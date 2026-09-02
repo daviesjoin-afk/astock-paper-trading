@@ -31,7 +31,7 @@ RUN install -o app -g app -m 0644 /app/frontend/app.js /app/frontend/assets/app.
 # Keep the legacy CSS URL aligned with the canonical stylesheet as well;
 # cached pages still request /assets/app.css.
 RUN install -o app -g app -m 0644 /app/frontend/app.css /app/frontend/assets/app.css
-COPY --chown=app:app deploy ./deploy
+# 注：公开镜像不含宿主部署/调度配置（cron、worker 编排等由部署侧提供）
 
 USER app
 EXPOSE 8600
