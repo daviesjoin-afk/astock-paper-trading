@@ -1946,7 +1946,7 @@ async function loadPaper(options){
     // immediately so it can read in parallel with the larger dashboard DOM
     // render instead of extending every browser refresh serially.
     var auditRequest = window._paperWorkspace==='activity'
-      ? api('/api/paper/risk-audit?limit=80')
+      ? api('/api/paper/risk-audit?limit=160')
       : null;
     var overviewQuery=[];
     if(options.refresh) overviewQuery.push('refresh=1');
@@ -2086,7 +2086,7 @@ async function loadPaper(options){
         // The shared overview request may have started while another tab was
         // active, in which case auditRequest is null.  Fetch it now instead of
         // awaiting null and passing that value into renderPaperAudit().
-        var auditDashboard=await (auditRequest||api('/api/paper/risk-audit?limit=80'));
+          var auditDashboard=await (auditRequest||api('/api/paper/risk-audit?limit=160'));
         var auditBoard=$('paperActivityBoard');
         if(auditBoard){
           // loadPaper() may overlap after a fast refresh/navigation. Keep one audit section.
