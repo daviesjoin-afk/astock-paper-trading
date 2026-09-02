@@ -107,6 +107,41 @@ cd backend
 docker build -t astock-codex:latest .
 ```
 
+## Docker 运行
+
+仓库同时提供单容器镜像和 Compose 配置。Compose 会把运行时 SQLite、股票池、日 K 与行情快照保存在名为 `astock_data` 的持久化卷中，容器重建不会丢失这些数据。
+
+```bash
+# 构建并启动 Web 看板/API
+docker compose up -d --build
+
+# 查看启动日志
+docker compose logs -f app
+
+# 打开 http://127.0.0.1:8600
+```
+
+停止服务但保留数据：
+
+```bash
+docker compose down
+```
+
+连同模拟盘运行数据一起重置（不可恢复，请确认后执行）：
+
+```bash
+docker compose down -v
+```
+
+也可以不使用 Compose 直接运行镜像：
+
+```bash
+docker build -t astock-codex:latest .
+docker run --rm -p 8600:8600 -v astock_data:/app/backend/data_cache astock-codex:latest
+```
+
+容器内默认只启动 API/Web 看板，不会自动定时触发交易扫描；需要扫描时通过 `docker compose exec app` 手动执行 `backend/paper_runner.py`，或在部署侧配置调度器。
+
 ## 风险结论
 
 模拟盘成交与回测结果不能视为盈利保证。实时行情来自公开接口（非真实盘口深度），撮合采用滑点/成交假设，样本受 A 股当前成分与停牌处理影响；自进化与新闻观测均不构成交易建议。策略历史表现不代表未来收益，本项目不构成任何投资建议。

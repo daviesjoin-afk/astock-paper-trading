@@ -21,9 +21,17 @@ RUN sed -i 's|http://deb.debian.org/debian|https://mirrors.cloud.tencent.com/deb
 RUN python -m pip install --no-cache-dir -r requirements.txt
 
 RUN useradd --uid 10001 --create-home --shell /usr/sbin/nologin app
+# Runtime state is written below these paths.  Create them in the image so the
+# non-root process can start even when no external volume is mounted; Compose
+# named volumes inherit these permissions on first use.
+RUN mkdir -p /app/reports \
+    && chown -R app:app /app/reports
 COPY --chown=app:app backend ./backend
 RUN find /app/backend -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
 COPY --chown=app:app frontend ./frontend
+# Create the cache mount point in the image so Docker initializes a named
+# volume with the non-root application's ownership.
+RUN install -d -o app -g app /app/backend/data_cache
 # Keep the legacy /assets/app.js URL byte-for-byte aligned with the canonical
 # frontend entrypoint.  Older cached HTML referenced this path; allowing the
 # checked-in mirror to drift made a normal refresh execute obsolete code.

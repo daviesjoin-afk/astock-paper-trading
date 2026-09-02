@@ -1,0 +1,23 @@
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: astock-codex:latest
+    restart: unless-stopped
+    ports:
+      - "8600:8600"
+    environment:
+      TZ: Asia/Shanghai
+      PYTHONUNBUFFERED: "1"
+      PYTHONDONTWRITEBYTECODE: "1"
+    volumes:
+      # data_fetcher.py stores SQLite, universe and market caches here.
+      - astock_data:/app/backend/data_cache
+      # Daily reports and logs are written below the repository root.
+      - astock_reports:/app/reports
+    init: true
+
+volumes:
+  astock_data:
+  astock_reports:
