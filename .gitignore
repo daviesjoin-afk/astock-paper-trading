@@ -4,6 +4,12 @@ reports/
 backups/
 cp/
 logs/
+# Defense in depth: never stage local ledgers if a tool writes one outside
+# the standard runtime directory.
+*.sqlite
+*.sqlite3
+*.db
+*.db-*
 
 # 部署暂存目录与运行时锁（临时工作副本，不入库）
 .locks/

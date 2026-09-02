@@ -60,10 +60,10 @@
 </div>
 
 <div id="p-paper" class="page">
-  <div class="page-header"><div><span class="page-kicker">共享资金模拟账本</span><h2>策略模拟</h2><p>三套策略共用总资金池、独立决策与风控、统一成交核算；核心持仓和当日操作置顶，完整审计记录按需展开。</p></div></div>
+  <div class="page-header"><div><span class="page-kicker">共享资金模拟账本</span><h2>策略模拟</h2><p>两套策略共用总资金池、独立决策与风控、统一成交核算；核心持仓和当日操作置顶，完整审计记录按需展开。</p></div></div>
   <div class="workspace-tabs-dock" data-workspace-tabs-dock="paper">
   <nav id="paperModuleTabs" class="module-tabs workspace-tab-strip" data-tab-scroll aria-label="&#x7b56;&#x7565;&#x6a21;&#x62df;&#x4e09;&#x7ea7;&#x5bfc;&#x822a;" role="tablist">
-    <button class="module-tab" role="tab" aria-selected="false" data-paper-view="strategy" onclick="showPaperWorkspace('strategy',this)"><span class="module-code">策略</span><span class="module-copy"><b>策略中心</b><small>三套账户的规则与风控边界</small></span></button>
+    <button class="module-tab" role="tab" aria-selected="false" data-paper-view="strategy" onclick="showPaperWorkspace('strategy',this)"><span class="module-code">策略</span><span class="module-copy"><b>策略中心</b><small>两套账户的规则与风控边界</small></span></button>
     <button class="module-tab" role="tab" aria-selected="false" data-paper-view="research" onclick="showPaperWorkspace('research',this)"><span class="module-code">证据</span><span class="module-copy"><b>策略证据</b><small>候选快照与后续兑现跟踪</small></span></button>
     <button class="module-tab active" role="tab" aria-selected="true" data-paper-view="portfolio" onclick="showPaperWorkspace('portfolio',this)"><span class="module-code">持仓</span><span class="module-copy"><b>&#x5f53;&#x524d;&#x6301;&#x4ed3;</b><small>&#x5e10;&#x6237;&#x4e0e;&#x53ef;&#x64cd;&#x4f5c;&#x5e95;&#x4ed3;</small></span></button>
     <button class="module-tab" role="tab" aria-selected="false" data-paper-view="activity" onclick="showPaperWorkspace('activity',this)"><span class="module-code">委托</span><span class="module-copy"><b>&#x59d4;&#x6258;&#x8bb0;&#x5f55;</b><small>&#x6309;&#x65e5;&#x671f;&#x4e0e;&#x7b56;&#x7565;&#x67e5;&#x770b;&#x64cd;&#x4f5c;</small></span></button>
@@ -72,13 +72,15 @@
   </nav>
   </div>
   <div id="paperStrategyView" class="paper-strategy-view" hidden><div class="loading">正在读取策略规则…</div></div>
-  <div id="paperResearchView" class="paper-research-view" hidden><div class="loading">正在读取三套模拟盘策略的研究证据…</div></div>
+  <div id="paperResearchView" class="paper-research-view" hidden><div class="loading">正在读取两套模拟盘策略的研究证据…</div></div>
   <div id="paperPortfolioView" class="paper-trade-view">
   <div class="panel paper-setup-panel">
     <h3>模拟周期设置 <span class="tag tag-info">纯模拟盘</span></h3>
     <div class="controls">
-      <label>总模拟资金池（元）</label>
+      <label for="paperCapital">总模拟资金池（元）</label>
       <input id="paperCapital" type="number" min="1000" max="10000000" step="1000" value="300000" style="width:150px" oninput="syncPaperCapitalHint()">
+      <div class="control-field"><label for="paperStyle">交易风格</label><select id="paperStyle" onchange="syncPaperCapitalHint()"><option value="aggressive">激进</option><option value="balanced" selected>宽松</option><option value="calm">平缓</option></select></div>
+      <div class="control-field"><label for="paperCycleDays">周期长度</label><select id="paperCycleDays" onchange="syncPaperCapitalHint()"><option value="5">5 个交易日</option><option value="10" selected>10 个交易日</option><option value="20">20 个交易日</option><option value="30">30 个交易日</option><option value="60">60 个交易日</option></select></div>
       <button id="paperStart" onclick="startPaper()">保存并启动新周期</button>
       <button id="paperResume" class="ghost" onclick="resumePaper()">恢复当前周期</button>
       <button id="paperPause" class="ghost" onclick="pausePaper()">暂停</button>
@@ -86,8 +88,8 @@
       <button id="paperRunNow" class="ghost" onclick="runPaperNow('intraday')">立即观察日内风险</button>
       <span id="paperStatus" role="status" aria-live="polite" style="font-size:12px;color:var(--text-secondary)"></span>
     </div>
-    <div id="paperCapitalHint" style="margin:-5px 0 10px;color:var(--text-secondary);font-size:12px">三套策略共享总资金池 ¥300,000；策略独立决策、独立风控，资金统一核算。</div>
-    <div class="disclaimer">三套策略并行、独立决策与交易归因，共用总资金池：短线日内做T仅卖出已结算底仓；当天新买股票仍为 T+1。每3分钟只观察行情和风险，只有价格、成本、仓位与各自模型同时通过才模拟成交。模拟盘不连接券商，也不代表真实可成交价格。</div>
+    <div id="paperCapitalHint" style="margin:-5px 0 10px;color:var(--text-secondary);font-size:12px">两套策略共享总资金池 ¥300,000；当前风格：宽松；周期：10 个交易日。策略独立决策、独立风控，资金统一核算。</div>
+    <div class="disclaimer">两套策略并行、独立决策与交易归因，共用总资金池：短线日内做T仅卖出已结算底仓；当天新买股票仍为 T+1。每3分钟只观察行情和风险，只有价格、成本、仓位与各自模型同时通过才模拟成交。模拟盘不连接券商，也不代表真实可成交价格。</div>
   </div>
   <div id="paperAccountStrip" class="paper-account-strip"></div>
   <section class="paper-trade-workspace">
@@ -112,13 +114,13 @@
   <div id="paperResult"><div class="loading">正在读取模拟账户…</div></div>
   </div>
   <div id="paperActivityView" class="paper-trade-view" hidden><div class="panel paper-terminal-board"><div id="paperActivityBoard"><div class="loading">&#x6b63;&#x5728;&#x8bfb;&#x53d6;&#x59d4;&#x6258;&#x8bb0;&#x5f55;&#x2026;</div></div></div></div>
-  <div id="paperHistoryView" class="paper-trade-view" hidden><div class="panel workspace-panel"><p class="paper-page-notice">&#x67e5;&#x770b;&#x6a21;&#x62df;&#x8d26;&#x672c;&#x4e2d;&#x67d0;&#x53ea;&#x80a1;&#x7968;&#x7684;&#x5386;&#x53f2;&#x4e70;&#x5356;&#x3001;&#x5df2;&#x5b9e;&#x73b0;&#x635f;&#x76ca;&#x3001;&#x8d39;&#x7528;&#x4e0e;&#x5f53;&#x524d;&#x5e95;&#x4ed3;&#x3002;&#x4e09;&#x5957;&#x7b56;&#x7565;&#x5206;&#x5f00;&#x8bb0;&#x8d26;&#x3002;</p><div class="paper-history-toolbar"><div class="control-field"><label for="paperHistoryCode">&#x80a1;&#x7968;&#x4ee3;&#x7801;</label><input id="paperHistoryCode" maxlength="6" inputmode="numeric" placeholder="&#x4f8b;&#x5982; 600176" onkeydown="if(event.key==='Enter')loadPaperStockHistory()"></div><div class="control-field"><label for="paperHistoryAccount">&#x7b56;&#x7565;&#x8d26;&#x6237;</label><select id="paperHistoryAccount"></select></div><button id="paperHistoryLoad" onclick="loadPaperStockHistory()">&#x67e5;&#x770b;&#x4e2a;&#x80a1;&#x6863;&#x6848;</button></div><div class="controls" style="margin-top:10px"><label for="paperHistoryQuick">&#x5386;&#x53f2;&#x4e2a;&#x80a1;&#x5feb;&#x9009;</label><select id="paperHistoryQuick" onchange="selectPaperHistoryQuick(this.value)"><option value="">&#x9009;&#x62e9;&#x4e00;&#x53ea;&#x6709;&#x6a21;&#x62df;&#x8d26;&#x672c;&#x8bb0;&#x5f55;&#x7684;&#x4e2a;&#x80a1;</option></select></div><div class="controls" style="margin-top:10px"><label for="paperHistorySide">&#x65b9;&#x5411;</label><select id="paperHistorySide" onchange="filterPaperHistoryRows()"><option value="all">&#x5168;&#x90e8;</option><option value="buy">&#x4e70;&#x5165;</option><option value="sell">&#x5356;&#x51fa;</option></select><label for="paperHistoryStatus">&#x7ed3;&#x679c;</label><select id="paperHistoryStatus" onchange="filterPaperHistoryRows()"><option value="all">&#x5168;&#x90e8;</option><option value="filled">&#x5df2;&#x6210;&#x4ea4;</option><option value="pending_limit">&#x5f85;&#x89e6;&#x53d1;</option><option value="risk_rejected">&#x98ce;&#x63a7;&#x62d2;&#x7edd;</option><option value="cancelled">&#x5df2;&#x64a4;&#x9500;</option></select><label for="paperHistoryDate">&#x65e5;&#x671f;</label><input id="paperHistoryDate" type="date" onchange="filterPaperHistoryRows()"><span id="paperHistoryVisible" class="paper-filter-count"></span></div><div id="paperHistoryResult" style="margin-top:16px"><div class="paper-empty">&#x8f93;&#x5165;&#x4ee3;&#x7801;&#xff0c;&#x6216;&#x4ece;&#x5f53;&#x524d;&#x6301;&#x4ed3;&#x4e2d;&#x9009;&#x62e9;&#x3002;</div></div></div></div>
+  <div id="paperHistoryView" class="paper-trade-view" hidden><div class="panel workspace-panel"><p class="paper-page-notice">&#x67e5;&#x770b;&#x6a21;&#x62df;&#x8d26;&#x672c;&#x4e2d;&#x67d0;&#x53ea;&#x80a1;&#x7968;&#x7684;&#x5386;&#x53f2;&#x4e70;&#x5356;&#x3001;&#x5df2;&#x5b9e;&#x73b0;&#x635f;&#x76ca;&#x3001;&#x8d39;&#x7528;&#x4e0e;&#x5f53;&#x524d;&#x5e95;&#x4ed3;&#x3002;&#x4e24;&#x5957;&#x7b56;&#x7565;&#x5206;&#x5f00;&#x8bb0;&#x8d26;&#x3002;</p><div class="paper-history-toolbar"><div class="control-field"><label for="paperHistoryCode">&#x80a1;&#x7968;&#x4ee3;&#x7801;</label><input id="paperHistoryCode" maxlength="6" inputmode="numeric" placeholder="&#x4f8b;&#x5982; 600176" onkeydown="if(event.key==='Enter')loadPaperStockHistory()"></div><div class="control-field"><label for="paperHistoryAccount">&#x7b56;&#x7565;&#x8d26;&#x6237;</label><select id="paperHistoryAccount"></select></div><button id="paperHistoryLoad" onclick="loadPaperStockHistory()">&#x67e5;&#x770b;&#x4e2a;&#x80a1;&#x6863;&#x6848;</button></div><div class="controls" style="margin-top:10px"><label for="paperHistoryQuick">&#x5386;&#x53f2;&#x4e2a;&#x80a1;&#x5feb;&#x9009;</label><select id="paperHistoryQuick" onchange="selectPaperHistoryQuick(this.value)"><option value="">&#x9009;&#x62e9;&#x4e00;&#x53ea;&#x6709;&#x6a21;&#x62df;&#x8d26;&#x672c;&#x8bb0;&#x5f55;&#x7684;&#x4e2a;&#x80a1;</option></select></div><div class="controls" style="margin-top:10px"><label for="paperHistorySide">&#x65b9;&#x5411;</label><select id="paperHistorySide" onchange="filterPaperHistoryRows()"><option value="all">&#x5168;&#x90e8;</option><option value="buy">&#x4e70;&#x5165;</option><option value="sell">&#x5356;&#x51fa;</option></select><label for="paperHistoryStatus">&#x7ed3;&#x679c;</label><select id="paperHistoryStatus" onchange="filterPaperHistoryRows()"><option value="all">&#x5168;&#x90e8;</option><option value="filled">&#x5df2;&#x6210;&#x4ea4;</option><option value="pending_limit">&#x5f85;&#x89e6;&#x53d1;</option><option value="risk_rejected">&#x98ce;&#x63a7;&#x62d2;&#x7edd;</option><option value="cancelled">&#x5df2;&#x64a4;&#x9500;</option></select><label for="paperHistoryDate">&#x65e5;&#x671f;</label><input id="paperHistoryDate" type="date" onchange="filterPaperHistoryRows()"><span id="paperHistoryVisible" class="paper-filter-count"></span></div><div id="paperHistoryResult" style="margin-top:16px"><div class="paper-empty">&#x8f93;&#x5165;&#x4ee3;&#x7801;&#xff0c;&#x6216;&#x4ece;&#x5f53;&#x524d;&#x6301;&#x4ed3;&#x4e2d;&#x9009;&#x62e9;&#x3002;</div></div></div></div>
   <div id="paperRiskView" class="paper-risk-view" hidden>
     <div class="paper-risk-toolbar">
       <p>只读风控中心：不会重置账户，也不会因刷新页面产生模拟买卖。</p>
       <button id="paperRiskRefresh" onclick="refreshPaperRisk()">刷新风控状态</button>
     </div>
-    <div id="paperRiskResult" aria-live="polite"><div class="loading">正在读取三套策略的风险状态…</div></div>
+    <div id="paperRiskResult" aria-live="polite"><div class="loading">正在读取两套策略的风险状态…</div></div>
   </div>
 </div>
 

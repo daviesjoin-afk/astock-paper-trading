@@ -30,7 +30,7 @@ python -m uvicorn backend.main:app --host 127.0.0.1 --port 8600
 打开 http://127.0.0.1:8600
 
 首次访问数据相关页面时，引擎会**自动初始化**：
-- 在 `data_cache/` 下创建 SQLite（`paper_trading.sqlite3`，建表 + 五套策略账户 + 初始资金周期）
+- 在 `data_cache/` 下创建 SQLite（`paper_trading.sqlite3`，建表 + 两套启用策略账户 + 初始资金周期；旧策略历史记录保留但停用）
 - 若本地还没有股票池 `data_cache/universe.json`，会**懒构建**全 A 码表（联网，约 1~3 分钟）
 - 前端静态页由 API 伺服（`/assets`、`/`）
 
@@ -102,8 +102,9 @@ cp .env.example .env
 
 ## 7. 运行时数据与重置
 
-- 全部运行时数据位于 `data_cache/`（已 gitignore，不入库）：SQLite、`universe.json`、日K 缓存、快照缓存
+- 全部运行时数据位于 `data_cache/`（已 gitignore，不入库）：SQLite、`universe.json`、日K 缓存、快照缓存；仓库克隆和 Docker 首次启动均从空账本开始，自进化样本不会从维护机迁移
 - **重置**：停服务后删除 `data_cache/` 重启即恢复出厂（重新初始化 + 重新补数据）
+- Compose 默认使用新的 `astock_repo_data` 和 `astock_repo_reports` 卷；不要把维护机已有的 `astock_data` / `astock_reports` 卷挂载到开源仓库实例，除非明确需要继续使用那套历史账本
 
 ## 8. 与"生产部署"的差异（本仓库范围外）
 

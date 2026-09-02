@@ -83,6 +83,9 @@ NEW_STRATEGY_ID = "reported_profit_breakout"
 NEW_STRATEGY_VERSION = "reported-profit-breakout-v1"
 MAIN_FORCE_STRATEGY_ID = "main_force_top10"
 MAIN_FORCE_STRATEGY_VERSION = "main-force-top10-v1"
+# Public paper-trading release: only these two sleeves participate in new
+# cycles. Legacy account rows and their audit history remain readable.
+ACTIVE_ACCOUNT_IDS = ("tq_breakout", MAIN_FORCE_STRATEGY_ID)
 LOT_SIZE = 100
 # 集中化配对约束：席位稀缺（15席）时，低于该金额的新开仓是"尘埃仓"——
 # 占用一席却几乎不承载资金（2026-08-25 000978 案例黄灯预算剩 ¥3.2K 仍
@@ -573,6 +576,15 @@ STYLE_PROFILES = {
     "main_force": {"name": "超强主力股", "source_strategy": MAIN_FORCE_STRATEGY_ID},
 }
 
+# User-facing execution posture.  These are deliberately bounded overlays on
+# soft thresholds only; T+1, price-limit, quote freshness, coverage, lot-size,
+# position and shared-pool hard gates remain unchanged.
+TRADING_MODE_PROFILES = {
+    "aggressive": {"name": "激进", "min_cost_edge_scale": 0.80, "max_weight_scale": 1.00, "max_exposure_scale": 1.00, "cooldown_delta": 0},
+    "balanced": {"name": "宽松", "min_cost_edge_scale": 1.00, "max_weight_scale": 1.00, "max_exposure_scale": 1.00, "cooldown_delta": 0},
+    "calm": {"name": "平缓", "min_cost_edge_scale": 1.15, "max_weight_scale": 0.80, "max_exposure_scale": 0.85, "cooldown_delta": 1},
+}
+
 RISK_PROFILES = {
     # 2026-08-24 集中化改造：总硬上限 15（动态分配），单笔风险预算
     # 提升至 ~1.2% NAV，使 risk 约束给出的单仓 ≈ ¥16-22K，与 weight 上限
@@ -795,11 +807,12 @@ def strategy_center():
         },
     }
     total_profile_exposure = sum(
-        _num(RISK_PROFILES[item["risk_profile"]].get("max_exposure"), 0.0)
-        for item in ACCOUNT_SPECS.values()
+        _num(RISK_PROFILES[ACCOUNT_SPECS[account_id]["risk_profile"]].get("max_exposure"), 0.0)
+        for account_id in ACTIVE_ACCOUNT_IDS
     ) or 1.0
     rows = []
-    for account_id, spec in ACCOUNT_SPECS.items():
+    for account_id in ACTIVE_ACCOUNT_IDS:
+        spec = ACCOUNT_SPECS[account_id]
         risk = RISK_PROFILES[spec["risk_profile"]]
         event_policy = OPENING_EVENT_POLICIES.get(account_id) or {}
         pool_budget_pct = SHARED_POOL_MAX_EXPOSURE * risk["max_exposure"] / total_profile_exposure * 100
@@ -835,12 +848,18 @@ def strategy_center():
         })
     return {
         "strategies": rows,
+        "active_account_ids": list(ACTIVE_ACCOUNT_IDS),
+        "trading_modes": [
+            {"id": key, "name": value["name"],
+             "description": "只调整软阈值/仓位节奏，硬风控门禁不变"}
+            for key, value in TRADING_MODE_PROFILES.items()
+        ],
         "shared_guards": [
             "仅使用独立模拟资金与规则化成交假设，不连接券商或真实账户。",
             "可买范围仅限沪深主板与创业板；ST/退市风险、科创板和北交所一律禁止新买，科创板行情只作同产业映射加分。",
-            f"四套策略共用一个总资金池，持仓与待成交买单合计不得超过总净值的 {SHARED_POOL_MAX_EXPOSURE * 100:.0f}%；这是硬上限，任何特级机会都不能突破。",
+            f"两套启用策略共用一个总资金池，持仓与待成交买单合计不得超过总净值的 {SHARED_POOL_MAX_EXPOSURE * 100:.0f}%；这是硬上限，任何特级机会都不能突破。",
             "策略额度按风险画像分配目标和保护底线；某策略未用额度只会在其他策略底线满足后转入，不再各自重复计算总池上限。",
-            f"股票持仓按策略席位计数：四策略共享总硬上限 {SHARED_POOL_MAX_POSITIONS} 个；满席时高分候选进入替补池，只有明显优于弱持仓才允许先卖后买。",
+            f"股票持仓按策略席位计数：两套启用策略共享总硬上限 {SHARED_POOL_MAX_POSITIONS} 个；满席时高分候选进入替补池，只有明显优于弱持仓才允许先卖后买。",
             "换仓必须通过实时双源行情、新闻、T+1与质量分复核；每策略每日最多一次主动择强换股，硬止损不受此限制。",
             "待成交买单会预占现金和总池额度；成交后核销，撤单、过期或风控拒绝后释放。",
             "自动开仓须使用当日实时行情，并通过东方财富与腾讯行情交叉核验。",
@@ -2165,7 +2184,9 @@ def init_db():
             CREATE TABLE IF NOT EXISTS paper_cycles (
                 id INTEGER PRIMARY KEY AUTOINCREMENT, cycle_key TEXT NOT NULL UNIQUE,
                 status TEXT NOT NULL, capital REAL NOT NULL, risk_profile TEXT NOT NULL,
-                started_at TEXT, ended_at TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+                cycle_days INTEGER, trading_mode TEXT NOT NULL DEFAULT 'balanced',
+                started_at TEXT, ended_at TEXT,
+                created_at TEXT NOT NULL, updated_at TEXT NOT NULL
             );
             CREATE TABLE IF NOT EXISTS paper_position_lots (
                 id INTEGER PRIMARY KEY AUTOINCREMENT, cycle_id INTEGER NOT NULL,
@@ -2309,6 +2330,11 @@ def init_db():
         for column, definition in account_migrations.items():
             if column not in account_columns:
                 conn.execute(f"ALTER TABLE paper_accounts ADD COLUMN {column} {definition}")
+        cycle_columns = {row[1] for row in conn.execute("PRAGMA table_info(paper_cycles)").fetchall()}
+        if "cycle_days" not in cycle_columns:
+            conn.execute("ALTER TABLE paper_cycles ADD COLUMN cycle_days INTEGER")
+        if "trading_mode" not in cycle_columns:
+            conn.execute("ALTER TABLE paper_cycles ADD COLUMN trading_mode TEXT NOT NULL DEFAULT 'balanced'")
         _ensure_accounts(conn)
         _ensure_cycle(conn)
         _ensure_runtime_lease_columns(conn)
@@ -2333,12 +2359,13 @@ def _ensure_accounts(conn):
         "SELECT id,status,capital FROM paper_cycles WHERE status IN ('draft','running','paused') ORDER BY id DESC LIMIT 1"
     ).fetchone()
     configured_share = (
-        _num(active_cycle["capital"], 0.0) / max(len(ACCOUNT_SPECS), 1)
+        _num(active_cycle["capital"], 0.0) / max(len(ACTIVE_ACCOUNT_IDS), 1)
         if active_cycle and _num(active_cycle["capital"], 0.0) > 0
         else 20000.0
     )
     configured_status = active_cycle["status"] if active_cycle else "paused"
-    for account_id, spec in ACCOUNT_SPECS.items():
+    for account_id in ACTIVE_ACCOUNT_IDS:
+        spec = ACCOUNT_SPECS[account_id]
         exists = conn.execute("SELECT 1 FROM paper_accounts WHERE id=?", (account_id,)).fetchone()
         new_run = not bool(exists)
         if exists:
@@ -2373,6 +2400,16 @@ def _ensure_accounts(conn):
         )
 
 
+def _disable_inactive_accounts(conn):
+    """Keep retired strategy ledgers readable while excluding them from runs."""
+    placeholders = ",".join("?" for _ in ACTIVE_ACCOUNT_IDS)
+    conn.execute(
+        f"UPDATE paper_accounts SET status='disabled',updated_at=? "
+        f"WHERE id NOT IN ({placeholders}) AND status!='disabled'",
+        (_now(), *ACTIVE_ACCOUNT_IDS),
+    )
+
+
 def _reconcile_shared_cash(conn, cycle_id):
     """Repair cash drift from the one-time shared-pool migration.
 
@@ -2381,6 +2418,8 @@ def _reconcile_shared_cash(conn, cycle_id):
     difference proportionally to the strategy ledgers so the pool NAV cannot
     be understated.  The correction is idempotent and is audited.
     """
+    # Reconciliation includes every ledger bucket in the cycle, including
+    # retired accounts, so historical cash attribution remains balanced.
     accounts = _rows(conn, "SELECT id,initial_cash,cash FROM paper_accounts WHERE cycle_id=? ORDER BY id", (cycle_id,))
     if not accounts:
         return 0.0
@@ -2432,7 +2471,7 @@ def _available_cycle_ledger_capital(conn, cycle, account_id):
         (cycle["id"], account_id),
     ).fetchone()
     if int(allocated["n"] or 0) <= 0:
-        return _num(cycle["capital"], 0.0) / max(len(ACCOUNT_SPECS), 1)
+        return _num(cycle["capital"], 0.0) / max(len(ACTIVE_ACCOUNT_IDS), 1)
     existing_initial = _num(allocated["s"])
     return max(0.0, _num(cycle["capital"], 0.0) - existing_initial)
 
@@ -2442,7 +2481,7 @@ def _late_join_reference_capital(conn, cycle, account_id):
 
     Match the share already attributed to the sleeves funded in this cycle
     instead of re-dividing the cycle capital by the new strategy count.  The
-    funded sleeves keep their original share, so ``capital / len(ACCOUNT_SPECS)``
+    funded sleeves keep their original share, so ``capital / len(ACTIVE_ACCOUNT_IDS)``
     would compare strategies on different bases: with a 300k cycle the four
     funded sleeves hold 75k each while the late joiner would be measured on
     60k, inflating its percentage return for the same P&L.
@@ -2454,14 +2493,19 @@ def _late_join_reference_capital(conn, cycle, account_id):
     ).fetchone()
     if int(funded["n"] or 0) > 0 and _num(funded["s"]) > 0:
         return round(_num(funded["s"]) / int(funded["n"]), 2)
-    return round(_num(cycle["capital"], 0.0) / max(len(ACCOUNT_SPECS), 1), 2)
+    return round(_num(cycle["capital"], 0.0) / max(len(ACTIVE_ACCOUNT_IDS), 1), 2)
 
 
 def _ensure_cycle(conn):
     """给旧版账户补一个可归档周期；不删除任何已有记录。"""
+    _disable_inactive_accounts(conn)
     active = conn.execute("SELECT * FROM paper_cycles WHERE status IN ('draft','running','paused') ORDER BY id DESC LIMIT 1").fetchone()
     if active is None:
-        account = conn.execute("SELECT * FROM paper_accounts ORDER BY id LIMIT 1").fetchone()
+        placeholders = ",".join("?" for _ in ACTIVE_ACCOUNT_IDS)
+        account = conn.execute(
+            f"SELECT * FROM paper_accounts WHERE id IN ({placeholders}) ORDER BY id LIMIT 1",
+            ACTIVE_ACCOUNT_IDS,
+        ).fetchone()
         capital = _num(account["initial_cash"], 100000.0) if account else 100000.0
         now = _now()
         key = "legacy-" + now.replace("-", "").replace(":", "").replace(" ", "-")
@@ -2473,15 +2517,18 @@ def _ensure_cycle(conn):
     # Only a synthetic legacy cycle may infer its declared capital from old
     # account ledgers.  A normal shared-pool cycle keeps paper_cycles.capital
     # authoritative; otherwise adding a strategy can silently enlarge it.
+    placeholders = ",".join("?" for _ in ACTIVE_ACCOUNT_IDS)
     account_total = conn.execute(
-        "SELECT COALESCE(SUM(initial_cash),0) FROM paper_accounts WHERE cycle_id=?",
-        (active["id"],),
+        f"SELECT COALESCE(SUM(initial_cash),0) FROM paper_accounts "
+        f"WHERE cycle_id=? AND id IN ({placeholders})",
+        (active["id"], *ACTIVE_ACCOUNT_IDS),
     ).fetchone()[0]
     if str(active["cycle_key"] or "").startswith("legacy-") and _num(account_total) > _num(active["capital"]):
         conn.execute("UPDATE paper_cycles SET capital=?,updated_at=? WHERE id=?",
                      (_num(account_total), _now(), active["id"]))
         active = conn.execute("SELECT * FROM paper_cycles WHERE id=?", (active["id"],)).fetchone()
-    for account_id, spec in ACCOUNT_SPECS.items():
+    for account_id in ACTIVE_ACCOUNT_IDS:
+        spec = ACCOUNT_SPECS[account_id]
         current = conn.execute("SELECT * FROM paper_accounts WHERE id=?", (account_id,)).fetchone()
         if current is None:
             continue
@@ -2618,11 +2665,23 @@ def _active_cycle(conn):
 
 
 def _shared_account_rows(conn, cycle_id=None):
-    """Return the strategy ledgers participating in the shared capital pool."""
+    """Return every ledger bucket participating in the shared capital pool.
+
+    Retired sleeves remain in the aggregate cash/NAV ledger until their cycle
+    is archived.  Their ``disabled`` status keeps them out of live account
+    views and execution loops without silently dropping legacy capital from
+    the shared pool.
+    """
     if cycle_id is None:
         cycle = _active_cycle(conn)
         cycle_id = cycle["id"]
     return _rows(conn, "SELECT * FROM paper_accounts WHERE cycle_id=? ORDER BY id", (cycle_id,))
+
+
+def _active_shared_account_rows(conn, cycle_id=None):
+    """Return only enabled sleeves for live UI and allocation decisions."""
+    rows = _shared_account_rows(conn, cycle_id)
+    return [row for row in rows if row.get("status") != "disabled"]
 
 
 def _shared_initial_cash(conn, cycle=None):
@@ -3670,7 +3729,7 @@ def _market_state(asof_date, live_universe=None, *, allow_network=True):
     elif stale and live_pct is not None:
         # 盘中最后一根完整日线落后一个交易日是正常现象；只要实时指数
         # 有当日时间戳，就按保守黄灯运行，不能把“趋势待更新”误判成未知
-        # 并暂停四套策略全部新开仓。
+        # 并暂停所有启用策略的新开仓。
         light = "red" if overseas.get("light") == "red" or live_pct <= -2.0 else "yellow"
         reason = f"实时沪深300 {live_pct:+.2f}%；中期趋势收盘数据待更新，按谨慎仓位执行"
     elif stale:
@@ -7559,6 +7618,26 @@ def _risk_profile(account, asof_day=None):
     for key, value in (INTRADAY_DOWNSIDE_POLICIES.get(account_id) or {}).items():
         profile[f"downside_{key}"] = value
     params = _loads(account.get("params"), {})
+    trading_mode = _validate_trading_mode(params.get("trading_mode"))
+    mode_profile = TRADING_MODE_PROFILES[trading_mode]
+    # Only soft execution posture values are adjusted here.  The executor's
+    # independent hard gates (T+1, quote validity, price limits, shared pool,
+    # position caps and stop-loss protection) remain authoritative elsewhere.
+    profile["min_cost_edge"] = max(
+        0.0,
+        _num(profile.get("min_cost_edge"), 0.0) * mode_profile["min_cost_edge_scale"],
+    )
+    profile["max_weight"] = min(
+        _num(profile.get("max_weight"), 0.0),
+        _num(profile.get("max_weight"), 0.0) * mode_profile["max_weight_scale"],
+    )
+    profile["max_exposure"] = min(
+        _num(profile.get("max_exposure"), 0.0),
+        _num(profile.get("max_exposure"), 0.0) * mode_profile["max_exposure_scale"],
+    )
+    profile["cooldown_days"] = max(2, int(profile.get("cooldown_days", 2)) + int(mode_profile["cooldown_delta"]))
+    profile["trading_mode"] = trading_mode
+    profile["trading_mode_name"] = mode_profile["name"]
     overlay = params.get("adaptive_risk") or {}
     meta = params.get("adaptive_risk_meta") or {}
     if _runtime_parameter_active(
@@ -7571,6 +7650,26 @@ def _risk_profile(account, asof_day=None):
             profile[key] = int(round(value)) if key == "cooldown_days" else round(value, 6)
         profile["adaptive_version"] = meta.get("version")
         profile["adaptive_candidate_id"] = meta.get("candidate_id")
+    # Re-apply the user posture after any adaptive overlay so an automated
+    # candidate can never silently relax the selected calm/balanced bounds.
+    if trading_mode != "aggressive":
+        profile["max_weight"] = min(
+            _num(profile.get("max_weight"), 0.0),
+            _num(RISK_PROFILES.get(account.get("risk_profile"), RISK_PROFILES[default_key]).get("max_weight"), 0.0)
+            * mode_profile["max_weight_scale"],
+        )
+        profile["max_exposure"] = min(
+            _num(profile.get("max_exposure"), 0.0),
+            _num(RISK_PROFILES.get(account.get("risk_profile"), RISK_PROFILES[default_key]).get("max_exposure"), 0.0)
+            * mode_profile["max_exposure_scale"],
+        )
+    profile["min_cost_edge"] = max(
+        0.0,
+        _num(RISK_PROFILES.get(account.get("risk_profile"), RISK_PROFILES[default_key]).get("min_cost_edge"), 0.0)
+        * mode_profile["min_cost_edge_scale"],
+    )
+    profile["trading_mode"] = trading_mode
+    profile["trading_mode_name"] = mode_profile["name"]
     return profile
 
 
@@ -7720,12 +7819,15 @@ def _dynamic_position_limits(conn):
     through the staged, T+1/quote/limit-aware capacity-exit path.
     """
     cycle = _active_cycle(conn)
-    all_rows = _shared_account_rows(conn, cycle["id"])
+    all_rows = _active_shared_account_rows(conn, cycle["id"])
     running_rows = [row for row in all_rows if row.get("status") == "running"]
     rows = running_rows or all_rows
     account_ids = [key for key in ACCOUNT_SPECS if any(row.get("id") == key for row in rows)]
     if not account_ids:
-        account_ids = list(ACCOUNT_SPECS)
+        # A partially initialized/legacy ledger must still fail closed to the
+        # public release allow-list; never recreate retired strategy sleeves
+        # merely because the live account rows are temporarily unavailable.
+        account_ids = list(ACTIVE_ACCOUNT_IDS)
     row_map = {row.get("id"): row for row in rows}
     profiles = {
         account_id: _risk_profile(row_map.get(account_id) or {"id": account_id})
@@ -7846,7 +7948,7 @@ def _strategy_pool_budget(conn, account, nav, positions, quotes, market=None, ex
     actual additional amount this strategy may open right now.  All values
     are derived from the same live quote snapshot used by the order gate.
     """
-    rows = _shared_account_rows(conn)
+    rows = _active_shared_account_rows(conn)
     if not rows:
         rows = [account]
     values = {}
@@ -14629,8 +14731,8 @@ def _shared_metrics(conn, cycle, positions, quotes):
     fills = conn.execute("SELECT COUNT(*) FROM paper_fills WHERE account_id IN (SELECT id FROM paper_accounts WHERE cycle_id=?)", (cycle["id"],)).fetchone()[0]
     return {
         "mode": "shared_pool",
-        "label": f"总资金池 · {len(ACCOUNT_SPECS)}套策略独立决策",
-        "strategy_count": len(_shared_account_rows(conn, cycle["id"])),
+        "label": f"总资金池 · {len(ACTIVE_ACCOUNT_IDS)}套策略独立决策",
+        "strategy_count": len(_active_shared_account_rows(conn, cycle["id"])),
         "initial_cash": round(initial, 2),
         "cash": round(cash, 2),
         "market_value": round(market_value, 2),
@@ -14864,13 +14966,7 @@ def dashboard(include_activity=False, include_history_symbols=False):
     market_session = _market_session()
     with _db() as conn:
         cycle = _active_cycle(conn)
-        account_rows = _rows(
-            conn,
-            """SELECT * FROM paper_accounts
-               ORDER BY CASE id WHEN 'tq_breakout' THEN 1 WHEN 'trend_pullback' THEN 2
-                                WHEN 'sector_rotation' THEN 3 WHEN 'reported_profit_breakout' THEN 4
-                                WHEN 'main_force_top10' THEN 5 ELSE 9 END""",
-        )
+        account_rows = _active_shared_account_rows(conn, cycle["id"])
         positions = _position_rows(conn, asof_day=dt.date.today())
         today = dt.date.today().isoformat()
         today_sell_codes = {
@@ -15263,13 +15359,18 @@ def dashboard(include_activity=False, include_history_symbols=False):
                     "count": len(intersection), "codes": intersection,
                     "jaccard_pct": round(len(intersection) / len(union) * 100, 1) if union else 0.0,
                 })
-        history_symbols = _rows(
-            conn,
-            """SELECT code,MAX(name) AS name,COUNT(*) AS order_count,
-                      MAX(COALESCE(executed_at,created_at)) AS last_activity_at
-                 FROM paper_orders GROUP BY code
-                 ORDER BY last_activity_at DESC,code""",
-        ) if include_history_symbols else []
+        if include_history_symbols:
+            placeholders = ",".join("?" for _ in ACTIVE_ACCOUNT_IDS)
+            history_symbols = _rows(
+                conn,
+                f"""SELECT code,MAX(name) AS name,COUNT(*) AS order_count,
+                          MAX(COALESCE(executed_at,created_at)) AS last_activity_at
+                     FROM paper_orders WHERE account_id IN ({placeholders})
+                     GROUP BY code ORDER BY last_activity_at DESC,code""",
+                ACTIVE_ACCOUNT_IDS,
+            )
+        else:
+            history_symbols = []
         reviews = _rows(conn, "SELECT * FROM paper_reviews ORDER BY week_key DESC, account_id LIMIT 4")
         last_jobs = _rows(conn, "SELECT * FROM paper_jobs ORDER BY market_date DESC, started_at DESC LIMIT 8")
         monitor_runs = _rows(conn, "SELECT * FROM paper_job_runs ORDER BY started_at DESC LIMIT 24")
@@ -16009,6 +16110,30 @@ def _validate_capital(capital):
     return capital
 
 
+def _validate_cycle_days(cycle_days):
+    """Validate an optional user-selected cycle length in trading days."""
+    if cycle_days is None or cycle_days == "":
+        return None
+    try:
+        value = int(cycle_days)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("周期长度须为 1 至 365 个交易日") from exc
+    if value < 1 or value > 365:
+        raise ValueError("周期长度须为 1 至 365 个交易日")
+    return value
+
+
+def _validate_trading_mode(mode):
+    if mode is None or mode == "":
+        return "balanced"
+    value = str(mode).strip().lower()
+    if value == "loose":
+        value = "balanced"
+    if value not in TRADING_MODE_PROFILES:
+        raise ValueError("交易风格必须为 aggressive、balanced 或 calm")
+    return value
+
+
 def _cycle_snapshot(conn):
     cycle = _active_cycle(conn)
     # Archives are consumed by the account/stock history views.  Loading every
@@ -16064,32 +16189,40 @@ def _archive_current_cycle(conn, reason):
     return cycle
 
 
-def _create_cycle(conn, capital, status="paused", reason="新建模拟周期"):
+def _create_cycle(conn, capital, status="paused", reason="新建模拟周期", cycle_days=None, trading_mode=None):
     capital = _validate_capital(capital)
+    cycle_days = _validate_cycle_days(cycle_days)
+    trading_mode = _validate_trading_mode(trading_mode)
     now = _now()
     key = "cycle-" + dt.datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+    _disable_inactive_accounts(conn)
     cursor = conn.execute(
-        "INSERT INTO paper_cycles(cycle_key,status,capital,risk_profile,started_at,created_at,updated_at) VALUES(?,?,?,?,?,?,?)",
-        (key, status, capital, "shared_pool", now if status == "running" else None, now, now),
+        "INSERT INTO paper_cycles(cycle_key,status,capital,risk_profile,cycle_days,trading_mode,started_at,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)",
+        (key, status, capital, "shared_pool", cycle_days, trading_mode, now if status == "running" else None, now, now),
     )
     cycle_id = cursor.lastrowid
     benchmark = _benchmark_close()
-    account_share = capital / max(len(ACCOUNT_SPECS), 1)
-    for account_id, spec in ACCOUNT_SPECS.items():
+    account_share = capital / max(len(ACTIVE_ACCOUNT_IDS), 1)
+    for account_id in ACTIVE_ACCOUNT_IDS:
+        spec = ACCOUNT_SPECS[account_id]
         conn.execute(
             """UPDATE paper_accounts SET name=?,source_strategy=?,status=?,initial_cash=?,cash=?,cycle_days=?,
                max_positions=?,max_weight=?,max_exposure=?,version=?,benchmark_start=?,cycle_id=?,mode=?,style=?,
-               risk_profile=?,params='{}',daily_start_nav=?,daily_nav_date=?,cooldown_until=NULL,updated_at=? WHERE id=?""",
-            (spec["name"], spec["source_strategy"], status, account_share, account_share, spec["cycle_days"], spec["max_positions"],
+               risk_profile=?,params=?,daily_start_nav=?,daily_nav_date=?,cooldown_until=NULL,updated_at=? WHERE id=?""",
+            (spec["name"], spec["source_strategy"], status, account_share, account_share,
+             cycle_days if cycle_days is not None else spec["cycle_days"], spec["max_positions"],
              spec["max_weight"], spec["max_exposure"], spec.get("strategy_version") or "v3.0", benchmark, cycle_id, spec["mode"], spec["default_style"],
-             spec["risk_profile"], account_share, _date().isoformat(), now, account_id),
+             spec["risk_profile"], _json({"trading_mode": trading_mode}), account_share, _date().isoformat(), now, account_id),
         )
         conn.execute("INSERT INTO paper_nav(account_id,nav_date,cash,market_value,nav,benchmark,created_at) VALUES(?,?,?,?,?,?,?)",
                      (account_id, _date().isoformat(), account_share, 0.0, account_share, benchmark, now))
         conn.execute("INSERT INTO paper_parameter_versions(cycle_id,account_id,version,style,params,reason,effective_date,created_at) VALUES(?,?,?,?,?,?,?,?)",
-                     (cycle_id, account_id, spec.get("strategy_version") or "v3.0", spec["default_style"], "{}", reason, _date().isoformat(), now))
+                     (cycle_id, account_id, spec.get("strategy_version") or "v3.0", spec["default_style"], _json({"trading_mode": trading_mode}), reason, _date().isoformat(), now))
     _audit(conn, None, "cycle_created", f"{key}：共享模拟资金池 {capital:.2f} 元，多策略独立决策共用资金，{reason}")
-    return {"id": cycle_id, "cycle_key": key, "status": status, "capital": capital}
+    return {
+        "id": cycle_id, "cycle_key": key, "status": status, "capital": capital,
+        "cycle_days": cycle_days, "trading_mode": trading_mode,
+    }
 
 
 def configure_capital(capital):
@@ -16105,14 +16238,21 @@ def configure_capital(capital):
         if activity or positions:
             raise ValueError("本周期已有模拟成交或持仓，资金已锁定；请使用完全重置新建周期")
         conn.execute("UPDATE paper_cycles SET capital=?,updated_at=? WHERE id=?", (capital, _now(), cycle["id"]))
-        share = capital / max(len(ACCOUNT_SPECS), 1)
-        conn.execute("UPDATE paper_accounts SET initial_cash=?,cash=?,daily_start_nav=?,updated_at=?", (share, share, share, _now()))
-        conn.execute("UPDATE paper_nav SET cash=?,market_value=0,nav=?", (share, share))
+        share = capital / max(len(ACTIVE_ACCOUNT_IDS), 1)
+        placeholders = ",".join("?" for _ in ACTIVE_ACCOUNT_IDS)
+        conn.execute(
+            f"UPDATE paper_accounts SET initial_cash=?,cash=?,daily_start_nav=?,updated_at=? WHERE id IN ({placeholders})",
+            (share, share, share, _now(), *ACTIVE_ACCOUNT_IDS),
+        )
+        conn.execute(
+            f"UPDATE paper_nav SET cash=?,market_value=0,nav=? WHERE account_id IN ({placeholders})",
+            (share, share, *ACTIVE_ACCOUNT_IDS),
+        )
         _audit(conn, None, "capital_configured", f"共享模拟资金池草稿设为 {capital:.2f} 元；策略初始展示份额 {share:.2f} 元")
     return dashboard()
 
 
-def start_new_cycle(capital=300000.0, include_dashboard=True):
+def start_new_cycle(capital=300000.0, include_dashboard=True, cycle_days=None, trading_mode=None):
     """保存资金并启动新周期。旧周期先完整归档，避免覆盖历史模拟结果。
 
     HTTP 写接口使用 ``include_dashboard=False``，避免在已经提交账本变更后
@@ -16125,16 +16265,18 @@ def start_new_cycle(capital=300000.0, include_dashboard=True):
         if current["status"] == "running":
             raise ValueError("当前周期仍在运行，请先暂停再启动新周期")
         _archive_current_cycle(conn, "用户保存资金并启动新周期")
-        cycle = _create_cycle(conn, capital, status="running", reason="保存资金并启动")
+        cycle = _create_cycle(
+            conn, capital, status="running", reason="保存资金并启动", cycle_days=cycle_days, trading_mode=trading_mode,
+        )
     summary = dashboard() if include_dashboard else {
         "cycle": cycle,
-        "strategy_count": len(ACCOUNT_SPECS),
+        "strategy_count": len(ACTIVE_ACCOUNT_IDS),
         "refresh_required": True,
     }
     return summary, cycle
 
 
-def reset_cycle(capital=300000.0, include_dashboard=True):
+def reset_cycle(capital=300000.0, include_dashboard=True, cycle_days=None, trading_mode=None):
     """完全重置只归档，不删除历史；新周期保持暂停，等待用户明确启动。
 
     HTTP 写接口使用 ``include_dashboard=False``（与 start_new_cycle 一致），
@@ -16146,18 +16288,20 @@ def reset_cycle(capital=300000.0, include_dashboard=True):
         if current["status"] == "running":
             raise ValueError("当前周期仍在运行，请先暂停后再完全重置")
         _archive_current_cycle(conn, "用户完全重置")
-        cycle = _create_cycle(conn, capital, status="paused", reason="完全重置后等待启动")
+        cycle = _create_cycle(
+            conn, capital, status="paused", reason="完全重置后等待启动", cycle_days=cycle_days, trading_mode=trading_mode,
+        )
     if include_dashboard:
         return dashboard(), cycle
     return {
         "cycle": cycle,
-        "strategy_count": len(ACCOUNT_SPECS),
+        "strategy_count": len(ACTIVE_ACCOUNT_IDS),
         "refresh_required": True,
     }, cycle
 
 
 def set_account_style(account_id, style):
-    if account_id not in ACCOUNT_SPECS:
+    if account_id not in ACTIVE_ACCOUNT_IDS:
         raise ValueError("未知策略账户")
     if style not in STYLE_PROFILES:
         raise ValueError("风格必须是 strong、pullback、sector 或 quality")
@@ -16168,6 +16312,25 @@ def set_account_style(account_id, style):
             raise ValueError("当前周期运行中，暂停后才能调整策略风格")
         conn.execute("UPDATE paper_accounts SET style=?,updated_at=? WHERE id=?", (style, _now(), account_id))
         _audit(conn, account_id, "style_changed", f"后续候选风格切换为 {STYLE_PROFILES[style]['name']}；已有持仓不强平")
+    return dashboard()
+
+
+def set_trading_mode(mode):
+    """Set the user-facing bounded execution posture for the active cycle."""
+    mode = _validate_trading_mode(mode)
+    init_db()
+    with _db() as conn:
+        cycle = _active_cycle(conn)
+        if cycle["status"] == "running":
+            raise ValueError("当前周期运行中，暂停后才能调整交易风格")
+        conn.execute("UPDATE paper_cycles SET trading_mode=?,updated_at=? WHERE id=?", (mode, _now(), cycle["id"]))
+        placeholders = ",".join("?" for _ in ACTIVE_ACCOUNT_IDS)
+        rows = conn.execute(f"SELECT id,params FROM paper_accounts WHERE id IN ({placeholders})", ACTIVE_ACCOUNT_IDS).fetchall()
+        for row in rows:
+            params = _loads(row["params"], {})
+            params["trading_mode"] = mode
+            conn.execute("UPDATE paper_accounts SET params=?,updated_at=? WHERE id=?", (_json(params), _now(), row["id"]))
+        _audit(conn, None, "trading_mode_changed", f"交易风格切换为 {TRADING_MODE_PROFILES[mode]['name']}；硬风控门禁不变")
     return dashboard()
 
 
@@ -16187,10 +16350,14 @@ def set_accounts_status(status, capital=None):
             raise ValueError("当前周期不是暂停状态，不能恢复运行")
         if status == "paused" and cycle["status"] != "running":
             raise ValueError("当前周期并未运行，无需再次暂停")
-        conn.execute("UPDATE paper_accounts SET status=?, updated_at=?", (status, _now()))
+        placeholders = ",".join("?" for _ in ACTIVE_ACCOUNT_IDS)
+        conn.execute(
+            f"UPDATE paper_accounts SET status=?, updated_at=? WHERE id IN ({placeholders})",
+            (status, _now(), *ACTIVE_ACCOUNT_IDS),
+        )
         conn.execute("UPDATE paper_cycles SET status=?,started_at=COALESCE(started_at,?),updated_at=? WHERE id=?",
                      (status, _now() if status == "running" else None, _now(), cycle["id"]))
-        _audit(conn, None, "accounts_" + status, "三策略模拟盘状态变更")
+        _audit(conn, None, "accounts_" + status, "两套启用策略模拟盘状态变更")
     return dashboard()
 
 

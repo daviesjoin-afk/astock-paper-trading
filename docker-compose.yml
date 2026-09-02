@@ -13,11 +13,13 @@ services:
       PYTHONDONTWRITEBYTECODE: "1"
     volumes:
       # data_fetcher.py stores SQLite, universe and market caches here.
-      - astock_data:/app/backend/data_cache
+      # Deliberately use a release-scoped volume name so a clone does not
+      # accidentally attach an older private simulation/evolution ledger.
+      - astock_repo_data:/app/backend/data_cache
       # Daily reports and logs are written below the repository root.
-      - astock_reports:/app/reports
+      - astock_repo_reports:/app/reports
     init: true
 
 volumes:
-  astock_data:
-  astock_reports:
+  astock_repo_data:
+  astock_repo_reports:
