@@ -76,30 +76,32 @@ Dockerfile              容器镜像（API 与应用镜像，不含编排）
 
 ## 本地开发
 
-Python 3.11+：
+Python 3.11+，从仓库根目录执行。首次启动会自动初始化 SQLite 与股票池（需联网）。
 
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
 
-# 启动 Web 看板与 API（http://127.0.0.1:8600）
+# 1) 启动 Web 看板与 API（http://127.0.0.1:8600）
 .\.venv\Scripts\python.exe -m uvicorn backend.main:app --port 8600
-```
 
-后端单元测试（unittest 风格）：
-
-```powershell
+# 2) 后端单元测试（unittest 风格，离线核心逻辑可跑）
 .\.venv\Scripts\python.exe -m unittest discover -s backend -p "test_*.py" -v
 ```
 
-手动触发一轮模拟盘扫描（示意；需已初始化本地运行时数据缓存，生产由部署侧定时触发）：
+手动触发一轮模拟盘扫描（slot：auction/open/intraday/risk/close/weekly-review）：
 
 ```powershell
 cd backend
 .\.venv\Scripts\python.exe paper_runner.py --slot open
 ```
 
-构建 API 镜像（完整多容器编排与调度属部署细节，不在本仓库提供）：
+可选 LLM 特性（自适应调参证据/顾问）：复制 `.env.example` 为 `.env` 并填入
+`DEEPSEEK_API_KEY` 与 `LLM_ADVISOR_ENABLED=1`；不配置则以基础模式运行。
+
+**完整「clone → 装依赖 → 看板 → 补数据 → 跑扫描」步骤见 [docs/RUNBOOK.md](docs/RUNBOOK.md)。**
+
+构建 API 镜像（仅应用镜像，不含多容器编排与宿主调度）：
 
 ```powershell
 docker build -t astock-codex:latest .

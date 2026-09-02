@@ -49,3 +49,8 @@ Thumbs.db
 *.bak_*
 *.tmp.*
 *.old
+
+# 本机密钥与运行时数据（clone 后自行生成，绝不上传）
+.env
+.env.*
+!.env.example
