@@ -7,6 +7,10 @@ __pycache__
 *.log
 data_cache
 reports
+*.sqlite
+*.sqlite3
+*.db
+*.db-*
 tests
 design-system
 deploy/*.service
