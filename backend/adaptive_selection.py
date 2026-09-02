@@ -725,7 +725,8 @@ def evaluate(conn, profile, config, paper_db_path, now_fn):
     try:
         accounts = [dict(row) for row in paper.execute(
             """SELECT * FROM paper_accounts
-               WHERE id IN ('tq_breakout','trend_pullback','sector_rotation','reported_profit_breakout','main_force_top10')
+               WHERE status!='disabled'
+                 AND id IN ('tq_breakout','trend_pullback','sector_rotation','reported_profit_breakout','main_force_top10')
                ORDER BY id"""
         )]
         for account in accounts:
@@ -847,7 +848,7 @@ def overview(conn, config, paper_db_path):
     if os.path.exists(paper_db_path):
         paper = _paper(paper_db_path)
         try:
-            for row in paper.execute("SELECT id,name,version,params FROM paper_accounts ORDER BY id"):
+            for row in paper.execute("SELECT id,name,version,params FROM paper_accounts WHERE status!='disabled' ORDER BY id"):
                 params = _loads(row["params"], {})
                 meta = params.get("adaptive_selection_meta") or {}
                 if meta.get("status") == "active":
@@ -871,7 +872,7 @@ def overview(conn, config, paper_db_path):
             paper.close()
     return {
         "mode": "模拟盘选股自动进化",
-        "policy": "三套模拟账户可进化因子权重、入场阈值和白名单选股条件；板块热度不足时可提出个股强势路径，趋势模型可提出从抄底切换为趋势延续；结构变更先影子验证并人工确认，公共选股页面不受影响。",
+        "policy": "启用的模拟账户可进化因子权重、入场阈值和白名单选股条件；结构变更先影子验证并人工确认，公共选股页面不受影响。",
         "auto_apply_bounded": bool(config.get("selection_auto_apply_bounded", False)),
         "requirements": _requirements(config, "shadow"),
         "tiers": {
