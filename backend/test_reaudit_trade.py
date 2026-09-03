@@ -34,6 +34,7 @@ class LeaseAndFreshnessTests(unittest.TestCase):
 
     def test_lease_generation_increments_and_stale_owner_is_fenced(self):
         conn = self._lease_conn()
+        self.addCleanup(conn.close)
         first, owner1, _ = P._claim_runtime_lease(
             conn, "test-lock", "worker-a", "risk", ttl_seconds=60
         )
