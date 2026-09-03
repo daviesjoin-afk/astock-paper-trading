@@ -24,14 +24,18 @@ def _result_exit_code(result):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--slot", required=True, choices=["auction", "open", "risk", "close", "weekly-review", "intraday"])
+    parser.add_argument("--slot", required=True, choices=["auction", "open", "risk", "close", "weekly-review", "intraday", "fast-entry"])
     args = parser.parse_args()
 
     # 重试导入和执行（应对数据库锁）
     for attempt in range(5):
         try:
             import paper_trading as paper
-            result = paper.run_slot(args.slot)
+            result = (
+                paper.monitor_fast_entries()
+                if args.slot == "fast-entry"
+                else paper.run_slot(args.slot)
+            )
             print(json.dumps(result, ensure_ascii=False))
             return _result_exit_code(result)
         except Exception as e:

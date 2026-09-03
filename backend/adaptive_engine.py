@@ -737,6 +737,15 @@ def _restore_paper_account(snapshot, account_id, candidate_id, event_name, expec
         # the expected version is deterministic for apply and is read back for
         # rollback before this helper is called.
         if expected_version and str(current["version"] or "") != str(expected_version):
+            # P3 审计修复（E5）：版本不一致时不再静默返回——旧路径 outbox
+            # 已终结、候选已还原但 paper 侧未恢复，双账本分歧无任何告警。
+            print(json.dumps({
+                "alarm": "restore_version_mismatch",
+                "account_id": account_id, "candidate_id": candidate_id,
+                "expected_version": str(expected_version),
+                "current_version": str(current["version"] or ""),
+                "note": "补偿恢复被跳过：paper 账户版本与预期不符，需人工核对双账本",
+            }, ensure_ascii=False), flush=True)
             return
         account = snapshot["account"]
         paper.execute(
@@ -1202,12 +1211,7 @@ def _normalize_genome(weights):
 
 
 def _alpha_dataset(conn, max_rows_per_window=ALPHA_MAX_ROWS_PER_WINDOW):
-    """Build a bounded GA dataset without materializing the full join.
-
-    The mature-return table grows by stock x date x horizon. Loading that
-    complete join before sampling defeated the cap and was the final learning
-    OOM peak. SQLite aggregates centres; Python only receives the cap.
-    """
+    """Build a bounded GA dataset without materializing the full join."""
     cap = max(100, int(max_rows_per_window))
     windows = conn.execute(
         """SELECT start_date,horizon,AVG(forward_return_pct) AS center
@@ -1232,12 +1236,7 @@ def _alpha_dataset(conn, max_rows_per_window=ALPHA_MAX_ROWS_PER_WINDOW):
 
 
 def _alpha_bounded_sample(rows, max_rows_per_window=ALPHA_MAX_ROWS_PER_WINDOW):
-    """Deterministically cap each date/horizon cross-section for the GA lab.
-
-    Stored ranks and returns remain complete. Only the repeated shadow-search
-    fitness pass is sampled; keeping every 5,500-stock cross-section in each of
-    hundreds of genome evaluations caused allocator growth and OOM restarts.
-    """
+    """Deterministically cap each date/horizon cross-section for the GA lab."""
     grouped = defaultdict(list)
     for row in rows:
         grouped[(row["profile_date"], row["horizon"])].append(row)
@@ -1819,8 +1818,6 @@ def run_learning_cycle(trigger="manual"):
                 "status": "failed",
                 "error": f"{type(exc).__name__}: {exc}",
             }
-        # Attribution may transiently load historical frames. Release arenas
-        # before the independent alpha pass so the two peaks never add up.
         gc.collect()
         try:
             import ctypes
@@ -2295,14 +2292,11 @@ def _sync_evidence_chains(conn):
         for row in paper.execute("SELECT id,order_id,quote_at FROM paper_fills ORDER BY id"):
             fills_by_order[int(row["order_id"])].append(dict(row))
         decisions = defaultdict(list)
-        for row in paper.execute(
-            "SELECT id,account_id,code,side,created_at FROM paper_risk_decisions ORDER BY id"
-        ):
+        for row in paper.execute("SELECT id,account_id,code,side,created_at FROM paper_risk_decisions ORDER BY id"):
             decisions[(row["account_id"], row["code"], row["side"])].append(dict(row))
 
-        actual = counterfactual = valid = linked = 0
+        actual = counterfactual = valid = linked = total = 0
         now = _now()
-        total = 0
         for raw_order in orders:
             total += 1
             order = dict(raw_order)
