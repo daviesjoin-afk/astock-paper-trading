@@ -39,6 +39,7 @@ import evolution_adversarial as adversarial
 import dual_ai_tuner
 import self_evolution
 import paper_ledger_reader as paper_reader
+from strategy_registry import labels as strategy_labels
 from adaptive_common import _now, _json, _loads, _clamp  # C3: 收敛重复工具函数
 try:
     import modlens_bridge
@@ -120,13 +121,7 @@ ALPHA_MAX_ROWS_PER_WINDOW = max(200, int(os.getenv("ALPHA_MAX_ROWS_PER_WINDOW", 
 DISCLOSURE_MAX_CODES = 150
 DISCLOSURE_CACHE_TTL_SECONDS = 6 * 60 * 60
 DISCLOSURE_REFRESH_AFTER = dt.time(15, 15)
-ACCOUNT_LABELS = {
-    "tq_breakout": "短线日内做T",
-    "trend_pullback": "趋势波段优选",
-    "sector_rotation": "板块轮动先锋",
-    "reported_profit_breakout": "三日策略",
-    "main_force_top10": "超强主力股",
-}
+ACCOUNT_LABELS = strategy_labels()
 REGIME_LABELS = {
     "momentum": "资金共振·动量扩张",
     "rotation": "板块轮动·结构分化",

@@ -24,6 +24,7 @@
 - [x] M3f：抽出持仓 lot 到聚合读模型的纯计算，保持 `paper_trading._position_rows` 的输出兼容。
 - [x] M3g：抽出行情代码、时间戳、行情行与 K 线 DataFrame 的无副作用标准化，保持 `data_fetcher` 旧入口兼容。
 - [x] M3h：为 adaptive 读取 paper ledger 提供 `mode=ro/query_only` 只读端口，保留明确的补偿写路径。
+- [x] M3i：建立策略身份 registry，统一 active/legacy 标签展示，不改变现有调度。
 - [ ] M3：本地 P2/P3/P4/P5 按小步提交完成，保持 API/交易语义兼容。
 - [x] M4：2026-09-03 将本地验收通过的同一版本部署到服务器并保留备份/回滚点。
 - [ ] M4a：2026-09-04 完成服务器健康、进程、数据库、模拟周期测试。

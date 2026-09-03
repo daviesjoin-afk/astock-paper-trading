@@ -16,6 +16,7 @@ import sqlite3
 from collections import defaultdict
 
 import data_fetcher as dfc
+from strategy_registry import labels as strategy_labels
 
 
 BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -24,13 +25,7 @@ VERSION = "paper-research-shadow-v1"
 HORIZONS = (1, 3, 5, 10, 20)
 CHINA_TZ = dt.timezone(dt.timedelta(hours=8))
 
-STRATEGY_NAMES = {
-    "tq_breakout": "短线日内做T",
-    "trend_pullback": "趋势波段优选",
-    "sector_rotation": "板块轮动先锋",
-    "reported_profit_breakout": "三日策略",
-    "main_force_top10": "超强主力股",
-}
+STRATEGY_NAMES = strategy_labels()
 
 
 def _now() -> str:
