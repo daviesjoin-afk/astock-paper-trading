@@ -1,0 +1,53 @@
+name: Feature proposal
+description: Propose a focused improvement to the research or paper-trading infrastructure
+title: "[Feature] "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Proposals are easiest to review when they describe the research or engineering problem first, then the smallest change that solves it.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem to solve
+      description: What limitation, failure mode or research need does this address?
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed change
+      description: Describe the behavior or interface you would add or change.
+    validations:
+      required: true
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - Market-data adapter
+        - Execution / matching
+        - Risk control
+        - Strategy interface
+        - Audit / replay
+        - Testing / reproducibility
+        - Web / API
+        - Documentation
+        - Other
+    validations:
+      required: true
+
+  - type: textarea
+    id: invariants
+    attributes:
+      label: Safety and compatibility considerations
+      description: Explain any impact on T+1, lot size, price limits, quote freshness, shared capital, point-in-time data or audit semantics.
+
+  - type: textarea
+    id: validation
+    attributes:
+      label: Suggested validation
+      description: What regression tests or replay cases should prove the change works safely?
