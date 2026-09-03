@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import re
 
+import pandas as pd
+
 
 def parse_tencent_realtime_text(text, *, attempt=1, allowed_codes=None):
     """解析腾讯 ``qt.gtimg.cn`` 文本响应。"""
@@ -87,3 +89,70 @@ def parse_sina_realtime_text(text, *, allowed_codes=None):
             "source": "sina_public_quote",
         }
     return list(rows_by_code.values())
+
+
+def parse_tencent_kline_rows(raw):
+    """解析腾讯日线数组并估算成交额/振幅。"""
+    rows = []
+    previous_close = None
+    for item in raw or []:
+        if len(item) < 6:
+            continue
+        date, open_, close, high, low, volume = item[:6]
+        open_, close, high, low, volume = map(float, (open_, close, high, low, volume))
+        typical = (open_ + close + high + low) / 4
+        amplitude_base = previous_close or close
+        rows.append({
+            "date": date,
+            "open": open_,
+            "close": close,
+            "high": high,
+            "low": low,
+            "volume": volume,
+            "amount": volume * 100 * typical,
+            "amplitude": (high - low) / amplitude_base * 100 if amplitude_base else None,
+        })
+        previous_close = close
+    return rows
+
+
+def parse_sina_kline_rows(payload, beg, end):
+    """解析新浪不复权日线并按请求区间过滤。"""
+    start = pd.Timestamp(str(beg))
+    finish = pd.Timestamp(str(end))
+    rows = []
+    for item in payload or []:
+        date = pd.Timestamp(item.get("day"))
+        if date < start or date > finish:
+            continue
+        open_ = float(item["open"])
+        close = float(item["close"])
+        high = float(item["high"])
+        low = float(item["low"])
+        volume = float(item["volume"])
+        typical = (open_ + close + high + low) / 4
+        rows.append({
+            "date": str(date.date()),
+            "open": open_,
+            "close": close,
+            "high": high,
+            "low": low,
+            "volume": volume,
+            "amount": volume * typical,
+            "amplitude": (high - low) / close * 100 if close else None,
+        })
+    return rows
+
+
+def parse_eastmoney_kline_rows(klines):
+    """解析东财逗号分隔日线数组。"""
+    rows = []
+    for kline in klines or []:
+        parts = kline.split(",")
+        rows.append({
+            "date": parts[0], "open": float(parts[1]), "close": float(parts[2]),
+            "high": float(parts[3]), "low": float(parts[4]),
+            "volume": float(parts[5]), "amount": float(parts[6]),
+            "amplitude": float(parts[7]) if len(parts) > 7 else None,
+        })
+    return rows
