@@ -10,15 +10,10 @@ import sqlite3
 import statistics
 
 import strategies as S
+from strategy_registry import labels as strategy_labels
 from adaptive_common import _loads, _json, _clamp  # C3: 收敛重复工具函数
 
-ACCOUNT_NAMES = {
-    "tq_breakout": "短线日内做T",
-    "trend_pullback": "趋势波段优选",
-    "sector_rotation": "板块轮动先锋",
-    "reported_profit_breakout": "三日策略",
-    "main_force_top10": "超强主力股",
-}
+ACCOUNT_NAMES = strategy_labels()
 ACCOUNT_MODELS = {
     "tq_breakout": "one_to_two",
     "trend_pullback": "bottom_reversal",
