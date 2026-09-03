@@ -130,6 +130,100 @@ def fetch_eastmoney_clist(
     return meta if return_meta else rows
 
 
+def fetch_eastmoney_concept_members(
+    *,
+    get_json,
+    hosts,
+    board_code,
+    ut,
+    quote_at,
+    finite_number,
+    max_pages=8,
+):
+    """Fetch and normalize one Eastmoney concept board's reported members.
+
+    This remains an adapter: callers inject transport and domain normalizers,
+    while the adapter guarantees that a capped or failed page set is marked
+    incomplete instead of being silently promoted to strategy evidence.
+    """
+    fields = "f2,f3,f8,f10,f12,f14,f62,f66,f100,f124,f184"
+    host_list = list(hosts)
+
+    def _one_page(page):
+        params = {
+            "pn": page, "pz": 100, "po": 1, "np": 1, "fltt": 2, "invt": 2,
+            "ut": ut, "fid": "f62", "fs": f"b:{board_code}+f:!50",
+            "fields": fields,
+        }
+        for host in host_list:
+            try:
+                payload = get_json(
+                    f"https://{host}/api/qt/clist/get", params,
+                    timeout=5, retries=0,
+                )
+                data = (payload or {}).get("data") or {}
+                rows = data.get("diff") or []
+                if rows:
+                    return rows, int(data.get("total") or len(rows)), True
+            except Exception:
+                continue
+        return [], 0, False
+
+    first, total, ok = _one_page(1)
+    if not ok:
+        return {
+            "members": [], "expected_count": 0, "pages_ok": 0,
+            "pages_expected": 0, "complete": False,
+        }
+    pages_expected = max(1, (total + 99) // 100)
+    pages_to_fetch = min(pages_expected, max(1, int(max_pages)))
+    results = {1: first}
+    if pages_to_fetch > 1:
+        with ThreadPoolExecutor(max_workers=min(4, pages_to_fetch - 1)) as pool:
+            futures = {
+                pool.submit(_one_page, page): page
+                for page in range(2, pages_to_fetch + 1)
+            }
+            for future in as_completed(futures):
+                page = futures[future]
+                try:
+                    rows, _, page_ok = future.result()
+                except Exception:
+                    rows, page_ok = [], False
+                if page_ok:
+                    results[page] = rows
+
+    members, seen, malformed = [], set(), 0
+    for page in sorted(results):
+        for item in results[page]:
+            code = str(item.get("f12") or "")
+            price = finite_number(item.get("f2"))
+            pct = finite_number(item.get("f3"))
+            if not code or code in seen or price is None or pct is None:
+                malformed += 1
+                continue
+            seen.add(code)
+            members.append({
+                "code": code, "name": item.get("f14"), "price": price, "pct": pct,
+                "turnover": finite_number(item.get("f8")),
+                "vol_ratio": finite_number(item.get("f10")), "industry": item.get("f100"),
+                "main_net": finite_number(item.get("f62")),
+                "super_net": finite_number(item.get("f66")),
+                "main_pct": finite_number(item.get("f184")),
+                "quote_ts": item.get("f124"), "quote_at": quote_at(item.get("f124")),
+            })
+    complete = (
+        pages_expected <= max_pages
+        and len(results) == pages_expected
+        and len(members) >= max(1, total - malformed)
+    )
+    return {
+        "members": members, "expected_count": total, "fetched_count": len(members),
+        "pages_ok": len(results), "pages_expected": pages_expected,
+        "malformed_rows": malformed, "complete": bool(complete),
+    }
+
+
 def parse_tencent_realtime_text(text, *, attempt=1, allowed_codes=None):
     """解析腾讯 ``qt.gtimg.cn`` 文本响应。"""
     allowed = {str(code) for code in allowed_codes} if allowed_codes is not None else None
