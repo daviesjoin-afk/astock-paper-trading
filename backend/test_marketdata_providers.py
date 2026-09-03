@@ -53,6 +53,18 @@ class MarketDataProviderParserTests(unittest.TestCase):
         self.assertEqual(result["pages_expected"], 2)
         self.assertFalse(result["complete"])
 
+    def test_concept_ref_parser_filters_non_theme_and_duplicate_boards(self):
+        refs = providers.parse_eastmoney_concept_refs(
+            {
+                "one": {"f12": "BK0001", "f14": "液冷服务器"},
+                "duplicate": {"f12": "BK0001", "f14": "液冷服务器"},
+                "excluded": {"f12": "BK0002", "f14": "沪股通"},
+                "non_board": {"f12": "000001", "f14": "平安银行"},
+            },
+            excluded_tokens=("沪股通",),
+        )
+        self.assertEqual(refs, [{"code": "BK0001", "name": "液冷服务器"}])
+
     def test_tencent_parser_uses_timestamp_and_allowed_codes(self):
         parts = [""] * 33
         parts[1] = "平安银行"

@@ -358,18 +358,9 @@ def _fetch_stock_concept_refs(code):
             payload = _get_json(f"https://{host}/api/qt/slist/get", params,
                                 timeout=5, retries=0)
             rows = ((payload or {}).get("data") or {}).get("diff") or []
-            if isinstance(rows, dict):
-                rows = rows.values()
-            refs = []
-            seen = set()
-            for row in rows:
-                board_code = str(row.get("f12") or "")
-                name = str(row.get("f14") or "").strip()
-                if (not board_code.startswith("BK") or not name or board_code in seen
-                        or any(token in name for token in _NON_THEME_CONCEPT_TOKENS)):
-                    continue
-                seen.add(board_code)
-                refs.append({"code": board_code, "name": name})
+            refs = MP.parse_eastmoney_concept_refs(
+                rows, excluded_tokens=_NON_THEME_CONCEPT_TOKENS,
+            )
             if refs:
                 return refs
         except Exception:

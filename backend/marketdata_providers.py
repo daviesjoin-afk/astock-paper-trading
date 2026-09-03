@@ -224,6 +224,26 @@ def fetch_eastmoney_concept_members(
     }
 
 
+def parse_eastmoney_concept_refs(rows, *, excluded_tokens=()):
+    """Normalize a stock-to-concept response without inferring theme tags."""
+    if isinstance(rows, dict):
+        rows = rows.values()
+    refs, seen = [], set()
+    for row in rows or []:
+        board_code = str(row.get("f12") or "")
+        name = str(row.get("f14") or "").strip()
+        if (
+            not board_code.startswith("BK")
+            or not name
+            or board_code in seen
+            or any(token in name for token in excluded_tokens)
+        ):
+            continue
+        seen.add(board_code)
+        refs.append({"code": board_code, "name": name})
+    return refs
+
+
 def parse_tencent_realtime_text(text, *, attempt=1, allowed_codes=None):
     """解析腾讯 ``qt.gtimg.cn`` 文本响应。"""
     allowed = {str(code) for code in allowed_codes} if allowed_codes is not None else None
