@@ -10,6 +10,7 @@ logs/
 *.db-*
 .swapfile
 .locks/
+.codex/
 .codex-test-tmp/
 .staging/
 .staging-*/
