@@ -38,6 +38,7 @@ import neural_shadow
 import evolution_adversarial as adversarial
 import dual_ai_tuner
 import self_evolution
+import paper_ledger_reader as paper_reader
 from adaptive_common import _now, _json, _loads, _clamp  # C3: 收敛重复工具函数
 try:
     import modlens_bridge
@@ -700,8 +701,7 @@ def _paper_account_snapshot(account_id):
     """Capture only the paper rows touched by an evolution apply/rollback."""
     if not os.path.exists(PAPER_DB_PATH):
         return None
-    paper = sqlite3.connect(PAPER_DB_PATH, timeout=30)
-    paper.row_factory = sqlite3.Row
+    paper = paper_reader.connect(PAPER_DB_PATH, timeout=30)
     try:
         account = paper.execute(
             "SELECT id,params,version,updated_at FROM paper_accounts WHERE id=?", (account_id,)
@@ -787,7 +787,7 @@ def _restore_paper_account(snapshot, account_id, candidate_id, event_name, expec
 def _paper_current_version(account_id):
     if not os.path.exists(PAPER_DB_PATH):
         return None
-    paper = sqlite3.connect(PAPER_DB_PATH, timeout=30)
+    paper = paper_reader.connect(PAPER_DB_PATH, timeout=30)
     try:
         row = paper.execute("SELECT version FROM paper_accounts WHERE id=?", (account_id,)).fetchone()
         return row[0] if row else None
@@ -833,7 +833,7 @@ def _manual_apply_gate(kind, candidate_snapshot, account_id):
     candidate_version = str(evidence.get("strategy_version") or "")
     if not candidate_version:
         raise ValueError("候选缺少生成时的策略版本，请重新生成")
-    with sqlite3.connect(PAPER_DB_PATH, timeout=30) as paper:
+    with paper_reader.connect(PAPER_DB_PATH, timeout=30) as paper:
         row = paper.execute("SELECT version FROM paper_accounts WHERE id=?", (account_id,)).fetchone()
     if not row or str(row[0] or "") != candidate_version:
         raise ValueError("策略版本已变化，请重新生成候选")
@@ -1415,8 +1415,7 @@ def _reward_regime(conn, start_date):
 def _evaluate_rewards(conn):
     if not os.path.exists(PAPER_DB_PATH):
         return 0
-    paper = sqlite3.connect(PAPER_DB_PATH, timeout=30)
-    paper.row_factory = sqlite3.Row
+    paper = paper_reader.connect(PAPER_DB_PATH, timeout=30)
     try:
         accounts = [row[0] for row in paper.execute("SELECT id FROM paper_accounts ORDER BY id")]
         # A cycle reset deletes paper_nav history but previously accumulated
@@ -2270,8 +2269,7 @@ def _sync_evidence_chains(conn):
     """
     if not os.path.exists(PAPER_DB_PATH):
         return {"orders": 0, "linked": 0, "valid": 0, "actual": 0, "counterfactual": 0}
-    paper = sqlite3.connect(PAPER_DB_PATH, timeout=30)
-    paper.row_factory = sqlite3.Row
+    paper = paper_reader.connect(PAPER_DB_PATH, timeout=30)
     try:
         orders = paper.execute(
             """SELECT id,account_id,code,side,signal_id,status,reason,created_at,executed_at,
@@ -2713,8 +2711,7 @@ def _portfolio_shadow_arbitration():
             "mode": "shadow", "version": "portfolio-arbiter-v1", "candidates": [],
             "reason": "paper_db_missing", "risk_metrics": _portfolio_shadow_risk([]),
         }
-    paper = sqlite3.connect(PAPER_DB_PATH, timeout=30)
-    paper.row_factory = sqlite3.Row
+    paper = paper_reader.connect(PAPER_DB_PATH, timeout=30)
     try:
         positions = [dict(row) for row in paper.execute(
             "SELECT account_id,code,name,industry,qty,cost FROM paper_positions WHERE qty>0"
@@ -2826,9 +2823,8 @@ def _disclosure_scope_codes(day: dt.date) -> list[str]:
         return []
     codes: list[str] = []
     seen: set[str] = set()
-    paper = sqlite3.connect(PAPER_DB_PATH, timeout=8)
+    paper = paper_reader.connect(PAPER_DB_PATH, timeout=8)
     try:
-        paper.row_factory = sqlite3.Row
         queries = (
             "SELECT code FROM paper_positions WHERE qty>0 ORDER BY account_id,code LIMIT ?",
             """SELECT code FROM paper_signals
@@ -2993,8 +2989,7 @@ def _execution_evidence_state(conn, day: dt.date | None = None, *, persist: bool
     if not os.path.exists(PAPER_DB_PATH):
         state["ledger_replay"] = {"status": "missing_paper_ledger", "errors": [], "warnings": []}
         return state
-    paper = sqlite3.connect(PAPER_DB_PATH, timeout=30)
-    paper.row_factory = sqlite3.Row
+    paper = paper_reader.connect(PAPER_DB_PATH, timeout=30)
     try:
         signal_rows = paper.execute(
             "SELECT payload FROM paper_signals WHERE signal_date=? OR intended_date=?",
@@ -3133,7 +3128,7 @@ def _data_input_state(conn):
     major_events = conn.execute("SELECT COUNT(*) FROM market_major_events").fetchone()[0]
     paper_counts = {"orders": 0, "fills": 0, "risk_decisions": 0, "nav_days": 0}
     if os.path.exists(PAPER_DB_PATH):
-        paper = sqlite3.connect(PAPER_DB_PATH, timeout=30)
+        paper = paper_reader.connect(PAPER_DB_PATH, timeout=30)
         try:
             paper_counts = {
                 "orders": paper.execute("SELECT COUNT(*) FROM paper_orders").fetchone()[0],
