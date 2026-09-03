@@ -1,182 +1,201 @@
 # A 股量化模拟盘引擎
 
-本地优先的 A 股**模拟盘**量化研究引擎。当前公开运行版本启用两套策略（`tq_breakout`、`main_force_top10`），共用一套撮合、分层风控、资金分配与审计引擎；覆盖竞价预选、开盘审批、盘中风控与日内调仓、收盘信号生成与周度复盘全流程，并带 Web 看板与自进化观测。系统**不连接任何券商、不触碰真实资金**，成交全部为带全路径交易约束的模拟成交。
+[English](README_EN.md) · 中文
 
-本仓库只包含源码与架构说明，不含部署编排、运维脚本、任何主机信息与运行时数据。
+[![CI](https://github.com/daviesjoin-afk/astock-paper-trading/actions/workflows/ci.yml/badge.svg)](https://github.com/daviesjoin-afk/astock-paper-trading/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Python 3.11+](https://img.shields.io/badge/Python-3.11%2B-blue.svg)](https://www.python.org/)
 
-## 当前阶段边界
+> **Local-first A-share paper-trading research infrastructure with T+1-aware execution, multi-source quote validation, layered risk controls and replayable audit trails.**
 
-- **纯模拟**：撮合发生在引擎内部，无券商接口、无实盘路由；模拟盘净值仅供策略与风控研究。
-- **A 股规则硬门禁**：T+1 锁定、最小 100 股整手、跌停不可卖/涨停不可买/停牌不可成交、佣金与印花税、买卖滑点全路径校验；异常行情（陈旧/缺失报价）默认拒绝而非放宽成交。
-- **盘中自动运行由外部调度触发**：引擎按 `auction / open / risk / intraday / close / weekly-review` 六类 slot 工作；交易日盘中 `intraday` 周期扫描，收盘后固化候选与快照。仓库不附带调度表，由部署侧自行编排。
-- **写入串行化**：多进程扫描通过「全局运行时租约 + fencing token + 心跳续期 + 完成 CAS」保证同一时刻只有一个写者；进程被杀或挂死可被自动回收，不产生重复订单、不留幽灵租约。
-- **不做的事**：不加杠杆、不做空、不做 T+0 回转（当日买入当日卖出）、不追一字板、不让“单只强势但板块不共振”的标的进入板块轮动仓位。
-- **可回放**：信号、风控决策、订单、成交、NAV、每轮扫描结果全部留痕，可按时间逐轮回放审计，用于定位历史行为偏差。
+一个面向中国 A 股微观交易规则的、本地优先的**模拟盘与量化研究基础设施**。项目把 T+1、整手、涨跌停、停牌、行情时效、费用/滑点、风险决策与审计回放直接放进撮合路径，而不是在回测结束后再做近似修正。
 
-## 当前启用策略
+系统**不连接券商、不触碰真实资金**。公开仓库只包含源码、容器配置和脱敏文档，不包含真实持仓、运行时数据库、服务器凭据或 API Key。
 
-新周期只会创建并运行以下两套独立策略账户，各有独立的入场车道、席位上限与退出规则。历史周期中的旧策略账户和审计记录保留可读，但不会再进入新周期或调度运行：
+## 为什么做这个项目
 
-| 账户 | 风格 | 定位 |
+很多通用 backtesting / paper-trading 框架默认“信号出现后就能成交”，但 A 股的实际可交易性受市场规则和数据质量强约束。这个项目的目标不是再做一个选股脚本，而是提供一套**可以复现、拒绝错误成交、事后可审计**的 A 股研究执行层。
+
+- **A 股规则是一等约束**：股票 T+1、100 股整手、涨跌停、停牌、佣金、印花税和滑点都进入下单校验。
+- **行情默认 fail-closed**：陈旧、缺失或覆盖率不足的行情不会被静默拼接成“实时价格”；证据不足时宁可拒绝模拟成交。
+- **决策链可回放**：信号 → 风控 → 订单 → 成交 → NAV → 扫描结果全部留痕，可定位历史行为偏差。
+- **并发写入有明确语义**：运行时租约、heartbeat、fencing token 与 CAS 防止重复订单、僵尸写者和并发覆盖。
+- **研究与正式撮合隔离**：自适应、新闻和 LLM 相关能力首先作为影子证据流，不因为研究模块异常而放宽正式交易门禁。
+
+## 当前公开范围
+
+当前新周期只启用两套独立策略账户；历史策略数据可保留用于回放，但不会进入新的正式调度。
+
+| 策略 | 风格 | 主要用途 |
 |---|---|---|
-| `tq_breakout` | 强势突破 | 放量突破、主力资金共振的短线打板/强势候选 |
-| `main_force_top10` | 主力资金 | 主力净流入居前标的的跟随 |
+| `tq_breakout` | 强势突破 | 放量、资金共振后的短周期突破候选 |
+| `main_force_top10` | 主力资金 | 跟踪主力净流入靠前、通过实时确认的候选 |
 
-模拟周期设置支持总资金池、周期长度（1–365 个交易日）和交易风格：激进、宽松、平缓。风格只调整有界的软阈值与仓位节奏，T+1、涨跌停、行情新鲜度、实时覆盖率、席位/资金硬上限和止损门禁始终有效。
+两套策略共用撮合、共享资金池、风控与审计基础设施，但拥有独立的候选车道、仓位席位和退出规则。
 
-## 核心设计
+**明确不做：** 实盘路由、杠杆、做空，以及普通股票的 T+0 当日买卖回转。
 
-### 撮合与资金模型
+## 核心能力
 
-- 共享资金池按账户做预算归因（席位最大持仓数 + 单票预算），含公平性保护与地板保护，防止策略间互相挤占；资金预留与扣款分离，配合 SQLite savepoint 保证并发下单不双扣。
-- 仓位计算做价格感知（涨跌幅/停牌/滑点后的可买量），预算缩水不静默放大成一手空转仓。
+### 1. 撮合与资金模型
 
-### 分层卖出状态机
+- 共享资金池按策略做预算归因，包含席位上限、单票预算、公平性保护和资金硬上限。
+- 资金预留与正式扣款分离，配合 SQLite savepoint，避免并发扫描下重复占用资金。
+- 下单前校验证券权限、行情新鲜度、涨跌停/停牌、整手、滑点和可买数量。
 
-同一只持仓可能被多重退出规则触发，按优先级依次评估（权限 → 容量 → 质量轮换 → 集中度守卫 → 常规退出）：
+### 2. 分层风险状态机
 
-- **下行守卫三道防线**：预警一次性减仓 → 连续两次独立扫描确认（按级别去重）→ 跌破确认全清；杜绝“同一理由每分钟重复卖”。
-- **硬止损**：首触止损线先减一部分，后续仍在线下则全清；崩盘形态直接全清。
-- **止盈**：移动止损 + 阶梯止盈（跳空越档单轮连续消费，不拖到下一轮）。
-- **轮换退出**：席位已满时按质量评分择强换股、按集中度轮换、按容量压缩超额持仓；退出原因结构化落单。
+- 每笔买卖先经过独立风控层，产生结构化的 `approved`、`rejected`、`deferred_capacity`、`downside_warning` 等结果。
+- 下行保护采用分段减仓 → 独立扫描确认 → 全清的状态机，避免同一理由反复卖出。
+- 支持硬止损、移动止损、阶梯止盈、质量轮换、容量压缩和集中度守卫。
+- 风控原因使用稳定标记和审计台账，避免仅依赖人类可读文案做历史归因。
 
-### 风控与数据
+### 3. 多源行情与数据质量
 
-- 每笔买卖先过独立风控决策层，形成 `rejected / approved / deferred_capacity / downside_warning` 等结构化决策并留痕；`risk_decisions` 与 `audit` 双台账可交叉核对。
-- 实时行情多源抓取（东财 ulist、腾讯、新浪独立核验），**价格防陈旧**：宁可标记缺失/拒绝成交，也不把缓存旧价拼到实时时间戳上制造“看似通过的成交”；全市场快照带覆盖率门禁（不足 4,000 只实时价即熔断放行）。
+- 公开行情源采用多源抓取和独立核验。
+- 实时价格具有明确时间戳和来源；缓存旧价不会伪装成实时行情。
+- 全市场快照设置覆盖率门禁，数据不完整时阻断依赖全市场截面的正式路径。
+- 数据源故障优先降级信号丰富度或阻断对应路径，而不是降低风险门槛。
 
-### 并发与状态机
+### 4. 并发与调度
 
-- `run_slot` 统一受理六类 slot；租约过期/心跳丢失自动回收僵尸，fencing token 保证后写者不能覆盖先写者。
-- 入场时机 `entry_timing` 状态机管理候选（观察 → 连续确认 → 放行/失效），避免单次脉冲信号直接成交。
+引擎统一支持：
 
-### 自进化观测（影子，不直接改实盘）
+`auction / open / risk / intraday / close / weekly-review`
 
-`adaptive_*`、`news_learning`、`neural_shadow`、`dual_ai_tuner` 等在盘中/盘后保存观测与影子权重，用于参数研究；观测写入不影响真实撮合路径，只作为独立证据流。
+六类 slot。
 
-## 目录结构
+一键启动默认启用内置的 **3 分钟盘中模拟盘调度器**；如果部署侧已经有完整宿主机计划任务，可关闭内置调度，避免重复执行。运行时租约 + heartbeat + fencing token 保证同一批次只由有效写者推进。
+
+### 5. 审计与研究
+
+信号、候选、风险决策、订单、成交、持仓、NAV 和逐轮扫描结果都会形成可追踪证据。`adaptive_*`、`news_learning`、`neural_shadow`、`dual_ai_tuner` 等研究模块保存独立影子观测，不直接绕过正式撮合路径。
+
+## 项目结构
 
 ```text
 backend/
-  paper_trading.py      模拟盘撮合/风控/审计主引擎（租约、风控决策、下单、NAV、slot 调度）
-  paper_runner.py       slot 命令行入口（auction/open/risk/intraday/close/weekly-review）
-  data_fetcher.py       行情/快照/公告多源数据层（本地缓存 + 覆盖率门禁）
+  paper_trading.py      撮合 / 风控 / 审计 / 资金 / slot 调度主引擎
+  paper_runner.py       auction/open/risk/intraday/close/weekly-review CLI
+  data_fetcher.py       行情、快照、公告与数据质量
   entry_timing.py       入场时机状态机
-  decision_engine.py    车道/因子判定与实时确认
-  strategies.py         策略定义与候选车道
-  adaptive_*.py         自进化观测/调参（影子）
-  news_learning.py      新闻舆情学习
+  decision_engine.py    候选车道、因子判定与实时确认
+  strategies.py         策略定义
+  adaptive_*.py         影子观测与参数研究
+  news_learning.py      新闻证据研究
   api_*.py              HTTP API
-  main.py               FastAPI 入口（伺服前端 + 看板/操作端点）
-  test_*.py             单元测试（unittest）
-frontend/               Web 看板（账户/持仓/风控/审计回放；静态资源）
-Dockerfile              容器镜像（API 与应用镜像，不含编排）
+  main.py               FastAPI + Web 看板入口
+  test_*.py             回归测试
+frontend/               Web 看板与审计界面
+.github/workflows/       GitHub Actions CI
+Dockerfile              应用镜像
+docker-compose.yml      本地/单机容器运行
 ```
 
 ## 一键启动
 
-仓库根目录提供跨平台启动脚本。脚本会优先尝试 Docker Compose；Docker 不可用时自动切换到本地 Python 虚拟环境，首次运行自动创建 `.venv` 并按 `requirements.txt` 安装依赖。启动成功后会打开 Web 看板，并默认启用内置的 3 分钟模拟盘调度器（仅在交易时段运行盘中监控与风控扫描）；脚本只启动服务，不会自动创建模拟交易周期。
+要求：**Python 3.11+**。Docker 可选。
 
-Windows：双击 [start.bat](start.bat)，或在 PowerShell 中运行：
+### Windows
 
 ```powershell
-.\start.ps1                 # 自动选择 Docker，失败后使用本地模式
-.\start.ps1 -Local          # 强制本地 Python 模式
-.\start.ps1 -Docker         # 强制 Docker Compose（端口固定为 8600）
-.\start.ps1 -Port 8601      # 使用自定义端口时自动使用本地模式
+.\start.ps1                 # 自动选择 Docker；失败后回退本地模式
+.\start.ps1 -Local          # 强制本地 Python
+.\start.ps1 -Docker         # 强制 Docker Compose
+.\start.ps1 -Port 8601      # 自定义端口
 .\start.ps1 -NoBrowser      # 不自动打开浏览器
-.\start.ps1 -NoScheduler    # 关闭内置调度（仅适用于已有外部调度器）
+.\start.ps1 -NoScheduler    # 已有外部调度器时关闭内置调度
 ```
 
-Linux/macOS：
+也可以直接双击 `start.bat`。
+
+### Linux / macOS
 
 ```bash
 chmod +x start.sh
-./start.sh                  # 自动选择 Docker 或本地模式
+./start.sh
 ./start.sh --local --port 8601 --no-browser
-./start.sh --no-scheduler  # 关闭内置调度（仅适用于已有外部调度器）
+./start.sh --no-scheduler
 ```
 
-启动脚本不包含密钥、服务器配置或运行时记录；`.env`、`.venv`、`data_cache/` 与 `reports/` 均只保留在本机。Docker 模式使用仓库专用的命名卷，从空账本开始，不会连接其他实例的数据卷。
+启动 Web/API 后访问 `http://localhost:8600`。启动服务本身不会自动创建新的模拟交易周期。
 
-若不使用启动脚本而直接运行 `uvicorn`，需要先设置 `ASTOCK_ENABLE_FALLBACK_THREADS=1` 才会启用同一套内置调度；使用宿主机计划任务时将其设为 `0`，避免两个调度器重复抢占同一批次。
+完整的 **clone → 安装依赖 → 看板 → 数据准备 → 手动扫描** 流程见 [`docs/RUNBOOK.md`](docs/RUNBOOK.md)。
 
-## 本地开发
-
-Python 3.11+，从仓库根目录执行。以下是手动启动方式，适合开发和调试。
-
-```powershell
-python -m venv .venv
-.\.venv\Scripts\python.exe -m pip install -r requirements.txt
-
-# 1) 启动 Web 看板与 API（http://localhost:8600）
-.\.venv\Scripts\python.exe -m uvicorn backend.main:app --port 8600
-
-# 2) 后端单元测试（unittest 风格，离线核心逻辑可跑）
-.\.venv\Scripts\python.exe -m unittest discover -s backend -p "test_*.py" -v
-```
-
-手动触发一轮模拟盘扫描（slot：auction/open/intraday/risk/close/weekly-review）：
-
-```powershell
-cd backend
-.\.venv\Scripts\python.exe paper_runner.py --slot open
-```
-
-可选 LLM 特性（自适应调参证据/顾问）：复制 `.env.example` 为 `.env` 并填入
-`DEEPSEEK_API_KEY` 与 `LLM_ADVISOR_ENABLED=1`；不配置则以基础模式运行。
-
-**完整「clone → 装依赖 → 看板 → 补数据 → 跑扫描」步骤见 [docs/RUNBOOK.md](docs/RUNBOOK.md)。**
-
-构建 API 镜像（仅应用镜像，不含多容器编排与宿主调度）：
-
-```powershell
-docker build -t astock-codex:latest .
-```
-
-## Docker 运行
-
-仓库同时提供单容器镜像和 Compose 配置。仓库不包含任何本机模拟成交、持仓、审计或自进化记录；首次启动会在新的 `astock_repo_data` / `astock_repo_reports` 卷中从空账本开始。之后这些卷会持久化当前实例的运行数据，容器重建不会丢失这些数据，也不会自动连接旧的私有 `astock_data` / `astock_reports` 卷。
+## 本地开发与验证
 
 ```bash
-# 构建并启动 Web 看板/API
-docker compose up -d --build
+python -m venv .venv
+# 激活对应平台的虚拟环境后：
+python -m pip install -r requirements.txt
 
-# 查看启动日志
-docker compose logs -f app
-
-# 打开 http://localhost:8600
+python -m uvicorn backend.main:app --port 8600
+python -m unittest discover -s backend -p "test_*.py" -v
 ```
 
-停止服务但保留数据：
+手动运行一个 slot：
+
+```bash
+cd backend
+python paper_runner.py --slot open
+```
+
+GitHub Actions 会在 **Python 3.11 / 3.12** 上执行后端回归测试。测试覆盖撮合门禁、point-in-time 数据、行情新鲜度、风险审计、并发租约、策略入场、共享资金与回放相关行为。
+
+## Docker
+
+```bash
+docker compose up -d --build
+docker compose logs -f app
+```
+
+停止但保留模拟盘数据：
 
 ```bash
 docker compose down
 ```
 
-连同模拟盘运行数据一起重置（不可恢复，请确认后执行）：
+重置当前容器实例的模拟盘数据：
 
 ```bash
 docker compose down -v
 ```
 
-也可以不使用 Compose 直接运行镜像：
+Docker 使用仓库专用命名卷，不会自动连接其他实例的私有运行时数据库。
 
-```bash
-docker build -t astock-codex:latest .
-docker run --rm -p 8600:8600 -v astock_repo_data:/app/backend/data_cache astock-codex:latest
-```
+## 开源维护
 
-Compose 默认启用内置调度器，容器启动后会在交易时段自动执行盘中监控和风控扫描。若部署侧已经配置了完整的宿主机计划任务，可在启动前设置 `ASTOCK_ENABLE_FALLBACK_THREADS=0`，然后继续通过 `docker compose exec app` 手动执行其他盘前、开盘、盘后和周度 slot。
+项目使用 **MIT License**，欢迎可复现的 bug、边界条件、数据源适配和小范围 PR。
 
-## 风险结论
+当前公开 roadmap：
 
-模拟盘成交与回测结果不能视为盈利保证。实时行情来自公开接口（非真实盘口深度），撮合采用滑点/成交假设，样本受 A 股当前成分与停牌处理影响；自进化与新闻观测均不构成交易建议。策略历史表现不代表未来收益，本项目不构成任何投资建议。
+- [#1 扩展行情数据源适配与故障降级](https://github.com/daviesjoin-afk/astock-paper-trading/issues/1)
+- [#2 设计可插拔策略接口与策略回放规范](https://github.com/daviesjoin-afk/astock-paper-trading/issues/2)
+- [#3 补充回测、纸面撮合与审计回放验证](https://github.com/daviesjoin-afk/astock-paper-trading/issues/3)
 
-## 项目状态与验证
+提交代码前请阅读 [`CONTRIBUTING.md`](CONTRIBUTING.md)。版本变化见 [`CHANGELOG.md`](CHANGELOG.md) 和 [GitHub Releases](https://github.com/daviesjoin-afk/astock-paper-trading/releases)。
 
-- 当前仓库包含 25 个后端测试模块，GitHub Actions 在 Python 3.11/3.12 上自动运行测试。
-- 本仓库不发布未经验证的收益率或实盘运行结果；测试、回放和模拟盘运行数据应以对应提交或本地环境中的可复现记录为准。
-- 当前版本为研究基础设施，后续重点包括：补充公开脱敏演示、扩展数据源故障回归、完善策略回放报告和持续维护文档。
+## 可选 LLM 研究能力
 
-许可证：MIT，详见 [LICENSE](LICENSE)。贡献请参阅 [CONTRIBUTING.md](CONTRIBUTING.md)。
+基础模拟盘**不依赖 LLM**。如果需要启用可选顾问/影子研究能力，可复制 `.env.example` 为 `.env` 并配置文档中的环境变量。真实密钥不会进入仓库。
+
+LLM 输出属于研究证据，不被当作确定事实或收益保证，也不会绕过正式交易风控。
+
+## 安全与隐私边界
+
+请勿在 Issue / PR 中提交：
+
+- API key、token、Cookie 或 `.env`；
+- 服务器地址、SSH 凭据或账户密码；
+- 真实证券账户、真实持仓或未脱敏运行数据库；
+- 含私人信息的日志或截图。
+
+`.env`、`data_cache/`、`reports/` 等运行时内容均应保留在本机或部署环境。
+
+## 风险声明
+
+本项目仅用于**模拟交易和量化研究**。实时行情来自公开接口，不代表交易所完整盘口；撮合包含滑点和成交假设。模拟盘、回测、影子观测和历史结果均不能视为未来收益保证，也不构成投资建议。
+
+## License
+
+MIT，详见 [`LICENSE`](LICENSE)。
