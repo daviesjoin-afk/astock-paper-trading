@@ -29,6 +29,7 @@ import risk_center as RC
 import news_learning as NL
 import paper_research as PR
 import paper_storage as PST
+import paper_portfolio as PP
 from market_policy import market_light_scale, market_light_scales
 from paper_trading_rules import (
     CHINEXT_PREFIXES,
@@ -3052,28 +3053,7 @@ def _position_rows(conn, account_id=None, asof_day=None, readonly=False):
         sql += " AND account_id=?"
         params.append(account_id)
     lots = _rows(conn, sql, tuple(params))
-    grouped = {}
-    for lot in lots:
-        key = (lot["account_id"], lot["code"])
-        item = grouped.setdefault(key, {
-            "account_id": lot["account_id"], "code": lot["code"], "name": lot.get("name"),
-            "industry": lot.get("industry") or "未知", "qty": 0, "cost_amount": 0.0,
-            "entry_date": lot["acquired_at"][:10], "available_qty": 0, "locked_qty": 0,
-            "asset_type": lot.get("asset_type") or "stock_t1", "available_date": lot["available_date"],
-        })
-        qty = int(lot["remaining_qty"])
-        item["qty"] += qty
-        item["cost_amount"] += qty * _num(lot["cost"])
-        if str(lot.get("acquired_at") or "")[:10] == day:
-            item["today_acquired_qty"] = int(item.get("today_acquired_qty") or 0) + qty
-            item["today_acquired_cost"] = _num(item.get("today_acquired_cost")) + qty * _num(lot["cost"])
-        item["entry_date"] = min(item["entry_date"], lot["acquired_at"][:10])
-        item["available_date"] = min(item["available_date"], lot["available_date"])
-        if lot["available_date"] <= day:
-            item["available_qty"] += qty
-        else:
-            item["locked_qty"] += qty
-    legacy = {(p["account_id"], p["code"]): p for p in _rows(conn, "SELECT * FROM paper_positions")}
+    legacy_rows = _rows(conn, "SELECT * FROM paper_positions")
     # 终端展示常用“摊薄成本”：已卖出部分的净回款抵减尚未卖出仓位成本。
     # 风控、卖出结转仍使用下面的 FIFO settlement_cost，不能用摊薄成本替代。
     cash_flows = {
@@ -3086,18 +3066,13 @@ def _position_rows(conn, account_id=None, asof_day=None, readonly=False):
                  FROM paper_orders WHERE status='filled' GROUP BY account_id,code""",
         )
     }
-    out = []
-    for key, item in grouped.items():
-        item["cost"] = item.pop("cost_amount") / max(item["qty"], 1)
-        item["settlement_cost"] = item["cost"]
-        flow = cash_flows.get(key) or {}
-        net_invested = _num(flow.get("buy_cash")) - _num(flow.get("sell_cash"))
-        item["display_cost"] = net_invested / max(item["qty"], 1)
-        old = legacy.get(key, {})
-        item["peak_price"] = _num(old.get("peak_price"), item["cost"])
-        item["take_stage"] = int(_num(old.get("take_stage"), 0))
-        out.append(item)
-    return out
+    return PP.aggregate_positions(
+        lots,
+        legacy_rows,
+        cash_flows,
+        day,
+        num=_num,
+    )
 
 
 # 今日盈亏可接受的报价来源白名单。dashboard_cache 是 overview 读模型从
