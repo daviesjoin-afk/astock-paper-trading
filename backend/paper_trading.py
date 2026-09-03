@@ -30,6 +30,7 @@ import news_learning as NL
 import paper_research as PR
 import paper_storage as PST
 import paper_portfolio as PP
+import paper_repository as PRP
 from market_policy import market_light_scale, market_light_scales
 from paper_trading_rules import (
     CHINEXT_PREFIXES,
@@ -2752,12 +2753,11 @@ def _shared_risk_state(conn, account, nav, asof_day):
 
 
 def _rows(conn, sql, params=()):
-    return [dict(row) for row in conn.execute(sql, params).fetchall()]
+    return PRP.rows(conn, sql, params)
 
 
 def _audit(conn, account_id, event, detail):
-    conn.execute("INSERT INTO paper_audit(account_id,event,detail,created_at) VALUES(?,?,?,?)",
-                 (account_id, event, detail, _now()))
+    return PRP.audit(conn, account_id, event, detail, _now())
 
 
 def _volatility_shadow(code, asof_day, price=None):
