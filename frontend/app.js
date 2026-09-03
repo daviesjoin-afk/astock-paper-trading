@@ -21,17 +21,21 @@ async function api(path, options){
   var r;
   // A container restart can briefly close the upstream connection and make
   // nginx return 502/503. GETs are safe to retry; keep POST semantics intact.
-  for(var attempt=0; attempt<3; attempt++){
+  // Use a retry window long enough to cover a normal container restart while
+  // leaving POST requests untouched to avoid duplicate side effects.
+  var MAX_GET_ATTEMPTS = 4;
+  for(var attempt=0; attempt<MAX_GET_ATTEMPTS; attempt++){
     var controller=typeof AbortController==='undefined'?null:new AbortController();
     var timeout=controller?setTimeout(function(){controller.abort();},Number(options.timeout)||25000):null;
     try { r = await fetch(path,{signal:controller&&controller.signal}); }
-    catch(err){ if(attempt===2) throw err; await new Promise(function(resolve){setTimeout(resolve,250*(attempt+1));}); continue; }
+    catch(err){ if(attempt===MAX_GET_ATTEMPTS-1) throw err; await new Promise(function(resolve){setTimeout(resolve,800*(attempt+1));}); continue; }
     finally { if(timeout) clearTimeout(timeout); }
     if(r.status!==502 && r.status!==503 && r.status!==504) break;
-    if(attempt<2) await new Promise(function(resolve){setTimeout(resolve,250*(attempt+1));});
+    if(attempt<MAX_GET_ATTEMPTS-1) await new Promise(function(resolve){setTimeout(resolve,800*(attempt+1));});
   }
   var d = await r.json().catch(function(){ return {}; });
-  if(!r.ok) throw new Error(d.detail || d.error || ('请求失败 HTTP '+r.status));
+  if(!r.ok) throw new Error(d.detail || d.error ||
+    ('请求失败 HTTP '+r.status+(r.status>=500?'（后端可能正在重启或过载，请稍后重试）':'')));
   return d;
 }
 async function apiPost(path){

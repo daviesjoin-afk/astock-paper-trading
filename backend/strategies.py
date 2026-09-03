@@ -354,7 +354,8 @@ def _bottom_reversal_profile(table):
                 + (pct.ge(8.5).astype(float) * 0.15)).clip(0.0, 1.0)
     score = (location * 0.30 + turn * 0.28 + rsi_fit * 0.12
              + confirmation * 0.30 - overheat * 0.35).clip(0.0, 1.0)
-    valid = price.notna() & ma20.notna() & ma60.notna() & mom5.notna() & mom20.notna()
+    valid = (price.notna() & ma20.notna() & ma60.notna() & mom5.notna() & mom20.notna()
+             & rsi.notna())
     score = score.where(valid, 0.0)
     structure = pd.Series("unknown", index=idx, dtype="object")
     structure.loc[valid & score.ge(0.62) & overheat.lt(0.55)] = "base_rebound"
@@ -1376,7 +1377,10 @@ def _run_paper_strategy(strategy_id, table, topn, gate, first_board_codes=None, 
         ma20 = numeric_column("ma20")
         ma60 = numeric_column("ma60")
         price = numeric_column("price")
-        structure = (ma20 > ma60) & (price >= ma20 * (1 + conditions["close_ma20_min"] / 100.0))
+        _ma20_ma60_min = _number_or(conditions.get("ma20_ma60_min"), 0.0)
+        structure = ((ma20 / ma60 - 1.0) * 100 >= _ma20_ma60_min) & (
+            price >= ma20 * (1 + conditions["close_ma20_min"] / 100.0)
+        )
         if enabled.get("trend_structure_guard", True):
             score += structure.astype(float) * 0.22
             score -= (~structure).astype(float) * conditions["broken_structure_penalty"]
@@ -1534,11 +1538,12 @@ def _run_paper_strategy(strategy_id, table, topn, gate, first_board_codes=None, 
     names = {
         "one_to_two": "强势日内候选（首板优先）",
         "bottom_reversal": "底部启动",
+        "trend_continuation": "趋势延续",
         "sentiment_pioneer": "情绪先锋",
     }
     return {
         "strategy": strategy_id,
-        "strategy_name": names[strategy_id],
+        "strategy_name": names.get(strategy_id, strategy_id),
         "count": len(picks),
         "picks": picks,
         "hot_leader_watch": hot_watch,
