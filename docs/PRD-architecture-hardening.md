@@ -1,10 +1,39 @@
 # PRD：架构硬化与 OSS 可维护性治理
 
-**状态**：草案，待评审
+**状态**：实施中；本地兼容拆分与回归已完成一批，服务器验收和 GitHub 阶段未完成。
 **日期**：2026-09-03
 **项目**：`daviesjoin-afk/astock-paper-trading`
 **本地基线**：`master` / `c9add450`（以本地实际提交为准）
 **产品边界**：仅限 A 股模拟交易，不接入真实券商下单。
+
+## 实施状态（2026-09-04）
+
+### 已完成（本地，未部署当前分支）
+
+- **P0 部分完成**：已新增 `ARCHITECTURE.md`、`SECURITY.md`，并补充 Docker health-smoke CI 配置；后端 198 项测试、Python 编译、前端脚本语法、CI YAML、关键模块导入和 FastAPI 路由加载均已通过。
+- **P1 部分完成**：已集中 paper ledger 的 v1-v4 schema migration，旧库 fixture 覆盖幂等、回滚、字段补齐及迁移前 SQLite 一致性备份；已建立 dashboard 与活动订单的 repository 读投影。
+- **P2 部分完成**：已抽出决策证据与纯规则、行情传输/缓存/标准化、东财/腾讯/新浪解析器及东财分页适配器；旧入口保留兼容包装，缺失/部分分页仍 fail-closed。
+- **P3 部分完成**：已从 `paper_trading.py` 抽出交易规则、报价门禁、资金分配、下单 sizing、存储、持仓聚合、归档读投影、今日绩效等边界；核心订单状态机和编排仍在原模块。
+- **P4 部分完成**：已建立 strategy registry 展示口径、adaptive 只读账本端口、遗传/影子风险纯计算，并以静态测试禁止 adaptive 直接调用订单入口。
+- **P5 部分完成**：CI 已定义 Docker 构建/健康冒烟；本机 Docker 引擎未启动，尚未实际运行该 job。
+
+### 尚未完成（不得误报为完成）
+
+- P0 的写接口 operator token/会话鉴权、本机/服务器绑定模式收敛和启动/停止端口残留的完整 smoke 闭环。
+- P1 的所有高频对象 repository 化，以及运行路径中剩余 schema 演进的单一真相源核验。
+- P2 的完整确定性 replay 契约和所有 provider 统一输出模型。
+- P3 的 Execution、Risk、Slot/Scheduler 编排层进一步拆分；`paper_trading.py` 仍是大模块。
+- P4 让 README、API、数据库记录、market policy 和 adaptive 全部以 registry 为唯一身份来源。
+- P5 的前端单一 source of truth/ES module 拆分、依赖锁文件、lint/coverage/audit，以及 GitHub 分支保护。
+
+### 服务器与 GitHub 验证待办
+
+1. 服务器当前工作区有用户改动，必须保留，不得覆盖；源码级归档和 Git bundle 已放入服务器交接目录。
+2. 在交易时段对当前服务完成数据库只读完整性、端口/进程、关键只读 API、最小模拟周期和回滚证据验证。
+3. 仅在用户确认服务器通过后，部署当前本地分支；部署后再次验证 Docker health-smoke、迁移备份路径及无真实券商调用。
+4. 仅在服务器验证通过且用户再次确认后，才可 push GitHub、创建/更新 PR、观察 CI，并单独记录分支保护检查结果。
+
+**当前结论**：PRD 未完成；当前完成的是可回滚的本地渐进拆分和可跨机器继续的交接准备。
 
 ## 1. 背景与问题
 
