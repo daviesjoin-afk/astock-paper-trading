@@ -64,4 +64,4 @@
 - Server deployment: 已执行；本地提交 `b60d3a6` 对应部署包已校验并解包，镜像重建/重启完成，服务器备份位于 `/root/backups/20260903-architecture-predeploy/`。
 - Tests for this PRD: 198 backend tests passed with ResourceWarning as errors; compileall, diff check and prior Node/HTTP smoke checks passed.
 - Remote source pull: completed with SHA-256 verification. 2026-09-04 00:05 read-only server check: source `22762e2` is dirty (100 modified, 37 untracked); running image was built at `2026-09-03T21:11:43+08:00`, container is healthy, and `:8600` read-only endpoints returned 200. Health is degraded only because the previous trade-day live snapshot is stale for the new calendar day.
-- Handoff: `docs/HANDOFF-architecture-hardening.md` records the local verification, server dirty-worktree gate, storage limit, source-only server archive, and next-machine continuation steps. Git bundle upload/verification remains pending.
+- Handoff: `docs/HANDOFF-architecture-hardening.md` records the local verification, server dirty-worktree gate, storage limit, verified source-only server archive, and verified full-history Git bundle for next-machine continuation.
