@@ -34,6 +34,7 @@ import paper_repository as PRP
 import paper_performance as PPerf
 import paper_schema_migrations as PSM
 import paper_archive_projection as PAP
+import paper_quote_policy as PQP
 from market_policy import market_light_scale, market_light_scales
 from paper_trading_rules import (
     CHINEXT_PREFIXES,
@@ -3198,90 +3199,17 @@ def _strategy_reference_is_usable(account_id, reference_date, asof_date):
 
 
 def _quote_is_fresh(quote, asof_date):
-    """只有带源时间戳的当日公开行情才可触发成交。"""
-    if not quote or quote.get("quote_source") != "live":
-        return False
-    try:
-        quote_time = dt.datetime.fromisoformat(str(quote.get("quote_at") or ""))
-    except (TypeError, ValueError):
-        return False
-    day = _date(asof_date)
-    if quote_time.date() != day:
-        return False
-    # 回放历史日期时只校验源日期；当日运行还要防止接口返回长时间未更新的收盘价。
-    if day != dt.date.today():
-        return True
-    now = dt.datetime.now(quote_time.tzinfo) if quote_time.tzinfo else dt.datetime.now()
-    age_seconds = (now - quote_time).total_seconds()
-    return -120 <= age_seconds <= 20 * 60
+    return PQP.quote_is_fresh(quote, asof_date, date_fn=_date)
 
 
 def _is_trading_active(quote):
-    """判断股票是否在活跃交易（非停牌）。"""
-    pct = _num(quote.get("pct"), None)
-    amount = _num(quote.get("amount"), 0)
-    turnover = _num(quote.get("turnover"), 0)
-    volume = _num(quote.get("volume"), 0)
-    if pct == 0 and amount == 0 and turnover == 0 and volume == 0:
-        return False
-    return True
+    return PQP.is_trading_active(quote, num=_num)
 
 
 def _execution_quote_status(quote, asof_date, purpose="entry"):
-    """自动成交行情门禁。
-
-    开仓与回补必须双源核验；风险卖出允许在主行情带当日时间戳且数值有效时
-    降级执行，避免备用公共接口短暂故障把止损/止盈仓位锁死。
-    """
-    if not quote:
-        return {"fresh": False, "status": "missing", "reason": "缺少行情"}
-    cross = dict(quote.get("quote_cross_check") or {})
-    validation = str(quote.get("quote_validation") or "")
-    diagnostics = {
-        "quote_source": quote.get("quote_source"),
-        "quote_validation": validation or None,
-        "quote_at": quote.get("quote_at"),
-        "quote_cross_check": cross,
-    }
-    if validation == "incomplete":
-        return {"fresh": False, "status": "invalid", "reason": "主行情价格或涨跌幅无效", **diagnostics}
-    if quote.get("quote_source") != "live":
-        return {
-            "fresh": False,
-            "status": "local_cache",
-            "reason": "行情来自本地缓存，禁止虚构自动成交",
-            "quote_at": quote.get("quote_at"),
-            **diagnostics,
-        }
-    if not _quote_is_fresh(quote, asof_date):
-        return {
-            "fresh": False,
-            "status": "stale",
-            "reason": "实时行情源时间戳已过期，等待下一次有效报价",
-            "quote_at": quote.get("quote_at"),
-            **diagnostics,
-        }
-    if quote.get("quote_validation") == "cross_source_checked":
-        return {
-        "fresh": True,
-        "status": "cross_source_checked",
-        "reason": "带当日源时间戳且双源核验通过的实时行情",
-        "quote_at": quote.get("quote_at"),
-        **diagnostics,
-    }
-    if validation == "cross_source_failed":
-        detail = cross.get("failure_reason") or "独立行情源返回结果与主行情不一致"
-        return {"fresh": False, "status": "cross_source_failed", "reason": detail, **diagnostics}
-    if validation == "cross_source_unavailable":
-        detail = cross.get("failure_reason") or "本次未获得独立行情源的有效返回"
-        if purpose == "exit":
-            return {"fresh": True, "status": "degraded_cross_source", "reason": detail + "；仅允许风控退出", "degraded": True, **diagnostics}
-        # 自动开仓、回补和确认加仓必须与最初信号使用同一双源门槛。
-        # 单源降级只适用于风险退出，不能在待买信号生成后绕过复核。
-        return {"fresh": False, "status": "cross_source_unavailable", "reason": detail + "；自动买入等待双源恢复", **diagnostics}
-    if validation == "range_timestamp_checked" and purpose == "exit":
-        return {"fresh": True, "status": "degraded_cross_source", "reason": "主行情新鲜有效，但未完成独立行情源校验；仅允许风控退出", "degraded": True, **diagnostics}
-    return {"fresh": False, "status": "unverified", "reason": "未获得通过的独立行情源校验结果", **diagnostics}
+    return PQP.execution_quote_status(
+        quote, asof_date, purpose=purpose, quote_fresh=_quote_is_fresh
+    )
 def _market_state(asof_date, live_universe=None, *, allow_network=True):
     """实时指数决定当日门控；历史日线只提供中期趋势，不冒充盘中行情。"""
     # 盘中市场宽度必须使用同一轮全市场实时快照，不能读取可能滞后数日的
