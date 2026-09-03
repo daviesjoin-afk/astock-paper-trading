@@ -45,6 +45,7 @@
 - [x] M3aa：将活动订单的轻量列表 SQL 与账户名称投影迁入 `paper_repository.py`，保持归档合并和日期配额编排不变。
 - [x] M3ab：将东财 `clist` 分页、主机冷却和完整性元数据迁入 provider 适配器；`data_fetcher.py` 只注入 HTTP、配置和健康状态，保留旧入口兼容。
 - [x] M3ac：将东财概念成员分页与完整性判定迁入 provider 适配器；保留概念筛选、缓存和旧 `_fetch_concept_members` 入口编排。
+- [x] M3ad：将个股到概念板块的东财响应解析迁入 provider 适配器；保留网络请求、主机回退和概念过滤口径。
 - [ ] M3：本地 P2/P3/P4/P5 按小步提交完成，保持 API/交易语义兼容。
 - [x] M4：2026-09-03 将本地验收通过的同一版本部署到服务器并保留备份/回滚点。
 - [ ] M4a：2026-09-04 完成服务器健康、进程、数据库、模拟周期测试。
@@ -61,5 +62,5 @@
 - PRD/implementation branch: `codex/architecture-hardening-local`（本地）。
 - GitHub push: 未执行。
 - Server deployment: 已执行；本地提交 `b60d3a6` 对应部署包已校验并解包，镜像重建/重启完成，服务器备份位于 `/root/backups/20260903-architecture-predeploy/`。
-- Tests for this PRD: 197 backend tests passed with ResourceWarning as errors; compileall, diff check and prior Node/HTTP smoke checks passed.
+- Tests for this PRD: 198 backend tests passed with ResourceWarning as errors; compileall, diff check and prior Node/HTTP smoke checks passed.
 - Remote source pull: completed with SHA-256 verification; HTTP health read-only check returned 200 on `:8600`.
