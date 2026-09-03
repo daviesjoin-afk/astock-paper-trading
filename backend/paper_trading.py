@@ -36,6 +36,7 @@ import paper_schema_migrations as PSM
 import paper_archive_projection as PAP
 import paper_quote_policy as PQP
 import paper_allocation as PA
+import paper_sizing as PSZ
 from market_policy import market_light_scale, market_light_scales
 from paper_trading_rules import (
     CHINEXT_PREFIXES,
@@ -7589,60 +7590,13 @@ def _price_aware_qty(
     strategy_cap_amount=None, pool_cap_amount=None,
     pending_strategy_amount=0.0, pending_pool_amount=0.0,
 ):
-    """按股数计算下单规模；数量席位是容量硬门，金额约束只做软 sizing。
-
-    现金、行情、T+1、跌停和硬风险仍由调用方的安全门禁负责；这里的
-    strategy/pool/industry amount limits 只决定本次最多下多少股。若不足一手，
-    调用方应把候选放入等待池，等待额度释放后按最新行情复核。
-    """
-    if fill_price <= 0:
-        return 0, {"target_amount": 0.0, "reason": "无有效价格"}
-    loss_per_share = fill_price * max(abs(hard_stop), 0.01)
-    risk_budget = nav * profile["single_risk"]
-    by_risk = risk_budget / loss_per_share
-    by_weight = max(0.0, nav * profile["max_weight"] - code_value) / fill_price
-    profile_exposure = _num(max_exposure_cap, profile["max_exposure"])
-    effective_exposure = min(profile_exposure, _num(exposure_cap, profile_exposure))
-    # 市场黄灯的仓位系数只作用于“剩余可用额度”。
-    # 旧逻辑把 max_exposure 直接乘 risk_scale，导致已有持仓超过缩小后的新上限时，
-    # 可用额度被算成 0；例如 65% 上限、当前 49.7% 持仓、黄灯 65% 时会错误得到 42.25% 上限。
-    scale = max(0.0, min(_num(exposure_scale, 1.0), 1.0))
-    pool_limit = nav * effective_exposure if pool_cap_amount is None else _num(pool_cap_amount)
-    pool_remaining = max(
-        0.0,
-        pool_limit - _num(position_value) - max(0.0, _num(pending_pool_amount)),
+    return PSZ.price_aware_qty(
+        nav, cash, position_value, industry_value, code_value,
+        fill_price, hard_stop, profile, exposure_cap, max_exposure_cap,
+        exposure_scale, strategy_position_value, strategy_cap_amount,
+        pool_cap_amount, pending_strategy_amount, pending_pool_amount,
+        num=_num, lot_size=LOT_SIZE,
     )
-    if strategy_cap_amount is None:
-        strategy_remaining = pool_remaining
-    else:
-        strategy_remaining = max(
-            0.0,
-            _num(strategy_cap_amount) - _num(strategy_position_value)
-            - max(0.0, _num(pending_strategy_amount)),
-        )
-    remaining_exposure = min(pool_remaining, strategy_remaining)
-    by_exposure = remaining_exposure * scale / fill_price
-    by_industry = max(0.0, nav * profile["max_industry"] - industry_value) / fill_price
-    by_cash = max(0.0, cash) / fill_price
-    limits = {
-        "risk": by_risk, "weight": by_weight, "exposure": by_exposure,
-        "industry": by_industry, "cash": by_cash,
-    }
-    shares = min(limits.values())
-    qty = int(shares / LOT_SIZE) * LOT_SIZE
-    binding = [name for name, value in limits.items() if value <= shares + 1e-6]
-    return max(qty, 0), {
-        "risk_budget": round(risk_budget, 2), "loss_per_share": round(loss_per_share, 4),
-        "target_amount": round(qty * fill_price, 2), "price": round(fill_price, 4),
-        "effective_max_exposure_pct": round(effective_exposure * 100, 1),
-        "pool_remaining_amount": round(pool_remaining, 2),
-        "strategy_remaining_amount": round(strategy_remaining, 2),
-        "pending_pool_amount": round(max(0.0, _num(pending_pool_amount)), 2),
-        "pending_strategy_amount": round(max(0.0, _num(pending_strategy_amount)), 2),
-        "new_exposure_scale_pct": round(scale * 100, 1),
-        "constraint_shares": {name: round(value, 2) for name, value in limits.items()},
-        "binding_constraints": binding,
-    }
 
 
 def _exceptional_opportunity(account, pick, quote, market, entry_model, q, risk_state, asof_day, conn):
