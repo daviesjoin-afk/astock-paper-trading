@@ -11,6 +11,9 @@ services:
       TZ: Asia/Shanghai
       PYTHONUNBUFFERED: "1"
       PYTHONDONTWRITEBYTECODE: "1"
+      # Standalone clones need an in-process scheduler. Set this to 0 when a
+      # host scheduler is configured and owns every paper-trading slot.
+      ASTOCK_ENABLE_FALLBACK_THREADS: "${ASTOCK_ENABLE_FALLBACK_THREADS:-1}"
     volumes:
       # data_fetcher.py stores SQLite, universe and market caches here.
       # Deliberately use a release-scoped volume name so a clone does not
