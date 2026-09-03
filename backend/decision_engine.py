@@ -13,8 +13,8 @@ import os, sys
 import pandas as pd
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import data_fetcher as dfc
 import factors as F
+from decision_context import load_evidence
 
 
 def _safe(v):
@@ -58,19 +58,16 @@ def pre_open_six_dim(code, name=None, kline=None, snap=None, sector_flow=None,
     """
     开仓前置六维核查，返回每个维度的 status(green/yellow/red)、score(0-1)、reason。
     """
-    name = name or code
-    if snap is None:
-        snap_rows = dfc.fetch_realtime_for_codes([code])
-        snap = snap_rows[0] if snap_rows else {}
-    if kline is None:
-        kline = dfc.load_cached_kline(code)
-    if sector_flow is None:
-        sector_flow = dfc.fetch_sector_flow("industry")
-    if overseas_gate is None:
-        try:
-            overseas_gate = F.overseas_risk_gate()
-        except Exception:
-            overseas_gate = {"light": "unknown"}
+    evidence = load_evidence(
+        code, name=name, kline=kline, snap=snap, sector_flow=sector_flow,
+        overseas_gate=overseas_gate, news_hits=news_hits,
+    )
+    name = evidence.name
+    snap = evidence.snap
+    kline = evidence.kline
+    sector_flow = evidence.sector_flow
+    overseas_gate = evidence.overseas_gate
+    news_hits = evidence.news_hits
 
     pct = _safe(snap.get("pct"))
     limit_pct = F.limit_up_threshold(code) * 100
@@ -194,22 +191,24 @@ def pre_open_six_dim(code, name=None, kline=None, snap=None, sector_flow=None,
     return dims
 
 
-def limit_up_seal_check(code, snap=None, kline=None):
+def limit_up_seal_check(code, snap=None, kline=None, sector_flow=None):
     """
     封单真伪六维鉴别。
     免费数据没有 level2 封单，用涨停日量价 + 资金 + 板块共振做代理。
     返回 status(green/yellow/red)、score、details。
     非涨停股返回 None（不适用）。
     """
-    if snap is None:
-        rows = dfc.fetch_realtime_for_codes([code])
-        snap = rows[0] if rows else {}
+    evidence = load_evidence(
+        code, snap=snap, kline=kline,
+        sector_flow=sector_flow if sector_flow is not None else None,
+        overseas_gate={},
+    )
+    snap = evidence.snap
+    kline = evidence.kline
+    sector_flow = evidence.sector_flow
     pct = _safe(snap.get("pct"))
     if pct < F.limit_up_threshold(code) * 100:
         return None
-    if kline is None:
-        kline = dfc.load_cached_kline(code)
-
     details = []
     score = 0.5
 
@@ -267,7 +266,7 @@ def limit_up_seal_check(code, snap=None, kline=None):
     # 6. 板块共振：所在行业今日涨幅
     ind = snap.get("industry")
     if ind:
-        sf = next((s for s in dfc.fetch_sector_flow("industry") if s.get("name") == ind), None)
+        sf = next((s for s in sector_flow if s.get("name") == ind), None)
         if sf and _safe(sf.get("pct")) > 0:
             score += 0.05; details.append("板块共振上涨")
 
@@ -305,14 +304,24 @@ def buy_decision(code, name=None, kline=None, snap=None, sector_flow=None,
     """
     完整买入执行决策：六维核查 + 涨停封单鉴别 + T1-T5 时机 + 观察清单判定。
     """
-    dims = pre_open_six_dim(code, name=name, kline=kline, snap=snap,
-                            sector_flow=sector_flow, overseas_gate=overseas_gate,
-                            news_hits=news_hits)
-    # 调用方已批量取得快照时直接复用，避免每只候选再次请求行情接口。
-    if snap is None:
-        snap_rows = dfc.fetch_realtime_for_codes([code])
-        snap = snap_rows[0] if snap_rows else {}
-    seal = limit_up_seal_check(code, snap=snap, kline=kline)
+    evidence = load_evidence(
+        code, name=name, kline=kline, snap=snap, sector_flow=sector_flow,
+        overseas_gate=overseas_gate, news_hits=news_hits,
+    )
+    # 兼容旧签名，但只在这里集中加载一次证据，避免每只候选重复读取行情。
+    name = evidence.name
+    snap = evidence.snap
+    kline = evidence.kline
+    sector_flow = evidence.sector_flow
+    overseas_gate = evidence.overseas_gate
+    news_hits = evidence.news_hits
+    dims = pre_open_six_dim(
+        code, name=name, kline=kline, snap=snap, sector_flow=sector_flow,
+        overseas_gate=overseas_gate, news_hits=news_hits,
+    )
+    seal = limit_up_seal_check(
+        code, snap=snap, kline=kline, sector_flow=sector_flow,
+    )
     tier = buy_timing_tier(dims, seal=seal)
     hard_vetoes = []
     pct = _safe(snap.get("pct"))
@@ -336,7 +345,7 @@ def buy_decision(code, name=None, kline=None, snap=None, sector_flow=None,
     watchlist = tier["tier"] == "T3"
 
     return {
-        "code": code, "name": name or snap.get("name") or code,
+        "code": code, "name": name,
         "avg_score": avg_score,
         "six_dim": dims,
         "seal_check": seal,
@@ -430,22 +439,22 @@ def forced_stop_losses(price, cost, peak_price, hold_days, mom20, main_pct,
 
 
 def next_day_auction_matrix(code, name=None, kline=None, snap=None,
-                            overseas_gate=None, news_hits=None):
+                            overseas_gate=None, news_hits=None, sector_flow=None):
     """
     次日竞价 Q1-Q5 决策矩阵。
     综合隔夜海外、板块、个股舆情、技术动量给出开盘动作建议。
     Q1 偏强持有/加仓；Q5 偏强减仓/竞价出。
     """
-    if snap is None:
-        rows = dfc.fetch_realtime_for_codes([code])
-        snap = rows[0] if rows else {}
-    if kline is None:
-        kline = dfc.load_cached_kline(code)
-    if overseas_gate is None:
-        try:
-            overseas_gate = F.overseas_risk_gate()
-        except Exception:
-            overseas_gate = {"light": "unknown"}
+    evidence = load_evidence(
+        code, name=name, kline=kline, snap=snap, sector_flow=sector_flow,
+        overseas_gate=overseas_gate, news_hits=news_hits,
+    )
+    name = evidence.name
+    snap = evidence.snap
+    kline = evidence.kline
+    sector_flow = evidence.sector_flow
+    overseas_gate = evidence.overseas_gate
+    news_hits = evidence.news_hits
 
     score = 0.5
     reasons = []
@@ -461,7 +470,7 @@ def next_day_auction_matrix(code, name=None, kline=None, snap=None,
 
     # 板块资金
     ind = snap.get("industry")
-    sf = next((s for s in dfc.fetch_sector_flow("industry") if s.get("name") == ind), None)
+    sf = next((s for s in sector_flow if s.get("name") == ind), None)
     if sf:
         s_pct = _safe(sf.get("pct"))
         s_main = _safe(sf.get("main_pct"))
@@ -517,12 +526,15 @@ def sell_decision(position_state, kline=None, snap=None,
     position_state 来自 tracker 的持仓记录。
     """
     code = position_state["code"]
-    name = position_state.get("name", code)
-    if snap is None:
-        rows = dfc.fetch_realtime_for_codes([code])
-        snap = rows[0] if rows else {}
-    if kline is None:
-        kline = dfc.load_cached_kline(code)
+    evidence = load_evidence(
+        code, name=position_state.get("name"), kline=kline, snap=snap,
+        overseas_gate=overseas_gate, news_hits=news_hits,
+    )
+    name = evidence.name
+    snap = evidence.snap
+    kline = evidence.kline
+    overseas_gate = evidence.overseas_gate
+    news_hits = evidence.news_hits
 
     price = snap.get("price")
     cost = position_state.get("cost")
@@ -540,7 +552,8 @@ def sell_decision(position_state, kline=None, snap=None,
     stops = forced_stop_losses(price, cost, peak, hold_days, mom20, main_pct,
                                news_neg=neg, overseas_light=(overseas_gate or {}).get("light"))
     auction = next_day_auction_matrix(code, name=name, kline=kline, snap=snap,
-                                      overseas_gate=overseas_gate, news_hits=news_hits)
+                                      overseas_gate=overseas_gate, news_hits=news_hits,
+                                      sector_flow=evidence.sector_flow)
 
     sell_signals = [s for s in stops if s["level"] == "sell"]
     action = ("卖出" if sell_signals else
