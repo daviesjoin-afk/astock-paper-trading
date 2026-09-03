@@ -32,6 +32,27 @@ class MarketDataProviderParserTests(unittest.TestCase):
         self.assertEqual(result["failed_pages"], [3])
         self.assertFalse(result["complete"])
 
+    def test_concept_members_marks_capped_pages_incomplete(self):
+        def fake_get_json(_url, _params, **_kwargs):
+            return {"data": {"total": 101, "diff": [{
+                "f12": "000001", "f14": "平安银行", "f2": "10.5", "f3": "1.2",
+                "f124": "20260903100000",
+            }]}}
+
+        result = providers.fetch_eastmoney_concept_members(
+            get_json=fake_get_json,
+            hosts=["test-host"],
+            board_code="BK0001",
+            ut="test-ut",
+            quote_at=lambda value: f"quote:{value}",
+            finite_number=lambda value: float(value) if value is not None else None,
+            max_pages=1,
+        )
+        self.assertEqual(result["members"][0]["code"], "000001")
+        self.assertEqual(result["members"][0]["quote_at"], "quote:20260903100000")
+        self.assertEqual(result["pages_expected"], 2)
+        self.assertFalse(result["complete"])
+
     def test_tencent_parser_uses_timestamp_and_allowed_codes(self):
         parts = [""] * 33
         parts[1] = "平安银行"
