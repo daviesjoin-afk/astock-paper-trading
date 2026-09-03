@@ -82,13 +82,20 @@ class LeaseAndFreshnessTests(unittest.TestCase):
         )
 
     def test_today_pnl_quote_requires_fresh_live_mark(self):
-        now = dt.datetime.now()
+        # Production treats offset-free market timestamps as Asia/Shanghai.
+        # Use an explicit +08:00 timestamp so this regression remains stable
+        # on GitHub-hosted runners whose local timezone is UTC.
+        shanghai_tz = dt.timezone(dt.timedelta(hours=8))
+        now = dt.datetime.now(shanghai_tz)
         fresh = {
             "price": 10.0,
             "quote_source": "live",
-            "quote_at": now.strftime("%Y-%m-%d %H:%M:%S"),
+            "quote_at": now.isoformat(timespec="seconds"),
         }
-        stale = dict(fresh, quote_at=(now - dt.timedelta(minutes=21)).strftime("%Y-%m-%d %H:%M:%S"))
+        stale = dict(
+            fresh,
+            quote_at=(now - dt.timedelta(minutes=21)).isoformat(timespec="seconds"),
+        )
         self.assertTrue(P._today_quote_is_usable(fresh, now.date()))
         self.assertFalse(P._today_quote_is_usable(stale, now.date()))
         aware = dict(fresh, quote_at=now.replace(tzinfo=dt.timezone(dt.timedelta(hours=8))).isoformat())
