@@ -51,6 +51,29 @@ class DbMigrateTests(unittest.TestCase):
             finally:
                 conn.close()
 
+    def test_migration_creates_consistent_pre_upgrade_backup(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "paper.sqlite3")
+            conn = sqlite3.connect(path)
+            conn.execute("CREATE TABLE paper_orders(id INTEGER PRIMARY KEY, status TEXT)")
+            conn.execute("INSERT INTO paper_orders(status) VALUES('legacy')")
+            conn.commit()
+            conn.close()
+
+            with redirect_stdout(StringIO()):
+                db_migrate.migrate("paper_trading", path=path)
+
+            backups = [name for name in os.listdir(directory) if name.startswith("paper.pre-v0-")]
+            self.assertEqual(len(backups), 1)
+            backup = sqlite3.connect(os.path.join(directory, backups[0]))
+            try:
+                self.assertEqual(backup.execute("SELECT status FROM paper_orders").fetchone()[0], "legacy")
+                self.assertIsNone(backup.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name='schema_version'"
+                ).fetchone())
+            finally:
+                backup.close()
+
     def test_failed_callable_migration_rolls_back_and_keeps_previous_version(self):
         with tempfile.TemporaryDirectory() as directory:
             path = os.path.join(directory, "paper.sqlite3")
