@@ -29,6 +29,23 @@ import risk_center as RC
 import news_learning as NL
 import paper_research as PR
 from market_policy import market_light_scale, market_light_scales
+from paper_trading_rules import (
+    CHINEXT_PREFIXES,
+    COMMISSION,
+    MAIN_BOARD_PREFIXES,
+    MIN_COMMISSION,
+    SLIPPAGE,
+    STAR_PREFIXES,
+    STAMP_SELL,
+    T0_ETF_PREFIXES,
+    asset_type as _asset_type,
+    commission as _commission,
+    is_st_or_delisting as _is_st_or_delisting,
+    is_trade_weekday as _is_trade_weekday,
+    limit_pct as _limit_pct,
+    next_weekday as _next_weekday,
+    security_scope as _security_scope,
+)
 try:
     import disclosure_timeline as DT
 except ImportError:  # 数据源模块故障不能中断风险卖出或候选扫描。
@@ -67,11 +84,6 @@ ARCHIVE_ORDERS_CACHE_PATH = os.path.join(BASE, "data_cache", "paper_archive_orde
 # 低于该值仍保留待买名单，风险卖出不受影响。
 SELECTION_FACTOR_MIN_COVERAGE = 0.85
 
-# 佣金万一免五（2026-08-28 起）：万1费率，无 5 元最低收费；印花税/滑点不变
-COMMISSION = 0.0001
-MIN_COMMISSION = 0.0
-STAMP_SELL = 0.0005
-SLIPPAGE = 0.001
 NEWS_UNVERIFIED_TTL_SECONDS = 12 * 60 * 60
 NEWS_VERIFIED_TTL_SECONDS = 3 * 24 * 60 * 60
 _NEWS_SCAN_META = {"observed_at": None, "stale": False, "error": None}
@@ -513,10 +525,6 @@ STRATEGY_RISK_BEHAVIORS = {
     },
 }
 
-MAIN_BOARD_PREFIXES = ("000", "001", "002", "003", "600", "601", "603", "605")
-CHINEXT_PREFIXES = ("300", "301", "302")
-STAR_PREFIXES = ("688", "689")
-
 # 新股没有 120 根历史日线是正常现象，不能把“上市时间短”与“历史缓存缺失”混为一谈。
 # 仅对主板/创业板、K 线起点与上市期一致且覆盖率足够的标的启用这条观察路径；
 # 科创/北交/ST 仍由证券权限门禁直接禁止新增仓位。
@@ -566,10 +574,6 @@ NEW_LISTING_POLICIES = {
         "min_vol_ratio": 1.00, "max_recent_range": 25.0,
     },
 }
-
-# 只有普通股票会进入日内做 T 模型。ETF 的 T+0 能力仍由通用结算层识别，
-# 但本轮日内策略不会把 ETF 当成候选标的。
-T0_ETF_PREFIXES = ("51", "52", "56", "58", "15", "16", "18")
 
 STYLE_PROFILES = {
     "strong": {"name": "强势接力", "source_strategy": "one_to_two"},
@@ -1443,69 +1447,6 @@ def _rebuild_realized_pnl(conn):
         if remaining == 0:
             realized = _num(order.get("amount")) - _num(order.get("fees")) - cost_amount
             conn.execute("UPDATE paper_orders SET realized_pnl=? WHERE id=?", (realized, order["id"]))
-
-
-def _next_weekday(value):
-    """T+1 unlocks on the next Shanghai trading day, not merely a weekday."""
-    return U.next_trade_day(_date(value))
-
-
-def _is_trade_weekday(value):
-    return U.is_trade_day(_date(value))
-
-
-def _commission(amount):
-    return max(MIN_COMMISSION, amount * COMMISSION)
-
-
-def _is_st_or_delisting(name=None, risk_flag=False):
-    """Return whether the current security identity uses the A-share ST limit.
-
-    The trade engine intentionally keeps legacy ST positions sellable while
-    blocking any new purchase.  Their 5% price limit must therefore be known
-    to the sell gate as well; a code-only board rule would treat an ST limit
-    down as an executable ordinary-board quote.
-    """
-    label = str(name or "").upper()
-    return bool(risk_flag) or "ST" in label or "退" in str(name or "")
-
-
-def _limit_pct(code, name=None, risk_flag=False):
-    """Return the applicable down-limit percentage for a tradable position."""
-    if _is_st_or_delisting(name, risk_flag):
-        return 5.0
-    return F.limit_up_threshold(str(code)) * 100
-
-
-def _asset_type(code, name=None):
-    """A 股普通股票 T+1；常见场内 ETF 代码段按 T+0 处理。
-
-    不把可转债、指数或未识别证券冒充 ETF；未来接入证券类型字段时可优先使用该字段。
-    """
-    code = str(code or "")
-    label = str(name or "")
-    if code.startswith(T0_ETF_PREFIXES) and ("ETF" in label.upper() or code.startswith(("51", "52", "56", "58", "15"))):
-        return "etf_t0"
-    return "stock_t1"
-
-
-def _security_scope(code, name=None, risk_flag=False):
-    """Single source of truth for securities the simulated account may buy."""
-    raw = str(code or "").strip()
-    normalized = raw.zfill(6) if raw.isdigit() else raw
-    label = str(name or "").strip()
-    upper = label.upper()
-    if risk_flag or "ST" in upper or "退" in label:
-        return {"allowed": False, "board": "风险警示", "reason": "ST/退市风险标的不在账户权限范围"}
-    if normalized.startswith(STAR_PREFIXES):
-        return {"allowed": False, "board": "科创板", "reason": "科创板不在账户权限范围"}
-    if normalized.startswith(("92",)) or normalized.startswith(("4", "8")):
-        return {"allowed": False, "board": "北交所", "reason": "北交所不在账户权限范围"}
-    if normalized.startswith(CHINEXT_PREFIXES):
-        return {"allowed": True, "board": "创业板", "reason": "创业板普通股票"}
-    if normalized.startswith(MAIN_BOARD_PREFIXES):
-        return {"allowed": True, "board": "沪深主板", "reason": "沪深主板普通股票"}
-    return {"allowed": False, "board": "其他证券", "reason": "仅允许沪深主板和创业板普通股票"}
 
 
 @contextmanager
