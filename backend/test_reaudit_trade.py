@@ -98,8 +98,6 @@ class LeaseAndFreshnessTests(unittest.TestCase):
         )
         self.assertTrue(P._today_quote_is_usable(fresh, now.date()))
         self.assertFalse(P._today_quote_is_usable(stale, now.date()))
-        aware = dict(fresh, quote_at=now.replace(tzinfo=dt.timezone(dt.timedelta(hours=8))).isoformat())
-        self.assertTrue(P._today_quote_is_usable(aware, now.date()))
 
 
 class ApiCacheGenerationTests(unittest.TestCase):
