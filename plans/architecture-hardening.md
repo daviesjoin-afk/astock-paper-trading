@@ -35,6 +35,7 @@
 - [x] M3q：增加 adaptive 依赖边界静态回归，禁止直接导入订单模块或调用提交/取消/开仓入口。
 - [x] M3r：将行情新鲜度、活跃度和成交核验门禁迁入 `paper_quote_policy.py`，保留 `paper_trading.py` 兼容包装并增加固定输入测试。
 - [x] M3s：将腾讯/新浪 K 线响应解析迁入 `marketdata_providers.py`，保留 `data_fetcher.py` provider 请求与回退顺序。
+- [x] M3t：将共享池席位分配和策略预算的纯计算迁入 `paper_allocation.py`，保留 `paper_trading.py` 数据读取、版本写入和兼容入口。
 - [ ] M3：本地 P2/P3/P4/P5 按小步提交完成，保持 API/交易语义兼容。
 - [x] M4：2026-09-03 将本地验收通过的同一版本部署到服务器并保留备份/回滚点。
 - [ ] M4a：2026-09-04 完成服务器健康、进程、数据库、模拟周期测试。
@@ -51,5 +52,5 @@
 - PRD/implementation branch: `codex/architecture-hardening-local`（本地）。
 - GitHub push: 未执行。
 - Server deployment: 已执行；本地提交 `b60d3a6` 对应部署包已校验并解包，镜像重建/重启完成，服务器备份位于 `/root/backups/20260903-architecture-predeploy/`。
-- Tests for this PRD: 179 backend tests passed with ResourceWarning as errors; compileall, diff check and prior Node/HTTP smoke checks passed.
+- Tests for this PRD: 182 backend tests passed with ResourceWarning as errors; compileall, diff check and prior Node/HTTP smoke checks passed.
 - Remote source pull: completed with SHA-256 verification; HTTP health read-only check returned 200 on `:8600`.
