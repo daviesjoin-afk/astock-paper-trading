@@ -5,12 +5,17 @@ param(
     [switch]$Local,
     [switch]$Docker,
     [switch]$SkipInstall,
-    [switch]$NoBrowser
+    [switch]$NoBrowser,
+    [switch]$NoScheduler
 )
 
 $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location -LiteralPath $root
+
+# Keep a fresh clone self-running during market hours.  The switch is useful
+# only when an external host scheduler owns the paper-trading slots.
+$env:ASTOCK_ENABLE_FALLBACK_THREADS = if ($NoScheduler) { "0" } else { "1" }
 
 function Test-Executable {
     param([Parameter(Mandatory)][string]$Name)
@@ -68,6 +73,7 @@ function Start-Docker {
         return $false
     }
     Write-Host "Building and starting the Docker service..."
+    Write-Host ("Built-in scheduler: " + ($(if ($NoScheduler) { "disabled" } else { "enabled" })))
     & docker compose up -d --build
     if ($LASTEXITCODE -ne 0) {
         if ($Docker) { throw "Docker Compose failed to start." }
