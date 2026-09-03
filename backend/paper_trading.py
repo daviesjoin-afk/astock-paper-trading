@@ -28,6 +28,7 @@ import universe as U
 import risk_center as RC
 import news_learning as NL
 import paper_research as PR
+import paper_storage as PST
 from market_policy import market_light_scale, market_light_scales
 from paper_trading_rules import (
     CHINEXT_PREFIXES,
@@ -1451,144 +1452,43 @@ def _rebuild_realized_pnl(conn):
 
 @contextmanager
 def _db(immediate=False):
-    """获取数据库连接。"""
-    path = DB_PATH
-    conn = sqlite3.connect(path, timeout=120)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys=ON")
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA busy_timeout=60000")
-    conn.execute("PRAGMA synchronous=NORMAL")
-    conn.execute("PRAGMA cache_size=-32000")
-    conn.execute("PRAGMA temp_store=MEMORY")
-    conn.execute("PRAGMA wal_autocheckpoint=1000")
-    if immediate:
-        conn.execute("BEGIN IMMEDIATE")
-    try:
+    """获取数据库连接（兼容包装，实际实现位于 ``paper_storage``）。"""
+    with PST.db(DB_PATH, immediate=immediate) as conn:
         yield conn
-    except Exception:
-        # 异常退出：回滚本事务块内尚未提交的写入，避免脏数据残留
-        try:
-            conn.rollback()
-        except Exception:
-            pass
-        raise
-    else:
-        # 正常退出：提交本事务块内的全部写入。
-        # 修复：此前缺少显式 commit，Python sqlite3 默认 isolation_level=''
-        # 会在 conn.close() 时隐式回滚，导致 paper_signals / paper_orders /
-        # paper_risk_decisions 等所有经 _db() 写入的数据全部丢失（审计记录
-        # 自 2026-08-18 10:46:48 起冻结）。
-        try:
-            conn.commit()
-        except sqlite3.OperationalError as exc:
-            if "database is locked" in str(exc):
-                # 锁冲突：写入仍在事务里，必须原样重试；二次失败先回滚，
-                # 不能让 close() 对半提交状态做隐式处理。
-                time.sleep(0.2)
-                try:
-                    conn.commit()
-                except Exception:
-                    conn.rollback()
-                    raise
-            else:
-                # 非锁类提交失败：显式回滚，保证连接关闭前状态确定。
-                try:
-                    conn.rollback()
-                except Exception:
-                    pass
-                raise
-    finally:
-        conn.close()
 
 
 def _wal_checkpoint():
-    """显式收缩 WAL 日志，防止 -wal/-shm 无界增长。
-
-    仅建议在批量写完成后调用（init_db 建表/迁移、每日清理归档等），
-    避免高频写路径上每次阻塞。TRUNCATE 需要无活跃读事务的独占条件，
-    失败时降级为 PASSIVE 尽力收缩；仍失败则静默等待下一轮。
-    """
-    try:
-        conn = sqlite3.connect(DB_PATH, timeout=30)
-        try:
-            conn.execute("PRAGMA busy_timeout=30000")
-            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-        except sqlite3.OperationalError:
-            try:
-                conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
-            except sqlite3.OperationalError:
-                pass
-        finally:
-            conn.close()
-    except Exception:
-        pass
+    """显式收缩 WAL 日志（兼容包装）。"""
+    PST.wal_checkpoint(DB_PATH)
 
 
 def _execute_with_retry(conn, sql, params=(), max_retries=3):
-    """执行 SQL 并在数据库锁定时重试。
-
-    Args:
-        conn: 数据库连接
-        sql: SQL 语句
-        params: 参数
-        max_retries: 最大重试次数
-
-    Returns:
-        cursor
-    """
-    for attempt in range(max_retries):
-        try:
-            return conn.execute(sql, params)
-        except sqlite3.OperationalError as e:
-            if "database is locked" in str(e) and attempt < max_retries - 1:
-                time.sleep(0.1 * (attempt + 1))
-                continue
-            raise
+    """执行 SQL 并在数据库锁定时重试（兼容包装）。"""
+    return PST.execute_with_retry(conn, sql, params=params, max_retries=max_retries)
 
 
 def _executemany_with_retry(conn, sql, params_list, max_retries=3):
-    """执行批量 SQL 并在数据库锁定时重试。"""
-    for attempt in range(max_retries):
-        try:
-            return conn.executemany(sql, params_list)
-        except sqlite3.OperationalError as e:
-            if "database is locked" in str(e) and attempt < max_retries - 1:
-                time.sleep(0.1 * (attempt + 1))
-                continue
-            raise
+    """执行批量 SQL 并在数据库锁定时重试（兼容包装）。"""
+    return PST.executemany_with_retry(
+        conn, sql, params_list, max_retries=max_retries
+    )
 
 
 def _commit_with_retry(conn, max_retries=3):
-    """提交事务并在数据库锁定时重试。"""
-    for attempt in range(max_retries):
-        try:
-            conn.commit()
-            return
-        except sqlite3.OperationalError as e:
-            if "database is locked" in str(e) and attempt < max_retries - 1:
-                time.sleep(0.1 * (attempt + 1))
-                continue
-            raise
+    """提交事务并在数据库锁定时重试（兼容包装）。"""
+    return PST.commit_with_retry(conn, max_retries=max_retries)
 
 @contextmanager
 def _db_readonly():
-    """Open a ledger reader that never runs migrations or takes a write lock.
+    """打开不执行迁移、不获取写锁的只读 ledger 连接（兼容包装）。
 
     Browser history/audit views must remain available while the intraday worker
     owns the writer.  ``init_db`` is intentionally a maintenance operation (it
     reconciles lots and performs schema upgrades), so it must not be called by
     a request that only displays archived orders.
     """
-    uri = f"file:{DB_PATH}?mode=ro"
-    conn = sqlite3.connect(uri, uri=True, timeout=3.0)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA query_only=ON")
-    conn.execute("PRAGMA busy_timeout=3000")
-    try:
+    with PST.db_readonly(DB_PATH) as conn:
         yield conn
-    finally:
-        conn.close()
 
 
 def _ensure_runtime_lease_columns(conn):
