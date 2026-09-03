@@ -28,6 +28,7 @@ paper ledger / read models
 - `backend/paper_portfolio.py` 负责将已读取的持仓 lot 聚合为兼容读模型；数据库查询与交易结算仍由 `paper_trading.py` 编排。
 - `backend/paper_ledger_reader.py` 是 adaptive 读取 paper ledger 的只读端口；使用 SQLite `mode=ro` 与 `query_only`，补偿恢复等明确写路径不经过该端口。
 - `backend/strategy_registry.py` 集中策略 ID、展示名称和 active/legacy 状态；adaptive、research、selection 展示从这里读取，暂不改变交易调度。
+- `backend/paper_repository.py` 提供通用 ledger 行读取与审计写入薄接口；`paper_trading.py` 保留旧 `_rows`/`_audit` 包装，后续再迁移对象级 SQL。
 - `backend/adaptive_risk.py` 使用 outbox（跨数据库操作意图表）保证纸盘提交后，adaptive 账本可重放收敛。
 - `frontend/app.js` 是前端运行时的 canonical source（唯一源文件）；`frontend/assets/` 在 Docker 构建时同步生成。
 
@@ -51,4 +52,4 @@ Domain 不直接依赖 FastAPI、SQLite、Eastmoney、Tencent、Sina 或具体 L
 
 ## 本次变更
 
-本次先同步服务器工作区并修复三个可验证边界：前端缓存版本/运行时镜像一致性、活动页风控审计请求上限，以及风险 outbox 在纸盘已提交后的 adaptive 侧重放收敛。随后新增 `decision_context.py` 集中证据读取、`decision_rules.py` 承载纯规则、`marketdata_transport.py` 承载 HTTP 传输、`marketdata_normalizers.py` 承载行情标准化、`paper_trading_rules.py` 承载交易日/费用/证券权限规则、`paper_storage.py` 隔离 SQLite 连接生命周期、`paper_portfolio.py` 承载持仓 lot 聚合、`paper_ledger_reader.py` 为 adaptive 提供只读 paper ledger 端口，并以 `strategy_registry.py` 集中策略身份口径；兼容导出和回归测试守住现有行为。更大范围的迁移和模块拆分仍按 `docs/PRD-architecture-hardening.md` 分阶段推进。
+本次先同步服务器工作区并修复三个可验证边界：前端缓存版本/运行时镜像一致性、活动页风控审计请求上限，以及风险 outbox 在纸盘已提交后的 adaptive 侧重放收敛。随后新增 `decision_context.py` 集中证据读取、`decision_rules.py` 承载纯规则、`marketdata_transport.py` 承载 HTTP 传输、`marketdata_normalizers.py` 承载行情标准化、`paper_trading_rules.py` 承载交易日/费用/证券权限规则、`paper_storage.py` 隔离 SQLite 连接生命周期、`paper_portfolio.py` 承载持仓 lot 聚合、`paper_ledger_reader.py` 为 adaptive 提供只读 paper ledger 端口、`strategy_registry.py` 集中策略身份口径，并以 `paper_repository.py` 建立 ledger 通用仓储薄接口；兼容导出和回归测试守住现有行为。更大范围的迁移和模块拆分仍按 `docs/PRD-architecture-hardening.md` 分阶段推进。
