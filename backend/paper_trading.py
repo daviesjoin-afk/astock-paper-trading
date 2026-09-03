@@ -31,6 +31,7 @@ import paper_research as PR
 import paper_storage as PST
 import paper_portfolio as PP
 import paper_repository as PRP
+import paper_performance as PPerf
 from market_policy import market_light_scale, market_light_scales
 from paper_trading_rules import (
     CHINEXT_PREFIXES,
@@ -3079,26 +3080,12 @@ def _position_rows(conn, account_id=None, asof_day=None, readonly=False):
 # 全市场快照缓存（盘中每 3 分钟由 intraday 扫描刷新）打的标签，quote_at
 # 与 live 同源同鲜度；只排除 local_cache（universe.json 陈旧价）。
 # 此前硬编码 == "live" 导致仪表盘路径今日盈亏永远显示"交易中"占位。
-_TODAY_PNL_QUOTE_SOURCES = {"live", "dashboard_cache", "live_snapshot"}
+_TODAY_PNL_QUOTE_SOURCES = PPerf.TODAY_PNL_QUOTE_SOURCES
 
 
 def _today_quote_is_usable(quote, asof_day):
     """Require a same-day, bounded-age mark before publishing daily P&L."""
-    if not isinstance(quote, dict) or quote.get("quote_source") not in _TODAY_PNL_QUOTE_SOURCES:
-        return False
-    quote_at = str(quote.get("quote_at") or "")
-    if quote_at[:10] != _date(asof_day).isoformat():
-        return False
-    try:
-        parsed = dt.datetime.fromisoformat(quote_at.replace("Z", "+00:00"))
-        if parsed.tzinfo is None:
-            parsed = parsed.replace(tzinfo=dt.timezone(dt.timedelta(hours=8)))
-        if _date(asof_day) != dt.date.today():
-            return True
-        age_seconds = (dt.datetime.now(dt.timezone.utc) - parsed.astimezone(dt.timezone.utc)).total_seconds()
-        return -120 <= age_seconds <= 20 * 60
-    except (TypeError, ValueError, OverflowError):
-        return False
+    return PPerf.quote_is_usable(quote, asof_day, date_fn=_date)
 
 
 def _open_runup_bonus(now=None):
@@ -3120,27 +3107,15 @@ def _open_runup_bonus(now=None):
 
 def _today_position_performance(position, price, quote, asof_day=None):
     """今日盈亏按持仓来源分段：当日买入按成交成本，隔夜仓按昨收。"""
-    day = _date(asof_day).isoformat()
-    # 只对当天的实时盘面应用交易时段门控；历史回看仍按历史行情计算。
-    if day == dt.date.today().isoformat() and not _market_session()["today_pnl_available"]:
-        return None, None, None
-    if not _today_quote_is_usable(quote, asof_day):
-        return None, None, None
-    qty = int(_num(position.get("qty")))
-    if qty <= 0 or price <= 0:
-        return None, None, None
-    bought_today = min(int(_num(position.get("today_acquired_qty"))), qty)
-    today_cost = _num(position.get("today_acquired_cost"))
-    carried_qty = qty - bought_today
-    quote_pct = _num(quote.get("pct"), None)
-    if carried_qty and (quote_pct is None or quote_pct <= -99.9):
-        return None, None, None
-    previous_close = _num(quote.get("previous_close"), 0.0) if carried_qty else 0.0
-    if carried_qty and previous_close <= 0:
-        previous_close = price / (1 + quote_pct / 100)
-    baseline = today_cost + carried_qty * previous_close
-    pnl = (price * bought_today - today_cost) + (price - previous_close) * carried_qty
-    return round(pnl, 2), (round(pnl / baseline * 100, 2) if baseline else None), round(baseline, 2)
+    return PPerf.position_performance(
+        position,
+        price,
+        quote,
+        asof_day,
+        date_fn=_date,
+        market_session=_market_session,
+        num=_num,
+    )
 
 
 def _today_sell_performance(sells, quotes, asof_day=None):
@@ -3151,38 +3126,13 @@ def _today_sell_performance(sells, quotes, asof_day=None):
     all gains/losses since acquisition to the sell date and double count the
     dashboard's daily movement.
     """
-    day = _date(asof_day).isoformat()
-    pnl = 0.0
-    baseline = 0.0
-    covered = 0
-    missing = []
-    for order in sells:
-        quote = quotes.get(str(order.get("code") or "")) or {}
-        if not _today_quote_is_usable(quote, asof_day):
-            missing.append(str(order.get("code") or ""))
-            continue
-        price = _num(quote.get("price"), 0.0)
-        pct = _num(quote.get("pct"), None)
-        qty = int(_num(order.get("qty")))
-        fill_price = _num(order.get("filled_price"), 0.0)
-        if price <= 0 or pct is None or pct <= -99.9 or qty <= 0 or fill_price <= 0:
-            missing.append(str(order.get("code") or ""))
-            continue
-        previous_close = _num(quote.get("previous_close"), 0.0)
-        if previous_close <= 0:
-            previous_close = price / (1 + pct / 100)
-        basis = previous_close * qty
-        proceeds = fill_price * qty - _num(order.get("fees"))
-        pnl += proceeds - basis
-        baseline += basis
-        covered += 1
-    return {
-        "pnl": round(pnl, 2),
-        "baseline": round(baseline, 2),
-        "covered": covered,
-        "total": len(sells),
-        "missing_codes": sorted({code for code in missing if code}),
-    }
+    return PPerf.sell_performance(
+        sells,
+        quotes,
+        asof_day,
+        date_fn=_date,
+        num=_num,
+    )
 
 
 def _sync_positions(conn, account_id=None, asof_day=None):
