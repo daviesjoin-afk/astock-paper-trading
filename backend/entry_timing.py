@@ -163,6 +163,7 @@ def _evaluate(strategy_id, code, price, pct, now=None, *, fast=False, evidence=N
                            "reason": "午后不接受首次触发，等待次日早盘结构"}
 
         # ---- 失效/已入场记录的守门 ----
+        _carry_retrig = 0
         if record:
             # 已入场标记：同日不再对同一标的重复触发（卖出后自然过期重置）
             if record.get("state") == "entered":
@@ -203,6 +204,8 @@ def _evaluate(strategy_id, code, price, pct, now=None, *, fast=False, evidence=N
                     _save()
                     return False, {"state": "expired",
                                    "reason": f"等待回踩：需回落至 {reclaim:.2f}（失效高点-2%）以下重新触发"}
+                # 保留重触发 lineage，便于日志和前端区分反复进出。
+                _carry_retrig = int(record.get("retrigger_seq") or 0) + 1
                 bucket.pop(code, None)  # 已回踩，清记录走全新触发
                 record = None
             else:
@@ -229,6 +232,7 @@ def _evaluate(strategy_id, code, price, pct, now=None, *, fast=False, evidence=N
                             "high_since_trigger": price,
                             "last_price": price,
                             "mode": record.get("mode") or "normal",
+                            "retrigger_seq": _carry_retrig,
                             "retriggered_after_timeout": True,
                         }
                         _save()
@@ -268,12 +272,14 @@ def _evaluate(strategy_id, code, price, pct, now=None, *, fast=False, evidence=N
                 "high_since_trigger": price,
                 "last_price": price,
                 "mode": mode,
+                "retrigger_seq": _carry_retrig,
             }
             _save()
             if required <= 1:
                 return True, {"state": "confirmed", "record": record}
+            retrig_label = f"第{_carry_retrig}次重触发" if _carry_retrig else "首次触发"
             return False, {"state": "triggered",
-                           "reason": f"首次触发，连续确认中 1/{required}（{mode}模式）",
+                           "reason": f"{retrig_label}，连续确认中 1/{required}（{mode}模式）",
                            "record": record}
 
         # ---- 后续扫描：更新轨迹 ----
@@ -423,8 +429,10 @@ def _evaluate(strategy_id, code, price, pct, now=None, *, fast=False, evidence=N
             record["state"] = "confirmed"
             _save()
             return True, {"state": "confirmed", "record": record}
+        retrig_seq = int(record.get("retrigger_seq") or 0)
         return False, {"state": "confirming",
-                       "reason": f"连续确认中 {confirm_count}/{required}（{mode}模式，已等 {int(elapsed)}秒）"}
+                       "reason": (f"第{retrig_seq}次重触发后" if retrig_seq else "")
+                                 + f"连续确认中 {confirm_count}/{required}（{mode}模式，已等 {int(elapsed)}秒）"}
 
 
 def mark_entered(strategy_id, code, price=None):

@@ -16,7 +16,7 @@ class FrontendRiskAuditRaceTests(unittest.TestCase):
         self.assertIn("auditRequest||api('/api/paper/risk-audit?limit=160')", source)
 
     def test_frontend_cache_key_includes_risk_audit_fix(self):
-        self.assertIn("risk-symbol-name-v6", INDEX.read_text(encoding="utf-8"))
+        self.assertIn("retry-backoff-v1", INDEX.read_text(encoding="utf-8"))
 
 
 if __name__ == "__main__":

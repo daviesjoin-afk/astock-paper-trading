@@ -629,7 +629,10 @@ def northbound_realtime(ttl_seconds=300):
     非空分钟点。上游断供/异常返回 None（fail-open）。注意：东财系北向
     净买字段 2024-08 后断供，此同花顺源是当前少数可用通道。
     """
-    hit = _cached("northbound", ttl_seconds)
+    # Keep the cache date-scoped so a midnight rollover cannot return
+    # yesterday's cumulative flow while the TTL is still valid.
+    _today = dt.date.today().isoformat()
+    hit = _cached(f"northbound:{_today}", ttl_seconds)
     if hit is not None:
         return hit
     result = None
@@ -661,7 +664,7 @@ def northbound_realtime(ttl_seconds=300):
             }
     except Exception:
         result = None
-    _store("northbound", result)
+    _store(f"northbound:{_today}", result)
     return result
 
 
