@@ -32,6 +32,7 @@ import paper_storage as PST
 import paper_portfolio as PP
 import paper_repository as PRP
 import paper_performance as PPerf
+import paper_schema_migrations as PSM
 from market_policy import market_light_scale, market_light_scales
 from paper_trading_rules import (
     CHINEXT_PREFIXES,
@@ -1502,48 +1503,7 @@ def _ensure_runtime_lease_columns(conn):
     rows; a missing expiry is handled by the conservative started_at fallback
     in ``_recover_stale_runtime_state``.
     """
-    migrations = {
-        "paper_jobs": {
-            "owner_key": "TEXT",
-            "heartbeat_at": "TEXT",
-            "expires_at": "TEXT",
-            "fencing_token": "INTEGER NOT NULL DEFAULT 0",
-        },
-        "paper_job_runs": {
-            "owner_key": "TEXT",
-            "heartbeat_at": "TEXT",
-            "expires_at": "TEXT",
-            "fencing_token": "INTEGER NOT NULL DEFAULT 0",
-        },
-        "paper_runtime_locks": {
-            "heartbeat_at": "TEXT",
-            "fencing_token": "INTEGER NOT NULL DEFAULT 0",
-        },
-        "paper_nav": {"quote_status": "TEXT NOT NULL DEFAULT 'verified'"},
-    }
-    for table, definitions in migrations.items():
-        try:
-            columns = {row[1] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
-        except sqlite3.Error:
-            continue
-        for column, definition in definitions.items():
-            if column not in columns:
-                conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
-    # Older runner builds used an ISO ``T`` separator for runtime locks while
-    # the rest of the ledger used a space.  Normalize those legacy values once
-    # so the expiry comparisons remain correct across the migration boundary.
-    for table in ("paper_jobs", "paper_job_runs", "paper_runtime_locks"):
-        try:
-            table_columns = {row[1] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
-            for column in ("started_at", "acquired_at", "heartbeat_at", "expires_at"):
-                if column not in table_columns:
-                    continue
-                conn.execute(
-                    f"UPDATE {table} SET {column}=replace({column},'T',' ') "
-                    f"WHERE {column} IS NOT NULL AND instr({column},'T')>0"
-                )
-        except sqlite3.Error:
-            continue
+    return PSM.ensure_runtime_lease_columns(conn)
 
 
 def _recover_stale_runtime_state(conn, *, boot_recovery=False):
@@ -1810,38 +1770,7 @@ def _ensure_ignition_shadow_table(conn):
     永远不会执行新建库的 executescript 建表块；新增表必须有自己的
     幂等迁移，否则线上库永远缺表（2026-08-31 部署时发现）。
     """
-    try:
-        conn.execute(
-            """CREATE TABLE IF NOT EXISTS paper_ignition_shadow (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                day TEXT NOT NULL,
-                bucket TEXT NOT NULL,
-                code TEXT NOT NULL,
-                recorded_at TEXT NOT NULL,
-                price REAL,
-                pct REAL,
-                runup REAL,
-                old_rule_passed INTEGER NOT NULL DEFAULT 0,
-                old_rule_reason TEXT,
-                ignition_passed INTEGER NOT NULL DEFAULT 0,
-                ignition_reasons TEXT,
-                price_30m REAL,
-                at_30m TEXT,
-                price_60m REAL,
-                at_60m TEXT,
-                resolved INTEGER NOT NULL DEFAULT 0
-            )"""
-        )
-        conn.execute(
-            """CREATE UNIQUE INDEX IF NOT EXISTS idx_paper_ignition_shadow_unique
-                ON paper_ignition_shadow(day, bucket, code)"""
-        )
-        conn.execute(
-            """CREATE INDEX IF NOT EXISTS idx_paper_ignition_shadow_recent
-                ON paper_ignition_shadow(day, resolved)"""
-        )
-    except Exception:
-        pass  # 影子表缺失只降级影子记录，绝不阻断交易主链路
+    return PSM.ensure_ignition_shadow_table(conn)
 
 
 def init_db():
@@ -1858,6 +1787,7 @@ def init_db():
                 # fast-path return previously skipped newly registered
                 # strategy accounts forever, so code/UI could show a strategy
                 # that the scheduler never ran.
+                PSM.ensure_paper_columns(conn)
                 _ensure_accounts(conn)
                 _ensure_cycle(conn)
                 _ensure_runtime_lease_columns(conn)
@@ -2079,21 +2009,7 @@ def init_db():
 
 """
         )
-        columns = {row[1] for row in conn.execute("PRAGMA table_info(paper_orders)").fetchall()}
-        if "realized_pnl" not in columns:
-            conn.execute("ALTER TABLE paper_orders ADD COLUMN realized_pnl REAL")
-        order_migrations = {
-            "order_type": "TEXT NOT NULL DEFAULT 'market'",
-            "origin": "TEXT NOT NULL DEFAULT 'strategy'",
-            "expires_at": "TEXT",
-            "cancelled_at": "TEXT",
-        }
-        for column, definition in order_migrations.items():
-            if column not in columns:
-                conn.execute(f"ALTER TABLE paper_orders ADD COLUMN {column} {definition}")
-        lot_columns = {row[1] for row in conn.execute("PRAGMA table_info(paper_position_lots)").fetchall()}
-        if "cost_fee_included" not in lot_columns:
-            conn.execute("ALTER TABLE paper_position_lots ADD COLUMN cost_fee_included INTEGER NOT NULL DEFAULT 0")
+        PSM.ensure_paper_columns(conn)
         # 升级前的 lot 只记录成交价。来源订单存在时，将已实际扣除的买入费用
         # 分摊到每股成本；无来源的历史兼容 lot 不臆造费用，保留原始成本。
         conn.execute(
@@ -2146,19 +2062,6 @@ def init_db():
             (ENTRY_FROZEN_WAITLIST_STATUS,),
         )
         _rebuild_realized_pnl(conn)
-        position_columns = {row[1] for row in conn.execute("PRAGMA table_info(paper_positions)").fetchall()}
-        if "asset_type" not in position_columns:
-            conn.execute("ALTER TABLE paper_positions ADD COLUMN asset_type TEXT NOT NULL DEFAULT 'stock_t1'")
-        account_columns = {row[1] for row in conn.execute("PRAGMA table_info(paper_accounts)").fetchall()}
-        account_migrations = {
-            "cycle_id": "INTEGER", "mode": "TEXT NOT NULL DEFAULT 'swing'",
-            "style": "TEXT NOT NULL DEFAULT 'pullback'", "risk_profile": "TEXT NOT NULL DEFAULT 'aggressive'",
-            "params": "TEXT NOT NULL DEFAULT '{}'", "daily_start_nav": "REAL",
-            "daily_nav_date": "TEXT", "cooldown_until": "TEXT",
-        }
-        for column, definition in account_migrations.items():
-            if column not in account_columns:
-                conn.execute(f"ALTER TABLE paper_accounts ADD COLUMN {column} {definition}")
         _ensure_accounts(conn)
         _ensure_cycle(conn)
         _ensure_runtime_lease_columns(conn)
