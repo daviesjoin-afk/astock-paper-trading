@@ -48,7 +48,7 @@
 - [x] M3ad：将个股到概念板块的东财响应解析迁入 provider 适配器；保留网络请求、主机回退和概念过滤口径。
 - [ ] M3：本地 P2/P3/P4/P5 按小步提交完成，保持 API/交易语义兼容。
 - [x] M4：2026-09-03 将本地验收通过的同一版本部署到服务器并保留备份/回滚点。
-- [ ] M4a：2026-09-04 完成服务器健康、进程、数据库、模拟周期测试。
+- [ ] M4a：2026-09-04 完成服务器健康、进程、数据库、模拟周期测试。00:05 初检中容器健康、`overview`/`strategy-center` 为 200；但服务器工作区有 100 个修改和 37 个未跟踪文件，且非交易时段，待保留该工作区并在交易时段继续验证。
 - [ ] M5：服务器通过且用户确认后，push 分支/创建或更新 PR，记录 CI 与 GitHub 状态。
 
 ## Decision log
@@ -63,4 +63,4 @@
 - GitHub push: 未执行。
 - Server deployment: 已执行；本地提交 `b60d3a6` 对应部署包已校验并解包，镜像重建/重启完成，服务器备份位于 `/root/backups/20260903-architecture-predeploy/`。
 - Tests for this PRD: 198 backend tests passed with ResourceWarning as errors; compileall, diff check and prior Node/HTTP smoke checks passed.
-- Remote source pull: completed with SHA-256 verification; HTTP health read-only check returned 200 on `:8600`.
+- Remote source pull: completed with SHA-256 verification. 2026-09-04 00:05 read-only server check: source `22762e2` is dirty (100 modified, 37 untracked); running image was built at `2026-09-03T21:11:43+08:00`, container is healthy, and `:8600` read-only endpoints returned 200. Health is degraded only because the previous trade-day live snapshot is stale for the new calendar day.
