@@ -16448,6 +16448,10 @@ def latest_reviews():
 
 
 def schedule_status():
+    # A fresh public clone has no runtime database yet.  Initialize the
+    # schema before the status read so the first dashboard request is usable
+    # instead of failing on the paper_jobs query.
+    init_db()
     names = [
             "A股模拟盘-竞价预选", "A股模拟盘-日内监控-上午", "A股模拟盘-日内监控-下午", "A股模拟盘-开盘审批",
         "A股模拟盘-盘后评分", "A股模拟盘-周度复盘",
