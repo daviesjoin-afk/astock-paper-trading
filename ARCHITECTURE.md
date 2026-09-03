@@ -20,6 +20,7 @@ paper ledger / read models
 - `backend/api_paper.py`、`backend/api_adaptive.py` 负责 HTTP 契约；`confirmed=true` 是防误触确认，不是身份认证。
 - `backend/paper_trading.py` 仍是主要交易编排与账本实现，后续按小步拆出 Execution、Portfolio、Risk 和 Scheduler。
 - `backend/decision_context.py` 集中定义决策证据快照与兼容加载适配器；`decision_engine.py` 的公开入口暂时保持不变。
+- `backend/decision_rules.py` 承载不依赖数据源的评分、买入时机、止盈和止损规则；规则模块不联网、不读缓存、不写账本。
 - `backend/adaptive_risk.py` 使用 outbox（跨数据库操作意图表）保证纸盘提交后，adaptive 账本可重放收敛。
 - `frontend/app.js` 是前端运行时的 canonical source（唯一源文件）；`frontend/assets/` 在 Docker 构建时同步生成。
 
@@ -43,4 +44,4 @@ Domain 不直接依赖 FastAPI、SQLite、Eastmoney、Tencent、Sina 或具体 L
 
 ## 本次变更
 
-本次先同步服务器工作区并修复三个可验证边界：前端缓存版本/运行时镜像一致性、活动页风控审计请求上限，以及风险 outbox 在纸盘已提交后的 adaptive 侧重放收敛。随后新增 `decision_context.py`，将决策所需证据的读取集中到兼容适配器，并用显式注入测试守住纯输入边界。更大范围的迁移和模块拆分仍按 `docs/PRD-architecture-hardening.md` 分阶段推进。
+本次先同步服务器工作区并修复三个可验证边界：前端缓存版本/运行时镜像一致性、活动页风控审计请求上限，以及风险 outbox 在纸盘已提交后的 adaptive 侧重放收敛。随后新增 `decision_context.py` 集中证据读取，并将无 I/O 的规则抽到 `decision_rules.py`，用显式注入和规则回归测试守住纯输入边界。更大范围的迁移和模块拆分仍按 `docs/PRD-architecture-hardening.md` 分阶段推进。

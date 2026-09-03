@@ -10,47 +10,20 @@
 """
 import os, sys
 
-import pandas as pd
-
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import factors as F
 from decision_context import load_evidence
-
-
-def _safe(v):
-    return v if isinstance(v, (int, float)) and not pd.isna(v) else 0.0
-
-
-def _normalize_news_hits(news_hits, code):
-    """归一化 news_hits：兼容 list[dict]（来自 news_keyword_scan）和 dict 两种格式。
-    返回 {pos:[], neg:[]}"""
-    pos, neg = [], []
-    if not news_hits:
-        return {"pos": pos, "neg": neg}
-    # dict 格式: {code: {pos:[], neg:[]}}
-    if isinstance(news_hits, dict):
-        hit = news_hits.get(code, {})
-        return {"pos": hit.get("pos", []), "neg": hit.get("neg", [])}
-    # list[dict] 格式: [{code, name, tone, keywords, summary, time, source}, ...]
-    for h in news_hits:
-        if h.get("code") != code:
-            continue
-        if h.get("tone", 0) > 0:
-            pos.append(h)
-        elif h.get("tone", 0) < 0:
-            neg.append(h)
-    return {"pos": pos, "neg": neg}
+from decision_rules import (
+    _dim_status,
+    _normalize_news_hits,
+    _safe,
+    buy_timing_tier,
+    forced_stop_losses,
+    ladder_take_profit,
+)
 
 
 # ---------- 工具：六维健康度 ----------
-def _dim_status(score):
-    if score >= 0.6:
-        return "green"
-    if score >= 0.35:
-        return "yellow"
-    return "red"
-
-
 # ---------- 一、买入执行 ----------
 
 def pre_open_six_dim(code, name=None, kline=None, snap=None, sector_flow=None,
@@ -277,28 +250,6 @@ def limit_up_seal_check(code, snap=None, kline=None, sector_flow=None):
                         ("谨慎追高" if status == "yellow" else "封单存疑，不建议追"))}
 
 
-def buy_timing_tier(dims, seal=None):
-    """
-    T1-T5 五级时机：
-    T1 积极买入，T2 可执行买入，T3 观察/轻仓，T4 放弃或仅观察，T5 禁止买入。
-    """
-    green = sum(1 for d in dims if d["status"] == "green")
-    red = sum(1 for d in dims if d["status"] == "red")
-    avg_score = sum(d["score"] for d in dims) / len(dims) if dims else 0
-
-    if seal and seal["status"] == "red":
-        return {"tier": "T5", "action": "放弃", "reason": "涨停封单存疑"}
-    if green >= 4 and red == 0 and avg_score >= 0.65:
-        return {"tier": "T1", "action": "积极买入", "reason": "六维 mostly 绿灯，大盘环境友好"}
-    if green >= 3 and red <= 1 and avg_score >= 0.5:
-        return {"tier": "T2", "action": "可执行买入", "reason": "多数维度健康，可开仓"}
-    if red <= 2 and avg_score >= 0.4:
-        return {"tier": "T3", "action": "观察/轻仓", "reason": "信号混杂，建议观察清单跟踪"}
-    if red >= 3:
-        return {"tier": "T4", "action": "放弃", "reason": "多个维度红灯"}
-    return {"tier": "T5", "action": "禁止买入", "reason": "综合评分过低或涨停封单不可信"}
-
-
 def buy_decision(code, name=None, kline=None, snap=None, sector_flow=None,
                  overseas_gate=None, news_hits=None):
     """
@@ -359,84 +310,6 @@ def buy_decision(code, name=None, kline=None, snap=None, sector_flow=None,
 
 
 # ---------- 二、卖出决策 ----------
-
-def ladder_take_profit(ret_pct):
-    """
-    8 档阶梯止盈：到达对应浮盈档位建议减仓比例。
-    返回 [(threshold, take_pct, keep_stop)]，keep_stop 为移动止盈位（相对成本 %）。
-    """
-    tiers = [
-        (5, 10, None),     # +5%  减仓 10%
-        (10, 15, 0),       # +10% 减仓 15%，保本
-        (15, 20, 3),       # +15% 减仓 20%，保 3% 利润
-        (20, 25, 5),       # +20% 减仓 25%，保 5% 利润
-        (30, 30, 10),      # +30% 减仓 30%，保 10% 利润
-        (50, 40, 20),      # +50% 减仓 40%，保 20% 利润
-        (80, 50, 40),      # +80% 减仓 50%，保 40% 利润
-        (100, 60, 50),     # +100% 减仓 60%，保 50% 利润
-    ]
-    active = []
-    for thr, take, stop in tiers:
-        if ret_pct >= thr:
-            active.append({"threshold": thr, "take_pct": take,
-                           "protect_profit": stop,
-                           "msg": f"浮盈 ≥{thr}% 已触发，建议减仓 {take}%，移动止盈保 {stop}%" if stop is not None
-                                   else f"浮盈 ≥{thr}% 已触发，建议减仓 {take}%"})
-    # 返回最高一档
-    return active[-1] if active else None
-
-
-def forced_stop_losses(price, cost, peak_price, hold_days, mom20, main_pct,
-                       news_neg=None, overseas_light=None):
-    """
-    4 类强制止损：价格、回撤、时间、因子/黑天鹅。
-    返回所有触发的信号列表。
-    """
-    signals = []
-    ret_pct = (price / cost - 1) * 100 if (price and cost) else None
-    dd = (1 - price / peak_price) * 100 if (price and peak_price) else None
-
-    # 1. 价格止损
-    if ret_pct is not None and ret_pct <= -8:
-        signals.append({"type": "价格止损", "level": "sell",
-                        "msg": f"较成本下跌 {abs(ret_pct):.1f}% ≥ 8%"})
-
-    # 2. 回撤止损
-    if dd is not None and dd >= 10:
-        signals.append({"type": "回撤止损", "level": "sell",
-                        "msg": f"自峰值回撤 {dd:.1f}% ≥ 10%"})
-
-    # 3. 时间止损
-    if hold_days is not None and hold_days > 20 and (ret_pct is None or ret_pct < 5):
-        signals.append({"type": "时间止损", "level": "warn",
-                        "msg": f"持有 {hold_days} 个交易日，收益不足 5%，机会成本过高"})
-
-    # 4. 因子/黑天鹅止损
-    deterioration = []
-    if mom20 is not None and mom20 < 0:
-        deterioration.append(f"20日动量转负({mom20:.1f}%)")
-    if isinstance(main_pct, (int, float)) and main_pct < -5:
-        deterioration.append(f"主力净流出占比 {main_pct:.1f}%")
-    if news_neg:
-        deterioration.append(f"负面舆情 {len(news_neg)} 条")
-    # 单一技术信号不再强制卖出：负面舆情，或动量+资金同时恶化才升级为卖出。
-    if news_neg or (
-        mom20 is not None
-        and mom20 < 0
-        and isinstance(main_pct, (int, float))
-        and main_pct < -5
-    ):
-        signals.append({"type": "因子/黑天鹅止损", "level": "sell",
-                        "msg": "；".join(deterioration)})
-    elif deterioration:
-        signals.append({"type": "因子恶化", "level": "warn",
-                        "msg": "；".join(deterioration)})
-    if overseas_light == "red":
-        signals.append({"type": "海外风险", "level": "warn",
-                        "msg": "海外风险红灯，建议降低组合仓位而非单票无条件卖出"})
-
-    return signals
-
 
 def next_day_auction_matrix(code, name=None, kline=None, snap=None,
                             overseas_gate=None, news_hits=None, sector_flow=None):
