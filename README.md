@@ -73,15 +73,39 @@ frontend/               Web 看板（账户/持仓/风控/审计回放；静态�
 Dockerfile              容器镜像（API 与应用镜像，不含编排）
 ```
 
+## 一键启动
+
+仓库根目录提供跨平台启动脚本。脚本会优先尝试 Docker Compose；Docker 不可用时自动切换到本地 Python 虚拟环境，首次运行自动创建 `.venv` 并按 `requirements.txt` 安装依赖。启动成功后会打开 Web 看板；脚本只启动服务，不会自动创建模拟交易周期。
+
+Windows：双击 [start.bat](start.bat)，或在 PowerShell 中运行：
+
+```powershell
+.\start.ps1                 # 自动选择 Docker，失败后使用本地模式
+.\start.ps1 -Local          # 强制本地 Python 模式
+.\start.ps1 -Docker         # 强制 Docker Compose（端口固定为 8600）
+.\start.ps1 -Port 8601      # 使用自定义端口时自动使用本地模式
+.\start.ps1 -NoBrowser      # 不自动打开浏览器
+```
+
+Linux/macOS：
+
+```bash
+chmod +x start.sh
+./start.sh                  # 自动选择 Docker 或本地模式
+./start.sh --local --port 8601 --no-browser
+```
+
+启动脚本不包含密钥、服务器配置或运行时记录；`.env`、`.venv`、`data_cache/` 与 `reports/` 均只保留在本机。Docker 模式使用仓库专用的命名卷，从空账本开始，不会连接其他实例的数据卷。
+
 ## 本地开发
 
-Python 3.11+，从仓库根目录执行。首次启动会自动初始化 SQLite 与股票池（需联网）。
+Python 3.11+，从仓库根目录执行。以下是手动启动方式，适合开发和调试。
 
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
 
-# 1) 启动 Web 看板与 API（http://127.0.0.1:8600）
+# 1) 启动 Web 看板与 API（http://localhost:8600）
 .\.venv\Scripts\python.exe -m uvicorn backend.main:app --port 8600
 
 # 2) 后端单元测试（unittest 风格，离线核心逻辑可跑）
@@ -117,7 +141,7 @@ docker compose up -d --build
 # 查看启动日志
 docker compose logs -f app
 
-# 打开 http://127.0.0.1:8600
+# 打开 http://localhost:8600
 ```
 
 停止服务但保留数据：
