@@ -7,6 +7,7 @@ from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import requests
 import pandas as pd
+import marketdata_cache as MDC
 import marketdata_normalizers as MN
 from marketdata_transport import (
     HEADERS,
@@ -47,16 +48,10 @@ _manifest = None
 _manifest_mtime = None
 _manifest_dirty = 0
 _manifest_pending = {}
+
+
 def _cached(key, ttl, fn):
-    now = time.time()
-    with _cache_lock:
-        if key in _mem_cache and now - _mem_cache[key][0] < ttl:
-            return _mem_cache[key][1]
-    val = fn()
-    if val:  # 空结果不进缓存，避免一次失败污染后续请求
-        with _cache_lock:
-            _mem_cache[key] = (now, val)
-    return val
+    return MDC.cached(_mem_cache, _cache_lock, key, ttl, fn)
 
 
 @contextmanager
@@ -69,27 +64,10 @@ def _full_snapshot_singleflight_lock():
     development has no ``fcntl``; the process-local lock still protects its
     threads and the lock file remains harmless.
     """
-    lock_handle = None
-    with _full_snapshot_thread_lock:
-        try:
-            lock_handle = open(MARKET_SNAPSHOT_FULL_LOCK_PATH, "a+", encoding="utf-8")
-        except OSError:
-            # A read-only/cache-recovery environment may not permit a lock
-            # sidecar.  Keep the process-local guard and let the caller's
-            # existing fail-closed refresh logic decide whether data is usable.
-            yield
-            return
-        try:
-            if _fcntl is not None:
-                _fcntl.flock(lock_handle.fileno(), _fcntl.LOCK_EX)
-            yield
-        finally:
-            if lock_handle is not None:
-                try:
-                    if _fcntl is not None:
-                        _fcntl.flock(lock_handle.fileno(), _fcntl.LOCK_UN)
-                finally:
-                    lock_handle.close()
+    with MDC.full_snapshot_singleflight_lock(
+        _full_snapshot_thread_lock, MARKET_SNAPSHOT_FULL_LOCK_PATH
+    ):
+        yield
 
 def _get_json(url, params=None, timeout=15, retries=2):
     txt = http_get(url, params=params, timeout=timeout, retries=retries)
@@ -99,24 +77,12 @@ def _get_json(url, params=None, timeout=15, retries=2):
 
 
 def _save_source_health(payload):
-    try:
-        # PID+UUID avoids collisions even when two containers both run as PID 1.
-        temp_path = f"{DATA_SOURCE_HEALTH_PATH}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
-        with open(temp_path, "w", encoding="utf-8") as handle:
-            json.dump(payload, handle, ensure_ascii=False, allow_nan=False)
-        os.replace(temp_path, DATA_SOURCE_HEALTH_PATH)
-    except OSError:
-        pass
+    return MDC.save_source_health(DATA_SOURCE_HEALTH_PATH, payload)
 
 
 def load_source_health():
     """Return the latest persisted source check without touching the network."""
-    try:
-        with open(DATA_SOURCE_HEALTH_PATH, encoding="utf-8") as handle:
-            payload = json.load(handle)
-        return payload if isinstance(payload, dict) else {}
-    except (OSError, ValueError, TypeError):
-        return {}
+    return MDC.load_source_health(DATA_SOURCE_HEALTH_PATH)
 
 
 def check_data_source_health(force=False):
