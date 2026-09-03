@@ -35,6 +35,7 @@ import paper_performance as PPerf
 import paper_schema_migrations as PSM
 import paper_archive_projection as PAP
 import paper_quote_policy as PQP
+import paper_allocation as PA
 from market_policy import market_light_scale, market_light_scales
 from paper_trading_rules import (
     CHINEXT_PREFIXES,
@@ -7379,43 +7380,22 @@ def _dynamic_position_limits(conn):
         }
     count = len(account_ids)
     baseline = sum(_num(ACCOUNT_SPECS[key].get("max_exposure"), 0.0) for key in account_ids) / max(count, 1)
-    current = sum(weights.values()) / max(count, 1)
-    # The hard cap is 15.  A material aggregate risk reduction leaves
-    # one or more seats empty instead of pretending every strategy should be
-    # fully deployed.  With four models, each retains a protected expression
-    # floor when the risk budget permits; the risk profile still
-    # constrains capital, single-name size and entry permission.
-    hard_cap = min(SHARED_POOL_MAX_POSITIONS, STRATEGY_MAX_POSITIONS * count)
-    risk_scale = max(0.60, min(1.0, current / max(baseline, 0.01)))
-    base_floor_total = min(hard_cap, STRATEGY_MIN_POSITIONS * count)
-    total_cap = max(base_floor_total, min(hard_cap, int(round(hard_cap * risk_scale))))
-    protected_floor = (
-        min(STRATEGY_PROTECTED_SLOT_FLOOR, STRATEGY_MAX_POSITIONS)
-        if total_cap >= STRATEGY_PROTECTED_SLOT_FLOOR * count else
-        STRATEGY_MIN_POSITIONS
+    allocation = PA.position_limits(
+        account_ids,
+        weights,
+        baseline,
+        hard_pool_cap=SHARED_POOL_MAX_POSITIONS,
+        strategy_max_positions=STRATEGY_MAX_POSITIONS,
+        strategy_min_positions=STRATEGY_MIN_POSITIONS,
+        protected_slot_floor=STRATEGY_PROTECTED_SLOT_FLOOR,
+        account_order={key: idx for idx, key in enumerate(ACCOUNT_SPECS)},
+        main_force_id=MAIN_FORCE_STRATEGY_ID,
     )
-    minimum = min(protected_floor, total_cap // max(count, 1))
-    weight_total = sum(weights.values()) or 1.0
-    raw = {key: total_cap * weights[key] / weight_total for key in account_ids}
-    strategy_caps = {key: (3 if key == MAIN_FORCE_STRATEGY_ID else STRATEGY_MAX_POSITIONS)
-                     for key in account_ids}
-    limits = {
-        key: max(minimum, min(strategy_caps[key], int(raw[key])))
-        for key in account_ids
-    }
-    order = {key: idx for idx, key in enumerate(ACCOUNT_SPECS)}
-    while sum(limits.values()) < total_cap:
-        candidates = [key for key in account_ids if limits[key] < strategy_caps[key]]
-        if not candidates:
-            break
-        key = max(candidates, key=lambda item: (raw[item] - limits[item], weights[item], -order.get(item, 99)))
-        limits[key] += 1
-    while sum(limits.values()) > total_cap:
-        candidates = [key for key in account_ids if limits[key] > minimum]
-        if not candidates:
-            break
-        key = max(candidates, key=lambda item: (limits[item] - raw[item], -weights[item], order.get(item, 99)))
-        limits[key] -= 1
+    risk_scale = allocation["risk_scale"]
+    protected_floor = allocation["protected_slot_floor"]
+    total_cap = allocation["total_cap"]
+    limits = allocation["limits"]
+    current = sum(weights.values()) / max(count, 1)
     now = _now()
     cursor = conn.execute(
         """INSERT INTO paper_position_limit_versions(
@@ -7479,107 +7459,23 @@ def _strategy_pool_budget(conn, account, nav, positions, quotes, market=None, ex
     pending_by_account, pending_total = _pending_buy_reservations(
         conn, exclude_order_key=exclude_reservation_key,
     )
-    nav = max(_num(nav), 0.0)
-    pool_cap_amount = nav * SHARED_POOL_MAX_EXPOSURE
-    pool_value = sum(values.values())
-    # Pending buys consume both cash and pool capacity before they fill.
-    # They are not added to market value, so keep the two figures explicit.
-    global_remaining = max(0.0, pool_cap_amount - pool_value - pending_total)
-    weight_total = sum(weights.values()) or 1.0
-    base_target_pct = {
-        key: SHARED_POOL_MAX_EXPOSURE * weight / weight_total
-        for key, weight in weights.items()
-    }
     market_light = str((market or {}).get("light") or "").lower()
     # A missing market argument is used by read-only dashboard aggregation;
     # the execution path always supplies the current market gate.
     scales = market_light_scales(market_light) if market_light else None
-    target_pct = {
-        key: value * (scales.get(key, 0.0) if scales is not None else 1.0)
-        for key, value in base_target_pct.items()
-    }
-    floor_pct = {key: value * STRATEGY_POOL_FLOOR_RATIO for key, value in target_pct.items()}
-    account_id = account.get("id")
-    # 超强主力资金优先：目标与地板取“灯色缩水目标”与“优先预留份额”的
-    # 较大者。预留写入 floor_pct 后，其他策略计算 other_floor_reserve 时
-    # 自动把它当受保护额度——这就是资金分配优先级的落点。
-    priority_floor_amount = (
-        nav * MAIN_FORCE_PRIORITY_FLOOR_PCT
-        if account_id == MAIN_FORCE_STRATEGY_ID else 0.0
+    return PA.strategy_pool_budget(
+        account_id=account.get("id"),
+        values=values,
+        weights=weights,
+        pending_by_account=pending_by_account,
+        pending_total=pending_total,
+        nav=_num(nav),
+        market_scales=scales,
+        shared_pool_max_exposure=SHARED_POOL_MAX_EXPOSURE,
+        strategy_pool_floor_ratio=STRATEGY_POOL_FLOOR_RATIO,
+        main_force_id=MAIN_FORCE_STRATEGY_ID,
+        main_force_priority_floor_pct=MAIN_FORCE_PRIORITY_FLOOR_PCT,
     )
-    if priority_floor_amount > 0.0:
-        target_pct[account_id] = max(
-            target_pct.get(account_id, 0.0), MAIN_FORCE_PRIORITY_FLOOR_PCT)
-        floor_pct[account_id] = max(
-            floor_pct.get(account_id, 0.0), MAIN_FORCE_PRIORITY_FLOOR_PCT)
-    current_amount = values.get(account_id, 0.0)
-    pending_strategy_amount = pending_by_account.get(account_id, 0.0)
-    current_total_amount = current_amount + pending_strategy_amount
-    target_amount = nav * target_pct.get(account_id, 0.0)
-    floor_amount = nav * floor_pct.get(account_id, 0.0)
-    own_headroom = max(0.0, target_amount - current_total_amount)
-    other_floor_reserve = sum(
-        max(0.0, nav * floor_pct.get(key, 0.0)
-            - values.get(key, 0.0) - pending_by_account.get(key, 0.0))
-        for key in values if key != account_id
-    )
-    after_floor = max(0.0, global_remaining - other_floor_reserve)
-    other_floors_met = all(
-        values.get(key, 0.0) + pending_by_account.get(key, 0.0) + 1e-6
-        >= nav * floor_pct.get(key, 0.0)
-        for key in values if key != account_id
-    )
-    # Only capacity left after the other floors are protected may be
-    # redistributed above this strategy's target.
-    redistribution = max(0.0, after_floor - own_headroom) if other_floors_met else 0.0
-    allowance = min(global_remaining, after_floor, own_headroom + redistribution)
-    # Sector rotation is the shortest-horizon and most concentrated sleeve.
-    # Its shared-pool budget must not turn into implicit leverage when account
-    # NAV is reduced by inter-sleeve transfers.  Cap gross committed value at
-    # 100% of its own NAV; exits and risk actions are unaffected.
-    if account_id == "sector_rotation" and nav > 0:
-        sector_cap = nav
-        allowance = min(allowance, max(0.0, sector_cap - current_total_amount))
-    # Gross committed cap: current holding + already-reserved pending orders
-    # + the net new allowance.  The sizing layer subtracts current and pending
-    # once, so pending capital is no longer double-counted.
-    absolute_cap = current_total_amount + max(0.0, allowance)
-    return {
-        "account_id": account_id,
-        "target_pct": round(target_pct.get(account_id, 0.0) * 100, 2),
-        "base_target_pct": round(base_target_pct.get(account_id, 0.0) * 100, 2),
-        "market_scale_pct": round((scales.get(account_id, 0.0) if scales is not None else 1.0) * 100, 1),
-        # target_amount / absolute_cap_amount above already include the
-        # market-light multiplier.  Callers must not multiply the same market
-        # coefficient a second time when turning remaining budget into shares.
-        "market_scale_applied": bool(scales is not None),
-        "floor_pct": round(floor_pct.get(account_id, 0.0) * 100, 2),
-        "priority_floor_pct": (
-            round(MAIN_FORCE_PRIORITY_FLOOR_PCT * 100, 2)
-            if priority_floor_amount > 0.0 else None),
-        "priority_floor_amount": round(priority_floor_amount, 2),
-        "current_pct": round(current_amount / nav * 100, 2) if nav else 0.0,
-        "target_amount": round(target_amount, 2),
-        "floor_amount": round(floor_amount, 2),
-        "current_amount": round(current_amount, 2),
-        "pending_reserve_amount": round(pending_strategy_amount, 2),
-        "current_total_amount": round(current_total_amount, 2),
-        "allowance_amount": round(max(0.0, allowance), 2),
-        "absolute_cap_amount": round(max(0.0, absolute_cap), 2),
-        "global_remaining_amount": round(global_remaining, 2),
-        "other_floor_reserve": round(other_floor_reserve, 2),
-        "redistribution_amount": round(redistribution, 2),
-        "redistribution_allowed": bool(redistribution > 0.0),
-        "pool_value": round(pool_value, 2),
-        "pool_cap_amount": round(pool_cap_amount, 2),
-        "pool_exposure_pct": round(pool_value / nav * 100, 2) if nav else 0.0,
-        "pending_pool_reserve_amount": round(pending_total, 2),
-        "pool_committed_amount": round(pool_value + pending_total, 2),
-        "pool_committed_pct": round((pool_value + pending_total) / nav * 100, 2) if nav else 0.0,
-        "pool_available_amount": round(global_remaining, 2),
-        "pool_limit_pct": round(SHARED_POOL_MAX_EXPOSURE * 100, 2),
-        "other_floors_met": bool(other_floors_met),
-    }
 
 
 def _entry_execution_scale(market_policy, entry_model, chase_entry, dynamic_news, strategy_budget):
