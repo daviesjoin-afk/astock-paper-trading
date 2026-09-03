@@ -27,6 +27,7 @@
 - [x] M3i：建立策略身份 registry，统一 active/legacy 标签展示，不改变现有调度。
 - [x] M3j：建立 ledger 通用仓储薄接口，保留 `_rows`/`_audit` 兼容包装，为对象级 SQL 迁移留入口。
 - [x] M3k：抽出今日报价新鲜度和今日盈亏纯计算，保持 `paper_trading` `_today_*` 入口兼容。
+- [x] M3l：集中 paper ledger 增量 schema、运行时租约和点火影子表迁移；`db_migrate.py` 以 v1-v4 事务化调用，旧表 fixture 验证幂等、回滚和字段补齐。
 - [ ] M3：本地 P2/P3/P4/P5 按小步提交完成，保持 API/交易语义兼容。
 - [x] M4：2026-09-03 将本地验收通过的同一版本部署到服务器并保留备份/回滚点。
 - [ ] M4a：2026-09-04 完成服务器健康、进程、数据库、模拟周期测试。
@@ -43,5 +44,5 @@
 - PRD/implementation branch: `codex/architecture-hardening-local`（本地）。
 - GitHub push: 未执行。
 - Server deployment: 已执行；本地提交 `b60d3a6` 对应部署包已校验并解包，镜像重建/重启完成，服务器备份位于 `/root/backups/20260903-architecture-predeploy/`。
-- Tests for this PRD: 124 tests passed with ResourceWarning as errors; compileall and Node checks passed; local HTTP health/home smoke passed.
+- Tests for this PRD: 159 backend tests passed with ResourceWarning as errors; compileall, diff check and prior Node/HTTP smoke checks passed.
 - Remote source pull: completed with SHA-256 verification; HTTP health read-only check returned 200 on `:8600`.
