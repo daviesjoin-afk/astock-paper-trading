@@ -6,10 +6,12 @@
 - 每个数据库维护一张 schema_version 表（db_name, version, applied_at, description）
 - 迁移脚本按版本号顺序执行，已应用版本跳过
 - 每个迁移在事务中执行，失败回滚
+- 首次应用待迁移项前创建一致性 SQLite 备份，便于整库恢复
 - 零第三方依赖，纯 sqlite3
 
-用法：python db_migrate.py [--db paper_trading|adaptive_learning|all]
+用法：python db_migrate.py [paper_trading|adaptive_learning|all] [--dry-run] [--no-backup]
 """
+import datetime as dt
 import os
 import sqlite3
 import sys
@@ -81,7 +83,20 @@ def _run_operation(conn, operation):
         conn.execute(sql)
 
 
-def migrate(db_name, apply=True, path=None):
+def _backup_database(conn, path, current_version):
+    """Create a consistent pre-migration SQLite snapshot using the backup API."""
+    root, extension = os.path.splitext(path)
+    stamp = dt.datetime.now().strftime("%Y%m%dT%H%M%S%f")
+    backup_path = f"{root}.pre-v{current_version}-{stamp}{extension or '.sqlite3'}"
+    backup = sqlite3.connect(backup_path, timeout=30)
+    try:
+        conn.backup(backup)
+    finally:
+        backup.close()
+    return backup_path
+
+
+def migrate(db_name, apply=True, path=None, backup=True):
     if db_name not in DB_PATHS:
         print(f"未知数据库: {db_name}")
         return
@@ -96,6 +111,9 @@ def migrate(db_name, apply=True, path=None):
         if not pending:
             print(f"[{db_name}] schema 已是最新 (v{current})")
             return
+        if apply and backup:
+            backup_path = _backup_database(conn, path, current)
+            print(f"[{db_name}] ✓ 已创建迁移前备份: {backup_path}")
         for version, desc, sql in sorted(pending, key=lambda x: x[0]):
             if not apply:
                 print(f"[{db_name}] 待应用 v{version}: {desc}")
@@ -118,16 +136,15 @@ def migrate(db_name, apply=True, path=None):
 
 
 def main():
-    targets = sys.argv[1:] or ["all"]
+    targets = [arg for arg in sys.argv[1:] if arg not in {"--dry-run", "--no-backup"}] or ["all"]
     apply = "--dry-run" not in sys.argv
+    backup = "--no-backup" not in sys.argv
     for target in targets:
-        if target == "--dry-run":
-            continue
         if target == "all":
             for db_name in DB_PATHS:
-                migrate(db_name, apply=apply)
+                migrate(db_name, apply=apply, backup=backup)
         else:
-            migrate(target, apply=apply)
+            migrate(target, apply=apply, backup=backup)
 
 
 if __name__ == "__main__":
