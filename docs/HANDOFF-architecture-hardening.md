@@ -7,6 +7,7 @@
 - 分支：`codex/architecture-hardening-local`
 - 本地验收：`python -W error::ResourceWarning -m unittest discover -s backend -p 'test*.py'`，198 项通过；`python -m compileall -q backend` 与 `git diff --check` 通过。关键后端模块冷启动导入通过，FastAPI 已加载 101 条路由，前端两份 `app.js` 的语法与 CI YAML 均通过。
 - 最近完成：东财 `clist` 分页、概念成员分页、个股概念板块引用解析迁入 `backend/marketdata_providers.py`，旧 `data_fetcher.py` 入口仍为兼容包装。
+- PRD 的逐项已完成、未完成和服务器验证状态见 `docs/PRD-architecture-hardening.md` 的“实施状态（2026-09-04）”。
 - 服务器与 GitHub 状态必须分开判断；当前分支尚未推送 GitHub。
 
 ## 服务器初检（只读）
