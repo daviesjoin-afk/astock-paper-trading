@@ -1,0 +1,67 @@
+name: Bug report
+description: Report a reproducible problem in the paper-trading engine or dashboard
+title: "[Bug] "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for helping improve the project. Do not include API keys, real holdings, private server information or non-sanitized runtime databases.
+
+  - type: textarea
+    id: summary
+    attributes:
+      label: What happened?
+      description: Describe the observed behavior and what you expected instead.
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Minimal reproduction
+      description: Include the smallest reliable sequence of commands, inputs or synthetic data that reproduces the issue.
+      placeholder: |
+        1. ...
+        2. ...
+        3. ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Python version, OS, Docker/local mode and relevant commit or release.
+    validations:
+      required: true
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - Execution / matching
+        - Risk controls
+        - Market data / freshness
+        - Strategy entry / exit
+        - Audit / replay
+        - Concurrency / scheduler
+        - Web / API
+        - Documentation / setup
+        - Other
+    validations:
+      required: true
+
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Sanitized evidence
+      description: Add relevant traceback, test failure, log excerpt or screenshot after removing private information.
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Safety check
+      options:
+        - label: I removed credentials, real account information, real holdings and private infrastructure details.
+          required: true
