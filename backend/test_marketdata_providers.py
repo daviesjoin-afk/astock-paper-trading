@@ -5,6 +5,33 @@ import marketdata_providers as providers
 
 
 class MarketDataProviderParserTests(unittest.TestCase):
+    def test_eastmoney_clist_reports_missing_page(self):
+        health = {}
+
+        def fake_get_json(_url, params, **_kwargs):
+            page = int(params["pn"])
+            if page == 1:
+                return {"data": {"total": 6, "diff": [{"f12": "000001"}, {"f12": "000002"}]}}
+            if page == 2:
+                return {"data": {"total": 6, "diff": [{"f12": "000003"}, {"f12": "000004"}]}}
+            return {"data": {"total": 6, "diff": []}}
+
+        result = providers.fetch_eastmoney_clist(
+            get_json=fake_get_json,
+            hosts=["test-host"],
+            host_health=health,
+            fields="f12",
+            pages=None,
+            pz=2,
+            return_meta=True,
+            ut="test-ut",
+            fs="test-fs",
+        )
+        self.assertEqual(result["pages_expected"], 3)
+        self.assertEqual(result["pages_ok"], 2)
+        self.assertEqual(result["failed_pages"], [3])
+        self.assertFalse(result["complete"])
+
     def test_tencent_parser_uses_timestamp_and_allowed_codes(self):
         parts = [""] * 33
         parts[1] = "平安银行"
