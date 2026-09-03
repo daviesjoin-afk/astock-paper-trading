@@ -15998,6 +15998,24 @@ def risk_audit(limit=160):
         with _db_readonly() as conn:
             accounts = _rows(conn, "SELECT id,name FROM paper_accounts ORDER BY id")
             names = {row["id"]: row["name"] for row in accounts}
+            scan_rows = _rows(
+                conn,
+                """SELECT detail,created_at
+                   FROM paper_audit
+                   WHERE event='risk_scan_state'
+                   ORDER BY id DESC LIMIT 1""",
+            )
+            latest_scan = None
+            if scan_rows:
+                scan_detail = _loads(scan_rows[0].get("detail"), {}) or {}
+                if isinstance(scan_detail, dict):
+                    latest_scan = {
+                        "scan_minute": scan_detail.get("scan_minute"),
+                        "status": scan_detail.get("status"),
+                        "started_at": scan_detail.get("started_at"),
+                        "finished_at": scan_detail.get("finished_at"),
+                        "created_at": scan_rows[0].get("created_at"),
+                    }
             decisions = _rows(
                 conn,
                 """SELECT id,account_id,code,side,decision,reason,payload,created_at
@@ -16058,7 +16076,7 @@ def risk_audit(limit=160):
         # created the ledger.  Keep the read endpoint useful and side-effect
         # free instead of initializing it from a GET request.
         if "no such table" in str(exc).lower():
-            return {"accounts": [], "alerts": [], "asof": _now(), "lightweight": True}
+            return {"accounts": [], "alerts": [], "asof": _now(), "lightweight": True, "latest_scan": None}
         raise
     linked_signals = {}
     for signal in signal_rows:
@@ -16153,7 +16171,16 @@ def risk_audit(limit=160):
                 "label": "待执行委托（等待开盘审批/执行批次）",
             } if linked else None),
         })
-    return {"accounts": accounts, "alerts": alerts, "asof": _now(), "lightweight": True}
+    return {
+        "accounts": accounts,
+        "alerts": alerts,
+        "asof": _now(),
+        "lightweight": True,
+        # A completed scan with no positions legitimately has no per-stock
+        # decision rows. Expose the scan marker so the UI can distinguish
+        # "scheduler ran and found nothing to inspect" from "never ran".
+        "latest_scan": latest_scan,
+    }
 
 
 def _validate_capital(capital):
@@ -16441,6 +16468,9 @@ def schedule_status():
         if os.path.isfile(schedule_file):
             found.extend(names)
     today = dt.date.today().isoformat()
+    fallback_enabled = str(os.getenv("ASTOCK_ENABLE_FALLBACK_THREADS") or "0").strip().lower() in {
+        "1", "true", "yes", "on"
+    }
     with _db() as conn:
         latest = _rows(conn, """
             SELECT slot,status,started_at,finished_at,detail
@@ -16457,13 +16487,22 @@ def schedule_status():
             LIMIT 12
         """, (f"intraday:{today.replace('-', '')}%",))
     failed = [row for row in latest + intraday if row.get("status") == "failed"]
+    installed = len(found) == len(names)
     return {
-        "installed": len(found) == len(names),
+        "installed": installed,
+        # ``installed`` remains the OS-task result for compatibility. A
+        # standalone clone is nevertheless runnable when the in-process
+        # fallback scheduler is enabled by the one-click launcher/Compose.
+        "fallback_enabled": fallback_enabled,
+        "effective": bool(installed or fallback_enabled),
         "tasks": found,
         "runtime_date": today,
         "latest_runs": latest,
         "latest_intraday_runs": intraday,
-        "runtime_status": "异常" if failed else ("已执行" if latest or intraday else "等待首个任务"),
+        "runtime_status": "异常" if failed else (
+            "已执行" if latest or intraday else
+            ("内置调度已启用，等待交易时段" if fallback_enabled else "等待首个任务")
+        ),
         "runtime_failed_count": len(failed),
         "note": "09:25采集集合竞价快照做预选；09:30、09:31、13:00先执行共享开盘事件扫描（冲高回落可减仓，回补需后续反弹确认），09:31再用最新双源行情审批新开仓；其后每3分钟执行至11:25和14:55；15:05盘后评分和周五15:20复盘。失败任务会由同一时段的兜底计划自动重试，页面显示数据库中的实际运行记录。"
     }

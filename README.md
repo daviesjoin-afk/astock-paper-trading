@@ -75,7 +75,7 @@ Dockerfile              容器镜像（API 与应用镜像，不含编排）
 
 ## 一键启动
 
-仓库根目录提供跨平台启动脚本。脚本会优先尝试 Docker Compose；Docker 不可用时自动切换到本地 Python 虚拟环境，首次运行自动创建 `.venv` 并按 `requirements.txt` 安装依赖。启动成功后会打开 Web 看板；脚本只启动服务，不会自动创建模拟交易周期。
+仓库根目录提供跨平台启动脚本。脚本会优先尝试 Docker Compose；Docker 不可用时自动切换到本地 Python 虚拟环境，首次运行自动创建 `.venv` 并按 `requirements.txt` 安装依赖。启动成功后会打开 Web 看板，并默认启用内置的 3 分钟模拟盘调度器（仅在交易时段运行盘中监控与风控扫描）；脚本只启动服务，不会自动创建模拟交易周期。
 
 Windows：双击 [start.bat](start.bat)，或在 PowerShell 中运行：
 
@@ -85,6 +85,7 @@ Windows：双击 [start.bat](start.bat)，或在 PowerShell 中运行：
 .\start.ps1 -Docker         # 强制 Docker Compose（端口固定为 8600）
 .\start.ps1 -Port 8601      # 使用自定义端口时自动使用本地模式
 .\start.ps1 -NoBrowser      # 不自动打开浏览器
+.\start.ps1 -NoScheduler    # 关闭内置调度（仅适用于已有外部调度器）
 ```
 
 Linux/macOS：
@@ -93,9 +94,12 @@ Linux/macOS：
 chmod +x start.sh
 ./start.sh                  # 自动选择 Docker 或本地模式
 ./start.sh --local --port 8601 --no-browser
+./start.sh --no-scheduler  # 关闭内置调度（仅适用于已有外部调度器）
 ```
 
 启动脚本不包含密钥、服务器配置或运行时记录；`.env`、`.venv`、`data_cache/` 与 `reports/` 均只保留在本机。Docker 模式使用仓库专用的命名卷，从空账本开始，不会连接其他实例的数据卷。
+
+若不使用启动脚本而直接运行 `uvicorn`，需要先设置 `ASTOCK_ENABLE_FALLBACK_THREADS=1` 才会启用同一套内置调度；使用宿主机计划任务时将其设为 `0`，避免两个调度器重复抢占同一批次。
 
 ## 本地开发
 
@@ -163,7 +167,7 @@ docker build -t astock-codex:latest .
 docker run --rm -p 8600:8600 -v astock_repo_data:/app/backend/data_cache astock-codex:latest
 ```
 
-容器内默认只启动 API/Web 看板，不会自动定时触发交易扫描；需要扫描时通过 `docker compose exec app` 手动执行 `backend/paper_runner.py`，或在部署侧配置调度器。
+Compose 默认启用内置调度器，容器启动后会在交易时段自动执行盘中监控和风控扫描。若部署侧已经配置了完整的宿主机计划任务，可在启动前设置 `ASTOCK_ENABLE_FALLBACK_THREADS=0`，然后继续通过 `docker compose exec app` 手动执行其他盘前、开盘、盘后和周度 slot。
 
 ## 风险结论
 

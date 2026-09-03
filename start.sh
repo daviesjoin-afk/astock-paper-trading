@@ -8,10 +8,11 @@ PORT="${PORT:-8600}"
 MODE="auto"
 SKIP_INSTALL=0
 NO_BROWSER=0
+NO_SCHEDULER=0
 
 usage() {
   cat <<'EOF'
-Usage: ./start.sh [--local|--docker] [--port PORT] [--skip-install] [--no-browser]
+Usage: ./start.sh [--local|--docker] [--port PORT] [--skip-install] [--no-browser] [--no-scheduler]
 
 Docker Compose is preferred when available; otherwise a local .venv is used.
 EOF
@@ -28,11 +29,20 @@ while [[ $# -gt 0 ]]; do
       ;;
     --skip-install) SKIP_INSTALL=1 ;;
     --no-browser) NO_BROWSER=1 ;;
+    --no-scheduler) NO_SCHEDULER=1 ;;
     -h|--help) usage; exit 0 ;;
     *) echo "Unknown option: $1" >&2; usage >&2; exit 2 ;;
   esac
   shift
 done
+
+# One-click startup enables the in-process three-minute paper scheduler. Use
+# --no-scheduler only when an external scheduler is responsible for all slots.
+if [[ "$NO_SCHEDULER" -eq 1 ]]; then
+  export ASTOCK_ENABLE_FALLBACK_THREADS=0
+else
+  export ASTOCK_ENABLE_FALLBACK_THREADS=1
+fi
 
 [[ "$PORT" =~ ^[0-9]+$ ]] && (( PORT >= 1 && PORT <= 65535 )) || {
   echo "PORT must be between 1 and 65535" >&2
