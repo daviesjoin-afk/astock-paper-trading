@@ -7,6 +7,16 @@ from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import requests
 import pandas as pd
+from marketdata_transport import (
+    HEADERS,
+    _session,
+    _session_local,
+    _tencent_circuit,
+    _tencent_circuit_lock,
+    http_get,
+    http_post_json,
+    reset_data_source,
+)
 
 try:  # POSIX containers use flock; local Windows checks keep the thread lock.
     import fcntl as _fcntl
@@ -28,9 +38,6 @@ DATA_SOURCE_HEALTH_PATH = os.path.join(CACHE_DIR, "data_source_health.json")
 os.makedirs(KLINE_DIR, exist_ok=True)
 
 UT_FLOW = "b2884a393a59ad64002292a3e90d46a5"
-HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
-_session_local = threading.local()
-
 _cache_lock = threading.Lock()
 _mem_cache = {}
 _full_snapshot_thread_lock = threading.Lock()
@@ -39,43 +46,6 @@ _manifest = None
 _manifest_mtime = None
 _manifest_dirty = 0
 _manifest_pending = {}
-_tencent_circuit_lock = threading.Lock()
-_tencent_circuit = {"failures": 0, "open_until": 0.0, "backoff_seconds": 45, "last_probe_at": 0.0}
-
-
-def _session():
-    """requests.Session 不跨线程共享；每个下载线程复用自己的连接池。"""
-    session = getattr(_session_local, "value", None)
-    if session is None:
-        session = requests.Session()
-        session.headers.update(HEADERS)
-        _session_local.value = session
-    return session
-
-
-def reset_data_source(reason=None, reset_circuit=False):
-    """重置连接池；默认保留源熔断器状态。
-
-    熔断器的失败计数必须跨调用累积才能在持续故障时开门（半开探测由
-    熔断器自身状态机负责）。此前每次空响应都无条件清零计数，历史恢复
-    场景中逐票失败把熔断器永远摁在复位状态，5000+ 只股票对免费接口
-    持续打满、加剧限流。需要彻底复位的调用方（如健康探测的主动重连）
-    显式传 ``reset_circuit=True``。
-    """
-    session = getattr(_session_local, "value", None)
-    if session is not None:
-        try:
-            session.close()
-        except Exception:
-            pass
-        try:
-            delattr(_session_local, "value")
-        except AttributeError:
-            pass
-    if reset_circuit:
-        with _tencent_circuit_lock:
-            _tencent_circuit.update({"failures": 0, "open_until": 0.0, "backoff_seconds": 45, "last_probe_at": 0.0})
-
 def _cached(key, ttl, fn):
     now = time.time()
     with _cache_lock:
@@ -119,34 +89,6 @@ def _full_snapshot_singleflight_lock():
                         _fcntl.flock(lock_handle.fileno(), _fcntl.LOCK_UN)
                 finally:
                     lock_handle.close()
-
-def http_get(url, params=None, timeout=15, encoding="utf-8", retries=2):
-    """直接走 requests + Session 连接复用（相比 curl 子进程极大提速）"""
-    for i in range(retries + 1):
-        try:
-            r = _session().get(url, params=params, timeout=timeout)
-            r.raise_for_status()
-            r.encoding = encoding
-            if r.text:
-                return r.text
-            # 空响应也触发重试（东财偶发 200/空正文）
-            if i < retries:
-                time.sleep(0.4 * (i + 1))
-                continue
-        except requests.RequestException:
-            if i == retries:
-                raise
-        time.sleep(0.5 * (i + 1))
-    return ""
-
-def http_post_json(url, body, timeout=15):
-    """POST JSON 请求（保持接口兼容）"""
-    try:
-        r = _session().post(url, json=body, timeout=timeout)
-        r.raise_for_status()
-        return r.json() if r.text else {}
-    except Exception:
-        return {}
 
 def _get_json(url, params=None, timeout=15, retries=2):
     txt = http_get(url, params=params, timeout=timeout, retries=retries)
