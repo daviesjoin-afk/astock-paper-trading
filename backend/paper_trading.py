@@ -37,6 +37,7 @@ import paper_archive_projection as PAP
 import paper_quote_policy as PQP
 import paper_allocation as PA
 import paper_sizing as PSZ
+import strategy_registry as SR
 from market_policy import market_light_scale, market_light_scales
 from paper_trading_rules import (
     CHINEXT_PREFIXES,
@@ -819,12 +820,15 @@ def strategy_center():
     ) or 1.0
     rows = []
     for account_id, spec in ACCOUNT_SPECS.items():
+        registered = SR.get(account_id)
         risk = RISK_PROFILES[spec["risk_profile"]]
         event_policy = OPENING_EVENT_POLICIES.get(account_id) or {}
         pool_budget_pct = SHARED_POOL_MAX_EXPOSURE * risk["max_exposure"] / total_profile_exposure * 100
         rows.append({
             "id": account_id,
-            "name": spec["name"],
+            "name": registered.name if registered else spec["name"],
+            "strategy_status": registered.status if registered else "unregistered",
+            "supports_new_cycle": bool(registered and registered.supports_new_cycle),
             "mode": "日内做T" if spec["mode"] == "intraday_t" else "波段交易",
             "entry_model": spec["entry_model_name"],
             "hold_range": f"{spec['hold_min']}–{spec['hold_max']} 个交易日",
