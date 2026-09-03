@@ -41,6 +41,7 @@
 - [x] M3w：将 adaptive 组合影子风控的历史归一化、波动率、集中度和压力测试迁入 `adaptive_shadow_risk.py`，保持只读/影子边界。
 - [x] M3x：将 adaptive risk 与 strategy-center 的展示身份接入 strategy registry，公开 active/legacy 元数据但不改变账户调度。
 - [x] M3y：为版本化 SQLite migration 增加迁移前一致性备份，并以旧库 fixture 验证备份保留原始 schema/数据。
+- [x] M3z：CI 新增独立 Docker 构建与健康端点冒烟 job；本机 Docker 引擎未启动，待服务器/GitHub 阶段验证实际容器运行。
 - [ ] M3：本地 P2/P3/P4/P5 按小步提交完成，保持 API/交易语义兼容。
 - [x] M4：2026-09-03 将本地验收通过的同一版本部署到服务器并保留备份/回滚点。
 - [ ] M4a：2026-09-04 完成服务器健康、进程、数据库、模拟周期测试。
