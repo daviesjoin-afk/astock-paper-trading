@@ -7,8 +7,127 @@
 from __future__ import annotations
 
 import re
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import pandas as pd
+
+
+def fetch_eastmoney_clist(
+    *,
+    get_json,
+    hosts,
+    host_health,
+    fields,
+    fid="f20",
+    pages=None,
+    pz=200,
+    return_meta=False,
+    ut,
+    fs,
+    cooldown_base=30,
+    max_cooldown=300,
+    now=time.time,
+):
+    """Fetch paginated Eastmoney ``clist`` rows through an injected transport.
+
+    The caller deliberately owns HTTP sessions and the mutable per-host health
+    dictionary.  Keeping those concerns injected makes this provider adapter
+    independently testable while preserving the existing fail-closed metadata
+    contract used by full-market snapshots.
+    """
+    host_list = list(hosts)
+
+    def _host_ok(host):
+        info = host_health.get(host)
+        return not (info and now() < info.get("cooldown_until", 0))
+
+    def _host_ok_set(host):
+        host_health[host] = {"failures": 0, "cooldown_until": 0}
+
+    def _host_fail(host):
+        info = host_health.get(host, {"failures": 0, "cooldown_until": 0})
+        failures = info["failures"] + 1
+        host_health[host] = {
+            "failures": failures,
+            "cooldown_until": now() + min(
+                cooldown_base * (2 ** (failures - 1)), max_cooldown
+            ),
+        }
+
+    def _one_page(page):
+        params = {
+            "pn": page, "pz": pz, "po": 1, "np": 1, "fltt": 2, "invt": 2,
+            "ut": ut, "fid": fid, "fs": fs, "fields": fields,
+        }
+        ordered = [host for host in host_list if _host_ok(host)]
+        ordered += [host for host in host_list if not _host_ok(host)]
+        for host in ordered:
+            try:
+                response = get_json(
+                    f"https://{host}/api/qt/clist/get", params,
+                    timeout=10, retries=1,
+                )
+                data = (response or {}).get("data") or {}
+                diff = data.get("diff") or []
+                total = data.get("total", 0)
+            except Exception:
+                diff, total = [], 0
+            if diff:
+                _host_ok_set(host)
+                return diff, total
+            _host_fail(host)
+        return [], 0
+
+    first, total = _one_page(1)
+    try:
+        total = int(total or 0)
+    except (TypeError, ValueError):
+        total = 0
+    if not first:
+        result = {
+            "rows": [], "total": total, "pages_expected": 0,
+            "pages_ok": 0, "failed_pages": [1], "complete": False,
+        }
+        return result if return_meta else []
+
+    actual_pz = max(len(first), 1)
+    effective_pz = min(pz, actual_pz)
+    total_pages = (total + effective_pz - 1) // effective_pz if total else 1
+    if pages:
+        total_pages = min(pages, total_pages)
+    expected_pages = total_pages
+    page_rows = {1: list(first)}
+    failed_pages = []
+    if total_pages > 1:
+        with ThreadPoolExecutor(max_workers=min(16, total_pages - 1)) as executor:
+            futures = {
+                executor.submit(_one_page, page): page
+                for page in range(2, total_pages + 1)
+            }
+            for future in as_completed(futures):
+                page = futures[future]
+                try:
+                    diff, _ = future.result()
+                except Exception:
+                    diff = []
+                if diff:
+                    page_rows[page] = list(diff)
+                else:
+                    failed_pages.append(page)
+    rows = []
+    for page in sorted(page_rows):
+        rows.extend(page_rows[page])
+    complete = bool(total and len(page_rows) == expected_pages and not failed_pages)
+    meta = {
+        "rows": rows,
+        "total": total,
+        "pages_expected": expected_pages,
+        "pages_ok": len(page_rows),
+        "failed_pages": sorted(failed_pages),
+        "complete": complete,
+    }
+    return meta if return_meta else rows
 
 
 def parse_tencent_realtime_text(text, *, attempt=1, allowed_codes=None):

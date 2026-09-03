@@ -546,83 +546,20 @@ def _fetch_clist(fields, fid="f20", pages=None, pz=200, return_meta=False):
     得到 ``list`` 以保持兼容；需要将结果写入正式全市场/资金快照的调用方
     必须传 ``return_meta=True``，并检查 ``complete``，避免残片污染横截面。
     """
-    def _host_ok(h):
-        info = _clist_host_health.get(h)
-        return not (info and time.time() < info.get("cooldown_until", 0))
-    def _host_ok_set(h):
-        _clist_host_health[h] = {"failures": 0, "cooldown_until": 0}
-    def _host_fail(h):
-        info = _clist_host_health.get(h, {"failures": 0, "cooldown_until": 0})
-        f = info["failures"] + 1
-        _clist_host_health[h] = {"failures": f, "cooldown_until": time.time() + min(_CLIST_HOST_COOLDOWN_BASE * (2 ** (f - 1)), _CLIST_HOST_MAX_COOLDOWN)}
-    def _one_page(pn):
-        params = {"pn": pn, "pz": pz, "po": 1, "np": 1, "fltt": 2, "invt": 2,
-                  "ut": UT_FLOW, "fid": fid, "fs": SNAP_FS, "fields": fields}
-        ordered = [h for h in CLIST_HOSTS if _host_ok(h)] + [h for h in CLIST_HOSTS if not _host_ok(h)]
-        for host in ordered:
-            try:
-                j = _get_json(f"https://{host}/api/qt/clist/get", params, timeout=10, retries=1)
-                data = (j or {}).get("data") or {}
-                diff = data.get("diff") or []
-                total = data.get("total", 0)
-            except Exception:
-                diff, total = [], 0
-            if diff:
-                _host_ok_set(host)
-                return diff, total
-            _host_fail(host)
-        return [], 0
-    first, total = _one_page(1)
-    try:
-        total = int(total or 0)
-    except (TypeError, ValueError):
-        total = 0
-    if not first:
-        result = {
-            "rows": [], "total": total, "pages_expected": 0,
-            "pages_ok": 0, "failed_pages": [1], "complete": False,
-        }
-        return result if return_meta else []
-    rows = list(first)
-    # Some hosts (e.g. push2delay) cap results below the requested pz.
-    # Use the actual page size to calculate how many pages we really need.
-    actual_pz = max(len(first), 1)
-    effective_pz = min(pz, actual_pz)
-    total_pages = (total + effective_pz - 1) // effective_pz if total else 1
-    if pages:
-        total_pages = min(pages, total_pages)
-    expected_pages = total_pages
-    page_rows = {1: list(first)}
-    failed_pages = []
-    if total_pages > 1:
-        with ThreadPoolExecutor(max_workers=min(16, total_pages - 1)) as ex:
-            futs = {ex.submit(_one_page, pn): pn for pn in range(2, total_pages + 1)}
-            for f in as_completed(futs):
-                page = futs[f]
-                try:
-                    d, _ = f.result()
-                except Exception:
-                    d = []
-                if d:
-                    page_rows[page] = list(d)
-                else:
-                    failed_pages.append(page)
-    rows = []
-    for page in sorted(page_rows):
-        rows.extend(page_rows[page])
-    # For an explicit sample, ``complete`` means all requested pages arrived;
-    # for a full pull, this is the same as every page implied by ``total``.
-    # A zero total with non-empty rows is not trusted as a complete response.
-    complete = bool(total and len(page_rows) == expected_pages and not failed_pages)
-    meta = {
-        "rows": rows,
-        "total": total,
-        "pages_expected": expected_pages,
-        "pages_ok": len(page_rows),
-        "failed_pages": sorted(failed_pages),
-        "complete": complete,
-    }
-    return meta if return_meta else rows
+    return MP.fetch_eastmoney_clist(
+        get_json=_get_json,
+        hosts=CLIST_HOSTS,
+        host_health=_clist_host_health,
+        fields=fields,
+        fid=fid,
+        pages=pages,
+        pz=pz,
+        return_meta=return_meta,
+        ut=UT_FLOW,
+        fs=SNAP_FS,
+        cooldown_base=_CLIST_HOST_COOLDOWN_BASE,
+        max_cooldown=_CLIST_HOST_MAX_COOLDOWN,
+    )
 
 def fetch_market_snapshot(pages=None, allow_disk_fallback=True):
     """全市场快照：价格/涨跌/换手/量比/PE/PB/市值/行业。注意 clist 不支持 f37 等财务扩展字段"""
