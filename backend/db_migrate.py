@@ -14,6 +14,8 @@ import os
 import sqlite3
 import sys
 
+import paper_schema_migrations as paper_schema
+
 BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CACHE_DIR = os.path.join(BASE, "data_cache")
 
@@ -33,6 +35,9 @@ MIGRATIONS = {
             description TEXT
         );
         """),
+        (2, "补齐订单、持仓和账户兼容字段", paper_schema.ensure_paper_columns),
+        (3, "补齐运行时租约与 fencing 字段", paper_schema.ensure_runtime_lease_columns),
+        (4, "补齐点火影子表与索引", paper_schema.ensure_ignition_shadow_table),
     ],
     "adaptive_learning": [
         (1, "创建 schema_version 表", """
@@ -57,11 +62,30 @@ def _current_version(conn, db_name):
         return 0
 
 
-def migrate(db_name, apply=True):
+def _run_operation(conn, operation):
+    if callable(operation):
+        result = operation(conn)
+        if result is False:
+            raise RuntimeError("迁移操作未完成")
+        return
+    statement = []
+    for char in operation:
+        statement.append(char)
+        if char == ";" and sqlite3.complete_statement("".join(statement)):
+            sql = "".join(statement).strip()
+            if sql:
+                conn.execute(sql)
+            statement = []
+    sql = "".join(statement).strip()
+    if sql and not sql.startswith("--"):
+        conn.execute(sql)
+
+
+def migrate(db_name, apply=True, path=None):
     if db_name not in DB_PATHS:
         print(f"未知数据库: {db_name}")
         return
-    path = DB_PATHS[db_name]
+    path = path or DB_PATHS[db_name]
     if not os.path.exists(path):
         print(f"数据库不存在（跳过）: {path}")
         return
@@ -77,14 +101,16 @@ def migrate(db_name, apply=True):
                 print(f"[{db_name}] 待应用 v{version}: {desc}")
                 continue
             try:
-                with conn:  # 事务
-                    conn.executescript(sql)
-                    conn.execute(
-                        "INSERT OR REPLACE INTO schema_version(db_name, version, applied_at, description) VALUES(?,?,datetime('now'),?)",
-                        (db_name, version, desc),
-                    )
+                conn.execute("BEGIN")
+                _run_operation(conn, sql)
+                conn.execute(
+                    "INSERT OR REPLACE INTO schema_version(db_name, version, applied_at, description) VALUES(?,?,datetime('now'),?)",
+                    (db_name, version, desc),
+                )
+                conn.commit()
                 print(f"[{db_name}] ✓ 已应用 v{version}: {desc}")
-            except sqlite3.OperationalError as exc:
+            except Exception as exc:
+                conn.rollback()
                 print(f"[{db_name}] ✗ v{version} 失败: {exc}（事务回滚）")
                 raise
     finally:
