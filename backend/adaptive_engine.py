@@ -39,6 +39,7 @@ import evolution_adversarial as adversarial
 import dual_ai_tuner
 import self_evolution
 import paper_ledger_reader as paper_reader
+import adaptive_genetics as AG
 from strategy_registry import labels as strategy_labels
 from adaptive_common import _now, _json, _loads, _clamp  # C3: 收敛重复工具函数
 try:
@@ -1200,9 +1201,7 @@ def _mature_alpha_returns(conn):
 
 
 def _normalize_genome(weights):
-    values = [float(weights.get(name, 0.0)) for name in ALPHA_FEATURES]
-    scale = sum(abs(value) for value in values) or 1.0
-    return {name: round(value / scale, 8) for name, value in zip(ALPHA_FEATURES, values)}
+    return AG.normalize_genome(weights, ALPHA_FEATURES)
 
 
 def _alpha_dataset(conn, max_rows_per_window=ALPHA_MAX_ROWS_PER_WINDOW):
@@ -1252,47 +1251,15 @@ def _alpha_bounded_sample(rows, max_rows_per_window=ALPHA_MAX_ROWS_PER_WINDOW):
 
 
 def _alpha_fitness(genome, rows):
-    """Walk-forward-safe cross-sectional spread with complexity/stability penalties."""
-    by_window = defaultdict(list)
-    for row in rows:
-        score = sum(genome[name] * row[name] for name in ALPHA_FEATURES)
-        by_window[(row["profile_date"], row["horizon"])].append((score, row["excess_return_pct"]))
-    spreads = []
-    for (_, horizon), values in by_window.items():
-        if len(values) < 100:
-            continue
-        values.sort(key=lambda item: item[0])
-        bucket = max(10, len(values) // 10)
-        low = statistics.mean(value[1] for value in values[:bucket])
-        high = statistics.mean(value[1] for value in values[-bucket:])
-        spreads.append((high - low) * HORIZON_WEIGHTS.get(horizon, 0.0))
-    if not spreads:
-        return {"fitness": -999.0, "spread_pct": 0.0, "stability": 0.0, "windows": 0}
-    mean_spread = statistics.mean(spreads)
-    stability = sum(value > 0 for value in spreads) / len(spreads)
-    dispersion = statistics.pstdev(spreads) if len(spreads) > 1 else abs(mean_spread)
-    complexity = sum(abs(value) >= 0.08 for value in genome.values())
-    fitness = mean_spread + 0.35 * stability - 0.18 * dispersion - 0.015 * complexity
-    return {
-        "fitness": round(fitness, 8),
-        "spread_pct": round(mean_spread, 8),
-        "stability": round(stability, 6),
-        "windows": len(spreads),
-    }
+    return AG.alpha_fitness(genome, rows, ALPHA_FEATURES, HORIZON_WEIGHTS)
 
 
 def _mutate_genome(parent, rng):
-    child = dict(parent)
-    count = 1 if rng.random() < 0.72 else 2
-    for name in rng.sample(list(ALPHA_FEATURES), count):
-        child[name] += rng.gauss(0, 0.16)
-    return _normalize_genome(child)
+    return AG.mutate_genome(parent, rng, ALPHA_FEATURES)
 
 
 def _crossover(left, right, rng):
-    return _normalize_genome({
-        name: left[name] if rng.random() < 0.5 else right[name] for name in ALPHA_FEATURES
-    })
+    return AG.crossover(left, right, rng, ALPHA_FEATURES)
 
 
 def _run_alpha_lab(conn, run_date):
