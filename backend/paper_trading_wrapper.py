@@ -6,5 +6,7 @@
 """
 from paper_trading import *
 
-# 确保所有公共接口都可用
-from paper_trading import __all__
+# 旧部署中的 paper_trading.py 没有定义 __all__。包装模块不能因为
+# 导出元数据缺失而让旧调用方导入失败。
+import paper_trading as _paper_trading
+__all__ = getattr(_paper_trading, "__all__", [name for name in dir(_paper_trading) if not name.startswith("_")])

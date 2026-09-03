@@ -39,3 +39,29 @@ jobs:
         env:
           PYTHONDONTWRITEBYTECODE: "1"
         run: python -m unittest discover -s backend -p "test_*.py" -v
+
+  syntax:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Compile backend modules
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: python -m compileall -q backend
+
+      - name: Check frontend JavaScript
+        run: |
+          node --check frontend/app.js
+          node --check frontend/assets/app.js
+
+      - name: Verify frontend source mirror
+        shell: bash
+        run: cmp --silent frontend/app.js frontend/assets/app.js

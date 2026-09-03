@@ -20,8 +20,7 @@ import pandas as pd
 import data_fetcher as dfc
 import strategies as S
 
-# Keep backtests aligned with the paper-trading fee model (0.01% commission,
-# no minimum commission).
+# 与 paper_trading 同步：佣金万一免五（2026-08-28 起）
 COMMISSION = 0.0001
 MIN_COMMISSION = 0.0
 STAMP_SELL = 0.0005
@@ -381,8 +380,7 @@ def run_backtest(
             shares = min(positions[code], sell_value_at_open / op)
             price = _execution_price("sell", op, next_low.get(code, np.nan), next_high.get(code, np.nan))
             gross = shares * price
-            # 佣金按万一免五模拟，与 paper_trading 保持一致。
-            # 小额交易的净收益，使优化器偏向过度换手的参数。
+            # 佣金按万一免五模拟（2026-08-28 起与模拟盘一致）。
             fees = max(MIN_COMMISSION, gross * COMMISSION) + gross * STAMP_SELL
             positions[code] -= shares
             if positions[code] <= 1e-12:

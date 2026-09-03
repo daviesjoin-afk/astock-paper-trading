@@ -10,7 +10,7 @@ import importlib
 try:
     import paper_trading
     # 将包的所有公共接口暴露到模块级别
-    for attr in paper_trading.__all__:
+    for attr in getattr(paper_trading, "__all__", [name for name in dir(paper_trading) if not name.startswith("_")]):
         if hasattr(paper_trading, attr):
             globals()[attr] = getattr(paper_trading, attr)
 except ImportError:
