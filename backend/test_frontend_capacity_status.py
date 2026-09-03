@@ -14,7 +14,7 @@ class FrontendCapacityStatusTests(unittest.TestCase):
         self.assertNotIn("deferred_capacity:['pending','次日重新筛选']", source)
 
     def test_cache_key_is_bumped_with_capacity_semantics(self):
-        self.assertIn("retry-backoff-v1", INDEX.read_text(encoding="utf-8"))
+        self.assertIn("risk-symbol-name-v6", INDEX.read_text(encoding="utf-8"))
 
 
 if __name__ == "__main__":
