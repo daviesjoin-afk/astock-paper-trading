@@ -92,13 +92,16 @@ LOT_SIZE = 100
 # 买出 ¥1.9K 仓）。预算不足时转入 deferred 队列等轮换释放额度，而不是
 # 用小仓填满席位。仅约束预算侧约束（cash/weight/exposure/industry）
 # 导致的小单；risk 约束导致的小单是低价股合法整手规模，不受此限。
-MIN_ORDER_AMOUNT = 8000.0
+MIN_ORDER_AMOUNT = 10000.0
 # The three strategies make independent decisions but draw from one capital
 # pool.  Their historical profile exposure values are kept as sizing hints;
 # using any one of them as the pool ceiling makes the other strategies see a
 # permanently full account (for example 70% pool utilisation is already above
 # the 55% breakout ceiling).  Keep one explicit pool-level hard cap instead.
 SHARED_POOL_MAX_EXPOSURE = 0.82
+# 主力策略仅保留 3 个集中席位。市场黄灯缩减策略预算时，仍为该策略
+# 保留一部分最低可表达资金份额；它只能抬高可下单额度，不突破共享池硬上限。
+MAIN_FORCE_PRIORITY_FLOOR_PCT = 0.15
 # 三分钟频率兼顾开盘/午后节奏与全市场双源校验耗时；09:30、13:00 仍由首轮立即触发。
 INTRADAY_INTERVAL_MINUTES = 3
 INTRADAY_WINDOWS = (("09:30", "11:25"), ("13:00", "14:55"))
@@ -7998,6 +8001,17 @@ def _strategy_pool_budget(conn, account, nav, positions, quotes, market=None, ex
     }
     floor_pct = {key: value * STRATEGY_POOL_FLOOR_RATIO for key, value in target_pct.items()}
     account_id = account.get("id")
+    # 主力资金优先：最低份额不随市场灯色缩到无法买入一手高价股。该份额
+    # 写入 floor_pct 后，其他策略的保留资金会自动把它视为受保护额度。
+    priority_floor_amount = (
+        nav * MAIN_FORCE_PRIORITY_FLOOR_PCT
+        if account_id == MAIN_FORCE_STRATEGY_ID else 0.0
+    )
+    if priority_floor_amount > 0.0:
+        target_pct[account_id] = max(
+            target_pct.get(account_id, 0.0), MAIN_FORCE_PRIORITY_FLOOR_PCT)
+        floor_pct[account_id] = max(
+            floor_pct.get(account_id, 0.0), MAIN_FORCE_PRIORITY_FLOOR_PCT)
     current_amount = values.get(account_id, 0.0)
     pending_strategy_amount = pending_by_account.get(account_id, 0.0)
     current_total_amount = current_amount + pending_strategy_amount
@@ -8040,6 +8054,10 @@ def _strategy_pool_budget(conn, account, nav, positions, quotes, market=None, ex
         # coefficient a second time when turning remaining budget into shares.
         "market_scale_applied": bool(scales is not None),
         "floor_pct": round(floor_pct.get(account_id, 0.0) * 100, 2),
+        "priority_floor_pct": (
+            round(MAIN_FORCE_PRIORITY_FLOOR_PCT * 100, 2)
+            if priority_floor_amount > 0.0 else None),
+        "priority_floor_amount": round(priority_floor_amount, 2),
         "current_pct": round(current_amount / nav * 100, 2) if nav else 0.0,
         "target_amount": round(target_amount, 2),
         "floor_amount": round(floor_amount, 2),
@@ -8689,6 +8707,15 @@ def _buy_order(conn, account, signal, quote, market, news, asof_day, *, all_quot
     sizing["one_lot_fee"] = round(_commission(LOT_SIZE * fill_price), 2)
     sizing["cash_available"] = round(shared_cash, 2)
     sizing["qty_final"] = int(qty)
+    # 预算侧能买出一手但金额不足最小建仓地板时，明确转入等待池。这样
+    # 尘埃仓不会先被当作 allowed=True 成交，再由展示层事后分类。
+    if qty >= LOT_SIZE and amount < MIN_ORDER_AMOUNT and not reasons:
+        dust_reason = (
+            f"低于最小建仓金额 ¥{MIN_ORDER_AMOUNT:,.0f}（当前 ¥{amount:,.0f}）；"
+            "席位稀缺时不建尘埃仓，候选保留在等待池，预算释放后按全尺寸复核"
+        )
+        reasons.append(dust_reason)
+        soft_amount_reasons.append(dust_reason)
     if qty < LOT_SIZE and not reasons:
         limits = sizing.get("constraint_shares") or {}
         binding = [name for name, value in limits.items() if _num(value) < LOT_SIZE]
@@ -8783,7 +8810,7 @@ def _buy_order(conn, account, signal, quote, market, news, asof_day, *, all_quot
         and amount < MIN_ORDER_AMOUNT
         and not hard_reasons
     )
-    capacity_deferred = count_only_blocked or (
+    capacity_deferred = bool(timing_block_reasons) or count_only_blocked or (
         bool(soft_amount_reasons) and not hard_reasons
     ) or dust_order or (
         qty < LOT_SIZE and not hard_reasons
@@ -9795,6 +9822,22 @@ def execute_open(asof_date=None):
     # order is reconsidered.  A quote gate may stop buys, but never stops a
     # protective sell pass.
     opening_risk = monitor_risk(day)
+    # 开盘 slot 先做轻量数据源探活，再执行实时行情门控。这样入场冻结状态
+    # 不会继续使用上一交易日的健康快照；探活失败时仍保持 fail-closed，
+    # 不会因为探活异常而放宽任何买入条件。
+    try:
+        open_source_health = dfc.check_data_source_health(force=True)
+    except Exception as exc:
+        open_source_health = {
+            "healthy": False, "reconnected": False, "attempts": 0,
+            "action": f"健康检查异常：{type(exc).__name__}: {exc}",
+        }
+    # 入场冻结状态带有短缓存，探活后强制重算，确保本轮买入判断读取最新
+    # 数据源健康快照；异常时保留原有冻结语义。
+    try:
+        _entry_freeze_status(force=True)
+    except Exception:
+        pass
     # A pending signal is not permission to trade against yesterday's or a
     # partial market snapshot.  Re-check the same full-market gate here so the
     # standalone 09:31 scheduler cannot bypass a blocked 3-minute scan.
@@ -9816,6 +9859,7 @@ def execute_open(asof_date=None):
             "orders": list(opening_risk.get("orders", [])),
             "manual_orders": list(opening_risk.get("manual_orders", [])), "expired": 0,
             "reason": reason, "live_scan_gate": open_gate,
+            "data_source_health": open_source_health,
         }
     current_clock = dt.datetime.now().strftime("%H:%M")
     opening_event = (
@@ -10712,15 +10756,24 @@ def _downside_confirmed(conn, account_id, code, asof_day, guard):
         # A missing timestamp must fail closed; two concurrent scheduler calls
         # must never be mistaken for two independent confirmations.
         return False
-    # Giveback protection is intent-independent by design (see the audit note
-    # above): a position that gave back a large accumulated edge while the
-    # main-force classifier returned "uncertain" (e.g. missing flow fields)
-    # used to make this confirmation unreachable, so the protective exit could
-    # never fire until the hard stop.  Two consecutive scans both carrying the
-    # giveback flag are still required — the spacing check above already
-    # guarantees they are distinct observations.
-    giveback_confirmed = bool(guard.get("giveback_protection")) and bool(
-        prior_guard.get("giveback_protection")
+    # Giveback protection is intent-independent by design. Once it has fired
+    # in any earlier scan today, keep it valid for the rest of the day so a
+    # minor bounce cannot make the protective confirmation unreachable.
+    giveback_today = bool(
+        conn.execute(
+            ("SELECT 1 FROM paper_risk_decisions "
+             "WHERE account_id=? AND code=? AND side='sell' "
+             "AND substr(created_at,1,10)=? "
+             "AND decision IN ('downside_warning','downside_partial_pending','downside_full_pending') "
+             "AND json_extract(payload,'$.downside_guard.giveback_protection') "
+             "    IN (1,'1','true','True') LIMIT 1"),
+            (account_id, code, _date(asof_day).isoformat()),
+        ).fetchone()
+    )
+    giveback_confirmed = (
+        bool(guard.get("giveback_protection")) or giveback_today
+    ) and (
+        bool(prior_guard.get("giveback_protection")) or giveback_today
     )
     confirmed_intent = (
         prior_class == current_class == "distribution" or giveback_confirmed
