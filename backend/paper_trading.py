@@ -33,6 +33,7 @@ import paper_portfolio as PP
 import paper_repository as PRP
 import paper_performance as PPerf
 import paper_schema_migrations as PSM
+import paper_archive_projection as PAP
 from market_policy import market_light_scale, market_light_scales
 from paper_trading_rules import (
     CHINEXT_PREFIXES,
@@ -14507,37 +14508,11 @@ def _archived_order_rows(conn):
         _archive_orders_cache["rows"] = projected_rows
         return [dict(row) for row in projected_rows]
 
-    archived_rows = []
-    archived_seen = set()
     try:
         archives = _rows(conn, "SELECT id,cycle_key,snapshot,created_at FROM paper_archives ORDER BY id DESC")
     except sqlite3.Error:
         archives = []
-    for archive in archives:
-        try:
-            snapshot = _loads(archive.get("snapshot"), {}) or {}
-            archived_names = {
-                row.get("id"): row.get("name")
-                for row in (snapshot.get("paper_accounts") or [])
-            }
-            for archived in snapshot.get("paper_orders") or []:
-                item = dict(archived)
-                key = (
-                    str(archive.get("cycle_key") or ""),
-                    str(item.get("id") or ""),
-                    str(item.get("created_at") or ""),
-                )
-                if key in archived_seen:
-                    continue
-                archived_seen.add(key)
-                item.pop("risk_payload", None)
-                item["account_name"] = archived_names.get(item.get("account_id"), item.get("account_id"))
-                item["archived_cycle"] = archive.get("cycle_key")
-                item["read_only"] = True
-                archived_rows.append(item)
-        except (TypeError, ValueError, sqlite3.Error):
-            # One damaged legacy archive must not blank the current ledger.
-            continue
+    archived_rows = PAP.project_order_rows(archives, _loads)
     _archive_orders_cache["signature"] = signature
     _archive_orders_cache["rows"] = tuple(archived_rows)
     _store_archive_order_projection(signature, archived_rows)
