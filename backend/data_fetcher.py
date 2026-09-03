@@ -2,13 +2,14 @@
 """数据层：东方财富 + 腾讯免费公开接口，全部实测验证于 2026-07-28
 传输层：requests + Session 连接复用，大幅降低进程开销"""
 import datetime as dt
-import os, json, time, threading, re, uuid
+import os, json, time, threading, uuid
 from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import requests
 import pandas as pd
 import marketdata_cache as MDC
 import marketdata_normalizers as MN
+import marketdata_providers as MP
 from marketdata_transport import (
     HEADERS,
     _session,
@@ -1041,29 +1042,10 @@ def fetch_tencent_realtime_for_codes(codes):
             )
         except Exception:
             text = ""
-        for line in str(text or "").strip().split(";"):
-            if "=" not in line:
-                continue
-            raw_code = line.split("=")[0].replace("v_", "").strip()
-            code = raw_code[-6:]
-            parts = line.split("=", 1)[1].strip().strip('"').split("~")
-            if len(parts) < 33 or not code.isdigit():
-                continue
-            try:
-                price = float(parts[3] or 0)
-                prev_close = float(parts[4] or 0)
-                pct = float(parts[32] or 0)
-            except (TypeError, ValueError):
-                continue
-            # The public Tencent schema has changed field positions before;
-            # locate the 14-digit quote timestamp rather than trusting index 30.
-            quote_at = next((part for part in parts if re.fullmatch(r"\d{14}", str(part or "").strip())), None)
-            if price > 0:
-                rows_by_code[code] = {
-                    "code": code, "name": parts[1], "price": price, "prev_close": prev_close,
-                    "pct": pct, "quote_at": quote_at,
-                    "source": "tencent_public_quote", "attempt": attempt + 1,
-                }
+        for row in MP.parse_tencent_realtime_text(
+            text, attempt=attempt + 1, allowed_codes=pending
+        ):
+            rows_by_code[row["code"]] = row
         pending = [code for code in pending if code not in rows_by_code]
         if pending and attempt < 2:
             if not text:
@@ -1107,43 +1089,8 @@ def _fetch_sina_realtime_for_codes(codes):
             if attempt == 0:
                 reset_data_source("新浪独立行情源空响应，自动重试")
                 time.sleep(0.25)
-        for line in text.strip().split(";"):
-            if "=" not in line:
-                continue
-            symbol = line.split("=", 1)[0].strip().split("_")[-1]
-            code = symbol[-6:]
-            if code not in batch:
-                continue
-            values = line.split("=", 1)[1].strip().strip('"').rstrip(";").strip('"').split(",")
-            if len(values) < 10:
-                continue
-            try:
-                price = float(values[3] or 0)
-                prev_close = float(values[2] or 0)
-            except (TypeError, ValueError):
-                continue
-            if price <= 0 or prev_close <= 0:
-                continue
-            quote_date = ""
-            quote_clock = ""
-            # 不同板块在时间字段后追加的字段数量不同（尤其北交所），
-            # 不能固定取倒数第 3/2 列；按日期和时刻格式定位。
-            for idx, value in enumerate(values[:-1]):
-                if re.fullmatch(r"\d{4}-\d{2}-\d{2}", str(value or "").strip()):
-                    if idx + 1 < len(values) and re.fullmatch(r"\d{2}:\d{2}:\d{2}", str(values[idx + 1] or "").strip()):
-                        quote_date = str(value).strip()
-                        quote_clock = str(values[idx + 1]).strip()
-                        break
-            quote_at = f"{quote_date}T{quote_clock}+08:00" if quote_date and quote_clock else None
-            rows_by_code[code] = {
-                "code": code,
-                "name": values[0],
-                "price": price,
-                "prev_close": prev_close,
-                "pct": round((price - prev_close) / prev_close * 100, 4),
-                "quote_at": quote_at,
-                "source": "sina_public_quote",
-            }
+        for row in MP.parse_sina_realtime_text(text, allowed_codes=batch):
+            rows_by_code[row["code"]] = row
     return [rows_by_code[code] for code in codes if code in rows_by_code]
 
 
