@@ -1442,28 +1442,7 @@ def _fetch_kline_tencent(code, beg, end, fqt=1, secid=None):
             break
         cursor_end = earliest - datetime.timedelta(days=1)
     raw = [raw_by_date[key] for key in sorted(raw_by_date)]
-    rows = []
-    previous_close = None
-    for item in raw:
-        if len(item) < 6:
-            continue
-        date, open_, close, high, low, volume = item[:6]
-        open_, close, high, low, volume = map(float, (open_, close, high, low, volume))
-        typical = (open_ + close + high + low) / 4
-        amplitude_base = previous_close or close
-        rows.append(
-            {
-                "date": date,
-                "open": open_,
-                "close": close,
-                "high": high,
-                "low": low,
-                "volume": volume,
-                "amount": volume * 100 * typical,
-                "amplitude": (high - low) / amplitude_base * 100 if amplitude_base else None,
-            }
-        )
-        previous_close = close
+    rows = MP.parse_tencent_kline_rows(raw)
     frame = _kline_frame(rows)
     frame.attrs.update({
         "source": "tencent" if (fqt != 1 or used_qfq_rows) else "tencent_raw",
@@ -1488,31 +1467,7 @@ def _fetch_kline_sina(code, beg, end):
         timeout=8,
         retries=0,
     ) or []
-    start = pd.Timestamp(str(beg))
-    finish = pd.Timestamp(str(end))
-    rows = []
-    for item in payload:
-        date = pd.Timestamp(item.get("day"))
-        if date < start or date > finish:
-            continue
-        open_ = float(item["open"])
-        close = float(item["close"])
-        high = float(item["high"])
-        low = float(item["low"])
-        volume = float(item["volume"])
-        typical = (open_ + close + high + low) / 4
-        rows.append(
-            {
-                "date": str(date.date()),
-                "open": open_,
-                "close": close,
-                "high": high,
-                "low": low,
-                "volume": volume,
-                "amount": volume * typical,
-                "amplitude": (high - low) / close * 100 if close else None,
-            }
-        )
+    rows = MP.parse_sina_kline_rows(payload, beg, end)
     frame = _kline_frame(rows)
     frame.attrs.update({"source": "sina", "adjustment": "none"})
     return frame
@@ -1543,15 +1498,7 @@ def _fetch_kline_eastmoney(code, beg, end, klt, fqt, secid):
         if klines:
             break
         time.sleep(0.4)
-    rows = []
-    for k in klines:
-        p = k.split(",")
-        rows.append({
-            "date": p[0], "open": float(p[1]), "close": float(p[2]),
-            "high": float(p[3]), "low": float(p[4]),
-            "volume": float(p[5]), "amount": float(p[6]),
-            "amplitude": float(p[7]) if len(p) > 7 else None,
-        })
+    rows = MP.parse_eastmoney_kline_rows(klines)
     frame = _kline_frame(rows)
     frame.attrs.update({"source": "eastmoney", "adjustment": "qfq" if fqt == 1 else "none"})
     return frame
