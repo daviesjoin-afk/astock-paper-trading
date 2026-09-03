@@ -86,3 +86,22 @@ def account_metric_inputs(conn, account_ids, today):
         "latest_nav": latest_nav, "navs": navs, "previous_nav": previous_nav,
         "sells": sells, "buy_count": buy_count, "rejected": rejected,
     }
+
+
+def recent_live_orders(conn, account_names, limit):
+    """读取活动周期订单的轻量列表投影，不读取庞大的 risk_payload。"""
+    fields = (
+        "id,account_id,signal_id,side,code,name,qty,planned_price,filled_price,"
+        "amount,fees,status,reason,realized_pnl,created_at,executed_at,"
+        "order_type,origin,expires_at,cancelled_at"
+    )
+    orders = rows(
+        conn,
+        f"SELECT {fields} FROM paper_orders ORDER BY id DESC LIMIT ?",
+        (max(1, int(limit)),),
+    )
+    for order in orders:
+        account_id = order.get("account_id")
+        order["account_name"] = account_names.get(account_id, account_id)
+        order["archived_cycle"] = None
+    return orders

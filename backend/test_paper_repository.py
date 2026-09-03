@@ -57,6 +57,24 @@ class PaperRepositoryTests(unittest.TestCase):
             "buy_count": {}, "rejected": {},
         })
 
+    def test_recent_live_orders_keeps_lightweight_activity_projection(self):
+        self.conn.execute(
+            """CREATE TABLE paper_orders(
+                id INTEGER PRIMARY KEY, account_id TEXT, signal_id INTEGER, side TEXT, code TEXT,
+                name TEXT, qty INTEGER, planned_price REAL, filled_price REAL, amount REAL,
+                fees REAL, status TEXT, reason TEXT, realized_pnl REAL, created_at TEXT,
+                executed_at TEXT, order_type TEXT, origin TEXT, expires_at TEXT, cancelled_at TEXT,
+                risk_payload TEXT
+            )"""
+        )
+        self.conn.execute(
+            "INSERT INTO paper_orders(id,account_id,side,code,status,created_at,risk_payload) VALUES(1,'acct','buy','000001','filled','2026-09-03 10:00:00','large')"
+        )
+        rows = repository.recent_live_orders(self.conn, {"acct": "策略 A"}, 20)
+        self.assertEqual(rows[0]["account_name"], "策略 A")
+        self.assertIsNone(rows[0]["archived_cycle"])
+        self.assertNotIn("risk_payload", rows[0])
+
 
 if __name__ == "__main__":
     unittest.main()

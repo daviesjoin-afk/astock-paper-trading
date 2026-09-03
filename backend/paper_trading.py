@@ -14318,22 +14318,9 @@ def _recent_orders_with_archives(conn, account_names, limit=500):
     # silently erase 09:35/10:05 orders after many waitlist retries arrive.
     live_window = max(limit, 2000)
     # ``risk_payload`` contains the complete decision snapshot and can be
-    # hundreds of KB per order.  This list view never renders it; selecting
-    # then ``pop``-ing it created a 500MB+ transient allocation on a busy
-    # ledger and was the direct cause of slow/502 dashboard refreshes.
-    order_fields = (
-        "id,account_id,signal_id,side,code,name,qty,planned_price,filled_price,"
-        "amount,fees,status,reason,realized_pnl,created_at,executed_at,"
-        "order_type,origin,expires_at,cancelled_at"
-    )
-    orders = _rows(
-        conn,
-        f"SELECT {order_fields} FROM paper_orders ORDER BY id DESC LIMIT ?",
-        (live_window,),
-    )
-    for order in orders:
-        order["account_name"] = account_names.get(order["account_id"], order["account_id"])
-        order["archived_cycle"] = None
+    # hundreds of KB per order. The repository projection intentionally never
+    # selects it, avoiding transient allocations on a busy activity page.
+    orders = PRP.recent_live_orders(conn, account_names, live_window)
 
     orders.extend(_archived_order_rows(conn))
     orders.sort(
