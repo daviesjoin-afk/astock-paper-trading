@@ -16,11 +16,11 @@ import sqlite3
 import statistics
 from collections import Counter
 from adaptive_common import _loads, _json, _clamp  # C3: 收敛重复工具函数
+from strategy_registry import labels as strategy_labels
 
 ACCOUNT_NAMES = {
-    "tq_breakout": "短线日内做T",
-    "trend_pullback": "趋势波段优选",
-    "sector_rotation": "板块轮动先锋",
+    account_id: strategy_labels().get(account_id, account_id)
+    for account_id in ("tq_breakout", "trend_pullback", "sector_rotation")
 }
 
 BASE_RISK = {
