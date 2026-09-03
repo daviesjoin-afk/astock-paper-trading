@@ -6,6 +6,8 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import strategy_registry as registry
+import adaptive_risk as adaptive_risk
+import paper_trading as paper
 
 
 class StrategyRegistryTests(unittest.TestCase):
@@ -22,6 +24,18 @@ class StrategyRegistryTests(unittest.TestCase):
         labels["tq_breakout"] = "changed"
         self.assertEqual(registry.get("tq_breakout").name, "短线日内做T")
         self.assertIsNone(registry.get("unknown"))
+
+    def test_adaptive_risk_labels_are_derived_from_registry(self):
+        labels = registry.labels()
+        self.assertEqual(adaptive_risk.ACCOUNT_NAMES, {
+            account_id: labels[account_id] for account_id in adaptive_risk.BASE_RISK
+        })
+
+    def test_strategy_center_exposes_registry_status_without_changing_account_scope(self):
+        rows = {row["id"]: row for row in paper.strategy_center()["strategies"]}
+        self.assertEqual(rows["tq_breakout"]["strategy_status"], "active")
+        self.assertTrue(rows["main_force_top10"]["supports_new_cycle"])
+        self.assertEqual(rows["trend_pullback"]["strategy_status"], "legacy")
 
 
 if __name__ == "__main__":
