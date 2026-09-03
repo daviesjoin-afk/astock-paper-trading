@@ -19,9 +19,10 @@
 ## 交接与恢复边界
 
 1. 仅在服务器上保留源码、Git 差异及未跟踪文件归档；不将运行数据库和缓存重复复制到同一块空间不足的磁盘。
-2. 本地 Git bundle 应包含当前架构硬化分支，以便另一台电脑离线获取该分支；bundle 的准确路径和 SHA-256 需在生成后填入本文件。
-3. 下一步先在交易时段做服务器数据库只读完整性与模拟周期验收；验证通过后才部署本地新版本。
-4. 服务器验收通过且用户明确确认前，不得推送 GitHub 或创建/更新 PR。
+2. 服务器源码级归档已创建：`/root/backups/20260904-server-worktree-source-handoff/worktree-source-excluding-runtime-state.tar.gz`，SHA-256 为 `e59e3877ae0a5662dae75e96a05927643d06e68d350ae5e0b2eef5bc262c0ecb`。同目录还包含 `worktree.status`、`worktree.diff`、`untracked.list`、`SCOPE.txt` 与 `SHA256SUMS`。
+3. 本地 Git bundle 将上传为 `/root/backups/20260904-server-worktree-source-handoff/architecture-hardening-20260904.bundle`，并在同目录提供 `.sha256` 校验文件。另一台电脑可下载后运行 `git clone architecture-hardening-20260904.bundle astock-paper-trading`。
+4. 下一步先在交易时段做服务器数据库只读完整性与模拟周期验收；验证通过后才部署本地新版本。
+5. 服务器验收通过且用户明确确认前，不得推送 GitHub 或创建/更新 PR。
 
 ## 禁止事项
 
