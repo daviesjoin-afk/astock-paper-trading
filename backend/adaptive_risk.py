@@ -478,9 +478,8 @@ def _sync_order_attribution(adaptive, paper, now):
     order_columns = {str(row["name"]) for row in paper.execute("PRAGMA table_info(paper_orders)")}
     order_type_expr = "order_type" if "order_type" in order_columns else "'market' AS order_type"
     origin_expr = "origin" if "origin" in order_columns else "'strategy' AS origin"
-    # risk_payload contains the complete decision snapshot and dominates the
-    # paper database size.  Evolution only needs to know whether it is a valid,
-    # non-empty object here; materialising every payload caused >1GB RSS.
+    # Only the validity bit is needed here. Materialising every full decision
+    # snapshot made the learning worker grow past its cgroup memory limit.
     orders = paper.execute(
         f"""SELECT id,account_id,code,side,status,created_at,filled_price,qty,
                    amount,executed_at,reason,realized_pnl,{order_type_expr},{origin_expr},
@@ -547,7 +546,10 @@ def _capture_daily_outcomes(adaptive, paper, now):
             peak = max(peak, nav)
             daily_return = (nav / previous - 1) * 100 if previous else None
             drawdown = (1 - nav / peak) * 100 if peak else 0.0
-            version, candidate_id, _ = _version_context(paper, account["id"], day)
+            # P3 审计修复（E1）：daily 行归属传当日结束时间——旧实现传裸日期，
+            # 字符串比较 "T+0 00:00:00" <= "T+0" 为 False，导致当日生效版本的
+            # 当日数据被错误归属到旧版本（订单级归因正确，两层口径矛盾）。
+            version, candidate_id, _ = _version_context(paper, account["id"], f"{day} 23:59:59")
             order_rows = paper.execute(
                 "SELECT status,side,reason,COALESCE(realized_pnl,0) pnl FROM paper_orders WHERE account_id=? AND substr(created_at,1,10)=?",
                 (account["id"], day),
@@ -695,6 +697,11 @@ def _monitor_deployments(conn, paper_db_path, now_fn):
                 reason = "观察期风险结果较部署前明显恶化；避免把市场波动误判为参数因果，暂停后续进化并等待人工复核"
             elif post["days"] >= 5:
                 status, decision, reason = "validated", "keep", "5个净值日观察完成，接线完整且未触发效果恶化门禁"
+            elif deployment["status"] == "review_required":
+                # P3 审计修复：观察日数不足时不得把人工复核中的部署降级
+                # 回 observing——那会抹掉 review_required 的人工复核标记。
+                status, decision = "review_required", "human_review"
+                reason = "人工复核中；观察日数不足5日，维持复核状态不降级"
             conn.execute(
                 """UPDATE adaptive_risk_deployments SET status=?,observation_days=?,post_metrics=?,
                        decision=?,reason=?,updated_at=?,reviewed_at=? WHERE candidate_id=?""",
@@ -853,7 +860,12 @@ def _gate_result(evidence, profile, config):
         tier_checks[prefix] = {"passed": passed, "checks": checks, "requirements": requirements}
         if passed:
             achieved = tier_name
-    return tier_checks["fast"]["checks"], achieved, tier_checks
+    # P3 审计修复（E3）：返回实际达成层级的检查项。旧实现固定返回
+    # fast 层——waiting/shadow 候选展示看似更严的门槛，mature 候选展示
+    # 看似更松的门槛，人工审批的核心审计材料层级错报。
+    display_tier = {"fast_shadow": "shadow", "micro": "fast", "standard": "standard",
+                    "mature": "mature"}.get(achieved, "shadow")
+    return tier_checks[display_tier]["checks"], achieved, tier_checks
 
 
 def _upsert_candidate(conn, payload, now):
@@ -981,6 +993,29 @@ def _record_risk_event_once(conn, candidate_id, account_id, event, detail, now):
         )
 
 
+def _finalize_apply(conn, candidate, candidate_id, version, effective_date,
+                    approved_by, previous_params, now):
+    """Finish the adaptive ledger side of an already durable paper apply.
+
+    The paper and adaptive databases are committed separately.  A retry may
+    therefore find the proposed parameters already present in the paper
+    ledger (``no_change``) while the adaptive candidate is still eligible.
+    Finalization must be replay-safe and restore every adaptive-side record
+    without creating a second deployment or event.
+    """
+    conn.execute(
+        """UPDATE adaptive_risk_candidates SET status='applied',application_mode=?,previous_account_params=?,
+           effective_date=?,applied_at=?,updated_at=? WHERE id=?""",
+        (approved_by, previous_params, effective_date, now, now, candidate_id),
+    )
+    _record_risk_event_once(
+        conn, candidate_id, candidate["account_id"], "applied",
+        _json({"approved_by": approved_by, "effective_date": effective_date, "effective_at": now}), now,
+    )
+    _register_deployment(conn, candidate, version, effective_date, now)
+    _mark_outbox_applied(conn, candidate_id, now)
+
+
 def apply_candidate(conn, paper_db_path, candidate_id, now_fn, approved_by="conservative-auto", require_conservative=True):
     ensure_schema(conn)
     row = conn.execute("SELECT * FROM adaptive_risk_candidates WHERE id=?", (candidate_id,)).fetchone()
@@ -1016,7 +1051,6 @@ def apply_candidate(conn, paper_db_path, candidate_id, now_fn, approved_by="cons
         current, account_params, _ = _current_risk(account)
         if require_conservative and not _is_conservative(current, proposed):
             raise ValueError("自动晋级只允许收紧风险，放宽参数必须人工审批")
-        # 风控调参对模拟盘即时生效；仍保留精确生效时间、版本、观察期和自动回滚机制。
         now = str(now_fn())
         effective_date = str(intent.get("effective_date") or now[:10])[:10]
         previous_params = intent.get("previous_account_params")
@@ -1024,6 +1058,16 @@ def apply_candidate(conn, paper_db_path, candidate_id, now_fn, approved_by="cons
             previous_params = _json(account_params)
         approved_by = intent.get("approved_by") or approved_by
         version = str(outbox_row["version"]) if outbox_row else f"risk-evo-{candidate['run_date'].replace('-', '')}-{candidate_id}"
+        # P3 审计修复（E4）：no_change 幂等返回——参数完全相同时不再写
+        # 新版本/重置观察期（旧路径会制造冗余版本并把部署观察清零）。
+        if _change_kind(current, proposed) == "no_change":
+            _finalize_apply(
+                conn, candidate, candidate_id, version, effective_date,
+                approved_by, previous_params, now,
+            )
+            conn.commit()
+            return candidate_id
+        # 风控调参对模拟盘即时生效；仍保留精确生效时间、版本、观察期和自动回滚机制。
     finally:
         paper.close()
 
@@ -1086,17 +1130,10 @@ def apply_candidate(conn, paper_db_path, candidate_id, now_fn, approved_by="cons
 
     now = str(now_fn())
     try:
-        conn.execute(
-            """UPDATE adaptive_risk_candidates SET status='applied',application_mode=?,previous_account_params=?,
-               effective_date=?,applied_at=?,updated_at=? WHERE id=?""",
-            (approved_by, previous_params, effective_date, now, now, candidate_id),
+        _finalize_apply(
+            conn, candidate, candidate_id, version, effective_date,
+            approved_by, previous_params, now,
         )
-        _record_risk_event_once(
-            conn, candidate_id, candidate["account_id"], "applied",
-            _json({"approved_by": approved_by, "effective_date": effective_date, "effective_at": now}), now,
-        )
-        _register_deployment(conn, candidate, version, effective_date, now)
-        _mark_outbox_applied(conn, candidate_id, now)
         conn.commit()
     except Exception:
         # The paper commit is already durable, so leave the committed outbox
@@ -1267,7 +1304,7 @@ def replay_pending_outbox(conn, paper_db_path, now_fn, limit=20):
     """Replay risk parameter applies/rollbacks after a process interruption."""
     ensure_schema(conn)
     rows = conn.execute(
-        """SELECT candidate_id,operation,payload FROM adaptive_risk_outbox
+        """SELECT candidate_id,operation,payload,attempts FROM adaptive_risk_outbox
            WHERE status IN ('pending','error') ORDER BY id LIMIT ?""",
         (max(1, min(int(limit), 100)),),
     ).fetchall()
@@ -1292,7 +1329,19 @@ def replay_pending_outbox(conn, paper_db_path, now_fn, limit=20):
                 )
             recovered.append(outbox_id)
         except Exception as exc:
-            _mark_outbox_error(conn, outbox_id, f"replay:{type(exc).__name__}: {exc}", str(now_fn()))
+            # P3 审计修复（E7）：持久性错误重试上限——超过 5 次转 dead
+            # 终态，不再每个学习周期空转刷屏；需人工介入。
+            attempts = int(row["attempts"] or 0)
+            marker = f"replay:{type(exc).__name__}: {exc}"
+            if attempts >= 5:
+                conn.execute(
+                    """UPDATE adaptive_risk_outbox SET status='dead',attempts=attempts+1,
+                           last_error=?,updated_at=? WHERE candidate_id=?""",
+                    (f"dead-letter: {marker}", str(now_fn()), outbox_id),
+                )
+                conn.commit()
+            else:
+                _mark_outbox_error(conn, outbox_id, marker, str(now_fn()))
     return recovered
 
 

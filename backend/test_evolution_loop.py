@@ -72,6 +72,7 @@ class EvolutionLoopTests(unittest.TestCase):
     def test_full_multi_generation_run(self):
         """连续跑 5 代，全部完成且无异常、无丢失。"""
         conn = _mem_conn()
+        self.addCleanup(conn.close)
         EL.ensure_loop_schema(conn)
         rep = EL.run_loop(conn, FakeBackend(), generations=5)
         self.assertEqual(rep["generations_run"], 5)
@@ -86,6 +87,7 @@ class EvolutionLoopTests(unittest.TestCase):
     def test_resume_after_interruption(self):
         """手动插入一个被中断的代(只跑完 observe)，续跑能补齐剩余阶段。"""
         conn = _mem_conn()
+        self.addCleanup(conn.close)
         EL.ensure_loop_schema(conn)
         # 模拟上一次进程在 evaluate 之前崩溃：写了 running + done_stages=["observe"]
         conn.execute(
@@ -107,6 +109,7 @@ class EvolutionLoopTests(unittest.TestCase):
     def test_stage_exception_isolated_loop_continues(self):
         """某阶段抛异常，整轮不崩，循环继续跑完后续代。"""
         conn = _mem_conn()
+        self.addCleanup(conn.close)
         EL.ensure_loop_schema(conn)
         rep = EL.run_loop(conn, FakeBackend(fail_stage="evaluate"), generations=3)
         # 三代数全部被驱动（循环未死）。
@@ -124,6 +127,7 @@ class EvolutionLoopTests(unittest.TestCase):
     def test_stale_data_self_heal_skip(self):
         """样本不足时 evaluate 阶段自愈为 skip，而非阻塞或抛错。"""
         conn = _mem_conn()
+        self.addCleanup(conn.close)
         EL.ensure_loop_schema(conn)
         rep = EL.run_loop(conn, FakeBackend(stale=True), generations=2)
         self.assertEqual(rep["generations_run"], 2)
@@ -134,6 +138,7 @@ class EvolutionLoopTests(unittest.TestCase):
     def test_time_budget_graceful_stop(self):
         """时间预算耗尽时优雅收尾，不无限运行。"""
         conn = _mem_conn()
+        self.addCleanup(conn.close)
         EL.ensure_loop_schema(conn)
         rep = EL.run_loop(conn, FakeBackend(), generations=100, time_budget_seconds=0.0001)
         self.assertLess(rep["generations_run"], 100)
@@ -142,6 +147,7 @@ class EvolutionLoopTests(unittest.TestCase):
     def test_param_drift_across_generations(self):
         """参数随代演化（动态调参机制生效）。"""
         conn = _mem_conn()
+        self.addCleanup(conn.close)
         EL.ensure_loop_schema(conn)
         b = FakeBackend()
         EL.run_loop(conn, b, generations=4)
@@ -151,6 +157,7 @@ class EvolutionLoopTests(unittest.TestCase):
 
     def test_loop_status_query(self):
         conn = _mem_conn()
+        self.addCleanup(conn.close)
         EL.ensure_loop_schema(conn)
         EL.run_loop(conn, FakeBackend(), generations=2)
         st = EL.loop_status(conn)
