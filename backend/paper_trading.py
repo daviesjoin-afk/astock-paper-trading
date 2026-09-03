@@ -3332,17 +3332,10 @@ def _today_quote_is_usable(quote, asof_day):
     try:
         parsed = dt.datetime.fromisoformat(quote_at.replace("Z", "+00:00"))
         if parsed.tzinfo is None:
-            # A timestamp without an offset has no defensible timezone
-            # contract at this boundary; treat it as process-local, matching
-            # the local ``datetime.now()`` used by the quote providers/tests.
-            # Production Compose sets the process timezone to Asia/Shanghai.
-            if _date(asof_day) != dt.date.today():
-                return True
-            age_seconds = (dt.datetime.now() - parsed).total_seconds()
-        else:
-            if _date(asof_day) != dt.date.today():
-                return True
-            age_seconds = (dt.datetime.now(dt.timezone.utc) - parsed.astimezone(dt.timezone.utc)).total_seconds()
+            parsed = parsed.replace(tzinfo=dt.timezone(dt.timedelta(hours=8)))
+        if _date(asof_day) != dt.date.today():
+            return True
+        age_seconds = (dt.datetime.now(dt.timezone.utc) - parsed.astimezone(dt.timezone.utc)).total_seconds()
         return -120 <= age_seconds <= 20 * 60
     except (TypeError, ValueError, OverflowError):
         return False
