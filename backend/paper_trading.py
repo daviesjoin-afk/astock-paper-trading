@@ -127,7 +127,7 @@ MAIN_FORCE_PRIORITY_FLOOR_PCT = 0.15
 # 三分钟频率兼顾开盘/午后节奏与全市场双源校验耗时；09:30、13:00 仍由首轮立即触发。
 INTRADAY_INTERVAL_MINUTES = 3
 INTRADAY_WINDOWS = (("09:30", "11:25"), ("13:00", "14:55"))
-# 开盘事件是共享执行引擎，三套策略只通过各自的策略画像决定阈值和仓位比例。
+# 开盘事件是共享执行引擎，五套策略只通过各自的策略画像决定阈值和仓位比例。
 # 这样既能在 09:30/09:31 抓住冲高回落，也不会把趋势/轮动策略改造成追涨策略。
 OPENING_EVENT_CLOCKS = {"09:30", "09:31", "13:00"}
 OPENING_EVENT_POLICIES = {
@@ -427,7 +427,7 @@ def paper_cache_generation():
     return "|".join(parts)
 
 # A small, recently updated subset is not a valid substitute for the A-share
-# market when ranking candidates.  The three paper strategies may use
+# market when ranking candidates.  The five paper strategies may use
 # different factor lags, but each one must still be ranked against a broad,
 # contemporaneous cross section.  Otherwise a transient cache failure can
 # silently turn a full-market strategy into a few-hundred-stock strategy.
@@ -501,7 +501,7 @@ INTRADAY_DOWNSIDE_POLICIES = {
 
 # 风控不是一个“全策略通用止损器”。这些字段同时用于审计与执行，
 # 明确每个账户面对洗盘/回吐时的容忍边界，避免仅凭同一个主力意图标签
-# 让三套策略做出相同动作。
+# 让五套策略做出相同动作。
 STRATEGY_RISK_BEHAVIORS = {
     "tq_breakout": {
         "entry_style": "实时动量确认，可小仓追高",
@@ -785,9 +785,8 @@ ACCOUNT_SPECS = {
 }
 
 # The registry is the single source of truth for what a new public cycle may
-# run.  Legacy specs stay in ACCOUNT_SPECS so archived ledgers and replay
-# tools can decode old rows, but they must never receive fresh cycle capital,
-# signals, or runner time.
+# run. All five registered specs receive fresh cycle capital, signals, and
+# runner time; ACCOUNT_SPECS also decodes archived ledgers.
 ACTIVE_ACCOUNT_IDS = tuple(
     account_id for account_id in SR.active_ids() if account_id in ACCOUNT_SPECS
 )
@@ -2162,9 +2161,9 @@ def _ensure_accounts(conn):
                 (spec["name"], spec["source_strategy"], spec["cycle_days"],
                  spec["max_weight"], spec["max_exposure"], spec["mode"], spec["risk_profile"], account_id),
             )
-            # Version only the newly introduced strategy.  Existing account
-            # versions remain untouched so historical three-strategy audits
-            # are not rewritten by a configuration refresh.
+            # Version only the newly introduced strategy. Existing account
+            # versions remain untouched so historical audits are not rewritten
+            # by a configuration refresh.
             if spec.get("strategy_version"):
                 conn.execute(
                     "UPDATE paper_accounts SET version=? WHERE id=?",
@@ -2283,9 +2282,16 @@ def _ensure_cycle(conn):
     """给旧版账户补一个可归档周期；不删除任何已有记录。"""
     active = conn.execute("SELECT * FROM paper_cycles WHERE status IN ('draft','running','paused') ORDER BY id DESC LIMIT 1").fetchone()
     if active is None:
-        first_active = ACTIVE_ACCOUNT_IDS[0] if ACTIVE_ACCOUNT_IDS else ""
-        account = conn.execute("SELECT * FROM paper_accounts WHERE id=?", (first_active,)).fetchone()
-        capital = _num(account["initial_cash"], 100000.0) if account else 100000.0
+        # A clean clone starts with one configured ledger per active strategy.
+        # Build the synthetic compatibility cycle from their total rather than
+        # the first account, so all five sleeves receive an equal bootstrap
+        # share before the operator starts a fresh explicit cycle.
+        active_clause, active_ids = _active_account_clause("id")
+        account_total = conn.execute(
+            f"SELECT COALESCE(SUM(initial_cash),0) FROM paper_accounts WHERE {active_clause}",
+            active_ids,
+        ).fetchone()[0]
+        capital = _num(account_total, 0.0) or 100000.0
         now = _now()
         key = "legacy-" + now.replace("-", "").replace(":", "").replace(" ", "-")
         conn.execute(
@@ -2326,7 +2332,11 @@ def _ensure_cycle(conn):
             # joining an already active legacy cycle, only unallocated
             # configured capital is attributed; zero is safe and keeps the
             # shared cash ledger from being inflated.
-            account_capital = _available_cycle_ledger_capital(conn, active, account_id)
+            account_capital = (
+                capital / max(len(ACTIVE_ACCOUNT_IDS), 1)
+                if str(active["cycle_key"] or "").startswith("legacy-")
+                else _available_cycle_ledger_capital(conn, active, account_id)
+            )
             benchmark = _benchmark_close()
             conn.execute(
                 "UPDATE paper_accounts SET cycle_id=?,mode=?,style=?,status=?,initial_cash=?,cash=?,benchmark_start=?,daily_start_nav=?,daily_nav_date=?,risk_profile=?,params=COALESCE(NULLIF(params,''),'{}') WHERE id=?",
@@ -2352,7 +2362,7 @@ def _ensure_cycle(conn):
             # is already running and this account has no activity, activate it
             # with the cycle rather than silently omitting today's signals.
             if (
-                account_id in {NEW_STRATEGY_ID, MAIN_FORCE_STRATEGY_ID}
+                account_id in ACTIVE_ACCOUNT_IDS
                 and active["status"] == "running"
                 and str(current["status"] or "") != "running"
                 and not conn.execute(
@@ -3348,7 +3358,7 @@ def _market_state(asof_date, live_universe=None, *, allow_network=True):
     elif stale and live_pct is not None:
         # 盘中最后一根完整日线落后一个交易日是正常现象；只要实时指数
         # 有当日时间戳，就按保守黄灯运行，不能把“趋势待更新”误判成未知
-        # 并暂停四套策略全部新开仓。
+        # 并暂停五套策略全部新开仓。
         light = "red" if overseas.get("light") == "red" or live_pct <= -2.0 else "yellow"
         reason = f"实时沪深300 {live_pct:+.2f}%；中期趋势收盘数据待更新，按谨慎仓位执行"
     elif stale:
@@ -7253,17 +7263,17 @@ def _risk_profile(account, asof_day=None):
 
 # The pool cap is hard, but it is not a per-strategy cap.  Each strategy gets
 # a risk-profile-weighted target inside the pool and a protected floor.  This
-# keeps a single signal stream from consuming all 82% before the other two
+# keeps a single signal stream from consuming all 82% before the other four
 # strategies have a chance to act; unused capacity can be lent only after the
 # other strategies have reached their floors.
 STRATEGY_POOL_FLOOR_RATIO = 0.60
-# Four strategy accounts share the pool.  2026-08-24 集中化改造：
-# 12 是硬上限（每策略 3 席），单仓风险预算同步放大，使资金利用率
+# Five strategy accounts share the pool.  2026-08-24 集中化改造：
+# 15 是硬上限（每策略 3 席），单仓风险预算同步放大，使资金利用率
 # 从 ~35% 提升到 ~75%；"集中力量办大事"而不是 17 席 × 零散小仓。
 SHARED_POOL_MAX_POSITIONS = 15
 STRATEGY_MIN_POSITIONS = 2
 STRATEGY_MAX_POSITIONS = 6
-# 四套模型共用资金但代表不同的市场假设。12 席总池下每策略保底 2 席，
+# 五套模型共用资金但代表不同的市场假设。15 席总池下每策略保底 2 席，
 # 该底座只保护"席位数"，不会放宽总暴露、单票/行业上限、行情校验或
 # 单笔风险预算。
 STRATEGY_PROTECTED_SLOT_FLOOR = 2
@@ -12649,7 +12659,7 @@ def _swing_scale_in(conn, account, position, quote, market, asof_day, profile, c
 
 
 def monitor_opening_events(asof_date=None, event_clock=None):
-    """扫描开盘冲高/回落事件；四策略共用识别器，各自使用独立策略阈值。"""
+    """扫描开盘冲高/回落事件；五策略共用识别器，各自使用独立策略阈值。"""
     init_db()
     day = _date(asof_date)
     clock = str(event_clock or dt.datetime.now().strftime("%H:%M"))
@@ -14657,7 +14667,7 @@ def dashboard(include_activity=False, include_history_symbols=False):
         shared["strategy_pnl_sum"] = round(raw_total, 2)
         shared["pnl_reconciliation_delta"] = round(pool_total - raw_total, 2)
         shared["strategy_today_pnl_sum"] = round(raw_today, 2) if today_complete else None
-        # The visible pool number and the four strategy cards now use the same
+        # The visible pool number and the five strategy cards now use the same
         # transfer-neutral definition and must reconcile exactly.  The former
         # synthetic-ledger discrepancy remains in ledger_* fields above.
         shared["today_pnl_reconciliation_delta"] = round(
@@ -14953,7 +14963,7 @@ def dashboard(include_activity=False, include_history_symbols=False):
 
 
 def research_validation_dashboard(limit=40):
-    """Return only the shadow-research ledger for the three paper strategies."""
+    """Return only the shadow-research ledger for the five paper strategies."""
     result = PR.dashboard(limit=limit)
     now = dt.datetime.now()
     today = now.date()
@@ -15360,7 +15370,7 @@ def risk_dashboard(refresh=False, allow_stale=False, allow_network=True):
         )
     result = RC.build_dashboard(base, snapshot)
     # 风控页面与交易页使用同一总资金池口径；策略仍保留各自的风险模型，
-    # 但不再把三套账户误展示成三个互不相关的资金账户。
+    # 但不再把五套账户误展示成五个互不相关的资金账户。
     result["capital_model"] = base.get("capital_model", "shared_pool")
     result["shared"] = base.get("shared", {})
     # 页面读取时同时暴露最近一轮 5 分钟探活结果，便于区分“没有行情”与

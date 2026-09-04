@@ -295,7 +295,7 @@ def _strategy_duplicates(records: Sequence[Mapping[str, Any]]) -> dict[str, Any]
     records = _normalise_rows(records)
     if not records:
         return {"status": "unavailable", "rows": 0,
-                "reason": "没有 selection_tracking 记录，无法判断三策略重复候选。"}
+                "reason": "没有 selection_tracking 记录，无法判断五策略重复候选。"}
     by_day_code: dict[tuple[str, str], set[str]] = defaultdict(set)
     strategy_counts = Counter()
     for row in records:
@@ -389,7 +389,7 @@ def audit_factor_rows(
                          "hhi": industry.get("hhi")})
     if strategy.get("status") == "available" and strategy.get("repeated_day_code_count", 0):
         findings.append({"id": "strategy_overlap", "severity": "low",
-                         "message": "三策略存在重复候选，供组合层观察，不改变策略分数。",
+                         "message": "五策略存在重复候选，供组合层观察，不改变策略分数。",
                          "repeated_day_code_count": strategy.get("repeated_day_code_count")})
 
     severity_order = {"critical": 4, "high": 3, "medium": 2, "low": 1}
