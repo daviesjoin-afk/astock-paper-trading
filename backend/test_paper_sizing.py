@@ -59,6 +59,16 @@ class PaperSizingTests(unittest.TestCase):
         self.assertEqual(detail["pending_pool_amount"], 7000.0)
         self.assertEqual(detail["pending_strategy_amount"], 5000.0)
 
+    def test_single_position_absolute_cap_overrides_strategy_weight(self):
+        qty, detail = sizing.price_aware_qty(
+            100000, 100000, 0, 0, 0, 10, -0.05,
+            dict(PROFILE, single_risk=0.50, max_weight=0.30),
+            single_position_max_amount=15000, num=number,
+        )
+        self.assertEqual(qty, 1500)
+        self.assertEqual(detail["single_position_cap_source"], "configured_absolute_cap")
+        self.assertEqual(detail["single_position_max_amount"], 15000.0)
+
 
 if __name__ == "__main__":
     unittest.main()

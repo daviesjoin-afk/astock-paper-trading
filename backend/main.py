@@ -27,6 +27,7 @@ import selection_tracking as ST
 import metrics as MET
 from api_paper import risk_refresh_status, router as paper_router
 from api_adaptive import router as adaptive_router
+from api_settings import router as settings_router
 from resource_guard import heavy_job_lease
 
 FRONTEND = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "frontend")
@@ -480,6 +481,7 @@ app.add_middleware(GZipMiddleware, minimum_size=256, compresslevel=9)
 app.mount("/assets", StaticFiles(directory=os.path.join(FRONTEND, "assets")), name="assets")
 app.include_router(paper_router)
 app.include_router(adaptive_router)
+app.include_router(settings_router)
 
 
 def _stock_code(code):
