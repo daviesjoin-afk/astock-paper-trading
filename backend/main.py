@@ -1357,7 +1357,7 @@ def _select_uncached(
         )
     result["executable_count"] = sum(1 for p in result["picks"] if p["buy_decision"]["executable"])
     result["watchlist_count"] = sum(1 for p in result["picks"] if p["buy_decision"]["watchlist"])
-    result["board_filter"] = "净利润优先按最新一季报/半年报/三季报累计进度判断，缺失时回退最近年报；三套策略仅允许沪深主板和创业板，统一排除ST/退市风险、科创板及北交所；科创板只作同产业实时共振加分"
+    result["board_filter"] = "净利润优先按最新一季报/半年报/三季报累计进度判断，缺失时回退最近年报；公开研究策略仅允许沪深主板和创业板，统一排除ST/退市风险、科创板及北交所；科创板只作同产业实时共振加分"
     result["disclaimer"] = "选股结果经舆情否决+买入执行风控模型过滤：负面舆情一票否决，仅 T1/T2 为建议买入，T3 进入观察清单，T4/T5 不执行。仅供研究参考，不构成投资建议。"
     return result
 

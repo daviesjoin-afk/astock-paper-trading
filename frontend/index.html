@@ -64,10 +64,10 @@
 </div>
 
 <div id="p-paper" class="page">
-  <div class="page-header"><div><span class="page-kicker">共享资金模拟账本</span><h2>策略模拟</h2><p>两套策略共用总资金池、独立决策与风控、统一成交核算；核心持仓和当日操作置顶，完整审计记录按需展开。</p></div></div>
+  <div class="page-header"><div><span class="page-kicker">共享资金模拟账本</span><h2>策略模拟</h2><p>五套策略共用总资金池、独立决策与风控、统一成交核算；核心持仓和当日操作置顶，完整审计记录按需展开。</p></div></div>
   <div class="workspace-tabs-dock" data-workspace-tabs-dock="paper">
   <nav id="paperModuleTabs" class="module-tabs workspace-tab-strip" data-tab-scroll aria-label="&#x7b56;&#x7565;&#x6a21;&#x62df;&#x4e09;&#x7ea7;&#x5bfc;&#x822a;" role="tablist">
-    <button class="module-tab" role="tab" aria-selected="false" data-paper-view="strategy" onclick="showPaperWorkspace('strategy',this)"><span class="module-code">策略</span><span class="module-copy"><b>策略中心</b><small>两套账户的规则与风控边界</small></span></button>
+    <button class="module-tab" role="tab" aria-selected="false" data-paper-view="strategy" onclick="showPaperWorkspace('strategy',this)"><span class="module-code">策略</span><span class="module-copy"><b>策略中心</b><small>五套账户的规则与风控边界</small></span></button>
     <button class="module-tab" role="tab" aria-selected="false" data-paper-view="research" onclick="showPaperWorkspace('research',this)"><span class="module-code">证据</span><span class="module-copy"><b>策略证据</b><small>候选快照与后续兑现跟踪</small></span></button>
     <button class="module-tab active" role="tab" aria-selected="true" data-paper-view="portfolio" onclick="showPaperWorkspace('portfolio',this)"><span class="module-code">持仓</span><span class="module-copy"><b>&#x5f53;&#x524d;&#x6301;&#x4ed3;</b><small>&#x5e10;&#x6237;&#x4e0e;&#x53ef;&#x64cd;&#x4f5c;&#x5e95;&#x4ed3;</small></span></button>
     <button class="module-tab" role="tab" aria-selected="false" data-paper-view="activity" onclick="showPaperWorkspace('activity',this)"><span class="module-code">委托</span><span class="module-copy"><b>&#x59d4;&#x6258;&#x8bb0;&#x5f55;</b><small>&#x6309;&#x65e5;&#x671f;&#x4e0e;&#x7b56;&#x7565;&#x67e5;&#x770b;&#x64cd;&#x4f5c;</small></span></button>
@@ -76,7 +76,7 @@
   </nav>
   </div>
   <div id="paperStrategyView" class="paper-strategy-view" hidden><div class="loading">正在读取策略规则…</div></div>
-  <div id="paperResearchView" class="paper-research-view" hidden><div class="loading">正在读取两套模拟盘策略的研究证据…</div></div>
+  <div id="paperResearchView" class="paper-research-view" hidden><div class="loading">正在读取五套模拟盘策略的研究证据…</div></div>
   <div id="paperPortfolioView" class="paper-trade-view">
   <div class="panel paper-setup-panel">
     <h3>模拟周期设置 <span class="tag tag-info">纯模拟盘</span></h3>
@@ -90,8 +90,8 @@
       <button id="paperRunNow" class="ghost" onclick="runPaperNow('intraday')">立即观察日内风险</button>
       <span id="paperStatus" role="status" aria-live="polite" style="font-size:12px;color:var(--text-secondary)"></span>
     </div>
-    <div id="paperCapitalHint" style="margin:-5px 0 10px;color:var(--text-secondary);font-size:12px">两套策略共享总资金池 ¥300,000；策略独立决策、独立风控，资金统一核算。</div>
-    <div class="disclaimer">两套策略并行、独立决策与交易归因，共用总资金池：短线日内做T仅卖出已结算底仓；当天新买股票仍为 T+1。每3分钟只观察行情和风险，只有价格、成本、仓位与各自模型同时通过才模拟成交。模拟盘不连接券商，也不代表真实可成交价格。</div>
+    <div id="paperCapitalHint" style="margin:-5px 0 10px;color:var(--text-secondary);font-size:12px">五套策略共享总资金池 ¥300,000；策略独立决策、独立风控，资金统一核算。</div>
+    <div class="disclaimer">五套策略并行、独立决策与交易归因，共用总资金池：短线日内做T仅卖出已结算底仓；当天新买股票仍为 T+1。每3分钟只观察行情和风险，只有价格、成本、仓位与各自模型同时通过才模拟成交。模拟盘不连接券商，也不代表真实可成交价格。</div>
   </div>
   <div id="paperAccountStrip" class="paper-account-strip"></div>
   <section class="paper-trade-workspace">
@@ -122,7 +122,7 @@
       <p>只读风控中心：不会重置账户，也不会因刷新页面产生模拟买卖。</p>
       <button id="paperRiskRefresh" onclick="refreshPaperRisk()">刷新风控状态</button>
     </div>
-    <div id="paperRiskResult" aria-live="polite"><div class="loading">正在读取两套策略的风险状态…</div></div>
+    <div id="paperRiskResult" aria-live="polite"><div class="loading">正在读取五套策略的风险状态…</div></div>
   </div>
 </div>
 
