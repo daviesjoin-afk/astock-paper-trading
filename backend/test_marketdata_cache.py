@@ -32,6 +32,20 @@ class MarketDataCacheTests(unittest.TestCase):
         self.assertEqual(empty_calls["count"], 2)
         self.assertNotIn("empty", memory)
 
+    def test_cached_evicts_oldest_entry_at_bound(self):
+        values = iter(({"n": 1}, {"n": 2}, {"n": 3}))
+        memory = {}
+        lock = threading.Lock()
+        original_limit = cache.MAX_CACHE_ENTRIES
+        cache.MAX_CACHE_ENTRIES = 2
+        try:
+            cache.cached(memory, lock, "a", 60, lambda: next(values))
+            cache.cached(memory, lock, "b", 60, lambda: next(values))
+            cache.cached(memory, lock, "c", 60, lambda: next(values))
+            self.assertEqual({"b", "c"}, set(memory))
+        finally:
+            cache.MAX_CACHE_ENTRIES = original_limit
+
     def test_full_snapshot_lock_creates_and_releases_sidecar(self):
         with tempfile.TemporaryDirectory() as directory:
             path = os.path.join(directory, "snapshot.lock")

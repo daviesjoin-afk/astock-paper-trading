@@ -864,7 +864,7 @@ def overview(conn, config, paper_db_path):
             paper.close()
     return {
         "mode": "模拟盘选股自动进化",
-        "policy": "三套模拟账户可进化因子权重、入场阈值和白名单选股条件；板块热度不足时可提出个股强势路径，趋势模型可提出从抄底切换为趋势延续；结构变更先影子验证并人工确认，公共选股页面不受影响。",
+        "policy": "两套当前模拟账户可进化因子权重、入场阈值和白名单选股条件；板块热度不足时可提出个股强势路径，趋势模型可提出从抄底切换为趋势延续；结构变更先影子验证并人工确认，公共选股页面不受影响。",
         "auto_apply_bounded": bool(config.get("selection_auto_apply_bounded", False)),
         "requirements": _requirements(config, "shadow"),
         "tiers": {
