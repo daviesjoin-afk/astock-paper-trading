@@ -2396,7 +2396,7 @@ def _closed_loop_state(conn, evidence=None):
     if profile_days < 10:
         blockers.append(f"完整画像日 {profile_days}/10")
     if recent_actual < 6 or accounts < 2:
-        blockers.append(f"可归因成交 {recent_actual} 笔、覆盖 {accounts}/3 策略")
+        blockers.append(f"可归因成交 {recent_actual} 笔、覆盖 {accounts}/2 当前策略账户")
     try:
         state["evidence"] = json.loads(state.get("evidence") or "{}")
     except (TypeError, ValueError):
