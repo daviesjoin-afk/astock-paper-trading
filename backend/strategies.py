@@ -257,7 +257,6 @@ def _hot_leader_profile(table):
     turnover = numeric("turnover")
     mom5 = numeric("mom5_raw")
     mom20 = numeric("mom20_raw")
-    vol_surge = numeric("vol_surge_raw")
     sector = numeric("sector_heat_score")
     sector_onset = numeric("sector_early_rotation_score")
     sector_onset_flag = table.get("sector_early_rotation", pd.Series(False, index=idx)).fillna(False).astype(bool)

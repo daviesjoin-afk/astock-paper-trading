@@ -204,10 +204,10 @@ def update_ai_settings(updates):
             checked[key] = value
         elif key == "llm_realtime_min_interval_minutes":
             try: checked[key] = max(5, min(240, int(value)))
-            except (TypeError, ValueError): raise ValueError("冷却时间必须是5-240的整数")
+            except (TypeError, ValueError) as exc: raise ValueError("冷却时间必须是5-240的整数") from exc
         elif key == "llm_realtime_min_valid_rows":
             try: checked[key] = max(100, min(10000, int(value)))
-            except (TypeError, ValueError): raise ValueError("有效行情行数必须是100-10000的整数")
+            except (TypeError, ValueError) as exc: raise ValueError("有效行情行数必须是100-10000的整数") from exc
     with _connect() as conn:
         now = _now()
         for key, value in checked.items():
@@ -1413,10 +1413,10 @@ def _evaluate_rewards(conn):
                 _run += fill_totals[_d]
                 fill_prefix.append(_run)
 
-            def _window_amount(start_date, end_date):
-                left = _bisect_right(fill_dates, start_date)
-                right = _bisect_right(fill_dates, end_date)
-                return (fill_prefix[right - 1] if right > 0 else 0.0) - (fill_prefix[left - 1] if left > 0 else 0.0)
+            def _window_amount(start_date, end_date, _fill_dates=fill_dates, _fill_prefix=fill_prefix):
+                left = _bisect_right(_fill_dates, start_date)
+                right = _bisect_right(_fill_dates, end_date)
+                return (_fill_prefix[right - 1] if right > 0 else 0.0) - (_fill_prefix[left - 1] if left > 0 else 0.0)
 
             for horizon, horizon_weight in HORIZON_WEIGHTS.items():
                 for index in range(0, len(nav_rows) - horizon):

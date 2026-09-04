@@ -12,7 +12,7 @@ import math
 import os
 import statistics
 
-from market_policy import MARKET_LIGHT_SCALES, market_light_scale, market_light_scales
+from market_policy import MARKET_LIGHT_SCALES, market_light_scale
 
 
 BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -740,7 +740,6 @@ def _attach_dynamic_pool_budgets(accounts, positions, shared, market):
     total_weight = sum(weights.values()) or 1.0
     base_targets = {key: SHARED_POOL_MAX_EXPOSURE_PCT * value / total_weight for key, value in weights.items()}
     light = str((market or {}).get("light") or "unknown")
-    scales = market_light_scales(light)
     targets = {key: base_targets[key] * market_light_scale(light, key) for key in ids}
     floors = {key: targets[key] * 0.60 for key in ids}
     current = {key: 0.0 for key in ids}
