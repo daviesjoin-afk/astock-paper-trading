@@ -2,7 +2,39 @@
 
 本文按 Git tag 记录公开仓库的可复现变化。Release 页面只保留版本号，详细变更、运行边界和验证结果统一维护在这里。
 
-## Unreleased
+## v1.0.0 — Five-strategy public baseline and runtime hardening
+
+发布日期：2026-09-04
+
+这是一次公开仓库的大版本更新：完整保留五套策略定义，同时把新周期的两套活动账户、研究/回放范围、风控审计和部署边界明确分层。运行时仍是 paper-only，不连接券商、不触碰真实资金；本版本不携带任何历史账本、服务器配置或凭据。
+
+### 五套策略公开口径
+
+| 策略 | 状态 | 公开用途 |
+| --- | --- | --- |
+| `tq_breakout` | active | 强势突破模拟账户、实时入场确认、独立风控与审计 |
+| `trend_pullback` | legacy | 趋势回调研究、历史回放与兼容读取 |
+| `sector_rotation` | legacy | 板块轮动研究、热点共振与历史回放 |
+| `reported_profit_breakout` | legacy | 财报/预告驱动的质量突破研究与历史回放 |
+| `main_force_top10` | active | 主力资金跟随模拟账户、实时确认、独立风控与审计 |
+
+`strategy_registry.py` 是五套策略身份的唯一注册表。active/legacy 只决定新周期是否获得账户、资金和调度时间，不会删除或改写 legacy 策略的规则、回放数据或研究接口。
+
+### 运行与兼容边界
+
+- 新周期继续使用两套 active 账户；两套账户共用撮合、资金池、T+1、行情核验和风险审计基础设施，策略候选车道、仓位席位、参数版本和退出规则保持独立。
+- legacy 策略仍可用于研究、回放、选择结果和历史归因；它们不会被隐式迁移到新周期，也不会从公开仓库中移除。
+- 一键启动支持本地 Python 与 Docker Compose；Docker 使用独立数据卷，仓库克隆从空账本开始，运行数据库、行情缓存、日志和自进化样本不进入 Git。
+- 调度入口统一为 `paper_runner.py --slot`，通过 runtime lease、heartbeat、fencing token 和幂等键防止重复写入；内置 3 分钟盘中兜底线程可按环境变量关闭，避免与宿主 cron 双重调度。
+- 正式执行路径对行情新鲜度、跨源一致性、覆盖率、涨跌停、停牌、整手、T+1、费用、滑点、共享资金池和席位上限 fail-closed；研究、新闻、神经网络和 LLM 模块只能写影子证据或等待人工确认。
+
+### 本版本验证清单
+
+- pytest：206 项通过；unittest discover：199 项通过。
+- `ruff check backend`、Python `compileall`、Node.js 两个前端主脚本语法和 `frontend/app.js` / `frontend/assets/app.js` 镜像校验通过。
+- 后端本地启动烟测：首页、健康检查、模拟盘概览、策略中心、风控概览和风控审计均返回 HTTP 200；手动风险刷新完成并更新成功时间戳。
+- GitHub Actions：Python 3.11、Python 3.12、syntax 和 docker-smoke 全部通过。
+- 发布前 staged/tracked 内容完成脱敏扫描，未发现本机绝对路径、服务器地址、账号密码、API key、私钥、运行数据库、日志或历史交易记录。
 
 ### 代码审计与策略兼容性
 
