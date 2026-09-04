@@ -1,5 +1,5 @@
 var charts = {};
-window.__ASTOCK_ADAPTIVE_UI_BUILD__='20260813-confirm-v4';
+window.__ASTOCK_ADAPTIVE_UI_BUILD__='20260904-settings-cleanup-v1';
 function $(id){ return document.getElementById(id); }
 function fmt(v, d){ if(v===null||v===undefined||isNaN(v)) return '-'; return Number(v).toFixed(d===undefined?2:d); }
 function pctCls(v){ return v>0?'up':(v<0?'down':''); }
@@ -18,7 +18,7 @@ async function api(path, options){
   for(var attempt=0; attempt<MAX_GET_ATTEMPTS; attempt++){
     var controller=typeof AbortController==='undefined'?null:new AbortController();
     var timeout=controller?setTimeout(function(){controller.abort();},Number(options.timeout)||25000):null;
-    try { r = await fetch(path,{signal:controller&&controller.signal}); }
+    try { r = await fetch(path,{signal:controller&&controller.signal,cache:'no-store'}); }
     catch(err){ if(attempt===MAX_GET_ATTEMPTS-1) throw err; await new Promise(function(resolve){setTimeout(resolve,800*(attempt+1));}); continue; }
     finally { if(timeout) clearTimeout(timeout); }
     if(r.status!==502 && r.status!==503 && r.status!==504) break;
@@ -2476,111 +2476,6 @@ function selectStock(code, name){
   window._stockCode = code;
   analyzeStock();
 }
-async function analyzeStockLegacy(){
-  var code = window._stockCode || $('stockCode').value.trim();
-  // 如果输入的是 "名称 代码" 格式，提取代码
-  var m = code.match(/(\d{6})/);
-  if(m) code = m[1];
-  if(!code){ alert('请输入股票代码或名称'); return; }
-  $('stockBasic').innerHTML = '<div class="loading">加载中…</div>';
-  $('stockFinance').innerHTML = '';
-  $('stockNews').innerHTML = '';
-  $('stockDecision').innerHTML = '';
-  try{
-    var d = await api('/api/stock_detail?code='+encodeURIComponent(code));
-    if(d.error){ $('stockBasic').innerHTML = '<div class="banner">'+d.error+'</div>'; return; }
-    if(d.need_init){ $('stockBasic').innerHTML = '<div class="banner">'+d.message+'</div>'; return; }
-    // 基本信息卡
-    $('stockBasic').innerHTML =
-      '<div class="metrics">'
-      +'<div class="metric"><div class="k">现价</div><div class="v">'+fmt(d.price)+'</div></div>'
-      +'<div class="metric"><div class="k">今日涨跌</div><div class="v '+pctCls(d.pct)+'">'+pctTxt(d.pct)+'</div></div>'
-      +'<div class="metric"><div class="k">PE</div><div class="v">'+fmt(d.pe,1)+'</div></div>'
-      +'<div class="metric"><div class="k">PB</div><div class="v">'+fmt(d.pb,2)+'</div></div>'
-      +'<div class="metric"><div class="k">ROE</div><div class="v">'+fmt(d.roe,1)+'%</div></div>'
-      +'<div class="metric"><div class="k">行业</div><div class="v" style="font-size:14px">'+(d.industry||'-')+'</div></div>'
-      +'<div class="metric"><div class="k">市值</div><div class="v">'+yi(d.mktcap)+'</div></div>'
-      +'<div class="metric"><div class="k">主力占比</div><div class="v '+pctCls(d.main_pct)+'">'+(d.main_pct!==null?pctTxt(d.main_pct):'-')+'</div></div>'
-      +'</div>';
-    // K线图 — 4面板：蜡烛图 + 成交量 + MACD + RSI
-    var kc = chart('stockKline');
-    var ohlc = d.kline.dates.map(function(_,i){
-      return [d.kline.open[i], d.kline.close[i], d.kline.low[i], d.kline.high[i]];
-    });
-    var upColor='#e74c3c', downColor='#27ae60';
-    kc.setOption({
-      tooltip:{trigger:'axis', axisPointer:{type:'cross'}},
-      legend:{data:['MA5','MA20','BOLL上轨','BOLL下轨','MACD(DIF)','MACD(DEA)','MACD柱','RSI(14)'], top:5},
-      grid:[
-        {left:60, right:20, top:40, height:'42%'},
-        {left:60, right:20, top:'62%', height:'10%'},
-        {left:60, right:20, top:'74%', height:'12%'},
-        {left:60, right:20, top:'87%', height:'12%'}
-      ],
-      xAxis:[
-        {type:'category', data:d.kline.dates, gridIndex:0, axisLabel:{show:false}},
-        {type:'category', data:d.kline.dates, gridIndex:1, axisLabel:{show:false}},
-        {type:'category', data:d.kline.dates, gridIndex:2, axisLabel:{show:false}},
-        {type:'category', data:d.kline.dates, gridIndex:3, axisLabel:{rotate:30,fontSize:10}}
-      ],
-      yAxis:[
-        {type:'value', scale:true, gridIndex:0, splitLine:{lineStyle:{color:'#f0f0f5'}}},
-        {type:'value', gridIndex:1, axisLabel:{show:false}},
-        {type:'value', gridIndex:2, splitLine:{lineStyle:{color:'#f0f0f5'}}},
-        {type:'value', gridIndex:3, min:0, max:100, splitLine:{lineStyle:{color:'#f0f0f5'}}}
-      ],
-      dataZoom:[{type:'inside', xAxisIndex:[0,1,2,3]},{type:'slider', xAxisIndex:[0,1,2,3], bottom:0}],
-      series:[
-        {name:'K线', type:'candlestick', data:ohlc, xAxisIndex:0, yAxisIndex:0,
-         itemStyle:{color:upColor, color0:downColor, borderColor:upColor, borderColor0:downColor}},
-        {name:'MA5', type:'line', data:d.kline.ma5, xAxisIndex:0, yAxisIndex:0, symbol:'none', lineStyle:{color:'#f39c12',width:1}},
-        {name:'MA20', type:'line', data:d.kline.ma20, xAxisIndex:0, yAxisIndex:0, symbol:'none', lineStyle:{color:'#3498db',width:1}},
-        {name:'BOLL上轨', type:'line', data:d.kline.bb_upper, xAxisIndex:0, yAxisIndex:0, symbol:'none', lineStyle:{color:'rgba(142,68,173,.6)',width:1,type:'dashed'}},
-        {name:'BOLL下轨', type:'line', data:d.kline.bb_lower, xAxisIndex:0, yAxisIndex:0, symbol:'none', lineStyle:{color:'rgba(142,68,173,.6)',width:1,type:'dashed'}},
-        {name:'成交量', type:'bar', data:d.kline.volume.map(function(v,i){
-          return {value:v, itemStyle:{color:d.kline.pcts[i]>=0?upColor:downColor}};
-        }), xAxisIndex:1, yAxisIndex:1},
-        {name:'MACD(DIF)', type:'line', data:d.kline.macd_dif, xAxisIndex:2, yAxisIndex:2, symbol:'none', lineStyle:{color:'#e74c3c',width:1}},
-        {name:'MACD(DEA)', type:'line', data:d.kline.macd_dea, xAxisIndex:2, yAxisIndex:2, symbol:'none', lineStyle:{color:'#3498db',width:1}},
-        {name:'MACD柱', type:'bar', data:d.kline.macd_bar, xAxisIndex:2, yAxisIndex:2},
-        {name:'RSI(14)', type:'line', data:d.kline.rsi, xAxisIndex:3, yAxisIndex:3, symbol:'none', lineStyle:{color:'#8b5cf6',width:1.5},
-         markLine:{silent:true, data:[{yAxis:70,lineStyle:{color:'#e74c3c'}},{yAxis:30,lineStyle:{color:'#27ae60'}}]}}
-      ]
-    }, true);
-    // 财务
-    $('stockFinance').innerHTML = '<table><tr><th>净利润同比</th><th>营收同比</th><th>报告期</th><th>流通市值</th><th>换手率</th></tr>'
-      +'<tr><td>'+pctTxt(d.profit_yoy)+'</td><td>'+pctTxt(d.rev_yoy)+'</td><td>'+(d.report_date||'-')+'</td><td>'+yi(d.float_cap)+'</td><td>'+fmt(d.turnover,2)+'%</td></tr></table>';
-    // 买卖决策
-    var bd=d.buy_decision, sd=d.sell_decision;
-    $('stockDecision').innerHTML =
-      '<div style="margin-bottom:8px"><b>买入决策：</b><span class="tag '+(bd.executable?'tag-ok':(bd.watchlist?'tag-info':'tag-warn'))+'">'+bd.tier+' '+bd.action+'</span> '+bd.summary+'</div>'
-      +'<div style="margin-bottom:8px"><b>六维核查：</b>'+bd.six_dim.map(function(dim){ return '<span style="margin-right:8px;font-size:12px">'+dim.name+' <span style="color:'+(dim.status==='green'?'#27ae60':(dim.status==='yellow'?'#f39c12':'#e74c3c'))+'">'+dim.status+'</span></span>'; }).join('')+'</div>'
-      +'<div style="margin-bottom:6px"><b>卖出决策：</b>'+sd.summary+'</div>'
-      +'<div style="font-size:12px;color:#9aa5b1">止盈策略：'+sd.take_profit+' | 强制止损：'+sd.forced_stop+'</div>';
-    // 新闻
-    if(d.news && d.news.length){
-      $('stockNews').innerHTML = d.news.map(function(n){
-        var tag = n.tone>0?'<span class="tag tag-ok">利好</span>':(n.tone<0?'<span class="tag tag-warn">风险</span>':'<span class="tag tag-info">中性</span>');
-        return '<div class="news-item">'+tag+(n.keywords&&n.keywords.length?' 关键词：'+n.keywords.join('、'):'')+'<br/>'+n.summary+'<br/><span class="news-time">'+(n.time||'')+' · '+n.source+'</span></div>';
-      }).join('');
-    }else{
-      $('stockNews').innerHTML = '<div style="color:var(--text-muted);padding:10px 0">近期快讯中暂无该股消息</div>';
-    }
-    // 同行业对比
-    try{
-      var peers = await api('/api/industry_peers?code='+encodeURIComponent(code)+'&topn=8');
-      if(peers.peers && peers.peers.length){
-        $('stockPeers').innerHTML = '<div style="font-size:12px;color:var(--text-muted);margin-bottom:6px">行业：'+peers.industry+'，共'+peers.count+'只同行业个股</div><table><tr><th>名称</th><th>代码</th><th>现价</th><th>涨跌</th><th>PE</th><th>PB</th><th>市值</th></tr>'
-        + peers.peers.map(function(p){
-          return '<tr onmouseover="this.style.background=\'var(--surface-hover)\'" onmouseout="this.style.background=\'\'" style="cursor:pointer" onclick="selectStock(decodeURIComponent(\''+adaptiveJsArg(p.code)+'\'),decodeURIComponent(\''+adaptiveJsArg(p.name)+'\'))"><td><b>'+adaptiveEsc(p.name)+'</b></td><td>'+adaptiveEsc(p.code)+'</td><td>'+fmt(p.price)+'</td><td class="'+pctCls(p.pct)+'">'+pctTxt(p.pct)+'</td><td>'+fmt(p.pe,1)+'</td><td>'+fmt(p.pb,2)+'</td><td>'+yi(p.mktcap)+'</td></tr>';
-        }).join('')+'</table>';
-      } else {
-        $('stockPeers').innerHTML = '<div style="color:var(--text-muted)">无同行业对比数据</div>';
-      }
-    }catch(e){ $('stockPeers').innerHTML = ''; }
-  }catch(e){ $('stockBasic').innerHTML = '<div class="banner">分析失败：'+e+'</div>'; }
-}
-
 // ---------- 个股研究页（本地行情快照，不宣称实时） ----------
 function stockMA(values, period){
   return values.map(function(_,i){ if(i<period-1) return null; var s=0; for(var j=i-period+1;j<=i;j++) s+=Number(values[j]||0); return +(s/period).toFixed(3); });
