@@ -20,6 +20,7 @@ router = APIRouter(prefix="/api/adaptive", tags=["adaptive-learning"])
 # path without maintaining a dead second namespace.
 _cache = {}
 _cache_ts = {}
+MAX_CACHE_ENTRIES = 64
 
 def _cache_get(key, ttl=30):
     import time as _t
@@ -29,6 +30,10 @@ def _cache_get(key, ttl=30):
 
 def _cache_set(key, value):
     import time as _t
+    if key not in _cache and len(_cache) >= MAX_CACHE_ENTRIES:
+        oldest_key = min(_cache, key=lambda item: _cache_ts.get(item, 0))
+        _cache.pop(oldest_key, None)
+        _cache_ts.pop(oldest_key, None)
     _cache[key] = value
     _cache_ts[key] = _t.time()
 

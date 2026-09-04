@@ -1407,7 +1407,7 @@ def _run_paper_strategy(strategy_id, table, topn, gate, first_board_codes=None, 
         price = numeric_column("price")
         # P3 精读修复：ma20_ma60_min 进化参数此前是死配置——实际用硬编码
         # ma20 > ma60，进化调整该值不生效。现在按白名单参数控制间隔余量。
-        _ma20_ma60_min = _num(conditions.get("ma20_ma60_min"), 0.0)
+        _ma20_ma60_min = _number_or(conditions.get("ma20_ma60_min"), 0.0)
         structure = ((ma20 / ma60 - 1.0) * 100 >= _ma20_ma60_min) & (price >= ma20 * (1 + conditions["close_ma20_min"] / 100.0))
         if enabled.get("trend_structure_guard", True):
             score += structure.astype(float) * 0.22
