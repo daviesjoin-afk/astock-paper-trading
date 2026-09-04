@@ -6,7 +6,7 @@
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='16' fill='%230b1712'/%3E%3Cpath d='M14 43 26 31l9 7 15-19' fill='none' stroke='%2378d1aa' stroke-width='5' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E">
 <title>A股量化策略台</title>
 <script src="/assets/vendor-echarts.min.js"></script>
-<link rel="stylesheet" href="/assets/app.css?v=20260904-risk-symbol-name-v6-settings-center-v1">
+<link rel="stylesheet" href="/assets/app.css?v=20260904-risk-symbol-name-v6-settings-center-v1-cleanup-v1">
 <style>
 /* AI审阅与调参样式 */
 .ai-status-cards{display:grid;grid-template-columns:repeat(auto-fill,minmax(140px,1fr));gap:10px;margin:12px 0}
@@ -34,7 +34,7 @@
   </div>
   <div class="header-status"><span class="header-status-label">市场门控</span><div id="gateBadge" class="gate-badge gate-green" role="status" aria-live="polite"><div class="gate-dot"></div><span>检测中…</span></div></div>
   <input type="text" id="headerSearch" placeholder="快搜代码/名称…" style="width:160px;font-size:12px;padding:6px 10px;background:rgba(255,255,255,.1);border:1px solid rgba(255,255,255,.15);color:#fff;border-radius:8px;outline:none" oninput="searchStockHeader()" onkeydown="if(event.key==='Enter')gotoStockDetail()" autocomplete="off">
-  <div class="header-meta"><span class="mode-label">研究 · 纯模拟</span><time id="clock"></time><button class="header-ai-btn" type="button" onclick="switchToAdaptiveAI()" title="AI审阅与双AI调参" style="margin-right:6px;padding:4px 10px;background:linear-gradient(135deg,#10b981,#059669);border:none;color:#fff;border-radius:6px;font-size:12px;cursor:pointer;font-weight:600;letter-spacing:0.5px">🤖 AI</button><button class="page-refresh" type="button" onclick="refreshApp()" title="重新加载服务器最新页面与数据">刷新页面</button><button id="themeToggle" class="theme-toggle" aria-label="切换深色模式" aria-pressed="false" title="切换深色模式" onclick="toggleDark()"><svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M20.4 15.4A8.5 8.5 0 0 1 8.6 3.6 8.6 8.6 0 1 0 20.4 15.4Z" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/></svg></button></div>
+  <div class="header-meta"><span class="mode-label">研究 · 纯模拟</span><time id="clock"></time><button class="header-settings-btn" type="button" onclick="activatePage('p-settings')" title="打开设置中心"><svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M12 8.2a3.8 3.8 0 1 0 0 7.6 3.8 3.8 0 0 0 0-7.6Z" stroke="currentColor" stroke-width="1.7"/><path d="m19.1 13.1 1.2 1-.1 1.8-1.8 1.1-1.5-.5-1.1.6-.3 1.5-1.7.7-1.7-.7-.3-1.5-1.1-.6-1.5.5-1.8-1.1-.1-1.8 1.2-1v-1.3l-1.2-1 .1-1.8 1.8-1.1 1.5.5 1.1-.6.3-1.5 1.7-.7 1.1.6 1.5-.5 1.8 1.1.1 1.8-1.2 1v1.3Z" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round"/></svg><span>设置</span></button><button class="header-ai-btn" type="button" onclick="switchToAdaptiveAI()" title="AI审阅与双AI调参" style="margin-right:6px;padding:4px 10px;background:linear-gradient(135deg,#10b981,#059669);border:none;color:#fff;border-radius:6px;font-size:12px;cursor:pointer;font-weight:600;letter-spacing:0.5px">🤖 AI</button><button class="page-refresh" type="button" onclick="refreshApp()" title="重新加载服务器最新页面与数据">刷新页面</button><button id="themeToggle" class="theme-toggle" aria-label="切换深色模式" aria-pressed="false" title="切换深色模式" onclick="toggleDark()"><svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M20.4 15.4A8.5 8.5 0 0 1 8.6 3.6 8.6 8.6 0 0 1 20.4 15.4Z" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/></svg></button></div>
 </header>
 <div id="headerSuggest" style="position:fixed;top:48px;right:28px;background:#fff;border:1px solid #e0e3e8;border-radius:8px;max-height:200px;overflow-y:auto;z-index:30;display:none;min-width:200px;box-shadow:0 8px 24px rgba(0,0,0,.12)"></div>
 <nav class="tabs" aria-label="主功能导航">
@@ -183,7 +183,7 @@
 </div>
 
 <div id="p-selection-evaluation" class="page">
-  <div class="page-header"><div><span class="page-kicker">&#x524d;&#x77bb;&#x9a8c;&#x8bc1;</span><h2>&#x7b56;&#x7565;&#x9a8c;&#x8bc1;</h2><p>&#x4ea4;&#x6613;&#x65e5;&#x6536;&#x76d8;&#x540e;&#x81ea;&#x52a8;&#x56fa;&#x5316;&#x4e09;&#x79cd;&#x7814;&#x7a76;&#x7b56;&#x7565;&#x7684;&#x5019;&#x9009;&#x5feb;&#x7167;&#xff0c;&#x5e76;&#x6301;&#x7eed;&#x6bd4;&#x8f83;&#x6301;&#x6709;&#x6536;&#x76ca;&#x4e0e;&#x6caa;&#x6df1;300&#x8d85;&#x989d;&#x6536;&#x76ca;&#xff1b;&#x7ed3;&#x679c;&#x4e0d;&#x4f1a;&#x6539;&#x53d8;&#x4e24;&#x5957;&#x6a21;&#x62df;&#x8d26;&#x6237;&#x3002;</p></div></div>
+  <div class="page-header"><div><span class="page-kicker">&#x524d;&#x77bb;&#x9a8c;&#x8bc1;</span><h2>&#x7b56;&#x7565;&#x9a8c;&#x8bc1;</h2><p>&#x4ea4;&#x6613;&#x65e5;&#x6536;&#x76d8;&#x540e;&#x81ea;&#x52a8;&#x56fa;&#x5316;&#x4e09;&#x79cd;&#x7814;&#x7a76;&#x7b56;&#x7565;&#x7684;&#x5019;&#x9009;&#x5feb;&#x7167;&#xff0c;&#x5e76;&#x6301;&#x7eed;&#x6bd4;&#x8f83;&#x6301;&#x6709;&#x6536;&#x76ca;&#x4e0e;&#x6caa;&#x6df1;300&#x8d85;&#x989d;&#x6536;&#x76ca;&#xff1b;&#x7ed3;&#x679c;&#x4e0d;&#x4f1a;&#x6539;&#x53d8;&#x4e94;&#x5957;&#x6a21;&#x62df;&#x8d26;&#x6237;&#x3002;</p></div></div>
   <nav class="module-tabs" aria-label="&#x7b56;&#x7565;&#x9009;&#x80a1;&#x4e8c;&#x7ea7;&#x5bfc;&#x822a;" role="tablist">
     <button class="module-tab" onclick="chooseStrategy('three_day',this)">&#x4e09;&#x65e5;&#x7b56;&#x7565;</button>
     <button class="module-tab" onclick="chooseStrategy('five_day',this)">&#x4e94;&#x65e5;&#x7b56;&#x7565;</button>
@@ -271,6 +271,6 @@
 <!-- Keep this version in sync with material dashboard fixes.  The paper
      workspace is entirely client-rendered, so a stable URL can leave browsers
      executing an old script after the HTML has changed. -->
-<script src="/app.js?v=20260904-risk-symbol-name-v6-settings-center-v1" defer></script>
+<script src="/app.js?v=20260904-risk-symbol-name-v6-settings-center-v1-cleanup-v1" defer></script>
 </body>
 </html>
