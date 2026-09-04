@@ -38,7 +38,7 @@ BASE_RISK = {
         "single_risk": 0.005, "daily_loss": 0.025, "drawdown": 0.085,
         "cooldown_days": 2, "min_cost_edge": 0.005,
     },
-    # Active in the current two-strategy cycle.  Keep this overlay inside the
+    # Active in the current five-strategy cycle.  Keep this overlay inside the
     # adaptive bounds; the execution profile remains the stricter authority.
     "main_force_top10": {
         "max_weight": 0.22, "max_exposure": 0.78, "max_industry": 0.45,

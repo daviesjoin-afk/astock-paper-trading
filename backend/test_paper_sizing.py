@@ -19,6 +19,20 @@ PROFILE = {
 
 
 class PaperSizingTests(unittest.TestCase):
+    def test_dynamic_minimum_uses_cycle_capital_and_slot_limit(self):
+        self.assertEqual(
+            sizing.dynamic_minimum_order_amount(100000, 15),
+            3200.0,
+        )
+        self.assertEqual(
+            sizing.dynamic_minimum_order_amount(300000, 15),
+            9800.0,
+        )
+
+    def test_dynamic_minimum_has_safe_nonzero_granularity(self):
+        self.assertEqual(sizing.dynamic_minimum_order_amount(1000, 15), 100.0)
+        self.assertEqual(sizing.dynamic_minimum_order_amount(100000, 0), 0.0)
+
     def test_invalid_price_returns_explanation_without_sizing(self):
         qty, detail = sizing.price_aware_qty(
             100000, 10000, 0, 0, 0, 0, -0.05, PROFILE, num=number,
@@ -44,6 +58,16 @@ class PaperSizingTests(unittest.TestCase):
         self.assertEqual(detail["strategy_remaining_amount"], 5000.0)
         self.assertEqual(detail["pending_pool_amount"], 7000.0)
         self.assertEqual(detail["pending_strategy_amount"], 5000.0)
+
+    def test_single_position_absolute_cap_overrides_strategy_weight(self):
+        qty, detail = sizing.price_aware_qty(
+            100000, 100000, 0, 0, 0, 10, -0.05,
+            dict(PROFILE, single_risk=0.50, max_weight=0.30),
+            single_position_max_amount=15000, num=number,
+        )
+        self.assertEqual(qty, 1500)
+        self.assertEqual(detail["single_position_cap_source"], "configured_absolute_cap")
+        self.assertEqual(detail["single_position_max_amount"], 15000.0)
 
 
 if __name__ == "__main__":

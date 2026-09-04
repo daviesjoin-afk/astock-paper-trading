@@ -364,7 +364,7 @@ def configure(capital: float = Query(..., ge=1000, le=10_000_000)):
 
 
 @router.post("/start")
-def start(capital: float = Query(300000, ge=1000, le=10_000_000)):
+def start(capital: float | None = Query(None, ge=1000, le=10_000_000)):
     try:
         result = _call_with_retry(P.start_new_cycle, capital)
         _cclear()  # 新周期启动后立即刷新所有缓存视图
@@ -394,7 +394,7 @@ def resume():
 
 
 @router.post("/reset")
-def reset(capital: float = Query(300000, ge=1000, le=10_000_000)):
+def reset(capital: float | None = Query(None, ge=1000, le=10_000_000)):
     try:
         # include_dashboard=False：重置后立即返回，避免抓行情超时；前端 loadPaper 再拉 overview
         result = _call_with_retry(P.reset_cycle, capital, False)

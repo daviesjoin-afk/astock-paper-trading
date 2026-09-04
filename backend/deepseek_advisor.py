@@ -877,7 +877,7 @@ def overview(conn, config=None):
             "enabled": bool((config or {}).get("llm_realtime_tuning_enabled", False)) and enabled(config),
             "auto_apply": False,
             "min_interval_minutes": int((config or {}).get("llm_realtime_min_interval_minutes", 15) or 15),
-            "scope": "仅两套当前模拟账户；只生成影子候选；应用必须人工确认并重新校验",
+            "scope": "仅五套当前模拟账户；只生成影子候选；应用必须人工确认并重新校验",
             "latest": latest_tuning,
         },
     }
