@@ -83,7 +83,9 @@ class LeaseAndFreshnessTests(unittest.TestCase):
         )
 
     def test_today_pnl_quote_requires_fresh_live_mark(self):
-        now = dt.datetime.now()
+        # Quote timestamps are serialized as Shanghai-local wall time; keep
+        # this test independent of the runner's host timezone.
+        now = dt.datetime.now(dt.timezone(dt.timedelta(hours=8)))
         fresh = {
             "price": 10.0,
             "quote_source": "live",
