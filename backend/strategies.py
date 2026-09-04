@@ -41,19 +41,15 @@ STRATEGIES = {
                 "scope_guard": "main_or_chinext_only; exclude_star_bse_st_delist",
                 "disclosure_required": True,
             },
-            "sort": "realtime_super_net_raw_desc",
+            "sort": "pullback_liquidity_flow_v1",
         },
     },
     "main_force_top10": {
         "name": "超强主力股",
         "desc": "全市场按板块扩散、主力/超大单强度、成交活跃与趋势承接选出每日10只观察股；盘中再确认资金持续性后最多持有3只",
         "horizon_days": 5,
-        "metadata": {
-            "kind": "paper",
-            "daily_candidate_limit": 10,
-            "position_limit": 3,
-            "sort": "main_force_composite_desc",
-        },
+        "metadata": {"kind": "paper", "daily_candidate_limit": 10,
+                     "position_limit": 3, "sort": "main_force_composite_desc"},
     },
 }
 
@@ -73,6 +69,40 @@ PAPER_WEIGHTS = {
     "trend_continuation": {"mom_short": 0.28, "mom": 0.22, "flow": 0.20, "volsurge": 0.15, "quality": 0.15},
     "sentiment_pioneer": {"sentiment": 0.40, "flow": 0.25, "mom_short": 0.20, "volsurge": 0.15},
 }
+
+# ===== 2026-08-28 选股负 alpha 修复 =====
+# 实证（08-20~08-27 全部成交信号 K 线回放，reports/selection_alpha_report.md）：
+# 四策略买入次日均值 -0.7%~-1.7%，同期随机基准 +0.05%；排序分与次日收益
+# 相关系数 -0.29，mom5 -0.20，主力净流入 +0.04（无预测力）。根因是全部
+# 策略追高动量、无均值回归约束。以下常数与辅助函数为该项修复的一部分。
+MOM5_OVERHEAT_PCT = 0.05      # 5 日动量超过此值视为过热
+MOM20_OVERHEAT_PCT = 0.15     # 20 日动量超过此值视为过热
+OVERHEAT_RANK_PENALTY = 0.35  # 过热候选的排序分扣减
+SECTOR_CLIMAX_MOM5 = 0.08     # 板块平均 5 日动量超过此值视为情绪高潮，禁入
+
+
+def _strategy_numeric(frame, name):
+    if name in frame.columns:
+        return pd.to_numeric(frame[name], errors="coerce")
+    return pd.Series(np.nan, index=frame.index)
+
+
+def _overheat_mask(frame):
+    mom5 = _strategy_numeric(frame, "mom5_raw") if "mom5_raw" in frame.columns else _strategy_numeric(frame, "mom5")
+    mom20 = _strategy_numeric(frame, "mom20_raw") if "mom20_raw" in frame.columns else _strategy_numeric(frame, "mom20")
+    return ((mom5 > MOM5_OVERHEAT_PCT) | (mom20 > MOM20_OVERHEAT_PCT)).fillna(False)
+
+
+def _apply_overheat_penalty(score, frame, penalty=OVERHEAT_RANK_PENALTY):
+    """过热候选（短期涨幅透支）在排序分上直接扣减，抑制追高入场。"""
+    mask = _overheat_mask(frame).reindex(score.index).fillna(False)
+    return score.mask(mask, score - penalty)
+
+
+def _gate_market_light(gate):
+    if not isinstance(gate, dict):
+        return ""
+    return str(gate.get("light") or "").strip().lower()
 
 # 模拟盘可进化的选股条件。基础条件保留在代码中，进化层只写入
 # 这些白名单字段，既允许增删条件，又不会把任意代码注入选股流程。
@@ -788,7 +818,9 @@ def _run_reported_profit_breakout(table, topn=10, news_hits=None, gate=None):
 
     Hard eligibility is evaluated before ranking.  The two technical/profit
     paths are alternatives; the MA and security-scope guards are shared.  The
-    ranking never adds a soft factor: ``super_net_raw`` is the sole ordering
+    Ranking blends pullback quality (rev5, distance from the 5-day
+    high), liquidity, and a bounded main-force flow rank; momentum
+    overheat is penalized (2026-08-28 alpha fix).
     metric so realtime super-large-order flow cannot be masked by another
     score component.
     """
@@ -821,14 +853,29 @@ def _run_reported_profit_breakout(table, topn=10, news_hits=None, gate=None):
 
     candidates = table.loc[eligible].copy()
     candidates["super_net_sort"] = _super_net_series(candidates)
-    # Absolute flow favors mega-caps; blend it with a bounded float-cap
-    # intensity rank so eligible mid-caps remain discoverable. Missing caps
-    # stay at the bottom and cannot gain a positive flow score.
+    # 修复5（2026-08-28）：super_net 与次日收益实证零相关（corr +0.04），
+    # 从主排序键降级为成分之一。主排序改为：
+    #   45% 回踩质量（rev5=距 5 日高点回撤，0~-4% 最优）
+    # + 30% 流动性（amount 缺失时退回 vol_surge）
+    # + 25% 主力净流入排名（绝对 65% + 流通盘强度 35%，保留中盘可发现性）。
+    # 过热候选（修复1）扣减排序分，市场黄/红灯（修复3）加倍。
     float_cap = pd.to_numeric(_table_column(candidates, "float_cap"), errors="coerce")
     candidates["super_net_intensity"] = candidates["super_net_sort"].where(float_cap > 0) / float_cap.where(float_cap > 0)
     raw_rank = candidates["super_net_sort"].rank(method="average", pct=True, na_option="bottom")
     intensity_rank = candidates["super_net_intensity"].rank(method="average", pct=True, na_option="bottom")
-    candidates["super_net_rank"] = (raw_rank * 0.65 + intensity_rank * 0.35).where(candidates["super_net_sort"].notna(), 0.0)
+    flow_rank = (raw_rank * 0.65 + intensity_rank * 0.35).where(candidates["super_net_sort"].notna(), 0.0)
+    candidates["super_net_rank"] = flow_rank
+    pullback = _strategy_numeric(candidates, "rev5")
+    pullback_quality = (1.0 - (pullback.abs() / 0.08).clip(upper=1.0)).where(pullback.notna(), 0.0)
+    liq = _strategy_numeric(candidates, "amount")
+    if liq.isna().all():
+        liq = _strategy_numeric(candidates, "vol_surge")
+    liq_rank = liq.rank(method="average", pct=True, na_option="bottom")
+    blended = 0.45 * pullback_quality + 0.30 * liq_rank + 0.25 * flow_rank
+    risk_off = _gate_market_light(gate) in {"yellow", "red"}
+    candidates["super_net_rank"] = _apply_overheat_penalty(
+        blended, candidates, OVERHEAT_RANK_PENALTY * (2.0 if risk_off else 1.0),
+    )
     candidates["mom5_sort"] = pd.to_numeric(_table_column(candidates, "mom5_raw"), errors="coerce")
     candidates = candidates.sort_values(
         ["super_net_rank", "super_net_sort", "mom5_sort"],
@@ -896,7 +943,7 @@ def _run_reported_profit_breakout(table, topn=10, news_hits=None, gate=None):
                 "entry_path": entry_path,
                 "hard_gate": True,
                 "disclosure_required": True,
-                "sort_metric": "super_net_raw",
+                "sort_metric": "pullback_liquidity_flow_v1",
                 "sort_direction": "desc",
                 "super_net_source": row.get("super_net_source"),
                 "quote_at": row.get("quote_at"),
@@ -936,7 +983,7 @@ def _run_reported_profit_breakout(table, topn=10, news_hits=None, gate=None):
                 "strategy_id": "reported_profit_breakout",
                 "hard_gate": False,
                 "disclosure_required": True,
-                "sort_metric": "super_net_raw",
+                "sort_metric": "pullback_liquidity_flow_v1",
             },
             "reason": "技术/路径条件具备，但已披露时间缺失或未证实；不进入正式候选",
         })
@@ -976,78 +1023,47 @@ def _run_reported_profit_breakout(table, topn=10, news_hits=None, gate=None):
 
 
 def _run_main_force_top10(table, topn=10, news_hits=None, gate=None):
-    """Build the deterministic daily main-force watchlist.
-
-    Absolute fund-flow values are deliberately blended with turnover and
-    float-cap intensity ranks.  This prevents the list from degenerating into
-    a permanent mega-cap ranking.  Intraday persistence/microstructure remain
-    execution-time confirmations and are not fabricated from a single
-    cross-sectional snapshot here.
-    """
+    """Select a ten-name daily main-force watchlist without mega-cap bias."""
     permitted = _permitted_a_share_mask(table)
-    amount = pd.to_numeric(_table_column(table, "amount"), errors="coerce")
-    turnover = pd.to_numeric(_table_column(table, "turnover"), errors="coerce")
-    pct = pd.to_numeric(_table_column(table, "pct"), errors="coerce")
-    main_pct = pd.to_numeric(_table_column(table, "main_pct"), errors="coerce")
-    super_net = pd.to_numeric(_table_column(table, "super_net_raw"), errors="coerce")
-    main_net = pd.to_numeric(_table_column(table, "main_net"), errors="coerce")
-    float_cap = pd.to_numeric(_table_column(table, "float_cap"), errors="coerce")
-    mom20 = pd.to_numeric(_table_column(table, "mom20_raw"), errors="coerce")
-    heat = pd.to_numeric(_table_column(table, "sector_heat_score"), errors="coerce").fillna(0.0)
-
+    col = lambda name: pd.to_numeric(_table_column(table, name), errors="coerce")
+    amount, turnover, pct = col("amount"), col("turnover"), col("pct")
+    main_pct, super_net, main_net = col("main_pct"), col("super_net_raw"), col("main_net")
+    float_cap, mom20 = col("float_cap"), col("mom20_raw")
+    heat = col("sector_heat_score").fillna(0.0)
     eligible = (
-        permitted
-        & (amount >= 2e8)
-        & turnover.between(0.5, 18.0, inclusive="both")
-        & pct.between(-2.0, 8.8, inclusive="both")
-        & (main_pct >= 2.0)
-        & (super_net > 0)
-        & (main_net > 0)
-        & (mom20 >= -8.0)
+        permitted & (amount >= 2e8) & turnover.between(0.5, 18.0, inclusive="both")
+        & pct.between(-2.0, 8.8, inclusive="both") & (main_pct >= 2.0)
+        & (super_net > 0) & (main_net > 0) & (mom20 >= -0.08)
     )
     candidates = table.loc[eligible].copy()
+    metadata = dict(STRATEGIES["main_force_top10"]["metadata"])
     if candidates.empty:
-        return {
-            "strategy": "main_force_top10", "strategy_name": "超强主力股",
-            "strategy_desc": STRATEGIES["main_force_top10"]["desc"],
-            "candidate_count": 0, "count": 0, "picks": [], "gate": gate,
-            "news_vetoed": [], "flow_source": "实时主力资金复合评分",
-            "metadata": dict(STRATEGIES["main_force_top10"]["metadata"]),
-        }
+        return {"strategy": "main_force_top10", "strategy_name": "超强主力股",
+                "strategy_desc": STRATEGIES["main_force_top10"]["desc"],
+                "candidate_count": 0, "count": 0, "picks": [], "gate": gate,
+                "news_vetoed": [], "flow_source": "实时主力资金复合评分",
+                "metadata": metadata}
 
-    def rank(values):
-        return pd.to_numeric(values, errors="coerce").rank(
-            method="average", pct=True, na_option="bottom"
-        )
-
+    rank = lambda values: pd.to_numeric(values, errors="coerce").rank(
+        method="average", pct=True, na_option="bottom")
     idx = candidates.index
     flow_amount = (main_net / amount.where(amount > 0)).reindex(idx)
     flow_cap = (super_net / float_cap.where(float_cap > 0)).reindex(idx)
     candidates["main_force_score"] = (
-        rank(main_pct.reindex(idx)) * 0.22
-        + rank(super_net.reindex(idx)) * 0.18
-        + rank(flow_amount) * 0.22
-        + rank(flow_cap) * 0.15
-        + rank(turnover.reindex(idx)) * 0.08
-        + rank(heat.reindex(idx)) * 0.15
+        rank(main_pct.reindex(idx)) * 0.22 + rank(super_net.reindex(idx)) * 0.18
+        + rank(flow_amount) * 0.22 + rank(flow_cap) * 0.15
+        + rank(turnover.reindex(idx)) * 0.08 + rank(heat.reindex(idx)) * 0.15
     )
     candidates["main_force_intensity"] = flow_amount
     candidates = candidates.sort_values(
         ["main_force_score", "main_force_intensity", "super_net_raw"],
-        ascending=[False, False, False], na_position="last",
-    )
-
-    vetoed = {
-        str(hit.get("code")) for hit in (news_hits or [])
-        if isinstance(hit, dict) and hit.get("code") and (_number(hit.get("tone")) or 0) < 0
-    }
-    news_vetoed = []
-    for code in sorted(vetoed):
-        if code in candidates.index:
-            news_vetoed.append({"code": code, "name": candidates.loc[code].get("name"),
-                                "reason": "命中负面公开事件，已从候选中剔除"})
+        ascending=[False, False, False], na_position="last")
+    vetoed = {str(hit.get("code")) for hit in (news_hits or [])
+              if isinstance(hit, dict) and hit.get("code") and (_number(hit.get("tone")) or 0) < 0}
+    news_vetoed = [{"code": code, "name": candidates.loc[code].get("name"),
+                    "reason": "命中负面公开事件，已从候选中剔除"}
+                   for code in sorted(vetoed) if code in candidates.index]
     candidates = candidates.drop(index=[code for code in vetoed if code in candidates.index])
-
     picks = []
     for code, row in candidates.head(min(10, max(1, int(topn)))).iterrows():
         picks.append({
@@ -1058,36 +1074,26 @@ def _run_main_force_top10(table, topn=10, news_hits=None, gate=None):
             "main_net": _number(row.get("main_net"), 2),
             "super_net": _number(row.get("super_net_raw"), 2),
             "super_net_raw": _number(row.get("super_net_raw"), 2),
-            "amount": _number(row.get("amount"), 2),
-            "turnover": _number(row.get("turnover"), 2),
+            "amount": _number(row.get("amount"), 2), "turnover": _number(row.get("turnover"), 2),
             "mom20": _percent(row.get("mom20_raw")),
             "sector_heat_score": _number(row.get("sector_heat_score"), 4),
-            "candidate_status": "main_force_daily_top10",
-            "entry_path": "main_force_confirmation",
-            "reasons": [
-                f"主力净流入占比 {_number(row.get('main_pct'), 2):+.2f}%",
-                "主力净额/成交额、超大单/流通市值与板块扩散复合排名",
-                "仅进入每日10只观察池，仍需盘中持续性和微观结构确认",
-            ],
-            "metadata": {
-                "strategy_id": "main_force_top10", "daily_candidate_limit": 10,
-                "position_limit": 3, "execution_allowed": True,
-                "requires_intraday_confirmation": True,
-            },
+            "candidate_status": "main_force_daily_top10", "entry_path": "main_force_confirmation",
+            "reasons": [f"主力净流入占比 {_number(row.get('main_pct'), 2):+.2f}%",
+                        "主力净额/成交额、超大单/流通市值与板块扩散复合排名",
+                        "仅进入每日10只观察池，仍需盘中持续性和微观结构确认"],
+            "metadata": {"strategy_id": "main_force_top10", "daily_candidate_limit": 10,
+                         "position_limit": 3, "execution_allowed": True,
+                         "requires_intraday_confirmation": True},
         })
-    metadata = dict(STRATEGIES["main_force_top10"]["metadata"])
     metadata.update({"candidate_count_before_news": int(eligible.sum()), "returned": len(picks)})
-    return {
-        "strategy": "main_force_top10",
-        "strategy_name": STRATEGIES["main_force_top10"]["name"],
-        "strategy_desc": STRATEGIES["main_force_top10"]["desc"],
-        "candidate_count": int(eligible.sum()), "count": len(picks), "picks": picks,
-        "gate": gate, "first_board_candidates": None, "news_vetoed": news_vetoed,
-        "news_scan": {"enabled": news_hits is not None, "total_hits": len(news_hits or []),
-                      "vetoed": len(news_vetoed)},
-        "flow_source": "主力占比、超大单、成交额/流通市值强度和板块扩散复合评分",
-        "metadata": metadata,
-    }
+    return {"strategy": "main_force_top10", "strategy_name": "超强主力股",
+            "strategy_desc": STRATEGIES["main_force_top10"]["desc"],
+            "candidate_count": int(eligible.sum()), "count": len(picks), "picks": picks,
+            "gate": gate, "first_board_candidates": None, "news_vetoed": news_vetoed,
+            "news_scan": {"enabled": news_hits is not None, "total_hits": len(news_hits or []),
+                          "vetoed": len(news_vetoed)},
+            "flow_source": "主力占比、超大单、成交额/流通市值强度和板块扩散复合评分",
+            "metadata": metadata}
 
 
 def run_strategy(
@@ -1121,9 +1127,7 @@ def run_strategy(
             gate=gate,
         )
     if strategy_id == "main_force_top10":
-        return _run_main_force_top10(
-            table, topn=min(10, topn), news_hits=news_hits, gate=gate,
-        )
+        return _run_main_force_top10(table, topn=min(10, topn), news_hits=news_hits, gate=gate)
     if strategy_id not in STRATEGIES:
         raise ValueError(f"未知策略: {strategy_id}")
     eligible = _eligible(strategy_id, table)
@@ -1334,10 +1338,34 @@ def _run_paper_strategy(strategy_id, table, topn, gate, first_board_codes=None, 
     }.get(strategy_id, 0.10)
     hot_bonus = hot_profile["score"] * hot_cap
     hot_bonus = hot_bonus.mask(hot_profile["stage"].eq("late_overheat"), -0.06)
+    # 修复3（2026-08-28）：市场黄/红灯不开新的动量追逐单——gate.light 此前
+    # 已由 paper 侧传入但从未被策略层使用。risk_off 时关闭热门股启动加分。
+    market_light = _gate_market_light(gate)
+    risk_off = market_light in {"yellow", "red"}
+    if risk_off:
+        hot_bonus = hot_bonus * 0.0
     score += hot_bonus
     bottom_profile = _bottom_reversal_profile(table)
     bottom_bonus = bottom_profile["score"] * (0.30 if strategy_id == "bottom_reversal" else 0.0)
     score += bottom_bonus
+
+    # 修复1（2026-08-28）：动量过热惩罚——mom5>5% 或 mom20>15% 的候选
+    # 排序分直接扣减；黄/红灯下加倍（修复3）。
+    score = _apply_overheat_penalty(score, table, OVERHEAT_RANK_PENALTY * (2.0 if risk_off else 1.0))
+    if strategy_id == "sentiment_pioneer":
+        # 修复2（2026-08-28）：板块情绪高潮禁入 + 早期轮动优先。板块热度
+        # 用行业内平均 5 日动量度量——高潮板块（>8%）整体排除，不再在
+        # 情绪顶点接力；sector_early_rotation_score（早期启动分）升为排序加分。
+        mom5_raw = numeric_column("mom5_raw")
+        if "industry" in table.columns:
+            sector_mom5 = mom5_raw.groupby(table["industry"].astype(str)).transform("mean")
+            climax = (sector_mom5 > SECTOR_CLIMAX_MOM5).reindex(table.index).fillna(False)
+        else:
+            climax = pd.Series(False, index=table.index)
+        onset = numeric_column("sector_early_rotation_score")
+        onset_bonus = onset.rank(method="average", pct=True, na_option="bottom") * 0.30
+        score = score + onset_bonus
+        score = score.mask(climax, -990.0)
 
     pct = numeric_column("pct")
     vol_surge = numeric_column("vol_surge_raw")
@@ -1377,10 +1405,10 @@ def _run_paper_strategy(strategy_id, table, topn, gate, first_board_codes=None, 
         ma20 = numeric_column("ma20")
         ma60 = numeric_column("ma60")
         price = numeric_column("price")
-        _ma20_ma60_min = _number_or(conditions.get("ma20_ma60_min"), 0.0)
-        structure = ((ma20 / ma60 - 1.0) * 100 >= _ma20_ma60_min) & (
-            price >= ma20 * (1 + conditions["close_ma20_min"] / 100.0)
-        )
+        # P3 精读修复：ma20_ma60_min 进化参数此前是死配置——实际用硬编码
+        # ma20 > ma60，进化调整该值不生效。现在按白名单参数控制间隔余量。
+        _ma20_ma60_min = _num(conditions.get("ma20_ma60_min"), 0.0)
+        structure = ((ma20 / ma60 - 1.0) * 100 >= _ma20_ma60_min) & (price >= ma20 * (1 + conditions["close_ma20_min"] / 100.0))
         if enabled.get("trend_structure_guard", True):
             score += structure.astype(float) * 0.22
             score -= (~structure).astype(float) * conditions["broken_structure_penalty"]

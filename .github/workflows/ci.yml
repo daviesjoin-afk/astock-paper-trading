@@ -39,3 +39,67 @@ jobs:
         env:
           PYTHONDONTWRITEBYTECODE: "1"
         run: python -m unittest discover -s backend -p "test_*.py" -v
+
+  syntax:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Compile backend modules
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: python -m compileall -q backend
+
+      - name: Check frontend JavaScript
+        run: |
+          node --check frontend/app.js
+          node --check frontend/assets/app.js
+
+      - name: Verify frontend source mirror
+        shell: bash
+        run: cmp --silent frontend/app.js frontend/assets/app.js
+
+  docker-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Build application image
+        run: docker build --tag astock-codex:ci .
+
+      - name: Start isolated paper-only container
+        run: |
+          docker run --detach --name astock-ci \
+            --env ASTOCK_ENABLE_FALLBACK_THREADS=0 \
+            --tmpfs /app/data_cache:rw,size=64m,uid=10001,gid=10001 \
+            --publish 127.0.0.1:18600:8600 \
+            astock-codex:ci
+
+      - name: Verify health endpoints
+        shell: bash
+        run: |
+          for attempt in {1..30}; do
+            if curl --fail --silent --show-error http://127.0.0.1:18600/api/health >/dev/null \
+              && curl --fail --silent --show-error http://127.0.0.1:18600/api/adaptive/ai/settings >/dev/null; then
+              exit 0
+            fi
+            sleep 2
+          done
+          docker logs astock-ci
+          exit 1
+
+      - name: Show logs and clean up
+        if: always()
+        shell: bash
+        run: |
+          docker logs astock-ci || true
+          docker rm --force astock-ci || true

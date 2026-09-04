@@ -1,0 +1,14 @@
+[Unit]
+Description=AStock Codex swap safety file
+DefaultDependencies=no
+After=local-fs.target
+Before=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/sbin/swapon /opt/astock-codex/.swapfile
+ExecStop=/usr/sbin/swapoff /opt/astock-codex/.swapfile
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
