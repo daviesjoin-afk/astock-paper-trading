@@ -6,7 +6,7 @@
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='16' fill='%230b1712'/%3E%3Cpath d='M14 43 26 31l9 7 15-19' fill='none' stroke='%2378d1aa' stroke-width='5' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E">
 <title>A股量化策略台</title>
 <script src="/assets/vendor-echarts.min.js"></script>
-<link rel="stylesheet" href="/assets/app.css?v=20260903-risk-symbol-name-v6">
+<link rel="stylesheet" href="/assets/app.css?v=20260904-risk-symbol-name-v6-settings-center-v1">
 <style>
 /* AI审阅与调参样式 */
 .ai-status-cards{display:grid;grid-template-columns:repeat(auto-fill,minmax(140px,1fr));gap:10px;margin:12px 0}
@@ -45,9 +45,22 @@
   <button class="tab" data-page="p-backtest"><b>策略回测</b><small>历史验证</small></button>
   <button class="tab" data-page="p-optimize"><b>参数优化</b><small>稳健性检查</small></button>
   <button class="tab" data-page="p-stock"><b>个股研究</b><small>技术与资料</small></button>
+  <button class="tab" data-page="p-settings"><svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M12 8.2a3.8 3.8 0 1 0 0 7.6 3.8 3.8 0 0 0 0-7.6Z" stroke="currentColor" stroke-width="1.7"/><path d="m19.1 13.1 1.2 1-.1 1.8-1.8 1.1-1.5-.5-1.1.6-.3 1.5-1.7.7-1.7-.7-.3-1.5-1.1-.6-1.5.5-1.8-1.1-.1-1.8 1.2-1v-1.3l-1.2-1 .1-1.8 1.8-1.1 1.5.5 1.1-.6.3-1.5 1.7-.7 1.7.7.3 1.5 1.1.6 1.5-.5 1.8 1.1.1 1.8-1.2 1v1.3Z" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round"/></svg><b>设置中心</b><small>资金 · 风控 · AI</small></button>
 </nav>
 
 <main id="appMain" tabindex="-1">
+<div id="p-settings" class="page settings-page">
+  <div class="page-header"><div><span class="page-kicker">运行控制 · 安全边界 · 版本审计</span><h2>设置中心</h2><p>集中管理模拟资金、五套策略、共享池风控和自进化接口。每次保存都会校验边界并留下审计记录。</p></div><div class="settings-head-state" id="settingsHeadState" role="status" aria-live="polite">正在读取设置…</div></div>
+  <div class="settings-shell">
+    <nav class="module-tabs settings-module-tabs" aria-label="设置中心二级导航" role="tablist">
+      <button class="module-tab settings-section-tab active" role="tab" aria-selected="true" data-settings-section="simulation" onclick="setSettingsSection('simulation',this)"><span class="module-code">资金</span><span class="module-copy"><b>模拟盘与资金</b><small>启动金额 · 周期 · 策略数量</small></span></button>
+      <button class="module-tab settings-section-tab" role="tab" aria-selected="false" data-settings-section="risk" onclick="setSettingsSection('risk',this)"><span class="module-code">风控</span><span class="module-copy"><b>仓位与风控</b><small>共享池 · 单票 · 建仓门槛</small></span></button>
+      <button class="module-tab settings-section-tab" role="tab" aria-selected="false" data-settings-section="strategy" onclick="setSettingsSection('strategy',this)"><span class="module-code">策略</span><span class="module-copy"><b>策略参数</b><small>五套模型 · 风格 · 席位</small></span></button>
+      <button class="module-tab settings-section-tab" role="tab" aria-selected="false" data-settings-section="evolution" onclick="setSettingsSection('evolution',this)"><span class="module-code">AI</span><span class="module-copy"><b>AI 与自进化</b><small>接口状态 · 调度周期 · 审批</small></span></button>
+    </nav>
+    <div id="settingsResult" aria-live="polite"><div class="loading">正在读取统一设置…</div></div>
+  </div>
+</div>
 <div id="p-sector" class="page">
   <div class="page-header"><div><span class="page-kicker">资金与联动</span><h2>板块分析</h2><p>从主力资金、涨跌强度、联动关系和事件催化四个角度定位当日热点。</p></div></div>
   <div class="panel workspace-panel">
@@ -258,6 +271,6 @@
 <!-- Keep this version in sync with material dashboard fixes.  The paper
      workspace is entirely client-rendered, so a stable URL can leave browsers
      executing an old script after the HTML has changed. -->
-<script src="/app.js?v=20260903-retry-backoff-v1" defer></script>
+<script src="/app.js?v=20260904-risk-symbol-name-v6-settings-center-v1" defer></script>
 </body>
 </html>

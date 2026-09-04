@@ -46,7 +46,7 @@ def price_aware_qty(
     exposure_scale=1.0, strategy_position_value=None,
     strategy_cap_amount=None, pool_cap_amount=None,
     pending_strategy_amount=0.0, pending_pool_amount=0.0,
-    *, num, lot_size=100,
+    *, num, lot_size=100, single_position_max_amount=None,
 ):
     """按股数计算下单规模；金额约束只做 sizing，不执行任何写操作。"""
     if fill_price <= 0:
@@ -54,7 +54,10 @@ def price_aware_qty(
     loss_per_share = fill_price * max(abs(hard_stop), 0.01)
     risk_budget = nav * profile["single_risk"]
     by_risk = risk_budget / loss_per_share
-    by_weight = max(0.0, nav * profile["max_weight"] - code_value) / fill_price
+    configured_single_cap = num(single_position_max_amount, 0.0)
+    weight_cap_amount = max(0.0, nav * profile["max_weight"])
+    position_cap_amount = min(weight_cap_amount, configured_single_cap) if configured_single_cap > 0 else weight_cap_amount
+    by_weight = max(0.0, position_cap_amount - code_value) / fill_price
     profile_exposure = num(max_exposure_cap, profile["max_exposure"])
     effective_exposure = min(profile_exposure, num(exposure_cap, profile_exposure))
     scale = max(0.0, min(num(exposure_scale, 1.0), 1.0))
@@ -91,6 +94,8 @@ def price_aware_qty(
         "pending_pool_amount": round(max(0.0, num(pending_pool_amount)), 2),
         "pending_strategy_amount": round(max(0.0, num(pending_strategy_amount)), 2),
         "new_exposure_scale_pct": round(scale * 100, 1),
+        "single_position_max_amount": round(configured_single_cap, 2) if configured_single_cap > 0 else 0.0,
+        "single_position_cap_source": "configured_absolute_cap" if configured_single_cap > 0 else "strategy_weight_auto",
         "constraint_shares": {name: round(value, 2) for name, value in limits.items()},
         "binding_constraints": binding,
     }
