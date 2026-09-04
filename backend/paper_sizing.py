@@ -2,6 +2,43 @@
 """模拟盘下单股数与约束解释的纯计算。"""
 from __future__ import annotations
 
+import math
+
+
+def dynamic_minimum_order_amount(
+    cycle_capital,
+    position_limit,
+    *,
+    exposure_cap=0.82,
+    slot_utilization=0.90,
+    round_to=100.0,
+):
+    """Return a meaningful new-position amount for the current cycle.
+
+    The threshold is derived from the cycle's declared capital and the hard
+    maximum number of stock slots, rather than from a fixed currency amount::
+
+        floor_to_100(cycle_capital * exposure_cap / position_limit * 90%)
+
+    The 90% factor leaves room for fees, price movement and shared-pool
+    reconciliation while still allowing a normal order to represent most of
+    one available slot.  ``round_to`` is also the minimum non-zero threshold,
+    so a malformed tiny cycle cannot disable the dust-order guard.
+    """
+    try:
+        capital = max(0.0, float(cycle_capital or 0.0))
+        slots = max(0, int(position_limit or 0))
+        exposure = max(0.0, min(1.0, float(exposure_cap)))
+        utilization = max(0.0, min(1.0, float(slot_utilization)))
+        granularity = max(1.0, float(round_to))
+    except (TypeError, ValueError):
+        return 0.0
+    if capital <= 0.0 or slots <= 0 or exposure <= 0.0 or utilization <= 0.0:
+        return 0.0
+    raw = capital * exposure / slots * utilization
+    rounded = math.floor(raw / granularity) * granularity
+    return round(max(granularity, rounded), 2)
+
 
 def price_aware_qty(
     nav, cash, position_value, industry_value, code_value,
