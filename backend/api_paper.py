@@ -19,6 +19,7 @@ _cache = {}
 _cache_ts = {}
 _cache_generation = {}
 _cache_inflight = {}
+MAX_CACHE_ENTRIES = 128
 
 
 def _current_cache_generation():
@@ -62,6 +63,11 @@ def _cset(key, val, *, generation=_CACHE_MISS):
     if generation is _CACHE_MISS:
         generation = _current_cache_generation()
     with _cache_lock:
+        if key not in _cache and len(_cache) >= MAX_CACHE_ENTRIES:
+            oldest_key = min(_cache, key=lambda item: _cache_ts.get(item, 0))
+            _cache.pop(oldest_key, None)
+            _cache_ts.pop(oldest_key, None)
+            _cache_generation.pop(oldest_key, None)
         _cache[key] = val
         _cache_ts[key] = time.time()
         _cache_generation[key] = generation
@@ -358,13 +364,9 @@ def configure(capital: float = Query(..., ge=1000, le=10_000_000)):
 
 
 @router.post("/start")
-def start(
-    capital: float = Query(300000, ge=1000, le=10_000_000),
-    cycle_days: int = Query(None, ge=1, le=365),
-    style: str = Query(None, pattern="^(aggressive|balanced|calm|loose)$"),
-):
+def start(capital: float = Query(300000, ge=1000, le=10_000_000)):
     try:
-        result = _call_with_retry(P.start_new_cycle, capital, cycle_days=cycle_days, trading_mode=style)
+        result = _call_with_retry(P.start_new_cycle, capital)
         _cclear()  # 新周期启动后立即刷新所有缓存视图
         return result
     except Exception as exc:
@@ -392,14 +394,10 @@ def resume():
 
 
 @router.post("/reset")
-def reset(
-    capital: float = Query(300000, ge=1000, le=10_000_000),
-    cycle_days: int = Query(None, ge=1, le=365),
-    style: str = Query(None, pattern="^(aggressive|balanced|calm|loose)$"),
-):
+def reset(capital: float = Query(300000, ge=1000, le=10_000_000)):
     try:
         # include_dashboard=False：重置后立即返回，避免抓行情超时；前端 loadPaper 再拉 overview
-        result = _call_with_retry(P.reset_cycle, capital, False, cycle_days=cycle_days, trading_mode=style)
+        result = _call_with_retry(P.reset_cycle, capital, False)
         _cclear()  # 重置归档后立即刷新前端
         return result
     except Exception as exc:
@@ -414,17 +412,6 @@ def style(account_id: str = Query(...), style: str = Query(...)):
         return result
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Style failed: {type(exc).__name__}") from exc
-
-
-@router.post("/mode")
-def mode(style: str = Query(..., pattern="^(aggressive|balanced|calm|loose)$")):
-    """Change the bounded user-facing trading posture for the paused cycle."""
-    try:
-        result = _call_with_retry(P.set_trading_mode, style)
-        _cclear()
-        return result
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"Mode failed: {type(exc).__name__}") from exc
 
 
 @router.get("/stock-history")

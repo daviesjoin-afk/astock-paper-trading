@@ -1,0 +1,59 @@
+# -*- coding: utf-8 -*-
+"""模拟盘下单股数与约束解释的纯计算。"""
+from __future__ import annotations
+
+
+def price_aware_qty(
+    nav, cash, position_value, industry_value, code_value,
+    fill_price, hard_stop, profile, exposure_cap=None, max_exposure_cap=None,
+    exposure_scale=1.0, strategy_position_value=None,
+    strategy_cap_amount=None, pool_cap_amount=None,
+    pending_strategy_amount=0.0, pending_pool_amount=0.0,
+    *, num, lot_size=100,
+):
+    """按股数计算下单规模；金额约束只做 sizing，不执行任何写操作。"""
+    if fill_price <= 0:
+        return 0, {"target_amount": 0.0, "reason": "无有效价格"}
+    loss_per_share = fill_price * max(abs(hard_stop), 0.01)
+    risk_budget = nav * profile["single_risk"]
+    by_risk = risk_budget / loss_per_share
+    by_weight = max(0.0, nav * profile["max_weight"] - code_value) / fill_price
+    profile_exposure = num(max_exposure_cap, profile["max_exposure"])
+    effective_exposure = min(profile_exposure, num(exposure_cap, profile_exposure))
+    scale = max(0.0, min(num(exposure_scale, 1.0), 1.0))
+    pool_limit = nav * effective_exposure if pool_cap_amount is None else num(pool_cap_amount)
+    pool_remaining = max(
+        0.0,
+        pool_limit - num(position_value) - max(0.0, num(pending_pool_amount)),
+    )
+    if strategy_cap_amount is None:
+        strategy_remaining = pool_remaining
+    else:
+        strategy_remaining = max(
+            0.0,
+            num(strategy_cap_amount) - num(strategy_position_value)
+            - max(0.0, num(pending_strategy_amount)),
+        )
+    remaining_exposure = min(pool_remaining, strategy_remaining)
+    by_exposure = remaining_exposure * scale / fill_price
+    by_industry = max(0.0, nav * profile["max_industry"] - industry_value) / fill_price
+    by_cash = max(0.0, cash) / fill_price
+    limits = {
+        "risk": by_risk, "weight": by_weight, "exposure": by_exposure,
+        "industry": by_industry, "cash": by_cash,
+    }
+    shares = min(limits.values())
+    qty = int(shares / lot_size) * lot_size
+    binding = [name for name, value in limits.items() if value <= shares + 1e-6]
+    return max(qty, 0), {
+        "risk_budget": round(risk_budget, 2), "loss_per_share": round(loss_per_share, 4),
+        "target_amount": round(qty * fill_price, 2), "price": round(fill_price, 4),
+        "effective_max_exposure_pct": round(effective_exposure * 100, 1),
+        "pool_remaining_amount": round(pool_remaining, 2),
+        "strategy_remaining_amount": round(strategy_remaining, 2),
+        "pending_pool_amount": round(max(0.0, num(pending_pool_amount)), 2),
+        "pending_strategy_amount": round(max(0.0, num(pending_strategy_amount)), 2),
+        "new_exposure_scale_pct": round(scale * 100, 1),
+        "constraint_shares": {name: round(value, 2) for name, value in limits.items()},
+        "binding_constraints": binding,
+    }

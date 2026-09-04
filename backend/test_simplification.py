@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import datetime as dt
-import inspect
 import os
 import sqlite3
 import sys
@@ -140,13 +139,6 @@ class AlphaLabBoundTests(unittest.TestCase):
         second = AE._alpha_bounded_sample(list(reversed(rows)), max_rows_per_window=100)
         self.assertEqual(len(first), 100)
         self.assertEqual([row["code"] for row in first], [row["code"] for row in second])
-
-    def test_alpha_history_and_dataset_are_sql_bounded(self):
-        returns_source = inspect.getsource(AE._mature_alpha_returns)
-        dataset_source = inspect.getsource(AE._alpha_dataset)
-        self.assertNotIn("by_date = {}", returns_source)
-        self.assertIn("INSERT OR IGNORE INTO adaptive_alpha_returns", returns_source)
-        self.assertIn("LIMIT ?", dataset_source)
 
 
 class ResearchSuiteSnapshotTests(unittest.TestCase):

@@ -38,11 +38,11 @@ import neural_shadow
 import evolution_adversarial as adversarial
 import dual_ai_tuner
 import self_evolution
+import paper_ledger_reader as paper_reader
+import adaptive_genetics as AG
+import adaptive_shadow_risk as ASR
+from strategy_registry import labels as strategy_labels
 from adaptive_common import _now, _json, _loads, _clamp  # C3: 收敛重复工具函数
-try:
-    import modlens_bridge
-except ImportError:
-    pass
 
 
 BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -119,13 +119,7 @@ ALPHA_MAX_ROWS_PER_WINDOW = max(200, int(os.getenv("ALPHA_MAX_ROWS_PER_WINDOW", 
 DISCLOSURE_MAX_CODES = 150
 DISCLOSURE_CACHE_TTL_SECONDS = 6 * 60 * 60
 DISCLOSURE_REFRESH_AFTER = dt.time(15, 15)
-ACCOUNT_LABELS = {
-    "tq_breakout": "短线日内做T",
-    "trend_pullback": "趋势波段优选",
-    "sector_rotation": "板块轮动先锋",
-    "reported_profit_breakout": "三日策略",
-    "main_force_top10": "超强主力股",
-}
+ACCOUNT_LABELS = strategy_labels()
 REGIME_LABELS = {
     "momentum": "资金共振·动量扩张",
     "rotation": "板块轮动·结构分化",
@@ -210,10 +204,10 @@ def update_ai_settings(updates):
             checked[key] = value
         elif key == "llm_realtime_min_interval_minutes":
             try: checked[key] = max(5, min(240, int(value)))
-            except (TypeError, ValueError): raise ValueError("冷却时间必须是5-240的整数")
+            except (TypeError, ValueError) as exc: raise ValueError("冷却时间必须是5-240的整数") from exc
         elif key == "llm_realtime_min_valid_rows":
             try: checked[key] = max(100, min(10000, int(value)))
-            except (TypeError, ValueError): raise ValueError("有效行情行数必须是100-10000的整数")
+            except (TypeError, ValueError) as exc: raise ValueError("有效行情行数必须是100-10000的整数") from exc
     with _connect() as conn:
         now = _now()
         for key, value in checked.items():
@@ -700,8 +694,7 @@ def _paper_account_snapshot(account_id):
     """Capture only the paper rows touched by an evolution apply/rollback."""
     if not os.path.exists(PAPER_DB_PATH):
         return None
-    paper = sqlite3.connect(PAPER_DB_PATH, timeout=30)
-    paper.row_factory = sqlite3.Row
+    paper = paper_reader.connect(PAPER_DB_PATH, timeout=30)
     try:
         account = paper.execute(
             "SELECT id,params,version,updated_at FROM paper_accounts WHERE id=?", (account_id,)
@@ -737,6 +730,15 @@ def _restore_paper_account(snapshot, account_id, candidate_id, event_name, expec
         # the expected version is deterministic for apply and is read back for
         # rollback before this helper is called.
         if expected_version and str(current["version"] or "") != str(expected_version):
+            # P3 审计修复（E5）：版本不一致时不再静默返回——旧路径 outbox
+            # 已终结、候选已还原但 paper 侧未恢复，双账本分歧无任何告警。
+            print(json.dumps({
+                "alarm": "restore_version_mismatch",
+                "account_id": account_id, "candidate_id": candidate_id,
+                "expected_version": str(expected_version),
+                "current_version": str(current["version"] or ""),
+                "note": "补偿恢复被跳过：paper 账户版本与预期不符，需人工核对双账本",
+            }, ensure_ascii=False), flush=True)
             return
         account = snapshot["account"]
         paper.execute(
@@ -778,7 +780,7 @@ def _restore_paper_account(snapshot, account_id, candidate_id, event_name, expec
 def _paper_current_version(account_id):
     if not os.path.exists(PAPER_DB_PATH):
         return None
-    paper = sqlite3.connect(PAPER_DB_PATH, timeout=30)
+    paper = paper_reader.connect(PAPER_DB_PATH, timeout=30)
     try:
         row = paper.execute("SELECT version FROM paper_accounts WHERE id=?", (account_id,)).fetchone()
         return row[0] if row else None
@@ -824,7 +826,7 @@ def _manual_apply_gate(kind, candidate_snapshot, account_id):
     candidate_version = str(evidence.get("strategy_version") or "")
     if not candidate_version:
         raise ValueError("候选缺少生成时的策略版本，请重新生成")
-    with sqlite3.connect(PAPER_DB_PATH, timeout=30) as paper:
+    with paper_reader.connect(PAPER_DB_PATH, timeout=30) as paper:
         row = paper.execute("SELECT version FROM paper_accounts WHERE id=?", (account_id,)).fetchone()
     if not row or str(row[0] or "") != candidate_version:
         raise ValueError("策略版本已变化，请重新生成候选")
@@ -1196,18 +1198,11 @@ def _mature_alpha_returns(conn):
 
 
 def _normalize_genome(weights):
-    values = [float(weights.get(name, 0.0)) for name in ALPHA_FEATURES]
-    scale = sum(abs(value) for value in values) or 1.0
-    return {name: round(value / scale, 8) for name, value in zip(ALPHA_FEATURES, values)}
+    return AG.normalize_genome(weights, ALPHA_FEATURES)
 
 
 def _alpha_dataset(conn, max_rows_per_window=ALPHA_MAX_ROWS_PER_WINDOW):
-    """Build a bounded GA dataset without materializing the full join.
-
-    The mature-return table grows by stock x date x horizon. Loading that
-    complete join before sampling defeated the cap and was the final learning
-    OOM peak. SQLite aggregates centres; Python only receives the cap.
-    """
+    """Build a bounded GA dataset without materializing the full join."""
     cap = max(100, int(max_rows_per_window))
     windows = conn.execute(
         """SELECT start_date,horizon,AVG(forward_return_pct) AS center
@@ -1232,12 +1227,7 @@ def _alpha_dataset(conn, max_rows_per_window=ALPHA_MAX_ROWS_PER_WINDOW):
 
 
 def _alpha_bounded_sample(rows, max_rows_per_window=ALPHA_MAX_ROWS_PER_WINDOW):
-    """Deterministically cap each date/horizon cross-section for the GA lab.
-
-    Stored ranks and returns remain complete. Only the repeated shadow-search
-    fitness pass is sampled; keeping every 5,500-stock cross-section in each of
-    hundreds of genome evaluations caused allocator growth and OOM restarts.
-    """
+    """Deterministically cap each date/horizon cross-section for the GA lab."""
     grouped = defaultdict(list)
     for row in rows:
         grouped[(row["profile_date"], row["horizon"])].append(row)
@@ -1258,47 +1248,15 @@ def _alpha_bounded_sample(rows, max_rows_per_window=ALPHA_MAX_ROWS_PER_WINDOW):
 
 
 def _alpha_fitness(genome, rows):
-    """Walk-forward-safe cross-sectional spread with complexity/stability penalties."""
-    by_window = defaultdict(list)
-    for row in rows:
-        score = sum(genome[name] * row[name] for name in ALPHA_FEATURES)
-        by_window[(row["profile_date"], row["horizon"])].append((score, row["excess_return_pct"]))
-    spreads = []
-    for (_, horizon), values in by_window.items():
-        if len(values) < 100:
-            continue
-        values.sort(key=lambda item: item[0])
-        bucket = max(10, len(values) // 10)
-        low = statistics.mean(value[1] for value in values[:bucket])
-        high = statistics.mean(value[1] for value in values[-bucket:])
-        spreads.append((high - low) * HORIZON_WEIGHTS.get(horizon, 0.0))
-    if not spreads:
-        return {"fitness": -999.0, "spread_pct": 0.0, "stability": 0.0, "windows": 0}
-    mean_spread = statistics.mean(spreads)
-    stability = sum(value > 0 for value in spreads) / len(spreads)
-    dispersion = statistics.pstdev(spreads) if len(spreads) > 1 else abs(mean_spread)
-    complexity = sum(abs(value) >= 0.08 for value in genome.values())
-    fitness = mean_spread + 0.35 * stability - 0.18 * dispersion - 0.015 * complexity
-    return {
-        "fitness": round(fitness, 8),
-        "spread_pct": round(mean_spread, 8),
-        "stability": round(stability, 6),
-        "windows": len(spreads),
-    }
+    return AG.alpha_fitness(genome, rows, ALPHA_FEATURES, HORIZON_WEIGHTS)
 
 
 def _mutate_genome(parent, rng):
-    child = dict(parent)
-    count = 1 if rng.random() < 0.72 else 2
-    for name in rng.sample(list(ALPHA_FEATURES), count):
-        child[name] += rng.gauss(0, 0.16)
-    return _normalize_genome(child)
+    return AG.mutate_genome(parent, rng, ALPHA_FEATURES)
 
 
 def _crossover(left, right, rng):
-    return _normalize_genome({
-        name: left[name] if rng.random() < 0.5 else right[name] for name in ALPHA_FEATURES
-    })
+    return AG.crossover(left, right, rng, ALPHA_FEATURES)
 
 
 def _run_alpha_lab(conn, run_date):
@@ -1416,8 +1374,7 @@ def _reward_regime(conn, start_date):
 def _evaluate_rewards(conn):
     if not os.path.exists(PAPER_DB_PATH):
         return 0
-    paper = sqlite3.connect(PAPER_DB_PATH, timeout=30)
-    paper.row_factory = sqlite3.Row
+    paper = paper_reader.connect(PAPER_DB_PATH, timeout=30)
     try:
         accounts = [row[0] for row in paper.execute("SELECT id FROM paper_accounts ORDER BY id")]
         # A cycle reset deletes paper_nav history but previously accumulated
@@ -1456,10 +1413,10 @@ def _evaluate_rewards(conn):
                 _run += fill_totals[_d]
                 fill_prefix.append(_run)
 
-            def _window_amount(start_date, end_date):
-                left = _bisect_right(fill_dates, start_date)
-                right = _bisect_right(fill_dates, end_date)
-                return (fill_prefix[right - 1] if right > 0 else 0.0) - (fill_prefix[left - 1] if left > 0 else 0.0)
+            def _window_amount(start_date, end_date, _fill_dates=fill_dates, _fill_prefix=fill_prefix):
+                left = _bisect_right(_fill_dates, start_date)
+                right = _bisect_right(_fill_dates, end_date)
+                return (_fill_prefix[right - 1] if right > 0 else 0.0) - (_fill_prefix[left - 1] if left > 0 else 0.0)
 
             for horizon, horizon_weight in HORIZON_WEIGHTS.items():
                 for index in range(0, len(nav_rows) - horizon):
@@ -1819,8 +1776,6 @@ def run_learning_cycle(trigger="manual"):
                 "status": "failed",
                 "error": f"{type(exc).__name__}: {exc}",
             }
-        # Attribution may transiently load historical frames. Release arenas
-        # before the independent alpha pass so the two peaks never add up.
         gc.collect()
         try:
             import ctypes
@@ -2273,8 +2228,7 @@ def _sync_evidence_chains(conn):
     """
     if not os.path.exists(PAPER_DB_PATH):
         return {"orders": 0, "linked": 0, "valid": 0, "actual": 0, "counterfactual": 0}
-    paper = sqlite3.connect(PAPER_DB_PATH, timeout=30)
-    paper.row_factory = sqlite3.Row
+    paper = paper_reader.connect(PAPER_DB_PATH, timeout=30)
     try:
         orders = paper.execute(
             """SELECT id,account_id,code,side,signal_id,status,reason,created_at,executed_at,
@@ -2295,14 +2249,11 @@ def _sync_evidence_chains(conn):
         for row in paper.execute("SELECT id,order_id,quote_at FROM paper_fills ORDER BY id"):
             fills_by_order[int(row["order_id"])].append(dict(row))
         decisions = defaultdict(list)
-        for row in paper.execute(
-            "SELECT id,account_id,code,side,created_at FROM paper_risk_decisions ORDER BY id"
-        ):
+        for row in paper.execute("SELECT id,account_id,code,side,created_at FROM paper_risk_decisions ORDER BY id"):
             decisions[(row["account_id"], row["code"], row["side"])].append(dict(row))
 
-        actual = counterfactual = valid = linked = 0
+        actual = counterfactual = valid = linked = total = 0
         now = _now()
-        total = 0
         for raw_order in orders:
             total += 1
             order = dict(raw_order)
@@ -2445,7 +2396,7 @@ def _closed_loop_state(conn, evidence=None):
     if profile_days < 10:
         blockers.append(f"完整画像日 {profile_days}/10")
     if recent_actual < 6 or accounts < 2:
-        blockers.append(f"可归因成交 {recent_actual} 笔、覆盖 {accounts}/3 策略")
+        blockers.append(f"可归因成交 {recent_actual} 笔、覆盖 {accounts}/2 当前策略账户")
     try:
         state["evidence"] = json.loads(state.get("evidence") or "{}")
     except (TypeError, ValueError):
@@ -2476,236 +2427,32 @@ def _closed_loop_state(conn, evidence=None):
 
 
 def _shadow_history_rows(history):
-    """Normalize a cached history into close/high/low rows without I/O.
-
-    The risk overlay deliberately accepts a small, dependency-free input
-    contract so it can be tested independently from the data provider.  A
-    pandas DataFrame, a list of mappings, or a list of close prices are all
-    valid.  Malformed values are discarded instead of being inferred.
-    """
-    if history is None:
-        return []
-    if hasattr(history, "to_dict"):
-        try:
-            history = history.to_dict("records")
-        except Exception:
-            history = []
-    if isinstance(history, dict):
-        history = history.get("rows") or history.get("data") or []
-    if not isinstance(history, (list, tuple)):
-        return []
-    rows = []
-    for item in history:
-        if isinstance(item, dict):
-            def pick(*keys):
-                for key in keys:
-                    if key in item:
-                        value = _num(item.get(key), None)
-                        if value is not None:
-                            return value
-                return None
-            close = pick("close", "close_price", "price", "收盘")
-            high = pick("high", "high_price", "最高")
-            low = pick("low", "low_price", "最低")
-            previous = pick("prev_close", "previous_close", "昨收")
-            if close is not None and close > 0:
-                rows.append({"close": close, "high": high, "low": low, "prev_close": previous})
-        elif isinstance(item, (list, tuple)) and len(item) == 1:
-            value = _num(item[0], None)
-            if value is not None and value > 0:
-                rows.append({"close": value, "high": None, "low": None, "prev_close": None})
-        else:
-            value = _num(item, None)
-            if value is not None and value > 0:
-                rows.append({"close": value, "high": None, "low": None, "prev_close": None})
-    return rows
+    return ASR.shadow_history_rows(history, num=_num)
 
 
 def _shadow_volatility(history, window):
-    """Return annualised close-to-close volatility or an explicit unknown."""
-    rows = _shadow_history_rows(history)
-    if len(rows) < int(window) + 1:
-        return {"status": "unknown", "value_pct": None, "samples": max(0, len(rows) - 1),
-                "required": int(window) + 1, "reason": "历史K线不足"}
-    closes = [row["close"] for row in rows[-(int(window) + 1):]]
-    returns = [(closes[idx] / closes[idx - 1]) - 1.0 for idx in range(1, len(closes))
-               if closes[idx - 1] > 0 and closes[idx] > 0]
-    if len(returns) < int(window):
-        return {"status": "unknown", "value_pct": None, "samples": len(returns),
-                "required": int(window), "reason": "有效收盘价不足"}
-    value = statistics.stdev(returns) * math.sqrt(252.0) * 100.0 if len(returns) > 1 else 0.0
-    return {"status": "known", "value_pct": round(value, 4), "samples": len(returns),
-            "window": int(window)}
+    return ASR.shadow_volatility(history, window, num=_num)
 
 
 def _shadow_atr_pct(history, window=20):
-    """Return ATR as a percent of the latest close, or unknown.
-
-    True ranges require high/low and a prior close.  Close-only histories are
-    therefore not silently treated as ATR data.
-    """
-    rows = _shadow_history_rows(history)
-    if len(rows) < int(window) + 1:
-        return {"status": "unknown", "value_pct": None, "samples": 0,
-                "required": int(window) + 1, "reason": "历史K线不足"}
-    selected = rows[-(int(window) + 1):]
-    true_ranges = []
-    for idx in range(1, len(selected)):
-        row = selected[idx]
-        prev_close = selected[idx - 1]["close"]
-        high, low = row.get("high"), row.get("low")
-        if high is None or low is None or prev_close <= 0 or high < low:
-            continue
-        true_ranges.append(max(high - low, abs(high - prev_close), abs(low - prev_close)))
-    latest = selected[-1]["close"]
-    if len(true_ranges) < int(window) or latest <= 0:
-        return {"status": "unknown", "value_pct": None, "samples": len(true_ranges),
-                "required": int(window), "reason": "高低价或昨收缺失"}
-    return {"status": "known", "value_pct": round(statistics.mean(true_ranges) / latest * 100.0, 4),
-            "samples": len(true_ranges), "window": int(window)}
+    return ASR.shadow_atr_pct(history, window, num=_num)
 
 
 def _shadow_hhi(values):
-    """Compute a normalized Herfindahl index from non-negative exposures."""
-    clean = [float(value) for value in values if _num(value, None) is not None and float(value) > 0]
-    total = sum(clean)
-    return round(sum((value / total) ** 2 for value in clean), 6) if total > 0 else None
+    return ASR.shadow_hhi(values, num=_num)
 
 
 def _portfolio_shadow_risk(positions, histories=None, asof=None, industry_shock_pct=-8.0,
                            limit_down_pct=-10.0):
-    """Build read-only portfolio risk metrics for the adaptive overview.
-
-    No caller in this module may use the result to submit, cancel, or resize
-    an order.  Unknown marks/history stay unknown; cost is only a labelled
-    fallback valuation and never masquerades as a real-time quote.
-    """
-    histories = histories if isinstance(histories, dict) else {}
-    positions = positions if isinstance(positions, (list, tuple)) else []
-    normalized = []
-    unknown_marks = []
-    for raw in positions:
-        if not isinstance(raw, dict):
-            continue
-        code = str(raw.get("code") or "").strip()
-        if not code:
-            continue
-        qty = _num(raw.get("qty"), 0.0) or 0.0
-        if qty <= 0:
-            continue
-        mark = _num(raw.get("market_price"), None)
-        mark = mark if mark is not None else _num(raw.get("current_price"), None)
-        mark = mark if mark is not None else _num(raw.get("price"), None)
-        cost = _num(raw.get("cost"), None)
-        if mark is not None and mark > 0:
-            value, source = qty * mark, "quote"
-        elif cost is not None and cost > 0:
-            value, source = qty * cost, "cost_fallback"
-        else:
-            value, source = None, "unknown"
-            unknown_marks.append(code)
-        normalized.append({
-            "account_id": str(raw.get("account_id") or "unknown"),
-            "account_name": raw.get("account_name"),
-            "code": code,
-            "name": str(raw.get("name") or ""),
-            "industry": str(raw.get("industry") or "未知"),
-            "qty": int(qty) if float(qty).is_integer() else round(qty, 4),
-            "mark_price": mark,
-            "cost": cost,
-            "market_value": round(value, 2) if value is not None else None,
-            "valuation_source": source,
-        })
-    valued = [row for row in normalized if row["market_value"] is not None]
-    total_value = sum(row["market_value"] for row in valued)
-    by_strategy = defaultdict(float)
-    by_code = defaultdict(float)
-    by_industry = defaultdict(float)
-    code_accounts = defaultdict(set)
-    for row in valued:
-        by_strategy[row["account_id"]] += row["market_value"]
-        by_code[row["code"]] += row["market_value"]
-        by_industry[row["industry"]] += row["market_value"]
-    for row in normalized:
-        code_accounts[row["code"]].add(row["account_id"])
-    def shares(values):
-        return {key: round(value / total_value * 100.0, 3) for key, value in sorted(values.items(), key=lambda item: item[1], reverse=True)} if total_value > 0 else {}
-    strategy_shares = shares(by_strategy)
-    industry_shares = shares(by_industry)
-    cross_strategy = []
-    for code, accounts in sorted(code_accounts.items()):
-        if len(accounts) > 1:
-            cross_strategy.append({
-                "code": code,
-                "strategies": sorted(accounts),
-                "strategy_count": len(accounts),
-                "market_value": round(by_code.get(code, 0.0), 2),
-                "share_pct": round(by_code.get(code, 0.0) / total_value * 100.0, 3) if total_value > 0 else None,
-            })
-    volatility = {}
-    for code in sorted({row["code"] for row in normalized}):
-        history = histories.get(code)
-        volatility[code] = {
-            "20d": _shadow_volatility(history, 20),
-            "60d": _shadow_volatility(history, 60),
-            "atr20_pct": _shadow_atr_pct(history, 20),
-        }
-    if total_value > 0:
-        index_stress = {
-            "index_minus_2_pct": round(total_value * -0.02, 2),
-            "index_minus_5_pct": round(total_value * -0.05, 2),
-        }
-        industry_stress = [{
-            "industry": industry, "shock_pct": float(industry_shock_pct),
-            "loss": round(value * industry_shock_pct / 100.0, 2),
-            "exposure": round(value, 2), "share_pct": industry_shares.get(industry),
-        } for industry, value in sorted(by_industry.items(), key=lambda item: item[1], reverse=True)]
-        worst_code, worst_value = max(by_code.items(), key=lambda item: item[1])
-        single_stress = {"code": worst_code, "shock_pct": float(limit_down_pct),
-                         "loss": round(worst_value * limit_down_pct / 100.0, 2),
-                         "exposure": round(worst_value, 2)}
-    else:
-        index_stress, industry_stress, single_stress = {
-            "status": "unknown", "reason": "没有可估值持仓"
-        }, [], {"status": "unknown", "reason": "没有可估值持仓"}
-    return {
-        "mode": "shadow",
-        "version": "portfolio-risk-shadow-v2",
-        "asof": asof or _now(),
-        "data_quality": {
-            "status": "known" if valued and not unknown_marks else ("partial" if valued else "unknown"),
-            "valued_positions": len(valued), "total_positions": len(normalized),
-            "unknown_mark_codes": sorted(set(unknown_marks)),
-            "history_codes": sorted(str(key) for key in histories if str(key) in {row["code"] for row in normalized}),
-            "note": "cost_fallback 仅用于影子估值；没有行情或历史不补造数据。",
-        },
-        "positions": {"total": len(normalized), "valued": len(valued), "unknown": len(normalized) - len(valued),
-                      "total_value": round(total_value, 2) if total_value > 0 else None},
-        "exposure": {
-            "by_strategy": [{"account_id": key, "market_value": round(value, 2), "share_pct": strategy_shares.get(key)} for key, value in sorted(by_strategy.items(), key=lambda item: item[1], reverse=True)],
-            "by_industry": [{"industry": key, "market_value": round(value, 2), "share_pct": industry_shares.get(key)} for key, value in sorted(by_industry.items(), key=lambda item: item[1], reverse=True)],
-            "cross_strategy_same_code": cross_strategy,
-        },
-        "concentration": {
-            "strategy_hhi": _shadow_hhi(by_strategy.values()),
-            "industry_hhi": _shadow_hhi(by_industry.values()),
-            "code_hhi": _shadow_hhi(by_code.values()),
-            "top_strategy_share_pct": max(strategy_shares.values()) if strategy_shares else None,
-            "top_industry_share_pct": max(industry_shares.values()) if industry_shares else None,
-            "top_code_share_pct": round(max(by_code.values()) / total_value * 100.0, 3) if total_value > 0 else None,
-        },
-        "volatility": volatility,
-        "stress": {
-            "index": index_stress,
-            "industry": {"assumption_pct": float(industry_shock_pct), "scenarios": industry_stress},
-            "single_limit_down": single_stress,
-        },
-        "flags": [
-            *(["行情估值不完整"] if unknown_marks else []),
-            *(["行业集中度较高"] if max(industry_shares.values(), default=0.0) >= 35.0 else []),
-            *(["同股跨策略重复暴露"] if cross_strategy else []),
-        ],
-    }
+    return ASR.portfolio_shadow_risk(
+        positions,
+        histories=histories,
+        asof=asof,
+        industry_shock_pct=industry_shock_pct,
+        limit_down_pct=limit_down_pct,
+        num=_num,
+        now_fn=_now,
+    )
 
 
 def _portfolio_shadow_arbitration():
@@ -2719,8 +2466,7 @@ def _portfolio_shadow_arbitration():
             "mode": "shadow", "version": "portfolio-arbiter-v1", "candidates": [],
             "reason": "paper_db_missing", "risk_metrics": _portfolio_shadow_risk([]),
         }
-    paper = sqlite3.connect(PAPER_DB_PATH, timeout=30)
-    paper.row_factory = sqlite3.Row
+    paper = paper_reader.connect(PAPER_DB_PATH, timeout=30)
     try:
         positions = [dict(row) for row in paper.execute(
             "SELECT account_id,code,name,industry,qty,cost FROM paper_positions WHERE qty>0"
@@ -2832,9 +2578,8 @@ def _disclosure_scope_codes(day: dt.date) -> list[str]:
         return []
     codes: list[str] = []
     seen: set[str] = set()
-    paper = sqlite3.connect(PAPER_DB_PATH, timeout=8)
+    paper = paper_reader.connect(PAPER_DB_PATH, timeout=8)
     try:
-        paper.row_factory = sqlite3.Row
         queries = (
             "SELECT code FROM paper_positions WHERE qty>0 ORDER BY account_id,code LIMIT ?",
             """SELECT code FROM paper_signals
@@ -2999,8 +2744,7 @@ def _execution_evidence_state(conn, day: dt.date | None = None, *, persist: bool
     if not os.path.exists(PAPER_DB_PATH):
         state["ledger_replay"] = {"status": "missing_paper_ledger", "errors": [], "warnings": []}
         return state
-    paper = sqlite3.connect(PAPER_DB_PATH, timeout=30)
-    paper.row_factory = sqlite3.Row
+    paper = paper_reader.connect(PAPER_DB_PATH, timeout=30)
     try:
         signal_rows = paper.execute(
             "SELECT payload FROM paper_signals WHERE signal_date=? OR intended_date=?",
@@ -3139,7 +2883,7 @@ def _data_input_state(conn):
     major_events = conn.execute("SELECT COUNT(*) FROM market_major_events").fetchone()[0]
     paper_counts = {"orders": 0, "fills": 0, "risk_decisions": 0, "nav_days": 0}
     if os.path.exists(PAPER_DB_PATH):
-        paper = sqlite3.connect(PAPER_DB_PATH, timeout=30)
+        paper = paper_reader.connect(PAPER_DB_PATH, timeout=30)
         try:
             paper_counts = {
                 "orders": paper.execute("SELECT COUNT(*) FROM paper_orders").fetchone()[0],
