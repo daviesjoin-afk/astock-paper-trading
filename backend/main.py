@@ -771,7 +771,6 @@ def health():
         "latest_trade_date": latest,
         "stale_calendar_days": stale_days,
         "init": U.get_init_state(),
-        "warnings": warnings,
     }
     _store_health_response(payload)
     return payload
