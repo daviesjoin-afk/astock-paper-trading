@@ -25,11 +25,14 @@ DATE=$(date +%Y%m%d-%H%M)
 DEST=${BACKUP_ROOT:-/var/backups/astock-codex}/daily/$DATE
 mkdir -p "$DEST"
 
-# 1. SQLite 在线备份（宿主机直连 data_cache 文件，.backup 保证一致性）
+# 1. SQLite 在线备份（宿主机直连 data_cache 文件，.backup 保证一致性）。
+#    账本体积大（paper_trading 2G+、adaptive 700M+），gzip 压缩后落盘，
+#    否则 keep 7 的日备份会在一周内占满整块磁盘。
 for DB in paper_trading.sqlite3 adaptive_learning.sqlite3 paper_research.sqlite3 selection_tracking.db; do
   if [[ -f "$PROJECT_DIR/data_cache/$DB" ]]; then
     sqlite3 "$PROJECT_DIR/data_cache/$DB" ".backup '$DEST/$DB'"
-    echo "backup $DB ok"
+    gzip -f "$DEST/$DB"
+    echo "backup $DB.gz ok ($(du -h "$DEST/$DB.gz" | cut -f1))"
   fi
 done
 
