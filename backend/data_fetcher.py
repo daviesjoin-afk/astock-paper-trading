@@ -2,11 +2,23 @@
 """数据层：东方财富 + 腾讯免费公开接口，全部实测验证于 2026-07-28
 传输层：requests + Session 连接复用，大幅降低进程开销"""
 import datetime as dt
-import os, json, time, threading, re, math, uuid
+import os, json, time, threading, uuid
 from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import requests
 import pandas as pd
+import marketdata_cache as MDC
+import marketdata_normalizers as MN
+import marketdata_providers as MP
+from marketdata_transport import (
+    HEADERS,
+    _session,
+    _tencent_circuit,
+    _tencent_circuit_lock,
+    http_get,
+    http_post_json,
+    reset_data_source,
+)
 
 try:  # POSIX containers use flock; local Windows checks keep the thread lock.
     import fcntl as _fcntl
@@ -28,9 +40,6 @@ DATA_SOURCE_HEALTH_PATH = os.path.join(CACHE_DIR, "data_source_health.json")
 os.makedirs(KLINE_DIR, exist_ok=True)
 
 UT_FLOW = "b2884a393a59ad64002292a3e90d46a5"
-HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
-_session_local = threading.local()
-
 _cache_lock = threading.Lock()
 _mem_cache = {}
 _full_snapshot_thread_lock = threading.Lock()
@@ -39,53 +48,10 @@ _manifest = None
 _manifest_mtime = None
 _manifest_dirty = 0
 _manifest_pending = {}
-_tencent_circuit_lock = threading.Lock()
-_tencent_circuit = {"failures": 0, "open_until": 0.0, "backoff_seconds": 45, "last_probe_at": 0.0}
 
-
-def _session():
-    """requests.Session 不跨线程共享；每个下载线程复用自己的连接池。"""
-    session = getattr(_session_local, "value", None)
-    if session is None:
-        session = requests.Session()
-        session.headers.update(HEADERS)
-        _session_local.value = session
-    return session
-
-
-def reset_data_source(reason=None, reset_circuit=False):
-    """重置连接池；默认保留源熔断器状态。
-
-    熔断器的失败计数必须跨调用累积才能在持续故障时开门（半开探测由
-    熔断器自身状态机负责）。此前每次空响应都无条件清零计数，历史恢复
-    场景中逐票失败把熔断器永远摁在复位状态，5000+ 只股票对免费接口
-    持续打满、加剧限流。需要彻底复位的调用方（如健康探测的主动重连）
-    显式传 ``reset_circuit=True``。
-    """
-    session = getattr(_session_local, "value", None)
-    if session is not None:
-        try:
-            session.close()
-        except Exception:
-            pass
-        try:
-            delattr(_session_local, "value")
-        except AttributeError:
-            pass
-    if reset_circuit:
-        with _tencent_circuit_lock:
-            _tencent_circuit.update({"failures": 0, "open_until": 0.0, "backoff_seconds": 45, "last_probe_at": 0.0})
 
 def _cached(key, ttl, fn):
-    now = time.time()
-    with _cache_lock:
-        if key in _mem_cache and now - _mem_cache[key][0] < ttl:
-            return _mem_cache[key][1]
-    val = fn()
-    if val:  # 空结果不进缓存，避免一次失败污染后续请求
-        with _cache_lock:
-            _mem_cache[key] = (now, val)
-    return val
+    return MDC.cached(_mem_cache, _cache_lock, key, ttl, fn)
 
 
 @contextmanager
@@ -98,55 +64,10 @@ def _full_snapshot_singleflight_lock():
     development has no ``fcntl``; the process-local lock still protects its
     threads and the lock file remains harmless.
     """
-    lock_handle = None
-    with _full_snapshot_thread_lock:
-        try:
-            lock_handle = open(MARKET_SNAPSHOT_FULL_LOCK_PATH, "a+", encoding="utf-8")
-        except OSError:
-            # A read-only/cache-recovery environment may not permit a lock
-            # sidecar.  Keep the process-local guard and let the caller's
-            # existing fail-closed refresh logic decide whether data is usable.
-            yield
-            return
-        try:
-            if _fcntl is not None:
-                _fcntl.flock(lock_handle.fileno(), _fcntl.LOCK_EX)
-            yield
-        finally:
-            if lock_handle is not None:
-                try:
-                    if _fcntl is not None:
-                        _fcntl.flock(lock_handle.fileno(), _fcntl.LOCK_UN)
-                finally:
-                    lock_handle.close()
-
-def http_get(url, params=None, timeout=15, encoding="utf-8", retries=2):
-    """直接走 requests + Session 连接复用（相比 curl 子进程极大提速）"""
-    for i in range(retries + 1):
-        try:
-            r = _session().get(url, params=params, timeout=timeout)
-            r.raise_for_status()
-            r.encoding = encoding
-            if r.text:
-                return r.text
-            # 空响应也触发重试（东财偶发 200/空正文）
-            if i < retries:
-                time.sleep(0.4 * (i + 1))
-                continue
-        except requests.RequestException:
-            if i == retries:
-                raise
-        time.sleep(0.5 * (i + 1))
-    return ""
-
-def http_post_json(url, body, timeout=15):
-    """POST JSON 请求（保持接口兼容）"""
-    try:
-        r = _session().post(url, json=body, timeout=timeout)
-        r.raise_for_status()
-        return r.json() if r.text else {}
-    except Exception:
-        return {}
+    with MDC.full_snapshot_singleflight_lock(
+        _full_snapshot_thread_lock, MARKET_SNAPSHOT_FULL_LOCK_PATH
+    ):
+        yield
 
 def _get_json(url, params=None, timeout=15, retries=2):
     txt = http_get(url, params=params, timeout=timeout, retries=retries)
@@ -156,24 +77,12 @@ def _get_json(url, params=None, timeout=15, retries=2):
 
 
 def _save_source_health(payload):
-    try:
-        # PID+UUID avoids collisions even when two containers both run as PID 1.
-        temp_path = f"{DATA_SOURCE_HEALTH_PATH}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
-        with open(temp_path, "w", encoding="utf-8") as handle:
-            json.dump(payload, handle, ensure_ascii=False, allow_nan=False)
-        os.replace(temp_path, DATA_SOURCE_HEALTH_PATH)
-    except OSError:
-        pass
+    return MDC.save_source_health(DATA_SOURCE_HEALTH_PATH, payload)
 
 
 def load_source_health():
     """Return the latest persisted source check without touching the network."""
-    try:
-        with open(DATA_SOURCE_HEALTH_PATH, encoding="utf-8") as handle:
-            payload = json.load(handle)
-        return payload if isinstance(payload, dict) else {}
-    except (OSError, ValueError, TypeError):
-        return {}
+    return MDC.load_source_health(DATA_SOURCE_HEALTH_PATH)
 
 
 def check_data_source_health(force=False):
@@ -371,75 +280,20 @@ _NON_THEME_CONCEPT_TOKENS = (
 
 
 def _finite_number(value):
-    try:
-        number = float(value)
-        return number if math.isfinite(number) else None
-    except (TypeError, ValueError):
-        return None
+    return MN.finite_number(value)
 
 
 def _fetch_concept_members(board_code, max_pages=8):
     """Fetch all currently reported members, with explicit completeness data."""
-    fields = "f2,f3,f8,f10,f12,f14,f62,f66,f100,f124,f184"
-
-    def one_page(page):
-        params = {
-            "pn": page, "pz": 100, "po": 1, "np": 1, "fltt": 2, "invt": 2,
-            "ut": UT_FLOW, "fid": "f62", "fs": f"b:{board_code}+f:!50",
-            "fields": fields,
-        }
-        for host in CLIST_HOSTS:
-            try:
-                payload = _get_json(f"https://{host}/api/qt/clist/get", params,
-                                    timeout=5, retries=0)
-                data = (payload or {}).get("data") or {}
-                rows = data.get("diff") or []
-                if rows:
-                    return rows, int(data.get("total") or len(rows)), True
-            except Exception:
-                continue
-        return [], 0, False
-
-    first, total, ok = one_page(1)
-    if not ok:
-        return {"members": [], "expected_count": 0, "pages_ok": 0,
-                "pages_expected": 0, "complete": False}
-    pages_expected = max(1, (total + 99) // 100)
-    pages_to_fetch = min(pages_expected, max(1, int(max_pages)))
-    results = {1: first}
-    if pages_to_fetch > 1:
-        with ThreadPoolExecutor(max_workers=min(4, pages_to_fetch - 1)) as pool:
-            futures = {pool.submit(one_page, page): page for page in range(2, pages_to_fetch + 1)}
-            for future in as_completed(futures):
-                page = futures[future]
-                try:
-                    rows, _, page_ok = future.result()
-                except Exception:
-                    rows, page_ok = [], False
-                if page_ok:
-                    results[page] = rows
-    members, seen, malformed = [], set(), 0
-    for page in sorted(results):
-        for item in results[page]:
-            code = str(item.get("f12") or "")
-            price, pct = _finite_number(item.get("f2")), _finite_number(item.get("f3"))
-            if not code or code in seen or price is None or pct is None:
-                malformed += 1
-                continue
-            seen.add(code)
-            members.append({
-                "code": code, "name": item.get("f14"), "price": price, "pct": pct,
-                "turnover": _finite_number(item.get("f8")),
-                "vol_ratio": _finite_number(item.get("f10")), "industry": item.get("f100"),
-                "main_net": _finite_number(item.get("f62")),
-                "super_net": _finite_number(item.get("f66")),
-                "main_pct": _finite_number(item.get("f184")),
-                "quote_ts": item.get("f124"), "quote_at": _quote_at(item.get("f124")),
-            })
-    complete = pages_expected <= max_pages and len(results) == pages_expected and len(members) >= max(1, total - malformed)
-    return {"members": members, "expected_count": total, "fetched_count": len(members),
-            "pages_ok": len(results), "pages_expected": pages_expected,
-            "malformed_rows": malformed, "complete": bool(complete)}
+    return MP.fetch_eastmoney_concept_members(
+        get_json=_get_json,
+        hosts=CLIST_HOSTS,
+        board_code=board_code,
+        ut=UT_FLOW,
+        quote_at=_quote_at,
+        finite_number=_finite_number,
+        max_pages=max_pages,
+    )
 
 
 def fetch_hot_concept_snapshot(topn=6):
@@ -480,11 +334,7 @@ def fetch_hot_concept_snapshot(topn=6):
 
 
 def _stock_secid(code):
-    """Return EastMoney's market-prefixed identifier for an A-share code."""
-    code = str(code or "").strip().zfill(6)
-    if not code.isdigit() or len(code) != 6:
-        return None
-    return f"{'1' if code.startswith(('5', '6', '9')) else '0'}.{code}"
+    return MN.stock_secid(code)
 
 
 def _fetch_stock_concept_refs(code):
@@ -507,18 +357,9 @@ def _fetch_stock_concept_refs(code):
             payload = _get_json(f"https://{host}/api/qt/slist/get", params,
                                 timeout=5, retries=0)
             rows = ((payload or {}).get("data") or {}).get("diff") or []
-            if isinstance(rows, dict):
-                rows = rows.values()
-            refs = []
-            seen = set()
-            for row in rows:
-                board_code = str(row.get("f12") or "")
-                name = str(row.get("f14") or "").strip()
-                if (not board_code.startswith("BK") or not name or board_code in seen
-                        or any(token in name for token in _NON_THEME_CONCEPT_TOKENS)):
-                    continue
-                seen.add(board_code)
-                refs.append({"code": board_code, "name": name})
+            refs = MP.parse_eastmoney_concept_refs(
+                rows, excluded_tokens=_NON_THEME_CONCEPT_TOKENS,
+            )
             if refs:
                 return refs
         except Exception:
@@ -635,24 +476,7 @@ _hot_sector_fetch_state = {
 
 
 def _sanitize_market_row(row):
-    """Drop impossible OHLC values instead of feeding them to risk models."""
-    def number(value):
-        try:
-            result = float(value)
-            return result if math.isfinite(result) else None
-        except (TypeError, ValueError):
-            return None
-    price = number(row.get("price"))
-    if price is None or price <= 0:
-        return row
-    for key in ("open_price", "high", "low", "prev_close"):
-        value = number(row.get(key))
-        if value is None or value <= 0 or value / price < 0.20 or value / price > 5.0:
-            row[key] = None
-    high, low = number(row.get("high")), number(row.get("low"))
-    if high is not None and low is not None and high < low:
-        row["high"], row["low"] = None, None
-    return row
+    return MN.sanitize_market_row(row)
 
 def _fetch_clist(fields, fid="f20", pages=None, pz=200, return_meta=False):
     """分页拉取 clist，并可返回分页完整性元数据。
@@ -661,83 +485,20 @@ def _fetch_clist(fields, fid="f20", pages=None, pz=200, return_meta=False):
     得到 ``list`` 以保持兼容；需要将结果写入正式全市场/资金快照的调用方
     必须传 ``return_meta=True``，并检查 ``complete``，避免残片污染横截面。
     """
-    def _host_ok(h):
-        info = _clist_host_health.get(h)
-        return not (info and time.time() < info.get("cooldown_until", 0))
-    def _host_ok_set(h):
-        _clist_host_health[h] = {"failures": 0, "cooldown_until": 0}
-    def _host_fail(h):
-        info = _clist_host_health.get(h, {"failures": 0, "cooldown_until": 0})
-        f = info["failures"] + 1
-        _clist_host_health[h] = {"failures": f, "cooldown_until": time.time() + min(_CLIST_HOST_COOLDOWN_BASE * (2 ** (f - 1)), _CLIST_HOST_MAX_COOLDOWN)}
-    def _one_page(pn):
-        params = {"pn": pn, "pz": pz, "po": 1, "np": 1, "fltt": 2, "invt": 2,
-                  "ut": UT_FLOW, "fid": fid, "fs": SNAP_FS, "fields": fields}
-        ordered = [h for h in CLIST_HOSTS if _host_ok(h)] + [h for h in CLIST_HOSTS if not _host_ok(h)]
-        for host in ordered:
-            try:
-                j = _get_json(f"https://{host}/api/qt/clist/get", params, timeout=10, retries=1)
-                data = (j or {}).get("data") or {}
-                diff = data.get("diff") or []
-                total = data.get("total", 0)
-            except Exception:
-                diff, total = [], 0
-            if diff:
-                _host_ok_set(host)
-                return diff, total
-            _host_fail(host)
-        return [], 0
-    first, total = _one_page(1)
-    try:
-        total = int(total or 0)
-    except (TypeError, ValueError):
-        total = 0
-    if not first:
-        result = {
-            "rows": [], "total": total, "pages_expected": 0,
-            "pages_ok": 0, "failed_pages": [1], "complete": False,
-        }
-        return result if return_meta else []
-    rows = list(first)
-    # Some hosts (e.g. push2delay) cap results below the requested pz.
-    # Use the actual page size to calculate how many pages we really need.
-    actual_pz = max(len(first), 1)
-    effective_pz = min(pz, actual_pz)
-    total_pages = (total + effective_pz - 1) // effective_pz if total else 1
-    if pages:
-        total_pages = min(pages, total_pages)
-    expected_pages = total_pages
-    page_rows = {1: list(first)}
-    failed_pages = []
-    if total_pages > 1:
-        with ThreadPoolExecutor(max_workers=min(16, total_pages - 1)) as ex:
-            futs = {ex.submit(_one_page, pn): pn for pn in range(2, total_pages + 1)}
-            for f in as_completed(futs):
-                page = futs[f]
-                try:
-                    d, _ = f.result()
-                except Exception:
-                    d = []
-                if d:
-                    page_rows[page] = list(d)
-                else:
-                    failed_pages.append(page)
-    rows = []
-    for page in sorted(page_rows):
-        rows.extend(page_rows[page])
-    # For an explicit sample, ``complete`` means all requested pages arrived;
-    # for a full pull, this is the same as every page implied by ``total``.
-    # A zero total with non-empty rows is not trusted as a complete response.
-    complete = bool(total and len(page_rows) == expected_pages and not failed_pages)
-    meta = {
-        "rows": rows,
-        "total": total,
-        "pages_expected": expected_pages,
-        "pages_ok": len(page_rows),
-        "failed_pages": sorted(failed_pages),
-        "complete": complete,
-    }
-    return meta if return_meta else rows
+    return MP.fetch_eastmoney_clist(
+        get_json=_get_json,
+        hosts=CLIST_HOSTS,
+        host_health=_clist_host_health,
+        fields=fields,
+        fid=fid,
+        pages=pages,
+        pz=pz,
+        return_meta=return_meta,
+        ut=UT_FLOW,
+        fs=SNAP_FS,
+        cooldown_base=_CLIST_HOST_COOLDOWN_BASE,
+        max_cooldown=_CLIST_HOST_MAX_COOLDOWN,
+    )
 
 def fetch_market_snapshot(pages=None, allow_disk_fallback=True):
     """全市场快照：价格/涨跌/换手/量比/PE/PB/市值/行业。注意 clist 不支持 f37 等财务扩展字段"""
@@ -1028,26 +789,7 @@ def get_hot_sector_fetch_state():
 
 
 def _realtime_row_from_ulist(raw):
-    """Normalize one Eastmoney ulist row for both primary and fallback paths."""
-    if not isinstance(raw, dict):
-        return None
-    code = str(raw.get("f12") or "")
-    if not code:
-        return None
-    return {
-        "code": code, "name": raw.get("f14"),
-        "price": raw.get("f2"), "pct": raw.get("f3"),
-        "open_price": raw.get("f17"), "high": raw.get("f15"),
-        "low": raw.get("f16"), "prev_close": raw.get("f18"),
-        "volume": raw.get("f5"), "amount": raw.get("f6"),
-        "turnover": raw.get("f8"), "pe": raw.get("f9"), "vol_ratio": raw.get("f10"),
-        "mktcap": raw.get("f20"), "float_cap": raw.get("f21"),
-        "pb": raw.get("f23"), "main_net": raw.get("f62"),
-        "super_net": raw.get("f66"), "big_net": raw.get("f72"),
-        "mid_net": raw.get("f78"), "small_net": raw.get("f84"),
-        "main_pct": raw.get("f184"), "industry": raw.get("f100"),
-        "quote_ts": raw.get("f124"), "quote_at": _quote_at(raw.get("f124")),
-    }
+    return MN.realtime_row_from_ulist(raw, quote_at_fn=_quote_at)
 
 
 def fetch_realtime_for_codes(codes, fields="f2,f3,f5,f6,f8,f9,f10,f12,f14,f15,f16,f17,f18,f20,f21,f23,f62,f66,f72,f78,f84,f184,f100,f124", return_meta=False):
@@ -1176,29 +918,10 @@ def fetch_tencent_realtime_for_codes(codes):
             )
         except Exception:
             text = ""
-        for line in str(text or "").strip().split(";"):
-            if "=" not in line:
-                continue
-            raw_code = line.split("=")[0].replace("v_", "").strip()
-            code = raw_code[-6:]
-            parts = line.split("=", 1)[1].strip().strip('"').split("~")
-            if len(parts) < 33 or not code.isdigit():
-                continue
-            try:
-                price = float(parts[3] or 0)
-                prev_close = float(parts[4] or 0)
-                pct = float(parts[32] or 0)
-            except (TypeError, ValueError):
-                continue
-            # The public Tencent schema has changed field positions before;
-            # locate the 14-digit quote timestamp rather than trusting index 30.
-            quote_at = next((part for part in parts if re.fullmatch(r"\d{14}", str(part or "").strip())), None)
-            if price > 0:
-                rows_by_code[code] = {
-                    "code": code, "name": parts[1], "price": price, "prev_close": prev_close,
-                    "pct": pct, "quote_at": quote_at,
-                    "source": "tencent_public_quote", "attempt": attempt + 1,
-                }
+        for row in MP.parse_tencent_realtime_text(
+            text, attempt=attempt + 1, allowed_codes=pending
+        ):
+            rows_by_code[row["code"]] = row
         pending = [code for code in pending if code not in rows_by_code]
         if pending and attempt < 2:
             if not text:
@@ -1242,43 +965,8 @@ def _fetch_sina_realtime_for_codes(codes):
             if attempt == 0:
                 reset_data_source("新浪独立行情源空响应，自动重试")
                 time.sleep(0.25)
-        for line in text.strip().split(";"):
-            if "=" not in line:
-                continue
-            symbol = line.split("=", 1)[0].strip().split("_")[-1]
-            code = symbol[-6:]
-            if code not in batch:
-                continue
-            values = line.split("=", 1)[1].strip().strip('"').rstrip(";").strip('"').split(",")
-            if len(values) < 10:
-                continue
-            try:
-                price = float(values[3] or 0)
-                prev_close = float(values[2] or 0)
-            except (TypeError, ValueError):
-                continue
-            if price <= 0 or prev_close <= 0:
-                continue
-            quote_date = ""
-            quote_clock = ""
-            # 不同板块在时间字段后追加的字段数量不同（尤其北交所），
-            # 不能固定取倒数第 3/2 列；按日期和时刻格式定位。
-            for idx, value in enumerate(values[:-1]):
-                if re.fullmatch(r"\d{4}-\d{2}-\d{2}", str(value or "").strip()):
-                    if idx + 1 < len(values) and re.fullmatch(r"\d{2}:\d{2}:\d{2}", str(values[idx + 1] or "").strip()):
-                        quote_date = str(value).strip()
-                        quote_clock = str(values[idx + 1]).strip()
-                        break
-            quote_at = f"{quote_date}T{quote_clock}+08:00" if quote_date and quote_clock else None
-            rows_by_code[code] = {
-                "code": code,
-                "name": values[0],
-                "price": price,
-                "prev_close": prev_close,
-                "pct": round((price - prev_close) / prev_close * 100, 4),
-                "quote_at": quote_at,
-                "source": "sina_public_quote",
-            }
+        for row in MP.parse_sina_realtime_text(text, allowed_codes=batch):
+            rows_by_code[row["code"]] = row
     return [rows_by_code[code] for code in codes if code in rows_by_code]
 
 
@@ -1544,21 +1232,11 @@ def _fetch_finance_report(report_date):
 
 # ---------- 5. 历史K线（前复权） ----------
 def _secid(code):
-    code = str(code)
-    # 北交所 920 新代码仍属于东财 market=0；必须在通用的 9 开头沪市判断之前处理。
-    if code.startswith("920"):
-        return f"0.{code}"
-    if code.startswith(("6", "9", "5")):
-        return f"1.{code}"
-    return f"0.{code}"
+    return MN.secid(code)
 
 
 def _quote_at(value):
-    """把东财 f124 Unix 时间转换为中国市场时区的可审计时间。"""
-    if not isinstance(value, (int, float)) or value <= 0:
-        return None
-    china_tz = dt.timezone(dt.timedelta(hours=8))
-    return dt.datetime.fromtimestamp(value, china_tz).isoformat(timespec="seconds")
+    return MN.quote_at(value)
 
 KLINE_HOSTS = ["push2his.eastmoney.com", "92.push2his.eastmoney.com", "33.push2his.eastmoney.com"]
 # The paper trader and the screener intentionally consume one authoritative
@@ -1567,12 +1245,7 @@ KLINE_HOSTS = ["push2his.eastmoney.com", "92.push2his.eastmoney.com", "33.push2h
 SHARED_KLINE_SOURCE_VERSION = "paper-kline-shared-v1"
 
 def _kline_frame(rows):
-    frame = pd.DataFrame(rows)
-    if not frame.empty:
-        frame["date"] = pd.to_datetime(frame["date"])
-        frame = frame.set_index("date")
-        frame = frame[~frame.index.duplicated(keep="last")].sort_index()
-    return frame
+    return MN.kline_frame(rows)
 
 
 def _fetch_kline_tencent(code, beg, end, fqt=1, secid=None):
@@ -1645,28 +1318,7 @@ def _fetch_kline_tencent(code, beg, end, fqt=1, secid=None):
             break
         cursor_end = earliest - datetime.timedelta(days=1)
     raw = [raw_by_date[key] for key in sorted(raw_by_date)]
-    rows = []
-    previous_close = None
-    for item in raw:
-        if len(item) < 6:
-            continue
-        date, open_, close, high, low, volume = item[:6]
-        open_, close, high, low, volume = map(float, (open_, close, high, low, volume))
-        typical = (open_ + close + high + low) / 4
-        amplitude_base = previous_close or close
-        rows.append(
-            {
-                "date": date,
-                "open": open_,
-                "close": close,
-                "high": high,
-                "low": low,
-                "volume": volume,
-                "amount": volume * 100 * typical,
-                "amplitude": (high - low) / amplitude_base * 100 if amplitude_base else None,
-            }
-        )
-        previous_close = close
+    rows = MP.parse_tencent_kline_rows(raw)
     frame = _kline_frame(rows)
     frame.attrs.update({
         "source": "tencent" if (fqt != 1 or used_qfq_rows) else "tencent_raw",
@@ -1691,31 +1343,7 @@ def _fetch_kline_sina(code, beg, end):
         timeout=8,
         retries=0,
     ) or []
-    start = pd.Timestamp(str(beg))
-    finish = pd.Timestamp(str(end))
-    rows = []
-    for item in payload:
-        date = pd.Timestamp(item.get("day"))
-        if date < start or date > finish:
-            continue
-        open_ = float(item["open"])
-        close = float(item["close"])
-        high = float(item["high"])
-        low = float(item["low"])
-        volume = float(item["volume"])
-        typical = (open_ + close + high + low) / 4
-        rows.append(
-            {
-                "date": str(date.date()),
-                "open": open_,
-                "close": close,
-                "high": high,
-                "low": low,
-                "volume": volume,
-                "amount": volume * typical,
-                "amplitude": (high - low) / close * 100 if close else None,
-            }
-        )
+    rows = MP.parse_sina_kline_rows(payload, beg, end)
     frame = _kline_frame(rows)
     frame.attrs.update({"source": "sina", "adjustment": "none"})
     return frame
@@ -1746,15 +1374,7 @@ def _fetch_kline_eastmoney(code, beg, end, klt, fqt, secid):
         if klines:
             break
         time.sleep(0.4)
-    rows = []
-    for k in klines:
-        p = k.split(",")
-        rows.append({
-            "date": p[0], "open": float(p[1]), "close": float(p[2]),
-            "high": float(p[3]), "low": float(p[4]),
-            "volume": float(p[5]), "amount": float(p[6]),
-            "amplitude": float(p[7]) if len(p) > 7 else None,
-        })
+    rows = MP.parse_eastmoney_kline_rows(klines)
     frame = _kline_frame(rows)
     frame.attrs.update({"source": "eastmoney", "adjustment": "qfq" if fqt == 1 else "none"})
     return frame

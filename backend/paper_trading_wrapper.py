@@ -4,7 +4,9 @@
 这个文件保持向后兼容，所有函数仍然可以通过 import paper_trading 访问。
 实际代码已迁移到 paper_trading/ 包中的各模块。
 """
-from paper_trading import *
+from paper_trading import *  # noqa: F403 - compatibility wrapper intentionally re-exports public names
 
-# 确保所有公共接口都可用
-from paper_trading import __all__
+# 旧部署中的 paper_trading.py 没有定义 __all__。包装模块不能因为
+# 导出元数据缺失而让旧调用方导入失败。
+import paper_trading as _paper_trading
+__all__ = getattr(_paper_trading, "__all__", [name for name in dir(_paper_trading) if not name.startswith("_")])

@@ -129,7 +129,7 @@ def run(dry_run=True, alpha_days=DAYS_ALPHA):
                 if rows:
                     with gzip.open(archive_path, "at", encoding="utf-8") as handle:
                         for r in rows:
-                            handle.write(json.dumps(dict(zip(cols, r)), ensure_ascii=False, default=str) + "\n")
+                            handle.write(json.dumps(dict(zip(cols, r, strict=True)), ensure_ascii=False, default=str) + "\n")
                     archived_rows += len(rows)
             except sqlite3.OperationalError:
                 pass

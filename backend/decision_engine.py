@@ -10,47 +10,20 @@
 """
 import os, sys
 
-import pandas as pd
-
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import data_fetcher as dfc
 import factors as F
-
-
-def _safe(v):
-    return v if isinstance(v, (int, float)) and not pd.isna(v) else 0.0
-
-
-def _normalize_news_hits(news_hits, code):
-    """归一化 news_hits：兼容 list[dict]（来自 news_keyword_scan）和 dict 两种格式。
-    返回 {pos:[], neg:[]}"""
-    pos, neg = [], []
-    if not news_hits:
-        return {"pos": pos, "neg": neg}
-    # dict 格式: {code: {pos:[], neg:[]}}
-    if isinstance(news_hits, dict):
-        hit = news_hits.get(code, {})
-        return {"pos": hit.get("pos", []), "neg": hit.get("neg", [])}
-    # list[dict] 格式: [{code, name, tone, keywords, summary, time, source}, ...]
-    for h in news_hits:
-        if h.get("code") != code:
-            continue
-        if h.get("tone", 0) > 0:
-            pos.append(h)
-        elif h.get("tone", 0) < 0:
-            neg.append(h)
-    return {"pos": pos, "neg": neg}
+from decision_context import load_evidence
+from decision_rules import (
+    _dim_status,
+    _normalize_news_hits,
+    _safe,
+    buy_timing_tier,
+    forced_stop_losses,
+    ladder_take_profit,
+)
 
 
 # ---------- 工具：六维健康度 ----------
-def _dim_status(score):
-    if score >= 0.6:
-        return "green"
-    if score >= 0.35:
-        return "yellow"
-    return "red"
-
-
 # ---------- 一、买入执行 ----------
 
 def pre_open_six_dim(code, name=None, kline=None, snap=None, sector_flow=None,
@@ -58,19 +31,16 @@ def pre_open_six_dim(code, name=None, kline=None, snap=None, sector_flow=None,
     """
     开仓前置六维核查，返回每个维度的 status(green/yellow/red)、score(0-1)、reason。
     """
-    name = name or code
-    if snap is None:
-        snap_rows = dfc.fetch_realtime_for_codes([code])
-        snap = snap_rows[0] if snap_rows else {}
-    if kline is None:
-        kline = dfc.load_cached_kline(code)
-    if sector_flow is None:
-        sector_flow = dfc.fetch_sector_flow("industry")
-    if overseas_gate is None:
-        try:
-            overseas_gate = F.overseas_risk_gate()
-        except Exception:
-            overseas_gate = {"light": "unknown"}
+    evidence = load_evidence(
+        code, name=name, kline=kline, snap=snap, sector_flow=sector_flow,
+        overseas_gate=overseas_gate, news_hits=news_hits,
+    )
+    name = evidence.name
+    snap = evidence.snap
+    kline = evidence.kline
+    sector_flow = evidence.sector_flow
+    overseas_gate = evidence.overseas_gate
+    news_hits = evidence.news_hits
 
     pct = _safe(snap.get("pct"))
     limit_pct = F.limit_up_threshold(code) * 100
@@ -194,22 +164,24 @@ def pre_open_six_dim(code, name=None, kline=None, snap=None, sector_flow=None,
     return dims
 
 
-def limit_up_seal_check(code, snap=None, kline=None):
+def limit_up_seal_check(code, snap=None, kline=None, sector_flow=None):
     """
     封单真伪六维鉴别。
     免费数据没有 level2 封单，用涨停日量价 + 资金 + 板块共振做代理。
     返回 status(green/yellow/red)、score、details。
     非涨停股返回 None（不适用）。
     """
-    if snap is None:
-        rows = dfc.fetch_realtime_for_codes([code])
-        snap = rows[0] if rows else {}
+    evidence = load_evidence(
+        code, snap=snap, kline=kline,
+        sector_flow=sector_flow if sector_flow is not None else None,
+        overseas_gate={},
+    )
+    snap = evidence.snap
+    kline = evidence.kline
+    sector_flow = evidence.sector_flow
     pct = _safe(snap.get("pct"))
     if pct < F.limit_up_threshold(code) * 100:
         return None
-    if kline is None:
-        kline = dfc.load_cached_kline(code)
-
     details = []
     score = 0.5
 
@@ -267,7 +239,7 @@ def limit_up_seal_check(code, snap=None, kline=None):
     # 6. 板块共振：所在行业今日涨幅
     ind = snap.get("industry")
     if ind:
-        sf = next((s for s in dfc.fetch_sector_flow("industry") if s.get("name") == ind), None)
+        sf = next((s for s in sector_flow if s.get("name") == ind), None)
         if sf and _safe(sf.get("pct")) > 0:
             score += 0.05; details.append("板块共振上涨")
 
@@ -278,41 +250,29 @@ def limit_up_seal_check(code, snap=None, kline=None):
                         ("谨慎追高" if status == "yellow" else "封单存疑，不建议追"))}
 
 
-def buy_timing_tier(dims, seal=None):
-    """
-    T1-T5 五级时机：
-    T1 积极买入，T2 可执行买入，T3 观察/轻仓，T4 放弃或仅观察，T5 禁止买入。
-    """
-    green = sum(1 for d in dims if d["status"] == "green")
-    red = sum(1 for d in dims if d["status"] == "red")
-    avg_score = sum(d["score"] for d in dims) / len(dims) if dims else 0
-
-    if seal and seal["status"] == "red":
-        return {"tier": "T5", "action": "放弃", "reason": "涨停封单存疑"}
-    if green >= 4 and red == 0 and avg_score >= 0.65:
-        return {"tier": "T1", "action": "积极买入", "reason": "六维 mostly 绿灯，大盘环境友好"}
-    if green >= 3 and red <= 1 and avg_score >= 0.5:
-        return {"tier": "T2", "action": "可执行买入", "reason": "多数维度健康，可开仓"}
-    if red <= 2 and avg_score >= 0.4:
-        return {"tier": "T3", "action": "观察/轻仓", "reason": "信号混杂，建议观察清单跟踪"}
-    if red >= 3:
-        return {"tier": "T4", "action": "放弃", "reason": "多个维度红灯"}
-    return {"tier": "T5", "action": "禁止买入", "reason": "综合评分过低或涨停封单不可信"}
-
-
 def buy_decision(code, name=None, kline=None, snap=None, sector_flow=None,
                  overseas_gate=None, news_hits=None):
     """
     完整买入执行决策：六维核查 + 涨停封单鉴别 + T1-T5 时机 + 观察清单判定。
     """
-    dims = pre_open_six_dim(code, name=name, kline=kline, snap=snap,
-                            sector_flow=sector_flow, overseas_gate=overseas_gate,
-                            news_hits=news_hits)
-    # 调用方已批量取得快照时直接复用，避免每只候选再次请求行情接口。
-    if snap is None:
-        snap_rows = dfc.fetch_realtime_for_codes([code])
-        snap = snap_rows[0] if snap_rows else {}
-    seal = limit_up_seal_check(code, snap=snap, kline=kline)
+    evidence = load_evidence(
+        code, name=name, kline=kline, snap=snap, sector_flow=sector_flow,
+        overseas_gate=overseas_gate, news_hits=news_hits,
+    )
+    # 兼容旧签名，但只在这里集中加载一次证据，避免每只候选重复读取行情。
+    name = evidence.name
+    snap = evidence.snap
+    kline = evidence.kline
+    sector_flow = evidence.sector_flow
+    overseas_gate = evidence.overseas_gate
+    news_hits = evidence.news_hits
+    dims = pre_open_six_dim(
+        code, name=name, kline=kline, snap=snap, sector_flow=sector_flow,
+        overseas_gate=overseas_gate, news_hits=news_hits,
+    )
+    seal = limit_up_seal_check(
+        code, snap=snap, kline=kline, sector_flow=sector_flow,
+    )
     tier = buy_timing_tier(dims, seal=seal)
     hard_vetoes = []
     pct = _safe(snap.get("pct"))
@@ -336,7 +296,7 @@ def buy_decision(code, name=None, kline=None, snap=None, sector_flow=None,
     watchlist = tier["tier"] == "T3"
 
     return {
-        "code": code, "name": name or snap.get("name") or code,
+        "code": code, "name": name,
         "avg_score": avg_score,
         "six_dim": dims,
         "seal_check": seal,
@@ -351,101 +311,23 @@ def buy_decision(code, name=None, kline=None, snap=None, sector_flow=None,
 
 # ---------- 二、卖出决策 ----------
 
-def ladder_take_profit(ret_pct):
-    """
-    8 档阶梯止盈：到达对应浮盈档位建议减仓比例。
-    返回 [(threshold, take_pct, keep_stop)]，keep_stop 为移动止盈位（相对成本 %）。
-    """
-    tiers = [
-        (5, 10, None),     # +5%  减仓 10%
-        (10, 15, 0),       # +10% 减仓 15%，保本
-        (15, 20, 3),       # +15% 减仓 20%，保 3% 利润
-        (20, 25, 5),       # +20% 减仓 25%，保 5% 利润
-        (30, 30, 10),      # +30% 减仓 30%，保 10% 利润
-        (50, 40, 20),      # +50% 减仓 40%，保 20% 利润
-        (80, 50, 40),      # +80% 减仓 50%，保 40% 利润
-        (100, 60, 50),     # +100% 减仓 60%，保 50% 利润
-    ]
-    active = []
-    for thr, take, stop in tiers:
-        if ret_pct >= thr:
-            active.append({"threshold": thr, "take_pct": take,
-                           "protect_profit": stop,
-                           "msg": f"浮盈 ≥{thr}% 已触发，建议减仓 {take}%，移动止盈保 {stop}%" if stop is not None
-                                   else f"浮盈 ≥{thr}% 已触发，建议减仓 {take}%"})
-    # 返回最高一档
-    return active[-1] if active else None
-
-
-def forced_stop_losses(price, cost, peak_price, hold_days, mom20, main_pct,
-                       news_neg=None, overseas_light=None):
-    """
-    4 类强制止损：价格、回撤、时间、因子/黑天鹅。
-    返回所有触发的信号列表。
-    """
-    signals = []
-    ret_pct = (price / cost - 1) * 100 if (price and cost) else None
-    dd = (1 - price / peak_price) * 100 if (price and peak_price) else None
-
-    # 1. 价格止损
-    if ret_pct is not None and ret_pct <= -8:
-        signals.append({"type": "价格止损", "level": "sell",
-                        "msg": f"较成本下跌 {abs(ret_pct):.1f}% ≥ 8%"})
-
-    # 2. 回撤止损
-    if dd is not None and dd >= 10:
-        signals.append({"type": "回撤止损", "level": "sell",
-                        "msg": f"自峰值回撤 {dd:.1f}% ≥ 10%"})
-
-    # 3. 时间止损
-    if hold_days is not None and hold_days > 20 and (ret_pct is None or ret_pct < 5):
-        signals.append({"type": "时间止损", "level": "warn",
-                        "msg": f"持有 {hold_days} 个交易日，收益不足 5%，机会成本过高"})
-
-    # 4. 因子/黑天鹅止损
-    deterioration = []
-    if mom20 is not None and mom20 < 0:
-        deterioration.append(f"20日动量转负({mom20:.1f}%)")
-    if isinstance(main_pct, (int, float)) and main_pct < -5:
-        deterioration.append(f"主力净流出占比 {main_pct:.1f}%")
-    if news_neg:
-        deterioration.append(f"负面舆情 {len(news_neg)} 条")
-    # 单一技术信号不再强制卖出：负面舆情，或动量+资金同时恶化才升级为卖出。
-    if news_neg or (
-        mom20 is not None
-        and mom20 < 0
-        and isinstance(main_pct, (int, float))
-        and main_pct < -5
-    ):
-        signals.append({"type": "因子/黑天鹅止损", "level": "sell",
-                        "msg": "；".join(deterioration)})
-    elif deterioration:
-        signals.append({"type": "因子恶化", "level": "warn",
-                        "msg": "；".join(deterioration)})
-    if overseas_light == "red":
-        signals.append({"type": "海外风险", "level": "warn",
-                        "msg": "海外风险红灯，建议降低组合仓位而非单票无条件卖出"})
-
-    return signals
-
-
 def next_day_auction_matrix(code, name=None, kline=None, snap=None,
-                            overseas_gate=None, news_hits=None):
+                            overseas_gate=None, news_hits=None, sector_flow=None):
     """
     次日竞价 Q1-Q5 决策矩阵。
     综合隔夜海外、板块、个股舆情、技术动量给出开盘动作建议。
     Q1 偏强持有/加仓；Q5 偏强减仓/竞价出。
     """
-    if snap is None:
-        rows = dfc.fetch_realtime_for_codes([code])
-        snap = rows[0] if rows else {}
-    if kline is None:
-        kline = dfc.load_cached_kline(code)
-    if overseas_gate is None:
-        try:
-            overseas_gate = F.overseas_risk_gate()
-        except Exception:
-            overseas_gate = {"light": "unknown"}
+    evidence = load_evidence(
+        code, name=name, kline=kline, snap=snap, sector_flow=sector_flow,
+        overseas_gate=overseas_gate, news_hits=news_hits,
+    )
+    name = evidence.name
+    snap = evidence.snap
+    kline = evidence.kline
+    sector_flow = evidence.sector_flow
+    overseas_gate = evidence.overseas_gate
+    news_hits = evidence.news_hits
 
     score = 0.5
     reasons = []
@@ -461,7 +343,7 @@ def next_day_auction_matrix(code, name=None, kline=None, snap=None,
 
     # 板块资金
     ind = snap.get("industry")
-    sf = next((s for s in dfc.fetch_sector_flow("industry") if s.get("name") == ind), None)
+    sf = next((s for s in sector_flow if s.get("name") == ind), None)
     if sf:
         s_pct = _safe(sf.get("pct"))
         s_main = _safe(sf.get("main_pct"))
@@ -517,12 +399,15 @@ def sell_decision(position_state, kline=None, snap=None,
     position_state 来自 tracker 的持仓记录。
     """
     code = position_state["code"]
-    name = position_state.get("name", code)
-    if snap is None:
-        rows = dfc.fetch_realtime_for_codes([code])
-        snap = rows[0] if rows else {}
-    if kline is None:
-        kline = dfc.load_cached_kline(code)
+    evidence = load_evidence(
+        code, name=position_state.get("name"), kline=kline, snap=snap,
+        overseas_gate=overseas_gate, news_hits=news_hits,
+    )
+    name = evidence.name
+    snap = evidence.snap
+    kline = evidence.kline
+    overseas_gate = evidence.overseas_gate
+    news_hits = evidence.news_hits
 
     price = snap.get("price")
     cost = position_state.get("cost")
@@ -540,7 +425,8 @@ def sell_decision(position_state, kline=None, snap=None,
     stops = forced_stop_losses(price, cost, peak, hold_days, mom20, main_pct,
                                news_neg=neg, overseas_light=(overseas_gate or {}).get("light"))
     auction = next_day_auction_matrix(code, name=name, kline=kline, snap=snap,
-                                      overseas_gate=overseas_gate, news_hits=news_hits)
+                                      overseas_gate=overseas_gate, news_hits=news_hits,
+                                      sector_flow=evidence.sector_flow)
 
     sell_signals = [s for s in stops if s["level"] == "sell"]
     action = ("卖出" if sell_signals else
