@@ -110,7 +110,7 @@ LOT_SIZE = 100
 # "尘埃仓"。阈值按周期声明本金、共享池硬敞口和股票持仓上限动态计算，
 # 不再固定为 10,000 元；仅约束预算侧小单，风险约束导致的低价股整手规模
 # 仍按原有风险门禁处理。
-MIN_ORDER_SLOT_UTILIZATION = 0.90
+MIN_ORDER_SLOT_UTILIZATION = 0.60
 MIN_ORDER_ROUNDING = 100.0
 # The five strategies make independent decisions but draw from one capital
 # pool.  Their historical profile exposure values are kept as sizing hints;
@@ -801,21 +801,26 @@ def _active_account_clause(column="id"):
     return f"{column} IN ({placeholders})", ACTIVE_ACCOUNT_IDS
 
 
-def _dynamic_minimum_order_amount(cycle, nav=None):
+def _dynamic_minimum_order_amount(cycle, nav=None, position_limit=None):
     """Return the current-cycle dust-order threshold and its audit inputs.
 
-    One slot should carry most of its fair share of the usable shared pool,
-    but reserving 10% headroom prevents fees, slippage and reconciliation
-    drift from making the threshold itself consume the whole budget.
+    One slot should carry a meaningful part of its fair share of the usable
+    shared pool, while reserving 40% headroom lets risk controls decide
+    whether a confirmed position deserves an additional tranche.
     """
     configured_slots = sum(
         max(1, int(ACCOUNT_SPECS.get(account_id, {}).get("max_positions", 1)))
         for account_id in ACTIVE_ACCOUNT_IDS
     )
-    position_limit = min(
-        SHARED_POOL_MAX_POSITIONS,
-        configured_slots or SHARED_POOL_MAX_POSITIONS,
-    )
+    if position_limit is None:
+        position_limit = min(
+            SHARED_POOL_MAX_POSITIONS,
+            configured_slots or SHARED_POOL_MAX_POSITIONS,
+        )
+        position_limit_source = "configured_active_account_limits"
+    else:
+        position_limit = max(0, int(position_limit))
+        position_limit_source = "effective_dynamic_pool_limit"
     cycle_data = cycle or {}
     cycle_capital = _num(cycle_data.get("capital"), _num(nav, 0.0))
     amount = PSZ.dynamic_minimum_order_amount(
@@ -831,9 +836,10 @@ def _dynamic_minimum_order_amount(cycle, nav=None):
         "pool_exposure_cap_pct": round(SHARED_POOL_MAX_EXPOSURE * 100, 2),
         "position_limit": position_limit,
         "configured_position_limit": configured_slots,
+        "position_limit_source": position_limit_source,
         "slot_utilization_pct": round(MIN_ORDER_SLOT_UTILIZATION * 100, 1),
         "rounding": MIN_ORDER_ROUNDING,
-        "formula": "floor_to_100(cycle_capital × pool_exposure_cap / position_limit × 90%)",
+        "formula": "floor_to_100(cycle_capital × pool_exposure_cap / position_limit × 60%)",
     }
 
 
@@ -7937,10 +7943,6 @@ def _buy_order(conn, account, signal, quote, market, news, asof_day, *, all_quot
         all_quotes = dict(all_quotes)
     positions, position_value, nav, industries, code_values = _shared_account_exposure(conn, all_quotes, asof_day)
     shared_cash = _shared_cash(conn)
-    minimum_order_amount, minimum_order_detail = _dynamic_minimum_order_amount(
-        current_cycle, nav=nav,
-    )
-    risk["minimum_order_amount"] = minimum_order_detail
     open_codes = {
         item["code"] for item in positions
         if item.get("account_id") == account["id"] and int(_num(item.get("qty"))) >= LOT_SIZE
@@ -7981,6 +7983,10 @@ def _buy_order(conn, account, signal, quote, market, news, asof_day, *, all_quot
                 f"入场时机：{timing_info.get('reason') or timing_info.get('state')}")
             reasons.extend(timing_block_reasons)
     count_budget = _dynamic_position_limits(conn)
+    minimum_order_amount, minimum_order_detail = _dynamic_minimum_order_amount(
+        current_cycle, nav=nav, position_limit=count_budget.get("pool_limit"),
+    )
+    risk["minimum_order_amount"] = minimum_order_detail
     position_limit = max(1, int(count_budget["limits"].get(account["id"], spec["max_positions"])))
     pool_open_positions = {
         (str(item.get("account_id")), str(item.get("code"))) for item in positions
@@ -8228,7 +8234,7 @@ def _buy_order(conn, account, signal, quote, market, news, asof_day, *, all_quot
             )
             soft_amount_reasons.append(reasons[-1])
     # 2026-09-03 修复：尘埃单此前仅用于"已拦截订单"的分类，金额低于
-    # 静态阈值且其余闸门全过时 allowed=True 照样成交。现按当前周期单席
+    # 动态阈值且其余闸门全过时 allowed=True 照样成交。现按当前周期单席
     # 可表达金额作为软性拦截：候选转入 deferred 队列，预算释放后按全尺寸
     # 复核，不再用小仓占用稀缺席位。
     if qty >= LOT_SIZE and amount < minimum_order_amount and not reasons:
