@@ -6,6 +6,16 @@ import datetime as dt
 
 
 TODAY_PNL_QUOTE_SOURCES = frozenset({"live", "dashboard_cache", "live_snapshot"})
+MARKET_TZ = dt.timezone(dt.timedelta(hours=8))
+
+
+def _market_now():
+    """Return the current time in the A-share market timezone."""
+    return dt.datetime.now(MARKET_TZ)
+
+
+def _market_today():
+    return _market_now().date()
 
 
 def quote_is_usable(quote, asof_day, *, date_fn):
@@ -19,9 +29,9 @@ def quote_is_usable(quote, asof_day, *, date_fn):
         parsed = dt.datetime.fromisoformat(quote_at.replace("Z", "+00:00"))
         if parsed.tzinfo is None:
             parsed = parsed.replace(tzinfo=dt.timezone(dt.timedelta(hours=8)))
-        if date_fn(asof_day) != dt.date.today():
+        if date_fn(asof_day) != _market_today():
             return True
-        age_seconds = (dt.datetime.now(dt.timezone.utc) - parsed.astimezone(dt.timezone.utc)).total_seconds()
+        age_seconds = (_market_now() - parsed.astimezone(MARKET_TZ)).total_seconds()
         return -120 <= age_seconds <= 20 * 60
     except (TypeError, ValueError, OverflowError):
         return False
@@ -30,7 +40,7 @@ def quote_is_usable(quote, asof_day, *, date_fn):
 def position_performance(position, price, quote, asof_day=None, *, date_fn, market_session, num):
     """按当日买入成本与隔夜昨收分别计算持仓今日盈亏。"""
     day = date_fn(asof_day).isoformat()
-    if day == dt.date.today().isoformat() and not market_session()["today_pnl_available"]:
+    if day == _market_today().isoformat() and not market_session()["today_pnl_available"]:
         return None, None, None
     if not quote_is_usable(quote, asof_day, date_fn=date_fn):
         return None, None, None
