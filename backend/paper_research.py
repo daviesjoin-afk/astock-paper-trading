@@ -14,8 +14,6 @@ import json
 import os
 import sqlite3
 from collections import defaultdict
-
-import data_fetcher as dfc
 from strategy_registry import labels as strategy_labels
 
 

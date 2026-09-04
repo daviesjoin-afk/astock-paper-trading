@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import datetime as dt
-import json
 import math
 import os
 import sqlite3
@@ -11,7 +10,7 @@ import statistics
 
 import strategies as S
 from strategy_registry import labels as strategy_labels
-from adaptive_common import _loads, _json, _clamp  # C3: 收敛重复工具函数
+from adaptive_common import _loads, _json  # C3: 收敛重复工具函数
 
 ACCOUNT_NAMES = strategy_labels()
 ACCOUNT_MODELS = {
@@ -499,7 +498,6 @@ def apply_candidate(conn, paper_db_path, candidate_id, now_fn, approved_by="boun
     if item["status"] not in {"eligible_auto_adjust", "eligible_manual_review", "eligible_structural_review"}:
         raise ValueError("选股候选尚未通过进化门槛")
     candidate_preview = _loads(item.get("candidate_params"), {})
-    baseline = _loads(item.get("baseline_params"), {})
     is_structural = candidate_preview.get("mutation_type") not in {None, "none"}
     if approved in _AUTO_APPROVERS:
         if is_structural:
@@ -864,7 +862,7 @@ def overview(conn, config, paper_db_path):
             paper.close()
     return {
         "mode": "模拟盘选股自动进化",
-        "policy": "三套模拟账户可进化因子权重、入场阈值和白名单选股条件；板块热度不足时可提出个股强势路径，趋势模型可提出从抄底切换为趋势延续；结构变更先影子验证并人工确认，公共选股页面不受影响。",
+        "policy": "两套当前模拟账户可进化因子权重、入场阈值和白名单选股条件；板块热度不足时可提出个股强势路径，趋势模型可提出从抄底切换为趋势延续；结构变更先影子验证并人工确认，公共选股页面不受影响。",
         "auto_apply_bounded": bool(config.get("selection_auto_apply_bounded", False)),
         "requirements": _requirements(config, "shadow"),
         "tiers": {
