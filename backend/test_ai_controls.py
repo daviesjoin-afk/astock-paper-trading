@@ -144,6 +144,7 @@ class PointInTimeTests(unittest.TestCase):
     def test_same_day_news_after_fill_is_excluded(self):
         import sqlite3
         conn = sqlite3.connect(":memory:")
+        self.addCleanup(conn.close)
         conn.row_factory = sqlite3.Row
         conn.execute("""CREATE TABLE news_events(
             code TEXT,name TEXT,title TEXT,source_name TEXT,source_type TEXT,
