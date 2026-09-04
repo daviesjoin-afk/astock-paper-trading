@@ -784,6 +784,59 @@ ACCOUNT_SPECS = {
     },
 }
 
+# The registry is the single source of truth for what a new public cycle may
+# run.  Legacy specs stay in ACCOUNT_SPECS so archived ledgers and replay
+# tools can decode old rows, but they must never receive fresh cycle capital,
+# signals, or runner time.
+ACTIVE_ACCOUNT_IDS = tuple(
+    account_id for account_id in SR.active_ids() if account_id in ACCOUNT_SPECS
+)
+ACTIVE_ACCOUNT_SPECS = {account_id: ACCOUNT_SPECS[account_id] for account_id in ACTIVE_ACCOUNT_IDS}
+
+
+def _active_account_clause(column="id"):
+    """Return a SQL predicate and parameters for current-cycle accounts."""
+    if not ACTIVE_ACCOUNT_IDS:
+        return "1=0", ()
+    placeholders = ",".join("?" for _ in ACTIVE_ACCOUNT_IDS)
+    return f"{column} IN ({placeholders})", ACTIVE_ACCOUNT_IDS
+
+
+def _active_account_rows(conn, status=None):
+    """Read only accounts allowed to participate in the current cycle."""
+    clause, params = _active_account_clause()
+    sql = f"SELECT * FROM paper_accounts WHERE {clause}"
+    if status is not None:
+        sql += " AND status=?"
+        params = (*params, status)
+    sql += " ORDER BY id"
+    rows = _rows(conn, sql, params)
+    order = {account_id: index for index, account_id in enumerate(ACTIVE_ACCOUNT_IDS)}
+    rows.sort(key=lambda row: order.get(row.get("id"), len(order)))
+    return rows
+
+
+def _active_account_ids(conn, status=None):
+    return [row["id"] for row in _active_account_rows(conn, status=status)]
+
+
+def _active_cycle_filter(conn, cycle_id, column="id"):
+    """Scope a cycle to all active sleeves once the active set is complete.
+
+    Small in-memory/unit-test ledgers and pre-migration databases can contain
+    only one newly introduced sleeve plus legacy IDs.  In that transitional
+    shape, falling back to the cycle's own rows preserves cash reconciliation;
+    a normal repository cycle has both active IDs and uses the strict filter.
+    """
+    active_clause, active_ids = _active_account_clause(column)
+    count = conn.execute(
+        f"SELECT COUNT(*) FROM paper_accounts WHERE cycle_id=? AND {active_clause}",
+        (cycle_id, *active_ids),
+    ).fetchone()[0]
+    if count >= len(ACTIVE_ACCOUNT_IDS):
+        return active_clause, active_ids
+    return "1=1", ()
+
 
 def strategy_center():
     """模拟盘策略说明的单一事实来源；纯只读，不影响账户或交易。"""
@@ -816,7 +869,7 @@ def strategy_center():
     }
     total_profile_exposure = sum(
         _num(RISK_PROFILES[item["risk_profile"]].get("max_exposure"), 0.0)
-        for item in ACCOUNT_SPECS.values()
+        for item in ACTIVE_ACCOUNT_SPECS.values()
     ) or 1.0
     rows = []
     for account_id, spec in ACCOUNT_SPECS.items():
@@ -861,9 +914,9 @@ def strategy_center():
         "shared_guards": [
             "仅使用独立模拟资金与规则化成交假设，不连接券商或真实账户。",
             "可买范围仅限沪深主板与创业板；ST/退市风险、科创板和北交所一律禁止新买，科创板行情只作同产业映射加分。",
-            f"四套策略共用一个总资金池，持仓与待成交买单合计不得超过总净值的 {SHARED_POOL_MAX_EXPOSURE * 100:.0f}%；这是硬上限，任何特级机会都不能突破。",
+            f"{len(ACTIVE_ACCOUNT_IDS)}套当前策略共用一个总资金池，持仓与待成交买单合计不得超过总净值的 {SHARED_POOL_MAX_EXPOSURE * 100:.0f}%；这是硬上限，任何特级机会都不能突破。",
             "策略额度按风险画像分配目标和保护底线；某策略未用额度只会在其他策略底线满足后转入，不再各自重复计算总池上限。",
-            f"股票持仓按策略席位计数：四策略共享总硬上限 {SHARED_POOL_MAX_POSITIONS} 个；满席时高分候选进入替补池，只有明显优于弱持仓才允许先卖后买。",
+            f"股票持仓按策略席位计数：{len(ACTIVE_ACCOUNT_IDS)}套当前策略共享总硬上限 {SHARED_POOL_MAX_POSITIONS} 个；满席时高分候选进入替补池，只有明显优于弱持仓才允许先卖后买。",
             "换仓必须通过实时双源行情、新闻、T+1与质量分复核；每策略每日最多一次主动择强换股，硬止损不受此限制。",
             "待成交买单会预占现金和总池额度；成交后核销，撤单、过期或风控拒绝后释放。",
             "自动开仓须使用当日实时行情，并通过东方财富与腾讯行情交叉核验。",
@@ -2094,12 +2147,12 @@ def _ensure_accounts(conn):
         "SELECT id,status,capital FROM paper_cycles WHERE status IN ('draft','running','paused') ORDER BY id DESC LIMIT 1"
     ).fetchone()
     configured_share = (
-        _num(active_cycle["capital"], 0.0) / max(len(ACCOUNT_SPECS), 1)
+        _num(active_cycle["capital"], 0.0) / max(len(ACTIVE_ACCOUNT_IDS), 1)
         if active_cycle and _num(active_cycle["capital"], 0.0) > 0
         else 20000.0
     )
     configured_status = active_cycle["status"] if active_cycle else "paused"
-    for account_id, spec in ACCOUNT_SPECS.items():
+    for account_id, spec in ACTIVE_ACCOUNT_SPECS.items():
         exists = conn.execute("SELECT 1 FROM paper_accounts WHERE id=?", (account_id,)).fetchone()
         new_run = not bool(exists)
         if exists:
@@ -2142,7 +2195,12 @@ def _reconcile_shared_cash(conn, cycle_id):
     difference proportionally to the strategy ledgers so the pool NAV cannot
     be understated.  The correction is idempotent and is audited.
     """
-    accounts = _rows(conn, "SELECT id,initial_cash,cash FROM paper_accounts WHERE cycle_id=? ORDER BY id", (cycle_id,))
+    active_clause, active_ids = _active_cycle_filter(conn, cycle_id, "id")
+    accounts = _rows(
+        conn,
+        f"SELECT id,initial_cash,cash FROM paper_accounts WHERE cycle_id=? AND {active_clause} ORDER BY id",
+        (cycle_id, *active_ids),
+    )
     if not accounts:
         return 0.0
     cycle = conn.execute("SELECT capital FROM paper_cycles WHERE id=?", (cycle_id,)).fetchone()
@@ -2152,11 +2210,13 @@ def _reconcile_shared_cash(conn, cycle_id):
     # money into the shared pool.
     initial_total = max(0.0, _num(cycle["capital"] if cycle else 0.0))
     ledger_net = conn.execute(
-        """SELECT COALESCE(SUM(CASE WHEN side='sell' THEN amount-fees
+        f"""SELECT COALESCE(SUM(CASE WHEN side='sell' THEN amount-fees
                                       WHEN side='buy' THEN -(amount+fees)
                                       ELSE 0 END),0)
-             FROM paper_fills WHERE account_id IN (SELECT id FROM paper_accounts WHERE cycle_id=?)""",
-        (cycle_id,),
+             FROM paper_fills WHERE account_id IN (
+                 SELECT id FROM paper_accounts WHERE cycle_id=? AND {active_clause}
+             )""",
+        (cycle_id, *active_ids),
     ).fetchone()[0]
     expected = initial_total + _num(ledger_net)
     actual = sum(_num(row.get("cash")) for row in accounts)
@@ -2188,12 +2248,13 @@ def _reconcile_shared_cash(conn, cycle_id):
 
 def _available_cycle_ledger_capital(conn, cycle, account_id):
     """Return unallocated economic capital without enlarging the cycle."""
+    active_clause, active_ids = _active_cycle_filter(conn, cycle["id"], "id")
     allocated = conn.execute(
-        "SELECT COALESCE(SUM(initial_cash),0) s,COUNT(*) n FROM paper_accounts WHERE cycle_id=? AND id<>?",
-        (cycle["id"], account_id),
+        f"SELECT COALESCE(SUM(initial_cash),0) s,COUNT(*) n FROM paper_accounts WHERE cycle_id=? AND id<>? AND {active_clause}",
+        (cycle["id"], account_id, *active_ids),
     ).fetchone()
     if int(allocated["n"] or 0) <= 0:
-        return _num(cycle["capital"], 0.0) / max(len(ACCOUNT_SPECS), 1)
+        return _num(cycle["capital"], 0.0) / max(len(ACTIVE_ACCOUNT_IDS), 1)
     existing_initial = _num(allocated["s"])
     return max(0.0, _num(cycle["capital"], 0.0) - existing_initial)
 
@@ -2208,21 +2269,23 @@ def _late_join_reference_capital(conn, cycle, account_id):
     funded sleeves hold 75k each while the late joiner would be measured on
     60k, inflating its percentage return for the same P&L.
     """
+    active_clause, active_ids = _active_cycle_filter(conn, cycle["id"], "id")
     funded = conn.execute(
-        """SELECT COALESCE(SUM(initial_cash),0) s, COUNT(*) n
-             FROM paper_accounts WHERE cycle_id=? AND id<>? AND initial_cash>0""",
-        (cycle["id"], account_id),
+        f"""SELECT COALESCE(SUM(initial_cash),0) s, COUNT(*) n
+             FROM paper_accounts WHERE cycle_id=? AND id<>? AND initial_cash>0 AND {active_clause}""",
+        (cycle["id"], account_id, *active_ids),
     ).fetchone()
     if int(funded["n"] or 0) > 0 and _num(funded["s"]) > 0:
         return round(_num(funded["s"]) / int(funded["n"]), 2)
-    return round(_num(cycle["capital"], 0.0) / max(len(ACCOUNT_SPECS), 1), 2)
+    return round(_num(cycle["capital"], 0.0) / max(len(ACTIVE_ACCOUNT_IDS), 1), 2)
 
 
 def _ensure_cycle(conn):
     """给旧版账户补一个可归档周期；不删除任何已有记录。"""
     active = conn.execute("SELECT * FROM paper_cycles WHERE status IN ('draft','running','paused') ORDER BY id DESC LIMIT 1").fetchone()
     if active is None:
-        account = conn.execute("SELECT * FROM paper_accounts ORDER BY id LIMIT 1").fetchone()
+        first_active = ACTIVE_ACCOUNT_IDS[0] if ACTIVE_ACCOUNT_IDS else ""
+        account = conn.execute("SELECT * FROM paper_accounts WHERE id=?", (first_active,)).fetchone()
         capital = _num(account["initial_cash"], 100000.0) if account else 100000.0
         now = _now()
         key = "legacy-" + now.replace("-", "").replace(":", "").replace(" ", "-")
@@ -2234,15 +2297,16 @@ def _ensure_cycle(conn):
     # Only a synthetic legacy cycle may infer its declared capital from old
     # account ledgers.  A normal shared-pool cycle keeps paper_cycles.capital
     # authoritative; otherwise adding a strategy can silently enlarge it.
+    active_clause, active_ids = _active_cycle_filter(conn, active["id"], "id")
     account_total = conn.execute(
-        "SELECT COALESCE(SUM(initial_cash),0) FROM paper_accounts WHERE cycle_id=?",
-        (active["id"],),
+        f"SELECT COALESCE(SUM(initial_cash),0) FROM paper_accounts WHERE cycle_id=? AND {active_clause}",
+        (active["id"], *active_ids),
     ).fetchone()[0]
     if str(active["cycle_key"] or "").startswith("legacy-") and _num(account_total) > _num(active["capital"]):
         conn.execute("UPDATE paper_cycles SET capital=?,updated_at=? WHERE id=?",
                      (_num(account_total), _now(), active["id"]))
         active = conn.execute("SELECT * FROM paper_cycles WHERE id=?", (active["id"],)).fetchone()
-    for account_id, spec in ACCOUNT_SPECS.items():
+    for account_id, spec in ACTIVE_ACCOUNT_SPECS.items():
         current = conn.execute("SELECT * FROM paper_accounts WHERE id=?", (account_id,)).fetchone()
         if current is None:
             continue
@@ -2383,7 +2447,12 @@ def _shared_account_rows(conn, cycle_id=None):
     if cycle_id is None:
         cycle = _active_cycle(conn)
         cycle_id = cycle["id"]
-    return _rows(conn, "SELECT * FROM paper_accounts WHERE cycle_id=? ORDER BY id", (cycle_id,))
+    active_clause, active_ids = _active_cycle_filter(conn, cycle_id, "id")
+    return _rows(
+        conn,
+        f"SELECT * FROM paper_accounts WHERE cycle_id=? AND {active_clause} ORDER BY id",
+        (cycle_id, *active_ids),
+    )
 
 
 def _shared_initial_cash(conn, cycle=None):
@@ -2428,10 +2497,10 @@ def _economic_pool_nav_history(conn, cycle=None):
     references = {row["id"]: _account_reference_capital(row) for row in accounts}
     rows = _rows(
         conn,
-        """SELECT account_id,nav_date,nav FROM paper_nav
-             WHERE account_id IN (SELECT id FROM paper_accounts WHERE cycle_id=?)
+        f"""SELECT account_id,nav_date,nav FROM paper_nav
+             WHERE account_id IN (SELECT id FROM paper_accounts WHERE cycle_id=? AND {_active_cycle_filter(conn, cycle['id'], 'id')[0]})
              ORDER BY nav_date,account_id""",
-        (cycle["id"],),
+        (cycle["id"], *_active_cycle_filter(conn, cycle["id"], "id")[1]),
     )
     dates = sorted({str(row.get("nav_date")) for row in rows if row.get("nav_date")})
     by_account = {}
@@ -6870,7 +6939,7 @@ def generate_signals(asof_date=None):
         reason = factor_refresh.get("reason") or factor_refresh.get("error") or "完整日线因子未就绪"
         summary.update({"status": "blocked", "reason": reason})
         with _db() as conn:
-            accounts = _rows(conn, "SELECT * FROM paper_accounts WHERE status='running'")
+            accounts = _active_account_rows(conn, status="running")
             for account in accounts:
                 detail = f"{reason}；{_json(factor_refresh.get('refresh_gate') or {})}"
                 _audit(conn, account["id"], "close_signal_blocked_history", detail)
@@ -6886,7 +6955,7 @@ def generate_signals(asof_date=None):
         )
         summary.update({"status": "blocked", "reason": reason})
         with _db() as conn:
-            for account in _rows(conn, "SELECT * FROM paper_accounts WHERE status='running'"):
+            for account in _active_account_rows(conn, status="running"):
                 _audit(conn, account["id"], "close_signal_blocked_market", reason)
                 summary["accounts"].append({
                     "id": account["id"], "created": 0, "blocked": True,
@@ -6914,7 +6983,7 @@ def generate_signals(asof_date=None):
     # _quotes/_news_for made network calls; a slow source could block fills,
     # risk exits and the API for minutes.
     with _db_readonly() as read_conn:
-        accounts = _rows(read_conn, "SELECT * FROM paper_accounts WHERE status='running'")
+        accounts = _active_account_rows(read_conn, status="running")
     candidate_batches = []
     all_names = {}
     all_codes = set()
@@ -7069,7 +7138,7 @@ def backfill_research_shadow(asof_date=None):
         "accounts": [],
     }
     with _db() as conn:
-        accounts = _rows(conn, "SELECT * FROM paper_accounts WHERE status='running'")
+        accounts = _active_account_rows(conn, status="running")
         for account in accounts:
             candidates, meta = _candidate_rows(
                 account, day, market, sector_rows=sector_rows, live_universe=close_universe,
@@ -9308,7 +9377,7 @@ def execute_open(asof_date=None):
     prefetch_news = _news_for(prefetch_names) if prefetch_codes else []
     prefetch_quotes = _quotes(prefetch_codes, asof_date=day) if prefetch_codes else {}
     with _db(immediate=True) as conn:
-        accounts = _rows(conn, "SELECT * FROM paper_accounts WHERE status='running'")
+        accounts = _active_account_rows(conn, status="running")
         # Limited slots must be won by the strongest live candidate, not by
         # whichever signal happened to be inserted first.
         pending = _rows(
@@ -10775,7 +10844,7 @@ def _monitor_risk_impl(asof_date=None):
         }))
     manual_orders = []
     with _db() as snapshot_conn:
-        running_ids = {row["id"] for row in _rows(snapshot_conn, "SELECT id FROM paper_accounts WHERE status='running'")}
+        running_ids = set(_active_account_ids(snapshot_conn, status="running"))
         positions = [p for p in _position_rows(snapshot_conn, asof_day=day) if p["account_id"] in running_ids]
         market_context = _cached_close_market(snapshot_conn, day, allow_network=False)
         retry_placeholders = ",".join("?" for _ in ENTRY_RETRY_SIGNAL_STATUSES)
@@ -10810,13 +10879,11 @@ def _monitor_risk_impl(asof_date=None):
             _audit(conn, None, "risk_scan_state", _json({"scan_minute": scan_minute, "status": "completed", "finished_at": _now()}))
         return result
     with _db(immediate=True) as conn:
-        running_ids = {row["id"] for row in _rows(conn, "SELECT id FROM paper_accounts WHERE status='running'")}
+        running_ids = set(_active_account_ids(conn, status="running"))
         positions = [p for p in _position_rows(conn, asof_day=day) if p["account_id"] in running_ids]
         cycle = _active_cycle(conn)
         account_map = {
-            row["id"]: row for row in _rows(
-                conn, "SELECT * FROM paper_accounts WHERE status='running'"
-            )
+            row["id"]: row for row in _active_account_rows(conn, status="running")
         }
         _, pool_market_value, pool_nav, _, _ = _shared_account_exposure(conn, quote_map, day)
         held_by_account = {}
@@ -11585,7 +11652,7 @@ def _bootstrap_signals_for_today(asof_day, live_universe=None, source_slot="intr
     # before opening the write transaction. A slow public tick endpoint must
     # never hold the SQLite writer or delay risk exits/API reads.
     with _db() as account_conn:
-        accounts = _rows(account_conn, "SELECT * FROM paper_accounts WHERE status='running'")
+        accounts = _active_account_rows(account_conn, status="running")
     precomputed_candidates = {}
     micro_codes = []
     for account in accounts:
@@ -12051,7 +12118,7 @@ def run_auction_preselection(asof_date=None, force=False):
     })
     with _db() as conn:
         cycle = _active_cycle(conn)
-        for account in _rows(conn, "SELECT id FROM paper_accounts WHERE status='running'"):
+        for account in _active_account_rows(conn, status="running"):
             _observe_intraday(
                 conn, cycle["id"], account["id"], None, None, "auction_preselect",
                 f"09:25 集合竞价预选完成：有效 {len(current_rows)} 只",
@@ -12596,7 +12663,7 @@ def monitor_opening_events(asof_date=None, event_clock=None):
                 "reason": "不在开盘事件窗口"}
     with _db() as snapshot_conn:
         cycle = _active_cycle(snapshot_conn)
-        accounts = _rows(snapshot_conn, "SELECT * FROM paper_accounts WHERE status='running'")
+        accounts = _active_account_rows(snapshot_conn, status="running")
         positions = [p for account in accounts for p in _position_rows(snapshot_conn, account["id"], day)]
     if not positions:
         return {"status": "completed", "slot": "opening_event", "date": day.isoformat(),
@@ -12608,7 +12675,7 @@ def monitor_opening_events(asof_date=None, event_clock=None):
         # Re-read mutable account/position state after network evidence is
         # ready; a concurrent pause/reset can only reduce the work performed.
         cycle = _active_cycle(conn)
-        accounts = _rows(conn, "SELECT * FROM paper_accounts WHERE status='running'")
+        accounts = _active_account_rows(conn, status="running")
         positions = [p for account in accounts for p in _position_rows(conn, account["id"], day)]
         if not positions:
             return {"status": "completed", "slot": "opening_event", "date": day.isoformat(),
@@ -12756,9 +12823,7 @@ def monitor_fast_entries(asof_datetime=None, force=False):
         retry_placeholders = ",".join("?" for _ in ENTRY_RETRY_SIGNAL_STATUSES)
         with _db() as snapshot_conn:
             accounts = {
-                row["id"]: row for row in _rows(
-                    snapshot_conn, "SELECT * FROM paper_accounts WHERE status='running'"
-                )
+                row["id"]: row for row in _active_account_rows(snapshot_conn, status="running")
             }
             # 快速通道覆盖两类候选：
             # 1) 所有策略被"入场时机"拦下的信号（原有逻辑）；
@@ -13018,7 +13083,7 @@ def monitor_intraday(asof_datetime=None, force=False):
             if scan_ready else {"status": "blocked", "reason": scan_block, "accounts": []}
         )
         with _db() as conn:
-            accounts = _rows(conn, "SELECT * FROM paper_accounts WHERE status='running'")
+            accounts = _active_account_rows(conn, status="running")
             market = _cached_close_market(conn, day)
         return {
             "slot": "intraday", "date": day.isoformat(),
@@ -13059,7 +13124,7 @@ def monitor_intraday(asof_datetime=None, force=False):
     live_market = _market_state(day, live_universe=live_universe, allow_network=True)
     with _db() as snapshot_conn:
         cycle = _active_cycle(snapshot_conn)
-        accounts = _rows(snapshot_conn, "SELECT * FROM paper_accounts WHERE status='running'")
+        accounts = _active_account_rows(snapshot_conn, status="running")
         positions = [p for account in accounts for p in _position_rows(snapshot_conn, account["id"], day)]
     if not positions:
         return {
@@ -13078,7 +13143,7 @@ def monitor_intraday(asof_datetime=None, force=False):
     nav_quotes = _nav_quotes_with_snapshot_fallback(quotes)
     with _db(immediate=True) as conn:
         cycle = _active_cycle(conn)
-        accounts = _rows(conn, "SELECT * FROM paper_accounts WHERE status='running'")
+        accounts = _active_account_rows(conn, status="running")
         positions = [p for account in accounts for p in _position_rows(conn, account["id"], day)]
         if not positions:
             return {
@@ -14184,10 +14249,14 @@ def _shared_metrics(conn, cycle, positions, quotes):
         pool_peak = max(pool_peak, value)
         if pool_peak > 0:
             pool_drawdown = max(pool_drawdown, 1 - value / pool_peak)
-    fills = conn.execute("SELECT COUNT(*) FROM paper_fills WHERE account_id IN (SELECT id FROM paper_accounts WHERE cycle_id=?)", (cycle["id"],)).fetchone()[0]
+    active_clause, active_ids = _active_cycle_filter(conn, cycle["id"], "id")
+    fills = conn.execute(
+        f"SELECT COUNT(*) FROM paper_fills WHERE account_id IN (SELECT id FROM paper_accounts WHERE cycle_id=? AND {active_clause})",
+        (cycle["id"], *active_ids),
+    ).fetchone()[0]
     return {
         "mode": "shared_pool",
-        "label": f"总资金池 · {len(ACCOUNT_SPECS)}套策略独立决策",
+        "label": f"总资金池 · {len(ACTIVE_ACCOUNT_IDS)}套策略独立决策",
         "strategy_count": len(_shared_account_rows(conn, cycle["id"])),
         "initial_cash": round(initial, 2),
         "cash": round(cash, 2),
@@ -14383,13 +14452,7 @@ def dashboard(include_activity=False, include_history_symbols=False):
     market_session = _market_session()
     with _db() as conn:
         cycle = _active_cycle(conn)
-        account_rows = _rows(
-            conn,
-            """SELECT * FROM paper_accounts
-               ORDER BY CASE id WHEN 'tq_breakout' THEN 1 WHEN 'trend_pullback' THEN 2
-                                WHEN 'sector_rotation' THEN 3 WHEN 'reported_profit_breakout' THEN 4
-                                WHEN 'main_force_top10' THEN 5 ELSE 9 END""",
-        )
+        account_rows = _active_account_rows(conn)
         positions = _position_rows(conn, asof_day=dt.date.today())
         today = dt.date.today().isoformat()
         today_sell_codes = {
@@ -15152,13 +15215,7 @@ def _risk_base_dashboard():
                 "capital_model": "shared_pool",
             }
         cycle = dict(cycle)
-        account_rows = _rows(
-            conn,
-            """SELECT * FROM paper_accounts
-               ORDER BY CASE id WHEN 'tq_breakout' THEN 1 WHEN 'trend_pullback' THEN 2
-                                WHEN 'sector_rotation' THEN 3 WHEN 'reported_profit_breakout' THEN 4
-                                WHEN 'main_force_top10' THEN 5 ELSE 9 END""",
-        )
+        account_rows = _active_account_rows(conn)
         positions = _position_rows(conn, asof_day=today, readonly=True)
         codes = sorted({str(position.get("code")) for position in positions if position.get("code")})
         quotes = {}
@@ -15593,8 +15650,8 @@ def _create_cycle(conn, capital, status="paused", reason="新建模拟周期"):
     )
     cycle_id = cursor.lastrowid
     benchmark = _benchmark_close()
-    account_share = capital / max(len(ACCOUNT_SPECS), 1)
-    for account_id, spec in ACCOUNT_SPECS.items():
+    account_share = capital / max(len(ACTIVE_ACCOUNT_IDS), 1)
+    for account_id, spec in ACTIVE_ACCOUNT_SPECS.items():
         conn.execute(
             """UPDATE paper_accounts SET name=?,source_strategy=?,status=?,initial_cash=?,cash=?,cycle_days=?,
                max_positions=?,max_weight=?,max_exposure=?,version=?,benchmark_start=?,cycle_id=?,mode=?,style=?,
@@ -15624,9 +15681,16 @@ def configure_capital(capital):
         if activity or positions:
             raise ValueError("本周期已有模拟成交或持仓，资金已锁定；请使用完全重置新建周期")
         conn.execute("UPDATE paper_cycles SET capital=?,updated_at=? WHERE id=?", (capital, _now(), cycle["id"]))
-        share = capital / max(len(ACCOUNT_SPECS), 1)
-        conn.execute("UPDATE paper_accounts SET initial_cash=?,cash=?,daily_start_nav=?,updated_at=?", (share, share, share, _now()))
-        conn.execute("UPDATE paper_nav SET cash=?,market_value=0,nav=?", (share, share))
+        share = capital / max(len(ACTIVE_ACCOUNT_IDS), 1)
+        active_clause, active_ids = _active_account_clause("id")
+        conn.execute(
+            f"UPDATE paper_accounts SET initial_cash=?,cash=?,daily_start_nav=?,updated_at=? WHERE {active_clause}",
+            (share, share, share, _now(), *active_ids),
+        )
+        conn.execute(
+            f"UPDATE paper_nav SET cash=?,market_value=0,nav=? WHERE account_id IN ({','.join('?' for _ in active_ids)})",
+            (share, share, *active_ids),
+        )
         _audit(conn, None, "capital_configured", f"共享模拟资金池草稿设为 {capital:.2f} 元；策略初始展示份额 {share:.2f} 元")
     return dashboard()
 
@@ -15647,7 +15711,7 @@ def start_new_cycle(capital=300000.0, include_dashboard=True):
         cycle = _create_cycle(conn, capital, status="running", reason="保存资金并启动")
     summary = dashboard() if include_dashboard else {
         "cycle": cycle,
-        "strategy_count": len(ACCOUNT_SPECS),
+        "strategy_count": len(ACTIVE_ACCOUNT_IDS),
         "refresh_required": True,
     }
     return summary, cycle
@@ -15670,7 +15734,7 @@ def reset_cycle(capital=300000.0, include_dashboard=True):
         return dashboard(), cycle
     return {
         "cycle": cycle,
-        "strategy_count": len(ACCOUNT_SPECS),
+        "strategy_count": len(ACTIVE_ACCOUNT_IDS),
         "refresh_required": True,
     }, cycle
 
@@ -15706,10 +15770,14 @@ def set_accounts_status(status, capital=None):
             raise ValueError("当前周期不是暂停状态，不能恢复运行")
         if status == "paused" and cycle["status"] != "running":
             raise ValueError("当前周期并未运行，无需再次暂停")
-        conn.execute("UPDATE paper_accounts SET status=?, updated_at=?", (status, _now()))
+        active_clause, active_ids = _active_account_clause("id")
+        conn.execute(
+            f"UPDATE paper_accounts SET status=?, updated_at=? WHERE {active_clause}",
+            (status, _now(), *active_ids),
+        )
         conn.execute("UPDATE paper_cycles SET status=?,started_at=COALESCE(started_at,?),updated_at=? WHERE id=?",
                      (status, _now() if status == "running" else None, _now(), cycle["id"]))
-        _audit(conn, None, "accounts_" + status, "三策略模拟盘状态变更")
+        _audit(conn, None, "accounts_" + status, f"{len(ACTIVE_ACCOUNT_IDS)}套当前策略模拟盘状态变更")
     return dashboard()
 
 

@@ -30,6 +30,10 @@ class StrategyRegistryTests(unittest.TestCase):
         self.assertEqual(adaptive_risk.ACCOUNT_NAMES, {
             account_id: labels[account_id] for account_id in adaptive_risk.BASE_RISK
         })
+        self.assertIn("main_force_top10", adaptive_risk.BASE_RISK)
+        self.assertIn("main_force_top10", adaptive_risk.DOWNSIDE_BASE)
+        current, _, _ = adaptive_risk._current_risk({"id": "main_force_top10", "params": "{}"})
+        self.assertEqual(-5.0, current["downside_full_pct"])
 
     def test_strategy_center_exposes_registry_status_without_changing_account_scope(self):
         rows = {row["id"]: row for row in paper.strategy_center()["strategies"]}
