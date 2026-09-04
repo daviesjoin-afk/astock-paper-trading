@@ -8,8 +8,6 @@
 
 设计原则：任何指标采集失败都必须静默降级（返回 None/0），绝不影响主业务。
 """
-import datetime as dt
-import json
 import os
 import time
 
