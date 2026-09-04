@@ -345,6 +345,7 @@ def _download_one(code, beg, tries=3, required_date=None):
                         dfc.save_kline(code, cached)
                     except Exception:
                         pass
+                _clear_failure_reason(code)
                 return True
         elif _history_is_fresh(latest):
             return True
@@ -368,6 +369,7 @@ def _download_one(code, beg, tries=3, required_date=None):
                     ):
                         # A provider can return a valid but stale response.  Do not
                         # overwrite the cache or report success in that case.
+                        _record_failure_reason(code, "行情源持续返回旧日期，未覆盖目标交易日")
                         try:
                             dfc.reset_data_source("历史行情源返回旧日期")
                         except Exception:
@@ -381,12 +383,14 @@ def _download_one(code, beg, tries=3, required_date=None):
                         df_new = _anchor_unadjusted_increment(df_new)
                         if df_new is None:
                             # 宁可保留稍旧的前复权历史，也不能把两个不同价格口径拼接。
+                            _record_failure_reason(code, "新浪未复权增量锚定失败，拒绝拼接不同复权口径")
                             time.sleep(0.3)
                             continue
                     attrs = dict(df_new.attrs)
                     merged = pd.concat([cached[cached.index < df_new.index[0]], df_new])
                     merged.attrs.update(attrs)
                     dfc.save_kline(code, merged)
+                    _clear_failure_reason(code)
                     return True
             else:
                 df = dfc.fetch_kline(
@@ -399,6 +403,7 @@ def _download_one(code, beg, tries=3, required_date=None):
                     if required_date is not None and (
                         pd.isna(newest) or newest.date() < required_date
                     ):
+                        _record_failure_reason(code, "行情源持续返回旧日期，未覆盖目标交易日")
                         try:
                             dfc.reset_data_source("历史行情源返回旧日期")
                         except Exception:
@@ -406,8 +411,10 @@ def _download_one(code, beg, tries=3, required_date=None):
                         time.sleep(0.3)
                         continue
                     dfc.save_kline(code, df)
+                    _clear_failure_reason(code)
                     return True
-        except Exception:
+        except Exception as exc:
+            _record_failure_reason(code, f"下载请求异常: {type(exc).__name__}: {exc}")
             try:
                 dfc.reset_data_source("历史行情请求异常")
             except Exception:
@@ -417,11 +424,35 @@ def _download_one(code, beg, tries=3, required_date=None):
         except Exception:
             pass
         time.sleep(0.3 * (attempt + 1))
+    # 所有重试用尽仍未成功：若没有更具体的原因（如请求异常），给出兜底说明。
+    with _FAILURE_REASONS_LOCK:
+        _FAILURE_REASONS.setdefault(str(code), "连续重试后仍无有效数据（空响应或数据源不可用）")
     return False
 
 
 MIN_STRATEGY_HISTORY_ROWS = 120
 FULL_HISTORY_BACKFILL_BEG = "20230101"
+
+# 单只下载失败原因登记（线程安全、进程内）。恢复队列与恢复报告通过它给出
+# “为什么一直失败”的可诊断原因，而不是只留一串无解释的股票代码名单。
+# docker exec 每次恢复都是新进程，进程内登记的生命周期即单次恢复窗口。
+_FAILURE_REASONS = {}
+_FAILURE_REASONS_LOCK = threading.Lock()
+
+
+def _record_failure_reason(code, reason):
+    with _FAILURE_REASONS_LOCK:
+        _FAILURE_REASONS[str(code)] = str(reason)[:200]
+
+
+def _clear_failure_reason(code):
+    with _FAILURE_REASONS_LOCK:
+        _FAILURE_REASONS.pop(str(code), None)
+
+
+def _failure_reasons_snapshot():
+    with _FAILURE_REASONS_LOCK:
+        return dict(_FAILURE_REASONS)
 
 
 def refresh_history(asof_day=None, workers=8, max_seconds=240):
@@ -583,11 +614,13 @@ def refresh_history(asof_day=None, workers=8, max_seconds=240):
                             updated += 1
                         else:
                             failed.append(code)
-                    except Exception:
+                    except Exception as exc:
+                        _record_failure_reason(code, f"下载线程内异常: {type(exc).__name__}: {exc}")
                         failed.append(code)
             except TimeoutError:
                 for future in futures:
                     if not future.done():
+                        _record_failure_reason(futures[future], "恢复窗口超时，本轮未完成下载")
                         failed.append(futures[future])
                         future.cancel()
 
@@ -627,6 +660,7 @@ def refresh_history(asof_day=None, workers=8, max_seconds=240):
     succeeded = set(submitted_codes) - set(failed)
     for code in succeeded:
         retry_by_code.pop(code, None)
+    failure_reasons = _failure_reasons_snapshot()
     for code in set(failed):
         item = retry_by_code.get(code) or {"code": code, "attempts": 0}
         attempts = min(8, int(item.get("attempts") or 0) + 1)
@@ -635,6 +669,8 @@ def refresh_history(asof_day=None, workers=8, max_seconds=240):
             "code": code,
             "attempts": attempts,
             "next_retry_at": (now + dt.timedelta(minutes=delay_minutes)).isoformat(timespec="seconds"),
+            # 失败原因随队列持久化：顽固失败代码不必再靠猜。
+            "last_error": failure_reasons.get(code) or item.get("last_error"),
         }
     retry_queue = sorted(
         retry_by_code.values(),
@@ -676,6 +712,11 @@ def refresh_history(asof_day=None, workers=8, max_seconds=240):
         pass
     dfc.flush_kline_manifest()
     invalidate_coverage_cache()
+    # 失败原因聚合：{原因: 股票数}，供恢复报告与监控直接消费。
+    reason_counts = {}
+    for code in set(failed):
+        reason = failure_reasons.get(code) or "未记录（历史遗留失败，本轮未重试）"
+        reason_counts[reason] = reason_counts.get(reason, 0) + 1
     return {
         "status": "ok" if not failed and not unprocessed else "partial",
         "requested_date": requested_date.isoformat() if requested_date else None,
@@ -684,6 +725,7 @@ def refresh_history(asof_day=None, workers=8, max_seconds=240):
         "updated": updated,
         "failed_count": len(failed),
         "failed": sorted(set(failed))[:100],
+        "failure_reasons": dict(sorted(reason_counts.items(), key=lambda kv: -kv[1])),
         "unprocessed_count": unprocessed,
         "retry_queue_count": len(retry_queue),
         "recovery": recovery_state,
