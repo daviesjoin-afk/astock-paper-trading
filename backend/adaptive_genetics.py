@@ -9,7 +9,7 @@ from collections import defaultdict
 def normalize_genome(weights, features):
     values = [float(weights.get(name, 0.0)) for name in features]
     scale = sum(abs(value) for value in values) or 1.0
-    return {name: round(value / scale, 8) for name, value in zip(features, values)}
+    return {name: round(value / scale, 8) for name, value in zip(features, values, strict=True)}
 
 
 def alpha_fitness(genome, rows, features, horizon_weights):

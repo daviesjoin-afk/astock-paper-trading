@@ -19,6 +19,7 @@ _cache = {}
 _cache_ts = {}
 _cache_generation = {}
 _cache_inflight = {}
+MAX_CACHE_ENTRIES = 128
 
 
 def _current_cache_generation():
@@ -62,6 +63,11 @@ def _cset(key, val, *, generation=_CACHE_MISS):
     if generation is _CACHE_MISS:
         generation = _current_cache_generation()
     with _cache_lock:
+        if key not in _cache and len(_cache) >= MAX_CACHE_ENTRIES:
+            oldest_key = min(_cache, key=lambda item: _cache_ts.get(item, 0))
+            _cache.pop(oldest_key, None)
+            _cache_ts.pop(oldest_key, None)
+            _cache_generation.pop(oldest_key, None)
         _cache[key] = val
         _cache_ts[key] = time.time()
         _cache_generation[key] = generation

@@ -226,7 +226,7 @@ def _correlation(rows: Sequence[Mapping[str, Any]], columns: Sequence[str]) -> d
             if len(pairs) < 3:
                 value = None
             else:
-                left_values, right_values = zip(*pairs)
+                left_values, right_values = zip(*pairs, strict=True)
                 left_mean, right_mean = statistics.mean(left_values), statistics.mean(right_values)
                 numerator = sum((a - left_mean) * (b - right_mean) for a, b in pairs)
                 left_var = sum((a - left_mean) ** 2 for a in left_values)
