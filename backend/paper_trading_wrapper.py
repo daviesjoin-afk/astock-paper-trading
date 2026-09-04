@@ -4,7 +4,7 @@
 这个文件保持向后兼容，所有函数仍然可以通过 import paper_trading 访问。
 实际代码已迁移到 paper_trading/ 包中的各模块。
 """
-from paper_trading import *
+from paper_trading import *  # noqa: F403 - compatibility wrapper intentionally re-exports public names
 
 # 旧部署中的 paper_trading.py 没有定义 __all__。包装模块不能因为
 # 导出元数据缺失而让旧调用方导入失败。

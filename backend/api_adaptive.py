@@ -174,7 +174,6 @@ def overview():
     with _overview_lock:
         data = _overview_cache["data"]
         fresh = data is not None and now - _overview_cache["ts"] < _OVERVIEW_TTL_SECONDS
-        running = bool(_overview_cache["running"])
         error = _overview_cache["error"]
     if fresh:
         return data

@@ -2154,7 +2154,6 @@ def _ensure_accounts(conn):
     configured_status = active_cycle["status"] if active_cycle else "paused"
     for account_id, spec in ACTIVE_ACCOUNT_SPECS.items():
         exists = conn.execute("SELECT 1 FROM paper_accounts WHERE id=?", (account_id,)).fetchone()
-        new_run = not bool(exists)
         if exists:
             conn.execute(
                 """UPDATE paper_accounts SET name=?,source_strategy=?,cycle_days=?,
@@ -3613,7 +3612,7 @@ def _rebuild_selection_factor_cache(asof_date=None):
         and _security_scope(row.get("code"), row.get("name"), row.get("risk_flag"))["allowed"]
     }
     built_codes = set(price_f.index.astype(str)) if not price_f.empty else set()
-    date_by_code = dict(zip(price_f.index.astype(str), price_f["last_date"].astype(str))) if "last_date" in price_f else {}
+    date_by_code = dict(zip(price_f.index.astype(str), price_f["last_date"].astype(str), strict=True)) if "last_date" in price_f else {}
     exact_codes = {
         code for code in built_codes
         if str(date_by_code.get(code) or "")[:10] == cutoff.isoformat()
@@ -3830,7 +3829,7 @@ def _new_listing_entry_assessment(account, pick, quote, kline, listing, market=N
         if liquidity.get("history_median"):
             detail += f"（近{int(policy.get('liquidity_lookback', 5))}日中位 ¥{_num(liquidity.get('history_median')):,.0f}，{liquidity.get('source')}）"
         else:
-            detail += f"（历史成交额不足，采用基础底线）"
+            detail += "（历史成交额不足，采用基础底线）"
         reasons.append(detail)
     if amount <= 0:
         reasons.append("新股缺少成交额，无法评估流动性")
@@ -4564,7 +4563,6 @@ def _sector_overheat_guard(kline, quote=None, candidate_heat=None):
             streak += 1
         else:
             break
-    current_pct = _num(quote.get("pct"), 0.0)
     intraday_high = _num(quote.get("high"), 0.0)
     open_price = _num(quote.get("open_price"), 0.0)
     intraday_pullback_pct = (
@@ -9416,7 +9414,6 @@ def execute_open(asof_date=None):
                 "expired": len(expired),
             }
         market = prefetch_market
-        names = {s["code"]: s.get("name") or s["code"] for s in due}
         news = prefetch_news
         quote_map = prefetch_quotes
         account_map = {a["id"]: a for a in accounts}
@@ -10475,7 +10472,6 @@ def _over_capacity_exit_candidates(conn, positions, reviews, account_map, asof_d
         if int(_num(position.get("qty"))) >= LOT_SIZE:
             by_account.setdefault(position["account_id"], []).append(position)
     for account_id, items in by_account.items():
-        account = account_map.get(account_id) or {}
         fallback = (ACCOUNT_SPECS.get(account_id) or {}).get("max_positions", 5)
         limit = max(1, int(count_budget["limits"].get(account_id, fallback)))
         excess = max(0, len(items) - limit)
@@ -11394,7 +11390,6 @@ def _monitor_risk_impl(asof_date=None):
                     # snapshot before this write transaction.  Never start
                     # network or disk I/O after the risk ledger is locked.
                     replacement_quote = quote_map.get(replacement_code) or {}
-                    replacement_name = replacement.get("name") or replacement_code
                     replacement_news = [
                         row for row in news if str(row.get("code") or "") == str(replacement_code)
                     ]
@@ -12863,16 +12858,13 @@ def monitor_fast_entries(asof_datetime=None, force=False):
                     candidates.append(row)
                     seen_fast.add(key)
             positions = _position_rows(snapshot_conn, asof_day=day, readonly=True)
-            market = _cached_close_market(snapshot_conn, day, allow_network=False)
+            _cached_close_market(snapshot_conn, day, allow_network=False)
         if not candidates:
             return {"status": "completed", "slot": "fast-entry", "checked": 0, "confirmed": []}
 
         candidate_codes = {str(row.get("code") or "") for row in candidates}
         all_codes = sorted(candidate_codes | {str(row.get("code") or "") for row in positions})
         quote_map = _quotes(all_codes, asof_date=day)
-        news = _news_for({
-            str(row.get("code")): row.get("name") or row.get("code") for row in candidates
-        })
         confirmed = []
         observations = []
         checked = 0
@@ -13191,7 +13183,8 @@ def monitor_intraday(asof_datetime=None, force=False):
             if account.get("mode") == "intraday_t":
                 action, reason = _run_intraday_action(
                     position,
-                    lambda: _intraday_sell(conn, account, position, quote, day, profile, cycle),
+                    lambda account=account, position=position, quote=quote, profile=profile:
+                        _intraday_sell(conn, account, position, quote, day, profile, cycle),
                     "sell",
                 )
                 if action:
@@ -13201,7 +13194,7 @@ def monitor_intraday(asof_datetime=None, force=False):
                 if not risk_state["blocked"]:
                     action, reason = _run_intraday_action(
                         position,
-                        lambda: _intraday_buyback(
+                        lambda account=account, position=position, quote=quote, profile=profile, live_market=live_market, cycle=cycle, quotes=quotes: _intraday_buyback(
                             conn, account, position, quote, live_market, day, profile, cycle,
                             all_quotes=quotes,
                         ),
@@ -13216,7 +13209,7 @@ def monitor_intraday(asof_datetime=None, force=False):
                 # 各自策略质量门和“卖出后低点反弹”确认，不复用普通开仓。
                 action, reason = _run_intraday_action(
                     position,
-                    lambda: _intraday_buyback(
+                    lambda account=account, position=position, quote=quote, profile=profile, live_market=live_market, cycle=cycle, quotes=quotes: _intraday_buyback(
                         conn, account, position, quote, live_market, day, profile, cycle,
                         all_quotes=quotes,
                     ),
@@ -13228,7 +13221,7 @@ def monitor_intraday(asof_datetime=None, force=False):
                     continue
                 action, reason = _run_intraday_action(
                     position,
-                    lambda: _swing_scale_in(
+                    lambda account=account, position=position, quote=quote, profile=profile, live_market=live_market, cycle=cycle, quotes=quotes: _swing_scale_in(
                         conn, account, position, quote, live_market, day, profile, cycle,
                         all_quotes=quotes,
                     ),
@@ -13510,7 +13503,6 @@ def _cleanup_stale_data():
     - 容量瓶颈的时间分布
     - 信号质量与执行率的关系
     """
-    now = _now()
     today = _date().isoformat()
 
     # 检查是否今天已经清理过
@@ -15015,7 +15007,7 @@ def stock_trade_history(code, account_id=None):
             order["account_name"] = account_names.get(order["account_id"], order["account_id"])
         fills = _rows(
             conn,
-            f"SELECT * FROM paper_fills WHERE code=?" + (" AND account_id=?" if account_id else "") + " ORDER BY fill_date DESC, id DESC",
+            "SELECT * FROM paper_fills WHERE code=?" + (" AND account_id=?" if account_id else "") + " ORDER BY fill_date DESC, id DESC",
             args,
         )
         for fill in fills:

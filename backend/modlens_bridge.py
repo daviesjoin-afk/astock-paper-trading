@@ -431,7 +431,7 @@ def format_for_prompt(vision_result: dict, include_layout: bool = False, include
                 elif isinstance(v, list) and len(v) <= 5:
                     sem_lines.append(f"  {k}: {v}")
             if sem_lines:
-                parts.append(f"=== 语义信息 ===\n" + "\n".join(sem_lines))
+                parts.append("=== 语义信息 ===\n" + "\n".join(sem_lines))
 
     # 不确定性
     uncertainties = vision_result.get("uncertainties", [])
