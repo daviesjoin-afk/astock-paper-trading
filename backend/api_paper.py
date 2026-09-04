@@ -238,7 +238,7 @@ def risk_audit(
                 }
             return full
 
-        return _cache_load(cache_key, load_audit, ttl=15)
+        return _cache_load(cache_key, load_audit, ttl=30)
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Risk audit failed: {type(exc).__name__}") from exc
 
@@ -254,7 +254,9 @@ def strategy_center():
 @router.get("/reviews")
 def reviews():
     try:
-        return _call_with_retry(P.latest_reviews)
+        # 前端高频轮询的只读视图；与 overview 同代（ledger-generation 感知），
+        # 订单/风控变化会立即失效缓存，TTL 只限制无变化时的重复 DB 重建。
+        return _cache_load("reviews", lambda: _call_with_retry(P.latest_reviews), ttl=30)
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Reviews failed: {type(exc).__name__}") from exc
 
