@@ -560,6 +560,8 @@ def _ensure_config_defaults(conn):
         "risk_mature_reward_samples": 12,
         "risk_mature_regimes": 2,
         "llm_advisor_enabled": False,
+        "llm_provider": "deepseek",
+        "llm_realtime_mode": "intraday",
         # 盘后逐笔归因默认开启确定性记录；配置了 DeepSeek 密钥时再做 AI
         # 批量解释，密钥/网络不可用不会阻断学习链。
         "trade_attribution_ai_enabled": True,
