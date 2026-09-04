@@ -132,7 +132,7 @@ def _run_daily(admission=None, now=None):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--slot", choices=["daily"], default="daily")
-    args = parser.parse_args()
+    parser.parse_args()
     result = run_daily()
     print(json.dumps(result, ensure_ascii=False, default=str))
     return 0 if result["status"] in {"ok", "skipped"} else 1

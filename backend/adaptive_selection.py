@@ -498,7 +498,6 @@ def apply_candidate(conn, paper_db_path, candidate_id, now_fn, approved_by="boun
     if item["status"] not in {"eligible_auto_adjust", "eligible_manual_review", "eligible_structural_review"}:
         raise ValueError("选股候选尚未通过进化门槛")
     candidate_preview = _loads(item.get("candidate_params"), {})
-    baseline = _loads(item.get("baseline_params"), {})
     is_structural = candidate_preview.get("mutation_type") not in {None, "none"}
     if approved in _AUTO_APPROVERS:
         if is_structural:
