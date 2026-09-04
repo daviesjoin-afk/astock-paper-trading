@@ -43,10 +43,6 @@ import adaptive_genetics as AG
 import adaptive_shadow_risk as ASR
 from strategy_registry import labels as strategy_labels
 from adaptive_common import _now, _json, _loads, _clamp  # C3: 收敛重复工具函数
-try:
-    import modlens_bridge
-except ImportError:
-    pass
 
 
 BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))

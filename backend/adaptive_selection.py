@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import datetime as dt
-import json
 import math
 import os
 import sqlite3
@@ -11,7 +10,7 @@ import statistics
 
 import strategies as S
 from strategy_registry import labels as strategy_labels
-from adaptive_common import _loads, _json, _clamp  # C3: 收敛重复工具函数
+from adaptive_common import _loads, _json  # C3: 收敛重复工具函数
 
 ACCOUNT_NAMES = strategy_labels()
 ACCOUNT_MODELS = {

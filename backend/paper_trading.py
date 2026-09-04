@@ -40,17 +40,17 @@ import paper_sizing as PSZ
 import strategy_registry as SR
 from market_policy import market_light_scale, market_light_scales
 from paper_trading_rules import (
-    CHINEXT_PREFIXES,
-    COMMISSION,
-    MAIN_BOARD_PREFIXES,
-    MIN_COMMISSION,
+    CHINEXT_PREFIXES,  # noqa: F401 - legacy public compatibility export
+    COMMISSION,  # noqa: F401 - legacy public compatibility export
+    MAIN_BOARD_PREFIXES,  # noqa: F401 - legacy public compatibility export
+    MIN_COMMISSION,  # noqa: F401 - legacy public compatibility export
     SLIPPAGE,
-    STAR_PREFIXES,
+    STAR_PREFIXES,  # noqa: F401 - legacy public compatibility export
     STAMP_SELL,
-    T0_ETF_PREFIXES,
+    T0_ETF_PREFIXES,  # noqa: F401 - legacy public compatibility export
     asset_type as _asset_type,
     commission as _commission,
-    is_st_or_delisting as _is_st_or_delisting,
+    is_st_or_delisting as _is_st_or_delisting,  # noqa: F401 - legacy public compatibility export
     is_trade_weekday as _is_trade_weekday,
     limit_pct as _limit_pct,
     next_weekday as _next_weekday,

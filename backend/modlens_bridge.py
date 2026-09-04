@@ -15,9 +15,7 @@ import http.client
 import ipaddress
 import json
 import os
-import shutil
 import socket
-import ssl
 import subprocess
 import tempfile
 import threading

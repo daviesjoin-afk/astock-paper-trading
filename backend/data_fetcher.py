@@ -13,7 +13,6 @@ import marketdata_providers as MP
 from marketdata_transport import (
     HEADERS,
     _session,
-    _session_local,
     _tencent_circuit,
     _tencent_circuit_lock,
     http_get,

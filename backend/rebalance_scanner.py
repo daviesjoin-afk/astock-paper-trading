@@ -19,8 +19,6 @@ from __future__ import annotations
 
 import datetime as dt
 import json
-import time
-from typing import Optional
 
 # ─── 调仓参数 ───
 REBALANCE_VERSION = "daily-rebalance-v2"
