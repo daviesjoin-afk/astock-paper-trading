@@ -20,8 +20,7 @@ import pandas as pd
 import data_fetcher as dfc
 import strategies as S
 
-# Keep backtests aligned with the paper-trading fee model (0.01% commission,
-# no minimum commission).
+# 与 paper_trading 同步：佣金万一免五（2026-08-28 起）
 COMMISSION = 0.0001
 MIN_COMMISSION = 0.0
 STAMP_SELL = 0.0005
@@ -30,6 +29,18 @@ SLIPPAGE = 0.001
 _matrix_cache = {}
 _daily_score_cache = {}
 _gate_series_cache = {}
+# A backtest can touch thousands of dates and several strategy IDs.  Keep the
+# reusable score/gate projections bounded so a long-lived API process does not
+# retain one large pandas object per historical request forever.  The matrix
+# cache remains the single shared source for the current backtest window.
+MAX_DAILY_SCORE_CACHE = 256
+MAX_GATE_SERIES_CACHE = 8
+
+
+def _bounded_cache_set(cache, key, value, limit):
+    if key not in cache and len(cache) >= limit:
+        cache.pop(next(iter(cache)), None)
+    cache[key] = value
 
 
 def _pct_change(obj):
@@ -175,7 +186,7 @@ def build_gate_series(dates):
             if len(known) >= 21 and float(known.iloc[-1] / known.iloc[-21] - 1) * 100 > 2:
                 score += 1
         lights.loc[date] = "red" if score >= 3 else ("yellow" if score >= 1.5 else "green")
-    _gate_series_cache[cache_key] = lights
+    _bounded_cache_set(_gate_series_cache, cache_key, lights, MAX_GATE_SERIES_CACHE)
     return lights
 
 
@@ -343,7 +354,7 @@ def run_backtest(
                 fundamentals_enabled,
             )
             if not fundamentals_enabled:
-                _daily_score_cache[score_key] = scores
+                _bounded_cache_set(_daily_score_cache, score_key, scores, MAX_DAILY_SCORE_CACHE)
         targets = list(scores.head(topn).index)
         light = gate_series.loc[date] if use_gate else "green"
         position_scale = GATE_POS.get(light, 1.0)
@@ -381,8 +392,7 @@ def run_backtest(
             shares = min(positions[code], sell_value_at_open / op)
             price = _execution_price("sell", op, next_low.get(code, np.nan), next_high.get(code, np.nan))
             gross = shares * price
-            # 佣金按万一免五模拟，与 paper_trading 保持一致。
-            # 小额交易的净收益，使优化器偏向过度换手的参数。
+            # 佣金按万一免五模拟（2026-08-28 起与模拟盘一致）。
             fees = max(MIN_COMMISSION, gross * COMMISSION) + gross * STAMP_SELL
             positions[code] -= shares
             if positions[code] <= 1e-12:

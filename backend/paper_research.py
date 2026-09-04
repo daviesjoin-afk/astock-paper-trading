@@ -3,7 +3,7 @@
 
 This module is intentionally read-only from the execution engine's point of
 view.  It stores the exact candidate inputs and later observed close prices for
-the enabled paper strategies, but it never changes a score, an order, a risk
+the three paper strategies, but it never changes a score, an order, a risk
 parameter, or an account balance.  A candidate is therefore evidence only
 until a separately reviewed experiment is promoted.
 """
@@ -14,8 +14,7 @@ import json
 import os
 import sqlite3
 from collections import defaultdict
-
-import data_fetcher as dfc
+from strategy_registry import labels as strategy_labels
 
 
 BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -24,10 +23,7 @@ VERSION = "paper-research-shadow-v1"
 HORIZONS = (1, 3, 5, 10, 20)
 CHINA_TZ = dt.timezone(dt.timedelta(hours=8))
 
-STRATEGY_NAMES = {
-    "tq_breakout": "短线日内做T",
-    "main_force_top10": "主力资金跟随",
-}
+STRATEGY_NAMES = strategy_labels()
 
 
 def _now() -> str:
@@ -229,16 +225,14 @@ def update_observations(observed_date, market_rows):
         return {"status": "skipped", "reason": "no same-day market prices", "date": day}
     inserted = 0
     with _connect() as conn:
-        active_ids = ",".join("?" for _ in STRATEGY_NAMES)
         rows = conn.execute(
-            f"""
+            """
             SELECT c.id, c.code, c.entry_price
             FROM paper_research_candidates c
             JOIN paper_research_runs r ON r.id=c.run_id
-            WHERE r.account_id IN ({active_ids})
-              AND r.signal_date < ? AND r.signal_date >= date(?, '-50 day')
+            WHERE r.signal_date < ? AND r.signal_date >= date(?, '-50 day')
             """,
-            (*STRATEGY_NAMES, day, day),
+            (day, day),
         ).fetchall()
         for row in rows:
             price = prices.get(row["code"])
@@ -267,31 +261,28 @@ def dashboard(limit=40):
     """Small read model for later UI integration; it never exposes a buy signal."""
     ensure_schema()
     with _connect() as conn:
-        active_ids = ",".join("?" for _ in STRATEGY_NAMES)
         runs = [dict(row) for row in conn.execute(
-            f"""
+            """
             SELECT signal_date, account_id, strategy_name, model_family, generated_at,
                    factor_asof_date, factor_oldest_date, universe_size,
                    eligible_count, candidate_count, data_quality_json, status
             FROM paper_research_runs
-            WHERE account_id IN ({active_ids})
             ORDER BY signal_date DESC, account_id
             LIMIT ?
             """,
-            (*STRATEGY_NAMES, max(1, min(int(limit), 180))),
+            (max(1, min(int(limit), 180)),),
         ).fetchall()]
         metrics = defaultdict(dict)
         for horizon in HORIZONS:
             rows = conn.execute(
-                f"""
+                """
                 SELECT r.account_id, o.return_pct
                 FROM paper_research_observations o
                 JOIN paper_research_candidates c ON c.id=o.candidate_id
                 JOIN paper_research_runs r ON r.id=c.run_id
-                WHERE r.account_id IN ({active_ids})
-                  AND o.holding_days >= ? AND o.return_pct IS NOT NULL
+                WHERE o.holding_days >= ? AND o.return_pct IS NOT NULL
                 """,
-                (*STRATEGY_NAMES, horizon),
+                (horizon,),
             ).fetchall()
             grouped = defaultdict(list)
             for row in rows:
@@ -313,7 +304,7 @@ def dashboard(limit=40):
     return {
         "version": VERSION,
         "mode": "shadow_only",
-        "message": "研究台账只记录启用模拟盘策略的候选与后续表现，不参与下单或自动调参。",
+        "message": "研究台账只记录四套模拟盘策略的候选与后续表现，不参与下单或自动调参。",
         "strategies": [
             {"id": account_id, "name": name}
             for account_id, name in STRATEGY_NAMES.items()

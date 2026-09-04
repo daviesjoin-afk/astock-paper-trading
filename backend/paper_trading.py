@@ -28,7 +28,34 @@ import universe as U
 import risk_center as RC
 import news_learning as NL
 import paper_research as PR
+import paper_storage as PST
+import paper_portfolio as PP
+import paper_repository as PRP
+import paper_performance as PPerf
+import paper_schema_migrations as PSM
+import paper_archive_projection as PAP
+import paper_quote_policy as PQP
+import paper_allocation as PA
+import paper_sizing as PSZ
+import strategy_registry as SR
 from market_policy import market_light_scale, market_light_scales
+from paper_trading_rules import (
+    CHINEXT_PREFIXES,  # noqa: F401 - legacy public compatibility export
+    COMMISSION,  # noqa: F401 - legacy public compatibility export
+    MAIN_BOARD_PREFIXES,  # noqa: F401 - legacy public compatibility export
+    MIN_COMMISSION,  # noqa: F401 - legacy public compatibility export
+    SLIPPAGE,
+    STAR_PREFIXES,  # noqa: F401 - legacy public compatibility export
+    STAMP_SELL,
+    T0_ETF_PREFIXES,  # noqa: F401 - legacy public compatibility export
+    asset_type as _asset_type,
+    commission as _commission,
+    is_st_or_delisting as _is_st_or_delisting,  # noqa: F401 - legacy public compatibility export
+    is_trade_weekday as _is_trade_weekday,
+    limit_pct as _limit_pct,
+    next_weekday as _next_weekday,
+    security_scope as _security_scope,
+)
 try:
     import disclosure_timeline as DT
 except ImportError:  # 数据源模块故障不能中断风险卖出或候选扫描。
@@ -67,11 +94,6 @@ ARCHIVE_ORDERS_CACHE_PATH = os.path.join(BASE, "data_cache", "paper_archive_orde
 # 低于该值仍保留待买名单，风险卖出不受影响。
 SELECTION_FACTOR_MIN_COVERAGE = 0.85
 
-# 佣金万一免五（2026-08-28 起）：万1费率，无 5 元最低收费；印花税/滑点不变
-COMMISSION = 0.0001
-MIN_COMMISSION = 0.0
-STAMP_SELL = 0.0005
-SLIPPAGE = 0.001
 NEWS_UNVERIFIED_TTL_SECONDS = 12 * 60 * 60
 NEWS_VERIFIED_TTL_SECONDS = 3 * 24 * 60 * 60
 _NEWS_SCAN_META = {"observed_at": None, "stale": False, "error": None}
@@ -83,9 +105,6 @@ NEW_STRATEGY_ID = "reported_profit_breakout"
 NEW_STRATEGY_VERSION = "reported-profit-breakout-v1"
 MAIN_FORCE_STRATEGY_ID = "main_force_top10"
 MAIN_FORCE_STRATEGY_VERSION = "main-force-top10-v1"
-# Public paper-trading release: only these two sleeves participate in new
-# cycles. Legacy account rows and their audit history remain readable.
-ACTIVE_ACCOUNT_IDS = ("tq_breakout", MAIN_FORCE_STRATEGY_ID)
 LOT_SIZE = 100
 # 集中化配对约束：席位稀缺（15席）时，低于该金额的新开仓是"尘埃仓"——
 # 占用一席却几乎不承载资金（2026-08-25 000978 案例黄灯预算剩 ¥3.2K 仍
@@ -99,8 +118,11 @@ MIN_ORDER_AMOUNT = 10000.0
 # permanently full account (for example 70% pool utilisation is already above
 # the 55% breakout ceiling).  Keep one explicit pool-level hard cap instead.
 SHARED_POOL_MAX_EXPOSURE = 0.82
-# 主力策略仅保留 3 个集中席位。市场黄灯缩减策略预算时，仍为该策略
-# 保留一部分最低可表达资金份额；它只能抬高可下单额度，不突破共享池硬上限。
+# 超强主力资金优先（2026-09-03）：该策略池内收益最高、仅 3 席集中持仓，
+# 市场黄灯 60% 缩水后目标额度可能不足一手高价股（例：300489 一手
+# ¥23,202，黄灯下剩余额度仅约 ¥20,000）。为其保留不随灯色缩水的最低
+# 预算份额（占共享池 NAV 比例），只抬高可下单额度，不改变
+# _price_aware_qty “金额约束仅影响下单规模”的机制，也不突破 82% 池硬上限。
 MAIN_FORCE_PRIORITY_FLOOR_PCT = 0.15
 # 三分钟频率兼顾开盘/午后节奏与全市场双源校验耗时；09:30、13:00 仍由首轮立即触发。
 INTRADAY_INTERVAL_MINUTES = 3
@@ -513,10 +535,6 @@ STRATEGY_RISK_BEHAVIORS = {
     },
 }
 
-MAIN_BOARD_PREFIXES = ("000", "001", "002", "003", "600", "601", "603", "605")
-CHINEXT_PREFIXES = ("300", "301", "302")
-STAR_PREFIXES = ("688", "689")
-
 # 新股没有 120 根历史日线是正常现象，不能把“上市时间短”与“历史缓存缺失”混为一谈。
 # 仅对主板/创业板、K 线起点与上市期一致且覆盖率足够的标的启用这条观察路径；
 # 科创/北交/ST 仍由证券权限门禁直接禁止新增仓位。
@@ -567,25 +585,12 @@ NEW_LISTING_POLICIES = {
     },
 }
 
-# 只有普通股票会进入日内做 T 模型。ETF 的 T+0 能力仍由通用结算层识别，
-# 但本轮日内策略不会把 ETF 当成候选标的。
-T0_ETF_PREFIXES = ("51", "52", "56", "58", "15", "16", "18")
-
 STYLE_PROFILES = {
     "strong": {"name": "强势接力", "source_strategy": "one_to_two"},
     "pullback": {"name": "趋势回踩", "source_strategy": "bottom_reversal"},
     "sector": {"name": "板块轮动", "source_strategy": "sentiment_pioneer"},
     "quality": {"name": "三日策略", "source_strategy": NEW_STRATEGY_ID},
     "main_force": {"name": "超强主力股", "source_strategy": MAIN_FORCE_STRATEGY_ID},
-}
-
-# User-facing execution posture.  These are deliberately bounded overlays on
-# soft thresholds only; T+1, price-limit, quote freshness, coverage, lot-size,
-# position and shared-pool hard gates remain unchanged.
-TRADING_MODE_PROFILES = {
-    "aggressive": {"name": "激进", "min_cost_edge_scale": 0.80, "max_weight_scale": 1.00, "max_exposure_scale": 1.00, "cooldown_delta": 0},
-    "balanced": {"name": "宽松", "min_cost_edge_scale": 1.00, "max_weight_scale": 1.00, "max_exposure_scale": 1.00, "cooldown_delta": 0},
-    "calm": {"name": "平缓", "min_cost_edge_scale": 1.15, "max_weight_scale": 0.80, "max_exposure_scale": 0.85, "cooldown_delta": 1},
 }
 
 RISK_PROFILES = {
@@ -779,6 +784,59 @@ ACCOUNT_SPECS = {
     },
 }
 
+# The registry is the single source of truth for what a new public cycle may
+# run.  Legacy specs stay in ACCOUNT_SPECS so archived ledgers and replay
+# tools can decode old rows, but they must never receive fresh cycle capital,
+# signals, or runner time.
+ACTIVE_ACCOUNT_IDS = tuple(
+    account_id for account_id in SR.active_ids() if account_id in ACCOUNT_SPECS
+)
+ACTIVE_ACCOUNT_SPECS = {account_id: ACCOUNT_SPECS[account_id] for account_id in ACTIVE_ACCOUNT_IDS}
+
+
+def _active_account_clause(column="id"):
+    """Return a SQL predicate and parameters for current-cycle accounts."""
+    if not ACTIVE_ACCOUNT_IDS:
+        return "1=0", ()
+    placeholders = ",".join("?" for _ in ACTIVE_ACCOUNT_IDS)
+    return f"{column} IN ({placeholders})", ACTIVE_ACCOUNT_IDS
+
+
+def _active_account_rows(conn, status=None):
+    """Read only accounts allowed to participate in the current cycle."""
+    clause, params = _active_account_clause()
+    sql = f"SELECT * FROM paper_accounts WHERE {clause}"
+    if status is not None:
+        sql += " AND status=?"
+        params = (*params, status)
+    sql += " ORDER BY id"
+    rows = _rows(conn, sql, params)
+    order = {account_id: index for index, account_id in enumerate(ACTIVE_ACCOUNT_IDS)}
+    rows.sort(key=lambda row: order.get(row.get("id"), len(order)))
+    return rows
+
+
+def _active_account_ids(conn, status=None):
+    return [row["id"] for row in _active_account_rows(conn, status=status)]
+
+
+def _active_cycle_filter(conn, cycle_id, column="id"):
+    """Scope a cycle to all active sleeves once the active set is complete.
+
+    Small in-memory/unit-test ledgers and pre-migration databases can contain
+    only one newly introduced sleeve plus legacy IDs.  In that transitional
+    shape, falling back to the cycle's own rows preserves cash reconciliation;
+    a normal repository cycle has both active IDs and uses the strict filter.
+    """
+    active_clause, active_ids = _active_account_clause(column)
+    count = conn.execute(
+        f"SELECT COUNT(*) FROM paper_accounts WHERE cycle_id=? AND {active_clause}",
+        (cycle_id, *active_ids),
+    ).fetchone()[0]
+    if count >= len(ACTIVE_ACCOUNT_IDS):
+        return active_clause, active_ids
+    return "1=1", ()
+
 
 def strategy_center():
     """模拟盘策略说明的单一事实来源；纯只读，不影响账户或交易。"""
@@ -810,18 +868,20 @@ def strategy_center():
         },
     }
     total_profile_exposure = sum(
-        _num(RISK_PROFILES[ACCOUNT_SPECS[account_id]["risk_profile"]].get("max_exposure"), 0.0)
-        for account_id in ACTIVE_ACCOUNT_IDS
+        _num(RISK_PROFILES[item["risk_profile"]].get("max_exposure"), 0.0)
+        for item in ACTIVE_ACCOUNT_SPECS.values()
     ) or 1.0
     rows = []
-    for account_id in ACTIVE_ACCOUNT_IDS:
-        spec = ACCOUNT_SPECS[account_id]
+    for account_id, spec in ACCOUNT_SPECS.items():
+        registered = SR.get(account_id)
         risk = RISK_PROFILES[spec["risk_profile"]]
         event_policy = OPENING_EVENT_POLICIES.get(account_id) or {}
         pool_budget_pct = SHARED_POOL_MAX_EXPOSURE * risk["max_exposure"] / total_profile_exposure * 100
         rows.append({
             "id": account_id,
-            "name": spec["name"],
+            "name": registered.name if registered else spec["name"],
+            "strategy_status": registered.status if registered else "unregistered",
+            "supports_new_cycle": bool(registered and registered.supports_new_cycle),
             "mode": "日内做T" if spec["mode"] == "intraday_t" else "波段交易",
             "entry_model": spec["entry_model_name"],
             "hold_range": f"{spec['hold_min']}–{spec['hold_max']} 个交易日",
@@ -851,18 +911,12 @@ def strategy_center():
         })
     return {
         "strategies": rows,
-        "active_account_ids": list(ACTIVE_ACCOUNT_IDS),
-        "trading_modes": [
-            {"id": key, "name": value["name"],
-             "description": "只调整软阈值/仓位节奏，硬风控门禁不变"}
-            for key, value in TRADING_MODE_PROFILES.items()
-        ],
         "shared_guards": [
             "仅使用独立模拟资金与规则化成交假设，不连接券商或真实账户。",
             "可买范围仅限沪深主板与创业板；ST/退市风险、科创板和北交所一律禁止新买，科创板行情只作同产业映射加分。",
-            f"两套启用策略共用一个总资金池，持仓与待成交买单合计不得超过总净值的 {SHARED_POOL_MAX_EXPOSURE * 100:.0f}%；这是硬上限，任何特级机会都不能突破。",
+            f"{len(ACTIVE_ACCOUNT_IDS)}套当前策略共用一个总资金池，持仓与待成交买单合计不得超过总净值的 {SHARED_POOL_MAX_EXPOSURE * 100:.0f}%；这是硬上限，任何特级机会都不能突破。",
             "策略额度按风险画像分配目标和保护底线；某策略未用额度只会在其他策略底线满足后转入，不再各自重复计算总池上限。",
-            f"股票持仓按策略席位计数：两套启用策略共享总硬上限 {SHARED_POOL_MAX_POSITIONS} 个；满席时高分候选进入替补池，只有明显优于弱持仓才允许先卖后买。",
+            f"股票持仓按策略席位计数：{len(ACTIVE_ACCOUNT_IDS)}套当前策略共享总硬上限 {SHARED_POOL_MAX_POSITIONS} 个；满席时高分候选进入替补池，只有明显优于弱持仓才允许先卖后买。",
             "换仓必须通过实时双源行情、新闻、T+1与质量分复核；每策略每日最多一次主动择强换股，硬止损不受此限制。",
             "待成交买单会预占现金和总池额度；成交后核销，撤单、过期或风控拒绝后释放。",
             "自动开仓须使用当日实时行情，并通过东方财富与腾讯行情交叉核验。",
@@ -1461,209 +1515,45 @@ def _rebuild_realized_pnl(conn):
             conn.execute("UPDATE paper_orders SET realized_pnl=? WHERE id=?", (realized, order["id"]))
 
 
-def _next_weekday(value):
-    """T+1 unlocks on the next Shanghai trading day, not merely a weekday."""
-    return U.next_trade_day(_date(value))
-
-
-def _is_trade_weekday(value):
-    return U.is_trade_day(_date(value))
-
-
-def _commission(amount):
-    return max(MIN_COMMISSION, amount * COMMISSION)
-
-
-def _is_st_or_delisting(name=None, risk_flag=False):
-    """Return whether the current security identity uses the A-share ST limit.
-
-    The trade engine intentionally keeps legacy ST positions sellable while
-    blocking any new purchase.  Their 5% price limit must therefore be known
-    to the sell gate as well; a code-only board rule would treat an ST limit
-    down as an executable ordinary-board quote.
-    """
-    label = str(name or "").upper()
-    return bool(risk_flag) or "ST" in label or "退" in str(name or "")
-
-
-def _limit_pct(code, name=None, risk_flag=False):
-    """Return the applicable down-limit percentage for a tradable position."""
-    if _is_st_or_delisting(name, risk_flag):
-        return 5.0
-    return F.limit_up_threshold(str(code)) * 100
-
-
-def _asset_type(code, name=None):
-    """A 股普通股票 T+1；常见场内 ETF 代码段按 T+0 处理。
-
-    不把可转债、指数或未识别证券冒充 ETF；未来接入证券类型字段时可优先使用该字段。
-    """
-    code = str(code or "")
-    label = str(name or "")
-    if code.startswith(T0_ETF_PREFIXES) and ("ETF" in label.upper() or code.startswith(("51", "52", "56", "58", "15"))):
-        return "etf_t0"
-    return "stock_t1"
-
-
-def _security_scope(code, name=None, risk_flag=False):
-    """Single source of truth for securities the simulated account may buy."""
-    raw = str(code or "").strip()
-    normalized = raw.zfill(6) if raw.isdigit() else raw
-    label = str(name or "").strip()
-    upper = label.upper()
-    if risk_flag or "ST" in upper or "退" in label:
-        return {"allowed": False, "board": "风险警示", "reason": "ST/退市风险标的不在账户权限范围"}
-    if normalized.startswith(STAR_PREFIXES):
-        return {"allowed": False, "board": "科创板", "reason": "科创板不在账户权限范围"}
-    if normalized.startswith(("92",)) or normalized.startswith(("4", "8")):
-        return {"allowed": False, "board": "北交所", "reason": "北交所不在账户权限范围"}
-    if normalized.startswith(CHINEXT_PREFIXES):
-        return {"allowed": True, "board": "创业板", "reason": "创业板普通股票"}
-    if normalized.startswith(MAIN_BOARD_PREFIXES):
-        return {"allowed": True, "board": "沪深主板", "reason": "沪深主板普通股票"}
-    return {"allowed": False, "board": "其他证券", "reason": "仅允许沪深主板和创业板普通股票"}
-
-
 @contextmanager
 def _db(immediate=False):
-    """获取数据库连接。"""
-    path = DB_PATH
-    conn = sqlite3.connect(path, timeout=120)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys=ON")
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA busy_timeout=60000")
-    conn.execute("PRAGMA synchronous=NORMAL")
-    conn.execute("PRAGMA cache_size=-32000")
-    conn.execute("PRAGMA temp_store=MEMORY")
-    conn.execute("PRAGMA wal_autocheckpoint=1000")
-    if immediate:
-        conn.execute("BEGIN IMMEDIATE")
-    try:
+    """获取数据库连接（兼容包装，实际实现位于 ``paper_storage``）。"""
+    with PST.db(DB_PATH, immediate=immediate) as conn:
         yield conn
-    except Exception:
-        # 异常退出：回滚本事务块内尚未提交的写入，避免脏数据残留
-        try:
-            conn.rollback()
-        except Exception:
-            pass
-        raise
-    else:
-        # 正常退出：提交本事务块内的全部写入。
-        # 修复：此前缺少显式 commit，Python sqlite3 默认 isolation_level=''
-        # 会在 conn.close() 时隐式回滚，导致 paper_signals / paper_orders /
-        # paper_risk_decisions 等所有经 _db() 写入的数据全部丢失（审计记录
-        # 自 2026-08-18 10:46:48 起冻结）。
-        try:
-            conn.commit()
-        except sqlite3.OperationalError as exc:
-            if "database is locked" in str(exc):
-                # 锁冲突：写入仍在事务里，必须原样重试；二次失败先回滚，
-                # 不能让 close() 对半提交状态做隐式处理。
-                time.sleep(0.2)
-                try:
-                    conn.commit()
-                except Exception:
-                    conn.rollback()
-                    raise
-            else:
-                # 非锁类提交失败：显式回滚，保证连接关闭前状态确定。
-                try:
-                    conn.rollback()
-                except Exception:
-                    pass
-                raise
-    finally:
-        conn.close()
 
 
 def _wal_checkpoint():
-    """显式收缩 WAL 日志，防止 -wal/-shm 无界增长。
-
-    仅建议在批量写完成后调用（init_db 建表/迁移、每日清理归档等），
-    避免高频写路径上每次阻塞。TRUNCATE 需要无活跃读事务的独占条件，
-    失败时降级为 PASSIVE 尽力收缩；仍失败则静默等待下一轮。
-    """
-    try:
-        conn = sqlite3.connect(DB_PATH, timeout=30)
-        try:
-            conn.execute("PRAGMA busy_timeout=30000")
-            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-        except sqlite3.OperationalError:
-            try:
-                conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
-            except sqlite3.OperationalError:
-                pass
-        finally:
-            conn.close()
-    except Exception:
-        pass
+    """显式收缩 WAL 日志（兼容包装）。"""
+    PST.wal_checkpoint(DB_PATH)
 
 
 def _execute_with_retry(conn, sql, params=(), max_retries=3):
-    """执行 SQL 并在数据库锁定时重试。
-
-    Args:
-        conn: 数据库连接
-        sql: SQL 语句
-        params: 参数
-        max_retries: 最大重试次数
-
-    Returns:
-        cursor
-    """
-    for attempt in range(max_retries):
-        try:
-            return conn.execute(sql, params)
-        except sqlite3.OperationalError as e:
-            if "database is locked" in str(e) and attempt < max_retries - 1:
-                time.sleep(0.1 * (attempt + 1))
-                continue
-            raise
+    """执行 SQL 并在数据库锁定时重试（兼容包装）。"""
+    return PST.execute_with_retry(conn, sql, params=params, max_retries=max_retries)
 
 
 def _executemany_with_retry(conn, sql, params_list, max_retries=3):
-    """执行批量 SQL 并在数据库锁定时重试。"""
-    for attempt in range(max_retries):
-        try:
-            return conn.executemany(sql, params_list)
-        except sqlite3.OperationalError as e:
-            if "database is locked" in str(e) and attempt < max_retries - 1:
-                time.sleep(0.1 * (attempt + 1))
-                continue
-            raise
+    """执行批量 SQL 并在数据库锁定时重试（兼容包装）。"""
+    return PST.executemany_with_retry(
+        conn, sql, params_list, max_retries=max_retries
+    )
 
 
 def _commit_with_retry(conn, max_retries=3):
-    """提交事务并在数据库锁定时重试。"""
-    for attempt in range(max_retries):
-        try:
-            conn.commit()
-            return
-        except sqlite3.OperationalError as e:
-            if "database is locked" in str(e) and attempt < max_retries - 1:
-                time.sleep(0.1 * (attempt + 1))
-                continue
-            raise
+    """提交事务并在数据库锁定时重试（兼容包装）。"""
+    return PST.commit_with_retry(conn, max_retries=max_retries)
 
 @contextmanager
 def _db_readonly():
-    """Open a ledger reader that never runs migrations or takes a write lock.
+    """打开不执行迁移、不获取写锁的只读 ledger 连接（兼容包装）。
 
     Browser history/audit views must remain available while the intraday worker
     owns the writer.  ``init_db`` is intentionally a maintenance operation (it
     reconciles lots and performs schema upgrades), so it must not be called by
     a request that only displays archived orders.
     """
-    uri = f"file:{DB_PATH}?mode=ro"
-    conn = sqlite3.connect(uri, uri=True, timeout=3.0)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA query_only=ON")
-    conn.execute("PRAGMA busy_timeout=3000")
-    try:
+    with PST.db_readonly(DB_PATH) as conn:
         yield conn
-    finally:
-        conn.close()
 
 
 def _ensure_runtime_lease_columns(conn):
@@ -1674,48 +1564,7 @@ def _ensure_runtime_lease_columns(conn):
     rows; a missing expiry is handled by the conservative started_at fallback
     in ``_recover_stale_runtime_state``.
     """
-    migrations = {
-        "paper_jobs": {
-            "owner_key": "TEXT",
-            "heartbeat_at": "TEXT",
-            "expires_at": "TEXT",
-            "fencing_token": "INTEGER NOT NULL DEFAULT 0",
-        },
-        "paper_job_runs": {
-            "owner_key": "TEXT",
-            "heartbeat_at": "TEXT",
-            "expires_at": "TEXT",
-            "fencing_token": "INTEGER NOT NULL DEFAULT 0",
-        },
-        "paper_runtime_locks": {
-            "heartbeat_at": "TEXT",
-            "fencing_token": "INTEGER NOT NULL DEFAULT 0",
-        },
-        "paper_nav": {"quote_status": "TEXT NOT NULL DEFAULT 'verified'"},
-    }
-    for table, definitions in migrations.items():
-        try:
-            columns = {row[1] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
-        except sqlite3.Error:
-            continue
-        for column, definition in definitions.items():
-            if column not in columns:
-                conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
-    # Older runner builds used an ISO ``T`` separator for runtime locks while
-    # the rest of the ledger used a space.  Normalize those legacy values once
-    # so the expiry comparisons remain correct across the migration boundary.
-    for table in ("paper_jobs", "paper_job_runs", "paper_runtime_locks"):
-        try:
-            table_columns = {row[1] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
-            for column in ("started_at", "acquired_at", "heartbeat_at", "expires_at"):
-                if column not in table_columns:
-                    continue
-                conn.execute(
-                    f"UPDATE {table} SET {column}=replace({column},'T',' ') "
-                    f"WHERE {column} IS NOT NULL AND instr({column},'T')>0"
-                )
-        except sqlite3.Error:
-            continue
+    return PSM.ensure_runtime_lease_columns(conn)
 
 
 def _recover_stale_runtime_state(conn, *, boot_recovery=False):
@@ -1982,38 +1831,7 @@ def _ensure_ignition_shadow_table(conn):
     永远不会执行新建库的 executescript 建表块；新增表必须有自己的
     幂等迁移，否则线上库永远缺表（2026-08-31 部署时发现）。
     """
-    try:
-        conn.execute(
-            """CREATE TABLE IF NOT EXISTS paper_ignition_shadow (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                day TEXT NOT NULL,
-                bucket TEXT NOT NULL,
-                code TEXT NOT NULL,
-                recorded_at TEXT NOT NULL,
-                price REAL,
-                pct REAL,
-                runup REAL,
-                old_rule_passed INTEGER NOT NULL DEFAULT 0,
-                old_rule_reason TEXT,
-                ignition_passed INTEGER NOT NULL DEFAULT 0,
-                ignition_reasons TEXT,
-                price_30m REAL,
-                at_30m TEXT,
-                price_60m REAL,
-                at_60m TEXT,
-                resolved INTEGER NOT NULL DEFAULT 0
-            )"""
-        )
-        conn.execute(
-            """CREATE UNIQUE INDEX IF NOT EXISTS idx_paper_ignition_shadow_unique
-                ON paper_ignition_shadow(day, bucket, code)"""
-        )
-        conn.execute(
-            """CREATE INDEX IF NOT EXISTS idx_paper_ignition_shadow_recent
-                ON paper_ignition_shadow(day, resolved)"""
-        )
-    except Exception:
-        pass  # 影子表缺失只降级影子记录，绝不阻断交易主链路
+    return PSM.ensure_ignition_shadow_table(conn)
 
 
 def init_db():
@@ -2030,6 +1848,7 @@ def init_db():
                 # fast-path return previously skipped newly registered
                 # strategy accounts forever, so code/UI could show a strategy
                 # that the scheduler never ran.
+                PSM.ensure_paper_columns(conn)
                 _ensure_accounts(conn)
                 _ensure_cycle(conn)
                 _ensure_runtime_lease_columns(conn)
@@ -2187,9 +2006,7 @@ def init_db():
             CREATE TABLE IF NOT EXISTS paper_cycles (
                 id INTEGER PRIMARY KEY AUTOINCREMENT, cycle_key TEXT NOT NULL UNIQUE,
                 status TEXT NOT NULL, capital REAL NOT NULL, risk_profile TEXT NOT NULL,
-                cycle_days INTEGER, trading_mode TEXT NOT NULL DEFAULT 'balanced',
-                started_at TEXT, ended_at TEXT,
-                created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+                started_at TEXT, ended_at TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
             );
             CREATE TABLE IF NOT EXISTS paper_position_lots (
                 id INTEGER PRIMARY KEY AUTOINCREMENT, cycle_id INTEGER NOT NULL,
@@ -2253,21 +2070,7 @@ def init_db():
 
 """
         )
-        columns = {row[1] for row in conn.execute("PRAGMA table_info(paper_orders)").fetchall()}
-        if "realized_pnl" not in columns:
-            conn.execute("ALTER TABLE paper_orders ADD COLUMN realized_pnl REAL")
-        order_migrations = {
-            "order_type": "TEXT NOT NULL DEFAULT 'market'",
-            "origin": "TEXT NOT NULL DEFAULT 'strategy'",
-            "expires_at": "TEXT",
-            "cancelled_at": "TEXT",
-        }
-        for column, definition in order_migrations.items():
-            if column not in columns:
-                conn.execute(f"ALTER TABLE paper_orders ADD COLUMN {column} {definition}")
-        lot_columns = {row[1] for row in conn.execute("PRAGMA table_info(paper_position_lots)").fetchall()}
-        if "cost_fee_included" not in lot_columns:
-            conn.execute("ALTER TABLE paper_position_lots ADD COLUMN cost_fee_included INTEGER NOT NULL DEFAULT 0")
+        PSM.ensure_paper_columns(conn)
         # 升级前的 lot 只记录成交价。来源订单存在时，将已实际扣除的买入费用
         # 分摊到每股成本；无来源的历史兼容 lot 不臆造费用，保留原始成本。
         conn.execute(
@@ -2320,24 +2123,6 @@ def init_db():
             (ENTRY_FROZEN_WAITLIST_STATUS,),
         )
         _rebuild_realized_pnl(conn)
-        position_columns = {row[1] for row in conn.execute("PRAGMA table_info(paper_positions)").fetchall()}
-        if "asset_type" not in position_columns:
-            conn.execute("ALTER TABLE paper_positions ADD COLUMN asset_type TEXT NOT NULL DEFAULT 'stock_t1'")
-        account_columns = {row[1] for row in conn.execute("PRAGMA table_info(paper_accounts)").fetchall()}
-        account_migrations = {
-            "cycle_id": "INTEGER", "mode": "TEXT NOT NULL DEFAULT 'swing'",
-            "style": "TEXT NOT NULL DEFAULT 'pullback'", "risk_profile": "TEXT NOT NULL DEFAULT 'aggressive'",
-            "params": "TEXT NOT NULL DEFAULT '{}'", "daily_start_nav": "REAL",
-            "daily_nav_date": "TEXT", "cooldown_until": "TEXT",
-        }
-        for column, definition in account_migrations.items():
-            if column not in account_columns:
-                conn.execute(f"ALTER TABLE paper_accounts ADD COLUMN {column} {definition}")
-        cycle_columns = {row[1] for row in conn.execute("PRAGMA table_info(paper_cycles)").fetchall()}
-        if "cycle_days" not in cycle_columns:
-            conn.execute("ALTER TABLE paper_cycles ADD COLUMN cycle_days INTEGER")
-        if "trading_mode" not in cycle_columns:
-            conn.execute("ALTER TABLE paper_cycles ADD COLUMN trading_mode TEXT NOT NULL DEFAULT 'balanced'")
         _ensure_accounts(conn)
         _ensure_cycle(conn)
         _ensure_runtime_lease_columns(conn)
@@ -2367,10 +2152,8 @@ def _ensure_accounts(conn):
         else 20000.0
     )
     configured_status = active_cycle["status"] if active_cycle else "paused"
-    for account_id in ACTIVE_ACCOUNT_IDS:
-        spec = ACCOUNT_SPECS[account_id]
+    for account_id, spec in ACTIVE_ACCOUNT_SPECS.items():
         exists = conn.execute("SELECT 1 FROM paper_accounts WHERE id=?", (account_id,)).fetchone()
-        new_run = not bool(exists)
         if exists:
             conn.execute(
                 """UPDATE paper_accounts SET name=?,source_strategy=?,cycle_days=?,
@@ -2403,16 +2186,6 @@ def _ensure_accounts(conn):
         )
 
 
-def _disable_inactive_accounts(conn):
-    """Keep retired strategy ledgers readable while excluding them from runs."""
-    placeholders = ",".join("?" for _ in ACTIVE_ACCOUNT_IDS)
-    conn.execute(
-        f"UPDATE paper_accounts SET status='disabled',updated_at=? "
-        f"WHERE id NOT IN ({placeholders}) AND status!='disabled'",
-        (_now(), *ACTIVE_ACCOUNT_IDS),
-    )
-
-
 def _reconcile_shared_cash(conn, cycle_id):
     """Repair cash drift from the one-time shared-pool migration.
 
@@ -2421,9 +2194,12 @@ def _reconcile_shared_cash(conn, cycle_id):
     difference proportionally to the strategy ledgers so the pool NAV cannot
     be understated.  The correction is idempotent and is audited.
     """
-    # Reconciliation includes every ledger bucket in the cycle, including
-    # retired accounts, so historical cash attribution remains balanced.
-    accounts = _rows(conn, "SELECT id,initial_cash,cash FROM paper_accounts WHERE cycle_id=? ORDER BY id", (cycle_id,))
+    active_clause, active_ids = _active_cycle_filter(conn, cycle_id, "id")
+    accounts = _rows(
+        conn,
+        f"SELECT id,initial_cash,cash FROM paper_accounts WHERE cycle_id=? AND {active_clause} ORDER BY id",
+        (cycle_id, *active_ids),
+    )
     if not accounts:
         return 0.0
     cycle = conn.execute("SELECT capital FROM paper_cycles WHERE id=?", (cycle_id,)).fetchone()
@@ -2433,11 +2209,13 @@ def _reconcile_shared_cash(conn, cycle_id):
     # money into the shared pool.
     initial_total = max(0.0, _num(cycle["capital"] if cycle else 0.0))
     ledger_net = conn.execute(
-        """SELECT COALESCE(SUM(CASE WHEN side='sell' THEN amount-fees
+        f"""SELECT COALESCE(SUM(CASE WHEN side='sell' THEN amount-fees
                                       WHEN side='buy' THEN -(amount+fees)
                                       ELSE 0 END),0)
-             FROM paper_fills WHERE account_id IN (SELECT id FROM paper_accounts WHERE cycle_id=?)""",
-        (cycle_id,),
+             FROM paper_fills WHERE account_id IN (
+                 SELECT id FROM paper_accounts WHERE cycle_id=? AND {active_clause}
+             )""",
+        (cycle_id, *active_ids),
     ).fetchone()[0]
     expected = initial_total + _num(ledger_net)
     actual = sum(_num(row.get("cash")) for row in accounts)
@@ -2469,9 +2247,10 @@ def _reconcile_shared_cash(conn, cycle_id):
 
 def _available_cycle_ledger_capital(conn, cycle, account_id):
     """Return unallocated economic capital without enlarging the cycle."""
+    active_clause, active_ids = _active_cycle_filter(conn, cycle["id"], "id")
     allocated = conn.execute(
-        "SELECT COALESCE(SUM(initial_cash),0) s,COUNT(*) n FROM paper_accounts WHERE cycle_id=? AND id<>?",
-        (cycle["id"], account_id),
+        f"SELECT COALESCE(SUM(initial_cash),0) s,COUNT(*) n FROM paper_accounts WHERE cycle_id=? AND id<>? AND {active_clause}",
+        (cycle["id"], account_id, *active_ids),
     ).fetchone()
     if int(allocated["n"] or 0) <= 0:
         return _num(cycle["capital"], 0.0) / max(len(ACTIVE_ACCOUNT_IDS), 1)
@@ -2484,15 +2263,16 @@ def _late_join_reference_capital(conn, cycle, account_id):
 
     Match the share already attributed to the sleeves funded in this cycle
     instead of re-dividing the cycle capital by the new strategy count.  The
-    funded sleeves keep their original share, so ``capital / len(ACTIVE_ACCOUNT_IDS)``
+    funded sleeves keep their original share, so ``capital / len(ACCOUNT_SPECS)``
     would compare strategies on different bases: with a 300k cycle the four
     funded sleeves hold 75k each while the late joiner would be measured on
     60k, inflating its percentage return for the same P&L.
     """
+    active_clause, active_ids = _active_cycle_filter(conn, cycle["id"], "id")
     funded = conn.execute(
-        """SELECT COALESCE(SUM(initial_cash),0) s, COUNT(*) n
-             FROM paper_accounts WHERE cycle_id=? AND id<>? AND initial_cash>0""",
-        (cycle["id"], account_id),
+        f"""SELECT COALESCE(SUM(initial_cash),0) s, COUNT(*) n
+             FROM paper_accounts WHERE cycle_id=? AND id<>? AND initial_cash>0 AND {active_clause}""",
+        (cycle["id"], account_id, *active_ids),
     ).fetchone()
     if int(funded["n"] or 0) > 0 and _num(funded["s"]) > 0:
         return round(_num(funded["s"]) / int(funded["n"]), 2)
@@ -2501,14 +2281,10 @@ def _late_join_reference_capital(conn, cycle, account_id):
 
 def _ensure_cycle(conn):
     """给旧版账户补一个可归档周期；不删除任何已有记录。"""
-    _disable_inactive_accounts(conn)
     active = conn.execute("SELECT * FROM paper_cycles WHERE status IN ('draft','running','paused') ORDER BY id DESC LIMIT 1").fetchone()
     if active is None:
-        placeholders = ",".join("?" for _ in ACTIVE_ACCOUNT_IDS)
-        account = conn.execute(
-            f"SELECT * FROM paper_accounts WHERE id IN ({placeholders}) ORDER BY id LIMIT 1",
-            ACTIVE_ACCOUNT_IDS,
-        ).fetchone()
+        first_active = ACTIVE_ACCOUNT_IDS[0] if ACTIVE_ACCOUNT_IDS else ""
+        account = conn.execute("SELECT * FROM paper_accounts WHERE id=?", (first_active,)).fetchone()
         capital = _num(account["initial_cash"], 100000.0) if account else 100000.0
         now = _now()
         key = "legacy-" + now.replace("-", "").replace(":", "").replace(" ", "-")
@@ -2520,18 +2296,16 @@ def _ensure_cycle(conn):
     # Only a synthetic legacy cycle may infer its declared capital from old
     # account ledgers.  A normal shared-pool cycle keeps paper_cycles.capital
     # authoritative; otherwise adding a strategy can silently enlarge it.
-    placeholders = ",".join("?" for _ in ACTIVE_ACCOUNT_IDS)
+    active_clause, active_ids = _active_cycle_filter(conn, active["id"], "id")
     account_total = conn.execute(
-        f"SELECT COALESCE(SUM(initial_cash),0) FROM paper_accounts "
-        f"WHERE cycle_id=? AND id IN ({placeholders})",
-        (active["id"], *ACTIVE_ACCOUNT_IDS),
+        f"SELECT COALESCE(SUM(initial_cash),0) FROM paper_accounts WHERE cycle_id=? AND {active_clause}",
+        (active["id"], *active_ids),
     ).fetchone()[0]
     if str(active["cycle_key"] or "").startswith("legacy-") and _num(account_total) > _num(active["capital"]):
         conn.execute("UPDATE paper_cycles SET capital=?,updated_at=? WHERE id=?",
                      (_num(account_total), _now(), active["id"]))
         active = conn.execute("SELECT * FROM paper_cycles WHERE id=?", (active["id"],)).fetchone()
-    for account_id in ACTIVE_ACCOUNT_IDS:
-        spec = ACCOUNT_SPECS[account_id]
+    for account_id, spec in ACTIVE_ACCOUNT_SPECS.items():
         current = conn.execute("SELECT * FROM paper_accounts WHERE id=?", (account_id,)).fetchone()
         if current is None:
             continue
@@ -2668,23 +2442,16 @@ def _active_cycle(conn):
 
 
 def _shared_account_rows(conn, cycle_id=None):
-    """Return every ledger bucket participating in the shared capital pool.
-
-    Retired sleeves remain in the aggregate cash/NAV ledger until their cycle
-    is archived.  Their ``disabled`` status keeps them out of live account
-    views and execution loops without silently dropping legacy capital from
-    the shared pool.
-    """
+    """Return the strategy ledgers participating in the shared capital pool."""
     if cycle_id is None:
         cycle = _active_cycle(conn)
         cycle_id = cycle["id"]
-    return _rows(conn, "SELECT * FROM paper_accounts WHERE cycle_id=? ORDER BY id", (cycle_id,))
-
-
-def _active_shared_account_rows(conn, cycle_id=None):
-    """Return only enabled sleeves for live UI and allocation decisions."""
-    rows = _shared_account_rows(conn, cycle_id)
-    return [row for row in rows if row.get("status") != "disabled"]
+    active_clause, active_ids = _active_cycle_filter(conn, cycle_id, "id")
+    return _rows(
+        conn,
+        f"SELECT * FROM paper_accounts WHERE cycle_id=? AND {active_clause} ORDER BY id",
+        (cycle_id, *active_ids),
+    )
 
 
 def _shared_initial_cash(conn, cycle=None):
@@ -2729,10 +2496,10 @@ def _economic_pool_nav_history(conn, cycle=None):
     references = {row["id"]: _account_reference_capital(row) for row in accounts}
     rows = _rows(
         conn,
-        """SELECT account_id,nav_date,nav FROM paper_nav
-             WHERE account_id IN (SELECT id FROM paper_accounts WHERE cycle_id=?)
+        f"""SELECT account_id,nav_date,nav FROM paper_nav
+             WHERE account_id IN (SELECT id FROM paper_accounts WHERE cycle_id=? AND {_active_cycle_filter(conn, cycle['id'], 'id')[0]})
              ORDER BY nav_date,account_id""",
-        (cycle["id"],),
+        (cycle["id"], *_active_cycle_filter(conn, cycle["id"], "id")[1]),
     )
     dates = sorted({str(row.get("nav_date")) for row in rows if row.get("nav_date")})
     by_account = {}
@@ -2966,12 +2733,11 @@ def _shared_risk_state(conn, account, nav, asof_day):
 
 
 def _rows(conn, sql, params=()):
-    return [dict(row) for row in conn.execute(sql, params).fetchall()]
+    return PRP.rows(conn, sql, params)
 
 
 def _audit(conn, account_id, event, detail):
-    conn.execute("INSERT INTO paper_audit(account_id,event,detail,created_at) VALUES(?,?,?,?)",
-                 (account_id, event, detail, _now()))
+    return PRP.audit(conn, account_id, event, detail, _now())
 
 
 def _volatility_shadow(code, asof_day, price=None):
@@ -3267,28 +3033,7 @@ def _position_rows(conn, account_id=None, asof_day=None, readonly=False):
         sql += " AND account_id=?"
         params.append(account_id)
     lots = _rows(conn, sql, tuple(params))
-    grouped = {}
-    for lot in lots:
-        key = (lot["account_id"], lot["code"])
-        item = grouped.setdefault(key, {
-            "account_id": lot["account_id"], "code": lot["code"], "name": lot.get("name"),
-            "industry": lot.get("industry") or "未知", "qty": 0, "cost_amount": 0.0,
-            "entry_date": lot["acquired_at"][:10], "available_qty": 0, "locked_qty": 0,
-            "asset_type": lot.get("asset_type") or "stock_t1", "available_date": lot["available_date"],
-        })
-        qty = int(lot["remaining_qty"])
-        item["qty"] += qty
-        item["cost_amount"] += qty * _num(lot["cost"])
-        if str(lot.get("acquired_at") or "")[:10] == day:
-            item["today_acquired_qty"] = int(item.get("today_acquired_qty") or 0) + qty
-            item["today_acquired_cost"] = _num(item.get("today_acquired_cost")) + qty * _num(lot["cost"])
-        item["entry_date"] = min(item["entry_date"], lot["acquired_at"][:10])
-        item["available_date"] = min(item["available_date"], lot["available_date"])
-        if lot["available_date"] <= day:
-            item["available_qty"] += qty
-        else:
-            item["locked_qty"] += qty
-    legacy = {(p["account_id"], p["code"]): p for p in _rows(conn, "SELECT * FROM paper_positions")}
+    legacy_rows = _rows(conn, "SELECT * FROM paper_positions")
     # 终端展示常用“摊薄成本”：已卖出部分的净回款抵减尚未卖出仓位成本。
     # 风控、卖出结转仍使用下面的 FIFO settlement_cost，不能用摊薄成本替代。
     cash_flows = {
@@ -3301,44 +3046,25 @@ def _position_rows(conn, account_id=None, asof_day=None, readonly=False):
                  FROM paper_orders WHERE status='filled' GROUP BY account_id,code""",
         )
     }
-    out = []
-    for key, item in grouped.items():
-        item["cost"] = item.pop("cost_amount") / max(item["qty"], 1)
-        item["settlement_cost"] = item["cost"]
-        flow = cash_flows.get(key) or {}
-        net_invested = _num(flow.get("buy_cash")) - _num(flow.get("sell_cash"))
-        item["display_cost"] = net_invested / max(item["qty"], 1)
-        old = legacy.get(key, {})
-        item["peak_price"] = _num(old.get("peak_price"), item["cost"])
-        item["take_stage"] = int(_num(old.get("take_stage"), 0))
-        out.append(item)
-    return out
+    return PP.aggregate_positions(
+        lots,
+        legacy_rows,
+        cash_flows,
+        day,
+        num=_num,
+    )
 
 
 # 今日盈亏可接受的报价来源白名单。dashboard_cache 是 overview 读模型从
 # 全市场快照缓存（盘中每 3 分钟由 intraday 扫描刷新）打的标签，quote_at
 # 与 live 同源同鲜度；只排除 local_cache（universe.json 陈旧价）。
 # 此前硬编码 == "live" 导致仪表盘路径今日盈亏永远显示"交易中"占位。
-_TODAY_PNL_QUOTE_SOURCES = {"live", "dashboard_cache", "live_snapshot"}
+_TODAY_PNL_QUOTE_SOURCES = PPerf.TODAY_PNL_QUOTE_SOURCES
 
 
 def _today_quote_is_usable(quote, asof_day):
     """Require a same-day, bounded-age mark before publishing daily P&L."""
-    if not isinstance(quote, dict) or quote.get("quote_source") not in _TODAY_PNL_QUOTE_SOURCES:
-        return False
-    quote_at = str(quote.get("quote_at") or "")
-    if quote_at[:10] != _date(asof_day).isoformat():
-        return False
-    try:
-        parsed = dt.datetime.fromisoformat(quote_at.replace("Z", "+00:00"))
-        if parsed.tzinfo is None:
-            parsed = parsed.replace(tzinfo=dt.timezone(dt.timedelta(hours=8)))
-        if _date(asof_day) != dt.date.today():
-            return True
-        age_seconds = (dt.datetime.now(dt.timezone.utc) - parsed.astimezone(dt.timezone.utc)).total_seconds()
-        return -120 <= age_seconds <= 20 * 60
-    except (TypeError, ValueError, OverflowError):
-        return False
+    return PPerf.quote_is_usable(quote, asof_day, date_fn=_date)
 
 
 def _open_runup_bonus(now=None):
@@ -3360,27 +3086,15 @@ def _open_runup_bonus(now=None):
 
 def _today_position_performance(position, price, quote, asof_day=None):
     """今日盈亏按持仓来源分段：当日买入按成交成本，隔夜仓按昨收。"""
-    day = _date(asof_day).isoformat()
-    # 只对当天的实时盘面应用交易时段门控；历史回看仍按历史行情计算。
-    if day == dt.date.today().isoformat() and not _market_session()["today_pnl_available"]:
-        return None, None, None
-    if not _today_quote_is_usable(quote, asof_day):
-        return None, None, None
-    qty = int(_num(position.get("qty")))
-    if qty <= 0 or price <= 0:
-        return None, None, None
-    bought_today = min(int(_num(position.get("today_acquired_qty"))), qty)
-    today_cost = _num(position.get("today_acquired_cost"))
-    carried_qty = qty - bought_today
-    quote_pct = _num(quote.get("pct"), None)
-    if carried_qty and (quote_pct is None or quote_pct <= -99.9):
-        return None, None, None
-    previous_close = _num(quote.get("previous_close"), 0.0) if carried_qty else 0.0
-    if carried_qty and previous_close <= 0:
-        previous_close = price / (1 + quote_pct / 100)
-    baseline = today_cost + carried_qty * previous_close
-    pnl = (price * bought_today - today_cost) + (price - previous_close) * carried_qty
-    return round(pnl, 2), (round(pnl / baseline * 100, 2) if baseline else None), round(baseline, 2)
+    return PPerf.position_performance(
+        position,
+        price,
+        quote,
+        asof_day,
+        date_fn=_date,
+        market_session=_market_session,
+        num=_num,
+    )
 
 
 def _today_sell_performance(sells, quotes, asof_day=None):
@@ -3391,38 +3105,13 @@ def _today_sell_performance(sells, quotes, asof_day=None):
     all gains/losses since acquisition to the sell date and double count the
     dashboard's daily movement.
     """
-    day = _date(asof_day).isoformat()
-    pnl = 0.0
-    baseline = 0.0
-    covered = 0
-    missing = []
-    for order in sells:
-        quote = quotes.get(str(order.get("code") or "")) or {}
-        if not _today_quote_is_usable(quote, asof_day):
-            missing.append(str(order.get("code") or ""))
-            continue
-        price = _num(quote.get("price"), 0.0)
-        pct = _num(quote.get("pct"), None)
-        qty = int(_num(order.get("qty")))
-        fill_price = _num(order.get("filled_price"), 0.0)
-        if price <= 0 or pct is None or pct <= -99.9 or qty <= 0 or fill_price <= 0:
-            missing.append(str(order.get("code") or ""))
-            continue
-        previous_close = _num(quote.get("previous_close"), 0.0)
-        if previous_close <= 0:
-            previous_close = price / (1 + pct / 100)
-        basis = previous_close * qty
-        proceeds = fill_price * qty - _num(order.get("fees"))
-        pnl += proceeds - basis
-        baseline += basis
-        covered += 1
-    return {
-        "pnl": round(pnl, 2),
-        "baseline": round(baseline, 2),
-        "covered": covered,
-        "total": len(sells),
-        "missing_codes": sorted({code for code in missing if code}),
-    }
+    return PPerf.sell_performance(
+        sells,
+        quotes,
+        asof_day,
+        date_fn=_date,
+        num=_num,
+    )
 
 
 def _sync_positions(conn, account_id=None, asof_day=None):
@@ -3584,90 +3273,17 @@ def _strategy_reference_is_usable(account_id, reference_date, asof_date):
 
 
 def _quote_is_fresh(quote, asof_date):
-    """只有带源时间戳的当日公开行情才可触发成交。"""
-    if not quote or quote.get("quote_source") != "live":
-        return False
-    try:
-        quote_time = dt.datetime.fromisoformat(str(quote.get("quote_at") or ""))
-    except (TypeError, ValueError):
-        return False
-    day = _date(asof_date)
-    if quote_time.date() != day:
-        return False
-    # 回放历史日期时只校验源日期；当日运行还要防止接口返回长时间未更新的收盘价。
-    if day != dt.date.today():
-        return True
-    now = dt.datetime.now(quote_time.tzinfo) if quote_time.tzinfo else dt.datetime.now()
-    age_seconds = (now - quote_time).total_seconds()
-    return -120 <= age_seconds <= 20 * 60
+    return PQP.quote_is_fresh(quote, asof_date, date_fn=_date)
 
 
 def _is_trading_active(quote):
-    """判断股票是否在活跃交易（非停牌）。"""
-    pct = _num(quote.get("pct"), None)
-    amount = _num(quote.get("amount"), 0)
-    turnover = _num(quote.get("turnover"), 0)
-    volume = _num(quote.get("volume"), 0)
-    if pct == 0 and amount == 0 and turnover == 0 and volume == 0:
-        return False
-    return True
+    return PQP.is_trading_active(quote, num=_num)
 
 
 def _execution_quote_status(quote, asof_date, purpose="entry"):
-    """自动成交行情门禁。
-
-    开仓与回补必须双源核验；风险卖出允许在主行情带当日时间戳且数值有效时
-    降级执行，避免备用公共接口短暂故障把止损/止盈仓位锁死。
-    """
-    if not quote:
-        return {"fresh": False, "status": "missing", "reason": "缺少行情"}
-    cross = dict(quote.get("quote_cross_check") or {})
-    validation = str(quote.get("quote_validation") or "")
-    diagnostics = {
-        "quote_source": quote.get("quote_source"),
-        "quote_validation": validation or None,
-        "quote_at": quote.get("quote_at"),
-        "quote_cross_check": cross,
-    }
-    if validation == "incomplete":
-        return {"fresh": False, "status": "invalid", "reason": "主行情价格或涨跌幅无效", **diagnostics}
-    if quote.get("quote_source") != "live":
-        return {
-            "fresh": False,
-            "status": "local_cache",
-            "reason": "行情来自本地缓存，禁止虚构自动成交",
-            "quote_at": quote.get("quote_at"),
-            **diagnostics,
-        }
-    if not _quote_is_fresh(quote, asof_date):
-        return {
-            "fresh": False,
-            "status": "stale",
-            "reason": "实时行情源时间戳已过期，等待下一次有效报价",
-            "quote_at": quote.get("quote_at"),
-            **diagnostics,
-        }
-    if quote.get("quote_validation") == "cross_source_checked":
-        return {
-        "fresh": True,
-        "status": "cross_source_checked",
-        "reason": "带当日源时间戳且双源核验通过的实时行情",
-        "quote_at": quote.get("quote_at"),
-        **diagnostics,
-    }
-    if validation == "cross_source_failed":
-        detail = cross.get("failure_reason") or "独立行情源返回结果与主行情不一致"
-        return {"fresh": False, "status": "cross_source_failed", "reason": detail, **diagnostics}
-    if validation == "cross_source_unavailable":
-        detail = cross.get("failure_reason") or "本次未获得独立行情源的有效返回"
-        if purpose == "exit":
-            return {"fresh": True, "status": "degraded_cross_source", "reason": detail + "；仅允许风控退出", "degraded": True, **diagnostics}
-        # 自动开仓、回补和确认加仓必须与最初信号使用同一双源门槛。
-        # 单源降级只适用于风险退出，不能在待买信号生成后绕过复核。
-        return {"fresh": False, "status": "cross_source_unavailable", "reason": detail + "；自动买入等待双源恢复", **diagnostics}
-    if validation == "range_timestamp_checked" and purpose == "exit":
-        return {"fresh": True, "status": "degraded_cross_source", "reason": "主行情新鲜有效，但未完成独立行情源校验；仅允许风控退出", "degraded": True, **diagnostics}
-    return {"fresh": False, "status": "unverified", "reason": "未获得通过的独立行情源校验结果", **diagnostics}
+    return PQP.execution_quote_status(
+        quote, asof_date, purpose=purpose, quote_fresh=_quote_is_fresh
+    )
 def _market_state(asof_date, live_universe=None, *, allow_network=True):
     """实时指数决定当日门控；历史日线只提供中期趋势，不冒充盘中行情。"""
     # 盘中市场宽度必须使用同一轮全市场实时快照，不能读取可能滞后数日的
@@ -3732,7 +3348,7 @@ def _market_state(asof_date, live_universe=None, *, allow_network=True):
     elif stale and live_pct is not None:
         # 盘中最后一根完整日线落后一个交易日是正常现象；只要实时指数
         # 有当日时间戳，就按保守黄灯运行，不能把“趋势待更新”误判成未知
-        # 并暂停所有启用策略的新开仓。
+        # 并暂停四套策略全部新开仓。
         light = "red" if overseas.get("light") == "red" or live_pct <= -2.0 else "yellow"
         reason = f"实时沪深300 {live_pct:+.2f}%；中期趋势收盘数据待更新，按谨慎仓位执行"
     elif stale:
@@ -3996,7 +3612,7 @@ def _rebuild_selection_factor_cache(asof_date=None):
         and _security_scope(row.get("code"), row.get("name"), row.get("risk_flag"))["allowed"]
     }
     built_codes = set(price_f.index.astype(str)) if not price_f.empty else set()
-    date_by_code = dict(zip(price_f.index.astype(str), price_f["last_date"].astype(str))) if "last_date" in price_f else {}
+    date_by_code = dict(zip(price_f.index.astype(str), price_f["last_date"].astype(str), strict=True)) if "last_date" in price_f else {}
     exact_codes = {
         code for code in built_codes
         if str(date_by_code.get(code) or "")[:10] == cutoff.isoformat()
@@ -4213,7 +3829,7 @@ def _new_listing_entry_assessment(account, pick, quote, kline, listing, market=N
         if liquidity.get("history_median"):
             detail += f"（近{int(policy.get('liquidity_lookback', 5))}日中位 ¥{_num(liquidity.get('history_median')):,.0f}，{liquidity.get('source')}）"
         else:
-            detail += f"（历史成交额不足，采用基础底线）"
+            detail += "（历史成交额不足，采用基础底线）"
         reasons.append(detail)
     if amount <= 0:
         reasons.append("新股缺少成交额，无法评估流动性")
@@ -4947,7 +4563,6 @@ def _sector_overheat_guard(kline, quote=None, candidate_heat=None):
             streak += 1
         else:
             break
-    current_pct = _num(quote.get("pct"), 0.0)
     intraday_high = _num(quote.get("high"), 0.0)
     open_price = _num(quote.get("open_price"), 0.0)
     intraday_pullback_pct = (
@@ -7322,7 +6937,7 @@ def generate_signals(asof_date=None):
         reason = factor_refresh.get("reason") or factor_refresh.get("error") or "完整日线因子未就绪"
         summary.update({"status": "blocked", "reason": reason})
         with _db() as conn:
-            accounts = _rows(conn, "SELECT * FROM paper_accounts WHERE status='running'")
+            accounts = _active_account_rows(conn, status="running")
             for account in accounts:
                 detail = f"{reason}；{_json(factor_refresh.get('refresh_gate') or {})}"
                 _audit(conn, account["id"], "close_signal_blocked_history", detail)
@@ -7338,7 +6953,7 @@ def generate_signals(asof_date=None):
         )
         summary.update({"status": "blocked", "reason": reason})
         with _db() as conn:
-            for account in _rows(conn, "SELECT * FROM paper_accounts WHERE status='running'"):
+            for account in _active_account_rows(conn, status="running"):
                 _audit(conn, account["id"], "close_signal_blocked_market", reason)
                 summary["accounts"].append({
                     "id": account["id"], "created": 0, "blocked": True,
@@ -7366,7 +6981,7 @@ def generate_signals(asof_date=None):
     # _quotes/_news_for made network calls; a slow source could block fills,
     # risk exits and the API for minutes.
     with _db_readonly() as read_conn:
-        accounts = _rows(read_conn, "SELECT * FROM paper_accounts WHERE status='running'")
+        accounts = _active_account_rows(read_conn, status="running")
     candidate_batches = []
     all_names = {}
     all_codes = set()
@@ -7521,7 +7136,7 @@ def backfill_research_shadow(asof_date=None):
         "accounts": [],
     }
     with _db() as conn:
-        accounts = _rows(conn, "SELECT * FROM paper_accounts WHERE status='running'")
+        accounts = _active_account_rows(conn, status="running")
         for account in accounts:
             candidates, meta = _candidate_rows(
                 account, day, market, sector_rows=sector_rows, live_universe=close_universe,
@@ -7621,26 +7236,6 @@ def _risk_profile(account, asof_day=None):
     for key, value in (INTRADAY_DOWNSIDE_POLICIES.get(account_id) or {}).items():
         profile[f"downside_{key}"] = value
     params = _loads(account.get("params"), {})
-    trading_mode = _validate_trading_mode(params.get("trading_mode"))
-    mode_profile = TRADING_MODE_PROFILES[trading_mode]
-    # Only soft execution posture values are adjusted here.  The executor's
-    # independent hard gates (T+1, quote validity, price limits, shared pool,
-    # position caps and stop-loss protection) remain authoritative elsewhere.
-    profile["min_cost_edge"] = max(
-        0.0,
-        _num(profile.get("min_cost_edge"), 0.0) * mode_profile["min_cost_edge_scale"],
-    )
-    profile["max_weight"] = min(
-        _num(profile.get("max_weight"), 0.0),
-        _num(profile.get("max_weight"), 0.0) * mode_profile["max_weight_scale"],
-    )
-    profile["max_exposure"] = min(
-        _num(profile.get("max_exposure"), 0.0),
-        _num(profile.get("max_exposure"), 0.0) * mode_profile["max_exposure_scale"],
-    )
-    profile["cooldown_days"] = max(2, int(profile.get("cooldown_days", 2)) + int(mode_profile["cooldown_delta"]))
-    profile["trading_mode"] = trading_mode
-    profile["trading_mode_name"] = mode_profile["name"]
     overlay = params.get("adaptive_risk") or {}
     meta = params.get("adaptive_risk_meta") or {}
     if _runtime_parameter_active(
@@ -7653,26 +7248,6 @@ def _risk_profile(account, asof_day=None):
             profile[key] = int(round(value)) if key == "cooldown_days" else round(value, 6)
         profile["adaptive_version"] = meta.get("version")
         profile["adaptive_candidate_id"] = meta.get("candidate_id")
-    # Re-apply the user posture after any adaptive overlay so an automated
-    # candidate can never silently relax the selected calm/balanced bounds.
-    if trading_mode != "aggressive":
-        profile["max_weight"] = min(
-            _num(profile.get("max_weight"), 0.0),
-            _num(RISK_PROFILES.get(account.get("risk_profile"), RISK_PROFILES[default_key]).get("max_weight"), 0.0)
-            * mode_profile["max_weight_scale"],
-        )
-        profile["max_exposure"] = min(
-            _num(profile.get("max_exposure"), 0.0),
-            _num(RISK_PROFILES.get(account.get("risk_profile"), RISK_PROFILES[default_key]).get("max_exposure"), 0.0)
-            * mode_profile["max_exposure_scale"],
-        )
-    profile["min_cost_edge"] = max(
-        0.0,
-        _num(RISK_PROFILES.get(account.get("risk_profile"), RISK_PROFILES[default_key]).get("min_cost_edge"), 0.0)
-        * mode_profile["min_cost_edge_scale"],
-    )
-    profile["trading_mode"] = trading_mode
-    profile["trading_mode_name"] = mode_profile["name"]
     return profile
 
 
@@ -7822,15 +7397,12 @@ def _dynamic_position_limits(conn):
     through the staged, T+1/quote/limit-aware capacity-exit path.
     """
     cycle = _active_cycle(conn)
-    all_rows = _active_shared_account_rows(conn, cycle["id"])
+    all_rows = _shared_account_rows(conn, cycle["id"])
     running_rows = [row for row in all_rows if row.get("status") == "running"]
     rows = running_rows or all_rows
     account_ids = [key for key in ACCOUNT_SPECS if any(row.get("id") == key for row in rows)]
     if not account_ids:
-        # A partially initialized/legacy ledger must still fail closed to the
-        # public release allow-list; never recreate retired strategy sleeves
-        # merely because the live account rows are temporarily unavailable.
-        account_ids = list(ACTIVE_ACCOUNT_IDS)
+        account_ids = list(ACCOUNT_SPECS)
     row_map = {row.get("id"): row for row in rows}
     profiles = {
         account_id: _risk_profile(row_map.get(account_id) or {"id": account_id})
@@ -7880,43 +7452,22 @@ def _dynamic_position_limits(conn):
         }
     count = len(account_ids)
     baseline = sum(_num(ACCOUNT_SPECS[key].get("max_exposure"), 0.0) for key in account_ids) / max(count, 1)
-    current = sum(weights.values()) / max(count, 1)
-    # The hard cap is 15.  A material aggregate risk reduction leaves
-    # one or more seats empty instead of pretending every strategy should be
-    # fully deployed.  With four models, each retains a protected expression
-    # floor when the risk budget permits; the risk profile still
-    # constrains capital, single-name size and entry permission.
-    hard_cap = min(SHARED_POOL_MAX_POSITIONS, STRATEGY_MAX_POSITIONS * count)
-    risk_scale = max(0.60, min(1.0, current / max(baseline, 0.01)))
-    base_floor_total = min(hard_cap, STRATEGY_MIN_POSITIONS * count)
-    total_cap = max(base_floor_total, min(hard_cap, int(round(hard_cap * risk_scale))))
-    protected_floor = (
-        min(STRATEGY_PROTECTED_SLOT_FLOOR, STRATEGY_MAX_POSITIONS)
-        if total_cap >= STRATEGY_PROTECTED_SLOT_FLOOR * count else
-        STRATEGY_MIN_POSITIONS
+    allocation = PA.position_limits(
+        account_ids,
+        weights,
+        baseline,
+        hard_pool_cap=SHARED_POOL_MAX_POSITIONS,
+        strategy_max_positions=STRATEGY_MAX_POSITIONS,
+        strategy_min_positions=STRATEGY_MIN_POSITIONS,
+        protected_slot_floor=STRATEGY_PROTECTED_SLOT_FLOOR,
+        account_order={key: idx for idx, key in enumerate(ACCOUNT_SPECS)},
+        main_force_id=MAIN_FORCE_STRATEGY_ID,
     )
-    minimum = min(protected_floor, total_cap // max(count, 1))
-    weight_total = sum(weights.values()) or 1.0
-    raw = {key: total_cap * weights[key] / weight_total for key in account_ids}
-    strategy_caps = {key: (3 if key == MAIN_FORCE_STRATEGY_ID else STRATEGY_MAX_POSITIONS)
-                     for key in account_ids}
-    limits = {
-        key: max(minimum, min(strategy_caps[key], int(raw[key])))
-        for key in account_ids
-    }
-    order = {key: idx for idx, key in enumerate(ACCOUNT_SPECS)}
-    while sum(limits.values()) < total_cap:
-        candidates = [key for key in account_ids if limits[key] < strategy_caps[key]]
-        if not candidates:
-            break
-        key = max(candidates, key=lambda item: (raw[item] - limits[item], weights[item], -order.get(item, 99)))
-        limits[key] += 1
-    while sum(limits.values()) > total_cap:
-        candidates = [key for key in account_ids if limits[key] > minimum]
-        if not candidates:
-            break
-        key = max(candidates, key=lambda item: (limits[item] - raw[item], -weights[item], order.get(item, 99)))
-        limits[key] -= 1
+    risk_scale = allocation["risk_scale"]
+    protected_floor = allocation["protected_slot_floor"]
+    total_cap = allocation["total_cap"]
+    limits = allocation["limits"]
+    current = sum(weights.values()) / max(count, 1)
     now = _now()
     cursor = conn.execute(
         """INSERT INTO paper_position_limit_versions(
@@ -7951,7 +7502,7 @@ def _strategy_pool_budget(conn, account, nav, positions, quotes, market=None, ex
     actual additional amount this strategy may open right now.  All values
     are derived from the same live quote snapshot used by the order gate.
     """
-    rows = _active_shared_account_rows(conn)
+    rows = _shared_account_rows(conn)
     if not rows:
         rows = [account]
     values = {}
@@ -7980,106 +7531,23 @@ def _strategy_pool_budget(conn, account, nav, positions, quotes, market=None, ex
     pending_by_account, pending_total = _pending_buy_reservations(
         conn, exclude_order_key=exclude_reservation_key,
     )
-    nav = max(_num(nav), 0.0)
-    pool_cap_amount = nav * SHARED_POOL_MAX_EXPOSURE
-    pool_value = sum(values.values())
-    # Pending buys consume both cash and pool capacity before they fill.
-    # They are not added to market value, so keep the two figures explicit.
-    global_remaining = max(0.0, pool_cap_amount - pool_value - pending_total)
-    weight_total = sum(weights.values()) or 1.0
-    base_target_pct = {
-        key: SHARED_POOL_MAX_EXPOSURE * weight / weight_total
-        for key, weight in weights.items()
-    }
     market_light = str((market or {}).get("light") or "").lower()
     # A missing market argument is used by read-only dashboard aggregation;
     # the execution path always supplies the current market gate.
     scales = market_light_scales(market_light) if market_light else None
-    target_pct = {
-        key: value * (scales.get(key, 0.0) if scales is not None else 1.0)
-        for key, value in base_target_pct.items()
-    }
-    floor_pct = {key: value * STRATEGY_POOL_FLOOR_RATIO for key, value in target_pct.items()}
-    account_id = account.get("id")
-    # 主力资金优先：最低份额不随市场灯色缩到无法买入一手高价股。该份额
-    # 写入 floor_pct 后，其他策略的保留资金会自动把它视为受保护额度。
-    priority_floor_amount = (
-        nav * MAIN_FORCE_PRIORITY_FLOOR_PCT
-        if account_id == MAIN_FORCE_STRATEGY_ID else 0.0
+    return PA.strategy_pool_budget(
+        account_id=account.get("id"),
+        values=values,
+        weights=weights,
+        pending_by_account=pending_by_account,
+        pending_total=pending_total,
+        nav=_num(nav),
+        market_scales=scales,
+        shared_pool_max_exposure=SHARED_POOL_MAX_EXPOSURE,
+        strategy_pool_floor_ratio=STRATEGY_POOL_FLOOR_RATIO,
+        main_force_id=MAIN_FORCE_STRATEGY_ID,
+        main_force_priority_floor_pct=MAIN_FORCE_PRIORITY_FLOOR_PCT,
     )
-    if priority_floor_amount > 0.0:
-        target_pct[account_id] = max(
-            target_pct.get(account_id, 0.0), MAIN_FORCE_PRIORITY_FLOOR_PCT)
-        floor_pct[account_id] = max(
-            floor_pct.get(account_id, 0.0), MAIN_FORCE_PRIORITY_FLOOR_PCT)
-    current_amount = values.get(account_id, 0.0)
-    pending_strategy_amount = pending_by_account.get(account_id, 0.0)
-    current_total_amount = current_amount + pending_strategy_amount
-    target_amount = nav * target_pct.get(account_id, 0.0)
-    floor_amount = nav * floor_pct.get(account_id, 0.0)
-    own_headroom = max(0.0, target_amount - current_total_amount)
-    other_floor_reserve = sum(
-        max(0.0, nav * floor_pct.get(key, 0.0)
-            - values.get(key, 0.0) - pending_by_account.get(key, 0.0))
-        for key in values if key != account_id
-    )
-    after_floor = max(0.0, global_remaining - other_floor_reserve)
-    other_floors_met = all(
-        values.get(key, 0.0) + pending_by_account.get(key, 0.0) + 1e-6
-        >= nav * floor_pct.get(key, 0.0)
-        for key in values if key != account_id
-    )
-    # Only capacity left after the other floors are protected may be
-    # redistributed above this strategy's target.
-    redistribution = max(0.0, after_floor - own_headroom) if other_floors_met else 0.0
-    allowance = min(global_remaining, after_floor, own_headroom + redistribution)
-    # Sector rotation is the shortest-horizon and most concentrated sleeve.
-    # Its shared-pool budget must not turn into implicit leverage when account
-    # NAV is reduced by inter-sleeve transfers.  Cap gross committed value at
-    # 100% of its own NAV; exits and risk actions are unaffected.
-    if account_id == "sector_rotation" and nav > 0:
-        sector_cap = nav
-        allowance = min(allowance, max(0.0, sector_cap - current_total_amount))
-    # Gross committed cap: current holding + already-reserved pending orders
-    # + the net new allowance.  The sizing layer subtracts current and pending
-    # once, so pending capital is no longer double-counted.
-    absolute_cap = current_total_amount + max(0.0, allowance)
-    return {
-        "account_id": account_id,
-        "target_pct": round(target_pct.get(account_id, 0.0) * 100, 2),
-        "base_target_pct": round(base_target_pct.get(account_id, 0.0) * 100, 2),
-        "market_scale_pct": round((scales.get(account_id, 0.0) if scales is not None else 1.0) * 100, 1),
-        # target_amount / absolute_cap_amount above already include the
-        # market-light multiplier.  Callers must not multiply the same market
-        # coefficient a second time when turning remaining budget into shares.
-        "market_scale_applied": bool(scales is not None),
-        "floor_pct": round(floor_pct.get(account_id, 0.0) * 100, 2),
-        "priority_floor_pct": (
-            round(MAIN_FORCE_PRIORITY_FLOOR_PCT * 100, 2)
-            if priority_floor_amount > 0.0 else None),
-        "priority_floor_amount": round(priority_floor_amount, 2),
-        "current_pct": round(current_amount / nav * 100, 2) if nav else 0.0,
-        "target_amount": round(target_amount, 2),
-        "floor_amount": round(floor_amount, 2),
-        "current_amount": round(current_amount, 2),
-        "pending_reserve_amount": round(pending_strategy_amount, 2),
-        "current_total_amount": round(current_total_amount, 2),
-        "allowance_amount": round(max(0.0, allowance), 2),
-        "absolute_cap_amount": round(max(0.0, absolute_cap), 2),
-        "global_remaining_amount": round(global_remaining, 2),
-        "other_floor_reserve": round(other_floor_reserve, 2),
-        "redistribution_amount": round(redistribution, 2),
-        "redistribution_allowed": bool(redistribution > 0.0),
-        "pool_value": round(pool_value, 2),
-        "pool_cap_amount": round(pool_cap_amount, 2),
-        "pool_exposure_pct": round(pool_value / nav * 100, 2) if nav else 0.0,
-        "pending_pool_reserve_amount": round(pending_total, 2),
-        "pool_committed_amount": round(pool_value + pending_total, 2),
-        "pool_committed_pct": round((pool_value + pending_total) / nav * 100, 2) if nav else 0.0,
-        "pool_available_amount": round(global_remaining, 2),
-        "pool_limit_pct": round(SHARED_POOL_MAX_EXPOSURE * 100, 2),
-        "other_floors_met": bool(other_floors_met),
-    }
 
 
 def _entry_execution_scale(market_policy, entry_model, chase_entry, dynamic_news, strategy_budget):
@@ -8193,60 +7661,13 @@ def _price_aware_qty(
     strategy_cap_amount=None, pool_cap_amount=None,
     pending_strategy_amount=0.0, pending_pool_amount=0.0,
 ):
-    """按股数计算下单规模；数量席位是容量硬门，金额约束只做软 sizing。
-
-    现金、行情、T+1、跌停和硬风险仍由调用方的安全门禁负责；这里的
-    strategy/pool/industry amount limits 只决定本次最多下多少股。若不足一手，
-    调用方应把候选放入等待池，等待额度释放后按最新行情复核。
-    """
-    if fill_price <= 0:
-        return 0, {"target_amount": 0.0, "reason": "无有效价格"}
-    loss_per_share = fill_price * max(abs(hard_stop), 0.01)
-    risk_budget = nav * profile["single_risk"]
-    by_risk = risk_budget / loss_per_share
-    by_weight = max(0.0, nav * profile["max_weight"] - code_value) / fill_price
-    profile_exposure = _num(max_exposure_cap, profile["max_exposure"])
-    effective_exposure = min(profile_exposure, _num(exposure_cap, profile_exposure))
-    # 市场黄灯的仓位系数只作用于“剩余可用额度”。
-    # 旧逻辑把 max_exposure 直接乘 risk_scale，导致已有持仓超过缩小后的新上限时，
-    # 可用额度被算成 0；例如 65% 上限、当前 49.7% 持仓、黄灯 65% 时会错误得到 42.25% 上限。
-    scale = max(0.0, min(_num(exposure_scale, 1.0), 1.0))
-    pool_limit = nav * effective_exposure if pool_cap_amount is None else _num(pool_cap_amount)
-    pool_remaining = max(
-        0.0,
-        pool_limit - _num(position_value) - max(0.0, _num(pending_pool_amount)),
+    return PSZ.price_aware_qty(
+        nav, cash, position_value, industry_value, code_value,
+        fill_price, hard_stop, profile, exposure_cap, max_exposure_cap,
+        exposure_scale, strategy_position_value, strategy_cap_amount,
+        pool_cap_amount, pending_strategy_amount, pending_pool_amount,
+        num=_num, lot_size=LOT_SIZE,
     )
-    if strategy_cap_amount is None:
-        strategy_remaining = pool_remaining
-    else:
-        strategy_remaining = max(
-            0.0,
-            _num(strategy_cap_amount) - _num(strategy_position_value)
-            - max(0.0, _num(pending_strategy_amount)),
-        )
-    remaining_exposure = min(pool_remaining, strategy_remaining)
-    by_exposure = remaining_exposure * scale / fill_price
-    by_industry = max(0.0, nav * profile["max_industry"] - industry_value) / fill_price
-    by_cash = max(0.0, cash) / fill_price
-    limits = {
-        "risk": by_risk, "weight": by_weight, "exposure": by_exposure,
-        "industry": by_industry, "cash": by_cash,
-    }
-    shares = min(limits.values())
-    qty = int(shares / LOT_SIZE) * LOT_SIZE
-    binding = [name for name, value in limits.items() if value <= shares + 1e-6]
-    return max(qty, 0), {
-        "risk_budget": round(risk_budget, 2), "loss_per_share": round(loss_per_share, 4),
-        "target_amount": round(qty * fill_price, 2), "price": round(fill_price, 4),
-        "effective_max_exposure_pct": round(effective_exposure * 100, 1),
-        "pool_remaining_amount": round(pool_remaining, 2),
-        "strategy_remaining_amount": round(strategy_remaining, 2),
-        "pending_pool_amount": round(max(0.0, _num(pending_pool_amount)), 2),
-        "pending_strategy_amount": round(max(0.0, _num(pending_strategy_amount)), 2),
-        "new_exposure_scale_pct": round(scale * 100, 1),
-        "constraint_shares": {name: round(value, 2) for name, value in limits.items()},
-        "binding_constraints": binding,
-    }
 
 
 def _exceptional_opportunity(account, pick, quote, market, entry_model, q, risk_state, asof_day, conn):
@@ -8517,17 +7938,38 @@ def _buy_order(conn, account, signal, quote, market, news, asof_day, *, all_quot
     } | pending_slots
     # 主力独立席位保障（2026-08-31 复核 P2）：主力空仓时，其他策略不得
     # 占用共享池最后一个空席——否则满席后已通过的主力候选会饿死。
+    # P1 死锁修复（2026-09-03）：预留仅在 ①主力当日确有在途候选（排队/
+    # 等待复核的非终态信号）且 ②未到 14:30 放行时限时生效；主力全天无
+    # 候选或临近收盘仍未建仓时，最后一席交还其他策略，避免"主力等确认、
+    # 其他策略等席位"的双向空等。查询异常时维持原预留行为（fail-closed）。
+    mf_seat_interest = 0
     mf_seat_reserved = (
         account["id"] != MAIN_FORCE_STRATEGY_ID
         and not any(key[0] == MAIN_FORCE_STRATEGY_ID for key in pool_open_positions)
         and len(pool_open_positions) >= count_budget["pool_limit"] - 1
     )
+    if mf_seat_reserved:
+        try:
+            mf_seat_interest = int(conn.execute(
+                "SELECT COUNT(*) FROM paper_signals "
+                "WHERE account_id=? AND intended_date=? AND status IN (?,?,?)",
+                (MAIN_FORCE_STRATEGY_ID, str(asof_day)[:10],
+                 *ENTRY_RETRY_SIGNAL_STATUSES),
+            ).fetchone()[0] or 0)
+        except Exception:
+            mf_seat_interest = 1
+        _mf_now = _now()
+        _mf_day = str(asof_day)[:10]
+        _mf_deadline = f"{_mf_day} 14:30:00" if _mf_day == _mf_now[:10] else None
+        mf_seat_reserved = mf_seat_interest > 0 and (
+            _mf_deadline is None or _mf_now < _mf_deadline)
     risk["position_count_gate"] = {
         "current": len(open_codes), "committed": len(committed_open_codes), "limit": position_limit,
         "pool_current": len(pool_open_positions), "pool_limit": count_budget["pool_limit"],
         "dynamic": True, "source": count_budget["source"],
         "allocation_version": count_budget["allocation_version"],
         "main_force_seat_reserved": mf_seat_reserved,
+        "main_force_seat_interest": mf_seat_interest,
         "is_existing_position": code in open_codes,
         "scope": "按策略账户计数；同一股票可由其他策略独立持有和交易",
     }
@@ -8707,15 +8149,6 @@ def _buy_order(conn, account, signal, quote, market, news, asof_day, *, all_quot
     sizing["one_lot_fee"] = round(_commission(LOT_SIZE * fill_price), 2)
     sizing["cash_available"] = round(shared_cash, 2)
     sizing["qty_final"] = int(qty)
-    # 预算侧能买出一手但金额不足最小建仓地板时，明确转入等待池。这样
-    # 尘埃仓不会先被当作 allowed=True 成交，再由展示层事后分类。
-    if qty >= LOT_SIZE and amount < MIN_ORDER_AMOUNT and not reasons:
-        dust_reason = (
-            f"低于最小建仓金额 ¥{MIN_ORDER_AMOUNT:,.0f}（当前 ¥{amount:,.0f}）；"
-            "席位稀缺时不建尘埃仓，候选保留在等待池，预算释放后按全尺寸复核"
-        )
-        reasons.append(dust_reason)
-        soft_amount_reasons.append(dust_reason)
     if qty < LOT_SIZE and not reasons:
         limits = sizing.get("constraint_shares") or {}
         binding = [name for name, value in limits.items() if _num(value) < LOT_SIZE]
@@ -8742,6 +8175,17 @@ def _buy_order(conn, account, signal, quote, market, news, asof_day, *, all_quot
                 f"当前转入等待池（参考限制：{root}，最多 {root_limit:.0f} 股）"
             )
             soft_amount_reasons.append(reasons[-1])
+    # 2026-09-03 修复：尘埃单此前仅用于"已拦截订单"的分类，金额低于
+    # MIN_ORDER_AMOUNT 且其余闸门全过时 allowed=True 照样成交（当日
+    # 7 笔 <8000 成交实证）。现作为软性拦截：候选转入 deferred 队列，
+    # 预算释放后按全尺寸复核，不再用小仓占用稀缺席位。
+    if qty >= LOT_SIZE and amount < MIN_ORDER_AMOUNT and not reasons:
+        dust_reason = (
+            f"低于最小建仓金额 \u00a5{MIN_ORDER_AMOUNT:,.0f}（当前 \u00a5{amount:,.0f}）；"
+            "席位稀缺时不建尘埃仓，候选保留在等待池，预算释放后按全尺寸复核"
+        )
+        reasons.append(dust_reason)
+        soft_amount_reasons.append(dust_reason)
     _, pending_cash = _pending_buy_reservations(conn)
     cash_after_pending = shared_cash - pending_cash
     # Zero cash is a real safety veto.  A positive balance that is merely
@@ -8810,6 +8254,13 @@ def _buy_order(conn, account, signal, quote, market, news, asof_day, *, all_quot
         and amount < MIN_ORDER_AMOUNT
         and not hard_reasons
     )
+    # 2026-09-03 修复：入场时机确认中的候选不允许被打成终态拒绝。
+    # 时机软阻断常与"主力席位预留"等硬拒绝写在同一单，旧逻辑会把确认中
+    # 的候选直接 risk_rejected，而两条复试通道（30 秒快速通道、3 分钟
+    # recheck）都不捞 rejected，确认计数永远停在 1/2（线上实证
+    # trend_pullback 21/21、tq_breakout 12/12 卡死）。确认中的候选反正
+    # 买不进，归入 deferred_capacity 留在复试队列；每次复试都会重跑全部
+    # 闸门（含硬拒绝），不会产生任何越权成交。
     capacity_deferred = bool(timing_block_reasons) or count_only_blocked or (
         bool(soft_amount_reasons) and not hard_reasons
     ) or dust_order or (
@@ -9135,15 +8586,33 @@ def _manual_order_plan(
             reasons.append(
                 f"策略持仓及待成交席位已达动态上限 {len(committed_open_codes)}/{position_limit}"
             )
+        # P1 死锁修复（2026-09-03）：同主判定处口径——预留仅当主力当日有
+        # 在途候选且未到 14:30 放行时限时生效；查询异常维持原预留行为。
+        _mf_seat_reserve = (
+            account_id != MAIN_FORCE_STRATEGY_ID
+            and not any(key[0] == MAIN_FORCE_STRATEGY_ID for key in pool_open_positions)
+            and len(pool_open_positions) >= count_budget["pool_limit"] - 1
+        )
+        if _mf_seat_reserve:
+            try:
+                _mf_interest = int(conn.execute(
+                    "SELECT COUNT(*) FROM paper_signals "
+                    "WHERE account_id=? AND intended_date=? AND status IN (?,?,?)",
+                    (MAIN_FORCE_STRATEGY_ID, str(day)[:10],
+                     *ENTRY_RETRY_SIGNAL_STATUSES),
+                ).fetchone()[0] or 0)
+            except Exception:
+                _mf_interest = 1
+            _mf_now = _now()
+            _mf_day = str(day)[:10]
+            _mf_deadline = f"{_mf_day} 14:30:00" if _mf_day == _mf_now[:10] else None
+            _mf_seat_reserve = _mf_interest > 0 and (
+                _mf_deadline is None or _mf_now < _mf_deadline)
         if (account_id, code) not in pool_open_positions and len(pool_open_positions) >= count_budget["pool_limit"]:
             reasons.append(
                 f"总持仓及待成交席位已达共享硬上限 {len(pool_open_positions)}/{count_budget['pool_limit']}"
             )
-        elif (
-            account_id != MAIN_FORCE_STRATEGY_ID
-            and not any(key[0] == MAIN_FORCE_STRATEGY_ID for key in pool_open_positions)
-            and len(pool_open_positions) >= count_budget["pool_limit"] - 1
-        ):
+        elif _mf_seat_reserve:
             reasons.append(
                 "共享池仅剩最后 1 席：为主力策略独立席位预留，"
                 "待主力建仓或池内席位释放后恢复其他策略买入"
@@ -9822,9 +9291,14 @@ def execute_open(asof_date=None):
     # order is reconsidered.  A quote gate may stop buys, but never stops a
     # protective sell pass.
     opening_risk = monitor_risk(day)
-    # 开盘 slot 先做轻量数据源探活，再执行实时行情门控。这样入场冻结状态
-    # 不会继续使用上一交易日的健康快照；探活失败时仍保持 fail-closed，
-    # 不会因为探活异常而放宽任何买入条件。
+    # P3 审计修复（2026-09-03）：开盘 slot 与 monitor_intraday 一样先做
+    # 轻量数据源探活。此前 09:31 只拉快照而不探活，入场门禁
+    # _entry_freeze_status 读到的仍是上一交易日收盘的 data_source_health
+    # （age 远大于 15 分钟），把开盘全部候选判为“行情源未通过最近15分钟
+    # 健康检查”而冻结，再由 09:33 首轮 intraday 扫描重建——每天约 20 条
+    # superseded 噪音并延迟建仓约 5 分钟。探活同时会在失败时关闭连接池、
+    # 轮换东财/腾讯重试，让随后的全市场快照拉取更可靠。
+    # 探活失败不放宽任何门禁：门禁仍按旧快照冻结（fail-closed 语义不变）。
     try:
         open_source_health = dfc.check_data_source_health(force=True)
     except Exception as exc:
@@ -9832,8 +9306,8 @@ def execute_open(asof_date=None):
             "healthy": False, "reconnected": False, "attempts": 0,
             "action": f"健康检查异常：{type(exc).__name__}: {exc}",
         }
-    # 入场冻结状态带有短缓存，探活后强制重算，确保本轮买入判断读取最新
-    # 数据源健康快照；异常时保留原有冻结语义。
+    # 门禁状态有 15s 缓存，且上面的 monitor_risk 可能已用旧快照算过一次；
+    # 探活后强制重算，让本轮买入判定基于最新健康快照。
     try:
         _entry_freeze_status(force=True)
     except Exception:
@@ -9901,7 +9375,7 @@ def execute_open(asof_date=None):
     prefetch_news = _news_for(prefetch_names) if prefetch_codes else []
     prefetch_quotes = _quotes(prefetch_codes, asof_date=day) if prefetch_codes else {}
     with _db(immediate=True) as conn:
-        accounts = _rows(conn, "SELECT * FROM paper_accounts WHERE status='running'")
+        accounts = _active_account_rows(conn, status="running")
         # Limited slots must be won by the strongest live candidate, not by
         # whichever signal happened to be inserted first.
         pending = _rows(
@@ -9940,7 +9414,6 @@ def execute_open(asof_date=None):
                 "expired": len(expired),
             }
         market = prefetch_market
-        names = {s["code"]: s.get("name") or s["code"] for s in due}
         news = prefetch_news
         quote_map = prefetch_quotes
         account_map = {a["id"]: a for a in accounts}
@@ -10725,7 +10198,11 @@ def _intraday_downside_guard(position, quote, market=None, news=None, policy_ove
 
 def _downside_confirmed(conn, account_id, code, asof_day, guard):
     """Require a distinct prior five-minute scan with the same adverse intent."""
-    if not guard or guard.get("level") not in {"partial", "full"}:
+    # 2026-09-03 二次确认减仓：warning 级也允许走两次确认。首段减仓
+    # 一天只有一次，之后价格长期停在 warning 区间（跌不深但持续阴跌、
+    # 主力意图反复读出疑似出货）时，两次确认是仅存的保护通道，
+    # 不能再被级别门槛直接挡掉。
+    if not guard or guard.get("level") not in {"partial", "full", "warning"}:
         return False
     rows = conn.execute(
         """SELECT decision,payload,created_at FROM paper_risk_decisions
@@ -10756,9 +10233,13 @@ def _downside_confirmed(conn, account_id, code, asof_day, guard):
         # A missing timestamp must fail closed; two concurrent scheduler calls
         # must never be mistaken for two independent confirmations.
         return False
-    # Giveback protection is intent-independent by design. Once it has fired
-    # in any earlier scan today, keep it valid for the rest of the day so a
-    # minor bounce cannot make the protective confirmation unreachable.
+    # Giveback protection is intent-independent by design (see the audit note
+    # above): a position that gave back a large accumulated edge while the
+    # main-force classifier returned "uncertain" (e.g. missing flow fields)
+    # used to make this confirmation unreachable, so the protective exit could
+    # never fire until the hard stop.  Two consecutive scans both carrying the
+    # giveback flag are still required — the spacing check above already
+    # guarantees they are distinct observations.
     giveback_today = bool(
         conn.execute(
             ("SELECT 1 FROM paper_risk_decisions "
@@ -10766,10 +10247,16 @@ def _downside_confirmed(conn, account_id, code, asof_day, guard):
              "AND substr(created_at,1,10)=? "
              "AND decision IN ('downside_warning','downside_partial_pending','downside_full_pending') "
              "AND json_extract(payload,'$.downside_guard.giveback_protection') "
-             "    IN (1,'1','true','True') LIMIT 1"),
+             "    IN (1,'1','true','True') "
+             "LIMIT 1"),
             (account_id, code, _date(asof_day).isoformat()),
         ).fetchone()
     )
+    # 2026-09-03 sticky fix: giveback protection is a persistent intraday
+    # condition.  Once it has fired in ANY earlier scan today it stays valid
+    # for the rest of the day, so a minor bounce flipping the live flag back
+    # to 0 can no longer make the protective confirmation unreachable (the
+    # position used to drift all the way to the hard stop instead).
     giveback_confirmed = (
         bool(guard.get("giveback_protection")) or giveback_today
     ) and (
@@ -10985,7 +10472,6 @@ def _over_capacity_exit_candidates(conn, positions, reviews, account_map, asof_d
         if int(_num(position.get("qty"))) >= LOT_SIZE:
             by_account.setdefault(position["account_id"], []).append(position)
     for account_id, items in by_account.items():
-        account = account_map.get(account_id) or {}
         fallback = (ACCOUNT_SPECS.get(account_id) or {}).get("max_positions", 5)
         limit = max(1, int(count_budget["limits"].get(account_id, fallback)))
         excess = max(0, len(items) - limit)
@@ -11354,7 +10840,7 @@ def _monitor_risk_impl(asof_date=None):
         }))
     manual_orders = []
     with _db() as snapshot_conn:
-        running_ids = {row["id"] for row in _rows(snapshot_conn, "SELECT id FROM paper_accounts WHERE status='running'")}
+        running_ids = set(_active_account_ids(snapshot_conn, status="running"))
         positions = [p for p in _position_rows(snapshot_conn, asof_day=day) if p["account_id"] in running_ids]
         market_context = _cached_close_market(snapshot_conn, day, allow_network=False)
         retry_placeholders = ",".join("?" for _ in ENTRY_RETRY_SIGNAL_STATUSES)
@@ -11389,13 +10875,11 @@ def _monitor_risk_impl(asof_date=None):
             _audit(conn, None, "risk_scan_state", _json({"scan_minute": scan_minute, "status": "completed", "finished_at": _now()}))
         return result
     with _db(immediate=True) as conn:
-        running_ids = {row["id"] for row in _rows(conn, "SELECT id FROM paper_accounts WHERE status='running'")}
+        running_ids = set(_active_account_ids(conn, status="running"))
         positions = [p for p in _position_rows(conn, asof_day=day) if p["account_id"] in running_ids]
         cycle = _active_cycle(conn)
         account_map = {
-            row["id"]: row for row in _rows(
-                conn, "SELECT * FROM paper_accounts WHERE status='running'"
-            )
+            row["id"]: row for row in _active_account_rows(conn, status="running")
         }
         _, pool_market_value, pool_nav, _, _ = _shared_account_exposure(conn, quote_map, day)
         held_by_account = {}
@@ -11627,33 +11111,80 @@ def _monitor_risk_impl(asof_date=None):
                 (position["account_id"], position["code"], day.isoformat(),
                  f"downside_{guard_level}", f"%下跌{guard_level}已连续两次确认%"),
             ).fetchone())
+            # 2026-09-03 二次确认减仓：warning 级首段减仓（一天一次）用完
+            # 之后，若连续两轮扫描（满足最小扫描间隔）均确认"疑似出货"，
+            # 允许追加一次 partial 比例的减仓——兑现"连续两次扫描确认后
+            # 才允许部分减仓"的审计口径；当日一次，条件恶化仍可升级 full。
+            warning_confirmed_trimmed = bool(conn.execute(
+                """SELECT 1 FROM paper_orders
+                   WHERE account_id=? AND code=? AND side='sell' AND status='filled'
+                     AND substr(created_at,1,10)=?
+                       AND (
+                           json_extract(risk_payload,'$.exit_marker')='downside_warning_confirmed'
+                           OR reason LIKE '%下跌预警连续两次确认减仓%'
+                       )
+                   LIMIT 1""",
+                (position["account_id"], position["code"], day.isoformat()),
+            ).fetchone())
             warning_actionable = bool(
                 position["account_id"] in {"tq_breakout", NEW_STRATEGY_ID}
                 and downside_guard.get("level") == "warning"
                 and _num(downside_guard.get("sell_ratio")) > 0
                 and not warning_trimmed
             )
+            warning_confirmed_trim = bool(
+                position["account_id"] in {"tq_breakout", NEW_STRATEGY_ID}
+                and downside_guard.get("level") == "warning"
+                and downside_confirmed
+                and ((downside_guard.get("main_force_intent") or {}).get("classification")
+                     == "distribution")
+                and warning_trimmed
+                and not warning_confirmed_trimmed
+            )
             guard_actionable = (
                 (downside_guard.get("level") in {"partial", "full"} and downside_confirmed
                  and not guard_level_trimmed)
                 or warning_actionable
+                or warning_confirmed_trim
             )
             guard_pending = downside_guard.get("level") in {"partial", "full"} and not downside_confirmed
             if guard_actionable and not concentration_triggered:
-                ratio = max(ratio, _num(downside_guard.get("sell_ratio"), 0.0))
+                if warning_confirmed_trim:
+                    # 追加减仓按 partial 比例执行（sell_ratio 在 warning 级
+                    # 只带首段比例，不能代表确认后的处置力度）。
+                    ratio = max(
+                        ratio,
+                        _num((downside_guard.get("policy") or {}).get("partial_ratio"),
+                             _num(downside_guard.get("sell_ratio"), 0.0)),
+                    )
+                else:
+                    ratio = max(ratio, _num(downside_guard.get("sell_ratio"), 0.0))
                 guard_level = downside_guard.get("level")
-                quality_action = "downside_warning_trim" if warning_actionable else f"downside_{guard_level}"
+                if warning_confirmed_trim:
+                    quality_action = "downside_warning_confirmed"
+                elif warning_actionable:
+                    quality_action = "downside_warning_trim"
+                else:
+                    quality_action = f"downside_{guard_level}"
                 # 当日去重的结构化消费标记（P1 审计修复 2026-09-02）：
                 # 卖出订单 payload 携带 exit_marker，次日/下一级别仍可升级。
                 detail["exit_marker"] = quality_action
-                quality_reason = (
-                    f"下跌预警首段减仓：本次处理可卖仓位的 {ratio*100:.0f}%；"
-                    f"{downside_guard.get('reason')}；主力意图 "
-                    f"{((downside_guard.get('main_force_intent') or {}).get('label') or '不确定')}"
-                    if warning_actionable else
-                    f"下跌{guard_level}已连续两次确认：{downside_guard.get('reason')}；"
-                    f"主力意图 {((downside_guard.get('main_force_intent') or {}).get('label') or '不确定')}"
-                )
+                mfi_label = ((downside_guard.get('main_force_intent') or {}).get('label') or '不确定')
+                if warning_confirmed_trim:
+                    quality_reason = (
+                        f"下跌预警连续两次确认减仓：本次处理可卖仓位的 {ratio*100:.0f}%；"
+                        f"{downside_guard.get('reason')}；主力意图 {mfi_label}"
+                    )
+                elif warning_actionable:
+                    quality_reason = (
+                        f"下跌预警首段减仓：本次处理可卖仓位的 {ratio*100:.0f}%；"
+                        f"{downside_guard.get('reason')}；主力意图 {mfi_label}"
+                    )
+                else:
+                    quality_reason = (
+                        f"下跌{guard_level}已连续两次确认：{downside_guard.get('reason')}；"
+                        f"主力意图 {mfi_label}"
+                    )
                 reason = f"{quality_reason}；覆盖常规卖出比例" if reason else quality_reason
             elif guard_pending or downside_guard.get("level") == "warning":
                 if not concentration_triggered:
@@ -11859,7 +11390,6 @@ def _monitor_risk_impl(asof_date=None):
                     # snapshot before this write transaction.  Never start
                     # network or disk I/O after the risk ledger is locked.
                     replacement_quote = quote_map.get(replacement_code) or {}
-                    replacement_name = replacement.get("name") or replacement_code
                     replacement_news = [
                         row for row in news if str(row.get("code") or "") == str(replacement_code)
                     ]
@@ -12117,7 +11647,7 @@ def _bootstrap_signals_for_today(asof_day, live_universe=None, source_slot="intr
     # before opening the write transaction. A slow public tick endpoint must
     # never hold the SQLite writer or delay risk exits/API reads.
     with _db() as account_conn:
-        accounts = _rows(account_conn, "SELECT * FROM paper_accounts WHERE status='running'")
+        accounts = _active_account_rows(account_conn, status="running")
     precomputed_candidates = {}
     micro_codes = []
     for account in accounts:
@@ -12583,7 +12113,7 @@ def run_auction_preselection(asof_date=None, force=False):
     })
     with _db() as conn:
         cycle = _active_cycle(conn)
-        for account in _rows(conn, "SELECT id FROM paper_accounts WHERE status='running'"):
+        for account in _active_account_rows(conn, status="running"):
             _observe_intraday(
                 conn, cycle["id"], account["id"], None, None, "auction_preselect",
                 f"09:25 集合竞价预选完成：有效 {len(current_rows)} 只",
@@ -13128,7 +12658,7 @@ def monitor_opening_events(asof_date=None, event_clock=None):
                 "reason": "不在开盘事件窗口"}
     with _db() as snapshot_conn:
         cycle = _active_cycle(snapshot_conn)
-        accounts = _rows(snapshot_conn, "SELECT * FROM paper_accounts WHERE status='running'")
+        accounts = _active_account_rows(snapshot_conn, status="running")
         positions = [p for account in accounts for p in _position_rows(snapshot_conn, account["id"], day)]
     if not positions:
         return {"status": "completed", "slot": "opening_event", "date": day.isoformat(),
@@ -13140,7 +12670,7 @@ def monitor_opening_events(asof_date=None, event_clock=None):
         # Re-read mutable account/position state after network evidence is
         # ready; a concurrent pause/reset can only reduce the work performed.
         cycle = _active_cycle(conn)
-        accounts = _rows(conn, "SELECT * FROM paper_accounts WHERE status='running'")
+        accounts = _active_account_rows(conn, status="running")
         positions = [p for account in accounts for p in _position_rows(conn, account["id"], day)]
         if not positions:
             return {"status": "completed", "slot": "opening_event", "date": day.isoformat(),
@@ -13288,9 +12818,7 @@ def monitor_fast_entries(asof_datetime=None, force=False):
         retry_placeholders = ",".join("?" for _ in ENTRY_RETRY_SIGNAL_STATUSES)
         with _db() as snapshot_conn:
             accounts = {
-                row["id"]: row for row in _rows(
-                    snapshot_conn, "SELECT * FROM paper_accounts WHERE status='running'"
-                )
+                row["id"]: row for row in _active_account_rows(snapshot_conn, status="running")
             }
             # 快速通道覆盖两类候选：
             # 1) 所有策略被"入场时机"拦下的信号（原有逻辑）；
@@ -13330,16 +12858,13 @@ def monitor_fast_entries(asof_datetime=None, force=False):
                     candidates.append(row)
                     seen_fast.add(key)
             positions = _position_rows(snapshot_conn, asof_day=day, readonly=True)
-            market = _cached_close_market(snapshot_conn, day, allow_network=False)
+            _cached_close_market(snapshot_conn, day, allow_network=False)
         if not candidates:
             return {"status": "completed", "slot": "fast-entry", "checked": 0, "confirmed": []}
 
         candidate_codes = {str(row.get("code") or "") for row in candidates}
         all_codes = sorted(candidate_codes | {str(row.get("code") or "") for row in positions})
         quote_map = _quotes(all_codes, asof_date=day)
-        news = _news_for({
-            str(row.get("code")): row.get("name") or row.get("code") for row in candidates
-        })
         confirmed = []
         observations = []
         checked = 0
@@ -13550,7 +13075,7 @@ def monitor_intraday(asof_datetime=None, force=False):
             if scan_ready else {"status": "blocked", "reason": scan_block, "accounts": []}
         )
         with _db() as conn:
-            accounts = _rows(conn, "SELECT * FROM paper_accounts WHERE status='running'")
+            accounts = _active_account_rows(conn, status="running")
             market = _cached_close_market(conn, day)
         return {
             "slot": "intraday", "date": day.isoformat(),
@@ -13591,7 +13116,7 @@ def monitor_intraday(asof_datetime=None, force=False):
     live_market = _market_state(day, live_universe=live_universe, allow_network=True)
     with _db() as snapshot_conn:
         cycle = _active_cycle(snapshot_conn)
-        accounts = _rows(snapshot_conn, "SELECT * FROM paper_accounts WHERE status='running'")
+        accounts = _active_account_rows(snapshot_conn, status="running")
         positions = [p for account in accounts for p in _position_rows(snapshot_conn, account["id"], day)]
     if not positions:
         return {
@@ -13610,7 +13135,7 @@ def monitor_intraday(asof_datetime=None, force=False):
     nav_quotes = _nav_quotes_with_snapshot_fallback(quotes)
     with _db(immediate=True) as conn:
         cycle = _active_cycle(conn)
-        accounts = _rows(conn, "SELECT * FROM paper_accounts WHERE status='running'")
+        accounts = _active_account_rows(conn, status="running")
         positions = [p for account in accounts for p in _position_rows(conn, account["id"], day)]
         if not positions:
             return {
@@ -13658,7 +13183,8 @@ def monitor_intraday(asof_datetime=None, force=False):
             if account.get("mode") == "intraday_t":
                 action, reason = _run_intraday_action(
                     position,
-                    lambda: _intraday_sell(conn, account, position, quote, day, profile, cycle),
+                    lambda account=account, position=position, quote=quote, profile=profile:
+                        _intraday_sell(conn, account, position, quote, day, profile, cycle),
                     "sell",
                 )
                 if action:
@@ -13668,7 +13194,7 @@ def monitor_intraday(asof_datetime=None, force=False):
                 if not risk_state["blocked"]:
                     action, reason = _run_intraday_action(
                         position,
-                        lambda: _intraday_buyback(
+                        lambda account=account, position=position, quote=quote, profile=profile, live_market=live_market, cycle=cycle, quotes=quotes: _intraday_buyback(
                             conn, account, position, quote, live_market, day, profile, cycle,
                             all_quotes=quotes,
                         ),
@@ -13683,7 +13209,7 @@ def monitor_intraday(asof_datetime=None, force=False):
                 # 各自策略质量门和“卖出后低点反弹”确认，不复用普通开仓。
                 action, reason = _run_intraday_action(
                     position,
-                    lambda: _intraday_buyback(
+                    lambda account=account, position=position, quote=quote, profile=profile, live_market=live_market, cycle=cycle, quotes=quotes: _intraday_buyback(
                         conn, account, position, quote, live_market, day, profile, cycle,
                         all_quotes=quotes,
                     ),
@@ -13695,7 +13221,7 @@ def monitor_intraday(asof_datetime=None, force=False):
                     continue
                 action, reason = _run_intraday_action(
                     position,
-                    lambda: _swing_scale_in(
+                    lambda account=account, position=position, quote=quote, profile=profile, live_market=live_market, cycle=cycle, quotes=quotes: _swing_scale_in(
                         conn, account, position, quote, live_market, day, profile, cycle,
                         all_quotes=quotes,
                     ),
@@ -13977,7 +13503,6 @@ def _cleanup_stale_data():
     - 容量瓶颈的时间分布
     - 信号质量与执行率的关系
     """
-    now = _now()
     today = _date().isoformat()
 
     # 检查是否今天已经清理过
@@ -14460,73 +13985,8 @@ def run_slot(slot, asof_date=None, force=False):
 
 
 def _account_metric_inputs(conn, account_ids, today):
-    """Batch the small ledger projections shared by dashboard account cards.
-
-    The previous implementation loaded the same sell rows, buy count,
-    rejected count, and NAV history once per account.  Keep the raw rows
-    narrow (never fetch ``risk_payload``) and group them in memory so the
-    account metric formula remains unchanged.
-    """
-    ids = [str(account_id) for account_id in account_ids if account_id]
-    empty = {
-        "latest_nav": {}, "navs": {}, "previous_nav": {}, "sells": {},
-        "buy_count": {}, "rejected": {},
-    }
-    if not ids:
-        return empty
-    placeholders = ",".join("?" for _ in ids)
-    order_columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(paper_orders)").fetchall()}
-    realized_field = "realized_pnl" if "realized_pnl" in order_columns else "NULL AS realized_pnl"
-    executed_field = "executed_at" if "executed_at" in order_columns else "NULL AS executed_at"
-    sell_fields = (
-        f"id,account_id,code,qty,filled_price,amount,fees,status,{realized_field},"
-        f"created_at,{executed_field}"
-    )
-    sell_rows = _rows(
-        conn,
-        f"SELECT {sell_fields} FROM paper_orders "
-        f"WHERE account_id IN ({placeholders}) AND side='sell' AND status='filled'",
-        tuple(ids),
-    )
-    sells = {account_id: [] for account_id in ids}
-    for row in sell_rows:
-        sells.setdefault(str(row.get("account_id") or ""), []).append(row)
-    buy_rows = _rows(
-        conn,
-        f"SELECT account_id,COUNT(*) AS count FROM paper_fills "
-        f"WHERE account_id IN ({placeholders}) AND side='buy' GROUP BY account_id",
-        tuple(ids),
-    )
-    buy_count = {str(row["account_id"]): int(row["count"] or 0) for row in buy_rows}
-    rejected_rows = _rows(
-        conn,
-        f"SELECT account_id,COUNT(*) AS count FROM paper_orders "
-        f"WHERE account_id IN ({placeholders}) AND status!='filled' GROUP BY account_id",
-        tuple(ids),
-    )
-    rejected = {str(row["account_id"]): int(row["count"] or 0) for row in rejected_rows}
-    nav_columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(paper_nav)").fetchall()}
-    quote_status_field = ",quote_status" if "quote_status" in nav_columns else ""
-    nav_rows = _rows(
-        conn,
-        f"SELECT account_id,nav_date,nav,benchmark{quote_status_field},created_at "
-        f"FROM paper_nav WHERE account_id IN ({placeholders}) ORDER BY account_id,nav_date",
-        tuple(ids),
-    )
-    navs = {account_id: [] for account_id in ids}
-    latest_nav = {}
-    previous_nav = {}
-    today_key = _date(today).isoformat()
-    for row in nav_rows:
-        account_id = str(row.get("account_id") or "")
-        navs.setdefault(account_id, []).append(row.get("nav"))
-        latest_nav[account_id] = row
-        if str(row.get("nav_date") or "") < today_key:
-            previous_nav[account_id] = row
-    return {
-        "latest_nav": latest_nav, "navs": navs, "previous_nav": previous_nav,
-        "sells": sells, "buy_count": buy_count, "rejected": rejected,
-    }
+    """兼容入口：批量读取 dashboard 账户卡片所需的账本投影。"""
+    return PRP.account_metric_inputs(conn, account_ids, _date(today).isoformat())
 
 
 def _account_metrics(conn, account, quotes=None, positions=None, metric_cache=None, allow_network=True):
@@ -14781,11 +14241,15 @@ def _shared_metrics(conn, cycle, positions, quotes):
         pool_peak = max(pool_peak, value)
         if pool_peak > 0:
             pool_drawdown = max(pool_drawdown, 1 - value / pool_peak)
-    fills = conn.execute("SELECT COUNT(*) FROM paper_fills WHERE account_id IN (SELECT id FROM paper_accounts WHERE cycle_id=?)", (cycle["id"],)).fetchone()[0]
+    active_clause, active_ids = _active_cycle_filter(conn, cycle["id"], "id")
+    fills = conn.execute(
+        f"SELECT COUNT(*) FROM paper_fills WHERE account_id IN (SELECT id FROM paper_accounts WHERE cycle_id=? AND {active_clause})",
+        (cycle["id"], *active_ids),
+    ).fetchone()[0]
     return {
         "mode": "shared_pool",
         "label": f"总资金池 · {len(ACTIVE_ACCOUNT_IDS)}套策略独立决策",
-        "strategy_count": len(_active_shared_account_rows(conn, cycle["id"])),
+        "strategy_count": len(_shared_account_rows(conn, cycle["id"])),
         "initial_cash": round(initial, 2),
         "cash": round(cash, 2),
         "market_value": round(market_value, 2),
@@ -14887,37 +14351,11 @@ def _archived_order_rows(conn):
         _archive_orders_cache["rows"] = projected_rows
         return [dict(row) for row in projected_rows]
 
-    archived_rows = []
-    archived_seen = set()
     try:
         archives = _rows(conn, "SELECT id,cycle_key,snapshot,created_at FROM paper_archives ORDER BY id DESC")
     except sqlite3.Error:
         archives = []
-    for archive in archives:
-        try:
-            snapshot = _loads(archive.get("snapshot"), {}) or {}
-            archived_names = {
-                row.get("id"): row.get("name")
-                for row in (snapshot.get("paper_accounts") or [])
-            }
-            for archived in snapshot.get("paper_orders") or []:
-                item = dict(archived)
-                key = (
-                    str(archive.get("cycle_key") or ""),
-                    str(item.get("id") or ""),
-                    str(item.get("created_at") or ""),
-                )
-                if key in archived_seen:
-                    continue
-                archived_seen.add(key)
-                item.pop("risk_payload", None)
-                item["account_name"] = archived_names.get(item.get("account_id"), item.get("account_id"))
-                item["archived_cycle"] = archive.get("cycle_key")
-                item["read_only"] = True
-                archived_rows.append(item)
-        except (TypeError, ValueError, sqlite3.Error):
-            # One damaged legacy archive must not blank the current ledger.
-            continue
+    archived_rows = PAP.project_order_rows(archives, _loads)
     _archive_orders_cache["signature"] = signature
     _archive_orders_cache["rows"] = tuple(archived_rows)
     _store_archive_order_projection(signature, archived_rows)
@@ -14941,22 +14379,9 @@ def _recent_orders_with_archives(conn, account_names, limit=500):
     # silently erase 09:35/10:05 orders after many waitlist retries arrive.
     live_window = max(limit, 2000)
     # ``risk_payload`` contains the complete decision snapshot and can be
-    # hundreds of KB per order.  This list view never renders it; selecting
-    # then ``pop``-ing it created a 500MB+ transient allocation on a busy
-    # ledger and was the direct cause of slow/502 dashboard refreshes.
-    order_fields = (
-        "id,account_id,signal_id,side,code,name,qty,planned_price,filled_price,"
-        "amount,fees,status,reason,realized_pnl,created_at,executed_at,"
-        "order_type,origin,expires_at,cancelled_at"
-    )
-    orders = _rows(
-        conn,
-        f"SELECT {order_fields} FROM paper_orders ORDER BY id DESC LIMIT ?",
-        (live_window,),
-    )
-    for order in orders:
-        order["account_name"] = account_names.get(order["account_id"], order["account_id"])
-        order["archived_cycle"] = None
+    # hundreds of KB per order. The repository projection intentionally never
+    # selects it, avoiding transient allocations on a busy activity page.
+    orders = PRP.recent_live_orders(conn, account_names, live_window)
 
     orders.extend(_archived_order_rows(conn))
     orders.sort(
@@ -15019,7 +14444,7 @@ def dashboard(include_activity=False, include_history_symbols=False):
     market_session = _market_session()
     with _db() as conn:
         cycle = _active_cycle(conn)
-        account_rows = _active_shared_account_rows(conn, cycle["id"])
+        account_rows = _active_account_rows(conn)
         positions = _position_rows(conn, asof_day=dt.date.today())
         today = dt.date.today().isoformat()
         today_sell_codes = {
@@ -15412,18 +14837,13 @@ def dashboard(include_activity=False, include_history_symbols=False):
                     "count": len(intersection), "codes": intersection,
                     "jaccard_pct": round(len(intersection) / len(union) * 100, 1) if union else 0.0,
                 })
-        if include_history_symbols:
-            placeholders = ",".join("?" for _ in ACTIVE_ACCOUNT_IDS)
-            history_symbols = _rows(
-                conn,
-                f"""SELECT code,MAX(name) AS name,COUNT(*) AS order_count,
-                          MAX(COALESCE(executed_at,created_at)) AS last_activity_at
-                     FROM paper_orders WHERE account_id IN ({placeholders})
-                     GROUP BY code ORDER BY last_activity_at DESC,code""",
-                ACTIVE_ACCOUNT_IDS,
-            )
-        else:
-            history_symbols = []
+        history_symbols = _rows(
+            conn,
+            """SELECT code,MAX(name) AS name,COUNT(*) AS order_count,
+                      MAX(COALESCE(executed_at,created_at)) AS last_activity_at
+                 FROM paper_orders GROUP BY code
+                 ORDER BY last_activity_at DESC,code""",
+        ) if include_history_symbols else []
         reviews = _rows(conn, "SELECT * FROM paper_reviews ORDER BY week_key DESC, account_id LIMIT 4")
         last_jobs = _rows(conn, "SELECT * FROM paper_jobs ORDER BY market_date DESC, started_at DESC LIMIT 8")
         monitor_runs = _rows(conn, "SELECT * FROM paper_job_runs ORDER BY started_at DESC LIMIT 24")
@@ -15587,7 +15007,7 @@ def stock_trade_history(code, account_id=None):
             order["account_name"] = account_names.get(order["account_id"], order["account_id"])
         fills = _rows(
             conn,
-            f"SELECT * FROM paper_fills WHERE code=?" + (" AND account_id=?" if account_id else "") + " ORDER BY fill_date DESC, id DESC",
+            "SELECT * FROM paper_fills WHERE code=?" + (" AND account_id=?" if account_id else "") + " ORDER BY fill_date DESC, id DESC",
             args,
         )
         for fill in fills:
@@ -15787,13 +15207,7 @@ def _risk_base_dashboard():
                 "capital_model": "shared_pool",
             }
         cycle = dict(cycle)
-        account_rows = _rows(
-            conn,
-            """SELECT * FROM paper_accounts
-               ORDER BY CASE id WHEN 'tq_breakout' THEN 1 WHEN 'trend_pullback' THEN 2
-                                WHEN 'sector_rotation' THEN 3 WHEN 'reported_profit_breakout' THEN 4
-                                WHEN 'main_force_top10' THEN 5 ELSE 9 END""",
-        )
+        account_rows = _active_account_rows(conn)
         positions = _position_rows(conn, asof_day=today, readonly=True)
         codes = sorted({str(position.get("code")) for position in positions if position.get("code")})
         quotes = {}
@@ -15998,24 +15412,6 @@ def risk_audit(limit=160):
         with _db_readonly() as conn:
             accounts = _rows(conn, "SELECT id,name FROM paper_accounts ORDER BY id")
             names = {row["id"]: row["name"] for row in accounts}
-            scan_rows = _rows(
-                conn,
-                """SELECT detail,created_at
-                   FROM paper_audit
-                   WHERE event='risk_scan_state'
-                   ORDER BY id DESC LIMIT 1""",
-            )
-            latest_scan = None
-            if scan_rows:
-                scan_detail = _loads(scan_rows[0].get("detail"), {}) or {}
-                if isinstance(scan_detail, dict):
-                    latest_scan = {
-                        "scan_minute": scan_detail.get("scan_minute"),
-                        "status": scan_detail.get("status"),
-                        "started_at": scan_detail.get("started_at"),
-                        "finished_at": scan_detail.get("finished_at"),
-                        "created_at": scan_rows[0].get("created_at"),
-                    }
             decisions = _rows(
                 conn,
                 """SELECT id,account_id,code,side,decision,reason,payload,created_at
@@ -16076,7 +15472,7 @@ def risk_audit(limit=160):
         # created the ledger.  Keep the read endpoint useful and side-effect
         # free instead of initializing it from a GET request.
         if "no such table" in str(exc).lower():
-            return {"accounts": [], "alerts": [], "asof": _now(), "lightweight": True, "latest_scan": None}
+            return {"accounts": [], "alerts": [], "asof": _now(), "lightweight": True}
         raise
     linked_signals = {}
     for signal in signal_rows:
@@ -16171,16 +15567,7 @@ def risk_audit(limit=160):
                 "label": "待执行委托（等待开盘审批/执行批次）",
             } if linked else None),
         })
-    return {
-        "accounts": accounts,
-        "alerts": alerts,
-        "asof": _now(),
-        "lightweight": True,
-        # A completed scan with no positions legitimately has no per-stock
-        # decision rows. Expose the scan marker so the UI can distinguish
-        # "scheduler ran and found nothing to inspect" from "never ran".
-        "latest_scan": latest_scan,
-    }
+    return {"accounts": accounts, "alerts": alerts, "asof": _now(), "lightweight": True}
 
 
 def _validate_capital(capital):
@@ -16188,30 +15575,6 @@ def _validate_capital(capital):
     if capital < 1000 or capital > 10_000_000:
         raise ValueError("总模拟资金池须在 1,000 至 10,000,000 元之间")
     return capital
-
-
-def _validate_cycle_days(cycle_days):
-    """Validate an optional user-selected cycle length in trading days."""
-    if cycle_days is None or cycle_days == "":
-        return None
-    try:
-        value = int(cycle_days)
-    except (TypeError, ValueError) as exc:
-        raise ValueError("周期长度须为 1 至 365 个交易日") from exc
-    if value < 1 or value > 365:
-        raise ValueError("周期长度须为 1 至 365 个交易日")
-    return value
-
-
-def _validate_trading_mode(mode):
-    if mode is None or mode == "":
-        return "balanced"
-    value = str(mode).strip().lower()
-    if value == "loose":
-        value = "balanced"
-    if value not in TRADING_MODE_PROFILES:
-        raise ValueError("交易风格必须为 aggressive、balanced 或 calm")
-    return value
 
 
 def _cycle_snapshot(conn):
@@ -16269,40 +15632,32 @@ def _archive_current_cycle(conn, reason):
     return cycle
 
 
-def _create_cycle(conn, capital, status="paused", reason="新建模拟周期", cycle_days=None, trading_mode=None):
+def _create_cycle(conn, capital, status="paused", reason="新建模拟周期"):
     capital = _validate_capital(capital)
-    cycle_days = _validate_cycle_days(cycle_days)
-    trading_mode = _validate_trading_mode(trading_mode)
     now = _now()
     key = "cycle-" + dt.datetime.now().strftime("%Y%m%d-%H%M%S-%f")
-    _disable_inactive_accounts(conn)
     cursor = conn.execute(
-        "INSERT INTO paper_cycles(cycle_key,status,capital,risk_profile,cycle_days,trading_mode,started_at,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)",
-        (key, status, capital, "shared_pool", cycle_days, trading_mode, now if status == "running" else None, now, now),
+        "INSERT INTO paper_cycles(cycle_key,status,capital,risk_profile,started_at,created_at,updated_at) VALUES(?,?,?,?,?,?,?)",
+        (key, status, capital, "shared_pool", now if status == "running" else None, now, now),
     )
     cycle_id = cursor.lastrowid
     benchmark = _benchmark_close()
     account_share = capital / max(len(ACTIVE_ACCOUNT_IDS), 1)
-    for account_id in ACTIVE_ACCOUNT_IDS:
-        spec = ACCOUNT_SPECS[account_id]
+    for account_id, spec in ACTIVE_ACCOUNT_SPECS.items():
         conn.execute(
             """UPDATE paper_accounts SET name=?,source_strategy=?,status=?,initial_cash=?,cash=?,cycle_days=?,
                max_positions=?,max_weight=?,max_exposure=?,version=?,benchmark_start=?,cycle_id=?,mode=?,style=?,
-               risk_profile=?,params=?,daily_start_nav=?,daily_nav_date=?,cooldown_until=NULL,updated_at=? WHERE id=?""",
-            (spec["name"], spec["source_strategy"], status, account_share, account_share,
-             cycle_days if cycle_days is not None else spec["cycle_days"], spec["max_positions"],
+               risk_profile=?,params='{}',daily_start_nav=?,daily_nav_date=?,cooldown_until=NULL,updated_at=? WHERE id=?""",
+            (spec["name"], spec["source_strategy"], status, account_share, account_share, spec["cycle_days"], spec["max_positions"],
              spec["max_weight"], spec["max_exposure"], spec.get("strategy_version") or "v3.0", benchmark, cycle_id, spec["mode"], spec["default_style"],
-             spec["risk_profile"], _json({"trading_mode": trading_mode}), account_share, _date().isoformat(), now, account_id),
+             spec["risk_profile"], account_share, _date().isoformat(), now, account_id),
         )
         conn.execute("INSERT INTO paper_nav(account_id,nav_date,cash,market_value,nav,benchmark,created_at) VALUES(?,?,?,?,?,?,?)",
                      (account_id, _date().isoformat(), account_share, 0.0, account_share, benchmark, now))
         conn.execute("INSERT INTO paper_parameter_versions(cycle_id,account_id,version,style,params,reason,effective_date,created_at) VALUES(?,?,?,?,?,?,?,?)",
-                     (cycle_id, account_id, spec.get("strategy_version") or "v3.0", spec["default_style"], _json({"trading_mode": trading_mode}), reason, _date().isoformat(), now))
+                     (cycle_id, account_id, spec.get("strategy_version") or "v3.0", spec["default_style"], "{}", reason, _date().isoformat(), now))
     _audit(conn, None, "cycle_created", f"{key}：共享模拟资金池 {capital:.2f} 元，多策略独立决策共用资金，{reason}")
-    return {
-        "id": cycle_id, "cycle_key": key, "status": status, "capital": capital,
-        "cycle_days": cycle_days, "trading_mode": trading_mode,
-    }
+    return {"id": cycle_id, "cycle_key": key, "status": status, "capital": capital}
 
 
 def configure_capital(capital):
@@ -16319,20 +15674,20 @@ def configure_capital(capital):
             raise ValueError("本周期已有模拟成交或持仓，资金已锁定；请使用完全重置新建周期")
         conn.execute("UPDATE paper_cycles SET capital=?,updated_at=? WHERE id=?", (capital, _now(), cycle["id"]))
         share = capital / max(len(ACTIVE_ACCOUNT_IDS), 1)
-        placeholders = ",".join("?" for _ in ACTIVE_ACCOUNT_IDS)
+        active_clause, active_ids = _active_account_clause("id")
         conn.execute(
-            f"UPDATE paper_accounts SET initial_cash=?,cash=?,daily_start_nav=?,updated_at=? WHERE id IN ({placeholders})",
-            (share, share, share, _now(), *ACTIVE_ACCOUNT_IDS),
+            f"UPDATE paper_accounts SET initial_cash=?,cash=?,daily_start_nav=?,updated_at=? WHERE {active_clause}",
+            (share, share, share, _now(), *active_ids),
         )
         conn.execute(
-            f"UPDATE paper_nav SET cash=?,market_value=0,nav=? WHERE account_id IN ({placeholders})",
-            (share, share, *ACTIVE_ACCOUNT_IDS),
+            f"UPDATE paper_nav SET cash=?,market_value=0,nav=? WHERE account_id IN ({','.join('?' for _ in active_ids)})",
+            (share, share, *active_ids),
         )
         _audit(conn, None, "capital_configured", f"共享模拟资金池草稿设为 {capital:.2f} 元；策略初始展示份额 {share:.2f} 元")
     return dashboard()
 
 
-def start_new_cycle(capital=300000.0, include_dashboard=True, cycle_days=None, trading_mode=None):
+def start_new_cycle(capital=300000.0, include_dashboard=True):
     """保存资金并启动新周期。旧周期先完整归档，避免覆盖历史模拟结果。
 
     HTTP 写接口使用 ``include_dashboard=False``，避免在已经提交账本变更后
@@ -16345,9 +15700,7 @@ def start_new_cycle(capital=300000.0, include_dashboard=True, cycle_days=None, t
         if current["status"] == "running":
             raise ValueError("当前周期仍在运行，请先暂停再启动新周期")
         _archive_current_cycle(conn, "用户保存资金并启动新周期")
-        cycle = _create_cycle(
-            conn, capital, status="running", reason="保存资金并启动", cycle_days=cycle_days, trading_mode=trading_mode,
-        )
+        cycle = _create_cycle(conn, capital, status="running", reason="保存资金并启动")
     summary = dashboard() if include_dashboard else {
         "cycle": cycle,
         "strategy_count": len(ACTIVE_ACCOUNT_IDS),
@@ -16356,7 +15709,7 @@ def start_new_cycle(capital=300000.0, include_dashboard=True, cycle_days=None, t
     return summary, cycle
 
 
-def reset_cycle(capital=300000.0, include_dashboard=True, cycle_days=None, trading_mode=None):
+def reset_cycle(capital=300000.0, include_dashboard=True):
     """完全重置只归档，不删除历史；新周期保持暂停，等待用户明确启动。
 
     HTTP 写接口使用 ``include_dashboard=False``（与 start_new_cycle 一致），
@@ -16368,9 +15721,7 @@ def reset_cycle(capital=300000.0, include_dashboard=True, cycle_days=None, tradi
         if current["status"] == "running":
             raise ValueError("当前周期仍在运行，请先暂停后再完全重置")
         _archive_current_cycle(conn, "用户完全重置")
-        cycle = _create_cycle(
-            conn, capital, status="paused", reason="完全重置后等待启动", cycle_days=cycle_days, trading_mode=trading_mode,
-        )
+        cycle = _create_cycle(conn, capital, status="paused", reason="完全重置后等待启动")
     if include_dashboard:
         return dashboard(), cycle
     return {
@@ -16381,7 +15732,7 @@ def reset_cycle(capital=300000.0, include_dashboard=True, cycle_days=None, tradi
 
 
 def set_account_style(account_id, style):
-    if account_id not in ACTIVE_ACCOUNT_IDS:
+    if account_id not in ACCOUNT_SPECS:
         raise ValueError("未知策略账户")
     if style not in STYLE_PROFILES:
         raise ValueError("风格必须是 strong、pullback、sector 或 quality")
@@ -16392,25 +15743,6 @@ def set_account_style(account_id, style):
             raise ValueError("当前周期运行中，暂停后才能调整策略风格")
         conn.execute("UPDATE paper_accounts SET style=?,updated_at=? WHERE id=?", (style, _now(), account_id))
         _audit(conn, account_id, "style_changed", f"后续候选风格切换为 {STYLE_PROFILES[style]['name']}；已有持仓不强平")
-    return dashboard()
-
-
-def set_trading_mode(mode):
-    """Set the user-facing bounded execution posture for the active cycle."""
-    mode = _validate_trading_mode(mode)
-    init_db()
-    with _db() as conn:
-        cycle = _active_cycle(conn)
-        if cycle["status"] == "running":
-            raise ValueError("当前周期运行中，暂停后才能调整交易风格")
-        conn.execute("UPDATE paper_cycles SET trading_mode=?,updated_at=? WHERE id=?", (mode, _now(), cycle["id"]))
-        placeholders = ",".join("?" for _ in ACTIVE_ACCOUNT_IDS)
-        rows = conn.execute(f"SELECT id,params FROM paper_accounts WHERE id IN ({placeholders})", ACTIVE_ACCOUNT_IDS).fetchall()
-        for row in rows:
-            params = _loads(row["params"], {})
-            params["trading_mode"] = mode
-            conn.execute("UPDATE paper_accounts SET params=?,updated_at=? WHERE id=?", (_json(params), _now(), row["id"]))
-        _audit(conn, None, "trading_mode_changed", f"交易风格切换为 {TRADING_MODE_PROFILES[mode]['name']}；硬风控门禁不变")
     return dashboard()
 
 
@@ -16430,14 +15762,14 @@ def set_accounts_status(status, capital=None):
             raise ValueError("当前周期不是暂停状态，不能恢复运行")
         if status == "paused" and cycle["status"] != "running":
             raise ValueError("当前周期并未运行，无需再次暂停")
-        placeholders = ",".join("?" for _ in ACTIVE_ACCOUNT_IDS)
+        active_clause, active_ids = _active_account_clause("id")
         conn.execute(
-            f"UPDATE paper_accounts SET status=?, updated_at=? WHERE id IN ({placeholders})",
-            (status, _now(), *ACTIVE_ACCOUNT_IDS),
+            f"UPDATE paper_accounts SET status=?, updated_at=? WHERE {active_clause}",
+            (status, _now(), *active_ids),
         )
         conn.execute("UPDATE paper_cycles SET status=?,started_at=COALESCE(started_at,?),updated_at=? WHERE id=?",
                      (status, _now() if status == "running" else None, _now(), cycle["id"]))
-        _audit(conn, None, "accounts_" + status, "两套启用策略模拟盘状态变更")
+        _audit(conn, None, "accounts_" + status, f"{len(ACTIVE_ACCOUNT_IDS)}套当前策略模拟盘状态变更")
     return dashboard()
 
 
@@ -16448,10 +15780,6 @@ def latest_reviews():
 
 
 def schedule_status():
-    # A fresh public clone has no runtime database yet.  Initialize the
-    # schema before the status read so the first dashboard request is usable
-    # instead of failing on the paper_jobs query.
-    init_db()
     names = [
             "A股模拟盘-竞价预选", "A股模拟盘-日内监控-上午", "A股模拟盘-日内监控-下午", "A股模拟盘-开盘审批",
         "A股模拟盘-盘后评分", "A股模拟盘-周度复盘",
@@ -16472,9 +15800,6 @@ def schedule_status():
         if os.path.isfile(schedule_file):
             found.extend(names)
     today = dt.date.today().isoformat()
-    fallback_enabled = str(os.getenv("ASTOCK_ENABLE_FALLBACK_THREADS") or "0").strip().lower() in {
-        "1", "true", "yes", "on"
-    }
     with _db() as conn:
         latest = _rows(conn, """
             SELECT slot,status,started_at,finished_at,detail
@@ -16491,22 +15816,13 @@ def schedule_status():
             LIMIT 12
         """, (f"intraday:{today.replace('-', '')}%",))
     failed = [row for row in latest + intraday if row.get("status") == "failed"]
-    installed = len(found) == len(names)
     return {
-        "installed": installed,
-        # ``installed`` remains the OS-task result for compatibility. A
-        # standalone clone is nevertheless runnable when the in-process
-        # fallback scheduler is enabled by the one-click launcher/Compose.
-        "fallback_enabled": fallback_enabled,
-        "effective": bool(installed or fallback_enabled),
+        "installed": len(found) == len(names),
         "tasks": found,
         "runtime_date": today,
         "latest_runs": latest,
         "latest_intraday_runs": intraday,
-        "runtime_status": "异常" if failed else (
-            "已执行" if latest or intraday else
-            ("内置调度已启用，等待交易时段" if fallback_enabled else "等待首个任务")
-        ),
+        "runtime_status": "异常" if failed else ("已执行" if latest or intraday else "等待首个任务"),
         "runtime_failed_count": len(failed),
         "note": "09:25采集集合竞价快照做预选；09:30、09:31、13:00先执行共享开盘事件扫描（冲高回落可减仓，回补需后续反弹确认），09:31再用最新双源行情审批新开仓；其后每3分钟执行至11:25和14:55；15:05盘后评分和周五15:20复盘。失败任务会由同一时段的兜底计划自动重试，页面显示数据库中的实际运行记录。"
     }

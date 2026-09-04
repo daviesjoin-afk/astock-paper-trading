@@ -95,7 +95,7 @@ class ApiCacheSingleFlightTests(unittest.TestCase):
             import api_paper as api
         except ModuleNotFoundError as exc:
             if exc.name != "fastapi":
-                raise unittest.SkipTest(f"API dependencies unavailable: {exc.name}")
+                raise unittest.SkipTest(f"API dependencies unavailable: {exc.name}") from exc
             # The bundled offline test runtime intentionally omits FastAPI.
             # A tiny decorator-compatible stub still exercises the cache
             # implementation without starting an HTTP server.

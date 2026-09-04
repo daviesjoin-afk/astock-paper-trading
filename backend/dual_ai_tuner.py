@@ -9,12 +9,8 @@
 """
 from __future__ import annotations
 
-import datetime as dt
-import hashlib
 import json
 import os
-import sqlite3
-import threading
 import time
 import urllib.error
 import urllib.request
@@ -525,9 +521,6 @@ def run_dual_ai_tuning(connect_factory, paper_db_path, snapshot_paths, evidence_
     user_prompt = _build_tuning_user_prompt(evidence, accounts, mode)
 
     # 并行调用两个AI
-    mimo_result = {"status": "pending", "response": None, "proposals": None, "latency_ms": None, "error": None, "model": mimo_config["model"]}
-    ds_result = {"status": "pending", "response": None, "proposals": None, "latency_ms": None, "error": None, "model": ds_config["model"]}
-
     def call_mimo():
         try:
             parsed, in_tok, out_tok, lat = _call_single_ai(mimo_config, system_prompt, user_prompt)

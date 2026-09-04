@@ -27,14 +27,17 @@ This makes the repository useful not only for strategy experiments, but also for
 
 ## Current scope
 
-The public runtime currently enables two independent strategy accounts:
+The repository preserves five strategy definitions in one registry and exposes the same identities to adaptive research, replay and audit views. The current paper cycle runs two active strategy accounts; the other three remain legacy research/replay definitions and receive no new-cycle capital or scheduler time.
 
-| Strategy | Style | Purpose |
-|---|---|---|
-| `tq_breakout` | Momentum breakout | Volume/flow-confirmed short-horizon breakout candidates |
-| `main_force_top10` | Main-fund flow | Candidates ranked by strong main-fund inflow |
+| Strategy | Status | Style | Purpose |
+|---|---|---|---|
+| `tq_breakout` | active | Momentum breakout | Volume/flow-confirmed short-horizon breakout candidates |
+| `trend_pullback` | legacy | Trend pullback | Mid-term pullback observations inside an established uptrend |
+| `sector_rotation` | legacy | Sector rotation | Sector heat, flow resonance and relative-strength rotation research |
+| `reported_profit_breakout` | legacy | Quality breakout | Disclosure- and earnings-driven breakout scoring and replay |
+| `main_force_top10` | active | Main-fund flow | Candidates ranked by strong main-fund inflow and live confirmation |
 
-Both strategies share the same execution, capital-allocation and audit infrastructure while keeping independent entry lanes, position limits and exit logic.
+The two active strategies share execution, capital-allocation and audit infrastructure while keeping independent entry lanes, position limits and exit logic. All five definitions remain available for replay and research; none is silently deleted, renamed or replaced.
 
 The engine is **paper trading only**. It does not include broker routing, leverage, short selling or real-money execution.
 

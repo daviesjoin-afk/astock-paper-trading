@@ -662,7 +662,6 @@ def _ai_batches(items, config, trigger, conn_factory):
             "news_events": _loads(item.get("news_events"), []), "reason_codes": _loads(item.get("reason_codes"), []),
             "order_reason": item.get("order_reason"),
         } for item in batch]
-        evidence_hash = hashlib.sha256(_json(evidence).encode("utf-8")).hexdigest()
         system = (
             "你是A股模拟盘盘后归因助手。只能根据输入中的确定性证据解释可能原因，"
             "不能把相关性写成已证实因果，不能补造公告、资金或行情；大盘拖累、板块拖累、"

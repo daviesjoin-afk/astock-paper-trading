@@ -5,10 +5,28 @@ function fmt(v, d){ if(v===null||v===undefined||isNaN(v)) return '-'; return Num
 function pctCls(v){ return v>0?'up':(v<0?'down':''); }
 function pctTxt(v){ if(v===null||v===undefined) return '-'; return (v>0?'+':'')+fmt(v)+'%'; }
 function yi(v){ if(v===null||v===undefined) return '-'; return fmt(v/1e8,1)+'亿'; }
-async function api(path){
-  var r = await fetch(path);
+async function api(path, options){
+  options=options||{};
+  var r;
+  // A container restart can briefly close the upstream connection and make
+  // nginx return 502/503. GETs are safe to retry; keep POST semantics intact.
+  // 2026-09-03 P3：旧退避仅 250/500ms，短于一次容器重启的拒连窗口（实测
+  // 约 2~3 秒），所以重新部署时前端仍会抛出硬错误“请求失败 HTTP 502”。
+  // 放宽到 4 次 / 累计约 4.8 秒，让部署重启对只读请求透明；非 5xx 首次
+  // 即跳出，正常请求不受影响。POST 保持不重试，避免重复下单类副作用。
+  var MAX_GET_ATTEMPTS = 4;
+  for(var attempt=0; attempt<MAX_GET_ATTEMPTS; attempt++){
+    var controller=typeof AbortController==='undefined'?null:new AbortController();
+    var timeout=controller?setTimeout(function(){controller.abort();},Number(options.timeout)||25000):null;
+    try { r = await fetch(path,{signal:controller&&controller.signal}); }
+    catch(err){ if(attempt===MAX_GET_ATTEMPTS-1) throw err; await new Promise(function(resolve){setTimeout(resolve,800*(attempt+1));}); continue; }
+    finally { if(timeout) clearTimeout(timeout); }
+    if(r.status!==502 && r.status!==503 && r.status!==504) break;
+    if(attempt<MAX_GET_ATTEMPTS-1) await new Promise(function(resolve){setTimeout(resolve,800*(attempt+1));});
+  }
   var d = await r.json().catch(function(){ return {}; });
-  if(!r.ok) throw new Error(d.detail || d.error || ('请求失败 HTTP '+r.status));
+  if(!r.ok) throw new Error(d.detail || d.error ||
+    ('请求失败 HTTP '+r.status+(r.status>=500?'（后端可能正在重启或过载，请稍后重试）':'')));
   return d;
 }
 async function apiPost(path){
@@ -20,6 +38,13 @@ async function apiPost(path){
 function chart(id){
   var target=$(id), existing=charts[id];
   if(!target) return null;
+  // Charts are optional: the local vendor bundle may be unavailable during a
+  // partial static deploy.  Return a no-op adapter so data tables and risk
+  // controls remain usable instead of throwing from every chart caller.
+  if(typeof echarts==='undefined') return {
+    getDom:function(){return target;}, dispose:function(){}, resize:function(){},
+    setOption:function(){}, dispatchAction:function(){}, clear:function(){}
+  };
   // Dynamic views replace their HTML on refresh. An ECharts instance keeps a
   // reference to its original DOM node, so reusing it would draw off-screen.
   if(existing && existing.getDom()!==target){
@@ -44,7 +69,7 @@ function renderPaperCompareChart(curve){
     target.innerHTML='<div class="paper-empty">净值点不足两个，下一次有效收盘或日内快照后将绘制曲线。</div>';
     return;
   }
-  var palette={tq_breakout:'#27775a',trend_pullback:'#5576bd',sector_rotation:'#b28131',reported_profit_breakout:'#8a5bb8',main_force_top10:'#c24f3d'};
+  var palette={tq_breakout:'#27775a',trend_pullback:'#5576bd',sector_rotation:'#b28131',reported_profit_breakout:'#8a5bb8'};
   // The shared pool is an accounting aggregate, not a fourth strategy.  It
   // used to dominate the y-axis and made the three strategy curves hard to
   // compare, so keep it in the API/account cards but exclude it from this
@@ -75,8 +100,6 @@ function activatePage(page, options){
     history.replaceState(null,'','#'+page.replace(/^p-/,'')+(page==='p-paper'?'/'+(window._paperWorkspace||'portfolio'):''));
   }
   if(page==='p-sector'&&!window._sectorLoaded){loadSectors();loadLinkage();window._sectorLoaded=true;}
-  if(page==='p-select') loadDataValidity();
-  if(page==='p-track') loadTrack();
   if(page==='p-adaptive') loadAdaptive();
   if(page==='p-paper'){
     var paperTab=document.querySelector('#p-paper [data-paper-view="'+(window._paperWorkspace||'portfolio')+'"]');
@@ -182,6 +205,9 @@ function adaptiveValue(value,suffix,digits){
 }
 function adaptiveEsc(value){
   return String(value===null||value===undefined?'':value).replace(/[&<>"']/g,function(ch){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch];});
+}
+function adaptiveJsArg(value){
+  return encodeURIComponent(String(value===null||value===undefined?'':value));
 }
 /* Optional snapshot fields can be absent while a backend is warming up.
    Never render transport placeholders as a state visible to an operator. */
@@ -297,9 +323,6 @@ function refreshAdaptiveTimelineNow(){ refreshAdaptiveTimeline(window._adaptiveO
 function setAdaptiveSection(section,button){
   var shell=document.querySelector('#adaptiveResult .adaptive-shell');
   var result=document.querySelector('#adaptiveResult');
-  /* The tabs are rendered before the async evidence payload.  Keep their
-     state interactive during that window, then apply visibility once the
-     shell arrives instead of silently returning. */
   document.querySelectorAll('#p-adaptive .adaptive-section-tab').forEach(function(item){
     var active=item.dataset.section===section;
     item.classList.toggle('active',active);
@@ -307,12 +330,54 @@ function setAdaptiveSection(section,button){
   });
   sessionStorage.setItem('astock.adaptiveSection',section);
   if(!shell) return;
+  /* Fallback: 如果 AI section 不存在，动态创建 */
+  if(section==='ai' && !shell.querySelector('[data-adaptive-section="ai"]')){
+    var aiHtml='<section class="adaptive-panel adaptive-ai-section" data-adaptive-section="ai">'
+      +'<header><div><span>DUAL AI CONSENSUS</span><h3>AI审阅与调参</h3></div>'
+      +'<div class="adaptive-advisor-actions">'
+      +'<button class="ghost" onclick="loadEvolutionStatus()">刷新状态</button>'
+      +'<button class="ghost" onclick="triggerEvolution()">手动触发进化</button>'
+      +'<button class="ghost" onclick="runDualAiTuning()">运行双AI调参</button>'
+      +'</div></header>'
+      +'<div class="ai-status-cards" id="aiStatusCards">'
+      +'<div class="ai-card"><small>MiMo</small><b id="aiMiMoStatus">检测中…</b></div>'
+      +'<div class="ai-card"><small>DeepSeek</small><b id="aiDeepSeekStatus">检测中…</b></div>'
+      +'<div class="ai-card"><small>modlens</small><b id="aiModlensStatus">检测中…</b></div>'
+      +'<div class="ai-card"><small>共识率</small><b id="aiConsensusRate">—</b></div>'
+      +'<div class="ai-card"><small>进化状态</small><b id="aiEvolutionState">检测中…</b></div>'
+      +'<div class="ai-card"><small>参数版本</small><b id="aiParamsVersion">—</b></div>'
+      +'</div>'
+      +'<div class="ai-params-panel"><h4>当前进化参数</h4><div id="aiParamsTable">加载中…</div></div>'
+      +'<div class="ai-runs-panel"><h4>最近双AI调参记录</h4><div id="aiRunsTable">加载中…</div></div>'
+      +'<div class="ai-metrics-panel"><h4>调参性能指标</h4><div id="aiMetricsGrid">加载中…</div></div>'
+      +'<div class="ai-log-panel"><h4>进化事件日志</h4><div id="aiLogTable">加载中…</div></div>'
+      +'<div class="ai-modlens-panel"><h4>modlens 视觉测试</h4>'
+      +'<div class="controls"><input id="aiImageUrl" type="text" placeholder="输入图片URL" style="width:400px">'
+      +'<button class="ghost" onclick="testModlensRead()">读取</button></div>'
+      +'<div id="aiModlensResult"></div></div>'
+      +'<div class="adaptive-notice">双AI共识：MiMo + DeepSeek 独立分析，方向一致且幅度接近才执行。自进化系统自动优化调参策略。</div>'
+      +'</section>';
+    shell.insertAdjacentHTML('beforeend',aiHtml);
+  }
   shell.querySelectorAll('[data-adaptive-section]').forEach(function(node){
     node.hidden=node.dataset.adaptiveSection!==section;
+    if(section==='ai' && node.dataset.adaptiveSection==='research') node.hidden=false;
   });
+  /* AI section 独立显示时，隐藏所有非 ai 的 section */
+  if(section==='ai'){
+    shell.querySelectorAll('[data-adaptive-section]').forEach(function(node){
+      if(node.dataset.adaptiveSection!=='ai') node.hidden=true;
+    });
+    var aiNode=shell.querySelector('[data-adaptive-section="ai"]');
+    if(aiNode) aiNode.hidden=false;
+  }
   var first=shell.querySelector('[data-adaptive-section="'+section+'"]');
   if(first && result && button && button.dataset.section===section){
     result.dataset.activeSection=section;
+  }
+  /* 自动加载 AI section 数据 */
+  if(section==='ai' && typeof loadEvolutionStatus==='function'){
+    loadEvolutionStatus();
   }
 }
 function renderAdaptive(d){
@@ -344,9 +409,9 @@ function renderAdaptive(d){
   ].map(function(x){return '<article class="adaptive-flow-step"><span>'+x.code+'</span><div><b>'+x.name+'</b><p>'+x.copy+'</p></div><em>'+x.state+'</em></article>';}).join('');
   var driverRows=drivers.map(function(x,index){var tone=index===0?'capital':(index===1?'momentum':(index===4?'risk':''));return '<div class="adaptive-driver"><div><b>'+x.name+'</b><strong>'+adaptiveValue(x.score,'',1)+'</strong></div>'+adaptiveBar(x.score,tone)+'<p>'+x.detail+'</p></div>';}).join('')||'<div class="paper-empty">尚无有效盘面画像。</div>';
   var sectorGroup=function(rows,kind){return (rows||[]).map(function(x){return '<li><div><b>'+x.name+'</b><small>'+x.sample_count+' 只 · 中位 '+pctTxt(x.median_pct)+'</small></div><strong class="'+(x.main_net_yi>=0?'up':'down')+'">'+(x.main_net_yi>=0?'+':'')+fmt(x.main_net_yi,1)+' 亿</strong></li>';}).join('')||'<li class="adaptive-empty-row">暂无可用板块样本</li>';};
-  var strategyCards=Object.keys(weights).map(function(id){var item=evidence[id]||{},weight=weights[id]||0,latest=(item.horizons||[]).filter(function(x){return x.samples>0;})[0]||{};return '<article class="adaptive-strategy-card '+id+'"><header><div><span>Bandit arm</span><h3>'+((item.name)||id)+'</h3></div><strong>'+fmt(weight,1)+'%</strong></header>'+adaptiveBar(weight,'allocation')+'<div class="adaptive-strategy-stats"><div><small>成熟样本</small><b>'+Number(item.samples||0)+'</b></div><div><small>当前盘面样本</small><b>'+Number(item.regime_samples||0)+'</b></div><div><small>最近可用超额</small><b class="'+pctCls(latest.mean_excess_pct)+'">'+adaptiveValue(latest.mean_excess_pct,'%',2)+'</b></div></div><p>后验 '+adaptiveValue(item.posterior_mean,'',3)+' · 探索奖励 '+adaptiveValue(item.exploration_bonus,'',3)+' · 风险扣分 '+adaptiveValue(item.downside_penalty,'',3)+'</p><div class="adaptive-human-actions"><button class="ghost" onclick="recordAdaptiveFeedback(\''+id+'\',\'approve\')">人工认可</button><button class="ghost" onclick="recordAdaptiveFeedback(\''+id+'\',\'watch\')">继续观察</button></div></article>';}).join('')||'<div class="paper-empty">尚未生成 Bandit 影子权重。</div>';
+  var strategyCards=Object.keys(weights).map(function(id){var item=evidence[id]||{},weight=weights[id]||0,latest=(item.horizons||[]).filter(function(x){return x.samples>0;})[0]||{};return '<article class="adaptive-strategy-card '+id+'"><header><div><span>Bandit arm</span><h3>'+adaptiveEsc((item.name)||id)+'</h3></div><strong>'+fmt(weight,1)+'%</strong></header>'+adaptiveBar(weight,'allocation')+'<div class="adaptive-strategy-stats"><div><small>成熟样本</small><b>'+Number(item.samples||0)+'</b></div><div><small>当前盘面样本</small><b>'+Number(item.regime_samples||0)+'</b></div><div><small>最近可用超额</small><b class="'+pctCls(latest.mean_excess_pct)+'">'+adaptiveValue(latest.mean_excess_pct,'%',2)+'</b></div></div><p>后验 '+adaptiveValue(item.posterior_mean,'',3)+' · 探索奖励 '+adaptiveValue(item.exploration_bonus,'',3)+' · 风险扣分 '+adaptiveValue(item.downside_penalty,'',3)+'</p><div class="adaptive-human-actions"><button class="ghost" onclick="recordAdaptiveFeedback(\''+id+'\',\'approve\')">人工认可</button><button class="ghost" onclick="recordAdaptiveFeedback(\''+id+'\',\'watch\')">继续观察</button></div></article>';}).join('')||'<div class="paper-empty">尚未生成 Bandit 影子权重。</div>';
   var horizons={};(d.horizon_summary||[]).forEach(function(x){(horizons[x.account_id]||(horizons[x.account_id]=[])).push(x);});
-  var horizonRows=Object.keys(horizons).map(function(id){var rows=horizons[id];return '<tr><td><b>'+rows[0].name+'</b></td>'+[1,3,5].map(function(h){var x=rows.filter(function(r){return r.horizon===h;})[0]||{};return '<td><span class="adaptive-sample-chip">'+Number(x.samples||0)+' 样本</span><br><b class="'+pctCls(x.mean_excess_pct)+'">'+adaptiveValue(x.mean_excess_pct,'%',2)+'</b></td>';}).join('')+'</tr>';}).join('');
+  var horizonRows=Object.keys(horizons).map(function(id){var rows=horizons[id];return '<tr><td><b>'+adaptiveEsc(rows[0].name)+'</b></td>'+[1,3,5].map(function(h){var x=rows.filter(function(r){return r.horizon===h;})[0]||{};return '<td><span class="adaptive-sample-chip">'+Number(x.samples||0)+' 样本</span><br><b class="'+pctCls(x.mean_excess_pct)+'">'+adaptiveValue(x.mean_excess_pct,'%',2)+'</b></td>';}).join('')+'</tr>';}).join('');
   var guardrails=(d.guardrails||[]).map(function(x){return '<li><span class="adaptive-guard-state '+x.status+'"></span><div><b>'+x.name+'</b><p>'+x.detail+'</p></div><em>'+x.status+'</em></li>';}).join('');
   var runRows=(d.runs||[]).slice(0,8).map(function(x){var detail=x.detail||{};var isObservation=x.status==='intraday_observation';var isAdvisor=x.status==='advisor_batch'||x.status==='advisor_skipped';var isSuccess=x.status==='completed'||isObservation||isAdvisor;var title=isObservation?'午间观测已保存':(isAdvisor?(x.status==='advisor_batch'?'AI审阅已完成':'AI审阅已跳过'):(x.status==='completed'?'学习账本已更新':'任务失败'));var extra=isObservation?(' · 已保存样本 '+Number(detail.sample_rows||0)+' 行 · 仅观测未调参'):(isAdvisor?(detail.reason==='completed'?' · 已完成候选挑战':''):(detail.alpha_lab_status?' · GA '+detail.alpha_lab_status:''));return '<li><time>'+String(x.finished_at||'').replace('T',' ').slice(5,16)+'</time><div><b>'+title+'</b><p>'+((detail.regime?'盘面 '+detail.regime+' · ':'')+'新增成熟奖励 '+Number(x.new_rewards||0)+extra)+'</p></div><span class="tag '+(isSuccess?'tag-ok':'tag-warn')+'">'+x.trigger+'</span></li>';}).join('')||'<li class="adaptive-empty-row">尚无学习运行记录</li>';
   var alphaProgress=Math.min(100,100*Math.min((alpha.profile_days||0)/Math.max(alpha.required_profile_days||1,1),(alpha.mature_rows||0)/Math.max(alpha.required_mature_rows||1,1)));
@@ -368,9 +433,9 @@ function renderAdaptive(d){
   };
   var riskParamLabel={max_exposure:'总仓上限',max_weight:'单股上限',max_industry:'行业上限',single_risk:'单笔风险',daily_loss:'单日熔断',drawdown:'回撤熔断',cooldown_days:'冷静期',min_cost_edge:'成本边际'};
   var downsidePolicy=riskOpt.downside_policy||{};
-  var downsideAccountNames={tq_breakout:'短线日内做T',trend_pullback:'趋势波段优选',sector_rotation:'板块轮动先锋',reported_profit_breakout:'三日策略',main_force_top10:'超强主力股'};
+  var downsideAccountNames={tq_breakout:'短线日内做T',main_force_top10:'超强主力股'};
   var downsideDefaults=downsidePolicy.defaults||{};
-  var downsidePolicyRows=Object.keys(downsideDefaults).map(function(id){var p=downsideDefaults[id]||{},pick=function(short,long){return Number(p[short]==null?p[long]:p[short])||0;};return '<div><b>'+adaptiveEsc(downsideAccountNames[id]||id)+'</b><span>预警 '+fmt(pick('downside_warning_pct','warning_pct'),1)+'% · 部分 '+fmt(pick('downside_partial_pct','partial_pct'),1)+'% · 强制 '+fmt(pick('downside_full_pct','full_pct'),1)+'%</span><small>相对大盘 '+fmt(pick('downside_relative_pct','relative_pct'),1)+'% · 峰值回撤 '+fmt(pick('downside_peak_retrace_pct','peak_retrace_pct'),1)+'% · 部分比例 '+fmt(pick('downside_partial_ratio','partial_ratio')*100,0)+'%</small></div>';}).join('')||'<div><b>等待风控策略基准</b><span>下一次风险评估后生成三段式阈值</span></div>';
+  var downsidePolicyRows=Object.keys(downsideDefaults).filter(function(id){return id==='tq_breakout'||id==='main_force_top10';}).map(function(id){var p=downsideDefaults[id]||{},pick=function(short,long){return Number(p[short]==null?p[long]:p[short])||0;};return '<div><b>'+adaptiveEsc(downsideAccountNames[id]||id)+'</b><span>预警 '+fmt(pick('downside_warning_pct','warning_pct'),1)+'% · 部分 '+fmt(pick('downside_partial_pct','partial_pct'),1)+'% · 强制 '+fmt(pick('downside_full_pct','full_pct'),1)+'%</span><small>相对大盘 '+fmt(pick('downside_relative_pct','relative_pct'),1)+'% · 峰值回撤 '+fmt(pick('downside_peak_retrace_pct','peak_retrace_pct'),1)+'% · 部分比例 '+fmt(pick('downside_partial_ratio','partial_ratio')*100,0)+'%</small></div>';}).join('')||'<div><b>等待风控策略基准</b><span>下一次风险评估后生成三段式阈值</span></div>';
   var downsideNotice='<div class="adaptive-notice adaptive-downside-notice"><b>下跌防线 · '+adaptiveEsc(downsidePolicy.engine||'主力意图 + 三段式下跌防线')+'</b><span>连续 '+Number(downsidePolicy.confirmation_scans||2)+' 次确认后才执行部分/强制减仓；自进化只在事件≥3、确认出货占比≥60%、奖励窗口为负时保守收紧，放宽必须人工批准。</span></div>';
   var riskCandidateRows=riskCandidates.slice(0,3).map(function(x){var ev=x.evidence||{},gates=ev.gates||{},dg=ev.downside_guard||{},base=x.baseline_params||{},next=x.candidate_params||{};var gateRows=['nav_days','trade_events','reward_samples','regime_count'].map(function(k){var gate=gates[k]||{};return '<span class="'+(gate.passed?'pass':'wait')+'">'+({nav_days:'净值日',trade_events:'交易事件',reward_samples:'奖励',regime_count:'盘面'}[k])+' '+Number(gate.current||0)+'/'+Number(gate.required||0)+'</span>';}).join('');var params=['max_exposure','max_weight','daily_loss','drawdown'].map(function(k){return '<div><small>'+riskParamLabel[k]+'</small><b>'+fmt((base[k]||0)*100,1)+'% → '+fmt((next[k]||0)*100,1)+'%</b></div>';}).join('');var guardSummary='<div class="adaptive-downside-evidence"><div><small>下跌防线样本</small><b>'+Number(dg.events||0)+' 事件 · '+Number(dg.confirmed_events||0)+' 已确认</b></div><span>预警 '+Number(dg.warning_events||0)+' · 部分 '+Number(dg.partial_events||0)+' · 强制 '+Number(dg.full_events||0)+'</span><span>疑似出货 '+Number(dg.distribution_events||0)+' · 洗盘 '+Number(dg.washout_events||0)+' · 成交退出 '+Number(dg.filled_exits||0)+'</span></div>';var action=x.status==='human_review_required'?'<button class="ghost" onclick="applyAdaptiveRiskCandidate('+x.id+')">人工批准</button>':'';return '<article class="adaptive-risk-card '+x.status+'"><header><div><span>'+x.account_name+'</span><h4>'+riskStatus[x.status]+'</h4></div><strong>'+(({waiting:'待1日影子',fast_shadow:'1日快速影子',micro:'3日小步调整',standard:'5日标准验证',mature:'10日成熟确认'})[ev.evolution_tier]||ev.evolution_tier||'等待')+'</strong></header><div class="adaptive-risk-params">'+params+'</div><div class="adaptive-risk-gates">'+gateRows+'</div>'+guardSummary+'<p>'+x.reason+'</p>'+action+'</article>';}).join('')||'<div class="paper-empty">运行一次模拟盘学习后生成各策略的风控候选。</div>';
   var activeRiskRows=(riskOpt.active_versions||[]).map(function(x){var version=adaptiveVersionInfo(x);return '<li><div><b>'+x.account_name+' · '+version.revision+'</b><p>版本生成：'+version.generated+' · 开始生效：'+version.effective+' · '+version.source+'</p><small>内部编号：'+adaptiveEsc(version.raw)+' · 候选 '+String((x.meta||{}).candidate_id||'—')+'</small></div><button class="ghost" onclick="rollbackAdaptiveRisk(\''+x.account_id+'\')">回滚</button></li>';}).join('')||'<li class="adaptive-empty-row">当前没有自进化风控覆盖，继续使用策略基准风控。</li>';
@@ -407,14 +472,14 @@ function renderAdaptive(d){
     var state=latest.status==='completed'?'已完成':(latest.status==='failed'?'调用失败':'等待首次运行');
     return '<article class="adaptive-research-card '+adaptiveEsc(task.purpose)+'"><header><div><span>'+adaptiveEsc(task.purpose.replace(/_/g,' '))+'</span><h4>'+adaptiveEsc(task.label)+'</h4></div><em>'+state+'</em></header><p>'+adaptiveEsc(report.summary||task.short)+'</p><div class="adaptive-research-meta"><span>置信度 <b>'+adaptiveValue(report.confidence,'%',0)+'</b></span><span>发现 <b>'+Number((report.findings||[]).length)+'</b></span><span>耗时 <b>'+(latest.latency_ms==null?'—':Number(latest.latency_ms)+'ms')+'</b></span></div>'+(topFinding.title?'<div class="adaptive-research-finding"><span>'+adaptiveEsc(topFinding.severity||'info')+'</span><b>'+adaptiveEsc(topFinding.title)+'</b><p>'+adaptiveEsc(topFinding.evidence||'')+'</p></div>':'')+(eventLinks?'<div class="adaptive-event-links">'+eventLinks+'</div>':'')+'<button class="ghost" onclick="runAdaptiveResearchTask(\''+adaptiveEsc(task.purpose)+'\',this)">单独运行</button></article>';
   }).join('')||'<div class="paper-empty">研究任务尚未加载。</div>';
-  var tradeAttrAccountCards=Object.keys(tradeAttrAccounts).map(function(id){var x=tradeAttrAccounts[id]||{};return '<div><small>'+adaptiveEsc(({tq_breakout:'短线日内做T',trend_pullback:'趋势波段优选',sector_rotation:'板块轮动先锋',reported_profit_breakout:'三日策略',main_force_top10:'超强主力股'})[id]||id)+'</small><b>'+Number(x.filled||0)+' 笔</b><span>个股 '+adaptiveValue(x.mean_stock_move_pct,'%',2)+' · 超额 '+adaptiveValue(x.mean_alpha_pct,'%',2)+'</span><em>公告偏空 '+Number(x.negative_news_records||0)+' 笔 · AI '+Number(x.ai_completed||0)+' 笔</em></div>';}).join('')||'<div class="adaptive-empty-row">盘后收盘后生成逐笔归因。</div>';
-  var tradeAttrRows=(tradeAttribution.recent||[]).filter(function(x){return x.order_status==='filled';}).slice(0,8).map(function(x){var reason=adaptiveJsonArray(x.reason_codes).join('、');return '<li><time>'+adaptiveEsc(String(x.fill_date||'').slice(5,10))+'</time><div><b>'+adaptiveEsc(x.name||x.code)+' '+adaptiveEsc(x.code)+'</b><p>'+adaptiveEsc(({tq_breakout:'短线日内做T',trend_pullback:'趋势波段优选',sector_rotation:'板块轮动先锋',reported_profit_breakout:'三日策略',main_force_top10:'超强主力股'})[x.account_id]||x.account_id)+' · '+adaptiveEsc(x.side==='buy'?'买入':'卖出')+' '+Number(x.qty||0)+'股 · 成交 '+fmt(x.fill_price,2)+' · 收盘 '+fmt(x.close_price,2)+'</p><small>'+adaptiveEsc(reason||'暂无足够证据')+' · 大盘 '+adaptiveValue(x.benchmark_move_pct,'%',2)+' · 个股超额 '+adaptiveValue(x.stock_alpha_pct,'%',2)+'</small></div><em class="tag '+(x.ai_status==='completed'?'tag-ok':'tag-warn')+'">'+adaptiveEsc(x.ai_status==='completed'?'AI已归因':'规则归因')+'</em></li>';}).join('')||'<li class="adaptive-empty-row">当天没有已成交操作。</li>';
+  var tradeAttrAccountCards=Object.keys(tradeAttrAccounts).filter(function(id){return id==='tq_breakout'||id==='main_force_top10';}).map(function(id){var x=tradeAttrAccounts[id]||{};return '<div><small>'+adaptiveEsc(({tq_breakout:'短线日内做T',main_force_top10:'超强主力股'})[id]||id)+'</small><b>'+Number(x.filled||0)+' 笔</b><span>个股 '+adaptiveValue(x.mean_stock_move_pct,'%',2)+' · 超额 '+adaptiveValue(x.mean_alpha_pct,'%',2)+'</span><em>公告偏空 '+Number(x.negative_news_records||0)+' 笔 · AI '+Number(x.ai_completed||0)+' 笔</em></div>';}).join('')||'<div class="adaptive-empty-row">盘后收盘后生成逐笔归因。</div>';
+  var tradeAttrRows=(tradeAttribution.recent||[]).filter(function(x){return x.order_status==='filled';}).slice(0,8).map(function(x){var reason=adaptiveJsonArray(x.reason_codes).join('、');return '<li><time>'+adaptiveEsc(String(x.fill_date||'').slice(5,10))+'</time><div><b>'+adaptiveEsc(x.name||x.code)+' '+adaptiveEsc(x.code)+'</b><p>'+adaptiveEsc(({tq_breakout:'短线日内做T',trend_pullback:'趋势波段优选',sector_rotation:'板块轮动先锋',reported_profit_breakout:'三日策略'})[x.account_id]||x.account_id)+' · '+adaptiveEsc(x.side==='buy'?'买入':'卖出')+' '+Number(x.qty||0)+'股 · 成交 '+fmt(x.fill_price,2)+' · 收盘 '+fmt(x.close_price,2)+'</p><small>'+adaptiveEsc(reason||'暂无足够证据')+' · 大盘 '+adaptiveValue(x.benchmark_move_pct,'%',2)+' · 个股超额 '+adaptiveValue(x.stock_alpha_pct,'%',2)+'</small></div><em class="tag '+(x.ai_status==='completed'?'tag-ok':'tag-warn')+'">'+adaptiveEsc(x.ai_status==='completed'?'AI已归因':'规则归因')+'</em></li>';}).join('')||'<li class="adaptive-empty-row">当天没有已成交操作。</li>';
   var tradeAttrPanel='<section class="adaptive-panel trade-attribution-panel"><header><div><span>TRADE → REASON → LEARNING</span><h3>盘后逐笔涨跌归因</h3></div><em>'+Number(tradeAttribution.records||0)+' 条记录</em></header><p class="adaptive-copy">每个收盘任务先计算个股涨跌、大盘拖累、板块贡献、公告/舆情和行情质量，再批量调用 AI 做可审计解释；AI 结论只进入自进化证据，不直接下单。</p><div class="adaptive-grid trade-attribution-summary">'+tradeAttrAccountCards+'</div><ul class="adaptive-run-log trade-attribution-list">'+tradeAttrRows+'</ul></section>';
   var closedLoopStages=(closedLoop.timeline||[]).map(function(x){var active=String(x.stage)===String(closedLoop.stage);return '<div class="closed-loop-stage '+(active?'active':'')+'"><b>'+adaptiveEsc(x.stage)+'</b><span>'+adaptiveEsc(x.mode)+'</span><em>'+Number(x.nav_pct||0)+'% 资金</em></div>';}).join('');
   var closedLoopBlockers=(closedLoop.blockers||[]).map(function(x){return '<li>'+adaptiveEsc(x)+'</li>';}).join('')||'<li class="pass">当前阶段的确定性门禁已通过</li>';
-  var closedLoopPanel='<section class="adaptive-panel closed-loop-panel"><header><div><span>DATA → ALPHA → PORTFOLIO → RISK → EXECUTION → FEEDBACK</span><h3>量化闭环准入台</h3></div><em>'+adaptiveEsc(closedLoop.stage||'D1-D3')+' · '+adaptiveEsc(closedLoop.mode==='shadow'?'影子运行':closedLoop.mode||'影子运行')+'</em></header><p class="adaptive-copy">先把信号、风控、委托、成交和结果串成同一证据链，再让自适应模块按 0% → 5% → 10% 的模拟资金逐级接管。日期到了但证据不达标不会强行放权。</p><div class="closed-loop-stages">'+closedLoopStages+'</div><div class="closed-loop-kpis"><div><small>历史证据链委托</small><b>'+Number(chain.orders||0)+'</b></div><div><small>新窗口关联率</small><b>'+adaptiveValue(admissionWindow.link_pct,'%',1)+'</b></div><div><small>新窗口完整率</small><b>'+adaptiveValue(admissionWindow.valid_pct,'%',1)+'</b></div><div><small>实际 / 反事实</small><b>'+Number(chain.actual||0)+' / '+Number(chain.counterfactual||0)+'</b></div><div><small>策略成交覆盖</small><b>'+Number(closedLoop.strategy_coverage||0)+' / 4</b></div><div><small>灰度硬上限</small><b>'+Number(canaryLimits.max_nav_pct||10)+'% · '+Number(canaryLimits.max_new_slots||2)+'槽</b></div></div><div class="closed-loop-gates"><h4>当前阻断项</h4><ul>'+closedLoopBlockers+'</ul><small>历史债务：未完整关联 '+Number(legacyDebt.unlinked_orders||0)+' 条；只保留审计，不计入新闭环准入。</small></div><div class="adaptive-notice">未成交、风控拒绝、容量延期只进入反事实账本，不再混入真实 Bandit 收益。GA、神经网络和 DeepSeek 在本阶段只能生成影子研究证据，不能直接控制订单。</div></section>';
+  var closedLoopPanel='<section class="adaptive-panel closed-loop-panel"><header><div><span>DATA → ALPHA → PORTFOLIO → RISK → EXECUTION → FEEDBACK</span><h3>量化闭环准入台</h3></div><em>'+adaptiveEsc(closedLoop.stage||'D1-D3')+' · '+adaptiveEsc(closedLoop.mode==='shadow'?'影子运行':closedLoop.mode||'影子运行')+'</em></header><p class="adaptive-copy">先把信号、风控、委托、成交和结果串成同一证据链，再让自适应模块按 0% → 5% → 10% 的模拟资金逐级接管。日期到了但证据不达标不会强行放权。</p><div class="closed-loop-stages">'+closedLoopStages+'</div><div class="closed-loop-kpis"><div><small>历史证据链委托</small><b>'+Number(chain.orders||0)+'</b></div><div><small>新窗口关联率</small><b>'+adaptiveValue(admissionWindow.link_pct,'%',1)+'</b></div><div><small>新窗口完整率</small><b>'+adaptiveValue(admissionWindow.valid_pct,'%',1)+'</b></div><div><small>实际 / 反事实</small><b>'+Number(chain.actual||0)+' / '+Number(chain.counterfactual||0)+'</b></div><div><small>策略成交覆盖</small><b>'+Number(closedLoop.strategy_coverage||0)+' / 2 当前账户</b></div><div><small>灰度硬上限</small><b>'+Number(canaryLimits.max_nav_pct||10)+'% · '+Number(canaryLimits.max_new_slots||2)+'槽</b></div></div><div class="closed-loop-gates"><h4>当前阻断项</h4><ul>'+closedLoopBlockers+'</ul><small>历史债务：未完整关联 '+Number(legacyDebt.unlinked_orders||0)+' 条；只保留审计，不计入新闭环准入。</small></div><div class="adaptive-notice">未成交、风控拒绝、容量延期只进入反事实账本，不再混入真实 Bandit 收益。GA、神经网络和 DeepSeek 在本阶段只能生成影子研究证据，不能直接控制订单。</div></section>';
   var portfolioRows=portfolioSelected.map(function(x){return '<article><div><span>'+adaptiveEsc(x.account_name)+'</span><b>'+adaptiveEsc(x.name||x.code)+' '+adaptiveEsc(x.code)+'</b><small>'+adaptiveEsc(x.industry||'未知行业')+' · '+adaptiveEsc((x.reasons||[]).join('；'))+'</small></div><strong>'+fmt(x.utility,1)+'</strong></article>';}).join('')||'<div class="paper-empty">当前没有可进入组合比较的新增候选。</div>';
-  var portfolioPanel='<section class="adaptive-panel portfolio-shadow-panel"><header><div><span>PORTFOLIO ARBITER · SHADOW</span><h3>跨策略组合裁决</h3></div><em>影子运行 · 不改变订单</em></header><p class="adaptive-copy">四套策略继续独立选股；组合层只在共享资金池里比较边际效用，并对同股重复、行业集中和容量延期扣分。当前最多展示 '+Number(portfolioShadow.max_canary_slots||2)+' 个灰度候选。</p><div class="portfolio-shadow-kpis"><span>候选 <b>'+Number(portfolioShadow.candidate_count||0)+'</b></span><span>当前持仓槽 <b>'+Number(portfolioShadow.held_slots||0)+'</b></span><span>重复代码 <b>'+Number(portfolioShadow.duplicate_code_count||0)+'</b></span></div><div class="portfolio-shadow-list">'+portfolioRows+'</div><div class="adaptive-notice">该裁决器不会因为 Bandit 权重变化强制卖出现有持仓；T+1、双源行情、82%总暴露和原策略风控仍拥有最终否决权。</div></section>';
+  var portfolioPanel='<section class="adaptive-panel portfolio-shadow-panel"><header><div><span>PORTFOLIO ARBITER · SHADOW</span><h3>跨策略组合裁决</h3></div><em>影子运行 · 不改变订单</em></header><p class="adaptive-copy">两套策略继续独立选股；组合层只在共享资金池里比较边际效用，并对同股重复、行业集中和容量延期扣分。当前最多展示 '+Number(portfolioShadow.max_canary_slots||2)+' 个灰度候选。</p><div class="portfolio-shadow-kpis"><span>候选 <b>'+Number(portfolioShadow.candidate_count||0)+'</b></span><span>当前持仓槽 <b>'+Number(portfolioShadow.held_slots||0)+'</b></span><span>重复代码 <b>'+Number(portfolioShadow.duplicate_code_count||0)+'</b></span></div><div class="portfolio-shadow-list">'+portfolioRows+'</div><div class="adaptive-notice">该裁决器不会因为 Bandit 权重变化强制卖出现有持仓；T+1、双源行情、82%总暴露和原策略风控仍拥有最终否决权。</div></section>';
   var dataCards=dataCategories.map(function(x){var coverage=x.coverage_pct==null?'分项统计':fmt(x.coverage_pct,1)+'%';var freshness=x.freshness_minutes==null?'':(' · 延迟 '+fmt(x.freshness_minutes,1)+'分钟');return '<article class="data-input-card '+adaptiveEsc(x.status||'partial')+'"><header><div><span>'+adaptiveEsc(x.id||'data')+'</span><h4>'+adaptiveEsc(x.name)+'</h4></div><em>'+adaptiveEsc(({usable:'可用于交易',shadow:'仅影子',partial:'部分可用',blocked:'禁止新增'})[x.status]||x.status)+'</em></header><div class="data-input-metric"><b>'+coverage+'</b><small>'+Number(x.records||0)+' 条/行'+freshness+'</small></div><p>'+adaptiveEsc(x.detail||'')+'</p><div class="data-input-sources">'+(x.sources||[]).map(function(s){return '<span>'+adaptiveEsc(s)+'</span>';}).join('')+'</div><small>'+adaptiveEsc(x.authority||'')+'</small></article>';}).join('');
   var dataBlockers=(dataInputs.blockers||[]).map(function(x){return '<li>'+adaptiveEsc(x)+'</li>';}).join('')||'<li class="pass">五类输入均达到当前使用门槛</li>';
   var dataInputPanel='<section class="adaptive-panel data-input-panel"><header><div><span>DATA INPUT BUS · QUALITY GATES</span><h3>五类数据输入总线</h3></div><em>'+adaptiveEsc(dataInputs.version||'data-input-bus-v1')+'</em></header><p class="adaptive-copy">全面不等于把所有字段都接进来，而是每类数据都要有来源、覆盖率、源时间、降级状态和明确使用权限。缺失数据不会静默用代理值冒充。</p><div class="data-input-grid">'+dataCards+'</div><div class="data-input-bottom"><div><h4>当前数据缺口</h4><ul>'+dataBlockers+'</ul></div><div><h4>输入纪律</h4><ul>'+(dataInputs.rules||[]).map(function(x){return '<li>'+adaptiveEsc(x)+'</li>';}).join('')+'</ul></div></div></section>';
@@ -434,7 +499,7 @@ function renderAdaptive(d){
     +'<section class="adaptive-panel news-learning-panel"><header><div><span>EVENT → OUTCOME → CALIBRATION</span><h3>统一情报与事件学习</h3></div><div class="adaptive-advisor-actions"><em>'+(newsLearning.mode==='paper_micro_eligible'?'有界微调资格':'影子学习')+'</em><button id="newsLearningRunButton" class="ghost" onclick="runNewsLearning()">运行新闻学习</button></div></header><p class="adaptive-copy">风控中心与自进化共用同一份新闻/公告事件账本；风控负责实时门禁，自进化负责1/3/5日兑现校准。</p>'+dynamicRiskNotice+'<div class="news-learning-flow"><span><b>01</b>采集去重</span><i></i><span><b>02</b>事件分型</span><i></i><span><b>03</b>1/3/5日兑现</span><i></i><span><b>04</b>来源校准</span><i></i><span><b>05</b>模拟盘微调</span></div><div class="news-kpis"><div><small>事件账本</small><b>'+Number(newsTotals.events||0)+'</b></div><div><small>可追溯链接</small><b>'+adaptiveValue(newsTotals.linked_pct,'%',1)+'</b></div><div><small>成熟结果</small><b>'+Number(newsTotals.mature_outcomes||0)+'</b></div><div><small>5日成熟事件</small><b>'+Number(newsTotals.mature_5d_events||0)+'</b></div></div><div class="news-learning-layout"><div><h4>最近进入账本</h4><ul class="news-event-list">'+newsEvents+'</ul></div><aside><h4>来源信誉（不使用涨跌评分）</h4><div class="news-source-list">'+newsSources+'</div><h4>微调门禁</h4><div class="news-gates">'+newsGateRows+'</div></aside></div><div class="adaptive-notice">'+adaptiveEsc(newsLearning.authority||'当前仅影子记录。')+'</div></section>'
     +'<section class="adaptive-panel adaptive-advisor-evidence"><header><div><span>DEEPSEEK · DATA QUALITY + TUNING</span><h3>模拟盘数据校验与有界调参</h3></div><div class="adaptive-advisor-actions"><em>'+adaptiveEsc(deepseek.model||'deepseek-v4-flash')+'</em><button id="advisorRunButton" class="ghost" onclick="runAdaptiveAdvisor()" '+(advisorReady?'':'disabled')+'>运行数据质量审阅</button><button id="adaptiveAiTuneInlineButton" class="ghost" onclick="runAdaptiveAiTuning()" '+(advisorReady&&aiTuning.enabled?'':'disabled')+'>运行AI有界调参</button></div></header><div class="adaptive-advisor-summary"><div><small>数据审阅</small><b>'+adaptiveEsc(advisorState)+'</b></div><div><small>AI调参状态</small><b>'+adaptiveEsc(aiTuningState)+'</b></div><div><small>确定性异常</small><b>'+Number(deterministicCount)+'</b></div><div><small>审阅置信度</small><b>'+adaptiveValue(advisorReport.confidence,'%',0)+'</b></div><div><small>跨源真实性</small><b class="'+(advisorReport.cross_source_status==='verified'?'up':'down')+'">'+crossSourceLabel+'</b></div><div><small>双源覆盖 / 一致</small><b>'+adaptiveValue(crossSource.coverage_pct,'%',1)+' / '+adaptiveValue(crossSource.agreement_pct,'%',1)+'</b></div></div><div class="adaptive-advisor-report"><div><h4>审阅摘要</h4><p>'+adaptiveEsc(advisorReport.summary||deepseek.truth_boundary||'DeepSeek只复核确定性证据；行情真实性仍需独立数据源交叉验证。')+'</p><small>市场状态：'+(advisorMarket.session_status==='closed'?'已收盘':'交易中')+' · 收盘口径 '+adaptiveEsc(String(advisorMarket.close_cutoff_at||'—').replace('T',' '))+' · 源行情最后到达 '+adaptiveEsc(String(advisorMarket.latest_source_at||'—').replace('T',' '))+' · 最近审阅 '+adaptiveEsc(String(advisorLatest.finished_at||'—').replace('T',' '))+'</small></div><ul>'+advisorFindings+'</ul></div><div class="adaptive-notice">AI只可在三套模拟账户内提出白名单权重、入场阈值和选股条件的小步补丁；系统先做行情质量、跨源、幅度、冷却和回滚校验，再允许盘中同日生效。AI不能下单、修改公共选股或放宽风控；超出边界的建议只留在影子候选中。</div></section>'
     +'<section class="adaptive-panel adaptive-research-suite"><header><div><span>DEEPSEEK · PAPER RESEARCH SUITE</span><h3>模拟盘智能研究任务</h3></div><button id="advisorSuiteButton" class="ghost" onclick="runAdaptiveResearchSuite()" '+(advisorReady?'':'disabled')+'>运行全部研究任务</button></header><p class="adaptive-copy">收盘后自动运行；每项独立留痕。结论只能进入研究和人工复核，不能直接改选股、风控或订单。</p><div class="adaptive-research-grid">'+researchCards+'</div></section>'
-    +'<section class="adaptive-panel"><header><div><span>CONTEXTUAL BANDIT</span><h3>五策略影子分配</h3></div><em>总和 100% · 不改变账户资金</em></header><div class="adaptive-strategy-grid">'+strategyCards+'</div><div class="adaptive-notice">'+d.data_note+'</div></section>'
+    +'<section class="adaptive-panel"><header><div><span>CONTEXTUAL BANDIT</span><h3>五策略影子分配</h3></div><em>总和 100% · 不改变账户资金</em></header><div class="adaptive-strategy-grid">'+strategyCards+'</div><div class="adaptive-notice">'+adaptiveEsc(d.data_note||'')+'</div></section>'
     +'<div class="adaptive-grid"><section class="adaptive-panel"><header><div><span>GENETIC ALGORITHM</span><h3>GA Alpha 实验室</h3></div><em>非神经网络</em></header><p class="adaptive-copy">'+alpha.architecture+'</p><div class="adaptive-progress-copy"><span>画像日 '+Number(alpha.profile_days||0)+' / '+Number(alpha.required_profile_days||10)+'</span><span>成熟标签 '+Number(alpha.mature_rows||0)+' / '+Number(alpha.required_mature_rows||5000)+'</span></div>'+adaptiveBar(alphaProgress,'ga')+'<ul class="adaptive-alpha-list">'+candidateRows+'</ul></section><section class="adaptive-panel"><header><div><span>MULTI-HORIZON REWARD</span><h3>策略周期兑现</h3></div><em>1日 20% · 3日 35% · 5日 45%</em></header><div class="table-scroll"><table class="adaptive-horizon-table"><thead><tr><th>策略</th><th>1日超额</th><th>3日超额</th><th>5日超额</th></tr></thead><tbody>'+horizonRows+'</tbody></table></div></section></div>'
     +'<div class="adaptive-grid"><section class="adaptive-panel"><header><div><span>RISK GATE</span><h3>放权门槛</h3></div><em>默认全部锁定</em></header><ul class="adaptive-guardrails">'+guardrails+'</ul></section><section class="adaptive-panel"><header><div><span>AUDIT LOG</span><h3>真实学习日志</h3></div><em>不展示虚构迭代数</em></header><ul class="adaptive-run-log">'+runRows+'</ul></section></div>'
     +'</div>';
@@ -457,13 +522,65 @@ function renderAdaptive(d){
     mark('.adaptive-risk-evolution,.risk-closure-panel','risk');
     mark('.intelligence-scope-panel,.news-learning-panel','news');
     mark('.adaptive-advisor-evidence,.adaptive-research-suite','research');
+    /* ─── AI审阅与调参 section ─── */
+    var aiSectionHtml='<section class="adaptive-panel adaptive-ai-section" data-adaptive-section="ai">'
+      +'<header><div><span>DUAL AI CONSENSUS · SELF-EVOLUTION</span><h3>AI审阅与调参</h3></div>'
+      +'<div class="adaptive-advisor-actions">'
+      +'<button class="ghost" onclick="loadEvolutionStatus()">刷新状态</button>'
+      +'<button class="ghost" onclick="triggerEvolution()">手动触发进化</button>'
+      +'<button class="ghost" onclick="runDualAiTuning()">运行双AI调参</button>'
+      +'</div></header>'
+      /* 双AI状态卡片 */
+      +'<div class="ai-status-cards" id="aiStatusCards">'
+      +'<div class="ai-card"><small>MiMo v2.5 Pro</small><b id="aiMiMoStatus">检测中…</b></div>'
+      +'<div class="ai-card"><small>DeepSeek</small><b id="aiDeepSeekStatus">检测中…</b></div>'
+      +'<div class="ai-card"><small>modlens 视觉</small><b id="aiModlensStatus">检测中…</b></div>'
+      +'<div class="ai-card"><small>共识率</small><b id="aiConsensusRate">—</b></div>'
+      +'<div class="ai-card"><small>进化状态</small><b id="aiEvolutionState">检测中…</b></div>'
+      +'<div class="ai-card"><small>参数版本</small><b id="aiParamsVersion">—</b></div>'
+      +'</div>'
+      /* 进化参数面板 */
+      +'<div class="ai-params-panel">'
+      +'<h4>当前进化参数</h4>'
+      +'<div id="aiParamsTable" class="ai-params-grid">加载中…</div>'
+      +'</div>'
+      /* 最近调参记录 */
+      +'<div class="ai-runs-panel">'
+      +'<h4>最近双AI调参记录</h4>'
+      +'<div id="aiRunsTable"><div class="loading">加载中…</div></div>'
+      +'</div>'
+      /* 性能指标 */
+      +'<div class="ai-metrics-panel">'
+      +'<h4>调参性能指标</h4>'
+      +'<div class="ai-metrics-grid" id="aiMetricsGrid">加载中…</div>'
+      +'</div>'
+      /* 进化日志 */
+      +'<div class="ai-log-panel">'
+      +'<h4>进化事件日志</h4>'
+      +'<div id="aiLogTable"><div class="loading">加载中…</div></div>'
+      +'</div>'
+      /* modlens 图片测试 */
+      +'<div class="ai-modlens-panel">'
+      +'<h4>modlens 视觉测试</h4>'
+      +'<div class="controls"><input id="aiImageUrl" type="text" placeholder="输入图片URL或本地路径" style="width:400px">'
+      +'<button class="ghost" onclick="testModlensRead()">读取图片</button></div>'
+      +'<div id="aiModlensResult" style="margin-top:10px"></div>'
+      +'</div>'
+      +'<div class="adaptive-notice">双AI共识调参：MiMo + DeepSeek 独立分析同一份市场证据，双方提案方向一致且幅度接近时才合并执行。自进化系统根据历史表现自动调整调参策略参数。modlens 为纯文本模型提供视觉能力。</div>'
+      +'</section>';
+    shell.insertAdjacentHTML('beforeend', aiSectionHtml);
+
     var grids=shell.querySelectorAll(':scope > .adaptive-grid');
     if(grids[0]) grids[0].dataset.adaptiveSection='overview';
+    /* AI section: 复用 research 的内容，但添加 AI 双共识面板 */
     if(grids[1]) grids[1].dataset.adaptiveSection='model';
     if(grids[2]) grids[2].dataset.adaptiveSection='model';
     /* Every direct content block belongs to exactly one tab.  This prevents
        trailing evidence panels from leaking into another subsection. */
-    shell.querySelectorAll(':scope > *').forEach(function(node){
+
+    /* AI section 标记 */
+    mark('.adaptive-ai-section','ai');
+  shell.querySelectorAll(':scope > *').forEach(function(node){
       if(!node.dataset.adaptiveSection) node.dataset.adaptiveSection='model';
     });
     setAdaptiveSection(sessionStorage.getItem('astock.adaptiveSection')||'overview');
@@ -541,16 +658,210 @@ function adaptiveActionNotice(title,detail){
   window.setTimeout(function(){var target=mask.querySelector('[data-action="close"]'); if(target) target.focus();},0);
 }
 async function runAdaptive(){
-  var confirmation=await adaptiveConfirm({title:'运行一次模拟盘学习',detail:'将更新三套短线策略的研究、逐笔归因和候选证据。',boundary:'不会新增模拟买卖，不会放宽任何风控。'}); if(!confirmation.approved) return;
+  var confirmation=await adaptiveConfirm({title:'运行一次模拟盘学习',detail:'将更新各模拟策略的研究、逐笔归因和候选证据。',boundary:'不会新增模拟买卖，不会放宽任何风控。'}); if(!confirmation.approved) return;
   var button=$('adaptiveRunButton'); if(button) button.disabled=true;
-  try{renderAdaptive(await apiPost('/api/adaptive/run?trigger=manual-ui&confirmed=true'));}
+  try{
+    var request=await apiPost('/api/adaptive/run?trigger=manual-ui&confirmed=true');
+    if(!request||['accepted','busy'].indexOf(request.status)<0) throw new Error((request&&request.message)||'学习任务未启动');
+    if(button) button.textContent=request.status==='accepted'?'学习运行中…':'已有学习运行中…';
+    for(var i=0;i<120;i++){
+      await new Promise(function(resolve){window.setTimeout(resolve,5000);});
+      var state=await api('/api/adaptive/run/status?_='+Date.now());
+        var stillRunning=['queued','claimed','running'].indexOf(state.status)>=0||state.running===true;
+        if(!stillRunning){
+          if(state.status==='failed'||state.error) throw new Error(state.error||'后台学习失败');
+          await loadAdaptive();
+          break;
+      }
+    }
+  }
   catch(e){adaptiveActionNotice('模拟盘学习失败',e.message);}
-  finally{if(button) button.disabled=false;}
+  finally{if(button){button.disabled=false;button.textContent='运行模拟盘学习';}}
 }
 async function approveAdaptiveNeural(){
   var confirmation=await adaptiveConfirm({title:'批准神经网络影子评分',detail:'神经网络只作为三个短线策略的候选排序参考。',boundary:'不会绕过行情双源、仓位、T+1 或风控门禁；不会直接下单。'}); if(!confirmation.approved) return;
   try{renderAdaptive(await apiPost('/api/adaptive/neural/approve?confirmed=true'));}
   catch(e){adaptiveActionNotice('神经网络仍未达到放权门槛',e.message);}
+}
+
+/* ─── AI审阅与调参 JavaScript 函数 ─── */
+
+async function loadEvolutionStatus(){
+  try{
+    /* 加载双AI状态 */
+    var dualAi=await api('/api/adaptive/dual-ai/status');
+    var keys=dualAi.providers||{};
+    var mimo=keys.mimo||{};
+    var ds=keys.deepseek||{};
+    setEl('aiMiMoStatus', mimo.configured?'已配置 '+adaptiveEsc(mimo.model||''):'未配置');
+    setEl('aiDeepSeekStatus', ds.configured?'已配置 '+adaptiveEsc(ds.model||''):'未配置');
+    setEl('aiConsensusRate', dualAi.consensus_rules?adaptiveValue(dualAi.consensus_rules.weight_magnitude_ratio*100,'%'): '—');
+    /* 加载modlens状态 */
+    try{
+      var modlens=await api('/api/adaptive/modlens/status');
+      setEl('aiModlensStatus', modlens.modlens_available?'可用':'不可用');
+    }catch(e){setEl('aiModlensStatus','检测失败');}
+    /* 加载进化状态 */
+    try{
+      var evo=await api('/api/adaptive/evolution/status');
+      setEl('aiEvolutionState', evo.should_evolve?'待进化':'稳定');
+      var params=evo.current_params||{};
+      setEl('aiParamsVersion', params.id?'#'+params.id+' ('+adaptiveEsc(params.source||'')+')':'默认');
+      renderEvolutionParams(params.params||{});
+      renderEvolutionMetrics(evo.performance_metrics||{});
+    }catch(e){
+      setEl('aiEvolutionState','未初始化');
+      setEl('aiParamsVersion','默认');
+    }
+  }catch(e){
+    setEl('aiMiMoStatus','加载失败');
+    setEl('aiDeepSeekStatus','加载失败');
+  }
+  /* 加载调参记录 */
+  try{
+    var runs=await api('/api/adaptive/dual-ai/runs?limit=10');
+    renderDualAiRuns(runs.runs||[]);
+  }catch(e){setEl('aiRunsTable','<div class="banner">加载调参记录失败：'+adaptiveEsc(e.message)+'</div>');}
+  /* 加载进化日志 */
+  try{
+    var log=await api('/api/adaptive/evolution/log?limit=20');
+    renderEvolutionLog(log.log||[]);
+  }catch(e){setEl('aiLogTable','<div class="banner">加载进化日志失败：'+adaptiveEsc(e.message)+'</div>');}
+}
+
+function renderEvolutionParams(params){
+  var keys=['max_weight_delta','max_delta_threshold','confidence_threshold',
+    'consensus_weight_ratio','consensus_direction_threshold','hold_bias',
+    'max_proposals_per_run','require_dual_confidence','min_dual_confidence'];
+  var labels={
+    max_weight_delta:'最大权重步长',max_delta_threshold:'最大入场阈值调整',
+    confidence_threshold:'置信度阈值',consensus_weight_ratio:'共识权重幅度比',
+    consensus_direction_threshold:'共识方向阈值',hold_bias:'hold倾向',
+    max_proposals_per_run:'单次最大提案数',require_dual_confidence:'要求双AI置信度',
+    min_dual_confidence:'双AI最低置信度'
+  };
+  var h='<table class="adaptive-table"><thead><tr><th>参数</th><th>当前值</th></tr></thead><tbody>';
+  keys.forEach(function(k){
+    var v=params[k];
+    if(v==null)return;
+    var display=typeof v==='boolean'?(v?'是':'否'):Number(v).toFixed(4);
+    h+='<tr><td>'+adaptiveEsc(labels[k]||k)+'</td><td>'+display+'</td></tr>';
+  });
+  h+='</tbody></table>';
+  setEl('aiParamsTable',h);
+}
+
+function renderEvolutionMetrics(m){
+  if(!m.has_data){setEl('aiMetricsGrid','<p>暂无足够数据</p>');return;}
+  var h='<div class="ai-metrics-kpis">'
+    +'<div><small>样本数</small><b>'+Number(m.sample_count)+'</b></div>'
+    +'<div><small>共识率</small><b>'+adaptiveValue(m.consensus_rate*100,'%')+'</b></div>'
+    +'<div><small>propose率</small><b>'+adaptiveValue(m.propose_rate*100,'%')+'</b></div>'
+    +'<div><small>失败率</small><b>'+adaptiveValue(m.failure_rate*100,'%')+'</b></div>'
+    +'<div><small>平均延迟</small><b>'+adaptiveValue(m.avg_latency_ms,'ms',0)+'</b></div>'
+    +'<div><small>评估分数</small><b>'+adaptiveValue(m.avg_eval_score,'',3)+'</b></div>'
+    +'</div>';
+  setEl('aiMetricsGrid',h);
+}
+
+function renderDualAiRuns(runs){
+  if(!runs.length){setEl('aiRunsTable','<p>暂无调参记录</p>');return;}
+  var h='<table class="adaptive-table"><thead><tr><th>ID</th><th>触发</th><th>模式</th><th>状态</th><th>MiMo</th><th>DeepSeek</th><th>共识</th><th>时间</th></tr></thead><tbody>';
+  runs.forEach(function(r){
+    var statusClass=r.status==='consensus'?'up':(r.status==='failed'?'down':'');
+    var mimo=r.mimo||{};
+    var ds=r.deepseek||{};
+    h+='<tr>'
+      +'<td>#'+r.id+'</td>'
+      +'<td>'+adaptiveEsc(r.trigger)+'</td>'
+      +'<td>'+adaptiveEsc(r.mode)+'</td>'
+      +'<td class="'+statusClass+'">'+adaptiveEsc(r.status)+'</td>'
+      +'<td>'+adaptiveEsc(mimo.status)+(mimo.latency_ms?' ('+mimo.latency_ms+'ms)':'')+'</td>'
+      +'<td>'+adaptiveEsc(ds.status)+(ds.latency_ms?' ('+ds.latency_ms+'ms)':'')+'</td>'
+      +'<td>'+adaptiveEsc(r.consensus_reason||'').substring(0,40)+'</td>'
+      +'<td>'+adaptiveEsc(r.created_at||'').replace('T',' ').substring(0,19)+'</td>'
+      +'</tr>';
+  });
+  h+='</tbody></table>';
+  setEl('aiRunsTable',h);
+}
+
+function renderEvolutionLog(log){
+  if(!log.length){setEl('aiLogTable','<p>暂无进化日志</p>');return;}
+  var h='<table class="adaptive-table"><thead><tr><th>时间</th><th>事件</th><th>详情</th></tr></thead><tbody>';
+  log.forEach(function(e){
+    var detail=e.detail||{};
+    var desc='';
+    if(detail.adjustments) desc=detail.adjustments.join('; ');
+    else if(detail.reason) desc=detail.reason;
+    else desc=JSON.stringify(detail).substring(0,80);
+    h+='<tr>'
+      +'<td>'+adaptiveEsc(e.created_at||'').replace('T',' ').substring(0,19)+'</td>'
+      +'<td>'+adaptiveEsc(e.event_type)+'</td>'
+      +'<td>'+adaptiveEsc(desc)+'</td>'
+      +'</tr>';
+  });
+  h+='</tbody></table>';
+  setEl('aiLogTable',h);
+}
+
+async function triggerEvolution(){
+  if(!confirm('确认手动触发一次自进化？')) return;
+  try{
+    var r=await apiPost('/api/adaptive/evolution/evolve?confirmed=true');
+    if(r.evolved){
+      alert('进化完成！调整了 '+((r.changed_keys||[]).length)+' 个参数');
+    }else{
+      alert('无需进化：'+(r.reason||r.metrics?'当前状态稳定':'无数据'));
+    }
+    loadEvolutionStatus();
+  }catch(e){alert('进化失败：'+e.message);}
+}
+
+async function runDualAiTuning(){
+  if(!confirm('确认运行一次双AI共识调参？')) return;
+  try{
+    var r=await apiPost('/api/adaptive/dual-ai/tune?trigger=manual&mode=intraday&confirmed=true');
+    var msg='调参完成\n状态：'+r.status+'\n共识：'+(r.consensus?'是':'否')+'\n原因：'+(r.consensus_reason||'');
+    if(r.evolution_triggered) msg+='\n\n⚡ 自动进化已触发';
+    alert(msg);
+    loadEvolutionStatus();
+  }catch(e){alert('双AI调参失败：'+e.message);}
+}
+
+async function testModlensRead(){
+  var url=($('aiImageUrl')||{}).value||'';
+  if(!url){alert('请输入图片URL或路径');return;}
+  setEl('aiModlensResult','<div class="loading">正在读取图片…</div>');
+  try{
+    var r=await apiPost('/api/adaptive/modlens/read-image?path='+encodeURIComponent(url));
+    var h='<div class="ai-modlens-output">'
+      +'<p><b>状态：</b>'+(r.success?'成功':'失败')+'</p>'
+      +'<p><b>耗时：</b>'+(r.latency_ms||0)+'ms</p>';
+    if(r.success){
+      h+='<p><b>OCR文字：</b></p><pre style="max-height:200px;overflow:auto;background:rgba(0,0,0,.2);padding:8px;border-radius:6px;font-size:12px">'
+        +adaptiveEsc(r.formatted_text||r.ocr_text||'（无文字）')+'</pre>';
+    }else{
+      h+='<p style="color:var(--state-error)">'+adaptiveEsc(r.error)+'</p>';
+    }
+    h+='</div>';
+    setEl('aiModlensResult',h);
+  }catch(e){setEl('aiModlensResult','<div class="banner">请求失败：'+adaptiveEsc(e.message)+'</div>');}
+}
+
+function setEl(id,html){var el=document.getElementById(id);if(el)el.innerHTML=html;}
+
+/* 页面加载时自动执行 */
+setTimeout(function(){if(document.getElementById('aiStatusCards')) loadEvolutionStatus();},1000);
+
+function switchToAdaptiveAI(){
+  /* 切换到自进化页面并打开AI tab */
+  var adaptiveTab=document.querySelector('[data-page="p-adaptive"]');
+  if(adaptiveTab && !adaptiveTab.classList.contains('active')) adaptiveTab.click();
+  setTimeout(function(){
+    var aiTab=document.querySelector('[data-section="ai"]');
+    if(aiTab) setAdaptiveSection('ai',aiTab);
+  },200);
 }
 async function runAdaptiveAiTuning(){
   var confirmation=await adaptiveConfirm({title:'运行 AI 有界调参',detail:'AI 会复核行情、账本和策略证据，并产出受限调参候选。',boundary:'结果先进入候选与审计，不会直接改变交易规则或下单。'}); if(!confirmation.approved) return;
@@ -730,6 +1041,7 @@ function setBacktestCycle(){
 }
 
 async function loadOverview(){
+  if(!$('idxCards')||!$('breadthChart')) return;
   try{
     var d = await api('/api/overview');
     var groups = {'A股':[], '港股':[], '美股':[]};
@@ -766,21 +1078,28 @@ async function loadOverview(){
 }
 
 function renderGate(g){
-  if(!g) return;
+  var badge=$('gateBadge');
+  if(!badge) return;
+  g=g||{};
   var known = ['green','yellow','red'].indexOf(g.light)>=0;
   var cls = g.light==='red'?'gate-red':(g.light==='yellow'||!known?'gate-yellow':'gate-green');
   var txt = g.light==='red'?'海外风险：红灯':(g.light==='yellow'?'海外风险：黄灯':(g.light==='green'?'海外风险：绿灯':'海外风险：未知（保守）'));
-  $('gateBadge').className = 'gate-badge '+cls;
-  $('gateBadge').innerHTML = '<div class="gate-dot"></div><span>'+txt+'</span>';
-  var rows = (g.detail||[]).map(function(x){
-    return '<tr><td>'+x.name+'</td><td>'+x.window+'</td><td class="'+pctCls(x.pct)+'">'+pctTxt(x.pct)+'</td></tr>';
-  }).join('');
-  $('gatePanel').innerHTML = '<table><tr><th>指标</th><th>窗口</th><th>涨跌幅</th></tr>'+rows+'</table>'
-    + '<div style="margin-top:12px;padding:10px;background:#fafbfd;border-radius:8px;font-size:13px">'+ (g.advice||'') +'</div>'
-    + '<div class="disclaimer">规则：美股5日均跌超3%记2分/超1.5%记1分；恒指5日跌超3%记1分；美元指数20日涨超2%记1分。≥3红灯、≥1.5黄灯。'+new Date().toLocaleTimeString('zh-CN')+'</div>';
+  badge.className = 'gate-badge '+cls;
+  badge.innerHTML = '<div class="gate-dot"></div><span>'+adaptiveEsc(txt)+'</span>';
+  badge.title = adaptiveEsc(g.advice||'市场门控结果来自本地缓存；未知时按保守规则执行。');
+}
+
+async function loadMarketGate(){
+  try{
+    var overview=await api('/api/overview');
+    renderGate(overview&&overview.gate);
+  }catch(e){
+    renderGate({light:'unknown',advice:'市场门控读取失败，执行层按保守规则处理。'});
+  }
 }
 
 async function checkInit(){
+  if(!$('initBanner')) return;
   try{
     var both = await Promise.all([api('/api/init/status'), api('/api/health')]);
     var st = both[0], h = both[1];
@@ -825,40 +1144,51 @@ function renderDataValidity(d){
     ['选股因子缓存',fmt(f.eligible_factor_coverage_pct,1)+'%',dataValidityTone(f.eligible_factor_coverage_pct,98,90), '因子日 '+(f.factor_date||'—')]
   ];
   $('dataValidityStatus').className='tag '+statusClass; $('dataValidityStatus').textContent=status;
+  var cancel=$('dataValidityCancel');
+  if(cancel) cancel.style.display=['queued','running','cancelling'].indexOf(String(u.status||''))>=0?'inline-flex':'none';
   $('dataValidityCards').innerHTML=cards.map(function(x){return '<div class="data-validity-card '+x[2]+'"><small>'+x[0]+'</small><b>'+x[1]+'</b><em>'+x[3]+'</em></div>';}).join('');
   var warnings=(d.warnings||[]).slice(0,5).map(function(x){return '<li>'+adaptiveEsc(x)+'</li>';}).join('')||'<li>当前没有数据质量告警。</li>';
   var source=d.source_health||{};
   $('dataValidityDetails').innerHTML='<b>数据源：</b>'+adaptiveEsc(source.healthy?'主源与独立源正常':'存在降级或未返回')+' · <b>最新交易日：</b>'+adaptiveEsc((d.reference||{}).latest_trade_date||'—')+' · <b>不复权兜底：</b>'+Number(c.fallback_unadjusted||0)+' 只 · <b>源快照年龄：</b>'+ (live.age_seconds==null?'—':fmt(live.age_seconds,0)+' 秒')
     +'<div style="margin-top:5px"><b>告警：</b><ul style="margin:3px 0 0 18px">'+warnings+'</ul></div>'
     +'<div style="margin-top:6px;color:#7b8d84">人工更新：'+adaptiveEsc(u.status||'idle')+(u.job_id?' · '+adaptiveEsc(u.job_id):'')+(u.error?' · '+adaptiveEsc(u.error):'')+'</div>';
-  var active=['queued','running','cancelling'].indexOf(String(u.status||''))>=0;
-  var cancel=$('dataValidityCancel'); if(cancel) cancel.style.display=active?'inline-block':'none';
-  var update=$('dataValidityUpdate'); if(update && !active){update.disabled=false;update.textContent='人工增量更新';}
 }
 async function loadDataValidity(){
   var panel=$('dataValidityCards'); if(!panel) return;
-  try{ var d=await api('/api/data-validity'); renderDataValidity(d); }
+  try{ var d=await api('/api/data-validity'); renderDataValidity(d); return d; }
   catch(e){ panel.innerHTML='<div class="banner">数据有效性读取失败：'+adaptiveEsc(e.message||e)+'</div>'; }
 }
 async function startManualDataUpdate(){
   var btn=$('dataValidityUpdate'); if(btn) {btn.disabled=true;btn.textContent='已提交，增量更新中…';}
   try{ await apiPost('/api/data-validity/incremental'); await loadDataValidity();
-    clearTimeout(window._dataValidityTimer);
-    window._dataValidityTimer=setInterval(async function(){ await loadDataValidity(); var d=await api('/api/data-validity').catch(function(){return null;}); var s=d&&d.incremental_update&&d.incremental_update.status; if(s&&['completed','partial','failed'].indexOf(s)>=0){clearInterval(window._dataValidityTimer);if(btn){btn.disabled=false;btn.textContent='人工增量更新';}} },4000);
+    clearInterval(window._dataValidityTimer);
+    window._dataValidityTimer=setInterval(async function(){
+      var d=await loadDataValidity();
+      var s=d&&d.incremental_update&&d.incremental_update.status;
+      if(s&&['completed','partial','failed','cancelled'].indexOf(s)>=0){
+        clearInterval(window._dataValidityTimer);
+        if(btn){btn.disabled=false;btn.textContent='人工增量更新';}
+      }
+    },4000);
   }catch(e){ if(btn){btn.disabled=false;btn.textContent='人工增量更新';} alert('增量更新未启动：'+(e.message||e)); }
 }
 async function startFactorIncrementalUpdate(){
   var btn=$('dataValidityFactor'); if(btn){btn.disabled=true;btn.textContent='因子重建中…';}
-  try{ await apiPost('/api/data-validity/factor/incremental'); await loadDataValidity();
-    clearTimeout(window._dataValidityTimer); window._dataValidityTimer=setInterval(async function(){
-      await loadDataValidity(); var d=await api('/api/data-validity').catch(function(){return null;});
-      var s=d&&d.incremental_update&&d.incremental_update.status;
-      if(s&&['completed','partial','failed'].indexOf(s)>=0){clearInterval(window._dataValidityTimer);if(btn){btn.disabled=false;btn.textContent='重建选股因子';}}
-    },3000);
-  }catch(e){if(btn){btn.disabled=false;btn.textContent='重建选股因子';}alert('因子重建未启动：'+(e.message||e));}
+  try{
+    await apiPost('/api/data-validity/factor/incremental');
+    var d=await loadDataValidity();
+    clearInterval(window._dataValidityTimer);
+    window._dataValidityTimer=setInterval(async function(){
+      var state=await loadDataValidity(), u=state&&state.incremental_update||{}, s=String(u.status||'');
+      if(['completed','partial','failed','cancelled','idle'].indexOf(s)>=0){
+        clearInterval(window._dataValidityTimer);
+        if(btn){btn.disabled=false;btn.textContent='重建选股因子';}
+      }
+    },4000);
+  }catch(e){ if(btn){btn.disabled=false;btn.textContent='重建选股因子';} alert('因子重建未启动：'+(e.message||e)); }
 }
 async function cancelManualDataUpdate(){
-  var btn=$('dataValidityCancel'); if(btn){btn.disabled=true;btn.textContent='正在取消…';}
+  var btn=$('dataValidityCancel'); if(btn){btn.disabled=true;btn.textContent='取消中…';}
   try{ await apiPost('/api/data-validity/incremental/cancel'); await loadDataValidity(); }
   catch(e){ alert('取消增量失败：'+(e.message||e)); }
   finally{ if(btn){btn.disabled=false;btn.textContent='取消增量';} }
@@ -989,7 +1319,7 @@ async function compareStrategies(){
   ];
   try{
     var results = await Promise.all(strategies.map(function(s){
-      return api('/api/select?strategy='+s.id+'&topn='+topn);
+      return api('/api/select?strategy='+encodeURIComponent(s.id)+'&topn='+encodeURIComponent(topn));
     }));
     var rows = '';
     for(var i=0;i<Math.max.apply(null,results.map(function(r){return r.picks.length;}));i++){
@@ -997,7 +1327,7 @@ async function compareStrategies(){
       results.forEach(function(r){
         var p = r.picks[i];
         if(p){
-          rows += '<td><b>'+p.name+'</b><br/><span style="color:var(--text-muted);font-size:11px">'+p.code+'</span></td><td class="'+pctCls(p.pct)+'">'+pctTxt(p.pct)+'</td><td>'+yi(p.super_net)+'</td><td>'+(p.buy_decision?p.buy_decision.tier:'-')+'</td>';
+          rows += '<td><b>'+adaptiveEsc(p.name||p.code)+'</b><br/><span style="color:var(--text-muted);font-size:11px">'+adaptiveEsc(p.code)+'</span></td><td class="'+pctCls(p.pct)+'">'+pctTxt(p.pct)+'</td><td>'+yi(p.super_net)+'</td><td>'+adaptiveEsc(p.buy_decision?p.buy_decision.tier:'-')+'</td>';
         }else{
           rows += '<td colspan="4" style="color:var(--text-muted)">—</td>';
         }
@@ -1005,12 +1335,12 @@ async function compareStrategies(){
       rows += '</tr>';
     }
     $('selectResult').innerHTML =
-      '<div style="margin-bottom:8px"><span class="tag tag-info">Top '+topn+' 四策略对比</span></div>'
+      '<div style="margin-bottom:8px"><span class="tag tag-info">Top '+adaptiveEsc(topn)+' 三策略对比</span></div>'
       +tableScroll('<table><tr><th>#</th><th>三日策略 股票</th><th>涨跌</th><th>超大单</th><th>买入</th>'
       +'<th>五日策略 股票</th><th>涨跌</th><th>超大单</th><th>买入</th>'
       +'<th>十日策略 股票</th><th>涨跌</th><th>超大单</th><th>买入</th></tr>'+rows+'</table>',1180)
-      +'<div class="disclaimer">四策略分别独立计算，同一只股票可能在多个策略中同时出现。仅供研究参考。</div>';
-  }catch(e){ $('selectResult').innerHTML = '<div class="banner">对比失败：'+e+'</div>'; }
+      +'<div class="disclaimer">三种研究策略分别独立计算，同一只股票可能在多个策略中同时出现。仅供研究参考，不会改变两套模拟账户。</div>';
+  }catch(e){ $('selectResult').innerHTML = '<div class="banner">对比失败：'+adaptiveEsc(e&&e.message||e)+'</div>'; }
 }
 
 // ---------- 板块联动 ----------
@@ -1187,12 +1517,12 @@ function paperAuditBlock(title, count, body){
 }
 function syncPaperCapitalHint(){
   var capital=Number($('paperCapital').value)||0;
-  $('paperCapitalHint').textContent='五套策略共享总资金池；输入总金额 ¥'+capital.toLocaleString('zh-CN')+'，五套策略只共享资金，不共享决策和风控规则。';
+  $('paperCapitalHint').textContent='两套策略共享总资金池；输入总金额 ¥'+capital.toLocaleString('zh-CN')+'，两套策略只共享资金，不共享决策和风控规则。';
 }
 async function startPaper(){
   var capital = Number($('paperCapital').value);
   if(!capital || capital<1000){ alert('请先设置总模拟资金，至少 1,000 元。'); return; }
-  if(!confirm('将以总资金池 '+capital.toLocaleString('zh-CN')+' 元归档旧周期并同时启动五套策略。五套策略独立决策，共享现金和总仓位风控；不会连接券商或发送真实订单，是否继续？')) return;
+  if(!confirm('将以总资金池 '+capital.toLocaleString('zh-CN')+' 元归档旧周期并同时启动两套策略。两套策略独立决策，共享现金和总仓位风控；不会连接券商或发送真实订单，是否继续？')) return;
   $('paperStart').disabled = true;
   try{
     var d = await apiPost('/api/paper/start?capital='+encodeURIComponent(capital));
@@ -1313,7 +1643,7 @@ async function submitPaperOrder(){
   if(!confirm(action+' '+plan.name+' '+plan.qty+' 股，'+state+'。这是纯本地模拟，不会发送到券商，继续吗？')) return;
   $('paperSubmitOrder').disabled=true;
   try{
-    var result=await apiPost('/api/paper/order?'+paperOrderQuery(form));
+    var result=await apiPost('/api/paper/order/submit?'+paperOrderQuery(form)+'&confirmed=true');
     alert(result.status==='filled'?'模拟成交已写入账本。':(result.status==='pending_limit'?'限价委托已进入待触发队列。':'委托被模型拒绝。'));
     clearPaperOrderPreview(); await loadPaper();
   }catch(e){ alert('模拟委托失败：'+e.message); }
@@ -1329,10 +1659,14 @@ async function cancelPaperOrder(orderId){
   try{ await apiPost('/api/paper/order/cancel?order_id='+encodeURIComponent(orderId)); await loadPaper(); }
   catch(e){ alert('撤单失败：'+e.message); }
 }
-function paperOrderStatusView(status){
+function paperOrderStatusView(status,reason){
+  // deferred_capacity is also used as the retryable queue marker for
+  // entry-timing confirmation.  Keep the backend lifecycle status intact,
+  // but show the actual reason instead of falsely reporting a cash shortage.
+  if(status==='deferred_capacity' && /入场时机|确认中|确认未完成|回踩/.test(String(reason||'')))
+    return ['pending','等待入场确认'];
   var map={
-    filled:['filled','已成交'],pending_limit:['pending','待触发'],risk_rejected:['rejected','风控拒绝'],deferred_capacity:['pending','次日重新筛选'],
-    entry_frozen_waitlist:['pending','数据恢复待复核'],superseded:['cancelled','已重新复核'],
+    filled:['filled','已成交'],pending_limit:['pending','待触发'],risk_rejected:['rejected','风控拒绝'],deferred_capacity:['pending','容量等待重排'],
     unfilled_limit_down:['rejected','跌停未成交'],cancelled:['cancelled','已撤销'],
     expired:['cancelled','已过期'],ready_to_fill:['pending','待成交']
   };
@@ -1419,7 +1753,7 @@ async function loadPaperStrategyCenter(){
   target.innerHTML='<div class="loading">正在读取策略规则…</div>';
   try{
     var d=await api('/api/paper/strategy-center');
-    var cards=(d.strategies||[]).map(function(s){
+    var cards=(d.strategies||[]).filter(function(s){return s.supports_new_cycle===true;}).map(function(s){
       return '<article class="paper-strategy-card"><header><b>'+riskText(s.name)+'</b><span>'+riskText(s.mode)+' · '+riskText(s.entry_model)+'</span></header>'
         +'<div class="paper-strategy-section"><label>候选来源</label><p>'+riskText(s.candidate)+'</p></div>'
         +'<div class="paper-strategy-section"><label>入场执行</label><p>'+riskText(s.entry)+'</p></div>'
@@ -1431,7 +1765,7 @@ async function loadPaperStrategyCenter(){
   }catch(e){target.innerHTML='<div class="banner">策略中心读取失败：'+riskText(e.message||e)+'</div>';}
 }
 function paperResearchStrategyName(id){
-  return ({tq_breakout:'短线日内做T',trend_pullback:'趋势波段优选',sector_rotation:'板块轮动先锋',reported_profit_breakout:'三日策略',main_force_top10:'超强主力股'})[id]||id||'未知策略';
+  return ({tq_breakout:'短线日内做T',main_force_top10:'超强主力股'})[id]||id||'未知策略';
 }
 function paperResearchOutcome(metric,horizon){
   if(!metric) return '<span class="paper-research-empty">等待 '+horizon+' 日观察</span>';
@@ -1452,12 +1786,12 @@ async function loadPaperResearchValidation(){
     var d=await api('/api/paper/research-validation?limit=90');
     var latestByStrategy={}, policy=d.backfill_policy||{};
     (d.runs||[]).forEach(function(run){ if(!latestByStrategy[run.account_id]) latestByStrategy[run.account_id]=run; });
-    var ids=['tq_breakout','trend_pullback','sector_rotation','reported_profit_breakout','main_force_top10'];
+    var ids=['tq_breakout','main_force_top10'];
     var cards=ids.map(function(id){
       var run=latestByStrategy[id], quality=paperResearchQuality(run), metrics=(d.metrics||{})[id]||{};
       var horizons=[1,3,5].map(function(h){return '<div class="paper-research-outcome"><span>'+h+'日</span>'+paperResearchOutcome(metrics[String(h)],h)+'</div>';}).join('');
       var q=(run&&run.data_quality)||{};
-      var shortCode={tq_breakout:'T',trend_pullback:'波',sector_rotation:'轮',reported_profit_breakout:'三',main_force_top10:'主'}[id]||'证';
+      var shortCode={tq_breakout:'T',main_force_top10:'主'}[id]||'证';
       return '<article class="paper-research-card '+quality.tone+'"><header><div><span class="paper-research-code">'+shortCode+'</span><h3>'+paperResearchStrategyName(id)+'</h3></div><em>'+quality.label+'</em></header>'
         +'<p>'+quality.detail+'</p><dl><div><dt>信号日</dt><dd>'+riskText((run&&run.signal_date)||'—')+'</dd></div><div><dt>候选快照</dt><dd>'+Number((run&&run.candidate_count)||0)+' 只</dd></div><div><dt>因子截至</dt><dd>'+riskText((run&&run.factor_asof_date)||'—')+'</dd></div></dl>'
         +'<div class="paper-research-outcomes">'+horizons+'</div>'
@@ -1470,7 +1804,7 @@ async function loadPaperResearchValidation(){
     var runCount=(d.runs||[]).length;
     var manualAllowed=policy.manual_allowed===true;
     var manualLabel=policy.manual_label||'收盘后可补录';
-    target.innerHTML='<section class="paper-research-hero"><div><span class="page-kicker">SHADOW EVIDENCE · PAPER ONLY</span><h3>五策略研究证据</h3><p>每个交易日收盘后固定候选、评分构成与可用数据范围，再跟踪后续表现。它不下单、不调参，也不会改动风控。</p></div><div class="paper-research-hero-actions"><span class="tag tag-info">已记录 '+runCount+' 份策略快照</span><span class="paper-research-schedule">自动：'+riskText(policy.scheduled_at||'每个交易日收盘后')+'<small>'+riskText(policy.next_observation||'后续有效收盘快照会补齐观察')+'</small></span><button class="ghost" type="button" onclick="refreshPaperResearchValidation(this)">刷新记录</button><button class="ghost paper-research-backfill" type="button" title="'+riskText(policy.manual_scope||'')+'" onclick="backfillPaperResearch(this)" '+(manualAllowed?'':'disabled')+'>'+riskText(manualLabel)+'</button><span id="paperResearchActionStatus" class="paper-research-action-status" role="status" aria-live="polite"></span></div></section>'
+    target.innerHTML='<section class="paper-research-hero"><div><span class="page-kicker">SHADOW EVIDENCE · PAPER ONLY</span><h3>两策略研究证据</h3><p>每个交易日收盘后固定候选、评分构成与可用数据范围，再跟踪后续表现。它不下单、不调参，也不会改动风控。</p></div><div class="paper-research-hero-actions"><span class="tag tag-info">已记录 '+runCount+' 份策略快照</span><span class="paper-research-schedule">自动：'+riskText(policy.scheduled_at||'每个交易日收盘后')+'<small>'+riskText(policy.next_observation||'后续有效收盘快照会补齐观察')+'</small></span><button class="ghost" type="button" onclick="refreshPaperResearchValidation(this)">刷新记录</button><button class="ghost paper-research-backfill" type="button" title="'+riskText(policy.manual_scope||'')+'" onclick="backfillPaperResearch(this)" '+(manualAllowed?'':'disabled')+'>'+riskText(manualLabel)+'</button><span id="paperResearchActionStatus" class="paper-research-action-status" role="status" aria-live="polite"></span></div></section>'
       +'<section class="paper-research-ladder" aria-label="研究兑现周期"><span>候选固定</span><i></i><span>1日观察</span><i></i><span>3日复核</span><i></i><span>5日对比</span><i></i><span>10日验证</span><i></i><span>20日人工复核</span></section>'
       +'<section class="paper-research-grid">'+cards+'</section>'
       +'<section class="paper-research-table"><header><div><h3>最新可核验快照</h3><p>只有收盘后写入的候选才会计入研究；数据不完整会明确标记，不会伪装成有效样本。</p></div><span class="tag tag-warn">影子验证中</span></header>'+tableScroll('<table><thead><tr><th>模拟盘策略</th><th>信号日</th><th>候选</th><th>因子截至</th><th>最早因子</th><th>数据质量</th></tr></thead><tbody>'+rows+'</tbody></table>',900)+'</section>'
@@ -1524,6 +1858,10 @@ function applyPaperRiskAuditFilter(){
   });
 }
 function renderPaperAudit(d){
+  // A fast tab switch can finish an overview request that was started from a
+  // different workspace.  Never let a missing optional audit payload abort
+  // the entire paper dashboard render.
+  d=(d&&typeof d==='object')?d:{};
   var options='<option value="">全部策略</option>'+(d.accounts||[]).map(function(a){return '<option value="'+riskText(a.id)+'">'+riskText(a.name)+'</option>';}).join('');
   var audit=(d.alerts||[]).map(function(a){
     var validation=a.quote_validation||'';
@@ -1532,7 +1870,8 @@ function renderPaperAudit(d){
     var validationText=(a.quote_validation_detail||(validation==='not_applicable'?'账户级风险状态，不涉及个股行情':'未提供独立行情源校验结果'))+(a.cross_price_gap_pct!=null?'；价格差 '+fmt(a.cross_price_gap_pct,3)+'%':'')+(a.cross_pct_gap!=null?'；涨跌幅差 '+fmt(a.cross_pct_gap,3)+'%':'');
     var linked=a.linked_signal, actionText=a.action||'—';
     if(linked) actionText+=' · '+(linked.label||'待执行委托')+' #'+riskText(linked.id)+'（'+riskText(linked.intended_date||'待定')+'）';
-    return '<tr data-account="'+riskText(a.account_id)+'" data-level="'+riskText(a.level)+'" data-date="'+riskText(String(a.time||'').slice(0,10))+'"><td>'+riskText(a.time)+'</td><td>'+riskText(a.account_name)+'</td><td>'+riskText(a.code)+'</td><td><span class="risk-pill '+riskText(a.level)+'">'+riskText(riskLevelView(a.level)[1])+'</span></td><td>'+zhRiskText(a.reason)+'</td><td><span class="quote-check '+validationClass+'" title="'+riskText(validationText)+'">'+validationLabel+'</span><small class="quote-check-detail">'+riskText(validationText)+'</small></td><td>'+zhRiskText(actionText)+'</td><td>'+zhRiskText(a.execution_mode)+'</td><td>'+zhRiskText(a.rule_version)+'</td></tr>';
+    var symbol=[a.name,a.code].filter(function(value){return value!==null&&value!==undefined&&value!=='';}).map(riskText).join(' ')||'—';
+    return '<tr data-account="'+riskText(a.account_id)+'" data-level="'+riskText(a.level)+'" data-date="'+riskText(String(a.time||'').slice(0,10))+'"><td>'+riskText(a.time)+'</td><td>'+riskText(a.account_name)+'</td><td>'+symbol+'</td><td><span class="risk-pill '+riskText(a.level)+'">'+riskText(riskLevelView(a.level)[1])+'</span></td><td>'+zhRiskText(a.reason)+'</td><td><span class="quote-check '+validationClass+'" title="'+riskText(validationText)+'">'+validationLabel+'</span><small class="quote-check-detail">'+riskText(validationText)+'</small></td><td>'+zhRiskText(actionText)+'</td><td>'+zhRiskText(a.execution_mode)+'</td><td>'+zhRiskText(a.rule_version)+'</td></tr>';
   }).join('');
   return '<section class="paper-terminal-section paper-risk-audit-section" style="border-top:1px solid var(--border-light)"><div class="paper-risk-toolbar"><h3 style="margin:0;border:0;padding:0">风控审计记录</h3><div class="controls" style="margin:0"><select id="paperRiskAccountFilter" onchange="applyPaperRiskAuditFilter()">'+options+'</select><select id="paperRiskLevelFilter" onchange="applyPaperRiskAuditFilter()"><option value="">全部等级</option><option value="watch">关注</option><option value="tightened">收紧</option><option value="blocked">禁止</option></select><input id="paperRiskDateFilter" type="date" onchange="applyPaperRiskAuditFilter()"></div></div>'+tableScroll('<table><tr><th>时间</th><th>策略</th><th>标的</th><th>等级</th><th>原因</th><th>行情核验</th><th>系统动作</th><th>模式</th><th>版本</th></tr><tbody id="paperRiskAuditRows">'+audit+'</tbody></table>',1180)+'</section>';
 }
@@ -1578,16 +1917,9 @@ async function loadPaperRisk(forceRefresh){
   if(window._paperRiskRequest) return window._paperRiskRequest;
   var button=$('paperRiskRefresh');
   if(button){button.disabled=true;button.textContent=forceRefresh?'正在刷新…':'读取中…';}
-  var request=(forceRefresh?apiPost('/api/paper/risk-refresh'):api('/api/paper/risk-overview')).then(function(d){
-    // 风控明细只包含已完成审计；同时读取调度心跳，避免任务运行中页面停在上一条记录。
-    return api('/api/paper/overview').then(function(o){ d._schedule=o&&o.schedule||null; return d; }).catch(function(){ return d; });
-  });
+  var request=forceRefresh?apiPost('/api/paper/risk-refresh'):api('/api/paper/risk-overview');
   window._paperRiskRequest=request.then(function(d){
     window._paperRiskDashboard=d;renderPaperRisk(d);
-    var runs=d._schedule&&d._schedule.latest_intraday_runs||[], running=runs.filter(function(r){return r.status==='running';})[0];
-    if(running){
-      $('paperRiskResult').insertAdjacentHTML('afterbegin','<div class="banner paper-risk-live">3分钟扫描运行中：'+riskText(running.run_key||'当前周期')+' · 开始 '+riskText(running.started_at||'—')+'；完成后自动刷新风控审计。</div>');
-    }
     if(d.refreshing||d.initializing){
       clearTimeout(window._paperRiskRetryTimer);
       window._paperRiskRetryTimer=setTimeout(function(){window._paperRiskRequest=null;loadPaperRisk(false);},1800);
@@ -1640,10 +1972,7 @@ function syncCycleControls(cycle, accounts){
     ['paperResume',!paused,'仅暂停周期可恢复'],
     ['paperPause',!running,'仅运行周期可暂停'],
     ['paperReset',running,'周期运行中，请先暂停后重置'],
-    ['paperRunNow',!running,'仅运行周期可立即观察'],
-    ['paperStyleT',running,'周期运行中，暂停后才能调整风格'],
-    ['paperStyleS',running,'周期运行中，暂停后才能调整风格'],
-    ['paperStyleR',running,'周期运行中，暂停后才能调整风格']
+    ['paperRunNow',!running,'仅运行周期可立即观察']
   ];
   controls.forEach(function(item){
     var el=$(item[0]); if(!el) return;
@@ -1654,23 +1983,35 @@ function syncCycleControls(cycle, accounts){
 
 function paperAccountDisplayName(account){
   var id=account&&account.id;
-  return ({tq_breakout:'短线日内做T',trend_pullback:'趋势波段优选',sector_rotation:'板块轮动先锋',reported_profit_breakout:'三日策略',main_force_top10:'超强主力股'})[id] || (account&&account.name) || id || '未知策略';
+  return ({tq_breakout:'短线日内做T',main_force_top10:'超强主力股'})[id] || (account&&account.name) || id || '未知策略';
 }
-async function loadPaper(){
+async function loadPaper(options){
+  options=options||{};
+  // Navigation, the one-minute refresh, and manual actions may all request an
+  // overview at the same time.  Let every caller share one in-flight request
+  // instead of rendering the large dashboard repeatedly in parallel.
+  if(window._paperLoadRequest) return window._paperLoadRequest;
+  window._paperLoadRequest=(async function(){
   try{
-    var d = await api('/api/paper/overview');
+    // The activity audit is independent from the account overview.  Start it
+    // immediately so it can read in parallel with the larger dashboard DOM
+    // render instead of extending every browser refresh serially.
+    var auditRequest = window._paperWorkspace==='activity'
+      ? api('/api/paper/risk-audit?limit=160')
+      : null;
+    var overviewQuery=[];
+    if(options.refresh) overviewQuery.push('refresh=1');
+    if(window._paperWorkspace==='activity') overviewQuery.push('activity=1');
+    if(window._paperWorkspace==='history') overviewQuery.push('history_symbols=1');
+    var d = await api('/api/paper/overview'+(overviewQuery.length?'?'+overviewQuery.join('&'):''));
     var accounts = d.accounts||[];
     var cycle = d.cycle||{};
     var legacyEmpty = String(cycle.cycle_key||'').indexOf('legacy-')===0 && accounts.every(function(a){return !a.trade_count;});
     if(accounts.length && document.activeElement!==$('paperCapital') && !legacyEmpty) $('paperCapital').value = Math.round((d.shared&&d.shared.initial_cash) || accounts.reduce(function(sum,a){return sum+Number(a.initial_cash||0);},0) || 300000);
     syncPaperCapitalHint();
-    if(accounts.length){
-      var accountById={};
-      accounts.forEach(function(a){accountById[a.id]=a;});
-      $('paperStyleT').value=(accountById.tq_breakout||{}).style||'strong';
-      $('paperStyleS').value=(accountById.trend_pullback||{}).style||'pullback';
-      $('paperStyleR').value=(accountById.sector_rotation||{}).style||'sector';
-    }
+    // Strategy-style selectors were intentionally removed from the page.
+    // Do not dereference their old IDs here: a null assignment used to abort
+    // the entire paper dashboard render after a browser refresh.
     var running = accounts.filter(function(a){return a.status==='running';}).length;
     syncCycleControls(cycle,accounts);
     window._paperDashboard=d;
@@ -1746,7 +2087,7 @@ async function loadPaper(){
         +'<button class="paper-mini-btn sell" '+(p.available_qty<100?'disabled':'')+' onclick="preparePaperSell(\''+p.account_id+'\',\''+p.code+'\','+p.available_qty+')">'+(p.available_qty<100?'T+1\u9501\u5b9a':'\u6a21\u62df\u5356\u51fa')+'</button></div>';
     }).join('');
     var recentOrders=(d.orders||[]).map(function(o){
-      var view=paperOrderStatusView(o.status), cancel=o.status==='pending_limit'?'<button class="paper-mini-btn cancel" onclick="cancelPaperOrder('+o.id+')">撤单</button>':'';
+      var view=paperOrderStatusView(o.status,o.reason), cancel=(!o.archived_cycle&&o.status==='pending_limit')?'<button class="paper-mini-btn cancel" onclick="cancelPaperOrder('+o.id+')">撤单</button>':'';
       return '<div class="paper-order-row" data-account="'+o.account_id+'" data-date="'+String(o.created_at||'').slice(0,10)+'" data-side="'+o.side+'" data-status="'+o.status+'"><span>'+String(o.created_at||'').slice(5,16)+'</span><span><button class="paper-stock-link" onclick="showPaperStockHistory(\''+o.code+'\')">'+o.name+'</button><br><small>'+o.code+' · '+(o.account_name||accountName[o.account_id]||o.account_id)+'</small></span>'
         +'<span class="'+(o.side==='buy'?'up':'down')+'">'+(o.side==='buy'?'买入':'卖出')+' '+o.qty+'</span><span>'+fmt(o.filled_price||o.planned_price)+'</span>'
         +'<span class="paper-order-status '+view[0]+'">'+view[1]+'</span><span>'+cancel+'</span></div>';
@@ -1760,7 +2101,7 @@ async function loadPaper(){
       var list=(signalsByAccount[a.id]||[]).slice(0,5);
       var rows=list.map(function(s){
         var pick=(s.payload&&s.payload.pick)||{}, heat=pick.sector_heat||{};
-    var stateMap={pending:'待开盘审批',filled:'已成交',blocked:'风控拦截',rejected:'已拒绝',deferred_capacity:'次日重新筛选',superseded:'已失效',cancelled:'已撤销'};
+    var stateMap={pending:'待开盘审批',filled:'已成交',blocked:'风控拦截',rejected:'已拒绝',deferred_capacity:'容量等待重排',superseded:'已失效',cancelled:'已撤销'};
         var state=stateMap[s.status]||s.status;
         var detail=(s.reason||'等待下一次检查').replace(/</g,'&lt;');
         var stateClass=s.status==='pending'?'pending':(s.status==='filled'?'filled':(s.status==='superseded'||s.status==='cancelled'?'cancelled':'rejected'));
@@ -1793,7 +2134,10 @@ async function loadPaper(){
     $('paperActivityBoard').innerHTML='<div class="paper-terminal-head"><h3>\u59d4\u6258\u64cd\u4f5c\u8bb0\u5f55</h3><span style="color:var(--text-secondary);font-size:12px">\u6309\u65e5\u671f\u4e0e\u7b56\u7565\u7b5b\u9009</span></div><div class="paper-terminal-section"><div class="paper-terminal-section-title"><span>\u6700\u8fd1\u59d4\u6258</span><div class="paper-filter-bar"><label>\u65e5\u671f</label><input id="paperOrderDateFilter" type="date" value="'+window._paperOrderDateFilter+'" onchange="setPaperTerminalFilter(\'orderDate\',this.value)"><button class="paper-filter-clear" onclick="clearPaperOrderDate()">\u5168\u90e8\u65e5\u671f</button><label>\u7b56\u7565</label><select id="paperOrderAccountFilter" onchange="setPaperTerminalFilter(\'orderAccount\',this.value)">'+accountFilterOptions+'</select><label>\u65b9\u5411</label><select id="paperOrderSideFilter" onchange="setPaperTerminalFilter(\'orderSide\',this.value)"><option value="all">\u5168\u90e8</option><option value="buy">\u4e70\u5165</option><option value="sell">\u5356\u51fa</option></select><label>\u7ed3\u679c</label><select id="paperOrderStatusFilter" onchange="setPaperTerminalFilter(\'orderStatus\',this.value)"><option value="all">\u5168\u90e8</option><option value="filled">\u5df2\u6210\u4ea4</option><option value="pending_limit">\u5f85\u89e6\u53d1</option><option value="risk_rejected">\u98ce\u63a7\u62d2\u7edd</option><option value="cancelled">\u5df2\u64a4\u9500</option><option value="expired">\u5df2\u8fc7\u671f</option></select><span id="paperOrderVisible" class="paper-filter-count"></span></div></div><div class="paper-order-scroll"><div class="paper-order-list">'+recentOrders+'<div id="paperOrderEmpty" class="paper-empty" hidden>\u6240\u9009\u65e5\u671f\u548c\u7b56\u7565\u6ca1\u6709\u59d4\u6258\u64cd\u4f5c\u3002</div></div></div></div>';
     if(window._paperWorkspace==='activity'){
       try{
-        var auditDashboard=await api('/api/paper/risk-audit?limit=160');
+        // The shared overview request may have started while another tab was
+        // active, in which case auditRequest is null.  Fetch it now instead of
+        // awaiting null and passing that value into renderPaperAudit().
+        var auditDashboard=await (auditRequest||api('/api/paper/risk-audit?limit=160'));
         var auditBoard=$('paperActivityBoard');
         if(auditBoard){
           // loadPaper() may overlap after a fast refresh/navigation. Keep one audit section.
@@ -1822,6 +2166,11 @@ async function loadPaper(){
     // in the strategy cards and squeezed the comparison chart vertically.
     // Keep the API summary available for other views, but do not render it
     // above the chart.
+    // A tab switch or an activity/history refresh does not need a hidden
+    // ECharts instance plus several wide audit tables.  Avoiding that render
+    // keeps the visible workspace responsive while retaining the portfolio
+    // view's complete comparison when it is actually selected.
+    if(window._paperWorkspace==='portfolio'){
     var todayBand='';
     var compareRows = accounts.map(function(a){
       var markClass = a.id==='trend_pullback' ? 'swing' : (a.id==='sector_rotation' ? 'rotation' : '');
@@ -1853,7 +2202,7 @@ async function loadPaper(){
       return '<tr><td>'+(accountName[s.account_id]||s.account_id)+'</td><td><b>'+s.name+'</b><br/><span style="font-size:11px;color:var(--text-muted)">'+s.code+'</span></td><td>'+(audit.factor_date||s.signal_date||'\u2014')+'</td><td>'+marketText+'</td><td>'+(audit.planned_review_date||s.intended_date||'\u2014')+'</td><td>'+actual+'</td><td>'+(model.name||'\u72ec\u7acb\u5165\u573a\u6a21\u578b')+'<br><small>'+fmt(s.t_score,2)+'</small></td><td>'+paperStatusTag(s.status)+'</td><td style="font-size:12px">'+(s.reason||'\u5f85\u5b9e\u65f6\u884c\u60c5\u4e0e\u8d26\u6237\u98ce\u63a7\u590d\u6838')+'</td></tr>';
     }).join('');
     var orders = (d.orders||[]).map(function(o){
-      var view=paperOrderStatusView(o.status), cancel=o.status==='pending_limit'?'<button class="paper-mini-btn cancel" onclick="cancelPaperOrder('+o.id+')">撤单</button>':'';
+      var view=paperOrderStatusView(o.status), cancel=(!o.archived_cycle&&o.status==='pending_limit')?'<button class="paper-mini-btn cancel" onclick="cancelPaperOrder('+o.id+')">撤单</button>':'';
       return '<tr><td>'+o.created_at+'</td><td>'+(o.account_name||accountName[o.account_id]||o.account_id)+'</td><td>'+(o.origin==='manual'?'手动模拟':'策略自动')+'<br><small>'+(o.order_type==='limit'?'限价':'市价')+'</small></td>'
         +'<td class="'+(o.side==='buy'?'up':'down')+'">'+(o.side==='buy'?'买入':'卖出')+'</td><td><b>'+o.name+'</b> '+o.code+'</td>'
         +'<td>'+o.qty+'</td><td>'+fmt(o.filled_price||o.planned_price)+'</td><td>'+cny(o.realized_pnl,true)+'</td><td><span class="paper-order-status '+view[0]+'">'+view[1]+'</span></td><td style="font-size:12px">'+(o.reason||'-')+cancel+'</td></tr>';
@@ -1869,12 +2218,13 @@ async function loadPaper(){
     var exposure = Object.keys(d.industry_exposure||{}).map(function(k){return '<span class="tag tag-info">'+k+' '+cny(d.industry_exposure[k])+'</span>';}).join(' ') || '暂无行业暴露';
     var schedule = d.schedule||{};
     var curve=d.equity_curve||{},curvePoints=(curve.dates||[]).length;
+    var strategyCount=accounts.length||0;
     var challengeMsg = curvePoints>=2
-      ? '曲线展示四套策略独立净值视图，并与沪深300收盘快照归一化对比。'
+      ? '曲线按各策略绩效参考本金归一化；策略启用前保持空值，并与沪深300收盘快照对比。'
       : (running?'本周期已启动；净值点不足两个，后续有效快照会自动补齐曲线。':'挑战将在确认资金并启动新周期后开始。');
     var signalsAudit = signals
       ? tableScroll('<table><tr><th>策略</th><th>标的</th><th>信号日</th><th>执行日</th><th>独立模型评分</th><th>状态</th><th>说明</th></tr>'+signals+'</table>',980)
-      : '<div class="paper-empty">暂无信号。四套策略会按各自模型、行情时间戳和仓位上限分别审批。</div>';
+      : '<div class="paper-empty">暂无信号。两套策略会按各自模型、行情时间戳和仓位上限分别审批。</div>';
     var positionsAudit = positions
       ? tableScroll('<table><tr><th>策略决策</th><th>标的</th><th>持仓股数</th><th>持仓市值 / 总池占比</th><th>成本</th><th>现价</th><th>浮盈亏</th><th>质量评分 / 处置</th><th>持有</th><th>份额状态</th><th>交易制度</th><th>最早可卖 / 报价</th></tr>'+positions+'</table>',1260)
       : '<div class="paper-empty">暂无模拟持仓。</div>';
@@ -1890,9 +2240,23 @@ async function loadPaper(){
     var paramsAudit = params
       ? tableScroll('<table><tr><th>记录时间</th><th>策略</th><th>版本</th><th>风格</th><th>生效日</th><th>原因</th></tr>'+params+'</table>',820)
       : '<div class="paper-empty">尚无参数版本记录。</div>';
-    $('paperResult').innerHTML = todayBand+'<section class="paper-challenge"><div class="paper-challenge-head"><h2>五策略公平对比</h2><p>收益、浮盈和今日盈亏均按各策略实际持仓独立核算；委托和个股历史已移至上方专页。</p></div><div id="paperCompareChart" class="paper-compare-chart" role="img" aria-label="五套策略与沪深300的历史净值对比曲线"></div><div class="paper-challenge-table"><table><tr><th>策略名称</th><th>挑战批次</th><th>当前持仓浮盈率</th><th>今日持仓盈亏</th><th>最大回撤</th><th>胜率</th><th>盈亏比</th><th>成交笔数</th><th>占总资金池</th></tr>'+compareRows+'</table></div><div class="paper-challenge-note">'+challengeMsg+'</div></section><div class="panel"><h3>当前行业风险暴露</h3><div class="result-toolbar">'+exposure+'</div></div><div class="disclaimer">'+d.disclaimer+'</div>';
+    $('paperResult').innerHTML = todayBand+'<section class="paper-challenge"><div class="paper-challenge-head"><h2>'+strategyCount+'策略归一化收益对比</h2><p>折线为策略累计收益（按绩效参考本金），持仓浮盈率按实际持仓成本计算；两种口径不混用。委托和个股历史已移至上方专页。</p></div><div id="paperCompareChart" class="paper-compare-chart" role="img" aria-label="'+strategyCount+'套策略与沪深300的归一化收益对比曲线"></div><div class="paper-challenge-table"><table><tr><th>策略名称</th><th>挑战批次</th><th>当前持仓浮盈率</th><th>今日持仓盈亏</th><th>最大回撤</th><th>胜率</th><th>盈亏比</th><th>成交笔数</th><th>占总资金池</th></tr>'+compareRows+'</table></div><div class="paper-challenge-note">'+challengeMsg+'</div></section><div class="panel"><h3>当前行业风险暴露</h3><div class="result-toolbar">'+exposure+'</div></div><div class="disclaimer">'+d.disclaimer+'</div>';
     renderPaperCompareChart(curve);
-  }catch(e){ $('paperResult').innerHTML = '<div class="banner">模拟盘加载失败：'+e.message+'</div>'; }
+    }
+  }catch(e){
+    var message=riskText((e&&e.message)||e||'未知错误');
+    // A dashboard failure must never leave the visible workspace permanently
+    // saying "正在读取".  Surface the exact failure in every affected panel so
+    // the user can refresh or report it, while risk exits continue server-side.
+    if($('paperResult')) $('paperResult').innerHTML='<div class="banner">模拟盘加载失败：'+message+'</div>';
+    if($('paperTerminalBoard')) $('paperTerminalBoard').innerHTML='<div class="paper-empty">持仓与委托状态读取失败：'+message+'。请刷新页面重试。</div>';
+    if($('paperActivityBoard')) $('paperActivityBoard').innerHTML='<div class="paper-empty">委托与风控审计读取失败：'+message+'。请刷新页面重试。</div>';
+    if($('paperStatus')) $('paperStatus').innerHTML='<span class="tag tag-warn">读取异常</span> '+message;
+  } finally {
+    window._paperLoadRequest=null;
+  }
+  })();
+  return window._paperLoadRequest;
 }
 
 async function runBacktest(){
@@ -1963,7 +2327,7 @@ async function searchStock(){
       var d = await api('/api/stock_search?q='+encodeURIComponent(q));
       if(!d.results.length){ $('stockSuggest').style.display='none'; return; }
       $('stockSuggest').innerHTML = d.results.map(function(r){
-        return '<div style="padding:6px 12px;cursor:pointer;font-size:13px;border-bottom:1px solid #f2f4f8" onmouseover="this.style.background=\'#f0f5ff\'" onmouseout="this.style.background=\'\'" onclick="selectStock(\''+r.code+'\',\''+r.name+'\')">'+r.name+' <span style="color:#9aa5b1">'+r.code+'</span> <span style="color:#7f8c9b;font-size:11px">'+(r.industry||'')+'</span></div>';
+        return '<div style="padding:6px 12px;cursor:pointer;font-size:13px;border-bottom:1px solid #f2f4f8" onmouseover="this.style.background=\'#f0f5ff\'" onmouseout="this.style.background=\'\'" onclick="selectStock(decodeURIComponent(\''+adaptiveJsArg(r.code)+'\'),decodeURIComponent(\''+adaptiveJsArg(r.name)+'\'))">'+adaptiveEsc(r.name)+' <span style="color:#9aa5b1">'+adaptiveEsc(r.code)+'</span> <span style="color:#7f8c9b;font-size:11px">'+adaptiveEsc(r.industry||'')+'</span></div>';
       }).join('');
       $('stockSuggest').style.display='block';
     }catch(e){}
@@ -1975,7 +2339,7 @@ function selectStock(code, name){
   window._stockCode = code;
   analyzeStock();
 }
-async function analyzeStock(){
+async function analyzeStockLegacy(){
   var code = window._stockCode || $('stockCode').value.trim();
   // 如果输入的是 "名称 代码" 格式，提取代码
   var m = code.match(/(\d{6})/);
@@ -2067,11 +2431,11 @@ async function analyzeStock(){
     }
     // 同行业对比
     try{
-      var peers = await api('/api/industry_peers?code='+code+'&topn=8');
+      var peers = await api('/api/industry_peers?code='+encodeURIComponent(code)+'&topn=8');
       if(peers.peers && peers.peers.length){
         $('stockPeers').innerHTML = '<div style="font-size:12px;color:var(--text-muted);margin-bottom:6px">行业：'+peers.industry+'，共'+peers.count+'只同行业个股</div><table><tr><th>名称</th><th>代码</th><th>现价</th><th>涨跌</th><th>PE</th><th>PB</th><th>市值</th></tr>'
         + peers.peers.map(function(p){
-          return '<tr onmouseover="this.style.background=\'var(--surface-hover)\'" onmouseout="this.style.background=\'\'" style="cursor:pointer" onclick="selectStock(\''+p.code+'\',\''+p.name+'\')"><td><b>'+p.name+'</b></td><td>'+p.code+'</td><td>'+fmt(p.price)+'</td><td class="'+pctCls(p.pct)+'">'+pctTxt(p.pct)+'</td><td>'+fmt(p.pe,1)+'</td><td>'+fmt(p.pb,2)+'</td><td>'+yi(p.mktcap)+'</td></tr>';
+          return '<tr onmouseover="this.style.background=\'var(--surface-hover)\'" onmouseout="this.style.background=\'\'" style="cursor:pointer" onclick="selectStock(decodeURIComponent(\''+adaptiveJsArg(p.code)+'\'),decodeURIComponent(\''+adaptiveJsArg(p.name)+'\'))"><td><b>'+adaptiveEsc(p.name)+'</b></td><td>'+adaptiveEsc(p.code)+'</td><td>'+fmt(p.price)+'</td><td class="'+pctCls(p.pct)+'">'+pctTxt(p.pct)+'</td><td>'+fmt(p.pe,1)+'</td><td>'+fmt(p.pb,2)+'</td><td>'+yi(p.mktcap)+'</td></tr>';
         }).join('')+'</table>';
       } else {
         $('stockPeers').innerHTML = '<div style="color:var(--text-muted)">无同行业对比数据</div>';
@@ -2181,7 +2545,7 @@ async function analyzeStock(refresh){
       +'<div style="border-top:1px solid #e7eeea;padding-top:14px;line-height:1.8"><b>卖出风控：</b>'+sd.action+'<br><span style="font-size:12px;color:var(--text-secondary)">'+sd.summary+'<br>止盈策略：'+(sd.take_profit?sd.take_profit.msg:'未触发')+'；强制止损：'+sd.forced_stop+'</span></div>';
     $('stockFinance').innerHTML='<table><tr><th>净利润同比</th><th>营收同比</th><th>报告期</th><th>流通市值</th><th>换手率</th></tr><tr><td class="'+pctCls(d.profit_yoy)+'">'+pctTxt(d.profit_yoy)+'</td><td class="'+pctCls(d.rev_yoy)+'">'+pctTxt(d.rev_yoy)+'</td><td>'+(d.report_date||'-')+'</td><td>'+yi(d.float_cap)+'</td><td>'+fmt(d.turnover,2)+'%</td></tr></table>';
     $('stockNews').innerHTML=d.news&&d.news.length?d.news.map(function(n){var t=n.tone>0?'利好':(n.tone<0?'风险':'中性'),cl=n.tone>0?'tag-ok':(n.tone<0?'tag-warn':'tag-info');return '<div class="news-item"><span class="tag '+cl+'">'+t+'</span> '+n.summary+'<br><span class="news-time">'+(n.time||'')+' · '+(n.source||'本地资料')+'</span></div>';}).join(''):'<div style="color:var(--text-muted);padding:10px 0">当前本地资料中暂无该股近期事件；后续刷新将补充可用公开来源。</div>';
-    try{ var peers=await api('/api/industry_peers?code='+d.code+'&topn=8'); $('stockPeers').innerHTML=peers.peers&&peers.peers.length?'<div style="font-size:12px;color:var(--text-muted);margin-bottom:10px">行业：'+peers.industry+'，共 '+peers.count+' 只同行业个股</div><table><tr><th>名称</th><th>代码</th><th>现价</th><th>涨跌</th><th>PE</th><th>PB</th><th>市值</th></tr>'+peers.peers.map(function(p){return '<tr style="cursor:pointer" onclick="selectStock(\''+p.code+'\',\''+p.name+'\')"><td><b>'+p.name+'</b></td><td>'+p.code+'</td><td>'+fmt(p.price)+'</td><td class="'+pctCls(p.pct)+'">'+pctTxt(p.pct)+'</td><td>'+fmt(p.pe,1)+'</td><td>'+fmt(p.pb,2)+'</td><td>'+yi(p.mktcap)+'</td></tr>';}).join('')+'</table>':'<div style="color:var(--text-muted)">无同行业对比数据</div>'; }catch(e){ $('stockPeers').innerHTML=''; }
+    try{ var peers=await api('/api/industry_peers?code='+encodeURIComponent(d.code)+'&topn=8'); $('stockPeers').innerHTML=peers.peers&&peers.peers.length?'<div style="font-size:12px;color:var(--text-muted);margin-bottom:10px">行业：'+adaptiveEsc(peers.industry)+'，共 '+Number(peers.count||0)+' 只同行业个股</div><table><tr><th>名称</th><th>代码</th><th>现价</th><th>涨跌</th><th>PE</th><th>PB</th><th>市值</th></tr>'+peers.peers.map(function(p){return '<tr style="cursor:pointer" onclick="selectStock(decodeURIComponent(\''+adaptiveJsArg(p.code)+'\'),decodeURIComponent(\''+adaptiveJsArg(p.name)+'\'))"><td><b>'+adaptiveEsc(p.name)+'</b></td><td>'+adaptiveEsc(p.code)+'</td><td>'+fmt(p.price)+'</td><td class="'+pctCls(p.pct)+'">'+pctTxt(p.pct)+'</td><td>'+fmt(p.pe,1)+'</td><td>'+fmt(p.pb,2)+'</td><td>'+yi(p.mktcap)+'</td></tr>';}).join('')+'</table>':'<div style="color:var(--text-muted)">无同行业对比数据</div>'; }catch(e){ $('stockPeers').innerHTML=''; }
   }catch(e){ $('stockBasic').innerHTML='<div class="banner">分析失败：'+e+'</div>'; }
 }
 
@@ -2223,6 +2587,7 @@ async function runOptimize(){
 }
 
 async function loadNews(){
+  if(!$('newsList')||!$('newsHits')||!$('hotTable')) return;
   try{
     var d = await api('/api/news');
     $('newsList').innerHTML = d.news.map(function(n){
@@ -2251,6 +2616,8 @@ async function loadNews(){
 }
 
 loadStrategies();
+loadDataValidity();
+loadMarketGate();
 installWorkspaceTabRails();
 restoreAppNavigation();
 document.addEventListener('click', function(e){
@@ -2268,9 +2635,60 @@ document.addEventListener('click', function(e){
   }
 });
 
+// Legacy adaptive/paper fragments can still arrive from a cached API payload.
+// Normalize only the visible workspace copy so the public UI consistently
+// describes the two active strategies while historical replay data stays
+// untouched in the backend.
+function normalizeActiveStrategyCopy(root){
+  if(!root) return;
+  var walker=document.createTreeWalker(root,NodeFilter.SHOW_TEXT), node;
+  while((node=walker.nextNode())){
+    var value=node.nodeValue||'';
+    var normalized=value.replace(/四套/g,'两套').replace(/三套/g,'两套').replace(/四策略/g,'两策略').replace(/三策略/g,'两策略');
+    if(normalized!==value) node.nodeValue=normalized;
+  }
+}
+if(typeof MutationObserver!=='undefined'){
+  var strategyCopyObserver=new MutationObserver(function(){
+    normalizeActiveStrategyCopy($('p-paper'));
+    normalizeActiveStrategyCopy($('p-adaptive'));
+  });
+  strategyCopyObserver.observe(document.body,{childList:true,subtree:true});
+}
+
 // 暗色模式切换
-function refreshApp(){
-  window.location.reload();
+async function refreshApp(){
+  if(window._manualRefreshInFlight) return;
+  window._manualRefreshInFlight=true;
+  var button=document.querySelector('.page-refresh'), original=button&&button.textContent;
+  if(button){ button.disabled=true; button.textContent='刷新中…'; }
+  try{
+    await loadMarketGate();
+    var page=(document.querySelector('.page.active')||{}).id;
+    if(page==='p-paper'){
+      var view=window._paperWorkspace||'portfolio';
+      if(view==='risk') await loadPaperRisk(true);
+      else if(view==='strategy') await loadPaperStrategyCenter();
+      else if(view==='research') await loadPaperResearchValidation();
+      else await loadPaper({refresh:true});
+    }else if(page==='p-select'){
+      var jobs=[];
+      if(typeof loadStrategies==='function') jobs.push(loadStrategies());
+      if(typeof loadDataValidity==='function') jobs.push(loadDataValidity());
+      await Promise.all(jobs);
+    }else if(page==='p-sector'&&typeof loadSectors==='function'){
+      await Promise.all([loadSectors(),typeof loadLinkage==='function'?loadLinkage():Promise.resolve()]);
+    }else if(page==='p-adaptive'&&typeof loadAdaptive==='function'){
+      await loadAdaptive();
+    }else if(page==='p-stock'&&typeof analyzeStock==='function'){
+      await analyzeStock();
+    }else{
+      window.location.reload();
+    }
+  }finally{
+    window._manualRefreshInFlight=false;
+    if(button){ button.disabled=false; button.textContent=original||'刷新页面'; }
+  }
 }
 function toggleDark(){
   document.body.classList.toggle('dark');
@@ -2300,7 +2718,7 @@ function searchStockHeader(){
       var d = await api('/api/stock_search?q='+encodeURIComponent(q));
       if(!d.results.length){ $('headerSuggest').style.display='none'; return; }
       $('headerSuggest').innerHTML = d.results.map(function(r){
-        return '<div style="padding:6px 12px;cursor:pointer;font-size:13px;border-bottom:1px solid var(--border-light)" onmousedown="document.querySelector(\'[data-page=p-stock]\').click();$(\'stockCode\').value=\''+r.name+' '+r.code+'\';window._stockCode=\''+r.code+'\';$(\'headerSearch\').value=\'\';$(\'headerSuggest\').style.display=\'none\';analyzeStock()">'+r.name+' <span style="color:var(--text-muted)">'+r.code+'</span> <span style="color:var(--text-secondary);font-size:11px">'+(r.industry||'')+'</span></div>';
+        return '<div style="padding:6px 12px;cursor:pointer;font-size:13px;border-bottom:1px solid var(--border-light)" onmousedown="document.querySelector(\'[data-page=p-stock]\').click();selectStock(decodeURIComponent(\''+adaptiveJsArg(r.code)+'\'),decodeURIComponent(\''+adaptiveJsArg(r.name)+'\'));$(\'headerSearch\').value=\'\';$(\'headerSuggest\').style.display=\'none\'">'+adaptiveEsc(r.name)+' <span style="color:var(--text-muted)">'+adaptiveEsc(r.code)+'</span> <span style="color:var(--text-secondary);font-size:11px">'+adaptiveEsc(r.industry||'')+'</span></div>';
       }).join('');
       $('headerSuggest').style.display='block';
     }catch(e){}
@@ -2317,9 +2735,16 @@ function gotoStockDetail(){
   $('headerSuggest').style.display = 'none';
   analyzeStock();
 }
+// Keep the two live ledger views current without requiring a full-page reload.
+// loadPaper() already shares an in-flight request, so a slow response cannot
+// create overlapping overview calls or overwrite a newer render.  Risk and
+// research keep their own refresh policies and are intentionally not polled
+// here.
 setInterval(function(){
-  if(!$('p-paper').classList.contains('active')) return;
+  var paper=$('p-paper');
+  if(!paper || !paper.classList.contains('active')) return;
   if(window._paperWorkspace==='risk') loadPaperRisk(false);
-  else if(window._paperWorkspace==='portfolio') loadPaper();
-}, 15000);
+  else if(window._paperWorkspace==='portfolio'||window._paperWorkspace==='activity') loadPaper();
+}, 180000);
+setInterval(loadMarketGate,180000);
 window.onresize = function(){ Object.keys(charts).forEach(function(k){ charts[k].resize(); }); };

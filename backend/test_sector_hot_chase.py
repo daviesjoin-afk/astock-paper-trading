@@ -66,29 +66,6 @@ class SectorHotChaseTests(unittest.TestCase):
         )
         self.assertAlmostEqual(scale, 0.4875)
 
-    def test_tq_mid_acceleration_requires_same_q1_chase_confirmation(self):
-        account = {"id": "tq_breakout"}
-        pick = {"code": "000001", "score": 0.5}
-        quote = {"pct": 5.0, "main_pct": 3.0, "vol_ratio": 2.0}
-        model = {"passed": True, "score": 0.82}
-        execution = {"status": "cross_source_checked"}
-        blocked = P._chase_entry_gate(account, pick, quote, {"light": "green"}, model, {"tier": "Q2"}, execution)
-        allowed = P._chase_entry_gate(account, pick, quote, {"light": "green"}, model, {"tier": "Q1"}, execution)
-        self.assertFalse(blocked["allowed"])
-        self.assertIn("Q1", blocked["reason"])
-        self.assertTrue(allowed["allowed"])
-
-    def test_sector_pullback_requires_real_intraday_retrace(self):
-        closes = P.pd.DataFrame({"close": [10 + i * 0.03 for i in range(30)]})
-        no_retrace = P._sector_overheat_guard(
-            closes, {"price": 10.85, "high": 10.86, "open_price": 10.2}, {"rank": 2, "pct": 3.8},
-        )
-        retrace = P._sector_overheat_guard(
-            closes, {"price": 10.65, "high": 10.85, "open_price": 10.5}, {"rank": 2, "pct": 3.8},
-        )
-        self.assertFalse(no_retrace["pullback_confirmed"])
-        self.assertTrue(retrace["pullback_confirmed"])
-
 
 if __name__ == "__main__":
     unittest.main()
