@@ -77,7 +77,7 @@ function renderPaperCompareChart(curve){
   }
   var palette={tq_breakout:'#27775a',trend_pullback:'#5576bd',sector_rotation:'#b28131',reported_profit_breakout:'#8a5bb8'};
   // The shared pool is an accounting aggregate, not a fourth strategy.  It
-  // used to dominate the y-axis and made the three strategy curves hard to
+  // used to dominate the y-axis and made the five strategy curves hard to
   // compare, so keep it in the API/account cards but exclude it from this
   // strategy comparison chart.
   var series=(curve.series||[]).filter(function(item){
@@ -106,7 +106,6 @@ function activatePage(page, options){
   if(options.writeHash!==false){
     history.replaceState(null,'','#'+page.replace(/^p-/,'')+(page==='p-paper'?'/'+(window._paperWorkspace||'portfolio'):(page==='p-settings'?'/'+(window._settingsSection||'simulation'):'')));
   }
-  if(page==='p-sector'&&!window._sectorLoaded){loadSectors();loadLinkage();window._sectorLoaded=true;}
   if(page==='p-adaptive') loadAdaptive();
   if(page==='p-settings') loadSettings();
   if(page==='p-paper'){
@@ -1029,61 +1028,17 @@ async function loadStrategies(){
   try{
     var d = await api('/api/strategies');
     var opts = d.strategies.map(function(s){ return '<option value="'+s.id+'" data-desc="'+s.desc+'">'+s.name+' — '+s.desc+'</option>'; }).join('');
-    ['selStrategy','btStrategy','opStrategy'].forEach(function(id){ if($(id)) $(id).innerHTML = opts; });
+    if($('selStrategy')) $('selStrategy').innerHTML = opts;
     $('selStrategy').onchange = function(){
       var o = this.options[this.selectedIndex];
       $('selStrategyDesc').textContent = o.dataset.desc || '';
     };
-    if($('btStrategy')) $('btStrategy').onchange = setBacktestCycle;
-    if($('btStrategy')) setBacktestCycle();
     // 默认选中第一个策略；进入页面只读取最近一次结果，重新计算必须由用户点击按钮触发。
     if(d.strategies.length>0 && $('selStrategy').value===d.strategies[0].id){
       $('selStrategyDesc').textContent = d.strategies[0].desc;
       setTimeout(loadLatestSelection, 0);
     }
   }catch(e){ console.error('loadStrategies failed:', e); }
-}
-
-function setBacktestCycle(){
-  var sid = $('btStrategy').value;
-  $('btReb').value = sid==='ten_day' ? '10' : (sid==='five_day' ? '5' : '3');
-}
-
-async function loadOverview(){
-  if(!$('idxCards')||!$('breadthChart')) return;
-  try{
-    var d = await api('/api/overview');
-    var groups = {'A股':[], '港股':[], '美股':[]};
-    d.indices.forEach(function(x){ if(groups[x.market]) groups[x.market].push(x); });
-    var html = '';
-    ['A股','港股','美股'].forEach(function(g){
-      groups[g].forEach(function(x){
-        html += '<div class="card"><div class="nm">'+x.name+' <span style="font-size:11px;color:#c4ccd6">'+g+'</span></div>'
-          + '<div class="px '+pctCls(x.pct)+'">'+fmt(x.price)+'</div>'
-          + '<div class="chg '+pctCls(x.pct)+'">'+(x.change>0?'+':'')+fmt(x.change)+'  '+pctTxt(x.pct)+'</div></div>';
-      });
-    });
-    $('idxCards').innerHTML = html;
-    var b = d.breadth;
-    chart('breadthChart').setOption({
-      tooltip:{},
-      xAxis:{type:'value'},
-      yAxis:{type:'category', data:['跌停','下跌','平盘','上涨','涨停']},
-      series:[{type:'bar', data:[
-        {value:b.limit_down, itemStyle:{color:'#0e6e3e'}},
-        {value:b.down, itemStyle:{color:'#1a7f4b'}},
-        {value:b.flat, itemStyle:{color:'#b0b8c2'}},
-        {value:b.up, itemStyle:{color:'#d4380d'}},
-        {value:b.limit_up, itemStyle:{color:'#8f1d05'}}
-      ], label:{show:true, position:'right'}}],
-      grid:{left:60, right:50, top:10, bottom:25},
-      graphic:[{type:'text', left:'center', bottom:0, style:{text:'两市成交额：'+fmt(b.amount_yi,0)+' 亿元 · 共 '+b.total+' 只', fontSize:12, fill:'#7f8c9b'}}]
-    });
-    renderGate(d.gate);
-  }catch(e){
-    console.error('loadOverview failed:', e);
-    $('idxCards').innerHTML = '<div class="banner">大盘数据加载失败，请稍后刷新</div>';
-  }
 }
 
 function renderGate(g){
@@ -1203,50 +1158,6 @@ async function cancelManualDataUpdate(){
   finally{ if(btn){btn.disabled=false;btn.textContent='取消增量';} }
 }
 
-async function loadSectors(){
-  var type = $('sectorType').value;
-  $('sectorTable').innerHTML = '<div class="loading">加载中…</div>';
-  var d = await api('/api/sectors?type='+type);
-  loadSectorEvents();
-  var secs = d.sectors.slice(0, 60);
-  var top = secs.slice(0, 20).reverse();
-  chart('sectorChart').setOption({
-    tooltip:{formatter:function(p){ return p.name+'<br/>主力净流入：'+yi(p.value); }},
-    xAxis:{type:'value', axisLabel:{formatter:function(v){ return (v/1e8).toFixed(0)+'亿'; }}},
-    yAxis:{type:'category', data: top.map(function(s){return s.name;})},
-    series:[{type:'bar', data: top.map(function(s){ return {value:s.main_net, itemStyle:{color: s.main_net>0?'#d4380d':'#1a7f4b'}}; }), label:{show:true, position:'right', formatter:function(p){ return yi(p.value); }, fontSize:11}}],
-    grid:{left:100, right:80, top:10, bottom:25}
-  }, true);
-  var rows = secs.map(function(s){
-    return '<tr><td>'+s.name+'</td><td class="'+pctCls(s.pct)+'">'+pctTxt(s.pct)+'</td>'
-      +'<td class="'+pctCls(s.main_net)+'">'+yi(s.main_net)+'</td>'
-        +'<td class="'+pctCls(s.main_pct)+'">'+pctTxt(s.main_pct)+'</td>'
-        +'<td class="'+pctCls(s.big_net)+'">'+yi(s.big_net)+'</td>'
-        +'<td class="'+pctCls(s.mid_net)+'">'+yi(s.mid_net)+'</td>'
-      +'<td class="'+pctCls(s.super_net)+'">'+yi(s.super_net)+'</td>'
-      +'<td class="'+pctCls(s.small_net)+'">'+yi(s.small_net)+'</td>'
-      +'<td>'+(s.top_stock||'-')+'</td></tr>';
-  }).join('');
-  $('sectorTable').innerHTML = tableScroll('<table><tr><th>板块</th><th>涨跌幅</th><th>主力净流入</th><th>主力占比</th><th>大单</th><th>中单</th><th>小单</th><th>领涨股</th></tr>'+rows+'</table>',860);
-}
-
-async function loadSectorEvents(){
-  try{
-    var d = await api('/api/sector_events?limit=10');
-    var rows = (d.events||[]).map(function(s){
-      var hits = s.events||[];
-      var hitHtml = hits.length ? hits.map(function(h){
-        var cls = h.tone<0?'tag-warn':(h.tone>0?'tag-ok':'tag-info');
-        var label = h.tone<0?'风险':(h.tone>0?'催化':'提及');
-        return '<div style="margin-top:5px"><span class="tag '+cls+'">'+label+'</span> '+h.summary+'<br/><span class="news-time">'+(h.time||'')+' · '+(h.source||'')+'</span></div>';
-      }).join('') : '<span style="color:var(--text-muted)">暂无代表股事件命中</span>';
-      return '<tr><td><b>'+s.sector+'</b><br/><span style="font-size:11px;color:var(--text-muted)">代表股 '+(s.top_stock||s.top_stock_code||'-')+'</span></td>'
-        +'<td class="'+pctCls(s.pct)+'">'+pctTxt(s.pct)+'</td><td class="'+pctCls(s.main_pct)+'">'+pctTxt(s.main_pct)+'</td><td>'+hitHtml+'</td></tr>';
-    }).join('');
-    $('sectorEvents').innerHTML = tableScroll('<table><tr><th>板块</th><th>涨跌</th><th>主力占比</th><th>事件摘要</th></tr>'+rows+'</table>',760)+'<div class="disclaimer">'+(d.note||'')+'</div>';
-  }catch(e){ $('sectorEvents').innerHTML = '<div style="color:var(--text-muted)">板块事件暂不可用：'+e.message+'</div>'; }
-}
-
 function renderSelectionResult(d, fromCache){
     if(d.need_init){ $('selectResult').innerHTML = '<div class="banner">'+d.message+'。请运行 start.bat 完成数据初始化后重试。</div>'; return; }
     if(!d.picks){ $('selectResult').innerHTML = '<div class="banner">暂无已完成的选股结果，请点击“开始选股”。</div>'; return; }
@@ -1350,43 +1261,6 @@ async function compareStrategies(){
       +'<th>十日策略 股票</th><th>涨跌</th><th>超大单</th><th>买入</th></tr>'+rows+'</table>',1180)
       +'<div class="disclaimer">三种研究策略分别独立计算，同一只股票可能在多个策略中同时出现。仅供研究参考，不会改变五套模拟账户。</div>';
   }catch(e){ $('selectResult').innerHTML = '<div class="banner">对比失败：'+adaptiveEsc(e&&e.message||e)+'</div>'; }
-}
-
-// ---------- 板块联动 ----------
-async function loadLinkage(){
-  try{
-    var d = await api('/api/sector_linkage');
-    $('linkageSummary').innerHTML = '<div style="margin:8px 0;color:#5a7cfa;font-size:13px">'+d.summary+' <span class="tag tag-ok">共振中 '+d.resonating_count+'对</span></div>';
-    var rows = d.pairs.map(function(p){
-      var tag = p.resonance ? '<span class="tag tag-ok">共振中</span>' : (p.co_move_today ? '<span class="tag tag-info">今日同向</span>' : '');
-      var fund = (p.a_main_yi!==null && p.b_main_yi!==null) ? ' 主力:'+p.a_main_yi+'亿 / '+p.b_main_yi+'亿' : '';
-      return '<tr><td>'+p.a+'</td><td>'+p.b+'</td><td>'+p.corr+'</td><td class="'+pctCls(p.a_pct)+'">'+(p.a_pct!==null?pctTxt(p.a_pct):'-')+'</td><td class="'+pctCls(p.b_pct)+'">'+(p.b_pct!==null?pctTxt(p.b_pct):'-')+'</td><td style="font-size:12px;color:#9aa5b1">'+fund+'</td><td>'+tag+'</td></tr>';
-    }).join('');
-    $('linkageTable').innerHTML = tableScroll('<table><tr><th>板块A</th><th>板块B</th><th>相关性</th><th>A今日涨幅</th><th>B今日涨幅</th><th>今日主力资金</th><th>状态</th></tr>'+rows+'</table>',780)+'<div class="disclaimer">'+d.note+'</div>';
-    // 热力图：取前15个行业构建相关性矩阵可视化
-    var inds = [];
-    var seen = {};
-    for(var i=0;i<d.pairs.length && inds.length<15;i++){
-      if(!seen[d.pairs[i].a]){ seen[d.pairs[i].a]=1; inds.push(d.pairs[i].a); }
-      if(!seen[d.pairs[i].b] && inds.length<15){ seen[d.pairs[i].b]=1; inds.push(d.pairs[i].b); }
-    }
-    var hmData = [];
-    for(var r=0;r<inds.length;r++){
-      for(var c=0;c<inds.length;c++){
-        var found = d.pairs.filter(function(p){ return (p.a===inds[r]&&p.b===inds[c])||(p.a===inds[c]&&p.b===inds[r]); });
-        hmData.push([c, r, found.length ? found[0].corr : (r===c?1:0)]);
-      }
-    }
-    var hm = chart('linkageChart');
-    hm.setOption({
-      tooltip:{formatter:function(p){ return inds[p.data[1]]+' <-> '+inds[p.data[0]]+'<br/>相关性: '+p.data[2]; }},
-      grid:{left:120, right:30, top:10, bottom:60},
-      xAxis:{type:'category', data:inds, axisLabel:{rotate:45,fontSize:11,interval:0}},
-      yAxis:{type:'category', data:inds, axisLabel:{fontSize:11}},
-      visualMap:{min:0.5, max:1, orient:'horizontal', left:'center', bottom:0, inRange:{color:['#e0e0e0','#ffd54f','#ff7043']}, calculable:true},
-      series:[{type:'heatmap', data:hmData, label:{show:function(p){ return p.data[2]>0.75; },fontSize:10}}]
-    }, true);
-  }catch(e){ $('linkageTable').innerHTML = '<div class="banner">联动分析失败: '+e+'</div>'; }
 }
 
 // ---------- 持仓跟踪 ----------
@@ -2396,63 +2270,6 @@ async function loadPaper(options){
   return window._paperLoadRequest;
 }
 
-async function runBacktest(){
-  $('btnBt').disabled = true;
-  $('btResult').innerHTML = '<div class="loading">回测运行中（策略信号、成交约束与风险指标计算）…</div>';
-  try{
-    var d = await api('/api/backtest?strategy='+$('btStrategy').value+'&topn='+$('btTopn').value+'&rebalance='+$('btReb').value+'&gate='+$('btGate').checked);
-    if(d.need_init){ $('btResult').innerHTML = '<div class="banner">'+d.message+'</div>'; return; }
-    if(d.error){ $('btResult').innerHTML = '<div class="banner">'+d.error+'</div>'; return; }
-    var m = d.metrics;
-    var mhtml = '<div class="metrics">'
-      +'<div class="metric"><div class="v '+pctCls(m.total_return)+'">'+pctTxt(m.total_return)+'</div><div class="k">区间总收益</div></div>'
-      +'<div class="metric"><div class="v '+pctCls(m.annual_return)+'">'+pctTxt(m.annual_return)+'</div><div class="k">年化收益</div></div>'
-      +'<div class="metric"><div class="v down">'+pctTxt(m.max_drawdown)+'</div><div class="k">最大回撤</div></div>'
-      +'<div class="metric"><div class="v">'+fmt(m.sharpe)+'</div><div class="k">夏普比率</div></div>'
-      +'<div class="metric"><div class="v">'+fmt(m.sortino)+'</div><div class="k">Sortino</div></div>'
-      +'<div class="metric"><div class="v">'+fmt(m.calmar)+'</div><div class="k">Calmar</div></div>'
-      +'<div class="metric"><div class="v">'+fmt(m.annual_volatility,1)+'%</div><div class="k">年化波动率</div></div>'
-      +'<div class="metric"><div class="v">'+fmt(m.daily_win_rate,1)+'%</div><div class="k">日胜率</div></div>'
-      +'<div class="metric"><div class="v '+pctCls(m.excess_return)+'">'+pctTxt(m.excess_return)+'</div><div class="k">超额收益(vs沪深300)</div></div>'
-      +'<div class="metric"><div class="v">'+d.trades+'</div><div class="k">交易次数</div></div></div>';
-    // 门控历史条
-    var gateHtml = '';
-    if(d.gate_log && d.gate_log.length){
-      var gateColors = {green:'#27ae60', yellow:'#f39c12', red:'#e74c3c'};
-      gateHtml = '<div style="display:flex;gap:2px;margin-bottom:12px;align-items:center"><span style="font-size:12px;color:#7f8c9b;margin-right:8px">风险门控：</span>'
-        + d.gate_log.slice(-120).map(function(g){
-          var c = gateColors[g.light]||'#ccc';
-          return '<span title="'+g.date+': '+g.light+'" style="display:inline-block;width:5px;height:14px;background:'+c+';border-radius:1px"></span>';
-        }).join('') + '</div>';
-    }
-    var holdings = (d.recent_holdings||[]).map(function(h){
-      return '<div style="font-size:12px;color:#5a6b7d;margin-top:4px"><b>'+h.signal_date+'</b> 产生信号，'+h.execution_date+' 执行 → '+(h.target.length?h.target.join('、'):'空仓')+'</div>';
-    }).join('');
-    var ex = d.execution || {};
-    var rej = ex.rejected_orders || {};
-    var quality = '<div class="banner" style="margin-top:12px">执行统计：换手 '+fmt(ex.turnover_multiple,2)+' 倍，估算成本 '+fmt(ex.estimated_cost_pct_of_initial,2)+'%；拒单 '
-      +(rej.limit_up||0)+' 笔涨停买入 / '+(rej.limit_down||0)+' 笔跌停卖出 / '+(rej.suspended||0)+' 笔停牌缺价。'
-      +'基本面模式：'+(d.params.fundamentals_mode==='disabled_no_pit_data'?'已关闭历史回填（防前视）':'最新快照近似')+'；当前上市基础库缺少完整退市历史成分，仍有幸存者偏差。</div>';
-    $('btResult').innerHTML = gateHtml + mhtml + '<div id="btChart" class="chart"></div>'
-      +'<div style="margin-top:10px"><b style="font-size:13px">最近调仓记录</b>'+holdings+'</div>'
-      +quality
-      +'<div class="disclaimer">'+d.disclaimer+'</div>';
-    var series = [{name:'策略净值', type:'line', data:d.equity, showSymbol:false, lineStyle:{width:2, color:'#d4380d'}}];
-    if(d.benchmark) series.push({name:'沪深300', type:'line', data:d.benchmark, showSymbol:false, lineStyle:{width:1.5, color:'#7f8c9b'}});
-    chart('btChart').setOption({
-      tooltip:{trigger:'axis'},
-      legend:{data:series.map(function(s){return s.name;})},
-      xAxis:{type:'category', data:d.dates},
-      yAxis:{type:'value', scale:true},
-      dataZoom:[{type:'inside'},{type:'slider'}],
-      grid:{left:55, right:20, top:35, bottom:60},
-      series:series
-    }, true);
-  }catch(e){
-    $('btResult').innerHTML = '<div class="banner">回测失败：'+e+'</div>';
-  }finally{ $('btnBt').disabled = false; }
-}
-
 // ---------- 个股分析 ----------
 var _searchTimer;
 async function searchStock(){
@@ -2581,72 +2398,6 @@ async function analyzeStock(refresh){
   }catch(e){ $('stockBasic').innerHTML='<div class="banner">分析失败：'+e+'</div>'; }
 }
 
-async function runOptimize(){
-  $('btnOp').disabled = true;
-  $('opResult').innerHTML = '<div class="loading">网格搜索运行中（18组参数 × 双段回测，请耐心等待2-5分钟）…</div>';
-  try{
-    var d = await api('/api/optimize?strategy='+$('opStrategy').value);
-    if(d.need_init){ $('opResult').innerHTML = '<div class="banner">'+d.message+'</div>'; return; }
-    if(d.error){ $('opResult').innerHTML = '<div class="banner">'+d.error+'</div>'; return; }
-    var rows = d.results.map(function(r){
-      var isBest = d.best && r.topn===d.best.topn && r.rebalance===d.best.rebalance && r.use_gate===d.best.use_gate;
-      return '<tr style="'+(isBest?'background:#fff7e6':'')+'">'
-        +'<td>'+(isBest?'⭐ ':'')+r.topn+'</td><td>'+r.rebalance+'</td><td>'+(r.use_gate?'开':'关')+'</td>'
-        +'<td class="'+pctCls(r.in_return)+'">'+pctTxt(r.in_return)+'</td><td>'+fmt(r.in_sharpe)+'</td><td class="down">'+pctTxt(r.in_dd)+'</td><td class="'+pctCls(r.in_excess)+'">'+pctTxt(r.in_excess)+'</td>'
-        +'<td class="'+pctCls(r.out_return)+'">'+pctTxt(r.out_return)+'</td><td>'+fmt(r.out_sharpe)+'</td><td class="down">'+pctTxt(r.out_dd)+'</td><td class="'+pctCls(r.out_excess)+'">'+pctTxt(r.out_excess)+'</td>'
-        +'<td>'+(r.overfit_warning?'<span class="tag tag-warn">过拟合警告</span>':'<span class="tag tag-ok">通过</span>')+'</td></tr>';
-    }).join('');
-    var bestHtml = d.best? ('<div class="banner" style="background:#e8f7ee;border-color:#a5d6b8;color:#1a7f4b">推荐参数：持仓 '+d.best.topn+' 只 · '+d.best.rebalance+' 日调仓 · 门控'+(d.best.use_gate?'开':'关')
-      +'（样本外年化 '+pctTxt(d.best.out_return)+'，夏普 '+fmt(d.best.out_sharpe)+'）— 可回到「回测」页用该参数复核'
-      +(d.best.adjusted_by_tracking?('<br/><span style="color:#dc3545">跟踪调整：'+d.best.adjusted_by_tracking+'</span>'):'')+'</div>') : '';
-    var fbHtml = '';
-    if(d.tracking_feedback && d.tracking_feedback.count>0){
-      var fb = d.tracking_feedback;
-      fbHtml = '<div style="margin:8px 0;padding:8px;background:#e3f2fd;border:1px solid #2196f3;border-radius:4px"><b>持仓跟踪反馈（'+fb.strategy+'）</b>：跟踪 '+fb.count+' 只 · 平均收益 '+(fb.avg_ret_pct!==null?pctTxt(fb.avg_ret_pct):'-')+' · 胜率 '+(fb.win_rate_pct!==null?fb.win_rate_pct+'%':'-')+' · 均持 '+fb.avg_hold_days+' 天<ul style="margin:4px 0 0 16px;font-size:12px">'+fb.advice.map(function(a){ return '<li>'+a+'</li>'; }).join('')+'</ul></div>';
-    }
-    var rebHtml = '';
-    if(d.rebalance_compare){
-      var keys = Object.keys(d.rebalance_compare);
-      rebHtml = '<div style="margin:8px 0;font-size:13px"><b>调仓周期对比：</b>'+keys.map(function(k){ return k+' 样本外夏普均值 '+fmt(d.rebalance_compare[k].avg_out_sharpe)+' / 最优 '+fmt(d.rebalance_compare[k].best_out_sharpe); }).join(' ｜ ')+'</div>';
-    }
-    $('opResult').innerHTML = bestHtml + fbHtml + rebHtml
-      +'<div style="margin-bottom:8px;font-size:13px;color:#5a6b7d">样本内：'+d.split.in_sample+' ｜ 样本外：'+d.split.out_sample+'</div>'
-      +tableScroll('<table><tr><th>持仓数</th><th>调仓周期</th><th>门控</th><th>样本内年化</th><th>内夏普</th><th>内回撤</th><th>内超额</th><th>样本外年化</th><th>外夏普</th><th>外回撤</th><th>外超额</th><th>过拟合检验</th></tr>'+rows+'</table>',1020)
-      +'<div class="disclaimer">'+d.note+'</div>';
-  }catch(e){
-    $('opResult').innerHTML = '<div class="banner">优化失败：'+e+'</div>';
-  }finally{ $('btnOp').disabled = false; }
-}
-
-async function loadNews(){
-  if(!$('newsList')||!$('newsHits')||!$('hotTable')) return;
-  try{
-    var d = await api('/api/news');
-    $('newsList').innerHTML = d.news.map(function(n){
-      return '<div class="news-item"><span class="news-time">'+(n.time||'')+'</span>'+n.summary+'</div>';
-    }).join('') || '暂无';
-    $('newsHits').innerHTML = d.stock_hits.length? d.stock_hits.map(function(h){
-      var tag = h.tone>0?'<span class="tag tag-ok">利好</span>':(h.tone<0?'<span class="tag tag-warn">风险</span>':'<span class="tag tag-info">中性</span>');
-      return '<div class="news-item">'+tag+'<b>'+h.name+'</b>（'+h.code+'）'
-        +(h.keywords.length?' 关键词：'+h.keywords.join('、'):'')
-        +'<br/><span style="color:#5a6b7d">'+h.summary+'</span><br/><span class="news-time">'+(h.time||'')+' · '+h.source+'</span></div>';
-    }).join('') : '<div style="color:#9aa5b1;padding:10px 0">当前快讯中暂无股票池个股命中</div>';
-    try{
-      var hot = await api('/api/hot');
-      $('hotTable').innerHTML = '<table><tr><th>排名</th><th>股票</th><th>现价</th><th>涨跌幅</th><th>行业</th><th>排名变化</th></tr>'
-        + hot.hot.slice(0,50).map(function(h){
-        return '<tr><td>'+h.rank+'</td><td>'+(h.name||h.code)+'</td><td>'+fmt(h.price)+'</td>'
-          +'<td class="'+pctCls(h.pct)+'">'+pctTxt(h.pct)+'</td><td>'+(h.industry||'-')+'</td>'
-          +'<td>'+(h.rank_chg>0?'<span class="up">↑'+h.rank_chg+'</span>':(h.rank_chg<0?'<span class="down">↓'+Math.abs(h.rank_chg)+'</span>':'-'))+'</td></tr>';
-      }).join('') + '</table>';
-    }catch(e){
-      $('hotTable').innerHTML = '<div style="color:#9aa5b1;padding:10px 0">人气榜加载失败</div>';
-    }
-  }catch(e){
-    $('newsList').innerHTML = '加载失败：'+e;
-  }
-}
-
 loadStrategies();
 loadDataValidity();
 loadMarketGate();
@@ -2708,8 +2459,6 @@ async function refreshApp(){
       if(typeof loadStrategies==='function') jobs.push(loadStrategies());
       if(typeof loadDataValidity==='function') jobs.push(loadDataValidity());
       await Promise.all(jobs);
-    }else if(page==='p-sector'&&typeof loadSectors==='function'){
-      await Promise.all([loadSectors(),typeof loadLinkage==='function'?loadLinkage():Promise.resolve()]);
     }else if(page==='p-adaptive'&&typeof loadAdaptive==='function'){
       await loadAdaptive();
     }else if(page==='p-settings'&&typeof loadSettings==='function'){
