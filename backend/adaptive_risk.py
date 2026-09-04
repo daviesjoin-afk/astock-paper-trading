@@ -9,7 +9,6 @@ creates orders and never connects to a broker.
 from __future__ import annotations
 
 import datetime as dt
-import json
 import math
 import os
 import sqlite3
