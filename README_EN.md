@@ -27,17 +27,17 @@ This makes the repository useful not only for strategy experiments, but also for
 
 ## Current scope
 
-The repository preserves five strategy definitions in one registry and exposes the same identities to adaptive research, replay and audit views. The current paper cycle runs two active strategy accounts; the other three remain legacy research/replay definitions and receive no new-cycle capital or scheduler time.
+The repository preserves five strategy definitions in one registry and exposes the same identities to adaptive research, replay and audit views. All five strategy accounts are active in a new paper cycle, with independent candidate lanes, risk profiles and scheduler time inside the shared capital pool.
 
 | Strategy | Status | Style | Purpose |
 |---|---|---|---|
 | `tq_breakout` | active | Momentum breakout | Volume/flow-confirmed short-horizon breakout candidates |
-| `trend_pullback` | legacy | Trend pullback | Mid-term pullback observations inside an established uptrend |
-| `sector_rotation` | legacy | Sector rotation | Sector heat, flow resonance and relative-strength rotation research |
-| `reported_profit_breakout` | legacy | Quality breakout | Disclosure- and earnings-driven breakout scoring and replay |
+| `trend_pullback` | active | Trend pullback | Mid-term pullback observations inside an established uptrend |
+| `sector_rotation` | active | Sector rotation | Sector heat, flow resonance and relative-strength rotation |
+| `reported_profit_breakout` | active | Quality breakout | Disclosure- and earnings-driven breakout scoring and paper execution |
 | `main_force_top10` | active | Main-fund flow | Candidates ranked by strong main-fund inflow and live confirmation |
 
-The two active strategies share execution, capital-allocation and audit infrastructure while keeping independent entry lanes, position limits and exit logic. All five definitions remain available for replay and research; none is silently deleted, renamed or replaced.
+All five active strategies share execution, capital-allocation and audit infrastructure while keeping independent entry lanes, position limits and exit logic. Existing historical cycles are not silently rebalanced; a new or reset cycle allocates capital evenly across all five definitions. None is silently deleted, renamed or replaced.
 
 The engine is **paper trading only**. It does not include broker routing, leverage, short selling or real-money execution.
 
@@ -46,6 +46,7 @@ The engine is **paper trading only**. It does not include broker routing, levera
 ### Execution and capital model
 
 - Shared capital pool with strategy-level budget attribution and position-slot limits.
+- The dust-order threshold is dynamic: `cycle capital × shared-pool exposure cap ÷ stock position limit × 60%`, rounded down to ¥100. A ¥100,000 cycle with an 82% cap and 15 slots therefore uses ¥3,200 instead of a fixed ¥10,000. The remaining 40% is reserved for risk-controlled adds after trend, drawdown and position checks.
 - Reservation and cash deduction are separated to reduce double-spend risk under concurrent scans.
 - SQLite savepoints protect order accounting during multi-step writes.
 - Position sizing is price-aware and validates lot size, slippage and tradeability before simulated fills.

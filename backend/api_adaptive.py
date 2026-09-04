@@ -342,7 +342,7 @@ def run_ai_tuning(
     mode: str = Query("intraday", max_length=30),
     confirmed: bool = Query(False),
 ):
-    """Run the bounded DeepSeek tuner for the three paper accounts only."""
+    """Run the bounded DeepSeek tuner for the five paper accounts only."""
     if mode not in {"intraday", "close", "shadow"}:
         raise HTTPException(status_code=422, detail="调参模式只支持 intraday、close 或 shadow")
     _require_confirmation(confirmed, "运行 AI 有界调参")
