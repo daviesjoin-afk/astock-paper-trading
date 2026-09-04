@@ -22,11 +22,11 @@ class PaperSizingTests(unittest.TestCase):
     def test_dynamic_minimum_uses_cycle_capital_and_slot_limit(self):
         self.assertEqual(
             sizing.dynamic_minimum_order_amount(100000, 15),
-            4900.0,
+            3200.0,
         )
         self.assertEqual(
             sizing.dynamic_minimum_order_amount(300000, 15),
-            14700.0,
+            9800.0,
         )
 
     def test_dynamic_minimum_has_safe_nonzero_granularity(self):

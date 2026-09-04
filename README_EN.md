@@ -46,7 +46,7 @@ The engine is **paper trading only**. It does not include broker routing, levera
 ### Execution and capital model
 
 - Shared capital pool with strategy-level budget attribution and position-slot limits.
-- The dust-order threshold is dynamic: `cycle capital × shared-pool exposure cap ÷ stock position limit × 90%`, rounded down to ¥100. A ¥100,000 cycle with an 82% cap and 15 slots therefore uses ¥4,900 instead of a fixed ¥10,000.
+- The dust-order threshold is dynamic: `cycle capital × shared-pool exposure cap ÷ stock position limit × 60%`, rounded down to ¥100. A ¥100,000 cycle with an 82% cap and 15 slots therefore uses ¥3,200 instead of a fixed ¥10,000. The remaining 40% is reserved for risk-controlled adds after trend, drawdown and position checks.
 - Reservation and cash deduction are separated to reduce double-spend risk under concurrent scans.
 - SQLite savepoints protect order accounting during multi-step writes.
 - Position sizing is price-aware and validates lot size, slippage and tradeability before simulated fills.
