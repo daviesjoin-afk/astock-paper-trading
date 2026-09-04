@@ -20,6 +20,7 @@ router = APIRouter(prefix="/api/adaptive", tags=["adaptive-learning"])
 # path without maintaining a dead second namespace.
 _cache = {}
 _cache_ts = {}
+MAX_CACHE_ENTRIES = 64
 
 def _cache_get(key, ttl=30):
     import time as _t
@@ -29,6 +30,10 @@ def _cache_get(key, ttl=30):
 
 def _cache_set(key, value):
     import time as _t
+    if key not in _cache and len(_cache) >= MAX_CACHE_ENTRIES:
+        oldest_key = min(_cache, key=lambda item: _cache_ts.get(item, 0))
+        _cache.pop(oldest_key, None)
+        _cache_ts.pop(oldest_key, None)
     _cache[key] = value
     _cache_ts[key] = _t.time()
 
@@ -169,7 +174,6 @@ def overview():
     with _overview_lock:
         data = _overview_cache["data"]
         fresh = data is not None and now - _overview_cache["ts"] < _OVERVIEW_TTL_SECONDS
-        running = bool(_overview_cache["running"])
         error = _overview_cache["error"]
     if fresh:
         return data
@@ -238,6 +242,35 @@ def ai_overview():
             "realtime_tuning": tuning, "latest_runs": [tuning.get("latest")] if tuning.get("latest") else [],
             "candidates": ai_candidates[:30], "snapshot_stale": not bool(data), "refreshing": refreshing}
 
+
+@router.get("/ai/timeline")
+def ai_timeline(
+    limit: int = Query(40, ge=1, le=100),
+    trade_date: str | None = Query(None, max_length=10),
+):
+    """Expose the persisted AI-analysis timeline used by the adaptive page."""
+    try:
+        return adaptive.ai_analysis_timeline(limit=limit, trade_date=trade_date)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"读取AI分析时间线失败：{type(exc).__name__}") from exc
+
+
+@router.post("/ai/analyze")
+def run_ai_analysis(
+    trigger: str = Query("manual-ui", max_length=80),
+    window: str = Query("manual", max_length=30),
+    scope: str = Query("all", max_length=30),
+    confirmed: bool = Query(False),
+):
+    """Run an explicitly-confirmed, non-trading AI evidence analysis."""
+    _require_confirmation(confirmed, "重试分时段AI分析")
+    try:
+        return adaptive.run_scheduled_ai_analysis(trigger=trigger, window=window, scope=scope)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"运行AI分析失败：{type(exc).__name__}") from exc
+
 @router.get("/trade-attributions")
 def trade_attributions(
     limit: int = Query(160, ge=20, le=500),
@@ -257,15 +290,13 @@ def run(
     accepted, state = learning_dispatch.enqueue(trigger)
     return {
         "status": "accepted" if accepted else "busy",
-        "message": "模拟盘学习已转入后台运行" if accepted else "已有模拟盘学习任务运行中",
+        "message": "模拟盘学习已转入独立任务容器" if accepted else "已有模拟盘学习任务运行中",
         "run": state,
     }
 
 
 @router.get("/run/status")
 def run_status():
-    # Status polling must stay O(1); refreshing the overview here made every
-    # five-second browser poll compete with the learning worker for memory.
     return learning_dispatch.read_status()
 
 
@@ -311,7 +342,7 @@ def run_ai_tuning(
     mode: str = Query("intraday", max_length=30),
     confirmed: bool = Query(False),
 ):
-    """Run the bounded DeepSeek tuner for enabled paper accounts only."""
+    """Run the bounded DeepSeek tuner for the three paper accounts only."""
     if mode not in {"intraday", "close", "shadow"}:
         raise HTTPException(status_code=422, detail="调参模式只支持 intraday、close 或 shadow")
     _require_confirmation(confirmed, "运行 AI 有界调参")

@@ -41,7 +41,11 @@ def compute_price_factors(klines: dict, asof=None):
         try:
             mom20 = c.iloc[-1] / c.iloc[-21] - 1
             mom60 = c.iloc[-1] / c.iloc[-61] - 1
-            rev5 = c.iloc[-1] / c.iloc[-6] - 1
+            # 2026-08-28 语义修正：rev5 原与 mom5 完全重复（同为 5 日涨幅），
+            # 现改为"距 5 日高点回撤"深度因子（<=0，越接近 0 回踩越浅），
+            # 供趋势/轮动策略度量回踩质量；mom5 保持 5 日动量原语义。
+            mom5 = c.iloc[-1] / c.iloc[-6] - 1
+            rev5 = c.iloc[-1] / c.iloc[-6:].max() - 1
             ret = c.pct_change().iloc[-21:]
             vol20 = ret.std() * np.sqrt(252)
             amt5 = d["amount"].iloc[-5:].mean()
@@ -62,8 +66,11 @@ def compute_price_factors(klines: dict, asof=None):
                 rs = gain.iloc[-1] / loss.iloc[-1] if loss.iloc[-1] else np.nan
                 rsi14 = round(float(100 - 100 / (1 + rs)), 1) if np.isfinite(rs) else 50.0
             # MACD 信号：DIF 与 DEA 差值
-            ema12 = c.iloc[-26:].ewm(span=12, adjust=False).mean().iloc[-1]
-            ema26 = c.iloc[-26:].ewm(span=26, adjust=False).mean().iloc[-1]
+            # P3 精读修复：EMA 是递归序列，必须全程展开再取末值。旧实现
+            # 截断到最后 26 根再算——ema12 需约 3×span=36 点收敛、ema26 需
+            # 约 78 点，截断后 DIF 系统性偏移且截面内不可比。
+            ema12 = c.ewm(span=12, adjust=False).mean().iloc[-1]
+            ema26 = c.ewm(span=26, adjust=False).mean().iloc[-1]
             macd_dif = float(ema12 - ema26)
             ma5 = c.rolling(5).mean()
             ma10 = c.rolling(10).mean()
@@ -89,7 +96,7 @@ def compute_price_factors(klines: dict, asof=None):
                 len(monthly) >= 6
                 and monthly.iloc[-1] <= monthly.iloc[-6:].max() * 0.88
             )
-            row_data = {"code": code, "mom5": rev5, "mom20": mom20, "mom60": mom60, "rev5": rev5,
+            row_data = {"code": code, "mom5": mom5, "mom20": mom20, "mom60": mom60, "rev5": rev5,
                          "vol20": vol20, "vol_surge": vol_surge, "flow_proxy": flow_proxy,
                          "rsi14": rsi14, "macd_dif": macd_dif,
                          "price": float(c.iloc[-1]), "last_date": str(d.index[-1].date()),
@@ -206,8 +213,8 @@ def compute_fundamental_factors(snapshot, finance, asof=None):
             if profit_source == "unknown" and annual_meta["profit_source"] != "unknown":
                 profit_source = annual_meta["profit_source"]
 
-        def _value(key, visible):
-            return f.get(key) if visible else np.nan
+        def _value(key, visible, _factor=f):
+            return _factor.get(key) if visible else np.nan
 
         pe = s.get("pe")
         pb = s.get("pb")

@@ -682,7 +682,6 @@ def recalibrate(conn):
                   COUNT(DISTINCT canonical_hash)*1.0/COUNT(*) uniqueness
            FROM news_events GROUP BY source_name"""
     ).fetchall()
-    total_horizons = len(HORIZONS)
     for row in sources:
         covered = conn.execute(
             """SELECT COUNT(DISTINCT e.id) FROM news_events e

@@ -34,6 +34,7 @@ class LeaseAndFreshnessTests(unittest.TestCase):
 
     def test_lease_generation_increments_and_stale_owner_is_fenced(self):
         conn = self._lease_conn()
+        self.addCleanup(conn.close)
         first, owner1, _ = P._claim_runtime_lease(
             conn, "test-lock", "worker-a", "risk", ttl_seconds=60
         )
@@ -82,20 +83,15 @@ class LeaseAndFreshnessTests(unittest.TestCase):
         )
 
     def test_today_pnl_quote_requires_fresh_live_mark(self):
-        # Production treats offset-free market timestamps as Asia/Shanghai.
-        # Use an explicit +08:00 timestamp so this regression remains stable
-        # on GitHub-hosted runners whose local timezone is UTC.
-        shanghai_tz = dt.timezone(dt.timedelta(hours=8))
-        now = dt.datetime.now(shanghai_tz)
+        # Quote timestamps are serialized as Shanghai-local wall time; keep
+        # this test independent of the runner's host timezone.
+        now = dt.datetime.now(dt.timezone(dt.timedelta(hours=8)))
         fresh = {
             "price": 10.0,
             "quote_source": "live",
-            "quote_at": now.isoformat(timespec="seconds"),
+            "quote_at": now.strftime("%Y-%m-%d %H:%M:%S"),
         }
-        stale = dict(
-            fresh,
-            quote_at=(now - dt.timedelta(minutes=21)).isoformat(timespec="seconds"),
-        )
+        stale = dict(fresh, quote_at=(now - dt.timedelta(minutes=21)).strftime("%Y-%m-%d %H:%M:%S"))
         self.assertTrue(P._today_quote_is_usable(fresh, now.date()))
         self.assertFalse(P._today_quote_is_usable(stale, now.date()))
 
