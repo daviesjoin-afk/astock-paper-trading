@@ -9,6 +9,48 @@
   --shadow: 0 8px 28px rgba(26,62,47,.055);
 }
 
+.settings-shell { display:grid; gap:16px; }
+.settings-module-tabs { display:flex; gap:8px; overflow-x:auto; padding-bottom:2px; }
+.settings-section-tab { min-width:190px; text-align:left; }
+.settings-head-state { align-self:center; color:var(--text-secondary); font-size:12px; }
+.settings-grid { display:grid; grid-template-columns:minmax(0,1.35fr) minmax(260px,.65fr); gap:16px; align-items:start; }
+.settings-panel { border:1px solid var(--border); border-radius:14px; background:var(--surface); padding:20px; box-shadow:0 6px 18px rgba(20,55,40,.04); }
+.settings-panel h3 { margin:0 0 5px; }
+.settings-panel > p { margin:0 0 16px; color:var(--text-secondary); font-size:12px; line-height:1.65; }
+.settings-form { display:grid; gap:14px; }
+.setting-row { display:grid; grid-template-columns:minmax(150px,.8fr) minmax(180px,1fr); gap:14px; align-items:center; padding:12px 0; border-bottom:1px solid var(--border-light); }
+.setting-row:last-child { border-bottom:0; }
+.setting-label b { display:block; font-size:14px; }
+.setting-label small,.setting-help { color:var(--text-muted); font-size:11px; line-height:1.55; }
+.setting-control { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+.setting-control input,.setting-control select { width:100%; max-width:260px; }
+.setting-control input[type=checkbox] { width:18px; height:18px; accent-color:#238b68; }
+.setting-value-preview { color:var(--text-secondary); font-size:12px; }
+.settings-actions { display:flex; gap:8px; flex-wrap:wrap; margin-top:14px; }
+.settings-note { padding:12px 14px; border-radius:10px; background:var(--th-bg); color:var(--text-secondary); font-size:12px; line-height:1.65; }
+.settings-note strong { color:var(--text); }
+.settings-preview { display:grid; gap:10px; }
+.settings-kpi { padding:12px 14px; border-radius:10px; background:var(--th-bg); border:1px solid var(--border-light); }
+.settings-kpi small { display:block; color:var(--text-muted); font-size:11px; }
+.settings-kpi b { display:block; margin-top:3px; font-size:18px; }
+.strategy-settings-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(260px,1fr)); gap:12px; }
+.strategy-setting-card { padding:15px; border:1px solid var(--border); border-radius:12px; background:var(--th-bg); }
+.strategy-setting-card header { display:flex; justify-content:space-between; gap:10px; align-items:flex-start; margin-bottom:12px; }
+.strategy-setting-card header b { font-size:14px; }
+.strategy-setting-card header small { display:block; color:var(--text-muted); margin-top:3px; }
+.strategy-setting-card .setting-control { margin-top:8px; }
+.strategy-setting-card label { color:var(--text-secondary); font-size:12px; min-width:96px; }
+.strategy-setting-card input,.strategy-setting-card select { max-width:130px; }
+.settings-audit-list { display:grid; gap:8px; max-height:340px; overflow:auto; }
+.settings-audit-item { padding:10px 12px; border-left:3px solid #72b99b; background:var(--th-bg); font-size:12px; }
+.settings-audit-item small { display:block; color:var(--text-muted); margin-top:3px; }
+@media (max-width:768px) {
+  .settings-grid { grid-template-columns:1fr; }
+  .setting-row { grid-template-columns:1fr; gap:7px; }
+  .settings-section-tab { min-width:165px; }
+  .settings-panel { padding:16px 14px; }
+}
+
 /* 横向导航必须可滚动且不能压缩按钮；窄屏/嵌入式浏览器不再把右侧入口截掉。 */
 #p-adaptive > .module-tabs,
 #p-paper > .module-tabs,
@@ -570,15 +612,20 @@ body,button,input,select { font-family:var(--font-ui); }
 .header-meta { display:flex; align-items:center; gap:12px; padding-left:16px; border-left:1px solid rgba(255,255,255,.11); }
 .mode-label { color:#a8beb5; font:600 10px/1 var(--font-data); letter-spacing:.08em; white-space:nowrap; }
 #clock { color:#d2ddd8 !important; font:500 11px/1 var(--font-data) !important; font-variant-numeric:tabular-nums; }
+.header-settings-btn { display:inline-flex; align-items:center; gap:6px; min-height:34px; padding:0 10px; border:1px solid rgba(120,209,170,.34); border-radius:8px; background:rgba(120,209,170,.1); color:#d9f2e6; font-size:12px; font-weight:700; box-shadow:none; white-space:nowrap; }
+.header-settings-btn svg { width:16px; height:16px; }
+.header-settings-btn:hover { background:rgba(120,209,170,.2); box-shadow:none; transform:none; }
 .theme-toggle { display:grid; place-items:center; width:44px; height:44px; min-height:44px; padding:0; border:1px solid rgba(255,255,255,.14); border-radius:10px; background:rgba(255,255,255,.06); color:#dce9e3; box-shadow:none; }
 .page-refresh { min-height:34px; padding:0 11px; border:1px solid rgba(255,255,255,.18); border-radius:8px; background:rgba(255,255,255,.07); color:#e6f0ea; font-size:12px; font-weight:700; box-shadow:none; white-space:nowrap; }
 .page-refresh:hover { background:rgba(255,255,255,.14); box-shadow:none; }
 .theme-toggle svg { width:18px; height:18px; }
 .theme-toggle:hover { background:rgba(255,255,255,.12); transform:none; box-shadow:none; }
 .tabs {
-  top:68px; min-height:58px; padding:0 clamp(18px,3vw,48px); gap:8px;
+  top:68px; min-height:58px; padding:0 clamp(18px,3vw,48px); gap:8px; overflow-x:auto; scrollbar-width:thin;
   background:rgba(247,249,248,.96); border-bottom-color:var(--border);
 }
+.tabs .tab[data-page="p-settings"] { order:-1; color:var(--primary); }
+.tabs .tab[data-page="p-settings"]:hover,.tabs .tab[data-page="p-settings"].active { background:var(--primary-soft); }
 body.dark .tabs { background:rgba(14,25,20,.96); }
 .tab {
   display:grid; grid-template-columns:22px auto; grid-template-rows:auto auto; align-items:center;
@@ -715,7 +762,7 @@ body.dark .paper-risk-notice { background:#2c2618; color:#ddc183; }
   .paper-order-ticket { position:static; }
 }
 
-/* Paper research evidence: a read-only ledger for the three simulated strategies. */
+/* Paper research evidence: a read-only ledger for the five active strategies. */
 .paper-research-view { padding-top:14px; }
 .paper-research-hero { display:flex; align-items:flex-start; justify-content:space-between; gap:24px; padding:24px 26px; border:1px solid var(--border); border-left:4px solid var(--primary); border-radius:16px; background:linear-gradient(118deg,var(--surface) 0%,#f6faf7 100%); box-shadow:var(--shadow); }
 .paper-research-hero .page-kicker { margin-bottom:8px; }

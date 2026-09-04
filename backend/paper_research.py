@@ -3,7 +3,7 @@
 
 This module is intentionally read-only from the execution engine's point of
 view.  It stores the exact candidate inputs and later observed close prices for
-the three paper strategies, but it never changes a score, an order, a risk
+the five paper strategies, but it never changes a score, an order, a risk
 parameter, or an account balance.  A candidate is therefore evidence only
 until a separately reviewed experiment is promoted.
 """
@@ -304,7 +304,7 @@ def dashboard(limit=40):
     return {
         "version": VERSION,
         "mode": "shadow_only",
-        "message": "研究台账只记录四套模拟盘策略的候选与后续表现，不参与下单或自动调参。",
+        "message": "研究台账记录五套模拟盘策略的候选与后续表现，不参与下单或自动调参。",
         "strategies": [
             {"id": account_id, "name": name}
             for account_id, name in STRATEGY_NAMES.items()

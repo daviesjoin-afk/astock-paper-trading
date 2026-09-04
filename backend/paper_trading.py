@@ -38,6 +38,7 @@ import paper_quote_policy as PQP
 import paper_allocation as PA
 import paper_sizing as PSZ
 import strategy_registry as SR
+import runtime_settings as RSET
 from market_policy import market_light_scale, market_light_scales
 from paper_trading_rules import (
     CHINEXT_PREFIXES,  # noqa: F401 - legacy public compatibility export
@@ -106,13 +107,13 @@ NEW_STRATEGY_VERSION = "reported-profit-breakout-v1"
 MAIN_FORCE_STRATEGY_ID = "main_force_top10"
 MAIN_FORCE_STRATEGY_VERSION = "main-force-top10-v1"
 LOT_SIZE = 100
-# 集中化配对约束：席位稀缺（15席）时，低于该金额的新开仓是"尘埃仓"——
-# 占用一席却几乎不承载资金（2026-08-25 000978 案例黄灯预算剩 ¥3.2K 仍
-# 买出 ¥1.9K 仓）。预算不足时转入 deferred 队列等轮换释放额度，而不是
-# 用小仓填满席位。仅约束预算侧约束（cash/weight/exposure/industry）
-# 导致的小单；risk 约束导致的小单是低价股合法整手规模，不受此限。
-MIN_ORDER_AMOUNT = 10000.0
-# The three strategies make independent decisions but draw from one capital
+# 集中化配对约束：席位稀缺时，低于当前周期单席可表达金额的新开仓是
+# "尘埃仓"。阈值按周期声明本金、共享池硬敞口和股票持仓上限动态计算，
+# 不再固定为 10,000 元；仅约束预算侧小单，风险约束导致的低价股整手规模
+# 仍按原有风险门禁处理。
+MIN_ORDER_SLOT_UTILIZATION = 0.60
+MIN_ORDER_ROUNDING = 100.0
+# The five strategies make independent decisions but draw from one capital
 # pool.  Their historical profile exposure values are kept as sizing hints;
 # using any one of them as the pool ceiling makes the other strategies see a
 # permanently full account (for example 70% pool utilisation is already above
@@ -127,7 +128,7 @@ MAIN_FORCE_PRIORITY_FLOOR_PCT = 0.15
 # 三分钟频率兼顾开盘/午后节奏与全市场双源校验耗时；09:30、13:00 仍由首轮立即触发。
 INTRADAY_INTERVAL_MINUTES = 3
 INTRADAY_WINDOWS = (("09:30", "11:25"), ("13:00", "14:55"))
-# 开盘事件是共享执行引擎，三套策略只通过各自的策略画像决定阈值和仓位比例。
+# 开盘事件是共享执行引擎，五套策略只通过各自的策略画像决定阈值和仓位比例。
 # 这样既能在 09:30/09:31 抓住冲高回落，也不会把趋势/轮动策略改造成追涨策略。
 OPENING_EVENT_CLOCKS = {"09:30", "09:31", "13:00"}
 OPENING_EVENT_POLICIES = {
@@ -427,7 +428,7 @@ def paper_cache_generation():
     return "|".join(parts)
 
 # A small, recently updated subset is not a valid substitute for the A-share
-# market when ranking candidates.  The three paper strategies may use
+# market when ranking candidates.  The five paper strategies may use
 # different factor lags, but each one must still be ranked against a broad,
 # contemporaneous cross section.  Otherwise a transient cache failure can
 # silently turn a full-market strategy into a few-hundred-stock strategy.
@@ -501,7 +502,7 @@ INTRADAY_DOWNSIDE_POLICIES = {
 
 # 风控不是一个“全策略通用止损器”。这些字段同时用于审计与执行，
 # 明确每个账户面对洗盘/回吐时的容忍边界，避免仅凭同一个主力意图标签
-# 让三套策略做出相同动作。
+# 让五套策略做出相同动作。
 STRATEGY_RISK_BEHAVIORS = {
     "tq_breakout": {
         "entry_style": "实时动量确认，可小仓追高",
@@ -785,9 +786,8 @@ ACCOUNT_SPECS = {
 }
 
 # The registry is the single source of truth for what a new public cycle may
-# run.  Legacy specs stay in ACCOUNT_SPECS so archived ledgers and replay
-# tools can decode old rows, but they must never receive fresh cycle capital,
-# signals, or runner time.
+# run. All five registered specs receive fresh cycle capital, signals, and
+# runner time; ACCOUNT_SPECS also decodes archived ledgers.
 ACTIVE_ACCOUNT_IDS = tuple(
     account_id for account_id in SR.active_ids() if account_id in ACCOUNT_SPECS
 )
@@ -800,6 +800,52 @@ def _active_account_clause(column="id"):
         return "1=0", ()
     placeholders = ",".join("?" for _ in ACTIVE_ACCOUNT_IDS)
     return f"{column} IN ({placeholders})", ACTIVE_ACCOUNT_IDS
+
+
+def _dynamic_minimum_order_amount(cycle, nav=None, position_limit=None, conn=None):
+    """Return the current-cycle dust-order threshold and its audit inputs.
+
+    One slot should carry a meaningful part of its fair share of the usable
+    shared pool, while reserving 40% headroom lets risk controls decide
+    whether a confirmed position deserves an additional tranche.
+    """
+    cycle_ids = tuple(item for item in _loads((cycle or {}).get("enabled_strategies"), []) if item in ACCOUNT_SPECS)
+    configured_ids = cycle_ids or ACTIVE_ACCOUNT_IDS
+    configured_slots = sum(
+        max(1, int(ACCOUNT_SPECS.get(account_id, {}).get("max_positions", 1)))
+        for account_id in configured_ids
+    )
+    if position_limit is None:
+        position_limit = min(
+            SHARED_POOL_MAX_POSITIONS,
+            configured_slots or SHARED_POOL_MAX_POSITIONS,
+        )
+        position_limit_source = "configured_active_account_limits"
+    else:
+        position_limit = max(0, int(position_limit))
+        position_limit_source = "effective_dynamic_pool_limit"
+    cycle_data = cycle or {}
+    cycle_capital = _num(cycle_data.get("capital"), _num(nav, 0.0))
+    exposure_cap = RSET.get(conn, "shared_pool_exposure_cap", SHARED_POOL_MAX_EXPOSURE) if conn is not None else SHARED_POOL_MAX_EXPOSURE
+    slot_utilization = RSET.get(conn, "minimum_entry_slot_utilization", MIN_ORDER_SLOT_UTILIZATION) if conn is not None else MIN_ORDER_SLOT_UTILIZATION
+    amount = PSZ.dynamic_minimum_order_amount(
+        cycle_capital,
+        position_limit,
+        exposure_cap=exposure_cap,
+        slot_utilization=slot_utilization,
+        round_to=MIN_ORDER_ROUNDING,
+    )
+    return amount, {
+        "amount": amount,
+        "cycle_capital": round(cycle_capital, 2),
+        "pool_exposure_cap_pct": round(exposure_cap * 100, 2),
+        "position_limit": position_limit,
+        "configured_position_limit": configured_slots,
+        "position_limit_source": position_limit_source,
+        "slot_utilization_pct": round(slot_utilization * 100, 1),
+        "rounding": MIN_ORDER_ROUNDING,
+        "formula": f"floor_to_100(cycle_capital × pool_exposure_cap / position_limit × {slot_utilization:.0%})",
+    }
 
 
 def _active_account_rows(conn, status=None):
@@ -828,7 +874,20 @@ def _active_cycle_filter(conn, cycle_id, column="id"):
     shape, falling back to the cycle's own rows preserves cash reconciliation;
     a normal repository cycle has both active IDs and uses the strict filter.
     """
-    active_clause, active_ids = _active_account_clause(column)
+    configured_ids = None
+    try:
+        cycle_row = conn.execute("SELECT enabled_strategies FROM paper_cycles WHERE id=?", (cycle_id,)).fetchone()
+        parsed = _loads(cycle_row["enabled_strategies"], None) if cycle_row and cycle_row["enabled_strategies"] else None
+        if isinstance(parsed, list):
+            selected = tuple(item for item in parsed if item in ACCOUNT_SPECS)
+            configured_ids = selected or None
+    except Exception:
+        configured_ids = None
+    active_ids = configured_ids or ACTIVE_ACCOUNT_IDS
+    placeholders = ",".join("?" for _ in active_ids)
+    active_clause = f"{column} IN ({placeholders})" if active_ids else "1=0"
+    if configured_ids is not None:
+        return active_clause, active_ids
     count = conn.execute(
         f"SELECT COUNT(*) FROM paper_accounts WHERE cycle_id=? AND {active_clause}",
         (cycle_id, *active_ids),
@@ -1849,6 +1908,7 @@ def init_db():
                 # strategy accounts forever, so code/UI could show a strategy
                 # that the scheduler never ran.
                 PSM.ensure_paper_columns(conn)
+                RSET.ensure_schema(conn)
                 _ensure_accounts(conn)
                 _ensure_cycle(conn)
                 _ensure_runtime_lease_columns(conn)
@@ -2070,6 +2130,7 @@ def init_db():
 
 """
         )
+        RSET.ensure_schema(conn)
         PSM.ensure_paper_columns(conn)
         # 升级前的 lot 只记录成交价。来源订单存在时，将已实际扣除的买入费用
         # 分摊到每股成本；无来源的历史兼容 lot 不臆造费用，保留原始成本。
@@ -2162,9 +2223,9 @@ def _ensure_accounts(conn):
                 (spec["name"], spec["source_strategy"], spec["cycle_days"],
                  spec["max_weight"], spec["max_exposure"], spec["mode"], spec["risk_profile"], account_id),
             )
-            # Version only the newly introduced strategy.  Existing account
-            # versions remain untouched so historical three-strategy audits
-            # are not rewritten by a configuration refresh.
+            # Version only the newly introduced strategy. Existing account
+            # versions remain untouched so historical audits are not rewritten
+            # by a configuration refresh.
             if spec.get("strategy_version"):
                 conn.execute(
                     "UPDATE paper_accounts SET version=? WHERE id=?",
@@ -2283,14 +2344,23 @@ def _ensure_cycle(conn):
     """给旧版账户补一个可归档周期；不删除任何已有记录。"""
     active = conn.execute("SELECT * FROM paper_cycles WHERE status IN ('draft','running','paused') ORDER BY id DESC LIMIT 1").fetchone()
     if active is None:
-        first_active = ACTIVE_ACCOUNT_IDS[0] if ACTIVE_ACCOUNT_IDS else ""
-        account = conn.execute("SELECT * FROM paper_accounts WHERE id=?", (first_active,)).fetchone()
-        capital = _num(account["initial_cash"], 100000.0) if account else 100000.0
+        # A clean clone starts with one configured ledger per active strategy.
+        # Build the synthetic compatibility cycle from their total rather than
+        # the first account, so all five sleeves receive an equal bootstrap
+        # share before the operator starts a fresh explicit cycle.
+        active_clause, active_ids = _active_account_clause("id")
+        account_total = conn.execute(
+            f"SELECT COALESCE(SUM(initial_cash),0) FROM paper_accounts WHERE {active_clause}",
+            active_ids,
+        ).fetchone()[0]
+        capital = _num(account_total, 0.0) or 100000.0
         now = _now()
         key = "legacy-" + now.replace("-", "").replace(":", "").replace(" ", "-")
+        duration = int(RSET.get(conn, "cycle_duration_days", 0) or 0)
+        enabled = RSET.enabled_strategies(conn)
         conn.execute(
-            "INSERT INTO paper_cycles(cycle_key,status,capital,risk_profile,created_at,updated_at) VALUES(?,?,?,?,?,?)",
-            (key, "paused", capital, "shared_pool", now, now),
+            "INSERT INTO paper_cycles(cycle_key,status,capital,risk_profile,created_at,updated_at,duration_days,enabled_strategies) VALUES(?,?,?,?,?,?,?,?)",
+            (key, "paused", capital, "shared_pool", now, now, duration, _json(enabled)),
         )
         active = conn.execute("SELECT * FROM paper_cycles WHERE cycle_key=?", (key,)).fetchone()
     # Only a synthetic legacy cycle may infer its declared capital from old
@@ -2305,9 +2375,17 @@ def _ensure_cycle(conn):
         conn.execute("UPDATE paper_cycles SET capital=?,updated_at=? WHERE id=?",
                      (_num(account_total), _now(), active["id"]))
         active = conn.execute("SELECT * FROM paper_cycles WHERE id=?", (active["id"],)).fetchone()
+    configured_enabled = _loads(active["enabled_strategies"], None) if "enabled_strategies" in active.keys() else None
+    enabled_ids = tuple(item for item in (configured_enabled or ACTIVE_ACCOUNT_IDS) if item in ACCOUNT_SPECS) or ACTIVE_ACCOUNT_IDS
     for account_id, spec in ACTIVE_ACCOUNT_SPECS.items():
         current = conn.execute("SELECT * FROM paper_accounts WHERE id=?", (account_id,)).fetchone()
         if current is None:
+            continue
+        if account_id not in enabled_ids and current["cycle_id"] == active["id"]:
+            conn.execute(
+                "UPDATE paper_accounts SET cycle_id=NULL,status='paused',initial_cash=0,cash=0,updated_at=? WHERE id=?",
+                (_now(), account_id),
+            )
             continue
         style = current["style"] if current["style"] in STYLE_PROFILES else spec["default_style"]
         # 旧版数据库新增列的默认值为 pullback；给日内模型纠正为强势风格，且不影响已有成交。
@@ -2326,7 +2404,11 @@ def _ensure_cycle(conn):
             # joining an already active legacy cycle, only unallocated
             # configured capital is attributed; zero is safe and keeps the
             # shared cash ledger from being inflated.
-            account_capital = _available_cycle_ledger_capital(conn, active, account_id)
+            account_capital = (
+                capital / max(len(enabled_ids), 1)
+                if str(active["cycle_key"] or "").startswith("legacy-")
+                else _available_cycle_ledger_capital(conn, active, account_id)
+            )
             benchmark = _benchmark_close()
             conn.execute(
                 "UPDATE paper_accounts SET cycle_id=?,mode=?,style=?,status=?,initial_cash=?,cash=?,benchmark_start=?,daily_start_nav=?,daily_nav_date=?,risk_profile=?,params=COALESCE(NULLIF(params,''),'{}') WHERE id=?",
@@ -2352,7 +2434,7 @@ def _ensure_cycle(conn):
             # is already running and this account has no activity, activate it
             # with the cycle rather than silently omitting today's signals.
             if (
-                account_id in {NEW_STRATEGY_ID, MAIN_FORCE_STRATEGY_ID}
+                account_id in ACTIVE_ACCOUNT_IDS
                 and active["status"] == "running"
                 and str(current["status"] or "") != "running"
                 and not conn.execute(
@@ -2851,7 +2933,7 @@ def _risk_log(conn, account_id, code, side, decision, reason, payload):
 def _bootstrap_structural_recheck_cooldown(conn, account_id, code, asof_day):
     """Return a short cooldown for unchanged structural bootstrap rejections.
 
-    This is account-local by design.  The three strategies may independently
+    This is account-local by design.  The five strategies may independently
     trade the same code, but a structurally rejected candidate must not occupy
     the same strategy's limited live-review slots every three minutes.
     Quote/source failures are intentionally *not* cooled down because they
@@ -3348,7 +3430,7 @@ def _market_state(asof_date, live_universe=None, *, allow_network=True):
     elif stale and live_pct is not None:
         # 盘中最后一根完整日线落后一个交易日是正常现象；只要实时指数
         # 有当日时间戳，就按保守黄灯运行，不能把“趋势待更新”误判成未知
-        # 并暂停四套策略全部新开仓。
+        # 并暂停五套策略全部新开仓。
         light = "red" if overseas.get("light") == "red" or live_pct <= -2.0 else "yellow"
         reason = f"实时沪深300 {live_pct:+.2f}%；中期趋势收盘数据待更新，按谨慎仓位执行"
     elif stale:
@@ -7253,17 +7335,17 @@ def _risk_profile(account, asof_day=None):
 
 # The pool cap is hard, but it is not a per-strategy cap.  Each strategy gets
 # a risk-profile-weighted target inside the pool and a protected floor.  This
-# keeps a single signal stream from consuming all 82% before the other two
+# keeps a single signal stream from consuming all 82% before the other four
 # strategies have a chance to act; unused capacity can be lent only after the
 # other strategies have reached their floors.
 STRATEGY_POOL_FLOOR_RATIO = 0.60
-# Four strategy accounts share the pool.  2026-08-24 集中化改造：
-# 12 是硬上限（每策略 3 席），单仓风险预算同步放大，使资金利用率
+# Five strategy accounts share the pool.  2026-08-24 集中化改造：
+# 15 是硬上限（每策略 3 席），单仓风险预算同步放大，使资金利用率
 # 从 ~35% 提升到 ~75%；"集中力量办大事"而不是 17 席 × 零散小仓。
 SHARED_POOL_MAX_POSITIONS = 15
 STRATEGY_MIN_POSITIONS = 2
 STRATEGY_MAX_POSITIONS = 6
-# 四套模型共用资金但代表不同的市场假设。12 席总池下每策略保底 2 席，
+# 五套模型共用资金但代表不同的市场假设。15 席总池下每策略保底 2 席，
 # 该底座只保护"席位数"，不会放宽总暴露、单票/行业上限、行情校验或
 # 单笔风险预算。
 STRATEGY_PROTECTED_SLOT_FLOOR = 2
@@ -7397,6 +7479,7 @@ def _dynamic_position_limits(conn):
     through the staged, T+1/quote/limit-aware capacity-exit path.
     """
     cycle = _active_cycle(conn)
+    hard_pool_cap = int(RSET.get(conn, "shared_pool_position_limit", SHARED_POOL_MAX_POSITIONS))
     all_rows = _shared_account_rows(conn, cycle["id"])
     running_rows = [row for row in all_rows if row.get("status") == "running"]
     rows = running_rows or all_rows
@@ -7414,7 +7497,7 @@ def _dynamic_position_limits(conn):
     }
     runtime_inputs = {
         "window": _position_limit_window(),
-        "hard_pool_cap": SHARED_POOL_MAX_POSITIONS,
+        "hard_pool_cap": hard_pool_cap,
         "protected_slot_floor": STRATEGY_PROTECTED_SLOT_FLOOR,
         # P3 审计修复（R7）：分配公式/常量参与指纹——改公式发版后当天
         # 同 phase 不再复用旧版本行的过时席位分配。
@@ -7441,7 +7524,7 @@ def _dynamic_position_limits(conn):
         weights = _loads(existing["weights"], {})
         inputs = _loads(existing["inputs"], {})
         return {
-            "pool_limit": int(_num(existing["pool_limit"], SHARED_POOL_MAX_POSITIONS)),
+            "pool_limit": int(_num(existing["pool_limit"], hard_pool_cap)),
             "limits": {key: int(_num(value)) for key, value in limits.items()},
             "weights": weights,
             "source": existing["source"],
@@ -7451,12 +7534,12 @@ def _dynamic_position_limits(conn):
             "slot_borrow": inputs.get("last_slot_borrow"),
         }
     count = len(account_ids)
-    baseline = sum(_num(ACCOUNT_SPECS[key].get("max_exposure"), 0.0) for key in account_ids) / max(count, 1)
+    baseline = sum(weights.values()) / max(count, 1)
     allocation = PA.position_limits(
         account_ids,
         weights,
         baseline,
-        hard_pool_cap=SHARED_POOL_MAX_POSITIONS,
+        hard_pool_cap=hard_pool_cap,
         strategy_max_positions=STRATEGY_MAX_POSITIONS,
         strategy_min_positions=STRATEGY_MIN_POSITIONS,
         protected_slot_floor=STRATEGY_PROTECTED_SLOT_FLOOR,
@@ -7543,7 +7626,7 @@ def _strategy_pool_budget(conn, account, nav, positions, quotes, market=None, ex
         pending_total=pending_total,
         nav=_num(nav),
         market_scales=scales,
-        shared_pool_max_exposure=SHARED_POOL_MAX_EXPOSURE,
+        shared_pool_max_exposure=RSET.get(conn, "shared_pool_exposure_cap", SHARED_POOL_MAX_EXPOSURE),
         strategy_pool_floor_ratio=STRATEGY_POOL_FLOOR_RATIO,
         main_force_id=MAIN_FORCE_STRATEGY_ID,
         main_force_priority_floor_pct=MAIN_FORCE_PRIORITY_FLOOR_PCT,
@@ -7660,6 +7743,7 @@ def _price_aware_qty(
     exposure_scale=1.0, strategy_position_value=None,
     strategy_cap_amount=None, pool_cap_amount=None,
     pending_strategy_amount=0.0, pending_pool_amount=0.0,
+    single_position_max_amount=None,
 ):
     return PSZ.price_aware_qty(
         nav, cash, position_value, industry_value, code_value,
@@ -7667,6 +7751,7 @@ def _price_aware_qty(
         exposure_scale, strategy_position_value, strategy_cap_amount,
         pool_cap_amount, pending_strategy_amount, pending_pool_amount,
         num=_num, lot_size=LOT_SIZE,
+        single_position_max_amount=single_position_max_amount,
     )
 
 
@@ -7931,6 +8016,10 @@ def _buy_order(conn, account, signal, quote, market, news, asof_day, *, all_quot
                 f"入场时机：{timing_info.get('reason') or timing_info.get('state')}")
             reasons.extend(timing_block_reasons)
     count_budget = _dynamic_position_limits(conn)
+    minimum_order_amount, minimum_order_detail = _dynamic_minimum_order_amount(
+        current_cycle, nav=nav, position_limit=count_budget.get("pool_limit"), conn=conn,
+    )
+    risk["minimum_order_amount"] = minimum_order_detail
     position_limit = max(1, int(count_budget["limits"].get(account["id"], spec["max_positions"])))
     pool_open_positions = {
         (str(item.get("account_id")), str(item.get("code"))) for item in positions
@@ -8062,7 +8151,8 @@ def _buy_order(conn, account, signal, quote, market, news, asof_day, *, all_quot
     # it is no longer calculated as 82% of a separate 300,000-yuan bucket for
     # every strategy.  Per-strategy models still control single-name risk,
     # industry concentration, stop distance and entry quality below.
-    exposure_cap = SHARED_POOL_MAX_EXPOSURE
+    exposure_cap = RSET.get(conn, "shared_pool_exposure_cap", SHARED_POOL_MAX_EXPOSURE)
+    single_position_max_amount = RSET.get(conn, "single_position_max_amount", 0.0)
     qty, sizing = _price_aware_qty(
         nav, shared_cash, position_value, industry_value, code_value,
         fill_price, ACCOUNT_SPECS[account["id"]]["hard_stop"], profile,
@@ -8072,6 +8162,7 @@ def _buy_order(conn, account, signal, quote, market, news, asof_day, *, all_quot
         pool_cap_amount=strategy_budget["pool_cap_amount"],
         pending_strategy_amount=strategy_budget.get("pending_reserve_amount", 0.0),
         pending_pool_amount=strategy_budget.get("pending_pool_reserve_amount", 0.0),
+        single_position_max_amount=single_position_max_amount,
     )
     # Entry-model scaling must reduce the actual order as well as the residual
     # exposure allowance.  Otherwise a risk/weight constraint could silently
@@ -8088,9 +8179,9 @@ def _buy_order(conn, account, signal, quote, market, news, asof_day, *, all_quot
         qty = int((qty * entry_tranche_scale) / LOT_SIZE) * LOT_SIZE
         sizing["entry_tranche_scale_pct"] = round(entry_tranche_scale * 100, 1)
         sizing["entry_tranche_qty"] = int(qty)
-        # P3 审计修复（P2）：同步缩放后的目标金额——dust_order 地板
-        # （MIN_ORDER_AMOUNT）读取本字段，不同步会让 ¥30000 预算缩到
-        # ¥7500 的探针仓绕过地板直接成交。
+        # P3 审计修复（P2）：同步缩放后的目标金额——动态 dust_order 地板
+        # 读取本字段，不同步会让 ¥30000 预算缩到 ¥7500 的探针仓绕过地板
+        # 直接成交。
         sizing["target_amount"] = round(qty * fill_price, 2)
     else:
         sizing["entry_tranche_scale_pct"] = 100.0
@@ -8139,6 +8230,8 @@ def _buy_order(conn, account, signal, quote, market, news, asof_day, *, all_quot
     sizing["execution_adjustment_scale"] = risk_scale
     sizing["market_scale_applied_in_budget"] = bool(strategy_budget.get("market_scale_applied"))
     sizing["entry_execution_mode"] = entry_model.get("execution_mode", "常规入场")
+    sizing["minimum_order_amount"] = minimum_order_amount
+    sizing["minimum_order_amount_inputs"] = minimum_order_detail
     risk["exceptional_opportunity"] = exceptional
     # 市场黄灯只收紧账户总仓位上限，不再把每笔数量二次打折。
     # 每笔委托仍受单票权重和单笔止损预算限制，可避免小账户因100股取整而长期空仓。
@@ -8176,12 +8269,12 @@ def _buy_order(conn, account, signal, quote, market, news, asof_day, *, all_quot
             )
             soft_amount_reasons.append(reasons[-1])
     # 2026-09-03 修复：尘埃单此前仅用于"已拦截订单"的分类，金额低于
-    # MIN_ORDER_AMOUNT 且其余闸门全过时 allowed=True 照样成交（当日
-    # 7 笔 <8000 成交实证）。现作为软性拦截：候选转入 deferred 队列，
-    # 预算释放后按全尺寸复核，不再用小仓占用稀缺席位。
-    if qty >= LOT_SIZE and amount < MIN_ORDER_AMOUNT and not reasons:
+    # 动态阈值且其余闸门全过时 allowed=True 照样成交。现按当前周期单席
+    # 可表达金额作为软性拦截：候选转入 deferred 队列，预算释放后按全尺寸
+    # 复核，不再用小仓占用稀缺席位。
+    if qty >= LOT_SIZE and amount < minimum_order_amount and not reasons:
         dust_reason = (
-            f"低于最小建仓金额 \u00a5{MIN_ORDER_AMOUNT:,.0f}（当前 \u00a5{amount:,.0f}）；"
+            f"低于动态最小建仓金额 \u00a5{minimum_order_amount:,.0f}（当前 \u00a5{amount:,.0f}）；"
             "席位稀缺时不建尘埃仓，候选保留在等待池，预算释放后按全尺寸复核"
         )
         reasons.append(dust_reason)
@@ -8248,10 +8341,10 @@ def _buy_order(conn, account, signal, quote, market, news, asof_day, *, all_quot
     )
     # 新开自动仓只要占用一席，就必须有足够的资金意义。止损后的回补
     # 也不是例外：一手探针若低于地板，保留观察即可，不能靠“探针”
-    # 名义绕过尘埃仓保护并挤占策略席位。
+    # 名义绕过动态尘埃仓保护并挤占策略席位。
     dust_order = (
         qty >= LOT_SIZE
-        and amount < MIN_ORDER_AMOUNT
+        and amount < minimum_order_amount
         and not hard_reasons
     )
     # 2026-09-03 修复：入场时机确认中的候选不允许被打成终态拒绝。
@@ -8355,7 +8448,7 @@ def _buy_order(conn, account, signal, quote, market, news, asof_day, *, all_quot
             elif dust_order:
                 deferred_reason = (
                     f"策略预算剩余仅支持 {_num(sizing.get('target_amount')):.0f} 元新仓，"
-                    f"低于最小建仓金额 {MIN_ORDER_AMOUNT:.0f} 元；席位稀缺时不建尘埃仓，"
+                    f"低于动态最小建仓金额 {minimum_order_amount:.0f} 元；席位稀缺时不建尘埃仓，"
                     "保留为替补候选，待轮换释放预算后按全尺寸复核"
                 )
             elif timing_block_reasons:
@@ -8687,13 +8780,14 @@ def _manual_order_plan(
         safe_qty, sizing = _price_aware_qty(
             nav, shared_cash, position_value, industry_value, code_value,
             fill_reference * (1 + SLIPPAGE), ACCOUNT_SPECS[account_id]["hard_stop"], profile,
-            exposure_cap=SHARED_POOL_MAX_EXPOSURE,
-            max_exposure_cap=SHARED_POOL_MAX_EXPOSURE,
+            exposure_cap=RSET.get(conn, "shared_pool_exposure_cap", SHARED_POOL_MAX_EXPOSURE),
+            max_exposure_cap=RSET.get(conn, "shared_pool_exposure_cap", SHARED_POOL_MAX_EXPOSURE),
             strategy_position_value=strategy_budget["current_amount"],
             strategy_cap_amount=strategy_budget["absolute_cap_amount"],
             pool_cap_amount=strategy_budget["pool_cap_amount"],
             pending_strategy_amount=strategy_budget.get("pending_reserve_amount", 0.0),
             pending_pool_amount=strategy_budget.get("pending_pool_reserve_amount", 0.0),
+            single_position_max_amount=RSET.get(conn, "single_position_max_amount", 0.0),
         )
         plan["risk"]["sizing"] = sizing
         plan["recommended_qty"] = safe_qty
@@ -12447,13 +12541,14 @@ def _intraday_buyback(conn, account, position, quote, market, asof_day, profile,
     qty, sizing = _price_aware_qty(
         nav, shared_cash, value, industries.get(position.get("industry") or "未知", 0.0),
         code_value, price * (1 + SLIPPAGE), ACCOUNT_SPECS[account["id"]]["hard_stop"], profile,
-        exposure_cap=SHARED_POOL_MAX_EXPOSURE,
-        max_exposure_cap=SHARED_POOL_MAX_EXPOSURE,
+        exposure_cap=RSET.get(conn, "shared_pool_exposure_cap", SHARED_POOL_MAX_EXPOSURE),
+        max_exposure_cap=RSET.get(conn, "shared_pool_exposure_cap", SHARED_POOL_MAX_EXPOSURE),
         strategy_position_value=strategy_budget["current_amount"],
         strategy_cap_amount=strategy_budget["absolute_cap_amount"],
         pool_cap_amount=strategy_budget["pool_cap_amount"],
         pending_strategy_amount=strategy_budget.get("pending_reserve_amount", 0.0),
         pending_pool_amount=strategy_budget.get("pending_pool_reserve_amount", 0.0),
+        single_position_max_amount=RSET.get(conn, "single_position_max_amount", 0.0),
     )
     sizing["strategy_budget"] = strategy_budget
     qty = min(qty, sold_qty)
@@ -12577,13 +12672,14 @@ def _swing_scale_in(conn, account, position, quote, market, asof_day, profile, c
         nav, shared_cash, position_value,
         industries.get(position.get("industry") or "未知", 0.0), code_value, fill,
         ACCOUNT_SPECS[account_id]["hard_stop"], profile,
-        exposure_cap=SHARED_POOL_MAX_EXPOSURE,
-        max_exposure_cap=SHARED_POOL_MAX_EXPOSURE,
+        exposure_cap=RSET.get(conn, "shared_pool_exposure_cap", SHARED_POOL_MAX_EXPOSURE),
+        max_exposure_cap=RSET.get(conn, "shared_pool_exposure_cap", SHARED_POOL_MAX_EXPOSURE),
         strategy_position_value=strategy_budget["current_amount"],
         strategy_cap_amount=strategy_budget["absolute_cap_amount"],
         pool_cap_amount=strategy_budget["pool_cap_amount"],
         pending_strategy_amount=strategy_budget.get("pending_reserve_amount", 0.0),
         pending_pool_amount=strategy_budget.get("pending_pool_reserve_amount", 0.0),
+        single_position_max_amount=RSET.get(conn, "single_position_max_amount", 0.0),
     )
     sizing["strategy_budget"] = strategy_budget
     # 趋势策略只补齐首笔观察仓：上限为现有可识别持仓规模，不能因一次
@@ -12649,7 +12745,7 @@ def _swing_scale_in(conn, account, position, quote, market, asof_day, profile, c
 
 
 def monitor_opening_events(asof_date=None, event_clock=None):
-    """扫描开盘冲高/回落事件；四策略共用识别器，各自使用独立策略阈值。"""
+    """扫描开盘冲高/回落事件；五策略共用识别器，各自使用独立策略阈值。"""
     init_db()
     day = _date(asof_date)
     clock = str(event_clock or dt.datetime.now().strftime("%H:%M"))
@@ -14225,7 +14321,8 @@ def _shared_metrics(conn, cycle, positions, quotes):
     )
     nav = cash + market_value
     _, pending_reserve = _pending_buy_reservations(conn, cycle["id"])
-    pool_cap = nav * SHARED_POOL_MAX_EXPOSURE
+    pool_exposure_cap = RSET.get(conn, "shared_pool_exposure_cap", SHARED_POOL_MAX_EXPOSURE)
+    pool_cap = nav * pool_exposure_cap
     economic_history = _economic_pool_nav_history(conn, cycle)
     previous = next(
         (row for row in reversed(economic_history) if row["nav_date"] < dt.date.today().isoformat()),
@@ -14258,7 +14355,7 @@ def _shared_metrics(conn, cycle, positions, quotes):
         "valuation_missing_codes": missing_valuation_codes,
         "return_pct": round((nav / initial - 1) * 100, 2) if initial else None,
         "fund_utilization_pct": round(market_value / max(nav, 1) * 100, 1),
-        "pool_limit_pct": round(SHARED_POOL_MAX_EXPOSURE * 100, 2),
+        "pool_limit_pct": round(pool_exposure_cap * 100, 2),
         "pool_limit_amount": round(pool_cap, 2),
         "pending_buy_reserve": round(pending_reserve, 2),
         "committed_exposure": round(market_value + pending_reserve, 2),
@@ -14657,7 +14754,7 @@ def dashboard(include_activity=False, include_history_symbols=False):
         shared["strategy_pnl_sum"] = round(raw_total, 2)
         shared["pnl_reconciliation_delta"] = round(pool_total - raw_total, 2)
         shared["strategy_today_pnl_sum"] = round(raw_today, 2) if today_complete else None
-        # The visible pool number and the four strategy cards now use the same
+        # The visible pool number and the five strategy cards now use the same
         # transfer-neutral definition and must reconcile exactly.  The former
         # synthetic-ledger discrepancy remains in ledger_* fields above.
         shared["today_pnl_reconciliation_delta"] = round(
@@ -14953,7 +15050,7 @@ def dashboard(include_activity=False, include_history_symbols=False):
 
 
 def research_validation_dashboard(limit=40):
-    """Return only the shadow-research ledger for the three paper strategies."""
+    """Return only the shadow-research ledger for the five paper strategies."""
     result = PR.dashboard(limit=limit)
     now = dt.datetime.now()
     today = now.date()
@@ -15360,7 +15457,7 @@ def risk_dashboard(refresh=False, allow_stale=False, allow_network=True):
         )
     result = RC.build_dashboard(base, snapshot)
     # 风控页面与交易页使用同一总资金池口径；策略仍保留各自的风险模型，
-    # 但不再把三套账户误展示成三个互不相关的资金账户。
+    # 但不再把五套账户误展示成五个互不相关的资金账户。
     result["capital_model"] = base.get("capital_model", "shared_pool")
     result["shared"] = base.get("shared", {})
     # 页面读取时同时暴露最近一轮 5 分钟探活结果，便于区分“没有行情”与
@@ -15632,32 +15729,50 @@ def _archive_current_cycle(conn, reason):
     return cycle
 
 
-def _create_cycle(conn, capital, status="paused", reason="新建模拟周期"):
+def _create_cycle(conn, capital, status="paused", reason="新建模拟周期", duration_days=None, enabled_strategies=None):
     capital = _validate_capital(capital)
+    if duration_days is None:
+        duration_days = int(RSET.get(conn, "cycle_duration_days", 0) or 0)
+    if enabled_strategies is None:
+        enabled_strategies = RSET.enabled_strategies(conn)
+    checked = RSET.validate({"cycle_duration_days": duration_days, "enabled_strategies": list(enabled_strategies)})
+    duration_days = checked["cycle_duration_days"]
+    enabled_strategies = checked["enabled_strategies"]
     now = _now()
     key = "cycle-" + dt.datetime.now().strftime("%Y%m%d-%H%M%S-%f")
     cursor = conn.execute(
-        "INSERT INTO paper_cycles(cycle_key,status,capital,risk_profile,started_at,created_at,updated_at) VALUES(?,?,?,?,?,?,?)",
-        (key, status, capital, "shared_pool", now if status == "running" else None, now, now),
+        "INSERT INTO paper_cycles(cycle_key,status,capital,risk_profile,started_at,created_at,updated_at,duration_days,enabled_strategies) VALUES(?,?,?,?,?,?,?,?,?)",
+        (key, status, capital, "shared_pool", now if status == "running" else None, now, now, duration_days, _json(enabled_strategies)),
     )
     cycle_id = cursor.lastrowid
     benchmark = _benchmark_close()
-    account_share = capital / max(len(ACTIVE_ACCOUNT_IDS), 1)
+    account_share = capital / max(len(enabled_strategies), 1)
     for account_id, spec in ACTIVE_ACCOUNT_SPECS.items():
+        if account_id not in enabled_strategies:
+            conn.execute(
+                "UPDATE paper_accounts SET cycle_id=NULL,status='paused',initial_cash=0,cash=0,updated_at=? WHERE id=?",
+                (now, account_id),
+            )
+            continue
+        override = (RSET.get(conn, "strategy_overrides", {}) or {}).get(account_id, {})
+        max_positions = int(override.get("max_positions", spec["max_positions"]))
+        max_weight = float(override.get("max_weight_pct", spec["max_weight"] * 100)) / 100.0
+        max_exposure = float(override.get("max_exposure_pct", spec["max_exposure"] * 100)) / 100.0
+        style = override.get("style") if override.get("style") in STYLE_PROFILES else spec["default_style"]
         conn.execute(
             """UPDATE paper_accounts SET name=?,source_strategy=?,status=?,initial_cash=?,cash=?,cycle_days=?,
                max_positions=?,max_weight=?,max_exposure=?,version=?,benchmark_start=?,cycle_id=?,mode=?,style=?,
                risk_profile=?,params='{}',daily_start_nav=?,daily_nav_date=?,cooldown_until=NULL,updated_at=? WHERE id=?""",
-            (spec["name"], spec["source_strategy"], status, account_share, account_share, spec["cycle_days"], spec["max_positions"],
-             spec["max_weight"], spec["max_exposure"], spec.get("strategy_version") or "v3.0", benchmark, cycle_id, spec["mode"], spec["default_style"],
+            (spec["name"], spec["source_strategy"], status, account_share, account_share, spec["cycle_days"], max_positions,
+             max_weight, max_exposure, spec.get("strategy_version") or "v3.0", benchmark, cycle_id, spec["mode"], style,
              spec["risk_profile"], account_share, _date().isoformat(), now, account_id),
         )
         conn.execute("INSERT INTO paper_nav(account_id,nav_date,cash,market_value,nav,benchmark,created_at) VALUES(?,?,?,?,?,?,?)",
                      (account_id, _date().isoformat(), account_share, 0.0, account_share, benchmark, now))
         conn.execute("INSERT INTO paper_parameter_versions(cycle_id,account_id,version,style,params,reason,effective_date,created_at) VALUES(?,?,?,?,?,?,?,?)",
-                     (cycle_id, account_id, spec.get("strategy_version") or "v3.0", spec["default_style"], "{}", reason, _date().isoformat(), now))
-    _audit(conn, None, "cycle_created", f"{key}：共享模拟资金池 {capital:.2f} 元，多策略独立决策共用资金，{reason}")
-    return {"id": cycle_id, "cycle_key": key, "status": status, "capital": capital}
+                     (cycle_id, account_id, spec.get("strategy_version") or "v3.0", style, "{}", reason, _date().isoformat(), now))
+    _audit(conn, None, "cycle_created", f"{key}：共享模拟资金池 {capital:.2f} 元，启用 {len(enabled_strategies)} 套策略，周期 {RSET.cycle_duration_label(duration_days)}，{reason}")
+    return {"id": cycle_id, "cycle_key": key, "status": status, "capital": capital, "duration_days": duration_days, "enabled_strategies": enabled_strategies}
 
 
 def configure_capital(capital):
@@ -15673,8 +15788,10 @@ def configure_capital(capital):
         if activity or positions:
             raise ValueError("本周期已有模拟成交或持仓，资金已锁定；请使用完全重置新建周期")
         conn.execute("UPDATE paper_cycles SET capital=?,updated_at=? WHERE id=?", (capital, _now(), cycle["id"]))
-        share = capital / max(len(ACTIVE_ACCOUNT_IDS), 1)
-        active_clause, active_ids = _active_account_clause("id")
+        configured = _loads(cycle.get("enabled_strategies"), None)
+        enabled_count = len(configured) if isinstance(configured, list) and configured else len(ACTIVE_ACCOUNT_IDS)
+        share = capital / max(enabled_count, 1)
+        active_clause, active_ids = _active_cycle_filter(conn, cycle["id"], "id")
         conn.execute(
             f"UPDATE paper_accounts SET initial_cash=?,cash=?,daily_start_nav=?,updated_at=? WHERE {active_clause}",
             (share, share, share, _now(), *active_ids),
@@ -15687,7 +15804,7 @@ def configure_capital(capital):
     return dashboard()
 
 
-def start_new_cycle(capital=300000.0, include_dashboard=True):
+def start_new_cycle(capital=None, include_dashboard=True):
     """保存资金并启动新周期。旧周期先完整归档，避免覆盖历史模拟结果。
 
     HTTP 写接口使用 ``include_dashboard=False``，避免在已经提交账本变更后
@@ -15696,6 +15813,8 @@ def start_new_cycle(capital=300000.0, include_dashboard=True):
     """
     init_db()
     with _db() as conn:
+        if capital is None:
+            capital = RSET.get(conn, "default_starting_capital", 300000.0)
         current = _active_cycle(conn)
         if current["status"] == "running":
             raise ValueError("当前周期仍在运行，请先暂停再启动新周期")
@@ -15703,13 +15822,13 @@ def start_new_cycle(capital=300000.0, include_dashboard=True):
         cycle = _create_cycle(conn, capital, status="running", reason="保存资金并启动")
     summary = dashboard() if include_dashboard else {
         "cycle": cycle,
-        "strategy_count": len(ACTIVE_ACCOUNT_IDS),
+        "strategy_count": len(cycle.get("enabled_strategies") or ACTIVE_ACCOUNT_IDS),
         "refresh_required": True,
     }
     return summary, cycle
 
 
-def reset_cycle(capital=300000.0, include_dashboard=True):
+def reset_cycle(capital=None, include_dashboard=True):
     """完全重置只归档，不删除历史；新周期保持暂停，等待用户明确启动。
 
     HTTP 写接口使用 ``include_dashboard=False``（与 start_new_cycle 一致），
@@ -15717,6 +15836,8 @@ def reset_cycle(capital=300000.0, include_dashboard=True):
     """
     init_db()
     with _db() as conn:
+        if capital is None:
+            capital = RSET.get(conn, "default_starting_capital", 300000.0)
         current = _active_cycle(conn)
         if current["status"] == "running":
             raise ValueError("当前周期仍在运行，请先暂停后再完全重置")
@@ -15726,7 +15847,7 @@ def reset_cycle(capital=300000.0, include_dashboard=True):
         return dashboard(), cycle
     return {
         "cycle": cycle,
-        "strategy_count": len(ACTIVE_ACCOUNT_IDS),
+        "strategy_count": len(cycle.get("enabled_strategies") or ACTIVE_ACCOUNT_IDS),
         "refresh_required": True,
     }, cycle
 
@@ -15735,7 +15856,7 @@ def set_account_style(account_id, style):
     if account_id not in ACCOUNT_SPECS:
         raise ValueError("未知策略账户")
     if style not in STYLE_PROFILES:
-        raise ValueError("风格必须是 strong、pullback、sector 或 quality")
+        raise ValueError("风格必须是 strong、pullback、sector、quality 或 main_force")
     init_db()
     with _db() as conn:
         cycle = _active_cycle(conn)
@@ -15762,14 +15883,14 @@ def set_accounts_status(status, capital=None):
             raise ValueError("当前周期不是暂停状态，不能恢复运行")
         if status == "paused" and cycle["status"] != "running":
             raise ValueError("当前周期并未运行，无需再次暂停")
-        active_clause, active_ids = _active_account_clause("id")
+        active_clause, active_ids = _active_cycle_filter(conn, cycle["id"], "id")
         conn.execute(
             f"UPDATE paper_accounts SET status=?, updated_at=? WHERE {active_clause}",
             (status, _now(), *active_ids),
         )
         conn.execute("UPDATE paper_cycles SET status=?,started_at=COALESCE(started_at,?),updated_at=? WHERE id=?",
                      (status, _now() if status == "running" else None, _now(), cycle["id"]))
-        _audit(conn, None, "accounts_" + status, f"{len(ACTIVE_ACCOUNT_IDS)}套当前策略模拟盘状态变更")
+        _audit(conn, None, "accounts_" + status, f"{len(active_ids)}套当前策略模拟盘状态变更")
     return dashboard()
 
 
