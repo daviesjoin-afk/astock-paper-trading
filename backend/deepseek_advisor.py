@@ -547,7 +547,7 @@ def _tuning_accounts(paper_db_path):
     try:
         paper = sqlite3.connect(paper_db_path, timeout=10)
         paper.row_factory = sqlite3.Row
-        rows = paper.execute("SELECT id,version,style,params FROM paper_accounts WHERE status!='disabled' ORDER BY id").fetchall()
+        rows = paper.execute("SELECT id,version,style,params FROM paper_accounts ORDER BY id").fetchall()
     except (OSError, sqlite3.Error):
         return []
     finally:
@@ -581,7 +581,7 @@ def _tuning_prompt(evidence, accounts, mode):
         "market_regime": "momentum|rotation|risk_off|high_volatility|balanced|unclassified",
         "summary": "中文说明",
         "proposals": [{
-            "account_id": "tq_breakout|main_force_top10",
+            "account_id": "tq_breakout|trend_pullback|sector_rotation",
             "reason": "只说明证据和预期改善",
             "weights": {"仅使用当前账户已有因子": 0.25},
         }],
@@ -878,7 +878,7 @@ def overview(conn, config=None):
             "enabled": bool((config or {}).get("llm_realtime_tuning_enabled", False)) and enabled(config),
             "auto_apply": False,
             "min_interval_minutes": int((config or {}).get("llm_realtime_min_interval_minutes", 15) or 15),
-            "scope": "仅启用模拟账户；只生成影子候选；应用必须人工确认并重新校验",
+            "scope": "仅三套模拟账户；只生成影子候选；应用必须人工确认并重新校验",
             "latest": latest_tuning,
         },
     }

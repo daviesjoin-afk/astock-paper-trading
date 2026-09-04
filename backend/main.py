@@ -652,6 +652,7 @@ def health():
         else None
     )
     warnings = []
+    advisories = []
     live_snapshot = {
         "rows": 0, "saved_at": None, "quote_at_min": None,
         "quote_at_max": None, "age_seconds": None, "status": "unknown",
@@ -675,33 +676,49 @@ def health():
             live_snapshot["age_seconds"] = round(
                 max(0.0, (datetime.datetime.now(datetime.timezone.utc) - parsed_saved.astimezone(datetime.timezone.utc)).total_seconds()), 1
             )
-        today = datetime.date.today()
+        china_tz = datetime.timezone(datetime.timedelta(hours=8))
+        china_now = datetime.datetime.now(china_tz)
+        today = china_now.date()
         expected_quote_day = (
             today.isoformat() if U.is_trade_day(today)
             else U.previous_trade_day(today).isoformat()
         )
         now_utc = datetime.datetime.now(datetime.timezone.utc)
-        valid_today = []
+        quote_day_rows = []
+        fresh_rows = []
         for row in rows:
             stamp = str(row.get("quote_at") or "")
             if stamp[:10] != expected_quote_day:
                 continue
+            quote_day_rows.append(row)
             try:
                 parsed = datetime.datetime.fromisoformat(stamp.replace("Z", "+00:00"))
                 if parsed.tzinfo is None:
                     parsed = parsed.replace(tzinfo=datetime.timezone.utc)
                 age = (now_utc - parsed.astimezone(datetime.timezone.utc)).total_seconds()
                 if 0 <= age <= 1800:
-                    valid_today.append(row)
+                    fresh_rows.append(row)
             except (ValueError, TypeError):
                 continue
-        live_snapshot["valid_today_rows"] = len(valid_today)
+        in_live_session = U.is_trade_day(today) and (
+            datetime.time(9, 15) <= china_now.time() <= datetime.time(11, 35)
+            or datetime.time(12, 55) <= china_now.time() <= datetime.time(15, 10)
+        )
+        live_snapshot["valid_today_rows"] = len(fresh_rows)
+        live_snapshot["quote_day_rows"] = len(quote_day_rows)
         live_snapshot["expected_quote_day"] = expected_quote_day
-        live_snapshot["status"] = "fresh" if len(rows) >= 4000 and len(valid_today) >= 4000 else "stale"
+        complete_snapshot = len(rows) >= 4000 and len(quote_day_rows) >= 4000
+        live_snapshot["status"] = (
+            "fresh" if in_live_session and len(rows) >= 4000 and len(fresh_rows) >= 4000
+            else "closed_snapshot" if not in_live_session and complete_snapshot
+            else "stale"
+        )
         if len(rows) < 4000:
             warnings.append(f"全市场实时快照仅 {len(rows)} 行，未达到完整性门槛 4000")
-        if len(valid_today) < 4000:
-            warnings.append(f"全市场实时快照新鲜有效仅 {len(valid_today)} 行，已超过30分钟或不是当日行情")
+        if in_live_session and len(fresh_rows) < 4000:
+            warnings.append(f"全市场实时快照新鲜有效仅 {len(fresh_rows)} 行，已超过30分钟或不是当日行情")
+        if not in_live_session and len(quote_day_rows) < 4000:
+            warnings.append(f"最近完整交易日快照仅 {len(quote_day_rows)} 行，未达到完整性门槛 4000")
     except (OSError, ValueError, TypeError) as exc:
         live_snapshot["status"] = "missing"
         warnings.append(f"全市场实时快照读取失败：{type(exc).__name__}")
@@ -713,7 +730,7 @@ def health():
     if coverage["fresh_selection_pct"] < 90:
         warnings.append("行情缓存可能已过期，请执行增量更新")
     if coverage["fallback_unadjusted"]:
-        warnings.append(
+        advisories.append(
             f"{coverage['fallback_unadjusted']} 只使用新浪不复权兜底，"
             "后续初始化会自动尝试升级为腾讯前复权"
         )
@@ -734,6 +751,7 @@ def health():
         "paper_risk_refresh": risk_refresh_status(),
         "data_source_health": source_health,
         "warnings": warnings,
+        "advisories": advisories,
         "live_snapshot": live_snapshot,
         "selection_usable_pct": coverage["usable_selection_pct"],
         "backtest_usable": coverage["usable_backtest"],
