@@ -10,20 +10,20 @@ def dynamic_minimum_order_amount(
     position_limit,
     *,
     exposure_cap=0.82,
-    slot_utilization=0.90,
+    slot_utilization=0.60,
     round_to=100.0,
 ):
     """Return a meaningful new-position amount for the current cycle.
 
-    The threshold is derived from the cycle's declared capital and the hard
-    maximum number of stock slots, rather than from a fixed currency amount::
+    The threshold is derived from the cycle's declared capital and the
+    effective maximum number of stock slots, rather than from a fixed amount::
 
-        floor_to_100(cycle_capital * exposure_cap / position_limit * 90%)
+        floor_to_100(cycle_capital * exposure_cap / position_limit * 60%)
 
-    The 90% factor leaves room for fees, price movement and shared-pool
-    reconciliation while still allowing a normal order to represent most of
-    one available slot.  ``round_to`` is also the minimum non-zero threshold,
-    so a malformed tiny cycle cannot disable the dust-order guard.
+    The 60% factor leaves a 40% reserve for risk-controlled adds, fees, price
+    movement and shared-pool reconciliation while keeping a normal order
+    meaningful.  ``round_to`` is also the minimum non-zero threshold, so a
+    malformed tiny cycle cannot disable the dust-order guard.
     """
     try:
         capital = max(0.0, float(cycle_capital or 0.0))
