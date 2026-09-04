@@ -106,13 +106,13 @@ NEW_STRATEGY_VERSION = "reported-profit-breakout-v1"
 MAIN_FORCE_STRATEGY_ID = "main_force_top10"
 MAIN_FORCE_STRATEGY_VERSION = "main-force-top10-v1"
 LOT_SIZE = 100
-# 集中化配对约束：席位稀缺（15席）时，低于该金额的新开仓是"尘埃仓"——
-# 占用一席却几乎不承载资金（2026-08-25 000978 案例黄灯预算剩 ¥3.2K 仍
-# 买出 ¥1.9K 仓）。预算不足时转入 deferred 队列等轮换释放额度，而不是
-# 用小仓填满席位。仅约束预算侧约束（cash/weight/exposure/industry）
-# 导致的小单；risk 约束导致的小单是低价股合法整手规模，不受此限。
-MIN_ORDER_AMOUNT = 10000.0
-# The three strategies make independent decisions but draw from one capital
+# 集中化配对约束：席位稀缺时，低于当前周期单席可表达金额的新开仓是
+# "尘埃仓"。阈值按周期声明本金、共享池硬敞口和股票持仓上限动态计算，
+# 不再固定为 10,000 元；仅约束预算侧小单，风险约束导致的低价股整手规模
+# 仍按原有风险门禁处理。
+MIN_ORDER_SLOT_UTILIZATION = 0.90
+MIN_ORDER_ROUNDING = 100.0
+# The five strategies make independent decisions but draw from one capital
 # pool.  Their historical profile exposure values are kept as sizing hints;
 # using any one of them as the pool ceiling makes the other strategies see a
 # permanently full account (for example 70% pool utilisation is already above
@@ -799,6 +799,42 @@ def _active_account_clause(column="id"):
         return "1=0", ()
     placeholders = ",".join("?" for _ in ACTIVE_ACCOUNT_IDS)
     return f"{column} IN ({placeholders})", ACTIVE_ACCOUNT_IDS
+
+
+def _dynamic_minimum_order_amount(cycle, nav=None):
+    """Return the current-cycle dust-order threshold and its audit inputs.
+
+    One slot should carry most of its fair share of the usable shared pool,
+    but reserving 10% headroom prevents fees, slippage and reconciliation
+    drift from making the threshold itself consume the whole budget.
+    """
+    configured_slots = sum(
+        max(1, int(ACCOUNT_SPECS.get(account_id, {}).get("max_positions", 1)))
+        for account_id in ACTIVE_ACCOUNT_IDS
+    )
+    position_limit = min(
+        SHARED_POOL_MAX_POSITIONS,
+        configured_slots or SHARED_POOL_MAX_POSITIONS,
+    )
+    cycle_data = cycle or {}
+    cycle_capital = _num(cycle_data.get("capital"), _num(nav, 0.0))
+    amount = PSZ.dynamic_minimum_order_amount(
+        cycle_capital,
+        position_limit,
+        exposure_cap=SHARED_POOL_MAX_EXPOSURE,
+        slot_utilization=MIN_ORDER_SLOT_UTILIZATION,
+        round_to=MIN_ORDER_ROUNDING,
+    )
+    return amount, {
+        "amount": amount,
+        "cycle_capital": round(cycle_capital, 2),
+        "pool_exposure_cap_pct": round(SHARED_POOL_MAX_EXPOSURE * 100, 2),
+        "position_limit": position_limit,
+        "configured_position_limit": configured_slots,
+        "slot_utilization_pct": round(MIN_ORDER_SLOT_UTILIZATION * 100, 1),
+        "rounding": MIN_ORDER_ROUNDING,
+        "formula": "floor_to_100(cycle_capital × pool_exposure_cap / position_limit × 90%)",
+    }
 
 
 def _active_account_rows(conn, status=None):
@@ -2861,7 +2897,7 @@ def _risk_log(conn, account_id, code, side, decision, reason, payload):
 def _bootstrap_structural_recheck_cooldown(conn, account_id, code, asof_day):
     """Return a short cooldown for unchanged structural bootstrap rejections.
 
-    This is account-local by design.  The three strategies may independently
+    This is account-local by design.  The five strategies may independently
     trade the same code, but a structurally rejected candidate must not occupy
     the same strategy's limited live-review slots every three minutes.
     Quote/source failures are intentionally *not* cooled down because they
@@ -7901,6 +7937,10 @@ def _buy_order(conn, account, signal, quote, market, news, asof_day, *, all_quot
         all_quotes = dict(all_quotes)
     positions, position_value, nav, industries, code_values = _shared_account_exposure(conn, all_quotes, asof_day)
     shared_cash = _shared_cash(conn)
+    minimum_order_amount, minimum_order_detail = _dynamic_minimum_order_amount(
+        current_cycle, nav=nav,
+    )
+    risk["minimum_order_amount"] = minimum_order_detail
     open_codes = {
         item["code"] for item in positions
         if item.get("account_id") == account["id"] and int(_num(item.get("qty"))) >= LOT_SIZE
@@ -8098,9 +8138,9 @@ def _buy_order(conn, account, signal, quote, market, news, asof_day, *, all_quot
         qty = int((qty * entry_tranche_scale) / LOT_SIZE) * LOT_SIZE
         sizing["entry_tranche_scale_pct"] = round(entry_tranche_scale * 100, 1)
         sizing["entry_tranche_qty"] = int(qty)
-        # P3 审计修复（P2）：同步缩放后的目标金额——dust_order 地板
-        # （MIN_ORDER_AMOUNT）读取本字段，不同步会让 ¥30000 预算缩到
-        # ¥7500 的探针仓绕过地板直接成交。
+        # P3 审计修复（P2）：同步缩放后的目标金额——动态 dust_order 地板
+        # 读取本字段，不同步会让 ¥30000 预算缩到 ¥7500 的探针仓绕过地板
+        # 直接成交。
         sizing["target_amount"] = round(qty * fill_price, 2)
     else:
         sizing["entry_tranche_scale_pct"] = 100.0
@@ -8149,6 +8189,8 @@ def _buy_order(conn, account, signal, quote, market, news, asof_day, *, all_quot
     sizing["execution_adjustment_scale"] = risk_scale
     sizing["market_scale_applied_in_budget"] = bool(strategy_budget.get("market_scale_applied"))
     sizing["entry_execution_mode"] = entry_model.get("execution_mode", "常规入场")
+    sizing["minimum_order_amount"] = minimum_order_amount
+    sizing["minimum_order_amount_inputs"] = minimum_order_detail
     risk["exceptional_opportunity"] = exceptional
     # 市场黄灯只收紧账户总仓位上限，不再把每笔数量二次打折。
     # 每笔委托仍受单票权重和单笔止损预算限制，可避免小账户因100股取整而长期空仓。
@@ -8186,12 +8228,12 @@ def _buy_order(conn, account, signal, quote, market, news, asof_day, *, all_quot
             )
             soft_amount_reasons.append(reasons[-1])
     # 2026-09-03 修复：尘埃单此前仅用于"已拦截订单"的分类，金额低于
-    # MIN_ORDER_AMOUNT 且其余闸门全过时 allowed=True 照样成交（当日
-    # 7 笔 <8000 成交实证）。现作为软性拦截：候选转入 deferred 队列，
-    # 预算释放后按全尺寸复核，不再用小仓占用稀缺席位。
-    if qty >= LOT_SIZE and amount < MIN_ORDER_AMOUNT and not reasons:
+    # 静态阈值且其余闸门全过时 allowed=True 照样成交。现按当前周期单席
+    # 可表达金额作为软性拦截：候选转入 deferred 队列，预算释放后按全尺寸
+    # 复核，不再用小仓占用稀缺席位。
+    if qty >= LOT_SIZE and amount < minimum_order_amount and not reasons:
         dust_reason = (
-            f"低于最小建仓金额 \u00a5{MIN_ORDER_AMOUNT:,.0f}（当前 \u00a5{amount:,.0f}）；"
+            f"低于动态最小建仓金额 \u00a5{minimum_order_amount:,.0f}（当前 \u00a5{amount:,.0f}）；"
             "席位稀缺时不建尘埃仓，候选保留在等待池，预算释放后按全尺寸复核"
         )
         reasons.append(dust_reason)
@@ -8258,10 +8300,10 @@ def _buy_order(conn, account, signal, quote, market, news, asof_day, *, all_quot
     )
     # 新开自动仓只要占用一席，就必须有足够的资金意义。止损后的回补
     # 也不是例外：一手探针若低于地板，保留观察即可，不能靠“探针”
-    # 名义绕过尘埃仓保护并挤占策略席位。
+    # 名义绕过动态尘埃仓保护并挤占策略席位。
     dust_order = (
         qty >= LOT_SIZE
-        and amount < MIN_ORDER_AMOUNT
+        and amount < minimum_order_amount
         and not hard_reasons
     )
     # 2026-09-03 修复：入场时机确认中的候选不允许被打成终态拒绝。
@@ -8365,7 +8407,7 @@ def _buy_order(conn, account, signal, quote, market, news, asof_day, *, all_quot
             elif dust_order:
                 deferred_reason = (
                     f"策略预算剩余仅支持 {_num(sizing.get('target_amount')):.0f} 元新仓，"
-                    f"低于最小建仓金额 {MIN_ORDER_AMOUNT:.0f} 元；席位稀缺时不建尘埃仓，"
+                    f"低于动态最小建仓金额 {minimum_order_amount:.0f} 元；席位稀缺时不建尘埃仓，"
                     "保留为替补候选，待轮换释放预算后按全尺寸复核"
                 )
             elif timing_block_reasons:
