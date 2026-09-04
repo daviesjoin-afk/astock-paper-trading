@@ -33,15 +33,12 @@
     <span class="brand-copy"><span class="brand-eyebrow">ASTOCK / QUANT DESK</span><h1>A股量化策略台</h1></span>
   </div>
   <div class="header-status"><span class="header-status-label">市场门控</span><div id="gateBadge" class="gate-badge gate-green" role="status" aria-live="polite"><div class="gate-dot"></div><span>检测中…</span></div></div>
-  <input type="text" id="headerSearch" placeholder="快搜代码/名称…" style="width:160px;font-size:12px;padding:6px 10px;background:rgba(255,255,255,.1);border:1px solid rgba(255,255,255,.15);color:#fff;border-radius:8px;outline:none" oninput="searchStockHeader()" onkeydown="if(event.key==='Enter')gotoStockDetail()" autocomplete="off">
   <div class="header-meta"><span class="mode-label">研究 · 纯模拟</span><time id="clock"></time><button class="header-settings-btn" type="button" onclick="activatePage('p-settings')" title="打开设置中心"><svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M12 8.2a3.8 3.8 0 1 0 0 7.6 3.8 3.8 0 0 0 0-7.6Z" stroke="currentColor" stroke-width="1.7"/><path d="m19.1 13.1 1.2 1-.1 1.8-1.8 1.1-1.5-.5-1.1.6-.3 1.5-1.7.7-1.7-.7-.3-1.5-1.1-.6-1.5.5-1.8-1.1-.1-1.8 1.2-1v-1.3l-1.2-1 .1-1.8 1.8-1.1 1.5.5 1.1-.6.3-1.5 1.7-.7 1.1.6 1.5-.5 1.8 1.1.1 1.8-1.2 1v1.3Z" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round"/></svg><span>设置</span></button><button class="header-ai-btn" type="button" onclick="switchToAdaptiveAI()" title="AI审阅与双AI调参" style="margin-right:6px;padding:4px 10px;background:linear-gradient(135deg,#10b981,#059669);border:none;color:#fff;border-radius:6px;font-size:12px;cursor:pointer;font-weight:600;letter-spacing:0.5px">🤖 AI</button><button class="page-refresh" type="button" onclick="refreshApp()" title="重新加载服务器最新页面与数据">刷新页面</button><button id="themeToggle" class="theme-toggle" aria-label="切换深色模式" aria-pressed="false" title="切换深色模式" onclick="toggleDark()"><svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M20.4 15.4A8.5 8.5 0 0 1 8.6 3.6 8.6 8.6 0 0 1 20.4 15.4Z" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/></svg></button></div>
 </header>
-<div id="headerSuggest" style="position:fixed;top:48px;right:28px;background:#fff;border:1px solid #e0e3e8;border-radius:8px;max-height:200px;overflow-y:auto;z-index:30;display:none;min-width:200px;box-shadow:0 8px 24px rgba(0,0,0,.12)"></div>
 <nav class="tabs" aria-label="主功能导航">
   <button class="tab active" data-page="p-select"><svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M4 5h16M7 12h10m-7 7h4" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/><circle cx="7" cy="5" r="2" fill="currentColor"/><circle cx="15" cy="12" r="2" fill="currentColor"/><circle cx="12" cy="19" r="2" fill="currentColor"/></svg><b>策略选股</b><small>选股研究</small></button>
   <button class="tab" data-page="p-paper"><svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M4 19V9m5 10V5m6 14v-7m5 7V3" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/><path d="M3 21h18" stroke="currentColor" stroke-width="1.2" opacity=".6"/></svg><b>策略模拟</b><small>模拟交易台</small></button>
   <button class="tab" data-page="p-adaptive"><svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M12 3a4 4 0 0 0-3.8 2.8A3.5 3.5 0 0 0 5.5 12 4 4 0 0 0 9 18h1v3m2-18a4 4 0 0 1 3.8 2.8A3.5 3.5 0 0 1 18.5 12 4 4 0 0 1 15 18h-1v3M8 9h3m2 0h3M8 14h3m2 0h3" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg><b>自进化</b><small>盘面学习中心</small></button>
-  <button class="tab" data-page="p-stock"><b>个股研究</b><small>技术与资料</small></button>
   <button class="tab" data-page="p-settings"><svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M12 8.2a3.8 3.8 0 1 0 0 7.6 3.8 3.8 0 0 0 0-7.6Z" stroke="currentColor" stroke-width="1.7"/><path d="m19.1 13.1 1.2 1-.1 1.8-1.8 1.1-1.5-.5-1.1.6-.3 1.5-1.7.7-1.7-.7-.3-1.5-1.1-.6-1.5.5-1.8-1.1-.1-1.8 1.2-1v-1.3l-1.2-1 .1-1.8 1.8-1.1 1.5.5 1.1-.6.3-1.5 1.7-.7 1.7.7.3 1.5 1.1.6 1.5-.5 1.8 1.1.1 1.8-1.2 1v1.3Z" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round"/></svg><b>设置中心</b><small>资金 · 风控 · AI</small></button>
 </nav>
 
@@ -185,49 +182,11 @@
   </div>
 </div>
 
-<div id="p-stock" class="page stock-research-page">
-  <div class="stock-research-shell">
-    <header class="stock-research-header">
-      <div id="stockTitle" class="stock-research-title">个股技术分析</div>
-      <div class="stock-research-subtitle">K线、技术信号与研究资料</div>
-      <button id="stockWatchBtn" class="stock-watch-btn" onclick="toggleStockWatch()">加入自选</button>
-      <button class="stock-refresh-btn" onclick="refreshStockResearch()">更新这只股票的行情与资料</button>
-      <div class="stock-search-line">
-        <input type="text" id="stockCode" placeholder="输入代码或名称，如 600519 / 茅台" oninput="searchStock()" onkeydown="if(event.key==='Enter')analyzeStock()" autocomplete="off">
-        <button class="ghost" onclick="analyzeStock()">查看个股</button>
-      </div>
-      <div id="stockSuggest" style="position:absolute;background:#fff;border:1px solid #ddd;border-radius:10px;max-height:200px;overflow-y:auto;z-index:20;display:none;min-width:262px"></div>
-    </header>
-    <div id="stockDataBanner" class="stock-data-banner">部分来源暂时无法连接。已保存在本地缓存中可用的行情与研究资料，稍后可再次更新。</div>
-    <nav class="stock-research-tabs" aria-label="个股资料分类">
-      <button class="stock-research-tab active" data-stock-section="kline" onclick="switchStockSection(this)">K线与技术</button>
-      <button class="stock-research-tab" data-stock-section="decision" onclick="switchStockSection(this)">概念题材</button>
-      <button class="stock-research-tab" data-stock-section="news" onclick="switchStockSection(this)">新闻</button>
-      <button class="stock-research-tab" data-stock-section="news" onclick="switchStockSection(this)">公告</button>
-      <button class="stock-research-tab" data-stock-section="decision" onclick="switchStockSection(this)">机构调研</button>
-      <button class="stock-research-tab" data-stock-section="finance" onclick="switchStockSection(this)">定期报告</button>
-      <button class="stock-research-tab" data-stock-section="peers" onclick="switchStockSection(this)">机构研报</button>
-      <button class="stock-research-tab" data-stock-section="finance" onclick="switchStockSection(this)">财务指标</button>
-    </nav>
-    <div id="stockBasic"></div>
-    <div class="stock-chart-hint">K线操作：点击下方按钮调整范围；鼠标滚轮可缩放，按住左键可左右拖动，底部范围条也可以拉近或拉远。</div>
-    <div class="stock-chart-tools">
-      <button onclick="stockZoom('in')">＋ 放大</button><button onclick="stockZoom('out')">－ 缩小</button><button onclick="stockZoom('earlier')">← 查看更早</button><button onclick="stockZoom('latest')">回到最新 →</button><button onclick="stockZoom('all')">显示全部</button>
-    </div>
-    <section class="stock-chart-wrap"><div id="stockKline" class="chart" style="height:650px"></div></section>
-    <section class="stock-research-detail">
-      <div class="panel" id="stockDecisionPanel"><h3>买入/卖出风控模型</h3><div id="stockDecision"></div></div>
-      <div class="panel" id="stockFinancePanel"><h3>财务指标</h3><div id="stockFinance"></div></div>
-    </section>
-    <section class="panel stock-wide-detail" id="stockNewsPanel"><h3>事件与资料 <span class="tag tag-info">已纳入风控参考</span></h3><div id="stockNews"></div></section>
-    <section class="panel stock-wide-detail" id="stockPeersPanel"><h3>同行业对比</h3><div id="stockPeers"></div></section>
-  </div>
-</div>
 </main>
 
 <!-- Keep this version in sync with material dashboard fixes.  The paper
      workspace is entirely client-rendered, so a stable URL can leave browsers
      executing an old script after the HTML has changed. -->
-<script src="/app.js?v=20260904-risk-symbol-name-v6-settings-center-v1-cleanup-v1" defer></script>
+<script src="/app.js?v=20260904-stock-page-removed-v1" defer></script>
 </body>
 </html>
