@@ -818,7 +818,6 @@ def run_realtime_tuning(connect_factory, paper_db_path, snapshot_paths, config=N
                      json.dumps({"source": "DeepSeek", "confidence": item["confidence"], "evidence_hash": evidence_hash}, ensure_ascii=False),
                      candidate_status, "ai_realtime", item["reason"], now, now),
                 )
-                candidate_id = int(cursor.lastrowid)
             status = "applied" if applied_ids else ("shadow_proposal" if mode == "shadow" else "proposal_only")
             reason = (f"通过确定性门禁；应用{len(applied_ids)}/{len(proposals)}个模拟盘候选"
                       if auto_apply else "通过确定性门禁；仅保存候选，未同日应用")

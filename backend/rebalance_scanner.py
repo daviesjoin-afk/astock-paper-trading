@@ -331,7 +331,6 @@ def scan_positions_quality(conn, account_id, positions, quotes, factor_table=Non
 
         # 分析资金流趋势
         super_net = _num(quote.get("super_net"))
-        main_net = _num(quote.get("main_net"))
         fund_flow_trend = "inflow" if super_net > 0 else ("outflow" if super_net < 0 else "neutral")
 
         # 检查连续流出天数
