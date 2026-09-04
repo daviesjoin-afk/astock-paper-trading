@@ -1,7 +1,9 @@
 # -*- coding: utf-8 -*-
 """Single-run entry point for midday observation and post-close evolution."""
 import argparse
+import datetime as dt
 import json
+import sqlite3
 import time
 
 import adaptive_engine as adaptive
@@ -10,6 +12,46 @@ from resource_guard import heavy_job_lease
 
 MAX_ATTEMPTS = 3
 RETRY_DELAYS_SECONDS = (15, 45)
+
+
+def _scheduled_close_due(trigger):
+    """Apply the operator-configured minimum interval to scheduled close runs.
+
+    Manual runs remain available for diagnosis.  A skipped scheduled run is a
+    successful no-op so cron does not retry it as a failure.
+    """
+    if not str(trigger or "").startswith("scheduled"):
+        return True, None
+    interval = 24
+    try:
+        with sqlite3.connect(adaptive.PAPER_DB_PATH, timeout=5) as conn:
+            row = conn.execute(
+                "SELECT value FROM paper_runtime_settings WHERE key='evolution_interval_hours'"
+            ).fetchone()
+            if row:
+                interval = max(1, min(168, int(json.loads(row[0]))))
+    except Exception:
+        pass
+    try:
+        with adaptive._connect() as conn:
+            row = conn.execute(
+                "SELECT finished_at FROM adaptive_runs WHERE status='completed' ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+    except Exception:
+        row = None
+    if not row or not row[0]:
+        return True, None
+    try:
+        finished = dt.datetime.fromisoformat(str(row[0]).replace("Z", "+00:00"))
+        if finished.tzinfo is None:
+            finished = finished.replace(tzinfo=dt.timezone.utc)
+        now = dt.datetime.now(dt.timezone.utc)
+        elapsed = (now - finished.astimezone(dt.timezone.utc)).total_seconds() / 3600.0
+    except (TypeError, ValueError):
+        return True, None
+    if elapsed + 1e-9 < interval:
+        return False, {"interval_hours": interval, "elapsed_hours": round(elapsed, 2), "last_finished_at": row[0]}
+    return True, None
 
 
 def _latest_run_status(result):
@@ -94,6 +136,10 @@ def main():
     args = parser.parse_args()
     if args.session == "close":
         _warn_stale_heartbeat()
+        due, detail = _scheduled_close_due(args.trigger)
+        if not due:
+            print(json.dumps({"session": args.session, "status": "skipped_due_interval", "detail": detail}, ensure_ascii=False))
+            return 0
     if args.session == "midday":
         dispatch = lambda: adaptive.run_midday_observation(trigger=args.trigger)
     elif args.session == "midday-advisor":
