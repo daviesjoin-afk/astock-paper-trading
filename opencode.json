@@ -1,0 +1,6 @@
+{
+  "$schema": "https://<REDACTED_HOST>/config.json",
+  "skills": {
+    "paths": [".opencode/skills"]
+  }
+}

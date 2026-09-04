@@ -10,15 +10,10 @@ import sqlite3
 import statistics
 
 import strategies as S
+from strategy_registry import labels as strategy_labels
 from adaptive_common import _loads, _json, _clamp  # C3: 收敛重复工具函数
 
-ACCOUNT_NAMES = {
-    "tq_breakout": "短线日内做T",
-    "trend_pullback": "趋势波段优选",
-    "sector_rotation": "板块轮动先锋",
-    "reported_profit_breakout": "三日策略",
-    "main_force_top10": "超强主力股",
-}
+ACCOUNT_NAMES = strategy_labels()
 ACCOUNT_MODELS = {
     "tq_breakout": "one_to_two",
     "trend_pullback": "bottom_reversal",
@@ -725,8 +720,7 @@ def evaluate(conn, profile, config, paper_db_path, now_fn):
     try:
         accounts = [dict(row) for row in paper.execute(
             """SELECT * FROM paper_accounts
-               WHERE status!='disabled'
-                 AND id IN ('tq_breakout','trend_pullback','sector_rotation','reported_profit_breakout','main_force_top10')
+               WHERE id IN ('tq_breakout','trend_pullback','sector_rotation','reported_profit_breakout','main_force_top10')
                ORDER BY id"""
         )]
         for account in accounts:
@@ -748,11 +742,9 @@ def evaluate(conn, profile, config, paper_db_path, now_fn):
                     "baseline_params": {"hard_rule_locked": True},
                     "candidate_params": {"mode": "shadow_review_only", "hard_rule_locked": True},
                     "evidence": evidence, "status": "shadow_candidate", "tier": tier,
-                    "reason": (
-                        "三日策略已接入自进化证据与兑现复盘；利润披露、均线和证券范围硬条件保持锁定，仅生成影子建议"
-                        if account["id"] == "reported_profit_breakout" else
-                        "超强主力股已接入兑现复盘；每日10选3、资金确认与出货退出规则保持锁定，仅生成影子建议"
-                    ),
+                    "reason": ("三日策略已接入自进化证据与兑现复盘；利润披露、均线和证券范围硬条件保持锁定，仅生成影子建议"
+                               if account["id"] == "reported_profit_breakout" else
+                               "超强主力股已接入兑现复盘；每日10选3、资金确认与出货退出规则保持锁定，仅生成影子建议"),
                 }
                 candidate_ids.append(_upsert(conn, payload, now_fn()))
                 continue
@@ -848,7 +840,7 @@ def overview(conn, config, paper_db_path):
     if os.path.exists(paper_db_path):
         paper = _paper(paper_db_path)
         try:
-            for row in paper.execute("SELECT id,name,version,params FROM paper_accounts WHERE status!='disabled' ORDER BY id"):
+            for row in paper.execute("SELECT id,name,version,params FROM paper_accounts ORDER BY id"):
                 params = _loads(row["params"], {})
                 meta = params.get("adaptive_selection_meta") or {}
                 if meta.get("status") == "active":
@@ -872,7 +864,7 @@ def overview(conn, config, paper_db_path):
             paper.close()
     return {
         "mode": "模拟盘选股自动进化",
-        "policy": "启用的模拟账户可进化因子权重、入场阈值和白名单选股条件；结构变更先影子验证并人工确认，公共选股页面不受影响。",
+        "policy": "三套模拟账户可进化因子权重、入场阈值和白名单选股条件；板块热度不足时可提出个股强势路径，趋势模型可提出从抄底切换为趋势延续；结构变更先影子验证并人工确认，公共选股页面不受影响。",
         "auto_apply_bounded": bool(config.get("selection_auto_apply_bounded", False)),
         "requirements": _requirements(config, "shadow"),
         "tiers": {
