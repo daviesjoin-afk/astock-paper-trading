@@ -22,7 +22,7 @@ fi
 
 # This script is deliberately the native CentOS profile.  The Docker profile
 # has a different image, data directory, worker split and 3-minute scheduler;
-# it is deployed from /root/codex and must never be mixed with this service.
+# it is deployed from /opt/astock-codex and must never be mixed with this service.
 # Keep the historical default (native) for existing installations, but make
 # an accidental Docker invocation fail before packages or files are changed.
 DEPLOY_PROFILE="${ASTOCK_DEPLOY_PROFILE:-native-centos9}"

@@ -213,8 +213,8 @@ def compute_fundamental_factors(snapshot, finance, asof=None):
             if profit_source == "unknown" and annual_meta["profit_source"] != "unknown":
                 profit_source = annual_meta["profit_source"]
 
-        def _value(key, visible):
-            return f.get(key) if visible else np.nan
+        def _value(key, visible, _factor=f):
+            return _factor.get(key) if visible else np.nan
 
         pe = s.get("pe")
         pb = s.get("pb")

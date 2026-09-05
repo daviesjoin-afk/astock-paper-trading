@@ -19,6 +19,7 @@ _cache = {}
 _cache_ts = {}
 _cache_generation = {}
 _cache_inflight = {}
+MAX_CACHE_ENTRIES = 128
 
 
 def _current_cache_generation():
@@ -62,6 +63,11 @@ def _cset(key, val, *, generation=_CACHE_MISS):
     if generation is _CACHE_MISS:
         generation = _current_cache_generation()
     with _cache_lock:
+        if key not in _cache and len(_cache) >= MAX_CACHE_ENTRIES:
+            oldest_key = min(_cache, key=lambda item: _cache_ts.get(item, 0))
+            _cache.pop(oldest_key, None)
+            _cache_ts.pop(oldest_key, None)
+            _cache_generation.pop(oldest_key, None)
         _cache[key] = val
         _cache_ts[key] = time.time()
         _cache_generation[key] = generation
@@ -232,7 +238,7 @@ def risk_audit(
                 }
             return full
 
-        return _cache_load(cache_key, load_audit, ttl=15)
+        return _cache_load(cache_key, load_audit, ttl=30)
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Risk audit failed: {type(exc).__name__}") from exc
 
@@ -248,7 +254,9 @@ def strategy_center():
 @router.get("/reviews")
 def reviews():
     try:
-        return _call_with_retry(P.latest_reviews)
+        # 前端高频轮询的只读视图；与 overview 同代（ledger-generation 感知），
+        # 订单/风控变化会立即失效缓存，TTL 只限制无变化时的重复 DB 重建。
+        return _cache_load("reviews", lambda: _call_with_retry(P.latest_reviews), ttl=30)
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Reviews failed: {type(exc).__name__}") from exc
 
@@ -358,7 +366,7 @@ def configure(capital: float = Query(..., ge=1000, le=10_000_000)):
 
 
 @router.post("/start")
-def start(capital: float = Query(300000, ge=1000, le=10_000_000)):
+def start(capital: float | None = Query(None, ge=1000, le=10_000_000)):
     try:
         result = _call_with_retry(P.start_new_cycle, capital)
         _cclear()  # 新周期启动后立即刷新所有缓存视图
@@ -388,7 +396,7 @@ def resume():
 
 
 @router.post("/reset")
-def reset(capital: float = Query(300000, ge=1000, le=10_000_000)):
+def reset(capital: float | None = Query(None, ge=1000, le=10_000_000)):
     try:
         # include_dashboard=False：重置后立即返回，避免抓行情超时；前端 loadPaper 再拉 overview
         result = _call_with_retry(P.reset_cycle, capital, False)

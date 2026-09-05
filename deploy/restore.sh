@@ -6,13 +6,22 @@ if [[ "${1:-}" != "--confirm-restore" ]]; then
   exit 2
 fi
 BACKUP_DIR="${2:-}"
-APP_DIR="${APP_DIR:-/root/codex}"
+if [[ -n "${APP_DIR:-}" ]]; then
+  APP_DIR="$APP_DIR"
+elif [[ -d /opt/astock-codex/data_cache ]]; then
+  APP_DIR=/opt/astock-codex
+elif [[ -d /root/codex/data_cache ]]; then
+  APP_DIR=/root/codex
+else
+  echo "restore failed: 未找到项目目录（尝试过 APP_DIR、/opt/astock-codex、/root/codex）" >&2
+  exit 1
+fi
 [[ -n "$BACKUP_DIR" && -d "$BACKUP_DIR" ]] || { echo "备份目录不存在" >&2; exit 2; }
 [[ -f "$BACKUP_DIR/SHA256SUMS" ]] || { echo "缺少 SHA256SUMS" >&2; exit 2; }
 
 cd "$APP_DIR"
 docker compose -f docker-compose.server.yml ps >/dev/null
-PRE="/root/codex/backups/pre-restore-$(date +%Y%m%d-%H%M%S)"
+PRE="$APP_DIR/backups/pre-restore-$(date +%Y%m%d-%H%M%S)"
 mkdir -p "$PRE"
 cp -a data_cache "$PRE/data_cache"
 cp -a reports "$PRE/reports" 2>/dev/null || true
@@ -33,7 +42,16 @@ rollback() {
 trap rollback EXIT
 
 (cd "$BACKUP_DIR" && sha256sum -c SHA256SUMS)
-rsync -a --delete "$BACKUP_DIR/data_cache/" data_cache/
+# backup.sh 将 sqlite（gzip 压缩）与 data_cache 附属清单直接放在备份目录
+# 根部（而非 data_cache/ 子目录），这里按相同布局恢复：先解压再落入
+# data_cache，同时兼容历史未压缩的 .sqlite3 备份。
+mkdir -p data_cache
+for f in "$BACKUP_DIR"/*.sqlite3.gz "$BACKUP_DIR"/*.db.gz; do
+  [[ -f "$f" ]] && gunzip -c "$f" > "data_cache/$(basename "$f" .gz)"
+done
+for f in "$BACKUP_DIR"/*.sqlite3 "$BACKUP_DIR"/*.db "$BACKUP_DIR"/kline_manifest.json "$BACKUP_DIR"/universe.json; do
+  [[ -f "$f" ]] && cp -f "$f" data_cache/
+done
 [[ -d "$BACKUP_DIR/reports" ]] && rsync -a --delete "$BACKUP_DIR/reports/" reports/ || true
 docker compose -f docker-compose.server.yml up -d --build --no-deps astock astock-task-worker astock-data-worker
 curl -fsS --max-time 20 http://127.0.0.1:18600/api/health >/dev/null

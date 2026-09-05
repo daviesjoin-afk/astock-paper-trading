@@ -27,6 +27,7 @@ import selection_tracking as ST
 import metrics as MET
 from api_paper import risk_refresh_status, router as paper_router
 from api_adaptive import router as adaptive_router
+from api_settings import router as settings_router
 from resource_guard import heavy_job_lease
 
 FRONTEND = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "frontend")
@@ -452,6 +453,10 @@ def _warmup_caches():
 async def _lifespan(_app):
     # 启动阶段只加载应用代码：不扫描全市场 CSV、不拉财报/海外/全市场快照。
     # 这些工作改为用户触发功能时按需执行，避免双击启动占满 CPU、内存和网络。
+    # 初始化本地模拟盘账本（幂等且不请求行情）。读模型接口刻意不在每次
+    # 请求中调用 init_db()，因此必须在服务启动阶段为全新克隆创建基础表；
+    # 否则空数据卷会出现首页/风险页因 paper_jobs/paper_cycles 缺表而 500。
+    P.init_db()
     # 盘后自动补齐历史K线并重建选股因子；线程内部带交易日、幂等和
     # 失败重试门禁，不占用请求线程，也不会触碰下单/风控路径。
     # 架构重构（2026-08-19）：容器内 daemon 兜底线程默认关闭，消除"宿主
@@ -476,6 +481,7 @@ app.add_middleware(GZipMiddleware, minimum_size=256, compresslevel=9)
 app.mount("/assets", StaticFiles(directory=os.path.join(FRONTEND, "assets")), name="assets")
 app.include_router(paper_router)
 app.include_router(adaptive_router)
+app.include_router(settings_router)
 
 
 def _stock_code(code):
@@ -767,7 +773,6 @@ def health():
         "latest_trade_date": latest,
         "stale_calendar_days": stale_days,
         "init": U.get_init_state(),
-        "warnings": warnings,
     }
     _store_health_response(payload)
     return payload
@@ -1354,7 +1359,7 @@ def _select_uncached(
         )
     result["executable_count"] = sum(1 for p in result["picks"] if p["buy_decision"]["executable"])
     result["watchlist_count"] = sum(1 for p in result["picks"] if p["buy_decision"]["watchlist"])
-    result["board_filter"] = "净利润优先按最新一季报/半年报/三季报累计进度判断，缺失时回退最近年报；三套策略仅允许沪深主板和创业板，统一排除ST/退市风险、科创板及北交所；科创板只作同产业实时共振加分"
+    result["board_filter"] = "净利润优先按最新一季报/半年报/三季报累计进度判断，缺失时回退最近年报；公开研究策略仅允许沪深主板和创业板，统一排除ST/退市风险、科创板及北交所；科创板只作同产业实时共振加分"
     result["disclaimer"] = "选股结果经舆情否决+买入执行风控模型过滤：负面舆情一票否决，仅 T1/T2 为建议买入，T3 进入观察清单，T4/T5 不执行。仅供研究参考，不构成投资建议。"
     return result
 

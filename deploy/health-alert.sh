@@ -3,7 +3,7 @@
 # 输出 0=健康, 1=有告警；告警信息写日志供监控查看
 set -u
 
-LOG=/root/codex/reports/health-alert.log
+LOG=/opt/astock-codex/reports/health-alert.log
 ALERT=0
 
 log() { echo "$(date '+%Y-%m-%d %H:%M:%S') $*" >> "$LOG"; }
@@ -40,7 +40,7 @@ if [[ "$HTTP_CODE" != "200" ]]; then
 fi
 
 # 5. 数据库膨胀检查（交易库 > 200MB 视为异常膨胀）
-DB_SIZE=$(stat -c %s /root/codex/data_cache/paper_trading.sqlite3 2>/dev/null || echo 0)
+DB_SIZE=$(stat -c %s /opt/astock-codex/data_cache/paper_trading.sqlite3 2>/dev/null || echo 0)
 if [[ "$DB_SIZE" -gt 209715200 ]]; then
   log "[WARN] paper_trading.sqlite3 ${DB_SIZE}B > 200MB, need VACUUM"
   ALERT=1
@@ -49,8 +49,8 @@ fi
 # 6. 业务任务告警：scheduler 最近错误 / 连续 blocked（竞价失败、数据源故障等）
 # 注意：本段必须在 exit 之前执行——此前 exit 写在第 50 行，业务告警永远
 # 不会运行。
-RECENT_ERR=$(tail -400 /root/codex/reports/scheduler.log 2>/dev/null | grep -c '"error"')
-RECENT_BLOCKED=$(tail -400 /root/codex/reports/scheduler.log 2>/dev/null | grep -c 'blocked')
+RECENT_ERR=$(tail -400 /opt/astock-codex/reports/scheduler.log 2>/dev/null | grep -c '"error"')
+RECENT_BLOCKED=$(tail -400 /opt/astock-codex/reports/scheduler.log 2>/dev/null | grep -c 'blocked')
 if [[ "$RECENT_ERR" -gt 0 ]]; then
   log "[WARN] scheduler 最近 ${RECENT_ERR} 次任务错误"
   ALERT=1

@@ -9,7 +9,6 @@ creates orders and never connects to a broker.
 from __future__ import annotations
 
 import datetime as dt
-import json
 import math
 import os
 import sqlite3
@@ -20,7 +19,7 @@ from strategy_registry import labels as strategy_labels
 
 ACCOUNT_NAMES = {
     account_id: strategy_labels().get(account_id, account_id)
-    for account_id in ("tq_breakout", "trend_pullback", "sector_rotation")
+    for account_id in ("tq_breakout", "trend_pullback", "sector_rotation", "main_force_top10")
 }
 
 BASE_RISK = {
@@ -38,6 +37,13 @@ BASE_RISK = {
         "max_weight": 0.18, "max_exposure": 0.65, "max_industry": 0.45,
         "single_risk": 0.005, "daily_loss": 0.025, "drawdown": 0.085,
         "cooldown_days": 2, "min_cost_edge": 0.005,
+    },
+    # Active in the current five-strategy cycle.  Keep this overlay inside the
+    # adaptive bounds; the execution profile remains the stricter authority.
+    "main_force_top10": {
+        "max_weight": 0.22, "max_exposure": 0.78, "max_industry": 0.45,
+        "single_risk": 0.006, "daily_loss": 0.025, "drawdown": 0.100,
+        "cooldown_days": 2, "min_cost_edge": 0.006,
     },
 }
 
@@ -61,6 +67,11 @@ DOWNSIDE_BASE = {
         "downside_warning_pct": -2.5, "downside_partial_pct": -3.5,
         "downside_full_pct": -5.5, "downside_relative_pct": -3.0,
         "downside_peak_retrace_pct": 4.0, "downside_partial_ratio": 0.30,
+    },
+    "main_force_top10": {
+        "downside_warning_pct": -2.5, "downside_partial_pct": -3.5,
+        "downside_full_pct": -5.0, "downside_relative_pct": -3.0,
+        "downside_peak_retrace_pct": 4.5, "downside_partial_ratio": 0.30,
     },
 }
 

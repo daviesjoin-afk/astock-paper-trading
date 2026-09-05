@@ -328,7 +328,7 @@ def _metric_rows(conn, strategy):
 
 
 def _duplicate_picks(conn, max_days=60):
-    """按信号日聚合三套策略的重复入选股票。"""
+    """按信号日聚合五套策略的重复入选股票。"""
     rows = conn.execute(
         """
         SELECT p.id AS pick_id, r.run_date, r.strategy, r.strategy_name,

@@ -250,7 +250,6 @@ def run_analysis(connect_factory, paper_db_path, snapshot_paths, provider_module
         conn.execute("INSERT INTO adaptive_ai_analysis_runs(business_key,trade_date,analysis_window,scope,trigger,status,deterministic_status,evidence_hash,retries,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)", (business_key, trade_date, window, scope, str(trigger)[:80], "running", "pending", "pending", retries, created, created))
     snapshot = deterministic_snapshot(paper_db_path, snapshot_paths, window, scope)
     quality = snapshot["data_quality"]
-    base = {"snapshot": snapshot, "evidence_hash": snapshot["evidence_hash"], "window": window, "scope": scope}
     if quality != "valid":
         result = {"status": "skipped_data_quality", "missing_data": ["valid_live_snapshot"], "shadow_only": True}
         with connect_factory() as conn:

@@ -6,7 +6,7 @@
 | Profile | 服务/数据目录 | 调度文件 | 日内频率 | 入口 |
 | --- | --- | --- | --- | --- |
 | `native-centos9` | `/opt/astock-quant`，systemd `astock-quant` | `/etc/cron.d/astock-quant` | 5 分钟 | 本文的 `install-centos9.sh` |
-| `docker-compose-server` | `/root/codex`，`astock-codex`/worker 容器 | `/etc/cron.d/astock-codex` | 3 分钟 | `docker-compose.server.yml` + `astock-codex.cron` |
+| `docker-compose-server` | `/opt/astock-codex`，`astock-codex`/worker 容器 | `/etc/cron.d/astock-codex` | 3 分钟 | `docker-compose.server.yml` + `astock-codex.cron` |
 
 `install-centos9.sh` 只安装 `native-centos9`。它不会把原生 profile 变成 Docker
 profile，也不会改变 8600 端口的访问或鉴权方式。Docker profile 的 3 分钟调度必须
@@ -42,7 +42,7 @@ ASTOCK_DEPLOY_PROFILE=native-centos9 \
 确认从 Docker 迁移到原生 profile 时，先停止 Docker 服务并确认数据备份，再执行：
 
 ```bash
-cd /root/codex
+cd /opt/astock-codex
 docker compose -f docker-compose.server.yml down
 ASTOCK_DEPLOY_PROFILE=native-centos9 \
 ASTOCK_MIGRATE_DOCKER_TO_NATIVE=1 \
@@ -116,5 +116,5 @@ sudo journalctl -u astock-quant -f
 `data_cache`、模拟盘数据库或报告目录。更新前仍建议备份：
 
 ```bash
-sudo tar -C /opt/astock-quant -czf /root/astock-data-backup.tgz data_cache reports
+sudo tar -C /opt/astock-quant -czf /var/backups/astock-data-backup.tgz data_cache reports
 ```

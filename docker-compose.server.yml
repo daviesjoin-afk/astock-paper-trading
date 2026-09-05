@@ -9,7 +9,7 @@ services:
     ports:
       - "127.0.0.1:18600:8600"
     env_file:
-      - /root/.config/astock-codex/deepseek.env
+      - ${ASTOCK_ENV_FILE:-./.env.example}
     environment:
       ASTOCK_SCHEDULE_FILE: /app/deploy/astock-codex.cron
       # 主力股点火通道：仅在 +3.5%~+7.5% 区间内，经八项证据和快速
@@ -41,7 +41,7 @@ services:
     restart: unless-stopped
     command: ["sleep", "infinity"]
     env_file:
-      - /root/.config/astock-codex/deepseek.env
+      - ${ASTOCK_ENV_FILE:-./.env.example}
     environment:
       ASTOCK_CACHE_DIR: /app/data_cache
       ASTOCK_WORKER_HIGH_WATER_PCT: "88"
@@ -71,7 +71,7 @@ services:
     restart: unless-stopped
     command: ["python", "-u", "backend/adaptive_learning_worker.py"]
     env_file:
-      - /root/.config/astock-codex/deepseek.env
+      - ${ASTOCK_ENV_FILE:-./.env.example}
     environment:
       ASTOCK_CACHE_DIR: /app/data_cache
       ASTOCK_WORKER_HIGH_WATER_PCT: "84"
@@ -100,7 +100,7 @@ services:
     restart: unless-stopped
     command: ["sleep", "infinity"]
     env_file:
-      - /root/.config/astock-codex/deepseek.env
+      - ${ASTOCK_ENV_FILE:-./.env.example}
     environment:
       ASTOCK_CACHE_DIR: /app/data_cache
       ASTOCK_WORKER_HIGH_WATER_PCT: "84"

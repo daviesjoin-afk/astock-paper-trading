@@ -1,69 +1,73 @@
 SHELL=/bin/bash
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin
-HOME=/root/codex
+HOME=/opt/astock-codex
 
 # One-shot paper/news/adaptive processes run in astock-task-worker.  Keep the
 # API container for HTTP/read paths; do not docker-exec heavy Python modules
 # into astock-codex, otherwise concurrent imports can exhaust its cgroup.
 
 # A股集合竞价预选：只采集09:25快照；不使用09:15-09:20可撤单阶段数据。
-25 9 * * 1-5 root flock -n /root/codex/.locks/auction.lock /root/codex/deploy/run_paper_slot.sh auction >>/root/codex/reports/scheduler.log 2>&1
+25 9 * * 1-5 root flock -n /opt/astock-codex/.locks/auction.lock /opt/astock-codex/deploy/run_paper_slot.sh auction >>/opt/astock-codex/reports/scheduler.log 2>&1
 # 竞价任务失败才自动重试；成功任务会被 run_slot 幂等跳过。
-27 9 * * 1-5 root flock -n /root/codex/.locks/auction.lock /root/codex/deploy/run_paper_slot.sh auction >>/root/codex/reports/scheduler.log 2>&1
-29 9 * * 1-5 root flock -n /root/codex/.locks/auction.lock /root/codex/deploy/run_paper_slot.sh auction >>/root/codex/reports/scheduler.log 2>&1
+27 9 * * 1-5 root flock -n /opt/astock-codex/.locks/auction.lock /opt/astock-codex/deploy/run_paper_slot.sh auction >>/opt/astock-codex/reports/scheduler.log 2>&1
+29 9 * * 1-5 root flock -n /opt/astock-codex/.locks/auction.lock /opt/astock-codex/deploy/run_paper_slot.sh auction >>/opt/astock-codex/reports/scheduler.log 2>&1
 
 # A股交易日内监控：09:30-11:25、13:00-14:55，每3分钟一次；开市首分钟只扫描。
-33-59/3 9 * * 1-5 root flock -n /root/codex/.locks/intraday.lock /root/codex/deploy/run_paper_slot.sh intraday >>/root/codex/reports/scheduler.log 2>&1
-*/3 10 * * 1-5 root flock -n /root/codex/.locks/intraday.lock /root/codex/deploy/run_paper_slot.sh intraday >>/root/codex/reports/scheduler.log 2>&1
-0-25/3 11 * * 1-5 root flock -n /root/codex/.locks/intraday.lock /root/codex/deploy/run_paper_slot.sh intraday >>/root/codex/reports/scheduler.log 2>&1
-0-55/3 13 * * 1-5 root flock -n /root/codex/.locks/intraday.lock /root/codex/deploy/run_paper_slot.sh intraday >>/root/codex/reports/scheduler.log 2>&1
-*/3 14 * * 1-5 root flock -n /root/codex/.locks/intraday.lock /root/codex/deploy/run_paper_slot.sh intraday >>/root/codex/reports/scheduler.log 2>&1
+33-59/3 9 * * 1-5 root flock -n /opt/astock-codex/.locks/intraday.lock /opt/astock-codex/deploy/run_paper_slot.sh intraday >>/opt/astock-codex/reports/scheduler.log 2>&1
+*/3 10 * * 1-5 root flock -n /opt/astock-codex/.locks/intraday.lock /opt/astock-codex/deploy/run_paper_slot.sh intraday >>/opt/astock-codex/reports/scheduler.log 2>&1
+0-25/3 11 * * 1-5 root flock -n /opt/astock-codex/.locks/intraday.lock /opt/astock-codex/deploy/run_paper_slot.sh intraday >>/opt/astock-codex/reports/scheduler.log 2>&1
+0-55/3 13 * * 1-5 root flock -n /opt/astock-codex/.locks/intraday.lock /opt/astock-codex/deploy/run_paper_slot.sh intraday >>/opt/astock-codex/reports/scheduler.log 2>&1
+*/3 14 * * 1-5 root flock -n /opt/astock-codex/.locks/intraday.lock /opt/astock-codex/deploy/run_paper_slot.sh intraday >>/opt/astock-codex/reports/scheduler.log 2>&1
 
-31 9 * * 1-5 root flock -n /root/codex/.locks/open.lock /root/codex/deploy/run_paper_slot.sh open >>/root/codex/reports/scheduler.log 2>&1
+31 9 * * 1-5 root flock -n /opt/astock-codex/.locks/open.lock /opt/astock-codex/deploy/run_paper_slot.sh open >>/opt/astock-codex/reports/scheduler.log 2>&1
 # 开盘审批与盘后因子失败时的单次兜底；已完成的日任务不会重复执行。
-33 9 * * 1-5 root flock -n /root/codex/.locks/open.lock /root/codex/deploy/run_paper_slot.sh open >>/root/codex/reports/scheduler.log 2>&1
-35 9 * * 1-5 root flock -n /root/codex/.locks/open.lock /root/codex/deploy/run_paper_slot.sh open >>/root/codex/reports/scheduler.log 2>&1
+33 9 * * 1-5 root flock -n /opt/astock-codex/.locks/open.lock /opt/astock-codex/deploy/run_paper_slot.sh open >>/opt/astock-codex/reports/scheduler.log 2>&1
+35 9 * * 1-5 root flock -n /opt/astock-codex/.locks/open.lock /opt/astock-codex/deploy/run_paper_slot.sh open >>/opt/astock-codex/reports/scheduler.log 2>&1
 # 14:50 风控已由同一分钟的日内监控统一执行，避免重复确认和重复卖出。
-5 15 * * 1-5 root flock -n /root/codex/.locks/close.lock /root/codex/deploy/run_paper_slot.sh close >>/root/codex/reports/scheduler.log 2>&1
-10 15 * * 1-5 root flock -n /root/codex/.locks/close.lock /root/codex/deploy/run_paper_slot.sh close >>/root/codex/reports/scheduler.log 2>&1
-12 15 * * 1-5 root flock -n /root/codex/.locks/close.lock /root/codex/deploy/run_paper_slot.sh close >>/root/codex/reports/scheduler.log 2>&1
-20 15 * * 5 root flock -n /root/codex/.locks/review.lock docker exec astock-task-worker python backend/paper_runner.py --slot weekly-review >>/root/codex/reports/scheduler.log 2>&1
+5 15 * * 1-5 root flock -n /opt/astock-codex/.locks/close.lock /opt/astock-codex/deploy/run_paper_slot.sh close >>/opt/astock-codex/reports/scheduler.log 2>&1
+10 15 * * 1-5 root flock -n /opt/astock-codex/.locks/close.lock /opt/astock-codex/deploy/run_paper_slot.sh close >>/opt/astock-codex/reports/scheduler.log 2>&1
+12 15 * * 1-5 root flock -n /opt/astock-codex/.locks/close.lock /opt/astock-codex/deploy/run_paper_slot.sh close >>/opt/astock-codex/reports/scheduler.log 2>&1
+20 15 * * 5 root flock -n /opt/astock-codex/.locks/review.lock docker exec astock-task-worker python backend/paper_runner.py --slot weekly-review >>/opt/astock-codex/reports/scheduler.log 2>&1
 
 # 每日收盘后固化三套策略候选并跟踪前期快照。
 # 盘后行情源可能晚于 16:15 才固化。失败时同一 runner 会保留上一份
 # 有效结果；16:45、17:15 仅补齐完整前复权日K并重新生成次日候选。
-45 15 * * 1-5 root flock -n /root/codex/.locks/resource-heavy.lock docker exec astock-data-worker python backend/selection_runner.py --slot daily >>/root/codex/reports/selection-scheduler.log 2>&1
-15 16 * * 1-5 root flock -n /root/codex/.locks/resource-heavy.lock docker exec astock-data-worker python backend/selection_runner.py --slot daily >>/root/codex/reports/selection-scheduler.log 2>&1
-45 16 * * 1-5 root flock -n /root/codex/.locks/resource-heavy.lock docker exec astock-data-worker python backend/selection_runner.py --slot daily >>/root/codex/reports/selection-scheduler.log 2>&1
-15 17 * * 1-5 root flock -n /root/codex/.locks/resource-heavy.lock docker exec astock-data-worker python backend/selection_runner.py --slot daily >>/root/codex/reports/selection-scheduler.log 2>&1
+45 15 * * 1-5 root flock -n /opt/astock-codex/.locks/resource-heavy.lock docker exec astock-data-worker python backend/selection_runner.py --slot daily >>/opt/astock-codex/reports/selection-scheduler.log 2>&1
+15 16 * * 1-5 root flock -n /opt/astock-codex/.locks/resource-heavy.lock docker exec astock-data-worker python backend/selection_runner.py --slot daily >>/opt/astock-codex/reports/selection-scheduler.log 2>&1
+45 16 * * 1-5 root flock -n /opt/astock-codex/.locks/resource-heavy.lock docker exec astock-data-worker python backend/selection_runner.py --slot daily >>/opt/astock-codex/reports/selection-scheduler.log 2>&1
+15 17 * * 1-5 root flock -n /opt/astock-codex/.locks/resource-heavy.lock docker exec astock-data-worker python backend/selection_runner.py --slot daily >>/opt/astock-codex/reports/selection-scheduler.log 2>&1
 
 # K线恢复队列：每日收盘后持续补齐整市场的完整日线。任务只修复数据，
 # 不生成信号、不下单；网络源临时失败会退避并在下一轮续传。
-20,35,50 15 * * 1-5 root flock -n /root/codex/.locks/resource-heavy.lock docker exec astock-data-worker python backend/history_recovery_runner.py --workers 2 --max-seconds 780 >>/root/codex/reports/history-recovery.log 2>&1
-5,20,35,50 16-22 * * 1-5 root flock -n /root/codex/.locks/resource-heavy.lock docker exec astock-data-worker python backend/history_recovery_runner.py --workers 2 --max-seconds 780 >>/root/codex/reports/history-recovery.log 2>&1
+20,35,50 15 * * 1-5 root flock -n /opt/astock-codex/.locks/resource-heavy.lock docker exec astock-data-worker python backend/history_recovery_runner.py --workers 2 --max-seconds 780 >>/opt/astock-codex/reports/history-recovery.log 2>&1
+5,20,35,50 16-22 * * 1-5 root flock -n /opt/astock-codex/.locks/resource-heavy.lock docker exec astock-data-worker python backend/history_recovery_runner.py --workers 2 --max-seconds 780 >>/opt/astock-codex/reports/history-recovery.log 2>&1
 # 首个全量恢复期不要止步于 22:00：盘后到次日盘前继续跑，确保最新完整
 # 交易日的 5,000+ 根增量 K 线能在下一次开盘前补齐。锁保证同一时刻只跑一轮。
-5,20,35,50 23,0-8 * * 1-5 root flock -n /root/codex/.locks/resource-heavy.lock docker exec astock-data-worker python backend/history_recovery_runner.py --workers 2 --max-seconds 780 >>/root/codex/reports/history-recovery.log 2>&1
+5,20,35,50 23,0-8 * * 1-5 root flock -n /opt/astock-codex/.locks/resource-heavy.lock docker exec astock-data-worker python backend/history_recovery_runner.py --workers 2 --max-seconds 780 >>/opt/astock-codex/reports/history-recovery.log 2>&1
 
 # 候选池新闻与全市场重大事件雷达：盘前、午间、盘后各一次。
-15 8 * * 1-5 root flock -n /root/codex/.locks/news-learning.lock docker exec astock-task-worker python backend/news_runner.py --slot premarket >>/root/codex/reports/news-learning-scheduler.log 2>&1
-15 12 * * 1-5 root flock -n /root/codex/.locks/news-learning.lock docker exec astock-task-worker python backend/news_runner.py --slot noon >>/root/codex/reports/news-learning-scheduler.log 2>&1
-45 18 * * 1-5 root flock -n /root/codex/.locks/news-learning.lock docker exec astock-task-worker python backend/news_runner.py --slot after-close >>/root/codex/reports/news-learning-scheduler.log 2>&1
+15 8 * * 1-5 root flock -n /opt/astock-codex/.locks/news-learning.lock docker exec astock-task-worker python backend/news_runner.py --slot premarket >>/opt/astock-codex/reports/news-learning-scheduler.log 2>&1
+15 12 * * 1-5 root flock -n /opt/astock-codex/.locks/news-learning.lock docker exec astock-task-worker python backend/news_runner.py --slot noon >>/opt/astock-codex/reports/news-learning-scheduler.log 2>&1
+45 18 * * 1-5 root flock -n /opt/astock-codex/.locks/news-learning.lock docker exec astock-task-worker python backend/news_runner.py --slot after-close >>/opt/astock-codex/reports/news-learning-scheduler.log 2>&1
 
 # 午间自进化观测：只保存盘中画像，不把未收盘数据混入奖励或调参。
-5 12 * * 1-5 root flock -n /root/codex/.locks/adaptive.lock docker exec astock-task-worker python backend/adaptive_runner.py --session midday --trigger scheduled-midday >>/root/codex/reports/adaptive-scheduler.log 2>&1
+5 12 * * 1-5 root flock -n /opt/astock-codex/.locks/adaptive.lock docker exec astock-task-worker python backend/adaptive_runner.py --session midday --trigger scheduled-midday >>/opt/astock-codex/reports/adaptive-scheduler.log 2>&1
 
 # 午间 DP 快速影子通道：异步审阅最新观测与候选，不阻塞实时扫描，不写入参数或订单。
-20 12 * * 1-5 root flock -n /root/codex/.locks/adaptive-dp.lock docker exec astock-task-worker python backend/adaptive_runner.py --session midday-advisor --trigger scheduled-midday-dp >>/root/codex/reports/adaptive-scheduler.log 2>&1
+20 12 * * 1-5 root flock -n /opt/astock-codex/.locks/adaptive-dp.lock docker exec astock-task-worker python backend/adaptive_runner.py --session midday-advisor --trigger scheduled-midday-dp >>/opt/astock-codex/reports/adaptive-scheduler.log 2>&1
 
 # 15:15 收盘快照确认：强制刷新全市场行情，仅采集数据，不下单、不改参数。
-15 15 * * 1-5 root flock -n /root/codex/.locks/resource-heavy.lock docker exec astock-data-worker python backend/close_snapshot_runner.py >>/root/codex/reports/close-snapshot-scheduler.log 2>&1
+15 15 * * 1-5 root flock -n /opt/astock-codex/.locks/resource-heavy.lock docker exec astock-data-worker python backend/close_snapshot_runner.py >>/opt/astock-codex/reports/close-snapshot-scheduler.log 2>&1
 
 # 盘后自进化：使用完整收盘数据更新盘面画像、多周期奖励与 Bandit 影子权重，不改实盘、不下单。
-35 15 * * 1-5 root flock -n /root/codex/.locks/adaptive-close.lock docker exec astock-task-worker python backend/adaptive_runner.py --trigger scheduled-close >>/root/codex/reports/adaptive-scheduler.log 2>&1
+35 15 * * 1-5 root flock -n /opt/astock-codex/.locks/adaptive-close.lock docker exec astock-task-worker python backend/adaptive_runner.py --trigger scheduled-close >>/opt/astock-codex/reports/adaptive-scheduler.log 2>&1
 # 若15:35与历史恢复抢占同一资源锁，延后重试，避免成熟奖励长期停在旧值。
-55 15 * * 1-5 root flock -n /root/codex/.locks/adaptive-close.lock docker exec astock-task-worker python backend/adaptive_runner.py --trigger scheduled-close-retry >>/root/codex/reports/adaptive-scheduler.log 2>&1
-15 16 * * 1-5 root flock -n /root/codex/.locks/adaptive-close.lock docker exec astock-task-worker python backend/adaptive_runner.py --trigger scheduled-close-retry-2 >>/root/codex/reports/adaptive-scheduler.log 2>&1
+55 15 * * 1-5 root flock -n /opt/astock-codex/.locks/adaptive-close.lock docker exec astock-task-worker python backend/adaptive_runner.py --trigger scheduled-close-retry >>/opt/astock-codex/reports/adaptive-scheduler.log 2>&1
+15 16 * * 1-5 root flock -n /opt/astock-codex/.locks/adaptive-close.lock docker exec astock-task-worker python backend/adaptive_runner.py --trigger scheduled-close-retry-2 >>/opt/astock-codex/reports/adaptive-scheduler.log 2>&1
 
 # weekly selection alpha validation (fix6 2026-08-28)
-31 15 * * 5 root flock -n /root/codex/.locks/resource-heavy.lock docker exec astock-task-worker python backend/selection_alpha_report.py >>/root/codex/reports/selection-alpha.log 2>&1
+31 15 * * 5 root flock -n /opt/astock-codex/.locks/resource-heavy.lock docker exec astock-task-worker python backend/selection_alpha_report.py >>/opt/astock-codex/reports/selection-alpha.log 2>&1
+
+# 每日自动备份（2026-09-04 排查确认此前从未有备份任务；sqlite 在线备份不锁库）。
+# backup.sh 自带路径探测（/opt/astock-codex 或 /root/codex）与清单自校验。
+10 20 * * * root flock -n /opt/astock-codex/.locks/backup.lock /opt/astock-codex/deploy/backup.sh --keep 7 >>/opt/astock-codex/reports/backup.log 2>&1

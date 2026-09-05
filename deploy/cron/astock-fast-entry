@@ -3,4 +3,4 @@ PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin
 
 # 每分钟两次（间隔30秒）快速观察；共享 paper-scan.lock，绝不与全量
 # 三分钟扫描并发导入同一策略栈。
-* 9-14 * * 1-5 root flock -n /root/codex/.locks/fast-entry.lock sh -c '/root/codex/deploy/run_paper_slot.sh fast-entry; sleep 30; /root/codex/deploy/run_paper_slot.sh fast-entry' >> /var/log/astock-fast-entry.log 2>&1
+* 9-14 * * 1-5 root flock -n /opt/astock-codex/.locks/fast-entry.lock sh -c '/opt/astock-codex/deploy/run_paper_slot.sh fast-entry; sleep 30; /opt/astock-codex/deploy/run_paper_slot.sh fast-entry' >> /var/log/astock-fast-entry.log 2>&1

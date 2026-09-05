@@ -18,6 +18,12 @@ except ImportError:  # pragma: no cover - exercised only on Windows.
     _fcntl = None
 
 
+# Provider keys include code/date combinations and can grow without bound in
+# a long-lived API process.  Keep the hot in-process cache small; disk snapshots
+# remain the durable source for larger reads.
+MAX_CACHE_ENTRIES = 128
+
+
 def cached(cache, lock, key, ttl, fn):
     """读取带 TTL 的内存缓存；空结果不写入，避免失败污染。"""
     now = time.time()
@@ -27,6 +33,9 @@ def cached(cache, lock, key, ttl, fn):
     value = fn()
     if value:
         with lock:
+            if key not in cache and len(cache) >= MAX_CACHE_ENTRIES:
+                oldest_key = min(cache, key=lambda item: cache[item][0])
+                cache.pop(oldest_key, None)
             cache[key] = (now, value)
     return value
 
