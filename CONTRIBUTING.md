@@ -5,10 +5,11 @@
 ## 开发流程
 
 1. 从 `master` 创建短分支，说明要解决的问题。
-2. 在 Python 3.11 或 3.12 环境安装 `requirements.txt`。
+2. 在 Python 3.11 或 3.12 环境安装 `requirements.lock`；`requirements.txt` 仅用于维护允许的版本范围。
 3. 运行 `python -m unittest discover -s backend -p "test_*.py" -v`。
-4. 对策略、撮合或风控改动补充回归测试，并在 PR 中说明数据假设和风险边界。
-5. 不提交 `data_cache/`、`reports/`、`.env`、日志、运行时数据库或任何凭据。
+4. 运行 `ruff check backend` 和 `pip-audit --requirement requirements.lock --strict`；修改依赖后用仓库约定的 uv 命令重新生成锁文件。
+5. 对策略、撮合或风控改动补充回归测试，并在 PR 中说明数据假设和风险边界。
+6. 不提交 `data_cache/`、`reports/`、`.env`、日志、运行时数据库或任何凭据。
 
 ## 交易安全边界
 

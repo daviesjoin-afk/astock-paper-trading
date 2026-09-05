@@ -15,7 +15,7 @@
 git clone <本仓库地址> astock-paper-trading && cd astock-paper-trading
 python -m venv .venv
 source .venv/bin/activate        # Windows: .venv\Scripts\activate
-pip install -r requirements.txt
+pip install -r requirements.lock
 ```
 
 可选：`cp .env.example .env` 后按需填写（见下）。不设 `.env` 也能以基础模式运行。

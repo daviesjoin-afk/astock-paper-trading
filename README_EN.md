@@ -105,7 +105,7 @@ For the complete clone → dependency install → dashboard → data bootstrap �
 ```bash
 python -m venv .venv
 # Activate the virtual environment for your platform
-python -m pip install -r requirements.txt
+python -m pip install -r requirements.lock
 
 python -m uvicorn backend.main:app --port 8600
 python -m unittest discover -s backend -p "test_*.py" -v
@@ -151,6 +151,8 @@ The base engine does not require an LLM. Optional advisory/observation features 
 LLM-assisted observations are kept separate from the formal paper-execution path and are not treated as guaranteed trading signals.
 
 ## Security and privacy boundary
+
+Report vulnerabilities through [GitHub private vulnerability reporting](https://github.com/daviesjoin-afk/astock-paper-trading/security/advisories/new). Do not place sensitive reproduction details in a public issue.
 
 This repository intentionally excludes:
 
