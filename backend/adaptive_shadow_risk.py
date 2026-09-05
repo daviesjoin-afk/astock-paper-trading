@@ -37,10 +37,10 @@ def shadow_history_rows(history, *, num=None):
     rows = []
     for item in history:
         if isinstance(item, dict):
-            def pick(*keys, _item=item):
+            def pick(*keys):
                 for key in keys:
-                    if key in _item:
-                        value = num(_item.get(key), None)
+                    if key in item:
+                        value = num(item.get(key), None)
                         if value is not None:
                             return value
                 return None
