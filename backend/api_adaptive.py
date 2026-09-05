@@ -20,6 +20,7 @@ router = APIRouter(prefix="/api/adaptive", tags=["adaptive-learning"])
 # path without maintaining a dead second namespace.
 _cache = {}
 _cache_ts = {}
+MAX_CACHE_ENTRIES = 64
 
 def _cache_get(key, ttl=30):
     import time as _t
@@ -29,6 +30,10 @@ def _cache_get(key, ttl=30):
 
 def _cache_set(key, value):
     import time as _t
+    if key not in _cache and len(_cache) >= MAX_CACHE_ENTRIES:
+        oldest_key = min(_cache, key=lambda item: _cache_ts.get(item, 0))
+        _cache.pop(oldest_key, None)
+        _cache_ts.pop(oldest_key, None)
     _cache[key] = value
     _cache_ts[key] = _t.time()
 
@@ -169,7 +174,6 @@ def overview():
     with _overview_lock:
         data = _overview_cache["data"]
         fresh = data is not None and now - _overview_cache["ts"] < _OVERVIEW_TTL_SECONDS
-        running = bool(_overview_cache["running"])
         error = _overview_cache["error"]
     if fresh:
         return data
@@ -338,7 +342,7 @@ def run_ai_tuning(
     mode: str = Query("intraday", max_length=30),
     confirmed: bool = Query(False),
 ):
-    """Run the bounded DeepSeek tuner for the three paper accounts only."""
+    """Run the bounded DeepSeek tuner for the five paper accounts only."""
     if mode not in {"intraday", "close", "shadow"}:
         raise HTTPException(status_code=422, detail="调参模式只支持 intraday、close 或 shadow")
     _require_confirmation(confirmed, "运行 AI 有界调参")

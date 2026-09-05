@@ -3,9 +3,6 @@
 
 将 paper_trading.xxx 的调用重定向到 paper_trading 包。
 """
-import sys
-import importlib
-
 # 确保 paper_trading 包可以被导入
 try:
     import paper_trading

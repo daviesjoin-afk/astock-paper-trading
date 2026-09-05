@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 """模拟盘策略身份注册表。
 
-策略状态只描述公开运行口径，不自动启用或删除任何账户。新周期当前只
-启用两套策略；历史策略保留给审计、研究和回放使用。
+策略状态只描述公开运行口径，不自动启用或删除任何账户。五套注册策略
+均正常参与新周期；历史成交仍保留给审计、研究和回放使用。
 """
 from __future__ import annotations
 
@@ -19,9 +19,9 @@ class StrategySpec:
 
 STRATEGY_REGISTRY = (
     StrategySpec("tq_breakout", "短线日内做T", "active", True),
-    StrategySpec("trend_pullback", "趋势波段优选", "legacy", False),
-    StrategySpec("sector_rotation", "板块轮动先锋", "legacy", False),
-    StrategySpec("reported_profit_breakout", "三日策略", "legacy", False),
+    StrategySpec("trend_pullback", "趋势波段优选", "active", True),
+    StrategySpec("sector_rotation", "板块轮动先锋", "active", True),
+    StrategySpec("reported_profit_breakout", "三日策略", "active", True),
     StrategySpec("main_force_top10", "超强主力股", "active", True),
 )
 
