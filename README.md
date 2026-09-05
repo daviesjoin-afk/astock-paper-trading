@@ -150,7 +150,7 @@ chmod +x start.sh
 ```bash
 python -m venv .venv
 # 激活对应平台的虚拟环境后：
-python -m pip install -r requirements.txt
+python -m pip install -r requirements.lock
 
 python -m uvicorn backend.main:app --port 8600
 python -m unittest discover -s backend -p "test_*.py" -v
@@ -163,7 +163,9 @@ cd backend
 python paper_runner.py --slot open
 ```
 
-GitHub Actions 会在 **Python 3.11 / 3.12** 上执行后端回归测试。测试覆盖撮合门禁、point-in-time 数据、行情新鲜度、风险审计、并发租约、策略入场、共享资金与回放相关行为。
+`requirements.txt` 声明允许的依赖范围，`requirements.lock` 固定可复现安装版本。修改依赖范围后必须重新生成并提交锁文件。
+
+GitHub Actions 会在 **Python 3.11 / 3.12** 上安装锁定依赖并执行后端回归，同时运行 Ruff 静态检查、锁文件一致性检查、pip-audit 已知漏洞审计、前端语法检查和 Docker 冒烟。测试覆盖撮合门禁、point-in-time 数据、行情新鲜度、风险审计、并发租约、策略入场、共享资金与回放相关行为。
 
 ## Docker
 
@@ -198,7 +200,7 @@ Docker 使用仓库专用命名卷，不会自动连接其他实例的私有运�
 - [#2 设计可插拔策略接口与策略回放规范](https://github.com/daviesjoin-afk/astock-paper-trading/issues/2)
 - [#3 补充回测、纸面撮合与审计回放验证](https://github.com/daviesjoin-afk/astock-paper-trading/issues/3)
 
-提交代码前请阅读 [`CONTRIBUTING.md`](CONTRIBUTING.md)。版本变化见 [`CHANGELOG.md`](CHANGELOG.md) 和 [GitHub Releases](https://github.com/daviesjoin-afk/astock-paper-trading/releases)。
+提交代码前请阅读 [`CONTRIBUTING.md`](CONTRIBUTING.md)。版本变化见 [`CHANGELOG.md`](CHANGELOG.md) 和 [GitHub Releases](https://github.com/daviesjoin-afk/astock-paper-trading/releases)。安全问题请通过 [私密漏洞报告](https://github.com/daviesjoin-afk/astock-paper-trading/security/advisories/new) 提交，不要公开包含敏感信息的复现材料。
 
 ## 可选 LLM 研究能力
 
