@@ -169,3 +169,9 @@ This project is research infrastructure for **simulated trading only**. Market d
 ## License
 
 MIT. See [`LICENSE`](LICENSE).
+
+## Release and deployment status
+
+Current release: **v1.1.0**. See [release notes](docs/RELEASE-v1.1.0.md) and [security boundaries](SECURITY.md). CI covers Python 3.11/3.12. The historical API version 2.0.0 is not the release tag.
+
+The local Compose mapping `8600:8600` binds all interfaces. Use `127.0.0.1:8600:8600` for local access. Built-in authentication is incomplete; remote deployments require access controls and authentication. `confirmed=true` is not authentication.
