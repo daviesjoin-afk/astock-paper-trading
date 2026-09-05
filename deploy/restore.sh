@@ -1,59 +1,90 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
-
-if [[ "${1:-}" != "--confirm-restore" ]]; then
-  echo "用法: $0 --confirm-restore <backup-dir>" >&2
-  exit 2
+[[ "${1:-}" == --confirm-restore ]] || { echo '用法: restore.sh --confirm-restore <backup-dir>' >&2; exit 2; }
+BACKUP_DIR=$(realpath -e "${2:?缺少备份目录}")
+if [[ -z "${APP_DIR:-}" ]]; then
+  if [[ -d /opt/astock-codex/data_cache ]]; then APP_DIR=/opt/astock-codex; else APP_DIR=/root/codex; fi
 fi
-BACKUP_DIR="${2:-}"
-if [[ -n "${APP_DIR:-}" ]]; then
-  APP_DIR="$APP_DIR"
-elif [[ -d /opt/astock-codex/data_cache ]]; then
-  APP_DIR=/opt/astock-codex
-elif [[ -d /root/codex/data_cache ]]; then
-  APP_DIR=/root/codex
-else
-  echo "restore failed: 未找到项目目录（尝试过 APP_DIR、/opt/astock-codex、/root/codex）" >&2
-  exit 1
-fi
-[[ -n "$BACKUP_DIR" && -d "$BACKUP_DIR" ]] || { echo "备份目录不存在" >&2; exit 2; }
-[[ -f "$BACKUP_DIR/SHA256SUMS" ]] || { echo "缺少 SHA256SUMS" >&2; exit 2; }
-
+APP_DIR=$(realpath -e "$APP_DIR")
+[[ "$APP_DIR" != / && -d "$APP_DIR/data_cache" ]] || exit 2
 cd "$APP_DIR"
-docker compose -f docker-compose.server.yml ps >/dev/null
-PRE="$APP_DIR/backups/pre-restore-$(date +%Y%m%d-%H%M%S)"
-mkdir -p "$PRE"
-cp -a data_cache "$PRE/data_cache"
-cp -a reports "$PRE/reports" 2>/dev/null || true
-cp -a docker-compose.server.yml Dockerfile .dockerignore "$PRE/"
+mkdir -p .locks
+exec 9>.locks/restore.lock
+flock -n 9 || exit 2
 
-rollback() {
+# Validate and stage before stopping services or touching live databases.
+[[ -s "$BACKUP_DIR/SHA256SUMS" ]] || exit 2
+(cd "$BACKUP_DIR" && sha256sum -c SHA256SUMS)
+PRE=$(mktemp -d "$APP_DIR/backups-restore-XXXXXXXX")
+mkdir "$PRE/staged" "$PRE/original"
+FILES=()
+for name in paper_trading.sqlite3 adaptive_learning.sqlite3 paper_research.sqlite3 selection_tracking.db; do
+  if [[ -f "$BACKUP_DIR/$name.gz" ]]; then
+    gzip -dc "$BACKUP_DIR/$name.gz" > "$PRE/staged/$name"
+  elif [[ -f "$BACKUP_DIR/$name" ]]; then
+    cp "$BACKUP_DIR/$name" "$PRE/staged/$name"
+  else
+    continue
+  fi
+  [[ "$(sqlite3 "$PRE/staged/$name" 'PRAGMA integrity_check;')" == ok ]] || exit 2
+  FILES+=("$name")
+done
+[[ ${#FILES[@]} -gt 0 ]] || { echo '没有可恢复数据库' >&2; exit 2; }
+COMPOSE=(docker compose -f docker-compose.server.yml)
+running=$("${COMPOSE[@]}" ps --status running --services)
+[[ -n "$running" ]] || { echo '没有运行中的服务，请使用离线恢复流程' >&2; exit 2; }
+mapfile -t RUNNING <<< "$running"
+STOPPED=0
+MODIFIED=0
+recover() {
   rc=$?
-  [[ "$rc" -eq 0 ]] && return
-  echo "恢复或健康检查失败，自动回滚到 $PRE" >&2
-  rm -rf data_cache
-  cp -a "$PRE/data_cache" data_cache
-  rm -rf reports
-  [[ -d "$PRE/reports" ]] && cp -a "$PRE/reports" reports
-  docker compose -f docker-compose.server.yml up -d --no-build --no-deps astock astock-task-worker astock-data-worker >/dev/null || true
-  curl -fsS --max-time 10 http://127.0.0.1:18600/api/health >/dev/null || true
+  trap - EXIT
+  if (( rc != 0 && MODIFIED )); then
+    "${COMPOSE[@]}" stop "${RUNNING[@]}" || { echo "停服务失败，保留 $PRE 供人工恢复" >&2; exit "$rc"; }
+    for name in "${FILES[@]}"; do
+      for suffix in '' -wal -shm; do
+        if [[ -e "$PRE/original/$name$suffix" ]]; then
+          cp -p "$PRE/original/$name$suffix" "data_cache/$name$suffix" || exit "$rc"
+        elif [[ -e "data_cache/$name$suffix" ]]; then
+          mv "data_cache/$name$suffix" "$PRE/staged/failed-$name$suffix" || exit "$rc"
+        fi
+      done
+    done
+  fi
+  if (( STOPPED )); then "${COMPOSE[@]}" start "${RUNNING[@]}" || exit 1; fi
   exit "$rc"
 }
-trap rollback EXIT
-
-(cd "$BACKUP_DIR" && sha256sum -c SHA256SUMS)
-# backup.sh 将 sqlite（gzip 压缩）与 data_cache 附属清单直接放在备份目录
-# 根部（而非 data_cache/ 子目录），这里按相同布局恢复：先解压再落入
-# data_cache，同时兼容历史未压缩的 .sqlite3 备份。
-mkdir -p data_cache
-for f in "$BACKUP_DIR"/*.sqlite3.gz "$BACKUP_DIR"/*.db.gz; do
-  [[ -f "$f" ]] && gunzip -c "$f" > "data_cache/$(basename "$f" .gz)"
+trap recover EXIT
+STOPPED=1
+# Include every running worker; stopped containers reject cron docker-exec.
+"${COMPOSE[@]}" stop "${RUNNING[@]}"
+for name in "${FILES[@]}"; do
+  for suffix in '' -wal -shm; do
+    [[ ! -e "data_cache/$name$suffix" ]] || cp -p "data_cache/$name$suffix" "$PRE/original/$name$suffix"
+  done
 done
-for f in "$BACKUP_DIR"/*.sqlite3 "$BACKUP_DIR"/*.db "$BACKUP_DIR"/kline_manifest.json "$BACKUP_DIR"/universe.json; do
-  [[ -f "$f" ]] && cp -f "$f" data_cache/
+MODIFIED=1
+for name in "${FILES[@]}"; do
+  for suffix in -wal -shm; do
+    [[ ! -e "data_cache/$name$suffix" ]] || mv "data_cache/$name$suffix" "$PRE/original/retired-$name$suffix"
+  done
+  cp "$PRE/staged/$name" "data_cache/$name"
+  if [[ -f "$PRE/original/$name" ]]; then
+    chown --reference="$PRE/original/$name" "data_cache/$name"
+    chmod --reference="$PRE/original/$name" "data_cache/$name"
+  else
+    chown --reference=data_cache "data_cache/$name"
+    chmod 660 "data_cache/$name"
+  fi
 done
-[[ -d "$BACKUP_DIR/reports" ]] && rsync -a --delete "$BACKUP_DIR/reports/" reports/ || true
-docker compose -f docker-compose.server.yml up -d --build --no-deps astock astock-task-worker astock-data-worker
-curl -fsS --max-time 20 http://127.0.0.1:18600/api/health >/dev/null
-trap - EXIT
-echo "恢复完成，回滚点: $PRE"
+"${COMPOSE[@]}" start "${RUNNING[@]}"
+for attempt in {1..30}; do
+  if curl -fsS --max-time 5 http://127.0.0.1:18600/api/health >/dev/null; then
+    trap - EXIT
+    echo "恢复完成，回滚点: $PRE"
+    exit 0
+  fi
+  sleep 2
+done
+echo '健康检查失败，回滚数据库' >&2
+exit 1
