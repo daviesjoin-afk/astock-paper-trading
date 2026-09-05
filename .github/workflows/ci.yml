@@ -86,6 +86,7 @@ jobs:
       - name: Verify dependency lock
         shell: bash
         run: |
+          cp requirements.lock /tmp/requirements.lock
           uv pip compile requirements.txt --universal --python-version 3.11 \
             --no-emit-index-url --custom-compile-command "uv pip compile requirements.txt" \
             --output-file /tmp/requirements.lock
