@@ -5,8 +5,8 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='16' fill='%230b1712'/%3E%3Cpath d='M14 43 26 31l9 7 15-19' fill='none' stroke='%2378d1aa' stroke-width='5' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E">
 <title>A股量化策略台</title>
-<script src="https://cdn.jsdelivr.net/npm/echarts@5.5.0/dist/echarts.min.js"></script>
-<link rel="stylesheet" href="/assets/app.css?v=20260903-risk-symbol-name-v6">
+<script src="/assets/vendor-echarts.min.js"></script>
+<link rel="stylesheet" href="/assets/app.css?v=20260904-risk-symbol-name-v6-settings-center-v1-cleanup-v1">
 <style>
 /* AI审阅与调参样式 */
 .ai-status-cards{display:grid;grid-template-columns:repeat(auto-fill,minmax(140px,1fr));gap:10px;margin:12px 0}
@@ -33,37 +33,33 @@
     <span class="brand-copy"><span class="brand-eyebrow">ASTOCK / QUANT DESK</span><h1>A股量化策略台</h1></span>
   </div>
   <div class="header-status"><span class="header-status-label">市场门控</span><div id="gateBadge" class="gate-badge gate-green" role="status" aria-live="polite"><div class="gate-dot"></div><span>检测中…</span></div></div>
-  <input type="text" id="headerSearch" placeholder="快搜代码/名称…" style="width:160px;font-size:12px;padding:6px 10px;background:rgba(255,255,255,.1);border:1px solid rgba(255,255,255,.15);color:#fff;border-radius:8px;outline:none" oninput="searchStockHeader()" onkeydown="if(event.key==='Enter')gotoStockDetail()" autocomplete="off">
-  <div class="header-meta"><span class="mode-label">研究 · 纯模拟</span><time id="clock"></time><button class="header-ai-btn" type="button" onclick="switchToAdaptiveAI()" title="AI审阅与双AI调参" style="margin-right:6px;padding:4px 10px;background:linear-gradient(135deg,#10b981,#059669);border:none;color:#fff;border-radius:6px;font-size:12px;cursor:pointer;font-weight:600;letter-spacing:0.5px">🤖 AI</button><button class="page-refresh" type="button" onclick="refreshApp()" title="重新加载服务器最新页面与数据">刷新页面</button><button id="themeToggle" class="theme-toggle" aria-label="切换深色模式" aria-pressed="false" title="切换深色模式" onclick="toggleDark()"><svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M20.4 15.4A8.5 8.5 0 0 1 8.6 3.6 8.6 8.6 0 1 0 20.4 15.4Z" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/></svg></button></div>
+  <div class="header-meta"><span class="mode-label">研究 · 纯模拟</span><time id="clock"></time><button class="header-settings-btn" type="button" onclick="activatePage('p-settings')" title="打开设置中心"><svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M12 8.2a3.8 3.8 0 1 0 0 7.6 3.8 3.8 0 0 0 0-7.6Z" stroke="currentColor" stroke-width="1.7"/><path d="m19.1 13.1 1.2 1-.1 1.8-1.8 1.1-1.5-.5-1.1.6-.3 1.5-1.7.7-1.7-.7-.3-1.5-1.1-.6-1.5.5-1.8-1.1-.1-1.8 1.2-1v-1.3l-1.2-1 .1-1.8 1.8-1.1 1.5.5 1.1-.6.3-1.5 1.7-.7 1.1.6 1.5-.5 1.8 1.1.1 1.8-1.2 1v1.3Z" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round"/></svg><span>设置</span></button><button class="header-ai-btn" type="button" onclick="switchToAdaptiveAI()" title="AI审阅与双AI调参" style="margin-right:6px;padding:4px 10px;background:linear-gradient(135deg,#10b981,#059669);border:none;color:#fff;border-radius:6px;font-size:12px;cursor:pointer;font-weight:600;letter-spacing:0.5px">🤖 AI</button><button class="page-refresh" type="button" onclick="refreshApp()" title="重新加载服务器最新页面与数据">刷新页面</button><button id="themeToggle" class="theme-toggle" aria-label="切换深色模式" aria-pressed="false" title="切换深色模式" onclick="toggleDark()"><svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M20.4 15.4A8.5 8.5 0 0 1 8.6 3.6 8.6 8.6 0 0 1 20.4 15.4Z" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/></svg></button></div>
 </header>
-<div id="headerSuggest" style="position:fixed;top:48px;right:28px;background:#fff;border:1px solid #e0e3e8;border-radius:8px;max-height:200px;overflow-y:auto;z-index:30;display:none;min-width:200px;box-shadow:0 8px 24px rgba(0,0,0,.12)"></div>
 <nav class="tabs" aria-label="主功能导航">
   <button class="tab active" data-page="p-select"><svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M4 5h16M7 12h10m-7 7h4" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/><circle cx="7" cy="5" r="2" fill="currentColor"/><circle cx="15" cy="12" r="2" fill="currentColor"/><circle cx="12" cy="19" r="2" fill="currentColor"/></svg><b>策略选股</b><small>选股研究</small></button>
   <button class="tab" data-page="p-paper"><svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M4 19V9m5 10V5m6 14v-7m5 7V3" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/><path d="M3 21h18" stroke="currentColor" stroke-width="1.2" opacity=".6"/></svg><b>策略模拟</b><small>模拟交易台</small></button>
   <button class="tab" data-page="p-adaptive"><svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M12 3a4 4 0 0 0-3.8 2.8A3.5 3.5 0 0 0 5.5 12 4 4 0 0 0 9 18h1v3m2-18a4 4 0 0 1 3.8 2.8A3.5 3.5 0 0 1 18.5 12 4 4 0 0 1 15 18h-1v3M8 9h3m2 0h3M8 14h3m2 0h3" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg><b>自进化</b><small>盘面学习中心</small></button>
+  <button class="tab" data-page="p-settings"><svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M12 8.2a3.8 3.8 0 1 0 0 7.6 3.8 3.8 0 0 0 0-7.6Z" stroke="currentColor" stroke-width="1.7"/><path d="m19.1 13.1 1.2 1-.1 1.8-1.8 1.1-1.5-.5-1.1.6-.3 1.5-1.7.7-1.7-.7-.3-1.5-1.1-.6-1.5.5-1.8-1.1-.1-1.8 1.2-1v-1.3l-1.2-1 .1-1.8 1.8-1.1 1.5.5 1.1-.6.3-1.5 1.7-.7 1.7.7.3 1.5 1.1.6 1.5-.5 1.8 1.1.1 1.8-1.2 1v1.3Z" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round"/></svg><b>设置中心</b><small>资金 · 风控 · AI</small></button>
 </nav>
 
 <main id="appMain" tabindex="-1">
-<div id="p-sector" class="page">
-  <div class="page-header"><div><span class="page-kicker">资金与联动</span><h2>板块分析</h2><p>从主力资金、涨跌强度、联动关系和事件催化四个角度定位当日热点。</p></div></div>
-  <div class="panel workspace-panel">
-    <div class="controls">
-      <select id="sectorType"><option value="industry">行业板块</option><option value="concept">概念板块</option></select>
-      <button onclick="loadSectors()">刷新</button>
-      <span style="color:#9aa5b1;font-size:12px">主力净流入 = 超大单+大单净额，数据来源：东方财富（实时）</span>
-    </div>
-    <div id="sectorChart" class="chart" style="height:420px"></div>
+<div id="p-settings" class="page settings-page">
+  <div class="page-header"><div><span class="page-kicker">运行控制 · 安全边界 · 版本审计</span><h2>设置中心</h2><p>集中管理模拟资金、五套策略、共享池风控和自进化接口。每次保存都会校验边界并留下审计记录。</p></div><div class="settings-head-state" id="settingsHeadState" role="status" aria-live="polite">正在读取设置…</div></div>
+  <div class="settings-shell">
+    <nav class="module-tabs settings-module-tabs" aria-label="设置中心二级导航" role="tablist">
+      <button class="module-tab settings-section-tab active" role="tab" aria-selected="true" data-settings-section="simulation" onclick="setSettingsSection('simulation',this)"><span class="module-code">资金</span><span class="module-copy"><b>模拟盘与资金</b><small>启动金额 · 周期 · 策略数量</small></span></button>
+      <button class="module-tab settings-section-tab" role="tab" aria-selected="false" data-settings-section="risk" onclick="setSettingsSection('risk',this)"><span class="module-code">风控</span><span class="module-copy"><b>仓位与风控</b><small>共享池 · 单票 · 建仓门槛</small></span></button>
+      <button class="module-tab settings-section-tab" role="tab" aria-selected="false" data-settings-section="strategy" onclick="setSettingsSection('strategy',this)"><span class="module-code">策略</span><span class="module-copy"><b>策略参数</b><small>五套模型 · 风格 · 席位</small></span></button>
+      <button class="module-tab settings-section-tab" role="tab" aria-selected="false" data-settings-section="evolution" onclick="setSettingsSection('evolution',this)"><span class="module-code">AI</span><span class="module-copy"><b>AI 与自进化</b><small>接口状态 · 调度周期 · 审批</small></span></button>
+    </nav>
+    <div id="settingsResult" aria-live="polite"><div class="loading">正在读取统一设置…</div></div>
   </div>
-  <div class="panel"><h3>板块联动（近60日收益相关性 &gt;0.7 的高联动板块对）</h3><div id="linkageSummary"></div><div id="linkageChart" class="chart" style="height:360px"></div><div id="linkageTable"></div></div>
-  <div class="panel"><h3>板块资金明细</h3><div id="sectorTable"></div></div>
-  <div class="panel"><h3>板块催化与风险 <span class="tag tag-info">按需加载</span></h3><div id="sectorEvents" style="color:var(--text-muted)">进入板块分析后，仅针对强弱板块的代表股提取事件摘要。</div></div>
 </div>
-
 <div id="p-paper" class="page">
-  <div class="page-header"><div><span class="page-kicker">共享资金模拟账本</span><h2>策略模拟</h2><p>三套策略共用总资金池、独立决策与风控、统一成交核算；核心持仓和当日操作置顶，完整审计记录按需展开。</p></div></div>
+  <div class="page-header"><div><span class="page-kicker">共享资金模拟账本</span><h2>策略模拟</h2><p>五套策略共用总资金池、独立决策与风控、统一成交核算；核心持仓和当日操作置顶，完整审计记录按需展开。</p></div></div>
   <div class="workspace-tabs-dock" data-workspace-tabs-dock="paper">
   <nav id="paperModuleTabs" class="module-tabs workspace-tab-strip" data-tab-scroll aria-label="&#x7b56;&#x7565;&#x6a21;&#x62df;&#x4e09;&#x7ea7;&#x5bfc;&#x822a;" role="tablist">
-    <button class="module-tab" role="tab" aria-selected="false" data-paper-view="strategy" onclick="showPaperWorkspace('strategy',this)"><span class="module-code">策略</span><span class="module-copy"><b>策略中心</b><small>三套账户的规则与风控边界</small></span></button>
+    <button class="module-tab" role="tab" aria-selected="false" data-paper-view="strategy" onclick="showPaperWorkspace('strategy',this)"><span class="module-code">策略</span><span class="module-copy"><b>策略中心</b><small>五套账户的规则与风控边界</small></span></button>
     <button class="module-tab" role="tab" aria-selected="false" data-paper-view="research" onclick="showPaperWorkspace('research',this)"><span class="module-code">证据</span><span class="module-copy"><b>策略证据</b><small>候选快照与后续兑现跟踪</small></span></button>
     <button class="module-tab active" role="tab" aria-selected="true" data-paper-view="portfolio" onclick="showPaperWorkspace('portfolio',this)"><span class="module-code">持仓</span><span class="module-copy"><b>&#x5f53;&#x524d;&#x6301;&#x4ed3;</b><small>&#x5e10;&#x6237;&#x4e0e;&#x53ef;&#x64cd;&#x4f5c;&#x5e95;&#x4ed3;</small></span></button>
     <button class="module-tab" role="tab" aria-selected="false" data-paper-view="activity" onclick="showPaperWorkspace('activity',this)"><span class="module-code">委托</span><span class="module-copy"><b>&#x59d4;&#x6258;&#x8bb0;&#x5f55;</b><small>&#x6309;&#x65e5;&#x671f;&#x4e0e;&#x7b56;&#x7565;&#x67e5;&#x770b;&#x64cd;&#x4f5c;</small></span></button>
@@ -72,7 +68,7 @@
   </nav>
   </div>
   <div id="paperStrategyView" class="paper-strategy-view" hidden><div class="loading">正在读取策略规则…</div></div>
-  <div id="paperResearchView" class="paper-research-view" hidden><div class="loading">正在读取三套模拟盘策略的研究证据…</div></div>
+  <div id="paperResearchView" class="paper-research-view" hidden><div class="loading">正在读取五套模拟盘策略的研究证据…</div></div>
   <div id="paperPortfolioView" class="paper-trade-view">
   <div class="panel paper-setup-panel">
     <h3>模拟周期设置 <span class="tag tag-info">纯模拟盘</span></h3>
@@ -86,8 +82,8 @@
       <button id="paperRunNow" class="ghost" onclick="runPaperNow('intraday')">立即观察日内风险</button>
       <span id="paperStatus" role="status" aria-live="polite" style="font-size:12px;color:var(--text-secondary)"></span>
     </div>
-    <div id="paperCapitalHint" style="margin:-5px 0 10px;color:var(--text-secondary);font-size:12px">三套策略共享总资金池 ¥300,000；策略独立决策、独立风控，资金统一核算。</div>
-    <div class="disclaimer">三套策略并行、独立决策与交易归因，共用总资金池：短线日内做T仅卖出已结算底仓；当天新买股票仍为 T+1。每3分钟只观察行情和风险，只有价格、成本、仓位与各自模型同时通过才模拟成交。模拟盘不连接券商，也不代表真实可成交价格。</div>
+    <div id="paperCapitalHint" style="margin:-5px 0 10px;color:var(--text-secondary);font-size:12px">五套策略共享总资金池 ¥300,000；策略独立决策、独立风控，资金统一核算。</div>
+    <div class="disclaimer">五套策略并行、独立决策与交易归因，共用总资金池：短线日内做T仅卖出已结算底仓；当天新买股票仍为 T+1。每3分钟只观察行情和风险，只有价格、成本、仓位与各自模型同时通过才模拟成交。模拟盘不连接券商，也不代表真实可成交价格。</div>
   </div>
   <div id="paperAccountStrip" class="paper-account-strip"></div>
   <section class="paper-trade-workspace">
@@ -118,7 +114,7 @@
       <p>只读风控中心：不会重置账户，也不会因刷新页面产生模拟买卖。</p>
       <button id="paperRiskRefresh" onclick="refreshPaperRisk()">刷新风控状态</button>
     </div>
-    <div id="paperRiskResult" aria-live="polite"><div class="loading">正在读取三套策略的风险状态…</div></div>
+    <div id="paperRiskResult" aria-live="polite"><div class="loading">正在读取五套策略的风险状态…</div></div>
   </div>
 </div>
 
@@ -158,7 +154,7 @@
       <div class="control-field"><label for="selTopn">候选数量</label><select id="selTopn"><option>5</option><option selected>10</option><option>20</option></select></div>
       <div id="selStrategyDesc" class="strategy-model-note">正在读取策略规则…</div>
       <button id="btnSelect" onclick="runSelect()">开始选股</button>
-      <button class="ghost" onclick="compareStrategies()">对比三策略</button>
+      <button class="ghost" onclick="compareStrategies()">对比三种研究策略</button>
     </div>
     <div id="selectResult" aria-live="polite"><div class="loading">选择策略后点击「开始选股」</div></div>
   </div>
@@ -166,7 +162,7 @@
 </div>
 
 <div id="p-selection-evaluation" class="page">
-  <div class="page-header"><div><span class="page-kicker">&#x524d;&#x77bb;&#x9a8c;&#x8bc1;</span><h2>&#x7b56;&#x7565;&#x9a8c;&#x8bc1;</h2><p>&#x4ea4;&#x6613;&#x65e5;&#x6536;&#x76d8;&#x540e;&#x81ea;&#x52a8;&#x56fa;&#x5316;&#x4e09;&#x5957;&#x7b56;&#x7565;&#x7684;&#x5019;&#x9009;&#x5feb;&#x7167;&#xff0c;&#x5e76;&#x6301;&#x7eed;&#x6bd4;&#x8f83;&#x6301;&#x6709;&#x6536;&#x76ca;&#x4e0e;&#x6caa;&#x6df1;300&#x8d85;&#x989d;&#x6536;&#x76ca;&#x3002;</p></div></div>
+  <div class="page-header"><div><span class="page-kicker">&#x524d;&#x77bb;&#x9a8c;&#x8bc1;</span><h2>&#x7b56;&#x7565;&#x9a8c;&#x8bc1;</h2><p>&#x4ea4;&#x6613;&#x65e5;&#x6536;&#x76d8;&#x540e;&#x81ea;&#x52a8;&#x56fa;&#x5316;&#x4e09;&#x79cd;&#x7814;&#x7a76;&#x7b56;&#x7565;&#x7684;&#x5019;&#x9009;&#x5feb;&#x7167;&#xff0c;&#x5e76;&#x6301;&#x7eed;&#x6bd4;&#x8f83;&#x6301;&#x6709;&#x6536;&#x76ca;&#x4e0e;&#x6caa;&#x6df1;300&#x8d85;&#x989d;&#x6536;&#x76ca;&#xff1b;&#x7ed3;&#x679c;&#x4e0d;&#x4f1a;&#x6539;&#x53d8;&#x4e94;&#x5957;&#x6a21;&#x62df;&#x8d26;&#x6237;&#x3002;</p></div></div>
   <nav class="module-tabs" aria-label="&#x7b56;&#x7565;&#x9009;&#x80a1;&#x4e8c;&#x7ea7;&#x5bfc;&#x822a;" role="tablist">
     <button class="module-tab" onclick="chooseStrategy('three_day',this)">&#x4e09;&#x65e5;&#x7b56;&#x7565;</button>
     <button class="module-tab" onclick="chooseStrategy('five_day',this)">&#x4e94;&#x65e5;&#x7b56;&#x7565;</button>
@@ -186,74 +182,11 @@
   </div>
 </div>
 
-<div id="p-backtest" class="page">
-  <div class="page-header"><div><span class="page-kicker">历史验证</span><h2>策略回测</h2><p>使用次日成交、费用、滑点与涨跌停约束检验策略，结果仅用于研究比较。</p></div></div>
-  <div class="panel workspace-panel">
-    <div class="controls">
-      <label>策略</label><select id="btStrategy" class="wide"></select>
-      <label>持仓数</label><select id="btTopn"><option>5</option><option selected>10</option><option>20</option></select>
-      <label>调仓周期(交易日)</label><select id="btReb"><option>1</option><option>2</option><option>3</option><option>5</option><option>10</option><option>20</option></select>
-      <label><input type="checkbox" id="btGate" checked> 海外风险门控</label>
-      <button id="btnBt" onclick="runBacktest()">运行回测</button>
-    </div>
-    <div id="btResult"><div class="loading">配置参数后运行回测（约10-30秒）</div></div>
-  </div>
-</div>
-
-<div id="p-optimize" class="page">
-  <div class="page-header"><div><span class="page-kicker">稳健性检查</span><h2>参数优化</h2><p>采用样本内/样本外严格分段，寻找稳健参数并检查过拟合风险。</p></div></div>
-  <div class="panel workspace-panel">
-    <div class="controls">
-      <label>策略</label><select id="opStrategy" class="wide"></select>
-      <button id="btnOp" onclick="runOptimize()">开始优化（策略专属网格18组）</button>
-    </div>
-    <div id="opResult"><div class="loading">策略专属网格 × 门控开关，样本内70% / 样本外30%严格不重叠验证</div></div>
-  </div>
-</div>
-
-<div id="p-stock" class="page stock-research-page">
-  <div class="stock-research-shell">
-    <header class="stock-research-header">
-      <div id="stockTitle" class="stock-research-title">个股技术分析</div>
-      <div class="stock-research-subtitle">K线、技术信号与研究资料</div>
-      <button id="stockWatchBtn" class="stock-watch-btn" onclick="toggleStockWatch()">加入自选</button>
-      <button class="stock-refresh-btn" onclick="refreshStockResearch()">更新这只股票的行情与资料</button>
-      <div class="stock-search-line">
-        <input type="text" id="stockCode" placeholder="输入代码或名称，如 600519 / 茅台" oninput="searchStock()" onkeydown="if(event.key==='Enter')analyzeStock()" autocomplete="off">
-        <button class="ghost" onclick="analyzeStock()">查看个股</button>
-      </div>
-      <div id="stockSuggest" style="position:absolute;background:#fff;border:1px solid #ddd;border-radius:10px;max-height:200px;overflow-y:auto;z-index:20;display:none;min-width:262px"></div>
-    </header>
-    <div id="stockDataBanner" class="stock-data-banner">部分来源暂时无法连接。已保存在本地缓存中可用的行情与研究资料，稍后可再次更新。</div>
-    <nav class="stock-research-tabs" aria-label="个股资料分类">
-      <button class="stock-research-tab active" data-stock-section="kline" onclick="switchStockSection(this)">K线与技术</button>
-      <button class="stock-research-tab" data-stock-section="decision" onclick="switchStockSection(this)">概念题材</button>
-      <button class="stock-research-tab" data-stock-section="news" onclick="switchStockSection(this)">新闻</button>
-      <button class="stock-research-tab" data-stock-section="news" onclick="switchStockSection(this)">公告</button>
-      <button class="stock-research-tab" data-stock-section="decision" onclick="switchStockSection(this)">机构调研</button>
-      <button class="stock-research-tab" data-stock-section="finance" onclick="switchStockSection(this)">定期报告</button>
-      <button class="stock-research-tab" data-stock-section="peers" onclick="switchStockSection(this)">机构研报</button>
-      <button class="stock-research-tab" data-stock-section="finance" onclick="switchStockSection(this)">财务指标</button>
-    </nav>
-    <div id="stockBasic"></div>
-    <div class="stock-chart-hint">K线操作：点击下方按钮调整范围；鼠标滚轮可缩放，按住左键可左右拖动，底部范围条也可以拉近或拉远。</div>
-    <div class="stock-chart-tools">
-      <button onclick="stockZoom('in')">＋ 放大</button><button onclick="stockZoom('out')">－ 缩小</button><button onclick="stockZoom('earlier')">← 查看更早</button><button onclick="stockZoom('latest')">回到最新 →</button><button onclick="stockZoom('all')">显示全部</button>
-    </div>
-    <section class="stock-chart-wrap"><div id="stockKline" class="chart" style="height:650px"></div></section>
-    <section class="stock-research-detail">
-      <div class="panel" id="stockDecisionPanel"><h3>买入/卖出风控模型</h3><div id="stockDecision"></div></div>
-      <div class="panel" id="stockFinancePanel"><h3>财务指标</h3><div id="stockFinance"></div></div>
-    </section>
-    <section class="panel stock-wide-detail" id="stockNewsPanel"><h3>事件与资料 <span class="tag tag-info">已纳入风控参考</span></h3><div id="stockNews"></div></section>
-    <section class="panel stock-wide-detail" id="stockPeersPanel"><h3>同行业对比</h3><div id="stockPeers"></div></section>
-  </div>
-</div>
 </main>
 
 <!-- Keep this version in sync with material dashboard fixes.  The paper
      workspace is entirely client-rendered, so a stable URL can leave browsers
      executing an old script after the HTML has changed. -->
-<script src="/app.js?v=20260903-retry-backoff-v1" defer></script>
+<script src="/app.js?v=20260904-stock-page-removed-v1" defer></script>
 </body>
 </html>

@@ -12,6 +12,92 @@ deterministic domain rules
 paper ledger / read models
 ```
 
+## 运行时总图
+
+下面这张图是当前仓库的实际调用边界；浏览器和定时器都只能进入 API/应用服务，不能绕过纸盘账本直接写交易数据。
+
+```text
+浏览器 Web 看板
+      │ HTTP / JSON
+      ▼
+backend/main.py  FastAPI 应用与生命周期
+      ├── /api/paper/*
+      │      ▼
+      │  backend/api_paper.py  纸盘 HTTP 契约
+      │      ▼
+      │  backend/paper_trading.py  交易编排、slot、账本写入
+      │      ├── strategies / decision_engine / decision_rules
+      │      ├── paper_quote_policy / paper_trading_rules
+      │      ├── paper_allocation / paper_sizing
+      │      ├── risk_center / entry_timing
+      │      └── paper_storage / paper_repository / schema_migrations
+      │
+      ├── /api/adaptive/*
+      │      ▼
+      │  backend/api_adaptive.py  研究与人工确认 HTTP 契约
+      │      ▼
+      │  adaptive_engine / adaptive_* / news_learning
+      │      └── 只读纸盘或写入独立影子证据；不能提交订单
+      │
+      └── /api/select、/api/stock_detail、/api/backtest 等
+             ▼
+         data_fetcher → marketdata_transport/providers/normalizers/cache
+             ▼
+         universe / factors / strategies / backtest / optimizer
+
+外部调度器（服务器 cron 或容器内可选兜底线程）
+      ▼
+paper_runner.py --slot <slot>
+      ▼
+paper_trading.run_slot()
+      ▼
+SQLite 纸盘账本（订单、成交、持仓、NAV、审计、租约）
+      ├── dashboard / risk_dashboard / audit read models
+      └── 前端策略模拟、委托记录、风控审计页面
+```
+
+### 一次盘中扫描的顺序
+
+```text
+调度触发
+  → 获取并校验当轮行情（覆盖率、时间戳、双源一致性）
+  → 读取当前周期的两套 active 账户
+  → 生成 tq_breakout / main_force_top10 候选
+  → 先执行风险退出，再做入场与盘中事件
+  → 共享资金池、席位、行业/单票权重、T+1、整手、涨跌停门禁
+  → SQLite 事务写入订单/成交/NAV/审计
+  → 前端按缓存代次读取最新只读投影
+```
+
+`strategy_registry.active_ids()` 是新周期的策略范围单一事实来源。当前新周期只有 `tq_breakout` 和 `main_force_top10`；`ACCOUNT_SPECS` 中的旧策略定义只为历史账本、回放和兼容读取保留，不会获得新周期资金、信号或调度时间。
+
+## 模块职责速查
+
+| 区域 | 文件/模块 | 负责什么 | 不负责什么 |
+| --- | --- | --- | --- |
+| 应用入口 | `backend/main.py` | 组装 FastAPI、挂载前端、健康检查、数据更新、选股/回测/个股查询、启动时初始化账本 | 不直接绕过交易服务写订单 |
+| 纸盘 API | `backend/api_paper.py` | 纸盘概览、风险概览/审计、委托预览/提交/撤单、周期启停、手动运行 slot | 不实现策略规则和 SQL 账本细节 |
+| 影子研究 API | `backend/api_adaptive.py` | 自适应、新闻、AI 顾问、再平衡和人工确认接口 | 不直接下单、不自动放宽风控 |
+| 交易编排 | `backend/paper_trading.py` | 周期/账户、候选、开仓、盘中、收盘、风控、NAV、审计和 slot 幂等编排 | 不把研究建议当成成交授权 |
+| 调度边界 | `backend/paper_runner.py` | 把一个 slot 运行成一次性进程，并用退出码告诉 cron 是否应重试 | 不常驻、不拥有第二套账本 |
+| 策略与决策 | `strategies.py`, `strategy_registry.py`, `decision_engine.py`, `decision_context.py`, `decision_rules.py` | 策略身份、候选车道、证据快照和纯规则评分 | 不读取真实券商账户 |
+| 行情基础设施 | `data_fetcher.py`, `marketdata_transport.py`, `marketdata_providers.py`, `marketdata_normalizers.py`, `marketdata_cache.py` | 多源请求、重试/熔断、解析标准化、缓存、覆盖率和新鲜度元数据 | 不在缓存陈旧时伪造实时价 |
+| 交易门禁 | `paper_trading_rules.py`, `paper_quote_policy.py`, `entry_timing.py` | 交易日、费用、证券权限、T+1、整手、涨跌停、行情新鲜度和入场时机 | 不负责持久化订单 |
+| 资金与仓位 | `paper_allocation.py`, `paper_sizing.py`, `paper_portfolio.py`, `paper_performance.py` | 共享池预算、席位、下单股数、持仓 lot 聚合、今日盈亏纯计算 | 不调用外部行情源 |
+| 账本与迁移 | `paper_storage.py`, `paper_repository.py`, `paper_schema_migrations.py`, `paper_ledger_reader.py`, `paper_archive_projection.py` | SQLite 连接/WAL/重试、通用行读写、幂等迁移、只读读取端口、历史快照投影 | 不改变交易策略结论 |
+| 风控与审计 | `risk_center.py`, `adaptive_risk.py`, `adaptive_shadow_risk.py` | 风险状态机、下行保护、风险仪表盘、影子风控和结构化审计原因 | 影子层不能越权提交订单 |
+| 自适应/新闻 | `adaptive_engine.py`, `adaptive_runner.py`, `adaptive_learning_*`, `news_learning.py`, `news_runner.py` | 研究样本、奖励、新闻证据和参数候选；通过 outbox/人工确认与正式路径隔离 | 不直接修改正式成交规则 |
+| 研究工具 | `backtest.py`, `optimizer.py`, `selection_tracking.py`, `selection_runner.py` | 回测、参数比较、选股跟踪和盘后候选固化 | 不替代正式纸盘撮合 |
+| 前端 | `frontend/index.html`, `frontend/app.js`, `frontend/app.css` | 单页看板、策略模拟、委托、风控审计、数据有效性和研究页面 | 不在浏览器本地决定最终成交 |
+| 部署 | `Dockerfile`, `docker-compose.yml`, `docker-compose.server.yml`, `deploy/*` | 镜像、数据卷、健康检查、锁、cron/systemd/nginx 部署边界 | 不把运行时数据库、密钥或历史账本提交进仓库 |
+
+## 调度与并发边界
+
+- 服务器 Docker profile 使用宿主机 cron 调 `deploy/run_paper_slot.sh`，脚本先用锁串行化 paper runner，再在 worker 容器中执行单个 slot。
+- 单机 clone 可将 `ASTOCK_ENABLE_FALLBACK_THREADS=1` 交给应用内置线程；生产环境应在 cron 与内置线程之间二选一，避免重复扫描。
+- `run_slot()` 使用数据库 runtime lease、heartbeat 和 fencing token；`paper_runner.py` 对 `failed`/`blocked`/`partial` 返回非零退出码，使调度器可以重试。
+- API 读取模型带短 TTL、账本 generation 和 single-flight；缓存只优化读取，不改变账本事实。
+
 行情提供方、SQLite 和 LLM 属于基础设施，不应被纯决策规则隐式调用。`adaptive_*` 模块是影子学习与审阅路径，只能读取行情和模拟账本，不能依赖订单执行入口。
 
 ## 当前边界

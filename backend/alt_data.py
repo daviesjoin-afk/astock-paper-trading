@@ -43,6 +43,7 @@ TENCENT_QUOTE_URL = "https://qt.gtimg.cn/q="
 _mem_cache = {}
 _cache_lock = threading.Lock()
 NEGATIVE_CACHE_SECONDS = 10 * 60
+MAX_MEM_CACHE_ENTRIES = 128
 
 
 def _eastmoney_secid(code):
@@ -452,6 +453,9 @@ def _cached(key, ttl_seconds):
 
 def _store(key, value):
     with _cache_lock:
+        if key not in _mem_cache and len(_mem_cache) >= MAX_MEM_CACHE_ENTRIES:
+            oldest_key = min(_mem_cache, key=lambda item: _mem_cache[item][0])
+            _mem_cache.pop(oldest_key, None)
         _mem_cache[key] = (dt.datetime.now(), value)
 
 
