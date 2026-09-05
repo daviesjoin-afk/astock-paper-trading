@@ -14,6 +14,8 @@
 
 ## Dashboard 预览
 
+当前发布版本：**v1.1.0**。查看 [详细更新与升级说明](docs/RELEASE-v1.1.0.md)、[架构说明](ARCHITECTURE.md) 和 [安全边界](SECURITY.md)。CI 验证 Python 3.11/3.12；API 返回的历史内部版本 2.0.0 不代表 Release 标签。
+
 ![模拟盘 Dashboard 预览](docs/assets/dashboard.png)
 
 截图来自全新公开克隆的空账本，展示可视化看板、委托记录和风控审计入口；运行时数据库与历史记录不会随仓库发布。
@@ -164,6 +166,8 @@ python paper_runner.py --slot open
 GitHub Actions 会在 **Python 3.11 / 3.12** 上执行后端回归测试。测试覆盖撮合门禁、point-in-time 数据、行情新鲜度、风险审计、并发租约、策略入场、共享资金与回放相关行为。
 
 ## Docker
+
+当前本地 Compose 的 `8600:8600` 映射会监听所有网卡。个人使用建议先改为 `127.0.0.1:8600:8600`。应用尚无完整内置鉴权，服务器访问须配置访问控制和认证；`confirmed=true` 仅防误触。
 
 ```bash
 docker compose up -d --build
