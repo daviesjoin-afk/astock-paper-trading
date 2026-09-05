@@ -5,7 +5,7 @@
 set -euo pipefail
 
 slot="${1:?slot is required}"
-lock_dir="<SERVER_PATH>"
+lock_dir="<SERVER_PATH>/.locks"
 mkdir -p "$lock_dir"
 
 # A short bounded wait allows the 30-second fast pass to finish before a

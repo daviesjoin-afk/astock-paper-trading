@@ -116,5 +116,5 @@ sudo journalctl -u astock-quant -f
 `data_cache`、模拟盘数据库或报告目录。更新前仍建议备份：
 
 ```bash
-sudo tar -C /opt/astock-quant -czf <SERVER_PATH> data_cache reports
+sudo tar -C /opt/astock-quant -czf /var/backups/astock-data-backup.tgz data_cache reports
 ```

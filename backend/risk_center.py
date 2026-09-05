@@ -12,7 +12,7 @@ import math
 import os
 import statistics
 
-from market_policy import MARKET_LIGHT_SCALES, market_light_scale, market_light_scales
+from market_policy import MARKET_LIGHT_SCALES, market_light_scale
 
 
 BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -740,7 +740,6 @@ def _attach_dynamic_pool_budgets(accounts, positions, shared, market):
     total_weight = sum(weights.values()) or 1.0
     base_targets = {key: SHARED_POOL_MAX_EXPOSURE_PCT * value / total_weight for key, value in weights.items()}
     light = str((market or {}).get("light") or "unknown")
-    scales = market_light_scales(light)
     targets = {key: base_targets[key] * market_light_scale(light, key) for key in ids}
     floors = {key: targets[key] * 0.60 for key in ids}
     current = {key: 0.0 for key in ids}
@@ -810,7 +809,7 @@ def build_dashboard(base_dashboard, snapshot):
     ])
     min_scale = min((card["risk_scale_pct"] for card in cards), default=0)
     overall_summary = {
-        "normal": "三套账户未触发新开仓熔断，新增因子仍处于影子观察。",
+        "normal": "五套当前账户未触发新开仓熔断，新增因子仍处于影子观察。",
         "watch": "存在需要跟踪的单点资金、快讯或持仓弱势信号，不自动减仓。",
         "tightened": "至少一个策略已降低新开仓额度，原持仓继续按各自退出规则监控。",
         "blocked": "至少一个策略或关键数据源禁止新增风险，风险卖出仍继续执行。",
@@ -856,7 +855,7 @@ def build_dashboard(base_dashboard, snapshot):
             "summary": overall_summary,
             "trade_permission": (
                 "仅在共享资金池整体红灯/数据失真时禁止新增；策略级限制只影响对应策略，风险卖出继续执行"
-                if worst == "blocked" else "三套策略共用总资金池；按各自单票、行业和止损模型执行"
+                if worst == "blocked" else "五套当前策略共用总资金池；按各自单票、行业和止损模型执行"
             ),
             "risk_scale_pct": min_scale,
             "sell_monitoring": "继续执行；T+1、跌停或行情过期时明确记录风险未解除",
