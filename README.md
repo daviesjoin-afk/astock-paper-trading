@@ -14,7 +14,7 @@
 
 ## Dashboard 预览
 
-当前发布版本：**v1.1.0**。查看 [详细更新与升级说明](docs/RELEASE-v1.1.0.md)、[架构说明](ARCHITECTURE.md) 和 [安全边界](SECURITY.md)。CI 验证 Python 3.11/3.12；API 返回的历史内部版本 2.0.0 不代表 Release 标签。
+当前发布版本：**v1.2.0**。查看 [详细更新与升级说明](docs/RELEASE-v1.2.0.md)、[架构说明](ARCHITECTURE.md) 和 [安全边界](SECURITY.md)。CI 验证 Python 3.11/3.12；API 返回的历史内部版本 2.0.0 不代表 Release 标签。
 
 ![模拟盘 Dashboard 预览](docs/assets/dashboard.png)
 
@@ -88,6 +88,8 @@
 ```text
 backend/
   paper_trading.py      撮合 / 风控 / 审计 / 资金 / slot 调度主引擎
+  manual_orders.py      手动下单链（预览 / 提交 / 撤单 / 待单推进）
+  dashboard_queries.py  看板读模型（overview / portfolio / activity）
   paper_runner.py       auction/open/risk/intraday/close/weekly-review CLI
   data_fetcher.py       行情、快照、公告与数据质量
   entry_timing.py       入场时机状态机
@@ -97,9 +99,10 @@ backend/
   news_learning.py      新闻证据研究
   api_*.py              HTTP API
   main.py               FastAPI + Web 看板入口
-  test_*.py             回归测试
-frontend/               Web 看板与审计界面
-.github/workflows/       GitHub Actions CI
+  test_*.py             回归测试（含离线确定性演示 golden replay）
+frontend/               Web 看板与审计界面（esbuild 构建）
+docs/                   运行手册、设置 PRD、测试场景矩阵、发布说明
+.github/workflows/       GitHub Actions CI（含离线测试层）
 Dockerfile              应用镜像
 docker-compose.yml      本地/单机容器运行
 ```
@@ -190,7 +193,7 @@ python paper_runner.py --slot open
 
 `requirements.txt` 声明允许的依赖范围，`requirements.lock` 固定可复现安装版本。修改依赖范围后必须重新生成并提交锁文件。
 
-GitHub Actions 会在 **Python 3.11 / 3.12** 上安装锁定依赖并执行后端回归，同时运行 Ruff 静态检查、锁文件一致性检查、pip-audit 已知漏洞审计、前端语法检查和 Docker 冒烟。测试覆盖撮合门禁、point-in-time 数据、行情新鲜度、风险审计、并发租约、策略入场、共享资金与回放相关行为。
+GitHub Actions 会在 **Python 3.11 / 3.12** 上安装锁定依赖并执行后端回归，同时运行 Ruff 静态检查、锁文件一致性检查、pip-audit 已知漏洞审计、前端语法检查和 Docker 冒烟。Docker 冒烟阶段以 `--network none` + tmpfs 缓存目录运行**全量离线测试层**：回归用例默认禁止联网，联网用例须显式设置 `ASTOCK_NET_TESTS=1` 才运行（分层规范见 [`CONTRIBUTING.md`](CONTRIBUTING.md)）。测试覆盖撮合门禁、point-in-time 数据、行情新鲜度、风险审计、并发租约、策略入场、确定性演示回放与共享资金行为，完整场景矩阵见 [`docs/TEST_MATRIX.md`](docs/TEST_MATRIX.md)。
 
 ## Docker
 
@@ -219,11 +222,11 @@ Docker 使用仓库专用命名卷，不会自动连接其他实例的私有运�
 
 项目使用 **MIT License**，欢迎可复现的 bug、边界条件、数据源适配和小范围 PR。
 
-当前公开 roadmap：
+当前公开 roadmap（欢迎在 [Discussions](https://github.com/daviesjoin-afk/astock-paper-trading/discussions) 交流，good-first-issue 子任务见对应主任务）：
 
 - [#1 扩展行情数据源适配与故障降级](https://github.com/daviesjoin-afk/astock-paper-trading/issues/1)
 - [#2 设计可插拔策略接口与策略回放规范](https://github.com/daviesjoin-afk/astock-paper-trading/issues/2)
-- [#3 补充回测、纸面撮合与审计回放验证](https://github.com/daviesjoin-afk/astock-paper-trading/issues/3)
+- [#3 补充回测、纸面撮合与审计回放验证](https://github.com/daviesjoin-afk/astock-paper-trading/issues/3)（场景矩阵与缺口见 [`docs/TEST_MATRIX.md`](docs/TEST_MATRIX.md)）
 
 提交代码前请阅读 [`CONTRIBUTING.md`](CONTRIBUTING.md)。版本变化见 [`CHANGELOG.md`](CHANGELOG.md) 和 [GitHub Releases](https://github.com/daviesjoin-afk/astock-paper-trading/releases)。安全问题请通过 [私密漏洞报告](https://github.com/daviesjoin-afk/astock-paper-trading/security/advisories/new) 提交，不要公开包含敏感信息的复现材料。
 
