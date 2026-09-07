@@ -1894,6 +1894,13 @@ def run_learning_cycle(trigger="manual"):
                         },
                         "news_schedule": "dedicated_08:15_12:15_18:45"}), _now(), run_id),
             )
+        # B 批：收盘学习末尾对全部生效部署记录 A/B 对照快照（幂等、
+        # 观察不足只记 observing；失败不阻塞学习主流程）。
+        try:
+            import evolution_validation
+            evolution_validation.record_ab_snapshots(_connect, PAPER_DB_PATH)
+        except Exception:
+            pass  # A/B 快照失败不阻塞学习主流程
         # The language-model review is deliberately outside the learning
         # transaction. A timeout or provider failure must never roll back the
         # deterministic paper-trading evolution cycle.
@@ -3002,6 +3009,15 @@ def _allocation_overview_safe():
         return {"active": {}, "latest_decision": None}
 
 
+def _validation_overview_safe():
+    """B/C 批：进化部署 A/B 对照结论（版本级归因的展示入口）。"""
+    try:
+        import evolution_validation
+        return evolution_validation.ab_summary(_connect)
+    except Exception:
+        return {"rows": [], "min_observation_days": 5}
+
+
 def _overview_uncached():
     with _connect() as conn:        # 闭环指标：执行质量审计和午间观测上下文
         try:
@@ -3207,6 +3223,7 @@ def _overview_uncached():
         "risk_optimizer": risk_optimizer,
         "selection_optimizer": selection_optimizer,
         "allocation": _allocation_overview_safe(),
+        "validation": _validation_overview_safe(),
         "deepseek_advisor": advisor,
         "news_learning": news_center,
         "trade_attribution": trade_attribution_view,
