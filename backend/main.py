@@ -457,6 +457,19 @@ async def _lifespan(_app):
     # 请求中调用 init_db()，因此必须在服务启动阶段为全新克隆创建基础表；
     # 否则空数据卷会出现首页/风险页因 paper_jobs/paper_cycles 缺表而 500。
     P.init_db()
+    # Deterministic demo mode: ASTOCK_DEMO=1 seeds a fully synthetic universe
+    # and a narrated paper ledger (T+1 reject, stale-quote reject, hard-stop
+    # sell, limit-up buy, NAV curve) so a fresh clone shows the whole
+    # signal->risk->order->fill->NAV->audit chain offline.  Idempotent.
+    if str(os.getenv("ASTOCK_DEMO") or "0").strip().lower() in {"1", "true", "yes", "on"}:
+        try:
+            import demo_seed
+        except ImportError:  # pragma: no cover - demo module co-located with backend
+            demo_seed = None
+        if demo_seed is not None:
+            demo_seed.ensure_demo_data(
+                force=str(os.getenv("ASTOCK_DEMO_FORCE") or "0").strip().lower() in {"1", "true", "yes", "on"},
+            )
     # 盘后自动补齐历史K线并重建选股因子；线程内部带交易日、幂等和
     # 失败重试门禁，不占用请求线程，也不会触碰下单/风控路径。
     # 架构重构（2026-08-19）：容器内 daemon 兜底线程默认关闭，消除"宿主
