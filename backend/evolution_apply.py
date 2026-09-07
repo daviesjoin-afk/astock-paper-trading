@@ -159,6 +159,11 @@ def apply_allocation(adaptive_connect, paper_db_path, decision_id: int,
         )
         decision_date = str(row["decision_date"] or "")
 
+    # B 批观察期门禁：任一目标账户的上一 allocation 覆盖仍在观察期即拒绝。
+    import evolution_validation as validation
+    for account_id in weights:
+        validation.pre_apply_gate(adaptive_connect, paper_db_path, account_id, "allocation")
+
     effective_date = dt.datetime.now(TZ).date().isoformat()
     paper = _paper_connect(paper_db_path)
     try:
@@ -337,6 +342,12 @@ def apply_tuner_proposals(adaptive_connect, paper_db_path, run_id: int,
             evolution = _SE.get_current_params(conn).get("params") or {}
         except sqlite3.Error:
             evolution = {}
+    # B 批观察期门禁：提案目标账户的上一 tuner 覆盖仍在观察期即拒绝。
+    import evolution_validation as validation
+    for proposal in merged:
+        validation.pre_apply_gate(
+            adaptive_connect, paper_db_path,
+            str(proposal.get("account_id") or ""), "tuner")
     max_weight_delta = float(
         max_weight_delta if max_weight_delta is not None
         else evolution.get("max_weight_delta", 0.03)
