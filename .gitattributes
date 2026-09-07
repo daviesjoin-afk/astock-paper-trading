@@ -11,9 +11,9 @@
 *.ps1 text eol=crlf
 
 # Binary assets - never normalize.
-*.png binary
-*.jpg binary
-*.gif binary
-*.ico binary
-*.woff binary
-*.woff2 binary
+*.png binary -eol
+*.jpg binary -eol
+*.gif binary -eol
+*.ico binary -eol
+*.woff binary -eol
+*.woff2 binary -eol
