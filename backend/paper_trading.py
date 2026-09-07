@@ -14852,88 +14852,105 @@ def dashboard(include_activity=False, include_history_symbols=False):
         orders = _recent_orders_with_archives(conn, account_names, limit=500) if include_activity else []
         fills = []
         risk_decisions = []
-        # Do not load the full signal payload here.  A signal's immutable
-        # decision snapshot can be hundreds of KB, and loading 120 of them
-        # just to render a candidate card was the main cold-page memory spike.
-        # SQLite extracts the two small presentation fragments in-process;
-        # the complete evidence remains in the ledger for the dedicated audit
-        # endpoints and never needs to live in the web response cache.
-        signal_fields = (
-            "id,account_id,signal_date,intended_date,code,name,industry,close_price,"
-            "rank_score,t_tier,t_score,status,reason,created_at"
-        )
-        try:
-            signals = _rows(
-                conn,
-                f"""SELECT {signal_fields},
-                           json_extract(payload,'$.pick.sector_heat') AS sector_heat_json,
-                           json_extract(payload,'$.decision.entry_model') AS entry_model_json
-                    FROM paper_signals WHERE intended_date=?
-                    ORDER BY account_id,rank_score DESC,id DESC LIMIT 120""",
-                (dt.date.today().isoformat(),),
+        if include_activity:
+            # The activity workspace renders orders, the account strip and the
+            # audit board only.  The candidate-signal projection (json_extract
+            # across 120 payloads plus the execution join and the overlap
+            # matrix) and the reviews/jobs reads are portfolio-view sections:
+            # on the production ledger they were ~0.9MB of the 1.5MB response
+            # and a measurable slice of every cold rebuild.  Portfolio reads
+            # keep the full shape; the activity cache key is already distinct
+            # (overview:1:*), so skipping them here cannot starve the other
+            # workspace.
+            signals = []
+            candidate_overlap = []
+            reviews = []
+            last_jobs = []
+        else:
+            # Do not load the full signal payload here.  A signal's immutable
+            # decision snapshot can be hundreds of KB, and loading 120 of them
+            # just to render a candidate card was the main cold-page memory spike.
+            # SQLite extracts the two small presentation fragments in-process;
+            # the complete evidence remains in the ledger for the dedicated audit
+            # endpoints and never needs to live in the web response cache.
+            signal_fields = (
+                "id,account_id,signal_date,intended_date,code,name,industry,close_price,"
+                "rank_score,t_tier,t_score,status,reason,created_at"
             )
-        except sqlite3.OperationalError:
-            # Older SQLite builds may omit JSON1.  Preserve a fast, useful
-            # dashboard instead of falling back to fetching the large payload.
-            signals = _rows(
-                conn,
-                f"""SELECT {signal_fields} FROM paper_signals WHERE intended_date=?
-                    ORDER BY account_id,rank_score DESC,id DESC LIMIT 120""",
-                (dt.date.today().isoformat(),),
-            )
-        signal_ids = [int(signal["id"]) for signal in signals]
-        execution_by_signal = {}
-        if signal_ids:
-            placeholders = ",".join("?" for _ in signal_ids)
-            execution_rows = _rows(
-                conn,
-                f"""SELECT o.signal_id,o.status AS order_status,o.executed_at,o.filled_price,
-                           f.quote_at AS execution_quote_at
-                    FROM paper_orders o
-                    LEFT JOIN paper_fills f ON f.order_id=o.id
-                    WHERE o.signal_id IN ({placeholders})
-                    ORDER BY o.id DESC""",
-                tuple(signal_ids),
-            )
-            for row in execution_rows:
-                execution_by_signal.setdefault(int(row["signal_id"]), row)
-        for signal in signals:
-            sector_heat = _loads(signal.pop("sector_heat_json", None), {}) or {}
-            entry_model = _loads(signal.pop("entry_model_json", None), {}) or {}
-            execution = execution_by_signal.get(int(signal["id"])) or {}
-            signal["audit"] = {
-                "factor_date": signal.get("signal_date"),
-                "signal_quote_at": None,
-                "signal_quote_pct": None,
-                "signal_quote_source": None,
-                "decision_at": signal.get("created_at"),
-                "planned_review_date": signal.get("intended_date"),
-                "signal_mode": "overview_compact",
-                "execution_status": execution.get("order_status") or "not_executed",
-                "executed_at": execution.get("executed_at"),
-                "execution_quote_at": execution.get("execution_quote_at"),
-                "execution_price": execution.get("filled_price"),
-            }
-            signal["payload"] = {
-                "pick": {"sector_heat": sector_heat},
-                "decision": {"entry_model": entry_model},
-            }
-            signal["account_name"] = account_names.get(signal["account_id"], signal["account_id"])
-        signal_sets = {}
-        for signal in signals:
-            signal_sets.setdefault(signal["account_id"], set()).add(signal["code"])
-        candidate_overlap = []
-        account_ids = [account["id"] for account in accounts]
-        for index, left in enumerate(account_ids):
-            for right in account_ids[index + 1:]:
-                intersection = sorted(signal_sets.get(left, set()) & signal_sets.get(right, set()))
-                union = signal_sets.get(left, set()) | signal_sets.get(right, set())
-                candidate_overlap.append({
-                    "left": left, "left_name": account_names.get(left, left),
-                    "right": right, "right_name": account_names.get(right, right),
-                    "count": len(intersection), "codes": intersection,
-                    "jaccard_pct": round(len(intersection) / len(union) * 100, 1) if union else 0.0,
-                })
+            try:
+                signals = _rows(
+                    conn,
+                    f"""SELECT {signal_fields},
+                               json_extract(payload,'$.pick.sector_heat') AS sector_heat_json,
+                               json_extract(payload,'$.decision.entry_model') AS entry_model_json
+                        FROM paper_signals WHERE intended_date=?
+                        ORDER BY account_id,rank_score DESC,id DESC LIMIT 120""",
+                    (dt.date.today().isoformat(),),
+                )
+            except sqlite3.OperationalError:
+                # Older SQLite builds may omit JSON1.  Preserve a fast, useful
+                # dashboard instead of falling back to fetching the large payload.
+                signals = _rows(
+                    conn,
+                    f"""SELECT {signal_fields} FROM paper_signals WHERE intended_date=?
+                        ORDER BY account_id,rank_score DESC,id DESC LIMIT 120""",
+                    (dt.date.today().isoformat(),),
+                )
+            signal_ids = [int(signal["id"]) for signal in signals]
+            execution_by_signal = {}
+            if signal_ids:
+                placeholders = ",".join("?" for _ in signal_ids)
+                execution_rows = _rows(
+                    conn,
+                    f"""SELECT o.signal_id,o.status AS order_status,o.executed_at,o.filled_price,
+                               f.quote_at AS execution_quote_at
+                        FROM paper_orders o
+                        LEFT JOIN paper_fills f ON f.order_id=o.id
+                        WHERE o.signal_id IN ({placeholders})
+                        ORDER BY o.id DESC""",
+                    tuple(signal_ids),
+                )
+                for row in execution_rows:
+                    execution_by_signal.setdefault(int(row["signal_id"]), row)
+            for signal in signals:
+                sector_heat = _loads(signal.pop("sector_heat_json", None), {}) or {}
+                entry_model = _loads(signal.pop("entry_model_json", None), {}) or {}
+                execution = execution_by_signal.get(int(signal["id"])) or {}
+                signal["audit"] = {
+                    "factor_date": signal.get("signal_date"),
+                    "signal_quote_at": None,
+                    "signal_quote_pct": None,
+                    "signal_quote_source": None,
+                    "decision_at": signal.get("created_at"),
+                    "planned_review_date": signal.get("intended_date"),
+                    "signal_mode": "overview_compact",
+                    "execution_status": execution.get("order_status") or "not_executed",
+                    "executed_at": execution.get("executed_at"),
+                    "execution_quote_at": execution.get("execution_quote_at"),
+                    "execution_price": execution.get("filled_price"),
+                }
+                signal["payload"] = {
+                    "pick": {"sector_heat": sector_heat},
+                    "decision": {"entry_model": entry_model},
+                }
+                signal["account_name"] = account_names.get(signal["account_id"], signal["account_id"])
+            signal_sets = {}
+            for signal in signals:
+                signal_sets.setdefault(signal["account_id"], set()).add(signal["code"])
+            candidate_overlap = []
+            account_ids = [account["id"] for account in accounts]
+            for index, left in enumerate(account_ids):
+                for right in account_ids[index + 1:]:
+                    intersection = sorted(signal_sets.get(left, set()) & signal_sets.get(right, set()))
+                    union = signal_sets.get(left, set()) | signal_sets.get(right, set())
+                    candidate_overlap.append({
+                        "left": left, "left_name": account_names.get(left, left),
+                        "right": right, "right_name": account_names.get(right, right),
+                        "count": len(intersection), "codes": intersection,
+                        "jaccard_pct": round(len(intersection) / len(union) * 100, 1) if union else 0.0,
+                    })
+            reviews = _rows(conn, "SELECT * FROM paper_reviews ORDER BY week_key DESC, account_id LIMIT 4")
+            last_jobs = _rows(conn, "SELECT * FROM paper_jobs ORDER BY market_date DESC, started_at DESC LIMIT 8")
         history_symbols = _rows(
             conn,
             """SELECT code,MAX(name) AS name,COUNT(*) AS order_count,
@@ -14941,8 +14958,6 @@ def dashboard(include_activity=False, include_history_symbols=False):
                  FROM paper_orders GROUP BY code
                  ORDER BY last_activity_at DESC,code""",
         ) if include_history_symbols else []
-        reviews = _rows(conn, "SELECT * FROM paper_reviews ORDER BY week_key DESC, account_id LIMIT 4")
-        last_jobs = _rows(conn, "SELECT * FROM paper_jobs ORDER BY market_date DESC, started_at DESC LIMIT 8")
         monitor_runs = _rows(conn, "SELECT * FROM paper_job_runs ORDER BY started_at DESC LIMIT 24")
         for run in monitor_runs:
             detail = _loads(run.get("detail"), {})
@@ -15035,7 +15050,10 @@ def dashboard(include_activity=False, include_history_symbols=False):
         }
         return {
             "accounts": accounts, "shared": shared, "capital_model": "shared_pool",
-            "positions": positions, "position_reviews": review_rows,
+            "positions": positions,
+            # 守仓评分明细（约 275KB）只服务于持仓卡片的 quality_* 投影，
+            # 浏览器从不消费整表；activity 工作区不再重复下发。
+            "position_reviews": [] if include_activity else review_rows,
             "orders": orders, "signals": signals,
             "today_summary": today_summary,
             "history_symbols": history_symbols,

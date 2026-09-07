@@ -1638,25 +1638,42 @@ async function previewPaperOrder(){
   try{
     var plan=await api('/api/paper/order-preview?'+paperOrderQuery(form));
     window._paperOrderPlan=plan; renderPaperOrderPreview(plan); return plan;
-  }catch(e){ $('paperOrderPreview').className='paper-order-preview block'; $('paperOrderPreview').textContent='预检失败：'+e.message; return null; }
+  }catch(e){ window._paperOrderPlan=null; $('paperOrderPreview').className='paper-order-preview block'; $('paperOrderPreview').textContent='预检失败：'+e.message; return null; }
 }
 async function submitPaperOrder(){
-  var form=paperOrderForm(), plan=await previewPaperOrder();
-  if(!plan||!plan.allowed) return;
-  if(!paperPlanHasExecutableQty(plan)){
-    renderPaperOrderPreview(Object.assign({},plan,{allowed:true,reasons:(plan.reasons||[]).concat(['当前模型可执行数量为 0 股，释放席位或等待下一轮扫描后再提交'])}));
-    return;
-  }
-  var action=form.side==='buy'?'买入':'卖出';
-  var state=plan.triggered?'立即按快照模拟成交':'进入当日限价委托';
-  if(!confirm(action+' '+plan.name+' '+plan.qty+' 股，'+state+'。这是纯本地模拟，不会发送到券商，继续吗？')) return;
-  $('paperSubmitOrder').disabled=true;
+  // 二次确认链路的防重保护：submitPaperOrder 是 /order/submit 的唯一入口，
+  // 但旧实现在"预检请求 → confirm 弹窗"期间按钮仍可点击。预检要跨一次
+  // 网络往返，快速双击会叠加两个 confirm 弹窗，若都确认就会提交两笔委托。
+  // 现在入口处立即置 in-flight 守卫并禁用按钮，finally 里按预检终态恢复。
+  if(window._paperOrderSubmitting) return;
+  window._paperOrderSubmitting=true;
+  var submit=$('paperSubmitOrder');
+  var wasEnabled=!!submit&&!submit.disabled;
+  if(wasEnabled) submit.disabled=true;
   try{
-    var result=await apiPost('/api/paper/order/submit?'+paperOrderQuery(form)+'&confirmed=true');
-    alert(result.status==='filled'?'模拟成交已写入账本。':(result.status==='pending_limit'?'限价委托已进入待触发队列。':'委托被模型拒绝。'));
-    clearPaperOrderPreview(); await loadPaper();
-  }catch(e){ alert('模拟委托失败：'+e.message); }
-  finally{ $('paperSubmitOrder').disabled=false; }
+    var form=paperOrderForm(), plan=await previewPaperOrder();
+    if(!plan||!plan.allowed) return;
+    if(!paperPlanHasExecutableQty(plan)){
+      renderPaperOrderPreview(Object.assign({},plan,{allowed:true,reasons:(plan.reasons||[]).concat(['当前模型可执行数量为 0 股，释放席位或等待下一轮扫描后再提交'])}));
+      return;
+    }
+    var action=form.side==='buy'?'买入':'卖出';
+    var state=plan.triggered?'立即按快照模拟成交':'进入当日限价委托';
+    if(!confirm(action+' '+plan.name+' '+plan.qty+' 股，'+state+'。这是纯本地模拟，不会发送到券商，继续吗？')) return;
+    try{
+      var result=await apiPost('/api/paper/order/submit?'+paperOrderQuery(form)+'&confirmed=true');
+      alert(result.status==='filled'?'模拟成交已写入账本。':(result.status==='pending_limit'?'限价委托已进入待触发队列。':'委托被模型拒绝。'));
+      clearPaperOrderPreview(); await loadPaper();
+    }catch(e){ alert('模拟委托失败：'+e.message); }
+  }finally{
+    window._paperOrderSubmitting=false;
+    // 恢复按钮时沿用 renderPaperOrderPreview 的语义：阻断态预检保持禁用，
+    // 成功/失败/取消（clearPaperOrderPreview 已清空 plan）恢复可用。
+    if(wasEnabled&&submit){
+      var endPlan=window._paperOrderPlan;
+      submit.disabled=!!(endPlan&&!(endPlan.allowed&&paperPlanHasExecutableQty(endPlan)));
+    }
+  }
 }
 function preparePaperSell(accountId,code,qty){
   $('paperOrderAccount').value=accountId; $('paperOrderCode').value=code; $('paperOrderQty').value=qty||0;
@@ -2104,33 +2121,9 @@ async function loadPaper(options){
     var riskFeed=(d.risk_decisions||[]).slice(0,5).map(function(r){
       return '<div style="padding:8px 0;border-bottom:1px solid #edf1ef;font-size:12px"><b>'+(r.account_name||r.account_id)+' · '+(r.side==='buy'?'买入':'卖出')+' '+(r.code||'')+'</b><br><span style="color:var(--text-secondary)">'+zhRiskText(r.reason||r.decision)+'</span></div>';
     }).join('');
-    var signalsByAccount={};
-    (d.signals||[]).forEach(function(s){ (signalsByAccount[s.account_id]||(signalsByAccount[s.account_id]=[])).push(s); });
-    var candidateCards=accounts.map(function(a){
-      var list=(signalsByAccount[a.id]||[]).slice(0,5);
-      var rows=list.map(function(s){
-        var pick=(s.payload&&s.payload.pick)||{}, heat=pick.sector_heat||{};
-    var stateMap={pending:'待开盘审批',filled:'已成交',blocked:'风控拦截',rejected:'已拒绝',deferred_capacity:'容量等待重排',superseded:'已失效',cancelled:'已撤销'};
-        var state=stateMap[s.status]||s.status;
-        var detail=(s.reason||'等待下一次检查').replace(/</g,'&lt;');
-        var stateClass=s.status==='pending'?'pending':(s.status==='filled'?'filled':(s.status==='superseded'||s.status==='cancelled'?'cancelled':'rejected'));
-        var audit=s.audit||{}, quotePct=audit.signal_quote_pct;
-        var quoteMove=(typeof quotePct==='number'?(quotePct>=0?'+':'')+fmt(quotePct,2)+'%':'\u2014');
-        var signalMarket=audit.signal_quote_at||'\u2014';
-        var plannedReview=audit.planned_review_date||s.intended_date||'\u2014';
-        var executionText=audit.execution_status==='filled'
-          ? ('\u5b9e\u9645\u6210\u4ea4 '+(audit.executed_at||'\u2014')+' \u00b7 \u884c\u60c5 '+(audit.execution_quote_at||'\u2014'))
-          : (s.status==='blocked'||s.status==='rejected'
-              ? '\u672a\u6267\u884c\uff1a\u98ce\u63a7\u5728\u4fe1\u53f7\u65f6\u70b9\u5df2\u62e6\u622a'
-              : '\u672a\u6210\u4ea4\uff1a\u7b49\u5f85\u8ba1\u5212\u5ba1\u6838');
-        var timeTrace='\u4fe1\u53f7\u884c\u60c5 '+signalMarket+'\uff08'+quoteMove+'\uff09 \u00b7 \u8ba1\u5212\u5ba1\u6838 '+plannedReview+' \u00b7 '+executionText;
-        return '<div class="paper-candidate-item"><div class="paper-candidate-symbol"><b>'+s.name+' '+s.code+'</b><span>'+(s.industry||'-')+(heat.rank?' · 板块第'+heat.rank:'')+'</span></div>'
-          +'<div class="paper-candidate-decision"><span class="paper-order-status '+stateClass+'">'+state+'</span><br><span style="color:#738078">模型 '+fmt(s.t_score,2)+' / 排名 '+fmt(s.rank_score,2)+'</span></div>'
-          +'<div class="paper-candidate-reason" title="'+detail+'">'+detail+'<br><span class="paper-signal-trace">'+timeTrace+'</span></div></div>';
-      }).join('');
-      return '<article class="paper-candidate-card"><div class="paper-candidate-head"><b>'+paperAccountDisplayName(a)+'</b><span>'+a.entry_model_name+' · '+list.length+' 个候选</span></div>'+(rows||'<div class="paper-empty">本时段尚未生成候选。</div>')+'</article>';
-    }).join('');
-    var overlapNote=(d.candidate_overlap||[]).map(function(x){ return x.left_name+' / '+x.right_name+' 重合 '+x.count+' 只（'+fmt(x.jaccard_pct,1)+'%）'; }).join('；') || '尚无可比较候选。';
+    // 组合视图曾用 signals 拼候选卡与重合度摘要，页面改版后这些 HTML
+    // 已无消费点，但每次 loadPaper 仍对 120 条 signals 做字符串拼接。
+    // 死代码已删除，activity 工作区不再为隐藏 DOM 付费。
     var latestMonitor=(d.monitor_runs||[])[0], monitorDetail=(latestMonitor&&latestMonitor.detail)||{};
     var monitorReason=monitorDetail.error||(monitorDetail.bootstrap&&monitorDetail.bootstrap.reason)||monitorDetail.reason;
     var monitorState=latestMonitor&&latestMonitor.status;
