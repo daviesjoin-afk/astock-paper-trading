@@ -7599,7 +7599,18 @@ def _strategy_pool_budget(conn, account, nav, positions, quotes, market=None, ex
         if not row_id:
             continue
         profiles[row_id] = _risk_profile(row)
-        weights[row_id] = max(_num(profiles[row_id].get("max_exposure"), 0.0), 0.01)
+        # A1 自进化落地：人工批准的 Bandit 策略权重覆盖共享池相对权重。
+        # 覆盖按 paper_accounts.params.adaptive_allocation 存储（status=active、
+        # 自带 effective_date），缺省或过期时回落到 max_exposure 基准。
+        row_params = _loads(row.get("params"), {}) or {}
+        alloc = row_params.get("adaptive_allocation") or {}
+        alloc_pct = _num(alloc.get("weight_pct"), 0.0)
+        if (alloc_pct > 0 and alloc.get("status") == "active"
+                and _runtime_parameter_active(
+                    alloc.get("effective_date"), status=alloc.get("status"))):
+            weights[row_id] = alloc_pct / 100.0
+        else:
+            weights[row_id] = max(_num(profiles[row_id].get("max_exposure"), 0.0), 0.01)
         values[row_id] = 0.0
     if account.get("id") not in values:
         account_id = account.get("id")
