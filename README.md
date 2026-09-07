@@ -151,10 +151,12 @@ chmod +x start.sh
 
 ```bash
 # Linux / macOS
-ASTOCK_DEMO=1 ./start.sh --local
+ASTOCK_DEMO=1 ./start.sh --local --no-scheduler
 # Windows PowerShell
-$env:ASTOCK_DEMO="1"; .\start.ps1 -Local
+$env:ASTOCK_DEMO="1"; .\start.ps1 -Local -NoScheduler
 ```
+
+`--no-scheduler` / `-NoScheduler` 关闭内置 3 分钟盘中调度器：演示账本是静态叙事，不应被盘中扫描改写或触发联网行情刷新。
 
 演示数据包含 10 只合成标的（6009xx）与一条完整叙事账本，看板每个页面都有内容可看：
 
@@ -165,7 +167,7 @@ $env:ASTOCK_DEMO="1"; .\start.ps1 -Local
 特性：
 
 - **幂等**：重复启动不会重复注入（以 `paper_audit event='demo_seeded'` 为标记）；`ASTOCK_DEMO_FORCE=1` 可强制重建。
-- **确定性**：同一版本代码产出完全相同的账本，可直接用于回归对比（见 [`docs/DEMO.md`](docs/DEMO.md)）。
+- **结构确定**：订单 / 成交 / 风控决策 / 持仓 / NAV 等结构化内容完全确定（时间戳与日期随运行当天取值），CI 以 golden replay 逐字节比对结构摘要，防止叙事漂移（见 [`docs/DEMO.md`](docs/DEMO.md)）。
 - **生产安全**：不设置该环境变量时，注入逻辑完全不触发。
 
 ## 本地开发与验证
