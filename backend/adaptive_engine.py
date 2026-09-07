@@ -2993,9 +2993,17 @@ def _compact_trade_attribution_overview(payload):
     return payload
 
 
+def _allocation_overview_safe():
+    """A1 自进化落地可观测：当前资金分摊覆盖 + 最新可批准的 Bandit 决策。"""
+    try:
+        import evolution_apply
+        return evolution_apply.allocation_overview(_connect, PAPER_DB_PATH)
+    except Exception:
+        return {"active": {}, "latest_decision": None}
+
+
 def _overview_uncached():
-    with _connect() as conn:
-        # 闭环指标：执行质量审计和午间观测上下文
+    with _connect() as conn:        # 闭环指标：执行质量审计和午间观测上下文
         try:
             import execution_quality_shadow as eqs
             execution_quality = eqs.audit(PAPER_DB_PATH, limit=3000)
@@ -3198,6 +3206,7 @@ def _overview_uncached():
         },
         "risk_optimizer": risk_optimizer,
         "selection_optimizer": selection_optimizer,
+        "allocation": _allocation_overview_safe(),
         "deepseek_advisor": advisor,
         "news_learning": news_center,
         "trade_attribution": trade_attribution_view,
