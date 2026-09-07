@@ -22,29 +22,45 @@ def _load_source(path):
 
 
 class ActivityOverviewSlimTests(unittest.TestCase):
-    """dashboard() must gate portfolio-only queries behind include_activity."""
+    """dashboard() must gate portfolio-only queries behind include_activity.
+
+    The read-model implementation lives in dashboard_queries.py (extracted in
+    the paper_trading split); paper_trading.py keeps a thin facade so the
+    historical public import path keeps working.  Structural assertions target
+    the implementation module, not the facade.
+    """
 
     def setUp(self):
-        self.source = _load_source(os.path.join(BACKEND, "paper_trading.py"))
+        self.pt_source = _load_source(os.path.join(BACKEND, "paper_trading.py"))
+        self.dq_source = _load_source(os.path.join(BACKEND, "dashboard_queries.py"))
+
+    def _dashboard_source(self, source):
+        import ast
+        tree = ast.parse(source)
+        for node in ast.walk(tree):
+            if isinstance(node, ast.FunctionDef) and node.name == "dashboard":
+                lines = source.splitlines()
+                return "\n".join(lines[node.lineno - 1:node.end_lineno])
+        self.fail("dashboard() not found in the scanned module")
+
+    def test_facade_keeps_public_import_path(self):
+        # paper_trading.dashboard stays a thin wrapper over the new module.
+        self.assertIn("def dashboard(", self.pt_source)
+        self.assertIn(
+            "from dashboard_queries import dashboard as _impl",
+            self.pt_source,
+            "paper_trading.dashboard must forward to dashboard_queries.dashboard",
+        )
 
     def test_activity_guard_branch_exists(self):
         self.assertIn(
             "if include_activity:",
-            self.source,
+            self.dq_source,
             "dashboard() needs an explicit include_activity branch",
         )
 
-    def _dashboard_source(self):
-        import ast
-        tree = ast.parse(self.source)
-        for node in ast.walk(tree):
-            if isinstance(node, ast.FunctionDef) and node.name == "dashboard":
-                lines = self.source.splitlines()
-                return "\n".join(lines[node.lineno - 1:node.end_lineno])
-        self.fail("dashboard() not found in paper_trading.py")
-
     def test_signals_query_is_not_duplicated_outside_the_guard(self):
-        body = self._dashboard_source()
+        body = self._dashboard_source(self.dq_source)
         self.assertEqual(
             body.count("FROM paper_signals"), 2,
             "dashboard must keep exactly the projection query plus its JSON1 fallback",
@@ -63,12 +79,12 @@ class ActivityOverviewSlimTests(unittest.TestCase):
             "reviews = []",
             "last_jobs = []",
         ):
-            self.assertIn(expected, self.source, expected)
+            self.assertIn(expected, self.dq_source, expected)
 
     def test_position_reviews_response_field_is_activity_gated(self):
         self.assertIn(
             "[] if include_activity else review_rows",
-            self.source,
+            self.dq_source,
             "position_reviews must be omitted from the activity response",
         )
 
