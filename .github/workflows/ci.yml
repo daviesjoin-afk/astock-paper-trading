@@ -134,6 +134,7 @@ jobs:
       - name: Run backend tests with network disabled
         run: >
           docker run --rm --network none
+          --tmpfs /app/data_cache:rw,size=64m,uid=10001,gid=10001
           astock-codex:ci python -m unittest discover -s backend -p "test_*.py"
 
       - name: Start isolated paper-only container
