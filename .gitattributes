@@ -1,0 +1,19 @@
+# Normalize every text file to LF in the repository AND in working trees,
+# regardless of the committer's core.autocrlf.  Rationale: this repo is
+# deployed to a Linux server via `git archive` tarballs; with
+# core.autocrlf=true on Windows, `git archive` used to bake CRLF into the
+# tarball and broke bash scripts on the server ("set: pipefail: invalid
+# option name").
+* text=auto eol=lf
+
+# Windows-only scripts keep CRLF locally so cmd and PowerShell stay happy.
+*.bat text eol=crlf
+*.ps1 text eol=crlf
+
+# Binary assets - never normalize.
+*.png binary
+*.jpg binary
+*.gif binary
+*.ico binary
+*.woff binary
+*.woff2 binary
