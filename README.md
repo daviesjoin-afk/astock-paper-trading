@@ -145,6 +145,29 @@ chmod +x start.sh
 
 完整的 **clone → 安装依赖 → 看板 → 数据准备 → 手动扫描** 流程见 [`docs/RUNBOOK.md`](docs/RUNBOOK.md)。
 
+## 离线确定性演示（ASTOCK_DEMO=1）
+
+不想先接真实行情？设置环境变量 `ASTOCK_DEMO=1` 再启动，系统会在首次启动时注入一套**完全合成的演示数据**，无需网络、无需 API key、无需任何凭据：
+
+```bash
+# Linux / macOS
+ASTOCK_DEMO=1 ./start.sh --local
+# Windows PowerShell
+$env:ASTOCK_DEMO="1"; .\start.ps1 -Local
+```
+
+演示数据包含 10 只合成标的（6009xx）与一条完整叙事账本，看板每个页面都有内容可看：
+
+- **信号 → 风控 → 订单 → 成交 → NAV** 的全链路审计证据
+- 一笔正常买入成交、一笔 **T+1 当日卖出被拒**、一笔**陈旧报价拒单**、一笔**硬止损卖出**、一笔**涨停价买入**、持仓质量复盘（卖出/继续持有）与 5 日净值曲线
+- 多账户共享资金池、席位容量与策略级风控参数的运行快照
+
+特性：
+
+- **幂等**：重复启动不会重复注入（以 `paper_audit event='demo_seeded'` 为标记）；`ASTOCK_DEMO_FORCE=1` 可强制重建。
+- **确定性**：同一版本代码产出完全相同的账本，可直接用于回归对比（见 [`docs/DEMO.md`](docs/DEMO.md)）。
+- **生产安全**：不设置该环境变量时，注入逻辑完全不触发。
+
 ## 本地开发与验证
 
 ```bash
