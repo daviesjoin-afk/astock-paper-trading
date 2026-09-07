@@ -32,7 +32,7 @@ class DeterministicDemoTests(unittest.TestCase):
         # Redirect every data path the pipeline touches into the temp dir.
         cls._patches = []
         for target, attr in (
-            (dfc, "CACHE_DIR"), (dfc, "MARKET_SNAPSHOT_FULL_CACHE_PATH"),
+            (dfc, "CACHE_DIR"), (dfc, "KLINE_DIR"), (dfc, "MARKET_SNAPSHOT_FULL_CACHE_PATH"),
             (U, "UNIVERSE_PATH"), (PT, "DB_PATH"),
         ):
             old = getattr(target, attr)
