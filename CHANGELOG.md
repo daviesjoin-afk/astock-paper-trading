@@ -2,6 +2,17 @@
 
 本文记录版本变化；GitHub Release 同步提供详细更新、升级步骤和已知限制。
 
+## v1.2.0 — 确定性演示、离线 CI 与引擎模块化
+
+发布日期：2026-09-07。详见 [完整发布说明](docs/RELEASE-v1.2.0.md)。
+
+- 新增确定性离线演示（`ASTOCK_DEMO=1`）：合成标的 + 完整叙事账本，零网络零凭据，幂等注入，CI 以 golden replay 逐字节比对结构摘要。
+- CI 增加 `--network none` 离线测试层；`CONTRIBUTING.md` 明确测试分层规范；回归总数增至 239 项。
+- 引擎模块化 Phase 1/2：`dashboard_queries.py` 读模型与 `manual_orders.py` 手动下单链（8 函数/1019 行）拆出，`paper_trading.py` 降至 14682 行，facade 保持 API 兼容。
+- 新增 `docs/TEST_MATRIX.md` 测试场景矩阵 + 3 项规则层测试；缺口拆为 #21–26 good-first-issue。
+- 活动概览响应瘦身约 59%，手动下单提交防重复守卫；前端引入 esbuild 构建管线。
+- 新增 `.gitattributes` 强制 LF 根治 EOL 问题；开启 Discussions 与 good-first-issue 子任务体系。
+
 ## v1.1.0 — 运行设置、五策略与恢复流程修复
 
 发布日期：2026-09-05。详见 [完整发布说明](docs/RELEASE-v1.1.0.md)。
