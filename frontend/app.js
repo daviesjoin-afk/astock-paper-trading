@@ -506,6 +506,7 @@ function renderAdaptive(d){
     +'<section class="adaptive-panel adaptive-advisor-evidence"><header><div><span>DEEPSEEK · DATA QUALITY + TUNING</span><h3>模拟盘数据校验与有界调参</h3></div><div class="adaptive-advisor-actions"><em>'+adaptiveEsc(deepseek.model||'deepseek-v4-flash')+'</em><button id="advisorRunButton" class="ghost" onclick="runAdaptiveAdvisor()" '+(advisorReady?'':'disabled')+'>运行数据质量审阅</button><button id="adaptiveAiTuneInlineButton" class="ghost" onclick="runAdaptiveAiTuning()" '+(advisorReady&&aiTuning.enabled?'':'disabled')+'>运行AI有界调参</button></div></header><div class="adaptive-advisor-summary"><div><small>数据审阅</small><b>'+adaptiveEsc(advisorState)+'</b></div><div><small>AI调参状态</small><b>'+adaptiveEsc(aiTuningState)+'</b></div><div><small>确定性异常</small><b>'+Number(deterministicCount)+'</b></div><div><small>审阅置信度</small><b>'+adaptiveValue(advisorReport.confidence,'%',0)+'</b></div><div><small>跨源真实性</small><b class="'+(advisorReport.cross_source_status==='verified'?'up':'down')+'">'+crossSourceLabel+'</b></div><div><small>双源覆盖 / 一致</small><b>'+adaptiveValue(crossSource.coverage_pct,'%',1)+' / '+adaptiveValue(crossSource.agreement_pct,'%',1)+'</b></div></div><div class="adaptive-advisor-report"><div><h4>审阅摘要</h4><p>'+adaptiveEsc(advisorReport.summary||deepseek.truth_boundary||'DeepSeek只复核确定性证据；行情真实性仍需独立数据源交叉验证。')+'</p><small>市场状态：'+(advisorMarket.session_status==='closed'?'已收盘':'交易中')+' · 收盘口径 '+adaptiveEsc(String(advisorMarket.close_cutoff_at||'—').replace('T',' '))+' · 源行情最后到达 '+adaptiveEsc(String(advisorMarket.latest_source_at||'—').replace('T',' '))+' · 最近审阅 '+adaptiveEsc(String(advisorLatest.finished_at||'—').replace('T',' '))+'</small></div><ul>'+advisorFindings+'</ul></div><div class="adaptive-notice">AI只可在五套模拟账户内提出白名单权重、入场阈值和选股条件的小步补丁；系统先做行情质量、跨源、幅度、冷却和回滚校验，再允许盘中同日生效。AI不能下单、修改公共选股或放宽风控；超出边界的建议只留在影子候选中。</div></section>'
     +'<section class="adaptive-panel adaptive-research-suite"><header><div><span>DEEPSEEK · PAPER RESEARCH SUITE</span><h3>模拟盘智能研究任务</h3></div><button id="advisorSuiteButton" class="ghost" onclick="runAdaptiveResearchSuite()" '+(advisorReady?'':'disabled')+'>运行全部研究任务</button></header><p class="adaptive-copy">收盘后自动运行；每项独立留痕。结论只能进入研究和人工复核，不能直接改选股、风控或订单。</p><div class="adaptive-research-grid">'+researchCards+'</div></section>'
     +'<section class="adaptive-panel"><header><div><span>CONTEXTUAL BANDIT</span><h3>五策略影子分配</h3></div><em>总和 100% · 不改变账户资金</em></header><div class="adaptive-strategy-grid">'+strategyCards+'</div>'+allocationActionPanel(d)+'<div class="adaptive-notice">'+adaptiveEsc(d.data_note||'')+'</div></section>'
+    +'<section class="adaptive-panel"><header><div><span>EVOLUTION A/B · VERSION ATTRIBUTION</span><h3>进化版本对照归因</h3></div><em>部署后 5 净值日 vs 部署前等长基线</em></header>'+abValidationPanel(d)+'</section>'
     +'<div class="adaptive-grid"><section class="adaptive-panel"><header><div><span>GENETIC ALGORITHM</span><h3>GA Alpha 实验室</h3></div><em>非神经网络</em></header><p class="adaptive-copy">'+alpha.architecture+'</p><div class="adaptive-progress-copy"><span>画像日 '+Number(alpha.profile_days||0)+' / '+Number(alpha.required_profile_days||10)+'</span><span>成熟标签 '+Number(alpha.mature_rows||0)+' / '+Number(alpha.required_mature_rows||5000)+'</span></div>'+adaptiveBar(alphaProgress,'ga')+'<ul class="adaptive-alpha-list">'+candidateRows+'</ul></section><section class="adaptive-panel"><header><div><span>MULTI-HORIZON REWARD</span><h3>策略周期兑现</h3></div><em>1日 20% · 3日 35% · 5日 45%</em></header><div class="table-scroll"><table class="adaptive-horizon-table"><thead><tr><th>策略</th><th>1日超额</th><th>3日超额</th><th>5日超额</th></tr></thead><tbody>'+horizonRows+'</tbody></table></div></section></div>'
     +'<div class="adaptive-grid"><section class="adaptive-panel"><header><div><span>RISK GATE</span><h3>放权门槛</h3></div><em>默认全部锁定</em></header><ul class="adaptive-guardrails">'+guardrails+'</ul></section><section class="adaptive-panel"><header><div><span>AUDIT LOG</span><h3>真实学习日志</h3></div><em>不展示虚构迭代数</em></header><ul class="adaptive-run-log">'+runRows+'</ul></section></div>'
     +'</div>';
@@ -735,6 +736,21 @@ async function loadEvolutionStatus(){
   }catch(e){setEl('aiLogTable','<div class="banner">加载进化日志失败：'+adaptiveEsc(e.message)+'</div>');}
 }
 
+function abValidationPanel(d){
+  var v=(d&&d.validation)||{},rows=v.rows||[];
+  var label={risk:'风控版本',selection:'选股进化',allocation:'资金分摊',tuner:'AI调参'};
+  var verdictCls={pass:'up',fail:'down',observing:''};
+  var body=rows.map(function(r){
+    return '<tr><td>'+adaptiveEsc(r.account_id||'')+'</td><td>'+adaptiveEsc(label[r.kind]||r.kind)+'</td>'
+      +'<td>'+adaptiveEsc(String(r.version||'—'))+'</td>'
+      +'<td>'+Number(r.observation_days||0)+'/'+Number(v.min_observation_days||5)+' 净值日</td>'
+      +'<td class="'+(verdictCls[r.verdict]||'')+'">'+(r.excess_pct==null?'—':adaptiveValue(r.excess_pct,'%',2))+'</td>'
+      +'<td><b>'+adaptiveEsc(r.verdict==='pass'?'有效':(r.verdict==='fail'?'弱于基线':'观察中'))+'</b></td>'
+      +'<td>'+adaptiveEsc(String(r.deployed_at||'—')).replace('T',' ').substring(0,10)+'</td></tr>';
+  }).join('');
+  if(!body){return '<div class="adaptive-notice">尚无生效的进化部署；应用任一版本后，收盘学习会自动记录部署前后 A/B 对照。</div>';}
+  return '<div class="table-scroll"><table class="adaptive-table"><thead><tr><th>账户</th><th>通道</th><th>版本</th><th>观察期</th><th>超额(vs部署前基线)</th><th>结论</th><th>部署日</th></tr></thead><tbody>'+body+'</tbody></table></div>';
+}
 function allocationActionPanel(d){
   var alloc=(d&&d.allocation)||{},latest=alloc.latest_decision||{},active=alloc.active||{};
   var rows=Object.keys(active).map(function(id){var a=active[id]||{};return '<li><div><b>'+adaptiveEsc(id)+'</b><small>当前分摊 '+adaptiveValue(a.weight_pct,'%',1)+' · 决策 #'+adaptiveEsc(String(a.decision_id||'—'))+' · 生效 '+adaptiveEsc(String(a.effective_date||'—'))+'</small></div><button class="ghost" onclick="rollbackAdaptiveAllocation(\''+adaptiveEsc(id)+'\')">回滚分摊</button></li>';}).join('');
