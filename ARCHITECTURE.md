@@ -61,15 +61,15 @@ SQLite 纸盘账本（订单、成交、持仓、NAV、审计、租约）
 ```text
 调度触发
   → 获取并校验当轮行情（覆盖率、时间戳、双源一致性）
-  → 读取当前周期的两套 active 账户
-  → 生成 tq_breakout / main_force_top10 候选
+  → 读取当前周期全部 active 账户（由策略注册表界定）
+  → 逐策略生成候选车道并做风控退出检查
   → 先执行风险退出，再做入场与盘中事件
   → 共享资金池、席位、行业/单票权重、T+1、整手、涨跌停门禁
   → SQLite 事务写入订单/成交/NAV/审计
   → 前端按缓存代次读取最新只读投影
 ```
 
-`strategy_registry.active_ids()` 是新周期的策略范围单一事实来源。当前新周期只有 `tq_breakout` 和 `main_force_top10`；`ACCOUNT_SPECS` 中的旧策略定义只为历史账本、回放和兼容读取保留，不会获得新周期资金、信号或调度时间。
+`strategy_registry.active_ids()` 是新周期的策略范围单一事实来源。当前五套注册策略（`tq_breakout`、`trend_pullback`、`sector_rotation`、`reported_profit_breakout`、`main_force_top10`）均处于 active 状态并支持新周期，按共享资金池独立分配预算、候选车道、风控与调度时间；注册表中的 legacy 定义只为历史账本、回放和兼容读取保留，不再进入新周期。
 
 ## 模块职责速查
 

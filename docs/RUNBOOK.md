@@ -30,7 +30,7 @@ python -m uvicorn backend.main:app --host 127.0.0.1 --port 8600
 打开 http://127.0.0.1:8600
 
 首次访问数据相关页面时，引擎会**自动初始化**：
-- 在 `data_cache/` 下创建 SQLite（`paper_trading.sqlite3`，建表 + 两套启用策略账户 + 初始资金周期；旧策略历史记录保留但停用）
+- 在 `data_cache/` 下创建 SQLite（`paper_trading.sqlite3`，建表 + 策略注册表界定的全部 active 策略账户 + 初始资金周期；旧策略历史记录保留但停用）
 - 若本地还没有股票池 `data_cache/universe.json`，会**懒构建**全 A 码表（联网，约 1~3 分钟）
 - 前端静态页由 API 伺服（`/assets`、`/`）
 
