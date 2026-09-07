@@ -275,17 +275,31 @@ def _build_tuning_user_prompt(evidence, accounts, mode):
     )
 
 
-def _check_consensus(mimo_proposals, deepseek_proposals, accounts_map):
+def _check_consensus(mimo_proposals, deepseek_proposals, accounts_map, evolution=None):
     """检查两个AI的提案是否达成共识。
 
     共识条件：
     1. 两个AI的 decision 都是 "propose"
     2. 对同一 account_id 的权重调整方向一致（同增/同减）
-    3. 调整幅度比 >= CONSENSUS_WEIGHT_MAGNITUDE_RATIO
+    3. 调整幅度比 >= weight_magnitude_ratio（A2b：默认取 self_evolution 当前
+       参数版本的 consensus_weight_ratio，缺省回落到模块常量）
     4. 入场阈值调整方向一致
+
+    A2b 接线：weight_step / entry_step / max_proposals 同样来自
+    self_evolution 当前参数版本（max_weight_delta / max_delta_threshold /
+    max_proposals_per_run），使进化参数真正约束调参输出，而不是只进日志。
 
     返回 (consensus: bool, reason: str, merged: list)
     """
+    evolution = evolution or {}
+    weight_magnitude_ratio = max(0.1, min(1.0, _num(
+        evolution.get("consensus_weight_ratio"), CONSENSUS_WEIGHT_MAGNITUDE_RATIO)))
+    weight_step = max(0.005, min(0.05, _num(
+        evolution.get("max_weight_delta"), CONSENSUS_MAX_WEIGHT_STEP)))
+    entry_step = max(0.001, min(0.01, _num(
+        evolution.get("max_delta_threshold"), CONSENSUS_MAX_DELTA_STEP)))
+    max_proposals = max(1, int(_num(
+        evolution.get("max_proposals_per_run"), 3)))
     if not mimo_proposals or not deepseek_proposals:
         return False, "至少一个AI未提出有效提案", []
 
@@ -370,9 +384,9 @@ def _check_consensus(mimo_proposals, deepseek_proposals, accounts_map):
             # 幅度比检查（仅当两者都有显著调整时）
             if abs(m_delta) > 0.005 and abs(d_delta) > 0.005:
                 ratio = min(abs(m_delta), abs(d_delta)) / max(abs(m_delta), abs(d_delta))
-                if ratio < CONSENSUS_WEIGHT_MAGNITUDE_RATIO:
+                if ratio < weight_magnitude_ratio:
                     weight_consensus = False
-                    disagreements.append(f"[{account_id}] {factor}: 幅度比={ratio:.2f} < {CONSENSUS_WEIGHT_MAGNITUDE_RATIO}")
+                    disagreements.append(f"[{account_id}] {factor}: 幅度比={ratio:.2f} < {weight_magnitude_ratio}")
                     continue
 
             # 取两者平均值作为共识值
@@ -421,8 +435,8 @@ def _check_consensus(mimo_proposals, deepseek_proposals, accounts_map):
             bounded_weights = {}
             for factor, value in weight_details.items():
                 base_val = _num(base_weights.get(factor), value)
-                bounded = min(max(value, base_val - CONSENSUS_MAX_WEIGHT_STEP),
-                              base_val + CONSENSUS_MAX_WEIGHT_STEP)
+                bounded = min(max(value, base_val - weight_step),
+                              base_val + weight_step)
                 bounded_weights[factor] = min(max(bounded, 0.0), 1.0)
             try:
                 import adaptive_selection as _selection
@@ -432,14 +446,15 @@ def _check_consensus(mimo_proposals, deepseek_proposals, accounts_map):
                 pass
             if set(bounded_weights) != set(base_weights) or any(
                     abs(_num(bounded_weights.get(key), 0.0) - _num(base_weights.get(key), 0.0))
-                    > CONSENSUS_MAX_WEIGHT_STEP + 1e-6
+                    > weight_step + 1e-6
                     for key in base_weights):
-                disagreements.append(f"[{account_id}] 归一化后单因子权重变化超过±3%，拒绝共识")
+                disagreements.append(
+                    f"[{account_id}] 归一化后单因子权重变化超过±{weight_step:.3f}，拒绝共识")
                 continue
             current_entry = _num(base.get("entry_score_delta"), merged_delta)
             merged_delta = round(
-                current_entry + max(-CONSENSUS_MAX_DELTA_STEP,
-                                    min(CONSENSUS_MAX_DELTA_STEP, merged_delta - current_entry)),
+                current_entry + max(-entry_step,
+                                    min(entry_step, merged_delta - current_entry)),
                 6,
             )
             for key, value in list(merged_conditions.items()):
@@ -463,6 +478,7 @@ def _check_consensus(mimo_proposals, deepseek_proposals, accounts_map):
     if not merged:
         return False, "无有效共识提案", []
 
+    merged = merged[:max_proposals]
     return True, f"双AI对 {len(merged)} 个账户达成共识", merged
 
 
@@ -574,10 +590,19 @@ def run_dual_ai_tuning(connect_factory, paper_db_path, snapshot_paths, evidence_
         if mimo_decision == "hold" and ds_decision == "hold":
             consensus_reason = "双AI一致认为当前证据不足，保持现状"
         elif mimo_decision == "propose" and ds_decision == "propose":
+            # A2b：调参边界读取 self_evolution 当前参数版本（读失败回落默认值，
+            # 绝不让追踪/进化库的异常阻塞调参主流程）。
+            try:
+                import self_evolution as _SE
+                _SE.ensure_schema(conn)
+                _evolution_params = _SE.get_current_params(conn).get("params") or {}
+            except Exception:
+                _evolution_params = {}
             consensus, consensus_reason, merged_proposals = _check_consensus(
                 mimo_r.get("proposals") or [],
                 ds_r.get("proposals") or [],
-                accounts_map
+                accounts_map,
+                evolution=_evolution_params,
             )
         else:
             consensus_reason = f"决策分歧：MiMo={mimo_decision}, DeepSeek={ds_decision}"
@@ -722,7 +747,7 @@ def recent_runs(conn, limit=20):
                   mimo_status, mimo_model, mimo_latency_ms, mimo_error,
                   deepseek_status, deepseek_model, deepseek_latency_ms, deepseek_error,
                   consensus_result, consensus_reason, merged_proposals,
-                  total_latency_ms, created_at, finished_at
+                  total_latency_ms, created_at, finished_at, applied_ids
            FROM dual_ai_tuning_runs ORDER BY id DESC LIMIT ?""",
         (limit,)
     ).fetchall()
@@ -736,6 +761,7 @@ def recent_runs(conn, limit=20):
             "consensus_result": row[14], "consensus_reason": row[15],
             "merged_proposals": _loads(row[16], []),
             "total_latency_ms": row[17], "created_at": row[18], "finished_at": row[19],
+            "applied_ids": _loads(row[20], None),
         })
     return result
 
