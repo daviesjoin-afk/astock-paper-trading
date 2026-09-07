@@ -37,3 +37,6 @@ server.log
 .env.*
 !.env.example
 *.tgz
+
+# Node build artifacts
+frontend/node_modules/
