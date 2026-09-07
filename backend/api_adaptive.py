@@ -443,6 +443,80 @@ def apply_selection(
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
+# ---------------------------------------------------------------------------
+# A 批自进化落地通道：Bandit 资金分摊 + 双AI共识提案
+# ---------------------------------------------------------------------------
+
+@router.post("/allocation/apply")
+def apply_allocation(
+    decision_id: int = Query(..., gt=0),
+    approved_by: str = Query("human", min_length=1, max_length=80),
+    confirmed: bool = Query(False),
+):
+    """人工批准把 Bandit 策略权重写入共享资金池分摊。"""
+    _require_confirmation(confirmed, "批准资金分摊版本")
+    import evolution_apply
+    try:
+        return evolution_apply.apply_allocation(
+            adaptive._connect, adaptive.PAPER_DB_PATH, decision_id,
+            approved_by=_MANUAL_ACTOR, confirmed=True,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@router.post("/allocation/rollback")
+def rollback_allocation(
+    account_id: str = Query(...),
+    reason: str = Query("人工回滚", max_length=300),
+    confirmed: bool = Query(False),
+):
+    _require_confirmation(confirmed, "回滚资金分摊版本")
+    import evolution_apply
+    try:
+        return evolution_apply.rollback_allocation(
+            adaptive.PAPER_DB_PATH, account_id, reason,
+            approved_by=_MANUAL_ACTOR, confirmed=True,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@router.post("/tuner/apply")
+def apply_tuner_proposals(
+    run_id: int = Query(..., gt=0),
+    approved_by: str = Query("human", min_length=1, max_length=80),
+    confirmed: bool = Query(False),
+):
+    """人工批准把双AI共识提案写入选股因子权重覆盖。"""
+    _require_confirmation(confirmed, "批准AI调参提案")
+    import evolution_apply
+    try:
+        return evolution_apply.apply_tuner_proposals(
+            adaptive._connect, adaptive.PAPER_DB_PATH, run_id,
+            approved_by=_MANUAL_ACTOR, confirmed=True,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@router.post("/tuner/rollback")
+def rollback_tuner_overlay(
+    account_id: str = Query(...),
+    reason: str = Query("人工回滚", max_length=300),
+    confirmed: bool = Query(False),
+):
+    _require_confirmation(confirmed, "回滚AI调参覆盖")
+    import evolution_apply
+    try:
+        return evolution_apply.rollback_tuner_overlay(
+            adaptive._connect, adaptive.PAPER_DB_PATH, account_id, reason,
+            approved_by=_MANUAL_ACTOR, confirmed=True,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
 @router.post("/neural/approve")
 def approve_neural_network(
     confirmed: bool = Query(False),

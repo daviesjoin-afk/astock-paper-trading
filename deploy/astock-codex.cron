@@ -59,6 +59,11 @@ HOME=<SERVER_PATH>
 # 15:15 收盘快照确认：强制刷新全市场行情，仅采集数据，不下单、不改参数。
 15 15 * * 1-5 root flock -n <SERVER_PATH>/.locks/resource-heavy.lock docker exec astock-data-worker python backend/close_snapshot_runner.py >><SERVER_PATH>/reports/close-snapshot-scheduler.log 2>&1
 
+# 盘后自进化闭环（observe→evaluate→mutate→validate→apply）：此前无任何调度，
+# evolution_params 从未被驱动。16:45 在收盘学习（15:35/15:55/16:15）之后运行，
+# time-budget 保证不跨时段久占；失败自然由下一个交易日续跑（不自动重放）。
+45 16 * * 1-5 root flock -n <SERVER_PATH>/.locks/adaptive-close.lock docker exec astock-task-worker python backend/evolution_loop_runner.py --generations 1 --time-budget 240 >><SERVER_PATH>/reports/evolution-loop.log 2>&1
+
 # 盘后自进化：使用完整收盘数据更新盘面画像、多周期奖励与 Bandit 影子权重，不改实盘、不下单。
 35 15 * * 1-5 root flock -n <SERVER_PATH>/.locks/adaptive-close.lock docker exec astock-task-worker python backend/adaptive_runner.py --trigger scheduled-close >><SERVER_PATH>/reports/adaptive-scheduler.log 2>&1
 # 若15:35与历史恢复抢占同一资源锁，延后重试，避免成熟奖励长期停在旧值。
