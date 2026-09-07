@@ -111,5 +111,26 @@ class OrderConfirmGuardTests(unittest.TestCase):
         )
 
 
+class FrontendMirrorTests(unittest.TestCase):
+    """The checked-in legacy mirror must stay byte-identical to the source.
+
+    frontend/assets/app.js is the legacy URL kept aligned by CI (cmp) and by
+    the Dockerfile (install).  Editing frontend/app.js without refreshing the
+    mirror made the syntax CI job fail on an otherwise green PR.
+    """
+
+    def test_app_js_mirror_is_byte_identical(self):
+        with open(os.path.join(FRONTEND, "app.js"), "rb") as handle:
+            canonical = handle.read()
+        with open(os.path.join(FRONTEND, "assets", "app.js"), "rb") as handle:
+            mirror = handle.read()
+        self.assertEqual(
+            canonical,
+            mirror,
+            "frontend/assets/app.js drifted from frontend/app.js; "
+            "copy the canonical file over the mirror",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
