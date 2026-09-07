@@ -3447,8 +3447,11 @@ def _market_state(asof_date, live_universe=None, *, allow_network=True):
         light, reason = "green", f"实时沪深300 {live_pct:+.2f}%，指数趋势正常"
     # 北向资金（P1）：同花顺分钟累计净流入。仅作情绪上下文展示与审计，
     # 不改变 light 门控——北向数据的当日语义（是否含买断额度）仍不稳。
+    # 与指数/海外源一致：read-model 调用（allow_network=False，例如
+    # dashboard 的逐账户市场灯）不得发起外部请求，否则一次页面刷新会
+    # 产生多次串行网络调用并拖慢只读响应。
     northbound = None
-    if AD is not None:
+    if AD is not None and allow_network:
         try:
             northbound = AD.northbound_realtime()
         except Exception:

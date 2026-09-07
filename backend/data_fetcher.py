@@ -462,6 +462,20 @@ _clist_host_health = {}  # {host: {"failures": int, "cooldown_until": float}}
 _CLIST_HOST_COOLDOWN_BASE = 30
 _CLIST_HOST_MAX_COOLDOWN = 300
 FULL_MARKET_MIN_ROWS = 4000
+
+
+def _full_market_min_rows():
+    """Row threshold for a 'complete' full-market snapshot.
+
+    Production default is FULL_MARKET_MIN_ROWS.  Demo mode (ASTOCK_DEMO=1)
+    writes a small synthetic snapshot and overrides this via
+    ASTOCK_FULL_MARKET_MIN_ROWS so the read models consume the synthetic data
+    instead of falling back to network paths.
+    """
+    value = os.environ.get("ASTOCK_FULL_MARKET_MIN_ROWS", "").strip()
+    if value.isdigit():
+        return int(value)
+    return FULL_MARKET_MIN_ROWS
 FLOW_MIN_COVERAGE = 0.90
 _flow_fetch_state = {
     "status": "unknown", "total": 0, "rows": 0, "coverage_pct": 0.0,
@@ -605,7 +619,7 @@ def _full_snapshot_payload_is_complete(payload):
     if not isinstance(payload, dict) or payload.get("complete") is not True:
         return False
     rows = payload.get("rows")
-    if not isinstance(rows, list) or len(rows) < FULL_MARKET_MIN_ROWS:
+    if not isinstance(rows, list) or len(rows) < _full_market_min_rows():
         return False
     try:
         expected = int(payload.get("expected_rows") or 0)
@@ -615,7 +629,7 @@ def _full_snapshot_payload_is_complete(payload):
         return False
     codes = {str(row.get("code") or "") for row in rows if isinstance(row, dict)}
     codes.discard("")
-    return len(codes) >= max(FULL_MARKET_MIN_ROWS, int(expected * 0.90))
+    return len(codes) >= max(_full_market_min_rows(), int(expected * 0.90))
 
 
 def load_market_snapshot_full_cached():
@@ -703,7 +717,7 @@ def fetch_market_snapshot_full(max_age=240, force=False):
         # has already checked the bounded cache age; a failed refresh must stop
         # the candidate scan and trigger source recovery instead.
         rows = fetch_market_snapshot(pages=None, allow_disk_fallback=False)
-        if isinstance(rows, list) and len(rows) >= FULL_MARKET_MIN_ROWS:
+        if isinstance(rows, list) and len(rows) >= _full_market_min_rows():
             return rows
         return []
 
