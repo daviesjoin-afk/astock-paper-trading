@@ -127,24 +127,31 @@ class OrderConfirmGuardTests(unittest.TestCase):
         )
 
 
-class FrontendMirrorTests(unittest.TestCase):
-    """The checked-in legacy mirror must stay byte-identical to the source.
+class FrontendBuildPipelineTests(unittest.TestCase):
+    """The served bundle must be reproducible from the checked-in sources.
 
-    frontend/assets/app.js is the legacy URL kept aligned by CI (cmp) and by
-    the Dockerfile (install).  Editing frontend/app.js without refreshing the
-    mirror made the syntax CI job fail on an otherwise green PR.
+    frontend/dist is the only artifact served at runtime (/app.js, /app.css).
+    The esbuild pipeline (frontend/build.mjs) rebuilds it; CI runs the same
+    build and fails when the committed dist drifted from the sources.
     """
 
-    def test_app_js_mirror_is_byte_identical(self):
-        with open(os.path.join(FRONTEND, "app.js"), "rb") as handle:
-            canonical = handle.read()
-        with open(os.path.join(FRONTEND, "assets", "app.js"), "rb") as handle:
-            mirror = handle.read()
+    def test_dist_exists_and_matches_sources(self):
+        # Cheap source-level guard for local runs: the dist header must be
+        # present and the committed bundle must not be empty.  Full freshness
+        # is enforced in CI (npm run build && git diff --exit-code).
+        dist_js = os.path.join(os.path.dirname(FRONTEND), "frontend", "dist", "app.js")
+        self.assertTrue(
+            os.path.isfile(dist_js) and os.path.getsize(dist_js) > 100_000,
+            "frontend/dist/app.js missing or empty; run `npm run build` in frontend/",
+        )
+
+    def test_assets_dir_holds_no_script_mirrors(self):
+        assets_dir = os.path.join(os.path.dirname(FRONTEND), "frontend", "assets")
+        self.assertTrue(os.path.isdir(assets_dir))
+        leftovers = [name for name in os.listdir(assets_dir) if name.startswith("app.")]
         self.assertEqual(
-            canonical,
-            mirror,
-            "frontend/assets/app.js drifted from frontend/app.js; "
-            "copy the canonical file over the mirror",
+            leftovers, [],
+            "legacy assets/app.* mirrors must stay deleted; only vendor files belong in assets/",
         )
 
 

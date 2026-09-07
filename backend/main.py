@@ -538,16 +538,25 @@ def index():
 
 @app.get("/app.js", include_in_schema=False)
 def frontend_app_script():
-    """Serve the canonical frontend script, not the stale assets mirror.
+    """Serve the bundled frontend script built from frontend/app.js.
 
-    The repository historically kept both ``frontend/app.js`` and
-    ``frontend/assets/app.js``.  The HTML was editing the former while
-    ``StaticFiles`` published the latter, so deployments could report success
-    while browsers continued executing obsolete dashboard code.
+    Sources are bundled into ``frontend/dist/`` by the esbuild pipeline; the
+    committed artifact is served here so browsers never run stale checked-in
+    mirrors.  ``frontend/dist`` is kept in sync with the sources by CI.
     """
     return FileResponse(
-        os.path.join(FRONTEND, "app.js"),
+        os.path.join(FRONTEND, "dist", "app.js"),
         media_type="application/javascript",
+        headers={"Cache-Control": "no-store, no-cache, must-revalidate, max-age=0"},
+    )
+
+
+@app.get("/app.css", include_in_schema=False)
+def frontend_app_css():
+    """Serve the bundled stylesheet built from frontend/app.css."""
+    return FileResponse(
+        os.path.join(FRONTEND, "dist", "app.css"),
+        media_type="text/css",
         headers={"Cache-Control": "no-store, no-cache, must-revalidate, max-age=0"},
     )
 

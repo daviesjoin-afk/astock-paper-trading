@@ -57,14 +57,33 @@ jobs:
           PYTHONDONTWRITEBYTECODE: "1"
         run: python -m compileall -q backend
 
-      - name: Check frontend JavaScript
-        run: |
-          node --check frontend/app.js
-          node --check frontend/assets/app.js
+      - name: Check frontend source syntax
+        run: node --check frontend/app.js
 
-      - name: Verify frontend source mirror
-        shell: bash
-        run: cmp --silent frontend/app.js frontend/assets/app.js
+  frontend:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install build tools
+        working-directory: frontend
+        run: npm ci
+
+      - name: Build frontend bundle
+        working-directory: frontend
+        run: npm run build
+
+      - name: Verify committed dist is up to date
+        run: git diff --exit-code -- frontend/dist
 
   quality:
     runs-on: ubuntu-latest
