@@ -24,13 +24,10 @@ RUN useradd --uid 10001 --create-home --shell /usr/sbin/nologin app
 COPY --chown=app:app backend ./backend
 RUN find /app/backend -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
 COPY --chown=app:app frontend ./frontend
-# Keep the legacy /assets/app.js URL byte-for-byte aligned with the canonical
-# frontend entrypoint.  Older cached HTML referenced this path; allowing the
-# checked-in mirror to drift made a normal refresh execute obsolete code.
-RUN install -o app -g app -m 0644 /app/frontend/app.js /app/frontend/assets/app.js
-# Keep the legacy CSS URL aligned with the canonical stylesheet as well;
-# cached pages still request /assets/app.css.
-RUN install -o app -g app -m 0644 /app/frontend/app.css /app/frontend/assets/app.css
+# frontend/dist (esbuild output) is committed alongside the sources and is the
+# only artifact served at runtime (/app.js, /app.css).  The old checked-in
+# assets/ mirrors and app.min.* duplicates are gone — no byte-alignment step
+# needed here anymore.
 COPY --chown=app:app deploy ./deploy
 
 USER app
