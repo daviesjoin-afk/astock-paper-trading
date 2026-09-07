@@ -14,6 +14,10 @@ services:
       # Standalone clones need an in-process scheduler. Set this to 0 when a
       # host scheduler is configured and owns every paper-trading slot.
       ASTOCK_ENABLE_FALLBACK_THREADS: "${ASTOCK_ENABLE_FALLBACK_THREADS:-1}"
+      # Deterministic offline demo: pass-through from the host env. Unset by
+      # default, so normal deployments never seed the synthetic demo ledger.
+      ASTOCK_DEMO: "${ASTOCK_DEMO:-}"
+      ASTOCK_DEMO_FORCE: "${ASTOCK_DEMO_FORCE:-}"
     volumes:
       # data_fetcher.py stores SQLite, universe and market caches here.
       # Deliberately use a release-scoped volume name so a clone does not
