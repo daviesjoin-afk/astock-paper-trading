@@ -127,6 +127,15 @@ jobs:
       - name: Build application image
         run: docker build --tag astock-codex:ci .
 
+      # Issue #29: the offline test suite must pass with *no network at all*,
+      # so core tests stay deterministic and cannot silently grow external
+      # calls.  New network-optional tests must skip unless explicitly
+      # enabled (see CONTRIBUTING.md "测试分层").
+      - name: Run backend tests with network disabled
+        run: >
+          docker run --rm --network none
+          astock-codex:ci python -m unittest discover -s backend -p "test_*.py"
+
       - name: Start isolated paper-only container
         run: |
           docker run --detach --name astock-ci \
