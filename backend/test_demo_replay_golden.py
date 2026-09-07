@@ -141,7 +141,7 @@ class DemoReplayGoldenTests(unittest.TestCase):
         cls._tmp = tempfile.mkdtemp(prefix="astock-demo-golden-")
         cls._patches = []
         for target, attr in (
-            (dfc, "CACHE_DIR"), (dfc, "MARKET_SNAPSHOT_FULL_CACHE_PATH"),
+            (dfc, "CACHE_DIR"), (dfc, "KLINE_DIR"), (dfc, "MARKET_SNAPSHOT_FULL_CACHE_PATH"),
             (U, "UNIVERSE_PATH"), (PT, "DB_PATH"),
         ):
             old = getattr(target, attr)
