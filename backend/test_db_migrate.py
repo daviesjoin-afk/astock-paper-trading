@@ -14,6 +14,7 @@ import db_migrate
 
 class DbMigrateTests(unittest.TestCase):
     def test_legacy_paper_schema_reaches_latest_version_idempotently(self):
+        latest_version = max(item[0] for item in db_migrate.MIGRATIONS["paper_trading"])
         with tempfile.TemporaryDirectory() as directory:
             path = os.path.join(directory, "paper.sqlite3")
             conn = sqlite3.connect(path)
@@ -36,10 +37,14 @@ class DbMigrateTests(unittest.TestCase):
                 db_migrate.migrate("paper_trading", path=path)
             conn = sqlite3.connect(path)
             try:
-                self.assertEqual(conn.execute("SELECT version FROM schema_version WHERE db_name='paper_trading'").fetchone()[0], 4)
+                self.assertEqual(conn.execute("SELECT version FROM schema_version WHERE db_name='paper_trading'").fetchone()[0], latest_version)
                 order_columns = {row[1] for row in conn.execute("PRAGMA table_info(paper_orders)")}
                 self.assertTrue({"realized_pnl", "order_type", "origin"}.issubset(order_columns))
                 self.assertIsNotNone(conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='paper_ignition_shadow'").fetchone())
+                self.assertEqual(
+                    conn.execute("SELECT COUNT(*) FROM strategy_definitions WHERE origin='builtin'").fetchone()[0],
+                    5,
+                )
             finally:
                 conn.close()
 
@@ -47,7 +52,7 @@ class DbMigrateTests(unittest.TestCase):
                 db_migrate.migrate("paper_trading", path=path)
             conn = sqlite3.connect(path)
             try:
-                self.assertEqual(conn.execute("SELECT version FROM schema_version WHERE db_name='paper_trading'").fetchone()[0], 4)
+                self.assertEqual(conn.execute("SELECT version FROM schema_version WHERE db_name='paper_trading'").fetchone()[0], latest_version)
             finally:
                 conn.close()
 
@@ -82,12 +87,15 @@ class DbMigrateTests(unittest.TestCase):
                 db_migrate.migrate("paper_trading", path=path)
 
             original = db_migrate.MIGRATIONS["paper_trading"]
+            latest_version = max(item[0] for item in original)
 
             def fail(conn):
                 conn.execute("CREATE TABLE should_rollback (id INTEGER)")
                 raise RuntimeError("migration failed")
 
-            db_migrate.MIGRATIONS["paper_trading"] = [*original, (5, "故意失败", fail)]
+            db_migrate.MIGRATIONS["paper_trading"] = [
+                *original, (latest_version + 1, "故意失败", fail),
+            ]
             try:
                 with self.assertRaisesRegex(RuntimeError, "migration failed"), redirect_stdout(StringIO()):
                     db_migrate.migrate("paper_trading", path=path)
@@ -96,7 +104,10 @@ class DbMigrateTests(unittest.TestCase):
 
             conn = sqlite3.connect(path)
             try:
-                self.assertEqual(conn.execute("SELECT version FROM schema_version WHERE db_name='paper_trading'").fetchone()[0], 4)
+                self.assertEqual(
+                    conn.execute("SELECT version FROM schema_version WHERE db_name='paper_trading'").fetchone()[0],
+                    latest_version,
+                )
                 self.assertIsNone(conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='should_rollback'").fetchone())
             finally:
                 conn.close()

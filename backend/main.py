@@ -18,6 +18,7 @@ import data_fetcher as dfc
 import universe as U
 import factors as F
 import strategies as S
+import strategy_registry as SR
 import backtest as B
 import optimizer as O
 import decision_engine as DE
@@ -645,6 +646,29 @@ def sector_events(limit: int = Query(10, ge=1, le=20)):
 @app.get("/api/strategies")
 def strategies():
     return {"strategies": [{"id": k, **v} for k, v in S.STRATEGIES.items()]}
+
+
+@app.get("/api/strategy-definitions")
+def strategy_definitions(
+    origin: str | None = Query(None),
+    status: str | None = Query(None),
+    include_archived: bool = Query(True),
+):
+    """Query durable built-in and user strategy definitions."""
+    try:
+        definitions = SR.list_definitions(
+            db_path=P.DB_PATH,
+            origins=(origin,) if origin else None,
+            statuses=(status,) if status else None,
+            include_archived=include_archived,
+        )
+        return {
+            "strategies": [definition.to_dict() for definition in definitions],
+            "lifecycle_statuses": list(SR.LIFECYCLE_STATUSES),
+            "origins": list(SR.ORIGINS),
+        }
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 @app.get("/api/init/status")
 def init_status():
