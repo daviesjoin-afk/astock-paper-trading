@@ -41,6 +41,13 @@ class StrategyRiskProfileTests(unittest.TestCase):
         for attempted in (
             {"paper_trading_rules": {"slippage": 0}},
             {"entry_score": {"commission": 0}},
+            # Prefix tuples and the ST/delisting gate also belong to
+            # paper_trading_rules and define the tradable security scope.
+            {"entry_score": {"MAIN_BOARD_PREFIXES": []}},
+            {"entry_score": {"CHINEXT_PREFIXES": ("300",)}},
+            {"entry_score": {"STAR_PREFIXES": ("688",)}},
+            {"entry_score": {"T0_ETF_PREFIXES": ("51",)}},
+            {"entry_score": {"is_st_or_delisting": None}},
         ):
             with self.subTest(attempted=attempted):
                 with self.assertRaises(SystemHardRuleOverrideError):
