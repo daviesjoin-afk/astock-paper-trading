@@ -563,6 +563,7 @@ def _commit_strategy_buy(
         _record_lot,
         _reserve_shared_capital,
         _risk_log,
+        _strategy_stamp,
     )
     _assert_active_lease(conn, "strategy auxiliary buy")
     account_id = account["id"]
@@ -571,14 +572,15 @@ def _commit_strategy_buy(
     fill_price = _num(plan["fill_price"])
     amount = _num(plan["amount"])
     fees = _num(plan["fees"])
+    strategy_stamp = _strategy_stamp(conn, account_id)
     cursor = conn.execute(
         """INSERT INTO paper_orders(
            account_id,side,code,name,qty,planned_price,status,reason,
-           risk_payload,created_at)
-           VALUES(?,?,?,?,?,?,?,?,?,?)""",
+           risk_payload,created_at,strategy_id,strategy_version,strategy_checksum)
+           VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (account_id, "buy", code, plan.get("name"), qty,
          _num(plan.get("planned_price"), fill_price), "pending_execution",
-         reason, _json(detail), _now()),
+         reason, _json(detail), _now(), *strategy_stamp),
     )
     order_id = int(cursor.lastrowid)
     savepoint = f"strategy_buy_{order_id}"
@@ -654,6 +656,7 @@ def submit_manual_order(
         _reserve_shared_capital,
         _risk_log,
         _rows,
+        _strategy_stamp,
         dfc,
         init_db,
     )
@@ -688,17 +691,20 @@ def submit_manual_order(
             reason = "限价尚未触发；委托当日有效，触发时重新执行风控"
         elif status == ENTRY_FROZEN_WAITLIST_STATUS:
             reason = reason or _entry_frozen_reason("手动委托")
+        strategy_stamp = _strategy_stamp(conn, account_id)
         cursor = conn.execute(
             """INSERT INTO paper_orders(
                account_id,side,code,name,qty,planned_price,status,reason,risk_payload,
-               order_type,origin,expires_at,created_at)
-               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+               order_type,origin,expires_at,created_at,
+               strategy_id,strategy_version,strategy_checksum)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 account_id, side, code, plan.get("name"), int(plan.get("qty") or 0),
                 _num(limit_price) if order_type == "limit" else _num(plan.get("quote_price")),
                 status, reason, _json(plan.get("risk") or {}), order_type, "manual",
                 day.isoformat() if status in {"pending_limit", ENTRY_FROZEN_WAITLIST_STATUS}
                 and order_type == "limit" else None, _now(),
+                *strategy_stamp,
             ),
         )
         order_id = cursor.lastrowid

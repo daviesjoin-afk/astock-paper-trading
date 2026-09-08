@@ -69,6 +69,78 @@ def ensure_paper_columns(conn):
     return changes
 
 
+def ensure_strategy_reference_columns(conn):
+    """Append immutable strategy-version stamps to execution evidence tables.
+
+    Live and archive tables intentionally receive the columns in the same
+    order because retention still uses ``INSERT ... SELECT *``.
+    Historical rows remain NULL and resolve through the small immutable legacy
+    binding table; this avoids rewriting a multi-gigabyte ledger.
+    """
+    definitions = {
+        "strategy_id": "TEXT",
+        "strategy_version": "INTEGER",
+        "strategy_checksum": "TEXT",
+    }
+    changes = {}
+    for table in (
+        "paper_signals", "paper_signals_archive",
+        "paper_orders", "paper_orders_archive",
+        "paper_risk_decisions", "paper_audit",
+    ):
+        changes[table] = ensure_columns(conn, table, definitions)
+    _ensure_strategy_reference_guards(conn)
+    return changes
+
+
+def _ensure_strategy_reference_guards(conn):
+    """Reject incomplete, forged, or later-mutated evidence stamps.
+
+    Historical NULL rows are intentionally left untouched. The INSERT guards
+    apply only to new account-scoped live evidence; archives accept legacy NULL
+    rows copied by retention while preserving any complete stamps verbatim.
+    """
+    for table in (
+        "paper_signals", "paper_orders", "paper_risk_decisions", "paper_audit",
+    ):
+        if not {"account_id", "strategy_id", "strategy_version", "strategy_checksum"}.issubset(
+            table_columns(conn, table)
+        ):
+            continue
+        conn.execute(
+            f"""CREATE TRIGGER IF NOT EXISTS trg_{table}_strategy_stamp_insert
+                BEFORE INSERT ON {table}
+                WHEN NEW.account_id IS NOT NULL AND (
+                    NEW.strategy_id IS NULL OR NEW.strategy_version IS NULL
+                    OR NEW.strategy_checksum IS NULL
+                    OR NEW.strategy_id <> NEW.account_id
+                    OR NOT EXISTS (
+                        SELECT 1 FROM paper_strategy_versions v
+                        WHERE v.strategy_id=NEW.strategy_id
+                          AND v.version=NEW.strategy_version
+                          AND v.checksum=NEW.strategy_checksum
+                    )
+                )
+                BEGIN SELECT RAISE(ABORT, 'invalid strategy version stamp'); END"""
+        )
+    for table in (
+        "paper_signals", "paper_signals_archive", "paper_orders",
+        "paper_orders_archive", "paper_risk_decisions", "paper_audit",
+    ):
+        if not {"strategy_id", "strategy_version", "strategy_checksum"}.issubset(
+            table_columns(conn, table)
+        ):
+            continue
+        conn.execute(
+            f"""CREATE TRIGGER IF NOT EXISTS trg_{table}_strategy_stamp_immutable
+                BEFORE UPDATE OF strategy_id,strategy_version,strategy_checksum ON {table}
+                WHEN NEW.strategy_id IS NOT OLD.strategy_id
+                  OR NEW.strategy_version IS NOT OLD.strategy_version
+                  OR NEW.strategy_checksum IS NOT OLD.strategy_checksum
+                BEGIN SELECT RAISE(ABORT, 'strategy version stamp is immutable'); END"""
+        )
+
+
 def ensure_runtime_lease_columns(conn):
     """补齐调度租约/fencing 字段，并规范旧时间分隔符。"""
     migrations = {
