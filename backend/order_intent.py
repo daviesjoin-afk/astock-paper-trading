@@ -41,6 +41,11 @@ _QTY_LIKE_KEYS = frozenset({
     "amount", "order_amount", "target_amount", "sizing",
 })
 
+# 历史负载里与下单金额同名的“市场事实”字段：改名入契约语境，避免误判违约。
+# 例：main_force_top10 的 ``amount`` 是龙虎榜当日成交额（市场数据），不是
+# 策略层给出的下单金额；还原旧字段视图时按映射改回，保持执行器等价。
+_LEGACY_MARKET_FIELD_ALIASES = {"amount": "market_turnover"}
+
 _SIDES = frozenset({"buy", "sell"})
 _URGENCIES = frozenset({"immediate", "same_session", "next_session", "conservative"})
 
@@ -57,6 +62,27 @@ _DEFAULT_PROFILE = {"urgency": "conservative", "stop_reference": "none", "expire
 
 _SAME_DAY_EXPIRY_TIME = "15:05"
 _NEXT_SESSION_EXPIRY_TIME = "09:35"
+
+
+def _next_trading_session(day: dt.date) -> dt.date:
+    """下一上海交易日（法定节假日感知；离线环境退化为跳过周末）。"""
+    try:
+        import universe as U
+        return U.next_trade_day(day)
+    except Exception:
+        value = day + dt.timedelta(days=1)
+        while value.weekday() >= 5:
+            value += dt.timedelta(days=1)
+        return value
+
+
+def _normalize_market_aliases(signal: Mapping[str, Any]) -> dict[str, Any]:
+    """把与下单金额同名的市场事实字段改名进入契约语境（顶层）。"""
+    normalized = dict(signal)
+    for legacy_key, contract_key in _LEGACY_MARKET_FIELD_ALIASES.items():
+        if legacy_key in normalized:
+            normalized[contract_key] = normalized.pop(legacy_key)
+    return normalized
 
 
 class OrderIntentContractError(ValueError):
@@ -150,6 +176,9 @@ class OrderIntent:
 
 def order_intent_from_payload(payload: Mapping[str, Any]) -> OrderIntent:
     """从入库的字典形式还原 OrderIntent（校验与构造共用同一套规则）。"""
+    # 先整体校验再筛字段：顶层混入 qty/amount 等越权键时必须显式失败，
+    # 而不是被静默丢弃后“洗白”成一个看似合法的意图。
+    reject_qty_claims(payload)
     known = {name: payload[name] for name in ORDER_INTENT_FIELDS if name in payload}
     known.setdefault("strategy_id", str(payload.get("strategy_id") or ""))
     context = payload.get("context")
@@ -166,10 +195,14 @@ def intent_to_legacy_fields(intent: OrderIntent) -> dict[str, Any]:
     “旧 signal -> 意图 -> 旧字段”对执行器可见行为等价。
     """
     legacy = dict(intent.context)
+    for legacy_key, contract_key in _LEGACY_MARKET_FIELD_ALIASES.items():
+        if contract_key in legacy:
+            legacy[legacy_key] = legacy.pop(contract_key)
     legacy["code"] = intent.symbol
     legacy["strategy_id"] = intent.strategy_id
     legacy["side"] = intent.side
     legacy["urgency"] = intent.urgency
+    legacy["reason"] = intent.reason
     return legacy
 
 
@@ -178,15 +211,21 @@ def order_intent_from_signal(
     signal: Mapping[str, Any],
     *,
     now: dt.datetime | None = None,
+    intended_session: dt.date | None = None,
 ) -> OrderIntent:
     """把五套策略现有 pick/signal 负载适配为 OrderIntent（兼容 adapter）。
 
     只读映射、确定性输出：同一输入永远得到同一意图；适配过程不改变任何
-    执行路径（旧行为等价）。负载中若出现数量/金额字段则抛出契约异常。
+    执行路径（旧行为等价）。负载中若出现数量/金额字段则抛出契约异常
+    （与下单金额同名的市场事实字段按 ``_LEGACY_MARKET_FIELD_ALIASES``
+    改名后放行）。收盘扫描等入口产生的信号天然面向下一交易日时，通过
+    ``intended_session`` 传入意图交易日，有效期将锚定该交易日而不是
+    ``data_asof`` 当日。
     """
     if not isinstance(signal, Mapping):
         raise OrderIntentContractError("signal 必须是映射")
-    reject_qty_claims(signal)
+    normalized = _normalize_market_aliases(signal)
+    reject_qty_claims(normalized)
 
     profile = _STRATEGY_INTENT_PROFILES.get(str(strategy_id or ""), _DEFAULT_PROFILE)
     now = now or dt.datetime.now()
@@ -209,35 +248,40 @@ def order_intent_from_signal(
         )
 
     asof = (
-        _as_date(signal.get("asof_date"))
-        or _as_date(signal.get("date"))
-        or _as_date(signal.get("quote_at"))
-        or _as_date(signal.get("trade_date"))
+        _as_date(normalized.get("asof_date"))
+        or _as_date(normalized.get("date"))
+        or _as_date(normalized.get("quote_at"))
+        or _as_date(normalized.get("trade_date"))
         or now.date()
     )
 
+    # 有效期锚点：收盘扫描在 D 日盘后生成、面向下一交易日的信号必须以
+    # 意图交易日（而非 D 日）为有效期基准，否则入库即已过期。
+    session = intended_session if intended_session and intended_session > asof else asof
     if profile["expires"] == "same_day":
-        expires_at = f"{asof.isoformat()}T{_SAME_DAY_EXPIRY_TIME}:00"
+        expires_at = f"{session.isoformat()}T{_SAME_DAY_EXPIRY_TIME}:00"
+    elif intended_session and intended_session > asof:
+        expires_at = f"{intended_session.isoformat()}T{_NEXT_SESSION_EXPIRY_TIME}:00"
     else:
-        next_session = asof + dt.timedelta(days=1)
+        next_session = _next_trading_session(asof)
         expires_at = f"{next_session.isoformat()}T{_NEXT_SESSION_EXPIRY_TIME}:00"
 
-    stop_reference = str(signal.get("stop_reference") or profile["stop_reference"])
+    stop_reference = str(normalized.get("stop_reference") or profile["stop_reference"])
     if stop_reference not in {"price", "atr", "technical", "none"}:
-        has_stop = bool(signal.get("stop_loss") or signal.get("hard_stop"))
-        has_atr = bool(signal.get("atr") or signal.get("atr14"))
-        has_ma = bool(signal.get("ma20") or signal.get("ma60"))
+        has_stop = bool(normalized.get("stop_loss") or normalized.get("hard_stop"))
+        has_atr = bool(normalized.get("atr") or normalized.get("atr14"))
+        has_ma = bool(normalized.get("ma20") or normalized.get("ma60"))
         stop_reference = "price" if has_stop else "atr" if has_atr else "technical" if has_ma else "none"
 
     reason = str(
-        signal.get("reason")
-        or signal.get("entry_model")
-        or signal.get("desc")
+        normalized.get("reason")
+        or normalized.get("entry_model")
+        or normalized.get("desc")
         or f"{strategy_id} 候选"
     )[:300]
 
     context = {
-        key: value for key, value in signal.items()
+        key: value for key, value in normalized.items()
         if key not in ORDER_INTENT_FIELDS and key not in {"code", "symbol", "side", "urgency", "asof_date", "date"}
     }
     reject_qty_claims(context)
