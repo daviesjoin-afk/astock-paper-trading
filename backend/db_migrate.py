@@ -17,6 +17,7 @@ import sqlite3
 import sys
 
 import paper_schema_migrations as paper_schema
+import strategy_registry
 
 BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CACHE_DIR = os.path.join(BASE, "data_cache")
@@ -40,6 +41,7 @@ MIGRATIONS = {
         (2, "补齐订单、持仓和账户兼容字段", paper_schema.ensure_paper_columns),
         (3, "补齐运行时租约与 fencing 字段", paper_schema.ensure_runtime_lease_columns),
         (4, "补齐点火影子表与索引", paper_schema.ensure_ignition_shadow_table),
+        (5, "创建动态策略定义与生命周期表", strategy_registry.ensure_schema),
     ],
     "adaptive_learning": [
         (1, "创建 schema_version 表", """
