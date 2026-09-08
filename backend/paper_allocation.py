@@ -24,17 +24,34 @@ from typing import Any, Sequence
 
 __all__ = [
     "ALLOCATION_ENGINE_VERSION",
+    "DEFAULT_STAGE_CAPITAL_SCALE",
     "FACTOR_FIELDS",
+    "LIFECYCLE_STAGES",
     "StrategyRuntime",
+    "allocation_plan",
+    "deployable_budget",
     "diversification_factor",
     "effective_weight",
     "effective_weights",
+    "minimum_deployable_budget",
     "pool_headroom",
     "position_limits",
+    "stage_capital_scale",
     "strategy_pool_budget",
 ]
 
 ALLOCATION_ENGINE_VERSION = "allocation-engine-v2"
+
+# 生命周期（PR-08）：冷启动 → 试点 → 标准 → 成熟；隔离策略不参与实盘分配。
+# 每个阶段一个资金系数（相对其可分配预算的真实部署比例）。
+LIFECYCLE_STAGES = ("shadow", "pilot", "standard", "mature", "quarantined")
+DEFAULT_STAGE_CAPITAL_SCALE = {
+    "shadow": 0.0,        # 影子运行：只记录意图，不动真金白银
+    "pilot": 0.25,        # 试点：小额真实资金验证
+    "standard": 1.0,      # 标准：全额部署
+    "mature": 1.0,        # 成熟：全额部署（规模上限由账户配置决定）
+    "quarantined": 0.0,   # 隔离：停止新开仓，等待人工处理
+}
 
 # 有效权重的六个因子；全部夹在 [0, 1]，缺省中性 1.0。
 FACTOR_FIELDS = (
@@ -80,6 +97,10 @@ class StrategyRuntime:
     priority_floor_pct: float | None = None
     # 该策略总占用不得超过净值的该比例（如“不得超过自身净值”）；None 表示不限。
     own_exposure_cap_pct: float | None = None
+    # 生命周期阶段（PR-08）：shadow/pilot/standard/mature/quarantined。
+    lifecycle_stage: str = "standard"
+    # 显式资金系数；None 时使用生命周期阶段的默认系数。
+    capital_scale: float | None = None
 
     def effective_weight(self) -> float:
         product = 1.0
@@ -405,4 +426,170 @@ def strategy_pool_budget(
         "pool_available_amount": round2(global_remaining),
         "pool_limit_pct": round(shared_pool_max_exposure * 100, 2),
         "other_floors_met": bool(other_floors_met),
+    }
+
+
+def stage_capital_scale(runtime: StrategyRuntime) -> tuple[float, str]:
+    """返回该运行时的（资金系数, 归一化阶段）。
+
+    - 显式 ``capital_scale`` 优先（夹到 [0, 1]）；
+    - 否则使用生命周期阶段的默认系数；
+    - 未知阶段 fail-closed 按 quarantined 处理（系数 0）。
+    """
+    if runtime.capital_scale is not None:
+        return _unit(runtime.capital_scale, 0.0), str(runtime.lifecycle_stage)
+    stage = str(runtime.lifecycle_stage or "")
+    if stage in DEFAULT_STAGE_CAPITAL_SCALE:
+        return DEFAULT_STAGE_CAPITAL_SCALE[stage], stage
+    return DEFAULT_STAGE_CAPITAL_SCALE["quarantined"], "quarantined"
+
+
+def minimum_deployable_budget(
+    price,
+    *,
+    lot_size: int = 100,
+    price_buffer: float = 1.0,
+) -> float:
+    """买入一手所需的最小预算（含价格缓冲，默认不留缓冲）。"""
+    try:
+        usable_price = max(float(price or 0.0), 0.0) * max(float(price_buffer), 1.0)
+    except (TypeError, ValueError):
+        return 0.0
+    lot_size = max(int(lot_size), 1)
+    return usable_price * lot_size
+
+
+def deployable_budget(
+    *,
+    budget_amount,
+    price,
+    lot_size: int = 100,
+    capital_scale: float = 1.0,
+    price_buffer: float = 1.0,
+) -> dict[str, Any]:
+    """把预算折算成整手可部署资金。
+
+    不变式（PR-08）：预算不足一手时**绝不生成碎片订单**——
+    ``lots == 0`` 且全部预算进入 ``waiting_capital``，不允许出现
+    ``0 < deployable < 一手成本`` 的碎片。
+    """
+    round2 = lambda value: round(value, 2)
+    scaled = max(float(budget_amount or 0.0), 0.0) * _unit(capital_scale, 0.0)
+    try:
+        usable_price = max(float(price or 0.0), 0.0) * max(float(price_buffer), 1.0)
+    except (TypeError, ValueError):
+        usable_price = 0.0
+    lot_size = max(int(lot_size), 1)
+    one_lot_cost = usable_price * lot_size
+    if one_lot_cost <= 0.0 or scaled < one_lot_cost:
+        return {
+            "allowed": False,
+            "lots": 0,
+            "deployable_amount": 0.0,
+            "waiting_capital": round2(scaled),
+            "scaled_budget": round2(scaled),
+            "one_lot_cost": round2(one_lot_cost),
+            "reason": (
+                "价格无效，预算冻结等待"
+                if one_lot_cost <= 0.0
+                else "预算不足一手，资金进入等待池"
+            ),
+        }
+    lots = int(scaled // one_lot_cost)
+    deployable = lots * usable_price * lot_size
+    return {
+        "allowed": True,
+        "lots": lots,
+        "deployable_amount": round2(deployable),
+        "waiting_capital": round2(max(0.0, scaled - deployable)),
+        "scaled_budget": round2(scaled),
+        "one_lot_cost": round2(one_lot_cost),
+        "reason": None,
+    }
+
+
+def allocation_plan(
+    runtimes: Sequence[StrategyRuntime],
+    *,
+    nav,
+    values,
+    pending_by_account,
+    pending_total,
+    prices_by_strategy,
+    shared_pool_max_exposure,
+    strategy_pool_floor_ratio,
+    lot_size: int = 100,
+    account_order=None,
+) -> dict[str, Any]:
+    """整池资金分配计划（PR-08）：预算 → 生命周期缩放 → 整手部署。
+
+    不变式：按有效权重从高到低依次消耗共享池余量，
+    ``Σ deployable ≤ pool_headroom`` 恒成立；任何一步不足一手都把剩余
+    预算放进 ``waiting_capital``，绝不产生碎片订单。
+    """
+    runtime_map = _runtime_map(runtimes)
+    nav_value = max(float(nav or 0.0), 0.0)
+    headroom = pool_headroom(
+        pool_cap_amount=nav_value * shared_pool_max_exposure,
+        pool_value=sum(values.values()),
+        pending_total=pending_total,
+    )
+    order = {key: int(value) for key, value in (account_order or {}).items()}
+    ordered = sorted(
+        runtime_map.values(),
+        key=lambda item: (
+            -item.effective_weight(),
+            order.get(item.strategy_id, 99),
+            item.strategy_id,
+        ),
+    )
+    rows: list[dict[str, Any]] = []
+    remaining_headroom = headroom
+    total_deployable = 0.0
+    total_waiting = 0.0
+    for runtime in ordered:
+        budget = strategy_pool_budget(
+            runtimes,
+            account_id=runtime.strategy_id,
+            values=values,
+            pending_by_account=pending_by_account,
+            pending_total=pending_total,
+            nav=nav,
+            market_scales=None,
+            shared_pool_max_exposure=shared_pool_max_exposure,
+            strategy_pool_floor_ratio=strategy_pool_floor_ratio,
+        )
+        raw_allowance = max(0.0, float(budget.get("allowance_amount") or 0.0))
+        budget_amount = min(raw_allowance, remaining_headroom)
+        scale, stage = stage_capital_scale(runtime)
+        deployment = deployable_budget(
+            budget_amount=budget_amount,
+            price=(prices_by_strategy or {}).get(runtime.strategy_id),
+            lot_size=lot_size,
+            capital_scale=scale,
+        )
+        deployable = float(deployment["deployable_amount"])
+        remaining_headroom = max(0.0, remaining_headroom - deployable)
+        total_deployable += deployable
+        total_waiting += float(deployment["waiting_capital"])
+        rows.append({
+            "strategy_id": runtime.strategy_id,
+            "lifecycle_stage": stage,
+            "capital_scale": round(scale, 4),
+            "raw_allowance_amount": round(raw_allowance, 2),
+            "budget_amount": round(budget_amount, 2),
+            "scaled_budget_amount": deployment["scaled_budget"],
+            "lots": deployment["lots"],
+            "deployable_amount": deployment["deployable_amount"],
+            "waiting_capital": deployment["waiting_capital"],
+            "blocked_reason": deployment["reason"],
+            "allowed": bool(deployment["allowed"]),
+        })
+    return {
+        "engine": ALLOCATION_ENGINE_VERSION,
+        "plan": rows,
+        "total_deployable_amount": round(total_deployable, 2),
+        "total_waiting_capital": round(total_waiting, 2),
+        "pool_headroom_amount": round(headroom, 2),
+        "lot_size": max(int(lot_size), 1),
     }
