@@ -610,6 +610,14 @@ def adjust_strategy_params(conn, strategy_id: str, adjustments: dict, *,
                 "profile": check["profile"]}
     new_params = {**current["params"], **check["adjusted"]}
     new_params = EP.clamp_to_profile(strategy_id, new_params)
+    changed_keys = sorted(
+        key for key in check["adjusted"]
+        if new_params.get(key) != current["params"].get(key)
+    )
+    if not changed_keys:
+        # 无变化（重试同值）：不落新版本，避免重复版本污染回滚链。
+        return {"adjusted": False, "reason": "无变化",
+                "strategy_id": str(strategy_id)}
     now = _now()
     cursor = conn.execute(
         """INSERT INTO evolution_params(version, params, source, reason, parent_id, created_at, strategy_id)
@@ -623,9 +631,9 @@ def adjust_strategy_params(conn, strategy_id: str, adjustments: dict, *,
         ("strategy_adjust", new_id, _json({
             "strategy_id": str(strategy_id),
             "adjustments": dict(adjustments or {}),
-            "changed_keys": sorted(check["adjusted"].keys()),
-            "old_params": {k: current["params"].get(k) for k in check["adjusted"]},
-            "new_params": {k: check["adjusted"][k] for k in check["adjusted"]},
+            "changed_keys": changed_keys,
+            "old_params": {k: current["params"].get(k) for k in changed_keys},
+            "new_params": {k: new_params.get(k) for k in changed_keys},
             "profile": check["profile"]["label"],
             "reason": reason,
         }), now),
@@ -633,9 +641,9 @@ def adjust_strategy_params(conn, strategy_id: str, adjustments: dict, *,
     conn.commit()
     return {
         "adjusted": True, "strategy_id": str(strategy_id), "new_params_id": new_id,
-        "changed_keys": sorted(check["adjusted"].keys()),
-        "old_params": {k: current["params"].get(k) for k in check["adjusted"]},
-        "new_params": {k: check["adjusted"][k] for k in check["adjusted"]},
+        "changed_keys": changed_keys,
+        "old_params": {k: current["params"].get(k) for k in changed_keys},
+        "new_params": {k: new_params.get(k) for k in changed_keys},
         "profile": check["profile"]["label"],
     }
 
@@ -651,12 +659,14 @@ def rollback_strategy_params(conn, strategy_id: str, reason: str = "strategy_rol
     if not rows:
         return {"rolled_back": False, "reason": "该策略没有专属参数版本"}
     if len(rows) < 2:
-        # 只有一版 = 尚无可回滚目标：插入全局默认作为回落版（也记审计）。
+        # 只有一版 = 尚无可回滚目标：回落到**当前全局参数**（该策略继承的
+        # 基线），而不是硬编码出厂默认——否则已手动调整过的全局值会被静默重置。
+        inherited = dict(get_current_params(conn)["params"])
         now = _now()
         cursor = conn.execute(
             """INSERT INTO evolution_params(version, params, source, reason, parent_id, created_at, strategy_id)
                VALUES(?,?,?,?,?,?,?)""",
-            (EVOLUTION_VERSION, _json(_default_params()), "rollback",
+            (EVOLUTION_VERSION, _json(inherited), "rollback",
              reason + "：仅一版，回落全局默认", rows[0][0], now, str(strategy_id)),
         )
         conn.execute(

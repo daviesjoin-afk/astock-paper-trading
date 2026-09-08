@@ -75,6 +75,8 @@ STRATEGY_EVOLUTION_PROFILES: dict[str, dict[str, Any]] = {
             "max_weight_delta": {"min": 0.01, "max": 0.04, "step": 0.002},
             "hold_bias": {"min": 0.05, "max": 0.5, "step": 0.02},
         },
+        # 单调约束：hold 倾向只允许变得更保守（数值增大），不许放松。
+        "monotonic": {"hold_bias": "increase"},
         "min_samples": 8,
     },
     # 板块轮动：热点节奏变化快，允许阈值微调；方向阈值锁定。
@@ -130,6 +132,8 @@ def evolution_profile_for(strategy_id: Any) -> dict[str, Any]:
         "tunable": tuple(profile["tunable"]),
         "locked": tuple(profile["locked"]),
         "bounds": {name: dict(bounds) for name, bounds in profile["bounds"].items()},
+        "monotonic": {name: direction for name, direction
+                      in (profile.get("monotonic") or {}).items()},
         "min_samples": int(profile["min_samples"]),
         "fallback": fallback,
         "version": STRATEGY_EVOLUTION_VERSION,
@@ -206,8 +210,16 @@ def validate_strategy_adjustment(
                 f"{key} 超出策略边界 [{bounds['min']}, {bounds['max']}]"
             )
             continue
+        direction = profile["monotonic"].get(key)
+        if direction == "increase" and new_value < old_value - 1e-12:
+            violations.append(
+                f"{key} 只允许单向收紧（{old_value} → {new_value} 是放松）"
+            )
+            continue
         adjusted[key] = new_value
-    if evidence_count is not None and evidence_count < profile["min_samples"]:
+    if evidence_count is None:
+        violations.append("未提供证据样本数（fail-closed）：策略级调整必须携带证据量")
+    elif evidence_count < profile["min_samples"]:
         violations.append(
             f"证据不足（{evidence_count}/{profile['min_samples']}），"
             f"{profile['label']}画像要求更多样本"
