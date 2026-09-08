@@ -12,6 +12,7 @@ import json
 import os
 import re
 import sqlite3
+from collections.abc import Mapping
 from dataclasses import asdict, dataclass
 
 
@@ -149,6 +150,8 @@ def _row_to_spec(row):
         metadata = json.loads(values.get("metadata") or "{}")
     except (TypeError, ValueError):
         metadata = {}
+    if not isinstance(metadata, Mapping):
+        metadata = {}
     return StrategySpec(
         id=values["id"], name=values["name"],
         status=values["lifecycle_status"],
@@ -166,35 +169,46 @@ def _open_readonly(path):
     return conn
 
 
+def _validate_filter_values(values, allowed, label):
+    requested = tuple(str(value) for value in (values or ()))
+    invalid = set(requested) - set(allowed)
+    if invalid:
+        raise ValueError(f"invalid strategy {label}: {sorted(invalid)[0]}")
+    return requested
+
+
+def _filter_builtins(origins, statuses, include_archived):
+    return tuple(
+        spec for spec in BUILTIN_STRATEGIES
+        if (not origins or spec.origin in origins)
+        and (not statuses or spec.status in statuses)
+        and (statuses or include_archived or spec.status != "archived")
+    )
+
+
 def list_definitions(*, conn=None, db_path=None, origins=None, statuses=None,
                      include_archived=True):
     """Return durable definitions; fall back to built-ins before DB bootstrap."""
+    origins = _validate_filter_values(origins, ORIGINS, "origin")
+    statuses = _validate_filter_values(statuses, LIFECYCLE_STATUSES, "status")
     owned = False
     try:
         if conn is None:
             path = db_path or DEFAULT_DB_PATH
             if not os.path.exists(path):
-                return tuple(BUILTIN_STRATEGIES)
+                return _filter_builtins(origins, statuses, include_archived)
             conn = _open_readonly(path)
             owned = True
         if not _table_exists(conn):
-            return tuple(BUILTIN_STRATEGIES)
+            return _filter_builtins(origins, statuses, include_archived)
         clauses = []
         params = []
         if origins:
-            requested = tuple(str(value) for value in origins)
-            invalid = set(requested) - set(ORIGINS)
-            if invalid:
-                raise ValueError(f"invalid strategy origin: {sorted(invalid)[0]}")
-            clauses.append(f"origin IN ({','.join('?' for _ in requested)})")
-            params.extend(requested)
+            clauses.append(f"origin IN ({','.join('?' for _ in origins)})")
+            params.extend(origins)
         if statuses:
-            requested = tuple(str(value) for value in statuses)
-            invalid = set(requested) - set(LIFECYCLE_STATUSES)
-            if invalid:
-                raise ValueError(f"invalid strategy status: {sorted(invalid)[0]}")
-            clauses.append(f"lifecycle_status IN ({','.join('?' for _ in requested)})")
-            params.extend(requested)
+            clauses.append(f"lifecycle_status IN ({','.join('?' for _ in statuses)})")
+            params.extend(statuses)
         elif not include_archived:
             clauses.append("lifecycle_status<>'archived'")
         where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
@@ -245,6 +259,8 @@ def create_user_definition(conn, strategy_id, name, *, implementation_key="",
         raise ValueError("strategy name is required")
     if strategy_id in _BUILTIN_BY_ID:
         raise ValueError("built-in strategy id is reserved")
+    if metadata is not None and not isinstance(metadata, Mapping):
+        raise ValueError("strategy metadata must be an object")
     ensure_schema(conn)
     now = _now()
     try:
