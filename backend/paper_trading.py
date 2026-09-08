@@ -8035,6 +8035,16 @@ def _buy_order(conn, account, signal, quote, market, news, asof_day, *, all_quot
             "reason": stale_reason,
         }
     pick = payload.get("pick") or {}
+    # 分批建仓续片标记：未走完切片计划的信号允许对已有持仓继续下一片
+    # （每片仍是独立委托意图并重跑全部风控），否则会被"已持有该股"闸门拦截。
+    _slice_plan = []
+    try:
+        _slice_plan = [int(item) for item in ((payload.get("entry_slices") or {}).get("plan") or [])]
+    except (TypeError, ValueError):
+        _slice_plan = []
+    slice_continuation = bool(_slice_plan) and int(
+        (payload.get("entry_slices") or {}).get("filled") or 0
+    ) < len(_slice_plan)
     market_policy = _strategy_market_policy(account, pick, quote, market)
     execution_quote = _execution_quote_status(quote, asof_day)
     signal_quote = payload.get("quote") or {}
@@ -8211,7 +8221,7 @@ def _buy_order(conn, account, signal, quote, market, news, asof_day, *, all_quot
         if pending_account == account["id"]
     }
     timing_block_reasons = []
-    if code in open_codes:
+    if code in open_codes and not slice_continuation:
         reasons.append(
             "本策略已持有该股票，不重复执行普通开仓；其他策略仍可按各自模型独立建仓，"
             "本策略仅由专属加仓/做T模型复核"
@@ -8473,6 +8483,9 @@ def _buy_order(conn, account, signal, quote, market, news, asof_day, *, all_quot
                           or account.get("entry_slices") or 1)
     except (TypeError, ValueError):
         slice_count = 1
+    if slice_continuation and _slice_plan:
+        # 续片以既有计划为准，忽略当前配置变化，保证同一信号的切片口径一致。
+        slice_count = max(slice_count, len(_slice_plan))
     slice_count = max(1, min(slice_count, 5))
     if slice_count > 1:
         slice_state = dict(payload.get("entry_slices") or {})
@@ -11235,6 +11248,17 @@ def _prioritize_live_candidate_budget(candidates, account_id, recheck_codes=None
     return selected
 
 
+def _staged_slice_pending(payload_text) -> bool:
+    """该信号是否还有未成交的分批建仓切片（PR：staged entry 续片）。"""
+    data = _loads(payload_text, {})
+    state = data.get("entry_slices") or {}
+    try:
+        plan = [int(item) for item in (state.get("plan") or [])]
+    except (TypeError, ValueError):
+        return False
+    return bool(plan) and int(state.get("filled") or 0) < len(plan)
+
+
 def _bootstrap_signals_for_today(asof_day, live_universe=None, source_slot="intraday"):
     """用上一交易日的完整因子扫描当日候选；仓位数量不作为扫描门槛。
 
@@ -11340,7 +11364,7 @@ def _bootstrap_signals_for_today(asof_day, live_universe=None, source_slot="intr
                     )
                 }
                 deferred_codes = {
-                    str(row["code"])
+                    str(row.get("code") or "")
                     for row in _rows(
                         conn,
                         """SELECT code FROM paper_signals
@@ -11348,6 +11372,21 @@ def _bootstrap_signals_for_today(asof_day, live_universe=None, source_slot="intr
                              AND status IN ('deferred_capacity',?)""",
                         (account["id"], day.isoformat(), ENTRY_FROZEN_WAITLIST_STATUS),
                     )
+                }
+                # 分批建仓续片：这些标的虽有持仓，但信号还有未成交切片，必须
+                # 豁免"已持仓跳过"抑制，否则配置了 entry_slice_policy 的策略
+                # 永远停在第一片（切片续跑是复核路径，不是重复开仓）。
+                staged_entry_codes = {
+                    str(row["code"])
+                    for row in _rows(
+                        conn,
+                        """SELECT code,payload FROM paper_signals
+                           WHERE account_id=? AND intended_date=?
+                             AND status='deferred_capacity'
+                             AND payload LIKE '%entry_slices%'""",
+                        (account["id"], day.isoformat()),
+                    )
+                    if _staged_slice_pending(row["payload"])
                 }
                 # 追高专属风控未通过时，当日不应每五分钟重复生成同一笔拒绝单；
                 # 保留审计，下一交易日再用新的行情、量能和Q级重新评估。
@@ -11526,7 +11565,8 @@ def _bootstrap_signals_for_today(asof_day, live_universe=None, source_slot="intr
                     )
                     if (
                         code in actionable_codes
-                        or code in position_codes or (code in filled_codes and not (is_reentry or is_recovery))
+                        or (code in position_codes and code not in staged_entry_codes)
+                        or (code in filled_codes and not (is_reentry or is_recovery))
                         or reentry_already_armed or code in chase_rejected_codes
                         or any(item.get("code") == code for item in risk_cooldowns)
                     ):
