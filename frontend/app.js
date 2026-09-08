@@ -114,7 +114,14 @@ function activatePage(page, options){
     var paperTab=document.querySelector('#p-paper [data-paper-view="'+(window._paperWorkspace||'portfolio')+'"]');
     showPaperWorkspace(window._paperWorkspace||'portfolio',paperTab,{restore:true});
   }
-  Object.keys(charts).forEach(function(k){charts[k].resize();});
+  // 只重绘当前可见页面上的图表：对隐藏页的图表做 resize 纯属浪费，
+  // 也是切页瞬间的小卡顿源；rAF 合并到下一帧，避免阻塞本次切换。
+  requestAnimationFrame(function(){
+    Object.keys(charts).forEach(function(k){
+      var el=document.getElementById(k);
+      if(el&&el.offsetParent) charts[k].resize();
+    });
+  });
 }
 document.querySelectorAll('.tab').forEach(function(t){
   t.setAttribute('aria-current',t.classList.contains('active')?'page':'false');
@@ -1027,6 +1034,7 @@ function chooseStrategy(strategyId){
 /* ---------- 策略选股：模拟盘五套策略的盘后自动选股（分组展示） ---------- */
 var paperStrategyFilter='';
 var paperSelectionCache=null;
+var paperSelectionCacheAt=0;
 
 // 始终缓存全量五组结果，筛选只在本地做：否则第一次取到的（过滤后）响应会被
 // 后续 tab 当成完整缓存，切换策略时看到的是上一次的旧分组。
@@ -1055,10 +1063,16 @@ function choosePaperStrategy(strategyId, el){
 
 async function loadPaperSelection(){
   var target=$('selectResult'); if(!target) return;
+  // 60 秒内重复进入选股页直接复用上次结果，避免每次切页都重新请求。
+  if(paperSelectionCache&&paperSelectionCacheAt&&Date.now()-paperSelectionCacheAt<PAPER_NAV_TTL_MS){
+    renderPaperSelection(paperSelectionView()||paperSelectionCache);
+    return;
+  }
   target.innerHTML='<div class="loading">正在读取最近一个交易日的策略选股结果…</div>';
   try{
     var d=await api('/api/paper-selection');
     paperSelectionCache=d;
+    paperSelectionCacheAt=Date.now();
     renderPaperSelection(paperSelectionView()||d);
   }catch(e){ target.innerHTML='<div class="banner">读取策略选股结果失败：'+adaptiveEsc(e.message||e)+'</div>'; }
 }
@@ -1114,6 +1128,7 @@ async function runPaperSelection(){
   try{
     var d=await apiPost('/api/paper-selection/run?topn='+encodeURIComponent(($('selTopn')||{}).value||5)+'&confirmed=true');
     paperSelectionCache=await api('/api/paper-selection');
+    paperSelectionCacheAt=Date.now();
     renderPaperSelection(paperSelectionView()||paperSelectionCache);
     var done=(d.strategies||[]).map(function(s){return s.label+' '+s.status+'('+s.picks.length+')';}).join(' · ');
     if(target) target.insertAdjacentHTML('afterbegin','<div class="tag tag-ok">已重跑：'+adaptiveEsc(done)+'</div>');
@@ -1638,7 +1653,7 @@ async function saveSettingsSection(section){
   if(section==='risk') payload.risk={shared_pool_position_limit:Number($('settingPoolLimit').value),shared_pool_exposure_cap:Number($('settingExposureCap').value)/100,single_position_max_amount:Number($('settingSingleMax').value),minimum_entry_slot_utilization:Number($('settingSlotUtilization').value)/100};
   if(section==='strategy') payload.strategy={strategy_overrides:collectStrategyOverrides()};
   if(section==='evolution') payload.evolution={evolution_interval_hours:Number($('settingEvolutionInterval').value)}; payload.ai=section==='evolution'?{llm_provider:$('settingAiProvider').value,llm_advisor_enabled:$('settingAiAdvisor').checked,llm_realtime_tuning_enabled:$('settingAiRealtime').checked,llm_realtime_mode:$('settingAiMode').value}:undefined;
-  try{var data=await apiPostJson('/api/settings/?confirmed=true',payload);renderSettings(data);alert('设置已保存并记录审计。');if(section==='risk'&&typeof loadPaper==='function') loadPaper();}catch(e){alert('保存失败：'+(e.message||e));}
+  try{var data=await apiPostJson('/api/settings/?confirmed=true',payload);renderSettings(data);alert('设置已保存并记录审计。');if(section==='risk'&&typeof loadPaper==='function') loadPaper({force:true});}catch(e){alert('保存失败：'+(e.message||e));}
 }
 async function resetSettingsSection(section){
   var defaults=(window._settingsPayload||{}).defaults||{}; if(!settingsConfirm('恢复该分组的默认安全设置？')) return;
@@ -1691,29 +1706,29 @@ async function startPaper(){
     var d = await apiPost('/api/paper/start?capital='+encodeURIComponent(capital));
     var note = d.schedule && d.schedule.ok ? '新周期已启动，3分钟监控任务已注册。' : '新周期已启动；计划任务未完全安装时可运行 setup_paper_schedule.bat。';
     alert(note);
-    await loadPaper();
+    await loadPaper({force:true});
   }catch(e){ alert('启用失败：'+e.message); }
   finally{ $('paperStart').disabled = false; }
 }
 async function resumePaper(){
-  try{ await apiPost('/api/paper/resume'); await loadPaper(); }
+  try{ await apiPost('/api/paper/resume'); await loadPaper({force:true}); }
   catch(e){ alert('恢复失败：'+e.message); }
 }
 async function pausePaper(){
-  try{ await apiPost('/api/paper/pause'); await loadPaper(); }
+  try{ await apiPost('/api/paper/pause'); await loadPaper({force:true}); }
   catch(e){ alert('暂停失败：'+e.message); }
 }
 async function resetPaper(){
   var capital = Number($('paperCapital').value);
   if(!capital || capital<1000){ alert('请填写新周期的总模拟资金。'); return; }
   if(!confirm('完全重置会归档当前周期的订单、持仓、盈亏、风控和周报，并创建暂停的新周期；历史不会删除。继续吗？')) return;
-  try{ await apiPost('/api/paper/reset?capital='+encodeURIComponent(capital)); await loadPaper(); }
+  try{ await apiPost('/api/paper/reset?capital='+encodeURIComponent(capital)); await loadPaper({force:true}); }
   catch(e){ alert('重置失败：'+e.message); }
 }
 async function setPaperStyle(accountId, style){
   try{
     await apiPost('/api/paper/style?account_id='+encodeURIComponent(accountId)+'&style='+encodeURIComponent(style));
-    await loadPaper();
+    await loadPaper({force:true});
   }catch(e){ alert('风格切换失败：'+e.message); }
 }
 async function runPaperNow(slot){
@@ -1721,7 +1736,7 @@ async function runPaperNow(slot){
     $('paperStatus').textContent = '正在执行 '+slot+' 检查…';
     var d = await apiPost('/api/paper/run-now?slot='+encodeURIComponent(slot));
     $('paperStatus').textContent = d.status==='already_done' ? '本时段已执行，未重复下单。' : '检查完成。';
-    await loadPaper();
+    await loadPaper({force:true});
   }catch(e){ $('paperStatus').textContent = '检查失败：'+e.message; }
 }
 window._paperOrderSide = 'buy';
@@ -1817,7 +1832,7 @@ async function submitPaperOrder(){
     try{
       var result=await apiPost('/api/paper/order/submit?'+paperOrderQuery(form)+'&confirmed=true');
       alert(result.status==='filled'?'模拟成交已写入账本。':(result.status==='pending_limit'?'限价委托已进入待触发队列。':'委托被模型拒绝。'));
-      clearPaperOrderPreview(); await loadPaper();
+      clearPaperOrderPreview(); await loadPaper({force:true});
     }catch(e){ alert('模拟委托失败：'+e.message); }
   }finally{
     window._paperOrderSubmitting=false;
@@ -1836,7 +1851,7 @@ function preparePaperSell(accountId,code,qty){
 }
 async function cancelPaperOrder(orderId){
   if(!confirm('撤销这笔待触发的模拟限价委托吗？')) return;
-  try{ await apiPost('/api/paper/order/cancel?order_id='+encodeURIComponent(orderId)); await loadPaper(); }
+  try{ await apiPost('/api/paper/order/cancel?order_id='+encodeURIComponent(orderId)); await loadPaper({force:true}); }
   catch(e){ alert('撤单失败：'+e.message); }
 }
 function paperOrderStatusView(status,reason){
@@ -1930,10 +1945,22 @@ function riskMetric(label,current,limit){
 async function loadPaperStrategyCenter(){
   var target=$('paperStrategyView');
   if(!target) return;
-  target.innerHTML='<div class="loading">正在读取策略规则…</div>';
+  var cached=window._paperStrategyCenterCache;
+  if(cached){
+    renderPaperStrategyCenter(cached.data);
+    if(Date.now()-cached.at<PAPER_NAV_TTL_MS) return;   // 缓存新鲜：零请求零重绘
+  }else{
+    target.innerHTML='<div class="loading">正在读取策略规则…</div>';
+  }
   try{
     var d=await api('/api/paper/strategy-center');
-    var cards=(d.strategies||[]).filter(function(s){return s.supports_new_cycle===true;}).map(function(s){
+    window._paperStrategyCenterCache={data:d,at:Date.now()};
+    renderPaperStrategyCenter(d);
+  }catch(e){ if(!cached) target.innerHTML='<div class="banner">策略中心读取失败：'+riskText(e.message||e)+'</div>'; }
+}
+function renderPaperStrategyCenter(d){
+  var target=$('paperStrategyView'); if(!target) return;
+  var cards=(d.strategies||[]).filter(function(s){return s.supports_new_cycle===true;}).map(function(s){
       return '<article class="paper-strategy-card"><header><b>'+riskText(s.name)+'</b><span>'+riskText(s.mode)+' · '+riskText(s.entry_model)+'</span></header>'
         +'<div class="paper-strategy-section"><label>候选来源</label><p>'+riskText(s.candidate)+'</p></div>'
         +'<div class="paper-strategy-section"><label>入场执行</label><p>'+riskText(s.entry)+'</p></div>'
@@ -1942,7 +1969,6 @@ async function loadPaperStrategyCenter(){
     }).join('');
     var guards=(d.shared_guards||[]).map(function(item){return '<li>'+riskText(item)+'</li>';}).join('');
     target.innerHTML='<section class="paper-strategy-intro"><div><h3>模拟盘策略中心</h3><p>这里展示的是当前服务器实际生效的策略定义。策略规则与模拟账户共用同一配置来源；本页只读，查看不会触发下单或改动资金。</p></div></section><section class="paper-strategy-grid">'+cards+'</section><section class="paper-strategy-guards"><b>共同执行边界</b><ul>'+guards+'</ul></section>';
-  }catch(e){target.innerHTML='<div class="banner">策略中心读取失败：'+riskText(e.message||e)+'</div>';}
 }
 function paperResearchStrategyName(id){
   return ({tq_breakout:'短线日内做T',trend_pullback:'趋势波段优选',sector_rotation:'板块轮动先锋',reported_profit_breakout:'三日策略',main_force_top10:'超强主力股'})[id]||id||'未知策略';
@@ -1961,10 +1987,22 @@ function paperResearchQuality(run){
 async function loadPaperResearchValidation(){
   var target=$('paperResearchView');
   if(!target) return;
-  target.innerHTML='<div class="loading">正在读取模拟盘策略的候选快照与兑现记录…</div>';
+  var cached=window._paperResearchCache;
+  if(cached){
+    renderPaperResearchValidation(cached.data);
+    if(Date.now()-cached.at<PAPER_NAV_TTL_MS) return;   // 缓存新鲜：零请求零重绘
+  }else{
+    target.innerHTML='<div class="loading">正在读取模拟盘策略的候选快照与兑现记录…</div>';
+  }
   try{
     var d=await api('/api/paper/research-validation?limit=90');
-    var latestByStrategy={}, policy=d.backfill_policy||{};
+    window._paperResearchCache={data:d,at:Date.now()};
+    renderPaperResearchValidation(d);
+  }catch(e){ if(!cached) target.innerHTML='<div class="banner">策略证据读取失败：'+riskText(e.message||e)+'</div>'; }
+}
+function renderPaperResearchValidation(d){
+  var target=$('paperResearchView'); if(!target) return;
+  var latestByStrategy={}, policy=d.backfill_policy||{};
     (d.runs||[]).forEach(function(run){ if(!latestByStrategy[run.account_id]) latestByStrategy[run.account_id]=run; });
     var ids=['tq_breakout','trend_pullback','sector_rotation','reported_profit_breakout','main_force_top10'];
     var cards=ids.map(function(id){
@@ -1989,7 +2027,6 @@ async function loadPaperResearchValidation(){
       +'<section class="paper-research-grid">'+cards+'</section>'
       +'<section class="paper-research-table"><header><div><h3>最新可核验快照</h3><p>只有收盘后写入的候选才会计入研究；数据不完整会明确标记，不会伪装成有效样本。</p></div><span class="tag tag-warn">影子验证中</span></header>'+tableScroll('<table><thead><tr><th>模拟盘策略</th><th>信号日</th><th>候选</th><th>因子截至</th><th>最早因子</th><th>数据质量</th></tr></thead><tbody>'+rows+'</tbody></table>',900)+'</section>'
       +'<p class="paper-research-note">当前为第一批样本。'+riskText(policy.next_observation||'1 日、3 日、5 日结果会在后续有效收盘快照到达后自动补齐')+'。手动补录只允许使用当日完整收盘快照，不能拿今天数据回写旧候选；样本不足 20 个时，系统只显示积累状态，不允许据此自动修改任何策略。</p>';
-  }catch(e){ target.innerHTML='<div class="banner">策略证据读取失败：'+riskText(e.message||e)+'</div>'; }
 }
 async function refreshPaperResearchValidation(button){
   if(button){button.disabled=true;button.textContent='正在刷新…';}
@@ -2006,6 +2043,7 @@ async function backfillPaperResearch(button){
   if(button){button.disabled=true;button.textContent='补录中…';}
   try{
     var result=await apiPost('/api/paper/research-validation/backfill');
+    window._paperResearchCache=null;   // 补录刚写入了新样本，绕过缓存强制刷新
     await loadPaperResearchValidation();
     if(result.status==='completed'){
       var saved=(result.accounts||[]).map(function(item){return paperResearchStrategyName(item.id)+' '+Number(item.candidates||0)+' 只';}).join('、');
@@ -2093,13 +2131,18 @@ function renderPaperRisk(d){
   $('paperRiskResult').innerHTML=html;
 }
 async function loadPaperRisk(forceRefresh){
-  if(!forceRefresh&&window._paperRiskDashboard) renderPaperRisk(window._paperRiskDashboard);
+  if(!forceRefresh&&window._paperRiskDashboard
+     &&!window._paperRiskDashboard.initializing&&!window._paperRiskDashboard.refreshing){
+    renderPaperRisk(window._paperRiskDashboard);
+    // 60 秒内的切页直接用上次快照，不再每次都发 risk-overview 请求。
+    if(Date.now()-(window._paperRiskDashboardAt||0)<PAPER_NAV_TTL_MS) return;
+  }
   if(window._paperRiskRequest) return window._paperRiskRequest;
   var button=$('paperRiskRefresh');
   if(button){button.disabled=true;button.textContent=forceRefresh?'正在刷新…':'读取中…';}
   var request=forceRefresh?apiPost('/api/paper/risk-refresh'):api('/api/paper/risk-overview');
   window._paperRiskRequest=request.then(function(d){
-    window._paperRiskDashboard=d;renderPaperRisk(d);
+    window._paperRiskDashboard=d;window._paperRiskDashboardAt=Date.now();renderPaperRisk(d);
     if(d.refreshing||d.initializing){
       clearTimeout(window._paperRiskRetryTimer);
       window._paperRiskRetryTimer=setTimeout(function(){window._paperRiskRequest=null;loadPaperRisk(false);},1800);
@@ -2165,8 +2208,46 @@ function paperAccountDisplayName(account){
   var id=account&&account.id;
   return ({tq_breakout:'短线日内做T',trend_pullback:'趋势波段优选',sector_rotation:'板块轮动先锋',reported_profit_breakout:'三日策略',main_force_top10:'超强主力股'})[id] || (account&&account.name) || id || '未知策略';
 }
+// 模拟盘组合/委托/档案三个工作区共用一份 overview。以前每次切换子页签都会
+// 重新请求完整 dashboard 并整体重建 DOM，是「切页卡顿」的最大来源。
+// 现在改为 stale-while-revalidate：切换时先立即渲染上一次的数据（零等待），
+// 60 秒内不再发请求；过期后在后台静默刷新，数据没有变化就不重绘。
+// 下单/撤单/暂停/恢复/重置/保存设置等写操作必须用 loadPaper({force:true})
+// 绕过缓存拿到最新账本。
+var PAPER_NAV_TTL_MS=60000;
+function paperOverviewVariant(){
+  return window._paperWorkspace==='activity'?'activity'
+    :(window._paperWorkspace==='history'?'history':'portfolio');
+}
+function paperOverviewSignature(d){
+  if(!d||typeof d!=='object') return 'null';
+  var s=d.shared||{},c=d.cycle||{},curve=d.equity_curve||{},mon=(d.monitor_runs||[])[0]||{};
+  return [s.nav,s.cash,s.position_count,s.dynamic_position_slots_used,
+    (d.orders||[]).length,(d.positions||[]).length,(d.signals||[]).length,
+    (d.observations||[]).length,(d.risk_decisions||[]).length,
+    (d.history_symbols||[]).length,(d.parameter_versions||[]).length,
+    c.cycle_key,(curve.dates||[]).length,mon.status].join('|');
+}
 async function loadPaper(options){
   options=options||{};
+  var variant=paperOverviewVariant();
+  var cache=window._paperOverviewCache;
+  if(!options.refresh&&!options.force&&cache&&cache.variant===variant&&!window._paperLoadRequest){
+    renderPaperDashboard(cache.data,null);
+    if(Date.now()-cache.at<PAPER_NAV_TTL_MS) return;   // 缓存仍新鲜：零网络、零重绘
+    window._paperLoadRequest=(async function(){        // 已过期：旧数据先顶着，后台刷新
+      try{
+        var fresh=await api('/api/paper/overview'
+          +(variant==='activity'?'?activity=1':variant==='history'?'?history_symbols=1':''));
+        if(paperOverviewSignature(fresh)!==paperOverviewSignature(cache.data)){
+          window._paperOverviewCache={variant:variant,data:fresh,at:Date.now()};
+          renderPaperDashboard(fresh,null);
+        }else window._paperOverviewCache.at=Date.now();
+      }catch(ignore){/* 静默刷新失败时保留当前画面，不打断浏览 */}
+      finally{ window._paperLoadRequest=null; }
+    })();
+    return window._paperLoadRequest;
+  }
   // Navigation, the one-minute refresh, and manual actions may all request an
   // overview at the same time.  Let every caller share one in-flight request
   // instead of rendering the large dashboard repeatedly in parallel.
@@ -2176,14 +2257,32 @@ async function loadPaper(options){
     // The activity audit is independent from the account overview.  Start it
     // immediately so it can read in parallel with the larger dashboard DOM
     // render instead of extending every browser refresh serially.
-    var auditRequest = window._paperWorkspace==='activity'
+    var auditRequest = variant==='activity'
       ? api('/api/paper/risk-audit?limit=160')
       : null;
     var overviewQuery=[];
     if(options.refresh) overviewQuery.push('refresh=1');
-    if(window._paperWorkspace==='activity') overviewQuery.push('activity=1');
-    if(window._paperWorkspace==='history') overviewQuery.push('history_symbols=1');
+    if(variant==='activity') overviewQuery.push('activity=1');
+    if(variant==='history') overviewQuery.push('history_symbols=1');
     var d = await api('/api/paper/overview'+(overviewQuery.length?'?'+overviewQuery.join('&'):''));
+    window._paperOverviewCache={variant:variant,data:d,at:Date.now()};
+    renderPaperDashboard(d,auditRequest);
+  }catch(e){
+    var message=riskText((e&&e.message)||e||'未知错误');
+    // A dashboard failure must never leave the visible workspace permanently
+    // saying "正在读取".  Surface the exact failure in every affected panel so
+    // the user can refresh or report it, while risk exits continue server-side.
+    if($('paperResult')) $('paperResult').innerHTML='<div class="banner">模拟盘加载失败：'+message+'</div>';
+    if($('paperTerminalBoard')) $('paperTerminalBoard').innerHTML='<div class="paper-empty">持仓与委托状态读取失败：'+message+'。请刷新页面重试。</div>';
+    if($('paperActivityBoard')) $('paperActivityBoard').innerHTML='<div class="paper-empty">委托与风控审计读取失败：'+message+'。请刷新页面重试。</div>';
+    if($('paperStatus')) $('paperStatus').innerHTML='<span class="tag tag-warn">读取异常</span> '+message;
+  } finally {
+    window._paperLoadRequest=null;
+  }
+  })();
+  return window._paperLoadRequest;
+}
+async function renderPaperDashboard(d,auditRequest){
     var accounts = d.accounts||[];
     var cycle = d.cycle||{};
     var legacyEmpty = String(cycle.cycle_key||'').indexOf('legacy-')===0 && accounts.every(function(a){return !a.trade_count;});
@@ -2293,7 +2392,11 @@ async function loadPaper(options){
         // The shared overview request may have started while another tab was
         // active, in which case auditRequest is null.  Fetch it now instead of
         // awaiting null and passing that value into renderPaperAudit().
-        var auditDashboard=await (auditRequest||api('/api/paper/risk-audit?limit=160'));
+        var auditDashboard=auditRequest||window._paperAuditCache;
+        if(!auditDashboard){
+          auditDashboard=await api('/api/paper/risk-audit?limit=160');
+          window._paperAuditCache=auditDashboard;
+        }
         var auditBoard=$('paperActivityBoard');
         if(auditBoard){
           // loadPaper() may overlap after a fast refresh/navigation. Keep one audit section.
@@ -2399,20 +2502,6 @@ async function loadPaper(options){
     $('paperResult').innerHTML = todayBand+'<section class="paper-challenge"><div class="paper-challenge-head"><h2>'+strategyCount+'策略归一化收益对比</h2><p>折线为策略累计收益（按绩效参考本金），持仓浮盈率按实际持仓成本计算；两种口径不混用。委托和个股历史已移至上方专页。</p></div><div id="paperCompareChart" class="paper-compare-chart" role="img" aria-label="'+strategyCount+'套策略与沪深300的归一化收益对比曲线"></div><div class="paper-challenge-table"><table><tr><th>策略名称</th><th>挑战批次</th><th>当前持仓浮盈率</th><th>今日持仓盈亏</th><th>最大回撤</th><th>胜率</th><th>盈亏比</th><th>成交笔数</th><th>占总资金池</th></tr>'+compareRows+'</table></div><div class="paper-challenge-note">'+challengeMsg+'</div></section><div class="panel"><h3>当前行业风险暴露</h3><div class="result-toolbar">'+exposure+'</div></div><div class="disclaimer">'+d.disclaimer+'</div>';
     renderPaperCompareChart(curve);
     }
-  }catch(e){
-    var message=riskText((e&&e.message)||e||'未知错误');
-    // A dashboard failure must never leave the visible workspace permanently
-    // saying "正在读取".  Surface the exact failure in every affected panel so
-    // the user can refresh or report it, while risk exits continue server-side.
-    if($('paperResult')) $('paperResult').innerHTML='<div class="banner">模拟盘加载失败：'+message+'</div>';
-    if($('paperTerminalBoard')) $('paperTerminalBoard').innerHTML='<div class="paper-empty">持仓与委托状态读取失败：'+message+'。请刷新页面重试。</div>';
-    if($('paperActivityBoard')) $('paperActivityBoard').innerHTML='<div class="paper-empty">委托与风控审计读取失败：'+message+'。请刷新页面重试。</div>';
-    if($('paperStatus')) $('paperStatus').innerHTML='<span class="tag tag-warn">读取异常</span> '+message;
-  } finally {
-    window._paperLoadRequest=null;
-  }
-  })();
-  return window._paperLoadRequest;
 }
 
 // ---------- 个股分析 ----------
@@ -2445,9 +2534,22 @@ function normalizeActiveStrategyCopy(root){
   }
 }
 if(typeof MutationObserver!=='undefined'){
-  var strategyCopyObserver=new MutationObserver(function(){
-    normalizeActiveStrategyCopy($('p-paper'));
-    normalizeActiveStrategyCopy($('p-adaptive'));
+  // 只规范化本批新增的节点。此前每次 DOM 变更都会 TreeWalker 全量遍历
+  // p-paper + p-adaptive 的所有文本节点；大盘一次渲染有几十次 innerHTML
+  // 写入，等于几十次全树扫描，是切页/渲染卡顿的主要脚本开销之一。
+  var strategyCopyObserver=new MutationObserver(function(mutations){
+    for(var i=0;i<mutations.length;i++){
+      var added=mutations[i].addedNodes;
+      for(var j=0;j<added.length;j++){
+        var node=added[j];
+        if(node.nodeType===Node.ELEMENT_NODE) normalizeActiveStrategyCopy(node);
+        else if(node.nodeType===Node.TEXT_NODE){
+          var value=node.nodeValue||'';
+          var normalized=value.replace(/[二两三四]套策略/g,'五套策略').replace(/[二两三四]策略/g,'五策略');
+          if(normalized!==value) node.nodeValue=normalized;
+        }
+      }
+    }
   });
   strategyCopyObserver.observe(document.body,{childList:true,subtree:true});
 }
