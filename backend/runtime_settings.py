@@ -264,9 +264,24 @@ def _boolean(value: Any, key: str) -> bool:
     raise ValueError(f"{key}必须是布尔值")
 
 
-def update(conn: sqlite3.Connection, updates: dict[str, Any], actor: str = "human-ui") -> dict[str, Any]:
+def update(conn: sqlite3.Connection, updates: dict[str, Any], actor: str = "human-ui",
+           *, risk_evidence: dict[str, Any] | None = None) -> dict[str, Any]:
     checked = validate(updates)
     current = _flat_read(conn)
+    # 非对称风险进化（PR）：strategy_overrides 的风险方向变化必须过闸——
+    # 放大需要严格证据 + 观察期 + 单轮幅度上限；收紧（安全方向）直接放行。
+    # 未携带证据上下文的调用（如设置界面）只能收紧，不能放大。
+    if "strategy_overrides" in checked:
+        import asymmetric_risk as AR
+
+        evidence = risk_evidence or {}
+        gate = AR.validate_risk_updates(
+            current["strategy_overrides"], checked["strategy_overrides"],
+            evidence_count=evidence.get("evidence_count"),
+            observation_days=evidence.get("observation_days"),
+        )
+        if not gate["allowed"]:
+            raise ValueError("；".join(gate["violations"]))
     now = dt.datetime.now().isoformat(timespec="seconds")
     for key, value in checked.items():
         old = current.get(key)
