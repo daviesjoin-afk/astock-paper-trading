@@ -44,6 +44,10 @@ DEFAULTS = {
     "minimum_entry_slot_utilization": 0.60,
     "evolution_interval_hours": 24,
     "strategy_overrides": {key: dict(value) for key, value in STRATEGY_DEFAULTS.items()},
+    # 执行画像执行器开关（PR-11）：批量窗口 / 人工核验 / TTL 清扫。
+    "execution_batch_gate": True,
+    "execution_verification_gate": False,
+    "execution_ttl_sweep": True,
 }
 
 SETTING_GROUPS = {
@@ -54,6 +58,7 @@ SETTING_GROUPS = {
     ),
     "strategy": ("strategy_overrides",),
     "evolution": ("evolution_interval_hours",),
+    "execution": ("execution_batch_gate", "execution_verification_gate", "execution_ttl_sweep"),
 }
 
 METADATA = {
@@ -66,6 +71,9 @@ METADATA = {
     "minimum_entry_slot_utilization": {"label": "最小建仓席位利用率", "unit": "%", "apply_mode": "immediate", "recommended": 60, "description": "动态最小建仓金额使用的席位金额比例，剩余空间留给风控加仓。"},
     "evolution_interval_hours": {"label": "自进化周期", "unit": "小时", "apply_mode": "next_run", "recommended": 24, "description": "后台收盘学习任务之间的最短间隔。"},
     "strategy_overrides": {"label": "策略参数", "apply_mode": "next_cycle", "recommended": STRATEGY_DEFAULTS, "description": "每套策略的风格、席位数和风险权重；仅允许在白名单范围内调整。"},
+    "execution_batch_gate": {"label": "批量撮合窗口", "apply_mode": "immediate", "recommended": True, "description": "轮动画像的委托挂起至收盘前批量窗口统一撮合；窗口内到达的委托仍立即成交。"},
+    "execution_verification_gate": {"label": "事件人工核验", "apply_mode": "immediate", "recommended": False, "description": "开启后事件画像的每笔买入都需人工放行；关闭时按普通限价路径执行。"},
+    "execution_ttl_sweep": {"label": "执行时限清扫", "apply_mode": "immediate", "recommended": True, "description": "清扫到期挂起委托：严格时限画像作废，其余自动放回重试管道。"},
 }
 
 
@@ -231,7 +239,23 @@ def validate(updates: dict[str, Any]) -> dict[str, Any]:
                 "max_exposure_pct": _number(candidate.get("max_exposure_pct", defaults_for_strategy["max_exposure_pct"]), f"{strategy_id}.max_exposure_pct", 35, 96),
             }
         checked["strategy_overrides"] = checked_overrides
+    for key in ("execution_batch_gate", "execution_verification_gate", "execution_ttl_sweep"):
+        if key in updates:
+            checked[key] = _boolean(updates[key], key)
     return checked
+
+
+def _boolean(value: Any, key: str) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)) and value in (0, 1):
+        return bool(value)
+    text = str(value or "").strip().lower()
+    if text in {"true", "1", "on", "yes", "开启", "开"}:
+        return True
+    if text in {"false", "0", "off", "no", "关闭", "关"}:
+        return False
+    raise ValueError(f"{key}必须是布尔值")
 
 
 def update(conn: sqlite3.Connection, updates: dict[str, Any], actor: str = "human-ui") -> dict[str, Any]:

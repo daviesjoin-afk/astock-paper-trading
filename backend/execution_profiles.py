@@ -1,9 +1,11 @@
 # -*- coding: utf-8 -*-
-"""策略执行画像（PR-10）：按风险指纹/画像族自动选择执行方式。
+r"""策略执行画像（PR-10）：按风险指纹/画像族自动选择执行方式。
 
 设计
 ----
-- 输入可以是：风险画像族字符串（\`breakout\`/\`trend\`/\`sector\`/...）、
+- 输入可以是：风险画像族字符串（`breakout`/`trend`/`sector`/...）、
+  :class:`strategy_risk_fingerprint.StrategyRiskFingerprint`（用其
+  archetype），或 `ACCOUNT_SPECS` 里每个账户声明的 `risk_profile`。
   :class:\`strategy_risk_fingerprint.StrategyRiskFingerprint\`（用其
   archetype），或 \`ACCOUNT_SPECS\` 里每个账户声明的 \`risk_profile\`。
   别名表把各口径收敛到七个画像族。
@@ -179,9 +181,9 @@ def enforce_entry_limit(
 ) -> dict[str, Any]:
     """入场限价门禁：限价锚定参考价（如信号收盘价），现价越界则延期。
 
-    市价画像恒通过。限价画像：\`limit = reference × (1 ± offset)\`，
-    若 \`fill_price\` 不优于限价（买入时更高），调用方应把订单延期
-    （\`execution_retry\`），而不是按更差的价格成交。
+    市价画像恒通过。限价画像：`limit = reference × (1 ± offset)`，
+    若 `fill_price` 不优于限价（买入时更高），调用方应把订单延期
+    （`execution_retry`），而不是按更差的价格成交。
     """
     try:
         price = float(fill_price or 0.0)
