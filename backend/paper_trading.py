@@ -36,6 +36,7 @@ import paper_schema_migrations as PSM
 import paper_archive_projection as PAP
 import paper_quote_policy as PQP
 import paper_allocation as PA
+import execution_dispatch as EPD
 import execution_profiles as EPF
 import paper_sizing as PSZ
 import order_intent as OI
@@ -7885,6 +7886,23 @@ def _execution_profile_for_account(account_id):
     return cached
 
 
+def execution_dispatch_overview():
+    """PR-11：执行器视图（开关 / 批量窗口 / 挂起队列），纯只读。"""
+    init_db()
+    with _db() as conn:
+        return EPD.dispatch_overview(conn)
+
+
+def resolve_execution_verification(order_id, approved, operator="", note=""):
+    """PR-11：人工核验结论——放行（放回重试管道）或驳回（终态作废）。"""
+    init_db()
+    with _db(immediate=True) as conn:
+        return EPD.resolve_verification(
+            conn, int(order_id), approved=bool(approved),
+            operator=str(operator or "")[:64], note=str(note or "")[:500],
+        )
+
+
 def _quote_liquidity_cap(quote):
     """按当日成交额 × 参与率估算流动性可买金额（PR-09）。
 
@@ -8382,6 +8400,16 @@ def _buy_order(conn, account, signal, quote, market, news, asof_day, *, all_quot
     if entry_limit["limit_price"] is not None:
         sizing["execution_limit_price"] = entry_limit["limit_price"]
     risk["execution_profile"] = exec_profile
+    # PR-11 执行器：批量窗口 / 人工核验只挂起"本可立即成交"的委托。挂起
+    # 发生在资金预占之前，因此不占额度也不占席位。驳回结论按
+    # 账户 × 标的 × 交易日 持久化，避免日内重建的候选重复进入核验队列。
+    dispatch_plan = EPD.plan_execution_dispatch(
+        exec_profile, signal_payload=payload, dispatch_settings=EPD.settings(conn),
+        verification_rejected=EPD.is_verification_rejected(
+            conn, account["id"], code, asof_day,
+        ),
+    )
+    risk["execution_dispatch"] = dispatch_plan
     amount = qty * fill_price
     fees = _commission(amount) if amount else 0.0
     sizing["one_lot_amount"] = round(LOT_SIZE * fill_price, 2)
@@ -8506,6 +8534,8 @@ def _buy_order(conn, account, signal, quote, market, news, asof_day, *, all_quot
         qty < LOT_SIZE and not hard_reasons
         and set(sizing.get("binding_constraints") or []).issubset({"cash", "weight", "exposure", "industry"})
     )
+    if dispatch_plan.get("blocked"):
+        reasons.append(str(dispatch_plan["blocked_reason"]))
     # A Q3 sample is worth recording only if every ordinary execution/risk
     # gate also passed.  It must never turn stale quotes, a hard veto or an
     # undersized order into a seemingly valid research observation.
@@ -8524,6 +8554,20 @@ def _buy_order(conn, account, signal, quote, market, news, asof_day, *, all_quot
     ))
     if limit_deferred:
         reason = f"{reason}；{entry_limit['reason']}" if reason else str(entry_limit["reason"])
+    risk["execution_dispatch"] = dispatch_plan
+    dispatch_gate = dispatch_plan["gate"] if allowed else "none"
+    dispatch_duplicate = None
+    if dispatch_gate != "none":
+        dispatch_duplicate = EPD.active_gated_order(conn, signal.get("id"))
+        if dispatch_duplicate is None:
+            allowed = False
+            order_status = dispatch_plan["status"]
+            reason = f"{reason}；{dispatch_plan['reason']}" if reason else str(dispatch_plan["reason"])
+            decision_name = f"execution_gate_{dispatch_gate}"
+    elif allowed:
+        # 闸门已开（批量窗口内 / 已人工核验）：回收该信号遗留的挂起单，
+        # 避免挂起单与本次成交单同时占用审计视图。
+        EPD.retire_gated_orders(conn, signal.get("id"))
     decision_name = "approved" if allowed else (
         "q3_shadow_candidate" if q3_shadow_ready else (
             "deferred_limit" if limit_deferred else
@@ -8535,6 +8579,23 @@ def _buy_order(conn, account, signal, quote, market, news, asof_day, *, all_quot
         quote=quote, kline=kline, news=news,
         final_score=entry_model.get("score"),
     )
+    if dispatch_duplicate is not None:
+        # 该信号已在执行队列中等待，本轮不再重复入队（否则每轮扫描都会新建
+        # 一条挂起单，TTL 与队列视图都会被不断刷新）。
+        if (risk.get("slot_borrow") or {}).get("allowed"):
+            risk["slot_borrow_rollback"] = _rollback_slot_borrow(conn, risk["slot_borrow"])
+        hold_reason = dispatch_plan["reason"] or "委托已在执行队列中等待放行"
+        _risk_log(conn, account["id"], code, "buy", f"execution_gate_{dispatch_gate}",
+                  hold_reason, risk)
+        conn.execute(
+            "UPDATE paper_signals SET status='deferred_capacity',reason=? WHERE id=? AND status<>?",
+            (hold_reason, signal["id"], "deferred_capacity"),
+        )
+        return {
+            "filled": False, "deferred": True, "execution_gate": dispatch_gate,
+            "status": str(dispatch_duplicate.get("status") or dispatch_plan["status"]),
+            "reason": hold_reason,
+        }
     # An execution retry is an attempt for this signal, not a new candidate.
     # Retire the old retry before inserting the next canonical attempt so it
     # cannot reserve a second slot or cash on the following scan.
@@ -8546,15 +8607,15 @@ def _buy_order(conn, account, signal, quote, market, news, asof_day, *, all_quot
     cursor = conn.execute(
         """INSERT INTO paper_orders(
            account_id,signal_id,side,code,name,qty,planned_price,order_type,filled_price,amount,
-           fees,status,reason,risk_payload,created_at,executed_at,
+           fees,status,reason,risk_payload,created_at,executed_at,expires_at,
            strategy_id,strategy_version,strategy_checksum)
-        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (account["id"], signal["id"], "buy", code, signal.get("name"), qty,
          entry_limit["limit_price"] if entry_limit["limit_price"] is not None else price,
          entry_limit["order_type"],
          fill_price if allowed else None,
          amount if allowed else None, fees if allowed else None, order_status, reason,
-         _json(risk), _now(), _now() if allowed else None,
+         _json(risk), _now(), _now() if allowed else None, dispatch_plan["expires_at"],
          strategy_id, strategy_version, strategy_checksum),
     )
     # A frozen order is a waitlist marker, not a second live order.  Once the
@@ -8595,6 +8656,20 @@ def _buy_order(conn, account, signal, quote, market, news, asof_day, *, all_quot
     if not allowed:
         if (risk.get("slot_borrow") or {}).get("allowed"):
             risk["slot_borrow_rollback"] = _rollback_slot_borrow(conn, risk["slot_borrow"])
+        if order_status in EPD.GATED_ORDER_STATUSES:
+            # 挂起单已落库（不预占资金、不占席位）；信号留在复试管道里，
+            # 批量窗口开启或人工核验放行后由下一轮扫描继续过闸成交。
+            hold_reason = str(dispatch_plan["reason"] or "执行画像挂起，等待放行")
+            conn.execute(
+                "UPDATE paper_signals SET status='deferred_capacity',reason=? WHERE id=?",
+                (hold_reason, signal["id"]),
+            )
+            return {
+                "filled": False, "deferred": True,
+                "execution_gate": dispatch_gate, "status": order_status,
+                "expires_at": dispatch_plan["expires_at"],
+                "reason": hold_reason,
+            }
         if q3_shadow_ready:
             conn.execute(
                 "UPDATE paper_signals SET status='shadow_q3', reason=?, payload=? WHERE id=?",
@@ -13125,6 +13200,19 @@ def run_slot(slot, asof_date=None, force=False):
     if slot not in {"auction", "open", "risk", "close", "weekly-review", "intraday"}:
         raise ValueError("slot 必须是 auction、open、risk、close、weekly-review 或 intraday")
     init_db()
+    # PR-11 执行器清扫：批量窗口到期放行、人工核验等待单回收、TTL 作废。
+    # 属于撮合前置动作，放在任何买入判定之前；清扫失败只记录审计，绝不能
+    # 打断本轮扫描（挂起单会在下一轮继续被清扫）。
+    try:
+        with _db() as dispatch_conn:
+            EPD.run_execution_dispatch(dispatch_conn)
+    except Exception as dispatch_exc:  # pragma: no cover - 防御性
+        try:
+            with _db() as dispatch_conn:
+                _audit(dispatch_conn, "system", "execution_dispatch_error",
+                       f"执行器清扫失败：{type(dispatch_exc).__name__}: {dispatch_exc}")
+        except Exception:
+            pass
     day = _date(asof_date)
     if slot == "weekly-review" and not force:
         # Anchor the weekly review to the last *trading* day of the ISO week.
