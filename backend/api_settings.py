@@ -92,6 +92,7 @@ def _snapshot() -> dict:
             "risk": {key: RSET.defaults()[key] for key in RSET.SETTING_GROUPS["risk"]},
             "strategy": {"strategy_overrides": RSET.defaults()["strategy_overrides"]},
             "evolution": {"evolution_interval_hours": RSET.defaults()["evolution_interval_hours"]},
+            "execution": {key: RSET.defaults()[key] for key in RSET.SETTING_GROUPS["execution"]},
         },
         "metadata": RSET.metadata(),
         "effective": {
