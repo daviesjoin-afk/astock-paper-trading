@@ -1,5 +1,7 @@
 # -*- coding: utf-8 -*-
 """策略执行画像（PR-10）的回归测试。"""
+import os
+import re
 import unittest
 
 import execution_profiles as profiles
@@ -123,3 +125,23 @@ class EntryLimitTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class BuyOrderWiringTests(unittest.TestCase):
+    def test_limit_deferred_signal_stays_retry_eligible(self):
+        # 回归护栏（P1）：限价未到时，关联 signal 必须转入 deferred_capacity
+        # （属于 ENTRY_RETRY_SIGNAL_STATUSES），绝不能打成终态 rejected。
+        with open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                               "paper_trading.py"), "r", encoding="utf-8") as handle:
+            source = handle.read()
+        match = re.search(r"^def _buy_order\(", source, re.M)
+        self.assertIsNotNone(match)
+        start = match.start()
+        nxt = re.search(r"^def ", source[start + 1:], re.M)
+        body = source[start:start + 1 + (nxt.start() if nxt else len(source))]
+        self.assertIn("limit_deferred", body)
+        rejected_pos = body.index("SET status='rejected'")
+        before_reject = body[:rejected_pos]
+        # rejected 之前必须存在"限价未到 → signal 转 deferred_capacity"的分支。
+        self.assertLess(before_reject.rindex("if limit_deferred:"),
+                        before_reject.rindex("SET status='deferred_capacity'"))
