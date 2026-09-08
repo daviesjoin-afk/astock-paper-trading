@@ -40,9 +40,14 @@ class DbMigrateTests(unittest.TestCase):
                 self.assertEqual(conn.execute("SELECT version FROM schema_version WHERE db_name='paper_trading'").fetchone()[0], latest_version)
                 order_columns = {row[1] for row in conn.execute("PRAGMA table_info(paper_orders)")}
                 self.assertTrue({"realized_pnl", "order_type", "origin"}.issubset(order_columns))
+                self.assertTrue({"strategy_id", "strategy_version", "strategy_checksum"}.issubset(order_columns))
                 self.assertIsNotNone(conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='paper_ignition_shadow'").fetchone())
                 self.assertEqual(
                     conn.execute("SELECT COUNT(*) FROM strategy_definitions WHERE origin='builtin'").fetchone()[0],
+                    5,
+                )
+                self.assertEqual(
+                    conn.execute("SELECT COUNT(*) FROM paper_strategy_versions WHERE version=1").fetchone()[0],
                     5,
                 )
             finally:

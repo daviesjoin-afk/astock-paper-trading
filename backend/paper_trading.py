@@ -1218,15 +1218,19 @@ def _record_entry_frozen_waitlist(
         payload["signal_id"] = int(signal_id)
     if existing:
         return int(existing["id"]), False, reason, payload
+    strategy_id, strategy_version, strategy_checksum = _strategy_stamp(
+        conn, account_id, signal_id,
+    )
     cursor = conn.execute(
         """INSERT INTO paper_orders(
                account_id,signal_id,side,code,name,qty,planned_price,status,reason,
-               risk_payload,origin,created_at)
-           VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
+               risk_payload,origin,created_at,strategy_id,strategy_version,strategy_checksum)
+           VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (
             account_id, signal_id, "buy", code, name, max(0, int(_num(qty))),
             _num(planned_price, None), ENTRY_FROZEN_WAITLIST_STATUS, reason,
             _json(payload), "strategy", _now(),
+            strategy_id, strategy_version, strategy_checksum,
         ),
     )
     order_id = int(cursor.lastrowid)
@@ -1910,6 +1914,7 @@ def init_db():
                 PSM.ensure_paper_columns(conn)
                 RSET.ensure_schema(conn)
                 SR.ensure_schema(conn)
+                PSM.ensure_strategy_reference_columns(conn)
                 _ensure_accounts(conn)
                 _ensure_cycle(conn)
                 _ensure_runtime_lease_columns(conn)
@@ -1935,7 +1940,8 @@ def init_db():
                 signal_date TEXT NOT NULL, intended_date TEXT NOT NULL, code TEXT NOT NULL,
                 name TEXT, industry TEXT, close_price REAL, rank_score REAL, t_tier TEXT,
                 t_score REAL, payload TEXT NOT NULL, status TEXT NOT NULL, reason TEXT,
-                created_at TEXT NOT NULL,
+                created_at TEXT NOT NULL, strategy_id TEXT,
+                strategy_version INTEGER, strategy_checksum TEXT,
                 UNIQUE(account_id, signal_date, code)
             );
             CREATE TABLE IF NOT EXISTS paper_orders (
@@ -1943,7 +1949,10 @@ def init_db():
                 signal_id INTEGER, side TEXT NOT NULL, code TEXT NOT NULL, name TEXT,
                 qty INTEGER NOT NULL, planned_price REAL, filled_price REAL,
                 amount REAL, fees REAL, status TEXT NOT NULL, reason TEXT,
-                risk_payload TEXT NOT NULL, realized_pnl REAL, created_at TEXT NOT NULL,                 executed_at TEXT
+                risk_payload TEXT NOT NULL, realized_pnl REAL, created_at TEXT NOT NULL, executed_at TEXT,
+                order_type TEXT NOT NULL DEFAULT 'market',
+                origin TEXT NOT NULL DEFAULT 'strategy', expires_at TEXT, cancelled_at TEXT,
+                strategy_id TEXT, strategy_version INTEGER, strategy_checksum TEXT
             );
             -- 归档表：列集与活跃表严格一致（清理函数用 SELECT * 归档），避免列错位。
             CREATE TABLE IF NOT EXISTS paper_orders_archive (
@@ -1951,12 +1960,14 @@ def init_db():
                 qty INTEGER, planned_price REAL, filled_price REAL, amount REAL, fees REAL,
                 status TEXT, reason TEXT, risk_payload TEXT, realized_pnl REAL,
                 created_at TEXT, executed_at TEXT, order_type TEXT, origin TEXT,
-                expires_at TEXT, cancelled_at TEXT
+                expires_at TEXT, cancelled_at TEXT, strategy_id TEXT,
+                strategy_version INTEGER, strategy_checksum TEXT
             );
             CREATE TABLE IF NOT EXISTS paper_signals_archive (
                 id INTEGER, account_id TEXT, signal_date TEXT, intended_date TEXT, code TEXT, name TEXT,
                 industry TEXT, close_price REAL, rank_score REAL, t_tier TEXT, t_score REAL,
-                payload TEXT, status TEXT, reason TEXT, created_at TEXT
+                payload TEXT, status TEXT, reason TEXT, created_at TEXT,
+                strategy_id TEXT, strategy_version INTEGER, strategy_checksum TEXT
             );
             CREATE TABLE IF NOT EXISTS paper_positions (
                 account_id TEXT NOT NULL, code TEXT NOT NULL, name TEXT, industry TEXT,
@@ -1973,7 +1984,8 @@ def init_db():
             CREATE TABLE IF NOT EXISTS paper_risk_decisions (
                 id INTEGER PRIMARY KEY AUTOINCREMENT, account_id TEXT NOT NULL,
                 code TEXT, side TEXT NOT NULL, decision TEXT NOT NULL, reason TEXT,
-                payload TEXT NOT NULL, created_at TEXT NOT NULL
+                payload TEXT NOT NULL, created_at TEXT NOT NULL, strategy_id TEXT,
+                strategy_version INTEGER, strategy_checksum TEXT
             );
             CREATE INDEX IF NOT EXISTS idx_paper_risk_decisions_recent
                 ON paper_risk_decisions(id DESC);
@@ -2062,7 +2074,8 @@ def init_db():
             );
             CREATE TABLE IF NOT EXISTS paper_audit (
                 id INTEGER PRIMARY KEY AUTOINCREMENT, account_id TEXT, event TEXT NOT NULL,
-                detail TEXT, created_at TEXT NOT NULL
+                detail TEXT, created_at TEXT NOT NULL, strategy_id TEXT,
+                strategy_version INTEGER, strategy_checksum TEXT
             );
             CREATE TABLE IF NOT EXISTS paper_cycles (
                 id INTEGER PRIMARY KEY AUTOINCREMENT, cycle_key TEXT NOT NULL UNIQUE,
@@ -2186,6 +2199,7 @@ def init_db():
         )
         _rebuild_realized_pnl(conn)
         SR.ensure_schema(conn)
+        PSM.ensure_strategy_reference_columns(conn)
         _ensure_accounts(conn)
         _ensure_cycle(conn)
         _ensure_runtime_lease_columns(conn)
@@ -2379,6 +2393,9 @@ def _ensure_cycle(conn):
         active = conn.execute("SELECT * FROM paper_cycles WHERE id=?", (active["id"],)).fetchone()
     configured_enabled = _loads(active["enabled_strategies"], None) if "enabled_strategies" in active.keys() else None
     enabled_ids = tuple(item for item in (configured_enabled or ACTIVE_ACCOUNT_IDS) if item in ACCOUNT_SPECS) or ACTIVE_ACCOUNT_IDS
+    # Bind before any account-repair audit below. A definition head can move
+    # independently, but every write in this cycle must retain this snapshot.
+    SR.bind_cycle_versions(conn, active["id"], enabled_ids)
     for account_id, spec in ACTIVE_ACCOUNT_SPECS.items():
         current = conn.execute("SELECT * FROM paper_accounts WHERE id=?", (account_id,)).fetchone()
         if current is None:
@@ -2514,6 +2531,7 @@ def _ensure_cycle(conn):
                              WHERE account_id=? AND nav_date=?""",
                         (reference_capital, account_id, _date().isoformat()),
                     )
+    SR.bind_cycle_versions(conn, active["id"], enabled_ids)
     _reconcile_shared_cash(conn, active["id"])
 
 
@@ -2824,6 +2842,19 @@ def _audit(conn, account_id, event, detail):
     return PRP.audit(conn, account_id, event, detail, _now())
 
 
+def _strategy_stamp(conn, account_id, signal_id=None):
+    """Return one complete causal Strategy Definition version stamp."""
+    if signal_id is not None:
+        row = conn.execute(
+            """SELECT strategy_id,strategy_version,strategy_checksum
+               FROM paper_signals WHERE id=?""",
+            (int(signal_id),),
+        ).fetchone()
+        if row and all(value is not None and value != "" for value in row):
+            return tuple(row)
+    return SR.stamp_for_account(conn, account_id)
+
+
 def _volatility_shadow(code, asof_day, price=None):
     """Return volatility diagnostics only; never changes a risk threshold."""
     result = {"version": "volatility-shadow-v1", "status": "unknown", "atr20_pct": None,
@@ -2926,9 +2957,14 @@ def _risk_log(conn, account_id, code, side, decision, reason, payload):
         payload or {}, account_id=account_id, code=code, side=side,
         decision=decision, reason=reason,
     )
+    strategy_id, strategy_version, strategy_checksum = _strategy_stamp(conn, account_id)
     conn.execute(
-        "INSERT INTO paper_risk_decisions(account_id,code,side,decision,reason,payload,created_at) VALUES(?,?,?,?,?,?,?)",
-        (account_id, code, side, decision, reason, _json(payload), _now()),
+        """INSERT INTO paper_risk_decisions(
+               account_id,code,side,decision,reason,payload,created_at,
+               strategy_id,strategy_version,strategy_checksum)
+           VALUES(?,?,?,?,?,?,?,?,?,?)""",
+        (account_id, code, side, decision, reason, _json(payload), _now(),
+         strategy_id, strategy_version, strategy_checksum),
     )
 
 
@@ -7162,13 +7198,20 @@ def generate_signals(asof_date=None):
                     final_score=(decision.get("entry_model") or {}).get("score"),
                 )
                 status = "pending" if passed else "blocked"
+                strategy_id, strategy_version, strategy_checksum = _strategy_stamp(
+                    conn, account["id"],
+                )
                 conn.execute(
-                    """INSERT OR IGNORE INTO paper_signals(account_id,signal_date,intended_date,code,name,industry,close_price,rank_score,t_tier,t_score,payload,status,reason,created_at)
-                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    """INSERT OR IGNORE INTO paper_signals(
+                       account_id,signal_date,intended_date,code,name,industry,close_price,
+                       rank_score,t_tier,t_score,payload,status,reason,created_at,
+                       strategy_id,strategy_version,strategy_checksum)
+                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                     (account["id"], day.isoformat(), _next_weekday(day).isoformat(), code, pick.get("name"),
                      pick.get("industry"), _num(quote.get("price"), _num(pick.get("price"))), _num(pick.get("score")),
                      decision.get("tier"), _num((decision.get("entry_model") or {}).get("score")),
-                     _json(payload), status, reason, _now()),
+                     _json(payload), status, reason, _now(),
+                     strategy_id, strategy_version, strategy_checksum),
                 )
                 _risk_log(conn, account["id"], code, "buy", "approved_signal" if passed else "rejected_signal", reason, payload)
                 created += int(passed)
@@ -8404,11 +8447,19 @@ def _buy_order(conn, account, signal, quote, market, news, asof_day, *, all_quot
     # cannot reserve a second slot or cash on the following scan.
     _supersede_signal_execution_retries(conn, signal.get("id"))
     _assert_active_lease(conn, "strategy buy order write")
+    strategy_id, strategy_version, strategy_checksum = _strategy_stamp(
+        conn, account["id"], signal.get("id"),
+    )
     cursor = conn.execute(
-        """INSERT INTO paper_orders(account_id,signal_id,side,code,name,qty,planned_price,filled_price,amount,fees,status,reason,risk_payload,created_at,executed_at)
-        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+        """INSERT INTO paper_orders(
+           account_id,signal_id,side,code,name,qty,planned_price,filled_price,amount,
+           fees,status,reason,risk_payload,created_at,executed_at,
+           strategy_id,strategy_version,strategy_checksum)
+        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (account["id"], signal["id"], "buy", code, signal.get("name"), qty, price, fill_price if allowed else None,
-         amount if allowed else None, fees if allowed else None, order_status, reason, _json(risk), _now(), _now() if allowed else None),
+         amount if allowed else None, fees if allowed else None, order_status, reason,
+         _json(risk), _now(), _now() if allowed else None,
+         strategy_id, strategy_version, strategy_checksum),
     )
     # A frozen order is a waitlist marker, not a second live order.  Once the
     # data gate reopens and this candidate receives a fresh decision, retire
@@ -10572,8 +10623,16 @@ def _monitor_risk_impl(asof_date=None):
                     asof_date=day, quote=quote, news=news,
                     kline=_completed_kline(position["code"], day, inclusive=False),
                 )
-                cursor = conn.execute("INSERT INTO paper_orders(account_id,side,code,name,qty,planned_price,status,reason,risk_payload,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
-                                      (position["account_id"], "sell", position["code"], position.get("name"), planned_qty, price or None, status, order_reason, _json(detail), _now()))
+                strategy_stamp = _strategy_stamp(conn, position["account_id"])
+                cursor = conn.execute(
+                    """INSERT INTO paper_orders(
+                           account_id,side,code,name,qty,planned_price,status,reason,
+                           risk_payload,created_at,strategy_id,strategy_version,strategy_checksum)
+                       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (position["account_id"], "sell", position["code"], position.get("name"),
+                     planned_qty, price or None, status, order_reason, _json(detail), _now(),
+                     *strategy_stamp),
+                )
                 _risk_log(conn, position["account_id"], position["code"], "sell", "unfilled", order_reason, detail)
                 orders.append({"code": position["code"], "status": status, "reason": order_reason})
                 continue
@@ -10609,11 +10668,13 @@ def _monitor_risk_impl(asof_date=None):
                     final_score=quality_review.get("score"),
                 )
                 _assert_active_lease(conn, "risk sell finalization")
+                strategy_stamp = _strategy_stamp(conn, position["account_id"])
                 cursor = conn.execute(
-                    """INSERT INTO paper_orders(account_id,side,code,name,qty,planned_price,filled_price,amount,fees,status,reason,risk_payload,realized_pnl,created_at,executed_at)
-                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    """INSERT INTO paper_orders(account_id,side,code,name,qty,planned_price,filled_price,amount,fees,status,reason,risk_payload,realized_pnl,created_at,executed_at,strategy_id,strategy_version,strategy_checksum)
+                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                     (position["account_id"], "sell", position["code"], position.get("name"), qty, price, fill_price,
-                     amount, fees, "filled", reason, _json(detail), realized_pnl, _now(), _now()),
+                     amount, fees, "filled", reason, _json(detail), realized_pnl, _now(), _now(),
+                     *strategy_stamp),
                 )
                 _credit_shared_cash(conn, amount - fees, position["account_id"])
                 conn.execute("UPDATE paper_positions SET take_stage=? WHERE account_id=? AND code=?",
@@ -11261,11 +11322,13 @@ def _bootstrap_signals_for_today(asof_day, live_universe=None, source_slot="intr
                         "reason": "早期强势、资金和流动性共振；仅用于同批等待池排序",
                         "execution_override": False,
                     }
+                    strategy_stamp = _strategy_stamp(conn, account["id"])
                     conn.execute(
                         """INSERT INTO paper_signals(
                                account_id,signal_date,intended_date,code,name,industry,close_price,
-                               rank_score,t_tier,t_score,payload,status,reason,created_at
-                           ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                               rank_score,t_tier,t_score,payload,status,reason,created_at,
+                               strategy_id,strategy_version,strategy_checksum
+                           ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                            ON CONFLICT(account_id,signal_date,code) DO UPDATE SET
                                intended_date=excluded.intended_date,
                                name=excluded.name,
@@ -11284,7 +11347,7 @@ def _bootstrap_signals_for_today(asof_day, live_universe=None, source_slot="intr
                             _num(quote.get("price"), _num(pick.get("price"))),
                             _num(pick.get("score")), decision.get("tier"),
                             _num((decision.get("entry_model") or {}).get("score"), 0.0) + waitlist_priority,
-                            _json(payload), status, reason, _now(),
+                            _json(payload), status, reason, _now(), *strategy_stamp,
                         ),
                     )
                     _risk_log(
@@ -11684,11 +11747,12 @@ def _intraday_sell(conn, account, position, quote, asof_day, profile, cycle, ope
     )
     order_reason = "开盘冲高回落减仓：共享事件引擎" if opening_event else "日内做T高抛：仅卖出已结算底仓"
     audit_action = "opening_event_t_sell" if opening_event else "intraday_t_sell"
+    strategy_stamp = _strategy_stamp(conn, account["id"])
     cursor = conn.execute(
-        """INSERT INTO paper_orders(account_id,side,code,name,qty,planned_price,filled_price,amount,fees,status,reason,risk_payload,realized_pnl,created_at,executed_at)
-           VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+        """INSERT INTO paper_orders(account_id,side,code,name,qty,planned_price,filled_price,amount,fees,status,reason,risk_payload,realized_pnl,created_at,executed_at,strategy_id,strategy_version,strategy_checksum)
+           VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (account["id"], "sell", position["code"], position.get("name"), qty, price, fill, amount, fees,
-         "filled", order_reason, _json(payload), pnl, _now(), _now()),
+         "filled", order_reason, _json(payload), pnl, _now(), _now(), *strategy_stamp),
     )
     _credit_shared_cash(conn, amount - fees, account["id"])
     conn.execute("INSERT INTO paper_fills(order_id,account_id,side,code,qty,price,amount,fees,fill_date,quote_at,assumption) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
@@ -14472,6 +14536,7 @@ def _create_cycle(conn, capital, status="paused", reason="新建模拟周期", d
                      (account_id, _date().isoformat(), account_share, 0.0, account_share, benchmark, now))
         conn.execute("INSERT INTO paper_parameter_versions(cycle_id,account_id,version,style,params,reason,effective_date,created_at) VALUES(?,?,?,?,?,?,?,?)",
                      (cycle_id, account_id, spec.get("strategy_version") or "v3.0", style, "{}", reason, _date().isoformat(), now))
+    SR.bind_cycle_versions(conn, cycle_id, enabled_strategies)
     _audit(conn, None, "cycle_created", f"{key}：共享模拟资金池 {capital:.2f} 元，启用 {len(enabled_strategies)} 套策略，周期 {RSET.cycle_duration_label(duration_days)}，{reason}")
     return {"id": cycle_id, "cycle_key": key, "status": status, "capital": capital, "duration_days": duration_days, "enabled_strategies": enabled_strategies}
 

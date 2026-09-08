@@ -37,6 +37,27 @@ class StrategyDefinitionLifecycleTests(unittest.TestCase):
         registry.ensure_schema(self.conn)
         self.assertEqual(registry.get("tq_breakout", conn=self.conn).status, "paused")
 
+    def test_old_pr01_definition_table_is_readable_before_version_migration(self):
+        self.conn.execute("DROP TABLE strategy_definitions")
+        self.conn.execute(
+            """CREATE TABLE strategy_definitions (
+                id TEXT PRIMARY KEY, name TEXT NOT NULL, origin TEXT NOT NULL,
+                lifecycle_status TEXT NOT NULL, implementation_key TEXT NOT NULL,
+                supports_new_cycle INTEGER NOT NULL, description TEXT NOT NULL,
+                metadata TEXT NOT NULL, sort_order INTEGER NOT NULL,
+                created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+            )"""
+        )
+        self.conn.execute(
+            """INSERT INTO strategy_definitions VALUES(
+                'legacy_strategy','Legacy','builtin','active','legacy_strategy',1,
+                '','{}',1,'2026-09-08','2026-09-08'
+            )"""
+        )
+        self.assertEqual(
+            registry.list_definitions(conn=self.conn)[0].current_version, None,
+        )
+
     def test_user_definition_can_be_queried_and_follows_lifecycle(self):
         created = registry.create_user_definition(
             self.conn, "user_momentum", "User Momentum", actor="unit-test",
