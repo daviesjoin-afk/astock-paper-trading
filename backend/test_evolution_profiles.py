@@ -71,9 +71,31 @@ class ValidationTests(unittest.TestCase):
     def test_within_step_and_bounds_is_allowed(self):
         result = EP.validate_strategy_adjustment(
             "tq_breakout", {"max_weight_delta": 0.03}, {"max_weight_delta": 0.033},
+            evidence_count=20,
         )
         self.assertTrue(result["allowed"])
         self.assertEqual(0.033, result["adjusted"]["max_weight_delta"])
+
+    def test_omitted_evidence_is_rejected(self):
+        result = EP.validate_strategy_adjustment(
+            "tq_breakout", {"max_weight_delta": 0.03}, {"max_weight_delta": 0.033},
+        )
+        self.assertFalse(result["allowed"])
+        self.assertIn("未提供证据", result["violations"][0])
+
+    def test_monotonic_hold_bias_only_tightens(self):
+        # trend_pullback 的 hold_bias 只许更保守（增大）；放松被拒。
+        loosened = EP.validate_strategy_adjustment(
+            "trend_pullback", {"hold_bias": 0.10}, {"hold_bias": 0.08},
+            evidence_count=20,
+        )
+        tightened = EP.validate_strategy_adjustment(
+            "trend_pullback", {"hold_bias": 0.10}, {"hold_bias": 0.12},
+            evidence_count=20,
+        )
+        self.assertFalse(loosened["allowed"])
+        self.assertIn("单向收紧", loosened["violations"][0])
+        self.assertTrue(tightened["allowed"])
 
     def test_out_of_bounds_is_rejected_not_clamped(self):
         # 步长内但越过边界：trend_pullback hold_bias 边界 [0.05, 0.5]。
@@ -149,6 +171,35 @@ class StorageTests(unittest.TestCase):
         self.assertTrue(rollback["rolled_back"])
         state = SE.get_strategy_params(conn, "trend_pullback")
         self.assertEqual(0.032, state["params"]["max_weight_delta"])
+
+    def test_noop_adjustment_creates_no_version(self):
+        conn = _db()
+        SE.init_params(conn)
+        SE.adjust_strategy_params(conn, "trend_pullback",
+                                  {"max_weight_delta": 0.032}, evidence_count=20)
+        result = SE.adjust_strategy_params(conn, "trend_pullback",
+                                           {"max_weight_delta": 0.032},
+                                           evidence_count=20)
+        self.assertFalse(result["adjusted"])
+        self.assertEqual("无变化", result["reason"])
+        # 重复版本不存在 → 回滚直接命中上一真实版本。
+        SE.adjust_strategy_params(conn, "trend_pullback",
+                                  {"max_weight_delta": 0.034}, evidence_count=20)
+        SE.rollback_strategy_params(conn, "trend_pullback")
+        state = SE.get_strategy_params(conn, "trend_pullback")
+        self.assertEqual(0.032, state["params"]["max_weight_delta"])
+
+    def test_rollback_single_version_restores_inherited_global_baseline(self):
+        conn = _db()
+        SE.init_params(conn)
+        SE.manual_adjust(conn, {"confidence_threshold": 80}, reason="全局先调整")
+        SE.adjust_strategy_params(conn, "tq_breakout",
+                                  {"max_weight_delta": 0.033}, evidence_count=20)
+        SE.rollback_strategy_params(conn, "tq_breakout")
+        state = SE.get_strategy_params(conn, "tq_breakout")
+        # 回落的是继承时的全局基线（confidence=80），不是出厂默认 70。
+        self.assertEqual(80, state["params"]["confidence_threshold"])
+        self.assertEqual(0.03, state["params"]["max_weight_delta"])
 
     def test_global_evolution_path_is_unchanged(self):
         conn = _db()
