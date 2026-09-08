@@ -1409,6 +1409,32 @@ def select(
         return result
 
 
+@app.get("/api/paper-selection")
+def paper_selection(
+    date: str = "",
+    strategy: str = "",
+):
+    """「策略选股」页只读入口：按策略分组返回最近交易日（或指定日）的结果。"""
+    import paper_selection as PS
+    return PS.latest(trade_date=date or None, strategy_id=strategy)
+
+
+@app.post("/api/paper-selection/run")
+def run_paper_selection(
+    topn: int = Query(5, ge=1, le=20),
+    strategy: str = "",
+    date: str = "",
+    confirmed: bool = Query(False),
+):
+    """人工重跑当天选股（覆盖写，不生成订单、不改动模拟盘账本）。"""
+    if not confirmed:
+        return JSONResponse({"error": "请先在页面点击确认后运行"}, status_code=422)
+    import paper_selection as PS
+    strategies = [item.strip() for item in str(strategy or "").split(",") if item.strip()]
+    return PS.run_daily(strategies=strategies or None, topn=topn,
+                        run_date=date or None, source="manual")
+
+
 @app.get("/api/select/latest")
 def select_latest(
     strategy: str = "three_day",

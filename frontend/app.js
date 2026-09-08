@@ -108,6 +108,8 @@ function activatePage(page, options){
   }
   if(page==='p-adaptive') loadAdaptive();
   if(page==='p-settings') loadSettings();
+  // 进入策略选股页（含首次加载默认落在本页）时读取一次结果，否则占位文案会一直停在“正在读取…”。
+  if(page==='p-select'&&typeof loadPaperSelection==='function') loadPaperSelection();
   if(page==='p-paper'){
     var paperTab=document.querySelector('#p-paper [data-paper-view="'+(window._paperWorkspace||'portfolio')+'"]');
     showPaperWorkspace(window._paperWorkspace||'portfolio',paperTab,{restore:true});
@@ -1020,6 +1022,104 @@ function chooseStrategy(strategyId){
   });
   // 切换策略只读取最近一次已完成结果，不在进入页面或切换标签时重复计算。
   loadLatestSelection();
+}
+
+/* ---------- 策略选股：模拟盘五套策略的盘后自动选股（分组展示） ---------- */
+var paperStrategyFilter='';
+var paperSelectionCache=null;
+
+// 始终缓存全量五组结果，筛选只在本地做：否则第一次取到的（过滤后）响应会被
+// 后续 tab 当成完整缓存，切换策略时看到的是上一次的旧分组。
+function paperSelectionView(){
+  if(!paperSelectionCache) return null;
+  var groups=paperSelectionCache.strategies||[];
+  if(paperStrategyFilter){
+    groups=groups.filter(function(g){return g.strategy_id===paperStrategyFilter;});
+  }
+  return Object.assign({},paperSelectionCache,{strategies:groups});
+}
+
+function choosePaperStrategy(strategyId, el){
+  activateStrategyWorkspace('p-select');
+  paperStrategyFilter=strategyId||'';
+  document.querySelectorAll('#p-select .module-tab').forEach(function(x){
+    var selected=(x.dataset.strategy||'')===paperStrategyFilter;
+    x.classList.toggle('active', selected);
+    x.setAttribute('aria-selected',selected?'true':'false');
+  });
+  // 切换只重渲染已有结果；没有缓存时才读取一次，不触发重新计算。
+  var view=paperSelectionView();
+  if(view) renderPaperSelection(view);
+  else loadPaperSelection();
+}
+
+async function loadPaperSelection(){
+  var target=$('selectResult'); if(!target) return;
+  target.innerHTML='<div class="loading">正在读取最近一个交易日的策略选股结果…</div>';
+  try{
+    var d=await api('/api/paper-selection');
+    paperSelectionCache=d;
+    renderPaperSelection(paperSelectionView()||d);
+  }catch(e){ target.innerHTML='<div class="banner">读取策略选股结果失败：'+adaptiveEsc(e.message||e)+'</div>'; }
+}
+
+function renderPaperSelection(d){
+  var target=$('selectResult'); if(!target) return;
+  var groups=d.strategies||[];
+  if(!d.found||!groups.length){
+    target.innerHTML='<div class="banner">尚无策略选股结果。盘后 17:25 会自动运行，也可点击「立即重跑选股」。</div>';
+    return;
+  }
+  var statusTag=function(s){
+    if(s.status==='ok') return '<span class="tag tag-ok">已入选 '+arguments[1]+' 只</span>';
+    if(s.status==='empty') return '<span class="tag tag-warn">候选不足 · 0 只</span>';
+    if(s.status==='blocked') return '<span class="tag tag-warn">数据门禁未通过</span>';
+    if(s.status==='error') return '<span class="tag tag-warn">运行异常</span>';
+    return '<span class="tag">未运行</span>';
+  };
+  var html='<div class="result-toolbar"><span class="tag tag-info">交易日 '+adaptiveEsc(d.trade_date||'—')+'</span>'
+    +'<span class="tag tag-info">去重规则：同一只股票被多策略选中时分别归属各策略，不合并</span>'
+    +'<span class="tag tag-info">重跑按「交易日 + 策略编号」覆盖当天结果</span></div>';
+  groups.forEach(function(g){
+    var picks=g.picks||[];
+    var rows=picks.map(function(p){
+      var reasons=(p.reasons||[]).slice(0,3).map(function(r){return '<li>'+adaptiveEsc(r)+'</li>';}).join('');
+      return '<tr><td>'+Number(p.rank_no)+'</td>'
+        +'<td><b>'+adaptiveEsc(p.name||p.code)+'</b><br/><span style="color:#9aa5b1;font-size:12px">'+adaptiveEsc(p.code)+' · '+adaptiveEsc(p.industry||'-')+'</span></td>'
+        +'<td>'+fmt(p.price)+'</td>'
+        +'<td class="'+pctCls(p.pct)+'">'+pctTxt(p.pct)+'</td>'
+        +'<td>'+(p.score==null?'—':Number(p.score).toFixed(3))+'</td>'
+        +'<td class="'+pctCls(p.super_net)+'">'+yi(p.super_net)+'</td>'
+        +'<td><ul class="reasons">'+reasons+'</ul></td></tr>';
+    }).join('');
+    var body=rows||('<tr><td colspan="7" style="text-align:center;color:#9aa5b1">'
+      +(g.status==='empty'?'当日该策略没有通过门禁的候选（允许少于 5 只，也允许为 0）'
+        :(g.status==='blocked'?'数据尚未就绪：'+adaptiveEsc(g.message||'')
+          :(g.status==='error'?'运行异常：'+adaptiveEsc(g.message||''):'该策略当天未运行')))+'</td></tr>');
+    html+='<section class="paper-selection-group"><header><div><span>'+adaptiveEsc(g.label||'')+' · '+adaptiveEsc(g.strategy_name||g.strategy_id)+'</span>'
+      +'<h4>'+adaptiveEsc(g.label||'')+' '+adaptiveEsc(g.strategy_name||'')+'<small style="margin-left:8px;font-weight:400;color:#9aa5b1">'+adaptiveEsc(g.strategy_id)+'</small></h4></div>'
+      +'<div class="group-tags">'+statusTag(g.status, picks.length)
+      +(g.updated_at?'<span class="tag">'+adaptiveEsc(String(g.updated_at).replace("T"," ").substring(0,19))+'</span>':'')+'</div></header>'
+      +tableScroll('<table><tr><th>#</th><th>股票</th><th>现价</th><th>涨跌</th><th>评分</th><th>超大单净流入</th><th>入选理由</th></tr>'+body+'</table>',1180)
+      +'</section>';
+  });
+  html+='<div class="disclaimer">选股结果来自各策略模型族的评分排序，仅供研究参考，不构成投资建议；结果不会生成订单或改动模拟盘账本。</div>';
+  target.innerHTML=html;
+}
+
+async function runPaperSelection(){
+  var btn=$('btnSelect'); if(btn) btn.disabled=true;
+  var target=$('selectResult');
+  if(target) target.innerHTML='<div class="loading">正在按五套策略评分重跑选股（约 30-90 秒）…</div>';
+  try{
+    var d=await apiPost('/api/paper-selection/run?topn='+encodeURIComponent(($('selTopn')||{}).value||5)+'&confirmed=true');
+    paperSelectionCache=await api('/api/paper-selection');
+    renderPaperSelection(paperSelectionView()||paperSelectionCache);
+    var done=(d.strategies||[]).map(function(s){return s.label+' '+s.status+'('+s.picks.length+')';}).join(' · ');
+    if(target) target.insertAdjacentHTML('afterbegin','<div class="tag tag-ok">已重跑：'+adaptiveEsc(done)+'</div>');
+  }catch(e){
+    if(target) target.innerHTML='<div class="banner">重跑失败：'+adaptiveEsc(e.message||e)+'</div>';
+  }finally{ if(btn) btn.disabled=false; }
 }
 
 function showStrategyWatch(){
@@ -2371,6 +2471,7 @@ async function refreshApp(){
       var jobs=[];
       if(typeof loadStrategies==='function') jobs.push(loadStrategies());
       if(typeof loadDataValidity==='function') jobs.push(loadDataValidity());
+      if(typeof loadPaperSelection==='function') jobs.push(loadPaperSelection());
       await Promise.all(jobs);
     }else if(page==='p-adaptive'&&typeof loadAdaptive==='function'){
       await loadAdaptive();
