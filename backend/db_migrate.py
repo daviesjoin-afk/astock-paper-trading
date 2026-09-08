@@ -27,6 +27,11 @@ DB_PATHS = {
     "adaptive_learning": os.path.join(CACHE_DIR, "adaptive_learning.sqlite3"),
 }
 
+
+def _ensure_strategy_versioning(conn):
+    strategy_registry.ensure_schema(conn)
+    return paper_schema.ensure_strategy_reference_columns(conn)
+
 # 迁移注册表：db_name -> [(version, description, sql_or_callable), ...]
 MIGRATIONS = {
     "paper_trading": [
@@ -42,6 +47,7 @@ MIGRATIONS = {
         (3, "补齐运行时租约与 fencing 字段", paper_schema.ensure_runtime_lease_columns),
         (4, "补齐点火影子表与索引", paper_schema.ensure_ignition_shadow_table),
         (5, "创建动态策略定义与生命周期表", strategy_registry.ensure_schema),
+        (6, "创建不可变策略版本与交易证据版本戳", _ensure_strategy_versioning),
     ],
     "adaptive_learning": [
         (1, "创建 schema_version 表", """
