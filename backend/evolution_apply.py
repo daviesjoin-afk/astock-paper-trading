@@ -385,20 +385,34 @@ def apply_tuner_proposals(adaptive_connect, paper_db_path, run_id: int,
                 base_weights = dict(base_weights_fn(account_id) or {})
             else:
                 base_weights = _baseline_weights(_account_params(row), row["source_strategy"])
+            # 策略级进化画像：每个账户的幅度硬边界用其策略专属参数版本
+            # （无专属版本时回落全局默认），锁定/边界由此约束该策略提案。
+            proposal_max_weight = max_weight_delta
+            proposal_max_entry = max_entry_delta
+            try:
+                import self_evolution as _SE_STRAT
+                strategy_params = (_SE_STRAT.get_strategy_params(
+                    conn, account_id).get("params") or {})
+                proposal_max_weight = float(strategy_params.get(
+                    "max_weight_delta", max_weight_delta))
+                proposal_max_entry = float(strategy_params.get(
+                    "max_delta_threshold", max_entry_delta))
+            except Exception:
+                pass
             new_weights = {k: float(v) for k, v in (proposal.get("weights") or {}).items()}
             if not base_weights or set(new_weights) != set(base_weights):
                 raise ValueError(
                     f"账户 {account_id} 提案权重因子与当前因子集不一致，拒绝应用"
                 )
             for factor, value in new_weights.items():
-                if abs(value - float(base_weights.get(factor, 0.0))) > max_weight_delta + 1e-6:
+                if abs(value - float(base_weights.get(factor, 0.0))) > proposal_max_weight + 1e-6:
                     raise ValueError(
-                        f"账户 {account_id} 因子 {factor} 变化超过 ±{max_weight_delta:.3f}，拒绝应用"
+                        f"账户 {account_id} 因子 {factor} 变化超过 ±{proposal_max_weight:.3f}，拒绝应用"
                     )
             entry_delta = float(proposal.get("entry_score_delta") or 0.0)
-            if abs(entry_delta) > max_entry_delta + 1e-9:
+            if abs(entry_delta) > proposal_max_entry + 1e-9:
                 raise ValueError(
-                    f"账户 {account_id} 入场阈值变化超过 ±{max_entry_delta:.4f}，拒绝应用"
+                    f"账户 {account_id} 入场阈值变化超过 ±{proposal_max_entry:.4f}，拒绝应用"
                 )
             conditions_raw = proposal.get("conditions") or {}
             skipped_conditions = []
