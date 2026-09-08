@@ -6277,21 +6277,22 @@ def _chase_entry_gate(account, pick, quote, market, entry_model, q, execution_qu
     pct = _num(quote.get("pct"), -999)
     limit_pct = _limit_pct(pick.get("code"))
     result = {"allowed": False, "risk_scale": 1.0, "reason": None, "mode": "normal"}
-    if account_id == "trend_pullback":
-        result["reason"] = "趋势回踩策略不追高"
-        return result
-    if account_id == NEW_STRATEGY_ID:
-        result["reason"] = "三日策略不使用追高通道"
+    # 追高通道由执行策略声明（chase_lane），不再按账户 ID 分支：
+    # momentum=短线接力，sector_hot=板块热点加速，其余一律不追高。
+    import execution_planner as EP
+    policy = EP.policy_for(account_id)
+    if policy.chase_lane not in ("momentum", "sector_hot"):
+        result["reason"] = policy.chase_rejection
         return result
     sector_hot = (
-        account_id == "sector_rotation"
+        policy.chase_lane == "sector_hot"
         and str(pick.get("candidate_status") or "") in {
             "ths_hot_lane", "concept_expansion_lane", "sector_surge_lane", "hot_leader_watch",
         }
         and pct >= 7.0
     )
-    if account_id != "tq_breakout" and not sector_hot:
-        result["reason"] = "板块轮动策略不追高"
+    if policy.chase_lane != "momentum" and not sector_hot:
+        result["reason"] = policy.chase_rejection
         return result
     result["required"] = bool(sector_hot)
     if sector_hot:
@@ -6376,8 +6377,10 @@ def _chase_entry_gate(account, pick, quote, market, entry_model, q, execution_qu
 
 def _strategy_market_policy(account, pick, quote, market):
     """不同策略使用不同的黄灯缩放；红灯统一停止新开仓。"""
+    import execution_planner as EP
     light = market.get("light") or "unknown"
     account_id = account["id"]
+    policy = EP.policy_for(account_id)
     if light == "green":
         return {"allowed": True, "risk_scale": 1.0, "state": "正常", "reason": "市场绿灯"}
     if light == "yellow":
@@ -6389,7 +6392,7 @@ def _strategy_market_policy(account, pick, quote, market):
     if light == "unknown":
         return {"allowed": False, "risk_scale": 0.0, "state": "禁止", "reason": "市场数据未知"}
 
-    if account_id == "sector_rotation":
+    if policy.chase_lane == "sector_hot":
         heat = pick.get("sector_heat") or {}
         hot_enough = _num(heat.get("rank"), 999) <= 8 and _num(heat.get("pct")) >= 1.0
         quote_pct = _num(quote.get("pct"), -999)
@@ -6402,19 +6405,10 @@ def _strategy_market_policy(account, pick, quote, market):
                 "仅记录为影子例外，不产生模拟成交"
             ) if hot_enough and quote_pct > 0 else None,
         }
-    if account_id == NEW_STRATEGY_ID:
-        return {
-            "allowed": False, "risk_scale": 0.0, "state": "观察",
-            "reason": "市场红灯，三日策略暂停新开仓",
-        }
-    if account_id == "tq_breakout":
-        return {
-            "allowed": False, "risk_scale": 0.0, "state": "观察",
-            "reason": "市场红灯，首板接力暂停新开仓",
-        }
+    # 红灯暂停文案按执行策略声明（red_light_reason），判定口径不变。
     return {
         "allowed": False, "risk_scale": 0.0, "state": "观察",
-        "reason": "市场红灯，趋势回踩策略暂停新开仓",
+        "reason": policy.red_light_reason,
     }
 
 
@@ -7855,6 +7849,9 @@ def _exceptional_opportunity(account, pick, quote, market, entry_model, q, risk_
     return False, "总资金池82%硬上限不可突破；需先卖出低质量持仓释放额度"
 
 def _buy_order(conn, account, signal, quote, market, news, asof_day, *, all_quotes=None):
+    # PR-06：席位预留、追高/加速门限、首仓纪律等差异统一由中央执行计划器的
+    # 声明式策略表提供，本函数不再按账户 ID 分支。
+    import execution_planner as EP
     _assert_active_lease(conn, "strategy buy")
     # Pause/reset may happen while a scheduled scan is already in progress.
     # Re-read the account and cycle immediately before any execution decision.
@@ -7987,7 +7984,8 @@ def _buy_order(conn, account, signal, quote, market, news, asof_day, *, all_quot
     risk["q"] = q
     # 一致预期 EPS（P2）：仅三日策略，周级缓存的信息上下文。
     # 机构覆盖数<3 或解析失败为 None；不参与评分，供人工复核与后续建模。
-    if account["id"] == NEW_STRATEGY_ID and AD is not None:
+    # 一致预期 EPS 上下文由执行策略声明（仅该策略附加，不参与评分）。
+    if EP.policy_for(account["id"]).eps_consensus_context and AD is not None:
         try:
             risk["eps_consensus"] = AD.ths_eps_forecast(code, asof_day=asof_day)
         except Exception:
@@ -8035,14 +8033,18 @@ def _buy_order(conn, account, signal, quote, market, news, asof_day, *, all_quot
     # 到末段才把它当作新的突破。+3.5% 以上只接受 Q1、双源、资金和量能
     # 同步的早盘确认，否则保留为次轮观察，不模拟追入。
     timing_gate = {"allowed": True, "mode": "常规入场", "reason": "处于策略常规执行区间"}
-    if account["id"] == NEW_STRATEGY_ID and _num(quote.get("pct"), -999.0) >= 3.5:
+    # 突破加速确认：门限与文案由执行策略声明（acceleration_pct / entry_label）。
+    _exec_policy = EP.policy_for(account["id"])
+    if _exec_policy.acceleration_pct is not None \
+            and _num(quote.get("pct"), -999.0) >= _exec_policy.acceleration_pct:
         timing_gate = {"allowed": False, "mode": "突破加速确认", "reason": None}
+        _label = _exec_policy.entry_label or "策略"
         if execution_quote.get("status") != "cross_source_checked":
-            timing_gate["reason"] = "三日策略加速段必须通过双源实时行情核验"
+            timing_gate["reason"] = f"{_label}加速段必须通过双源实时行情核验"
         elif q.get("tier") != "Q1":
-            timing_gate["reason"] = f"三日策略加速段仅允许 Q1，当前为 {q.get('tier')}"
+            timing_gate["reason"] = f"{_label}加速段仅允许 Q1，当前为 {q.get('tier')}"
         elif _num(quote.get("main_pct"), -999.0) < 1.0 or _num(quote.get("vol_ratio"), 0.0) < 1.2:
-            timing_gate["reason"] = "三日策略加速段需主力净流入≥1%且量比≥1.2"
+            timing_gate["reason"] = f"{_label}加速段需主力净流入≥1%且量比≥1.2"
         else:
             timing_gate.update({"allowed": True, "reason": "财报突破在加速段获得双源、Q1、资金与量能确认"})
     risk["three_day_timing_gate"] = timing_gate
@@ -8116,33 +8118,13 @@ def _buy_order(conn, account, signal, quote, market, news, asof_day, *, all_quot
         (str(item.get("account_id")), str(item.get("code"))) for item in positions
         if int(_num(item.get("qty"))) >= LOT_SIZE
     } | pending_slots
-    # 主力独立席位保障（2026-08-31 复核 P2）：主力空仓时，其他策略不得
-    # 占用共享池最后一个空席——否则满席后已通过的主力候选会饿死。
-    # P1 死锁修复（2026-09-03）：预留仅在 ①主力当日确有在途候选（排队/
-    # 等待复核的非终态信号）且 ②未到 14:30 放行时限时生效；主力全天无
-    # 候选或临近收盘仍未建仓时，最后一席交还其他策略，避免"主力等确认、
-    # 其他策略等席位"的双向空等。查询异常时维持原预留行为（fail-closed）。
-    mf_seat_interest = 0
-    mf_seat_reserved = (
-        account["id"] != MAIN_FORCE_STRATEGY_ID
-        and not any(key[0] == MAIN_FORCE_STRATEGY_ID for key in pool_open_positions)
-        and len(pool_open_positions) >= count_budget["pool_limit"] - 1
+    # 主力独立席位保障与手动委托共用中央执行计划器的同一实现：
+    # 执行路径不再比较账户身份，预留规则由声明式 ExecutionPolicy 表达。
+    seat_reserve = EP.seat_reserve_gate(
+        conn, account["id"], pool_open_positions, count_budget["pool_limit"], asof_day,
     )
-    if mf_seat_reserved:
-        try:
-            mf_seat_interest = int(conn.execute(
-                "SELECT COUNT(*) FROM paper_signals "
-                "WHERE account_id=? AND intended_date=? AND status IN (?,?,?)",
-                (MAIN_FORCE_STRATEGY_ID, str(asof_day)[:10],
-                 *ENTRY_RETRY_SIGNAL_STATUSES),
-            ).fetchone()[0] or 0)
-        except Exception:
-            mf_seat_interest = 1
-        _mf_now = _now()
-        _mf_day = str(asof_day)[:10]
-        _mf_deadline = f"{_mf_day} 14:30:00" if _mf_day == _mf_now[:10] else None
-        mf_seat_reserved = mf_seat_interest > 0 and (
-            _mf_deadline is None or _mf_now < _mf_deadline)
+    mf_seat_interest = int(seat_reserve.get("interest") or 0)
+    mf_seat_reserved = bool(seat_reserve.get("reserved"))
     risk["position_count_gate"] = {
         "current": len(open_codes), "committed": len(committed_open_codes), "limit": position_limit,
         "pool_current": len(pool_open_positions), "pool_limit": count_budget["pool_limit"],
@@ -8150,6 +8132,7 @@ def _buy_order(conn, account, signal, quote, market, news, asof_day, *, all_quot
         "allocation_version": count_budget["allocation_version"],
         "main_force_seat_reserved": mf_seat_reserved,
         "main_force_seat_interest": mf_seat_interest,
+        "seat_reserve": seat_reserve,
         "is_existing_position": code in open_codes,
         "scope": "按策略账户计数；同一股票可由其他策略独立持有和交易",
     }
@@ -8276,15 +8259,16 @@ def _buy_order(conn, account, signal, quote, market, news, asof_day, *, all_quot
         sizing["target_amount"] = round(qty * fill_price, 2)
     else:
         sizing["entry_tranche_scale_pct"] = 100.0
+    # 首仓纪律（2026-08-31 复核 P1）：首笔不超过共享净值的一定比例，
+    # 比例由执行策略声明（first_tranche_nav_pct），None 表示不限制。
     if (
-        account["id"] == MAIN_FORCE_STRATEGY_ID
+        _exec_policy.first_tranche_nav_pct is not None
         and (account["id"], code) not in committed_open_codes
         and qty >= LOT_SIZE
     ):
-        # 主力首仓纪律（2026-08-31 复核 P1）：首笔不超过共享净值 12%，
-        # 资金持续、价格站稳后再由既有加仓路径表达；避免一笔 6.7 万
-        # 吃掉"精挑三只"的大部分预算，也不退回两三千元的无效小仓。
-        first_cap = nav * 0.12
+        # 资金持续、价格站稳后再由既有加仓路径表达；避免一笔大仓吃掉
+        # “精挑三只”的大部分预算，也不退回两三千元的无效小仓。
+        first_cap = nav * _exec_policy.first_tranche_nav_pct
         capped_qty = int(min(qty * fill_price, first_cap) / fill_price / LOT_SIZE) * LOT_SIZE
         if capped_qty < qty:
             sizing["main_force_first_tranche"] = {
