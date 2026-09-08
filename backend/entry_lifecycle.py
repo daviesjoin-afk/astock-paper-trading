@@ -104,14 +104,30 @@ def signal_freshness(
         }
     age_minutes = max(0.0, (moment - stamp).total_seconds() / 60.0)
     if asof_day is not None:
+        target_day = str(asof_day)[:10]
         signal_day = str(signal.get("intended_date") or signal.get("signal_date") or "")[:10]
-        if signal_day and signal_day != str(asof_day)[:10]:
+        if signal_day and signal_day != target_day:
             return {
                 "usable": False, "age_minutes": round(age_minutes, 1),
                 "ttl_minutes": ttl_minutes,
                 "reason": f"信号属于 {signal_day}，禁止使用旧信号开新仓",
                 "version": ENTRY_LIFECYCLE_VERSION,
             }
+        if stamp.strftime("%Y-%m-%d") == target_day and age_minutes > ttl_minutes:
+            # 仅日内产生的信号按 TTL 判龄；收盘扫描为下一交易日生成的隔夜
+            # 计划信号在目标交易日全天有效（挂钟年龄不代表证据过期）。
+            return {
+                "usable": False, "age_minutes": round(age_minutes, 1),
+                "ttl_minutes": ttl_minutes,
+                "reason": f"信号已超过 {int(ttl_minutes)} 分钟有效期（{age_minutes:.0f} 分钟），失效",
+                "version": ENTRY_LIFECYCLE_VERSION,
+            }
+        return {
+            "usable": True, "age_minutes": round(age_minutes, 1),
+            "ttl_minutes": ttl_minutes, "reason": None,
+            "overnight_plan": stamp.strftime("%Y-%m-%d") != target_day,
+            "version": ENTRY_LIFECYCLE_VERSION,
+        }
     if age_minutes > ttl_minutes:
         return {
             "usable": False, "age_minutes": round(age_minutes, 1),
@@ -124,6 +140,23 @@ def signal_freshness(
         "ttl_minutes": ttl_minutes, "reason": None,
         "version": ENTRY_LIFECYCLE_VERSION,
     }
+
+
+def _parse_deadline(value: Any) -> dt.datetime | None:
+    """解析委托有效期；date-only（YYYY-MM-DD）按**当日收盘**语义处理。
+
+    手动限价单写入的 ``expires_at`` 是包含当日的日期（可比照"当日有效"），
+    解析成当天零点会让盘中清扫立刻把仍在等待触发的委托作废。
+    """
+    text = str(value or "").strip()
+    if not text:
+        return None
+    parsed = _parse_ts(text)
+    if parsed is None:
+        return None
+    if len(text) <= 10:
+        return parsed.replace(hour=23, minute=59, second=59)
+    return parsed
 
 
 def entry_slice_plan(
@@ -200,7 +233,7 @@ def expire_stale_orders(
         summary["checked"] += 1
         # 显式 expires_at（gated / 手动限价单）优先；否则按委托创建时间 + TTL。
         deadline: dt.datetime | None = None
-        explicit = _parse_ts(row.get("expires_at"))
+        explicit = _parse_deadline(row.get("expires_at"))
         if explicit is not None:
             deadline = explicit
         else:

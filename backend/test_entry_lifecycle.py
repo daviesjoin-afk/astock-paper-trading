@@ -96,6 +96,24 @@ class SignalFreshnessTests(unittest.TestCase):
         self.assertFalse(result["usable"])
         self.assertIn("旧信号", result["reason"])
 
+    def test_overnight_plan_signal_is_valid_for_its_target_session(self):
+        # 收盘扫描为下一交易日生成的计划信号：挂钟年龄超过 TTL 也不失效。
+        signal = {"created_at": "2026-09-04T15:20:00", "intended_date": "2026-09-07"}
+        result = ELC.signal_freshness(signal, now=dt.datetime(2026, 9, 7, 14, 0),
+                                      asof_day="2026-09-07")
+        self.assertTrue(result["usable"])
+        self.assertTrue(result["overnight_plan"])
+
+    def test_intraday_signal_aged_past_ttl_is_stale(self):
+        signal = {"created_at": "2026-09-09T07:00:00", "intended_date": TODAY}
+        result = ELC.signal_freshness(signal, now=NOW, asof_day=TODAY)
+        self.assertFalse(result["usable"])
+        self.assertIn("有效期", result["reason"])
+
+    def test_age_check_without_asof_day_still_applies(self):
+        signal = {"created_at": _iso(200), "intended_date": TODAY}
+        self.assertFalse(ELC.signal_freshness(signal, now=NOW)["usable"])
+
     def test_missing_timestamp_fails_closed(self):
         result = ELC.signal_freshness({}, now=NOW, asof_day=TODAY)
         self.assertFalse(result["usable"])
@@ -156,6 +174,20 @@ class SweepOrderTests(unittest.TestCase):
         summary = ELC.expire_stale_orders(conn, now=NOW, ttl_minutes=30)
         self.assertEqual(0, summary["expired"])
         self.assertEqual("execution_retry", _row(conn, "paper_orders", order_id)["status"])
+
+    def test_date_only_expiry_keeps_inclusive_day_semantics(self):
+        # 手动限价单的 date-only expires_at 表示"当日有效"：盘中不能被清扫作废。
+        conn = _db()
+        signal_id = _signal(conn, minutes_ago=600)
+        order_id = _order(conn, signal_id, minutes_ago=600, expires_at="2026-09-09")
+        summary = ELC.expire_stale_orders(conn, now=NOW, ttl_minutes=30)
+        self.assertEqual(0, summary["expired"])
+        self.assertEqual("execution_retry", _row(conn, "paper_orders", order_id)["status"])
+        # 次日同一清扫即作废。
+        summary = ELC.expire_stale_orders(
+            conn, now=dt.datetime(2026, 9, 10, 9, 35), ttl_minutes=30)
+        self.assertEqual(1, summary["expired"])
+        self.assertEqual("expired", _row(conn, "paper_orders", order_id)["status"])
 
     def test_filled_orders_are_untouched(self):
         conn = _db()
