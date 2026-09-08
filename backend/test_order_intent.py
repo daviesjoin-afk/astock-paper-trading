@@ -41,7 +41,7 @@ FIVE_STRATEGY_SIGNALS = {
     "main_force_top10": {
         "code": "601899", "name": "紫金矿业", "price": 17.8, "score": 0.77,
         "industry": "有色金属", "entry_model": "主力持续性与微观成交确认",
-        "main_pct": 12.4,
+        "main_pct": 12.4, "amount": 2450000000.0,
     },
 }
 
@@ -97,6 +97,16 @@ class OrderIntentContractTests(unittest.TestCase):
         self.assertEqual(intent, restored)
         self.assertEqual("order-intent-v1", intent.to_payload()["contract_version"])
 
+    def test_payload_with_top_level_qty_is_rejected_not_silently_dropped(self):
+        stored = {
+            "symbol": "002241", "side": "buy", "strength": 0.82,
+            "urgency": "immediate", "data_asof": "2026-09-08",
+            "expires_at": "2026-09-08T15:05:00", "stop_reference": "price",
+            "reason": "test", "qty": 500,
+        }
+        with self.assertRaises(OrderIntentContractError):
+            order_intent_from_payload(stored)
+
 
 class FiveStrategyAdapterTests(unittest.TestCase):
     def test_every_paper_strategy_signal_adapts_to_a_valid_intent(self):
@@ -145,7 +155,7 @@ class FiveStrategyAdapterTests(unittest.TestCase):
         executor_read_keys = (
             "code", "name", "price", "score", "industry", "entry_model",
             "stop_loss", "candidate_status", "sector_rank", "main_pct",
-            "ma20", "ma60",
+            "ma20", "ma60", "amount",
         )
         for strategy_id, signal in FIVE_STRATEGY_SIGNALS.items():
             with self.subTest(strategy_id=strategy_id):
@@ -178,6 +188,50 @@ class FiveStrategyAdapterTests(unittest.TestCase):
             order_intent_from_signal(
                 "tq_breakout", {"code": "002241", "qty": 500}, now=NOW
             )
+
+    def test_market_turnover_alias_is_not_an_order_sizing_claim(self):
+        # main_force_top10 的 ``amount`` 是龙虎榜市场成交额，不是下单金额；
+        # 适配必须放行并以 market_turnover 入 context，还原时改回 amount。
+        intent = order_intent_from_signal(
+            "main_force_top10", FIVE_STRATEGY_SIGNALS["main_force_top10"], now=NOW
+        )
+        self.assertNotIn("amount", intent.context)
+        self.assertEqual(2450000000.0, intent.context["market_turnover"])
+
+        legacy = intent_to_legacy_fields(intent)
+        self.assertNotIn("market_turnover", legacy)
+        self.assertEqual(2450000000.0, legacy["amount"])
+
+    def test_adapter_reason_survives_legacy_projection(self):
+        signal = {"code": "002241", "reason": "20 日新高放量突破"}
+        intent = order_intent_from_signal("tq_breakout", signal, now=NOW)
+        self.assertEqual("20 日新高放量突破", intent.reason)
+        self.assertEqual("20 日新高放量突破", intent_to_legacy_fields(intent)["reason"])
+
+    def test_close_scan_intended_session_anchors_expiry(self):
+        # 收盘扫描在 2026-09-08 盘后生成、面向 09-09 的信号：
+        # 有效期必须锚定意图交易日，而不是入库即过期的 09-08T15:05。
+        for strategy_id, expected_expiry in (
+            ("tq_breakout", "2026-09-09T15:05"),
+            ("sector_rotation", "2026-09-09T15:05"),
+            ("main_force_top10", "2026-09-09T15:05"),
+            ("trend_pullback", "2026-09-09T09:35"),
+            ("reported_profit_breakout", "2026-09-09T09:35"),
+        ):
+            with self.subTest(strategy_id=strategy_id):
+                intent = order_intent_from_signal(
+                    strategy_id, FIVE_STRATEGY_SIGNALS[strategy_id], now=NOW,
+                    intended_session=dt.date(2026, 9, 9),
+                )
+                self.assertEqual(expected_expiry, intent.expires_at[:16], strategy_id)
+
+    def test_next_session_expiry_skips_weekends(self):
+        # 2026-09-11 是周五：next_session 有效期必须是下周一，而不是周六。
+        friday = dt.datetime(2026, 9, 11, 10, 30, 0)
+        intent = order_intent_from_signal(
+            "trend_pullback", FIVE_STRATEGY_SIGNALS["trend_pullback"], now=friday,
+        )
+        self.assertEqual("2026-09-14T09:35", intent.expires_at[:16])
 
     def test_adapter_is_deterministic(self):
         signal = FIVE_STRATEGY_SIGNALS["sector_rotation"]

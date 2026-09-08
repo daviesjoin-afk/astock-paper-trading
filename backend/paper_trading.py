@@ -1546,20 +1546,24 @@ def _with_decision_snapshot(payload=None, **kwargs):
     return enriched
 
 
-def _order_intent_payload(strategy_id, pick, *, asof_day=None):
+def _order_intent_payload(strategy_id, pick, *, asof_day=None, intended_session=None):
     """PR-05 OrderIntent：把策略 pick 适配为统一订单意图（纯附加，零行为变更）。
 
     契约见 :mod:`order_intent`：策略只描述意图，最终数量仍完全由
     ``_price_aware_qty`` 在执行时决定。本函数只做“旧 pick -> 意图”的等价
     适配并随信号入库供审计；契约违约（负载中出现数量字段）不阻断现有
     流程，仅记录违约说明，后续 PR 再升级为硬拒绝。
+    ``intended_session``：收盘扫描等盘后入口生成、面向下一交易日的信号
+    必须传入意图交易日，避免意图入库即已过期。
     """
     try:
         now = (
             dt.datetime.combine(_date(asof_day), dt.time(9, 30))
             if asof_day is not None else None
         )
-        intent = OI.order_intent_from_signal(strategy_id, pick, now=now)
+        intent = OI.order_intent_from_signal(
+            strategy_id, pick, now=now, intended_session=intended_session,
+        )
     except OI.OrderIntentContractError as exc:
         return None, f"{type(exc).__name__}: {exc}"
     return intent.to_payload(), None
@@ -7212,6 +7216,7 @@ def generate_signals(asof_date=None):
                            "news": [n for n in evidence_news if n.get("code") == code]}
                 intent_payload, intent_violation = _order_intent_payload(
                     account["id"], pick, asof_day=day,
+                    intended_session=_next_weekday(day),
                 )
                 if intent_payload is not None:
                     payload["order_intent"] = intent_payload
@@ -11301,6 +11306,7 @@ def _bootstrap_signals_for_today(asof_day, live_universe=None, source_slot="intr
                     }
                     intent_payload, intent_violation = _order_intent_payload(
                         account["id"], pick, asof_day=day,
+                        intended_session=day,
                     )
                     if intent_payload is not None:
                         payload["order_intent"] = intent_payload
