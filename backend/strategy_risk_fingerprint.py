@@ -43,10 +43,22 @@ _CONSERVATIVE = StrategyRiskFingerprint(
 
 
 def _tokens(value: Any) -> set[str]:
-    """Return lower-cased lexical evidence without interpreting the DSL."""
+    """Return lower-cased lexical evidence without interpreting the DSL.
+
+    Inactive declarations are deliberately excluded: ``{"realtime": false}``
+    or ``{"stop_loss": false}`` disables a feature, so its key must not be
+    counted as positive evidence for that feature.  Empty strings, ``None``
+    and empty collections carry no evidence either.
+    """
     if isinstance(value, Mapping):
         result: set[str] = set()
         for key, item in value.items():
+            if item is None or item is False:
+                continue
+            if isinstance(item, str) and not item.strip():
+                continue
+            if isinstance(item, (list, tuple, frozenset, set, Mapping)) and not len(item):
+                continue
             result.update(_tokens(key))
             result.update(_tokens(item))
         return result
@@ -97,15 +109,27 @@ def _archetype(tokens: set[str]) -> str:
     return winner if score and list(scores.values()).count(score) == 1 else "composite"
 
 
+# Only semantically recognised holding/horizon keys may contribute to the
+# horizon classification.  Generic ``*_days`` keys such as cooldown_days,
+# lookback_days or validation windows describe something else entirely and
+# must not turn a swing strategy into a position strategy (review P2).
+_HOLDING_KEYS = frozenset({"hold", "holding", "horizon"})
+
+
 def _horizon(config: Mapping[str, Any], tokens: set[str]) -> tuple[str, str]:
-    days = _numbers(config, frozenset({"horizon", "holding", "hold", "days", "day"}))
-    if _has(tokens, "intraday", "日内") or any(value <= 1 for value in days):
+    days = _numbers(config, _HOLDING_KEYS)
+    if _has(tokens, "intraday", "日内"):
         return "intraday", "minutes"
     if days:
-        maximum = max(days)
-        if maximum <= 5:
+        # A declared range such as hold_min=1 / hold_max=8 must be classified
+        # by its applicable upper bound: on a T+1 market a one-day holding
+        # floor is not evidence of intraday execution (review P2).
+        representative = max(days)
+        if representative <= 1:
+            return "intraday", "minutes"
+        if representative <= 5:
             return "short", "days"
-        if maximum <= 20:
+        if representative <= 20:
             return "swing", "weeks"
         return "position", "weeks"
     if _has(tokens, "realtime", "minute", "盘中"):
@@ -147,7 +171,12 @@ def compile_strategy_risk_fingerprint(
             "time" if _has(tokens, "horizon", "holding", "hold") else "conservative"
         )
     )
-    limits = _numbers(config, frozenset({"position", "positions", "max", "limit"}))
+    # Concentration is a position-COUNT property.  Percentages (max_weight,
+    # max_exposure), day counts (hold_max) and ratios (max_drawdown) must not
+    # be compared with position-count thresholds (review P2).
+    limits = _numbers(config, frozenset({
+        "positions", "position", "stocks", "positions_count", "position_limit",
+    }))
     concentration = "high" if limits and min(limits) <= 3 else (
         "medium" if limits and min(limits) <= 10 else "low" if limits else "conservative"
     )
