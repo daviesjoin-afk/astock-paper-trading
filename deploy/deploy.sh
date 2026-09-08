@@ -1,7 +1,7 @@
 #!/bin/bash
 # A股模拟盘一键部署脚本
 # 用法：bash deploy/deploy.sh [--no-backup] [--no-migrate]
-# 流程：备份 → 构建镜像 → 重启容器 → schema迁移 → 健康检查 → 最终验证
+# 流程：备份 → 构建镜像 → 重启容器 → schema迁移 → cron同步 → 健康检查
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -14,31 +14,44 @@ echo "════════════════════════�
 
 # 1. 备份（默认开启）
 if [[ "${1:-}" != "--no-backup" ]]; then
-  echo "▶ [1/5] 备份当前数据..."
+  echo "▶ [1/6] 备份当前数据..."
   bash deploy/backup.sh
 else
-  echo "▶ [1/5] 跳过备份（--no-backup）"
+  echo "▶ [1/6] 跳过备份（--no-backup）"
 fi
 
 # 2. 构建镜像
-echo "▶ [2/5] 构建镜像..."
+echo "▶ [2/6] 构建镜像..."
 $COMPOSE build
 
 # 3. 重启容器
-echo "▶ [3/5] 重启容器..."
+echo "▶ [3/6] 重启容器..."
 $COMPOSE up -d
 sleep 8
 
 # 4. schema 迁移
 if [[ "${1:-}" != "--no-migrate" ]]; then
-  echo "▶ [4/5] 执行 schema 迁移..."
+  echo "▶ [4/6] 执行 schema 迁移..."
   docker exec astock-codex python /app/backend/db_migrate.py all
 else
-  echo "▶ [4/5] 跳过迁移（--no-migrate）"
+  echo "▶ [4/6] 跳过迁移（--no-migrate）"
 fi
 
-# 5. 健康检查
-echo "▶ [5/5] 健康检查..."
+# 5. cron 同步（模板里的 <SERVER_PATH> 跟随本次部署的实际根目录，防止
+#    覆盖服务器手工版后出现"路径指向不存在的目录 → 所有任务静默失败"）。
+#    2026-09-08 事故：仓库模板路径 <SERVER_PATH> 覆盖了服务器 /root/codex
+#    手工版，/opt 下无 deploy/reports，11:06 起盘中监控全部秒失败。
+if [[ "$(id -u)" == "0" && -d /etc/cron.d ]]; then
+  echo "▶ [5/6] 同步 cron（路径随部署目录 $ROOT）..."
+  cp -a /etc/cron.d/astock-codex "/etc/cron.d/astock-codex.bak-$(date +%Y%m%d%H%M%S)" 2>/dev/null || true
+  sed "s|<SERVER_PATH>|$ROOT|g" deploy/astock-codex.cron > /etc/cron.d/astock-codex
+  chmod 644 /etc/cron.d/astock-codex
+else
+  echo "▶ [5/6] 跳过 cron 同步（非 root 或无 /etc/cron.d）"
+fi
+
+# 6. 健康检查
+echo "▶ [6/6] 健康检查..."
 HEALTH=$(docker inspect --format '{{.State.Health.Status}}' astock-codex 2>/dev/null || echo unknown)
 echo "  容器状态: $HEALTH"
 API=$(curl -s -o /dev/null -w '%{http_code}' --max-time 15 http://127.0.0.1:18600/api/health 2>/dev/null || echo 000)
