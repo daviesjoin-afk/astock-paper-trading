@@ -134,7 +134,7 @@ document.querySelectorAll('.tab').forEach(function(t){
     sessionStorage.removeItem(PAPER_VIEW_KEY);
   }
   if(page==='p-paper'&&parts[1]) window._paperWorkspace=parts[1];
-  if(page==='p-settings'&&parts[1]&&['simulation','risk','strategy','evolution'].indexOf(parts[1])>=0){ window._settingsSection=parts[1]; sessionStorage.setItem(SETTINGS_SECTION_KEY,parts[1]); }
+  if(page==='p-settings'&&parts[1]&&['simulation','risk','strategy','evolution','execution'].indexOf(parts[1])>=0){ window._settingsSection=parts[1]; sessionStorage.setItem(SETTINGS_SECTION_KEY,parts[1]); }
   activatePage(page,{writeHash:false});
 }
 window.addEventListener('popstate',restoreAppNavigation);
@@ -1983,14 +1983,15 @@ function renderPaperStrategyCenter(d){
 function paperResearchStrategyName(id){
   return ({tq_breakout:'短线日内做T',trend_pullback:'趋势波段优选',sector_rotation:'板块轮动先锋',reported_profit_breakout:'三日策略',main_force_top10:'超强主力股'})[id]||id||'未知策略';
 }
-async function loadPaperExecution(){
+async function loadPaperExecution(forceRefresh){
   var target=$('paperExecutionView');
   if(!target) return;
   var cached=window._paperExecutionCenterCache;
-  if(cached){
+  if(!forceRefresh&&cached){
     renderPaperExecution(cached.data);
     if(Date.now()-cached.at<PAPER_NAV_TTL_MS) return;
   }else{
+    window._paperExecutionCenterCache=null;
     target.innerHTML='<div class="loading">正在读取执行画像与执行队列…</div>';
   }
   try{
@@ -2068,7 +2069,7 @@ function renderPaperExecution(d){
   }).join('');
   target.innerHTML='<section class="panel exec-panel"><div class="exec-head"><div><h3>执行器开关与批量窗口</h3>'
     +'<p>开关在「设置中心 → 执行」中调整；本页只读展示当前生效状态。</p></div>'
-    +'<div class="exec-head-state">'+windowBadge+'<button class="ghost" onclick="loadPaperExecution()">刷新</button></div></div>'
+    +'<div class="exec-head-state">'+windowBadge+'<button class="ghost" onclick="loadPaperExecution(true)">刷新</button></div></div>'
     +'<div class="exec-switches">'+switches+'</div>'
     +(batchRows.length
       ? '<h4>批量等待队列（'+batchRows.length+'）</h4>'+execQueueTable(batchRows,'没有等待批量窗口的委托。',false)
@@ -2699,6 +2700,7 @@ async function refreshApp(){
       if(view==='risk') await loadPaperRisk(true);
       else if(view==='strategy') await loadPaperStrategyCenter();
       else if(view==='research') await loadPaperResearchValidation();
+      else if(view==='execution') await loadPaperExecution(true);
       else await loadPaper({refresh:true});
     }else if(page==='p-select'){
       var jobs=[];
