@@ -295,7 +295,13 @@ def _hot_leader_profile(table):
     overheat += pct.ge(9.0).astype(float) * 0.20
     overheat = overheat.clip(0.0, 1.0)
 
-    onset_score = (sector_onset.clip(0.0, 1.0) * sector_onset_flag.astype(float))
+    onset_score = (sector_onset.clip(0.0, 1.0).fillna(0.0)
+                   * sector_onset_flag.astype(float))
+    # 列缺失时必须保持中性 0：sector_onset 来自扫描器注入的
+    # sector_early_rotation_score（「策略选股」页复用 _select_uncached
+    # 流水线时没有该列），NaN 若汇入下面的 score 加权和会让整列变成
+    # NaN，而 NaN 与任何阈值比较恒为 False，ranked[...>-990] 会把全部
+    # 候选静默清空（2026-09-08 选股页 5 策略全部 empty(0) 的根因）。
     score = (pct_score * 0.28 + flow_score * 0.34 + liquidity_score * 0.14
              + momentum_score * 0.12 + sector_score * 0.08 + onset_score * 0.04)
     score = score.clip(0.0, 1.0)
@@ -1323,7 +1329,7 @@ def _run_paper_strategy(strategy_id, table, topn, gate, first_board_codes=None, 
     # 放宽任何硬条件。流通市值和成交额缺失时取中性值，避免数据缺失
     # 把候选静默打入末尾。
     core_stock_bonus = _core_stock_preference(table) * 0.025
-    score += core_stock_bonus
+    score += core_stock_bonus.fillna(0.0)
 
     # 热门股启动段是独立的软排序层。它不改变任何证券权限、行情、
     # 财务或风险硬门禁，只让第一/第二个强势日的“资金+量能+板块”
@@ -1343,10 +1349,10 @@ def _run_paper_strategy(strategy_id, table, topn, gate, first_board_codes=None, 
     risk_off = market_light in {"yellow", "red"}
     if risk_off:
         hot_bonus = hot_bonus * 0.0
-    score += hot_bonus
+    score += hot_bonus.fillna(0.0)
     bottom_profile = _bottom_reversal_profile(table)
     bottom_bonus = bottom_profile["score"] * (0.30 if strategy_id == "bottom_reversal" else 0.0)
-    score += bottom_bonus
+    score += bottom_bonus.fillna(0.0)
 
     # 修复1（2026-08-28）：动量过热惩罚——mom5>5% 或 mom20>15% 的候选
     # 排序分直接扣减；黄/红灯下加倍（修复3）。
@@ -1579,7 +1585,8 @@ def _run_paper_strategy(strategy_id, table, topn, gate, first_board_codes=None, 
         "first_board_candidates": len(first_board_codes) if first_board_codes is not None else None,
         "news_vetoed": [],
         "news_scan": {"enabled": False, "total_hits": 0, "vetoed": 0},
-        "flow_source": table["flow_source"].iloc[0] if len(table) else None,
+        "flow_source": (table["flow_source"].iloc[0]
+                        if "flow_source" in table and len(table) else None),
         "weights_used": {key: round(value, 6) for key, value in weights.items()},
         "conditions_used": conditions,
         "hot_leader_context": {
