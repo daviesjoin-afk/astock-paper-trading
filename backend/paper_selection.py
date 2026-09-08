@@ -162,7 +162,13 @@ def run_daily(strategies=None, topn: int = DEFAULT_TOPN, run_date: str | None = 
             status, message, picks, factor_date = "error", "", [], ""
             try:
                 result = _run_one(item["model_id"], topn)
-                if isinstance(result, dict) and result.get("need_init"):
+                if not isinstance(result, dict):
+                    # 选股链路（main._select_uncached）在拒绝场景会返回
+                    # FastAPI JSONResponse 而不是 dict；显式报错而不是让
+                    # 后续 .get 抛出难以定位的 AttributeError。
+                    raise TypeError(
+                        f"选股链路返回类型异常: {type(result).__name__}")
+                if result.get("need_init"):
                     status = "blocked"
                     message = str(result.get("message") or "选股数据尚未就绪")
                     factor_date = str(result.get("factor_date") or "")

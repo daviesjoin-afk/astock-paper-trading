@@ -1092,7 +1092,10 @@ def _select_uncached(
     strategy: str = "three_day",
     topn: int = Query(10, ge=1, le=100),
 ):
-    if strategy not in S.STRATEGIES:
+    # 「策略选股」页复用本流水线跑模拟盘模型族（paper_selection.STRATEGY_MODEL
+    # → strategies.PAPER_WEIGHTS），run_strategy 会把这些 id 分派给
+    # _run_paper_strategy，因此白名单必须同时放行两套 id 体系。
+    if strategy not in S.STRATEGIES and strategy not in S.PAPER_WEIGHTS:
         return JSONResponse({"error": "未知策略"}, status_code=400)
     # 选股和回测的完整度要求不同。回测需要近乎全市场连续历史；选股只要
     # 使用“最近完整交易日”已有的因子行即可。不要因少量停牌/更新失败股票
