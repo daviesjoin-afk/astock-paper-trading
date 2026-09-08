@@ -58,10 +58,7 @@ def _manual_order_plan(
         DE,
         ENTRY_FREEZE_ENV,
         ENTRY_FROZEN_WAITLIST_STATUS,
-        ENTRY_RETRY_SIGNAL_STATUSES,
         LOT_SIZE,
-        MAIN_FORCE_STRATEGY_ID,
-        NEW_STRATEGY_ID,
         RSET,
         SHARED_POOL_MAX_EXPOSURE,
         SLIPPAGE,
@@ -73,20 +70,16 @@ def _manual_order_plan(
         _dynamic_position_limits,
         _entry_freeze_enabled,
         _entry_frozen_reason,
-        _execution_quote_status,
         _existing_position_addition_gate,
         _hold_days,
         _limit_pct,
         _market_state,
-        _now,
         _num,
-        _pending_buy_reservations,
         _pending_position_slots,
         _position_rows,
         _price_aware_qty,
         _quotes,
         _risk_profile,
-        _security_scope,
         _shared_account_exposure,
         _shared_cash,
         _shared_risk_state,
@@ -96,6 +89,7 @@ def _manual_order_plan(
         _with_decision_snapshot,
         dfc,
     )
+    import execution_planner as EP
     day = _date(asof_day)
     code = str(code or "").strip()
     side = str(side or "").lower()
@@ -208,53 +202,24 @@ def _manual_order_plan(
     plan["asset_type"] = asset_type
 
     if side == "buy":
-        security_scope = _security_scope(code, local_quote.get("name"), local_quote.get("risk_flag"))
-        plan["risk"]["security_scope"] = security_scope
-        if not security_scope["allowed"]:
-            reasons.append(security_scope["reason"])
-        plan["risk"]["position_count_gate"] = {
-            "current": len(open_codes), "committed": len(committed_open_codes), "limit": position_limit,
-            "pool_current": len(pool_open_positions), "pool_limit": count_budget["pool_limit"],
-            "dynamic": True, "source": count_budget["source"],
-            "allocation_version": count_budget["allocation_version"],
-            "is_existing_position": code in open_codes,
-            "scope": "按策略账户计数；同一股票可由其他策略独立持有和交易",
-        }
-        if code not in committed_open_codes and len(committed_open_codes) >= position_limit:
-            reasons.append(
-                f"策略持仓及待成交席位已达动态上限 {len(committed_open_codes)}/{position_limit}"
-            )
-        # P1 死锁修复（2026-09-03）：同主判定处口径——预留仅当主力当日有
-        # 在途候选且未到 14:30 放行时限时生效；查询异常维持原预留行为。
-        _mf_seat_reserve = (
-            account_id != MAIN_FORCE_STRATEGY_ID
-            and not any(key[0] == MAIN_FORCE_STRATEGY_ID for key in pool_open_positions)
-            and len(pool_open_positions) >= count_budget["pool_limit"] - 1
+        security_gate = EP.security_gate(code, local_quote.get("name"), local_quote.get("risk_flag"))
+        plan["risk"]["security_scope"] = security_gate["scope"]
+        if not security_gate["allowed"]:
+            reasons.append(security_gate["reason"])
+        # 席位与共享池容量门禁（含主力最后一席预留）由中央执行计划器统一判定：
+        # 手动委托与自动策略共用同一口径，执行路径不再按账户身份分支。
+        capacity = EP.capacity_gate(
+            code=code, account_id=account_id, open_codes=open_codes,
+            committed_open_codes=committed_open_codes,
+            pool_open_positions=pool_open_positions,
+            position_limit=position_limit, pool_limit=count_budget["pool_limit"],
+            asof_day=day, conn=conn,
+            allocation_source=count_budget.get("source"),
+            allocation_version=count_budget.get("allocation_version"),
         )
-        if _mf_seat_reserve:
-            try:
-                _mf_interest = int(conn.execute(
-                    "SELECT COUNT(*) FROM paper_signals "
-                    "WHERE account_id=? AND intended_date=? AND status IN (?,?,?)",
-                    (MAIN_FORCE_STRATEGY_ID, str(day)[:10],
-                     *ENTRY_RETRY_SIGNAL_STATUSES),
-                ).fetchone()[0] or 0)
-            except Exception:
-                _mf_interest = 1
-            _mf_now = _now()
-            _mf_day = str(day)[:10]
-            _mf_deadline = f"{_mf_day} 14:30:00" if _mf_day == _mf_now[:10] else None
-            _mf_seat_reserve = _mf_interest > 0 and (
-                _mf_deadline is None or _mf_now < _mf_deadline)
-        if (account_id, code) not in pool_open_positions and len(pool_open_positions) >= count_budget["pool_limit"]:
-            reasons.append(
-                f"总持仓及待成交席位已达共享硬上限 {len(pool_open_positions)}/{count_budget['pool_limit']}"
-            )
-        elif _mf_seat_reserve:
-            reasons.append(
-                "共享池仅剩最后 1 席：为主力策略独立席位预留，"
-                "待主力建仓或池内席位释放后恢复其他策略买入"
-            )
+        plan["risk"]["position_count_gate"] = capacity["gate"]
+        plan["risk"]["seat_reserve"] = capacity["reserve"]
+        reasons.extend(capacity["reasons"])
         if code in open_codes:
             addition_allowed, addition_reason = _existing_position_addition_gate(
                 conn, account, code, day,
@@ -287,10 +252,10 @@ def _manual_order_plan(
             exclude_reservation_key=exclude_reservation_key,
         )
         plan["risk"]["strategy_budget"] = strategy_budget
-        if market.get("light") in ("red", "unknown"):
+        # 市场灯门禁沿用既有判定（红灯/未知禁止新开仓），仅由 planner 统一编排。
+        if EP.market_gate(market, account_id)["blocked"]:
             reasons.append("市场门控为红灯或未知，禁止新开仓")
-        if risk_state["blocked"]:
-            reasons.extend(risk_state["reasons"])
+        reasons.extend(EP.account_risk_gate(risk_state))
         if account.get("mode") == "intraday_t" and asset_type != "stock_t1":
             reasons.append("短线日内做T账户只接受普通股票")
         if local_quote.get("risk_flag") or "ST" in str(local_quote.get("name") or "").upper():
@@ -304,11 +269,9 @@ def _manual_order_plan(
         plan["risk"]["model"] = decision
         if decision.get("tier") not in ("T1", "T2"):
             reasons.append(f"买入模型为 {decision.get('tier')}，未通过开仓门禁")
-        if account_id == NEW_STRATEGY_ID:
-            # Manual orders use the same independent quality/breakout entry
-            # review; without a persisted candidate's disclosure/technical
-            # evidence they fail closed rather than bypassing the strategy
-            # model through the operator UI.
+        # 是否必须走策略专属入场复核由执行策略声明，而不是比较账户 ID：
+        # 手动委托同样不能绕过该策略的模型门禁。
+        if EP.policy_for(account_id).manual_entry_review:
             manual_pick = dict(local_quote)
             manual_pick.update({"code": code, "name": local_quote.get("name") or code})
             manual_entry = _strategy_entry_assessment(
@@ -373,11 +336,9 @@ def _manual_order_plan(
     # 手动委托只是人工发起，不得绕过自动交易使用的行情真实性门禁。限价单在
     # 尚未触发时可以保留（触发瞬间仍会复核）；一旦需要模拟成交，买入必须双源
     # 通过，卖出至少要有当日新鲜主行情，且跌停时绝不虚构成交。
-    execution_gate = _execution_quote_status(
-        local_quote,
-        day,
-        purpose="entry" if side == "buy" else "exit",
-    )
+    execution_gate = EP.quote_gate(
+        local_quote, day, purpose="entry" if side == "buy" else "exit",
+    )["status"]
     plan["risk"]["execution_quote"] = execution_gate
     requires_fill_gate = order_type == "market" or plan["triggered"]
     if requires_fill_gate and not execution_gate.get("fresh"):
@@ -410,14 +371,13 @@ def _manual_order_plan(
     amount = max(plan["qty"], 0) * max(fill_price, 0)
     fees = _commission(amount) + (amount * STAMP_SELL if side == "sell" else 0.0)
     if side == "buy":
-        _, pending_cash = _pending_buy_reservations(
-            conn, exclude_order_key=exclude_reservation_key,
+        # 共享资金池可用性（含在途预占）同样交给 planner，保持与自动路径同口径。
+        cash_check = EP.cash_gate(
+            conn, side, amount, fees,
+            exclude_reservation_key=exclude_reservation_key, shared_cash=shared_cash,
         )
-        if amount + fees > shared_cash - pending_cash + 1e-6:
-            reasons.append(
-                f"共享资金池可用现金不足（已有待成交买单预占 ¥{pending_cash:,.2f}）"
-                if pending_cash > 0 else "共享资金池可用现金不足"
-            )
+        if not cash_check["allowed"]:
+            reasons.append(cash_check["reason"])
     plan.update({
         "fill_price": round(fill_price, 4), "amount": round(amount, 2),
         "fees": round(fees, 2), "reasons": list(dict.fromkeys(reasons)),
@@ -467,74 +427,32 @@ def _execute_manual_plan(conn, account, plan, order_id, asof_day):
     # Phase 2 extraction: resolved at call time to avoid a circular import.
     from paper_trading import (
         _assert_active_lease,
-        _audit,
-        _consume_available_lots,
-        _credit_shared_cash,
-        _date,
-        _debit_shared_cash,
         _entry_freeze_enabled,
         _entry_frozen_reason,
-        _finish_capital_reservation,
-        _json,
-        _now,
-        _num,
-        _record_lot,
-        _risk_log,
-        _sync_positions,
     )
+    import execution_planner as EP
     _assert_active_lease(conn, "manual fill")
     if plan.get("side") == "buy" and _entry_freeze_enabled():
         # Callers normally gate this earlier; keep the fill primitive itself
         # fail-closed so a future path cannot debit cash or write a lot while
         # the operator freeze is active.
         raise RuntimeError(_entry_frozen_reason("成交执行"))
-    qty = int(plan["qty"])
-    amount = _num(plan["amount"])
-    fees = _num(plan["fees"])
-    fill_price = _num(plan["fill_price"])
-    realized_pnl = None
-    if plan["side"] == "buy":
-        _assert_active_lease(conn, "manual fill cash debit")
-        _debit_shared_cash(conn, amount + fees, preferred_account_id=account["id"])
-        _finish_capital_reservation(conn, order_id, "consumed")
-        _record_lot(conn, account, plan, qty, fill_price, asof_day, order_id, is_t_base=True, fees=fees)
-    else:
-        _assert_active_lease(conn, "manual fill lot consumption")
-        consumed, cost_amount = _consume_available_lots(
-            conn, account["id"], plan["code"], qty, asof_day
-        )
-        if consumed != qty:
-            raise RuntimeError("可卖份额在成交前发生变化，委托已停止")
-        realized_pnl = amount - cost_amount - fees
-        _credit_shared_cash(conn, amount - fees, account["id"])
-    _assert_active_lease(conn, "manual fill finalization")
-    conn.execute(
-        """UPDATE paper_orders SET filled_price=?,amount=?,fees=?,status='filled',
-           reason=?,risk_payload=?,realized_pnl=?,executed_at=? WHERE id=?""",
-        (
-            fill_price, amount, fees, "手动模拟委托经模型复核后成交",
-            _json(plan["risk"]), realized_pnl, _now(), order_id,
-        ),
+    # 成交落库统一走中央执行计划器：预留已在提交阶段完成，这里只消费预占。
+    # 自动策略买入（_commit_strategy_buy）复用同一原语，只是由 planner 内部预占。
+    return EP.commit_fill(
+        conn,
+        account=account,
+        plan=plan,
+        order_id=order_id,
+        asof_day=asof_day,
+        reserved=True,
+        action="manual_filled",
+        risk_log_reason="手动模拟委托通过模型门禁并成交",
+        audit_action="manual_order_filled",
+        reason="手动模拟委托经模型复核后成交",
+        detail=plan.get("risk"),
+        assumption="本地行情快照按 0.10% 滑点模拟；不代表真实可成交价格",
     )
-    conn.execute(
-        """INSERT INTO paper_fills(order_id,account_id,side,code,qty,price,amount,fees,fill_date,quote_at,assumption)
-           VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
-        (
-            order_id, account["id"], plan["side"], plan["code"], qty, fill_price,
-            amount, fees, _date(asof_day).isoformat(), plan.get("quote_at"),
-            "本地行情快照按 0.10% 滑点模拟；不代表真实可成交价格",
-        ),
-    )
-    _risk_log(
-        conn, account["id"], plan["code"], plan["side"], "manual_filled",
-        "手动模拟委托通过模型门禁并成交", plan,
-    )
-    _audit(
-        conn, account["id"], "manual_order_filled",
-        f"{plan['side']} {plan['code']} {qty}股 @ {fill_price:.2f}",
-    )
-    _sync_positions(conn, account["id"], asof_day)
-    return realized_pnl
 
 
 def _commit_strategy_buy(
@@ -552,26 +470,20 @@ def _commit_strategy_buy(
     from paper_trading import (
         STRATEGY_EXECUTION_RETRY_STATUS,
         _assert_active_lease,
-        _audit,
-        _date,
-        _debit_shared_cash,
         _finish_capital_reservation,
         _json,
         _lease_lost,
         _now,
         _num,
-        _record_lot,
-        _reserve_shared_capital,
         _risk_log,
         _strategy_stamp,
     )
+    import execution_planner as EP
     _assert_active_lease(conn, "strategy auxiliary buy")
     account_id = account["id"]
     code = str(plan["code"])
     qty = int(plan["qty"])
     fill_price = _num(plan["fill_price"])
-    amount = _num(plan["amount"])
-    fees = _num(plan["fees"])
     strategy_stamp = _strategy_stamp(conn, account_id)
     cursor = conn.execute(
         """INSERT INTO paper_orders(
@@ -586,34 +498,21 @@ def _commit_strategy_buy(
     savepoint = f"strategy_buy_{order_id}"
     conn.execute(f"SAVEPOINT {savepoint}")
     try:
-        _assert_active_lease(conn, "strategy auxiliary reservation")
-        reserved, reserve_reason = _reserve_shared_capital(
-            conn, order_id, account_id, code, amount, fees,
+        # 与手动成交共用同一落库原语（planner 内部完成预占 → 扣款 → 记 lot → 写 fill）。
+        EP.commit_fill(
+            conn,
+            account=account,
+            plan={**plan, "quote_at": plan.get("quote_at")},
+            order_id=order_id,
+            asof_day=asof_day,
+            reserved=False,
+            action=action,
+            audit_message=f"{code} {qty}股 @ {fill_price:.2f}",
+            reason=reason,
+            detail=detail,
+            assumption=assumption,
+            is_t_base=is_t_base,
         )
-        if not reserved:
-            raise RuntimeError(reserve_reason or "共享资金池预占失败")
-        _assert_active_lease(conn, "strategy auxiliary cash debit")
-        _debit_shared_cash(conn, amount + fees, preferred_account_id=account_id)
-        _finish_capital_reservation(conn, order_id, "consumed")
-        conn.execute(
-            """UPDATE paper_orders SET filled_price=?,amount=?,fees=?,status='filled',
-               executed_at=? WHERE id=?""",
-            (fill_price, amount, fees, _now(), order_id),
-        )
-        _assert_active_lease(conn, "strategy auxiliary lot")
-        _record_lot(
-            conn, account, plan, qty, fill_price, asof_day, order_id,
-            is_t_base=is_t_base, fees=fees,
-        )
-        conn.execute(
-            """INSERT INTO paper_fills(
-               order_id,account_id,side,code,qty,price,amount,fees,fill_date,
-               quote_at,assumption)
-               VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
-            (order_id, account_id, "buy", code, qty, fill_price, amount, fees,
-             _date(asof_day).isoformat(), plan.get("quote_at"), assumption),
-        )
-        _assert_active_lease(conn, "strategy auxiliary fill finalization")
         conn.execute(f"RELEASE SAVEPOINT {savepoint}")
     except Exception as exc:
         conn.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
@@ -629,8 +528,8 @@ def _commit_strategy_buy(
         _risk_log(conn, account_id, code, "buy", STRATEGY_EXECUTION_RETRY_STATUS, failure, detail)
         return None, failure
     _assert_active_lease(conn, "strategy auxiliary audit")
-    _risk_log(conn, account_id, code, "buy", action, reason, detail)
-    _audit(conn, account_id, action, f"{code} {qty}股 @ {fill_price:.2f}")
+    # risk/audit 事件由 planner 的 commit_fill 统一写入，此处不再重复记录，
+    # 避免同一笔成交在 paper_risk_decisions / paper_audit 中出现两次。
     return {"order_id": order_id, "side": "buy", "code": code, "qty": qty}, None
 
 
@@ -819,6 +718,7 @@ def process_pending_manual_orders(asof_date=None):
         dfc,
         init_db,
     )
+    import execution_planner as EP
     init_db()
     day = _date(asof_date)
     output = []
@@ -897,13 +797,11 @@ def process_pending_manual_orders(asof_date=None):
                 output.append({"order_id": order["id"], "status": "expired"})
                 continue
             quote = dict(quote_map.get(order["code"]) or {})
-            order_type = str(order.get("order_type") or "limit").lower()
+            # 待成交复核（revalidate）与提交时共用同一计划逻辑，避免两套口径。
             try:
-                plan = _manual_order_plan(
-                    conn, order["account_id"], order["code"], order["side"], order["qty"],
-                    order_type, order["planned_price"] if order_type == "limit" else None, day, quote=quote,
-                    exclude_reservation_key=str(order["id"]),
-                    all_quotes=quote_map, live_universe=live_universe,
+                plan = EP.revalidate_order_plan(
+                    conn, order, plan_builder=_manual_order_plan, asof_day=day,
+                    quote=quote, all_quotes=quote_map, live_universe=live_universe,
                     market_context=market_context,
                 )
             except Exception as exc:
