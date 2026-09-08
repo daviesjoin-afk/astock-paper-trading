@@ -1909,6 +1909,7 @@ def init_db():
                 # that the scheduler never ran.
                 PSM.ensure_paper_columns(conn)
                 RSET.ensure_schema(conn)
+                SR.ensure_schema(conn)
                 _ensure_accounts(conn)
                 _ensure_cycle(conn)
                 _ensure_runtime_lease_columns(conn)
@@ -2184,6 +2185,7 @@ def init_db():
             (ENTRY_FROZEN_WAITLIST_STATUS,),
         )
         _rebuild_realized_pnl(conn)
+        SR.ensure_schema(conn)
         _ensure_accounts(conn)
         _ensure_cycle(conn)
         _ensure_runtime_lease_columns(conn)
