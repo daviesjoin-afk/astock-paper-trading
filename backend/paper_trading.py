@@ -8628,6 +8628,19 @@ def _buy_order(conn, account, signal, quote, market, news, asof_day, *, all_quot
                 deferred_reason = "金额/成本约束仅影响本次下单规模，候选保留在等待池；资金、席位或预算释放后按最新行情重新复核"
             conn.execute("UPDATE paper_signals SET status='deferred_capacity', reason=? WHERE id=?", (deferred_reason, signal["id"]))
             return {"filled": False, "deferred": True, "reason": deferred_reason}
+        if limit_deferred:
+            # PR-10：限价未到的候选必须留在复试管道里（deferred_capacity 属于
+            # ENTRY_RETRY_SIGNAL_STATUSES），下一执行窗口会重跑全部闸门；绝不能
+            # 打成终态 rejected，否则限价即使到达也无法再复核。
+            deferred_reason = str(entry_limit["reason"])
+            conn.execute(
+                "UPDATE paper_signals SET status='deferred_capacity', reason=? WHERE id=?",
+                (deferred_reason, signal["id"]),
+            )
+            return {
+                "filled": False, "deferred": True, "deferred_limit": True,
+                "reason": deferred_reason,
+            }
         conn.execute("UPDATE paper_signals SET status='rejected', reason=? WHERE id=?", (reason, signal["id"]))
         return {"filled": False, "reason": reason}
     order_id = int(cursor.lastrowid)
