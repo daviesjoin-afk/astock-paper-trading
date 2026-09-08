@@ -74,7 +74,6 @@ def _manual_order_plan(
         _hold_days,
         _limit_pct,
         _market_state,
-        _now,
         _num,
         _pending_position_slots,
         _position_rows,
@@ -440,7 +439,6 @@ def _execute_manual_plan(conn, account, plan, order_id, asof_day):
         raise RuntimeError(_entry_frozen_reason("成交执行"))
     # 成交落库统一走中央执行计划器：预留已在提交阶段完成，这里只消费预占。
     # 自动策略买入（_commit_strategy_buy）复用同一原语，只是由 planner 内部预占。
-    import execution_planner as EP
     return EP.commit_fill(
         conn,
         account=account,
@@ -472,7 +470,6 @@ def _commit_strategy_buy(
     from paper_trading import (
         STRATEGY_EXECUTION_RETRY_STATUS,
         _assert_active_lease,
-        _audit,
         _finish_capital_reservation,
         _json,
         _lease_lost,
@@ -487,8 +484,6 @@ def _commit_strategy_buy(
     code = str(plan["code"])
     qty = int(plan["qty"])
     fill_price = _num(plan["fill_price"])
-    amount = _num(plan["amount"])
-    fees = _num(plan["fees"])
     strategy_stamp = _strategy_stamp(conn, account_id)
     cursor = conn.execute(
         """INSERT INTO paper_orders(
@@ -533,8 +528,8 @@ def _commit_strategy_buy(
         _risk_log(conn, account_id, code, "buy", STRATEGY_EXECUTION_RETRY_STATUS, failure, detail)
         return None, failure
     _assert_active_lease(conn, "strategy auxiliary audit")
-    _risk_log(conn, account_id, code, "buy", action, reason, detail)
-    _audit(conn, account_id, action, f"{code} {qty}股 @ {fill_price:.2f}")
+    # risk/audit 事件由 planner 的 commit_fill 统一写入，此处不再重复记录，
+    # 避免同一笔成交在 paper_risk_decisions / paper_audit 中出现两次。
     return {"order_id": order_id, "side": "buy", "code": code, "qty": qty}, None
 
 
@@ -802,7 +797,6 @@ def process_pending_manual_orders(asof_date=None):
                 output.append({"order_id": order["id"], "status": "expired"})
                 continue
             quote = dict(quote_map.get(order["code"]) or {})
-            order_type = str(order.get("order_type") or "limit").lower()
             # 待成交复核（revalidate）与提交时共用同一计划逻辑，避免两套口径。
             try:
                 plan = EP.revalidate_order_plan(
