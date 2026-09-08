@@ -143,20 +143,23 @@
   </section>
   <div class="strategy-console-layout">
   <nav class="module-tabs strategy-module-tabs" aria-label="策略选股二级导航" role="tablist">
-    <button class="module-tab active" role="tab" aria-selected="true" data-strategy="three_day" onclick="chooseStrategy('three_day',this)"><span class="module-code">03D</span><span class="module-copy"><b>三日策略</b><small>短周期突破确认</small></span></button>
-    <button class="module-tab" role="tab" aria-selected="false" data-strategy="five_day" onclick="chooseStrategy('five_day',this)"><span class="module-code">05D</span><span class="module-copy"><b>五日策略</b><small>趋势与均线强度</small></span></button>
-    <button class="module-tab" role="tab" aria-selected="false" data-strategy="ten_day" onclick="chooseStrategy('ten_day',this)"><span class="module-code">10D</span><span class="module-copy"><b>十日策略</b><small>中短期结构确认</small></span></button>
-    <button class="module-tab" role="tab" aria-selected="false" onclick="showSelectionValidation(this)"><span class="module-code">VAL</span><span class="module-copy"><b>&#x7b56;&#x7565;&#x9a8c;&#x8bc1;</b><small>&#x6bcf;&#x65e5;&#x5feb;&#x7167;&#x4e0e;&#x8d85;&#x989d;&#x6536;&#x76ca;</small></span></button>
+    <button class="module-tab active" role="tab" aria-selected="true" data-strategy="" onclick="choosePaperStrategy('',this)"><span class="module-code">ALL</span><span class="module-copy"><b>全部策略</b><small>五套策略分组展示</small></span></button>
+    <button class="module-tab" role="tab" aria-selected="false" data-strategy="tq_breakout" onclick="choosePaperStrategy('tq_breakout',this)"><span class="module-code">01</span><span class="module-copy"><b>策略1 短线日内做T</b><small>动量 · 资金 · 量能</small></span></button>
+    <button class="module-tab" role="tab" aria-selected="false" data-strategy="trend_pullback" onclick="choosePaperStrategy('trend_pullback',this)"><span class="module-code">02</span><span class="module-copy"><b>策略2 趋势波段优选</b><small>价值 · 质量 · 回踩</small></span></button>
+    <button class="module-tab" role="tab" aria-selected="false" data-strategy="sector_rotation" onclick="choosePaperStrategy('sector_rotation',this)"><span class="module-code">03</span><span class="module-copy"><b>策略3 板块轮动先锋</b><small>情绪 · 资金 · 动量</small></span></button>
+    <button class="module-tab" role="tab" aria-selected="false" data-strategy="reported_profit_breakout" onclick="choosePaperStrategy('reported_profit_breakout',this)"><span class="module-code">04</span><span class="module-copy"><b>策略4 三日策略</b><small>回踩质量 · 流动性 · 主力</small></span></button>
+    <button class="module-tab" role="tab" aria-selected="false" data-strategy="main_force_top10" onclick="choosePaperStrategy('main_force_top10',this)"><span class="module-code">05</span><span class="module-copy"><b>策略5 超强主力股</b><small>主力占比 · 超大单 · 扩散</small></span></button>
+    <button class="module-tab" role="tab" aria-selected="false" data-strategy="__val__" onclick="showSelectionValidation(this)"><span class="module-code">VAL</span><span class="module-copy"><b>&#x7b56;&#x7565;&#x9a8c;&#x8bc1;</b><small>&#x6bcf;&#x65e5;&#x5feb;&#x7167;&#x4e0e;&#x8d85;&#x989d;&#x6536;&#x76ca;</small></span></button>
   </nav>
   <div class="panel workspace-panel strategy-command-panel">
     <div class="controls">
       <select id="selStrategy" class="wide" style="display:none"></select>
-      <div class="control-field"><label for="selTopn">候选数量</label><select id="selTopn"><option>5</option><option selected>10</option><option>20</option></select></div>
-      <div id="selStrategyDesc" class="strategy-model-note">正在读取策略规则…</div>
-      <button id="btnSelect" onclick="runSelect()">开始选股</button>
-      <button class="ghost" onclick="compareStrategies()">对比三种研究策略</button>
+      <div class="control-field"><label for="selTopn">每策略入选上限</label><select id="selTopn"><option selected>5</option><option>10</option><option>20</option></select></div>
+      <div id="selStrategyDesc" class="strategy-model-note">五套策略与「策略模拟」同源；每交易日盘后 17:25 自动按评分各选前 5 只，重跑覆盖当天结果。</div>
+      <button id="btnSelect" onclick="runPaperSelection()">立即重跑选股</button>
+      <button class="ghost" onclick="loadPaperSelection()">刷新结果</button>
     </div>
-    <div id="selectResult" aria-live="polite"><div class="loading">选择策略后点击「开始选股」</div></div>
+    <div id="selectResult" aria-live="polite"><div class="loading">正在读取最近一个交易日的策略选股结果…</div></div>
   </div>
   </div>
 </div>

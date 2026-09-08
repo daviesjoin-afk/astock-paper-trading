@@ -14,8 +14,13 @@ ENV PYTHONUNBUFFERED=1 \
 WORKDIR /app
 
 COPY requirements.txt requirements.lock ./
-RUN sed -i 's|http://deb.debian.org/debian|https://mirrors.cloud.tencent.com/debian|g; s|http://deb.debian.org/debian-security|https://mirrors.cloud.tencent.com/debian-security|g' /etc/apt/sources.list.d/debian.sources \
-    && apt-get update \
+# 主仓库走腾讯云内网友好的镜像；security 单独走阿里云——腾讯云的
+# debian-security 镜像曾出现 InRelease 过期（2026-09-07 起），会直接让
+# apt-get update 失败并中断镜像构建。仍保留一次「忽略 Valid-Until」的兜底
+# 重试，避免任何单一镜像源同步滞后再次阻断构建。
+RUN sed -i 's|http://deb.debian.org/debian|https://mirrors.cloud.tencent.com/debian|g; s|http://deb.debian.org/debian-security|https://mirrors.aliyun.com/debian-security|g' /etc/apt/sources.list.d/debian.sources \
+    && { apt-get update \
+         || apt-get -o Acquire::Check-Valid-Until=false update; } \
     && apt-get install -y --no-install-recommends curl \
     && rm -rf /var/lib/apt/lists/*
 RUN python -m pip install --no-cache-dir -r requirements.lock
