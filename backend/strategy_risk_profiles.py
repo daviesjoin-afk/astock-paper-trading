@@ -37,10 +37,16 @@ class StrategyRiskProfile:
 
 # These names are owned by backend/paper_trading_rules.py.  A profile template
 # may add strategy-level discipline, but it must never relax or replace them.
+# Every top-level name owned by backend/paper_trading_rules.py.  A profile
+# template may add strategy-level discipline, but it must never relax or
+# replace any of them — including the board/ETF prefix tuples and the ST/
+# delisting gate, which define the tradable security scope (review P2).
 _SYSTEM_HARD_RULE_KEYS = frozenset({
     "paper_trading_rules", "commission", "min_commission", "stamp_sell",
     "slippage", "security_scope", "asset_type", "limit_pct", "next_weekday",
-    "is_trade_weekday", "t_plus_one", "t1", "t0_etf",
+    "is_trade_weekday", "t_plus_one", "t1", "t0_etf", "t0_etf_prefixes",
+    "main_board_prefixes", "chinext_prefixes", "star_prefixes",
+    "is_st_or_delisting",
 })
 
 _ARCHETYPE_TO_TEMPLATE = {
