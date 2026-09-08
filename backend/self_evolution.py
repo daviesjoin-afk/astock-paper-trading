@@ -22,6 +22,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import sqlite3
 from typing import Optional
 from zoneinfo import ZoneInfo
 
@@ -70,6 +71,7 @@ def ensure_schema(conn):
             reason TEXT,                   -- 进化/回滚原因
             parent_id INTEGER,             -- 上一版参数的ID
             performance_snapshot TEXT,     -- JSON: 触发进化时的性能快照
+            strategy_id TEXT,              -- NULL=全局默认行；非 NULL=策略专属版本链
             created_at TEXT NOT NULL,
             FOREIGN KEY (parent_id) REFERENCES evolution_params(id)
         );
@@ -124,10 +126,21 @@ def ensure_schema(conn):
 
 
 def get_current_params(conn) -> dict:
-    """获取当前生效的进化参数。"""
-    row = conn.execute(
-        "SELECT id, params, version, source, created_at FROM evolution_params ORDER BY id DESC LIMIT 1"
-    ).fetchone()
+    """获取当前生效的**全局**进化参数（排除策略专属版本行）。"""
+    try:
+        _ensure_strategy_column(conn)
+    except Exception:
+        pass  # 列缺失时旧库迁移交给 ensure_schema；查询退回全表最新行。
+    try:
+        row = conn.execute(
+            """SELECT id, params, version, source, created_at FROM evolution_params
+                WHERE strategy_id IS NULL ORDER BY id DESC LIMIT 1"""
+        ).fetchone()
+    except sqlite3.Error:
+        # 旧库尚未迁移出 strategy_id 列时退回旧行为（全表最新行）。
+        row = conn.execute(
+            "SELECT id, params, version, source, created_at FROM evolution_params ORDER BY id DESC LIMIT 1"
+        ).fetchone()
     if row:
         return {
             "id": row[0],
@@ -520,6 +533,170 @@ def manual_adjust(conn, adjustments: dict, reason: str = "manual") -> dict:
         "old_params": {k: old_params.get(k) for k in changed_keys},
         "new_params": {k: new_params.get(k) for k in changed_keys},
     }
+
+
+
+# ---------------------------------------------------------------------------
+# 策略级进化画像（PR：per-strategy evolution profile）
+#
+# evolution_params 增加可选 strategy_id 列：NULL = 全局默认行（旧行为不变），
+# 非 NULL = 策略专属参数版本链。策略级调整必须通过
+# evolution_profiles.validate_strategy_adjustment 的画像校验
+# （可调清单 / 锁定参数 / 单步步长 / 边界 / 最小证据量），并写 evolution_log。
+# ---------------------------------------------------------------------------
+
+
+def _ensure_strategy_column(conn) -> None:
+    """幂等补齐 evolution_params.strategy_id 列（旧库迁移）。"""
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(evolution_params)").fetchall()}
+    if "strategy_id" not in columns:
+        conn.execute("ALTER TABLE evolution_params ADD COLUMN strategy_id TEXT")
+
+
+def get_strategy_params(conn, strategy_id: str) -> dict:
+    """获取策略专属进化参数；没有专属行时回落到全局默认并套用画像边界。"""
+    import evolution_profiles as EP
+
+    _ensure_strategy_column(conn)
+    row = conn.execute(
+        """SELECT id, params, version, source, created_at FROM evolution_params
+            WHERE strategy_id=? ORDER BY id DESC LIMIT 1""",
+        (str(strategy_id or ""),),
+    ).fetchone()
+    profile = EP.evolution_profile_for(strategy_id)
+    if row is not None:
+        return {
+            "id": row[0], "strategy_id": str(strategy_id),
+            "params": EP.clamp_to_profile(strategy_id, _loads(row[1], _default_params())),
+            "version": row[2], "source": row[3], "created_at": row[4],
+            "profile": profile,
+        }
+    # 无专属行：从全局默认出发生成画像内的初始视图（不落库，只读视图）。
+    global_params = dict(get_current_params(conn)["params"])
+    tuned = {key: global_params[key] for key in profile["tunable"] if key in global_params}
+    return {
+        "id": None, "strategy_id": str(strategy_id or ""),
+        "params": {**global_params, **EP.clamp_to_profile(strategy_id, tuned)},
+        "version": EVOLUTION_VERSION, "source": "global_default",
+        "created_at": None, "profile": profile,
+    }
+
+
+def adjust_strategy_params(conn, strategy_id: str, adjustments: dict, *,
+                           reason: str = "strategy_manual", source: str = "strategy_manual",
+                           evidence_count: Optional[int] = None) -> dict:
+    """按策略画像校验并落地一次参数调整（版本链 + 审计）。
+
+    校验失败返回 {"adjusted": False, "violations": [...]}，绝不静默夹回。
+    """
+    import evolution_profiles as EP
+
+    _ensure_strategy_column(conn)
+    current = get_strategy_params(conn, strategy_id)
+    check = EP.validate_strategy_adjustment(
+        strategy_id, current["params"], adjustments or {},
+        evidence_count=evidence_count,
+    )
+    if not check["allowed"]:
+        conn.execute(
+            "INSERT INTO evolution_log(event_type, params_id, detail, created_at) VALUES(?,?,?,?)",
+            ("strategy_adjust_rejected", None, _json({
+                "strategy_id": str(strategy_id), "adjustments": dict(adjustments or {}),
+                "violations": check["violations"], "reason": reason,
+            }), _now()),
+        )
+        conn.commit()
+        return {"adjusted": False, "violations": check["violations"],
+                "profile": check["profile"]}
+    new_params = {**current["params"], **check["adjusted"]}
+    new_params = EP.clamp_to_profile(strategy_id, new_params)
+    changed_keys = sorted(
+        key for key in check["adjusted"]
+        if new_params.get(key) != current["params"].get(key)
+    )
+    if not changed_keys:
+        # 无变化（重试同值）：不落新版本，避免重复版本污染回滚链。
+        return {"adjusted": False, "reason": "无变化",
+                "strategy_id": str(strategy_id)}
+    now = _now()
+    cursor = conn.execute(
+        """INSERT INTO evolution_params(version, params, source, reason, parent_id, created_at, strategy_id)
+           VALUES(?,?,?,?,?,?,?)""",
+        (EVOLUTION_VERSION, _json(new_params), source, reason, current["id"], now,
+         str(strategy_id)),
+    )
+    new_id = cursor.lastrowid
+    conn.execute(
+        "INSERT INTO evolution_log(event_type, params_id, detail, created_at) VALUES(?,?,?,?)",
+        ("strategy_adjust", new_id, _json({
+            "strategy_id": str(strategy_id),
+            "adjustments": dict(adjustments or {}),
+            "changed_keys": changed_keys,
+            "old_params": {k: current["params"].get(k) for k in changed_keys},
+            "new_params": {k: new_params.get(k) for k in changed_keys},
+            "profile": check["profile"]["label"],
+            "reason": reason,
+        }), now),
+    )
+    conn.commit()
+    return {
+        "adjusted": True, "strategy_id": str(strategy_id), "new_params_id": new_id,
+        "changed_keys": changed_keys,
+        "old_params": {k: current["params"].get(k) for k in changed_keys},
+        "new_params": {k: new_params.get(k) for k in changed_keys},
+        "profile": check["profile"]["label"],
+    }
+
+
+def rollback_strategy_params(conn, strategy_id: str, reason: str = "strategy_rollback") -> dict:
+    """把策略专属参数回滚到上一版（重新插入旧版，保留完整审计链）。"""
+    _ensure_strategy_column(conn)
+    rows = conn.execute(
+        """SELECT id, params FROM evolution_params
+            WHERE strategy_id=? ORDER BY id DESC LIMIT 2""",
+        (str(strategy_id or ""),),
+    ).fetchall()
+    if not rows:
+        return {"rolled_back": False, "reason": "该策略没有专属参数版本"}
+    if len(rows) < 2:
+        # 只有一版 = 尚无可回滚目标：回落到**当前全局参数**（该策略继承的
+        # 基线），而不是硬编码出厂默认——否则已手动调整过的全局值会被静默重置。
+        inherited = dict(get_current_params(conn)["params"])
+        now = _now()
+        cursor = conn.execute(
+            """INSERT INTO evolution_params(version, params, source, reason, parent_id, created_at, strategy_id)
+               VALUES(?,?,?,?,?,?,?)""",
+            (EVOLUTION_VERSION, _json(inherited), "rollback",
+             reason + "：仅一版，回落全局默认", rows[0][0], now, str(strategy_id)),
+        )
+        conn.execute(
+            "INSERT INTO evolution_log(event_type, params_id, detail, created_at) VALUES(?,?,?,?)",
+            ("strategy_rollback", cursor.lastrowid, _json({
+                "strategy_id": str(strategy_id), "target": "global_default",
+                "reason": reason,
+            }), now),
+        )
+        conn.commit()
+        return {"rolled_back": True, "strategy_id": str(strategy_id),
+                "target": "global_default", "new_params_id": cursor.lastrowid}
+    previous = dict(rows[1])
+    now = _now()
+    cursor = conn.execute(
+        """INSERT INTO evolution_params(version, params, source, reason, parent_id, created_at, strategy_id)
+           VALUES(?,?,?,?,?,?,?)""",
+        (EVOLUTION_VERSION, previous["params"], "rollback", reason,
+         rows[0][0], now, str(strategy_id)),
+    )
+    conn.execute(
+        "INSERT INTO evolution_log(event_type, params_id, detail, created_at) VALUES(?,?,?,?)",
+        ("strategy_rollback", cursor.lastrowid, _json({
+            "strategy_id": str(strategy_id), "target_params_id": previous["id"],
+            "reason": reason,
+        }), now),
+    )
+    conn.commit()
+    return {"rolled_back": True, "strategy_id": str(strategy_id),
+            "target_params_id": previous["id"], "new_params_id": cursor.lastrowid}
 
 
 def get_evolution_history(conn, limit: int = 20) -> list:
