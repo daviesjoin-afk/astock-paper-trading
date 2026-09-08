@@ -36,6 +36,7 @@ import paper_schema_migrations as PSM
 import paper_archive_projection as PAP
 import paper_quote_policy as PQP
 import paper_allocation as PA
+import entry_lifecycle as ELC
 import execution_dispatch as EPD
 import execution_profiles as EPF
 import paper_sizing as PSZ
@@ -8016,6 +8017,23 @@ def _buy_order(conn, account, signal, quote, market, news, asof_day, *, all_quot
             "reason": freeze_reason,
         }
     payload = _loads(signal["payload"])
+    # 信号 TTL：入场信号是即时证据。超龄或跨日信号直接终态拒绝，旧信号
+    # 永远不能开新仓；加仓必须由新信号/新委托意图重新走完整风控。
+    freshness = ELC.signal_freshness(signal, asof_day=asof_day)
+    if not freshness["usable"]:
+        stale_reason = freshness["reason"]
+        conn.execute(
+            "UPDATE paper_signals SET status='expired',reason=? WHERE id=? AND status IN (?,?,?)",
+            (stale_reason, signal["id"], *ELC.RETRY_SIGNAL_STATUSES),
+        )
+        _risk_log(conn, account["id"], code, "buy", "signal_expired", stale_reason, {
+            "signal_id": signal.get("id"), "age_minutes": freshness["age_minutes"],
+            "ttl_minutes": freshness["ttl_minutes"],
+        })
+        return {
+            "code": code, "filled": False, "status": "signal_expired",
+            "reason": stale_reason,
+        }
     pick = payload.get("pick") or {}
     market_policy = _strategy_market_policy(account, pick, quote, market)
     execution_quote = _execution_quote_status(quote, asof_day)
@@ -8446,6 +8464,36 @@ def _buy_order(conn, account, signal, quote, market, news, asof_day, *, all_quot
         ),
     )
     risk["execution_dispatch"] = dispatch_plan
+    # 分批建仓（entry slices）：一份信号可分多片成交，但每一片都是一条
+    # 独立的新委托意图——本轮只执行当前片，剩余片由下一轮扫描重新取价、
+    # 重新跑全部风控与 sizing；信号失效（TTL/跨日）后剩余片自动作废。
+    slice_state = None
+    try:
+        slice_count = int(payload.get("entry_slice_policy")
+                          or account.get("entry_slices") or 1)
+    except (TypeError, ValueError):
+        slice_count = 1
+    slice_count = max(1, min(slice_count, 5))
+    if slice_count > 1:
+        slice_state = dict(payload.get("entry_slices") or {})
+        if not slice_state.get("plan"):
+            slice_state = {
+                "plan": ELC.entry_slice_plan(int(qty or 0), slice_count, lot_size=LOT_SIZE),
+                "filled": 0, "day": str(asof_day)[:10], "slices": slice_count,
+            }
+        plan = [int(item) for item in (slice_state.get("plan") or [])]
+        filled = max(0, int(slice_state.get("filled") or 0))
+        if plan and filled < len(plan):
+            target = plan[filled]
+            clamped = (min(int(qty or 0), target) // LOT_SIZE) * LOT_SIZE
+            sizing["entry_slice_target_qty"] = target
+            sizing["entry_slice_index"] = filled + 1
+            sizing["entry_slice_total"] = len(plan)
+            if clamped > 0:
+                qty = clamped
+        risk["entry_slices"] = {
+            "plan": plan, "filled": filled, "slices": slice_count,
+        }
     amount = qty * fill_price
     fees = _commission(amount) if amount else 0.0
     sizing["one_lot_amount"] = round(LOT_SIZE * fill_price, 2)
@@ -8774,7 +8822,24 @@ def _buy_order(conn, account, signal, quote, market, news, asof_day, *, all_quot
         conn.execute("INSERT INTO paper_fills(order_id,account_id,side,code,qty,price,amount,fees,fill_date,quote_at,assumption) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
                      (order_id, account["id"], "buy", code, qty, fill_price, amount, fees, asof_day.isoformat(), quote.get("quote_at"), "实时价 + 0.10% 滑点"))
         _assert_active_lease(conn, "strategy fill finalization")
-        conn.execute("UPDATE paper_signals SET status='filled', reason=? WHERE id=?", (reason, signal["id"]))
+        slice_done = slice_state is None
+        if slice_state is not None:
+            slice_plan = [int(item) for item in (slice_state.get("plan") or [])]
+            slices_filled = max(0, int(slice_state.get("filled") or 0)) + 1
+            slice_done = slices_filled >= len(slice_plan)
+            conn.execute(
+                "UPDATE paper_signals SET payload=? WHERE id=?",
+                (_json({**payload, "entry_slices": {**slice_state, "filled": slices_filled}}),
+                 signal["id"]),
+            )
+            if not slice_done:
+                conn.execute(
+                    "UPDATE paper_signals SET status='deferred_capacity',reason=? WHERE id=?",
+                    (f"分批建仓第 {slices_filled}/{len(slice_plan)} 片已成交；"
+                     "剩余片由后续扫描重新取价并重跑全部风控", signal["id"]),
+                )
+        if slice_done:
+            conn.execute("UPDATE paper_signals SET status='filled', reason=? WHERE id=?", (reason, signal["id"]))
         _sync_positions(conn, account["id"], asof_day)
         conn.execute(
             "UPDATE paper_orders SET status='filled',filled_price=?,amount=?,fees=?,executed_at=? WHERE id=?",
@@ -13236,6 +13301,19 @@ def run_slot(slot, asof_date=None, force=False):
     if slot not in {"auction", "open", "risk", "close", "weekly-review", "intraday"}:
         raise ValueError("slot 必须是 auction、open、risk、close、weekly-review 或 intraday")
     init_db()
+    # 信号 / 委托生命周期清扫（signal expiry & staged entry）：跨日或超龄
+    # 信号收敛为 expired，超龄活动买单作废并释放预占。放在执行器清扫之前。
+    try:
+        with _db() as lifecycle_conn:
+            ELC.expire_stale_signals(lifecycle_conn, asof_day=_date(asof_date))
+            ELC.expire_stale_orders(lifecycle_conn)
+    except Exception as lifecycle_exc:  # pragma: no cover - 防御性
+        try:
+            with _db() as lifecycle_conn:
+                _audit(lifecycle_conn, "system", "entry_lifecycle_error",
+                       f"信号/委托清扫失败：{type(lifecycle_exc).__name__}: {lifecycle_exc}")
+        except Exception:
+            pass
     # PR-11 执行器清扫：批量窗口到期放行、人工核验等待单回收、TTL 作废。
     # 属于撮合前置动作，放在任何买入判定之前；清扫失败只记录审计，绝不能
     # 打断本轮扫描（挂起单会在下一轮继续被清扫）。
