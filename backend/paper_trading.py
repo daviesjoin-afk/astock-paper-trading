@@ -7554,16 +7554,54 @@ def _entry_deployment_gate(conn, account_id, code, positions, pending_slots, cou
     }
 
 
-def _strategy_cluster_profiles(conn, asof_day=None):
+def _strategy_return_series(conn, account_ids, *, days=30):
+    """按策略聚合近 N 天的日盈亏序列（已实现盈亏，Pearson 对线性缩放不变）。
+
+    每个策略一条按日求和的 realized-pnl 序列；无成交日补 0，保证各序列
+    长度一致。查询失败返回空映射（证据缺失时权重自动让渡）。
+    """
+    if conn is None or not account_ids:
+        return {}
+    day = _date()
+    since = (day - dt.timedelta(days=days)).isoformat()
+    series = {account_id: [] for account_id in account_ids}
+    placeholders = ",".join("?" for _ in account_ids)
+    try:
+        rows = conn.execute(
+            f"""SELECT account_id, substr(executed_at,1,10) AS day,
+                      COALESCE(SUM(COALESCE(realized_pnl,0)),0) AS pnl
+                 FROM paper_orders
+                WHERE side='sell' AND status='filled' AND executed_at>=?
+                  AND account_id IN ({placeholders})
+                GROUP BY account_id, day ORDER BY day""",
+            (since, *account_ids),
+        ).fetchall()
+    except sqlite3.Error:
+        return series
+    daily: dict[str, dict[str, float]] = {account_id: {} for account_id in account_ids}
+    for row in rows:
+        record = dict(row)
+        account_id = str(record.get("account_id") or "")
+        if account_id in daily and record.get("day"):
+            daily[account_id][str(record["day"])] = _num(record.get("pnl"))
+    all_days = sorted({d for series_days in daily.values() for d in series_days} |
+                      {(day - dt.timedelta(days=offset)).isoformat() for offset in range(days)})
+    for account_id, buckets in daily.items():
+        series[account_id] = [_num(buckets.get(d)) for d in all_days]
+    return series
+
+
+def _strategy_cluster_profiles(conn, asof_day=None, account_ids=None):
     """收集各策略的相关性画像：持仓/近期信号代码与行业集合（约 14 天窗口）。
 
-    供 strategy_clusters 归簇与分散化惩罚使用；任何查询失败都只损失证据，
-    不阻塞主扫描。
+    只为**参与当前周期的策略**建画像（未启用策略不占预算也不该抬簇规模），
+    任何查询失败都只损失证据，不阻塞主扫描。
     """
     day = _date(asof_day)
+    wanted = [str(item) for item in (account_ids or list(ACCOUNT_SPECS))]
     positions = _position_rows(conn, asof_day=day)
     profiles = {}
-    for account_id in ACCOUNT_SPECS:
+    for account_id in wanted:
         own = [item for item in positions if item.get("account_id") == account_id]
         profiles[account_id] = SC.similarity_profile(
             position_codes={str(item.get("code")) for item in own if item.get("code")},
@@ -7578,15 +7616,21 @@ def _strategy_cluster_profiles(conn, asof_day=None):
     except sqlite3.Error:
         rows = []
     for row in rows:
-        account_id = str(row.get("account_id") or "")
-        if account_id in profiles and row.get("code"):
-            profiles[account_id]["signals"].add(str(row["code"]))
+        # sqlite3.Row 没有 .get，统一转 dict。
+        record = dict(row)
+        account_id = str(record.get("account_id") or "")
+        if account_id in profiles and record.get("code"):
+            profiles[account_id]["signals"].add(str(record["code"]))
+    returns_map = _strategy_return_series(conn, wanted)
+    for account_id, returns in returns_map.items():
+        if account_id in profiles and returns:
+            profiles[account_id]["returns"] = returns
     return profiles
 
 
-def _strategy_cluster_factors(conn, asof_day=None):
+def _strategy_cluster_factors(conn, asof_day=None, account_ids=None):
     """返回 (clusters, {strategy_id: 分散化系数})；单策略簇系数 = 1.0。"""
-    profiles = _strategy_cluster_profiles(conn, asof_day)
+    profiles = _strategy_cluster_profiles(conn, asof_day, account_ids)
     clusters = SC.strategy_clusters(profiles)
     factors = {
         account_id: SC.cluster_diversification_factor(account_id, clusters)
@@ -7644,7 +7688,10 @@ def _dynamic_position_limits(conn):
     }
     # 相关.cluster（PR）：按信号/持仓/行业重合归簇，簇内策略乘以
     # 1/sqrt(簇规模) 的分散化系数——复制近似策略拿不到线性叠加的风险额度。
-    clusters, cluster_factors = _strategy_cluster_factors(conn)
+    # 只对参与当前周期的策略建画像。
+    clusters, cluster_factors = _strategy_cluster_factors(
+        conn, account_ids=account_ids,
+    )
     diversification = {key: cluster_factors.get(key, 1.0) for key in account_ids}
     weights = {
         account_id: max(_num(profiles[account_id].get("max_exposure")), 0.01)
@@ -7784,9 +7831,12 @@ def _strategy_pool_budget(conn, account, nav, positions, quotes, market=None, ex
     # A missing market argument is used by read-only dashboard aggregation;
     # the execution path always supplies the current market gate.
     scales = market_light_scales(market_light) if market_light else None
-    # 相关.cluster：资金预算与席位分配使用同一套分散化系数。
-    _, cluster_factors = _strategy_cluster_factors(conn)
-    return PA.strategy_pool_budget(
+    # 相关.cluster：资金预算与席位分配使用同一套分散化系数，并施加**绝对**
+    # 簇预算——归一化的有效权重会抵消公共系数，绝对约束才能兜住克隆簇。
+    clusters, cluster_factors = _strategy_cluster_factors(
+        conn, account_ids=list(weights),
+    )
+    result = PA.strategy_pool_budget(
         _strategy_runtimes(
             list(weights), weights,
             diversification={key: cluster_factors.get(key, 1.0) for key in weights},
@@ -7800,6 +7850,27 @@ def _strategy_pool_budget(conn, account, nav, positions, quotes, market=None, ex
         shared_pool_max_exposure=RSET.get(conn, "shared_pool_exposure_cap", SHARED_POOL_MAX_EXPOSURE),
         strategy_pool_floor_ratio=STRATEGY_POOL_FLOOR_RATIO,
     )
+    cluster = SC.cluster_of(account.get("id"), clusters)
+    if len(cluster) > 1:
+        # 单策略绝对上限（元）≈ 净值 × 该策略 max_exposure 权重；
+        # 簇上限 = 单策略上限 × 簇预算倍数（sqrt(n)，触发地板后线性）。
+        unit_amount = _num(nav) * _num(weights.get(account.get("id"), 0.0))
+        cluster_cap = unit_amount * SC.cluster_budget_multiplier(cluster)
+        cluster_committed = sum(
+            _num(values.get(member)) + _num(pending_by_account.get(member))
+            for member in cluster
+        )
+        headroom = max(0.0, cluster_cap - cluster_committed)
+        result["cluster_budget"] = {
+            "cluster": sorted(cluster), "cap_amount": round(cluster_cap, 2),
+            "committed_amount": round(cluster_committed, 2),
+            "headroom_amount": round(headroom, 2),
+            "version": SC.STRATEGY_CLUSTER_VERSION,
+        }
+        result["allowance_amount"] = min(
+            _num(result.get("allowance_amount")), headroom,
+        )
+    return result
 
 
 def _entry_execution_scale(market_policy, entry_model, chase_entry, dynamic_news, strategy_budget):
