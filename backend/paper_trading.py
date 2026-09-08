@@ -8516,6 +8516,29 @@ def _buy_order(conn, account, signal, quote, market, news, asof_day, *, all_quot
         risk["entry_slices"] = {
             "plan": plan, "filled": filled, "slices": slice_count,
         }
+    # 组合级单票上限（可选）：0 = 关闭。开启后按"共享池净值 × 比例"约束
+    # 所有策略对同一 symbol 的持仓 + 在途合计，并把本次数量钳制到余量内，
+    # 新买入不能绕过聚合上限（也不能"略微超限"成交）。
+    symbol_aggregate_cap_pct = _num(RSET.get(conn, "symbol_aggregate_cap_pct", 0.0))
+    if symbol_aggregate_cap_pct > 0:
+        aggregate = PCO.aggregate_exposure(
+            positions, all_quotes or {}, pending_by_symbol=pending_by_symbol,
+        )
+        symbol_check = PCO.symbol_headroom(
+            code, aggregate, cap_amount=nav * symbol_aggregate_cap_pct / 100.0,
+        )
+        risk["symbol_aggregate_check"] = symbol_check
+        if not symbol_check["allowed"]:
+            reasons.append(str(symbol_check["reason"]))
+        else:
+            headroom = _num(symbol_check["headroom_amount"])
+            headroom_qty = (
+                int(headroom / fill_price // LOT_SIZE) * LOT_SIZE
+                if fill_price > 0 and headroom > 0 else 0
+            )
+            if headroom_qty < qty:
+                qty = max(0, headroom_qty)
+                sizing["symbol_headroom_clamped_qty"] = qty
     amount = qty * fill_price
     fees = _commission(amount) if amount else 0.0
     sizing["one_lot_amount"] = round(LOT_SIZE * fill_price, 2)
@@ -8640,19 +8663,6 @@ def _buy_order(conn, account, signal, quote, market, news, asof_day, *, all_quot
         qty < LOT_SIZE and not hard_reasons
         and set(sizing.get("binding_constraints") or []).issubset({"cash", "weight", "exposure", "industry"})
     )
-    # 组合级单票上限（可选）：0 = 关闭。开启后按"共享池净值 × 比例"约束
-    # 所有策略对同一 symbol 的持仓 + 在途合计，新买入不能绕过聚合上限。
-    symbol_aggregate_cap_pct = _num(RSET.get(conn, "symbol_aggregate_cap_pct", 0.0))
-    if symbol_aggregate_cap_pct > 0:
-        aggregate = PCO.aggregate_exposure(
-            positions, all_quotes or {}, pending_by_symbol=pending_by_symbol,
-        )
-        symbol_check = PCO.symbol_headroom(
-            code, aggregate, cap_amount=nav * symbol_aggregate_cap_pct / 100.0,
-        )
-        risk["symbol_aggregate_check"] = symbol_check
-        if not symbol_check["allowed"]:
-            reasons.append(str(symbol_check["reason"]))
     if dispatch_plan.get("blocked"):
         reasons.append(str(dispatch_plan["blocked_reason"]))
     # A Q3 sample is worth recording only if every ordinary execution/risk
@@ -12315,6 +12325,21 @@ def _swing_scale_in(conn, account, position, quote, market, asof_day, profile, c
         single_position_max_amount=RSET.get(conn, "single_position_max_amount", 0.0),
     )
     sizing["strategy_budget"] = strategy_budget
+    # 组合级单票上限同样约束确认加仓（P5）：占满即拒绝，有余量则钳制本次片。
+    symbol_cap_pct = _num(RSET.get(conn, "symbol_aggregate_cap_pct", 0.0))
+    if symbol_cap_pct > 0:
+        aggregate = PCO.aggregate_exposure(
+            positions, quotes, pending_by_symbol=PCO.pending_symbol_amounts(conn),
+        )
+        symbol_check = PCO.symbol_headroom(
+            position["code"], aggregate, cap_amount=nav * symbol_cap_pct / 100.0,
+        )
+        sizing["symbol_aggregate_check"] = symbol_check
+        if not symbol_check["allowed"]:
+            return None, str(symbol_check["reason"])
+        headroom = _num(symbol_check["headroom_amount"])
+        headroom_qty = int(headroom / fill // LOT_SIZE) * LOT_SIZE if fill > 0 and headroom > 0 else 0
+        qty = min(qty, headroom_qty)
     # 趋势策略只补齐首笔观察仓：上限为现有可识别持仓规模，不能因一次
     # 确认把单票直接推到整个账户的最大额度。板块策略仍按其独立小仓确认。
     if account_id == "trend_pullback":

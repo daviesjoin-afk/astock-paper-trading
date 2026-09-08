@@ -179,3 +179,25 @@ class WiringGuardTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ReviewFixTests(unittest.TestCase):
+    """回归护栏：等待池标记不算敞口、余量钳制与加仓上限已接线。"""
+
+    def test_waitlist_markers_are_not_committed_exposure(self):
+        conn = _db()
+        _order(conn, "600000", 500, 10.0, status="deferred_capacity")
+        _order(conn, "600000", 300, 10.0, status="entry_frozen_waitlist")
+        _order(conn, "000001", 100, 10.0, status="pending_limit")
+        amounts = PCO.pending_symbol_amounts(conn)
+        self.assertNotIn("600000", amounts)
+        self.assertEqual(1000.0, amounts["000001"])
+
+    def test_headroom_clamp_is_wired_into_both_buy_paths(self):
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "paper_trading.py")
+        with open(path, "r", encoding="utf-8") as handle:
+            source = handle.read()
+        self.assertIn("symbol_headroom_clamped_qty", source)
+        # 新开仓与确认加仓两条路径都读取聚合上限设置并应用余量钳制。
+        self.assertGreaterEqual(source.count('RSET.get(conn, "symbol_aggregate_cap_pct"'), 2)
+        self.assertGreaterEqual(source.count("symbol_headroom("), 2)
