@@ -1909,6 +1909,7 @@ def init_db():
                 # that the scheduler never ran.
                 PSM.ensure_paper_columns(conn)
                 RSET.ensure_schema(conn)
+                SR.ensure_schema(conn)
                 _ensure_accounts(conn)
                 _ensure_cycle(conn)
                 _ensure_runtime_lease_columns(conn)
@@ -2184,6 +2185,7 @@ def init_db():
             (ENTRY_FROZEN_WAITLIST_STATUS,),
         )
         _rebuild_realized_pnl(conn)
+        SR.ensure_schema(conn)
         _ensure_accounts(conn)
         _ensure_cycle(conn)
         _ensure_runtime_lease_columns(conn)
@@ -14430,7 +14432,13 @@ def _create_cycle(conn, capital, status="paused", reason="新建模拟周期", d
         enabled_strategies = RSET.enabled_strategies(conn)
     checked = RSET.validate({"cycle_duration_days": duration_days, "enabled_strategies": list(enabled_strategies)})
     duration_days = checked["cycle_duration_days"]
-    enabled_strategies = checked["enabled_strategies"]
+    eligible_ids = frozenset(SR.active_ids(conn=conn))
+    enabled_strategies = tuple(
+        strategy_id for strategy_id in checked["enabled_strategies"]
+        if strategy_id in eligible_ids
+    )
+    if not enabled_strategies:
+        raise ValueError("没有可用于新周期的活跃策略")
     now = _now()
     key = "cycle-" + dt.datetime.now().strftime("%Y%m%d-%H%M%S-%f")
     cursor = conn.execute(
