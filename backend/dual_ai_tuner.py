@@ -275,7 +275,8 @@ def _build_tuning_user_prompt(evidence, accounts, mode):
     )
 
 
-def _check_consensus(mimo_proposals, deepseek_proposals, accounts_map, evolution=None):
+def _check_consensus(mimo_proposals, deepseek_proposals, accounts_map, evolution=None,
+                     evolution_by_account=None):
     """检查两个AI的提案是否达成共识。
 
     共识条件：
@@ -289,15 +290,13 @@ def _check_consensus(mimo_proposals, deepseek_proposals, accounts_map, evolution
     self_evolution 当前参数版本（max_weight_delta / max_delta_threshold /
     max_proposals_per_run），使进化参数真正约束调参输出，而不是只进日志。
 
+    策略级进化画像（PR）：``evolution_by_account`` 提供 account_id → 参数
+    映射时，逐账户叠加其策略专属参数（无覆盖的键回落全局），策略画像的
+    边界/锁定才真正约束每个策略自己的提案。
+
     返回 (consensus: bool, reason: str, merged: list)
     """
     evolution = evolution or {}
-    weight_magnitude_ratio = max(0.1, min(1.0, _num(
-        evolution.get("consensus_weight_ratio"), CONSENSUS_WEIGHT_MAGNITUDE_RATIO)))
-    weight_step = max(0.005, min(0.05, _num(
-        evolution.get("max_weight_delta"), CONSENSUS_MAX_WEIGHT_STEP)))
-    entry_step = max(0.001, min(0.01, _num(
-        evolution.get("max_delta_threshold"), CONSENSUS_MAX_DELTA_STEP)))
     max_proposals = max(1, int(_num(
         evolution.get("max_proposals_per_run"), 3)))
     if not mimo_proposals or not deepseek_proposals:
@@ -328,6 +327,16 @@ def _check_consensus(mimo_proposals, deepseek_proposals, accounts_map, evolution
         mp = mimo_map[account_id]
         dp = ds_map[account_id]
         base = accounts_map.get(account_id, {})
+        # 策略级进化画像：逐账户叠加策略专属参数（无覆盖的键回落全局）。
+        account_evolution = dict(evolution)
+        account_evolution.update((evolution_by_account or {}).get(account_id) or {})
+        weight_magnitude_ratio = max(0.1, min(1.0, _num(
+            account_evolution.get("consensus_weight_ratio"),
+            CONSENSUS_WEIGHT_MAGNITUDE_RATIO)))
+        weight_step = max(0.005, min(0.05, _num(
+            account_evolution.get("max_weight_delta"), CONSENSUS_MAX_WEIGHT_STEP)))
+        entry_step = max(0.001, min(0.01, _num(
+            account_evolution.get("max_delta_threshold"), CONSENSUS_MAX_DELTA_STEP)))
 
         # 置信度门禁：单AI路径要求确定性 ≥70 才允许 propose；共识路径此前
         # 完全不读置信度，两个低置信提案方向一致即可通过。先归一化 0-1
@@ -596,13 +605,23 @@ def run_dual_ai_tuning(connect_factory, paper_db_path, snapshot_paths, evidence_
                 import self_evolution as _SE
                 _SE.ensure_schema(conn)
                 _evolution_params = _SE.get_current_params(conn).get("params") or {}
+                # 策略级进化画像：逐账户叠加策略专属参数版本。
+                _evolution_by_account = {}
+                for _account_id in (accounts_map or {}):
+                    try:
+                        _evolution_by_account[_account_id] = _SE.get_strategy_params(
+                            conn, _account_id).get("params") or {}
+                    except Exception:
+                        continue
             except Exception:
                 _evolution_params = {}
+                _evolution_by_account = {}
             consensus, consensus_reason, merged_proposals = _check_consensus(
                 mimo_r.get("proposals") or [],
                 ds_r.get("proposals") or [],
                 accounts_map,
                 evolution=_evolution_params,
+                evolution_by_account=_evolution_by_account,
             )
         else:
             consensus_reason = f"决策分歧：MiMo={mimo_decision}, DeepSeek={ds_decision}"
