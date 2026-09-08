@@ -7851,7 +7851,7 @@ def _price_aware_qty(
     exposure_scale=1.0, strategy_position_value=None,
     strategy_cap_amount=None, pool_cap_amount=None,
     pending_strategy_amount=0.0, pending_pool_amount=0.0,
-    single_position_max_amount=None,
+    single_position_max_amount=None, liquidity_cap_amount=None,
 ):
     return PSZ.price_aware_qty(
         nav, cash, position_value, industry_value, code_value,
@@ -7860,7 +7860,26 @@ def _price_aware_qty(
         pool_cap_amount, pending_strategy_amount, pending_pool_amount,
         num=_num, lot_size=LOT_SIZE,
         single_position_max_amount=single_position_max_amount,
+        liquidity_cap_amount=liquidity_cap_amount,
     )
+
+
+LIQUIDITY_PARTICIPATION_RATE = 0.05
+
+
+def _quote_liquidity_cap(quote):
+    """按当日成交额 × 参与率估算流动性可买金额（PR-09）。
+
+    成交额数据源历史上出现过"元"与"万元"两种口径：金额 < 100 万时按
+    "万元"解释（正常个股日成交额不会低于十万量级），否则按"元"解释。
+    拿不到成交额时返回 None，流动性约束不生效（行为与旧版一致）。
+    """
+    amount = _num((quote or {}).get("amount"), 0.0)
+    if amount <= 0:
+        return None
+    if amount < 1_000_000:
+        amount *= 10_000
+    return amount * LIQUIDITY_PARTICIPATION_RATE
 
 
 def _exceptional_opportunity(account, pick, quote, market, entry_model, q, risk_state, asof_day, conn):
@@ -8260,6 +8279,7 @@ def _buy_order(conn, account, signal, quote, market, news, asof_day, *, all_quot
         pending_strategy_amount=strategy_budget.get("pending_reserve_amount", 0.0),
         pending_pool_amount=strategy_budget.get("pending_pool_reserve_amount", 0.0),
         single_position_max_amount=single_position_max_amount,
+        liquidity_cap_amount=_quote_liquidity_cap(quote),
     )
     # Entry-model scaling must reduce the actual order as well as the residual
     # exposure allowance.  Otherwise a risk/weight constraint could silently
