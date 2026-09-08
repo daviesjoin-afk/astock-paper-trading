@@ -4,10 +4,12 @@ import sqlite3
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import strategy_registry as registry
+import paper_trading as paper
 
 
 class StrategyDefinitionLifecycleTests(unittest.TestCase):
@@ -82,6 +84,46 @@ class StrategyDefinitionLifecycleTests(unittest.TestCase):
             conn=self.conn, statuses=("archived",),
         )
         self.assertEqual([row.id for row in archived], ["user_archived"])
+
+    def test_bootstrap_fallback_applies_filters_and_rejects_invalid_values(self):
+        missing_path = os.path.join(self.directory.name, "missing.sqlite3")
+        self.assertEqual(
+            registry.list_definitions(db_path=missing_path, origins=("user",)), (),
+        )
+        with self.assertRaisesRegex(ValueError, "invalid strategy origin"):
+            registry.list_definitions(db_path=missing_path, origins=("invalid",))
+
+    def test_non_object_metadata_is_rejected_before_persisting(self):
+        with self.assertRaisesRegex(ValueError, "metadata must be an object"):
+            registry.create_user_definition(
+                self.conn, "user_bad_metadata", "Bad Metadata", metadata=["not", "an", "object"],
+            )
+
+    def test_paused_definition_is_excluded_from_a_new_cycle_without_restart(self):
+        paper_path = os.path.join(self.directory.name, "paper-cycle.sqlite3")
+        with (
+            mock.patch.object(paper, "DB_PATH", paper_path),
+            mock.patch.object(paper, "_benchmark_close", return_value=None),
+            mock.patch.object(paper, "_RUNNER_BOOT_RECOVERED", False),
+        ):
+            paper.init_db()
+            conn = sqlite3.connect(paper_path)
+            try:
+                registry.transition(
+                    conn, "tq_breakout", "paused", expected_status="active", actor="test",
+                )
+                conn.commit()
+            finally:
+                conn.close()
+            paper.reset_cycle(100000, include_dashboard=False)
+            conn = sqlite3.connect(paper_path)
+            try:
+                enabled = conn.execute(
+                    "SELECT enabled_strategies FROM paper_cycles ORDER BY id DESC LIMIT 1"
+                ).fetchone()[0]
+            finally:
+                conn.close()
+        self.assertNotIn("tq_breakout", enabled)
 
     def test_query_endpoint_returns_database_definitions(self):
         import main
