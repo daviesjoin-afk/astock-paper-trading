@@ -7893,6 +7893,42 @@ def execution_dispatch_overview():
         return EPD.dispatch_overview(conn)
 
 
+def execution_profile_center():
+    """PR-12：七档执行画像目录 + 账户映射 + 执行器视图（纯只读）。"""
+    init_db()
+    rows = []
+    for account_id, spec in ACCOUNT_SPECS.items():
+        profile = _execution_profile_for_account(account_id)
+        rows.append({
+            "id": account_id,
+            "name": spec.get("name"),
+            "risk_profile": spec.get("risk_profile"),
+            "family": profile.get("family"),
+            "label": profile.get("label"),
+            "urgency": profile.get("urgency"),
+            "order_type": profile.get("order_type"),
+            "limit_offset_pct": profile.get("limit_offset_pct"),
+            "ttl_minutes": profile.get("ttl_minutes"),
+            "batch": bool(profile.get("batch")),
+            "verification_required": bool(profile.get("verification_required")),
+            "strict_ttl": bool(profile.get("strict_ttl")),
+            "fallback_from": profile.get("fallback_from"),
+            "active": account_id in ACTIVE_ACCOUNT_SPECS,
+        })
+    with _db() as conn:
+        dispatch = EPD.dispatch_overview(conn)
+    return {
+        "engine": EPF.EXECUTION_PROFILE_VERSION,
+        "catalog": [
+            dict(spec, family=family)
+            for family, spec in EPF.EXECUTION_PROFILES.items()
+        ],
+        "aliases": dict(EPF.PROFILE_FAMILY_ALIASES),
+        "accounts": rows,
+        "dispatch": dispatch,
+    }
+
+
 def resolve_execution_verification(order_id, approved, operator="", note=""):
     """PR-11：人工核验结论——放行（放回重试管道）或驳回（终态作废）。"""
     init_db()
