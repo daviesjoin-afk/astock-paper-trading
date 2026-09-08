@@ -8,6 +8,7 @@ import sys
 import tempfile
 import types
 import unittest
+from contextlib import contextmanager
 from pathlib import Path
 from unittest import mock
 
@@ -20,6 +21,42 @@ import deepseek_advisor as DA  # noqa: E402
 import dual_ai_tuner as DT  # noqa: E402
 import modlens_bridge as MB  # noqa: E402
 import trade_attribution as TA  # noqa: E402
+
+
+class _FakeKlineFrame:
+    """Minimal kline frame exposing only a ``close`` mapping."""
+
+    empty = False
+
+    def __init__(self, closes):
+        self.close = closes
+
+    def __getitem__(self, key):
+        return self.close
+
+    def __contains__(self, key):
+        return key == "close"
+
+
+def _fake_kline_fetcher(closes_by_code):
+    return types.SimpleNamespace(
+        load_cached_kline=lambda code: _FakeKlineFrame(closes_by_code[code])
+    )
+
+
+@contextmanager
+def _isolated_kline_source(fake_fetcher):
+    """Serve klines only from the injected fake fetcher.
+
+    ``_load_kline_once`` prefers the production CSV cache (``data_cache/klines``).
+    On machines that hold real cached bars the production files would otherwise
+    shadow the fixture injected through the ``data_fetcher`` seam and break the
+    expected numbers.  Stubbing ``_read_cached_closes`` makes these tests
+    hermetic: they pass with or without real cached klines.
+    """
+    with mock.patch.object(TA, "_read_cached_closes", lambda code: None), \
+            mock.patch.dict(sys.modules, {"data_fetcher": fake_fetcher}):
+        yield
 
 
 class AIControlTests(unittest.TestCase):
@@ -78,17 +115,8 @@ class AIControlTests(unittest.TestCase):
 class PointInTimeTests(unittest.TestCase):
     def test_historical_quote_does_not_use_current_snapshot(self):
         target = dt.date(2026, 8, 24)
-        class FakeFrame:
-            empty = False
-            def __init__(self):
-                self.close = {dt.datetime(2026, 8, 24): 100.0}
-            def __getitem__(self, key):
-                return self.close
-            def __contains__(self, key):
-                return key == "close"
-
-        fake_fetcher = types.SimpleNamespace(load_cached_kline=lambda code: FakeFrame())
-        with mock.patch.dict(sys.modules, {"data_fetcher": fake_fetcher}):
+        fake_fetcher = _fake_kline_fetcher({"000001": {dt.datetime(2026, 8, 24): 100.0}})
+        with _isolated_kline_source(fake_fetcher):
             price, quality = TA._point_in_time_quote(
                 "000001", target,
                 {"000001": {"price": 200.0, "quote_at": "2026-08-25T10:00:00"}},
@@ -98,21 +126,12 @@ class PointInTimeTests(unittest.TestCase):
         self.assertEqual(quality, "historical_kline")
 
     def test_horizon_does_not_use_future_bars(self):
-        class FakeFrame:
-            empty = False
-            def __init__(self):
-                self.close = {
-                    dt.datetime(2026, 8, 24): 101.0,
-                    dt.datetime(2026, 8, 25): 102.0,
-                    dt.datetime(2026, 8, 26): 103.0,
-                }
-            def __getitem__(self, key):
-                return self.close
-            def __contains__(self, key):
-                return key == "close"
-
-        fake_fetcher = types.SimpleNamespace(load_cached_kline=lambda code: FakeFrame())
-        with mock.patch.dict(sys.modules, {"data_fetcher": fake_fetcher}):
+        fake_fetcher = _fake_kline_fetcher({"000001": {
+            dt.datetime(2026, 8, 24): 101.0,
+            dt.datetime(2026, 8, 25): 102.0,
+            dt.datetime(2026, 8, 26): 103.0,
+        }})
+        with _isolated_kline_source(fake_fetcher):
             result = TA._horizon_results(
                 "000001", dt.date(2026, 8, 23), 100.0,
                 dt.date(2026, 8, 25), 102.0, None,
@@ -120,20 +139,29 @@ class PointInTimeTests(unittest.TestCase):
         self.assertEqual(result["1d"]["target_date"], "2026-08-24")
         self.assertNotIn("3d", result)
 
-    def test_horizon_uses_cumulative_benchmark_return(self):
-        class FakeFrame:
-            empty = False
-            def __init__(self, closes):
-                self.close = closes
-            def __getitem__(self, key):
-                return self.close
-            def __contains__(self, key):
-                return key == "close"
+    def test_isolated_kline_source_shadows_production_csv(self):
+        # Regression guard: on hosts holding a real data_cache/klines CSV the
+        # production read path must not shadow the injected fixture.
+        production_csv = {"000001": {dt.date(2026, 8, 24): 999.0}}
+        fake_fetcher = _fake_kline_fetcher({"000001": {dt.datetime(2026, 8, 24): 100.0}})
+        with mock.patch.object(TA, "_read_cached_closes", lambda code: production_csv.get(code)):
+            with _isolated_kline_source(fake_fetcher):
+                price, quality = TA._point_in_time_quote(
+                    "000001", dt.date(2026, 8, 24),
+                    {"000001": {"price": 200.0, "quote_at": "2026-08-25T10:00:00"}},
+                    {"saved_at": "2026-08-25T10:00:00"},
+                )
+        self.assertEqual(price, 100.0)
+        self.assertEqual(quality, "historical_kline")
 
+    def test_horizon_uses_cumulative_benchmark_return(self):
         stock = {dt.datetime(2026, 8, day): 100.0 + day for day in (24, 25, 26, 27, 28)}
         benchmark = {dt.datetime(2026, 8, day): 100.0 + (day - 23) * 2 for day in (23, 24, 25, 26, 27, 28)}
-        fake_fetcher = types.SimpleNamespace(load_cached_kline=lambda code: FakeFrame(benchmark if code == TA.BENCHMARK_CACHE_KEY else stock))
-        with mock.patch.dict(sys.modules, {"data_fetcher": fake_fetcher}):
+        fake_fetcher = _fake_kline_fetcher({
+            "000001": stock,
+            TA.BENCHMARK_CACHE_KEY: benchmark,
+        })
+        with _isolated_kline_source(fake_fetcher):
             result = TA._horizon_results(
                 "000001", dt.date(2026, 8, 23), 100.0,
                 dt.date(2026, 8, 28), 105.0,
