@@ -59,6 +59,47 @@ class StrategyRiskFingerprintTests(unittest.TestCase):
         self.assertEqual("daily_close", first.data_freshness)
         self.assertEqual("medium", first.concentration_risk)
 
+    def test_disabled_declarations_are_not_positive_evidence(self):
+        # {"realtime": false} / {"stop_loss": false} disable the features, so
+        # they must not produce a realtime/high-turnover/price-stop profile.
+        result = compile_strategy_risk_fingerprint(
+            None, {"realtime": False, "stop_loss": False, "news_scan": None}
+        )
+
+        self.assertEqual("composite", result.archetype)
+        self.assertNotEqual("realtime", result.data_freshness)
+        self.assertNotEqual("immediate", result.entry_urgency)
+        self.assertNotEqual("price", result.natural_stop)
+        self.assertNotEqual("high", result.turnover)
+
+    def test_horizon_ignores_unrelated_day_keys(self):
+        # cooldown_days/lookback_days are not holding periods; the explicit
+        # 10-day horizon must win instead of the 30-day cooldown.
+        result = compile_strategy_risk_fingerprint(
+            None, {"horizon_days": 10, "cooldown_days": 30, "lookback_days": 60}
+        )
+
+        self.assertEqual("swing", result.holding_horizon)
+        self.assertEqual("weeks", result.signal_half_life)
+
+    def test_holding_range_is_classified_by_its_upper_bound(self):
+        # hold_min=1 / hold_max=8 is an 8-day swing plan; a one-day floor is
+        # not intraday evidence on a T+1 market.
+        result = compile_strategy_risk_fingerprint(None, {"hold_min": 1, "hold_max": 8})
+
+        self.assertEqual("swing", result.holding_horizon)
+        self.assertEqual("weeks", result.signal_half_life)
+
+    def test_concentration_uses_position_counts_not_percentages(self):
+        # 20 permitted positions is broad diversification even when each
+        # position is capped at 10% weight.
+        result = compile_strategy_risk_fingerprint(
+            None, {"max_positions": 20, "max_weight": 0.1, "max_drawdown": 0.15, "hold_max": 8}
+        )
+
+        self.assertEqual("low", result.concentration_risk)
+        self.assertEqual("swing", result.holding_horizon)
+
 
 if __name__ == "__main__":
     unittest.main()
