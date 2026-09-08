@@ -51,6 +51,7 @@
       <button class="module-tab settings-section-tab" role="tab" aria-selected="false" data-settings-section="risk" onclick="setSettingsSection('risk',this)"><span class="module-code">风控</span><span class="module-copy"><b>仓位与风控</b><small>共享池 · 单票 · 建仓门槛</small></span></button>
       <button class="module-tab settings-section-tab" role="tab" aria-selected="false" data-settings-section="strategy" onclick="setSettingsSection('strategy',this)"><span class="module-code">策略</span><span class="module-copy"><b>策略参数</b><small>五套模型 · 风格 · 席位</small></span></button>
       <button class="module-tab settings-section-tab" role="tab" aria-selected="false" data-settings-section="evolution" onclick="setSettingsSection('evolution',this)"><span class="module-code">AI</span><span class="module-copy"><b>AI 与自进化</b><small>接口状态 · 调度周期 · 审批</small></span></button>
+      <button class="module-tab settings-section-tab" role="tab" aria-selected="false" data-settings-section="execution" onclick="setSettingsSection('execution',this)"><span class="module-code">执行</span><span class="module-copy"><b>执行画像执行器</b><small>批量窗口 · 人工核验 · 时限</small></span></button>
     </nav>
     <div id="settingsResult" aria-live="polite"><div class="loading">正在读取统一设置…</div></div>
   </div>
@@ -65,6 +66,7 @@
     <button class="module-tab" role="tab" aria-selected="false" data-paper-view="activity" onclick="showPaperWorkspace('activity',this)"><span class="module-code">委托</span><span class="module-copy"><b>&#x59d4;&#x6258;&#x8bb0;&#x5f55;</b><small>&#x6309;&#x65e5;&#x671f;&#x4e0e;&#x7b56;&#x7565;&#x67e5;&#x770b;&#x64cd;&#x4f5c;</small></span></button>
     <button class="module-tab" role="tab" aria-selected="false" data-paper-view="history" onclick="showPaperWorkspace('history',this)"><span class="module-code">档案</span><span class="module-copy"><b>&#x4e2a;&#x80a1;&#x6863;&#x6848;</b><small>&#x5386;&#x53f2;&#x4e70;&#x5356;&#x4e0e;&#x635f;&#x76ca;&#x5f52;&#x56e0;</small></span></button>
     <button class="module-tab" role="tab" aria-selected="false" data-paper-view="risk" onclick="showPaperWorkspace('risk',this)"><span class="module-code">风控</span><span class="module-copy"><b>&#x98ce;&#x63a7;&#x4e2d;&#x5fc3;</b><small>&#x95e8;&#x7981;&#x3001;&#x98ce;&#x9669;&#x961f;&#x5217;&#x3001;&#x5ba1;&#x8ba1;</small></span></button>
+    <button class="module-tab" role="tab" aria-selected="false" data-paper-view="execution" onclick="showPaperWorkspace('execution',this)"><span class="module-code">执行</span><span class="module-copy"><b>执行画像</b><small>七档执行参数 · 批量窗口 · 人工核验</small></span></button>
   </nav>
   </div>
   <div id="paperStrategyView" class="paper-strategy-view" hidden><div class="loading">正在读取策略规则…</div></div>
@@ -116,6 +118,7 @@
     </div>
     <div id="paperRiskResult" aria-live="polite"><div class="loading">正在读取五套策略的风险状态…</div></div>
   </div>
+  <div id="paperExecutionView" class="paper-execution-view" hidden><div class="loading">正在读取执行画像与执行队列…</div></div>
 </div>
 
 <div id="p-adaptive" class="page adaptive-page">
