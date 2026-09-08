@@ -126,6 +126,12 @@ SHARED_POOL_MAX_EXPOSURE = 0.82
 # 预算份额（占共享池 NAV 比例），只抬高可下单额度，不改变
 # _price_aware_qty “金额约束仅影响下单规模”的机制，也不突破 82% 池硬上限。
 MAIN_FORCE_PRIORITY_FLOOR_PCT = 0.15
+# 分配层的声明式策略差异（PR-07）：席位上限、资金地板与自身敞口约束
+# 全部落到数据表里，由 StrategyRuntime 携带给 paper_allocation 引擎；
+# 分配与执行代码不再出现任何策略 ID 比较。不在表中的策略使用全局默认。
+ALLOCATION_SLOT_CAPS = {MAIN_FORCE_STRATEGY_ID: 3}
+ALLOCATION_PRIORITY_FLOOR_PCT = {MAIN_FORCE_STRATEGY_ID: MAIN_FORCE_PRIORITY_FLOOR_PCT}
+ALLOCATION_OWN_EXPOSURE_CAP_PCT = {"sector_rotation": 1.0}
 # 三分钟频率兼顾开盘/午后节奏与全市场双源校验耗时；09:30、13:00 仍由首轮立即触发。
 INTRADAY_INTERVAL_MINUTES = 3
 INTRADAY_WINDOWS = (("09:30", "11:25"), ("13:00", "14:55"))
@@ -7543,6 +7549,27 @@ def _entry_deployment_gate(conn, account_id, code, positions, pending_slots, cou
     }
 
 
+def _strategy_runtimes(account_ids, weights=None):
+    """把账户权重与声明式配置编译成分配引擎的 StrategyRuntime 列表（PR-07）。
+
+    任意 N 个策略：席位上限、优先级地板与自身敞口约束全部来自数据表
+    （ALLOCATION_*），不在分配代码里比较策略 ID。
+    """
+    runtimes = []
+    for account_id in account_ids:
+        weight = _num((weights or {}).get(account_id), 1.0)
+        runtimes.append(
+            PA.StrategyRuntime(
+                strategy_id=account_id,
+                base_priority=max(weight, 0.01),
+                max_positions=ALLOCATION_SLOT_CAPS.get(account_id, STRATEGY_MAX_POSITIONS),
+                priority_floor_pct=ALLOCATION_PRIORITY_FLOOR_PCT.get(account_id),
+                own_exposure_cap_pct=ALLOCATION_OWN_EXPOSURE_CAP_PCT.get(account_id),
+            )
+        )
+    return runtimes
+
+
 def _dynamic_position_limits(conn):
     """Return a versioned allocation inside the 15-slot hard cap.
 
@@ -7610,15 +7637,13 @@ def _dynamic_position_limits(conn):
     count = len(account_ids)
     baseline = sum(weights.values()) / max(count, 1)
     allocation = PA.position_limits(
-        account_ids,
-        weights,
-        baseline,
+        _strategy_runtimes(account_ids, weights),
         hard_pool_cap=hard_pool_cap,
         strategy_max_positions=STRATEGY_MAX_POSITIONS,
         strategy_min_positions=STRATEGY_MIN_POSITIONS,
         protected_slot_floor=STRATEGY_PROTECTED_SLOT_FLOOR,
         account_order={key: idx for idx, key in enumerate(ACCOUNT_SPECS)},
-        main_force_id=MAIN_FORCE_STRATEGY_ID,
+        baseline_exposure=baseline,
     )
     risk_scale = allocation["risk_scale"]
     protected_floor = allocation["protected_slot_floor"]
@@ -7704,17 +7729,15 @@ def _strategy_pool_budget(conn, account, nav, positions, quotes, market=None, ex
     # the execution path always supplies the current market gate.
     scales = market_light_scales(market_light) if market_light else None
     return PA.strategy_pool_budget(
+        _strategy_runtimes(list(weights), weights),
         account_id=account.get("id"),
         values=values,
-        weights=weights,
         pending_by_account=pending_by_account,
         pending_total=pending_total,
         nav=_num(nav),
         market_scales=scales,
         shared_pool_max_exposure=RSET.get(conn, "shared_pool_exposure_cap", SHARED_POOL_MAX_EXPOSURE),
         strategy_pool_floor_ratio=STRATEGY_POOL_FLOOR_RATIO,
-        main_force_id=MAIN_FORCE_STRATEGY_ID,
-        main_force_priority_floor_pct=MAIN_FORCE_PRIORITY_FLOOR_PCT,
     )
 
 
@@ -9149,7 +9172,7 @@ def _apply_slot_borrow(conn, account_id, upgrade, asof_day):
          or limits.get(item.get("account_id"), 0) == int(_num(item.get("limit")))),
         None,
     )
-    account_slot_cap = 3 if account_id == MAIN_FORCE_STRATEGY_ID else STRATEGY_MAX_POSITIONS
+    account_slot_cap = ALLOCATION_SLOT_CAPS.get(account_id, STRATEGY_MAX_POSITIONS)
     if donor is None or limits.get(account_id, 0) >= account_slot_cap:
         return {"allowed": False, "reason": "借位名额已被其他并发下单占用"}
     donor_id = donor["account_id"]
