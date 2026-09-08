@@ -204,6 +204,66 @@ class PaperSelectionTests(unittest.TestCase):
         data = PS.latest(strategy_id="main_force_top10")
         self.assertEqual([g["strategy_id"] for g in data["strategies"]], ["main_force_top10"])
 
+    # -- 选股链路兼容（2026-09-08 生产事故回归）---------------------------
+    def test_model_ids_within_select_whitelist(self):
+        # main._select_uncached 只放行 S.STRATEGIES ∪ S.PAPER_WEIGHTS；
+        # STRATEGY_MODEL 的模型 id 漂移出白名单会静默 error(0)。
+        import strategies as S
+        allowed = set(S.STRATEGIES) | set(S.PAPER_WEIGHTS)
+        missing = set(PS.STRATEGY_MODEL.values()) - allowed
+        self.assertEqual(missing, set(),
+                         f"模型 id 不在选股白名单内: {sorted(missing)}")
+
+    def test_non_dict_pipeline_result_is_reported_as_error(self):
+        # 防御纵深：选股链路拒绝场景返回 JSONResponse（非 dict）时，
+        # run_daily 必须给出可定位的 message，而不是 AttributeError。
+        def bad_run(model_id, topn):
+            if model_id == "one_to_two":
+                return object()  # 模拟 JSONResponse 之类的非 dict 返回
+            return _payload(_picks("6002", 1))
+
+        old = PS._run_one
+        PS._run_one = bad_run
+        try:
+            summary = PS.run_daily(topn=5, run_date="2026-09-07")
+        finally:
+            PS._run_one = old
+        errored = [s for s in summary["strategies"] if s["status"] == "error"]
+        self.assertEqual(len(errored), 1)
+        self.assertIn("选股链路返回类型异常", errored[0]["message"])
+        self.assertIn("object", errored[0]["message"])
+
+
+class SelectUncachedWhitelistTests(unittest.TestCase):
+    """直接验证 main._select_uncached 对模拟盘模型 id 的白名单行为。
+
+    2026-09-08 生产首跑：one_to_two/bottom_reversal/sentiment_pioneer 不在
+    白名单内，_select_uncached 返回 JSONResponse，run_daily 逐策略炸出
+    AttributeError → error(0)。此测试用低覆盖率门禁短路重链路，只验证
+    「id 通过白名单且返回 dict」，不触网、不依赖本地数据。
+    """
+
+    def test_paper_model_ids_return_dict_not_jsonresponse(self):
+        import main as M
+        original = M.U.coverage_report
+
+        def low_coverage():
+            return {"fresh_selection": 0, "fresh_selection_pct": 0.0,
+                    "expected_reference_date": "2026-09-07"}
+
+        M.U.coverage_report = low_coverage
+        try:
+            for model_id in sorted(set(PS.STRATEGY_MODEL.values())):
+                result = M._select_uncached(strategy=model_id, topn=5)
+                self.assertIsInstance(
+                    result, dict,
+                    f"{model_id} 返回 {type(result).__name__}，未过白名单")
+                self.assertTrue(
+                    result.get("need_init"),
+                    f"{model_id} 在无数据环境应命中 need_init 门禁")
+        finally:
+            M.U.coverage_report = original
+
 
 if __name__ == "__main__":
     unittest.main()
