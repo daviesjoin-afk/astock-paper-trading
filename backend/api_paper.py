@@ -251,6 +251,15 @@ def strategy_center():
         raise HTTPException(status_code=500, detail=f"Strategy center failed: {type(exc).__name__}") from exc
 
 
+@router.get("/execution-profiles")
+def execution_profiles():
+    """PR-12 执行画像中心：七档画像目录、账户映射与执行器视图（只读）。"""
+    try:
+        return _call_with_retry(P.execution_profile_center)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Execution profiles failed: {type(exc).__name__}") from exc
+
+
 @router.get("/execution-dispatch")
 def execution_dispatch():
     """PR-11 执行器视图：批量窗口、挂起队列与三个开关（只读）。"""
