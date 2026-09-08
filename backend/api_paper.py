@@ -251,6 +251,37 @@ def strategy_center():
         raise HTTPException(status_code=500, detail=f"Strategy center failed: {type(exc).__name__}") from exc
 
 
+@router.get("/execution-dispatch")
+def execution_dispatch():
+    """PR-11 执行器视图：批量窗口、挂起队列与三个开关（只读）。"""
+    try:
+        return _call_with_retry(P.execution_dispatch_overview)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Execution dispatch failed: {type(exc).__name__}") from exc
+
+
+@router.post("/execution-dispatch/verify")
+def execution_dispatch_verify(
+    order_id: int = Query(..., gt=0),
+    approved: bool = Query(True),
+    operator: str = Query("", max_length=64),
+    note: str = Query("", max_length=500),
+):
+    """PR-11 人工核验：放行（approved=1）进入重试管道，驳回（0）终态作废。"""
+    try:
+        result = _call_with_retry(
+            P.resolve_execution_verification, order_id, bool(approved), operator, note,
+        )
+        if not result.get("ok"):
+            raise HTTPException(status_code=409, detail=result.get("reason") or "核验失败")
+        _cclear()
+        return result
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Verification failed: {type(exc).__name__}") from exc
+
+
 @router.get("/reviews")
 def reviews():
     try:
