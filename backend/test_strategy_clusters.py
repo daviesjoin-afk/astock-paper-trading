@@ -112,6 +112,16 @@ class BudgetPenaltyTests(unittest.TestCase):
         for size, multiplier in zip((2, 4, 9), multipliers, strict=False):
             self.assertLess(multiplier, float(size))
 
+    def test_budget_multiplier_honors_the_floor(self):
+        # 64 簇：1/sqrt(64)=0.125 触发 0.3 地板 → 倍数 = 64×0.3 = 19.2，
+        # 与 size × cluster_diversification_factor 严格一致。
+        clusters = [{f"s{index}" for index in range(64)}]
+        self.assertAlmostEqual(19.2, SC.cluster_budget_multiplier(clusters), places=3)
+        self.assertAlmostEqual(
+            SC.cluster_budget_multiplier(clusters),
+            64 * SC.cluster_diversification_factor("s0", clusters), places=3,
+        )
+
 
 class WiringGuardTests(unittest.TestCase):
     @staticmethod

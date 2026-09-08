@@ -185,13 +185,17 @@ def cluster_budget_multiplier(
     *,
     floor: float = 0.3,
 ) -> float:
-    """整簇合计预算相对单策略预算的倍数 = sqrt(簇规模)（下限保护后）。
+    """整簇合计预算相对单策略预算的倍数（与分散化系数同一地板口径）。
 
-    这是"复制 N 个近似策略拿不到 N 倍额度"的直接不变式：
-    N 个同簇策略 × 各自 1/sqrt(N) 的系数 = sqrt(N) 倍合计（N=10 → 3.16）。
+    簇规模 ≤ ~11 时 = sqrt(n)；更大规模时每策略系数触底 ``floor``，
+    倍数 = n × floor。调用方据此得到的合计预算与
+    ``size × cluster_diversification_factor`` 严格一致。
     """
     if isinstance(clusters, set):
         size = max(1, len(clusters))
     else:
         size = max((len(cluster) for cluster in clusters), default=1)
-    return round(math.sqrt(max(1, size)) if size > 1 else 1.0, 4) if size > 1 else 1.0
+    if size <= 1:
+        return 1.0
+    factor = max(float(floor), 1.0 / math.sqrt(size))
+    return round(size * factor, 4)
