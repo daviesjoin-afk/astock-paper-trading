@@ -265,3 +265,157 @@ class PoolCapPropertyTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class LifecycleStageTests(unittest.TestCase):
+    def test_default_stage_is_standard_with_full_scale(self):
+        scale, stage = allocation.stage_capital_scale(_runtime("a"))
+        self.assertEqual(("standard", 1.0), (stage, scale))
+
+    def test_stage_scale_table_covers_cold_start_to_retirement(self):
+        expected = {"shadow": 0.0, "pilot": 0.25, "standard": 1.0,
+                    "mature": 1.0, "quarantined": 0.0}
+        for stage, scale in expected.items():
+            with self.subTest(stage=stage):
+                got_scale, got_stage = allocation.stage_capital_scale(
+                    _runtime("a", lifecycle_stage=stage))
+                self.assertEqual((stage, scale), (got_stage, got_scale))
+
+    def test_explicit_capital_scale_overrides_stage(self):
+        scale, stage = allocation.stage_capital_scale(
+            _runtime("a", lifecycle_stage="standard", capital_scale=0.4))
+        self.assertEqual(("standard", 0.4), (stage, scale))
+
+    def test_unknown_stage_fails_closed_as_quarantined(self):
+        scale, stage = allocation.stage_capital_scale(_runtime("a", lifecycle_stage="zzz"))
+        self.assertEqual(("quarantined", 0.0), (stage, scale))
+
+
+class CapitalEligibilityTests(unittest.TestCase):
+    def test_minimum_deployable_budget_is_one_lot(self):
+        self.assertEqual(2150.0, allocation.minimum_deployable_budget(21.5))
+        self.assertEqual(2193.0, allocation.minimum_deployable_budget(21.5, price_buffer=1.02))
+
+    def test_budget_below_one_lot_never_produces_a_fragment(self):
+        result = allocation.deployable_budget(budget_amount=2000.0, price=21.5)
+        self.assertFalse(result["allowed"])
+        self.assertEqual(0, result["lots"])
+        self.assertEqual(0.0, result["deployable_amount"])
+        self.assertEqual(2000.0, result["waiting_capital"])
+
+    def test_exact_multiple_deploys_without_waiting(self):
+        result = allocation.deployable_budget(budget_amount=4300.0, price=21.5)
+        self.assertTrue(result["allowed"])
+        self.assertEqual(2, result["lots"])
+        self.assertEqual(4300.0, result["deployable_amount"])
+        self.assertEqual(0.0, result["waiting_capital"])
+
+    def test_remainder_after_whole_lots_goes_to_waiting(self):
+        result = allocation.deployable_budget(budget_amount=5000.0, price=21.5)
+        self.assertEqual(2, result["lots"])
+        self.assertEqual(4300.0, result["deployable_amount"])
+        self.assertEqual(700.0, result["waiting_capital"])
+
+    def test_invalid_price_freezes_the_budget(self):
+        result = allocation.deployable_budget(budget_amount=5000.0, price=0)
+        self.assertFalse(result["allowed"])
+        self.assertEqual(0.0, result["deployable_amount"])
+        self.assertEqual(5000.0, result["waiting_capital"])
+
+    def test_shadow_and_quarantined_deploy_nothing(self):
+        for stage in ("shadow", "quarantined"):
+            with self.subTest(stage=stage):
+                result = allocation.deployable_budget(
+                    budget_amount=10000.0, price=21.5,
+                    capital_scale=allocation.DEFAULT_STAGE_CAPITAL_SCALE[stage])
+                self.assertEqual(0, result["lots"])
+                self.assertEqual(0.0, result["deployable_amount"])
+                # 生命周期系数为 0：既不部署、也没有等待资金（ entitlement 归零）。
+                self.assertEqual(0.0, result["waiting_capital"])
+                self.assertEqual(0.0, result["scaled_budget"])
+
+
+class AllocationPlanPropertyTests(unittest.TestCase):
+    """不变式：任意 N 个策略下 Σ deployable ≤ pool headroom，且永无碎片订单。"""
+
+    def _runtimes(self, count):
+        stages = ("standard", "pilot", "mature", "shadow", "quarantined")
+        return [
+            _runtime(
+                f"s{index}",
+                base_priority=0.2 + (index % 7) * 0.1,
+                regime_fit=0.5 + (index % 3) * 0.2,
+                confidence=0.4 + (index % 5) * 0.1,
+                health=0.3 + (index % 4) * 0.2,
+                data_quality=0.6,
+                diversification=0.7 + (index % 2) * 0.3,
+                max_positions=3 + (index % 3),
+                lifecycle_stage=stages[index % len(stages)],
+            )
+            for index in range(count)
+        ]
+
+    def test_plan_invariants_hold_for_any_strategy_count(self):
+        for count in (0, 1, 2, 5, 10, 20, 50):
+            with self.subTest(count=count):
+                runtimes = self._runtimes(count)
+                nav = 200000.0
+                values = {r.strategy_id: (i * 2711.0) % 6000.0 for i, r in enumerate(runtimes)}
+                pending = {r.strategy_id: (i * 353.0) % 800.0 for i, r in enumerate(runtimes)}
+                prices = {r.strategy_id: 8.0 + (i % 11) * 7.3 for i, r in enumerate(runtimes)}
+                plan = allocation.allocation_plan(
+                    runtimes,
+                    nav=nav,
+                    values=values,
+                    pending_by_account=pending,
+                    pending_total=sum(pending.values()),
+                    prices_by_strategy=prices,
+                    shared_pool_max_exposure=0.82,
+                    strategy_pool_floor_ratio=0.60,
+                )
+                # ① Σ deployable ≤ 池余量；
+                self.assertLessEqual(plan["total_deployable_amount"],
+                                     plan["pool_headroom_amount"] + 0.02)
+                # ② 永无碎片订单：要么 lots ≥ 1，要么 deployable == 0；
+                for row in plan["plan"]:
+                    if row["lots"] >= 1:
+                        self.assertGreater(row["deployable_amount"], 0.0)
+                    else:
+                        self.assertEqual(0.0, row["deployable_amount"])
+                        self.assertTrue(row["blocked_reason"])
+                    self.assertAlmostEqual(row["deployable_amount"] + row["waiting_capital"],
+                                           row["scaled_budget_amount"], delta=0.02)
+                # ③ waiting 与 deployable 的账目自洽；
+                scaled_total = sum(row["scaled_budget_amount"] for row in plan["plan"])
+                self.assertLessEqual(
+                    plan["total_deployable_amount"] + plan["total_waiting_capital"],
+                    scaled_total + count * 0.02 + 0.02)
+                # ④ shadow/quarantined 永远 0 部署。
+                for row in plan["plan"]:
+                    if row["lifecycle_stage"] in ("shadow", "quarantined"):
+                        self.assertEqual(0.0, row["deployable_amount"])
+
+    def test_plan_is_deterministic(self):
+        runtimes = self._runtimes(7)
+        kwargs = dict(
+            nav=150000.0,
+            values={r.strategy_id: 500.0 * (i + 1) for i, r in enumerate(runtimes)},
+            pending_by_account={r.strategy_id: 0.0 for r in runtimes},
+            pending_total=0.0,
+            prices_by_strategy={r.strategy_id: 12.0 + i for i, r in enumerate(runtimes)},
+            shared_pool_max_exposure=0.82,
+            strategy_pool_floor_ratio=0.60,
+        )
+        first = allocation.allocation_plan(runtimes, **kwargs)
+        second = allocation.allocation_plan(runtimes, **kwargs)
+        self.assertEqual(first, second)
+
+    def test_empty_plan_is_safe(self):
+        plan = allocation.allocation_plan(
+            [], nav=10000.0, values={}, pending_by_account={}, pending_total=0.0,
+            prices_by_strategy={}, shared_pool_max_exposure=0.82,
+            strategy_pool_floor_ratio=0.60,
+        )
+        self.assertEqual([], plan["plan"])
+        self.assertEqual(0.0, plan["total_deployable_amount"])
+        self.assertEqual(0.0, plan["total_waiting_capital"])
