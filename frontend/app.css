@@ -1832,3 +1832,30 @@ body.dark #p-adaptive .adaptive-shell {
   .data-validity-actions { margin-top:12px; white-space:normal; }
   .data-validity-cards { grid-template-columns:1fr 1fr; }
 }
+
+/* ─── 执行画像中心（PR-12） ─── */
+.paper-execution-view { display:grid; gap:16px; }
+.exec-panel { border:1px solid var(--border); border-radius:14px; background:var(--surface); padding:18px 20px; box-shadow:0 6px 18px rgba(20,55,40,.04); }
+.exec-panel h3 { margin:0 0 4px; }
+.exec-panel h4 { margin:18px 0 8px; font-size:14px; }
+.exec-panel > p, .exec-hint { margin:0 0 12px; color:var(--text-secondary); font-size:12px; line-height:1.6; }
+.exec-head { display:flex; justify-content:space-between; align-items:flex-start; gap:12px; flex-wrap:wrap; }
+.exec-head-state { display:flex; align-items:center; gap:10px; flex-wrap:wrap; }
+.exec-switches { display:grid; grid-template-columns:repeat(auto-fit,minmax(200px,1fr)); gap:10px; margin-top:12px; }
+.exec-switch { display:flex; justify-content:space-between; align-items:center; gap:8px; padding:10px 14px; border:1px solid var(--border-light); border-radius:10px; background:var(--th-bg); font-size:13px; }
+.exec-queue-table { width:100%; border-collapse:collapse; font-size:12.5px; }
+.exec-queue-table th, .exec-queue-table td { padding:8px 10px; border-bottom:1px solid var(--table-border); text-align:left; vertical-align:top; }
+.exec-queue-table th { background:var(--th-bg); color:var(--text-secondary); font-weight:600; white-space:nowrap; }
+.exec-queue-table td small { display:block; color:var(--text-muted); margin-top:2px; }
+.exec-queue-reason { max-width:320px; color:var(--text-secondary); }
+.exec-queue-actions { display:flex; gap:6px; white-space:nowrap; }
+.exec-queue-actions button { padding:4px 12px; font-size:12px; border-radius:6px; border:1px solid var(--primary); background:var(--primary); color:#fff; cursor:pointer; }
+.exec-queue-actions button:hover { background:var(--primary-hover); }
+.exec-queue-actions button.exec-reject { border-color:var(--border); background:var(--surface); color:var(--danger); }
+.exec-queue-actions button.exec-reject:hover { background:var(--tag-warn-bg); }
+.exec-inactive td { opacity:.55; }
+@media (max-width:760px) {
+  .exec-queue-reason { max-width:none; }
+  .exec-head { display:block; }
+  .exec-head-state { margin-top:10px; }
+}

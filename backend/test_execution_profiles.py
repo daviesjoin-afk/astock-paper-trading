@@ -145,3 +145,27 @@ class BuyOrderWiringTests(unittest.TestCase):
         # rejected 之前必须存在"限价未到 → signal 转 deferred_capacity"的分支。
         self.assertLess(before_reject.rindex("if limit_deferred:"),
                         before_reject.rindex("SET status='deferred_capacity'"))
+
+
+class ProfileCenterTests(unittest.TestCase):
+    """PR-12：执行画像中心的数据面（目录 + 账户映射 + 执行器视图）。"""
+
+    def test_center_lists_catalog_accounts_and_dispatch(self):
+        import paper_trading as paper
+
+        data = paper.execution_profile_center()
+        self.assertEqual(7, len(data["catalog"]))
+        families = {row["family"] for row in data["catalog"]}
+        self.assertEqual(
+            {"breakout", "trend", "mean_reversion", "rotation",
+             "event_driven", "flow_momentum", "composite"},
+            families,
+        )
+        accounts = {row["id"]: row for row in data["accounts"]}
+        self.assertEqual("rotation", accounts["sector_rotation"]["family"])
+        self.assertEqual("event_driven",
+                         accounts["reported_profit_breakout"]["family"])
+        self.assertTrue(accounts["sector_rotation"]["active"])
+        self.assertIn("settings", data["dispatch"])
+        self.assertIn("batch_queue", data["dispatch"])
+        self.assertIn("verification_queue", data["dispatch"])

@@ -134,7 +134,7 @@ document.querySelectorAll('.tab').forEach(function(t){
     sessionStorage.removeItem(PAPER_VIEW_KEY);
   }
   if(page==='p-paper'&&parts[1]) window._paperWorkspace=parts[1];
-  if(page==='p-settings'&&parts[1]&&['simulation','risk','strategy','evolution'].indexOf(parts[1])>=0){ window._settingsSection=parts[1]; sessionStorage.setItem(SETTINGS_SECTION_KEY,parts[1]); }
+  if(page==='p-settings'&&parts[1]&&['simulation','risk','strategy','evolution','execution'].indexOf(parts[1])>=0){ window._settingsSection=parts[1]; sessionStorage.setItem(SETTINGS_SECTION_KEY,parts[1]); }
   activatePage(page,{writeHash:false});
 }
 window.addEventListener('popstate',restoreAppNavigation);
@@ -1604,6 +1604,15 @@ function renderSettings(data){
         +'<div class="setting-control"><label>单票权重</label><input class="strategy-max-weight" type="number" min="8" max="36" step="1" value="'+Number(item.max_weight_pct||32)+'"><span class="setting-value-preview">%</span></div>'
         +'<div class="setting-control"><label>策略敞口</label><input class="strategy-max-exposure" type="number" min="35" max="96" step="1" value="'+Number(item.max_exposure_pct||90)+'"><span class="setting-value-preview">%</span></div></article>';
     }).join('')+'</div><div class="settings-actions"><button onclick="saveSettingsSection(\'strategy\')">保存策略参数</button><button class="ghost" onclick="resetSettingsSection(\'strategy\')">恢复默认</button></div></section>'+settingsPreviewHtml(data,section)+'</div>';
+  }else if(section==='execution'){
+    var exe=settings.execution||{}, exeDefaults=(data.defaults||{}).execution||{};
+    var execSwitch=function(key,label,help){ var value=(exe[key]===undefined?exeDefaults[key]:exe[key]); return '<div class="setting-row"><div class="setting-label"><b>'+riskText(label)+'</b><small>'+riskText(help)+'</small></div><div class="setting-control"><label class="settings-exec-toggle"><input id="settingExec_'+key+'" type="checkbox"'+settingsChecked(!!value)+'><span>'+(value?'开启':'关闭')+'</span></label></div></div>'; };
+    html='<div class="settings-grid"><section class="settings-panel"><h3>执行画像执行器</h3><p>控制批量窗口、人工核验与执行时限清扫三个执行器开关。关闭批量窗口后轮动委托按普通限价路径即时撮合；开启人工核验后事件画像的每笔买入都需要在「策略模拟 → 执行」页放行。</p><div class="settings-form">'
+      +execSwitch('execution_batch_gate','批量撮合窗口','轮动画像委托挂起至收盘前批量窗口统一撮合；窗口内到达的委托仍立即成交。')
+      +execSwitch('execution_verification_gate','事件人工核验','开启后事件画像的每笔买入都需人工放行；默认关闭，避免无人值守时账户停摆。')
+      +execSwitch('execution_ttl_sweep','执行时限清扫','清扫到期挂起委托：严格时限画像作废，其余自动放回重试管道。')
+      +'</div><div class="settings-actions"><button onclick="saveSettingsSection(\'execution\')">保存执行开关</button><button class="ghost" onclick="resetSettingsSection(\'execution\')">恢复默认</button></div>'
+      +'<div class="settings-note">挂起委托不占用资金与席位；所有放行/驳回都写入审计。开关立即生效，无需重启扫描。</div></section>'+settingsPreviewHtml(data,section)+'</div>';
   }else{
     var ais=ai.settings||{}; var keyMap=ai.keys||{}; var activeProvider=ais.llm_provider||'deepseek'; var activeKey=keyMap[activeProvider]||{};
     html='<div class="settings-grid"><section class="settings-panel"><h3>AI 与自进化</h3><p>AI 只生成审阅和有界候选，默认需要人工确认；API Key 只写入后端安全存储，页面和日志永远不回显明文。</p><div class="settings-form">'
@@ -1622,7 +1631,7 @@ function renderSettings(data){
   var head=$('settingsHeadState'); if(head) head.textContent='默认安全边界已加载 · 最近审计 '+(Array.isArray(data.audit)?data.audit.length:0)+' 条';
 }
 function setSettingsSection(section,button){
-  if(['simulation','risk','strategy','evolution'].indexOf(section)<0) section='simulation';
+  if(['simulation','risk','strategy','evolution','execution'].indexOf(section)<0) section='simulation';
   window._settingsSection=section; sessionStorage.setItem(SETTINGS_SECTION_KEY,section);
   document.querySelectorAll('#p-settings .settings-section-tab').forEach(function(item){var active=item.dataset.settingsSection===section;item.classList.toggle('active',active);item.setAttribute('aria-selected',active?'true':'false');});
   if(window._settingsPayload) renderSettings(window._settingsPayload);
@@ -1647,12 +1656,13 @@ function collectStrategyOverrides(){
   var result={}; document.querySelectorAll('#p-settings .strategy-setting-card').forEach(function(card){var id=card.dataset.strategyId;result[id]={style:card.querySelector('.strategy-style').value,max_positions:Number(card.querySelector('.strategy-max-positions').value),max_weight_pct:Number(card.querySelector('.strategy-max-weight').value),max_exposure_pct:Number(card.querySelector('.strategy-max-exposure').value)};}); return result;
 }
 async function saveSettingsSection(section){
-  if(!settingsConfirm('确认保存“'+({simulation:'模拟盘与资金',risk:'仓位与风控',strategy:'策略参数',evolution:'AI与自进化'}[section]||section)+'”设置？后端会校验范围并写入审计。')) return;
+  if(!settingsConfirm('确认保存“'+({simulation:'模拟盘与资金',risk:'仓位与风控',strategy:'策略参数',evolution:'AI与自进化',execution:'执行画像执行器'}[section]||section)+'”设置？后端会校验范围并写入审计。')) return;
   var payload={};
   if(section==='simulation') payload.simulation={default_starting_capital:Number($('settingDefaultCapital').value),cycle_duration_days:Number($('settingCycleDuration').value),enabled_strategies:Array.prototype.slice.call(document.querySelectorAll('.setting-strategy-enabled:checked')).map(function(item){return item.value;})};
   if(section==='risk') payload.risk={shared_pool_position_limit:Number($('settingPoolLimit').value),shared_pool_exposure_cap:Number($('settingExposureCap').value)/100,single_position_max_amount:Number($('settingSingleMax').value),minimum_entry_slot_utilization:Number($('settingSlotUtilization').value)/100};
   if(section==='strategy') payload.strategy={strategy_overrides:collectStrategyOverrides()};
-  if(section==='evolution') payload.evolution={evolution_interval_hours:Number($('settingEvolutionInterval').value)}; payload.ai=section==='evolution'?{llm_provider:$('settingAiProvider').value,llm_advisor_enabled:$('settingAiAdvisor').checked,llm_realtime_tuning_enabled:$('settingAiRealtime').checked,llm_realtime_mode:$('settingAiMode').value}:undefined;
+  if(section==='evolution') payload.evolution={evolution_interval_hours:Number($('settingEvolutionInterval').value)};
+  if(section==='execution') payload.execution={execution_batch_gate:!!($('settingExec_execution_batch_gate')||{}).checked,execution_verification_gate:!!($('settingExec_execution_verification_gate')||{}).checked,execution_ttl_sweep:!!($('settingExec_execution_ttl_sweep')||{}).checked}; payload.ai=section==='evolution'?{llm_provider:$('settingAiProvider').value,llm_advisor_enabled:$('settingAiAdvisor').checked,llm_realtime_tuning_enabled:$('settingAiRealtime').checked,llm_realtime_mode:$('settingAiMode').value}:undefined;
   try{var data=await apiPostJson('/api/settings/?confirmed=true',payload);renderSettings(data);alert('设置已保存并记录审计。');if(section==='risk'&&typeof loadPaper==='function') loadPaper({force:true});}catch(e){alert('保存失败：'+(e.message||e));}
 }
 async function resetSettingsSection(section){
@@ -1973,6 +1983,127 @@ function renderPaperStrategyCenter(d){
 function paperResearchStrategyName(id){
   return ({tq_breakout:'短线日内做T',trend_pullback:'趋势波段优选',sector_rotation:'板块轮动先锋',reported_profit_breakout:'三日策略',main_force_top10:'超强主力股'})[id]||id||'未知策略';
 }
+async function loadPaperExecution(forceRefresh){
+  var target=$('paperExecutionView');
+  if(!target) return;
+  var cached=window._paperExecutionCenterCache;
+  if(!forceRefresh&&cached){
+    renderPaperExecution(cached.data);
+    if(Date.now()-cached.at<PAPER_NAV_TTL_MS) return;
+  }else{
+    window._paperExecutionCenterCache=null;
+    target.innerHTML='<div class="loading">正在读取执行画像与执行队列…</div>';
+  }
+  try{
+    var d=await api('/api/paper/execution-profiles');
+    window._paperExecutionCenterCache={data:d,at:Date.now()};
+    renderPaperExecution(d);
+  }catch(err){
+    target.innerHTML='<div class="paper-empty">执行画像读取失败：'+riskText(err.message||err)+'<button class="ghost" style="margin-left:10px" onclick="loadPaperExecution()">重试</button></div>';
+  }
+}
+function execText(v){ return (v===null||v===undefined||v==='')?'—':riskText(String(v)); }
+function execOrderTypeLabel(v){ return v==='market'?'市价':(v==='limit'?'限价':execText(v)); }
+function execQueueRow(row,actions){
+  return '<tr>'
+    +'<td>'+execText(row.code)+'</td>'
+    +'<td>'+execText(row.name)+'</td>'
+    +'<td>'+execText(row.account_id)+'</td>'
+    +'<td>'+fmt(row.qty,0)+'</td>'
+    +'<td>'+execText(row.planned_price)+'</td>'
+    +'<td>'+execText(row.profile_label)+'</td>'
+    +'<td><span class="tag '+(row.status==='pending_verification'?'tag-warn':'tag-info')+'">'+execText(row.status)+'</span></td>'
+    +'<td class="exec-queue-reason">'+execText(row.reason)+'</td>'
+    +'<td>'+(actions?'<div class="exec-queue-actions">'
+        +'<button onclick="verifyExecutionOrder('+Number(row.order_id)+',1)">放行</button>'
+        +'<button class="exec-reject" onclick="verifyExecutionOrder('+Number(row.order_id)+',0)">驳回</button></div>':'—')+'</td>'
+    +'</tr>';
+}
+function execQueueTable(rows,emptyText,actions){
+  if(!rows||!rows.length) return '<div class="paper-empty">'+riskText(emptyText)+'</div>';
+  return '<div class="table-scroll"><table class="exec-queue-table"><thead><tr>'
+    +'<th>代码</th><th>名称</th><th>策略</th><th>股数</th><th>委托价</th><th>画像</th><th>状态</th><th>说明</th><th>操作</th>'
+    +'</tr></thead><tbody>'+rows.map(function(row){return execQueueRow(row,actions);}).join('')+'</tbody></table></div>';
+}
+function renderPaperExecution(d){
+  var target=$('paperExecutionView'); if(!target) return;
+  d=(d&&typeof d==='object')?d:{};
+  var catalog=(d.catalog||[]).map(function(p){
+    var flags=[];
+    if(p.batch) flags.push('批量窗口');
+    if(p.verification_required) flags.push('人工核验');
+    if(p.strict_ttl) flags.push('严格时限');
+    if(!flags.length) flags.push('—');
+    return '<tr><td><b>'+execText(p.family)+'</b></td>'
+      +'<td>'+execText(p.label)+'</td>'
+      +'<td>'+execText(p.urgency)+'</td>'
+      +'<td>'+execOrderTypeLabel(p.order_type)+'</td>'
+      +'<td>'+(p.limit_offset_pct===null||p.limit_offset_pct===undefined?'—':fmt(p.limit_offset_pct,1)+'%')+'</td>'
+      +'<td>'+(p.ttl_minutes===null||p.ttl_minutes===undefined?'不限':fmt(p.ttl_minutes,0)+' 分钟')+'</td>'
+      +'<td>'+riskText(flags.join(' · '))+'</td>'
+      +'</tr>';
+  }).join('');
+  var accounts=(d.accounts||[]).map(function(a){
+    var note=a.fallback_from?('未知画像 '+execText(a.fallback_from)+' 保守回落'):'';
+    return '<tr'+(a.active?'':' class="exec-inactive"')+'><td><b>'+execText(a.name)+'</b></td>'
+      +'<td>'+execText(a.id)+'</td>'
+      +'<td>'+execText(a.risk_profile)+'</td>'
+      +'<td>'+execText(a.label)+(note?'<small>（'+note+'）</small>':'')+'</td>'
+      +'<td>'+execOrderTypeLabel(a.order_type)+'</td>'
+      +'<td>'+(a.ttl_minutes===null||a.ttl_minutes===undefined?'不限':fmt(a.ttl_minutes,0)+' 分钟')+'</td>'
+      +'<td>'+(a.active?'<span class="tag tag-ok">启用中</span>':'<span class="tag">未启用</span>')+'</td>'
+      +'</tr>';
+  }).join('');
+  var dispatch=(d.dispatch||{});
+  var windows=(dispatch.windows||{});
+  var settings=(dispatch.settings||{});
+  var batchRows=dispatch.batch_queue||[];
+  var verifyRows=dispatch.verification_queue||[];
+  var windowBadge=windows.in_window
+    ? '<span class="tag tag-ok">窗口内 '+(windows.current_window?execText(windows.current_window.start)+'–'+execText(windows.current_window.end):'')+'</span>'
+    : (windows.next_window?'<span class="tag tag-info">下一窗口 '+execText(windows.next_window.start)+'–'+execText(windows.next_window.end)+'</span>':'<span class="tag">今日已无窗口</span>');
+  var switches=['batch','verification','ttl'].map(function(key){
+    var on=key==='batch'?settings.execution_batch_gate:(key==='verification'?settings.execution_verification_gate:settings.execution_ttl_sweep);
+    var label=key==='batch'?'批量撮合窗口':(key==='verification'?'事件人工核验':'执行时限清扫');
+    return '<div class="exec-switch"><span>'+riskText(label)+'</span><span class="tag '+(on?'tag-ok':'')+'">'+(on?'开启':'关闭')+'</span></div>';
+  }).join('');
+  target.innerHTML='<section class="panel exec-panel"><div class="exec-head"><div><h3>执行器开关与批量窗口</h3>'
+    +'<p>开关在「设置中心 → 执行」中调整；本页只读展示当前生效状态。</p></div>'
+    +'<div class="exec-head-state">'+windowBadge+'<button class="ghost" onclick="loadPaperExecution(true)">刷新</button></div></div>'
+    +'<div class="exec-switches">'+switches+'</div>'
+    +(batchRows.length
+      ? '<h4>批量等待队列（'+batchRows.length+'）</h4>'+execQueueTable(batchRows,'没有等待批量窗口的委托。',false)
+      : '<h4>批量等待队列</h4><div class="paper-empty">没有等待批量窗口的委托。</div>')
+    +'<h4>人工核验队列（'+verifyRows.length+'）</h4>'
+    +execQueueTable(verifyRows,'核验闸门关闭或暂无待核验委托。放行后进入重试管道，驳回则终态作废。',true)
+    +'</section>'
+    +'<section class="panel exec-panel"><h3>五套账户的执行画像映射</h3>'
+    +'<p class="exec-hint">画像按账户 risk_profile 自动选择；未识别的画像 fail-closed 回落「保守组合」。</p>'
+    +'<div class="table-scroll"><table class="exec-queue-table"><thead><tr>'
+    +'<th>策略账户</th><th>账户 ID</th><th>风险画像</th><th>执行画像</th><th>订单类型</th><th>TTL</th><th>状态</th>'
+    +'</tr></thead><tbody>'+accounts+'</tbody></table></div></section>'
+    +'<section class="panel exec-panel"><h3>七档执行画像参数</h3>'
+    +'<div class="table-scroll"><table class="exec-queue-table"><thead><tr>'
+    +'<th>画像族</th><th>名称</th><th>紧急度</th><th>订单类型</th><th>限价让价</th><th>TTL</th><th>特性</th>'
+    +'</tr></thead><tbody>'+catalog+'</tbody></table></div></section>';
+}
+async function verifyExecutionOrder(orderId,approved){
+  var verb=approved?'放行':'驳回';
+  var note='';
+  if(!approved){
+    note=window.prompt('驳回原因（可选）：')||'';
+    if(note===null) return;
+  }
+  if(!window.confirm('确认'+verb+'委托 #'+orderId+'？')) return;
+  try{
+    var query='?order_id='+Number(orderId)+'&approved='+(approved?1:0)+'&operator='+encodeURIComponent('运营台')+'&note='+encodeURIComponent(note);
+    await apiPost('/api/paper/execution-dispatch/verify'+query);
+    window._paperExecutionCenterCache=null;
+    await loadPaperExecution();
+  }catch(err){
+    window.alert('核验失败：'+(err.message||err));
+  }
+}
 function paperResearchOutcome(metric,horizon){
   if(!metric) return '<span class="paper-research-empty">等待 '+horizon+' 日观察</span>';
   return '<b class="'+pctCls(metric.avg_return_pct)+'">'+pctTxt(metric.avg_return_pct)+'</b><small>'+Number(metric.samples||0)+' 个样本 · 胜率 '+fmt(metric.win_rate_pct,1)+'%</small>';
@@ -2059,13 +2190,14 @@ async function backfillPaperResearch(button){
 }
 function showPaperWorkspace(view,button,options){
   options=options||{};
-  if(['strategy','research','portfolio','activity','history','risk'].indexOf(view)<0) view='portfolio';
-  ['strategy','research','portfolio','activity','history','risk'].forEach(function(key){ var panel=$('paper'+key.charAt(0).toUpperCase()+key.slice(1)+'View'); if(panel) panel.hidden=key!==view; });
+  var VIEWS=['strategy','research','portfolio','activity','history','risk','execution'];
+  if(VIEWS.indexOf(view)<0) view='portfolio';
+  VIEWS.forEach(function(key){ var panel=$('paper'+key.charAt(0).toUpperCase()+key.slice(1)+'View'); if(panel) panel.hidden=key!==view; });
   document.querySelectorAll('#p-paper [data-paper-view]').forEach(function(item){ var selected=item.dataset.paperView===view; item.classList.toggle('active',selected); item.setAttribute('aria-selected',selected?'true':'false'); });
   window._paperWorkspace=view;
   sessionStorage.setItem(PAPER_VIEW_KEY,view);
   if(!options.restore) history.replaceState(null,'','#paper/'+view);
-  if(view==='strategy') loadPaperStrategyCenter(); else if(view==='research') loadPaperResearchValidation(); else if(view==='risk') loadPaperRisk(false); else loadPaper();
+  if(view==='strategy') loadPaperStrategyCenter(); else if(view==='research') loadPaperResearchValidation(); else if(view==='risk') loadPaperRisk(false); else if(view==='execution') loadPaperExecution(); else loadPaper();
 }
 function applyPaperRiskAuditFilter(){
   var account=$('paperRiskAccountFilter')?$('paperRiskAccountFilter').value:'';
@@ -2568,6 +2700,7 @@ async function refreshApp(){
       if(view==='risk') await loadPaperRisk(true);
       else if(view==='strategy') await loadPaperStrategyCenter();
       else if(view==='research') await loadPaperResearchValidation();
+      else if(view==='execution') await loadPaperExecution(true);
       else await loadPaper({refresh:true});
     }else if(page==='p-select'){
       var jobs=[];
