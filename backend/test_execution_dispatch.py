@@ -35,8 +35,9 @@ def _db():
             risk_payload TEXT, created_at TEXT, executed_at TEXT, expires_at TEXT,
             cancelled_at TEXT, order_type TEXT DEFAULT 'market', origin TEXT DEFAULT 'strategy');
         CREATE TABLE paper_signals(
-            id INTEGER PRIMARY KEY AUTOINCREMENT, account_id TEXT, status TEXT,
-            reason TEXT, payload TEXT);
+            id INTEGER PRIMARY KEY AUTOINCREMENT, account_id TEXT, code TEXT,
+            signal_date TEXT, intended_date TEXT, status TEXT,
+            reason TEXT, payload TEXT, created_at TEXT);
         CREATE TABLE paper_capital_reservations(
             id INTEGER PRIMARY KEY AUTOINCREMENT, order_key TEXT, status TEXT,
             released_at TEXT);
@@ -56,8 +57,11 @@ def _order(
     code="600000",
 ):
     conn.execute(
-        "INSERT INTO paper_signals(id,account_id,status,reason,payload) VALUES(?,?,?,?,?)",
-        (signal_id, account_id, "deferred_capacity", "等待放行", "{}"),
+        """INSERT INTO paper_signals(id,account_id,code,intended_date,signal_date,
+               status,reason,payload,created_at)
+           VALUES(?,?,?,?,?,?,?,?,?)""",
+        (signal_id, account_id, code, "2026-09-08", "2026-09-08",
+         "deferred_capacity", "等待放行", "{}", "2026-09-08 10:00:00"),
     )
     cursor = conn.execute(
         """INSERT INTO paper_orders(account_id,signal_id,side,code,name,qty,planned_price,
@@ -293,6 +297,94 @@ class VerificationTests(unittest.TestCase):
         _order(conn, status=EPD.BATCH_HOLD_STATUS, signal_id=2)
         self.assertEqual(1, len(EPD.verification_queue(conn)))
         self.assertEqual(1, len(EPD.batch_queue(conn)))
+
+
+class PersistenceTests(unittest.TestCase):
+    """P1 回归：驳回与放行必须跨越"信号被日内重建"依然生效。"""
+
+    def _reject_then_recreate(self, conn):
+        order_id = _order(conn, status=EPD.VERIFICATION_HOLD_STATUS, signal_id=1,
+                          account_id="reported_profit_breakout", code="600519")
+        EPD.resolve_verification(conn, order_id, approved=False, note="证据不足")
+        # 日内引导把普通 rejected 信号 supersede 掉，并用新的 signal 行重建候选。
+        conn.execute("UPDATE paper_signals SET status='superseded' WHERE id=1")
+        conn.execute(
+            """INSERT INTO paper_signals(id,account_id,code,intended_date,signal_date,
+                   status,reason,payload,created_at)
+               VALUES(2,?,?,?,?,'pending','重新入选','{}','2026-09-08 13:00:00')""",
+            ("reported_profit_breakout", "600519", "2026-09-08", "2026-09-08"),
+        )
+        conn.commit()
+        return 2
+
+    def test_rejection_survives_candidate_regeneration(self):
+        conn = _db()
+        self._reject_then_recreate(conn)
+        self.assertTrue(EPD.is_verification_rejected(
+            conn, "reported_profit_breakout", "600519", "2026-09-08"))
+        # 重建出来的新 signal 行 payload 是空的，必须靠历史行判定。
+        plan = EPD.plan_execution_dispatch(
+            _profile("event_driven"), signal_payload={},
+            dispatch_settings={"execution_verification_gate": True},
+            verification_rejected=EPD.is_verification_rejected(
+                conn, "reported_profit_breakout", "600519", "2026-09-08"),
+        )
+        self.assertTrue(plan["blocked"])
+        self.assertEqual("none", plan["gate"])
+        self.assertIn("驳回", plan["blocked_reason"])
+
+    def test_other_codes_are_not_blocked(self):
+        conn = _db()
+        self._reject_then_recreate(conn)
+        self.assertFalse(EPD.is_verification_rejected(
+            conn, "reported_profit_breakout", "000001", "2026-09-08"))
+
+    def test_rejection_expires_on_another_day(self):
+        conn = _db()
+        self._reject_then_recreate(conn)
+        self.assertFalse(EPD.is_verification_rejected(
+            conn, "reported_profit_breakout", "600519", "2026-09-09"))
+
+    def test_batch_release_marker_is_one_use_and_same_day(self):
+        today = {"execution_batch_release": {"released": True, "at": "2026-09-08T15:20:00"}}
+        plan = EPD.plan_execution_dispatch(
+            _profile("rotation"), now=dt.datetime(2026, 9, 8, 15, 25),
+            signal_payload=today,
+        )
+        self.assertEqual("none", plan["gate"])
+        self.assertTrue(plan["batch_released"])
+
+        stale = {"execution_batch_release": {"released": True, "at": "2026-09-07T15:20:00"}}
+        plan = EPD.plan_execution_dispatch(
+            _profile("rotation"), now=dt.datetime(2026, 9, 8, 10, 5),
+            signal_payload=stale,
+        )
+        self.assertEqual("batch", plan["gate"])
+
+    def test_expired_release_writes_the_batch_marker(self):
+        conn = _db()
+        _order(conn, expires_at="2026-09-08T15:15:00")
+        EPD.run_execution_dispatch(conn, now=dt.datetime(2026, 9, 8, 15, 30))
+        payload = json.loads(_row(conn, "paper_signals", 1)["payload"] or "{}")
+        self.assertTrue(payload["execution_batch_release"]["released"])
+        # 标记写入后，同一信号在同一轮次内不会再被挂起。
+        plan = EPD.plan_execution_dispatch(
+            _profile("rotation"), now=dt.datetime(2026, 9, 8, 15, 31),
+            signal_payload=payload,
+        )
+        self.assertEqual("none", plan["gate"])
+
+    def test_approval_marker_is_recorded(self):
+        conn = _db()
+        order_id = _order(conn, status=EPD.VERIFICATION_HOLD_STATUS, signal_id=1)
+        EPD.resolve_verification(conn, order_id, approved=True, operator="运营A")
+        payload = json.loads(_row(conn, "paper_signals", 1)["payload"] or "{}")
+        self.assertTrue(payload["execution_verification"]["approved"])
+        plan = EPD.plan_execution_dispatch(
+            _profile("event_driven"), signal_payload=payload,
+            dispatch_settings={"execution_verification_gate": True},
+        )
+        self.assertEqual("none", plan["gate"])
 
 
 class OverviewTests(unittest.TestCase):
