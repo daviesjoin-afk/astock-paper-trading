@@ -124,30 +124,32 @@ def pending_symbol_amounts(conn, *, exclude_signal_id=None) -> dict[str, float]:
 
     ``exclude_signal_id`` 用于成交路径：同一信号的重试在 sizing 时点尚未
     替换旧单，排除自身后才能避免"自己挂单压低自己"的自缩循环。
+
+    只统计**可执行**的在途单：``deferred_capacity`` 与
+    ``entry_frozen_waitlist`` 是研究/等待池标记（不持现金、不占席位），
+    计入会制造幽灵敞口，把正常买单压成零或误拒。
     """
     if conn is None:
         return {}
+    pending_statuses = (
+        "'pending_limit','execution_retry','manual_execution_retry',"
+        "'awaiting_batch','pending_verification'"
+    )
     try:
         if exclude_signal_id is not None:
             rows = conn.execute(
-                """SELECT code, COALESCE(SUM(qty * COALESCE(planned_price,0)),0) AS amount
+                f"""SELECT code, COALESCE(SUM(qty * COALESCE(planned_price,0)),0) AS amount
                      FROM paper_orders
-                    WHERE side='buy' AND status IN
-                          ('pending_limit','deferred_capacity','execution_retry',
-                           'manual_execution_retry','entry_frozen_waitlist','awaiting_batch',
-                           'pending_verification')
+                    WHERE side='buy' AND status IN ({pending_statuses})
                       AND (signal_id IS NULL OR signal_id<>?)
                     GROUP BY code""",
                 (int(exclude_signal_id),),
             ).fetchall()
         else:
             rows = conn.execute(
-                """SELECT code, COALESCE(SUM(qty * COALESCE(planned_price,0)),0) AS amount
+                f"""SELECT code, COALESCE(SUM(qty * COALESCE(planned_price,0)),0) AS amount
                      FROM paper_orders
-                    WHERE side='buy' AND status IN
-                          ('pending_limit','deferred_capacity','execution_retry',
-                           'manual_execution_retry','entry_frozen_waitlist','awaiting_batch',
-                           'pending_verification')
+                    WHERE side='buy' AND status IN ({pending_statuses})
                     GROUP BY code"""
             ).fetchall()
     except sqlite3.Error:
