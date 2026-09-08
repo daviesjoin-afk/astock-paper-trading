@@ -39,6 +39,7 @@ import paper_allocation as PA
 import entry_lifecycle as ELC
 import execution_dispatch as EPD
 import portfolio_coordinator as PCO
+import strategy_clusters as SC
 import execution_profiles as EPF
 import paper_sizing as PSZ
 import order_intent as OI
@@ -7553,12 +7554,56 @@ def _entry_deployment_gate(conn, account_id, code, positions, pending_slots, cou
     }
 
 
-def _strategy_runtimes(account_ids, weights=None):
+def _strategy_cluster_profiles(conn, asof_day=None):
+    """收集各策略的相关性画像：持仓/近期信号代码与行业集合（约 14 天窗口）。
+
+    供 strategy_clusters 归簇与分散化惩罚使用；任何查询失败都只损失证据，
+    不阻塞主扫描。
+    """
+    day = _date(asof_day)
+    positions = _position_rows(conn, asof_day=day)
+    profiles = {}
+    for account_id in ACCOUNT_SPECS:
+        own = [item for item in positions if item.get("account_id") == account_id]
+        profiles[account_id] = SC.similarity_profile(
+            position_codes={str(item.get("code")) for item in own if item.get("code")},
+            industries={str(item.get("industry") or "") for item in own if item.get("industry")},
+        )
+    try:
+        rows = conn.execute(
+            """SELECT account_id,code FROM paper_signals
+                WHERE intended_date>=? AND code IS NOT NULL AND code<>''""",
+            ((day - dt.timedelta(days=14)).isoformat(),),
+        ).fetchall()
+    except sqlite3.Error:
+        rows = []
+    for row in rows:
+        account_id = str(row.get("account_id") or "")
+        if account_id in profiles and row.get("code"):
+            profiles[account_id]["signals"].add(str(row["code"]))
+    return profiles
+
+
+def _strategy_cluster_factors(conn, asof_day=None):
+    """返回 (clusters, {strategy_id: 分散化系数})；单策略簇系数 = 1.0。"""
+    profiles = _strategy_cluster_profiles(conn, asof_day)
+    clusters = SC.strategy_clusters(profiles)
+    factors = {
+        account_id: SC.cluster_diversification_factor(account_id, clusters)
+        for account_id in profiles
+    }
+    return clusters, factors
+
+
+def _strategy_runtimes(account_ids, weights=None, diversification=None):
     """把账户权重与声明式配置编译成分配引擎的 StrategyRuntime 列表（PR-07）。
 
     任意 N 个策略：席位上限、优先级地板与自身敞口约束全部来自数据表
-    （ALLOCATION_*），不在分配代码里比较策略 ID。
+    （ALLOCATION_*），不在分配代码里比较策略 ID。``diversification`` 是
+    相关.cluster 的分散化系数（PR：1/sqrt(簇规模)），近似策略聚合后拿不到
+    线性叠加的风险额度。
     """
+    diversification = diversification or {}
     runtimes = []
     for account_id in account_ids:
         weight = _num((weights or {}).get(account_id), 1.0)
@@ -7569,6 +7614,7 @@ def _strategy_runtimes(account_ids, weights=None):
                 max_positions=ALLOCATION_SLOT_CAPS.get(account_id, STRATEGY_MAX_POSITIONS),
                 priority_floor_pct=ALLOCATION_PRIORITY_FLOOR_PCT.get(account_id),
                 own_exposure_cap_pct=ALLOCATION_OWN_EXPOSURE_CAP_PCT.get(account_id),
+                diversification=_num(diversification.get(account_id), 1.0),
             )
         )
     return runtimes
@@ -7596,6 +7642,10 @@ def _dynamic_position_limits(conn):
         account_id: _risk_profile(row_map.get(account_id) or {"id": account_id})
         for account_id in account_ids
     }
+    # 相关.cluster（PR）：按信号/持仓/行业重合归簇，簇内策略乘以
+    # 1/sqrt(簇规模) 的分散化系数——复制近似策略拿不到线性叠加的风险额度。
+    clusters, cluster_factors = _strategy_cluster_factors(conn)
+    diversification = {key: cluster_factors.get(key, 1.0) for key in account_ids}
     weights = {
         account_id: max(_num(profiles[account_id].get("max_exposure")), 0.01)
         for account_id in account_ids
@@ -7612,10 +7662,12 @@ def _dynamic_position_limits(conn):
                 "max_exposure": round(weights[account_id], 6),
                 "adaptive_version": profiles[account_id].get("adaptive_version"),
                 "adaptive_candidate_id": profiles[account_id].get("adaptive_candidate_id"),
+                "cluster_diversification": diversification.get(account_id, 1.0),
             }
             for account_id in account_ids
         },
         "running_accounts": [row.get("id") for row in running_rows],
+        "cluster_version": SC.STRATEGY_CLUSTER_VERSION,
     }
     fingerprint = hashlib.sha1(_json(runtime_inputs).encode("utf-8")).hexdigest()[:12]
     allocation_key = f"{runtime_inputs['window']}:risk-{fingerprint}"
@@ -7641,7 +7693,7 @@ def _dynamic_position_limits(conn):
     count = len(account_ids)
     baseline = sum(weights.values()) / max(count, 1)
     allocation = PA.position_limits(
-        _strategy_runtimes(account_ids, weights),
+        _strategy_runtimes(account_ids, weights, diversification=diversification),
         hard_pool_cap=hard_pool_cap,
         strategy_max_positions=STRATEGY_MAX_POSITIONS,
         strategy_min_positions=STRATEGY_MIN_POSITIONS,
@@ -7732,8 +7784,13 @@ def _strategy_pool_budget(conn, account, nav, positions, quotes, market=None, ex
     # A missing market argument is used by read-only dashboard aggregation;
     # the execution path always supplies the current market gate.
     scales = market_light_scales(market_light) if market_light else None
+    # 相关.cluster：资金预算与席位分配使用同一套分散化系数。
+    _, cluster_factors = _strategy_cluster_factors(conn)
     return PA.strategy_pool_budget(
-        _strategy_runtimes(list(weights), weights),
+        _strategy_runtimes(
+            list(weights), weights,
+            diversification={key: cluster_factors.get(key, 1.0) for key in weights},
+        ),
         account_id=account.get("id"),
         values=values,
         pending_by_account=pending_by_account,
