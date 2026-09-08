@@ -84,6 +84,8 @@ ROTATION_BATCH_WINDOWS = (("14:30", "14:45"), ("14:50", "15:00"))
 
 # 信号 payload 里记录核验结论的键；放行的委托在下一轮扫描就不再被挂起。
 VERIFICATION_PAYLOAD_KEY = "execution_verification"
+# 一次性标记：批量窗口到期放行后写入，下一轮扫描绕过批量闸门。
+BATCH_RELEASE_PAYLOAD_KEY = "execution_batch_release"
 
 SETTING_KEYS = (
     "execution_batch_gate",
@@ -229,12 +231,48 @@ def _verification_state(signal_payload: Any) -> dict[str, Any]:
     return {}
 
 
+def _marker_fresh(marker: Any, now: dt.datetime) -> bool:
+    """标记只在写入当日有效；跨日重新回到画像默认行为。"""
+    if not isinstance(marker, Mapping):
+        return False
+    return str(marker.get("at") or "")[:10] == now.date().isoformat()
+
+
+def is_verification_rejected(conn, account_id, code, day=None) -> bool:
+    """该账户当日该标的是否已被人工核验驳回。
+
+    驳回只把信号标为 ``rejected`` 是不够的：日内引导会把普通 rejected
+    信号 supersede 掉，并可能用**新的 signal 行**（payload 为空）重建同一
+    候选，于是同一标的会再次进入核验队列。驳回结论因此按
+    ``账户 × 标的 × 交易日`` 持久化在信号 payload 里，重建的新行也要先查
+    历史行。
+    """
+    if conn is None or not code:
+        return False
+    target_day = str(day)[:10] if day is not None else _now().date().isoformat()
+    try:
+        rows = conn.execute(
+            """SELECT payload FROM paper_signals
+                WHERE account_id=? AND code=? AND substr(COALESCE(intended_date,created_at),1,10)=?
+                  AND payload LIKE '%execution_verification%'""",
+            (str(account_id), str(code), target_day),
+        ).fetchall()
+    except sqlite3.Error:
+        return False
+    for row in rows:
+        state = _verification_state(_signal_payload_from_row(row))
+        if state and not state.get("approved"):
+            return True
+    return False
+
+
 def plan_execution_dispatch(
     profile: Mapping[str, Any],
     *,
     now: dt.datetime | None = None,
     signal_payload: Any = None,
     dispatch_settings: Mapping[str, Any] | None = None,
+    verification_rejected: bool = False,
     windows: Sequence = ROTATION_BATCH_WINDOWS,
 ) -> dict[str, Any]:
     """按执行画像决定本笔委托是否需要挂起，以及挂起到何时。
@@ -265,10 +303,17 @@ def plan_execution_dispatch(
     status: str | None = None
     expires_at: dt.datetime | None = None
     reason: str | None = None
+    blocked = False
+    blocked_reason: str | None = None
 
     requires_verification = bool(profile.get("verification_required"))
     verification = _verification_state(signal_payload)
-    if requires_verification and flags["execution_verification_gate"] and not verification.get("approved"):
+    if requires_verification and verification_rejected:
+        # 当日已被运营驳回：直接终止本次候选，不再重复进入核验队列。
+        blocked = True
+        blocked_reason = "该标的当日已被人工核验驳回，当日不再重复提交核验"
+        explanation.append("命中当日人工核验驳回记录，候选终止")
+    elif requires_verification and flags["execution_verification_gate"] and not verification.get("approved"):
         gate = "verification"
         status = VERIFICATION_HOLD_STATUS
         reason = (
@@ -281,7 +326,17 @@ def plan_execution_dispatch(
     elif requires_verification and not flags["execution_verification_gate"]:
         explanation.append("画像要求人工核验，但核验闸门当前关闭，按普通路径执行")
 
-    if gate == "none" and bool(profile.get("batch")) and flags["execution_batch_gate"]:
+    released = _marker_fresh(
+        (signal_payload or {}).get(BATCH_RELEASE_PAYLOAD_KEY)
+        if isinstance(signal_payload, Mapping) else None,
+        moment,
+    )
+    if gate == "none" and blocked and bool(profile.get("batch")):
+        explanation.append("候选已被终止，不再评估批量闸门")
+    elif gate == "none" and bool(profile.get("batch")) and released:
+        # 一次性放行标记：批量窗口到期未撮合时写入，避免同一信号被反复挂起。
+        explanation.append("已按执行时限一次性放行，本轮不再进入批量等待")
+    elif gate == "none" and bool(profile.get("batch")) and flags["execution_batch_gate"]:
         if window_state["in_window"]:
             explanation.append(
                 f"处于批量窗口 {window_state['current_window']['start']}-"
@@ -325,6 +380,9 @@ def plan_execution_dispatch(
         "current_window": window_state["current_window"],
         "next_window": window_state["next_window"],
         "verification": verification or None,
+        "blocked": blocked,
+        "blocked_reason": blocked_reason,
+        "batch_released": released,
         "settings": {key: bool(flags[key]) for key in SETTING_KEYS},
         "explanation": explanation or ["画像无需挂起，按普通路径执行"],
         "version": EXECUTION_DISPATCH_VERSION,
@@ -416,8 +474,64 @@ def _retire_retry_rows(conn, signal_id) -> int:
     return len(rows)
 
 
-def _release_to_retry(conn, row: Mapping[str, Any], reason: str) -> None:
-    """把挂起委托放回重试管道；信号回到 pending，下一轮扫描重跑全部闸门。"""
+def _signal_payload_from_row(row: Any) -> dict[str, Any]:
+    import json
+
+    raw = row["payload"] if row is not None else None
+    if isinstance(row, Mapping):
+        raw = row.get("payload")
+    if not raw:
+        return {}
+    try:
+        parsed = json.loads(raw)
+    except (TypeError, ValueError):
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _write_signal_marker(
+    conn,
+    signal_id,
+    key: str,
+    value: Mapping[str, Any],
+    *,
+    now: dt.datetime | None = None,
+) -> None:
+    """把一次性标记写入信号 payload（信号被 supersede 后仍随行保留）。
+
+    时间戳显式取调用方传入的时钟，保证"清扫时钟"与"判定时钟"是同一个；
+    生产里两者都是真实时间。
+    """
+    if signal_id is None:
+        return
+    import json
+
+    payload = _signal_payload(conn, signal_id)
+    marker = dict(value)
+    marker["at"] = _iso(now or _now())
+    payload[key] = marker
+    try:
+        conn.execute(
+            "UPDATE paper_signals SET payload=? WHERE id=?",
+            (json.dumps(payload, ensure_ascii=False), int(signal_id)),
+        )
+    except sqlite3.Error:
+        pass
+
+
+def _release_to_retry(
+    conn,
+    row: Mapping[str, Any],
+    reason: str,
+    *,
+    release_batch: bool = False,
+    now: dt.datetime | None = None,
+) -> None:
+    """把挂起委托放回重试管道；信号回到 pending，下一轮扫描重跑全部闸门。
+
+    ``release_batch`` 用于批量窗口到期放行：写入一次性放行标记，否则同一
+    信号在收工后仍会被同一轮转画像再次挂起，形成"到期→放行→再挂起"的循环。
+    """
     order_id = int(row["id"])
     signal_id = row.get("signal_id")
     _retire_retry_rows(conn, signal_id)
@@ -425,6 +539,10 @@ def _release_to_retry(conn, row: Mapping[str, Any], reason: str) -> None:
         "UPDATE paper_orders SET status=?,reason=COALESCE(reason,'') || '；' || ? WHERE id=?",
         (RETRY_ORDER_STATUS, reason, order_id),
     )
+    if release_batch:
+        _write_signal_marker(conn, signal_id, BATCH_RELEASE_PAYLOAD_KEY, {
+            "released": True, "reason": reason,
+        }, now=now)
     if signal_id is not None:
         conn.execute(
             "UPDATE paper_signals SET status=?,reason=? WHERE id=?",
@@ -534,6 +652,7 @@ def sweep_expired_gated_orders(
             _release_to_retry(
                 conn, row,
                 "执行器时限到期未撮合，自动放行并由下一轮扫描重新过闸",
+                release_batch=True, now=moment,
             )
             summary["released"] += 1
     return summary
@@ -627,6 +746,7 @@ def resolve_verification(
     approved: bool,
     operator: str = "",
     note: str = "",
+    now: dt.datetime | None = None,
 ) -> dict[str, Any]:
     """人工核验结论：放行（放回重试管道）或驳回（终态作废）。"""
     row = conn.execute(
@@ -647,18 +767,9 @@ def resolve_verification(
         "approved": bool(approved),
         "operator": str(operator or "")[:64],
         "note": str(note or "")[:500],
-        "at": _iso(_now()),
         "order_id": int(order_id),
     }
-    payload = _signal_payload(conn, signal_id)
-    payload[VERIFICATION_PAYLOAD_KEY] = decision
-    import json
-
-    if signal_id is not None:
-        conn.execute(
-            "UPDATE paper_signals SET payload=? WHERE id=?",
-            (json.dumps(payload, ensure_ascii=False), int(signal_id)),
-        )
+    _write_signal_marker(conn, signal_id, VERIFICATION_PAYLOAD_KEY, decision, now=now)
     if approved:
         _release_to_retry(
             conn, record,

@@ -8400,6 +8400,16 @@ def _buy_order(conn, account, signal, quote, market, news, asof_day, *, all_quot
     if entry_limit["limit_price"] is not None:
         sizing["execution_limit_price"] = entry_limit["limit_price"]
     risk["execution_profile"] = exec_profile
+    # PR-11 执行器：批量窗口 / 人工核验只挂起"本可立即成交"的委托。挂起
+    # 发生在资金预占之前，因此不占额度也不占席位。驳回结论按
+    # 账户 × 标的 × 交易日 持久化，避免日内重建的候选重复进入核验队列。
+    dispatch_plan = EPD.plan_execution_dispatch(
+        exec_profile, signal_payload=payload, dispatch_settings=EPD.settings(conn),
+        verification_rejected=EPD.is_verification_rejected(
+            conn, account["id"], code, asof_day,
+        ),
+    )
+    risk["execution_dispatch"] = dispatch_plan
     amount = qty * fill_price
     fees = _commission(amount) if amount else 0.0
     sizing["one_lot_amount"] = round(LOT_SIZE * fill_price, 2)
@@ -8524,6 +8534,8 @@ def _buy_order(conn, account, signal, quote, market, news, asof_day, *, all_quot
         qty < LOT_SIZE and not hard_reasons
         and set(sizing.get("binding_constraints") or []).issubset({"cash", "weight", "exposure", "industry"})
     )
+    if dispatch_plan.get("blocked"):
+        reasons.append(str(dispatch_plan["blocked_reason"]))
     # A Q3 sample is worth recording only if every ordinary execution/risk
     # gate also passed.  It must never turn stale quotes, a hard veto or an
     # undersized order into a seemingly valid research observation.
@@ -8542,11 +8554,6 @@ def _buy_order(conn, account, signal, quote, market, news, asof_day, *, all_quot
     ))
     if limit_deferred:
         reason = f"{reason}；{entry_limit['reason']}" if reason else str(entry_limit["reason"])
-    # PR-11 执行器：批量窗口 / 人工核验只挂起"本可立即成交"的委托。挂起
-    # 发生在资金预占之前，因此不占额度也不占席位。
-    dispatch_plan = EPD.plan_execution_dispatch(
-        exec_profile, signal_payload=payload, dispatch_settings=EPD.settings(conn),
-    )
     risk["execution_dispatch"] = dispatch_plan
     dispatch_gate = dispatch_plan["gate"] if allowed else "none"
     dispatch_duplicate = None
