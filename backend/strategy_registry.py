@@ -286,6 +286,8 @@ def ensure_schema(conn):
             metadata = json.loads(row[4] or "{}")
         except (TypeError, ValueError):
             metadata = {}
+        if not isinstance(metadata, Mapping):
+            metadata = {}
         payload, canonical, checksum = _canonical_definition(
             name=row[1], implementation_key=row[2], description=row[3], metadata=metadata,
         )
@@ -304,10 +306,13 @@ def ensure_schema(conn):
             (row[0], checksum, now),
         )
         if row[5] is None:
+            metadata_json = json.dumps(
+                payload["metadata"], ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+            )
             conn.execute(
-                """UPDATE strategy_definitions SET current_version=1,current_checksum=?
+                """UPDATE strategy_definitions SET metadata=?,current_version=1,current_checksum=?
                    WHERE id=? AND current_version IS NULL""",
-                (checksum, row[0]),
+                (metadata_json, checksum, row[0]),
             )
     _seed_legacy_bindings(conn)
     return True

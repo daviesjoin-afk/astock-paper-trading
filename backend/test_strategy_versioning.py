@@ -155,6 +155,35 @@ class StrategyVersioningTests(unittest.TestCase):
         ).fetchone()
         self.assertEqual(tuple(archived), stamp)
 
+    def test_pr01_metadata_is_normalized_during_version_migration(self):
+        path = os.path.join(self.temporary.name, "pr01.sqlite3")
+        conn = sqlite3.connect(path)
+        try:
+            conn.execute(
+                """CREATE TABLE strategy_definitions (
+                    id TEXT PRIMARY KEY, name TEXT NOT NULL, origin TEXT NOT NULL,
+                    lifecycle_status TEXT NOT NULL, implementation_key TEXT NOT NULL,
+                    supports_new_cycle INTEGER NOT NULL, description TEXT NOT NULL,
+                    metadata TEXT NOT NULL, sort_order INTEGER NOT NULL,
+                    created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+                )"""
+            )
+            conn.execute(
+                """INSERT INTO strategy_definitions VALUES(
+                    'user_legacy','Legacy','user','draft','user_legacy',0,'',
+                    '{"risk": 1}',1000,'2026-09-08','2026-09-08'
+                )"""
+            )
+            registry.ensure_schema(conn)
+            self.assertEqual(
+                conn.execute(
+                    "SELECT metadata,current_version FROM strategy_definitions WHERE id='user_legacy'"
+                ).fetchone(),
+                ('{"risk":1}', 1),
+            )
+        finally:
+            conn.close()
+
 
 if __name__ == "__main__":
     unittest.main()
