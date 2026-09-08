@@ -264,9 +264,34 @@ def _boolean(value: Any, key: str) -> bool:
     raise ValueError(f"{key}必须是布尔值")
 
 
-def update(conn: sqlite3.Connection, updates: dict[str, Any], actor: str = "human-ui") -> dict[str, Any]:
+def update(conn: sqlite3.Connection, updates: dict[str, Any], actor: str = "human-ui",
+           *, risk_evidence: dict[str, Any] | None = None) -> dict[str, Any]:
     checked = validate(updates)
     current = _flat_read(conn)
+    # 非对称风险进化（PR）：strategy_overrides 的风险方向变化必须过闸——
+    # 放大需要严格证据 + 持久化观察期 + 单轮幅度上限；收紧（安全方向）直接放行。
+    # 未携带证据上下文的调用（如设置界面）只能收紧，不能放大。
+    if "strategy_overrides" in checked:
+        import asymmetric_risk as AR
+
+        evidence = risk_evidence or {}
+        evidence_count = evidence.get("evidence_count")
+        gate = AR.validate_risk_updates(
+            current["strategy_overrides"], checked["strategy_overrides"],
+            evidence_count=evidence_count, conn=conn,
+        )
+        if not gate["allowed"]:
+            # 证据达标但缺提案的放大意图：登记提案、启动观察时钟后仍拒绝本次。
+            registered = AR.ensure_proposals_registered(
+                conn, current["strategy_overrides"], checked["strategy_overrides"],
+                evidence_count=evidence_count,
+            )
+            if registered:
+                gate["violations"] = [
+                    item + "（已登记提案，观察期重新起算）" if "尚未登记" in item else item
+                    for item in gate["violations"]
+                ]
+            raise ValueError("；".join(gate["violations"]))
     now = dt.datetime.now().isoformat(timespec="seconds")
     for key, value in checked.items():
         old = current.get(key)
@@ -282,6 +307,18 @@ def update(conn: sqlite3.Connection, updates: dict[str, Any], actor: str = "huma
             (key, _json(old), _json(value), actor, now),
         )
     return read(conn)
+
+
+def apply_evolution_risk_update(conn: sqlite3.Connection, updates: dict[str, Any],
+                                evidence_count: int) -> dict[str, Any]:
+    """进化流程的风险更新入口（生产路径）。
+
+    观察期从 risk_expansion_proposals 的持久化登记时间推算——进化流程先
+    调用一次（登记提案、启动观察时钟），观察期满后携带达标证据重试即可
+    真正生效。这是唯一允许放大风险参数的调用方式。
+    """
+    return update(conn, updates, actor="evolution",
+                  risk_evidence={"evidence_count": evidence_count})
 
 
 def audit(conn: sqlite3.Connection, limit: int = 50) -> list[dict[str, Any]]:
