@@ -108,6 +108,8 @@ function activatePage(page, options){
   }
   if(page==='p-adaptive') loadAdaptive();
   if(page==='p-settings') loadSettings();
+  // 进入策略选股页（含首次加载默认落在本页）时读取一次结果，否则占位文案会一直停在“正在读取…”。
+  if(page==='p-select'&&typeof loadPaperSelection==='function') loadPaperSelection();
   if(page==='p-paper'){
     var paperTab=document.querySelector('#p-paper [data-paper-view="'+(window._paperWorkspace||'portfolio')+'"]');
     showPaperWorkspace(window._paperWorkspace||'portfolio',paperTab,{restore:true});
@@ -1026,6 +1028,17 @@ function chooseStrategy(strategyId){
 var paperStrategyFilter='';
 var paperSelectionCache=null;
 
+// 始终缓存全量五组结果，筛选只在本地做：否则第一次取到的（过滤后）响应会被
+// 后续 tab 当成完整缓存，切换策略时看到的是上一次的旧分组。
+function paperSelectionView(){
+  if(!paperSelectionCache) return null;
+  var groups=paperSelectionCache.strategies||[];
+  if(paperStrategyFilter){
+    groups=groups.filter(function(g){return g.strategy_id===paperStrategyFilter;});
+  }
+  return Object.assign({},paperSelectionCache,{strategies:groups});
+}
+
 function choosePaperStrategy(strategyId, el){
   activateStrategyWorkspace('p-select');
   paperStrategyFilter=strategyId||'';
@@ -1035,7 +1048,8 @@ function choosePaperStrategy(strategyId, el){
     x.setAttribute('aria-selected',selected?'true':'false');
   });
   // 切换只重渲染已有结果；没有缓存时才读取一次，不触发重新计算。
-  if(paperSelectionCache) renderPaperSelection(paperSelectionCache);
+  var view=paperSelectionView();
+  if(view) renderPaperSelection(view);
   else loadPaperSelection();
 }
 
@@ -1043,9 +1057,9 @@ async function loadPaperSelection(){
   var target=$('selectResult'); if(!target) return;
   target.innerHTML='<div class="loading">正在读取最近一个交易日的策略选股结果…</div>';
   try{
-    var d=await api('/api/paper-selection'+(paperStrategyFilter?'?strategy='+encodeURIComponent(paperStrategyFilter):''));
+    var d=await api('/api/paper-selection');
     paperSelectionCache=d;
-    renderPaperSelection(d);
+    renderPaperSelection(paperSelectionView()||d);
   }catch(e){ target.innerHTML='<div class="banner">读取策略选股结果失败：'+adaptiveEsc(e.message||e)+'</div>'; }
 }
 
@@ -1100,7 +1114,7 @@ async function runPaperSelection(){
   try{
     var d=await apiPost('/api/paper-selection/run?topn='+encodeURIComponent(($('selTopn')||{}).value||5)+'&confirmed=true');
     paperSelectionCache=await api('/api/paper-selection');
-    renderPaperSelection(paperSelectionCache);
+    renderPaperSelection(paperSelectionView()||paperSelectionCache);
     var done=(d.strategies||[]).map(function(s){return s.label+' '+s.status+'('+s.picks.length+')';}).join(' · ');
     if(target) target.insertAdjacentHTML('afterbegin','<div class="tag tag-ok">已重跑：'+adaptiveEsc(done)+'</div>');
   }catch(e){

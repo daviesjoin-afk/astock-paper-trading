@@ -17,6 +17,12 @@ import sys
 import paper_selection as PS
 
 
+def _is_trade_day(day) -> bool:
+    """复用统一交易日历（与 selection_runner 同一判定源）。"""
+    import main as M
+    return bool(M.U.is_trade_day(day))
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--slot", choices=["daily"], default="daily")
@@ -32,6 +38,16 @@ def main() -> int:
         return 0
 
     strategies = [item.strip() for item in str(args.strategy or "").split(",") if item.strip()]
+
+    # 调度路径（未显式指定日期/策略）遇到非交易日直接跳过：否则法定节假日也会
+    # 按当天日期落库，而「最近交易日」读取会让休市日的空结果顶掉上一个真实
+    # 交易日的结果。手工重跑（带 --date 或 --strategy）不受此限制。
+    if not args.date and not strategies:
+        today = PS._today()
+        if not _is_trade_day(today):
+            print(json.dumps({"skipped": "non_trading_day", "date": today.isoformat()},
+                             ensure_ascii=False))
+            return 0
     result = PS.run_daily(
         strategies=strategies or None,
         topn=args.topn,

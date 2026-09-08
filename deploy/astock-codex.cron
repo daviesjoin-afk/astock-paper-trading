@@ -75,9 +75,14 @@ HOME=/opt/astock-codex
 
 # 「策略选股」：模拟盘 5 套策略按评分各取 Top5，盘后 17:25 自动运行；
 # 重跑按 (交易日, 策略编号) 覆盖当天结果，同一只股票被多策略选中时分别归属。
-# 17:55 为 K 线恢复较晚时的兜底重试；两次都由 flock 保证同一时刻只跑一轮。
-25 17 * * 1-5 root flock -n /opt/astock-codex/.locks/paper-selection.lock docker exec astock-data-worker python backend/paper_selection_runner.py --slot daily --topn 5 >>/opt/astock-codex/reports/paper-selection.log 2>&1
-55 17 * * 1-5 root flock -n /opt/astock-codex/.locks/paper-selection.lock docker exec astock-data-worker python backend/paper_selection_runner.py --slot daily --topn 5 >>/opt/astock-codex/reports/paper-selection.log 2>&1
+# 17:55 为 K 线恢复较晚时的兜底重试。
+# 必须复用 resource-heavy.lock：全市场五策略扫描和历史恢复
+# (history_recovery_runner，16-22 点每 15 分钟一轮、最长 780s) 跑在同一个
+# astock-data-worker 的 650MB cgroup 里，用独立锁就会并发 → OOM 被杀。
+# -w 900 表示排队等待而不是直接失败，避免撞上恢复窗口就整天漏跑。
+# 非交易日由 paper_selection_runner 的交易日历守卫自行跳过。
+25 17 * * 1-5 root flock -w 900 /opt/astock-codex/.locks/resource-heavy.lock docker exec astock-data-worker python backend/paper_selection_runner.py --slot daily --topn 5 >>/opt/astock-codex/reports/paper-selection.log 2>&1
+55 17 * * 1-5 root flock -w 900 /opt/astock-codex/.locks/resource-heavy.lock docker exec astock-data-worker python backend/paper_selection_runner.py --slot daily --topn 5 >>/opt/astock-codex/reports/paper-selection.log 2>&1
 
 # 每日自动备份（2026-09-04 排查确认此前从未有备份任务；sqlite 在线备份不锁库）。
 # backup.sh 自带路径探测（/opt/astock-codex 或 /root/codex）与清单自校验。

@@ -113,11 +113,29 @@ def _run_one(model_id: str, topn: int):
     return M._select_uncached(strategy=model_id, topn=topn)
 
 
+_DATE_KEYS = ("historical_factor_date", "trade_date", "reference_date", "complete_cutoff")
+
+
 def _trade_date_of(result):
-    for key in ("historical_factor_date", "reference_date", "trade_date"):
-        value = str(result.get(key) or "").strip()
-        if value:
-            return value[:10]
+    """从选股返回里解析因子基准日（即本次选股对应的交易日）。
+
+    真实的 ``main._select_uncached`` 并不会在顶层放日期：它把
+    ``historical_factor_date`` 写到每只 pick 上，把 ``reference_date`` /
+    ``complete_cutoff`` 放在 ``data_quality`` 里。因此按
+    顶层 → data_quality → pick 逐级回退，保证落库时不会丢数据来源。
+    """
+    if not isinstance(result, dict):
+        return ""
+    sources = [result]
+    quality = result.get("data_quality")
+    if isinstance(quality, dict):
+        sources.append(quality)
+    sources.extend(p for p in (result.get("picks") or [])[:1] if isinstance(p, dict))
+    for source in sources:
+        for key in _DATE_KEYS:
+            value = str(source.get(key) or "").strip()
+            if value:
+                return value[:10]
     return ""
 
 
