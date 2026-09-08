@@ -38,6 +38,7 @@ import paper_quote_policy as PQP
 import paper_allocation as PA
 import entry_lifecycle as ELC
 import execution_dispatch as EPD
+import portfolio_coordinator as PCO
 import execution_profiles as EPF
 import paper_sizing as PSZ
 import order_intent as OI
@@ -8346,6 +8347,14 @@ def _buy_order(conn, account, signal, quote, market, news, asof_day, *, all_quot
         reasons.extend(risk_state["reasons"])
     profile = _risk_profile(account)
     code_value = code_values.get(code, 0.0)
+    # 组合口径（PR：cross-strategy exposure）：单票占用必须包含**所有策略**
+    # 的在途买单，否则两个策略同时买入同一标的会各自只看到已成交部分，
+    # 合计击穿单票上限。排除当前信号自身，避免重试单压低自己。
+    pending_by_symbol = PCO.pending_symbol_amounts(
+        conn, exclude_signal_id=signal.get("id"),
+    )
+    pending_same_symbol = pending_by_symbol.get(code, 0.0)
+    code_value += pending_same_symbol
     industry_value = industries.get(signal.get("industry") or "未知", 0.0)
     fill_price = price * (1 + SLIPPAGE)
     if signal_close > 0 and lim > 0:
@@ -8631,6 +8640,19 @@ def _buy_order(conn, account, signal, quote, market, news, asof_day, *, all_quot
         qty < LOT_SIZE and not hard_reasons
         and set(sizing.get("binding_constraints") or []).issubset({"cash", "weight", "exposure", "industry"})
     )
+    # 组合级单票上限（可选）：0 = 关闭。开启后按"共享池净值 × 比例"约束
+    # 所有策略对同一 symbol 的持仓 + 在途合计，新买入不能绕过聚合上限。
+    symbol_aggregate_cap_pct = _num(RSET.get(conn, "symbol_aggregate_cap_pct", 0.0))
+    if symbol_aggregate_cap_pct > 0:
+        aggregate = PCO.aggregate_exposure(
+            positions, all_quotes or {}, pending_by_symbol=pending_by_symbol,
+        )
+        symbol_check = PCO.symbol_headroom(
+            code, aggregate, cap_amount=nav * symbol_aggregate_cap_pct / 100.0,
+        )
+        risk["symbol_aggregate_check"] = symbol_check
+        if not symbol_check["allowed"]:
+            reasons.append(str(symbol_check["reason"]))
     if dispatch_plan.get("blocked"):
         reasons.append(str(dispatch_plan["blocked_reason"]))
     # A Q3 sample is worth recording only if every ordinary execution/risk
@@ -12222,6 +12244,10 @@ def _swing_scale_in(conn, account, position, quote, market, asof_day, profile, c
     """趋势/板块策略的单日一次确认加仓；始终受原有仓位和风险预算约束。"""
     if account.get("mode") == "intraday_t":
         return None, "日内做T使用专用高抛回补规则"
+    # 意图优先级（PR：intent coordinator）：P5 加仓必须让位于 P0 风控退出。
+    # 同一标的有在途卖出意图时，先让风控退出完成，绝不同时既买又卖。
+    if position["code"] in PCO.pending_risk_exit_codes(conn):
+        return None, "P0 风控退出在途，P5 确认加仓让位（intent priority）"
     addition_allowed, addition_reason = _existing_position_addition_gate(
         conn, account, position["code"], asof_day, quote=quote,
     )
@@ -12270,7 +12296,10 @@ def _swing_scale_in(conn, account, position, quote, market, asof_day, profile, c
     risk_state = _shared_risk_state(conn, account, nav, asof_day)
     if risk_state["blocked"]:
         return None, "；".join(risk_state["reasons"])
-    code_value = code_values.get(position["code"], 0.0)
+    # 加仓同样按组合口径计入所有策略的在途买单（同 symbol 聚合上限不被绕过）。
+    code_value = code_values.get(position["code"], 0.0) + PCO.pending_symbol_amounts(
+        conn, exclude_signal_id=None,
+    ).get(position["code"], 0.0)
     fill = price * (1 + SLIPPAGE)
     qty, sizing = _price_aware_qty(
         nav, shared_cash, position_value,
