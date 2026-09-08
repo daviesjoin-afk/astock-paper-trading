@@ -8,7 +8,6 @@
 from __future__ import annotations
 
 import datetime as dt
-import inspect
 import os
 import re
 import types
@@ -300,6 +299,50 @@ class CommitFillTests(_StubbedPlannerTest):
             )
         self.assertNotIn("reserve", [item[0] for item in calls])
         self.assertIn(("risk_log", "手动模拟委托通过模型门禁并成交"), calls)
+
+    def test_commit_fill_logs_each_event_exactly_once(self):
+        # 回归护栏：成交的 risk/audit 事件由 commit_fill 独占写入。
+        calls = []
+        stub = types.SimpleNamespace(
+            _assert_active_lease=lambda conn, label: None,
+            _reserve_shared_capital=lambda *args, **kwargs: (True, None),
+            _debit_shared_cash=lambda conn, value, preferred_account_id=None: None,
+            _finish_capital_reservation=lambda conn, order_id, status: None,
+            _record_lot=lambda *args, **kwargs: None,
+            _consume_available_lots=lambda conn, account_id, code, qty, day: (qty, 0.0),
+            _credit_shared_cash=lambda *args, **kwargs: None,
+            _json=lambda value: value,
+            _now=lambda: NOW,
+            _date=lambda day: day,
+            _num=lambda value, default=0.0: default if value in (None, "") else float(value),
+            _risk_log=lambda *args, **kwargs: calls.append(("risk_log",)),
+            _audit=lambda *args, **kwargs: calls.append(("audit",)),
+            _sync_positions=lambda conn, account_id, day: None,
+        )
+        plan = {
+            "side": "buy", "code": "002241", "qty": 100, "amount": 1000.0,
+            "fees": 1.0, "fill_price": 10.0, "quote_at": "2026-09-08T10:00:00",
+        }
+        with mock.patch.object(EP, "_pt", lambda: stub):
+            EP.commit_fill(
+                _FakeConn(), account={"id": "tq_breakout"}, plan=plan, order_id=11,
+                asof_day=dt.date(2026, 9, 8), reserved=False, action="strategy_buy",
+            )
+        self.assertEqual(1, [item[0] for item in calls].count("risk_log"))
+        self.assertEqual(1, [item[0] for item in calls].count("audit"))
+
+    def test_auxiliary_buy_does_not_duplicate_commit_logging(self):
+        # 成功路径的 risk/audit 由 planner 写入；调用方只保留失败分支的一次记录。
+        with open(os.path.join(BACKEND_DIR, "manual_orders.py"), "r", encoding="utf-8") as handle:
+            source = handle.read()
+        match = re.search(r"^def _commit_strategy_buy\(", source, re.M)
+        self.assertIsNotNone(match)
+        start = match.start()
+        nxt = re.search(r"^def ", source[start + 1:], re.M)
+        body = source[start:start + 1 + (nxt.start() if nxt else len(source))]
+        self.assertIn("EP.commit_fill(", body)
+        self.assertEqual(1, body.count("_risk_log("))
+        self.assertEqual(0, body.count("_audit("))
 
     def test_sell_commit_requires_the_full_available_quantity(self):
         stub = types.SimpleNamespace(

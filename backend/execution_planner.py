@@ -7,7 +7,7 @@
 ``manual_orders._manual_order_plan`` 两条链路里：同一条“共享池最后一席预留给主力”
 的规则被抄了两份，并且都以“比较账户 ID”的形式硬编码
 在执行路径上；手动委托是否走策略专属入场复核也靠比较账户 ID 判断。
-判断。结果是新增一个策略就要改执行代码，两条链路还容易各自漂移。
+结果是新增一个策略就要改执行代码，两条链路还容易各自漂移。
 
 本模块把**执行决策**集中到一处：
 
@@ -26,7 +26,6 @@
 """
 from __future__ import annotations
 
-import datetime as dt
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
@@ -387,7 +386,6 @@ def plan_entry(
     只负责“能不能下”，不负责“下多少”（数量仍由 ``paper_sizing``/``_price_aware_qty``
     在执行时决定）。返回 ``{"allowed", "reasons", "gates", "policy"}``。
     """
-    PT = _pt()
     account_id = str((account or {}).get("id") or "")
     policy = policy_for(account_id)
     reasons: list[str] = []
