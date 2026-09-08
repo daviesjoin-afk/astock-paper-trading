@@ -36,6 +36,7 @@ import paper_schema_migrations as PSM
 import paper_archive_projection as PAP
 import paper_quote_policy as PQP
 import paper_allocation as PA
+import execution_profiles as EPF
 import paper_sizing as PSZ
 import order_intent as OI
 import strategy_registry as SR
@@ -7867,6 +7868,23 @@ def _price_aware_qty(
 LIQUIDITY_PARTICIPATION_RATE = 0.05
 
 
+# PR-10：账户 → 执行画像缓存（账户 specs 进程内不变，可以安全缓存）。
+_EXECUTION_PROFILE_CACHE: dict = {}
+
+
+def _execution_profile_for_account(account_id):
+    """按账户声明的 risk_profile 取执行画像（PR-10），未声明回落保守。
+
+    第一版只用 market/limit 两种订单类型；TTL/batch/verification 作为
+    订单审计字段与延期依据，具体批量撮合/人工核验由既有 retry 机制承担。
+    """
+    cached = _EXECUTION_PROFILE_CACHE.get(account_id)
+    if cached is None:
+        cached = EPF.execution_profile_for(ACCOUNT_SPECS.get(account_id) or {})
+        _EXECUTION_PROFILE_CACHE[account_id] = cached
+    return cached
+
+
 def _quote_liquidity_cap(quote):
     """按当日成交额 × 参与率估算流动性可买金额（PR-09）。
 
@@ -8354,6 +8372,16 @@ def _buy_order(conn, account, signal, quote, market, news, asof_day, *, all_quot
     # 市场黄灯只收紧账户总仓位上限，不再把每笔数量二次打折。
     # 每笔委托仍受单票权重和单笔止损预算限制，可避免小账户因100股取整而长期空仓。
     risk["sizing"] = sizing
+    # PR-10 执行画像：按账户 risk_profile 自动选择 market/limit 与让价。
+    # 限价画像要求现价不高于让价上限，未到价则延期（execution_retry）。
+    exec_profile = _execution_profile_for_account(account["id"])
+    entry_limit = EPF.enforce_entry_limit(
+        exec_profile, fill_price, reference_price=signal_close or price,
+    )
+    limit_deferred = not entry_limit["allowed"] and not reasons
+    if entry_limit["limit_price"] is not None:
+        sizing["execution_limit_price"] = entry_limit["limit_price"]
+    risk["execution_profile"] = exec_profile
     amount = qty * fill_price
     fees = _commission(amount) if amount else 0.0
     sizing["one_lot_amount"] = round(LOT_SIZE * fill_price, 2)
@@ -8482,9 +8510,11 @@ def _buy_order(conn, account, signal, quote, market, news, asof_day, *, all_quot
     # gate also passed.  It must never turn stale quotes, a hard veto or an
     # undersized order into a seemingly valid research observation.
     q3_shadow_ready = q3_shadow and not reasons
-    allowed = not reasons and not q3_shadow_ready
+    allowed = not reasons and not q3_shadow_ready and not limit_deferred
     order_status = "filled" if allowed else (
-        "shadow_q3" if q3_shadow_ready else ("deferred_capacity" if capacity_deferred else "risk_rejected")
+        "shadow_q3" if q3_shadow_ready else (
+            STRATEGY_EXECUTION_RETRY_STATUS if limit_deferred else
+            ("deferred_capacity" if capacity_deferred else "risk_rejected"))
     )
     reason = (
         "Q3 三重强度影子候选：个股强度、实时资金和板块确认均通过；仅记录验证，不模拟买入"
@@ -8492,8 +8522,12 @@ def _buy_order(conn, account, signal, quote, market, news, asof_day, *, all_quot
         f"{q.get('tier')} 通过；按价格与风险预算计算 {qty} 股"
         + (f"；{chase_entry['reason']}" if chase_entry["allowed"] else "")
     ))
+    if limit_deferred:
+        reason = f"{reason}；{entry_limit['reason']}" if reason else str(entry_limit["reason"])
     decision_name = "approved" if allowed else (
-        "q3_shadow_candidate" if q3_shadow_ready else ("deferred_capacity" if capacity_deferred else "rejected")
+        "q3_shadow_candidate" if q3_shadow_ready else (
+            "deferred_limit" if limit_deferred else
+            ("deferred_capacity" if capacity_deferred else "rejected"))
     )
     risk = _with_decision_snapshot(
         risk, account_id=account["id"], code=code, side="buy",
@@ -8511,11 +8545,14 @@ def _buy_order(conn, account, signal, quote, market, news, asof_day, *, all_quot
     )
     cursor = conn.execute(
         """INSERT INTO paper_orders(
-           account_id,signal_id,side,code,name,qty,planned_price,filled_price,amount,
+           account_id,signal_id,side,code,name,qty,planned_price,order_type,filled_price,amount,
            fees,status,reason,risk_payload,created_at,executed_at,
            strategy_id,strategy_version,strategy_checksum)
-        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-        (account["id"], signal["id"], "buy", code, signal.get("name"), qty, price, fill_price if allowed else None,
+        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+        (account["id"], signal["id"], "buy", code, signal.get("name"), qty,
+         entry_limit["limit_price"] if entry_limit["limit_price"] is not None else price,
+         entry_limit["order_type"],
+         fill_price if allowed else None,
          amount if allowed else None, fees if allowed else None, order_status, reason,
          _json(risk), _now(), _now() if allowed else None,
          strategy_id, strategy_version, strategy_checksum),
@@ -8591,6 +8628,19 @@ def _buy_order(conn, account, signal, quote, market, news, asof_day, *, all_quot
                 deferred_reason = "金额/成本约束仅影响本次下单规模，候选保留在等待池；资金、席位或预算释放后按最新行情重新复核"
             conn.execute("UPDATE paper_signals SET status='deferred_capacity', reason=? WHERE id=?", (deferred_reason, signal["id"]))
             return {"filled": False, "deferred": True, "reason": deferred_reason}
+        if limit_deferred:
+            # PR-10：限价未到的候选必须留在复试管道里（deferred_capacity 属于
+            # ENTRY_RETRY_SIGNAL_STATUSES），下一执行窗口会重跑全部闸门；绝不能
+            # 打成终态 rejected，否则限价即使到达也无法再复核。
+            deferred_reason = str(entry_limit["reason"])
+            conn.execute(
+                "UPDATE paper_signals SET status='deferred_capacity', reason=? WHERE id=?",
+                (deferred_reason, signal["id"]),
+            )
+            return {
+                "filled": False, "deferred": True, "deferred_limit": True,
+                "reason": deferred_reason,
+            }
         conn.execute("UPDATE paper_signals SET status='rejected', reason=? WHERE id=?", (reason, signal["id"]))
         return {"filled": False, "reason": reason}
     order_id = int(cursor.lastrowid)
