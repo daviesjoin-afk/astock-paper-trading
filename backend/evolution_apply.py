@@ -23,6 +23,7 @@ from __future__ import annotations
 import datetime as dt
 import sqlite3
 import zoneinfo
+import paper_repository as PRP
 
 import evolution_adversarial as adversarial
 from adaptive_common import _json, _loads, _now
@@ -95,9 +96,8 @@ def _write_account_params(conn, account_id, params):
 
 def _audit(conn, account_id, event, detail):
     try:
-        conn.execute(
-            "INSERT INTO paper_audit(account_id,event,detail,created_at) VALUES(?,?,?,?)",
-            (str(account_id or "")[:40], str(event)[:60], _json(detail), _now()),
+        PRP.audit(
+            conn, str(account_id or "")[:40], str(event)[:60], _json(detail), _now(),
         )
     except sqlite3.Error:
         pass  # 审计失败不阻断主流程（与其它影子路径一致）

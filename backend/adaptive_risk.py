@@ -15,6 +15,7 @@ import sqlite3
 import statistics
 from collections import Counter
 from adaptive_common import _loads, _json, _clamp  # C3: 收敛重复工具函数
+import paper_repository as PRP
 from strategy_registry import labels as strategy_labels
 
 ACCOUNT_NAMES = {
@@ -1120,10 +1121,9 @@ def apply_candidate(conn, paper_db_path, candidate_id, now_fn, approved_by="cons
                 (account.get("cycle_id"), candidate["account_id"], version, account.get("style") or "adaptive-risk",
                  _json(account_params), f"自进化风控候选 {candidate_id}；{approved_by}", effective_date, now),
             )
-            paper.execute(
-                "INSERT INTO paper_audit(account_id,event,detail,created_at) VALUES(?,?,?,?)",
-                (candidate["account_id"], "adaptive_risk_applied",
-                 f"candidate={candidate_id}; version={version}; effective_at={now}; approved_by={approved_by}", now),
+            PRP.audit(
+                paper, candidate["account_id"], "adaptive_risk_applied",
+                f"candidate={candidate_id}; version={version}; effective_at={now}; approved_by={approved_by}", now,
             )
         paper.commit()
     except Exception as exc:
@@ -1268,10 +1268,9 @@ def _finish_rollback(conn, paper_db_path, candidate, payload, now_fn):
                 (account["cycle_id"], account_id, version, account["style"] or "adaptive-risk",
                  _json(previous), reason, effective_date, now),
             )
-            paper.execute(
-                "INSERT INTO paper_audit(account_id,event,detail,created_at) VALUES(?,?,?,?)",
-                (account_id, "adaptive_risk_rolled_back",
-                 f"candidate={candidate_id}; effective_at={now}; reason={reason}", now),
+            PRP.audit(
+                paper, account_id, "adaptive_risk_rolled_back",
+                f"candidate={candidate_id}; effective_at={now}; reason={reason}", now,
             )
         paper.commit()
     except Exception as exc:

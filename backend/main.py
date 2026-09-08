@@ -670,6 +670,18 @@ def strategy_definitions(
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
+
+@app.get("/api/strategy-definitions/{strategy_id}/versions")
+def strategy_definition_versions(strategy_id: str):
+    """Return immutable versions for one stable strategy identity."""
+    versions = SR.list_versions(strategy_id, db_path=P.DB_PATH)
+    if not versions:
+        raise HTTPException(status_code=404, detail="strategy definition not found")
+    return {
+        "strategy_id": strategy_id,
+        "versions": [version.to_dict() for version in versions],
+    }
+
 @app.get("/api/init/status")
 def init_status():
     st = U.get_init_state()

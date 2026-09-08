@@ -102,23 +102,27 @@ def _now():
 
 
 def _decision(conn, account_id, code, side, decision, reason, name):
+    strategy_stamp = PT._strategy_stamp(conn, account_id)
     PT._rows(conn, """
-        INSERT INTO paper_risk_decisions(account_id,code,side,decision,reason,payload,created_at)
-        VALUES (?,?,?,?,?,?,?)""", (
+        INSERT INTO paper_risk_decisions(account_id,code,side,decision,reason,payload,created_at,
+                                         strategy_id,strategy_version,strategy_checksum)
+        VALUES (?,?,?,?,?,?,?,?,?,?)""", (
         account_id, code, side, decision, reason,
         json.dumps({"name": name, "decision_note": reason}, ensure_ascii=False), _now(),
+        *strategy_stamp,
     ))
 
 
 def _order(conn, account_id, code, name, side, qty, status, reason, created_at, planned=None, filled=None):
     price = filled if filled is not None else (planned if planned is not None else 0.0)
+    strategy_stamp = PT._strategy_stamp(conn, account_id)
     cur = conn.execute(
-        "INSERT INTO paper_orders(account_id,side,code,name,qty,planned_price,filled_price,amount,fees,status,reason,risk_payload,created_at,executed_at) "
-        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        "INSERT INTO paper_orders(account_id,side,code,name,qty,planned_price,filled_price,amount,fees,status,reason,risk_payload,created_at,executed_at,strategy_id,strategy_version,strategy_checksum) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         (account_id, side, code, name, qty,
          planned if planned is not None else price, filled, round(price * qty, 2),
          round(price * qty * 0.0003, 2), status, reason, "{}", created_at,
-         created_at if status == "filled" else None),
+         created_at if status == "filled" else None, *strategy_stamp),
     )
     return cur.lastrowid
 

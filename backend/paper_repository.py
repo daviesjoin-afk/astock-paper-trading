@@ -6,6 +6,8 @@
 """
 from __future__ import annotations
 
+import strategy_registry as SR
+
 
 def rows(conn, sql, params=()):
     """执行查询并把 sqlite Row 转成普通字典，保持旧返回形状。"""
@@ -14,9 +16,29 @@ def rows(conn, sql, params=()):
 
 def audit(conn, account_id, event, detail, created_at):
     """写入一条结构化审计事件。"""
+    columns = {
+        str(row[1]) for row in conn.execute("PRAGMA table_info(paper_audit)").fetchall()
+    }
+    stamp_columns = {"strategy_id", "strategy_version", "strategy_checksum"}
+    if not stamp_columns.issubset(columns):
+        # Compatibility for focused unit-test fixtures created with the old
+        # four-column audit table. The migrated application schema always
+        # takes the stamped branch below.
+        conn.execute(
+            "INSERT INTO paper_audit(account_id,event,detail,created_at) VALUES(?,?,?,?)",
+            (account_id, event, detail, created_at),
+        )
+        return
+    strategy_id, strategy_version, strategy_checksum = SR.stamp_for_account(
+        conn, account_id,
+    )
     conn.execute(
-        "INSERT INTO paper_audit(account_id,event,detail,created_at) VALUES(?,?,?,?)",
-        (account_id, event, detail, created_at),
+        """INSERT INTO paper_audit(
+               account_id,event,detail,created_at,
+               strategy_id,strategy_version,strategy_checksum)
+           VALUES(?,?,?,?,?,?,?)""",
+        (account_id, event, detail, created_at,
+         strategy_id, strategy_version, strategy_checksum),
     )
 
 
