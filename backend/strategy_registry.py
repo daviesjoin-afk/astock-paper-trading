@@ -673,8 +673,16 @@ def create_user_definition(conn, strategy_id, name, *, implementation_key="",
 
 
 def save_definition(conn, strategy_id, changes, *, expected_version=None,
-                    actor="system", change_note=""):
-    """Append a new immutable version and atomically advance the head."""
+                    actor="system", change_note="",
+                    risk_evidence=None, challenger_win=False):
+    """Append a new immutable version and atomically advance the head.
+
+    PR-33：``dsl_ast`` 里声明式参数的**风险方向变化**必须经过非对称风险门
+    （收紧放行 / 放大需 evidence + 观察期 + 单轮上限 + Challenger 胜出）。
+    这是所有策略定义写入（人工 API / 自进化 / 晋升）的唯一落库口，
+    因此不提供任何绕过开关；``risk_evidence`` 与 ``challenger_win`` 由
+    调用方如实申报，缺失即按 fail-closed 处理（只允许收紧）。
+    """
     ensure_schema(conn)
     current = get_version(strategy_id, conn=conn)
     if current is None:
@@ -682,6 +690,14 @@ def save_definition(conn, strategy_id, changes, *, expected_version=None,
     if expected_version is not None and current.version != int(expected_version):
         raise ValueError(
             f"strategy version changed: expected v{expected_version}, found v{current.version}"
+        )
+    if "dsl_ast" in (changes or {}):
+        import asymmetric_risk as AR
+
+        AR.guard_definition_change(
+            conn, str(strategy_id),
+            (current.definition or {}).get("dsl_ast"), changes["dsl_ast"],
+            evidence_count=risk_evidence, challenger_win=challenger_win, actor=actor,
         )
     invalid = set(changes or {}) - set(_VERSIONED_FIELDS)
     if invalid:

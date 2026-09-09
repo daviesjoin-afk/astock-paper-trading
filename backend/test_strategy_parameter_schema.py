@@ -1,4 +1,5 @@
 import copy
+import datetime as dt
 import os
 import sqlite3
 import sys
@@ -120,8 +121,9 @@ class StrategyParameterRuntimeTests(unittest.TestCase):
 
     def test_evolution_entrypoint_creates_a_real_strategy_definition_version(self):
         before = runtime.get_context(self.conn, "parameterized_alpha", settings_rev="1")
+        # ma_period 声明 lower_is_riskier → 20 → 21 是收紧方向，快速放行。
         result = evolution.adjust_strategy_dsl_parameters(
-            self.conn, "parameterized_alpha", {"ma_period": 19}, evidence_count=10,
+            self.conn, "parameterized_alpha", {"ma_period": 21}, evidence_count=10,
         )
         after = runtime.get_context(self.conn, "parameterized_alpha", settings_rev="1")
 
@@ -129,9 +131,48 @@ class StrategyParameterRuntimeTests(unittest.TestCase):
         self.assertEqual(2, result["version"])
         self.assertEqual(1, before.version)
         self.assertEqual(2, after.version)
-        self.assertEqual(19, after.parameter_schema.parameters[0].value)
+        self.assertEqual(21, after.parameter_schema.parameters[0].value)
         self.assertEqual(20, registry.get_version("parameterized_alpha", 1, conn=self.conn)
                          .definition["dsl_ast"]["rule"]["right"]["window"]["value"])
+
+    def test_evolution_cannot_expand_a_risk_direction_parameter(self):
+        """PR-33：AI/自进化路径放大风险参数必须先过非对称门（默认无权放大）。"""
+        with self.assertRaises(ValueError) as ctx:
+            evolution.adjust_strategy_dsl_parameters(
+                self.conn, "parameterized_alpha", {"ma_period": 19}, evidence_count=10,
+            )
+        self.assertIn("风险放大证据不足", str(ctx.exception))
+        # 未生效：版本仍然是 1。
+        self.assertEqual(1, runtime.get_context(
+            self.conn, "parameterized_alpha", settings_rev="1").version)
+
+    def test_expansion_lands_only_with_evidence_observation_and_challenger_win(self):
+        import asymmetric_risk as AR
+
+        AR.register_proposal(self.conn, "parameterized_alpha", "risk_per_trade",
+                             0.01, 0.012, evidence_count=30, actor="test")
+        self.conn.execute(
+            "UPDATE risk_expansion_proposals SET proposed_at=? WHERE strategy_id=?",
+            ((dt.datetime.now() - dt.timedelta(days=12)).isoformat(timespec="seconds"),
+             "parameterized_alpha"),
+        )
+        self.conn.commit()
+        with self.assertRaises(ValueError) as ctx:
+            # 观察期已满，但没有 Challenger 胜出 → 仍然拒绝。
+            evolution.adjust_strategy_dsl_parameters(
+                self.conn, "parameterized_alpha", {"risk_per_trade": 0.012},
+                evidence_count=30,
+            )
+        self.assertIn("Challenger 胜出", str(ctx.exception))
+        result = evolution.adjust_strategy_dsl_parameters(
+            self.conn, "parameterized_alpha", {"risk_per_trade": 0.012},
+            evidence_count=30, challenger_win=True,
+        )
+        self.assertTrue(result["adjusted"])
+        statuses = [row[0] for row in self.conn.execute(
+            "SELECT status FROM risk_expansion_proposals WHERE strategy_id=?",
+            ("parameterized_alpha",)).fetchall()]
+        self.assertEqual(["promoted"], statuses)
 
 
 if __name__ == "__main__":

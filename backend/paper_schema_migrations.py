@@ -230,3 +230,15 @@ def ensure_ignition_shadow_table(conn):
         return True
     except Exception:
         return False
+
+
+def ensure_proposal_lifecycle_columns(conn):
+    """PR-33：风险放大提案的生命周期列（resolved_at/resolved_by/note，幂等）。"""
+    import asymmetric_risk as AR
+
+    try:
+        AR.ensure_proposals_table(conn)
+        AR.ensure_proposal_lifecycle_columns(conn)
+        return True
+    except Exception:
+        return False
