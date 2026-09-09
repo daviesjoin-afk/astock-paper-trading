@@ -8191,7 +8191,6 @@ def strategy_allocation_explain():
         strategies = []
         for account_id in participating:
             account_row = rows_map.get(account_id) or {"id": account_id}
-            profile = _risk_profile(account_row)
             weights = _strategy_pool_weights(conn, list(rows_map.values()), {
                 row_id: _risk_profile(row) for row_id, row in rows_map.items()})
             runtimes = _strategy_runtimes(
