@@ -62,6 +62,7 @@ def _manual_order_plan(
         RSET,
         SHARED_POOL_MAX_EXPOSURE,
         SLIPPAGE,
+        _spec_for,
         STAMP_SELL,
         _asset_type,
         _commission,
@@ -173,7 +174,11 @@ def _manual_order_plan(
     count_budget = _dynamic_position_limits(conn)
     position_limit = max(
         1,
-        int(count_budget["limits"].get(account_id, (ACCOUNT_SPECS.get(account_id) or {}).get("max_positions", 5))),
+        # PR-39：内置账户保持原口径；用户策略账户走 _spec_for 派生，
+        # 不再静默退回硬编码的 5。
+        int(count_budget["limits"].get(
+            account_id, (ACCOUNT_SPECS.get(account_id) or _spec_for(account_id, conn=conn)).get("max_positions", 5)
+        )),
     )
     pool_open_positions = {
         (str(item.get("account_id")), str(item.get("code"))) for item in positions
@@ -287,7 +292,9 @@ def _manual_order_plan(
         industry_value = industries.get(plan["industry"], 0.0)
         safe_qty, sizing = _price_aware_qty(
             nav, shared_cash, position_value, industry_value, code_value,
-            fill_reference * (1 + SLIPPAGE), ACCOUNT_SPECS[account_id]["hard_stop"], profile,
+            # PR-39：用户策略账户不在 ACCOUNT_SPECS 里，直接下标会 KeyError；
+            # 统一走 paper_trading._spec_for（内置 → 表，用户 → RuntimeContext）。
+            fill_reference * (1 + SLIPPAGE), _spec_for(account_id, conn=conn)["hard_stop"], profile,
             exposure_cap=RSET.get(conn, "shared_pool_exposure_cap", SHARED_POOL_MAX_EXPOSURE),
             max_exposure_cap=RSET.get(conn, "shared_pool_exposure_cap", SHARED_POOL_MAX_EXPOSURE),
             strategy_position_value=strategy_budget["current_amount"],
