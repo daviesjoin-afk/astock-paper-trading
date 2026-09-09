@@ -46,6 +46,8 @@ DEFAULTS = {
     "execution_ttl_sweep": True,
     # 组合级单票上限（占共享池净值百分比）；0 = 关闭（按策略权重各自约束）。
     "symbol_aggregate_cap_pct": 0.0,
+    # PR-30 组合级主题（theme）聚合上限（占共享池净值百分比）；0 = 关闭。
+    "theme_aggregate_cap_pct": 0.0,
 }
 
 SETTING_GROUPS = {
@@ -53,7 +55,7 @@ SETTING_GROUPS = {
     "risk": (
         "shared_pool_position_limit", "shared_pool_exposure_cap",
         "single_position_max_amount", "minimum_entry_slot_utilization",
-        "symbol_aggregate_cap_pct",
+        "symbol_aggregate_cap_pct", "theme_aggregate_cap_pct",
     ),
     "strategy": ("strategy_overrides",),
     "evolution": ("evolution_interval_hours",),
@@ -74,6 +76,7 @@ METADATA = {
     "execution_verification_gate": {"label": "事件人工核验", "apply_mode": "immediate", "recommended": False, "description": "开启后事件画像的每笔买入都需人工放行；关闭时按普通限价路径执行。"},
     "execution_ttl_sweep": {"label": "执行时限清扫", "apply_mode": "immediate", "recommended": True, "description": "清扫到期挂起委托：严格时限画像作废，其余自动放回重试管道。"},
     "symbol_aggregate_cap_pct": {"label": "组合级单票上限", "unit": "%", "apply_mode": "immediate", "recommended": 0, "description": "所有策略对同一标的的持仓+在途合计占共享池净值上限；0 表示关闭（仅按各策略权重约束）。"},
+    "theme_aggregate_cap_pct": {"label": "组合级主题上限", "unit": "%", "apply_mode": "immediate", "recommended": 0, "description": "所有策略对同一主题（行业聚合组）的持仓+在途合计占共享池净值上限；0 表示关闭。"},
 }
 
 
@@ -286,6 +289,8 @@ def validate(updates: dict[str, Any], *, conn: sqlite3.Connection | None = None)
         checked["minimum_entry_slot_utilization"] = _number(updates["minimum_entry_slot_utilization"], "最小建仓席位利用率", 0.30, 0.80)
     if "symbol_aggregate_cap_pct" in updates:
         checked["symbol_aggregate_cap_pct"] = _number(updates["symbol_aggregate_cap_pct"], "组合级单票上限", 0, 25)
+    if "theme_aggregate_cap_pct" in updates:
+        checked["theme_aggregate_cap_pct"] = _number(updates["theme_aggregate_cap_pct"], "组合级主题上限", 0, 40)
     if "evolution_interval_hours" in updates:
         checked["evolution_interval_hours"] = _number(updates["evolution_interval_hours"], "自进化周期", 1, 168, integer=True)
     if "strategy_overrides" in updates:
