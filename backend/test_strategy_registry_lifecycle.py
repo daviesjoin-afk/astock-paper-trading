@@ -61,6 +61,8 @@ class StrategyDefinitionLifecycleTests(unittest.TestCase):
     def test_user_definition_can_be_queried_and_follows_lifecycle(self):
         created = registry.create_user_definition(
             self.conn, "user_momentum", "User Momentum", actor="unit-test",
+            dsl_ast={"op": "gt", "left": {"op": "field", "name": "close"},
+                     "right": {"op": "indicator", "name": "ma", "window": 20}},
         )
         self.assertEqual((created.origin, created.status), ("user", "draft"))
         validated = registry.transition(
@@ -72,8 +74,8 @@ class StrategyDefinitionLifecycleTests(unittest.TestCase):
             actor="unit-test",
         )
         self.assertEqual(validated.status, "validated")
-        self.assertFalse(active.supports_new_cycle)
-        self.assertNotIn(created.id, registry.active_ids(conn=self.conn))
+        self.assertTrue(active.supports_new_cycle)
+        self.assertIn(created.id, registry.active_ids(conn=self.conn))
         self.assertEqual(len(registry.lifecycle_events(self.conn, created.id)), 3)
 
     def test_invalid_transition_is_rejected(self):
