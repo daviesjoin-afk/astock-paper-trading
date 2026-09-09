@@ -15258,7 +15258,7 @@ def _create_cycle(conn, capital, status="paused", reason="新建模拟周期", d
         duration_days = int(RSET.get(conn, "cycle_duration_days", 0) or 0)
     if enabled_strategies is None:
         enabled_strategies = RSET.enabled_strategies(conn)
-    checked = RSET.validate({"cycle_duration_days": duration_days, "enabled_strategies": list(enabled_strategies)})
+    checked = RSET.validate({"cycle_duration_days": duration_days, "enabled_strategies": list(enabled_strategies)}, conn=conn)
     duration_days = checked["cycle_duration_days"]
     eligible_ids = frozenset(SR.active_ids(conn=conn))
     enabled_strategies = tuple(
