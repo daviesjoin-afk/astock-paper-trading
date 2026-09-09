@@ -147,25 +147,14 @@ INTRADAY_WINDOWS = (("09:30", "11:25"), ("13:00", "14:55"))
 # 开盘事件是共享执行引擎，五套策略只通过各自的策略画像决定阈值和仓位比例。
 # 这样既能在 09:30/09:31 抓住冲高回落，也不会把趋势/轮动策略改造成追涨策略。
 OPENING_EVENT_CLOCKS = {"09:30", "09:31", "13:00"}
-# PR-37：开盘事件 EntryPolicy 表已移至 strategy_policies（声明式画像模块），
-# 经 SPOL.opening_event_policy() 访问；未声明账户 fail-closed（引擎不介入）。
+# PR-37/PR-41：策略键控的声明式画像表已全部移至 strategy_policies
+# （EntryPolicy / ReviewPolicy / CooldownPolicy / RotationPolicy /
+# RecoveryPolicy / EntryEconomicsPolicy），经 SPOL 访问器读取；本引擎
+# 只保留与策略无关的全局阈值（下方 POSITION_REVIEW_SMALL_PCT 等）。
 # Concentration is a quality gate, not a crude fixed position-count limit.
 # A small holding is retained when its quality is high; only a weak, low-impact
 # holding can be rotated out automatically.  This avoids replacing one bad
 # rule (27 tiny lots) with another (blindly capping positions).
-# Active replacement needs a strategy-specific observation window. A single
-# two-day constant made the fast sector-rotation account behave like the trend
-# account: a sellable weak holding could occupy the last slot while a clearly
-# stronger live candidate waited. T+1 remains the first gate, so a zero-day
-# rotation window never makes same-day bought shares sellable.
-POSITION_REVIEW_MIN_HOLD_DAYS = 2  # conservative fallback for unknown accounts
-POSITION_REVIEW_MIN_HOLD_DAYS_BY_STRATEGY = {
-    "tq_breakout": 1,
-    "trend_pullback": 2,
-    "sector_rotation": 0,
-    NEW_STRATEGY_ID: 1,
-    MAIN_FORCE_STRATEGY_ID: 1,
-}
 POSITION_REVIEW_SMALL_PCT = 0.0125
 POSITION_REVIEW_EXIT_SCORE = 38.0
 POSITION_REVIEW_REPLACE_SCORE = 52.0
@@ -181,10 +170,8 @@ POSITION_ROTATION_MAX_PER_STRATEGY_DAY = 2
 POSITION_ADD_MIN_SCORE = 60.0
 POSITION_REVIEW_MAX_SELLS_PER_RUN = 3
 POSITION_REVIEW_BLOCKED_RETRY_MINUTES = 15
-# 短线日内做T的低额委托经常被最低佣金、卖出印花税和双向滑点吞掉。
-# 这不是提高仓位上限，而是拒绝“理论有收益、成本后没有意义”的碎单。
-TQ_MIN_EFFECTIVE_ENTRY_AMOUNT = 4_000.0
-TQ_MIN_EXPECTED_EDGE_PCT = 0.008
+# PR-41：TQ 碎单经济性阈值（TQ_MIN_EFFECTIVE_ENTRY_AMOUNT /
+# TQ_MIN_EXPECTED_EDGE_PCT）已迁至 strategy_policies.EntryEconomicsPolicy。
 # Every strategy has its own candidate queue.  A structural rejection occupies
 # no shared/global blacklist: it only yields the relevant strategy's limited
 # live-review slots to deeper candidates for a short period.
@@ -196,13 +183,6 @@ TQ_MIN_EXPECTED_EDGE_PCT = 0.008
 # local: an intraday T setup may recover quickly, while a quality/trend setup
 # must wait for more meaningful structure change.  Existing holdings, exits,
 # source errors and capacity/waitlist states are never cooled down.
-RISK_REJECT_COOLDOWN_AFTER_TWO_MINUTES = {
-    "tq_breakout": 30,
-    "trend_pullback": 75,
-    "sector_rotation": 45,
-    NEW_STRATEGY_ID: 90,
-    MAIN_FORCE_STRATEGY_ID: 45,
-}
 RISK_REJECT_COOLDOWN_MAX_MINUTES = 240
 RISK_REJECT_COOLDOWN_MAX_SAMPLES = 8
 PERMISSION_SCOPE_EXIT_MAX_PER_STRATEGY_DAY = 1
@@ -214,14 +194,9 @@ PERMISSION_SCOPE_EXIT_RATIO = 1.0 / 3.0
 # Protective exits are not the same as tactical profit-taking.  A protective
 # exit may earn one controlled recovery observation path; it must never turn
 # into an immediate chase or bypass the ordinary entry gates.
-RECOVERY_WATCH_STATUS = "recovery_watch"
-RECOVERY_POLICIES = {
-    "tq_breakout": {"min_scans": 2, "cooldown_minutes": 15, "reclaim_pct": 0.005, "max_days": 1},
-    "trend_pullback": {"min_scans": 2, "cooldown_minutes": 60, "reclaim_pct": 0.008, "max_days": 3},
-    "sector_rotation": {"min_scans": 3, "cooldown_minutes": 60, "reclaim_pct": 0.010, "max_days": 2},
-    NEW_STRATEGY_ID: {"min_scans": 2, "cooldown_minutes": 45, "reclaim_pct": 0.008, "max_days": 2},
-    MAIN_FORCE_STRATEGY_ID: {"min_scans": 2, "cooldown_minutes": 45, "reclaim_pct": 0.010, "max_days": 2},
-}
+# PR-41：RECOVERY_WATCH_STATUS / RECOVERY_POLICIES 声明源已移至
+# strategy_policies（RecoveryPolicy），此处仅保留引用别名。
+RECOVERY_WATCH_STATUS = SPOL.RECOVERY_WATCH_STATUS
 PROTECTIVE_EXIT_CLASSES = {"hard_stop", "trailing_stop", "max_hold", "downside_guard"}
 
 # Entry capacity is slot-first.  Strategy/pool amount budgets and small-order
@@ -3225,7 +3200,7 @@ def _volatility_shadow(code, asof_day, price=None):
 
 
 def _recovery_policy(account_id):
-    return dict(RECOVERY_POLICIES.get(account_id, RECOVERY_POLICIES["trend_pullback"]))
+    return SPOL.recovery_policy(account_id)
 
 
 def _recovery_watches(conn, account_id, day):
@@ -3366,9 +3341,9 @@ def _bootstrap_risk_rejection_cooldown(conn, account_id, code, asof_day):
     Structural/quote failures are deliberately excluded: those should retry
     as soon as data recovers.  Capacity and waitlist decisions are also
     excluded because they represent valid candidates waiting for a released
-    slot.  Only risk decisions for a new buy candidate participate here.
+    slot.      Only risk decisions for a new buy candidate participate here.
     """
-    base = int(RISK_REJECT_COOLDOWN_AFTER_TWO_MINUTES.get(account_id, 0))
+    base = SPOL.risk_reject_cooldown_minutes(account_id)
     if base <= 0:
         return None
     day = _date(asof_day).isoformat()
@@ -9608,21 +9583,26 @@ def _buy_order(conn, account, signal, quote, market, news, asof_day, *, all_quot
         cost_reason = "单笔最低佣金占比过高，暂不下单，候选保留在等待池复核"
         reasons.append(cost_reason)
         soft_amount_reasons.append(cost_reason)
-    if account["id"] == "tq_breakout" and amount > 0:
-        expected_edge = max(TQ_MIN_EXPECTED_EDGE_PCT, _num(profile.get("min_cost_edge"), 0.0))
+    econ = SPOL.entry_economics_policy(account["id"])
+    if econ and amount > 0:
+        min_effective_amount = _num(econ.get("min_effective_order_amount"), 0.0)
+        expected_edge = max(
+            _num(econ.get("min_expected_edge_pct"), 0.0),
+            _num(profile.get("min_cost_edge"), 0.0),
+        )
         # 用实际买入佣金 + 预估卖出佣金/印花税 + 双向滑点做保守成本门槛；
         # 不把未实现收益当现金，只判断该委托是否值得发生。
         expected_profit = amount * expected_edge
         estimated_round_trip_cost = (
             fees + _commission(amount) + amount * STAMP_SELL + amount * SLIPPAGE * 2
         )
-        sizing["minimum_effective_order_amount"] = TQ_MIN_EFFECTIVE_ENTRY_AMOUNT
+        sizing["minimum_effective_order_amount"] = min_effective_amount
         sizing["expected_edge_pct"] = round(expected_edge * 100, 2)
         sizing["expected_profit_amount"] = round(expected_profit, 2)
         sizing["estimated_round_trip_cost"] = round(estimated_round_trip_cost, 2)
-        if amount < TQ_MIN_EFFECTIVE_ENTRY_AMOUNT:
+        if min_effective_amount and amount < min_effective_amount:
             min_amount_reason = (
-                f"短线有效委托至少 ¥{TQ_MIN_EFFECTIVE_ENTRY_AMOUNT:,.0f}，当前 ¥{amount:,.0f}；"
+                f"短线有效委托至少 ¥{min_effective_amount:,.0f}，当前 ¥{amount:,.0f}；"
                 "金额约束仅用于委托 sizing，候选保留在等待池复核"
             )
             reasons.append(min_amount_reason)
@@ -10172,9 +10152,7 @@ def _replacement_min_hold_days(account_id):
     holding horizon, while this value only decides when a *sellable* weak
     position may yield a full slot to a materially stronger candidate.
     """
-    return int(POSITION_REVIEW_MIN_HOLD_DAYS_BY_STRATEGY.get(
-        str(account_id or ""), POSITION_REVIEW_MIN_HOLD_DAYS,
-    ))
+    return int(SPOL.position_review_min_hold_days(account_id))
 
 
 def _score100(value, default=50.0):
