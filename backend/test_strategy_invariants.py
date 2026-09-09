@@ -142,7 +142,7 @@ class SymbolAggregateInvariantTests(unittest.TestCase):
             for i in range(10)
         }
         gate = AR.validate_risk_updates(
-            overrides, proposed, evidence_count=99, conn=conn)
+            overrides, proposed, evidence_count=99, conn=conn, challenger_win=True)
         self.assertFalse(gate["allowed"])
         self.assertTrue(all("尚未登记" in v or "观察期" in v
                             for v in gate["violations"]))

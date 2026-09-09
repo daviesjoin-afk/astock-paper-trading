@@ -50,6 +50,7 @@ MIGRATIONS = {
         (6, "创建不可变策略版本与交易证据版本戳", _ensure_strategy_versioning),
         (7, "新增可执行策略 DSL 定义字段", strategy_registry.ensure_schema),
         (8, "新增订单重试血缘字段 retry_of_order_id", paper_schema.ensure_order_lineage_column),
+        (9, "新增风险放大提案生命周期字段", paper_schema.ensure_proposal_lifecycle_columns),
     ],
     "adaptive_learning": [
         (1, "创建 schema_version 表", """
