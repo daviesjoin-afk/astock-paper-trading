@@ -354,6 +354,12 @@ class OfflinePaperEnv:
 
 class ProductionPathGoldenReplayTests(OfflinePaperEnv, unittest.TestCase):
 
+    def setUp(self):
+        # 防御：无论类间运行顺序如何（pytest 按定义序、unittest 按字母序），
+        # 每个用例都从干净的注入行情字典开始，不依赖前序类的残留状态。
+        QUOTE_PRICES.clear()
+        QUOTE_SCENARIOS.clear()
+
     # ---------- 测试 ----------
 
     def test_production_path_golden_replay(self):
@@ -688,6 +694,14 @@ class ProductionInvariantTests(OfflinePaperEnv, unittest.TestCase):
         QUOTE_SCENARIOS.clear()
         SRT.clear_cache()
         PT.init_db()
+
+    def tearDown(self):
+        # unittest 按字母序运行测试类：本类（ProductionInvariantTests）先于
+        # ProductionPathGoldenReplayTests 执行。模块级注入行情若不在用例
+        # 结束后清空，本类的天价场景（QUOTE_PRICES=CAPITAL）会泄漏给后续
+        # 类，把黄金回放 D1 的默认报价顶掉，触发"跳空 +4648900%"误拒。
+        QUOTE_PRICES.clear()
+        QUOTE_SCENARIOS.clear()
 
     @contextlib.contextmanager
     def _conn(self):
