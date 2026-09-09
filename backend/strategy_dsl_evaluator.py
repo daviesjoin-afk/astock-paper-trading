@@ -118,19 +118,22 @@ def _value(node: Mapping[str, Any], snapshot: Mapping[str, Any], index: int) -> 
     return _rsi(source, index, window)
 
 
-def _evaluate(node: Mapping[str, Any], snapshot: Mapping[str, Any], index: int) -> bool:
+def _evaluate(node: Mapping[str, Any], snapshot: Mapping[str, Any], index: int) -> bool | None:
     op = node["op"]
     if op == "and":
-        return all(_evaluate(item, snapshot, index) for item in node["args"])
+        values = [_evaluate(item, snapshot, index) for item in node["args"]]
+        return False if False in values else (None if None in values else True)
     if op == "or":
-        return any(_evaluate(item, snapshot, index) for item in node["args"])
+        values = [_evaluate(item, snapshot, index) for item in node["args"]]
+        return True if True in values else (None if None in values else False)
     if op == "not":
-        return not _evaluate(node["arg"], snapshot, index)
+        value = _evaluate(node["arg"], snapshot, index)
+        return None if value is None else not value
     if op == "mul":
         raise StrategyDslEvaluationError("arithmetic is not a boolean expression")
     left, right = _value(node["left"], snapshot, index), _value(node["right"], snapshot, index)
     if left is None or right is None:
-        return False
+        return None
     if op == "gt": return left > right
     if op == "gte": return left >= right
     if op == "lt": return left < right
@@ -138,7 +141,7 @@ def _evaluate(node: Mapping[str, Any], snapshot: Mapping[str, Any], index: int) 
     previous_left = _value(node["left"], snapshot, index - 1)
     previous_right = _value(node["right"], snapshot, index - 1)
     if previous_left is None or previous_right is None:
-        return False
+        return None
     if op == "cross_above":
         return previous_left <= previous_right and left > right
     if op == "cross_below":
@@ -158,4 +161,7 @@ def evaluate(ast: Mapping[str, Any], factor_snapshot: Mapping[str, Any]) -> bool
         normalized = normalize(ast)
     except StrategyDslValidationError:
         raise
-    return bool(_evaluate(normalized, factor_snapshot, -1))
+    # Unknown data propagates through boolean composition and only becomes a
+    # fail-closed False at the public boundary.  In particular, ``not`` may
+    # never turn unavailable evidence into a trade signal.
+    return _evaluate(normalized, factor_snapshot, -1) is True

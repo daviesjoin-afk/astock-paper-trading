@@ -55,7 +55,7 @@ def _only_keys(node: Mapping[str, Any], allowed: set[str]) -> None:
         raise StrategyDslValidationError(f"unsupported DSL key: {sorted(unknown)[0]}")
 
 
-def _normalize(node: Any, *, depth: int, counter: list[int]) -> dict[str, Any]:
+def _normalize(node: Any, *, depth: int, counter: list[int]) -> tuple[dict[str, Any], str]:
     if depth > MAX_AST_DEPTH:
         raise StrategyDslValidationError(f"DSL AST exceeds max depth {MAX_AST_DEPTH}")
     counter[0] += 1
@@ -69,13 +69,13 @@ def _normalize(node: Any, *, depth: int, counter: list[int]) -> dict[str, Any]:
 
     if op == "const":
         _only_keys(raw, {"op", "value"})
-        return {"op": "const", "value": _number(raw.get("value"), "const value")}
+        return {"op": "const", "value": _number(raw.get("value"), "const value")}, "scalar"
     if op == "field":
         _only_keys(raw, {"op", "name"})
         name = raw.get("name")
         if not isinstance(name, str) or name not in FIELD_NAMES:
             raise StrategyDslValidationError("DSL field is not allowlisted")
-        return {"op": "field", "name": name}
+        return {"op": "field", "name": name}, "scalar"
     if op == "indicator":
         _only_keys(raw, {"op", "name", "window"})
         name = raw.get("name")
@@ -88,29 +88,45 @@ def _normalize(node: Any, *, depth: int, counter: list[int]) -> dict[str, Any]:
             raise StrategyDslValidationError(
                 f"indicator window must be between 1 and {MAX_ROLLING_WINDOW}"
             )
-        return {"op": "indicator", "name": name, "window": window}
+        return {"op": "indicator", "name": name, "window": window}, "scalar"
     if op in BOOLEAN_OPS:
         if op == "not":
             _only_keys(raw, {"op", "arg"})
-            return {"op": op, "arg": _normalize(raw.get("arg"), depth=depth + 1, counter=counter)}
+            arg, arg_type = _normalize(raw.get("arg"), depth=depth + 1, counter=counter)
+            if arg_type != "boolean":
+                raise StrategyDslValidationError("not requires a boolean arg")
+            return {"op": op, "arg": arg}, "boolean"
         _only_keys(raw, {"op", "args"})
         args = raw.get("args")
         if not isinstance(args, Sequence) or isinstance(args, (str, bytes)) or len(args) < 2:
             raise StrategyDslValidationError(f"{op} requires at least two args")
-        return {"op": op, "args": [_normalize(item, depth=depth + 1, counter=counter) for item in args]}
+        normalized_args = []
+        for item in args:
+            normalized, expression_type = _normalize(item, depth=depth + 1, counter=counter)
+            if expression_type != "boolean":
+                raise StrategyDslValidationError(f"{op} requires boolean args")
+            normalized_args.append(normalized)
+        return {"op": op, "args": normalized_args}, "boolean"
     if op in COMPARISONS | CROSS_OPS | ARITHMETIC_OPS:
         _only_keys(raw, {"op", "left", "right"})
+        left, left_type = _normalize(raw.get("left"), depth=depth + 1, counter=counter)
+        right, right_type = _normalize(raw.get("right"), depth=depth + 1, counter=counter)
+        if left_type != "scalar" or right_type != "scalar":
+            raise StrategyDslValidationError(f"{op} requires scalar operands")
         return {
             "op": op,
-            "left": _normalize(raw.get("left"), depth=depth + 1, counter=counter),
-            "right": _normalize(raw.get("right"), depth=depth + 1, counter=counter),
-        }
+            "left": left,
+            "right": right,
+        }, "scalar" if op in ARITHMETIC_OPS else "boolean"
     raise StrategyDslValidationError(f"unsupported DSL op: {op or '<empty>'}")
 
 
 def normalize(ast: Mapping[str, Any]) -> dict[str, Any]:
     """Validate and normalize an AST without evaluating it."""
-    return _normalize(ast, depth=1, counter=[0])
+    normalized, expression_type = _normalize(ast, depth=1, counter=[0])
+    if expression_type != "boolean":
+        raise StrategyDslValidationError("DSL root must be a boolean expression")
+    return normalized
 
 
 def canonical_json(ast: Mapping[str, Any]) -> str:
