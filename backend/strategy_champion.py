@@ -417,7 +417,13 @@ def promote_challenger(paper_conn, evo_conn, strategy_id: str, *, now: dt.dateti
         return {"promoted": False, "reason": "Champion 参数头已变化，拒绝过期 Challenger 晋升"}
     candidate = _json_loads(challenger["params"])
     diffs = {key: value for key, value in candidate.items() if active["params"].get(key) != value}
-    activated = SE.adjust_strategy_params(evo_conn, strategy_id, diffs, reason="challenger_promotion", source="challenger_promotion", evidence_count=challenger.get("evidence_count"))
+    # PR-33：晋升是唯一可以申报 Challenger 胜出的路径（challenger_win=True），
+    # 风险方向参数仍需满足证据 + 观察期 + 单轮上限，缺一不可。
+    activated = SE.adjust_strategy_params(
+        evo_conn, strategy_id, diffs, reason="challenger_promotion",
+        source="challenger_promotion", evidence_count=challenger.get("evidence_count"),
+        challenger_win=True,
+    )
     if not activated.get("adjusted"):
         return {"promoted": False, "reason": "无法原子切换 active 参数头：" + str(activated.get("reason") or activated.get("violations"))}
     after = active_runtime_checksum(evo_conn, strategy_id)

@@ -548,16 +548,20 @@ def manual_adjust(conn, adjustments: dict, reason: str = "manual") -> dict:
 
 def adjust_strategy_dsl_parameters(paper_conn, strategy_id: str, adjustments: dict,
                                    *, evidence_count: int | None,
-                                   actor: str = "self_evolution") -> dict:
+                                   actor: str = "self_evolution",
+                                   challenger_win: bool = False) -> dict:
     """让自进化写入策略定义版本，而不是只更新调参器控制参数。
 
     该入口只转交给 ``StrategyParameterSchema``：它不能接受替换 AST，
     因而无法自动增加/删除条件或改变运算符。
+
+    PR-33：AI/自进化路径默认 ``challenger_win=False`` —— 只能收紧风险，
+    放大必须由 Champion/Challenger 晋升路径显式申报 ``challenger_win=True``。
     """
     import strategy_runtime as runtime
     return runtime.apply_parameter_adjustments(
         paper_conn, strategy_id, adjustments, evidence_count=evidence_count,
-        actor=actor,
+        actor=actor, challenger_win=challenger_win,
     )
 
 
@@ -599,15 +603,44 @@ def get_strategy_params(conn, strategy_id: str) -> dict:
 
 def adjust_strategy_params(conn, strategy_id: str, adjustments: dict, *,
                            reason: str = "strategy_manual", source: str = "strategy_manual",
-                           evidence_count: Optional[int] = None) -> dict:
+                           evidence_count: Optional[int] = None,
+                           challenger_win: bool = False) -> dict:
     """按策略画像校验并落地一次参数调整（版本链 + 审计）。
 
     校验失败返回 {"adjusted": False, "violations": [...]}，绝不静默夹回。
+
+    PR-33：带风险方向的参数（见 ``asymmetric_risk.RISK_DIRECTION_BY_KEY``）
+    还要过唯一风险放大门；不在方向表里的调参器控制参数（``max_weight_delta``
+    等）维持原有画像约束，不受本门影响。``challenger_win`` 由 Champion
+    晋升路径申报，AI/人工路径默认 False → 只能收紧。
     """
+    import asymmetric_risk as AR
+
     import evolution_profiles as EP
 
     _ensure_strategy_column(conn)
     current = get_strategy_params(conn, strategy_id)
+    gate = AR.evaluate_risk_adjustments(
+        conn, str(strategy_id),
+        [
+            {"key": key, "old": current["params"].get(key), "new": value}
+            for key, value in dict(adjustments or {}).items()
+            if key in AR.RISK_DIRECTION_BY_KEY
+        ],
+        evidence_count=evidence_count, challenger_win=challenger_win, actor=source,
+    )
+    if not gate["allowed"]:
+        conn.execute(
+            "INSERT INTO evolution_log(event_type, params_id, detail, created_at) VALUES(?,?,?,?)",
+            ("strategy_adjust_rejected", None, _json({
+                "strategy_id": str(strategy_id), "adjustments": dict(adjustments or {}),
+                "violations": gate["violations"], "reason": reason,
+                "gate": "asymmetric_risk",
+            }), _now()),
+        )
+        conn.commit()
+        return {"adjusted": False, "violations": gate["violations"],
+                "gate": AR.ASYMMETRIC_RISK_VERSION}
     check = EP.validate_strategy_adjustment(
         strategy_id, current["params"], adjustments or {},
         evidence_count=evidence_count,
@@ -653,6 +686,10 @@ def adjust_strategy_params(conn, strategy_id: str, adjustments: dict, *,
             "reason": reason,
         }), now),
     )
+    # 放大落地后闭环提案生命周期（pending → promoted）。
+    for expansion in gate["expansions"]:
+        AR.promote_proposal(conn, str(strategy_id), expansion["key"], expansion["new"],
+                            actor=source)
     conn.commit()
     return {
         "adjusted": True, "strategy_id": str(strategy_id), "new_params_id": new_id,
