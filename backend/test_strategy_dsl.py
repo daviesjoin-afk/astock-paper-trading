@@ -1,5 +1,7 @@
 # -*- coding: utf-8 -*-
 import copy
+import hashlib
+import json
 import os
 import sqlite3
 import sys
@@ -77,6 +79,18 @@ class StrategyDslTests(unittest.TestCase):
         with self.assertRaisesRegex(dsl.StrategyDslValidationError, "max depth"):
             dsl.normalize(nested)
 
+    def test_rejects_ill_typed_expressions_and_fails_closed_through_not(self):
+        with self.assertRaisesRegex(dsl.StrategyDslValidationError, "root must be a boolean"):
+            dsl.normalize({"op": "const", "value": 1})
+        with self.assertRaisesRegex(dsl.StrategyDslValidationError, "requires scalar operands"):
+            dsl.normalize({"op": "gt", "left": {"op": "and", "args": [_sample_rule(), _sample_rule()]},
+                           "right": {"op": "const", "value": 1}})
+        with self.assertRaisesRegex(dsl.StrategyDslValidationError, "boolean arg"):
+            dsl.normalize({"op": "not", "arg": {"op": "field", "name": "close"}})
+        missing = {"op": "not", "arg": {"op": "gt", "left": {"op": "field", "name": "roe"},
+                                              "right": {"op": "const", "value": 10}}}
+        self.assertFalse(dsl.evaluate(missing, {"close": [10.0]}))
+
     def test_canonical_serialization_and_checksum_ignore_input_key_order(self):
         left = {"left": {"name": "close", "op": "field"}, "op": "gt",
                 "right": {"value": 10, "op": "const"}}
@@ -102,6 +116,30 @@ class StrategyDslTests(unittest.TestCase):
                 )
                 self.assertEqual(updated.version, 2)
                 self.assertEqual(registry.get_version(created.id, 1, conn=conn), original)
+            finally:
+                conn.close()
+
+    def test_legacy_snapshot_without_null_dsl_is_a_noop_save(self):
+        with tempfile.TemporaryDirectory() as directory:
+            conn = sqlite3.connect(os.path.join(directory, "paper.sqlite3"))
+            try:
+                registry.ensure_schema(conn)
+                current = registry.get_version("tq_breakout", 1, conn=conn)
+                legacy = dict(current.definition)
+                legacy.pop("dsl_ast")
+                encoded = json.dumps(legacy, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+                legacy_checksum = hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+                conn.execute("DROP TRIGGER trg_strategy_versions_no_update")
+                conn.execute("DROP TRIGGER trg_strategy_definition_version_guard")
+                conn.execute("UPDATE paper_strategy_versions SET definition_json=?,checksum=? WHERE strategy_id=? AND version=1",
+                             (encoded, legacy_checksum, "tq_breakout"))
+                conn.execute("UPDATE paper_strategy_version_heads SET current_checksum=? WHERE strategy_id=?",
+                             (legacy_checksum, "tq_breakout"))
+                conn.execute("UPDATE strategy_definitions SET current_checksum=? WHERE id=?",
+                             (legacy_checksum, "tq_breakout"))
+                unchanged = registry.save_definition(conn, "tq_breakout", {})
+                self.assertEqual(unchanged.version, 1)
+                self.assertEqual(len(registry.list_versions("tq_breakout", conn=conn)), 1)
             finally:
                 conn.close()
 
