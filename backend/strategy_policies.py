@@ -174,3 +174,84 @@ BOOTSTRAP_STRUCTURAL_RECHECK_COOLDOWN_MINUTES: dict[str, int] = {
 def bootstrap_recheck_cooldown_minutes(account_id) -> int:
     """CooldownPolicy 访问器。未声明账户无结构性冷却（0 分钟）。"""
     return int(BOOTSTRAP_STRUCTURAL_RECHECK_COOLDOWN_MINUTES.get(str(account_id or ""), 0))
+
+
+# ---------------------------------------------------------------------------
+# RotationPolicy：主动换仓的观察窗口（PR-41 自 paper_trading.py 迁入）。
+# sellable 弱持仓只有观察满 min_hold_days 后，才能把整席让给显著更强的候选。
+# T+1 仍是第一道闸门，0 天窗口也绝不让当日买入的股份可卖。
+# ---------------------------------------------------------------------------
+POSITION_REVIEW_MIN_HOLD_DAYS_DEFAULT = 2  # 未声明账户的保守回退值
+POSITION_REVIEW_MIN_HOLD_DAYS_BY_STRATEGY: dict[str, int] = {
+    "tq_breakout": 1,
+    "trend_pullback": 2,
+    "sector_rotation": 0,
+    NEW_STRATEGY_ID: 1,
+    MAIN_FORCE_STRATEGY_ID: 1,
+}
+
+
+def position_review_min_hold_days(account_id) -> int:
+    """RotationPolicy 访问器。未声明账户回退到保守默认（2 天）。"""
+    return int(POSITION_REVIEW_MIN_HOLD_DAYS_BY_STRATEGY.get(
+        str(account_id or ""), POSITION_REVIEW_MIN_HOLD_DAYS_DEFAULT,
+    ))
+
+
+# ---------------------------------------------------------------------------
+# CooldownPolicy：两次同日风控拒绝后的递进冷却（分钟）（PR-41 迁入）。
+# 首次拒绝仍可下一轮复审；连续两次才进入策略本地冷却，之后按 2 的幂
+# 保守延长（封顶值 RISK_REJECT_COOLDOWN_MAX_MINUTES 仍留在执行引擎）。
+# ---------------------------------------------------------------------------
+RISK_REJECT_COOLDOWN_AFTER_TWO_MINUTES: dict[str, int] = {
+    "tq_breakout": 30,
+    "trend_pullback": 75,
+    "sector_rotation": 45,
+    NEW_STRATEGY_ID: 90,
+    MAIN_FORCE_STRATEGY_ID: 45,
+}
+
+
+def risk_reject_cooldown_minutes(account_id) -> int:
+    """CooldownPolicy 访问器。未声明账户无冷却（0 分钟）。"""
+    return int(RISK_REJECT_COOLDOWN_AFTER_TWO_MINUTES.get(str(account_id or ""), 0))
+
+
+# ---------------------------------------------------------------------------
+# RecoveryPolicy：保护性退出后的受控恢复观察（PR-41 迁入）。
+# 防护性退出允许一次受控的恢复观察路径，但绝不能变成立即追涨或绕过
+# 常规入场闸门。
+# ---------------------------------------------------------------------------
+RECOVERY_WATCH_STATUS = "recovery_watch"
+RECOVERY_POLICIES: dict[str, dict] = {
+    "tq_breakout": {"min_scans": 2, "cooldown_minutes": 15, "reclaim_pct": 0.005, "max_days": 1},
+    "trend_pullback": {"min_scans": 2, "cooldown_minutes": 60, "reclaim_pct": 0.008, "max_days": 3},
+    "sector_rotation": {"min_scans": 3, "cooldown_minutes": 60, "reclaim_pct": 0.010, "max_days": 2},
+    NEW_STRATEGY_ID: {"min_scans": 2, "cooldown_minutes": 45, "reclaim_pct": 0.008, "max_days": 2},
+    MAIN_FORCE_STRATEGY_ID: {"min_scans": 2, "cooldown_minutes": 45, "reclaim_pct": 0.010, "max_days": 2},
+}
+
+
+def recovery_policy(account_id) -> dict:
+    """RecoveryPolicy 访问器。未声明账户回退到 trend_pullback 模板（历史行为）。"""
+    table = RECOVERY_POLICIES
+    return dict(table.get(str(account_id or ""), table["trend_pullback"]))
+
+
+# ---------------------------------------------------------------------------
+# EntryEconomicsPolicy：碎单经济性门槛（PR-41 迁入）。
+# 短线日内做T的低额委托经常被最低佣金、卖出印花税和双向滑点吞掉。
+# 这不是提高仓位上限，而是拒绝"理论有收益、成本后没有意义"的碎单。
+# 未声明账户返回空 dict：不启用该门槛（与历史"仅 tq_breakout"一致）。
+# ---------------------------------------------------------------------------
+ENTRY_ECONOMICS_POLICIES: dict[str, dict] = {
+    "tq_breakout": {
+        "min_effective_order_amount": 4_000.0,
+        "min_expected_edge_pct": 0.008,
+    },
+}
+
+
+def entry_economics_policy(account_id) -> dict:
+    """EntryEconomicsPolicy 访问器。未声明账户返回空 dict（不启用碎单门槛）。"""
+    return dict(ENTRY_ECONOMICS_POLICIES.get(str(account_id or "")) or {})
