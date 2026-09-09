@@ -139,7 +139,18 @@ def run_custom_strategy_replay(tmpdir: str) -> dict[str, Any]:
     )
     paper.commit()
 
-    # 3. signal（确定性合成信号）
+    # 3. signal（确定性合成信号）→ OrderIntent（生产适配器）
+    OI = __import__("order_intent")
+    signal_payload = {
+        "code": TICKER[0], "name": TICKER[1], "close_price": SIGNAL_CLOSE,
+        "side": "buy", "strength": 0.8, "urgency": "same_session",
+        "data_asof": "2026-09-01", "stop_reference": "-5% 硬止损",
+        "reason": "自定义策略首只候选（合成行情）",
+        "industry": TICKER[2],
+    }
+    OI.reject_qty_claims(signal_payload)  # 契约：策略层不得携带数量/金额
+    intent = OI.order_intent_from_signal(strategy_id, signal_payload, now=BASE_TS)
+    legacy = OI.intent_to_legacy_fields(intent)
     paper.execute(
         """INSERT INTO paper_signals(account_id,code,name,signal_date,intended_date,
                close_price,status,reason,created_at)
@@ -151,6 +162,8 @@ def run_custom_strategy_replay(tmpdir: str) -> dict[str, Any]:
     stage("signal", {
         "signal_id": int(signal_id), "code": TICKER[0],
         "close_price": SIGNAL_CLOSE,
+        "intent_symbol": intent.symbol, "intent_side": intent.side,
+        "intent_urgency": intent.urgency,
     })
 
     # 4. allocation（席位 + 资金预算，任意 1 个策略也必须成立）
