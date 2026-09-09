@@ -45,6 +45,7 @@ import strategy_clusters as SC
 import execution_profiles as EPF
 import paper_sizing as PSZ
 import order_intent as OI
+import strategy_policies as SPOL
 import strategy_registry as SR
 import strategy_runtime as SRT
 import user_strategy_participation as USP
@@ -110,12 +111,10 @@ NEWS_UNVERIFIED_TTL_SECONDS = 12 * 60 * 60
 NEWS_VERIFIED_TTL_SECONDS = 3 * 24 * 60 * 60
 _NEWS_SCAN_META = {"observed_at": None, "stale": False, "error": None}
 RISK_VERSION = "paper-risk-v4"
-# The reported-profit breakout model is an independent paper account.  Keep
-# its identity/version explicit in every execution payload so a future model
-# change cannot be mistaken for one of the legacy three accounts.
-NEW_STRATEGY_ID = "reported_profit_breakout"
+# PR-37：内置策略标识的唯一声明源已移至 strategy_policies（声明式画像模块）。
+NEW_STRATEGY_ID = SPOL.NEW_STRATEGY_ID
 NEW_STRATEGY_VERSION = "reported-profit-breakout-v1"
-MAIN_FORCE_STRATEGY_ID = "main_force_top10"
+MAIN_FORCE_STRATEGY_ID = SPOL.MAIN_FORCE_STRATEGY_ID
 MAIN_FORCE_STRATEGY_VERSION = "main-force-top10-v1"
 LOT_SIZE = 100
 # 集中化配对约束：席位稀缺时，低于当前周期单席可表达金额的新开仓是
@@ -148,74 +147,8 @@ INTRADAY_WINDOWS = (("09:30", "11:25"), ("13:00", "14:55"))
 # 开盘事件是共享执行引擎，五套策略只通过各自的策略画像决定阈值和仓位比例。
 # 这样既能在 09:30/09:31 抓住冲高回落，也不会把趋势/轮动策略改造成追涨策略。
 OPENING_EVENT_CLOCKS = {"09:30", "09:31", "13:00"}
-OPENING_EVENT_POLICIES = {
-    "tq_breakout": {
-        "name": "短线日内做T",
-        "enabled": True,
-        "min_peak_pct": 3.0,
-        "min_retrace_pct": 2.2,
-        "min_current_pct": -1.0,
-        "min_peak_edge_pct": -8.0,
-        "trim_ratio": 0.30,
-        "allow_loss_trim": True,
-        "rebuy_rebound_pct": 1.2,
-        "rebuy_max_sold_ratio": 0.995,
-        "rebuy_min_observations": 2,
-        "rebuy_min_main_pct": -0.25,
-        "rebuy_min_current_pct": -1.5,
-    },
-    "trend_pullback": {
-        "name": "趋势波段优选",
-        "enabled": True,
-        "min_peak_pct": 4.0,
-        "min_retrace_pct": 2.6,
-        "min_current_pct": -0.8,
-        "min_peak_edge_pct": 1.5,
-        "trim_ratio": 0.20,
-        "allow_loss_trim": False,
-        "rebuy_rebound_pct": 1.8,
-        "rebuy_max_sold_ratio": 0.985,
-        "rebuy_min_observations": 2,
-        "rebuy_min_main_pct": 0.20,
-        "rebuy_min_current_pct": -0.8,
-    },
-    "sector_rotation": {
-        "name": "板块轮动先锋",
-        "enabled": True,
-        "min_peak_pct": 4.5,
-        "min_retrace_pct": 2.8,
-        "min_current_pct": -1.0,
-        "min_peak_edge_pct": 1.0,
-        "trim_ratio": 0.25,
-        "allow_loss_trim": False,
-        "rebuy_rebound_pct": 1.5,
-        "rebuy_max_sold_ratio": 0.985,
-        "rebuy_min_observations": 2,
-        "rebuy_min_main_pct": 0.50,
-        "rebuy_min_current_pct": -0.5,
-    },
-    NEW_STRATEGY_ID: {
-        "name": "财报突破质量",
-        "enabled": True,
-        "min_peak_pct": 3.5,
-        "min_retrace_pct": 2.4,
-        "min_current_pct": -0.8,
-        "min_peak_edge_pct": 1.5,
-        "trim_ratio": 0.25,
-        "allow_loss_trim": False,
-        "rebuy_rebound_pct": 1.6,
-        "rebuy_max_sold_ratio": 0.985,
-        "rebuy_min_observations": 2,
-        "rebuy_min_main_pct": 0.20,
-        "rebuy_min_current_pct": -0.8,
-    },
-    MAIN_FORCE_STRATEGY_ID: {"name": "超强主力股", "enabled": True,
-        "min_peak_pct": 4.0, "min_retrace_pct": 2.5, "min_current_pct": -1.0,
-        "min_peak_edge_pct": 1.5, "trim_ratio": 0.25, "allow_loss_trim": False,
-        "rebuy_rebound_pct": 1.8, "rebuy_max_sold_ratio": 0.985,
-        "rebuy_min_observations": 2, "rebuy_min_main_pct": 0.50,
-        "rebuy_min_current_pct": -0.5},
-}
+# PR-37：开盘事件 EntryPolicy 表已移至 strategy_policies（声明式画像模块），
+# 经 SPOL.opening_event_policy() 访问；未声明账户 fail-closed（引擎不介入）。
 # Concentration is a quality gate, not a crude fixed position-count limit.
 # A small holding is retained when its quality is high; only a weak, low-impact
 # holding can be rotated out automatically.  This avoids replacing one bad
@@ -255,13 +188,7 @@ TQ_MIN_EXPECTED_EDGE_PCT = 0.008
 # Every strategy has its own candidate queue.  A structural rejection occupies
 # no shared/global blacklist: it only yields the relevant strategy's limited
 # live-review slots to deeper candidates for a short period.
-BOOTSTRAP_STRUCTURAL_RECHECK_COOLDOWN_MINUTES = {
-    "tq_breakout": 6,
-    "trend_pullback": 12,
-    "sector_rotation": 9,
-    NEW_STRATEGY_ID: 15,
-    MAIN_FORCE_STRATEGY_ID: 9,
-}
+# PR-37：结构性复审冷却表已移至 strategy_policies（声明式 CooldownPolicy）。
 # A candidate enters this cooldown only after *two* same-day entry-risk
 # rejections.  One refusal may be a transient intraday condition, while two
 # consecutive reviews are enough to stop the same name monopolising a
@@ -472,56 +399,8 @@ HOLDING_QUALITY_WEIGHTS = {
 
 # still requires two consecutive confirmed scans and the normal quote, T+1,
 # limit-down and lot-size gates.
-INTRADAY_DOWNSIDE_POLICIES = {
-    "tq_breakout": {
-        "warning_pct": -2.0, "partial_pct": -3.0, "full_pct": -5.0,
-        "relative_pct": -2.5, "peak_retrace_pct": 3.5,
-        "partial_ratio": 0.35,
-        # 首次下跌预警不是硬止损：只处理当日可卖仓的四分之一，
-        # 每标的一天最多一次；后续恶化仍走 partial/full 防线。
-        "warning_trim_ratio": 0.25,
-        # Protect a profitable position from giving back its edge even when
-        # low-frequency flow looks like a possible washout.
-        "giveback_partial_pct": 5.5, "giveback_full_pct": 9.0,
-        "giveback_min_peak_return_pct": 4.0,
-    },
-    "trend_pullback": {
-        "warning_pct": -2.2, "partial_pct": -3.0, "full_pct": -5.0,
-        "relative_pct": -2.7, "peak_retrace_pct": 4.0,
-        "partial_ratio": 0.35,
-        "giveback_partial_pct": 5.0, "giveback_full_pct": 8.0,
-        "giveback_min_peak_return_pct": 4.0,
-    },
-    "sector_rotation": {
-        # Recent ledger results show that this fast-rotation sleeve was
-        # allowing weak hot-theme names to become large losses.  A genuine
-        # sector leader should either recover promptly or be replaced; retain
-        # two distinct scans, but tighten the loss/retrace ladder.
-        "warning_pct": -2.2, "partial_pct": -3.0, "full_pct": -4.5,
-        "relative_pct": -2.5, "peak_retrace_pct": 3.5,
-        "partial_ratio": 0.40,
-        "giveback_partial_pct": 5.0, "giveback_full_pct": 8.0,
-        "giveback_min_peak_return_pct": 4.0,
-    },
-    NEW_STRATEGY_ID: {
-        # A quality/breakout holding tolerates less structural damage than a
-        # broad trend position, while requiring a distinct confirmation scan
-        # before partial/full exits.  Warning trim remains independent from
-        # the legacy TQ thresholds.
-        "warning_pct": -1.8, "partial_pct": -3.2, "full_pct": -5.8,
-        "relative_pct": -2.4, "peak_retrace_pct": 3.2,
-        "partial_ratio": 0.40, "warning_trim_ratio": 0.20,
-        "giveback_partial_pct": 4.5, "giveback_full_pct": 8.0,
-        "giveback_min_peak_return_pct": 3.5,
-    },
-    MAIN_FORCE_STRATEGY_ID: {
-        "warning_pct": -2.0, "partial_pct": -3.0, "full_pct": -5.0,
-        "relative_pct": -2.5, "peak_retrace_pct": 4.0,
-        "partial_ratio": 0.50, "warning_trim_ratio": 0.0,
-        "giveback_partial_pct": 5.0, "giveback_full_pct": 8.0,
-        "giveback_min_peak_return_pct": 4.0,
-    },
-}
+# PR-37：盘中下行守卫 ReviewPolicy 表已移至 strategy_policies（声明式画像模块），
+# 经 SPOL.intraday_downside_policy() 访问；未声明账户得到保守通用默认。
 
 # 风控不是一个“全策略通用止损器”。这些字段同时用于审计与执行，
 # 明确每个账户面对洗盘/回吐时的容忍边界，避免仅凭同一个主力意图标签
@@ -1042,7 +921,7 @@ def strategy_center():
     for account_id, spec in ACCOUNT_SPECS.items():
         registered = SR.get(account_id)
         risk = RISK_PROFILES[spec["risk_profile"]]
-        event_policy = OPENING_EVENT_POLICIES.get(account_id) or {}
+        event_policy = SPOL.opening_event_policy(account_id)
         pool_budget_pct = SHARED_POOL_MAX_EXPOSURE * risk["max_exposure"] / total_profile_exposure * 100
         rows.append({
             "id": account_id,
@@ -3291,7 +3170,7 @@ def _bootstrap_structural_recheck_cooldown(conn, account_id, code, asof_day):
     Quote/source failures are intentionally *not* cooled down because they
     should be retried as soon as the backup source recovers.
     """
-    cooldown_minutes = int(BOOTSTRAP_STRUCTURAL_RECHECK_COOLDOWN_MINUTES.get(account_id, 0))
+    cooldown_minutes = SPOL.bootstrap_recheck_cooldown_minutes(account_id)
     if cooldown_minutes <= 0:
         return None
     row = conn.execute(
@@ -7777,7 +7656,7 @@ def _risk_profile(account, asof_day=None, conn=None):
     # profile used by sizing/entry.  Without an overlay the three strategy
     # defaults remain exactly those defined by the execution policy.
     account_id = str(account.get("id") or "")
-    for key, value in (INTRADAY_DOWNSIDE_POLICIES.get(account_id) or {}).items():
+    for key, value in SPOL.intraday_downside_policy(account_id).items():
         profile[f"downside_{key}"] = value
     params = _loads(account.get("params"), {})
     overlay = params.get("adaptive_risk") or {}
@@ -10704,7 +10583,7 @@ def _intraday_downside_guard(position, quote, market=None, news=None, policy_ove
     a severe loss/negative-event condition is also present.
     """
     account_id = str(position.get("account_id") or "")
-    policy = dict(INTRADAY_DOWNSIDE_POLICIES.get(account_id) or {})
+    policy = dict(SPOL.intraday_downside_policy(account_id))
     if policy_override:
         for key in policy:
             candidate_key = f"downside_{key}"
@@ -11399,7 +11278,7 @@ def _sell_plan(position, quote, asof_day, news, hard_stop_touched_today=False, s
             _set_exit("hard_stop", "hard_stop")
         else:
             guard_ratio = _num(
-                (INTRADAY_DOWNSIDE_POLICIES.get(position["account_id"]) or {}).get("partial_ratio"), 0.35,
+                SPOL.intraday_downside_policy(position["account_id"]).get("partial_ratio"), 0.35,
             )
             reasons.append(
                 f"硬止损首段减仓：现距成本 {ret*100:.1f}% 触及止损线且非崩盘形态，"
@@ -12888,7 +12767,7 @@ def _existing_position_addition_gate(conn, account, code, asof_day, quote=None):
 
 def _opening_event_assessment(conn, account, position, quote, asof_day, cycle):
     """共享的开盘事件识别器；策略只提供阈值，不复制行情判断逻辑。"""
-    policy = OPENING_EVENT_POLICIES.get(account.get("id")) or {}
+    policy = SPOL.opening_event_policy(account.get("id"))
     price = _num(quote.get("price"))
     cost = _num(position.get("cost"))
     pct = _num(quote.get("pct"), 0.0)
@@ -12951,7 +12830,7 @@ def _sell_rebuy_confirmation(conn, sold, quote, asof_day, account):
     经过冷却、重新入选与完整入场门禁处理。回补必须同时确认卖后折价、低点、
     反弹持续、日内未失控以及实时资金不偏空。
     """
-    policy = OPENING_EVENT_POLICIES.get(account.get("id")) or {}
+    policy = SPOL.opening_event_policy(account.get("id"))
     sold_payload = _loads(sold.get("payload"), {}) or {}
     sold_price = _num(sold_payload.get("sell_price"))
     price = _num(quote.get("price"))
@@ -13046,7 +12925,7 @@ def _intraday_sell(conn, account, position, quote, asof_day, profile, cycle, ope
     if opening_event:
         if not event.get("passed"):
             return None, event.get("reason") or "未达到开盘事件阈值"
-        qty_ratio = _num((OPENING_EVENT_POLICIES.get(account.get("id")) or {}).get("trim_ratio"), 0.2)
+        qty_ratio = _num(SPOL.opening_event_policy(account.get("id")).get("trim_ratio"), 0.2)
         trigger = "开盘冲高回落，策略专属事件减仓"
     else:
         # 做T高抛不是“涨 1.2% 就卖”。旧规则把仍在加速的主升股当成
@@ -13156,7 +13035,7 @@ def _intraday_buyback(conn, account, position, quote, market, asof_day, profile,
     if not confirmation.get("passed"):
         return None, confirmation.get("reason") or "等待回补确认"
     rebuy_ratio = _num(
-        (OPENING_EVENT_POLICIES.get(account.get("id")) or {}).get("rebuy_max_sold_ratio"),
+        SPOL.opening_event_policy(account.get("id")).get("rebuy_max_sold_ratio"),
         0.992,
     ) if payload.get("opening_event") else 0.992
     if price <= 0 or sold_qty < LOT_SIZE or price > sold_price * rebuy_ratio:
