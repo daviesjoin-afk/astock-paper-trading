@@ -13,6 +13,7 @@ import execution_profiles as EP
 import paper_allocation as PA
 import strategy_dsl_schema as DSL
 import strategy_registry as SR
+from strategy_parameter_schema import StrategyParameterSchema
 from strategy_risk_fingerprint import StrategyRiskFingerprint, compile_strategy_risk_fingerprint
 from strategy_risk_profiles import StrategyRiskProfile, compile_strategy_risk_profile
 
@@ -22,13 +23,6 @@ class EvolutionControlProfile:
     enabled: bool
     lifecycle_stage: str
     interval_hours: int
-
-
-@dataclass(frozen=True)
-class StrategyParameterSchema:
-    version: str
-    editable: tuple[str, ...]
-    immutable: tuple[str, ...]
 
 
 def lifecycle_stage_for(spec) -> str:
@@ -147,11 +141,7 @@ def get_context(conn: sqlite3.Connection, strategy_id: str, *, settings_rev: str
             enabled=status == "active", lifecycle_stage=allocation.lifecycle_stage,
             interval_hours=24,
         ),
-        parameter_schema=StrategyParameterSchema(
-            version="strategy-parameters-v1",
-            editable=("metadata", "dsl_ast"),
-            immutable=("strategy_id", "version", "checksum"),
-        ),
+        parameter_schema=StrategyParameterSchema.from_dsl(compiled),
         settings_revision=revision,
     )
     _CACHE[key] = context
@@ -161,3 +151,43 @@ def get_context(conn: sqlite3.Connection, strategy_id: str, *, settings_rev: str
 def active_contexts(conn: sqlite3.Connection, *, settings_rev: str | None = None) -> tuple[StrategyRuntimeContext, ...]:
     revision = settings_rev if settings_rev is not None else settings_revision(conn)
     return tuple(get_context(conn, strategy_id, settings_rev=revision) for strategy_id in SR.active_ids(conn=conn))
+
+
+def apply_parameter_adjustments(
+    conn: sqlite3.Connection,
+    strategy_id: str,
+    adjustments: dict[str, Any],
+    *,
+    evidence_count: int | None,
+    actor: str = "self_evolution",
+    change_note: str = "self evolution strategy parameter adjustment",
+) -> dict[str, Any]:
+    """Version one strategy after a schema-validated parameter-only change.
+
+    ``StrategyParameterSchema`` owns all validation.  This function intentionally
+    has no replacement-AST argument, so the only mutable bytes are declared
+    parameter ``value`` fields inside the already pinned strategy definition.
+    """
+    context = get_context(conn, strategy_id)
+    if not context.evolution_control.enabled:
+        raise ValueError("strategy evolution is disabled for this lifecycle state")
+    if context.compiled_dsl is None:
+        raise ValueError("strategy has no executable DSL parameter schema")
+    applied = context.parameter_schema.apply(
+        context.compiled_dsl, adjustments, evidence_count=evidence_count,
+    )
+    if not applied.changed:
+        return {
+            "adjusted": False, "strategy_id": strategy_id,
+            "version": context.version, "changed": {},
+        }
+    version = SR.save_definition(
+        conn, strategy_id, {"dsl_ast": applied.dsl_ast},
+        expected_version=context.version, actor=actor, change_note=change_note,
+    )
+    clear_cache()
+    return {
+        "adjusted": True, "strategy_id": strategy_id, "version": version.version,
+        "checksum": version.checksum, "changed": applied.changed,
+        "structure_checksum": applied.structure_checksum,
+    }
