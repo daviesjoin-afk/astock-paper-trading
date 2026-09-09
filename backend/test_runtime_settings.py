@@ -5,6 +5,12 @@ import unittest
 
 from api_settings import _planned_end
 import runtime_settings as settings
+import strategy_registry as registry
+
+
+def _rule():
+    return {"op": "gt", "left": {"op": "field", "name": "close"},
+            "right": {"op": "const", "value": 1}}
 
 
 class RuntimeSettingsTests(unittest.TestCase):
@@ -21,7 +27,7 @@ class RuntimeSettingsTests(unittest.TestCase):
         current = settings.read(self.conn)
         self.assertEqual(current["simulation"]["default_starting_capital"], 300000.0)
         self.assertEqual(current["simulation"]["cycle_duration_days"], 0)
-        self.assertEqual(current["simulation"]["enabled_strategies"], list(settings.STRATEGIES))
+        self.assertEqual(current["simulation"]["enabled_strategies"], list(registry.active_ids(conn=self.conn)))
         self.assertEqual(current["risk"]["shared_pool_position_limit"], 15)
         self.assertEqual(current["risk"]["shared_pool_exposure_cap"], 0.82)
 
@@ -39,17 +45,30 @@ class RuntimeSettingsTests(unittest.TestCase):
 
     def test_invalid_duration_and_empty_strategy_set_are_rejected(self):
         with self.assertRaises(ValueError):
-            settings.validate({"cycle_duration_days": 45})
+            settings.validate({"cycle_duration_days": 45}, conn=self.conn)
         with self.assertRaises(ValueError):
-            settings.validate({"enabled_strategies": []})
+            settings.validate({"enabled_strategies": []}, conn=self.conn)
         with self.assertRaises(ValueError):
-            settings.validate({"enabled_strategies": ["not-a-strategy"]})
+            settings.validate({"enabled_strategies": ["not-a-strategy"]}, conn=self.conn)
 
     def test_strategy_overrides_are_bounded(self):
-        value = settings.validate({"strategy_overrides": {"tq_breakout": {"style": "strong", "max_positions": 6, "max_weight_pct": 36, "max_exposure_pct": 96}}})
+        value = settings.validate({"strategy_overrides": {"tq_breakout": {"style": "strong", "max_positions": 6, "max_weight_pct": 36, "max_exposure_pct": 96}}}, conn=self.conn)
         self.assertEqual(value["strategy_overrides"]["tq_breakout"]["max_positions"], 6)
         with self.assertRaises(ValueError):
-            settings.validate({"strategy_overrides": {"tq_breakout": {"max_weight_pct": 50}}})
+            settings.validate({"strategy_overrides": {"tq_breakout": {"max_weight_pct": 50}}}, conn=self.conn)
+
+    def test_active_custom_strategy_is_setting_eligible_and_archive_is_not(self):
+        created = registry.create_user_definition(
+            self.conn, "custom_settings_probe", "Custom settings", dsl_ast=_rule(), actor="test",
+        )
+        registry.transition(self.conn, created.id, "validated", actor="test")
+        registry.transition(self.conn, created.id, "active", actor="test")
+        updated = settings.update(self.conn, {"enabled_strategies": [created.id]}, actor="test")
+        self.assertEqual(updated["simulation"]["enabled_strategies"], [created.id])
+        self.assertIn(created.id, updated["strategy"]["strategy_overrides"])
+        registry.archive_definition(self.conn, created.id, actor="test")
+        with self.assertRaisesRegex(ValueError, "未知策略"):
+            settings.validate({"enabled_strategies": [created.id]}, conn=self.conn)
 
     def test_planned_end_counts_weekdays_for_trading_day_duration(self):
         self.assertEqual(_planned_end("2026-09-04 10:00:00", 1), "2026-09-07")

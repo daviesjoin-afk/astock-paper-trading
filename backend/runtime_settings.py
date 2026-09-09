@@ -13,15 +13,11 @@ import json
 import sqlite3
 from typing import Any
 
+import strategy_registry as SR
 
-STRATEGIES = (
-    "tq_breakout",
-    "trend_pullback",
-    "sector_rotation",
-    "reported_profit_breakout",
-    "main_force_top10",
-)
 
+# Built-in values are seed preferences only.  The registry, not this mapping,
+# decides which strategy ids exist or are eligible for a new cycle.
 STRATEGY_DEFAULTS = {
     "tq_breakout": {"style": "strong", "max_positions": 3, "max_weight_pct": 32.0, "max_exposure_pct": 95.0},
     "trend_pullback": {"style": "pullback", "max_positions": 3, "max_weight_pct": 34.0, "max_exposure_pct": 95.0},
@@ -37,13 +33,13 @@ CYCLE_DURATION_OPTIONS = (15, 30, 60, 90, 180, 0)
 DEFAULTS = {
     "default_starting_capital": 300000.0,
     "cycle_duration_days": 0,
-    "enabled_strategies": list(STRATEGIES),
+    "enabled_strategies": [],
     "shared_pool_position_limit": 15,
     "shared_pool_exposure_cap": 0.82,
     "single_position_max_amount": 0.0,
     "minimum_entry_slot_utilization": 0.60,
     "evolution_interval_hours": 24,
-    "strategy_overrides": {key: dict(value) for key, value in STRATEGY_DEFAULTS.items()},
+    "strategy_overrides": {},
     # 执行画像执行器开关（PR-11）：批量窗口 / 人工核验 / TTL 清扫。
     "execution_batch_gate": True,
     "execution_verification_gate": False,
@@ -67,13 +63,13 @@ SETTING_GROUPS = {
 METADATA = {
     "default_starting_capital": {"label": "默认启动金额", "unit": "元", "apply_mode": "next_cycle", "recommended": 300000, "description": "创建新模拟周期时预填的共享资金池金额。"},
     "cycle_duration_days": {"label": "模拟周期", "unit": "交易日", "apply_mode": "next_cycle", "recommended": 0, "description": "新周期的计划观察时长；长期表示不设自动到期。"},
-    "enabled_strategies": {"label": "启用策略", "apply_mode": "next_cycle", "recommended": list(STRATEGIES), "description": "下一周期参与分配、扫描和风控的策略集合；历史周期不重写。"},
+    "enabled_strategies": {"label": "启用策略", "apply_mode": "next_cycle", "recommended": [], "description": "下一周期参与分配、扫描和风控的策略集合；候选来自可运行的策略注册表，历史周期不重写。"},
     "shared_pool_position_limit": {"label": "共享池持仓上限", "unit": "席", "apply_mode": "immediate", "recommended": 15, "description": "共享资金池的有效持仓席位硬上限。"},
     "shared_pool_exposure_cap": {"label": "共享池敞口上限", "unit": "%", "apply_mode": "immediate", "recommended": 82, "description": "所有策略合计持仓与待成交金额的硬敞口。"},
     "single_position_max_amount": {"label": "单票最大金额", "unit": "元", "apply_mode": "immediate", "recommended": 0, "description": "0 表示按策略权重自动计算；大于 0 时作为额外绝对上限。"},
     "minimum_entry_slot_utilization": {"label": "最小建仓席位利用率", "unit": "%", "apply_mode": "immediate", "recommended": 60, "description": "动态最小建仓金额使用的席位金额比例，剩余空间留给风控加仓。"},
     "evolution_interval_hours": {"label": "自进化周期", "unit": "小时", "apply_mode": "next_run", "recommended": 24, "description": "后台收盘学习任务之间的最短间隔。"},
-    "strategy_overrides": {"label": "策略参数", "apply_mode": "next_cycle", "recommended": STRATEGY_DEFAULTS, "description": "每套策略的风格、席位数和风险权重；仅允许在白名单范围内调整。"},
+    "strategy_overrides": {"label": "策略参数", "apply_mode": "next_cycle", "recommended": {}, "description": "每套策略的风格、席位数和风险权重；按可运行策略的风险画像生成。"},
     "execution_batch_gate": {"label": "批量撮合窗口", "apply_mode": "immediate", "recommended": True, "description": "轮动画像的委托挂起至收盘前批量窗口统一撮合；窗口内到达的委托仍立即成交。"},
     "execution_verification_gate": {"label": "事件人工核验", "apply_mode": "immediate", "recommended": False, "description": "开启后事件画像的每笔买入都需人工放行；关闭时按普通限价路径执行。"},
     "execution_ttl_sweep": {"label": "执行时限清扫", "apply_mode": "immediate", "recommended": True, "description": "清扫到期挂起委托：严格时限画像作废，其余自动放回重试管道。"},
@@ -92,7 +88,54 @@ def _decode(value: str, fallback: Any = None) -> Any:
         return fallback
 
 
+def eligible_strategy_ids(conn: sqlite3.Connection) -> list[str]:
+    """Return the registry's current new-cycle candidates, never a static list."""
+    SR.ensure_schema(conn)
+    return list(SR.active_ids(conn=conn))
+
+
+def _override_from_profile(conn: sqlite3.Connection, strategy_id: str) -> dict[str, Any]:
+    """Compile a settings default from the strategy's durable risk profile."""
+    # Preserve the reviewed five built-in seed defaults.  They are defaults,
+    # not an eligibility boundary; every user definition below is generated
+    # from its own compiled risk profile.
+    if strategy_id in STRATEGY_DEFAULTS:
+        return dict(STRATEGY_DEFAULTS[strategy_id])
+    readiness = SR.runtime_readiness(conn, strategy_id)
+    profile = readiness.get("risk_profile") or {}
+    soft = profile.get("soft_limits") or {}
+    fingerprint = readiness.get("fingerprint") or {}
+    archetype = str(fingerprint.get("archetype") or "").lower()
+    style = {
+        "breakout": "strong", "momentum": "strong", "trend": "pullback",
+        "mean_reversion": "pullback", "rotation": "sector", "event": "quality",
+        "event_driven": "quality", "flow": "main_force", "flow_momentum": "main_force",
+    }.get(archetype, "strong")
+    return {
+        "style": style,
+        "max_positions": int(soft.get("max_positions", 3)),
+        "max_weight_pct": round(float(soft.get("max_weight", 0.30)) * 100, 6),
+        "max_exposure_pct": round(float(soft.get("max_exposure", 0.82)) * 100, 6),
+    }
+
+
+def strategy_override_defaults(conn: sqlite3.Connection) -> dict[str, dict[str, Any]]:
+    result = {}
+    for strategy_id in eligible_strategy_ids(conn):
+        try:
+            result[strategy_id] = _override_from_profile(conn, strategy_id)
+        except Exception:
+            # A registry item is independently lifecycle-gated; keep settings
+            # conservative if a legacy/native profile cannot be compiled here.
+            result[strategy_id] = dict(STRATEGY_DEFAULTS.get(strategy_id, {
+                "style": "strong", "max_positions": 3,
+                "max_weight_pct": 30.0, "max_exposure_pct": 82.0,
+            }))
+    return result
+
+
 def ensure_schema(conn: sqlite3.Connection) -> None:
+    SR.ensure_schema(conn)
     conn.executescript(
         """
         CREATE TABLE IF NOT EXISTS paper_runtime_settings(
@@ -124,24 +167,38 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
         for key in SETTING_GROUPS[group]:
             if conn.execute("SELECT 1 FROM paper_runtime_settings WHERE key=?", (key,)).fetchone():
                 continue
-            value = DEFAULTS[key]
+            value = defaults(conn)[key]
             conn.execute(
                 "INSERT INTO paper_runtime_settings(key,value,updated_at,updated_by) VALUES(?,?,?,?)",
                 (key, _json(value), dt.datetime.now().isoformat(timespec="seconds"), "system-default"),
             )
 
 
-def defaults() -> dict[str, Any]:
-    return json.loads(_json(DEFAULTS))
+def defaults(conn: sqlite3.Connection | None = None) -> dict[str, Any]:
+    result = json.loads(_json(DEFAULTS))
+    if conn is not None:
+        result["enabled_strategies"] = eligible_strategy_ids(conn)
+        result["strategy_overrides"] = strategy_override_defaults(conn)
+    return result
 
 
 def _flat_read(conn: sqlite3.Connection) -> dict[str, Any]:
     ensure_schema(conn)
-    result = defaults()
+    result = defaults(conn)
     for row in conn.execute("SELECT key,value FROM paper_runtime_settings"):
         if row[0] in result:
             value = _decode(row[1], result[row[0]])
-            result[row[0]] = value
+            if row[0] == "strategy_overrides" and isinstance(value, dict):
+                # Existing records are a user overlay.  Rebase it on today's
+                # registry-derived profiles so newly active strategies receive
+                # defaults and archived ones cease being configuration targets.
+                generated = result["strategy_overrides"]
+                result[row[0]] = {
+                    strategy_id: {**generated[strategy_id], **value.get(strategy_id, {})}
+                    for strategy_id in generated
+                }
+            else:
+                result[row[0]] = value
     return result
 
 
@@ -157,8 +214,12 @@ def flat_read(conn: sqlite3.Connection) -> dict[str, Any]:
     return _flat_read(conn)
 
 
-def metadata() -> dict[str, Any]:
-    return json.loads(_json(METADATA))
+def metadata(conn: sqlite3.Connection | None = None) -> dict[str, Any]:
+    result = json.loads(_json(METADATA))
+    if conn is not None:
+        result["enabled_strategies"]["recommended"] = eligible_strategy_ids(conn)
+        result["strategy_overrides"]["recommended"] = strategy_override_defaults(conn)
+    return result
 
 
 def get(conn: sqlite3.Connection, key: str, fallback: Any = None) -> Any:
@@ -185,7 +246,7 @@ def _number(value: Any, key: str, low: float, high: float, integer: bool = False
     return round(number, 6)
 
 
-def validate(updates: dict[str, Any]) -> dict[str, Any]:
+def validate(updates: dict[str, Any], *, conn: sqlite3.Connection | None = None) -> dict[str, Any]:
     if not isinstance(updates, dict):
         raise ValueError("设置更新必须是对象")
     unknown = set(updates) - set(DEFAULTS)
@@ -206,9 +267,10 @@ def validate(updates: dict[str, Any]) -> dict[str, Any]:
         if not isinstance(value, list) or not value:
             raise ValueError("至少启用一套策略")
         normalized = []
+        eligible = set(eligible_strategy_ids(conn)) if conn is not None else set(SR.active_ids())
         for item in value:
             item = str(item)
-            if item not in STRATEGIES:
+            if item not in eligible:
                 raise ValueError(f"未知策略: {item}")
             if item not in normalized:
                 normalized.append(item)
@@ -230,8 +292,18 @@ def validate(updates: dict[str, Any]) -> dict[str, Any]:
         raw = updates["strategy_overrides"]
         if not isinstance(raw, dict):
             raise ValueError("策略参数必须是对象")
+        eligible = eligible_strategy_ids(conn) if conn is not None else list(SR.active_ids())
+        unknown = set(raw) - set(eligible)
+        if unknown:
+            raise ValueError(f"未知策略: {sorted(unknown)[0]}")
+        generated = strategy_override_defaults(conn) if conn is not None else {
+            strategy_id: dict(STRATEGY_DEFAULTS.get(strategy_id, {
+                "style": "strong", "max_positions": 3, "max_weight_pct": 30, "max_exposure_pct": 82,
+            })) for strategy_id in eligible
+        }
         checked_overrides = {}
-        for strategy_id, defaults_for_strategy in STRATEGY_DEFAULTS.items():
+        for strategy_id in eligible:
+            defaults_for_strategy = generated[strategy_id]
             candidate = raw.get(strategy_id, defaults_for_strategy)
             if not isinstance(candidate, dict):
                 raise ValueError(f"{strategy_id}策略参数必须是对象")
@@ -266,7 +338,7 @@ def _boolean(value: Any, key: str) -> bool:
 
 def update(conn: sqlite3.Connection, updates: dict[str, Any], actor: str = "human-ui",
            *, risk_evidence: dict[str, Any] | None = None) -> dict[str, Any]:
-    checked = validate(updates)
+    checked = validate(updates, conn=conn)
     current = _flat_read(conn)
     # 非对称风险进化（PR）：strategy_overrides 的风险方向变化必须过闸——
     # 放大需要严格证据 + 持久化观察期 + 单轮幅度上限；收紧（安全方向）直接放行。
@@ -337,8 +409,9 @@ def audit(conn: sqlite3.Connection, limit: int = 50) -> list[dict[str, Any]]:
 
 
 def enabled_strategies(conn: sqlite3.Connection) -> list[str]:
-    value = get(conn, "enabled_strategies", list(STRATEGIES))
-    return [item for item in value if item in STRATEGIES] or list(STRATEGIES)
+    eligible = eligible_strategy_ids(conn)
+    value = get(conn, "enabled_strategies", eligible)
+    return [item for item in value if item in eligible] or eligible
 
 
 def cycle_duration_label(days: int | None) -> str:
