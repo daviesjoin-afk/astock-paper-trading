@@ -7783,25 +7783,16 @@ def _dynamic_position_limits(conn):
     }
 
 
-def _strategy_pool_budget(conn, account, nav, positions, quotes, market=None, exclude_reservation_key=None):
-    """Return the fair shared-pool budget for one strategy.
+def _strategy_pool_weights(conn, rows, profiles):
+    """共享池相对权重：active 的 adaptive_allocation 覆盖优先，否则 max_exposure。
 
-    ``target_amount`` is a soft target, ``floor_amount`` is the amount kept
-    available for the other strategies, and ``allowance_amount`` is the
-    actual additional amount this strategy may open right now.  All values
-    are derived from the same live quote snapshot used by the order gate.
+    预算计算与分配解释必须使用**同一个**优先级来源，否则解释与实际分配背离。
     """
-    rows = _shared_account_rows(conn)
-    if not rows:
-        rows = [account]
-    values = {}
-    profiles = {}
     weights = {}
-    for row in rows:
+    for row in rows or []:
         row_id = row.get("id")
         if not row_id:
             continue
-        profiles[row_id] = _risk_profile(row)
         # A1 自进化落地：人工批准的 Bandit 策略权重覆盖共享池相对权重。
         # 覆盖按 paper_accounts.params.adaptive_allocation 存储（status=active、
         # 自带 effective_date），缺省或过期时回落到 max_exposure 基准。
@@ -7813,8 +7804,27 @@ def _strategy_pool_budget(conn, account, nav, positions, quotes, market=None, ex
                     alloc.get("effective_date"), status=alloc.get("status"))):
             weights[row_id] = alloc_pct / 100.0
         else:
-            weights[row_id] = max(_num(profiles[row_id].get("max_exposure"), 0.0), 0.01)
-        values[row_id] = 0.0
+            profile = profiles.get(row_id) or {}
+            weights[row_id] = max(_num(profile.get("max_exposure"), 0.0), 0.01)
+    return weights
+
+
+def _strategy_pool_budget(conn, account, nav, positions, quotes, market=None, exclude_reservation_key=None):
+    """Return the fair shared-pool budget for one strategy.
+
+    ``target_amount`` is a soft target, ``floor_amount`` is the amount kept
+    available for the other strategies, and ``allowance_amount`` is the
+    actual additional amount this strategy may open right now.  All values
+    are derived from the same live quote snapshot used by the order gate.
+    """
+    rows = _shared_account_rows(conn)
+    if not rows:
+        rows = [account]
+    profiles = {
+        row.get("id"): _risk_profile(row) for row in rows if row.get("id")
+    }
+    weights = _strategy_pool_weights(conn, rows, profiles)
+    values = {row.get("id"): 0.0 for row in rows if row.get("id")}
     if account.get("id") not in values:
         account_id = account.get("id")
         profiles[account_id] = _risk_profile(account)
@@ -8146,6 +8156,122 @@ def rollback_strategy_challenger(strategy_id, reason="manual_rollback"):
             return SCM.rollback_challenger(conn, evo_conn, strategy_id, reason=reason)
         finally:
             evo_conn.close()
+
+
+def strategy_allocation_explain():
+    """PR-17：资金分配可解释性——回答"这个策略为什么拿到当前资金"。
+
+    每个策略返回：base_priority、regime（市场灯与缩放）、confidence/health/
+    data_quality/diversification 六因子、capital_scale、目标预算、可用预算、
+    席位上限、以及当前未部署的等待原因。纯只读，不影响任何交易。
+    """
+    init_db()
+    with _db() as conn:
+        day = _date()
+        cycle = _active_cycle(conn)
+        # 行情估值走缓存快照（离线回落成本价），尽量与执行路径同口径。
+        try:
+            quotes_map = {str(row.get("code")): row
+                          for row in (dfc.fetch_market_snapshot_full(max_age=240) or [])
+                          if row.get("code")}
+        except Exception:
+            quotes_map = {}
+        try:
+            market = _market_state(day, allow_network=False) or {}
+        except Exception:
+            market = {}
+        market_light = str(market.get("light") or "")
+        positions, _position_value, nav, _industries, _code_values = \
+            _shared_account_exposure(conn, quotes_map, day)
+        count_budget = _dynamic_position_limits(conn)
+        rows_map = {row.get("id"): row for row in _shared_account_rows(conn, cycle["id"])}
+        participating = list(count_budget["limits"].keys()) or list(ACCOUNT_SPECS)
+        clusters, cluster_factors = _strategy_cluster_factors(
+            conn, account_ids=participating)
+        strategies = []
+        for account_id in participating:
+            account_row = rows_map.get(account_id) or {"id": account_id}
+            weights = _strategy_pool_weights(conn, list(rows_map.values()), {
+                row_id: _risk_profile(row) for row_id, row in rows_map.items()})
+            runtimes = _strategy_runtimes(
+                participating, weights,
+                diversification={key: cluster_factors.get(key, 1.0) for key in participating},
+            )
+            runtime = next((item for item in runtimes if item.strategy_id == account_id), None)
+            budget = _strategy_pool_budget(
+                conn, account_row, nav, positions, quotes_map, market=market,
+            )
+            # 等待原因：该策略最新的未部署信号原因。
+            waiting = conn.execute(
+                """SELECT status,reason,code,intended_date FROM paper_signals
+                    WHERE account_id=? AND intended_date=?
+                      AND status IN ('deferred_capacity','awaiting_batch',
+                                     'pending_verification','entry_frozen_waitlist')
+                    ORDER BY id DESC LIMIT 1""",
+                (account_id, day.isoformat()),
+            ).fetchone()
+            waiting_row = dict(waiting) if waiting is not None else None
+            pending_by_account, pending_total = _pending_buy_reservations(conn)
+            stage_scale, stage_label = PA.stage_capital_scale(runtime) if runtime else (1.0, "standard")
+            strategies.append({
+                "strategy_id": account_id,
+                "name": (SR.get(account_id).name if SR.get(account_id) else account_id),
+                "running": account_row.get("status") == "running",
+                # 分配六因子
+                "base_priority": round(_num(weights.get(account_id)), 6),
+                "regime": {
+                    "market_light": market_light or "unknown",
+                    "market_scale_pct": budget.get("market_scale_pct"),
+                    "market_scale_applied": budget.get("market_scale_applied"),
+                },
+                "confidence": round(_num(getattr(runtime, "confidence", 1.0)), 4),
+                "health": round(_num(getattr(runtime, "health", 1.0)), 4),
+                "data_quality": round(_num(getattr(runtime, "data_quality", 1.0)), 4),
+                "diversification": {
+                    "runtime_factor": round(_num(getattr(runtime, "diversification", 1.0)), 4),
+                    "cluster_size": len(SC.cluster_of(account_id, clusters)),
+                    "cluster_members": sorted(SC.cluster_of(account_id, clusters)),
+                },
+                "capital_scale": {
+                    "factor": round(_num(stage_scale), 4),
+                    "lifecycle_stage": stage_label,
+                },
+                # 预算
+                "target_budget": {
+                    "target_amount": budget.get("target_amount"),
+                    "target_pct": budget.get("target_pct"),
+                    "floor_amount": budget.get("floor_amount"),
+                    "priority_floor_amount": budget.get("priority_floor_amount"),
+                    "absolute_cap_amount": budget.get("absolute_cap_amount"),
+                },
+                "available_budget": {
+                    "allowance_amount": budget.get("allowance_amount"),
+                    "current_amount": budget.get("current_amount"),
+                    "pending_reserve_amount": budget.get("pending_reserve_amount"),
+                    "pool_available_amount": budget.get("pool_available_amount"),
+                    "cluster_budget": budget.get("cluster_budget"),
+                },
+                "position_limit": int(_num(count_budget["limits"].get(account_id))),
+                "position_count": sum(
+                    1 for item in positions
+                    if item.get("account_id") == account_id
+                    and int(_num(item.get("qty"))) >= LOT_SIZE
+                ),
+                "waiting_reason": {
+                    "status": waiting_row.get("status") if waiting_row else None,
+                    "code": waiting_row.get("code") if waiting_row else None,
+                    "reason": waiting_row.get("reason") if waiting_row else None,
+                    "intended_date": waiting_row.get("intended_date") if waiting_row else None,
+                },
+            })
+        return {
+            "engine": PA.ALLOCATION_ENGINE_VERSION,
+            "nav": round(_num(nav), 2),
+            "pool_limit": int(_num(count_budget["pool_limit"])),
+            "market_light": market_light or "unknown",
+            "cluster_version": SC.STRATEGY_CLUSTER_VERSION,
+            "strategies": strategies,
+        }
 
 
 def resolve_execution_verification(order_id, approved, operator="", note=""):
