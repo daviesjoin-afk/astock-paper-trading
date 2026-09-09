@@ -262,6 +262,15 @@ def allocation_explain():
         raise HTTPException(status_code=500, detail=f"Allocation explain failed: {type(exc).__name__}") from exc
 
 
+@router.post("/strategy-preview")
+async def strategy_preview(payload: dict | None = None):
+    """PR-18 创建预览：Risk Fingerprint、推荐画像、执行方式、边界与高风险 override。"""
+    try:
+        return _call_with_retry(P.strategy_creation_preview, payload or {})
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Strategy preview failed: {type(exc).__name__}") from exc
+
+
 @router.get("/strategy-champions")
 def strategy_champions():
     """PR-16 Champion/Challenger 视图：版本与影子评估（只读，附带评估落库）。"""
