@@ -106,3 +106,40 @@ class ApiWiringTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ReviewFixTests(unittest.TestCase):
+    """P1/P2 回归：hold 基线存在、风格别名归一化。"""
+
+    def test_full_draft_with_holding_fields_does_not_crash(self):
+        # 模拟 ACCOUNT_SPECS 形态的完整草稿：hold_max 覆盖比较必须有基线。
+        preview = SCP.strategy_creation_preview({
+            "style": "板块轮动", "hold_max": 7, "hold_min": 3,
+            "max_positions": 3,
+        }, RISK_PROFILES)
+        self.assertIn("hold_max", preview["recommended"]["limits"])
+        self.assertIn("hold_min", preview["recommended"]["limits"])
+
+    def test_shorter_hold_than_baseline_is_flagged(self):
+        preview = SCP.strategy_creation_preview({
+            "style": "板块轮动", "hold_min": 1,
+        }, RISK_PROFILES)
+        flagged = {item["key"] for item in preview["high_risk_overrides"]}
+        self.assertIn("hold_min", flagged)
+
+    def test_style_aliases_map_to_archetypes(self):
+        cases = {
+            "strong": "breakout",
+            "pullback": "trend",
+            "sector": "rotation",
+            "quality": "event_driven",
+            "main_force": "flow_momentum",
+        }
+        for alias, expected in cases.items():
+            preview = SCP.strategy_creation_preview({"style": alias}, RISK_PROFILES)
+            self.assertEqual(expected, preview["risk_fingerprint"]["archetype"],
+                             alias)
+
+    def test_chinese_natural_labels_are_normalized(self):
+        preview = SCP.strategy_creation_preview({"style": "板块轮动"}, RISK_PROFILES)
+        self.assertEqual("rotation", preview["risk_fingerprint"]["archetype"])
