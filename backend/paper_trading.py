@@ -39,6 +39,8 @@ import paper_allocation as PA
 import entry_lifecycle as ELC
 import execution_dispatch as EPD
 import portfolio_coordinator as PCO
+import self_evolution as SE
+import strategy_champion as SCM
 import strategy_clusters as SC
 import execution_profiles as EPF
 import paper_sizing as PSZ
@@ -1957,6 +1959,7 @@ def init_db():
                 _reconcile_signal_order_states(conn)
                 _ensure_performance_indexes(conn)
                 _ensure_ignition_shadow_table(conn)
+                SCM.ensure_schema(conn)
                 return
     except Exception:
         pass
@@ -2241,6 +2244,7 @@ def init_db():
         _recover_stale_runtime_state(conn)
         _reconcile_signal_order_states(conn)
         _ensure_performance_indexes(conn)
+        SCM.ensure_schema(conn)
         _RUNNER_BOOT_RECOVERED = True
     # H9: 建表/迁移/启动回收是批量写，显式收缩 WAL，避免 -wal 无界增长。
     _wal_checkpoint()
@@ -8057,6 +8061,91 @@ def execution_profile_center():
         "accounts": rows,
         "dispatch": dispatch,
     }
+
+
+def _evolution_conn():
+    """打开自进化参数仓（adaptive_learning.sqlite3）连接；调用方负责关闭。"""
+    import db_migrate as DBM
+
+    conn = sqlite3.connect(DBM.DB_PATHS["adaptive_learning"], timeout=30)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def strategy_champion_overview():
+    """PR-16：Champion/Challenger 视图（版本 + 影子评估），纯只读。
+
+    评估带自动回滚（失败恢复 Champion 参数），但绝不触发晋升——晋升只走
+    显式 promote 端点。
+    """
+    init_db()
+    with _db() as conn:
+        SCM.ensure_schema(conn)
+        evo_conn = _evolution_conn()
+        try:
+            SE.ensure_schema(evo_conn)
+            evaluations = {
+                account_id: SCM.evaluate_challenger(conn, evo_conn, account_id)
+                for account_id in ACCOUNT_SPECS
+            }
+        finally:
+            evo_conn.close()
+        rows = _rows(conn.execute(
+            """SELECT id,strategy_id,role,params,base_version_id,source,status,
+                      proposed_at,evaluated_at,metrics,decision
+                 FROM strategy_champion_versions ORDER BY id DESC LIMIT 80"""
+        ).fetchall())
+        for row in rows:
+            row["params"] = _loads(row.get("params"), {})
+            row["metrics"] = _loads(row.get("metrics"), {})
+            row["decision"] = _loads(row.get("decision"), {})
+    return {
+        "engine": SCM.STRATEGY_CHAMPION_VERSION,
+        "versions": rows,
+        "evaluations": evaluations,
+    }
+
+
+def open_strategy_challenger(strategy_id, params, source="manual", evidence_count=None):
+    """PR-16：为策略开启影子 Challenger（参数写入运行仓，失败自动回滚）。"""
+    init_db()
+    with _db() as conn:
+        SCM.ensure_schema(conn)
+        evo_conn = _evolution_conn()
+        try:
+            SE.ensure_schema(evo_conn)
+            return SCM.open_challenger(
+                conn, evo_conn, strategy_id, params,
+                source=source, evidence_count=evidence_count,
+            )
+        finally:
+            evo_conn.close()
+
+
+def promote_strategy_challenger(strategy_id):
+    """PR-16：晋升通过门禁的 Challenger（收益改善且风险不恶化）。"""
+    init_db()
+    with _db(immediate=True) as conn:
+        SCM.ensure_schema(conn)
+        evo_conn = _evolution_conn()
+        try:
+            SE.ensure_schema(evo_conn)
+            return SCM.promote_challenger(conn, evo_conn, strategy_id)
+        finally:
+            evo_conn.close()
+
+
+def rollback_strategy_challenger(strategy_id, reason="manual_rollback"):
+    """PR-16：丢弃 Challenger 并恢复 Champion 参数（显式/自动回滚共用）。"""
+    init_db()
+    with _db(immediate=True) as conn:
+        SCM.ensure_schema(conn)
+        evo_conn = _evolution_conn()
+        try:
+            SE.ensure_schema(evo_conn)
+            return SCM.rollback_challenger(conn, evo_conn, strategy_id, reason=reason)
+        finally:
+            evo_conn.close()
 
 
 def resolve_execution_verification(order_id, approved, operator="", note=""):
