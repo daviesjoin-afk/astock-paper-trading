@@ -327,12 +327,27 @@ class CapitalEligibilityTests(unittest.TestCase):
             with self.subTest(stage=stage):
                 result = allocation.deployable_budget(
                     budget_amount=10000.0, price=21.5,
-                    capital_scale=allocation.DEFAULT_STAGE_CAPITAL_SCALE[stage])
+                    capital_scale=allocation.DEFAULT_STAGE_CAPITAL_SCALE[stage],
+                    lifecycle_stage=stage)
                 self.assertEqual(0, result["lots"])
                 self.assertEqual(0.0, result["deployable_amount"])
-                # 生命周期系数为 0：既不部署、也没有等待资金（ entitlement 归零）。
-                self.assertEqual(0.0, result["waiting_capital"])
+                # 生命周期系数为 0：不部署一分钱，但整笔预算仍挂在等待池账上
+                # （被阶段系数扣留的资金不能从账目中消失）。
+                self.assertEqual(10000.0, result["waiting_capital"])
+                self.assertEqual(10000.0, result["lifecycle_withheld_amount"])
                 self.assertEqual(0.0, result["scaled_budget"])
+
+    def test_pilot_waiting_capital_keeps_the_withheld_majority(self):
+        """pilot 系数 0.25：等待池要含全部未部署预算，而非只剩缩放后的零头。"""
+        result = allocation.deployable_budget(
+            budget_amount=10000.0, price=21.5, capital_scale=0.25,
+            lifecycle_stage="pilot")
+        # 10000 × 0.25 = 2500 → 21.5 元/股 × 100 股/手 = 2150 元/手 → 1 手。
+        self.assertEqual(1, result["lots"])
+        self.assertEqual(2150.0, result["deployable_amount"])
+        self.assertEqual(7850.0, result["waiting_capital"])
+        self.assertEqual(7500.0, result["lifecycle_withheld_amount"])
+        self.assertEqual(2500.0, result["scaled_budget"])
 
 
 class AllocationPlanPropertyTests(unittest.TestCase):
@@ -383,13 +398,14 @@ class AllocationPlanPropertyTests(unittest.TestCase):
                     else:
                         self.assertEqual(0.0, row["deployable_amount"])
                         self.assertTrue(row["blocked_reason"])
+                    # 部署 + 等待 = 原始预算（含被生命周期系数扣留的部分）。
                     self.assertAlmostEqual(row["deployable_amount"] + row["waiting_capital"],
-                                           row["scaled_budget_amount"], delta=0.02)
+                                           row["budget_amount"], delta=0.02)
                 # ③ waiting 与 deployable 的账目自洽；
-                scaled_total = sum(row["scaled_budget_amount"] for row in plan["plan"])
-                self.assertLessEqual(
+                budget_total = sum(row["budget_amount"] for row in plan["plan"])
+                self.assertAlmostEqual(
                     plan["total_deployable_amount"] + plan["total_waiting_capital"],
-                    scaled_total + count * 0.02 + 0.02)
+                    budget_total, delta=count * 0.02 + 0.02)
                 # ④ shadow/quarantined 永远 0 部署。
                 for row in plan["plan"]:
                     if row["lifecycle_stage"] in ("shadow", "quarantined"):
@@ -465,6 +481,9 @@ class AllocationPlanPropertyTests(unittest.TestCase):
             self.assertEqual(0, row["lots"])
             self.assertEqual(0.0, row["deployable_amount"])
             self.assertIn("生命周期阶段", row["blocked_reason"] or "")
+            # 整笔预算留在等待池，不因阶段系数为 0 而蒸发。
+            self.assertEqual(row["budget_amount"], row["waiting_capital"])
+            self.assertEqual(row["budget_amount"], row["lifecycle_withheld_amount"])
         self.assertTrue(rows["standard_one"]["allowed"])
         self.assertGreater(rows["standard_one"]["deployable_amount"], 0.0)
 

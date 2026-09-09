@@ -86,7 +86,9 @@ class StrategyRuntimeContext:
     settings_revision: str
 
 
-_CACHE: dict[tuple[str, int, str, str], StrategyRuntimeContext] = {}
+# 键包含 strategy status 与生命周期阶段：策略暂停/下线后必须让旧缓存失效，
+# 否则 pilot/standard 的旧额度会继续被复用（PR-26 评审 P1）。
+_CACHE: dict[tuple[str, int, str, str, str, str], StrategyRuntimeContext] = {}
 
 
 def settings_revision(conn: sqlite3.Connection) -> str:
@@ -112,7 +114,10 @@ def get_context(conn: sqlite3.Connection, strategy_id: str, *, settings_rev: str
     if version is None:
         raise ValueError("strategy has no immutable version")
     revision = settings_rev if settings_rev is not None else settings_revision(conn)
-    key = (spec.id, version.version, version.checksum, revision)
+    status = str(getattr(spec, "status", "") or "").strip().lower()
+    # PR-26 评审 P1：生命周期阶段参与缓存键，状态迁移（active→paused 等）立即生效。
+    stage = lifecycle_stage_for(spec)
+    key = (spec.id, version.version, version.checksum, revision, status, stage)
     cached = _CACHE.get(key)
     if cached is not None:
         return cached
@@ -124,7 +129,6 @@ def get_context(conn: sqlite3.Connection, strategy_id: str, *, settings_rev: str
     execution = EP.execution_profile_for(fingerprint)
     soft = risk.soft_limits
     # PR-26：生命周期阶段来自注册表的真实状态，不再是 active/shadow 二选一。
-    stage = lifecycle_stage_for(spec)
     allocation = PA.StrategyRuntime(
         strategy_id=spec.id,
         base_priority=max(float(soft.get("max_exposure", 0.65)), 0.01),
@@ -140,7 +144,7 @@ def get_context(conn: sqlite3.Connection, strategy_id: str, *, settings_rev: str
         capital_scale=PA.stage_capital_scale(allocation)[0],
         allocation_runtime=allocation,
         evolution_control=EvolutionControlProfile(
-            enabled=spec.status == "active", lifecycle_stage=allocation.lifecycle_stage,
+            enabled=status == "active", lifecycle_stage=allocation.lifecycle_stage,
             interval_hours=24,
         ),
         parameter_schema=StrategyParameterSchema(

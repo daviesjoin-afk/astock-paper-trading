@@ -69,6 +69,22 @@ class StrategyRuntimeTests(unittest.TestCase):
         self.assertEqual(context.lifecycle_stage, "quarantined")
         self.assertEqual(context.capital_scale, 0.0)
 
+    def test_lifecycle_transition_invalidates_the_cached_context(self):
+        """PR-26 评审 P1：状态迁移必须让旧上下文失效，不能靠手动清缓存。"""
+        before = runtime.get_context(self.conn, "runtime_breakout", settings_rev="1")
+        self.assertEqual(before.lifecycle_stage, "pilot")
+        registry.transition(self.conn, "runtime_breakout", "paused", actor="test")
+        after = runtime.get_context(self.conn, "runtime_breakout", settings_rev="1")
+        self.assertIsNot(before, after)
+        self.assertEqual(after.lifecycle_stage, "quarantined")
+        self.assertEqual(after.capital_scale, 0.0)
+        self.assertFalse(after.evolution_control.enabled)
+        # 迁回 active 同样要立刻反映，而不是复用 quarantine 的上下文。
+        registry.transition(self.conn, "runtime_breakout", "active", actor="test")
+        revived = runtime.get_context(self.conn, "runtime_breakout", settings_rev="1")
+        self.assertEqual(revived.lifecycle_stage, "pilot")
+        self.assertTrue(revived.evolution_control.enabled)
+
     def test_builtin_active_strategy_deploys_at_full_scale(self):
         builtin = registry.get("tq_breakout", conn=self.conn)
         if builtin is None:

@@ -473,9 +473,15 @@ def deployable_budget(
     不变式（PR-08）：预算不足一手时**绝不生成碎片订单**——
     ``lots == 0`` 且全部预算进入 ``waiting_capital``，不允许出现
     ``0 < deployable < 一手成本`` 的碎片。
+
+    PR-26：``waiting_capital`` 统计的是**原始预算减去实际部署额**，
+    因此被生命周期系数扣留的部分（shadow/quarantined 的 100%、pilot 的 75%）
+    也留在等待池账上，不会从资金账目里凭空消失；
+    ``lifecycle_withheld_amount`` 单独给出这笔被阶段系数扣下的金额。
     """
     round2 = lambda value: round(value, 2)
-    scaled = max(float(budget_amount or 0.0), 0.0) * _unit(capital_scale, 0.0)
+    budget = max(float(budget_amount or 0.0), 0.0)
+    scaled = budget * _unit(capital_scale, 0.0)
     try:
         usable_price = max(float(price or 0.0), 0.0) * max(float(price_buffer), 1.0)
     except (TypeError, ValueError):
@@ -498,8 +504,9 @@ def deployable_budget(
             "allowed": False,
             "lots": 0,
             "deployable_amount": 0.0,
-            "waiting_capital": round2(scaled),
+            "waiting_capital": round2(budget),
             "scaled_budget": round2(scaled),
+            "lifecycle_withheld_amount": round2(max(0.0, budget - scaled)),
             "one_lot_cost": round2(one_lot_cost),
             "reason": reason,
         }
@@ -509,8 +516,9 @@ def deployable_budget(
         "allowed": True,
         "lots": lots,
         "deployable_amount": round2(deployable),
-        "waiting_capital": round2(max(0.0, scaled - deployable)),
+        "waiting_capital": round2(max(0.0, budget - deployable)),
         "scaled_budget": round2(scaled),
+        "lifecycle_withheld_amount": round2(max(0.0, budget - scaled)),
         "one_lot_cost": round2(one_lot_cost),
         "reason": None,
     }
@@ -592,6 +600,7 @@ def allocation_plan(
             "lots": deployment["lots"],
             "deployable_amount": deployment["deployable_amount"],
             "waiting_capital": deployment["waiting_capital"],
+            "lifecycle_withheld_amount": deployment["lifecycle_withheld_amount"],
             "blocked_reason": deployment["reason"],
             "allowed": bool(deployment["allowed"]),
         })
