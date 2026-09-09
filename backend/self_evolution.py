@@ -546,6 +546,21 @@ def manual_adjust(conn, adjustments: dict, reason: str = "manual") -> dict:
 # ---------------------------------------------------------------------------
 
 
+def adjust_strategy_dsl_parameters(paper_conn, strategy_id: str, adjustments: dict,
+                                   *, evidence_count: int | None,
+                                   actor: str = "self_evolution") -> dict:
+    """让自进化写入策略定义版本，而不是只更新调参器控制参数。
+
+    该入口只转交给 ``StrategyParameterSchema``：它不能接受替换 AST，
+    因而无法自动增加/删除条件或改变运算符。
+    """
+    import strategy_runtime as runtime
+    return runtime.apply_parameter_adjustments(
+        paper_conn, strategy_id, adjustments, evidence_count=evidence_count,
+        actor=actor,
+    )
+
+
 def _ensure_strategy_column(conn) -> None:
     """幂等补齐 evolution_params.strategy_id 列（旧库迁移）。"""
     columns = {row[1] for row in conn.execute("PRAGMA table_info(evolution_params)").fetchall()}
