@@ -251,6 +251,17 @@ def strategy_center():
         raise HTTPException(status_code=500, detail=f"Strategy center failed: {type(exc).__name__}") from exc
 
 
+@router.get("/allocation-explain")
+def allocation_explain():
+    """PR-17 分配可解释性：每个策略为什么得到当前资金（base priority、
+    regime、confidence、health、correlation penalty、capital scale、
+    target/available budget、position limit、waiting reason）。"""
+    try:
+        return _call_with_retry(P.strategy_allocation_explain)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Allocation explain failed: {type(exc).__name__}") from exc
+
+
 @router.get("/strategy-champions")
 def strategy_champions():
     """PR-16 Champion/Challenger 视图：版本与影子评估（只读，附带评估落库）。"""
