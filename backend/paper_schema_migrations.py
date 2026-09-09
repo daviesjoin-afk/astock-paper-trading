@@ -40,7 +40,14 @@ def ensure_paper_columns(conn):
             "origin": "TEXT NOT NULL DEFAULT 'strategy'",
             "expires_at": "TEXT",
             "cancelled_at": "TEXT",
+            "retry_of_order_id": "INTEGER",
         },
+    )
+    # 归档表列集必须与活跃表一致（retention 用 SELECT * 整行拷贝）。
+    changes["paper_orders_archive"] = ensure_columns(
+        conn,
+        "paper_orders_archive",
+        {"retry_of_order_id": "INTEGER"},
     )
     changes["paper_position_lots"] = ensure_columns(
         conn,
@@ -66,6 +73,15 @@ def ensure_paper_columns(conn):
             "cooldown_until": "TEXT",
         },
     )
+    return changes
+
+
+def ensure_order_lineage_column(conn):
+    """PR-29：订单重试血缘列 retry_of_order_id（活跃表 + 归档表，幂等）。"""
+    definitions = {"retry_of_order_id": "INTEGER"}
+    changes = {}
+    for table in ("paper_orders", "paper_orders_archive"):
+        changes[table] = ensure_columns(conn, table, definitions)
     return changes
 
 
