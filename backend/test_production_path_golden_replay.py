@@ -228,7 +228,9 @@ def _fake_quotes(codes, asof_date=None):
     return result
 
 
-class ProductionPathGoldenReplayTests(unittest.TestCase):
+class OfflinePaperEnv:
+    """共享离线回放环境：临时目录 + 依赖注入补丁（黄金回放/归档回放共用）。"""
+
     @classmethod
     def setUpClass(cls):
         cls._tmp = tempfile.mkdtemp(prefix="astock-golden-v2-")
@@ -347,6 +349,9 @@ class ProductionPathGoldenReplayTests(unittest.TestCase):
 
     def _one(self, conn, sql, params=()):
         return conn.execute(sql, params).fetchone()
+
+
+class ProductionPathGoldenReplayTests(OfflinePaperEnv, unittest.TestCase):
 
     # ---------- 测试 ----------
 
