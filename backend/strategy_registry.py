@@ -126,6 +126,24 @@ def _canonical_definition(*, name, implementation_key, description="", metadata=
     return payload, canonical, checksum
 
 
+def _definitions_equal(current_definition, candidate):
+    """Compare definition content while accepting the v6 missing-DSL shape.
+
+    Migration v7 introduced ``dsl_ast``.  A v6 immutable snapshot legitimately
+    lacks that key, and it means the same thing as a null DSL for native
+    built-ins.  Do not create a synthetic version merely to add that spelling.
+    """
+    current = dict(current_definition or {})
+    proposed = dict(candidate or {})
+    if current.get("dsl_ast") is None:
+        current.pop("dsl_ast", None)
+    if proposed.get("dsl_ast") is None:
+        proposed.pop("dsl_ast", None)
+    return json.dumps(current, sort_keys=True, separators=(",", ":"), ensure_ascii=False) == json.dumps(
+        proposed, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+    )
+
+
 def _add_column(conn, table, name, definition):
     columns = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
     if columns and name not in columns:
@@ -623,7 +641,7 @@ def save_definition(conn, strategy_id, changes, *, expected_version=None,
     merged = dict(current.definition)
     merged.update(dict(changes or {}))
     payload, canonical, checksum = _canonical_definition(**merged)
-    if checksum == current.checksum:
+    if checksum == current.checksum or _definitions_equal(current.definition, payload):
         return current
     next_version = current.version + 1
     now = _now()
