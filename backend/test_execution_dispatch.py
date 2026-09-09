@@ -190,15 +190,34 @@ class GatedOrderTests(unittest.TestCase):
 
 
 class SweepTests(unittest.TestCase):
-    def test_expired_batch_order_is_released_not_lost(self):
+    def test_expired_batch_order_rearms_a_fresh_signal(self):
+        """PR-29：过期挂起委托终态化，信号仍新鲜时送回复试管道。"""
+        conn = _db()
+        order_id = _order(conn, expires_at="2026-09-08T15:15:00")
+        # 让信号仍新鲜（复核管道只在信号 fresh 时重建新委托）。
+        conn.execute(
+            "UPDATE paper_signals SET created_at='2026-09-08 15:20:00' WHERE id=1")
+        conn.commit()
+        summary = EPD.run_execution_dispatch(conn, now=dt.datetime(2026, 9, 8, 15, 30))
+        self.assertEqual(1, summary["released"])
+        order = _row(conn, "paper_orders", order_id)
+        self.assertEqual("superseded", order["status"])
+        self.assertIsNotNone(order["cancelled_at"])
+        self.assertEqual("pending", _row(conn, "paper_signals", 1)["status"])
+        # 绝不允许出现 execution_retry 状态的旧 order row。
+        retry_rows = conn.execute(
+            "SELECT COUNT(*) FROM paper_orders WHERE status='execution_retry'"
+        ).fetchone()[0]
+        self.assertEqual(0, retry_rows)
+
+    def test_expired_batch_order_with_stale_signal_expires(self):
+        """PR-29：信号已过有效期时，委托与信号一并收敛为终态。"""
         conn = _db()
         order_id = _order(conn, expires_at="2026-09-08T15:15:00")
         summary = EPD.run_execution_dispatch(conn, now=dt.datetime(2026, 9, 8, 15, 30))
         self.assertEqual(1, summary["released"])
-        order = _row(conn, "paper_orders", order_id)
-        self.assertEqual("execution_retry", order["status"])
-        signal = _row(conn, "paper_signals", 1)
-        self.assertEqual("pending", signal["status"])
+        self.assertEqual("superseded", _row(conn, "paper_orders", order_id)["status"])
+        self.assertEqual("expired", _row(conn, "paper_signals", 1)["status"])
 
     def test_strict_ttl_order_expires_terminally(self):
         conn = _db()
@@ -211,7 +230,7 @@ class SweepTests(unittest.TestCase):
         order = _row(conn, "paper_orders", order_id)
         self.assertEqual(EPD.EXPIRED_ORDER_STATUS, order["status"])
         self.assertIsNotNone(order["cancelled_at"])
-        self.assertEqual("rejected", _row(conn, "paper_signals", 1)["status"])
+        self.assertEqual("expired", _row(conn, "paper_signals", 1)["status"])
 
     def test_terminal_signal_retires_the_gate(self):
         conn = _db()
@@ -255,14 +274,22 @@ class SweepTests(unittest.TestCase):
 
 
 class VerificationTests(unittest.TestCase):
-    def test_approval_releases_into_the_retry_pipeline(self):
+    def test_approval_rearms_the_signal_with_a_fresh_attempt(self):
+        """PR-29：放行作废挂起尝试行，由信号重建新委托（不原改写为重试行）。"""
         conn = _db()
         order_id = _order(conn, status=EPD.VERIFICATION_HOLD_STATUS)
         result = EPD.resolve_verification(
             conn, order_id, approved=True, operator="运营A", note="财报已核实",
+            now=dt.datetime(2026, 9, 8, 10, 30),
         )
         self.assertTrue(result["ok"])
-        self.assertEqual("execution_retry", _row(conn, "paper_orders", order_id)["status"])
+        self.assertEqual("released", result["status"])
+        # 挂起尝试行终态化，绝不留下 execution_retry 行。
+        self.assertEqual("superseded", _row(conn, "paper_orders", order_id)["status"])
+        retry_rows = conn.execute(
+            "SELECT COUNT(*) FROM paper_orders WHERE status='execution_retry'"
+        ).fetchone()[0]
+        self.assertEqual(0, retry_rows)
         self.assertEqual("pending", _row(conn, "paper_signals", 1)["status"])
         payload = json.loads(_row(conn, "paper_signals", 1)["payload"] or "{}")
         self.assertTrue(payload["execution_verification"]["approved"])

@@ -31,11 +31,13 @@ __all__ = [
     "SIGNAL_EXPIRED_STATUS",
     "ORDER_EXPIRED_STATUS",
     "RECOVERABLE_ORDER_STATUSES",
+    "ACTIVE_OR_RETRY_ORDER_STATUSES",
     "RETRY_SIGNAL_STATUSES",
     "entry_slice_plan",
     "expire_stale_orders",
     "expire_stale_signals",
     "signal_freshness",
+    "stale_active_orders",
 ]
 
 ENTRY_LIFECYCLE_VERSION = "entry-lifecycle-v1"
@@ -55,6 +57,13 @@ RECOVERABLE_ORDER_STATUSES = (
 )
 # 这些状态对应的信号仍在复试管道里，可被 TTL 收敛为终态。
 RETRY_SIGNAL_STATUSES = ("pending", "deferred_capacity", "entry_frozen_waitlist")
+
+# PR-29 单一归属 TTL 语义下的"活动/重试态"全集：本模块的可恢复态 +
+# 执行器的两个挂起态（字面量定义，避免模块环依赖）。TTL 不变式对全集生效：
+# 任何处于这些状态的委托都不允许带着已过期的 expires_at 存活。
+ACTIVE_OR_RETRY_ORDER_STATUSES = RECOVERABLE_ORDER_STATUSES + (
+    "awaiting_batch", "pending_verification",
+)
 
 
 def _now() -> dt.datetime:
@@ -215,6 +224,44 @@ def _order_rows(conn, placeholders: str) -> list[dict[str, Any]]:
         RECOVERABLE_ORDER_STATUSES,
     ).fetchall()
     return [dict(row) for row in rows]
+
+
+def stale_active_orders(
+    conn,
+    *,
+    now: dt.datetime | None = None,
+    ttl_minutes: float = ORDER_TTL_MINUTES,
+) -> list[dict[str, Any]]:
+    """PR-29 TTL 不变式体检：仍处于活动/重试状态但已过有效期的委托。
+
+    判定口径与 :func:`expire_stale_orders` 一致（显式 ``expires_at`` 优先，
+    否则按 created_at + TTL）。验收口径即"数据库中不存在 active/retry
+    order 带过期 expires_at"——两个清扫器（本模块与执行器）跑完后，
+    本函数返回值必须为空。
+    """
+    moment = now or _now()
+    placeholders = ",".join("?" for _ in ACTIVE_OR_RETRY_ORDER_STATUSES)
+    try:
+        rows = conn.execute(
+            f"""SELECT id,status,created_at,expires_at,signal_id,side
+                  FROM paper_orders
+                 WHERE side='buy' AND status IN ({placeholders})""",
+            ACTIVE_OR_RETRY_ORDER_STATUSES,
+        ).fetchall()
+    except sqlite3.Error:
+        return []
+    stale: list[dict[str, Any]] = []
+    for row in rows:
+        record = dict(row)
+        deadline = _parse_deadline(record.get("expires_at"))
+        if deadline is None:
+            created = _parse_ts(record.get("created_at"))
+            if created is not None:
+                deadline = created + dt.timedelta(minutes=ttl_minutes)
+        if deadline is not None and moment > deadline:
+            record["deadline"] = deadline.isoformat(timespec="seconds")
+            stale.append(record)
+    return stale
 
 
 def expire_stale_orders(
