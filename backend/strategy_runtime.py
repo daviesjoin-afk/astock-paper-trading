@@ -31,6 +31,43 @@ class StrategyParameterSchema:
     immutable: tuple[str, ...]
 
 
+def lifecycle_stage_for(spec) -> str:
+    """把注册表里的策略生命周期翻译成分配层的资金阶段（PR-26）。
+
+    PR-08 定义了 shadow/pilot/standard/mature/quarantined 五档资金系数，
+    但此前 ``get_context`` 只会算 ``active ? standard : shadow``——新策略
+    一上线就拿到满额预算，生命周期实际只是个原语。现在的取值顺序：
+
+    1. 定义元数据显式指定（``metadata.lifecycle_stage`` 或
+       ``metadata.allocation.lifecycle_stage``）——人工晋升/隔离的入口；
+    2. 否则按注册表生命周期状态推导：draft→shadow、validated→pilot、
+       paused/retiring/archived→quarantined、active→内置 standard /
+       用户自建 pilot（新策略默认试点，验证后再人工晋升）；
+    3. 未知状态 fail-closed → quarantined（不部署新资金）。
+    """
+    metadata = getattr(spec, "metadata", None) or {}
+    if not isinstance(metadata, dict):
+        metadata = {}
+    allocation_meta = metadata.get("allocation")
+    explicit = metadata.get("lifecycle_stage")
+    if explicit is None and isinstance(allocation_meta, dict):
+        explicit = allocation_meta.get("lifecycle_stage")
+    stage = str(explicit or "").strip().lower()
+    if stage in PA.LIFECYCLE_STAGES:
+        return stage
+    status = str(getattr(spec, "status", "") or "").strip().lower()
+    if status == "draft":
+        return "shadow"
+    if status == "validated":
+        return "pilot"
+    if status in {"paused", "retiring", "archived"}:
+        return "quarantined"
+    if status == "active":
+        # 内置五套是长期验证过的老账户；用户自建/AI 生成的策略一律从试点起步。
+        return "standard" if str(getattr(spec, "origin", "") or "") == "builtin" else "pilot"
+    return "quarantined"
+
+
 @dataclass(frozen=True)
 class StrategyRuntimeContext:
     strategy_id: str
@@ -86,12 +123,14 @@ def get_context(conn: sqlite3.Connection, strategy_id: str, *, settings_rev: str
     risk = compile_strategy_risk_profile(fingerprint)
     execution = EP.execution_profile_for(fingerprint)
     soft = risk.soft_limits
+    # PR-26：生命周期阶段来自注册表的真实状态，不再是 active/shadow 二选一。
+    stage = lifecycle_stage_for(spec)
     allocation = PA.StrategyRuntime(
         strategy_id=spec.id,
         base_priority=max(float(soft.get("max_exposure", 0.65)), 0.01),
         max_positions=int(soft.get("max_positions", 3)),
         own_exposure_cap_pct=float(soft.get("max_exposure", 0.65)),
-        lifecycle_stage="standard" if spec.status == "active" else "shadow",
+        lifecycle_stage=stage,
     )
     context = StrategyRuntimeContext(
         strategy_id=spec.id, version=version.version, checksum=version.checksum,

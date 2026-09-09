@@ -466,6 +466,7 @@ def deployable_budget(
     lot_size: int = 100,
     capital_scale: float = 1.0,
     price_buffer: float = 1.0,
+    lifecycle_stage: str | None = None,
 ) -> dict[str, Any]:
     """把预算折算成整手可部署资金。
 
@@ -482,6 +483,17 @@ def deployable_budget(
     lot_size = max(int(lot_size), 1)
     one_lot_cost = usable_price * lot_size
     if one_lot_cost <= 0.0 or scaled < one_lot_cost:
+        stage = str(lifecycle_stage or "").strip()
+        if _unit(capital_scale, 0.0) <= 0.0 and stage:
+            # PR-26：shadow/quarantined 阶段系数 0，预算整笔进等待池——
+            # 原因必须写明是生命周期，而不是含糊的“预算不足一手”。
+            reason = f"生命周期阶段 {stage}：不部署新资金，预算进入等待池"
+        else:
+            reason = (
+                "价格无效，预算冻结等待"
+                if one_lot_cost <= 0.0
+                else "预算不足一手，资金进入等待池"
+            )
         return {
             "allowed": False,
             "lots": 0,
@@ -489,11 +501,7 @@ def deployable_budget(
             "waiting_capital": round2(scaled),
             "scaled_budget": round2(scaled),
             "one_lot_cost": round2(one_lot_cost),
-            "reason": (
-                "价格无效，预算冻结等待"
-                if one_lot_cost <= 0.0
-                else "预算不足一手，资金进入等待池"
-            ),
+            "reason": reason,
         }
     lots = int(scaled // one_lot_cost)
     deployable = lots * usable_price * lot_size
@@ -520,6 +528,7 @@ def allocation_plan(
     strategy_pool_floor_ratio,
     lot_size: int = 100,
     account_order=None,
+    market_scales=None,
 ) -> dict[str, Any]:
     """整池资金分配计划（PR-08）：预算 → 生命周期缩放 → 整手部署。
 
@@ -555,7 +564,7 @@ def allocation_plan(
             pending_by_account=pending_by_account,
             pending_total=pending_total,
             nav=nav,
-            market_scales=None,
+            market_scales=market_scales,
             shared_pool_max_exposure=shared_pool_max_exposure,
             strategy_pool_floor_ratio=strategy_pool_floor_ratio,
         )
@@ -567,6 +576,7 @@ def allocation_plan(
             price=(prices_by_strategy or {}).get(runtime.strategy_id),
             lot_size=lot_size,
             capital_scale=scale,
+            lifecycle_stage=stage,
         )
         deployable = float(deployment["deployable_amount"])
         remaining_headroom = max(0.0, remaining_headroom - deployable)

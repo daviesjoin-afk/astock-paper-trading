@@ -25,6 +25,9 @@ class StrategyRuntimeTests(unittest.TestCase):
         )
         registry.transition(self.conn, strategy.id, "validated", actor="test")
         registry.transition(self.conn, strategy.id, "active", actor="test")
+        # 上下文缓存是模块级的（同 id+版本+revision 复用），用例之间必须清掉，
+        # 否则上一个用例的生命周期状态会串到下一个用例。
+        runtime.clear_cache()
 
     def tearDown(self):
         self.conn.close()
@@ -40,6 +43,47 @@ class StrategyRuntimeTests(unittest.TestCase):
         self.assertEqual(first.compiled_dsl, _breakout_rule())
         self.assertEqual(first.execution_profile["family"], "trend")
         self.assertEqual(first.allocation_runtime.strategy_id, "runtime_breakout")
+
+    def test_user_strategy_starts_in_pilot_not_full_budget(self):
+        """PR-26 验收：新用户策略 active 也在 pilot，资金系数 0.25。"""
+        context = runtime.get_context(self.conn, "runtime_breakout", settings_rev="1")
+        self.assertEqual(context.lifecycle_stage, "pilot")
+        self.assertEqual(context.capital_scale, 0.25)
+        self.assertEqual(context.allocation_runtime.lifecycle_stage, "pilot")
+        self.assertEqual(context.evolution_control.lifecycle_stage, "pilot")
+
+    def test_metadata_lifecycle_stage_overrides_derivation(self):
+        registry.save_definition(
+            self.conn, "runtime_breakout",
+            {"metadata": {"lifecycle_stage": "standard"}},
+        )
+        runtime.clear_cache()
+        context = runtime.get_context(self.conn, "runtime_breakout", settings_rev="1")
+        self.assertEqual(context.lifecycle_stage, "standard")
+        self.assertEqual(context.capital_scale, 1.0)
+
+    def test_paused_and_archived_are_quarantined(self):
+        registry.transition(self.conn, "runtime_breakout", "paused", actor="test")
+        runtime.clear_cache()
+        context = runtime.get_context(self.conn, "runtime_breakout", settings_rev="1")
+        self.assertEqual(context.lifecycle_stage, "quarantined")
+        self.assertEqual(context.capital_scale, 0.0)
+
+    def test_builtin_active_strategy_deploys_at_full_scale(self):
+        builtin = registry.get("tq_breakout", conn=self.conn)
+        if builtin is None:
+            self.skipTest("builtin registry not seeded")
+        context = runtime.get_context(self.conn, "tq_breakout", settings_rev="1")
+        self.assertEqual(context.lifecycle_stage, "standard")
+        self.assertEqual(context.capital_scale, 1.0)
+
+    def test_draft_strategy_is_shadow_only(self):
+        registry.create_user_definition(
+            self.conn, "runtime_draft", "Runtime draft", dsl_ast=_breakout_rule(), actor="test",
+        )
+        context = runtime.get_context(self.conn, "runtime_draft", settings_rev="1")
+        self.assertEqual(context.lifecycle_stage, "shadow")
+        self.assertEqual(context.capital_scale, 0.0)
 
     def test_dsl_version_change_produces_new_context_contract(self):
         before = runtime.get_context(self.conn, "runtime_breakout", settings_rev="1")

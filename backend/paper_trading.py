@@ -7818,23 +7818,24 @@ def _strategy_pool_weights(conn, rows, profiles):
     return weights
 
 
-def _strategy_pool_budget(conn, account, nav, positions, quotes, market=None, exclude_reservation_key=None):
-    """Return the fair shared-pool budget for one strategy.
+def _pool_allocation_inputs(conn, account, nav, positions, quotes, market=None,
+                            exclude_reservation_key=None, rows=None):
+    """共享池分配的**唯一输入装配点**（PR-26）。
 
-    ``target_amount`` is a soft target, ``floor_amount`` is the amount kept
-    available for the other strategies, and ``allowance_amount`` is the
-    actual additional amount this strategy may open right now.  All values
-    are derived from the same live quote snapshot used by the order gate.
+    生产预算（:func:`_strategy_pool_budget`）与正式资金部署入口
+    （:func:`_allocation_plan` → ``PA.allocation_plan``）必须消费同一份
+    账户权重、占用估值、在途预占、市场缩放与分散化系数。任何一侧单独
+    装配输入，都会让执行路径与 explainability 看到两个不同的分配结果。
     """
-    rows = _shared_account_rows(conn)
+    rows = rows if rows is not None else _shared_account_rows(conn)
     if not rows:
-        rows = [account]
+        rows = [account] if account is not None else []
     profiles = {
         row.get("id"): _risk_profile(row) for row in rows if row.get("id")
     }
     weights = _strategy_pool_weights(conn, rows, profiles)
     values = {row.get("id"): 0.0 for row in rows if row.get("id")}
-    if account.get("id") not in values:
+    if account is not None and account.get("id") not in values:
         account_id = account.get("id")
         profiles[account_id] = _risk_profile(account)
         weights[account_id] = max(_num(profiles[account_id].get("max_exposure"), 0.0), 0.01)
@@ -7859,21 +7860,92 @@ def _strategy_pool_budget(conn, account, nav, positions, quotes, market=None, ex
     clusters, cluster_factors = _strategy_cluster_factors(
         conn, account_ids=list(weights),
     )
+    runtimes = _strategy_runtimes(
+        list(weights), weights,
+        diversification={key: cluster_factors.get(key, 1.0) for key in weights}, conn=conn,
+    )
+    return {
+        "rows": rows,
+        "profiles": profiles,
+        "weights": weights,
+        "values": values,
+        "pending_by_account": pending_by_account,
+        "pending_total": pending_total,
+        "market_light": market_light,
+        "scales": scales,
+        "clusters": clusters,
+        "cluster_factors": cluster_factors,
+        "runtimes": runtimes,
+        "shared_pool_max_exposure": RSET.get(conn, "shared_pool_exposure_cap", SHARED_POOL_MAX_EXPOSURE),
+        "strategy_pool_floor_ratio": STRATEGY_POOL_FLOOR_RATIO,
+    }
+
+
+def _allocation_plan(conn, *, nav, positions, quotes, market=None, prices_by_strategy=None,
+                     account=None, rows=None, exclude_reservation_key=None,
+                     account_order=None):
+    """正式资金部署入口（PR-26）：预算 → 生命周期缩放 → 整手部署。
+
+    返回 ``PA.allocation_plan`` 的原始结果，外加 ``rows_by_strategy``
+    索引。执行路径与 explainability 都只读这份结果，不允许各自重算：
+    - ``shadow``/``quarantined`` 系数 0 → 不部署，预算整笔进 waiting_capital；
+    - ``pilot`` 系数 0.25 → 即使权重最高也只能拿到四分之一预算；
+    - 缩放后不足一手 → ``lots=0``，全部预算进 waiting_capital，绝不产生碎片单。
+    """
+    inputs = _pool_allocation_inputs(
+        conn, account, nav, positions, quotes, market,
+        exclude_reservation_key=exclude_reservation_key, rows=rows,
+    )
+    plan = PA.allocation_plan(
+        inputs["runtimes"],
+        nav=_num(nav),
+        values=inputs["values"],
+        pending_by_account=inputs["pending_by_account"],
+        pending_total=inputs["pending_total"],
+        prices_by_strategy=prices_by_strategy,
+        shared_pool_max_exposure=inputs["shared_pool_max_exposure"],
+        strategy_pool_floor_ratio=inputs["strategy_pool_floor_ratio"],
+        lot_size=LOT_SIZE,
+        account_order=account_order,
+        market_scales=inputs["scales"],
+    )
+    plan["rows_by_strategy"] = {
+        str(row.get("strategy_id")): row for row in (plan.get("plan") or [])
+    }
+    return plan
+
+
+def _strategy_pool_budget(conn, account, nav, positions, quotes, market=None, exclude_reservation_key=None):
+    """Return the fair shared-pool budget for one strategy.
+
+    ``target_amount`` is a soft target, ``floor_amount`` is the amount kept
+    available for the other strategies, and ``allowance_amount`` is the
+    actual additional amount this strategy may open right now.  All values
+    are derived from the same live quote snapshot used by the order gate.
+
+    PR-26: ``absolute_cap_amount`` (what the sizing layer actually consumes)
+    is lifecycle-scaled — a pilot strategy can only deploy a quarter of its
+    allowance and a shadow/quarantined one gets no new capital at all.
+    """
+    inputs = _pool_allocation_inputs(
+        conn, account, nav, positions, quotes, market,
+        exclude_reservation_key=exclude_reservation_key,
+    )
+    values = inputs["values"]
+    weights = inputs["weights"]
+    pending_by_account = inputs["pending_by_account"]
     result = PA.strategy_pool_budget(
-        _strategy_runtimes(
-            list(weights), weights,
-            diversification={key: cluster_factors.get(key, 1.0) for key in weights}, conn=conn,
-        ),
+        inputs["runtimes"],
         account_id=account.get("id"),
         values=values,
         pending_by_account=pending_by_account,
-        pending_total=pending_total,
+        pending_total=inputs["pending_total"],
         nav=_num(nav),
-        market_scales=scales,
-        shared_pool_max_exposure=RSET.get(conn, "shared_pool_exposure_cap", SHARED_POOL_MAX_EXPOSURE),
-        strategy_pool_floor_ratio=STRATEGY_POOL_FLOOR_RATIO,
+        market_scales=inputs["scales"],
+        shared_pool_max_exposure=inputs["shared_pool_max_exposure"],
+        strategy_pool_floor_ratio=inputs["strategy_pool_floor_ratio"],
     )
-    cluster = SC.cluster_of(account.get("id"), clusters)
+    cluster = SC.cluster_of(account.get("id"), inputs["clusters"])
     if len(cluster) > 1:
         # 单策略绝对上限（元）≈ 净值 × 该策略 max_exposure 权重；
         # 簇上限 = 单策略上限 × 簇预算倍数（sqrt(n)，触发地板后线性）。
@@ -7893,6 +7965,22 @@ def _strategy_pool_budget(conn, account, nav, positions, quotes, market=None, ex
         result["allowance_amount"] = min(
             _num(result.get("allowance_amount")), headroom,
         )
+    # 生命周期阶段来自运行时 Context（PR-26）：阶段系数直接决定本策略
+    # 本轮能部署多少钱，未部署的部分记入 waiting_capital 供审计追踪。
+    runtime = next(
+        (item for item in inputs["runtimes"] if item.strategy_id == account.get("id")),
+        None,
+    )
+    stage_scale, stage_label = PA.stage_capital_scale(runtime) if runtime is not None else (1.0, "standard")
+    allowance = max(0.0, _num(result.get("allowance_amount")))
+    scaled_allowance = allowance * max(0.0, min(1.0, stage_scale))
+    result["lifecycle_stage"] = stage_label
+    result["capital_scale"] = round(stage_scale, 4)
+    result["scaled_allowance_amount"] = round(scaled_allowance, 2)
+    result["lifecycle_waiting_capital"] = round(max(0.0, allowance - scaled_allowance), 2)
+    result["absolute_cap_amount"] = round(
+        _num(result.get("current_total_amount")) + scaled_allowance, 2,
+    )
     return result
 
 
@@ -8202,6 +8290,15 @@ def strategy_allocation_explain():
         participating = list(count_budget["limits"].keys()) or list(ACCOUNT_SPECS)
         clusters, cluster_factors = _strategy_cluster_factors(
             conn, account_ids=participating)
+        # PR-26：正式部署计划只算一次——explainability 与执行路径读同一份
+        # 结果，生命周期阶段/资金系数/可部署金额都取自 plan 行，禁止在此
+        # 重算（历史上这里自己调 PA.stage_capital_scale，与执行口径漂移）。
+        plan = _allocation_plan(
+            conn, nav=nav, positions=positions, quotes=quotes_map, market=market,
+            rows=list(rows_map.values()) or None,
+            account=(rows_map.get(participating[0]) if participating else None),
+        )
+        plan_rows = plan.get("rows_by_strategy") or {}
         strategies = []
         for account_id in participating:
             account_row = rows_map.get(account_id) or {"id": account_id}
@@ -8213,6 +8310,7 @@ def strategy_allocation_explain():
                 conn=conn,
             )
             runtime = next((item for item in runtimes if item.strategy_id == account_id), None)
+            plan_row = plan_rows.get(account_id) or {}
             budget = _strategy_pool_budget(
                 conn, account_row, nav, positions, quotes_map, market=market,
             )
@@ -8227,7 +8325,9 @@ def strategy_allocation_explain():
             ).fetchone()
             waiting_row = dict(waiting) if waiting is not None else None
             pending_by_account, pending_total = _pending_buy_reservations(conn)
-            stage_scale, stage_label = PA.stage_capital_scale(runtime) if runtime else (1.0, "standard")
+            # 生命周期与部署金额一律读 plan 行（同一份 allocation result）。
+            stage_scale = _num(plan_row.get("capital_scale"), budget.get("capital_scale", 1.0))
+            stage_label = str(plan_row.get("lifecycle_stage") or budget.get("lifecycle_stage") or "standard")
             strategies.append({
                 "strategy_id": account_id,
                 "name": (SR.get(account_id).name if SR.get(account_id) else account_id),
@@ -8266,6 +8366,16 @@ def strategy_allocation_explain():
                     "pool_available_amount": budget.get("pool_available_amount"),
                     "cluster_budget": budget.get("cluster_budget"),
                 },
+                # 正式部署结果（PA.allocation_plan 的同一份行数据）
+                "deployment": {
+                    "raw_allowance_amount": plan_row.get("raw_allowance_amount"),
+                    "scaled_budget_amount": plan_row.get("scaled_budget_amount"),
+                    "deployable_amount": plan_row.get("deployable_amount"),
+                    "waiting_capital": plan_row.get("waiting_capital"),
+                    "lots": plan_row.get("lots"),
+                    "allowed": plan_row.get("allowed"),
+                    "blocked_reason": plan_row.get("blocked_reason"),
+                },
                 "position_limit": int(_num(count_budget["limits"].get(account_id))),
                 "position_count": sum(
                     1 for item in positions
@@ -8285,6 +8395,13 @@ def strategy_allocation_explain():
             "pool_limit": int(_num(count_budget["pool_limit"])),
             "market_light": market_light or "unknown",
             "cluster_version": SC.STRATEGY_CLUSTER_VERSION,
+            # PR-26：部署计划摘要（与执行路径同一份结果）
+            "allocation_plan": {
+                "total_deployable_amount": plan.get("total_deployable_amount"),
+                "total_waiting_capital": plan.get("total_waiting_capital"),
+                "pool_headroom_amount": plan.get("pool_headroom_amount"),
+                "lot_size": plan.get("lot_size"),
+            },
             "strategies": strategies,
         }
 
@@ -8729,6 +8846,31 @@ def _buy_order(conn, account, signal, quote, market, news, asof_day, *, all_quot
         # 涨停价的成交——现实中该价位根本买不到。
         upper_limit = signal_close * (1 + lim / 100)
         fill_price = min(fill_price, round(upper_limit, 2))
+    # PR-26：资金部署入口。候选价格已知后由 PA.allocation_plan() 决定本策略
+    # 本轮可部署的手数与金额——生命周期阶段（shadow/pilot/quarantined）在
+    # 这里真正生效：试点只拿 25%，隔离/影子不部署，缩放后不足一手则整笔
+    # 预算进 waiting_capital，候选转等待池而不是碎片成交。
+    deployment = None
+    try:
+        plan = _allocation_plan(
+            conn, nav=nav, positions=positions, quotes=all_quotes, market=market,
+            prices_by_strategy={account.get("id"): fill_price} if fill_price > 0 else None,
+            account=account,
+        )
+        deployment = (plan.get("rows_by_strategy") or {}).get(account.get("id"))
+    except Exception:
+        deployment = None
+    if deployment is not None:
+        risk["capital_deployment"] = deployment
+        sizing["capital_deployment"] = {
+            "lifecycle_stage": deployment.get("lifecycle_stage"),
+            "capital_scale": deployment.get("capital_scale"),
+            "raw_allowance_amount": deployment.get("raw_allowance_amount"),
+            "deployable_amount": deployment.get("deployable_amount"),
+            "waiting_capital": deployment.get("waiting_capital"),
+            "lots": deployment.get("lots"),
+            "allowed": bool(deployment.get("allowed")),
+        }
     # The strategy budget has already applied the current market light to its
     # remaining amount.  Only independent model/chase/news adjustments belong
     # here; _entry_execution_scale restores a market multiplier only for
@@ -8807,6 +8949,18 @@ def _buy_order(conn, account, signal, quote, market, news, asof_day, *, all_quot
     sizing["amount_constraints_soft"] = True
     exceptional = {"approved": False, "reason": None}
     soft_amount_reasons = []
+    # PR-26：生命周期不允许部署（shadow/quarantined）或缩放后不足一手时，
+    # 候选进等待池等待晋升/预算释放——不是终态拒绝，也不允许碎片成交。
+    if deployment is not None and not deployment.get("allowed"):
+        waiting = _num(deployment.get("waiting_capital"))
+        deployment_reason = (
+            f"生命周期阶段 {deployment.get('lifecycle_stage')}（资金系数 "
+            f"{_num(deployment.get('capital_scale')):.0%}）："
+            f"{deployment.get('blocked_reason') or '预算不足一手'}"
+            f"（等待资金 ¥{waiting:,.2f}）"
+        )
+        reasons.append(deployment_reason)
+        soft_amount_reasons.append(deployment_reason)
     # 入场时机未确认 = 未到时机，进替补队列复试而非终态拒绝。
     soft_amount_reasons.extend(timing_block_reasons)
     capacity_constraints = set(sizing.get("binding_constraints") or [])
@@ -8905,6 +9059,14 @@ def _buy_order(conn, account, signal, quote, market, news, asof_day, *, all_quot
             if headroom_qty < qty:
                 qty = max(0, headroom_qty)
                 sizing["symbol_headroom_clamped_qty"] = qty
+    # PR-26：最终数量不得超过正式部署计划给出的可部署手数（生命周期缩放
+    # 后的整手规模）。权重再高，试点策略也只能部署它那一份缩水预算。
+    if deployment is not None and deployment.get("allowed") and fill_price > 0:
+        max_qty = int(_num(deployment.get("lots"))) * LOT_SIZE
+        if max_qty < qty:
+            sizing["lifecycle_deployment_clamped_qty"] = int(max_qty)
+            sizing["lifecycle_deployment_amount"] = _num(deployment.get("deployable_amount"))
+            qty = max(0, max_qty)
     amount = qty * fill_price
     fees = _commission(amount) if amount else 0.0
     sizing["one_lot_amount"] = round(LOT_SIZE * fill_price, 2)
