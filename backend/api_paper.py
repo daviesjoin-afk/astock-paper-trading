@@ -273,7 +273,7 @@ async def strategy_preview(payload: dict | None = None):
 
 @router.get("/strategy-champions")
 def strategy_champions():
-    """PR-16 Champion/Challenger 视图：版本与影子评估（只读，附带评估落库）。"""
+    """PR-32 Champion/Challenger：版本与同快照影子评估。"""
     try:
         return _call_with_retry(P.strategy_champion_overview)
     except Exception as exc:
@@ -286,7 +286,7 @@ def strategy_champion_open(
     params: str = Query("{}", max_length=4000),
     source: str = Query("manual", max_length=32),
 ):
-    """PR-16 开启影子 Challenger：参数经策略进化画像钳制后进入 shadow。"""
+    """PR-32 创建不可变影子候选，不改变正式 Champion 参数头。"""
     import json as _json
 
     try:
@@ -305,7 +305,7 @@ def strategy_champion_open(
 
 @router.post("/strategy-champion/promote")
 def strategy_champion_promote(strategy_id: str = Query(...)):
-    """PR-16 晋升：必须通过「收益改善且风险不恶化」门禁。"""
+    """PR-32 晋升：同快照门禁通过后才切换正式参数头。"""
     try:
         result = _call_with_retry(P.promote_strategy_challenger, strategy_id)
         if not result.get("promoted"):
@@ -322,7 +322,7 @@ def strategy_champion_promote(strategy_id: str = Query(...)):
 def strategy_champion_rollback(
     strategy_id: str = Query(...), reason: str = Query("manual_rollback", max_length=200),
 ):
-    """PR-16 回滚：丢弃 Challenger，策略保持 Champion 参数。"""
+    """PR-32 回滚：仅丢弃 Challenger，正式 Champion 参数保持不变。"""
     try:
         result = _call_with_retry(P.rollback_strategy_challenger, strategy_id, reason)
         _cclear()
