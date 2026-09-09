@@ -272,7 +272,7 @@ def strategy_champion_open(
     try:
         parsed = _json.loads(params or "{}")
     except ValueError:
-        raise HTTPException(status_code=400, detail="params 必须是 JSON 对象")
+        raise HTTPException(status_code=400, detail="params 必须是 JSON 对象") from None
     try:
         result = _call_with_retry(
             P.open_strategy_challenger, strategy_id, parsed, source,
