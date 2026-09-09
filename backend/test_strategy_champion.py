@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""策略 Champion/Challenger 版本管理（PR-16）回归测试。"""
+"""PR-32 true-shadow Champion/Challenger regression tests."""
 from __future__ import annotations
 
 import datetime as dt
@@ -13,286 +13,211 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import self_evolution as SE
 import strategy_champion as SCM
 
-# 用真实时钟做基准（窗口计算相对该时钟）；下单时间相对 NOW 偏移。
-NOW = dt.datetime.now()
+NOW = dt.datetime.now().replace(microsecond=0)
 EVIDENCE = 50
+STRATEGY = "trend_pullback"
 
 
-def _db():
+def _paper_db():
     conn = sqlite3.connect(":memory:")
     conn.row_factory = sqlite3.Row
-    SCM.ensure_schema(conn)
-    SE.ensure_schema(conn)
     conn.executescript(
         """
-        CREATE TABLE paper_orders(
-            id INTEGER PRIMARY KEY AUTOINCREMENT, account_id TEXT, signal_id INTEGER,
-            side TEXT, code TEXT, qty INTEGER, planned_price REAL, filled_price REAL,
-            amount REAL, fees REAL, status TEXT, reason TEXT, risk_payload TEXT,
-            realized_pnl REAL, created_at TEXT, executed_at TEXT);
-        CREATE TABLE paper_positions(
-            account_id TEXT, code TEXT, qty INTEGER, cost REAL, entry_date TEXT,
-            PRIMARY KEY(account_id, code));
+        CREATE TABLE paper_accounts(id TEXT PRIMARY KEY, cash REAL);
+        CREATE TABLE paper_orders(id INTEGER PRIMARY KEY, account_id TEXT, side TEXT,
+                                  status TEXT, amount REAL, realized_pnl REAL,
+                                  created_at TEXT, executed_at TEXT, code TEXT);
+        CREATE TABLE paper_positions(account_id TEXT, code TEXT, qty INTEGER);
+        CREATE TABLE paper_capital_reservations(id INTEGER PRIMARY KEY, amount REAL);
         """
     )
+    conn.execute("INSERT INTO paper_accounts VALUES(?,?)", (STRATEGY, 100000.0))
+    conn.execute("INSERT INTO paper_positions VALUES(?,?,?)", (STRATEGY, "600000", 100))
+    conn.execute("INSERT INTO paper_capital_reservations VALUES(1, 5000.0)")
+    SCM.ensure_schema(conn)
     return conn
 
 
-def _order(conn, *, side="buy", status="filled", code="600000", amount=10000.0,
-           pnl=0.0, executed_at=None, account_id="sector_rotation"):
-    stamp = executed_at or NOW.isoformat(timespec="seconds")
-    conn.execute(
-        """INSERT INTO paper_orders(account_id,side,code,qty,amount,status,
-               realized_pnl,executed_at,created_at)
-           VALUES(?,?,?,?,?,?,?,?,?)""",
-        (account_id, side, code, 500, amount, status, pnl, stamp, stamp),
-    )
-    conn.commit()
+def _evolution_db():
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    SE.ensure_schema(conn)
+    SE.init_params(conn)
+    return conn
 
 
-def _seed_window(conn, *, challenger_pnl, champion_pnl, account_id="trend_pullback"):
-    """对照窗（5 天前~开 Challenger）盈利 champion_pnl；影子窗 challenger_pnl。"""
-    _order(conn, side="buy", amount=10000.0, account_id=account_id,
-           executed_at=(NOW - dt.timedelta(days=9)).isoformat(timespec="seconds"))
-    _order(conn, side="sell", amount=11000.0, pnl=champion_pnl, account_id=account_id,
-           executed_at=(NOW - dt.timedelta(days=7)).isoformat(timespec="seconds"))
-    _order(conn, side="buy", amount=10000.0, account_id=account_id,
-           executed_at=(NOW - dt.timedelta(days=2)).isoformat(timespec="seconds"))
-    _order(conn, side="sell", amount=11000.0, pnl=challenger_pnl, account_id=account_id,
-           executed_at=(NOW - dt.timedelta(days=1)).isoformat(timespec="seconds"))
+def _output(*, pnl: float, nav: float, code="600000"):
+    return {
+        "signals": [{"signal_key": "same-signal", "code": code, "side": "buy"}],
+        "orders": [{"signal_key": "same-signal", "code": code, "side": "buy", "qty": 100,
+                    "planned_price": 10.0, "amount": 10000.0, "status": "filled"}],
+        "fills": [
+            {"code": code, "side": "buy", "qty": 100, "price": 10.0, "amount": 10000.0},
+            {"code": code, "side": "sell", "qty": 100, "price": 10.0, "amount": 10000.0,
+             "realized_pnl": pnl},
+        ],
+        "nav": {"nav_date": NOW.date().isoformat(), "cash": nav, "market_value": 0, "nav": nav},
+    }
 
 
-class MetricsTests(unittest.TestCase):
-    def test_metrics_are_derived_from_the_ledger(self):
-        conn = _db()
-        start = (NOW - dt.timedelta(days=10)).isoformat(timespec="seconds")
-        _order(conn, side="buy", amount=50000.0, executed_at=start)
-        _order(conn, side="sell", amount=52000.0, pnl=800.0,
-               executed_at=(NOW - dt.timedelta(days=1)).isoformat(timespec="seconds"))
-        _order(conn, side="buy", status="risk_rejected", amount=0.0,
-               executed_at=(NOW - dt.timedelta(days=1)).isoformat(timespec="seconds"))
-        metrics = SCM.collect_ledger_metrics(conn, "sector_rotation", start,
-                                             NOW.isoformat(timespec="seconds"))
-        self.assertEqual(800.0 / 50000.0 * 100.0, metrics["return_pct"])
-        self.assertEqual(50.0, metrics["execution_fill_rate"])  # 1 成交 / (1 成交 + 1 被拒)
+class TrueShadowLifecycleTests(unittest.TestCase):
+    def setUp(self):
+        self.paper = _paper_db()
+        self.evo = _evolution_db()
 
-    def test_carried_positions_are_part_of_the_denominator(self):
-        conn = _db()
-        start = (NOW - dt.timedelta(days=5)).isoformat(timespec="seconds")
-        # 窗口前建仓（entry_date 早于窗口），窗口内卖出获利 100 元、窗口内无新买入。
-        conn.execute(
-            "INSERT INTO paper_positions VALUES('sector_rotation','600000',500,10.0,?)",
-            ((NOW - dt.timedelta(days=30)).date().isoformat(),),
+    def tearDown(self):
+        self.paper.close()
+        self.evo.close()
+
+    def _open(self, *, at=None):
+        return SCM.open_challenger(
+            self.paper, self.evo, STRATEGY, {"max_weight_delta": 0.032},
+            evidence_count=EVIDENCE, now=at or NOW - dt.timedelta(days=5),
         )
-        _order(conn, side="sell", amount=5000.0, pnl=100.0,
-               executed_at=(NOW - dt.timedelta(days=1)).isoformat(timespec="seconds"))
-        metrics = SCM.collect_ledger_metrics(conn, "sector_rotation", start,
-                                             NOW.isoformat(timespec="seconds"))
-        # 分母 = 0 买入 + 500×10 = 5000 持仓市值 → 收益 2%，而非 10000%。
-        self.assertEqual(2.0, metrics["return_pct"])
-        self.assertEqual(5000.0, metrics["carried_value"])
 
-    def test_drawdown_from_cumulative_daily_pnl(self):
-        conn = _db()
-        start = (NOW - dt.timedelta(days=10)).isoformat(timespec="seconds")
-        _order(conn, side="buy", amount=100000.0, executed_at=start)
-        _order(conn, side="sell", pnl=3000.0,
-               executed_at=(NOW - dt.timedelta(days=4)).isoformat(timespec="seconds"))
-        _order(conn, side="sell", pnl=-5000.0,
-               executed_at=(NOW - dt.timedelta(days=1)).isoformat(timespec="seconds"))
-        metrics = SCM.collect_ledger_metrics(conn, "sector_rotation", start,
-                                             NOW.isoformat(timespec="seconds"))
-        self.assertGreater(metrics["max_drawdown_pct"], 0.0)
+    def _record_counterfactual(self, *, challenger_pnl=2000.0, at=None):
+        return SCM.run_shadow_counterfactual(
+            self.paper, STRATEGY, {"asof": "2026-09-09", "600000": {"close": 10.0}},
+            _output(pnl=1000.0, nav=101000.0),
+            _output(pnl=challenger_pnl, nav=100000.0 + challenger_pnl),
+            observed_at=at or NOW - dt.timedelta(days=1),
+        )
 
-    def test_empty_window_is_safe(self):
-        conn = _db()
-        metrics = SCM.collect_ledger_metrics(
-            conn, "sector_rotation",
-            (NOW - dt.timedelta(days=1)).isoformat(timespec="seconds"),
-            NOW.isoformat(timespec="seconds"))
-        self.assertEqual(0.0, metrics["return_pct"])
-        self.assertEqual(0.0, metrics["execution_fill_rate"])
-
-
-class PromotionGateTests(unittest.TestCase):
-    def _metrics(self, **overrides):
-        base = {
-            "return_pct": 1.0, "max_drawdown_pct": 3.0,
-            "turnover_amount": 10000.0, "execution_fill_rate": 95.0,
-            "concentration_hhi": 0.3,
-        }
-        base.update(overrides)
-        return base
-
-    def test_improvement_with_stable_risk_is_promotable(self):
-        decision = SCM.compare_for_promotion(
-            self._metrics(), self._metrics(return_pct=2.0, max_drawdown_pct=3.2))
-        self.assertTrue(decision["promotable"])
-
-    def test_no_return_improvement_blocks_promotion(self):
-        decision = SCM.compare_for_promotion(
-            self._metrics(), self._metrics(return_pct=0.5))
-        self.assertFalse(decision["promotable"])
-        self.assertIn("收益（必须改善）", decision["failed"])
-
-    def test_drawdown_deterioration_beyond_tolerance_blocks(self):
-        decision = SCM.compare_for_promotion(
-            self._metrics(), self._metrics(return_pct=2.0, max_drawdown_pct=3.8))
-        self.assertFalse(decision["promotable"])
-        self.assertIn("最大回撤", decision["failed"])
-
-    def test_turnover_surge_blocks_promotion(self):
-        decision = SCM.compare_for_promotion(
-            self._metrics(), self._metrics(return_pct=2.0, turnover_amount=20000.0))
-        self.assertFalse(decision["promotable"])
-        self.assertIn("换手", decision["failed"])
-
-    def test_execution_drop_beyond_five_pp_blocks(self):
-        # 容差 = 5 个百分点：95 → 91 应通过，95 → 89 应拒绝。
-        within = SCM.compare_for_promotion(
-            self._metrics(), self._metrics(return_pct=2.0, execution_fill_rate=91.0))
-        beyond = SCM.compare_for_promotion(
-            self._metrics(), self._metrics(return_pct=2.0, execution_fill_rate=89.0))
-        self.assertTrue(within["promotable"])
-        self.assertFalse(beyond["promotable"])
-        self.assertIn("成交率", beyond["failed"])
-
-    def test_concentration_worsening_blocks_promotion(self):
-        decision = SCM.compare_for_promotion(
-            self._metrics(), self._metrics(return_pct=2.0, concentration_hhi=0.6))
-        self.assertFalse(decision["promotable"])
-        self.assertIn("集中度", decision["failed"])
-
-
-class LifecycleTests(unittest.TestCase):
-    def test_open_validates_against_the_full_profile(self):
-        conn = _db()
-        # 锁定参数（trend_pullback 的 max_delta_threshold）被拒绝。
-        result = SCM.open_challenger(
-            conn, conn, "trend_pullback", {"max_delta_threshold": 0.006},
-            evidence_count=EVIDENCE)
-        self.assertFalse(result["opened"])
-        self.assertTrue(any("锁定" in v for v in result["violations"]))
-        # 证据不足被拒绝。
-        result = SCM.open_challenger(
-            conn, conn, "trend_pullback", {"max_weight_delta": 0.032},
-            evidence_count=2)
-        self.assertFalse(result["opened"])
-        self.assertTrue(any("证据" in v for v in result["violations"]))
-
-    def test_open_writes_params_into_the_runtime_store(self):
-        conn = _db()
-        evo = _db()
-        SE.init_params(evo)
-        result = SCM.open_challenger(
-            conn, evo, "trend_pullback", {"max_weight_delta": 0.032},
-            evidence_count=EVIDENCE)
+    def test_open_leaves_active_runtime_checksum_and_params_unchanged(self):
+        before = SCM.active_runtime_checksum(self.evo, STRATEGY)
+        result = self._open()
+        after = SCM.active_runtime_checksum(self.evo, STRATEGY)
         self.assertTrue(result["opened"])
-        runtime = SE.get_strategy_params(evo, "trend_pullback")
-        self.assertEqual(0.032, runtime["params"]["max_weight_delta"])
-        # shadow 行记录了 Champion 参数快照（回滚用）。
-        row = conn.execute(
-            "SELECT champion_params,status FROM strategy_champion_versions WHERE role='challenger'"
+        self.assertEqual(before["checksum"], after["checksum"])
+        self.assertEqual(before["checksum"], result["active_runtime_checksum_before"])
+        self.assertEqual(before["checksum"], result["active_runtime_checksum_after"])
+        self.assertEqual(0.03, after["params"]["max_weight_delta"])
+        self.assertEqual(0.032, result["params"]["max_weight_delta"])
+
+    def test_candidate_parameter_version_is_physically_immutable(self):
+        result = self._open()
+        row = self.paper.execute(
+            "SELECT params,base_active_checksum FROM strategy_shadow_parameter_versions WHERE id=?",
+            (result["shadow_param_version_id"],),
         ).fetchone()
-        self.assertEqual("shadow", row["status"])
-        self.assertNotEqual(0.032, SCM._json_loads(row["champion_params"])["max_weight_delta"])
+        self.assertEqual(0.032, SCM._json_loads(row["params"])["max_weight_delta"])
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.paper.execute("UPDATE strategy_shadow_parameter_versions SET params='{}' WHERE id=?", (result["shadow_param_version_id"],))
 
-    def test_duplicate_shadow_challenger_is_rejected(self):
-        conn = _db()
-        evo = _db()
-        SE.init_params(evo)
-        first = SCM.open_challenger(conn, evo, "trend_pullback",
-                                    {"max_weight_delta": 0.032}, evidence_count=EVIDENCE)
-        self.assertTrue(first["opened"])
-        second = SCM.open_challenger(conn, evo, "trend_pullback",
-                                     {"max_weight_delta": 0.033}, evidence_count=EVIDENCE)
-        self.assertFalse(second["opened"])
+    def test_shadow_run_writes_only_shadow_ledgers_and_same_snapshot_for_both_sides(self):
+        self._open()
+        formal_before = {
+            table: self.paper.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+            for table in ("paper_accounts", "paper_orders", "paper_positions", "paper_capital_reservations")
+        }
+        result = self._record_counterfactual()
+        formal_after = {
+            table: self.paper.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+            for table in formal_before
+        }
+        self.assertTrue(result["recorded"])
+        self.assertEqual(formal_before, formal_after)
+        self.assertEqual(2, self.paper.execute("SELECT COUNT(*) FROM shadow_signals").fetchone()[0])
+        checksums = {row[0] for row in self.paper.execute("SELECT snapshot_checksum FROM shadow_nav")}
+        self.assertEqual({result["snapshot_checksum"]}, checksums)
+        roles = {row[0] for row in self.paper.execute("SELECT role FROM shadow_nav")}
+        self.assertEqual({SCM.ROLE_CHAMPION, SCM.ROLE_CHALLENGER}, roles)
 
-    def test_failing_challenger_auto_rolls_back_params(self):
-        conn = _db()
-        evo = _db()
-        SE.init_params(evo)
-        _seed_window(conn, champion_pnl=1000.0, challenger_pnl=-1000.0)
-        SCM.open_challenger(conn, evo, "trend_pullback",
-                            {"max_weight_delta": 0.032},
-                            evidence_count=EVIDENCE,
-                            now=NOW - dt.timedelta(days=5))
-        result = SCM.evaluate_challenger(conn, evo, "trend_pullback", now=NOW)
+    def test_shadow_context_runs_immutable_candidate_against_the_same_snapshot(self):
+        self._open()
+        seen = []
+
+        def runner(role, params, snapshot):
+            seen.append((role, params["max_weight_delta"], dict(snapshot)))
+            snapshot["mutated_by"] = role
+            return _output(pnl=2000.0 if role == SCM.ROLE_CHALLENGER else 1000.0,
+                           nav=102000.0 if role == SCM.ROLE_CHALLENGER else 101000.0)
+
+        result = SCM.run_shadow_context(
+            self.paper, self.evo, STRATEGY, {"asof": "2026-09-09", "close": 10.0}, runner,
+            observed_at=NOW - dt.timedelta(days=1),
+        )
+        self.assertTrue(result["recorded"])
+        self.assertEqual([SCM.ROLE_CHAMPION, SCM.ROLE_CHALLENGER], [row[0] for row in seen])
+        self.assertEqual(0.03, seen[0][1])
+        self.assertEqual(0.032, seen[1][1])
+        self.assertEqual({"asof": "2026-09-09", "close": 10.0}, seen[0][2])
+        self.assertEqual({"asof": "2026-09-09", "close": 10.0}, seen[1][2])
+
+    def test_evaluation_uses_same_period_counterfactual_not_prior_market_window(self):
+        self._open()
+        self._record_counterfactual(challenger_pnl=2000.0)
+        result = SCM.evaluate_challenger(self.paper, self.evo, STRATEGY, now=NOW)
         self.assertTrue(result["evaluated"])
-        self.assertEqual("rolled_back", result["status"])
-        # 参数仓已恢复 Champion（默认 0.03）。
-        runtime = SE.get_strategy_params(evo, "trend_pullback")
-        self.assertEqual(0.03, runtime["params"]["max_weight_delta"])
+        self.assertEqual(SCM.STATUS_READY, result["status"])
+        self.assertGreater(result["challenger_metrics"]["return_pct"], result["champion_metrics"]["return_pct"])
+        self.assertEqual(1, len(result["decision"]["counterfactual_snapshot_checksums"]))
+        champion_params = SCM._json_loads(self.paper.execute(
+            "SELECT champion_params FROM strategy_champion_versions WHERE role='challenger'"
+        ).fetchone()[0])
+        self.assertEqual(SCM._checksum(champion_params), SCM.active_runtime_checksum(self.evo, STRATEGY)["checksum"])
 
-    def test_passing_challenger_becomes_ready_not_promoted(self):
-        conn = _db()
-        evo = _db()
-        SE.init_params(evo)
-        _seed_window(conn, champion_pnl=1000.0, challenger_pnl=2000.0)
-        SCM.open_challenger(conn, evo, "trend_pullback",
-                            {"max_weight_delta": 0.032},
-                            evidence_count=EVIDENCE,
-                            now=NOW - dt.timedelta(days=5))
-        result = SCM.evaluate_challenger(conn, evo, "trend_pullback", now=NOW)
-        self.assertEqual("ready", result["status"])
-        # 查看/轮询绝不晋升：不建立任何 champion 版本行。
-        champion = conn.execute(
-            "SELECT COUNT(*) FROM strategy_champion_versions WHERE role='champion'"
-        ).fetchone()[0]
-        self.assertEqual(0, champion)
+    def test_mismatched_counterfactual_snapshots_fail_closed(self):
+        self._open()
+        self._record_counterfactual()
+        self.paper.execute("DELETE FROM shadow_nav WHERE role=?", (SCM.ROLE_CHALLENGER,))
+        self.paper.commit()
+        result = SCM.evaluate_challenger(self.paper, self.evo, STRATEGY, now=NOW)
+        self.assertFalse(result["evaluated"])
+        self.assertIn("同期间同快照", result["reason"])
 
-    def test_promotion_only_from_ready(self):
-        conn = _db()
-        evo = _db()
-        SE.init_params(evo)
-        _seed_window(conn, champion_pnl=1000.0, challenger_pnl=2000.0)
-        SCM.open_challenger(conn, evo, "trend_pullback",
-                            {"max_weight_delta": 0.032},
-                            evidence_count=EVIDENCE,
-                            now=NOW - dt.timedelta(days=5))
-        result = SCM.promote_challenger(conn, evo, "trend_pullback", now=NOW)
+    def test_failed_shadow_evaluation_never_restores_or_changes_formal_runtime(self):
+        before = SCM.active_runtime_checksum(self.evo, STRATEGY)
+        self._open()
+        self._record_counterfactual(challenger_pnl=-1000.0)
+        result = SCM.evaluate_challenger(self.paper, self.evo, STRATEGY, now=NOW)
+        after = SCM.active_runtime_checksum(self.evo, STRATEGY)
+        self.assertEqual(SCM.STATUS_ROLLED_BACK, result["status"])
+        self.assertEqual(before["checksum"], after["checksum"])
+
+    def test_promotion_is_the_only_active_head_switch(self):
+        before = SCM.active_runtime_checksum(self.evo, STRATEGY)
+        self._open()
+        self._record_counterfactual(challenger_pnl=2000.0)
+        self.assertEqual(SCM.STATUS_READY, SCM.evaluate_challenger(self.paper, self.evo, STRATEGY, now=NOW)["status"])
+        result = SCM.promote_challenger(self.paper, self.evo, STRATEGY, now=NOW)
+        after = SCM.active_runtime_checksum(self.evo, STRATEGY)
         self.assertTrue(result["promoted"])
-        champion = conn.execute(
-            """SELECT params FROM strategy_champion_versions
-                WHERE role='champion' ORDER BY id DESC LIMIT 1"""
-        ).fetchone()
-        self.assertEqual(0.032, SCM._json_loads(champion["params"])["max_weight_delta"])
-        # 晋升后再 promote 无可晋升对象。
-        again = SCM.promote_challenger(conn, evo, "trend_pullback", now=NOW)
-        self.assertFalse(again["promoted"])
+        self.assertNotEqual(before["checksum"], after["checksum"])
+        self.assertEqual(0.032, after["params"]["max_weight_delta"])
+        self.assertEqual(after["checksum"], result["active_runtime_checksum"])
 
-    def test_manual_rollback_restores_champion_params(self):
-        conn = _db()
-        evo = _db()
-        SE.init_params(evo)
-        SCM.open_challenger(conn, evo, "trend_pullback",
-                            {"max_weight_delta": 0.032}, evidence_count=EVIDENCE)
-        result = SCM.rollback_challenger(conn, evo, "trend_pullback", reason="证据不足")
+    def test_manual_rollback_only_discards_shadow_metadata(self):
+        before = SCM.active_runtime_checksum(self.evo, STRATEGY)
+        self._open()
+        result = SCM.rollback_challenger(self.paper, self.evo, STRATEGY)
         self.assertTrue(result["rolled_back"])
-        runtime = SE.get_strategy_params(evo, "trend_pullback")
-        self.assertEqual(0.03, runtime["params"]["max_weight_delta"])
+        self.assertEqual(before["checksum"], SCM.active_runtime_checksum(self.evo, STRATEGY)["checksum"])
 
 
-class WiringGuardTests(unittest.TestCase):
-    @staticmethod
-    def _source(name):
-        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), name)
-        with open(path, "r", encoding="utf-8") as handle:
-            return handle.read()
+class ValidationAndWiringTests(unittest.TestCase):
+    def test_open_still_enforces_profile_locks_and_evidence(self):
+        paper, evo = _paper_db(), _evolution_db()
+        try:
+            locked = SCM.open_challenger(paper, evo, STRATEGY, {"max_delta_threshold": 0.006}, evidence_count=EVIDENCE)
+            insufficient = SCM.open_challenger(paper, evo, STRATEGY, {"max_weight_delta": 0.032}, evidence_count=2)
+            self.assertFalse(locked["opened"])
+            self.assertTrue(any("锁定" in item for item in locked["violations"]))
+            self.assertFalse(insufficient["opened"])
+            self.assertTrue(any("证据" in item for item in insufficient["violations"]))
+        finally:
+            paper.close()
+            evo.close()
 
-    def test_runtime_store_is_the_single_source_of_truth(self):
-        body = self._source("strategy_champion.py")
-        self.assertIn("adjust_strategy_params", body)
-        self.assertIn("_restore_champion_params", body)
-
-    def test_paper_api_opens_the_evolution_store(self):
-        body = self._source("paper_trading.py")
-        self.assertIn("_evolution_conn", body)
-        self.assertIn('DBM.DB_PATHS["adaptive_learning"]', body)
-
-    def test_schema_is_created_on_every_init_path(self):
-        body = self._source("paper_trading.py")
-        self.assertGreaterEqual(body.count("SCM.ensure_schema(conn)"), 2)
+    def test_open_path_cannot_write_formal_parameter_store(self):
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "strategy_champion.py")
+        with open(path, encoding="utf-8") as handle:
+            body = handle.read()
+        open_body = body[body.index("def open_challenger"):body.index("def _mapping_rows")]
+        self.assertNotIn("adjust_strategy_params", open_body)
+        self.assertIn("strategy_shadow_parameter_versions", open_body)
+        self.assertIn("def run_shadow_context", body)
+        self.assertIn("run_shadow_counterfactual", body)
 
 
 if __name__ == "__main__":

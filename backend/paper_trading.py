@@ -8296,11 +8296,7 @@ def _evolution_conn():
 
 
 def strategy_champion_overview():
-    """PR-16：Champion/Challenger 视图（版本 + 影子评估），纯只读。
-
-    评估带自动回滚（失败恢复 Champion 参数），但绝不触发晋升——晋升只走
-    显式 promote 端点。
-    """
+    """PR-32：读取版本与同快照影子评估；绝不修改正式参数头。"""
     init_db()
     with _db() as conn:
         SCM.ensure_schema(conn)
@@ -8314,8 +8310,8 @@ def strategy_champion_overview():
         finally:
             evo_conn.close()
         rows = _rows(conn.execute(
-            """SELECT id,strategy_id,role,params,base_version_id,source,status,
-                      proposed_at,evaluated_at,metrics,decision
+            """SELECT id,strategy_id,role,params,base_version_id,base_checksum,
+                      shadow_param_version_id,source,status,proposed_at,evaluated_at,metrics,decision
                  FROM strategy_champion_versions ORDER BY id DESC LIMIT 80"""
         ).fetchall())
         for row in rows:
@@ -8330,7 +8326,7 @@ def strategy_champion_overview():
 
 
 def open_strategy_challenger(strategy_id, params, source="manual", evidence_count=None):
-    """PR-16：为策略开启影子 Challenger（参数写入运行仓，失败自动回滚）。"""
+    """PR-32：创建不可变 Challenger，不改 Champion 正式运行参数。"""
     init_db()
     with _db() as conn:
         SCM.ensure_schema(conn)
@@ -8359,7 +8355,7 @@ def promote_strategy_challenger(strategy_id):
 
 
 def rollback_strategy_challenger(strategy_id, reason="manual_rollback"):
-    """PR-16：丢弃 Challenger 并恢复 Champion 参数（显式/自动回滚共用）。"""
+    """PR-32：丢弃 Challenger；Champion 参数头始终保持原值。"""
     init_db()
     with _db(immediate=True) as conn:
         SCM.ensure_schema(conn)
