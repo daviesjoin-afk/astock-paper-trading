@@ -48,6 +48,7 @@ MIGRATIONS = {
         (4, "补齐点火影子表与索引", paper_schema.ensure_ignition_shadow_table),
         (5, "创建动态策略定义与生命周期表", strategy_registry.ensure_schema),
         (6, "创建不可变策略版本与交易证据版本戳", _ensure_strategy_versioning),
+        (7, "新增可执行策略 DSL 定义字段", strategy_registry.ensure_schema),
     ],
     "adaptive_learning": [
         (1, "创建 schema_version 表", """
