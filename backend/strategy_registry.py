@@ -913,6 +913,18 @@ def stamp_for_account(conn, account_id, *, cycle_id=None):
                FROM paper_strategy_legacy_bindings WHERE account_id=?""",
             (account_id,),
         ).fetchone()
+    if row is None and _table_exists(conn, "strategy_definitions"):
+        # PR-35：用户策略账户在未绑定周期（开户后等待分配资金/暂停）时，
+        # 以其定义头作为审计戳。内置五套仍保持严格的 legacy 绑定语义。
+        head = conn.execute(
+            """SELECT h.strategy_id,h.current_version,h.current_checksum
+               FROM paper_strategy_version_heads h
+               JOIN strategy_definitions d ON d.id=h.strategy_id
+               WHERE h.strategy_id=? AND d.origin='user'""",
+            (account_id,),
+        ).fetchone()
+        if head is not None and head[1] is not None:
+            return tuple(head)
     if row is None:
         raise ValueError(f"strategy version binding not found for account: {account_id}")
     return tuple(row)
