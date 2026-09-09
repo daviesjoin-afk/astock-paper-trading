@@ -8274,6 +8274,14 @@ def strategy_allocation_explain():
         }
 
 
+def strategy_creation_preview(draft=None):
+    """PR-18：策略创建预览——指纹/推荐画像/执行方式/边界/高风险 override。"""
+    import strategy_creation_preview as SCP
+
+    draft = draft if isinstance(draft, dict) else (_loads(draft, {}) if draft else {})
+    return SCP.strategy_creation_preview(draft, RISK_PROFILES)
+
+
 def resolve_execution_verification(order_id, approved, operator="", note=""):
     """PR-11：人工核验结论——放行（放回重试管道）或驳回（终态作废）。"""
     init_db()
