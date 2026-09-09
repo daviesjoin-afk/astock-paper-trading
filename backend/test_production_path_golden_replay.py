@@ -23,6 +23,7 @@ commit 的强制契约（origin=user）。
 """
 from __future__ import annotations
 
+import contextlib
 import datetime as dt
 import json
 import os
@@ -643,6 +644,291 @@ def _as_date(value=None):
         except ValueError:
             return None
     return None
+
+
+# ---------------------------------------------------------------------------
+# PR-40：生产不变式的显式断言。
+#
+# 这一段**不重新手写任何交易逻辑**——全部调用生产 Service
+# （``SR.create_user_definition`` / ``PT.start_new_cycle`` /
+# ``PT.generate_signals`` / ``PT.run_slot`` / ``PT._allocation_plan``），
+# 只把此前隐含在代码里、从未被断言过的六条不变式写出来：
+#   1. pilot capital_scale == 0.25，且 deployable budget 真的被缩放；
+#   2. 不足 100 股不下单（预算进等待池，不产生碎片单）；
+#   3. stale signal 不成交；
+#   4. T+1 当日卖出被拒；
+#   5. 同一 fixture 全流程执行两次产生相同的 canonical replay digest；
+#   6. 所有 allocation 合计永远 <= shared_pool_cap。
+# ---------------------------------------------------------------------------
+
+# canonical digest 只覆盖持久账本中与决策相关的列：刻意排除 created_at /
+# executed_at 等墙钟时间戳与自增 id 之外的易变字段，让 digest 真正表达
+# "同样的输入 → 同样的交易结果"。
+_DIGEST_SOURCES = (
+    ("paper_signals", "account_id,signal_date,intended_date,code,status"),
+    ("paper_orders", "account_id,code,side,qty,status,planned_price,filled_price"),
+    ("paper_fills", "account_id,code,side,qty,price,fill_date"),
+)
+
+
+class ProductionInvariantTests(OfflinePaperEnv, unittest.TestCase):
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        QUOTE_PRICES.clear()
+        QUOTE_SCENARIOS.clear()
+
+    def setUp(self):
+        self._db_index = getattr(ProductionInvariantTests, "_db_seq", 0)
+        ProductionInvariantTests._db_seq = self._db_index + 1
+        PT.DB_PATH = os.path.join(self._tmp, f"paper_invariant_{self._db_index}.sqlite3")
+        # 注入行情是模块级字典：用例之间必须清空，否则串价会污染断言。
+        QUOTE_PRICES.clear()
+        QUOTE_SCENARIOS.clear()
+        SRT.clear_cache()
+        PT.init_db()
+
+    @contextlib.contextmanager
+    def _conn(self):
+        """基类 _conn 不关闭连接；这里显式关闭，避免临时库被长期占用。"""
+        conn = sqlite3.connect(PT.DB_PATH, timeout=30)
+        conn.row_factory = sqlite3.Row
+        try:
+            with conn:
+                yield conn
+        finally:
+            conn.close()
+
+    # ---------- 生产链路装配（不重写交易逻辑） ----------
+
+    def _boot_strategy(self):
+        """create → validate → activate → enable → 新周期（全生产 Service）。"""
+        with self._conn() as conn:
+            SR.ensure_schema(conn)
+            SR.create_user_definition(
+                conn, STRATEGY_ID, "不变式回放策略", dsl_ast=RULE,
+                metadata={"candidate_topn": 10, "style": "trend", "hold": 8},
+                actor="invariant-test",
+            )
+            SR.transition(conn, STRATEGY_ID, "validated", expected_status="draft",
+                          reason="validate", actor="invariant-test")
+            SR.transition(conn, STRATEGY_ID, "active", expected_status="validated",
+                          reason="activate", actor="invariant-test")
+            RSET.update(conn, {"enabled_strategies": [STRATEGY_ID]}, actor="invariant-test")
+        PT.init_db()
+        _, cycle = PT.start_new_cycle(capital=CAPITAL, include_dashboard=False)
+        return cycle
+
+    def _close_and_open(self):
+        close_result = PT.generate_signals(D0)
+        self.assertNotEqual(close_result.get("status"), "failed", close_result)
+        opened = PT.run_slot("open", D1, force=True)
+        self.assertNotEqual(opened.get("status"), "failed", opened)
+        return close_result, opened
+
+    def _allocation(self, price, positions=None, nav=None, conn=None):
+        """生产资金部署入口（唯一输入装配点），不做任何本地重算。"""
+        def _run(active):
+            return PT._allocation_plan(
+                active, nav=CAPITAL if nav is None else nav,
+                positions=positions or [], quotes={}, market={"light": "green"},
+                prices_by_strategy={STRATEGY_ID: price}, account={"id": STRATEGY_ID},
+            )
+        if conn is not None:
+            return _run(conn)
+        with self._conn() as active:
+            return _run(active)
+
+    def _digest(self):
+        import hashlib
+        digest = hashlib.sha256()
+        with self._conn() as conn:
+            for table, columns in _DIGEST_SOURCES:
+                rows = conn.execute(
+                    f"SELECT {columns} FROM {table} ORDER BY {columns}"
+                ).fetchall()
+                digest.update(table.encode("utf-8"))
+                for row in rows:
+                    digest.update(repr(tuple(row)).encode("utf-8"))
+        return digest.hexdigest()
+
+    def _buy_fills(self, day=None):
+        with self._conn() as conn:
+            if day is None:
+                rows = conn.execute(
+                    "SELECT * FROM paper_fills WHERE account_id=? AND side='buy'",
+                    (STRATEGY_ID,),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT * FROM paper_fills WHERE account_id=? AND side='buy' AND fill_date=?",
+                    (STRATEGY_ID, day.isoformat()),
+                ).fetchall()
+            return [dict(row) for row in rows]
+
+    def _sell_fills(self, day=None):
+        with self._conn() as conn:
+            if day is None:
+                rows = conn.execute(
+                    "SELECT * FROM paper_fills WHERE account_id=? AND side='sell'",
+                    (STRATEGY_ID,),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT * FROM paper_fills WHERE account_id=? AND side='sell' AND fill_date=?",
+                    (STRATEGY_ID, day.isoformat()),
+                ).fetchall()
+            return [dict(row) for row in rows]
+
+    # ---------- 1) pilot capital_scale ----------
+
+    def test_pilot_capital_scale_actually_scales_deployable_budget(self):
+        self._boot_strategy()
+        price = LAST_CLOSE["600901"]
+        with self._conn() as conn:
+            context = SRT.get_context(conn, STRATEGY_ID)
+            self.assertEqual(context.lifecycle_stage, "pilot")
+            self.assertEqual(context.capital_scale, 0.25)
+            plan = self._allocation(price, conn=conn)
+        row = plan["rows_by_strategy"][STRATEGY_ID]
+        # 阶段与系数必须从同一个 runtime 出来。
+        self.assertEqual(row["lifecycle_stage"], "pilot")
+        self.assertEqual(row["capital_scale"], 0.25)
+        # deployable budget 真的被缩放到四分之一，而不是只写了个标签。
+        self.assertAlmostEqual(row["scaled_budget_amount"], row["budget_amount"] * 0.25, places=2)
+        self.assertLessEqual(row["deployable_amount"], row["raw_allowance_amount"] * 0.25 + 1e-6)
+        self.assertAlmostEqual(
+            row["lifecycle_withheld_amount"], row["budget_amount"] * 0.75, places=2
+        )
+        self.assertGreater(row["lifecycle_withheld_amount"], 0.0)
+
+    # ---------- 2) 不足 100 股不下单 ----------
+
+    def test_sub_lot_budget_places_no_order(self):
+        self._boot_strategy()
+        # 价格高到 pilot 缩放后的预算连一手都买不起。
+        expensive = CAPITAL
+        plan = self._allocation(expensive)
+        row = plan["rows_by_strategy"][STRATEGY_ID]
+        self.assertEqual(row["lots"], 0, row)
+        self.assertEqual(row["deployable_amount"], 0.0, row)
+        self.assertGreater(row["waiting_capital"], 0.0, row)
+        self.assertIn("预算不足一手", str(row.get("blocked_reason") or ""))
+
+        # 端到端：用这个价格跑开盘 slot，必须一笔成交都没有。
+        for code in ALL_CODES:
+            QUOTE_PRICES[(code, D1.isoformat())] = float(expensive)
+        self._close_and_open()
+        self.assertEqual([], self._buy_fills(), "不足一手必须不下单")
+        with self._conn() as conn:
+            orders = conn.execute(
+                "SELECT COUNT(*) FROM paper_orders WHERE account_id=? AND status='filled'",
+                (STRATEGY_ID,),
+            ).fetchone()[0]
+        self.assertEqual(0, orders)
+
+    # ---------- 3) stale signal 不成交 ----------
+
+    def test_stale_signal_does_not_fill(self):
+        self._boot_strategy()
+        self._close_and_open()
+        self.assertTrue(self._buy_fills(), "前置条件：正常信号必须成交")
+        # 清账后只留下一个"意图日早已过去"的陈旧信号，再跑一次开盘。
+        with self._conn() as conn:
+            conn.execute("DELETE FROM paper_fills")
+            conn.execute("DELETE FROM paper_orders")
+            conn.execute("DELETE FROM paper_position_lots")
+            conn.execute("DELETE FROM paper_positions")
+            conn.execute(
+                "UPDATE paper_signals SET intended_date=?, signal_date=? WHERE account_id=?",
+                ((D0 - dt.timedelta(days=20)).isoformat(),
+                 (D0 - dt.timedelta(days=20)).isoformat(), STRATEGY_ID),
+            )
+            stale = conn.execute(
+                "SELECT COUNT(*) FROM paper_signals WHERE account_id=?", (STRATEGY_ID,)
+            ).fetchone()[0]
+        self.assertGreater(stale, 0)
+        opened = PT.run_slot("open", D1, force=True)
+        self.assertNotEqual(opened.get("status"), "failed", opened)
+        self.assertEqual([], self._buy_fills(), "陈旧信号必须不成交")
+
+    # ---------- 4) T+1 当日卖出被拒 ----------
+
+    def test_same_day_sell_is_rejected_by_t_plus_one(self):
+        self._boot_strategy()
+        self._close_and_open()
+        fills = self._buy_fills(day=D1)
+        self.assertTrue(fills, "前置条件：D1 必须有买入成交")
+        # 当天就跑风控：T+1 未满足，不允许卖出（哪怕价格暴跌）。
+        QUOTE_SCENARIOS[D1.isoformat()] = {
+            "pct": -9.0, "main_pct": -6.0, "main_net": -6_000_000.0,
+            "super_net": -5_000_000.0, "vol_ratio": 2.0, "open_above": True,
+        }
+        for code in PASS_CODES:
+            QUOTE_PRICES[(code, D1.isoformat())] = round(float(fills[0]["price"]) * 0.91, 2)
+        with self._conn() as conn:
+            conn.execute("DELETE FROM paper_jobs WHERE slot='risk'")
+            conn.execute("DELETE FROM paper_audit WHERE event='risk_scan_state'")
+        risk = PT.run_slot("risk", D1, force=True)
+        self.assertNotEqual(risk.get("status"), "failed", risk)
+        self.assertEqual([], self._sell_fills(day=D1), "T+1 当日卖出必须被拒")
+        with self._conn() as conn:
+            remaining = conn.execute(
+                "SELECT COALESCE(SUM(qty),0) FROM paper_positions WHERE account_id=?",
+                (STRATEGY_ID,),
+            ).fetchone()[0]
+        self.assertGreater(int(remaining), 0, "T+1 拒绝卖出后持仓必须完整保留")
+
+    # ---------- 5) 全流程两次执行 → 相同 canonical digest ----------
+
+    def test_full_replay_digest_is_deterministic(self):
+        first = self._run_fixture_and_digest()
+        PT.DB_PATH = os.path.join(self._tmp, "paper_invariant_second.sqlite3")
+        SRT.clear_cache()
+        PT.init_db()
+        second = self._run_fixture_and_digest()
+        self.assertTrue(first["fills"], "前置条件：fixture 必须产生成交")
+        self.assertEqual(first["digest"], second["digest"],
+                         "同一 fixture 全流程执行两次必须产生相同的 canonical replay digest")
+
+    def _run_fixture_and_digest(self):
+        self._boot_strategy()
+        self._close_and_open()
+        return {"digest": self._digest(), "fills": self._buy_fills()}
+
+    # ---------- 6) allocation 合计永远 <= shared_pool_cap ----------
+
+    def test_allocation_total_never_exceeds_shared_pool_cap(self):
+        self._boot_strategy()
+        price = LAST_CLOSE["600901"]
+        with self._conn() as conn:
+            exposure_cap = RSET.get(conn, "shared_pool_exposure_cap", PT.SHARED_POOL_MAX_EXPOSURE)
+            for nav in (0.0, CAPITAL * 0.1, CAPITAL, CAPITAL * 10.0):
+                plan = self._allocation(price, nav=nav, conn=conn)
+                self.assertLessEqual(
+                    plan["total_deployable_amount"], plan["pool_headroom_amount"] + 1e-6,
+                    f"nav={nav}",
+                )
+                self.assertLessEqual(
+                    plan["total_deployable_amount"], nav * exposure_cap + 1e-6, f"nav={nav}",
+                )
+        # 真实交易后（有持仓、有在途）不变式仍然成立。
+        self._close_and_open()
+        with self._conn() as conn:
+            positions = [dict(row) for row in conn.execute(
+                "SELECT * FROM paper_positions WHERE account_id=?", (STRATEGY_ID,)
+            ).fetchall()]
+            pool_cap = CAPITAL * RSET.get(conn, "shared_pool_exposure_cap", PT.SHARED_POOL_MAX_EXPOSURE)
+            plan = self._allocation(price, positions=positions, conn=conn)
+            self.assertLessEqual(
+                plan["total_deployable_amount"], plan["pool_headroom_amount"] + 1e-6
+            )
+            self.assertLessEqual(plan["total_deployable_amount"], pool_cap + 1e-6)
+        # 逐策略相加也永不越过共享池上限。
+        total = sum(float(row["deployable_amount"]) for row in plan["plan"])
+        self.assertLessEqual(total, plan["pool_headroom_amount"] + 1e-6)
+        self.assertLessEqual(total, pool_cap + 1e-6)
 
 
 if __name__ == "__main__":
