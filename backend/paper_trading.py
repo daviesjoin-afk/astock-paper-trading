@@ -712,6 +712,111 @@ def _active_account_clause(column="id", conn=None):
     return f"{column} IN ({placeholders})", ids
 
 
+# PR-38：执行层参与者解析的权威口径（single-owner）。
+#
+# Registry（``strategy_definitions``）只回答"下一周期能否启用某策略"；
+# 执行层（产生新信号 / 新委托 / 占用共享资金）只认周期快照：
+#
+#     paper_cycles.enabled_strategies  ∩  paper_accounts.cycle_id == 当期 id
+#
+# 否则"注册表里仍是 active"的策略会被执行层偷偷拉回一个已经把它摘掉的
+# 周期，继续占用共享池资金并产生本周期不该存在的信号与委托。
+# lifecycle pause（注册表 lifecycle_status='paused'）可以从执行层临时
+# 禁用新信号，而不必改写周期快照、也不必把账户摘出周期（历史仍可查）。
+_CYCLE_PARTICIPANT_VERSION = "cycle-participant-v1"
+_LIFECYCLE_PAUSED_STATUSES = ("paused",)
+
+
+def _lifecycle_paused_ids(conn) -> frozenset:
+    """注册表中被生命周期暂停的策略 id；执行层据此临时禁用新信号。"""
+    if conn is None:
+        return frozenset()
+    placeholders = ",".join("?" for _ in _LIFECYCLE_PAUSED_STATUSES)
+    try:
+        rows = conn.execute(
+            f"SELECT id FROM strategy_definitions WHERE lifecycle_status IN ({placeholders})",
+            _LIFECYCLE_PAUSED_STATUSES,
+        ).fetchall()
+    except sqlite3.Error:
+        return frozenset()
+    return frozenset(str(row[0]) for row in rows if row[0])
+
+
+def _cycle_participant_resolution(conn, cycle_id=None):
+    """解析当前周期权威参与者，并给出判定来源供审计。
+
+    返回值：``{"ids", "source", "enabled", "bound", "paused", "cycle_id"}``。
+    ``source`` 只有三种：
+    - ``cycle_snapshot``：启用集合 ∩ 周期挂接（权威路径）；
+    - ``cycle_enabled_unbound_fallback``：周期已声明启用集合但账本尚未
+      挂接（新建周期首轮 / 迁移窗口），退化为启用集合本身，避免整轮空转；
+    - ``no_cycle`` / ``cycle_not_configured`` / ``no_conn``：沿用内置集合
+      （+ 注册表参与者），与 PR-38 之前的行为一致。
+    """
+    fallback_ids = (
+        tuple(dict.fromkeys([*ACTIVE_ACCOUNT_IDS, *USP.user_participant_ids(conn)]))
+        if conn is not None else tuple(ACTIVE_ACCOUNT_IDS)
+    )
+    if conn is None:
+        return {"ids": fallback_ids, "source": "no_conn", "enabled": (),
+                "bound": frozenset(), "paused": frozenset(), "cycle_id": None,
+                "version": _CYCLE_PARTICIPANT_VERSION}
+    try:
+        if cycle_id is None:
+            cycle_row = conn.execute(
+                "SELECT id,enabled_strategies FROM paper_cycles "
+                "WHERE status IN ('draft','running','paused') ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+        else:
+            cycle_row = conn.execute(
+                "SELECT id,enabled_strategies FROM paper_cycles WHERE id=?", (int(cycle_id),)
+            ).fetchone()
+    except sqlite3.Error:
+        cycle_row = None
+    if cycle_row is None:
+        return {"ids": fallback_ids, "source": "no_cycle", "enabled": (),
+                "bound": frozenset(), "paused": frozenset(), "cycle_id": None,
+                "version": _CYCLE_PARTICIPANT_VERSION}
+    parsed = _loads(cycle_row["enabled_strategies"], None) if cycle_row["enabled_strategies"] else None
+    if not isinstance(parsed, list) or not parsed:
+        return {"ids": fallback_ids, "source": "cycle_not_configured", "enabled": (),
+                "bound": frozenset(), "paused": frozenset(), "cycle_id": cycle_row["id"],
+                "version": _CYCLE_PARTICIPANT_VERSION}
+    enabled = tuple(dict.fromkeys(str(item) for item in parsed))
+    try:
+        bound = frozenset(
+            str(row[0]) for row in conn.execute(
+                "SELECT id FROM paper_accounts WHERE cycle_id=?", (cycle_row["id"],),
+            ).fetchall() if row[0]
+        )
+    except sqlite3.Error:
+        bound = frozenset()
+    paused = _lifecycle_paused_ids(conn)
+    ids = tuple(item for item in enabled if item in bound and item not in paused)
+    source = "cycle_snapshot"
+    if not ids:
+        # 周期已声明启用集合但账本尚未挂接：退化为启用集合本身，
+        # 被 lifecycle pause 的 id 仍然不参与执行。
+        ids = tuple(item for item in enabled if item not in paused)
+        source = "cycle_enabled_unbound_fallback"
+    return {
+        "ids": ids, "source": source, "enabled": enabled, "bound": bound,
+        "paused": paused, "cycle_id": cycle_row["id"],
+        "version": _CYCLE_PARTICIPANT_VERSION,
+    }
+
+
+def current_cycle_participant_ids(conn, cycle_id=None):
+    """当前周期权威参与者 id（PR-38 单一事实来源）。
+
+    权威条件 = ``paper_cycles.enabled_strategies`` ∩
+    ``paper_accounts.cycle_id == 当前周期 id``；被 lifecycle pause 的策略
+    临时退出执行层（仍保留在周期内，历史可查）。Registry active 只用于
+    创建下一周期，不再作为执行层依据。
+    """
+    return _cycle_participant_resolution(conn, cycle_id)["ids"]
+
+
 # 用户策略声明式 spec 解析（PR-35）。无 conn 时按需开只读连接；底层
 # SRT.get_context 自带缓存，无需在此重复缓存。
 _UNKNOWN_USER_SPEC = {
@@ -807,14 +912,30 @@ def _dynamic_minimum_order_amount(cycle, nav=None, position_limit=None, conn=Non
 
 
 def _active_account_rows(conn, status=None):
-    """Read only accounts allowed to participate in the current cycle."""
-    clause, params = _active_account_clause(conn=conn)
-    sql = f"SELECT * FROM paper_accounts WHERE {clause}"
-    if status is not None:
-        sql += " AND status=?"
-        params = (*params, status)
-    sql += " ORDER BY id"
-    rows = _rows(conn, sql, params)
+    """Read only accounts allowed to participate in the current cycle.
+
+    PR-38：参与资格统一走 ``current_cycle_participant_ids``（周期快照），
+    不再由 Registry active 决定。周期快照不可用时才退回旧口径，保证早期
+    /迁移期数据库行为不变。
+    """
+    participant_ids = current_cycle_participant_ids(conn) if conn is not None else ()
+    if participant_ids:
+        placeholders = ",".join("?" for _ in participant_ids)
+        sql = f"SELECT * FROM paper_accounts WHERE id IN ({placeholders})"
+        params = tuple(participant_ids)
+        if status is not None:
+            sql += " AND status=?"
+            params = (*params, status)
+        sql += " ORDER BY id"
+        rows = _rows(conn, sql, params)
+    else:
+        clause, params = _active_account_clause(conn=conn)
+        sql = f"SELECT * FROM paper_accounts WHERE {clause}"
+        if status is not None:
+            sql += " AND status=?"
+            params = (*params, status)
+        sql += " ORDER BY id"
+        rows = _rows(conn, sql, params)
     order = {account_id: index for index, account_id in enumerate(ACTIVE_ACCOUNT_IDS)}
     rows.sort(key=lambda row: order.get(row.get("id"), len(order)))
     return rows
@@ -2684,7 +2805,22 @@ def _ensure_cycle(conn):
                         (reference_capital, account_id, _date().isoformat()),
                     )
     # PR-35：用户策略账户的周期挂接/摘除（声明式 spec，不做内置专属修复）。
-    for account_id in sorted(user_ids):
+    # PR-38：摘出范围同样必须是"所有已知用户策略账户"——注册表里已暂停/
+    # 退休但账本仍挂在当期 cycle_id 的账户，也要显式摘出并清零资金，
+    # 否则执行层会把它当成当期参与者。
+    all_user_ids = set(user_ids)
+    try:
+        for registry_row in conn.execute(
+            "SELECT id FROM strategy_definitions WHERE origin='user'"
+        ).fetchall():
+            if registry_row[0]:
+                all_user_ids.add(str(registry_row[0]))
+    except sqlite3.Error:
+        pass
+    for account_row in conn.execute("SELECT id FROM paper_accounts").fetchall():
+        if account_row[0] and str(account_row[0]) not in ACCOUNT_SPECS:
+            all_user_ids.add(str(account_row[0]))
+    for account_id in sorted(all_user_ids):
         if account_id in ACTIVE_ACCOUNT_SPECS:
             continue
         row = conn.execute("SELECT * FROM paper_accounts WHERE id=?", (account_id,)).fetchone()
@@ -8740,6 +8876,14 @@ def _buy_order(conn, account, signal, quote, market, news, asof_day, *, all_quot
         return {
             "code": signal["code"], "status": "risk_rejected",
             "reason": "周期已暂停、重置或切换，本次在途订单已取消",
+        }
+    # PR-38：参与者权威口径 = 周期启用集合 ∩ 周期挂接。未被本周期启用的
+    # 策略（即使注册表里仍是 active）不允许产生新委托，也不允许占用共享
+    # 池资金或席位；历史周期数据不受影响，仍可查询。
+    if account["id"] not in current_cycle_participant_ids(conn, current_cycle["id"]):
+        return {
+            "code": signal["code"], "status": "risk_rejected",
+            "reason": "策略未被当前周期启用（cycle snapshot），本次候选不参与执行",
         }
     code = signal["code"]
     if _entry_freeze_enabled():
@@ -15833,11 +15977,26 @@ def _create_cycle(conn, capital, status="paused", reason="新建模拟周期", d
     cycle_user_ids = {
         strategy_id for strategy_id in enabled_strategies if strategy_id not in ACCOUNT_SPECS
     }
-    for user_id in cycle_user_ids:
+    # PR-38：摘出范围必须是"所有已知用户策略账户"，而不只是新周期启用集合
+    # 里的那些。否则上一周期参与、本周期未启用的策略（注册表里可能仍是
+    # active）会被留在旧 cycle_id 上继续占用共享池资金并产生新信号。
+    all_user_ids = set(cycle_user_ids)
+    try:
+        for registry_row in conn.execute(
+            "SELECT id FROM strategy_definitions WHERE origin='user'"
+        ).fetchall():
+            if registry_row[0]:
+                all_user_ids.add(str(registry_row[0]))
+    except sqlite3.Error:
+        pass
+    for account_row in conn.execute("SELECT id FROM paper_accounts").fetchall():
+        if account_row[0] and str(account_row[0]) not in ACCOUNT_SPECS:
+            all_user_ids.add(str(account_row[0]))
+    for user_id in sorted(all_user_ids):
         if not conn.execute("SELECT 1 FROM paper_accounts WHERE id=?", (user_id,)).fetchone():
             _ensure_user_strategy_accounts(conn)
             break
-    for account_id in tuple(ACTIVE_ACCOUNT_SPECS) + tuple(sorted(cycle_user_ids)):
+    for account_id in tuple(ACTIVE_ACCOUNT_SPECS) + tuple(sorted(all_user_ids)):
         spec = ACCOUNT_SPECS.get(account_id)
         if spec is None:
             spec = _spec_for(account_id, conn=conn)
