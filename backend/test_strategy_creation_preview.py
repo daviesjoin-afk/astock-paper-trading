@@ -143,3 +143,65 @@ class ReviewFixTests(unittest.TestCase):
     def test_chinese_natural_labels_are_normalized(self):
         preview = SCP.strategy_creation_preview({"style": "板块轮动"}, RISK_PROFILES)
         self.assertEqual("rotation", preview["risk_fingerprint"]["archetype"])
+
+
+def _dsl_rule(risk_per_trade=0.01):
+    """一条最小可执行 DSL（带声明式风险参数）。"""
+    return {
+        "op": "strategy",
+        "rule": {
+            "op": "gt", "left": {"op": "field", "name": "close"},
+            "right": {"op": "indicator", "name": "ma", "window": 20},
+        },
+        "parameters": [
+            {"op": "parameter", "parameter_id": "risk_per_trade", "type": "number",
+             "value": risk_per_trade, "min": 0.002, "max": 0.02, "max_step": 0.002,
+             "locked": False, "risk_direction": "higher_is_riskier",
+             "min_evidence": 20},
+            {"op": "parameter", "parameter_id": "holding_days", "type": "integer",
+             "value": 5, "min": 1, "max": 20, "max_step": 1,
+             "locked": False, "risk_direction": "higher_is_riskier",
+             "min_evidence": 10},
+        ],
+    }
+
+
+class DslPreviewTests(unittest.TestCase):
+    """PR-34：编辑期实时预览走与生产一致的 StrategyRuntime 编译管线。"""
+
+    def test_dsl_preview_compiles_like_production(self):
+        preview = SCP.strategy_creation_preview(
+            {"style": "trend pullback 趋势 回踩"}, RISK_PROFILES,
+            dsl_ast=_dsl_rule(), pool_capital=1_000_000.0,
+        )
+        self.assertTrue(preview["dsl_valid"])
+        self.assertIsNone(preview["dsl_error"])
+        self.assertEqual("strategy-creation-preview-v2", preview["engine"])
+        self.assertIn("archetype", preview["risk_fingerprint"])
+        self.assertIn("soft_limits", preview["risk_profile"])
+        self.assertIn("order_type", preview["execution_profile"])
+        # 用户策略初始即试点，按资金池折算预计资金。
+        self.assertEqual("pilot", preview["lifecycle"]["initial_stage"])
+        self.assertEqual(0.25, preview["lifecycle"]["capital_scale"])
+        self.assertEqual(250000.0, preview["lifecycle"]["estimated_capital"])
+        # 可进化参数来自声明式 parameter schema。
+        self.assertEqual(["risk_per_trade", "holding_days"],
+                         preview["parameters"]["editable"])
+        items = {item["parameter_id"]: item for item in preview["parameters"]["items"]}
+        self.assertEqual("higher_is_riskier", items["risk_per_trade"]["risk_direction"])
+        # 带风险方向的声明式参数会列入高风险 override 清单并说明非对称门约束。
+        flagged = {item["key"] for item in preview["high_risk_overrides"]}
+        self.assertIn("risk_per_trade", flagged)
+
+    def test_dsl_preview_fails_closed_on_invalid_dsl(self):
+        preview = SCP.strategy_creation_preview({}, RISK_PROFILES,
+                                                dsl_ast={"op": "eval"})
+        self.assertFalse(preview["dsl_valid"])
+        self.assertIn("dsl_error", preview)
+        # 解析失败仍给出保守预览（fail-closed），不给空白页。
+        self.assertIn("risk_fingerprint", preview)
+
+    def test_dsl_preview_without_pool_capital_omits_estimate(self):
+        preview = SCP.strategy_creation_preview({}, RISK_PROFILES, dsl_ast=_dsl_rule())
+        self.assertIsNone(preview["lifecycle"]["pool_capital"])
+        self.assertIsNone(preview["lifecycle"]["estimated_capital"])

@@ -1859,3 +1859,22 @@ body.dark #p-adaptive .adaptive-shell {
   .exec-head { display:block; }
   .exec-head-state { margin-top:10px; }
 }
+
+/* ---------- PR-34: strategy builder & registry management ---------- */
+.strategy-builder-toolbar{margin-top:12px;display:flex;align-items:center;gap:12px;flex-wrap:wrap}
+.strategy-builder-hint,.strategy-muted{color:var(--text-dim,#8a93a5);font-size:12px}
+.strategy-registry-panel{margin-top:16px}
+.strategy-builder-panel{margin-top:14px}
+.strategy-builder-form{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:10px;margin:12px 0}
+.strategy-builder-form label{display:flex;flex-direction:column;gap:4px;font-size:12px;color:var(--text-dim,#8a93a5)}
+.strategy-builder-form input,.strategy-builder-form select{padding:6px 8px;border:1px solid var(--border,#2a3140);border-radius:6px;background:var(--panel,#fff);color:inherit}
+.strategy-condition-editor{border:1px solid var(--border,#2a3140);border-radius:8px;padding:10px;margin:10px 0}
+.sb-group{border:1px dashed var(--border,#2a3140);border-radius:6px;padding:8px;margin:6px 0}
+.sb-cond{display:flex;gap:6px;align-items:center;margin:6px 0;flex-wrap:wrap}
+.sb-cond select,.sb-cond input{padding:4px 6px;border:1px solid var(--border,#2a3140);border-radius:4px;background:var(--panel,#fff);color:inherit;max-width:170px}
+.strategy-condition-actions{display:flex;gap:8px;margin-top:8px}
+.strategy-dsl-view pre{max-height:220px;overflow:auto;background:var(--panel-2,#f6f7fa);border:1px solid var(--border,#2a3140);border-radius:6px;padding:8px;font-size:12px}
+.strategy-preview-box{border:1px solid var(--border,#2a3140);border-radius:8px;padding:10px;margin:10px 0}
+.strategy-preview-box .paper-strategy-metrics{margin:8px 0}
+.strategy-builder-actions{margin-top:10px;display:flex;gap:8px}
+.exec-queue-actions button{margin-right:4px}

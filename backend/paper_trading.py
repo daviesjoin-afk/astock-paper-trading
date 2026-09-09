@@ -989,9 +989,9 @@ def strategy_center():
         "shared_guards": [
             "仅使用独立模拟资金与规则化成交假设，不连接券商或真实账户。",
             "可买范围仅限沪深主板与创业板；ST/退市风险、科创板和北交所一律禁止新买，科创板行情只作同产业映射加分。",
-            f"{len(ACTIVE_ACCOUNT_IDS)}套当前策略共用一个总资金池，持仓与待成交买单合计不得超过总净值的 {SHARED_POOL_MAX_EXPOSURE * 100:.0f}%；这是硬上限，任何特级机会都不能突破。",
+            f"已启用策略集合（当前 {len(ACTIVE_ACCOUNT_IDS)} 套）共用一个总资金池，持仓与待成交买单合计不得超过总净值的 {SHARED_POOL_MAX_EXPOSURE * 100:.0f}%；这是硬上限，任何特级机会都不能突破。",
             "策略额度按风险画像分配目标和保护底线；某策略未用额度只会在其他策略底线满足后转入，不再各自重复计算总池上限。",
-            f"股票持仓按策略席位计数：{len(ACTIVE_ACCOUNT_IDS)}套当前策略共享总硬上限 {SHARED_POOL_MAX_POSITIONS} 个；满席时高分候选进入替补池，只有明显优于弱持仓才允许先卖后买。",
+            f"股票持仓按策略席位计数：已启用策略集合（当前 {len(ACTIVE_ACCOUNT_IDS)} 套）共享总硬上限 {SHARED_POOL_MAX_POSITIONS} 个；满席时高分候选进入替补池，只有明显优于弱持仓才允许先卖后买。",
             "换仓必须通过实时双源行情、新闻、T+1与质量分复核；每策略每日最多一次主动择强换股，硬止损不受此限制。",
             "待成交买单会预占现金和总池额度；成交后核销，撤单、过期或风控拒绝后释放。",
             "自动开仓须使用当日实时行情，并通过东方财富与腾讯行情交叉核验。",
@@ -8514,11 +8514,25 @@ def strategy_allocation_explain():
 
 
 def strategy_creation_preview(draft=None):
-    """PR-18：策略创建预览——指纹/推荐画像/执行方式/边界/高风险 override。"""
+    """PR-18：策略创建预览——指纹/推荐画像/执行方式/边界/高风险 override。
+
+    PR-34：草稿携带 ``dsl_ast`` 时走与生产一致的 StrategyRuntime 编译管线，
+    并按共享资金池现值折算试点阶段的预计资金。
+    """
     import strategy_creation_preview as SCP
 
     draft = draft if isinstance(draft, dict) else (_loads(draft, {}) if draft else {})
-    return SCP.strategy_creation_preview(draft, RISK_PROFILES)
+    pool_capital = None
+    try:
+        with _db() as conn:
+            row = conn.execute("SELECT COALESCE(SUM(cash),0) FROM paper_accounts").fetchone()
+            pool_capital = float(row[0]) if row else None
+    except Exception:
+        pool_capital = None
+    return SCP.strategy_creation_preview(
+        draft, RISK_PROFILES,
+        dsl_ast=draft.get("dsl_ast"), pool_capital=pool_capital,
+    )
 
 
 def resolve_execution_verification(order_id, approved, operator="", note=""):
