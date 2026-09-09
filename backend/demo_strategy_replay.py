@@ -150,7 +150,9 @@ def run_custom_strategy_replay(tmpdir: str) -> dict[str, Any]:
     }
     OI.reject_qty_claims(signal_payload)  # 契约：策略层不得携带数量/金额
     intent = OI.order_intent_from_signal(strategy_id, signal_payload, now=BASE_TS)
+    # 旧字段视图必须还原出 code/strategy_id/side（等价性承诺）。
     legacy = OI.intent_to_legacy_fields(intent)
+    assert legacy["code"] == TICKER[0] and legacy["strategy_id"] == strategy_id
     paper.execute(
         """INSERT INTO paper_signals(account_id,code,name,signal_date,intended_date,
                close_price,status,reason,created_at)
