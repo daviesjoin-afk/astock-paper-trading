@@ -251,6 +251,66 @@ def strategy_center():
         raise HTTPException(status_code=500, detail=f"Strategy center failed: {type(exc).__name__}") from exc
 
 
+@router.get("/strategy-champions")
+def strategy_champions():
+    """PR-16 Champion/Challenger 视图：版本与影子评估（只读，附带评估落库）。"""
+    try:
+        return _call_with_retry(P.strategy_champion_overview)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Strategy champions failed: {type(exc).__name__}") from exc
+
+
+@router.post("/strategy-champion/open")
+def strategy_champion_open(
+    strategy_id: str = Query(...),
+    params: str = Query("{}", max_length=4000),
+    source: str = Query("manual", max_length=32),
+):
+    """PR-16 开启影子 Challenger：参数经策略进化画像钳制后进入 shadow。"""
+    import json as _json
+
+    try:
+        parsed = _json.loads(params or "{}")
+    except ValueError:
+        raise HTTPException(status_code=400, detail="params 必须是 JSON 对象")
+    try:
+        result = _call_with_retry(
+            P.open_strategy_challenger, strategy_id, parsed, source,
+        )
+        _cclear()
+        return result
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Challenger open failed: {type(exc).__name__}") from exc
+
+
+@router.post("/strategy-champion/promote")
+def strategy_champion_promote(strategy_id: str = Query(...)):
+    """PR-16 晋升：必须通过「收益改善且风险不恶化」门禁。"""
+    try:
+        result = _call_with_retry(P.promote_strategy_challenger, strategy_id)
+        if not result.get("promoted"):
+            raise HTTPException(status_code=409, detail=result.get("reason") or "晋升未通过")
+        _cclear()
+        return result
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Challenger promote failed: {type(exc).__name__}") from exc
+
+
+@router.post("/strategy-champion/rollback")
+def strategy_champion_rollback(
+    strategy_id: str = Query(...), reason: str = Query("manual_rollback", max_length=200),
+):
+    """PR-16 回滚：丢弃 Challenger，策略保持 Champion 参数。"""
+    try:
+        result = _call_with_retry(P.rollback_strategy_challenger, strategy_id, reason)
+        _cclear()
+        return result
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Challenger rollback failed: {type(exc).__name__}") from exc
+
+
 @router.get("/execution-profiles")
 def execution_profiles():
     """PR-12 执行画像中心：七档画像目录、账户映射与执行器视图（只读）。"""
