@@ -8148,6 +8148,116 @@ def rollback_strategy_challenger(strategy_id, reason="manual_rollback"):
             evo_conn.close()
 
 
+def strategy_allocation_explain():
+    """PR-17：资金分配可解释性——回答"这个策略为什么拿到当前资金"。
+
+    每个策略返回：base_priority、regime（市场灯与缩放）、confidence/health/
+    data_quality/diversification 六因子、capital_scale、目标预算、可用预算、
+    席位上限、以及当前未部署的等待原因。纯只读，不影响任何交易。
+    """
+    init_db()
+    with _db() as conn:
+        day = _date()
+        cycle = _active_cycle(conn)
+        positions, _position_value, nav, _industries, _code_values = \
+            _shared_account_exposure(conn, {}, day)
+        count_budget = _dynamic_position_limits(conn)
+        rows_map = {row.get("id"): row for row in _shared_account_rows(conn, cycle["id"])}
+        participating = list(count_budget["limits"].keys()) or list(ACCOUNT_SPECS)
+        clusters, cluster_factors = _strategy_cluster_factors(
+            conn, account_ids=participating)
+        try:
+            market_light = str(
+                (_market_state(day, allow_network=False) or {}).get("light") or "")
+        except Exception:
+            market_light = "unknown"
+        strategies = []
+        for account_id in participating:
+            account_row = rows_map.get(account_id) or {"id": account_id}
+            profile = _risk_profile(account_row)
+            weights = {key: max(_num(profile.get("max_exposure"), 0.0), 0.01)
+                       for key in participating}
+            runtimes = _strategy_runtimes(
+                participating, weights,
+                diversification={key: cluster_factors.get(key, 1.0) for key in participating},
+            )
+            runtime = next((item for item in runtimes if item.strategy_id == account_id), None)
+            budget = _strategy_pool_budget(
+                conn, account_row, nav, positions, {}, market=None,
+            )
+            # 等待原因：该策略最新的未部署信号原因。
+            waiting = conn.execute(
+                """SELECT status,reason,code,intended_date FROM paper_signals
+                    WHERE account_id=? AND intended_date=?
+                      AND status IN ('deferred_capacity','awaiting_batch',
+                                     'pending_verification','entry_frozen_waitlist')
+                    ORDER BY id DESC LIMIT 1""",
+                (account_id, day.isoformat()),
+            ).fetchone()
+            waiting_row = dict(waiting) if waiting is not None else None
+            pending_by_account, pending_total = _pending_buy_reservations(conn)
+            stage_scale, stage_label = PA.stage_capital_scale(runtime) if runtime else (1.0, "standard")
+            strategies.append({
+                "strategy_id": account_id,
+                "name": (SR.get(account_id).name if SR.get(account_id) else account_id),
+                "running": account_row.get("status") == "running",
+                # 分配六因子
+                "base_priority": round(_num(weights.get(account_id)), 6),
+                "regime": {
+                    "market_light": market_light or "unknown",
+                    "market_scale_pct": budget.get("market_scale_pct"),
+                    "market_scale_applied": budget.get("market_scale_applied"),
+                },
+                "confidence": round(_num(getattr(runtime, "confidence", 1.0)), 4),
+                "health": round(_num(getattr(runtime, "health", 1.0)), 4),
+                "data_quality": round(_num(getattr(runtime, "data_quality", 1.0)), 4),
+                "diversification": {
+                    "runtime_factor": round(_num(getattr(runtime, "diversification", 1.0)), 4),
+                    "cluster_size": len(SC.cluster_of(account_id, clusters)),
+                    "cluster_members": sorted(SC.cluster_of(account_id, clusters)),
+                },
+                "capital_scale": {
+                    "factor": round(_num(stage_scale), 4),
+                    "lifecycle_stage": stage_label,
+                },
+                # 预算
+                "target_budget": {
+                    "target_amount": budget.get("target_amount"),
+                    "target_pct": budget.get("target_pct"),
+                    "floor_amount": budget.get("floor_amount"),
+                    "priority_floor_amount": budget.get("priority_floor_amount"),
+                    "absolute_cap_amount": budget.get("absolute_cap_amount"),
+                },
+                "available_budget": {
+                    "allowance_amount": budget.get("allowance_amount"),
+                    "current_amount": budget.get("current_amount"),
+                    "pending_reserve_amount": budget.get("pending_reserve_amount"),
+                    "pool_available_amount": budget.get("pool_available_amount"),
+                    "cluster_budget": budget.get("cluster_budget"),
+                },
+                "position_limit": int(_num(count_budget["limits"].get(account_id))),
+                "position_count": sum(
+                    1 for item in positions
+                    if item.get("account_id") == account_id
+                    and int(_num(item.get("qty"))) >= LOT_SIZE
+                ),
+                "waiting_reason": {
+                    "status": waiting_row.get("status") if waiting_row else None,
+                    "code": waiting_row.get("code") if waiting_row else None,
+                    "reason": waiting_row.get("reason") if waiting_row else None,
+                    "intended_date": waiting_row.get("intended_date") if waiting_row else None,
+                },
+            })
+        return {
+            "engine": PA.ALLOCATION_ENGINE_VERSION,
+            "nav": round(_num(nav), 2),
+            "pool_limit": int(_num(count_budget["pool_limit"])),
+            "market_light": market_light or "unknown",
+            "cluster_version": SC.STRATEGY_CLUSTER_VERSION,
+            "strategies": strategies,
+        }
+
+
 def resolve_execution_verification(order_id, approved, operator="", note=""):
     """PR-11：人工核验结论——放行（放回重试管道）或驳回（终态作废）。"""
     init_db()

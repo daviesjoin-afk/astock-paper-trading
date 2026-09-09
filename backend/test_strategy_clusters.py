@@ -143,3 +143,28 @@ class WiringGuardTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class AllocationExplainTests(unittest.TestCase):
+    """PR-17：分配可解释性 API 的数据面。"""
+
+    def test_expose_per_strategy_factors_budgets_and_waiting_reason(self):
+        import paper_trading as paper
+
+        data = paper.strategy_allocation_explain()
+        self.assertEqual(5, len(data["strategies"]))
+        for row in data["strategies"]:
+            for key in ("base_priority", "regime", "confidence", "health",
+                        "data_quality", "diversification", "capital_scale",
+                        "target_budget", "available_budget", "position_limit",
+                        "waiting_reason"):
+                self.assertIn(key, row)
+            # 前端不能只看到一个总额：预算字段必须可拆。
+            self.assertIn("target_amount", row["target_budget"])
+            self.assertIn("allowance_amount", row["available_budget"])
+            self.assertIn("cluster_size", row["diversification"])
+            self.assertIn("market_light", row["regime"])
+        # waiting_reason 结构完整（无等待时字段为 None 而非缺失）。
+        first = data["strategies"][0]["waiting_reason"]
+        for key in ("status", "code", "reason", "intended_date"):
+            self.assertIn(key, first)
