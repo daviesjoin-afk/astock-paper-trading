@@ -1583,6 +1583,72 @@ def _order_intent_payload(strategy_id, pick, *, asof_day=None, intended_session=
     return intent.to_payload(), None
 
 
+def _strategy_contract_mode(conn, account_id):
+    """PR-28：判定策略是否处于 OrderIntent 强制契约模式。
+
+    ``origin=user`` 或定义 ``metadata.contract_version >= 1`` 的策略必须走
+    OrderIntent → ExecutionPlanner.plan → reserve → revalidate → commit，
+    任何策略层 qty/shares/amount/sizing 声明都直接终态拒绝信号；
+    builtin 策略暂允许 legacy adapter（既有等价适配）。
+    返回 ``(enforced, origin, contract_version)``。
+    """
+    origin, contract_version = "builtin", 0
+    try:
+        spec = SR.get(account_id, conn=conn)
+        if spec is not None:
+            origin = str(getattr(spec, "origin", "") or "builtin")
+    except (ValueError, sqlite3.Error):
+        pass
+    try:
+        metadata = (SRT.get_context(conn, account_id).definition or {}).get("metadata") or {}
+        contract_version = int(_num(metadata.get("contract_version"), 0))
+    except (ValueError, TypeError, sqlite3.Error):
+        contract_version = 0
+    enforced = origin == "user" or contract_version >= 1
+    return enforced, origin, contract_version
+
+
+def _enforce_order_intent(conn, account, code, payload, *, signal_id=None):
+    """PR-28：执行入口的 OrderIntent 契约闸门（强制模式）。
+
+    - 强制模式下先对**整个信号负载**做数量声明扫描：任何 qty/shares/
+      amount/sizing 字段（含嵌套）都视为策略层越权决定数量，立即终态
+      拒绝信号——静默忽略会让越权数量变成“薛定谔的契约”。
+    - 通过后构造正式 OrderIntent（数量不在契约中，由执行器统一计算），
+      返回 ``(intent, None)`` 供执行链路与审计共用。
+    - legacy 模式（builtin 且 contract_version<1）返回 ``(None, None)``，
+      由调用方继续走等价适配路径。
+    """
+    account_id = account.get("id")
+    enforced, origin, contract_version = _strategy_contract_mode(conn, account_id)
+    if not enforced:
+        return None, None
+    try:
+        intent = OI.order_intent_from_signal(
+            account_id, {**(payload.get("pick") or {}), "code": code},
+        )
+        OI.reject_qty_claims(payload)
+    except OI.OrderIntentContractError as exc:
+        reason = f"OrderIntent 契约拒绝：{type(exc).__name__}: {exc}"
+        if signal_id is not None:
+            try:
+                conn.execute(
+                    "UPDATE paper_signals SET status='rejected', reason=? WHERE id=?",
+                    (reason, signal_id),
+                )
+            except sqlite3.Error:
+                pass
+        _risk_log(conn, account_id, code, "buy", "order_intent_rejected", reason, {
+            "origin": origin, "contract_version": contract_version,
+            "strategy_id": account_id,
+        })
+        return None, {
+            "code": code, "filled": False, "status": "risk_rejected",
+            "reason": reason,
+        }
+    return intent, None
+
+
 def _rebuild_realized_pnl(conn):
     """按成交流水 FIFO 重放卖出成本，兼容升级前未含买入费用的历史记录。"""
     lots = {}
@@ -8478,10 +8544,13 @@ def _buy_order(conn, account, signal, quote, market, news, asof_day, *, all_quot
     if _entry_freeze_enabled():
         freeze_reason = _entry_frozen_reason("自动候选")
         payload = _loads(signal.get("payload"), {})
+        # PR-28：强制契约策略不允许信号携带数量——冻结等待池记录同样
+        # 不采纳 signal.qty（数量只属于执行器）。
+        enforced, _origin, _cv = _strategy_contract_mode(conn, account["id"])
         order_id, _created, _reason, freeze_payload = _record_entry_frozen_waitlist(
             conn, account["id"], code,
             name=signal.get("name"),
-            qty=signal.get("qty") or 0,
+            qty=0 if enforced else (signal.get("qty") or 0),
             planned_price=_num(quote.get("price"), signal.get("close_price")),
             risk_payload={
                 "signal": payload.get("decision"),
@@ -8514,6 +8583,14 @@ def _buy_order(conn, account, signal, quote, market, news, asof_day, *, all_quot
             "reason": freeze_reason,
         }
     payload = _loads(signal["payload"])
+    # PR-28：OrderIntent 契约闸门。origin=user 或 contract_version>=1 的
+    # 策略，任何 qty/shares/amount/sizing 声明（含嵌套）都直接终态拒绝
+    # 信号——策略只能表达意图，数量永远由执行器统一计算。
+    intent, contract_reject = _enforce_order_intent(
+        conn, account, code, payload, signal_id=signal.get("id"),
+    )
+    if contract_reject is not None:
+        return contract_reject
     # 信号 TTL：入场信号是即时证据。超龄或跨日信号直接终态拒绝，旧信号
     # 永远不能开新仓；加仓必须由新信号/新委托意图重新走完整风控。
     freshness = ELC.signal_freshness(signal, asof_day=asof_day)
@@ -8558,6 +8635,10 @@ def _buy_order(conn, account, signal, quote, market, news, asof_day, *, all_quot
         "execution_day": _date(asof_day).isoformat(),
         "q": None,
     }
+    # PR-28：通过的 OrderIntent 随风险负载贯穿执行链路（plan → reserve →
+    # revalidate → commit 各阶段共用同一份意图）。
+    if intent is not None:
+        risk["order_intent"] = intent.to_payload()
     reasons = []
     security_scope = _security_scope(code, quote.get("name") or signal.get("name"), quote.get("risk_flag"))
     risk["security_scope"] = security_scope
@@ -12676,6 +12757,15 @@ def _intraday_sell(conn, account, position, quote, asof_day, profile, cycle, ope
 
 def _intraday_buyback(conn, account, position, quote, market, asof_day, profile, cycle, *, all_quotes=None):
     """回补腿只能对应同日已高抛的库存；回补后仍按 T+1 锁定。"""
+    # PR-28：加仓/换仓同样是数量决策，必须先过 OrderIntent 契约闸门
+    # （回补意图由已成交卖出记录合成，不携带任何策略层数量声明）。
+    intent, contract_reason = _enforce_order_intent(
+        conn, account, position["code"],
+        {"pick": {"code": position["code"], "price": _num(quote.get("price")),
+                  "reason": "日内回补（同日高抛库存）"}},
+    )
+    if contract_reason is not None:
+        return None, contract_reason.get("reason")
     quote_status = _execution_quote_status(quote, asof_day)
     if not quote_status["fresh"]:
         _risk_log(
@@ -12794,6 +12884,15 @@ def _intraday_buyback(conn, account, position, quote, market, asof_day, profile,
 
 def _swing_scale_in(conn, account, position, quote, market, asof_day, profile, cycle, *, all_quotes=None):
     """趋势/板块策略的单日一次确认加仓；始终受原有仓位和风险预算约束。"""
+    # PR-28：加仓是数量决策，先过 OrderIntent 契约闸门（加仓意图由
+    # 持仓与行情合成，不携带任何策略层数量声明）。
+    intent, contract_reason = _enforce_order_intent(
+        conn, account, position["code"],
+        {"pick": {"code": position["code"], "price": _num(quote.get("price")),
+                  "reason": "波段确认加仓"}},
+    )
+    if contract_reason is not None:
+        return None, contract_reason.get("reason")
     if account.get("mode") == "intraday_t":
         return None, "日内做T使用专用高抛回补规则"
     # 意图优先级（PR：intent coordinator）：P5 加仓必须让位于 P0 风控退出。
