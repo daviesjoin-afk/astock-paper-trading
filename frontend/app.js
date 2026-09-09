@@ -41,6 +41,12 @@ async function apiPostJson(path, payload){
   if(!r.ok) throw new Error(d.detail||d.error||('请求失败 HTTP '+r.status));
   return d;
 }
+async function apiJson(path, method, payload){
+  var r=await fetch(path,{method:method||'GET',headers:{'Content-Type':'application/json'},body:(payload===undefined?undefined:JSON.stringify(payload||{}))});
+  var d=await r.json().catch(function(){return {};});
+  if(!r.ok) throw new Error(d.detail||d.error||('请求失败 HTTP '+r.status));
+  return d;
+}
 function chart(id){
   var target=$(id), existing=charts[id];
   if(!target) return null;
@@ -494,12 +500,12 @@ function renderAdaptive(d){
   var closedLoopBlockers=(closedLoop.blockers||[]).map(function(x){return '<li>'+adaptiveEsc(x)+'</li>';}).join('')||'<li class="pass">当前阶段的确定性门禁已通过</li>';
   var closedLoopPanel='<section class="adaptive-panel closed-loop-panel"><header><div><span>DATA → ALPHA → PORTFOLIO → RISK → EXECUTION → FEEDBACK</span><h3>量化闭环准入台</h3></div><em>'+adaptiveEsc(closedLoop.stage||'D1-D3')+' · '+adaptiveEsc(closedLoop.mode==='shadow'?'影子运行':closedLoop.mode||'影子运行')+'</em></header><p class="adaptive-copy">先把信号、风控、委托、成交和结果串成同一证据链，再让自适应模块按 0% → 5% → 10% 的模拟资金逐级接管。日期到了但证据不达标不会强行放权。</p><div class="closed-loop-stages">'+closedLoopStages+'</div><div class="closed-loop-kpis"><div><small>历史证据链委托</small><b>'+Number(chain.orders||0)+'</b></div><div><small>新窗口关联率</small><b>'+adaptiveValue(admissionWindow.link_pct,'%',1)+'</b></div><div><small>新窗口完整率</small><b>'+adaptiveValue(admissionWindow.valid_pct,'%',1)+'</b></div><div><small>实际 / 反事实</small><b>'+Number(chain.actual||0)+' / '+Number(chain.counterfactual||0)+'</b></div><div><small>策略成交覆盖</small><b>'+Number(closedLoop.strategy_coverage||0)+' / 5 当前账户</b></div><div><small>灰度硬上限</small><b>'+Number(canaryLimits.max_nav_pct||10)+'% · '+Number(canaryLimits.max_new_slots||2)+'槽</b></div></div><div class="closed-loop-gates"><h4>当前阻断项</h4><ul>'+closedLoopBlockers+'</ul><small>历史债务：未完整关联 '+Number(legacyDebt.unlinked_orders||0)+' 条；只保留审计，不计入新闭环准入。</small></div><div class="adaptive-notice">未成交、风控拒绝、容量延期只进入反事实账本，不再混入真实 Bandit 收益。GA、神经网络和 DeepSeek 在本阶段只能生成影子研究证据，不能直接控制订单。</div></section>';
   var portfolioRows=portfolioSelected.map(function(x){return '<article><div><span>'+adaptiveEsc(x.account_name)+'</span><b>'+adaptiveEsc(x.name||x.code)+' '+adaptiveEsc(x.code)+'</b><small>'+adaptiveEsc(x.industry||'未知行业')+' · '+adaptiveEsc((x.reasons||[]).join('；'))+'</small></div><strong>'+fmt(x.utility,1)+'</strong></article>';}).join('')||'<div class="paper-empty">当前没有可进入组合比较的新增候选。</div>';
-  var portfolioPanel='<section class="adaptive-panel portfolio-shadow-panel"><header><div><span>PORTFOLIO ARBITER · SHADOW</span><h3>跨策略组合裁决</h3></div><em>影子运行 · 不改变订单</em></header><p class="adaptive-copy">五套策略继续独立选股；组合层只在共享资金池里比较边际效用，并对同股重复、行业集中和容量延期扣分。当前最多展示 '+Number(portfolioShadow.max_canary_slots||2)+' 个灰度候选。</p><div class="portfolio-shadow-kpis"><span>候选 <b>'+Number(portfolioShadow.candidate_count||0)+'</b></span><span>当前持仓槽 <b>'+Number(portfolioShadow.held_slots||0)+'</b></span><span>重复代码 <b>'+Number(portfolioShadow.duplicate_code_count||0)+'</b></span></div><div class="portfolio-shadow-list">'+portfolioRows+'</div><div class="adaptive-notice">该裁决器不会因为 Bandit 权重变化强制卖出现有持仓；T+1、双源行情、82%总暴露和原策略风控仍拥有最终否决权。</div></section>';
+  var portfolioPanel='<section class="adaptive-panel portfolio-shadow-panel"><header><div><span>PORTFOLIO ARBITER · SHADOW</span><h3>跨策略组合裁决</h3></div><em>影子运行 · 不改变订单</em></header><p class="adaptive-copy">已启用策略继续独立选股；组合层只在共享资金池里比较边际效用，并对同股重复、行业集中和容量延期扣分。当前最多展示 '+Number(portfolioShadow.max_canary_slots||2)+' 个灰度候选。</p><div class="portfolio-shadow-kpis"><span>候选 <b>'+Number(portfolioShadow.candidate_count||0)+'</b></span><span>当前持仓槽 <b>'+Number(portfolioShadow.held_slots||0)+'</b></span><span>重复代码 <b>'+Number(portfolioShadow.duplicate_code_count||0)+'</b></span></div><div class="portfolio-shadow-list">'+portfolioRows+'</div><div class="adaptive-notice">该裁决器不会因为 Bandit 权重变化强制卖出现有持仓；T+1、双源行情、82%总暴露和原策略风控仍拥有最终否决权。</div></section>';
   var dataCards=dataCategories.map(function(x){var coverage=x.coverage_pct==null?'分项统计':fmt(x.coverage_pct,1)+'%';var freshness=x.freshness_minutes==null?'':(' · 延迟 '+fmt(x.freshness_minutes,1)+'分钟');return '<article class="data-input-card '+adaptiveEsc(x.status||'partial')+'"><header><div><span>'+adaptiveEsc(x.id||'data')+'</span><h4>'+adaptiveEsc(x.name)+'</h4></div><em>'+adaptiveEsc(({usable:'可用于交易',shadow:'仅影子',partial:'部分可用',blocked:'禁止新增'})[x.status]||x.status)+'</em></header><div class="data-input-metric"><b>'+coverage+'</b><small>'+Number(x.records||0)+' 条/行'+freshness+'</small></div><p>'+adaptiveEsc(x.detail||'')+'</p><div class="data-input-sources">'+(x.sources||[]).map(function(s){return '<span>'+adaptiveEsc(s)+'</span>';}).join('')+'</div><small>'+adaptiveEsc(x.authority||'')+'</small></article>';}).join('');
   var dataBlockers=(dataInputs.blockers||[]).map(function(x){return '<li>'+adaptiveEsc(x)+'</li>';}).join('')||'<li class="pass">五类输入均达到当前使用门槛</li>';
   var dataInputPanel='<section class="adaptive-panel data-input-panel"><header><div><span>DATA INPUT BUS · QUALITY GATES</span><h3>五类数据输入总线</h3></div><em>'+adaptiveEsc(dataInputs.version||'data-input-bus-v1')+'</em></header><p class="adaptive-copy">全面不等于把所有字段都接进来，而是每类数据都要有来源、覆盖率、源时间、降级状态和明确使用权限。缺失数据不会静默用代理值冒充。</p><div class="data-input-grid">'+dataCards+'</div><div class="data-input-bottom"><div><h4>当前数据缺口</h4><ul>'+dataBlockers+'</ul></div><div><h4>输入纪律</h4><ul>'+(dataInputs.rules||[]).map(function(x){return '<li>'+adaptiveEsc(x)+'</li>';}).join('')+'</ul></div></div></section>';
   var neuralBlockers=(neural.readiness&&neural.readiness.blockers||[]).map(function(x){return '<li>'+adaptiveEsc(x)+'</li>';}).join('')||'<li class="pass">样本门槛已满足，可申请人工确认</li>';
-  var neuralPanel='<section class="adaptive-panel neural-control-panel"><header><div><span>NEURAL SHADOW · HUMAN GATE</span><h3>神经网络候选评分</h3></div><em class="'+(neuralApproved?'tag-ok':'tag-warn')+'">'+adaptiveEsc(({shadow_only:'影子运行',approval_waiting_data:'已申请 · 等待数据',approved_bounded_shadow:'人工确认 · 有界影子',disabled:'已停用'})[neural.status]||'影子运行')+'</em></header><p class="adaptive-copy">当前对五套当前策略做候选排序对照，最多影响排序分 '+fmt(neural.max_rank_adjustment||0,3)+'；不直接下单、不绕过行情双源、板块权限、仓位、T+1或风控卖出。</p><div class="neural-gate-kpis"><div><small>特征样本</small><b>'+Number((neural.readiness||{}).feature_rows||0)+'</b></div><div><small>标签样本</small><b>'+Number((neural.readiness||{}).label_rows||0)+'</b></div><div><small>独立盘面日</small><b>'+Number((neural.readiness||{}).profile_days||0)+' / '+Number((neural.readiness||{}).requirements&&neural.readiness.requirements.min_profile_days||60)+'</b></div><div><small>可用周期</small><b>'+adaptiveEsc(((neural.readiness||{}).available_horizons||[]).join('/')||'—')+'</b></div></div><ul class="adaptive-guardrails neural-blockers">'+neuralBlockers+'</ul>'+(neuralReady&&!neuralApproved?'<button class="ghost" onclick="approveAdaptiveNeural()">人工确认，启用有界影子评分</button>':'')+(neuralApproved?'<div class="adaptive-notice">已确认：仅作为排序副分，硬门禁仍由原策略和风控最终决定。</div>':'<div class="adaptive-notice">未满足样本外门槛前，按钮不会放权；当前结果只记录在自进化证据中。</div>')+'</section>';
+  var neuralPanel='<section class="adaptive-panel neural-control-panel"><header><div><span>NEURAL SHADOW · HUMAN GATE</span><h3>神经网络候选评分</h3></div><em class="'+(neuralApproved?'tag-ok':'tag-warn')+'">'+adaptiveEsc(({shadow_only:'影子运行',approval_waiting_data:'已申请 · 等待数据',approved_bounded_shadow:'人工确认 · 有界影子',disabled:'已停用'})[neural.status]||'影子运行')+'</em></header><p class="adaptive-copy">当前对已启用策略集合做候选排序对照，最多影响排序分 '+fmt(neural.max_rank_adjustment||0,3)+'；不直接下单、不绕过行情双源、板块权限、仓位、T+1或风控卖出。</p><div class="neural-gate-kpis"><div><small>特征样本</small><b>'+Number((neural.readiness||{}).feature_rows||0)+'</b></div><div><small>标签样本</small><b>'+Number((neural.readiness||{}).label_rows||0)+'</b></div><div><small>独立盘面日</small><b>'+Number((neural.readiness||{}).profile_days||0)+' / '+Number((neural.readiness||{}).requirements&&neural.readiness.requirements.min_profile_days||60)+'</b></div><div><small>可用周期</small><b>'+adaptiveEsc(((neural.readiness||{}).available_horizons||[]).join('/')||'—')+'</b></div></div><ul class="adaptive-guardrails neural-blockers">'+neuralBlockers+'</ul>'+(neuralReady&&!neuralApproved?'<button class="ghost" onclick="approveAdaptiveNeural()">人工确认，启用有界影子评分</button>':'')+(neuralApproved?'<div class="adaptive-notice">已确认：仅作为排序副分，硬门禁仍由原策略和风控最终决定。</div>':'<div class="adaptive-notice">未满足样本外门槛前，按钮不会放权；当前结果只记录在自进化证据中。</div>')+'</section>';
   $('adaptiveResult').innerHTML='<div class="adaptive-shell">'
     +closedLoopPanel
     +adaptiveTimelinePanel
@@ -510,11 +516,11 @@ function renderAdaptive(d){
     +'<section class="adaptive-flow" aria-label="自进化流程">'+architecture+'</section>'
     +'<div class="adaptive-grid"><section class="adaptive-panel adaptive-profile-panel"><header><div><span>MARKET TRANSFORMER</span><h3>盘面画像</h3></div><em>'+Number(profile.valid_rows||0)+' 个有效样本</em></header><div class="adaptive-drivers">'+driverRows+'</div></section><section class="adaptive-panel adaptive-sector-panel"><header><div><span>CAPITAL FLOW</span><h3>资金流方向</h3></div><em>只作代理证据</em></header><div class="adaptive-sector-columns"><div><h4>资金共振方向</h4><ul>'+sectorGroup(features.top_sectors,'up')+'</ul></div><div><h4>资金减弱方向</h4><ul>'+sectorGroup(features.weak_sectors,'down')+'</ul></div></div></section></div>'
     +'<section class="adaptive-panel adaptive-selection-evolution"><header><div><span>PAPER SELECTION EVOLUTION</span><h3>模拟盘选股进化</h3></div><em>'+adaptiveEsc(adaptiveText(selectionOpt.mode,'等待样本'))+'</em></header><p class="adaptive-copy">'+adaptiveEsc(adaptiveText(selectionOpt.policy,'等待选股进化证据汇总。'))+'</p><div class="adaptive-tier-track"><span><b>3日</b>快速影子</span><span><b>5日</b>明显微调</span><span><b>10日</b>标准进化</span><span><b>20日</b>成熟进化</span></div><div class="adaptive-selection-layout"><div class="adaptive-selection-candidates">'+selectionCandidateRows+'</div><aside class="adaptive-active-risk"><h4>已生效选股版本</h4><ul>'+activeSelectionRows+'</ul></aside></div></section>'
-    +'<section class="adaptive-panel adaptive-risk-evolution"><header><div><span>PAPER RISK EVOLUTION</span><h3>模拟盘风控进化</h3></div><em>'+adaptiveEsc(adaptiveText(riskOpt.mode,'等待样本'))+'</em></header><p class="adaptive-copy">'+adaptiveEsc(adaptiveText(riskOpt.policy,'等待风控进化证据汇总。'))+'</p>'+downsideNotice+'<div class="adaptive-downside-policy"><header><b>当前五套策略防线基准</b><span>只读展示；参数变更仍受版本、影子观察和人工放权约束</span></header>'+downsidePolicyRows+'</div><div class="adaptive-tier-track"><span><b>3日</b>快速影子</span><span><b>5日</b>明显微调</span><span><b>10日</b>标准进化</span><span><b>20日</b>完整受限区间</span></div><div class="adaptive-risk-layout"><div class="adaptive-risk-candidates">'+riskCandidateRows+'</div><aside class="adaptive-risk-side"><div class="adaptive-advisor-card"><span>AI EVIDENCE REVIEWER</span><h4>DeepSeek 数据审阅</h4><b class="'+(advisorReady?'on':'off')+'">'+adaptiveEsc(advisorState)+'</b><p>'+adaptiveEsc(adaptiveText(deepseek.truth_boundary,'证据解释器，不是真实性证明。'))+'</p></div><div class="adaptive-active-risk"><h4>已生效风控版本</h4><ul>'+activeRiskRows+'</ul></div></aside></div></section>'
+    +'<section class="adaptive-panel adaptive-risk-evolution"><header><div><span>PAPER RISK EVOLUTION</span><h3>模拟盘风控进化</h3></div><em>'+adaptiveEsc(adaptiveText(riskOpt.mode,'等待样本'))+'</em></header><p class="adaptive-copy">'+adaptiveEsc(adaptiveText(riskOpt.policy,'等待风控进化证据汇总。'))+'</p>'+downsideNotice+'<div class="adaptive-downside-policy"><header><b>当前已启用策略防线基准</b><span>只读展示；参数变更仍受版本、影子观察和人工放权约束</span></header>'+downsidePolicyRows+'</div><div class="adaptive-tier-track"><span><b>3日</b>快速影子</span><span><b>5日</b>明显微调</span><span><b>10日</b>标准进化</span><span><b>20日</b>完整受限区间</span></div><div class="adaptive-risk-layout"><div class="adaptive-risk-candidates">'+riskCandidateRows+'</div><aside class="adaptive-risk-side"><div class="adaptive-advisor-card"><span>AI EVIDENCE REVIEWER</span><h4>DeepSeek 数据审阅</h4><b class="'+(advisorReady?'on':'off')+'">'+adaptiveEsc(advisorState)+'</b><p>'+adaptiveEsc(adaptiveText(deepseek.truth_boundary,'证据解释器，不是真实性证明。'))+'</p></div><div class="adaptive-active-risk"><h4>已生效风控版本</h4><ul>'+activeRiskRows+'</ul></div></aside></div></section>'
     +'<section class="adaptive-panel news-learning-panel"><header><div><span>EVENT → OUTCOME → CALIBRATION</span><h3>统一情报与事件学习</h3></div><div class="adaptive-advisor-actions"><em>'+(newsLearning.mode==='paper_micro_eligible'?'有界微调资格':'影子学习')+'</em><button id="newsLearningRunButton" class="ghost" onclick="runNewsLearning()">运行新闻学习</button></div></header><p class="adaptive-copy">风控中心与自进化共用同一份新闻/公告事件账本；风控负责实时门禁，自进化负责1/3/5日兑现校准。</p>'+dynamicRiskNotice+'<div class="news-learning-flow"><span><b>01</b>采集去重</span><i></i><span><b>02</b>事件分型</span><i></i><span><b>03</b>1/3/5日兑现</span><i></i><span><b>04</b>来源校准</span><i></i><span><b>05</b>模拟盘微调</span></div><div class="news-kpis"><div><small>事件账本</small><b>'+Number(newsTotals.events||0)+'</b></div><div><small>可追溯链接</small><b>'+adaptiveValue(newsTotals.linked_pct,'%',1)+'</b></div><div><small>成熟结果</small><b>'+Number(newsTotals.mature_outcomes||0)+'</b></div><div><small>5日成熟事件</small><b>'+Number(newsTotals.mature_5d_events||0)+'</b></div></div><div class="news-learning-layout"><div><h4>最近进入账本</h4><ul class="news-event-list">'+newsEvents+'</ul></div><aside><h4>来源信誉（不使用涨跌评分）</h4><div class="news-source-list">'+newsSources+'</div><h4>微调门禁</h4><div class="news-gates">'+newsGateRows+'</div></aside></div><div class="adaptive-notice">'+adaptiveEsc(newsLearning.authority||'当前仅影子记录。')+'</div></section>'
-    +'<section class="adaptive-panel adaptive-advisor-evidence"><header><div><span>DEEPSEEK · DATA QUALITY + TUNING</span><h3>模拟盘数据校验与有界调参</h3></div><div class="adaptive-advisor-actions"><em>'+adaptiveEsc(deepseek.model||'deepseek-v4-flash')+'</em><button id="advisorRunButton" class="ghost" onclick="runAdaptiveAdvisor()" '+(advisorReady?'':'disabled')+'>运行数据质量审阅</button><button id="adaptiveAiTuneInlineButton" class="ghost" onclick="runAdaptiveAiTuning()" '+(advisorReady&&aiTuning.enabled?'':'disabled')+'>运行AI有界调参</button></div></header><div class="adaptive-advisor-summary"><div><small>数据审阅</small><b>'+adaptiveEsc(advisorState)+'</b></div><div><small>AI调参状态</small><b>'+adaptiveEsc(aiTuningState)+'</b></div><div><small>确定性异常</small><b>'+Number(deterministicCount)+'</b></div><div><small>审阅置信度</small><b>'+adaptiveValue(advisorReport.confidence,'%',0)+'</b></div><div><small>跨源真实性</small><b class="'+(advisorReport.cross_source_status==='verified'?'up':'down')+'">'+crossSourceLabel+'</b></div><div><small>双源覆盖 / 一致</small><b>'+adaptiveValue(crossSource.coverage_pct,'%',1)+' / '+adaptiveValue(crossSource.agreement_pct,'%',1)+'</b></div></div><div class="adaptive-advisor-report"><div><h4>审阅摘要</h4><p>'+adaptiveEsc(advisorReport.summary||deepseek.truth_boundary||'DeepSeek只复核确定性证据；行情真实性仍需独立数据源交叉验证。')+'</p><small>市场状态：'+(advisorMarket.session_status==='closed'?'已收盘':'交易中')+' · 收盘口径 '+adaptiveEsc(String(advisorMarket.close_cutoff_at||'—').replace('T',' '))+' · 源行情最后到达 '+adaptiveEsc(String(advisorMarket.latest_source_at||'—').replace('T',' '))+' · 最近审阅 '+adaptiveEsc(String(advisorLatest.finished_at||'—').replace('T',' '))+'</small></div><ul>'+advisorFindings+'</ul></div><div class="adaptive-notice">AI只可在五套模拟账户内提出白名单权重、入场阈值和选股条件的小步补丁；系统先做行情质量、跨源、幅度、冷却和回滚校验，再允许盘中同日生效。AI不能下单、修改公共选股或放宽风控；超出边界的建议只留在影子候选中。</div></section>'
+    +'<section class="adaptive-panel adaptive-advisor-evidence"><header><div><span>DEEPSEEK · DATA QUALITY + TUNING</span><h3>模拟盘数据校验与有界调参</h3></div><div class="adaptive-advisor-actions"><em>'+adaptiveEsc(deepseek.model||'deepseek-v4-flash')+'</em><button id="advisorRunButton" class="ghost" onclick="runAdaptiveAdvisor()" '+(advisorReady?'':'disabled')+'>运行数据质量审阅</button><button id="adaptiveAiTuneInlineButton" class="ghost" onclick="runAdaptiveAiTuning()" '+(advisorReady&&aiTuning.enabled?'':'disabled')+'>运行AI有界调参</button></div></header><div class="adaptive-advisor-summary"><div><small>数据审阅</small><b>'+adaptiveEsc(advisorState)+'</b></div><div><small>AI调参状态</small><b>'+adaptiveEsc(aiTuningState)+'</b></div><div><small>确定性异常</small><b>'+Number(deterministicCount)+'</b></div><div><small>审阅置信度</small><b>'+adaptiveValue(advisorReport.confidence,'%',0)+'</b></div><div><small>跨源真实性</small><b class="'+(advisorReport.cross_source_status==='verified'?'up':'down')+'">'+crossSourceLabel+'</b></div><div><small>双源覆盖 / 一致</small><b>'+adaptiveValue(crossSource.coverage_pct,'%',1)+' / '+adaptiveValue(crossSource.agreement_pct,'%',1)+'</b></div></div><div class="adaptive-advisor-report"><div><h4>审阅摘要</h4><p>'+adaptiveEsc(advisorReport.summary||deepseek.truth_boundary||'DeepSeek只复核确定性证据；行情真实性仍需独立数据源交叉验证。')+'</p><small>市场状态：'+(advisorMarket.session_status==='closed'?'已收盘':'交易中')+' · 收盘口径 '+adaptiveEsc(String(advisorMarket.close_cutoff_at||'—').replace('T',' '))+' · 源行情最后到达 '+adaptiveEsc(String(advisorMarket.latest_source_at||'—').replace('T',' '))+' · 最近审阅 '+adaptiveEsc(String(advisorLatest.finished_at||'—').replace('T',' '))+'</small></div><ul>'+advisorFindings+'</ul></div><div class="adaptive-notice">AI只可在已启用的模拟策略内提出白名单权重、入场阈值和选股条件的小步补丁；系统先做行情质量、跨源、幅度、冷却和回滚校验，再允许盘中同日生效。AI不能下单、修改公共选股或放宽风控；超出边界的建议只留在影子候选中。</div></section>'
     +'<section class="adaptive-panel adaptive-research-suite"><header><div><span>DEEPSEEK · PAPER RESEARCH SUITE</span><h3>模拟盘智能研究任务</h3></div><button id="advisorSuiteButton" class="ghost" onclick="runAdaptiveResearchSuite()" '+(advisorReady?'':'disabled')+'>运行全部研究任务</button></header><p class="adaptive-copy">收盘后自动运行；每项独立留痕。结论只能进入研究和人工复核，不能直接改选股、风控或订单。</p><div class="adaptive-research-grid">'+researchCards+'</div></section>'
-    +'<section class="adaptive-panel"><header><div><span>CONTEXTUAL BANDIT</span><h3>五策略影子分配</h3></div><em>总和 100% · 不改变账户资金</em></header><div class="adaptive-strategy-grid">'+strategyCards+'</div>'+allocationActionPanel(d)+'<div class="adaptive-notice">'+adaptiveEsc(d.data_note||'')+'</div></section>'
+    +'<section class="adaptive-panel"><header><div><span>CONTEXTUAL BANDIT</span><h3>策略集合影子分配</h3></div><em>总和 100% · 不改变账户资金</em></header><div class="adaptive-strategy-grid">'+strategyCards+'</div>'+allocationActionPanel(d)+'<div class="adaptive-notice">'+adaptiveEsc(d.data_note||'')+'</div></section>'
     +'<section class="adaptive-panel"><header><div><span>EVOLUTION A/B · VERSION ATTRIBUTION</span><h3>进化版本对照归因</h3></div><em>部署后 5 净值日 vs 部署前等长基线</em></header>'+abValidationPanel(d)+'</section>'
     +'<div class="adaptive-grid"><section class="adaptive-panel"><header><div><span>GENETIC ALGORITHM</span><h3>GA Alpha 实验室</h3></div><em>非神经网络</em></header><p class="adaptive-copy">'+alpha.architecture+'</p><div class="adaptive-progress-copy"><span>画像日 '+Number(alpha.profile_days||0)+' / '+Number(alpha.required_profile_days||10)+'</span><span>成熟标签 '+Number(alpha.mature_rows||0)+' / '+Number(alpha.required_mature_rows||5000)+'</span></div>'+adaptiveBar(alphaProgress,'ga')+'<ul class="adaptive-alpha-list">'+candidateRows+'</ul></section><section class="adaptive-panel"><header><div><span>MULTI-HORIZON REWARD</span><h3>策略周期兑现</h3></div><em>1日 20% · 3日 35% · 5日 45%</em></header><div class="table-scroll"><table class="adaptive-horizon-table"><thead><tr><th>策略</th><th>1日超额</th><th>3日超额</th><th>5日超额</th></tr></thead><tbody>'+horizonRows+'</tbody></table></div></section></div>'
     +'<div class="adaptive-grid"><section class="adaptive-panel"><header><div><span>RISK GATE</span><h3>放权门槛</h3></div><em>默认全部锁定</em></header><ul class="adaptive-guardrails">'+guardrails+'</ul></section><section class="adaptive-panel"><header><div><span>AUDIT LOG</span><h3>真实学习日志</h3></div><em>不展示虚构迭代数</em></header><ul class="adaptive-run-log">'+runRows+'</ul></section></div>'
@@ -1031,7 +1037,7 @@ function chooseStrategy(strategyId){
   loadLatestSelection();
 }
 
-/* ---------- 策略选股：模拟盘五套策略的盘后自动选股（分组展示） ---------- */
+/* ---------- 策略选股：模拟盘已启用策略的盘后自动选股（分组展示） ---------- */
 var paperStrategyFilter='';
 var paperSelectionCache=null;
 var paperSelectionCacheAt=0;
@@ -1124,7 +1130,7 @@ function renderPaperSelection(d){
 async function runPaperSelection(){
   var btn=$('btnSelect'); if(btn) btn.disabled=true;
   var target=$('selectResult');
-  if(target) target.innerHTML='<div class="loading">正在按五套策略评分重跑选股（约 30-90 秒）…</div>';
+  if(target) target.innerHTML='<div class="loading">正在按已启用策略评分重跑选股（约 30-90 秒）…</div>';
   try{
     var d=await apiPost('/api/paper-selection/run?topn='+encodeURIComponent(($('selTopn')||{}).value||5)+'&confirmed=true');
     paperSelectionCache=await api('/api/paper-selection');
@@ -1426,7 +1432,7 @@ async function compareStrategies(){
       +tableScroll('<table><tr><th>#</th><th>三日策略 股票</th><th>涨跌</th><th>超大单</th><th>买入</th>'
       +'<th>五日策略 股票</th><th>涨跌</th><th>超大单</th><th>买入</th>'
       +'<th>十日策略 股票</th><th>涨跌</th><th>超大单</th><th>买入</th></tr>'+rows+'</table>',1180)
-      +'<div class="disclaimer">三种研究策略分别独立计算，同一只股票可能在多个策略中同时出现。仅供研究参考，不会改变五套模拟账户。</div>';
+      +'<div class="disclaimer">三种研究策略分别独立计算，同一只股票可能在多个策略中同时出现。仅供研究参考，不会改变已启用的模拟策略。</div>';
   }catch(e){ $('selectResult').innerHTML = '<div class="banner">对比失败：'+adaptiveEsc(e&&e.message||e)+'</div>'; }
 }
 
@@ -1596,7 +1602,7 @@ function renderSettings(data){
       +'</div><div class="settings-actions"><button onclick="saveSettingsSection(\'risk\')">保存风控设置</button><button class="ghost" onclick="resetSettingsSection(\'risk\')">恢复默认</button></div><div class="settings-note">动态最小建仓金额会随周期金额、敞口上限、席位上限和利用率实时变化；不是固定的 10,000 元门槛。</div></section>'+settingsPreviewHtml(data,section)+'</div>';
   }else if(section==='strategy'){
     var overrides=strat.strategy_overrides||{};
-    html='<div class="settings-grid"><section class="settings-panel"><h3>策略参数</h3><p>五套策略保留独立模型和审计身份。风格、席位和权重参数在下个新周期初始化，当前持仓不会被强行改写。</p><div class="strategy-settings-grid">'+Object.keys(SETTINGS_STRATEGY_NAMES).map(function(id){
+    html='<div class="settings-grid"><section class="settings-panel"><h3>策略参数</h3><p>已启用策略保留独立模型和审计身份。风格、席位和权重参数在下个新周期初始化，当前持仓不会被强行改写。</p><div class="strategy-settings-grid">'+Object.keys(SETTINGS_STRATEGY_NAMES).map(function(id){
       var item=overrides[id]||{};
       return '<article class="strategy-setting-card" data-strategy-id="'+id+'"><header><div><b>'+adaptiveEsc(SETTINGS_STRATEGY_NAMES[id])+'</b><small>'+adaptiveEsc(id)+'</small></div><span class="tag tag-info">下一周期</span></header>'
         +'<div class="setting-control"><label>风格</label><select class="strategy-style"><option value="strong"'+(item.style==='strong'?' selected':'')+'>强势接力</option><option value="pullback"'+(item.style==='pullback'?' selected':'')+'>趋势回踩</option><option value="sector"'+(item.style==='sector'?' selected':'')+'>板块轮动</option><option value="quality"'+(item.style==='quality'?' selected':'')+'>质量突破</option><option value="main_force"'+(item.style==='main_force'?' selected':'')+'>主力跟随</option></select></div>'
@@ -1621,7 +1627,7 @@ function renderSettings(data){
       +'<div class="setting-row"><div class="setting-label"><b>AI运行开关</b><small>只影响审阅/候选生成，不直接下单。</small></div><div class="setting-control"><label><input id="settingAiAdvisor" type="checkbox"'+settingsChecked(ais.llm_advisor_enabled)+'><span>启用 AI 审阅</span></label><label><input id="settingAiRealtime" type="checkbox"'+settingsChecked(ais.llm_realtime_tuning_enabled)+'><span>启用有界调参</span></label><label><input type="checkbox" checked disabled><span>人工确认候选（强制）</span></label></div></div>'
       +'<div class="setting-row"><div class="setting-label"><b>调参模式</b><small>shadow 最稳，intraday 更及时，close 只在收盘运行。</small></div><div class="setting-control"><select id="settingAiMode"><option value="shadow"'+(ais.llm_realtime_mode==='shadow'?' selected':'')+'>shadow · 只观察</option><option value="intraday"'+(ais.llm_realtime_mode==='intraday'?' selected':'')+'>intraday · 盘中候选</option><option value="close"'+(ais.llm_realtime_mode==='close'?' selected':'')+'>close · 收盘候选</option></select></div></div>'
       +'</div><div class="settings-actions"><button onclick="saveSettingsSection(\'evolution\')">保存 AI 与调度</button><button class="ghost" onclick="resetSettingsSection(\'evolution\')">恢复默认</button></div>'
-      +'<div class="settings-note"><strong>自动应用：</strong>后端固定关闭，任何 AI 候选都要经过数据质量、跨源和人工确认门禁。自进化周期只控制后台学习频率，不会改变五套策略的交易硬规则。</div>'
+      +'<div class="settings-note"><strong>自动应用：</strong>后端固定关闭，任何 AI 候选都要经过数据质量、跨源和人工确认门禁。自进化周期只控制后台学习频率，不会改变已启用策略的交易硬规则。</div>'
       +'<div class="settings-panel" style="margin-top:14px;padding:14px"><h4>接口凭据（仅显示掩码状态）</h4><div class="setting-control"><label for="settingKeyProvider">供应商</label><select id="settingKeyProvider" onchange="refreshSettingsKeyForm()"><option value="deepseek"'+(activeProvider==='deepseek'?' selected':'')+'>DeepSeek</option><option value="mimo"'+(activeProvider==='mimo'?' selected':'')+'>MiMo</option></select><span id="settingsKeyStatus" class="setting-value-preview">'+(activeKey.configured?'已配置 '+adaptiveEsc(activeKey.key_preview||''):'未配置')+'</span></div><div class="setting-control"><label for="settingApiKey">API Key</label><input id="settingApiKey" type="password" autocomplete="new-password" placeholder="留空表示保持现有 Key"></div><div class="setting-control"><label for="settingBaseUrl">Base URL</label><input id="settingBaseUrl" type="url" value="'+adaptiveEsc(activeKey.base_url||'')+'"></div><div class="setting-control"><label for="settingAiModel">模型</label><input id="settingAiModel" type="text" value="'+adaptiveEsc(activeKey.model||'')+'"></div><div class="settings-actions"><button class="ghost" onclick="saveSettingsKey()">保存接口配置</button></div></div></section>'+settingsPreviewHtml(data,section)+'</div>';
   }
   target.innerHTML=html;
@@ -1705,12 +1711,12 @@ function paperAuditBlock(title, count, body){
 }
 function syncPaperCapitalHint(){
   var capital=Number($('paperCapital').value)||0;
-  $('paperCapitalHint').textContent='五套策略共享总资金池；输入总金额 ¥'+capital.toLocaleString('zh-CN')+'，五套策略只共享资金，不共享决策和风控规则。';
+  $('paperCapitalHint').textContent='已启用策略共享总资金池；输入总金额 ¥'+capital.toLocaleString('zh-CN')+'，已启用策略只共享资金，不共享决策和风控规则。';
 }
 async function startPaper(){
   var capital = Number($('paperCapital').value);
   if(!capital || capital<1000){ alert('请先设置总模拟资金，至少 1,000 元。'); return; }
-  if(!confirm('将以总资金池 '+capital.toLocaleString('zh-CN')+' 元归档旧周期并同时启动五套策略。五套策略独立决策，共享现金和总仓位风控；不会连接券商或发送真实订单，是否继续？')) return;
+  if(!confirm('将以总资金池 '+capital.toLocaleString('zh-CN')+' 元归档旧周期并同时启动已启用策略。各策略独立决策，共享现金和总仓位风控；不会连接券商或发送真实订单，是否继续？')) return;
   $('paperStart').disabled = true;
   try{
     var d = await apiPost('/api/paper/start?capital='+encodeURIComponent(capital));
@@ -1978,7 +1984,355 @@ function renderPaperStrategyCenter(d){
         +'<div class="paper-strategy-section"><label>风险边界</label><div class="paper-strategy-metrics"><div>持仓周期<b>'+riskText(s.hold_range)+'</b></div><div>单股 / 总池预算<b>'+fmt(s.max_weight_pct,1)+'% / '+fmt(s.pool_budget_pct,2)+'%</b></div><div>保底 / 风险画像<b>'+fmt(s.pool_floor_pct,2)+'% / '+fmt(s.max_exposure_pct,0)+'%</b></div><div>单日亏损 / 回撤<b>'+fmt(s.daily_loss_pct,1)+'% / '+fmt(s.drawdown_pct,1)+'%</b></div><div>行业 / 冷却<b>'+fmt(s.industry_limit_pct,0)+'% / '+riskText(s.cooldown_days)+'天</b></div></div></div></article>';
     }).join('');
     var guards=(d.shared_guards||[]).map(function(item){return '<li>'+riskText(item)+'</li>';}).join('');
-    target.innerHTML='<section class="paper-strategy-intro"><div><h3>模拟盘策略中心</h3><p>这里展示的是当前服务器实际生效的策略定义。策略规则与模拟账户共用同一配置来源；本页只读，查看不会触发下单或改动资金。</p></div></section><section class="paper-strategy-grid">'+cards+'</section><section class="paper-strategy-guards"><b>共同执行边界</b><ul>'+guards+'</ul></section>';
+    target.innerHTML='<section class="paper-strategy-intro"><div><h3>模拟盘策略中心</h3><p>这里展示的是当前服务器实际生效的策略定义与策略集合管理。策略规则与模拟账户共用同一配置来源；查看不会触发下单或改动资金，创建/编辑受版本链与非对称风险门约束，暂停/归档不会改写历史交易记录。</p>'
+      +'<div class="strategy-builder-toolbar"><button onclick="openStrategyBuilder()">创建策略</button><span class="strategy-builder-hint">用户策略上线即试点（小额资金验证），验证通过后可晋升标准档。</span></div></div></section>'
+      +'<section class="paper-strategy-grid">'+cards+'</section>'
+      +'<section class="paper-strategy-guards"><b>共同执行边界</b><ul>'+guards+'</ul></section>'
+      +'<section class="panel strategy-registry-panel"><h3>策略集合管理</h3><p class="exec-hint">全部注册策略（含草稿、已暂停、已归档）。删除是归档语义：历史订单、成交与审计血缘永久保留，只是不再产生新信号；只有从未被引用的草稿才允许硬删除。</p><div id="strategyRegistryList"><div class="loading">正在读取策略注册表…</div></div></section>'
+      +'<div id="strategyBuilderMount"></div>';
+  loadStrategyRegistry();
+}
+
+/* ---------- PR-34：策略集合管理 + 策略构建器 ---------- */
+var STRATEGY_FIELD_OPTIONS=[
+  ['close','收盘价'],['open','开盘价'],['high','最高价'],['low','最低价'],
+  ['volume','成交量'],['amount','成交额'],
+  ['pe','市盈率'],['pb','市净率'],['roe','ROE'],['revenue_yoy','营收同比'],
+  ['profit_yoy','利润同比'],['gross_margin','毛利率'],['debt_ratio','负债率'],
+  ['main_net_inflow','主力净流入'],['main_net_inflow_pct','主力净流入%'],
+  ['northbound_net_inflow','北向净流入'],['turnover_rate','换手率']];
+var STRATEGY_INDICATOR_OPTIONS=[
+  ['ma:20','MA20 均线'],['ma:60','MA60 均线'],['ema:12','EMA12'],
+  ['rsi:14','RSI14'],['volume_mean:20','20日均量'],['atr:14','ATR14']];
+var STRATEGY_COMPARE_OPTIONS=[['gt','大于'],['gte','大于等于'],['lt','小于'],['lte','小于等于']];
+var STRATEGY_STATUS_LABELS={draft:'草稿',validated:'已验证',active:'运行中',paused:'已暂停',retiring:'退役中',archived:'已归档'};
+
+async function loadStrategyRegistry(forceRefresh){
+  if(!forceRefresh&&window._strategyRegistryCache){
+    renderStrategyRegistry(window._strategyRegistryCache);
+    return;
+  }
+  try{
+    var d=await api('/api/strategies?include_archived=true');
+    window._strategyRegistryCache=d;
+    renderStrategyRegistry(d);
+  }catch(e){
+    var mount=$('strategyRegistryList');
+    if(mount) mount.innerHTML='<div class="paper-empty">策略注册表读取失败：'+riskText(e.message||e)+'</div>';
+  }
+}
+function renderStrategyRegistry(d){
+  var mount=$('strategyRegistryList'); if(!mount) return;
+  var rows=(d.strategies||[]).map(function(s){
+    var status=STRATEGY_STATUS_LABELS[s.status]||s.status||'—';
+    var actions=[];
+    if(s.status==='draft'){ actions.push(['validate','验证']); actions.push(['edit','编辑']); actions.push(['clone','复制']); actions.push(['delete','删除']); }
+    if(s.status==='validated'){ actions.push(['activate','激活上线']); actions.push(['edit','编辑']); actions.push(['clone','复制']); }
+    if(s.status==='active'){ actions.push(['pause','暂停']); actions.push(['edit','编辑']); actions.push(['clone','复制']); actions.push(['archive','归档']); }
+    if(s.status==='paused'){ actions.push(['activate','恢复运行']); actions.push(['archive','归档']); }
+    var actionHtml=actions.length?actions.map(function(pair){
+      return '<button'+(pair[0]==='delete'?' class="exec-reject"':'')+' onclick="strategyLifecycleAction(\''+riskText(s.id)+'\',\''+pair[0]+'\','+Number(s.current_version||s.version||1)+')">'+pair[1]+'</button>';
+    }).join(''):'<span class="strategy-muted">已归档：保留全部历史，仅停止新信号</span>';
+    return '<tr'+(s.status==='archived'?' class="exec-inactive"':'')+'><td><b>'+riskText(s.name)+'</b></td><td>'+riskText(s.id)+'</td>'
+      +'<td>'+(s.origin==='builtin'?'内置':'用户')+'</td><td>v'+Number(s.current_version||s.version||1)+'</td>'
+      +'<td><span class="tag '+(s.status==='active'?'tag-ok':(s.status==='archived'?'':'tag-info'))+'">'+riskText(status)+'</span></td>'
+      +'<td class="exec-queue-reason">'+riskText(s.description||'—')+'</td>'
+      +'<td><div class="exec-queue-actions">'+actionHtml+'</div></td></tr>';
+  }).join('');
+  mount.innerHTML=(rows?'<div class="table-scroll"><table class="exec-queue-table"><thead><tr><th>名称</th><th>ID</th><th>来源</th><th>版本</th><th>状态</th><th>说明</th><th>操作</th></tr></thead><tbody>'+rows+'</tbody></table></div>':'<div class="paper-empty">注册表为空。</div>')
+    +'<button class="ghost" style="margin-top:8px" onclick="loadStrategyRegistry(true)">刷新注册表</button>';
+}
+async function strategyLifecycleAction(id,action,expectedVersion){
+  var routes={validate:'validate',activate:'activate',pause:'pause',archive:'archive'};
+  try{
+    if(action==='delete'){
+      if(!confirm('确认硬删除草稿 '+id+'？只有从未产生引用的草稿才允许删除。')) return;
+      await apiJson('/api/strategies/'+encodeURIComponent(id),'DELETE');
+    }else if(action==='edit'){ openStrategyBuilder('edit',id); return; }
+    else if(action==='clone'){
+      var newId=(id+'_copy').slice(0,48);
+      var name=prompt('新策略 ID（留空自动生成）：',newId);
+      if(name===null) return;
+      await apiPostJson('/api/strategies/'+encodeURIComponent(id)+'/clone',{id:name||undefined,actor:'human-ui'});
+    }else{
+      var verb={validate:'验证',activate:'激活上线',pause:'暂停',archive:'归档'}[action];
+      if(!confirm('确认'+verb+'策略 '+id+'？归档/暂停都会保留完整历史。')) return;
+      await apiPostJson('/api/strategies/'+encodeURIComponent(id)+'/'+routes[action],{actor:'human-ui'});
+    }
+    window._strategyRegistryCache=null;
+    window._paperStrategyCenterCache=null;
+    await loadStrategyRegistry(true);
+  }catch(e){ alert('操作失败：'+(e.message||e)); }
+}
+
+function strategyBuilderDefaultState(){
+  return {mode:'create',strategyId:null,expectedVersion:null,ruleDirty:false,dslSource:null,advancedRule:false,
+    rule:{kind:'group',op:'and',args:[{kind:'cond',field:'close',indicator:'',compare:'gt',value:''}]},
+    previewTimer:null};
+}
+/* 把既有 DSL 规则还原成条件编辑器模型；不能完整表达的构件返回 null（保持原样） */
+function sbDslToGroup(dsl){
+  if(!dsl||typeof dsl!=='object') return null;
+  var op=dsl.op;
+  if(op==='and'||op==='or'){
+    var args=(dsl.args||[]).map(sbDslToGroup);
+    if(args.some(function(a){return a===null;})) return null;
+    return {kind:'group',op:op,args:args};
+  }
+  if(op==='not'||op==='not_group'){ return null; }
+  if(['gt','gte','lt','lte'].indexOf(op)<0) return null;
+  var left=dsl.left||{}, right=dsl.right||{};
+  if(right.op!=='const'||typeof right.value!=='number') return null;
+  if(left.op==='field'){
+    var known=STRATEGY_FIELD_OPTIONS.some(function(o){return o[0]===left.name;});
+    return {kind:'cond',field:known?left.name:'close',indicator:'',compare:op,value:String(right.value)};
+  }
+  if(left.op==='indicator'){
+    var win=typeof left.window==='number'?left.window:null;
+    if(win===null) return null;
+    var key=left.name+':'+win;
+    var knownInd=STRATEGY_INDICATOR_OPTIONS.some(function(o){return o[0]===key;});
+    if(!knownInd) return null;
+    return {kind:'cond',field:'close',indicator:key,compare:op,value:String(right.value)};
+  }
+  return null;
+}
+async function sbLoadDefinition(strategyId){
+  try{
+    var versions=await api('/api/strategy-definitions/'+encodeURIComponent(strategyId)+'/versions');
+    var list=(versions&&(versions.versions||versions))||[];
+    if(!list.length) return;
+    var latest=list[list.length-1];
+    var definition=(latest&&latest.definition)||{};
+    var state=window._strategyBuilder; if(!state) return;
+    state.expectedVersion=latest.version||null;
+    state.dslSource=definition.dsl_ast||null;
+    var nameInput=$('sbName'); if(nameInput&&definition.name) nameInput.value=definition.name;
+    var meta=definition.metadata||{};
+    var styleSelect=$('sbStyle');
+    if(styleSelect&&meta.style){
+      for(var i=0;i<styleSelect.options.length;i++){
+        if(styleSelect.options[i].value===meta.style){ styleSelect.selectedIndex=i; break; }
+      }
+    }
+    if(meta.max_positions&&$('sbMaxPositions')) $('sbMaxPositions').value=meta.max_positions;
+    if(meta.max_weight_pct&&$('sbMaxWeight')) $('sbMaxWeight').value=meta.max_weight_pct;
+    if(meta.max_exposure_pct&&$('sbMaxExposure')) $('sbMaxExposure').value=meta.max_exposure_pct;
+    if(definition.dsl_ast){
+      var tree=sbDslToGroup(definition.dsl_ast&&definition.dsl_ast.rule);
+      if(tree&&tree.kind==='group'){
+        state.rule=tree;
+        if(!(state.rule.args&&state.rule.args.length)) state.rule.args=[{kind:'cond',field:'close',indicator:'',compare:'gt',value:''}];
+        state.ruleDirty=false;
+      }else{
+        state.advancedRule=true;
+        var notice=document.createElement('div');
+        notice.className='adaptive-notice';
+        notice.textContent='该策略包含条件编辑器暂不支持的高级构件；下方条件编辑器为空白草稿，不保存条件修改时保留原规则。';
+        var editor=document.querySelector('.strategy-condition-editor');
+        if(editor) editor.insertBefore(notice,editor.firstChild.nextSibling);
+      }
+      renderConditionTree();
+      scheduleStrategyPreview();
+    }
+  }catch(e){ /* 预填失败不阻塞编辑 */ }
+}
+function openStrategyBuilder(mode,strategyId){
+  mode=mode||'create';
+  var mount=$('strategyBuilderMount'); if(!mount) return;
+  var state=strategyBuilderDefaultState();
+  state.mode=mode; state.strategyId=strategyId||null;
+  window._strategyBuilder=state;
+  mount.innerHTML='<section class="panel strategy-builder-panel"><div class="exec-head"><div><h3>'+(mode==='edit'?'编辑策略 '+(strategyId||''):'创建新策略')+'</h3>'
+    +'<p class="exec-hint">条件支持嵌套 AND/OR 分组；保存后生成不可变版本。高级用户可在下方查看编译后的 DSL JSON，但危险代码不能通过页面提交——只允许声明式参数。</p></div>'
+    +'<div class="exec-head-state"><button class="ghost" onclick="closeStrategyBuilder()">关闭</button></div></div>'
+    +'<div class="strategy-builder-form">'
+    +'<label>策略 ID（创建后不可改）<input id="sbId" placeholder="my_strategy" '+(mode==='edit'?'disabled':'')+'></label>'
+    +'<label>名称<input id="sbName" placeholder="我的策略"></label>'
+    +'<label>风格<select id="sbStyle"><option value="">自动识别</option><option value="突破 breakout">突破 / 日内</option><option value="trend pullback 趋势 回踩">趋势 / 回踩</option><option value="sector rotation 板块 轮动">板块 / 轮动</option><option value="earnings report event 财报">事件 / 财报</option><option value="flow momentum 资金 主力">资金 / 主力</option></select></label>'
+    +'<label>最大席位<input id="sbMaxPositions" type="number" min="1" max="6" value="3"></label>'
+    +'<label>单票权重%<input id="sbMaxWeight" type="number" min="8" max="36" value="30"></label>'
+    +'<label>总敞口%<input id="sbMaxExposure" type="number" min="35" max="96" value="82"></label>'
+    +'</div>'
+    +'<div class="strategy-condition-editor"><b>条件编辑器</b><div id="sbConditionTree"></div>'
+    +'<div class="strategy-condition-actions"><button onclick="sbAddCondition()">加条件</button><button onclick="sbAddGroup()">加 AND/OR 分组</button></div></div>'
+    +'<div class="strategy-dsl-view"><b>编译 DSL（只读 · 不可提交任意代码）</b><pre id="sbDslJson"></pre></div>'
+    +'<div class="strategy-preview-box"><b>实时编译预览 <span class="strategy-muted">（调用与生产一致的 StrategyRuntime 编译器）</span></b><div id="sbPreview"><div class="strategy-muted">输入条件后自动编译…</div></div></div>'
+    +'<div class="strategy-builder-actions"><button onclick="submitStrategyBuilder()">'+(mode==='edit'?'保存新版本':'创建策略')+'</button></div>'
+    +'</section>';
+  renderConditionTree();
+  scheduleStrategyPreview();
+  if(mode==='edit'&&strategyId) sbLoadDefinition(strategyId);
+}
+function closeStrategyBuilder(){
+  var mount=$('strategyBuilderMount'); if(mount) mount.innerHTML='';
+  window._strategyBuilder=null;
+}
+function sbLeftNode(cond){
+  if(cond.indicator){
+    var parts=cond.indicator.split(':');
+    return {op:'indicator',name:parts[0],window:Number(parts[1])};
+  }
+  return {op:'field',name:cond.field};
+}
+function sbGroupToDsl(node){
+  if(node.kind==='cond'){
+    return {op:(STRATEGY_COMPARE_OPTIONS.some(function(o){return o[0]===node.compare;})?node.compare:'gt'),
+      left:sbLeftNode(node),right:{op:'const',value:Number(node.value||0)}};
+  }
+  var args=(node.args||[]).map(sbGroupToDsl);
+  if(!args.length) return {op:'gt',left:{op:'field',name:'close'},right:{op:'const',value:0}};
+  if(args.length===1) return args[0];
+  return {op:node.op==='or'?'or':'and',args:args};
+}
+function strategyBuilderDslAst(){
+  var state=window._strategyBuilder; if(!state) return null;
+  return {op:'strategy',rule:sbGroupToDsl(state.rule),parameters:[]};
+}
+function renderConditionTree(){
+  var state=window._strategyBuilder; if(!state) return;
+  var container=$('sbConditionTree'); if(!container) return;
+  container.innerHTML=sbRenderNode(state.rule,'');
+  var dslView=$('sbDslJson');
+  if(dslView) dslView.textContent=JSON.stringify(strategyBuilderDslAst(),null,2);
+}
+function sbRenderNode(node,path){
+  if(node.kind==='cond'){
+    var fieldOptions=STRATEGY_FIELD_OPTIONS.map(function(o){return '<option value="'+o[0]+'"'+(node.field===o[0]?' selected':'')+'>'+o[1]+'</option>';}).join('');
+    var indicatorOptions='<option value="">（直接字段）</option>'+STRATEGY_INDICATOR_OPTIONS.map(function(o){return '<option value="'+o[0]+'"'+(node.indicator===o[0]?' selected':'')+'>'+o[1]+'</option>';}).join('');
+    var compareOptions=STRATEGY_COMPARE_OPTIONS.map(function(o){return '<option value="'+o[0]+'"'+(node.compare===o[0]?' selected':'')+'>'+o[1]+'</option>';}).join('');
+    return '<div class="sb-cond">'
+      +'<select onchange="sbUpdateCond(\''+path+'\',\'indicator\',this.value)">'+indicatorOptions+'</select>'
+      +'<select onchange="sbUpdateCond(\''+path+'\',\'field\',this.value)">'+fieldOptions+'</select>'
+      +'<select onchange="sbUpdateCond(\''+path+'\',\'compare\',this.value)">'+compareOptions+'</select>'
+      +'<input type="number" step="any" value="'+riskText(node.value)+'" onchange="sbUpdateCond(\''+path+'\',\'value\',this.value)">'
+      +'<button class="ghost" onclick="sbRemoveNode(\''+path+'\')">删</button></div>';
+  }
+  var opSelect='<select onchange="sbUpdateGroupOp(\''+path+'\',this.value)"><option value="and"'+(node.op!=='or'?' selected':'')+'>AND 全部满足</option><option value="or"'+(node.op==='or'?' selected':'')+'>OR 任一满足</option></select>';
+  var children=(node.args||[]).map(function(child,i){return sbRenderNode(child,path?path+'.'+i:String(i));}).join('');
+  return '<div class="sb-group" data-op="'+node.op+'">'+opSelect+children+'</div>';
+}
+function sbNodeAt(path){
+  var state=window._strategyBuilder; if(!state) return null;
+  if(!path) return state.rule;
+  return path.split('.').reduce(function(node,key){return (node&&node.args)?node.args[Number(key)]:null;},state.rule);
+}
+function sbParentAt(path){
+  var state=window._strategyBuilder; if(!state) return null;
+  var parts=path.split('.');
+  var parentPath=parts.slice(0,-1).join('.');
+  return sbNodeAt(parentPath);
+}
+function sbUpdateCond(path,key,value){
+  var node=sbNodeAt(path); if(!node) return;
+  node[key]=value;
+  if(window._strategyBuilder) window._strategyBuilder.ruleDirty=true;
+  renderConditionTree();
+  scheduleStrategyPreview();
+}
+function sbUpdateGroupOp(path,value){
+  var node=sbNodeAt(path); if(!node) return;
+  node.op=value;
+  if(window._strategyBuilder) window._strategyBuilder.ruleDirty=true;
+  scheduleStrategyPreview();
+}
+function sbAddCondition(){
+  var state=window._strategyBuilder; if(!state) return;
+  state.rule.args.push({kind:'cond',field:'close',indicator:'',compare:'gt',value:''});
+  state.ruleDirty=true;
+  renderConditionTree(); scheduleStrategyPreview();
+}
+function sbAddGroup(){
+  var state=window._strategyBuilder; if(!state) return;
+  state.rule.args.push({kind:'group',op:'or',args:[{kind:'cond',field:'main_net_inflow_pct',indicator:'',compare:'gt',value:'2'}]});
+  state.ruleDirty=true;
+  renderConditionTree(); scheduleStrategyPreview();
+}
+function sbRemoveNode(path){
+  var state=window._strategyBuilder; if(!state||!path) return;
+  var parent=sbParentAt(path); if(!parent||!parent.args) return;
+  parent.args.splice(Number(path.split('.').pop()),1);
+  if(!parent.args.length) parent.args.push({kind:'cond',field:'close',indicator:'',compare:'gt',value:''});
+  state.ruleDirty=true;
+  renderConditionTree(); scheduleStrategyPreview();
+}
+function scheduleStrategyPreview(){
+  var state=window._strategyBuilder; if(!state) return;
+  if(state.previewTimer) clearTimeout(state.previewTimer);
+  state.previewTimer=setTimeout(runStrategyPreview,500);
+}
+async function runStrategyPreview(){
+  var state=window._strategyBuilder; if(!state) return;
+  var box=$('sbPreview'); if(!box) return;
+  var draft={
+    style:$('sbStyle')?$('sbStyle').value:'',
+    max_positions:Number(($('sbMaxPositions')||{}).value||0)||undefined,
+    max_weight_pct:Number(($('sbMaxWeight')||{}).value||0)||undefined,
+    max_exposure_pct:Number(($('sbMaxExposure')||{}).value||0)||undefined,
+    dsl_ast:strategyBuilderDslAst(),
+  };
+  try{
+    var p=await apiPostJson('/api/paper/strategy-preview',draft);
+    renderStrategyPreview(p);
+  }catch(e){ box.innerHTML='<div class="paper-empty">预览失败：'+riskText(e.message||e)+'</div>'; }
+}
+function renderStrategyPreview(p){
+  var box=$('sbPreview'); if(!box) return;
+  p=p||{};
+  var fp=(p.risk_fingerprint||{});
+  var rp=(p.risk_profile||{});
+  var soft=(rp.soft_limits||{});
+  var ex=(p.execution_profile||{});
+  var lc=(p.lifecycle||{});
+  var evo=(p.evolution||{});
+  var overrides=(p.high_risk_overrides||[]);
+  var overrideRows=overrides.length?('<ul>'+overrides.map(function(o){
+    return '<li><b>'+riskText(o.label||o.key)+'</b>：'+riskText(o.note||('当前 '+o.user_value+' / 推荐 '+o.recommended_value))+'</li>';
+  }).join('')+'</ul>'):'<div class="strategy-muted">没有比推荐档更激进的配置。</div>';
+  if(p.dsl_valid===false){
+    box.innerHTML='<div class="banner">DSL 编译失败（fail-closed 保守展示）：'+riskText(p.dsl_error||'无法解析')+'</div>'+overrideRows;
+    return;
+  }
+  box.innerHTML='<div class="paper-strategy-metrics">'
+    +'<div>Archetype<b>'+riskText(fp.archetype||'—')+'</b></div>'
+    +'<div>风险画像<b>'+riskText(rp.recommended_profile_label||rp.template||'—')+'</b></div>'
+    +'<div>席位 / 单票 / 敞口<b>'+execText(soft.max_positions)+' / '+fmt(soft.max_weight_pct,1)+'% / '+fmt(soft.max_exposure_pct,1)+'%</b></div>'
+    +'<div>行业上限 / 单笔风险<b>'+fmt(soft.max_industry_pct,1)+'% / '+fmt((soft.risk_per_trade||0)*100,2)+'%</b></div>'
+    +'<div>执行方式<b>'+execOrderTypeLabel(ex.order_type)+(ex.ttl_minutes?(' · TTL '+execText(ex.ttl_minutes)+'分'):'')+(ex.batch?' · 批量':'')+(ex.verification_required?' · 核验':'')+'</b></div>'
+    +'<div>初始 lifecycle<b>'+riskText(lc.stage_label||'试点（pilot）')+' ×'+fmt(lc.capital_scale,2)+'</b></div>'
+    +'<div>预计资金<b>'+(lc.estimated_capital?('¥'+Number(lc.estimated_capital).toLocaleString('zh-CN')):'—')+'</b></div>'
+    +'<div>可进化参数<b>'+riskText((evo.tunable||[]).join(', ')||'—')+'</b></div>'
+    +'<div>锁定参数<b>'+riskText((evo.locked||[]).join(', ')||'—')+'</b></div>'
+    +'</div><div class="adaptive-notice">高风险 override（受非对称风险门约束：收紧快行 / 放大需证据+观察期+步长上限+Challenger 胜出）：</div>'+overrideRows;
+}
+async function submitStrategyBuilder(){
+  var state=window._strategyBuilder; if(!state) return;
+  var dsl=(state.mode==='edit'&&!state.ruleDirty&&state.dslSource)?state.dslSource:strategyBuilderDslAst();
+  var metadata={
+    style:$('sbStyle').value||'',
+    max_positions:Number($('sbMaxPositions').value||3),
+    max_weight_pct:Number($('sbMaxWeight').value||30),
+    max_exposure_pct:Number($('sbMaxExposure').value||82),
+  };
+  try{
+    if(state.mode==='edit'&&state.strategyId){
+      await apiJson('/api/strategies/'+encodeURIComponent(state.strategyId),'PATCH',{
+        changes:{name:$('sbName').value||undefined,dsl_ast:dsl,metadata:metadata},
+        expected_version:state.expectedVersion,actor:'human-ui',change_note:'strategy builder edit',
+      });
+    }else{
+      var id=($('sbId').value||'').trim();
+      if(!id){ alert('请填写策略 ID'); return; }
+      await apiPostJson('/api/strategies',{
+        id:id,name:$('sbName').value||id,description:'用户自建策略（策略构建器）',
+        dsl_ast:dsl,metadata:metadata,actor:'human-ui',
+      });
+    }
+    window._strategyRegistryCache=null;
+    window._paperStrategyCenterCache=null;
+    closeStrategyBuilder();
+    await loadStrategyRegistry(true);
+  }catch(e){ alert('保存失败：'+(e.message||e)); }
 }
 function paperResearchStrategyName(id){
   return ({tq_breakout:'短线日内做T',trend_pullback:'趋势波段优选',sector_rotation:'板块轮动先锋',reported_profit_breakout:'三日策略',main_force_top10:'超强主力股'})[id]||id||'未知策略';
@@ -2077,7 +2431,7 @@ function renderPaperExecution(d){
     +'<h4>人工核验队列（'+verifyRows.length+'）</h4>'
     +execQueueTable(verifyRows,'核验闸门关闭或暂无待核验委托。放行后进入重试管道，驳回则终态作废。',true)
     +'</section>'
-    +'<section class="panel exec-panel"><h3>五套账户的执行画像映射</h3>'
+    +'<section class="panel exec-panel"><h3>各策略账户的执行画像映射</h3>'
     +'<p class="exec-hint">画像按账户 risk_profile 自动选择；未识别的画像 fail-closed 回落「保守组合」。</p>'
     +'<div class="table-scroll"><table class="exec-queue-table"><thead><tr>'
     +'<th>策略账户</th><th>账户 ID</th><th>风险画像</th><th>执行画像</th><th>订单类型</th><th>TTL</th><th>状态</th>'
@@ -2153,7 +2507,7 @@ function renderPaperResearchValidation(d){
     var runCount=(d.runs||[]).length;
     var manualAllowed=policy.manual_allowed===true;
     var manualLabel=policy.manual_label||'收盘后可补录';
-    target.innerHTML='<section class="paper-research-hero"><div><span class="page-kicker">SHADOW EVIDENCE · PAPER ONLY</span><h3>五策略研究证据</h3><p>每个交易日收盘后固定候选、评分构成与可用数据范围，再跟踪后续表现。它不下单、不调参，也不会改动风控。</p></div><div class="paper-research-hero-actions"><span class="tag tag-info">已记录 '+runCount+' 份策略快照</span><span class="paper-research-schedule">自动：'+riskText(policy.scheduled_at||'每个交易日收盘后')+'<small>'+riskText(policy.next_observation||'后续有效收盘快照会补齐观察')+'</small></span><button class="ghost" type="button" onclick="refreshPaperResearchValidation(this)">刷新记录</button><button class="ghost paper-research-backfill" type="button" title="'+riskText(policy.manual_scope||'')+'" onclick="backfillPaperResearch(this)" '+(manualAllowed?'':'disabled')+'>'+riskText(manualLabel)+'</button><span id="paperResearchActionStatus" class="paper-research-action-status" role="status" aria-live="polite"></span></div></section>'
+    target.innerHTML='<section class="paper-research-hero"><div><span class="page-kicker">SHADOW EVIDENCE · PAPER ONLY</span><h3>策略集合研究证据</h3><p>每个交易日收盘后固定候选、评分构成与可用数据范围，再跟踪后续表现。它不下单、不调参，也不会改动风控。</p></div><div class="paper-research-hero-actions"><span class="tag tag-info">已记录 '+runCount+' 份策略快照</span><span class="paper-research-schedule">自动：'+riskText(policy.scheduled_at||'每个交易日收盘后')+'<small>'+riskText(policy.next_observation||'后续有效收盘快照会补齐观察')+'</small></span><button class="ghost" type="button" onclick="refreshPaperResearchValidation(this)">刷新记录</button><button class="ghost paper-research-backfill" type="button" title="'+riskText(policy.manual_scope||'')+'" onclick="backfillPaperResearch(this)" '+(manualAllowed?'':'disabled')+'>'+riskText(manualLabel)+'</button><span id="paperResearchActionStatus" class="paper-research-action-status" role="status" aria-live="polite"></span></div></section>'
       +'<section class="paper-research-ladder" aria-label="研究兑现周期"><span>候选固定</span><i></i><span>1日观察</span><i></i><span>3日复核</span><i></i><span>5日对比</span><i></i><span>10日验证</span><i></i><span>20日人工复核</span></section>'
       +'<section class="paper-research-grid">'+cards+'</section>'
       +'<section class="paper-research-table"><header><div><h3>最新可核验快照</h3><p>只有收盘后写入的候选才会计入研究；数据不完整会明确标记，不会伪装成有效样本。</p></div><span class="tag tag-warn">影子验证中</span></header>'+tableScroll('<table><thead><tr><th>模拟盘策略</th><th>信号日</th><th>候选</th><th>因子截至</th><th>最早因子</th><th>数据质量</th></tr></thead><tbody>'+rows+'</tbody></table>',900)+'</section>'
@@ -2615,7 +2969,7 @@ async function renderPaperDashboard(d,auditRequest){
       : (running?'本周期已启动；净值点不足两个，后续有效快照会自动补齐曲线。':'挑战将在确认资金并启动新周期后开始。');
     var signalsAudit = signals
       ? tableScroll('<table><tr><th>策略</th><th>标的</th><th>信号日</th><th>执行日</th><th>独立模型评分</th><th>状态</th><th>说明</th></tr>'+signals+'</table>',980)
-      : '<div class="paper-empty">暂无信号。五套策略会按各自模型、行情时间戳和仓位上限分别审批。</div>';
+      : '<div class="paper-empty">暂无信号。已启用策略会按各自模型、行情时间戳和仓位上限分别审批。</div>';
     var positionsAudit = positions
       ? tableScroll('<table><tr><th>策略决策</th><th>标的</th><th>持仓股数</th><th>持仓市值 / 总池占比</th><th>成本</th><th>现价</th><th>浮盈亏</th><th>质量评分 / 处置</th><th>持有</th><th>份额状态</th><th>交易制度</th><th>最早可卖 / 报价</th></tr>'+positions+'</table>',1260)
       : '<div class="paper-empty">暂无模拟持仓。</div>';
@@ -2661,7 +3015,7 @@ function normalizeActiveStrategyCopy(root){
   var walker=document.createTreeWalker(root,NodeFilter.SHOW_TEXT), node;
   while((node=walker.nextNode())){
     var value=node.nodeValue||'';
-    var normalized=value.replace(/[二两三四]套策略/g,'五套策略').replace(/[二两三四]策略/g,'五策略');
+    var normalized=value.replace(/(二|两|三|四|五)套(当前)?(模拟账户|策略)/g,'已启用策略').replace(/五策略/g,'已启用策略');
     if(normalized!==value) node.nodeValue=normalized;
   }
 }
@@ -2677,7 +3031,7 @@ if(typeof MutationObserver!=='undefined'){
         if(node.nodeType===Node.ELEMENT_NODE) normalizeActiveStrategyCopy(node);
         else if(node.nodeType===Node.TEXT_NODE){
           var value=node.nodeValue||'';
-          var normalized=value.replace(/[二两三四]套策略/g,'五套策略').replace(/[二两三四]策略/g,'五策略');
+          var normalized=value.replace(/(二|两|三|四|五)套(当前)?(模拟账户|策略)/g,'已启用策略').replace(/五策略/g,'已启用策略');
           if(normalized!==value) node.nodeValue=normalized;
         }
       }

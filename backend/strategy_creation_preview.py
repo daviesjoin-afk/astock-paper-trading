@@ -22,7 +22,11 @@ from typing import Any, Mapping
 
 import evolution_profiles as EP
 import execution_profiles as EPF
+import paper_allocation as PA
+import strategy_dsl_schema as DSL
+import strategy_parameter_schema as SPS
 import strategy_risk_fingerprint as SRF
+import strategy_risk_profiles as SRP
 
 __all__ = ["strategy_creation_preview"]
 
@@ -80,9 +84,21 @@ _ARCHETYPE_PROFILE = {
 def strategy_creation_preview(
     draft: Mapping[str, Any] | None,
     risk_profiles: Mapping[str, Mapping[str, Any]],
+    *,
+    dsl_ast: Mapping[str, Any] | None = None,
+    pool_capital: float | None = None,
 ) -> dict[str, Any]:
-    """根据草稿配置生成创建预览（指纹 / 推荐画像 / 执行方式 / 边界 / 覆盖）。"""
+    """根据草稿配置生成创建预览（指纹 / 推荐画像 / 执行方式 / 边界 / 覆盖）。
+
+    PR-34：携带 ``dsl_ast`` 时走**与生产一致的 StrategyRuntime 编译管线**
+    （DSL normalize → Risk Fingerprint → Risk Profile → Execution Profile →
+    Parameter Schema），并给出初始 lifecycle（用户策略一律 pilot 起步）与
+    按资金池折算的预计资金。DSL 无法解析时 fail-closed 返回保守预览并附
+    ``dsl_error``。
+    """
     draft = dict(draft or {})
+    if dsl_ast is not None:
+        return _dsl_preview(draft, risk_profiles, dsl_ast, pool_capital)
     style = str(draft.get("style") or "").strip()
     normalized_style = _LABEL_NORMALIZATION.get(style.lower(), style)
     alias = _STYLE_ALIASES.get(normalized_style.lower())
@@ -186,3 +202,117 @@ _ARCHETYPE_STRATEGY = {
     "mean_reversion": "trend_pullback",
     "composite": "unknown_strategy",
 }
+
+
+def _dsl_preview(
+    draft: Mapping[str, Any],
+    risk_profiles: Mapping[str, Mapping[str, Any]],
+    dsl_ast: Mapping[str, Any],
+    pool_capital: float | None,
+) -> dict[str, Any]:
+    """PR-34：基于 DSL 的编辑期实时预览（与生产同一条编译管线）。"""
+    try:
+        normalized = DSL.normalize(dsl_ast)
+        dsl_error = None
+    except (ValueError, TypeError) as exc:
+        normalized = None
+        dsl_error = str(exc)
+    if normalized is None:
+        # fail-closed：解析失败按保守 composite 展示，绝不猜测用户意图。
+        base = strategy_creation_preview(draft, risk_profiles)
+        base["dsl_valid"] = False
+        base["dsl_error"] = dsl_error
+        base["engine"] = "strategy-creation-preview-v2"
+        return base
+
+    metadata = draft.get("metadata") if isinstance(draft.get("metadata"), Mapping) else None
+    fingerprint = SRF.compile_strategy_risk_fingerprint(normalized, metadata)
+    archetype = fingerprint.archetype
+    execution = EPF.execution_profile_for(archetype)
+    profile = SRP.compile_strategy_risk_profile(fingerprint)
+    soft = dict(profile.soft_limits)
+    recommended_profile_key = _ARCHETYPE_PROFILE.get(archetype, "composite")
+    recommended = dict(risk_profiles.get(recommended_profile_key) or {})
+    schema = SPS.StrategyParameterSchema.from_dsl(normalized)
+
+    # 用户自建策略上线即试点：小额资金验证后再人工晋升（PR-26 语义）。
+    initial_stage = "pilot"
+    capital_scale = PA.DEFAULT_STAGE_CAPITAL_SCALE.get(initial_stage, 0.0)
+    estimated_capital = None
+    if pool_capital is not None:
+        try:
+            estimated_capital = round(float(pool_capital) * float(capital_scale), 2)
+        except (TypeError, ValueError):
+            estimated_capital = None
+
+    high_risk_overrides: list[dict[str, Any]] = []
+    for item in schema.parameters:
+        if item.risk_direction not in ("higher_is_riskier", "lower_is_riskier"):
+            continue
+        high_risk_overrides.append({
+            "key": item.parameter_id,
+            "label": f"声明式参数 {item.parameter_id}",
+            "user_value": item.value,
+            "declared_direction": item.risk_direction,
+            "bounds": [item.min, item.max],
+            "max_step": item.max_step,
+            "min_evidence": item.min_evidence,
+            "note": "风险方向参数调整受非对称风险门约束（收紧快行/放大四重门槛）",
+        })
+
+    return {
+        "engine": "strategy-creation-preview-v2",
+        "dsl_valid": True,
+        "dsl_error": None,
+        "structure_checksum": schema.structure_checksum,
+        "risk_fingerprint": fingerprint.to_dict(),
+        "risk_profile": {
+            "template": profile.template,
+            "recommended_profile": recommended_profile_key,
+            "recommended_profile_label": (recommended or {}).get(
+                "name", recommended_profile_key),
+            "hard_rules": dict(profile.hard_rules),
+            "soft_limits": {
+                "max_positions": soft.get("max_positions"),
+                "max_weight_pct": round(float(soft.get("max_weight", 0.0)) * 100, 1),
+                "max_exposure_pct": round(float(soft.get("max_exposure", 0.0)) * 100, 1),
+                "max_industry_pct": round(float(soft.get("max_industry", 0.0)) * 100, 1),
+                "risk_per_trade": soft.get("risk_per_trade"),
+            },
+            "evolvable_params": dict(profile.evolvable_params),
+            "user_locked_params": dict(profile.user_locked_params),
+        },
+        "execution_profile": {
+            "family": execution.get("family"),
+            "label": execution.get("label"),
+            "order_type": execution.get("order_type"),
+            "limit_offset_pct": execution.get("limit_offset_pct"),
+            "ttl_minutes": execution.get("ttl_minutes"),
+            "batch": bool(execution.get("batch")),
+            "verification_required": bool(execution.get("verification_required")),
+            "strict_ttl": bool(execution.get("strict_ttl")),
+        },
+        "lifecycle": {
+            "initial_stage": initial_stage,
+            "stage_label": "试点（pilot）",
+            "capital_scale": capital_scale,
+            "pool_capital": pool_capital,
+            "estimated_capital": estimated_capital,
+            "note": "用户策略上线即试点，仅按资金系数的小比例部署；验证后人工晋升 standard",
+        },
+        "evolution": {
+            "tunable": list(schema.editable),
+            "locked": list(schema.immutable),
+            "min_samples": max(
+                (item.min_evidence for item in schema.parameters), default=0),
+            "note": "只有可调参数允许自进化；锁定参数任何路径都不能改",
+        },
+        "parameters": {
+            "editable": list(schema.editable),
+            "immutable": list(schema.immutable),
+            "items": [item.to_dict() for item in schema.parameters],
+        },
+        "high_risk_overrides": high_risk_overrides,
+        "declared_limits": {},
+        "fail_closed": False,
+    }
