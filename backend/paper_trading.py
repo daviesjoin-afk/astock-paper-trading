@@ -47,6 +47,7 @@ import paper_sizing as PSZ
 import order_intent as OI
 import strategy_registry as SR
 import strategy_runtime as SRT
+import user_strategy_participation as USP
 import strategy_risk_enforcement as SRE
 import runtime_settings as RSET
 from market_policy import market_light_scale, market_light_scales
@@ -451,6 +452,12 @@ def paper_cache_generation():
 CANDIDATE_FACTOR_MIN_ROWS = 4_000
 CANDIDATE_FACTOR_MIN_COVERAGE = 0.85
 
+# 实时横截面扫描门禁的绝对下限（A股全市场 ≈ 5000+）。与因子覆盖门一
+# 样属于部署规模阈值：全量市场必须整体可验证，绝不允许在残缺快照上选
+# 股。独立成常量是为了让小样本注入环境（黄金回放等）可以显式放宽而不
+# 改动门禁逻辑本身。
+LIVE_SCAN_GATE_MIN_ROWS = 4_000
+
 # Holding-quality is a review score, not an entry score.  It therefore needs
 # strategy-specific weights: forcing the intraday-T model to share the
 # long-trend MA weighting was the reason many fresh, valid T positions looked
@@ -810,12 +817,65 @@ ACTIVE_ACCOUNT_IDS = tuple(
 ACTIVE_ACCOUNT_SPECS = {account_id: ACCOUNT_SPECS[account_id] for account_id in ACTIVE_ACCOUNT_IDS}
 
 
-def _active_account_clause(column="id"):
-    """Return a SQL predicate and parameters for current-cycle accounts."""
-    if not ACTIVE_ACCOUNT_IDS:
+def _active_account_clause(column="id", conn=None):
+    """Return a SQL predicate and parameters for current-cycle accounts.
+
+    PR-35：参与资格 = 内置五套 ∪ 注册表中 active 且 supports_new_cycle=1
+    的用户策略（``USP.user_participant_ids``）。传入 conn 才能看到用户
+    策略；无 conn 的旧调用保持内置集合，行为不变。
+    """
+    ids = ACTIVE_ACCOUNT_IDS
+    if conn is not None:
+        ids = tuple(dict.fromkeys([*ACTIVE_ACCOUNT_IDS, *USP.user_participant_ids(conn)]))
+    if not ids:
         return "1=0", ()
-    placeholders = ",".join("?" for _ in ACTIVE_ACCOUNT_IDS)
-    return f"{column} IN ({placeholders})", ACTIVE_ACCOUNT_IDS
+    placeholders = ",".join("?" for _ in ids)
+    return f"{column} IN ({placeholders})", ids
+
+
+# 用户策略声明式 spec 解析（PR-35）。无 conn 时按需开只读连接；底层
+# SRT.get_context 自带缓存，无需在此重复缓存。
+_UNKNOWN_USER_SPEC = {
+    "name": "未知策略账户", "source_strategy": "strategy_dsl", "selection_mode": "dsl",
+    "mode": "swing", "cycle_days": 8, "max_positions": 1, "max_weight": 0.10,
+    "max_exposure": 0.35, "risk_profile": "trend", "strategy_version": "v0",
+    "default_style": "pullback", "entry_model_name": "未知策略账户",
+    "max_factor_lag": 1, "entry_pct_high": 6.5, "gap_q2": (-0.025, 0.07),
+    "hold_min": 1, "hold_max": 8, "hard_stop": -0.05, "trail_after": 0.05,
+    "trail_stop": 0.06, "take_profit": [(0.10, 1 / 3), (0.16, 1 / 3)],
+    "candidate_topn": 10, "lifecycle_stage": "quarantined",
+}
+
+
+def spec_selection_mode(account_id, conn=None):
+    """内置账户返回 None；声明式（DSL）用户策略返回 "dsl"（PR-35 能力位）。"""
+    return _spec_for(account_id, conn=conn).get("selection_mode")
+
+
+def _user_runtime_context(account_id):
+    """按需开只读连接取用户策略的注册表运行时上下文（fail-fast ValueError）。"""
+    with _db_readonly() as readonly:
+        return SRT.get_context(readonly, account_id)
+
+
+def _spec_for(account_id, conn=None):
+    """内置账户取 ACCOUNT_SPECS；用户策略账户按注册表运行时上下文派生。
+
+    这是固定五套表走向声明化（PR-37）的唯一解析口：所有此前直接索引
+    ``ACCOUNT_SPECS[account_id]`` 的生产路径都改走这里，用户策略从此
+    不再 KeyError，也不再被排除在风控/评估/退出状态机之外。
+    """
+    spec = ACCOUNT_SPECS.get(account_id)
+    if spec is not None:
+        return spec
+    try:
+        context = (
+            SRT.get_context(conn, account_id) if conn is not None
+            else _user_runtime_context(account_id)
+        )
+    except (ValueError, sqlite3.Error):
+        return dict(_UNKNOWN_USER_SPEC)
+    return USP.user_spec_for(context, risk_profiles=RISK_PROFILES)
 
 
 def _dynamic_minimum_order_amount(cycle, nav=None, position_limit=None, conn=None):
@@ -826,9 +886,12 @@ def _dynamic_minimum_order_amount(cycle, nav=None, position_limit=None, conn=Non
     whether a confirmed position deserves an additional tranche.
     """
     cycle_ids = tuple(item for item in _loads((cycle or {}).get("enabled_strategies"), []) if item in ACCOUNT_SPECS)
+    if conn is not None:
+        # PR-35：周期启用集合中的用户策略也参与池位配置。
+        cycle_ids = tuple(dict.fromkeys([*cycle_ids, *(item for item in _loads((cycle or {}).get("enabled_strategies"), []) if item in USP.user_participant_ids(conn))]))
     configured_ids = cycle_ids or ACTIVE_ACCOUNT_IDS
     configured_slots = sum(
-        max(1, int(ACCOUNT_SPECS.get(account_id, {}).get("max_positions", 1)))
+        max(1, int(_spec_for(account_id, conn=conn).get("max_positions", 1)))
         for account_id in configured_ids
     )
     if position_limit is None:
@@ -866,7 +929,7 @@ def _dynamic_minimum_order_amount(cycle, nav=None, position_limit=None, conn=Non
 
 def _active_account_rows(conn, status=None):
     """Read only accounts allowed to participate in the current cycle."""
-    clause, params = _active_account_clause()
+    clause, params = _active_account_clause(conn=conn)
     sql = f"SELECT * FROM paper_accounts WHERE {clause}"
     if status is not None:
         sql += " AND status=?"
@@ -895,7 +958,8 @@ def _active_cycle_filter(conn, cycle_id, column="id"):
         cycle_row = conn.execute("SELECT enabled_strategies FROM paper_cycles WHERE id=?", (cycle_id,)).fetchone()
         parsed = _loads(cycle_row["enabled_strategies"], None) if cycle_row and cycle_row["enabled_strategies"] else None
         if isinstance(parsed, list):
-            selected = tuple(item for item in parsed if item in ACCOUNT_SPECS)
+            user_ids = set(USP.user_participant_ids(conn))
+            selected = tuple(item for item in parsed if item in ACCOUNT_SPECS or item in user_ids)
             configured_ids = selected or None
     except Exception:
         configured_ids = None
@@ -1611,12 +1675,24 @@ def _strategy_contract_mode(conn, account_id):
     return enforced, origin, contract_version
 
 
+# 信号负载中的数据域（行情/引擎/因子层生成）：不属于策略层的数量声明。
+# OrderIntent 契约扫描跳过这些 section（PR-35，见 _enforce_order_intent）。
+_SIGNAL_DATA_SECTIONS = frozenset({
+    "quote", "market", "market_policy", "factor", "news",
+    "decision", "decision_snapshot", "order_intent",
+})
+
+
 def _enforce_order_intent(conn, account, code, payload, *, signal_id=None):
     """PR-28：执行入口的 OrderIntent 契约闸门（强制模式）。
 
-    - 强制模式下先对**整个信号负载**做数量声明扫描：任何 qty/shares/
-      amount/sizing 字段（含嵌套）都视为策略层越权决定数量，立即终态
-      拒绝信号——静默忽略会让越权数量变成“薛定谔的契约”。
+    - 强制模式下先做数量声明扫描：策略层（pick 及其负载内嵌副本）出现
+      任何 qty/shares/amount/sizing 字段（含嵌套）都视为越权决定数量，
+      立即终态拒绝信号——静默忽略会让越权数量变成“薛定谔的契约”。
+      PR-35 修正扫描范围：``quote``/``market``/``factor`` 等数据域由
+      行情与引擎层生成，其中的市场事实字段（如成交额 amount、因子
+      中间值）不是策略层的数量声明，纳入递归扫描会把每一次真实行情
+      都误判为违约，强制契约因此从未在真实负载上跑通过。
     - 通过后构造正式 OrderIntent（数量不在契约中，由执行器统一计算），
       返回 ``(intent, None)`` 供执行链路与审计共用。
     - legacy 模式（builtin 且 contract_version<1）返回 ``(None, None)``，
@@ -1630,7 +1706,10 @@ def _enforce_order_intent(conn, account, code, payload, *, signal_id=None):
         intent = OI.order_intent_from_signal(
             account_id, {**(payload.get("pick") or {}), "code": code},
         )
-        OI.reject_qty_claims(payload)
+        OI.reject_qty_claims({
+            key: value for key, value in (payload or {}).items()
+            if key not in _SIGNAL_DATA_SECTIONS
+        })
     except OI.OrderIntentContractError as exc:
         reason = f"OrderIntent 契约拒绝：{type(exc).__name__}: {exc}"
         if signal_id is not None:
@@ -2045,6 +2124,7 @@ def init_db():
                 SR.ensure_schema(conn)
                 PSM.ensure_strategy_reference_columns(conn)
                 _ensure_accounts(conn)
+                _ensure_user_strategy_accounts(conn)
                 _ensure_cycle(conn)
                 _ensure_runtime_lease_columns(conn)
                 _recover_stale_runtime_state(conn)
@@ -2332,6 +2412,7 @@ def init_db():
         SR.ensure_schema(conn)
         PSM.ensure_strategy_reference_columns(conn)
         _ensure_accounts(conn)
+        _ensure_user_strategy_accounts(conn)
         _ensure_cycle(conn)
         _ensure_runtime_lease_columns(conn)
         _recover_stale_runtime_state(conn)
@@ -2393,6 +2474,34 @@ def _ensure_accounts(conn):
             "INSERT OR IGNORE INTO paper_nav(account_id,nav_date,cash,market_value,nav,benchmark,created_at) VALUES(?,?,?,?,?,?,?)",
             (account_id, dt.date.today().isoformat(), configured_share, 0.0, configured_share, benchmark, now),
         )
+
+
+def _ensure_user_strategy_accounts(conn):
+    """为可参与运行的用户策略补齐纸盘账户行（PR-35，幂等）。
+
+    active ∧ supports_new_cycle=1 的用户策略必须有 paper_accounts 行，
+    否则信号/订单/持仓没有账本主体。新建行保持 paused/零资金：
+    资金与周期挂接只由 ``_create_cycle`` / ``_ensure_cycle`` 分配，
+    激活绝不私自挪用共享池。策略暂停/归档后行保留（历史账本语义），
+    但参与资格消失，不会再被任何周期启用。
+    """
+    for account_id in USP.user_participant_ids(conn):
+        exists = conn.execute("SELECT 1 FROM paper_accounts WHERE id=?", (account_id,)).fetchone()
+        if exists:
+            continue
+        spec = _spec_for(account_id, conn=conn)
+        now = _now()
+        conn.execute(
+            """INSERT INTO paper_accounts
+            (id,name,source_strategy,status,initial_cash,cash,cycle_days,max_positions,max_weight,max_exposure,
+             risk_profile,version,benchmark_start,created_at,updated_at)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (account_id, spec["name"], spec["source_strategy"], "paused", 0.0, 0.0,
+             spec["cycle_days"], spec["max_positions"], spec["max_weight"], spec["max_exposure"],
+             spec["risk_profile"], spec["strategy_version"], None, now, now),
+        )
+        _audit(conn, account_id, "user_strategy_account_provisioned",
+               f"用户策略 {spec['name']} 已开户（paused，等待周期分配资金；DSL v{spec['dsl_version']}）")
 
 
 def _reconcile_shared_cash(conn, cycle_id):
@@ -2524,7 +2633,11 @@ def _ensure_cycle(conn):
                      (_num(account_total), _now(), active["id"]))
         active = conn.execute("SELECT * FROM paper_cycles WHERE id=?", (active["id"],)).fetchone()
     configured_enabled = _loads(active["enabled_strategies"], None) if "enabled_strategies" in active.keys() else None
-    enabled_ids = tuple(item for item in (configured_enabled or ACTIVE_ACCOUNT_IDS) if item in ACCOUNT_SPECS) or ACTIVE_ACCOUNT_IDS
+    # PR-35：启用集合按"能力位"过滤——内置 id 看 ACCOUNT_SPECS，用户 id 看
+    # 注册表参与资格；陈旧/未知 id 仍被剔除。
+    user_ids = set(USP.user_participant_ids(conn))
+    base_enabled = configured_enabled if isinstance(configured_enabled, list) and configured_enabled else ACTIVE_ACCOUNT_IDS
+    enabled_ids = tuple(item for item in base_enabled if item in ACCOUNT_SPECS or item in user_ids) or tuple(ACTIVE_ACCOUNT_IDS)
     # Bind before any account-repair audit below. A definition head can move
     # independently, but every write in this cycle must retain this snapshot.
     SR.bind_cycle_versions(conn, active["id"], enabled_ids)
@@ -2663,6 +2776,47 @@ def _ensure_cycle(conn):
                              WHERE account_id=? AND nav_date=?""",
                         (reference_capital, account_id, _date().isoformat()),
                     )
+    # PR-35：用户策略账户的周期挂接/摘除（声明式 spec，不做内置专属修复）。
+    for account_id in sorted(user_ids):
+        if account_id in ACTIVE_ACCOUNT_SPECS:
+            continue
+        row = conn.execute("SELECT * FROM paper_accounts WHERE id=?", (account_id,)).fetchone()
+        if row is None:
+            continue
+        user_spec = _spec_for(account_id, conn=conn)
+        if account_id not in enabled_ids and row["cycle_id"] == active["id"]:
+            conn.execute(
+                "UPDATE paper_accounts SET cycle_id=NULL,status='paused',initial_cash=0,cash=0,updated_at=? WHERE id=?",
+                (_now(), account_id),
+            )
+            continue
+        if row["cycle_id"] is None and account_id in enabled_ids:
+            capital = _num(active["capital"], 100000.0)
+            account_capital = (
+                capital / max(len(enabled_ids), 1)
+                if str(active["cycle_key"] or "").startswith("legacy-")
+                else _available_cycle_ledger_capital(conn, active, account_id)
+            )
+            benchmark = _benchmark_close()
+            conn.execute(
+                "UPDATE paper_accounts SET cycle_id=?,mode=?,style=?,status=?,initial_cash=?,cash=?,benchmark_start=?,daily_start_nav=?,daily_nav_date=?,risk_profile=?,version=?,max_positions=?,max_weight=?,max_exposure=?,updated_at=? WHERE id=?",
+                (active["id"], user_spec["mode"], user_spec["default_style"], active["status"],
+                 account_capital, account_capital, benchmark, account_capital, _date().isoformat(),
+                 user_spec["risk_profile"], user_spec["strategy_version"], user_spec["max_positions"],
+                 user_spec["max_weight"], user_spec["max_exposure"], _now(), account_id),
+            )
+            conn.execute("DELETE FROM paper_nav WHERE account_id=?", (account_id,))
+            conn.execute(
+                "INSERT INTO paper_nav(account_id,nav_date,cash,market_value,nav,benchmark,created_at) VALUES(?,?,?,?,?,?,?)",
+                (account_id, _date().isoformat(), account_capital, 0.0, account_capital, benchmark, _now()),
+            )
+            conn.execute(
+                "INSERT INTO paper_parameter_versions(cycle_id,account_id,version,style,params,reason,effective_date,created_at) VALUES(?,?,?,?,?,?,?,?)",
+                (active["id"], account_id, user_spec["strategy_version"], user_spec["default_style"], "{}",
+                 "用户策略接入周期", _date().isoformat(), _now()),
+            )
+            _audit(conn, account_id, "user_strategy_cycle_attached",
+                   f"用户策略 {user_spec['name']} 接入周期（{user_spec['lifecycle_stage']} 档）")
     SR.bind_cycle_versions(conn, active["id"], enabled_ids)
     _reconcile_shared_cash(conn, active["id"])
 
@@ -3519,7 +3673,7 @@ def _trading_weekday_lag(reference_date, asof_date):
 
 
 def _strategy_reference_is_usable(account_id, reference_date, asof_date):
-    spec = ACCOUNT_SPECS[account_id]
+    spec = _spec_for(account_id)
     lag = _trading_weekday_lag(reference_date, asof_date)
     return lag is not None and lag <= spec["max_factor_lag"], lag
 
@@ -4966,6 +5120,7 @@ def _new_entry_price_gate(account, pick, quote=None):
             )
     if pct is None:
         return True, None
+    entry_name = _spec_for(account_id).get("entry_model_name") or account_id
     limit_pct = _limit_pct(pick.get("code"))
     # 短线日内做T拥有唯一的追高通道，后续仍必须通过 _chase_entry_gate 的
     # 双源行情、Q1、资金、量能和策略确认分校验；本函数不能提前把它筛掉。
@@ -4981,7 +5136,7 @@ def _new_entry_price_gate(account, pick, quote=None):
     if account_id == MAIN_FORCE_STRATEGY_ID:
         limit_buffer = 1.0 if limit_pct <= 10.0 else 2.0
         if pct >= limit_pct - limit_buffer:
-            return False, f"涨幅 {pct:+.2f}% 已接近涨停，{ACCOUNT_SPECS[account_id]['entry_model_name']}不模拟封板排队"
+            return False, f"涨幅 {pct:+.2f}% 已接近涨停，{entry_name}不模拟封板排队"
         ignition_high = 7.5
         if pct > ignition_high:
             return False, (
@@ -4998,10 +5153,10 @@ def _new_entry_price_gate(account, pick, quote=None):
     if account_id == NEW_STRATEGY_ID:
         limit_buffer = 1.0 if limit_pct <= 10.0 else 2.0
         if pct >= limit_pct - limit_buffer:
-            return False, f"涨幅 {pct:+.2f}% 已接近涨停，{ACCOUNT_SPECS[account_id]['entry_model_name']}不追高，转入回踩观察"
-        ceiling = _num(ACCOUNT_SPECS[account_id].get("entry_pct_high"), 6.5)
+            return False, f"涨幅 {pct:+.2f}% 已接近涨停，{entry_name}不追高，转入回踩观察"
+        ceiling = _num(_spec_for(account_id).get("entry_pct_high"), 6.5)
         if pct > ceiling:
-            return False, f"涨幅 {pct:+.2f}% 超出{ACCOUNT_SPECS[account_id]['entry_model_name']}突破执行上限，转入观察"
+            return False, f"涨幅 {pct:+.2f}% 超出{entry_name}突破执行上限，转入观察"
         return True, None
 
     # 板块轮动的热点加速候选由专属追高门禁接管；普通板块候选仍不追高。
@@ -5013,10 +5168,12 @@ def _new_entry_price_gate(account, pick, quote=None):
     # 趋势与板块策略不追高：涨停附近一律观察；其余高位也按策略上限过滤。
     limit_buffer = 1.0 if limit_pct <= 10.0 else 2.0
     if pct >= limit_pct - limit_buffer:
-        return False, f"涨幅 {pct:+.2f}% 已接近涨停，{ACCOUNT_SPECS[account_id]['entry_model_name']}不追高，转入次日观察"
+        return False, f"涨幅 {pct:+.2f}% 已接近涨停，{entry_name}不追高，转入次日观察"
     ceiling = {"sector_rotation": 7.0, "trend_pullback": 6.0}.get(account_id, 7.0)
+    if spec_selection_mode(account_id) == "dsl":
+        ceiling = _num(_spec_for(account_id).get("entry_pct_high"), 7.0)
     if pct > ceiling:
-        return False, f"涨幅 {pct:+.2f}% 超出{ACCOUNT_SPECS[account_id]['entry_model_name']}当日新开仓区间，转入观察"
+        return False, f"涨幅 {pct:+.2f}% 超出{entry_name}当日新开仓区间，转入观察"
     return True, None
 
 
@@ -5406,7 +5563,7 @@ def _candidate_rows(account, asof_date, market, sector_rows=None, live_universe=
     """
     price_f, first_board_codes = _selection_inputs()
     account_id = account["id"] if isinstance(account, dict) else str(account)
-    spec = ACCOUNT_SPECS[account_id]
+    spec = _spec_for(account_id)
     base_universe = {str(row.get("code")): row for row in (U.load_universe() or [])}
     factor_freshness = _selection_factor_freshness(price_f, list(base_universe.values()), asof_date)
     if not factor_freshness.get("passed"):
@@ -5709,28 +5866,50 @@ def _candidate_rows(account, asof_date, market, sector_rows=None, live_universe=
         table["sentiment"] = F.zscore(heat_values).reindex(table.index).fillna(-1.5)
     selection_overlay = _adaptive_selection(account)
     selection_model = selection_overlay.get("model_family") or profile["source_strategy"]
-    available_models = set(getattr(S, "PAPER_WEIGHTS", {}) or {}) | set(getattr(S, "STRATEGIES", {}) or {})
-    if selection_model not in available_models:
-        # The strategy package may be deployed independently from the paper
-        # executor.  Fail closed and leave an auditable blocked scan instead of
-        # silently falling back to one of the three legacy models.
-        return [], {
-            "blocked": True,
-            "reason": f"纸盘策略模型 {selection_model} 尚未在 strategies 模块注册；本轮不生成候选或成交",
-            "model_family": selection_model,
-            "strategy_id": account_id,
+    if spec.get("selection_mode") == "dsl":
+        # PR-35：声明式策略通道——同一份共享因子表，选股由编译后的 DSL
+        # 完成（纯离线求值器），不再要求模型在 strategies.STRATEGIES 注册。
+        selection_model = USP.USER_SOURCE_STRATEGY
+        try:
+            context = _user_runtime_context(account_id)
+        except (ValueError, sqlite3.Error):
+            context = None
+        if context is None:
+            return [], {
+                "blocked": True,
+                "reason": "声明式策略缺少可用的注册表运行时上下文；本轮不生成候选",
+                "strategy_id": account_id, "model_family": selection_model,
+            }
+        raw = USP.dsl_strategy_raw(
+            context, spec, table, asof_date=asof_date, kline_loader=_completed_kline,
+        )
+        candidate_topn = int(spec.get("candidate_topn") or 10)
+        raw.setdefault("metadata", {})["factor_meta"] = {
+            "factor_date": factor_date, "style": style,
         }
-    # 主力观察池：多请求 3 只替补位（top10 掉榜时用 11-13 名补位/保留），
-    # 实际池大小仍为 10，由 _main_force_watch_pool 冻结与替换。
-    candidate_topn = (
-        _MAIN_FORCE_POOL_SIZE + _MAIN_FORCE_POOL_BUFFER
-        if account_id == MAIN_FORCE_STRATEGY_ID
-        else (120 if style == "pullback" else 48)
-    )
-    raw = S.run_strategy(selection_model, table, topn=candidate_topn, news_hits=[], auto_news=False,
-                         gate={"light": market["light"]}, first_board_codes=first_board_codes,
-                         weight_overrides=selection_overlay.get("weights"),
-                         condition_overrides=selection_overlay.get("conditions"))
+    else:
+        available_models = set(getattr(S, "PAPER_WEIGHTS", {}) or {}) | set(getattr(S, "STRATEGIES", {}) or {})
+        if selection_model not in available_models:
+            # The strategy package may be deployed independently from the paper
+            # executor.  Fail closed and leave an auditable blocked scan instead of
+            # silently falling back to one of the three legacy models.
+            return [], {
+                "blocked": True,
+                "reason": f"纸盘策略模型 {selection_model} 尚未在 strategies 模块注册；本轮不生成候选或成交",
+                "model_family": selection_model,
+                "strategy_id": account_id,
+            }
+        # 主力观察池：多请求 3 只替补位（top10 掉榜时用 11-13 名补位/保留），
+        # 实际池大小仍为 10，由 _main_force_watch_pool 冻结与替换。
+        candidate_topn = (
+            _MAIN_FORCE_POOL_SIZE + _MAIN_FORCE_POOL_BUFFER
+            if account_id == MAIN_FORCE_STRATEGY_ID
+            else (120 if style == "pullback" else 48)
+        )
+        raw = S.run_strategy(selection_model, table, topn=candidate_topn, news_hits=[], auto_news=False,
+                             gate={"light": market["light"]}, first_board_codes=first_board_codes,
+                             weight_overrides=selection_overlay.get("weights"),
+                             condition_overrides=selection_overlay.get("conditions"))
     disclosure_prime = {"status": "not_required", "requested": 0, "reported": 0}
     if account_id == NEW_STRATEGY_ID and not (raw.get("picks") or []):
         # First pass deliberately produces a bounded shadow set.  Resolve its
@@ -5876,7 +6055,9 @@ def _candidate_rows(account, asof_date, market, sector_rows=None, live_universe=
         _ignition_shadow_store(shadow_rows)
     picks = entry_screened
     picks, financial_evidence = _attach_candidate_financial_disclosure(picks, asof_date)
-    if style == "pullback":
+    if style == "pullback" and spec.get("selection_mode") != "dsl":
+        # PR-35：声明式策略的候选不经内置风格池（其字段语义来自内置
+        # 模型的 pick 负载）；DSL 门在选股层已判定，直接进入执行审批。
         # 趋势波段不是只买“已经完全多头排列”的股票，否则市场处于
         # 轮动/修复阶段时候选会被压到个位数。保留温和过渡期的回踩股，
         # 最终仍由趋势结构、回踩位置、资金稳定和 Q1-Q3 再次确认。
@@ -6495,7 +6676,7 @@ def _strategy_market_policy(account, pick, quote, market):
         scale = market_light_scale(light, account["id"])
         return {
             "allowed": True, "risk_scale": scale, "state": "谨慎",
-            "reason": f"市场黄灯，{ACCOUNT_SPECS[account['id']]['entry_model_name']}按{scale*100:.0f}%仓位执行",
+            "reason": f"市场黄灯，{_spec_for(account['id']).get('entry_model_name') or account['id']}按{scale*100:.0f}%仓位执行",
         }
     if light == "unknown":
         return {"allowed": False, "risk_scale": 0.0, "state": "禁止", "reason": "市场数据未知"}
@@ -6568,10 +6749,74 @@ def _microstructure_soft_factor(account_id, evidence):
     return evidence, score, weight, detail
 
 
+def _dsl_entry_assessment(account_id, spec, pick, quote, decision, threshold_delta=0.0, market=None):
+    """声明式（DSL）策略的入场复核（PR-35）。
+
+    选股层已经用编译后的 DSL 在完整历史因子上做了布尔判定；这里不复述
+    规则，只复核执行域事实：通用六维护栏的硬否决、实时量价与资金方向。
+    全部字段来自注入的实时快照，缺失按中性/保守处理，绝不虚构证据。
+    """
+    pct = _num(quote.get("pct"), -999)
+    vol_ratio = _num(quote.get("vol_ratio"))
+    main_pct = _num(quote.get("main_pct"))
+    checks = []
+    blockers = [
+        reason for reason in (decision.get("hard_vetoes") or [])
+        if reason != "海外风险红灯"
+    ]
+    overheat = {"level": "normal", "score": 0.0, "pullback_confirmed": False}
+
+    def add(name, value, weight, detail):
+        checks.append({
+            "name": name, "score": round(_clip01(value), 3),
+            "weight": weight, "detail": detail,
+        })
+
+    add("声明式规则通过", 1.0, 0.55, "编译 DSL 规则在最新完整收盘因子上成立")
+    add("实时涨幅区间", 1.0 if -2.0 <= pct <= _num(spec.get("entry_pct_high"), 7.0) else 0.3,
+        0.20, f"实时涨幅 {pct:+.2f}%")
+    if vol_ratio is None:
+        add("实时量能", 1.0, 0.15, "量比缺失，按中性处理")
+    else:
+        add("实时量能", min(max(vol_ratio, 0.0) / 1.2, 1.5), 0.15, f"量比 {vol_ratio:.2f}")
+    if main_pct is None:
+        add("资金方向", 1.0, 0.10, "主力净流入缺失，按中性处理")
+    else:
+        add("资金方向", 1.0 if main_pct >= 0 else 0.2, 0.10, f"主力净流入占比 {main_pct:+.2f}%")
+    if pct <= -4.0:
+        blockers.append(f"实时跌幅 {pct:+.2f}% 触发声明式入场否决")
+    weight_total = sum(item["weight"] for item in checks) or 1.0
+    score = sum(item["score"] * item["weight"] for item in checks) / weight_total
+    threshold = max(0.45, min(0.85, 0.55 + threshold_delta))
+    passed = not blockers and score >= threshold
+    reasons = list(blockers)
+    if score < threshold:
+        reasons.append(f"{spec['entry_model_name']}评分 {score:.2f} 未达 {threshold:.2f}")
+    return {
+        "name": spec["entry_model_name"],
+        "risk_profile": spec["risk_profile"],
+        "risk_profile_name": RISK_PROFILES[spec["risk_profile"]]["name"],
+        "score": round(score, 3),
+        "threshold": round(threshold, 3),
+        "threshold_context": {"version": "dsl-entry-v1",
+                              "reason": "声明式规则门在选股层判定；执行层只复核量价/资金/硬否决"},
+        "passed": passed,
+        "checks": checks,
+        "blockers": blockers,
+        "reasons": reasons,
+        "overheat_guard": overheat,
+        "microstructure": None,
+        "timing_mode": "声明式规则确认",
+        "position_scale": 1.0,
+        "entry_tranche_scale": 1.0,
+        "execution_mode": "声明式 DSL 入场",
+    }
+
+
 def _strategy_entry_assessment(account, pick, quote, kline, decision, threshold_delta=0.0, market=None):
     """按各模拟盘账户各自的独立模型复核入场。"""
     account_id = account["id"]
-    spec = ACCOUNT_SPECS[account_id]
+    spec = _spec_for(account_id)
     pct = _num(quote.get("pct"), -999)
     vol_ratio = _num(quote.get("vol_ratio"))
     main_pct = _num(quote.get("main_pct"))
@@ -6597,6 +6842,13 @@ def _strategy_entry_assessment(account, pick, quote, kline, decision, threshold_
     microstructure, micro_score, micro_weight, micro_detail = _microstructure_soft_factor(
         account_id, pick.get("microstructure")
     )
+
+    if spec.get("selection_mode") == "dsl":
+        # PR-35：声明式策略走专属入场复核，不再落入板块热度通用分支。
+        return _dsl_entry_assessment(
+            account_id, spec, pick, quote, decision,
+            threshold_delta=threshold_delta, market=market,
+        )
 
     if account_id == "tq_breakout":
         limit_pct = _limit_pct(pick.get("code"))
@@ -8711,7 +8963,7 @@ def _buy_order(conn, account, signal, quote, market, news, asof_day, *, all_quot
     risk["dynamic_news_risk"] = dynamic_news
     signal_close = _num(signal.get("close_price"), 0)
     gap = price / signal_close - 1 if signal_close > 0 and price > 0 else None
-    spec = ACCOUNT_SPECS[account["id"]]
+    spec = _spec_for(account["id"])
     if gap is None:
         reasons.append("缺少有效收盘价，无法计算跳空")
     elif not (spec["gap_q2"][0] <= gap <= spec["gap_q2"][1]):
@@ -11071,7 +11323,7 @@ def _rotation_buy_candidate(conn, account, replacement, quote, market, news, aso
 def _sell_plan(position, quote, asof_day, news, hard_stop_touched_today=False, spec_override=None):
     # PR-30：spec_override 允许调用方传入"ACCOUNT_SPECS × 编译画像"的生效参数
     # （hard_stop/trail/hold_max 取更紧）；未传时保持原有行为。
-    spec = dict(ACCOUNT_SPECS[position["account_id"]])
+    spec = dict(_spec_for(position["account_id"]))
     if spec_override:
         spec.update(spec_override)
     price = _num(quote.get("price"), 0)
@@ -13268,7 +13520,7 @@ def _live_scan_gate(live_universe, expected_day):
     live_codes = {str(row.get("code") or "") for row in (live_universe or [])}
     covered = eligible & live_codes
     coverage = len(covered) / max(len(eligible), 1)
-    required = max(4000, int(len(eligible) * 0.90 + 0.9999))
+    required = max(LIVE_SCAN_GATE_MIN_ROWS, int(len(eligible) * 0.90 + 0.9999))
     return {
         "ready": len(covered) >= required and coverage >= 0.90,
         "eligible_codes": len(eligible),
@@ -15669,7 +15921,19 @@ def _create_cycle(conn, capital, status="paused", reason="新建模拟周期", d
     cycle_id = cursor.lastrowid
     benchmark = _benchmark_close()
     account_share = capital / max(len(enabled_strategies), 1)
-    for account_id, spec in ACTIVE_ACCOUNT_SPECS.items():
+    # PR-35：参与主体 = 内置五套 ∪ 启用集合中的用户策略。用户策略缺行时
+    # 现场开户（ activating 后未跑 init_db 的进程内路径），避免静默漏扫。
+    cycle_user_ids = {
+        strategy_id for strategy_id in enabled_strategies if strategy_id not in ACCOUNT_SPECS
+    }
+    for user_id in cycle_user_ids:
+        if not conn.execute("SELECT 1 FROM paper_accounts WHERE id=?", (user_id,)).fetchone():
+            _ensure_user_strategy_accounts(conn)
+            break
+    for account_id in tuple(ACTIVE_ACCOUNT_SPECS) + tuple(sorted(cycle_user_ids)):
+        spec = ACCOUNT_SPECS.get(account_id)
+        if spec is None:
+            spec = _spec_for(account_id, conn=conn)
         if account_id not in enabled_strategies:
             conn.execute(
                 "UPDATE paper_accounts SET cycle_id=NULL,status='paused',initial_cash=0,cash=0,updated_at=? WHERE id=?",
