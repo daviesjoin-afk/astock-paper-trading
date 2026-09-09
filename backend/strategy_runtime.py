@@ -161,18 +161,44 @@ def apply_parameter_adjustments(
     evidence_count: int | None,
     actor: str = "self_evolution",
     change_note: str = "self evolution strategy parameter adjustment",
+    challenger_win: bool = False,
 ) -> dict[str, Any]:
     """Version one strategy after a schema-validated parameter-only change.
 
     ``StrategyParameterSchema`` owns all validation.  This function intentionally
     has no replacement-AST argument, so the only mutable bytes are declared
     parameter ``value`` fields inside the already pinned strategy definition.
+
+    PR-33：任何带风险方向的参数变化都必须先过非对称风险门——收紧快速放行，
+    放大需要证据 + 观察期 + 单轮上限 + Challenger 胜出。AI/自进化路径默认
+    ``challenger_win=False``，因此**只能收紧**。
     """
+    import asymmetric_risk as AR
+
     context = get_context(conn, strategy_id)
     if not context.evolution_control.enabled:
         raise ValueError("strategy evolution is disabled for this lifecycle state")
     if context.compiled_dsl is None:
         raise ValueError("strategy has no executable DSL parameter schema")
+    by_id = {item.parameter_id: item for item in context.parameter_schema.parameters}
+    gate = AR.evaluate_risk_adjustments(
+        conn, strategy_id,
+        [
+            {
+                "key": parameter_id,
+                "old": by_id[parameter_id].value if parameter_id in by_id else None,
+                "new": candidate,
+                "direction": by_id[parameter_id].risk_direction if parameter_id in by_id else None,
+            }
+            for parameter_id, candidate in dict(adjustments or {}).items()
+            if by_id.get(parameter_id) is not None
+        ],
+        evidence_count=evidence_count,
+        challenger_win=challenger_win,
+        actor=actor,
+    )
+    if not gate["allowed"]:
+        raise ValueError("；".join(gate["violations"]))
     applied = context.parameter_schema.apply(
         context.compiled_dsl, adjustments, evidence_count=evidence_count,
     )
@@ -184,10 +210,15 @@ def apply_parameter_adjustments(
     version = SR.save_definition(
         conn, strategy_id, {"dsl_ast": applied.dsl_ast},
         expected_version=context.version, actor=actor, change_note=change_note,
+        risk_evidence=evidence_count, challenger_win=challenger_win,
     )
     clear_cache()
+    # 放大真正落到生产参数后，把观察提案标记为 promoted（生命周期闭环）。
+    for expansion in gate["expansions"]:
+        AR.promote_proposal(conn, strategy_id, expansion["key"], expansion["new"], actor=actor)
     return {
         "adjusted": True, "strategy_id": strategy_id, "version": version.version,
         "checksum": version.checksum, "changed": applied.changed,
         "structure_checksum": applied.structure_checksum,
+        "risk_gate": gate,
     }
