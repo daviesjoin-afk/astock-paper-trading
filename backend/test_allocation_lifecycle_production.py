@@ -8,7 +8,6 @@
 3. ``_allocation_plan`` 与 ``_strategy_pool_budget`` 的阶段/系数必须一致
    ——执行路径与 explainability 不允许各算各的。
 """
-import contextlib
 import dataclasses
 import os
 import tempfile

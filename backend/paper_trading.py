@@ -8862,15 +8862,6 @@ def _buy_order(conn, account, signal, quote, market, news, asof_day, *, all_quot
         deployment = None
     if deployment is not None:
         risk["capital_deployment"] = deployment
-        sizing["capital_deployment"] = {
-            "lifecycle_stage": deployment.get("lifecycle_stage"),
-            "capital_scale": deployment.get("capital_scale"),
-            "raw_allowance_amount": deployment.get("raw_allowance_amount"),
-            "deployable_amount": deployment.get("deployable_amount"),
-            "waiting_capital": deployment.get("waiting_capital"),
-            "lots": deployment.get("lots"),
-            "allowed": bool(deployment.get("allowed")),
-        }
     # The strategy budget has already applied the current market light to its
     # remaining amount.  Only independent model/chase/news adjustments belong
     # here; _entry_execution_scale restores a market multiplier only for
@@ -9061,6 +9052,16 @@ def _buy_order(conn, account, signal, quote, market, news, asof_day, *, all_quot
                 sizing["symbol_headroom_clamped_qty"] = qty
     # PR-26：最终数量不得超过正式部署计划给出的可部署手数（生命周期缩放
     # 后的整手规模）。权重再高，试点策略也只能部署它那一份缩水预算。
+    if deployment is not None:
+        sizing["capital_deployment"] = {
+            "lifecycle_stage": deployment.get("lifecycle_stage"),
+            "capital_scale": deployment.get("capital_scale"),
+            "raw_allowance_amount": deployment.get("raw_allowance_amount"),
+            "deployable_amount": deployment.get("deployable_amount"),
+            "waiting_capital": deployment.get("waiting_capital"),
+            "lots": deployment.get("lots"),
+            "allowed": bool(deployment.get("allowed")),
+        }
     if deployment is not None and deployment.get("allowed") and fill_price > 0:
         max_qty = int(_num(deployment.get("lots"))) * LOT_SIZE
         if max_qty < qty:
