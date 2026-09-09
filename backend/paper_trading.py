@@ -945,6 +945,34 @@ def _active_account_ids(conn, status=None):
     return [row["id"] for row in _active_account_rows(conn, status=status)]
 
 
+def _risk_exit_account_ids(conn, status="running"):
+    """PR-36：风控退出必须覆盖“仍有持仓但已退出当前周期”的账户。
+
+    策略 paused/retiring/archived 后 supports_new_cycle=0，账户不再出现在
+    _active_account_clause 的名单里；但已有 T+1 持仓仍必须被继续扫描到
+    安全清仓为止——否则归档等于把存量持仓变成无人风控的孤儿敞口。
+    """
+    ids = set(_active_account_ids(conn, status=status))
+    holding = conn.execute(
+        "SELECT DISTINCT account_id FROM paper_position_lots WHERE remaining_qty>0"
+    ).fetchall()
+    ids.update(str(row[0]) for row in holding if row[0])
+    return ids
+
+
+def _accounts_by_id(conn, account_ids):
+    """按 id 取账户行（含已退出当前周期、但仍 running 的账户）。"""
+    ids = sorted({str(a) for a in account_ids or () if a})
+    if not ids:
+        return []
+    placeholders = ",".join("?" for _ in ids)
+    return _rows(
+        conn,
+        f"SELECT * FROM paper_accounts WHERE id IN ({placeholders}) AND status=?",
+        (*ids, "running"),
+    )
+
+
 def _active_cycle_filter(conn, cycle_id, column="id"):
     """Scope a cycle to all active sleeves once the active set is complete.
 
@@ -11478,8 +11506,8 @@ def _monitor_risk_impl(asof_date=None):
         }))
     manual_orders = []
     with _db() as snapshot_conn:
-        running_ids = set(_active_account_ids(snapshot_conn, status="running"))
-        positions = [p for p in _position_rows(snapshot_conn, asof_day=day) if p["account_id"] in running_ids]
+        risk_ids = _risk_exit_account_ids(snapshot_conn)
+        positions = [p for p in _position_rows(snapshot_conn, asof_day=day) if p["account_id"] in risk_ids]
         market_context = _cached_close_market(snapshot_conn, day, allow_network=False)
         retry_placeholders = ",".join("?" for _ in ENTRY_RETRY_SIGNAL_STATUSES)
         candidate_rows = snapshot_conn.execute(
@@ -11513,11 +11541,11 @@ def _monitor_risk_impl(asof_date=None):
             _audit(conn, None, "risk_scan_state", _json({"scan_minute": scan_minute, "status": "completed", "finished_at": _now()}))
         return result
     with _db(immediate=True) as conn:
-        running_ids = set(_active_account_ids(conn, status="running"))
-        positions = [p for p in _position_rows(conn, asof_day=day) if p["account_id"] in running_ids]
+        risk_ids = _risk_exit_account_ids(conn)
+        positions = [p for p in _position_rows(conn, asof_day=day) if p["account_id"] in risk_ids]
         cycle = _active_cycle(conn)
         account_map = {
-            row["id"]: row for row in _active_account_rows(conn, status="running")
+            row["id"]: row for row in _accounts_by_id(conn, risk_ids)
         }
         _, pool_market_value, pool_nav, _, _ = _shared_account_exposure(conn, quote_map, day)
         held_by_account = {}
