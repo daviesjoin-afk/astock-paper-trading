@@ -99,6 +99,8 @@ def _value(node: Mapping[str, Any], snapshot: Mapping[str, Any], index: int) -> 
     op = node["op"]
     if op == "const":
         return float(node["value"])
+    if op == "parameter":
+        return float(node["value"])
     if op == "field":
         return _field(snapshot, node["name"], index)
     if op == "mul":
@@ -107,6 +109,11 @@ def _value(node: Mapping[str, Any], snapshot: Mapping[str, Any], index: int) -> 
     if op != "indicator":
         raise StrategyDslEvaluationError(f"{op} is not a scalar expression")
     name, window = node["name"], node["window"]
+    if isinstance(window, Mapping):
+        resolved = _value(window, snapshot, index)
+        if resolved is None or not resolved.is_integer():
+            return None
+        window = int(resolved)
     if name == "atr":
         return _atr(snapshot, index, window)
     source = _series(snapshot, "volume" if name == "volume_mean" else "close")
@@ -164,4 +171,6 @@ def evaluate(ast: Mapping[str, Any], factor_snapshot: Mapping[str, Any]) -> bool
     # Unknown data propagates through boolean composition and only becomes a
     # fail-closed False at the public boundary.  In particular, ``not`` may
     # never turn unavailable evidence into a trade signal.
+    if normalized.get("op") == "strategy":
+        normalized = normalized["rule"]
     return _evaluate(normalized, factor_snapshot, -1) is True
