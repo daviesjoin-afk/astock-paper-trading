@@ -14,9 +14,13 @@ PR-10 把 TTL / batch / verification 作为订单审计字段引入，但具体�
   成交，而是等收盘前的批量窗口统一放行。窗口内到达的委托立即成交（不挂起）。
 - **人工核验（event）**：``pending_verification``。事件画像的委托先进入核验
   队列，由运营显式放行或驳回，未核验前不成交。
-- **TTL 清扫**：被挂起的委托都有 ``expires_at``。到期未放行的委托按画像
-  ``strict_ttl`` 决定终态作废还是放回重试管道——**默认放回重试管道**，
-  保证任何执行器故障都不会让一笔已经通过全部风控的候选永久丢失。
+- **TTL 清扫**：被挂起的委托都有 ``expires_at``。到期未放行的委托一律
+  终态作废（PR-29 单一归属语义：过期 order row 永远 terminal，绝不原地
+  改写成 ``execution_retry``）；``strict_ttl`` 画像与信号过期一并收敛，
+  非 strict 画像在信号仍新鲜时把信号送回复试管道，由下一轮扫描基于
+  Signal 重建新委托（新 id / 新 ``expires_at``，旧委托以
+  ``retry_of_order_id`` 保留审计血缘）——执行器故障不会让一笔已过风控
+  的候选永久丢失，但也绝不留下"活动/重试状态却已过期"的委托。
 
 被挂起的委托**不预占资金、不占用席位**（挂起发生在预占之前），所以批量
 等待不会削弱其它策略的可用额度。
@@ -60,7 +64,7 @@ __all__ = [
     "verification_queue",
 ]
 
-EXECUTION_DISPATCH_VERSION = "execution-dispatch-v1"
+EXECUTION_DISPATCH_VERSION = "execution-dispatch-v2"
 
 # 挂起状态：这两个状态都位于成交之前，不预占、不占席位。
 BATCH_HOLD_STATUS = "awaiting_batch"
@@ -448,32 +452,6 @@ def _release_reservation(conn, order_id) -> None:
         pass
 
 
-def _retire_retry_rows(conn, signal_id) -> int:
-    """让同一信号只保留一条重试委托，避免部分唯一索引冲突。"""
-    if signal_id is None:
-        return 0
-    try:
-        rows = conn.execute(
-            """SELECT id FROM paper_orders
-                WHERE signal_id=? AND side='buy' AND status=?
-                ORDER BY id""",
-            (int(signal_id), RETRY_ORDER_STATUS),
-        ).fetchall()
-    except sqlite3.Error:
-        return 0
-    for row in rows:
-        order_id = int(row["id"])
-        conn.execute(
-            """UPDATE paper_orders
-                  SET status='superseded',
-                      reason=COALESCE(reason,'') || '；执行器放行，旧重试委托已回收'
-                WHERE id=? AND status=?""",
-            (order_id, RETRY_ORDER_STATUS),
-        )
-        _release_reservation(conn, order_id)
-    return len(rows)
-
-
 def _signal_payload_from_row(row: Any) -> dict[str, Any]:
     import json
 
@@ -519,35 +497,92 @@ def _write_signal_marker(
         pass
 
 
-def _release_to_retry(
+def _signal_alive(conn, signal_id, *, now: dt.datetime) -> bool:
+    """信号是否仍新鲜（决定过期委托能否由信号重建新的委托尝试）。
+
+    PR-29 单一归属语义：只有 ``signal_freshness`` 判定 usable 的信号才允许
+    重新回到复试管道；过期/终态信号不再借尸还魂。
+    """
+    if signal_id is None:
+        return False
+    try:
+        row = conn.execute(
+            """SELECT created_at,intended_date,signal_date,status
+                 FROM paper_signals WHERE id=?""",
+            (int(signal_id),),
+        ).fetchone()
+    except sqlite3.Error:
+        return False
+    if row is None:
+        return False
+    if str(row["status"] or "") in TERMINAL_SIGNAL_STATUSES:
+        return False
+    try:
+        import entry_lifecycle as ELC
+
+        verdict = ELC.signal_freshness(
+            dict(row), now=now, asof_day=now.date().isoformat(),
+        )
+    except Exception:
+        return False
+    return bool(verdict.get("usable"))
+
+
+def _retire_for_retry(
     conn,
     row: Mapping[str, Any],
     reason: str,
     *,
     release_batch: bool = False,
     now: dt.datetime | None = None,
-) -> None:
-    """把挂起委托放回重试管道；信号回到 pending，下一轮扫描重跑全部闸门。
+) -> bool:
+    """把到期挂起委托收敛为终态 ``superseded``，由信号重建新委托（PR-29）。
 
-    ``release_batch`` 用于批量窗口到期放行：写入一次性放行标记，否则同一
-    信号在收工后仍会被同一轮转画像再次挂起，形成"到期→放行→再挂起"的循环。
+    单一归属语义（与 entry_lifecycle 合并）：
+
+    - **过期 order row 永远 terminal**——不允许把已经过期的委托改写成
+      ``execution_retry`` 继续占用活动/重试视图；
+    - 信号仍 fresh 时回到 ``pending``，下一轮扫描基于 Signal 创建新的
+      OrderIntent（新 order id / 新 ``expires_at``），并在新委托上通过
+      ``retry_of_order_id`` 保留完整审计血缘；
+    - 信号已过期/终态时一并收敛为 ``expired``，候选彻底终止。
+
+    ``release_batch`` 用于批量窗口到期放行：写入一次性放行标记，避免重建的
+    新委托在收工后被同一轮转画像再次挂起。
     """
+    moment = now or _now()
     order_id = int(row["id"])
     signal_id = row.get("signal_id")
-    _retire_retry_rows(conn, signal_id)
     conn.execute(
-        "UPDATE paper_orders SET status=?,reason=COALESCE(reason,'') || '；' || ? WHERE id=?",
-        (RETRY_ORDER_STATUS, reason, order_id),
+        """UPDATE paper_orders
+              SET status='superseded',
+                  reason=COALESCE(reason,'') || '；' || ?,cancelled_at=?
+            WHERE id=?""",
+        (reason, _iso(moment), order_id),
     )
-    if release_batch:
+    _release_reservation(conn, order_id)
+    if release_batch and signal_id is not None:
         _write_signal_marker(conn, signal_id, BATCH_RELEASE_PAYLOAD_KEY, {
             "released": True, "reason": reason,
-        }, now=now)
+        }, now=moment)
     if signal_id is not None:
-        conn.execute(
-            "UPDATE paper_signals SET status=?,reason=? WHERE id=?",
-            (RETRY_SIGNAL_STATUS, reason, int(signal_id)),
-        )
+        terminal = ",".join("?" for _ in TERMINAL_SIGNAL_STATUSES)
+        if _signal_alive(conn, signal_id, now=moment):
+            conn.execute(
+                f"""UPDATE paper_signals SET status=?,reason=?
+                     WHERE id=? AND status NOT IN ({terminal})""",
+                (RETRY_SIGNAL_STATUS, reason, int(signal_id),
+                 *TERMINAL_SIGNAL_STATUSES),
+            )
+        else:
+            conn.execute(
+                f"""UPDATE paper_signals SET status='expired',
+                         reason=COALESCE(reason,'') || '；' || ?
+                     WHERE id=? AND status NOT IN ({terminal})""",
+                (reason + "；信号已过有效期，一并失效", int(signal_id),
+                 *TERMINAL_SIGNAL_STATUSES),
+            )
+    return True
 
 
 def _terminate(
@@ -557,6 +592,7 @@ def _terminate(
     reason: str,
     *,
     terminal_signal: bool = True,
+    signal_status: str = "rejected",
 ) -> None:
     order_id = int(row["id"])
     _release_reservation(conn, order_id)
@@ -568,8 +604,8 @@ def _terminate(
     )
     if terminal_signal and row.get("signal_id") is not None:
         conn.execute(
-            "UPDATE paper_signals SET status='rejected',reason=? WHERE id=?",
-            (reason, int(row["signal_id"])),
+            "UPDATE paper_signals SET status=?,reason=? WHERE id=?",
+            (signal_status, reason, int(row["signal_id"])),
         )
 
 
@@ -602,11 +638,14 @@ def sweep_expired_gated_orders(
     now: dt.datetime | None = None,
     dispatch_settings: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """清扫到期/失效的挂起委托。
+    """清扫到期/失效的挂起委托（PR-29 单一归属 TTL 语义）。
 
     - 信号已进入终态 → 挂起委托回收（superseded）；
-    - 超过 ``expires_at`` → ``strict_ttl`` 画像终态作废，其余放回重试管道
-      （fail-open：执行器故障不会永久吞掉一笔已过风控的候选）。
+    - 超过 ``expires_at`` → **委托行一律终态**：``strict_ttl`` 画像作废
+      （expired），其余也作废（superseded）但信号仍新鲜时回到复试管道，
+      由下一轮扫描基于 Signal 创建新委托（新 id / 新 expires_at，旧委托以
+      ``retry_of_order_id`` 保留血缘）。**绝不把过期 order row 原地改写成
+      ``execution_retry``**——该状态只允许由成交路径为未过期尝试新建。
     """
     flags = settings(conn)
     if isinstance(dispatch_settings, Mapping):
@@ -646,12 +685,13 @@ def sweep_expired_gated_orders(
             _terminate(
                 conn, row, EXPIRED_ORDER_STATUS,
                 "严格时限画像到期未成交，委托作废",
+                signal_status="expired",
             )
             summary["expired"] += 1
         else:
-            _release_to_retry(
+            _retire_for_retry(
                 conn, row,
-                "执行器时限到期未撮合，自动放行并由下一轮扫描重新过闸",
+                "执行时限到期，挂起委托作废；信号仍新鲜时由下一轮重建新委托",
                 release_batch=True, now=moment,
             )
             summary["released"] += 1
@@ -771,9 +811,12 @@ def resolve_verification(
     }
     _write_signal_marker(conn, signal_id, VERIFICATION_PAYLOAD_KEY, decision, now=now)
     if approved:
-        _release_to_retry(
+        # PR-29：放行不是把挂起行原地改写为重试行，而是作废本次挂起尝试；
+        # 放行结论已写入信号 payload，下一轮由信号重建新委托（新 expires_at）。
+        _retire_for_retry(
             conn, record,
             f"人工核验放行（{decision['operator'] or '运营'}）：{note or '无备注'}",
+            now=now,
         )
     else:
         _terminate(
@@ -784,6 +827,7 @@ def resolve_verification(
         "ok": True,
         "order_id": int(order_id),
         "approved": bool(approved),
-        "status": RETRY_ORDER_STATUS if approved else CANCELLED_ORDER_STATUS,
+        "status": "released" if approved else CANCELLED_ORDER_STATUS,
+        "order_status": "superseded" if approved else CANCELLED_ORDER_STATUS,
         "version": EXECUTION_DISPATCH_VERSION,
     }
