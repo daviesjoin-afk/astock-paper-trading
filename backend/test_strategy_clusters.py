@@ -149,8 +149,13 @@ class AllocationExplainTests(unittest.TestCase):
     """PR-17：分配可解释性 API 的数据面。"""
 
     def test_expose_per_strategy_factors_budgets_and_waiting_reason(self):
+        import tempfile
+
         import paper_trading as paper
 
+        # 隔离：不碰 checkout 里的真实账本（init_db/席位分配版本会写库）。
+        tmp = tempfile.mkdtemp()
+        paper.DB_PATH = os.path.join(tmp, "paper_trading.sqlite3")
         data = paper.strategy_allocation_explain()
         self.assertEqual(5, len(data["strategies"]))
         for row in data["strategies"]:
