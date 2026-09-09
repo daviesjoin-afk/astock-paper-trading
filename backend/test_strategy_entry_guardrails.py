@@ -4,6 +4,7 @@ from __future__ import annotations
 import unittest
 
 import paper_trading as P
+import strategy_policies as SPOL
 
 
 def _decision():
@@ -66,7 +67,8 @@ class StrategyEntryGuardrailTests(unittest.TestCase):
         self.assertTrue(any("偏弱，不做趋势回踩" in item for item in result["blockers"]))
 
     def test_sector_downside_ladder_is_tighter_than_before(self):
-        policy = P.INTRADAY_DOWNSIDE_POLICIES["sector_rotation"]
+        # PR-37：ReviewPolicy 表迁移至 strategy_policies，值保持不变。
+        policy = SPOL.INTRADAY_DOWNSIDE_POLICIES["sector_rotation"]
         self.assertEqual(policy["warning_pct"], -2.2)
         self.assertEqual(policy["partial_pct"], -3.0)
         self.assertEqual(policy["full_pct"], -4.5)
