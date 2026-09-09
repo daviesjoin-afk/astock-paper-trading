@@ -495,6 +495,54 @@ def active_ids(*, conn=None, db_path=None):
     )
 
 
+def runtime_readiness(conn, strategy_id):
+    """Compile the four runtime contracts needed before a new cycle may use a strategy.
+
+    Built-ins retain their audited native implementation path while user
+    strategies must carry a valid executable DSL AST.  This is intentionally a
+    pure compilation gate: it does not place orders or mutate definitions.
+    """
+    spec = get(strategy_id, conn=conn)
+    if spec is None:
+        raise ValueError("unknown strategy id")
+    version = get_version(spec.id, conn=conn)
+    definition = version.definition if version else {}
+    dsl_ast = definition.get("dsl_ast")
+    checks = {"dsl_compiled": False, "fingerprint_valid": False,
+              "risk_profile_compiled": False, "execution_profile_compiled": False}
+    errors = []
+    try:
+        if dsl_ast is None:
+            if spec.origin != "builtin":
+                raise ValueError("user strategy requires a DSL AST")
+        else:
+            DSL.normalize(dsl_ast)
+        checks["dsl_compiled"] = True
+        from strategy_risk_fingerprint import compile_strategy_risk_fingerprint
+        fingerprint = compile_strategy_risk_fingerprint(dsl_ast, definition.get("metadata"))
+        checks["fingerprint_valid"] = True
+        from strategy_risk_profiles import compile_strategy_risk_profile
+        risk_profile = compile_strategy_risk_profile(fingerprint)
+        checks["risk_profile_compiled"] = True
+        from execution_profiles import execution_profile_for
+        execution_profile = execution_profile_for(fingerprint)
+        checks["execution_profile_compiled"] = True
+    except Exception as exc:
+        errors.append(str(exc))
+        fingerprint = risk_profile = execution_profile = None
+    return {
+        "strategy_id": spec.id,
+        "version": version.version if version else None,
+        "checksum": version.checksum if version else None,
+        "runtime_ready": not errors and all(checks.values()),
+        "checks": checks,
+        "errors": errors,
+        "fingerprint": fingerprint.to_dict() if fingerprint else None,
+        "risk_profile": risk_profile.to_dict() if risk_profile else None,
+        "execution_profile": execution_profile,
+    }
+
+
 def statuses(*, conn=None, db_path=None):
     return {spec.id: spec.status for spec in list_definitions(conn=conn, db_path=db_path)}
 
@@ -721,7 +769,10 @@ def transition(conn, strategy_id, to_status, *, reason="", actor="system",
     if to_status not in _TRANSITIONS[current.status]:
         raise ValueError(f"invalid lifecycle transition: {current.status} -> {to_status}")
     now = _now()
-    supports_new_cycle = int(to_status == "active" and current.origin == "builtin")
+    readiness = runtime_readiness(conn, current.id) if to_status == "active" else None
+    if to_status == "active" and not readiness["runtime_ready"]:
+        raise ValueError("strategy runtime is not ready: " + "; ".join(readiness["errors"]))
+    supports_new_cycle = int(to_status == "active" and readiness["runtime_ready"])
     cursor = conn.execute(
         """UPDATE strategy_definitions
            SET lifecycle_status=?,supports_new_cycle=?,updated_at=?
@@ -738,6 +789,66 @@ def transition(conn, strategy_id, to_status, *, reason="", actor="system",
          str(actor or "system"), now),
     )
     return get(current.id, conn=conn)
+
+
+def archive_definition(conn, strategy_id, *, reason="", actor="system"):
+    """Move a definition through legal lifecycle edges until archived."""
+    current = get(strategy_id, conn=conn)
+    if current is None:
+        raise ValueError("unknown strategy id")
+    while current.status != "archived":
+        target = {"active": "retiring", "paused": "retiring", "retiring": "archived",
+                  "draft": "archived", "validated": "archived"}.get(current.status)
+        if target is None:
+            raise ValueError("strategy cannot be archived")
+        current = transition(conn, current.id, target, reason=reason, actor=actor,
+                             expected_status=current.status)
+    return current
+
+
+def _table_columns(conn, table):
+    return {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+
+
+def _historical_reference_exists(conn, strategy_id):
+    tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    for table in ("paper_accounts", "paper_signals", "paper_signals_archive", "paper_orders",
+                  "paper_orders_archive", "paper_risk_decisions", "paper_audit",
+                  "paper_cycle_strategy_versions", "paper_strategy_legacy_bindings"):
+        if table not in tables:
+            continue
+        columns = _table_columns(conn, table)
+        column = "strategy_id" if "strategy_id" in columns else "account_id" if "account_id" in columns else None
+        if column and conn.execute(f"SELECT 1 FROM {table} WHERE {column}=? LIMIT 1", (strategy_id,)).fetchone():
+            return True
+    return False
+
+
+def hard_delete_unused_draft(conn, strategy_id):
+    """Physically delete only an unused user draft and its private v1 snapshot."""
+    ensure_schema(conn)
+    spec = get(strategy_id, conn=conn)
+    if spec is None:
+        raise ValueError("unknown strategy id")
+    if spec.origin != "user" or spec.status != "draft":
+        raise ValueError("only unused user drafts can be hard-deleted")
+    if _historical_reference_exists(conn, spec.id):
+        raise ValueError("strategy has historical references and must be archived")
+    conn.execute("DELETE FROM strategy_definition_events WHERE strategy_id=?", (spec.id,))
+    conn.execute("DELETE FROM paper_strategy_version_heads WHERE strategy_id=?", (spec.id,))
+    # The immutable-version trigger protects all retained history.  A draft
+    # with no ledger/cycle references is the deliberate exception.
+    conn.execute("DROP TRIGGER IF EXISTS trg_strategy_versions_no_delete")
+    try:
+        conn.execute("DELETE FROM paper_strategy_versions WHERE strategy_id=?", (spec.id,))
+    finally:
+        conn.execute(
+            """CREATE TRIGGER IF NOT EXISTS trg_strategy_versions_no_delete
+               BEFORE DELETE ON paper_strategy_versions
+               BEGIN SELECT RAISE(ABORT, 'strategy versions are immutable'); END"""
+        )
+    conn.execute("DELETE FROM strategy_definitions WHERE id=?", (spec.id,))
+    return {"strategy_id": spec.id, "deleted": True}
 
 
 def lifecycle_events(conn, strategy_id):
