@@ -64,41 +64,69 @@ _ARCHETYPE_TO_TEMPLATE = {
 
 # All values are strategy-level defaults.  Execution-time system safeguards do
 # not appear in these payloads, so there is no accidental control-plane path.
+#
+# PR-30（接生产）：模板补齐执行域软风险参数，成为生产 sizing/止损/持仓/加仓
+# 的策略层来源——
+# - soft_limits：风险预算与仓位/敞口帽（risk_per_trade=单笔止损预算占 NAV、
+#   max_industry=行业聚合敞口帽）；
+# - evolvable_params：纪律类参数（hard_stop=固定止损深度、trail_after/trail_stop=
+#   移动止损、holding_days=时间止损、max_pyramiding=单笔持仓累计确认加仓上限）。
+# System hard rules（T+1、证券范围、stale quote、全局 pool exposure、系统
+# drawdown）仍由 paper_trading_rules 全局拥有，任何模板/锁定都不能触达。
 _TEMPLATES = {
     "Momentum": {
         "hard_rules": {"signal_confirmation": "realtime", "entry_evidence": "price_and_volume"},
-        "soft_limits": {"max_positions": 3, "max_weight": 0.30, "max_exposure": 0.88},
-        "evolvable_params": {"entry_score": 0.76, "trail_after": 0.04, "trail_stop": 0.05},
+        "soft_limits": {"max_positions": 3, "max_weight": 0.30, "max_exposure": 0.88,
+                        "max_industry": 0.42, "risk_per_trade": 0.012},
+        "evolvable_params": {"entry_score": 0.76, "trail_after": 0.04, "trail_stop": 0.05,
+                             "hard_stop": -0.05, "holding_days": 8, "max_pyramiding": 0},
     },
     "Trend": {
         "hard_rules": {"signal_confirmation": "daily_close", "entry_evidence": "trend_and_pullback"},
-        "soft_limits": {"max_positions": 4, "max_weight": 0.28, "max_exposure": 0.85},
-        "evolvable_params": {"entry_score": 0.72, "holding_days": 10, "trail_stop": 0.06},
+        "soft_limits": {"max_positions": 4, "max_weight": 0.28, "max_exposure": 0.85,
+                        "max_industry": 0.45, "risk_per_trade": 0.012},
+        "evolvable_params": {"entry_score": 0.72, "holding_days": 10, "trail_stop": 0.06,
+                             "hard_stop": -0.04, "trail_after": 0.05, "max_pyramiding": 2},
     },
     "MeanReversion": {
         "hard_rules": {"signal_confirmation": "daily_close", "entry_evidence": "oversold_and_reversal"},
-        "soft_limits": {"max_positions": 4, "max_weight": 0.24, "max_exposure": 0.75},
-        "evolvable_params": {"entry_score": 0.70, "holding_days": 8, "take_profit_target": 0.06},
+        "soft_limits": {"max_positions": 4, "max_weight": 0.24, "max_exposure": 0.75,
+                        "max_industry": 0.38, "risk_per_trade": 0.010},
+        "evolvable_params": {"entry_score": 0.70, "holding_days": 8, "take_profit_target": 0.06,
+                             "hard_stop": -0.045, "trail_after": 0.04, "trail_stop": 0.05,
+                             "max_pyramiding": 1},
     },
     "Rotation": {
         "hard_rules": {"signal_confirmation": "sector_relative_strength", "entry_evidence": "sector_and_stock"},
-        "soft_limits": {"max_positions": 3, "max_weight": 0.30, "max_exposure": 0.82},
-        "evolvable_params": {"entry_score": 0.74, "holding_days": 7, "sector_breadth_min": 0.55},
+        "soft_limits": {"max_positions": 3, "max_weight": 0.30, "max_exposure": 0.82,
+                        "max_industry": 0.42, "risk_per_trade": 0.012},
+        "evolvable_params": {"entry_score": 0.74, "holding_days": 7, "sector_breadth_min": 0.55,
+                             "hard_stop": -0.055, "trail_after": 0.05, "trail_stop": 0.06,
+                             "max_pyramiding": 2},
     },
     "Event": {
         "hard_rules": {"signal_confirmation": "disclosed_event", "entry_evidence": "event_and_price"},
-        "soft_limits": {"max_positions": 3, "max_weight": 0.26, "max_exposure": 0.72},
-        "evolvable_params": {"entry_score": 0.75, "holding_days": 5, "event_decay_days": 3},
+        "soft_limits": {"max_positions": 3, "max_weight": 0.26, "max_exposure": 0.72,
+                        "max_industry": 0.40, "risk_per_trade": 0.011},
+        "evolvable_params": {"entry_score": 0.75, "holding_days": 5, "event_decay_days": 3,
+                             "hard_stop": -0.045, "trail_after": 0.04, "trail_stop": 0.05,
+                             "max_pyramiding": 1},
     },
     "Flow": {
         "hard_rules": {"signal_confirmation": "realtime", "entry_evidence": "flow_persistence"},
-        "soft_limits": {"max_positions": 3, "max_weight": 0.28, "max_exposure": 0.80},
-        "evolvable_params": {"entry_score": 0.76, "flow_min": 0.65, "confirmation_window": 3},
+        "soft_limits": {"max_positions": 3, "max_weight": 0.28, "max_exposure": 0.80,
+                        "max_industry": 0.42, "risk_per_trade": 0.012},
+        "evolvable_params": {"entry_score": 0.76, "flow_min": 0.65, "confirmation_window": 3,
+                             "hard_stop": -0.05, "trail_after": 0.04, "trail_stop": 0.05,
+                             "holding_days": 5, "max_pyramiding": 0},
     },
     "Composite": {
         "hard_rules": {"signal_confirmation": "independent_evidence", "entry_evidence": "two_or_more_factors"},
-        "soft_limits": {"max_positions": 3, "max_weight": 0.22, "max_exposure": 0.65},
-        "evolvable_params": {"entry_score": 0.78, "holding_days": 5, "confirmation_window": 2},
+        "soft_limits": {"max_positions": 3, "max_weight": 0.22, "max_exposure": 0.65,
+                        "max_industry": 0.30, "risk_per_trade": 0.008},
+        "evolvable_params": {"entry_score": 0.78, "holding_days": 5, "confirmation_window": 2,
+                             "hard_stop": -0.04, "trail_after": 0.03, "trail_stop": 0.04,
+                             "max_pyramiding": 0},
     },
 }
 

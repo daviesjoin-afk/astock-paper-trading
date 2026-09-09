@@ -47,6 +47,7 @@ import paper_sizing as PSZ
 import order_intent as OI
 import strategy_registry as SR
 import strategy_runtime as SRT
+import strategy_risk_enforcement as SRE
 import runtime_settings as RSET
 from market_policy import market_light_scale, market_light_scales
 from paper_trading_rules import (
@@ -2917,7 +2918,7 @@ def _shared_account_exposure(conn, quotes, asof_day=None):
 
 def _shared_risk_state(conn, account, nav, asof_day):
     """Apply each strategy's risk profile to the same pool-level NAV path."""
-    profile = _risk_profile(account)
+    profile = _risk_profile(account, conn=conn)
     day = _date(asof_day).isoformat()
     # P3 审计修复（R3）：按当前周期过滤——归档时 paper_nav 全表删除前
     # 无影响，但未来多周期并存时未过滤会把其他周期的净值混入熔断基线。
@@ -7488,7 +7489,7 @@ def _runtime_parameter_active(effective_date=None, asof_day=None, status=None):
     return bool(effective and effective <= target_day.isoformat())
 
 
-def _risk_profile(account, asof_day=None):
+def _risk_profile(account, asof_day=None, conn=None):
     account_id = account.get("id")
     default_key = (ACCOUNT_SPECS.get(account_id) or {}).get("risk_profile", "trend")
     profile = dict(RISK_PROFILES.get(account.get("risk_profile"), RISK_PROFILES[default_key]))
@@ -7511,6 +7512,12 @@ def _risk_profile(account, asof_day=None):
             profile[key] = int(round(value)) if key == "cooldown_days" else round(value, 6)
         profile["adaptive_version"] = meta.get("version")
         profile["adaptive_candidate_id"] = meta.get("candidate_id")
+    # PR-30：编译策略风险画像接生产。帽类/纪律类参数按"画像只能收紧"融合；
+    # 解析失败 fail-closed 回落 Composite 最保守模板，绝不因解析失败而放宽。
+    if conn is not None:
+        compiled = SRE.compiled_profile_for(conn, account_id)
+        profile, compiled_audit = SRE.tighten_caps(profile, compiled)
+        profile["compiled_risk_profile"] = compiled_audit
     return profile
 
 
@@ -7937,7 +7944,7 @@ def _pool_allocation_inputs(conn, account, nav, positions, quotes, market=None,
     values = {row.get("id"): 0.0 for row in rows if row.get("id")}
     if account is not None and account.get("id") not in values:
         account_id = account.get("id")
-        profiles[account_id] = _risk_profile(account)
+        profiles[account_id] = _risk_profile(account, conn=conn)
         weights[account_id] = max(_num(profiles[account_id].get("max_exposure"), 0.0), 0.01)
         values[account_id] = 0.0
     for position in positions or []:
@@ -8167,7 +8174,7 @@ def _entry_score_delta(account, asof_day=None):
 
 def _account_risk_state(conn, account, nav, asof_day):
     """账户级熔断：达到阈值只禁止新开仓，卖出风控仍会继续。"""
-    profile = _risk_profile(account)
+    profile = _risk_profile(account, conn=conn)
     day = _date(asof_day).isoformat()
     start_nav = _num(account.get("daily_start_nav"), 0)
     if account.get("daily_nav_date") != day or start_nav <= 0:
@@ -8947,7 +8954,7 @@ def _buy_order(conn, account, signal, quote, market, news, asof_day, *, all_quot
     risk["account_risk"] = risk_state
     if risk_state["blocked"]:
         reasons.extend(risk_state["reasons"])
-    profile = _risk_profile(account)
+    profile = _risk_profile(account, conn=conn)
     code_value = code_values.get(code, 0.0)
     # 组合口径（PR：cross-strategy exposure）：单票占用必须包含**所有策略**
     # 的在途买单，否则两个策略同时买入同一标的会各自只看到已成交部分，
@@ -8996,9 +9003,15 @@ def _buy_order(conn, account, signal, quote, market, news, asof_day, *, all_quot
     # industry concentration, stop distance and entry quality below.
     exposure_cap = RSET.get(conn, "shared_pool_exposure_cap", SHARED_POOL_MAX_EXPOSURE)
     single_position_max_amount = RSET.get(conn, "single_position_max_amount", 0.0)
+    # PR-30：生效执行参数 = ACCOUNT_SPECS × 编译画像（止损/移动止损/持仓/加仓取更紧）。
+    eff_spec = SRE.effective_spec(conn, account["id"], ACCOUNT_SPECS.get(account["id"]) or {})
+    risk["effective_spec"] = {
+        key: eff_spec.get(key)
+        for key in ("hard_stop", "trail_after", "trail_stop", "hold_max", "max_positions", "max_pyramiding")
+    }
     qty, sizing = _price_aware_qty(
         nav, shared_cash, position_value, industry_value, code_value,
-        fill_price, ACCOUNT_SPECS[account["id"]]["hard_stop"], profile,
+        fill_price, eff_spec["hard_stop"], profile,
         exposure_cap=exposure_cap, max_exposure_cap=exposure_cap, exposure_scale=risk_scale,
         strategy_position_value=strategy_budget["current_amount"],
         strategy_cap_amount=strategy_budget["absolute_cap_amount"],
@@ -9169,6 +9182,33 @@ def _buy_order(conn, account, signal, quote, market, news, asof_day, *, all_quot
             if headroom_qty < qty:
                 qty = max(0, headroom_qty)
                 sizing["symbol_headroom_clamped_qty"] = qty
+    # PR-30 主题（theme）聚合统一检查（可选）：0 = 关闭。与 symbol 聚合同一
+    # 套协调器口径（PCO.aggregate_exposure / theme_for），主题敞口 = 组内
+    # 各行业持仓 + 在途合计，新买入同样不允许"略微超限"成交。
+    theme_aggregate_cap_pct = _num(RSET.get(conn, "theme_aggregate_cap_pct", 0.0))
+    if theme_aggregate_cap_pct > 0:
+        aggregate = PCO.aggregate_exposure(
+            positions, all_quotes or {}, pending_by_symbol=pending_by_symbol,
+        )
+        theme = PCO.theme_for(signal.get("industry"))
+        theme_value = (aggregate.get("by_theme") or {}).get(theme, 0.0)
+        theme_cap_amount = nav * theme_aggregate_cap_pct / 100.0
+        proposed = qty * fill_price
+        risk["theme_aggregate_check"] = {
+            "theme": theme, "current_amount": round(theme_value, 2),
+            "proposed_amount": round(proposed, 2),
+            "cap_amount": round(theme_cap_amount, 2),
+        }
+        if theme_value + proposed > theme_cap_amount:
+            headroom_amount = max(0.0, theme_cap_amount - theme_value)
+            headroom_qty = (
+                int(headroom_amount / fill_price // LOT_SIZE) * LOT_SIZE
+                if fill_price > 0 and headroom_amount > 0 else 0
+            )
+            if headroom_qty < qty:
+                qty = max(0, headroom_qty)
+                sizing["theme_headroom_clamped_qty"] = qty
+                risk["theme_aggregate_check"]["clamped"] = True
     # PR-26：最终数量不得超过正式部署计划给出的可部署手数（生命周期缩放
     # 后的整手规模）。权重再高，试点策略也只能部署它那一份缩水预算。
     if deployment is not None:
@@ -11018,8 +11058,12 @@ def _rotation_buy_candidate(conn, account, replacement, quote, market, news, aso
     return result
 
 
-def _sell_plan(position, quote, asof_day, news, hard_stop_touched_today=False):
-    spec = ACCOUNT_SPECS[position["account_id"]]
+def _sell_plan(position, quote, asof_day, news, hard_stop_touched_today=False, spec_override=None):
+    # PR-30：spec_override 允许调用方传入"ACCOUNT_SPECS × 编译画像"的生效参数
+    # （hard_stop/trail/hold_max 取更紧）；未传时保持原有行为。
+    spec = dict(ACCOUNT_SPECS[position["account_id"]])
+    if spec_override:
+        spec.update(spec_override)
     price = _num(quote.get("price"), 0)
     cost = _num(position["cost"], 0)
     # 与盘中守护同口径：峰值吸收当日 high，回撤不被 3 分钟采样间隙低估；
@@ -11372,6 +11416,11 @@ def _monitor_risk_impl(asof_date=None):
             ).fetchone())
             ratio, reason, next_stage, detail = _sell_plan(
                 position, quote, day, news, hard_stop_touched_today=hard_stop_touched_today,
+                # PR-30：卖出状态机的止损/移动止损/时间止损用编译画像收紧后的生效参数。
+                spec_override=SRE.effective_spec(
+                    conn, position["account_id"],
+                    ACCOUNT_SPECS.get(position["account_id"]) or {},
+                ),
             )
             quality_action, quality_reason = _concentration_action(
                 quality_review, position, quote_status, concentration_sells_used,
@@ -12835,7 +12884,9 @@ def _intraday_buyback(conn, account, position, quote, market, asof_day, profile,
     code_value = code_values.get(position["code"], 0.0)
     qty, sizing = _price_aware_qty(
         nav, shared_cash, value, industries.get(position.get("industry") or "未知", 0.0),
-        code_value, price * (1 + SLIPPAGE), ACCOUNT_SPECS[account["id"]]["hard_stop"], profile,
+        code_value, price * (1 + SLIPPAGE),
+        SRE.effective_spec(conn, account["id"], ACCOUNT_SPECS.get(account["id"]) or {})["hard_stop"],
+        profile,
         exposure_cap=RSET.get(conn, "shared_pool_exposure_cap", SHARED_POOL_MAX_EXPOSURE),
         max_exposure_cap=RSET.get(conn, "shared_pool_exposure_cap", SHARED_POOL_MAX_EXPOSURE),
         strategy_position_value=strategy_budget["current_amount"],
@@ -12933,6 +12984,21 @@ def _swing_scale_in(conn, account, position, quote, market, asof_day, profile, c
         return None, addition_reason
     if _intraday_action_today(conn, cycle["id"], account["id"], position["code"], "swing_scale_in", asof_day):
         return None, "本标的今日已完成确认加仓"
+    # PR-30：加仓上限（pyramiding）来自编译风险画像（模板可收紧 ACCOUNT_SPECS）。
+    # 上限按"该持仓自建仓以来"的累计确认加仓次数计，0 = 不允许任何加仓。
+    _pyr_spec = SRE.effective_spec(conn, account["id"], ACCOUNT_SPECS.get(account["id"]) or {})
+    _max_pyr = int(_pyr_spec.get("max_pyramiding") if _pyr_spec.get("max_pyramiding") is not None else 2)
+    if _max_pyr <= 0:
+        return None, "编译风险画像不允许确认加仓（max_pyramiding=0）"
+    _pyr_used = conn.execute(
+        """SELECT COUNT(*) FROM paper_intraday_observations
+            WHERE cycle_id=? AND account_id=? AND code=? AND action='swing_scale_in'
+              AND substr(observed_at,1,10)>=?""",
+        (cycle["id"], account["id"], position["code"],
+         str(position.get("entry_date") or "")[:10] or "0000-01-01"),
+    ).fetchone()[0]
+    if _pyr_used >= _max_pyr:
+        return None, f"累计确认加仓 {_pyr_used} 次已达上限 {_max_pyr}（pyramiding cap）"
     if market.get("light") in ("red", "unknown"):
         return None, "市场门控不允许加仓"
     quote_status = _execution_quote_status(quote, asof_day)
@@ -12982,7 +13048,7 @@ def _swing_scale_in(conn, account, position, quote, market, asof_day, profile, c
     qty, sizing = _price_aware_qty(
         nav, shared_cash, position_value,
         industries.get(position.get("industry") or "未知", 0.0), code_value, fill,
-        ACCOUNT_SPECS[account_id]["hard_stop"], profile,
+        _pyr_spec["hard_stop"], profile,
         exposure_cap=RSET.get(conn, "shared_pool_exposure_cap", SHARED_POOL_MAX_EXPOSURE),
         max_exposure_cap=RSET.get(conn, "shared_pool_exposure_cap", SHARED_POOL_MAX_EXPOSURE),
         strategy_position_value=strategy_budget["current_amount"],
@@ -13107,7 +13173,7 @@ def monitor_opening_events(asof_date=None, event_clock=None):
                 continue
             quote = quotes.get(str(position["code"]), {})
             action, reason = _intraday_sell(
-                conn, account, position, quote, day, _risk_profile(account), cycle,
+                conn, account, position, quote, day, _risk_profile(account, conn=conn), cycle,
                 opening_event=True,
             )
             price = _num(quote.get("price"))
@@ -13599,7 +13665,7 @@ def monitor_intraday(asof_datetime=None, force=False):
             account = account_map[position["account_id"]]
             quote = quotes.get(position["code"], {})
             price = _num(quote.get("price"))
-            profile = _risk_profile(account)
+            profile = _risk_profile(account, conn=conn)
             risk_state = _shared_risk_state(conn, account, shared_nav, day)
             reason = "共享风控状态正常，等待策略专属事件或加仓条件"
             if account.get("mode") == "intraday_t":
@@ -14441,7 +14507,7 @@ def _account_metrics(conn, account, quotes=None, positions=None, metric_cache=No
     # Orphan accounts (removed from ACCOUNT_SPECS but still present in the
     # ledger) must not crash the whole dashboard.
     spec = ACCOUNT_SPECS.get(account["id"]) or {"entry_model_name": str(account.get("id") or "unknown")}
-    profile = _risk_profile(account)
+    profile = _risk_profile(account, conn=conn)
     if metric_cache is None:
         nav_row = conn.execute(
             "SELECT * FROM paper_nav WHERE account_id=? ORDER BY nav_date DESC LIMIT 1",
