@@ -35,6 +35,36 @@ _HIGH_RISK_KEYS = (
     ("hold_min", "最短持有天数", "fewer"),    # 持有更短 = 更激进
 )
 
+# 既有体系的风格别名 → 指纹关键词（strong/quality/main_force 等不被
+# compile_strategy_risk_fingerprint 识别，需先归一化）。
+_STYLE_ALIASES = {
+    "strong": "breakout 突破",
+    "pullback": "trend pullback 趋势 回踩",
+    "sector": "sector rotation 板块 轮动",
+    "quality": "earnings report event 财报 公告",
+    "main_force": "flow momentum 资金 主力",
+}
+
+# 自然中文标签 → 空格分词的指纹关键词（单 token 中文无法匹配）。
+_LABEL_NORMALIZATION = {
+    "板块轮动": "sector rotation 板块 轮动",
+    "趋势回踩": "trend pullback 趋势 回踩 均线",
+    "短线日内做t": "breakout realtime 盘中 突破 止损",
+    "超强主力股": "flow momentum 资金 主力",
+    "三日策略": "earnings report event 财报",
+}
+
+# archetype → 持有天数基线（min, max）：hold_min/hold_max 覆盖比较的基准。
+_HOLDING_BASELINES = {
+    "breakout": (1, 5),
+    "trend": (5, 20),
+    "mean_reversion": (5, 20),
+    "rotation": (3, 7),
+    "event_driven": (5, 12),
+    "flow_momentum": (1, 3),
+    "composite": (3, 10),
+}
+
 # archetype → 推荐的风险画像档（RISK_PROFILES 键）。
 _ARCHETYPE_PROFILE = {
     "breakout": "breakout",
@@ -53,6 +83,13 @@ def strategy_creation_preview(
 ) -> dict[str, Any]:
     """根据草稿配置生成创建预览（指纹 / 推荐画像 / 执行方式 / 边界 / 覆盖）。"""
     draft = dict(draft or {})
+    style = str(draft.get("style") or "").strip()
+    normalized_style = _LABEL_NORMALIZATION.get(style.lower(), style)
+    alias = _STYLE_ALIASES.get(normalized_style.lower())
+    if alias:
+        normalized_style = f"{normalized_style} {alias}".strip()
+    if normalized_style:
+        draft["style"] = normalized_style
     fingerprint = SRF.compile_strategy_risk_fingerprint(None, draft)
     archetype = fingerprint.archetype
     execution = EPF.execution_profile_for(archetype)
@@ -69,6 +106,8 @@ def strategy_creation_preview(
         "hold_max": draft.get("hold_max"),
         "hold_min": draft.get("hold_min"),
     }
+    hold_min_baseline, hold_max_baseline = _HOLDING_BASELINES.get(
+        archetype, _HOLDING_BASELINES["composite"])
     recommended_limits = {
         "max_positions": int(recommended.get("max_positions", 3)
                              if recommended else 3),
@@ -76,6 +115,8 @@ def strategy_creation_preview(
         if recommended else 32.0,
         "max_exposure_pct": round(float(recommended.get("max_exposure", 0.92)) * 100, 1)
         if recommended else 90.0,
+        "hold_min": hold_min_baseline,
+        "hold_max": hold_max_baseline,
     }
     high_risk_overrides: list[dict[str, Any]] = []
     accepted: dict[str, Any] = {}
