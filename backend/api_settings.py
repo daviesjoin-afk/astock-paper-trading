@@ -53,7 +53,7 @@ def _snapshot() -> dict:
         enabled = cycle.get("enabled_strategies")
         if isinstance(enabled, str):
             enabled = RSET._decode(enabled, None)
-        enabled = list(enabled) if isinstance(enabled, (list, tuple)) else list(RSET.STRATEGIES)
+        enabled = list(enabled) if isinstance(enabled, (list, tuple)) else RSET.enabled_strategies(conn)
         cycle_duration = cycle.get("duration_days")
         if cycle_duration is None:
             cycle_duration = settings["simulation"]["cycle_duration_days"]
@@ -73,6 +73,8 @@ def _snapshot() -> dict:
             "enabled_strategies": enabled,
             "historical_unchanged": True,
         }
+        defaults = RSET.defaults(conn)
+        metadata = RSET.metadata(conn)
     # adaptive_engine masks keys before returning them; no raw credential is
     # ever copied into the unified snapshot.
     try:
@@ -88,13 +90,13 @@ def _snapshot() -> dict:
         "schema_version": "settings-v1",
         "settings": settings,
         "defaults": {
-            "simulation": {key: RSET.defaults()[key] for key in RSET.SETTING_GROUPS["simulation"]},
-            "risk": {key: RSET.defaults()[key] for key in RSET.SETTING_GROUPS["risk"]},
-            "strategy": {"strategy_overrides": RSET.defaults()["strategy_overrides"]},
-            "evolution": {"evolution_interval_hours": RSET.defaults()["evolution_interval_hours"]},
-            "execution": {key: RSET.defaults()[key] for key in RSET.SETTING_GROUPS["execution"]},
+            "simulation": {key: defaults[key] for key in RSET.SETTING_GROUPS["simulation"]},
+            "risk": {key: defaults[key] for key in RSET.SETTING_GROUPS["risk"]},
+            "strategy": {"strategy_overrides": defaults["strategy_overrides"]},
+            "evolution": {"evolution_interval_hours": defaults["evolution_interval_hours"]},
+            "execution": {key: defaults[key] for key in RSET.SETTING_GROUPS["execution"]},
         },
-        "metadata": RSET.metadata(),
+        "metadata": metadata,
         "effective": {
             "current_cycle": current,
             "next_cycle": {
