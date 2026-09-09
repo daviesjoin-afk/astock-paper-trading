@@ -46,6 +46,7 @@ import execution_profiles as EPF
 import paper_sizing as PSZ
 import order_intent as OI
 import strategy_registry as SR
+import strategy_runtime as SRT
 import runtime_settings as RSET
 from market_policy import market_light_scale, market_light_scales
 from paper_trading_rules import (
@@ -7643,7 +7644,7 @@ def _strategy_cluster_factors(conn, asof_day=None, account_ids=None):
     return clusters, factors
 
 
-def _strategy_runtimes(account_ids, weights=None, diversification=None):
+def _strategy_runtimes(account_ids, weights=None, diversification=None, *, conn=None):
     """把账户权重与声明式配置编译成分配引擎的 StrategyRuntime 列表（PR-07）。
 
     任意 N 个策略：席位上限、优先级地板与自身敞口约束全部来自数据表
@@ -7655,14 +7656,22 @@ def _strategy_runtimes(account_ids, weights=None, diversification=None):
     runtimes = []
     for account_id in account_ids:
         weight = _num((weights or {}).get(account_id), 1.0)
+        context_runtime = None
+        if conn is not None:
+            try:
+                context_runtime = SRT.get_context(conn, account_id).allocation_runtime
+            except (ValueError, sqlite3.Error):
+                context_runtime = None
         runtimes.append(
             PA.StrategyRuntime(
                 strategy_id=account_id,
                 base_priority=max(weight, 0.01),
-                max_positions=ALLOCATION_SLOT_CAPS.get(account_id, STRATEGY_MAX_POSITIONS),
+                max_positions=ALLOCATION_SLOT_CAPS.get(account_id, context_runtime.max_positions if context_runtime else STRATEGY_MAX_POSITIONS),
                 priority_floor_pct=ALLOCATION_PRIORITY_FLOOR_PCT.get(account_id),
-                own_exposure_cap_pct=ALLOCATION_OWN_EXPOSURE_CAP_PCT.get(account_id),
+                own_exposure_cap_pct=ALLOCATION_OWN_EXPOSURE_CAP_PCT.get(account_id, context_runtime.own_exposure_cap_pct if context_runtime else None),
                 diversification=_num(diversification.get(account_id), 1.0),
+                lifecycle_stage=context_runtime.lifecycle_stage if context_runtime else "standard",
+                capital_scale=context_runtime.capital_scale if context_runtime else None,
             )
         )
     return runtimes
@@ -7744,7 +7753,7 @@ def _dynamic_position_limits(conn):
     count = len(account_ids)
     baseline = sum(weights.values()) / max(count, 1)
     allocation = PA.position_limits(
-        _strategy_runtimes(account_ids, weights, diversification=diversification),
+        _strategy_runtimes(account_ids, weights, diversification=diversification, conn=conn),
         hard_pool_cap=hard_pool_cap,
         strategy_max_positions=STRATEGY_MAX_POSITIONS,
         strategy_min_positions=STRATEGY_MIN_POSITIONS,
@@ -7853,7 +7862,7 @@ def _strategy_pool_budget(conn, account, nav, positions, quotes, market=None, ex
     result = PA.strategy_pool_budget(
         _strategy_runtimes(
             list(weights), weights,
-            diversification={key: cluster_factors.get(key, 1.0) for key in weights},
+            diversification={key: cluster_factors.get(key, 1.0) for key in weights}, conn=conn,
         ),
         account_id=account.get("id"),
         values=values,
@@ -8017,12 +8026,17 @@ LIQUIDITY_PARTICIPATION_RATE = 0.05
 _EXECUTION_PROFILE_CACHE: dict = {}
 
 
-def _execution_profile_for_account(account_id):
+def _execution_profile_for_account(account_id, *, conn=None):
     """按账户声明的 risk_profile 取执行画像（PR-10），未声明回落保守。
 
     第一版只用 market/limit 两种订单类型；TTL/batch/verification 作为
     订单审计字段与延期依据，具体批量撮合/人工核验由既有 retry 机制承担。
     """
+    if conn is not None:
+        try:
+            return SRT.get_context(conn, account_id).execution_profile
+        except (ValueError, sqlite3.Error):
+            pass
     cached = _EXECUTION_PROFILE_CACHE.get(account_id)
     if cached is None:
         cached = EPF.execution_profile_for(ACCOUNT_SPECS.get(account_id) or {})
@@ -8196,6 +8210,7 @@ def strategy_allocation_explain():
             runtimes = _strategy_runtimes(
                 participating, weights,
                 diversification={key: cluster_factors.get(key, 1.0) for key in participating},
+                conn=conn,
             )
             runtime = next((item for item in runtimes if item.strategy_id == account_id), None)
             budget = _strategy_pool_budget(
@@ -8816,7 +8831,7 @@ def _buy_order(conn, account, signal, quote, market, news, asof_day, *, all_quot
     risk["sizing"] = sizing
     # PR-10 执行画像：按账户 risk_profile 自动选择 market/limit 与让价。
     # 限价画像要求现价不高于让价上限，未到价则延期（execution_retry）。
-    exec_profile = _execution_profile_for_account(account["id"])
+    exec_profile = _execution_profile_for_account(account["id"], conn=conn)
     entry_limit = EPF.enforce_entry_limit(
         exec_profile, fill_price, reference_price=signal_close or price,
     )
