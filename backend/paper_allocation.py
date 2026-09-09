@@ -466,15 +466,22 @@ def deployable_budget(
     lot_size: int = 100,
     capital_scale: float = 1.0,
     price_buffer: float = 1.0,
+    lifecycle_stage: str | None = None,
 ) -> dict[str, Any]:
     """把预算折算成整手可部署资金。
 
     不变式（PR-08）：预算不足一手时**绝不生成碎片订单**——
     ``lots == 0`` 且全部预算进入 ``waiting_capital``，不允许出现
     ``0 < deployable < 一手成本`` 的碎片。
+
+    PR-26：``waiting_capital`` 统计的是**原始预算减去实际部署额**，
+    因此被生命周期系数扣留的部分（shadow/quarantined 的 100%、pilot 的 75%）
+    也留在等待池账上，不会从资金账目里凭空消失；
+    ``lifecycle_withheld_amount`` 单独给出这笔被阶段系数扣下的金额。
     """
     round2 = lambda value: round(value, 2)
-    scaled = max(float(budget_amount or 0.0), 0.0) * _unit(capital_scale, 0.0)
+    budget = max(float(budget_amount or 0.0), 0.0)
+    scaled = budget * _unit(capital_scale, 0.0)
     try:
         usable_price = max(float(price or 0.0), 0.0) * max(float(price_buffer), 1.0)
     except (TypeError, ValueError):
@@ -482,18 +489,26 @@ def deployable_budget(
     lot_size = max(int(lot_size), 1)
     one_lot_cost = usable_price * lot_size
     if one_lot_cost <= 0.0 or scaled < one_lot_cost:
+        stage = str(lifecycle_stage or "").strip()
+        if _unit(capital_scale, 0.0) <= 0.0 and stage:
+            # PR-26：shadow/quarantined 阶段系数 0，预算整笔进等待池——
+            # 原因必须写明是生命周期，而不是含糊的“预算不足一手”。
+            reason = f"生命周期阶段 {stage}：不部署新资金，预算进入等待池"
+        else:
+            reason = (
+                "价格无效，预算冻结等待"
+                if one_lot_cost <= 0.0
+                else "预算不足一手，资金进入等待池"
+            )
         return {
             "allowed": False,
             "lots": 0,
             "deployable_amount": 0.0,
-            "waiting_capital": round2(scaled),
+            "waiting_capital": round2(budget),
             "scaled_budget": round2(scaled),
+            "lifecycle_withheld_amount": round2(max(0.0, budget - scaled)),
             "one_lot_cost": round2(one_lot_cost),
-            "reason": (
-                "价格无效，预算冻结等待"
-                if one_lot_cost <= 0.0
-                else "预算不足一手，资金进入等待池"
-            ),
+            "reason": reason,
         }
     lots = int(scaled // one_lot_cost)
     deployable = lots * usable_price * lot_size
@@ -501,8 +516,9 @@ def deployable_budget(
         "allowed": True,
         "lots": lots,
         "deployable_amount": round2(deployable),
-        "waiting_capital": round2(max(0.0, scaled - deployable)),
+        "waiting_capital": round2(max(0.0, budget - deployable)),
         "scaled_budget": round2(scaled),
+        "lifecycle_withheld_amount": round2(max(0.0, budget - scaled)),
         "one_lot_cost": round2(one_lot_cost),
         "reason": None,
     }
@@ -520,6 +536,7 @@ def allocation_plan(
     strategy_pool_floor_ratio,
     lot_size: int = 100,
     account_order=None,
+    market_scales=None,
 ) -> dict[str, Any]:
     """整池资金分配计划（PR-08）：预算 → 生命周期缩放 → 整手部署。
 
@@ -555,7 +572,7 @@ def allocation_plan(
             pending_by_account=pending_by_account,
             pending_total=pending_total,
             nav=nav,
-            market_scales=None,
+            market_scales=market_scales,
             shared_pool_max_exposure=shared_pool_max_exposure,
             strategy_pool_floor_ratio=strategy_pool_floor_ratio,
         )
@@ -567,6 +584,7 @@ def allocation_plan(
             price=(prices_by_strategy or {}).get(runtime.strategy_id),
             lot_size=lot_size,
             capital_scale=scale,
+            lifecycle_stage=stage,
         )
         deployable = float(deployment["deployable_amount"])
         remaining_headroom = max(0.0, remaining_headroom - deployable)
@@ -582,6 +600,7 @@ def allocation_plan(
             "lots": deployment["lots"],
             "deployable_amount": deployment["deployable_amount"],
             "waiting_capital": deployment["waiting_capital"],
+            "lifecycle_withheld_amount": deployment["lifecycle_withheld_amount"],
             "blocked_reason": deployment["reason"],
             "allowed": bool(deployment["allowed"]),
         })
