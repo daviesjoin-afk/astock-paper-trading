@@ -17,6 +17,8 @@ import sqlite3
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass
 
+import strategy_dsl_schema as DSL
+
 
 ORIGINS = ("builtin", "user")
 LIFECYCLE_STATUSES = (
@@ -33,7 +35,7 @@ _TRANSITIONS = {
 _ID_PATTERN = re.compile(r"^[a-z][a-z0-9_]{2,63}$")
 _BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEFAULT_DB_PATH = os.path.join(_BASE, "data_cache", "paper_trading.sqlite3")
-_VERSIONED_FIELDS = ("name", "implementation_key", "description", "metadata")
+_VERSIONED_FIELDS = ("name", "implementation_key", "description", "metadata", "dsl_ast")
 
 
 @dataclass(frozen=True)
@@ -50,6 +52,7 @@ class StrategySpec:
     updated_at: str | None = None
     current_version: int | None = None
     current_checksum: str | None = None
+    dsl_ast: dict | None = None
 
     def to_dict(self):
         payload = asdict(self)
@@ -101,10 +104,11 @@ def _now():
     return dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat()
 
 
-def _canonical_definition(*, name, implementation_key, description="", metadata=None):
+def _canonical_definition(*, name, implementation_key, description="", metadata=None, dsl_ast=None):
     if metadata is not None and not isinstance(metadata, Mapping):
         raise ValueError("strategy metadata must be an object")
     payload = {
+        "dsl_ast": None if dsl_ast is None else DSL.normalize(dsl_ast),
         "description": str(description or "").strip(),
         "implementation_key": str(implementation_key or "").strip(),
         "metadata": dict(metadata or {}),
@@ -131,6 +135,7 @@ def _add_column(conn, table, name, definition):
 def _create_version_schema(conn):
     _add_column(conn, "strategy_definitions", "current_version", "INTEGER")
     _add_column(conn, "strategy_definitions", "current_checksum", "TEXT")
+    _add_column(conn, "strategy_definitions", "dsl_ast", "TEXT NOT NULL DEFAULT 'null'")
     conn.execute(
         """CREATE TABLE IF NOT EXISTS paper_strategy_versions (
             strategy_id TEXT NOT NULL,
@@ -143,6 +148,7 @@ def _create_version_schema(conn):
             implementation_key TEXT NOT NULL,
             description TEXT NOT NULL DEFAULT '',
             metadata TEXT NOT NULL DEFAULT '{}',
+            dsl_ast TEXT NOT NULL DEFAULT 'null',
             created_at TEXT NOT NULL,
             created_by TEXT NOT NULL DEFAULT 'system',
             change_note TEXT NOT NULL DEFAULT '',
@@ -163,6 +169,7 @@ def _create_version_schema(conn):
                 REFERENCES paper_strategy_versions(strategy_id, version)
         )"""
     )
+    _add_column(conn, "paper_strategy_versions", "dsl_ast", "TEXT NOT NULL DEFAULT 'null'")
     conn.execute(
         """CREATE TABLE IF NOT EXISTS paper_cycle_strategy_versions (
             cycle_id INTEGER NOT NULL,
@@ -175,6 +182,16 @@ def _create_version_schema(conn):
             FOREIGN KEY(strategy_id, strategy_version)
                 REFERENCES paper_strategy_versions(strategy_id, version)
         )"""
+    )
+    conn.execute(
+        """CREATE TRIGGER IF NOT EXISTS trg_strategy_definition_dsl_version_guard
+           BEFORE UPDATE OF dsl_ast ON strategy_definitions
+           WHEN NOT EXISTS (
+              SELECT 1 FROM paper_strategy_versions v
+              WHERE v.strategy_id=NEW.id AND v.version=NEW.current_version
+                AND v.checksum=NEW.current_checksum AND v.dsl_ast=NEW.dsl_ast
+           )
+           BEGIN SELECT RAISE(ABORT, 'DSL changes require a new strategy version'); END"""
     )
     conn.execute(
         """CREATE TABLE IF NOT EXISTS paper_strategy_legacy_bindings (
@@ -229,6 +246,7 @@ def ensure_schema(conn):
             supports_new_cycle INTEGER NOT NULL DEFAULT 0 CHECK(supports_new_cycle IN (0,1)),
             description TEXT NOT NULL DEFAULT '',
             metadata TEXT NOT NULL DEFAULT '{}',
+            dsl_ast TEXT NOT NULL DEFAULT 'null',
             sort_order INTEGER NOT NULL DEFAULT 1000,
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL,
@@ -261,7 +279,7 @@ def ensure_schema(conn):
     for sort_order, spec in enumerate(BUILTIN_STRATEGIES):
         payload, canonical, checksum = _canonical_definition(
             name=spec.name, implementation_key=spec.implementation_key or spec.id,
-            description=spec.description, metadata=spec.metadata,
+            description=spec.description, metadata=spec.metadata, dsl_ast=None,
         )
         conn.execute(
             """INSERT OR IGNORE INTO strategy_definitions
@@ -278,7 +296,7 @@ def ensure_schema(conn):
     # PR-01 databases already contain definitions. Preserve those bytes when
     # establishing v1 instead of replacing them with process defaults.
     rows = conn.execute(
-        """SELECT id,name,implementation_key,description,metadata,current_version
+        """SELECT id,name,implementation_key,description,metadata,dsl_ast,current_version
            FROM strategy_definitions ORDER BY origin,sort_order,id"""
     ).fetchall()
     for row in rows:
@@ -290,29 +308,32 @@ def ensure_schema(conn):
             metadata = {}
         payload, canonical, checksum = _canonical_definition(
             name=row[1], implementation_key=row[2], description=row[3], metadata=metadata,
+            dsl_ast=json.loads(row[5]) if row[5] else None,
         )
         conn.execute(
             """INSERT OR IGNORE INTO paper_strategy_versions
                (strategy_id,version,checksum,definition_json,name,implementation_key,
-                description,metadata,created_at,created_by,change_note)
-               VALUES(?,?,?,?,?,?,?,?,?,'system','initial immutable definition')""",
+                description,metadata,dsl_ast,created_at,created_by,change_note)
+               VALUES(?,?,?,?,?,?,?,?,?,?,'system','initial immutable definition')""",
             (row[0], 1, checksum, canonical, payload["name"], payload["implementation_key"],
              payload["description"], json.dumps(payload["metadata"], ensure_ascii=False,
-                                                sort_keys=True, separators=(",", ":")), now),
+                                                sort_keys=True, separators=(",", ":")),
+             json.dumps(payload["dsl_ast"], ensure_ascii=False, sort_keys=True, separators=(",", ":")), now),
         )
         conn.execute(
             """INSERT OR IGNORE INTO paper_strategy_version_heads
                (strategy_id,current_version,current_checksum,updated_at) VALUES(?,1,?,?)""",
             (row[0], checksum, now),
         )
-        if row[5] is None:
+        if row[6] is None:
             metadata_json = json.dumps(
                 payload["metadata"], ensure_ascii=False, sort_keys=True, separators=(",", ":"),
             )
             conn.execute(
-                """UPDATE strategy_definitions SET metadata=?,current_version=1,current_checksum=?
+                """UPDATE strategy_definitions SET metadata=?,dsl_ast=?,current_version=1,current_checksum=?
                    WHERE id=? AND current_version IS NULL""",
-                (metadata_json, checksum, row[0]),
+                (metadata_json, json.dumps(payload["dsl_ast"], ensure_ascii=False,
+                                            sort_keys=True, separators=(",", ":")), checksum, row[0]),
             )
     _seed_legacy_bindings(conn)
     return True
@@ -347,7 +368,7 @@ def _row_to_spec(row):
         "lifecycle_status": row[3], "implementation_key": row[4],
         "supports_new_cycle": row[5], "description": row[6],
         "metadata": row[7], "created_at": row[8], "updated_at": row[9],
-        "current_version": row[10], "current_checksum": row[11],
+        "current_version": row[10], "current_checksum": row[11], "dsl_ast": row[12],
     }
     try:
         metadata = json.loads(values.get("metadata") or "{}")
@@ -363,6 +384,7 @@ def _row_to_spec(row):
         created_at=values.get("created_at"), updated_at=values.get("updated_at"),
         current_version=values.get("current_version"),
         current_checksum=values.get("current_checksum"),
+        dsl_ast=json.loads(values.get("dsl_ast") or "null"),
     )
 
 
@@ -424,10 +446,12 @@ def list_definitions(*, conn=None, db_path=None, origins=None, statuses=None,
             if {"current_version", "current_checksum"}.issubset(columns)
             else "NULL AS current_version,NULL AS current_checksum"
         )
+        dsl_projection = "dsl_ast" if "dsl_ast" in columns else "NULL AS dsl_ast"
         rows = conn.execute(
             "SELECT id,name,origin,lifecycle_status,implementation_key,"
             "supports_new_cycle,description,metadata,created_at,updated_at,"
             f"{version_projection} "
+            f",{dsl_projection} "
             f"FROM strategy_definitions{where} ORDER BY origin,sort_order,id", params,
         ).fetchall()
         return tuple(_row_to_spec(row) for row in rows)
@@ -526,7 +550,7 @@ def list_versions(strategy_id, *, conn=None, db_path=None):
 
 
 def create_user_definition(conn, strategy_id, name, *, implementation_key="",
-                           description="", metadata=None, actor="system",
+                           description="", metadata=None, dsl_ast=None, actor="system",
                            _clone_source=None):
     strategy_id = str(strategy_id or "").strip()
     if not _ID_PATTERN.fullmatch(strategy_id):
@@ -538,28 +562,30 @@ def create_user_definition(conn, strategy_id, name, *, implementation_key="",
         raise ValueError("strategy id already exists")
     payload, canonical, checksum = _canonical_definition(
         name=name, implementation_key=implementation_key or strategy_id,
-        description=description, metadata=metadata,
+        description=description, metadata=metadata, dsl_ast=dsl_ast,
     )
     now = _now()
     conn.execute(
         """INSERT INTO strategy_definitions
-           (id,name,origin,lifecycle_status,implementation_key,supports_new_cycle,
-            description,metadata,sort_order,created_at,updated_at,current_version,current_checksum)
-           VALUES(?,?,'user','draft',?,0,?,?,1000,?,?,1,?)""",
+            (id,name,origin,lifecycle_status,implementation_key,supports_new_cycle,
+            description,metadata,dsl_ast,sort_order,created_at,updated_at,current_version,current_checksum)
+           VALUES(?,?,'user','draft',?,0,?,?,?,1000,?,?,1,?)""",
         (strategy_id, payload["name"], payload["implementation_key"],
          payload["description"], json.dumps(payload["metadata"], ensure_ascii=False,
                                             sort_keys=True, separators=(",", ":")),
+         json.dumps(payload["dsl_ast"], ensure_ascii=False, sort_keys=True, separators=(",", ":")),
          now, now, checksum),
     )
     conn.execute(
         """INSERT INTO paper_strategy_versions
            (strategy_id,version,checksum,definition_json,name,implementation_key,
-            description,metadata,created_at,created_by,change_note,
+            description,metadata,dsl_ast,created_at,created_by,change_note,
             cloned_from_strategy_id,cloned_from_version,cloned_from_checksum)
-           VALUES(?,1,?,?,?,?,?,?,?,?,?,?,?,?)""",
+           VALUES(?,1,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (strategy_id, checksum, canonical, payload["name"], payload["implementation_key"],
          payload["description"], json.dumps(payload["metadata"], ensure_ascii=False,
                                             sort_keys=True, separators=(",", ":")),
+         json.dumps(payload["dsl_ast"], ensure_ascii=False, sort_keys=True, separators=(",", ":")),
          now, str(actor or "system"),
          "cloned strategy definition" if _clone_source else "initial user definition",
          _clone_source.strategy_id if _clone_source else None,
@@ -610,10 +636,11 @@ def save_definition(conn, strategy_id, changes, *, expected_version=None,
         conn.execute(
             """INSERT INTO paper_strategy_versions
                (strategy_id,version,checksum,definition_json,name,implementation_key,
-                description,metadata,created_at,created_by,change_note)
-               VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+                description,metadata,dsl_ast,created_at,created_by,change_note)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
             (str(strategy_id), next_version, checksum, canonical, payload["name"],
              payload["implementation_key"], payload["description"], metadata_json,
+             json.dumps(payload["dsl_ast"], ensure_ascii=False, sort_keys=True, separators=(",", ":")),
              now, str(actor or "system"), str(change_note or "")),
         )
         cursor = conn.execute(
@@ -626,10 +653,12 @@ def save_definition(conn, strategy_id, changes, *, expected_version=None,
             raise ValueError("strategy version changed concurrently")
         conn.execute(
             """UPDATE strategy_definitions
-               SET name=?,implementation_key=?,description=?,metadata=?,
+               SET name=?,implementation_key=?,description=?,metadata=?,dsl_ast=?,
                    current_version=?,current_checksum=?,updated_at=? WHERE id=?""",
             (payload["name"], payload["implementation_key"], payload["description"],
-             metadata_json, next_version, checksum, now, str(strategy_id)),
+             metadata_json, json.dumps(payload["dsl_ast"], ensure_ascii=False,
+                                       sort_keys=True, separators=(",", ":")),
+             next_version, checksum, now, str(strategy_id)),
         )
         conn.execute(f"RELEASE SAVEPOINT {savepoint}")
     except Exception:
@@ -651,7 +680,8 @@ def clone_definition(conn, source_strategy_id, source_version, new_strategy_id,
     clone = create_user_definition(
         conn, new_strategy_id, payload["name"],
         implementation_key=payload["implementation_key"],
-        description=payload["description"], metadata=payload["metadata"], actor=actor,
+        description=payload["description"], metadata=payload["metadata"],
+        dsl_ast=payload.get("dsl_ast"), actor=actor,
         _clone_source=source,
     )
     return clone
