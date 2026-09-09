@@ -59,11 +59,13 @@ class PoolExposureInvariantTests(unittest.TestCase):
                     strategy_max_positions=6, strategy_min_positions=1,
                     protected_slot_floor=1,
                 )
-            self.assertLessEqual(
-                sum(allocation["limits"].values()), 15,
-                f"N={count} salt={salt}",
-            )
-            self.assertLessEqual(allocation["total_cap"], 15)
+                # 断言必须在 salt 循环内：每个组合都要验证，不能被覆盖。
+                self.assertLessEqual(
+                    sum(allocation["limits"].values()), 15,
+                    f"N={count} salt={salt}",
+                )
+                self.assertLessEqual(allocation["total_cap"], 15,
+                                     f"N={count} salt={salt}")
 
     def test_pool_limit_stays_within_the_hard_cap_for_any_exposure(self):
         for count in range(1, 13):
@@ -223,8 +225,8 @@ class MinLotInvariantTests(unittest.TestCase):
             num=lambda value, default=None: value,  # 与生产包装一致：透传数值
             single_position_max_amount=0.0,
         )
-        # 100 元现金买不起一手 50 元股票 → qty 必须 < 100 股。
-        self.assertLess(int(qty), 100)
+        # 100 元现金买不起一手 50 元股票 → qty 必须为 0（不允许碎股买单）。
+        self.assertEqual(0, int(qty))
 
 
 class IntentPriorityInvariantTests(unittest.TestCase):
