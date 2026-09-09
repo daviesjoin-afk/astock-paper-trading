@@ -7601,6 +7601,8 @@ def _strategy_cluster_profiles(conn, asof_day=None, account_ids=None):
 
     只为**参与当前周期的策略**建画像（未启用策略不占预算也不该抬簇规模），
     任何查询失败都只损失证据，不阻塞主扫描。
+    PR-27：画像额外携带策略 DSL AST——新复制的策略没有任何行为历史，
+    只有结构证据能第一时间把它抓进簇。
     """
     day = _date(asof_day)
     wanted = [str(item) for item in (account_ids or list(ACCOUNT_SPECS))]
@@ -7608,9 +7610,16 @@ def _strategy_cluster_profiles(conn, asof_day=None, account_ids=None):
     profiles = {}
     for account_id in wanted:
         own = [item for item in positions if item.get("account_id") == account_id]
+        dsl_ast = None
+        if conn is not None:
+            try:
+                dsl_ast = SRT.get_context(conn, account_id).compiled_dsl
+            except (ValueError, sqlite3.Error):
+                dsl_ast = None
         profiles[account_id] = SC.similarity_profile(
             position_codes={str(item.get("code")) for item in own if item.get("code")},
             industries={str(item.get("industry") or "") for item in own if item.get("industry")},
+            dsl_ast=dsl_ast,
         )
     try:
         rows = conn.execute(
@@ -7947,23 +7956,27 @@ def _strategy_pool_budget(conn, account, nav, positions, quotes, market=None, ex
     )
     cluster = SC.cluster_of(account.get("id"), inputs["clusters"])
     if len(cluster) > 1:
-        # 单策略绝对上限（元）≈ 净值 × 该策略 max_exposure 权重；
-        # 簇上限 = 单策略上限 × 簇预算倍数（sqrt(n)，触发地板后线性）。
+        # PR-27 cluster-first：先定簇总预算，再均分给成员——
+        # 簇上限 = 单策略基准 × (1 + novelty bonus)，封顶 +10%；
+        # 每成员的分项上限 = 簇上限 / n，扣除自身已占用后才是新增额度。
+        # 复制 50 份的簇总预算 ≈ 1.1 倍单策略（v1 的 floor 口径是 15 倍），
+        # 且后到的克隆抢不走先到成员的份额（不存在簇 headroom 竞争）。
         unit_amount = _num(nav) * _num(weights.get(account.get("id"), 0.0))
         cluster_cap = unit_amount * SC.cluster_budget_multiplier(cluster)
-        cluster_committed = sum(
-            _num(values.get(member)) + _num(pending_by_account.get(member))
-            for member in cluster
+        per_member_cap = cluster_cap / len(cluster)
+        own_committed = _num(values.get(account.get("id"))) + _num(
+            pending_by_account.get(account.get("id")),
         )
-        headroom = max(0.0, cluster_cap - cluster_committed)
+        member_headroom = max(0.0, per_member_cap - own_committed)
         result["cluster_budget"] = {
             "cluster": sorted(cluster), "cap_amount": round(cluster_cap, 2),
-            "committed_amount": round(cluster_committed, 2),
-            "headroom_amount": round(headroom, 2),
+            "per_member_cap_amount": round(per_member_cap, 2),
+            "committed_amount": round(own_committed, 2),
+            "headroom_amount": round(member_headroom, 2),
             "version": SC.STRATEGY_CLUSTER_VERSION,
         }
         result["allowance_amount"] = min(
-            _num(result.get("allowance_amount")), headroom,
+            _num(result.get("allowance_amount")), member_headroom,
         )
     # 生命周期阶段来自运行时 Context（PR-26）：阶段系数直接决定本策略
     # 本轮能部署多少钱，未部署的部分记入 waiting_capital 供审计追踪。
