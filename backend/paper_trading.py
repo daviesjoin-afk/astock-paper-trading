@@ -1239,13 +1239,15 @@ def _record_entry_frozen_waitlist(
     cursor = conn.execute(
         """INSERT INTO paper_orders(
                account_id,signal_id,side,code,name,qty,planned_price,status,reason,
-               risk_payload,origin,created_at,strategy_id,strategy_version,strategy_checksum)
-           VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+               risk_payload,origin,created_at,strategy_id,strategy_version,strategy_checksum,
+               retry_of_order_id)
+           VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (
             account_id, signal_id, "buy", code, name, max(0, int(_num(qty))),
             _num(planned_price, None), ENTRY_FROZEN_WAITLIST_STATUS, reason,
             _json(payload), "strategy", _now(),
             strategy_id, strategy_version, strategy_checksum,
+            _previous_attempt_order_id(conn, signal_id),
         ),
     )
     order_id = int(cursor.lastrowid)
@@ -1935,6 +1937,28 @@ def _reconcile_signal_order_states(conn):
     }
 
 
+def _previous_attempt_order_id(conn, signal_id):
+    """PR-29：返回该信号最近一条已终态的买单尝试 id（审计血缘）。
+
+    过期/回收的旧委托（superseded / expired / cancelled）保留完整行；
+    同一信号重建的新委托以 ``retry_of_order_id`` 指向它，形成
+    Signal → 尝试1（终态）→ 尝试2（…）的链路。
+    """
+    if signal_id is None:
+        return None
+    try:
+        row = conn.execute(
+            """SELECT id FROM paper_orders
+                WHERE signal_id=? AND side='buy'
+                  AND status IN ('superseded','expired','cancelled')
+                ORDER BY id DESC LIMIT 1""",
+            (int(signal_id),),
+        ).fetchone()
+    except sqlite3.Error:
+        return None
+    return int(row["id"]) if row is not None else None
+
+
 def _supersede_signal_execution_retries(conn, signal_id):
     """Keep one retry row for a signal and release every older reservation."""
     if signal_id is None:
@@ -2057,7 +2081,8 @@ def init_db():
                 risk_payload TEXT NOT NULL, realized_pnl REAL, created_at TEXT NOT NULL, executed_at TEXT,
                 order_type TEXT NOT NULL DEFAULT 'market',
                 origin TEXT NOT NULL DEFAULT 'strategy', expires_at TEXT, cancelled_at TEXT,
-                strategy_id TEXT, strategy_version INTEGER, strategy_checksum TEXT
+                strategy_id TEXT, strategy_version INTEGER, strategy_checksum TEXT,
+                retry_of_order_id INTEGER
             );
             -- 归档表：列集与活跃表严格一致（清理函数用 SELECT * 归档），避免列错位。
             CREATE TABLE IF NOT EXISTS paper_orders_archive (
@@ -2066,7 +2091,7 @@ def init_db():
                 status TEXT, reason TEXT, risk_payload TEXT, realized_pnl REAL,
                 created_at TEXT, executed_at TEXT, order_type TEXT, origin TEXT,
                 expires_at TEXT, cancelled_at TEXT, strategy_id TEXT,
-                strategy_version INTEGER, strategy_checksum TEXT
+                strategy_version INTEGER, strategy_checksum TEXT, retry_of_order_id INTEGER
             );
             CREATE TABLE IF NOT EXISTS paper_signals_archive (
                 id INTEGER, account_id TEXT, signal_date TEXT, intended_date TEXT, code TEXT, name TEXT,
@@ -9356,19 +9381,21 @@ def _buy_order(conn, account, signal, quote, market, news, asof_day, *, all_quot
     strategy_id, strategy_version, strategy_checksum = _strategy_stamp(
         conn, account["id"], signal.get("id"),
     )
+    # PR-29：同一信号重建的新委托记录审计血缘——上一条终态尝试的 order id。
+    retry_of_order_id = _previous_attempt_order_id(conn, signal.get("id"))
     cursor = conn.execute(
         """INSERT INTO paper_orders(
            account_id,signal_id,side,code,name,qty,planned_price,order_type,filled_price,amount,
            fees,status,reason,risk_payload,created_at,executed_at,expires_at,
-           strategy_id,strategy_version,strategy_checksum)
-        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+           strategy_id,strategy_version,strategy_checksum,retry_of_order_id)
+        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (account["id"], signal["id"], "buy", code, signal.get("name"), qty,
          entry_limit["limit_price"] if entry_limit["limit_price"] is not None else price,
          entry_limit["order_type"],
          fill_price if allowed else None,
          amount if allowed else None, fees if allowed else None, order_status, reason,
          _json(risk), _now(), _now() if allowed else None, dispatch_plan["expires_at"],
-         strategy_id, strategy_version, strategy_checksum),
+         strategy_id, strategy_version, strategy_checksum, retry_of_order_id),
     )
     # A frozen order is a waitlist marker, not a second live order.  Once the
     # data gate reopens and this candidate receives a fresh decision, retire
