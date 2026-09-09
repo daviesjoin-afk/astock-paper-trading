@@ -6059,7 +6059,7 @@ def _candidate_rows(account, asof_date, market, sector_rows=None, live_universe=
                 price_s = _num(pick.get("price"), 0.0)
                 open_s = _num(pick.get("open"), 0.0)
                 runup_s = (price_s / open_s - 1) if price_s > 0 and open_s > 0 else None
-                spec_mf = ACCOUNT_SPECS[account_id]
+                spec_mf = _spec_for(account_id)
                 limit_s = _limit_pct(code)
                 buffer_s = 1.0 if limit_s <= 10.0 else 2.0
                 old_rejected = False
@@ -7321,6 +7321,7 @@ def _signal_approval(
     history_meta=None,
     asof_date=None,
     factor_asof_date=None,
+    conn=None,
 ):
     code = pick["code"]
     flags = []
@@ -7368,7 +7369,9 @@ def _signal_approval(
     if not usable_history:
         flags.append(
             f"历史数据滞后 {history_lag if history_lag is not None else '未知'} 个工作日，"
-            f"超过本策略上限 {ACCOUNT_SPECS[account['id']]['max_factor_lag']}"
+            # PR-39：用户策略不在 ACCOUNT_SPECS 里，直接下标会 KeyError；
+            # 统一走 _spec_for（内置 → 表，用户 → RuntimeContext 派生）。
+            f"超过本策略上限 {_spec_for(account['id'], conn=conn).get('max_factor_lag')}"
         )
     decision = DE.buy_decision(
         code, name=pick.get("name"), kline=kline, snap=quote,
@@ -7606,7 +7609,7 @@ def generate_signals(asof_date=None):
                 kline = _completed_kline(code, day)
                 passed, reason, decision, market_policy = _signal_approval(
                     account, pick, quote, kline, evidence_sector_flow, market,
-                    evidence_news, evidence_history.get(code), day
+                    evidence_news, evidence_history.get(code), day, conn=conn,
                 )
                 payload = {"pick": pick, "decision": decision, "market": market, "factor": meta,
                            "market_policy": market_policy, "quote": quote,
@@ -12623,7 +12626,7 @@ def _bootstrap_signals_for_today(asof_day, live_universe=None, source_slot="intr
                     passed, reason, decision, market_policy = _signal_approval(
                         account, pick, quote, kline,
                         sector_flow, market, news, history.get(code), day,
-                        factor_asof_date=factor_day,
+                        factor_asof_date=factor_day, conn=conn,
                     )
                     recovery_observation = None
                     if is_recovery:
