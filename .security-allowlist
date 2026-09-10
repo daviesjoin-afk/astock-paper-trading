@@ -54,8 +54,6 @@ value:b2884a393a59ad64002292a3e90d46a5
 # --- deploy docs use an explicit placeholder instead of a real host ---
 value:root@服务器IP:/tmp/astock-quant/
 # --- false positives: a JS regex literal and an inline SVG path number ---
-path:frontend/src/features/adaptive.js
-path:frontend/index.html
 # --- public CDN / schema hosts referenced by shipped assets ---
 host:www.apache.org
 host:opencode.ai
@@ -64,13 +62,18 @@ host:cdn.jsdelivr.net
 value:/root/astock-data-
 # --- documented false positives: minified bundle keeps a regex literal that
 #     looks like a drive path; archived deploy doc quotes a backup path.
-path:frontend/dist/app.js
-path:frontend/assets/
-path:deploy/README.md
-path:frontend/app.js
 # --- deployment paths that ARE this repo's public convention (self-detecting
 #     backup root in deploy/*.sh); they carry no host, user or secret ---
 value:/opt/astock-codex
 value:/root/codex
 value:/root/astock-data-
-path:deploy/
+
+# --- 逐值放行（替代原目录级 path: 白名单；每条都写明理由）---
+# 文档占位示例（主机名为中文占位符，非真实服务器）
+value:rsync-exclude.txt ./ root@服务器IP
+# 前端内联 SVG 路径数字，非 IP 地址
+value:1.7.7.3
+# 前端源码中的 JS 正则字面量（形如 [+]\d\d:），非本机路径
+value:d:\d\d
+# 历史提交中同一份部署文档的占位路径
+value:/root/astock-data-backup.tgz

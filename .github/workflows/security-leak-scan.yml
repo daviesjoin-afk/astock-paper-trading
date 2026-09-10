@@ -1,0 +1,36 @@
+name: Security Leak Scan
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: security-leak-scan-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  security-leak-scan:
+    name: security-leak-scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Scan worktree and full history for sensitive data
+        run: python scripts/security/scan-sensitive-data.py --repo . --scope all
+
+      - name: Scan the pull request diff only (fast feedback)
+        if: github.event_name == 'pull_request'
+        run: |
+          git fetch --no-tags origin "${{ github.base_ref }}"
+          git diff --unified=0 "origin/${{ github.base_ref }}...HEAD" > /tmp/pr.diff || true
+          python scripts/security/scan-sensitive-data.py --repo . --scope worktree

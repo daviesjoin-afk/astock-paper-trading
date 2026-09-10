@@ -1,0 +1,18 @@
+# Gitleaks 配置：保留内置规则，仅对**一处已确认的文档占位符**做规则级放行。
+#
+# 背景：deploy/README.md 的 Basic Auth 示例曾是
+#     curl -u <中文占位账号>:<中文占位口令> -I http://<占位主机>/
+# 属于文档示例、不是真实凭据。当前文件已改为变量引用
+#     curl -u "$ASTOCK_ADMIN_USER:$ASTOCK_ADMIN_PASSWORD" -I http://<SERVER_HOST>/
+# 但历史提交里仍保留当时的写法。
+#
+# 放行范围刻意收窄到：单条规则（curl-auth-user）× 单个文件（deploy/README.md）。
+# 不使用目录级或全局放行；任何其它规则、任何其它文件都不受影响。
+
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "deploy/README.md 的 Basic Auth 示例为文档占位符，非真实凭据"
+targetRules = ["curl-auth-user"]
+paths = ['''deploy/README\.md''']
