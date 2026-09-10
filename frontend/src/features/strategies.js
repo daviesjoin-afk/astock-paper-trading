@@ -114,7 +114,7 @@ export function wbCard(item){
     // validated→draft/active/archived、active→paused/retiring、
     // paused→active/retiring/archived、retiring→archived）补齐按钮，
     // 让 Pause / Clone / Retire 在界面上真正闭环，不必再手搓 curl。
-    if(st==='draft'||st==='validated') actions+='<button type="button" onclick="wbOpenEditor('+sid+')">编辑</button>';
+    if(st==='draft'||st==='validated') actions+='<button type="button" data-testid="strategy-edit" onclick="wbOpenEditor('+sid+')">编辑</button>';
     actions+='<button type="button" data-testid="strategy-clone" onclick="wbCloneStrategy('+sid+')">'+(st==='archived'?'复制并编辑':'复制')+'</button>';
     if(st==='draft') actions+='<button type="button" data-testid="strategy-transition-validated" onclick="wbValidateAndMark('+sid+')">验证并标记可激活</button>';
     if(st==='validated') actions+='<button type="button" data-testid="strategy-transition-draft" onclick="wbTransition('+sid+',\'draft\')">退回草稿</button>';
@@ -126,10 +126,10 @@ export function wbCard(item){
     if(st==='draft'||st==='validated'||st==='paused') actions+='<button type="button" data-testid="strategy-transition-archive" onclick="wbTransition('+sid+',\'archived\')">归档</button>';
     if(st==='draft') actions+='<button type="button" class="strategy-card-danger" onclick="wbDeleteDraft('+sid+')">删除草稿</button>';
   }else{
-    actions='<button type="button" onclick="wbCloneStrategy(\''+adaptiveEsc(item.id)+'\')">复制并编辑</button>';
+    actions='<button type="button" data-testid="strategy-clone" onclick="wbCloneStrategy(\''+adaptiveEsc(item.id)+'\')">复制并编辑</button>';
   }
-  actions+='<button type="button" onclick="wbOpenDetail(\''+adaptiveEsc(item.id)+'\')">版本与详情</button>';
-  return '<article class="strategy-card" data-testid="strategy-card-'+adaptiveEsc(item.id)+'" data-strategy-id="'+adaptiveEsc(item.id)+'">'
+  actions+='<button type="button" data-testid="strategy-open-detail" onclick="wbOpenDetail(\''+adaptiveEsc(item.id)+'\')">版本与详情</button>';
+  return '<article class="strategy-card" data-testid="strategy-card-'+adaptiveEsc(item.id)+'" data-strategy-id="'+adaptiveEsc(item.id)+'" data-status="'+adaptiveEsc(item.status||'')+'">'
     +'<header><h3>'+adaptiveEsc(item.name||item.id)+'</h3>'+wbStatusBadge(item.status)+'</header>'
     +'<p class="strategy-card-meta"><span class="strategy-card-origin '+(userCard?'strategy-card-origin-user':'strategy-card-origin-builtin')+'">'+(userCard?'自定义':'内置')+'</span>'
     +'<span>v'+(item.current_version||item.version||1)+' · '+(item.has_dsl?'DSL':'原生')+'</span>'

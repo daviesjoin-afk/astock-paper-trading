@@ -36,8 +36,15 @@ export const test = base.extend({
       if (isExpectedUnknownStrategy404) return;
       if (!isAllowedNoise(text)) errors.push(`console.error -> ${text}`);
     });
+    // 真实弹窗交互：confirm 接受；prompt 返回 test 预设的答案（默认克隆用 ID）。
+    page.__promptAnswer = null;
     page.on("dialog", async (dialog) => {
       dialogs.push({ type: dialog.type(), message: dialog.message() });
+      if (dialog.type() === "prompt") {
+        // 未指定答案时接受产品给出的默认值（等价于真人直接点确定）
+        await dialog.accept(page.__promptAnswer == null ? dialog.defaultValue() : page.__promptAnswer);
+        return;
+      }
       await dialog.accept();
     });
     page.__dialogs = dialogs;
@@ -130,11 +137,26 @@ export async function promoteToActive(page, strategyId, { from = "draft" } = {})
     const validated = waitForApi(page, /\/api\/strategies\/[^/]+\/transition$/);
     await cardAction(page, strategyId, "strategy-transition-validated").click();
     expect((await validated).ok(), "draft→validated 必须 2xx").toBeTruthy();
-    await expect(page.getByTestId(`strategy-card-${strategyId}`)).toContainText(/Validated/);
+    await expect(page.getByTestId(`strategy-card-${strategyId}`)).toHaveAttribute("data-status", "validated");
   }
   const activated = waitForApi(page, /\/api\/strategies\/[^/]+\/transition$/);
   await cardAction(page, strategyId, "strategy-transition-active").click();
   expect((await activated).ok(), "validated→active 必须 2xx").toBeTruthy();
-  await expect(page.getByTestId(`strategy-card-${strategyId}`)).toContainText(/Active/);
+  await expect(page.getByTestId(`strategy-card-${strategyId}`)).toHaveAttribute("data-status", "active");
   return strategyId;
+}
+
+/** 打开设置中心的"模拟盘与资金"子页（下一周期策略集合所在处）。 */
+export async function openSettings(page) {
+  await gotoPage(page, "settings-nav");
+  await expect(page.getByTestId("settings-result")).not.toContainText("正在读取");
+  return page.getByTestId("settings-result");
+}
+
+/** 读取当前"下一周期启用策略"集合（只读 API 回读）。 */
+export async function enabledStrategies(page) {
+  // 契约：GET /api/settings/ -> { settings: { simulation: { enabled_strategies: [...] } } }
+  const body = await apiJson(page, "/api/settings/");
+  const sim = (body && body.settings && body.settings.simulation) || {};
+  return sim.enabled_strategies || [];
 }
