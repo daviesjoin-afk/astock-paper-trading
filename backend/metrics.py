@@ -14,7 +14,8 @@ import time
 import data_fetcher as dfc
 
 BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-CACHE_DIR = os.path.join(BASE, "data_cache")
+import data_paths
+CACHE_DIR = data_paths.data_dir()
 REPORT_DIR = os.path.join(BASE, "reports")
 
 _METRICS_CACHE = {"data": None, "ts": 0.0}

@@ -20,7 +20,8 @@ import paper_schema_migrations as paper_schema
 import strategy_registry
 
 BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-CACHE_DIR = os.path.join(BASE, "data_cache")
+import data_paths
+CACHE_DIR = data_paths.data_dir()
 
 DB_PATHS = {
     "paper_trading": os.path.join(CACHE_DIR, "paper_trading.sqlite3"),

@@ -95,11 +95,12 @@ IGNITION_BUY_ENABLED = os.environ.get("PAPER_IGNITION_BUY", "").strip().lower() 
 }
 
 BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-DB_PATH = os.path.join(BASE, "data_cache", "paper_trading.sqlite3")
-REPORT_DIR = os.path.join(BASE, "reports")
-SELECTION_FACTORS_PATH = os.path.join(BASE, "data_cache", "selection_factors.csv")
-SELECTION_META_PATH = os.path.join(BASE, "data_cache", "selection_cache.json")
-ARCHIVE_ORDERS_CACHE_PATH = os.path.join(BASE, "data_cache", "paper_archive_orders_projection.json")
+import data_paths
+DB_PATH = data_paths.data_path("paper_trading.sqlite3")
+REPORT_DIR = data_paths.report_dir()
+SELECTION_FACTORS_PATH = data_paths.data_path("selection_factors.csv")
+SELECTION_META_PATH = data_paths.data_path("selection_cache.json")
+ARCHIVE_ORDERS_CACHE_PATH = data_paths.data_path("paper_archive_orders_projection.json")
 # 日线因子只在足够覆盖可交易全市场的完整交易日时才允许覆盖上一版本。
 # 盘后源短暂限流时，宁可保留最后一份已验证因子，也不能用几百只股票
 # 的截面重排全市场。候选阶段还会再次按策略时效复核该覆盖率。
@@ -5381,7 +5382,7 @@ def _attach_candidate_financial_disclosure(picks, asof_date):
     return picks, summary
 
 
-MAIN_FORCE_WATCH_POOL_PATH = os.path.join(BASE, "data_cache", "main_force_watch_pool.json")
+MAIN_FORCE_WATCH_POOL_PATH = data_paths.data_path("main_force_watch_pool.json")
 _MAIN_FORCE_POOL_LOCK = threading.Lock()
 _MAIN_FORCE_POOL_SIZE = 10
 _MAIN_FORCE_POOL_BUFFER = 3   # 额外请求的替补位（top10 掉榜时用 11-13 名补）

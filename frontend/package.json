@@ -9,6 +9,7 @@
     "check:dist": "git diff --quiet -- frontend/dist || (echo 'frontend/dist is stale: run npm run build and commit the result' && exit 1)"
   },
   "devDependencies": {
+    "@playwright/test": "^1.63.0",
     "esbuild": "^0.25.0"
   }
 }

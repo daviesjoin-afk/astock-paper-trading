@@ -23,8 +23,9 @@ import data_fetcher as dfc
 
 
 BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-DB_PATH = os.path.join(BASE, "data_cache", "adaptive_learning.sqlite3")
-PAPER_DB_PATH = os.path.join(BASE, "data_cache", "paper_trading.sqlite3")
+import data_paths
+DB_PATH = data_paths.data_path("adaptive_learning.sqlite3")
+PAPER_DB_PATH = data_paths.data_path("paper_trading.sqlite3")
 BENCHMARK_CACHE_KEY = "BENCH_000300"
 TZ = ZoneInfo("Asia/Shanghai")
 HORIZONS = (1, 3, 5)
