@@ -56,6 +56,12 @@ export async function loadStrategyWorkbench(force){
       var data=await api('/api/strategies?include_archived=true&_='+Date.now());
       WB_STATE.items=data.items||[]; WB_STATE.summary=data.summary||{};
       wbRenderSummary(); wbRenderList();
+      // 路由意图必须在 registry 就绪之后应用（详情渲染依赖 items/接口）。
+      var routeId=window._strategiesRouteId;
+      if(routeId){
+        window._strategiesRouteId=null;
+        wbOpenDetail(routeId);
+      }
       return data;
     }catch(e){
       if(target) target.innerHTML='<div class="strategy-workbench-error"><b>无法加载策略</b><span>'+adaptiveEsc(e.message||e)+'</span><button type="button" onclick="loadStrategyWorkbench(true)">重试</button></div>';
@@ -108,9 +114,9 @@ export function wbCard(item){
     // validated→draft/active/archived、active→paused/retiring、
     // paused→active/retiring/archived、retiring→archived）补齐按钮，
     // 让 Pause / Clone / Retire 在界面上真正闭环，不必再手搓 curl。
-    if(st==='draft'||st==='validated') actions+='<button type="button" onclick="wbOpenEditor('+sid+')">编辑</button>';
+    if(st==='draft'||st==='validated') actions+='<button type="button" data-testid="strategy-edit" onclick="wbOpenEditor('+sid+')">编辑</button>';
     actions+='<button type="button" data-testid="strategy-clone" onclick="wbCloneStrategy('+sid+')">'+(st==='archived'?'复制并编辑':'复制')+'</button>';
-    if(st==='draft') actions+='<button type="button" onclick="wbValidateAndMark('+sid+')">验证并标记可激活</button>';
+    if(st==='draft') actions+='<button type="button" data-testid="strategy-transition-validated" onclick="wbValidateAndMark('+sid+')">验证并标记可激活</button>';
     if(st==='validated') actions+='<button type="button" data-testid="strategy-transition-draft" onclick="wbTransition('+sid+',\'draft\')">退回草稿</button>';
     if(st==='validated') actions+='<button type="button" class="strategy-workbench-primary" data-testid="strategy-transition-active" onclick="wbTransition('+sid+',\'active\')">激活策略</button>';
     if(st==='active') actions+='<button type="button" data-testid="strategy-transition-paused" onclick="wbTransition('+sid+',\'paused\')">暂停</button>';
@@ -120,10 +126,10 @@ export function wbCard(item){
     if(st==='draft'||st==='validated'||st==='paused') actions+='<button type="button" data-testid="strategy-transition-archive" onclick="wbTransition('+sid+',\'archived\')">归档</button>';
     if(st==='draft') actions+='<button type="button" class="strategy-card-danger" onclick="wbDeleteDraft('+sid+')">删除草稿</button>';
   }else{
-    actions='<button type="button" onclick="wbCloneStrategy(\''+adaptiveEsc(item.id)+'\')">复制并编辑</button>';
+    actions='<button type="button" data-testid="strategy-clone" onclick="wbCloneStrategy(\''+adaptiveEsc(item.id)+'\')">复制并编辑</button>';
   }
-  actions+='<button type="button" onclick="wbOpenDetail(\''+adaptiveEsc(item.id)+'\')">版本与详情</button>';
-  return '<article class="strategy-card" data-testid="strategy-card-'+adaptiveEsc(item.id)+'" data-strategy-id="'+adaptiveEsc(item.id)+'">'
+  actions+='<button type="button" data-testid="strategy-open-detail" onclick="wbOpenDetail(\''+adaptiveEsc(item.id)+'\')">版本与详情</button>';
+  return '<article class="strategy-card" data-testid="strategy-card-'+adaptiveEsc(item.id)+'" data-strategy-id="'+adaptiveEsc(item.id)+'" data-status="'+adaptiveEsc(item.status||'')+'">'
     +'<header><h3>'+adaptiveEsc(item.name||item.id)+'</h3>'+wbStatusBadge(item.status)+'</header>'
     +'<p class="strategy-card-meta"><span class="strategy-card-origin '+(userCard?'strategy-card-origin-user':'strategy-card-origin-builtin')+'">'+(userCard?'自定义':'内置')+'</span>'
     +'<span>v'+(item.current_version||item.version||1)+' · '+(item.has_dsl?'DSL':'原生')+'</span>'
@@ -470,10 +476,24 @@ export async function wbDeleteDraft(strategyId){
   }catch(e){ alert('删除失败：'+(e.message||e)); }
 }
 
+export function wbRenderNotFound(strategyId,message){
+  var box=$('wbDetail'); if(!box) return;
+  box.innerHTML='<header class="strategy-editor-head"><h3>策略不存在</h3>'
+    +'<div><button type="button" onclick="wbBackToList()">返回列表</button></div></header>'
+    +'<div class="strategy-editor-note" data-testid="strategy-not-found">'
+    +'找不到策略 <code>'+adaptiveEsc(strategyId)+'</code>。它可能已被删除，或链接里的 ID 拼错了。'
+    +(message?'<br><small>'+adaptiveEsc(message)+'</small>':'')+'</div>';
+  wbShowView('detail');
+}
+
 export async function wbOpenDetail(strategyId){
   var item;
   try{ item=await api('/api/strategies/'+encodeURIComponent(strategyId)+'?_='+Date.now()); }
-  catch(e){ alert('读取失败：'+(e.message||e)); return; }
+  catch(e){
+    // 未知/不可读的策略：给出可读状态，不弹 modal、不抛异常、不写坏 hash。
+    wbRenderNotFound(strategyId,e&&e.message);
+    return null;
+  }
   var versions=[],events=[];
   try{ versions=(await api('/api/strategies/'+encodeURIComponent(strategyId)+'/versions')).items||[]; }catch(e){}
   try{ events=(await api('/api/strategies/'+encodeURIComponent(strategyId)+'/events')).items||[]; }catch(e){}
@@ -503,7 +523,9 @@ export async function wbOpenDetail(strategyId){
     +'<h4>生命周期时间线</h4><ul class="strategy-version-list">'+(timeline||'<li>暂无事件。</li>')+'</ul></section>'
     +'<section><h4>版本历史（只读）</h4><ul class="strategy-version-list" data-testid="strategy-version-list">'+(versionRows||'<li>暂无版本。</li>')+'</ul></section></div>';
   wbShowView('detail');
+  window._strategiesRouteId=null;
   history.replaceState(null,'','#strategies/'+encodeURIComponent(strategyId));
+  return item;
 }
 
 export function wbBackToList(){
