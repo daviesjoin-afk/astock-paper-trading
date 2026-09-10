@@ -753,8 +753,15 @@ def _cycle_participant_resolution(conn, cycle_id=None):
                 "bound": frozenset(), "paused": frozenset(), "cycle_id": None,
                 "version": _CYCLE_PARTICIPANT_VERSION}
     parsed = _loads(cycle_row["enabled_strategies"], None) if cycle_row["enabled_strategies"] else None
-    if not isinstance(parsed, list) or not parsed:
+    if not isinstance(parsed, list):
+        # 缺失/损坏 → 旧语义：回落内置五套（未配置 ≠ 零策略）。
         return {"ids": fallback_ids, "source": "cycle_not_configured", "enabled": (),
+                "bound": frozenset(), "paused": frozenset(), "cycle_id": cycle_row["id"],
+                "version": _CYCLE_PARTICIPANT_VERSION}
+    if not parsed:
+        # PR-47：显式空配置 = 零策略 idle 周期——不产生新参与者，风控扫描、
+        # 存量退出与系统调度照常。不再回落内置五套。
+        return {"ids": (), "source": "cycle_idle", "enabled": (),
                 "bound": frozenset(), "paused": frozenset(), "cycle_id": cycle_row["id"],
                 "version": _CYCLE_PARTICIPANT_VERSION}
     enabled = tuple(dict.fromkeys(str(item) for item in parsed))
@@ -844,10 +851,31 @@ def _dynamic_minimum_order_amount(cycle, nav=None, position_limit=None, conn=Non
     shared pool, while reserving 40% headroom lets risk controls decide
     whether a confirmed position deserves an additional tranche.
     """
-    cycle_ids = tuple(item for item in _loads((cycle or {}).get("enabled_strategies"), []) if item in ACCOUNT_SPECS)
+    cycle_data = cycle or {}
+    raw_enabled = None
+    if cycle is not None:
+        try:
+            raw_enabled = cycle["enabled_strategies"]
+        except (KeyError, IndexError):
+            raw_enabled = None
+    # PR-47：显式空配置 = 零策略 idle 周期，无新开仓 → 最小建仓金额为 0。
+    # 缺失/损坏仍回落内置五套（未配置 ≠ 零策略）。
+    if raw_enabled is not None and _loads(raw_enabled, None) == []:
+        return 0.0, {
+            "amount": 0.0,
+            "cycle_capital": round(_num(raw_enabled is not None and cycle_data["capital"], _num(nav, 0.0)), 2),
+            "pool_exposure_cap_pct": 0.0,
+            "position_limit": 0,
+            "configured_position_limit": 0,
+            "position_limit_source": "cycle_idle_zero_strategies",
+            "slot_utilization_pct": 0.0,
+            "rounding": MIN_ORDER_ROUNDING,
+            "formula": "cycle_idle (explicit empty enabled_strategies)",
+        }
+    cycle_ids = tuple(item for item in _loads(raw_enabled, []) if item in ACCOUNT_SPECS)
     if conn is not None:
         # PR-35：周期启用集合中的用户策略也参与池位配置。
-        cycle_ids = tuple(dict.fromkeys([*cycle_ids, *(item for item in _loads((cycle or {}).get("enabled_strategies"), []) if item in USP.user_participant_ids(conn))]))
+        cycle_ids = tuple(dict.fromkeys([*cycle_ids, *(item for item in _loads(raw_enabled, []) if item in USP.user_participant_ids(conn))]))
     configured_ids = cycle_ids or ACTIVE_ACCOUNT_IDS
     configured_slots = sum(
         max(1, int(_spec_for(account_id, conn=conn).get("max_positions", 1)))
@@ -862,7 +890,6 @@ def _dynamic_minimum_order_amount(cycle, nav=None, position_limit=None, conn=Non
     else:
         position_limit = max(0, int(position_limit))
         position_limit_source = "effective_dynamic_pool_limit"
-    cycle_data = cycle or {}
     cycle_capital = _num(cycle_data.get("capital"), _num(nav, 0.0))
     exposure_cap = RSET.get(conn, "shared_pool_exposure_cap", SHARED_POOL_MAX_EXPOSURE) if conn is not None else SHARED_POOL_MAX_EXPOSURE
     slot_utilization = RSET.get(conn, "minimum_entry_slot_utilization", MIN_ORDER_SLOT_UTILIZATION) if conn is not None else MIN_ORDER_SLOT_UTILIZATION
@@ -891,9 +918,14 @@ def _active_account_rows(conn, status=None):
 
     PR-38：参与资格统一走 ``current_cycle_participant_ids``（周期快照），
     不再由 Registry active 决定。周期快照不可用时才退回旧口径，保证早期
-    /迁移期数据库行为不变。
+    /迁移期数据库行为不变。PR-47：显式空启用集合（cycle_idle）是合法的
+    零策略 idle 周期——返回空参与者列表，不回落旧口径。
     """
-    participant_ids = current_cycle_participant_ids(conn) if conn is not None else ()
+    resolution = _cycle_participant_resolution(conn) if conn is not None else None
+    participant_ids = tuple((resolution or {}).get("ids") or ())
+    if resolution and resolution.get("source") == "cycle_idle":
+        # 零策略 idle：明确返回空集，绝不回落内置五套。
+        return []
     if participant_ids:
         placeholders = ",".join("?" for _ in participant_ids)
         sql = f"SELECT * FROM paper_accounts WHERE id IN ({placeholders})"
@@ -2639,8 +2671,14 @@ def _ensure_cycle(conn):
     # PR-35：启用集合按"能力位"过滤——内置 id 看 ACCOUNT_SPECS，用户 id 看
     # 注册表参与资格；陈旧/未知 id 仍被剔除。
     user_ids = set(USP.user_participant_ids(conn))
-    base_enabled = configured_enabled if isinstance(configured_enabled, list) and configured_enabled else ACTIVE_ACCOUNT_IDS
-    enabled_ids = tuple(item for item in base_enabled if item in ACCOUNT_SPECS or item in user_ids) or tuple(ACTIVE_ACCOUNT_IDS)
+    # PR-47：显式空列表 = 零策略 idle 周期（保留空集）；缺失/损坏才回落内置五套。
+    if isinstance(configured_enabled, list):
+        base_enabled = configured_enabled
+    else:
+        base_enabled = list(ACTIVE_ACCOUNT_IDS)
+    enabled_ids = tuple(
+        item for item in base_enabled if item in ACCOUNT_SPECS or item in user_ids
+    )
     # Bind before any account-repair audit below. A definition head can move
     # independently, but every write in this cycle must retain this snapshot.
     SR.bind_cycle_versions(conn, active["id"], enabled_ids)
@@ -15942,8 +15980,8 @@ def _create_cycle(conn, capital, status="paused", reason="新建模拟周期", d
         strategy_id for strategy_id in checked["enabled_strategies"]
         if strategy_id in eligible_ids
     )
-    if not enabled_strategies:
-        raise ValueError("没有可用于新周期的活跃策略")
+    # PR-47：空启用集合合法 = 零策略 idle 周期（无新信号/新开仓，风控与
+    # 存量退出照常）。不再强制"至少一套"。
     now = _now()
     key = "cycle-" + dt.datetime.now().strftime("%Y%m%d-%H%M%S-%f")
     cursor = conn.execute(
@@ -16056,7 +16094,8 @@ def start_new_cycle(capital=None, include_dashboard=True):
         cycle = _create_cycle(conn, capital, status="running", reason="保存资金并启动")
     summary = dashboard() if include_dashboard else {
         "cycle": cycle,
-        "strategy_count": len(cycle.get("enabled_strategies") or ACTIVE_ACCOUNT_IDS),
+        # PR-47：显式空启用集合 = idle 周期，策略数如实显示 0。
+        "strategy_count": len(cycle.get("enabled_strategies") or ()),
         "refresh_required": True,
     }
     return summary, cycle

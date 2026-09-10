@@ -1590,10 +1590,31 @@ function renderSettings(data){
   if(section==='simulation'){
     var durationOptions=SETTINGS_DURATION_OPTIONS.map(function(option){return '<option value="'+option+'"'+(Number(sim.cycle_duration_days)===option?' selected':'')+'>'+settingsDurationLabel(option)+'</option>';}).join('');
     var strategyChecks=(sim.enabled_strategies||[]);
+    var strategyCheckbox=function(item){
+      var checkable=item.status==='active'&&item.supports_new_cycle;
+      var checked=strategyChecks.indexOf(item.id)>=0;
+      var badge=wbStatusBadge(item.status);
+      var extra='';
+      if(item.status==='paused') extra='<button type="button" class="settings-strategy-link" onclick="activatePage(\'p-strategies\')">去策略中心恢复</button>';
+      else if(!checkable&&item.status!=='active') extra='<small class="setting-help">'+adaptiveEsc((STRATEGY_STATUS_LABELS[item.status]||item.status)+' · 不可勾选')+'</small>';
+      return '<label class="settings-strategy-item'+(checkable?'':' settings-strategy-item-disabled')+'">'
+        +'<input type="checkbox" class="setting-strategy-enabled" value="'+adaptiveEsc(item.id)+'"'+settingsChecked(checked)+(checkable?'':' disabled')+'>'
+        +'<span><b>'+adaptiveEsc(item.name||item.id)+'</b>'
+        +(item.origin==='user'?'<small class="setting-help">自定义 · v'+(item.current_version||1)+'</small>':'')
+        +'</span>'+badge+extra+'</label>';
+    };
+    var items=settingsStrategyItems();
+    var builtinItems=items.filter(function(x){return x.origin==='builtin';});
+    var userItems=items.filter(function(x){return x.origin==='user';});
+    var strategyHtml='<p class="setting-help" style="margin:2px 0 6px">内置策略</p><div class="settings-strategy-group">'
+      +builtinItems.map(strategyCheckbox).join('')+'</div>';
+    if(userItems.length) strategyHtml+='<p class="setting-help" style="margin:8px 0 6px">我的策略（在策略中心创建）</p><div class="settings-strategy-group">'+userItems.map(strategyCheckbox).join('')+'</div>';
+    if(window._registryError) strategyHtml+='<p class="setting-help" style="color:var(--danger)">'+adaptiveEsc(window._registryError)+'</p>';
+    strategyHtml+='<p class="setting-help" style="margin-top:8px">一个都不勾 = 下一周期零策略 idle：不产生新开仓，风险扫描、存量退出与系统调度照常工作。</p>';
     html='<div class="settings-grid"><section class="settings-panel"><h3>模拟盘与资金</h3><p>这些项目决定下一次新周期的初始资金、观察时长和参与策略。当前周期的本金、成交与归档不会被覆盖。</p><div class="settings-form">'
       +settingsInputRow('default_starting_capital','默认启动金额','创建新周期时的共享资金池预填值。','<input id="settingDefaultCapital" data-settings-preview-input type="number" min="1000" max="10000000" step="1000" value="'+Number(sim.default_starting_capital||300000)+'"> <span class="setting-value-preview">元</span>')
       +settingsInputRow('cycle_duration_days','模拟周期','可选 15/30/60/90/180 个交易日或长期。','<select id="settingCycleDuration" data-settings-preview-input>'+durationOptions+'</select>')
-      +'<div class="setting-row"><div class="setting-label"><b>启用策略</b><small>至少启用一套；只对下一周期生效。</small></div><div class="setting-control settings-strategy-checks">'+Object.keys(SETTINGS_STRATEGY_NAMES).map(function(id){return '<label><input type="checkbox" class="setting-strategy-enabled" value="'+id+'"'+settingsChecked(strategyChecks.indexOf(id)>=0)+'>'+adaptiveEsc(SETTINGS_STRATEGY_NAMES[id])+'</label>';}).join('')+'</div></div>'
+      +'<div class="setting-row"><div class="setting-label"><b>下一周期启用策略</b><small>只有 Active 且支持新周期的策略可勾选；只对下一周期生效。</small></div><div class="setting-control settings-strategy-checks">'+strategyHtml+'</div></div>'
       +'</div><div class="settings-actions"><button onclick="saveSettingsSection(\'simulation\')">保存资金与周期</button><button class="ghost" onclick="resetSettingsSection(\'simulation\')">恢复默认</button></div><div class="settings-note">当前周期：'+adaptiveEsc(cur.status||'—')+'；已启用 '+(cur.enabled_strategies||[]).length+' 套策略。保存后点击“保存并启动新周期”才会切换账本。</div></section>'+settingsPreviewHtml(data,section)+'</div>';
   }else if(section==='risk'){
     html='<div class="settings-grid"><section class="settings-panel"><h3>仓位与风控</h3><p>风险边界设有后端白名单。系统永远不会因界面输入突破单票、共享池、现金、T+1 或交易所涨跌停门禁。</p><div class="settings-form">'
@@ -1604,14 +1625,30 @@ function renderSettings(data){
       +'</div><div class="settings-actions"><button onclick="saveSettingsSection(\'risk\')">保存风控设置</button><button class="ghost" onclick="resetSettingsSection(\'risk\')">恢复默认</button></div><div class="settings-note">动态最小建仓金额会随周期金额、敞口上限、席位上限和利用率实时变化；不是固定的 10,000 元门槛。</div></section>'+settingsPreviewHtml(data,section)+'</div>';
   }else if(section==='strategy'){
     var overrides=strat.strategy_overrides||{};
-    html='<div class="settings-grid"><section class="settings-panel"><h3>策略参数</h3><p>已启用策略保留独立模型和审计身份。风格、席位和权重参数在下个新周期初始化，当前持仓不会被强行改写。</p><div class="strategy-settings-grid">'+Object.keys(SETTINGS_STRATEGY_NAMES).map(function(id){
-      var item=overrides[id]||{};
-      return '<article class="strategy-setting-card" data-strategy-id="'+id+'"><header><div><b>'+adaptiveEsc(SETTINGS_STRATEGY_NAMES[id])+'</b><small>'+adaptiveEsc(id)+'</small></div><span class="tag tag-info">下一周期</span></header>'
-        +'<div class="setting-control"><label>风格</label><select class="strategy-style"><option value="strong"'+(item.style==='strong'?' selected':'')+'>强势接力</option><option value="pullback"'+(item.style==='pullback'?' selected':'')+'>趋势回踩</option><option value="sector"'+(item.style==='sector'?' selected':'')+'>板块轮动</option><option value="quality"'+(item.style==='quality'?' selected':'')+'>质量突破</option><option value="main_force"'+(item.style==='main_force'?' selected':'')+'>主力跟随</option></select></div>'
-        +'<div class="setting-control"><label>最大席位</label><input class="strategy-max-positions" type="number" min="1" max="6" step="1" value="'+Number(item.max_positions||3)+'"><span class="setting-value-preview">席</span></div>'
-        +'<div class="setting-control"><label>单票权重</label><input class="strategy-max-weight" type="number" min="8" max="36" step="1" value="'+Number(item.max_weight_pct||32)+'"><span class="setting-value-preview">%</span></div>'
-        +'<div class="setting-control"><label>策略敞口</label><input class="strategy-max-exposure" type="number" min="35" max="96" step="1" value="'+Number(item.max_exposure_pct||90)+'"><span class="setting-value-preview">%</span></div></article>';
-    }).join('')+'</div><div class="settings-actions"><button onclick="saveSettingsSection(\'strategy\')">保存策略参数</button><button class="ghost" onclick="resetSettingsSection(\'strategy\')">恢复默认</button></div></section>'+settingsPreviewHtml(data,section)+'</div>';
+    var builtinCard=function(item){
+      var id=item.id;
+      var itemOverride=overrides[id]||{};
+      return '<article class="strategy-setting-card" data-strategy-id="'+adaptiveEsc(id)+'"><header><div><b>'+adaptiveEsc(item.name||id)+'</b><small>'+adaptiveEsc(id)+'</small></div><span class="tag tag-info">下一周期</span></header>'
+        +'<div class="setting-control"><label>风格</label><select class="strategy-style"><option value="strong"'+(itemOverride.style==='strong'?' selected':'')+'>强势接力</option><option value="pullback"'+(itemOverride.style==='pullback'?' selected':'')+'>趋势回踩</option><option value="sector"'+(itemOverride.style==='sector'?' selected':'')+'>板块轮动</option><option value="quality"'+(itemOverride.style==='quality'?' selected':'')+'>质量突破</option><option value="main_force"'+(itemOverride.style==='main_force'?' selected':'')+'>主力跟随</option></select></div>'
+        +'<div class="setting-control"><label>最大席位</label><input class="strategy-max-positions" type="number" min="1" max="6" step="1" value="'+Number(itemOverride.max_positions||3)+'"><span class="setting-value-preview">席</span></div>'
+        +'<div class="setting-control"><label>单票权重</label><input class="strategy-max-weight" type="number" min="8" max="36" step="1" value="'+Number(itemOverride.max_weight_pct||32)+'"><span class="setting-value-preview">%</span></div>'
+        +'<div class="setting-control"><label>策略敞口</label><input class="strategy-max-exposure" type="number" min="35" max="96" step="1" value="'+Number(itemOverride.max_exposure_pct||90)+'"><span class="setting-value-preview">%</span></div></article>';
+    };
+    var userCard=function(item){
+      var runtime=item.runtime||{};
+      var stage=runtime.runtime_ready?adaptiveEsc(runtime.lifecycle_stage||'—'):'—';
+      var scale=(runtime.runtime_ready&&runtime.capital_scale!=null)?Math.round(runtime.capital_scale*100)+'%':'—';
+      return '<article class="strategy-user-card" data-strategy-user-id="'+adaptiveEsc(item.id)+'"><header><div><b>'+adaptiveEsc(item.name||item.id)+'</b><small>'+adaptiveEsc(item.id)+' · v'+(item.current_version||1)+'</small></div>'+wbStatusBadge(item.status)+'</header>'
+        +'<div class="strategy-preview-grid"><dt>生命周期阶段</dt><dd>'+stage+'</dd><dt>资金系数</dt><dd>'+scale+'</dd></div>'
+        +'<p class="setting-help">风险画像与参数由策略中心统一管理，这里只控制组合参与。</p>'
+        +'<div class="settings-actions"><button class="ghost" onclick="activatePage(\'p-strategies\')">去策略中心编辑</button></div></article>';
+    };
+    var allItems=settingsStrategyItems();
+    var builtinItems=allItems.filter(function(x){return x.origin==='builtin';});
+    var userItems=allItems.filter(function(x){return x.origin==='user';});
+    var cardsHtml=builtinItems.map(builtinCard).join('');
+    if(userItems.length) cardsHtml+='<h4 style="grid-column:1/-1;margin:4px 0 0">我的策略（参数在策略中心维护）</h4>'+userItems.map(userCard).join('');
+    html='<div class="settings-grid"><section class="settings-panel"><h3>策略运行参数</h3><p>内置策略保留独立模型和审计身份。风格、席位和权重参数在下个新周期初始化，当前持仓不会被强行改写。</p><div class="strategy-settings-grid">'+cardsHtml+'</div><div class="settings-actions"><button onclick="saveSettingsSection(\'strategy\')">保存策略参数</button><button class="ghost" onclick="resetSettingsSection(\'strategy\')">恢复默认</button></div></section>'+settingsPreviewHtml(data,section)+'</div>';
   }else if(section==='execution'){
     var exe=settings.execution||{}, exeDefaults=(data.defaults||{}).execution||{};
     var execSwitch=function(key,label,help){ var value=(exe[key]===undefined?exeDefaults[key]:exe[key]); return '<div class="setting-row"><div class="setting-label"><b>'+riskText(label)+'</b><small>'+riskText(help)+'</small></div><div class="setting-control"><label class="settings-exec-toggle"><input id="settingExec_'+key+'" type="checkbox"'+settingsChecked(!!value)+'><span>'+(value?'开启':'关闭')+'</span></label></div></div>'; };
@@ -1656,8 +1693,37 @@ function updateSettingsPreview(){
 }
 async function loadSettings(force){
   if(window._settingsLoading&&!force) return window._settingsLoading;
-  window._settingsLoading=(async function(){try{var data=await api('/api/settings/?_='+Date.now());renderSettings(data);return data;}catch(e){var target=$('settingsResult');if(target) target.innerHTML='<div class="settings-note">设置读取失败：'+adaptiveEsc(e.message||e)+'</div>';throw e;}finally{window._settingsLoading=null;}})();
+  window._settingsLoading=(async function(){
+    try{
+      // PR-47：策略集合与设置并行读取（Registry 是策略集合唯一权威）。
+      var results=await Promise.all([
+        api('/api/settings/?_='+Date.now()),
+        api('/api/strategies?include_archived=true&_='+Date.now()).catch(function(){ return null; }),
+      ]);
+      var data=results[0];
+      if(results[1]&&Array.isArray(results[1].items)){
+        window._registryItems=results[1].items;
+        window._registrySummary=results[1].summary||{};
+        window._registryError=null;
+      }else{
+        window._registryItems=null; window._registryError='策略注册表读取失败，已回退到内置策略展示。';
+      }
+      renderSettings(data);
+      return data;
+    }catch(e){
+      var target=$('settingsResult');if(target) target.innerHTML='<div class="settings-note">设置读取失败：'+adaptiveEsc(e.message||e)+'</div>';throw e;
+    }finally{window._settingsLoading=null;}
+  })();
   return window._settingsLoading;
+}
+// PR-47：Registry 不可用时的兜底显示名单（仅用于渲染，不再是策略集合权威）。
+function settingsStrategyItems(){
+  if(Array.isArray(window._registryItems)&&window._registryItems.length){
+    return window._registryItems.filter(function(item){return item.status!=='archived';});
+  }
+  return Object.keys(SETTINGS_STRATEGY_NAMES).map(function(id){
+    return {id:id,name:SETTINGS_STRATEGY_NAMES[id],origin:'builtin',status:'active',supports_new_cycle:true,current_version:1,metadata:{},description:''};
+  });
 }
 function settingsConfirm(message){ return window.confirm(message); }
 function collectStrategyOverrides(){

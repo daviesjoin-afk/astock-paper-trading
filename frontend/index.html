@@ -45,7 +45,7 @@
 
 <main id="appMain" tabindex="-1">
 <div id="p-strategies" class="page strategy-workbench-page">
-  <div class="page-header"><div><span class="page-kicker">创建 · 验证 · 版本 · 生命周期</span><h2>策略中心</h2><p>在这里创建自定义策略：可视化条件或声明式 DSL → 后端验证 → 风险与资金预览 → 保存草稿 → 激活 → 参与下一周期。内置五套策略保留为平台自带模板，可复制后修改。</p></div><div class="strategy-workbench-actions"><button class="strategy-workbench-new-btn" type="button" onclick="wbNewStrategy()">+ 新建策略</button></div></div>
+  <div class="page-header"><div><span class="page-kicker">创建 · 验证 · 版本 · 生命周期</span><h2>策略中心</h2><p>在这里创建自定义策略：可视化条件或声明式 DSL → 后端验证 → 风险与资金预览 → 保存草稿 → 激活 → 参与下一周期。内置策略保留为平台自带模板，可复制后修改。</p></div><div class="strategy-workbench-actions"><button class="strategy-workbench-new-btn" type="button" onclick="wbNewStrategy()">+ 新建策略</button></div></div>
   <div id="wbSummary" class="strategy-workbench-summary" role="status" aria-live="polite">正在读取策略 Registry…</div>
   <div class="strategy-workbench-toolbar">
     <div class="strategy-workbench-filters" role="group" aria-label="策略筛选">
@@ -64,12 +64,12 @@
   <div id="wbDetail" class="strategy-workbench-detail" hidden></div>
 </div>
 <div id="p-settings" class="page settings-page">
-  <div class="page-header"><div><span class="page-kicker">运行控制 · 安全边界 · 版本审计</span><h2>设置中心</h2><p>集中管理模拟资金、五套策略、共享池风控和自进化接口。每次保存都会校验边界并留下审计记录。</p></div><div class="settings-head-state" id="settingsHeadState" role="status" aria-live="polite">正在读取设置…</div></div>
+  <div class="page-header"><div><span class="page-kicker">运行控制 · 安全边界 · 版本审计</span><h2>设置中心</h2><p>集中管理模拟资金、策略集合、共享池风控和自进化接口。每次保存都会校验边界并留下审计记录。</p></div><div class="settings-head-state" id="settingsHeadState" role="status" aria-live="polite">正在读取设置…</div></div>
   <div class="settings-shell">
     <nav class="module-tabs settings-module-tabs" aria-label="设置中心二级导航" role="tablist">
       <button class="module-tab settings-section-tab active" role="tab" aria-selected="true" data-settings-section="simulation" onclick="setSettingsSection('simulation',this)"><span class="module-code">资金</span><span class="module-copy"><b>模拟盘与资金</b><small>启动金额 · 周期 · 策略数量</small></span></button>
       <button class="module-tab settings-section-tab" role="tab" aria-selected="false" data-settings-section="risk" onclick="setSettingsSection('risk',this)"><span class="module-code">风控</span><span class="module-copy"><b>仓位与风控</b><small>共享池 · 单票 · 建仓门槛</small></span></button>
-      <button class="module-tab settings-section-tab" role="tab" aria-selected="false" data-settings-section="strategy" onclick="setSettingsSection('strategy',this)"><span class="module-code">策略</span><span class="module-copy"><b>策略参数</b><small>五套模型 · 风格 · 席位</small></span></button>
+      <button class="module-tab settings-section-tab" role="tab" aria-selected="false" data-settings-section="strategy" onclick="setSettingsSection('strategy',this)"><span class="module-code">策略</span><span class="module-copy"><b>策略运行参数</b><small>内置与自定义策略 · 风格 · 席位</small></span></button>
       <button class="module-tab settings-section-tab" role="tab" aria-selected="false" data-settings-section="evolution" onclick="setSettingsSection('evolution',this)"><span class="module-code">AI</span><span class="module-copy"><b>AI 与自进化</b><small>接口状态 · 调度周期 · 审批</small></span></button>
       <button class="module-tab settings-section-tab" role="tab" aria-selected="false" data-settings-section="execution" onclick="setSettingsSection('execution',this)"><span class="module-code">执行</span><span class="module-copy"><b>执行画像执行器</b><small>批量窗口 · 人工核验 · 时限</small></span></button>
     </nav>
@@ -77,10 +77,10 @@
   </div>
 </div>
 <div id="p-paper" class="page">
-  <div class="page-header"><div><span class="page-kicker">共享资金模拟账本</span><h2>策略模拟</h2><p>五套策略共用总资金池、独立决策与风控、统一成交核算；核心持仓和当日操作置顶，完整审计记录按需展开。</p></div></div>
+  <div class="page-header"><div><span class="page-kicker">共享资金模拟账本</span><h2>策略模拟</h2><p>多策略共用总资金池、独立决策与风控、统一成交核算；核心持仓和当日操作置顶，完整审计记录按需展开。</p></div></div>
   <div class="workspace-tabs-dock" data-workspace-tabs-dock="paper">
   <nav id="paperModuleTabs" class="module-tabs workspace-tab-strip" data-tab-scroll aria-label="&#x7b56;&#x7565;&#x6a21;&#x62df;&#x4e09;&#x7ea7;&#x5bfc;&#x822a;" role="tablist">
-    <button class="module-tab" role="tab" aria-selected="false" data-paper-view="strategy" onclick="showPaperWorkspace('strategy',this)"><span class="module-code">策略</span><span class="module-copy"><b>策略中心</b><small>五套账户的规则与风控边界</small></span></button>
+    <button class="module-tab" role="tab" aria-selected="false" data-paper-view="strategy" onclick="showPaperWorkspace('strategy',this)"><span class="module-code">策略</span><span class="module-copy"><b>策略中心</b><small>各策略的规则与风控边界</small></span></button>
     <button class="module-tab" role="tab" aria-selected="false" data-paper-view="research" onclick="showPaperWorkspace('research',this)"><span class="module-code">证据</span><span class="module-copy"><b>策略证据</b><small>候选快照与后续兑现跟踪</small></span></button>
     <button class="module-tab active" role="tab" aria-selected="true" data-paper-view="portfolio" onclick="showPaperWorkspace('portfolio',this)"><span class="module-code">持仓</span><span class="module-copy"><b>&#x5f53;&#x524d;&#x6301;&#x4ed3;</b><small>&#x5e10;&#x6237;&#x4e0e;&#x53ef;&#x64cd;&#x4f5c;&#x5e95;&#x4ed3;</small></span></button>
     <button class="module-tab" role="tab" aria-selected="false" data-paper-view="activity" onclick="showPaperWorkspace('activity',this)"><span class="module-code">委托</span><span class="module-copy"><b>&#x59d4;&#x6258;&#x8bb0;&#x5f55;</b><small>&#x6309;&#x65e5;&#x671f;&#x4e0e;&#x7b56;&#x7565;&#x67e5;&#x770b;&#x64cd;&#x4f5c;</small></span></button>
@@ -90,7 +90,7 @@
   </nav>
   </div>
   <div id="paperStrategyView" class="paper-strategy-view" hidden><div class="loading">正在读取策略规则…</div></div>
-  <div id="paperResearchView" class="paper-research-view" hidden><div class="loading">正在读取五套模拟盘策略的研究证据…</div></div>
+  <div id="paperResearchView" class="paper-research-view" hidden><div class="loading">正在读取模拟盘策略的研究证据…</div></div>
   <div id="paperPortfolioView" class="paper-trade-view">
   <div class="panel paper-setup-panel">
     <h3>模拟周期设置 <span class="tag tag-info">纯模拟盘</span></h3>
@@ -104,8 +104,8 @@
       <button id="paperRunNow" class="ghost" onclick="runPaperNow('intraday')">立即观察日内风险</button>
       <span id="paperStatus" role="status" aria-live="polite" style="font-size:12px;color:var(--text-secondary)"></span>
     </div>
-    <div id="paperCapitalHint" style="margin:-5px 0 10px;color:var(--text-secondary);font-size:12px">五套策略共享总资金池 ¥300,000；策略独立决策、独立风控，资金统一核算。</div>
-    <div class="disclaimer">五套策略并行、独立决策与交易归因，共用总资金池：短线日内做T仅卖出已结算底仓；当天新买股票仍为 T+1。每3分钟只观察行情和风险，只有价格、成本、仓位与各自模型同时通过才模拟成交。模拟盘不连接券商，也不代表真实可成交价格。</div>
+    <div id="paperCapitalHint" style="margin:-5px 0 10px;color:var(--text-secondary);font-size:12px">各策略共享总资金池 ¥300,000；策略独立决策、独立风控，资金统一核算。</div>
+    <div class="disclaimer">多策略并行、独立决策与交易归因，共用总资金池：短线日内做T仅卖出已结算底仓；当天新买股票仍为 T+1。每3分钟只观察行情和风险，只有价格、成本、仓位与各自模型同时通过才模拟成交。模拟盘不连接券商，也不代表真实可成交价格。</div>
   </div>
   <div id="paperAccountStrip" class="paper-account-strip"></div>
   <section class="paper-trade-workspace">
@@ -136,7 +136,7 @@
       <p>只读风控中心：不会重置账户，也不会因刷新页面产生模拟买卖。</p>
       <button id="paperRiskRefresh" onclick="refreshPaperRisk()">刷新风控状态</button>
     </div>
-    <div id="paperRiskResult" aria-live="polite"><div class="loading">正在读取五套策略的风险状态…</div></div>
+    <div id="paperRiskResult" aria-live="polite"><div class="loading">正在读取各策略的风险状态…</div></div>
   </div>
   <div id="paperExecutionView" class="paper-execution-view" hidden><div class="loading">正在读取执行画像与执行队列…</div></div>
 </div>
@@ -166,7 +166,7 @@
   </section>
   <div class="strategy-console-layout">
   <nav class="module-tabs strategy-module-tabs" aria-label="策略选股二级导航" role="tablist">
-    <button class="module-tab active" role="tab" aria-selected="true" data-strategy="" onclick="choosePaperStrategy('',this)"><span class="module-code">ALL</span><span class="module-copy"><b>全部策略</b><small>五套策略分组展示</small></span></button>
+    <button class="module-tab active" role="tab" aria-selected="true" data-strategy="" onclick="choosePaperStrategy('',this)"><span class="module-code">ALL</span><span class="module-copy"><b>全部策略</b><small>策略分组展示</small></span></button>
     <button class="module-tab" role="tab" aria-selected="false" data-strategy="tq_breakout" onclick="choosePaperStrategy('tq_breakout',this)"><span class="module-code">01</span><span class="module-copy"><b>策略1 短线日内做T</b><small>动量 · 资金 · 量能</small></span></button>
     <button class="module-tab" role="tab" aria-selected="false" data-strategy="trend_pullback" onclick="choosePaperStrategy('trend_pullback',this)"><span class="module-code">02</span><span class="module-copy"><b>策略2 趋势波段优选</b><small>价值 · 质量 · 回踩</small></span></button>
     <button class="module-tab" role="tab" aria-selected="false" data-strategy="sector_rotation" onclick="choosePaperStrategy('sector_rotation',this)"><span class="module-code">03</span><span class="module-copy"><b>策略3 板块轮动先锋</b><small>情绪 · 资金 · 动量</small></span></button>
@@ -178,7 +178,7 @@
     <div class="controls">
       <select id="selStrategy" class="wide" style="display:none"></select>
       <div class="control-field"><label for="selTopn">每策略入选上限</label><select id="selTopn"><option selected>5</option><option>10</option><option>20</option></select></div>
-      <div id="selStrategyDesc" class="strategy-model-note">五套策略与「策略模拟」同源；每交易日盘后 17:25 自动按评分各选前 5 只，重跑覆盖当天结果。</div>
+      <div id="selStrategyDesc" class="strategy-model-note">内置研究模型与「策略模拟」同源；每交易日盘后 17:25 自动按评分各选前 5 只，重跑覆盖当天结果。自定义策略的正式候选与模拟交易请在「策略中心」/「策略模拟」查看——本页研究重跑仅支持内置研究模型。</div>
       <button id="btnSelect" onclick="runPaperSelection()">立即重跑选股</button>
       <button class="ghost" onclick="loadPaperSelection()">刷新结果</button>
     </div>
