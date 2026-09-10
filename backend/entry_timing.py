@@ -19,7 +19,8 @@ import os
 import threading
 
 BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-STATE_PATH = os.path.join(BASE, "data_cache", "entry_timing_state.json")
+import data_paths
+STATE_PATH = data_paths.data_path("entry_timing_state.json")
 
 _lock = threading.Lock()
 _state = None
