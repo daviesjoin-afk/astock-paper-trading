@@ -14,7 +14,7 @@
 
 ## Dashboard 预览
 
-当前发布版本：**v1.2.0**。查看 [详细更新与升级说明](docs/RELEASE-v1.2.0.md)、[架构说明](ARCHITECTURE.md) 和 [安全边界](SECURITY.md)。CI 验证 Python 3.11/3.12；API 返回的历史内部版本 2.0.0 不代表 Release 标签。
+当前发布版本：**v1.2.0**。查看 [详细更新与升级说明](docs/RELEASE-v1.2.0.md)、[架构说明](ARCHITECTURE.md)、[仓库结构地图](docs/REPOSITORY_LAYOUT.md) 和 [安全边界](SECURITY.md)。CI 验证 Python 3.11/3.12；API 返回的历史内部版本 2.0.0 不代表 Release 标签。
 
 ![模拟盘 Dashboard 预览](docs/assets/dashboard.png)
 
@@ -101,7 +101,8 @@ backend/
   main.py               FastAPI + Web 看板入口
   test_*.py             回归测试（含离线确定性演示 golden replay）
 frontend/               Web 看板与审计界面（esbuild 构建）
-docs/                   运行手册、设置 PRD、测试场景矩阵、发布说明
+docs/                   运行手册、设置 PRD、测试场景矩阵、发布说明、仓库结构地图
+docs/archive/           已完成的历史计划与快照（只作追溯，不代表当前设计）
 .github/workflows/       GitHub Actions CI（含离线测试层）
 Dockerfile              应用镜像
 docker-compose.yml      本地/单机容器运行
