@@ -29,6 +29,7 @@ import metrics as MET
 from api_paper import risk_refresh_status, router as paper_router
 from api_adaptive import router as adaptive_router
 from api_settings import router as settings_router
+from api_strategies import router as strategies_router
 from resource_guard import heavy_job_lease
 
 FRONTEND = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "frontend")
@@ -496,6 +497,7 @@ app.mount("/assets", StaticFiles(directory=os.path.join(FRONTEND, "assets")), na
 app.include_router(paper_router)
 app.include_router(adaptive_router)
 app.include_router(settings_router)
+app.include_router(strategies_router)
 
 
 def _stock_code(code):
@@ -643,7 +645,10 @@ def sector_events(limit: int = Query(10, ge=1, le=20)):
         })
     return {"events": grouped, "note": "仅针对资金异动板块的代表股按名称匹配公开快讯，可能遗漏或误匹配。"}
 
-@app.get("/api/strategies")
+# PR-45：``/api/strategies`` 现在是 Strategy Admin API（注册表语义，
+# 见 api_strategies.py）。选股扫描页的静态策略列表迁到专属路径，
+# 避免同一路径两种语义把 UI 打挂。
+@app.get("/api/scanner-strategies")
 def strategies():
     return {"strategies": [{"id": k, **v} for k, v in S.STRATEGIES.items()]}
 
@@ -706,51 +711,6 @@ def _strategy_http_error(exc):
     raise HTTPException(status_code=status, detail=message) from exc
 
 
-@app.post("/api/strategies")
-async def create_strategy(payload: dict):
-    try:
-        with _strategy_write_connection() as conn:
-            strategy = SR.create_user_definition(
-                conn, payload.get("id"), payload.get("name"),
-                implementation_key=payload.get("implementation_key") or "",
-                description=payload.get("description") or "", metadata=payload.get("metadata"),
-                dsl_ast=payload.get("dsl_ast"), actor=payload.get("actor") or "api",
-            )
-            readiness = SR.runtime_readiness(conn, strategy.id)
-        return {"strategy": strategy.to_dict(), "readiness": readiness}
-    except ValueError as exc:
-        _strategy_http_error(exc)
-
-
-@app.patch("/api/strategies/{strategy_id}")
-async def update_strategy(strategy_id: str, payload: dict):
-    try:
-        with _strategy_write_connection() as conn:
-            strategy = SR.save_definition(
-                conn, strategy_id, payload.get("changes") or {},
-                expected_version=payload.get("expected_version"), actor=payload.get("actor") or "api",
-                change_note=payload.get("change_note") or "",
-            )
-            readiness = SR.runtime_readiness(conn, strategy_id)
-        return {"version": strategy.to_dict(), "readiness": readiness}
-    except ValueError as exc:
-        _strategy_http_error(exc)
-
-
-@app.post("/api/strategies/{strategy_id}/clone")
-async def clone_strategy(strategy_id: str, payload: dict):
-    try:
-        with _strategy_write_connection() as conn:
-            strategy = SR.clone_definition(
-                conn, strategy_id, payload.get("source_version"), payload.get("id"),
-                name=payload.get("name"), actor=payload.get("actor") or "api",
-            )
-            readiness = SR.runtime_readiness(conn, strategy.id)
-        return {"strategy": strategy.to_dict(), "readiness": readiness}
-    except ValueError as exc:
-        _strategy_http_error(exc)
-
-
 @app.post("/api/strategies/{strategy_id}/validate")
 async def validate_strategy(strategy_id: str, payload: dict | None = None):
     payload = payload or {}
@@ -803,14 +763,6 @@ async def archive_strategy(strategy_id: str, payload: dict | None = None):
     except ValueError as exc:
         _strategy_http_error(exc)
 
-
-@app.delete("/api/strategies/{strategy_id}")
-async def delete_strategy(strategy_id: str):
-    try:
-        with _strategy_write_connection() as conn:
-            return SR.hard_delete_unused_draft(conn, strategy_id)
-    except ValueError as exc:
-        _strategy_http_error(exc)
 
 @app.get("/api/init/status")
 def init_status():
