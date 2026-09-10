@@ -181,9 +181,14 @@ def position_limits(
     不变式：``Σ limits ≤ total_cap ≤ min(hard_pool_cap, Σ max_positions)``，
     且 ``Σ limits ≥ 0``；函数返回前再做一次最终钳制，保证无论输入如何
     都不会越过共享池硬上限。
+
+    **确定性 tie-break（PR-54）**：同分策略的取舍顺序是显式的——先看
+    ``account_order``（越小越优先），再按策略 id 字典序。因此结果只取决于
+    策略集合本身，与调用方传入的 list 顺序无关（此前同分时依赖
+    ``max(...)`` 命中输入列表里的第一个，同一组策略换顺序会拿到不同席位）。
     """
     runtime_map = _runtime_map(runtimes)
-    ids = list(runtime_map)
+    ids = sorted(runtime_map)
     count = len(ids)
     if count == 0:
         return {
@@ -240,7 +245,7 @@ def position_limits(
     }
     # 全局下限之和不得超过总席位，否则先压缩各策略下限。
     while sum(minimum.values()) > total_cap and any(minimum[key] > 0 for key in ids):
-        heaviest = max(ids, key=lambda item: (minimum[item], -order.get(item, 99)))
+        heaviest = max(ids, key=lambda item: (minimum[item], -order.get(item, 99), item))
         minimum[heaviest] -= 1
     weight_total = sum(weights.values()) or 1.0
     raw = {key: total_cap * weights[key] / weight_total for key in ids}
@@ -255,7 +260,7 @@ def position_limits(
         key = max(
             candidates,
             key=lambda item: (
-                raw[item] - limits[item], weights[item], -order.get(item, 99)
+                raw[item] - limits[item], weights[item], -order.get(item, 99), item
             ),
         )
         limits[key] += 1
@@ -266,7 +271,7 @@ def position_limits(
         key = max(
             candidates,
             key=lambda item: (
-                limits[item] - raw[item], -weights[item], order.get(item, 99)
+                limits[item] - raw[item], -weights[item], order.get(item, 99), item
             ),
         )
         limits[key] -= 1
@@ -277,7 +282,7 @@ def position_limits(
             removable = [key for key in ids if limits[key] > 0]
             if not removable:
                 break
-        key = max(removable, key=lambda item: (limits[item], order.get(item, 99)))
+        key = max(removable, key=lambda item: (limits[item], order.get(item, 99), item))
         limits[key] -= 1
     return {
         "engine": ALLOCATION_ENGINE_VERSION,
