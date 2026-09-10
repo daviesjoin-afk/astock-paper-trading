@@ -2008,3 +2008,9 @@ body.dark .strategy-workbench-empty { background:rgba(255,255,255,.02); }
 .strategy-user-card header { display:flex; justify-content:space-between; align-items:flex-start; gap:10px; }
 .strategy-user-card header b { font-size:14px; }
 body.dark .settings-strategy-item,body.dark .strategy-user-card { background:rgba(255,255,255,.03); }
+
+/* ============ PR-49：策略中心空态 / 发布版本收口 ============ */
+.strategy-workbench-empty-inline { text-align:left; align-items:flex-start; margin:0 0 14px; }
+.strategy-workbench-empty-inline p { margin:2px 0 10px; }
+.strategy-workbench-empty .ghost { border:1px solid var(--border); background:var(--surface); color:var(--text); border-radius:8px; padding:6px 12px; cursor:pointer; font-size:12px; }
+.settings-head-state { max-width:52ch; }
