@@ -1,23 +1,26 @@
 # -*- coding: utf-8 -*-
 """PR-45：Strategy Admin API（``/api/strategies``）闭环与错误映射。
 
-端到端跑通产品验收链条：创建 draft → 列表可见 → validate → transition
-validated → transition active（supports_new_cycle=true）→ 编辑产生 v2 →
-clone → pause → resume；并锁定错误语义：非法 id 400 / 重复 id 409 /
-非法 DSL 422 / 版本冲突 409 / 非法状态迁移 409 / 已引用与内置策略不可删。
+说明：直接调用路由函数并断言 ``HTTPException`` 的状态码，而不是起 HTTP
+客户端——CI/容器镜像里的 starlette 需要 ``httpx2``，测试不该依赖额外的
+网络栈包。路由是否真的挂到产品 app 上由 ``test_routes_registered_on_app``
+单独锁住（检查 ``main.app.routes``）。
+
+覆盖：创建 draft → 列表可见 → validate → transition validated →
+transition active（supports_new_cycle=true）→ 编辑产生 v2 → clone →
+pause → resume；以及错误语义：非法 id 400 / 重复 id 409 / 非法 DSL 422 /
+版本冲突 409 / 非法状态迁移 409 / 已引用与内置策略不可删。
 """
 from __future__ import annotations
 
 import os
-
 import shutil
 import tempfile
 import types
+import unittest
 import unittest.mock
 
-import unittest
-
-from fastapi.testclient import TestClient
+from fastapi import HTTPException
 
 import api_strategies as API
 import main
@@ -49,8 +52,6 @@ class ApiStrategiesTests(unittest.TestCase):
         P.DB_PATH = os.path.join(cls._tmp, "paper_trading.sqlite3")
         SR.DEFAULT_DB_PATH = P.DB_PATH
         P.init_db()
-        SRT.clear_cache()
-        cls.client = TestClient(main.app)
 
     @classmethod
     def tearDownClass(cls):
@@ -62,7 +63,14 @@ class ApiStrategiesTests(unittest.TestCase):
     def setUp(self):
         SRT.clear_cache()
 
-    # ---------- 辅助 ----------
+    # ---------- 辅助：调用路由函数并归一化成 (status, body) ----------
+
+    @staticmethod
+    def _call(func, *args, default_status: int = 200, **kwargs):
+        try:
+            return default_status, func(*args, **kwargs)
+        except HTTPException as exc:
+            return exc.status_code, {"detail": exc.detail}
 
     def _create(self, strategy_id: str, **overrides):
         payload = {
@@ -73,12 +81,18 @@ class ApiStrategiesTests(unittest.TestCase):
             "dsl_ast": RULE,
         }
         payload.update(overrides)
-        return self.client.post("/api/strategies", json=payload)
+        return self._call(API.create_strategy, payload, default_status=201)
 
     def _create_draft(self, strategy_id: str):
-        response = self._create(strategy_id)
-        self.assertEqual(response.status_code, 201, response.text)
-        return response.json()
+        status, body = self._create(strategy_id)
+        self.assertEqual(status, 201, body)
+        return body
+
+    def _transition(self, strategy_id: str, to_status: str, expected_status=None):
+        payload = {"to_status": to_status, "reason": "接口测试"}
+        if expected_status is not None:
+            payload["expected_status"] = expected_status
+        return self._call(API.transition_strategy, strategy_id, payload)
 
     def _reference(self, strategy_id: str) -> None:
         """制造一条历史引用，使该 draft 不再可硬删除。"""
@@ -92,13 +106,28 @@ class ApiStrategiesTests(unittest.TestCase):
                  version.version, version.checksum),
             )
 
+    # ---------- 0) 路由注册 ----------
+
+    def test_routes_registered_on_app(self):
+        paths = {getattr(route, "path", None) for route in main.app.routes}
+        for expected in (
+            "/api/strategies",
+            "/api/strategies/validate",
+            "/api/strategies/preview",
+            "/api/strategies/{strategy_id}",
+            "/api/strategies/{strategy_id}/transition",
+            "/api/strategies/{strategy_id}/clone",
+            "/api/strategies/{strategy_id}/versions",
+            "/api/strategies/{strategy_id}/events",
+        ):
+            self.assertIn(expected, paths, expected)
+
     # ---------- 1) 列表 ----------
 
     def test_list_returns_builtins_and_user_with_summary(self):
         self._create_draft("api_list_alpha")
-        response = self.client.get("/api/strategies")
-        self.assertEqual(response.status_code, 200)
-        body = response.json()
+        status, body = self._call(API.list_strategies)
+        self.assertEqual(status, 200)
         ids = {item["id"] for item in body["items"]}
         self.assertIn("trend_pullback", ids)
         self.assertIn("api_list_alpha", ids)
@@ -111,28 +140,25 @@ class ApiStrategiesTests(unittest.TestCase):
         self.assertTrue(summary["user"])
 
     def test_list_origin_filter(self):
-        response = self.client.get("/api/strategies", params={"origin": "builtin"})
-        self.assertEqual(response.status_code, 200)
-        items = response.json()["items"]
-        self.assertTrue(items)
-        self.assertTrue(all(item["origin"] == "builtin" for item in items))
+        status, body = self._call(API.list_strategies, origin="builtin")
+        self.assertEqual(status, 200)
+        self.assertTrue(body["items"])
+        self.assertTrue(all(item["origin"] == "builtin" for item in body["items"]))
 
     def test_list_invalid_origin_is_rejected(self):
-        response = self.client.get("/api/strategies", params={"origin": "martian"})
-        self.assertEqual(response.status_code, 400)
+        status, _body = self._call(API.list_strategies, origin="martian")
+        self.assertEqual(status, 400)
 
     # ---------- 2) 详情 ----------
 
     def test_detail_includes_definition_version_and_runtime(self):
         created = self._create_draft("api_detail_alpha")
-        response = self.client.get(f"/api/strategies/{created['id']}")
-        self.assertEqual(response.status_code, 200)
-        body = response.json()
+        status, body = self._call(API.get_strategy, created["id"])
+        self.assertEqual(status, 200)
         self.assertEqual(body["id"], "api_detail_alpha")
         self.assertEqual(body["origin"], "user")
         self.assertEqual(body["status"], "draft")
         self.assertEqual(body["version"], 1)
-        self.assertTrue(body["definition"]["dsl_ast"])
         self.assertEqual(body["definition"]["dsl_ast"], RULE)
         self.assertTrue(body["runtime_ready"], body.get("runtime"))
         self.assertIn("risk_fingerprint", body["runtime"])
@@ -140,10 +166,13 @@ class ApiStrategiesTests(unittest.TestCase):
         self.assertIn("execution_profile", body["runtime"])
         # PR-26：draft 不部署资金（shadow），validated/active 才是 pilot。
         self.assertEqual(body["runtime"]["lifecycle_stage"], "shadow")
-        self.assertIn("items", self.client.get("/api/strategies/api_detail_alpha/events").json())
+        status, events = self._call(API.list_strategy_events, created["id"])
+        self.assertEqual(status, 200)
+        self.assertTrue(events["items"])
 
     def test_detail_unknown_strategy_404(self):
-        self.assertEqual(self.client.get("/api/strategies/nope_missing").status_code, 404)
+        status, _body = self._call(API.get_strategy, "nope_missing")
+        self.assertEqual(status, 404)
 
     def test_detail_runtime_failure_does_not_500(self):
         # RuntimeContext 构建失败（编译期异常）必须降级为 runtime_ready=false，
@@ -156,9 +185,8 @@ class ApiStrategiesTests(unittest.TestCase):
 
         fake_runtime = types.SimpleNamespace(get_context=_boom)
         with unittest.mock.patch.object(API, "SRT", fake_runtime):
-            response = self.client.get(f"/api/strategies/{created['id']}")
-        self.assertEqual(response.status_code, 200, response.text)
-        body = response.json()
+            status, body = self._call(API.get_strategy, created["id"])
+        self.assertEqual(status, 200, body)
         self.assertFalse(body["runtime_ready"])
         self.assertIn("编译失败", str(body["runtime"]["runtime_error"]))
 
@@ -173,78 +201,75 @@ class ApiStrategiesTests(unittest.TestCase):
         self.assertTrue(body["has_dsl"])
 
     def test_create_invalid_id_400(self):
-        response = self._create("BAD ID!")
-        self.assertEqual(response.status_code, 400, response.text)
+        status, _body = self._create("BAD ID!")
+        self.assertEqual(status, 400)
 
     def test_create_duplicate_id_409(self):
         self._create_draft("api_dup_alpha")
-        response = self._create("api_dup_alpha")
-        self.assertEqual(response.status_code, 409, response.text)
+        status, _body = self._create("api_dup_alpha")
+        self.assertEqual(status, 409)
 
     def test_create_builtin_conflict_409(self):
-        response = self._create("trend_pullback")
-        self.assertEqual(response.status_code, 409, response.text)
+        status, _body = self._create("trend_pullback")
+        self.assertEqual(status, 409)
 
     def test_create_invalid_dsl_422(self):
-        response = self._create("api_bad_dsl", dsl_ast=BAD_RULE)
-        self.assertEqual(response.status_code, 422, response.text)
+        status, _body = self._create("api_bad_dsl", dsl_ast=BAD_RULE)
+        self.assertEqual(status, 422)
 
     # ---------- 4) 编辑 → 不可变新版本 ----------
 
     def test_save_creates_next_immutable_version(self):
         created = self._create_draft("api_edit_alpha")
-        response = self.client.put(
-            f"/api/strategies/{created['id']}",
-            json={"expected_version": 1, "change_note": "调整量能阈值",
-                  "changes": {"description": "第二版"}},
+        status, body = self._call(
+            API.update_strategy, created["id"],
+            {"expected_version": 1, "change_note": "调整量能阈值",
+             "changes": {"description": "第二版"}},
         )
-        self.assertEqual(response.status_code, 200, response.text)
-        self.assertEqual(response.json()["created_version"], 2)
-        detail = self.client.get(f"/api/strategies/{created['id']}").json()
+        self.assertEqual(status, 200, body)
+        self.assertEqual(body["created_version"], 2)
+        _status, detail = self._call(API.get_strategy, created["id"])
         self.assertEqual(detail["version"], 2)
         self.assertEqual(detail["definition"]["description"], "第二版")
-        versions = self.client.get(f"/api/strategies/{created['id']}/versions").json()["items"]
-        self.assertEqual([row["version"] for row in versions], [1, 2])
+        _status, versions = self._call(API.list_strategy_versions, created["id"])
+        self.assertEqual([row["version"] for row in versions["items"]], [1, 2])
 
     def test_save_expected_version_conflict_409(self):
         created = self._create_draft("api_conflict_alpha")
-        response = self.client.put(
-            f"/api/strategies/{created['id']}",
-            json={"expected_version": 9, "changes": {"description": "过期写"}},
+        status, _body = self._call(
+            API.update_strategy, created["id"],
+            {"expected_version": 9, "changes": {"description": "过期写"}},
         )
-        self.assertEqual(response.status_code, 409, response.text)
+        self.assertEqual(status, 409)
 
     def test_save_non_versioned_field_400(self):
         created = self._create_draft("api_nonversioned")
-        response = self.client.put(
-            f"/api/strategies/{created['id']}",
-            json={"changes": {"origin": "builtin"}},
+        status, _body = self._call(
+            API.update_strategy, created["id"], {"changes": {"origin": "builtin"}},
         )
-        self.assertEqual(response.status_code, 400, response.text)
+        self.assertEqual(status, 400)
 
     # ---------- 5) 验证 ----------
 
     def test_validate_valid_and_invalid(self):
-        ok = self.client.post("/api/strategies/validate", json={"dsl_ast": RULE}).json()
+        _status, ok = self._call(API.validate_strategy, {"dsl_ast": RULE})
         self.assertTrue(ok["valid"], ok)
         self.assertTrue(ok["checksum"])
         self.assertTrue(ok["normalized_ast"])
-        bad = self.client.post("/api/strategies/validate", json={"dsl_ast": BAD_RULE})
-        self.assertEqual(bad.status_code, 200)
-        self.assertFalse(bad.json()["valid"])
-        self.assertTrue(bad.json()["errors"])
-        missing = self.client.post("/api/strategies/validate", json={}).json()
+        _status, bad = self._call(API.validate_strategy, {"dsl_ast": BAD_RULE})
+        self.assertFalse(bad["valid"])
+        self.assertTrue(bad["errors"])
+        _status, missing = self._call(API.validate_strategy, {})
         self.assertFalse(missing["valid"])
 
     # ---------- 6) 预览 ----------
 
     def test_preview_returns_unified_profiles(self):
-        response = self.client.post(
-            "/api/strategies/preview",
-            json={"dsl_ast": RULE, "metadata": {"style": "trend", "hold": 8}},
+        status, body = self._call(
+            API.preview_strategy,
+            {"dsl_ast": RULE, "metadata": {"style": "trend", "hold": 8}},
         )
-        self.assertEqual(response.status_code, 200, response.text)
-        body = response.json()
+        self.assertEqual(status, 200, body)
         self.assertTrue(body["valid"], body)
         self.assertIn("archetype", body["risk_fingerprint"])
         self.assertIn("risk_profile", body)
@@ -257,81 +282,72 @@ class ApiStrategiesTests(unittest.TestCase):
     def test_full_lifecycle_to_active_pause_resume(self):
         created = self._create_draft("api_life_alpha")
         sid = created["id"]
-
-        def move(to_status, expected_status):
-            return self.client.post(
-                f"/api/strategies/{sid}/transition",
-                json={"to_status": to_status, "expected_status": expected_status,
-                      "reason": "接口测试"},
-            )
-
-        self.assertEqual(move("validated", "draft").status_code, 200, "draft→validated")
-        active = move("active", "validated")
-        self.assertEqual(active.status_code, 200, active.text)
-        self.assertTrue(active.json()["supports_new_cycle"], "active 后必须可进新周期")
+        status, _body = self._transition(sid, "validated", "draft")
+        self.assertEqual(status, 200, "draft→validated")
+        status, active = self._transition(sid, "active", "validated")
+        self.assertEqual(status, 200, active)
+        self.assertTrue(active["supports_new_cycle"], "active 后必须可进新周期")
         # 用户策略上线即试点：active 后 runtime 阶段为 pilot（内置才是 standard）。
-        self.assertEqual(active.json()["runtime"]["lifecycle_stage"], "pilot")
-        paused = move("paused", "active")
-        self.assertEqual(paused.status_code, 200)
-        self.assertFalse(paused.json()["supports_new_cycle"])
-        resumed = move("active", "paused")
-        self.assertEqual(resumed.status_code, 200, resumed.text)
-        self.assertTrue(resumed.json()["supports_new_cycle"])
+        self.assertEqual(active["runtime"]["lifecycle_stage"], "pilot")
+        status, paused = self._transition(sid, "paused", "active")
+        self.assertEqual(status, 200, paused)
+        self.assertFalse(paused["supports_new_cycle"])
+        status, resumed = self._transition(sid, "active", "paused")
+        self.assertEqual(status, 200, resumed)
+        self.assertTrue(resumed["supports_new_cycle"])
 
     def test_invalid_transition_409(self):
         created = self._create_draft("api_jump_alpha")
-        response = self.client.post(
-            f"/api/strategies/{created['id']}/transition", json={"to_status": "active"},
-        )
-        self.assertEqual(response.status_code, 409, response.text)
+        status, _body = self._transition(created["id"], "active")
+        self.assertEqual(status, 409)
+
+    def test_transition_requires_to_status(self):
+        created = self._create_draft("api_no_status")
+        status, _body = self._call(API.transition_strategy, created["id"], {})
+        self.assertEqual(status, 400)
 
     # ---------- 8) Clone ----------
 
     def test_clone_returns_user_draft_v1(self):
         created = self._create_draft("api_clone_src")
-        response = self.client.post(
-            f"/api/strategies/{created['id']}/clone",
-            json={"source_version": 1, "new_strategy_id": "api_clone_dst",
-                  "name": "我的趋势策略副本"},
+        status, body = self._call(
+            API.clone_strategy, created["id"],
+            {"source_version": 1, "new_strategy_id": "api_clone_dst",
+             "name": "我的趋势策略副本"},
+            default_status=201,
         )
-        self.assertEqual(response.status_code, 201, response.text)
-        body = response.json()
+        self.assertEqual(status, 201, body)
         self.assertEqual(body["id"], "api_clone_dst")
         self.assertEqual(body["origin"], "user")
         self.assertEqual(body["status"], "draft")
         self.assertEqual(body["version"], 1)
         self.assertEqual(body["name"], "我的趋势策略副本")
         self.assertFalse(body["supports_new_cycle"])
-        versions = self.client.get("/api/strategies/api_clone_dst/versions").json()["items"]
-        self.assertEqual(versions[0]["cloned_from_strategy_id"], "api_clone_src")
-        self.assertEqual(versions[0]["cloned_from_version"], 1)
+        _status, versions = self._call(API.list_strategy_versions, "api_clone_dst")
+        self.assertEqual(versions["items"][0]["cloned_from_strategy_id"], "api_clone_src")
+        self.assertEqual(versions["items"][0]["cloned_from_version"], 1)
 
     def test_clone_duplicate_target_409(self):
         created = self._create_draft("api_clone_dup")
-        response = self.client.post(
-            f"/api/strategies/{created['id']}/clone",
-            json={"source_version": 1, "new_strategy_id": "api_clone_dup"},
+        status, _body = self._call(
+            API.clone_strategy, created["id"],
+            {"source_version": 1, "new_strategy_id": "api_clone_dup"},
+            default_status=201,
         )
-        self.assertEqual(response.status_code, 409, response.text)
+        self.assertEqual(status, 409)
 
     # ---------- 9) 版本与事件 ----------
 
     def test_versions_and_events_timeline(self):
         created = self._create_draft("api_hist_alpha")
-        self.client.put(
-            f"/api/strategies/{created['id']}/transition", json={},
-        )  # 空 payload → 400，不影响历史
-        self.client.post(
-            f"/api/strategies/{created['id']}/transition",
-            json={"to_status": "validated", "expected_status": "draft"},
-        )
-        versions = self.client.get(f"/api/strategies/{created['id']}/versions").json()
+        self._transition(created["id"], "validated", "draft")
+        _status, versions = self._call(API.list_strategy_versions, created["id"])
         self.assertEqual(len(versions["items"]), 1)
         self.assertEqual(versions["items"][0]["version"], 1)
         self.assertTrue(versions["items"][0]["checksum"])
         self.assertEqual(versions["items"][0]["change_note"], "initial user definition")
-        events = self.client.get(f"/api/strategies/{created['id']}/events").json()["items"]
-        transitions = [(row["from_status"], row["to_status"]) for row in events]
+        _status, events = self._call(API.list_strategy_events, created["id"])
+        transitions = [(row["from_status"], row["to_status"]) for row in events["items"]]
         self.assertIn((None, "draft"), transitions)
         self.assertIn(("draft", "validated"), transitions)
 
@@ -339,37 +355,30 @@ class ApiStrategiesTests(unittest.TestCase):
 
     def test_unused_draft_can_be_deleted(self):
         self._create_draft("api_del_free")
-        response = self.client.delete("/api/strategies/api_del_free")
-        self.assertEqual(response.status_code, 200, response.text)
-        self.assertTrue(response.json()["deleted"])
-        self.assertEqual(self.client.get("/api/strategies/api_del_free").status_code, 404)
+        status, body = self._call(API.delete_strategy, "api_del_free")
+        self.assertEqual(status, 200, body)
+        self.assertTrue(body["deleted"])
+        status, _body = self._call(API.get_strategy, "api_del_free")
+        self.assertEqual(status, 404)
 
     def test_referenced_draft_cannot_be_deleted(self):
         self._create_draft("api_del_used")
         self._reference("api_del_used")
-        response = self.client.delete("/api/strategies/api_del_used")
-        self.assertEqual(response.status_code, 409, response.text)
-        detail = response.json()["detail"]
-        self.assertIn("归档", str(detail))
+        status, body = self._call(API.delete_strategy, "api_del_used")
+        self.assertEqual(status, 409, body)
+        self.assertIn("归档", str(body["detail"]))
 
     def test_builtin_cannot_be_deleted(self):
-        response = self.client.delete("/api/strategies/trend_pullback")
-        self.assertEqual(response.status_code, 409, response.text)
+        status, _body = self._call(API.delete_strategy, "trend_pullback")
+        self.assertEqual(status, 409)
 
     def test_active_strategy_cannot_be_deleted(self):
         created = self._create_draft("api_del_active")
-        self.client.post(
-            f"/api/strategies/{created['id']}/transition",
-            json={"to_status": "validated", "expected_status": "draft"},
-        )
-        activated = self.client.post(
-            f"/api/strategies/{created['id']}/transition",
-            json={"to_status": "active", "expected_status": "validated"},
-        )
-        self.assertEqual(activated.status_code, 200, activated.text)
-        self.assertEqual(
-            self.client.delete(f"/api/strategies/{created['id']}").status_code, 409,
-        )
+        self._transition(created["id"], "validated", "draft")
+        status, body = self._transition(created["id"], "active", "validated")
+        self.assertEqual(status, 200, body)
+        status, _body = self._call(API.delete_strategy, created["id"])
+        self.assertEqual(status, 409)
 
 
 if __name__ == "__main__":  # pragma: no cover

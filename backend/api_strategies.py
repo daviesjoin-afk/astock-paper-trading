@@ -15,6 +15,7 @@ API 层不复制任何规则、不手写 SQL、不重新计算风险画像。
 from __future__ import annotations
 
 from collections.abc import Mapping
+from typing import Annotated
 
 from fastapi import APIRouter, HTTPException, Query
 
@@ -147,9 +148,14 @@ def _detail(conn, spec: SR.StrategySpec, *, with_runtime: bool = True) -> dict:
 
 @router.get("")
 def list_strategies(
-    origin: str | None = Query(None, description="builtin / user"),
-    status: str | None = Query(None, description="draft/validated/active/paused/retiring/archived"),
-    include_archived: bool = Query(False),
+    # Annotated + 默认值写法：保留 OpenAPI 元数据，同时让直接函数调用
+    # （测试/内部复用）拿到真实的 None，而不是 Query 描述对象。
+    origin: Annotated[str | None, Query(description="builtin / user")] = None,
+    status: Annotated[
+        str | None,
+        Query(description="draft/validated/active/paused/retiring/archived"),
+    ] = None,
+    include_archived: Annotated[bool, Query()] = False,
 ):
     P.init_db()
     try:
