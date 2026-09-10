@@ -36,6 +36,7 @@
   <div class="header-meta"><span class="mode-label">研究 · 纯模拟</span><time id="clock"></time><button class="header-settings-btn" type="button" onclick="activatePage('p-settings')" title="打开设置中心"><svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M12 8.2a3.8 3.8 0 1 0 0 7.6 3.8 3.8 0 0 0 0-7.6Z" stroke="currentColor" stroke-width="1.7"/><path d="m19.1 13.1 1.2 1-.1 1.8-1.8 1.1-1.5-.5-1.1.6-.3 1.5-1.7.7-1.7-.7-.3-1.5-1.1-.6-1.5.5-1.8-1.1-.1-1.8 1.2-1v-1.3l-1.2-1 .1-1.8 1.8-1.1 1.5.5 1.1-.6.3-1.5 1.7-.7 1.1.6 1.5-.5 1.8 1.1.1 1.8-1.2 1v1.3Z" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round"/></svg><span>设置</span></button><button class="header-ai-btn" type="button" onclick="switchToAdaptiveAI()" title="AI审阅与双AI调参" style="margin-right:6px;padding:4px 10px;background:linear-gradient(135deg,#10b981,#059669);border:none;color:#fff;border-radius:6px;font-size:12px;cursor:pointer;font-weight:600;letter-spacing:0.5px">🤖 AI</button><button class="page-refresh" type="button" onclick="refreshApp()" title="重新加载服务器最新页面与数据">刷新页面</button><button id="themeToggle" class="theme-toggle" aria-label="切换深色模式" aria-pressed="false" title="切换深色模式" onclick="toggleDark()"><svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M20.4 15.4A8.5 8.5 0 0 1 8.6 3.6 8.6 8.6 0 0 1 20.4 15.4Z" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/></svg></button></div>
 </header>
 <nav class="tabs" aria-label="主功能导航">
+  <button class="tab" data-page="p-strategies"><svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><rect x="3" y="3" width="7" height="7" rx="1.5" stroke="currentColor" stroke-width="1.8"/><rect x="14" y="3" width="7" height="7" rx="1.5" stroke="currentColor" stroke-width="1.8"/><rect x="3" y="14" width="7" height="7" rx="1.5" stroke="currentColor" stroke-width="1.8"/><path d="M14 17.5h7M17.5 14v7" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg><b>策略中心</b><small>创建 · 版本 · 生命周期</small></button>
   <button class="tab active" data-page="p-select"><svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M4 5h16M7 12h10m-7 7h4" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/><circle cx="7" cy="5" r="2" fill="currentColor"/><circle cx="15" cy="12" r="2" fill="currentColor"/><circle cx="12" cy="19" r="2" fill="currentColor"/></svg><b>策略选股</b><small>选股研究</small></button>
   <button class="tab" data-page="p-paper"><svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M4 19V9m5 10V5m6 14v-7m5 7V3" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/><path d="M3 21h18" stroke="currentColor" stroke-width="1.2" opacity=".6"/></svg><b>策略模拟</b><small>模拟交易台</small></button>
   <button class="tab" data-page="p-adaptive"><svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M12 3a4 4 0 0 0-3.8 2.8A3.5 3.5 0 0 0 5.5 12 4 4 0 0 0 9 18h1v3m2-18a4 4 0 0 1 3.8 2.8A3.5 3.5 0 0 1 18.5 12 4 4 0 0 1 15 18h-1v3M8 9h3m2 0h3M8 14h3m2 0h3" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg><b>自进化</b><small>盘面学习中心</small></button>
@@ -43,6 +44,25 @@
 </nav>
 
 <main id="appMain" tabindex="-1">
+<div id="p-strategies" class="page strategy-workbench-page">
+  <div class="page-header"><div><span class="page-kicker">创建 · 验证 · 版本 · 生命周期</span><h2>策略中心</h2><p>在这里创建自定义策略：可视化条件或声明式 DSL → 后端验证 → 风险与资金预览 → 保存草稿 → 激活 → 参与下一周期。内置五套策略保留为平台自带模板，可复制后修改。</p></div><div class="strategy-workbench-actions"><button class="strategy-workbench-new-btn" type="button" onclick="wbNewStrategy()">+ 新建策略</button></div></div>
+  <div id="wbSummary" class="strategy-workbench-summary" role="status" aria-live="polite">正在读取策略 Registry…</div>
+  <div class="strategy-workbench-toolbar">
+    <div class="strategy-workbench-filters" role="group" aria-label="策略筛选">
+      <button class="strategy-workbench-filter active" type="button" data-wb-origin="all" onclick="wbSetOriginFilter('all',this)">全部</button>
+      <button class="strategy-workbench-filter" type="button" data-wb-origin="builtin" onclick="wbSetOriginFilter('builtin',this)">内置</button>
+      <button class="strategy-workbench-filter" type="button" data-wb-origin="user" onclick="wbSetOriginFilter('user',this)">我的策略</button>
+      <button class="strategy-workbench-filter" type="button" data-wb-status="all" onclick="wbSetStatusFilter('all',this)">全部状态</button>
+      <button class="strategy-workbench-filter" type="button" data-wb-status="active" onclick="wbSetStatusFilter('active',this)">Active</button>
+      <button class="strategy-workbench-filter" type="button" data-wb-status="draft" onclick="wbSetStatusFilter('draft',this)">Draft</button>
+      <button class="strategy-workbench-filter" type="button" data-wb-status="paused" onclick="wbSetStatusFilter('paused',this)">Paused</button>
+    </div>
+    <input id="wbSearch" class="strategy-workbench-search" type="search" placeholder="搜索策略名称或 ID…" aria-label="搜索策略" oninput="wbRenderList()">
+  </div>
+  <div id="wbList" class="strategy-workbench-list" aria-live="polite"><div class="loading">正在读取策略…</div></div>
+  <div id="wbEditor" class="strategy-workbench-editor" hidden></div>
+  <div id="wbDetail" class="strategy-workbench-detail" hidden></div>
+</div>
 <div id="p-settings" class="page settings-page">
   <div class="page-header"><div><span class="page-kicker">运行控制 · 安全边界 · 版本审计</span><h2>设置中心</h2><p>集中管理模拟资金、五套策略、共享池风控和自进化接口。每次保存都会校验边界并留下审计记录。</p></div><div class="settings-head-state" id="settingsHeadState" role="status" aria-live="polite">正在读取设置…</div></div>
   <div class="settings-shell">
