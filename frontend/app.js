@@ -1595,7 +1595,7 @@ function renderSettings(data){
       var checked=strategyChecks.indexOf(item.id)>=0;
       var badge=wbStatusBadge(item.status);
       var extra='';
-      if(item.status==='paused') extra='<button type="button" class="settings-strategy-link" onclick="activatePage(\'p-strategies\')">去策略中心恢复</button>';
+      if(item.status==='paused') extra='<button type="button" class="settings-strategy-link" onclick="activatePage(\'p-strategies\')">去策略工坊恢复</button>';
       else if(!checkable&&item.status!=='active') extra='<small class="setting-help">'+adaptiveEsc((STRATEGY_STATUS_LABELS[item.status]||item.status)+' · 不可勾选')+'</small>';
       return '<label class="settings-strategy-item'+(checkable?'':' settings-strategy-item-disabled')+'">'
         +'<input type="checkbox" class="setting-strategy-enabled" value="'+adaptiveEsc(item.id)+'"'+settingsChecked(checked)+(checkable?'':' disabled')+'>'
@@ -1608,7 +1608,7 @@ function renderSettings(data){
     var userItems=items.filter(function(x){return x.origin==='user';});
     var strategyHtml='<p class="setting-help" style="margin:2px 0 6px">内置策略</p><div class="settings-strategy-group">'
       +builtinItems.map(strategyCheckbox).join('')+'</div>';
-    if(userItems.length) strategyHtml+='<p class="setting-help" style="margin:8px 0 6px">我的策略（在策略中心创建）</p><div class="settings-strategy-group">'+userItems.map(strategyCheckbox).join('')+'</div>';
+    if(userItems.length) strategyHtml+='<p class="setting-help" style="margin:8px 0 6px">我的策略（在策略工坊创建）</p><div class="settings-strategy-group">'+userItems.map(strategyCheckbox).join('')+'</div>';
     if(window._registryError) strategyHtml+='<p class="setting-help" style="color:var(--danger)">'+adaptiveEsc(window._registryError)+'</p>';
     strategyHtml+='<p class="setting-help" style="margin-top:8px">一个都不勾 = 下一周期零策略 idle：不产生新开仓，风险扫描、存量退出与系统调度照常工作。</p>';
     html='<div class="settings-grid"><section class="settings-panel"><h3>模拟盘与资金</h3><p>这些项目决定下一次新周期的初始资金、观察时长和参与策略。当前周期的本金、成交与归档不会被覆盖。</p><div class="settings-form">'
@@ -1640,14 +1640,14 @@ function renderSettings(data){
       var scale=(runtime.runtime_ready&&runtime.capital_scale!=null)?Math.round(runtime.capital_scale*100)+'%':'—';
       return '<article class="strategy-user-card" data-strategy-user-id="'+adaptiveEsc(item.id)+'"><header><div><b>'+adaptiveEsc(item.name||item.id)+'</b><small>'+adaptiveEsc(item.id)+' · v'+(item.current_version||1)+'</small></div>'+wbStatusBadge(item.status)+'</header>'
         +'<div class="strategy-preview-grid"><dt>生命周期阶段</dt><dd>'+stage+'</dd><dt>资金系数</dt><dd>'+scale+'</dd></div>'
-        +'<p class="setting-help">风险画像与参数由策略中心统一管理，这里只控制组合参与。</p>'
-        +'<div class="settings-actions"><button class="ghost" onclick="activatePage(\'p-strategies\')">去策略中心编辑</button></div></article>';
+        +'<p class="setting-help">风险画像与参数由策略工坊统一管理，这里只控制组合参与。</p>'
+        +'<div class="settings-actions"><button class="ghost" onclick="activatePage(\'p-strategies\')">去策略工坊编辑</button></div></article>';
     };
     var allItems=settingsStrategyItems();
     var builtinItems=allItems.filter(function(x){return x.origin==='builtin';});
     var userItems=allItems.filter(function(x){return x.origin==='user';});
     var cardsHtml=builtinItems.map(builtinCard).join('');
-    if(userItems.length) cardsHtml+='<h4 style="grid-column:1/-1;margin:4px 0 0">我的策略（参数在策略中心维护）</h4>'+userItems.map(userCard).join('');
+    if(userItems.length) cardsHtml+='<h4 style="grid-column:1/-1;margin:4px 0 0">我的策略（参数在策略工坊维护）</h4>'+userItems.map(userCard).join('');
     html='<div class="settings-grid"><section class="settings-panel"><h3>策略运行参数</h3><p>内置策略保留独立模型和审计身份。风格、席位和权重参数在下个新周期初始化，当前持仓不会被强行改写。</p><div class="strategy-settings-grid">'+cardsHtml+'</div><div class="settings-actions"><button onclick="saveSettingsSection(\'strategy\')">保存策略参数</button><button class="ghost" onclick="resetSettingsSection(\'strategy\')">恢复默认</button></div></section>'+settingsPreviewHtml(data,section)+'</div>';
   }else if(section==='execution'){
     var exe=settings.execution||{}, exeDefaults=(data.defaults||{}).execution||{};
@@ -2029,6 +2029,15 @@ function riskMetric(label,current,limit){
   var l=limit===null||limit===undefined?'—':fmt(limit,2)+'%';
   return '<div class="paper-risk-metric">'+label+'<b>'+c+' / '+l+'</b></div>';
 }
+/* ================= PR-52：模拟交易 → 运行策略（只读运行时面板） =================
+   策略定义的唯一编辑入口是主导航「策略工坊」（DSL / 版本 / 生命周期）。
+   本页只回答「当前周期里每个策略跑得怎么样」：参与、额度、阶段、席位占用、
+   等待原因。这里没有 DSL 编辑、没有版本保存、没有第二套 clone、没有第二套
+   生命周期编辑——需要改定义就跳转到策略工坊。 */
+var PAPER_STAGE_LABELS={shadow:'影子（不部署）',pilot:'试点',standard:'标准',mature:'成熟',quarantined:'隔离（不部署）'};
+// 生命周期状态中文名：设置中心的「启用策略」分组也在用（PR-52 从已删除的旧构建器里
+// 提升为模块级共享常量，避免设置页与运行策略页各写一份）。
+var STRATEGY_STATUS_LABELS={draft:'草稿',validated:'已验证',active:'运行中',paused:'已暂停',retiring:'退役中',archived:'已归档'};
 async function loadPaperStrategyCenter(){
   var target=$('paperStrategyView');
   if(!target) return;
@@ -2037,374 +2046,105 @@ async function loadPaperStrategyCenter(){
     renderPaperStrategyCenter(cached.data);
     if(Date.now()-cached.at<PAPER_NAV_TTL_MS) return;   // 缓存新鲜：零请求零重绘
   }else{
-    target.innerHTML='<div class="loading">正在读取策略规则…</div>';
+    target.innerHTML='<div class="loading">正在读取运行策略状态…</div>';
   }
   try{
-    var d=await api('/api/paper/strategy-center');
+    // 三个只读来源各司其职：分配解释=运行时参与/额度/阶段/等待原因；
+    // 注册表=规范身份与不可变版本；strategy-center=内置策略的风险边界摘要。
+    var results=await Promise.all([
+      api('/api/paper/allocation-explain'),
+      api('/api/strategies?include_archived=true&_='+Date.now()),
+      api('/api/paper/strategy-center').catch(function(){ return null; })
+    ]);
+    var d={allocation:results[0]||{},registry:results[1]||{},boundaries:results[2]||{}};
     window._paperStrategyCenterCache={data:d,at:Date.now()};
     renderPaperStrategyCenter(d);
-  }catch(e){ if(!cached) target.innerHTML='<div class="banner">策略中心读取失败：'+riskText(e.message||e)+'</div>'; }
+  }catch(e){ if(!cached) target.innerHTML='<div class="banner">运行策略读取失败：'+riskText(e.message||e)+'</div>'; }
+}
+function paperRunningStageLabel(row){
+  var stage=row&&row.capital_scale&&row.capital_scale.lifecycle_stage;
+  if(!stage) return '—';
+  return PAPER_STAGE_LABELS[stage]||stage;
+}
+function paperRunningStrategyCard(id,item,runtime,boundary){
+  item=item||{}; runtime=runtime||{};
+  var name=item.name||runtime.name||id;
+  var origin=item.origin==='builtin'?'内置':'自定义';
+  var originClass=item.origin==='builtin'?'strategy-card-origin-builtin':'strategy-card-origin-user';
+  var badge=(typeof wbStatusBadge==='function')?wbStatusBadge(item.status):riskText(item.status||'—');
+  var version=(item.current_version===null||item.current_version===undefined)?'—':item.current_version;
+  var checksum=String(item.current_checksum||'').slice(0,8);
+  var scale=(runtime.capital_scale&&runtime.capital_scale.factor!==null&&runtime.capital_scale.factor!==undefined)
+    ?Math.round(runtime.capital_scale.factor*100)+'%':'—';
+  var target=(runtime.target_budget&&runtime.target_budget.target_amount!==null&&runtime.target_budget.target_amount!==undefined)
+    ?cny(runtime.target_budget.target_amount):'—';
+  var deployable=(runtime.deployment&&runtime.deployment.deployable_amount!==null&&runtime.deployment.deployable_amount!==undefined)
+    ?cny(runtime.deployment.deployable_amount):'—';
+  var waiting=(runtime.deployment&&runtime.deployment.waiting_capital!==null&&runtime.deployment.waiting_capital!==undefined)
+    ?cny(runtime.deployment.waiting_capital):'—';
+  var blocked=(runtime.deployment&&runtime.deployment.blocked_reason)
+    ||(runtime.waiting_reason&&runtime.waiting_reason.reason)
+    ||(runtime.running?'正常运行，无阻塞':'未参与当前周期');
+  var limits='';
+  if(boundary){
+    limits='<div class="paper-strategy-section"><label>风险 / 执行边界（摘要）</label><div class="paper-strategy-metrics">'
+      +'<div>持仓周期<b>'+riskText(boundary.hold_range||'—')+'</b></div>'
+      +'<div>单股 / 总池预算<b>'+fmt(boundary.max_weight_pct,1)+'% / '+fmt(boundary.pool_budget_pct,2)+'%</b></div>'
+      +'<div>保底 / 风险画像<b>'+fmt(boundary.pool_floor_pct,2)+'% / '+fmt(boundary.max_exposure_pct,0)+'%</b></div>'
+      +'<div>单日亏损 / 回撤<b>'+fmt(boundary.daily_loss_pct,1)+'% / '+fmt(boundary.drawdown_pct,1)+'%</b></div>'
+      +'<div>行业 / 冷却<b>'+fmt(boundary.industry_limit_pct,0)+'% / '+riskText(boundary.cooldown_days)+'天</b></div>'
+      +'<div>入场模型<b>'+riskText(boundary.entry_model||'—')+'</b></div>'
+      +'</div></div>';
+  }
+  return '<article class="paper-strategy-card" data-strategy-id="'+adaptiveEsc(id)+'">'
+    +'<header><b>'+riskText(name)+'</b><span>'+badge+' <span class="strategy-card-origin '+originClass+'">'+origin+'</span></span></header>'
+    +'<div class="paper-strategy-section"><label>当前周期运行时</label><div class="paper-strategy-metrics">'
+    +'<div>参与本周期<b>'+(runtime.running?'是':'否')+'</b></div>'
+    +'<div>生命周期阶段<b>'+riskText(paperRunningStageLabel(runtime))+'</b></div>'
+    +'<div>资金系数<b>'+scale+'</b></div>'
+    +'<div>持仓席位<b>'+fmt(runtime.position_count,0)+' / '+fmt(runtime.position_limit,0)+'</b></div>'
+    +'<div>目标额度<b>'+target+'</b></div>'
+    +'<div>可部署<b>'+deployable+'</b></div>'
+    +'<div>未部署余额<b>'+waiting+'</b></div>'
+    +'</div></div>'
+    +limits
+    +'<div class="paper-strategy-section"><label>不可变版本</label><p>v'+riskText(version)
+    +(checksum?(' · '+riskText(checksum)):'')+(item.has_dsl?' · DSL':' · 原生')+'</p></div>'
+    +'<div class="paper-strategy-section"><label>等待 / 阻塞原因</label><p>'+riskText(blocked)+'</p></div>'
+    +'<div class="strategy-builder-toolbar"><button type="button" onclick="openInStrategyWorkbench(\''+adaptiveEsc(id)+'\')">在策略工坊打开</button></div>'
+    +'</article>';
+}
+function openInStrategyWorkbench(strategyId){
+  // PR-52：本页唯一的"去改定义"出口——跳到策略工坊；带 id 时直接打开该策略详情。
+  activatePage('p-strategies');
+  if(strategyId&&typeof wbOpenDetail==='function'){ wbOpenDetail(strategyId); return; }
+  if(typeof wbShowView==='function') wbShowView('list');
 }
 function renderPaperStrategyCenter(d){
   var target=$('paperStrategyView'); if(!target) return;
-  var cards=(d.strategies||[]).filter(function(s){return s.supports_new_cycle===true;}).map(function(s){
-      return '<article class="paper-strategy-card"><header><b>'+riskText(s.name)+'</b><span>'+riskText(s.mode)+' · '+riskText(s.entry_model)+'</span></header>'
-        +'<div class="paper-strategy-section"><label>候选来源</label><p>'+riskText(s.candidate)+'</p></div>'
-        +'<div class="paper-strategy-section"><label>入场执行</label><p>'+riskText(s.entry)+'</p></div>'
-        +'<div class="paper-strategy-section"><label>退出纪律</label><p>'+riskText(s.exit)+'</p></div>'
-        +'<div class="paper-strategy-section"><label>风险边界</label><div class="paper-strategy-metrics"><div>持仓周期<b>'+riskText(s.hold_range)+'</b></div><div>单股 / 总池预算<b>'+fmt(s.max_weight_pct,1)+'% / '+fmt(s.pool_budget_pct,2)+'%</b></div><div>保底 / 风险画像<b>'+fmt(s.pool_floor_pct,2)+'% / '+fmt(s.max_exposure_pct,0)+'%</b></div><div>单日亏损 / 回撤<b>'+fmt(s.daily_loss_pct,1)+'% / '+fmt(s.drawdown_pct,1)+'%</b></div><div>行业 / 冷却<b>'+fmt(s.industry_limit_pct,0)+'% / '+riskText(s.cooldown_days)+'天</b></div></div></div></article>';
-    }).join('');
-    var guards=(d.shared_guards||[]).map(function(item){return '<li>'+riskText(item)+'</li>';}).join('');
-    target.innerHTML='<section class="paper-strategy-intro"><div><h3>模拟盘策略中心</h3><p>这里展示的是当前服务器实际生效的策略定义与策略集合管理。策略规则与模拟账户共用同一配置来源；查看不会触发下单或改动资金，创建/编辑受版本链与非对称风险门约束，暂停/归档不会改写历史交易记录。</p>'
-      +'<div class="strategy-builder-toolbar"><button onclick="openStrategyBuilder()">创建策略</button><span class="strategy-builder-hint">用户策略上线即试点（小额资金验证），验证通过后可晋升标准档。</span></div></div></section>'
-      +'<section class="paper-strategy-grid">'+cards+'</section>'
-      +'<section class="paper-strategy-guards"><b>共同执行边界</b><ul>'+guards+'</ul></section>'
-      +'<section class="panel strategy-registry-panel"><h3>策略集合管理</h3><p class="exec-hint">全部注册策略（含草稿、已暂停、已归档）。删除是归档语义：历史订单、成交与审计血缘永久保留，只是不再产生新信号；只有从未被引用的草稿才允许硬删除。</p><div id="strategyRegistryList"><div class="loading">正在读取策略注册表…</div></div></section>'
-      +'<div id="strategyBuilderMount"></div>';
-  loadStrategyRegistry();
+  d=d||{};
+  var registry={}; (((d.registry||{}).items)||[]).forEach(function(item){ registry[item.id]=item; });
+  var boundaries={}; ((((d.boundaries||{}).strategies)||[])).forEach(function(row){ boundaries[row.id]=row; });
+  var runtime={}; (((d.allocation||{}).strategies)||[]).forEach(function(row){ runtime[row.strategy_id]=row; });
+  var ids=Object.keys(runtime);
+  Object.keys(registry).forEach(function(id){ if(ids.indexOf(id)<0) ids.push(id); });
+  var cards=ids.map(function(id){ return paperRunningStrategyCard(id,registry[id],runtime[id],boundaries[id]); }).join('');
+  if(!cards) cards='<div class="paper-empty">还没有任何已注册策略。</div>';
+  var allocation=d.allocation||{}, plan=allocation.allocation_plan||{};
+  var headline=[];
+  if(allocation.nav!==null&&allocation.nav!==undefined) headline.push('总资金池净值 '+cny(allocation.nav));
+  if(allocation.pool_limit!==null&&allocation.pool_limit!==undefined) headline.push('池硬上限 '+fmt(allocation.pool_limit,0)+' 席');
+  if(allocation.market_light) headline.push('市场灯 '+riskText(allocation.market_light));
+  if(plan.total_deployable_amount!==null&&plan.total_deployable_amount!==undefined) headline.push('本轮可部署 '+cny(plan.total_deployable_amount));
+  var guards=(((d.boundaries||{}).shared_guards)||[]).map(function(item){return '<li>'+riskText(item)+'</li>';}).join('');
+  target.innerHTML='<section class="paper-strategy-intro"><div><h3>运行策略</h3>'
+    +'<p>本页只读展示当前周期里各策略的运行状态：参与情况、资金额度、生命周期阶段、席位占用与等待原因。策略定义、DSL、版本与生命周期统一在主导航「策略工坊」维护，本页不提供任何修改入口。</p>'
+    +'<div class="strategy-builder-toolbar"><button type="button" onclick="openInStrategyWorkbench()">打开策略工坊</button>'
+    +'<span class="strategy-builder-hint">'+(headline.join(' · ')||'—')+'</span></div></div></section>'
+    +'<section class="paper-strategy-grid">'+cards+'</section>'
+    +(guards?('<section class="paper-strategy-guards"><b>共同执行边界</b><ul>'+guards+'</ul></section>'):'');
 }
 
-/* ---------- PR-34：策略集合管理 + 策略构建器 ---------- */
-var STRATEGY_FIELD_OPTIONS=[
-  ['close','收盘价'],['open','开盘价'],['high','最高价'],['low','最低价'],
-  ['volume','成交量'],['amount','成交额'],
-  ['pe','市盈率'],['pb','市净率'],['roe','ROE'],['revenue_yoy','营收同比'],
-  ['profit_yoy','利润同比'],['gross_margin','毛利率'],['debt_ratio','负债率'],
-  ['main_net_inflow','主力净流入'],['main_net_inflow_pct','主力净流入%'],
-  ['northbound_net_inflow','北向净流入'],['turnover_rate','换手率']];
-var STRATEGY_INDICATOR_OPTIONS=[
-  ['ma:20','MA20 均线'],['ma:60','MA60 均线'],['ema:12','EMA12'],
-  ['rsi:14','RSI14'],['volume_mean:20','20日均量'],['atr:14','ATR14']];
-var STRATEGY_COMPARE_OPTIONS=[['gt','大于'],['gte','大于等于'],['lt','小于'],['lte','小于等于']];
-var STRATEGY_STATUS_LABELS={draft:'草稿',validated:'已验证',active:'运行中',paused:'已暂停',retiring:'退役中',archived:'已归档'};
-
-async function loadStrategyRegistry(forceRefresh){
-  if(!forceRefresh&&window._strategyRegistryCache){
-    renderStrategyRegistry(window._strategyRegistryCache);
-    return;
-  }
-  try{
-    var d=await api('/api/strategies?include_archived=true');
-    window._strategyRegistryCache=d;
-    renderStrategyRegistry(d);
-  }catch(e){
-    var mount=$('strategyRegistryList');
-    if(mount) mount.innerHTML='<div class="paper-empty">策略注册表读取失败：'+riskText(e.message||e)+'</div>';
-  }
-}
-function renderStrategyRegistry(d){
-  var mount=$('strategyRegistryList'); if(!mount) return;
-  var rows=(d.items||d.strategies||[]).map(function(s){
-    var status=STRATEGY_STATUS_LABELS[s.status]||s.status||'—';
-    var actions=[];
-    if(s.status==='draft'){ actions.push(['validate','验证']); actions.push(['edit','编辑']); actions.push(['clone','复制']); actions.push(['delete','删除']); }
-    if(s.status==='validated'){ actions.push(['activate','激活上线']); actions.push(['edit','编辑']); actions.push(['clone','复制']); }
-    if(s.status==='active'){ actions.push(['pause','暂停']); actions.push(['edit','编辑']); actions.push(['clone','复制']); actions.push(['archive','归档']); }
-    if(s.status==='paused'){ actions.push(['activate','恢复运行']); actions.push(['archive','归档']); }
-    var actionHtml=actions.length?actions.map(function(pair){
-      return '<button'+(pair[0]==='delete'?' class="exec-reject"':'')+' onclick="strategyLifecycleAction(\''+riskText(s.id)+'\',\''+pair[0]+'\','+Number(s.current_version||s.version||1)+')">'+pair[1]+'</button>';
-    }).join(''):'<span class="strategy-muted">已归档：保留全部历史，仅停止新信号</span>';
-    return '<tr'+(s.status==='archived'?' class="exec-inactive"':'')+'><td><b>'+riskText(s.name)+'</b></td><td>'+riskText(s.id)+'</td>'
-      +'<td>'+(s.origin==='builtin'?'内置':'用户')+'</td><td>v'+Number(s.current_version||s.version||1)+'</td>'
-      +'<td><span class="tag '+(s.status==='active'?'tag-ok':(s.status==='archived'?'':'tag-info'))+'">'+riskText(status)+'</span></td>'
-      +'<td class="exec-queue-reason">'+riskText(s.description||'—')+'</td>'
-      +'<td><div class="exec-queue-actions">'+actionHtml+'</div></td></tr>';
-  }).join('');
-  mount.innerHTML=(rows?'<div class="table-scroll"><table class="exec-queue-table"><thead><tr><th>名称</th><th>ID</th><th>来源</th><th>版本</th><th>状态</th><th>说明</th><th>操作</th></tr></thead><tbody>'+rows+'</tbody></table></div>':'<div class="paper-empty">注册表为空。</div>')
-    +'<button class="ghost" style="margin-top:8px" onclick="loadStrategyRegistry(true)">刷新注册表</button>';
-}
-async function strategyLifecycleAction(id,action,expectedVersion){
-  var routes={validate:'validate',activate:'activate',pause:'pause',archive:'archive'};
-  try{
-    if(action==='delete'){
-      if(!confirm('确认硬删除草稿 '+id+'？只有从未产生引用的草稿才允许删除。')) return;
-      await apiJson('/api/strategies/'+encodeURIComponent(id),'DELETE');
-    }else if(action==='edit'){ openStrategyBuilder('edit',id); return; }
-    else if(action==='clone'){
-      var newId=(id+'_copy').slice(0,48);
-      var name=prompt('新策略 ID（留空自动生成）：',newId);
-      if(name===null) return;
-      await apiPostJson('/api/strategies/'+encodeURIComponent(id)+'/clone',{id:name||undefined,actor:'human-ui'});
-    }else{
-      var verb={validate:'验证',activate:'激活上线',pause:'暂停',archive:'归档'}[action];
-      if(!confirm('确认'+verb+'策略 '+id+'？归档/暂停都会保留完整历史。')) return;
-      await apiPostJson('/api/strategies/'+encodeURIComponent(id)+'/'+routes[action],{actor:'human-ui'});
-    }
-    window._strategyRegistryCache=null;
-    window._paperStrategyCenterCache=null;
-    await loadStrategyRegistry(true);
-  }catch(e){ alert('操作失败：'+(e.message||e)); }
-}
-
-function strategyBuilderDefaultState(){
-  return {mode:'create',strategyId:null,expectedVersion:null,ruleDirty:false,dslSource:null,advancedRule:false,
-    rule:{kind:'group',op:'and',args:[{kind:'cond',field:'close',indicator:'',compare:'gt',value:''}]},
-    previewTimer:null};
-}
-/* 把既有 DSL 规则还原成条件编辑器模型；不能完整表达的构件返回 null（保持原样） */
-function sbDslToGroup(dsl){
-  if(!dsl||typeof dsl!=='object') return null;
-  var op=dsl.op;
-  if(op==='and'||op==='or'){
-    var args=(dsl.args||[]).map(sbDslToGroup);
-    if(args.some(function(a){return a===null;})) return null;
-    return {kind:'group',op:op,args:args};
-  }
-  if(op==='not'||op==='not_group'){ return null; }
-  if(['gt','gte','lt','lte'].indexOf(op)<0) return null;
-  var left=dsl.left||{}, right=dsl.right||{};
-  if(right.op!=='const'||typeof right.value!=='number') return null;
-  if(left.op==='field'){
-    var known=STRATEGY_FIELD_OPTIONS.some(function(o){return o[0]===left.name;});
-    return {kind:'cond',field:known?left.name:'close',indicator:'',compare:op,value:String(right.value)};
-  }
-  if(left.op==='indicator'){
-    var win=typeof left.window==='number'?left.window:null;
-    if(win===null) return null;
-    var key=left.name+':'+win;
-    var knownInd=STRATEGY_INDICATOR_OPTIONS.some(function(o){return o[0]===key;});
-    if(!knownInd) return null;
-    return {kind:'cond',field:'close',indicator:key,compare:op,value:String(right.value)};
-  }
-  return null;
-}
-async function sbLoadDefinition(strategyId){
-  try{
-    var versions=await api('/api/strategy-definitions/'+encodeURIComponent(strategyId)+'/versions');
-    var list=(versions&&(versions.versions||versions))||[];
-    if(!list.length) return;
-    var latest=list[list.length-1];
-    var definition=(latest&&latest.definition)||{};
-    var state=window._strategyBuilder; if(!state) return;
-    state.expectedVersion=latest.version||null;
-    state.dslSource=definition.dsl_ast||null;
-    var nameInput=$('sbName'); if(nameInput&&definition.name) nameInput.value=definition.name;
-    var meta=definition.metadata||{};
-    var styleSelect=$('sbStyle');
-    if(styleSelect&&meta.style){
-      for(var i=0;i<styleSelect.options.length;i++){
-        if(styleSelect.options[i].value===meta.style){ styleSelect.selectedIndex=i; break; }
-      }
-    }
-    if(meta.max_positions&&$('sbMaxPositions')) $('sbMaxPositions').value=meta.max_positions;
-    if(meta.max_weight_pct&&$('sbMaxWeight')) $('sbMaxWeight').value=meta.max_weight_pct;
-    if(meta.max_exposure_pct&&$('sbMaxExposure')) $('sbMaxExposure').value=meta.max_exposure_pct;
-    if(definition.dsl_ast){
-      var tree=sbDslToGroup(definition.dsl_ast&&definition.dsl_ast.rule);
-      if(tree&&tree.kind==='group'){
-        state.rule=tree;
-        if(!(state.rule.args&&state.rule.args.length)) state.rule.args=[{kind:'cond',field:'close',indicator:'',compare:'gt',value:''}];
-        state.ruleDirty=false;
-      }else{
-        state.advancedRule=true;
-        var notice=document.createElement('div');
-        notice.className='adaptive-notice';
-        notice.textContent='该策略包含条件编辑器暂不支持的高级构件；下方条件编辑器为空白草稿，不保存条件修改时保留原规则。';
-        var editor=document.querySelector('.strategy-condition-editor');
-        if(editor) editor.insertBefore(notice,editor.firstChild.nextSibling);
-      }
-      renderConditionTree();
-      scheduleStrategyPreview();
-    }
-  }catch(e){ /* 预填失败不阻塞编辑 */ }
-}
-function openStrategyBuilder(mode,strategyId){
-  mode=mode||'create';
-  var mount=$('strategyBuilderMount'); if(!mount) return;
-  var state=strategyBuilderDefaultState();
-  state.mode=mode; state.strategyId=strategyId||null;
-  window._strategyBuilder=state;
-  mount.innerHTML='<section class="panel strategy-builder-panel"><div class="exec-head"><div><h3>'+(mode==='edit'?'编辑策略 '+(strategyId||''):'创建新策略')+'</h3>'
-    +'<p class="exec-hint">条件支持嵌套 AND/OR 分组；保存后生成不可变版本。高级用户可在下方查看编译后的 DSL JSON，但危险代码不能通过页面提交——只允许声明式参数。</p></div>'
-    +'<div class="exec-head-state"><button class="ghost" onclick="closeStrategyBuilder()">关闭</button></div></div>'
-    +'<div class="strategy-builder-form">'
-    +'<label>策略 ID（创建后不可改）<input id="sbId" placeholder="my_strategy" '+(mode==='edit'?'disabled':'')+'></label>'
-    +'<label>名称<input id="sbName" placeholder="我的策略"></label>'
-    +'<label>风格<select id="sbStyle"><option value="">自动识别</option><option value="突破 breakout">突破 / 日内</option><option value="trend pullback 趋势 回踩">趋势 / 回踩</option><option value="sector rotation 板块 轮动">板块 / 轮动</option><option value="earnings report event 财报">事件 / 财报</option><option value="flow momentum 资金 主力">资金 / 主力</option></select></label>'
-    +'<label>最大席位<input id="sbMaxPositions" type="number" min="1" max="6" value="3"></label>'
-    +'<label>单票权重%<input id="sbMaxWeight" type="number" min="8" max="36" value="30"></label>'
-    +'<label>总敞口%<input id="sbMaxExposure" type="number" min="35" max="96" value="82"></label>'
-    +'</div>'
-    +'<div class="strategy-condition-editor"><b>条件编辑器</b><div id="sbConditionTree"></div>'
-    +'<div class="strategy-condition-actions"><button onclick="sbAddCondition()">加条件</button><button onclick="sbAddGroup()">加 AND/OR 分组</button></div></div>'
-    +'<div class="strategy-dsl-view"><b>编译 DSL（只读 · 不可提交任意代码）</b><pre id="sbDslJson"></pre></div>'
-    +'<div class="strategy-preview-box"><b>实时编译预览 <span class="strategy-muted">（调用与生产一致的 StrategyRuntime 编译器）</span></b><div id="sbPreview"><div class="strategy-muted">输入条件后自动编译…</div></div></div>'
-    +'<div class="strategy-builder-actions"><button onclick="submitStrategyBuilder()">'+(mode==='edit'?'保存新版本':'创建策略')+'</button></div>'
-    +'</section>';
-  renderConditionTree();
-  scheduleStrategyPreview();
-  if(mode==='edit'&&strategyId) sbLoadDefinition(strategyId);
-}
-function closeStrategyBuilder(){
-  var mount=$('strategyBuilderMount'); if(mount) mount.innerHTML='';
-  window._strategyBuilder=null;
-}
-function sbLeftNode(cond){
-  if(cond.indicator){
-    var parts=cond.indicator.split(':');
-    return {op:'indicator',name:parts[0],window:Number(parts[1])};
-  }
-  return {op:'field',name:cond.field};
-}
-function sbGroupToDsl(node){
-  if(node.kind==='cond'){
-    return {op:(STRATEGY_COMPARE_OPTIONS.some(function(o){return o[0]===node.compare;})?node.compare:'gt'),
-      left:sbLeftNode(node),right:{op:'const',value:Number(node.value||0)}};
-  }
-  var args=(node.args||[]).map(sbGroupToDsl);
-  if(!args.length) return {op:'gt',left:{op:'field',name:'close'},right:{op:'const',value:0}};
-  if(args.length===1) return args[0];
-  return {op:node.op==='or'?'or':'and',args:args};
-}
-function strategyBuilderDslAst(){
-  var state=window._strategyBuilder; if(!state) return null;
-  return {op:'strategy',rule:sbGroupToDsl(state.rule),parameters:[]};
-}
-function renderConditionTree(){
-  var state=window._strategyBuilder; if(!state) return;
-  var container=$('sbConditionTree'); if(!container) return;
-  container.innerHTML=sbRenderNode(state.rule,'');
-  var dslView=$('sbDslJson');
-  if(dslView) dslView.textContent=JSON.stringify(strategyBuilderDslAst(),null,2);
-}
-function sbRenderNode(node,path){
-  if(node.kind==='cond'){
-    var fieldOptions=STRATEGY_FIELD_OPTIONS.map(function(o){return '<option value="'+o[0]+'"'+(node.field===o[0]?' selected':'')+'>'+o[1]+'</option>';}).join('');
-    var indicatorOptions='<option value="">（直接字段）</option>'+STRATEGY_INDICATOR_OPTIONS.map(function(o){return '<option value="'+o[0]+'"'+(node.indicator===o[0]?' selected':'')+'>'+o[1]+'</option>';}).join('');
-    var compareOptions=STRATEGY_COMPARE_OPTIONS.map(function(o){return '<option value="'+o[0]+'"'+(node.compare===o[0]?' selected':'')+'>'+o[1]+'</option>';}).join('');
-    return '<div class="sb-cond">'
-      +'<select onchange="sbUpdateCond(\''+path+'\',\'indicator\',this.value)">'+indicatorOptions+'</select>'
-      +'<select onchange="sbUpdateCond(\''+path+'\',\'field\',this.value)">'+fieldOptions+'</select>'
-      +'<select onchange="sbUpdateCond(\''+path+'\',\'compare\',this.value)">'+compareOptions+'</select>'
-      +'<input type="number" step="any" value="'+riskText(node.value)+'" onchange="sbUpdateCond(\''+path+'\',\'value\',this.value)">'
-      +'<button class="ghost" onclick="sbRemoveNode(\''+path+'\')">删</button></div>';
-  }
-  var opSelect='<select onchange="sbUpdateGroupOp(\''+path+'\',this.value)"><option value="and"'+(node.op!=='or'?' selected':'')+'>AND 全部满足</option><option value="or"'+(node.op==='or'?' selected':'')+'>OR 任一满足</option></select>';
-  var children=(node.args||[]).map(function(child,i){return sbRenderNode(child,path?path+'.'+i:String(i));}).join('');
-  return '<div class="sb-group" data-op="'+node.op+'">'+opSelect+children+'</div>';
-}
-function sbNodeAt(path){
-  var state=window._strategyBuilder; if(!state) return null;
-  if(!path) return state.rule;
-  return path.split('.').reduce(function(node,key){return (node&&node.args)?node.args[Number(key)]:null;},state.rule);
-}
-function sbParentAt(path){
-  var state=window._strategyBuilder; if(!state) return null;
-  var parts=path.split('.');
-  var parentPath=parts.slice(0,-1).join('.');
-  return sbNodeAt(parentPath);
-}
-function sbUpdateCond(path,key,value){
-  var node=sbNodeAt(path); if(!node) return;
-  node[key]=value;
-  if(window._strategyBuilder) window._strategyBuilder.ruleDirty=true;
-  renderConditionTree();
-  scheduleStrategyPreview();
-}
-function sbUpdateGroupOp(path,value){
-  var node=sbNodeAt(path); if(!node) return;
-  node.op=value;
-  if(window._strategyBuilder) window._strategyBuilder.ruleDirty=true;
-  scheduleStrategyPreview();
-}
-function sbAddCondition(){
-  var state=window._strategyBuilder; if(!state) return;
-  state.rule.args.push({kind:'cond',field:'close',indicator:'',compare:'gt',value:''});
-  state.ruleDirty=true;
-  renderConditionTree(); scheduleStrategyPreview();
-}
-function sbAddGroup(){
-  var state=window._strategyBuilder; if(!state) return;
-  state.rule.args.push({kind:'group',op:'or',args:[{kind:'cond',field:'main_net_inflow_pct',indicator:'',compare:'gt',value:'2'}]});
-  state.ruleDirty=true;
-  renderConditionTree(); scheduleStrategyPreview();
-}
-function sbRemoveNode(path){
-  var state=window._strategyBuilder; if(!state||!path) return;
-  var parent=sbParentAt(path); if(!parent||!parent.args) return;
-  parent.args.splice(Number(path.split('.').pop()),1);
-  if(!parent.args.length) parent.args.push({kind:'cond',field:'close',indicator:'',compare:'gt',value:''});
-  state.ruleDirty=true;
-  renderConditionTree(); scheduleStrategyPreview();
-}
-function scheduleStrategyPreview(){
-  var state=window._strategyBuilder; if(!state) return;
-  if(state.previewTimer) clearTimeout(state.previewTimer);
-  state.previewTimer=setTimeout(runStrategyPreview,500);
-}
-async function runStrategyPreview(){
-  var state=window._strategyBuilder; if(!state) return;
-  var box=$('sbPreview'); if(!box) return;
-  var draft={
-    style:$('sbStyle')?$('sbStyle').value:'',
-    max_positions:Number(($('sbMaxPositions')||{}).value||0)||undefined,
-    max_weight_pct:Number(($('sbMaxWeight')||{}).value||0)||undefined,
-    max_exposure_pct:Number(($('sbMaxExposure')||{}).value||0)||undefined,
-    dsl_ast:strategyBuilderDslAst(),
-  };
-  try{
-    var p=await apiPostJson('/api/paper/strategy-preview',draft);
-    renderStrategyPreview(p);
-  }catch(e){ box.innerHTML='<div class="paper-empty">预览失败：'+riskText(e.message||e)+'</div>'; }
-}
-function renderStrategyPreview(p){
-  var box=$('sbPreview'); if(!box) return;
-  p=p||{};
-  var fp=(p.risk_fingerprint||{});
-  var rp=(p.risk_profile||{});
-  var soft=(rp.soft_limits||{});
-  var ex=(p.execution_profile||{});
-  var lc=(p.lifecycle||{});
-  var evo=(p.evolution||{});
-  var overrides=(p.high_risk_overrides||[]);
-  var overrideRows=overrides.length?('<ul>'+overrides.map(function(o){
-    return '<li><b>'+riskText(o.label||o.key)+'</b>：'+riskText(o.note||('当前 '+o.user_value+' / 推荐 '+o.recommended_value))+'</li>';
-  }).join('')+'</ul>'):'<div class="strategy-muted">没有比推荐档更激进的配置。</div>';
-  if(p.dsl_valid===false){
-    box.innerHTML='<div class="banner">DSL 编译失败（fail-closed 保守展示）：'+riskText(p.dsl_error||'无法解析')+'</div>'+overrideRows;
-    return;
-  }
-  box.innerHTML='<div class="paper-strategy-metrics">'
-    +'<div>Archetype<b>'+riskText(fp.archetype||'—')+'</b></div>'
-    +'<div>风险画像<b>'+riskText(rp.recommended_profile_label||rp.template||'—')+'</b></div>'
-    +'<div>席位 / 单票 / 敞口<b>'+execText(soft.max_positions)+' / '+fmt(soft.max_weight_pct,1)+'% / '+fmt(soft.max_exposure_pct,1)+'%</b></div>'
-    +'<div>行业上限 / 单笔风险<b>'+fmt(soft.max_industry_pct,1)+'% / '+fmt((soft.risk_per_trade||0)*100,2)+'%</b></div>'
-    +'<div>执行方式<b>'+execOrderTypeLabel(ex.order_type)+(ex.ttl_minutes?(' · TTL '+execText(ex.ttl_minutes)+'分'):'')+(ex.batch?' · 批量':'')+(ex.verification_required?' · 核验':'')+'</b></div>'
-    +'<div>初始 lifecycle<b>'+riskText(lc.stage_label||'试点（pilot）')+' ×'+fmt(lc.capital_scale,2)+'</b></div>'
-    +'<div>预计资金<b>'+(lc.estimated_capital?('¥'+Number(lc.estimated_capital).toLocaleString('zh-CN')):'—')+'</b></div>'
-    +'<div>可进化参数<b>'+riskText((evo.tunable||[]).join(', ')||'—')+'</b></div>'
-    +'<div>锁定参数<b>'+riskText((evo.locked||[]).join(', ')||'—')+'</b></div>'
-    +'</div><div class="adaptive-notice">高风险 override（受非对称风险门约束：收紧快行 / 放大需证据+观察期+步长上限+Challenger 胜出）：</div>'+overrideRows;
-}
-async function submitStrategyBuilder(){
-  var state=window._strategyBuilder; if(!state) return;
-  var dsl=(state.mode==='edit'&&!state.ruleDirty&&state.dslSource)?state.dslSource:strategyBuilderDslAst();
-  var metadata={
-    style:$('sbStyle').value||'',
-    max_positions:Number($('sbMaxPositions').value||3),
-    max_weight_pct:Number($('sbMaxWeight').value||30),
-    max_exposure_pct:Number($('sbMaxExposure').value||82),
-  };
-  try{
-    if(state.mode==='edit'&&state.strategyId){
-      await apiJson('/api/strategies/'+encodeURIComponent(state.strategyId),'PATCH',{
-        changes:{name:$('sbName').value||undefined,dsl_ast:dsl,metadata:metadata},
-        expected_version:state.expectedVersion,actor:'human-ui',change_note:'strategy builder edit',
-      });
-    }else{
-      var id=($('sbId').value||'').trim();
-      if(!id){ alert('请填写策略 ID'); return; }
-      await apiPostJson('/api/strategies',{
-        id:id,name:$('sbName').value||id,description:'用户自建策略（策略构建器）',
-        dsl_ast:dsl,metadata:metadata,actor:'human-ui',
-      });
-    }
-    window._strategyRegistryCache=null;
-    window._paperStrategyCenterCache=null;
-    closeStrategyBuilder();
-    await loadStrategyRegistry(true);
-  }catch(e){ alert('保存失败：'+(e.message||e)); }
-}
 function paperResearchStrategyName(id){
   return ({tq_breakout:'短线日内做T',trend_pullback:'趋势波段优选',sector_rotation:'板块轮动先锋',reported_profit_breakout:'三日策略',main_force_top10:'超强主力股'})[id]||id||'未知策略';
 }
@@ -3175,7 +2915,7 @@ setInterval(function(){
 setInterval(loadMarketGate,180000);
 window.onresize = function(){ Object.keys(charts).forEach(function(k){ charts[k].resize(); }); };
 
-/* ================= PR-46：策略中心（Strategy Workbench） =================
+/* ================= PR-46：策略工坊（Strategy Workbench） =================
    Registry 驱动的策略生命周期工作台：列表 → 新建/编辑（条件构建器 + 高级
    DSL）→ 验证 → 风险与资金预览 → 保存草稿 → 激活 → 版本/事件 → 克隆/归档。
    规则全部来自后端（strategy_registry / DSL compiler），前端只做 UX。 */
