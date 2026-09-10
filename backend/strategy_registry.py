@@ -158,9 +158,11 @@ def _add_column(conn, table, name, definition):
 #   - 裸 ``DELETE FROM paper_strategy_versions`` 一律失败——包括"lifecycle 从
 #     validated 回退到 draft，但 ledger/audit 仍引用某个 version/checksum"的
 #     情况（paper_signals 等表对 version 没有 FK，只靠 lifecycle 判断会漏）；
-#   - 唯一合法例外是 unused user draft 的私有快照：domain 层用 canonical
-#     helper ``_historical_reference_exists``（lifecycle + registry ownership +
-#     历史引用）判定后，插入一次性授权、删除、再撤销授权，全程在调用方事务内。
+#   - 唯一合法例外是 **从未离开 draft 生命周期** 的 unused user draft 私有快照：
+#     domain 层用 canonical helper ``_ever_left_draft``（生命周期历史：PR-56，
+#     draft→validated→draft 的回退不算"没用过"）与 ``_historical_reference_exists``
+#     （ledger/audit/执行引用）双重判定后，插入一次性授权、删除、再撤销授权，
+#     全程在调用方事务内。
 #   - 即便有人伪造授权，触发器仍要求 definition 是 ``origin='user' AND
 #     lifecycle_status='draft'``，因此正式版本永远删不掉。
 #
@@ -919,6 +921,43 @@ def _historical_reference_exists(conn, strategy_id):
     return False
 
 
+def _left_draft_evidence(conn, strategy_id):
+    """Return the first lifecycle event proving the strategy left scratch draft.
+
+    PR-56：``draft -> validated -> draft`` 的回退不能把策略变回"从未使用过的
+    草稿"——生命周期历史本身就是"已正式使用"的证据。判定只看事件表：
+
+    - 创建事件 ``NULL -> draft``（reason=definition_created）每个 draft 都有，
+      **不算**离开 draft；
+    - 任何 ``to_status`` 非 draft 的事件（draft -> validated / draft -> archived）
+      算；``from_status`` 是真实非 draft 状态的事件（validated -> draft 的回退）
+      也算。
+
+    不能只看 ``current lifecycle_status``：状态可以退回 draft；也不能只数事件
+    条数：定义事件对任何草稿都存在。
+    """
+    row = conn.execute(
+        """SELECT from_status,to_status FROM strategy_definition_events
+           WHERE strategy_id=?
+             AND ( IFNULL(to_status,'draft') <> 'draft'
+                   OR (from_status IS NOT NULL AND from_status <> ''
+                       AND from_status <> 'draft') )
+           ORDER BY id LIMIT 1""",
+        (str(strategy_id),),
+    ).fetchone()
+    return None if row is None else (row[0], row[1])
+
+
+def _ever_left_draft(conn, strategy_id):
+    """Canonical predicate：生命周期历史是否证明该策略离开过初始 draft。
+
+    hard delete 的形式化规则之一（``never_left_draft``）。与
+    ``_historical_reference_exists`` 正交：后者看 ledger/audit 的经济与执行
+    引用，本谓词只看生命周期形态。
+    """
+    return _left_draft_evidence(conn, strategy_id) is not None
+
+
 def hard_delete_unused_draft(conn, strategy_id):
     """Physically delete only an unused user draft and its private version rows.
 
@@ -929,10 +968,17 @@ def hard_delete_unused_draft(conn, strategy_id):
       allocation/runtime/evolution/champion/challenger consumers.  Those
       records must stay resolvable to their exact checksum forever, so the
       database refuses every delete.
-    - A **user draft** with no historical reference is the single deliberate
-      exception: it never left ``draft``, never entered a cycle and has no
-      ledger/audit row pointing at it, so its private snapshot is pure scratch
-      state.  Deleting it removes nothing anyone can still resolve.
+    - A **user draft** that **never left the draft lifecycle** and has no
+      historical reference is the single deliberate exception: it was never
+      validated/activated, never entered a cycle and has no ledger/audit row
+      pointing at it, so its private snapshot is pure scratch state.  Deleting
+      it removes nothing anyone can still resolve.
+
+      "Never left the draft lifecycle" is stricter than "is currently draft":
+      PR-56 起用 canonical 谓词 ``_ever_left_draft``（见 ``_left_draft_evidence``）
+      判定，``draft -> validated -> draft`` 的回退**不能**重新获得删除资格——
+      生命周期历史本身就是正式使用的证据。多版本（v2/v3）草稿只要没离开过
+      draft，仍是可删除的 scratch。
 
     The database trigger is **default-deny**: it aborts every delete on
     ``paper_strategy_versions`` unless the same transaction holds a one-shot
@@ -941,8 +987,10 @@ def hard_delete_unused_draft(conn, strategy_id):
     delete a version by just calling ``DELETE`` — a formal version is refused by
     the database even after a lifecycle rollback, because the trigger no longer
     trusts lifecycle alone.  This function is the only place that mints the
-    authorization, and it mints it only after ``_historical_reference_exists``
-    proves the draft never left scratch state.  The authorization row is
+    authorization, and it mints it only after both gates prove the draft never
+    left scratch state: ``_ever_left_draft`` (lifecycle history — PR-56) and
+    ``_historical_reference_exists`` (ledger/audit/execution references).
+    The authorization row is
     inserted and dropped inside the caller's transaction, so it is never
     observable by another connection and disappears if anything fails.
     """
@@ -952,6 +1000,16 @@ def hard_delete_unused_draft(conn, strategy_id):
         raise ValueError("unknown strategy id")
     if spec.origin != "user" or spec.status != "draft":
         raise ValueError("only unused user drafts can be hard-deleted")
+    # PR-56：先证明"从未离开 draft 生命周期"，再看经济/执行引用。顺序即
+    # 形式化规则：origin ∧ status ∧ never_left_draft ∧ no historical reference。
+    # 回退到 draft 的策略在这里就被挡住——早于任何 purge token 铸造。
+    evidence = _left_draft_evidence(conn, spec.id)
+    if evidence is not None:
+        raise ValueError(
+            "strategy has historical references and must be archived: "
+            "lifecycle history shows it already left the draft state "
+            f"({evidence[0] or 'NULL'} -> {evidence[1]})"
+        )
     if _historical_reference_exists(conn, spec.id):
         raise ValueError("strategy has historical references and must be archived")
     conn.execute("DELETE FROM strategy_definition_events WHERE strategy_id=?", (spec.id,))
