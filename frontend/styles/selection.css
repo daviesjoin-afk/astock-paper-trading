@@ -1,0 +1,16 @@
+/* PR-55：由 frontend/app.css 拆分（纯搬运）。
+   原始行区间 428–439；选股验证证据区（紧凑研究卡片）。
+   本文件必须保持它在 styles/index.css 中的位置：
+   @import 顺序 = 原文件顺序 = 层叠顺序。 */
+
+/* Daily strategy validation: compact research evidence, separate from paper trading. */
+.selection-validation-grid { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:12px; margin:14px 0; }
+.selection-validation-card { padding:15px; border:1px solid var(--border); border-radius:14px; background:var(--surface); box-shadow:var(--shadow); }
+.selection-validation-card h3 { margin:0 0 8px; padding:0; border:0; font-size:15px; }
+.selection-validation-card p { margin:0; color:var(--text-secondary); font-size:12px; line-height:1.6; }
+.selection-validation-stats { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:7px; margin-top:12px; }
+.selection-validation-stat { padding:8px; border:1px solid var(--border-light); border-radius:9px; background:var(--surface-hover); color:var(--text-muted); font-size:10px; }
+.selection-validation-stat b { display:block; margin-top:3px; color:var(--text); font:700 13px var(--font-data); }
+.selection-validation-card.review { border-left:4px solid var(--negative); }.selection-validation-card.validated { border-left:4px solid var(--positive); }.selection-validation-card.watch { border-left:4px solid var(--warning); }
+.selection-validation-timeline { display:flex; flex-wrap:wrap; gap:7px; margin:10px 0 0; }.selection-validation-timeline span { padding:5px 8px; border:1px solid var(--border-light); border-radius:8px; background:var(--surface-hover); color:var(--text-secondary); font:600 11px var(--font-data); }
+@media (max-width:900px){ .selection-validation-grid{grid-template-columns:1fr;}.selection-validation-stats{grid-template-columns:repeat(2,minmax(0,1fr));} }
