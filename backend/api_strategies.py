@@ -259,7 +259,8 @@ def list_strategy_events(strategy_id: str):
 
 
 # ---------------------------------------------------------------------------
-# 10) 删除（仅未使用的用户 draft）
+# 10) 删除（仅限**从未离开 draft 生命周期**的用户草稿：PR-56 起，
+#     draft→validated→draft 的回退不再具备删除资格，走归档提示）
 # ---------------------------------------------------------------------------
 
 @router.delete("/{strategy_id}", response_model=Models.StrategyDeleteResponse)
