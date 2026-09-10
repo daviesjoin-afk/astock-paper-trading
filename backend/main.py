@@ -29,6 +29,7 @@ import metrics as MET
 from api_paper import risk_refresh_status, router as paper_router
 from api_adaptive import router as adaptive_router
 from api_settings import router as settings_router
+from api_strategies import router as strategies_router
 from resource_guard import heavy_job_lease
 
 FRONTEND = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "frontend")
@@ -496,6 +497,7 @@ app.mount("/assets", StaticFiles(directory=os.path.join(FRONTEND, "assets")), na
 app.include_router(paper_router)
 app.include_router(adaptive_router)
 app.include_router(settings_router)
+app.include_router(strategies_router)
 
 
 def _stock_code(code):
