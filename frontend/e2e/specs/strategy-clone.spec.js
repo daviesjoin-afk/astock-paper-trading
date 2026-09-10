@@ -19,14 +19,15 @@ test.describe("Journey 5 — Clone 内置策略", () => {
     const sourceBefore = await apiJson(page, `/api/strategies/${builtin.id}`);
 
     const cloneId = uniqueId(PREFIX);
-    // 克隆前设置 prompt 答案（产品用 prompt 让用户确认新 ID）
-    await page.evaluate((v) => { window.__e2ePrompt = v; }, cloneId);
-    await page.evaluate(() => {});
-    // 通过 fixtures 注入 prompt 答案
-    page.__promptAnswer = cloneId;
 
-    const cloned = waitForApi(page, /\/api\/strategies\/[^/]+\/clone$/);
+    // PR-57：克隆用应用内输入模态（替代 window.prompt）。
+    // 真实交互：点击克隆 → 模态出现（默认值已填）→ 填入目标 ID → 确认。
     await page.getByTestId(`strategy-card-${builtin.id}`).getByTestId("strategy-clone").click();
+    const modal = page.getByTestId("app-confirm-dialog");
+    await expect(modal).toBeVisible();
+    await modal.locator('[data-role="input"]').fill(cloneId);
+    const cloned = waitForApi(page, /\/api\/strategies\/[^/]+\/clone$/);
+    await modal.locator('[data-action="approve"]').click();
     const res = await cloned;
     expect(res.ok(), "clone 必须 2xx").toBeTruthy();
 

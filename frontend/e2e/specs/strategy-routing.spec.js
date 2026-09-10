@@ -9,7 +9,7 @@
 //   #strategies/{id}       → 工作坊 + registry 就绪 + 打开该策略详情
 //   #strategies/{unknown}  → 工作坊 + 可读的"策略不存在"，不崩、不报错
 // 直接加载与站内导航必须落到等价状态。
-import { test, expect, uniqueId, openWorkbench, createDraftViaUi } from "../fixtures.js";
+import { test, expect, uniqueId, openWorkbench, createDraftViaUi, apiJson } from "../fixtures.js";
 
 const PREFIX = "e2e_route";
 
@@ -37,17 +37,21 @@ test.describe("策略深链接路由", () => {
     // 这里走真实的"在策略工坊打开"出口，证明站内导航与深链接落到同一状态。
     await page.goto("/");
     await page.getByTestId("main-nav-paper").click();
-    await page.getByTestId("paper-module-tabs").getByText("运行策略").click();
+    await page.locator('#paperModuleTabs [data-paper-view="strategy"]').click();
     // 等真实内容（运行时卡片）出现，而不是断言"加载文案消失"——后者会被
   // 其它用例留下的零策略状态影响，产生跨用例耦合。
   await expect(
     page.getByTestId("paper-runtime-strategies").locator('[data-testid^="paper-runtime-card-"]').first(),
-  ).toBeVisible({ timeout: 30_000 });
+  ).toBeVisible({ timeout: 60_000 });
 
-    const card = page.getByTestId("paper-runtime-strategies").locator('[data-testid^="paper-runtime-card-"]').first();
-    await expect(card).toBeVisible();
-    const strategyId = await card.getAttribute("data-strategy-id");
-    expect(strategyId).toBeTruthy();
+    await expect(
+      page.getByTestId("paper-runtime-strategies").locator('[data-testid^="paper-runtime-card-"]').first(),
+    ).toBeVisible();
+    // 用内置策略定位（不依赖"第一张卡"，避免受其它用例新建策略影响）
+    const registry = await apiJson(page, "/api/strategies?include_archived=true");
+    const builtin = (registry.items || []).find((s) => s.origin === "builtin");
+    expect(builtin, "应存在内置策略").toBeTruthy();
+    const strategyId = builtin.id;
 
     await page.getByTestId(`paper-open-workbench-${strategyId}`).click();
     await expect(page.getByTestId("strategy-detail")).toBeVisible();

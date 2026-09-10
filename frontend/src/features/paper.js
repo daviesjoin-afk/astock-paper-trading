@@ -7,6 +7,13 @@ import { showPaperWorkspace } from "../core/navigation.js";
 import { PAPER_NAV_TTL_MS } from "../core/state.js";
 import { renderPaperAudit } from "./risk.js";
 import { openInStrategyWorkbench, wbStatusBadge } from "./strategies.js";
+import { toast, inlineError, confirmDialog } from "../ui/dialog.js";
+
+/** PR-57：把原生 alert 统一换成应用内反馈；危险/失败给 danger 语义，其余 warn。 */
+function paperNotice(message){
+  var text=String(message==null?'':message);
+  toast(text, { tone: /失败|错误|异常|拒绝|不可/.test(text) ? 'danger' : 'warn' });
+}
 
 export function renderPaperCompareChart(curve){
   var target=$('paperCompareChart');
@@ -44,41 +51,63 @@ export function syncPaperCapitalHint(){
 
 export async function startPaper(){
   var capital = Number($('paperCapital').value);
-  if(!capital || capital<1000){ alert('请先设置总模拟资金，至少 1,000 元。'); return; }
-  if(!confirm('将以总资金池 '+capital.toLocaleString('zh-CN')+' 元归档旧周期并同时启动已启用策略。各策略独立决策，共享现金和总仓位风控；不会连接券商或发送真实订单，是否继续？')) return;
+  if(!capital || capital<1000){ paperNotice('请先设置总模拟资金，至少 1,000 元。'); return; }
+  var startAnswer=await confirmDialog({
+    kicker:'模拟交易 · 启动新周期',
+    title:'启动新周期？',
+    detail:'总资金池 ¥'+capital.toLocaleString('zh-CN'),
+    bullets:[
+      '当前周期会被归档（历史不会删除）。',
+      '各策略独立决策，共享现金与总仓位风控。',
+      '不会连接券商、不会发送真实订单。',
+    ],
+    confirmText:'启动新周期',
+  });
+  if(!startAnswer.approved) return;
   $('paperStart').disabled = true;
   try{
     var d = await apiPost('/api/paper/start?capital='+encodeURIComponent(capital));
     var note = d.schedule && d.schedule.ok ? '新周期已启动，3分钟监控任务已注册。' : '新周期已启动；计划任务未完全安装时可运行 setup_paper_schedule.bat。';
-    alert(note);
+    paperNotice(note);
     await loadPaper({force:true});
-  }catch(e){ alert('启用失败：'+e.message); }
+  }catch(e){ paperNotice('启用失败：'+e.message); }
   finally{ $('paperStart').disabled = false; }
 }
 
 export async function resumePaper(){
   try{ await apiPost('/api/paper/resume'); await loadPaper({force:true}); }
-  catch(e){ alert('恢复失败：'+e.message); }
+  catch(e){ paperNotice('恢复失败：'+e.message); }
 }
 
 export async function pausePaper(){
   try{ await apiPost('/api/paper/pause'); await loadPaper({force:true}); }
-  catch(e){ alert('暂停失败：'+e.message); }
+  catch(e){ paperNotice('暂停失败：'+e.message); }
 }
 
 export async function resetPaper(){
   var capital = Number($('paperCapital').value);
-  if(!capital || capital<1000){ alert('请填写新周期的总模拟资金。'); return; }
-  if(!confirm('完全重置会归档当前周期的订单、持仓、盈亏、风控和周报，并创建暂停的新周期；历史不会删除。继续吗？')) return;
+  if(!capital || capital<1000){ paperNotice('请填写新周期的总模拟资金。'); return; }
+  var resetAnswer=await confirmDialog({
+    kicker:'模拟交易 · 高风险操作',
+    title:'完全重置并归档当前周期？',
+    danger:true,
+    bullets:[
+      '当前周期的订单、持仓、盈亏、风控与周报会被归档。',
+      '历史记录不会被删除，归档后仍可查阅。',
+      '重置后会创建一个「暂停」状态的新周期，需要你手动恢复。',
+    ],
+    confirmText:'重置并归档',
+  });
+  if(!resetAnswer.approved) return;
   try{ await apiPost('/api/paper/reset?capital='+encodeURIComponent(capital)); await loadPaper({force:true}); }
-  catch(e){ alert('重置失败：'+e.message); }
+  catch(e){ paperNotice('重置失败：'+e.message); }
 }
 
 export async function setPaperStyle(accountId, style){
   try{
     await apiPost('/api/paper/style?account_id='+encodeURIComponent(accountId)+'&style='+encodeURIComponent(style));
     await loadPaper({force:true});
-  }catch(e){ alert('风格切换失败：'+e.message); }
+  }catch(e){ paperNotice('风格切换失败：'+e.message); }
 }
 
 export async function runPaperNow(slot){
@@ -156,9 +185,9 @@ export function renderPaperOrderPreview(plan){
 
 export async function previewPaperOrder(){
   var form=paperOrderForm();
-  if(!form.account_id||!/^\d{6}$/.test(form.code)){ alert('请选择策略账户并输入六位证券代码。'); return null; }
-  if(form.qty<0||form.qty%100){ alert('数量必须为 0 或 100 股的整数倍。'); return null; }
-  if(form.order_type==='limit'&&!form.limit_price){ alert('请填写限价。'); return null; }
+  if(!form.account_id||!/^\d{6}$/.test(form.code)){ paperNotice('请选择策略账户并输入六位证券代码。'); return null; }
+  if(form.qty<0||form.qty%100){ paperNotice('数量必须为 0 或 100 股的整数倍。'); return null; }
+  if(form.order_type==='limit'&&!form.limit_price){ paperNotice('请填写限价。'); return null; }
   $('paperOrderPreview').className='paper-order-preview';
   $('paperOrderPreview').textContent='模型正在检查行情时效、账户风险、仓位、T+1 和交易成本…';
   try{
@@ -186,12 +215,19 @@ export async function submitPaperOrder(){
     }
     var action=form.side==='buy'?'买入':'卖出';
     var state=plan.triggered?'立即按快照模拟成交':'进入当日限价委托';
-    if(!confirm(action+' '+plan.name+' '+plan.qty+' 股，'+state+'。这是纯本地模拟，不会发送到券商，继续吗？')) return;
+    var orderAnswer=await confirmDialog({
+    kicker:'模拟交易 · 手工下单',
+    title:action+' '+plan.name,
+    detail:'数量 '+plan.qty+' 股',
+    bullets:['这是纯本地模拟，不会发送到券商，继续吗？','提交前会重新经过模型校验、T+1 与涨跌停门禁。'],
+    confirmText:'提交模拟委托',
+  });
+  if(!orderAnswer.approved) return;
     try{
       var result=await apiPost('/api/paper/order/submit?'+paperOrderQuery(form)+'&confirmed=true');
-      alert(result.status==='filled'?'模拟成交已写入账本。':(result.status==='pending_limit'?'限价委托已进入待触发队列。':'委托被模型拒绝。'));
+      paperNotice(result.status==='filled'?'模拟成交已写入账本。':(result.status==='pending_limit'?'限价委托已进入待触发队列。':'委托被模型拒绝。'));
       clearPaperOrderPreview(); await loadPaper({force:true});
-    }catch(e){ alert('模拟委托失败：'+e.message); }
+    }catch(e){ paperNotice('模拟委托失败：'+e.message); }
   }finally{
     window._paperOrderSubmitting=false;
     // 恢复按钮时沿用 renderPaperOrderPreview 的语义：阻断态预检保持禁用，
@@ -210,9 +246,15 @@ export function preparePaperSell(accountId,code,qty){
 }
 
 export async function cancelPaperOrder(orderId){
-  if(!confirm('撤销这笔待触发的模拟限价委托吗？')) return;
+  var cancelAnswer=await confirmDialog({
+    kicker:'模拟交易 · 撤单',
+    title:'撤销这笔模拟委托？',
+    bullets:['撤单只影响模拟盘，不涉及真实券商。','已成交部分不会被回滚。'],
+    confirmText:'确认撤单',
+  });
+  if(!cancelAnswer.approved) return;
   try{ await apiPost('/api/paper/order/cancel?order_id='+encodeURIComponent(orderId)); await loadPaper({force:true}); }
-  catch(e){ alert('撤单失败：'+e.message); }
+  catch(e){ paperNotice('撤单失败：'+e.message); }
 }
 
 export function paperOrderStatusView(status,reason){
@@ -457,7 +499,13 @@ export function setPaperResearchActionStatus(message,tone){
 }
 
 export async function backfillPaperResearch(button){
-  if(!confirm('仅补录当日完整收盘快照与既有样本的当日观察；不会生成买卖信号、委托或风控决策。现在执行吗？')) return;
+  var snapAnswer=await confirmDialog({
+    kicker:'模拟交易 · 手动执行',
+    title:'补录当日收盘快照？',
+    bullets:['只补录当日完整收盘快照与既有样本的当日观察。','不会生成买卖信号、委托或风控决策。'],
+    confirmText:'开始补录',
+  });
+  if(!snapAnswer.approved) return;
   if(button){button.disabled=true;button.textContent='补录中…';}
   try{
     var result=await apiPost('/api/paper/research-validation/backfill');

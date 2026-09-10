@@ -40,6 +40,12 @@ test.describe("Journey 1 — 创建草稿（真实浏览器 + 真实 HTTP）", (
     const previewRes = await preview;
     expect(previewRes.ok(), "预览接口必须返回 2xx").toBeTruthy();
     await expect(page.getByTestId("strategy-editor")).toContainText(/风险|资金|画像|risk/i);
+    // PR-57：预览必须把"系统硬边界 / 策略风控 / 可进化参数"三段明确分开
+    await expect(page.getByTestId("risk-preview-system")).toBeVisible();
+    await expect(page.getByTestId("risk-preview-strategy")).toBeVisible();
+    await expect(page.getByTestId("risk-preview-evolvable")).toBeVisible();
+    // 系统硬边界必须明确"策略无法覆盖"
+    await expect(page.getByTestId("risk-preview-system")).toContainText(/无法覆盖|硬边界/);
 
     // 保存草稿：真实落库
     const created = waitForApi(page, /\/api\/strategies$/);

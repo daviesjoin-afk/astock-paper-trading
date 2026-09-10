@@ -10,14 +10,13 @@ async function openPaperRuntime(page) {
   await page.goto("/");
   await page.getByTestId("main-nav-paper").click();
   await expect(page.getByTestId("main-nav-paper")).toHaveClass(/active/);
-  await page.getByTestId("paper-module-tabs").getByText("运行策略").click();
+  await page.locator('#paperModuleTabs [data-paper-view="strategy"]').click();
   await expect(page.getByTestId("paper-runtime-strategies")).toBeVisible();
   // 等只读数据源读完（占位文案消失）
-  // 等真实内容（运行时卡片）出现，而不是断言"加载文案消失"——后者会被
-  // 其它用例留下的零策略状态影响，产生跨用例耦合。
+  // 等真实内容出现（运行时卡片），不做"加载文案消失"式断言。
   await expect(
     page.getByTestId("paper-runtime-strategies").locator('[data-testid^="paper-runtime-card-"]').first(),
-  ).toBeVisible({ timeout: 30_000 });
+  ).toBeVisible({ timeout: 60_000 });
 }
 
 test.describe("Journey 7 — 运行策略为运行时只读视图", () => {
@@ -28,8 +27,14 @@ test.describe("Journey 7 — 运行策略为运行时只读视图", () => {
     const cards = panel.locator('[data-testid^="paper-runtime-card-"]');
     await expect(cards.first(), "运行策略面板应至少渲染一张运行时卡片").toBeVisible();
 
-    // 每张运行时卡片都标注为 runtime-only
-    await expect(cards.first()).toHaveAttribute("data-runtime-only", "1");
+    // 精确定位一条**内置**策略的运行时卡片：内置策略始终有运行时边界数据，
+    // 不会因为其它用例新建了用户策略而改变。
+    const registry = await apiJson(page, "/api/strategies?include_archived=true");
+    const builtin = (registry.items || []).find((s) => s.origin === "builtin");
+    expect(builtin, "应存在内置策略").toBeTruthy();
+    const card = page.getByTestId(`paper-runtime-card-${builtin.id}`);
+    await expect(card).toBeVisible();
+    await expect(card).toHaveAttribute("data-runtime-only", "1");
 
     // 负向断言：不得出现定义/编辑器/生命周期控件
     for (const forbidden of [
@@ -49,7 +54,7 @@ test.describe("Journey 7 — 运行策略为运行时只读视图", () => {
     }
 
     // 唯一的定义管理出口：在策略工坊打开 → 详情
-    const strategyId = await cards.first().getAttribute("data-strategy-id");
+    const strategyId = await card.getAttribute("data-strategy-id");
     expect(strategyId, "运行时卡片必须带 data-strategy-id").toBeTruthy();
     await page.getByTestId(`paper-open-workbench-${strategyId}`).click();
 

@@ -12,7 +12,7 @@ import { backfillPaperResearch, cancelPaperOrder, clearPaperOrderDate, clearPape
 import { applyPaperRiskAuditFilter, loadPaperRisk, refreshPaperRisk } from "./features/risk.js";
 import { cancelManualDataUpdate, choosePaperStrategy, chooseStrategy, filterSelectionEvaluationRows, loadDataValidity, loadPaperSelection, loadSelectionEvaluation, refreshSelectionEvaluation, runPaperSelection, showSelectionValidation, startFactorIncrementalUpdate, startInit, startManualDataUpdate, trackRemove } from "./features/selection.js";
 import { refreshSettingsKeyForm, resetSettingsSection, saveSettingsKey, saveSettingsSection, setSettingsSection } from "./features/settings.js";
-import { loadStrategyWorkbench, openInStrategyWorkbench, wbAddCondition, wbBackToList, wbCloneStrategy, wbDeleteDraft, wbFormatDsl, wbFromConditionsToDsl, wbNewStrategy, wbOpenDetail, wbOpenEditor, wbPreviewDraft, wbRemoveCondition, wbRenderList, wbResetFilters, wbSaveDraft, wbSetMode, wbSetOriginFilter, wbSetStatusFilter, wbTransition, wbValidateAndMark, wbValidateDraft } from "./features/strategies.js";
+import { loadStrategyWorkbench, openInStrategyWorkbench, wbAddCondition, wbBackToList, wbCloneFirstBuiltin, wbCloneStrategy, wbDeleteDraft, wbFormatDsl, wbFromConditionsToDsl, wbNewStrategy, wbOpenDetail, wbOpenEditor, wbPreviewDraft, wbRemoveCondition, wbRenderList, wbResetFilters, wbSaveDraft, wbSetMode, wbSetOriginFilter, wbSetStatusFilter, wbTransition, wbValidateAndMark, wbValidateDraft } from "./features/strategies.js";
 
 window.activatePage = activatePage;
 window.adaptiveEsc = adaptiveEsc;
@@ -91,6 +91,7 @@ window.verifyExecutionOrder = verifyExecutionOrder;
 window.wbAddCondition = wbAddCondition;
 window.wbBackToList = wbBackToList;
 window.wbCloneStrategy = wbCloneStrategy;
+window.wbCloneFirstBuiltin = wbCloneFirstBuiltin;
 window.wbDeleteDraft = wbDeleteDraft;
 window.wbFormatDsl = wbFormatDsl;
 window.wbFromConditionsToDsl = wbFromConditionsToDsl;

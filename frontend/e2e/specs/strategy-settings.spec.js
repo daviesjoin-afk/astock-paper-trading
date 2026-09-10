@@ -5,7 +5,7 @@
 // Journey 6：取消全部策略 → 保存被接受 → UI 显示 idle 说明 → API enabled_strategies == []
  import {
   test, expect, uniqueId, openWorkbench, createDraftViaUi, promoteToActive,
-  apiJson, openSettings, enabledStrategies, waitForApi,
+  apiJson, openSettings, enabledStrategies, waitForApi, clickAndApprove,
 } from "../fixtures.js";
 
 test.describe("Journey 3 — 设置集成（下一周期策略集合）", () => {
@@ -27,9 +27,7 @@ test.describe("Journey 3 — 设置集成（下一周期策略集合）", () => 
 
     // 勾选并保存（走真实按钮 + 真实 HTTP）
     if (!(await checkbox.isChecked())) await checkbox.check();
-    const saved = waitForApi(page, /\/api\/settings\/$/, "POST");
-    await page.getByTestId("settings-save-simulation").click();
-    const res = await saved;
+    const res = await clickAndApprove(page, page.getByTestId("settings-save-simulation"), /\/api\/settings\/$/);
     // 200/201 都算成功；422 会被下面 API 回读暴露
     expect([200, 201]).toContain(res.status());
 
@@ -66,9 +64,7 @@ test.describe("Journey 6 — 零策略 Idle", () => {
       if (await box.isChecked()) await box.uncheck();
     }
 
-    const saved = waitForApi(page, /\/api\/settings\/$/, "POST");
-    await page.getByTestId("settings-save-simulation").click();
-    const res = await saved;
+    const res = await clickAndApprove(page, page.getByTestId("settings-save-simulation"), /\/api\/settings\/$/);
     expect([200, 201], "零策略必须被后端接受（不得强制回退到内置五策略）").toContain(res.status());
 
     // API 事实：启用集合为空

@@ -9,7 +9,7 @@
 // - 暂停 ≠ 历史删除：版本与事件仍可读
 import {
   test, expect, uniqueId, openWorkbench, createDraftViaUi, promoteToActive,
-  apiJson, cardAction, waitForApi,
+  apiJson, cardAction, waitForApi, clickAndApprove,
 } from "../fixtures.js";
 
 const PREFIX = "e2e_lifecycle";
@@ -34,9 +34,8 @@ test.describe("Journey 2 — 生命周期", () => {
     const checksumAtDraft = await checksumOf(page, id);
 
     // draft → validated（真实确认框由 fixtures accept）
-    const validated = waitForApi(page, /\/api\/strategies\/[^/]+\/transition$/);
-    await cardAction(page, id, "strategy-transition-validated").click();
-    expect((await validated).ok()).toBeTruthy();
+    const validated = await clickAndApprove(page, cardAction(page, id, "strategy-transition-validated"), /\/api\/strategies\/[^/]+\/transition$/);
+    expect(validated.ok()).toBeTruthy();
     await expect(page.getByTestId(`strategy-card-${id}`)).toHaveAttribute("data-status", "validated");
     expect(await statusOf(page, id)).toBe("validated");
 
@@ -47,9 +46,8 @@ test.describe("Journey 2 — 生命周期", () => {
     expect(await checksumOf(page, id), "生命周期变化不应改动版本校验和").toBe(checksumAtDraft);
 
     // active → paused（暂停：不再可执行，但历史保留）
-    const paused = waitForApi(page, /\/api\/strategies\/[^/]+\/transition$/);
-    await cardAction(page, id, "strategy-transition-paused").click();
-    expect((await paused).ok()).toBeTruthy();
+    const paused = await clickAndApprove(page, cardAction(page, id, "strategy-transition-paused"), /\/api\/strategies\/[^/]+\/transition$/);
+    expect(paused.ok()).toBeTruthy();
     await expect(page.getByTestId(`strategy-card-${id}`)).toHaveAttribute("data-status", "paused");
     expect(await statusOf(page, id)).toBe("paused");
     // 暂停不是删除：版本与事件仍可读
@@ -59,22 +57,19 @@ test.describe("Journey 2 — 生命周期", () => {
     expect((eventsWhilePaused.items || []).length).toBeGreaterThan(0);
 
     // paused → active（恢复）
-    const resumed = waitForApi(page, /\/api\/strategies\/[^/]+\/transition$/);
-    await cardAction(page, id, "strategy-transition-resume").click();
-    expect((await resumed).ok()).toBeTruthy();
+    const resumed = await clickAndApprove(page, cardAction(page, id, "strategy-transition-resume"), /\/api\/strategies\/[^/]+\/transition$/);
+    expect(resumed.ok()).toBeTruthy();
     await expect(page.getByTestId(`strategy-card-${id}`)).toHaveAttribute("data-status", "active");
     expect(await statusOf(page, id)).toBe("active");
 
     // active → retiring → archived
-    const retiring = waitForApi(page, /\/api\/strategies\/[^/]+\/transition$/);
-    await cardAction(page, id, "strategy-transition-retiring").click();
-    expect((await retiring).ok()).toBeTruthy();
+    const retiring = await clickAndApprove(page, cardAction(page, id, "strategy-transition-retiring"), /\/api\/strategies\/[^/]+\/transition$/);
+    expect(retiring.ok()).toBeTruthy();
     await expect(page.getByTestId(`strategy-card-${id}`)).toHaveAttribute("data-status", "retiring");
     expect(await statusOf(page, id)).toBe("retiring");
 
-    const archived = waitForApi(page, /\/api\/strategies\/[^/]+\/transition$/);
-    await cardAction(page, id, "strategy-transition-archived").click();
-    expect((await archived).ok()).toBeTruthy();
+    const archived = await clickAndApprove(page, cardAction(page, id, "strategy-transition-archived"), /\/api\/strategies\/[^/]+\/transition$/);
+    expect(archived.ok()).toBeTruthy();
     await expect(page.getByTestId(`strategy-card-${id}`)).toHaveAttribute("data-status", "archived");
     expect(await statusOf(page, id)).toBe("archived");
 
