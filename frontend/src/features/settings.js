@@ -60,8 +60,8 @@ export function renderSettings(data){
       var extra='';
       if(item.status==='paused') extra='<button type="button" class="settings-strategy-link" onclick="activatePage(\'p-strategies\')">去策略工坊恢复</button>';
       else if(!checkable&&item.status!=='active') extra='<small class="setting-help">'+adaptiveEsc((STRATEGY_STATUS_LABELS[item.status]||item.status)+' · 不可勾选')+'</small>';
-      return '<label class="settings-strategy-item'+(checkable?'':' settings-strategy-item-disabled')+'">'
-        +'<input type="checkbox" class="setting-strategy-enabled" value="'+adaptiveEsc(item.id)+'"'+settingsChecked(checked)+(checkable?'':' disabled')+'>'
+      return '<label data-testid="settings-strategy-'+adaptiveEsc(item.id)+'" class="settings-strategy-item'+(checkable?'':' settings-strategy-item-disabled')+'">'
+        +'<input data-testid="settings-strategy-checkbox-'+adaptiveEsc(item.id)+'" type="checkbox" class="setting-strategy-enabled" value="'+adaptiveEsc(item.id)+'"'+settingsChecked(checked)+(checkable?'':' disabled')+'>'
         +'<span><b>'+adaptiveEsc(item.name||item.id)+'</b>'
         +(item.origin==='user'?'<small class="setting-help">自定义 · v'+(item.current_version||1)+'</small>':'')
         +'</span>'+badge+extra+'</label>';
@@ -73,12 +73,12 @@ export function renderSettings(data){
       +builtinItems.map(strategyCheckbox).join('')+'</div>';
     if(userItems.length) strategyHtml+='<p class="setting-help" style="margin:8px 0 6px">我的策略（在策略工坊创建）</p><div class="settings-strategy-group">'+userItems.map(strategyCheckbox).join('')+'</div>';
     if(window._registryError) strategyHtml+='<p class="setting-help" style="color:var(--danger)">'+adaptiveEsc(window._registryError)+'</p>';
-    strategyHtml+='<p class="setting-help" style="margin-top:8px">一个都不勾 = 下一周期零策略 idle：不产生新开仓，风险扫描、存量退出与系统调度照常工作。</p>';
+    strategyHtml+='<p class="setting-help" data-testid="settings-idle-note" style="margin-top:8px">一个都不勾 = 下一周期零策略 idle：不产生新开仓，风险扫描、存量退出与系统调度照常工作。</p>';
     html='<div class="settings-grid"><section class="settings-panel"><h3>模拟盘与资金</h3><p>这些项目决定下一次新周期的初始资金、观察时长和参与策略。当前周期的本金、成交与归档不会被覆盖。</p><div class="settings-form">'
       +settingsInputRow('default_starting_capital','默认启动金额','创建新周期时的共享资金池预填值。','<input id="settingDefaultCapital" data-settings-preview-input type="number" min="1000" max="10000000" step="1000" value="'+Number(sim.default_starting_capital||300000)+'"> <span class="setting-value-preview">元</span>')
       +settingsInputRow('cycle_duration_days','模拟周期','可选 15/30/60/90/180 个交易日或长期。','<select id="settingCycleDuration" data-settings-preview-input>'+durationOptions+'</select>')
       +'<div class="setting-row"><div class="setting-label"><b>下一周期启用策略</b><small>只有 Active 且支持新周期的策略可勾选；只对下一周期生效。</small></div><div class="setting-control settings-strategy-checks">'+strategyHtml+'</div></div>'
-      +'</div><div class="settings-actions"><button onclick="saveSettingsSection(\'simulation\')">保存资金与周期</button><button class="ghost" onclick="resetSettingsSection(\'simulation\')">恢复默认</button></div><div class="settings-note">当前周期：'+adaptiveEsc(cur.status||'—')+'；已启用 '+(cur.enabled_strategies||[]).length+' 套策略。保存后点击“保存并启动新周期”才会切换账本。</div></section>'+settingsPreviewHtml(data,section)+'</div>';
+      +'</div><div class="settings-actions"><button data-testid="settings-save-simulation" onclick="saveSettingsSection(\'simulation\')">保存资金与周期</button><button class="ghost" onclick="resetSettingsSection(\'simulation\')">恢复默认</button></div><div class="settings-note">当前周期：'+adaptiveEsc(cur.status||'—')+'；已启用 '+(cur.enabled_strategies||[]).length+' 套策略。保存后点击“保存并启动新周期”才会切换账本。</div></section>'+settingsPreviewHtml(data,section)+'</div>';
   }else if(section==='risk'){
     html='<div class="settings-grid"><section class="settings-panel"><h3>仓位与风控</h3><p>风险边界设有后端白名单。系统永远不会因界面输入突破单票、共享池、现金、T+1 或交易所涨跌停门禁。</p><div class="settings-form">'
       +settingsInputRow('shared_pool_position_limit','共享池持仓上限','总池有效持仓席位，范围 1–30。','<input id="settingPoolLimit" data-settings-preview-input type="number" min="1" max="30" step="1" value="'+Number(risk.shared_pool_position_limit||15)+'"> <span class="setting-value-preview">席</span>')

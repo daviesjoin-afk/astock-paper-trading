@@ -44,6 +44,10 @@ export function activatePage(page, options){
 export function restoreAppNavigation(){
   var parts=String(location.hash||'').replace(/^#/,'').split('/');
   var page=parts[0]?'p-'+parts[0]:(sessionStorage.getItem(APP_PAGE_KEY)||'p-select');
+  // 路由意图：把深度链接的第二段交给对应 feature 自己处理，navigation 只表达意图。
+  // 之前只处理了 p-paper / p-settings，#strategies/{id} 的 id 被静默丢弃，
+  // 直接加载深链接只会停在列表页（PR-56b 修复）。
+  window._strategiesRouteId = (page==='p-strategies' && parts[1]) ? decodeURIComponent(parts[1]) : null;
   if(page==='p-paper'&&(parts[1]==='adaptive'||sessionStorage.getItem(PAPER_VIEW_KEY)==='adaptive')){
     page='p-adaptive';
     sessionStorage.removeItem(PAPER_VIEW_KEY);
@@ -56,6 +60,13 @@ export function restoreAppNavigation(){
 /* The two deep workspaces have more tabs than a narrow browser can show.
    Native scrollbars are often configured as overlay-only on Windows, so keep a
    visible, keyboard-accessible rail in addition to the browser scrollbar. */
+/* 深链接路由入口：hash 变化（含直接加载与站内跳转）都回到同一套解析逻辑，
+   保证"直接打开"与"站内导航"落到完全一致的状态。replaceState 不触发本事件，
+   所以 detail 内部规范化 hash 不会引起回环。 */
+export function installHashRouting(){
+  window.addEventListener('hashchange',function(){ restoreAppNavigation(); });
+}
+
 export function workspaceTabStrip(id){ return $(id); }
 
 export function updateWorkspaceTabRail(id){

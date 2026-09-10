@@ -2,7 +2,7 @@
    顺序即执行顺序，重排等于改行为。 */
 import { api, apiPost } from "./core/api.js";
 import { $, charts } from "./core/dom.js";
-import { PAPER_VIEW_KEY, SETTINGS_SECTION_KEY, activatePage, installWorkspaceTabRails, renderClock, restoreAppNavigation, syncThemeControl, syncWorkspaceTabRails } from "./core/navigation.js";
+import { PAPER_VIEW_KEY, SETTINGS_SECTION_KEY, activatePage, installHashRouting, installWorkspaceTabRails, renderClock, restoreAppNavigation, syncThemeControl, syncWorkspaceTabRails } from "./core/navigation.js";
 import { loadEvolutionStatus, renderAdaptive, setAdaptiveSection } from "./features/adaptive.js";
 import { loadPaper } from "./features/paper.js";
 import { loadPaperRisk } from "./features/risk.js";
@@ -66,6 +66,7 @@ loadMarketGate();
 
 installWorkspaceTabRails();
 
+installHashRouting();
 restoreAppNavigation();
 
 document.addEventListener('click', function(e){

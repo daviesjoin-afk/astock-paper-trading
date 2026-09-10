@@ -337,7 +337,7 @@ export function paperRunningStrategyCard(id,item,runtime,boundary){
       +'<div>入场模型<b>'+riskText(boundary.entry_model||'—')+'</b></div>'
       +'</div></div>';
   }
-  return '<article class="paper-strategy-card" data-strategy-id="'+adaptiveEsc(id)+'">'
+  return '<article class="paper-strategy-card" data-testid="paper-runtime-card-'+adaptiveEsc(id)+'" data-strategy-id="'+adaptiveEsc(id)+'" data-runtime-only="1">'
     +'<header><b>'+riskText(name)+'</b><span>'+badge+' <span class="strategy-card-origin '+originClass+'">'+origin+'</span></span></header>'
     +'<div class="paper-strategy-section"><label>当前周期运行时</label><div class="paper-strategy-metrics">'
     +'<div>参与本周期<b>'+(runtime.running?'是':'否')+'</b></div>'
@@ -352,7 +352,7 @@ export function paperRunningStrategyCard(id,item,runtime,boundary){
     +'<div class="paper-strategy-section"><label>不可变版本</label><p>v'+riskText(version)
     +(checksum?(' · '+riskText(checksum)):'')+(item.has_dsl?' · DSL':' · 原生')+'</p></div>'
     +'<div class="paper-strategy-section"><label>等待 / 阻塞原因</label><p>'+riskText(blocked)+'</p></div>'
-    +'<div class="strategy-builder-toolbar"><button type="button" onclick="openInStrategyWorkbench(\''+adaptiveEsc(id)+'\')">在策略工坊打开</button></div>'
+    +'<div class="strategy-builder-toolbar"><button type="button" data-testid="paper-open-workbench-'+adaptiveEsc(id)+'" onclick="openInStrategyWorkbench(\''+adaptiveEsc(id)+'\')">在策略工坊打开</button></div>'
     +'</article>';
 }
 
