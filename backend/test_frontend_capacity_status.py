@@ -1,17 +1,18 @@
 """Ensure waitlist wording does not claim an automatic next-day retry."""
+import frontend_sources
 from pathlib import Path
 import unittest
 
 import build_info as BI
 
 
-APP = Path(__file__).resolve().parents[1] / "frontend" / "app.js"
+SOURCE = frontend_sources.source_text  # PR-55：源已拆到 frontend/src/**
 INDEX = Path(__file__).resolve().parents[1] / "frontend" / "index.html"
 
 
 class FrontendCapacityStatusTests(unittest.TestCase):
     def test_deferred_capacity_is_described_as_re_rankable_waitlist(self):
-        source = APP.read_text(encoding="utf-8")
+        source = SOURCE()
         self.assertIn("deferred_capacity:['pending','容量等待重排']", source)
         self.assertNotIn("deferred_capacity:['pending','次日重新筛选']", source)
 

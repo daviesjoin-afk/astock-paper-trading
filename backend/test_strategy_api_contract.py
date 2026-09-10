@@ -3,7 +3,7 @@
 
 锁住四类东西：
 
-1. **前端 contract 不破坏**——用 ``frontend/app.js`` 里真实发出的 payload
+1. **前端 contract 不破坏**——用前端源码（PR-55 起为 ``frontend/src/**``）里真实发出的 payload
    形状回放：Workbench 与旧策略构建器两条路径的 create / patch、transition、
    clone（新契约 ``new_strategy_id`` 与旧 ``id``）、validate、preview、list、
    delete。
@@ -97,7 +97,7 @@ class _ApiFixture(unittest.TestCase):
 
 
 class FrontendPayloadContractTests(_ApiFixture):
-    """回放 frontend/app.js 真实发出的请求体。"""
+    """回放前端源码真实发出的请求体。"""
 
     def test_workbench_create_and_patch_payload(self):
         draft = {
