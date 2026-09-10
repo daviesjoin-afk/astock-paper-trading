@@ -109,22 +109,20 @@ class ApiStrategiesTests(unittest.TestCase):
     # ---------- 0) 路由注册 ----------
 
     def test_routes_registered_on_app(self):
-        # 逐个校验模块声明的路由真的挂到产品 app 上：新版 FastAPI/Starlette
-        # 会丢弃被同层路径参数遮蔽的字面量路由（/validate、/preview），
-        # 顺序写错就不会被注册。
+        # 逐条校验模块声明的 (path, methods) 都挂到产品 app 上：新版
+        # FastAPI/Starlette 会丢弃被同层路径参数遮蔽的字面量路由
+        # （/validate、/preview），顺序写错就会缺路由。include_router
+        # 会复制路由对象，因此必须按键比较而不是按对象。
         app_keys = {
             (getattr(route, "path", None), tuple(sorted(getattr(route, "methods", None) or [])))
             for route in main.app.routes
         }
-        declared = [
-            route for route in API.router.routes
-            if (getattr(route, "path", None), tuple(sorted(getattr(route, "methods", None) or []))) not in app_keys
-        ]
-        self.assertEqual(
-            [],
-            [(route.path, sorted(route.methods or [])) for route in declared],
-            "有路由未注册到 app（多半是被 /{strategy_id} 遮蔽）",
-        )
+        missing = []
+        for route in API.router.routes:
+            key = (route.path, tuple(sorted(route.methods or [])))
+            if key not in app_keys:
+                missing.append(key)
+        self.assertEqual([], missing, "有路由未注册到 app（多半是被 /{strategy_id} 遮蔽）")
 
     def test_scanner_strategies_endpoint_is_separate(self):
         # 选股扫描页的静态策略列表不能和注册表共用 /api/strategies。
