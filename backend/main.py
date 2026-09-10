@@ -27,9 +27,12 @@ import linkage as L
 import paper_trading as P
 import selection_tracking as ST
 import metrics as MET
+from fastapi.exception_handlers import request_validation_exception_handler
+from fastapi.exceptions import RequestValidationError
 from api_paper import risk_refresh_status, router as paper_router
 from api_adaptive import router as adaptive_router
 from api_settings import router as settings_router
+import api_strategies as strategies_api
 from api_strategies import router as strategies_router
 from resource_guard import heavy_job_lease
 
@@ -499,6 +502,22 @@ app.include_router(paper_router)
 app.include_router(adaptive_router)
 app.include_router(settings_router)
 app.include_router(strategies_router)
+
+
+# PR-51：/api/strategies 的请求体由类型化契约（strategy_api_models）解析。
+# FastAPI 默认把校验失败一律报 422，但 Strategy Admin 的历史语义是"缺必填
+# 字段 → 400（``xxx is required``）、形状/类型错误 → 422"。这里让真实 HTTP
+# 请求走与直接函数调用（api_strategies._coerce）完全相同的映射，避免两种入口
+# 对同一个畸形请求给出不同的状态码；其余路由保持 FastAPI 原生行为不变。
+@app.exception_handler(RequestValidationError)
+async def _strategy_request_validation(request, exc):
+    if request.url.path.startswith(strategies_router.prefix):
+        errors = exc.errors()
+        return JSONResponse(
+            status_code=strategies_api.request_validation_status(errors),
+            content={"detail": strategies_api.request_validation_detail(errors)},
+        )
+    return await request_validation_exception_handler(request, exc)
 
 
 def _stock_code(code):

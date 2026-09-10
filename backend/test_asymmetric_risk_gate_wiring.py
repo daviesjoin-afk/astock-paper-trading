@@ -82,14 +82,17 @@ class ManualApiPathTests(unittest.TestCase):
 
     def _patch(self, changes, **extra):
         import api_strategies as API
+        import strategy_service as SVC
 
-        original_path = API.P.DB_PATH
-        API.P.DB_PATH = self.path
+        # PR-51：数据库连接由 StrategyService 持有，DB 路径注入缝随之下移到
+        # 该模块（api_strategies 不再直接调用 paper_trading._db）。断言不变。
+        original_path = SVC.P.DB_PATH
+        SVC.P.DB_PATH = self.path
         try:
             payload = {"changes": changes, "actor": "human-ui", **extra}
             return API.update_strategy("gate_api", payload)
         finally:
-            API.P.DB_PATH = original_path
+            SVC.P.DB_PATH = original_path
 
     def test_manual_api_cannot_expand_risk(self):
         from fastapi import HTTPException

@@ -27,6 +27,7 @@ import main
 import paper_trading as P
 import strategy_registry as SR
 import strategy_runtime as SRT
+import strategy_service as SVC
 
 # 声明式 DSL：close > ma20 且 volume > volume_mean5 × 1.2（纯离线可判）。
 RULE = {
@@ -193,15 +194,15 @@ class ApiStrategiesTests(unittest.TestCase):
 
     def test_detail_runtime_failure_does_not_500(self):
         # RuntimeContext 构建失败（编译期异常）必须降级为 runtime_ready=false，
-        # 而不是让整个详情页 500。只替换 API 模块内的运行时引用，
-        # 避免影响 paper_trading 的 init_db 路径。
+        # 而不是让整个详情页 500。只替换运行时的编译入口（PR-51 起该调用在
+        # StrategyService 内），避免影响 paper_trading 的 init_db 路径。
         created = self._create_draft("api_runtime_broken")
 
         def _boom(*_args, **_kwargs):
             raise ValueError("编译失败")
 
         fake_runtime = types.SimpleNamespace(get_context=_boom)
-        with unittest.mock.patch.object(API, "SRT", fake_runtime):
+        with unittest.mock.patch.object(SVC, "SRT", fake_runtime):
             status, body = self._call(API.get_strategy, created["id"])
         self.assertEqual(status, 200, body)
         self.assertFalse(body["runtime_ready"])
