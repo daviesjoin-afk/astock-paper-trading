@@ -65,6 +65,15 @@ SKIP_DIRS = {".git", ".venv", "node_modules", "__pycache__", ".workbuddy", "dist
 SCAN_SUFFIXES = (".py", ".js", ".html", ".css", ".md", ".sh", ".bat", ".ps1",
                  ".yml", ".yaml", ".toml", ".txt", ".cfg", ".ini")
 
+# 本机专用、**不进 git 也不进镜像**的本地记录。它们本来就该记录"删了什么"，
+# 因此不能拿"引用了已删模块"去判它们不合格；CI 检出与运行时镜像里都没有这些文件。
+LOCAL_ONLY_FILES = ("docs/DEV_LOG.md",)
+LOCAL_ONLY_PREFIXES = ("docs/strategy-audit-",)
+
+
+def _is_local_only(rel_path: str) -> bool:
+    return rel_path in LOCAL_ONLY_FILES or rel_path.startswith(LOCAL_ONLY_PREFIXES)
+
 
 def _walk_scan_scope():
     for name in SCAN_DIRS:
@@ -123,6 +132,8 @@ class RemovedArtifactTests(unittest.TestCase):
             rel = os.path.relpath(path, ROOT).replace(os.sep, "/")
             if rel == "backend/test_repository_hygiene.py":
                 continue  # 本文件自身持有名单
+            if _is_local_only(rel):
+                continue  # 本机记录不进仓库，允许记录"删除了什么"
             try:
                 with open(path, encoding="utf-8", errors="ignore") as handle:
                     text = handle.read()
