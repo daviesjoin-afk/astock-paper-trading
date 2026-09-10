@@ -875,7 +875,8 @@ def _dynamic_minimum_order_amount(cycle, nav=None, position_limit=None, conn=Non
     cycle_ids = tuple(item for item in _loads(raw_enabled, []) if item in ACCOUNT_SPECS)
     if conn is not None:
         # PR-35：周期启用集合中的用户策略也参与池位配置。
-        cycle_ids = tuple(dict.fromkeys([*cycle_ids, *(item for item in _loads(raw_enabled, []) if item in USP.user_participant_ids(conn))]))
+        # PR-48：池位是经济口径——lifecycle pause 不改变席位配置。
+        cycle_ids = tuple(dict.fromkeys([*cycle_ids, *(item for item in _loads(raw_enabled, []) if item in USP.user_known_ids(conn))]))
     configured_ids = cycle_ids or ACTIVE_ACCOUNT_IDS
     configured_slots = sum(
         max(1, int(_spec_for(account_id, conn=conn).get("max_positions", 1)))
@@ -983,6 +984,10 @@ def _accounts_by_id(conn, account_ids):
 def _active_cycle_filter(conn, cycle_id, column="id"):
     """Scope a cycle to all active sleeves once the active set is complete.
 
+    PR-48：这里是**经济所有权**口径（= ``cycle_ledger_ids``）——能力位
+    判定用"已知用户策略"（``USP.user_known_ids``，不查 lifecycle/status），
+    因此 lifecycle pause 不会把策略移出账本。小账本/迁移库回退行为保留。
+
     Small in-memory/unit-test ledgers and pre-migration databases can contain
     only one newly introduced sleeve plus legacy IDs.  In that transitional
     shape, falling back to the cycle's own rows preserves cash reconciliation;
@@ -993,16 +998,19 @@ def _active_cycle_filter(conn, cycle_id, column="id"):
         cycle_row = conn.execute("SELECT enabled_strategies FROM paper_cycles WHERE id=?", (cycle_id,)).fetchone()
         parsed = _loads(cycle_row["enabled_strategies"], None) if cycle_row and cycle_row["enabled_strategies"] else None
         if isinstance(parsed, list):
-            user_ids = set(USP.user_participant_ids(conn))
-            selected = tuple(item for item in parsed if item in ACCOUNT_SPECS or item in user_ids)
-            configured_ids = selected or None
+            user_ids = set(USP.user_known_ids(conn))
+            configured_ids = tuple(item for item in parsed if item in ACCOUNT_SPECS or item in user_ids)
     except Exception:
         configured_ids = None
-    active_ids = configured_ids or ACTIVE_ACCOUNT_IDS
+    if configured_ids is not None:
+        # PR-47/48：显式空启用集合 = idle 周期 → 空账本（1=0），不再回落
+        # 内置五套；未配置（None）才走下面的迁移期回退。
+        placeholders = ",".join("?" for _ in configured_ids)
+        active_clause = f"{column} IN ({placeholders})" if configured_ids else "1=0"
+        return active_clause, configured_ids
+    active_ids = tuple(ACTIVE_ACCOUNT_IDS)
     placeholders = ",".join("?" for _ in active_ids)
     active_clause = f"{column} IN ({placeholders})" if active_ids else "1=0"
-    if configured_ids is not None:
-        return active_clause, active_ids
     count = conn.execute(
         f"SELECT COUNT(*) FROM paper_accounts WHERE cycle_id=? AND {active_clause}",
         (cycle_id, *active_ids),
@@ -1010,6 +1018,34 @@ def _active_cycle_filter(conn, cycle_id, column="id"):
     if count >= len(ACTIVE_ACCOUNT_IDS):
         return active_clause, active_ids
     return "1=1", ()
+
+
+def cycle_ledger_ids(conn, cycle_id=None):
+    """PR-48：周期**经济所有权**账户集合（单一事实来源）。
+
+    语义 = ``cycle.enabled_strategies``（能力位过滤，不查 Registry
+    lifecycle/status）∩ ``paper_accounts.cycle_id == 该周期``。用于：
+    共享现金、NAV、initial capital、configure_capital、资金对账、
+    周期暂停/恢复与经济所有权——**lifecycle pause 不改变这个集合**
+    （Cycle owns capital; lifecycle controls execution permission）。
+    """
+    if cycle_id is None:
+        cycle_id = _active_cycle(conn)["id"]
+    return tuple(
+        row["id"]
+        for row in _shared_account_rows(conn, cycle_id)
+    )
+
+
+def execution_participant_ids(conn, cycle_id=None):
+    """PR-48：周期**执行资格**账户集合。
+
+    语义 = ``cycle_ledger_ids`` ∩ 当前可执行 lifecycle（被 lifecycle
+    pause 的策略临时退出执行层，但保留在经济账本里）。用于：候选、
+    新信号、新开仓、资金预占与新持仓。Risk Exit 另见
+    ``_risk_exit_account_ids``（执行参与者 ∪ 仍有剩余 lots 的账户）。
+    """
+    return current_cycle_participant_ids(conn, cycle_id)
 
 
 def strategy_center():
@@ -2669,8 +2705,10 @@ def _ensure_cycle(conn):
         active = conn.execute("SELECT * FROM paper_cycles WHERE id=?", (active["id"],)).fetchone()
     configured_enabled = _loads(active["enabled_strategies"], None) if "enabled_strategies" in active.keys() else None
     # PR-35：启用集合按"能力位"过滤——内置 id 看 ACCOUNT_SPECS，用户 id 看
-    # 注册表参与资格；陈旧/未知 id 仍被剔除。
-    user_ids = set(USP.user_participant_ids(conn))
+    # 注册表里"已知用户策略"。PR-48：账本挂接是**经济所有权**口径，必须用
+    # user_known_ids（不查 lifecycle/status）——lifecycle pause 只退出执行层，
+    # 不能把策略从周期账本上摘除（否则 pause 期间的账本修复会清掉它的资金）。
+    user_ids = set(USP.user_known_ids(conn))
     # PR-47：显式空列表 = 零策略 idle 周期（保留空集）；缺失/损坏才回落内置五套。
     if isinstance(configured_enabled, list):
         base_enabled = configured_enabled
@@ -2700,7 +2738,13 @@ def _ensure_cycle(conn):
                 style = "strong"
         # 新增策略时也要加入当前周期并继承该周期的状态/虚拟资金；不能留下默认
         # 的 20,000 元暂停账户，否则会破坏同本金公平对比。
-        is_new_for_cycle = current["cycle_id"] is None
+        # PR-48：重绑必须以 enabled_ids 为门禁——未启用的 builtin 已被上方
+        # 摘除（cycle_id=NULL），下一轮 repair 不能再把它们当"新增策略"
+        # 绑回周期（否则 _available_cycle_ledger_capital 会被重复瓜分，
+        # 凭空造钱）。
+        is_new_for_cycle = current["cycle_id"] is None and account_id in enabled_ids
+        if account_id not in enabled_ids:
+            continue
         if is_new_for_cycle:
             capital = _num(active["capital"], 100000.0)
             # Preserve the shared-pool synthetic attribution used by
@@ -16064,9 +16108,11 @@ def configure_capital(capital):
         enabled_count = len(configured) if isinstance(configured, list) and configured else len(ACTIVE_ACCOUNT_IDS)
         share = capital / max(enabled_count, 1)
         active_clause, active_ids = _active_cycle_filter(conn, cycle["id"], "id")
+        # PR-48：显式限定当期账本行——active_clause 只含 id 集合，不加
+        # cycle_id 会把绑定在其它周期的同名行也改写。
         conn.execute(
-            f"UPDATE paper_accounts SET initial_cash=?,cash=?,daily_start_nav=?,updated_at=? WHERE {active_clause}",
-            (share, share, share, _now(), *active_ids),
+            f"UPDATE paper_accounts SET initial_cash=?,cash=?,daily_start_nav=?,updated_at=? WHERE cycle_id=? AND {active_clause}",
+            (share, share, share, _now(), cycle["id"], *active_ids),
         )
         conn.execute(
             f"UPDATE paper_nav SET cash=?,market_value=0,nav=? WHERE account_id IN ({','.join('?' for _ in active_ids)})",
