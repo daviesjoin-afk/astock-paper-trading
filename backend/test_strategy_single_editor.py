@@ -25,6 +25,7 @@ import unittest
 from fastapi import HTTPException
 
 import api_strategies as API
+import frontend_sources
 import main
 import paper_trading as P
 import strategy_registry as SR
@@ -32,7 +33,8 @@ import strategy_runtime as SRT
 import strategy_service as SVC
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-APP_JS = os.path.join(ROOT, "frontend", "app.js")
+# PR-55：源已拆到 frontend/src/**；用助手拿"整份源码"做包含断言。
+APP_JS = os.path.join(ROOT, "frontend", "src")
 INDEX_HTML = os.path.join(ROOT, "frontend", "index.html")
 DIST_JS = os.path.join(ROOT, "frontend", "dist", "app.js")
 MAIN_PY = os.path.join(ROOT, "backend", "main.py")
@@ -49,6 +51,9 @@ LEGACY_LIFECYCLE_ALIASES = ("validate", "activate", "pause", "archive")
 
 
 def _read(path: str) -> str:
+    """读单个文件；传目录（新布局的 frontend/src）时返回全部模块拼接。"""
+    if os.path.isdir(path):
+        return frontend_sources.source_text()
     with open(path, encoding="utf-8") as handle:
         return handle.read()
 

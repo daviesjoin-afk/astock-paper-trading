@@ -8,6 +8,7 @@ reviews/jobs) used to be built for every activity request as well, adding
 These tests pin the wiring so the split cannot silently regress.
 """
 from __future__ import annotations
+import frontend_sources
 
 import os
 import unittest
@@ -93,7 +94,7 @@ class OrderConfirmGuardTests(unittest.TestCase):
     """The manual submit path must stay single-entry and re-entrancy safe."""
 
     def setUp(self):
-        self.app_js = _load_source(os.path.join(FRONTEND, "app.js"))
+        self.app_js = frontend_sources.source_text()  # PR-55：源已拆到 frontend/src/**
 
     def test_submit_button_guard_exists(self):
         self.assertIn(

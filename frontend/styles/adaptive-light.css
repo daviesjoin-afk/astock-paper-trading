@@ -1,0 +1,748 @@
+/* PR-55：由 frontend/app.css 拆分（纯搬运）。
+   原始行区间 1274–2017；自适应 v2 浅色面与 #p-adaptive 覆盖。
+   本文件必须保持它在 styles/index.css 中的位置：
+   @import 顺序 = 原文件顺序 = 层叠顺序。 */
+
+/* Keep the accessibility shortcut off-canvas until it receives keyboard focus. */
+.skip-link { top:10px; transform:translateY(-220%); }
+.skip-link:focus,.skip-link:focus-visible { top:10px; transform:translateY(0); }
+
+/* Final adaptive light-surface pass: keep the evidence lab dense, but align it with the paper console. */
+.adaptive-shell { --adaptive-line:#dbe5e0; --adaptive-copy:#5d7068; --adaptive-muted:#788981; --adaptive-card:#fff; --adaptive-raised:#f4f7f5; --adaptive-green:#238365; border-color:#d5e1dc; background:linear-gradient(145deg,#f7faf8,#eef4f1); color:#19352b; box-shadow:var(--shadow); }
+.adaptive-shell .adaptive-hero { background:linear-gradient(125deg,#fff,#f3f8f5); }
+.adaptive-shell .adaptive-hero h3,.adaptive-shell .adaptive-panel h3,.adaptive-shell .adaptive-panel h4,.adaptive-shell .adaptive-flow-step b,.adaptive-shell .adaptive-strategy-card h3,.adaptive-shell .adaptive-risk-card h4,.adaptive-shell .adaptive-advisor-card h4,.adaptive-shell .adaptive-active-risk h4,.adaptive-shell .adaptive-research-card h4 { color:#19352b; }
+.adaptive-shell .adaptive-flow-step,.adaptive-shell .adaptive-panel,.adaptive-shell .adaptive-strategy-card,.adaptive-shell .adaptive-risk-card,.adaptive-shell .adaptive-advisor-card,.adaptive-shell .adaptive-active-risk,.adaptive-shell .adaptive-research-card { background:#fff; border-color:#dbe5e0; box-shadow:0 8px 20px rgba(24,60,44,.06); }
+.adaptive-shell .adaptive-hero-metrics div,.adaptive-shell .adaptive-strategy-stats div,.adaptive-shell .adaptive-selection-weights div,.adaptive-shell .adaptive-risk-params div,.adaptive-shell .adaptive-advisor-summary>div,.adaptive-shell .adaptive-advisor-report li,.adaptive-shell .adaptive-research-meta span,.adaptive-shell .news-scope-top>div,.adaptive-shell .major-radar-layout>aside { background:#f6faf7; border-color:#dbe5e0; }
+.adaptive-shell .adaptive-flow-step>span { border-color:#b9d9cb; background:#edf7f2; color:#237e61; }
+.adaptive-shell .adaptive-flow-step p,.adaptive-shell .adaptive-panel header em,.adaptive-shell .adaptive-sector-columns h4,.adaptive-shell .adaptive-driver p,.adaptive-shell .adaptive-strategy-card header span,.adaptive-shell .adaptive-strategy-card>p,.adaptive-shell .adaptive-copy,.adaptive-shell .adaptive-risk-card>p,.adaptive-shell .adaptive-advisor-card p,.adaptive-shell .adaptive-research-card>p,.adaptive-shell .news-event-list li p,.adaptive-shell .news-source-list small { color:#6d7e77; }
+.adaptive-shell .adaptive-driver b,.adaptive-shell .adaptive-sector-columns b,.adaptive-shell .adaptive-strategy-stats b,.adaptive-shell .adaptive-alpha-list b,.adaptive-shell .adaptive-guardrails b,.adaptive-shell .adaptive-run-log b,.adaptive-shell .adaptive-risk-params b,.adaptive-shell .adaptive-research-meta b,.adaptive-shell .news-event-list li b,.adaptive-shell .news-source-list b { color:#234238; }
+.adaptive-shell .adaptive-meter { background:#e7eee9; }
+.adaptive-shell .adaptive-notice { border-color:#c9e1d5; background:#eef8f2; color:#547066; }
+.adaptive-dynamic-risk { display:grid; gap:4px; margin:14px 0; padding:12px 14px; border:1px solid #b7dccb; border-left:4px solid #16805f; border-radius:10px; background:#f2faf6; color:#193b31; }
+.adaptive-dynamic-risk b { font-size:14px; }
+.adaptive-dynamic-risk span { font-size:13px; line-height:1.55; }
+.adaptive-dynamic-risk small { color:#547066; font-size:12px; }
+.adaptive-dynamic-risk.caution { border-color:#e8ce93; border-left-color:#c58a18; background:#fff9ea; }
+.adaptive-dynamic-risk.halt { border-color:#efb8b8; border-left-color:#c94b4b; background:#fff1f1; }
+.paper-risk-dynamic { display:grid; grid-template-columns:minmax(260px,1fr) minmax(320px,1.6fr); gap:10px 18px; margin:14px 0; padding:14px 16px; border:1px solid #b7dccb; border-left:4px solid #16805f; border-radius:10px; background:#f2faf6; color:#193b31; }
+.paper-risk-dynamic h3 { margin:0 0 4px; font-size:16px; }
+.paper-risk-dynamic p { margin:0; font-size:13px; line-height:1.55; }
+.paper-risk-dynamic small { grid-column:1/-1; color:#547066; font-size:12px; }
+.paper-risk-dynamic-metrics { display:flex; flex-wrap:wrap; gap:8px 16px; align-items:center; font-size:13px; }
+.paper-risk-dynamic-metrics span { white-space:nowrap; }
+.paper-risk-dynamic.caution { border-color:#e8ce93; border-left-color:#c58a18; background:#fff9ea; }
+.paper-risk-dynamic.halt { border-color:#efb8b8; border-left-color:#c94b4b; background:#fff1f1; }
+@media (max-width:720px) { .paper-risk-dynamic { grid-template-columns:1fr; } .paper-risk-dynamic small { grid-column:auto; } }
+.adaptive-shell .adaptive-advisor-actions button,.adaptive-shell .adaptive-research-suite>header button { border-color:#b9d6c8; background:#f5faf7; color:#216b52; }
+.adaptive-shell .adaptive-horizon-table th { background:#eef4f1; color:#61736b; border-color:#dbe5e0; }
+.adaptive-shell .adaptive-horizon-table td { color:#29483d; border-color:#dbe5e0; }
+
+/* v2: all self-evolution evidence uses the same light paper-console surface.
+   Keep this scoped to the page so the global dark-mode switch remains intact
+   for other workspaces. */
+#p-adaptive > .adaptive-module-tabs { position:relative; z-index:3; }
+#p-adaptive > .adaptive-module-tabs .adaptive-section-tab {
+  background:#f7faf8 !important; color:#5d7068 !important;
+  border:1px solid #d5e1dc !important; cursor:pointer; pointer-events:auto;
+}
+#p-adaptive > .adaptive-module-tabs .adaptive-section-tab:hover { background:#edf6f1 !important; color:#19352b !important; }
+#p-adaptive > .adaptive-module-tabs .adaptive-section-tab.active {
+  background:#102d22 !important; color:#f1f7f4 !important; border-color:#102d22 !important;
+}
+#p-adaptive > .adaptive-module-tabs .adaptive-section-tab.active .module-code { border-color:#3c6b58 !important; background:#1c3a2e !important; color:#76d0a8 !important; }
+#p-adaptive > .adaptive-module-tabs .adaptive-section-tab.active small { color:#9eb9ad !important; }
+#p-adaptive .adaptive-shell,
+body.dark #p-adaptive .adaptive-shell {
+  background:#f4f8f6 !important; color:#19352b !important; border-color:#d5e1dc !important;
+  box-shadow:0 14px 34px rgba(32,72,66,.08) !important;
+}
+#p-adaptive .adaptive-shell > [data-adaptive-section][hidden] { display:none !important; }
+#p-adaptive .adaptive-shell > [data-adaptive-section]:not([hidden]) { animation:adaptiveSectionIn .18s ease-out; }
+#p-adaptive .adaptive-shell .adaptive-hero,
+#p-adaptive .adaptive-shell .adaptive-flow-step,
+#p-adaptive .adaptive-shell .adaptive-panel,
+#p-adaptive .adaptive-shell .adaptive-selection-card,
+#p-adaptive .adaptive-shell .adaptive-risk-card,
+#p-adaptive .adaptive-shell .adaptive-advisor-card,
+#p-adaptive .adaptive-shell .adaptive-active-risk,
+#p-adaptive .adaptive-shell .adaptive-research-card {
+  background:#fff !important; color:#19352b !important; border-color:#dbe5e0 !important;
+  box-shadow:0 8px 20px rgba(24,60,44,.06) !important;
+}
+#p-adaptive .adaptive-shell .adaptive-hero { background:linear-gradient(125deg,#fff,#f3f8f5) !important; }
+#p-adaptive .adaptive-shell .adaptive-hero h3,
+#p-adaptive .adaptive-shell .adaptive-panel h3,
+#p-adaptive .adaptive-shell .adaptive-panel h4,
+#p-adaptive .adaptive-shell .adaptive-flow-step b,
+#p-adaptive .adaptive-shell .adaptive-selection-card h4,
+#p-adaptive .adaptive-shell .adaptive-risk-card h4,
+#p-adaptive .adaptive-shell .adaptive-advisor-card h4,
+#p-adaptive .adaptive-shell .adaptive-active-risk h4,
+#p-adaptive .adaptive-shell .adaptive-research-card h4,
+#p-adaptive .adaptive-shell .adaptive-advisor-report h4,
+#p-adaptive .adaptive-shell .risk-closure-layout h4,
+#p-adaptive .adaptive-shell .news-learning-layout h4,
+#p-adaptive .adaptive-shell .news-scope-top h4,
+#p-adaptive .adaptive-shell .major-radar-layout h4 { color:#19352b !important; }
+#p-adaptive .adaptive-shell .adaptive-hero p,
+#p-adaptive .adaptive-shell .adaptive-flow-step p,
+#p-adaptive .adaptive-shell .adaptive-copy,
+#p-adaptive .adaptive-shell .adaptive-selection-card > p,
+#p-adaptive .adaptive-shell .adaptive-risk-card > p,
+#p-adaptive .adaptive-shell .adaptive-advisor-card p,
+#p-adaptive .adaptive-shell .adaptive-research-card > p,
+#p-adaptive .adaptive-shell .adaptive-advisor-report > div p,
+#p-adaptive .adaptive-shell .adaptive-advisor-report li p,
+#p-adaptive .adaptive-shell .adaptive-research-finding p,
+#p-adaptive .adaptive-shell .risk-closure-layout aside > p,
+#p-adaptive .adaptive-shell .news-scope-top p,
+#p-adaptive .adaptive-shell .major-radar-layout aside > p { color:#63766d !important; }
+#p-adaptive .adaptive-shell .adaptive-tier-track span,
+#p-adaptive .adaptive-shell .adaptive-selection-weights div,
+#p-adaptive .adaptive-shell .adaptive-selection-delta,
+#p-adaptive .adaptive-shell .adaptive-risk-params div,
+#p-adaptive .adaptive-shell .adaptive-risk-gates span,
+#p-adaptive .adaptive-shell .adaptive-advisor-summary > div,
+#p-adaptive .adaptive-shell .adaptive-advisor-report > div,
+#p-adaptive .adaptive-shell .adaptive-advisor-report li,
+#p-adaptive .adaptive-shell .adaptive-research-meta span,
+#p-adaptive .adaptive-shell .adaptive-research-finding,
+#p-adaptive .adaptive-shell .adaptive-event-links a,
+#p-adaptive .adaptive-shell .risk-closure-kpis > div,
+#p-adaptive .adaptive-shell .risk-closure-layout aside,
+#p-adaptive .adaptive-shell .risk-deployment-list li,
+#p-adaptive .adaptive-shell .news-event-list li,
+#p-adaptive .adaptive-shell .news-source-list > div,
+#p-adaptive .adaptive-shell .news-scope-top > div,
+#p-adaptive .adaptive-shell .major-radar-layout > aside,
+#p-adaptive .adaptive-shell .major-event-list li,
+#p-adaptive .adaptive-shell .news-gates span { background:#f6faf7 !important; border-color:#dbe5e0 !important; color:#4f675d !important; }
+#p-adaptive .adaptive-shell .adaptive-tier-track b,
+#p-adaptive .adaptive-shell .adaptive-risk-card header strong,
+#p-adaptive .adaptive-shell .news-schedule b,
+#p-adaptive .adaptive-shell .news-event-list li a,
+#p-adaptive .adaptive-shell .news-event-list li em,
+#p-adaptive .adaptive-shell .major-event-list li a,
+#p-adaptive .adaptive-shell .major-event-list li em { color:#238365 !important; }
+#p-adaptive .adaptive-shell .adaptive-selection-card header span,
+#p-adaptive .adaptive-shell .adaptive-risk-card header span,
+#p-adaptive .adaptive-shell .adaptive-advisor-card > span,
+#p-adaptive .adaptive-shell .adaptive-research-card header span,
+#p-adaptive .adaptive-shell .adaptive-advisor-summary small,
+#p-adaptive .adaptive-shell .news-source-list small { color:#71827b !important; }
+#p-adaptive .adaptive-shell .adaptive-risk-gates span,
+#p-adaptive .adaptive-shell .news-gates span { background:#edf5f0 !important; color:#64786e !important; }
+#p-adaptive .adaptive-shell .adaptive-risk-gates .pass,
+#p-adaptive .adaptive-shell .news-gates span.pass { background:#e5f5ed !important; color:#237e61 !important; }
+#p-adaptive .adaptive-shell .adaptive-risk-card > button,
+#p-adaptive .adaptive-shell .adaptive-active-risk button,
+#p-adaptive .adaptive-shell .adaptive-research-card > button { color:#216b52 !important; border-color:#b9d6c8 !important; background:#f5faf7 !important; }
+#p-adaptive .adaptive-shell .adaptive-advisor-actions button,
+#p-adaptive .adaptive-shell .adaptive-research-suite > header button { color:#216b52 !important; border-color:#b9d6c8 !important; background:#f5faf7 !important; }
+@keyframes adaptiveSectionIn { from { opacity:.7; transform:translateY(3px); } to { opacity:1; transform:none; } }
+
+/* v3 readability pass: the evidence sections below the fold used the original
+   dark research tokens.  Keep the self-evolution workspace light and raise
+   the minimum type size so event/risk evidence remains readable. */
+#p-adaptive .adaptive-shell .adaptive-hero-metrics div,
+#p-adaptive .adaptive-shell .adaptive-strategy-stats div,
+#p-adaptive .adaptive-shell .adaptive-tier-track span,
+#p-adaptive .adaptive-shell .adaptive-selection-weights div,
+#p-adaptive .adaptive-shell .adaptive-selection-delta,
+#p-adaptive .adaptive-shell .adaptive-risk-params div,
+#p-adaptive .adaptive-shell .adaptive-risk-gates span,
+#p-adaptive .adaptive-shell .adaptive-advisor-summary > div,
+#p-adaptive .adaptive-shell .adaptive-advisor-report > div,
+#p-adaptive .adaptive-shell .adaptive-advisor-report li,
+#p-adaptive .adaptive-shell .adaptive-research-meta span,
+#p-adaptive .adaptive-shell .adaptive-research-finding,
+#p-adaptive .adaptive-shell .adaptive-event-links a,
+#p-adaptive .adaptive-shell .risk-closure-kpis > div,
+#p-adaptive .adaptive-shell .risk-closure-layout aside,
+#p-adaptive .adaptive-shell .risk-deployment-list li,
+#p-adaptive .adaptive-shell .news-kpis div,
+#p-adaptive .adaptive-shell .news-event-list li,
+#p-adaptive .adaptive-shell .news-source-list > div,
+#p-adaptive .adaptive-shell .news-scope-top > div,
+#p-adaptive .adaptive-shell .major-radar-layout > aside,
+#p-adaptive .adaptive-shell .major-event-list li,
+#p-adaptive .adaptive-shell .news-gates span,
+#p-adaptive .adaptive-shell .news-pool-kpis div {
+  background:#f6faf7 !important;
+  border-color:#dbe5e0 !important;
+  color:#345247 !important;
+}
+#p-adaptive .adaptive-shell .adaptive-hero-metrics small,
+#p-adaptive .adaptive-shell .adaptive-tier-track span,
+#p-adaptive .adaptive-shell .adaptive-selection-weights small,
+#p-adaptive .adaptive-shell .adaptive-selection-delta,
+#p-adaptive .adaptive-shell .adaptive-risk-params small,
+#p-adaptive .adaptive-shell .adaptive-risk-gates span,
+#p-adaptive .adaptive-shell .adaptive-advisor-summary small,
+#p-adaptive .adaptive-shell .adaptive-advisor-report > div small,
+#p-adaptive .adaptive-shell .adaptive-advisor-report li small,
+#p-adaptive .adaptive-shell .adaptive-research-meta span,
+#p-adaptive .adaptive-shell .adaptive-research-finding span,
+#p-adaptive .adaptive-shell .adaptive-research-finding p,
+#p-adaptive .adaptive-shell .adaptive-event-links b,
+#p-adaptive .adaptive-shell .risk-closure-kpis small,
+#p-adaptive .adaptive-shell .risk-closure-layout aside > p,
+#p-adaptive .adaptive-shell .risk-deployment-list li span,
+#p-adaptive .adaptive-shell .risk-deployment-list li p,
+#p-adaptive .adaptive-shell .risk-deployment-list li small,
+#p-adaptive .adaptive-shell .news-kpis small,
+#p-adaptive .adaptive-shell .news-event-list li p,
+#p-adaptive .adaptive-shell .news-source-list b,
+#p-adaptive .adaptive-shell .news-source-list small,
+#p-adaptive .adaptive-shell .news-scope-top p,
+#p-adaptive .adaptive-shell .major-radar-layout aside > p,
+#p-adaptive .adaptive-shell .news-pool-kpis small,
+#p-adaptive .adaptive-shell .news-gates span {
+  color:#63766d !important;
+  font-size:11px !important;
+  line-height:1.5 !important;
+}
+#p-adaptive .adaptive-shell .adaptive-hero-metrics b,
+#p-adaptive .adaptive-shell .adaptive-tier-track b,
+#p-adaptive .adaptive-shell .adaptive-selection-weights b,
+#p-adaptive .adaptive-shell .adaptive-selection-delta b,
+#p-adaptive .adaptive-shell .adaptive-risk-params b,
+#p-adaptive .adaptive-shell .adaptive-advisor-summary b,
+#p-adaptive .adaptive-shell .adaptive-advisor-report li b,
+#p-adaptive .adaptive-shell .adaptive-research-meta b,
+#p-adaptive .adaptive-shell .adaptive-research-finding b,
+#p-adaptive .adaptive-shell .risk-closure-kpis b,
+#p-adaptive .adaptive-shell .risk-deployment-list li b,
+#p-adaptive .adaptive-shell .news-kpis b,
+#p-adaptive .adaptive-shell .news-event-list li b,
+#p-adaptive .adaptive-shell .news-source-list strong,
+#p-adaptive .adaptive-shell .news-pool-kpis b,
+#p-adaptive .adaptive-shell .major-event-score b {
+  color:#234238 !important;
+  font-size:14px !important;
+}
+#p-adaptive .adaptive-shell .adaptive-selection-card > p,
+#p-adaptive .adaptive-shell .adaptive-risk-card > p,
+#p-adaptive .adaptive-shell .adaptive-advisor-card p,
+#p-adaptive .adaptive-shell .adaptive-research-card > p,
+#p-adaptive .adaptive-shell .adaptive-advisor-report > div p,
+#p-adaptive .adaptive-shell .adaptive-advisor-report li p,
+#p-adaptive .adaptive-shell .news-event-list li a,
+#p-adaptive .adaptive-shell .news-event-list li em,
+#p-adaptive .adaptive-shell .news-source-list span,
+#p-adaptive .adaptive-shell .news-source-list strong,
+#p-adaptive .adaptive-shell .major-event-list p,
+#p-adaptive .adaptive-shell .major-event-list a,
+#p-adaptive .adaptive-shell .major-event-list em,
+#p-adaptive .adaptive-shell .news-schedule span,
+#p-adaptive .adaptive-shell .news-schedule b,
+#p-adaptive .adaptive-shell .news-gates span b {
+  font-size:11px !important;
+  line-height:1.55 !important;
+}
+#p-adaptive .adaptive-shell .adaptive-research-card h4,
+#p-adaptive .adaptive-shell .adaptive-selection-card h4,
+#p-adaptive .adaptive-shell .adaptive-risk-card h4,
+#p-adaptive .adaptive-shell .adaptive-advisor-card h4,
+#p-adaptive .adaptive-shell .adaptive-active-risk h4,
+#p-adaptive .adaptive-shell .risk-closure-layout h4,
+#p-adaptive .adaptive-shell .news-learning-layout h4,
+#p-adaptive .adaptive-shell .news-scope-top h4,
+#p-adaptive .adaptive-shell .major-radar-layout h4 {
+  color:#19352b !important;
+  font-size:16px !important;
+}
+#p-adaptive .adaptive-shell .risk-closure-flow span,
+#p-adaptive .adaptive-shell .news-learning-flow span,
+#p-adaptive .adaptive-shell .risk-closure-layout h4,
+#p-adaptive .adaptive-shell .news-learning-layout h4 { color:#4f675d !important; }
+#p-adaptive .adaptive-shell .adaptive-event-links a:hover,
+#p-adaptive .adaptive-shell .adaptive-research-card > button:hover,
+#p-adaptive .adaptive-shell .adaptive-risk-card > button:hover { background:#edf6f1 !important; }
+
+/* v4: readable Chinese-first typography. The previous pass raised the
+   minimum but several nested news/radar selectors still forced 7–10px text
+   and pale dark-theme colors. */
+#p-adaptive .adaptive-shell {
+  font-family:"Microsoft YaHei","PingFang SC","Noto Sans CJK SC",sans-serif !important;
+  font-size:14px !important;
+  line-height:1.6 !important;
+}
+#p-adaptive .adaptive-shell .adaptive-panel,
+#p-adaptive .adaptive-shell .adaptive-flow-step,
+#p-adaptive .adaptive-shell .adaptive-selection-card,
+#p-adaptive .adaptive-shell .adaptive-risk-card,
+#p-adaptive .adaptive-shell .adaptive-advisor-card,
+#p-adaptive .adaptive-shell .adaptive-active-risk,
+#p-adaptive .adaptive-shell .adaptive-research-card { font-size:14px !important; }
+#p-adaptive .adaptive-shell .news-event-list li,
+#p-adaptive .adaptive-shell .major-event-list li,
+#p-adaptive .adaptive-shell .news-source-list > div { min-height:72px; }
+#p-adaptive .adaptive-shell .news-event-list li b,
+#p-adaptive .adaptive-shell .major-event-list li > div:nth-child(2) > b {
+  color:#234238 !important; font-size:13px !important; line-height:1.55 !important;
+  font-weight:700 !important; opacity:1 !important;
+}
+#p-adaptive .adaptive-shell .news-event-list li p,
+#p-adaptive .adaptive-shell .major-event-list p,
+#p-adaptive .adaptive-shell .news-source-list b,
+#p-adaptive .adaptive-shell .news-source-list small,
+#p-adaptive .adaptive-shell .news-scope-top p,
+#p-adaptive .adaptive-shell .major-radar-layout aside > p {
+  color:#536c61 !important; font-size:12px !important; line-height:1.6 !important;
+  opacity:1 !important;
+}
+#p-adaptive .adaptive-shell .news-event-list li a,
+#p-adaptive .adaptive-shell .news-event-list li em,
+#p-adaptive .adaptive-shell .major-event-list li a,
+#p-adaptive .adaptive-shell .major-event-list li em,
+#p-adaptive .adaptive-shell .news-source-list span,
+#p-adaptive .adaptive-shell .news-source-list strong {
+  color:#197452 !important; font-size:12px !important; font-weight:700 !important;
+}
+#p-adaptive .adaptive-shell .major-event-score b,
+#p-adaptive .adaptive-shell .news-pool-kpis b,
+#p-adaptive .adaptive-shell .news-kpis b,
+#p-adaptive .adaptive-shell .risk-closure-kpis b,
+#p-adaptive .adaptive-shell .adaptive-advisor-summary b {
+  color:#19352b !important; font-size:18px !important; line-height:1.2 !important;
+}
+#p-adaptive .adaptive-shell .major-event-score small,
+#p-adaptive .adaptive-shell .news-pool-kpis small,
+#p-adaptive .adaptive-shell .news-kpis small,
+#p-adaptive .adaptive-shell .risk-closure-kpis small,
+#p-adaptive .adaptive-shell .adaptive-advisor-summary small {
+  color:#61776c !important; font-size:12px !important; line-height:1.4 !important;
+}
+#p-adaptive .adaptive-shell .news-scope-top h4,
+#p-adaptive .adaptive-shell .major-radar-layout h4,
+#p-adaptive .adaptive-shell .news-learning-layout h4,
+#p-adaptive .adaptive-shell .risk-closure-layout h4 {
+  color:#19352b !important; font-size:17px !important; line-height:1.35 !important;
+}
+#p-adaptive .adaptive-shell .news-schedule span,
+#p-adaptive .adaptive-shell .news-schedule b,
+#p-adaptive .adaptive-shell .news-gates span,
+#p-adaptive .adaptive-shell .news-gates span b {
+  color:#356052 !important; font-size:12px !important; line-height:1.5 !important;
+}
+#p-adaptive .adaptive-shell .adaptive-advisor-report > div p,
+#p-adaptive .adaptive-shell .adaptive-advisor-report li p,
+#p-adaptive .adaptive-shell .adaptive-research-finding p,
+#p-adaptive .adaptive-shell .adaptive-copy,
+#p-adaptive .adaptive-shell .adaptive-selection-card > p,
+#p-adaptive .adaptive-shell .adaptive-risk-card > p,
+#p-adaptive .adaptive-shell .adaptive-advisor-card p,
+#p-adaptive .adaptive-shell .adaptive-research-card > p {
+  color:#536c61 !important; font-size:13px !important; line-height:1.7 !important;
+}
+#p-adaptive .adaptive-shell .adaptive-advisor-report li b,
+#p-adaptive .adaptive-shell .adaptive-research-finding b,
+#p-adaptive .adaptive-shell .adaptive-selection-card h4,
+#p-adaptive .adaptive-shell .adaptive-risk-card h4,
+#p-adaptive .adaptive-shell .adaptive-advisor-card h4,
+#p-adaptive .adaptive-shell .adaptive-active-risk h4,
+#p-adaptive .adaptive-shell .adaptive-research-card h4 {
+  color:#19352b !important; font-size:16px !important; line-height:1.45 !important;
+}
+#p-adaptive .adaptive-shell .adaptive-advisor-summary > div,
+#p-adaptive .adaptive-shell .news-kpis div,
+#p-adaptive .adaptive-shell .news-pool-kpis div,
+#p-adaptive .adaptive-shell .risk-closure-kpis > div { padding:14px !important; }
+
+/* v5: readability-first pass across the console.  The previous adaptive
+   passes corrected the palette but several legacy selectors still forced
+   8–11px text.  Keep one type scale and comfortable row density everywhere. */
+body {
+  font-size:15px;
+  line-height:1.6;
+}
+.page { padding-top:30px; }
+.page-header h2 { font-size:24px; }
+.page-header p { font-size:14px; line-height:1.7; }
+.page-kicker { font-size:13px; }
+.panel { padding:22px; }
+.panel h3 { font-size:18px; line-height:1.4; }
+.card .nm { font-size:13px; }
+.card .px { font-size:24px; }
+.card .chg { font-size:14px; }
+.section-note,.banner,.reasons,.news-item { font-size:14px; line-height:1.7; }
+.disclaimer { font-size:13px; }
+select, input[type=number], input[type=text], input[type=date], button { font-size:14px; }
+table { font-size:14px; }
+th { padding:12px 12px; font-size:13px; }
+td { padding:12px; }
+.tag { font-size:12px; padding:5px 10px; }
+.loading { font-size:14px; }
+.metric .k { font-size:12px; }
+.stock-signal-label { font-size:13px !important; }
+
+/* Adaptive lab: light paper-console surface, no low-contrast microcopy. */
+#p-adaptive .adaptive-shell,
+body.dark #p-adaptive .adaptive-shell {
+  --adaptive-line:#d5e1dc;
+  --adaptive-copy:#4f675d;
+  --adaptive-muted:#60776c;
+  --adaptive-card:#ffffff;
+  --adaptive-raised:#f3f8f5;
+  --adaptive-green:#1e7b5a;
+  background:#f5f9f7 !important;
+  color:#19352b !important;
+  border-color:#cddbd4 !important;
+  box-shadow:0 12px 30px rgba(22,48,37,.08) !important;
+  font-size:15px !important;
+  line-height:1.65 !important;
+}
+#p-adaptive .adaptive-shell .adaptive-hero,
+#p-adaptive .adaptive-shell .adaptive-flow-step,
+#p-adaptive .adaptive-shell .adaptive-panel,
+#p-adaptive .adaptive-shell .adaptive-selection-card,
+#p-adaptive .adaptive-shell .adaptive-risk-card,
+#p-adaptive .adaptive-shell .adaptive-advisor-card,
+#p-adaptive .adaptive-shell .adaptive-active-risk,
+#p-adaptive .adaptive-shell .adaptive-research-card,
+#p-adaptive .adaptive-shell .adaptive-strategy-card {
+  background:#ffffff !important;
+  color:#19352b !important;
+  border-color:#d5e1dc !important;
+  box-shadow:0 7px 18px rgba(24,60,44,.055) !important;
+}
+#p-adaptive .adaptive-shell .adaptive-hero { padding:28px 30px !important; }
+#p-adaptive .adaptive-shell .adaptive-hero h3 { font-size:30px !important; line-height:1.25 !important; color:#17382b !important; }
+#p-adaptive .adaptive-shell .adaptive-panel h3 { font-size:21px !important; line-height:1.4 !important; color:#17382b !important; }
+#p-adaptive .adaptive-shell h4 { font-size:18px !important; line-height:1.45 !important; color:#17382b !important; }
+#p-adaptive .adaptive-shell p,
+#p-adaptive .adaptive-shell li,
+#p-adaptive .adaptive-shell a,
+#p-adaptive .adaptive-shell label,
+#p-adaptive .adaptive-shell .adaptive-copy,
+#p-adaptive .adaptive-shell .adaptive-flow-step p,
+#p-adaptive .adaptive-shell .adaptive-driver p,
+#p-adaptive .adaptive-shell .adaptive-selection-card > p,
+#p-adaptive .adaptive-shell .adaptive-risk-card > p,
+#p-adaptive .adaptive-shell .adaptive-advisor-card p,
+#p-adaptive .adaptive-shell .adaptive-research-card > p,
+#p-adaptive .adaptive-shell .adaptive-advisor-report li p,
+#p-adaptive .adaptive-shell .adaptive-research-finding p,
+#p-adaptive .adaptive-shell .news-event-list li p,
+#p-adaptive .adaptive-shell .major-event-list p {
+  color:#4f675d !important;
+  font-size:14px !important;
+  line-height:1.7 !important;
+}
+#p-adaptive .adaptive-shell small,
+#p-adaptive .adaptive-shell time,
+#p-adaptive .adaptive-shell em,
+#p-adaptive .adaptive-shell .adaptive-panel header span,
+#p-adaptive .adaptive-shell .adaptive-panel header em,
+#p-adaptive .adaptive-shell .adaptive-sector-columns h4,
+#p-adaptive .adaptive-shell .adaptive-strategy-card header span,
+#p-adaptive .adaptive-shell .adaptive-risk-card header span,
+#p-adaptive .adaptive-shell .adaptive-advisor-card > span,
+#p-adaptive .adaptive-shell .adaptive-research-card header span,
+#p-adaptive .adaptive-shell .news-source-list small {
+  color:#60776c !important;
+  font-size:13px !important;
+  line-height:1.55 !important;
+}
+#p-adaptive .adaptive-shell b,
+#p-adaptive .adaptive-shell strong { color:#214838 !important; font-size:15px !important; }
+#p-adaptive .adaptive-shell .adaptive-hero-metrics b,
+#p-adaptive .adaptive-shell .adaptive-strategy-card header > strong,
+#p-adaptive .adaptive-shell .adaptive-driver strong,
+#p-adaptive .adaptive-shell .adaptive-hero-metrics strong,
+#p-adaptive .adaptive-shell .major-event-score b,
+#p-adaptive .adaptive-shell .news-kpis b,
+#p-adaptive .adaptive-shell .news-pool-kpis b,
+#p-adaptive .adaptive-shell .risk-closure-kpis b { font-size:20px !important; }
+#p-adaptive .adaptive-shell .adaptive-section-nav { background:#ffffff !important; border-color:#d5e1dc !important; }
+#p-adaptive .adaptive-shell .adaptive-section-tab { min-height:44px; color:#496459 !important; font-size:14px !important; }
+#p-adaptive .adaptive-shell .adaptive-section-tab.active { background:#176b50 !important; color:#ffffff !important; }
+#p-adaptive .adaptive-shell .adaptive-flow { gap:14px; }
+#p-adaptive .adaptive-shell .adaptive-flow-step { min-height:140px; padding:20px; }
+#p-adaptive .adaptive-shell .adaptive-flow-step > span { width:38px; height:38px; font-size:13px !important; }
+#p-adaptive .adaptive-shell .adaptive-flow-step b { font-size:17px !important; }
+#p-adaptive .adaptive-shell .adaptive-panel { padding:24px !important; }
+#p-adaptive .adaptive-shell .adaptive-guardrails,
+#p-adaptive .adaptive-shell .adaptive-run-log { max-height:560px; overflow:auto; padding-right:10px; scrollbar-gutter:stable; }
+#p-adaptive .adaptive-shell .adaptive-guardrails li,
+#p-adaptive .adaptive-shell .adaptive-run-log li { min-height:76px; gap:14px; padding:16px 0; border-color:#dbe5e0 !important; }
+#p-adaptive .adaptive-shell .adaptive-guardrails b,
+#p-adaptive .adaptive-shell .adaptive-run-log b { font-size:15px !important; color:#214838 !important; }
+#p-adaptive .adaptive-shell .adaptive-guardrails p,
+#p-adaptive .adaptive-shell .adaptive-run-log p { font-size:14px !important; color:#536c61 !important; line-height:1.65 !important; }
+#p-adaptive .adaptive-shell .adaptive-run-log time { min-width:82px; font-size:13px !important; color:#507064 !important; }
+#p-adaptive .adaptive-shell .adaptive-run-log .tag,
+#p-adaptive .adaptive-shell .tag { font-size:12px !important; padding:6px 10px !important; }
+#p-adaptive .adaptive-shell .adaptive-horizon-table th,
+#p-adaptive .adaptive-shell .adaptive-horizon-table td { font-size:14px !important; padding:13px 12px !important; }
+#p-adaptive .adaptive-shell .adaptive-selection-weights small,
+#p-adaptive .adaptive-shell .adaptive-selection-weights b,
+#p-adaptive .adaptive-shell .adaptive-risk-params small,
+#p-adaptive .adaptive-shell .adaptive-risk-params b { font-size:14px !important; }
+#p-adaptive .adaptive-shell button { min-height:44px; font-size:14px !important; }
+.closed-loop-panel { border-left:4px solid #176b50 !important; }
+.closed-loop-stages { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:10px; margin:18px 0; }
+.closed-loop-stage { display:grid; gap:5px; padding:14px; border:1px solid #d5e1dc; border-radius:12px; background:#f6faf8; }
+.closed-loop-stage.active { background:#e4f4ed; border-color:#53a88b; box-shadow:inset 0 0 0 1px #53a88b; }
+.closed-loop-stage b { font-size:16px !important; }
+.closed-loop-stage span,.closed-loop-stage em { font-style:normal; color:#60776c; font-size:13px; }
+.closed-loop-kpis { display:grid; grid-template-columns:repeat(6,minmax(0,1fr)); gap:10px; }
+.closed-loop-kpis > div { padding:14px; border:1px solid #d5e1dc; border-radius:12px; background:#f8fbfa; }
+.closed-loop-kpis small { display:block; margin-bottom:7px; color:#60776c; }
+.closed-loop-kpis b { font-size:18px !important; }
+.closed-loop-gates { margin-top:16px; padding:16px; border:1px solid #ead6ad; border-radius:12px; background:#fff9eb; }
+.closed-loop-gates ul { margin:8px 0 0; padding-left:20px; color:#7c5c18; line-height:1.8; }
+.closed-loop-gates li.pass { color:#176b50; }
+.portfolio-shadow-kpis { display:flex; flex-wrap:wrap; gap:10px; margin:16px 0; }
+.portfolio-shadow-kpis span { padding:10px 14px; border:1px solid #d5e1dc; border-radius:999px; background:#f6faf8; color:#60776c; }
+.portfolio-shadow-list { display:grid; grid-template-columns:1fr 1fr; gap:12px; }
+.portfolio-shadow-list article { display:flex; align-items:center; justify-content:space-between; gap:15px; padding:16px; border:1px solid #d5e1dc; border-radius:12px; background:#f8fbfa; }
+.portfolio-shadow-list article div { display:grid; gap:5px; }
+.portfolio-shadow-list article span,.portfolio-shadow-list article small { color:#60776c; }
+.portfolio-shadow-list article strong { min-width:58px; text-align:center; padding:10px; border-radius:10px; background:#e4f4ed; font-size:20px !important; }
+.data-input-grid { display:grid; grid-template-columns:repeat(5,minmax(0,1fr)); gap:12px; }
+.data-input-card { display:grid; align-content:start; gap:12px; padding:17px; border:1px solid #d5e1dc; border-radius:14px; background:#f8fbfa; }
+.data-input-card.usable { border-top:4px solid #238467; }
+.data-input-card.shadow { border-top:4px solid #b98222; }
+.data-input-card.partial { border-top:4px solid #6784b6; }
+.data-input-card.blocked { border-top:4px solid #c84c45; }
+.data-input-card header { display:flex; justify-content:space-between; gap:8px; align-items:flex-start; }
+.data-input-card header span { text-transform:uppercase; letter-spacing:.08em; font-size:11px !important; color:#6b8277; }
+.data-input-card header h4 { margin:4px 0 0; font-size:18px !important; }
+.data-input-card header em { font-style:normal; white-space:nowrap; padding:5px 8px; border-radius:999px; background:#e8f2ed; font-size:12px; color:#176b50; }
+.data-input-card.shadow header em { background:#fff2d8; color:#80570e; }
+.data-input-card.partial header em { background:#eaf0fa; color:#486695; }
+.data-input-card.blocked header em { background:#fee9e7; color:#a93631; }
+.data-input-metric b { display:block; font-size:22px !important; }
+.data-input-card p { min-height:100px; }
+.data-input-sources { display:flex; flex-wrap:wrap; gap:5px; }
+.data-input-sources span { padding:4px 7px; border-radius:7px; background:#edf3f0; color:#557064; font-size:11px !important; }
+.data-input-bottom { display:grid; grid-template-columns:1fr 1fr; gap:14px; margin-top:16px; }
+.data-input-bottom > div { padding:16px; border:1px solid #d5e1dc; border-radius:12px; background:#fff; }
+.data-input-bottom ul { margin:8px 0 0; padding-left:20px; line-height:1.75; color:#60776c; }
+.data-validity-panel { border-color:#d5e5dd !important; background:linear-gradient(135deg,#fbfefd,#f2f8f5) !important; }
+.data-validity-head { display:flex; justify-content:space-between; gap:20px; align-items:flex-start; padding-bottom:14px; border-bottom:1px solid var(--border-light); }
+.data-validity-head h3 { margin:5px 0 4px; font-size:20px; }
+.data-validity-head p { margin:0; color:var(--text-secondary); font-size:12px; line-height:1.6; }
+.data-validity-actions { display:flex; align-items:center; gap:8px; flex-wrap:wrap; white-space:nowrap; }
+.data-validity-cards { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:10px; margin-top:14px; }
+.data-validity-card { padding:13px 14px; border:1px solid #d5e1dc; border-radius:11px; background:rgba(255,255,255,.82); }
+.data-validity-card small { display:block; color:#71857b; font-size:11px; }
+.data-validity-card b { display:block; margin-top:4px; font-size:20px; color:#123d2e; }
+.data-validity-card em { display:block; margin-top:4px; font-style:normal; color:#6b8277; font-size:11px; }
+.data-validity-card.good { border-top:3px solid #2e9b73; }
+.data-validity-card.warn { border-top:3px solid #d7a33b; }
+.data-validity-card.bad { border-top:3px solid #c84c45; }
+.data-validity-details { margin-top:12px; padding:11px 13px; border-radius:10px; background:#f7faf8; color:#647a6e; font-size:12px; line-height:1.7; }
+.data-validity-details button { margin-left:8px; }
+
+@media (max-width:768px) {
+  body { font-size:14px; }
+  .page-header h2 { font-size:22px; }
+  .panel { padding:18px 14px; }
+  table { font-size:13px; }
+  th { font-size:12px; padding:10px 8px; }
+  td { padding:10px 8px; }
+  #p-adaptive .adaptive-shell { font-size:14px !important; }
+  #p-adaptive .adaptive-shell .adaptive-hero { padding:22px 18px !important; }
+  #p-adaptive .adaptive-shell .adaptive-hero h3 { font-size:25px !important; }
+  #p-adaptive .adaptive-shell .adaptive-panel { padding:18px !important; }
+  #p-adaptive .adaptive-shell p,
+  #p-adaptive .adaptive-shell li { font-size:14px !important; }
+  #p-adaptive .adaptive-shell .adaptive-run-log,
+  #p-adaptive .adaptive-shell .adaptive-guardrails { max-height:480px; }
+  #p-adaptive .adaptive-shell .adaptive-downside-policy > div { grid-template-columns:1fr; gap:3px; }
+  #p-adaptive .adaptive-shell .adaptive-downside-policy > header { display:block; }
+  #p-adaptive .adaptive-shell .adaptive-downside-policy > header span { display:block; margin-top:4px; }
+  .closed-loop-stages,.closed-loop-kpis { grid-template-columns:1fr 1fr; }
+  .portfolio-shadow-list { grid-template-columns:1fr; }
+  .data-input-grid { grid-template-columns:1fr; }
+  .data-input-card p { min-height:0; }
+  .data-input-bottom { grid-template-columns:1fr; }
+  .data-validity-head { display:block; }
+  .data-validity-actions { margin-top:12px; white-space:normal; }
+  .data-validity-cards { grid-template-columns:1fr 1fr; }
+}
+
+/* ─── 执行画像中心（PR-12） ─── */
+.paper-execution-view { display:grid; gap:16px; }
+.exec-panel { border:1px solid var(--border); border-radius:14px; background:var(--surface); padding:18px 20px; box-shadow:0 6px 18px rgba(20,55,40,.04); }
+.exec-panel h3 { margin:0 0 4px; }
+.exec-panel h4 { margin:18px 0 8px; font-size:14px; }
+.exec-panel > p, .exec-hint { margin:0 0 12px; color:var(--text-secondary); font-size:12px; line-height:1.6; }
+.exec-head { display:flex; justify-content:space-between; align-items:flex-start; gap:12px; flex-wrap:wrap; }
+.exec-head-state { display:flex; align-items:center; gap:10px; flex-wrap:wrap; }
+.exec-switches { display:grid; grid-template-columns:repeat(auto-fit,minmax(200px,1fr)); gap:10px; margin-top:12px; }
+.exec-switch { display:flex; justify-content:space-between; align-items:center; gap:8px; padding:10px 14px; border:1px solid var(--border-light); border-radius:10px; background:var(--th-bg); font-size:13px; }
+.exec-queue-table { width:100%; border-collapse:collapse; font-size:12.5px; }
+.exec-queue-table th, .exec-queue-table td { padding:8px 10px; border-bottom:1px solid var(--table-border); text-align:left; vertical-align:top; }
+.exec-queue-table th { background:var(--th-bg); color:var(--text-secondary); font-weight:600; white-space:nowrap; }
+.exec-queue-table td small { display:block; color:var(--text-muted); margin-top:2px; }
+.exec-queue-reason { max-width:320px; color:var(--text-secondary); }
+.exec-queue-actions { display:flex; gap:6px; white-space:nowrap; }
+.exec-queue-actions button { padding:4px 12px; font-size:12px; border-radius:6px; border:1px solid var(--primary); background:var(--primary); color:#fff; cursor:pointer; }
+.exec-queue-actions button:hover { background:var(--primary-hover); }
+.exec-queue-actions button.exec-reject { border-color:var(--border); background:var(--surface); color:var(--danger); }
+.exec-queue-actions button.exec-reject:hover { background:var(--tag-warn-bg); }
+.exec-inactive td { opacity:.55; }
+@media (max-width:760px) {
+  .exec-queue-reason { max-width:none; }
+  .exec-head { display:block; }
+  .exec-head-state { margin-top:10px; }
+}
+
+/* ---------- PR-34: strategy builder & registry management ---------- */
+.strategy-builder-toolbar{margin-top:12px;display:flex;align-items:center;gap:12px;flex-wrap:wrap}
+.strategy-builder-hint,.strategy-muted{color:var(--text-dim,#8a93a5);font-size:12px}
+.strategy-registry-panel{margin-top:16px}
+.strategy-builder-panel{margin-top:14px}
+.strategy-builder-form{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:10px;margin:12px 0}
+.strategy-builder-form label{display:flex;flex-direction:column;gap:4px;font-size:12px;color:var(--text-dim,#8a93a5)}
+.strategy-builder-form input,.strategy-builder-form select{padding:6px 8px;border:1px solid var(--border,#2a3140);border-radius:6px;background:var(--panel,#fff);color:inherit}
+.strategy-condition-editor{border:1px solid var(--border,#2a3140);border-radius:8px;padding:10px;margin:10px 0}
+.sb-group{border:1px dashed var(--border,#2a3140);border-radius:6px;padding:8px;margin:6px 0}
+.sb-cond{display:flex;gap:6px;align-items:center;margin:6px 0;flex-wrap:wrap}
+.sb-cond select,.sb-cond input{padding:4px 6px;border:1px solid var(--border,#2a3140);border-radius:4px;background:var(--panel,#fff);color:inherit;max-width:170px}
+.strategy-condition-actions{display:flex;gap:8px;margin-top:8px}
+.strategy-dsl-view pre{max-height:220px;overflow:auto;background:var(--panel-2,#f6f7fa);border:1px solid var(--border,#2a3140);border-radius:6px;padding:8px;font-size:12px}
+.strategy-preview-box{border:1px solid var(--border,#2a3140);border-radius:8px;padding:10px;margin:10px 0}
+.strategy-preview-box .paper-strategy-metrics{margin:8px 0}
+.strategy-builder-actions{margin-top:10px;display:flex;gap:8px}
+.exec-queue-actions button{margin-right:4px}
+
+/* ============ PR-46：策略中心（Strategy Workbench） ============ */
+.strategy-workbench-page .page-header { display:flex; justify-content:space-between; gap:16px; align-items:flex-start; flex-wrap:wrap; }
+.strategy-workbench-actions { display:flex; gap:8px; }
+.strategy-workbench-primary { background:var(--primary); border:1px solid var(--primary); color:#fff; padding:9px 16px; border-radius:9px; font-weight:600; font-size:13px; cursor:pointer; min-height:38px; }
+.strategy-workbench-primary:hover { background:var(--primary-hover); }
+.strategy-workbench-new-btn { background:var(--primary); border:1px solid var(--primary); color:#fff; padding:10px 18px; border-radius:10px; font-weight:600; font-size:13px; cursor:pointer; }
+.strategy-workbench-new-btn:hover { background:var(--primary-hover); }
+.strategy-workbench-summary { color:var(--text-secondary); font-size:13px; padding:10px 14px; border:1px solid var(--border-light); border-radius:10px; background:var(--th-bg); }
+.strategy-workbench-summary b { color:var(--text); font-size:15px; }
+.strategy-workbench-summary span { color:var(--text-muted); margin:0 4px; }
+.strategy-workbench-toolbar { display:flex; gap:12px; align-items:center; flex-wrap:wrap; margin-top:12px; }
+.strategy-workbench-filters { display:flex; gap:6px; flex-wrap:wrap; }
+.strategy-workbench-filter { border:1px solid var(--border); background:var(--surface); color:var(--text-secondary); border-radius:999px; padding:6px 14px; font-size:12px; cursor:pointer; min-height:32px; }
+.strategy-workbench-filter:hover { border-color:var(--primary); color:var(--primary); }
+.strategy-workbench-filter.active { background:var(--primary); border-color:var(--primary); color:#fff; }
+.strategy-workbench-search { flex:1; min-width:200px; max-width:320px; border:1px solid var(--border); border-radius:9px; padding:8px 12px; background:var(--surface); color:var(--text); font-size:13px; }
+.strategy-workbench-search:focus-visible { outline:2px solid var(--primary); outline-offset:1px; }
+.strategy-list-group { margin:18px 0 10px; font-size:14px; color:var(--text-secondary); }
+.strategy-card-grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(320px,1fr)); gap:12px; }
+.strategy-card { border:1px solid var(--border); border-radius:13px; background:var(--surface); padding:16px; box-shadow:var(--shadow); display:flex; flex-direction:column; gap:8px; }
+.strategy-card header { display:flex; justify-content:space-between; align-items:center; gap:10px; }
+.strategy-card header h3 { margin:0; font-size:15px; }
+.strategy-card-meta { margin:0; display:flex; gap:10px; flex-wrap:wrap; color:var(--text-muted); font-size:12px; align-items:center; }
+.strategy-card-origin { padding:2px 8px; border-radius:999px; font-size:11px; font-weight:600; }
+.strategy-card-origin-builtin { background:var(--th-bg); color:var(--text-secondary); border:1px solid var(--border); }
+.strategy-card-origin-user { background:var(--tag-ok-bg); color:var(--primary); border:1px solid var(--primary); }
+.strategy-card-desc { margin:0; color:var(--text-secondary); font-size:12px; line-height:1.6; min-height:2.6em; }
+.strategy-card-actions { display:flex; gap:6px; flex-wrap:wrap; margin-top:auto; padding-top:8px; border-top:1px solid var(--border-light); }
+.strategy-card-actions button { border:1px solid var(--border); background:var(--surface); color:var(--text); border-radius:8px; padding:6px 12px; font-size:12px; cursor:pointer; min-height:32px; }
+.strategy-card-actions button:hover { border-color:var(--primary); color:var(--primary); }
+.strategy-card-actions button.strategy-workbench-primary:hover { color:#fff; }
+.strategy-card-danger { color:var(--danger) !important; border-color:var(--danger) !important; }
+.strategy-status-badge { padding:3px 9px; border-radius:999px; font-size:11px; font-weight:700; letter-spacing:.4px; white-space:nowrap; }
+.strategy-status-draft { background:var(--th-bg); color:var(--text-muted); border:1px solid var(--border); }
+.strategy-status-validated { background:var(--tag-info-bg); color:#1d4ed8; border:1px solid #bfd3f7; }
+.strategy-status-active { background:var(--tag-ok-bg); color:var(--primary); border:1px solid var(--primary); }
+.strategy-status-paused { background:rgba(180,131,29,.12); color:#a6741f; border:1px solid #e2c684; }
+.strategy-status-retiring { background:rgba(217,79,71,.10); color:var(--danger); border:1px solid #eeb9b5; }
+.strategy-status-archived { background:var(--th-bg); color:var(--text-muted); border:1px dashed var(--border); }
+.strategy-workbench-empty { border:1px dashed var(--border); border-radius:13px; background:var(--th-bg); padding:28px 20px; text-align:center; color:var(--text-secondary); }
+.strategy-workbench-empty b { color:var(--text); }
+.strategy-workbench-empty ul { display:inline-block; text-align:left; margin:10px 0; }
+.strategy-workbench-empty button { margin-top:6px; }
+.strategy-workbench-error { border:1px solid var(--danger); border-radius:12px; background:var(--tag-warn-bg); color:var(--danger); padding:18px; display:grid; gap:8px; justify-items:start; }
+.strategy-workbench-error button { border:1px solid var(--danger); background:var(--surface); color:var(--danger); border-radius:8px; padding:6px 14px; cursor:pointer; }
+/* 编辑器 */
+.strategy-editor-head { display:flex; justify-content:space-between; align-items:center; gap:12px; margin-bottom:12px; flex-wrap:wrap; }
+.strategy-editor-head h3 { margin:0; font-size:16px; }
+.strategy-editor-head button { border:1px solid var(--border); background:var(--surface); border-radius:8px; padding:7px 14px; cursor:pointer; color:var(--text); }
+.strategy-editor-columns { display:grid; grid-template-columns:minmax(0,1.5fr) minmax(300px,1fr); gap:16px; align-items:start; }
+.strategy-editor-form { border:1px solid var(--border); border-radius:13px; background:var(--surface); padding:18px; box-shadow:var(--shadow); display:grid; gap:10px; }
+.strategy-editor-form h4 { margin:6px 0 0; font-size:13px; color:var(--text-secondary); text-transform:uppercase; letter-spacing:.5px; }
+.strategy-editor-form label { display:grid; gap:5px; font-size:13px; color:var(--text-secondary); }
+.strategy-editor-form input[type=text],.strategy-editor-form input[type=number],.strategy-editor-form textarea,.strategy-editor-form select { border:1px solid var(--border); border-radius:8px; padding:9px 11px; background:var(--surface); color:var(--text); font-size:13px; width:100%; }
+.strategy-editor-form input:focus-visible,.strategy-editor-form textarea:focus-visible,.strategy-editor-form select:focus-visible { outline:2px solid var(--primary); outline-offset:1px; }
+.strategy-editor-form small { color:var(--text-muted); font-size:11px; }
+.strategy-editor-static { margin:0; font-size:13px; color:var(--text-secondary); }
+.strategy-editor-modes { display:flex; gap:6px; }
+.strategy-editor-modes button { border:1px solid var(--border); background:var(--surface); color:var(--text-secondary); border-radius:8px; padding:6px 14px; font-size:12px; cursor:pointer; min-height:32px; }
+.strategy-editor-modes button.active { background:var(--primary); border-color:var(--primary); color:#fff; }
+.strategy-editor-note { margin:0; color:var(--text-muted); font-size:12px; line-height:1.6; }
+.strategy-conditions { display:grid; gap:8px; }
+.strategy-condition-row { display:grid; grid-template-columns:1.1fr .9fr .8fr 1.4fr auto; gap:8px; align-items:end; border:1px solid var(--border-light); border-radius:10px; padding:10px; background:var(--th-bg); }
+.strategy-condition-row label { display:grid; gap:4px; font-size:11px; color:var(--text-muted); }
+.strategy-condition-row select,.strategy-condition-row input { border:1px solid var(--border); border-radius:7px; padding:7px 9px; font-size:12px; background:var(--surface); color:var(--text); min-height:34px; }
+.strategy-condition-value { display:flex; gap:6px; }
+.strategy-condition-value select,.strategy-condition-value input { min-width:0; flex:1; }
+.strategy-condition-remove { border:1px solid var(--border); background:var(--surface); color:var(--text-muted); border-radius:7px; width:34px; height:34px; cursor:pointer; }
+.strategy-condition-remove:hover { color:var(--danger); border-color:var(--danger); }
+.strategy-condition-add { justify-self:start; border:1px dashed var(--border); background:transparent; color:var(--text-secondary); border-radius:9px; padding:8px 16px; cursor:pointer; min-height:36px; }
+.strategy-condition-add:hover { color:var(--primary); border-color:var(--primary); }
+.strategy-dsl-input { font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; font-size:12px; line-height:1.6; border:1px solid var(--border); border-radius:10px; padding:12px; background:var(--th-bg); color:var(--text); width:100%; resize:vertical; }
+.strategy-editor-dsl-tools { display:flex; gap:8px; }
+.strategy-editor-dsl-tools button { border:1px solid var(--border); background:var(--surface); border-radius:8px; padding:6px 14px; font-size:12px; cursor:pointer; color:var(--text); min-height:32px; }
+.strategy-editor-footer { display:flex; gap:8px; flex-wrap:wrap; padding-top:6px; border-top:1px solid var(--border-light); }
+.strategy-editor-footer button { border:1px solid var(--border); background:var(--surface); color:var(--text); border-radius:9px; padding:9px 16px; font-size:13px; cursor:pointer; min-height:38px; }
+/* 预览面板 */
+.strategy-preview-panel { border:1px solid var(--border); border-radius:13px; background:var(--surface); padding:18px; box-shadow:var(--shadow); display:grid; gap:12px; align-content:start; }
+.strategy-preview-panel h4 { margin:0; font-size:14px; }
+.strategy-preview-panel h5 { margin:0 0 6px; font-size:12px; color:var(--text-secondary); text-transform:uppercase; letter-spacing:.5px; }
+.strategy-preview-grid { display:grid; grid-template-columns:auto 1fr; gap:4px 14px; margin:0; font-size:12px; }
+.strategy-preview-grid dt { color:var(--text-muted); }
+.strategy-preview-grid dd { margin:0; color:var(--text); font-weight:600; }
+.strategy-preview-result { border-radius:10px; padding:12px 14px; font-size:12px; line-height:1.65; }
+.strategy-preview-ok { background:var(--tag-ok-bg); border:1px solid var(--primary); color:var(--primary); }
+.strategy-preview-bad { background:var(--tag-warn-bg); border:1px solid var(--danger); color:var(--danger); }
+.strategy-preview-warn { color:#a6741f; font-size:12px; }
+.strategy-preview-bad ul,.strategy-preview-ok ul { margin:6px 0 0; padding-left:18px; }
+/* 详情 */
+.strategy-detail-columns { display:grid; grid-template-columns:1fr 1fr; gap:16px; align-items:start; }
+.strategy-detail-columns section { border:1px solid var(--border); border-radius:13px; background:var(--surface); padding:18px; box-shadow:var(--shadow); }
+.strategy-detail-columns h4 { margin:0 0 10px; font-size:14px; }
+.strategy-version-list { list-style:none; margin:0; padding:0; display:grid; gap:8px; font-size:12px; }
+.strategy-version-list li { border:1px solid var(--border-light); border-radius:9px; padding:9px 12px; background:var(--th-bg); color:var(--text-secondary); display:flex; gap:8px; align-items:baseline; flex-wrap:wrap; }
+.strategy-version-list li.current { border-color:var(--primary); }
+.strategy-version-list b { color:var(--text); }
+.strategy-version-time { color:var(--text-muted); font-size:11px; }
+.strategy-version-list code { color:var(--text-muted); font-size:11px; margin-left:auto; }
+/* 响应式 */
+@media (max-width:1099px){
+  .strategy-editor-columns { grid-template-columns:1fr; }
+  .strategy-preview-panel { order:2; }
+}
+@media (max-width:700px){
+  .strategy-detail-columns { grid-template-columns:1fr; }
+  .strategy-condition-row { grid-template-columns:1fr 1fr; }
+  .strategy-card-grid { grid-template-columns:1fr; }
+  .strategy-editor-footer button,.strategy-workbench-new-btn { width:100%; }
+}
+body.dark .strategy-workbench-filter.active { color:#fff; }
+body.dark .strategy-status-active { background:rgba(35,139,104,.22); }
+body.dark .strategy-status-validated { background:rgba(29,78,216,.22); color:#93b4f5; border-color:#2b4a7a; }
+body.dark .strategy-status-paused { background:rgba(166,116,31,.18); }
+body.dark .strategy-workbench-summary,body.dark .strategy-condition-row,body.dark .strategy-version-list li,body.dark .strategy-dsl-input { background:rgba(255,255,255,.03); }
+body.dark .strategy-workbench-empty { background:rgba(255,255,255,.02); }
+
+/* ============ PR-47：Settings Registry 驱动 ============ */
+.settings-strategy-group { display:grid; gap:8px; }
+.settings-strategy-item { display:flex; gap:10px; align-items:center; flex-wrap:wrap; padding:9px 12px; border:1px solid var(--border-light); border-radius:10px; background:var(--th-bg); cursor:pointer; min-height:44px; }
+.settings-strategy-item input[type=checkbox] { width:18px; height:18px; accent-color:#238b68; flex:none; }
+.settings-strategy-item span { display:grid; gap:2px; }
+.settings-strategy-item span b { font-size:13px; color:var(--text); }
+.settings-strategy-item-disabled { opacity:.62; cursor:not-allowed; }
+.settings-strategy-link { border:1px solid var(--border); background:var(--surface); color:var(--primary); border-radius:8px; padding:4px 10px; font-size:11px; cursor:pointer; margin-left:auto; min-height:28px; }
+.settings-strategy-link:hover { border-color:var(--primary); }
+.strategy-user-card { padding:15px; border:1px solid var(--border); border-radius:12px; background:var(--th-bg); display:grid; gap:8px; }
+.strategy-user-card header { display:flex; justify-content:space-between; align-items:flex-start; gap:10px; }
+.strategy-user-card header b { font-size:14px; }
+body.dark .settings-strategy-item,body.dark .strategy-user-card { background:rgba(255,255,255,.03); }
+
+/* ============ PR-49：策略中心空态 / 发布版本收口 ============ */
+.strategy-workbench-empty-inline { text-align:left; align-items:flex-start; margin:0 0 14px; }
+.strategy-workbench-empty-inline p { margin:2px 0 10px; }
+.strategy-workbench-empty .ghost { border:1px solid var(--border); background:var(--surface); color:var(--text); border-radius:8px; padding:6px 12px; cursor:pointer; font-size:12px; }
+.settings-head-state { max-width:52ch; }

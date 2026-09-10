@@ -1,16 +1,17 @@
+import frontend_sources
 from pathlib import Path
 import unittest
 
 import build_info as BI
 
 
-APP = Path(__file__).resolve().parents[1] / "frontend" / "app.js"
+SOURCE = frontend_sources.source_text  # PR-55：源已拆到 frontend/src/**
 INDEX = Path(__file__).resolve().parents[1] / "frontend" / "index.html"
 
 
 class FrontendRiskAuditRaceTests(unittest.TestCase):
     def test_risk_audit_renderer_accepts_empty_payload(self):
-        source = APP.read_text(encoding="utf-8")
+        source = SOURCE()
         self.assertIn("d=(d&&typeof d==='object')?d:{};", source)
 
     def test_activity_tab_late_switch_fetches_audit_payload(self):
@@ -20,7 +21,7 @@ class FrontendRiskAuditRaceTests(unittest.TestCase):
         缓存：优先用并行请求 / 上次缓存，两者皆无时仍会现场拉取，保证延迟
         切换到 activity 页时审计记录一定出现（而不是静默缺失）。
         """
-        source = APP.read_text(encoding="utf-8")
+        source = SOURCE()
         self.assertIn("auditDashboard=auditRequest||window._paperAuditCache", source)
         self.assertIn("auditDashboard=await api('/api/paper/risk-audit?limit=160')", source)
         self.assertIn("window._paperAuditCache=auditDashboard", source)

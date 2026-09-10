@@ -1,6 +1,7 @@
 {
   "name": "astock-paper-frontend",
   "private": true,
+  "type": "module",
   "version": "1.1.1",
   "description": "Astock paper-trading dashboard. Legacy vanilla JS/CSS sources are bundled into dist/ with esbuild; dist/ is committed so Docker and the local uvicorn server can serve it without a Node runtime.",
   "scripts": {

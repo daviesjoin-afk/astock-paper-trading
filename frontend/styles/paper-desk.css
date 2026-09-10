@@ -1,0 +1,14 @@
+/* PR-55：由 frontend/app.css 拆分（纯搬运）。
+   原始行区间 440–449；模拟盘交易台（一页一决策面）。
+   本文件必须保持它在 styles/index.css 中的位置：
+   @import 顺序 = 原文件顺序 = 层叠顺序。 */
+
+/* Paper desk: one decision surface per page, with on-demand stock audit. */
+.paper-history-toolbar { display:grid; grid-template-columns:minmax(180px,1fr) minmax(180px,1fr) auto; gap:10px; align-items:end; }
+.paper-history-summary { display:grid; grid-template-columns:repeat(5,minmax(0,1fr)); gap:9px; margin:14px 0; }
+.paper-history-stat { padding:10px; border:1px solid var(--border-light); border-radius:10px; background:var(--surface-hover); color:var(--text-muted); font-size:11px; }
+.paper-history-stat b { display:block; margin-top:4px; color:var(--text); font:700 15px var(--font-data); }
+.paper-stock-link { appearance:none; margin:0; padding:0; border:0; background:transparent; color:var(--text); font:700 13px var(--font-ui); text-align:left; cursor:pointer; }
+.paper-stock-link:hover { color:var(--primary); }.paper-stock-link:focus-visible { outline:2px solid var(--primary); outline-offset:3px; border-radius:3px; }
+.paper-page-notice { margin:0 0 14px; color:var(--text-secondary); font-size:12px; line-height:1.6; }
+@media (max-width:900px){ .paper-history-toolbar{grid-template-columns:1fr;}.paper-history-summary{grid-template-columns:repeat(2,minmax(0,1fr));} }
