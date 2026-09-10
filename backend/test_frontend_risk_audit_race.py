@@ -1,6 +1,8 @@
 from pathlib import Path
 import unittest
 
+import build_info as BI
+
 
 APP = Path(__file__).resolve().parents[1] / "frontend" / "app.js"
 INDEX = Path(__file__).resolve().parents[1] / "frontend" / "index.html"
@@ -24,7 +26,10 @@ class FrontendRiskAuditRaceTests(unittest.TestCase):
         self.assertIn("window._paperAuditCache=auditDashboard", source)
 
     def test_frontend_cache_key_includes_risk_audit_fix(self):
-        self.assertIn("20260907-frontend-build-pipeline-v1", INDEX.read_text(encoding="utf-8"))
+        # PR-49：cache-bust 值统一引用规范 build id，不再逐次硬编码日期串。
+        index = INDEX.read_text(encoding="utf-8")
+        self.assertIn("/app.js?v=" + BI.APP_BUILD_ID, index)
+        self.assertIn("/app.css?v=" + BI.APP_BUILD_ID, index)
 
 
 if __name__ == "__main__":
