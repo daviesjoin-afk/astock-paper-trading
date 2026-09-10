@@ -222,7 +222,7 @@ export async function resetSettingsSection(section){
   var resetAnswer=await confirmDialog({
     kicker:'设置 · 恢复默认',
     title:'恢复该分组的默认安全设置？',
-    bullets:['仅当前分组回到默认值，其他分组不受影响。','恢复后仍需点击保存才会写入后端。'],
+    bullets:['仅当前分组回到默认值，其他分组不受影响。','确认后会立即写入后端并留下审计（无需再点保存）。'],
     confirmText:'恢复默认',
   });
   if(!resetAnswer.approved) return;
@@ -248,5 +248,5 @@ export async function saveSettingsKey(){
   });
   if(!aiAnswer.approved) return;
   var body={provider:$('settingKeyProvider').value,api_key:$('settingApiKey').value||undefined,base_url:$('settingBaseUrl').value||undefined,model:$('settingAiModel').value||undefined};
-  try{var data=await apiPostJson('/api/settings/ai-key?confirmed=true',body);renderSettings(data);toast('AI 接口配置已保存（页面仅显示掩码状态）。');}catch(e){inlineError($('settingsResult'), (e&&e.message)||e, { title:'接口保存失败', retryLabel:'重试', onRetry:function(){ saveAiKey(); } }); toast('接口保存失败：'+(e.message||e));}
+  try{var data=await apiPostJson('/api/settings/ai-key?confirmed=true',body);renderSettings(data);toast('AI 接口配置已保存（页面仅显示掩码状态）。');}catch(e){inlineError($('settingsResult'), (e&&e.message)||e, { title:'接口保存失败', retryLabel:'重试', onRetry:function(){ saveSettingsKey(); } }); toast('接口保存失败：'+(e.message||e));}
 }

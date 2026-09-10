@@ -59,6 +59,13 @@ export async function loadStrategyWorkbench(force){
     try{
       var data=await api('/api/strategies?include_archived=true&_='+Date.now());
       WB_STATE.items=data.items||[]; WB_STATE.summary=data.summary||{};
+      // 下一周期是否参与由设置里的 enabled_strategies 决定，不能只看生命周期资格。
+      // 读不到配置时退化为"符合条件"措辞，绝不宣称已启用。
+      try{
+        var cfg=await api('/api/settings/?_='+Date.now());
+        var sim=(cfg&&cfg.settings&&cfg.settings.simulation)||{};
+        WB_STATE.enabledIds=Array.isArray(sim.enabled_strategies)?sim.enabled_strategies.slice():null;
+      }catch(e){ WB_STATE.enabledIds=null; }
       wbRenderSummary(); wbRenderList();
       // 路由意图必须在 registry 就绪之后应用（详情渲染依赖 items/接口）。
       var routeId=window._strategiesRouteId;
@@ -142,8 +149,20 @@ export function wbCard(item){
   if(runtime.capital_scale&&runtime.capital_scale.factor!=null) scale=Math.round(runtime.capital_scale.factor*100)+'%';
   else if(runtime.capital_scale!=null&&typeof runtime.capital_scale==='number') scale=Math.round(runtime.capital_scale*100)+'%';
   var seats=runtime.position_limit!=null?runtime.position_limit:(meta.max_positions!=null?meta.max_positions:null);
-  var participates=!!item.supports_new_cycle&&item.status==='active';
-  var participation=participates?'下一周期：已启用':(item.status==='active'&&!item.supports_new_cycle?'下一周期：不支持':'下一周期：未启用');
+  var eligible=!!item.supports_new_cycle&&item.status==='active';
+  var enabledIds=WB_STATE.enabledIds;
+  var participates;
+  var participation;
+  if(eligible&&Array.isArray(enabledIds)){
+    participates=enabledIds.indexOf(item.id)>=0;
+    participation=participates?'下一周期：已启用':'下一周期：未勾选';
+  }else if(eligible){
+    participates=false;
+    participation='下一周期：符合条件（以设置为准）';
+  }else{
+    participates=false;
+    participation=item.status==='active'?'下一周期：不支持':'下一周期：不可参与';
+  }
   var checksum=String(item.current_checksum||item.checksum||'');
   var dslChecksum=String(item.dsl_checksum||item.dsl_checksum_sha256||'');
   var implKey=item.implementation_key||item.implemented_by||item.native_key||(item.has_dsl?'dsl':'native');
@@ -434,7 +453,8 @@ export async function wbPreviewDraft(){
     //   B 策略风控（后端 soft_limits/limits + 执行画像，可在画像内调整）
     //   C 可进化参数（后端 parameter_schema.tunable，仅展示真实存在的可调参数）
     var hard=rp.hard_rules||result.hard_rules||{};
-    var evolvable=(result.parameter_schema&&result.parameter_schema.tunable)||rp.evolvable_params||result.evolvable_params||{};
+    var schemaDeclared=!!(result.parameter_schema&&result.parameter_schema.tunable);
+    var evolvable=(schemaDeclared?result.parameter_schema.tunable:(rp.evolvable_params||result.evolvable_params||{}));
     function kv(map, formatter){
       var keys=Object.keys(map||{});
       if(!keys.length) return '<p class="risk-preview-empty">后端未返回该段数据。</p>';
@@ -467,9 +487,12 @@ export async function wbPreviewDraft(){
       +'<dt>资金系数</dt><dd>'+(alloc.capital_scale!=null?Math.round(alloc.capital_scale*100)+'%':'—')+'</dd>'
       +'<dt>预计可部署</dt><dd>'+(alloc.estimated_capital!=null?'¥'+Number(alloc.estimated_capital).toLocaleString('zh-CN'):'—')+'</dd></dl></section>'
       +'<section class="risk-preview-section risk-preview-evolvable" data-testid="risk-preview-evolvable">'
-      +'<h5>可进化参数</h5>'
+      +'<h5>'+(schemaDeclared?'可进化参数':'风险模板可调参数')+'</h5>'
       +kv(evolvable)
-      +'<p class="risk-preview-note">仅列出后端参数 Schema 声明的可调项；未声明的不允许自进化调整。</p></section>'
+      +(schemaDeclared
+        ?'<p class="risk-preview-note">来源：本草稿编译出的参数 Schema；未声明的项不允许自进化调整。</p>'
+        :'<p class="risk-preview-note">来源：风险画像模板声明的可调项（后端 preview 当前未返回 parameter_schema），不代表本草稿 DSL 的可调集合。</p>')
+      +'</section>'
       +'</div>'
       +(conservative?'<p class="strategy-preview-warn">保守画像：系统按最安全口径处理，请确认条件符合预期。</p>':'')
       +(warnings.length?'<ul class="strategy-preview-warn">'+warnings.map(function(x){return '<li>'+adaptiveEsc(typeof x==='string'?x:(x.note||x.label||x.reason||x.code||''))+'</li>';}).join('')+'</ul>':'');
@@ -561,6 +584,13 @@ export async function wbTransition(strategyId,toStatus){
     await loadStrategyWorkbench(true);
     toast('已更新生命周期：'+strategyId+' → '+strategyStatusLabelTech(toStatus));
   }catch(e){ inlineError($('wbList'), e, { title:'生命周期迁移失败', retryLabel:'重试', onRetry:function(){ wbTransition(strategyId,toStatus); } }); }
+}
+
+export async function wbCloneFirstBuiltin(){
+  // 空态 CTA：复制第一套内置策略（复用既有克隆流程与确认模态）。
+  var builtin=(WB_STATE.items||[]).filter(function(x){return x.origin==='builtin';})[0];
+  if(!builtin){ toast('当前没有可复制的内置策略。', { tone: 'warn' }); return; }
+  await wbCloneStrategy(builtin.id);
 }
 
 export async function wbCloneStrategy(strategyId){
