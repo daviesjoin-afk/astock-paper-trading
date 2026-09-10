@@ -52,7 +52,7 @@ _BAD_REQUEST_TOKENS = (
 )
 # 非对称风险门（唯一风险放大门）拒绝：语义是"这次定义变更被风控否决"，
 # 历史上人工 API 返回 422，迁移到 Strategy Admin 后保持一致。
-_RISK_GATE_TOKENS = ("风险放大", "证据不足", "观察期未满", "Challenger")
+_RISK_GATE_TOKENS = ("风险放大", "证据不足", "观察期未满", "Challenger", "单轮放大")
 
 
 def _raise_registry_error(exc: Exception, *, default: int = 400) -> None:
@@ -245,9 +245,11 @@ def _save(strategy_id: str, payload: dict | None):
     expected_version = body.get("expected_version")
     change_note = str(body.get("change_note") or "")
     actor = str(body.get("actor") or "web-ui")
-    # 非对称风险门：evidence/challenger 由调用方如实申报，缺省即 fail-closed。
-    risk_evidence = body.get("risk_evidence")
-    challenger_win = bool(body.get("challenger_win"))
+    # 非对称风险门（唯一风险放大门）不暴露给 HTTP 调用方：任何请求都按
+    # fail-closed 处理（risk_evidence/challenger_win 一律为空），风险放大
+    # 只能走正规提案流程（自进化 / Champion 晋升），Web 端只允许收紧。
+    risk_evidence = None
+    challenger_win = False
     P.init_db()
     try:
         with P._db() as conn:
@@ -384,6 +386,15 @@ def transition_strategy(strategy_id: str, payload: dict | None = None):
     P.init_db()
     try:
         with P._db() as conn:
+            # validated 与 active 同样是"可进新周期"的入口门槛：进入
+            # validated 前先跑一遍生产编译闸门（与被移除的旧 /validate
+            # 端点语义一致），不就绪就拒绝。
+            if to_status == "validated":
+                readiness = SR.runtime_readiness(conn, strategy_id)
+                if not readiness.get("runtime_ready"):
+                    raise ValueError(
+                        "strategy runtime is not ready: " + "; ".join(readiness.get("errors") or [])
+                    )
             spec = SR.transition(
                 conn, strategy_id, to_status, reason=reason, actor=actor,
                 expected_status=expected_status if expected_status is not None else None,

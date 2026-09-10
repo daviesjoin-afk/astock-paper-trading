@@ -355,6 +355,56 @@ class ApiStrategiesTests(unittest.TestCase):
         self.assertEqual(status, 201, body)
         self.assertEqual(body["id"], "api_clone_legacy_dst")
 
+    def test_transition_validated_requires_runtime_ready(self):
+        # 无 DSL 的用户策略不能进 validated（与旧 /validate 端点语义一致）。
+        status, created = self._create("api_no_dsl", dsl_ast=None)
+        self.assertEqual(status, 201, created)
+        self.assertEqual(created["status"], "draft")
+        status, body = self._transition(created["id"], "validated", "draft")
+        self.assertEqual(status, 409, body)
+        self.assertIn("runtime is not ready", str(body["detail"]))
+
+    def test_risk_expansion_cannot_bypass_gate_via_payload(self):
+        # 非对称风险门不接受 HTTP 调用方自带的 risk_evidence/challenger_win：
+        # 声明"Challenger 已胜出"也不能放大风险，必须 422 且不落库。
+        expanding = {
+            "op": "strategy",
+            "rule": {
+                "op": "gt", "left": {"op": "field", "name": "close"},
+                "right": {"op": "indicator", "name": "ma", "window": 20},
+            },
+            "parameters": [
+                {"op": "parameter", "parameter_id": "risk_per_trade", "type": "number",
+                 "value": 0.02, "min": 0.002, "max": 0.02, "max_step": 0.002,
+                 "locked": False, "risk_direction": "higher_is_riskier",
+                 "min_evidence": 10},
+            ],
+        }
+        base_rule = {
+            "op": "strategy",
+            "rule": {
+                "op": "gt", "left": {"op": "field", "name": "close"},
+                "right": {"op": "indicator", "name": "ma", "window": 20},
+            },
+            "parameters": [
+                {"op": "parameter", "parameter_id": "risk_per_trade", "type": "number",
+                 "value": 0.008, "min": 0.002, "max": 0.02, "max_step": 0.002,
+                 "locked": False, "risk_direction": "higher_is_riskier",
+                 "min_evidence": 10},
+            ],
+        }
+        status, created = self._create("api_gate_bypass", dsl_ast=base_rule)
+        self.assertEqual(status, 201, created)
+        status, body = self._call(
+            API.update_strategy, created["id"],
+            {"expected_version": 1, "changes": {"dsl_ast": expanding},
+             "risk_evidence": 999, "challenger_win": True},
+        )
+        self.assertEqual(status, 422, body)
+        self.assertRegex(str(body["detail"]), "风险放大|单轮放大")
+        _status, detail = self._call(API.get_strategy, created["id"])
+        self.assertEqual(detail["version"], 1)
+
     def test_clone_duplicate_target_409(self):
         created = self._create_draft("api_clone_dup")
         status, _body = self._call(
