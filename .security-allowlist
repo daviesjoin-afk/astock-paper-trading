@@ -1,0 +1,60 @@
+# Security allowlist — documented exceptions for the P0 leak scanner.
+#
+# Every entry must be publishable as-is. Format: `kind:value` (see
+# scripts/security/scan-sensitive-data.py). Real personal emails, public IPs,
+# credentials, private keys and live broker accounts can never be allowlisted.
+#
+# --- public vendor / market-data endpoints used by the data layer ---
+suffix:eastmoney.com
+suffix:gtimg.cn
+suffix:sinajs.cn
+suffix:sina.com.cn
+suffix:163.com
+suffix:tencent.com
+suffix:baidu.com
+suffix:csrc.gov.cn
+suffix:sse.com.cn
+suffix:szse.cn
+suffix:deepseek.com
+suffix:openai.com
+suffix:openrouter.ai
+suffix:10jqka.com.cn
+suffix:hexin.cn
+suffix:qq.com
+# --- package mirrors and public documentation assets ---
+host:deb.debian.org
+host:mirrors.cloud.tencent.com
+host:mirrors.aliyun.com
+host:pypi.org
+host:files.pythonhosted.org
+host:img.shields.io
+host:www.python.org
+host:docs.python.org
+host:github.com
+host:raw.githubusercontent.com
+host:api.github.com
+# --- local development endpoints (documented defaults, no real host) ---
+host:localhost
+host:127.0.0.1
+host:host.docker.internal
+# --- documented container/deployment paths used by the shipped deploy scripts.
+#     These are the public convention of this repo (Dockerfile workdir and the
+#     self-detecting backup path), not a private machine layout. ---
+value:<SERVER_PATH>
+value:<SERVER_PATH>/data_cache
+value:<SERVER_PATH>
+# --- provider data-flow identifiers (public API parameter constants) ---
+value:fa5fd1943c7b386f172d6893dbbd1d0c
+value:b2884a393a59ad64002292a3e90d46a5
+suffix:moonshot.cn
+suffix:mimo.ai
+host:api.moonshot.cn
+host:api.mimo.ai
+# --- deploy docs use an explicit placeholder instead of a real host ---
+value:root@服务器IP:/tmp/astock-quant/
+# --- archived handoff notes list internal backup dirs; contents are redacted in
+#     history via replacements, the remaining names carry no host or user info ---
+value:/root/backups/20260903-architecture-predeploy/
+# --- false positives: JS regex literal and an inline SVG path number ---
+path:frontend/src/features/adaptive.js
+path:frontend/index.html
