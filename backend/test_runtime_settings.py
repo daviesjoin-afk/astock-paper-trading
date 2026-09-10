@@ -43,13 +43,23 @@ class RuntimeSettingsTests(unittest.TestCase):
         self.assertEqual(len(rows), 3)
         self.assertEqual(rows[0]["updated_by"], "test")
 
-    def test_invalid_duration_and_empty_strategy_set_are_rejected(self):
+    def test_invalid_duration_and_unknown_strategy_are_rejected(self):
         with self.assertRaises(ValueError):
             settings.validate({"cycle_duration_days": 45}, conn=self.conn)
         with self.assertRaises(ValueError):
-            settings.validate({"enabled_strategies": []}, conn=self.conn)
-        with self.assertRaises(ValueError):
             settings.validate({"enabled_strategies": ["not-a-strategy"]}, conn=self.conn)
+
+    def test_explicit_empty_enabled_strategies_is_a_valid_idle_cycle(self):
+        """PR-47：显式空启用集合 = 零策略 idle 周期，读取时不再回落全集。"""
+        settings.update(self.conn, {"enabled_strategies": []}, actor="test")
+        self.assertEqual([], settings.enabled_strategies(self.conn))
+        self.assertEqual([], settings.read(self.conn)["simulation"]["enabled_strategies"])
+        # 缺失/未配置（旧行）仍回落 eligible 全集。
+        self.conn.execute("DELETE FROM paper_runtime_settings WHERE key='enabled_strategies'")
+        self.assertEqual(
+            list(registry.active_ids(conn=self.conn)),
+            settings.enabled_strategies(self.conn),
+        )
 
     def test_strategy_overrides_are_bounded(self):
         value = settings.validate({"strategy_overrides": {"tq_breakout": {"style": "strong", "max_positions": 6, "max_weight_pct": 36, "max_exposure_pct": 96}}}, conn=self.conn)

@@ -65,7 +65,7 @@ SETTING_GROUPS = {
 METADATA = {
     "default_starting_capital": {"label": "默认启动金额", "unit": "元", "apply_mode": "next_cycle", "recommended": 300000, "description": "创建新模拟周期时预填的共享资金池金额。"},
     "cycle_duration_days": {"label": "模拟周期", "unit": "交易日", "apply_mode": "next_cycle", "recommended": 0, "description": "新周期的计划观察时长；长期表示不设自动到期。"},
-    "enabled_strategies": {"label": "启用策略", "apply_mode": "next_cycle", "recommended": [], "description": "下一周期参与分配、扫描和风控的策略集合；候选来自可运行的策略注册表，历史周期不重写。"},
+    "enabled_strategies": {"label": "启用策略", "apply_mode": "next_cycle", "recommended": [], "description": "下一周期参与分配、扫描和风控的策略集合，候选来自可运行的策略注册表，历史周期不重写；留空表示零策略 idle 周期（无新信号，风控与存量退出照常）。"},
     "shared_pool_position_limit": {"label": "共享池持仓上限", "unit": "席", "apply_mode": "immediate", "recommended": 15, "description": "共享资金池的有效持仓席位硬上限。"},
     "shared_pool_exposure_cap": {"label": "共享池敞口上限", "unit": "%", "apply_mode": "immediate", "recommended": 82, "description": "所有策略合计持仓与待成交金额的硬敞口。"},
     "single_position_max_amount": {"label": "单票最大金额", "unit": "元", "apply_mode": "immediate", "recommended": 0, "description": "0 表示按策略权重自动计算；大于 0 时作为额外绝对上限。"},
@@ -267,8 +267,10 @@ def validate(updates: dict[str, Any], *, conn: sqlite3.Connection | None = None)
             raise ValueError("模拟周期只支持 15、30、60、90、180 天或长期")
     if "enabled_strategies" in updates:
         value = updates["enabled_strategies"]
-        if not isinstance(value, list) or not value:
-            raise ValueError("至少启用一套策略")
+        if not isinstance(value, list):
+            raise ValueError("enabled_strategies 必须是列表")
+        # PR-47：空列表合法 = 下一周期零策略 idle（风控/退出/调度照常，
+        # 只是没有新信号与新开仓）。
         normalized = []
         eligible = set(eligible_strategy_ids(conn)) if conn is not None else set(SR.active_ids())
         for item in value:
@@ -425,7 +427,20 @@ def audit(conn: sqlite3.Connection, limit: int = 50) -> list[dict[str, Any]]:
 
 
 def enabled_strategies(conn: sqlite3.Connection) -> list[str]:
+    """Return the configured next-cycle strategy ids (PR-47).
+
+    显式空配置（存了 ``[]``）= 零策略 idle 周期：返回空列表，**不再**回落到
+    全部 eligible 策略。缺失/旧库未配置时保持旧行为（回落 eligible 全集）。
+    """
     eligible = eligible_strategy_ids(conn)
+    try:
+        row = conn.execute(
+            "SELECT value FROM paper_runtime_settings WHERE key='enabled_strategies'"
+        ).fetchone()
+    except sqlite3.Error:
+        row = None
+    if row is not None and _decode(row[0], None) == []:
+        return []
     value = get(conn, "enabled_strategies", eligible)
     return [item for item in value if item in eligible] or eligible
 
