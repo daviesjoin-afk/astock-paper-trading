@@ -587,13 +587,37 @@ def scan_worktree(repo: str, findings: Findings, manual_review: list, allow: "Al
         scan_text(data.decode("utf-8", "replace"), f"worktree:{rel}", findings, allow=allow)
 
 
+def reachable_refs(repo: str) -> list:
+    """Refs to scan.
+
+    Default is the repository's own history: local branches, tags and the checked
+    out revision. `refs/remotes/origin/*` is deliberately NOT used because on CI
+    (actions/checkout with fetch-depth: 0) the remote-tracking refs can point at
+    pull-request refs, which would make the gate report history that no branch
+    exposes any more. Set ASTOCK_SCAN_REMOTE_REFS=1 to include every ref (useful
+    for a local audit before deleting stale remote refs).
+    """
+    pattern = "refs" if os.environ.get("ASTOCK_SCAN_REMOTE_REFS") == "1" else "refs/heads"
+    raw = run(["git", "-C", repo, "for-each-ref", "--format=%(refname)", pattern], cwd=repo)
+    refs = [line.strip() for line in raw.splitlines() if line.strip()]
+    if "refs/remotes" not in pattern:
+        tags = run(["git", "-C", repo, "for-each-ref", "--format=%(refname)", "refs/tags"], cwd=repo)
+        refs += [line.strip() for line in tags.splitlines() if line.strip()]
+        head = run(["git", "-C", repo, "symbolic-ref", "-q", "HEAD"], cwd=repo).strip()
+        if head and head not in refs:
+            refs.append(head)
+    return refs
+
+
 def scan_history(repo: str, findings: Findings, manual_review: list, allow: "AllowList"):
     def skip(value: str) -> bool:
         return allow.evaluate_value(value)
 
+    refs = reachable_refs(repo)
+
     # 1) metadata + messages
     fmt = "%H%x1f%an%x1f%ae%x1f%cn%x1f%ce%x1f%B%x1e"
-    raw = run(["git", "log", "--all", f"--format={fmt}"], cwd=repo)
+    raw = run(["git", "log", "--format=" + fmt, *refs], cwd=repo)
     for record in raw.split("\x1e"):
         record = record.strip("\n")
         if not record.strip():
@@ -614,7 +638,7 @@ def scan_history(repo: str, findings: Findings, manual_review: list, allow: "All
     # 2) every reachable blob (de-duplicated by object id: metadata-only rewrites keep
     #    the same blob ids, so identity-only rewrites stay cheap; content rewrites
     #    cascade and every rewritten blob is genuinely new).
-    objects = run(["git", "rev-list", "--objects", "--all"], cwd=repo)
+    objects = run(["git", "rev-list", "--objects", *refs], cwd=repo)
     seen_blobs = {}
     for line in objects.splitlines():
         parts = line.split(" ", 1)
@@ -739,6 +763,7 @@ def main() -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
+
 
 
 
