@@ -92,7 +92,7 @@ sudo bash /opt/astock-quant/deploy/healthcheck.sh
 sudo systemctl status astock-quant nginx crond
 sudo journalctl -u astock-quant -n 100 --no-pager
 sudo tail -n 100 /var/log/astock-quant-scheduler.log
-curl -u admin:'你的密码' -I http://服务器IP/
+curl -u "$ASTOCK_ADMIN_USER:$ASTOCK_ADMIN_PASSWORD" -I http://<SERVER_HOST>/
 ```
 
 持续观察资源：
@@ -118,3 +118,4 @@ sudo journalctl -u astock-quant -f
 ```bash
 sudo tar -C /opt/astock-quant -czf /var/backups/astock-data-backup.tgz data_cache reports
 ```
+

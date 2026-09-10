@@ -1,5 +1,34 @@
 # Security boundary
 
+## 禁止提交的内容（P0）
+
+以下内容一律不得进入仓库、提交信息、Issue、PR、CI 日志或截图：
+
+- 私人邮箱（提交身份必须使用 `*@users.noreply.github.com`）
+- 公网 IP、真实服务器地址、SSH 登录信息与私钥
+- 密码、Token、API Key、Cookie、Session 凭据
+- 真实账户号 / Broker 账户 ID
+- 数据库、导出数据、日志、备份文件
+- 本机绝对路径（`C:\Users\<name>`）与服务器部署绝对路径
+- 未脱敏的界面截图（可能含账户号、邮箱、路径、IP）
+
+文档与示例一律使用：`user@example.com`、`example.com`、`localhost`、`127.0.0.1`、
+`192.0.2.x`、`198.51.100.x`、`203.0.113.x`、`<PROJECT_ROOT>`、`<USER_HOME>`、`<SERVER_HOST>`。
+
+## 自动门禁
+
+`scripts/security/scan-sensitive-data.py` 同时扫描当前工作树与全部可达历史；
+CI job `security-leak-scan` 在 push 与 pull_request 上强制运行，命中即失败。
+本地可在推送前手动执行：
+
+```bash
+python scripts/security/scan-sensitive-data.py --repo . --scope all
+```
+
+确需放行的公开内容（厂商域名、示例路径等）写入 `.security-allowlist` 并注明理由；
+真实邮箱、公网 IP、凭据、私钥与真实账户号**永远不得**加入白名单。
+
+
 ## 支持版本
 
 仅维护最新 GitHub Release 对应的 `master`。旧标签用于复现和审计，不再单独接收安全补丁。
