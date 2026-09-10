@@ -98,7 +98,7 @@ chmod +x start.sh
 
 The startup scripts launch the API/Web dashboard but do not automatically create a paper-trading cycle.
 
-For the complete clone → dependency install → dashboard → data bootstrap → scan workflow, see [`docs/RUNBOOK.md`](docs/RUNBOOK.md).
+For the complete clone → dependency install → dashboard → data bootstrap → scan workflow, see [`docs/RUNBOOK.md`](docs/RUNBOOK.md). For the module map (what each file belongs to), see [`docs/REPOSITORY_LAYOUT.md`](docs/REPOSITORY_LAYOUT.md).
 
 ## Manual development workflow
 

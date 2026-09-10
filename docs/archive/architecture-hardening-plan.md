@@ -1,5 +1,9 @@
 # Exec plan: Architecture hardening
 
+> **已归档（已执行完毕的架构硬化 Exec plan）**：基线提交与阶段勾选均已完成/过时，
+> 仅作追溯用。仍然有效的分阶段计划见 [`../PRD-architecture-hardening.md`](../PRD-architecture-hardening.md)。
+
+
 ## Purpose / success criteria
 
 将审计建议转成可分阶段验收的架构硬化工作：今天从服务器取源并完成本地行为保持的改造和测试，再推送服务器；2026-09-04 验证服务器，服务器明确通过且用户确认后才推送 GitHub。
@@ -64,4 +68,4 @@
 - Server deployment: 已执行；本地提交 `b60d3a6` 对应部署包已校验并解包，镜像重建/重启完成，服务器备份位于 `<SERVER_PATH>/`。
 - Tests for this PRD: 198 backend tests passed with ResourceWarning as errors; compileall, diff check and prior Node/HTTP smoke checks passed.
 - Remote source pull: completed with SHA-256 verification. 2026-09-04 00:05 read-only server check: source `22762e2` is dirty (100 modified, 37 untracked); running image was built at `2026-09-03T21:11:43+08:00`, container is healthy, and `:8600` read-only endpoints returned 200. Health is degraded only because the previous trade-day live snapshot is stale for the new calendar day.
-- Handoff: `docs/HANDOFF-architecture-hardening.md` records the local integration verification, server dirty-worktree gate, storage limit, verified source-only server archive, and verified full-history Git bundle for next-machine continuation. `docs/PRD-architecture-hardening.md` now carries an explicit P0-P5 implementation status. Server directory will contain both documents and verified `README-CONTINUE.md`.
+- Handoff: `docs/archive/HANDOFF-architecture-hardening-2026-09-05.md` records the local integration verification, server dirty-worktree gate, storage limit, verified source-only server archive, and verified full-history Git bundle for next-machine continuation. `docs/PRD-architecture-hardening.md` now carries an explicit P0-P5 implementation status. Server directory will contain both documents and verified `README-CONTINUE.md`.
