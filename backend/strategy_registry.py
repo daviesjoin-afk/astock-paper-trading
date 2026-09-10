@@ -150,6 +150,56 @@ def _add_column(conn, table, name, definition):
         conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {definition}")
 
 
+# PR-50：version immutability 的数据库闸门。
+#
+# 规则由数据库与 domain rule 共同表达，**不再**在删除路径里临时 DROP：
+#   - 正式版本（definition 不是"user draft"）永远不可删除；
+#   - 只有 unused user draft 的私有 v-snapshot 是唯一合法例外——"unused"
+#     由 domain 层的 ``_historical_reference_exists`` 判定（lifecycle +
+#     registry ownership + 历史引用），数据库只负责"非 user draft 一律拒绝"。
+#
+# 名称固定：``_install_immutable_version_trigger`` 会按 SQL 内容比对，老库
+# 上残留的"无条件拒绝"版本会在 schema 建立阶段被一次性升级（在调用方事务内，
+# 对外不存在"保护缺失"的可见窗口）。
+IMMUTABLE_VERSION_TRIGGER = "trg_strategy_versions_no_delete"
+IMMUTABLE_VERSION_TRIGGER_SQL = (
+    """CREATE TRIGGER IF NOT EXISTS trg_strategy_versions_no_delete
+       BEFORE DELETE ON paper_strategy_versions
+       WHEN NOT EXISTS (
+           SELECT 1 FROM strategy_definitions d
+           WHERE d.id=OLD.strategy_id
+             AND d.origin='user'
+             AND d.lifecycle_status='draft'
+       )
+       BEGIN SELECT RAISE(ABORT, 'strategy versions are immutable'); END"""
+)
+
+
+def _normalize_trigger_sql(sql):
+    text = " ".join(str(sql or "").split()).lower()
+    return text.replace("if not exists ", "")
+
+
+def _install_immutable_version_trigger(conn):
+    """Create the immutability trigger, upgrading a legacy definition in place.
+
+    Older databases carry an unconditional BEFORE DELETE trigger that made the
+    unused-draft purge impossible without a temporary DROP.  Compare the stored
+    body and swap it once here (schema setup) so the deletion path never has to
+    touch protection at all.
+    """
+    stored = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='trigger' AND name=?",
+        (IMMUTABLE_VERSION_TRIGGER,),
+    ).fetchone()
+    if stored is not None and _normalize_trigger_sql(stored[0]) == _normalize_trigger_sql(
+        IMMUTABLE_VERSION_TRIGGER_SQL
+    ):
+        return
+    conn.execute(f"DROP TRIGGER IF EXISTS {IMMUTABLE_VERSION_TRIGGER}")
+    conn.execute(IMMUTABLE_VERSION_TRIGGER_SQL)
+
+
 def _create_version_schema(conn):
     _add_column(conn, "strategy_definitions", "current_version", "INTEGER")
     _add_column(conn, "strategy_definitions", "current_checksum", "TEXT")
@@ -227,11 +277,7 @@ def _create_version_schema(conn):
            BEFORE UPDATE ON paper_strategy_versions
            BEGIN SELECT RAISE(ABORT, 'strategy versions are immutable'); END"""
     )
-    conn.execute(
-        """CREATE TRIGGER IF NOT EXISTS trg_strategy_versions_no_delete
-           BEFORE DELETE ON paper_strategy_versions
-           BEGIN SELECT RAISE(ABORT, 'strategy versions are immutable'); END"""
-    )
+    _install_immutable_version_trigger(conn)
     conn.execute(
         """CREATE TRIGGER IF NOT EXISTS trg_strategy_definition_version_guard
            BEFORE UPDATE OF name,implementation_key,description,metadata,
@@ -841,7 +887,24 @@ def _historical_reference_exists(conn, strategy_id):
 
 
 def hard_delete_unused_draft(conn, strategy_id):
-    """Physically delete only an unused user draft and its private v1 snapshot."""
+    """Physically delete only an unused user draft and its private version rows.
+
+    Why an unused draft may be deleted while a formal version may not:
+
+    - A **formal** version carries history — it was validated/activated, bound
+      to a cycle, or referenced by signals/orders/fills/positions/audit and by
+      allocation/runtime/evolution/champion/challenger consumers.  Those
+      records must stay resolvable to their exact checksum forever, so the
+      database refuses every delete.
+    - A **user draft** with no historical reference is the single deliberate
+      exception: it never left ``draft``, never entered a cycle and has no
+      ledger/audit row pointing at it, so its private snapshot is pure scratch
+      state.  Deleting it removes nothing anyone can still resolve.
+
+    The database trigger enforces "non-draft definitions are immutable"; this
+    function enforces "and the draft is unused".  Neither side needs to disable
+    the other — the deletion path never touches the trigger.
+    """
     ensure_schema(conn)
     spec = get(strategy_id, conn=conn)
     if spec is None:
@@ -852,17 +915,11 @@ def hard_delete_unused_draft(conn, strategy_id):
         raise ValueError("strategy has historical references and must be archived")
     conn.execute("DELETE FROM strategy_definition_events WHERE strategy_id=?", (spec.id,))
     conn.execute("DELETE FROM paper_strategy_version_heads WHERE strategy_id=?", (spec.id,))
-    # The immutable-version trigger protects all retained history.  A draft
-    # with no ledger/cycle references is the deliberate exception.
-    conn.execute("DROP TRIGGER IF EXISTS trg_strategy_versions_no_delete")
-    try:
-        conn.execute("DELETE FROM paper_strategy_versions WHERE strategy_id=?", (spec.id,))
-    finally:
-        conn.execute(
-            """CREATE TRIGGER IF NOT EXISTS trg_strategy_versions_no_delete
-               BEFORE DELETE ON paper_strategy_versions
-               BEGIN SELECT RAISE(ABORT, 'strategy versions are immutable'); END"""
-        )
+    # PR-50：不再 DROP immutable trigger。触发器本身已把可删范围限定为
+    # "origin='user' AND lifecycle_status='draft'"（见 IMMUTABLE_VERSION_TRIGGER_SQL），
+    # 上面的 lifecycle 与历史引用检查再把范围收窄到"从未使用的 user draft"。
+    # 正式版本在任意时刻都受同一个触发器保护，删除路径不制造任何保护窗口。
+    conn.execute("DELETE FROM paper_strategy_versions WHERE strategy_id=?", (spec.id,))
     conn.execute("DELETE FROM strategy_definitions WHERE id=?", (spec.id,))
     return {"strategy_id": spec.id, "deleted": True}
 
