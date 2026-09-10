@@ -36,7 +36,7 @@
   <div class="header-meta"><span class="mode-label">研究 · 纯模拟</span><time id="clock"></time><button class="header-settings-btn" type="button" onclick="activatePage('p-settings')" title="打开设置中心"><svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M12 8.2a3.8 3.8 0 1 0 0 7.6 3.8 3.8 0 0 0 0-7.6Z" stroke="currentColor" stroke-width="1.7"/><path d="m19.1 13.1 1.2 1-.1 1.8-1.8 1.1-1.5-.5-1.1.6-.3 1.5-1.7.7-1.7-.7-.3-1.5-1.1-.6-1.5.5-1.8-1.1-.1-1.8 1.2-1v-1.3l-1.2-1 .1-1.8 1.8-1.1 1.5.5 1.1-.6.3-1.5 1.7-.7 1.1.6 1.5-.5 1.8 1.1.1 1.8-1.2 1v1.3Z" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round"/></svg><span>设置</span></button><button class="header-ai-btn" type="button" onclick="switchToAdaptiveAI()" title="AI审阅与双AI调参" style="margin-right:6px;padding:4px 10px;background:linear-gradient(135deg,#10b981,#059669);border:none;color:#fff;border-radius:6px;font-size:12px;cursor:pointer;font-weight:600;letter-spacing:0.5px">🤖 AI</button><button class="page-refresh" type="button" onclick="refreshApp()" title="重新加载服务器最新页面与数据">刷新页面</button><button id="themeToggle" class="theme-toggle" aria-label="切换深色模式" aria-pressed="false" title="切换深色模式" onclick="toggleDark()"><svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M20.4 15.4A8.5 8.5 0 0 1 8.6 3.6 8.6 8.6 0 0 1 20.4 15.4Z" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/></svg></button></div>
 </header>
 <nav class="tabs" aria-label="主功能导航">
-  <button class="tab" data-page="p-strategies"><svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><rect x="3" y="3" width="7" height="7" rx="1.5" stroke="currentColor" stroke-width="1.8"/><rect x="14" y="3" width="7" height="7" rx="1.5" stroke="currentColor" stroke-width="1.8"/><rect x="3" y="14" width="7" height="7" rx="1.5" stroke="currentColor" stroke-width="1.8"/><path d="M14 17.5h7M17.5 14v7" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg><b>策略中心</b><small>创建 · 版本 · 生命周期</small></button>
+  <button class="tab" data-page="p-strategies"><svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><rect x="3" y="3" width="7" height="7" rx="1.5" stroke="currentColor" stroke-width="1.8"/><rect x="14" y="3" width="7" height="7" rx="1.5" stroke="currentColor" stroke-width="1.8"/><rect x="3" y="14" width="7" height="7" rx="1.5" stroke="currentColor" stroke-width="1.8"/><path d="M14 17.5h7M17.5 14v7" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg><b>策略工坊</b><small>定义 · DSL · 版本 · 生命周期</small></button>
   <button class="tab active" data-page="p-select"><svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M4 5h16M7 12h10m-7 7h4" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/><circle cx="7" cy="5" r="2" fill="currentColor"/><circle cx="15" cy="12" r="2" fill="currentColor"/><circle cx="12" cy="19" r="2" fill="currentColor"/></svg><b>策略选股</b><small>选股研究</small></button>
   <button class="tab" data-page="p-paper"><svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M4 19V9m5 10V5m6 14v-7m5 7V3" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/><path d="M3 21h18" stroke="currentColor" stroke-width="1.2" opacity=".6"/></svg><b>策略模拟</b><small>模拟交易台</small></button>
   <button class="tab" data-page="p-adaptive"><svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M12 3a4 4 0 0 0-3.8 2.8A3.5 3.5 0 0 0 5.5 12 4 4 0 0 0 9 18h1v3m2-18a4 4 0 0 1 3.8 2.8A3.5 3.5 0 0 1 18.5 12 4 4 0 0 1 15 18h-1v3M8 9h3m2 0h3M8 14h3m2 0h3" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg><b>自进化</b><small>盘面学习中心</small></button>
@@ -45,7 +45,7 @@
 
 <main id="appMain" tabindex="-1">
 <div id="p-strategies" class="page strategy-workbench-page">
-  <div class="page-header"><div><span class="page-kicker">创建 · 验证 · 版本 · 生命周期</span><h2>策略中心</h2><p>在这里创建自定义策略：可视化条件或声明式 DSL → 后端验证 → 风险与资金预览 → 保存草稿 → 激活 → 参与下一周期。内置策略保留为平台自带模板，可复制后修改。</p></div><div class="strategy-workbench-actions"><button class="strategy-workbench-new-btn" type="button" onclick="wbNewStrategy()">+ 新建策略</button></div></div>
+  <div class="page-header"><div><span class="page-kicker">创建 · 验证 · 版本 · 生命周期</span><h2>策略工坊</h2><p>在这里创建自定义策略：可视化条件或声明式 DSL → 后端验证 → 风险与资金预览 → 保存草稿 → 激活 → 参与下一周期。内置策略保留为平台自带模板，可复制后修改。</p></div><div class="strategy-workbench-actions"><button class="strategy-workbench-new-btn" type="button" onclick="wbNewStrategy()">+ 新建策略</button></div></div>
   <div id="wbSummary" class="strategy-workbench-summary" role="status" aria-live="polite">正在读取策略 Registry…</div>
   <div class="strategy-workbench-toolbar">
     <div class="strategy-workbench-filters" role="group" aria-label="策略筛选">
@@ -82,7 +82,7 @@
   <div class="page-header"><div><span class="page-kicker">共享资金模拟账本</span><h2>策略模拟</h2><p>多策略共用总资金池、独立决策与风控、统一成交核算；核心持仓和当日操作置顶，完整审计记录按需展开。</p></div></div>
   <div class="workspace-tabs-dock" data-workspace-tabs-dock="paper">
   <nav id="paperModuleTabs" class="module-tabs workspace-tab-strip" data-tab-scroll aria-label="&#x7b56;&#x7565;&#x6a21;&#x62df;&#x4e09;&#x7ea7;&#x5bfc;&#x822a;" role="tablist">
-    <button class="module-tab" role="tab" aria-selected="false" data-paper-view="strategy" onclick="showPaperWorkspace('strategy',this)"><span class="module-code">策略</span><span class="module-copy"><b>策略中心</b><small>各策略的规则与风控边界</small></span></button>
+    <button class="module-tab" role="tab" aria-selected="false" data-paper-view="strategy" onclick="showPaperWorkspace('strategy',this)"><span class="module-code">运行</span><span class="module-copy"><b>运行策略</b><small>运行时状态与资金占用</small></span></button>
     <button class="module-tab" role="tab" aria-selected="false" data-paper-view="research" onclick="showPaperWorkspace('research',this)"><span class="module-code">证据</span><span class="module-copy"><b>策略证据</b><small>候选快照与后续兑现跟踪</small></span></button>
     <button class="module-tab active" role="tab" aria-selected="true" data-paper-view="portfolio" onclick="showPaperWorkspace('portfolio',this)"><span class="module-code">持仓</span><span class="module-copy"><b>&#x5f53;&#x524d;&#x6301;&#x4ed3;</b><small>&#x5e10;&#x6237;&#x4e0e;&#x53ef;&#x64cd;&#x4f5c;&#x5e95;&#x4ed3;</small></span></button>
     <button class="module-tab" role="tab" aria-selected="false" data-paper-view="activity" onclick="showPaperWorkspace('activity',this)"><span class="module-code">委托</span><span class="module-copy"><b>&#x59d4;&#x6258;&#x8bb0;&#x5f55;</b><small>&#x6309;&#x65e5;&#x671f;&#x4e0e;&#x7b56;&#x7565;&#x67e5;&#x770b;&#x64cd;&#x4f5c;</small></span></button>
@@ -91,7 +91,7 @@
     <button class="module-tab" role="tab" aria-selected="false" data-paper-view="execution" onclick="showPaperWorkspace('execution',this)"><span class="module-code">执行</span><span class="module-copy"><b>执行画像</b><small>七档执行参数 · 批量窗口 · 人工核验</small></span></button>
   </nav>
   </div>
-  <div id="paperStrategyView" class="paper-strategy-view" hidden><div class="loading">正在读取策略规则…</div></div>
+  <div id="paperStrategyView" class="paper-strategy-view" hidden><div class="loading">正在读取运行策略状态…</div></div>
   <div id="paperResearchView" class="paper-research-view" hidden><div class="loading">正在读取模拟盘策略的研究证据…</div></div>
   <div id="paperPortfolioView" class="paper-trade-view">
   <div class="panel paper-setup-panel">
@@ -180,7 +180,7 @@
     <div class="controls">
       <select id="selStrategy" class="wide" style="display:none"></select>
       <div class="control-field"><label for="selTopn">每策略入选上限</label><select id="selTopn"><option selected>5</option><option>10</option><option>20</option></select></div>
-      <div id="selStrategyDesc" class="strategy-model-note">内置研究模型与「策略模拟」同源；每交易日盘后 17:25 自动按评分各选前 5 只，重跑覆盖当天结果。自定义策略的正式候选与模拟交易请在「策略中心」/「策略模拟」查看——本页研究重跑仅支持内置研究模型。</div>
+      <div id="selStrategyDesc" class="strategy-model-note">内置研究模型与「策略模拟」同源；每交易日盘后 17:25 自动按评分各选前 5 只，重跑覆盖当天结果。自定义策略的正式候选与模拟交易请在「策略工坊」/「策略模拟」查看——本页研究重跑仅支持内置研究模型。</div>
       <button id="btnSelect" onclick="runPaperSelection()">立即重跑选股</button>
       <button class="ghost" onclick="loadPaperSelection()">刷新结果</button>
     </div>

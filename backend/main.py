@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """A股智能选股系统 - FastAPI 后端"""
-import os, sys, time, datetime, threading, json, uuid, sqlite3
+import os, sys, time, datetime, threading, json, uuid
 from contextlib import asynccontextmanager, contextmanager
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from fastapi import FastAPI, Query, HTTPException
@@ -19,7 +19,6 @@ import data_fetcher as dfc
 import universe as U
 import factors as F
 import strategies as S
-import strategy_registry as SR
 import backtest as B
 import optimizer as O
 import decision_engine as DE
@@ -673,115 +672,18 @@ def strategies():
     return {"strategies": [{"id": k, **v} for k, v in S.STRATEGIES.items()]}
 
 
-@app.get("/api/strategy-definitions")
-def strategy_definitions(
-    origin: str | None = Query(None),
-    status: str | None = Query(None),
-    include_archived: bool = Query(True),
-):
-    """Query durable built-in and user strategy definitions."""
-    try:
-        definitions = SR.list_definitions(
-            db_path=P.DB_PATH,
-            origins=(origin,) if origin else None,
-            statuses=(status,) if status else None,
-            include_archived=include_archived,
-        )
-        return {
-            "strategies": [definition.to_dict() for definition in definitions],
-            "lifecycle_statuses": list(SR.LIFECYCLE_STATUSES),
-            "origins": list(SR.ORIGINS),
-        }
-    except ValueError as exc:
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
-
-
-@app.get("/api/strategy-definitions/{strategy_id}/versions")
-def strategy_definition_versions(strategy_id: str):
-    """Return immutable versions for one stable strategy identity."""
-    versions = SR.list_versions(strategy_id, db_path=P.DB_PATH)
-    if not versions:
-        raise HTTPException(status_code=404, detail="strategy definition not found")
-    return {
-        "strategy_id": strategy_id,
-        "versions": [version.to_dict() for version in versions],
-    }
-
-
-@contextmanager
-def _strategy_write_connection():
-    P.init_db()
-    conn = sqlite3.connect(P.DB_PATH, timeout=30)
-    try:
-        SR.ensure_schema(conn)
-        yield conn
-        conn.commit()
-    except Exception:
-        conn.rollback()
-        raise
-    finally:
-        conn.close()
-
-
-def _strategy_http_error(exc):
-    message = str(exc)
-    status = 404 if message == "unknown strategy id" else 409 if (
-        "changed" in message or "historical" in message or "runtime is not ready" in message
-    ) else 422
-    raise HTTPException(status_code=status, detail=message) from exc
-
-
-@app.post("/api/strategies/{strategy_id}/validate")
-async def validate_strategy(strategy_id: str, payload: dict | None = None):
-    payload = payload or {}
-    try:
-        with _strategy_write_connection() as conn:
-            readiness = SR.runtime_readiness(conn, strategy_id)
-            if not readiness["runtime_ready"]:
-                raise ValueError("strategy runtime is not ready: " + "; ".join(readiness["errors"]))
-            strategy = SR.transition(conn, strategy_id, "validated", expected_status="draft",
-                                     reason=payload.get("reason") or "validated", actor=payload.get("actor") or "api")
-        return {"strategy": strategy.to_dict(), "readiness": readiness}
-    except ValueError as exc:
-        _strategy_http_error(exc)
-
-
-@app.post("/api/strategies/{strategy_id}/activate")
-async def activate_strategy(strategy_id: str, payload: dict | None = None):
-    payload = payload or {}
-    try:
-        with _strategy_write_connection() as conn:
-            current = SR.get(strategy_id, conn=conn)
-            strategy = SR.transition(conn, strategy_id, "active", expected_status=current.status,
-                                     reason=payload.get("reason") or "activated", actor=payload.get("actor") or "api")
-            readiness = SR.runtime_readiness(conn, strategy_id)
-        return {"strategy": strategy.to_dict(), "readiness": readiness}
-    except (ValueError, AttributeError) as exc:
-        _strategy_http_error(exc)
-
-
-@app.post("/api/strategies/{strategy_id}/pause")
-async def pause_strategy(strategy_id: str, payload: dict | None = None):
-    payload = payload or {}
-    try:
-        with _strategy_write_connection() as conn:
-            strategy = SR.transition(conn, strategy_id, "paused", expected_status="active",
-                                     reason=payload.get("reason") or "paused", actor=payload.get("actor") or "api")
-        return {"strategy": strategy.to_dict()}
-    except ValueError as exc:
-        _strategy_http_error(exc)
-
-
-@app.post("/api/strategies/{strategy_id}/archive")
-async def archive_strategy(strategy_id: str, payload: dict | None = None):
-    payload = payload or {}
-    try:
-        with _strategy_write_connection() as conn:
-            strategy = SR.archive_definition(conn, strategy_id, reason=payload.get("reason") or "archived",
-                                              actor=payload.get("actor") or "api")
-        return {"strategy": strategy.to_dict()}
-    except ValueError as exc:
-        _strategy_http_error(exc)
+# PR-52：策略定义只有一套 API —— ``/api/strategies``（Strategy Admin，
+# 见 api_strategies.py / strategy_service.py）。这里曾经并行存在
+# ``/api/strategy-definitions``（定义列表 + 版本列表）与四个生命周期别名
+# ``/api/strategies/{id}/validate|activate|pause|archive``，唯一调用方是
+# 前端「模拟交易 → 策略中心」里那套旧定义编辑器；该编辑器已删除，这些
+# 重复入口一并移除，生命周期写入统一走
+# ``POST /api/strategies/{id}/transition``。
+#
+# 注意区分（两者语义不同，都必须保留）：
+#   - ``POST /api/strategies/validate``  → DSL 校验（无副作用）
+#   - ``POST /api/strategies/preview``   → 风险/资金预览（无副作用）
+#   - ``POST /api/strategies/{id}/transition`` → 唯一生命周期写入入口
 
 
 @app.get("/api/init/status")
