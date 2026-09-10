@@ -122,7 +122,13 @@ class ApiStrategiesTests(unittest.TestCase):
             key = (route.path, tuple(sorted(route.methods or [])))
             if key not in app_keys:
                 missing.append(key)
-        self.assertEqual([], missing, "有路由未注册到 app（多半是被 /{strategy_id} 遮蔽）")
+        if missing:
+            self.fail(
+                f"main module: {getattr(main, '__file__', '?')}; "
+                f"app strategy paths: "
+                f"{sorted({r.path for r in main.app.routes if 'strateg' in (r.path or '')})}; "
+                f"missing={missing}"
+            )
 
     def test_scanner_strategies_endpoint_is_separate(self):
         # 选股扫描页的静态策略列表不能和注册表共用 /api/strategies。
