@@ -3,7 +3,7 @@ set -Eeuo pipefail
 [[ "${1:-}" == --confirm-restore ]] || { echo '用法: restore.sh --confirm-restore <backup-dir>' >&2; exit 2; }
 BACKUP_DIR=$(realpath -e "${2:?缺少备份目录}")
 if [[ -z "${APP_DIR:-}" ]]; then
-  if [[ -d <SERVER_PATH> ]]; then APP_DIR=<SERVER_PATH>; else APP_DIR=/root/codex; fi
+  if [[ -d /opt/astock-codex/data_cache ]]; then APP_DIR=/opt/astock-codex; else APP_DIR=/root/codex; fi
 fi
 APP_DIR=$(realpath -e "$APP_DIR")
 [[ "$APP_DIR" != / && -d "$APP_DIR/data_cache" ]] || exit 2

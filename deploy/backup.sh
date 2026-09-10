@@ -2,7 +2,7 @@
 # A股模拟盘每日自动备份：SQLite 在线备份 + 关键配置，保留 N 天
 # 用法：backup.sh [--keep 7]
 # 在宿主机执行（不需要容器权限），SQLite .backup 保证一致性且不锁主库。
-# 项目目录自动探测：优先 <SERVER_PATH>（开源部署），回退 /root/codex（腾讯云单机）。
+# 项目目录自动探测：优先 /opt/astock-codex（开源部署），回退 /root/codex（腾讯云单机）。
 set -euo pipefail
 
 KEEP_DAYS=7
@@ -12,12 +12,12 @@ fi
 
 if [[ -n "${APP_DIR:-}" ]]; then
   PROJECT_DIR="$APP_DIR"
-elif [[ -d <SERVER_PATH> ]]; then
-  PROJECT_DIR=<SERVER_PATH>
-elif [[ -d <SERVER_PATH> ]]; then
+elif [[ -d /opt/astock-codex/data_cache ]]; then
+  PROJECT_DIR=/opt/astock-codex
+elif [[ -d /root/codex/data_cache ]]; then
   PROJECT_DIR=/root/codex
 else
-  echo "backup failed: 未找到项目目录（尝试过 APP_DIR、<SERVER_PATH>、/root/codex）" >&2
+  echo "backup failed: 未找到项目目录（尝试过 APP_DIR、/opt/astock-codex、/root/codex）" >&2
   exit 1
 fi
 

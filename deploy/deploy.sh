@@ -37,14 +37,14 @@ else
   echo "▶ [4/6] 跳过迁移（--no-migrate）"
 fi
 
-# 5. cron 同步（模板里的 <SERVER_PATH> 跟随本次部署的实际根目录，防止
+# 5. cron 同步（模板里的 /opt/astock-codex 跟随本次部署的实际根目录，防止
 #    覆盖服务器手工版后出现"路径指向不存在的目录 → 所有任务静默失败"）。
-#    2026-09-08 事故：仓库模板路径 <SERVER_PATH> 覆盖了服务器 /root/codex
+#    2026-09-08 事故：仓库模板路径 /opt/astock-codex 覆盖了服务器 /root/codex
 #    手工版，/opt 下无 deploy/reports，11:06 起盘中监控全部秒失败。
 if [[ "$(id -u)" == "0" && -d /etc/cron.d ]]; then
   echo "▶ [5/6] 同步 cron（路径随部署目录 $ROOT）..."
   cp -a /etc/cron.d/astock-codex "/etc/cron.d/astock-codex.bak-$(date +%Y%m%d%H%M%S)" 2>/dev/null || true
-  sed "s|<SERVER_PATH>|$ROOT|g" deploy/astock-codex.cron > /etc/cron.d/astock-codex
+  sed "s|/opt/astock-codex|$ROOT|g" deploy/astock-codex.cron > /etc/cron.d/astock-codex
   chmod 644 /etc/cron.d/astock-codex
 else
   echo "▶ [5/6] 跳过 cron 同步（非 root 或无 /etc/cron.d）"
