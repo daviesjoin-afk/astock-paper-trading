@@ -149,21 +149,28 @@ class StrategyDefinitionLifecycleTests(unittest.TestCase):
         self.assertNotIn("tq_breakout", enabled)
 
     def test_query_endpoint_returns_database_definitions(self):
-        import main
+        # PR-52：策略定义的唯一 API 是 ``/api/strategies``（Strategy Admin）。
+        # 旧的 ``/api/strategy-definitions`` 与生命周期别名一并删除，因此这里
+        # 改为断言 canonical 路由同样返回数据库里的定义与生命周期状态。
+        import api_strategies as API
 
         registry.create_user_definition(self.conn, "user_api", "API Strategy")
         self.conn.commit()
-        original_path = main.P.DB_PATH
+        original_path = paper.DB_PATH
         try:
-            main.P.DB_PATH = self.path
-            payload = main.strategy_definitions(
-                origin="user", status=None, include_archived=True,
-            )
+            paper.DB_PATH = self.path
+            payload = API.list_strategies(origin="user", include_archived=True)
+            everything = API.list_strategies(include_archived=True)
         finally:
-            main.P.DB_PATH = original_path
-        self.assertEqual([row["id"] for row in payload["strategies"]], ["user_api"])
-        self.assertEqual(payload["strategies"][0]["status"], "draft")
-        self.assertEqual(payload["origins"], ["builtin", "user"])
+            paper.DB_PATH = original_path
+        self.assertEqual([row["id"] for row in payload["items"]], ["user_api"])
+        self.assertEqual(payload["items"][0]["status"], "draft")
+        self.assertEqual(payload["items"][0]["origin"], "user")
+        # 内置与自定义来自同一份注册表（旧端点用 origins 字段表达同一事实）。
+        ids = {row["id"] for row in everything["items"]}
+        self.assertIn("trend_pullback", ids)
+        self.assertEqual(everything["summary"]["user"], 1)
+        self.assertGreaterEqual(everything["summary"]["builtin"], 5)
 
 
 if __name__ == "__main__":
