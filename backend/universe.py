@@ -222,6 +222,11 @@ def is_trade_day(value=None):
     other statutory closures.  ``chinese-calendar`` covers the current A-share
     operating years; if it cannot classify an out-of-range date we fail closed
     rather than unlock T+1 inventory on an assumed session.
+
+    PR-56：``chinese-calendar`` 的节假日表只覆盖到已发布的年份。对**超出库区间**
+    的工作日，fail-closed 会让"上一交易日"永远算不出来（离线 E2E 与演示模式直接
+    500）。因此仅在库明确无法分类（``NotImplementedError``/``ValueError``）时按
+    星期兜底：周末仍然闭市，工作日视为交易日。库能分类的日期行为完全不变。
     """
     day = _as_date(value)
     if day.weekday() >= 5:
@@ -230,7 +235,10 @@ def is_trade_day(value=None):
         return False
     try:
         return not _cn_calendar.is_holiday(day)
-    except (NotImplementedError, ValueError, TypeError):
+    except NotImplementedError:
+        # 日期超出库覆盖范围：按星期兜底（周末已在上方排除）
+        return True
+    except (ValueError, TypeError):
         return False
 
 

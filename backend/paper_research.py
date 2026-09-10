@@ -18,7 +18,8 @@ from strategy_registry import labels as strategy_labels
 
 
 BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-DB_PATH = os.path.join(BASE, "data_cache", "paper_research.sqlite3")
+import data_paths
+DB_PATH = data_paths.data_path("paper_research.sqlite3")
 VERSION = "paper-research-shadow-v1"
 HORIZONS = (1, 3, 5, 10, 20)
 CHINA_TZ = dt.timezone(dt.timedelta(hours=8))

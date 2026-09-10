@@ -16,7 +16,8 @@ import sys
 import time
 
 BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-CACHE_DIR = os.path.join(BASE, "data_cache")
+import data_paths
+CACHE_DIR = data_paths.data_dir()
 DB_PATH = os.path.join(CACHE_DIR, "adaptive_learning.sqlite3")
 ARCHIVE_DIR = os.path.join(CACHE_DIR, "retention_archive")
 os.makedirs(ARCHIVE_DIR, exist_ok=True)

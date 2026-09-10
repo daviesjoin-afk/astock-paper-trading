@@ -109,21 +109,21 @@ export function wbCard(item){
     // paused→active/retiring/archived、retiring→archived）补齐按钮，
     // 让 Pause / Clone / Retire 在界面上真正闭环，不必再手搓 curl。
     if(st==='draft'||st==='validated') actions+='<button type="button" onclick="wbOpenEditor('+sid+')">编辑</button>';
-    actions+='<button type="button" onclick="wbCloneStrategy('+sid+')">'+(st==='archived'?'复制并编辑':'复制')+'</button>';
+    actions+='<button type="button" data-testid="strategy-clone" onclick="wbCloneStrategy('+sid+')">'+(st==='archived'?'复制并编辑':'复制')+'</button>';
     if(st==='draft') actions+='<button type="button" onclick="wbValidateAndMark('+sid+')">验证并标记可激活</button>';
-    if(st==='validated') actions+='<button type="button" onclick="wbTransition('+sid+',\'draft\')">退回草稿</button>';
-    if(st==='validated') actions+='<button type="button" class="strategy-workbench-primary" onclick="wbTransition('+sid+',\'active\')">激活策略</button>';
-    if(st==='active') actions+='<button type="button" onclick="wbTransition('+sid+',\'paused\')">暂停</button>';
-    if(st==='paused') actions+='<button type="button" onclick="wbTransition('+sid+',\'active\')">恢复</button>';
-    if(st==='active'||st==='paused') actions+='<button type="button" onclick="wbTransition('+sid+',\'retiring\')">退役</button>';
-    if(st==='retiring') actions+='<button type="button" onclick="wbTransition('+sid+',\'archived\')">完成归档</button>';
-    if(st==='draft'||st==='validated'||st==='paused') actions+='<button type="button" onclick="wbTransition('+sid+',\'archived\')">归档</button>';
+    if(st==='validated') actions+='<button type="button" data-testid="strategy-transition-draft" onclick="wbTransition('+sid+',\'draft\')">退回草稿</button>';
+    if(st==='validated') actions+='<button type="button" class="strategy-workbench-primary" data-testid="strategy-transition-active" onclick="wbTransition('+sid+',\'active\')">激活策略</button>';
+    if(st==='active') actions+='<button type="button" data-testid="strategy-transition-paused" onclick="wbTransition('+sid+',\'paused\')">暂停</button>';
+    if(st==='paused') actions+='<button type="button" data-testid="strategy-transition-resume" onclick="wbTransition('+sid+',\'active\')">恢复</button>';
+    if(st==='active'||st==='paused') actions+='<button type="button" data-testid="strategy-transition-retiring" onclick="wbTransition('+sid+',\'retiring\')">退役</button>';
+    if(st==='retiring') actions+='<button type="button" data-testid="strategy-transition-archived" onclick="wbTransition('+sid+',\'archived\')">完成归档</button>';
+    if(st==='draft'||st==='validated'||st==='paused') actions+='<button type="button" data-testid="strategy-transition-archive" onclick="wbTransition('+sid+',\'archived\')">归档</button>';
     if(st==='draft') actions+='<button type="button" class="strategy-card-danger" onclick="wbDeleteDraft('+sid+')">删除草稿</button>';
   }else{
     actions='<button type="button" onclick="wbCloneStrategy(\''+adaptiveEsc(item.id)+'\')">复制并编辑</button>';
   }
   actions+='<button type="button" onclick="wbOpenDetail(\''+adaptiveEsc(item.id)+'\')">版本与详情</button>';
-  return '<article class="strategy-card" data-strategy-id="'+adaptiveEsc(item.id)+'">'
+  return '<article class="strategy-card" data-testid="strategy-card-'+adaptiveEsc(item.id)+'" data-strategy-id="'+adaptiveEsc(item.id)+'">'
     +'<header><h3>'+adaptiveEsc(item.name||item.id)+'</h3>'+wbStatusBadge(item.status)+'</header>'
     +'<p class="strategy-card-meta"><span class="strategy-card-origin '+(userCard?'strategy-card-origin-user':'strategy-card-origin-builtin')+'">'+(userCard?'自定义':'内置')+'</span>'
     +'<span>v'+(item.current_version||item.version||1)+' · '+(item.has_dsl?'DSL':'原生')+'</span>'
@@ -241,26 +241,26 @@ export function wbRenderEditor(item){
     +'<div><button type="button" onclick="wbBackToList()">返回列表</button></div></header>'
     +'<div class="strategy-editor-columns"><section class="strategy-editor-form">'
     +'<h4>基本信息</h4>'
-    +'<label>策略名称 <input id="wbName" type="text" maxlength="64" value="'+adaptiveEsc(item?item.name:'')+'" placeholder="例如：趋势放量突破"></label>'
-    +(isNew?'<label>策略 ID <input id="wbStrategyId" type="text" maxlength="64" placeholder="例如 trend_volume_breakout"><small>3–64 字符，小写字母开头，仅 a-z 0-9 _（创建后不能改）</small></label>'
+    +'<label>策略名称 <input data-testid="strategy-name" id="wbName" type="text" maxlength="64" value="'+adaptiveEsc(item?item.name:'')+'" placeholder="例如：趋势放量突破"></label>'
+    +(isNew?'<label>策略 ID <input data-testid="strategy-id" id="wbStrategyId" type="text" maxlength="64" placeholder="例如 trend_volume_breakout"><small>3–64 字符，小写字母开头，仅 a-z 0-9 _（创建后不能改）</small></label>'
            :'<p class="strategy-editor-static">ID：<b>'+adaptiveEsc(item.id)+'</b> · 当前版本 v'+(item.version||item.current_version||1)+'</p>')
     +'<label>策略说明 <textarea id="wbDescription" rows="2" maxlength="300">'+adaptiveEsc(item?item.description:'')+'</textarea></label>'
     +'<h4>策略条件</h4>'
-    +'<div class="strategy-editor-modes"><button type="button" class="active" id="wbModeBuilder" onclick="wbSetMode(\'builder\')">可视化模式</button><button type="button" id="wbModeDsl" onclick="wbSetMode(\'dsl\')">高级 DSL / JSON</button></div>'
+    +'<div class="strategy-editor-modes"><button type="button" class="active" data-testid="strategy-mode-builder" id="wbModeBuilder" onclick="wbSetMode(\'builder\')">可视化模式</button><button type="button" data-testid="strategy-mode-dsl" id="wbModeDsl" onclick="wbSetMode(\'dsl\')">高级 DSL / JSON</button></div>'
     +'<p class="strategy-editor-note" id="wbCombineNote">条件之间以 AND 组合</p>'
-    +'<div id="wbConditions" class="strategy-conditions">'+conditions.map(wbConditionRowHtml).join('')+'</div>'
-    +'<button type="button" class="strategy-condition-add" onclick="wbAddCondition()">+ 添加条件</button>'
+    +'<div id="wbConditions" class="strategy-conditions" data-testid="strategy-condition-builder">'+conditions.map(wbConditionRowHtml).join('')+'</div>'
+    +'<button type="button" class="strategy-condition-add" data-testid="strategy-add-condition" onclick="wbAddCondition()">+ 添加条件</button>'
     +'<div id="wbDslPane" hidden><p class="strategy-editor-note">这里只接受声明式策略 DSL（JSON），不执行 Python / SQL / Shell。</p>'
-    +'<textarea id="wbDslText" class="strategy-dsl-input" rows="10" spellcheck="false" placeholder=\'{"op":"and","args":[…]}\''+'>'+adaptiveEsc(dsl)+'</textarea>'
+    +'<textarea data-testid="strategy-dsl" id="wbDslText" class="strategy-dsl-input" rows="10" spellcheck="false" placeholder=\'{"op":"and","args":[…]}\''+'>'+adaptiveEsc(dsl)+'</textarea>'
     +'<div class="strategy-editor-dsl-tools"><button type="button" onclick="wbFormatDsl()">格式化</button><button type="button" onclick="wbFromConditionsToDsl()">从条件生成</button></div></div>'
     +'<h4>运行参数</h4>'
     +'<label>候选数量 <input id="wbCandidateTopn" type="number" min="1" max="50" value="'+(meta.candidate_topn!=null?meta.candidate_topn:10)+'"></label>'
     +'<label>持有周期（天） <input id="wbHold" type="number" min="1" max="60" value="'+(meta.hold!=null?meta.hold:8)+'"></label>'
     +(isNew?'':'<label>变更说明（保存后生成新版本）<input id="wbChangeNote" type="text" maxlength="120" value="Web editor update"></label>')
     +'<footer class="strategy-editor-footer">'
-    +'<button type="button" class="strategy-workbench-primary" onclick="wbSaveDraft()">保存草稿</button>'
-    +'<button type="button" onclick="wbValidateDraft()">验证策略</button>'
-    +'<button type="button" onclick="wbPreviewDraft()">预览风险与资金</button>'
+    +'<button type="button" class="strategy-workbench-primary" data-testid="strategy-save" onclick="wbSaveDraft()">保存草稿</button>'
+    +'<button type="button" data-testid="strategy-validate" onclick="wbValidateDraft()">验证策略</button>'
+    +'<button type="button" data-testid="strategy-preview" onclick="wbPreviewDraft()">预览风险与资金</button>'
     +'</footer>'
     +'<div id="wbValidateResult" class="strategy-preview-result" role="status" aria-live="polite"></div>'
     +'</section>'
@@ -486,7 +486,7 @@ export async function wbOpenDetail(strategyId){
       +(ev.reason?'<small> · '+adaptiveEsc(ev.reason)+'</small>':'')+'</li>';
   }).join('');
   var versionRows=versions.slice().reverse().map(function(v){
-    return '<li class="strategy-version-row'+(v.version===currentVersion?' current':'')+'">'
+    return '<li data-testid="strategy-version-'+v.version+'" class="strategy-version-row'+(v.version===currentVersion?' current':'')+'">'
       +'<b>v'+v.version+'</b>'+(v.version===currentVersion?' <span class="strategy-status-badge strategy-status-validated">当前</span>':'')
       +'<span class="strategy-version-time">'+adaptiveEsc(v.created_at||'')+'</span>'
       +'<small>'+adaptiveEsc(v.change_note||v.created_by||'')+'</small>'
@@ -501,7 +501,7 @@ export async function wbOpenDetail(strategyId){
     +'<dt>资金系数</dt><dd>'+(runtime.runtime_ready&&runtime.capital_scale!=null?Math.round(runtime.capital_scale*100)+'%':'—')+'</dd>'
     +'<dt>运行时就绪</dt><dd>'+(item.runtime_ready===false?'否 · '+adaptiveEsc(item.runtime_error||''):'是')+'</dd></dl>'
     +'<h4>生命周期时间线</h4><ul class="strategy-version-list">'+(timeline||'<li>暂无事件。</li>')+'</ul></section>'
-    +'<section><h4>版本历史（只读）</h4><ul class="strategy-version-list">'+(versionRows||'<li>暂无版本。</li>')+'</ul></section></div>';
+    +'<section><h4>版本历史（只读）</h4><ul class="strategy-version-list" data-testid="strategy-version-list">'+(versionRows||'<li>暂无版本。</li>')+'</ul></section></div>';
   wbShowView('detail');
   history.replaceState(null,'','#strategies/'+encodeURIComponent(strategyId));
 }

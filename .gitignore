@@ -40,3 +40,8 @@ server.log
 
 # Node build artifacts
 frontend/node_modules/
+
+# PR-56：Playwright E2E 产物（截图 / trace / video / 报告）不入库
+frontend/e2e/.artifacts/
+frontend/playwright-report/
+frontend/test-results/

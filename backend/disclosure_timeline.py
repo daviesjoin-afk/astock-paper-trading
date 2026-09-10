@@ -40,7 +40,8 @@ DEFAULT_MAX_PAGES = 3
 MIN_REQUEST_INTERVAL_SECONDS = 0.35
 
 _BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-CACHE_PATH = os.path.join(_BASE_DIR, "data_cache", "disclosure_timeline.json")
+import data_paths
+CACHE_PATH = data_paths.data_path("disclosure_timeline.json")
 _CACHE_LOCK = threading.RLock()
 _RATE_LOCK = threading.Lock()
 _LAST_REQUEST_AT = 0.0

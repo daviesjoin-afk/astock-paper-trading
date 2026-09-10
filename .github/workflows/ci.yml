@@ -165,3 +165,64 @@ jobs:
         run: |
           docker logs astock-ci || true
           docker rm --force astock-ci || true
+
+  # PR-56：真实浏览器 E2E（Playwright + Chromium，单 job，避免每个 Python 矩阵都装浏览器）。
+  # 用项目 venv 的 Python 起真实 FastAPI（临时 ASTOCK_DATA_DIR + ASTOCK_DEMO=1），
+  # 浏览器只访问本机 HTTP，不依赖行情 / LLM / 新闻等外部服务。
+  browser-e2e:
+    name: browser-e2e (chromium)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements.lock
+
+      - name: Install backend dependencies
+        run: python -m pip install --upgrade pip && python -m pip install -r requirements.lock
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install frontend build + test tooling
+        working-directory: frontend
+        run: npm ci
+
+      - name: Rebuild frontend bundle and fail if committed dist is stale
+        working-directory: frontend
+        run: |
+          npm run build
+          git diff --exit-code -- dist
+
+      - name: Install Chromium only
+        working-directory: frontend
+        run: npx playwright install --with-deps chromium
+
+      - name: Run browser journeys against a real local server
+        working-directory: frontend
+        env:
+          # 用 setup-python 的解释器起后端；临时数据目录由 server.py 自己创建
+          ASTOCK_E2E_PYTHON: python
+          ASTOCK_E2E_PORT: "8611"
+        run: npx playwright test --project=chromium
+
+      - name: Upload failure artifacts (screenshots / traces / video)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: browser-e2e-artifacts
+          path: |
+            frontend/e2e/.artifacts
+            frontend/playwright-report
+          retention-days: 7
+          if-no-files-found: ignore

@@ -46,7 +46,8 @@ from adaptive_common import _now, _json, _loads, _clamp  # C3: 收敛重复工�
 
 
 BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-CACHE_DIR = os.path.join(BASE, "data_cache")
+import data_paths
+CACHE_DIR = data_paths.data_dir()
 DB_PATH = os.path.join(CACHE_DIR, "adaptive_learning.sqlite3")
 PAPER_DB_PATH = os.path.join(CACHE_DIR, "paper_trading.sqlite3")
 SNAPSHOT_PATHS = (

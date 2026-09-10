@@ -18,3 +18,8 @@ deploy/*.service
 **/*.before
 **/*.tmp
 **/*.orig
+
+# PR-56：浏览器 E2E 源码与 Node 依赖不进运行时镜像
+frontend/e2e
+frontend/playwright.config.js
+frontend/node_modules
