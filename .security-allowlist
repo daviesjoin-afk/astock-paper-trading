@@ -21,7 +21,9 @@ suffix:openrouter.ai
 suffix:10jqka.com.cn
 suffix:hexin.cn
 suffix:qq.com
-# --- package mirrors and public documentation assets ---
+suffix:moonshot.cn
+suffix:mimo.ai
+# --- package mirrors, docs and public assets ---
 host:deb.debian.org
 host:mirrors.cloud.tencent.com
 host:mirrors.aliyun.com
@@ -33,28 +35,24 @@ host:docs.python.org
 host:github.com
 host:raw.githubusercontent.com
 host:api.github.com
-# --- local development endpoints (documented defaults, no real host) ---
+host:api.moonshot.cn
+host:api.mimo.ai
+# --- local development endpoints ---
 host:localhost
 host:127.0.0.1
 host:host.docker.internal
-# --- documented container/deployment paths used by the shipped deploy scripts.
-#     These are the public convention of this repo (Dockerfile workdir and the
-#     self-detecting backup path), not a private machine layout. ---
-value:<SERVER_PATH>
-value:<SERVER_PATH>/data_cache
-value:<SERVER_PATH>
+# --- container/deployment paths that ship with this repo (Dockerfile WORKDIR and
+#     the self-detecting backup path); they are the public convention, not a
+#     private machine layout ---
+value:/root/codex
+value:/root/codex/data_cache
+value:/opt/astock-codex
+value:/root/backups/20260903-architecture-predeploy/
 # --- provider data-flow identifiers (public API parameter constants) ---
 value:fa5fd1943c7b386f172d6893dbbd1d0c
 value:b2884a393a59ad64002292a3e90d46a5
-suffix:moonshot.cn
-suffix:mimo.ai
-host:api.moonshot.cn
-host:api.mimo.ai
 # --- deploy docs use an explicit placeholder instead of a real host ---
 value:root@服务器IP:/tmp/astock-quant/
-# --- archived handoff notes list internal backup dirs; contents are redacted in
-#     history via replacements, the remaining names carry no host or user info ---
-value:/root/backups/20260903-architecture-predeploy/
-# --- false positives: JS regex literal and an inline SVG path number ---
+# --- false positives: a JS regex literal and an inline SVG path number ---
 path:frontend/src/features/adaptive.js
 path:frontend/index.html

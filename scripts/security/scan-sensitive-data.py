@@ -629,7 +629,9 @@ def scan_history(repo: str, findings: Findings, manual_review: list, allow: "All
     )
     for sha, path in blobs:
         ext = os.path.splitext(path)[1].lower()
-        if SENSITIVE_FILE_RE.search(path) and not path.endswith(SENSITIVE_FILE_ALLOW):
+        if SCANNER_SELF_RE.search(path):
+            continue
+        if SENSITIVE_FILE_RE.search(path) and not path.endswith(SENSITIVE_FILE_ALLOW) and not FIXTURE_PATH_RE.search(path):
             if not skip(path):
                 findings.add("SENSITIVE_FILE", path, f"history:{sha[:10]}")
         if ext in BINARY_EXT:
