@@ -82,6 +82,31 @@ export const SIMPLE_DSL_V2 = {
   right: { op: "indicator", name: "ma", window: 21 },
 };
 
+/**
+ * 带参数 Schema 的 DSL：一个未锁定可调参数（risk_per_trade）+ 一个锁定参数
+ * （holding_days）。用于验证预览"可进化参数"段只展示 DSL Schema 声明的可调项。
+ */
+export const PARAM_DSL = {
+  op: "strategy",
+  rule: {
+    op: "gt",
+    left: { op: "field", name: "close" },
+    right: { op: "indicator", name: "ma", window: 20 },
+  },
+  parameters: [
+    {
+      op: "parameter", parameter_id: "risk_per_trade", type: "number",
+      value: 0.02, min: 0.002, max: 0.02, max_step: 0.002,
+      locked: false, risk_direction: "higher_is_riskier", min_evidence: 10,
+    },
+    {
+      op: "parameter", parameter_id: "holding_days", type: "integer",
+      value: 5, min: 1, max: 20, max_step: 1,
+      locked: true, risk_direction: "neutral", min_evidence: 0,
+    },
+  ],
+};
+
 /** 主菜单导航（稳定 testid）。 */
 export async function gotoPage(page, testid) {
   await page.goto("/");

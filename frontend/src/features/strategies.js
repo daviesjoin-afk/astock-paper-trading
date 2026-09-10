@@ -451,10 +451,19 @@ export async function wbPreviewDraft(){
     // PR-57：预览拆成三段，职责分明——
     //   A 系统硬边界（后端 hard_rules，策略无法覆盖）
     //   B 策略风控（后端 soft_limits/limits + 执行画像，可在画像内调整）
-    //   C 可进化参数（后端 parameter_schema.tunable，仅展示真实存在的可调参数）
+    //   C 可进化参数（只认本草稿编译出的参数 Schema）
     var hard=rp.hard_rules||result.hard_rules||{};
-    var schemaDeclared=!!(result.parameter_schema&&result.parameter_schema.tunable);
-    var evolvable=(schemaDeclared?result.parameter_schema.tunable:(rp.evolvable_params||result.evolvable_params||{}));
+    // P2 评审修复：可调集合只能来自 DSL 编译出的参数 Schema。未声明的项一律不展示，
+    // 也不再用风险画像模板的 evolvable_params 兜底——那会让用户误以为是本草稿的可调项。
+    var schemaItems=(result.parameters&&Array.isArray(result.parameters.items))?result.parameters.items:[];
+    var schemaAvailable=!!(result.parameters&&Array.isArray(result.parameters.items));
+    var editableIds=(result.evolution&&Array.isArray(result.evolution.tunable))
+      ?result.evolution.tunable
+      :((result.parameters&&Array.isArray(result.parameters.editable))?result.parameters.editable:[]);
+    var tunableItems=schemaItems.filter(function(it){
+      return editableIds.length?editableIds.indexOf(it.parameter_id)>=0:!it.locked;
+    });
+    var lockedCount=schemaItems.filter(function(it){return !!it.locked;}).length;
     function kv(map, formatter){
       var keys=Object.keys(map||{});
       if(!keys.length) return '<p class="risk-preview-empty">后端未返回该段数据。</p>';
@@ -487,11 +496,20 @@ export async function wbPreviewDraft(){
       +'<dt>资金系数</dt><dd>'+(alloc.capital_scale!=null?Math.round(alloc.capital_scale*100)+'%':'—')+'</dd>'
       +'<dt>预计可部署</dt><dd>'+(alloc.estimated_capital!=null?'¥'+Number(alloc.estimated_capital).toLocaleString('zh-CN'):'—')+'</dd></dl></section>'
       +'<section class="risk-preview-section risk-preview-evolvable" data-testid="risk-preview-evolvable">'
-      +'<h5>'+(schemaDeclared?'可进化参数':'风险模板可调参数')+'</h5>'
-      +kv(evolvable)
-      +(schemaDeclared
-        ?'<p class="risk-preview-note">来源：本草稿编译出的参数 Schema；未声明的项不允许自进化调整。</p>'
-        :'<p class="risk-preview-note">来源：风险画像模板声明的可调项（后端 preview 当前未返回 parameter_schema），不代表本草稿 DSL 的可调集合。</p>')
+      +'<h5>可进化参数</h5>'
+      +(schemaAvailable
+        ?(tunableItems.length
+          ?('<dl class="strategy-preview-grid">'+tunableItems.map(function(it){
+              var extra=(it.min!=null&&it.max!=null?('　范围 '+it.min+'~'+it.max):'')
+                +(it.max_step!=null?('　单次≤'+it.max_step):'')
+                +(it.risk_direction?('　方向 '+it.risk_direction):'');
+              return '<dt>'+adaptiveEsc(it.parameter_id)+'</dt><dd>'
+                +adaptiveEsc(String(it.value==null?'—':it.value))+adaptiveEsc(extra)+'</dd>';
+            }).join('')+'</dl>'
+            +'<p class="risk-preview-note">来源：本草稿 DSL 编译出的参数 Schema，只列出未锁定的可调参数'
+            +(lockedCount?('；另有 '+lockedCount+' 个锁定参数不参与自进化'):'')+'。未声明的项不允许自进化调整。</p>')
+          :'<p class="risk-preview-empty">本草稿编译出的参数 Schema 为空：没有可调参数，也就没有可进化项。</p>')
+        :'<p class="risk-preview-empty">后端本次未返回参数 Schema，无法判定可调集合，故不展示可调项。</p>')
       +'</section>'
       +'</div>'
       +(conservative?'<p class="strategy-preview-warn">保守画像：系统按最安全口径处理，请确认条件符合预期。</p>':'')
