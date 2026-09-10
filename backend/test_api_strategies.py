@@ -109,26 +109,26 @@ class ApiStrategiesTests(unittest.TestCase):
     # ---------- 0) 路由注册 ----------
 
     def test_routes_registered_on_app(self):
-        # 逐条校验模块声明的 (path, methods) 都挂到产品 app 上：新版
-        # FastAPI/Starlette 会丢弃被同层路径参数遮蔽的字面量路由
-        # （/validate、/preview），顺序写错就会缺路由。include_router
-        # 会复制路由对象，因此必须按键比较而不是按对象。
-        app_keys = {
-            (getattr(route, "path", None), tuple(sorted(getattr(route, "methods", None) or [])))
-            for route in main.app.routes
+        # 用 OpenAPI schema 校验接线：fastapi 0.141/starlette 1.6 的
+        # app.routes 里有 _IncludedRouter 包装对象（无 path 属性），
+        # 直接内省 app.routes 跨版本不可靠；openapi paths 才是稳定契约。
+        openapi = main.app.openapi()
+        paths = openapi.get("paths") or {}
+        expected = {
+            "/api/strategies": {"get", "post"},
+            "/api/strategies/validate": {"post"},
+            "/api/strategies/preview": {"post"},
+            "/api/strategies/{strategy_id}": {"get", "put", "patch", "delete"},
+            "/api/strategies/{strategy_id}/transition": {"post"},
+            "/api/strategies/{strategy_id}/clone": {"post"},
+            "/api/strategies/{strategy_id}/versions": {"get"},
+            "/api/strategies/{strategy_id}/events": {"get"},
         }
-        missing = []
-        for route in API.router.routes:
-            key = (route.path, tuple(sorted(route.methods or [])))
-            if key not in app_keys:
-                missing.append(key)
-        if missing:
-            self.fail(
-                f"main module: {getattr(main, '__file__', '?')}; "
-                f"app strategy paths: "
-                f"{sorted({r.path for r in main.app.routes if 'strateg' in (r.path or '')})}; "
-                f"missing={missing}"
-            )
+        for path, methods in expected.items():
+            self.assertIn(path, paths, path)
+            for method in methods:
+                self.assertIn(method, paths[path], (path, method))
+        self.assertIn("/api/scanner-strategies", paths)
 
     def test_scanner_strategies_endpoint_is_separate(self):
         # 选股扫描页的静态策略列表不能和注册表共用 /api/strategies。
