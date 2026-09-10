@@ -1,5 +1,5 @@
 var charts = {};
-window.__ASTOCK_ADAPTIVE_UI_BUILD__='20260904-settings-cleanup-v1';
+window.__ASTOCK_ADAPTIVE_UI_BUILD__='20260910-strategy-console-v1';
 function $(id){ return document.getElementById(id); }
 function fmt(v, d){ if(v===null||v===undefined||isNaN(v)) return '-'; return Number(v).toFixed(d===undefined?2:d); }
 function pctCls(v){ return v>0?'up':(v<0?'down':''); }
@@ -1696,10 +1696,13 @@ async function loadSettings(force){
   window._settingsLoading=(async function(){
     try{
       // PR-47：策略集合与设置并行读取（Registry 是策略集合唯一权威）。
+      // PR-49：并行取后端发布标识，用于界面版本核验。
       var results=await Promise.all([
         api('/api/settings/?_='+Date.now()),
         api('/api/strategies?include_archived=true&_='+Date.now()).catch(function(){ return null; }),
+        api('/api/version?_='+Date.now()).catch(function(){ return null; }),
       ]);
+      window._appBuild=(results[2]&&results[2].build)||'';
       var data=results[0];
       if(results[1]&&Array.isArray(results[1].items)){
         window._registryItems=results[1].items;
@@ -3232,13 +3235,23 @@ function wbCard(item){
   var hold=meta.hold?meta.hold+' 日':'—';
   var actions='';
   if(userCard){
-    actions='<button type="button" onclick="wbOpenEditor(\''+adaptiveEsc(item.id)+'\')">编辑</button>';
-    actions+='<button type="button" onclick="wbCloneStrategy(\''+adaptiveEsc(item.id)+'\')">复制</button>';
-    if(item.status==='active') actions+='<button type="button" onclick="wbTransition(\''+adaptiveEsc(item.id)+'\',\'paused\')">暂停</button>';
-    if(item.status==='paused') actions+='<button type="button" onclick="wbTransition(\''+adaptiveEsc(item.id)+'\',\'active\')">恢复</button>';
-    if(item.status==='draft') actions+='<button type="button" class="strategy-card-danger" onclick="wbDeleteDraft(\''+adaptiveEsc(item.id)+'\')">删除草稿</button>';
-    if(item.status==='draft') actions+='<button type="button" onclick="wbValidateAndMark(\''+adaptiveEsc(item.id)+'\')">验证并标记可激活</button>';
-    if(item.status==='validated') actions+='<button type="button" class="strategy-workbench-primary" onclick="wbTransition(\''+adaptiveEsc(item.id)+'\',\'active\')">激活策略</button>';
+    var sid='\''+adaptiveEsc(item.id)+'\'';
+    var st=item.status;
+    // PR-49：按注册表合法迁移矩阵（draft→validated/archived、
+    // validated→draft/active/archived、active→paused/retiring、
+    // paused→active/retiring/archived、retiring→archived）补齐按钮，
+    // 让 Pause / Clone / Retire 在界面上真正闭环，不必再手搓 curl。
+    if(st==='draft'||st==='validated') actions+='<button type="button" onclick="wbOpenEditor('+sid+')">编辑</button>';
+    actions+='<button type="button" onclick="wbCloneStrategy('+sid+')">'+(st==='archived'?'复制并编辑':'复制')+'</button>';
+    if(st==='draft') actions+='<button type="button" onclick="wbValidateAndMark('+sid+')">验证并标记可激活</button>';
+    if(st==='validated') actions+='<button type="button" onclick="wbTransition('+sid+',\'draft\')">退回草稿</button>';
+    if(st==='validated') actions+='<button type="button" class="strategy-workbench-primary" onclick="wbTransition('+sid+',\'active\')">激活策略</button>';
+    if(st==='active') actions+='<button type="button" onclick="wbTransition('+sid+',\'paused\')">暂停</button>';
+    if(st==='paused') actions+='<button type="button" onclick="wbTransition('+sid+',\'active\')">恢复</button>';
+    if(st==='active'||st==='paused') actions+='<button type="button" onclick="wbTransition('+sid+',\'retiring\')">退役</button>';
+    if(st==='retiring') actions+='<button type="button" onclick="wbTransition('+sid+',\'archived\')">完成归档</button>';
+    if(st==='draft'||st==='validated'||st==='paused') actions+='<button type="button" onclick="wbTransition('+sid+',\'archived\')">归档</button>';
+    if(st==='draft') actions+='<button type="button" class="strategy-card-danger" onclick="wbDeleteDraft('+sid+')">删除草稿</button>';
   }else{
     actions='<button type="button" onclick="wbCloneStrategy(\''+adaptiveEsc(item.id)+'\')">复制并编辑</button>';
   }
@@ -3257,14 +3270,28 @@ function wbRenderList(){
   var matched=WB_STATE.items.filter(wbMatches);
   var users=matched.filter(function(x){return x.origin==='user';});
   var builtins=matched.filter(function(x){return x.origin==='builtin';});
+  if(!matched.length){
+    // PR-49：区分「筛选没命中」与「一条自定义策略都还没有」两种空态。
+    list.innerHTML=WB_STATE.originFilter==='user'
+      ? '<div class="strategy-workbench-empty"><b>还没有自定义策略</b><p>从空白策略开始，或复制一套内置策略后修改。</p><button type="button" class="strategy-workbench-primary" onclick="wbNewStrategy()">创建第一个策略</button></div>'
+      : '<div class="strategy-workbench-empty"><b>没有匹配的策略</b><p>换个来源/状态筛选，或清空搜索词再试。</p><button type="button" class="ghost" onclick="wbResetFilters()">重置筛选</button></div>';
+    return;
+  }
   var html='';
-  if(users.length) html+='<h3 class="strategy-list-group">我的策略</h3><div class="strategy-card-grid">'+users.map(wbCard).join('')+'</div>';
-  if(users.length===0&&WB_STATE.originFilter!=='builtin'){
-    html+='<div class="strategy-workbench-empty"><b>还没有自定义策略</b><p>你可以：</p><ul><li>从空白策略开始</li><li>复制一套内置策略后修改</li></ul><button type="button" class="strategy-workbench-primary" onclick="wbNewStrategy()">创建第一个策略</button></div>';
+  if(users.length){
+    html+='<h3 class="strategy-list-group">我的策略</h3><div class="strategy-card-grid">'+users.map(wbCard).join('')+'</div>';
+  }else if(WB_STATE.originFilter==='all'&&WB_STATE.statusFilter==='all'&&!($('wbSearch')&&$('wbSearch').value.trim())){
+    html+='<div class="strategy-workbench-empty strategy-workbench-empty-inline"><b>还没有自定义策略</b><p>内置策略可直接复制成自定义策略后修改。</p><button type="button" class="strategy-workbench-primary" onclick="wbNewStrategy()">创建第一个策略</button></div>';
   }
   if(builtins.length) html+='<h3 class="strategy-list-group">内置策略（平台自带，可复制后修改）</h3><div class="strategy-card-grid">'+builtins.map(wbCard).join('')+'</div>';
-  if(!matched.length&&!users.length&&!builtins.length) html='<div class="loading">没有匹配的策略。</div>';
   list.innerHTML=html;
+}
+function wbResetFilters(){
+  WB_STATE.originFilter='all'; WB_STATE.statusFilter='all';
+  var search=$('wbSearch'); if(search) search.value='';
+  document.querySelectorAll('[data-wb-origin]').forEach(function(x){x.classList.toggle('active',x.getAttribute('data-wb-origin')==='all');});
+  document.querySelectorAll('[data-wb-status]').forEach(function(x){x.classList.toggle('active',x.getAttribute('data-wb-status')==='all');});
+  wbRenderList();
 }
 function wbShowView(view){
   WB_STATE.view=view;
@@ -3521,9 +3548,10 @@ async function wbValidateAndMark(strategyId){
 async function wbTransition(strategyId,toStatus){
   var item=WB_STATE.items.filter(function(x){return x.id===strategyId;})[0]||{};
   var confirmMsg={
+    draft:'确认将 '+strategyId+' 退回草稿？\n\n退回后不再参与新周期，可继续修改；\n已产生的订单与审计记录不会回滚。',
     active:'确认激活 '+strategyId+'？\n\n策略已激活后不会加入正在运行的周期；\n可在“设置中心 → 模拟盘与资金”选择其参与下一周期。',
-    paused:'确认暂停 '+strategyId+'？\n\n暂停后不再产生新的 entry signal；\n存量持仓仍由系统风控退出。',
-    retiring:'确认退役 '+strategyId+'？',
+    paused:'确认暂停 '+strategyId+'？\n\n暂停后不再产生新的 entry signal；\n存量持仓仍由系统风控退出；账本份额保留。',
+    retiring:'确认退役 '+strategyId+'？\n\n退役后不再参与新周期和新开仓；\n存量持仓按风控退出，随后可完成归档。',
     archived:'确认归档 '+strategyId+'？\n\n历史版本、订单、成交和审计不会删除。\n归档后不能加入未来周期。'
   }[toStatus];
   if(!window.confirm(confirmMsg||('确认将 '+strategyId+' 迁移到 '+toStatus+'？'))) return;

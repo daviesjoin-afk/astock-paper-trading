@@ -14,6 +14,7 @@ try:
 except ImportError:  # pragma: no cover - Windows development only.
     _main_fcntl = None
 
+import build_info as BI
 import data_fetcher as dfc
 import universe as U
 import factors as F
@@ -775,6 +776,16 @@ def metrics_endpoint():
     """Prometheus 文本格式指标（零依赖，供监控采集）。"""
     from fastapi.responses import PlainTextResponse
     return PlainTextResponse(MET.metrics_payload(), media_type="text/plain; version=0.0.4")
+
+
+@app.get("/api/version")
+def version():
+    """PR-49：返回发布标识，零网络、不缓存。
+
+    运维/发布核验用它把「本地 ↔ 服务器 ↔ GitHub」对齐到同一个 build id，
+    不必再 md5 比对文件；设置中心也会展示它，便于一眼确认当前跑的是哪版。
+    """
+    return BI.build_payload()
 
 
 @app.get("/api/health")
