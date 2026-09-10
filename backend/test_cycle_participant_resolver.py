@@ -278,6 +278,44 @@ class CycleParticipantResolverTests(G.OfflinePaperEnv, unittest.TestCase):
             self.assertEqual(resolution["source"], "cycle_not_configured")
             self.assertTrue(set(PT.ACTIVE_ACCOUNT_IDS).issubset(set(ids)))
 
+    def test_explicit_empty_enabled_set_is_a_valid_idle_cycle(self):
+        """PR-47：显式空启用集合 = 零策略 idle 周期。
+
+        断言：创建成功、enabled_strategies='[]'、参与者为空、内置五套账本
+        解绑暂停、扫描一轮零新信号、动态最小建仓金额为 0；风控/退出链路
+        仍可读（cycle_idle 不抛异常）。
+        """
+        self._activate(STRATEGY_A)
+        # 显式空配置保存必须成功（旧语义会拒绝）。
+        self._enable([])
+        _summary, cycle = self._start_cycle()
+        self.assertEqual([], list(cycle["enabled_strategies"]))
+        with self._conn() as conn:
+            resolution = PT._cycle_participant_resolution(conn)
+            self.assertEqual("cycle_idle", resolution["source"])
+            self.assertEqual((), resolution["ids"])
+            self.assertEqual((), PT.current_cycle_participant_ids(conn))
+            # 内置五套账本与用户策略账户全部解绑暂停（idle，不占资金）。
+            bound = conn.execute(
+                "SELECT COUNT(*) FROM paper_accounts WHERE cycle_id=?", (cycle["id"],)
+            ).fetchone()[0]
+            self.assertEqual(0, bound)
+            # 动态最小建仓金额为 0（无新开仓）。
+            cycle_row = conn.execute(
+                "SELECT * FROM paper_cycles WHERE id=?", (cycle["id"],)
+            ).fetchone()
+            amount, audit = PT._dynamic_minimum_order_amount(cycle_row, conn=conn)
+            self.assertEqual(0.0, amount)
+            self.assertEqual("cycle_idle_zero_strategies", audit["position_limit_source"])
+        # 扫描 + 执行一轮：不产生任何新信号/委托/预留。
+        close_result, opened = self._run_one_round()
+        with self._conn() as conn:
+            self.assertEqual(0, _table_count(conn, "paper_signals", "1=1"))
+            self.assertEqual(0, _table_count(conn, "paper_orders", "1=1"))
+            self.assertEqual(
+                0, _table_count(conn, "paper_capital_reservations", "cycle_id=?", (cycle["id"],))
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

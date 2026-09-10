@@ -1994,3 +1994,17 @@ body.dark .strategy-status-validated { background:rgba(29,78,216,.22); color:#93
 body.dark .strategy-status-paused { background:rgba(166,116,31,.18); }
 body.dark .strategy-workbench-summary,body.dark .strategy-condition-row,body.dark .strategy-version-list li,body.dark .strategy-dsl-input { background:rgba(255,255,255,.03); }
 body.dark .strategy-workbench-empty { background:rgba(255,255,255,.02); }
+
+/* ============ PR-47：Settings Registry 驱动 ============ */
+.settings-strategy-group { display:grid; gap:8px; }
+.settings-strategy-item { display:flex; gap:10px; align-items:center; flex-wrap:wrap; padding:9px 12px; border:1px solid var(--border-light); border-radius:10px; background:var(--th-bg); cursor:pointer; min-height:44px; }
+.settings-strategy-item input[type=checkbox] { width:18px; height:18px; accent-color:#238b68; flex:none; }
+.settings-strategy-item span { display:grid; gap:2px; }
+.settings-strategy-item span b { font-size:13px; color:var(--text); }
+.settings-strategy-item-disabled { opacity:.62; cursor:not-allowed; }
+.settings-strategy-link { border:1px solid var(--border); background:var(--surface); color:var(--primary); border-radius:8px; padding:4px 10px; font-size:11px; cursor:pointer; margin-left:auto; min-height:28px; }
+.settings-strategy-link:hover { border-color:var(--primary); }
+.strategy-user-card { padding:15px; border:1px solid var(--border); border-radius:12px; background:var(--th-bg); display:grid; gap:8px; }
+.strategy-user-card header { display:flex; justify-content:space-between; align-items:flex-start; gap:10px; }
+.strategy-user-card header b { font-size:14px; }
+body.dark .settings-strategy-item,body.dark .strategy-user-card { background:rgba(255,255,255,.03); }
