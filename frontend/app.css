@@ -1878,3 +1878,119 @@ body.dark #p-adaptive .adaptive-shell {
 .strategy-preview-box .paper-strategy-metrics{margin:8px 0}
 .strategy-builder-actions{margin-top:10px;display:flex;gap:8px}
 .exec-queue-actions button{margin-right:4px}
+
+/* ============ PR-46：策略中心（Strategy Workbench） ============ */
+.strategy-workbench-page .page-header { display:flex; justify-content:space-between; gap:16px; align-items:flex-start; flex-wrap:wrap; }
+.strategy-workbench-actions { display:flex; gap:8px; }
+.strategy-workbench-primary { background:var(--primary); border:1px solid var(--primary); color:#fff; padding:9px 16px; border-radius:9px; font-weight:600; font-size:13px; cursor:pointer; min-height:38px; }
+.strategy-workbench-primary:hover { background:var(--primary-hover); }
+.strategy-workbench-new-btn { background:var(--primary); border:1px solid var(--primary); color:#fff; padding:10px 18px; border-radius:10px; font-weight:600; font-size:13px; cursor:pointer; }
+.strategy-workbench-new-btn:hover { background:var(--primary-hover); }
+.strategy-workbench-summary { color:var(--text-secondary); font-size:13px; padding:10px 14px; border:1px solid var(--border-light); border-radius:10px; background:var(--th-bg); }
+.strategy-workbench-summary b { color:var(--text); font-size:15px; }
+.strategy-workbench-summary span { color:var(--text-muted); margin:0 4px; }
+.strategy-workbench-toolbar { display:flex; gap:12px; align-items:center; flex-wrap:wrap; margin-top:12px; }
+.strategy-workbench-filters { display:flex; gap:6px; flex-wrap:wrap; }
+.strategy-workbench-filter { border:1px solid var(--border); background:var(--surface); color:var(--text-secondary); border-radius:999px; padding:6px 14px; font-size:12px; cursor:pointer; min-height:32px; }
+.strategy-workbench-filter:hover { border-color:var(--primary); color:var(--primary); }
+.strategy-workbench-filter.active { background:var(--primary); border-color:var(--primary); color:#fff; }
+.strategy-workbench-search { flex:1; min-width:200px; max-width:320px; border:1px solid var(--border); border-radius:9px; padding:8px 12px; background:var(--surface); color:var(--text); font-size:13px; }
+.strategy-workbench-search:focus-visible { outline:2px solid var(--primary); outline-offset:1px; }
+.strategy-list-group { margin:18px 0 10px; font-size:14px; color:var(--text-secondary); }
+.strategy-card-grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(320px,1fr)); gap:12px; }
+.strategy-card { border:1px solid var(--border); border-radius:13px; background:var(--surface); padding:16px; box-shadow:var(--shadow); display:flex; flex-direction:column; gap:8px; }
+.strategy-card header { display:flex; justify-content:space-between; align-items:center; gap:10px; }
+.strategy-card header h3 { margin:0; font-size:15px; }
+.strategy-card-meta { margin:0; display:flex; gap:10px; flex-wrap:wrap; color:var(--text-muted); font-size:12px; align-items:center; }
+.strategy-card-origin { padding:2px 8px; border-radius:999px; font-size:11px; font-weight:600; }
+.strategy-card-origin-builtin { background:var(--th-bg); color:var(--text-secondary); border:1px solid var(--border); }
+.strategy-card-origin-user { background:var(--tag-ok-bg); color:var(--primary); border:1px solid var(--primary); }
+.strategy-card-desc { margin:0; color:var(--text-secondary); font-size:12px; line-height:1.6; min-height:2.6em; }
+.strategy-card-actions { display:flex; gap:6px; flex-wrap:wrap; margin-top:auto; padding-top:8px; border-top:1px solid var(--border-light); }
+.strategy-card-actions button { border:1px solid var(--border); background:var(--surface); color:var(--text); border-radius:8px; padding:6px 12px; font-size:12px; cursor:pointer; min-height:32px; }
+.strategy-card-actions button:hover { border-color:var(--primary); color:var(--primary); }
+.strategy-card-actions button.strategy-workbench-primary:hover { color:#fff; }
+.strategy-card-danger { color:var(--danger) !important; border-color:var(--danger) !important; }
+.strategy-status-badge { padding:3px 9px; border-radius:999px; font-size:11px; font-weight:700; letter-spacing:.4px; white-space:nowrap; }
+.strategy-status-draft { background:var(--th-bg); color:var(--text-muted); border:1px solid var(--border); }
+.strategy-status-validated { background:var(--tag-info-bg); color:#1d4ed8; border:1px solid #bfd3f7; }
+.strategy-status-active { background:var(--tag-ok-bg); color:var(--primary); border:1px solid var(--primary); }
+.strategy-status-paused { background:rgba(180,131,29,.12); color:#a6741f; border:1px solid #e2c684; }
+.strategy-status-retiring { background:rgba(217,79,71,.10); color:var(--danger); border:1px solid #eeb9b5; }
+.strategy-status-archived { background:var(--th-bg); color:var(--text-muted); border:1px dashed var(--border); }
+.strategy-workbench-empty { border:1px dashed var(--border); border-radius:13px; background:var(--th-bg); padding:28px 20px; text-align:center; color:var(--text-secondary); }
+.strategy-workbench-empty b { color:var(--text); }
+.strategy-workbench-empty ul { display:inline-block; text-align:left; margin:10px 0; }
+.strategy-workbench-empty button { margin-top:6px; }
+.strategy-workbench-error { border:1px solid var(--danger); border-radius:12px; background:var(--tag-warn-bg); color:var(--danger); padding:18px; display:grid; gap:8px; justify-items:start; }
+.strategy-workbench-error button { border:1px solid var(--danger); background:var(--surface); color:var(--danger); border-radius:8px; padding:6px 14px; cursor:pointer; }
+/* 编辑器 */
+.strategy-editor-head { display:flex; justify-content:space-between; align-items:center; gap:12px; margin-bottom:12px; flex-wrap:wrap; }
+.strategy-editor-head h3 { margin:0; font-size:16px; }
+.strategy-editor-head button { border:1px solid var(--border); background:var(--surface); border-radius:8px; padding:7px 14px; cursor:pointer; color:var(--text); }
+.strategy-editor-columns { display:grid; grid-template-columns:minmax(0,1.5fr) minmax(300px,1fr); gap:16px; align-items:start; }
+.strategy-editor-form { border:1px solid var(--border); border-radius:13px; background:var(--surface); padding:18px; box-shadow:var(--shadow); display:grid; gap:10px; }
+.strategy-editor-form h4 { margin:6px 0 0; font-size:13px; color:var(--text-secondary); text-transform:uppercase; letter-spacing:.5px; }
+.strategy-editor-form label { display:grid; gap:5px; font-size:13px; color:var(--text-secondary); }
+.strategy-editor-form input[type=text],.strategy-editor-form input[type=number],.strategy-editor-form textarea,.strategy-editor-form select { border:1px solid var(--border); border-radius:8px; padding:9px 11px; background:var(--surface); color:var(--text); font-size:13px; width:100%; }
+.strategy-editor-form input:focus-visible,.strategy-editor-form textarea:focus-visible,.strategy-editor-form select:focus-visible { outline:2px solid var(--primary); outline-offset:1px; }
+.strategy-editor-form small { color:var(--text-muted); font-size:11px; }
+.strategy-editor-static { margin:0; font-size:13px; color:var(--text-secondary); }
+.strategy-editor-modes { display:flex; gap:6px; }
+.strategy-editor-modes button { border:1px solid var(--border); background:var(--surface); color:var(--text-secondary); border-radius:8px; padding:6px 14px; font-size:12px; cursor:pointer; min-height:32px; }
+.strategy-editor-modes button.active { background:var(--primary); border-color:var(--primary); color:#fff; }
+.strategy-editor-note { margin:0; color:var(--text-muted); font-size:12px; line-height:1.6; }
+.strategy-conditions { display:grid; gap:8px; }
+.strategy-condition-row { display:grid; grid-template-columns:1.1fr .9fr .8fr 1.4fr auto; gap:8px; align-items:end; border:1px solid var(--border-light); border-radius:10px; padding:10px; background:var(--th-bg); }
+.strategy-condition-row label { display:grid; gap:4px; font-size:11px; color:var(--text-muted); }
+.strategy-condition-row select,.strategy-condition-row input { border:1px solid var(--border); border-radius:7px; padding:7px 9px; font-size:12px; background:var(--surface); color:var(--text); min-height:34px; }
+.strategy-condition-value { display:flex; gap:6px; }
+.strategy-condition-value select,.strategy-condition-value input { min-width:0; flex:1; }
+.strategy-condition-remove { border:1px solid var(--border); background:var(--surface); color:var(--text-muted); border-radius:7px; width:34px; height:34px; cursor:pointer; }
+.strategy-condition-remove:hover { color:var(--danger); border-color:var(--danger); }
+.strategy-condition-add { justify-self:start; border:1px dashed var(--border); background:transparent; color:var(--text-secondary); border-radius:9px; padding:8px 16px; cursor:pointer; min-height:36px; }
+.strategy-condition-add:hover { color:var(--primary); border-color:var(--primary); }
+.strategy-dsl-input { font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; font-size:12px; line-height:1.6; border:1px solid var(--border); border-radius:10px; padding:12px; background:var(--th-bg); color:var(--text); width:100%; resize:vertical; }
+.strategy-editor-dsl-tools { display:flex; gap:8px; }
+.strategy-editor-dsl-tools button { border:1px solid var(--border); background:var(--surface); border-radius:8px; padding:6px 14px; font-size:12px; cursor:pointer; color:var(--text); min-height:32px; }
+.strategy-editor-footer { display:flex; gap:8px; flex-wrap:wrap; padding-top:6px; border-top:1px solid var(--border-light); }
+.strategy-editor-footer button { border:1px solid var(--border); background:var(--surface); color:var(--text); border-radius:9px; padding:9px 16px; font-size:13px; cursor:pointer; min-height:38px; }
+/* 预览面板 */
+.strategy-preview-panel { border:1px solid var(--border); border-radius:13px; background:var(--surface); padding:18px; box-shadow:var(--shadow); display:grid; gap:12px; align-content:start; }
+.strategy-preview-panel h4 { margin:0; font-size:14px; }
+.strategy-preview-panel h5 { margin:0 0 6px; font-size:12px; color:var(--text-secondary); text-transform:uppercase; letter-spacing:.5px; }
+.strategy-preview-grid { display:grid; grid-template-columns:auto 1fr; gap:4px 14px; margin:0; font-size:12px; }
+.strategy-preview-grid dt { color:var(--text-muted); }
+.strategy-preview-grid dd { margin:0; color:var(--text); font-weight:600; }
+.strategy-preview-result { border-radius:10px; padding:12px 14px; font-size:12px; line-height:1.65; }
+.strategy-preview-ok { background:var(--tag-ok-bg); border:1px solid var(--primary); color:var(--primary); }
+.strategy-preview-bad { background:var(--tag-warn-bg); border:1px solid var(--danger); color:var(--danger); }
+.strategy-preview-warn { color:#a6741f; font-size:12px; }
+.strategy-preview-bad ul,.strategy-preview-ok ul { margin:6px 0 0; padding-left:18px; }
+/* 详情 */
+.strategy-detail-columns { display:grid; grid-template-columns:1fr 1fr; gap:16px; align-items:start; }
+.strategy-detail-columns section { border:1px solid var(--border); border-radius:13px; background:var(--surface); padding:18px; box-shadow:var(--shadow); }
+.strategy-detail-columns h4 { margin:0 0 10px; font-size:14px; }
+.strategy-version-list { list-style:none; margin:0; padding:0; display:grid; gap:8px; font-size:12px; }
+.strategy-version-list li { border:1px solid var(--border-light); border-radius:9px; padding:9px 12px; background:var(--th-bg); color:var(--text-secondary); display:flex; gap:8px; align-items:baseline; flex-wrap:wrap; }
+.strategy-version-list li.current { border-color:var(--primary); }
+.strategy-version-list b { color:var(--text); }
+.strategy-version-time { color:var(--text-muted); font-size:11px; }
+.strategy-version-list code { color:var(--text-muted); font-size:11px; margin-left:auto; }
+/* 响应式 */
+@media (max-width:1099px){
+  .strategy-editor-columns { grid-template-columns:1fr; }
+  .strategy-preview-panel { order:2; }
+}
+@media (max-width:700px){
+  .strategy-detail-columns { grid-template-columns:1fr; }
+  .strategy-condition-row { grid-template-columns:1fr 1fr; }
+  .strategy-card-grid { grid-template-columns:1fr; }
+  .strategy-editor-footer button,.strategy-workbench-new-btn { width:100%; }
+}
+body.dark .strategy-workbench-filter.active { color:#fff; }
+body.dark .strategy-status-active { background:rgba(35,139,104,.22); }
+body.dark .strategy-status-validated { background:rgba(29,78,216,.22); color:#93b4f5; border-color:#2b4a7a; }
+body.dark .strategy-status-paused { background:rgba(166,116,31,.18); }
+body.dark .strategy-workbench-summary,body.dark .strategy-condition-row,body.dark .strategy-version-list li,body.dark .strategy-dsl-input { background:rgba(255,255,255,.03); }
+body.dark .strategy-workbench-empty { background:rgba(255,255,255,.02); }
