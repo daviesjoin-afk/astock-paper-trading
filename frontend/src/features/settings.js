@@ -6,7 +6,7 @@ import { adaptiveEsc, riskText } from "../core/format.js";
 import { SETTINGS_SECTION_KEY, activatePage } from "../core/navigation.js";
 import { loadPaper } from "./paper.js";
 import { STRATEGY_STATUS_LABELS, wbStatusBadge } from "./strategies.js";
-import { settingsConfirm } from "../ui/dialog.js";
+import { settingsConfirm, toast, inlineError, confirmDialog } from "../ui/dialog.js";
 
 // ---------- 统一设置中心 ----------
 export var SETTINGS_STRATEGY_NAMES={tq_breakout:'短线日内做T',trend_pullback:'趋势波段优选',sector_rotation:'板块轮动先锋',reported_profit_breakout:'财报突破质量',main_force_top10:'超强主力股'};
@@ -201,21 +201,34 @@ export function collectStrategyOverrides(){
 }
 
 export async function saveSettingsSection(section){
-  if(!settingsConfirm('确认保存“'+({simulation:'模拟盘与资金',risk:'仓位与风控',strategy:'策略参数',evolution:'AI与自进化',execution:'执行画像执行器'}[section]||section)+'”设置？后端会校验范围并写入审计。')) return;
+  var saveAnswer=await confirmDialog({
+    kicker:'设置 · 写入审计',
+    title:'保存“'+({simulation:'模拟盘与资金',risk:'仓位与风控',strategy:'策略参数',evolution:'AI与自进化',execution:'执行画像执行器'}[section]||section)+'”设置？',
+    bullets:['后端会校验取值范围，越界会被拒绝。','本次修改只影响下一周期，不改写当前账本。','保存会写入审计记录。'],
+    confirmText:'保存',
+  });
+  if(!saveAnswer.approved) return;
   var payload={};
   if(section==='simulation') payload.simulation={default_starting_capital:Number($('settingDefaultCapital').value),cycle_duration_days:Number($('settingCycleDuration').value),enabled_strategies:Array.prototype.slice.call(document.querySelectorAll('.setting-strategy-enabled:checked')).map(function(item){return item.value;})};
   if(section==='risk') payload.risk={shared_pool_position_limit:Number($('settingPoolLimit').value),shared_pool_exposure_cap:Number($('settingExposureCap').value)/100,single_position_max_amount:Number($('settingSingleMax').value),minimum_entry_slot_utilization:Number($('settingSlotUtilization').value)/100};
   if(section==='strategy') payload.strategy={strategy_overrides:collectStrategyOverrides()};
   if(section==='evolution') payload.evolution={evolution_interval_hours:Number($('settingEvolutionInterval').value)};
   if(section==='execution') payload.execution={execution_batch_gate:!!($('settingExec_execution_batch_gate')||{}).checked,execution_verification_gate:!!($('settingExec_execution_verification_gate')||{}).checked,execution_ttl_sweep:!!($('settingExec_execution_ttl_sweep')||{}).checked}; payload.ai=section==='evolution'?{llm_provider:$('settingAiProvider').value,llm_advisor_enabled:$('settingAiAdvisor').checked,llm_realtime_tuning_enabled:$('settingAiRealtime').checked,llm_realtime_mode:$('settingAiMode').value}:undefined;
-  try{var data=await apiPostJson('/api/settings/?confirmed=true',payload);renderSettings(data);alert('设置已保存并记录审计。');if(section==='risk'&&typeof loadPaper==='function') loadPaper({force:true});}catch(e){alert('保存失败：'+(e.message||e));}
+  try{var data=await apiPostJson('/api/settings/?confirmed=true',payload);renderSettings(data);toast('设置已保存并记录审计。');if(section==='risk'&&typeof loadPaper==='function') loadPaper({force:true});}catch(e){toast('保存失败：'+((e&&e.message)||e), { tone: 'danger' });}
 }
 
 export async function resetSettingsSection(section){
-  var defaults=(window._settingsPayload||{}).defaults||{}; if(!settingsConfirm('恢复该分组的默认安全设置？')) return;
+  var defaults=(window._settingsPayload||{}).defaults||{};
+  var resetAnswer=await confirmDialog({
+    kicker:'设置 · 恢复默认',
+    title:'恢复该分组的默认安全设置？',
+    bullets:['仅当前分组回到默认值，其他分组不受影响。','恢复后仍需点击保存才会写入后端。'],
+    confirmText:'恢复默认',
+  });
+  if(!resetAnswer.approved) return;
   var value=defaults[section]; if(!value) return;
   var payload={}; if(section==='strategy') payload.strategy={strategy_overrides:value.strategy_overrides}; else payload[section]=value;
-  try{var data=await apiPostJson('/api/settings/?confirmed=true',payload);renderSettings(data);}catch(e){alert('恢复默认失败：'+(e.message||e));}
+  try{var data=await apiPostJson('/api/settings/?confirmed=true',payload);renderSettings(data);toast('已恢复该分组默认值。');}catch(e){inlineError($('settingsResult'), e, { title:'恢复默认失败', retryLabel:'重试', onRetry:function(){ resetSettingsSection(section); } });}
 }
 
 export function refreshSettingsKeyForm(){
@@ -227,7 +240,13 @@ export function refreshSettingsKeyForm(){
 }
 
 export async function saveSettingsKey(){
-  if(!settingsConfirm('确认保存该 AI 接口配置？Key 只会写入后端，不会回显。')) return;
+  var aiAnswer=await confirmDialog({
+    kicker:'设置 · AI 接口',
+    title:'保存该 AI 接口配置？',
+    bullets:['Key 只写入后端，页面不会回显明文。','AI 仅用于审阅与候选生成，不直接下单。'],
+    confirmText:'保存配置',
+  });
+  if(!aiAnswer.approved) return;
   var body={provider:$('settingKeyProvider').value,api_key:$('settingApiKey').value||undefined,base_url:$('settingBaseUrl').value||undefined,model:$('settingAiModel').value||undefined};
-  try{var data=await apiPostJson('/api/settings/ai-key?confirmed=true',body);renderSettings(data);alert('AI 接口配置已保存（页面仅显示掩码状态）。');}catch(e){alert('接口保存失败：'+(e.message||e));}
+  try{var data=await apiPostJson('/api/settings/ai-key?confirmed=true',body);renderSettings(data);toast('AI 接口配置已保存（页面仅显示掩码状态）。');}catch(e){inlineError($('settingsResult'), (e&&e.message)||e, { title:'接口保存失败', retryLabel:'重试', onRetry:function(){ saveAiKey(); } }); toast('接口保存失败：'+(e.message||e));}
 }

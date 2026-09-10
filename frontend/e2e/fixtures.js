@@ -133,15 +133,14 @@ export function cardAction(page, strategyId, testid) {
 
 /** 从 draft 推进到 active（全部 UI 点击 + 真实 HTTP + 真实确认框）。 */
 export async function promoteToActive(page, strategyId, { from = "draft" } = {}) {
+  const transition = /\/api\/strategies\/[^/]+\/transition$/;
   if (from === "draft") {
-    const validated = waitForApi(page, /\/api\/strategies\/[^/]+\/transition$/);
-    await cardAction(page, strategyId, "strategy-transition-validated").click();
-    expect((await validated).ok(), "draft→validated 必须 2xx").toBeTruthy();
+    const validated = await clickAndApprove(page, cardAction(page, strategyId, "strategy-transition-validated"), transition);
+    expect(validated.ok(), "draft→validated 必须 2xx").toBeTruthy();
     await expect(page.getByTestId(`strategy-card-${strategyId}`)).toHaveAttribute("data-status", "validated");
   }
-  const activated = waitForApi(page, /\/api\/strategies\/[^/]+\/transition$/);
-  await cardAction(page, strategyId, "strategy-transition-active").click();
-  expect((await activated).ok(), "validated→active 必须 2xx").toBeTruthy();
+  const activated = await clickAndApprove(page, cardAction(page, strategyId, "strategy-transition-active"), transition);
+  expect(activated.ok(), "validated→active 必须 2xx").toBeTruthy();
   await expect(page.getByTestId(`strategy-card-${strategyId}`)).toHaveAttribute("data-status", "active");
   return strategyId;
 }
@@ -159,4 +158,25 @@ export async function enabledStrategies(page) {
   const body = await apiJson(page, "/api/settings/");
   const sim = (body && body.settings && body.settings.simulation) || {};
   return sim.enabled_strategies || [];
+}
+
+/**
+ * PR-57：危险/高影响动作改为应用内模态（DOM，不是浏览器原生 dialog）。
+ * 测试必须像真人一样点击模态里的确认按钮——不允许用 JS 绕过。
+ */
+export async function approveModal(page, label) {
+  const modal = page.getByTestId("app-confirm-dialog");
+  await expect(modal).toBeVisible();
+  const approve = modal.locator('[data-action="approve"]');
+  if (label) await expect(approve).toContainText(label);
+  await approve.click();
+  await expect(modal).toHaveCount(0);
+}
+
+/** 打开模态并确认的同时等待其触发的 API 响应。 */
+export async function clickAndApprove(page, clickTarget, matcher) {
+  await clickTarget.click();
+  const response = waitForApi(page, matcher);
+  await approveModal(page);
+  return response;
 }

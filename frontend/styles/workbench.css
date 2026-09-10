@@ -250,3 +250,187 @@
   .major-event-list li { grid-template-columns:44px minmax(0,1fr); }
   .major-event-list li a,.major-event-list li em { grid-column:2; }
 }
+
+/* ==== PR-57：应用内反馈组件（toast / 内联错误 / 模态）与策略卡片信息层级 ====
+   新增样式，不属于原 app.css 的行区间；并入本片段以保持片段行区间契约。 */
+/* PR-57：应用内反馈组件（toast / 内联错误 / 确认模态）与技术详情披露。
+   与既有 adaptive-confirm-* 视觉保持同一语言，但作为通用组件独立成文件。 */
+
+/* ---------- toast ---------- */
+.app-toast-host {
+  position: fixed;
+  right: 16px;
+  bottom: 16px;
+  z-index: 60;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  max-width: min(420px, calc(100vw - 32px));
+}
+.app-toast {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 10px 12px;
+  border-radius: 10px;
+  border: 1px solid var(--border, #d8dee8);
+  background: var(--surface, #fff);
+  box-shadow: 0 8px 24px rgba(15, 23, 42, .14);
+  font-size: 13px;
+  line-height: 1.45;
+}
+.app-toast-ok { border-left: 3px solid #16a34a; }
+.app-toast-warn { border-left: 3px solid #d97706; }
+.app-toast-danger { border-left: 3px solid #dc2626; }
+.app-toast-glyph { flex: 0 0 auto; font-weight: 700; }
+.app-toast-text { flex: 1 1 auto; word-break: break-word; }
+.app-toast-close {
+  flex: 0 0 auto;
+  border: 0;
+  background: none;
+  cursor: pointer;
+  font-size: 16px;
+  line-height: 1;
+  color: var(--text-secondary, #64748b);
+}
+
+/* ---------- inline error ---------- */
+.app-inline-error {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  margin: 8px 0;
+  padding: 10px 12px;
+  border: 1px solid rgba(220, 38, 38, .35);
+  border-left: 3px solid #dc2626;
+  border-radius: 10px;
+  background: rgba(220, 38, 38, .06);
+  font-size: 13px;
+}
+.app-inline-error-glyph { font-weight: 800; color: #b91c1c; }
+.app-inline-error-body { flex: 1 1 auto; }
+.app-inline-error-body p { margin: 2px 0 0; color: var(--text-secondary, #475569); }
+.app-inline-error-retry {
+  border: 1px solid var(--border, #cbd5e1);
+  background: var(--surface, #fff);
+  border-radius: 8px;
+  padding: 3px 10px;
+  cursor: pointer;
+}
+.app-inline-error-close { border: 0; background: none; cursor: pointer; font-size: 16px; line-height: 1; }
+
+/* ---------- modal（危险动作 / 输入 / 原因） ---------- */
+.app-modal-mask {
+  position: fixed;
+  inset: 0;
+  z-index: 70;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 16px;
+  background: rgba(15, 23, 42, .45);
+}
+.app-modal {
+  width: min(560px, 100%);
+  max-height: calc(100vh - 32px);
+  overflow: auto;
+  padding: 18px;
+  border-radius: 14px;
+  background: var(--surface, #fff);
+  box-shadow: 0 20px 48px rgba(15, 23, 42, .28);
+}
+.app-modal-danger { border-top: 3px solid #dc2626; }
+.app-modal-kicker {
+  display: inline-block;
+  font-size: 11px;
+  letter-spacing: .08em;
+  text-transform: uppercase;
+  color: var(--text-secondary, #64748b);
+}
+.app-modal h3 { margin: 6px 0 8px; font-size: 17px; }
+.app-modal p { margin: 0 0 8px; color: var(--text-secondary, #475569); }
+.app-modal-list { margin: 8px 0; padding-left: 18px; font-size: 13px; }
+.app-modal-list li { margin: 3px 0; }
+.app-modal-field { display: block; margin: 10px 0; font-size: 13px; }
+.app-modal-field input,
+.app-modal-field textarea {
+  display: block;
+  width: 100%;
+  margin-top: 4px;
+  padding: 7px 9px;
+  border: 1px solid var(--border, #cbd5e1);
+  border-radius: 8px;
+  font: inherit;
+}
+.app-modal footer { display: flex; justify-content: flex-end; gap: 8px; margin-top: 14px; }
+
+/* ---------- 技术详情披露 ---------- */
+.strategy-tech-details {
+  margin-top: 8px;
+  border-top: 1px dashed var(--border, #dbe2ea);
+  padding-top: 6px;
+  font-size: 12px;
+}
+.strategy-tech-details > summary {
+  cursor: pointer;
+  color: var(--text-secondary, #64748b);
+  list-style: none;
+}
+.strategy-tech-details > summary::-webkit-details-marker { display: none; }
+.strategy-tech-details > summary::before { content: '▸ '; }
+.strategy-tech-details[open] > summary::before { content: '▾ '; }
+.strategy-tech-grid {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 2px 10px;
+  margin: 6px 0 0;
+}
+.strategy-tech-grid dt { color: var(--text-secondary, #64748b); }
+.strategy-tech-grid dd { margin: 0; word-break: break-all; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+
+/* ---------- 卡片事实行（主视觉信息） ---------- */
+.strategy-card-facts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 10px;
+  margin: 6px 0 2px;
+  padding: 0;
+  list-style: none;
+  font-size: 12.5px;
+}
+.strategy-card-facts li { display: inline-flex; align-items: center; gap: 4px; }
+.strategy-card-facts .fact-label { color: var(--text-secondary, #64748b); }
+.strategy-card-participation-ok { color: #15803d; font-weight: 600; }
+.strategy-card-participation-off { color: var(--text-secondary, #64748b); }
+.strategy-status-glyph { margin-right: 4px; font-size: 10px; }
+
+/* ---------- 预览分区（系统硬边界 / 策略风控 / 可进化参数） ---------- */
+.risk-preview-sections { display: grid; gap: 10px; }
+.risk-preview-section {
+  border: 1px solid var(--border, #dbe2ea);
+  border-radius: 10px;
+  padding: 10px 12px;
+}
+.risk-preview-section > h5 {
+  margin: 0 0 6px;
+  font-size: 12.5px;
+  letter-spacing: .02em;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.risk-preview-system { background: rgba(100, 116, 139, .06); border-style: solid; }
+.risk-preview-system .risk-preview-lock { font-size: 12px; }
+.risk-preview-system .risk-preview-note {
+  margin: 6px 0 0;
+  font-size: 12px;
+  color: var(--text-secondary, #64748b);
+}
+.risk-preview-strategy { background: rgba(37, 99, 235, .05); }
+.risk-preview-evolvable { background: rgba(22, 163, 74, .05); }
+.risk-preview-empty { margin: 0; font-size: 12px; color: var(--text-secondary, #64748b); }
+
+@media (max-width: 768px) {
+  .app-toast-host { right: 10px; left: 10px; bottom: 10px; max-width: none; }
+  .strategy-card-facts { font-size: 12px; }
+}

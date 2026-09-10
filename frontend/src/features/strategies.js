@@ -4,10 +4,14 @@ import { api, apiJson, apiPostJson } from "../core/api.js";
 import { $ } from "../core/dom.js";
 import { adaptiveEsc } from "../core/format.js";
 import { activatePage } from "../core/navigation.js";
+import { STRATEGY_STATUS_LABELS, strategyStatusBadge, strategyStatusLabelTech } from "../core/strategy_labels.js";
+import { toast, inlineError, confirmDialog, promptDialog } from "../ui/dialog.js";
 
 // 生命周期状态中文名：设置中心的「启用策略」分组也在用（PR-52 从已删除的旧构建器里
 // 提升为模块级共享常量，避免设置页与运行策略页各写一份）。
-export var STRATEGY_STATUS_LABELS={draft:'草稿',validated:'已验证',active:'运行中',paused:'已暂停',retiring:'退役中',archived:'已归档'};
+// PR-57：状态标签的唯一来源在 core/strategy_labels.js（上面已显式 import），
+// 这里只做兼容再导出，避免 Strategy / Settings 各维护一份 map。
+export { STRATEGY_STATUS_LABELS };
 
 export function openInStrategyWorkbench(strategyId){
   // PR-52：本页唯一的"去改定义"出口——跳到策略工坊；带 id 时直接打开该策略详情。
@@ -89,8 +93,8 @@ export function wbSetStatusFilter(value,btn){
 }
 
 export function wbStatusBadge(status){
-  var pair=WB_STATUS_BADGES[status]||[String(status||'—').toUpperCase(),'strategy-status-draft'];
-  return '<span class="strategy-status-badge '+pair[1]+'">'+pair[0]+'</span>';
+  // PR-57：主文案是中文生命周期标签 + 非颜色信号（符号），技术枚举放 title。
+  return strategyStatusBadge(status);
 }
 
 export function wbMatches(item){
@@ -129,12 +133,45 @@ export function wbCard(item){
     actions='<button type="button" data-testid="strategy-clone" onclick="wbCloneStrategy(\''+adaptiveEsc(item.id)+'\')">复制并编辑</button>';
   }
   actions+='<button type="button" data-testid="strategy-open-detail" onclick="wbOpenDetail(\''+adaptiveEsc(item.id)+'\')">版本与详情</button>';
+  // PR-57：卡片分两层。主视觉 = 用户判断"这是什么、现在什么状态、能不能参与"所需的信息；
+  // 技术标识（id/校验和/实现键/原始指纹）收进 <details> 披露区，降低默认认知负荷。
+  var runtime=item.runtime||{};
+  var riskLabel=item.risk_archetype||item.fingerprint_archetype||(meta.style?style:'')||'—';
+  var stageLabel=runtime.stage_label||runtime.lifecycle_stage||'—';
+  var scale=null;
+  if(runtime.capital_scale&&runtime.capital_scale.factor!=null) scale=Math.round(runtime.capital_scale.factor*100)+'%';
+  else if(runtime.capital_scale!=null&&typeof runtime.capital_scale==='number') scale=Math.round(runtime.capital_scale*100)+'%';
+  var seats=runtime.position_limit!=null?runtime.position_limit:(meta.max_positions!=null?meta.max_positions:null);
+  var participates=!!item.supports_new_cycle&&item.status==='active';
+  var participation=participates?'下一周期：已启用':(item.status==='active'&&!item.supports_new_cycle?'下一周期：不支持':'下一周期：未启用');
+  var checksum=String(item.current_checksum||item.checksum||'');
+  var dslChecksum=String(item.dsl_checksum||item.dsl_checksum_sha256||'');
+  var implKey=item.implementation_key||item.implemented_by||item.native_key||(item.has_dsl?'dsl':'native');
+  var rawFingerprint=item.risk_fingerprint?JSON.stringify(item.risk_fingerprint):(item.fingerprint?JSON.stringify(item.fingerprint):'');
   return '<article class="strategy-card" data-testid="strategy-card-'+adaptiveEsc(item.id)+'" data-strategy-id="'+adaptiveEsc(item.id)+'" data-status="'+adaptiveEsc(item.status||'')+'">'
     +'<header><h3>'+adaptiveEsc(item.name||item.id)+'</h3>'+wbStatusBadge(item.status)+'</header>'
-    +'<p class="strategy-card-meta"><span class="strategy-card-origin '+(userCard?'strategy-card-origin-user':'strategy-card-origin-builtin')+'">'+(userCard?'自定义':'内置')+'</span>'
-    +'<span>v'+(item.current_version||item.version||1)+' · '+(item.has_dsl?'DSL':'原生')+'</span>'
-    +'<span>风格 '+style+'</span><span>持有 '+hold+'</span></p>'
+    +'<p class="strategy-card-identity"><span class="strategy-card-origin '+(userCard?'strategy-card-origin-user':'strategy-card-origin-builtin')+'">'+(userCard?'自定义':'内置')+'</span>'
+    +'<span>v'+(item.current_version||item.version||1)+'</span>'
+    +'<span>'+(item.has_dsl?'DSL':'原生')+'</span></p>'
+    +'<ul class="strategy-card-facts">'
+    +'<li><span class="fact-label">风险画像</span><b>'+adaptiveEsc(riskLabel)+'</b></li>'
+    +'<li><span class="fact-label">资金阶段</span><b>'+adaptiveEsc(stageLabel)+(scale?' · '+scale:'')+'</b></li>'
+    +'<li><span class="fact-label">席位</span><b>'+(seats!=null?seats+' 席':'—')+'</b></li>'
+    +'<li class="'+(participates?'strategy-card-participation-ok':'strategy-card-participation-off')+'">'+adaptiveEsc(participation)+'</li>'
+    +'</ul>'
     +'<p class="strategy-card-desc">'+adaptiveEsc(item.description||'')+'</p>'
+    +'<details class="strategy-tech-details" data-testid="strategy-tech-details">'
+    +'<summary>技术详情</summary>'
+    +'<dl class="strategy-tech-grid">'
+    +'<dt>策略 ID</dt><dd>'+adaptiveEsc(item.id)+'</dd>'
+    +'<dt>生命周期（枚举）</dt><dd>'+adaptiveEsc(strategyStatusLabelTech(item.status))+'</dd>'
+    +'<dt>当前版本</dt><dd>v'+(item.current_version||item.version||1)+'</dd>'
+    +'<dt>版本校验和</dt><dd>'+(checksum?adaptiveEsc(checksum.slice(0,24)):'—')+'</dd>'
+    +'<dt>DSL 校验和</dt><dd>'+(dslChecksum?adaptiveEsc(dslChecksum.slice(0,24)):'—')+'</dd>'
+    +'<dt>实现键</dt><dd>'+adaptiveEsc(String(implKey))+'</dd>'
+    +'<dt>风格 / 持有</dt><dd>'+adaptiveEsc(style)+' · '+adaptiveEsc(hold)+'</dd>'
+    +'<dt>原始指纹</dt><dd>'+(rawFingerprint?adaptiveEsc(rawFingerprint.slice(0,120)):'—')+'</dd>'
+    +'</dl></details>'
     +'<footer class="strategy-card-actions">'+actions+'</footer></article>';
 }
 
@@ -147,7 +184,11 @@ export function wbRenderList(){
   if(!matched.length){
     // PR-49：区分「筛选没命中」与「一条自定义策略都还没有」两种空态。
     list.innerHTML=WB_STATE.originFilter==='user'
-      ? '<div class="strategy-workbench-empty"><b>还没有自定义策略</b><p>从空白策略开始，或复制一套内置策略后修改。</p><button type="button" class="strategy-workbench-primary" onclick="wbNewStrategy()">创建第一个策略</button></div>'
+      ? '<div class="strategy-workbench-empty" data-testid="strategy-empty-user"><b>还没有自定义策略</b><p>从空白策略开始，或复制一套内置策略后修改。</p>'
+        +'<div class="strategy-workbench-empty-actions">'
+        +'<button type="button" class="strategy-workbench-primary" data-testid="strategy-empty-create" onclick="wbNewStrategy()">创建第一个策略</button>'
+        +'<button type="button" class="ghost" data-testid="strategy-empty-clone-builtin" onclick="wbCloneFirstBuiltin()">复制内置策略</button>'
+        +'</div></div>'
       : '<div class="strategy-workbench-empty"><b>没有匹配的策略</b><p>换个来源/状态筛选，或清空搜索词再试。</p><button type="button" class="ghost" onclick="wbResetFilters()">重置筛选</button></div>';
     return;
   }
@@ -187,8 +228,8 @@ export function wbNewStrategy(){
 export async function wbOpenEditor(strategyId){
   var item=null;
   try{ item=await api('/api/strategies/'+encodeURIComponent(strategyId)+'?_='+Date.now()); }
-  catch(e){ alert('读取策略失败：'+(e.message||e)); return; }
-  if(item.origin!=='user'){ alert('内置策略不可直接修改。\n可以“复制为自定义策略”后在副本上修改。'); return; }
+  catch(e){ inlineError($('wbList'), e, { title: '读取策略失败', retryLabel: '重试', onRetry: function(){ wbOpenEditor(strategyId); } }); return; }
+  if(item.origin!=='user'){ toast('内置策略不可直接修改；请先“复制并编辑”生成自定义副本。', { tone: 'warn' }); return; }
   WB_STATE.editingId=strategyId; WB_STATE.editingVersion=item.version||item.current_version;
   wbRenderEditor(item); wbShowView('editor');
   history.replaceState(null,'','#strategies/'+encodeURIComponent(strategyId));
@@ -297,7 +338,7 @@ export function wbAddCondition(){
 
 export function wbRemoveCondition(btn){
   var box=$('wbConditions');
-  if(box&&box.querySelectorAll('[data-wb-row]').length<=1){ alert('至少保留一条条件。'); return; }
+  if(box&&box.querySelectorAll('[data-wb-row]').length<=1){ toast('至少保留一条条件。', { tone: 'warn' }); return; }
   var row=btn.closest('[data-wb-row]'); if(row) row.remove();
 }
 
@@ -388,25 +429,57 @@ export async function wbPreviewDraft(){
     var alloc=result.allocation||{};
     var warnings=(result.warnings||[]).concat(result.high_risk_overrides||[]);
     var conservative=result.fail_closed||String(fp.archetype||'').indexOf('composite')>=0;
+    // PR-57：预览拆成三段，职责分明——
+    //   A 系统硬边界（后端 hard_rules，策略无法覆盖）
+    //   B 策略风控（后端 soft_limits/limits + 执行画像，可在画像内调整）
+    //   C 可进化参数（后端 parameter_schema.tunable，仅展示真实存在的可调参数）
+    var hard=rp.hard_rules||result.hard_rules||{};
+    var evolvable=(result.parameter_schema&&result.parameter_schema.tunable)||rp.evolvable_params||result.evolvable_params||{};
+    function kv(map, formatter){
+      var keys=Object.keys(map||{});
+      if(!keys.length) return '<p class="risk-preview-empty">后端未返回该段数据。</p>';
+      return '<dl class="strategy-preview-grid">'+keys.map(function(k){
+        var v=map[k]; var text=(formatter&&formatter[k])?formatter[k](v):(v==null?'—':String(v));
+        return '<dt>'+adaptiveEsc(k)+'</dt><dd>'+adaptiveEsc(text)+'</dd>';
+      }).join('')+'</dl>';
+    }
+    var softFormatter={
+      risk_per_trade:function(v){return v==null?'—':(Number(v)*100).toFixed(2)+'%';},
+      max_exposure:function(v){return v==null?'—':(Number(v)*100).toFixed(1)+'%';},
+      max_exposure_pct:function(v){return v==null?'—':(Number(v)*100).toFixed(1)+'%';},
+    };
+    var hardList=Object.keys(hard);
     panel.innerHTML='<h4>风险与资金预览</h4>'
-      +'<section><h5>风险画像</h5><p>'+adaptiveEsc(rp.recommended_profile_label||rp.template||fp.archetype||'—')+'</p>'
-      +'<dl class="strategy-preview-grid"><dt>置信度</dt><dd>'+(fp.confidence!=null?Math.round(fp.confidence*100)+'%':'—')+'</dd>'
-      +'<dt>单笔风险</dt><dd>'+(limits.risk_per_trade!=null?(limits.risk_per_trade*100).toFixed(2)+'%':'—')+'</dd>'
-      +'<dt>最大席位</dt><dd>'+(limits.max_positions!=null?limits.max_positions:'—')+'</dd>'
-      +'<dt>最大策略敞口</dt><dd>'+(limits.max_exposure_pct!=null?(limits.max_exposure_pct*100).toFixed(1)+'%':(limits.max_exposure!=null?(limits.max_exposure*100).toFixed(1)+'%':'—'))+'</dd>'
-      +'<dt>最大持有</dt><dd>'+(draft.metadata.hold+' 日')+'</dd></dl></section>'
-      +'<section><h5>执行画像</h5><dl class="strategy-preview-grid"><dt>订单类型</dt><dd>'+adaptiveEsc(ep.order_type||'—')+'</dd><dt>紧急度</dt><dd>'+adaptiveEsc(ep.urgency||'—')+'</dd><dt>TTL</dt><dd>'+(ep.ttl_minutes!=null?ep.ttl_minutes+' 分钟':'—')+'</dd></dl></section>'
-      +'<section><h5>初始资金状态</h5><dl class="strategy-preview-grid"><dt>生命周期</dt><dd>'+adaptiveEsc(alloc.stage_label||alloc.lifecycle_stage||'—')+'</dd><dt>资金系数</dt><dd>'+(alloc.capital_scale!=null?Math.round(alloc.capital_scale*100)+'%':'—')+'</dd><dt>预计可部署</dt><dd>'+(alloc.estimated_capital!=null?'¥'+Number(alloc.estimated_capital).toLocaleString('zh-CN'):'—')+'</dd></dl>'
+      +'<p class="strategy-preview-note">风险画像：'+adaptiveEsc(rp.recommended_profile_label||rp.template||fp.archetype||'—')
+      +'　置信度：'+(fp.confidence!=null?Math.round(fp.confidence*100)+'%':'—')+'</p>'
+      +'<div class="risk-preview-sections">'
+      +'<section class="risk-preview-section risk-preview-system" data-testid="risk-preview-system">'
+      +'<h5><span class="risk-preview-lock" aria-hidden="true">🔒</span>系统硬边界</h5>'
+      +(hardList.length?('<dl class="strategy-preview-grid">'+hardList.map(function(k){return '<dt>'+adaptiveEsc(k)+'</dt><dd>'+adaptiveEsc(hard[k]==null?'—':String(hard[k]))+'</dd>';}).join('')+'</dl>'):('<p class="risk-preview-empty">后端未返回硬边界明细。</p>'))
+      +'<p class="risk-preview-note">这些是平台与交易所层面的硬规则，策略定义无法覆盖或放宽。</p></section>'
+      +'<section class="risk-preview-section risk-preview-strategy" data-testid="risk-preview-strategy">'
+      +'<h5>策略风控</h5>'
+      +kv(limits, softFormatter)
+      +'<dl class="strategy-preview-grid"><dt>最大持有</dt><dd>'+adaptiveEsc(String(draft.metadata.hold))+' 日</dd>'
+      +'<dt>订单类型</dt><dd>'+adaptiveEsc(ep.order_type||'—')+'</dd><dt>紧急度</dt><dd>'+adaptiveEsc(ep.urgency||'—')+'</dd>'
+      +'<dt>TTL</dt><dd>'+(ep.ttl_minutes!=null?ep.ttl_minutes+' 分钟':'—')+'</dd></dl>'
+      +'<dl class="strategy-preview-grid"><dt>资金阶段</dt><dd>'+adaptiveEsc(alloc.stage_label||alloc.lifecycle_stage||'—')+'</dd>'
+      +'<dt>资金系数</dt><dd>'+(alloc.capital_scale!=null?Math.round(alloc.capital_scale*100)+'%':'—')+'</dd>'
+      +'<dt>预计可部署</dt><dd>'+(alloc.estimated_capital!=null?'¥'+Number(alloc.estimated_capital).toLocaleString('zh-CN'):'—')+'</dd></dl></section>'
+      +'<section class="risk-preview-section risk-preview-evolvable" data-testid="risk-preview-evolvable">'
+      +'<h5>可进化参数</h5>'
+      +kv(evolvable)
+      +'<p class="risk-preview-note">仅列出后端参数 Schema 声明的可调项；未声明的不允许自进化调整。</p></section>'
+      +'</div>'
       +(conservative?'<p class="strategy-preview-warn">保守画像：系统按最安全口径处理，请确认条件符合预期。</p>':'')
-      +(warnings.length?'<ul class="strategy-preview-warn">'+warnings.map(function(x){return '<li>'+adaptiveEsc(typeof x==='string'?x:(x.note||x.label||x.reason||x.code||''))+'</li>';}).join('')+'</ul>':'')
-      +'</section>';
+      +(warnings.length?'<ul class="strategy-preview-warn">'+warnings.map(function(x){return '<li>'+adaptiveEsc(typeof x==='string'?x:(x.note||x.label||x.reason||x.code||''))+'</li>';}).join('')+'</ul>':'');
   }catch(e){ panel.innerHTML='<h4>风险与资金预览</h4><div class="strategy-preview-bad">预览失败：'+adaptiveEsc(e.message||e)+'</div>'; }
 }
 
 export function wbFormatDsl(){
   var box=$('wbDslText'); if(!box) return;
   try{ box.value=JSON.stringify(JSON.parse(box.value||'null'),null,2); }
-  catch(e){ alert('JSON 解析失败：'+e.message); }
+  catch(e){ toast('JSON 解析失败：'+(e.message||e), { tone: 'danger' }); }
 }
 
 export function wbFromConditionsToDsl(){
@@ -416,64 +489,120 @@ export function wbFromConditionsToDsl(){
 
 export async function wbSaveDraft(){
   var draft;
-  try{ draft=wbCollectDraft(); }catch(e){ alert(e.message); return; }
+  try{ draft=wbCollectDraft(); }catch(e){ inlineError($('wbEditor')||$('wbPreviewPanel'), e, { title: '无法保存', testid: 'strategy-save-error' }); return; }
   try{
     if(WB_STATE.editingId){
       var saved=await apiJson('/api/strategies/'+encodeURIComponent(WB_STATE.editingId),'PATCH',{
         changes:{name:draft.name,description:draft.description,metadata:draft.metadata,dsl_ast:draft.dsl_ast},
         expected_version:WB_STATE.editingVersion,change_note:($('wbChangeNote')&&$('wbChangeNote').value||'Web editor update'),actor:'strategy-workbench',
       });
-      alert('保存成功 · v'+(saved.version||saved.current_version||'?')+'（旧版本保留）');
+      toast('保存成功 · v'+(saved.version||saved.current_version||'?')+'（旧版本保留）');
     }else{
       var created=await apiPostJson('/api/strategies',Object.assign({actor:'strategy-workbench'},draft));
-      alert('保存成功 · '+adaptiveEsc(created.id||draft.id)+' v'+(created.version||created.current_version||1));
+      toast('保存成功 · '+adaptiveEsc(created.id||draft.id)+' v'+(created.version||created.current_version||1));
     }
     await loadStrategyWorkbench(true);
     wbBackToList();
-  }catch(e){ alert('保存失败：'+(e.message||e)); }
+  }catch(e){
+    // 版本竞争（expected_version 不匹配）必须显式告知，绝不静默覆盖。
+    var msg=String((e&&e.message)||e);
+    if(/version|版本|conflict|409/i.test(msg)){
+      inlineError($('wbEditor'), '当前版本已变化：'+msg+'。请重新载入最新版本后再提交，本次修改未写入。',
+        { title: '版本冲突', testid: 'strategy-version-conflict', retryLabel: '重新载入最新', onRetry: function(){ loadStrategyWorkbench(true); wbBackToList(); } });
+    }else{
+      inlineError($('wbEditor'), msg, { title: '保存失败', testid: 'strategy-save-error', retryLabel: '重试保存', onRetry: function(){ wbSaveDraft(); } });
+    }
+  }
 }
 
 export async function wbValidateAndMark(strategyId){
-  if(!window.confirm('确认将 '+strategyId+' 标记为 Validated（已验证、可激活）？')) return;
+  var ok=await confirmDialog({
+    kicker:'生命周期 · 标记已验证',
+    title:'标记为已验证？',
+    detail:strategyId,
+    bullets:['标记后仍不参与任何周期，也不会开仓。','可继续修改定义；修改会生成新版本。','只有已验证的策略才能被激活。'],
+    confirmText:'标记为已验证',
+  });
+  if(!ok.approved) return;
   try{
     await apiPostJson('/api/strategies/'+encodeURIComponent(strategyId)+'/transition',{to_status:'validated',reason:'Web workbench 验证通过'});
     await loadStrategyWorkbench(true);
-  }catch(e){ alert('操作失败：'+(e.message||e)); }
+    toast('已标记为已验证：'+strategyId);
+  }catch(e){ inlineError($('wbList'), e, { title:'标记失败', retryLabel:'重试', onRetry:function(){ wbValidateAndMark(strategyId); } }); }
 }
 
 export async function wbTransition(strategyId,toStatus){
   var item=WB_STATE.items.filter(function(x){return x.id===strategyId;})[0]||{};
-  var confirmMsg={
-    draft:'确认将 '+strategyId+' 退回草稿？\n\n退回后不再参与新周期，可继续修改；\n已产生的订单与审计记录不会回滚。',
-    active:'确认激活 '+strategyId+'？\n\n策略已激活后不会加入正在运行的周期；\n可在“设置中心 → 模拟盘与资金”选择其参与下一周期。',
-    paused:'确认暂停 '+strategyId+'？\n\n暂停后不再产生新的 entry signal；\n存量持仓仍由系统风控退出；账本份额保留。',
-    retiring:'确认退役 '+strategyId+'？\n\n退役后不再参与新周期和新开仓；\n存量持仓按风控退出，随后可完成归档。',
-    archived:'确认归档 '+strategyId+'？\n\n历史版本、订单、成交和审计不会删除。\n归档后不能加入未来周期。'
-  }[toStatus];
-  if(!window.confirm(confirmMsg||('确认将 '+strategyId+' 迁移到 '+toStatus+'？'))) return;
+  // PR-57：危险/高影响动作改用应用内模态，并明确说明各自的边界语义。
+  var DIALOGS={
+    draft:{ title:'退回草稿？', danger:false, confirmText:'退回草稿',
+      bullets:['退回后不参与未来周期，可继续修改定义。','已产生的订单、成交与审计记录不会回滚或删除。'] },
+    active:{ title:'激活策略？', danger:false, confirmText:'激活策略',
+      bullets:['激活不会把策略加入正在运行的周期。','请在「设置 → 模拟盘与资金」勾选它参与下一周期。','激活本身不改动历史版本与账本。'] },
+    paused:{ title:'暂停策略？', danger:false, confirmText:'暂停',
+      bullets:['暂停后不再产生新的开仓信号（停止新开仓）。','当前周期的经济账本归属保持不变，不会被删除。','存量持仓继续由系统风控执行退出。'] },
+    retiring:{ title:'退役策略？', danger:false, confirmText:'进入退役',
+      bullets:['退役表示不再参与未来周期、不再新开仓。','存量持仓按风控逐步退出。','退役不等于删除：历史版本、订单、成交与审计都保留。','退出完成后可选择归档。'] },
+    archived:{ title:'归档策略？', danger:true, confirmText:'确认归档',
+      bullets:['归档后该策略不再加入任何未来周期。','历史与详情仍可查看（版本、订单、成交、审计记录都不会删除）。','归档是高影响动作，但可逆性有限：如需再启用需重新创建或复制。'] },
+  };
+  var dlg=DIALOGS[toStatus]||{ title:'迁移到 '+toStatus+'？', confirmText:'确认迁移', bullets:[] };
+  var answer=await confirmDialog({
+    kicker:'生命周期 · '+strategyStatusLabelTech(toStatus),
+    title:dlg.title,
+    detail:strategyId,
+    bullets:dlg.bullets,
+    danger:dlg.danger,
+    confirmText:dlg.confirmText,
+  });
+  if(!answer.approved) return;
   try{
     await apiPostJson('/api/strategies/'+encodeURIComponent(strategyId)+'/transition',{to_status:toStatus,expected_status:item.status,reason:'Web workbench 操作'});
     await loadStrategyWorkbench(true);
-  }catch(e){ alert('操作失败：'+(e.message||e)); }
+    toast('已更新生命周期：'+strategyId+' → '+strategyStatusLabelTech(toStatus));
+  }catch(e){ inlineError($('wbList'), e, { title:'生命周期迁移失败', retryLabel:'重试', onRetry:function(){ wbTransition(strategyId,toStatus); } }); }
 }
 
 export async function wbCloneStrategy(strategyId){
   var suffix=Date.now().toString(36).slice(-4);
-  var newId=prompt('新策略 ID（3–64 字符，小写字母开头）：',strategyId+'_clone_'+suffix);
-  if(!newId) return;
+  var answer=await promptDialog({
+    kicker:'复制策略',
+    title:'复制为新草稿',
+    detail:'源策略不会被修改；副本以 draft 起步，版本从 v1 开始。',
+    label:'新策略 ID（3–64 字符，小写字母开头）',
+    value:strategyId+'_clone_'+suffix,
+  });
+  if(!answer.approved||!answer.value) return;
+  var newId=answer.value;
   try{
-    await apiPostJson('/api/strategies/'+encodeURIComponent(strategyId)+'/clone',{id:newId.trim(),actor:'strategy-workbench'});
+    await apiPostJson('/api/strategies/'+encodeURIComponent(strategyId)+'/clone',{id:newId,actor:'strategy-workbench'});
     await loadStrategyWorkbench(true);
-    alert('已复制为草稿：'+newId.trim());
-  }catch(e){ alert('复制失败：'+(e.message||e)); }
+    toast('已复制为草稿：'+newId);
+  }catch(e){ inlineError($('wbList'), e, { title:'复制失败', retryLabel:'重试', onRetry:function(){ wbCloneStrategy(strategyId); } }); }
 }
 
 export async function wbDeleteDraft(strategyId){
-  if(!window.confirm('确认删除草稿 '+strategyId+'？该操作不可撤销。')) return;
+  var answer=await confirmDialog({
+    kicker:'物理删除 · 不可撤销',
+    title:'删除这个草稿？',
+    detail:strategyId,
+    danger:true,
+    confirmText:'永久删除',
+    bullets:[
+      '只有**从未离开草稿状态且从未被使用**的草稿才能被物理删除。',
+      '一旦该策略产生过正式生命周期记录（例如验证、激活、回退），删除会被后端拒绝。',
+      '那种情况下请改用「归档」：历史版本、订单、成交与审计都会保留。',
+    ],
+  });
+  if(!answer.approved) return;
   try{
     await apiJson('/api/strategies/'+encodeURIComponent(strategyId),'DELETE');
     await loadStrategyWorkbench(true);
-  }catch(e){ alert('删除失败：'+(e.message||e)); }
+    toast('已删除草稿：'+strategyId);
+  }catch(e){
+    inlineError($('wbList'), '删除被拒绝：'+((e&&e.message)||e)+'（若该策略已进入过正式生命周期，请使用归档。）',
+      { title:'无法物理删除', testid:'strategy-delete-rejected' });
+  }
 }
 
 export function wbRenderNotFound(strategyId,message){
