@@ -6,8 +6,8 @@ Before=docker.service
 
 [Service]
 Type=oneshot
-ExecStart=/usr/sbin/swapon <SERVER_PATH>
-ExecStop=/usr/sbin/swapoff <SERVER_PATH>
+ExecStart=/usr/sbin/swapon /opt/astock-codex/.swapfile
+ExecStop=/usr/sbin/swapoff /opt/astock-codex/.swapfile
 RemainAfterExit=yes
 
 [Install]
