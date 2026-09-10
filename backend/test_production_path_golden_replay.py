@@ -59,6 +59,14 @@ D5 = dt.date(2026, 9, 15)  # 周二：连续深跌（分批退出续）
 D6 = dt.date(2026, 9, 16)  # 周三：分批退出兜底窗口
 CAPITAL = 1_000_000.0
 
+# 回放时钟（PR-51）：入场熔断用 ``U.latest_complete_trade_date()``（无参 →
+# 真实时钟）作为「最近完整交易日」，而回放里的因子快照永远落在 D0。真实日期
+# 一旦推进到 D1 收盘之后，期望日就从 D1 变成 D1+1，lag 由 1 变 2，熔断把
+# fixture 判成"因子缓存已过期"，整组回放随墙上时钟变红。把"现在"钉在 D1 收盘
+# 之后，期望日恒为 D1、lag 恒为 1，离线回放与真实日期彻底解耦。
+REPLAY_FROZEN_NOW = dt.datetime.combine(D1, dt.time(15, 30))
+_REAL_LATEST_COMPLETE_TRADE_DATE = U.latest_complete_trade_date
+
 PASS_CODES = ("600901", "600902")
 FAIL_CODES = ("600903", "600904", "600905", "600906")
 ALL_CODES = PASS_CODES + FAIL_CODES
@@ -264,6 +272,13 @@ class OfflinePaperEnv:
         # 交易日历属于外部数据：离线环境按工作日近似（不影响被测逻辑）。
         cls._patches.append((U, "is_trade_day", U.is_trade_day))
         U.is_trade_day = staticmethod(lambda value=None: (_as_date(value) or dt.date.today()).weekday() < 5)
+        # 冻结回放时钟：把无参 ``latest_complete_trade_date()`` 的"现在"钉在
+        # D1 收盘之后，使各闸门的期望交易日恒为 D1（回放因子快照 D0 恰好 lag=1）。
+        # 显式传 asof 的回填路径不变（``now`` 只影响"是否把当天算作完整"）。
+        cls._patches.append((U, "latest_complete_trade_date", U.latest_complete_trade_date))
+        U.latest_complete_trade_date = lambda asof_day=None, now=None: (
+            _REAL_LATEST_COMPLETE_TRADE_DATE(asof_day, now=REPLAY_FROZEN_NOW)
+        )
         cls._patches.append((PT, "schedule_status", PT.schedule_status))
         PT.schedule_status = staticmethod(lambda: {"scheduler": "unit-test", "enabled": False})
         cls._patches.append((PT, "AD", PT.AD))
@@ -943,6 +958,28 @@ class ProductionInvariantTests(OfflinePaperEnv, unittest.TestCase):
         total = sum(float(row["deployable_amount"]) for row in plan["plan"])
         self.assertLessEqual(total, plan["pool_headroom_amount"] + 1e-6)
         self.assertLessEqual(total, pool_cap + 1e-6)
+
+
+class ReplayClockContractTests(OfflinePaperEnv, unittest.TestCase):
+    """PR-51：离线回放的"现在"必须属于 fixture 窗口，不能是墙上时钟。"""
+
+    def test_latest_complete_trade_date_is_pinned_to_the_replay_window(self):
+        # 真实日期（含 D1 收盘之后）不得改变回放的"最近完整交易日"。
+        self.assertEqual(U.latest_complete_trade_date(), D1)
+        # 显式回填历史日的调用不受冻结影响。
+        self.assertEqual(U.latest_complete_trade_date(D0), D0)
+        self.assertEqual(U.latest_complete_trade_date(D2), D2)
+
+    def test_entry_freeze_gate_accepts_the_replay_factor_snapshot(self):
+        # 熔断闸门必须接受 fixture 的因子快照。它此前用无参
+        # ``latest_complete_trade_date()`` 取期望日，真实日期越过 D1 收盘后
+        # 期望日变成 D1+1、lag 由 1 变 2，闸门就会把回放判成"因子已过期"。
+        status = PT._entry_freeze_status(force=True)
+        self.assertEqual(
+            status["checks"]["factor_cache"]["expected_factor_date"], D1.isoformat(),
+        )
+        self.assertTrue(status["checks"]["factor_cache"]["passed"], status)
+        self.assertFalse(status["enabled"], status)
 
 
 if __name__ == "__main__":
