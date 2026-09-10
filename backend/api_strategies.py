@@ -50,6 +50,9 @@ _BAD_REQUEST_TOKENS = (
     "invalid strategy status",
     "must be an object",
 )
+# 非对称风险门（唯一风险放大门）拒绝：语义是"这次定义变更被风控否决"，
+# 历史上人工 API 返回 422，迁移到 Strategy Admin 后保持一致。
+_RISK_GATE_TOKENS = ("风险放大", "证据不足", "观察期未满", "Challenger")
 
 
 def _raise_registry_error(exc: Exception, *, default: int = 400) -> None:
@@ -57,6 +60,8 @@ def _raise_registry_error(exc: Exception, *, default: int = 400) -> None:
     lowered = message.lower()
     if any(token in lowered for token in _NOT_FOUND_TOKENS):
         code = 404
+    elif any(token in message for token in _RISK_GATE_TOKENS):
+        code = 422
     elif any(token in lowered for token in _CONFLICT_TOKENS):
         code = 409
     elif any(token in lowered for token in _BAD_REQUEST_TOKENS):
@@ -184,17 +189,6 @@ def list_strategies(
 # 2) 单策略详情
 # ---------------------------------------------------------------------------
 
-@router.get("/{strategy_id}")
-def get_strategy(strategy_id: str):
-    P.init_db()
-    with P._db() as conn:
-        spec = SR.get(strategy_id, conn=conn)
-    if spec is None:
-        raise HTTPException(status_code=404, detail="unknown strategy id")
-    with P._db() as conn:
-        return _detail(conn, spec)
-
-
 # ---------------------------------------------------------------------------
 # 3) 创建用户策略
 # ---------------------------------------------------------------------------
@@ -274,20 +268,6 @@ def _save(strategy_id: str, payload: dict | None):
         _raise_registry_error(exc)
 
 
-@router.put("/{strategy_id}")
-def update_strategy(strategy_id: str, payload: dict | None = None):
-    return _save(strategy_id, payload)
-
-
-@router.patch("/{strategy_id}")
-def patch_strategy(strategy_id: str, payload: dict | None = None):
-    return _save(strategy_id, payload)
-
-
-# ---------------------------------------------------------------------------
-# 5) DSL 验证
-# ---------------------------------------------------------------------------
-
 @router.post("/validate")
 def validate_strategy(payload: dict | None = None):
     body = payload if isinstance(payload, Mapping) else {}
@@ -364,6 +344,34 @@ def preview_strategy(payload: dict | None = None):
 # 7) 生命周期迁移
 # ---------------------------------------------------------------------------
 
+@router.put("/{strategy_id}")
+def update_strategy(strategy_id: str, payload: dict | None = None):
+    return _save(strategy_id, payload)
+
+
+@router.patch("/{strategy_id}")
+def patch_strategy(strategy_id: str, payload: dict | None = None):
+    return _save(strategy_id, payload)
+
+
+# ---------------------------------------------------------------------------
+# 5) DSL 验证
+# ---------------------------------------------------------------------------
+
+# 字面量子路径必须声明在 ``/{strategy_id}`` 之后仍能被注册：新版
+# FastAPI/Starlette（0.141+/1.6+）会丢弃被同层路径参数遮蔽的路由，
+# 因此这里把 /validate、/preview 放在 /{strategy_id} 之前声明。
+@router.get("/{strategy_id}")
+def get_strategy(strategy_id: str):
+    P.init_db()
+    with P._db() as conn:
+        spec = SR.get(strategy_id, conn=conn)
+    if spec is None:
+        raise HTTPException(status_code=404, detail="unknown strategy id")
+    with P._db() as conn:
+        return _detail(conn, spec)
+
+
 @router.post("/{strategy_id}/transition")
 def transition_strategy(strategy_id: str, payload: dict | None = None):
     body = payload if isinstance(payload, Mapping) else {}
@@ -397,7 +405,8 @@ def transition_strategy(strategy_id: str, payload: dict | None = None):
 @router.post("/{strategy_id}/clone", status_code=201)
 def clone_strategy(strategy_id: str, payload: dict | None = None):
     body = payload if isinstance(payload, Mapping) else {}
-    new_strategy_id = str(body.get("new_strategy_id") or "").strip()
+    # 旧前端（策略注册表）传的是 ``id``；新契约用 ``new_strategy_id``。
+    new_strategy_id = str(body.get("new_strategy_id") or body.get("id") or "").strip()
     name = body.get("name")
     actor = str(body.get("actor") or "web-ui")
     if not new_strategy_id:

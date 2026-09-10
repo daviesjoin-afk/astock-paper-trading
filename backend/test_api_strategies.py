@@ -109,18 +109,31 @@ class ApiStrategiesTests(unittest.TestCase):
     # ---------- 0) 路由注册 ----------
 
     def test_routes_registered_on_app(self):
+        # 逐个校验模块声明的路由真的挂到产品 app 上：新版 FastAPI/Starlette
+        # 会丢弃被同层路径参数遮蔽的字面量路由（/validate、/preview），
+        # 顺序写错就不会被注册。
+        app_keys = {
+            (getattr(route, "path", None), tuple(sorted(getattr(route, "methods", None) or [])))
+            for route in main.app.routes
+        }
+        declared = [
+            route for route in API.router.routes
+            if (getattr(route, "path", None), tuple(sorted(getattr(route, "methods", None) or []))) not in app_keys
+        ]
+        self.assertEqual(
+            [],
+            [(route.path, sorted(route.methods or [])) for route in declared],
+            "有路由未注册到 app（多半是被 /{strategy_id} 遮蔽）",
+        )
+
+    def test_scanner_strategies_endpoint_is_separate(self):
+        # 选股扫描页的静态策略列表不能和注册表共用 /api/strategies。
+        body = main.strategies()
+        ids = {item["id"] for item in body["strategies"]}
+        self.assertTrue(ids)
+        self.assertNotIn("trend_pullback", ids)
         paths = {getattr(route, "path", None) for route in main.app.routes}
-        for expected in (
-            "/api/strategies",
-            "/api/strategies/validate",
-            "/api/strategies/preview",
-            "/api/strategies/{strategy_id}",
-            "/api/strategies/{strategy_id}/transition",
-            "/api/strategies/{strategy_id}/clone",
-            "/api/strategies/{strategy_id}/versions",
-            "/api/strategies/{strategy_id}/events",
-        ):
-            self.assertIn(expected, paths, expected)
+        self.assertIn("/api/scanner-strategies", paths)
 
     # ---------- 1) 列表 ----------
 
@@ -326,6 +339,17 @@ class ApiStrategiesTests(unittest.TestCase):
         _status, versions = self._call(API.list_strategy_versions, "api_clone_dst")
         self.assertEqual(versions["items"][0]["cloned_from_strategy_id"], "api_clone_src")
         self.assertEqual(versions["items"][0]["cloned_from_version"], 1)
+
+    def test_clone_accepts_legacy_id_field(self):
+        # 旧前端（策略注册表）传 {id: 新策略ID}，新契约用 new_strategy_id。
+        created = self._create_draft("api_clone_legacy")
+        status, body = self._call(
+            API.clone_strategy, created["id"],
+            {"source_version": 1, "id": "api_clone_legacy_dst"},
+            default_status=201,
+        )
+        self.assertEqual(status, 201, body)
+        self.assertEqual(body["id"], "api_clone_legacy_dst")
 
     def test_clone_duplicate_target_409(self):
         created = self._create_draft("api_clone_dup")

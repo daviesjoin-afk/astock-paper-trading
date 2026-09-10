@@ -3,7 +3,8 @@
 
 覆盖四条公开路径：
 
-1. **manual API**：``PATCH /api/strategies/{id}``（main.update_strategy）；
+1. **manual API**：``PATCH /api/strategies/{id}``（PR-45 起 Strategy Admin：
+   api_strategies.update_strategy）；
 2. **AI / 自进化**：``self_evolution.adjust_strategy_dsl_parameters``；
 3. **Champion promotion**：``strategy_champion.promote_challenger``；
 4. **UI**：``runtime_settings.update``（见 test_asymmetric_risk.py）。
@@ -12,7 +13,6 @@
 """
 from __future__ import annotations
 
-import asyncio
 import datetime as dt
 import os
 import sqlite3
@@ -81,15 +81,15 @@ class ManualApiPathTests(unittest.TestCase):
         self.tmp.cleanup()
 
     def _patch(self, changes, **extra):
-        import main
+        import api_strategies as API
 
-        original_path = main.P.DB_PATH
-        main.P.DB_PATH = self.path
+        original_path = API.P.DB_PATH
+        API.P.DB_PATH = self.path
         try:
             payload = {"changes": changes, "actor": "human-ui", **extra}
-            return asyncio.run(main.update_strategy("gate_api", payload))
+            return API.update_strategy("gate_api", payload)
         finally:
-            main.P.DB_PATH = original_path
+            API.P.DB_PATH = original_path
 
     def test_manual_api_cannot_expand_risk(self):
         from fastapi import HTTPException
