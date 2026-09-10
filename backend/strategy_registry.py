@@ -150,6 +150,79 @@ def _add_column(conn, table, name, definition):
         conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {definition}")
 
 
+# PR-50：version immutability 的数据库闸门。
+#
+# 闸门是**默认拒绝**的：没有同一事务内、针对该 strategy_id 的一次性清除授权
+# （``VERSION_PURGE_TOKEN_TABLE``）时，任何 DELETE 都被 ABORT。这样
+#
+#   - 裸 ``DELETE FROM paper_strategy_versions`` 一律失败——包括"lifecycle 从
+#     validated 回退到 draft，但 ledger/audit 仍引用某个 version/checksum"的
+#     情况（paper_signals 等表对 version 没有 FK，只靠 lifecycle 判断会漏）；
+#   - 唯一合法例外是 unused user draft 的私有快照：domain 层用 canonical
+#     helper ``_historical_reference_exists``（lifecycle + registry ownership +
+#     历史引用）判定后，插入一次性授权、删除、再撤销授权，全程在调用方事务内。
+#   - 即便有人伪造授权，触发器仍要求 definition 是 ``origin='user' AND
+#     lifecycle_status='draft'``，因此正式版本永远删不掉。
+#
+# 名称固定：``_install_immutable_version_trigger`` 按 SQL 内容比对，把老库上
+# 残留的"无条件拒绝"旧定义**在一个显式事务内原子替换**（见该函数文档）。
+IMMUTABLE_VERSION_TRIGGER = "trg_strategy_versions_no_delete"
+VERSION_PURGE_TOKEN_TABLE = "paper_strategy_version_purge_tokens"
+IMMUTABLE_VERSION_TRIGGER_SQL = (
+    """CREATE TRIGGER IF NOT EXISTS trg_strategy_versions_no_delete
+       BEFORE DELETE ON paper_strategy_versions
+       WHEN NOT EXISTS (
+           SELECT 1 FROM paper_strategy_version_purge_tokens t
+           JOIN strategy_definitions d ON d.id=t.strategy_id
+           WHERE t.strategy_id=OLD.strategy_id
+             AND d.origin='user'
+             AND d.lifecycle_status='draft'
+       )
+       BEGIN SELECT RAISE(ABORT, 'strategy versions are immutable'); END"""
+)
+
+
+def _normalize_trigger_sql(sql):
+    text = " ".join(str(sql or "").split()).lower()
+    return text.replace("if not exists ", "")
+
+
+def _install_immutable_version_trigger(conn):
+    """Create the immutability trigger, upgrading a legacy definition atomically.
+
+    Older databases carry an unconditional BEFORE DELETE trigger that made the
+    unused-draft purge impossible without a temporary DROP.  The replacement
+    must not reopen that hole: a bare DROP + CREATE on an autocommit connection
+    are two independently committed DDL statements, so an interruption between
+    them would leave the database with no protection at all.
+
+    Therefore the swap runs in one explicit ``BEGIN IMMEDIATE`` transaction when
+    the caller has not already opened one (when it has, the swap inherits the
+    caller's transaction and is atomic with it).  SQLite DDL is transactional,
+    so no connection can ever observe a state without the trigger.
+    """
+    stored = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='trigger' AND name=?",
+        (IMMUTABLE_VERSION_TRIGGER,),
+    ).fetchone()
+    if stored is not None and _normalize_trigger_sql(stored[0]) == _normalize_trigger_sql(
+        IMMUTABLE_VERSION_TRIGGER_SQL
+    ):
+        return
+    owned = not conn.in_transaction
+    if owned:
+        conn.execute("BEGIN IMMEDIATE")
+    try:
+        conn.execute(f"DROP TRIGGER IF EXISTS {IMMUTABLE_VERSION_TRIGGER}")
+        conn.execute(IMMUTABLE_VERSION_TRIGGER_SQL)
+    except Exception:
+        if owned:
+            conn.rollback()
+        raise
+    if owned:
+        conn.commit()
+
+
 def _create_version_schema(conn):
     _add_column(conn, "strategy_definitions", "current_version", "INTEGER")
     _add_column(conn, "strategy_definitions", "current_checksum", "TEXT")
@@ -227,11 +300,17 @@ def _create_version_schema(conn):
            BEFORE UPDATE ON paper_strategy_versions
            BEGIN SELECT RAISE(ABORT, 'strategy versions are immutable'); END"""
     )
+    # PR-50：一次性清除授权表。触发器只认"该 strategy_id 在**同一事务内**留下一行
+    # 授权、且其 definition 仍是 user+draft"的删除，这是 unused draft 私有快照的
+    # 唯一合法出口。授权行不落盘（调用方事务结束即消失），也不影响其他 strategy。
+    # 必须早于触发器创建：SQLite 在 CREATE TRIGGER 时就会解析触发器体里引用的表。
     conn.execute(
-        """CREATE TRIGGER IF NOT EXISTS trg_strategy_versions_no_delete
-           BEFORE DELETE ON paper_strategy_versions
-           BEGIN SELECT RAISE(ABORT, 'strategy versions are immutable'); END"""
+        """CREATE TABLE IF NOT EXISTS paper_strategy_version_purge_tokens (
+            strategy_id TEXT PRIMARY KEY,
+            FOREIGN KEY(strategy_id) REFERENCES strategy_definitions(id)
+        )"""
     )
+    _install_immutable_version_trigger(conn)
     conn.execute(
         """CREATE TRIGGER IF NOT EXISTS trg_strategy_definition_version_guard
            BEFORE UPDATE OF name,implementation_key,description,metadata,
@@ -841,7 +920,32 @@ def _historical_reference_exists(conn, strategy_id):
 
 
 def hard_delete_unused_draft(conn, strategy_id):
-    """Physically delete only an unused user draft and its private v1 snapshot."""
+    """Physically delete only an unused user draft and its private version rows.
+
+    Why an unused draft may be deleted while a formal version may not:
+
+    - A **formal** version carries history — it was validated/activated, bound
+      to a cycle, or referenced by signals/orders/fills/positions/audit and by
+      allocation/runtime/evolution/champion/challenger consumers.  Those
+      records must stay resolvable to their exact checksum forever, so the
+      database refuses every delete.
+    - A **user draft** with no historical reference is the single deliberate
+      exception: it never left ``draft``, never entered a cycle and has no
+      ledger/audit row pointing at it, so its private snapshot is pure scratch
+      state.  Deleting it removes nothing anyone can still resolve.
+
+    The database trigger is **default-deny**: it aborts every delete on
+    ``paper_strategy_versions`` unless the same transaction holds a one-shot
+    authorization row for a definition that is still ``origin='user' AND
+    lifecycle_status='draft'``.  So neither this function nor anyone else can
+    delete a version by just calling ``DELETE`` — a formal version is refused by
+    the database even after a lifecycle rollback, because the trigger no longer
+    trusts lifecycle alone.  This function is the only place that mints the
+    authorization, and it mints it only after ``_historical_reference_exists``
+    proves the draft never left scratch state.  The authorization row is
+    inserted and dropped inside the caller's transaction, so it is never
+    observable by another connection and disappears if anything fails.
+    """
     ensure_schema(conn)
     spec = get(strategy_id, conn=conn)
     if spec is None:
@@ -852,17 +956,14 @@ def hard_delete_unused_draft(conn, strategy_id):
         raise ValueError("strategy has historical references and must be archived")
     conn.execute("DELETE FROM strategy_definition_events WHERE strategy_id=?", (spec.id,))
     conn.execute("DELETE FROM paper_strategy_version_heads WHERE strategy_id=?", (spec.id,))
-    # The immutable-version trigger protects all retained history.  A draft
-    # with no ledger/cycle references is the deliberate exception.
-    conn.execute("DROP TRIGGER IF EXISTS trg_strategy_versions_no_delete")
+    conn.execute(
+        f"INSERT OR REPLACE INTO {VERSION_PURGE_TOKEN_TABLE} (strategy_id) VALUES(?)",
+        (spec.id,),
+    )
     try:
         conn.execute("DELETE FROM paper_strategy_versions WHERE strategy_id=?", (spec.id,))
     finally:
-        conn.execute(
-            """CREATE TRIGGER IF NOT EXISTS trg_strategy_versions_no_delete
-               BEFORE DELETE ON paper_strategy_versions
-               BEGIN SELECT RAISE(ABORT, 'strategy versions are immutable'); END"""
-        )
+        conn.execute(f"DELETE FROM {VERSION_PURGE_TOKEN_TABLE} WHERE strategy_id=?", (spec.id,))
     conn.execute("DELETE FROM strategy_definitions WHERE id=?", (spec.id,))
     return {"strategy_id": spec.id, "deleted": True}
 
