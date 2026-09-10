@@ -60,6 +60,22 @@ def user_participant_ids(conn: sqlite3.Connection) -> tuple[str, ...]:
     return tuple(str(row[0]) for row in rows)
 
 
+def user_known_ids(conn: sqlite3.Connection) -> tuple[str, ...]:
+    """返回注册表里全部已知用户策略 id，**不做任何 lifecycle/status 过滤**。
+
+    PR-48：经济所有权口径（cycle_ledger_ids）的能力位判定用这个集合——
+    lifecycle pause 只能停止新信号，不能把策略移出周期的经济账本
+    （Cycle owns capital, lifecycle controls execution permission）。
+    """
+    try:
+        rows = conn.execute(
+            "SELECT id FROM strategy_definitions WHERE origin='user' ORDER BY id"
+        ).fetchall()
+    except sqlite3.Error:
+        return ()
+    return tuple(str(row[0]) for row in rows)
+
+
 def user_spec_for(context, *, risk_profiles: Mapping[str, Mapping[str, Any]]) -> dict[str, Any]:
     """从 StrategyRuntimeContext 派生纸盘账户 spec（声明式，纯函数）。
 
