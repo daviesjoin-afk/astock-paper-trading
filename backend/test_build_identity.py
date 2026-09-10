@@ -3,7 +3,7 @@
 
 历史上这三处是手工维护、彼此独立：
 
-1. ``frontend/app.js`` 第 2 行 ``window.__ASTOCK_ADAPTIVE_UI_BUILD__``；
+1. ``frontend/src/app.js``（PR-55 起的入口）第 2 行 ``window.__ASTOCK_ADAPTIVE_UI_BUILD__``；
 2. ``frontend/index.html`` 中 ``/app.css?v=`` / ``/app.js?v=`` 的 cache-bust 值；
 3. 后端 ``/api/version`` 返回的 ``build``（``backend/build_info.py``）。
 
@@ -34,7 +34,7 @@ class BuildIdentityTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.index_source = _load(os.path.join(FRONTEND, "index.html"))
-        cls.app_source = _load(os.path.join(FRONTEND, "app.js"))
+        cls.app_source = _load(os.path.join(FRONTEND, "src", "app.js"))
 
     def test_build_id_is_non_empty_and_dated(self):
         self.assertTrue(BI.APP_BUILD_ID)

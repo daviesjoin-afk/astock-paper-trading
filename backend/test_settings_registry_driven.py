@@ -10,6 +10,7 @@
 - 后端保存语义：显式空 enabled_strategies 合法（零策略 idle 周期）。
 """
 from __future__ import annotations
+import frontend_sources
 
 import os
 import sqlite3
@@ -30,7 +31,7 @@ def _load(path):
 class SettingsRegistryDrivenTests(unittest.TestCase):
     def setUp(self):
         self.index_source = _load(os.path.join(FRONTEND, "index.html"))
-        self.app_source = _load(os.path.join(FRONTEND, "app.js"))
+        self.app_source = frontend_sources.source_text()
 
     def test_index_html_has_no_fixed_five_copy(self):
         for phrase in ("五套策略", "五套模型", "五套账户"):

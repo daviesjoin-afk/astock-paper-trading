@@ -1,0 +1,16 @@
+/* PR-55：样式入口。@import 顺序 = 原 app.css 的行顺序 = 层叠顺序。
+   合并结果应与拆分前的 app.css 等价（由 backend/test_frontend_module_contract.py 校验）。 */
+
+@import "./tokens.css";
+@import "./base.css";
+@import "./layout.css";
+@import "./paper.css";
+@import "./selection.css";
+@import "./paper-desk.css";
+@import "./adaptive.css";
+@import "./console-v5.css";
+@import "./research.css";
+@import "./forms.css";
+@import "./navigation.css";
+@import "./workbench.css";
+@import "./adaptive-light.css";

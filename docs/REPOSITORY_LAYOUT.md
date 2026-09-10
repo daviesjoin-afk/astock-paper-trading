@@ -7,7 +7,8 @@
 
 ```
 backend/            Python 后端：HTTP、策略域、模拟盘域、数据与研究
-frontend/           前端源码（app.js / index.html / index.css）
+frontend/src/       前端源码：ESM 模块（入口 src/app.js + bridge.js + boot.js）
+frontend/styles/    样式片段（styles/index.css 按原顺序 @import）
 frontend/dist/      **构建产物（提交物）**：由 esbuild 打包，服务端直接下发
 docs/               运行手册、设置 PRD、测试矩阵、发布说明、本文件
 docs/archive/       已完成的历史计划与快照（只作追溯）
@@ -76,7 +77,8 @@ cd frontend && node build.mjs      # 生成 dist/app.js、dist/app.css
 ```
 
 CI 会重建并校验一致性；服务端 `/app.js`、`/app.css` 直接下发 `frontend/dist/` 里的文件。
-改 `frontend/app.js` / `index.html` / `index.css` 后**必须重新构建并提交 dist**。
+改 `frontend/src/**` / `frontend/styles/**` / `index.html` 后**必须重新构建并提交 dist**；
+模块地图与依赖概览见 [`frontend/src/README.md`](../frontend/src/README.md)。
 
 ## docs/ 与 docs/archive/
 
