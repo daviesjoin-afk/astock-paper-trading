@@ -1199,7 +1199,8 @@ setInterval(renderClock,1000);
 
 async function loadStrategies(){
   try{
-    var d = await api('/api/strategies');
+    // PR-45：/api/strategies 已归 Strategy Admin（注册表）；扫描页用静态扫描策略专属接口。
+    var d = await api('/api/scanner-strategies');
     var opts = d.strategies.map(function(s){ return '<option value="'+s.id+'" data-desc="'+s.desc+'">'+s.name+' — '+s.desc+'</option>'; }).join('');
     if($('selStrategy')) $('selStrategy').innerHTML = opts;
     $('selStrategy').onchange = function(){
@@ -2023,7 +2024,7 @@ async function loadStrategyRegistry(forceRefresh){
 }
 function renderStrategyRegistry(d){
   var mount=$('strategyRegistryList'); if(!mount) return;
-  var rows=(d.strategies||[]).map(function(s){
+  var rows=(d.items||d.strategies||[]).map(function(s){
     var status=STRATEGY_STATUS_LABELS[s.status]||s.status||'—';
     var actions=[];
     if(s.status==='draft'){ actions.push(['validate','验证']); actions.push(['edit','编辑']); actions.push(['clone','复制']); actions.push(['delete','删除']); }
