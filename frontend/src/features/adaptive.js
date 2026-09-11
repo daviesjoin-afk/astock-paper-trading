@@ -486,7 +486,12 @@ export async function loadEvolutionStatus(){
       var evo=await api('/api/adaptive/evolution/status');
       setEl('aiEvolutionState', evo.should_evolve?'待进化':'稳定');
       var params=evo.current_params||{};
-      setEl('aiParamsVersion', params.id?'#'+params.id+' ('+adaptiveEsc(params.source||'')+')':'默认');
+      /* 待激活候选：候选 != 生效，必须显式激活才改变 runtime */
+      var pendingCount=0;
+      var counts=evo.pending_candidates||{};
+      for(var _pk in counts){ if(Object.prototype.hasOwnProperty.call(counts,_pk)) pendingCount+=Number(counts[_pk]||0); }
+      setEl('aiParamsVersion', (params.id?'#'+params.id+' ('+adaptiveEsc(params.source||'')+')':'默认')
+        +(pendingCount?(' · 待激活 '+pendingCount):''));
       renderEvolutionParams(params.params||{});
       renderEvolutionMetrics(evo.performance_metrics||{});
     }catch(e){
@@ -612,11 +617,13 @@ export function renderEvolutionLog(log){
 }
 
 export async function triggerEvolution(){
-  if(!confirm('确认手动触发一次自进化？')) return;
+  if(!confirm('确认手动触发一次自进化？\n\n注意：进化只生成候选参数，不会立即生效；需要显式激活后才会改变调参边界。')) return;
   try{
     var r=await apiPost('/api/adaptive/evolution/evolve?confirmed=true');
     if(r.evolved){
-      alert('进化完成！调整了 '+((r.changed_keys||[]).length)+' 个参数');
+      alert('已生成进化候选 #'+(r.new_params_id||'-')+'（调整 '+((r.changed_keys||[]).length)+' 个参数）。\n'
+        +'状态：'+(r.validation_state||'candidate')+'\n\n'
+        +'该候选尚未生效，需显式激活后才会改变调参边界。');
     }else{
       alert('无需进化：'+(r.reason||r.metrics?'当前状态稳定':'无数据'));
     }

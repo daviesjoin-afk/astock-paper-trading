@@ -125,16 +125,18 @@ class ValidationTests(unittest.TestCase):
 
 
 class StorageTests(unittest.TestCase):
-    def test_strategy_params_fall_back_to_global_defaults(self):
+    def test_strategy_params_inherit_global_active_when_no_pointer(self):
+        """策略没有专属指针 = 继承全局 active（不是"没有参数"）。"""
         conn = _db()
         SE.init_params(conn)
         state = SE.get_strategy_params(conn, "tq_breakout")
-        self.assertIsNone(state["id"])
-        self.assertEqual("global_default", state["source"])
+        self.assertEqual("__global__", state["inherited_from"])
+        self.assertEqual(SE.get_current_params(conn)["id"], state["id"])
         # 画像边界生效：全局默认 0.03 在做T边界内保持不变。
         self.assertEqual(0.03, state["params"]["max_weight_delta"])
 
-    def test_adjust_and_read_back_strategy_scoped(self):
+    def test_adjust_only_creates_candidate_until_activated(self):
+        """调整先只落地候选；未经显式激活，runtime 参数不变。"""
         conn = _db()
         SE.init_params(conn)
         result = SE.adjust_strategy_params(
@@ -142,6 +144,12 @@ class StorageTests(unittest.TestCase):
             evidence_count=20,
         )
         self.assertTrue(result["adjusted"])
+        self.assertFalse(result["activated"])
+        # 关键：尚未激活 → 策略仍在继承全局 0.03。
+        state = SE.get_strategy_params(conn, "tq_breakout")
+        self.assertEqual(0.03, state["params"]["max_weight_delta"])
+        # 显式激活后才生效。
+        SE.activate_params_candidate(conn, result["new_params_id"], actor="test")
         state = SE.get_strategy_params(conn, "tq_breakout")
         self.assertEqual(0.033, state["params"]["max_weight_delta"])
         # 全局参数不受影响。
@@ -160,13 +168,21 @@ class StorageTests(unittest.TestCase):
         self.assertTrue(any(item["event_type"] == "strategy_adjust_rejected"
                             for item in log))
 
-    def test_rollback_restores_previous_version(self):
+    def test_rollback_restores_previous_activated_version(self):
+        """回滚目标来自激活历史：回到上一次**生效**的版本。"""
         conn = _db()
         SE.init_params(conn)
+        first = SE.adjust_strategy_params(conn, "trend_pullback",
+                                          {"max_weight_delta": 0.032},
+                                          evidence_count=20)
+        SE.activate_params_candidate(conn, first["new_params_id"], actor="test")
+        second = SE.adjust_strategy_params(conn, "trend_pullback",
+                                           {"max_weight_delta": 0.034},
+                                           evidence_count=20)
+        SE.activate_params_candidate(conn, second["new_params_id"], actor="test")
+        # 再插一条从未激活、id 最大的候选：回滚绝不能落到它身上。
         SE.adjust_strategy_params(conn, "trend_pullback",
-                                  {"max_weight_delta": 0.032}, evidence_count=20)
-        SE.adjust_strategy_params(conn, "trend_pullback",
-                                  {"max_weight_delta": 0.034}, evidence_count=20)
+                                  {"max_weight_delta": 0.036}, evidence_count=20)
         rollback = SE.rollback_strategy_params(conn, "trend_pullback")
         self.assertTrue(rollback["rolled_back"])
         state = SE.get_strategy_params(conn, "trend_pullback")
@@ -175,16 +191,28 @@ class StorageTests(unittest.TestCase):
     def test_noop_adjustment_creates_no_version(self):
         conn = _db()
         SE.init_params(conn)
-        SE.adjust_strategy_params(conn, "trend_pullback",
-                                  {"max_weight_delta": 0.032}, evidence_count=20)
+        first = SE.adjust_strategy_params(conn, "trend_pullback",
+                                          {"max_weight_delta": 0.032},
+                                          evidence_count=20)
+        SE.activate_params_candidate(conn, first["new_params_id"], actor="test")
+        # 与生效值同值 → 无变化，不落新版本。
         result = SE.adjust_strategy_params(conn, "trend_pullback",
                                            {"max_weight_delta": 0.032},
                                            evidence_count=20)
         self.assertFalse(result["adjusted"])
         self.assertEqual("无变化", result["reason"])
-        # 重复版本不存在 → 回滚直接命中上一真实版本。
-        SE.adjust_strategy_params(conn, "trend_pullback",
-                                  {"max_weight_delta": 0.034}, evidence_count=20)
+        # 已有等价的待激活候选 → 不重复落版本。
+        pending = SE.adjust_strategy_params(conn, "trend_pullback",
+                                            {"max_weight_delta": 0.034},
+                                            evidence_count=20)
+        self.assertTrue(pending["adjusted"])
+        duplicate = SE.adjust_strategy_params(conn, "trend_pullback",
+                                              {"max_weight_delta": 0.034},
+                                              evidence_count=20)
+        self.assertFalse(duplicate["adjusted"])
+        self.assertEqual(pending["new_params_id"], duplicate["existing_params_id"])
+        # 激活后回滚 → 回到上一真实版本（不是第二新行）。
+        SE.activate_params_candidate(conn, pending["new_params_id"], actor="test")
         SE.rollback_strategy_params(conn, "trend_pullback")
         state = SE.get_strategy_params(conn, "trend_pullback")
         self.assertEqual(0.032, state["params"]["max_weight_delta"])
@@ -192,9 +220,13 @@ class StorageTests(unittest.TestCase):
     def test_rollback_single_version_restores_inherited_global_baseline(self):
         conn = _db()
         SE.init_params(conn)
-        SE.manual_adjust(conn, {"confidence_threshold": 80}, reason="全局先调整")
-        SE.adjust_strategy_params(conn, "tq_breakout",
-                                  {"max_weight_delta": 0.033}, evidence_count=20)
+        manual = SE.manual_adjust(conn, {"confidence_threshold": 80},
+                                  reason="全局先调整")
+        SE.activate_params_candidate(conn, manual["new_params_id"], actor="test")
+        scoped = SE.adjust_strategy_params(conn, "tq_breakout",
+                                           {"max_weight_delta": 0.033},
+                                           evidence_count=20)
+        SE.activate_params_candidate(conn, scoped["new_params_id"], actor="test")
         SE.rollback_strategy_params(conn, "tq_breakout")
         state = SE.get_strategy_params(conn, "tq_breakout")
         # 回落的是继承时的全局基线（confidence=80），不是出厂默认 70。
@@ -206,6 +238,10 @@ class StorageTests(unittest.TestCase):
         SE.init_params(conn)
         result = SE.manual_adjust(conn, {"confidence_threshold": 72}, reason="test")
         self.assertTrue(result["adjusted"])
+        # 人工调整同样只生成候选，必须显式激活。
+        self.assertFalse(result["activated"])
+        self.assertEqual(70, SE.get_current_params(conn)["params"]["confidence_threshold"])
+        SE.activate_params_candidate(conn, result["new_params_id"], actor="test")
         self.assertEqual(72, SE.get_current_params(conn)["params"]["confidence_threshold"])
         # 策略画像的锁定参数约束只作用于策略级路径。
         rejected = SE.adjust_strategy_params(

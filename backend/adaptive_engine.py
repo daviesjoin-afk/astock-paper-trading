@@ -3305,11 +3305,23 @@ def evolution_status_fn():
         return self_evolution.evolution_status(conn)
 
 
-def get_evolution_params_fn():
-    """获取当前进化参数。"""
+def get_evolution_params_fn(strategy_id=None):
+    """进化参数生命周期读模型。
+
+    明确区分 **当前生效（active 指针）**、**最新候选**（可能从未生效）、
+    **待激活候选**（已校验但未批准），并附上激活历史。
+    """
     with _connect() as conn:
         self_evolution.ensure_schema(conn)
-        return self_evolution.get_current_params(conn)
+        return self_evolution.lifecycle_view(conn, strategy_id)
+
+
+def activate_evolution_candidate_fn(params_id, actor, reason=None):
+    """显式激活一个已校验的候选 —— 唯一改变 runtime 参数的入口。"""
+    with _connect() as conn:
+        self_evolution.ensure_schema(conn)
+        return self_evolution.activate_params_candidate(
+            conn, params_id, actor=actor, reason=reason)
 
 
 def update_evolution_params_fn(adjustments, reason="manual"):

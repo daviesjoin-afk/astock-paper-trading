@@ -10,6 +10,7 @@ from fastapi import APIRouter, HTTPException, Query
 
 import adaptive_engine as adaptive
 import adaptive_learning_dispatch as learning_dispatch
+import self_evolution as SE
 
 
 router = APIRouter(prefix="/api/adaptive", tags=["adaptive-learning"])
@@ -710,20 +711,55 @@ def evolution_status():
 
 
 @router.get("/evolution/params")
-def evolution_params():
+def evolution_params(strategy_id: str = Query(None, max_length=100)):
+    """读模型：显式区分 当前生效 / 最新候选 / 待激活候选。
+
+    旧接口只回一行"当前参数"，无法分辨它到底是**生效版本**还是
+    **刚插入的候选**。这里把三者分开返回。
+    """
     try:
-        return adaptive.get_evolution_params_fn()
+        return adaptive.get_evolution_params_fn(strategy_id)
+    except SE.EvolutionLifecycleError as exc:
+        # 指针损坏：绝不回落 latest row，直接暴露故障。
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"获取进化参数失败：{type(exc).__name__}") from exc
 
 
 @router.post("/evolution/evolve")
 def trigger_evolution(confirmed: bool = Query(False)):
+    """触发一次进化 —— 只**生成候选**，不激活。"""
     _require_confirmation(confirmed, "执行自进化")
     try:
         return adaptive.trigger_evolution_fn()
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"执行进化失败：{type(exc).__name__}") from exc
+
+
+@router.post("/evolution/activate")
+def activate_evolution_candidate(
+    params_id: int = Query(..., ge=1, description="要激活的候选参数版本 id"),
+    confirmed: bool = Query(False),
+    reason: str = Query(None, max_length=200),
+):
+    """显式激活一个已校验的候选：这是**唯一**能把候选变成 runtime 参数的入口。
+
+    激活前仍要过 stale CAS —— 若候选创建时的基线已不是当前生效版本，
+    返回 409，绝不静默 rebase 或覆盖。
+    """
+    _require_confirmation(confirmed, f"激活候选参数 #{params_id}")
+    try:
+        return adaptive.activate_evolution_candidate_fn(
+            params_id, _MANUAL_ACTOR, reason=reason)
+    except SE.CandidateNotFound as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except SE.EvolutionCandidateError as exc:
+        # 未通过校验 / 已被拒绝 / 基线过期 / 并发推进：一律 409。
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except SE.EvolutionLifecycleError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"激活候选失败：{type(exc).__name__}") from exc
 
 
 @router.get("/evolution/metrics")
