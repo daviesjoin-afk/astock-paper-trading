@@ -38,6 +38,7 @@ import datetime as dt
 import json
 import math
 
+import factor_units as FU
 import paper_repository as PRP
 
 __all__ = [
@@ -71,14 +72,18 @@ _TOLERANCE = 1e-12
 
 
 def canonical_mom5_min_fraction():
-    """canonical 目标值的**唯一来源**：PR #107 的代码默认值。
+    """canonical 目标值的**唯一来源**：固定单位契约，而非当前策略默认值。
 
-    刻意从 ``strategies.PAPER_CONDITION_DEFAULTS`` 读取而不是再硬编码一个
-    ``0.02``，避免出现第二个事实源。``strategies`` 依赖 pandas，故延迟导入。
+    ``2.0`` 是历史 bug 的签名（错误的 percentage points，本意 +2%），canonical 值由
+    :func:`factor_units.pct_points_to_fraction` 按 ``1 pct point == 0.01`` 的**固定契约**
+    换算得出（``2.0 -> 0.02``）。
+
+    刻意**不**从 ``strategies.PAPER_CONDITION_DEFAULTS`` 读取：历史迁移的语义必须锚定在
+    单位契约上。若锚定当前默认值，将来一次无关的默认值调整（例如改成 ``0.03``）就会悄然
+    改变这条迁移的结果，让同一份历史数据在不同版本下迁出不同值。``factor_units`` 是纯
+    标准库模块，因此本模块也彻底摆脱了 ``strategies`` 的 pandas 依赖。
     """
-    import strategies as S
-
-    return float(S.PAPER_CONDITION_DEFAULTS[SENTIMENT_PIONEER_MODEL][MOM5_MIN_FIELD])
+    return FU.pct_points_to_fraction(LEGACY_MOM5_MIN_PCT_POINTS)
 
 
 def is_exact_legacy_mom5_min(value):

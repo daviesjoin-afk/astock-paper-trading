@@ -12,6 +12,7 @@
 （``sentiment_pioneer.conditions.individual_mom5_min == 2.0``）。
 其它任何值（``0.025`` / ``2.1`` / ``"2.0"`` / ``True``）一律保持原样。
 """
+import ast
 import copy
 import json
 import os
@@ -22,11 +23,17 @@ import unittest
 import adaptive_selection as A
 import adaptive_selection_compat as C
 import db_migrate
+import factor_units as FU
 import paper_trading as PT
 import strategies as S
 
+BACKEND = os.path.dirname(os.path.abspath(__file__))
+COMPAT_SRC = os.path.join(BACKEND, "adaptive_selection_compat.py")
+
 CANONICAL = 0.02
 LEGACY = 2.0
+SENTIMENT_PIONEER = "sentiment_pioneer"
+MOM5_MIN_FIELD = "individual_mom5_min"
 NOW = "2026-09-11 09:30:00"
 
 _SENTIMENT_WEIGHTS = {"sentiment": 0.40, "flow": 0.25, "mom_short": 0.20, "volsurge": 0.15}
@@ -328,11 +335,54 @@ class PureNormalizationTests(unittest.TestCase):
         self.assertEqual(normalized, _expected_after_migration(params))
         self.assertEqual(params["adaptive_selection"]["conditions"]["individual_mom5_min"], LEGACY)
 
-    def test_a12_canonical_target_comes_from_pr107_defaults(self):
-        self.assertEqual(C.canonical_mom5_min_fraction(), CANONICAL)
+    def test_a12_canonical_target_comes_from_the_fixed_unit_contract(self):
+        # 目标值来自**固定单位契约**（1 pct point == 0.01），而不是"当前策略默认值"：
+        # 默认值日后若被改动，这条历史迁移的语义不应随之漂移。
+        self.assertEqual(C.LEGACY_MOM5_MIN_PCT_POINTS, LEGACY)
         self.assertEqual(
-            S.PAPER_CONDITION_DEFAULTS["sentiment_pioneer"]["individual_mom5_min"], CANONICAL,
+            FU.pct_points_to_fraction(C.LEGACY_MOM5_MIN_PCT_POINTS), CANONICAL,
         )
+        self.assertEqual(C.canonical_mom5_min_fraction(), CANONICAL)
+
+    def test_a13_target_does_not_follow_a_changed_strategy_default(self):
+        """即使策略默认值被临时改成 0.03，历史 2.0 仍必须迁成 0.02。
+
+        迁移锚定固定单位契约；一次无关的默认值调整不得绑架历史数据的迁移结果。
+        """
+        default = S.PAPER_CONDITION_DEFAULTS[SENTIMENT_PIONEER][MOM5_MIN_FIELD]
+        try:
+            S.PAPER_CONDITION_DEFAULTS[SENTIMENT_PIONEER][MOM5_MIN_FIELD] = 0.03
+            normalized, details = self._normalize(_legacy_overlay())
+            self.assertEqual(
+                normalized["conditions"][MOM5_MIN_FIELD], CANONICAL,
+                "历史 2.0 必须仍按单位契约迁成 0.02，而不是跟随被改动的默认值",
+            )
+            self.assertEqual(len(details), 1)
+            self.assertEqual(details[0]["new_value"], CANONICAL)
+        finally:
+            S.PAPER_CONDITION_DEFAULTS[SENTIMENT_PIONEER][MOM5_MIN_FIELD] = default
+
+    def test_a14_compat_module_does_not_read_live_strategy_defaults(self):
+        """窄 AST 守卫：兼容层的迁移目标必须锚定 ``factor_units`` 单位契约。
+
+        只要兼容层还 import ``strategies`` 或引用 ``PAPER_CONDITION_DEFAULTS``，
+        一次无关的默认值调整就能改变历史迁移结果 —— 这正是要禁止的耦合。
+        """
+        with open(COMPAT_SRC, encoding="utf-8") as handle:
+            tree = ast.parse(handle.read())
+
+        imported = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                imported.update(alias.name.split(".")[0] for alias in node.names)
+            elif isinstance(node, ast.ImportFrom) and node.module:
+                imported.add(node.module.split(".")[0])
+
+        self.assertNotIn("strategies", imported, "迁移目标不得取自当前策略默认值")
+        self.assertIn("factor_units", imported, "迁移目标必须经单位契约换算")
+        referenced = {node.id for node in ast.walk(tree) if isinstance(node, ast.Name)}
+        referenced |= {node.attr for node in ast.walk(tree) if isinstance(node, ast.Attribute)}
+        self.assertNotIn("PAPER_CONDITION_DEFAULTS", referenced)
 
 
 # --------------------------------------------------------------------------
