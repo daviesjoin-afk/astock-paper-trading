@@ -37,6 +37,7 @@ import paper_archive_projection as PAP
 import paper_quote_policy as PQP
 import paper_allocation as PA
 import paper_cycle_service as PCS
+import adaptive_selection_compat as ASC
 import entry_lifecycle as ELC
 import execution_dispatch as EPD
 import portfolio_coordinator as PCO
@@ -8482,6 +8483,43 @@ def _entry_execution_scale(market_policy, entry_model, chase_entry, dynamic_news
     return max(0.0, min(scale, 1.0))
 
 
+_LEGACY_UNIT_WARNED = set()
+
+
+def _normalize_selection_conditions(conditions, model_family, account_id=None):
+    """Layer C（PR-1.1）：读路径的**内存级** legacy 单位归一化。
+
+    持久化迁移由 ``db_migrate`` v10 负责；这里只是 fail-safe：即使迁移因环境原因
+    还没跑，策略也不会继续拿着 +200% 的阈值去跑一条永远不成立的分支。
+
+    严格约束：
+    - **绝不写数据库**（只改传出去的副本）；
+    - 只修已证实的 legacy sentinel（``individual_mom5_min == 2.0`` 且 model 为
+      ``sentiment_pioneer``）；``2.1`` / ``0.025`` / ``"2.0"`` 等一律原样保留，
+      也不会抛异常——一个可疑的排序参数不允许拖垮持仓保护性退出。
+    """
+    if not isinstance(conditions, dict):
+        return {}
+    normalized, details = ASC.normalize_legacy_conditions(
+        conditions, model_family=model_family,
+    )
+    for detail in details:
+        key = (str(account_id), detail["field"])
+        if key in _LEGACY_UNIT_WARNED:
+            continue
+        _LEGACY_UNIT_WARNED.add(key)
+        # 有界告警：每个账户每字段每次进程只打一次，避免刷日志。
+        print(json.dumps({
+            "alarm": "legacy_selection_unit_normalized",
+            "account_id": str(account_id),
+            "field": detail["field"],
+            "old_value": detail["old_value"],
+            "new_value": detail["new_value"],
+            "note": "读路径内存级归一化（未写库）；持久化由 db_migrate v10 完成",
+        }, ensure_ascii=False), flush=True)
+    return normalized
+
+
 def _adaptive_selection(account, asof_day=None):
     """Return a bounded paper-only ranking overlay once it is active."""
     params = _loads(account.get("params"), {})
@@ -8505,10 +8543,13 @@ def _adaptive_selection(account, asof_day=None):
     expected = set(S.PAPER_WEIGHTS.get(model_family, {}))
     if set(weights) != expected:
         weights = {}
-    conditions = overlay.get("conditions") or {}
+    # Layer C：读路径内存级归一化（不写库），确保 stale overlay 不会继续生效。
+    conditions = _normalize_selection_conditions(
+        overlay.get("conditions") or {}, model_family, account.get("id"),
+    )
     return {
         "weights": weights,
-        "conditions": conditions if isinstance(conditions, dict) else {},
+        "conditions": conditions,
         "model_family": model_family,
         "entry_paths": overlay.get("entry_paths") or {"normal": True},
         "mutation_type": overlay.get("mutation_type") or "none",

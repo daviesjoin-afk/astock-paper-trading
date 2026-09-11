@@ -16,6 +16,7 @@ import os
 import sqlite3
 import sys
 
+import adaptive_selection_compat as selection_compat
 import paper_schema_migrations as paper_schema
 import strategy_registry
 
@@ -52,6 +53,13 @@ MIGRATIONS = {
         (7, "新增可执行策略 DSL 定义字段", strategy_registry.ensure_schema),
         (8, "新增订单重试血缘字段 retry_of_order_id", paper_schema.ensure_order_lineage_column),
         (9, "新增风险放大提案生命周期字段", paper_schema.ensure_proposal_lifecycle_columns),
+        # PR-1.1：PR #107 修好了代码默认值（individual_mom5_min 2.0 -> 0.02），
+        # 但历史自进化 overlay 已把旧的 percentage-point 值持久化进
+        # paper_accounts.params，运行时会覆盖代码默认值。这里做一次性数据兼容
+        # 迁移：只修 sentiment_pioneer 且恰为 2.0 的情形，同事务写 audit。
+        # 幂等由 schema_version 保证；重复启动 migrated=0 且不产生重复 audit。
+        (10, "迁移 legacy 选股动量 overlay 单位（2.0 -> 0.02）",
+         selection_compat.migrate_legacy_selection_units),
     ],
     "adaptive_learning": [
         (1, "创建 schema_version 表", """
