@@ -150,7 +150,7 @@ def _seed_market(tmp: str) -> None:
         frame = _synthetic_kline(code)
         dfc.save_kline(code, frame)
         stocks.append({
-            "code": code, "name": NAMES[code], "board": "主板",
+            "code": code, "name": NAMES.get(code, code), "board": "主板",
             "risk_flag": 0, "snapshot_tradable": True, "listing_status": "listed",
             "price": LAST_CLOSE[code], "pct": 0.6, "industry": INDUSTRY,
         })
@@ -585,14 +585,29 @@ class ProductionPathGoldenReplayTests(OfflinePaperEnv, unittest.TestCase):
                 evidence_count=20, now=now - dt.timedelta(days=5),
             )
             self.assertTrue(opened.get("opened"), opened)
-            SCM.run_shadow_counterfactual(
-                paper, STRATEGY_ID,
-                {"asof": D1.isoformat(), "600901": {"close": LAST_CLOSE["600901"]}},
-                self._counterfactual_output(pnl=1000.0, nav=CAPITAL + 1000.0),
-                self._counterfactual_output(pnl=2000.0, nav=CAPITAL + 2000.0),
-                observed_at=now - dt.timedelta(days=1),
-            )
-            result = SCM.promote_challenger(paper, evo, STRATEGY_ID)
+            champion_nav = CAPITAL
+            challenger_nav = CAPITAL
+            for i in range(12):
+                if i:
+                    champion_nav *= 1.001
+                    challenger_nav *= 1.0016
+                day_offset = (i * 4) // 11
+                observed = (
+                    now - dt.timedelta(days=4 - day_offset, hours=1)
+                    + dt.timedelta(minutes=i)
+                )
+                recorded = SCM.run_shadow_counterfactual(
+                    paper, STRATEGY_ID,
+                    {
+                        "asof": observed.date().isoformat(), "seq": i,
+                        "600901": {"close": LAST_CLOSE["600901"] + i / 100},
+                    },
+                    self._counterfactual_output(pnl=1000.0, nav=champion_nav),
+                    self._counterfactual_output(pnl=2000.0, nav=challenger_nav),
+                    observed_at=observed,
+                )
+                self.assertTrue(recorded.get("recorded"), recorded)
+            result = SCM.promote_challenger(paper, evo, STRATEGY_ID, now=now)
             self.assertTrue(result.get("promoted"), result)
             # 晋升推进的是进化参数头（active runtime checksum/version），
             # 注册库 definition 版本只在保存 DSL/定义时递增。

@@ -12,6 +12,8 @@ import hashlib
 import json
 from typing import Any, Mapping
 
+import promotion_science as PS
+
 __all__ = [
     "STRATEGY_CHAMPION_VERSION", "ROLE_CHAMPION", "ROLE_CHALLENGER",
     "STATUS_SHADOW", "STATUS_READY", "STATUS_PROMOTED", "STATUS_ROLLED_BACK",
@@ -21,7 +23,7 @@ __all__ = [
     "rollback_challenger", "run_shadow_context", "run_shadow_counterfactual",
 ]
 
-STRATEGY_CHAMPION_VERSION = "strategy-champion-v3"
+STRATEGY_CHAMPION_VERSION = "strategy-champion-v4"
 ROLE_CHAMPION = "champion"
 ROLE_CHALLENGER = "challenger"
 STATUS_SHADOW = "shadow"
@@ -373,7 +375,7 @@ def _counterfactual_snapshots(conn, challenger_id: int, role: str, since: str, u
 
 
 def evaluate_challenger(paper_conn, evo_conn, strategy_id: str, *, now: dt.datetime | None = None) -> dict[str, Any]:
-    """Compare only same-period rows carrying identical market snapshot checksums."""
+    """Evaluate operational metrics plus paired post-proposal OOS evidence."""
     challenger = _latest(paper_conn, strategy_id, ROLE_CHALLENGER, (STATUS_SHADOW,))
     if challenger is None:
         ready = _latest(paper_conn, strategy_id, ROLE_CHALLENGER, (STATUS_READY,))
@@ -387,15 +389,58 @@ def evaluate_challenger(paper_conn, evo_conn, strategy_id: str, *, now: dt.datet
     challenger_snapshots = _counterfactual_snapshots(paper_conn, challenger["id"], ROLE_CHALLENGER, since, until)
     if not champion_snapshots or champion_snapshots != challenger_snapshots:
         return {"evaluated": False, "challenger_id": int(challenger["id"]), "reason": "缺少同期间同快照的 Champion/Challenger counterfactual 账本"}
+
+    science = PS.evaluate_promotion_evidence(paper_conn, int(challenger["id"]), since, until)
+    if not science.get("evaluable"):
+        preliminary = {
+            "promotable": False,
+            "scientific_gate": science,
+            "promotion_gate_version": PS.PROMOTION_SCIENCE_VERSION,
+            "counterfactual_snapshot_checksums": sorted(champion_snapshots),
+            "version": STRATEGY_CHAMPION_VERSION,
+        }
+        paper_conn.execute(
+            "UPDATE strategy_champion_versions SET decision=? WHERE id=?",
+            (_json_dumps(preliminary), challenger["id"]),
+        )
+        paper_conn.commit()
+        return {
+            "evaluated": False,
+            "status": STATUS_SHADOW,
+            "challenger_id": int(challenger["id"]),
+            "reason": science.get("reason") or "科学晋升证据不足",
+            "scientific_gate": science,
+            "version": STRATEGY_CHAMPION_VERSION,
+        }
+
     champion_metrics = collect_shadow_ledger_metrics(paper_conn, challenger["id"], ROLE_CHAMPION, since, until)
     challenger_metrics = collect_shadow_ledger_metrics(paper_conn, challenger["id"], ROLE_CHALLENGER, since, until)
     decision = compare_for_promotion(champion_metrics, challenger_metrics)
+    operational_ok = bool(decision["promotable"])
+    decision["scientific_gate"] = science
+    decision["promotion_gate_version"] = PS.PROMOTION_SCIENCE_VERSION
     decision["counterfactual_snapshot_checksums"] = sorted(champion_snapshots)
+    decision["promotable"] = operational_ok and bool(science.get("promotable"))
+    if not science.get("promotable"):
+        decision.setdefault("failed", []).append("科学晋升门禁")
     status = STATUS_READY if decision["promotable"] else STATUS_ROLLED_BACK
     paper_conn.execute("UPDATE strategy_champion_versions SET status=?,evaluated_at=?,metrics=?,decision=? WHERE id=?",
                        (status, until, _json_dumps({"champion": champion_metrics, "challenger": challenger_metrics}), _json_dumps(decision), challenger["id"]))
     paper_conn.commit()
-    return {"evaluated": True, "challenger_id": int(challenger["id"]), "decision": decision, "champion_metrics": champion_metrics, "challenger_metrics": challenger_metrics, "status": status, "version": STRATEGY_CHAMPION_VERSION}
+    return {"evaluated": True, "challenger_id": int(challenger["id"]), "decision": decision, "champion_metrics": champion_metrics, "challenger_metrics": challenger_metrics, "scientific_gate": science, "status": status, "version": STRATEGY_CHAMPION_VERSION}
+
+
+def _verify_ready_science(paper_conn, challenger: Mapping[str, Any]) -> dict[str, Any]:
+    decision = _json_loads(challenger.get("decision"))
+    if not isinstance(decision, Mapping) or not decision.get("promotable"):
+        return {"valid": False, "reason": "Challenger 没有可验证的 promotable 决策"}
+    if decision.get("promotion_gate_version") != PS.PROMOTION_SCIENCE_VERSION:
+        return {"valid": False, "reason": "READY Challenger 缺少当前科学晋升门禁版本"}
+    science = decision.get("scientific_gate")
+    verified = PS.verify_promotion_evidence(paper_conn, int(challenger["id"]), science)
+    if not verified.get("valid"):
+        return verified
+    return {"valid": True, "scientific_gate": verified.get("current")}
 
 
 def promote_challenger(paper_conn, evo_conn, strategy_id: str, *, now: dt.datetime | None = None) -> dict[str, Any]:
@@ -412,16 +457,16 @@ def promote_challenger(paper_conn, evo_conn, strategy_id: str, *, now: dt.dateti
         challenger = _latest(paper_conn, strategy_id, ROLE_CHALLENGER, (STATUS_READY,))
         if challenger is None:
             return {"promoted": False, "reason": "晋升门禁未通过，Challenger 已结束"}
+
+    science_check = _verify_ready_science(paper_conn, challenger)
+    if not science_check.get("valid"):
+        return {"promoted": False, "reason": "科学晋升证据校验失败：" + str(science_check.get("reason") or "unknown")}
+
     active = active_runtime_checksum(evo_conn, strategy_id)
     if active["checksum"] != challenger.get("base_checksum"):
         return {"promoted": False, "reason": "Champion 参数头已变化，拒绝过期 Challenger 晋升"}
     candidate = _json_loads(challenger["params"])
     diffs = {key: value for key, value in candidate.items() if active["params"].get(key) != value}
-    # PR-33：晋升是唯一可以申报 Challenger 胜出的路径（challenger_win=True），
-    # 风险方向参数仍需满足证据 + 观察期 + 单轮上限，缺一不可。
-    #
-    # 晋升现在分两步：先生成候选，再显式激活。激活仍要过 stale CAS ——
-    # 若参数头在候选生成期间被别处推动，这里拒绝而不是覆盖。
     created = SE.adjust_strategy_params(
         evo_conn, strategy_id, diffs, reason="challenger_promotion",
         source="challenger_promotion", evidence_count=challenger.get("evidence_count"),
@@ -435,8 +480,6 @@ def promote_challenger(paper_conn, evo_conn, strategy_id: str, *, now: dt.dateti
             reason="Challenger 胜出晋升",
         )
     except (SE.EvolutionCandidateError, SE.ActivationSideEffectFailed) as exc:
-        # 副作用闭环失败时激活已被整笔回滚，所以这里同样是"没晋升成"，
-        # 而不是让异常冒出去变成 500。重试是安全的。
         return {"promoted": False, "reason": f"晋升候选无法激活（{exc}）"}
     after = active_runtime_checksum(evo_conn, strategy_id)
     if after["checksum"] != _checksum(candidate):
@@ -448,7 +491,7 @@ def promote_challenger(paper_conn, evo_conn, strategy_id: str, *, now: dt.dateti
                           VALUES(?,?,?,?,?,?,?,?,?)""",
                        (str(strategy_id), ROLE_CHAMPION, _json_dumps(candidate), after["version_id"], after["checksum"], "promotion", STATUS_PROMOTED, now_text, now_text))
     paper_conn.commit()
-    return {"promoted": True, "strategy_id": str(strategy_id), "challenger_id": int(challenger["id"]), "params": candidate, "active_parameter_version_id": after["version_id"], "active_runtime_checksum": after["checksum"], "version": STRATEGY_CHAMPION_VERSION}
+    return {"promoted": True, "strategy_id": str(strategy_id), "challenger_id": int(challenger["id"]), "params": candidate, "active_parameter_version_id": after["version_id"], "active_runtime_checksum": after["checksum"], "scientific_gate": science_check.get("scientific_gate"), "version": STRATEGY_CHAMPION_VERSION}
 
 
 def rollback_challenger(paper_conn, evo_conn, strategy_id: str, reason: str = "manual_rollback") -> dict[str, Any]:
