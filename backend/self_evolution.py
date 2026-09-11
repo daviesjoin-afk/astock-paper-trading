@@ -42,6 +42,7 @@ CandidateStale = EA.CandidateStale
 CandidateRejected = EA.CandidateRejected
 CandidateTampered = EA.CandidateTampered
 ActivationConflict = EA.ActivationConflict
+ActivationSideEffectFailed = EA.ActivationSideEffectFailed
 
 # ─── 进化参数默认值 ───
 EVOLUTION_VERSION = "self-evolution-v1"

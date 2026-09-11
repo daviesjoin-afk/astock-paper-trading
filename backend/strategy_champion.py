@@ -434,7 +434,9 @@ def promote_challenger(paper_conn, evo_conn, strategy_id: str, *, now: dt.dateti
             evo_conn, created["new_params_id"], actor="challenger_promotion",
             reason="Challenger 胜出晋升",
         )
-    except SE.EvolutionCandidateError as exc:
+    except (SE.EvolutionCandidateError, SE.ActivationSideEffectFailed) as exc:
+        # 副作用闭环失败时激活已被整笔回滚，所以这里同样是"没晋升成"，
+        # 而不是让异常冒出去变成 500。重试是安全的。
         return {"promoted": False, "reason": f"晋升候选无法激活（{exc}）"}
     after = active_runtime_checksum(evo_conn, strategy_id)
     if after["checksum"] != _checksum(candidate):
