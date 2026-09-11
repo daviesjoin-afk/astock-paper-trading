@@ -14,6 +14,11 @@ import { test, expect, uniqueId, openWorkbench, createDraftViaUi, apiJson } from
 const PREFIX = "e2e_route";
 
 test.describe("策略深链接路由", () => {
+  // PR-2：这些旅程会触发受保护写接口，因此先走真实 UI 解锁本标签页
+  // （不预注入凭据——解锁流程本身也要被测到）。
+  test.use({ operatorUnlocked: true });
+
+
   test("A. 直接加载 /#strategies/{id} 即渲染该策略详情", async ({ page }) => {
     const id = uniqueId(PREFIX);
     await openWorkbench(page);

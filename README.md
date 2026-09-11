@@ -261,7 +261,33 @@ GitHub Actions 会在 **Python 3.11 / 3.12** 上安装锁定依赖并执行后�
 
 ## Docker
 
-当前本地 Compose 的 `8600:8600` 映射会监听所有网卡。个人使用建议先改为 `127.0.0.1:8600:8600`。应用尚无完整内置鉴权，服务器访问须配置访问控制和认证；`confirmed=true` 仅防误触。
+本地 Compose 只把宿主端口绑定到环回地址（`127.0.0.1:8600:8600`），容器内部 Uvicorn 仍监听 `0.0.0.0` 以配合端口发布、健康检查与反代。
+
+HTTP 控制面有统一的操作员边界（PR-2）：`POST`/`PUT`/`PATCH`/`DELETE` 需要 operator
+凭据，`GET` 只读、无需凭据。三种模式：
+
+- **未配置 token**（local-only）：仅"本机环回地址 + 本地 `Host`"可写，其余写请求
+  `403`（`Host` 必须是 `localhost` 或环回 IP 字面量，用以挡住 DNS rebinding）；
+- **配置合法 token**（>= 24 字符，authenticated）：任何客户端的写请求都必须带
+  标准 Authorization 头（Bearer 方案，值形如「Bearer <凭据>」），localhost 无豁免；
+- **token 非法**（misconfigured）：所有写请求 `503`。
+
+**使用自定义主机名（内网域名等）必须配置 token**，让边界进入 authenticated 模式。
+反向代理转发 `Host` 时必须保留 `host:port`（nginx 用 `$http_host`，不要用会丢端口的
+`$host`），否则浏览器 `Origin` 里的端口与后端推断的默认端口不一致，合法的同源写请求
+会被判 `cross-origin` → `403`。
+
+**不存在关闭边界的开关。** 先准备密钥：
+
+```bash
+# 生成强随机 token（>= 24 字符），写入 .env（已被 gitignore，勿提交）
+python -c "import secrets; print('ASTOCK_OPERATOR_TOKEN=' + secrets.token_urlsafe(32))" >> .env
+```
+
+浏览器端不需要手工操作：打开看板 → **设置中心 → 操作员授权** → 粘贴凭据 →
+点「本标签页解锁」。凭据只保存在该标签页的 `sessionStorage`，关闭标签页即失效；
+写操作会自动带上标准 Authorization 头（Bearer 方案），只读请求绝不携带。细节见
+[`SECURITY.md`](SECURITY.md)。
 
 ```bash
 docker compose up -d --build

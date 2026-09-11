@@ -25,6 +25,11 @@ async function checksumOf(page, id) {
 }
 
 test.describe("Journey 2 — 生命周期", () => {
+  // PR-2：这些旅程会触发受保护写接口，因此先走真实 UI 解锁本标签页
+  // （不预注入凭据——解锁流程本身也要被测到）。
+  test.use({ operatorUnlocked: true });
+
+
   test("draft → validated → active → paused → resumed → retiring → archived", async ({ page }) => {
     const id = uniqueId(PREFIX);
     await openWorkbench(page);

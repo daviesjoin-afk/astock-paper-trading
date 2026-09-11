@@ -6,11 +6,19 @@ services:
     image: astock-codex:latest
     restart: unless-stopped
     ports:
-      - "8600:8600"
+      # PR-2：只绑定环回地址。默认的 "8600:8600" 会让宿主所有网卡都能访问
+      # HTTP 控制面（含未认证的写接口）。绑定 127.0.0.1 后，只有本机能连，
+      # 需要对外时由运维层显式加反向代理 + 网络 ACL + operator token。
+      - "127.0.0.1:8600:8600"
     environment:
       TZ: Asia/Shanghai
       PYTHONUNBUFFERED: "1"
       PYTHONDONTWRITEBYTECODE: "1"
+      # PR-2：**不在此声明 ASTOCK_OPERATOR_TOKEN**。开发者需要凭据时按项目
+      # 现有方式提供（`docker compose --env-file .env`、env_file 或本地
+      # environment override）。刻意避免 `ASTOCK_OPERATOR_TOKEN: "${...:-}"`：
+      # 那会把宿主未导出的空串注入容器，虽然空串被正确归类为 UNSET
+      # （local-only），但会让"我明明导出了 token"变得难以排查。
       # Standalone clones need an in-process scheduler. Set this to 0 when a
       # host scheduler is configured and owns every paper-trading slot.
       ASTOCK_ENABLE_FALLBACK_THREADS: "${ASTOCK_ENABLE_FALLBACK_THREADS:-1}"

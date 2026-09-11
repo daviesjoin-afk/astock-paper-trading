@@ -26,6 +26,7 @@ import linkage as L
 import paper_trading as P
 import selection_tracking as ST
 import metrics as MET
+import operator_auth
 from fastapi.exception_handlers import request_validation_exception_handler
 from fastapi.exceptions import RequestValidationError
 from api_paper import risk_refresh_status, router as paper_router
@@ -501,6 +502,91 @@ app.include_router(paper_router)
 app.include_router(adaptive_router)
 app.include_router(settings_router)
 app.include_router(strategies_router)
+
+
+# ─── PR-2：HTTP 操作员安全边界（Operator Security Boundary）───────────────
+# 统一入口在 operator_auth 模块；这里只做"取 Request 信息 → 调 operator_auth →
+# 按 Decision 返回 → call_next"这一件事。**不在本文件复制** Bearer parser /
+# Origin parser / IP parser / token 校验逻辑。
+#
+# 为什么用全局中间件而不是逐路由 Depends：
+#   逐路由标注要求每个新写接口都被作者记得补上鉴权——这正是 PR-2 要消灭的
+#   失效模式（"新增 mutation route 时容易忘记单独补鉴权"）。全局中间件按
+#   **HTTP 方法**（而非 URL 前缀）判定，因此不存在"前缀旁路"：任何 POST/
+#   PUT/PATCH/DELETE，无论挂在 /api/paper、/api/adaptive、/api/settings、
+#   /api/strategies 还是 main.py 顶层（/api/init、/api/track/*、
+#   /api/data-validity/* 等）都被同一条规则覆盖。
+#
+# 只读方法（GET/HEAD/OPTIONS）不经鉴权：控制面读写分离，看板无需密钥。
+# 但**浏览器来源防护**（Origin / Sec-Fetch-Site）对写方法始终生效，因此
+# 环回客户端也不能被跨站页面冒用（DNS-rebinding / localhost CSRF）。
+_OPERATOR_STATUS_PATH = "/api/operator-status"
+
+
+def _operator_request_context(request):
+    """从 Request 取出判定所需的最小信息（不做任何解析逻辑）。
+
+    客户端地址**只**取 ``request.client.host``——不读取 X-Forwarded-For /
+    X-Real-IP / Forwarded（§17）。代理信任由 Uvicorn 的
+    ``--proxy-headers --forwarded-allow-ips=127.0.0.1`` 负责（§18）。
+    """
+    client = getattr(request, "client", None)
+    client_host = getattr(client, "host", None) if client is not None else None
+    url = getattr(request, "url", None)
+    scheme = getattr(url, "scheme", None) or "http"
+    try:
+        server_port = request.url.port
+    except Exception:
+        server_port = None
+    if server_port is None:
+        server_port = 443 if str(scheme).lower() == "https" else 80
+    host_header = request.headers.get("host") or None
+    return {
+        "client_host": client_host,
+        "scheme": scheme,
+        "host_header": host_header,
+        "server_port": server_port,
+    }
+
+
+@app.middleware("http")
+async def _operator_boundary(request, call_next):
+    context = _operator_request_context(request)
+    decision = operator_auth.evaluate_request(
+        request.method,
+        request.headers,
+        context["client_host"],
+        scheme=context["scheme"],
+        host_header=context["host_header"],
+        server_port=context["server_port"],
+    )
+    if not decision.allowed:
+        return JSONResponse(
+            status_code=decision.status,
+            content={"detail": decision.detail, "reason": decision.reason},
+            headers=operator_auth.challenge_headers(decision),
+        )
+    response = await call_next(request)
+    # 安全响应头：与 nginx 侧对齐（直连容器时也生效）。
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("Referrer-Policy", "no-referrer")
+    return response
+
+
+@app.get(_OPERATOR_STATUS_PATH)
+def operator_status():
+    """操作员边界状态（**只读**，永不回显 token）。
+
+    只返回 ``mode`` / ``token_configured`` / ``writes_protected``；
+    不返回 token 长度、前缀或任何强度细节（§55）。
+    """
+    return operator_auth.describe_configuration()
+
+
+# 启动期把当前模式打进日志（只打模式名，不打 token 长度/值/前缀）。
+operator_auth.log_configuration()
+
+
 
 
 # PR-51：/api/strategies 的请求体由类型化契约（strategy_api_models）解析。

@@ -224,4 +224,32 @@ MIT. See [`LICENSE`](LICENSE).
 
 Current release: **v1.3.0** (see [GitHub Releases](https://github.com/daviesjoin-afk/astock-paper-trading/releases); the detailed [`CHANGELOG.md`](CHANGELOG.md) entries currently stop at v1.2.0). See [security boundaries](SECURITY.md), the [strategy platform](docs/STRATEGY_PLATFORM.md) and the [repository layout](docs/REPOSITORY_LAYOUT.md). CI covers Python 3.11/3.12. The historical API version 2.0.0 is not the release tag.
 
-The local Compose mapping `8600:8600` binds all interfaces. Use `127.0.0.1:8600:8600` for local access. Built-in authentication is incomplete; remote deployments require access controls and authentication. `confirmed=true` is not authentication.
+The local Compose mapping binds the host port to loopback only (`127.0.0.1:8600:8600`); inside the container Uvicorn still listens on `0.0.0.0` for port publishing, health checks and reverse proxying.
+
+The HTTP control plane enforces a unified operator boundary (PR-2): `POST`/`PUT`/`PATCH`/`DELETE`
+require an operator credential, while `GET` is read-only and needs none. There are three modes:
+
+- **No token configured** (local-only): only a loopback client **with a loopback `Host`** may write;
+  everything else gets `403` (`Host` must be `localhost` or a loopback IP literal — this blocks DNS
+  rebinding).
+- **Valid token configured** (>= 24 chars, authenticated): every client, including localhost, must
+  send the standard Authorization header using the Bearer scheme (value: `Bearer <credential>`).
+- **Invalid token** (misconfigured): all writes get `503`.
+
+**Custom hostnames (e.g. an intranet domain) require a token**, so the boundary runs in authenticated
+mode. When a reverse proxy forwards `Host` it must preserve `host:port` (use nginx `$http_host`, not
+`$host`, which drops non-default ports) — otherwise the port in the browser `Origin` no longer matches
+the default port the backend infers, and legitimate same-origin writes are judged `cross-origin` → `403`.
+
+There is **no switch to disable the boundary**. Configure the secret in `.env` (gitignored):
+
+```bash
+python -c "import secrets; print('ASTOCK_OPERATOR_TOKEN=' + secrets.token_urlsafe(32))" >> .env
+```
+
+In the browser, open **Settings → Operator authorization**, paste the credential and click
+"Unlock this tab". The credential lives only in that tab's `sessionStorage` and is cleared when the
+tab closes; write requests automatically send the standard Authorization header using the Bearer
+scheme, and read requests never do. The credential is only ever sent via that header, never in the
+URL. `confirmed=true` is a product confirmation step, not authentication. See
+[SECURITY.md](SECURITY.md) for the full threat model.
