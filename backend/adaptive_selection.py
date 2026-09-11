@@ -10,6 +10,7 @@ import statistics
 
 import strategies as S
 import paper_repository as PRP
+import adaptive_selection_compat as UNIT_COMPAT
 from strategy_registry import labels as strategy_labels
 from adaptive_common import _loads, _json  # C3: 收敛重复工具函数
 
@@ -264,6 +265,11 @@ def _condition_target(model_id, regime):
 
 def _blend_conditions(model_id, current, target, tier):
     blend = {"waiting": 0.0, "fast_shadow": 0.10, "micro": 0.25, "standard": 0.65, "mature": 1.0}.get(tier, 0.0)
+    # PR-1.1 §17 防复发：新候选 = 当前 overlay 值与最新默认值的插值。若当前
+    # overlay 还带着 legacy 单位（2.0），插值会产出 blend(2.0, 0.02) ≈ 1.60 这种
+    # 既不是旧值也不是 canonical 的垃圾值，而 activation 边界认不出它（它不是
+    # 已证实的 sentinel）。因此在生成候选前先把 current 在内存里归一化。
+    current = UNIT_COMPAT.normalize_legacy_conditions(current, model_family=model_id)[0]
     result = _conditions(model_id, current)
     result["enabled"] = dict(current.get("enabled") or {})
     for key in target:
@@ -540,9 +546,17 @@ def apply_candidate(conn, paper_db_path, candidate_id, now_fn, approved_by="boun
         ).fetchone()
         if not existing_version:
             current_model, current_weights, _, account_params, _ = _current(account)
-            account_params["adaptive_selection"] = _merge_selection_overlay(
+            merged_overlay = _merge_selection_overlay(
                 account_params, candidate, current_weights, current_model,
             )
+            # Layer B（PR-1.1）：历史 candidate 可能携带 PR #107 之前的
+            # percentage-point 值（individual_mom5_min = 2.0）。必须在**写 live
+            # 之前**做一次兼容归一化——只修已证实的 legacy sentinel，且**不修改
+            # candidate 行本身**（历史证据保持原样，见 §18）。
+            merged_overlay, _unit_fixes = UNIT_COMPAT.normalize_legacy_selection_units(
+                merged_overlay, effective_model=current_model,
+            )
+            account_params["adaptive_selection"] = merged_overlay
             account_params["adaptive_selection_meta"] = {
                 "status": "active", "candidate_id": candidate_id, "version": version,
                 "effective_date": effective, "approved_by": approved_by,
@@ -560,6 +574,15 @@ def apply_candidate(conn, paper_db_path, candidate_id, now_fn, approved_by="boun
                 paper, item["account_id"], "adaptive_selection_applied",
                 f"candidate={candidate_id}; version={version}; effective={effective}", now_fn(),
             )
+            # 归一化发生时才写审计：同时记录 candidate 原始值（历史事实）与
+            # 实际生效值，二者一起落在同一事务里。
+            for _unit_fix in _unit_fixes:
+                PRP.audit(
+                    paper, item["account_id"], UNIT_COMPAT.NORMALIZED_EVENT,
+                    _json({**_unit_fix, "candidate_id": candidate_id,
+                           "applied_by": approved_by}),
+                    now_fn(),
+                )
         paper.commit()
     except Exception as exc:
         try:
@@ -640,18 +663,29 @@ def _finish_rollback(conn, paper_db_path, candidate_id, payload, now_fn):
             (account_id, version),
         ).fetchone()
         if not existing_version:
+            # Layer B（PR-1.1）：回滚点本身也可能带着 legacy 单位值（它来自
+            # 更早的 live params 快照）。这里同样是"写 live 之前"的兼容边界，
+            # 只修已证实的 legacy sentinel，不改写 outbox payload 历史。
+            restored, _unit_fixes = UNIT_COMPAT.normalize_legacy_account_params(previous)
             paper.execute("UPDATE paper_accounts SET params=?,version=?,updated_at=? WHERE id=?",
-                          (_json(previous), version, now_fn(), account_id))
+                          (_json(restored), version, now_fn(), account_id))
             paper.execute(
                 """INSERT INTO paper_parameter_versions(cycle_id,account_id,version,style,params,reason,effective_date,created_at)
                    VALUES(?,?,?,?,?,?,?,?)""",
                 (account.get("cycle_id"), account_id, version, account.get("style") or "adaptive-selection",
-                 _json(previous), reason, effective, now_fn()),
+                 _json(restored), reason, effective, now_fn()),
             )
             PRP.audit(
                 paper, account_id, "adaptive_selection_rolled_back",
                 f"candidate={candidate_id}; reason={reason}", now_fn(),
             )
+            for _unit_fix in _unit_fixes:
+                PRP.audit(
+                    paper, account_id, UNIT_COMPAT.NORMALIZED_EVENT,
+                    _json({**_unit_fix, "candidate_id": candidate_id,
+                           "source": "rollback"}),
+                    now_fn(),
+                )
         paper.commit()
     except Exception as exc:
         try:
