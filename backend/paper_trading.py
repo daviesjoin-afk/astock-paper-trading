@@ -14546,8 +14546,12 @@ def run_slot(slot, asof_date=None, force=False):
     """统一幂等入口；计划任务和页面的“立即检查”都使用同一事务键。"""
     PSS.validate_slot(slot)
     init_db()
+    PSS.run_preflight(
+        db_factory=_db,
+        audit=_audit,
+        resolve_asof_day=lambda: _date(asof_date),
+    )
     day = _date(asof_date)
-    PSS.run_preflight(db_factory=_db, audit=_audit, asof_day=day)
     if slot == "weekly-review" and not force:
         # Anchor the weekly review to the last *trading* day of the ISO week.
         # Previously a statutory holiday on Friday left the entire week without
