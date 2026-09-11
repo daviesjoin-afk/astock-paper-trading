@@ -56,10 +56,13 @@ class PreflightTests(unittest.TestCase):
              mock.patch.object(PSS.ELC, "expire_stale_orders", side_effect=lambda conn: events.append("orders")), \
              mock.patch.object(PSS.EPD, "run_execution_dispatch", side_effect=lambda conn: events.append("dispatch")):
             result = PSS.run_preflight(
-                db_factory=self._factory(events), audit=lambda *args: None, asof_day=day,
+                db_factory=self._factory(events),
+                audit=lambda *args: None,
+                resolve_asof_day=lambda: day,
             )
         self.assertEqual(result["lifecycle"], "ok")
         self.assertEqual(result["dispatch"], "ok")
+        self.assertEqual(result["asof_day"], "2026-09-11")
         self.assertLess(events.index("signals"), events.index("orders"))
         self.assertLess(events.index("orders"), events.index("dispatch"))
 
@@ -71,13 +74,30 @@ class PreflightTests(unittest.TestCase):
             result = PSS.run_preflight(
                 db_factory=self._factory(events),
                 audit=lambda conn, actor, event, detail: audits.append((actor, event, detail)),
-                asof_day=dt.date(2026, 9, 11),
+                resolve_asof_day=lambda: dt.date(2026, 9, 11),
             )
         self.assertEqual(result["lifecycle"], "error")
         self.assertEqual(result["dispatch"], "ok")
         self.assertIn("dispatch", events)
         self.assertEqual(audits[0][1], "entry_lifecycle_error")
         self.assertIn("RuntimeError: boom", audits[0][2])
+
+    def test_date_resolution_failure_is_audited_and_dispatch_still_runs(self):
+        events = []
+        audits = []
+        resolver = mock.Mock(side_effect=ValueError("bad date"))
+        with mock.patch.object(PSS.ELC, "expire_stale_signals") as signals, \
+             mock.patch.object(PSS.EPD, "run_execution_dispatch", side_effect=lambda conn: events.append("dispatch")):
+            result = PSS.run_preflight(
+                db_factory=self._factory(events),
+                audit=lambda conn, actor, event, detail: audits.append((event, detail)),
+                resolve_asof_day=resolver,
+            )
+        self.assertEqual(result["lifecycle"], "error")
+        self.assertIn("dispatch", events)
+        signals.assert_not_called()
+        self.assertEqual(audits[0][0], "entry_lifecycle_error")
+        self.assertIn("ValueError: bad date", audits[0][1])
 
     def test_dispatch_failure_is_audited_and_not_raised(self):
         events = []
@@ -88,7 +108,7 @@ class PreflightTests(unittest.TestCase):
             result = PSS.run_preflight(
                 db_factory=self._factory(events),
                 audit=lambda conn, actor, event, detail: audits.append((event, detail)),
-                asof_day=dt.date(2026, 9, 11),
+                resolve_asof_day=lambda: dt.date(2026, 9, 11),
             )
         self.assertEqual(result["dispatch"], "error")
         self.assertEqual(audits[0][0], "execution_dispatch_error")
@@ -100,7 +120,7 @@ class PreflightTests(unittest.TestCase):
             result = PSS.run_preflight(
                 db_factory=self._factory(events),
                 audit=mock.Mock(side_effect=RuntimeError("audit unavailable")),
-                asof_day=dt.date(2026, 9, 11),
+                resolve_asof_day=lambda: dt.date(2026, 9, 11),
             )
         self.assertEqual(result["lifecycle"], "error")
         self.assertEqual(result["dispatch"], "ok")
@@ -128,7 +148,11 @@ class ArchitectureGuardTests(unittest.TestCase):
         end = source.index("\ndef ", start + 4) if "\ndef " in source[start + 4:] else len(source)
         body = source[start:end]
         self.assertIn("PSS.validate_slot(slot)", body)
-        self.assertIn("PSS.run_preflight(db_factory=_db, audit=_audit, asof_day=day)", body)
+        self.assertIn(
+            "PSS.run_preflight(db_factory=_db, audit=_audit, resolve_asof_day=lambda: _date(asof_date))",
+            body,
+        )
+        self.assertLess(body.index("PSS.run_preflight"), body.index("day = _date(asof_date)"))
         self.assertNotIn("ELC.expire_stale_signals", body)
         self.assertNotIn("EPD.run_execution_dispatch", body)
 
