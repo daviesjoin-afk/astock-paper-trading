@@ -101,6 +101,63 @@ def _pointer(conn, scope):
     return None if row is None else int(row["params_id"])
 
 
+def _history_count(conn, scope=None):
+    if scope is None:
+        return conn.execute("SELECT COUNT(*) FROM evolution_activation_history").fetchone()[0]
+    return conn.execute(
+        "SELECT COUNT(*) FROM evolution_activation_history WHERE scope_key=?", (scope,)
+    ).fetchone()[0]
+
+
+def _stub_authorized_expansion(case, *, key="max_weight_delta", old=0.03, new=0.032):
+    """把确定性校验整体 stub 成"通过且含一条已授权放大"。
+
+    为什么必须 stub 而不是走真实路径：``expansions`` 只可能来自
+    ``AR.evaluate_risk_adjustments``，而它只对 ``RISK_DIRECTION_BY_KEY``
+    里的键生效 —— 进化参数键不在其中；往候选里塞风险键又会被策略画像的
+    "可调参数清单"直接拒绝。也就是说**真实路径产不出 expansion**。
+
+    所以这里 stub 掉校验器本身，但**封存仍然走真实的
+    ``validate_candidate``**（指纹照样落盘、激活前照样复核）。这样测到的
+    是"激活与副作用的原子性"，而不是绕过 invariant 去手改已封存字段。
+    """
+    original = EA._validate_params_payload
+
+    def fake(conn, params_id, scope):
+        return {"valid": True, "violations": [], "detail": {
+            "params_digest": EA.params_digest(BASE_PARAMS),
+            "scope_key": scope,
+            "checked_keys": [],
+            "base_params_id": 1,
+            "expansions": [{"strategy_id": "trend_pullback", "key": key,
+                            "old": old, "new": new}],
+            "tightenings": [],
+        }}
+
+    EA._validate_params_payload = fake
+    case.addCleanup(setattr, EA, "_validate_params_payload", original)
+
+
+def _candidate_with_expansion(conn):
+    """造一条校验阶段就认定"含已授权放大"的策略候选。"""
+    SE.init_params(conn)
+    created = EA.create_candidate(conn, dict(BASE_PARAMS, max_weight_delta=0.032),
+                                  strategy_id="trend_pullback",
+                                  source="challenger_promotion", reason="expansion probe",
+                                  evidence_count=20)
+    params_id = created["params_id"]
+    detail = EA._loads(EA._params_row(conn, params_id)["validation_detail"], {})
+    return params_id, detail.get("expansions") or []
+
+
+def _validated_global_candidate(conn, **params):
+    """造一条已校验、但**未激活**的全局候选。"""
+    SE.init_params(conn)
+    created = EA.create_candidate(conn, dict(BASE_PARAMS, **params),
+                                  source="evolve", reason="immutability probe")
+    return created["params_id"]
+
+
 class LegacyBootstrapTests(unittest.TestCase):
     """旧库迁移：保留旧 runtime 事实，且只能跑一次。"""
 
@@ -433,6 +490,142 @@ class RollbackTests(unittest.TestCase):
         self.assertEqual(0.03, state["params"]["max_weight_delta"])
 
 
+class CandidateImmutabilityTests(unittest.TestCase):
+    """候选快照不可变是 runtime invariant，不是约定。
+
+    校验通过只证明"封存那一刻"这一行合法。激活前必须重新证明它没被改过：
+    指纹覆盖 params + strategy_id + source + base_params_id + evidence_count
+    + validation_detail —— 少任何一个都能在不改 params 的前提下改变校验结论
+    或凭空造出放大副作用。
+    """
+
+    def _tamper(self, conn, params_id, **sets):
+        assignments = ", ".join(f"{key}=?" for key in sets)
+        conn.execute(
+            f"UPDATE evolution_params SET {assignments} WHERE id=?",  # noqa: S608
+            (*sets.values(), params_id),
+        )
+        conn.commit()
+
+    def test_tampered_params_refuses_activation(self):
+        conn = _db()
+        self.addCleanup(conn.close)
+        pid = _validated_global_candidate(conn, max_weight_delta=0.033)
+        self._tamper(conn, pid, params=json.dumps(dict(BASE_PARAMS, max_weight_delta=0.06)))
+        with self.assertRaises(EA.CandidateTampered):
+            EA.activate_params_candidate(conn, pid, actor="test")
+
+    def test_tampered_source_refuses_activation(self):
+        """改 source 能凭空拿到 Challenger 的放大授权，必须拦住。"""
+        conn = _db()
+        self.addCleanup(conn.close)
+        pid = _validated_global_candidate(conn, max_weight_delta=0.033)
+        self._tamper(conn, pid, source="challenger_promotion")
+        with self.assertRaises(EA.CandidateTampered):
+            EA.activate_params_candidate(conn, pid, actor="test")
+
+    def test_tampered_base_refuses_activation(self):
+        conn = _db()
+        self.addCleanup(conn.close)
+        pid = _validated_global_candidate(conn, max_weight_delta=0.033)
+        self._tamper(conn, pid, base_params_id=999999)
+        # 先于 stale CAS 判定的必须是"被篡改"，而不是"基线过期"。
+        with self.assertRaises(EA.CandidateTampered):
+            EA.activate_params_candidate(conn, pid, actor="test")
+
+    def test_tampered_evidence_refuses_activation(self):
+        conn = _db()
+        self.addCleanup(conn.close)
+        pid = _validated_global_candidate(conn, max_weight_delta=0.033)
+        self._tamper(conn, pid, evidence_count=9999)
+        with self.assertRaises(EA.CandidateTampered):
+            EA.activate_params_candidate(conn, pid, actor="test")
+
+    def test_tampered_validation_detail_refuses_activation(self):
+        """改 validation_detail 能凭空造出放大副作用，必须拦住。"""
+        conn = _db()
+        self.addCleanup(conn.close)
+        pid = _validated_global_candidate(conn, max_weight_delta=0.033)
+        self._tamper(conn, pid, validation_detail=EA._json(
+            {"expansions": [{"key": "max_weight_delta", "new": 0.06}]}))
+        with self.assertRaises(EA.CandidateTampered):
+            EA.activate_params_candidate(conn, pid, actor="test")
+
+    def test_unsealed_candidate_refuses_activation(self):
+        """没有指纹 = 无法证明快照未被改动，fail closed。"""
+        conn = _db()
+        self.addCleanup(conn.close)
+        pid = _validated_global_candidate(conn, max_weight_delta=0.033)
+        self._tamper(conn, pid, candidate_fingerprint=None)
+        with self.assertRaises(EA.CandidateTampered):
+            EA.activate_params_candidate(conn, pid, actor="test")
+
+    def test_tamper_leaves_pointer_and_history_unchanged(self):
+        conn = _db()
+        self.addCleanup(conn.close)
+        pid = _validated_global_candidate(conn, max_weight_delta=0.033)
+        before_pointer = _pointer(conn, GLOBAL)
+        before_history = _history_count(conn)
+        self._tamper(conn, pid, params=json.dumps(dict(BASE_PARAMS, max_weight_delta=0.05)))
+        with self.assertRaises(EA.CandidateTampered):
+            EA.activate_params_candidate(conn, pid, actor="test")
+        self.assertEqual(before_pointer, _pointer(conn, GLOBAL))
+        self.assertEqual(before_history, _history_count(conn))
+
+    def test_untouched_candidate_still_activates(self):
+        """负向对照：没被改动的候选必须照常激活，别把门禁做成误杀。"""
+        conn = _db()
+        self.addCleanup(conn.close)
+        pid = _validated_global_candidate(conn, max_weight_delta=0.033)
+        result = EA.activate_params_candidate(conn, pid, actor="test")
+        self.assertTrue(result["activated"])
+        self.assertEqual(pid, _pointer(conn, GLOBAL))
+
+
+class GlobalPointerIntegrityTests(unittest.TestCase):
+    """全局指针丢失 = 损坏，不是"回到出厂设置"。"""
+
+    def test_missing_global_pointer_fails_closed_on_read(self):
+        conn = _db()
+        self.addCleanup(conn.close)
+        SE.init_params(conn)
+        conn.execute("DELETE FROM evolution_active_params WHERE scope_key=?", (GLOBAL,))
+        conn.commit()
+        with self.assertRaises(EA.EvolutionLifecycleError):
+            SE.get_current_params(conn)
+
+    def test_missing_global_pointer_blocks_write_path(self):
+        conn = _db()
+        self.addCleanup(conn.close)
+        SE.init_params(conn)
+        conn.execute("DELETE FROM evolution_active_params WHERE scope_key=?", (GLOBAL,))
+        conn.commit()
+        with self.assertRaises(EA.EvolutionLifecycleError):
+            EA.create_candidate(conn, dict(BASE_PARAMS, max_weight_delta=0.033),
+                                source="evolve", reason="should not write")
+
+    def test_missing_global_pointer_never_falls_back_to_latest_row(self):
+        """删掉指针后读到的绝不能是最新那一行。"""
+        conn = _db()
+        self.addCleanup(conn.close)
+        SE.init_params(conn)
+        latest = _validated_global_candidate(conn, max_weight_delta=0.033)
+        conn.execute("DELETE FROM evolution_active_params WHERE scope_key=?", (GLOBAL,))
+        conn.commit()
+        with self.assertRaises(EA.EvolutionLifecycleError):
+            SE.get_current_params(conn)
+        self.assertNotEqual(latest, _pointer(conn, GLOBAL))
+
+    def test_brand_new_database_still_returns_defaults(self):
+        """全新库（从未有过全局激活历史）必须照常给默认值。"""
+        conn = _db()
+        self.addCleanup(conn.close)
+        SE.ensure_schema(conn)
+        current = SE.get_current_params(conn)
+        self.assertEqual("default", current["source"])
+        self.assertIsNone(current["id"])
+
+
 class ConsumerTests(unittest.TestCase):
     """下游消费者只看到 active，看不到候选。"""
 
@@ -473,33 +666,95 @@ class ConsumerTests(unittest.TestCase):
 
 
 class SideEffectTests(unittest.TestCase):
-    """与"生效"绑定的副作用只在激活时执行。"""
+    """与"生效"绑定的副作用只在激活时执行，且与激活同生共死。"""
 
     def test_risk_expansion_proposal_closes_only_at_activation(self):
+        """放大提案在候选阶段不动，激活时才 promote。
+
+        注意：这里走**真实校验路径**产生 expansion（登记提案并把观察期
+        回拨到窗口之外），不再直接改写 validation_detail —— 后者现在会
+        触发指纹不匹配而被拒绝，那正是想要的 invariant。
+        """
         conn = _db()
         self.addCleanup(conn.close)
-        SE.init_params(conn)
+        _stub_authorized_expansion(self)
+        params_id, expansions = _candidate_with_expansion(conn)
+        self.assertTrue(expansions, "校验应当把已授权放大封存进 validation_detail")
+
         import asymmetric_risk as AR
         calls: list = []
         original = AR.promote_proposal
         AR.promote_proposal = lambda c, s, k, v, actor="": (calls.append((s, k, v)), True)[1]
         try:
-            created = SE.adjust_strategy_params(
-                conn, "trend_pullback", {"max_weight_delta": 0.032},
-                evidence_count=20, source="challenger_promotion", challenger_win=True)
-            self.assertTrue(created["adjusted"])
             # 仅生成候选：提案必须仍未闭环。
             self.assertEqual([], calls)
-            # 模拟一条已获授权的放大，验证它在**激活**时才 promote。
-            conn.execute(
-                "UPDATE evolution_params SET validation_detail=? WHERE id=?",
-                (EA._json({"expansions": [{"key": "max_weight_delta", "new": 0.032}]}),
-                 created["new_params_id"]),
-            )
-            conn.commit()
-            SE.activate_params_candidate(conn, created["new_params_id"], actor="test")
+            EA.activate_params_candidate(conn, params_id, actor="test")
         finally:
             AR.promote_proposal = original
+        self.assertEqual([("trend_pullback", "max_weight_delta", 0.032)], calls)
+
+    def test_side_effect_failure_rolls_back_the_whole_activation(self):
+        """promote 失败 → 指针/history/log 一起回滚，绝不留半截状态。"""
+        conn = _db()
+        self.addCleanup(conn.close)
+        _stub_authorized_expansion(self)
+        params_id, _ = _candidate_with_expansion(conn)
+        scope = "strategy:trend_pullback"
+
+        import asymmetric_risk as AR
+        original = AR.promote_proposal
+
+        def boom(*_a, **_k):
+            raise RuntimeError("proposal store unavailable")
+
+        AR.promote_proposal = boom
+        try:
+            with self.assertRaises(RuntimeError):
+                EA.activate_params_candidate(conn, params_id, actor="test")
+        finally:
+            AR.promote_proposal = original
+
+        # 回滚证据：没有指针、没有激活历史、候选仍是 validated 而非 active。
+        self.assertIsNone(_pointer(conn, scope))
+        self.assertEqual(0, conn.execute(
+            "SELECT COUNT(*) FROM evolution_activation_history WHERE scope_key=?",
+            (scope,)).fetchone()[0])
+        self.assertEqual(EA.STATE_VALIDATED, EA._params_row(conn, params_id)["validation_state"])
+
+    def test_retry_after_side_effect_failure_is_exactly_once(self):
+        """修好后重试必须能成功，且副作用只发生一次。"""
+        conn = _db()
+        self.addCleanup(conn.close)
+        _stub_authorized_expansion(self)
+        params_id, _ = _candidate_with_expansion(conn)
+        scope = "strategy:trend_pullback"
+
+        import asymmetric_risk as AR
+        original = AR.promote_proposal
+        calls: list = []
+
+        def failing(*_a, **_k):
+            raise RuntimeError("transient")
+
+        def working(c, s, k, v, actor=""):
+            calls.append((s, k, v))
+            return True
+
+        AR.promote_proposal = failing
+        try:
+            with self.assertRaises(RuntimeError):
+                EA.activate_params_candidate(conn, params_id, actor="test")
+        finally:
+            AR.promote_proposal = original
+
+        AR.promote_proposal = working
+        try:
+            result = EA.activate_params_candidate(conn, params_id, actor="test")
+        finally:
+            AR.promote_proposal = original
+
+        self.assertTrue(result["activated"])
+        self.assertEqual(params_id, _pointer(conn, scope))
         self.assertEqual([("trend_pullback", "max_weight_delta", 0.032)], calls)
 
 
@@ -527,6 +782,7 @@ class ApiContractTests(unittest.TestCase):
                 (SE.CandidateNotValidated("未校验"), 409),
                 (SE.CandidateStale("基线过期"), 409),
                 (SE.CandidateRejected("已拒绝"), 409),
+                (SE.CandidateTampered("被篡改"), 409),
                 (SE.ActivationConflict("并发"), 409),
                 (SE.EvolutionLifecycleError("指针损坏"), 503),
             )

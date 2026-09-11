@@ -40,6 +40,7 @@ CandidateNotFound = EA.CandidateNotFound
 CandidateNotValidated = EA.CandidateNotValidated
 CandidateStale = EA.CandidateStale
 CandidateRejected = EA.CandidateRejected
+CandidateTampered = EA.CandidateTampered
 ActivationConflict = EA.ActivationConflict
 
 # ─── 进化参数默认值 ───
@@ -149,8 +150,10 @@ def get_current_params(conn) -> dict:
     一条刚插入、未校验、未批准的候选立刻变成"当前生效参数"，并直接被
     ``dual_ai_tuner`` 当作调参边界消费。
 
-    没有指针时返回出厂默认值（``source='default'``），绝不回落 latest row。
     指针指向缺失行时抛 ``EvolutionLifecycleError``（fail closed）。
+    没有指针时：仅当"确实从没有过全局参数"才返回出厂默认值
+    （``source='default'``）；已有全局参数行或激活历史却丢了指针同样视为
+    损坏并抛 ``EvolutionLifecycleError``，绝不回落 latest row。
     """
     try:
         EA.ensure_ready(conn)
@@ -159,6 +162,10 @@ def get_current_params(conn) -> dict:
         # 表结构尚不可用（例如极早期启动）：返回默认值，而不是猜一行。
         active = None
     if active is None:
+        # 没有指针时，只有在"确实从没有过全局参数"的情况下才允许出厂默认值。
+        # 已有全局参数行/激活历史却丢了指针 = 存储损坏，必须 fail closed，
+        # 绝不能静默把 runtime 换回一套完全不同的参数。
+        EA.assert_global_pointer_present(conn)
         return {
             "id": None,
             "params": _default_params(),

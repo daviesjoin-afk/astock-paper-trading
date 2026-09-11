@@ -62,6 +62,7 @@ LOG_CANDIDATE_VALIDATED = "candidate_validated"
 LOG_CANDIDATE_REJECTED = "candidate_rejected"
 LOG_CANDIDATE_ACTIVATED = "candidate_activated"
 LOG_CANDIDATE_STALE_REJECTED = "candidate_stale_rejected"
+LOG_CANDIDATE_TAMPER_REJECTED = "candidate_tamper_rejected"
 LOG_ROLLBACK = "rollback"
 LOG_LEGACY_BOOTSTRAP = "legacy_bootstrap"
 
@@ -85,13 +86,16 @@ _LIFECYCLE_COLUMNS = (
     # 候选创建时携带的证据量。必须随候选一起持久化，否则校验阶段无法
     # 确定性重放画像的 min_samples 判定（不能依赖调用方再传一次）。
     ("evidence_count", "INTEGER"),
+    # 候选在**校验通过瞬间**封存的不可变指纹。激活前必须重新计算并比对，
+    # 不一致即拒绝激活 —— "候选快照不可变"是 runtime invariant，不是约定。
+    ("candidate_fingerprint", "TEXT"),
 )
 
 #: 读生命周期行时统一 SELECT 的列。
 _PARAMS_SELECT = """SELECT id, version, params, source, reason, parent_id,
                            performance_snapshot, strategy_id, created_at,
                            validation_state, validated_at, validation_detail,
-                           base_params_id, evidence_count
+                           base_params_id, evidence_count, candidate_fingerprint
                     FROM evolution_params"""
 
 
@@ -114,6 +118,12 @@ class CandidateNotValidated(EvolutionCandidateError):
 
 
 class CandidateStale(EvolutionCandidateError):
+    http_status = 409
+
+
+class CandidateTampered(EvolutionCandidateError):
+    """候选在校验通过之后被篡改（指纹不匹配），或根本没封存过指纹。"""
+
     http_status = 409
 
 
@@ -189,6 +199,34 @@ def params_digest(params: Any) -> str:
         params, sort_keys=True, ensure_ascii=False, separators=(",", ":"), allow_nan=False
     )
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def candidate_fingerprint(row: dict) -> str:
+    """候选的不可变指纹。
+
+    必须覆盖**所有决定校验语义**的字段，而不只是 params：
+    ``strategy_id`` 决定 scope 与画像、``source`` 决定风险放大授权、
+    ``base_params_id`` 决定 stale CAS、``evidence_count`` 决定画像
+    min_samples 判定。只绑定 params 的话，改其中任何一个字段都能在不触发
+    params 摘要变化的前提下改变校验结论。
+
+    ``validation_detail`` 同样在内：它携带的 ``expansions`` 会在激活时驱动
+    副作用（风险放大提案闭环）。若放行对它的改写，攻击者不必碰 params
+    就能凭空造出放大副作用。"改完 validation_detail 再激活"必须失败。
+    """
+    payload = {
+        "params": _row_params(row),
+        "strategy_id": str(row.get("strategy_id") or ""),
+        "source": str(row.get("source") or ""),
+        "base_params_id": None if row.get("base_params_id") is None
+        else int(row["base_params_id"]),
+        "evidence_count": None if row.get("evidence_count") is None
+        else int(row["evidence_count"]),
+        "validation_detail": row.get("validation_detail"),
+    }
+    encoded = json.dumps(payload, sort_keys=True, ensure_ascii=False,
+                         separators=(",", ":"), allow_nan=False)
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
 def _row_params(row) -> Optional[dict]:
@@ -349,12 +387,19 @@ def bootstrap_legacy_pointers(conn) -> dict:
         detail = _validate_params_payload(conn, params_id, scope)
         now = _now()
         state = STATE_VALIDATED if detail["valid"] else STATE_CANDIDATE
+        legacy_row = _params_row(conn, int(params_id))
+        sealed_detail = _json({"legacy_bootstrap": True, **detail})
+        if legacy_row is not None:
+            legacy_row = dict(legacy_row)
+            legacy_row["validation_detail"] = sealed_detail
         conn.execute(
             """UPDATE evolution_params
-               SET validation_state=?, validated_at=?, validation_detail=?
+               SET validation_state=?, validated_at=?, validation_detail=?,
+                   candidate_fingerprint=?
                WHERE id=? AND (validation_state IS NULL OR validation_state='')""",
-            (state, now if detail["valid"] else None,
-             _json({"legacy_bootstrap": True, **detail}), int(params_id)),
+            (state, now if detail["valid"] else None, sealed_detail,
+             candidate_fingerprint(legacy_row) if legacy_row else None,
+             int(params_id)),
         )
         _write_pointer(conn, scope, params_id, actor=ACTION_LEGACY_BOOTSTRAP,
                        reason="legacy bootstrap: 旧系统 latest row 即当时 current")
@@ -431,6 +476,7 @@ def _shape(row, *, scope: str, inherited_from: Optional[str] = None) -> dict:
         "validation_detail": _loads(row["validation_detail"], {}),
         "base_params_id": row["base_params_id"],
         "evidence_count": row["evidence_count"],
+        "candidate_fingerprint": row["candidate_fingerprint"],
         "scope_key": scope,
         "inherited_from": inherited_from,
     }
@@ -481,8 +527,33 @@ def resolve_effective(conn, strategy_id: Optional[str] = None) -> dict:
             "pointer_params_id": global_active["id"],
             "inherited_from": SCOPE_GLOBAL if strategy_id else None,
         }
+    # 走到这里说明全局没有指针。先判断是"全新库"还是"指针损坏"，
+    # 损坏必须 fail closed，不能静默回 default（那等于偷偷换一套参数）。
+    assert_global_pointer_present(conn)
     return {"source": "default", "scope_key": scope_key(strategy_id), "active": None,
             "pointer_params_id": None}
+
+
+def assert_global_pointer_present(conn) -> None:
+    """全局指针缺失时判断这是"全新库"还是"损坏"，后者必须 fail closed。
+
+    判据只用 **append-only 的 activation history**，不用"是否存在参数行"：
+    初始化第一条全局参数时必然是"有行、无指针"，那是合法状态，不能误判。
+    history 一旦写入就永不删除，所以"有全局激活历史却没有指针"只可能是
+    指针被误删/损坏 —— 此时回落出厂默认值会让 runtime 在无人察觉的情况下
+    切回一套完全不同的参数，必须 fail closed。
+
+    注意：strategy scope 无指针继承全局是**合法**的，与本判断无关，
+    不要把两者混为一谈。
+    """
+    if not _table_exists(conn, "evolution_activation_history"):
+        return
+    if not _history_exists(conn, SCOPE_GLOBAL):
+        return
+    raise EvolutionLifecycleError(
+        "global active pointer is missing while activation history exists; "
+        "refusing to fall back to factory defaults or the latest row"
+    )
 
 
 def has_any_params(conn) -> bool:
@@ -631,12 +702,20 @@ def validate_candidate(conn, params_id: int) -> dict:
     outcome = _validate_params_payload(conn, int(params_id), scope)
     now = _now()
     state = STATE_VALIDATED if outcome["valid"] else STATE_REJECTED
+    # 封存指纹：此刻这一行的语义被定住，之后任何改动都会让激活失败。
+    # 指纹必须包含**即将写入**的 validation_detail，否则该字段可在封存后
+    # 被改写而指纹不变。
+    sealed_detail = _json({"legacy_bootstrap": False, **outcome["detail"],
+                           "violations": outcome["violations"]})
+    sealed_row = dict(row)
+    sealed_row["validation_detail"] = sealed_detail
     conn.execute(
-        """UPDATE evolution_params SET validation_state=?, validated_at=?, validation_detail=?
+        """UPDATE evolution_params
+           SET validation_state=?, validated_at=?, validation_detail=?,
+               candidate_fingerprint=?
            WHERE id=?""",
-        (state, now if outcome["valid"] else None,
-         _json({"legacy_bootstrap": False, **outcome["detail"],
-                "violations": outcome["violations"]}), int(params_id)),
+        (state, now if outcome["valid"] else None, sealed_detail,
+         candidate_fingerprint(sealed_row), int(params_id)),
     )
     _log_event(
         conn,
@@ -761,6 +840,42 @@ def activate_params_candidate(conn, params_id: int, *, actor: str,
         return {"activated": False, "already_active": True, "params_id": int(params_id),
                 "scope_key": scope, "active_params_id": current_pointer_id}
 
+    # ── 不可变候选不变式 ──
+    # 校验通过只代表"封存那一刻"这一行合法。激活前必须重新证明它没被改过：
+    # 先比对指纹（覆盖 params + strategy_id + source + base + evidence_count），
+    # 再重跑一次确定性校验。任一步失败都不允许推进指针。
+    sealed = row["candidate_fingerprint"]
+    if not sealed:
+        _log_event(conn, LOG_CANDIDATE_TAMPER_REJECTED, int(params_id), {
+            "scope_key": scope, "reason": "候选没有封存指纹，无法证明快照未被改动",
+        })
+        conn.commit()
+        raise CandidateTampered(
+            f"候选 {params_id} 没有封存指纹，请重新校验后再激活"
+        )
+    if candidate_fingerprint(row) != sealed:
+        _log_event(conn, LOG_CANDIDATE_TAMPER_REJECTED, int(params_id), {
+            "scope_key": scope,
+            "sealed_fingerprint": sealed,
+            "current_fingerprint": candidate_fingerprint(row),
+            "reason": "校验通过后候选快照被改动",
+        })
+        conn.commit()
+        raise CandidateTampered(
+            f"候选 {params_id} 在校验通过后被改动（指纹不匹配），请重新生成候选"
+        )
+    recheck = _validate_params_payload(conn, int(params_id), scope)
+    if not recheck["valid"]:
+        _log_event(conn, LOG_CANDIDATE_TAMPER_REJECTED, int(params_id), {
+            "scope_key": scope, "violations": recheck["violations"],
+            "reason": "激活前复核未通过",
+        })
+        conn.commit()
+        raise CandidateNotValidated(
+            f"候选 {params_id} 激活前复核未通过："
+            + "; ".join(recheck["violations"])
+        )
+
     expected_base = row["base_params_id"]
     if expected_base != effective_id:
         _log_event(conn, LOG_CANDIDATE_STALE_REJECTED, int(params_id), {
@@ -814,7 +929,14 @@ def activate_params_candidate(conn, params_id: int, *, actor: str,
         "reason": reason or "",
     })
     if side_effects:
-        _apply_activation_side_effects(conn, row, scope, actor=actor)
+        # 与激活绑定的副作用必须和指针/history/log 同生共死：
+        # 失败就整体 rollback，绝不留"已 active 但副作用缺失"的半截状态。
+        # 否则重试时会因 already_active 提前返回，副作用永久丢失。
+        try:
+            _apply_activation_side_effects(conn, row, scope, actor=actor)
+        except Exception:
+            conn.rollback()
+            raise
     conn.commit()
     return {"activated": True, "already_active": False, "params_id": int(params_id),
             "scope_key": scope, "active_params_id": int(params_id),
@@ -834,16 +956,13 @@ def _apply_activation_side_effects(conn, row, scope: str, *, actor: str) -> None
     expansions = detail.get("expansions") or []
     if not expansions:
         return
-    try:
-        import asymmetric_risk as AR
-    except Exception:  # noqa: BLE001
-        return
+    import asymmetric_risk as AR  # 导入失败必须冒泡：静默跳过等于副作用缺失
     for expansion in expansions:
-        try:
-            AR.promote_proposal(conn, str(row["strategy_id"]), expansion.get("key"),
-                                expansion.get("new"), actor=actor)
-        except Exception:  # noqa: BLE001 - 提案闭环失败不得回滚已完成的激活
-            continue
+        # 这里**不做** try/except。一次瞬时失败若被吞掉，就会形成
+        # "candidate 已 active、proposal 仍 pending"的半截状态，而再次激活
+        # 同一 candidate 会因 already_active 提前返回 —— 副作用永久缺失。
+        AR.promote_proposal(conn, str(row["strategy_id"]), expansion.get("key"),
+                            expansion.get("new"), actor=actor)
 
 
 # ─── 回滚 ───
