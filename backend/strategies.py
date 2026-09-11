@@ -8,6 +8,7 @@ import numpy as np
 import pandas as pd
 
 import factors as F
+import factor_calibration as FC
 
 
 STRATEGIES = {
@@ -207,7 +208,7 @@ TECHNICAL_COLUMNS = (
 
 
 def zneg(series):
-    return F.zscore(pd.Series(series, dtype="float64") * -1)
+    return F.zscore(pd.Series(series, dtype="float64") * -1, fill_missing=False)
 
 
 def _core_stock_preference(table):
@@ -285,8 +286,9 @@ def _hot_leader_profile(table):
     flow_score = (rank01(super_net) * 0.55 + rank01(main_pct) * 0.25
                   + rank01(amount) * 0.20)
     liquidity_score = (rank01(amount) * 0.65 + rank01(turnover) * 0.35)
-    momentum_score = (rank01(mom5.clip(-20, 20)) * 0.60
-                      + rank01(mom20.clip(-40, 60)) * 0.40)
+    # mom5/mom20 are fractions. Keep winsorisation in the same unit.
+    momentum_score = (rank01(mom5.clip(-0.20, 0.20)) * 0.60
+                      + rank01(mom20.clip(-0.40, 0.60)) * 0.40)
     sector_score = rank01(sector)
 
     distance = (price / ma20 - 1.0).where(price.gt(0) & ma20.gt(0))
@@ -419,30 +421,17 @@ def build_factor_table(
     realtime_flow: dict = None,
     realtime_super_flow: dict = None,
 ):
-    """合并价格、财务和实时资金字段，并保留规则型策略需要的原始布尔条件。"""
+    """Merge factor sources while keeping alpha and evidence quality separate."""
     idx = price_f.index.intersection(fund_f.index)
     table = pd.DataFrame(index=idx)
     price = price_f.loc[idx]
     fund = fund_f.loc[idx]
 
     for column in (
-        "name",
-        "industry",
-        "pe",
-        "pb",
-        "roe",
-        "rev_yoy",
-        "profit_yoy",
-        "net_profit",
-        "annual_net_profit",
-        "annual_report_date",
-        "annual_report_published_at",
-        "report_published_at",
-        "report_age_days",
-        "profit_source",
-        "mktcap",
-        "float_cap",
-        "report_date",
+        "name", "industry", "pe", "pb", "roe", "rev_yoy", "profit_yoy",
+        "net_profit", "annual_net_profit", "annual_report_date",
+        "annual_report_published_at", "report_published_at", "report_age_days",
+        "profit_source", "mktcap", "float_cap", "report_date",
     ):
         table[column] = fund[column] if column in fund else np.nan
     table["price"] = price["price"]
@@ -457,50 +446,103 @@ def build_factor_table(
     for column in TECHNICAL_COLUMNS:
         table[column] = price[column] if column in price else False
 
-    # 关键列整列缺失时必须告警：下游 numeric_column().fillna(0) 会把数据
-    # 事故变成静默策略退化（pct→0 使涨跌幅带/追高/弱势门禁全部恒假）。
-    # 打印结构化 ALARM 供 scheduler.log 捕获，并挂到 table.attrs 供调用方
-    # 透传到结果审计字段。
-    _missing_columns = [
+    missing_columns = [
         name for name in ("pct", "amount", "turnover")
         if name not in table.columns or table[name].notna().sum() == 0
     ]
-    if _missing_columns:
+    if missing_columns:
         import json as _json
         import sys as _sys
         print(_json.dumps({
             "alarm": "factor_columns_missing",
-            "columns": _missing_columns,
-            "note": "行情快照关键字段整列缺失，相关条件门禁将按 0 处理（候选可能异常为空）",
+            "columns": missing_columns,
+            "note": "行情快照关键字段整列缺失；缺失证据保持 unknown 并由 evidence-quality 门禁处理",
         }, ensure_ascii=False), flush=True)
         _sys.stdout.flush()
-    table.attrs["factor_warnings"] = _missing_columns
+    table.attrs["factor_warnings"] = missing_columns
 
-    table["value"] = (zneg(fund["pe"]) + zneg(fund["pb"])) / 2
-    table["quality"] = (
-        F.zscore(fund["roe"])
-        + F.zscore(fund["profit_yoy"]) * 0.5
-        + F.zscore(fund["rev_yoy"]) * 0.5
-    ) / 2
-    table["mom"] = F.zscore(price["mom20"]) * 0.6 + F.zscore(price["mom60"]) * 0.4
-    table["mom_short"] = (
-        F.zscore(price["mom5"]) * 0.5
-        + F.zscore(price["mom20"]) * 0.3
-        + F.zscore(price["mom60"]) * 0.2
+    # Missing factor observations stay missing. Composite alpha renormalises
+    # over observed components instead of silently replacing unknown with zero.
+    pe_z = F.zscore(pd.to_numeric(fund["pe"], errors="coerce") * -1, fill_missing=False)
+    pb_z = F.zscore(pd.to_numeric(fund["pb"], errors="coerce") * -1, fill_missing=False)
+    roe_z = F.zscore(fund["roe"], fill_missing=False)
+    profit_z = F.zscore(fund["profit_yoy"], fill_missing=False)
+    revenue_z = F.zscore(fund["rev_yoy"], fill_missing=False)
+    mom5_z = F.zscore(price["mom5"], fill_missing=False)
+    mom20_z = F.zscore(price["mom20"], fill_missing=False)
+    mom60_z = F.zscore(price["mom60"], fill_missing=False)
+
+    table["value"] = FC.weighted_available(
+        {"pe": pe_z, "pb": pb_z}, {"pe": 0.5, "pb": 0.5}, index=idx
     )
-    table["volsurge"] = F.zscore(price["vol_surge"])
-    table["rsi"] = zneg(price["rsi14"])
+    table["quality"] = FC.weighted_available(
+        {"roe": roe_z, "profit": profit_z, "revenue": revenue_z},
+        {"roe": 0.5, "profit": 0.25, "revenue": 0.25},
+        index=idx,
+    )
+    # Short and medium momentum are intentionally disjoint factor families.
+    table["mom_short"] = mom5_z
+    table["mom"] = FC.weighted_available(
+        {"mom20": mom20_z, "mom60": mom60_z},
+        {"mom20": 0.6, "mom60": 0.4},
+        index=idx,
+    )
+    table["volsurge"] = F.zscore(price["vol_surge"], fill_missing=False)
+    table["rsi"] = F.zscore(
+        pd.to_numeric(price["rsi14"], errors="coerce") * -1,
+        fill_missing=False,
+    )
 
-    proxy_flow = F.zscore(price["flow_proxy"])
+    price_quality = pd.to_numeric(
+        price.get("price_evidence_quality", pd.Series(FC.FULL_QUALITY, index=idx)),
+        errors="coerce",
+    ).reindex(idx).clip(0.0, 1.0).fillna(0.0)
+    table["adjustment_warning"] = price.get(
+        "adjustment_warning", pd.Series(False, index=idx)
+    ).reindex(idx).fillna(False).astype(bool)
+    table["mom_short_evidence_quality"] = price_quality.where(mom5_z.notna(), 0.0)
+    table["mom_evidence_quality"] = price_quality * (
+        mom20_z.notna().astype(float) * 0.6 + mom60_z.notna().astype(float) * 0.4
+    )
+    table["volsurge_evidence_quality"] = price_quality.where(
+        table["volsurge"].notna(), 0.0
+    )
+    table["rsi_evidence_quality"] = price_quality.where(table["rsi"].notna(), 0.0)
+    table["value_evidence_quality"] = (
+        pe_z.notna().astype(float) * 0.5 + pb_z.notna().astype(float) * 0.5
+    )
+    table["quality_evidence_quality"] = (
+        roe_z.notna().astype(float) * 0.5
+        + profit_z.notna().astype(float) * 0.25
+        + revenue_z.notna().astype(float) * 0.25
+    )
+
+    proxy_flow = F.zscore(price["flow_proxy"], fill_missing=False)
     if realtime_flow:
         flow_series = pd.Series({code: realtime_flow.get(code, np.nan) for code in idx})
         live_flow = F.zscore(flow_series, fill_missing=False)
-        table["flow"] = live_flow.fillna(proxy_flow * 0.5)
+        table["flow"] = live_flow.combine_first(proxy_flow)
+        table["flow_evidence_quality"] = pd.Series(
+            np.where(
+                live_flow.notna(),
+                FC.FULL_QUALITY,
+                np.where(proxy_flow.notna(), FC.PROXY_QUALITY, 0.0),
+            ),
+            index=idx,
+            dtype="float64",
+        )
         coverage = int(live_flow.notna().sum())
-        table["flow_source"] = f"实时主力净流入占比({coverage}/{len(idx)})，缺失项用量价代理"
+        table["flow_source"] = (
+            f"实时主力净流入占比({coverage}/{len(idx)})，缺失项用量价代理（质量单独记录）"
+        )
     else:
         table["flow"] = proxy_flow
-        table["flow_source"] = "量价资金代理"
+        table["flow_evidence_quality"] = pd.Series(
+            np.where(proxy_flow.notna(), FC.PROXY_QUALITY, 0.0),
+            index=idx,
+            dtype="float64",
+        )
+        table["flow_source"] = "量价资金代理（质量单独记录）"
 
     fallback_super = (
         pd.to_numeric(fund["super_net"], errors="coerce").reindex(idx)
@@ -523,17 +565,25 @@ def build_factor_table(
         table["super_net_source"] = "历史资金字段（仅上下文）"
 
     if sentiment:
-        table["hot_rank"] = pd.Series(
-            {code: (sentiment.get(code) or {}).get("hot_rank") for code in idx}
+        table["hot_rank"] = pd.Series({
+            code: (sentiment.get(code) or {}).get("hot_rank") for code in idx
+        })
+        sentiment_raw = pd.Series({
+            code: (sentiment.get(code) or {}).get("sentiment", np.nan) for code in idx
+        })
+        table["sentiment"] = F.zscore(sentiment_raw, fill_missing=False)
+        table["sentiment_evidence_quality"] = table["sentiment"].notna().astype(float)
+        table["sentiment_source"] = np.where(
+            table["sentiment"].notna(), "实时人气榜", "unavailable"
         )
-        table["sentiment"] = F.zscore(
-            pd.Series(
-                {code: (sentiment.get(code) or {}).get("sentiment", np.nan) for code in idx}
-            )
-        ).fillna(0)
     else:
+        # Momentum/volume are not allowed to masquerade as sentiment.
         table["hot_rank"] = np.nan
-        table["sentiment"] = F.zscore(price["vol_surge"] * 0.5 + price["mom20"])
+        table["sentiment"] = np.nan
+        table["sentiment_evidence_quality"] = 0.0
+        table["sentiment_source"] = "unavailable"
+
+    table.attrs["factor_calibration_version"] = FC.CALIBRATION_VERSION
     return table
 
 
@@ -1310,26 +1360,41 @@ def _run_paper_strategy(strategy_id, table, topn, gate, first_board_codes=None, 
     weights = dict(PAPER_WEIGHTS[strategy_id])
     conditions = _paper_conditions(strategy_id, condition_overrides)
     enabled = conditions.get("enabled", {})
+    weight_override_rejected = False
     if isinstance(weight_overrides, dict) and set(weight_overrides) == set(weights):
-        weights = _bounded_weight_simplex(weight_overrides)
-    score = pd.Series(0.0, index=table.index)
-    for factor, weight in weights.items():
-        # 行情快照来自 JSON/CSV 混合缓存时，数值列偶尔会以字符串形式
-        # 进入 DataFrame。统一转数值，避免 5 分钟监控因字符串与数字比较
-        # 异常退出并把本轮状态误显示成“异常”。
-        values = pd.to_numeric(table[factor], errors="coerce").fillna(0.0)
-        score += values * weight
-    # Keep the unmodified factor score for research.  The execution model still
-    # uses ``score`` below exactly as before; these extra columns are evidence
-    # for the shadow-validation ledger and do not change ranking or orders.
+        candidate_weights = _bounded_weight_simplex(weight_overrides)
+        if FC.group_caps_ok(candidate_weights):
+            weights = candidate_weights
+        else:
+            # Adaptive overlays cannot recreate correlated double-voting by
+            # concentrating multiple factors from the same evidence family.
+            # Fail closed to the audited strategy defaults rather than clamp a
+            # different economic model silently.
+            weight_override_rejected = True
+    weight_group_totals = FC.weight_group_totals(weights)
+    required_factors = ("sentiment",) if strategy_id == "sentiment_pioneer" else ()
+    calibrated = FC.score_factors(
+        table,
+        weights,
+        required_factors=required_factors,
+    )
+    score = calibrated.alpha_score.copy()
     base_score = score.copy()
+    evidence_quality = calibrated.evidence_quality
+    evidence_observed_weight = calibrated.observed_weight
+    evidence_ok = (
+        base_score.notna()
+        & calibrated.required_ok
+        & evidence_quality.ge(FC.MIN_RUNTIME_EVIDENCE_QUALITY)
+    )
+
     def numeric_column(name):
-        source = table[name] if name in table.columns else pd.Series(0.0, index=table.index)
-        return pd.to_numeric(source, errors="coerce").fillna(0.0)
+        source = table[name] if name in table.columns else pd.Series(np.nan, index=table.index)
+        return pd.to_numeric(source, errors="coerce")
 
     # 科创板本身永远不进入可交易候选；这里只把同产业科创板的实时
     # 共振作为有上限的上下文加分，参与主板/创业板候选排序。
-    star_sector_bonus = numeric_column("star_sector_bonus")
+    star_sector_bonus = numeric_column("star_sector_bonus").fillna(0.0)
     score += star_sector_bonus
     # 传统核心股偏好只作很小的软排序项：不设“名气白名单”，也不
     # 放宽任何硬条件。流通市值和成交额缺失时取中性值，避免数据缺失
@@ -1441,8 +1506,14 @@ def _run_paper_strategy(strategy_id, table, topn, gate, first_board_codes=None, 
             )
             score += individual.astype(float) * conditions["individual_bonus"]
 
+    # Evidence quality is an audit/gate dimension, never an alpha multiplier.
+    score = score.mask(~evidence_ok, -999.0)
+
     ranked = table.copy()
     ranked["score_base"] = base_score
+    ranked["score_evidence_quality"] = evidence_quality
+    ranked["score_observed_weight"] = evidence_observed_weight
+    ranked["score_required_ok"] = calibrated.required_ok
     ranked["score_star_sector_bonus"] = star_sector_bonus
     ranked["score_core_stock_bonus"] = core_stock_bonus
     ranked["score_hot_leader_bonus"] = hot_bonus
@@ -1468,6 +1539,10 @@ def _run_paper_strategy(strategy_id, table, topn, gate, first_board_codes=None, 
                 "turnover", "main_pct", "super_net", "pe", "pb", "roe",
                 "profit_yoy", "net_profit", "annual_net_profit",
                 "sector_heat_score", "sector_early_rotation_score",
+                "mom_short_evidence_quality", "mom_evidence_quality",
+                "flow_evidence_quality", "volsurge_evidence_quality",
+                "sentiment_evidence_quality", "value_evidence_quality",
+                "quality_evidence_quality", "rsi_evidence_quality",
             )
             if key in ranked.columns
         }
@@ -1489,7 +1564,11 @@ def _run_paper_strategy(strategy_id, table, topn, gate, first_board_codes=None, 
                 "mom60": _percent(row.get("mom60_raw")),
                 "hot_rank": _number(row.get("hot_rank")),
                 "score_components": {
-                    "version": "paper-score-evidence-v1",
+                    "version": "paper-score-evidence-v2",
+                    "factor_calibration_version": FC.CALIBRATION_VERSION,
+                    "evidence_quality": _number(row.get("score_evidence_quality"), 6),
+                    "observed_weight": _number(row.get("score_observed_weight"), 6),
+                    "required_factors_ok": bool(row.get("score_required_ok", False)),
                     "weights": {key: round(value, 6) for key, value in weights.items()},
                     "base_score": _number(row.get("score_base"), 6),
                     "star_sector_bonus": _number(row.get("score_star_sector_bonus"), 6),
@@ -1595,6 +1674,17 @@ def _run_paper_strategy(strategy_id, table, topn, gate, first_board_codes=None, 
                         if "flow_source" in table and len(table) else None),
         "weights_used": {key: round(value, 6) for key, value in weights.items()},
         "conditions_used": conditions,
+        "factor_calibration": {
+            "version": FC.CALIBRATION_VERSION,
+            "minimum_evidence_quality": FC.MIN_RUNTIME_EVIDENCE_QUALITY,
+            "maximum_factor_group_weight": FC.MAX_FACTOR_GROUP_WEIGHT,
+            "weight_group_totals": {
+                key: round(value, 6) for key, value in weight_group_totals.items()
+            },
+            "weight_override_rejected": weight_override_rejected,
+            "required_factors": list(required_factors),
+            "eligible_evidence_rows": int(evidence_ok.sum()),
+        },
         "hot_leader_context": {
             "version": "hot-leader-onset-v1",
             "caps": {key: value for key, value in {

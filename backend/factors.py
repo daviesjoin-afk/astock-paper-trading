@@ -10,6 +10,10 @@ try:
     from financial_point_in_time import financial_visibility
 except ImportError:  # Allow ``backend.factors`` package-style test imports.
     from .financial_point_in_time import financial_visibility
+try:
+    import factor_calibration as FC
+except ImportError:  # Allow ``backend.factors`` package-style test imports.
+    from . import factor_calibration as FC
 
 def zscore(series, fill_missing=True):
     """横截面标准分；可选择保留缺失值以便调用方使用可信代理回填。"""
@@ -111,15 +115,19 @@ def compute_price_factors(klines: dict, asof=None):
                          "monthly_oversold": monthly_oversold,
                          "ma5": float(ma5.iloc[-1]), "ma10": float(ma10.iloc[-1]),
                          "ma20": float(ma20.iloc[-1]), "ma60": float(ma60.iloc[-1])}
-            # #7: 新浪不复权数据的技术指标偏差衰减
+            # 数据源可信度只能进入 evidence-quality；绝不能改变动量/反转
+            # 的经济含义。旧逻辑对新浪不复权源直接乘 0.7，会让同一价格
+            # 序列仅因来源不同就得到不同 alpha，且无法区分“信号弱”与
+            # “证据质量低”。
             meta = _manifest.get(code) or {}
-            if str(meta.get("source") or "").lower() == "sina" and str(meta.get("adjustment") or "").lower() == "none":
-                row_data["adjustment_warning"] = True
-                for _fcol in ("mom5", "mom20", "mom60", "rev5"):
-                    if isinstance(row_data.get(_fcol), (int, float)):
-                        row_data[_fcol] = row_data[_fcol] * 0.7
-            else:
-                row_data["adjustment_warning"] = False
+            unadjusted = (
+                str(meta.get("source") or "").lower() == "sina"
+                and str(meta.get("adjustment") or "").lower() == "none"
+            )
+            row_data["adjustment_warning"] = bool(unadjusted)
+            row_data["price_evidence_quality"] = (
+                FC.UNADJUSTED_PRICE_QUALITY if unadjusted else FC.FULL_QUALITY
+            )
             rows.append(row_data)
         except Exception:
             continue
@@ -399,7 +407,7 @@ def find_first_board_candidates(klines: dict, today_date=None):
             else:
                 open_today = None
                 close_today = None
-            # 判断首板：昨日涨到涨停 且 前日未涨��
+            # 判断首板：昨日涨到涨停 且 前日未涨停
             if yd_ret < board_lim:
                 continue
             if db_ret is not None and db_ret >= board_lim:
