@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""PR-32 true-shadow Champion/Challenger regression tests."""
+"""True-shadow Champion/Challenger + scientific promotion regressions."""
 from __future__ import annotations
 
 import datetime as dt
@@ -10,6 +10,7 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+import promotion_science as PS
 import self_evolution as SE
 import strategy_champion as SCM
 
@@ -72,7 +73,7 @@ class TrueShadowLifecycleTests(unittest.TestCase):
     def _open(self, *, at=None):
         return SCM.open_challenger(
             self.paper, self.evo, STRATEGY, {"max_weight_delta": 0.032},
-            evidence_count=EVIDENCE, now=at or NOW - dt.timedelta(days=5),
+            evidence_count=EVIDENCE, now=at or NOW - dt.timedelta(days=20),
         )
 
     def _record_counterfactual(self, *, challenger_pnl=2000.0, at=None):
@@ -82,6 +83,25 @@ class TrueShadowLifecycleTests(unittest.TestCase):
             _output(pnl=challenger_pnl, nav=100000.0 + challenger_pnl),
             observed_at=at or NOW - dt.timedelta(days=1),
         )
+
+    def _record_scientific_window(self, *, challenger_rate=0.0016,
+                                  challenger_pnl=2000.0, count=14):
+        champion_nav = 100000.0
+        challenger_nav = 100000.0
+        for i in range(count):
+            if i:
+                champion_nav *= 1.001
+                challenger_nav *= 1.0 + challenger_rate
+            observed = NOW - dt.timedelta(days=count - i)
+            result = SCM.run_shadow_counterfactual(
+                self.paper,
+                STRATEGY,
+                {"asof": observed.date().isoformat(), "seq": i, "600000": {"close": 10.0 + i / 100}},
+                _output(pnl=1000.0, nav=champion_nav),
+                _output(pnl=challenger_pnl, nav=challenger_nav),
+                observed_at=observed,
+            )
+            self.assertTrue(result["recorded"])
 
     def test_open_leaves_active_runtime_checksum_and_params_unchanged(self):
         before = SCM.active_runtime_checksum(self.evo, STRATEGY)
@@ -144,14 +164,27 @@ class TrueShadowLifecycleTests(unittest.TestCase):
         self.assertEqual({"asof": "2026-09-09", "close": 10.0}, seen[0][2])
         self.assertEqual({"asof": "2026-09-09", "close": 10.0}, seen[1][2])
 
-    def test_evaluation_uses_same_period_counterfactual_not_prior_market_window(self):
+    def test_insufficient_scientific_evidence_stays_shadow(self):
+        before = SCM.active_runtime_checksum(self.evo, STRATEGY)
         self._open()
-        self._record_counterfactual(challenger_pnl=2000.0)
+        self._record_counterfactual()
+        result = SCM.evaluate_challenger(self.paper, self.evo, STRATEGY, now=NOW)
+        self.assertFalse(result["evaluated"])
+        self.assertEqual(SCM.STATUS_SHADOW, result["status"])
+        self.assertIn("证据不足", result["reason"])
+        self.assertEqual(before["checksum"], SCM.active_runtime_checksum(self.evo, STRATEGY)["checksum"])
+        promoted = SCM.promote_challenger(self.paper, self.evo, STRATEGY, now=NOW)
+        self.assertFalse(promoted["promoted"])
+
+    def test_evaluation_uses_same_period_counterfactual_and_scientific_gate(self):
+        self._open()
+        self._record_scientific_window()
         result = SCM.evaluate_challenger(self.paper, self.evo, STRATEGY, now=NOW)
         self.assertTrue(result["evaluated"])
         self.assertEqual(SCM.STATUS_READY, result["status"])
+        self.assertTrue(result["scientific_gate"]["promotable"])
         self.assertGreater(result["challenger_metrics"]["return_pct"], result["champion_metrics"]["return_pct"])
-        self.assertEqual(1, len(result["decision"]["counterfactual_snapshot_checksums"]))
+        self.assertGreaterEqual(len(result["decision"]["counterfactual_snapshot_checksums"]), PS.MIN_PAIRED_SNAPSHOTS)
         champion_params = SCM._json_loads(self.paper.execute(
             "SELECT champion_params FROM strategy_champion_versions WHERE role='challenger'"
         ).fetchone()[0])
@@ -159,26 +192,30 @@ class TrueShadowLifecycleTests(unittest.TestCase):
 
     def test_mismatched_counterfactual_snapshots_fail_closed(self):
         self._open()
-        self._record_counterfactual()
-        self.paper.execute("DELETE FROM shadow_nav WHERE role=?", (SCM.ROLE_CHALLENGER,))
+        self._record_scientific_window()
+        self.paper.execute(
+            "DELETE FROM shadow_nav WHERE role=? AND id=(SELECT MAX(id) FROM shadow_nav WHERE role=?)",
+            (SCM.ROLE_CHALLENGER, SCM.ROLE_CHALLENGER),
+        )
         self.paper.commit()
         result = SCM.evaluate_challenger(self.paper, self.evo, STRATEGY, now=NOW)
         self.assertFalse(result["evaluated"])
         self.assertIn("同期间同快照", result["reason"])
 
-    def test_failed_shadow_evaluation_never_restores_or_changes_formal_runtime(self):
+    def test_failed_shadow_evaluation_never_changes_formal_runtime(self):
         before = SCM.active_runtime_checksum(self.evo, STRATEGY)
         self._open()
-        self._record_counterfactual(challenger_pnl=-1000.0)
+        self._record_scientific_window(challenger_rate=0.0005, challenger_pnl=-1000.0)
         result = SCM.evaluate_challenger(self.paper, self.evo, STRATEGY, now=NOW)
         after = SCM.active_runtime_checksum(self.evo, STRATEGY)
+        self.assertTrue(result["evaluated"])
         self.assertEqual(SCM.STATUS_ROLLED_BACK, result["status"])
         self.assertEqual(before["checksum"], after["checksum"])
 
     def test_promotion_is_the_only_active_head_switch(self):
         before = SCM.active_runtime_checksum(self.evo, STRATEGY)
         self._open()
-        self._record_counterfactual(challenger_pnl=2000.0)
+        self._record_scientific_window()
         self.assertEqual(SCM.STATUS_READY, SCM.evaluate_challenger(self.paper, self.evo, STRATEGY, now=NOW)["status"])
         result = SCM.promote_challenger(self.paper, self.evo, STRATEGY, now=NOW)
         after = SCM.active_runtime_checksum(self.evo, STRATEGY)
@@ -186,15 +223,40 @@ class TrueShadowLifecycleTests(unittest.TestCase):
         self.assertNotEqual(before["checksum"], after["checksum"])
         self.assertEqual(0.032, after["params"]["max_weight_delta"])
         self.assertEqual(after["checksum"], result["active_runtime_checksum"])
+        self.assertEqual(PS.PROMOTION_SCIENCE_VERSION, result["scientific_gate"]["version"])
+
+    def test_legacy_ready_row_without_science_cannot_promote(self):
+        before = SCM.active_runtime_checksum(self.evo, STRATEGY)
+        opened = self._open()
+        self.paper.execute(
+            "UPDATE strategy_champion_versions SET status=?,decision=? WHERE id=?",
+            (SCM.STATUS_READY, SCM._json_dumps({"promotable": True}), opened["challenger_id"]),
+        )
+        self.paper.commit()
+        result = SCM.promote_challenger(self.paper, self.evo, STRATEGY, now=NOW)
+        self.assertFalse(result["promoted"])
+        self.assertIn("科学", result["reason"])
+        self.assertEqual(before["checksum"], SCM.active_runtime_checksum(self.evo, STRATEGY)["checksum"])
+
+    def test_scientific_evidence_mutation_blocks_ready_promotion(self):
+        before = SCM.active_runtime_checksum(self.evo, STRATEGY)
+        self._open()
+        self._record_scientific_window()
+        self.assertEqual(SCM.STATUS_READY, SCM.evaluate_challenger(self.paper, self.evo, STRATEGY, now=NOW)["status"])
+        row = self.paper.execute(
+            "SELECT id FROM shadow_nav WHERE role=? ORDER BY id LIMIT 1 OFFSET 5",
+            (SCM.ROLE_CHALLENGER,),
+        ).fetchone()
+        self.paper.execute("UPDATE shadow_nav SET nav=nav*1.01 WHERE id=?", (row["id"],))
+        self.paper.commit()
+        result = SCM.promote_challenger(self.paper, self.evo, STRATEGY, now=NOW)
+        self.assertFalse(result["promoted"])
+        self.assertIn("科学晋升证据", result["reason"])
+        self.assertEqual(before["checksum"], SCM.active_runtime_checksum(self.evo, STRATEGY)["checksum"])
 
     def test_side_effect_failure_is_reported_not_raised(self):
-        """晋升时提案闭环失败：激活已整笔回滚，对外必须是"没晋升成"，不能 500。
-
-        ``ActivationSideEffectFailed`` 继承 ``EvolutionLifecycleError``，
-        不在 ``EvolutionCandidateError`` 里 —— 捕获列表漏了它就会直接冒泡。
-        """
         self._open()
-        self._record_counterfactual(challenger_pnl=2000.0)
+        self._record_scientific_window()
         self.assertEqual(SCM.STATUS_READY, SCM.evaluate_challenger(
             self.paper, self.evo, STRATEGY, now=NOW)["status"])
 
@@ -242,6 +304,14 @@ class ValidationAndWiringTests(unittest.TestCase):
         self.assertIn("strategy_shadow_parameter_versions", open_body)
         self.assertIn("def run_shadow_context", body)
         self.assertIn("run_shadow_counterfactual", body)
+
+    def test_promotion_path_requires_current_scientific_gate(self):
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "strategy_champion.py")
+        with open(path, encoding="utf-8") as handle:
+            body = handle.read()
+        promote_body = body[body.index("def promote_challenger"):body.index("def rollback_challenger")]
+        self.assertIn("_verify_ready_science", promote_body)
+        self.assertIn("verify_promotion_evidence", body)
 
 
 if __name__ == "__main__":
