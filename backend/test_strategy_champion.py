@@ -187,6 +187,30 @@ class TrueShadowLifecycleTests(unittest.TestCase):
         self.assertEqual(0.032, after["params"]["max_weight_delta"])
         self.assertEqual(after["checksum"], result["active_runtime_checksum"])
 
+    def test_side_effect_failure_is_reported_not_raised(self):
+        """晋升时提案闭环失败：激活已整笔回滚，对外必须是"没晋升成"，不能 500。
+
+        ``ActivationSideEffectFailed`` 继承 ``EvolutionLifecycleError``，
+        不在 ``EvolutionCandidateError`` 里 —— 捕获列表漏了它就会直接冒泡。
+        """
+        self._open()
+        self._record_counterfactual(challenger_pnl=2000.0)
+        self.assertEqual(SCM.STATUS_READY, SCM.evaluate_challenger(
+            self.paper, self.evo, STRATEGY, now=NOW)["status"])
+
+        original = SE.activate_params_candidate
+
+        def boom(*_a, **_k):
+            raise SE.ActivationSideEffectFailed("提案闭环失败")
+
+        SE.activate_params_candidate = boom
+        try:
+            result = SCM.promote_challenger(self.paper, self.evo, STRATEGY, now=NOW)
+        finally:
+            SE.activate_params_candidate = original
+        self.assertFalse(result["promoted"])
+        self.assertIn("提案闭环失败", result["reason"])
+
     def test_manual_rollback_only_discards_shadow_metadata(self):
         before = SCM.active_runtime_checksum(self.evo, STRATEGY)
         self._open()

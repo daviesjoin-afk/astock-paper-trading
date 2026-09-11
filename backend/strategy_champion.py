@@ -419,13 +419,25 @@ def promote_challenger(paper_conn, evo_conn, strategy_id: str, *, now: dt.dateti
     diffs = {key: value for key, value in candidate.items() if active["params"].get(key) != value}
     # PR-33：晋升是唯一可以申报 Challenger 胜出的路径（challenger_win=True），
     # 风险方向参数仍需满足证据 + 观察期 + 单轮上限，缺一不可。
-    activated = SE.adjust_strategy_params(
+    #
+    # 晋升现在分两步：先生成候选，再显式激活。激活仍要过 stale CAS ——
+    # 若参数头在候选生成期间被别处推动，这里拒绝而不是覆盖。
+    created = SE.adjust_strategy_params(
         evo_conn, strategy_id, diffs, reason="challenger_promotion",
         source="challenger_promotion", evidence_count=challenger.get("evidence_count"),
         challenger_win=True,
     )
-    if not activated.get("adjusted"):
-        return {"promoted": False, "reason": "无法原子切换 active 参数头：" + str(activated.get("reason") or activated.get("violations"))}
+    if not created.get("adjusted"):
+        return {"promoted": False, "reason": "无法生成晋升候选：" + str(created.get("reason") or created.get("violations"))}
+    try:
+        SE.activate_params_candidate(
+            evo_conn, created["new_params_id"], actor="challenger_promotion",
+            reason="Challenger 胜出晋升",
+        )
+    except (SE.EvolutionCandidateError, SE.ActivationSideEffectFailed) as exc:
+        # 副作用闭环失败时激活已被整笔回滚，所以这里同样是"没晋升成"，
+        # 而不是让异常冒出去变成 500。重试是安全的。
+        return {"promoted": False, "reason": f"晋升候选无法激活（{exc}）"}
     after = active_runtime_checksum(evo_conn, strategy_id)
     if after["checksum"] != _checksum(candidate):
         raise RuntimeError("promotion did not produce the Challenger parameter head")

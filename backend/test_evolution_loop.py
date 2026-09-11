@@ -194,15 +194,20 @@ class ProductionIntegrationTests(unittest.TestCase):
             before = SE.get_current_params(conn)["id"]
             rep = EL.run_loop(conn, ProductionBackend(), generations=1)
             self.assertEqual(rep["generations_run"], 1)
+            # 自动进化只生成候选：active 指针必须没动。
+            self.assertEqual(before, SE.get_current_params(conn)["id"])
+            pending = SE.validated_pending(conn)
+            self.assertTrue(pending, "自动进化应产出待激活候选")
+            # 显式激活后才真正生效。
+            SE.activate_params_candidate(conn, pending[0]["id"], actor="test")
             after = SE.get_current_params(conn)["id"]
-            # 真的发生了调参（新参数版本）。
             self.assertNotEqual(before, after)
-            # 逐代快照记录了参数版本变化。
+            # 代际快照只记录"生效"参数：闭环内没有激活，所以起点 == 终点。
             grow = conn.execute(
                 "SELECT params_id_start, params_id_end FROM evolution_generation WHERE generation=1"
             ).fetchone()
             self.assertEqual(grow[0], before)
-            self.assertEqual(grow[1], after)
+            self.assertEqual(grow[1], before)
         finally:
             conn.close()
             os.remove(path)

@@ -29,6 +29,21 @@ from zoneinfo import ZoneInfo
 TZ = ZoneInfo("Asia/Shanghai")
 from adaptive_common import _now, _json, _loads  # C3: 收敛重复工具函数
 
+# 生命周期契约：candidate / validated / active 三者分离，由显式指针决定
+# "当前生效参数"。本模块所有读写都必须经过它，绝不用 id 顺序推断 current。
+import evolution_activation as EA
+
+#: 生命周期异常（对外重导出，便于调用方区分 404 / 409 / 存储损坏）。
+EvolutionLifecycleError = EA.EvolutionLifecycleError
+EvolutionCandidateError = EA.EvolutionCandidateError
+CandidateNotFound = EA.CandidateNotFound
+CandidateNotValidated = EA.CandidateNotValidated
+CandidateStale = EA.CandidateStale
+CandidateRejected = EA.CandidateRejected
+CandidateTampered = EA.CandidateTampered
+ActivationConflict = EA.ActivationConflict
+ActivationSideEffectFailed = EA.ActivationSideEffectFailed
+
 # ─── 进化参数默认值 ───
 EVOLUTION_VERSION = "self-evolution-v1"
 
@@ -123,33 +138,49 @@ def ensure_schema(conn):
             FOREIGN KEY (params_id) REFERENCES evolution_params(id)
         );
     """)
+    # 生命周期表（显式 active 指针 / 激活历史 / 迁移标记），并跑一次性
+    # legacy bootstrap 把旧库的 latest row 语义固化成初始指针。
+    EA.ensure_schema(conn)
 
 
 def get_current_params(conn) -> dict:
-    """获取当前生效的**全局**进化参数（排除策略专属版本行）。"""
+    """获取当前生效的**全局**进化参数。
+
+    唯一权威来源是 ``evolution_active_params`` 中 ``__global__`` 的显式指针。
+    这里**不再**用 ``ORDER BY id DESC LIMIT 1`` 推断 current —— 那条路径会让
+    一条刚插入、未校验、未批准的候选立刻变成"当前生效参数"，并直接被
+    ``dual_ai_tuner`` 当作调参边界消费。
+
+    指针指向缺失行时抛 ``EvolutionLifecycleError``（fail closed）。
+    没有指针时：仅当"确实从没有过全局参数"才返回出厂默认值
+    （``source='default'``）；已有全局参数行或激活历史却丢了指针同样视为
+    损坏并抛 ``EvolutionLifecycleError``，绝不回落 latest row。
+    """
     try:
-        _ensure_strategy_column(conn)
-    except Exception:
-        pass  # 列缺失时旧库迁移交给 ensure_schema；查询退回全表最新行。
-    try:
-        row = conn.execute(
-            """SELECT id, params, version, source, created_at FROM evolution_params
-                WHERE strategy_id IS NULL ORDER BY id DESC LIMIT 1"""
-        ).fetchone()
+        EA.ensure_ready(conn)
+        active = EA.resolve_scope_active(conn, EA.SCOPE_GLOBAL)
     except sqlite3.Error:
-        # 旧库尚未迁移出 strategy_id 列时退回旧行为（全表最新行）。
-        row = conn.execute(
-            "SELECT id, params, version, source, created_at FROM evolution_params ORDER BY id DESC LIMIT 1"
-        ).fetchone()
-    if row:
+        # 表结构尚不可用（例如极早期启动）：返回默认值，而不是猜一行。
+        active = None
+    if active is None:
+        # 没有指针时，只有在"确实从没有过全局参数"的情况下才允许出厂默认值。
+        # 已有全局参数行/激活历史却丢了指针 = 存储损坏，必须 fail closed，
+        # 绝不能静默把 runtime 换回一套完全不同的参数。
+        EA.assert_global_pointer_present(conn)
         return {
-            "id": row[0],
-            "params": _loads(row[1], _default_params()),
-            "version": row[2],
-            "source": row[3],
-            "created_at": row[4],
+            "id": None,
+            "params": _default_params(),
+            "version": EVOLUTION_VERSION,
+            "source": "default",
+            "created_at": None,
         }
-    return {"id": None, "params": _default_params(), "version": EVOLUTION_VERSION, "source": "default", "created_at": None}
+    return {
+        "id": active["id"],
+        "params": active["params"],
+        "version": active["version"],
+        "source": active["source"],
+        "created_at": active["created_at"],
+    }
 
 
 def _default_params() -> dict:
@@ -168,10 +199,15 @@ def _default_params() -> dict:
 
 
 def init_params(conn, params: Optional[dict] = None, source: str = "init") -> dict:
-    """初始化进化参数（仅在没有参数时执行）。"""
+    """初始化全局进化参数：创建首版并**显式激活**（仅在没有 active 指针时执行）。
+
+    首版必须走显式激活。若只插入一行就算"当前参数"，那正是本 PR 要消灭的
+    latest-row 推断 —— 初始化会变成"任何一次插入都自动生效"。
+    """
+    EA.ensure_ready(conn)
     existing = get_current_params(conn)
     if existing["id"] is not None and source == "init":
-        return existing  # 已有参数，不覆盖
+        return existing  # 已有生效参数，不覆盖
 
     p = _default_params()
     if params:
@@ -180,13 +216,20 @@ def init_params(conn, params: Optional[dict] = None, source: str = "init") -> di
     # 验证边界
     p = _clamp_params(p)
 
-    now = _now()
-    cursor = conn.execute(
-        "INSERT INTO evolution_params(version, params, source, reason, created_at) VALUES(?,?,?,?,?)",
-        (EVOLUTION_VERSION, _json(p), source, "初始化", now)
+    created = EA.create_candidate(
+        conn, p, strategy_id=None, source=source, reason="初始化", validate=True,
     )
-    conn.commit()
-    return {"id": cursor.lastrowid, "params": p, "version": EVOLUTION_VERSION, "source": source, "created_at": now}
+    EA.activate_params_candidate(
+        conn, created["params_id"], actor="init_params",
+        reason="首次初始化：建立全局 active 指针",
+    )
+    return {
+        "id": created["params_id"],
+        "params": p,
+        "version": EVOLUTION_VERSION,
+        "source": source,
+        "created_at": created["created_at"],
+    }
 
 
 def _clamp_params(params: dict) -> dict:
@@ -428,15 +471,14 @@ def evolve(conn, reason: str = "auto") -> dict:
             "metrics": metrics,
         }
 
-    # 保存新参数
-    now = _now()
-    cursor = conn.execute(
-        "INSERT INTO evolution_params(version, params, source, reason, parent_id, performance_snapshot, created_at) VALUES(?,?,?,?,?,?,?)",
-        (EVOLUTION_VERSION, _json(new_params), "evolve",
-         f"{reason}: " + "; ".join(adjustments), current["id"],
-         _json(metrics), now)
+    # 保存为**候选**：这里绝不推进 active 指针。
+    # 候选要经过确定性校验，并由显式激活入口批准后才会生效。
+    created = EA.create_candidate(
+        conn, new_params, strategy_id=None, source="evolve",
+        reason=f"{reason}: " + "; ".join(adjustments),
+        parent_id=current["id"], performance_snapshot=metrics, validate=True,
     )
-    new_id = cursor.lastrowid
+    new_id = created["params_id"]
 
     # 记录进化事件
     conn.execute(
@@ -446,13 +488,20 @@ def evolve(conn, reason: str = "auto") -> dict:
             "changed_keys": changed_keys,
             "old_params": {k: old_params.get(k) for k in changed_keys},
             "new_params": {k: new_params.get(k) for k in changed_keys},
-        }), _json(metrics), now)
+            "activated": False,
+            "validation_state": created.get("validation_state"),
+        }), _json(metrics), _now())
     )
     conn.commit()
 
     return {
         "evolved": True,
         "new_params_id": new_id,
+        # 明确：进化只产出候选，不改变 runtime。生效需要显式激活。
+        "activated": False,
+        "validation_state": created.get("validation_state"),
+        "valid": created.get("valid"),
+        "violations": created.get("violations") or [],
         "adjustments": adjustments,
         "changed_keys": changed_keys,
         "old_params": {k: old_params.get(k) for k in changed_keys},
@@ -462,14 +511,21 @@ def evolve(conn, reason: str = "auto") -> dict:
 
 
 def _find_rollback_target(conn) -> Optional[dict]:
-    """找到合适的回滚目标参数。"""
-    # 找最近一次成功率较高的参数版本
+    """找到合适的回滚目标参数（只考虑**曾经真正生效过**的全局版本）。
+
+    旧实现按 ``evolution_log.event_type='evolve'`` 找，那等于"找一条候选"：
+    候选可能从未生效，把它当回滚目标会退回到一个从未跑过的参数组合。
+    现在只认 activation history 里的版本，且它们天然满足"回滚式候选"的
+    步长豁免（见 ``evolution_activation._matches_activated_row``）。
+    """
     rows = conn.execute(
-        """SELECT ep.id, ep.params
-           FROM evolution_params ep
-           JOIN evolution_log el ON el.params_id = ep.id
-           WHERE el.event_type = 'evolve'
-           ORDER BY ep.id DESC LIMIT 10"""
+        f"""SELECT ep.id, ep.params
+            FROM evolution_params ep
+            JOIN evolution_activation_history h ON h.to_params_id = ep.id
+            WHERE ep.strategy_id IS NULL
+              AND h.action IN ({','.join('?' for _ in EA._SWITCH_ACTIONS)})
+            ORDER BY ep.id DESC LIMIT 10""",
+        tuple(EA._SWITCH_ACTIONS),
     ).fetchall()
 
     for row in rows:
@@ -493,6 +549,9 @@ def _find_rollback_target(conn) -> Optional[dict]:
 def manual_adjust(conn, adjustments: dict, reason: str = "manual") -> dict:
     """手动调整进化参数。
 
+    与 ``evolve`` 一致：只**生成候选**，不激活。人工调整同样要走
+    "生成 → 校验 → 显式激活"，否则"人工"就成了一条绕过激活门的后门。
+
     Args:
         adjustments: 要调整的参数键值对
         reason: 调整原因
@@ -507,12 +566,11 @@ def manual_adjust(conn, adjustments: dict, reason: str = "manual") -> dict:
     if not changed_keys:
         return {"adjusted": False, "reason": "无变化"}
 
-    now = _now()
-    cursor = conn.execute(
-        "INSERT INTO evolution_params(version, params, source, reason, parent_id, created_at) VALUES(?,?,?,?,?,?)",
-        (EVOLUTION_VERSION, _json(new_params), "manual", reason, current["id"], now)
+    created = EA.create_candidate(
+        conn, new_params, strategy_id=None, source="manual", reason=reason,
+        parent_id=current["id"], validate=True,
     )
-    new_id = cursor.lastrowid
+    new_id = created["params_id"]
 
     conn.execute(
         "INSERT INTO evolution_log(event_type, params_id, detail, created_at) VALUES(?,?,?,?)",
@@ -522,13 +580,19 @@ def manual_adjust(conn, adjustments: dict, reason: str = "manual") -> dict:
             "old_params": {k: old_params.get(k) for k in changed_keys},
             "new_params": {k: new_params.get(k) for k in changed_keys},
             "reason": reason,
-        }), now)
+            "activated": False,
+            "validation_state": created.get("validation_state"),
+        }), _now())
     )
     conn.commit()
 
     return {
         "adjusted": True,
         "new_params_id": new_id,
+        "activated": False,
+        "validation_state": created.get("validation_state"),
+        "valid": created.get("valid"),
+        "violations": created.get("violations") or [],
         "changed_keys": changed_keys,
         "old_params": {k: old_params.get(k) for k in changed_keys},
         "new_params": {k: new_params.get(k) for k in changed_keys},
@@ -566,38 +630,40 @@ def adjust_strategy_dsl_parameters(paper_conn, strategy_id: str, adjustments: di
 
 
 def _ensure_strategy_column(conn) -> None:
-    """幂等补齐 evolution_params.strategy_id 列（旧库迁移）。"""
-    columns = {row[1] for row in conn.execute("PRAGMA table_info(evolution_params)").fetchall()}
-    if "strategy_id" not in columns:
-        conn.execute("ALTER TABLE evolution_params ADD COLUMN strategy_id TEXT")
+    """幂等补齐 evolution_params 的生命周期列（旧库迁移）。"""
+    EA._ensure_params_columns(conn)
 
 
 def get_strategy_params(conn, strategy_id: str) -> dict:
-    """获取策略专属进化参数；没有专属行时回落到全局默认并套用画像边界。"""
+    """获取策略**当前生效**的进化参数。
+
+    - 策略有专属 active 指针 → 用该指针指向的行（按画像收紧边界）；
+    - 没有专属指针 → 继承全局 active（同样按画像收紧）。
+
+    两种情况下都**不再**按 id 顺序取"最新行"：一条刚生成的候选不再等于生效。
+    """
     import evolution_profiles as EP
 
-    _ensure_strategy_column(conn)
-    row = conn.execute(
-        """SELECT id, params, version, source, created_at FROM evolution_params
-            WHERE strategy_id=? ORDER BY id DESC LIMIT 1""",
-        (str(strategy_id or ""),),
-    ).fetchone()
+    EA.ensure_ready(conn)
+    sid = str(strategy_id or "")
     profile = EP.evolution_profile_for(strategy_id)
-    if row is not None:
+    effective = EA.resolve_effective(conn, sid)
+    active = effective["active"]
+    base = dict(active["params"]) if active is not None else _default_params()
+    if active is None:
+        # 全新库：从出厂默认出发生成画像内的只读视图（不落库）。
         return {
-            "id": row[0], "strategy_id": str(strategy_id),
-            "params": EP.clamp_to_profile(strategy_id, _loads(row[1], _default_params())),
-            "version": row[2], "source": row[3], "created_at": row[4],
-            "profile": profile,
+            "id": None, "strategy_id": sid,
+            "params": EP.clamp_to_profile(strategy_id, base),
+            "version": EVOLUTION_VERSION, "source": "default",
+            "created_at": None, "profile": profile, "inherited_from": None,
         }
-    # 无专属行：从全局默认出发生成画像内的初始视图（不落库，只读视图）。
-    global_params = dict(get_current_params(conn)["params"])
-    tuned = {key: global_params[key] for key in profile["tunable"] if key in global_params}
     return {
-        "id": None, "strategy_id": str(strategy_id or ""),
-        "params": {**global_params, **EP.clamp_to_profile(strategy_id, tuned)},
-        "version": EVOLUTION_VERSION, "source": "global_default",
-        "created_at": None, "profile": profile,
+        "id": active["id"], "strategy_id": sid,
+        "params": EP.clamp_to_profile(strategy_id, base),
+        "version": active["version"], "source": active["source"],
+        "created_at": active["created_at"], "profile": profile,
+        "inherited_from": effective.get("inherited_from"),
     }
 
 
@@ -666,14 +732,36 @@ def adjust_strategy_params(conn, strategy_id: str, adjustments: dict, *,
         # 无变化（重试同值）：不落新版本，避免重复版本污染回滚链。
         return {"adjusted": False, "reason": "无变化",
                 "strategy_id": str(strategy_id)}
-    now = _now()
-    cursor = conn.execute(
-        """INSERT INTO evolution_params(version, params, source, reason, parent_id, created_at, strategy_id)
-           VALUES(?,?,?,?,?,?,?)""",
-        (EVOLUTION_VERSION, _json(new_params), source, reason, current["id"], now,
-         str(strategy_id)),
+    # 已经有一个等价的待激活候选时也不重复落版本（同样的理由：
+    # 不要让"反复点同一个按钮"堆出成百上千条一模一样的候选）。
+    effective = EA.resolve_effective(conn, str(strategy_id))
+    duplicate = EA.find_equivalent_candidate(
+        conn, new_params, strategy_id=str(strategy_id),
+        base_params_id=effective["pointer_params_id"],
     )
-    new_id = cursor.lastrowid
+    if duplicate is not None:
+        conn.execute(
+            "INSERT INTO evolution_log(event_type, params_id, detail, created_at) VALUES(?,?,?,?)",
+            ("strategy_adjust_duplicate", duplicate, _json({
+                "strategy_id": str(strategy_id),
+                "adjustments": dict(adjustments or {}),
+                "changed_keys": changed_keys,
+                "reason": reason,
+                "deduped": True,
+            }), _now()),
+        )
+        conn.commit()
+        return {"adjusted": False, "reason": "等价候选已存在（尚未激活）",
+                "existing_params_id": duplicate,
+                "strategy_id": str(strategy_id)}
+    # 只生成**候选**：校验通过 ≠ 生效。生效必须由显式激活入口推进指针。
+    # 风险放大提案的闭环（pending → promoted）同样推迟到激活时执行 ——
+    # 否则一条从未生效的候选会提前消费掉观察期提案。
+    created = EA.create_candidate(
+        conn, new_params, strategy_id=str(strategy_id), source=source, reason=reason,
+        parent_id=current["id"], evidence_count=evidence_count, validate=True,
+    )
+    new_id = created["params_id"]
     conn.execute(
         "INSERT INTO evolution_log(event_type, params_id, detail, created_at) VALUES(?,?,?,?)",
         ("strategy_adjust", new_id, _json({
@@ -684,15 +772,18 @@ def adjust_strategy_params(conn, strategy_id: str, adjustments: dict, *,
             "new_params": {k: new_params.get(k) for k in changed_keys},
             "profile": check["profile"]["label"],
             "reason": reason,
-        }), now),
+            "activated": False,
+            "validation_state": created.get("validation_state"),
+        }), _now()),
     )
-    # 放大落地后闭环提案生命周期（pending → promoted）。
-    for expansion in gate["expansions"]:
-        AR.promote_proposal(conn, str(strategy_id), expansion["key"], expansion["new"],
-                            actor=source)
     conn.commit()
     return {
         "adjusted": True, "strategy_id": str(strategy_id), "new_params_id": new_id,
+        # 明确：本入口只产出候选；runtime 未变。
+        "activated": False,
+        "validation_state": created.get("validation_state"),
+        "valid": created.get("valid"),
+        "violations": created.get("violations") or [],
         "changed_keys": changed_keys,
         "old_params": {k: current["params"].get(k) for k in changed_keys},
         "new_params": {k: new_params.get(k) for k in changed_keys},
@@ -701,54 +792,87 @@ def adjust_strategy_params(conn, strategy_id: str, adjustments: dict, *,
 
 
 def rollback_strategy_params(conn, strategy_id: str, reason: str = "strategy_rollback") -> dict:
-    """把策略专属参数回滚到上一版（重新插入旧版，保留完整审计链）。"""
-    _ensure_strategy_column(conn)
-    rows = conn.execute(
-        """SELECT id, params FROM evolution_params
-            WHERE strategy_id=? ORDER BY id DESC LIMIT 2""",
-        (str(strategy_id or ""),),
-    ).fetchall()
-    if not rows:
-        return {"rolled_back": False, "reason": "该策略没有专属参数版本"}
-    if len(rows) < 2:
-        # 只有一版 = 尚无可回滚目标：回落到**当前全局参数**（该策略继承的
-        # 基线），而不是硬编码出厂默认——否则已手动调整过的全局值会被静默重置。
-        inherited = dict(get_current_params(conn)["params"])
-        now = _now()
-        cursor = conn.execute(
-            """INSERT INTO evolution_params(version, params, source, reason, parent_id, created_at, strategy_id)
-               VALUES(?,?,?,?,?,?,?)""",
-            (EVOLUTION_VERSION, _json(inherited), "rollback",
-             reason + "：仅一版，回落全局默认", rows[0][0], now, str(strategy_id)),
-        )
-        conn.execute(
-            "INSERT INTO evolution_log(event_type, params_id, detail, created_at) VALUES(?,?,?,?)",
-            ("strategy_rollback", cursor.lastrowid, _json({
-                "strategy_id": str(strategy_id), "target": "global_default",
-                "reason": reason,
-            }), now),
-        )
-        conn.commit()
-        return {"rolled_back": True, "strategy_id": str(strategy_id),
-                "target": "global_default", "new_params_id": cursor.lastrowid}
-    previous = dict(rows[1])
-    now = _now()
-    cursor = conn.execute(
-        """INSERT INTO evolution_params(version, params, source, reason, parent_id, created_at, strategy_id)
-           VALUES(?,?,?,?,?,?,?)""",
-        (EVOLUTION_VERSION, previous["params"], "rollback", reason,
-         rows[0][0], now, str(strategy_id)),
-    )
+    """把策略参数回滚到**上一次显式激活之前**的版本。
+
+    目标完全由 ``evolution_activation_history`` 决定，不再取"第二新版本"：
+    行 id 顺序与"曾经生效的顺序"无关（候选会不断插进版本链），按 id 回滚会
+    滚到一个从未生效过的候选上。
+
+    策略从未有过专属指针（一直继承全局）时是 no-op。
+    重复调用幂等 —— 不会向历史深处继续滚。
+    """
+    EA.ensure_ready(conn)
+    sid = str(strategy_id or "")
+    result = EA.rollback_active(conn, strategy_id=sid,
+                               actor="rollback_strategy_params", reason=reason)
+    if not result.get("rolled_back"):
+        return {
+            "rolled_back": False, "strategy_id": sid,
+            "reason": result.get("reason") or "无可回滚的激活历史",
+        }
+    target_params_id = result.get("target_params_id")
+    target = "global_default" if result.get("target") == "inherit_global" \
+        else f"params:{target_params_id}"
     conn.execute(
         "INSERT INTO evolution_log(event_type, params_id, detail, created_at) VALUES(?,?,?,?)",
-        ("strategy_rollback", cursor.lastrowid, _json({
-            "strategy_id": str(strategy_id), "target_params_id": previous["id"],
+        ("strategy_rollback", target_params_id, _json({
+            "strategy_id": sid,
+            "target": target,
+            "target_params_id": target_params_id,
+            "previous_params_id": result.get("previous_params_id"),
             "reason": reason,
-        }), now),
+        }), _now()),
     )
     conn.commit()
-    return {"rolled_back": True, "strategy_id": str(strategy_id),
-            "target_params_id": previous["id"], "new_params_id": cursor.lastrowid}
+    return {
+        "rolled_back": True, "strategy_id": sid,
+        "target": target, "target_params_id": target_params_id,
+        "previous_params_id": result.get("previous_params_id"),
+        "scope_key": result.get("scope_key"),
+    }
+
+
+# ---------------------------------------------------------------------------
+# 生命周期入口：候选生成 与 生效 彻底分离
+#
+# evolve / manual_adjust / adjust_strategy_params 只写版本链（候选）；
+# 只有下面这些入口能读/写 active 指针。
+# ---------------------------------------------------------------------------
+
+
+def activate_params_candidate(conn, params_id: int, *, actor: str,
+                              reason: Optional[str] = None) -> dict:
+    """显式激活一个已校验的候选 —— **唯一**改变 runtime 参数的入口。
+
+    前置条件（任一不满足即拒绝，绝不静默覆盖或自动 rebase）：
+    候选存在、未被拒绝、``validation_state == validated``、
+    且候选创建时的 base 仍等于当前 effective active（stale CAS）。
+    """
+    return EA.activate_params_candidate(conn, params_id, actor=actor, reason=reason)
+
+
+def lifecycle_view(conn, strategy_id: Optional[str] = None) -> dict:
+    """读模型：显式区分 ACTIVE / latest CANDIDATE / VALIDATED-PENDING。"""
+    return EA.lifecycle_view(conn, strategy_id)
+
+
+def validated_pending(conn, strategy_id: Optional[str] = None) -> list:
+    """已通过校验、但尚未激活的候选（等待人工/晋升显式批准）。"""
+    return EA.validated_pending(conn, strategy_id)
+
+
+def activation_history(conn, strategy_id: Optional[str] = None, limit: int = 50) -> list:
+    """append-only 的激活历史。"""
+    return EA.activation_history(conn, strategy_id, limit=limit)
+
+
+def pending_candidate_counts(conn) -> dict:
+    return EA.pending_candidate_counts(conn)
+
+
+def assert_pointer_integrity(conn) -> None:
+    """指针必须指向存在的行；否则抛 ``EvolutionLifecycleError``（fail closed）。"""
+    EA.assert_pointer_integrity(conn)
 
 
 def get_evolution_history(conn, limit: int = 20) -> list:
@@ -782,10 +906,35 @@ def get_evolution_log(conn, limit: int = 50) -> list:
 
 def evolution_status(conn) -> dict:
     """返回自进化系统的完整状态。"""
-    current = get_current_params(conn)
     metrics = get_performance_metrics(conn, 20)
     should, should_reason = should_evolve(conn)
     recent_log = get_evolution_log(conn, 10)
+
+    # 生命周期读模型：active 指针 / 最新候选 / 待激活候选 / 激活历史。
+    # 指针损坏时**把故障报出来**，而不是让状态页 500。
+    #
+    # 注意 `get_current_params` 也要包在同一个 try 里：全局指针悬空时它同样会
+    # 抛 `EvolutionLifecycleError`（fail closed），漏掉它的话这个降级分支
+    # 就成了永远走不到的死代码，状态页照样 500。
+    #
+    # 降级后 `current_params` 显式标记 unavailable —— 是"没有可信任的生效
+    # 参数"，**不是**悄悄用 latest row 顶上。
+    try:
+        current = get_current_params(conn)
+        lifecycle = lifecycle_view(conn)
+        lifecycle_healthy = True
+    except EA.EvolutionLifecycleError as exc:
+        current = {
+            "id": None,
+            "params": _default_params(),
+            "version": EVOLUTION_VERSION,
+            "source": "unavailable",
+            "created_at": None,
+            "unavailable": True,
+            "error": str(exc),
+        }
+        lifecycle = {"error": str(exc)}
+        lifecycle_healthy = False
 
     return {
         "version": EVOLUTION_VERSION,
@@ -795,6 +944,9 @@ def evolution_status(conn) -> dict:
         "should_evolve_reason": should_reason,
         "bounds": BOUNDS,
         "recent_events": recent_log,
+        "lifecycle": lifecycle,
+        "lifecycle_healthy": lifecycle_healthy,
+        "pending_candidates": pending_candidate_counts(conn),
         "config": {
             "min_samples": MIN_SAMPLES_FOR_EVOLUTION,
             "cooldown_seconds": EVOLUTION_COOLDOWN_SECONDS,
@@ -805,7 +957,12 @@ def evolution_status(conn) -> dict:
 
 
 def auto_evolve_if_needed(conn) -> Optional[dict]:
-    """自动检查并执行进化（如果需要）。"""
+    """自动检查并执行进化（如果需要）。
+
+    注意：自动进化只**生成候选**，绝不激活。runtime 参数的变更必须由
+    ``activate_params_candidate`` 显式批准 —— 否则"自动"就成了一条
+    绕过激活门的路径。
+    """
     should, reason = should_evolve(conn)
     if not should:
         return None

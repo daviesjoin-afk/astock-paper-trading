@@ -335,6 +335,43 @@ def promote_proposal(conn, strategy_id: str, key: str, new_value: Any,
                             actor=actor, note="expansion applied to production parameters")
 
 
+def promote_proposal_tx(conn, strategy_id: str, key: str, new_value: Any,
+                       *, actor: str = "", note: str = "") -> int:
+    """**事务内**闭环一条 pending 提案：不建表、不 commit、不吞异常。
+
+    返回受影响行数（0 = 没有匹配的 pending 提案，**调用方必须视为失败**）。
+
+    为什么不能直接用 ``promote_proposal()``：它走
+    ``_proposal_key_match → ensure_proposals_table → executescript``，并经由
+    ``resolve_proposal`` 内部 ``conn.commit()``。``executescript`` 与显式
+    commit 都会把外层**尚未提交**的写入提前落盘 —— 激活路径上这会先把
+    active pointer / history / log 提交掉，之后的 rollback 就撤不回来了。
+
+    调用方负责在开启事务前先把表建好（``ensure_proposals_table``），本函数
+    遇到任何 SQLite 错误都直接冒泡，绝不静默返回 0。
+    """
+    target = _as_number(new_value)
+    if target is None:
+        return 0
+    row = conn.execute(
+        """SELECT id FROM risk_expansion_proposals
+            WHERE strategy_id=? AND key=? AND status='pending'
+              AND ABS(new_value-?)<1e-9
+            ORDER BY proposed_at DESC LIMIT 1""",
+        (str(strategy_id), str(key), target),
+    ).fetchone()
+    if row is None:
+        return 0
+    cursor = conn.execute(
+        """UPDATE risk_expansion_proposals
+              SET status='promoted', resolved_at=?, resolved_by=?, note=?
+            WHERE id=? AND status='pending'""",
+        (dt.datetime.now().isoformat(timespec="seconds"), str(actor or ""),
+         str(note or ""), int(row[0])),
+    )
+    return int(cursor.rowcount)
+
+
 def reject_proposal(conn, proposal_id: int, *, actor: str = "", note: str = "") -> bool:
     """人工拒绝一条放大提案（不可再被任何路径自动生效）。"""
     return resolve_proposal(conn, proposal_id, "rejected", actor=actor, note=note or "manual rejection")

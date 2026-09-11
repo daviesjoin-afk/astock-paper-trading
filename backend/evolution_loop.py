@@ -183,11 +183,17 @@ class ProductionBackend(Backend):
     def mutate(self, conn, generation, ctx):
         import self_evolution as SE
         result = SE.auto_evolve_if_needed(conn)
+        # 自动进化只生成候选，绝不激活。这里回填的必须是"仍然生效的"参数 id：
+        # 把候选 id 写进 params_id_end 会让代际快照看起来像是已经生效了，
+        # 那正是 latest row == active 的老毛病。
+        cur = SE.get_current_params(conn)
         if result is None:
-            return {"mutated": False, "params_id": ctx.get("params_id_start")}
+            return {"mutated": False, "params_id": cur["id"]}
         return {
             "mutated": True,
-            "params_id": result.get("new_params_id"),
+            "params_id": cur["id"],
+            "candidate_params_id": result.get("new_params_id"),
+            "candidate_validation_state": result.get("validation_state"),
             "adjustments": result.get("adjustments", []),
             "changed_keys": result.get("changed_keys", []),
         }
