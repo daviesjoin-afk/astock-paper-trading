@@ -500,12 +500,22 @@ def build_factor_table(
     table["adjustment_warning"] = price.get(
         "adjustment_warning", pd.Series(False, index=idx)
     ).reindex(idx).fillna(False).astype(bool)
-    for factor in ("mom_short", "mom", "volsurge", "rsi"):
-        table[f"{factor}_evidence_quality"] = price_quality.where(
-            table[factor].notna(), 0.0
-        )
-    table["value_evidence_quality"] = table["value"].notna().astype(float)
-    table["quality_evidence_quality"] = table["quality"].notna().astype(float)
+    table["mom_short_evidence_quality"] = price_quality.where(mom5_z.notna(), 0.0)
+    table["mom_evidence_quality"] = price_quality * (
+        mom20_z.notna().astype(float) * 0.6 + mom60_z.notna().astype(float) * 0.4
+    )
+    table["volsurge_evidence_quality"] = price_quality.where(
+        table["volsurge"].notna(), 0.0
+    )
+    table["rsi_evidence_quality"] = price_quality.where(table["rsi"].notna(), 0.0)
+    table["value_evidence_quality"] = (
+        pe_z.notna().astype(float) * 0.5 + pb_z.notna().astype(float) * 0.5
+    )
+    table["quality_evidence_quality"] = (
+        roe_z.notna().astype(float) * 0.5
+        + profit_z.notna().astype(float) * 0.25
+        + revenue_z.notna().astype(float) * 0.25
+    )
 
     proxy_flow = F.zscore(price["flow_proxy"], fill_missing=False)
     if realtime_flow:

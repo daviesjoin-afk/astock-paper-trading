@@ -224,6 +224,21 @@ class FactorTableTests(unittest.TestCase):
         self.assertEqual(float(table.loc[code, "mom_evidence_quality"]), 0.7)
         self.assertEqual(table.attrs["factor_calibration_version"], FC.CALIBRATION_VERSION)
 
+    def test_nested_composite_quality_tracks_component_coverage(self):
+        price, fund = self._frames()
+        code = price.index[0]
+        fund.loc[code, "pb"] = np.nan
+        fund.loc[code, "profit_yoy"] = np.nan
+        fund.loc[code, "rev_yoy"] = np.nan
+        price.loc[code, "mom60"] = np.nan
+        table = S.build_factor_table(price, fund)
+        self.assertAlmostEqual(float(table.loc[code, "value_evidence_quality"]), 0.5)
+        self.assertAlmostEqual(float(table.loc[code, "quality_evidence_quality"]), 0.5)
+        self.assertAlmostEqual(float(table.loc[code, "mom_evidence_quality"]), 0.6)
+        self.assertTrue(pd.notna(table.loc[code, "value"]))
+        self.assertTrue(pd.notna(table.loc[code, "quality"]))
+        self.assertTrue(pd.notna(table.loc[code, "mom"]))
+
 
 class RuntimeCalibrationTests(unittest.TestCase):
     def _table(self, with_sentiment=False):
