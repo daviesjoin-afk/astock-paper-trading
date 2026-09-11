@@ -475,7 +475,7 @@ def resolve_effective(conn, strategy_id: Optional[str] = None) -> dict:
     global_active = resolve_scope_active(conn, SCOPE_GLOBAL)
     if global_active is not None:
         return {
-            "source": "global" if strategy_id else "global",
+            "source": "global",
             "scope_key": SCOPE_GLOBAL,
             "active": global_active,
             "pointer_params_id": global_active["id"],
