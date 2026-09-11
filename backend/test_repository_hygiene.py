@@ -292,7 +292,9 @@ class DocumentationLinkTests(unittest.TestCase):
         # 明确不许删的正式文档必须仍在原位。
         for rel in ("docs/RELEASE-v1.1.0.md", "docs/RELEASE-v1.2.0.md",
                     "docs/RUNBOOK.md", "docs/TEST_MATRIX.md", "docs/SETTINGS_PRD.md",
-                    "docs/DEMO.md", "ARCHITECTURE.md", "docs/PRD-architecture-hardening.md"):
+                    "docs/DEMO.md", "docs/STRATEGY_PLATFORM.md",
+                    "docs/EVOLUTION_ARCHITECTURE.md",
+                    "ARCHITECTURE.md", "docs/PRD-architecture-hardening.md"):
             self.assertTrue(os.path.isfile(os.path.join(ROOT, rel)), rel)
 
     def test_layout_and_archive_docs_exist(self):

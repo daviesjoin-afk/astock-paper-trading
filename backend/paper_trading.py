@@ -7889,7 +7889,7 @@ STRATEGY_POOL_FLOOR_RATIO = 0.60
 SHARED_POOL_MAX_POSITIONS = 15
 STRATEGY_MIN_POSITIONS = 2
 STRATEGY_MAX_POSITIONS = 6
-# 五套模型共用资金但代表不同的市场假设。15 席总池下每策略保底 2 席，
+# 各参与策略共用资金但代表不同的市场假设。15 席总池下每策略保底 2 席，
 # 该底座只保护"席位数"，不会放宽总暴露、单票/行业上限、行情校验或
 # 单笔风险预算。
 STRATEGY_PROTECTED_SLOT_FLOOR = 2

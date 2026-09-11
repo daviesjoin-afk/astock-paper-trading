@@ -6,7 +6,9 @@ import datetime as dt
 from unittest import mock
 
 
-# The unit tests mock all network access and do not require requests locally.
+# Hermetic offline test: the real ``requests`` client is replaced before import
+# so no code path can reach the network (the runtime image does install
+# ``requests``; the stub is deliberate isolation, not a missing dependency).
 sys.modules.setdefault("requests", mock.MagicMock())
 sys.path.insert(0, os.path.dirname(__file__))
 import alt_data as AD  # noqa: E402

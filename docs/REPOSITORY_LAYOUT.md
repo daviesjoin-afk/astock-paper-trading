@@ -10,10 +10,11 @@ backend/            Python 后端：HTTP、策略域、模拟盘域、数据与�
 frontend/src/       前端源码：ESM 模块（入口 src/app.js + bridge.js + boot.js）
 frontend/styles/    样式片段（styles/index.css 按原顺序 @import）
 frontend/dist/      **构建产物（提交物）**：由 esbuild 打包，服务端直接下发
-docs/               运行手册、设置 PRD、测试矩阵、发布说明、本文件
+frontend/e2e/       Playwright 浏览器 E2E（合成数据 server.py + specs/ 关键旅程）
+docs/               运行手册、设置 PRD、策略平台、自进化、测试矩阵、发布说明、本文件
 docs/archive/       已完成的历史计划与快照（只作追溯）
 deploy/             服务器脚本（备份/恢复/健康检查/cron）
-.github/workflows/  CI（语法、ruff、锁文件、pip-audit、前端、测试 3.11/3.12、Docker 冒烟）
+.github/workflows/  CI（语法、ruff、锁文件、pip-audit、前端、测试 3.11/3.12、浏览器 E2E、Docker 冒烟）
 Dockerfile          应用镜像；docker-compose*.yml 本地与服务器编排
 ```
 
@@ -49,9 +50,15 @@ Dockerfile          应用镜像；docker-compose*.yml 本地与服务器编排
   `strategy_dsl`（**对外 facade**，保留）
 - **风险与执行**：`strategy_risk_fingerprint`、`strategy_risk_profiles`、
   `strategy_risk_enforcement`（非对称风险门）、`strategy_parameter_schema`
-- **运行时**：`strategy_runtime`（编译期画像 + 缓存）、`strategy_creation_preview`（创建预览）
-- **治理**：`strategy_clusters`（同构归簇）、`strategy_champion`（晋升/回滚）、
-  `strategy_policies`（策略级策略表）
+- **运行时**：`strategy_runtime`（编译期画像 + 缓存）、`strategy_creation_preview`（创建预览）、
+  `user_strategy_participation`（用户策略接入生产链路）
+- **订单意图与执行**：`order_intent`（意图契约，拒绝数量越权）、`execution_planner`
+  （中央计划/复核/落库）、`execution_dispatch`
+- **治理与进化**：`strategy_clusters`（同构归簇）、`strategy_champion`（晋升/回滚）、
+  `strategy_policies`（策略级策略表）、`evolution_loop`、`evolution_apply`、
+  `evolution_validation`、`asymmetric_risk`、`self_evolution`
+- 策略数据模型、生命周期与删除边界的完整说明见 [`STRATEGY_PLATFORM.md`](STRATEGY_PLATFORM.md)；
+  自进化链路见 [`EVOLUTION_ARCHITECTURE.md`](EVOLUTION_ARCHITECTURE.md)。
 
 ### 4. 模拟盘域：`paper_*.py`
 
@@ -68,6 +75,26 @@ Dockerfile          应用镜像；docker-compose*.yml 本地与服务器编排
 `data_fetcher`（兼容入口）+ `marketdata_*`（transport / cache / providers / normalizers）、
 `universe`、`factors`、`decision_*`、`adaptive_*`、`asymmetric_risk`、`build_info`。
 
+## frontend/ 结构
+
+```
+frontend/src/        当前前端源码（ESM）：入口 app.js + bridge.js + boot.js
+  core/              api.js（唯一 HTTP 出口）· dom.js · format.js · navigation.js（页面与路由）· state.js · strategy_labels.js
+  features/          strategies（策略工坊）· settings（设置中心）· paper（模拟盘）· selection · execution · risk · adaptive
+  ui/                dialog.js（toast / 内联错误 / 确认框 / 输入框）
+frontend/styles/     样式片段（index.css 按原顺序 @import）
+frontend/dist/       **构建产物（提交物）**：由 esbuild 打包，服务端直接下发 /app.js 与 /app.css
+frontend/e2e/        Playwright 浏览器 E2E（server.py 起合成数据实例 + specs/ 关键旅程）
+frontend/build.mjs   构建脚本
+```
+
+模块级说明、功能归属与依赖表见 [`../frontend/src/README.md`](../frontend/src/README.md)。
+
+两个需要留意的**迁移缝**（过渡结构，不是目标架构）：
+
+- `frontend/src/bridge.js`：把 inline `onclick` 需要的函数挂到 `window` 的兼容层；新代码不应新增 inline handler，长期目标是改为事件绑定并删除该文件。
+- `frontend/src/boot.js`：集中执行顶层语句以保持拆分前的就绪顺序；待各模块显式 `init()` 后应退化为普通入口装配点。
+
 ## frontend/dist
 
 **构建产物，必须与源码同步提交**：
@@ -83,6 +110,7 @@ CI 会重建并校验一致性；服务端 `/app.js`、`/app.css` 直接下发 `
 ## docs/ 与 docs/archive/
 
 - 现行文档：`RUNBOOK`（运行手册）、`SETTINGS_PRD`、`TEST_MATRIX`、`DEMO`、
+  `STRATEGY_PLATFORM`（策略数据模型与生命周期）、`EVOLUTION_ARCHITECTURE`（自进化链路）、
   `RELEASE-v*`（**发布说明，不删除**）、`PRD-architecture-hardening`（仍然有效的分阶段计划）、本文件。
 - `docs/archive/`：**已完成**的历史计划与快照（含带日期的交接记录与仓库规范评审）。
   归档不等于删除——保留可追溯性，但不再代表当前设计；其中的路径/提交可能已过时。
