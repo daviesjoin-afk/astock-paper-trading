@@ -185,13 +185,20 @@ def score_factors(
 
 
 def rank_ic(factor, forward_return, *, minimum_pairs: int = 5) -> float | None:
-    """Spearman rank IC using only explicit factor/return pairs."""
+    """Spearman rank IC using only explicit factor/return pairs.
+
+    Compute Spearman as Pearson correlation of average ranks so this primitive
+    stays within the repository's locked NumPy/Pandas dependency set instead of
+    importing SciPy through ``Series.corr(method='spearman')``.
+    """
     left = _float_series(factor)
     right = _float_series(forward_return).reindex(left.index)
     paired = pd.concat([left.rename("factor"), right.rename("forward")], axis=1).dropna()
     if len(paired) < int(minimum_pairs):
         return None
-    value = paired["factor"].corr(paired["forward"], method="spearman")
+    factor_rank = paired["factor"].rank(method="average")
+    forward_rank = paired["forward"].rank(method="average")
+    value = factor_rank.corr(forward_rank)
     return float(value) if value is not None and math.isfinite(float(value)) else None
 
 
@@ -201,7 +208,9 @@ def icir(values: Sequence[float | None], *, minimum_periods: int = 3) -> float |
     if len(clean) < int(minimum_periods):
         return None
     std = float(np.std(clean, ddof=1))
-    if not math.isfinite(std) or std <= 0:
+    scale = max(1.0, max(abs(value) for value in clean))
+    numerical_zero = np.finfo(float).eps * scale * max(1, len(clean))
+    if not math.isfinite(std) or std <= numerical_zero:
         return None
     return float(np.mean(clean) / std)
 
