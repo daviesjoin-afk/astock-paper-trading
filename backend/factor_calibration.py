@@ -27,6 +27,21 @@ FULL_QUALITY = 1.0
 PROXY_QUALITY = 0.60
 UNADJUSTED_PRICE_QUALITY = 0.70
 MIN_RUNTIME_EVIDENCE_QUALITY = 0.60
+MAX_FACTOR_GROUP_WEIGHT = 0.50
+
+# Groups are economic evidence families, not arbitrary display categories.
+# The runtime cap prevents adaptive weight overrides from recreating correlated
+# double-voting after the raw factor definitions have been de-duplicated.
+FACTOR_GROUPS = {
+    "value": "fundamental",
+    "quality": "fundamental",
+    "mom_short": "momentum",
+    "mom": "momentum",
+    "flow": "liquidity",
+    "volsurge": "liquidity",
+    "sentiment": "sentiment",
+    "rsi": "reversal",
+}
 
 
 @dataclass(frozen=True)
@@ -69,6 +84,41 @@ def weighted_available(
         numerator = numerator.add(series.where(known, 0.0) * weight, fill_value=0.0)
         denominator = denominator.add(known.astype(float) * weight, fill_value=0.0)
     return numerator.div(denominator.where(denominator > 0))
+
+
+def weight_group_totals(
+    weights: Mapping[str, float],
+    *,
+    factor_groups: Mapping[str, str] = FACTOR_GROUPS,
+) -> dict[str, float]:
+    """Aggregate positive finite weights by economic evidence family."""
+    totals: dict[str, float] = {}
+    for factor, raw_weight in weights.items():
+        if not isinstance(raw_weight, (int, float)) or isinstance(raw_weight, bool):
+            continue
+        weight = float(raw_weight)
+        if not math.isfinite(weight) or weight <= 0:
+            continue
+        group = str(factor_groups.get(str(factor), str(factor)))
+        totals[group] = totals.get(group, 0.0) + weight
+    return totals
+
+
+def group_caps_ok(
+    weights: Mapping[str, float],
+    *,
+    factor_groups: Mapping[str, str] = FACTOR_GROUPS,
+    maximum: float = MAX_FACTOR_GROUP_WEIGHT,
+    tolerance: float = 1e-12,
+) -> bool:
+    """Whether no correlated evidence family exceeds the declared cap."""
+    cap = float(maximum)
+    if not math.isfinite(cap) or cap <= 0:
+        return False
+    return all(
+        total <= cap + float(tolerance)
+        for total in weight_group_totals(weights, factor_groups=factor_groups).values()
+    )
 
 
 def score_factors(
@@ -161,8 +211,8 @@ def neutralize_by_group(values, groups, *, minimum_group_size: int = 2) -> pd.Se
     series = _float_series(values)
     group_series = pd.Series(groups).reindex(series.index)
     result = pd.Series(np.nan, index=series.index, dtype="float64")
-    for group, positions in group_series.dropna().groupby(group_series.dropna()).groups.items():
-        del group  # group identity is intentionally not interpreted here.
+    known_groups = group_series.dropna()
+    for positions in known_groups.groupby(known_groups).groups.values():
         observed = series.loc[positions].dropna()
         if len(observed) < int(minimum_group_size):
             continue
