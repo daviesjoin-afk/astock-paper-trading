@@ -138,6 +138,22 @@ def _stub_authorized_expansion(case, *, key="max_weight_delta", old=0.03, new=0.
     case.addCleanup(setattr, EA, "_validate_params_payload", original)
 
 
+def _seed_pending_proposal(conn, *, key="max_weight_delta", old=0.03, new=0.032):
+    """在真实 risk_expansion_proposals 表里登记一条 pending 提案。"""
+    import asymmetric_risk as AR
+
+    AR.ensure_proposals_table(conn)
+    AR.register_proposal(conn, "trend_pullback", key, old, new,
+                         evidence_count=20, actor="test")
+    conn.commit()
+
+
+def _proposal_status(conn):
+    row = conn.execute(
+        "SELECT status FROM risk_expansion_proposals LIMIT 1").fetchone()
+    return None if row is None else row["status"]
+
+
 def _candidate_with_expansion(conn):
     """造一条校验阶段就认定"含已授权放大"的策略候选。"""
     SE.init_params(conn)
@@ -572,6 +588,69 @@ class CandidateImmutabilityTests(unittest.TestCase):
         self.assertEqual(before_pointer, _pointer(conn, GLOBAL))
         self.assertEqual(before_history, _history_count(conn))
 
+    def test_tampered_performance_snapshot_refuses_activation(self):
+        conn = _db()
+        self.addCleanup(conn.close)
+        pid = _validated_global_candidate(conn, max_weight_delta=0.033)
+        self._tamper(conn, pid, performance_snapshot=EA._json({"win_rate": 0.99}))
+        with self.assertRaises(EA.CandidateTampered):
+            EA.activate_params_candidate(conn, pid, actor="test")
+
+    def test_tampered_parent_id_refuses_activation(self):
+        conn = _db()
+        self.addCleanup(conn.close)
+        pid = _validated_global_candidate(conn, max_weight_delta=0.033)
+        self._tamper(conn, pid, parent_id=424242)
+        with self.assertRaises(EA.CandidateTampered):
+            EA.activate_params_candidate(conn, pid, actor="test")
+
+    def test_tampered_created_at_refuses_activation(self):
+        """改 created_at 就是改审计证据，必须拦住。"""
+        conn = _db()
+        self.addCleanup(conn.close)
+        pid = _validated_global_candidate(conn, max_weight_delta=0.033)
+        self._tamper(conn, pid, created_at="2020-01-01T00:00:00+08:00")
+        with self.assertRaises(EA.CandidateTampered):
+            EA.activate_params_candidate(conn, pid, actor="test")
+
+    def test_tampered_reason_refuses_activation(self):
+        conn = _db()
+        self.addCleanup(conn.close)
+        pid = _validated_global_candidate(conn, max_weight_delta=0.033)
+        self._tamper(conn, pid, reason="事后编造的理由")
+        with self.assertRaises(EA.CandidateTampered):
+            EA.activate_params_candidate(conn, pid, actor="test")
+
+    def test_revalidating_tampered_row_cannot_reseal(self):
+        """核心绕过口：validated → 改行 → 再 validate（重新封存）→ activate。
+
+        ``validate_candidate`` 只允许 candidate → validated|rejected，
+        对已 validated 的行绝不重新封存指纹。
+        """
+        conn = _db()
+        self.addCleanup(conn.close)
+        pid = _validated_global_candidate(conn, max_weight_delta=0.033)
+        sealed = EA._params_row(conn, pid)["candidate_fingerprint"]
+        self._tamper(conn, pid, params=json.dumps(dict(BASE_PARAMS, max_weight_delta=0.06)))
+        with self.assertRaises(EA.CandidateTampered):
+            EA.validate_candidate(conn, pid)
+        # 指纹没有被重新封存
+        self.assertEqual(sealed, EA._params_row(conn, pid)["candidate_fingerprint"])
+
+    def test_revalidating_untouched_row_is_idempotent(self):
+        """没被改动的 validated 行重复校验：幂等 no-op，不重写指纹。"""
+        conn = _db()
+        self.addCleanup(conn.close)
+        pid = _validated_global_candidate(conn, max_weight_delta=0.033)
+        before = EA._params_row(conn, pid)
+        outcome = EA.validate_candidate(conn, pid)
+        after = EA._params_row(conn, pid)
+        self.assertEqual(EA.STATE_VALIDATED, outcome["validation_state"])
+        self.assertTrue(outcome["valid"])
+        self.assertFalse(outcome["rescaled"])
+        self.assertEqual(before["candidate_fingerprint"], after["candidate_fingerprint"])
+        self.assertEqual(before["validated_at"], after["validated_at"])
+
     def test_untouched_candidate_still_activates(self):
         """负向对照：没被改动的候选必须照常激活，别把门禁做成误杀。"""
         conn = _db()
@@ -666,96 +745,94 @@ class ConsumerTests(unittest.TestCase):
 
 
 class SideEffectTests(unittest.TestCase):
-    """与"生效"绑定的副作用只在激活时执行，且与激活同生共死。"""
+    """与"生效"绑定的副作用只在激活时执行，且与激活真正同事务。
 
-    def test_risk_expansion_proposal_closes_only_at_activation(self):
-        """放大提案在候选阶段不动，激活时才 promote。
+    上一版这里 monkeypatch ``AR.promote_proposal``，是**假**的原子性证明：
+    真实 ``promote_proposal`` 走 ``resolve_proposal``，而后者内部
+    ``conn.commit()``，会把外层尚未提交的 pointer/history/log 一起提交掉，
+    之后再 rollback 也撤不回来。所以本组测试一律走**真实提案表 + 真实
+    transition**，故障注入用 SQLite trigger（真正打断 UPDATE 那一刻）。
+    """
 
-        注意：这里走**真实校验路径**产生 expansion（登记提案并把观察期
-        回拨到窗口之外），不再直接改写 validation_detail —— 后者现在会
-        触发指纹不匹配而被拒绝，那正是想要的 invariant。
-        """
-        conn = _db()
-        self.addCleanup(conn.close)
+    def _activate_with_real_proposal(self, conn, *, seed=True):
+        """造好"含一条已授权放大"的候选；seed=False 时不登记 pending 提案。"""
         _stub_authorized_expansion(self)
+        if seed:
+            _seed_pending_proposal(conn)
         params_id, expansions = _candidate_with_expansion(conn)
         self.assertTrue(expansions, "校验应当把已授权放大封存进 validation_detail")
+        return params_id
 
-        import asymmetric_risk as AR
-        calls: list = []
-        original = AR.promote_proposal
-        AR.promote_proposal = lambda c, s, k, v, actor="": (calls.append((s, k, v)), True)[1]
-        try:
-            # 仅生成候选：提案必须仍未闭环。
-            self.assertEqual([], calls)
-            EA.activate_params_candidate(conn, params_id, actor="test")
-        finally:
-            AR.promote_proposal = original
-        self.assertEqual([("trend_pullback", "max_weight_delta", 0.032)], calls)
-
-    def test_side_effect_failure_rolls_back_the_whole_activation(self):
-        """promote 失败 → 指针/history/log 一起回滚，绝不留半截状态。"""
+    def test_proposal_is_closed_only_at_activation(self):
+        """候选阶段提案不动，激活才 promote —— 走真实 risk_expansion_proposals。"""
         conn = _db()
         self.addCleanup(conn.close)
-        _stub_authorized_expansion(self)
-        params_id, _ = _candidate_with_expansion(conn)
+        params_id = self._activate_with_real_proposal(conn)
+        # 仅生成候选：提案必须仍是 pending。
+        self.assertEqual("pending", _proposal_status(conn))
+        EA.activate_params_candidate(conn, params_id, actor="test")
+        self.assertEqual(params_id, _pointer(conn, "strategy:trend_pullback"))
+        self.assertEqual("promoted", _proposal_status(conn))
+
+    def test_proposal_transition_failure_rolls_back_the_whole_activation(self):
+        """UPDATE 提案失败（trigger 打断）→ pointer/history/proposal 全部回滚。"""
+        conn = _db()
+        self.addCleanup(conn.close)
+        params_id = self._activate_with_real_proposal(conn)
         scope = "strategy:trend_pullback"
 
-        import asymmetric_risk as AR
-        original = AR.promote_proposal
-
-        def boom(*_a, **_k):
-            raise RuntimeError("proposal store unavailable")
-
-        AR.promote_proposal = boom
+        conn.execute(
+            "CREATE TRIGGER trg_proposal_boom BEFORE UPDATE ON risk_expansion_proposals"
+            " BEGIN SELECT RAISE(ABORT, 'proposal store unavailable'); END")
+        conn.commit()
         try:
-            with self.assertRaises(RuntimeError):
+            with self.assertRaises(sqlite3.Error):
                 EA.activate_params_candidate(conn, params_id, actor="test")
         finally:
-            AR.promote_proposal = original
+            conn.execute("DROP TRIGGER trg_proposal_boom")
+            conn.commit()
 
-        # 回滚证据：没有指针、没有激活历史、候选仍是 validated 而非 active。
+        # 真实回滚证据：指针没动、没有激活历史、提案仍是 pending。
         self.assertIsNone(_pointer(conn, scope))
-        self.assertEqual(0, conn.execute(
-            "SELECT COUNT(*) FROM evolution_activation_history WHERE scope_key=?",
-            (scope,)).fetchone()[0])
-        self.assertEqual(EA.STATE_VALIDATED, EA._params_row(conn, params_id)["validation_state"])
+        self.assertEqual(0, _history_count(conn, scope))
+        self.assertEqual(EA.STATE_VALIDATED,
+                         EA._params_row(conn, params_id)["validation_state"])
+        self.assertEqual("pending", _proposal_status(conn))
 
-    def test_retry_after_side_effect_failure_is_exactly_once(self):
-        """修好后重试必须能成功，且副作用只发生一次。"""
+    def test_retry_after_transition_failure_is_exactly_once(self):
+        """修好后重试能成功，且提案只被闭环一次。"""
         conn = _db()
         self.addCleanup(conn.close)
-        _stub_authorized_expansion(self)
-        params_id, _ = _candidate_with_expansion(conn)
-        scope = "strategy:trend_pullback"
+        params_id = self._activate_with_real_proposal(conn)
 
-        import asymmetric_risk as AR
-        original = AR.promote_proposal
-        calls: list = []
-
-        def failing(*_a, **_k):
-            raise RuntimeError("transient")
-
-        def working(c, s, k, v, actor=""):
-            calls.append((s, k, v))
-            return True
-
-        AR.promote_proposal = failing
+        conn.execute(
+            "CREATE TRIGGER trg_proposal_boom BEFORE UPDATE ON risk_expansion_proposals"
+            " BEGIN SELECT RAISE(ABORT, 'transient'); END")
+        conn.commit()
         try:
-            with self.assertRaises(RuntimeError):
+            with self.assertRaises(sqlite3.Error):
                 EA.activate_params_candidate(conn, params_id, actor="test")
         finally:
-            AR.promote_proposal = original
+            conn.execute("DROP TRIGGER trg_proposal_boom")
+            conn.commit()
 
-        AR.promote_proposal = working
-        try:
-            result = EA.activate_params_candidate(conn, params_id, actor="test")
-        finally:
-            AR.promote_proposal = original
-
+        result = EA.activate_params_candidate(conn, params_id, actor="test")
         self.assertTrue(result["activated"])
-        self.assertEqual(params_id, _pointer(conn, scope))
-        self.assertEqual([("trend_pullback", "max_weight_delta", 0.032)], calls)
+        self.assertEqual(params_id, _pointer(conn, "strategy:trend_pullback"))
+        self.assertEqual(1, conn.execute(
+            "SELECT COUNT(*) FROM risk_expansion_proposals WHERE status='promoted'"
+        ).fetchone()[0])
+
+    def test_missing_pending_proposal_refuses_activation(self):
+        """没有匹配的 pending 提案 → 视为失败并整笔回滚（不能静默返回 False）。"""
+        conn = _db()
+        self.addCleanup(conn.close)
+        params_id = self._activate_with_real_proposal(conn, seed=False)
+        scope = "strategy:trend_pullback"
+        with self.assertRaises(EA.ActivationSideEffectFailed):
+            EA.activate_params_candidate(conn, params_id, actor="test")
+        self.assertIsNone(_pointer(conn, scope))
+        self.assertEqual(0, _history_count(conn, scope))
 
 
 class ApiContractTests(unittest.TestCase):

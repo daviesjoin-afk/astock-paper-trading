@@ -121,6 +121,10 @@ class CandidateStale(EvolutionCandidateError):
     http_status = 409
 
 
+class ActivationSideEffectFailed(EvolutionLifecycleError):
+    """与激活绑定的副作用未能闭环；整笔激活已回滚，可安全重试。"""
+
+
 class CandidateTampered(EvolutionCandidateError):
     """候选在校验通过之后被篡改（指纹不匹配），或根本没封存过指纹。"""
 
@@ -213,11 +217,22 @@ def candidate_fingerprint(row: dict) -> str:
     ``validation_detail`` 同样在内：它携带的 ``expansions`` 会在激活时驱动
     副作用（风险放大提案闭环）。若放行对它的改写，攻击者不必碰 params
     就能凭空造出放大副作用。"改完 validation_detail 再激活"必须失败。
+
+    审计/谱系字段同样在内（``version`` / ``reason`` / ``parent_id`` /
+    ``performance_snapshot`` / ``created_at``）：候选快照的不可变性覆盖的是
+    **整行证据**，不只是"参数长什么样"。否则改写审计证据（比如把
+    performance_snapshot 换成漂亮数字、把 parent_id 指到别处）后候选照样
+    能激活，事后追责链条就断了。
     """
     payload = {
+        "version": str(row.get("version") or ""),
         "params": _row_params(row),
-        "strategy_id": str(row.get("strategy_id") or ""),
         "source": str(row.get("source") or ""),
+        "reason": row.get("reason"),
+        "parent_id": None if row.get("parent_id") is None else int(row["parent_id"]),
+        "performance_snapshot": row.get("performance_snapshot"),
+        "strategy_id": str(row.get("strategy_id") or ""),
+        "created_at": row.get("created_at"),
         "base_params_id": None if row.get("base_params_id") is None
         else int(row["base_params_id"]),
         "evidence_count": None if row.get("evidence_count") is None
@@ -699,6 +714,25 @@ def validate_candidate(conn, params_id: int) -> dict:
     if row["validation_state"] == STATE_REJECTED:
         raise CandidateRejected(f"候选 {params_id} 已被拒绝，不能重新校验")
 
+    # 生命周期状态机：candidate -> validated|rejected，**仅此一条边**。
+    # 已 validated 的行绝不允许重新校验并重新封存指纹 —— 否则
+    # "validated → 改行 → 再 validate（重新封存）→ activate" 就能绕过
+    # "校验后不可变"这条 runtime invariant。
+    if row["validation_state"] == STATE_VALIDATED:
+        sealed = row["candidate_fingerprint"]
+        detail = _loads(row["validation_detail"], {})
+        if not sealed:
+            raise CandidateTampered(
+                f"候选 {params_id} 已标记为 validated 却没有封存指纹")
+        if candidate_fingerprint(row) != sealed:
+            raise CandidateTampered(
+                f"候选 {params_id} 在校验通过后被改动，拒绝重新封存指纹"
+                "（请重新生成候选）")
+        return {"params_id": int(params_id), "scope_key": scope,
+                "validation_state": STATE_VALIDATED, "valid": True,
+                "violations": list(detail.get("violations") or []),
+                "detail": detail, "rescaled": False}
+
     outcome = _validate_params_payload(conn, int(params_id), scope)
     now = _now()
     state = STATE_VALIDATED if outcome["valid"] else STATE_REJECTED
@@ -889,6 +923,12 @@ def activate_params_candidate(conn, params_id: int, *, actor: str,
             "evolution candidate is stale; regenerate from current active parameters"
         )
 
+    # 副作用要写的表必须在**任何 DML 之前**建好：``ensure_proposals_table``
+    # 走 executescript，而 executescript 会隐式提交当前事务。放在指针写入
+    # 之后调用，就等于先把 activation 提交掉，再谈原子性。
+    if side_effects:
+        _prepare_side_effect_storage(conn, row)
+
     now = _now()
     if current_pointer is None:
         try:
@@ -944,6 +984,18 @@ def activate_params_candidate(conn, params_id: int, *, actor: str,
             "from_effective_params_id": effective_id}
 
 
+def _prepare_side_effect_storage(conn, row) -> None:
+    """副作用涉及的 DDL 前置到事务开始前执行（``executescript`` 会隐式提交）。"""
+    if not row["strategy_id"]:
+        return
+    expansions = (_loads(row["validation_detail"], {}) or {}).get("expansions") or []
+    if not expansions:
+        return
+    import asymmetric_risk as AR
+
+    AR.ensure_proposals_table(conn)
+
+
 def _apply_activation_side_effects(conn, row, scope: str, *, actor: str) -> None:
     """只在这里执行与"真正激活"绑定的生命周期副作用。
 
@@ -956,13 +1008,21 @@ def _apply_activation_side_effects(conn, row, scope: str, *, actor: str) -> None
     expansions = detail.get("expansions") or []
     if not expansions:
         return
-    import asymmetric_risk as AR  # 导入失败必须冒泡：静默跳过等于副作用缺失
+    # 导入失败必须冒泡：静默跳过等于副作用缺失。
+    import asymmetric_risk as AR
+
     for expansion in expansions:
-        # 这里**不做** try/except。一次瞬时失败若被吞掉，就会形成
-        # "candidate 已 active、proposal 仍 pending"的半截状态，而再次激活
-        # 同一 candidate 会因 already_active 提前返回 —— 副作用永久缺失。
-        AR.promote_proposal(conn, str(row["strategy_id"]), expansion.get("key"),
-                            expansion.get("new"), actor=actor)
+        # 事务内版本：不建表、不 commit、不吞异常。返回 0 说明没有匹配的
+        # pending 提案（真实 helper 在这种情况下返回 False 而不抛错），
+        # 同样视为失败 —— 否则会留下"已 active、提案未闭环"的半截状态。
+        updated = AR.promote_proposal_tx(
+            conn, str(row["strategy_id"]), expansion.get("key"),
+            expansion.get("new"), actor=actor,
+            note="expansion applied to production parameters")
+        if updated != 1:
+            raise ActivationSideEffectFailed(
+                f"风险放大提案闭环失败（{expansion.get('key')}={expansion.get('new')}，"
+                f"影响行数 {updated}）：没有匹配的 pending 提案或已被终结")
 
 
 # ─── 回滚 ───
