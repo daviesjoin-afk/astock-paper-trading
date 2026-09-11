@@ -38,8 +38,7 @@ import paper_quote_policy as PQP
 import paper_allocation as PA
 import paper_cycle_service as PCS
 import adaptive_selection_compat as ASC
-import entry_lifecycle as ELC
-import execution_dispatch as EPD
+import paper_slot_service as PSS
 import portfolio_coordinator as PCO
 import self_evolution as SE
 import strategy_champion as SCM
@@ -14545,36 +14544,10 @@ def _cleanup_stale_data():
 
 def run_slot(slot, asof_date=None, force=False):
     """统一幂等入口；计划任务和页面的“立即检查”都使用同一事务键。"""
-    if slot not in {"auction", "open", "risk", "close", "weekly-review", "intraday"}:
-        raise ValueError("slot 必须是 auction、open、risk、close、weekly-review 或 intraday")
+    PSS.validate_slot(slot)
     init_db()
-    # 信号 / 委托生命周期清扫（signal expiry & staged entry）：跨日或超龄
-    # 信号收敛为 expired，超龄活动买单作废并释放预占。放在执行器清扫之前。
-    try:
-        with _db() as lifecycle_conn:
-            ELC.expire_stale_signals(lifecycle_conn, asof_day=_date(asof_date))
-            ELC.expire_stale_orders(lifecycle_conn)
-    except Exception as lifecycle_exc:  # pragma: no cover - 防御性
-        try:
-            with _db() as lifecycle_conn:
-                _audit(lifecycle_conn, "system", "entry_lifecycle_error",
-                       f"信号/委托清扫失败：{type(lifecycle_exc).__name__}: {lifecycle_exc}")
-        except Exception:
-            pass
-    # PR-11 执行器清扫：批量窗口到期放行、人工核验等待单回收、TTL 作废。
-    # 属于撮合前置动作，放在任何买入判定之前；清扫失败只记录审计，绝不能
-    # 打断本轮扫描（挂起单会在下一轮继续被清扫）。
-    try:
-        with _db() as dispatch_conn:
-            EPD.run_execution_dispatch(dispatch_conn)
-    except Exception as dispatch_exc:  # pragma: no cover - 防御性
-        try:
-            with _db() as dispatch_conn:
-                _audit(dispatch_conn, "system", "execution_dispatch_error",
-                       f"执行器清扫失败：{type(dispatch_exc).__name__}: {dispatch_exc}")
-        except Exception:
-            pass
     day = _date(asof_date)
+    PSS.run_preflight(db_factory=_db, audit=_audit, asof_day=day)
     if slot == "weekly-review" and not force:
         # Anchor the weekly review to the last *trading* day of the ISO week.
         # Previously a statutory holiday on Friday left the entire week without
