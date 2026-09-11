@@ -13,8 +13,10 @@ from pathlib import Path
 from unittest import mock
 
 sys.path.insert(0, os.path.dirname(__file__))
-# The runtime image intentionally has no requests dependency; these tests do
-# not make network calls and only need import-time compatibility.
+# Keep these tests hermetic: the runtime image does install ``requests``
+# (declared in requirements.lock), but a MagicMock in ``sys.modules`` guarantees
+# no module under test can construct a real HTTP client, so the suite stays
+# offline and deterministic.
 sys.modules.setdefault("requests", mock.MagicMock())
 import adaptive_selection as AS  # noqa: E402
 import deepseek_advisor as DA  # noqa: E402
