@@ -9,6 +9,11 @@ import {
 const PREFIX = "e2e_clone";
 
 test.describe("Journey 5 — Clone 内置策略", () => {
+  // PR-2：这些旅程会触发受保护写接口，因此先走真实 UI 解锁本标签页
+  // （不预注入凭据——解锁流程本身也要被测到）。
+  test.use({ operatorUnlocked: true });
+
+
   test("复制内置策略得到独立可编辑的 user draft", async ({ page }) => {
     await openWorkbench(page);
 

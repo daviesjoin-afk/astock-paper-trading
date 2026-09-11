@@ -49,34 +49,109 @@ python scripts/security/scan-sensitive-data.py --repo . --scope all
 和 `main.py` 的全局中间件保护，与路由前缀无关，因此不存在"某个前缀漏配"的旁路。
 `GET`/`HEAD`/`OPTIONS` 为只读控制面，不需要凭据（读写分离）。
 
+### 三种运行模式
+
+系统只有三种 token 配置状态，对应三种模式。**不存在任何关闭边界的开关**：
+
+| token 状态 | 模式 | 写请求行为 |
+| --- | --- | --- |
+| UNSET（不存在 / trim 后为空） | `local-only` | 环回客户端（`127.0.0.1` / `::1`）允许；远端 **403** |
+| VALID（trim 后 >= 24 字符且字符合法） | `authenticated` | 任何客户端（含 localhost）都必须带 `Authorization: Bearer` |
+| INVALID（存在但太短 / 含非法字符） | `misconfigured` | 全部 **503**（绝不降级为 UNSET 或免鉴权） |
+
+#### Local-only mode
+
+未配置 token 时的默认模式，保留"本机零配置可用"：
+
+- 环回客户端的写请求允许（仍须通过浏览器来源防护）。
+- 远端写请求一律 `403 remote operator mutations are disabled`。
+- 这不是配置错误，因此**不返回 503**——它是刻意的本地兼容模式。
+- 浏览器来源防护（`Origin` / `Sec-Fetch-Site`）在写方法上始终生效，所以环回
+  客户端也不能被跨站页面冒用（localhost CSRF / DNS rebinding）。
+- 该模式依赖环回 + 来源防护，**不应通过额外网络转发对外暴露**。
+
+#### Authenticated mode
+
+配置了合法 token 后的模式：
+
+- 任何客户端的写请求都必须携带 `Authorization: Bearer <token>`。
+- **localhost 没有豁免**——`VALID + 127.0.0.1 + 无凭据` 同样返回 `401`。
+- 凭据比较使用 `hmac.compare_digest`（常量时间）。
+
+#### Misconfigured mode
+
+配置了存在但非法的 token（例如长度不足）：
+
+- 所有写请求 `503 operator authentication is misconfigured`。
+- 不 fallback 到 UNSET、不 fallback 到 local-only、不 fallback 到免鉴权。
+- 响应体不含 token、token 前缀、实际长度或 env 路径。
+
 ### 配置
 
 ```bash
-# 生成一个强随机 token（>= 16 字符）
+# 生成一个强随机 token（>= 24 字符）
 python -c "import secrets; print(secrets.token_urlsafe(32))"
 
 # 写入 .env（已被 gitignore），不要提交
 ASTOCK_OPERATOR_TOKEN=<生成的随机串>
 ```
 
-- **未配置 token 时写接口按 fail-closed 拒绝（HTTP 503）**，只读看板不受影响。
-  这不会静默降级成"无鉴权"。
-- 弱 token（< 16 字符或含非法字符）**不构成边界**，写请求同样被拒绝。
-- 仅在**纯本机离线演示**时，可用 `ASTOCK_OPERATOR_AUTH_REQUIRED=0` 显式关闭写接口鉴权；
-  不要在服务器或任何他人可达的环境设置它。
-- 当前状态随时可见于只读接口 `GET /api/operator-status`（**不回显 token 本身**）。
+- 当前状态随时可见于只读接口 `GET /api/operator-status`，它只返回
+  `mode` / `token_configured` / `writes_protected`——**不返回 token 长度、前缀或值**。
+- 启动日志只打印模式名（`operator auth mode: local-only` /
+  `operator auth mode: authenticated` / `operator auth misconfigured`）。
 
 ### 客户端携带方式
 
-凭据**只走请求头**，绝不进 URL/query（避免落入访问日志、浏览器历史与 `Referer`）：
+唯一支持的凭据形式是标准请求头，Bearer 方案：
 
 ```
-X-Operator-Token: <token>
 Authorization: Bearer <token>
 ```
 
-浏览器端在 `localStorage['operatorToken']` 中保存一次，由 `frontend/src/core/api.js`
-自动附加到写请求。它不是身份系统，只是一道本机/内网边界；不要在共享浏览器上保存。
+`Bearer` scheme 大小写不敏感；但 `Basic` / `Token` / 缺 scheme / 缺凭据 /
+凭据内含空白一律拒绝。凭据**只走这一个请求头**，绝不进 URL / query / body /
+cookie（避免落入访问日志、浏览器历史与 `Referer`）。
+
+浏览器端在 **`sessionStorage`**（key `astock.operatorToken.v1`）中保存，
+由 `frontend/src/core/api.js` **仅对写方法**自动附加。语义是"本标签页本次会话"：
+同一 tab 刷新保留，关闭 tab 即消失。它不是身份系统，只是一道本机/内网边界；
+不要在共享浏览器上解锁。只读请求（GET/HEAD/OPTIONS）**绝不**携带凭据。
+
+### 浏览器来源防护
+
+对所有写方法：
+
+- 请求带 `Origin` 时执行同源校验（比较 scheme / host / port，默认端口规范化）；
+  跨源 → `403`。
+- `Origin: null` → `403`（不解释成"没有 Origin"）。
+- `Sec-Fetch-Site: cross-site` → `403`，**即使 Bearer 正确**。
+- `Origin` 缺失（CLI / curl 常见）→ 继续按 token 状态与 IP 策略判断。
+
+### 客户端 IP 判定
+
+环回判定**只**使用 `request.client.host`，再用
+`ipaddress.ip_address(...).is_loopback` 判定。应用层**不解析**
+`X-Forwarded-For` / `X-Real-IP` / `Forwarded`——手工信任转发头会让远端客户端
+伪装成本机。代理信任由 Uvicorn 的
+`--proxy-headers --forwarded-allow-ips=127.0.0.1` 承担，应用层不建立第二套 parser。
+
+### Compose Credential Source
+
+**server compose 的 `ASTOCK_OPERATOR_TOKEN` 唯一来源是 `env_file`。**
+
+```yaml
+env_file:
+  - ${ASTOCK_ENV_FILE:-./.env.example}
+environment:
+  ASTOCK_SCHEDULE_FILE: /app/deploy/astock-codex.cron
+  # 不得在此声明 ASTOCK_OPERATOR_TOKEN
+```
+
+原因：compose 的 `environment:` 优先级高于 `env_file:`。若写成
+`ASTOCK_OPERATOR_TOKEN: "${ASTOCK_OPERATOR_TOKEN:-}"`，宿主未导出的空串会覆盖
+`ASTOCK_ENV_FILE` 里已正确写入的 token，把服务悄悄降级成 UNSET（local-only）。
+`backend/test_operator_boundary.py::ComposeSecurityTests` 对此有回归测试。
 
 ### 已知边界（本 PR 不做）
 
@@ -85,11 +160,20 @@ Authorization: Bearer <token>
 - 来源 IP 信任不由应用层判断——应用不解析 `X-Forwarded-For` 做授权，
   网络来源应由 nginx / 安全组 / ACL 层约束。
 
+### 残余风险
+
+1. 这是**单操作员共享密钥**边界，不是 RBAC，无法区分多个操作者。
+2. **TLS 由部署层负责**：Bearer token 不应经公网明文 HTTP 传输。
+3. 只读 GET 默认仍公开，看板数据对可达网络可见。
+4. `sessionStorage` 不能抵抗同源 XSS——同源脚本仍可读取凭据。
+5. 操作员边界不替代既有的风险门禁与人工确认（`confirmed=true` 仍独立生效）。
+6. local-only 模式依赖环回 + 来源防护，不应通过额外网络转发暴露。
+
 
 ## 写接口清单
 
 纸盘和 adaptive API 含有启动、暂停、下单、撤单、运行研究、写反馈和应用风控等状态变更接口。
-当前 HTTP 控制面共有 **129 条路由，其中 61 条为写方法**（`POST`/`PUT`/`PATCH`/`DELETE`）。
+当前 HTTP 控制面共有 **128 条路由，其中 61 条为写方法**（`POST`/`PUT`/`PATCH`/`DELETE`）。
 它们全部由统一中间件覆盖（按方法判定，不按前缀），验证要点：
 
 1. 本机/容器模式下宿主端口仅绑定环回地址（`127.0.0.1`）。
@@ -97,8 +181,9 @@ Authorization: Bearer <token>
 3. 未授权请求不会因为携带 `confirmed=true` 而成功——`confirmed` 只是产品确认步骤。
 4. 所有状态变更都能在审计记录中定位操作者、时间、版本和原因。
 
-回归测试见 `backend/test_operator_boundary.py`（覆盖各前缀族的写路由 + 配置 fail-closed +
-读写分离 + 不依赖 cookie 的 CSRF 免疫）。
+回归测试见 `backend/test_operator_boundary.py`，路由清单从 `main.app.openapi()`
+生成（不维护人工白名单），覆盖三态矩阵、Origin 矩阵、Bearer 解析、query 凭据无效、
+转发头伪造、GET 凭据不泄漏、domain handler 不被触达，以及 compose 优先级契约。
 
 ## 报告问题
 

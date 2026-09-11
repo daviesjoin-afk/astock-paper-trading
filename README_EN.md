@@ -226,4 +226,23 @@ Current release: **v1.3.0** (see [GitHub Releases](https://github.com/daviesjoin
 
 The local Compose mapping binds the host port to loopback only (`127.0.0.1:8600:8600`); inside the container Uvicorn still listens on `0.0.0.0` for port publishing, health checks and reverse proxying.
 
-The HTTP control plane enforces a unified operator boundary (PR-2): `POST`/`PUT`/`PATCH`/`DELETE` require an operator token, while `GET` is read-only and needs no credential. **When no token is configured, write endpoints fail closed with 503** — the read-only dashboard keeps working. The token is sent via the `X-Operator-Token` header (or the standard `Authorization` header using the Bearer scheme), never in the URL. `confirmed=true` is a product confirmation step, not authentication. See [SECURITY.md](SECURITY.md) for configuration and the full threat model.
+The HTTP control plane enforces a unified operator boundary (PR-2): `POST`/`PUT`/`PATCH`/`DELETE`
+require an operator credential, while `GET` is read-only and needs none. There are three modes:
+
+- **No token configured** (local-only): only loopback clients may write; remote writes get `403`.
+- **Valid token configured** (>= 24 chars, authenticated): every client, including localhost, must
+  send the standard Authorization header using the Bearer scheme (value: `Bearer <credential>`).
+- **Invalid token** (misconfigured): all writes get `503`.
+
+There is **no switch to disable the boundary**. Configure the secret in `.env` (gitignored):
+
+```bash
+python -c "import secrets; print('ASTOCK_OPERATOR_TOKEN=' + secrets.token_urlsafe(32))" >> .env
+```
+
+In the browser, open **Settings → Operator authorization**, paste the credential and click
+"Unlock this tab". The credential lives only in that tab's `sessionStorage` and is cleared when the
+tab closes; write requests automatically send the standard Authorization header using the Bearer
+scheme, and read requests never do. The credential is only ever sent via that header, never in the
+URL. `confirmed=true` is a product confirmation step, not authentication. See
+[SECURITY.md](SECURITY.md) for the full threat model.

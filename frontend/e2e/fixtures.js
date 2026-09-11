@@ -1,7 +1,8 @@
 // PR-56 / PR-56b：Playwright 共用夹具。
 //
 // 1) 浏览器错误策略：每个页面收集 pageerror 与 console.error，测试结束若非空 → 失败。
-//    allowlist 保持为空（不允许为了过测试而放宽）。
+//    allowlist 保持为空（不允许为了过测试而放宽）。唯一的例外通过**显式 opt-in**
+//    表达（见下面的 expectedAuthFailures），默认行为对所有 spec 保持严格。
 // 2) 真实确认框：产品用 window.confirm 做生命周期/删除确认，必须与真实弹窗交互
 //    （这里统一 accept 并记录文案），不允许用 JS 绕过。
 // 3) 共享小工具：唯一 ID、导航、UI 建草稿、只读 API 回读、卡片动作定位。
@@ -15,8 +16,54 @@ function isAllowedNoise(text) {
   return ALLOWED_NOISE.some((re) => re.test(text));
 }
 
+/**
+ * PR-2：受保护写接口返回 401/403 时，浏览器必然把它记为 console.error
+ * （"Failed to load resource: ... 401/403"）。这是**被测产品应有的正确行为**，
+ * 不是缺陷——操作员边界测试就是要去触发它。
+ *
+ * 为避免全局放宽（那会让真正的错误被吞掉），这里用**显式 opt-in**：
+ * 只有声明了 `test.use({ expectedAuthFailures: true })` 的 spec 才会过滤
+ * 这类日志，且过滤范围严格限定为"对 /api/ 路径的 401/403"。
+ */
+const AUTH_REJECTION = /status of (401|403)\b/;
+
+/** PR-2：E2E 的操作员凭据（与 e2e/server.py 的 OPERATOR_TOKEN 一致）。 */
+export const OPERATOR_TOKEN = process.env.ASTOCK_E2E_OPERATOR_TOKEN || "";
+
+/**
+ * PR-2：通过**真实 UI**解锁本标签页。
+ *
+ * 刻意不写 sessionStorage——那等于把凭据预注入，掩盖了解锁流程本身。
+ * 这里走的是真人路径：设置中心 → 操作员授权 → 输入凭据 → 本标签页解锁。
+ * 需要写操作才能验证的既有 spec 用 `test.use({ operatorUnlocked: true })`
+ * 选择启用，而不是靠全局 config 注入。
+ */
+export async function unlockOperatorViaUi(page) {
+  if (!OPERATOR_TOKEN) {
+    throw new Error(
+      "ASTOCK_E2E_OPERATOR_TOKEN 未设置：playwright.config.js 应把它传给 spec 进程",
+    );
+  }
+  await page.goto("/");
+  await page.getByTestId("settings-nav").click();
+  await page.getByTestId("settings-section-operator").click();
+  await expect(page.getByTestId("operator-unlock-panel")).toBeVisible();
+  await page.getByTestId("operator-token-input").fill(OPERATOR_TOKEN);
+  await page.getByTestId("operator-unlock-btn").click();
+  await expect(page.getByTestId("operator-unlock-state")).toHaveText("本标签页已授权");
+  // 解锁会把设置子页停在"操作员授权"；恢复默认子页，避免影响调用方后续的
+  // 设置断言（解锁应是"只写凭据"的最小副作用）。
+  await page.locator('[data-settings-section="simulation"]').click();
+  await expect(page.getByTestId("settings-result")).not.toContainText("正在读取");
+}
+
 export const test = base.extend({
-  page: async ({ page }, use, testInfo) => {
+  // opt-in 开关：默认 false，保持既有严格性。
+  expectedAuthFailures: [false, { option: true }],
+  // opt-in 开关：默认 false。开启后在本用例开始前走真实 UI 解锁本标签页。
+  operatorUnlocked: [false, { option: true }],
+
+  page: async ({ page, expectedAuthFailures, operatorUnlocked }, use, testInfo) => {
     const errors = [];
     const dialogs = [];
     page.on("pageerror", (err) => {
@@ -34,6 +81,12 @@ export const test = base.extend({
       const isExpectedUnknownStrategy404 =
         /status of 404/.test(text) && /\/api\/strategies\/does_not_exist/.test(location);
       if (isExpectedUnknownStrategy404) return;
+      // PR-2 opt-in：仅在 spec 显式声明时，放行对 /api/ 的 401/403。
+      const isExpectedAuthRejection =
+        expectedAuthFailures &&
+        AUTH_REJECTION.test(text) &&
+        /\/api\//.test(location);
+      if (isExpectedAuthRejection) return;
       if (!isAllowedNoise(text)) errors.push(`console.error -> ${text}`);
     });
     // 真实弹窗交互：confirm 接受；prompt 返回 test 预设的答案（默认克隆用 ID）。
@@ -48,6 +101,11 @@ export const test = base.extend({
       await dialog.accept();
     });
     page.__dialogs = dialogs;
+
+    // PR-2：需要写操作的 spec 通过 opt-in 在用例开始前走真实 UI 解锁。
+    if (operatorUnlocked) {
+      await unlockOperatorViaUi(page);
+    }
 
     await use(page);
 

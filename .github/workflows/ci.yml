@@ -83,6 +83,13 @@ jobs:
         working-directory: frontend
         run: npm run build
 
+      - name: Run frontend unit tests
+        # PR-2：操作员凭据的行为契约（GET 绝不带 Authorization、写方法带 Bearer、
+        # 凭据只存 sessionStorage）。这是**行为**断言，Python 侧的源码存在性
+        # 检查无法覆盖（负向验证 N4 证实）。
+        working-directory: frontend
+        run: npm run test:unit
+
       - name: Verify committed dist is up to date
         run: git diff --exit-code -- frontend/dist
 

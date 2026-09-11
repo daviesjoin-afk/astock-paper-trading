@@ -6,6 +6,11 @@ import { test, expect, openWorkbench, createDraftViaUi, uniqueId } from "../fixt
 const WIDTHS = [390, 768, 1024, 1440];
 
 test.describe("响应式与可访问性", () => {
+  // PR-2：这些旅程会触发受保护写接口，因此先走真实 UI 解锁本标签页
+  // （不预注入凭据——解锁流程本身也要被测到）。
+  test.use({ operatorUnlocked: true });
+
+
   for (const width of WIDTHS) {
     test(`${width}px：主导航 / 策略工坊 / 筛选栏可用且无横向溢出`, async ({ page }) => {
       await page.setViewportSize({ width, height: 900 });

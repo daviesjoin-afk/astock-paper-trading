@@ -1,12 +1,58 @@
 /* PR-55：由 frontend/app.js 拆分（纯搬运，逻辑/文案未改） */
 // 跨模块依赖（由原单文件作用域推导）
-import { api, apiPostJson } from "../core/api.js";
+import { api, apiPostJson, getOperatorToken, setOperatorToken, clearOperatorToken } from "../core/api.js";
 import { $ } from "../core/dom.js";
 import { adaptiveEsc, riskText } from "../core/format.js";
 import { SETTINGS_SECTION_KEY, activatePage } from "../core/navigation.js";
 import { loadPaper } from "./paper.js";
 import { STRATEGY_STATUS_LABELS, wbStatusBadge } from "./strategies.js";
 import { settingsConfirm, toast, inlineError, confirmDialog } from "../ui/dialog.js";
+
+// ---------- 操作员授权（PR-2）----------
+// 只管理**本标签页**的浏览器凭据：不调用任何后端 login / session / token 校验
+// 接口，只做 sessionStorage 的读写与状态展示。凭据本身永不回显。
+export function operatorUnlockStateHtml(){
+  var unlocked=!!getOperatorToken();
+  return '<span class="setting-value-preview" id="operatorUnlockState" data-testid="operator-unlock-state">'+(unlocked?'本标签页已授权':'未授权')+'</span>';
+}
+
+export function renderOperatorUnlockPanel(){
+  var unlocked=!!getOperatorToken();
+  return '<div class="settings-panel" style="margin-top:14px;padding:14px" data-testid="operator-unlock-panel">'
+    +'<h4>操作员授权</h4>'
+    +'<p>写操作（下单、启停、改设置等）需要操作员凭据。凭据只保存在<strong>本标签页</strong>，关闭标签页即失效；刷新本页保留。授权不会回显凭据内容。</p>'
+    +'<div class="setting-control"><label for="operatorTokenInput">操作员凭据</label>'
+    +'<input id="operatorTokenInput" data-testid="operator-token-input" type="password" autocomplete="off" spellcheck="false" placeholder="粘贴操作员凭据"></div>'
+    +'<div class="settings-actions">'
+    +'<button type="button" data-testid="operator-unlock-btn" onclick="unlockOperatorTab()">本标签页解锁</button>'
+    +'<button type="button" class="ghost" data-testid="operator-clear-btn" onclick="clearOperatorTab()">清除授权</button>'
+    +'</div>'
+    +'<div class="setting-row"><div class="setting-label"><b>当前状态</b><small>授权只影响本标签页；其它标签页需各自解锁。</small></div>'
+    +'<div class="setting-control">'+operatorUnlockStateHtml()+'</div></div>'
+    +'</div>';
+}
+
+export function unlockOperatorTab(){
+  var input=$('operatorTokenInput');
+  var value=input?String(input.value||'').trim():'';
+  if(!value){ toast('请输入操作员凭据。', { tone: 'danger' }); return; }
+  setOperatorToken(value);
+  if(input) input.value='';
+  refreshOperatorUnlockState();
+  toast('本标签页已授权，可以执行写操作。');
+}
+
+export function clearOperatorTab(){
+  clearOperatorToken();
+  var input=$('operatorTokenInput'); if(input) input.value='';
+  refreshOperatorUnlockState();
+  toast('已清除本标签页授权。');
+}
+
+export function refreshOperatorUnlockState(){
+  var node=$('operatorUnlockState');
+  if(node) node.textContent=getOperatorToken()?'本标签页已授权':'未授权';
+}
 
 // ---------- 统一设置中心 ----------
 export var SETTINGS_STRATEGY_NAMES={tq_breakout:'短线日内做T',trend_pullback:'趋势波段优选',sector_rotation:'板块轮动先锋',reported_profit_breakout:'财报突破质量',main_force_top10:'超强主力股'};
@@ -121,6 +167,13 @@ export function renderSettings(data){
       +execSwitch('execution_ttl_sweep','执行时限清扫','清扫到期挂起委托：严格时限画像作废，其余自动放回重试管道。')
       +'</div><div class="settings-actions"><button onclick="saveSettingsSection(\'execution\')">保存执行开关</button><button class="ghost" onclick="resetSettingsSection(\'execution\')">恢复默认</button></div>'
       +'<div class="settings-note">挂起委托不占用资金与席位；所有放行/驳回都写入审计。开关立即生效，无需重启扫描。</div></section>'+settingsPreviewHtml(data,section)+'</div>';
+  }else if(section==='operator'){
+    html='<div class="settings-grid"><section class="settings-panel"><h3>操作员授权</h3>'
+      +'<p>本页只管理<strong>本标签页</strong>的写操作凭据，不涉及账户体系。凭据保存在 sessionStorage：本标签页刷新后保留，关闭标签页即消失。'
+      +'只读接口（看板、行情、健康检查）不需要授权；写接口在未授权时会返回 401，前端不会自动重放，请解锁后重新点击原操作。</p>'
+      +renderOperatorUnlockPanel()
+      +'<div class="settings-note"><strong>边界说明：</strong>这是一道单操作员共享密钥边界，不是 RBAC；它不替代既有的风险与人工确认门禁，也不会把凭据写入日志或页面。</div>'
+      +'</section>'+settingsPreviewHtml(data,section)+'</div>';
   }else{
     var ais=ai.settings||{}; var keyMap=ai.keys||{}; var activeProvider=ais.llm_provider||'deepseek'; var activeKey=keyMap[activeProvider]||{};
     html='<div class="settings-grid"><section class="settings-panel"><h3>AI 与自进化</h3><p>AI 只生成审阅和有界候选，默认需要人工确认；API Key 只写入后端安全存储，页面和日志永远不回显明文。</p><div class="settings-form">'
@@ -140,10 +193,11 @@ export function renderSettings(data){
 }
 
 export function setSettingsSection(section,button){
-  if(['simulation','risk','strategy','evolution','execution'].indexOf(section)<0) section='simulation';
+  if(['simulation','risk','strategy','evolution','execution','operator'].indexOf(section)<0) section='simulation';
   window._settingsSection=section; sessionStorage.setItem(SETTINGS_SECTION_KEY,section);
   document.querySelectorAll('#p-settings .settings-section-tab').forEach(function(item){var active=item.dataset.settingsSection===section;item.classList.toggle('active',active);item.setAttribute('aria-selected',active?'true':'false');});
   if(window._settingsPayload) renderSettings(window._settingsPayload);
+  refreshOperatorUnlockState();
   history.replaceState(null,'','#settings/'+section);
 }
 

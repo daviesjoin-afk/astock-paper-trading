@@ -14,6 +14,11 @@ import { test, expect, openWorkbench, waitForApi, SIMPLE_DSL } from "../fixtures
 const STRATEGY_ID = "e2e_journey1_draft";
 
 test.describe("Journey 1 — 创建草稿（真实浏览器 + 真实 HTTP）", () => {
+  // PR-2：这些旅程会触发受保护写接口，因此先走真实 UI 解锁本标签页
+  // （不预注入凭据——解锁流程本身也要被测到）。
+  test.use({ operatorUnlocked: true });
+
+
   test("新建 → 填表 → 验证 → 预览 → 保存 → 刷新仍在（真实落库）", async ({ page }) => {
     await openWorkbench(page);
 

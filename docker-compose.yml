@@ -14,10 +14,11 @@ services:
       TZ: Asia/Shanghai
       PYTHONUNBUFFERED: "1"
       PYTHONDONTWRITEBYTECODE: "1"
-      # PR-2：操作员边界密钥。写请求必须携带 X-Operator-Token（或
-      # Authorization 头（Bearer 方案））。未设置时写接口按 fail-closed 拒绝（503），
-      # 只读看板不受影响。生成方式见 SECURITY.md。
-      ASTOCK_OPERATOR_TOKEN: "${ASTOCK_OPERATOR_TOKEN:-}"
+      # PR-2：**不在此声明 ASTOCK_OPERATOR_TOKEN**。开发者需要凭据时按项目
+      # 现有方式提供（`docker compose --env-file .env`、env_file 或本地
+      # environment override）。刻意避免 `ASTOCK_OPERATOR_TOKEN: "${...:-}"`：
+      # 那会把宿主未导出的空串注入容器，虽然空串被正确归类为 UNSET
+      # （local-only），但会让"我明明导出了 token"变得难以排查。
       # Standalone clones need an in-process scheduler. Set this to 0 when a
       # host scheduler is configured and owns every paper-trading slot.
       ASTOCK_ENABLE_FALLBACK_THREADS: "${ASTOCK_ENABLE_FALLBACK_THREADS:-1}"

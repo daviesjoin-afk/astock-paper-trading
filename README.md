@@ -263,20 +263,25 @@ GitHub Actions 会在 **Python 3.11 / 3.12** 上安装锁定依赖并执行后�
 
 本地 Compose 只把宿主端口绑定到环回地址（`127.0.0.1:8600:8600`），容器内部 Uvicorn 仍监听 `0.0.0.0` 以配合端口发布、健康检查与反代。
 
-HTTP 控制面有统一的操作员边界（PR-2）：`POST`/`PUT`/`PATCH`/`DELETE` 需要 operator token，`GET` 只读、无需凭据。**未配置 token 时写接口按 fail-closed 返回 503**——只读看板照常可用。先准备密钥：
+HTTP 控制面有统一的操作员边界（PR-2）：`POST`/`PUT`/`PATCH`/`DELETE` 需要 operator
+凭据，`GET` 只读、无需凭据。三种模式：
+
+- **未配置 token**（local-only）：仅本机环回地址可写，远端写请求 `403`；
+- **配置合法 token**（>= 24 字符，authenticated）：任何客户端的写请求都必须带
+  标准 Authorization 头（Bearer 方案，值形如「Bearer <凭据>」），localhost 无豁免；
+- **token 非法**（misconfigured）：所有写请求 `503`。
+
+**不存在关闭边界的开关。** 先准备密钥：
 
 ```bash
-# 生成强随机 token（>= 16 字符），写入 .env（已被 gitignore，勿提交）
+# 生成强随机 token（>= 24 字符），写入 .env（已被 gitignore，勿提交）
 python -c "import secrets; print('ASTOCK_OPERATOR_TOKEN=' + secrets.token_urlsafe(32))" >> .env
 ```
 
-浏览器端把同一串存入 `localStorage`（DevTools 控制台执行一次）：
-
-```js
-localStorage.setItem('operatorToken', '<粘贴同一 token>')
-```
-
-之后页面的写操作会自动携带 `X-Operator-Token` 头。仅纯本机离线演示可用 `ASTOCK_OPERATOR_AUTH_REQUIRED=0` 显式关闭鉴权。细节见 [`SECURITY.md`](SECURITY.md)。
+浏览器端不需要手工操作：打开看板 → **设置中心 → 操作员授权** → 粘贴凭据 →
+点「本标签页解锁」。凭据只保存在该标签页的 `sessionStorage`，关闭标签页即失效；
+写操作会自动带上标准 Authorization 头（Bearer 方案），只读请求绝不携带。细节见
+[`SECURITY.md`](SECURITY.md)。
 
 ```bash
 docker compose up -d --build

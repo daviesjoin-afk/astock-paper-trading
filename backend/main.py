@@ -505,7 +505,9 @@ app.include_router(strategies_router)
 
 
 # ─── PR-2：HTTP 操作员安全边界（Operator Security Boundary）───────────────
-# 统一入口在 operator_auth 模块；这里只做"接进 ASGI 管道"这一件事。
+# 统一入口在 operator_auth 模块；这里只做"取 Request 信息 → 调 operator_auth →
+# 按 Decision 返回 → call_next"这一件事。**不在本文件复制** Bearer parser /
+# Origin parser / IP parser / token 校验逻辑。
 #
 # 为什么用全局中间件而不是逐路由 Depends：
 #   逐路由标注要求每个新写接口都被作者记得补上鉴权——这正是 PR-2 要消灭的
@@ -515,15 +517,49 @@ app.include_router(strategies_router)
 #   /api/strategies 还是 main.py 顶层（/api/init、/api/track/*、
 #   /api/data-validity/* 等）都被同一条规则覆盖。
 #
-# 只读方法（GET/HEAD/OPTIONS）不经鉴权：控制面读写分离，看板无需密钥；且
-# 本边界不依赖任何 cookie/session，因此浏览器跨站请求无从冒用身份（无凭据
-# 可带），天然免疫 CSRF。
+# 只读方法（GET/HEAD/OPTIONS）不经鉴权：控制面读写分离，看板无需密钥。
+# 但**浏览器来源防护**（Origin / Sec-Fetch-Site）对写方法始终生效，因此
+# 环回客户端也不能被跨站页面冒用（DNS-rebinding / localhost CSRF）。
 _OPERATOR_STATUS_PATH = "/api/operator-status"
+
+
+def _operator_request_context(request):
+    """从 Request 取出判定所需的最小信息（不做任何解析逻辑）。
+
+    客户端地址**只**取 ``request.client.host``——不读取 X-Forwarded-For /
+    X-Real-IP / Forwarded（§17）。代理信任由 Uvicorn 的
+    ``--proxy-headers --forwarded-allow-ips=127.0.0.1`` 负责（§18）。
+    """
+    client = getattr(request, "client", None)
+    client_host = getattr(client, "host", None) if client is not None else None
+    url = getattr(request, "url", None)
+    scheme = getattr(url, "scheme", None) or "http"
+    try:
+        server_port = request.url.port
+    except Exception:
+        server_port = None
+    if server_port is None:
+        server_port = 443 if str(scheme).lower() == "https" else 80
+    host_header = request.headers.get("host") or None
+    return {
+        "client_host": client_host,
+        "scheme": scheme,
+        "host_header": host_header,
+        "server_port": server_port,
+    }
 
 
 @app.middleware("http")
 async def _operator_boundary(request, call_next):
-    decision = operator_auth.evaluate_request(request.method, request.headers)
+    context = _operator_request_context(request)
+    decision = operator_auth.evaluate_request(
+        request.method,
+        request.headers,
+        context["client_host"],
+        scheme=context["scheme"],
+        host_header=context["host_header"],
+        server_port=context["server_port"],
+    )
     if not decision.allowed:
         return JSONResponse(
             status_code=decision.status,
@@ -539,21 +575,17 @@ async def _operator_boundary(request, call_next):
 
 @app.get(_OPERATOR_STATUS_PATH)
 def operator_status():
-    """操作员边界状态（**只读**，永不回显 token 本身）。
+    """操作员边界状态（**只读**，永不回显 token）。
 
-    便于运维在不登录服务器的前提下确认"写接口是否已被保护"。不返回任何
-    密钥、长度以外都不暴露；未配置 token 时会明确标注 insecure。
+    只返回 ``mode`` / ``token_configured`` / ``writes_protected``；
+    不返回 token 长度、前缀或任何强度细节（§55）。
     """
     return operator_auth.describe_configuration()
 
 
-# 启动期把配置状态打进日志：未配置 token 时**显著**告警，避免"以为有边界、
-# 实际裸奔"的静默安全假象（对应威胁模型第 6 条：弱/缺配置不得静默降级）。
-_OPERATOR_CONFIG_OK, _OPERATOR_CONFIG_MSG = operator_auth.assert_secure_configuration()
-if not _OPERATOR_CONFIG_OK:
-    print(f"[operator-auth][WARN] {_OPERATOR_CONFIG_MSG}", file=sys.stderr, flush=True)
-else:
-    print(f"[operator-auth] {_OPERATOR_CONFIG_MSG}", flush=True)
+# 启动期把当前模式打进日志（只打模式名，不打 token 长度/值/前缀）。
+operator_auth.log_configuration()
+
 
 
 

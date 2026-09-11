@@ -14,9 +14,12 @@ services:
       - ${ASTOCK_ENV_FILE:-./.env.example}
     environment:
       ASTOCK_SCHEDULE_FILE: /app/deploy/astock-codex.cron
-      # PR-2：操作员边界密钥（从 env 文件读入，不写入 compose、不进仓库）。
-      # 写接口要求此 token；缺失时写接口 503，只读看板不受影响。
-      ASTOCK_OPERATOR_TOKEN: "${ASTOCK_OPERATOR_TOKEN:-}"
+      # PR-2：**不要**在此声明 ASTOCK_OPERATOR_TOKEN。
+      # compose 的 `environment:` 优先级高于 `env_file:`，一旦这里写成
+      # `ASTOCK_OPERATOR_TOKEN: "${ASTOCK_OPERATOR_TOKEN:-}"`，宿主未导出的
+      # 空串就会覆盖 ASTOCK_ENV_FILE 里已正确写入的 token，把服务悄悄降级成
+      # UNSET（local-only）。token 的唯一来源必须是 env_file（见 SECURITY.md
+      # 的 "Compose Credential Source"）。
       # 主力股点火通道：仅在 +3.5%~+7.5% 区间内，经八项证据和快速
       # 确认后才允许进入既有的三分钟审批链路；不是绕开风控的追涨开关。
       PAPER_IGNITION_BUY: "1"

@@ -9,6 +9,11 @@
 } from "../fixtures.js";
 
 test.describe("Journey 3 — 设置集成（下一周期策略集合）", () => {
+  // PR-2：这些旅程会触发受保护写接口，因此先走真实 UI 解锁本标签页
+  // （不预注入凭据——解锁流程本身也要被测到）。
+  test.use({ operatorUnlocked: true });
+
+
   test("激活的自定义策略可被选中，保存后刷新仍保持", async ({ page }) => {
     const id = uniqueId("e2e_settings");
     await openWorkbench(page);
@@ -52,6 +57,11 @@ test.describe("Journey 3 — 设置集成（下一周期策略集合）", () => 
 });
 
 test.describe("Journey 6 — 零策略 Idle", () => {
+  // PR-2：这些旅程会触发受保护写接口，因此先走真实 UI 解锁本标签页
+  // （不预注入凭据——解锁流程本身也要被测到）。
+  test.use({ operatorUnlocked: true });
+
+
   test("全部取消后保存被接受，UI 给出 idle 说明且 API 为空集合", async ({ page }) => {
     await openSettings(page);
 

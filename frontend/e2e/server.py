@@ -47,8 +47,9 @@ def main() -> int:
     os.environ["LLM_ADVISOR_ENABLED"] = "0"
     # PR-2：操作员边界。E2E 驱动的是真实应用，因此必须像真实运维那样配置
     # operator token——绝不能为了过测试而关掉鉴权（那会让测试失去意义）。
-    # 前端通过 localStorage 里的 operatorToken 读取并放进请求头（见
-    # playwright.config.js 的 addInitScript）。
+    # 前端通过 **sessionStorage** 里的 astock.operatorToken.v1 读取，并把它作为
+    # 标准 authorization 头（Bearer 方案）发出；E2E 用真实的"解锁"交互写入
+    # （见 e2e/specs/operator-unlock.spec.js），不在配置层预注入。
     os.environ["ASTOCK_OPERATOR_TOKEN"] = OPERATOR_TOKEN
     sys.path.insert(0, BACKEND)
 

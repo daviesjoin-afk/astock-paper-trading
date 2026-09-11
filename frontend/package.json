@@ -6,7 +6,8 @@
   "description": "Astock paper-trading dashboard. Legacy vanilla JS/CSS sources are bundled into dist/ with esbuild; dist/ is committed so Docker and the local uvicorn server can serve it without a Node runtime.",
   "scripts": {
     "build": "node build.mjs",
-    "check:dist": "git diff --quiet -- frontend/dist || (echo 'frontend/dist is stale: run npm run build and commit the result' && exit 1)"
+    "check:dist": "git diff --quiet -- frontend/dist || (echo 'frontend/dist is stale: run npm run build and commit the result' && exit 1)",
+    "test:unit": "node --test \"tests/**/*.test.mjs\""
   },
   "devDependencies": {
     "@playwright/test": "^1.63.0",

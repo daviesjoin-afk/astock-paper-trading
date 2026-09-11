@@ -10,6 +10,11 @@ import {
 const PREFIX = "e2e_version";
 
 test.describe("Journey 4 — 版本 v1 → v2", () => {
+  // PR-2：这些旅程会触发受保护写接口，因此先走真实 UI 解锁本标签页
+  // （不预注入凭据——解锁流程本身也要被测到）。
+  test.use({ operatorUnlocked: true });
+
+
   test("编辑保存生成 v2，v1 保持只读且校验和不变", async ({ page }) => {
     const id = uniqueId(PREFIX);
     await openWorkbench(page);

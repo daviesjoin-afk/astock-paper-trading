@@ -53,7 +53,7 @@ export function restoreAppNavigation(){
     sessionStorage.removeItem(PAPER_VIEW_KEY);
   }
   if(page==='p-paper'&&parts[1]) window._paperWorkspace=parts[1];
-  if(page==='p-settings'&&parts[1]&&['simulation','risk','strategy','evolution','execution'].indexOf(parts[1])>=0){ window._settingsSection=parts[1]; sessionStorage.setItem(SETTINGS_SECTION_KEY,parts[1]); }
+  if(page==='p-settings'&&parts[1]&&['simulation','risk','strategy','evolution','execution','operator'].indexOf(parts[1])>=0){ window._settingsSection=parts[1]; sessionStorage.setItem(SETTINGS_SECTION_KEY,parts[1]); }
   activatePage(page,{writeHash:false});
 }
 
