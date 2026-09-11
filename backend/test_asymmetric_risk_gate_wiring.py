@@ -187,13 +187,34 @@ class ChampionPromotionPathTests(unittest.TestCase):
             observed_at=at or dt.datetime.now().replace(microsecond=0) - dt.timedelta(days=1),
         )
 
+    def _record_scientific_counterfactual(self, now: dt.datetime, *, count=12):
+        """补足 PR-4 科学门禁，再让本组测试继续验证它原本负责的风险门。"""
+        champion_nav = 100000.0
+        challenger_nav = 100000.0
+        for i in range(count):
+            if i:
+                champion_nav *= 1.001
+                challenger_nav *= 1.0016
+            day_offset = (i * 4) // (count - 1)
+            observed = now - dt.timedelta(days=4 - day_offset, hours=1) + dt.timedelta(minutes=i)
+            result = SCM.run_shadow_counterfactual(
+                self.paper,
+                STRATEGY,
+                {"asof": observed.date().isoformat(), "seq": i,
+                 "600000": {"close": 10.0 + i / 100}},
+                self._output(pnl=1000.0, nav=champion_nav),
+                self._output(pnl=2000.0, nav=challenger_nav),
+                observed_at=observed,
+            )
+            self.assertTrue(result["recorded"])
+
     def test_promotion_declares_challenger_win(self):
         """晋升路径显式声明 challenger_win=True，仍受证据/观察期/步长约束。"""
         captured: dict = {}
         now = dt.datetime.now().replace(microsecond=0)
         SCM.open_challenger(self.paper, self.evo, STRATEGY, {"max_weight_delta": 0.032},
                             evidence_count=EVIDENCE, now=now - dt.timedelta(days=5))
-        self._record_counterfactual()
+        self._record_scientific_counterfactual(now)
         original = SE.adjust_strategy_params
 
         def spy(conn, strategy_id, adjustments, **kwargs):
@@ -202,7 +223,7 @@ class ChampionPromotionPathTests(unittest.TestCase):
 
         SE.adjust_strategy_params = spy
         try:
-            result = SCM.promote_challenger(self.paper, self.evo, STRATEGY)
+            result = SCM.promote_challenger(self.paper, self.evo, STRATEGY, now=now)
         finally:
             SE.adjust_strategy_params = original
         self.assertTrue(result.get("promoted"), result)
@@ -219,8 +240,8 @@ class ChampionPromotionPathTests(unittest.TestCase):
         try:
             SCM.open_challenger(self.paper, self.evo, STRATEGY, {key: 0.032},
                                 evidence_count=EVIDENCE, now=now - dt.timedelta(days=5))
-            self._record_counterfactual()
-            result = SCM.promote_challenger(self.paper, self.evo, STRATEGY)
+            self._record_scientific_counterfactual(now)
+            result = SCM.promote_challenger(self.paper, self.evo, STRATEGY, now=now)
             self.assertFalse(result.get("promoted"))
             self.assertIn("观察", str(result.get("reason")))
         finally:
