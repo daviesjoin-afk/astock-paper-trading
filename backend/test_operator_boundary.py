@@ -81,6 +81,29 @@ REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SERVER_COMPOSE = os.path.join(REPO_ROOT, "docker-compose.server.yml")
 LOCAL_COMPOSE = os.path.join(REPO_ROOT, "docker-compose.yml")
 ENV_EXAMPLE = os.path.join(REPO_ROOT, ".env.example")
+DOCKERFILE = os.path.join(REPO_ROOT, "Dockerfile")
+CI_WORKFLOW = os.path.join(REPO_ROOT, ".github", "workflows", "ci.yml")
+PLAYWRIGHT_CONFIG = os.path.join(REPO_ROOT, "frontend", "playwright.config.js")
+OPERATOR_UNLOCK_SPEC = os.path.join(
+    REPO_ROOT, "frontend", "e2e", "specs", "operator-unlock.spec.js"
+)
+
+# 运行时镜像（Dockerfile）只拷 backend/ + frontend/ + deploy/，并按 .dockerignore
+# 排除 .github/**、Dockerfile、docker-compose*.yml、.env.example、frontend/e2e、
+# frontend/playwright.config.js。因此**仓库布局类**测试（读取这些文件的那几条）
+# 在镜像内无法运行。
+#
+# 判定方式刻意使用"整个仓库是否完整"的哨兵，而不是"单个文件是否存在"：
+# 若在完整检出里有人误删了 .env.example，哨兵仍为真 → 测试照常运行并失败，
+# 不会被静默跳过。只有真正的运行时镜像（哨兵为假）才会跳过。
+_IS_FULL_CHECKOUT = os.path.isdir(os.path.join(REPO_ROOT, ".github")) and os.path.isfile(
+    DOCKERFILE
+)
+
+
+def _requires_full_checkout(reason):
+    """仓库布局类测试：仅在完整检出下运行，运行时镜像内跳过。"""
+    return unittest.skipUnless(_IS_FULL_CHECKOUT, reason)
 
 
 def _addr(*octets):
@@ -1181,12 +1204,18 @@ class SecretLeakTests(unittest.TestCase):
 
 
 class ComposeSecurityTests(unittest.TestCase):
-    """server compose 不得用空的 environment 覆盖 env_file 里的 token。"""
+    """server compose 不得用空的 environment 覆盖 env_file 里的 token。
+
+    说明：本类中读取 compose / Dockerfile / .env.example / 仓库根文档的用例，
+    在运行时镜像内会被跳过（见 ``_requires_full_checkout``）；其余用例在镜像内
+    照常执行。跳过是**显式**的，不是静默通过。
+    """
 
     def _read(self, path):
         with open(path, encoding="utf-8") as fh:
             return fh.read()
 
+    @_requires_full_checkout("docker-compose.server.yml 不在运行时镜像内")
     def test_server_compose_does_not_declare_operator_token(self):
         text = self._read(SERVER_COMPOSE)
         # 允许注释里提到变量名（解释为什么不能声明），但不得有实际的 YAML 键。
@@ -1201,16 +1230,19 @@ class ComposeSecurityTests(unittest.TestCase):
                 "（会覆盖 env_file）",
             )
 
+    @_requires_full_checkout("docker-compose.server.yml 不在运行时镜像内")
     def test_server_compose_still_uses_env_file(self):
         text = self._read(SERVER_COMPOSE)
         self.assertIn("env_file", text)
         self.assertIn("ASTOCK_ENV_FILE", text)
 
+    @_requires_full_checkout("docker-compose.server.yml 不在运行时镜像内")
     def test_server_compose_loopback_bind(self):
         text = self._read(SERVER_COMPOSE)
         self.assertIn("127.0.0.1:18600:8600", text)
         self.assertNotIn('"18600:8600"', text)
 
+    @_requires_full_checkout("docker-compose.yml 不在运行时镜像内")
     def test_local_compose_loopback_bind(self):
         text = self._read(LOCAL_COMPOSE)
         self.assertIn("127.0.0.1:8600:8600", text)
@@ -1220,6 +1252,7 @@ class ComposeSecurityTests(unittest.TestCase):
                 continue
             self.assertNotIn('"8600:8600"', stripped, "本地 compose 不得绑全网卡 8600")
 
+    @_requires_full_checkout("docker-compose.yml 不在运行时镜像内")
     def test_local_compose_does_not_declare_operator_token(self):
         text = self._read(LOCAL_COMPOSE)
         for line in text.splitlines():
@@ -1232,11 +1265,13 @@ class ComposeSecurityTests(unittest.TestCase):
                 "local compose 不得声明空的 operator token",
             )
 
+    @_requires_full_checkout("Dockerfile 不在运行时镜像内")
     def test_dockerfile_keeps_internal_wildcard_bind(self):
         dockerfile = os.path.join(REPO_ROOT, "Dockerfile")
         text = self._read(dockerfile)
         self.assertIn("0.0.0.0", text, "容器内必须监听 0.0.0.0")
 
+    @_requires_full_checkout(".env.example 不在运行时镜像内")
     def test_env_example_documents_new_contract(self):
         text = self._read(ENV_EXAMPLE)
         active = _strip_yaml_comments(text)
@@ -1279,12 +1314,16 @@ class ComposeSecurityTests(unittest.TestCase):
                     f"{os.path.basename(path)} 生效配置不得残留 {name}",
                 )
 
+    @_requires_full_checkout("SECURITY.md / README*.md 不在运行时镜像内")
     def test_docs_do_not_promise_private_header_or_localstorage(self):
-        """文档不得再宣传已废弃的机制（合同 §80）。"""
+        """文档不得再宣传已废弃的机制（合同 §80）。
+
+        刻意用显式跳过而不是"文件不存在就 continue"：后者在镜像内会变成
+        **静默通过**，掩盖掉文档漂移。
+        """
         for name in ["SECURITY.md", "README.md", "README_EN.md"]:
             path = os.path.join(REPO_ROOT, name)
-            if not os.path.exists(path):
-                continue
+            self.assertTrue(os.path.exists(path), f"{name} 必须存在（文档是合同的一部分）")
             text = self._read(path)
             self.assertNotIn("X-Operator-Token", text, f"{name} 不得宣传私有 header")
             self.assertNotIn(
@@ -1347,6 +1386,9 @@ class FrontendCredentialTests(unittest.TestCase):
         self.assertIn("READ_METHODS", text)
         self.assertIn("indexOf(verb)>=0", text, "只读短路分支必须存在")
 
+    @_requires_full_checkout(
+        "frontend/tests 与 .github/workflows 不进运行时镜像（.dockerignore）"
+    )
     def test_behavioral_node_test_exists_and_wired(self):
         """前端凭据的**行为**测试必须存在并接入 CI（否则 N4 无法被检出）。"""
         node_test = os.path.join(
@@ -1399,6 +1441,9 @@ class FrontendCredentialTests(unittest.TestCase):
         for endpoint in ["/api/login", "/api/session", "/api/operator/verify", "/api/operator/login"]:
             self.assertNotIn(endpoint, text, f"解锁 UI 不得调用 {endpoint}")
 
+    @_requires_full_checkout(
+        "frontend/playwright.config.js 不进运行时镜像（.dockerignore）"
+    )
     def test_playwright_config_has_no_global_credential(self):
         config = os.path.join(REPO_ROOT, "frontend", "playwright.config.js")
         text = self._read(config)
@@ -1409,6 +1454,9 @@ class FrontendCredentialTests(unittest.TestCase):
             self.assertNotRegex(stripped, r"^\s*extraHTTPHeaders\s*:", "不得全局注入凭据")
             self.assertNotRegex(stripped, r"^\s*storageState\s*:", "不得预注入 storageState")
 
+    @_requires_full_checkout(
+        "frontend/e2e 不进运行时镜像（.dockerignore）"
+    )
     def test_operator_unlock_spec_exists(self):
         spec = os.path.join(
             REPO_ROOT, "frontend", "e2e", "specs", "operator-unlock.spec.js"
