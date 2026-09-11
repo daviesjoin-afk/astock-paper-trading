@@ -38,7 +38,23 @@ def _checksum(value: Any) -> str:
     return hashlib.sha256(_json(value).encode("utf-8")).hexdigest()
 
 
+def _snapshot_set(conn, challenger_id: int, role: str, since: str, until: str) -> set[str]:
+    return {
+        str(row[0])
+        for row in conn.execute(
+            """SELECT snapshot_checksum FROM shadow_nav
+                 WHERE challenger_id=? AND role=? AND created_at>=? AND created_at<?""",
+            (int(challenger_id), str(role), str(since), str(until)),
+        ).fetchall()
+    }
+
+
 def _paired_rows(conn, challenger_id: int, since: str, until: str) -> list[dict[str, Any]]:
+    champion_snapshots = _snapshot_set(conn, challenger_id, "champion", since, until)
+    challenger_snapshots = _snapshot_set(conn, challenger_id, "challenger", since, until)
+    if not champion_snapshots or champion_snapshots != challenger_snapshots:
+        raise ValueError("Champion/Challenger scientific evidence is not a complete paired snapshot set")
+
     rows = conn.execute(
         """SELECT c.snapshot_checksum, c.created_at,
                   c.nav AS champion_nav, x.nav AS challenger_nav,
@@ -53,6 +69,9 @@ def _paired_rows(conn, challenger_id: int, since: str, until: str) -> list[dict[
             ORDER BY c.created_at, c.id""",
         (int(challenger_id), str(since), str(until)),
     ).fetchall()
+    if len(rows) != len(champion_snapshots):
+        raise ValueError("paired shadow evidence contains duplicate or missing NAV rows")
+
     result: list[dict[str, Any]] = []
     for row in rows:
         item = dict(row)
@@ -243,10 +262,10 @@ def verify_promotion_evidence(conn, challenger_id: int, stored: Mapping[str, Any
     if not since or not until:
         return {"valid": False, "reason": "科学晋升证据缺少固定评估窗口"}
     current = evaluate_promotion_evidence(conn, challenger_id, str(since), str(until))
-    if not current.get("evaluable") or not current.get("promotable"):
-        return {"valid": False, "reason": current.get("reason") or "科学晋升门禁当前不通过", "current": current}
     if current.get("evidence_checksum") != stored.get("evidence_checksum"):
         return {"valid": False, "reason": "科学晋升证据在评估后发生变化", "current": current}
+    if not current.get("evaluable") or not current.get("promotable"):
+        return {"valid": False, "reason": current.get("reason") or "科学晋升门禁当前不通过", "current": current}
     if not stored.get("promotable"):
         return {"valid": False, "reason": "已存科学晋升决策不是 promotable", "current": current}
     return {"valid": True, "current": current}
