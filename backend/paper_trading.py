@@ -36,6 +36,7 @@ import paper_schema_migrations as PSM
 import paper_archive_projection as PAP
 import paper_quote_policy as PQP
 import paper_allocation as PA
+import paper_cycle_service as PCS
 import entry_lifecycle as ELC
 import execution_dispatch as EPD
 import portfolio_coordinator as PCO
@@ -15951,65 +15952,18 @@ def risk_audit(limit=160):
 
 
 def _validate_capital(capital):
-    capital = float(capital)
-    if capital < 1000 or capital > 10_000_000:
-        raise ValueError("总模拟资金池须在 1,000 至 10,000,000 元之间")
-    return capital
+    """PR-58：实现已移至 ``paper_cycle_service``（保留同名 façade）。"""
+    return PCS.validate_capital(capital)
 
 
 def _cycle_snapshot(conn):
-    cycle = _active_cycle(conn)
-    # Archives are consumed by the account/stock history views.  Loading every
-    # risk decision and its full decision_snapshot into one Python object made
-    # cycle rollover grow without bound and could restart the container before
-    # the transaction committed.  Preserve the durable trading ledger and
-    # version history, while recording counts for high-volume operational
-    # tables instead of duplicating their bulky payloads.
-    ledger_tables = [
-        "paper_accounts", "paper_orders", "paper_positions",
-        "paper_position_lots", "paper_fills", "paper_nav",
-        "paper_parameter_versions", "paper_position_limit_versions",
-    ]
-    counted_tables = [
-        "paper_signals", "paper_risk_decisions", "paper_jobs",
-        "paper_job_runs", "paper_reviews", "paper_intraday_observations",
-        "paper_position_reviews", "paper_capital_reservations",
-    ]
-    snapshot = {}
-    for table in ledger_tables:
-        if table == "paper_orders":
-            # Exclude the large evidence JSON at SQL level.  Fetching it and
-            # deleting it afterwards still causes a large temporary allocation
-            # and was enough to make rollover exceed the gateway timeout.
-            columns = [
-                row["name"] for row in conn.execute("PRAGMA table_info(paper_orders)").fetchall()
-                if row["name"] != "risk_payload"
-            ]
-            select_list = ",".join(f'"{name}"' for name in columns)
-            snapshot[table] = _rows(conn, f"SELECT {select_list} FROM paper_orders")
-        else:
-            snapshot[table] = _rows(conn, f"SELECT * FROM {table}")
-    snapshot["_archive_format"] = "compact-ledger-v2"
-    snapshot["_table_counts"] = {
-        table: int(conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
-        for table in ledger_tables + counted_tables
-    }
-    return cycle, snapshot
+    """PR-58：快照（``compact-ledger-v2``）实现已移至 ``paper_cycle_service``。"""
+    return PCS.cycle_snapshot(conn, _active_cycle(conn))
 
 
 def _archive_current_cycle(conn, reason):
-    cycle, snapshot = _cycle_snapshot(conn)
-    now = _now()
-    conn.execute("INSERT INTO paper_archives(cycle_id,cycle_key,reason,snapshot,created_at) VALUES(?,?,?,?,?)",
-                 (cycle["id"], cycle["cycle_key"], reason, _json(snapshot), now))
-    conn.execute("UPDATE paper_cycles SET status='archived',ended_at=?,updated_at=? WHERE id=?", (now, now, cycle["id"]))
-    for table in ["paper_signals", "paper_orders", "paper_positions", "paper_position_lots", "paper_fills",
-                  "paper_risk_decisions", "paper_nav", "paper_jobs", "paper_job_runs", "paper_reviews",
-                  "paper_intraday_observations", "paper_parameter_versions", "paper_position_reviews",
-                  "paper_capital_reservations", "paper_position_limit_versions"]:
-        conn.execute(f"DELETE FROM {table}")
-    _audit(conn, None, "cycle_archived", f"周期 {cycle['cycle_key']} 已归档：{reason}")
-    return cycle
+    """PR-58：归档实现已移至 ``paper_cycle_service``（存档 + 翻状态 + 清表 + 审计）。"""
+    return PCS.archive_cycle(conn, _active_cycle(conn), reason)
 
 
 def _create_cycle(conn, capital, status="paused", reason="新建模拟周期", duration_days=None, enabled_strategies=None):
