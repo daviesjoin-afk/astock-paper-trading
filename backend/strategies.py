@@ -126,11 +126,14 @@ PAPER_CONDITION_DEFAULTS = {
     },
     "sentiment_pioneer": {
         # 板块热度是优先级，不再是一票否决；个股极强时走独立强势路径。
+        # individual_pct_* 比较的是 ``pct``（百分点，3.5 == +3.5%）；
+        # individual_mom5_min 比较的是 ``mom5_raw``（**fraction**，0.02 == +2%）。
+        # 两者单位不同，切勿互相套用。
         "enabled": {"sentiment_guard": True, "individual_strong": True},
         "sentiment_min": -0.5, "sentiment_penalty": 0.20,
         "individual_pct_min": 3.5, "individual_pct_max": 8.5,
         "individual_flow_min": 0.65, "individual_vol_surge_min": 1.20,
-        "individual_mom5_min": 2.0, "individual_bonus": 0.28,
+        "individual_mom5_min": 0.02, "individual_bonus": 0.28,  # fraction: 0.02 == +2%
     },
 }
 
@@ -288,9 +291,11 @@ def _hot_leader_profile(table):
 
     distance = (price / ma20 - 1.0).where(price.gt(0) & ma20.gt(0))
     # 启动段通常尚未远离 MA20；过热判断同时参考短中期涨幅和均线乖离。
+    # mom5/mom20 取 mom5_raw/mom20_raw，是 **fraction**（0.18 == +18%）。
+    # 阈值必须同单位；写作 18/35（百分点）会让这两个过热分量恒为 0（死分支）。
     overheat = pd.Series(0.0, index=idx)
-    overheat += mom5.ge(18).astype(float) * 0.30
-    overheat += mom20.ge(35).astype(float) * 0.25
+    overheat += mom5.ge(0.18).astype(float) * 0.30      # fraction: 0.18 == +18%
+    overheat += mom20.ge(0.35).astype(float) * 0.25     # fraction: 0.35 == +35%
     overheat += distance.ge(0.15).astype(float) * 0.25
     overheat += pct.ge(9.0).astype(float) * 0.20
     overheat = overheat.clip(0.0, 1.0)
@@ -375,16 +380,17 @@ def _bottom_reversal_profile(table):
     location = location.mask(dist20.lt(-0.08) & dist20.ge(-0.15), 0.42)
 
     # Prior weakness plus a positive short turn is the central reversal shape.
+    # mom5 是 fraction（0.03 == +3%），短转区间"1%~10%"必须写成 0.01~0.10。
     turn = pd.Series(0.0, index=idx)
     turn += ((mom20 <= 0) & mom5.gt(0)).astype(float) * 0.60
-    turn += mom5.between(1.0, 10.0, inclusive="both").astype(float) * 0.25
+    turn += mom5.between(0.01, 0.10, inclusive="both").astype(float) * 0.25  # fraction: +1%~+10%
     turn += above_boll.astype(float) * 0.15
     turn = turn.clip(0.0, 1.0)
     rsi_fit = (1.0 - (rsi - 55.0).abs() / 45.0).clip(0.0, 1.0)
     confirmation = (rank01(flow) * 0.50 + rank01(volume) * 0.25
                     + pct.clip(-5, 8).rank(pct=True).fillna(0.5) * 0.25)
-    overheat = ((mom5.ge(15).astype(float) * 0.30)
-                + (mom20.ge(35).astype(float) * 0.25)
+    overheat = ((mom5.ge(0.15).astype(float) * 0.30)    # fraction: 0.15 == +15%
+                + (mom20.ge(0.35).astype(float) * 0.25)  # fraction: 0.35 == +35%
                 + (dist20.ge(0.15).astype(float) * 0.30)
                 + (pct.ge(8.5).astype(float) * 0.15)).clip(0.0, 1.0)
     score = (location * 0.30 + turn * 0.28 + rsi_fit * 0.12
@@ -1529,7 +1535,7 @@ def _run_paper_strategy(strategy_id, table, topn, gate, first_board_codes=None, 
                     and _number_or(row.get("pct"), -999.0) >= conditions.get("individual_pct_min", 3.5)
                     and _number_or(row.get("flow"), -999.0) >= conditions.get("individual_flow_min", 0.65)
                     and _number_or(row.get("vol_surge_raw"), -999.0) >= conditions.get("individual_vol_surge_min", 1.2)
-                    and _number_or(row.get("mom5_raw"), -999.0) >= conditions.get("individual_mom5_min", 2.0)
+                    and _number_or(row.get("mom5_raw"), -999.0) >= conditions.get("individual_mom5_min", 0.02)
                 ) else "sector_heat",
                 "reasons": [f"模拟盘内部候选分 {float(row['score']):.3f}"],
                 "news_check": {"status": "clean", "hits": 0},
