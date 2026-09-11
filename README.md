@@ -266,10 +266,16 @@ GitHub Actions 会在 **Python 3.11 / 3.12** 上安装锁定依赖并执行后�
 HTTP 控制面有统一的操作员边界（PR-2）：`POST`/`PUT`/`PATCH`/`DELETE` 需要 operator
 凭据，`GET` 只读、无需凭据。三种模式：
 
-- **未配置 token**（local-only）：仅本机环回地址可写，远端写请求 `403`；
+- **未配置 token**（local-only）：仅"本机环回地址 + 本地 `Host`"可写，其余写请求
+  `403`（`Host` 必须是 `localhost` 或环回 IP 字面量，用以挡住 DNS rebinding）；
 - **配置合法 token**（>= 24 字符，authenticated）：任何客户端的写请求都必须带
   标准 Authorization 头（Bearer 方案，值形如「Bearer <凭据>」），localhost 无豁免；
 - **token 非法**（misconfigured）：所有写请求 `503`。
+
+**使用自定义主机名（内网域名等）必须配置 token**，让边界进入 authenticated 模式。
+反向代理转发 `Host` 时必须保留 `host:port`（nginx 用 `$http_host`，不要用会丢端口的
+`$host`），否则浏览器 `Origin` 里的端口与后端推断的默认端口不一致，合法的同源写请求
+会被判 `cross-origin` → `403`。
 
 **不存在关闭边界的开关。** 先准备密钥：
 

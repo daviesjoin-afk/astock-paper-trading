@@ -229,3 +229,148 @@ test("真实 apiJson(POST) 调用会发送 Authorization", async () => {
   assert.equal(seen.length, 1);
   assert.equal(seen[0].headers.Authorization, "Bearer " + TOKEN);
 });
+
+// ─────────────────────────────────────────────
+// 重试作用域：只读方法才重试，写方法永不重放
+// ─────────────────────────────────────────────
+//
+// 复审 advisory：api(path, options) 是通用入口，之前重试上限与 method 无关，
+// 传 options.method='POST' 时一次 502/503/504 会被自动重放最多 4 次，可能造成
+// 重复副作用（重复下单/重复启动）。这里用**行为**断言锁住"写方法只尝试 1 次"。
+//
+// 加速：api.js 的退避时长恰为 800/1600/2400ms（见 800*(attempt+1)）。把它们
+// 压缩为 0 以缩短测试时间；其余定时器（AbortController 的 25000ms 超时）保持
+// 真实。若将来退避公式变化，测试只会变慢，断言仍然有效。
+
+const BACKOFF_DELAYS = new Set([800, 1600, 2400]);
+
+async function withFastBackoff(fn) {
+  const realSetTimeout = globalThis.setTimeout;
+  globalThis.setTimeout = (cb, ms, ...rest) =>
+    realSetTimeout(cb, BACKOFF_DELAYS.has(ms) ? 0 : ms, ...rest);
+  try {
+    return await fn();
+  } finally {
+    globalThis.setTimeout = realSetTimeout;
+  }
+}
+
+/** 用固定状态序列驱动 fetch，返回被调用的次数与方法。 */
+function stubFetch(statuses) {
+  const seen = [];
+  let i = 0;
+  globalThis.fetch = async (url, options) => {
+    const status = statuses[Math.min(i, statuses.length - 1)];
+    i += 1;
+    seen.push({ url, method: (options && options.method) || "GET" });
+    return { ok: status < 400, status, json: async () => ({ detail: "stub" }) };
+  };
+  return seen;
+}
+
+test("GET 遇 503 会重试（最终成功）", async () => {
+  reset();
+  const original = globalThis.fetch;
+  const seen = stubFetch([503, 200]);
+  try {
+    await withFastBackoff(() => API.api("/api/version"));
+  } finally {
+    globalThis.fetch = original;
+  }
+  assert.equal(seen.length, 2, "GET 应在 503 后重试一次");
+});
+
+test("GET 持续 503 时尝试次数为 4 且最终抛错", async () => {
+  reset();
+  const original = globalThis.fetch;
+  const seen = stubFetch([503]);
+  let err = null;
+  try {
+    await withFastBackoff(() => API.api("/api/version"));
+  } catch (e) {
+    err = e;
+  } finally {
+    globalThis.fetch = original;
+  }
+  assert.ok(err, "持续 503 必须抛错，不能静默返回");
+  assert.equal(seen.length, 4, "GET 重试上限应为 4 次");
+});
+
+test("GET 遇 500（非 502/503/504）只尝试 1 次", async () => {
+  reset();
+  const original = globalThis.fetch;
+  const seen = stubFetch([500]);
+  let err = null;
+  try {
+    await withFastBackoff(() => API.api("/api/version"));
+  } catch (e) {
+    err = e;
+  } finally {
+    globalThis.fetch = original;
+  }
+  assert.ok(err);
+  assert.equal(seen.length, 1, "500 不在重试白名单内");
+});
+
+for (const method of WRITE_METHODS) {
+  for (const status of [502, 503, 504]) {
+    test(`${method} 遇 ${status} 绝不重放（只尝试 1 次）`, async () => {
+      reset();
+      API.setOperatorToken(TOKEN);
+      const original = globalThis.fetch;
+      const seen = stubFetch([status]);
+      let err = null;
+      try {
+        await withFastBackoff(() => API.api("/api/paper/start", { method }));
+      } catch (e) {
+        err = e;
+      } finally {
+        globalThis.fetch = original;
+      }
+      assert.ok(err, `${method} ${status} 必须抛错`);
+      assert.equal(seen.length, 1, `${method} 是写方法，不得重放（实际 ${seen.length} 次）`);
+    });
+  }
+}
+
+test("写方法遇网络异常（fetch reject）也不重放", async () => {
+  reset();
+  API.setOperatorToken(TOKEN);
+  const original = globalThis.fetch;
+  let calls = 0;
+  globalThis.fetch = async () => {
+    calls += 1;
+    throw new Error("network down");
+  };
+  let err = null;
+  try {
+    await withFastBackoff(() => API.api("/api/paper/start", { method: "POST" }));
+  } catch (e) {
+    err = e;
+  } finally {
+    globalThis.fetch = original;
+  }
+  assert.ok(err);
+  assert.equal(calls, 1, "写方法的网络异常不得触发重试");
+});
+
+test("写方法重放场景下凭据仍只发送标准 Bearer 头", async () => {
+  reset();
+  API.setOperatorToken(TOKEN);
+  const original = globalThis.fetch;
+  const headers = [];
+  globalThis.fetch = async (url, options) => {
+    headers.push(options && options.headers);
+    return { ok: false, status: 503, json: async () => ({ detail: "stub" }) };
+  };
+  try {
+    await withFastBackoff(() => API.api("/api/paper/start", { method: "DELETE" }));
+  } catch (e) {
+    /* 预期抛错 */
+  } finally {
+    globalThis.fetch = original;
+  }
+  assert.equal(headers.length, 1);
+  assert.equal(headers[0].Authorization, "Bearer " + TOKEN);
+  assert.ok(!("X-Operator-Token" in headers[0]));
+});

@@ -43,6 +43,15 @@ const PORT = Number(process.env.ASTOCK_E2E_PORT || 8611);
 const BASE_URL = `http://127.0.0.1:${PORT}`;
 const isCI = !!process.env.CI;
 
+// PR-2 复审 Blocker 1：正式反代形态回归的端口。
+// 直连 Uvicorn 时 Host 天然带端口，测不出 nginx ``Host $host`` 丢端口的缺陷；
+// 因此 server.py 额外起两个真实反代（见 e2e/reverse_proxy.py），这里把端口
+// 通过 env 同时交给 webServer（子进程）与 spec（worker 进程），保证唯一来源。
+const PROXY_PORT = Number(process.env.ASTOCK_E2E_PROXY_PORT || 8612);
+const STRIP_PROXY_PORT = Number(process.env.ASTOCK_E2E_STRIP_PROXY_PORT || 8613);
+process.env.ASTOCK_E2E_PROXY_PORT = String(PROXY_PORT);
+process.env.ASTOCK_E2E_STRIP_PROXY_PORT = String(STRIP_PROXY_PORT);
+
 export default defineConfig({
   testDir: "./e2e/specs",
   // 每个 spec 文件串行，避免多个 worker 抢同一份临时账本；文件之间可并行。
@@ -78,7 +87,7 @@ export default defineConfig({
     },
   ],
   webServer: {
-    command: `"${PYTHON}" e2e/server.py --port ${PORT}`,
+    command: `"${PYTHON}" e2e/server.py --port ${PORT} --proxy-port ${PROXY_PORT} --strip-proxy-port ${STRIP_PROXY_PORT}`,
     cwd: here,
     url: `${BASE_URL}/api/health`,
     // 永远新建：每个 run 一份独立临时数据目录（ASTOCK_DATA_DIR），

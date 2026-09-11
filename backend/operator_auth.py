@@ -22,9 +22,22 @@ token 落入访问日志、浏览器历史与 Referer。
 
 对应三种运行模式：
 
-    local-only mode     UNSET，写操作仅允许环回客户端（仍受浏览器来源防护约束）
+    local-only mode     UNSET，写操作仅允许环回客户端，且 ``Host`` 必须是
+                        ``localhost`` / loopback IP 字面量（仍受浏览器来源防护约束）
     authenticated mode  VALID，任何客户端的写操作都必须带 Bearer（localhost 无豁免）
     misconfigured mode  INVALID，所有写操作 503
+
+## local-only 模式的 Host 约束（DNS rebinding）
+
+"客户端 IP 是环回"**不足以**证明请求来自本机操作员：恶意页面可以在
+``http://attacker.example.com`` 上运行，随后该域名被重绑到 127.0.0.1。此时浏览器
+发出的 ``Origin`` 与 ``Host`` 都是 ``attacker.example``，``Sec-Fetch-Site`` 也
+表现为 same-origin，而 TCP 层客户端确实是 loopback —— 只靠"Origin == Host"
+与 IP 判定无法区分。
+
+因此 local-only 模式额外要求 ``Host`` 本身是本地地址（见 :func:`is_local_host`）。
+自定义主机名不是"本地放行"的合法场景，需要配置 VALID token 进入
+authenticated 模式。
 
 ## fail-closed
 
@@ -77,6 +90,11 @@ _DEFAULT_PORTS = {"http": 80, "https": 443}
 # 浏览器来源防护：这些 Origin 值一律拒绝，不得解释成"没有 Origin"。
 _NULL_ORIGINS = frozenset({"null"})
 
+# local-only 模式可接受的 ``Host`` 主机名（大小写不敏感，端口另行拆分）。
+# 只接受 exact ``localhost`` 或 loopback IP 字面量。**任意域名都不接受**——
+# 包括"当前解析到 127.0.0.1"的域名：那正是 DNS rebinding 的入口。
+_LOCAL_HOST_NAMES = frozenset({"localhost"})
+
 # 允许继续后续判断的 Sec-Fetch-Site 取值。
 # cross-site 直接拒绝；其余（含缺失）交给 Origin / Auth / IP 策略决定。
 _FETCH_SITE_ALLOWED = frozenset({"same-origin", "same-site", "none"})
@@ -86,6 +104,7 @@ _FETCH_SITE_BLOCKED = frozenset({"cross-site"})
 DETAIL_AUTH_REQUIRED = "operator authentication required"
 DETAIL_MISCONFIGURED = "operator authentication is misconfigured"
 DETAIL_REMOTE_DISABLED = "remote operator mutations are disabled"
+DETAIL_NON_LOCAL_HOST = "local-only operator mutations require a loopback host"
 DETAIL_CROSS_SITE = "cross-site operator mutation is not allowed"
 DETAIL_BAD_ORIGIN = "request origin is not allowed"
 DETAIL_UNSUPPORTED_METHOD = "unsupported HTTP method"
@@ -356,6 +375,31 @@ def _split_host_header(value):
     return text.lower(), None
 
 
+def is_local_host(value):
+    """``Host`` 头是否指向**本机**（loopback 语义）。允许带端口。
+
+    只接受两类取值：
+
+    - exact ``localhost``（大小写不敏感）；
+    - loopback IP 字面量（``127.0.0.0/8``、``::1``，IPv6 可带方括号）。
+
+    **任意域名一律不接受**，即使它当前解析到 127.0.0.1。这是 DNS rebinding
+    的关键约束：攻击者页面本身可以是 ``http://attacker.example.com``，随后该域名
+    被重绑到 127.0.0.1；此时浏览器发出的 ``Origin`` 与 ``Host`` 都仍是
+    ``attacker.example``，``Sec-Fetch-Site`` 也表现为 same-origin，而 TCP 层
+    客户端恰好是 loopback —— 只靠"Origin == Host"与"客户端是否 loopback"
+    无法区分。因此 local-only 模式必须额外要求 Host 本身就是本地地址。
+
+    无法解析 / 缺失 → ``False``（fail-closed）。
+    """
+    host, _port = _split_host_header(value)
+    if not host:
+        return False
+    if host in _LOCAL_HOST_NAMES:
+        return True
+    return is_loopback_client(host)
+
+
 def validate_origin(origin, *, scheme="http", host=None, server_port=None):
     """校验 ``Origin`` 是否与**服务器自身 origin** 同源。
 
@@ -492,7 +536,12 @@ def authorize_mutation(
         return Decision(False, 503, DETAIL_MISCONFIGURED, "misconfigured")
 
     if cfg.state is TokenConfigState.UNSET:
-        # local-only mode：仅环回客户端可写。
+        # local-only mode：除了"客户端来自环回"，还要求 **Host 本身是本地地址**。
+        # 只检查客户端 IP 不足以挡住 DNS rebinding（见 is_local_host 的说明）。
+        # 自定义主机名不是"本地放行"的合法场景——需要配置 VALID token 进入
+        # authenticated 模式。
+        if not is_local_host(host_header):
+            return Decision(False, 403, DETAIL_NON_LOCAL_HOST, "non_local_host")
         if is_loopback_client(client_host):
             return Decision(True, 200, "", "local_only_allowed")
         return Decision(False, 403, DETAIL_REMOTE_DISABLED, "remote_disabled")

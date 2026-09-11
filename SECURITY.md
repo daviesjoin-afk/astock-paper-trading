@@ -55,7 +55,7 @@ python scripts/security/scan-sensitive-data.py --repo . --scope all
 
 | token 状态 | 模式 | 写请求行为 |
 | --- | --- | --- |
-| UNSET（不存在 / trim 后为空） | `local-only` | 环回客户端（`127.0.0.1` / `::1`）允许；远端 **403** |
+| UNSET（不存在 / trim 后为空） | `local-only` | 环回客户端 + **本地 `Host`** 才允许；其余 **403** |
 | VALID（trim 后 >= 24 字符且字符合法） | `authenticated` | 任何客户端（含 localhost）都必须带 `Authorization: Bearer` |
 | INVALID（存在但太短 / 含非法字符） | `misconfigured` | 全部 **503**（绝不降级为 UNSET 或免鉴权） |
 
@@ -63,12 +63,34 @@ python scripts/security/scan-sensitive-data.py --repo . --scope all
 
 未配置 token 时的默认模式，保留"本机零配置可用"：
 
-- 环回客户端的写请求允许（仍须通过浏览器来源防护）。
+- 写请求需要**同时**满足两个条件：客户端来自环回，且 `Host` 本身指向本机。
 - 远端写请求一律 `403 remote operator mutations are disabled`。
+- `Host` 不是本地地址时一律 `403 local-only operator mutations require a loopback host`。
 - 这不是配置错误，因此**不返回 503**——它是刻意的本地兼容模式。
 - 浏览器来源防护（`Origin` / `Sec-Fetch-Site`）在写方法上始终生效，所以环回
   客户端也不能被跨站页面冒用（localhost CSRF / DNS rebinding）。
 - 该模式依赖环回 + 来源防护，**不应通过额外网络转发对外暴露**。
+
+##### `Host` 必须是本地地址（DNS rebinding）
+
+仅检查"客户端 IP 是环回"**不足以**挡住 DNS rebinding。攻击者可以让页面运行在
+`http://attacker.example.com`，随后把该域名重绑到 `127.0.0.1`；此时：
+
+- 浏览器发出的 `Origin` 与 `Host` 都是 `attacker.example.com`，两者一致；
+- `Sec-Fetch-Site` 表现为 `same-origin`；
+- TCP 层客户端确实是环回地址。
+
+也就是说"环回 + `Origin == Host`"这三个条件会被同时满足，而请求其实来自
+攻击者页面。因此在 local-only 模式下，`Host` 必须**本身就是本地地址**：
+
+- 接受：exact `localhost`（大小写不敏感），以及环回 IP 字面量
+  （`127.0.0.0/8`、`::1`，可带端口，IPv6 可带方括号）。
+- 拒绝：**一切域名**，包括"当前解析到 `127.0.0.1`"的域名。
+- 判定是**纯字面量比较，绝不查 DNS**——任何"解析后看是不是环回"的实现都会
+  重新打开这个漏洞。
+
+> 使用自定义主机名（例如内网域名 `astock.internal`）时必须配置合法 token，
+> 让边界进入 `authenticated` 模式；local-only 模式不接受任何域名。
 
 #### Authenticated mode
 
@@ -136,6 +158,45 @@ cookie（避免落入访问日志、浏览器历史与 `Referer`）。
 伪装成本机。代理信任由 Uvicorn 的
 `--proxy-headers --forwarded-allow-ips=127.0.0.1` 承担，应用层不建立第二套 parser。
 
+### 反向代理必须保留 `Host` 的端口
+
+浏览器访问 `http://server.example.com:8600` 时发送的 `Origin` 里**带端口**——
+端口是 origin 的一部分。若反向代理把 `Host` 规范化成不带端口的形式，后端只能按
+协议默认端口推断（http→80），于是 `8600 != 80`，**合法的同源写请求会被判
+`cross_origin` → 403**。
+
+因此 `deploy/astock-codex.nginx.conf` 用 `$http_host`（原样保留 `host:port`）
+而不是 `$host`（会丢掉非默认端口）：
+
+```nginx
+map $http_host $astock_upstream_host {
+    ""      $host;          # HTTP/1.0 客户端不发 Host 时的兜底
+    default $http_host;
+}
+
+location / {
+    proxy_pass http://127.0.0.1:18600;
+    proxy_set_header Host $astock_upstream_host;
+}
+```
+
+回归证据分两层，缺一不可：
+
+- **静态**：`backend/test_operator_boundary.py::NginxProxyConfigTests` 锁住配置
+  文件里不得出现 `proxy_set_header Host $host;`，且 map 变量必须被真正使用
+  （只定义不使用等于死配置）。
+- **行为**：`ReverseProxyIntegrationTests`（真实 TCP 反代 + 真实 uvicorn）与浏览器端
+  `frontend/e2e/specs/reverse-proxy.spec.js`（真实 Chromium + 真实反代）双向验证——
+  保留端口的形态下同源写请求成功，丢端口的形态下**复现 403**。
+  后者是必要的：直连 Uvicorn 的 E2E 里 `Host` 天然带端口，**永远测不出**这个缺陷。
+
+> **不要把 local-only 模式放在反向代理之后对外提供写服务。**
+> 反代到后端的 TCP 连接来自 `127.0.0.1`，因此**所有**经反代而来的远端客户端在应用层
+> 都表现为"环回客户端"。此时 local-only 模式只剩两道防线：来源防护与 `Host` 本地性。
+> 若反代把 `Host` 固定改写成 `localhost`（而不是原样透传），这两道防线会一起失效，
+> 远端就能写。对外提供写服务请配置 token（authenticated 模式），并让反代**原样透传**
+> `Host`。
+
 ### Compose Credential Source
 
 **server compose 的 `ASTOCK_OPERATOR_TOKEN` 唯一来源是 `env_file`。**
@@ -167,7 +228,10 @@ environment:
 3. 只读 GET 默认仍公开，看板数据对可达网络可见。
 4. `sessionStorage` 不能抵抗同源 XSS——同源脚本仍可读取凭据。
 5. 操作员边界不替代既有的风险门禁与人工确认（`confirmed=true` 仍独立生效）。
-6. local-only 模式依赖环回 + 来源防护，不应通过额外网络转发暴露。
+6. local-only 模式依赖环回 + 来源防护 + `Host` 本地性，不应通过额外网络转发暴露；
+   使用自定义主机名必须配置 token 进入 authenticated 模式。
+7. 反向代理配置错误（如用 `$host` 丢掉非默认端口）会让合法同源写请求 403——
+   这是可用性问题，不是鉴权绕过；但它会诱使运维"关掉边界"，故必须按上节配置。
 
 
 ## 写接口清单

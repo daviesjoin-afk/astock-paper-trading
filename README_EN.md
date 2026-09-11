@@ -229,10 +229,17 @@ The local Compose mapping binds the host port to loopback only (`127.0.0.1:8600:
 The HTTP control plane enforces a unified operator boundary (PR-2): `POST`/`PUT`/`PATCH`/`DELETE`
 require an operator credential, while `GET` is read-only and needs none. There are three modes:
 
-- **No token configured** (local-only): only loopback clients may write; remote writes get `403`.
+- **No token configured** (local-only): only a loopback client **with a loopback `Host`** may write;
+  everything else gets `403` (`Host` must be `localhost` or a loopback IP literal — this blocks DNS
+  rebinding).
 - **Valid token configured** (>= 24 chars, authenticated): every client, including localhost, must
   send the standard Authorization header using the Bearer scheme (value: `Bearer <credential>`).
 - **Invalid token** (misconfigured): all writes get `503`.
+
+**Custom hostnames (e.g. an intranet domain) require a token**, so the boundary runs in authenticated
+mode. When a reverse proxy forwards `Host` it must preserve `host:port` (use nginx `$http_host`, not
+`$host`, which drops non-default ports) — otherwise the port in the browser `Origin` no longer matches
+the default port the backend infers, and legitimate same-origin writes are judged `cross-origin` → `403`.
 
 There is **no switch to disable the boundary**. Configure the secret in `.env` (gitignored):
 

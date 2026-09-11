@@ -21,6 +21,11 @@ import tempfile
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 BACKEND = os.path.join(REPO_ROOT, "backend")
 
+# 本文件以脚本方式运行（``python e2e/server.py``），脚本所在目录即 e2e/，
+# 因此可以直接 import 同目录的反代夹具。
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from reverse_proxy import ReverseProxy  # noqa: E402
+
 # PR-2：E2E 用的 operator token。刻意写成明显的合成值（全小写 + 连字符），
 # 不对应任何真实环境；仅供本地/CI 的临时实例使用。
 OPERATOR_TOKEN = "zz-e2e-operator-placeholder-value"
@@ -33,6 +38,12 @@ def main() -> int:
                         help="临时数据目录（缺省自动创建并 DROP_AFTER 时删除）")
     parser.add_argument("--keep-data-dir", action="store_true",
                         help="结束后保留临时数据目录（排障用）")
+    # PR-2 复审 Blocker 1：正式反代形态回归。直连 Uvicorn 时 Host 天然带端口，
+    # 测不出 nginx ``Host $host`` 丢端口的缺陷；因此这里额外起两个真实反代。
+    parser.add_argument("--proxy-port", type=int, default=8612,
+                        help="保留 host:port 的反代端口（修复后的 nginx 形态）；0=禁用")
+    parser.add_argument("--strip-proxy-port", type=int, default=8613,
+                        help="丢弃端口的反代端口（修复前的 nginx 形态，用于自证回归有效）；0=禁用")
     args = parser.parse_args()
 
     data_dir = args.data_dir or tempfile.mkdtemp(prefix="astock-e2e-")
@@ -56,11 +67,28 @@ def main() -> int:
     import uvicorn  # noqa: E402
     import main  # noqa: E402,F401  (真实应用装配)
 
+    # PR-2 复审 Blocker 1：在应用之前先把反代起好（uvicorn.run 会阻塞主线程）。
+    # 反代只做 Host 转发语义的复刻，转发目标就是本进程即将监听的 127.0.0.1:port。
+    proxies = []
+    for port, mode, label in (
+        (args.proxy_port, "preserve", "reverse proxy (host:port preserved)"),
+        (args.strip_proxy_port, "strip_port", "reverse proxy (port stripped / buggy)"),
+    ):
+        if not port:
+            continue
+        proxies.append(
+            ReverseProxy("127.0.0.1", args.port, host_mode=mode,
+                         listen_port=port, name=f"proxy-{mode}").start()
+        )
+        print(f"[e2e-server] {label} on http://127.0.0.1:{port}", flush=True)
+
     print(f"[e2e-server] data_dir={data_dir}", flush=True)
     print(f"[e2e-server] listening on http://127.0.0.1:{args.port}", flush=True)
     try:
         uvicorn.run(main.app, host="127.0.0.1", port=args.port, log_level="warning")
     finally:
+        for proxy in proxies:
+            proxy.stop()
         if not args.keep_data_dir:
             shutil.rmtree(data_dir, ignore_errors=True)
     return 0

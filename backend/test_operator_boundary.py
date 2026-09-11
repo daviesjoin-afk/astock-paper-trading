@@ -26,9 +26,15 @@
 from __future__ import annotations
 
 import asyncio
+import http.client
+import http.server
 import os
 import re
+import socket
 import subprocess as _subprocess
+import tempfile
+import threading
+import time
 import unittest
 import unittest.mock
 
@@ -82,6 +88,7 @@ SERVER_COMPOSE = os.path.join(REPO_ROOT, "docker-compose.server.yml")
 LOCAL_COMPOSE = os.path.join(REPO_ROOT, "docker-compose.yml")
 ENV_EXAMPLE = os.path.join(REPO_ROOT, ".env.example")
 DOCKERFILE = os.path.join(REPO_ROOT, "Dockerfile")
+NGINX_CONF = os.path.join(REPO_ROOT, "deploy", "astock-codex.nginx.conf")
 CI_WORKFLOW = os.path.join(REPO_ROOT, ".github", "workflows", "ci.yml")
 PLAYWRIGHT_CONFIG = os.path.join(REPO_ROOT, "frontend", "playwright.config.js")
 OPERATOR_UNLOCK_SPEC = os.path.join(
@@ -491,7 +498,11 @@ class ClientAddressTests(unittest.TestCase):
             status, reason, _ = _decision(
                 "POST",
                 "/api/paper/start",
-                {"x-forwarded-for": "127.0.0.1", "x-real-ip": "127.0.0.1"},
+                {
+                    "host": "localhost",
+                    "x-forwarded-for": "127.0.0.1",
+                    "x-real-ip": "127.0.0.1",
+                },
                 client=("203.0.113.7", 5000),
             )
         self.assertEqual(status, 403)
@@ -619,6 +630,208 @@ class OriginPolicyTests(unittest.TestCase):
         self.assertEqual(OA.is_cross_site(""), (False, False))
 
 
+# ─── 4b. local-only 的 Host 本地性（PR-2 复审 Blocker 2：DNS rebinding）───
+
+
+class LocalHostBoundaryTests(unittest.TestCase):
+    """UNSET local-only 模式必须额外约束 ``Host`` 本身是本地地址。
+
+    仅检查"客户端 IP 是 loopback"不足以挡住 DNS rebinding：恶意页面可以在
+    任意域名上运行，随后该域名被重绑到 127.0.0.1。此时浏览器发出的
+    ``Origin`` 与 ``Host`` 都是该域名，``Sec-Fetch-Site`` 也表现为
+    same-origin，而 TCP 层客户端确实是 loopback。
+    """
+
+    WRITE = "/api/paper/start"
+    EVIL_HOST = "attacker.example.com"
+    CUSTOM_HOST = "astock.internal"
+
+    def _cfg(self, **env):
+        return unittest.mock.patch.dict(os.environ, _env(**env), clear=False)
+
+    # ── 判定函数本身 ──
+    def test_is_local_host_accepts_local_names_and_loopback_literals(self):
+        for value in [
+            "localhost",
+            "LOCALHOST",
+            "LocalHost:8600",
+            "127.0.0.1",
+            "127.0.0.1:18600",
+            _addr(127, 0, 0, 53),
+            _addr(127, 1, 2, 3),
+            "::1",
+            "[::1]",
+            "[::1]:8000",
+        ]:
+            self.assertTrue(OA.is_local_host(value), f"{value} 应被视为本地 Host")
+
+    def test_is_local_host_rejects_domains_and_remote_literals(self):
+        for value in [
+            None,
+            "",
+            "   ",
+            self.EVIL_HOST,
+            self.CUSTOM_HOST,
+            "localhost.evil.example.com",
+            "127.0.0.1.evil.example.com",
+            # 机制锁定：这些**通配 DNS 域名**在公网确实解析到 127.0.0.1。
+            # 任何"解析后看是不是 loopback 就放行"的实现都会接受它们——那正是
+            # DNS rebinding 的入口。断言它们被拒绝，等于钉死"判定只认字面量、
+            # 绝不查 DNS"这一机制（断言本身不联网，只调用纯函数）。
+            "127.0.0.1.nip.io",
+            "127.0.0.1.nip.io:8600",
+            "localtest.me",
+            _addr(203, 0, 113, 9),
+            _addr(10, 0, 0, 5),
+            "example.com",
+            "0.0.0.0",
+        ]:
+            self.assertFalse(OA.is_local_host(value), f"{value} 不得被视为本地 Host")
+
+    def test_is_local_host_performs_no_dns_lookup(self):
+        """判定必须是**纯字面量**比较，绝不查 DNS。
+
+        用"任何 DNS 查询都抛错"的替身把机制钉死：若实现被改成"解析后看是不是
+        loopback"，``socket.getaddrinfo`` 就会被调用并立刻失败——测试变红。
+        这条断言不依赖网络，因此不会因沙箱 / CI 的 DNS 环境差异而摇摆。
+        """
+        def _forbidden(*args, **kwargs):
+            raise AssertionError("is_local_host 不得触发 DNS 解析")
+
+        with unittest.mock.patch("socket.getaddrinfo", _forbidden):
+            self.assertTrue(OA.is_local_host("localhost"))
+            self.assertTrue(OA.is_local_host("127.0.0.1:8600"))
+            self.assertTrue(OA.is_local_host("[::1]:8600"))
+            self.assertFalse(OA.is_local_host("127.0.0.1.nip.io"))
+            self.assertFalse(OA.is_local_host(self.EVIL_HOST))
+
+    # ── 真实 rebinding 形态：Host / Origin 一致且 Sec-Fetch-Site 同源 ──
+    def test_rebinding_shape_rejected_in_local_only(self):
+        """client=loopback + UNSET + Host=Origin=攻击者域名 → 403。
+
+        这是复审明确要求的回归：不加 Host 本地性约束时该请求会被放行。
+        """
+        with self._cfg():
+            os.environ.pop(OA.TOKEN_ENV, None)
+            status, reason, stub = _decision(
+                "POST",
+                self.WRITE,
+                {
+                    "host": self.EVIL_HOST,
+                    "origin": "http://" + self.EVIL_HOST,
+                    "sec-fetch-site": "same-origin",
+                },
+                client=("127.0.0.1", 5000),
+            )
+        self.assertEqual(status, 403, "DNS rebinding 形态必须 403")
+        self.assertEqual(reason, "non_local_host")
+        self.assertEqual(stub.reached, [], "被拒后不得触达下游")
+
+    def test_rebinding_shape_rejected_through_full_app(self):
+        """同形态走完整 ASGI app（含中间件栈）也必须 403。"""
+        with self._cfg():
+            os.environ.pop(OA.TOKEN_ENV, None)
+            status, body = _call(
+                "POST",
+                self.WRITE,
+                {
+                    "host": self.EVIL_HOST,
+                    "origin": "http://" + self.EVIL_HOST,
+                    "sec-fetch-site": "same-origin",
+                },
+                client=("127.0.0.1", 5000),
+            )
+        self.assertEqual(status, 403)
+        self.assertIn(b"loopback host", body)
+
+    def test_forwarded_host_header_does_not_grant_local(self):
+        """``X-Forwarded-Host`` 之类不得把非本地 Host 洗成本地。"""
+        with self._cfg():
+            os.environ.pop(OA.TOKEN_ENV, None)
+            status = _blocked(
+                "POST",
+                self.WRITE,
+                {
+                    "host": self.EVIL_HOST,
+                    "x-forwarded-host": "localhost",
+                    "x-forwarded-for": "127.0.0.1",
+                },
+                client=("127.0.0.1", 5000),
+            )
+        self.assertEqual(status, 403)
+
+    def test_missing_host_rejected_in_local_only(self):
+        """HTTP/1.1 必有 Host；缺失即无法证明本地性 → fail-closed。"""
+        with self._cfg():
+            os.environ.pop(OA.TOKEN_ENV, None)
+            status, reason, _ = _decision("POST", self.WRITE, None, client=("127.0.0.1", 5000))
+        self.assertEqual(status, 403)
+        self.assertEqual(reason, "non_local_host")
+
+    # ── 正常本地 Host 仍必须放行（不能把合法场景一起打死）──
+    def test_local_hosts_allowed_in_local_only(self):
+        for value in ["localhost", "localhost:18600", "127.0.0.1:18600", "[::1]:18600"]:
+            with self.subTest(host=value):
+                with self._cfg():
+                    os.environ.pop(OA.TOKEN_ENV, None)
+                    _allowed(
+                        "POST", self.WRITE, {"host": value},
+                        client=("127.0.0.1", 5000),
+                    )
+
+    # ── 自定义主机名：必须配置 VALID token 进入 authenticated 模式 ──
+    def test_custom_hostname_denied_in_local_only(self):
+        with self._cfg():
+            os.environ.pop(OA.TOKEN_ENV, None)
+            status, reason, _ = _decision(
+                "POST",
+                self.WRITE,
+                {"host": self.CUSTOM_HOST, "origin": "http://" + self.CUSTOM_HOST},
+                client=("127.0.0.1", 5000),
+            )
+        self.assertEqual(status, 403)
+        self.assertEqual(reason, "non_local_host")
+
+    def test_custom_hostname_allowed_with_valid_token(self):
+        """配置 VALID token 后，自定义主机名的同源写请求恢复正常。
+
+        同时证明：Host 本地性**只**约束 local-only 模式；authenticated 模式的
+        安全由 Bearer + 同源校验共同保证。
+        """
+        with self._cfg(**{OA.TOKEN_ENV: TOKEN}):
+            _allowed(
+                "POST",
+                self.WRITE,
+                {
+                    "host": self.CUSTOM_HOST,
+                    "origin": "http://" + self.CUSTOM_HOST,
+                    "authorization": BEARER_OK,
+                },
+                client=("127.0.0.1", 5000),
+            )
+
+    def test_remote_client_with_local_host_still_denied(self):
+        """Host 本地但客户端是远端 → 仍按 remote_disabled 拒绝。"""
+        with self._cfg():
+            os.environ.pop(OA.TOKEN_ENV, None)
+            status, reason, _ = _decision(
+                "POST", self.WRITE, {"host": "localhost"},
+                client=("203.0.113.7", 5000),
+            )
+        self.assertEqual(status, 403)
+        self.assertEqual(reason, "remote_disabled")
+
+    def test_reads_not_affected_by_host_locality(self):
+        """只读方法不受 Host 本地性约束（防护只针对写操作）。"""
+        with self._cfg():
+            os.environ.pop(OA.TOKEN_ENV, None)
+            _allowed(
+                "GET", "/api/paper/overview",
+                {"host": self.CUSTOM_HOST},
+                client=("203.0.113.7", 5000),
+            )
+
+
 # ─── 5. 授权矩阵（合同 §65）───
 
 
@@ -630,17 +843,23 @@ class AuthorizationMatrixTests(unittest.TestCase):
     def _cfg(self, **env):
         return unittest.mock.patch.dict(os.environ, _env(**env), clear=False)
 
-    # ── A: UNSET + 127.0.0.1 + 无 Origin → 允许
+    # ── A: UNSET + 127.0.0.1 + 本地 Host + 无 Origin → 允许
     def test_matrix_A_unset_loopback_ipv4_allowed(self):
         with self._cfg():
             os.environ.pop(OA.TOKEN_ENV, None)
-            _allowed("POST", self.WRITE, client=("127.0.0.1", 5000))
+            _allowed(
+                "POST", self.WRITE, {"host": "localhost"},
+                client=("127.0.0.1", 5000),
+            )
 
-    # ── B: UNSET + ::1 + 无 Origin → 允许
+    # ── B: UNSET + ::1 + 本地 Host + 无 Origin → 允许
     def test_matrix_B_unset_loopback_ipv6_allowed(self):
         with self._cfg():
             os.environ.pop(OA.TOKEN_ENV, None)
-            _allowed("POST", self.WRITE, client=("::1", 5000))
+            _allowed(
+                "POST", self.WRITE, {"host": "[::1]:18600"},
+                client=("::1", 5000),
+            )
 
     # ── C: UNSET + remote → 403（不是 503）
     def test_matrix_C_unset_remote_denied_403(self):
@@ -1332,6 +1551,308 @@ class ComposeSecurityTests(unittest.TestCase):
             self.assertNotIn(
                 "localStorage", text, f"{name} 不得再写 localStorage 存凭据"
             )
+
+
+# ─── 11b. 正式反代（nginx）契约 —— PR-2 复审 Blocker 1 ───
+
+
+class NginxProxyConfigTests(unittest.TestCase):
+    """nginx 必须转发**原始 host:port**，否则合法同源写请求被误判为跨源。
+
+    `proxy_set_header Host $host` 会丢掉非默认端口：浏览器访问
+    ``http://server.example.com:8600`` 时发送 ``Origin: http://server.example.com:8600``，而后端收到的
+    Host 只有 ``server``，按 http 默认端口 80 比较 8600 → ``cross_origin`` → 403。
+    """
+
+    def _lines(self):
+        text = _read_text(NGINX_CONF)
+        return [line.strip() for line in text.splitlines()]
+
+    def test_config_exists(self):
+        self.assertTrue(os.path.exists(NGINX_CONF), "必须存在 nginx 站点配置")
+
+    def test_host_header_preserves_port(self):
+        """所有 Host 转发都不得使用会丢端口的 ``$host``。"""
+        host_lines = [l for l in self._lines() if l.startswith("proxy_set_header Host ")]
+        self.assertTrue(host_lines, "配置里必须有 Host 转发")
+        for line in host_lines:
+            self.assertNotEqual(
+                line, "proxy_set_header Host $host;",
+                "不得用 $host 转发 Host——它会丢掉非默认端口",
+            )
+            self.assertNotIn("$host;", line, f"不得使用 $host：{line}")
+
+    def test_upstream_host_variable_defined_by_map(self):
+        text = _read_text(NGINX_CONF)
+        self.assertRegex(
+            text,
+            r"map\s+\$http_host\s+\$astock_upstream_host\s*\{[^}]*default\s+\$http_host\s*;",
+            "必须用 map 把 $http_host 映射成上游 Host 变量",
+        )
+        # 只"定义"不"使用"等于死配置：把 proxy_set_header 改回 $host 时，
+        # map 仍然存在，光看定义会假绿（负向验证 N6 实测证实了这一点）。
+        # 因此这里额外要求该变量确实被 Host 转发引用。
+        host_lines = [l for l in self._lines() if l.startswith("proxy_set_header Host ")]
+        self.assertTrue(
+            host_lines and all("$astock_upstream_host" in l for l in host_lines),
+            f"map 变量必须被 Host 转发真正使用，实际转发行：{host_lines}",
+        )
+
+    def test_every_location_forwards_host(self):
+        """每个 proxy_pass 所在 location 都必须设置 Host（不允许漏配）。"""
+        lines = self._lines()
+        proxy_pass = [l for l in lines if l.startswith("proxy_pass ")]
+        host_lines = [l for l in lines if l.startswith("proxy_set_header Host ")]
+        self.assertEqual(
+            len(proxy_pass), len(host_lines),
+            "proxy_pass 与 Host 转发必须成对出现，避免某个 location 漏配",
+        )
+        self.assertGreaterEqual(len(proxy_pass), 2)
+
+    def test_listen_port_unchanged(self):
+        text = _read_text(NGINX_CONF)
+        self.assertIn("listen 8600;", text)
+        self.assertIn("listen [::]:8600;", text)
+
+    def test_no_untrusted_host_forwarding(self):
+        """不得引入 X-Forwarded-Host 之类新的信任通道。"""
+        text = _read_text(NGINX_CONF).lower()
+        self.assertNotIn("x-forwarded-host", text)
+
+    def test_host_header_is_not_hardcoded_to_local(self):
+        """不得把转发的 ``Host`` 硬编码成本地地址。
+
+        反代到后端的 TCP 连接本来就来自 ``127.0.0.1``；一旦 ``Host`` 也被写成
+        ``localhost`` / ``127.0.0.1``，local-only 模式的"环回客户端 + 本地 Host"
+        两道防线会**同时**失效——远端请求经反代即可写入。必须原样透传客户端
+        ``Host``（``$http_host`` / ``$astock_upstream_host``）。
+        """
+        for line in self._lines():
+            if not line.startswith("proxy_set_header Host "):
+                continue
+            self.assertNotRegex(
+                line,
+                r"Host\s+(?:localhost|127\.|\[::1\]|0\.0\.0\.0)",
+                f"不得把 Host 硬编码成本地地址：{line}",
+            )
+
+
+class _RecordingProxy:
+    """最小反向代理：复现 nginx 的 Host 转发行为（真实 TCP，非 ASGI 直调）。
+
+    - ``mode="preserve"``   → 等价于修复后的 ``Host $astock_upstream_host``
+      （``$http_host``：原样保留 ``host:port``）。
+    - ``mode="strip_port"`` → 等价于修复前的 ``Host $host``（丢掉非默认端口），
+      用于证明回归测试确实能抓到该缺陷。
+    """
+
+    def __init__(self, upstream_host, upstream_port, mode="preserve"):
+        self.upstream = (upstream_host, upstream_port)
+        self.mode = mode
+        self.seen_hosts = []
+        proxy = self
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def log_message(self, *args):  # 静默，避免污染测试输出
+                return
+
+            def _forward(self):
+                raw_host = self.headers.get("Host", "")
+                proxy.seen_hosts.append(raw_host)
+                forwarded = raw_host.split(":")[0] if proxy.mode == "strip_port" else raw_host
+                length = int(self.headers.get("Content-Length") or 0)
+                body = self.rfile.read(length) if length else b""
+                conn = http.client.HTTPConnection(*proxy.upstream, timeout=15)
+                headers = {k: v for k, v in self.headers.items() if k.lower() != "host"}
+                headers["Host"] = forwarded
+                conn.request(self.command, self.path, body=body, headers=headers)
+                resp = conn.getresponse()
+                payload = resp.read()
+                self.send_response(resp.status)
+                for key, value in resp.getheaders():
+                    if key.lower() in ("content-length", "transfer-encoding", "connection"):
+                        continue
+                    self.send_header(key, value)
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+                conn.close()
+
+            do_GET = _forward
+            do_POST = _forward
+            do_PUT = _forward
+            do_PATCH = _forward
+            do_DELETE = _forward
+            do_HEAD = _forward
+
+        class _QuietServer(http.server.ThreadingHTTPServer):
+            daemon_threads = True
+
+            def handle_error(self, request, client_address):
+                # 客户端提前关闭连接（ConnectionReset/Aborted）属正常现象，
+                # 静默处理，避免向 CI 日志倾倒无关堆栈。
+                return
+
+        self._httpd = _QuietServer(("127.0.0.1", 0), Handler)
+        self.port = self._httpd.server_address[1]
+        self._thread = threading.Thread(target=self._httpd.serve_forever, daemon=True)
+
+    def __enter__(self):
+        self._thread.start()
+        return self
+
+    def __exit__(self, *exc):
+        self._httpd.shutdown()
+        self._httpd.server_close()
+        return False
+
+
+def _start_app_server(timeout=30.0):
+    """在后台线程里用 uvicorn 起**真实应用**，返回 ``(server, port)``。
+
+    自己先 bind 一个临时端口再交给 uvicorn，避免"选端口→启动"之间的竞态。
+    """
+    try:
+        import uvicorn
+    except ImportError:  # pragma: no cover - uvicorn 是运行时依赖
+        raise unittest.SkipTest("uvicorn 不可用，跳过反代集成测试") from None
+
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    sock.bind(("127.0.0.1", 0))
+    port = sock.getsockname()[1]
+
+    config = uvicorn.Config(main.app, log_level="warning", access_log=False)
+    server = uvicorn.Server(config)
+    threading.Thread(
+        target=server.run, kwargs={"sockets": [sock]}, daemon=True
+    ).start()
+
+    deadline = time.time() + timeout
+    while not server.started and time.time() < deadline:
+        time.sleep(0.05)
+    if not server.started:
+        raise RuntimeError("uvicorn 未能在超时内启动")
+    return server, port
+
+
+class ReverseProxyIntegrationTests(unittest.TestCase):
+    """PR-2 复审 Blocker 1：**正式反代**路径下的同源写请求。
+
+    直连 Uvicorn 时 ``Host`` 自带测试端口，抓不到"反代丢掉端口"的缺陷；这里起
+    真实 uvicorn + 真实反向代理（真实 TCP），覆盖 nginx 的实际转发形态。
+    """
+
+    WRITE = "/api/strategies/preview"
+    ORIGIN_PORT = None  # 由用例填充
+
+    @classmethod
+    def setUpClass(cls):
+        cls._env = unittest.mock.patch.dict(
+            os.environ,
+            {
+                "ASTOCK_OPERATOR_TOKEN": TOKEN,
+                "ASTOCK_DEMO": "1",
+                "ASTOCK_DEMO_FORCE": "1",
+                "ASTOCK_ENABLE_FALLBACK_THREADS": "0",
+                "ASTOCK_DATA_DIR": tempfile.mkdtemp(prefix="astock-proxy-test-"),
+            },
+            clear=False,
+        )
+        cls._env.start()
+        cls.server, cls.app_port = _start_app_server()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.should_exit = True
+        cls._env.stop()
+
+    def _post_through(self, proxy, host_header):
+        conn = http.client.HTTPConnection("127.0.0.1", proxy.port, timeout=20)
+        try:
+            conn.request(
+                "POST",
+                self.WRITE,
+                body=b"{}",
+                headers={
+                    "Host": host_header,
+                    "Origin": f"http://{host_header}",
+                    "Content-Type": "application/json",
+                    "Content-Length": "2",
+                    "authorization": BEARER_OK,
+                },
+            )
+            resp = conn.getresponse()
+            return resp.status, resp.read()
+        finally:
+            conn.close()
+
+    def test_same_origin_write_succeeds_through_port_preserving_proxy(self):
+        """修复后的反代形态：Host 带端口 → 同源 → 边界放行（非 403）。"""
+        with _RecordingProxy("127.0.0.1", self.app_port, mode="preserve") as proxy:
+            host_header = f"127.0.0.1:{proxy.port}"
+            status, _body = self._post_through(proxy, host_header)
+        self.assertEqual(proxy.seen_hosts, [host_header], "代理必须原样转发 Host")
+        self.assertNotIn(
+            status, (401, 403, 503),
+            f"合法同源写请求不得被边界拒绝（实际 {status}）",
+        )
+
+    def test_port_dropping_proxy_reproduces_403(self):
+        """修复前的反代形态（``Host $host`` 丢端口）必须复现 403。
+
+        这条同时是**自检**：证明上面的回归测试真的能抓到该缺陷，而不是恒绿。
+        """
+        with _RecordingProxy("127.0.0.1", self.app_port, mode="strip_port") as proxy:
+            host_header = f"127.0.0.1:{proxy.port}"
+            status, _body = self._post_through(proxy, host_header)
+        self.assertEqual(
+            status, 403,
+            "Host 丢端口的反代形态应被判为跨源（这正是复审指出的缺陷）",
+        )
+
+    def test_cross_site_metadata_still_blocked_through_proxy(self):
+        """反代路径下 ``Sec-Fetch-Site: cross-site`` 仍必须 403（防护未被绕过）。"""
+        with _RecordingProxy("127.0.0.1", self.app_port, mode="preserve") as proxy:
+            host_header = f"127.0.0.1:{proxy.port}"
+            conn = http.client.HTTPConnection("127.0.0.1", proxy.port, timeout=20)
+            try:
+                conn.request(
+                    "POST",
+                    self.WRITE,
+                    body=b"{}",
+                    headers={
+                        "Host": host_header,
+                        "Origin": f"http://{host_header}",
+                        "Sec-Fetch-Site": "cross-site",
+                        "Content-Type": "application/json",
+                        "Content-Length": "2",
+                        "authorization": BEARER_OK,
+                    },
+                )
+                status = conn.getresponse().status
+            finally:
+                conn.close()
+        self.assertEqual(status, 403)
+
+    def test_operator_status_reachable_through_proxy(self):
+        """只读接口经反代可达（证明反代链路本身是通的，避免上面的断言假阴性）。"""
+        with _RecordingProxy("127.0.0.1", self.app_port, mode="preserve") as proxy:
+            conn = http.client.HTTPConnection("127.0.0.1", proxy.port, timeout=20)
+            try:
+                conn.request(
+                    "GET", "/api/operator-status",
+                    headers={"Host": f"127.0.0.1:{proxy.port}"},
+                )
+                resp = conn.getresponse()
+                status = resp.status
+                body = resp.read()
+            finally:
+                conn.close()
+        self.assertEqual(status, 200)
+        self.assertIn(b"writes_protected", body)
 
 
 # ─── 12. 前端契约（合同 §35–§44 / §70 / §71）───
