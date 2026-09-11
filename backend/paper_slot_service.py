@@ -35,20 +35,22 @@ def _best_effort_audit(db_factory, audit: Callable, event: str, detail: str) -> 
         pass
 
 
-def run_preflight(*, db_factory, audit: Callable, asof_day) -> dict:
+def run_preflight(*, db_factory, audit: Callable, resolve_asof_day: Callable) -> dict:
     """Run cleanup in the legacy order and keep failures fail-soft + audited.
 
-    Lifecycle cleanup must run before dispatch cleanup.  Either cleanup may
-    fail independently; the slot itself continues exactly as the legacy facade
-    did, while a best-effort audit records the failure.
+    ``resolve_asof_day`` is invoked *inside* the lifecycle try/DB context.  That
+    deliberately preserves the legacy exceptional path: a bad date is audited
+    as a lifecycle failure, dispatch cleanup still runs, and the facade later
+    resolves the date again for the actual slot run (where the error propagates
+    exactly as before).
     """
-    result = {
-        "lifecycle": "ok",
-        "dispatch": "ok",
-        "asof_day": asof_day.isoformat() if hasattr(asof_day, "isoformat") else str(asof_day),
-    }
+    result = {"lifecycle": "ok", "dispatch": "ok", "asof_day": None}
     try:
         with db_factory() as conn:
+            asof_day = resolve_asof_day()
+            result["asof_day"] = (
+                asof_day.isoformat() if hasattr(asof_day, "isoformat") else str(asof_day)
+            )
             ELC.expire_stale_signals(conn, asof_day=asof_day)
             ELC.expire_stale_orders(conn)
     except Exception as exc:  # pragma: no cover - exercised through injected failures
