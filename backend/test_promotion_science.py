@@ -36,7 +36,9 @@ def _db():
 def _seed(conn, challenger_navs, champion_navs=None, *, challenger_id=1):
     if champion_navs is None:
         champion_navs = [100000.0 * (1.001 ** i) for i in range(len(challenger_navs))]
-    for i, (champion, challenger) in enumerate(zip(champion_navs, challenger_navs)):
+    for i, (champion, challenger) in enumerate(
+        zip(champion_navs, challenger_navs, strict=True)
+    ):
         moment = BASE + dt.timedelta(days=i)
         checksum = f"snap-{i:03d}"
         for role, nav in (("champion", champion), ("challenger", challenger)):
