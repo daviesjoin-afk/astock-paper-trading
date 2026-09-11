@@ -261,7 +261,22 @@ GitHub Actions 会在 **Python 3.11 / 3.12** 上安装锁定依赖并执行后�
 
 ## Docker
 
-当前本地 Compose 的 `8600:8600` 映射会监听所有网卡。个人使用建议先改为 `127.0.0.1:8600:8600`。应用尚无完整内置鉴权，服务器访问须配置访问控制和认证；`confirmed=true` 仅防误触。
+本地 Compose 只把宿主端口绑定到环回地址（`127.0.0.1:8600:8600`），容器内部 Uvicorn 仍监听 `0.0.0.0` 以配合端口发布、健康检查与反代。
+
+HTTP 控制面有统一的操作员边界（PR-2）：`POST`/`PUT`/`PATCH`/`DELETE` 需要 operator token，`GET` 只读、无需凭据。**未配置 token 时写接口按 fail-closed 返回 503**——只读看板照常可用。先准备密钥：
+
+```bash
+# 生成强随机 token（>= 16 字符），写入 .env（已被 gitignore，勿提交）
+python -c "import secrets; print('ASTOCK_OPERATOR_TOKEN=' + secrets.token_urlsafe(32))" >> .env
+```
+
+浏览器端把同一串存入 `localStorage`（DevTools 控制台执行一次）：
+
+```js
+localStorage.setItem('operatorToken', '<粘贴同一 token>')
+```
+
+之后页面的写操作会自动携带 `X-Operator-Token` 头。仅纯本机离线演示可用 `ASTOCK_OPERATOR_AUTH_REQUIRED=0` 显式关闭鉴权。细节见 [`SECURITY.md`](SECURITY.md)。
 
 ```bash
 docker compose up -d --build

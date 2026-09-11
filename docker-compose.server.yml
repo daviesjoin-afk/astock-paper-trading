@@ -7,11 +7,16 @@ services:
     container_name: astock-codex
     restart: on-failure:5
     ports:
+      # PR-2：保持环回绑定不变。宿主 18600 由 nginx 反代对外；应用层的
+      # operator token 校验（operator_auth）是第二道边界，二者共同工作。
       - "127.0.0.1:18600:8600"
     env_file:
       - ${ASTOCK_ENV_FILE:-./.env.example}
     environment:
       ASTOCK_SCHEDULE_FILE: /app/deploy/astock-codex.cron
+      # PR-2：操作员边界密钥（从 env 文件读入，不写入 compose、不进仓库）。
+      # 写接口要求此 token；缺失时写接口 503，只读看板不受影响。
+      ASTOCK_OPERATOR_TOKEN: "${ASTOCK_OPERATOR_TOKEN:-}"
       # 主力股点火通道：仅在 +3.5%~+7.5% 区间内，经八项证据和快速
       # 确认后才允许进入既有的三分钟审批链路；不是绕开风控的追涨开关。
       PAPER_IGNITION_BUY: "1"

@@ -21,6 +21,10 @@ import tempfile
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 BACKEND = os.path.join(REPO_ROOT, "backend")
 
+# PR-2：E2E 用的 operator token。刻意写成明显的合成值（全小写 + 连字符），
+# 不对应任何真实环境；仅供本地/CI 的临时实例使用。
+OPERATOR_TOKEN = "zz-e2e-operator-placeholder-value"
+
 
 def main() -> int:
     parser = argparse.ArgumentParser()
@@ -41,6 +45,11 @@ def main() -> int:
     os.environ["ASTOCK_ENABLE_FALLBACK_THREADS"] = "0"
     os.environ.pop("DEEPSEEK_API_KEY", None)
     os.environ["LLM_ADVISOR_ENABLED"] = "0"
+    # PR-2：操作员边界。E2E 驱动的是真实应用，因此必须像真实运维那样配置
+    # operator token——绝不能为了过测试而关掉鉴权（那会让测试失去意义）。
+    # 前端通过 localStorage 里的 operatorToken 读取并放进请求头（见
+    # playwright.config.js 的 addInitScript）。
+    os.environ["ASTOCK_OPERATOR_TOKEN"] = OPERATOR_TOKEN
     sys.path.insert(0, BACKEND)
 
     import uvicorn  # noqa: E402

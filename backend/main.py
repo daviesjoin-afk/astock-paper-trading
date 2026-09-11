@@ -26,6 +26,7 @@ import linkage as L
 import paper_trading as P
 import selection_tracking as ST
 import metrics as MET
+import operator_auth
 from fastapi.exception_handlers import request_validation_exception_handler
 from fastapi.exceptions import RequestValidationError
 from api_paper import risk_refresh_status, router as paper_router
@@ -501,6 +502,59 @@ app.include_router(paper_router)
 app.include_router(adaptive_router)
 app.include_router(settings_router)
 app.include_router(strategies_router)
+
+
+# ─── PR-2：HTTP 操作员安全边界（Operator Security Boundary）───────────────
+# 统一入口在 operator_auth 模块；这里只做"接进 ASGI 管道"这一件事。
+#
+# 为什么用全局中间件而不是逐路由 Depends：
+#   逐路由标注要求每个新写接口都被作者记得补上鉴权——这正是 PR-2 要消灭的
+#   失效模式（"新增 mutation route 时容易忘记单独补鉴权"）。全局中间件按
+#   **HTTP 方法**（而非 URL 前缀）判定，因此不存在"前缀旁路"：任何 POST/
+#   PUT/PATCH/DELETE，无论挂在 /api/paper、/api/adaptive、/api/settings、
+#   /api/strategies 还是 main.py 顶层（/api/init、/api/track/*、
+#   /api/data-validity/* 等）都被同一条规则覆盖。
+#
+# 只读方法（GET/HEAD/OPTIONS）不经鉴权：控制面读写分离，看板无需密钥；且
+# 本边界不依赖任何 cookie/session，因此浏览器跨站请求无从冒用身份（无凭据
+# 可带），天然免疫 CSRF。
+_OPERATOR_STATUS_PATH = "/api/operator-status"
+
+
+@app.middleware("http")
+async def _operator_boundary(request, call_next):
+    decision = operator_auth.evaluate_request(request.method, request.headers)
+    if not decision.allowed:
+        return JSONResponse(
+            status_code=decision.status,
+            content={"detail": decision.detail, "reason": decision.reason},
+            headers=operator_auth.challenge_headers(decision),
+        )
+    response = await call_next(request)
+    # 安全响应头：与 nginx 侧对齐（直连容器时也生效）。
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("Referrer-Policy", "no-referrer")
+    return response
+
+
+@app.get(_OPERATOR_STATUS_PATH)
+def operator_status():
+    """操作员边界状态（**只读**，永不回显 token 本身）。
+
+    便于运维在不登录服务器的前提下确认"写接口是否已被保护"。不返回任何
+    密钥、长度以外都不暴露；未配置 token 时会明确标注 insecure。
+    """
+    return operator_auth.describe_configuration()
+
+
+# 启动期把配置状态打进日志：未配置 token 时**显著**告警，避免"以为有边界、
+# 实际裸奔"的静默安全假象（对应威胁模型第 6 条：弱/缺配置不得静默降级）。
+_OPERATOR_CONFIG_OK, _OPERATOR_CONFIG_MSG = operator_auth.assert_secure_configuration()
+if not _OPERATOR_CONFIG_OK:
+    print(f"[operator-auth][WARN] {_OPERATOR_CONFIG_MSG}", file=sys.stderr, flush=True)
+else:
+    print(f"[operator-auth] {_OPERATOR_CONFIG_MSG}", flush=True)
+
 
 
 # PR-51：/api/strategies 的请求体由类型化契约（strategy_api_models）解析。

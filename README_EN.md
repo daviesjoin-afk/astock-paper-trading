@@ -224,4 +224,6 @@ MIT. See [`LICENSE`](LICENSE).
 
 Current release: **v1.3.0** (see [GitHub Releases](https://github.com/daviesjoin-afk/astock-paper-trading/releases); the detailed [`CHANGELOG.md`](CHANGELOG.md) entries currently stop at v1.2.0). See [security boundaries](SECURITY.md), the [strategy platform](docs/STRATEGY_PLATFORM.md) and the [repository layout](docs/REPOSITORY_LAYOUT.md). CI covers Python 3.11/3.12. The historical API version 2.0.0 is not the release tag.
 
-The local Compose mapping `8600:8600` binds all interfaces. Use `127.0.0.1:8600:8600` for local access. Built-in authentication is incomplete; remote deployments require access controls and authentication. `confirmed=true` is not authentication.
+The local Compose mapping binds the host port to loopback only (`127.0.0.1:8600:8600`); inside the container Uvicorn still listens on `0.0.0.0` for port publishing, health checks and reverse proxying.
+
+The HTTP control plane enforces a unified operator boundary (PR-2): `POST`/`PUT`/`PATCH`/`DELETE` require an operator token, while `GET` is read-only and needs no credential. **When no token is configured, write endpoints fail closed with 503** — the read-only dashboard keeps working. The token is sent via the `X-Operator-Token` header (or the standard `Authorization` header using the Bearer scheme), never in the URL. `confirmed=true` is a product confirmation step, not authentication. See [SECURITY.md](SECURITY.md) for configuration and the full threat model.

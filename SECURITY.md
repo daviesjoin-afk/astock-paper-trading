@@ -37,17 +37,68 @@ python scripts/security/scan-sensitive-data.py --repo . --scope all
 
 - 这是模拟交易系统，不支持真实券商下单；不要把任何券商凭据放入仓库、日志、Issue 或测试数据。
 - 本地启动脚本默认使用 `localhost`/`127.0.0.1`。
-- 服务器 Compose 默认将宿主端口绑定到 `127.0.0.1:18600`；如需反向代理或公网访问，必须由运维层显式配置网络 ACL、TLS 和身份认证。
-- `confirmed=true` 只用于浏览器二次确认，不能当作鉴权。当前服务器若暴露写接口，必须限制可访问网络；operator token/session auth 是后续 P0 安全项。
+- 本地 Compose 与服务器 Compose 均将宿主端口绑定到环回地址（`127.0.0.1:8600` /
+  `127.0.0.1:18600`），容器内部 Uvicorn 仍监听 `0.0.0.0`——三层边界共同工作：
+  **容器内 0.0.0.0（供 docker port publishing / healthcheck / nginx 反代）+ 宿主环回发布 +
+  应用层 operator 鉴权**。如需公网访问，必须由运维层显式配置网络 ACL、TLS 与身份认证。
+- `confirmed=true` 只用于浏览器二次确认，**不能当作鉴权**。
+
+## 操作员边界（PR-2）
+
+写接口（`POST`/`PUT`/`PATCH`/`DELETE`）由统一模块 `backend/operator_auth.py`
+和 `main.py` 的全局中间件保护，与路由前缀无关，因此不存在"某个前缀漏配"的旁路。
+`GET`/`HEAD`/`OPTIONS` 为只读控制面，不需要凭据（读写分离）。
+
+### 配置
+
+```bash
+# 生成一个强随机 token（>= 16 字符）
+python -c "import secrets; print(secrets.token_urlsafe(32))"
+
+# 写入 .env（已被 gitignore），不要提交
+ASTOCK_OPERATOR_TOKEN=<生成的随机串>
+```
+
+- **未配置 token 时写接口按 fail-closed 拒绝（HTTP 503）**，只读看板不受影响。
+  这不会静默降级成"无鉴权"。
+- 弱 token（< 16 字符或含非法字符）**不构成边界**，写请求同样被拒绝。
+- 仅在**纯本机离线演示**时，可用 `ASTOCK_OPERATOR_AUTH_REQUIRED=0` 显式关闭写接口鉴权；
+  不要在服务器或任何他人可达的环境设置它。
+- 当前状态随时可见于只读接口 `GET /api/operator-status`（**不回显 token 本身**）。
+
+### 客户端携带方式
+
+凭据**只走请求头**，绝不进 URL/query（避免落入访问日志、浏览器历史与 `Referer`）：
+
+```
+X-Operator-Token: <token>
+Authorization: Bearer <token>
+```
+
+浏览器端在 `localStorage['operatorToken']` 中保存一次，由 `frontend/src/core/api.js`
+自动附加到写请求。它不是身份系统，只是一道本机/内网边界；不要在共享浏览器上保存。
+
+### 已知边界（本 PR 不做）
+
+- 不引入 OAuth / 账户系统 / JWT / RBAC / session 框架。
+- 不做 TLS 终止、不新增反向代理；这些属于运维层。
+- 来源 IP 信任不由应用层判断——应用不解析 `X-Forwarded-For` 做授权，
+  网络来源应由 nginx / 安全组 / ACL 层约束。
+
 
 ## 写接口清单
 
-纸盘和 adaptive API 含有启动、暂停、下单、撤单、运行研究、写反馈和应用风控等状态变更接口。部署前应逐项验证：
+纸盘和 adaptive API 含有启动、暂停、下单、撤单、运行研究、写反馈和应用风控等状态变更接口。
+当前 HTTP 控制面共有 **129 条路由，其中 61 条为写方法**（`POST`/`PUT`/`PATCH`/`DELETE`）。
+它们全部由统一中间件覆盖（按方法判定，不按前缀），验证要点：
 
-1. 本机模式下接口仅对本机开放。
-2. 服务器模式下写接口有独立 operator 身份校验，读接口与写接口权限分离。
-3. 未授权请求不会因为携带 `confirmed=true` 而成功。
+1. 本机/容器模式下宿主端口仅绑定环回地址（`127.0.0.1`）。
+2. 写接口要求 operator 凭据；读接口不要求，读写分离。
+3. 未授权请求不会因为携带 `confirmed=true` 而成功——`confirmed` 只是产品确认步骤。
 4. 所有状态变更都能在审计记录中定位操作者、时间、版本和原因。
+
+回归测试见 `backend/test_operator_boundary.py`（覆盖各前缀族的写路由 + 配置 fail-closed +
+读写分离 + 不依赖 cookie 的 CSRF 免疫）。
 
 ## 报告问题
 

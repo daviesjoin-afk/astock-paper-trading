@@ -6,11 +6,18 @@ services:
     image: astock-codex:latest
     restart: unless-stopped
     ports:
-      - "8600:8600"
+      # PR-2：只绑定环回地址。默认的 "8600:8600" 会让宿主所有网卡都能访问
+      # HTTP 控制面（含未认证的写接口）。绑定 127.0.0.1 后，只有本机能连，
+      # 需要对外时由运维层显式加反向代理 + 网络 ACL + operator token。
+      - "127.0.0.1:8600:8600"
     environment:
       TZ: Asia/Shanghai
       PYTHONUNBUFFERED: "1"
       PYTHONDONTWRITEBYTECODE: "1"
+      # PR-2：操作员边界密钥。写请求必须携带 X-Operator-Token（或
+      # Authorization 头（Bearer 方案））。未设置时写接口按 fail-closed 拒绝（503），
+      # 只读看板不受影响。生成方式见 SECURITY.md。
+      ASTOCK_OPERATOR_TOKEN: "${ASTOCK_OPERATOR_TOKEN:-}"
       # Standalone clones need an in-process scheduler. Set this to 0 when a
       # host scheduler is configured and owns every paper-trading slot.
       ASTOCK_ENABLE_FALLBACK_THREADS: "${ASTOCK_ENABLE_FALLBACK_THREADS:-1}"
