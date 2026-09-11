@@ -2,9 +2,12 @@ from pathlib import Path
 
 path = Path("backend/paper_trading.py")
 text = path.read_text(encoding="utf-8")
-old_imports = "import entry_lifecycle as ELC\nimport execution_dispatch as EPD\n"
-assert text.count(old_imports) == 1, "expected exactly one legacy preflight import pair"
-text = text.replace(old_imports, "import paper_slot_service as PSS\n", 1)
+legacy_import = "import entry_lifecycle as ELC"
+dispatch_import = "import execution_dispatch as EPD"
+assert text.count(legacy_import) == 1, "expected exactly one entry_lifecycle import"
+assert text.count(dispatch_import) == 1, "expected exactly one execution_dispatch import"
+text = text.replace(legacy_import, "import paper_slot_service as PSS", 1)
+text = text.replace(dispatch_import, "", 1)
 
 start_marker = "def run_slot(slot, asof_date=None, force=False):\n"
 start = text.index(start_marker)
