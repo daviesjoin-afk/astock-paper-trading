@@ -5,10 +5,10 @@ The gate deliberately uses only post-proposal shadow NAV observations where the
 Champion and Challenger were evaluated on the same immutable market snapshot.
 It never reads formal trading results and never tunes candidate parameters.
 
-The last part of the chronological sample is treated as a holdout.  Promotion
+The last part of the chronological sample is treated as a holdout. Promotion
 requires a positive paired excess return, a conservative lower confidence bound
 above zero on the full paired sample, and continued positive behavior in the
-holdout.  This is an engineering promotion gate, not a claim of academic proof;
+holdout. This is an engineering promotion gate, not a claim of academic proof;
 serial correlation and multiple-testing correction remain explicit residual
 risks for later work.
 """
@@ -40,9 +40,9 @@ def _checksum(value: Any) -> str:
 
 def _paired_rows(conn, challenger_id: int, since: str, until: str) -> list[dict[str, Any]]:
     rows = conn.execute(
-        """SELECT c.snapshot_checksum, c.created_at, c.nav_date,
+        """SELECT c.snapshot_checksum, c.created_at,
                   c.nav AS champion_nav, x.nav AS challenger_nav,
-                  x.created_at AS challenger_created_at, x.nav_date AS challenger_nav_date
+                  x.created_at AS challenger_created_at
              FROM shadow_nav c
              JOIN shadow_nav x
                ON x.challenger_id=c.challenger_id
@@ -62,10 +62,11 @@ def _paired_rows(conn, challenger_id: int, since: str, until: str) -> list[dict[
         challenger_nav = float(item["challenger_nav"] or 0)
         if champion_nav <= 0 or challenger_nav <= 0:
             raise ValueError("shadow NAV must be positive for scientific promotion evidence")
+        created_at = str(item["created_at"])
         result.append({
             "snapshot_checksum": str(item["snapshot_checksum"]),
-            "created_at": str(item["created_at"]),
-            "nav_date": str(item["nav_date"] or item["created_at"])[:10],
+            "created_at": created_at,
+            "evidence_day": created_at[:10],
             "champion_nav": champion_nav,
             "challenger_nav": challenger_nav,
         })
@@ -118,7 +119,7 @@ def evaluate_promotion_evidence(
     """Evaluate paired post-proposal shadow evidence for one Challenger.
 
     ``evaluable=False`` means more evidence is required and the Challenger should
-    remain in shadow.  ``evaluable=True, promotable=False`` means the configured
+    remain in shadow. ``evaluable=True, promotable=False`` means the configured
     sample requirement has been reached but the candidate failed the scientific
     promotion gate.
     """
@@ -137,7 +138,7 @@ def evaluate_promotion_evidence(
 
     snapshot_count = len(rows)
     intervals = _paired_excess_returns(rows)
-    distinct_days = len({row["nav_date"] for row in rows})
+    distinct_days = len({row["evidence_day"] for row in rows})
     evidence_checksum = _checksum(rows)
     base = {
         "version": PROMOTION_SCIENCE_VERSION,
