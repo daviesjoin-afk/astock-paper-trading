@@ -122,7 +122,7 @@ def _sample_stats(values: list[float]) -> dict[str, Any]:
 
 def _paired_excess_returns(rows: list[Mapping[str, Any]]) -> list[float]:
     values: list[float] = []
-    for previous, current in zip(rows, rows[1:]):
+    for previous, current in zip(rows, rows[1:], strict=False):
         champion_return = float(current["champion_nav"]) / float(previous["champion_nav"]) - 1.0
         challenger_return = float(current["challenger_nav"]) / float(previous["challenger_nav"]) - 1.0
         values.append(challenger_return - champion_return)
