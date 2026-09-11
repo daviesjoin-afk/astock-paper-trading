@@ -898,17 +898,33 @@ def get_evolution_log(conn, limit: int = 50) -> list:
 
 def evolution_status(conn) -> dict:
     """返回自进化系统的完整状态。"""
-    current = get_current_params(conn)
     metrics = get_performance_metrics(conn, 20)
     should, should_reason = should_evolve(conn)
     recent_log = get_evolution_log(conn, 10)
 
     # 生命周期读模型：active 指针 / 最新候选 / 待激活候选 / 激活历史。
-    # 指针损坏时显式暴露，而不是让状态页 500 —— 但绝不回落 latest row。
+    # 指针损坏时**把故障报出来**，而不是让状态页 500。
+    #
+    # 注意 `get_current_params` 也要包在同一个 try 里：全局指针悬空时它同样会
+    # 抛 `EvolutionLifecycleError`（fail closed），漏掉它的话这个降级分支
+    # 就成了永远走不到的死代码，状态页照样 500。
+    #
+    # 降级后 `current_params` 显式标记 unavailable —— 是"没有可信任的生效
+    # 参数"，**不是**悄悄用 latest row 顶上。
     try:
+        current = get_current_params(conn)
         lifecycle = lifecycle_view(conn)
         lifecycle_healthy = True
     except EA.EvolutionLifecycleError as exc:
+        current = {
+            "id": None,
+            "params": _default_params(),
+            "version": EVOLUTION_VERSION,
+            "source": "unavailable",
+            "created_at": None,
+            "unavailable": True,
+            "error": str(exc),
+        }
         lifecycle = {"error": str(exc)}
         lifecycle_healthy = False
 

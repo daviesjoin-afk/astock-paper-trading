@@ -156,6 +156,24 @@ class LegacyBootstrapTests(unittest.TestCase):
         with self.assertRaises(SE.EvolutionLifecycleError):
             SE.get_current_params(conn)
 
+    def test_evolution_status_reports_corruption_instead_of_crashing(self):
+        """状态页必须把指针损坏**报出来**，而不是 500。
+
+        损坏时 `current_params` 显式标记为不可用（不是"悄悄用 latest row"），
+        `lifecycle_healthy=False` 让运维一眼看见。
+        """
+        conn = _db()
+        self.addCleanup(conn.close)
+        SE.init_params(conn)
+        conn.execute("UPDATE evolution_active_params SET params_id=99999 WHERE scope_key=?",
+                     (GLOBAL,))
+        conn.commit()
+        status = SE.evolution_status(conn)
+        self.assertFalse(status["lifecycle_healthy"])
+        self.assertIsNone(status["current_params"]["id"])
+        self.assertTrue(status["current_params"].get("unavailable"))
+        self.assertIn("99999", str(status["lifecycle"]["error"]))
+
 
 class CandidateIsolationTests(unittest.TestCase):
     """核心：创建候选不改变 runtime。"""
