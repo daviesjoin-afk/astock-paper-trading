@@ -5,7 +5,7 @@ from __future__ import annotations
 import learning_dataset
 import learning_evaluation
 
-NEURAL_SHADOW_VERSION = "neural-shadow-v4-evaluation-gated"
+NEURAL_SHADOW_VERSION = "neural-shadow-v5-evaluation-contract-v2"
 NEURAL_CONTROL_VERSION = "neural-control-v2"
 # ─── 加速模式参数 ───
 # 原始值: MIN_PROFILE_DAYS=60, MIN_LABEL_DATES=40, MIN_LABEL_ROWS=20000
@@ -19,6 +19,8 @@ REQUIRED_HORIZONS = (1, 3, 5)
 DATASET_GATE_MAX_EVIDENCE_ROWS = 40_000
 # PR-9：评估契约门禁的预测证据读取上限，同样 fail-closed。
 EVALUATION_GATE_MAX_PREDICTION_ROWS = 40_000
+# 模型训练溯源的读取上限：行数极少（每个模型一行），触顶同样 fail-closed。
+EVALUATION_GATE_MAX_PROVENANCE_ROWS = 2_000
 
 # 加速模式配置键
 ACCELERATED_MODE_KEY = "neural_accelerated_mode"
@@ -135,13 +137,18 @@ def _evaluation_gate(conn):
     """PR-9：把样本外评估契约接进 readiness，失败即 fail closed。
 
     行数达标、数据集就绪都不等于有样本外能力：这里额外要求评估绑定到同一个
-    数据集 fingerprint、只用时间上的 held-out 分区、逐日截面 rank IC 达到门槛、
-    并且**按日期单位**计算的置信下界为正。任一条不满足：``admitted = False``，
-    但 ``mode`` 仍是 ``shadow_only``、``trading_impact`` 仍是 ``none``。
+    数据集 fingerprint 与同一份模型产物溯源（model_artifact_fingerprint）、
+    只评估时间上的 held-out 分区且 **只能评估 test**、每个 held-out 样本都被
+    100% 覆盖（不许挑样本）、训练边界可证明早于 test、模型没有在 test 上做过
+    选择、逐日截面 rank IC 达到门槛、**按日期单位**计算的置信下界为正、且最近
+    一段时间序列尾部没有退化。任一条不满足：``admitted = False``，但 ``mode``
+    仍是 ``shadow_only``、``trading_impact`` 仍是 ``none``。
     """
     try:
         return learning_evaluation.contract_status(
-            conn, max_prediction_rows=EVALUATION_GATE_MAX_PREDICTION_ROWS
+            conn,
+            max_prediction_rows=EVALUATION_GATE_MAX_PREDICTION_ROWS,
+            max_provenance_rows=EVALUATION_GATE_MAX_PROVENANCE_ROWS,
         )
     except Exception:
         return {
@@ -156,6 +163,12 @@ def _evaluation_gate(conn):
             "evaluation_admitted": False,
             "evaluation_blockers": ["evaluation_contract_error"],
             "exclusion_reasons": {},
+            "coverage": {},
+            "holdout": {},
+            "model_version": None,
+            "model_artifact_fingerprint": None,
+            "trained_through": None,
+            "selection_partition": None,
         }
 
 
@@ -247,6 +260,19 @@ def readiness(conn):
         "evaluation_admitted": bool(evaluation_contract.get("evaluation_admitted")),
         "evaluation_blockers": evaluation_blockers,
         "prediction_exclusions": dict(evaluation_contract.get("exclusion_reasons") or {}),
+        # ── PR-9 追加字段（模型/训练溯源 + 覆盖率 + 尾部稳健性，只增不改）──
+        "evaluation_model_version": evaluation_contract.get("model_version"),
+        "evaluation_model_artifact_fingerprint": evaluation_contract.get(
+            "model_artifact_fingerprint"
+        ),
+        "evaluation_training_dataset_fingerprint": evaluation_contract.get(
+            "training_dataset_fingerprint"
+        ),
+        "evaluation_trained_through": evaluation_contract.get("trained_through"),
+        "evaluation_selection_partition": evaluation_contract.get("selection_partition"),
+        "evaluation_provenance_fingerprint": evaluation_contract.get("provenance_fingerprint"),
+        "evaluation_coverage": dict(evaluation_contract.get("coverage") or {}),
+        "evaluation_holdout": dict(evaluation_contract.get("holdout") or {}),
         "protocol": [
             "只使用点时可见特征与已完成的1/3/5日标签；可用性无法证明的行一律排除",
             "缺失/未知一律不填空：不做 0/均值/中性 插补，只在契约层标记或排除",
@@ -254,8 +280,13 @@ def readiness(conn):
             "切分后按 label_end_date 清除跨界标签：train→validation、validation→test",
             "horizon 语义为“已捕获 profile 日步数”，不等于经认证的交易所交易日",
             "预测证据按内容寻址、只追加；同一身份两个互相矛盾的分数一律 fail closed",
-            "只在时间上的 held-out 分区评估，逐日截面 Spearman rank IC",
+            "预测必须自带可证明的生成时刻，且早于它所预测标签的可用时刻，否则不计入",
+            "只在时间上的 held-out 分区评估，且**只允许 test**：train/validation 一律拒绝",
+            "每个 held-out 样本都必须有且只有一个预测，缺口即评判失败，不允许挑样本",
+            "训练边界必须可证明早于 test 起点，且模型只能在 validation 上做选择",
+            "逐日截面 Spearman rank IC",
             "同日多标的不算独立样本：置信下界按“日期”为单位计算，行数不构成证据",
+            "最近一段日期的 rank IC 必须仍为正且不退化为样本均值的零头",
             "先与当前硬规则和遗传算法并行影子比较",
             "只有样本外成本后表现达标且人工确认，才允许作为建议分",
             "数据集/评估就绪不授予任何执行权限：不能下单、不能放宽风控、不能自我晋升",
@@ -286,6 +317,11 @@ if __name__ == "__main__":
     assert result["evaluation_admitted"] is False
     assert result["evaluation_metric"] == learning_evaluation.METRIC_SPEARMAN_RANK_IC
     assert result["evaluation_holdout_partition"] == learning_evaluation.DEFAULT_HOLDOUT_PARTITION
+    # PR-9 v2：只有 test 可被评估；覆盖率/尾部/模型溯源都必须以 fail-closed 形式出现。
+    assert learning_evaluation.SUPPORTED_HOLDOUT_PARTITIONS == ("test",)
+    assert result["evaluation_coverage"]["coverage_ratio"] == 0.0
+    assert result["evaluation_model_artifact_fingerprint"] is None
+    assert result["evaluation_trained_through"] is None
     status = control_status(conn)
     assert status["status"] == "shadow_only"
     assert status["max_rank_adjustment"] == 0.0
