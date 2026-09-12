@@ -1168,6 +1168,8 @@ def run_strategy(
     first_board_codes=None,
     weight_overrides=None,
     condition_overrides=None,
+    replay_data_date=None,
+    replay_required=False,
 ):
     """执行硬规则筛选，并按超大单净流入从高到低返回结果。"""
     if strategy_id in PAPER_WEIGHTS:
@@ -1757,6 +1759,8 @@ def run_strategy(
     first_board_codes=None,
     weight_overrides=None,
     condition_overrides=None,
+    replay_data_date=None,
+    replay_required=False,
 ):
     """Production selector facade: plugin first, exact legacy fallback otherwise."""
     import strategy_plugins as SP
@@ -1773,6 +1777,8 @@ def run_strategy(
             first_board_codes=first_board_codes,
             weight_overrides=weight_overrides,
             condition_overrides=condition_overrides,
+            replay_data_date=replay_data_date,
+            replay_required=replay_required,
         )
     return _run_strategy_legacy(
         strategy_id,

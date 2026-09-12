@@ -6016,7 +6016,7 @@ def _candidate_rows(account, asof_date, market, sector_rows=None, live_universe=
         raw = S.run_strategy(selection_model, table, topn=candidate_topn, news_hits=[], auto_news=False,
                              gate={"light": market["light"]}, first_board_codes=first_board_codes,
                              weight_overrides=selection_overlay.get("weights"),
-                             condition_overrides=selection_overlay.get("conditions"))
+                             condition_overrides=selection_overlay.get("conditions"), replay_data_date=asof_date, replay_required=True)
     disclosure_prime = {"status": "not_required", "requested": 0, "reported": 0}
     if account_id == NEW_STRATEGY_ID and not (raw.get("picks") or []):
         # First pass deliberately produces a bounded shadow set.  Resolve its
@@ -6049,7 +6049,7 @@ def _candidate_rows(account, asof_date, market, sector_rows=None, live_universe=
                     raw = S.run_strategy(selection_model, table, topn=candidate_topn, news_hits=[], auto_news=False,
                                          gate={"light": market["light"]}, first_board_codes=first_board_codes,
                                          weight_overrides=selection_overlay.get("weights"),
-                                         condition_overrides=selection_overlay.get("conditions"))
+                                         condition_overrides=selection_overlay.get("conditions"), replay_data_date=asof_date, replay_required=True)
             except Exception as exc:
                 disclosure_prime.update({"status": "error", "error": f"{type(exc).__name__}: {exc}"})
     raw.setdefault("metadata", {})["disclosure_prime"] = disclosure_prime
