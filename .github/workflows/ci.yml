@@ -6,75 +6,13 @@ on:
   pull_request:
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
-  apply-strategy-routing:
-    if: github.event_name == 'pull_request' && github.head_ref == 'codex/issue-24-strategy-plugin-contract'
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    steps:
-      - name: Check out pull request branch
-        uses: actions/checkout@v4
-        with:
-          ref: codex/issue-24-strategy-plugin-contract
-          fetch-depth: 0
-
-      - name: Apply exact production routing patch
-        shell: bash
-        env:
-          STRATEGIES_APPEND_B64: CgojIFN0cmF0ZWd5UGx1Z2luIHByb2R1Y3Rpb24gZmFjYWRlIChpc3N1ZSAjMjQpCiMgS2VlcCBldmVyeSBhdWRpdGVkIHNlbGVjdG9yIGltcGxlbWVudGF0aW9uIGFib3ZlIHVuY2hhbmdlZC4gUmVnaXN0ZXJlZCBwbHVnaW4KIyBzZWxlY3RvcnMgdXNlIHRoZSB1bmlmaWVkIGJvdW5kYXJ5OyBsZWdhY3kgcmVzZWFyY2ggc2VsZWN0b3JzIGNvbnRpbnVlIHRocm91Z2gKIyB0aGUgZXhhY3QgcHJlLXBsdWdpbiBpbXBsZW1lbnRhdGlvbi4KX3J1bl9zdHJhdGVneV9sZWdhY3kgPSBydW5fc3RyYXRlZ3kKCgpkZWYgYXZhaWxhYmxlX3NlbGVjdGlvbl9tb2RlbHMoKToKICAgICIiIlJldHVybiBsZWdhY3kgYW5kIHJlZ2lzdGVyZWQgcGx1Z2luIHNlbGVjdG9yIGlkcyBhY2NlcHRlZCBieSBwcm9kdWN0aW9uLiIiIgogICAgaW1wb3J0IHN0cmF0ZWd5X3BsdWdpbnMgYXMgU1AKCiAgICByZXR1cm4gc2V0KFBBUEVSX1dFSUdIVFMpIHwgc2V0KFNUUkFURUdJRVMpIHwgc2V0KFNQLnNlbGVjdG9yX2lkcygpKQoKCmRlZiBydW5fc3RyYXRlZ3koCiAgICBzdHJhdGVneV9pZCwKICAgIHRhYmxlOiBwZC5EYXRhRnJhbWUsCiAgICB0b3BuPTEwLAogICAgbmV3c19oaXRzPU5vbmUsCiAgICBnYXRlPU5vbmUsCiAgICBhdXRvX25ld3M9VHJ1ZSwKICAgIGtsaW5lcz1Ob25lLAogICAgZmlyc3RfYm9hcmRfY29kZXM9Tm9uZSwKICAgIHdlaWdodF9vdmVycmlkZXM9Tm9uZSwKICAgIGNvbmRpdGlvbl9vdmVycmlkZXM9Tm9uZSwKKToKICAgICIiIlByb2R1Y3Rpb24gc2VsZWN0b3IgZmFjYWRlOiBwbHVnaW4gZmlyc3QsIGV4YWN0IGxlZ2FjeSBmYWxsYmFjayBvdGhlcndpc2UuIiIiCiAgICBpbXBvcnQgc3RyYXRlZ3lfcGx1Z2lucyBhcyBTUAoKICAgIHBsdWdpbiA9IFNQLnBsdWdpbl9mb3Jfc2VsZWN0b3Ioc3RyYXRlZ3lfaWQpCiAgICBpZiBwbHVnaW4gaXMgbm90IE5vbmU6CiAgICAgICAgcmV0dXJuIHBsdWdpbi5zZWxlY3RfY2FuZGlkYXRlcygKICAgICAgICAgICAgdGFibGUsCiAgICAgICAgICAgIHRvcG49dG9wbiwKICAgICAgICAgICAgbmV3c19oaXRzPW5ld3NfaGl0cywKICAgICAgICAgICAgZ2F0ZT1nYXRlLAogICAgICAgICAgICBhdXRvX25ld3M9YXV0b19uZXdzLAogICAgICAgICAgICBrbGluZXM9a2xpbmVzLAogICAgICAgICAgICBmaXJzdF9ib2FyZF9jb2Rlcz1maXJzdF9ib2FyZF9jb2RlcywKICAgICAgICAgICAgd2VpZ2h0X292ZXJyaWRlcz13ZWlnaHRfb3ZlcnJpZGVzLAogICAgICAgICAgICBjb25kaXRpb25fb3ZlcnJpZGVzPWNvbmRpdGlvbl9vdmVycmlkZXMsCiAgICAgICAgKQogICAgcmV0dXJuIF9ydW5fc3RyYXRlZ3lfbGVnYWN5KAogICAgICAgIHN0cmF0ZWd5X2lkLAogICAgICAgIHRhYmxlLAogICAgICAgIHRvcG49dG9wbiwKICAgICAgICBuZXdzX2hpdHM9bmV3c19oaXRzLAogICAgICAgIGdhdGU9Z2F0ZSwKICAgICAgICBhdXRvX25ld3M9YXV0b19uZXdzLAogICAgICAgIGtsaW5lcz1rbGluZXMsCiAgICAgICAgZmlyc3RfYm9hcmRfY29kZXM9Zmlyc3RfYm9hcmRfY29kZXMsCiAgICAgICAgd2VpZ2h0X292ZXJyaWRlcz13ZWlnaHRfb3ZlcnJpZGVzLAogICAgICAgIGNvbmRpdGlvbl9vdmVycmlkZXM9Y29uZGl0aW9uX292ZXJyaWRlcywKICAgICkK
-          TEST_APPEND_B64: CiAgICBkZWYgdGVzdF9wbHVnaW5faWRlbnRpZmllcnNfYXJlX2Nhbm9uaWNhbGl6ZWRfYmVmb3JlX3JlZ2lzdHJhdGlvbihzZWxmKToKICAgICAgICBwbHVnaW4gPSBwbHVnaW5zLlN0cmF0ZWd5UGx1Z2luKAogICAgICAgICAgICAiICBjYW5vbmljYWxfcGx1Z2luICAiLAogICAgICAgICAgICAiICBjYW5vbmljYWxfc2VsZWN0b3IgICIsCiAgICAgICAgICAgICgiZmFjdG9yX2EiLCksCiAgICAgICAgICAgIGNhbmRpZGF0ZV9ydW5uZXI9bGFtYmRhIF90YWJsZSwgKipfa3dhcmdzOiB7CiAgICAgICAgICAgICAgICAic3RyYXRlZ3kiOiAiY2Fub25pY2FsX3BsdWdpbiIsICJjb3VudCI6IDAsICJwaWNrcyI6IFtdLAogICAgICAgICAgICB9LAogICAgICAgICkKICAgICAgICBzZWxmLmFzc2VydEVxdWFsKHBsdWdpbi5zdHJhdGVneV9pZCwgImNhbm9uaWNhbF9wbHVnaW4iKQogICAgICAgIHNlbGYuYXNzZXJ0RXF1YWwocGx1Z2luLnNlbGVjdG9yX2lkLCAiY2Fub25pY2FsX3NlbGVjdG9yIikKICAgICAgICBwbHVnaW5zLnJlZ2lzdGVyX3BsdWdpbihwbHVnaW4pCiAgICAgICAgc2VsZi5hZGRDbGVhbnVwKHBsdWdpbnMudW5yZWdpc3Rlcl9wbHVnaW4sIHBsdWdpbi5zdHJhdGVneV9pZCkKICAgICAgICBzZWxmLmFzc2VydElzKHBsdWdpbnMuZ2V0X3BsdWdpbigiY2Fub25pY2FsX3BsdWdpbiIpLCBwbHVnaW4pCiAgICAgICAgc2VsZi5hc3NlcnRJcyhwbHVnaW5zLnBsdWdpbl9mb3Jfc2VsZWN0b3IoImNhbm9uaWNhbF9zZWxlY3RvciIpLCBwbHVnaW4pCgogICAgZGVmIHRlc3RfcHJvZHVjdGlvbl9ydW5fc3RyYXRlZ3lfZGlzcGF0Y2hlc19yZWdpc3RlcmVkX3NlbGVjdG9yKHNlbGYpOgogICAgICAgIGltcG9ydCBzdHJhdGVnaWVzIGFzIFMKCiAgICAgICAgc2VlbiA9IFtdCgogICAgICAgIGRlZiBydW5uZXIodGFibGUsICosIHRvcG49MTAsICoqX2t3YXJncyk6CiAgICAgICAgICAgIHNlZW4uYXBwZW5kKChsaXN0KHRhYmxlLmluZGV4KSwgdG9wbikpCiAgICAgICAgICAgIHJldHVybiB7CiAgICAgICAgICAgICAgICAic3RyYXRlZ3kiOiAicHJvZHVjdGlvbl9kaXNwYXRjaF9wbHVnaW4iLAogICAgICAgICAgICAgICAgImNvdW50IjogbWluKGxlbih0YWJsZSksIHRvcG4pLAogICAgICAgICAgICAgICAgInBpY2tzIjogW3siY29kZSI6IHN0cihjb2RlKX0gZm9yIGNvZGUgaW4gbGlzdCh0YWJsZS5pbmRleClbOnRvcG5dXSwKICAgICAgICAgICAgfQoKICAgICAgICBwbHVnaW4gPSBwbHVnaW5zLlN0cmF0ZWd5UGx1Z2luKAogICAgICAgICAgICAicHJvZHVjdGlvbl9kaXNwYXRjaF9wbHVnaW4iLAogICAgICAgICAgICAicHJvZHVjdGlvbl9kaXNwYXRjaF9zZWxlY3RvciIsCiAgICAgICAgICAgICgiZmFjdG9yX2EiLCksCiAgICAgICAgICAgIGNhbmRpZGF0ZV9ydW5uZXI9cnVubmVyLAogICAgICAgICkKICAgICAgICBwbHVnaW5zLnJlZ2lzdGVyX3BsdWdpbihwbHVnaW4pCiAgICAgICAgc2VsZi5hZGRDbGVhbnVwKHBsdWdpbnMudW5yZWdpc3Rlcl9wbHVnaW4sIHBsdWdpbi5zdHJhdGVneV9pZCkKICAgICAgICB0YWJsZSA9IHBkLkRhdGFGcmFtZSh7ImZhY3Rvcl9hIjogWzEuMCwgMi4wXX0sIGluZGV4PVsiMDAwMDAxIiwgIjAwMDAwMiJdKQogICAgICAgIHJlc3VsdCA9IFMucnVuX3N0cmF0ZWd5KCJwcm9kdWN0aW9uX2Rpc3BhdGNoX3NlbGVjdG9yIiwgdGFibGUsIHRvcG49MSkKICAgICAgICBzZWxmLmFzc2VydEVxdWFsKHJlc3VsdFsicGlja3MiXSwgW3siY29kZSI6ICIwMDAwMDEifV0pCiAgICAgICAgc2VsZi5hc3NlcnRFcXVhbChzZWVuLCBbKFsiMDAwMDAxIiwgIjAwMDAwMiJdLCAxKV0pCiAgICAgICAgc2VsZi5hc3NlcnRJbigicHJvZHVjdGlvbl9kaXNwYXRjaF9zZWxlY3RvciIsIFMuYXZhaWxhYmxlX3NlbGVjdGlvbl9tb2RlbHMoKSkKCiAgICBkZWYgdGVzdF9kdXBsaWNhdGVfc2VsZWN0b3JfcmVnaXN0cmF0aW9uX2ZhaWxzX2Nsb3NlZChzZWxmKToKICAgICAgICBmaXJzdCA9IHBsdWdpbnMuU3RyYXRlZ3lQbHVnaW4oCiAgICAgICAgICAgICJzZWxlY3Rvcl9vd25lcl9vbmUiLCAic2hhcmVkX3BsdWdpbl9zZWxlY3RvciIsICgiZmFjdG9yX2EiLCksCiAgICAgICAgICAgIGNhbmRpZGF0ZV9ydW5uZXI9bGFtYmRhIF90YWJsZSwgKipfa3dhcmdzOiB7CiAgICAgICAgICAgICAgICAic3RyYXRlZ3kiOiAic2VsZWN0b3Jfb3duZXJfb25lIiwgImNvdW50IjogMCwgInBpY2tzIjogW10sCiAgICAgICAgICAgIH0sCiAgICAgICAgKQogICAgICAgIHNlY29uZCA9IHBsdWdpbnMuU3RyYXRlZ3lQbHVnaW4oCiAgICAgICAgICAgICJzZWxlY3Rvcl9vd25lcl90d28iLCAic2hhcmVkX3BsdWdpbl9zZWxlY3RvciIsICgiZmFjdG9yX2EiLCksCiAgICAgICAgICAgIGNhbmRpZGF0ZV9ydW5uZXI9bGFtYmRhIF90YWJsZSwgKipfa3dhcmdzOiB7CiAgICAgICAgICAgICAgICAic3RyYXRlZ3kiOiAic2VsZWN0b3Jfb3duZXJfdHdvIiwgImNvdW50IjogMCwgInBpY2tzIjogW10sCiAgICAgICAgICAgIH0sCiAgICAgICAgKQogICAgICAgIHBsdWdpbnMucmVnaXN0ZXJfcGx1Z2luKGZpcnN0KQogICAgICAgIHNlbGYuYWRkQ2xlYW51cChwbHVnaW5zLnVucmVnaXN0ZXJfcGx1Z2luLCBmaXJzdC5zdHJhdGVneV9pZCkKICAgICAgICB3aXRoIHNlbGYuYXNzZXJ0UmFpc2VzUmVnZXgoVmFsdWVFcnJvciwgInNlbGVjdG9yIGFscmVhZHkgcmVnaXN0ZXJlZCIpOgogICAgICAgICAgICBwbHVnaW5zLnJlZ2lzdGVyX3BsdWdpbihzZWNvbmQpCgo=
-        run: |
-          python - <<'PY'
-          import base64
-          import os
-          from pathlib import Path
-
-          strategies = Path('backend/strategies.py')
-          text = strategies.read_text(encoding='utf-8')
-          marker = '# StrategyPlugin production facade (issue #24)'
-          if marker not in text:
-              text += base64.b64decode(os.environ['STRATEGIES_APPEND_B64']).decode('utf-8')
-              strategies.write_text(text, encoding='utf-8')
-
-          paper = Path('backend/paper_trading.py')
-          text = paper.read_text(encoding='utf-8')
-          old = 'available_models = set(getattr(S, "PAPER_WEIGHTS", {}) or {}) | set(getattr(S, "STRATEGIES", {}) or {})'
-          new = 'available_models = S.available_selection_models()'
-          if old in text:
-              if text.count(old) != 1:
-                  raise SystemExit('paper selection whitelist count changed')
-              paper.write_text(text.replace(old, new, 1), encoding='utf-8')
-          elif new not in text:
-              raise SystemExit('paper selection whitelist anchor missing')
-
-          tests = Path('backend/test_strategy_plugins.py')
-          text = tests.read_text(encoding='utf-8')
-          marker = '    def test_production_run_strategy_dispatches_registered_selector(self):'
-          if marker not in text:
-              block = base64.b64decode(os.environ['TEST_APPEND_B64']).decode('utf-8')
-              anchor = '\n\nif __name__ == "__main__":\n'
-              if anchor not in text:
-                  raise SystemExit('test module anchor not found')
-              tests.write_text(text.replace(anchor, '\n' + block + anchor, 1), encoding='utf-8')
-          PY
-
-          git diff --check
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add backend/strategies.py backend/paper_trading.py backend/test_strategy_plugins.py
-          if git diff --cached --quiet; then
-            echo "Routing patch already applied"
-            exit 0
-          fi
-          git commit -m "fix(strategy): wire plugins into production selection"
-          git push origin HEAD:codex/issue-24-strategy-plugin-contract
-
   tests:
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -120,6 +58,7 @@ jobs:
         run: python -m compileall -q backend
 
       - name: Check frontend source syntax
+        # PR-55：源已拆到 frontend/src/**（ESM），逐个模块做语法检查。
         run: find frontend/src -name '*.js' -print0 | xargs -0 -n1 node --check
 
   frontend:
@@ -145,6 +84,13 @@ jobs:
         run: npm run build
 
       - name: Run frontend unit tests
+        # PR-2：操作员凭据的行为契约（GET 绝不带 Authorization、写方法带 Bearer、
+        # 凭据只存 sessionStorage）。这是**行为**断言，Python 侧的源码存在性
+        # 检查无法覆盖（负向验证 N4 证实）。
+        #
+        # 注意：`node --test` 在 Node 20 上**不接受 glob 模式**（会把
+        # "tests/**/*.test.mjs" 当字面路径，报 Could not find）。因此这里依赖
+        # shell 展开——脚本里写的是未加引号的 tests/*.test.mjs。
         working-directory: frontend
         run: npm run test:unit
 
@@ -193,6 +139,10 @@ jobs:
       - name: Build application image
         run: docker build --tag astock-codex:ci .
 
+      # Issue #29: the offline test suite must pass with *no network at all*,
+      # so core tests stay deterministic and cannot silently grow external
+      # calls.  New network-optional tests must skip unless explicitly
+      # enabled (see CONTRIBUTING.md "测试分层").
       - name: Run backend tests with network disabled
         run: >
           docker run --rm --network none
@@ -227,6 +177,9 @@ jobs:
           docker logs astock-ci || true
           docker rm --force astock-ci || true
 
+  # PR-56：真实浏览器 E2E（Playwright + Chromium，单 job，避免每个 Python 矩阵都装浏览器）。
+  # 用项目 venv 的 Python 起真实 FastAPI（临时 ASTOCK_DATA_DIR + ASTOCK_DEMO=1），
+  # 浏览器只访问本机 HTTP，不依赖行情 / LLM / 新闻等外部服务。
   browser-e2e:
     name: browser-e2e (chromium)
     runs-on: ubuntu-latest
@@ -269,6 +222,7 @@ jobs:
       - name: Run browser journeys against a real local server
         working-directory: frontend
         env:
+          # 用 setup-python 的解释器起后端；临时数据目录由 server.py 自己创建
           ASTOCK_E2E_PYTHON: python
           ASTOCK_E2E_PORT: "8611"
         run: npx playwright test --project=chromium

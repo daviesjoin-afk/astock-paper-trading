@@ -5,7 +5,7 @@ on:
   pull_request:
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: security-leak-scan-${{ github.ref }}
@@ -34,19 +34,3 @@ jobs:
           git fetch --no-tags origin "${{ github.base_ref }}"
           git diff --unified=0 "origin/${{ github.base_ref }}...HEAD" > /tmp/pr.diff || true
           python scripts/security/scan-sensitive-data.py --repo . --scope worktree
-
-      - name: Apply one-shot strategy plugin production routing patch
-        if: github.event_name == 'push' && github.ref_name == 'codex/issue-24-strategy-plugin-contract'
-        shell: bash
-        run: |
-          python scripts/tmp_apply_strategy_plugin_routing.py
-          git diff --check
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add backend/strategies.py backend/paper_trading.py backend/test_strategy_plugins.py
-          if git diff --cached --quiet; then
-            echo "Routing patch already applied"
-            exit 0
-          fi
-          git commit -m "fix(strategy): wire plugins into production selection"
-          git push origin HEAD:codex/issue-24-strategy-plugin-contract
