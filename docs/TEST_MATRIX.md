@@ -91,6 +91,29 @@
 | 无网络 / 无执行（只消费已持久化证据，不触碰下单与风控） | `learning_dataset` | `test_learning_dataset.py`（`NoNetworkTests`、`NoExecutionTests`） | ✅ |
 | 负向变异验证（N1–N11 必须让守卫变红；含 N7 future label、N8 ambiguous label、N9 label PIT、N10 timezone cutoff、N11 provenance override） | — | 手工执行 N1–N11 变异脚本（见 PR 描述） | ✅ |
 
+## 学习评估契约（PR-9）
+
+| 场景 | 实现位置 | 回归用例 | 状态 |
+| --- | --- | --- | --- |
+| 预测证据内容寻址（`prediction_id = sha256(fingerprint\|model\|sample\|score)`，与行位置无关） | `learning_evaluation.prediction_identity`、`normalize_prediction` | `test_learning_evaluation.py`（`PredictionIdentityTests`） | ✅ |
+| 预测证据只追加不可变（主键 + `INSERT OR IGNORE`，重放幂等、不改写） | `learning_evaluation.record_predictions`、`read_prediction_evidence` | `test_learning_evaluation.py`（`PredictionIdentityTests`） | ✅ |
+| 冲突分数 fail-closed（同一身份两个不同分数全部排除，与插入顺序无关） | `learning_evaluation.build_evaluation` | `test_learning_evaluation.py`（`PredictionIdentityTests`） | ✅ |
+| 数据集指纹绑定（跨数据集预测一律 `unbound_prediction`；缺失 fingerprint 关闭门禁） | `learning_evaluation._binds_dataset` | `test_learning_evaluation.py`（`FingerprintBindingTests`） | ✅ |
+| 模型归属（多模型且未显式指定 ⇒ `evaluation_model_ambiguous`；他模型行记 `other_model` 不参与打分） | `learning_evaluation.build_evaluation` | `test_learning_evaluation.py`（`FingerprintBindingTests`） | ✅ |
+| 只用时序 held-out 分区（train/validation → `not_held_out`；分区不符 → `partition_mismatch`） | `learning_evaluation._is_held_out` | `test_learning_evaluation.py`（`HoldoutLeakageTests`） | ✅ |
+| 前瞻泄漏（`prediction_asof > cutoff` → `future_prediction`） | `learning_evaluation._is_future_prediction` | `test_learning_evaluation.py`（`HoldoutLeakageTests`） | ✅ |
+| 逐日截面 Spearman rank IC（平均秩处理并列；单调变换不变；退化截面 undefined 不记 0） | `learning_evaluation.spearman_rank_ic`、`_average_ranks` | `test_learning_evaluation.py`（`RankIcTests`） | ✅ |
+| 同日非独立（置信区间以**日期**为单位，n=有效日数；同日加标的不会缩小标准误） | `learning_evaluation._mean_and_bound` | `test_learning_evaluation.py`（`SameDateDependenceTests`） | ✅ |
+| 置信下界 + holdout 门禁（有效日数下限、均值下限、下界必须为正；单日无区间） | `learning_evaluation.build_evaluation` | `test_learning_evaluation.py`（`ConfidenceGateTests`） | ✅ |
+| 缺失/非有限分数不插补（NaN / None / 非数字 → `invalid_prediction_score`，绝不记 0） | `learning_evaluation._canon_number`、`_finite` | `test_learning_evaluation.py`（`PredictionIdentityTests`） | ✅ |
+| 有界读取截断边界（`LIMIT max_prediction_rows + 1`，恰好等于上限不算截断；truncated 显式传入契约） | `learning_evaluation.read_prediction_evidence`、`contract_status` | `test_learning_evaluation.py`（`ConfidenceGateTests`） | ✅ |
+| 评估 manifest 内容寻址 + 只追加（同证据同参数 ⇒ 同 SHA-256；`created_at` 不入指纹；`prediction_digest` 绑定所判证据） | `learning_evaluation.evaluation_fingerprint`、`persist_evaluation_manifest` | `test_learning_evaluation.py`（`ManifestTests`、`DeterminismTests`） | ✅ |
+| 评估指纹敏感度（分数 / 模型 / held-out 分区 / 评分下限 / 数据集绑定 / 截断） | `learning_evaluation.evaluation_fingerprint` | `test_learning_evaluation.py`（`SensitivityTests`） | ✅ |
+| 跨模块归一化一致（本地 `_canon_number` / `_finite` / `_iso_date` 与数据集层不漂移） | `learning_evaluation` ↔ `learning_dataset` | `test_learning_evaluation.py`（`NormalizationAgreementTests`） | ✅ |
+| 三闸合放权（`dataset_contract_ok AND evaluation_contract_ok AND human_approved`；数据就绪但无样本外证据 → `approval_waiting_evaluation`） | `neural_shadow._evaluation_gate`、`readiness`、`control_status` | `test_learning_evaluation.py`（`NeuralShadowGateTests`） | ✅ |
+| 无网络 / 无训练 / 无执行（无 ML 依赖、无 `.fit` / 下单调用、只读不改库） | `learning_evaluation` | `test_learning_evaluation.py`（`SafetyTests`） | ✅ |
+| 负向变异验证（N1–N7 必须让守卫变红：N1 数据集绑定、N2 held-out、N3 前瞻泄漏、N4 并列秩、N5 点估计当置信下界、N6 证据摘要、N7 预测身份） | — | 手工执行 N1–N7 变异脚本（见 PR 描述） | ✅ |
+
 ## 维护约定
 
 1. 新增门禁必须先在本表加一行，再写测试；表格状态从 ⚠️ → ✅。

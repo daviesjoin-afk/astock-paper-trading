@@ -35,6 +35,7 @@ import trade_attribution
 import ai_analysis
 import factor_quality_shadow
 import learning_dataset
+import learning_evaluation
 import neural_shadow
 import evolution_adversarial as adversarial
 import dual_ai_tuner
@@ -309,6 +310,7 @@ def _init_schema(conn):
             trade_attribution.ensure_schema(conn)
             ai_analysis.ensure_schema(conn)
             learning_dataset.ensure_schema(conn)
+            learning_evaluation.ensure_schema(conn)
             _ensure_config_defaults(conn)
             return
     except Exception:
@@ -531,6 +533,11 @@ def _init_schema(conn):
     # 都能通过；失败也不阻断建表（契约层自身会 fail closed）。
     try:
         learning_dataset.ensure_schema(conn)
+    except Exception:
+        pass
+    # PR-9：预测证据表与评估 manifest 表同样 additive + 幂等。
+    try:
+        learning_evaluation.ensure_schema(conn)
     except Exception:
         pass
     _ensure_config_defaults(conn)

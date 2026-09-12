@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import learning_dataset
+import learning_evaluation
 
-NEURAL_SHADOW_VERSION = "neural-shadow-v3-dataset-gated"
+NEURAL_SHADOW_VERSION = "neural-shadow-v4-evaluation-gated"
 NEURAL_CONTROL_VERSION = "neural-control-v2"
 # ─── 加速模式参数 ───
 # 原始值: MIN_PROFILE_DAYS=60, MIN_LABEL_DATES=40, MIN_LABEL_ROWS=20000
@@ -16,6 +17,8 @@ REQUIRED_HORIZONS = (1, 3, 5)
 # 数据集契约门禁的读取上限：保证概览读路径不被大表拖慢；一旦触顶即视为
 # "无法证明整库完整性"，按 fail-closed 处理（不会因为截断而误判为 ready）。
 DATASET_GATE_MAX_EVIDENCE_ROWS = 40_000
+# PR-9：评估契约门禁的预测证据读取上限，同样 fail-closed。
+EVALUATION_GATE_MAX_PREDICTION_ROWS = 40_000
 
 # 加速模式配置键
 ACCELERATED_MODE_KEY = "neural_accelerated_mode"
@@ -50,16 +53,28 @@ def approval_state(conn):
 
 
 def control_status(conn):
-    """Combine readiness and approval into a UI/audit-safe status object."""
+    """Combine readiness and approval into a UI/audit-safe status object.
+
+    PR-9：有界影子放权必须同时满足三件事 —— 数据集契约成立、**样本外评估契约**
+    成立、人工确认。缺任何一条都停在影子态：缺数据 → ``approval_waiting_data``，
+    数据就绪但样本外证据未达标 → ``approval_waiting_evaluation``。
+    """
     ready = readiness(conn)
     approval = approval_state(conn)
     admitted = bool(ready.get("admitted"))
     approved = bool(approval.get("approved"))
     accelerated = bool(approval.get("accelerated_mode"))
+    dataset_ok = not (ready.get("dataset_blockers") or [])
+    evaluation_ok = bool(ready.get("evaluation_contract_ok"))
+    combined_gate_ok = bool(dataset_ok and evaluation_ok and admitted)
     if not approval["shadow_enabled"]:
         status = "disabled"
-    elif approved and admitted:
+    elif approved and combined_gate_ok:
         status = "approved_bounded_shadow"
+    elif approved and not dataset_ok:
+        status = "approval_waiting_data"
+    elif approved and not evaluation_ok:
+        status = "approval_waiting_evaluation"
     elif approved and not admitted:
         status = "approval_waiting_data"
     else:
@@ -76,6 +91,11 @@ def control_status(conn):
         "readiness": ready,
         "hard_gates_unchanged": True,
         "max_rank_adjustment": 0.05 if status == "approved_bounded_shadow" else 0.0,
+        # ── PR-9 追加字段（只增不改）──
+        "dataset_contract_ok": dataset_ok,
+        "evaluation_contract_ok": evaluation_ok,
+        "human_approved": approved,
+        "combined_gate_ok": combined_gate_ok,
         "not_used": ["直接下单", "绕过行情双源", "绕过板块权限", "放宽仓位/T+1/风控"],
     }
 
@@ -111,6 +131,34 @@ def _dataset_gate(conn):
         }
 
 
+def _evaluation_gate(conn):
+    """PR-9：把样本外评估契约接进 readiness，失败即 fail closed。
+
+    行数达标、数据集就绪都不等于有样本外能力：这里额外要求评估绑定到同一个
+    数据集 fingerprint、只用时间上的 held-out 分区、逐日截面 rank IC 达到门槛、
+    并且**按日期单位**计算的置信下界为正。任一条不满足：``admitted = False``，
+    但 ``mode`` 仍是 ``shadow_only``、``trading_impact`` 仍是 ``none``。
+    """
+    try:
+        return learning_evaluation.contract_status(
+            conn, max_prediction_rows=EVALUATION_GATE_MAX_PREDICTION_ROWS
+        )
+    except Exception:
+        return {
+            "evaluation_schema_version": learning_evaluation.EVALUATION_SCHEMA_VERSION,
+            "evaluation_contract_version": learning_evaluation.EVALUATION_CONTRACT_VERSION,
+            "metric": learning_evaluation.METRIC_SPEARMAN_RANK_IC,
+            "holdout_partition": learning_evaluation.DEFAULT_HOLDOUT_PARTITION,
+            "evaluation_fingerprint": None,
+            "evaluation_status": "not_ready",
+            "evaluation_metrics": {},
+            "evaluation_contract_ok": False,
+            "evaluation_admitted": False,
+            "evaluation_blockers": ["evaluation_contract_error"],
+            "exclusion_reasons": {},
+        }
+
+
 def readiness(conn):
     """Return a conservative training gate; never changes trading behavior."""
     profile_days = _count(conn, "SELECT COUNT(DISTINCT profile_date) FROM adaptive_alpha_samples")
@@ -134,6 +182,11 @@ def readiness(conn):
     dataset_blockers = list(dataset_contract.get("dataset_blockers") or [])
     # 行数达标只是必要条件；数据集契约不通过同样不能算科研就绪。
     blockers.extend(f"数据集契约未通过：{code}" for code in dataset_blockers)
+    evaluation_contract = _evaluation_gate(conn)
+    evaluation_blockers = list(evaluation_contract.get("evaluation_blockers") or [])
+    # PR-9：数据集就绪也只说明"能评估"，还不能说明"评估通过了"。样本外证据
+    # 不达标同样不能算科研就绪。
+    blockers.extend(f"评估契约未通过：{code}" for code in evaluation_blockers)
     admitted = not blockers
     # 计算各维度的完成进度百分比
     progress = {
@@ -181,15 +234,31 @@ def readiness(conn):
         "horizon_semantics": dataset_contract.get("horizon_semantics"),
         "dataset_blockers": dataset_blockers,
         "execution_authority": "none",
+        # ── PR-9 追加字段（只增不改）──
+        "evaluation_contract": evaluation_contract.get("evaluation_contract_version"),
+        "evaluation_schema_version": evaluation_contract.get("evaluation_schema_version"),
+        "evaluation_metric": evaluation_contract.get("metric"),
+        "evaluation_holdout_partition": evaluation_contract.get("holdout_partition"),
+        "evaluation_fingerprint": evaluation_contract.get("evaluation_fingerprint"),
+        "evaluation_model_id": evaluation_contract.get("model_id"),
+        "evaluation_status": evaluation_contract.get("evaluation_status"),
+        "evaluation_metrics": dict(evaluation_contract.get("evaluation_metrics") or {}),
+        "evaluation_contract_ok": bool(evaluation_contract.get("evaluation_contract_ok")),
+        "evaluation_admitted": bool(evaluation_contract.get("evaluation_admitted")),
+        "evaluation_blockers": evaluation_blockers,
+        "prediction_exclusions": dict(evaluation_contract.get("exclusion_reasons") or {}),
         "protocol": [
             "只使用点时可见特征与已完成的1/3/5日标签；可用性无法证明的行一律排除",
             "缺失/未知一律不填空：不做 0/均值/中性 插补，只在契约层标记或排除",
             "按 label_start_date 时间切分训练、验证、样本外测试，不随机打乱未来",
             "切分后按 label_end_date 清除跨界标签：train→validation、validation→test",
             "horizon 语义为“已捕获 profile 日步数”，不等于经认证的交易所交易日",
+            "预测证据按内容寻址、只追加；同一身份两个互相矛盾的分数一律 fail closed",
+            "只在时间上的 held-out 分区评估，逐日截面 Spearman rank IC",
+            "同日多标的不算独立样本：置信下界按“日期”为单位计算，行数不构成证据",
             "先与当前硬规则和遗传算法并行影子比较",
             "只有样本外成本后表现达标且人工确认，才允许作为建议分",
-            "数据集就绪不授予任何执行权限：不能下单、不能放宽风控、不能自我晋升",
+            "数据集/评估就绪不授予任何执行权限：不能下单、不能放宽风控、不能自我晋升",
         ],
     }
 
@@ -211,8 +280,17 @@ if __name__ == "__main__":
     assert result["dataset_blockers"], result["dataset_blockers"]
     assert result["execution_authority"] == "none"
     assert result["horizon_semantics"] == learning_dataset.HORIZON_SEMANTICS_OBSERVED_PROFILE_STEPS
+    # PR-9：评估契约门禁同样 fail-closed，且只在有样本外证据时才可能放行。
+    assert result["evaluation_blockers"], result["evaluation_blockers"]
+    assert result["evaluation_contract_ok"] is False
+    assert result["evaluation_admitted"] is False
+    assert result["evaluation_metric"] == learning_evaluation.METRIC_SPEARMAN_RANK_IC
+    assert result["evaluation_holdout_partition"] == learning_evaluation.DEFAULT_HOLDOUT_PARTITION
     status = control_status(conn)
     assert status["status"] == "shadow_only"
     assert status["max_rank_adjustment"] == 0.0
     assert status["accelerated_mode"] == True
+    assert status["combined_gate_ok"] is False
+    assert status["dataset_contract_ok"] is False
+    assert status["evaluation_contract_ok"] is False
     print(f"neural_shadow self-check passed ({NEURAL_SHADOW_VERSION})")

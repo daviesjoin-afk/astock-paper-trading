@@ -231,6 +231,27 @@ raw evidence → PIT eligibility → canonical samples → mature labels
 - **Chronological splits purge overlapping forward labels.** 按 `label_start_date` 时间切分，且 train 中任何 `label_end_date` 触及 validation 起点的样本一律 purge，validation → test 同理。
 - **A dataset becoming research-ready grants zero execution authority.** 行数达标不再是科研就绪的充分条件：`neural_shadow.readiness` 还必须通过数据集契约门禁，未通过时 `admitted = false`，但 `mode` 始终 `shadow_only`、`trading_impact` 始终 `none`。
 
+## 学习评估契约（PR-9）
+
+数据集就绪只说明"**能评估**"，不说明"**评估通过了**"。PR-9 在 PR-8 之上再加一层**模型无关、可复现的样本外评估门禁**：实现落在 `backend/learning_evaluation.py`（小型纯研究模块，不做训练，不引入任何 ML 依赖：无 numpy / pandas / scikit-learn / torch），由 `neural_shadow` 的 readiness 消费其结论。
+
+```text
+immutable prediction evidence → dataset-fingerprint binding
+    → chronological held-out set → per-date cross-sectional Spearman rank IC
+    → confidence lower bound over *date* units → append-only manifest + SHA-256
+    → shadow admission gate（永不赋予执行权）
+```
+
+契约条文（全部由 `backend/test_learning_evaluation.py` 断言）：
+
+- **An evaluation is bound to exactly one dataset fingerprint.** 预测证据只对构建它的那个数据集成立：fingerprint 缺失或与数据集不一致的行一律记 `unbound_prediction` 并拒绝，绝不因为"分数看起来合理"而接受。数据集绑定进入评估指纹。
+- **Prediction evidence is immutable and content-addressed.** `prediction_id = sha256(dataset_fingerprint | model_id | sample_key | score)`，主键 + `INSERT OR IGNORE`，重放同一预测是幂等 no-op，永不改写既有事实。同一逻辑身份出现两个互相矛盾的分数时，两行**全部** fail closed（不按 first / last / MIN / MAX / rowid 任选其一），保证结论与插入顺序无关。
+- **Only the chronological held-out partition may be scored.** 默认只用 `test` 分区：train / validation 的预测一律 `not_held_out` 排除（那是样本内拟合，不是样本外能力）；预测自称的分区与数据集分区不一致记 `partition_mismatch`；`prediction_asof` 晚于数据集 cutoff 记 `future_prediction`——只在冻结后才可知的分数构不成样本外证据。
+- **Rank IC is cross-sectional, per date.** 每个交易日独立计算截面 Spearman rank IC（并列值用**平均秩**，与输入顺序无关）；每日子样本数低于下限的日期丢弃；秩方差为零的退化截面判为 **undefined 并丢弃，绝不记 0**。缺失 / 非有限 / 不可解析的分数一律 `invalid_prediction_score` 审计并排除，不做 0 插补。
+- **Rows on the same date are NOT independent.** 置信区间以**日期**为单位：`mean_ic − z · (std / √n_dates)`，其中 n 是有效**日数**而非行数。同一个交易日里的 500 只股票是"该策略截面能力"的**一个**观测，不是 500 个；因此给同日增加标的不会缩小标准误，`min_dates`（默认 5）是纯日期门槛。**正值点估计不构成证据**：下界必须为正（默认 `> 0`）；有效日期不足 2 天时区间不存在，门禁保持关闭，而不是用一个数编出区间。
+- **Evaluation manifests are content-addressed and reproducible.** 同一数据集 + 同一预测证据 + 同一评分参数 ⇒ 同一个 SHA-256；`created_at` 不属于内容指纹，重复评估走 `INSERT OR IGNORE`。指纹显式包含 `prediction_digest`（所判证据的内容摘要）：rank IC 对分数做单调变换不变，若不含证据摘要，两个不同的预测集会共用一个审计记录。
+- **Scientific readiness grants zero execution authority.** `neural_shadow` 落到 `approved_bounded_shadow` 必须**同时**满足 `dataset_contract_ok AND evaluation_contract_ok AND human_approved`；数据集就绪但样本外证据未达标时停在新增状态 `approval_waiting_evaluation`（缺数据则仍是 `approval_waiting_data`）。任何状态下 `mode` 始终 `shadow_only`、`trading_impact` 与 `execution_authority` 始终 `none`，硬门禁不变。
+
 ## 目标依赖方向
 
 ```text
