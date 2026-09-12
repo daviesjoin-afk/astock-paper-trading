@@ -163,27 +163,33 @@ _DATE_ONLY = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 # mistaken for a date.
 _DAY_PRECISION = re.compile(r"^\d{4}[-/]\d{2}[-/]\d{2}$")
 # A *spelling* gate for the one fraction ``datetime.fromisoformat`` destroys.
-# The parser normalizes a **zero** offset (``±00:00:00`` / ``±000000``) to a
-# plain ``timezone.utc`` and *discards* any fractional second on it, so
-# ``2026-01-02T10:00:00+00:00:00.100000`` parses to a datetime whose wall
-# ``microsecond`` is 0 **and** whose absolute ``microsecond`` is 0 -- the
+# The parser normalizes a **zero** offset -- in any grammar ISO 8601 allows --
+# to a plain ``timezone.utc`` and, before 3.14, *discards* any fractional second
+# on it, so ``2026-01-02T10:00:00+00:00:00.100000`` parses to a datetime whose
+# wall ``microsecond`` is 0 **and** whose absolute ``microsecond`` is 0 -- the
 # sub-second information is gone before either semantic check can observe it,
 # and two spellings encoding *different* fractional offsets (``.100000`` vs
 # ``.900000``) would collapse onto one dataset identity.
 #
-# Empirically this is the **only** offset shape that loses data: ``+00:00:01.5``,
+# Empirically only a **zero** offset loses data: ``+00:00:01.5``,
 # ``+00:30:00.5``, ``+08:00:00.5`` and every other non-zero offset keep their
 # fraction and are still handled by the semantic checks.  The gate is therefore
-# deliberately narrow -- sign, zero hours, zero minutes, zero seconds, then a
-# decimal separator and a fraction containing a non-zero digit -- covering both
-# the extended (``+00:00:00.5``) and basic (``+000000.5``) spellings and either
-# separator (``.`` or ``,``) ISO 8601 allows.  The non-zero digit is required so
-# that an explicit **all-zero** fraction (``+00:00:00.000000``) still spells a
-# whole second and stays accepted, exactly like ``+00:00:00``.  Keying on this
-# *grammar* rather than on a colon (as the removed ``:\d{2}[.,]\d+`` did) is
-# what makes it spelling-independent.  A whole-second zero offset (``Z``,
-# ``+00:00``, ``+00:00:00``) carries no fraction and is untouched.
-_ZERO_OFFSET_FRACTION = re.compile(r"[+-]00:?00:?00[.,]\d*[1-9]")
+# deliberately narrow: an offset sign, a zero offset in *any* grammar ISO 8601
+# allows (``+00``, ``+0000`` / ``+00:00``, ``+000000`` / ``+00:00:00``), then a
+# decimal separator and a fraction containing a non-zero digit.  Spelling all
+# three grammars matters, because the parser reads -- and, before 3.14, discards
+# -- a trailing fraction on the hours-only and hours+minutes forms exactly as it
+# does on the explicit-seconds form; keying on the seconds-bearing shape alone
+# left ``+00.5`` / ``+0000.5`` / ``+00:00.5`` free to collapse onto a whole
+# second.  The ``$`` anchor keeps the match on the trailing offset (the only
+# place an offset can appear) while still admitting further fraction digits, and
+# the non-zero digit keeps an explicit **all-zero** fraction
+# (``+00:00.000000``) a legitimate whole second, exactly like ``+00:00``.
+# Keying on this *grammar* rather than on a colon (as the removed
+# ``:\d{2}[.,]\d+`` did) is what makes it spelling-independent.  A whole-second
+# zero offset (``Z``, ``+00``, ``+00:00``, ``+00:00:00``) carries no fraction
+# and is untouched.
+_ZERO_OFFSET_FRACTION = re.compile(r"[+-](?:00|00:?00|00:?00:?00)[.,]\d*[1-9]\d*$")
 _END_OF_DAY = "T23:59:59"
 _START_OF_DAY = "T00:00:00"
 
@@ -421,13 +427,14 @@ def _normalize_cutoff(value: Any) -> Optional[str]:
     * a cutoff carrying **sub-second** precision *anywhere* -- in the wall clock
       (``10:00:00.5+08:00``), in the UTC offset (``10:00:00+08:00:00.5``), or in
       an offset ``datetime.fromisoformat`` would silently *discard*
-      (``10:00:00+00:00:00.100000``) -- is refused for the same reason: the
-      canonical PIT clock is second-granularity, so rounding it would move the
-      freeze and collapse two distinct instants onto one dataset identity.  The
-      decision is semantic wherever the parser preserves the fraction, plus a
-      narrow *spelling* gate for the fraction the parser destroys -- see below.
-      An all-zero fraction (``.000000``) still spells a whole second, and stays
-      accepted.
+      (``10:00:00+00:00:00.100000``, or the same fraction on an abbreviated zero
+      offset such as ``10:00:00+00:00.100000``) -- is refused for the same
+      reason: the canonical PIT clock is second-granularity, so rounding it
+      would move the freeze and collapse two distinct instants onto one dataset
+      identity.  The decision is semantic wherever the parser preserves the
+      fraction, plus a narrow *spelling* gate for the fraction the parser
+      destroys -- see below.  An all-zero fraction (``.000000``) still spells a
+      whole second, and stays accepted.
 
     Equivalent spellings of the same instant (``+08:00``, ``Z``, naive
     exchange-local, or an already-canonical ``+00:00``) collapse to one string.

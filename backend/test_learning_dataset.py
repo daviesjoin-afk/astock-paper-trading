@@ -1587,6 +1587,8 @@ class CutoffPrecisionContractTests(DbTestCase):
             ("2026/01/02", "2026-01-02"),
             (self.EXACT, self.EXACT_UTC),
             ("2026-01-02T02:00:00Z", self.EXACT_UTC),
+            ("2026-01-02T02:00:00+00:00", self.EXACT_UTC),
+            ("20260102T020000+0000", self.EXACT_UTC),  # basic ISO, zero offset
             ("2026-01-02T10:00:00", self.EXACT_UTC),
         ):
             with self.subTest(value=value):
@@ -1628,6 +1630,18 @@ class CutoffPrecisionContractTests(DbTestCase):
             "2026-01-02T10:00:00+00:00:00.900000",
             "2026-01-02T10:00:00-00:00:00.100000",
             "20260102T100000+000000.100000",
+            # ... including when that same zero offset is written in an
+            # *abbreviated* grammar -- hours only (``+00``) or hours+minutes
+            # (``+0000`` / ``+00:00``).  ISO 8601 admits all of them and the
+            # parser discards the fraction on each, so the gate covers all three.
+            "2026-01-02T10:00:00+00.5",
+            "2026-01-02T10:00:00+00,5",
+            "2026-01-02T10:00:00+0000.5",
+            "2026-01-02T10:00:00+00:00.5",
+            "2026-01-02T10:00:00+00:00.100000",
+            "2026-01-02T10:00:00-00:00.900000",
+            "2026-01-02T10:00:00-00.100000",
+            "20260102T100000+0000.5",
         ):
             with self.subTest(bad=bad):
                 self.assertIsNone(LD.normalize_cutoff(bad))
@@ -1688,8 +1702,24 @@ class CutoffSpellingIndependenceTests(DbTestCase):
       whole second -- so the wall-clock guard missed it and two such instants
       collapsed onto one second (group G below).
 
-    The check now reads the parsed value, on both the wall clock *and* the
-    absolute UTC instant, so no spelling can bypass it.
+    A third hole needed a different remedy, because the parser *destroys* the
+    evidence rather than merely hiding it.  On a **zero** offset the fraction is
+    read and then thrown away, so ``+00:00:00.100000`` parses to a datetime whose
+    wall clock *and* absolute instant both read as whole seconds and no semantic
+    check can see anything wrong.  A narrow *spelling* gate is therefore applied
+    before parsing (group H below).
+
+    That gate first spelled only the explicit-seconds zero offset
+    (``+00:00:00.5`` / ``+000000.5``), but ISO 8601 also writes a zero offset as
+    ``+00`` (hours), ``+0000`` / ``+00:00`` (hours+minutes), and the parser
+    discards a fraction on those forms too -- so ``+00.5`` / ``+0000.5`` /
+    ``+00:00.5`` slipped past a seconds-only gate and collapsed onto a whole
+    second.  The gate now spans the whole zero-offset grammar, so no zero-offset
+    spelling can smuggle a discarded fraction through (group I below).
+
+    The check reads the parsed value, on both the wall clock *and* the absolute
+    UTC instant, and additionally refuses the one shape the parser destroys by
+    spelling it; no spelling can bypass the contract.
     """
 
     # Two instants differing by 0.8s -- far finer than the canonical second
@@ -1940,22 +1970,32 @@ class CutoffSpellingIndependenceTests(DbTestCase):
     )
 
     def test_a_discarded_zero_offset_fraction_is_invisible_to_both_checks(self):
-        """Non-vacuity: neither semantic check can see this case at all."""
+        """Non-vacuity: neither semantic check can see this case at all.
+
+        Where the interpreter still *parses* a fractional offset (3.11--3.13)
+        the module's own parser keeps a datetime whose wall clock and absolute
+        instant both read as a whole second, so a semantic-only guard would
+        accept it.  3.14 refuses these spellings at parse time and so fails
+        closed one layer earlier; the spelling gate is what makes the refusal a
+        property of the contract rather than of the interpreter.
+        """
         import datetime as _dt
 
         for value in (self.ZERO_OFF_FINE_A, self.ZERO_OFF_FINE_B):
             with self.subTest(value=value):
-                parsed = _dt.datetime.fromisoformat(value)
-                # The wall clock is whole ...
+                # The gate is the only layer that can see the fraction ...
+                self.assertIsNotNone(LD._ZERO_OFFSET_FRACTION.search(value))
+                # ... and the contract refuses the cutoff.
+                self.assertIsNone(LD.normalize_cutoff(value))
+                # The module's own parser, though, keeps a whole second -- i.e.
+                # the semantic checks have nothing to object to.
+                parsed = LD._parse_datetime(value)
+                if parsed is None:
+                    continue  # 3.14+: the parser refuses the spelling outright
                 self.assertEqual(parsed.microsecond, 0)
-                # ... and so is the absolute instant, because the parser threw
-                # the fractional offset away.  A semantic-only guard therefore
-                # reads these as plain whole-second UTC cutoffs.
+                self.assertEqual(LD._utc_instant(parsed).microsecond, 0)
                 self.assertEqual(
-                    parsed.astimezone(_dt.timezone.utc).microsecond, 0
-                )
-                self.assertEqual(
-                    _dt.datetime.fromisoformat(value),
+                    parsed,
                     _dt.datetime.fromisoformat("2026-01-02T10:00:00+00:00"),
                 )
 
@@ -1986,8 +2026,6 @@ class CutoffSpellingIndependenceTests(DbTestCase):
 
     def test_distinct_discarded_zero_offset_fractions_never_share_an_identity(self):
         """Both are refused rather than accepted as one whole-second cutoff."""
-        import datetime as _dt
-
         # Non-vacuity: the caller *spelled* two different fractional offsets.
         self.assertNotEqual(self.ZERO_OFF_FINE_A, self.ZERO_OFF_FINE_B)
 
@@ -2001,13 +2039,13 @@ class CutoffSpellingIndependenceTests(DbTestCase):
                 self.assertNotEqual(LD.normalize_cutoff(value), self.ZERO_OFF_FINE_UTC)
         # The whole-second instant itself keeps its identity (non-vacuous).
         self.assertEqual(LD.normalize_cutoff("2026-01-02T10:00:00+00:00"), self.ZERO_OFF_FINE_UTC)
-        # The two spellings differ textually, yet the parser collapses them onto
-        # one datetime -- precisely why a *semantic* guard cannot separate them
-        # and a spelling gate is required.
-        self.assertEqual(
-            _dt.datetime.fromisoformat(self.ZERO_OFF_FINE_A),
-            _dt.datetime.fromisoformat(self.ZERO_OFF_FINE_B),
-        )
+        # The two spellings differ textually, yet -- wherever the interpreter
+        # still parses a fractional offset -- the parser collapses them onto one
+        # datetime.  That is precisely why a *semantic* guard cannot separate
+        # them and a spelling gate is required.
+        parsed_a = LD._parse_datetime(self.ZERO_OFF_FINE_A)
+        if parsed_a is not None:
+            self.assertEqual(parsed_a, LD._parse_datetime(self.ZERO_OFF_FINE_B))
 
     def test_whole_second_zero_offsets_are_still_accepted(self):
         """Non-vacuous control: every whole-second zero-offset form keeps working."""
@@ -2023,6 +2061,146 @@ class CutoffSpellingIndependenceTests(DbTestCase):
                 self.assertEqual(LD.normalize_cutoff(form), self.ZERO_OFF_FINE_UTC)
         conn = self._seeded()
         built = [build(conn, cutoff=form) for form in forms]
+        self.assertEqual({row.cutoff for row in built}, {self.ZERO_OFF_FINE_UTC})
+        self.assertEqual(len({row.fingerprint for row in built}), 1)
+
+    # ── I. the parser-loss gate spans the *whole* zero-offset grammar ──
+    #
+    # ISO 8601 writes a zero UTC offset as hours (``+00``), hours+minutes
+    # (``+0000`` / ``+00:00``) or hours+minutes+seconds (``+000000`` /
+    # ``+00:00:00``), and ``datetime.fromisoformat`` reads -- and, before 3.14,
+    # discards -- a trailing fraction on any of them, exactly as for the
+    # explicit-seconds form of group H.  The gate first spelled only the
+    # seconds-bearing shape, so ``+00.5`` / ``+0000.5`` / ``+00:00.5`` slipped
+    # past it and collapsed onto a whole-second identity.  It now matches the
+    # whole zero-offset grammar; the ``$`` anchor confines the match to the
+    # trailing offset and the required non-zero digit keeps an all-zero
+    # fraction legitimate.
+
+    ZERO_OFF_ABBREV_FINE = (
+        "2026-01-02T10:00:00+00.100000",      # HH.fraction
+        "2026-01-02T10:00:00+00.900000",
+        "2026-01-02T10:00:00+00.5",
+        "2026-01-02T10:00:00+00,5",           # comma decimal sign
+        "2026-01-02T10:00:00+0000.100000",    # HHMM.fraction
+        "2026-01-02T10:00:00+0000.5",
+        "2026-01-02T10:00:00+00:00.100000",   # HH:MM.fraction
+        "2026-01-02T10:00:00+00:00.900000",
+        "2026-01-02T10:00:00+00:00.5",
+        "20260102T100000+00.100000",          # basic ISO spelling
+        "20260102T100000+0000.5",
+        "2026-01-02T10:00:00-00.100000",      # negative zero offset
+        "2026-01-02T10:00:00-00:00.5",
+        "2026-01-02T10:00:00-0000.900000",
+    )
+    # Whole-second zero offsets in every grammar.  Each must be left *ungated*;
+    # those the running interpreter also parses must additionally still resolve
+    # to the one whole-second UTC instant, i.e. the wider gate caused no false
+    # refusal.
+    ZERO_OFF_WHOLE_ALL = (
+        "2026-01-02T10:00:00Z",
+        "2026-01-02T10:00:00+00",
+        "2026-01-02T10:00:00-00",
+        "2026-01-02T10:00:00+0000",
+        "2026-01-02T10:00:00-0000",
+        "2026-01-02T10:00:00+00:00",
+        "2026-01-02T10:00:00-00:00",
+        "2026-01-02T10:00:00+000000",
+        "2026-01-02T10:00:00-000000",
+        "2026-01-02T10:00:00+00:00:00",
+        "2026-01-02T10:00:00-00:00:00",
+        "20260102T100000+00",
+        "20260102T100000+0000",
+        "20260102T100000+000000",
+        "20260102T100000+00:00:00",
+    )
+    # An explicit *all-zero* fraction is a whole second, so it must stay legal.
+    # The abbreviated spellings only parse before 3.14; hence "never gated"
+    # unconditionally and "accepted" wherever the interpreter supports it.
+    ZERO_OFF_ALL_ZERO_FRACTION = (
+        "2026-01-02T10:00:00+00:00:00.000000",
+        "2026-01-02T10:00:00+00:00.000000",
+        "2026-01-02T10:00:00+0000.000000",
+        "2026-01-02T10:00:00+00.000000",
+    )
+
+    def test_the_spelling_gate_covers_every_zero_offset_grammar(self):
+        """Every zero-offset fraction is gated, whichever grammar spells it."""
+        for value in self.ZERO_OFF_FINE + self.ZERO_OFF_ABBREV_FINE:
+            with self.subTest(value=value):
+                self.assertIsNotNone(LD._ZERO_OFFSET_FRACTION.search(value))
+
+    def test_abbreviated_zero_offset_fraction_cutoffs_are_refused(self):
+        for value in self.ZERO_OFF_ABBREV_FINE:
+            with self.subTest(value=value):
+                self.assertIsNone(LD.normalize_cutoff(value))
+
+    def test_build_dataset_refuses_an_abbreviated_zero_offset_fraction(self):
+        conn = self._seeded()
+        for value in self.ZERO_OFF_ABBREV_FINE:
+            with self.subTest(value=value):
+                with self.assertRaises(ValueError):
+                    build(conn, cutoff=value)
+
+    def test_contract_status_refuses_an_abbreviated_zero_offset_fraction(self):
+        conn = self._seeded()
+        provable = LD._latest_provable_cutoff(conn)
+        self.assertIsNotNone(provable)
+        for value in self.ZERO_OFF_ABBREV_FINE:
+            with self.subTest(value=value):
+                status = LD.contract_status(conn, cutoff=value)
+                self.assertIsNone(status["cutoff"])
+                self.assertIsNone(status["dataset_fingerprint"])
+                self.assertIn("dataset_cutoff_unprovable", status["dataset_blockers"])
+                # Explicitly *not* the latest provable cutoff: no fallback.
+                self.assertNotEqual(status["cutoff"], provable)
+
+    def test_distinct_abbreviated_zero_offset_fractions_never_collapse(self):
+        """Two different abbreviated fractions must not become one identity."""
+        fine_a = "2026-01-02T10:00:00+00:00.100000"
+        fine_b = "2026-01-02T10:00:00+00:00.900000"
+        # Non-vacuity: the caller really *spelled* two different offsets ...
+        self.assertNotEqual(fine_a, fine_b)
+        for value in (fine_a, fine_b):
+            with self.subTest(value=value):
+                self.assertIsNotNone(LD._ZERO_OFFSET_FRACTION.search(value))
+                self.assertIsNone(LD.normalize_cutoff(value))
+        # ... and neither is accepted as the whole-second instant they fold onto.
+        for value in (fine_a, fine_b):
+            with self.subTest(value=value):
+                self.assertNotEqual(LD.normalize_cutoff(value), self.ZERO_OFF_FINE_UTC)
+        # The whole-second spelling of the same offset keeps its identity.
+        self.assertEqual(
+            LD.normalize_cutoff("2026-01-02T10:00:00+00:00"), self.ZERO_OFF_FINE_UTC
+        )
+        # Where the interpreter parses a fraction on this offset form, both
+        # spellings fold onto one datetime -- which is why a spelling gate, and
+        # not a semantic guard, has to separate them.
+        parsed_a = LD._parse_datetime(fine_a)
+        if parsed_a is not None:
+            self.assertEqual(parsed_a.microsecond, 0)
+            self.assertEqual(parsed_a, LD._parse_datetime(fine_b))
+
+    def test_whole_second_zero_offsets_are_never_gated(self):
+        """Non-vacuous control: the widened gate leaves whole seconds alone."""
+        for form in self.ZERO_OFF_WHOLE_ALL + self.ZERO_OFF_ALL_ZERO_FRACTION:
+            with self.subTest(form=form):
+                # The gate keys on a *non-zero* fraction, so no whole-second
+                # spelling can trip it -- whichever grammar it uses, and whether
+                # or not the running interpreter parses that grammar.
+                self.assertIsNone(LD._ZERO_OFFSET_FRACTION.search(form))
+        conn = self._seeded()
+        accepted = [
+            form
+            for form in self.ZERO_OFF_WHOLE_ALL + self.ZERO_OFF_ALL_ZERO_FRACTION
+            if LD._parse_datetime(form) is not None
+        ]
+        # Non-vacuity: the two universal spellings are always honoured.
+        for universal in ("2026-01-02T10:00:00Z", "2026-01-02T10:00:00+00:00"):
+            self.assertIn(universal, accepted)
+        # ... and every accepted spelling resolves to the same whole-second
+        # instant *and* the same dataset identity (no false refusal, no fork).
+        built = [build(conn, cutoff=form) for form in accepted]
         self.assertEqual({row.cutoff for row in built}, {self.ZERO_OFF_FINE_UTC})
         self.assertEqual(len({row.fingerprint for row in built}), 1)
 
