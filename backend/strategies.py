@@ -1730,3 +1730,59 @@ def _number_or(value, default=0.0):
 def _percent(value):
     number = _number(value)
     return round(number * 100, 2) if number is not None else None
+
+
+# StrategyPlugin production facade (issue #24)
+# Keep every audited selector implementation above unchanged. Registered plugin
+# selectors use the unified boundary; legacy research selectors continue through
+# the exact pre-plugin implementation.
+_run_strategy_legacy = run_strategy
+
+
+def available_selection_models():
+    """Return legacy and registered plugin selector ids accepted by production."""
+    import strategy_plugins as SP
+
+    return set(PAPER_WEIGHTS) | set(STRATEGIES) | set(SP.selector_ids())
+
+
+def run_strategy(
+    strategy_id,
+    table: pd.DataFrame,
+    topn=10,
+    news_hits=None,
+    gate=None,
+    auto_news=True,
+    klines=None,
+    first_board_codes=None,
+    weight_overrides=None,
+    condition_overrides=None,
+):
+    """Production selector facade: plugin first, exact legacy fallback otherwise."""
+    import strategy_plugins as SP
+
+    plugin = SP.plugin_for_selector(strategy_id)
+    if plugin is not None:
+        return plugin.select_candidates(
+            table,
+            topn=topn,
+            news_hits=news_hits,
+            gate=gate,
+            auto_news=auto_news,
+            klines=klines,
+            first_board_codes=first_board_codes,
+            weight_overrides=weight_overrides,
+            condition_overrides=condition_overrides,
+        )
+    return _run_strategy_legacy(
+        strategy_id,
+        table,
+        topn=topn,
+        news_hits=news_hits,
+        gate=gate,
+        auto_news=auto_news,
+        klines=klines,
+        first_board_codes=first_board_codes,
+        weight_overrides=weight_overrides,
+        condition_overrides=condition_overrides,
+    )
