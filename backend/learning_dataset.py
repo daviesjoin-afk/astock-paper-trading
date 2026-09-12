@@ -47,7 +47,8 @@ Contracts enforced here:
     a naive availability is exchange-local, never the host machine timezone
     every PIT comparison runs on one canonical UTC instant clock
     an explicit cutoff that is unparseable, or finer than the canonical clock's
-    second granularity, is refused rather than silently loosened or rounded
+    second granularity, is refused rather than silently loosened or rounded --
+    decided on the parsed instant, so no ISO 8601 spelling slips past it
 """
 
 from __future__ import annotations
@@ -161,11 +162,6 @@ _DATE_ONLY = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 # gave day precision or instant precision, so an intraday timestamp can never be
 # mistaken for a date.
 _DAY_PRECISION = re.compile(r"^\d{4}[-/]\d{2}[-/]\d{2}$")
-# Any sub-second component, in either ISO separator (``.`` or ``,``).  The PIT
-# clock is second-granularity everywhere (``_canonical_instant`` formats with
-# ``timespec="seconds"``), so a cutoff carrying more precision than that cannot
-# be represented -- see :func:`_normalize_cutoff`.
-_SUBSECOND = re.compile(r":\d{2}[.,]\d+")
 _END_OF_DAY = "T23:59:59"
 _START_OF_DAY = "T00:00:00"
 
@@ -293,6 +289,36 @@ def _exchange_day_edge(day: str, edge: str) -> Optional[str]:
     return _canonical_instant(naive)
 
 
+def _parse_datetime(value: Any) -> Optional[_dt.datetime]:
+    """Parse one timestamp spelling, or ``None`` -- the module's only parser.
+
+    ``datetime.fromisoformat`` is deliberately the primary path because it
+    accepts every ISO 8601 spelling the standard library knows, including the
+    *basic* form (``20260102T100000+0800``) that a hand-written pattern would
+    miss.  The legacy space-separated shapes stay as a fallback for stored
+    evidence.  Nothing is ever synthesized: an unparseable input returns
+    ``None`` so callers fail closed.
+
+    Sub-second precision is **preserved** here -- the parsed ``datetime`` keeps
+    its microsecond field -- so callers can decide for themselves whether the
+    second-granularity canonical clock can hold it.
+    """
+    text = _text(value)
+    if text is None:
+        return None
+    normalized = text[:-1] + "+00:00" if text.endswith(("Z", "z")) else text
+    try:
+        return _dt.datetime.fromisoformat(normalized)
+    except ValueError:
+        pass
+    for fmt in ("%Y/%m/%d %H:%M:%S", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"):
+        try:
+            return _dt.datetime.strptime(text, fmt)
+        except ValueError:
+            continue
+    return None
+
+
 def _timestamp_text(value: Any) -> Optional[str]:
     """Normalize a stored availability timestamp onto the canonical UTC clock.
 
@@ -306,19 +332,9 @@ def _timestamp_text(value: Any) -> Optional[str]:
     if _DATE_ONLY.match(text):
         # Day-precise evidence keeps its day; _instant() picks the edge.
         return text
-    normalized = text[:-1] + "+00:00" if text.endswith(("Z", "z")) else text
-    try:
-        parsed = _dt.datetime.fromisoformat(normalized)
-    except ValueError:
-        parsed = None
-        for fmt in ("%Y/%m/%d %H:%M:%S", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"):
-            try:
-                parsed = _dt.datetime.strptime(text, fmt)
-                break
-            except ValueError:
-                continue
-        if parsed is None:
-            return None
+    parsed = _parse_datetime(text)
+    if parsed is None:
+        return None
     return _canonical_instant(parsed)
 
 
@@ -372,6 +388,8 @@ def _normalize_cutoff(value: Any) -> Optional[str]:
     * a cutoff carrying **sub-second** precision is refused for the same reason:
       the canonical PIT clock is second-granularity, so rounding it would move
       the freeze and collapse two distinct instants onto one dataset identity.
+      This is decided **semantically**, on the parsed value, never by matching
+      the spelling -- see below.
 
     Equivalent spellings of the same instant (``+08:00``, ``Z``, naive
     exchange-local, or an already-canonical ``+00:00``) collapse to one string.
@@ -383,14 +401,24 @@ def _normalize_cutoff(value: Any) -> Optional[str]:
         # Day precision is preserved as a day; the EOD reading happens later,
         # at comparison time, so the stored identity stays day-precise.
         return _date_text(text)
-    if _SUBSECOND.search(text):
-        # Every canonical string and every comparison in this module uses
-        # ``timespec="seconds"``, so a sub-second cutoff cannot be represented
-        # faithfully.  Rounding it would silently pick a precision, move the
-        # freeze, and let two distinct instants share one fingerprint -- the
-        # exact defect this contract forbids.  Refuse instead of choosing.
+    parsed = _parse_datetime(text)
+    if parsed is None:
         return None
-    return _timestamp_text(text)
+    if parsed.microsecond:
+        # The canonical PIT clock holds whole seconds (``_canonical_instant``
+        # formats with ``timespec="seconds"``), so an instant carrying a
+        # sub-second component cannot be represented faithfully.  Rounding or
+        # truncating would silently pick a precision, move the freeze, and let
+        # two distinct freeze instants share one dataset identity/fingerprint --
+        # exactly the defect this contract forbids.  Refuse instead of choosing.
+        #
+        # The check is *semantic* -- it reads the parsed value, not the
+        # spelling.  ``datetime.fromisoformat`` legally accepts many ISO 8601
+        # forms (e.g. the basic ``20260102T100000.100000+0800``) that no single
+        # hand-written pattern can be trusted to cover, so a pattern-based test
+        # would silently let some of them through to be truncated.
+        return None
+    return _canonical_instant(parsed)
 
 
 def _finite(value: Any) -> Optional[float]:

@@ -1592,7 +1592,26 @@ class CutoffPrecisionContractTests(DbTestCase):
             with self.subTest(value=value):
                 self.assertEqual(LD.normalize_cutoff(value), expected)
                 self.assertEqual(LD.normalize_cutoff(expected), expected)
-        for bad in ("not-a-date", "2026-13-45", "2026-02-30", "", "   ", None):
+        for bad in (
+            "not-a-date",
+            "2026-13-45",
+            "2026-02-30",
+            "",
+            "   ",
+            None,
+            # The canonical clock is second-granularity, so a cutoff finer than
+            # that cannot be held without rounding -- refuse it, never round it.
+            "2026-01-02T10:00:00.100000+08:00",
+            "2026-01-02T10:00:00.900000+08:00",
+            "2026-01-02T02:00:00.5Z",
+            "2026-01-02T10:00:00,250+08:00",
+            # ... including the *basic* ISO form, which carries no colon for a
+            # pattern to key on: the check now reads the parsed value, so this
+            # spelling cannot smuggle a sub-second instant past it.
+            "20260102T100000.100000+0800",
+            "20260102T100000.900000+0800",
+            "20260102T100000,100000+0800",
+        ):
             with self.subTest(bad=bad):
                 self.assertIsNone(LD.normalize_cutoff(bad))
 
@@ -1630,6 +1649,118 @@ class CutoffPrecisionContractTests(DbTestCase):
                 os.environ["TZ"] = original_tz
             if hasattr(time, "tzset"):
                 time.tzset()
+
+
+class CutoffSpellingIndependenceTests(DbTestCase):
+    """Precision is judged on the parsed instant, never on the spelling.
+
+    PR-10's core invariant is that two *different* freeze instants may never
+    collapse onto one dataset identity/fingerprint because the canonical clock
+    is second-granular.  Detecting "too fine to hold" with a regular expression
+    over the text only covered the extended ISO form; the *basic* ISO form
+    (``20260102T100000.100000+0800``) is equally legal to
+    ``datetime.fromisoformat`` and slipped through to be truncated to the
+    second.  The check now reads the parsed value, so no spelling can bypass it.
+    """
+
+    # Two instants differing by 0.8s -- far finer than the canonical second
+    # clock, so both must be *refused* rather than collapsed onto one identity.
+    FINE_A = "20260102T100000.100000+0800"
+    FINE_B = "20260102T100000.900000+0800"
+    FINE = (FINE_A, FINE_B)
+    # The same wall clock at whole-second precision: a legal basic-ISO spelling.
+    COARSE_BASIC = "20260102T100000+0800"
+    COARSE_UTC = "2026-01-02T02:00:00+00:00"
+
+    def _seeded(self):
+        conn = self.new_db()
+        seed_series(conn, dates(12), horizons=(1,))
+        return conn
+
+    # ── A. the basic ISO sub-second forms are refused ──
+
+    def test_basic_iso_subsecond_cutoffs_are_refused(self):
+        for value in self.FINE:
+            with self.subTest(value=value):
+                self.assertIsNone(LD.normalize_cutoff(value))
+
+    # ── B. build_dataset fails closed ──
+
+    def test_build_dataset_refuses_a_basic_iso_subsecond_cutoff(self):
+        conn = self._seeded()
+        for value in self.FINE:
+            with self.subTest(value=value):
+                with self.assertRaises(ValueError):
+                    build(conn, cutoff=value)
+
+    # ── C. contract_status fails closed, with no fallback ──
+
+    def test_contract_status_refuses_a_basic_iso_subsecond_cutoff(self):
+        conn = self._seeded()
+        provable = LD._latest_provable_cutoff(conn)
+        self.assertIsNotNone(provable)
+        for value in self.FINE:
+            with self.subTest(value=value):
+                status = LD.contract_status(conn, cutoff=value)
+                self.assertIsNone(status["cutoff"])
+                self.assertIsNone(status["dataset_fingerprint"])
+                self.assertIn("dataset_cutoff_unprovable", status["dataset_blockers"])
+                # Explicitly *not* the latest provable cutoff: no fallback.
+                self.assertNotEqual(status["cutoff"], provable)
+
+    # ── D. the identity collapse itself must not happen ──
+
+    def test_two_distinct_subsecond_instants_never_share_a_dataset_identity(self):
+        """Both are refused, rather than both mapping to one second-precision id.
+
+        Non-vacuity first: the two inputs really are two *distinct* instants, so
+        refusing them is about precision and not about being unparseable.
+        """
+        import datetime as _dt
+
+        parsed_a = _dt.datetime.fromisoformat(self.FINE_A)
+        parsed_b = _dt.datetime.fromisoformat(self.FINE_B)
+        self.assertNotEqual(parsed_a, parsed_b)
+        self.assertNotEqual(parsed_a.microsecond, 0)
+        self.assertNotEqual(parsed_b.microsecond, 0)
+
+        # Neither is accepted ...
+        for value in self.FINE:
+            with self.subTest(value=value):
+                self.assertIsNone(LD.normalize_cutoff(value))
+        # ... and neither is quietly mapped onto the second-precision instant
+        # both used to be truncated to -- which is exactly the collapse.
+        for value in self.FINE:
+            with self.subTest(value=value):
+                self.assertNotEqual(LD.normalize_cutoff(value), self.COARSE_UTC)
+
+    # ── E. the coarse basic-ISO spelling still works (non-vacuous control) ──
+
+    def test_a_whole_second_basic_iso_cutoff_is_still_accepted(self):
+        self.assertEqual(LD.normalize_cutoff(self.COARSE_BASIC), self.COARSE_UTC)
+        conn = self._seeded()
+        built = build(conn, cutoff=self.COARSE_BASIC)
+        self.assertEqual(built.cutoff, self.COARSE_UTC)
+        # ... and it is the *same* dataset as the extended spelling of it.
+        self.assertEqual(
+            built.fingerprint,
+            build(conn, cutoff="2026-01-02T10:00:00+08:00").fingerprint,
+        )
+
+    # ── F. every equivalent spelling keeps one dataset identity ──
+
+    def test_basic_and_extended_spellings_share_one_dataset_identity(self):
+        conn = self._seeded()
+        forms = (
+            self.COARSE_BASIC,                # basic ISO
+            "2026-01-02T10:00:00+08:00",      # extended ISO
+            "2026-01-02T02:00:00Z",
+            "2026-01-02T02:00:00+00:00",
+            "2026-01-02T10:00:00",            # naive == exchange-local
+        )
+        built = [build(conn, cutoff=form) for form in forms]
+        self.assertEqual({row.cutoff for row in built}, {self.COARSE_UTC})
+        self.assertEqual(len({row.fingerprint for row in built}), 1)
 
 
 class NoNetworkTests(DbTestCase):
