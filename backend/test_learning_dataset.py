@@ -8,6 +8,7 @@ silently accepts unprovable evidence is worse than one that returns nothing.
 """
 
 import ast
+import json
 import os
 import sqlite3
 import sys
@@ -820,6 +821,205 @@ class LabelPitInheritanceTests(DbTestCase):
         built = build(conn)
         self.assertEqual(reasons(built).get("unproven_label_pit"), 1)
         self.assertEqual(built.eligible_rows, 0)
+
+
+def evidence(
+    *,
+    asof="2026-09-11",
+    feature_available="2026-09-12T15:59:59+00:00",
+    feature_pit=None,
+    label_start="2026-09-11",
+    label_end="2026-09-12",
+    label_available="2026-09-12T15:59:59+00:00",
+    label_pit=None,
+    horizon=1,
+    target=1.0,
+):
+    """Assemble one synthetic candidate without touching a database.
+
+    Defaults sit exactly on the ``cutoff="2026-09-12"`` boundary so a test can
+    move a single field across it.
+    """
+    return {
+        "sample": {
+            "profile_date": asof,
+            "code": "000001",
+            "feature_asof": asof,
+            "feature_available_at": feature_available,
+            "pit_status": LD.PIT_VERIFIED if feature_pit is None else feature_pit,
+            "source": LD.DATASET_KIND_ADAPTIVE_ALPHA,
+            "source_version": "test-v1",
+            "contract_version": LD.CONTRACT_VERSION,
+            "sample_features": {name: 0.5 for name in FEATURES},
+        },
+        "label": {
+            "start_date": label_start,
+            "end_date": label_end,
+            "horizon": horizon,
+            "forward_return_pct": target,
+            "label_available_at": label_available,
+            "horizon_semantics": LD.HORIZON_SEMANTICS_OBSERVED_PROFILE_STEPS,
+            "pit_status": LD.PIT_VERIFIED if label_pit is None else label_pit,
+        },
+    }
+
+
+class TimezoneContractTests(DbTestCase):
+    """PIT comparisons run on one canonical UTC clock.
+
+    A date-only cutoff is the end of that *exchange-local* (UTC+08:00) day, so
+    an availability that is still 2026-09-12 in Shanghai is inside the cutoff
+    even though it is already 2026-09-12T16:00Z.
+    """
+
+    CUTOFF = "2026-09-12"
+
+    def classify(self, **kwargs):
+        return LD._classify(evidence(**kwargs), cutoff=self.CUTOFF, feature_names=FEATURES)
+
+    # ── A. feature availability ──
+
+    def test_feature_availability_at_local_day_end_is_allowed(self):
+        sample, reason = self.classify(feature_available="2026-09-12T23:59:59+08:00")
+        self.assertIsNotNone(sample, reason)
+
+    def test_feature_availability_at_utc_equivalent_of_local_day_end_is_allowed(self):
+        sample, reason = self.classify(feature_available="2026-09-12T15:59:59+00:00")
+        self.assertIsNotNone(sample, reason)
+
+    def test_feature_availability_at_160000Z_is_future(self):
+        # == 2026-09-13T00:00:00+08:00, i.e. the next Shanghai calendar day.
+        sample, reason = self.classify(feature_available="2026-09-12T16:00:00+00:00")
+        self.assertIsNone(sample)
+        self.assertEqual(reason, "future_feature")
+
+    def test_feature_availability_at_local_next_midnight_is_future(self):
+        sample, reason = self.classify(feature_available="2026-09-13T00:00:00+08:00")
+        self.assertIsNone(sample)
+        self.assertEqual(reason, "future_feature")
+
+    # ── B. label availability ──
+
+    def test_label_availability_at_local_day_end_is_allowed(self):
+        sample, reason = self.classify(label_available="2026-09-12T23:59:59+08:00")
+        self.assertIsNotNone(sample, reason)
+
+    def test_label_availability_at_utc_equivalent_of_local_day_end_is_allowed(self):
+        sample, reason = self.classify(label_available="2026-09-12T15:59:59+00:00")
+        self.assertIsNotNone(sample, reason)
+
+    def test_label_availability_at_160000Z_is_a_future_label(self):
+        sample, reason = self.classify(label_available="2026-09-12T16:00:00+00:00")
+        self.assertIsNone(sample)
+        self.assertEqual(reason, "future_label")
+
+    def test_label_availability_at_local_next_midnight_is_a_future_label(self):
+        sample, reason = self.classify(label_available="2026-09-13T00:00:00+08:00")
+        self.assertIsNone(sample)
+        self.assertEqual(reason, "future_label")
+
+    # ── C. offset equivalence ──
+
+    def test_equal_instants_in_different_offsets_canonicalize_identically(self):
+        self.assertEqual(
+            LD._timestamp_text("2026-09-12T15:00:00+00:00"),
+            LD._timestamp_text("2026-09-12T23:00:00+08:00"),
+        )
+        self.assertEqual(
+            LD._instant("2026-09-12T15:00:00+00:00"),
+            LD._instant("2026-09-12T23:00:00+08:00"),
+        )
+
+    def test_zulu_offset_and_naive_forms_share_one_instant(self):
+        for text in (
+            "2026-09-12T15:59:59Z",
+            "2026-09-12T15:59:59+00:00",
+            "2026-09-12T23:59:59+08:00",
+            "2026-09-12T23:59:59",  # naive == exchange-local
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(LD._timestamp_text(text), "2026-09-12T15:59:59+00:00")
+
+    def test_canonicalization_is_idempotent(self):
+        once = LD._timestamp_text("2026-09-12T23:59:59+08:00")
+        self.assertEqual(LD._timestamp_text(once), once)
+        self.assertEqual(LD._instant(once), once)
+
+    # ── D. date-only cutoff ──
+
+    def test_date_only_cutoff_is_the_exchange_local_day_end(self):
+        self.assertEqual(LD._cutoff_instant(self.CUTOFF), "2026-09-12T15:59:59+00:00")
+
+    def test_date_only_cutoff_is_not_the_utc_day_end(self):
+        self.assertNotEqual(LD._cutoff_instant(self.CUTOFF), "2026-09-12T23:59:59+00:00")
+        self.assertNotEqual(LD._cutoff_instant(self.CUTOFF), "2026-09-12T23:59:59")
+
+    def test_date_only_instant_is_the_exchange_local_day_start(self):
+        self.assertEqual(LD._instant(self.CUTOFF), "2026-09-11T16:00:00+00:00")
+
+    def test_cutoff_is_never_read_in_the_host_timezone(self):
+        # The canonical cutoff must be a fixed UTC instant, independent of the
+        # machine that rebuilds the dataset.
+        self.assertTrue(LD._cutoff_instant(self.CUTOFF).endswith("+00:00"))
+
+    # ── E. naive compatibility ──
+
+    def test_naive_availability_is_read_as_exchange_local(self):
+        self.assertEqual(LD._timestamp_text("2026-09-12T23:59:59"), "2026-09-12T15:59:59+00:00")
+        sample, reason = self.classify(feature_available="2026-09-12T23:59:59")
+        self.assertIsNotNone(sample, reason)
+
+    def test_timezone_fix_does_not_upgrade_unproven_naive_rows(self):
+        conn = self.new_db()
+        seed_sample(conn, "2026-01-01", available="2026-01-01T15:15:00",
+                    pit=LD.PIT_LEGACY_UNPROVEN)
+        seed_label(conn, "2026-01-01", "2026-01-02")
+        built = build(conn)
+        self.assertEqual(built.eligible_rows, 0)
+        self.assertEqual(reasons(built).get("legacy_unproven_pit"), 1)
+
+    def test_timezone_fix_does_not_upgrade_unproven_aware_rows(self):
+        conn = self.new_db()
+        seed_sample(conn, "2026-01-01", available="2026-01-01T15:15:00+00:00",
+                    pit=LD.PIT_LEGACY_UNPROVEN)
+        seed_label(conn, "2026-01-01", "2026-01-02")
+        built = build(conn)
+        self.assertEqual(built.eligible_rows, 0)
+        self.assertEqual(reasons(built).get("legacy_unproven_pit"), 1)
+
+    def test_equivalent_offsets_produce_the_same_fingerprint(self):
+        local, utc = self.new_db(), self.new_db()
+        seed_sample(local, "2026-01-01", available="2026-01-01T15:15:00")            # exchange-local
+        seed_sample(utc, "2026-01-01", available="2026-01-01T07:15:00+00:00")       # same instant
+        seed_label(local, "2026-01-01", "2026-01-02")
+        seed_label(utc, "2026-01-01", "2026-01-02")
+        self.assertEqual(build(local).fingerprint, build(utc).fingerprint)
+
+    # ── provenance ──
+
+    def test_captured_provenance_declares_the_canonical_clock(self):
+        provenance = LD.capture_provenance(available_at="2026-09-12T23:59:59+08:00")
+        self.assertEqual(provenance["feature_available_at"], "2026-09-12T15:59:59+00:00")
+        self.assertEqual(provenance["pit_status"], LD.PIT_VERIFIED)
+        self.assertEqual(
+            json.loads(provenance["provenance_json"])["availability_clock"], "canonical_utc"
+        )
+
+    def test_captured_provenance_without_a_timestamp_stays_unproven(self):
+        provenance = LD.capture_provenance(available_at=None)
+        self.assertIsNone(provenance["feature_available_at"])
+        self.assertEqual(provenance["pit_status"], LD.PIT_LEGACY_UNPROVEN)
+        self.assertEqual(
+            json.loads(provenance["provenance_json"])["availability_clock"], "canonical_utc"
+        )
+
+    def test_dataset_provenance_declares_the_canonical_clock(self):
+        conn = self.new_db()
+        seed_sample(conn, "2026-01-01", available="2026-01-01T15:15:00")
+        seed_label(conn, "2026-01-01", "2026-01-02")
+        built = build(conn)
+        row = all_rows(built)[0]
+        self.assertEqual(row.provenance["availability_clock"], "canonical_utc")
 
 
 class SchemaMigrationTests(DbTestCase):

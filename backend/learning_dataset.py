@@ -42,6 +42,9 @@ Contracts enforced here:
     row count != scientific readiness
     observed step != proven exchange trading day
     training data != execution authority
+    a date-only cutoff means end of that exchange-local (UTC+08:00) day
+    a naive availability is exchange-local, never the host machine timezone
+    every PIT comparison runs on one canonical UTC instant clock
 """
 
 from __future__ import annotations
@@ -153,6 +156,17 @@ _DATE_ONLY = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 _END_OF_DAY = "T23:59:59"
 _START_OF_DAY = "T00:00:00"
 
+# ── PIT instant contract ──────────────────────────────────────────────────
+# Every availability / cutoff comparison happens on ONE canonical clock: UTC.
+# A-share evidence is exchange-local, so a date-only cutoff denotes the end of
+# that calendar day in Asia/Shanghai (UTC+08:00) -- *not* the end of day UTC.
+# A naive stored timestamp has no offset of its own; per the PR-8 provenance
+# contract it is exchange-local, and it is never read in the host machine's
+# timezone (which would make the dataset depend on where it was rebuilt).
+_EXCHANGE_TZ = _dt.timezone(_dt.timedelta(hours=8), "UTC+08:00")
+_UTC = _dt.timezone.utc
+_AVAILABILITY_CLOCK = "canonical_utc"
+
 # Modules that must never appear in this module's namespace.  Enforced by
 # :func:`forbidden_dependencies` and asserted in the dependency guard test.
 _FORBIDDEN_DEPENDENCY_PREFIXES = (
@@ -232,12 +246,40 @@ def _date_text(value: Any) -> Optional[str]:
     return candidate
 
 
+def _canonical_instant(value: _dt.datetime) -> str:
+    """Return ``YYYY-MM-DDTHH:MM:SS+00:00`` on the canonical PIT clock.
+
+    A naive input carries no offset, so it is read as *exchange-local*
+    (Asia/Shanghai) rather than the host's timezone.  The output always keeps
+    an explicit ``+00:00`` so the function is idempotent: feeding a canonical
+    value back in cannot shift it a second time.
+    """
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=_EXCHANGE_TZ)
+    return value.astimezone(_UTC).isoformat(timespec="seconds")
+
+
+def _exchange_day_edge(day: str, edge: str) -> Optional[str]:
+    """Canonical UTC instant for an edge of an exchange-local calendar day."""
+    try:
+        naive = _dt.datetime.fromisoformat(day + edge)
+    except ValueError:
+        return None
+    return _canonical_instant(naive)
+
+
 def _timestamp_text(value: Any) -> Optional[str]:
-    """Normalize a stored availability timestamp; never synthesize one."""
+    """Normalize a stored availability timestamp onto the canonical UTC clock.
+
+    Never synthesizes a timestamp and never drops a real offset: a tz-aware
+    input is converted to UTC, a naive input is read as exchange-local, and an
+    unparseable input returns ``None`` so callers fail closed.
+    """
     text = _text(value)
     if text is None:
         return None
     if _DATE_ONLY.match(text):
+        # Day-precise evidence keeps its day; _instant() picks the edge.
         return text
     normalized = text[:-1] + "+00:00" if text.endswith(("Z", "z")) else text
     try:
@@ -252,34 +294,37 @@ def _timestamp_text(value: Any) -> Optional[str]:
                 continue
         if parsed is None:
             return None
-    if parsed.tzinfo is not None:
-        return parsed.astimezone(_dt.timezone.utc).replace(tzinfo=None).isoformat(timespec="seconds")
-    return parsed.isoformat(timespec="seconds")
+    return _canonical_instant(parsed)
 
 
 def _instant(value: Any) -> Optional[str]:
-    """Comparable instant string.  A date-only value means day granularity.
+    """Canonical UTC instant.  A date-only value means day granularity.
 
-    Day granularity is encoded as the *start* of the day: the source proved
-    only the day, so we never claim intraday evidence it never gave us.
+    Day granularity is encoded as the *start* of the exchange-local day: the
+    source proved only the day, so we never claim intraday evidence it never
+    gave us.
     """
     text = _text(value)
     if text is None:
         return None
     if len(text) == 10 and _DATE_ONLY.match(text):
         day = _date_text(text)
-        return None if day is None else day + _START_OF_DAY
+        return None if day is None else _exchange_day_edge(day, _START_OF_DAY)
     return _timestamp_text(text)
 
 
 def _cutoff_instant(value: Any) -> Optional[str]:
-    """Cutoff instant; a date-only cutoff denotes the end of that calendar day."""
+    """Cutoff instant on the canonical UTC clock.
+
+    A date-only cutoff denotes the end of that calendar day in the exchange's
+    own timezone (UTC+08:00), not the end of the UTC day.
+    """
     text = _text(value)
     if text is None:
         return None
     if len(text) == 10 and _DATE_ONLY.match(text):
         day = _date_text(text)
-        return None if day is None else day + _END_OF_DAY
+        return None if day is None else _exchange_day_edge(day, _END_OF_DAY)
     return _timestamp_text(text)
 
 
@@ -410,7 +455,7 @@ def capture_provenance(
     normalized = _timestamp_text(available_at)
     provenance = dict(extra or {})
     provenance["capture_contract_version"] = contract_version
-    provenance["availability_clock"] = "exchange_local_naive"
+    provenance["availability_clock"] = _AVAILABILITY_CLOCK
     return {
         "feature_available_at": normalized,
         "pit_status": PIT_VERIFIED if normalized else PIT_LEGACY_UNPROVEN,
@@ -918,7 +963,7 @@ def _classify(evidence: Mapping[str, Any], *, cutoff: str, feature_names: Sequen
                 "label_source": _text(label.get("source")) or "",
                 "label_source_version": _text(label.get("source_version")) or "",
                 "sample_contract_version": _text(sample.get("contract_version")) or CONTRACT_VERSION,
-                "availability_clock": "exchange_local_naive",
+                "availability_clock": _AVAILABILITY_CLOCK,
                 **_loads(sample.get("provenance_json")),
                 **_loads(label.get("provenance_json")),
             },
