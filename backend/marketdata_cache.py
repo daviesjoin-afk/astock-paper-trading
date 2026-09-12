@@ -63,21 +63,51 @@ def full_snapshot_singleflight_lock(thread_lock, lock_path):
 
 
 def save_source_health(path, payload):
-    """以临时文件替换方式持久化数据源健康状态。"""
+    """以临时文件替换方式持久化数据源健康状态。
+
+    Feed runtime health is attached lazily so `/api/health` can expose provider
+    circuit/degradation state without importing transport policy into the API.
+    An empty runtime registry leaves the legacy payload shape unchanged.
+    """
+    snapshot = dict(payload) if isinstance(payload, dict) else {}
+    try:
+        import marketdata_feeds as feeds
+        runtime_feeds = feeds.feed_health_snapshot()
+        if runtime_feeds:
+            snapshot["runtime_feeds"] = runtime_feeds
+    except Exception:
+        # Health persistence is diagnostic and must never break the data path.
+        pass
     try:
         temp_path = f"{path}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
         with open(temp_path, "w", encoding="utf-8") as handle:
-            json.dump(payload, handle, ensure_ascii=False, allow_nan=False)
+            json.dump(snapshot, handle, ensure_ascii=False, allow_nan=False)
         os.replace(temp_path, path)
     except OSError:
         pass
 
 
 def load_source_health(path):
-    """读取最近一次数据源健康状态，不触碰网络。"""
+    """读取健康状态并叠加当前进程的实时 feed 状态，不触碰网络。
+
+    持久化快照适合审计，但 circuit/degraded 状态会在请求路径中变化；读取时
+    合并内存 registry，确保现有 `/api/health` 看到的是当前状态。进程重启后
+    registry 为空时移除旧 runtime 状态，避免把上个进程的 circuit 当成当前值。
+    """
     try:
         with open(path, encoding="utf-8") as handle:
             payload = json.load(handle)
-        return payload if isinstance(payload, dict) else {}
+        payload = dict(payload) if isinstance(payload, dict) else {}
     except (OSError, ValueError, TypeError):
-        return {}
+        payload = {}
+    try:
+        import marketdata_feeds as feeds
+        runtime_feeds = feeds.feed_health_snapshot()
+        if runtime_feeds:
+            payload["runtime_feeds"] = runtime_feeds
+        else:
+            payload.pop("runtime_feeds", None)
+    except Exception:
+        # Observability must never make health reads fail.
+        pass
+    return payload
