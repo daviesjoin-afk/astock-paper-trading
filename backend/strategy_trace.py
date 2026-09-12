@@ -143,16 +143,6 @@ def _canonical_date(value: Any) -> str | None:
         return None
 
 
-def _selection_cache_factor_date() -> str | None:
-    path = _cache_root() / "selection_cache.json"
-    try:
-        with path.open("r", encoding="utf-8") as handle:
-            payload = json.load(handle) or {}
-    except (OSError, ValueError, TypeError):
-        return None
-    return _canonical_date(payload.get("factor_date"))
-
-
 def data_date(table: pd.DataFrame, explicit: Any = None) -> str:
     """Resolve one exact factor as-of date; mixed dates are never collapsed."""
     value = _canonical_date(explicit)
@@ -177,12 +167,6 @@ def data_date(table: pd.DataFrame, explicit: Any = None) -> str:
             return next(iter(dates))
         if len(dates) > 1:
             raise ValueError(f"strategy replay refuses mixed data dates in {key}")
-    # build_factor_table does not currently carry price_f.last_date forward.
-    # Its source selection_cache metadata is already validated by the loader,
-    # so this is the only allowed production fallback. Never substitute today.
-    cached = _selection_cache_factor_date()
-    if cached:
-        return cached
     raise ValueError("strategy replay cannot prove factor data date")
 
 
@@ -327,9 +311,6 @@ def persist_snapshot(
     if not factors:
         raise ValueError("strategy replay requires declared factor inputs")
     _validate_table(table)
-    missing = [factor for factor in factors if factor not in table.columns]
-    if missing:
-        raise ValueError(f"strategy replay factor missing from input table: {missing[0]}")
     resolved_date = data_date(table, explicit=explicit_data_date)
     resolved_version = code_version(explicit_code_version)
     safe_inputs = _safe_selection_inputs(selection_kwargs)
