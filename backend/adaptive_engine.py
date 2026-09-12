@@ -1202,6 +1202,9 @@ def _mature_alpha_returns(conn):
     交易日数，故显式写 ``horizon_semantics='observed_profile_steps'``。
     标签的可见时间取终点那一行样本的 ``feature_available_at``（同一个已持久化
     快照的收盘观测）；取不到就保持 NULL + ``legacy_unproven``，绝不补猜。
+    只有终点样本本身已经是 ``verified``（有可解析的可用时间且 provenance 已证明）
+    时，标签才能继承为 ``verified``；时间戳存在 ≠ provenance 已证明，所以
+    ``legacy_unproven`` / ``unknown`` 的终点只能产出 ``legacy_unproven`` 标签。
     这里不重写任何历史 horizon 数值，也不删除旧行。
     """
     dates = [row[0] for row in conn.execute(
@@ -1227,13 +1230,15 @@ def _mature_alpha_returns(conn):
                    SELECT ?,?,?,first.code,
                           ROUND((last.close_price / first.close_price - 1) * 100, 8),?,
                           last.feature_available_at,?,
-                          CASE WHEN last.feature_available_at IS NOT NULL THEN ? ELSE ? END,
+                          CASE WHEN last.feature_available_at IS NOT NULL AND last.pit_status = ?
+                               THEN ? ELSE ? END,
                           ?,?,?
                      FROM adaptive_alpha_samples first
                      JOIN adaptive_alpha_samples last ON last.code=first.code AND last.profile_date=?
                     WHERE first.profile_date=? AND first.close_price>0 AND last.close_price>0""",
                 (start_date, end_date, horizon, _now(),
                  learning_dataset.HORIZON_SEMANTICS_OBSERVED_PROFILE_STEPS,
+                 learning_dataset.PIT_VERIFIED,
                  learning_dataset.PIT_VERIFIED,
                  learning_dataset.PIT_LEGACY_UNPROVEN,
                  learning_dataset.DATASET_KIND_ADAPTIVE_ALPHA,

@@ -26,9 +26,14 @@ back-dated, and never replaced with ``0``.
 
 Contracts enforced here:
 
-    feature time <= sample cutoff
-    label end time > sample cutoff
+    feature_asof <= sample cutoff
+    feature_available_at <= sample cutoff
+    feature_asof < label end date <= sample cutoff
+    label end date <= label availability <= sample cutoff
+    label availability is independently proven (label pit_status = verified)
+    conflicting labels for one logical sample identity fail closed
     future feature != available feature
+    future label != matured label
     unknown availability != available
     missing != 0
     stale != current
@@ -96,8 +101,11 @@ EXCLUSION_REASONS = (
     "missing_label",
     "immature_label",
     "invalid_label_time",
+    "future_label",
+    "unproven_label_pit",
     "future_or_invalid_asof",
     "duplicate_sample",
+    "ambiguous_label",
     "unsupported_horizon_semantics",
     "overlapping_label_purged",
 )
@@ -655,17 +663,43 @@ _RETURN_FIELDS = (
     "forward_return_pct",
     "label_available_at",
     "horizon_semantics",
+    "pit_status",
     "source",
     "source_version",
+    "contract_version",
     "provenance_json",
 )
 
 
-def _read_alpha_evidence(conn: sqlite3.Connection, max_rows: Optional[int] = None) -> list:
-    """Read persisted adaptive-alpha evidence into candidate dicts.
+def _evidence_order_clause(sample_columns: set, return_columns: set) -> str:
+    """Fully deterministic bounded-read order.
 
-    Persistence only -- never a provider call.  The join is stable-ordered so
-    a bounded read is deterministic as well.
+    Ambiguity is refused regardless, but a *bounded* read still has to be
+    stable: a nondeterministic window would hand two runs of the same database
+    a different slice of rows and quietly break reproducibility.  Only columns
+    that actually exist are referenced, so a partial legacy/test database does
+    not raise here.
+    """
+    fields = []
+    if "profile_date" in sample_columns:
+        fields.append("s.profile_date")
+    if "code" in sample_columns:
+        fields.append("s.code")
+    for name in ("horizon", "end_date", "label_available_at", "forward_return_pct"):
+        if name in return_columns:
+            fields.append(f"r.{name}")
+    return ", ".join(fields) if fields else "1"
+
+
+def _read_alpha_evidence_page(
+    conn: sqlite3.Connection, max_rows: Optional[int] = None
+) -> tuple:
+    """Read evidence with an explicit truncation verdict.
+
+    Persistence only -- never a provider call.  Reads ``max_rows + 1`` rows so a
+    dataset that is *exactly* ``max_rows`` long is not mistaken for a truncated
+    one; the returned list still never exceeds ``max_rows``.  Returns
+    ``(evidence, truncated)``.
 
     ``LEFT JOIN`` on purpose: a sample whose forward label has not been
     recorded yet must still be *audited* as excluded (``missing_label``).
@@ -674,7 +708,7 @@ def _read_alpha_evidence(conn: sqlite3.Connection, max_rows: Optional[int] = Non
     sample_columns = _table_columns(conn, ALPHA_SAMPLE_TABLE)
     return_columns = _table_columns(conn, ALPHA_RETURN_TABLE)
     if not sample_columns or not return_columns:
-        return []
+        return [], False
 
     sample_select = ", ".join(
         [_select(sample_columns, name, name, "s") for name in _SAMPLE_FIELDS]
@@ -682,21 +716,24 @@ def _read_alpha_evidence(conn: sqlite3.Connection, max_rows: Optional[int] = Non
     return_select = ", ".join(
         [_select(return_columns, name, f"r_{name}", "r") for name in _RETURN_FIELDS]
     )
+    order_clause = _evidence_order_clause(sample_columns, return_columns)
     limit_clause = ""
     args: tuple = ()
+    fetch_limit = None
     if max_rows is not None and int(max_rows) > 0:
+        fetch_limit = int(max_rows) + 1
         limit_clause = " LIMIT ?"
-        args = (int(max_rows),)
+        args = (fetch_limit,)
     sql = f"""
         SELECT {sample_select}, {return_select}
           FROM {ALPHA_SAMPLE_TABLE} s
           LEFT JOIN {ALPHA_RETURN_TABLE} r
             ON r.start_date = s.profile_date AND r.code = s.code
-         ORDER BY s.profile_date, s.code, r.horizon{limit_clause}
+         ORDER BY {order_clause}{limit_clause}
     """
     raw_rows = _rows_as_dicts(conn, sql, args)
     if not raw_rows:
-        return []
+        return [], False
 
     evidence = []
     for record in raw_rows:
@@ -704,7 +741,60 @@ def _read_alpha_evidence(conn: sqlite3.Connection, max_rows: Optional[int] = Non
         sample["sample_features"] = {name: record.get(name) for name in DEFAULT_ALPHA_FEATURES}
         label = {name: record.get(f"r_{name}") for name in _RETURN_FIELDS}
         evidence.append({"sample": sample, "label": label})
+
+    truncated = fetch_limit is not None and len(evidence) > int(max_rows)
+    if truncated:
+        evidence = evidence[: int(max_rows)]
+    return evidence, truncated
+
+
+def _read_alpha_evidence(conn: sqlite3.Connection, max_rows: Optional[int] = None) -> list:
+    """Backwards-compatible read that returns only the evidence rows."""
+    evidence, _truncated = _read_alpha_evidence_page(conn, max_rows=max_rows)
     return evidence
+
+
+def _label_identity(evidence: Mapping[str, Any]) -> Optional[tuple]:
+    """Logical learning-sample identity of one candidate.
+
+    Deliberately *not* the storage primary key: the returns table keys rows by
+    ``(start_date, end_date, horizon, code)``, so two rows that differ only by
+    ``end_date`` are distinct storage rows describing the *same* logical sample.
+    """
+    sample = dict(evidence.get("sample") or {})
+    label = dict(evidence.get("label") or {})
+    feature_asof = _date_text(sample.get("feature_asof")) or _date_text(sample.get("profile_date"))
+    if feature_asof is None:
+        return None
+    horizon_value = _finite(label.get("horizon"))
+    if horizon_value is None or horizon_value <= 0:
+        return None
+    return (
+        _text(sample.get("source")) or DATASET_KIND_ADAPTIVE_ALPHA,
+        feature_asof,
+        _text(sample.get("code")) or "",
+        int(horizon_value),
+    )
+
+
+def _ambiguous_identities(evidence: Sequence[Mapping[str, Any]]) -> frozenset:
+    """Identities whose candidates disagree about the forward-label endpoint.
+
+    Conflict is *not* resolved by picking one -- not first, not last, not
+    ``MIN``/``MAX``, not rowid.  Every candidate under such an identity is
+    refused, so the verdict can never depend on SQLite row order.
+    """
+    endpoints: dict = {}
+    for item in evidence:
+        identity = _label_identity(item)
+        if identity is None:
+            continue
+        label = dict(item.get("label") or {})
+        endpoint = _date_text(label.get("end_date"))
+        if endpoint is None:
+            continue
+        endpoints.setdefault(identity, set()).add(endpoint)
+    return frozenset(identity for identity, seen in endpoints.items() if len(seen) > 1)
 
 
 def _classify(evidence: Mapping[str, Any], *, cutoff: str, feature_names: Sequence[str]) -> tuple:
@@ -774,7 +864,7 @@ def _classify(evidence: Mapping[str, Any], *, cutoff: str, feature_names: Sequen
         # the profile date back in).  Still strict-excluded.
         return None, "legacy_unproven_pit"
 
-    # ── labels: ordering and maturity, fail closed. ──
+    # ── labels: ordering, maturity and provenance, fail closed. ──
     label_start = _date_text(label.get("start_date"))
     label_end = _date_text(label.get("end_date"))
     if label_start is None or label_end is None:
@@ -787,6 +877,19 @@ def _classify(evidence: Mapping[str, Any], *, cutoff: str, feature_names: Sequen
         return None, "immature_label"
     if (_instant(label_available) or "") < (_instant(label_end) or ""):
         return None, "invalid_label_time"
+    # A label that matures (or becomes publishable) after the cutoff did not
+    # exist yet at cutoff time.  Rebuilding a past dataset must never import a
+    # future outcome, and this is never repaired by clamping or back-dating.
+    cutoff_instant = _cutoff_instant(cutoff) or ""
+    if (_instant(label_end) or "") > cutoff_instant:
+        return None, "future_label"
+    if (_instant(label_available) or "") > cutoff_instant:
+        return None, "future_label"
+    # Availability being *present* is not proof that it was *verified*.  An
+    # endpoint that inherits a timestamp from a legacy/unknown row must not
+    # launder that into a trusted label.
+    if _text(label.get("pit_status")) != PIT_VERIFIED:
+        return None, "unproven_label_pit"
 
     return (
         CanonicalSample(
@@ -939,6 +1042,12 @@ def label_spec(horizon_semantics: str = HORIZON_SEMANTICS_OBSERVED_PROFILE_STEPS
         "label_available_field": "label_available_at",
         "requires_mature_label": True,
         "label_end_must_exceed_feature_asof": True,
+        # Maturity is only half of the label contract: the endpoint must also
+        # be inside the cutoff and its availability independently proven.
+        "label_end_must_not_exceed_cutoff": True,
+        "label_availability_must_not_exceed_cutoff": True,
+        "label_pit_must_be_verified": True,
+        "conflicting_labels_for_same_identity_fail_closed": True,
         "observed_step_is_not_certified_session": True,
     }
 
@@ -1006,6 +1115,7 @@ class DatasetBuild:
     purge_counts: dict
     manifest: dict
     fingerprint: str
+    truncated: bool = False
 
     @property
     def eligible_rows(self) -> int:
@@ -1156,11 +1266,19 @@ def build_dataset(
     spec = _normalize_split_spec(split_spec)
     features = tuple(str(name) for name in feature_names)
 
-    evidence = _read_alpha_evidence(conn, max_rows=max_evidence_rows)
+    evidence, truncated = _read_alpha_evidence_page(conn, max_rows=max_evidence_rows)
+    ambiguous = _ambiguous_identities(evidence)
     exclusions = {reason: 0 for reason in EXCLUSION_REASONS}
     accepted = []
     seen = set()
     for item in evidence:
+        if _label_identity(item) in ambiguous:
+            # Two candidates claim the same logical sample but disagree about
+            # the label endpoint.  Picking one -- first, last, MIN or MAX --
+            # would make the dataset depend on SQLite row order, so all of
+            # them are refused instead.
+            exclusions["ambiguous_label"] = exclusions.get("ambiguous_label", 0) + 1
+            continue
         sample, reason = _classify(item, cutoff=cutoff_date, feature_names=features)
         if reason is not None:
             exclusions[reason] = exclusions.get(reason, 0) + 1
@@ -1198,6 +1316,7 @@ def build_dataset(
         purge_counts=purge_counts,
         manifest=manifest,
         fingerprint=manifest["dataset_fingerprint"],
+        truncated=truncated,
     )
 
 
@@ -1265,9 +1384,7 @@ def contract_status(
     status["horizon_semantics"] = build.horizon_semantics
     status["min_label_end_date"] = build.manifest["min_label_end_date"]
     status["max_label_end_date"] = build.manifest["max_label_end_date"]
-    status["truncated"] = bool(
-        max_evidence_rows is not None and build.manifest["source_row_count"] >= int(max_evidence_rows)
-    )
+    status["truncated"] = bool(build.truncated)
 
     blockers = status["dataset_blockers"]
     if not build.fingerprint:

@@ -86,15 +86,19 @@ def seed_sample(conn, profile_date, code="000001", *, asof="auto", available="au
     )
 
 
-def seed_label(conn, start, end, horizon=1, code="000001", ret=1.0, available="auto"):
+def seed_label(conn, start, end, horizon=1, code="000001", ret=1.0, available="auto", pit="auto"):
+    """Insert one forward label.  ``pit='auto'`` means "verified"; pass an
+    explicit status (or ``None``) to model an endpoint whose provenance is not
+    proven."""
     availability = f"{end}T15:15:00" if available == "auto" else available
+    status = LD.PIT_VERIFIED if pit == "auto" else pit
     conn.execute(
         """INSERT OR IGNORE INTO adaptive_alpha_returns(
                start_date,end_date,horizon,code,forward_return_pct,created_at,
                label_available_at,horizon_semantics,pit_status,source,source_version,contract_version)
            VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
         (start, end, horizon, code, ret, f"{end}T16:00:00", availability,
-         LD.HORIZON_SEMANTICS_OBSERVED_PROFILE_STEPS, LD.PIT_VERIFIED,
+         LD.HORIZON_SEMANTICS_OBSERVED_PROFILE_STEPS, status,
          LD.DATASET_KIND_ADAPTIVE_ALPHA, "test-v1", LD.CONTRACT_VERSION),
     )
 
@@ -255,6 +259,72 @@ class LabelContractTests(DbTestCase):
         built = build(conn)
         self.assertEqual(built.eligible_rows, 0)
         self.assertEqual(reasons(built).get("invalid_label_time"), 1)
+
+    # ── A. a label that matures after the cutoff is a *future* label ──
+
+    def test_label_end_after_cutoff_is_a_future_label(self):
+        conn = self.new_db()
+        seed_sample(conn, "2026-01-01")
+        seed_label(conn, "2026-01-01", "2026-01-20")
+        built = build(conn, cutoff="2026-01-10")
+        self.assertEqual(built.eligible_rows, 0)
+        self.assertEqual(reasons(built).get("future_label"), 1)
+
+    def test_label_availability_after_cutoff_is_a_future_label(self):
+        conn = self.new_db()
+        seed_sample(conn, "2026-01-01")
+        # Endpoint is inside the cutoff, but it only became available later.
+        seed_label(conn, "2026-01-01", "2026-01-05", available="2026-01-20T15:15:00")
+        built = build(conn, cutoff="2026-01-10")
+        self.assertEqual(built.eligible_rows, 0)
+        self.assertEqual(reasons(built).get("future_label"), 1)
+
+    def test_label_available_equal_to_cutoff_is_allowed(self):
+        conn = self.new_db()
+        seed_sample(conn, "2026-01-01")
+        seed_label(conn, "2026-01-01", "2026-01-05", available="2026-01-10T15:15:00")
+        built = build(conn, cutoff="2026-01-10")
+        self.assertEqual(built.eligible_rows, 1, reasons(built))
+
+    def test_future_label_is_purged_not_clamped(self):
+        """The builder must exclude, never back-date the endpoint to cutoff."""
+        conn = self.new_db()
+        seed_sample(conn, "2026-01-01")
+        seed_label(conn, "2026-01-01", "2026-01-20")
+        built = build(conn, cutoff="2026-01-10")
+        self.assertEqual(all_rows(built), [])
+        self.assertIsNone(built.manifest["max_label_end_date"])
+
+    # ── B. label provenance must be independently proven ──
+
+    def test_unproven_label_pit_is_excluded(self):
+        conn = self.new_db()
+        seed_sample(conn, "2026-01-01")
+        seed_label(conn, "2026-01-01", "2026-01-02", pit=LD.PIT_LEGACY_UNPROVEN)
+        built = build(conn)
+        self.assertEqual(built.eligible_rows, 0)
+        self.assertEqual(reasons(built).get("unproven_label_pit"), 1)
+
+    def test_every_non_verified_label_pit_state_is_excluded(self):
+        for status in (LD.PIT_LEGACY_UNPROVEN, LD.PIT_UNPROVEN, LD.PIT_UNKNOWN,
+                       LD.PIT_FUTURE, None, "bogus"):
+            with self.subTest(status=status):
+                conn = self.new_db()
+                seed_sample(conn, "2026-01-01")
+                seed_label(conn, "2026-01-01", "2026-01-02", pit=status)
+                built = build(conn)
+                self.assertEqual(built.eligible_rows, 0, status)
+                self.assertEqual(reasons(built).get("unproven_label_pit"), 1, status)
+
+    def test_label_availability_timestamp_alone_does_not_imply_verified(self):
+        """A present timestamp is not provenance: verified is required."""
+        conn = self.new_db()
+        seed_sample(conn, "2026-01-01")
+        seed_label(conn, "2026-01-01", "2026-01-02",
+                   available="2026-01-02T15:15:00", pit=None)
+        built = build(conn)
+        self.assertEqual(built.eligible_rows, 0)
+        self.assertEqual(reasons(built).get("unproven_label_pit"), 1)
 
     def test_missing_target_is_excluded_not_zero_filled(self):
         conn = self.new_db()
@@ -615,29 +685,141 @@ class ExclusionAuditTests(DbTestCase):
         self.assertEqual(audit["legacy_unproven_pit"], 1)
         self.assertEqual(built.manifest["excluded_row_count"], sum(audit.values()))
 
-    def test_duplicate_sample_is_audited(self):
+    def test_conflicting_label_endpoints_fail_closed(self):
+        """Same logical identity, two endpoints -> refuse both.
+
+        The previous assertion here (``assertGreaterEqual(count, 0)``) was
+        vacuously true, so it proved nothing.  This fixes real behaviour:
+        neither endpoint may enter the dataset, and the audit must say why.
+        """
         conn = self.new_db()
         seed_sample(conn, "2026-01-01")
-        conn.execute(
-            "UPDATE adaptive_alpha_samples SET code=code WHERE profile_date='2026-01-01'"
-        )
-        # Two labels for the same (start, horizon) pair collapse to one key.
-        seed_label(conn, "2026-01-01", "2026-01-02", 1)
-        conn.execute(
-            """INSERT OR IGNORE INTO adaptive_alpha_returns(
-                   start_date,end_date,horizon,code,forward_return_pct,created_at,
-                   label_available_at,horizon_semantics,pit_status)
-               VALUES('2026-01-01','2026-01-02',1,'000001',2.0,'x','2026-01-02T15:15:00',?,'verified')""",
-            (LD.HORIZON_SEMANTICS_OBSERVED_PROFILE_STEPS,),
-        )
+        seed_label(conn, "2026-01-01", "2026-01-02", 1, ret=1.0)
+        seed_label(conn, "2026-01-01", "2026-01-03", 1, ret=2.0)
         built = build(conn)
-        self.assertGreaterEqual(built.manifest["exclusion_reasons"]["duplicate_sample"], 0)
+        self.assertEqual(built.eligible_rows, 0)
+        self.assertEqual(reasons(built).get("ambiguous_label"), 2)
+        self.assertEqual(built.manifest["exclusion_reasons"]["duplicate_sample"], 0)
 
     def test_source_row_count_matches_evidence_read(self):
         conn = self.new_db()
         seed_series(conn, dates(6), horizons=(1,))
         built = build(conn)
         self.assertEqual(built.manifest["source_row_count"], len(LD._read_alpha_evidence(conn)))
+
+
+class AmbiguousLabelTests(DbTestCase):
+    """Conflicting label endpoints must fail closed, order-independently.
+
+    ``adaptive_alpha_returns`` is keyed by ``(start_date, end_date, horizon,
+    code)``, so the database legitimately allows two rows that describe the
+    *same* logical sample (same source/asof/code/horizon) with different
+    endpoints.  Neither may win by accident of storage order.
+    """
+
+    def _seed_conflict(self, conn, order=("A", "B")):
+        seed_sample(conn, "2026-01-01")
+        endpoints = {"A": ("2026-01-02", 1.0), "B": ("2026-01-03", 2.0)}
+        for key in order:
+            end, ret = endpoints[key]
+            seed_label(conn, "2026-01-01", end, 1, ret=ret)
+
+    def test_conflict_is_never_resolved_by_picking_an_endpoint(self):
+        conn = self.new_db()
+        self._seed_conflict(conn)
+        built = build(conn)
+        self.assertEqual(built.eligible_rows, 0)
+        self.assertEqual(built.manifest["eligible_row_count"], 0)
+        self.assertIsNone(built.manifest["max_label_end_date"])
+        self.assertIsNone(built.manifest["min_label_end_date"])
+
+    def test_conflicting_endpoints_are_all_audited(self):
+        conn = self.new_db()
+        self._seed_conflict(conn)
+        built = build(conn)
+        # Counting unit: one per refused *candidate evidence row* (two rows
+        # here), not one per identity.
+        self.assertEqual(reasons(built).get("ambiguous_label"), 2)
+
+    def test_insertion_order_does_not_change_the_verdict(self):
+        forward, reverse = self.new_db(), self.new_db()
+        self._seed_conflict(forward, order=("A", "B"))
+        self._seed_conflict(reverse, order=("B", "A"))
+        first, second = build(forward), build(reverse)
+        self.assertEqual(first.fingerprint, second.fingerprint)
+        self.assertEqual(reasons(first), reasons(second))
+        self.assertEqual(all_rows(first), [])
+        self.assertEqual(all_rows(second), [])
+
+    def test_ambiguous_identity_does_not_leak_into_a_sibling_identity(self):
+        conn = self.new_db()
+        seed_sample(conn, "2026-01-01")
+        # Same start/horizon, different code -> a *different* logical sample,
+        # so the conflict on 000001 must not poison 000002.
+        seed_label(conn, "2026-01-01", "2026-01-02", 1, code="000001")
+        seed_label(conn, "2026-01-01", "2026-01-03", 1, code="000001")
+        seed_sample(conn, "2026-01-01", "000002")
+        seed_label(conn, "2026-01-01", "2026-01-02", 1, code="000002")
+        built = build(conn)
+        self.assertEqual(reasons(built).get("ambiguous_label"), 2)
+        self.assertEqual(built.eligible_rows, 1)
+        self.assertEqual([row.code for row in all_rows(built)], ["000002"])
+
+
+class LabelPitInheritanceTests(DbTestCase):
+    """A matured label may only inherit provenance from a *proven* endpoint."""
+
+    def _engine(self):
+        try:
+            import adaptive_engine as AE  # noqa: E402
+        except Exception as exc:  # pragma: no cover - environment dependent
+            raise unittest.SkipTest(f"adaptive_engine unavailable: {exc}") from exc
+        return AE
+
+    def _mature(self, conn):
+        self._engine()._mature_alpha_returns(conn)
+        return conn.execute(
+            """SELECT pit_status, label_available_at FROM adaptive_alpha_returns
+                WHERE start_date='2026-01-01' AND end_date='2026-01-02' AND horizon=1"""
+        ).fetchone()
+
+    def test_verified_endpoint_yields_a_verified_label(self):
+        conn = self.new_db()
+        seed_sample(conn, "2026-01-01")
+        seed_sample(conn, "2026-01-02")
+        row = self._mature(conn)
+        self.assertIsNotNone(row)
+        self.assertEqual(row[0], LD.PIT_VERIFIED)
+
+    def test_unproven_endpoint_cannot_yield_a_verified_label(self):
+        conn = self.new_db()
+        seed_sample(conn, "2026-01-01")
+        # Availability timestamp present, provenance only legacy.
+        seed_sample(conn, "2026-01-02", available="2026-01-02T15:15:00",
+                    pit=LD.PIT_LEGACY_UNPROVEN)
+        row = self._mature(conn)
+        self.assertIsNotNone(row)
+        self.assertNotEqual(row[0], LD.PIT_VERIFIED)
+        self.assertEqual(row[0], LD.PIT_LEGACY_UNPROVEN)
+
+    def test_endpoint_without_availability_stays_unproven(self):
+        conn = self.new_db()
+        seed_sample(conn, "2026-01-01")
+        seed_sample(conn, "2026-01-02", available=None)
+        row = self._mature(conn)
+        self.assertIsNotNone(row)
+        self.assertEqual(row[0], LD.PIT_LEGACY_UNPROVEN)
+        self.assertIsNone(row[1])
+
+    def test_unproven_label_is_refused_by_the_dataset_builder(self):
+        conn = self.new_db()
+        seed_sample(conn, "2026-01-01")
+        seed_sample(conn, "2026-01-02", available="2026-01-02T15:15:00",
+                    pit=LD.PIT_LEGACY_UNPROVEN)
+        self._mature(conn)
+        built = build(conn)
+        self.assertEqual(reasons(built).get("unproven_label_pit"), 1)
+        self.assertEqual(built.eligible_rows, 0)
 
 
 class SchemaMigrationTests(DbTestCase):
@@ -781,6 +963,43 @@ class ContractStatusTests(DbTestCase):
         status = LD.contract_status(conn, max_evidence_rows=1)
         self.assertTrue(status["truncated"])
         self.assertIn("dataset_evidence_read_truncated", status["dataset_blockers"])
+
+    # ── D. an evidence set that is exactly the limit is not truncated ──
+
+    def test_exact_evidence_count_is_not_reported_as_truncated(self):
+        conn = self.new_db()
+        seed_series(conn, dates(12), horizons=(1,))
+        total = len(LD._read_alpha_evidence(conn))
+        self.assertGreater(total, 0)
+        built = build(conn, max_evidence_rows=total)
+        self.assertFalse(built.truncated)
+        self.assertEqual(built.manifest["source_row_count"], total)
+        status = LD.contract_status(conn, max_evidence_rows=total)
+        self.assertFalse(status["truncated"])
+        self.assertNotIn("dataset_evidence_read_truncated", status["dataset_blockers"])
+
+    def test_one_row_over_the_limit_is_reported_as_truncated(self):
+        conn = self.new_db()
+        seed_series(conn, dates(12), horizons=(1,))
+        total = len(LD._read_alpha_evidence(conn))
+        built = build(conn, max_evidence_rows=total - 1)
+        self.assertTrue(built.truncated)
+        self.assertEqual(built.manifest["source_row_count"], total - 1)
+        status = LD.contract_status(conn, max_evidence_rows=total - 1)
+        self.assertTrue(status["truncated"])
+        self.assertIn("dataset_evidence_read_truncated", status["dataset_blockers"])
+
+    def test_truncation_check_does_not_depend_on_a_full_count(self):
+        """The bounded read must use LIMIT max+1, not a separate COUNT(*)."""
+        conn = self.new_db()
+        seed_series(conn, dates(12), horizons=(1,))
+        total = len(LD._read_alpha_evidence(conn))
+        evidence, truncated = LD._read_alpha_evidence_page(conn, max_rows=total)
+        self.assertEqual(len(evidence), total)
+        self.assertFalse(truncated)
+        evidence, truncated = LD._read_alpha_evidence_page(conn, max_rows=total - 1)
+        self.assertEqual(len(evidence), total - 1)
+        self.assertTrue(truncated)
 
     def test_contract_status_never_writes_a_manifest(self):
         conn = self.new_db()
