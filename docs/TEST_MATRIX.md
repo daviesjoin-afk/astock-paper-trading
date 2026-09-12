@@ -22,9 +22,9 @@
 | 场景 | 实现位置 | 正向用例 | 拒绝用例 | 状态 |
 | --- | --- | --- | --- | --- |
 | 快照页缺失 → fail-closed | `data_fetcher.fetch_market_snapshot` / `_fetch_clist` | `test_full_market_snapshot_fails_closed_on_partial_pages`（正向=完整时通过） | 同用例（partial → `[]`） | ✅ |
-| 全市场行数不足（`ASTOCK_FULL_MARKET_MIN_ROWS`） | `data_fetcher._full_market_min_rows` + 快照完整性门禁 | demo 模式阈值=1（`test_demo_seed`） | 部分页 → `complete=False`（同上） | ✅ |
-| 行情陈旧（stale quote） | 撮合端：`quote_at` 新鲜度门禁（`paper_trading` data_quality/`_market_state`） | demo：正常价成交 | demo：陈旧报价拒单（`test_demo_seed` 叙事 + golden replay 锁定） | ✅（撮合端）；数据层独立用例待补 |
-| 双源交叉容差（价格/成交量） | `data_fetcher` 交叉核验（`cross-source` `quote_validation`） | demo 叙事正常成交 | — | ⚠️ 状态位已落 audit；独立容差单测待补 |
+| 全市场行数/唯一代码覆盖不足（`ASTOCK_FULL_MARKET_MIN_ROWS`） | `data_fetcher._full_snapshot_payload_is_complete` / `_full_market_min_rows` | `test_full_market_snapshot_contract_accepts_complete_coverage` | `test_full_market_snapshot_contract_rejects_row_or_unique_code_shortfall` | ✅ |
+| 行情陈旧（stale quote） | `data_fetcher._fresh_full_snapshot_from_disk` 内容时间戳门禁 | `test_full_market_disk_cache_accepts_fresh_content_timestamp` | `test_full_market_disk_cache_rejects_stale_content_timestamp` | ✅ |
+| 双源交叉容差（价格/涨跌幅） | `paper_trading._quotes`（`cross-source` `quote_validation`） | `test_quote_cross_check_accepts_values_within_tolerance` | `test_quote_cross_check_rejects_price_gap_over_tolerance`、`test_quote_cross_check_rejects_pct_gap_over_tolerance` | ✅ |
 | 来源健康状态/熔断 | `marketdata_transport`（timeout/retries/腾讯熔断）+ `data_source_health.json` + `/api` 暴露 | `test_source_health_round_trip`、`test_missing_source_health_is_empty` | 熔断打开时回退备用源（引擎路径） | ✅（状态与暴露）；熔断行为单测待补 |
 
 ## 撮合执行层
