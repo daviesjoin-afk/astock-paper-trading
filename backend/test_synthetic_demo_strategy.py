@@ -43,7 +43,7 @@ class SyntheticDemoStrategyTests(unittest.TestCase):
     def test_demo_exercises_entry_risk_and_exit_contracts(self):
         payload = DEMO.run_demo()
         self.assertTrue(payload["entry"]["opening_event"])
-        self.assertTrue(payload["entry"]["entry_economics"])
+        self.assertIsInstance(payload["entry"]["entry_economics"], dict)
         self.assertIn("hard_limits", payload["risk"])
         self.assertIn("soft_limits", payload["risk"])
         self.assertTrue(payload["exit"]["intraday_downside"])
