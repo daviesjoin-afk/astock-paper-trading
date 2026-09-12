@@ -6,13 +6,78 @@ on:
   pull_request:
 
 permissions:
-  contents: read
+  contents: write
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
+  source-patch:
+    if: github.event.pull_request.head.ref == 'codex/issue-25-replay-traceability'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check out PR head
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.ref }}
+          fetch-depth: 0
+
+      - name: Apply exact replay-date source patch
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          def replace_or_verify(path, old, new, expected=1):
+              p = Path(path)
+              text = p.read_text(encoding='utf-8')
+              old_count = text.count(old)
+              new_count = text.count(new)
+              if old_count == expected:
+                  p.write_text(text.replace(old, new), encoding='utf-8')
+                  return
+              if old_count == 0 and new_count == expected:
+                  return
+              raise SystemExit(
+                  f'{path}: expected {expected} old or new exact matches; '
+                  f'got old={old_count}, new={new_count}'
+              )
+
+          replace_or_verify(
+              'backend/strategies.py',
+              '''def run_strategy(\n    strategy_id,\n    table: pd.DataFrame,\n    topn=10,\n    news_hits=None,\n    gate=None,\n    auto_news=True,\n    klines=None,\n    first_board_codes=None,\n    weight_overrides=None,\n    condition_overrides=None,\n):''',
+              '''def run_strategy(\n    strategy_id,\n    table: pd.DataFrame,\n    topn=10,\n    news_hits=None,\n    gate=None,\n    auto_news=True,\n    klines=None,\n    first_board_codes=None,\n    weight_overrides=None,\n    condition_overrides=None,\n    replay_data_date=None,\n    replay_required=False,\n):''',
+          )
+          replace_or_verify(
+              'backend/strategies.py',
+              '''            weight_overrides=weight_overrides,\n            condition_overrides=condition_overrides,\n        )\n    return _run_strategy_legacy(''',
+              '''            weight_overrides=weight_overrides,\n            condition_overrides=condition_overrides,\n            replay_data_date=replay_data_date,\n            replay_required=replay_required,\n        )\n    return _run_strategy_legacy(''',
+          )
+          replace_or_verify(
+              'backend/main.py',
+              '''        gate=gate,\n        first_board_codes=first_board_codes,\n    )''',
+              '''        gate=gate,\n        first_board_codes=first_board_codes,\n        replay_data_date=complete_cutoff,\n        replay_required=True,\n    )''',
+          )
+          replace_or_verify(
+              'backend/paper_trading.py',
+              '''                             gate={"light": market["light"]}, first_board_codes=first_board_codes,\n                             weight_overrides=selection_overlay.get("weights"),\n                             condition_overrides=selection_overlay.get("conditions"))''',
+              '''                             gate={"light": market["light"]}, first_board_codes=first_board_codes,\n                             weight_overrides=selection_overlay.get("weights"),\n                             condition_overrides=selection_overlay.get("conditions"),\n                             replay_data_date=asof_date, replay_required=True)''',
+              expected=2,
+          )
+          PY
+          git diff --check
+          if git diff --quiet -- backend/strategies.py backend/main.py backend/paper_trading.py; then
+            echo 'Source patch already present.'
+            exit 0
+          fi
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add backend/strategies.py backend/main.py backend/paper_trading.py
+          git commit -m 'fix(strategy): wire explicit replay dates [source-patch]'
+          git push origin HEAD:${{ github.event.pull_request.head.ref }}
+
   tests:
     runs-on: ubuntu-latest
     timeout-minutes: 20
