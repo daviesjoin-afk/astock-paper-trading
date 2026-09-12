@@ -43,7 +43,7 @@ class SyntheticDemoStrategyTests(unittest.TestCase):
     def test_demo_exercises_entry_risk_and_exit_contracts(self):
         payload = DEMO.run_demo()
         self.assertTrue(payload["entry"]["opening_event"])
-        self.assertIsInstance(payload["entry"]["entry_economics"], dict)
+        self.assertTrue(payload["entry"]["entry_economics"])
         self.assertIn("hard_limits", payload["risk"])
         self.assertIn("soft_limits", payload["risk"])
         self.assertTrue(payload["exit"]["intraday_downside"])
@@ -65,6 +65,13 @@ class SyntheticDemoStrategyTests(unittest.TestCase):
         plugin = DEMO.build_demo_plugin()
         with self.assertRaisesRegex(ValueError, "missing column: quality"):
             plugin.select_candidates(table, topn=2)
+
+    def test_collision_does_not_unregister_preexisting_plugin(self):
+        existing = DEMO.build_demo_plugin()
+        PLUGINS.register_plugin(existing)
+        with self.assertRaisesRegex(RuntimeError, "already registered"):
+            DEMO.run_demo()
+        self.assertIs(PLUGINS.get_plugin(DEMO.DEMO_STRATEGY_ID), existing)
 
 
 if __name__ == "__main__":
