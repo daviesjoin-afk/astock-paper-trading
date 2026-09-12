@@ -70,6 +70,27 @@
 | Docker 冒烟（`--network none` + tmpfs 跑全量离线测试层 + 健康端点） | `Dockerfile`、`docker-compose*.yml` | CI `docker-smoke` 作业 | ✅ |
 | 仓库卫生与文档链接（无断链、无废弃产物引用、无未声明依赖） | `docs/**`、根 markdown | `test_repository_hygiene.py` | ✅ |
 
+## 学习数据集契约（PR-8）
+
+| 场景 | 实现位置 | 回归用例 | 状态 |
+| --- | --- | --- | --- |
+| PIT 可用性（`feature_available_at <= cutoff`，未知/未证明一律排除） | `learning_dataset._classify`、`financial_point_in_time` | `test_learning_dataset.py`（`PitContractTests`） | ✅ |
+| PIT 时区契约（canonical UTC instant；date-only cutoff = 中国市场自然日结束 `T15:59:59Z`；naive 按 UTC+08:00；不依赖机器 local tz） | `learning_dataset._timestamp_text`、`_instant`、`_cutoff_instant`、`_canonical_instant` | `test_learning_dataset.py`（`TimezoneContractTests`） | ✅ |
+| Canonical provenance 保留字段（raw evidence provenance 不得覆盖 `availability_clock` / `sample_contract_version` / `label_source` / `label_source_version` / `industry` / `regime`；非保留审计字段保留） | `learning_dataset._canonical_provenance`、`CANONICAL_RESERVED_PROVENANCE_KEYS` | `test_learning_dataset.py`（`CanonicalProvenanceTests`） | ✅ |
+| 标签成熟度与 cutoff（`feature_asof < label_end_date <= cutoff`；cutoff 之后成熟/可用判 `future_label`，不 clamp/不回填） | `learning_dataset._classify` | `test_learning_dataset.py`（`LabelContractTests`） | ✅ |
+| 标签 PIT 独立 fail-closed（`label pit_status = verified` 才准入；时间戳存在 ≠ provenance 已证明；未证明终点不得继承为 verified） | `learning_dataset._classify`、`adaptive_engine._mature_alpha_returns` | `test_learning_dataset.py`（`LabelContractTests`、`LabelPitInheritanceTests`） | ✅ |
+| 冲突 label fail-closed（同一逻辑身份多 endpoint 全部排除，与插入顺序无关） | `learning_dataset._ambiguous_identities` | `test_learning_dataset.py`（`AmbiguousLabelTests`、`ExclusionAuditTests`） | ✅ |
+| 时间序切分与跨界标签 purge（train→validation、validation→test） | `learning_dataset.chronological_split` | `test_learning_dataset.py`（`SplitPurgeTests`） | ✅ |
+| 确定性指纹（同数据同 cutoff ⇒ 同 SHA-256；插入顺序无关） | `learning_dataset.dataset_fingerprint` | `test_learning_dataset.py`（`DeterminismTests`） | ✅ |
+| 指纹敏感度（特征/可用性/目标/标签终点/特征表/cutoff/切分/契约版本） | `learning_dataset.dataset_fingerprint` | `test_learning_dataset.py`（`SensitivityTests`） | ✅ |
+| 缺失/未知不插补（None / NaN / Infinity 不允许变成 0） | `learning_dataset._classify`、`_finite` | `test_learning_dataset.py`（`MissingDataTests`） | ✅ |
+| 排除审计（每次构建输出 `exclusion_reasons`，不静默丢弃） | `learning_dataset.build_manifest` | `test_learning_dataset.py`（`ExclusionAuditTests`） | ✅ |
+| 幂等迁移（旧库/空库/测试库；legacy 行标 `legacy_unproven` 不伪造） | `learning_dataset.ensure_schema` | `test_learning_dataset.py`（`SchemaMigrationTests`） | ✅ |
+| 研究就绪 ≠ 行数达标（数据契约门禁，fail-closed） | `neural_shadow._dataset_gate`、`learning_dataset.contract_status` | `test_learning_dataset.py`（`ContractStatusTests`） | ✅ |
+| 有界读取截断边界（`LIMIT max_evidence_rows + 1`，恰好等于上限不算截断；truncated 为显式字段） | `learning_dataset._read_alpha_evidence_page`、`contract_status` | `test_learning_dataset.py`（`ContractStatusTests`） | ✅ |
+| 无网络 / 无执行（只消费已持久化证据，不触碰下单与风控） | `learning_dataset` | `test_learning_dataset.py`（`NoNetworkTests`、`NoExecutionTests`） | ✅ |
+| 负向变异验证（N1–N11 必须让守卫变红；含 N7 future label、N8 ambiguous label、N9 label PIT、N10 timezone cutoff、N11 provenance override） | — | 手工执行 N1–N11 变异脚本（见 PR 描述） | ✅ |
+
 ## 维护约定
 
 1. 新增门禁必须先在本表加一行，再写测试；表格状态从 ⚠️ → ✅。

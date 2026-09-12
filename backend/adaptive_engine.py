@@ -34,6 +34,7 @@ import risk_center as paper_risk_center
 import trade_attribution
 import ai_analysis
 import factor_quality_shadow
+import learning_dataset
 import neural_shadow
 import evolution_adversarial as adversarial
 import dual_ai_tuner
@@ -307,6 +308,7 @@ def _init_schema(conn):
             news_learning.ensure_schema(conn)
             trade_attribution.ensure_schema(conn)
             ai_analysis.ensure_schema(conn)
+            learning_dataset.ensure_schema(conn)
             _ensure_config_defaults(conn)
             return
     except Exception:
@@ -525,6 +527,12 @@ def _init_schema(conn):
     news_learning.ensure_schema(conn)
     trade_attribution.ensure_schema(conn)
     ai_analysis.ensure_schema(conn)
+    # PR-8：学习数据集契约的表/列升级是纯 additive + 幂等的，旧库、空库、测试库
+    # 都能通过；失败也不阻断建表（契约层自身会 fail closed）。
+    try:
+        learning_dataset.ensure_schema(conn)
+    except Exception:
+        pass
     _ensure_config_defaults(conn)
 
 
@@ -1131,8 +1139,14 @@ def _rank_values(rows, getter, reverse=False):
 
 
 def _capture_alpha_samples(conn, profile):
-    """Persist rank-transformed daily features for future, never same-day, labels."""
-    rows, _, _ = _snapshot_rows()
+    """Persist rank-transformed daily features for future, never same-day, labels.
+
+    PR-8：同时落 provenance —— ``feature_asof``（特征描述的时点）与
+    ``feature_available_at``（证明该特征对研究者可见的时间）严格区分。
+    可见时间只取快照自身的持久化时间（``saved_at``）；取不到就写 NULL +
+    ``legacy_unproven``，绝不用 profile_date 反推或补一个猜测值。
+    """
+    rows, snapshot_saved_at, snapshot_source = _snapshot_rows()
     profile_date = profile["profile_date"]
     rows = [
         row for row in rows
@@ -1142,6 +1156,12 @@ def _capture_alpha_samples(conn, profile):
     ]
     if not rows:
         return 0
+    provenance = learning_dataset.capture_provenance(
+        available_at=snapshot_saved_at,
+        source=snapshot_source or "market_snapshot",
+        source_version=snapshot_saved_at,
+    )
+    feature_available_at = provenance["feature_available_at"]
     transforms = {
         "price_momentum": _rank_values(rows, lambda row: row.get("pct")),
         "main_flow": _rank_values(rows, lambda row: row.get("main_pct")),
@@ -1159,10 +1179,16 @@ def _capture_alpha_samples(conn, profile):
         conn.execute(
             """INSERT OR REPLACE INTO adaptive_alpha_samples(
                profile_date,code,industry,close_price,regime,price_momentum,main_flow,turnover,
-               volume_ratio,small_size,value,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
+               volume_ratio,small_size,value,created_at,
+               feature_asof,feature_available_at,pit_status,source,source_version,
+               contract_version,provenance_json)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (profile_date, str(row["code"]), str(row.get("industry") or "未分类"),
              _num(row.get("price"), 0), profile["regime"],
-             *[round(transforms[name][index], 8) for name in ALPHA_FEATURES], now),
+             *[round(transforms[name][index], 8) for name in ALPHA_FEATURES], now,
+             profile_date, feature_available_at, provenance["pit_status"], provenance["source"],
+             provenance["source_version"], provenance["contract_version"],
+             provenance["provenance_json"]),
         )
         if conn.total_changes > before:
             inserted += 1
@@ -1170,7 +1196,17 @@ def _capture_alpha_samples(conn, profile):
 
 
 def _mature_alpha_returns(conn):
-    """Mature returns with SQLite joins, never a full history Python map."""
+    """Mature returns with SQLite joins, never a full history Python map.
+
+    PR-8：``horizon`` 是"已捕获 profile 日序列的步数"，不是经交易所日历认证的
+    交易日数，故显式写 ``horizon_semantics='observed_profile_steps'``。
+    标签的可见时间取终点那一行样本的 ``feature_available_at``（同一个已持久化
+    快照的收盘观测）；取不到就保持 NULL + ``legacy_unproven``，绝不补猜。
+    只有终点样本本身已经是 ``verified``（有可解析的可用时间且 provenance 已证明）
+    时，标签才能继承为 ``verified``；时间戳存在 ≠ provenance 已证明，所以
+    ``legacy_unproven`` / ``unknown`` 的终点只能产出 ``legacy_unproven`` 标签。
+    这里不重写任何历史 horizon 数值，也不删除旧行。
+    """
     dates = [row[0] for row in conn.execute(
         "SELECT DISTINCT profile_date FROM adaptive_alpha_samples ORDER BY profile_date"
     )]
@@ -1188,16 +1224,54 @@ def _mature_alpha_returns(conn):
             before = conn.total_changes
             conn.execute(
                 """INSERT OR IGNORE INTO adaptive_alpha_returns(
-                       start_date,end_date,horizon,code,forward_return_pct,created_at)
+                       start_date,end_date,horizon,code,forward_return_pct,created_at,
+                       label_available_at,horizon_semantics,pit_status,source,source_version,
+                       contract_version)
                    SELECT ?,?,?,first.code,
-                          ROUND((last.close_price / first.close_price - 1) * 100, 8),?
+                          ROUND((last.close_price / first.close_price - 1) * 100, 8),?,
+                          last.feature_available_at,?,
+                          CASE WHEN last.feature_available_at IS NOT NULL AND last.pit_status = ?
+                               THEN ? ELSE ? END,
+                          ?,?,?
                      FROM adaptive_alpha_samples first
                      JOIN adaptive_alpha_samples last ON last.code=first.code AND last.profile_date=?
                     WHERE first.profile_date=? AND first.close_price>0 AND last.close_price>0""",
-                (start_date, end_date, horizon, _now(), end_date, start_date),
+                (start_date, end_date, horizon, _now(),
+                 learning_dataset.HORIZON_SEMANTICS_OBSERVED_PROFILE_STEPS,
+                 learning_dataset.PIT_VERIFIED,
+                 learning_dataset.PIT_VERIFIED,
+                 learning_dataset.PIT_LEGACY_UNPROVEN,
+                 learning_dataset.DATASET_KIND_ADAPTIVE_ALPHA,
+                 learning_dataset.CONTRACT_VERSION,
+                 learning_dataset.CONTRACT_VERSION,
+                 end_date, start_date),
             )
             inserted += conn.total_changes - before
     return inserted
+
+
+def _persist_research_dataset(conn, cutoff):
+    """PR-8 研究层阶段：把已持久化的证据编成不可变数据集清单。
+
+    纯研究层：只读已落库的证据，不发网络请求、不触碰成交/持仓/风控。
+    产物是内容寻址的 manifest —— 同一份数据重复构建得到同一个 fingerprint，
+    持久化走 INSERT OR IGNORE，绝不用第二次运行改写第一次记录的历史事实。
+    """
+    build = learning_dataset.build_dataset(
+        conn,
+        cutoff=cutoff,
+        code_build_identity=ENGINE_VERSION,
+        persist=True,
+    )
+    return {
+        "status": "ok",
+        "contract_version": build.contract_version,
+        "dataset_fingerprint": build.fingerprint,
+        "eligible_rows": build.eligible_rows,
+        "partition_rows": build.manifest["partition_rows"],
+        "excluded_row_count": build.manifest["excluded_row_count"],
+        "execution_authority": "none",
+    }
 
 
 def _normalize_genome(weights):
@@ -1799,11 +1873,24 @@ def run_learning_cycle(trigger="manual"):
         with _connect() as conn:
             new_alpha_returns = _mature_alpha_returns(conn)
         gc.collect()
+        # —— PR-8 研究数据集清单（研究层，确定性、只读证据、无网络）——
+        # 失败只作为"科研就绪"的阻塞项，绝不影响成交/持仓/风控路径。
+        _learning_update_stage(run_id, "learning_dataset")
+        try:
+            with _connect() as conn:
+                dataset_manifest = _persist_research_dataset(conn, profile["profile_date"])
+        except Exception as exc:
+            dataset_manifest = {
+                "status": "failed",
+                "error": f"{type(exc).__name__}: {exc}"[:200],
+            }
+        gc.collect()
         _learning_update_stage(run_id, "alpha_lab")
         with _connect() as conn:
             alpha_lab = _run_alpha_lab(conn, profile["profile_date"])
         print(f"[learning-cycle] stage1 profile+alpha done regime={profile.get('regime')} "
-              f"samples={alpha_samples} returns={new_alpha_returns} lab={alpha_lab.get('status')}", flush=True)
+              f"samples={alpha_samples} returns={new_alpha_returns} "
+              f"dataset={dataset_manifest.get('status')} lab={alpha_lab.get('status')}", flush=True)
         # —— 阶段 2：多 horizon 奖励结算（独立事务）——
         _learning_update_stage(run_id, "rewards")
         with _connect() as conn:

@@ -18,6 +18,9 @@ BENCHMARK_NAME = "CSI 300"
 HORIZONS = (1, 3, 5, 10, 20)
 MAX_TRACKING_DAYS = 20
 CHINA_TZ = dt.timezone(dt.timedelta(hours=8))
+# PR-8：``holding_days`` 记录的是"已成功记录的收盘观测次数"，不是经交易所日历
+# 认证的交易日数。字段名保留（兼容旧 API / 旧库），但语义必须显式声明。
+HOLDING_DAY_SEMANTICS = "recorded_close_observation_count"
 
 
 def _today():
@@ -461,6 +464,8 @@ def dashboard(strategy="", limit=30):
         "generated_at": dt.datetime.now(CHINA_TZ).isoformat(timespec="seconds"),
         "tracking_days": MAX_TRACKING_DAYS,
         "benchmark": BENCHMARK_NAME,
+        # PR-8：观测语义显式对齐，避免把观测次数读成"交易日"。
+        "holding_day_semantics": HOLDING_DAY_SEMANTICS,
         "kline_source": "与模拟盘共享：data_cache/klines（前复权日线）",
         "kline_source_version": getattr(dfc, "SHARED_KLINE_SOURCE_VERSION", "unknown"),
         "kline_manifest_updated_at": (max((str(item.get("updated_at")) for item in manifest.values() if item.get("updated_at")), default=None)),
