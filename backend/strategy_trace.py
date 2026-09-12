@@ -1,9 +1,10 @@
 # -*- coding: utf-8 -*-
 """Deterministic, privacy-bounded strategy candidate replay traces.
 
-A replay trace records only market/factor inputs and a small whitelist of
-selection controls. It never serializes arbitrary kwargs, account state,
-positions, credentials, or the process environment.
+Replay data is content-addressed and column-sharded. Static factor columns are
+stored once and reused by every strategy/run; only changed live columns create
+new blobs. Arbitrary kwargs, account state, positions, credentials and process
+environment data are never serialized.
 """
 from __future__ import annotations
 
@@ -21,7 +22,11 @@ from typing import Any, Iterable, Mapping
 import pandas as pd
 
 TRACE_SCHEMA = "strategy-replay-v1"
+_TABLE_SCHEMA = "strategy-replay-table-v1"
+_INDEX_SCHEMA = "strategy-replay-index-v1"
+_COLUMN_SCHEMA = "strategy-replay-column-v1"
 _GIT_HASH = re.compile(r"^[0-9a-fA-F]{7,40}$")
+_BLOB_ID = re.compile(r"^[0-9a-f]{64}$")
 _DATE_KEYS = ("last_date", "factor_date", "data_date", "historical_factor_date")
 _SAFE_SELECTION_INPUTS = {
     "topn",
@@ -62,7 +67,7 @@ def _canonical_git_hash(value: Any) -> str | None:
 
 
 def code_version(explicit: Any = None) -> str:
-    """Return the audited short git hash, without exposing other env values."""
+    """Return only the audited short git hash, never a dump of runtime env."""
     candidate = _canonical_git_hash(explicit)
     if candidate:
         return candidate
@@ -101,8 +106,11 @@ def _json_safe(value: Any) -> Any:
             return _json_safe(value.item())
         except Exception:
             pass
-    if pd.isna(value):
-        return None
+    try:
+        if pd.isna(value):
+            return None
+    except (TypeError, ValueError):
+        pass
     return str(value)
 
 
@@ -136,7 +144,6 @@ def _canonical_date(value: Any) -> str | None:
 
 
 def _selection_cache_factor_date() -> str | None:
-    """Read the same factor-cache date already validated by selection loading."""
     path = _cache_root() / "selection_cache.json"
     try:
         with path.open("r", encoding="utf-8") as handle:
@@ -170,9 +177,9 @@ def data_date(table: pd.DataFrame, explicit: Any = None) -> str:
             return next(iter(dates))
         if len(dates) > 1:
             raise ValueError(f"strategy replay refuses mixed data dates in {key}")
-    # Production build_factor_table intentionally strips the source last_date
-    # column.  The selection cache metadata is its already-validated same-source
-    # as-of contract, so it is a safe final fallback; never substitute "today".
+    # build_factor_table does not currently carry price_f.last_date forward.
+    # Its source selection_cache metadata is already validated by the loader,
+    # so this is the only allowed production fallback. Never substitute today.
     cached = _selection_cache_factor_date()
     if cached:
         return cached
@@ -189,22 +196,6 @@ def _safe_selection_inputs(kwargs: Mapping[str, Any]) -> dict[str, Any]:
     return _json_safe(selected)
 
 
-def _safe_table(table: pd.DataFrame) -> dict[str, Any]:
-    if not isinstance(table, pd.DataFrame):
-        raise TypeError("strategy replay requires a pandas DataFrame")
-    prohibited = [str(column) for column in table.columns if _field_is_prohibited(column)]
-    if prohibited:
-        raise ValueError(
-            "strategy replay refuses prohibited table columns: " + ", ".join(sorted(prohibited))
-        )
-    rows = []
-    for code, row in table.iterrows():
-        values = {str(column): _json_safe(row[column]) for column in table.columns}
-        _assert_no_prohibited_keys(values, path=f"table[{code}]")
-        rows.append({"code": str(code), "values": values})
-    return {"columns": [str(column) for column in table.columns], "rows": rows}
-
-
 def _canonical_json(value: Any) -> bytes:
     return json.dumps(
         value,
@@ -214,11 +205,104 @@ def _canonical_json(value: Any) -> bytes:
     ).encode("utf-8")
 
 
-def _snapshot_path(snapshot_id: str, trace_dir: Path | None = None) -> Path:
-    if not re.fullmatch(r"[0-9a-f]{64}", str(snapshot_id or "")):
+def _blob_path(root: Path, kind: str, blob_id: str) -> Path:
+    if kind not in {"runs", "indexes", "columns"}:
+        raise ValueError("invalid strategy replay blob kind")
+    if not _BLOB_ID.fullmatch(str(blob_id or "")):
         raise ValueError("invalid strategy replay snapshot id")
-    root = Path(trace_dir) if trace_dir is not None else _default_trace_dir()
-    return root / f"{snapshot_id}.json.gz"
+    return root / kind / f"{blob_id}.json.gz"
+
+
+def _write_blob(root: Path, kind: str, payload: Mapping[str, Any]) -> str:
+    raw = _canonical_json(payload)
+    blob_id = hashlib.sha256(raw).hexdigest()
+    path = _blob_path(root, kind, blob_id)
+    if path.exists():
+        return blob_id
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temp_name = tempfile.mkstemp(prefix=f".{blob_id}.", suffix=".tmp", dir=path.parent)
+    try:
+        with os.fdopen(fd, "wb") as raw_handle:
+            with gzip.GzipFile(filename="", fileobj=raw_handle, mode="wb", mtime=0) as handle:
+                handle.write(raw)
+            raw_handle.flush()
+            os.fsync(raw_handle.fileno())
+        os.replace(temp_name, path)
+    finally:
+        try:
+            os.unlink(temp_name)
+        except FileNotFoundError:
+            pass
+    return blob_id
+
+
+def _read_blob(root: Path, kind: str, blob_id: str) -> dict[str, Any]:
+    path = _blob_path(root, kind, blob_id)
+    with gzip.open(path, "rt", encoding="utf-8") as handle:
+        payload = json.load(handle)
+    if hashlib.sha256(_canonical_json(payload)).hexdigest() != blob_id:
+        raise ValueError("strategy replay snapshot integrity mismatch")
+    return payload
+
+
+def _validate_table(table: pd.DataFrame) -> None:
+    if not isinstance(table, pd.DataFrame):
+        raise TypeError("strategy replay requires a pandas DataFrame")
+    prohibited = [str(column) for column in table.columns if _field_is_prohibited(column)]
+    if prohibited:
+        raise ValueError(
+            "strategy replay refuses prohibited table columns: " + ", ".join(sorted(prohibited))
+        )
+
+
+def _persist_table(root: Path, table: pd.DataFrame) -> dict[str, Any]:
+    _validate_table(table)
+    index_payload = {
+        "schema": _INDEX_SCHEMA,
+        "values": [str(value) for value in table.index.tolist()],
+    }
+    index_id = _write_blob(root, "indexes", index_payload)
+    columns = []
+    for column in table.columns:
+        name = str(column)
+        values = [_json_safe(value) for value in table[column].tolist()]
+        for row_no, value in enumerate(values):
+            _assert_no_prohibited_keys(value, path=f"table.{name}[{row_no}]")
+        column_payload = {
+            "schema": _COLUMN_SCHEMA,
+            "name": name,
+            "values": values,
+        }
+        columns.append({"name": name, "blob_id": _write_blob(root, "columns", column_payload)})
+    return {
+        "schema": _TABLE_SCHEMA,
+        "row_count": len(table),
+        "index_id": index_id,
+        "columns": columns,
+    }
+
+
+def _load_table(root: Path, manifest: Mapping[str, Any]) -> pd.DataFrame:
+    if manifest.get("schema") != _TABLE_SCHEMA:
+        raise ValueError("unsupported strategy replay table schema")
+    index_payload = _read_blob(root, "indexes", str(manifest.get("index_id") or ""))
+    if index_payload.get("schema") != _INDEX_SCHEMA:
+        raise ValueError("unsupported strategy replay index schema")
+    index = [str(value) for value in index_payload.get("values") or []]
+    data: dict[str, list[Any]] = {}
+    ordered_columns = []
+    for item in manifest.get("columns") or []:
+        name = str(item.get("name") or "")
+        payload = _read_blob(root, "columns", str(item.get("blob_id") or ""))
+        if payload.get("schema") != _COLUMN_SCHEMA or payload.get("name") != name:
+            raise ValueError("strategy replay column manifest mismatch")
+        values = list(payload.get("values") or [])
+        if len(values) != len(index):
+            raise ValueError("strategy replay column length mismatch")
+        ordered_columns.append(name)
+        data[name] = values
+    table = pd.DataFrame(data, index=index)
+    return table.loc[:, ordered_columns]
 
 
 def persist_snapshot(
@@ -232,15 +316,25 @@ def persist_snapshot(
     explicit_code_version: Any = None,
     trace_dir: Path | str | None = None,
 ) -> dict[str, Any]:
-    """Persist one immutable replay input artifact and return its compact manifest."""
+    """Persist one immutable replay run manifest over deduplicated table blobs."""
     factors = tuple(str(item).strip() for item in factor_inputs if str(item).strip())
     if not factors:
         raise ValueError("strategy replay requires declared factor inputs")
+    _validate_table(table)
     missing = [factor for factor in factors if factor not in table.columns]
     if missing:
         raise ValueError(f"strategy replay factor missing from input table: {missing[0]}")
     resolved_date = data_date(table, explicit=explicit_data_date)
     resolved_version = code_version(explicit_code_version)
+    safe_inputs = _safe_selection_inputs(selection_kwargs)
+    # Validate every cell before any run manifest is committed. Harmless orphan
+    # content-addressed blobs are acceptable after a crash; sensitive data is not.
+    for column in table.columns:
+        for row_no, value in enumerate(table[column].tolist()):
+            safe = _json_safe(value)
+            _assert_no_prohibited_keys(safe, path=f"table.{column}[{row_no}]")
+    root = Path(trace_dir) if trace_dir is not None else _default_trace_dir()
+    table_manifest = _persist_table(root, table)
     snapshot = {
         "schema": TRACE_SCHEMA,
         "strategy_id": str(strategy_id),
@@ -248,28 +342,10 @@ def persist_snapshot(
         "data_date": resolved_date,
         "code_version": resolved_version,
         "factor_inputs": list(factors),
-        "selection_inputs": _safe_selection_inputs(selection_kwargs),
-        "table": _safe_table(table),
+        "selection_inputs": safe_inputs,
+        "table": table_manifest,
     }
-    raw = _canonical_json(snapshot)
-    snapshot_id = hashlib.sha256(raw).hexdigest()
-    root = Path(trace_dir) if trace_dir is not None else _default_trace_dir()
-    root.mkdir(parents=True, exist_ok=True)
-    path = _snapshot_path(snapshot_id, root)
-    if not path.exists():
-        fd, temp_name = tempfile.mkstemp(prefix=f".{snapshot_id}.", suffix=".tmp", dir=root)
-        try:
-            with os.fdopen(fd, "wb") as raw_handle:
-                with gzip.GzipFile(fileobj=raw_handle, mode="wb", mtime=0) as handle:
-                    handle.write(raw)
-                raw_handle.flush()
-                os.fsync(raw_handle.fileno())
-            os.replace(temp_name, path)
-        finally:
-            try:
-                os.unlink(temp_name)
-            except FileNotFoundError:
-                pass
+    snapshot_id = _write_blob(root, "runs", snapshot)
     return {
         "schema": TRACE_SCHEMA,
         "snapshot_id": snapshot_id,
@@ -281,29 +357,21 @@ def persist_snapshot(
 
 
 def load_snapshot(snapshot_id: str, *, trace_dir: Path | str | None = None) -> dict[str, Any]:
-    path = _snapshot_path(snapshot_id, Path(trace_dir) if trace_dir is not None else None)
-    with gzip.open(path, "rt", encoding="utf-8") as handle:
-        payload = json.load(handle)
+    root = Path(trace_dir) if trace_dir is not None else _default_trace_dir()
+    payload = _read_blob(root, "runs", snapshot_id)
     if payload.get("schema") != TRACE_SCHEMA:
         raise ValueError("unsupported strategy replay schema")
-    expected = hashlib.sha256(_canonical_json(payload)).hexdigest()
-    if expected != snapshot_id:
-        raise ValueError("strategy replay snapshot integrity mismatch")
     _assert_no_prohibited_keys(payload, path="snapshot")
     return payload
 
 
-def replay_inputs(snapshot: Mapping[str, Any]) -> tuple[pd.DataFrame, dict[str, Any]]:
-    table_payload = snapshot.get("table") or {}
-    columns = [str(column) for column in table_payload.get("columns") or []]
-    rows = table_payload.get("rows") or []
-    data = []
-    index = []
-    for item in rows:
-        index.append(str(item.get("code") or ""))
-        values = item.get("values") or {}
-        data.append([values.get(column) for column in columns])
-    table = pd.DataFrame(data, index=index, columns=columns)
+def replay_inputs(
+    snapshot: Mapping[str, Any],
+    *,
+    trace_dir: Path | str | None = None,
+) -> tuple[pd.DataFrame, dict[str, Any]]:
+    root = Path(trace_dir) if trace_dir is not None else _default_trace_dir()
+    table = _load_table(root, snapshot.get("table") or {})
     table.attrs["data_date"] = snapshot.get("data_date")
     return table, dict(snapshot.get("selection_inputs") or {})
 
@@ -331,23 +399,25 @@ def attach_candidate_traces(
     factor_inputs: Iterable[str],
     manifest: Mapping[str, Any],
 ) -> dict[str, Any]:
-    """Attach compact, human-readable provenance to each emitted candidate."""
+    """Attach compact provenance to every emitted candidate-like row."""
     factors = tuple(str(item) for item in factor_inputs)
     output = dict(result)
-    traced = []
-    for raw_pick in result.get("picks") or []:
-        pick = dict(raw_pick)
-        row = _row_for_code(table, pick.get("code"))
-        if row is None:
-            raise ValueError(f"strategy replay candidate missing from input table: {pick.get('code')}")
-        factor_snapshot = {factor: _json_safe(row.get(factor)) for factor in factors}
-        pick["candidate_trace"] = {
-            "snapshot_id": manifest["snapshot_id"],
-            "data_date": manifest["data_date"],
-            "code_version": manifest["code_version"],
-            "factor_snapshot": factor_snapshot,
-        }
-        traced.append(pick)
-    output["picks"] = traced
+    for key in ("picks", "shadow_picks", "hot_leader_watch"):
+        if key not in result:
+            continue
+        traced = []
+        for raw_pick in result.get(key) or []:
+            pick = dict(raw_pick)
+            row = _row_for_code(table, pick.get("code"))
+            if row is None:
+                raise ValueError(f"strategy replay candidate missing from input table: {pick.get('code')}")
+            pick["candidate_trace"] = {
+                "snapshot_id": manifest["snapshot_id"],
+                "data_date": manifest["data_date"],
+                "code_version": manifest["code_version"],
+                "factor_snapshot": {factor: _json_safe(row.get(factor)) for factor in factors},
+            }
+            traced.append(pick)
+        output[key] = traced
     output["replay_trace"] = dict(manifest)
     return output
