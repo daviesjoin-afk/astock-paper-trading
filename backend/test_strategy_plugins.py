@@ -127,8 +127,8 @@ class StrategyPluginContractTests(unittest.TestCase):
         result = plugins.select_candidates(plugin.strategy_id, table, topn=1)
         self.assertEqual(result["strategy"], plugin.strategy_id)
         self.assertEqual(result["picks"][0]["code"], "000001")
-        self.assertIn("candidate_trace", result["picks"][0])
-        self.assertIn("replay_trace", result)
+        self.assertNotIn("candidate_trace", result["picks"][0])
+        self.assertNotIn("replay_trace", result)
         self.assertEqual(seen, [(["000001", "000002"], 1)])
 
     def test_candidate_output_contract_fails_closed_on_malformed_plugin(self):
@@ -203,10 +203,26 @@ class StrategyPluginContractTests(unittest.TestCase):
         plugins.register_plugin(plugin)
         self.addCleanup(plugins.unregister_plugin, plugin.strategy_id)
         table = self._dated_table({"factor_a": [1.0, 2.0]}, index=["000001", "000002"])
-        result = S.run_strategy("production_dispatch_selector", table, topn=1)
-        self.assertEqual(result["picks"][0]["code"], "000001")
-        self.assertIn("candidate_trace", result["picks"][0])
-        self.assertEqual(seen, [(["000001", "000002"], 1)])
+
+        plain = S.run_strategy("production_dispatch_selector", table, topn=1)
+        self.assertEqual(plain["picks"][0]["code"], "000001")
+        self.assertNotIn("candidate_trace", plain["picks"][0])
+        self.assertNotIn("replay_trace", plain)
+
+        traced = S.run_strategy(
+            "production_dispatch_selector",
+            table,
+            topn=1,
+            replay_data_date="2026-09-11",
+            replay_required=True,
+        )
+        self.assertEqual(traced["picks"][0]["code"], "000001")
+        self.assertIn("candidate_trace", traced["picks"][0])
+        self.assertEqual(traced["replay_trace"]["data_date"], "2026-09-11")
+        self.assertEqual(
+            seen,
+            [(["000001", "000002"], 1), (["000001", "000002"], 1)],
+        )
         self.assertIn("production_dispatch_selector", S.available_selection_models())
 
     def test_duplicate_selector_registration_fails_closed(self):
