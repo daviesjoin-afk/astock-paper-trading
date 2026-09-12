@@ -49,6 +49,15 @@ class StrategyPlugin:
             raise ValueError("strategy plugin requires selector_id or candidate_runner")
         if not self.factor_inputs:
             raise ValueError("strategy plugin factor_inputs must not be empty")
+        # Frozen descriptors still store canonical ids.  Without this assignment
+        # a caller could register " foo " while lookups normalize to "foo",
+        # leaving a registration that can never be reached again.
+        object.__setattr__(self, "strategy_id", strategy_id)
+        object.__setattr__(self, "selector_id", selector_id)
+        if self.entry_policy_key is not None:
+            object.__setattr__(self, "entry_policy_key", str(self.entry_policy_key).strip())
+        if self.exit_policy_key is not None:
+            object.__setattr__(self, "exit_policy_key", str(self.exit_policy_key).strip())
 
     @property
     def entry_key(self) -> str:
@@ -103,10 +112,11 @@ class StrategyPlugin:
         if self.candidate_runner is not None:
             result = self.candidate_runner(table, **kwargs)
         else:
-            # Lazy import avoids a strategies <-> plugin import cycle and leaves
-            # audited algorithm functions in their existing module.
+            # ``strategies.run_strategy`` is the production plugin-aware facade.
+            # Built-ins must call the legacy implementation underneath it here,
+            # otherwise selector dispatch would recurse back into this plugin.
             import strategies as S
-            result = S.run_strategy(self.selector_id, table, **kwargs)
+            result = S._run_strategy_legacy(self.selector_id, table, **kwargs)
         if not isinstance(result, Mapping):
             raise TypeError("strategy candidate runner must return an object")
         missing = [key for key in self.candidate_output_keys if key not in result]
@@ -208,6 +218,7 @@ class StrategyPlugin:
 
 
 _PLUGINS: dict[str, StrategyPlugin] = {}
+_PLUGINS_BY_SELECTOR: dict[str, StrategyPlugin] = {}
 
 
 def register_plugin(plugin: StrategyPlugin, *, replace: bool = False) -> StrategyPlugin:
@@ -217,13 +228,23 @@ def register_plugin(plugin: StrategyPlugin, *, replace: bool = False) -> Strateg
     current = _PLUGINS.get(plugin.strategy_id)
     if current is not None and not replace:
         raise ValueError(f"strategy plugin already registered: {plugin.strategy_id}")
+    selector_owner = _PLUGINS_BY_SELECTOR.get(plugin.selector_id)
+    if selector_owner is not None and selector_owner.strategy_id != plugin.strategy_id:
+        raise ValueError(f"strategy selector already registered: {plugin.selector_id}")
+    if current is not None and current.selector_id != plugin.selector_id:
+        if _PLUGINS_BY_SELECTOR.get(current.selector_id) is current:
+            _PLUGINS_BY_SELECTOR.pop(current.selector_id, None)
     _PLUGINS[plugin.strategy_id] = plugin
+    _PLUGINS_BY_SELECTOR[plugin.selector_id] = plugin
     return plugin
 
 
 def unregister_plugin(strategy_id: str) -> StrategyPlugin | None:
     """Remove a runtime registration; durable strategy definitions are untouched."""
-    return _PLUGINS.pop(str(strategy_id or "").strip(), None)
+    plugin = _PLUGINS.pop(str(strategy_id or "").strip(), None)
+    if plugin is not None and _PLUGINS_BY_SELECTOR.get(plugin.selector_id) is plugin:
+        _PLUGINS_BY_SELECTOR.pop(plugin.selector_id, None)
+    return plugin
 
 
 def get_plugin(strategy_id: str) -> StrategyPlugin:
@@ -234,8 +255,18 @@ def get_plugin(strategy_id: str) -> StrategyPlugin:
     return plugin
 
 
+def plugin_for_selector(selector_id: str) -> StrategyPlugin | None:
+    """Return a registered selector binding, or ``None`` for legacy models."""
+    return _PLUGINS_BY_SELECTOR.get(str(selector_id or "").strip())
+
+
 def plugin_ids() -> tuple[str, ...]:
     return tuple(_PLUGINS)
+
+
+def selector_ids() -> tuple[str, ...]:
+    """Production selection models provided by plugins."""
+    return tuple(_PLUGINS_BY_SELECTOR)
 
 
 def manifests(*, conn=None) -> tuple[dict[str, Any], ...]:
@@ -244,6 +275,13 @@ def manifests(*, conn=None) -> tuple[dict[str, Any], ...]:
 
 def select_candidates(strategy_id: str, table, **kwargs) -> dict[str, Any]:
     return get_plugin(strategy_id).select_candidates(table, **kwargs)
+
+
+def select_by_selector(selector_id: str, table, **kwargs) -> dict[str, Any]:
+    plugin = plugin_for_selector(selector_id)
+    if plugin is None:
+        raise ValueError(f"strategy selector is not registered: {str(selector_id or '').strip()}")
+    return plugin.select_candidates(table, **kwargs)
 
 
 # Current account->candidate bindings already used by paper_trading.ACCOUNT_SPECS.
