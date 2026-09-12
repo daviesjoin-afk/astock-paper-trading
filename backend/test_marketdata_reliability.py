@@ -3,7 +3,6 @@ import json
 import os
 import tempfile
 import unittest
-from unittest import mock
 
 import marketdata_cache as cache
 import marketdata_feeds as feeds
