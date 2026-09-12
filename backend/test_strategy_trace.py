@@ -61,6 +61,9 @@ class StrategyReplayTraceTests(unittest.TestCase):
             candidate_runner=runner,
         )
 
+    def _run_path(self, snapshot_id):
+        return Path(self.temp.name) / "strategy_replay" / "runs" / f"{snapshot_id}.json.gz"
+
     def test_candidate_trace_persists_factor_date_code_and_replay_artifact(self):
         result = self._plugin().select_candidates(self._table(), topn=2)
         replay = result["replay_trace"]
@@ -68,8 +71,7 @@ class StrategyReplayTraceTests(unittest.TestCase):
         self.assertEqual(replay["code_version"], "a1b2c3d4e5f6")
         self.assertEqual(replay["row_count"], 3)
         self.assertRegex(replay["snapshot_id"], r"^[0-9a-f]{64}$")
-        artifact = Path(self.temp.name) / "strategy_replay" / f"{replay['snapshot_id']}.json.gz"
-        self.assertTrue(artifact.is_file())
+        self.assertTrue(self._run_path(replay["snapshot_id"]).is_file())
 
         pick_trace = result["picks"][0]["candidate_trace"]
         self.assertEqual(pick_trace["snapshot_id"], replay["snapshot_id"])
@@ -88,6 +90,17 @@ class StrategyReplayTraceTests(unittest.TestCase):
             {key: value for key, value in pick.items() if key != "candidate_trace"}
             for pick in original["picks"]
         ])
+
+    def test_table_columns_are_content_addressed_and_reused(self):
+        plugin = self._plugin()
+        first = plugin.select_candidates(self._table(), topn=1)
+        first_snapshot = trace.load_snapshot(first["replay_trace"]["snapshot_id"])
+        second = plugin.select_candidates(self._table(), topn=2)
+        second_snapshot = trace.load_snapshot(second["replay_trace"]["snapshot_id"])
+        self.assertNotEqual(first["replay_trace"]["snapshot_id"], second["replay_trace"]["snapshot_id"])
+        self.assertEqual(first_snapshot["table"], second_snapshot["table"])
+        column_dir = Path(self.temp.name) / "strategy_replay" / "columns"
+        self.assertEqual(len(list(column_dir.glob("*.json.gz"))), 3)
 
     def test_snapshot_contains_only_whitelisted_selection_inputs(self):
         seen = {}
@@ -166,7 +179,7 @@ class StrategyReplayTraceTests(unittest.TestCase):
     def test_integrity_check_rejects_modified_snapshot(self):
         result = self._plugin().select_candidates(self._table(), topn=1)
         snapshot_id = result["replay_trace"]["snapshot_id"]
-        path = Path(self.temp.name) / "strategy_replay" / f"{snapshot_id}.json.gz"
+        path = self._run_path(snapshot_id)
         with gzip.open(path, "rt", encoding="utf-8") as handle:
             payload = json.load(handle)
         payload["data_date"] = "2026-09-10"
