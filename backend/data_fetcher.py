@@ -8,6 +8,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import requests
 import pandas as pd
 import marketdata_cache as MDC
+import marketdata_feeds as MDF
 import marketdata_normalizers as MN
 import marketdata_providers as MP
 from marketdata_transport import (
@@ -806,220 +807,72 @@ def _realtime_row_from_ulist(raw):
     return MN.realtime_row_from_ulist(raw, quote_at_fn=_quote_at)
 
 
-def fetch_realtime_for_codes(codes, fields="f2,f3,f5,f6,f8,f9,f10,f12,f14,f15,f16,f17,f18,f20,f21,f23,f62,f66,f72,f78,f84,f184,f100,f124", return_meta=False):
-    """批量取指定代码的实时行情（ulist.np，单次/分批请求，比全市场快照快数十倍）。
-    用于选股：按全市场基础库代码分批拉取，避免使用单个超长 URL。"""
-    # Callers often combine strategy candidates and the universe, which can
-    # contain the same code several times.  Preserve order while removing
-    # duplicates so request counts and coverage denominators describe the
-    # actual universe rather than the caller's intermediate list.
-    normalized = list(dict.fromkeys(
-        str(code) for code in (codes or [])
-        if str(code).isdigit() and len(str(code)) == 6
-    ))
-    if not normalized:
-        return {"rows": [], "expected": 0, "returned": 0, "coverage_pct": 0.0,
-                "complete": False, "batches": [], "missing_codes": []} if return_meta else []
-    # ulist 接口在 push2delay 上最稳最快，优先；其余作为兜底
-    ULIST_HOSTS = ["push2delay.eastmoney.com", "push2.eastmoney.com", "82.push2.eastmoney.com"]
-    out = []
-    batch_meta = []
-    BATCH = 200  # secids 过长时分批，避免超长 URL
-    for i in range(0, len(normalized), BATCH):
-        batch = normalized[i:i + BATCH]
-        secids = ",".join(_secid(c) for c in batch)
-        params = {
-            "pn": 1, "pz": len(batch), "np": 1, "fltt": 2, "invt": 2,
-            "ut": UT_FLOW, "fields": fields, "secids": secids,
-        }
-        batch_by_code = {}
-        attempts_used = 0
-        for attempt in range(3):
-            attempts_used = attempt + 1
-            for k in range(len(ULIST_HOSTS)):
-                host = ULIST_HOSTS[(i // BATCH + k + attempt) % len(ULIST_HOSTS)]
-                try:
-                    j = _get_json(f"https://{host}/api/qt/ulist.np/get", params, retries=1)
-                    diff = (j or {}).get("data", {}).get("diff") or []
-                except Exception:
-                    diff = []
-                if diff:
-                    for d in diff:
-                        row = _realtime_row_from_ulist(d)
-                        code = row["code"] if row else ""
-                        if not row or code not in batch:
-                            continue
-                        batch_by_code[code] = row
-                    # Do not stop after a partial page: the next attempt
-                    # requests the same batch and fills the missing codes.
-                    if len(batch_by_code) >= len(batch):
-                        break
-                reset_data_source("实时行情源空响应")
-                time.sleep(0.25 * (attempt + 1))
-            if len(batch_by_code) >= len(batch):
-                break
-        # One last smaller request reduces the common failure mode where a
-        # provider drops a few codes from an otherwise valid 200-row page.
-        missing = [code for code in batch if code not in batch_by_code]
-        if missing and len(missing) > 1:
-            for start in range(0, len(missing), 50):
-                small = missing[start:start + 50]
-                secids_small = ",".join(_secid(c) for c in small)
-                small_params = dict(params, secids=secids_small, pz=len(small))
-                for host in ULIST_HOSTS:
-                    try:
-                        j = _get_json(f"https://{host}/api/qt/ulist.np/get", small_params, retries=1)
-                        diff = (j or {}).get("data", {}).get("diff") or []
-                    except Exception:
-                        diff = []
-                    for d in diff:
-                        row = _realtime_row_from_ulist(d)
-                        code = row["code"] if row else ""
-                        if row and code in small:
-                            batch_by_code[code] = row
-                    if all(code in batch_by_code for code in small):
-                        break
-        batch_rows = [batch_by_code[code] for code in batch if code in batch_by_code]
-        out.extend(batch_rows)
-        batch_meta.append({
-            "offset": i, "requested": len(batch), "returned": len(batch_rows),
-            "coverage_pct": round(len(batch_rows) / max(len(batch), 1) * 100, 2),
-            "complete": len(batch_rows) == len(batch), "attempts": attempts_used,
-            "missing_codes": [code for code in batch if code not in batch_by_code][:100],
-        })
-    returned_codes = {str(row.get("code")) for row in out if row.get("code")}
-    metadata = {
-        "rows": out, "expected": len(normalized), "returned": len(returned_codes),
-        "coverage_pct": round(len(returned_codes) / max(len(normalized), 1) * 100, 2),
-        "complete": len(returned_codes) == len(normalized), "batches": batch_meta,
-        "missing_codes": [code for code in normalized if code not in returned_codes][:200],
-    }
-    return metadata if return_meta else out
+_REALTIME_FIELDS = "f2,f3,f5,f6,f8,f9,f10,f12,f14,f15,f16,f17,f18,f20,f21,f23,f62,f66,f72,f78,f84,f184,f100,f124"
+
+
+def _eastmoney_realtime_feed(fields=_REALTIME_FIELDS):
+    return MDF.EastmoneyRealtimeFeed(
+        get_json=_get_json,
+        secid=_secid,
+        row_parser=_realtime_row_from_ulist,
+        reset_data_source=reset_data_source,
+        ut=UT_FLOW,
+        fields=fields,
+        sleep=time.sleep,
+    )
+
+
+def fetch_realtime_for_codes(codes, fields=_REALTIME_FIELDS, return_meta=False):
+    """Batch realtime quotes through the primary DataFeed adapter.
+
+    The historical list/metadata return shapes stay unchanged so scan and
+    execution callers keep their existing fail-closed coverage checks.
+    """
+    feed = _eastmoney_realtime_feed(fields)
+    return feed.fetch_realtime_with_meta(codes) if return_meta else feed.fetch_realtime(codes)
+
+
+def _tencent_realtime_feed():
+    return MDF.TencentRealtimeFeed(
+        http_get=http_get,
+        parser=MP.parse_tencent_realtime_text,
+        reset_data_source=reset_data_source,
+        sleep=time.sleep,
+    )
+
+
+def _sina_realtime_feed():
+    return MDF.SinaRealtimeFeed(
+        session_factory=_session,
+        headers=HEADERS,
+        parser=MP.parse_sina_realtime_text,
+        reset_data_source=reset_data_source,
+        sleep=time.sleep,
+    )
+
+
+def _independent_realtime_feed():
+    return MDF.DataFeedChain(
+        (_tencent_realtime_feed(), _sina_realtime_feed()),
+        reset_data_source=reset_data_source,
+        sleep=time.sleep,
+        retry_last_feed=True,
+    )
 
 
 def fetch_tencent_realtime_for_codes(codes):
-    """Independent public quote cross-check for a small list of A-share codes."""
-    codes = [str(code) for code in (codes or []) if str(code).isdigit() and len(str(code)) == 6]
-    if not codes:
-        return []
-    # 腾讯单次 URL 过长时会出现 200/空正文，不能把整批标记成“独立源未返回”。
-    # 分成小批后逐批重试，失败代码再交给新浪备用源。
-    # Smaller requests avoid Tencent returning HTTP 200 with a truncated body
-    # during peak market traffic; missing codes are retried independently.
-    if len(codes) > 30:
-        rows = []
-        for start in range(0, len(codes), 30):
-            rows.extend(fetch_tencent_realtime_for_codes(codes[start:start + 30]))
-        return rows
-    def _prefix(code):
-        # 北交所新代码以 920 开头；必须在通用的 9 开头沪市分支之前识别。
-        if code.startswith(("920", "8", "4")):
-            return "bj"
-        if code.startswith(("6", "9")):
-            return "sh"
-        return "sz"
-    # 公共接口偶发截断或瞬断。只重试尚未得到有效返回的代码，避免把一次
-    # 网络抖动直接升级成“行情不可信”。
-    pending = list(codes)
-    rows_by_code = {}
-    for attempt in range(3):
-        if not pending:
-            break
-        try:
-            text = http_get(
-                "https://qt.gtimg.cn/q=" + ",".join(_prefix(code) + code for code in pending),
-                timeout=8, encoding="gbk", retries=1,
-            )
-        except Exception:
-            text = ""
-        for row in MP.parse_tencent_realtime_text(
-            text, attempt=attempt + 1, allowed_codes=pending
-        ):
-            rows_by_code[row["code"]] = row
-        pending = [code for code in pending if code not in rows_by_code]
-        if pending and attempt < 2:
-            if not text:
-                reset_data_source("腾讯个股独立行情源空响应")
-            time.sleep(0.25 * (attempt + 1))
-    return [rows_by_code[code] for code in codes if code in rows_by_code]
+    """Independent Tencent quote source through the shared DataFeed contract."""
+    return _tencent_realtime_feed().fetch_realtime(codes)
 
 
 def _fetch_sina_realtime_for_codes(codes):
-    """新浪公开个股行情备用源；只用于腾讯缺失代码的独立交叉核验。"""
-    codes = [str(code) for code in (codes or []) if str(code).isdigit() and len(str(code)) == 6]
-    if not codes:
-        return []
-
-    def _prefix(code):
-        if code.startswith(("920", "8", "4")):
-            return "bj"
-        if code.startswith(("6", "9")):
-            return "sh"
-        return "sz"
-
-    rows_by_code = {}
-    # 新浪也会对过长 URL 返回空正文，控制在 80 个代码以内。
-    for start in range(0, len(codes), 80):
-        batch = codes[start:start + 80]
-        text = ""
-        for attempt in range(2):
-            try:
-                response = _session().get(
-                    "https://hq.sinajs.cn/list=" + ",".join(_prefix(code) + code for code in batch),
-                    headers={"Referer": "https://finance.sina.com.cn/", **HEADERS},
-                    timeout=8,
-                )
-                response.raise_for_status()
-                response.encoding = "gbk"
-                text = response.text or ""
-            except Exception:
-                text = ""
-            if text.strip():
-                break
-            if attempt == 0:
-                reset_data_source("新浪独立行情源空响应，自动重试")
-                time.sleep(0.25)
-        for row in MP.parse_sina_realtime_text(text, allowed_codes=batch):
-            rows_by_code[row["code"]] = row
-    return [rows_by_code[code] for code in codes if code in rows_by_code]
+    """Independent Sina fallback through the shared DataFeed contract."""
+    return _sina_realtime_feed().fetch_realtime(codes)
 
 
 def fetch_independent_realtime_for_codes(codes):
-    """获取独立个股行情：腾讯→新浪备用，逐代码重试并保留来源标记。
-
-    不能只按“是否有行”判断腾讯成功：部分响应可能带空价、空时间或旧
-    格式。此类行会进入备用源，而不是把整只股票误报成已核验。
-    """
-    normalized = [str(code) for code in (codes or []) if str(code).isdigit() and len(str(code)) == 6]
-    if not normalized:
-        return []
-    def _usable(row):
-        if not isinstance(row, dict):
-            return False
-        try:
-            price = float(row.get("price") or 0)
-        except (TypeError, ValueError):
-            price = 0
-        return price > 0 and bool(str(row.get("quote_at") or "").strip())
-
-    primary = fetch_tencent_realtime_for_codes(normalized)
-    by_code = {
-        str(row.get("code")): row for row in primary
-        if row.get("code") and _usable(row)
-    }
-    missing = [code for code in normalized if code not in by_code]
-    if missing:
-        fallback = _fetch_sina_realtime_for_codes(missing)
-        by_code.update({str(row.get("code")): row for row in fallback if row.get("code") and _usable(row)})
-    # 新浪偶发只返回部分列表；再做一次小批次备用重试，避免同一轮把
-    # 瞬时网络抖动写成“独立行情源未返回”。
-    missing = [code for code in normalized if code not in by_code]
-    if missing:
-        reset_data_source("腾讯/新浪独立行情均有缺口，自动切换后重试")
-        time.sleep(0.25)
-        fallback_retry = _fetch_sina_realtime_for_codes(missing)
-        by_code.update({str(row.get("code")): row for row in fallback_retry if row.get("code") and _usable(row)})
-    return [by_code[code] for code in normalized if code in by_code]
+    """Resolve independent quotes through the ordered pluggable DataFeed chain."""
+    return _independent_realtime_feed().fetch_realtime(codes)
 
 
 def fetch_fund_flow_rank(topn=300):
