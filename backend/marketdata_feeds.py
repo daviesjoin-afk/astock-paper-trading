@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """Pluggable realtime market-data feed contracts.
 
-This module owns provider orchestration, not trading policy.  Concrete feeds
+This module owns provider orchestration, not trading policy. Concrete feeds
 normalize the same small realtime quote contract while callers decide whether a
 quote is fresh/tradable and whether cross-source differences are acceptable.
 Transport and parsers are injected so every adapter is testable offline.
@@ -56,6 +56,128 @@ def market_symbol(code: str) -> str:
     if code.startswith(("6", "9")):
         return "sh" + code
     return "sz" + code
+
+
+@dataclass(frozen=True)
+class EastmoneyRealtimeFeed:
+    """Eastmoney ulist adapter with the existing completeness metadata contract."""
+
+    get_json: Callable[..., Any]
+    secid: Callable[[str], str]
+    row_parser: Callable[[Mapping[str, Any]], QuoteRow | None]
+    reset_data_source: Callable[..., Any]
+    ut: str
+    fields: str
+    hosts: Sequence[str] = (
+        "push2delay.eastmoney.com",
+        "push2.eastmoney.com",
+        "82.push2.eastmoney.com",
+    )
+    sleep: Callable[[float], Any] = time.sleep
+    batch_size: int = 200
+    attempts: int = 3
+    small_batch_size: int = 50
+    name: str = "eastmoney_ulist"
+
+    def _fetch(self, codes: Sequence[str]) -> dict[str, Any]:
+        normalized = normalize_codes(codes)
+        if not normalized:
+            return {
+                "rows": [], "expected": 0, "returned": 0, "coverage_pct": 0.0,
+                "complete": False, "batches": [], "missing_codes": [],
+            }
+        out: list[QuoteRow] = []
+        batch_meta: list[dict[str, Any]] = []
+        batch_size = max(1, int(self.batch_size))
+        attempts = max(1, int(self.attempts))
+        host_list = list(self.hosts)
+        for offset in range(0, len(normalized), batch_size):
+            batch = normalized[offset:offset + batch_size]
+            secids = ",".join(self.secid(code) for code in batch)
+            params = {
+                "pn": 1, "pz": len(batch), "np": 1, "fltt": 2, "invt": 2,
+                "ut": self.ut, "fields": self.fields, "secids": secids,
+            }
+            batch_by_code: dict[str, QuoteRow] = {}
+            attempts_used = 0
+            for attempt in range(attempts):
+                attempts_used = attempt + 1
+                for host_index in range(len(host_list)):
+                    host = host_list[(offset // batch_size + host_index + attempt) % len(host_list)]
+                    try:
+                        payload = self.get_json(
+                            f"https://{host}/api/qt/ulist.np/get", params, retries=1,
+                        )
+                        diff = (payload or {}).get("data", {}).get("diff") or []
+                    except Exception:
+                        diff = []
+                    if diff:
+                        for raw in diff:
+                            row = self.row_parser(raw)
+                            code = str(row.get("code") or "") if row else ""
+                            if row and code in batch:
+                                batch_by_code[code] = row
+                        if len(batch_by_code) >= len(batch):
+                            break
+                    self.reset_data_source("实时行情源空响应")
+                    self.sleep(0.25 * (attempt + 1))
+                if len(batch_by_code) >= len(batch):
+                    break
+
+            missing = [code for code in batch if code not in batch_by_code]
+            if missing and len(missing) > 1:
+                small_batch_size = max(1, int(self.small_batch_size))
+                for start in range(0, len(missing), small_batch_size):
+                    small = missing[start:start + small_batch_size]
+                    small_params = dict(
+                        params,
+                        secids=",".join(self.secid(code) for code in small),
+                        pz=len(small),
+                    )
+                    for host in host_list:
+                        try:
+                            payload = self.get_json(
+                                f"https://{host}/api/qt/ulist.np/get", small_params, retries=1,
+                            )
+                            diff = (payload or {}).get("data", {}).get("diff") or []
+                        except Exception:
+                            diff = []
+                        for raw in diff:
+                            row = self.row_parser(raw)
+                            code = str(row.get("code") or "") if row else ""
+                            if row and code in small:
+                                batch_by_code[code] = row
+                        if all(code in batch_by_code for code in small):
+                            break
+
+            batch_rows = [batch_by_code[code] for code in batch if code in batch_by_code]
+            out.extend(batch_rows)
+            batch_meta.append({
+                "offset": offset,
+                "requested": len(batch),
+                "returned": len(batch_rows),
+                "coverage_pct": round(len(batch_rows) / max(len(batch), 1) * 100, 2),
+                "complete": len(batch_rows) == len(batch),
+                "attempts": attempts_used,
+                "missing_codes": [code for code in batch if code not in batch_by_code][:100],
+            })
+
+        returned_codes = {str(row.get("code")) for row in out if row.get("code")}
+        return {
+            "rows": out,
+            "expected": len(normalized),
+            "returned": len(returned_codes),
+            "coverage_pct": round(len(returned_codes) / max(len(normalized), 1) * 100, 2),
+            "complete": len(returned_codes) == len(normalized),
+            "batches": batch_meta,
+            "missing_codes": [code for code in normalized if code not in returned_codes][:200],
+        }
+
+    def fetch_realtime(self, codes: Sequence[str]) -> list[QuoteRow]:
+        return self._fetch(codes)["rows"]
+
+    def fetch_realtime_with_meta(self, codes: Sequence[str]) -> dict[str, Any]:
+        return self._fetch(codes)
 
 
 @dataclass(frozen=True)
@@ -155,9 +277,9 @@ class SinaRealtimeFeed:
 class DataFeedChain:
     """Resolve requested codes through ordered feeds without core-chain branching.
 
-    Each feed receives only codes still missing a usable quote.  Adding another
+    Each feed receives only codes still missing a usable quote. Adding another
     provider is therefore a composition change (append/register a DataFeed), not
-    a change to scan, matching, or execution policy.  The optional final retry
+    a change to scan, matching, or execution policy. The optional final retry
     preserves the historical Tencent -> Sina -> Sina-retry behavior.
     """
 
