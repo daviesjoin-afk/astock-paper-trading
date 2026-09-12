@@ -162,6 +162,28 @@ _DATE_ONLY = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 # gave day precision or instant precision, so an intraday timestamp can never be
 # mistaken for a date.
 _DAY_PRECISION = re.compile(r"^\d{4}[-/]\d{2}[-/]\d{2}$")
+# A *spelling* gate for the one fraction ``datetime.fromisoformat`` destroys.
+# The parser normalizes a **zero** offset (``±00:00:00`` / ``±000000``) to a
+# plain ``timezone.utc`` and *discards* any fractional second on it, so
+# ``2026-01-02T10:00:00+00:00:00.100000`` parses to a datetime whose wall
+# ``microsecond`` is 0 **and** whose absolute ``microsecond`` is 0 -- the
+# sub-second information is gone before either semantic check can observe it,
+# and two spellings encoding *different* fractional offsets (``.100000`` vs
+# ``.900000``) would collapse onto one dataset identity.
+#
+# Empirically this is the **only** offset shape that loses data: ``+00:00:01.5``,
+# ``+00:30:00.5``, ``+08:00:00.5`` and every other non-zero offset keep their
+# fraction and are still handled by the semantic checks.  The gate is therefore
+# deliberately narrow -- sign, zero hours, zero minutes, zero seconds, then a
+# decimal separator and a fraction containing a non-zero digit -- covering both
+# the extended (``+00:00:00.5``) and basic (``+000000.5``) spellings and either
+# separator (``.`` or ``,``) ISO 8601 allows.  The non-zero digit is required so
+# that an explicit **all-zero** fraction (``+00:00:00.000000``) still spells a
+# whole second and stays accepted, exactly like ``+00:00:00``.  Keying on this
+# *grammar* rather than on a colon (as the removed ``:\d{2}[.,]\d+`` did) is
+# what makes it spelling-independent.  A whole-second zero offset (``Z``,
+# ``+00:00``, ``+00:00:00``) carries no fraction and is untouched.
+_ZERO_OFFSET_FRACTION = re.compile(r"[+-]00:?00:?00[.,]\d*[1-9]")
 _END_OF_DAY = "T23:59:59"
 _START_OF_DAY = "T00:00:00"
 
@@ -397,18 +419,30 @@ def _normalize_cutoff(value: Any) -> Optional[str]:
     * an unparseable explicit cutoff returns ``None`` so callers fail closed
       instead of silently falling back to a looser cutoff.
     * a cutoff carrying **sub-second** precision *anywhere* -- in the wall clock
-      (``10:00:00.5+08:00``) or in the UTC offset (``10:00:00+08:00:00.5``) -- is
-      refused for the same reason: the canonical PIT clock is second-granularity,
-      so rounding it would move the freeze and collapse two distinct instants
-      onto one dataset identity.  This is decided **semantically**, on the parsed
-      value (including its absolute UTC instant), never by matching the spelling
-      -- see below.
+      (``10:00:00.5+08:00``), in the UTC offset (``10:00:00+08:00:00.5``), or in
+      an offset ``datetime.fromisoformat`` would silently *discard*
+      (``10:00:00+00:00:00.100000``) -- is refused for the same reason: the
+      canonical PIT clock is second-granularity, so rounding it would move the
+      freeze and collapse two distinct instants onto one dataset identity.  The
+      decision is semantic wherever the parser preserves the fraction, plus a
+      narrow *spelling* gate for the fraction the parser destroys -- see below.
+      An all-zero fraction (``.000000``) still spells a whole second, and stays
+      accepted.
 
     Equivalent spellings of the same instant (``+08:00``, ``Z``, naive
     exchange-local, or an already-canonical ``+00:00``) collapse to one string.
     """
     text = _text(value)
     if text is None:
+        return None
+    if _ZERO_OFFSET_FRACTION.search(text):
+        # Parser-loss boundary -- see ``_ZERO_OFFSET_FRACTION``.  This runs
+        # *before* parsing because ``datetime.fromisoformat`` destroys the
+        # fraction of a zero offset: by the time a parsed value exists, both the
+        # wall clock and the absolute instant read as a whole second, so no
+        # semantic check can still see the fraction the caller spelled.  Only
+        # this one shape needs the spelling gate; every other sub-second
+        # spelling is caught semantically below.
         return None
     if _DAY_PRECISION.match(text):
         # Day precision is preserved as a day; the EOD reading happens later,

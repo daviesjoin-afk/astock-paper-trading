@@ -1620,6 +1620,14 @@ class CutoffPrecisionContractTests(DbTestCase):
             "2026-01-02T10:00:00+08:00:00.900000",
             "20260102T100000+080000.5",
             "2026-01-02T10:00:00-05:00:00.25",
+            # ... and a fraction on a *zero-hour* offset, which
+            # ``datetime.fromisoformat`` discards outright -- both semantic
+            # checks would read it as a whole second, so only the spelling gate
+            # can refuse it.
+            "2026-01-02T10:00:00+00:00:00.100000",
+            "2026-01-02T10:00:00+00:00:00.900000",
+            "2026-01-02T10:00:00-00:00:00.100000",
+            "20260102T100000+000000.100000",
         ):
             with self.subTest(bad=bad):
                 self.assertIsNone(LD.normalize_cutoff(bad))
@@ -1909,6 +1917,114 @@ class CutoffSpellingIndependenceTests(DbTestCase):
         ):
             with self.subTest(value=value):
                 self.assertIsNone(LD.normalize_cutoff(value))
+
+    # ── H. a fraction the parser *discards* is still refused ──
+    #
+    # ``datetime.fromisoformat`` drops the fractional part of a zero-hour /
+    # zero-minute offset, so ``+00:00:00.100000`` parses to a plain UTC
+    # datetime whose wall clock *and* absolute instant both read as a whole
+    # second.  No semantic check can see the fraction the caller spelled; only
+    # a spelling gate can, which is why one is applied before parsing.
+
+    ZERO_OFF_FINE_A = "2026-01-02T10:00:00+00:00:00.100000"
+    ZERO_OFF_FINE_B = "2026-01-02T10:00:00+00:00:00.900000"
+    # The whole-second instant both used to be accepted as.
+    ZERO_OFF_FINE_UTC = "2026-01-02T10:00:00+00:00"
+    ZERO_OFF_FINE = (
+        ZERO_OFF_FINE_A,
+        ZERO_OFF_FINE_B,
+        "2026-01-02T10:00:00+00:00:00.5",
+        "2026-01-02T10:00:00-00:00:00.100000",   # negative-zero offset
+        "2026-01-02T10:00:00-00:00:00.900000",
+        "20260102T100000+000000.100000",         # basic ISO spelling
+    )
+
+    def test_a_discarded_zero_offset_fraction_is_invisible_to_both_checks(self):
+        """Non-vacuity: neither semantic check can see this case at all."""
+        import datetime as _dt
+
+        for value in (self.ZERO_OFF_FINE_A, self.ZERO_OFF_FINE_B):
+            with self.subTest(value=value):
+                parsed = _dt.datetime.fromisoformat(value)
+                # The wall clock is whole ...
+                self.assertEqual(parsed.microsecond, 0)
+                # ... and so is the absolute instant, because the parser threw
+                # the fractional offset away.  A semantic-only guard therefore
+                # reads these as plain whole-second UTC cutoffs.
+                self.assertEqual(
+                    parsed.astimezone(_dt.timezone.utc).microsecond, 0
+                )
+                self.assertEqual(
+                    _dt.datetime.fromisoformat(value),
+                    _dt.datetime.fromisoformat("2026-01-02T10:00:00+00:00"),
+                )
+
+    def test_discarded_zero_offset_fraction_cutoffs_are_refused(self):
+        for value in self.ZERO_OFF_FINE:
+            with self.subTest(value=value):
+                self.assertIsNone(LD.normalize_cutoff(value))
+
+    def test_build_dataset_refuses_a_discarded_zero_offset_fraction_cutoff(self):
+        conn = self._seeded()
+        for value in self.ZERO_OFF_FINE:
+            with self.subTest(value=value):
+                with self.assertRaises(ValueError):
+                    build(conn, cutoff=value)
+
+    def test_contract_status_refuses_a_discarded_zero_offset_fraction_cutoff(self):
+        conn = self._seeded()
+        provable = LD._latest_provable_cutoff(conn)
+        self.assertIsNotNone(provable)
+        for value in self.ZERO_OFF_FINE:
+            with self.subTest(value=value):
+                status = LD.contract_status(conn, cutoff=value)
+                self.assertIsNone(status["cutoff"])
+                self.assertIsNone(status["dataset_fingerprint"])
+                self.assertIn("dataset_cutoff_unprovable", status["dataset_blockers"])
+                # Explicitly *not* the latest provable cutoff: no fallback.
+                self.assertNotEqual(status["cutoff"], provable)
+
+    def test_distinct_discarded_zero_offset_fractions_never_share_an_identity(self):
+        """Both are refused rather than accepted as one whole-second cutoff."""
+        import datetime as _dt
+
+        # Non-vacuity: the caller *spelled* two different fractional offsets.
+        self.assertNotEqual(self.ZERO_OFF_FINE_A, self.ZERO_OFF_FINE_B)
+
+        for value in (self.ZERO_OFF_FINE_A, self.ZERO_OFF_FINE_B):
+            with self.subTest(value=value):
+                self.assertIsNone(LD.normalize_cutoff(value))
+        # ... and neither is accepted as the whole-second instant the parser
+        # collapsed both of them to -- which is exactly the collapse.
+        for value in (self.ZERO_OFF_FINE_A, self.ZERO_OFF_FINE_B):
+            with self.subTest(value=value):
+                self.assertNotEqual(LD.normalize_cutoff(value), self.ZERO_OFF_FINE_UTC)
+        # The whole-second instant itself keeps its identity (non-vacuous).
+        self.assertEqual(LD.normalize_cutoff("2026-01-02T10:00:00+00:00"), self.ZERO_OFF_FINE_UTC)
+        # The two spellings differ textually, yet the parser collapses them onto
+        # one datetime -- precisely why a *semantic* guard cannot separate them
+        # and a spelling gate is required.
+        self.assertEqual(
+            _dt.datetime.fromisoformat(self.ZERO_OFF_FINE_A),
+            _dt.datetime.fromisoformat(self.ZERO_OFF_FINE_B),
+        )
+
+    def test_whole_second_zero_offsets_are_still_accepted(self):
+        """Non-vacuous control: every whole-second zero-offset form keeps working."""
+        forms = (
+            "2026-01-02T10:00:00Z",
+            "2026-01-02T10:00:00+00:00",
+            "2026-01-02T10:00:00+00:00:00",       # explicit whole-second offset
+            "2026-01-02T10:00:00-00:00:00",       # negative zero
+            "2026-01-02T10:00:00+00:00:00.000000",  # all-zero fraction
+        )
+        for form in forms:
+            with self.subTest(form=form):
+                self.assertEqual(LD.normalize_cutoff(form), self.ZERO_OFF_FINE_UTC)
+        conn = self._seeded()
+        built = [build(conn, cutoff=form) for form in forms]
+        self.assertEqual({row.cutoff for row in built}, {self.ZERO_OFF_FINE_UTC})
+        self.assertEqual(len({row.fingerprint for row in built}), 1)
 
 
 class NoNetworkTests(DbTestCase):
