@@ -8,6 +8,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import requests
 import pandas as pd
 import marketdata_cache as MDC
+import marketdata_feeds as MDF
 import marketdata_normalizers as MN
 import marketdata_providers as MP
 from marketdata_transport import (
@@ -897,133 +898,51 @@ def fetch_realtime_for_codes(codes, fields="f2,f3,f5,f6,f8,f9,f10,f12,f14,f15,f1
     return metadata if return_meta else out
 
 
+def _tencent_realtime_feed():
+    return MDF.TencentRealtimeFeed(
+        http_get=http_get,
+        parser=MP.parse_tencent_realtime_text,
+        reset_data_source=reset_data_source,
+        sleep=time.sleep,
+    )
+
+
+def _sina_realtime_feed():
+    return MDF.SinaRealtimeFeed(
+        session_factory=_session,
+        headers=HEADERS,
+        parser=MP.parse_sina_realtime_text,
+        reset_data_source=reset_data_source,
+        sleep=time.sleep,
+    )
+
+
+def _independent_realtime_feed():
+    return MDF.DataFeedChain(
+        (_tencent_realtime_feed(), _sina_realtime_feed()),
+        reset_data_source=reset_data_source,
+        sleep=time.sleep,
+        retry_last_feed=True,
+    )
+
+
 def fetch_tencent_realtime_for_codes(codes):
-    """Independent public quote cross-check for a small list of A-share codes."""
-    codes = [str(code) for code in (codes or []) if str(code).isdigit() and len(str(code)) == 6]
-    if not codes:
-        return []
-    # 腾讯单次 URL 过长时会出现 200/空正文，不能把整批标记成“独立源未返回”。
-    # 分成小批后逐批重试，失败代码再交给新浪备用源。
-    # Smaller requests avoid Tencent returning HTTP 200 with a truncated body
-    # during peak market traffic; missing codes are retried independently.
-    if len(codes) > 30:
-        rows = []
-        for start in range(0, len(codes), 30):
-            rows.extend(fetch_tencent_realtime_for_codes(codes[start:start + 30]))
-        return rows
-    def _prefix(code):
-        # 北交所新代码以 920 开头；必须在通用的 9 开头沪市分支之前识别。
-        if code.startswith(("920", "8", "4")):
-            return "bj"
-        if code.startswith(("6", "9")):
-            return "sh"
-        return "sz"
-    # 公共接口偶发截断或瞬断。只重试尚未得到有效返回的代码，避免把一次
-    # 网络抖动直接升级成“行情不可信”。
-    pending = list(codes)
-    rows_by_code = {}
-    for attempt in range(3):
-        if not pending:
-            break
-        try:
-            text = http_get(
-                "https://qt.gtimg.cn/q=" + ",".join(_prefix(code) + code for code in pending),
-                timeout=8, encoding="gbk", retries=1,
-            )
-        except Exception:
-            text = ""
-        for row in MP.parse_tencent_realtime_text(
-            text, attempt=attempt + 1, allowed_codes=pending
-        ):
-            rows_by_code[row["code"]] = row
-        pending = [code for code in pending if code not in rows_by_code]
-        if pending and attempt < 2:
-            if not text:
-                reset_data_source("腾讯个股独立行情源空响应")
-            time.sleep(0.25 * (attempt + 1))
-    return [rows_by_code[code] for code in codes if code in rows_by_code]
+    """Independent Tencent quote source through the shared DataFeed contract."""
+    return _tencent_realtime_feed().fetch_realtime(codes)
 
 
 def _fetch_sina_realtime_for_codes(codes):
-    """新浪公开个股行情备用源；只用于腾讯缺失代码的独立交叉核验。"""
-    codes = [str(code) for code in (codes or []) if str(code).isdigit() and len(str(code)) == 6]
-    if not codes:
-        return []
-
-    def _prefix(code):
-        if code.startswith(("920", "8", "4")):
-            return "bj"
-        if code.startswith(("6", "9")):
-            return "sh"
-        return "sz"
-
-    rows_by_code = {}
-    # 新浪也会对过长 URL 返回空正文，控制在 80 个代码以内。
-    for start in range(0, len(codes), 80):
-        batch = codes[start:start + 80]
-        text = ""
-        for attempt in range(2):
-            try:
-                response = _session().get(
-                    "https://hq.sinajs.cn/list=" + ",".join(_prefix(code) + code for code in batch),
-                    headers={"Referer": "https://finance.sina.com.cn/", **HEADERS},
-                    timeout=8,
-                )
-                response.raise_for_status()
-                response.encoding = "gbk"
-                text = response.text or ""
-            except Exception:
-                text = ""
-            if text.strip():
-                break
-            if attempt == 0:
-                reset_data_source("新浪独立行情源空响应，自动重试")
-                time.sleep(0.25)
-        for row in MP.parse_sina_realtime_text(text, allowed_codes=batch):
-            rows_by_code[row["code"]] = row
-    return [rows_by_code[code] for code in codes if code in rows_by_code]
+    """Independent Sina fallback through the shared DataFeed contract."""
+    return _sina_realtime_feed().fetch_realtime(codes)
 
 
 def fetch_independent_realtime_for_codes(codes):
-    """获取独立个股行情：腾讯→新浪备用，逐代码重试并保留来源标记。
-
-    不能只按“是否有行”判断腾讯成功：部分响应可能带空价、空时间或旧
-    格式。此类行会进入备用源，而不是把整只股票误报成已核验。
-    """
-    normalized = [str(code) for code in (codes or []) if str(code).isdigit() and len(str(code)) == 6]
-    if not normalized:
-        return []
-    def _usable(row):
-        if not isinstance(row, dict):
-            return False
-        try:
-            price = float(row.get("price") or 0)
-        except (TypeError, ValueError):
-            price = 0
-        return price > 0 and bool(str(row.get("quote_at") or "").strip())
-
-    primary = fetch_tencent_realtime_for_codes(normalized)
-    by_code = {
-        str(row.get("code")): row for row in primary
-        if row.get("code") and _usable(row)
-    }
-    missing = [code for code in normalized if code not in by_code]
-    if missing:
-        fallback = _fetch_sina_realtime_for_codes(missing)
-        by_code.update({str(row.get("code")): row for row in fallback if row.get("code") and _usable(row)})
-    # 新浪偶发只返回部分列表；再做一次小批次备用重试，避免同一轮把
-    # 瞬时网络抖动写成“独立行情源未返回”。
-    missing = [code for code in normalized if code not in by_code]
-    if missing:
-        reset_data_source("腾讯/新浪独立行情均有缺口，自动切换后重试")
-        time.sleep(0.25)
-        fallback_retry = _fetch_sina_realtime_for_codes(missing)
-        by_code.update({str(row.get("code")): row for row in fallback_retry if row.get("code") and _usable(row)})
-    return [by_code[code] for code in normalized if code in by_code]
+    """Resolve independent quotes through the ordered pluggable DataFeed chain."""
+    return _independent_realtime_feed().fetch_realtime(codes)
 
 
 def fetch_fund_flow_rank(topn=300):
-    """个股主力净流入排行（实时）"""
+    """个股主力净流入排行（实时）""
     def _do():
         fields = "f12,f14,f2,f3,f62,f66,f72,f78,f84,f124,f184"
         result = _fetch_clist(
@@ -1139,7 +1058,7 @@ def fetch_stock_flow_batch(codes):
 
 
 def enrich_live_flow(live_universe, missing_codes):
-    """对缺失超大单资金的个股进行补齐。
+    """对缺失超大单资金数据的个股进行补齐。
 
     Args:
         live_universe: 市场快照行列表
