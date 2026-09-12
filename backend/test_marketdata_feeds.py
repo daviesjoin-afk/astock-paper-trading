@@ -23,6 +23,17 @@ class DataFeedContractTests(unittest.TestCase):
         fake = _FakeFeed("fake", {}, [])
         self.assertIsInstance(fake, feeds.DataFeed)
         self.assertIsInstance(
+            feeds.EastmoneyRealtimeFeed(
+                get_json=lambda *_args, **_kwargs: {},
+                secid=lambda code: code,
+                row_parser=lambda _row: None,
+                reset_data_source=lambda *_args, **_kwargs: None,
+                ut="test",
+                fields="f2,f12",
+            ),
+            feeds.DataFeed,
+        )
+        self.assertIsInstance(
             feeds.TencentRealtimeFeed(
                 http_get=lambda *_args, **_kwargs: "",
                 parser=lambda *_args, **_kwargs: [],
@@ -113,7 +124,100 @@ class DataFeedContractTests(unittest.TestCase):
         sleep.assert_called_once_with(0.25)
 
 
+class EastmoneyRealtimeFeedTests(unittest.TestCase):
+    @staticmethod
+    def _row_parser(raw):
+        code = str(raw.get("f12") or "")
+        if not code:
+            return None
+        return {
+            "code": code,
+            "price": float(raw.get("f2") or 0),
+            "quote_at": "2026-09-12T10:00:00+08:00",
+        }
+
+    def test_complete_batch_preserves_legacy_metadata_shape(self):
+        reset = mock.Mock()
+        sleep = mock.Mock()
+
+        def get_json(_url, _params, **_kwargs):
+            return {"data": {"diff": [{"f12": "000001", "f2": 10}, {"f12": "600000", "f2": 20}]}}
+
+        feed = feeds.EastmoneyRealtimeFeed(
+            get_json=get_json,
+            secid=lambda code: ("1." if code.startswith("6") else "0.") + code,
+            row_parser=self._row_parser,
+            reset_data_source=reset,
+            ut="test",
+            fields="f2,f12",
+            hosts=("test-host",),
+            attempts=1,
+            sleep=sleep,
+        )
+        result = feed.fetch_realtime_with_meta(["000001", "000001", "600000"])
+        self.assertEqual([row["code"] for row in result["rows"]], ["000001", "600000"])
+        self.assertEqual(result["expected"], 2)
+        self.assertEqual(result["returned"], 2)
+        self.assertEqual(result["coverage_pct"], 100.0)
+        self.assertTrue(result["complete"])
+        self.assertEqual(result["missing_codes"], [])
+        self.assertEqual(result["batches"][0]["requested"], 2)
+        self.assertEqual(result["batches"][0]["returned"], 2)
+        reset.assert_not_called()
+        sleep.assert_not_called()
+
+    def test_partial_batch_reports_missing_code_and_fails_completeness(self):
+        reset = mock.Mock()
+        sleep = mock.Mock()
+
+        def get_json(_url, _params, **_kwargs):
+            return {"data": {"diff": [{"f12": "000001", "f2": 10}]}}
+
+        feed = feeds.EastmoneyRealtimeFeed(
+            get_json=get_json,
+            secid=lambda code: "0." + code,
+            row_parser=self._row_parser,
+            reset_data_source=reset,
+            ut="test",
+            fields="f2,f12",
+            hosts=("test-host",),
+            attempts=1,
+            sleep=sleep,
+        )
+        result = feed.fetch_realtime_with_meta(["000001", "000002"])
+        self.assertEqual([row["code"] for row in result["rows"]], ["000001"])
+        self.assertEqual(result["expected"], 2)
+        self.assertEqual(result["returned"], 1)
+        self.assertEqual(result["coverage_pct"], 50.0)
+        self.assertFalse(result["complete"])
+        self.assertEqual(result["missing_codes"], ["000002"])
+        self.assertEqual(result["batches"][0]["missing_codes"], ["000002"])
+        reset.assert_called_once_with("实时行情源空响应")
+        sleep.assert_called_once_with(0.25)
+
+
 class DataFetcherFacadeTests(unittest.TestCase):
+    def test_primary_quote_facade_preserves_list_and_metadata_modes(self):
+        rows = [{"code": "000001", "price": 10.0}]
+        metadata = {
+            "rows": rows,
+            "expected": 1,
+            "returned": 1,
+            "coverage_pct": 100.0,
+            "complete": True,
+            "batches": [],
+            "missing_codes": [],
+        }
+        feed = mock.Mock()
+        feed.fetch_realtime.return_value = rows
+        feed.fetch_realtime_with_meta.return_value = metadata
+        with mock.patch.object(dfc, "_eastmoney_realtime_feed", return_value=feed) as factory:
+            self.assertEqual(dfc.fetch_realtime_for_codes(["000001"]), rows)
+            self.assertEqual(dfc.fetch_realtime_for_codes(["000001"], return_meta=True), metadata)
+        factory.assert_has_calls([mock.call(dfc._REALTIME_FIELDS), mock.call(dfc._REALTIME_FIELDS)])
+        feed.fetch_realtime.assert_called_once_with(["000001"])
+        feed.fetch_realtime_with_meta.assert_called_once_with(["000001"])
+
     def test_independent_quote_facade_delegates_without_changing_public_api(self):
         expected = [{"code": "000001", "price": 10.0, "quote_at": "2026-09-12T10:00:00+08:00"}]
         feed = mock.Mock()
