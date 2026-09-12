@@ -1472,6 +1472,8 @@ def _select_uncached(
         news_hits=news_hits,
         gate=gate,
         first_board_codes=first_board_codes,
+        replay_data_date=complete_cutoff,
+        replay_required=True,
     )
     for pick in result.get("picks", []) or []:
         live_row = live_map.get(str(pick.get("code")))
