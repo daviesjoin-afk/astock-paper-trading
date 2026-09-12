@@ -267,17 +267,28 @@ def _date_text(value: Any) -> Optional[str]:
     return candidate
 
 
-def _canonical_instant(value: _dt.datetime) -> str:
-    """Return ``YYYY-MM-DDTHH:MM:SS+00:00`` on the canonical PIT clock.
+def _utc_instant(value: _dt.datetime) -> _dt.datetime:
+    """Absolute UTC instant for a parsed datetime.
 
     A naive input carries no offset, so it is read as *exchange-local*
-    (Asia/Shanghai) rather than the host's timezone.  The output always keeps
-    an explicit ``+00:00`` so the function is idempotent: feeding a canonical
-    value back in cannot shift it a second time.
+    (Asia/Shanghai) rather than the host's timezone.  Sub-second precision is
+    **preserved** here (the result keeps its microsecond field); deciding
+    whether the second-granularity clock can hold it belongs to the caller.
     """
     if value.tzinfo is None:
         value = value.replace(tzinfo=_EXCHANGE_TZ)
-    return value.astimezone(_UTC).isoformat(timespec="seconds")
+    return value.astimezone(_UTC)
+
+
+def _canonical_instant(value: _dt.datetime) -> str:
+    """Return ``YYYY-MM-DDTHH:MM:SS+00:00`` on the canonical PIT clock.
+
+    A naive input is read as *exchange-local* (Asia/Shanghai) rather than the
+    host's timezone -- see :func:`_utc_instant`.  The output always keeps an
+    explicit ``+00:00`` so the function is idempotent: feeding a canonical
+    value back in cannot shift it a second time.
+    """
+    return _utc_instant(value).isoformat(timespec="seconds")
 
 
 def _exchange_day_edge(day: str, edge: str) -> Optional[str]:
@@ -385,11 +396,13 @@ def _normalize_cutoff(value: Any) -> Optional[str]:
       in that day can never leak into the dataset.
     * an unparseable explicit cutoff returns ``None`` so callers fail closed
       instead of silently falling back to a looser cutoff.
-    * a cutoff carrying **sub-second** precision is refused for the same reason:
-      the canonical PIT clock is second-granularity, so rounding it would move
-      the freeze and collapse two distinct instants onto one dataset identity.
-      This is decided **semantically**, on the parsed value, never by matching
-      the spelling -- see below.
+    * a cutoff carrying **sub-second** precision *anywhere* -- in the wall clock
+      (``10:00:00.5+08:00``) or in the UTC offset (``10:00:00+08:00:00.5``) -- is
+      refused for the same reason: the canonical PIT clock is second-granularity,
+      so rounding it would move the freeze and collapse two distinct instants
+      onto one dataset identity.  This is decided **semantically**, on the parsed
+      value (including its absolute UTC instant), never by matching the spelling
+      -- see below.
 
     Equivalent spellings of the same instant (``+08:00``, ``Z``, naive
     exchange-local, or an already-canonical ``+00:00``) collapse to one string.
@@ -404,7 +417,7 @@ def _normalize_cutoff(value: Any) -> Optional[str]:
     parsed = _parse_datetime(text)
     if parsed is None:
         return None
-    if parsed.microsecond:
+    if parsed.microsecond or _utc_instant(parsed).microsecond:
         # The canonical PIT clock holds whole seconds (``_canonical_instant``
         # formats with ``timespec="seconds"``), so an instant carrying a
         # sub-second component cannot be represented faithfully.  Rounding or
@@ -412,11 +425,24 @@ def _normalize_cutoff(value: Any) -> Optional[str]:
         # two distinct freeze instants share one dataset identity/fingerprint --
         # exactly the defect this contract forbids.  Refuse instead of choosing.
         #
-        # The check is *semantic* -- it reads the parsed value, not the
-        # spelling.  ``datetime.fromisoformat`` legally accepts many ISO 8601
-        # forms (e.g. the basic ``20260102T100000.100000+0800``) that no single
-        # hand-written pattern can be trusted to cover, so a pattern-based test
-        # would silently let some of them through to be truncated.
+        # The test is *semantic* -- it reads the parsed value, not the spelling.
+        # ``datetime.fromisoformat`` legally accepts many ISO 8601 forms (e.g.
+        # the basic ``20260102T100000.100000+0800``) that no single hand-written
+        # pattern can be trusted to cover, so a pattern-based test would
+        # silently let some of them through to be truncated.
+        #
+        # Sub-second precision can hide in *two* places, so both are checked:
+        #   * the wall clock (``parsed.microsecond``), e.g. ``10:00:00.5+08:00``;
+        #   * the UTC offset, e.g. ``10:00:00+08:00:00.5``.  That spelling
+        #     leaves ``parsed.microsecond == 0`` yet is 0.5s off a whole second,
+        #     so only the *absolute* instant (after ``.astimezone(UTC)``) exposes
+        #     it.  Checking the wall clock alone let such inputs be truncated --
+        #     and two of them (``.100000`` vs ``.900000``) then collapsed onto the
+        #     same second-precision instant.
+        # Both are checked rather than the absolute instant alone: a wall-clock
+        # fraction can be *cancelled* by a fractional offset (``10:00:00.5`` at
+        # ``-08:00:00.5`` is a whole second in UTC), and refusing it is the
+        # fail-closed answer for a cutoff spelled with sub-second precision.
         return None
     return _canonical_instant(parsed)
 

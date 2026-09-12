@@ -1611,6 +1611,15 @@ class CutoffPrecisionContractTests(DbTestCase):
             "20260102T100000.100000+0800",
             "20260102T100000.900000+0800",
             "20260102T100000,100000+0800",
+            # ... and including a fraction carried by the *UTC offset*, which
+            # leaves the wall clock whole (``parsed.microsecond == 0``) yet is
+            # still finer than the second clock.  Only the absolute instant
+            # reveals it, so the guard reads that too.
+            "2026-01-02T10:00:00+08:00:00.5",
+            "2026-01-02T10:00:00+08:00:00.100000",
+            "2026-01-02T10:00:00+08:00:00.900000",
+            "20260102T100000+080000.5",
+            "2026-01-02T10:00:00-05:00:00.25",
         ):
             with self.subTest(bad=bad):
                 self.assertIsNone(LD.normalize_cutoff(bad))
@@ -1656,11 +1665,23 @@ class CutoffSpellingIndependenceTests(DbTestCase):
 
     PR-10's core invariant is that two *different* freeze instants may never
     collapse onto one dataset identity/fingerprint because the canonical clock
-    is second-granular.  Detecting "too fine to hold" with a regular expression
-    over the text only covered the extended ISO form; the *basic* ISO form
-    (``20260102T100000.100000+0800``) is equally legal to
-    ``datetime.fromisoformat`` and slipped through to be truncated to the
-    second.  The check now reads the parsed value, so no spelling can bypass it.
+    is second-granular.  Two successive spelling-shaped holes had to be closed
+    before that invariant held for *every* ISO 8601 form:
+
+    * detecting "too fine to hold" with a regular expression over the text only
+      covered the extended ISO form; the *basic* ISO form
+      (``20260102T100000.100000+0800``) is equally legal to
+      ``datetime.fromisoformat`` and slipped through to be truncated to the
+      second (group A--F below);
+    * that spelling test also only ever looked at the *wall clock*.
+      ``datetime.fromisoformat`` additionally accepts a fraction on the **UTC
+      offset** (``2026-01-02T10:00:00+08:00:00.5``), which leaves
+      ``parsed.microsecond == 0`` while the *absolute* instant is 0.5s off a
+      whole second -- so the wall-clock guard missed it and two such instants
+      collapsed onto one second (group G below).
+
+    The check now reads the parsed value, on both the wall clock *and* the
+    absolute UTC instant, so no spelling can bypass it.
     """
 
     # Two instants differing by 0.8s -- far finer than the canonical second
@@ -1671,6 +1692,21 @@ class CutoffSpellingIndependenceTests(DbTestCase):
     # The same wall clock at whole-second precision: a legal basic-ISO spelling.
     COARSE_BASIC = "20260102T100000+0800"
     COARSE_UTC = "2026-01-02T02:00:00+00:00"
+
+    # Sub-second precision hidden in the *UTC offset*.  ``fromisoformat`` puts
+    # the fraction in the offset, so the wall clock stays whole while the
+    # absolute instant is not: the wall-clock guard cannot see these.
+    OFFSET_FINE_A = "2026-01-02T10:00:00+08:00:00.100000"
+    OFFSET_FINE_B = "2026-01-02T10:00:00+08:00:00.900000"
+    # The second-precision instant both used to be truncated to.
+    OFFSET_FINE_UTC = "2026-01-02T01:59:59+00:00"
+    OFFSET_FINE = (
+        OFFSET_FINE_A,
+        OFFSET_FINE_B,
+        "2026-01-02T10:00:00+08:00:00.5",
+        "20260102T100000+080000.5",          # basic ISO spelling
+        "2026-01-02T10:00:00-05:00:00.25",   # negative fractional offset
+    )
 
     def _seeded(self):
         conn = self.new_db()
@@ -1761,6 +1797,118 @@ class CutoffSpellingIndependenceTests(DbTestCase):
         built = [build(conn, cutoff=form) for form in forms]
         self.assertEqual({row.cutoff for row in built}, {self.COARSE_UTC})
         self.assertEqual(len({row.fingerprint for row in built}), 1)
+
+    # ── G. a fraction carried by the UTC offset is refused too ──
+    #
+    # The wall-clock guard is blind to these: ``fromisoformat`` stores the
+    # fraction in the offset, so ``parsed.microsecond`` is 0 while the absolute
+    # instant is not a whole second.  Only ``.astimezone(UTC)`` exposes it.
+
+    def test_a_fractional_offset_leaves_the_wall_clock_whole(self):
+        """Non-vacuity: these really do defeat a wall-clock-only check."""
+        import datetime as _dt
+
+        for value in (self.OFFSET_FINE_A, self.OFFSET_FINE_B):
+            with self.subTest(value=value):
+                parsed = _dt.datetime.fromisoformat(value)
+                # The old guard read exactly this field, and it is zero ...
+                self.assertEqual(parsed.microsecond, 0)
+                # ... yet the absolute instant is not a whole second.
+                self.assertNotEqual(
+                    parsed.astimezone(_dt.timezone.utc).microsecond, 0
+                )
+
+    def test_fractional_offset_cutoffs_are_refused(self):
+        for value in self.OFFSET_FINE:
+            with self.subTest(value=value):
+                self.assertIsNone(LD.normalize_cutoff(value))
+
+    def test_build_dataset_refuses_a_fractional_offset_cutoff(self):
+        conn = self._seeded()
+        for value in self.OFFSET_FINE:
+            with self.subTest(value=value):
+                with self.assertRaises(ValueError):
+                    build(conn, cutoff=value)
+
+    def test_contract_status_refuses_a_fractional_offset_cutoff(self):
+        conn = self._seeded()
+        provable = LD._latest_provable_cutoff(conn)
+        self.assertIsNotNone(provable)
+        for value in self.OFFSET_FINE:
+            with self.subTest(value=value):
+                status = LD.contract_status(conn, cutoff=value)
+                self.assertIsNone(status["cutoff"])
+                self.assertIsNone(status["dataset_fingerprint"])
+                self.assertIn("dataset_cutoff_unprovable", status["dataset_blockers"])
+                # Explicitly *not* the latest provable cutoff: no fallback.
+                self.assertNotEqual(status["cutoff"], provable)
+
+    def test_two_distinct_fractional_offset_instants_never_share_a_dataset_identity(
+        self,
+    ):
+        """Both are refused rather than collapsed onto one second-precision id.
+
+        Non-vacuity first: the two inputs really are two *distinct* instants, so
+        refusing them is about precision and not about being unparseable.
+        """
+        import datetime as _dt
+
+        parsed_a = _dt.datetime.fromisoformat(self.OFFSET_FINE_A)
+        parsed_b = _dt.datetime.fromisoformat(self.OFFSET_FINE_B)
+        self.assertNotEqual(parsed_a, parsed_b)
+        self.assertNotEqual(
+            parsed_a.astimezone(_dt.timezone.utc),
+            parsed_b.astimezone(_dt.timezone.utc),
+        )
+
+        # Neither is accepted ...
+        for value in (self.OFFSET_FINE_A, self.OFFSET_FINE_B):
+            with self.subTest(value=value):
+                self.assertIsNone(LD.normalize_cutoff(value))
+        # ... and neither is quietly mapped onto the second-precision instant
+        # both used to be truncated to -- which is exactly the collapse.
+        for value in (self.OFFSET_FINE_A, self.OFFSET_FINE_B):
+            with self.subTest(value=value):
+                self.assertNotEqual(LD.normalize_cutoff(value), self.OFFSET_FINE_UTC)
+
+    def test_a_whole_second_offset_is_still_accepted(self):
+        """Non-vacuous control: unusual but whole-second offsets keep working."""
+        # 2026-01-02T10:00:00+08:00:30 == 2026-01-02T01:59:30+00:00
+        self.assertEqual(
+            LD.normalize_cutoff("2026-01-02T10:00:00+08:00:30"),
+            "2026-01-02T01:59:30+00:00",
+        )
+        # An *explicit* zero fraction on the offset is whole-second as well.
+        self.assertEqual(
+            LD.normalize_cutoff("2026-01-02T10:00:00+08:00:00.000000"),
+            self.COARSE_UTC,
+        )
+
+    def test_a_wall_clock_fraction_cancelled_by_an_offset_fraction_is_refused(self):
+        """Fail closed even when the two fractions cancel to a whole second.
+
+        ``10:00:00.5`` at ``-08:00:00.5`` lands exactly on ``18:00:01Z``, so an
+        absolute-instant-only check would *accept* it.  The spelling still
+        carries sub-second precision, and the contract refuses rather than
+        choosing a precision for the caller -- which is why the wall clock is
+        checked as well as the absolute instant.
+        """
+        import datetime as _dt
+
+        value = "2026-01-02T10:00:00.5-08:00:00.5"
+        parsed = _dt.datetime.fromisoformat(value)
+        self.assertNotEqual(parsed.microsecond, 0)
+        self.assertEqual(parsed.astimezone(_dt.timezone.utc).microsecond, 0)
+        self.assertIsNone(LD.normalize_cutoff(value))
+
+    def test_fractional_offset_and_wall_clock_fractions_agree_on_one_policy(self):
+        """Either location for the fraction is refused; neither is special-cased."""
+        for value in (
+            "2026-01-02T10:00:00.100000+08:00",     # fraction on the wall clock
+            "2026-01-02T10:00:00+08:00:00.100000",  # fraction on the offset
+        ):
+            with self.subTest(value=value):
+                self.assertIsNone(LD.normalize_cutoff(value))
 
 
 class NoNetworkTests(DbTestCase):
