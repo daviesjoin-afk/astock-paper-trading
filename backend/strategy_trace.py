@@ -2,7 +2,7 @@
 """Deterministic, privacy-bounded strategy candidate replay traces.
 
 A replay trace records only market/factor inputs and a small whitelist of
-selection controls.  It never serializes arbitrary kwargs, account state,
+selection controls. It never serializes arbitrary kwargs, account state,
 positions, credentials, or the process environment.
 """
 from __future__ import annotations
@@ -33,28 +33,11 @@ _SAFE_SELECTION_INPUTS = {
     "condition_overrides",
 }
 _PROHIBITED_FIELD_NAMES = {
-    "account",
-    "account_id",
-    "accounts",
-    "position",
-    "positions",
-    "holding",
-    "holdings",
-    "cash",
-    "cash_balance",
-    "balance",
-    "balances",
-    "password",
-    "passwd",
-    "secret",
-    "secrets",
-    "token",
-    "api_key",
-    "authorization",
-    "cookie",
-    "cookies",
-    "environment",
-    "env",
+    "account", "account_id", "accounts",
+    "position", "positions", "holding", "holdings",
+    "cash", "cash_balance", "balance", "balances",
+    "password", "passwd", "secret", "secrets", "token", "api_key",
+    "authorization", "cookie", "cookies", "environment", "env",
 }
 
 
@@ -62,10 +45,13 @@ def _repo_root() -> Path:
     return Path(__file__).resolve().parent.parent
 
 
-def _default_trace_dir() -> Path:
+def _cache_root() -> Path:
     cache = os.environ.get("ASTOCK_CACHE_DIR")
-    root = Path(cache).expanduser() if cache else _repo_root() / "data_cache"
-    return root / "strategy_replay"
+    return Path(cache).expanduser() if cache else _repo_root() / "data_cache"
+
+
+def _default_trace_dir() -> Path:
+    return _cache_root() / "strategy_replay"
 
 
 def _canonical_git_hash(value: Any) -> str | None:
@@ -104,7 +90,9 @@ def _json_safe(value: Any) -> Any:
         return value
     if isinstance(value, Mapping):
         return {str(key): _json_safe(item) for key, item in value.items()}
-    if isinstance(value, (list, tuple, set, frozenset)):
+    if isinstance(value, (set, frozenset)):
+        return [_json_safe(item) for item in sorted(value, key=lambda item: str(item))]
+    if isinstance(value, (list, tuple)):
         return [_json_safe(item) for item in value]
     if isinstance(value, (dt.date, dt.datetime, pd.Timestamp)):
         return value.isoformat()
@@ -147,6 +135,17 @@ def _canonical_date(value: Any) -> str | None:
         return None
 
 
+def _selection_cache_factor_date() -> str | None:
+    """Read the same factor-cache date already validated by selection loading."""
+    path = _cache_root() / "selection_cache.json"
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            payload = json.load(handle) or {}
+    except (OSError, ValueError, TypeError):
+        return None
+    return _canonical_date(payload.get("factor_date"))
+
+
 def data_date(table: pd.DataFrame, explicit: Any = None) -> str:
     """Resolve one exact factor as-of date; mixed dates are never collapsed."""
     value = _canonical_date(explicit)
@@ -171,6 +170,12 @@ def data_date(table: pd.DataFrame, explicit: Any = None) -> str:
             return next(iter(dates))
         if len(dates) > 1:
             raise ValueError(f"strategy replay refuses mixed data dates in {key}")
+    # Production build_factor_table intentionally strips the source last_date
+    # column.  The selection cache metadata is its already-validated same-source
+    # as-of contract, so it is a safe final fallback; never substitute "today".
+    cached = _selection_cache_factor_date()
+    if cached:
+        return cached
     raise ValueError("strategy replay cannot prove factor data date")
 
 
