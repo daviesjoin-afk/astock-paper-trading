@@ -88,10 +88,26 @@ def save_source_health(path, payload):
 
 
 def load_source_health(path):
-    """读取最近一次数据源健康状态，不触碰网络。"""
+    """读取健康状态并叠加当前进程的实时 feed 状态，不触碰网络。
+
+    持久化快照适合审计，但 circuit/degraded 状态会在请求路径中变化；读取时
+    合并内存 registry，确保现有 `/api/health` 看到的是当前状态。进程重启后
+    registry 为空时移除旧 runtime 状态，避免把上个进程的 circuit 当成当前值。
+    """
     try:
         with open(path, encoding="utf-8") as handle:
             payload = json.load(handle)
-        return payload if isinstance(payload, dict) else {}
+        payload = dict(payload) if isinstance(payload, dict) else {}
     except (OSError, ValueError, TypeError):
-        return {}
+        payload = {}
+    try:
+        import marketdata_feeds as feeds
+        runtime_feeds = feeds.feed_health_snapshot()
+        if runtime_feeds:
+            payload["runtime_feeds"] = runtime_feeds
+        else:
+            payload.pop("runtime_feeds", None)
+    except Exception:
+        # Observability must never make health reads fail.
+        pass
+    return payload
