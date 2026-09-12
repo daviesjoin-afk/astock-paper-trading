@@ -35,19 +35,37 @@
  *      调用方无法区分 401/403/409/503。
  *
  * 收敛方式：**唯一 HTTP 原语 `request()`**，四个公开 helper 只是它的薄封装。
- * 所有权规则：本模块只**读**调用方传入的对象，绝不改写（调用方的 options 与
- * headers 在调用前后必须逐键相等）。这条规则由
- * `frontend/tests/api-request-contract.test.mjs` 用行为断言锁住，并由同文件里的
- * "单一 fetch 调用点"源码守卫防止再次漂移。
+ *
+ * 本模块对外承诺的四条不变量（均由 `frontend/tests/api-request-contract.test.mjs`
+ * 用行为断言锁住，并由同文件里的"单一 fetch 调用点"源码守卫防止再次漂移）：
+ *
+ *   A. **所有权**：只**读**调用方传入的对象，绝不改写——`options` 与 `headers`
+ *      在调用前后必须逐键相等。
+ *   B. **凭据白名单 + 主动剥离**：只有 POST/PUT/PATCH/DELETE 可能携带
+ *      `Authorization`；只读方法与未知方法（TRACE/CONNECT/自定义）**剥离**
+ *      任意大小写的既有 Authorization，而不只是"不添加"。
+ *   C. **payload 精确**：合法 JSON 值（`null`/`false`/`0`/`""`/`[]`）原样
+ *      序列化，绝不被吞成 `{}`；`undefined` 才表示"没有 payload"。
+ *   D. **Content-Type 归属**：默认 JSON 头只在**本模块自己序列化 JSON** 时补；
+ *      `api()` 的原始 body 不贴任何 Content-Type。
  */
 export var OPERATOR_TOKEN_KEY='astock.operatorToken.v1';
 
-// 只读方法：绝不附加凭据。
+// 只读方法：绝不携带凭据。与 backend/operator_auth.py 的 READ_METHODS 对齐。
 var READ_METHODS=['GET','HEAD','OPTIONS'];
+
+// **唯一**允许携带 operator 凭据的方法白名单，与 backend/operator_auth.py 的
+// WRITE_METHODS 逐字对齐（POST/PUT/PATCH/DELETE）。
+//
+// 白名单之外的一切方法——只读方法，以及 TRACE / CONNECT / 自定义方法——都必须
+// **主动剥离** Authorization，而不是"不主动添加"就算了。凭据只能出现在这四种
+// 写方法上：调用方预先塞进来的 Authorization（任意大小写）也不得搭只读/未知
+// 方法的顺风车，否则凭据会落进访问日志 / Referer 面。
+var MUTATION_METHODS=['POST','PUT','PATCH','DELETE'];
 
 // 只读请求的重试上限。一次容器重启的拒连窗口实测约 2~3 秒，4 次 / 累计约
 // 4.8 秒足以让部署重启对只读请求透明；非 5xx 首次即跳出，正常请求不受影响。
-// 写方法永远只尝试 1 次（见 request()）。
+// 只有只读方法重试；写方法与未知方法永远只尝试 1 次（见 request()）。
 var MAX_READ_ATTEMPTS=4;
 
 // 只读请求的重试白名单：只有这三种状态码代表"上游暂时不可用"。
@@ -103,6 +121,9 @@ function copyHeaders(headers){
     }
     return out;
   }
+  // 非对象（字符串 / 数字 / 布尔）不参与归一化：`for...in` 会遍历字符串的
+  // 字符下标，把 "abc" 变成 {0:'a',1:'b',2:'c'} 这种假头。
+  if(typeof headers!=='object') return out;
   for(var key in headers){
     if(Object.prototype.hasOwnProperty.call(headers,key)) out[key]=headers[key];
   }
@@ -121,18 +142,41 @@ function hasHeader(headers,name){
 }
 
 /**
- * 按方法决定是否附加凭据。
- * - mutation（POST/PUT/PATCH/DELETE）→ 追加标准 authorization 头（Bearer 方案）
- * - read（GET/HEAD/OPTIONS）、未知方法 → 原样返回，绝不附加
+ * 大小写不敏感地删除**所有** Authorization 键（`Authorization` /
+ * `authorization` / `AUTHORIZATION` …）。
  *
- * 返回值永远是**新对象**：调用方传入的 headers 不会被改写（PR-8 缺陷 1）。
+ * 为什么必须删除而不是"不添加"：只要留下任意一种大小写的同名头，fetch 就会
+ * 把它原样发出去。凭据是否随请求出去，必须由本模块唯一决定。
+ */
+function stripAuthorization(headers){
+  for(var key in headers){
+    if(Object.prototype.hasOwnProperty.call(headers,key) && String(key).toLowerCase()==='authorization'){
+      delete headers[key];
+    }
+  }
+  return headers;
+}
+
+/**
+ * 按方法决定凭据头。返回值永远是**新对象**：调用方传入的 headers 不会被改写。
+ *
+ * 规则（白名单制，不是"非只读即写"）：
+ * - 只读方法（GET/HEAD/OPTIONS）→ 返回副本，并**剥离**任意大小写的 Authorization；
+ * - 未知方法（TRACE / CONNECT / 自定义）→ 同上，剥离；既不携带凭据，也不重试；
+ * - 白名单写方法（POST/PUT/PATCH/DELETE）+ 已解锁 → 先剥离任意大小写的既有
+ *   Authorization，再写入标准的 Authorization 头（Bearer 方案）（不这样做会出现
+ *   两个同名异大小写的键，被 fetch 合并成逗号串 → 凭据非法）；
+ * - 白名单写方法但未解锁 → 原样返回副本，不抛错、不阻断（由服务端按契约拒绝）。
  */
 export function operatorAuthorizationHeaders(method, headers){
   var out=copyHeaders(headers);
   var verb=String(method||'GET').toUpperCase();
-  if(READ_METHODS.indexOf(verb)>=0) return out;
+  if(READ_METHODS.indexOf(verb)>=0) return stripAuthorization(out);
+  if(MUTATION_METHODS.indexOf(verb)<0) return stripAuthorization(out);
   var token=getOperatorToken();
-  if(token) out['Authorization']='Bearer '+token;
+  if(!token) return out;
+  stripAuthorization(out);
+  out['Authorization']='Bearer '+token;
   return out;
 }
 
@@ -254,8 +298,10 @@ async function _settle(response, verb, path){
  *
  * - 只读方法：网络异常与 502/503/504 最多重试 MAX_READ_ATTEMPTS 次；
  * - 写方法与未知方法：**永远只尝试 1 次**（一次 502/503/504 被自动重放会带来
- *   重复副作用：重复下单 / 重复启动）。
- * - Content-Type 只在真的带 body 时补默认值。
+ *   重复副作用：重复下单 / 重复启动）。未知方法同样不重试，但也同样不携带凭据。
+ * - `options.jsonBody === true` 表示 body 是**本模块序列化出来的 JSON**，此时才补
+ *   默认 `Content-Type: application/json`。`api()` 的 body 是调用方的原始 body
+ *   （可能是文本 / FormData / URLSearchParams），不得凭空贴 JSON 头。
  */
 async function request(method, path, options){
   options=options||{};
@@ -264,7 +310,9 @@ async function request(method, path, options){
   var attempts=isRead?MAX_READ_ATTEMPTS:1;
   var hasBody=options.body!==undefined && options.body!==null;
   var headers=operatorAuthorizationHeaders(verb, options.headers);
-  if(hasBody && !hasHeader(headers,'Content-Type')) headers['Content-Type']='application/json';
+  if(hasBody && options.jsonBody===true && !hasHeader(headers,'Content-Type')){
+    headers['Content-Type']='application/json';
+  }
   var timeoutMs=Number(options.timeout)>0?Number(options.timeout):DEFAULT_TIMEOUT_MS;
 
   var response;
@@ -283,8 +331,9 @@ async function request(method, path, options){
 }
 
 /**
- * 通用入口。`options` 只被读取，绝不改写。
- * `{method, headers, body, timeout}` 均透传给唯一原语。
+ * 通用入口（原始 body）。`options` 只被读取，绝不改写。
+ * `body` 按原样透传——不序列化、不贴 Content-Type；调用方要发 JSON 就自己
+ * 设 `Content-Type`（或直接用 `apiPostJson` / `apiJson`）。
  */
 export async function api(path, options){
   options=options||{};
@@ -301,22 +350,33 @@ export async function apiPost(path, options){
   });
 }
 
-/** POST + JSON body。payload 缺省等价于 `{}`。 */
+/**
+ * POST + JSON body。
+ *
+ * payload 序列化规则：**只有 `undefined` 走兼容例外**（历史行为是发 `{}`，
+ * 且真实端点都期望一个 JSON 对象），其余值一律 `JSON.stringify(payload)`
+ * 原样发送。刻意**不用** `payload || {}`——那会把 `false` / `0` / `null` / `""`
+ * 这些合法 JSON 值吞成 `{}`。
+ */
 export async function apiPostJson(path, payload, options){
   options=options||{};
+  var body=payload===undefined?'{}':JSON.stringify(payload);
   return request('POST', path, {
-    headers: options.headers, body: JSON.stringify(payload||{}), timeout: options.timeout,
+    headers: options.headers, body: body, timeout: options.timeout, jsonBody: true,
   });
 }
 
 /**
  * 任意方法 + 可选 JSON body。
- * `payload === undefined` → **不发 body**（也不再附 Content-Type）。
+ *
+ * `payload === undefined` → **不发 body**，也不附 Content-Type（GET/DELETE 的
+ * 常态）。其余值一律原样序列化：`null` → `'null'`、`false` → `'false'`、
+ * `0` → `'0'`、`""` → `'""'`、`[]` → `'[]'`。
  */
 export async function apiJson(path, method, payload, options){
   options=options||{};
-  var body=payload===undefined?undefined:JSON.stringify(payload||{});
+  var body=payload===undefined?undefined:JSON.stringify(payload);
   return request(method||'GET', path, {
-    headers: options.headers, body: body, timeout: options.timeout,
+    headers: options.headers, body: body, timeout: options.timeout, jsonBody: true,
   });
 }

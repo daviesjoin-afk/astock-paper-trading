@@ -322,7 +322,168 @@ test("无法识别的 headers 入参不抛错（请求照发，由服务端按�
 });
 
 // ─────────────────────────────────────────────
-// 3. 写方法永不重放（mutation non-replay）
+// 3. 凭据归属：白名单 + 主动剥离
+//
+// 契约：凭据只允许出现在 POST/PUT/PATCH/DELETE 上。只读方法（GET/HEAD/OPTIONS）
+// 与未知方法（TRACE/CONNECT/自定义）不仅要"不添加"，还必须**主动剥离**调用方
+// 预先塞进来的 Authorization —— 任意大小写。
+//
+// 为什么"不添加"不够：`operatorAuthorizationHeaders("GET", {Authorization:'Bearer fake-stale'})`
+// 若只是原样返回副本，凭据就会随只读请求发出去（访问日志 / Referer 面）。
+// ─────────────────────────────────────────────
+
+/** Authorization 的所有键（任意大小写）——必须为空才叫"剥离干净"。 */
+function authorizationKeys(headers) {
+  return Object.keys(headers || {}).filter((k) => k.toLowerCase() === "authorization");
+}
+
+const FAKE_STALE = "Bearer fake-stale-credential-must-not-ride-a-read";
+const NON_MUTATION_METHODS = [...READ_METHODS, "TRACE", "CONNECT", "PROPFIND", "custom-verb"];
+
+test("只读方法与未知方法：helper 剥离任意大小写的既有 Authorization", () => {
+  reset();
+  API.setOperatorToken(TOKEN); // 即使已解锁也必须剥离
+  const casings = [
+    { Authorization: FAKE_STALE },
+    { authorization: FAKE_STALE },
+    { AUTHORIZATION: FAKE_STALE },
+    { AuThOrIzAtIoN: FAKE_STALE },
+  ];
+  for (const method of NON_MUTATION_METHODS) {
+    for (const caller of casings) {
+      const out = API.operatorAuthorizationHeaders(method, caller);
+      assert.deepEqual(
+        authorizationKeys(out),
+        [],
+        `${method} + ${JSON.stringify(caller)} 必须剥离 Authorization`,
+      );
+    }
+  }
+});
+
+test("剥离 Authorization 时保留其它无关头", () => {
+  reset();
+  API.setOperatorToken(TOKEN);
+  const out = API.operatorAuthorizationHeaders("GET", {
+    Authorization: FAKE_STALE,
+    "X-Trace-Id": "t-9",
+    "Content-Type": "text/plain",
+  });
+  assert.deepEqual(authorizationKeys(out), []);
+  assert.equal(out["X-Trace-Id"], "t-9");
+  assert.equal(out["Content-Type"], "text/plain");
+});
+
+test("helper 剥离时不改写调用方对象（剥离的是副本）", () => {
+  reset();
+  API.setOperatorToken(TOKEN);
+  const caller = { Authorization: FAKE_STALE, "X-Trace-Id": "t-10" };
+  API.operatorAuthorizationHeaders("GET", caller);
+  assert.equal(caller.Authorization, FAKE_STALE, "调用方对象必须原样");
+  assert.equal(caller["X-Trace-Id"], "t-10");
+});
+
+test(
+  "Headers 实例里的既有 Authorization 也会被剥离（只读）",
+  { skip: HAS_HEADERS ? false : "本运行时没有全局 Headers" },
+  () => {
+    reset();
+    API.setOperatorToken(TOKEN);
+    const out = API.operatorAuthorizationHeaders(
+      "GET",
+      new Headers({ Authorization: FAKE_STALE, "X-Trace-Id": "t-11" }),
+    );
+    assert.deepEqual(authorizationKeys(out), []);
+    assert.equal(headerValue(out, "X-Trace-Id"), "t-11");
+  },
+);
+
+test("二元组数组里的既有 Authorization 也会被剥离（只读）", () => {
+  reset();
+  API.setOperatorToken(TOKEN);
+  const out = API.operatorAuthorizationHeaders("HEAD", [
+    ["Authorization", FAKE_STALE],
+    ["X-Trace-Id", "t-12"],
+  ]);
+  assert.deepEqual(authorizationKeys(out), []);
+  assert.equal(out["X-Trace-Id"], "t-12");
+});
+
+test("直接回归：调用方预置 Authorization 时，GET 请求不得带出去", async () => {
+  reset();
+  API.setOperatorToken(TOKEN);
+  const caller = { Authorization: FAKE_STALE };
+  const calls = await withFetch(OK, () => API.api("/api/version", { headers: caller }));
+
+  assert.deepEqual(
+    authorizationKeys(calls[0].headers),
+    [],
+    "只读请求不得携带调用方预置的 Authorization",
+  );
+  assert.equal(caller.Authorization, FAKE_STALE, "调用方对象仍应原样");
+});
+
+test(
+  "直接回归：Headers 实例预置 Authorization，只读请求不得带出去",
+  { skip: HAS_HEADERS ? false : "本运行时没有全局 Headers" },
+  async () => {
+    reset();
+    API.setOperatorToken(TOKEN);
+    const calls = await withFetch(OK, () =>
+      API.api("/api/version", { headers: new Headers({ Authorization: FAKE_STALE }) }),
+    );
+    assert.deepEqual(authorizationKeys(calls[0].headers), []);
+  },
+);
+
+test("未知方法绝不携带凭据，且仍然只尝试 1 次", async () => {
+  reset();
+  API.setOperatorToken(TOKEN);
+  for (const method of ["TRACE", "CONNECT", "PROPFIND", "custom-verb"]) {
+    const calls = await withFetch(
+      () => FAIL(503, { detail: "stub" }),
+      () =>
+        withFastBackoff(() =>
+          rejectionOf(() => API.api("/api/paper/start", { method })),
+        ),
+    );
+    assert.equal(calls.length, 1, `${method} 不得重试`);
+    assert.deepEqual(
+      authorizationKeys(calls[0].headers),
+      [],
+      `${method} 不得携带 operator 凭据`,
+    );
+  }
+});
+
+test("写方法上的既有 Authorization 被规范化为唯一一个标准键", () => {
+  reset();
+  API.setOperatorToken(TOKEN);
+  const out = API.operatorAuthorizationHeaders("POST", {
+    authorization: "Bearer fake-stale",
+    "X-Trace-Id": "t-13",
+  });
+  assert.deepEqual(
+    authorizationKeys(out),
+    ["Authorization"],
+    "必须只剩一个规范大小写的键（否则 fetch 会把两个同名头合并成逗号串）",
+  );
+  assert.equal(out.Authorization, "Bearer " + TOKEN);
+  assert.equal(out["X-Trace-Id"], "t-13");
+});
+
+test("写方法已解锁时凭据覆盖调用方预置值（不叠加）", async () => {
+  reset();
+  API.setOperatorToken(TOKEN);
+  const calls = await withFetch(OK, () =>
+    API.apiPost("/api/paper/pause", { headers: { Authorization: FAKE_STALE } }),
+  );
+  assert.deepEqual(authorizationKeys(calls[0].headers), ["Authorization"]);
+  assert.equal(calls[0].headers.Authorization, "Bearer " + TOKEN);
+});
+
+// ─────────────────────────────────────────────
+// 4. 写方法与未知方法永不重放（mutation non-replay）
 // ─────────────────────────────────────────────
 
 for (const method of [...WRITE_METHODS, "TRACE", "trace"]) {
@@ -371,7 +532,7 @@ test("写方法超时后也不重放", async () => {
 });
 
 // ─────────────────────────────────────────────
-// 4. 只读方法的重试作用域
+// 5. 只读方法的重试作用域
 // ─────────────────────────────────────────────
 
 test("GET 遇 502/503/504 会重试，上限 4 次", async () => {
@@ -433,7 +594,7 @@ test("HEAD / OPTIONS 与 GET 同属只读族（同样带重试、同样不带凭
 });
 
 // ─────────────────────────────────────────────
-// 5. body 序列化与 Content-Type
+// 6. body 序列化与 Content-Type
 // ─────────────────────────────────────────────
 
 test("apiPost 不发 body、不附 Content-Type", async () => {
@@ -450,10 +611,32 @@ test("apiPostJson 总是发 JSON body 并附 Content-Type", async () => {
   assert.equal(headerValue(calls[0].headers, "Content-Type"), "application/json");
 });
 
-test("apiPostJson 的 payload 缺省等价于 {}", async () => {
+test("apiPostJson 的 payload 缺省走显式兼容例外：发 {}（而不是 undefined 静默丢弃）", async () => {
   reset();
   const calls = await withFetch(OK, () => API.apiPostJson("/api/strategies"));
   assert.equal(calls[0].init.body, "{}");
+  assert.equal(headerValue(calls[0].headers, "Content-Type"), "application/json");
+});
+
+test("apiPostJson：合法 JSON 假值不被吞成 {}（禁止 `payload || {}`）", async () => {
+  reset();
+  const matrix = [
+    [false, "false"],
+    [0, "0"],
+    [null, "null"],
+    ["", '""'],
+    ["abc", '"abc"'],
+    [[], "[]"],
+    [{}, "{}"],
+  ];
+  for (const [payload, expected] of matrix) {
+    const calls = await withFetch(OK, () => API.apiPostJson("/api/strategies", payload));
+    assert.equal(
+      calls[0].init.body,
+      expected,
+      `apiPostJson(${JSON.stringify(payload)}) 必须原样发送 ${expected}`,
+    );
+  }
 });
 
 test("apiJson 无 payload 时不发 body、不附 Content-Type（旧实现在这里漂移）", async () => {
@@ -478,10 +661,38 @@ test("apiJson 有 payload 时序列化并附 Content-Type", async () => {
   assert.equal(headerValue(calls[0].headers, "Content-Type"), "application/json");
 });
 
-test("apiJson(payload=null) 与 undefined 语义一致地序列化为 {}", async () => {
+test("apiJson 的完整 payload 矩阵：undefined 才是「没有 payload」", async () => {
+  reset();
+  const matrix = [
+    [undefined, undefined],
+    [{}, "{}"],
+    [[], "[]"],
+    [false, "false"],
+    [0, "0"],
+    [null, "null"],
+    ["abc", '"abc"'],
+    ["", '""'],
+  ];
+  for (const [payload, expected] of matrix) {
+    const calls = await withFetch(OK, () => API.apiJson("/api/strategies/x", "PATCH", payload));
+    assert.equal(
+      calls[0].init.body,
+      expected,
+      `apiJson(PATCH, ${String(payload)}) 的 body 必须是 ${String(expected)}`,
+    );
+    if (expected === undefined) {
+      assert.equal(headerValue(calls[0].headers, "Content-Type"), undefined);
+    } else {
+      assert.equal(headerValue(calls[0].headers, "Content-Type"), "application/json");
+    }
+  }
+});
+
+test("apiJson(payload=null) 发送 JSON 字面量 null，而不是 {}", async () => {
   reset();
   const calls = await withFetch(OK, () => API.apiJson("/api/strategies/x", "PATCH", null));
-  assert.equal(calls[0].init.body, "{}");
+  assert.equal(calls[0].init.body, "null");
+  assert.equal(headerValue(calls[0].headers, "Content-Type"), "application/json");
 });
 
 test("调用方显式提供的 Content-Type 被保留且不重复", async () => {
@@ -499,11 +710,49 @@ test("调用方显式提供的 Content-Type 被保留且不重复", async () => 
 test("api(path, options) 的 body 被透传（通用入口不再丢弃 body）", async () => {
   reset();
   API.setOperatorToken(TOKEN);
+  const raw = JSON.stringify({ a: 1 });
   const calls = await withFetch(OK, () =>
-    API.api("/api/strategies", { method: "PUT", body: JSON.stringify({ a: 1 }) }),
+    API.api("/api/strategies", { method: "PUT", body: raw }),
   );
-  assert.equal(calls[0].init.body, JSON.stringify({ a: 1 }));
-  assert.equal(headerValue(calls[0].headers, "Content-Type"), "application/json");
+  assert.equal(calls[0].init.body, raw);
+});
+
+test("api() 的原始 body 不得被凭空贴上 JSON Content-Type", async () => {
+  reset();
+  API.setOperatorToken(TOKEN);
+  const calls = await withFetch(OK, () =>
+    API.api("/api/strategies", { method: "POST", body: "plain text" }),
+  );
+  assert.equal(calls[0].init.body, "plain text");
+  assert.equal(
+    headerValue(calls[0].headers, "Content-Type"),
+    undefined,
+    "api() 是原始 body 入口，可能是文本/FormData/URLSearchParams，不得自行判定为 JSON",
+  );
+});
+
+test("api() 原始 body：调用方自己给的 Content-Type 被原样保留", async () => {
+  reset();
+  API.setOperatorToken(TOKEN);
+  const calls = await withFetch(OK, () =>
+    API.api("/api/strategies", {
+      method: "POST",
+      body: "a=1&b=2",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    }),
+  );
+  assert.equal(headerValue(calls[0].headers, "Content-Type"), "application/x-www-form-urlencoded");
+});
+
+test("apiPostJson / apiJson 才补默认 JSON Content-Type（与 api() 对比）", async () => {
+  reset();
+  const jsonCalls = await withFetch(OK, () => API.apiPostJson("/api/strategies", { a: 1 }));
+  assert.equal(headerValue(jsonCalls[0].headers, "Content-Type"), "application/json");
+
+  const rawCalls = await withFetch(OK, () =>
+    API.api("/api/strategies", { method: "POST", body: '{"a":1}' }),
+  );
+  assert.equal(headerValue(rawCalls[0].headers, "Content-Type"), undefined);
 });
 
 test("只读请求带 cache:'no-store'（旧实现只有 api() 有）", async () => {
@@ -513,7 +762,7 @@ test("只读请求带 cache:'no-store'（旧实现只有 api() 有）", async ()
 });
 
 // ─────────────────────────────────────────────
-// 6. 超时
+// 7. 超时
 // ─────────────────────────────────────────────
 
 test("四个公开 helper 都会传 AbortSignal（旧实现只有 api() 有超时）", async () => {
@@ -565,7 +814,7 @@ test("默认超时是 25000ms（未显式指定 timeout 时）", async () => {
 });
 
 // ─────────────────────────────────────────────
-// 7. ApiError：HTTP 语义 + 不泄漏凭据
+// 8. ApiError：HTTP 语义 + 不泄漏凭据
 // ─────────────────────────────────────────────
 
 test("失败响应抛出 ApiError，带 status / detail / payload / method / path", async () => {
@@ -684,7 +933,7 @@ test("ApiError 不把请求头带进 payload（服务端没说的一律不带）
 });
 
 // ─────────────────────────────────────────────
-// 8. 源码守卫：单一 fetch 调用点 + 公开面不缩水
+// 9. 源码守卫：单一 fetch 调用点 + 公开面不缩水
 // ─────────────────────────────────────────────
 
 /**
