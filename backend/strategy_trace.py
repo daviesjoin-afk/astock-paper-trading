@@ -5,6 +5,10 @@ Replay data is content-addressed and column-sharded. Static factor columns are
 stored once and reused by every strategy/run; only changed live columns create
 new blobs. Arbitrary kwargs, account state, positions, credentials and process
 environment data are never serialized.
+
+Exact full-table replay artifacts are retained for a bounded window. Compact
+per-candidate provenance remains in the caller's durable signal/result payload
+and is not managed by this module's blob retention.
 """
 from __future__ import annotations
 
@@ -16,6 +20,7 @@ import os
 import re
 import subprocess
 import tempfile
+import time
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 
@@ -44,6 +49,8 @@ _PROHIBITED_FIELD_NAMES = {
     "password", "passwd", "secret", "secrets", "token", "api_key",
     "authorization", "cookie", "cookies", "environment", "env",
 }
+REPLAY_RETENTION_DAYS = 90
+_REPLAY_PRUNE_INTERVAL_SECONDS = 24 * 60 * 60
 
 
 def _repo_root() -> Path:
@@ -203,11 +210,23 @@ def _blob_path(root: Path, kind: str, blob_id: str) -> Path:
     return root / kind / f"{blob_id}.json.gz"
 
 
+def _blob_id_from_path(path: Path) -> str | None:
+    name = path.name
+    if not name.endswith(".json.gz"):
+        return None
+    blob_id = name[:-8]
+    return blob_id if _BLOB_ID.fullmatch(blob_id) else None
+
+
 def _write_blob(root: Path, kind: str, payload: Mapping[str, Any]) -> str:
     raw = _canonical_json(payload)
     blob_id = hashlib.sha256(raw).hexdigest()
     path = _blob_path(root, kind, blob_id)
     if path.exists():
+        # mtime is the last-use clock for retention. Touching reused blobs also
+        # closes the race where a concurrent GC sees an old shared blob before
+        # a just-created run manifest becomes visible.
+        os.utime(path, None)
         return blob_id
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, temp_name = tempfile.mkstemp(prefix=f".{blob_id}.", suffix=".tmp", dir=path.parent)
@@ -295,6 +314,113 @@ def _load_table(root: Path, manifest: Mapping[str, Any]) -> pd.DataFrame:
     return table.loc[:, ordered_columns]
 
 
+def prune_snapshots(
+    *,
+    trace_dir: Path | str | None = None,
+    now: float | None = None,
+    retention_days: int = REPLAY_RETENTION_DAYS,
+) -> dict[str, Any]:
+    """Delete expired run manifests, then old blobs no surviving run references.
+
+    Shared table blobs are never removed while any retained run references them.
+    Unreferenced blobs also need to be older than the retention cutoff, which
+    protects blobs written by a concurrent process before its run manifest.
+    """
+    root = Path(trace_dir) if trace_dir is not None else _default_trace_dir()
+    retention_days = max(1, int(retention_days))
+    now_value = float(time.time() if now is None else now)
+    cutoff = now_value - retention_days * 86400
+    runs_dir = root / "runs"
+    if not runs_dir.exists():
+        return {
+            "status": "ok",
+            "retention_days": retention_days,
+            "deleted_runs": 0,
+            "deleted_indexes": 0,
+            "deleted_columns": 0,
+        }
+
+    deleted_runs = 0
+    for path in list(runs_dir.glob("*.json.gz")):
+        try:
+            if path.stat().st_mtime < cutoff:
+                path.unlink()
+                deleted_runs += 1
+        except FileNotFoundError:
+            continue
+
+    live_indexes: set[str] = set()
+    live_columns: set[str] = set()
+    for path in list(runs_dir.glob("*.json.gz")):
+        blob_id = _blob_id_from_path(path)
+        if blob_id is None:
+            continue
+        try:
+            payload = _read_blob(root, "runs", blob_id)
+            table = payload.get("table") or {}
+            index_id = str(table.get("index_id") or "")
+            column_ids = [str(item.get("blob_id") or "") for item in table.get("columns") or []]
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            # A surviving unreadable manifest means references are unknowable.
+            # Fail safe by skipping shared-blob GC rather than causing more loss.
+            return {
+                "status": "skipped",
+                "reason": "unreadable_live_run",
+                "retention_days": retention_days,
+                "deleted_runs": deleted_runs,
+                "deleted_indexes": 0,
+                "deleted_columns": 0,
+            }
+        if not _BLOB_ID.fullmatch(index_id) or any(not _BLOB_ID.fullmatch(item) for item in column_ids):
+            return {
+                "status": "skipped",
+                "reason": "invalid_live_run_references",
+                "retention_days": retention_days,
+                "deleted_runs": deleted_runs,
+                "deleted_indexes": 0,
+                "deleted_columns": 0,
+            }
+        live_indexes.add(index_id)
+        live_columns.update(column_ids)
+
+    deleted = {"indexes": 0, "columns": 0}
+    for kind, live in (("indexes", live_indexes), ("columns", live_columns)):
+        directory = root / kind
+        if not directory.exists():
+            continue
+        for path in list(directory.glob("*.json.gz")):
+            blob_id = _blob_id_from_path(path)
+            if blob_id is None or blob_id in live:
+                continue
+            try:
+                if path.stat().st_mtime < cutoff:
+                    path.unlink()
+                    deleted[kind] += 1
+            except FileNotFoundError:
+                continue
+
+    return {
+        "status": "ok",
+        "retention_days": retention_days,
+        "deleted_runs": deleted_runs,
+        "deleted_indexes": deleted["indexes"],
+        "deleted_columns": deleted["columns"],
+    }
+
+
+def _maybe_prune(root: Path) -> None:
+    marker = root / ".last_prune"
+    now_value = time.time()
+    try:
+        if marker.exists() and now_value - marker.stat().st_mtime < _REPLAY_PRUNE_INTERVAL_SECONDS:
+            return
+    except OSError:
+        pass
+    prune_snapshots(trace_dir=root, now=now_value)
+    root.mkdir(parents=True, exist_ok=True)
+    marker.touch()
+
+
 def persist_snapshot(
     *,
     strategy_id: str,
@@ -331,6 +457,7 @@ def persist_snapshot(
         "table": table_manifest,
     }
     snapshot_id = _write_blob(root, "runs", snapshot)
+    _maybe_prune(root)
     return {
         "schema": TRACE_SCHEMA,
         "snapshot_id": snapshot_id,
@@ -338,6 +465,7 @@ def persist_snapshot(
         "code_version": resolved_version,
         "factor_inputs": list(factors),
         "row_count": len(table),
+        "retention_days": REPLAY_RETENTION_DAYS,
     }
 
 
