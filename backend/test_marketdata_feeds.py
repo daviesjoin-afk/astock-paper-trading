@@ -2,6 +2,7 @@
 import unittest
 from unittest import mock
 
+import data_fetcher as dfc
 import marketdata_feeds as feeds
 
 
@@ -21,6 +22,23 @@ class DataFeedContractTests(unittest.TestCase):
     def test_protocol_is_structural(self):
         fake = _FakeFeed("fake", {}, [])
         self.assertIsInstance(fake, feeds.DataFeed)
+        self.assertIsInstance(
+            feeds.TencentRealtimeFeed(
+                http_get=lambda *_args, **_kwargs: "",
+                parser=lambda *_args, **_kwargs: [],
+                reset_data_source=lambda *_args, **_kwargs: None,
+            ),
+            feeds.DataFeed,
+        )
+        self.assertIsInstance(
+            feeds.SinaRealtimeFeed(
+                session_factory=lambda: None,
+                headers={},
+                parser=lambda *_args, **_kwargs: [],
+                reset_data_source=lambda *_args, **_kwargs: None,
+            ),
+            feeds.DataFeed,
+        )
 
     def test_normalize_codes_is_ordered_deduplicated_and_strict(self):
         self.assertEqual(
@@ -93,6 +111,26 @@ class DataFeedContractTests(unittest.TestCase):
         self.assertEqual(calls, [["000001"], ["000001"]])
         reset.assert_called_once()
         sleep.assert_called_once_with(0.25)
+
+
+class DataFetcherFacadeTests(unittest.TestCase):
+    def test_independent_quote_facade_delegates_without_changing_public_api(self):
+        expected = [{"code": "000001", "price": 10.0, "quote_at": "2026-09-12T10:00:00+08:00"}]
+        feed = mock.Mock()
+        feed.fetch_realtime.return_value = expected
+        with mock.patch.object(dfc, "_independent_realtime_feed", return_value=feed):
+            self.assertEqual(dfc.fetch_independent_realtime_for_codes(["000001"]), expected)
+        feed.fetch_realtime.assert_called_once_with(["000001"])
+
+    def test_provider_specific_facades_delegate_to_matching_adapters(self):
+        tencent = mock.Mock()
+        sina = mock.Mock()
+        tencent.fetch_realtime.return_value = [{"code": "000001"}]
+        sina.fetch_realtime.return_value = [{"code": "000002"}]
+        with mock.patch.object(dfc, "_tencent_realtime_feed", return_value=tencent):
+            self.assertEqual(dfc.fetch_tencent_realtime_for_codes(["000001"]), [{"code": "000001"}])
+        with mock.patch.object(dfc, "_sina_realtime_feed", return_value=sina):
+            self.assertEqual(dfc._fetch_sina_realtime_for_codes(["000002"]), [{"code": "000002"}])
 
 
 class TencentRealtimeFeedTests(unittest.TestCase):
