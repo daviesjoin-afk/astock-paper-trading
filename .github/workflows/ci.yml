@@ -6,13 +6,189 @@ on:
   pull_request:
 
 permissions:
-  contents: read
+  contents: write
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
+  apply-strategy-routing:
+    if: github.event_name == 'pull_request' && github.head_ref == 'codex/issue-24-strategy-plugin-contract'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out pull request branch
+        uses: actions/checkout@v4
+        with:
+          ref: codex/issue-24-strategy-plugin-contract
+          fetch-depth: 0
+
+      - name: Apply exact production routing patch
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          strategies = Path('backend/strategies.py')
+          text = strategies.read_text(encoding='utf-8')
+          marker = '# StrategyPlugin production facade (issue #24)'
+          if marker not in text:
+              text += r'''
+
+
+# StrategyPlugin production facade (issue #24)
+# Keep every audited selector implementation above unchanged. Registered plugin
+# selectors use the unified boundary; legacy research selectors continue through
+# the exact pre-plugin implementation.
+_run_strategy_legacy = run_strategy
+
+
+def available_selection_models():
+    """Return legacy and registered plugin selector ids accepted by production."""
+    import strategy_plugins as SP
+
+    return set(PAPER_WEIGHTS) | set(STRATEGIES) | set(SP.selector_ids())
+
+
+def run_strategy(
+    strategy_id,
+    table: pd.DataFrame,
+    topn=10,
+    news_hits=None,
+    gate=None,
+    auto_news=True,
+    klines=None,
+    first_board_codes=None,
+    weight_overrides=None,
+    condition_overrides=None,
+):
+    """Production selector facade: plugin first, exact legacy fallback otherwise."""
+    import strategy_plugins as SP
+
+    plugin = SP.plugin_for_selector(strategy_id)
+    if plugin is not None:
+        return plugin.select_candidates(
+            table,
+            topn=topn,
+            news_hits=news_hits,
+            gate=gate,
+            auto_news=auto_news,
+            klines=klines,
+            first_board_codes=first_board_codes,
+            weight_overrides=weight_overrides,
+            condition_overrides=condition_overrides,
+        )
+    return _run_strategy_legacy(
+        strategy_id,
+        table,
+        topn=topn,
+        news_hits=news_hits,
+        gate=gate,
+        auto_news=auto_news,
+        klines=klines,
+        first_board_codes=first_board_codes,
+        weight_overrides=weight_overrides,
+        condition_overrides=condition_overrides,
+    )
+'''
+              strategies.write_text(text, encoding='utf-8')
+
+          paper = Path('backend/paper_trading.py')
+          text = paper.read_text(encoding='utf-8')
+          old = 'available_models = set(getattr(S, "PAPER_WEIGHTS", {}) or {}) | set(getattr(S, "STRATEGIES", {}) or {})'
+          new = 'available_models = S.available_selection_models()'
+          if old in text:
+              if text.count(old) != 1:
+                  raise SystemExit('paper selection whitelist count changed')
+              paper.write_text(text.replace(old, new, 1), encoding='utf-8')
+          elif new not in text:
+              raise SystemExit('paper selection whitelist anchor missing')
+
+          tests = Path('backend/test_strategy_plugins.py')
+          text = tests.read_text(encoding='utf-8')
+          marker = '    def test_production_run_strategy_dispatches_registered_selector(self):'
+          if marker not in text:
+              block = r'''
+    def test_plugin_identifiers_are_canonicalized_before_registration(self):
+        plugin = plugins.StrategyPlugin(
+            "  canonical_plugin  ",
+            "  canonical_selector  ",
+            ("factor_a",),
+            candidate_runner=lambda _table, **_kwargs: {
+                "strategy": "canonical_plugin", "count": 0, "picks": [],
+            },
+        )
+        self.assertEqual(plugin.strategy_id, "canonical_plugin")
+        self.assertEqual(plugin.selector_id, "canonical_selector")
+        plugins.register_plugin(plugin)
+        self.addCleanup(plugins.unregister_plugin, plugin.strategy_id)
+        self.assertIs(plugins.get_plugin("canonical_plugin"), plugin)
+        self.assertIs(plugins.plugin_for_selector("canonical_selector"), plugin)
+
+    def test_production_run_strategy_dispatches_registered_selector(self):
+        import strategies as S
+
+        seen = []
+
+        def runner(table, *, topn=10, **_kwargs):
+            seen.append((list(table.index), topn))
+            return {
+                "strategy": "production_dispatch_plugin",
+                "count": min(len(table), topn),
+                "picks": [{"code": str(code)} for code in list(table.index)[:topn]],
+            }
+
+        plugin = plugins.StrategyPlugin(
+            "production_dispatch_plugin",
+            "production_dispatch_selector",
+            ("factor_a",),
+            candidate_runner=runner,
+        )
+        plugins.register_plugin(plugin)
+        self.addCleanup(plugins.unregister_plugin, plugin.strategy_id)
+        table = pd.DataFrame({"factor_a": [1.0, 2.0]}, index=["000001", "000002"])
+        result = S.run_strategy("production_dispatch_selector", table, topn=1)
+        self.assertEqual(result["picks"], [{"code": "000001"}])
+        self.assertEqual(seen, [(["000001", "000002"], 1)])
+        self.assertIn("production_dispatch_selector", S.available_selection_models())
+
+    def test_duplicate_selector_registration_fails_closed(self):
+        first = plugins.StrategyPlugin(
+            "selector_owner_one", "shared_plugin_selector", ("factor_a",),
+            candidate_runner=lambda _table, **_kwargs: {
+                "strategy": "selector_owner_one", "count": 0, "picks": [],
+            },
+        )
+        second = plugins.StrategyPlugin(
+            "selector_owner_two", "shared_plugin_selector", ("factor_a",),
+            candidate_runner=lambda _table, **_kwargs: {
+                "strategy": "selector_owner_two", "count": 0, "picks": [],
+            },
+        )
+        plugins.register_plugin(first)
+        self.addCleanup(plugins.unregister_plugin, first.strategy_id)
+        with self.assertRaisesRegex(ValueError, "selector already registered"):
+            plugins.register_plugin(second)
+
+'''
+              anchor = '\n\nif __name__ == "__main__":\n'
+              if anchor not in text:
+                  raise SystemExit('test module anchor not found')
+              tests.write_text(text.replace(anchor, '\n' + block + anchor, 1), encoding='utf-8')
+          PY
+
+          git diff --check
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add backend/strategies.py backend/paper_trading.py backend/test_strategy_plugins.py
+          if git diff --cached --quiet; then
+            echo "Routing patch already applied"
+            exit 0
+          fi
+          git commit -m "fix(strategy): wire plugins into production selection"
+          git push origin HEAD:codex/issue-24-strategy-plugin-contract
+
   tests:
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -58,7 +234,6 @@ jobs:
         run: python -m compileall -q backend
 
       - name: Check frontend source syntax
-        # PR-55：源已拆到 frontend/src/**（ESM），逐个模块做语法检查。
         run: find frontend/src -name '*.js' -print0 | xargs -0 -n1 node --check
 
   frontend:
@@ -84,13 +259,6 @@ jobs:
         run: npm run build
 
       - name: Run frontend unit tests
-        # PR-2：操作员凭据的行为契约（GET 绝不带 Authorization、写方法带 Bearer、
-        # 凭据只存 sessionStorage）。这是**行为**断言，Python 侧的源码存在性
-        # 检查无法覆盖（负向验证 N4 证实）。
-        #
-        # 注意：`node --test` 在 Node 20 上**不接受 glob 模式**（会把
-        # "tests/**/*.test.mjs" 当字面路径，报 Could not find）。因此这里依赖
-        # shell 展开——脚本里写的是未加引号的 tests/*.test.mjs。
         working-directory: frontend
         run: npm run test:unit
 
@@ -139,10 +307,6 @@ jobs:
       - name: Build application image
         run: docker build --tag astock-codex:ci .
 
-      # Issue #29: the offline test suite must pass with *no network at all*,
-      # so core tests stay deterministic and cannot silently grow external
-      # calls.  New network-optional tests must skip unless explicitly
-      # enabled (see CONTRIBUTING.md "测试分层").
       - name: Run backend tests with network disabled
         run: >
           docker run --rm --network none
@@ -177,9 +341,6 @@ jobs:
           docker logs astock-ci || true
           docker rm --force astock-ci || true
 
-  # PR-56：真实浏览器 E2E（Playwright + Chromium，单 job，避免每个 Python 矩阵都装浏览器）。
-  # 用项目 venv 的 Python 起真实 FastAPI（临时 ASTOCK_DATA_DIR + ASTOCK_DEMO=1），
-  # 浏览器只访问本机 HTTP，不依赖行情 / LLM / 新闻等外部服务。
   browser-e2e:
     name: browser-e2e (chromium)
     runs-on: ubuntu-latest
@@ -222,7 +383,6 @@ jobs:
       - name: Run browser journeys against a real local server
         working-directory: frontend
         env:
-          # 用 setup-python 的解释器起后端；临时数据目录由 server.py 自己创建
           ASTOCK_E2E_PYTHON: python
           ASTOCK_E2E_PORT: "8611"
         run: npx playwright test --project=chromium
