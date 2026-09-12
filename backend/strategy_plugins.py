@@ -142,12 +142,21 @@ class StrategyPlugin:
         )
 
     def replay_candidates(self, snapshot_id: str) -> dict[str, Any]:
-        """Re-run this selector from one immutable factor/input snapshot."""
+        """Re-run this selector only under the exact recorded code revision."""
         snapshot = STRACE.load_snapshot(snapshot_id)
         if snapshot.get("strategy_id") != self.strategy_id:
             raise ValueError("strategy replay snapshot belongs to another strategy")
         if snapshot.get("selector_id") != self.selector_id:
             raise ValueError("strategy replay snapshot selector mismatch")
+        recorded_version = str(snapshot.get("code_version") or "")
+        current_version = STRACE.code_version()
+        if recorded_version == "unavailable" or current_version == "unavailable":
+            raise ValueError("strategy replay code version is unavailable")
+        if recorded_version != current_version:
+            raise ValueError(
+                "strategy replay code version mismatch: "
+                f"snapshot={recorded_version} current={current_version}"
+            )
         table, kwargs = STRACE.replay_inputs(snapshot)
         return self._validate_candidate_output(self._run_candidate(table, **kwargs))
 
