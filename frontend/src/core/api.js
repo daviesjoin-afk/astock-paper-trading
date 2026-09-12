@@ -163,10 +163,12 @@ function stripAuthorization(headers){
  * 规则（白名单制，不是"非只读即写"）：
  * - 只读方法（GET/HEAD/OPTIONS）→ 返回副本，并**剥离**任意大小写的 Authorization；
  * - 未知方法（TRACE / CONNECT / 自定义）→ 同上，剥离；既不携带凭据，也不重试；
- * - 白名单写方法（POST/PUT/PATCH/DELETE）+ 已解锁 → 先剥离任意大小写的既有
- *   Authorization，再写入标准的 Authorization 头（Bearer 方案）（不这样做会出现
- *   两个同名异大小写的键，被 fetch 合并成逗号串 → 凭据非法）；
- * - 白名单写方法但未解锁 → 原样返回副本，不抛错、不阻断（由服务端按契约拒绝）。
+ * - 白名单写方法（POST/PUT/PATCH/DELETE）→ **无条件先剥离**任意大小写的既有
+ *   Authorization，再按解锁状态决定要不要写入标准的 Authorization 头（Bearer 方案）。
+ *   先剥离有两个理由：① 不先剥离会留下两个同名异大小写的键，被 fetch 合并成
+ *   逗号串 → 凭据反而非法；② **未解锁时同样必须剥离** —— 否则 UI 显示未解锁，
+ *   调用方却可以自己传一个 Authorization 把凭据送出去，"凭据由本模块唯一决定"
+ *   就成了空话。未解锁只剥离、不写入，也不抛错、不阻断（由服务端按契约拒绝）。
  */
 export function operatorAuthorizationHeaders(method, headers){
   var out=copyHeaders(headers);
@@ -174,8 +176,8 @@ export function operatorAuthorizationHeaders(method, headers){
   if(READ_METHODS.indexOf(verb)>=0) return stripAuthorization(out);
   if(MUTATION_METHODS.indexOf(verb)<0) return stripAuthorization(out);
   var token=getOperatorToken();
-  if(!token) return out;
   stripAuthorization(out);
+  if(!token) return out;
   out['Authorization']='Bearer '+token;
   return out;
 }

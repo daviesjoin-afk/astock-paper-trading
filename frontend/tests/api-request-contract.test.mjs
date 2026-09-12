@@ -482,6 +482,74 @@ test("写方法已解锁时凭据覆盖调用方预置值（不叠加）", async
   assert.equal(calls[0].headers.Authorization, "Bearer " + TOKEN);
 });
 
+// 未解锁也必须剥离：凭据由本模块唯一决定，与"调用方有没有自己传"无关。
+// 旧实现把 `if(!token) return out;` 放在 strip 之前，未解锁时调用方预置的
+// Authorization 会被原样透传 —— UI 显示未解锁，feature caller 却仍能送凭据出去。
+
+test("写方法未解锁时也要剥离调用方预置的 Authorization（任意大小写）", () => {
+  reset(); // 未解锁：sessionStorage 里没有任何 token
+  const casings = [
+    { Authorization: FAKE_STALE },
+    { authorization: FAKE_STALE },
+    { AUTHORIZATION: FAKE_STALE },
+    { AuThOrIzAtIoN: FAKE_STALE },
+  ];
+  for (const method of WRITE_METHODS) {
+    for (const caller of casings) {
+      const out = API.operatorAuthorizationHeaders(method, caller);
+      assert.deepEqual(
+        authorizationKeys(out),
+        [],
+        `未解锁 ${method} + ${JSON.stringify(caller)} 必须剥离 Authorization`,
+      );
+    }
+  }
+});
+
+test("写方法未解锁时剥离凭据但保留其它头，且不改写调用方对象", () => {
+  reset();
+  const caller = { Authorization: FAKE_STALE, "X-Trace-Id": "t-14" };
+  const out = API.operatorAuthorizationHeaders("POST", caller);
+  assert.deepEqual(authorizationKeys(out), []);
+  assert.equal(out["X-Trace-Id"], "t-14");
+  assert.equal(caller.Authorization, FAKE_STALE, "调用方对象必须原样");
+});
+
+test(
+  "写方法未解锁：Headers 实例与二元组数组里的 Authorization 同样被剥离",
+  { skip: HAS_HEADERS ? false : "本运行时没有全局 Headers" },
+  () => {
+    reset();
+    const fromHeaders = API.operatorAuthorizationHeaders(
+      "PUT",
+      new Headers({ Authorization: FAKE_STALE, "X-Trace-Id": "t-15" }),
+    );
+    assert.deepEqual(authorizationKeys(fromHeaders), []);
+    assert.equal(headerValue(fromHeaders, "X-Trace-Id"), "t-15");
+
+    const fromPairs = API.operatorAuthorizationHeaders("PATCH", [
+      ["Authorization", FAKE_STALE],
+      ["X-Trace-Id", "t-16"],
+    ]);
+    assert.deepEqual(authorizationKeys(fromPairs), []);
+    assert.equal(fromPairs["X-Trace-Id"], "t-16");
+  },
+);
+
+test("直接回归：未解锁时写请求不得带出调用方预置的 Authorization", async () => {
+  reset();
+  for (const method of WRITE_METHODS) {
+    const calls = await withFetch(OK, () =>
+      API.api("/api/paper/start", { method, headers: { Authorization: FAKE_STALE } }),
+    );
+    assert.deepEqual(
+      authorizationKeys(calls[0].headers),
+      [],
+      `未解锁 ${method} 不得携带调用方预置的 Authorization`,
+    );
+  }
+});
+
 // ─────────────────────────────────────────────
 // 4. 写方法与未知方法永不重放（mutation non-replay）
 // ─────────────────────────────────────────────
