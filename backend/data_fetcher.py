@@ -807,95 +807,29 @@ def _realtime_row_from_ulist(raw):
     return MN.realtime_row_from_ulist(raw, quote_at_fn=_quote_at)
 
 
-def fetch_realtime_for_codes(codes, fields="f2,f3,f5,f6,f8,f9,f10,f12,f14,f15,f16,f17,f18,f20,f21,f23,f62,f66,f72,f78,f84,f184,f100,f124", return_meta=False):
-    """批量取指定代码的实时行情（ulist.np，单次/分批请求，比全市场快照快数十倍）。
-    用于选股：按全市场基础库代码分批拉取，避免使用单个超长 URL。"""
-    # Callers often combine strategy candidates and the universe, which can
-    # contain the same code several times.  Preserve order while removing
-    # duplicates so request counts and coverage denominators describe the
-    # actual universe rather than the caller's intermediate list.
-    normalized = list(dict.fromkeys(
-        str(code) for code in (codes or [])
-        if str(code).isdigit() and len(str(code)) == 6
-    ))
-    if not normalized:
-        return {"rows": [], "expected": 0, "returned": 0, "coverage_pct": 0.0,
-                "complete": False, "batches": [], "missing_codes": []} if return_meta else []
-    # ulist 接口在 push2delay 上最稳最快，优先；其余作为兜底
-    ULIST_HOSTS = ["push2delay.eastmoney.com", "push2.eastmoney.com", "82.push2.eastmoney.com"]
-    out = []
-    batch_meta = []
-    BATCH = 200  # secids 过长时分批，避免超长 URL
-    for i in range(0, len(normalized), BATCH):
-        batch = normalized[i:i + BATCH]
-        secids = ",".join(_secid(c) for c in batch)
-        params = {
-            "pn": 1, "pz": len(batch), "np": 1, "fltt": 2, "invt": 2,
-            "ut": UT_FLOW, "fields": fields, "secids": secids,
-        }
-        batch_by_code = {}
-        attempts_used = 0
-        for attempt in range(3):
-            attempts_used = attempt + 1
-            for k in range(len(ULIST_HOSTS)):
-                host = ULIST_HOSTS[(i // BATCH + k + attempt) % len(ULIST_HOSTS)]
-                try:
-                    j = _get_json(f"https://{host}/api/qt/ulist.np/get", params, retries=1)
-                    diff = (j or {}).get("data", {}).get("diff") or []
-                except Exception:
-                    diff = []
-                if diff:
-                    for d in diff:
-                        row = _realtime_row_from_ulist(d)
-                        code = row["code"] if row else ""
-                        if not row or code not in batch:
-                            continue
-                        batch_by_code[code] = row
-                    # Do not stop after a partial page: the next attempt
-                    # requests the same batch and fills the missing codes.
-                    if len(batch_by_code) >= len(batch):
-                        break
-                reset_data_source("实时行情源空响应")
-                time.sleep(0.25 * (attempt + 1))
-            if len(batch_by_code) >= len(batch):
-                break
-        # One last smaller request reduces the common failure mode where a
-        # provider drops a few codes from an otherwise valid 200-row page.
-        missing = [code for code in batch if code not in batch_by_code]
-        if missing and len(missing) > 1:
-            for start in range(0, len(missing), 50):
-                small = missing[start:start + 50]
-                secids_small = ",".join(_secid(c) for c in small)
-                small_params = dict(params, secids=secids_small, pz=len(small))
-                for host in ULIST_HOSTS:
-                    try:
-                        j = _get_json(f"https://{host}/api/qt/ulist.np/get", small_params, retries=1)
-                        diff = (j or {}).get("data", {}).get("diff") or []
-                    except Exception:
-                        diff = []
-                    for d in diff:
-                        row = _realtime_row_from_ulist(d)
-                        code = row["code"] if row else ""
-                        if row and code in small:
-                            batch_by_code[code] = row
-                    if all(code in batch_by_code for code in small):
-                        break
-        batch_rows = [batch_by_code[code] for code in batch if code in batch_by_code]
-        out.extend(batch_rows)
-        batch_meta.append({
-            "offset": i, "requested": len(batch), "returned": len(batch_rows),
-            "coverage_pct": round(len(batch_rows) / max(len(batch), 1) * 100, 2),
-            "complete": len(batch_rows) == len(batch), "attempts": attempts_used,
-            "missing_codes": [code for code in batch if code not in batch_by_code][:100],
-        })
-    returned_codes = {str(row.get("code")) for row in out if row.get("code")}
-    metadata = {
-        "rows": out, "expected": len(normalized), "returned": len(returned_codes),
-        "coverage_pct": round(len(returned_codes) / max(len(normalized), 1) * 100, 2),
-        "complete": len(returned_codes) == len(normalized), "batches": batch_meta,
-        "missing_codes": [code for code in normalized if code not in returned_codes][:200],
-    }
-    return metadata if return_meta else out
+_REALTIME_FIELDS = "f2,f3,f5,f6,f8,f9,f10,f12,f14,f15,f16,f17,f18,f20,f21,f23,f62,f66,f72,f78,f84,f184,f100,f124"
+
+
+def _eastmoney_realtime_feed(fields=_REALTIME_FIELDS):
+    return MDF.EastmoneyRealtimeFeed(
+        get_json=_get_json,
+        secid=_secid,
+        row_parser=_realtime_row_from_ulist,
+        reset_data_source=reset_data_source,
+        ut=UT_FLOW,
+        fields=fields,
+        sleep=time.sleep,
+    )
+
+
+def fetch_realtime_for_codes(codes, fields=_REALTIME_FIELDS, return_meta=False):
+    """Batch realtime quotes through the primary DataFeed adapter.
+
+    The historical list/metadata return shapes stay unchanged so scan and
+    execution callers keep their existing fail-closed coverage checks.
+    """
+    feed = _eastmoney_realtime_feed(fields)
+    return feed.fetch_realtime_with_meta(codes) if return_meta else feed.fetch_realtime(codes)
 
 
 def _tencent_realtime_feed():
@@ -942,7 +876,7 @@ def fetch_independent_realtime_for_codes(codes):
 
 
 def fetch_fund_flow_rank(topn=300):
-    """个股主力净流入排行（实时）""
+    """个股主力净流入排行（实时）"""
     def _do():
         fields = "f12,f14,f2,f3,f62,f66,f72,f78,f84,f124,f184"
         result = _fetch_clist(
@@ -1058,7 +992,7 @@ def fetch_stock_flow_batch(codes):
 
 
 def enrich_live_flow(live_universe, missing_codes):
-    """对缺失超大单资金数据的个股进行补齐。
+    """对缺失超大单资金的个股进行补齐。
 
     Args:
         live_universe: 市场快照行列表
