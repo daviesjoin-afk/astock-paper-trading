@@ -26,72 +26,20 @@ jobs:
 
       - name: Apply exact production routing patch
         shell: bash
+        env:
+          STRATEGIES_APPEND_B64: CgojIFN0cmF0ZWd5UGx1Z2luIHByb2R1Y3Rpb24gZmFjYWRlIChpc3N1ZSAjMjQpCiMgS2VlcCBldmVyeSBhdWRpdGVkIHNlbGVjdG9yIGltcGxlbWVudGF0aW9uIGFib3ZlIHVuY2hhbmdlZC4gUmVnaXN0ZXJlZCBwbHVnaW4KIyBzZWxlY3RvcnMgdXNlIHRoZSB1bmlmaWVkIGJvdW5kYXJ5OyBsZWdhY3kgcmVzZWFyY2ggc2VsZWN0b3JzIGNvbnRpbnVlIHRocm91Z2gKIyB0aGUgZXhhY3QgcHJlLXBsdWdpbiBpbXBsZW1lbnRhdGlvbi4KX3J1bl9zdHJhdGVneV9sZWdhY3kgPSBydW5fc3RyYXRlZ3kKCgpkZWYgYXZhaWxhYmxlX3NlbGVjdGlvbl9tb2RlbHMoKToKICAgICIiIlJldHVybiBsZWdhY3kgYW5kIHJlZ2lzdGVyZWQgcGx1Z2luIHNlbGVjdG9yIGlkcyBhY2NlcHRlZCBieSBwcm9kdWN0aW9uLiIiIgogICAgaW1wb3J0IHN0cmF0ZWd5X3BsdWdpbnMgYXMgU1AKCiAgICByZXR1cm4gc2V0KFBBUEVSX1dFSUdIVFMpIHwgc2V0KFNUUkFURUdJRVMpIHwgc2V0KFNQLnNlbGVjdG9yX2lkcygpKQoKCmRlZiBydW5fc3RyYXRlZ3koCiAgICBzdHJhdGVneV9pZCwKICAgIHRhYmxlOiBwZC5EYXRhRnJhbWUsCiAgICB0b3BuPTEwLAogICAgbmV3c19oaXRzPU5vbmUsCiAgICBnYXRlPU5vbmUsCiAgICBhdXRvX25ld3M9VHJ1ZSwKICAgIGtsaW5lcz1Ob25lLAogICAgZmlyc3RfYm9hcmRfY29kZXM9Tm9uZSwKICAgIHdlaWdodF9vdmVycmlkZXM9Tm9uZSwKICAgIGNvbmRpdGlvbl9vdmVycmlkZXM9Tm9uZSwKKToKICAgICIiIlByb2R1Y3Rpb24gc2VsZWN0b3IgZmFjYWRlOiBwbHVnaW4gZmlyc3QsIGV4YWN0IGxlZ2FjeSBmYWxsYmFjayBvdGhlcndpc2UuIiIiCiAgICBpbXBvcnQgc3RyYXRlZ3lfcGx1Z2lucyBhcyBTUAoKICAgIHBsdWdpbiA9IFNQLnBsdWdpbl9mb3Jfc2VsZWN0b3Ioc3RyYXRlZ3lfaWQpCiAgICBpZiBwbHVnaW4gaXMgbm90IE5vbmU6CiAgICAgICAgcmV0dXJuIHBsdWdpbi5zZWxlY3RfY2FuZGlkYXRlcygKICAgICAgICAgICAgdGFibGUsCiAgICAgICAgICAgIHRvcG49dG9wbiwKICAgICAgICAgICAgbmV3c19oaXRzPW5ld3NfaGl0cywKICAgICAgICAgICAgZ2F0ZT1nYXRlLAogICAgICAgICAgICBhdXRvX25ld3M9YXV0b19uZXdzLAogICAgICAgICAgICBrbGluZXM9a2xpbmVzLAogICAgICAgICAgICBmaXJzdF9ib2FyZF9jb2Rlcz1maXJzdF9ib2FyZF9jb2RlcywKICAgICAgICAgICAgd2VpZ2h0X292ZXJyaWRlcz13ZWlnaHRfb3ZlcnJpZGVzLAogICAgICAgICAgICBjb25kaXRpb25fb3ZlcnJpZGVzPWNvbmRpdGlvbl9vdmVycmlkZXMsCiAgICAgICAgKQogICAgcmV0dXJuIF9ydW5fc3RyYXRlZ3lfbGVnYWN5KAogICAgICAgIHN0cmF0ZWd5X2lkLAogICAgICAgIHRhYmxlLAogICAgICAgIHRvcG49dG9wbiwKICAgICAgICBuZXdzX2hpdHM9bmV3c19oaXRzLAogICAgICAgIGdhdGU9Z2F0ZSwKICAgICAgICBhdXRvX25ld3M9YXV0b19uZXdzLAogICAgICAgIGtsaW5lcz1rbGluZXMsCiAgICAgICAgZmlyc3RfYm9hcmRfY29kZXM9Zmlyc3RfYm9hcmRfY29kZXMsCiAgICAgICAgd2VpZ2h0X292ZXJyaWRlcz13ZWlnaHRfb3ZlcnJpZGVzLAogICAgICAgIGNvbmRpdGlvbl9vdmVycmlkZXM9Y29uZGl0aW9uX292ZXJyaWRlcywKICAgICkK
+          TEST_APPEND_B64: CiAgICBkZWYgdGVzdF9wbHVnaW5faWRlbnRpZmllcnNfYXJlX2Nhbm9uaWNhbGl6ZWRfYmVmb3JlX3JlZ2lzdHJhdGlvbihzZWxmKToKICAgICAgICBwbHVnaW4gPSBwbHVnaW5zLlN0cmF0ZWd5UGx1Z2luKAogICAgICAgICAgICAiICBjYW5vbmljYWxfcGx1Z2luICAiLAogICAgICAgICAgICAiICBjYW5vbmljYWxfc2VsZWN0b3IgICIsCiAgICAgICAgICAgICgiZmFjdG9yX2EiLCksCiAgICAgICAgICAgIGNhbmRpZGF0ZV9ydW5uZXI9bGFtYmRhIF90YWJsZSwgKipfa3dhcmdzOiB7CiAgICAgICAgICAgICAgICAic3RyYXRlZ3kiOiAiY2Fub25pY2FsX3BsdWdpbiIsICJjb3VudCI6IDAsICJwaWNrcyI6IFtdLAogICAgICAgICAgICB9LAogICAgICAgICkKICAgICAgICBzZWxmLmFzc2VydEVxdWFsKHBsdWdpbi5zdHJhdGVneV9pZCwgImNhbm9uaWNhbF9wbHVnaW4iKQogICAgICAgIHNlbGYuYXNzZXJ0RXF1YWwocGx1Z2luLnNlbGVjdG9yX2lkLCAiY2Fub25pY2FsX3NlbGVjdG9yIikKICAgICAgICBwbHVnaW5zLnJlZ2lzdGVyX3BsdWdpbihwbHVnaW4pCiAgICAgICAgc2VsZi5hZGRDbGVhbnVwKHBsdWdpbnMudW5yZWdpc3Rlcl9wbHVnaW4sIHBsdWdpbi5zdHJhdGVneV9pZCkKICAgICAgICBzZWxmLmFzc2VydElzKHBsdWdpbnMuZ2V0X3BsdWdpbigiY2Fub25pY2FsX3BsdWdpbiIpLCBwbHVnaW4pCiAgICAgICAgc2VsZi5hc3NlcnRJcyhwbHVnaW5zLnBsdWdpbl9mb3Jfc2VsZWN0b3IoImNhbm9uaWNhbF9zZWxlY3RvciIpLCBwbHVnaW4pCgogICAgZGVmIHRlc3RfcHJvZHVjdGlvbl9ydW5fc3RyYXRlZ3lfZGlzcGF0Y2hlc19yZWdpc3RlcmVkX3NlbGVjdG9yKHNlbGYpOgogICAgICAgIGltcG9ydCBzdHJhdGVnaWVzIGFzIFMKCiAgICAgICAgc2VlbiA9IFtdCgogICAgICAgIGRlZiBydW5uZXIodGFibGUsICosIHRvcG49MTAsICoqX2t3YXJncyk6CiAgICAgICAgICAgIHNlZW4uYXBwZW5kKChsaXN0KHRhYmxlLmluZGV4KSwgdG9wbikpCiAgICAgICAgICAgIHJldHVybiB7CiAgICAgICAgICAgICAgICAic3RyYXRlZ3kiOiAicHJvZHVjdGlvbl9kaXNwYXRjaF9wbHVnaW4iLAogICAgICAgICAgICAgICAgImNvdW50IjogbWluKGxlbih0YWJsZSksIHRvcG4pLAogICAgICAgICAgICAgICAgInBpY2tzIjogW3siY29kZSI6IHN0cihjb2RlKX0gZm9yIGNvZGUgaW4gbGlzdCh0YWJsZS5pbmRleClbOnRvcG5dXSwKICAgICAgICAgICAgfQoKICAgICAgICBwbHVnaW4gPSBwbHVnaW5zLlN0cmF0ZWd5UGx1Z2luKAogICAgICAgICAgICAicHJvZHVjdGlvbl9kaXNwYXRjaF9wbHVnaW4iLAogICAgICAgICAgICAicHJvZHVjdGlvbl9kaXNwYXRjaF9zZWxlY3RvciIsCiAgICAgICAgICAgICgiZmFjdG9yX2EiLCksCiAgICAgICAgICAgIGNhbmRpZGF0ZV9ydW5uZXI9cnVubmVyLAogICAgICAgICkKICAgICAgICBwbHVnaW5zLnJlZ2lzdGVyX3BsdWdpbihwbHVnaW4pCiAgICAgICAgc2VsZi5hZGRDbGVhbnVwKHBsdWdpbnMudW5yZWdpc3Rlcl9wbHVnaW4sIHBsdWdpbi5zdHJhdGVneV9pZCkKICAgICAgICB0YWJsZSA9IHBkLkRhdGFGcmFtZSh7ImZhY3Rvcl9hIjogWzEuMCwgMi4wXX0sIGluZGV4PVsiMDAwMDAxIiwgIjAwMDAwMiJdKQogICAgICAgIHJlc3VsdCA9IFMucnVuX3N0cmF0ZWd5KCJwcm9kdWN0aW9uX2Rpc3BhdGNoX3NlbGVjdG9yIiwgdGFibGUsIHRvcG49MSkKICAgICAgICBzZWxmLmFzc2VydEVxdWFsKHJlc3VsdFsicGlja3MiXSwgW3siY29kZSI6ICIwMDAwMDEifV0pCiAgICAgICAgc2VsZi5hc3NlcnRFcXVhbChzZWVuLCBbKFsiMDAwMDAxIiwgIjAwMDAwMiJdLCAxKV0pCiAgICAgICAgc2VsZi5hc3NlcnRJbigicHJvZHVjdGlvbl9kaXNwYXRjaF9zZWxlY3RvciIsIFMuYXZhaWxhYmxlX3NlbGVjdGlvbl9tb2RlbHMoKSkKCiAgICBkZWYgdGVzdF9kdXBsaWNhdGVfc2VsZWN0b3JfcmVnaXN0cmF0aW9uX2ZhaWxzX2Nsb3NlZChzZWxmKToKICAgICAgICBmaXJzdCA9IHBsdWdpbnMuU3RyYXRlZ3lQbHVnaW4oCiAgICAgICAgICAgICJzZWxlY3Rvcl9vd25lcl9vbmUiLCAic2hhcmVkX3BsdWdpbl9zZWxlY3RvciIsICgiZmFjdG9yX2EiLCksCiAgICAgICAgICAgIGNhbmRpZGF0ZV9ydW5uZXI9bGFtYmRhIF90YWJsZSwgKipfa3dhcmdzOiB7CiAgICAgICAgICAgICAgICAic3RyYXRlZ3kiOiAic2VsZWN0b3Jfb3duZXJfb25lIiwgImNvdW50IjogMCwgInBpY2tzIjogW10sCiAgICAgICAgICAgIH0sCiAgICAgICAgKQogICAgICAgIHNlY29uZCA9IHBsdWdpbnMuU3RyYXRlZ3lQbHVnaW4oCiAgICAgICAgICAgICJzZWxlY3Rvcl9vd25lcl90d28iLCAic2hhcmVkX3BsdWdpbl9zZWxlY3RvciIsICgiZmFjdG9yX2EiLCksCiAgICAgICAgICAgIGNhbmRpZGF0ZV9ydW5uZXI9bGFtYmRhIF90YWJsZSwgKipfa3dhcmdzOiB7CiAgICAgICAgICAgICAgICAic3RyYXRlZ3kiOiAic2VsZWN0b3Jfb3duZXJfdHdvIiwgImNvdW50IjogMCwgInBpY2tzIjogW10sCiAgICAgICAgICAgIH0sCiAgICAgICAgKQogICAgICAgIHBsdWdpbnMucmVnaXN0ZXJfcGx1Z2luKGZpcnN0KQogICAgICAgIHNlbGYuYWRkQ2xlYW51cChwbHVnaW5zLnVucmVnaXN0ZXJfcGx1Z2luLCBmaXJzdC5zdHJhdGVneV9pZCkKICAgICAgICB3aXRoIHNlbGYuYXNzZXJ0UmFpc2VzUmVnZXgoVmFsdWVFcnJvciwgInNlbGVjdG9yIGFscmVhZHkgcmVnaXN0ZXJlZCIpOgogICAgICAgICAgICBwbHVnaW5zLnJlZ2lzdGVyX3BsdWdpbihzZWNvbmQpCgo=
         run: |
           python - <<'PY'
+          import base64
+          import os
           from pathlib import Path
 
           strategies = Path('backend/strategies.py')
           text = strategies.read_text(encoding='utf-8')
           marker = '# StrategyPlugin production facade (issue #24)'
           if marker not in text:
-              text += r'''
-
-
-# StrategyPlugin production facade (issue #24)
-# Keep every audited selector implementation above unchanged. Registered plugin
-# selectors use the unified boundary; legacy research selectors continue through
-# the exact pre-plugin implementation.
-_run_strategy_legacy = run_strategy
-
-
-def available_selection_models():
-    """Return legacy and registered plugin selector ids accepted by production."""
-    import strategy_plugins as SP
-
-    return set(PAPER_WEIGHTS) | set(STRATEGIES) | set(SP.selector_ids())
-
-
-def run_strategy(
-    strategy_id,
-    table: pd.DataFrame,
-    topn=10,
-    news_hits=None,
-    gate=None,
-    auto_news=True,
-    klines=None,
-    first_board_codes=None,
-    weight_overrides=None,
-    condition_overrides=None,
-):
-    """Production selector facade: plugin first, exact legacy fallback otherwise."""
-    import strategy_plugins as SP
-
-    plugin = SP.plugin_for_selector(strategy_id)
-    if plugin is not None:
-        return plugin.select_candidates(
-            table,
-            topn=topn,
-            news_hits=news_hits,
-            gate=gate,
-            auto_news=auto_news,
-            klines=klines,
-            first_board_codes=first_board_codes,
-            weight_overrides=weight_overrides,
-            condition_overrides=condition_overrides,
-        )
-    return _run_strategy_legacy(
-        strategy_id,
-        table,
-        topn=topn,
-        news_hits=news_hits,
-        gate=gate,
-        auto_news=auto_news,
-        klines=klines,
-        first_board_codes=first_board_codes,
-        weight_overrides=weight_overrides,
-        condition_overrides=condition_overrides,
-    )
-'''
+              text += base64.b64decode(os.environ['STRATEGIES_APPEND_B64']).decode('utf-8')
               strategies.write_text(text, encoding='utf-8')
 
           paper = Path('backend/paper_trading.py')
@@ -109,69 +57,7 @@ def run_strategy(
           text = tests.read_text(encoding='utf-8')
           marker = '    def test_production_run_strategy_dispatches_registered_selector(self):'
           if marker not in text:
-              block = r'''
-    def test_plugin_identifiers_are_canonicalized_before_registration(self):
-        plugin = plugins.StrategyPlugin(
-            "  canonical_plugin  ",
-            "  canonical_selector  ",
-            ("factor_a",),
-            candidate_runner=lambda _table, **_kwargs: {
-                "strategy": "canonical_plugin", "count": 0, "picks": [],
-            },
-        )
-        self.assertEqual(plugin.strategy_id, "canonical_plugin")
-        self.assertEqual(plugin.selector_id, "canonical_selector")
-        plugins.register_plugin(plugin)
-        self.addCleanup(plugins.unregister_plugin, plugin.strategy_id)
-        self.assertIs(plugins.get_plugin("canonical_plugin"), plugin)
-        self.assertIs(plugins.plugin_for_selector("canonical_selector"), plugin)
-
-    def test_production_run_strategy_dispatches_registered_selector(self):
-        import strategies as S
-
-        seen = []
-
-        def runner(table, *, topn=10, **_kwargs):
-            seen.append((list(table.index), topn))
-            return {
-                "strategy": "production_dispatch_plugin",
-                "count": min(len(table), topn),
-                "picks": [{"code": str(code)} for code in list(table.index)[:topn]],
-            }
-
-        plugin = plugins.StrategyPlugin(
-            "production_dispatch_plugin",
-            "production_dispatch_selector",
-            ("factor_a",),
-            candidate_runner=runner,
-        )
-        plugins.register_plugin(plugin)
-        self.addCleanup(plugins.unregister_plugin, plugin.strategy_id)
-        table = pd.DataFrame({"factor_a": [1.0, 2.0]}, index=["000001", "000002"])
-        result = S.run_strategy("production_dispatch_selector", table, topn=1)
-        self.assertEqual(result["picks"], [{"code": "000001"}])
-        self.assertEqual(seen, [(["000001", "000002"], 1)])
-        self.assertIn("production_dispatch_selector", S.available_selection_models())
-
-    def test_duplicate_selector_registration_fails_closed(self):
-        first = plugins.StrategyPlugin(
-            "selector_owner_one", "shared_plugin_selector", ("factor_a",),
-            candidate_runner=lambda _table, **_kwargs: {
-                "strategy": "selector_owner_one", "count": 0, "picks": [],
-            },
-        )
-        second = plugins.StrategyPlugin(
-            "selector_owner_two", "shared_plugin_selector", ("factor_a",),
-            candidate_runner=lambda _table, **_kwargs: {
-                "strategy": "selector_owner_two", "count": 0, "picks": [],
-            },
-        )
-        plugins.register_plugin(first)
-        self.addCleanup(plugins.unregister_plugin, first.strategy_id)
-        with self.assertRaisesRegex(ValueError, "selector already registered"):
-            plugins.register_plugin(second)
-
-'''
+              block = base64.b64decode(os.environ['TEST_APPEND_B64']).decode('utf-8')
               anchor = '\n\nif __name__ == "__main__":\n'
               if anchor not in text:
                   raise SystemExit('test module anchor not found')
