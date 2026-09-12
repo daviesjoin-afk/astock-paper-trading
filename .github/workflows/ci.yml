@@ -63,8 +63,8 @@ jobs:
           )
           replace_or_verify(
               'backend/paper_trading.py',
-              '''                             gate={"light": market["light"]}, first_board_codes=first_board_codes,\n                             weight_overrides=selection_overlay.get("weights"),\n                             condition_overrides=selection_overlay.get("conditions"))''',
-              '''                             gate={"light": market["light"]}, first_board_codes=first_board_codes,\n                             weight_overrides=selection_overlay.get("weights"),\n                             condition_overrides=selection_overlay.get("conditions"),\n                             replay_data_date=asof_date, replay_required=True)''',
+              'condition_overrides=selection_overlay.get("conditions"))',
+              'condition_overrides=selection_overlay.get("conditions"), replay_data_date=asof_date, replay_required=True)',
               expected=2,
           )
           PY
