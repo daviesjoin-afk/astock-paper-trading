@@ -23,6 +23,9 @@ DB_PATH = data_paths.data_path("paper_research.sqlite3")
 VERSION = "paper-research-shadow-v1"
 HORIZONS = (1, 3, 5, 10, 20)
 CHINA_TZ = dt.timezone(dt.timedelta(hours=8))
+# PR-8：``holding_days`` 记录的是"已成功记录的收盘观测次数"，不是经交易所日历
+# 认证的交易日数。字段名保留（兼容旧 API / 旧库），但语义必须显式声明。
+HOLDING_DAY_SEMANTICS = "recorded_close_observation_count"
 
 STRATEGY_NAMES = strategy_labels()
 
@@ -306,6 +309,8 @@ def dashboard(limit=40):
         "version": VERSION,
         "mode": "shadow_only",
         "message": "研究台账记录五套模拟盘策略的候选与后续表现，不参与下单或自动调参。",
+        # PR-8：observation 语义显式对齐，避免把观测次数读成"交易日"。
+        "holding_day_semantics": HOLDING_DAY_SEMANTICS,
         "strategies": [
             {"id": account_id, "name": name}
             for account_id, name in STRATEGY_NAMES.items()

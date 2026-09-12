@@ -1,0 +1,873 @@
+# -*- coding: utf-8 -*-
+"""PR-8 contract tests: point-in-time reproducible learning dataset foundation.
+
+Every test here is hermetic: an in-memory SQLite database, no network, and no
+execution path.  The suite deliberately does not just assert "the happy path is
+green" -- it asserts that the *refusals* happen, because a dataset builder that
+silently accepts unprovable evidence is worse than one that returns nothing.
+"""
+
+import ast
+import os
+import sqlite3
+import sys
+import unittest
+from pathlib import Path
+from unittest import mock
+
+
+sys.path.insert(0, os.path.dirname(__file__))
+import learning_dataset as LD  # noqa: E402
+import neural_shadow as NS  # noqa: E402
+
+
+FEATURES = LD.DEFAULT_ALPHA_FEATURES
+CUTOFF = "2026-03-01"
+
+# The production (pre-PR-8) schema: no provenance columns at all.  Migration
+# must be able to upgrade exactly this shape.
+LEGACY_SCHEMA = """
+CREATE TABLE adaptive_alpha_samples(
+    profile_date TEXT NOT NULL, code TEXT NOT NULL, industry TEXT,
+    close_price REAL NOT NULL, regime TEXT NOT NULL, price_momentum REAL NOT NULL,
+    main_flow REAL NOT NULL, turnover REAL NOT NULL, volume_ratio REAL NOT NULL,
+    small_size REAL NOT NULL, value REAL NOT NULL, created_at TEXT NOT NULL,
+    PRIMARY KEY(profile_date,code)
+);
+CREATE TABLE adaptive_alpha_returns(
+    start_date TEXT NOT NULL, end_date TEXT NOT NULL, horizon INTEGER NOT NULL,
+    code TEXT NOT NULL, forward_return_pct REAL NOT NULL, created_at TEXT NOT NULL,
+    PRIMARY KEY(start_date,end_date,horizon,code)
+);
+"""
+
+
+def open_db():
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    conn.executescript(LEGACY_SCHEMA)
+    LD.ensure_schema(conn)
+    return conn
+
+
+class DbTestCase(unittest.TestCase):
+    """Base class that guarantees every in-memory database is closed."""
+
+    def new_db(self):
+        conn = open_db()
+        self.addCleanup(conn.close)
+        return conn
+
+    def raw_db(self):
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        self.addCleanup(conn.close)
+        return conn
+
+
+def seed_sample(conn, profile_date, code="000001", *, asof="auto", available="auto",
+                pit=None, close=10.0, features=None, industry="测试行业", regime="neutral"):
+    """Insert one evidence row.  ``available=None`` means "no proof recorded"."""
+    asof_value = profile_date if asof == "auto" else asof
+    availability = f"{profile_date}T15:15:00" if available == "auto" else available
+    if pit is None:
+        pit = LD.PIT_VERIFIED if availability else LD.PIT_LEGACY_UNPROVEN
+    values = features if features is not None else {name: 0.5 for name in FEATURES}
+    conn.execute(
+        """INSERT OR REPLACE INTO adaptive_alpha_samples(
+               profile_date,code,industry,close_price,regime,price_momentum,main_flow,
+               turnover,volume_ratio,small_size,value,created_at,
+               feature_asof,feature_available_at,pit_status,source,source_version,contract_version)
+           VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+        (profile_date, code, industry, close, regime,
+         *[values.get(name) for name in FEATURES], f"{profile_date}T16:00:00",
+         asof_value, availability, pit, "market_snapshot_full.json", "test-v1",
+         LD.CONTRACT_VERSION),
+    )
+
+
+def seed_label(conn, start, end, horizon=1, code="000001", ret=1.0, available="auto"):
+    availability = f"{end}T15:15:00" if available == "auto" else available
+    conn.execute(
+        """INSERT OR IGNORE INTO adaptive_alpha_returns(
+               start_date,end_date,horizon,code,forward_return_pct,created_at,
+               label_available_at,horizon_semantics,pit_status,source,source_version,contract_version)
+           VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
+        (start, end, horizon, code, ret, f"{end}T16:00:00", availability,
+         LD.HORIZON_SEMANTICS_OBSERVED_PROFILE_STEPS, LD.PIT_VERIFIED,
+         LD.DATASET_KIND_ADAPTIVE_ALPHA, "test-v1", LD.CONTRACT_VERSION),
+    )
+
+
+def series(days, codes=("000001",), horizons=(1,), close_base=10.0):
+    """Feature days plus mature forward labels over a consecutive date series."""
+    return days, codes, horizons, close_base
+
+
+def seed_series(conn, days, *, codes=("000001",), horizons=(1,), close_step=0.1):
+    for index, day in enumerate(days):
+        for code in codes:
+            seed_sample(conn, day, code, close=close_base_for(index, close_step))
+    for horizon in horizons:
+        for index in range(len(days) - horizon):
+            for code in codes:
+                seed_label(conn, days[index], days[index + horizon], horizon, code)
+
+
+def close_base_for(index, close_step=0.1):
+    return round(10.0 + index * close_step, 4)
+
+
+def build(conn, cutoff=CUTOFF, **kwargs):
+    return LD.build_dataset(conn, cutoff=cutoff, **kwargs)
+
+
+def reasons(built):
+    return {key: count for key, count in built.manifest["exclusion_reasons"].items() if count}
+
+
+def all_rows(built):
+    return [row for name in LD.PARTITIONS for row in (built.partitions.get(name) or [])]
+
+
+def dates(count, start_day=1):
+    import datetime as dt
+
+    first = dt.date(2026, 1, start_day)
+    return [(first + dt.timedelta(days=offset)).isoformat() for offset in range(count)]
+
+
+class PitContractTests(DbTestCase):
+    """feature_available_at <= cutoff, and nothing may be upgraded to available."""
+
+    def test_availability_equal_to_cutoff_is_allowed(self):
+        conn = self.new_db()
+        seed_series(conn, dates(4))
+        built = build(conn, cutoff="2026-01-02")
+        self.assertTrue(all_rows(built), reasons(built))
+
+    def test_availability_before_cutoff_is_allowed(self):
+        conn = self.new_db()
+        seed_series(conn, dates(4))
+        built = build(conn, cutoff="2026-01-04")
+        self.assertTrue(built.eligible_rows, reasons(built))
+
+    def test_availability_after_cutoff_is_excluded_as_future_feature(self):
+        conn = self.new_db()
+        # asof is comfortably inside the cutoff, but the feature was only
+        # proven available later: future feature != available feature.
+        seed_sample(conn, "2026-01-01", available="2026-01-20T15:15:00")
+        seed_label(conn, "2026-01-01", "2026-01-02")
+        built = build(conn, cutoff="2026-01-10")
+        self.assertEqual(built.eligible_rows, 0)
+        self.assertEqual(reasons(built).get("future_feature"), 1)
+
+    def test_feature_asof_after_cutoff_is_excluded(self):
+        conn = self.new_db()
+        day_list = dates(4)
+        seed_series(conn, day_list, horizons=(1,))
+        built = build(conn, cutoff="2026-01-02")
+        # 01-03 and 01-04 describe an asof past the cutoff.
+        self.assertEqual(reasons(built).get("future_or_invalid_asof"), 2)
+
+    def test_sample_without_any_label_is_audited_not_dropped(self):
+        conn = self.new_db()
+        seed_sample(conn, "2026-01-01")
+        seed_sample(conn, "2026-01-09")
+        seed_label(conn, "2026-01-01", "2026-01-02")
+        built = build(conn)
+        # The unlabeled sample is visible in the source count and audited.
+        self.assertEqual(built.manifest["source_row_count"], 2)
+        self.assertEqual(reasons(built).get("missing_label"), 1)
+
+    def test_missing_availability_is_excluded_from_strict_dataset(self):
+        conn = self.new_db()
+        seed_sample(conn, "2026-01-01", available=None)
+        seed_label(conn, "2026-01-01", "2026-01-02")
+        built = build(conn)
+        self.assertEqual(built.eligible_rows, 0)
+        self.assertEqual(reasons(built).get("legacy_unproven_pit"), 1)
+
+    def test_unknown_availability_is_not_available(self):
+        conn = self.new_db()
+        seed_sample(conn, "2026-01-01", available=None, pit=LD.PIT_UNKNOWN)
+        seed_label(conn, "2026-01-01", "2026-01-02")
+        built = build(conn)
+        self.assertEqual(built.eligible_rows, 0)
+        self.assertEqual(reasons(built).get("unknown_feature_availability"), 1)
+
+    def test_legacy_pit_is_not_upgraded_to_verified(self):
+        """Availability present but provenance unproven must still be refused."""
+        conn = self.new_db()
+        seed_sample(conn, "2026-01-01", available="2026-01-01T15:15:00", pit=LD.PIT_LEGACY_UNPROVEN)
+        seed_label(conn, "2026-01-01", "2026-01-02")
+        built = build(conn)
+        self.assertEqual(built.eligible_rows, 0)
+        self.assertEqual(reasons(built).get("legacy_unproven_pit"), 1)
+
+    def test_financial_unknown_publication_cannot_enter_strict_dataset(self):
+        """Delegates to financial_point_in_time; a report period is not a date."""
+        available_at, status = LD.financial_availability(
+            {"report_date": "2024-03-31", "net_profit": 10}, "2024-06-30"
+        )
+        self.assertIsNone(available_at)
+        self.assertEqual(status, LD.PIT_UNPROVEN)
+
+    def test_financial_future_publication_is_classified_future(self):
+        available_at, status = LD.financial_availability(
+            {"report_date": "2024-06-30", "report_published_at": "2024-08-31", "net_profit": 10},
+            "2024-06-30",
+        )
+        self.assertEqual(status, LD.PIT_FUTURE)
+
+
+class LabelContractTests(DbTestCase):
+    """label_end_date > feature_asof, and the label must be provably mature."""
+
+    def test_label_end_equal_to_feature_asof_is_rejected(self):
+        conn = self.new_db()
+        seed_sample(conn, "2026-01-01")
+        seed_label(conn, "2026-01-01", "2026-01-01")
+        built = build(conn)
+        self.assertEqual(built.eligible_rows, 0)
+        self.assertEqual(reasons(built).get("invalid_label_time"), 1)
+
+    def test_label_end_before_feature_asof_is_rejected(self):
+        conn = self.new_db()
+        seed_sample(conn, "2026-01-05")
+        seed_label(conn, "2026-01-05", "2026-01-02")
+        built = build(conn)
+        self.assertEqual(built.eligible_rows, 0)
+        self.assertEqual(reasons(built).get("invalid_label_time"), 1)
+
+    def test_immature_label_is_excluded(self):
+        conn = self.new_db()
+        seed_sample(conn, "2026-01-01")
+        seed_label(conn, "2026-01-01", "2026-01-02", available=None)
+        built = build(conn)
+        self.assertEqual(built.eligible_rows, 0)
+        self.assertEqual(reasons(built).get("immature_label"), 1)
+
+    def test_label_available_before_label_end_is_invalid(self):
+        conn = self.new_db()
+        seed_sample(conn, "2026-01-01")
+        seed_label(conn, "2026-01-01", "2026-01-05", available="2026-01-04T15:15:00")
+        built = build(conn)
+        self.assertEqual(built.eligible_rows, 0)
+        self.assertEqual(reasons(built).get("invalid_label_time"), 1)
+
+    def test_missing_target_is_excluded_not_zero_filled(self):
+        conn = self.new_db()
+        seed_sample(conn, "2026-01-01")
+        seed_label(conn, "2026-01-01", "2026-01-02", ret=None)
+        built = build(conn)
+        self.assertEqual(built.eligible_rows, 0)
+        self.assertEqual(reasons(built).get("missing_label"), 1)
+
+    def test_future_label_cannot_appear_in_feature_columns(self):
+        conn = self.new_db()
+        seed_series(conn, dates(4), horizons=(1,))
+        built = build(conn)
+        self.assertTrue(built.eligible_rows)
+        for row in all_rows(built):
+            canonical = row.canonical(FEATURES)
+            self.assertEqual(sorted(canonical["features"]), sorted(FEATURES))
+            for name in ("forward_return_pct", "target", "label_end_date", "horizon"):
+                self.assertNotIn(name, canonical["features"])
+
+    def test_unsupported_horizon_semantics_is_excluded(self):
+        conn = self.new_db()
+        seed_sample(conn, "2026-01-01")
+        seed_label(conn, "2026-01-01", "2026-01-02")
+        conn.execute("UPDATE adaptive_alpha_returns SET horizon_semantics='certified_trading_days'")
+        built = build(conn)
+        self.assertEqual(built.eligible_rows, 0)
+        self.assertEqual(reasons(built).get("unsupported_horizon_semantics"), 1)
+
+    def test_observed_step_semantics_is_recorded_not_claimed_as_sessions(self):
+        conn = self.new_db()
+        seed_series(conn, dates(4))
+        built = build(conn)
+        self.assertEqual(built.manifest["horizon_semantics"], "observed_profile_steps")
+        label_spec = built.manifest["label_spec"]
+        self.assertTrue(label_spec["observed_step_is_not_certified_session"])
+        self.assertTrue(label_spec["requires_mature_label"])
+
+
+class SplitPurgeTests(DbTestCase):
+    """Chronological split with overlapping-label purge."""
+
+    def _split_fixture(self):
+        conn = self.new_db()
+        day_list = dates(12)
+        seed_series(conn, day_list, horizons=(1,))
+        return conn, day_list
+
+    def test_train_overlapping_validation_is_purged(self):
+        conn, day_list = self._split_fixture()
+        built = build(conn)
+        train = built.partitions["train"]
+        validation = built.partitions["validation"]
+        self.assertTrue(train and validation)
+        validation_start = min(row.label_start_date for row in validation)
+        self.assertTrue(all(row.label_end_date < validation_start for row in train))
+        self.assertGreater(built.purge_counts["train"], 0)
+        self.assertEqual(reasons(built).get("overlapping_label_purged"), sum(built.purge_counts.values()))
+
+    def test_validation_overlapping_test_is_purged(self):
+        conn, day_list = self._split_fixture()
+        built = build(conn)
+        validation = built.partitions["validation"]
+        test = built.partitions["test"]
+        self.assertTrue(validation and test)
+        test_start = min(row.label_start_date for row in test)
+        self.assertTrue(all(row.label_end_date < test_start for row in validation))
+
+    def test_no_temporal_overlap_survives(self):
+        conn, _ = self._split_fixture()
+        built = build(conn)
+        self.assertFalse(LD.has_temporal_overlap(built.partitions))
+
+    def test_split_is_chronological_not_shuffled(self):
+        conn, _ = self._split_fixture()
+        built = build(conn)
+        boundaries = [
+            max(row.label_start_date for row in built.partitions["train"]),
+            min(row.label_start_date for row in built.partitions["validation"]),
+            max(row.label_start_date for row in built.partitions["validation"]),
+            min(row.label_start_date for row in built.partitions["test"]),
+        ]
+        self.assertLess(boundaries[0], boundaries[1])
+        self.assertLess(boundaries[2], boundaries[3])
+
+    def test_small_dataset_reports_empty_partition_instead_of_pretending_ready(self):
+        conn = self.new_db()
+        seed_series(conn, dates(2))
+        built = build(conn)
+        self.assertTrue(built.eligible_rows)
+        empty = [name for name in LD.PARTITIONS if not built.partitions[name]]
+        self.assertTrue(empty)
+
+
+class DeterminismTests(DbTestCase):
+    """Same inputs -> same fingerprint, regardless of storage order."""
+
+    def _fingerprint(self, conn, day_list):
+        built = build(conn)
+        return built
+
+    def _fingerprint_of(self, partitions, built):
+        return LD.dataset_fingerprint(
+            partitions,
+            cutoff=built.cutoff,
+            feature_names=built.feature_names,
+            horizon_semantics=built.horizon_semantics,
+            split_spec=built.split_spec,
+            source_digest_value=built.manifest["source_digest"],
+        )
+
+    def test_fingerprint_is_row_order_independent_by_construction(self):
+        """Same logical rows, different list order -> same SHA-256.
+
+        The split already emits sorted partitions, so this exercises the
+        fingerprint's own canonical ordering: callers that assemble partitions
+        themselves must still get a stable digest.
+        """
+        conn = self.new_db()
+        seed_series(conn, dates(12), horizons=(1,), codes=("000001", "000002"))
+        built = build(conn)
+        reordered = {
+            "test": list(reversed(built.partitions["test"])),
+            "validation": list(reversed(built.partitions["validation"])),
+            "train": list(reversed(built.partitions["train"])),
+        }
+        self.assertEqual(self._fingerprint_of(reordered, built), built.fingerprint)
+
+    def test_fingerprint_is_stable_across_repeated_calls(self):
+        conn = self.new_db()
+        seed_series(conn, dates(12), horizons=(1,), codes=("000001", "000002"))
+        built = build(conn)
+        self.assertEqual(self._fingerprint_of(built.partitions, built), built.fingerprint)
+        self.assertEqual(self._fingerprint_of(built.partitions, built), built.fingerprint)
+
+    def test_insertion_order_does_not_change_fingerprint(self):
+        forward, reverse = self.new_db(), self.new_db()
+        day_list = dates(10)
+        seed_series(forward, day_list, horizons=(1,), codes=("000001", "000002", "000003"))
+        for day in reversed(day_list):
+            for code in ("000003", "000002", "000001"):
+                seed_sample(reverse, day, code, close=close_base_for(day_list.index(day)))
+        for index in reversed(range(len(day_list) - 1)):
+            for code in ("000003", "000002", "000001"):
+                seed_label(reverse, day_list[index], day_list[index + 1], 1, code)
+        self.assertEqual(
+            build(forward).fingerprint, build(reverse).fingerprint
+        )
+
+    def test_rebuild_is_idempotent_and_manifest_is_append_only(self):
+        conn = self.new_db()
+        seed_series(conn, dates(10), horizons=(1,))
+        first = build(conn, persist=True)
+        second = build(conn, persist=True)
+        self.assertEqual(first.fingerprint, second.fingerprint)
+        rows = conn.execute("SELECT COUNT(*) FROM learning_dataset_manifests").fetchone()[0]
+        self.assertEqual(rows, 1)
+        third = build(conn, persist=True)
+        self.assertEqual(third.fingerprint, first.fingerprint)
+        self.assertEqual(conn.execute("SELECT COUNT(*) FROM learning_dataset_manifests").fetchone()[0], 1)
+
+    def test_persist_is_opt_in_and_never_writes_a_manifest_by_default(self):
+        conn = self.new_db()
+        seed_series(conn, dates(10), horizons=(1,))
+        build(conn)
+        self.assertEqual(
+            conn.execute("SELECT COUNT(*) FROM learning_dataset_manifests").fetchone()[0], 0
+        )
+
+    def test_manifest_round_trip(self):
+        conn = self.new_db()
+        seed_series(conn, dates(10), horizons=(1,))
+        built = build(conn, persist=True)
+        stored = LD.read_manifest(conn, built.fingerprint)
+        self.assertIsNotNone(stored)
+        self.assertEqual(stored["dataset_fingerprint"], built.fingerprint)
+        self.assertEqual(stored["eligible_row_count"], built.eligible_rows)
+        self.assertEqual(stored["exclusion_reasons"], built.manifest["exclusion_reasons"])
+
+
+class SensitivityTests(DbTestCase):
+    """Every material change must fork the fingerprint."""
+
+    def _baseline(self):
+        conn = self.new_db()
+        day_list = dates(10)
+        seed_series(conn, day_list, horizons=(1,), codes=("000001", "000002"))
+        return conn, day_list, build(conn).fingerprint
+
+    def _fingerprint(self, conn, **kwargs):
+        return build(conn, **kwargs).fingerprint
+
+    def test_one_feature_value_changes_fingerprint(self):
+        conn, _, baseline = self._baseline()
+        conn.execute("UPDATE adaptive_alpha_samples SET main_flow=0.123456 WHERE code='000002'")
+        self.assertNotEqual(self._fingerprint(conn), baseline)
+
+    def test_availability_timestamp_changes_fingerprint(self):
+        conn, _, baseline = self._baseline()
+        conn.execute("UPDATE adaptive_alpha_samples SET feature_available_at='2026-01-11T15:15:00'")
+        self.assertNotEqual(self._fingerprint(conn), baseline)
+
+    def test_target_changes_fingerprint(self):
+        conn, _, baseline = self._baseline()
+        conn.execute("UPDATE adaptive_alpha_returns SET forward_return_pct=9.5 WHERE code='000002'")
+        self.assertNotEqual(self._fingerprint(conn), baseline)
+
+    def test_label_end_date_changes_fingerprint(self):
+        conn, day_list, baseline = self._baseline()
+        conn.execute(
+            "UPDATE adaptive_alpha_returns SET end_date=? WHERE code='000001' AND start_date=?",
+            (day_list[2], day_list[0]),
+        )
+        self.assertNotEqual(self._fingerprint(conn), baseline)
+
+    def test_feature_list_changes_fingerprint(self):
+        conn, _, baseline = self._baseline()
+        self.assertNotEqual(self._fingerprint(conn, feature_names=FEATURES[:4]), baseline)
+
+    def test_cutoff_changes_fingerprint(self):
+        conn, _, baseline = self._baseline()
+        self.assertNotEqual(self._fingerprint(conn, cutoff="2026-01-08"), baseline)
+
+    def test_split_spec_changes_fingerprint(self):
+        conn, _, baseline = self._baseline()
+        self.assertNotEqual(
+            self._fingerprint(conn, split_spec={"train": 0.5, "validation": 0.25, "test": 0.25}),
+            baseline,
+        )
+
+    def test_contract_version_changes_fingerprint(self):
+        conn, _, baseline = self._baseline()
+        self.assertNotEqual(self._fingerprint(conn, contract_version="learning-dataset-v0"), baseline)
+
+    def test_partition_membership_changes_fingerprint(self):
+        conn, _, baseline = self._baseline()
+        built = build(conn)
+        moved = {
+            "train": [row.with_partition("test") for row in list(built.partitions["train"])[:1]],
+            "validation": list(built.partitions["validation"]),
+            "test": [row.with_partition("train") for row in list(built.partitions["train"])[1:]]
+            + list(built.partitions["test"]),
+        }
+        self.assertNotEqual(
+            LD.dataset_fingerprint(
+                moved,
+                cutoff=built.cutoff,
+                feature_names=built.feature_names,
+                horizon_semantics=built.horizon_semantics,
+                split_spec=built.split_spec,
+                source_digest_value=built.manifest["source_digest"],
+            ),
+            baseline,
+        )
+
+    def test_created_at_is_not_part_of_the_content_fingerprint(self):
+        conn, _, baseline = self._baseline()
+        built = build(conn)
+        recomputed = LD.dataset_fingerprint(
+            built.partitions,
+            cutoff=built.cutoff,
+            feature_names=built.feature_names,
+            horizon_semantics=built.horizon_semantics,
+            split_spec=built.split_spec,
+            source_digest_value=built.manifest["source_digest"],
+        )
+        self.assertEqual(recomputed, baseline)
+        self.assertNotIn("created_at", built.manifest["label_spec"])
+        self.assertNotIn(built.manifest["created_at"], str(recomputed))
+
+
+class MissingDataTests(DbTestCase):
+    """Missing is not zero, and the layer never imputes."""
+
+    def test_missing_feature_is_not_converted_to_zero(self):
+        conn = self.new_db()
+        seed_sample(conn, "2026-01-01")
+        seed_label(conn, "2026-01-01", "2026-01-02")
+        # A blank / unparseable stored value is "missing", not "0.0".
+        conn.execute("UPDATE adaptive_alpha_samples SET value=''")
+        built = build(conn)
+        self.assertEqual(built.eligible_rows, 0)
+        self.assertEqual(reasons(built).get("missing_feature"), 1)
+
+    def test_nan_is_never_silently_zero(self):
+        evidence = {
+            "sample": {
+                "profile_date": "2026-01-01",
+                "code": "000001",
+                "feature_asof": "2026-01-01",
+                "feature_available_at": "2026-01-01T15:15:00",
+                "pit_status": LD.PIT_VERIFIED,
+                "sample_features": {**{name: 0.5 for name in FEATURES}, "turnover": float("nan")},
+            },
+            "label": {
+                "start_date": "2026-01-01",
+                "end_date": "2026-01-02",
+                "horizon": 1,
+                "forward_return_pct": 1.0,
+                "label_available_at": "2026-01-02T15:15:00",
+                "horizon_semantics": LD.HORIZON_SEMANTICS_OBSERVED_PROFILE_STEPS,
+            },
+        }
+        sample, reason = LD._classify(evidence, cutoff="2026-03-01", feature_names=FEATURES)
+        self.assertIsNone(sample)
+        self.assertEqual(reason, "non_finite_feature")
+
+    def test_nan_stored_in_sqlite_is_excluded(self):
+        conn = self.new_db()
+        seed_sample(conn, "2026-01-01")
+        seed_label(conn, "2026-01-01", "2026-01-02")
+        # A stored non-numeric token is non-finite, not zero (the column is
+        # NOT NULL, so a real NULL cannot even be written here).
+        conn.execute("UPDATE adaptive_alpha_samples SET turnover='NaN'")
+        built = build(conn)
+        self.assertEqual(built.eligible_rows, 0)
+        self.assertEqual(reasons(built).get("non_finite_feature"), 1)
+
+    def test_infinity_is_rejected_not_normalized(self):
+        conn = self.new_db()
+        seed_sample(conn, "2026-01-01")
+        seed_label(conn, "2026-01-01", "2026-01-02")
+        conn.execute("UPDATE adaptive_alpha_samples SET turnover=?", (float("inf"),))
+        built = build(conn)
+        self.assertEqual(built.eligible_rows, 0)
+        self.assertEqual(reasons(built).get("non_finite_feature"), 1)
+
+    def test_genuine_zero_is_preserved(self):
+        conn = self.new_db()
+        features = {name: 0.5 for name in FEATURES}
+        features["turnover"] = 0.0
+        seed_sample(conn, "2026-01-01", features=features)
+        seed_label(conn, "2026-01-01", "2026-01-02")
+        built = build(conn)
+        self.assertEqual(built.eligible_rows, 1)
+        row = all_rows(built)[0]
+        self.assertEqual(row.features["turnover"], 0.0)
+
+    def test_canonical_number_normalizes_negative_zero(self):
+        self.assertEqual(LD._canon_number(-0.0), LD._canon_number(0.0))
+
+    def test_canonical_number_rejects_non_finite(self):
+        self.assertIsNone(LD._canon_number(float("inf")))
+        self.assertIsNone(LD._canon_number(float("nan")))
+
+
+class ExclusionAuditTests(DbTestCase):
+    """Nothing is dropped silently; the manifest counts every refusal."""
+
+    def test_manifest_counts_every_exclusion_reason(self):
+        conn = self.new_db()
+        seed_series(conn, dates(6), horizons=(1,))
+        seed_sample(conn, "2026-01-03", "999999", available=None)
+        seed_label(conn, "2026-01-03", "2026-01-04", 1, "999999")
+        built = build(conn)
+        audit = built.manifest["exclusion_reasons"]
+        self.assertEqual(set(audit), set(LD.EXCLUSION_REASONS))
+        self.assertEqual(audit["legacy_unproven_pit"], 1)
+        self.assertEqual(built.manifest["excluded_row_count"], sum(audit.values()))
+
+    def test_duplicate_sample_is_audited(self):
+        conn = self.new_db()
+        seed_sample(conn, "2026-01-01")
+        conn.execute(
+            "UPDATE adaptive_alpha_samples SET code=code WHERE profile_date='2026-01-01'"
+        )
+        # Two labels for the same (start, horizon) pair collapse to one key.
+        seed_label(conn, "2026-01-01", "2026-01-02", 1)
+        conn.execute(
+            """INSERT OR IGNORE INTO adaptive_alpha_returns(
+                   start_date,end_date,horizon,code,forward_return_pct,created_at,
+                   label_available_at,horizon_semantics,pit_status)
+               VALUES('2026-01-01','2026-01-02',1,'000001',2.0,'x','2026-01-02T15:15:00',?,'verified')""",
+            (LD.HORIZON_SEMANTICS_OBSERVED_PROFILE_STEPS,),
+        )
+        built = build(conn)
+        self.assertGreaterEqual(built.manifest["exclusion_reasons"]["duplicate_sample"], 0)
+
+    def test_source_row_count_matches_evidence_read(self):
+        conn = self.new_db()
+        seed_series(conn, dates(6), horizons=(1,))
+        built = build(conn)
+        self.assertEqual(built.manifest["source_row_count"], len(LD._read_alpha_evidence(conn)))
+
+
+class SchemaMigrationTests(DbTestCase):
+    """Old DB, empty DB, test DB -- all must migrate idempotently."""
+
+    def test_empty_database_migrates(self):
+        conn = self.raw_db()
+        conn.executescript(LEGACY_SCHEMA)
+        first = LD.ensure_schema(conn)
+        second = LD.ensure_schema(conn)
+        self.assertTrue(first["manifest_table"])
+        self.assertGreater(first["added_columns"], 0)
+        self.assertEqual(second["added_columns"], 0)
+
+    def test_minimal_test_database_migrates_without_crashing(self):
+        conn = self.raw_db()
+        conn.executescript(
+            "CREATE TABLE adaptive_alpha_samples(profile_date TEXT, code TEXT);"
+            "CREATE TABLE adaptive_alpha_returns(start_date TEXT, horizon INTEGER);"
+        )
+        LD.ensure_schema(conn)
+        self.assertEqual(NS.readiness(conn)["admitted"], False)
+
+    def test_database_without_alpha_tables_is_tolerated(self):
+        conn = self.raw_db()
+        LD.ensure_schema(conn)
+        status = LD.contract_status(conn)
+        self.assertEqual(status["dataset_blockers"], ["dataset_evidence_table_missing"])
+
+    def test_legacy_rows_are_marked_not_invented(self):
+        conn = self.raw_db()
+        conn.executescript(LEGACY_SCHEMA)
+        conn.execute(
+            "INSERT INTO adaptive_alpha_samples VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+            ("2026-01-01", "000001", "A", 10.0, "neutral", .5, .5, .5, .5, .5, .5, "2026-01-01T16:00:00"),
+        )
+        conn.execute(
+            "INSERT INTO adaptive_alpha_returns VALUES(?,?,?,?,?,?)",
+            ("2026-01-01", "2026-01-02", 1, "000001", 1.0, "2026-01-02T16:00:00"),
+        )
+        LD.ensure_schema(conn)
+        self.assertEqual(
+            conn.execute("SELECT pit_status FROM adaptive_alpha_samples").fetchone()[0],
+            LD.PIT_LEGACY_UNPROVEN,
+        )
+        self.assertIsNone(
+            conn.execute("SELECT feature_available_at FROM adaptive_alpha_samples").fetchone()[0]
+        )
+        built = build(conn)
+        self.assertEqual(built.eligible_rows, 0)
+
+    def test_legacy_unknown_pit_does_not_become_verified(self):
+        conn = self.raw_db()
+        conn.executescript(LEGACY_SCHEMA)
+        conn.execute(
+            "INSERT INTO adaptive_alpha_samples VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+            ("2026-01-01", "000001", "A", 10.0, "neutral", .5, .5, .5, .5, .5, .5, "x"),
+        )
+        conn.execute(
+            "INSERT INTO adaptive_alpha_returns VALUES(?,?,?,?,?,?)",
+            ("2026-01-01", "2026-01-02", 1, "000001", 1.0, "x"),
+        )
+        LD.ensure_schema(conn)
+        status = LD.contract_status(conn)
+        self.assertIn("dataset_cutoff_unprovable", status["dataset_blockers"])
+        self.assertEqual(status["pit_eligible_rows"], 0)
+
+
+class ContractStatusTests(DbTestCase):
+    """Row count is not readiness; the contract gate is."""
+
+    def _bulk_legacy(self, conn, day_count=30, codes=100):
+        day_list = dates(day_count)
+        samples = []
+        labels = []
+        for index, day in enumerate(day_list):
+            for code_index in range(codes):
+                code = f"{code_index:06d}"
+                samples.append(
+                    (day, code, "A", close_base_for(index), "neutral",
+                     0.5, 0.5, 0.5, 0.5, 0.5, 0.5, f"{day}T16:00:00",
+                     day, None, LD.PIT_LEGACY_UNPROVEN, "legacy", "legacy", LD.CONTRACT_VERSION)
+                )
+        conn.executemany(
+            """INSERT OR REPLACE INTO adaptive_alpha_samples(
+                   profile_date,code,industry,close_price,regime,price_momentum,main_flow,
+                   turnover,volume_ratio,small_size,value,created_at,
+                   feature_asof,feature_available_at,pit_status,source,source_version,contract_version)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            samples,
+        )
+        for horizon in (1, 3, 5):
+            for index in range(len(day_list) - horizon):
+                for code_index in range(codes):
+                    code = f"{code_index:06d}"
+                    labels.append(
+                        (day_list[index], day_list[index + horizon], horizon, code, 1.0,
+                         f"{day_list[index + horizon]}T16:00:00", None,
+                         LD.HORIZON_SEMANTICS_OBSERVED_PROFILE_STEPS,
+                         LD.PIT_LEGACY_UNPROVEN, "legacy", "legacy", LD.CONTRACT_VERSION)
+                    )
+        conn.executemany(
+            """INSERT OR IGNORE INTO adaptive_alpha_returns(
+                   start_date,end_date,horizon,code,forward_return_pct,created_at,
+                   label_available_at,horizon_semantics,pit_status,source,source_version,contract_version)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
+            labels,
+        )
+        return day_list
+
+    def test_row_counts_alone_never_clear_the_dataset_gate(self):
+        conn = self.new_db()
+        self._bulk_legacy(conn)
+        ready = NS.readiness(conn)
+        # Numeric sample gates are satisfied by construction ...
+        self.assertGreaterEqual(ready["profile_days"], NS.MIN_PROFILE_DAYS)
+        self.assertGreaterEqual(ready["label_dates"], NS.MIN_LABEL_DATES)
+        self.assertGreaterEqual(ready["label_rows"], NS.MIN_LABEL_ROWS)
+        self.assertEqual(ready["available_horizons"], list(NS.REQUIRED_HORIZONS))
+        # ... yet the dataset contract still refuses to call this research-ready.
+        self.assertTrue(ready["dataset_blockers"])
+        self.assertFalse(ready["admitted"])
+        self.assertEqual(ready["status"], "waiting_data")
+        self.assertEqual(ready["mode"], "shadow_only")
+        self.assertEqual(ready["trading_impact"], "none")
+        self.assertEqual(ready["execution_authority"], "none")
+
+    def test_proven_dataset_passes_the_gate_and_stays_shadow_only(self):
+        conn = self.new_db()
+        seed_series(conn, dates(12), horizons=(1,), codes=("000001", "000002", "000003"))
+        status = LD.contract_status(conn)
+        self.assertEqual(status["dataset_blockers"], [])
+        self.assertTrue(status["dataset_fingerprint"])
+        self.assertGreater(status["pit_eligible_rows"], 0)
+        for name in LD.PARTITIONS:
+            self.assertGreater(status["split_rows"][name], 0)
+
+    def test_truncated_read_is_not_reported_as_ready(self):
+        conn = self.new_db()
+        seed_series(conn, dates(12), horizons=(1,))
+        status = LD.contract_status(conn, max_evidence_rows=1)
+        self.assertTrue(status["truncated"])
+        self.assertIn("dataset_evidence_read_truncated", status["dataset_blockers"])
+
+    def test_contract_status_never_writes_a_manifest(self):
+        conn = self.new_db()
+        seed_series(conn, dates(12), horizons=(1,))
+        LD.contract_status(conn)
+        self.assertEqual(
+            conn.execute("SELECT COUNT(*) FROM learning_dataset_manifests").fetchone()[0], 0
+        )
+
+    def test_contract_layer_error_fails_closed(self):
+        conn = self.new_db()
+        seed_series(conn, dates(12), horizons=(1,))
+        with mock.patch.object(LD, "build_dataset", side_effect=RuntimeError("boom")):
+            status = LD.contract_status(conn)
+        self.assertEqual(status["dataset_blockers"], ["dataset_contract_error"])
+        self.assertIsNone(status["dataset_fingerprint"])
+
+
+class NoNetworkTests(DbTestCase):
+    """The builder consumes persisted evidence only."""
+
+    def test_dataset_build_never_touches_the_network(self):
+        conn = self.new_db()
+        seed_series(conn, dates(12), horizons=(1,))
+        with mock.patch("socket.socket", side_effect=AssertionError("network during build")):
+            with mock.patch("socket.create_connection", side_effect=AssertionError("network")):
+                with mock.patch("urllib.request.urlopen", side_effect=AssertionError("network")):
+                    built = build(conn)
+        self.assertTrue(built.eligible_rows)
+
+    def test_builder_has_no_provider_dependency(self):
+        self.assertEqual(LD.forbidden_dependencies(), [])
+
+    def test_source_has_no_network_module_import(self):
+        tree = ast.parse(Path(LD.__file__).read_text(encoding="utf-8"))
+        imported = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                imported.update(alias.name.split(".", 1)[0] for alias in node.names)
+            elif isinstance(node, ast.ImportFrom) and node.module:
+                imported.add(node.module.split(".", 1)[0])
+        for forbidden in ("requests", "urllib", "socket", "httpx", "aiohttp", "http"):
+            self.assertNotIn(forbidden, imported)
+        for forbidden in ("adaptive_engine", "paper_trading", "order_intent", "strategy_registry"):
+            self.assertNotIn(forbidden, imported)
+
+
+class NoExecutionTests(DbTestCase):
+    """Building a dataset must not mutate trading state or submit orders."""
+
+    def test_build_is_read_only_over_the_database(self):
+        conn = self.new_db()
+        seed_series(conn, dates(12), horizons=(1,))
+        before = conn.total_changes
+        build(conn)
+        self.assertEqual(conn.total_changes, before)
+
+    def test_source_has_no_order_submission_calls(self):
+        tree = ast.parse(Path(LD.__file__).read_text(encoding="utf-8"))
+        forbidden = {
+            "submit_order", "submit_manual_order", "cancel_manual_order",
+            "execute_open", "_execute_manual_plan", "_commit_strategy_buy",
+        }
+        calls = {
+            node.func.id for node in ast.walk(tree)
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+        }
+        self.assertTrue(forbidden.isdisjoint(calls), sorted(forbidden & calls))
+
+    def test_module_keeps_research_only_identity(self):
+        conn = self.new_db()
+        seed_series(conn, dates(12), horizons=(1,))
+        manifest = build(conn).manifest
+        self.assertEqual(manifest["execution_authority"], "none")
+        self.assertEqual(manifest["dataset_scope"], "research_read_only")
+
+    def test_neural_gate_never_changes_trading_behaviour(self):
+        conn = self.new_db()
+        conn.executescript(
+            "CREATE TABLE IF NOT EXISTS adaptive_config(key TEXT PRIMARY KEY, value TEXT);"
+        )
+        seed_series(conn, dates(12), horizons=(1,))
+        state = NS.control_status(conn)
+        self.assertEqual(state["mode"], "shadow_only")
+        self.assertEqual(state["trading_impact"], "none")
+        self.assertTrue(state["hard_gates_unchanged"])
+
+
+if __name__ == "__main__":
+    unittest.main()
