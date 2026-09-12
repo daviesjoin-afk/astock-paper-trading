@@ -67,8 +67,13 @@ class DbTestCase(unittest.TestCase):
 
 
 def seed_sample(conn, profile_date, code="000001", *, asof="auto", available="auto",
-                pit=None, close=10.0, features=None, industry="测试行业", regime="neutral"):
-    """Insert one evidence row.  ``available=None`` means "no proof recorded"."""
+                pit=None, close=10.0, features=None, industry="测试行业", regime="neutral",
+                provenance=None):
+    """Insert one evidence row.  ``available=None`` means "no proof recorded".
+
+    ``provenance`` models the *raw* evidence provenance blob a historical row
+    may carry; it must never override the canonical layer's own fields.
+    """
     asof_value = profile_date if asof == "auto" else asof
     availability = f"{profile_date}T15:15:00" if available == "auto" else available
     if pit is None:
@@ -78,16 +83,22 @@ def seed_sample(conn, profile_date, code="000001", *, asof="auto", available="au
         """INSERT OR REPLACE INTO adaptive_alpha_samples(
                profile_date,code,industry,close_price,regime,price_momentum,main_flow,
                turnover,volume_ratio,small_size,value,created_at,
-               feature_asof,feature_available_at,pit_status,source,source_version,contract_version)
-           VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+               feature_asof,feature_available_at,pit_status,source,source_version,
+               contract_version,provenance_json)
+           VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (profile_date, code, industry, close, regime,
          *[values.get(name) for name in FEATURES], f"{profile_date}T16:00:00",
          asof_value, availability, pit, "market_snapshot_full.json", "test-v1",
-         LD.CONTRACT_VERSION),
+         LD.CONTRACT_VERSION, _json(provenance)),
     )
 
 
-def seed_label(conn, start, end, horizon=1, code="000001", ret=1.0, available="auto", pit="auto"):
+def _json(value):
+    return None if value is None else json.dumps(value, ensure_ascii=False)
+
+
+def seed_label(conn, start, end, horizon=1, code="000001", ret=1.0, available="auto", pit="auto",
+               provenance=None):
     """Insert one forward label.  ``pit='auto'`` means "verified"; pass an
     explicit status (or ``None``) to model an endpoint whose provenance is not
     proven."""
@@ -96,11 +107,13 @@ def seed_label(conn, start, end, horizon=1, code="000001", ret=1.0, available="a
     conn.execute(
         """INSERT OR IGNORE INTO adaptive_alpha_returns(
                start_date,end_date,horizon,code,forward_return_pct,created_at,
-               label_available_at,horizon_semantics,pit_status,source,source_version,contract_version)
-           VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
+               label_available_at,horizon_semantics,pit_status,source,source_version,
+               contract_version,provenance_json)
+           VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (start, end, horizon, code, ret, f"{end}T16:00:00", availability,
          LD.HORIZON_SEMANTICS_OBSERVED_PROFILE_STEPS, status,
-         LD.DATASET_KIND_ADAPTIVE_ALPHA, "test-v1", LD.CONTRACT_VERSION),
+         LD.DATASET_KIND_ADAPTIVE_ALPHA, "test-v1", LD.CONTRACT_VERSION,
+         _json(provenance)),
     )
 
 
@@ -1020,6 +1033,110 @@ class TimezoneContractTests(DbTestCase):
         built = build(conn)
         row = all_rows(built)[0]
         self.assertEqual(row.provenance["availability_clock"], "canonical_utc")
+
+
+class CanonicalProvenanceTests(DbTestCase):
+    """Raw evidence provenance is audit data; it may not override the contract.
+
+    The canonical row is what enters the fingerprint, so a stale
+    ``availability_clock`` in a historical row must not be able to contradict
+    the canonical UTC timestamps stored right next to it.
+    """
+
+    def _one_row(self, conn):
+        built = build(conn)
+        rows = all_rows(built)
+        self.assertEqual(len(rows), 1, reasons(built))
+        return rows[0]
+
+    def test_stale_sample_clock_cannot_override_canonical_clock(self):
+        conn = self.new_db()
+        seed_sample(conn, "2026-01-01",
+                    provenance={"availability_clock": "exchange_local_naive",
+                                "sample_note": "keep-me"})
+        seed_label(conn, "2026-01-01", "2026-01-02")
+        row = self._one_row(conn)
+        self.assertEqual(row.provenance["availability_clock"], "canonical_utc")
+        self.assertEqual(row.provenance["sample_note"], "keep-me")
+
+    def test_label_provenance_cannot_override_canonical_clock(self):
+        conn = self.new_db()
+        seed_sample(conn, "2026-01-01")
+        seed_label(conn, "2026-01-01", "2026-01-02",
+                   provenance={"availability_clock": "bogus", "label_note": "keep-label-note"})
+        row = self._one_row(conn)
+        self.assertEqual(row.provenance["availability_clock"], "canonical_utc")
+        self.assertEqual(row.provenance["label_note"], "keep-label-note")
+
+    def test_conflicting_sample_and_label_clocks_resolve_to_the_canonical_one(self):
+        conn = self.new_db()
+        seed_sample(conn, "2026-01-01",
+                    provenance={"availability_clock": "exchange_local_naive"})
+        seed_label(conn, "2026-01-01", "2026-01-02",
+                   provenance={"availability_clock": "bogus"})
+        row = self._one_row(conn)
+        # Not first-wins and not last-wins: the canonical layer wins.
+        self.assertEqual(row.provenance["availability_clock"], "canonical_utc")
+
+    def test_reserved_contract_fields_cannot_be_spoofed(self):
+        conn = self.new_db()
+        spoof = {
+            "sample_contract_version": "spoofed-v0",
+            "label_source": "spoofed_source",
+            "label_source_version": "spoofed-v0",
+            "industry": "spoofed_industry",
+            "regime": "spoofed_regime",
+            "audit_note": "keep-audit",
+        }
+        seed_sample(conn, "2026-01-01", provenance=spoof)
+        seed_label(conn, "2026-01-01", "2026-01-02", provenance=spoof)
+        row = self._one_row(conn)
+        self.assertEqual(row.provenance["sample_contract_version"], LD.CONTRACT_VERSION)
+        self.assertEqual(row.provenance["label_source"], LD.DATASET_KIND_ADAPTIVE_ALPHA)
+        self.assertEqual(row.provenance["label_source_version"], "test-v1")
+        self.assertEqual(row.provenance["industry"], "测试行业")
+        self.assertEqual(row.provenance["regime"], "neutral")
+        # Non-reserved audit provenance survives untouched.
+        self.assertEqual(row.provenance["audit_note"], "keep-audit")
+
+    def test_reserved_keys_are_exactly_the_documented_set(self):
+        self.assertEqual(
+            set(LD.CANONICAL_RESERVED_PROVENANCE_KEYS),
+            {
+                "industry",
+                "regime",
+                "label_source",
+                "label_source_version",
+                "sample_contract_version",
+                "availability_clock",
+            },
+        )
+
+    def test_reserved_spoof_does_not_fork_the_fingerprint(self):
+        """Only the *reserved derived* field is normalized away.
+
+        Two databases whose only difference is a spoofed reserved clock value
+        must canonicalize to the same row and therefore the same fingerprint.
+        """
+        first, second = self.new_db(), self.new_db()
+        seed_sample(first, "2026-01-01", provenance={"availability_clock": "exchange_local_naive"})
+        seed_sample(second, "2026-01-01", provenance={"availability_clock": "bogus"})
+        seed_label(first, "2026-01-01", "2026-01-02")
+        seed_label(second, "2026-01-01", "2026-01-02")
+        self.assertEqual(
+            self._one_row(first).provenance["availability_clock"],
+            self._one_row(second).provenance["availability_clock"],
+        )
+        self.assertEqual(build(first).fingerprint, build(second).fingerprint)
+
+    def test_non_reserved_provenance_difference_still_forks_the_fingerprint(self):
+        """Audit provenance is content: a real difference must change the hash."""
+        first, second = self.new_db(), self.new_db()
+        seed_sample(first, "2026-01-01", provenance={"sample_note": "a"})
+        seed_sample(second, "2026-01-01", provenance={"sample_note": "b"})
+        seed_label(first, "2026-01-01", "2026-01-02")
+        seed_label(second, "2026-01-01", "2026-01-02")
+        self.assertNotEqual(build(first).fingerprint, build(second).fingerprint)
 
 
 class SchemaMigrationTests(DbTestCase):

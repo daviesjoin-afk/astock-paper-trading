@@ -167,6 +167,18 @@ _EXCHANGE_TZ = _dt.timezone(_dt.timedelta(hours=8), "UTC+08:00")
 _UTC = _dt.timezone.utc
 _AVAILABILITY_CLOCK = "canonical_utc"
 
+# Provenance keys the canonical dataset layer owns.  Raw evidence provenance is
+# preserved for audit, but it may never override these: they are derived from
+# structured columns / the contract, not from whatever a historical row wrote.
+CANONICAL_RESERVED_PROVENANCE_KEYS = (
+    "industry",
+    "regime",
+    "label_source",
+    "label_source_version",
+    "sample_contract_version",
+    "availability_clock",
+)
+
 # Modules that must never appear in this module's namespace.  Enforced by
 # :func:`forbidden_dependencies` and asserted in the dependency guard test.
 _FORBIDDEN_DEPENDENCY_PREFIXES = (
@@ -842,6 +854,32 @@ def _ambiguous_identities(evidence: Sequence[Mapping[str, Any]]) -> frozenset:
     return frozenset(identity for identity, seen in endpoints.items() if len(seen) > 1)
 
 
+def _canonical_provenance(sample: Mapping[str, Any], label: Mapping[str, Any]) -> dict:
+    """Merge raw evidence provenance *under* the canonical dataset's fields.
+
+    Raw provenance is audit evidence and is kept as-is, but the canonical layer
+    is authoritative for :data:`CANONICAL_RESERVED_PROVENANCE_KEYS`: a stale or
+    spoofed value in a historical row must never contradict the contract that
+    produced the canonical row (for example ``availability_clock`` has to agree
+    with the canonical UTC timestamps stored beside it).
+    """
+    provenance = {
+        **_loads(sample.get("provenance_json")),
+        **_loads(label.get("provenance_json")),
+    }
+    provenance.update(
+        {
+            "industry": _text(sample.get("industry")),
+            "regime": _text(sample.get("regime")),
+            "label_source": _text(label.get("source")) or "",
+            "label_source_version": _text(label.get("source_version")) or "",
+            "sample_contract_version": _text(sample.get("contract_version")) or CONTRACT_VERSION,
+            "availability_clock": _AVAILABILITY_CLOCK,
+        }
+    )
+    return provenance
+
+
 def _classify(evidence: Mapping[str, Any], *, cutoff: str, feature_names: Sequence[str]) -> tuple:
     """Return ``(CanonicalSample | None, exclusion_reason | None)``.
 
@@ -957,16 +995,7 @@ def _classify(evidence: Mapping[str, Any], *, cutoff: str, feature_names: Sequen
             target=target,
             pit_status=PIT_VERIFIED,
             quality_flags=tuple(sorted(_loads(sample.get("quality_json")).keys())),
-            provenance={
-                "industry": _text(sample.get("industry")),
-                "regime": _text(sample.get("regime")),
-                "label_source": _text(label.get("source")) or "",
-                "label_source_version": _text(label.get("source_version")) or "",
-                "sample_contract_version": _text(sample.get("contract_version")) or CONTRACT_VERSION,
-                "availability_clock": _AVAILABILITY_CLOCK,
-                **_loads(sample.get("provenance_json")),
-                **_loads(label.get("provenance_json")),
-            },
+            provenance=_canonical_provenance(sample, label),
         ),
         None,
     )
