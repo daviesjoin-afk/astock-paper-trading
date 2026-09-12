@@ -75,10 +75,11 @@ def build_demo_plugin() -> PLUGINS.StrategyPlugin:
         selector_id=DEMO_SELECTOR_ID,
         factor_inputs=DEMO_FACTOR_INPUTS,
         candidate_runner=_candidate_runner,
-        # Reuse an audited policy family for the mechanics of the example.  The
-        # demo never opens a paper account or submits an order.
-        entry_policy_key="trend_pullback",
-        exit_policy_key="trend_pullback",
+        # Use one audited policy family that exercises opening-event,
+        # entry-economics, downside and recovery contracts.  The demo never
+        # opens a paper account or submits an order.
+        entry_policy_key="tq_breakout",
+        exit_policy_key="tq_breakout",
     )
 
 
@@ -106,11 +107,13 @@ def run_demo() -> dict[str, Any]:
     """
     plugin = build_demo_plugin()
     conn = _demo_connection()
+    registered_here = False
     SRT.clear_cache()
     try:
         if DEMO_STRATEGY_ID in PLUGINS.plugin_ids():
             raise RuntimeError("synthetic demo plugin is already registered")
         PLUGINS.register_plugin(plugin)
+        registered_here = True
         table = synthetic_factor_table()
         candidates = PLUGINS.select_candidates(DEMO_STRATEGY_ID, table, topn=2)
         registered = PLUGINS.get_plugin(DEMO_STRATEGY_ID)
@@ -137,7 +140,8 @@ def run_demo() -> dict[str, Any]:
             },
         }
     finally:
-        PLUGINS.unregister_plugin(DEMO_STRATEGY_ID)
+        if registered_here:
+            PLUGINS.unregister_plugin(DEMO_STRATEGY_ID)
         SRT.clear_cache()
         conn.close()
 
