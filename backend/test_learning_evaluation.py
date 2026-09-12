@@ -17,6 +17,7 @@ import sqlite3
 import sys
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 
@@ -130,21 +131,31 @@ def seed_label(conn, start, end, code, *, horizon=1, ret=1.0, available="auto", 
     )
 
 
-def seed_panel(conn, *, day_count=40, codes=CODES, target_fn=None, horizons=(1,)):
+def date_series(count, start=dt.date(2026, 1, 1)):
+    """A consecutive calendar-date series longer than the 40-day default panel.
+
+    The default ``DAYS`` panel only yields nine held-out dates, which is not
+    enough to show a chronological tail being *skipped*: with three or four
+    dates, "the last three" and "the last three that scored" nearly coincide.
+    """
+    return [(start + dt.timedelta(days=offset)).isoformat() for offset in range(count)]
+
+
+def seed_panel(conn, *, day_count=40, codes=CODES, target_fn=None, horizons=(1,), days=None):
     """Seed features plus mature forward labels over a consecutive date series."""
-    days = DAYS[:day_count]
+    series = list(days) if days is not None else DAYS[:day_count]
     target_fn = target_fn or (lambda index, code_index, code: code_value(code))
-    for index, day in enumerate(days):
+    for index, day in enumerate(series):
         for code in codes:
             seed_sample(conn, day, code)
     for horizon in horizons:
-        for index in range(len(days) - horizon):
+        for index in range(len(series) - horizon):
             for code in codes:
                 seed_label(
-                    conn, days[index], days[index + horizon], code,
+                    conn, series[index], series[index + horizon], code,
                     horizon=horizon, ret=target_fn(index, codes.index(code), code),
                 )
-    return days
+    return series
 
 
 def alternating_target(index, code_index, code):
@@ -1125,6 +1136,136 @@ class PredictionAvailabilityTests(DbTestCase):
         self.assertTrue(build_eval.contract_ok, build_eval.blockers)
 
 
+# ──────────── K1: a date-only cutoff keeps PR-8's exchange-local EOD ────────────
+
+
+class EvaluationCutoffSemanticsTests(DbTestCase):
+    """A cutoff is read on the *cutoff* clock, never the availability clock.
+
+    PR-8 freezes a date-only cutoff at the **end** of that exchange-local day,
+    so a dataset frozen at ``2026-09-12`` legitimately contains evidence
+    produced at any point during that day.  Reading the cutoff as an ordinary
+    availability instant would move the freeze to 00:00 exchange-local and
+    refuse every same-day prediction -- a silently *tighter* freeze than the
+    dataset layer ever declared, which is a contract regression, not caution.
+    """
+
+    CUTOFF = "2026-09-12"
+    # A label that matures well after the cutoff day, so that the cutoff rule is
+    # the only rule that *can* fire.  With a realistic same-day label the
+    # stronger label-availability rule would mask the cutoff rule entirely and
+    # the assertion would pass for the wrong reason.
+    LATE_LABEL = "2026-09-30T15:15:00"
+
+    def _sample(self, label_available_at=None):
+        return SimpleNamespace(label_available_at=label_available_at or self.LATE_LABEL)
+
+    def _row(self, asof):
+        return {"prediction_asof": asof}
+
+    def test_date_only_cutoff_uses_exchange_local_day_end(self):
+        # 23:59:59+08:00 == 15:59:59Z -- and emphatically *not* the day start,
+        # which would be 2026-09-11T16:00:00Z.
+        self.assertEqual(
+            LE._cutoff_instant(self.CUTOFF).isoformat(), "2026-09-12T15:59:59+00:00"
+        )
+        self.assertEqual(
+            LE._cutoff_instant(self.CUTOFF),
+            LE._availability_instant("2026-09-12T23:59:59+08:00"),
+        )
+        self.assertNotEqual(
+            LE._cutoff_instant(self.CUTOFF), LE._availability_instant(self.CUTOFF)
+        )
+        # A full timestamp keeps the ordinary availability semantics.
+        self.assertEqual(
+            LE._cutoff_instant("2026-09-12T10:00:00+08:00"),
+            LE._availability_instant("2026-09-12T10:00:00+08:00"),
+        )
+        self.assertIsNone(LE._cutoff_instant("not-a-date"))
+        self.assertIsNone(LE._cutoff_instant(None))
+
+    def test_prediction_on_cutoff_day_before_eod_is_not_future(self):
+        sample = self._sample()
+        asof = f"{self.CUTOFF}T10:00:00"
+        row = self._row(asof)
+        # The regression made explicit: on the availability clock this instant
+        # is *after* the cutoff; on the cutoff clock it is comfortably inside.
+        self.assertGreater(
+            LE._availability_instant(asof), LE._availability_instant(self.CUTOFF)
+        )
+        self.assertLessEqual(
+            LE._availability_instant(asof), LE._cutoff_instant(self.CUTOFF)
+        )
+        self.assertFalse(LE._is_future_prediction(row, sample, self.CUTOFF))
+        self.assertFalse(LE._is_future_prediction(row, sample, None))
+
+    def test_prediction_at_next_local_midnight_is_future(self):
+        sample = self._sample()
+        self.assertFalse(
+            LE._is_future_prediction(self._row(f"{self.CUTOFF}T23:59:59"), sample, self.CUTOFF)
+        )
+        midnight = (dt.date.fromisoformat(self.CUTOFF) + dt.timedelta(days=1)).isoformat()
+        self.assertTrue(
+            LE._is_future_prediction(self._row(f"{midnight}T00:00:00"), sample, self.CUTOFF)
+        )
+
+    def test_cutoff_boundary_is_offset_equivalent(self):
+        sample = self._sample()
+        # 2026-09-12T15:59:59Z and 2026-09-12T23:59:59+08:00 are the same instant:
+        # the boundary itself, which is inside the freeze and therefore admitted.
+        zulu = self._row(f"{self.CUTOFF}T15:59:59Z")
+        offset = self._row(f"{self.CUTOFF}T23:59:59+08:00")
+        self.assertEqual(
+            LE._availability_instant(zulu["prediction_asof"]),
+            LE._availability_instant(offset["prediction_asof"]),
+        )
+        self.assertFalse(LE._is_future_prediction(zulu, sample, self.CUTOFF))
+        self.assertFalse(LE._is_future_prediction(offset, sample, self.CUTOFF))
+        # One second past the exchange-local day end is outside the freeze.
+        self.assertTrue(
+            LE._is_future_prediction(self._row(f"{self.CUTOFF}T16:00:00Z"), sample, self.CUTOFF)
+        )
+        self.assertTrue(
+            LE._is_future_prediction(self._row(f"{self.CUTOFF}T15:59:59-08:00"), sample, self.CUTOFF)
+        )
+
+    def test_evaluation_cutoff_semantics_match_dataset_layer(self):
+        """The evaluation mirror must agree with PR-8's cutoff rule, always."""
+        values = (
+            "2026-09-12", "2026-09-12T10:00:00", "2026-09-12T10:00:00+08:00",
+            "2026-09-12T02:00:00Z", "2026-09-12T23:59:59+08:00", "2026/09/12",
+            "2026-09-12 10:00:00", "not-a-date", None, "",
+        )
+        for value in values:
+            mine = LE._cutoff_instant(value)
+            theirs = LD._cutoff_instant(value)
+            self.assertEqual(None if mine is None else mine.isoformat(), theirs, repr(value))
+
+    def test_admits_a_prediction_made_on_the_cutoff_day_itself(self):
+        """End-to-end wiring: the evaluation path really uses the cutoff clock.
+
+        The last held-out date's label matures at 15:15 exchange-local on the
+        following day, which is the panel's cutoff day.  A prediction stamped
+        that morning is therefore *inside the freeze* yet *before the label* --
+        the one window where the two rules disagree.
+        """
+        conn = self.proven()
+        build = build_dataset(conn)
+        last_date = test_dates(build)[-1]
+        cutoff = build.cutoff
+        self.assertEqual(
+            cutoff, (dt.date.fromisoformat(last_date) + dt.timedelta(days=1)).isoformat()
+        )
+        predictions = predictions_for(build)
+        for row in predictions:
+            if row["label_start_date"] == last_date:
+                row["prediction_asof"] = f"{cutoff}T10:00:00"
+        build_eval = evaluate_build(build, predictions, model_id=MODEL_ID)
+        self.assertNotIn("future_prediction", active_exclusions(build_eval))
+        self.assertTrue(build_eval.coverage["coverage_complete"])
+        self.assertTrue(build_eval.contract_ok, build_eval.blockers)
+
+
 # ─────────────────────────────── rank IC math ───────────────────────────────
 
 
@@ -1354,6 +1495,124 @@ class TailRobustnessTests(DbTestCase):
         self.assertIn("evaluation_holdout_insufficient", build_eval.blockers)
 
 
+# ────── K2: the tail is the canonical chronology, not a self-selected one ──────
+
+
+class CanonicalTailTests(DbTestCase):
+    """A recent date that yields no IC is missing evidence, not a skipped date.
+
+    Cutting the tail from the dates that happened to score lets a model go flat
+    on its most recent days and still have the window slide backwards into its
+    earlier, better ones.  The window belongs to the dataset, so it is cut
+    first and checked afterwards -- and any canonical date inside it that
+    produced no IC is an incomplete-evidence refusal.
+    """
+
+    DAY_COUNT = 45  # -> ten held-out dates, enough for a tail to be *skipped*
+
+    def _panel(self):
+        conn = self.new_db()
+        series = date_series(self.DAY_COUNT)
+        seed_panel(conn, days=series)
+        return conn, build_dataset(conn, cutoff=series[-1]), series
+
+    def _constant_on(self, build, dates):
+        flat = set(dates)
+        return predictions_for(
+            build,
+            score_of=lambda sample: (
+                0.0 if sample.label_start_date in flat else code_value(sample.code)
+            ),
+        )
+
+    def test_the_panel_really_has_enough_held_out_dates(self):
+        _conn, build, _series = self._panel()
+        self.assertGreaterEqual(len(test_dates(build)), 10)
+
+    def test_the_healthy_panel_passes(self):
+        _conn, build, _series = self._panel()
+        build_eval = evaluate_build(build, predictions_for(build), model_id=MODEL_ID)
+        canonical = test_dates(build)
+        self.assertTrue(build_eval.contract_ok, build_eval.blockers)
+        self.assertEqual(build_eval.holdout["canonical_test_date_count"], len(canonical))
+        self.assertEqual(build_eval.holdout["valid_ic_date_count"], len(canonical))
+        self.assertEqual(build_eval.holdout["undefined_ic_dates"], [])
+        self.assertEqual(build_eval.holdout["holdout_start_date"], canonical[-3])
+
+    def test_flat_predictions_on_the_recent_dates_are_not_silently_skipped(self):
+        """100% coverage, timely, provable provenance -- and no IC on the tail."""
+        _conn, build, _series = self._panel()
+        canonical = test_dates(build)
+        flat = canonical[-3:]
+        predictions = self._constant_on(build, flat)
+        build_eval = evaluate_build(build, predictions, model_id=MODEL_ID)
+
+        # Nothing else is wrong: the refusal is purely the missing evidence.
+        self.assertTrue(build_eval.coverage["coverage_complete"])
+        self.assertNotIn("future_prediction", active_exclusions(build_eval))
+        self.assertEqual(build_eval.holdout["undefined_ic_dates"], flat)
+        self.assertEqual(build_eval.holdout["undefined_ic_date_count"], 3)
+        self.assertEqual(build_eval.holdout["valid_ic_date_count"], len(canonical) - 3)
+        # The window is the dataset's tail, per date, not the tail of the dates
+        # that still scored -- which is exactly what used to happen.
+        self.assertEqual(build_eval.holdout["holdout_date_count"], 3)
+        self.assertEqual(build_eval.holdout["holdout_valid_date_count"], 0)
+        self.assertEqual(build_eval.holdout["holdout_start_date"], canonical[-3])
+        self.assertEqual(
+            build_eval.blockers,
+            ["evaluation_holdout_incomplete", "evaluation_undefined_ic_dates"],
+        )
+        self.assertFalse(build_eval.contract_ok)
+
+    def test_constant_recent_targets_are_not_silently_skipped(self):
+        """The same refusal when the *labels* collapse, not the scores."""
+        series = date_series(self.DAY_COUNT)
+        flat_from = self.DAY_COUNT - 4  # the last three held-out label dates
+        conn = self.new_db()
+        seed_panel(
+            conn,
+            days=series,
+            target_fn=lambda index, code_index, code: (
+                0.0 if index >= flat_from else code_value(code)
+            ),
+        )
+        build = build_dataset(conn, cutoff=series[-1])
+        canonical = test_dates(build)
+        build_eval = evaluate_build(build, predictions_for(build), model_id=MODEL_ID)
+        self.assertEqual(build_eval.holdout["undefined_ic_dates"], canonical[-3:])
+        self.assertEqual(build_eval.holdout["holdout_start_date"], canonical[-3])
+        self.assertIn("evaluation_undefined_ic_dates", build_eval.blockers)
+        self.assertIn("evaluation_holdout_incomplete", build_eval.blockers)
+        self.assertFalse(build_eval.contract_ok)
+
+    def test_holdout_start_date_never_drifts_backwards(self):
+        _conn, build, _series = self._panel()
+        canonical = test_dates(build)
+        healthy = evaluate_build(build, predictions_for(build), model_id=MODEL_ID)
+        degraded = evaluate_build(
+            build, self._constant_on(build, canonical[-3:]), model_id=MODEL_ID
+        )
+        self.assertTrue(healthy.contract_ok, healthy.blockers)
+        self.assertFalse(degraded.contract_ok)
+        self.assertEqual(healthy.holdout["holdout_start_date"], canonical[-3])
+        self.assertEqual(degraded.holdout["holdout_start_date"], canonical[-3])
+
+    def test_an_incomplete_tail_is_exposed_to_the_read_only_gate(self):
+        conn = self.new_db()
+        series = date_series(self.DAY_COUNT)
+        seed_panel(conn, days=series)
+        build = build_dataset(conn, cutoff=series[-1])
+        canonical = test_dates(build)
+        LE.record_predictions(conn, self._constant_on(build, canonical[-3:]))
+        LE.record_model_provenance(conn, provenance_for(build))
+        status = gate(conn, cutoff=series[-1])
+        self.assertIn("evaluation_undefined_ic_dates", status["evaluation_blockers"])
+        self.assertIn("evaluation_holdout_incomplete", status["evaluation_blockers"])
+        self.assertFalse(status["evaluation_contract_ok"])
+        self.assertEqual(status["holdout"]["undefined_ic_dates"], canonical[-3:])
+        self.assertEqual(status["evaluation_metrics"]["undefined_ic_date_count"], 3)
+
+
 # ──────────────────────────── confidence / holdout gate ────────────────────────────
 
 
@@ -1533,6 +1792,34 @@ class ManifestTests(DbTestCase):
         )
         self.assertEqual(stored["missing_prediction_rows"], 0)
         self.assertEqual(stored["holdout_date_count"], build_eval.holdout["holdout_date_count"])
+
+    def test_manifest_records_the_canonical_tail_audit(self):
+        conn = self.new_db()
+        series = date_series(CanonicalTailTests.DAY_COUNT)
+        seed_panel(conn, days=series)
+        build = build_dataset(conn, cutoff=series[-1])
+        canonical = test_dates(build)
+        flat = set(canonical[-3:])
+        build_eval = evaluate_build(
+            build,
+            predictions_for(
+                build,
+                score_of=lambda sample: (
+                    0.0 if sample.label_start_date in flat else code_value(sample.code)
+                ),
+            ),
+            model_id=MODEL_ID,
+        )
+        LE.persist_evaluation_manifest(conn, build_eval.manifest)
+        stored = LE.read_evaluation_manifest(conn, build_eval.fingerprint)
+        self.assertEqual(stored["canonical_test_date_count"], len(canonical))
+        self.assertEqual(stored["valid_ic_date_count"], len(canonical) - 3)
+        self.assertEqual(stored["undefined_ic_date_count"], 3)
+        # the offending dates survive the round trip as *dates*, not a count
+        self.assertEqual(stored["undefined_ic_dates"], canonical[-3:])
+        self.assertEqual(stored["holdout_undefined_dates"], canonical[-3:])
+        self.assertEqual(stored["holdout_start_date"], canonical[-3])
+        self.assertEqual(stored["holdout_end_date"], canonical[-1])
 
     def test_read_only_gate_never_writes_a_manifest(self):
         conn = self.proven()
@@ -1746,6 +2033,82 @@ class SensitivityTests(DbTestCase):
         baseline = self._fingerprint(build, predictions)
         partial = self._fingerprint(build, predictions[:-1])
         self.assertNotEqual(baseline, partial)
+
+    def test_undefined_recent_dates_move_the_fingerprint(self):
+        conn = self.proven()
+        build = build_dataset(conn)
+        canonical = test_dates(build)
+        flat = set(canonical[-3:])
+        baseline = self._fingerprint(build, predictions_for(build))
+        degraded = self._fingerprint(
+            build,
+            predictions_for(
+                build,
+                score_of=lambda sample: (
+                    0.0 if sample.label_start_date in flat else code_value(sample.code)
+                ),
+            ),
+        )
+        self.assertNotEqual(baseline, degraded)
+
+    def _audit_payload(self, **overrides):
+        """A minimal, *self-consistent* fingerprint payload for one verdict."""
+        audit = {
+            "holdout_start_date": "2026-01-30",
+            "holdout_end_date": "2026-02-01",
+            "holdout_date_count": 3,
+            "holdout_valid_date_count": 3,
+            "holdout_undefined_date_count": 0,
+            "holdout_undefined_dates": [],
+            "holdout_mean_rank_ic": 1.0,
+            "holdout_positive_ratio": 1.0,
+            "holdout_retention": 1.0,
+            "holdout_fraction": 0.3,
+            "canonical_test_date_count": 10,
+            "valid_ic_date_count": 10,
+            "undefined_ic_date_count": 0,
+            "undefined_ic_dates": [],
+        }
+        audit.update(overrides)
+        return audit
+
+    def _fingerprint_of(self, holdout):
+        return LE.evaluation_fingerprint(
+            dataset_fingerprint="f" * 64,
+            model_id=MODEL_ID,
+            holdout_partition="test",
+            scoring={"min_dates": 5},
+            per_date_ic={},
+            evaluated_dates=10,
+            evaluated_rows=40,
+            mean_rank_ic=1.0,
+            ic_std=0.0,
+            ic_std_error=0.0,
+            ic_lower_bound=1.0,
+            evaluation_blockers=("evaluation_holdout_incomplete",),
+            holdout=holdout,
+        )
+
+    def test_scientific_audit_identity_alone_moves_the_fingerprint(self):
+        """Same evidence, same blockers -- only the *which dates* audit differs."""
+        baseline = self._fingerprint_of(self._audit_payload())
+        self.assertEqual(baseline, self._fingerprint_of(self._audit_payload()))
+        # one recent date that used to be valid is now undefined
+        moved = self._fingerprint_of(
+            self._audit_payload(undefined_ic_dates=["2026-02-01"], undefined_ic_date_count=1)
+        )
+        self.assertNotEqual(baseline, moved)
+        # ... and the same date disappearing from the *tail* audit is material too
+        moved_tail = self._fingerprint_of(
+            self._audit_payload(
+                holdout_undefined_dates=["2026-02-01"],
+                holdout_undefined_date_count=1,
+            )
+        )
+        self.assertNotEqual(baseline, moved_tail)
+        # the canonical window itself is material
+        shifted = self._fingerprint_of(self._audit_payload(holdout_start_date="2026-01-29"))
+        self.assertNotEqual(baseline, shifted)
 
 
 # ─────────────────────────── neural shadow integration ───────────────────────────
@@ -1965,6 +2328,20 @@ class NormalizationAgreementTests(DbTestCase):
         for value in ("2026-01-05T10:00:00", "2026-01-05T10:00:00+08:00", "2026-01-05", "nonsense"):
             self.assertEqual(LE.normalize_prediction({"prediction_asof": value})["prediction_asof"],
                              LD.normalize_availability(value), repr(value))
+
+    def test_cutoff_normalization_matches_the_dataset_layer(self):
+        """A cutoff is day-end, an availability is day-start: never interchangeable."""
+        values = (
+            "2026-01-05", "2026-01-05T10:00:00", "2026-01-05T10:00:00+08:00",
+            "2026-01-05T02:00:00Z", "2026-01-05T23:59:59+08:00", "2026/01/05",
+            "2026-01-05 10:00:00", "nonsense", None, "",
+        )
+        for value in values:
+            mine = LE._cutoff_instant(value)
+            theirs = LD._cutoff_instant(value)
+            self.assertEqual(None if mine is None else mine.isoformat(), theirs, repr(value))
+        # ... and the two clocks must genuinely differ on a date-only value.
+        self.assertNotEqual(LE._cutoff_instant("2026-01-05"), LE._availability_instant("2026-01-05"))
 
 
 # ──────────────────────────────── safety ────────────────────────────────

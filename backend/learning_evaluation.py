@@ -31,10 +31,13 @@ Contracts enforced here (v2 -- every one of them is a refusal, not a warning):
     only ``test`` may be scored; train/validation are refused outright
     a prediction whose availability instant was never proven cannot count
     a prediction must predate the label it claims to have predicted
+    a date-only cutoff is the END of the exchange-local day (PR-8 freeze)
     every canonical held-out sample must carry exactly one prediction
     the model's training boundary must be proven to stop before the test set
     the model must not have been selected on the held-out partition
     the recent chronological tail must not have lost the edge
+    the tail is cut from the canonical held-out calendar, not from scored dates
+    a canonical held-out date that yields no IC is missing evidence, not a skip
     IC is cross-sectional per date, and tied ranks use average ranks
     rows on the same date are NOT independent: the date is the unit
     a row count is not scientific evidence; the date count is
@@ -142,6 +145,8 @@ EVALUATION_BLOCKERS = (
     "evaluation_holdout_insufficient",
     "evaluation_holdout_mean_not_positive",
     "evaluation_holdout_deterioration",
+    "evaluation_undefined_ic_dates",
+    "evaluation_holdout_incomplete",
     "evaluation_predictions_read_truncated",
 )
 
@@ -395,6 +400,34 @@ def _availability_instant(value: Any) -> Optional[_dt.datetime]:
     return parsed.astimezone(_UTC)
 
 
+def _cutoff_instant(value: Any) -> Optional[_dt.datetime]:
+    """Canonical UTC instant for a dataset *cutoff*.
+
+    A cutoff is not an availability timestamp, and the dataset layer says so:
+    PR-8 fixes a date-only cutoff at the **end** of that exchange-local day
+    (``23:59:59+08:00``), because a frozen-at-cutoff dataset legitimately
+    contains evidence produced at any point during the cutoff day.  A date-only
+    *availability* means the opposite -- only the day was proven, so it is read
+    as the **start** of the day.
+
+    Reading a cutoff through the availability rule would therefore place the
+    freeze at 00:00 exchange-local and refuse every prediction made later that
+    same day: a silently *tighter* freeze than PR-8 ever declared.  Mirroring
+    the dataset layer's ``_cutoff_instant`` keeps the two contracts identical,
+    and ``NormalizationAgreementTests`` fails if they ever drift apart.
+    """
+    text = _text(value)
+    if text is None:
+        return None
+    if _DATE_ONLY.match(text):
+        try:
+            naive = _dt.datetime.fromisoformat(text + "T23:59:59")
+        except ValueError:
+            return None
+        return naive.replace(tzinfo=_EXCHANGE_TZ).astimezone(_UTC)
+    return _availability_instant(text)
+
+
 def _table_columns(conn: sqlite3.Connection, table: str) -> set:
     try:
         return {str(row[1]) for row in conn.execute(f"PRAGMA table_info({table})")}
@@ -633,6 +666,15 @@ def ensure_schema(conn: sqlite3.Connection) -> dict:
             "holdout_date_count": "INTEGER",
             "holdout_mean_rank_ic": "TEXT",
             "holdout_positive_ratio": "TEXT",
+            "holdout_start_date": "TEXT",
+            "holdout_end_date": "TEXT",
+            "holdout_valid_date_count": "INTEGER",
+            "holdout_undefined_date_count": "INTEGER",
+            "holdout_undefined_dates": "TEXT",
+            "canonical_test_date_count": "INTEGER",
+            "valid_ic_date_count": "INTEGER",
+            "undefined_ic_date_count": "INTEGER",
+            "undefined_ic_dates": "TEXT",
         },
     )
     return {
@@ -1088,6 +1130,12 @@ def _is_future_prediction(row: Mapping[str, Any], sample: Any, cutoff: Optional[
     after the moment the label became available has already seen the answer.
     The cutoff rule is the dataset-freeze companion -- anything stamped after
     the frozen cutoff cannot be part of a reproducible verdict either.
+
+    The two rules use *different* clocks on purpose: an instant is read as an
+    availability, but a date-only cutoff is read through ``_cutoff_instant``,
+    i.e. the end of the exchange-local cutoff day.  Collapsing them would make
+    a prediction generated during the cutoff day itself look like a lookahead
+    leak, which PR-8's freeze never claimed.
     """
     predicted = _availability_instant(row.get("prediction_asof"))
     available = _availability_instant(getattr(sample, "label_available_at", None))
@@ -1096,7 +1144,7 @@ def _is_future_prediction(row: Mapping[str, Any], sample: Any, cutoff: Optional[
         return True
     if predicted >= available:
         return True
-    cutoff_instant = _availability_instant(cutoff)
+    cutoff_instant = _cutoff_instant(cutoff)
     if cutoff_instant is not None and predicted > cutoff_instant:
         return True
     return False
@@ -1381,21 +1429,38 @@ def build_evaluation(
             (row["sample_key"], _finite(row["score"]), _finite(sample.target))
         )
 
+    # ── canonical held-out dates: the chronology belongs to the dataset, not
+    #    to whichever dates happened to yield a number.  Cutting the tail from
+    #    ``per_date_ic.keys()`` would let a model that goes flat on its most
+    #    recent dates have the tail slide backwards into its earlier, better
+    #    days -- a gate quietly rewriting its own window. ──
+    canonical_test_dates = sorted(
+        {
+            day
+            for sample in holdout_samples
+            for day in (_iso_date(sample.label_start_date),)
+            if day is not None
+        }
+    )
+
     per_date_ic: dict = {}
-    dropped_dates = 0
-    for date in sorted(grouped):
-        pairs = sorted(grouped[date], key=lambda item: item[0])
+    undefined_ic_dates: list = []
+    for date in canonical_test_dates:
+        pairs = sorted(grouped.get(date, []), key=lambda item: item[0])
         if len(pairs) < int(min_codes_per_date):
-            dropped_dates += 1
+            undefined_ic_dates.append(date)
             continue
         ic = spearman_rank_ic(
             [pair[1] for pair in pairs], [pair[2] for pair in pairs]
         )
         if ic is None:
-            # Degenerate cross-section: undefined, never a zero.
-            dropped_dates += 1
+            # Degenerate cross-section: undefined, never a zero -- and a date
+            # that carries a prediction but yields no IC is *missing evidence*,
+            # not an absent date.
+            undefined_ic_dates.append(date)
             continue
         per_date_ic[date] = ic
+    dropped_dates = len(undefined_ic_dates)
 
     evaluated_dates = len(per_date_ic)
     evaluated_rows = sum(len(grouped[date]) for date in per_date_ic)
@@ -1403,17 +1468,24 @@ def build_evaluation(
         [per_date_ic[date] for date in sorted(per_date_ic)], confidence_z
     )
 
-    # ── chronological tail robustness: the most recent slice of the held-out
-    #    window is scored separately, so a model that decayed still refuses. ──
-    ic_dates = sorted(per_date_ic)
+    # ── chronological tail robustness: the tail is cut from the canonical
+    #    held-out calendar *first*, then checked.  A canonical date inside it
+    #    that produced no IC is an incomplete-evidence refusal, never a reason
+    #    to look at an older date instead. ──
+    canonical_date_count = len(canonical_test_dates)
     tail_count = 0
-    if ic_dates:
+    if canonical_date_count:
         tail_count = max(
-            int(min_holdout_dates), int(math.ceil(float(holdout_fraction) * len(ic_dates)))
+            int(min_holdout_dates),
+            int(math.ceil(float(holdout_fraction) * canonical_date_count)),
         )
-        tail_count = min(tail_count, len(ic_dates))
-    tail_dates = ic_dates[len(ic_dates) - tail_count:] if tail_count else []
-    tail_values = [per_date_ic[date] for date in tail_dates]
+        tail_count = min(tail_count, canonical_date_count)
+    tail_dates = (
+        canonical_test_dates[canonical_date_count - tail_count:] if tail_count else []
+    )
+    holdout_valid_dates = [date for date in tail_dates if date in per_date_ic]
+    holdout_undefined_dates = [date for date in tail_dates if date not in per_date_ic]
+    tail_values = [per_date_ic[date] for date in holdout_valid_dates]
     tail_mean = (sum(tail_values) / len(tail_values)) if tail_values else None
     positive_ratio = (
         sum(1 for value in tail_values if value > 0) / len(tail_values)
@@ -1426,12 +1498,26 @@ def build_evaluation(
         else None
     )
     holdout_stats = {
+        # The canonical tail window -- reported whether or not every date in it
+        # was scorable, because the window is a property of the dataset.
         "holdout_start_date": tail_dates[0] if tail_dates else None,
+        "holdout_end_date": tail_dates[-1] if tail_dates else None,
         "holdout_date_count": len(tail_dates),
+        "holdout_valid_date_count": len(holdout_valid_dates),
+        "holdout_undefined_date_count": len(holdout_undefined_dates),
+        "holdout_undefined_dates": list(holdout_undefined_dates),
         "holdout_mean_rank_ic": tail_mean,
         "holdout_positive_ratio": positive_ratio,
         "holdout_retention": retention,
         "holdout_fraction": float(holdout_fraction),
+        # ── whole-window scientific audit: how many canonical held-out dates
+        #    exist, how many produced a measurable IC, and exactly which ones
+        #    did not.  A date with full prediction coverage but a degenerate
+        #    cross-section is named here rather than silently averaged away. ──
+        "canonical_test_date_count": canonical_date_count,
+        "valid_ic_date_count": evaluated_dates,
+        "undefined_ic_date_count": len(undefined_ic_dates),
+        "undefined_ic_dates": list(undefined_ic_dates),
     }
 
     # ── model provenance: which artifact produced these scores, trained on
@@ -1509,6 +1595,15 @@ def build_evaluation(
         deteriorated = True
     if deteriorated:
         blockers.append("evaluation_holdout_deterioration")
+    if undefined_ic_dates:
+        # A canonical held-out date was asked for an IC and did not produce one.
+        # That is missing evidence about the window that was claimed -- not a
+        # date to drop and quietly average over.
+        blockers.append("evaluation_undefined_ic_dates")
+    if holdout_undefined_dates:
+        # The most recent slice is exactly where decay hides, so an incomplete
+        # tail can never be reported as a robustness result.
+        blockers.append("evaluation_holdout_incomplete")
     if truncated:
         blockers.append("evaluation_predictions_read_truncated")
     blockers = sorted(set(blockers))
@@ -1598,8 +1693,14 @@ def build_evaluation(
         "missing_prediction_rows": coverage["missing_prediction_rows"],
         "coverage_ratio": coverage_ratio,
         "holdout_date_count": holdout_stats["holdout_date_count"],
+        "holdout_valid_date_count": holdout_stats["holdout_valid_date_count"],
+        "holdout_undefined_date_count": holdout_stats["holdout_undefined_date_count"],
+        "holdout_start_date": holdout_stats["holdout_start_date"],
         "holdout_mean_rank_ic": holdout_stats["holdout_mean_rank_ic"],
         "holdout_positive_ratio": holdout_stats["holdout_positive_ratio"],
+        "canonical_test_date_count": holdout_stats["canonical_test_date_count"],
+        "valid_ic_date_count": holdout_stats["valid_ic_date_count"],
+        "undefined_ic_date_count": holdout_stats["undefined_ic_date_count"],
         "model_version": provenance_payload.get("model_version", ""),
         "model_artifact_fingerprint": provenance_payload.get("model_artifact_fingerprint", ""),
         "trained_through": provenance_payload.get("trained_through"),
@@ -1648,8 +1749,11 @@ def persist_evaluation_manifest(conn: sqlite3.Connection, manifest: Mapping[str,
             trained_through, selection_partition, hyperparameters_fingerprint, random_seed,
             provenance_fingerprint, coverage_ratio, expected_prediction_rows,
             observed_prediction_rows, missing_prediction_rows, holdout_date_count,
-            holdout_mean_rank_ic, holdout_positive_ratio
-        ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            holdout_mean_rank_ic, holdout_positive_ratio, holdout_start_date,
+            holdout_end_date, holdout_valid_date_count, holdout_undefined_date_count,
+            holdout_undefined_dates, canonical_test_date_count, valid_ic_date_count,
+            undefined_ic_date_count, undefined_ic_dates
+        ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """,
         (
             manifest["evaluation_fingerprint"],
@@ -1692,6 +1796,15 @@ def persist_evaluation_manifest(conn: sqlite3.Connection, manifest: Mapping[str,
             holdout.get("holdout_date_count"),
             _canon_number(holdout.get("holdout_mean_rank_ic")),
             _canon_number(holdout.get("holdout_positive_ratio")),
+            holdout.get("holdout_start_date"),
+            holdout.get("holdout_end_date"),
+            holdout.get("holdout_valid_date_count"),
+            holdout.get("holdout_undefined_date_count"),
+            json.dumps(holdout.get("holdout_undefined_dates") or [], ensure_ascii=False),
+            holdout.get("canonical_test_date_count"),
+            holdout.get("valid_ic_date_count"),
+            holdout.get("undefined_ic_date_count"),
+            json.dumps(holdout.get("undefined_ic_dates") or [], ensure_ascii=False),
         ),
     )
     return bool(cursor.rowcount)
@@ -1707,7 +1820,14 @@ def read_evaluation_manifest(
     )
     if manifest is None:
         return None
-    for key in ("scoring", "per_date_ic", "exclusion_reasons", "evaluation_blockers"):
+    for key in (
+        "scoring",
+        "per_date_ic",
+        "exclusion_reasons",
+        "evaluation_blockers",
+        "undefined_ic_dates",
+        "holdout_undefined_dates",
+    ):
         if isinstance(manifest.get(key), str):
             try:
                 manifest[key] = json.loads(manifest[key])
@@ -1833,8 +1953,13 @@ def _empty_metrics(holdout_partition: str) -> dict:
         "missing_prediction_rows": 0,
         "coverage_ratio": 0.0,
         "holdout_date_count": 0,
+        "holdout_valid_date_count": 0,
+        "holdout_undefined_date_count": 0,
         "holdout_mean_rank_ic": None,
         "holdout_positive_ratio": None,
+        "canonical_test_date_count": 0,
+        "valid_ic_date_count": 0,
+        "undefined_ic_date_count": 0,
         "model_version": "",
         "model_artifact_fingerprint": "",
         "trained_through": None,
@@ -1981,6 +2106,12 @@ def _self_check() -> None:
     # Only ``test`` may be scored; train/validation are refused outright.
     assert SUPPORTED_HOLDOUT_PARTITIONS == ("test",)
     assert set(SUPPORTED_HOLDOUT_PARTITIONS) < set(LD.PARTITIONS)
+    # A date-only cutoff is the end of the exchange-local day (23:59:59+08:00),
+    # and the two clocks must never be interchangeable on a date-only value.
+    assert _cutoff_instant("2026-09-12").isoformat() == "2026-09-12T15:59:59+00:00"
+    assert _cutoff_instant("2026-09-12") != _availability_instant("2026-09-12")
+    assert _availability_instant("2026-09-12").isoformat() == "2026-09-11T16:00:00+00:00"
+    assert _cutoff_instant("nonsense") is None
 
     fingerprint = "f" * 64
     dataset = _DatasetView(fingerprint=fingerprint, cutoff="2026-03-01")
