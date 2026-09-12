@@ -35,7 +35,13 @@ class FeedReliabilityPolicy:
 
 
 class FeedHealthRegistry:
-    """Thread-safe per-provider runtime health used by API/audit diagnostics."""
+    """Thread-safe per-provider runtime health used by API/audit diagnostics.
+
+    Circuit failures are reserved for provider/transport exceptions. A valid
+    request that returns no quote may simply name a nonexistent or delisted
+    symbol, so symbol-level misses are degraded evidence and never poison the
+    provider-wide circuit.
+    """
 
     def __init__(self, *, monotonic: Callable[[], float] = time.monotonic,
                  wall_clock: Callable[[], float] = time.time):
@@ -58,11 +64,13 @@ class FeedHealthRegistry:
             "last_failure_at": None,
             "last_error": None,
             "open_until_monotonic": 0.0,
+            "probe_in_flight": False,
             "last_requested": 0,
             "last_returned": 0,
         })
 
     def allow(self, name: str) -> bool:
+        """Admit normal calls, or exactly one half-open probe after cooldown."""
         now = self._monotonic()
         with self._lock:
             entry = self._entry(name)
@@ -71,11 +79,21 @@ class FeedHealthRegistry:
                 entry["status"] = "circuit_open"
                 return False
             if entry.get("status") == "circuit_open":
+                if entry.get("probe_in_flight"):
+                    return False
                 entry["status"] = "half_open"
+                entry["probe_in_flight"] = True
+                return True
+            if entry.get("status") == "half_open":
+                # One probe already owns the recovery attempt. Other workers
+                # keep failing fast until that probe records success/failure.
+                return not bool(entry.get("probe_in_flight"))
             return True
 
     def record_result(self, name: str, *, requested: int, returned: int,
                       policy: FeedReliabilityPolicy, reason: str | None = None) -> None:
+        """Record a completed transport result without treating misses as outages."""
+        del policy  # Kept in the public signature for one uniform registry API.
         requested = max(0, int(requested))
         returned = max(0, int(returned))
         now = self._wall_clock()
@@ -83,35 +101,41 @@ class FeedHealthRegistry:
             entry = self._entry(name)
             entry["last_requested"] = requested
             entry["last_returned"] = returned
-            if requested == 0 or returned > 0:
-                entry["consecutive_failures"] = 0
-                entry["open_until_monotonic"] = 0.0
-                entry["total_successes"] += 1
-                entry["last_success_at"] = now
-                entry["last_error"] = reason if returned < requested else None
-                entry["status"] = "healthy" if returned >= requested else "degraded"
-                return
+            entry["probe_in_flight"] = False
+            # A completed provider response proves transport availability even
+            # if this particular symbol is absent. Clear outage streaks and
+            # leave missing/partial coverage as degraded, fail-closed evidence.
+            entry["consecutive_failures"] = 0
+            entry["open_until_monotonic"] = 0.0
+            entry["total_successes"] += 1
+            entry["last_success_at"] = now
+            entry["last_error"] = reason if returned < requested else None
+            entry["status"] = "healthy" if returned >= requested else "degraded"
+
+    def record_exception(self, name: str, exc: BaseException,
+                         policy: FeedReliabilityPolicy, requested: int) -> None:
+        """Record provider-wide/transport failure and advance the circuit."""
+        requested = max(0, int(requested))
+        now = self._wall_clock()
+        with self._lock:
+            entry = self._entry(name)
+            entry["last_requested"] = requested
+            entry["last_returned"] = 0
+            entry["probe_in_flight"] = False
             failures = int(entry.get("consecutive_failures") or 0) + 1
             entry["consecutive_failures"] = failures
             entry["total_failures"] += 1
             entry["last_failure_at"] = now
-            entry["last_error"] = reason or "no usable quotes returned"
+            entry["last_error"] = f"{type(exc).__name__}: {exc}"
             threshold = max(1, int(policy.failure_threshold))
             if failures >= threshold:
-                entry["open_until_monotonic"] = self._monotonic() + max(0.0, float(policy.cooldown_seconds))
+                entry["open_until_monotonic"] = (
+                    self._monotonic() + max(0.0, float(policy.cooldown_seconds))
+                )
                 entry["status"] = "circuit_open"
             else:
+                entry["open_until_monotonic"] = 0.0
                 entry["status"] = "degraded"
-
-    def record_exception(self, name: str, exc: BaseException,
-                         policy: FeedReliabilityPolicy, requested: int) -> None:
-        self.record_result(
-            name,
-            requested=requested,
-            returned=0,
-            policy=policy,
-            reason=f"{type(exc).__name__}: {exc}",
-        )
 
     def snapshot(self) -> dict[str, dict[str, Any]]:
         now = self._monotonic()
@@ -206,11 +230,13 @@ class EastmoneyRealtimeFeed:
         attempts = max(1, int(self.attempts))
         host_list = list(self.hosts)
         if not host_list:
-            self.health.record_result(
-                self.name, requested=len(normalized), returned=0,
-                policy=self.reliability, reason="no provider hosts configured",
+            self.health.record_exception(
+                self.name, RuntimeError("no provider hosts configured"),
+                self.reliability, len(normalized),
             )
             return self._empty_meta(normalized)
+        transport_succeeded = False
+        last_transport_error: BaseException | None = None
         try:
             for offset in range(0, len(normalized), batch_size):
                 batch = normalized[offset:offset + batch_size]
@@ -230,8 +256,10 @@ class EastmoneyRealtimeFeed:
                                 f"https://{host}/api/qt/ulist.np/get", params,
                                 timeout=self.reliability.timeout_seconds, retries=1,
                             )
+                            transport_succeeded = True
                             diff = (payload or {}).get("data", {}).get("diff") or []
-                        except Exception:
+                        except Exception as exc:
+                            last_transport_error = exc
                             diff = []
                         if diff:
                             for raw in diff:
@@ -259,8 +287,10 @@ class EastmoneyRealtimeFeed:
                                     f"https://{host}/api/qt/ulist.np/get", small_params,
                                     timeout=self.reliability.timeout_seconds, retries=1,
                                 )
+                                transport_succeeded = True
                                 diff = (payload or {}).get("data", {}).get("diff") or []
-                            except Exception:
+                            except Exception as exc:
+                                last_transport_error = exc
                                 diff = []
                             for raw in diff:
                                 row = self.row_parser(raw)
@@ -287,11 +317,16 @@ class EastmoneyRealtimeFeed:
             "complete": len(returned_codes) == len(normalized), "batches": batch_meta,
             "missing_codes": [code for code in normalized if code not in returned_codes][:200],
         }
-        self.health.record_result(
-            self.name, requested=len(normalized), returned=len(returned_codes),
-            policy=self.reliability,
-            reason=None if result["complete"] else "partial realtime coverage",
-        )
+        if not transport_succeeded and last_transport_error is not None:
+            self.health.record_exception(
+                self.name, last_transport_error, self.reliability, len(normalized),
+            )
+        else:
+            self.health.record_result(
+                self.name, requested=len(normalized), returned=len(returned_codes),
+                policy=self.reliability,
+                reason=None if result["complete"] else "partial realtime coverage",
+            )
         return result
 
     def fetch_realtime(self, codes: Sequence[str]) -> list[QuoteRow]:
@@ -318,6 +353,8 @@ class TencentRealtimeFeed:
         if not normalized or not self.health.allow(self.name):
             return []
         rows_by_code: dict[str, QuoteRow] = {}
+        transport_succeeded = False
+        last_transport_error: BaseException | None = None
         try:
             for start in range(0, len(normalized), max(1, int(self.batch_size))):
                 batch = normalized[start:start + max(1, int(self.batch_size))]
@@ -330,7 +367,9 @@ class TencentRealtimeFeed:
                             "https://qt.gtimg.cn/q=" + ",".join(market_symbol(code) for code in pending),
                             timeout=self.reliability.timeout_seconds, encoding="gbk", retries=1,
                         )
-                    except Exception:
+                        transport_succeeded = True
+                    except Exception as exc:
+                        last_transport_error = exc
                         text = ""
                     for row in self.parser(text, attempt=attempt + 1, allowed_codes=pending):
                         code = str(row.get("code") or "")
@@ -345,10 +384,15 @@ class TencentRealtimeFeed:
             self.health.record_exception(self.name, exc, self.reliability, len(normalized))
             return []
         rows = [rows_by_code[code] for code in normalized if code in rows_by_code]
-        self.health.record_result(
-            self.name, requested=len(normalized), returned=len(rows), policy=self.reliability,
-            reason=None if len(rows) == len(normalized) else "partial or empty provider response",
-        )
+        if not transport_succeeded and last_transport_error is not None:
+            self.health.record_exception(
+                self.name, last_transport_error, self.reliability, len(normalized),
+            )
+        else:
+            self.health.record_result(
+                self.name, requested=len(normalized), returned=len(rows), policy=self.reliability,
+                reason=None if len(rows) == len(normalized) else "partial or empty provider response",
+            )
         return rows
 
 
@@ -370,6 +414,8 @@ class SinaRealtimeFeed:
         if not normalized or not self.health.allow(self.name):
             return []
         rows_by_code: dict[str, QuoteRow] = {}
+        transport_succeeded = False
+        last_transport_error: BaseException | None = None
         try:
             for start in range(0, len(normalized), max(1, int(self.batch_size))):
                 batch = normalized[start:start + max(1, int(self.batch_size))]
@@ -384,7 +430,9 @@ class SinaRealtimeFeed:
                         response.raise_for_status()
                         response.encoding = "gbk"
                         text = response.text or ""
-                    except Exception:
+                        transport_succeeded = True
+                    except Exception as exc:
+                        last_transport_error = exc
                         text = ""
                     if text.strip():
                         break
@@ -399,10 +447,15 @@ class SinaRealtimeFeed:
             self.health.record_exception(self.name, exc, self.reliability, len(normalized))
             return []
         rows = [rows_by_code[code] for code in normalized if code in rows_by_code]
-        self.health.record_result(
-            self.name, requested=len(normalized), returned=len(rows), policy=self.reliability,
-            reason=None if len(rows) == len(normalized) else "partial or empty provider response",
-        )
+        if not transport_succeeded and last_transport_error is not None:
+            self.health.record_exception(
+                self.name, last_transport_error, self.reliability, len(normalized),
+            )
+        else:
+            self.health.record_result(
+                self.name, requested=len(normalized), returned=len(rows), policy=self.reliability,
+                reason=None if len(rows) == len(normalized) else "partial or empty provider response",
+            )
         return rows
 
 
