@@ -1545,6 +1545,40 @@ class CutoffPrecisionContractTests(DbTestCase):
         self.assertEqual(status["cutoff"], self.EXACT_UTC)
         self.assertNotEqual(status["cutoff"], "2026-01-02")
 
+    def test_a_subsecond_cutoff_is_refused_rather_than_rounded(self):
+        """Sub-second precision cannot be held, so it must not be rounded away.
+
+        The PIT clock formats every instant with ``timespec="seconds"``.  If a
+        finer cutoff were accepted, two *distinct* freeze instants would both
+        round to the same second and share one dataset fingerprint -- silently
+        collapsing distinct identities.  The contract refuses such a cutoff at
+        both gates instead of choosing a precision for the caller.
+        """
+        conn = self._late_label_db()
+        finer = (
+            "2026-01-02T10:00:00.100000+08:00",
+            "2026-01-02T10:00:00.900000+08:00",
+        )
+        for bad in finer:
+            with self.subTest(cutoff=bad):
+                with self.assertRaises(ValueError):
+                    build(conn, cutoff=bad)
+                status = LD.contract_status(conn, cutoff=bad)
+                self.assertIsNone(status["cutoff"])
+                self.assertIsNone(status["dataset_fingerprint"])
+                self.assertIn("dataset_cutoff_unprovable", status["dataset_blockers"])
+
+    def test_two_distinct_subsecond_cutoffs_do_not_share_an_identity(self):
+        """A refused cutoff yields no identity -- never a collapsed one."""
+        # These two instants differ by 0.8s, below the canonical resolution.
+        left = "2026-01-02T10:00:00.100000+08:00"
+        right = "2026-01-02T10:00:00.900000+08:00"
+        self.assertIsNone(LD.normalize_cutoff(left))
+        self.assertIsNone(LD.normalize_cutoff(right))
+        # The second-precision spellings of the *same* wall time stay valid and
+        # identical, so nothing about the coarse contract regressed.
+        self.assertEqual(LD.normalize_cutoff(self.EXACT), self.EXACT_UTC)
+
     # ── F. the normalisation helper ──
 
     def test_normalize_cutoff_is_idempotent_and_fails_closed(self):
@@ -1572,18 +1606,30 @@ class CutoffPrecisionContractTests(DbTestCase):
         conn = self._late_label_db()
         baseline = build(conn, cutoff=self.EXACT)
         self.assertEqual(baseline.cutoff, self.EXACT_UTC)
-        for zone in ("UTC", "America/New_York", "Asia/Kolkata", "Pacific/Kiritimati"):
-            with self.subTest(tz=zone):
-                with mock.patch.dict(os.environ, {"TZ": zone}):
-                    if hasattr(time, "tzset"):
-                        time.tzset()
-                    try:
-                        observed = build(conn, cutoff=self.EXACT)
-                    finally:
+        original_tz = os.environ.get("TZ")
+        try:
+            for zone in ("UTC", "America/New_York", "Asia/Kolkata", "Pacific/Kiritimati"):
+                with self.subTest(tz=zone):
+                    with mock.patch.dict(os.environ, {"TZ": zone}):
                         if hasattr(time, "tzset"):
                             time.tzset()
-                self.assertEqual(observed.cutoff, baseline.cutoff)
-                self.assertEqual(observed.fingerprint, baseline.fingerprint)
+                        observed = build(conn, cutoff=self.EXACT)
+                    # ``mock.patch.dict`` has now restored the environment, so
+                    # re-sync the libc clock *outside* the patch.  Calling
+                    # ``tzset()`` only inside the block would leave the last
+                    # patched zone installed for every later test that reads
+                    # ``time.localtime()`` / ``datetime.now()``.
+                    if hasattr(time, "tzset"):
+                        time.tzset()
+                    self.assertEqual(observed.cutoff, baseline.cutoff)
+                    self.assertEqual(observed.fingerprint, baseline.fingerprint)
+        finally:
+            if original_tz is None:
+                os.environ.pop("TZ", None)
+            else:
+                os.environ["TZ"] = original_tz
+            if hasattr(time, "tzset"):
+                time.tzset()
 
 
 class NoNetworkTests(DbTestCase):

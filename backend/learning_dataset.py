@@ -46,7 +46,8 @@ Contracts enforced here:
     a timestamp cutoff means that exact instant -- never widened back to its day
     a naive availability is exchange-local, never the host machine timezone
     every PIT comparison runs on one canonical UTC instant clock
-    an unparseable explicit cutoff is refused, never silently loosened
+    an explicit cutoff that is unparseable, or finer than the canonical clock's
+    second granularity, is refused rather than silently loosened or rounded
 """
 
 from __future__ import annotations
@@ -160,6 +161,11 @@ _DATE_ONLY = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 # gave day precision or instant precision, so an intraday timestamp can never be
 # mistaken for a date.
 _DAY_PRECISION = re.compile(r"^\d{4}[-/]\d{2}[-/]\d{2}$")
+# Any sub-second component, in either ISO separator (``.`` or ``,``).  The PIT
+# clock is second-granularity everywhere (``_canonical_instant`` formats with
+# ``timespec="seconds"``), so a cutoff carrying more precision than that cannot
+# be represented -- see :func:`_normalize_cutoff`.
+_SUBSECOND = re.compile(r":\d{2}[.,]\d+")
 _END_OF_DAY = "T23:59:59"
 _START_OF_DAY = "T00:00:00"
 
@@ -363,6 +369,9 @@ def _normalize_cutoff(value: Any) -> Optional[str]:
       in that day can never leak into the dataset.
     * an unparseable explicit cutoff returns ``None`` so callers fail closed
       instead of silently falling back to a looser cutoff.
+    * a cutoff carrying **sub-second** precision is refused for the same reason:
+      the canonical PIT clock is second-granularity, so rounding it would move
+      the freeze and collapse two distinct instants onto one dataset identity.
 
     Equivalent spellings of the same instant (``+08:00``, ``Z``, naive
     exchange-local, or an already-canonical ``+00:00``) collapse to one string.
@@ -374,6 +383,13 @@ def _normalize_cutoff(value: Any) -> Optional[str]:
         # Day precision is preserved as a day; the EOD reading happens later,
         # at comparison time, so the stored identity stays day-precise.
         return _date_text(text)
+    if _SUBSECOND.search(text):
+        # Every canonical string and every comparison in this module uses
+        # ``timespec="seconds"``, so a sub-second cutoff cannot be represented
+        # faithfully.  Rounding it would silently pick a precision, move the
+        # freeze, and let two distinct instants share one fingerprint -- the
+        # exact defect this contract forbids.  Refuse instead of choosing.
+        return None
     return _timestamp_text(text)
 
 
