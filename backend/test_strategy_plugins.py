@@ -144,5 +144,68 @@ class StrategyPluginContractTests(unittest.TestCase):
             plugin.validate_parameters(conn, {"invented": 1.0}, evidence_count=100)
 
 
+    def test_plugin_identifiers_are_canonicalized_before_registration(self):
+        plugin = plugins.StrategyPlugin(
+            "  canonical_plugin  ",
+            "  canonical_selector  ",
+            ("factor_a",),
+            candidate_runner=lambda _table, **_kwargs: {
+                "strategy": "canonical_plugin", "count": 0, "picks": [],
+            },
+        )
+        self.assertEqual(plugin.strategy_id, "canonical_plugin")
+        self.assertEqual(plugin.selector_id, "canonical_selector")
+        plugins.register_plugin(plugin)
+        self.addCleanup(plugins.unregister_plugin, plugin.strategy_id)
+        self.assertIs(plugins.get_plugin("canonical_plugin"), plugin)
+        self.assertIs(plugins.plugin_for_selector("canonical_selector"), plugin)
+
+    def test_production_run_strategy_dispatches_registered_selector(self):
+        import strategies as S
+
+        seen = []
+
+        def runner(table, *, topn=10, **_kwargs):
+            seen.append((list(table.index), topn))
+            return {
+                "strategy": "production_dispatch_plugin",
+                "count": min(len(table), topn),
+                "picks": [{"code": str(code)} for code in list(table.index)[:topn]],
+            }
+
+        plugin = plugins.StrategyPlugin(
+            "production_dispatch_plugin",
+            "production_dispatch_selector",
+            ("factor_a",),
+            candidate_runner=runner,
+        )
+        plugins.register_plugin(plugin)
+        self.addCleanup(plugins.unregister_plugin, plugin.strategy_id)
+        table = pd.DataFrame({"factor_a": [1.0, 2.0]}, index=["000001", "000002"])
+        result = S.run_strategy("production_dispatch_selector", table, topn=1)
+        self.assertEqual(result["picks"], [{"code": "000001"}])
+        self.assertEqual(seen, [(["000001", "000002"], 1)])
+        self.assertIn("production_dispatch_selector", S.available_selection_models())
+
+    def test_duplicate_selector_registration_fails_closed(self):
+        first = plugins.StrategyPlugin(
+            "selector_owner_one", "shared_plugin_selector", ("factor_a",),
+            candidate_runner=lambda _table, **_kwargs: {
+                "strategy": "selector_owner_one", "count": 0, "picks": [],
+            },
+        )
+        second = plugins.StrategyPlugin(
+            "selector_owner_two", "shared_plugin_selector", ("factor_a",),
+            candidate_runner=lambda _table, **_kwargs: {
+                "strategy": "selector_owner_two", "count": 0, "picks": [],
+            },
+        )
+        plugins.register_plugin(first)
+        self.addCleanup(plugins.unregister_plugin, first.strategy_id)
+        with self.assertRaisesRegex(ValueError, "selector already registered"):
+            plugins.register_plugin(second)
+
+
+
 if __name__ == "__main__":
     unittest.main()

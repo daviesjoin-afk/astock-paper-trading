@@ -5995,7 +5995,7 @@ def _candidate_rows(account, asof_date, market, sector_rows=None, live_universe=
             "factor_date": factor_date, "style": style,
         }
     else:
-        available_models = set(getattr(S, "PAPER_WEIGHTS", {}) or {}) | set(getattr(S, "STRATEGIES", {}) or {})
+        available_models = S.available_selection_models()
         if selection_model not in available_models:
             # The strategy package may be deployed independently from the paper
             # executor.  Fail closed and leave an auditable blocked scan instead of
