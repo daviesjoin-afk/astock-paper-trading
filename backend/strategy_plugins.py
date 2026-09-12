@@ -129,16 +129,25 @@ class StrategyPlugin:
         }
 
     def exit_contract(self, conn) -> dict[str, Any]:
-        """Return exit/review inputs using the existing independent policy tables."""
+        """Return exit/review inputs without inheriting another strategy's defaults.
+
+        ``strategy_policies.recovery_policy`` intentionally falls back to the
+        trend profile for legacy callers.  A plugin boundary must not do that:
+        an undeclared new strategy gets no strategy-specific recovery/rotation
+        override and relies on its compiled risk profile until it declares one.
+        """
         context = self.runtime(conn)
+        recovery = dict(SPOL.RECOVERY_POLICIES.get(self.exit_key) or {})
+        min_hold = SPOL.POSITION_REVIEW_MIN_HOLD_DAYS_BY_STRATEGY.get(self.exit_key)
+        cooldown = SPOL.RISK_REJECT_COOLDOWN_AFTER_TWO_MINUTES.get(self.exit_key)
         return {
             "strategy_id": self.strategy_id,
             "version": context.version,
             "risk_profile": context.risk_profile.to_dict(),
             "intraday_downside": dict(SPOL.intraday_downside_policy(self.exit_key)),
-            "recovery": dict(SPOL.recovery_policy(self.exit_key)),
-            "position_review_min_hold_days": SPOL.position_review_min_hold_days(self.exit_key),
-            "risk_reject_cooldown_minutes": SPOL.risk_reject_cooldown_minutes(self.exit_key),
+            "recovery": recovery,
+            "position_review_min_hold_days": min_hold,
+            "risk_reject_cooldown_minutes": cooldown,
         }
 
     def validate_parameters(
