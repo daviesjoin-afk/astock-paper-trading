@@ -1642,6 +1642,18 @@ class CutoffPrecisionContractTests(DbTestCase):
             "2026-01-02T10:00:00-00:00.900000",
             "2026-01-02T10:00:00-00.100000",
             "20260102T100000+0000.5",
+            # ... and precision *below* what the parser can hold at all: it
+            # keeps microseconds, so a fraction longer than six digits is
+            # truncated to its first six.  With those six digits zero, both
+            # semantic checks read an exact whole second while the caller
+            # spelled a non-zero sub-microsecond amount -- on the wall clock or
+            # on a *non-zero* offset, so the zero-offset gate cannot help either.
+            "2026-01-02T10:00:00.0000001+08:00",
+            "2026-01-02T10:00:00.0000009+08:00",
+            "2026-01-02T10:00:00+08:00:00.0000001",
+            "2026-01-02T10:00:00+08:00:00.0000009",
+            "20260102T100000.0000001+0800",
+            "2026-01-02T10:00:00.0000000001+08:00",
         ):
             with self.subTest(bad=bad):
                 self.assertIsNone(LD.normalize_cutoff(bad))
@@ -1717,9 +1729,19 @@ class CutoffSpellingIndependenceTests(DbTestCase):
     second.  The gate now spans the whole zero-offset grammar, so no zero-offset
     spelling can smuggle a discarded fraction through (group I below).
 
+    A fourth hole sits *below* the parser's own resolution: ``datetime`` keeps
+    microseconds, so a fraction longer than six digits is truncated to its first
+    six.  When those six digits are zero the parsed value is an exact whole
+    second even though the caller spelled a non-zero sub-microsecond amount --
+    ``10:00:00.0000001`` and ``10:00:00.0000009`` both read as whole seconds and
+    collapse onto one identity.  The zero-offset gate does not cover them (the
+    first fraction is on the wall clock, the second on a *non-zero* offset), so a
+    second narrow spelling gate covers the class (group J below).
+
     The check reads the parsed value, on both the wall clock *and* the absolute
-    UTC instant, and additionally refuses the one shape the parser destroys by
-    spelling it; no spelling can bypass the contract.
+    UTC instant, and additionally refuses by spelling the two shapes the parser
+    destroys -- a zero offset whose fraction is discarded, and any fraction finer
+    than a microsecond; no spelling can bypass the contract.
     """
 
     # Two instants differing by 0.8s -- far finer than the canonical second
@@ -2203,6 +2225,180 @@ class CutoffSpellingIndependenceTests(DbTestCase):
         built = [build(conn, cutoff=form) for form in accepted]
         self.assertEqual({row.cutoff for row in built}, {self.ZERO_OFF_FINE_UTC})
         self.assertEqual(len({row.fingerprint for row in built}), 1)
+
+    # ── J. precision *below* the parser's own resolution (sub-microsecond) ──
+    #
+    # ``datetime`` keeps microseconds, so a fraction longer than six digits is
+    # truncated to its first six.  When those six digits are zero the parsed
+    # value is an exact whole second even though the caller spelled a non-zero
+    # sub-microsecond amount, so the wall clock *and* the absolute instant both
+    # read zero.  The zero-offset gate does not cover this class either: the
+    # first two fractions sit on the wall clock, the next two on a *non-zero*
+    # offset.  A second narrow spelling gate (a separator, exactly six zero
+    # digits, then a non-zero somewhere later) covers it; all-zero runs of any
+    # length remain whole seconds and stay accepted.
+
+    SUB_MICRO_WALL_A = "2026-01-02T10:00:00.0000001+08:00"
+    SUB_MICRO_WALL_B = "2026-01-02T10:00:00.0000009+08:00"
+    SUB_MICRO_OFFSET_A = "2026-01-02T10:00:00+08:00:00.0000001"
+    SUB_MICRO_OFFSET_B = "2026-01-02T10:00:00+08:00:00.0000009"
+    SUB_MICRO_FINE = (
+        SUB_MICRO_WALL_A,
+        SUB_MICRO_WALL_B,
+        SUB_MICRO_OFFSET_A,
+        SUB_MICRO_OFFSET_B,
+        "2026-01-02T10:00:00.0000001Z",              # same instant, Zulu
+        "2026-01-02T10:00:00.0000001",               # naive == exchange-local
+        "2026-01-02T10:00:00,0000001+08:00",         # comma decimal sign
+        "20260102T100000.0000001+0800",              # basic ISO
+        "2026-01-02T10:00:00+080000.0000001",        # basic ISO offset
+        "2026-01-02T10:00:00.0000000001+08:00",      # ten digits
+        "2026-01-02T10:00:00+08:00:00.0000000001",
+    )
+    # The whole-second instant every form above sits on.
+    SUB_MICRO_UTC = "2026-01-02T02:00:00+00:00"
+    # All-zero fractions of *any* length are still whole seconds.
+    SUB_MICRO_WHOLE = (
+        "2026-01-02T10:00:00.000000+08:00",
+        "2026-01-02T10:00:00.0000000+08:00",
+        "2026-01-02T10:00:00.00000000+08:00",
+        "2026-01-02T10:00:00+08:00:00.000000",
+        "2026-01-02T10:00:00+08:00:00.0000000",
+        "20260102T100000.0000000+0800",
+    )
+    # Representable sub-second fractions stay the *semantic* guard's business --
+    # the new gate must not fire on them, or it would hollow that guard out.
+    SUB_MICRO_REPRESENTABLE = (
+        "2026-01-02T10:00:00.000001+08:00",
+        "2026-01-02T10:00:00.100000+08:00",
+        "2026-01-02T10:00:00+08:00:00.5",
+        "2026-01-02T10:00:00+00:00:00.100000",
+    )
+
+    def test_sub_microsecond_precision_is_invisible_to_both_checks(self):
+        """Non-vacuity: the fraction is gone before either semantic check runs.
+
+        ``datetime`` parses these spellings and truncates the fraction away, so
+        the parsed wall clock *and* the parsed absolute instant are whole
+        seconds -- a semantic-only guard has nothing to object to.  An
+        interpreter that refused the spelling outright would also fail closed;
+        the assertions that do not depend on the parser are unconditional.
+        """
+        for value in (self.SUB_MICRO_WALL_A, self.SUB_MICRO_OFFSET_A):
+            with self.subTest(value=value):
+                # The new gate is the only layer that can see the fraction ...
+                self.assertIsNotNone(LD._SUB_MICROSECOND_FRACTION.search(value))
+                # ... and the contract refuses the cutoff.
+                self.assertIsNone(LD.normalize_cutoff(value))
+                # The earlier parser-loss gate genuinely does *not* cover it:
+                # neither shape is a zero offset.
+                self.assertIsNone(LD._ZERO_OFFSET_FRACTION.search(value))
+                # The module's own parser keeps an exact whole second.
+                parsed = LD._parse_datetime(value)
+                if parsed is None:
+                    continue  # interpreter refuses the spelling: also fail closed
+                self.assertEqual(parsed.microsecond, 0)
+                self.assertEqual(LD._utc_instant(parsed).microsecond, 0)
+
+    def test_sub_microsecond_cutoffs_are_refused(self):
+        for value in self.SUB_MICRO_FINE:
+            with self.subTest(value=value):
+                self.assertIsNone(LD.normalize_cutoff(value))
+
+    def test_build_dataset_refuses_a_sub_microsecond_cutoff(self):
+        conn = self._seeded()
+        for value in self.SUB_MICRO_FINE:
+            with self.subTest(value=value):
+                with self.assertRaises(ValueError):
+                    build(conn, cutoff=value)
+
+    def test_contract_status_refuses_a_sub_microsecond_cutoff(self):
+        conn = self._seeded()
+        provable = LD._latest_provable_cutoff(conn)
+        self.assertIsNotNone(provable)
+        for value in self.SUB_MICRO_FINE:
+            with self.subTest(value=value):
+                status = LD.contract_status(conn, cutoff=value)
+                self.assertIsNone(status["cutoff"])
+                self.assertIsNone(status["dataset_fingerprint"])
+                self.assertIn("dataset_cutoff_unprovable", status["dataset_blockers"])
+                # Explicitly *not* the latest provable cutoff: no fallback.
+                self.assertNotEqual(status["cutoff"], provable)
+
+    def test_distinct_sub_microsecond_fractions_never_collapse(self):
+        """A 0.1µs and a 0.9µs fraction must not become one identity."""
+        pairs = (
+            (self.SUB_MICRO_WALL_A, self.SUB_MICRO_WALL_B),      # wall clock
+            (self.SUB_MICRO_OFFSET_A, self.SUB_MICRO_OFFSET_B),  # non-zero offset
+        )
+        for fine_a, fine_b in pairs:
+            # Non-vacuity: the caller really *spelled* two different fractions.
+            self.assertNotEqual(fine_a, fine_b)
+            for value in (fine_a, fine_b):
+                with self.subTest(value=value):
+                    self.assertIsNotNone(LD._SUB_MICROSECOND_FRACTION.search(value))
+                    self.assertIsNone(LD.normalize_cutoff(value))
+                    # Not accepted as the whole-second instant they fold onto.
+                    self.assertNotEqual(LD.normalize_cutoff(value), self.SUB_MICRO_UTC)
+            # Where the interpreter parses the spelling, both fold onto the
+            # *same* datetime -- which is why only a spelling gate can separate
+            # them.
+            parsed_a = LD._parse_datetime(fine_a)
+            if parsed_a is not None:
+                self.assertEqual(parsed_a, LD._parse_datetime(fine_b))
+        # The whole-second spelling of the same instant keeps its identity.
+        self.assertEqual(
+            LD.normalize_cutoff("2026-01-02T10:00:00+08:00"), self.SUB_MICRO_UTC
+        )
+
+    def test_whole_second_and_representable_fractions_are_never_gated(self):
+        """Non-vacuous control: the new gate leaves everything else alone."""
+        for form in self.SUB_MICRO_WHOLE + self.SUB_MICRO_REPRESENTABLE:
+            with self.subTest(form=form):
+                self.assertIsNone(LD._SUB_MICROSECOND_FRACTION.search(form))
+        # All-zero runs of any length are whole seconds, so they are accepted and
+        # share one identity -- where the interpreter parses that many digits.
+        accepted = [
+            form for form in self.SUB_MICRO_WHOLE
+            if LD._parse_datetime(form) is not None
+        ]
+        for form in ("2026-01-02T10:00:00.000000+08:00",):
+            self.assertIn(form, accepted)
+        for form in accepted:
+            with self.subTest(form=form):
+                self.assertEqual(LD.normalize_cutoff(form), self.SUB_MICRO_UTC)
+        conn = self._seeded()
+        built = [build(conn, cutoff=form) for form in accepted]
+        self.assertEqual({row.cutoff for row in built}, {self.SUB_MICRO_UTC})
+        self.assertEqual(len({row.fingerprint for row in built}), 1)
+        # Representable sub-second precision is still refused, by the semantic
+        # guard rather than by this gate.
+        for form in self.SUB_MICRO_REPRESENTABLE:
+            with self.subTest(form=form):
+                self.assertIsNone(LD._SUB_MICROSECOND_FRACTION.search(form))
+                self.assertIsNone(LD.normalize_cutoff(form))
+
+    def test_the_sub_microsecond_gate_leaves_the_earlier_shapes_to_their_gates(
+        self,
+    ):
+        """Non-subsumption: the new gate must not swallow the P2-E/F/G cases.
+
+        If it did, removing those gates (mutation T8--T11) would stop being
+        caught, so this is checked from the test side as well as by the matrix.
+        """
+        for value in (
+            "2026-01-02T10:00:00.100000+08:00",     # wall-clock fraction
+            "2026-01-02T10:00:00+08:00:00.5",       # UTC-offset fraction
+            "2026-01-02T10:00:00.5-08:00:00.5",     # cancelling fractions
+            "2026-01-02T10:00:00+00:00:00.100000",  # zero offset, parser loss
+            "2026-01-02T10:00:00+00:00.5",          # abbreviated zero offset
+            "2026-01-02T10:00:00+00.5",
+        ):
+            with self.subTest(value=value):
+                # Not this gate's business ...
+                self.assertIsNone(LD._SUB_MICROSECOND_FRACTION.search(value))
+                # ... and still refused, by the guard that owns that shape.
+                self.assertIsNone(LD.normalize_cutoff(value))
 
 
 class NoNetworkTests(DbTestCase):

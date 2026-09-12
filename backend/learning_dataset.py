@@ -190,6 +190,24 @@ _DAY_PRECISION = re.compile(r"^\d{4}[-/]\d{2}[-/]\d{2}$")
 # zero offset (``Z``, ``+00``, ``+00:00``, ``+00:00:00``) carries no fraction
 # and is untouched.
 _ZERO_OFFSET_FRACTION = re.compile(r"[+-](?:00|00:?00|00:?00:?00)[.,]\d*[1-9]\d*$")
+# A *second* spelling gate, for precision even ``datetime`` cannot hold: it keeps
+# microseconds, so a fraction longer than six digits is **truncated** to its
+# first six.  When those six digits are zero the parsed value is an exact whole
+# second while the caller spelled a *non-zero* sub-microsecond amount, so the
+# wall clock **and** the absolute instant both read zero and the raw spelling is
+# the only remaining evidence -- the same blind spot as the zero-offset case
+# above, one layer deeper.  The offset grammar needs it too:
+# ``+08:00:00.0000001`` carries a *non-zero* offset, which
+# ``_ZERO_OFFSET_FRACTION`` deliberately leaves alone.
+#
+# The gate is narrow on purpose: a decimal separator, exactly six zero digits,
+# then a digit run containing a non-zero.  Both of these stay legal -- an
+# all-zero run of any length (``.000000`` / ``.0000000``) still spells a whole
+# second, and a run whose first six digits are not all zero carries precision
+# ``datetime`` *can* represent, which the semantic checks already refuse.  So
+# the new gate does not make the semantic checks redundant, and the semantic
+# checks do not make it redundant.
+_SUB_MICROSECOND_FRACTION = re.compile(r"[.,]0{6}\d*[1-9]\d*")
 _END_OF_DAY = "T23:59:59"
 _START_OF_DAY = "T00:00:00"
 
@@ -425,16 +443,18 @@ def _normalize_cutoff(value: Any) -> Optional[str]:
     * an unparseable explicit cutoff returns ``None`` so callers fail closed
       instead of silently falling back to a looser cutoff.
     * a cutoff carrying **sub-second** precision *anywhere* -- in the wall clock
-      (``10:00:00.5+08:00``), in the UTC offset (``10:00:00+08:00:00.5``), or in
-      an offset ``datetime.fromisoformat`` would silently *discard*
+      (``10:00:00.5+08:00``), in the UTC offset (``10:00:00+08:00:00.5``), in an
+      offset ``datetime.fromisoformat`` would silently *discard*
       (``10:00:00+00:00:00.100000``, or the same fraction on an abbreviated zero
-      offset such as ``10:00:00+00:00.100000``) -- is refused for the same
-      reason: the canonical PIT clock is second-granularity, so rounding it
-      would move the freeze and collapse two distinct instants onto one dataset
-      identity.  The decision is semantic wherever the parser preserves the
-      fraction, plus a narrow *spelling* gate for the fraction the parser
-      destroys -- see below.  An all-zero fraction (``.000000``) still spells a
-      whole second, and stays accepted.
+      offset such as ``10:00:00+00:00.100000``), or below the microsecond
+      resolution the parser can represent at all
+      (``10:00:00.0000001+08:00`` / ``10:00:00+08:00:00.0000001``) -- is refused
+      for the same reason: the canonical PIT clock is second-granularity, so
+      rounding it would move the freeze and collapse two distinct instants onto
+      one dataset identity.  The decision is semantic wherever the parser
+      preserves the fraction, plus a narrow *spelling* gate for each fraction
+      the parser destroys -- see below.  An all-zero fraction (``.000000`` or
+      ``.0000000``) still spells a whole second, and stays accepted.
 
     Equivalent spellings of the same instant (``+08:00``, ``Z``, naive
     exchange-local, or an already-canonical ``+00:00``) collapse to one string.
@@ -448,8 +468,15 @@ def _normalize_cutoff(value: Any) -> Optional[str]:
         # fraction of a zero offset: by the time a parsed value exists, both the
         # wall clock and the absolute instant read as a whole second, so no
         # semantic check can still see the fraction the caller spelled.  Only
-        # this one shape needs the spelling gate; every other sub-second
-        # spelling is caught semantically below.
+        # the fractions the parser *discards* need a spelling gate; every other
+        # sub-second spelling is caught semantically below.
+        return None
+    if _SUB_MICROSECOND_FRACTION.search(text):
+        # Below the canonical clock *and* below what the parser can hold at all
+        # -- see ``_SUB_MICROSECOND_FRACTION``.  This too runs *before* parsing:
+        # ``datetime`` truncates a fraction to six digits, so
+        # ``10:00:00.0000001`` parses to an exact whole second and neither
+        # semantic check can see the remainder the caller spelled.
         return None
     if _DAY_PRECISION.match(text):
         # Day precision is preserved as a day; the EOD reading happens later,
