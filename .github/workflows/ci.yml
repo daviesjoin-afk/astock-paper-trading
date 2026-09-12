@@ -6,79 +6,13 @@ on:
   pull_request:
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
-  source-patch:
-    if: github.event.pull_request.head.ref == 'codex/issue-25-replay-traceability'
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    steps:
-      - name: Check out PR head
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ github.event.pull_request.head.ref }}
-          fetch-depth: 0
-
-      - name: Apply exact replay-date source patch
-        shell: bash
-        run: |
-          python - <<'PY'
-          from pathlib import Path
-
-          def replace_or_verify(path, old, new, expected=1):
-              p = Path(path)
-              text = p.read_text(encoding='utf-8')
-              old_count = text.count(old)
-              new_count = text.count(new)
-              if old_count == expected:
-                  p.write_text(text.replace(old, new), encoding='utf-8')
-                  return
-              if old_count == 0 and new_count == expected:
-                  return
-              raise SystemExit(
-                  f'{path}: expected {expected} old or new exact matches; '
-                  f'got old={old_count}, new={new_count}'
-              )
-
-          replace_or_verify(
-              'backend/strategies.py',
-              '''def run_strategy(\n    strategy_id,\n    table: pd.DataFrame,\n    topn=10,\n    news_hits=None,\n    gate=None,\n    auto_news=True,\n    klines=None,\n    first_board_codes=None,\n    weight_overrides=None,\n    condition_overrides=None,\n):''',
-              '''def run_strategy(\n    strategy_id,\n    table: pd.DataFrame,\n    topn=10,\n    news_hits=None,\n    gate=None,\n    auto_news=True,\n    klines=None,\n    first_board_codes=None,\n    weight_overrides=None,\n    condition_overrides=None,\n    replay_data_date=None,\n    replay_required=False,\n):''',
-              expected=2,
-          )
-          replace_or_verify(
-              'backend/strategies.py',
-              '''            weight_overrides=weight_overrides,\n            condition_overrides=condition_overrides,\n        )\n    return _run_strategy_legacy(''',
-              '''            weight_overrides=weight_overrides,\n            condition_overrides=condition_overrides,\n            replay_data_date=replay_data_date,\n            replay_required=replay_required,\n        )\n    return _run_strategy_legacy(''',
-          )
-          replace_or_verify(
-              'backend/main.py',
-              '''        gate=gate,\n        first_board_codes=first_board_codes,\n    )''',
-              '''        gate=gate,\n        first_board_codes=first_board_codes,\n        replay_data_date=complete_cutoff,\n        replay_required=True,\n    )''',
-          )
-          replace_or_verify(
-              'backend/paper_trading.py',
-              'condition_overrides=selection_overlay.get("conditions"))',
-              'condition_overrides=selection_overlay.get("conditions"), replay_data_date=asof_date, replay_required=True)',
-              expected=2,
-          )
-          PY
-          git diff --check
-          if git diff --quiet -- backend/strategies.py backend/main.py backend/paper_trading.py; then
-            echo 'Source patch already present.'
-            exit 0
-          fi
-          git config user.name github-actions[bot]
-          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
-          git add backend/strategies.py backend/main.py backend/paper_trading.py
-          git commit -m 'fix(strategy): wire explicit replay dates [source-patch]'
-          git push origin HEAD:${{ github.event.pull_request.head.ref }}
-
   tests:
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -86,17 +20,21 @@ jobs:
       fail-fast: false
       matrix:
         python-version: ["3.11", "3.12"]
+
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
           cache: pip
           cache-dependency-path: requirements.lock
+
       - name: Install locked dependencies
         run: python -m pip install --upgrade pip && python -m pip install -r requirements.lock
+
       - name: Run backend unit tests
         env:
           PYTHONDONTWRITEBYTECODE: "1"
@@ -108,14 +46,17 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+
       - name: Compile backend modules
         env:
           PYTHONDONTWRITEBYTECODE: "1"
         run: python -m compileall -q backend
+
       - name: Check frontend source syntax
         # PR-55：源已拆到 frontend/src/**（ESM），逐个模块做语法检查。
         run: find frontend/src -name '*.js' -print0 | xargs -0 -n1 node --check
@@ -126,18 +67,22 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
+
       - name: Set up Node
         uses: actions/setup-node@v4
         with:
           node-version: "20"
           cache: npm
           cache-dependency-path: frontend/package-lock.json
+
       - name: Install build tools
         working-directory: frontend
         run: npm ci
+
       - name: Build frontend bundle
         working-directory: frontend
         run: npm run build
+
       - name: Run frontend unit tests
         # PR-2：操作员凭据的行为契约（GET 绝不带 Authorization、写方法带 Bearer、
         # 凭据只存 sessionStorage）。这是**行为**断言，Python 侧的源码存在性
@@ -148,6 +93,7 @@ jobs:
         # shell 展开——脚本里写的是未加引号的 tests/*.test.mjs。
         working-directory: frontend
         run: npm run test:unit
+
       - name: Verify committed dist is up to date
         run: git diff --exit-code -- frontend/dist
 
@@ -157,14 +103,17 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
           cache: pip
           cache-dependency-path: requirements.lock
+
       - name: Install pinned quality tools
         run: python -m pip install ruff==0.16.6 pip-audit==2.10.1 uv==0.12.5
+
       - name: Verify dependency lock
         shell: bash
         run: |
@@ -173,8 +122,10 @@ jobs:
             --no-emit-index-url --custom-compile-command "uv pip compile requirements.txt" \
             --output-file /tmp/requirements.lock
           cmp --silent requirements.lock /tmp/requirements.lock
+
       - name: Lint backend
         run: ruff check backend
+
       - name: Audit locked dependencies
         run: pip-audit --requirement requirements.lock --strict --progress-spinner off
 
@@ -184,8 +135,10 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
+
       - name: Build application image
         run: docker build --tag astock-codex:ci .
+
       # Issue #29: the offline test suite must pass with *no network at all*,
       # so core tests stay deterministic and cannot silently grow external
       # calls.  New network-optional tests must skip unless explicitly
@@ -195,6 +148,7 @@ jobs:
           docker run --rm --network none
           --tmpfs /app/data_cache:rw,size=64m,uid=10001,gid=10001
           astock-codex:ci python -m unittest discover -s backend -p "test_*.py"
+
       - name: Start isolated paper-only container
         run: |
           docker run --detach --name astock-ci \
@@ -202,6 +156,7 @@ jobs:
             --tmpfs /app/data_cache:rw,size=64m,uid=10001,gid=10001 \
             --publish 127.0.0.1:18600:8600 \
             astock-codex:ci
+
       - name: Verify health endpoints
         shell: bash
         run: |
@@ -214,6 +169,7 @@ jobs:
           done
           docker logs astock-ci
           exit 1
+
       - name: Show logs and clean up
         if: always()
         shell: bash
@@ -231,31 +187,38 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
           cache: pip
           cache-dependency-path: requirements.lock
+
       - name: Install backend dependencies
         run: python -m pip install --upgrade pip && python -m pip install -r requirements.lock
+
       - name: Set up Node
         uses: actions/setup-node@v4
         with:
           node-version: "20"
           cache: npm
           cache-dependency-path: frontend/package-lock.json
+
       - name: Install frontend build + test tooling
         working-directory: frontend
         run: npm ci
+
       - name: Rebuild frontend bundle and fail if committed dist is stale
         working-directory: frontend
         run: |
           npm run build
           git diff --exit-code -- dist
+
       - name: Install Chromium only
         working-directory: frontend
         run: npx playwright install --with-deps chromium
+
       - name: Run browser journeys against a real local server
         working-directory: frontend
         env:
@@ -263,6 +226,7 @@ jobs:
           ASTOCK_E2E_PYTHON: python
           ASTOCK_E2E_PORT: "8611"
         run: npx playwright test --project=chromium
+
       - name: Upload failure artifacts (screenshots / traces / video)
         if: failure()
         uses: actions/upload-artifact@v4
