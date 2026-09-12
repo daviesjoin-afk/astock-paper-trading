@@ -70,6 +70,22 @@ class StrategyPluginContractTests(unittest.TestCase):
             exits["main_force_top10"]["intraday_downside"],
         )
 
+    def test_undeclared_exit_policy_does_not_inherit_another_strategy(self):
+        conn = sqlite3.connect(":memory:")
+        self.addCleanup(conn.close)
+        SR.ensure_schema(conn)
+        plugin = plugins.StrategyPlugin(
+            "main_force_top10",
+            "main_force_top10",
+            ("main_pct",),
+            exit_policy_key="not_declared",
+        )
+        contract = plugin.exit_contract(conn)
+        self.assertEqual(contract["recovery"], {})
+        self.assertEqual(contract["intraday_downside"], {})
+        self.assertIsNone(contract["position_review_min_hold_days"])
+        self.assertIsNone(contract["risk_reject_cooldown_minutes"])
+
     def test_custom_plugin_runs_by_registration_without_core_dispatch_change(self):
         seen = []
 
