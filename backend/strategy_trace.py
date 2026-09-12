@@ -187,6 +187,12 @@ def data_date(table: pd.DataFrame, explicit: Any = None) -> str:
 
 
 def _safe_selection_inputs(kwargs: Mapping[str, Any]) -> dict[str, Any]:
+    extras = sorted(
+        key for key, value in kwargs.items()
+        if key not in _SAFE_SELECTION_INPUTS and value is not None
+    )
+    if extras:
+        raise ValueError(f"strategy replay refuses undeclared selection input: {extras[0]}")
     selected = {
         key: kwargs[key]
         for key in _SAFE_SELECTION_INPUTS
@@ -327,8 +333,6 @@ def persist_snapshot(
     resolved_date = data_date(table, explicit=explicit_data_date)
     resolved_version = code_version(explicit_code_version)
     safe_inputs = _safe_selection_inputs(selection_kwargs)
-    # Validate every cell before any run manifest is committed. Harmless orphan
-    # content-addressed blobs are acceptable after a crash; sensitive data is not.
     for column in table.columns:
         for row_no, value in enumerate(table[column].tolist()):
             safe = _json_safe(value)
