@@ -126,6 +126,7 @@ EVALUATION_BLOCKERS = (
     "evaluation_prediction_table_missing",
     "evaluation_contract_error",
     "evaluation_dataset_contract_failed",
+    "evaluation_dataset_cutoff_unprovable",
     "evaluation_dataset_fingerprint_unavailable",
     "evaluation_holdout_partition_unsupported",
     "evaluation_model_ambiguous",
@@ -1223,13 +1224,28 @@ def build_evaluation(
     A strictly read-only, side-effect-free function: it never trains, never
     persists and never mutates its inputs.  Every prediction it refuses is
     counted under a machine-readable reason, so nothing disappears silently.
+
+    Because it accepts any dataset object, a dataset whose freeze boundary
+    cannot be canonicalised (missing, unparseable, or finer than the canonical
+    clock) is refused rather than read as "no cutoff" -- an unprovable boundary
+    is a contract failure, never a boundary-free pass.
     """
     dataset_fingerprint = _text(getattr(dataset, "fingerprint", None)) or ""
     # The dataset layer already canonicalised its cutoff; re-normalising here
     # (rather than truncating to a date) keeps an intraday freeze point at its
     # exact instant, so the evaluation can never score a *wider* window than
     # the dataset contract was built on.
-    cutoff = LD.normalize_cutoff(getattr(dataset, "cutoff", None))
+    raw_cutoff = getattr(dataset, "cutoff", None)
+    cutoff = LD.normalize_cutoff(raw_cutoff)
+    # A dataset freeze boundary that is missing, unparseable, or finer than the
+    # canonical clock cannot be canonicalised, and would otherwise read as
+    # ``cutoff=None`` -- which *drops* the freeze rule entirely (see
+    # ``_is_future_prediction``) and lets a prediction stamped after the
+    # unrepresentable freeze point through.  An unprovable boundary must never
+    # become "no boundary": record it as a dataset contract failure so it can
+    # never form a passing verdict.
+    if cutoff is None:
+        dataset_blockers = [*dataset_blockers, "dataset_cutoff_unprovable"]
     holdout = _text(holdout_partition) or DEFAULT_HOLDOUT_PARTITION
     scoring = scoring_spec(
         holdout_partition=holdout,
@@ -1531,6 +1547,10 @@ def build_evaluation(
     blockers = []
     if dataset_blockers:
         blockers.append("evaluation_dataset_contract_failed")
+    if cutoff is None:
+        # Named separately from the generic dataset failure so a stored
+        # manifest records *why* the freeze rule could not be applied.
+        blockers.append("evaluation_dataset_cutoff_unprovable")
     if not dataset_fingerprint:
         blockers.append("evaluation_dataset_fingerprint_unavailable")
     if holdout not in SUPPORTED_HOLDOUT_PARTITIONS:
