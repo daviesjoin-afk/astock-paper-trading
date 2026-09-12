@@ -43,8 +43,12 @@ Contracts enforced here:
     observed step != proven exchange trading day
     training data != execution authority
     a date-only cutoff means end of that exchange-local (UTC+08:00) day
+    a timestamp cutoff means that exact instant -- never widened back to its day
     a naive availability is exchange-local, never the host machine timezone
     every PIT comparison runs on one canonical UTC instant clock
+    an explicit cutoff that is unparseable, or finer than the canonical clock's
+    second granularity, is refused rather than silently loosened or rounded --
+    decided on the parsed instant, so no ISO 8601 spelling slips past it
 """
 
 from __future__ import annotations
@@ -153,6 +157,57 @@ RETURN_PROVENANCE_COLUMNS = (
 )
 
 _DATE_ONLY = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+# A *whole-input* day, either separator.  ``_DATE_ONLY`` is used to recognise a
+# day inside a longer string; this one is used when deciding whether the caller
+# gave day precision or instant precision, so an intraday timestamp can never be
+# mistaken for a date.
+_DAY_PRECISION = re.compile(r"^\d{4}[-/]\d{2}[-/]\d{2}$")
+# A *spelling* gate for the one fraction ``datetime.fromisoformat`` destroys.
+# The parser normalizes a **zero** offset -- in any grammar ISO 8601 allows --
+# to a plain ``timezone.utc`` and, before 3.14, *discards* any fractional second
+# on it, so ``2026-01-02T10:00:00+00:00:00.100000`` parses to a datetime whose
+# wall ``microsecond`` is 0 **and** whose absolute ``microsecond`` is 0 -- the
+# sub-second information is gone before either semantic check can observe it,
+# and two spellings encoding *different* fractional offsets (``.100000`` vs
+# ``.900000``) would collapse onto one dataset identity.
+#
+# Empirically only a **zero** offset loses data: ``+00:00:01.5``,
+# ``+00:30:00.5``, ``+08:00:00.5`` and every other non-zero offset keep their
+# fraction and are still handled by the semantic checks.  The gate is therefore
+# deliberately narrow: an offset sign, a zero offset in *any* grammar ISO 8601
+# allows (``+00``, ``+0000`` / ``+00:00``, ``+000000`` / ``+00:00:00``), then a
+# decimal separator and a fraction containing a non-zero digit.  Spelling all
+# three grammars matters, because the parser reads -- and, before 3.14, discards
+# -- a trailing fraction on the hours-only and hours+minutes forms exactly as it
+# does on the explicit-seconds form; keying on the seconds-bearing shape alone
+# left ``+00.5`` / ``+0000.5`` / ``+00:00.5`` free to collapse onto a whole
+# second.  The ``$`` anchor keeps the match on the trailing offset (the only
+# place an offset can appear) while still admitting further fraction digits, and
+# the non-zero digit keeps an explicit **all-zero** fraction
+# (``+00:00.000000``) a legitimate whole second, exactly like ``+00:00``.
+# Keying on this *grammar* rather than on a colon (as the removed
+# ``:\d{2}[.,]\d+`` did) is what makes it spelling-independent.  A whole-second
+# zero offset (``Z``, ``+00``, ``+00:00``, ``+00:00:00``) carries no fraction
+# and is untouched.
+_ZERO_OFFSET_FRACTION = re.compile(r"[+-](?:00|00:?00|00:?00:?00)[.,]\d*[1-9]\d*$")
+# A *second* spelling gate, for precision even ``datetime`` cannot hold: it keeps
+# microseconds, so a fraction longer than six digits is **truncated** to its
+# first six.  When those six digits are zero the parsed value is an exact whole
+# second while the caller spelled a *non-zero* sub-microsecond amount, so the
+# wall clock **and** the absolute instant both read zero and the raw spelling is
+# the only remaining evidence -- the same blind spot as the zero-offset case
+# above, one layer deeper.  The offset grammar needs it too:
+# ``+08:00:00.0000001`` carries a *non-zero* offset, which
+# ``_ZERO_OFFSET_FRACTION`` deliberately leaves alone.
+#
+# The gate is narrow on purpose: a decimal separator, exactly six zero digits,
+# then a digit run containing a non-zero.  Both of these stay legal -- an
+# all-zero run of any length (``.000000`` / ``.0000000``) still spells a whole
+# second, and a run whose first six digits are not all zero carries precision
+# ``datetime`` *can* represent, which the semantic checks already refuse.  So
+# the new gate does not make the semantic checks redundant, and the semantic
+# checks do not make it redundant.
+_SUB_MICROSECOND_FRACTION = re.compile(r"[.,]0{6}\d*[1-9]\d*")
 _END_OF_DAY = "T23:59:59"
 _START_OF_DAY = "T00:00:00"
 
@@ -258,17 +313,28 @@ def _date_text(value: Any) -> Optional[str]:
     return candidate
 
 
-def _canonical_instant(value: _dt.datetime) -> str:
-    """Return ``YYYY-MM-DDTHH:MM:SS+00:00`` on the canonical PIT clock.
+def _utc_instant(value: _dt.datetime) -> _dt.datetime:
+    """Absolute UTC instant for a parsed datetime.
 
     A naive input carries no offset, so it is read as *exchange-local*
-    (Asia/Shanghai) rather than the host's timezone.  The output always keeps
-    an explicit ``+00:00`` so the function is idempotent: feeding a canonical
-    value back in cannot shift it a second time.
+    (Asia/Shanghai) rather than the host's timezone.  Sub-second precision is
+    **preserved** here (the result keeps its microsecond field); deciding
+    whether the second-granularity clock can hold it belongs to the caller.
     """
     if value.tzinfo is None:
         value = value.replace(tzinfo=_EXCHANGE_TZ)
-    return value.astimezone(_UTC).isoformat(timespec="seconds")
+    return value.astimezone(_UTC)
+
+
+def _canonical_instant(value: _dt.datetime) -> str:
+    """Return ``YYYY-MM-DDTHH:MM:SS+00:00`` on the canonical PIT clock.
+
+    A naive input is read as *exchange-local* (Asia/Shanghai) rather than the
+    host's timezone -- see :func:`_utc_instant`.  The output always keeps an
+    explicit ``+00:00`` so the function is idempotent: feeding a canonical
+    value back in cannot shift it a second time.
+    """
+    return _utc_instant(value).isoformat(timespec="seconds")
 
 
 def _exchange_day_edge(day: str, edge: str) -> Optional[str]:
@@ -278,6 +344,36 @@ def _exchange_day_edge(day: str, edge: str) -> Optional[str]:
     except ValueError:
         return None
     return _canonical_instant(naive)
+
+
+def _parse_datetime(value: Any) -> Optional[_dt.datetime]:
+    """Parse one timestamp spelling, or ``None`` -- the module's only parser.
+
+    ``datetime.fromisoformat`` is deliberately the primary path because it
+    accepts every ISO 8601 spelling the standard library knows, including the
+    *basic* form (``20260102T100000+0800``) that a hand-written pattern would
+    miss.  The legacy space-separated shapes stay as a fallback for stored
+    evidence.  Nothing is ever synthesized: an unparseable input returns
+    ``None`` so callers fail closed.
+
+    Sub-second precision is **preserved** here -- the parsed ``datetime`` keeps
+    its microsecond field -- so callers can decide for themselves whether the
+    second-granularity canonical clock can hold it.
+    """
+    text = _text(value)
+    if text is None:
+        return None
+    normalized = text[:-1] + "+00:00" if text.endswith(("Z", "z")) else text
+    try:
+        return _dt.datetime.fromisoformat(normalized)
+    except ValueError:
+        pass
+    for fmt in ("%Y/%m/%d %H:%M:%S", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"):
+        try:
+            return _dt.datetime.strptime(text, fmt)
+        except ValueError:
+            continue
+    return None
 
 
 def _timestamp_text(value: Any) -> Optional[str]:
@@ -293,19 +389,9 @@ def _timestamp_text(value: Any) -> Optional[str]:
     if _DATE_ONLY.match(text):
         # Day-precise evidence keeps its day; _instant() picks the edge.
         return text
-    normalized = text[:-1] + "+00:00" if text.endswith(("Z", "z")) else text
-    try:
-        parsed = _dt.datetime.fromisoformat(normalized)
-    except ValueError:
-        parsed = None
-        for fmt in ("%Y/%m/%d %H:%M:%S", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"):
-            try:
-                parsed = _dt.datetime.strptime(text, fmt)
-                break
-            except ValueError:
-                continue
-        if parsed is None:
-            return None
+    parsed = _parse_datetime(text)
+    if parsed is None:
+        return None
     return _canonical_instant(parsed)
 
 
@@ -338,6 +424,95 @@ def _cutoff_instant(value: Any) -> Optional[str]:
         day = _date_text(text)
         return None if day is None else _exchange_day_edge(day, _END_OF_DAY)
     return _timestamp_text(text)
+
+
+def _normalize_cutoff(value: Any) -> Optional[str]:
+    """Normalize a caller cutoff *without ever widening its precision*.
+
+    This is the one place the dataset layer turns whatever cutoff a caller
+    handed it into the canonical string that becomes part of the dataset
+    identity, and it deliberately keeps the two precisions apart:
+
+    * a **date-only** cutoff stays ``YYYY-MM-DD`` (day precision).  Everything
+      downstream reads that as the end of the exchange-local day, exactly as
+      the PR-8 contract always did, so day-precise callers keep their identity.
+    * a **full timestamp** is reduced to its exact canonical UTC instant and is
+      *never* expanded to the end of its day.  ``2026-09-12T10:00:00+08:00``
+      means 10:00, not 23:59:59, so evidence that only became available later
+      in that day can never leak into the dataset.
+    * an unparseable explicit cutoff returns ``None`` so callers fail closed
+      instead of silently falling back to a looser cutoff.
+    * a cutoff carrying **sub-second** precision *anywhere* -- in the wall clock
+      (``10:00:00.5+08:00``), in the UTC offset (``10:00:00+08:00:00.5``), in an
+      offset ``datetime.fromisoformat`` would silently *discard*
+      (``10:00:00+00:00:00.100000``, or the same fraction on an abbreviated zero
+      offset such as ``10:00:00+00:00.100000``), or below the microsecond
+      resolution the parser can represent at all
+      (``10:00:00.0000001+08:00`` / ``10:00:00+08:00:00.0000001``) -- is refused
+      for the same reason: the canonical PIT clock is second-granularity, so
+      rounding it would move the freeze and collapse two distinct instants onto
+      one dataset identity.  The decision is semantic wherever the parser
+      preserves the fraction, plus a narrow *spelling* gate for each fraction
+      the parser destroys -- see below.  An all-zero fraction (``.000000`` or
+      ``.0000000``) still spells a whole second, and stays accepted.
+
+    Equivalent spellings of the same instant (``+08:00``, ``Z``, naive
+    exchange-local, or an already-canonical ``+00:00``) collapse to one string.
+    """
+    text = _text(value)
+    if text is None:
+        return None
+    if _ZERO_OFFSET_FRACTION.search(text):
+        # Parser-loss boundary -- see ``_ZERO_OFFSET_FRACTION``.  This runs
+        # *before* parsing because ``datetime.fromisoformat`` destroys the
+        # fraction of a zero offset: by the time a parsed value exists, both the
+        # wall clock and the absolute instant read as a whole second, so no
+        # semantic check can still see the fraction the caller spelled.  Only
+        # the fractions the parser *discards* need a spelling gate; every other
+        # sub-second spelling is caught semantically below.
+        return None
+    if _SUB_MICROSECOND_FRACTION.search(text):
+        # Below the canonical clock *and* below what the parser can hold at all
+        # -- see ``_SUB_MICROSECOND_FRACTION``.  This too runs *before* parsing:
+        # ``datetime`` truncates a fraction to six digits, so
+        # ``10:00:00.0000001`` parses to an exact whole second and neither
+        # semantic check can see the remainder the caller spelled.
+        return None
+    if _DAY_PRECISION.match(text):
+        # Day precision is preserved as a day; the EOD reading happens later,
+        # at comparison time, so the stored identity stays day-precise.
+        return _date_text(text)
+    parsed = _parse_datetime(text)
+    if parsed is None:
+        return None
+    if parsed.microsecond or _utc_instant(parsed).microsecond:
+        # The canonical PIT clock holds whole seconds (``_canonical_instant``
+        # formats with ``timespec="seconds"``), so an instant carrying a
+        # sub-second component cannot be represented faithfully.  Rounding or
+        # truncating would silently pick a precision, move the freeze, and let
+        # two distinct freeze instants share one dataset identity/fingerprint --
+        # exactly the defect this contract forbids.  Refuse instead of choosing.
+        #
+        # The test is *semantic* -- it reads the parsed value, not the spelling.
+        # ``datetime.fromisoformat`` legally accepts many ISO 8601 forms (e.g.
+        # the basic ``20260102T100000.100000+0800``) that no single hand-written
+        # pattern can be trusted to cover, so a pattern-based test would
+        # silently let some of them through to be truncated.
+        #
+        # Sub-second precision can hide in *two* places, so both are checked:
+        #   * the wall clock (``parsed.microsecond``), e.g. ``10:00:00.5+08:00``;
+        #   * the UTC offset, e.g. ``10:00:00+08:00:00.5``.  That spelling
+        #     leaves ``parsed.microsecond == 0`` yet is 0.5s off a whole second,
+        #     so only the *absolute* instant (after ``.astimezone(UTC)``) exposes
+        #     it.  Checking the wall clock alone let such inputs be truncated --
+        #     and two of them (``.100000`` vs ``.900000``) then collapsed onto the
+        #     same second-precision instant.
+        # Both are checked rather than the absolute instant alone: a wall-clock
+        # fraction can be *cancelled* by a fractional offset (``10:00:00.5`` at
+        # ``-08:00:00.5`` is a whole second in UTC), and refusing it is the
+        # fail-closed answer for a cutoff spelled with sub-second precision.
+        return None
+    return _canonical_instant(parsed)
 
 
 def _finite(value: Any) -> Optional[float]:
@@ -449,6 +624,20 @@ def normalize_availability(value: Any) -> Optional[str]:
     prove availability writes an explicit "unproven" state instead of a guess.
     """
     return _timestamp_text(value)
+
+
+def normalize_cutoff(value: Any) -> Optional[str]:
+    """Public wrapper for the cutoff normalisation the dataset contract uses.
+
+    Unlike :func:`normalize_availability`, a cutoff may legitimately be given at
+    **day precision**: a date-only value is returned as a date and is never
+    expanded to a timestamp here, because the day-end reading belongs to the
+    comparison step, not to the dataset identity.  A full timestamp is reduced
+    to its exact canonical UTC instant and is never widened back to its day.
+    Anything unparseable returns ``None`` so callers fail closed instead of
+    falling back to a looser cutoff.
+    """
+    return _normalize_cutoff(value)
 
 
 def capture_provenance(
@@ -895,7 +1084,13 @@ def _classify(evidence: Mapping[str, Any], *, cutoff: str, feature_names: Sequen
     feature_asof = _date_text(sample.get("feature_asof")) or _date_text(sample.get("profile_date"))
     if feature_asof is None:
         return None, "future_or_invalid_asof"
-    if feature_asof > cutoff:
+    # ``feature_asof`` is day-precision by contract -- it is part of the sample
+    # identity, so it must never carry intraday detail.  A raw string compare
+    # against a *timestamp* cutoff would therefore be reading a date against an
+    # instant.  Compare on the canonical clock instead: day-precision evidence
+    # begins at the start of the exchange-local day, so a cutoff later that same
+    # day still admits it, and only a genuinely later day is refused.
+    if (_instant(feature_asof) or "") > (_cutoff_instant(cutoff) or ""):
         return None, "future_or_invalid_asof"
 
     horizon_value = _finite(label.get("horizon"))
@@ -1333,10 +1528,16 @@ def build_dataset(
     No network call, no execution call, no imputation.  Rows that cannot prove
     their point-in-time availability or label maturity are excluded and
     audited by reason.
+
+    ``cutoff`` keeps the precision the caller chose: a date-only cutoff means
+    the end of that exchange-local day (the unchanged PR-8 reading), while a
+    full timestamp is honoured as that **exact instant** and is never silently
+    widened to the end of its day.  An unparseable cutoff raises rather than
+    quietly loosening the window.
     """
-    cutoff_date = _date_text(cutoff)
-    if cutoff_date is None:
-        raise ValueError("a parseable cutoff date is required to build a strict dataset")
+    canonical_cutoff = _normalize_cutoff(cutoff)
+    if canonical_cutoff is None:
+        raise ValueError("a parseable cutoff is required to build a strict dataset")
     spec = _normalize_split_spec(split_spec)
     features = tuple(str(name) for name in feature_names)
 
@@ -1353,7 +1554,7 @@ def build_dataset(
             # them are refused instead.
             exclusions["ambiguous_label"] = exclusions.get("ambiguous_label", 0) + 1
             continue
-        sample, reason = _classify(item, cutoff=cutoff_date, feature_names=features)
+        sample, reason = _classify(item, cutoff=canonical_cutoff, feature_names=features)
         if reason is not None:
             exclusions[reason] = exclusions.get(reason, 0) + 1
             continue
@@ -1369,7 +1570,7 @@ def build_dataset(
     manifest = build_manifest(
         partitions,
         exclusions=exclusions,
-        cutoff=cutoff_date,
+        cutoff=canonical_cutoff,
         feature_names=features,
         horizon_semantics=horizon_semantics,
         split_spec=spec,
@@ -1380,7 +1581,7 @@ def build_dataset(
     if persist:
         persist_manifest(conn, manifest)
     return DatasetBuild(
-        cutoff=cutoff_date,
+        cutoff=canonical_cutoff,
         contract_version=contract_version,
         feature_names=features,
         horizon_semantics=horizon_semantics,
@@ -1431,7 +1632,15 @@ def contract_status(
         if not _table_columns(conn, ALPHA_SAMPLE_TABLE):
             status["dataset_blockers"].append("dataset_evidence_table_missing")
             return status
-        resolved_cutoff = _date_text(cutoff) or _latest_provable_cutoff(conn)
+        if cutoff is None:
+            # No explicit freeze point: fall back to the newest provable day.
+            resolved_cutoff = _latest_provable_cutoff(conn)
+        else:
+            # An explicit cutoff is honoured at its own precision.  When it is
+            # unparseable the gate refuses -- it never quietly widens the window
+            # to the latest provable day, which would be a *looser* dataset
+            # than the caller asked to be measured.
+            resolved_cutoff = _normalize_cutoff(cutoff)
         if resolved_cutoff is None:
             status["dataset_blockers"].append("dataset_cutoff_unprovable")
             return status
