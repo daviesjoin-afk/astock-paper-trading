@@ -44,7 +44,7 @@ class SyntheticDemoStrategyTests(unittest.TestCase):
         payload = DEMO.run_demo()
         self.assertTrue(payload["entry"]["opening_event"])
         self.assertTrue(payload["entry"]["entry_economics"])
-        self.assertIn("hard_limits", payload["risk"])
+        self.assertIn("hard_rules", payload["risk"])
         self.assertIn("soft_limits", payload["risk"])
         self.assertTrue(payload["exit"]["intraday_downside"])
         self.assertIsInstance(payload["exit"]["recovery"], dict)
