@@ -1,0 +1,190 @@
+name: Temporary strategy plugin routing patch
+
+on:
+  push:
+    branches:
+      - codex/issue-24-strategy-plugin-contract
+    paths:
+      - .github/workflows/tmp-strategy-plugin-routing.yml
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: codex/issue-24-strategy-plugin-contract
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Apply surgical production routing patch
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          strategies = Path('backend/strategies.py')
+          text = strategies.read_text(encoding='utf-8')
+          marker = '# StrategyPlugin production facade (issue #24)'
+          if marker not in text:
+              text += r'''
+
+
+# StrategyPlugin production facade (issue #24)
+# Keep every audited selector implementation above unchanged. Registered plugin
+# selectors use the unified boundary; legacy research selectors continue through
+# the exact pre-plugin implementation.
+_run_strategy_legacy = run_strategy
+
+
+def available_selection_models():
+    """Return legacy and registered plugin selector ids accepted by production."""
+    import strategy_plugins as SP
+
+    return set(PAPER_WEIGHTS) | set(STRATEGIES) | set(SP.selector_ids())
+
+
+def run_strategy(
+    strategy_id,
+    table: pd.DataFrame,
+    topn=10,
+    news_hits=None,
+    gate=None,
+    auto_news=True,
+    klines=None,
+    first_board_codes=None,
+    weight_overrides=None,
+    condition_overrides=None,
+):
+    """Production selector facade: plugin first, exact legacy fallback otherwise."""
+    import strategy_plugins as SP
+
+    plugin = SP.plugin_for_selector(strategy_id)
+    if plugin is not None:
+        return plugin.select_candidates(
+            table,
+            topn=topn,
+            news_hits=news_hits,
+            gate=gate,
+            auto_news=auto_news,
+            klines=klines,
+            first_board_codes=first_board_codes,
+            weight_overrides=weight_overrides,
+            condition_overrides=condition_overrides,
+        )
+    return _run_strategy_legacy(
+        strategy_id,
+        table,
+        topn=topn,
+        news_hits=news_hits,
+        gate=gate,
+        auto_news=auto_news,
+        klines=klines,
+        first_board_codes=first_board_codes,
+        weight_overrides=weight_overrides,
+        condition_overrides=condition_overrides,
+    )
+'''
+              strategies.write_text(text, encoding='utf-8')
+
+          paper = Path('backend/paper_trading.py')
+          text = paper.read_text(encoding='utf-8')
+          old = 'available_models = set(getattr(S, "PAPER_WEIGHTS", {}) or {}) | set(getattr(S, "STRATEGIES", {}) or {})'
+          new = 'available_models = S.available_selection_models()'
+          count = text.count(old)
+          if count != 1:
+              raise SystemExit(f'expected exactly one paper selection whitelist, found {count}')
+          paper.write_text(text.replace(old, new, 1), encoding='utf-8')
+
+          tests = Path('backend/test_strategy_plugins.py')
+          text = tests.read_text(encoding='utf-8')
+          marker = '    def test_production_run_strategy_dispatches_registered_selector(self):'
+          if marker not in text:
+              block = r'''
+    def test_plugin_identifiers_are_canonicalized_before_registration(self):
+        plugin = plugins.StrategyPlugin(
+            "  canonical_plugin  ",
+            "  canonical_selector  ",
+            ("factor_a",),
+            candidate_runner=lambda _table, **_kwargs: {
+                "strategy": "canonical_plugin", "count": 0, "picks": [],
+            },
+        )
+        self.assertEqual(plugin.strategy_id, "canonical_plugin")
+        self.assertEqual(plugin.selector_id, "canonical_selector")
+        plugins.register_plugin(plugin)
+        self.addCleanup(plugins.unregister_plugin, plugin.strategy_id)
+        self.assertIs(plugins.get_plugin("canonical_plugin"), plugin)
+        self.assertIs(plugins.plugin_for_selector("canonical_selector"), plugin)
+
+    def test_production_run_strategy_dispatches_registered_selector(self):
+        import strategies as S
+
+        seen = []
+
+        def runner(table, *, topn=10, **_kwargs):
+            seen.append((list(table.index), topn))
+            return {
+                "strategy": "production_dispatch_plugin",
+                "count": min(len(table), topn),
+                "picks": [{"code": str(code)} for code in list(table.index)[:topn]],
+            }
+
+        plugin = plugins.StrategyPlugin(
+            "production_dispatch_plugin",
+            "production_dispatch_selector",
+            ("factor_a",),
+            candidate_runner=runner,
+        )
+        plugins.register_plugin(plugin)
+        self.addCleanup(plugins.unregister_plugin, plugin.strategy_id)
+        table = pd.DataFrame({"factor_a": [1.0, 2.0]}, index=["000001", "000002"])
+        result = S.run_strategy("production_dispatch_selector", table, topn=1)
+        self.assertEqual(result["picks"], [{"code": "000001"}])
+        self.assertEqual(seen, [(["000001", "000002"], 1)])
+        self.assertIn("production_dispatch_selector", S.available_selection_models())
+
+    def test_duplicate_selector_registration_fails_closed(self):
+        first = plugins.StrategyPlugin(
+            "selector_owner_one", "shared_plugin_selector", ("factor_a",),
+            candidate_runner=lambda _table, **_kwargs: {
+                "strategy": "selector_owner_one", "count": 0, "picks": [],
+            },
+        )
+        second = plugins.StrategyPlugin(
+            "selector_owner_two", "shared_plugin_selector", ("factor_a",),
+            candidate_runner=lambda _table, **_kwargs: {
+                "strategy": "selector_owner_two", "count": 0, "picks": [],
+            },
+        )
+        plugins.register_plugin(first)
+        self.addCleanup(plugins.unregister_plugin, first.strategy_id)
+        with self.assertRaisesRegex(ValueError, "selector already registered"):
+            plugins.register_plugin(second)
+
+'''
+              anchor = '\n\nif __name__ == "__main__":\n'
+              if anchor not in text:
+                  raise SystemExit('test module anchor not found')
+              tests.write_text(text.replace(anchor, '\n' + block + anchor, 1), encoding='utf-8')
+          PY
+
+          cd backend
+          python -m unittest test_strategy_plugins
+          python -m compileall strategy_plugins.py strategies.py paper_trading.py test_strategy_plugins.py
+          cd ..
+
+          git diff --check
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add backend/strategy_plugins.py backend/strategies.py backend/paper_trading.py backend/test_strategy_plugins.py
+          if git diff --cached --quiet; then
+            echo "No patch needed"
+            exit 0
+          fi
+          git commit -m "fix(strategy): wire plugins into production selection"
+          git push origin HEAD:codex/issue-24-strategy-plugin-contract
