@@ -261,8 +261,17 @@ class WiringGuardTests(unittest.TestCase):
         self.assertIn("entry_slice_target_qty", body)
 
     def test_run_slot_sweeps_the_lifecycle(self):
-        self.assertIn("ELC.expire_stale_signals", self._source())
-        self.assertIn("ELC.expire_stale_orders", self._source())
+        """扫描入口仍会清扫 lifecycle。
+
+        PR #113 之后清扫动作由 ``paper_slot_service.run_preflight`` 承担，
+        facade 通过 ``PSS.run_preflight`` 委托。护栏的意图不变 —— 清扫必须
+        仍在 slot 路径上发生 —— 所以这里同时锁住"service 里有清扫"和
+        "facade 确实委托给 service"，删掉任一侧都会失败。
+        """
+        service = self._source("paper_slot_service.py")
+        self.assertIn("ELC.expire_stale_signals", service)
+        self.assertIn("ELC.expire_stale_orders", service)
+        self.assertIn("PSS.run_preflight(", self._source())
 
 
 if __name__ == "__main__":

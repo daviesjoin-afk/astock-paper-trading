@@ -445,8 +445,13 @@ class WiringGuardTests(unittest.TestCase):
             return handle.read()
 
     def test_run_slot_sweeps_the_dispatch_queue(self):
-        source = self._source()
-        self.assertIn("EPD.run_execution_dispatch", source)
+        """扫描入口仍会清扫 dispatch 队列。
+
+        PR #113 之后清扫动作由 ``paper_slot_service.run_preflight`` 承担，
+        facade 通过 ``PSS.run_preflight`` 委托。护栏意图不变，所以两侧都锁。
+        """
+        self.assertIn("EPD.run_execution_dispatch", self._source("paper_slot_service.py"))
+        self.assertIn("PSS.run_preflight(", self._source())
 
     def test_buy_order_creates_gated_orders(self):
         source = self._source()

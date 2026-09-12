@@ -38,6 +38,11 @@ import paper_quote_policy as PQP
 import paper_allocation as PA
 import paper_cycle_service as PCS
 import adaptive_selection_compat as ASC
+# ELC / EPD 仍被非 cleanup 路径使用（signal freshness、entry slice plan、
+# dispatch 规划与核验、gated order 查询）。清理动作已移交 paper_slot_service，
+# 但这两个模块本身仍是 facade 的依赖，不能随 cleanup 一起删掉 import。
+import entry_lifecycle as ELC
+import execution_dispatch as EPD
 import paper_slot_service as PSS
 import portfolio_coordinator as PCO
 import self_evolution as SE
