@@ -1,13 +1,9 @@
 # -*- coding: utf-8 -*-
 """Unified strategy plugin contract over the existing versioned runtime.
 
-The repository already has authoritative strategy definitions, immutable versions,
-parameter schemas, risk fingerprints and execution profiles.  This module does
-not duplicate any of them.  It only binds a stable strategy id to its candidate
-selector and exposes the existing runtime/policy objects through one interface.
-
-Adding a new native strategy therefore means registering a ``StrategyPlugin``;
-matching, capital-pool and order execution code remain strategy-agnostic.
+The registry/runtime remain authoritative for strategy metadata and risk.  This
+module binds them to candidate selectors and, via ``strategy_trace``, records a
+privacy-bounded replay artifact for every plugin candidate run.
 """
 from __future__ import annotations
 
@@ -17,20 +13,14 @@ from typing import Any, Callable, Mapping, Sequence
 import strategy_policies as SPOL
 import strategy_registry as SR
 import strategy_runtime as SRT
+import strategy_trace as STRACE
 
 CandidateRunner = Callable[..., Mapping[str, Any]]
 
 
 @dataclass(frozen=True)
 class StrategyPlugin:
-    """One strategy's candidate, lifecycle, parameter and risk contract.
-
-    ``selector_id`` is the existing candidate implementation key.  Built-ins
-    deliberately keep their audited selector functions in ``strategies.py``;
-    custom plugins may provide ``candidate_runner`` and need no core dispatch
-    change.  Version/schema/risk values are always read from the authoritative
-    registry/runtime instead of being copied into this descriptor.
-    """
+    """One strategy's candidate, lifecycle, parameter and risk contract."""
 
     strategy_id: str
     selector_id: str
@@ -49,9 +39,6 @@ class StrategyPlugin:
             raise ValueError("strategy plugin requires selector_id or candidate_runner")
         if not self.factor_inputs:
             raise ValueError("strategy plugin factor_inputs must not be empty")
-        # Frozen descriptors still store canonical ids.  Without this assignment
-        # a caller could register " foo " while lookups normalize to "foo",
-        # leaving a registration that can never be reached again.
         object.__setattr__(self, "strategy_id", strategy_id)
         object.__setattr__(self, "selector_id", selector_id)
         if self.entry_policy_key is not None:
@@ -68,18 +55,15 @@ class StrategyPlugin:
         return str(self.exit_policy_key or self.strategy_id)
 
     def spec(self, *, conn=None):
-        """Return the authoritative registry spec for this plugin."""
         spec = SR.get(self.strategy_id, conn=conn)
         if spec is None:
             raise ValueError(f"strategy is not registered: {self.strategy_id}")
         return spec
 
     def runtime(self, conn):
-        """Compile the authoritative immutable runtime for the current version."""
         return SRT.get_context(conn, self.strategy_id)
 
     def manifest(self, *, conn=None) -> dict[str, Any]:
-        """Expose id/name/version/schema plus the plugin's I/O declaration."""
         spec = self.spec(conn=conn)
         payload: dict[str, Any] = {
             "strategy_id": spec.id,
@@ -107,16 +91,13 @@ class StrategyPlugin:
             })
         return payload
 
-    def select_candidates(self, table, **kwargs) -> dict[str, Any]:
-        """Run the candidate selector and validate its shared output envelope."""
+    def _run_candidate(self, table, **kwargs):
         if self.candidate_runner is not None:
-            result = self.candidate_runner(table, **kwargs)
-        else:
-            # ``strategies.run_strategy`` is the production plugin-aware facade.
-            # Built-ins must call the legacy implementation underneath it here,
-            # otherwise selector dispatch would recurse back into this plugin.
-            import strategies as S
-            result = S._run_strategy_legacy(self.selector_id, table, **kwargs)
+            return self.candidate_runner(table, **kwargs)
+        import strategies as S
+        return S._run_strategy_legacy(self.selector_id, table, **kwargs)
+
+    def _validate_candidate_output(self, result) -> dict[str, Any]:
         if not isinstance(result, Mapping):
             raise TypeError("strategy candidate runner must return an object")
         missing = [key for key in self.candidate_output_keys if key not in result]
@@ -126,8 +107,34 @@ class StrategyPlugin:
             raise ValueError("strategy candidate output picks must be a list")
         return dict(result)
 
+    def select_candidates(self, table, **kwargs) -> dict[str, Any]:
+        """Run, validate and persist a replayable candidate trace."""
+        result = self._validate_candidate_output(self._run_candidate(table, **kwargs))
+        trace = STRACE.persist_snapshot(
+            strategy_id=self.strategy_id,
+            selector_id=self.selector_id,
+            table=table,
+            factor_inputs=self.factor_inputs,
+            selection_kwargs=kwargs,
+        )
+        return STRACE.attach_candidate_traces(
+            result,
+            table=table,
+            factor_inputs=self.factor_inputs,
+            manifest=trace,
+        )
+
+    def replay_candidates(self, snapshot_id: str) -> dict[str, Any]:
+        """Re-run this selector from one immutable factor/input snapshot."""
+        snapshot = STRACE.load_snapshot(snapshot_id)
+        if snapshot.get("strategy_id") != self.strategy_id:
+            raise ValueError("strategy replay snapshot belongs to another strategy")
+        if snapshot.get("selector_id") != self.selector_id:
+            raise ValueError("strategy replay snapshot selector mismatch")
+        table, kwargs = STRACE.replay_inputs(snapshot)
+        return self._validate_candidate_output(self._run_candidate(table, **kwargs))
+
     def entry_contract(self, conn) -> dict[str, Any]:
-        """Return entry/risk inputs without copying strategy-specific thresholds."""
         context = self.runtime(conn)
         return {
             "strategy_id": self.strategy_id,
@@ -139,13 +146,6 @@ class StrategyPlugin:
         }
 
     def exit_contract(self, conn) -> dict[str, Any]:
-        """Return exit/review inputs without inheriting another strategy's defaults.
-
-        ``strategy_policies.recovery_policy`` intentionally falls back to the
-        trend profile for legacy callers.  A plugin boundary must not do that:
-        an undeclared new strategy gets no strategy-specific recovery/rotation
-        override and relies on its compiled risk profile until it declares one.
-        """
         context = self.runtime(conn)
         recovery = dict(SPOL.RECOVERY_POLICIES.get(self.exit_key) or {})
         min_hold = SPOL.POSITION_REVIEW_MIN_HOLD_DAYS_BY_STRATEGY.get(self.exit_key)
@@ -167,7 +167,6 @@ class StrategyPlugin:
         *,
         evidence_count: int | None,
     ) -> dict[str, Any]:
-        """Validate parameter-only changes without persisting a new version."""
         context = self.runtime(conn)
         if context.compiled_dsl is None:
             if adjustments:
@@ -195,7 +194,6 @@ class StrategyPlugin:
         change_note: str = "strategy plugin parameter adjustment",
         challenger_win: bool = False,
     ) -> dict[str, Any]:
-        """Apply a schema/risk-gated parameter change through the canonical runtime."""
         return SRT.apply_parameter_adjustments(
             conn,
             self.strategy_id,
@@ -206,8 +204,14 @@ class StrategyPlugin:
             challenger_win=challenger_win,
         )
 
-    def transition(self, conn, to_status: str, *, reason: str = "", actor: str = "strategy_plugin"):
-        """Route strategy enable/disable lifecycle changes through the registry."""
+    def transition(
+        self,
+        conn,
+        to_status: str,
+        *,
+        reason: str = "",
+        actor: str = "strategy_plugin",
+    ):
         return SR.transition(
             conn,
             self.strategy_id,
@@ -222,7 +226,6 @@ _PLUGINS_BY_SELECTOR: dict[str, StrategyPlugin] = {}
 
 
 def register_plugin(plugin: StrategyPlugin, *, replace: bool = False) -> StrategyPlugin:
-    """Register one plugin without changing matching or execution core code."""
     if not isinstance(plugin, StrategyPlugin):
         raise TypeError("plugin must be StrategyPlugin")
     current = _PLUGINS.get(plugin.strategy_id)
@@ -240,7 +243,6 @@ def register_plugin(plugin: StrategyPlugin, *, replace: bool = False) -> Strateg
 
 
 def unregister_plugin(strategy_id: str) -> StrategyPlugin | None:
-    """Remove a runtime registration; durable strategy definitions are untouched."""
     plugin = _PLUGINS.pop(str(strategy_id or "").strip(), None)
     if plugin is not None and _PLUGINS_BY_SELECTOR.get(plugin.selector_id) is plugin:
         _PLUGINS_BY_SELECTOR.pop(plugin.selector_id, None)
@@ -256,7 +258,6 @@ def get_plugin(strategy_id: str) -> StrategyPlugin:
 
 
 def plugin_for_selector(selector_id: str) -> StrategyPlugin | None:
-    """Return a registered selector binding, or ``None`` for legacy models."""
     return _PLUGINS_BY_SELECTOR.get(str(selector_id or "").strip())
 
 
@@ -265,7 +266,6 @@ def plugin_ids() -> tuple[str, ...]:
 
 
 def selector_ids() -> tuple[str, ...]:
-    """Production selection models provided by plugins."""
     return tuple(_PLUGINS_BY_SELECTOR)
 
 
@@ -284,10 +284,10 @@ def select_by_selector(selector_id: str, table, **kwargs) -> dict[str, Any]:
     return plugin.select_candidates(table, **kwargs)
 
 
-# Current account->candidate bindings already used by paper_trading.ACCOUNT_SPECS.
-# Keeping the bindings here makes them an explicit plugin contract instead of an
-# implicit convention.  Selector algorithms and all hard execution/risk gates
-# remain in their existing modules.
+def replay_candidates(strategy_id: str, snapshot_id: str) -> dict[str, Any]:
+    return get_plugin(strategy_id).replay_candidates(snapshot_id)
+
+
 _BUILTIN_PLUGINS: Sequence[StrategyPlugin] = (
     StrategyPlugin(
         "tq_breakout", "one_to_two",
