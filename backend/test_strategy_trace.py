@@ -102,27 +102,13 @@ class StrategyReplayTraceTests(unittest.TestCase):
         column_dir = Path(self.temp.name) / "strategy_replay" / "columns"
         self.assertEqual(len(list(column_dir.glob("*.json.gz"))), 3)
 
-    def test_snapshot_contains_only_whitelisted_selection_inputs(self):
-        seen = {}
-
-        def runner(table, **kwargs):
-            seen.update(kwargs)
-            return {"strategy": "trace_private", "count": 1,
-                    "picks": [{"code": str(table.index[0])}]}
-
-        plugin = plugins.StrategyPlugin(
-            "trace_private", "trace_private", ("factor_a",), candidate_runner=runner
-        )
-        result = plugin.select_candidates(
-            self._table(), topn=1, account_state={"cash": 123456}, harmless_extra="not persisted"
-        )
-        self.assertIn("account_state", seen)
-        snapshot = trace.load_snapshot(result["replay_trace"]["snapshot_id"])
-        self.assertEqual(snapshot["selection_inputs"], {"topn": 1})
-        raw = json.dumps(snapshot, ensure_ascii=False)
-        self.assertNotIn("123456", raw)
-        self.assertNotIn("account_state", raw)
-        self.assertNotIn("harmless_extra", raw)
+    def test_undeclared_selection_input_fails_closed_instead_of_being_dropped(self):
+        plugin = self._plugin()
+        with self.assertRaisesRegex(ValueError, "undeclared selection input: account_state"):
+            plugin.select_candidates(
+                self._table(), topn=1, account_state={"cash": 123456}
+            )
+        self.assertFalse((Path(self.temp.name) / "strategy_replay").exists())
 
     def test_prohibited_market_columns_fail_closed(self):
         table = self._table()
