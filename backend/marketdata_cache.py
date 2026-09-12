@@ -63,11 +63,22 @@ def full_snapshot_singleflight_lock(thread_lock, lock_path):
 
 
 def save_source_health(path, payload):
-    """以临时文件替换方式持久化数据源健康状态。"""
+    """以临时文件替换方式持久化数据源健康状态。
+
+    Feed runtime health is attached lazily so `/api/health` can expose provider
+    circuit/degradation state without importing transport policy into the API.
+    """
+    snapshot = dict(payload) if isinstance(payload, dict) else {}
+    try:
+        import marketdata_feeds as feeds
+        snapshot["runtime_feeds"] = feeds.feed_health_snapshot()
+    except Exception:
+        # Health persistence is diagnostic and must never break the data path.
+        pass
     try:
         temp_path = f"{path}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
         with open(temp_path, "w", encoding="utf-8") as handle:
-            json.dump(payload, handle, ensure_ascii=False, allow_nan=False)
+            json.dump(snapshot, handle, ensure_ascii=False, allow_nan=False)
         os.replace(temp_path, path)
     except OSError:
         pass
