@@ -3,6 +3,7 @@ import gzip
 import json
 import os
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -68,15 +69,18 @@ class StrategyReplayTraceTests(unittest.TestCase):
             **kwargs,
         )
 
+    def _root(self):
+        return Path(self.temp.name) / "strategy_replay"
+
     def _run_path(self, snapshot_id):
-        return Path(self.temp.name) / "strategy_replay" / "runs" / f"{snapshot_id}.json.gz"
+        return self._root() / "runs" / f"{snapshot_id}.json.gz"
 
     def test_low_level_candidate_call_has_no_replay_side_effect(self):
         result = self._plugin().select_candidates(self._table(), topn=1)
         self.assertEqual(result["picks"][0]["code"], "000001")
         self.assertNotIn("replay_trace", result)
         self.assertNotIn("candidate_trace", result["picks"][0])
-        self.assertFalse((Path(self.temp.name) / "strategy_replay").exists())
+        self.assertFalse(self._root().exists())
 
     def test_candidate_trace_persists_factor_date_code_and_replay_artifact(self):
         result = self._traced(topn=2)
@@ -84,6 +88,7 @@ class StrategyReplayTraceTests(unittest.TestCase):
         self.assertEqual(replay["data_date"], "2026-09-11")
         self.assertEqual(replay["code_version"], "a1b2c3d4e5f6")
         self.assertEqual(replay["row_count"], 3)
+        self.assertEqual(replay["retention_days"], trace.REPLAY_RETENTION_DAYS)
         self.assertRegex(replay["snapshot_id"], r"^[0-9a-f]{64}$")
         self.assertTrue(self._run_path(replay["snapshot_id"]).is_file())
 
@@ -115,6 +120,14 @@ class StrategyReplayTraceTests(unittest.TestCase):
             for pick in original["picks"]
         ])
 
+    def test_replay_rejects_different_code_revision(self):
+        plugin = self._plugin()
+        original = self._traced(plugin=plugin, topn=1)
+        snapshot_id = original["replay_trace"]["snapshot_id"]
+        with mock.patch.dict(os.environ, {"ASTOCK_GIT_COMMIT": "bbbbbbb12345"}, clear=False):
+            with self.assertRaisesRegex(ValueError, "code version mismatch"):
+                plugin.replay_candidates(snapshot_id)
+
     def test_table_columns_are_content_addressed_and_reused(self):
         plugin = self._plugin()
         first = self._traced(plugin=plugin, topn=1)
@@ -123,20 +136,49 @@ class StrategyReplayTraceTests(unittest.TestCase):
         second_snapshot = trace.load_snapshot(second["replay_trace"]["snapshot_id"])
         self.assertNotEqual(first["replay_trace"]["snapshot_id"], second["replay_trace"]["snapshot_id"])
         self.assertEqual(first_snapshot["table"], second_snapshot["table"])
-        column_dir = Path(self.temp.name) / "strategy_replay" / "columns"
+        column_dir = self._root() / "columns"
         self.assertEqual(len(list(column_dir.glob("*.json.gz"))), 3)
+
+    def test_retention_prunes_expired_runs_without_deleting_live_shared_blobs(self):
+        plugin = self._plugin()
+        first = self._traced(plugin=plugin, topn=1)
+        second = self._traced(plugin=plugin, topn=2)
+        first_id = first["replay_trace"]["snapshot_id"]
+        second_id = second["replay_trace"]["snapshot_id"]
+        now_value = time.time()
+        old = now_value - (trace.REPLAY_RETENTION_DAYS + 5) * 86400
+
+        os.utime(self._run_path(first_id), (old, old))
+        report = trace.prune_snapshots(trace_dir=self._root(), now=now_value)
+        self.assertEqual(report["status"], "ok")
+        self.assertEqual(report["deleted_runs"], 1)
+        self.assertFalse(self._run_path(first_id).exists())
+        self.assertTrue(self._run_path(second_id).exists())
+        replayed = plugin.replay_candidates(second_id)
+        self.assertEqual(replayed["count"], 2)
+
+        os.utime(self._run_path(second_id), (old, old))
+        for kind in ("indexes", "columns"):
+            for path in (self._root() / kind).glob("*.json.gz"):
+                os.utime(path, (old, old))
+        report = trace.prune_snapshots(trace_dir=self._root(), now=now_value)
+        self.assertEqual(report["status"], "ok")
+        self.assertEqual(report["deleted_runs"], 1)
+        self.assertFalse(self._run_path(second_id).exists())
+        self.assertEqual(list((self._root() / "indexes").glob("*.json.gz")), [])
+        self.assertEqual(list((self._root() / "columns").glob("*.json.gz")), [])
 
     def test_undeclared_selection_input_fails_closed_instead_of_being_dropped(self):
         with self.assertRaisesRegex(ValueError, "undeclared selection input: account_state"):
             self._traced(topn=1, account_state={"cash": 123456})
-        self.assertFalse((Path(self.temp.name) / "strategy_replay").exists())
+        self.assertFalse(self._root().exists())
 
     def test_prohibited_market_columns_fail_closed(self):
         table = self._table()
         table["account_id"] = "real-account"
         with self.assertRaisesRegex(ValueError, "prohibited table columns"):
             self._traced(table=table, topn=1)
-        self.assertFalse((Path(self.temp.name) / "strategy_replay").exists())
+        self.assertFalse(self._root().exists())
 
     def test_prohibited_nested_whitelisted_input_fails_closed(self):
         with self.assertRaisesRegex(ValueError, "prohibited field"):
