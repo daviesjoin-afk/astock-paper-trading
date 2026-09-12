@@ -1,6 +1,9 @@
 # -*- coding: utf-8 -*-
+import os
 import sqlite3
+import tempfile
 import unittest
+from unittest import mock
 
 import pandas as pd
 
@@ -10,6 +13,23 @@ import strategy_registry as SR
 
 
 class StrategyPluginContractTests(unittest.TestCase):
+    def setUp(self):
+        self.trace_temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.trace_temp.cleanup)
+        self.trace_env = mock.patch.dict(
+            os.environ,
+            {"ASTOCK_CACHE_DIR": self.trace_temp.name, "ASTOCK_GIT_COMMIT": "abcdef123456"},
+            clear=False,
+        )
+        self.trace_env.start()
+        self.addCleanup(self.trace_env.stop)
+
+    @staticmethod
+    def _dated_table(data, index=None):
+        table = pd.DataFrame(data, index=index)
+        table.attrs["data_date"] = "2026-09-11"
+        return table
+
     def test_builtin_plugins_cover_exactly_the_five_registered_active_strategies(self):
         expected = {spec.id for spec in SR.BUILTIN_STRATEGIES}
         self.assertEqual(set(plugins.plugin_ids()), expected)
@@ -103,10 +123,12 @@ class StrategyPluginContractTests(unittest.TestCase):
         )
         plugins.register_plugin(plugin)
         self.addCleanup(plugins.unregister_plugin, plugin.strategy_id)
-        table = pd.DataFrame({"factor_a": [1.0, 2.0]}, index=["000001", "000002"])
+        table = self._dated_table({"factor_a": [1.0, 2.0]}, index=["000001", "000002"])
         result = plugins.select_candidates(plugin.strategy_id, table, topn=1)
         self.assertEqual(result["strategy"], plugin.strategy_id)
-        self.assertEqual(result["picks"], [{"code": "000001"}])
+        self.assertEqual(result["picks"][0]["code"], "000001")
+        self.assertIn("candidate_trace", result["picks"][0])
+        self.assertIn("replay_trace", result)
         self.assertEqual(seen, [(["000001", "000002"], 1)])
 
     def test_candidate_output_contract_fails_closed_on_malformed_plugin(self):
@@ -142,7 +164,6 @@ class StrategyPluginContractTests(unittest.TestCase):
         self.assertEqual(empty["changed"], {})
         with self.assertRaisesRegex(ValueError, "no executable DSL parameter schema"):
             plugin.validate_parameters(conn, {"invented": 1.0}, evidence_count=100)
-
 
     def test_plugin_identifiers_are_canonicalized_before_registration(self):
         plugin = plugins.StrategyPlugin(
@@ -181,9 +202,10 @@ class StrategyPluginContractTests(unittest.TestCase):
         )
         plugins.register_plugin(plugin)
         self.addCleanup(plugins.unregister_plugin, plugin.strategy_id)
-        table = pd.DataFrame({"factor_a": [1.0, 2.0]}, index=["000001", "000002"])
+        table = self._dated_table({"factor_a": [1.0, 2.0]}, index=["000001", "000002"])
         result = S.run_strategy("production_dispatch_selector", table, topn=1)
-        self.assertEqual(result["picks"], [{"code": "000001"}])
+        self.assertEqual(result["picks"][0]["code"], "000001")
+        self.assertIn("candidate_trace", result["picks"][0])
         self.assertEqual(seen, [(["000001", "000002"], 1)])
         self.assertIn("production_dispatch_selector", S.available_selection_models())
 
@@ -204,7 +226,6 @@ class StrategyPluginContractTests(unittest.TestCase):
         self.addCleanup(plugins.unregister_plugin, first.strategy_id)
         with self.assertRaisesRegex(ValueError, "selector already registered"):
             plugins.register_plugin(second)
-
 
 
 if __name__ == "__main__":
