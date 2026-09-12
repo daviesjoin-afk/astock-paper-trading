@@ -4,6 +4,7 @@ import unittest
 
 import pandas as pd
 
+import paper_trading as P
 import strategy_plugins as plugins
 import strategy_registry as SR
 
@@ -20,11 +21,8 @@ class StrategyPluginContractTests(unittest.TestCase):
 
     def test_builtin_candidate_bindings_match_current_paper_account_contract(self):
         expected = {
-            "tq_breakout": "one_to_two",
-            "trend_pullback": "bottom_reversal",
-            "sector_rotation": "sentiment_pioneer",
-            "reported_profit_breakout": "reported_profit_breakout",
-            "main_force_top10": "main_force_top10",
+            spec.id: P.ACCOUNT_SPECS[spec.id]["source_strategy"]
+            for spec in SR.BUILTIN_STRATEGIES
         }
         self.assertEqual(
             {strategy_id: plugins.get_plugin(strategy_id).selector_id for strategy_id in expected},
