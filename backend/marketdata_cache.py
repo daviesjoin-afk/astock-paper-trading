@@ -67,11 +67,14 @@ def save_source_health(path, payload):
 
     Feed runtime health is attached lazily so `/api/health` can expose provider
     circuit/degradation state without importing transport policy into the API.
+    An empty runtime registry leaves the legacy payload shape unchanged.
     """
     snapshot = dict(payload) if isinstance(payload, dict) else {}
     try:
         import marketdata_feeds as feeds
-        snapshot["runtime_feeds"] = feeds.feed_health_snapshot()
+        runtime_feeds = feeds.feed_health_snapshot()
+        if runtime_feeds:
+            snapshot["runtime_feeds"] = runtime_feeds
     except Exception:
         # Health persistence is diagnostic and must never break the data path.
         pass
