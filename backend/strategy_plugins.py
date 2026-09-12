@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
 """Unified strategy plugin contract over the existing versioned runtime.
 
-The registry/runtime remain authoritative for strategy metadata and risk.  This
-module binds them to candidate selectors and, via ``strategy_trace``, records a
-privacy-bounded replay artifact for every plugin candidate run.
+The registry/runtime remain authoritative for strategy metadata and risk. This
+module binds them to candidate selectors and, when the production caller opts
+into the replay contract, records a privacy-bounded replay artifact.
 """
 from __future__ import annotations
 
@@ -107,15 +107,32 @@ class StrategyPlugin:
             raise ValueError("strategy candidate output picks must be a list")
         return dict(result)
 
-    def select_candidates(self, table, **kwargs) -> dict[str, Any]:
-        """Run, validate and persist a replayable candidate trace."""
+    def select_candidates(
+        self,
+        table,
+        *,
+        replay_data_date=None,
+        replay_required: bool = False,
+        **kwargs,
+    ) -> dict[str, Any]:
+        """Run a selector; persist replay data only when the caller requests it.
+
+        Low-level strategy evaluation stays a pure algorithm boundary. Production
+        selection/paper paths opt into ``replay_required`` and must supply the
+        actual factor cutoff. This prevents a test/backtest helper from gaining
+        filesystem side effects and prevents production from inventing a date.
+        """
         result = self._validate_candidate_output(self._run_candidate(table, **kwargs))
+        should_trace = bool(replay_required or replay_data_date is not None)
+        if not should_trace:
+            return result
         trace = STRACE.persist_snapshot(
             strategy_id=self.strategy_id,
             selector_id=self.selector_id,
             table=table,
             factor_inputs=self.factor_inputs,
             selection_kwargs=kwargs,
+            explicit_data_date=replay_data_date,
         )
         return STRACE.attach_candidate_traces(
             result,
