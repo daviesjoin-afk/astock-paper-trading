@@ -43,8 +43,10 @@ Contracts enforced here:
     observed step != proven exchange trading day
     training data != execution authority
     a date-only cutoff means end of that exchange-local (UTC+08:00) day
+    a timestamp cutoff means that exact instant -- never widened back to its day
     a naive availability is exchange-local, never the host machine timezone
     every PIT comparison runs on one canonical UTC instant clock
+    an unparseable explicit cutoff is refused, never silently loosened
 """
 
 from __future__ import annotations
@@ -153,6 +155,11 @@ RETURN_PROVENANCE_COLUMNS = (
 )
 
 _DATE_ONLY = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+# A *whole-input* day, either separator.  ``_DATE_ONLY`` is used to recognise a
+# day inside a longer string; this one is used when deciding whether the caller
+# gave day precision or instant precision, so an intraday timestamp can never be
+# mistaken for a date.
+_DAY_PRECISION = re.compile(r"^\d{4}[-/]\d{2}[-/]\d{2}$")
 _END_OF_DAY = "T23:59:59"
 _START_OF_DAY = "T00:00:00"
 
@@ -340,6 +347,36 @@ def _cutoff_instant(value: Any) -> Optional[str]:
     return _timestamp_text(text)
 
 
+def _normalize_cutoff(value: Any) -> Optional[str]:
+    """Normalize a caller cutoff *without ever widening its precision*.
+
+    This is the one place the dataset layer turns whatever cutoff a caller
+    handed it into the canonical string that becomes part of the dataset
+    identity, and it deliberately keeps the two precisions apart:
+
+    * a **date-only** cutoff stays ``YYYY-MM-DD`` (day precision).  Everything
+      downstream reads that as the end of the exchange-local day, exactly as
+      the PR-8 contract always did, so day-precise callers keep their identity.
+    * a **full timestamp** is reduced to its exact canonical UTC instant and is
+      *never* expanded to the end of its day.  ``2026-09-12T10:00:00+08:00``
+      means 10:00, not 23:59:59, so evidence that only became available later
+      in that day can never leak into the dataset.
+    * an unparseable explicit cutoff returns ``None`` so callers fail closed
+      instead of silently falling back to a looser cutoff.
+
+    Equivalent spellings of the same instant (``+08:00``, ``Z``, naive
+    exchange-local, or an already-canonical ``+00:00``) collapse to one string.
+    """
+    text = _text(value)
+    if text is None:
+        return None
+    if _DAY_PRECISION.match(text):
+        # Day precision is preserved as a day; the EOD reading happens later,
+        # at comparison time, so the stored identity stays day-precise.
+        return _date_text(text)
+    return _timestamp_text(text)
+
+
 def _finite(value: Any) -> Optional[float]:
     """Return a finite float, or ``None``.  Never coerces missing to ``0``."""
     if value is None or isinstance(value, bool):
@@ -449,6 +486,20 @@ def normalize_availability(value: Any) -> Optional[str]:
     prove availability writes an explicit "unproven" state instead of a guess.
     """
     return _timestamp_text(value)
+
+
+def normalize_cutoff(value: Any) -> Optional[str]:
+    """Public wrapper for the cutoff normalisation the dataset contract uses.
+
+    Unlike :func:`normalize_availability`, a cutoff may legitimately be given at
+    **day precision**: a date-only value is returned as a date and is never
+    expanded to a timestamp here, because the day-end reading belongs to the
+    comparison step, not to the dataset identity.  A full timestamp is reduced
+    to its exact canonical UTC instant and is never widened back to its day.
+    Anything unparseable returns ``None`` so callers fail closed instead of
+    falling back to a looser cutoff.
+    """
+    return _normalize_cutoff(value)
 
 
 def capture_provenance(
@@ -895,7 +946,13 @@ def _classify(evidence: Mapping[str, Any], *, cutoff: str, feature_names: Sequen
     feature_asof = _date_text(sample.get("feature_asof")) or _date_text(sample.get("profile_date"))
     if feature_asof is None:
         return None, "future_or_invalid_asof"
-    if feature_asof > cutoff:
+    # ``feature_asof`` is day-precision by contract -- it is part of the sample
+    # identity, so it must never carry intraday detail.  A raw string compare
+    # against a *timestamp* cutoff would therefore be reading a date against an
+    # instant.  Compare on the canonical clock instead: day-precision evidence
+    # begins at the start of the exchange-local day, so a cutoff later that same
+    # day still admits it, and only a genuinely later day is refused.
+    if (_instant(feature_asof) or "") > (_cutoff_instant(cutoff) or ""):
         return None, "future_or_invalid_asof"
 
     horizon_value = _finite(label.get("horizon"))
@@ -1333,10 +1390,16 @@ def build_dataset(
     No network call, no execution call, no imputation.  Rows that cannot prove
     their point-in-time availability or label maturity are excluded and
     audited by reason.
+
+    ``cutoff`` keeps the precision the caller chose: a date-only cutoff means
+    the end of that exchange-local day (the unchanged PR-8 reading), while a
+    full timestamp is honoured as that **exact instant** and is never silently
+    widened to the end of its day.  An unparseable cutoff raises rather than
+    quietly loosening the window.
     """
-    cutoff_date = _date_text(cutoff)
-    if cutoff_date is None:
-        raise ValueError("a parseable cutoff date is required to build a strict dataset")
+    canonical_cutoff = _normalize_cutoff(cutoff)
+    if canonical_cutoff is None:
+        raise ValueError("a parseable cutoff is required to build a strict dataset")
     spec = _normalize_split_spec(split_spec)
     features = tuple(str(name) for name in feature_names)
 
@@ -1353,7 +1416,7 @@ def build_dataset(
             # them are refused instead.
             exclusions["ambiguous_label"] = exclusions.get("ambiguous_label", 0) + 1
             continue
-        sample, reason = _classify(item, cutoff=cutoff_date, feature_names=features)
+        sample, reason = _classify(item, cutoff=canonical_cutoff, feature_names=features)
         if reason is not None:
             exclusions[reason] = exclusions.get(reason, 0) + 1
             continue
@@ -1369,7 +1432,7 @@ def build_dataset(
     manifest = build_manifest(
         partitions,
         exclusions=exclusions,
-        cutoff=cutoff_date,
+        cutoff=canonical_cutoff,
         feature_names=features,
         horizon_semantics=horizon_semantics,
         split_spec=spec,
@@ -1380,7 +1443,7 @@ def build_dataset(
     if persist:
         persist_manifest(conn, manifest)
     return DatasetBuild(
-        cutoff=cutoff_date,
+        cutoff=canonical_cutoff,
         contract_version=contract_version,
         feature_names=features,
         horizon_semantics=horizon_semantics,
@@ -1431,7 +1494,15 @@ def contract_status(
         if not _table_columns(conn, ALPHA_SAMPLE_TABLE):
             status["dataset_blockers"].append("dataset_evidence_table_missing")
             return status
-        resolved_cutoff = _date_text(cutoff) or _latest_provable_cutoff(conn)
+        if cutoff is None:
+            # No explicit freeze point: fall back to the newest provable day.
+            resolved_cutoff = _latest_provable_cutoff(conn)
+        else:
+            # An explicit cutoff is honoured at its own precision.  When it is
+            # unparseable the gate refuses -- it never quietly widens the window
+            # to the latest provable day, which would be a *looser* dataset
+            # than the caller asked to be measured.
+            resolved_cutoff = _normalize_cutoff(cutoff)
         if resolved_cutoff is None:
             status["dataset_blockers"].append("dataset_cutoff_unprovable")
             return status

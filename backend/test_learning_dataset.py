@@ -12,6 +12,7 @@ import json
 import os
 import sqlite3
 import sys
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -1333,6 +1334,256 @@ class ContractStatusTests(DbTestCase):
             status = LD.contract_status(conn)
         self.assertEqual(status["dataset_blockers"], ["dataset_contract_error"])
         self.assertIsNone(status["dataset_fingerprint"])
+
+
+class CutoffPrecisionContractTests(DbTestCase):
+    """A cutoff keeps the precision it was given -- it is never silently widened.
+
+    PR-8 fixed one half of the cutoff contract: a **date-only** cutoff means the
+    *end* of that exchange-local day.  This class pins the other half.  A full
+    timestamp is an **exact** freeze instant: it is canonicalised onto the UTC
+    clock and is never expanded back to the end of its day, because doing so
+    imports evidence that only became available after the freeze.
+
+    Concretely, the regression this guards: a dataset frozen at
+    ``2026-01-02T10:00:00+08:00`` used to degrade its cutoff to the bare date
+    ``2026-01-02``, which reads as 23:59:59 Shanghai -- so a label published at
+    14:00 that same afternoon was admitted even though the caller had frozen the
+    dataset four hours earlier.  Precision is therefore part of the dataset
+    identity, and an unparseable explicit cutoff fails closed.
+    """
+
+    # 2026-01-02T10:00:00+08:00 == 2026-01-02T02:00:00+00:00
+    EXACT = "2026-01-02T10:00:00+08:00"
+    EXACT_UTC = "2026-01-02T02:00:00+00:00"
+    # The synthetic ``evidence()`` fixture lives on 2026-09-11/12, so the
+    # classify-level tests need the same freeze instant on *that* day.
+    EXACT_SEP = "2026-09-12T10:00:00+08:00"
+
+    def _late_label_db(self):
+        """One sample plus a label that only appears at 14:00 Shanghai time.
+
+        The label becomes available at 06:00Z, i.e. *after* a 10:00 Shanghai
+        freeze but well *before* the end of that same day -- exactly the evidence
+        a widened cutoff would wrongly import.
+        """
+        conn = self.new_db()
+        seed_sample(conn, "2026-01-01", available="2026-01-01T15:15:00")
+        seed_label(conn, "2026-01-01", "2026-01-02", available="2026-01-02T14:00:00")
+        return conn
+
+    def _classify_at(self, cutoff, **overrides):
+        fields = {"label_available": "2026-09-12T09:45:00+08:00"}
+        fields.update(overrides)
+        return LD._classify(evidence(**fields), cutoff=cutoff, feature_names=FEATURES)
+
+    # ── A. the date-only reading is unchanged ──
+
+    def test_date_only_cutoff_still_means_the_exchange_local_day_end(self):
+        conn = self._late_label_db()
+        built = build(conn, cutoff="2026-01-02")
+        self.assertEqual(built.cutoff, "2026-01-02")
+        self.assertEqual(built.eligible_rows, 1, reasons(built))
+        self.assertEqual(built.manifest["cutoff"], "2026-01-02")
+
+    def test_date_only_cutoff_is_not_canonicalised_into_a_timestamp(self):
+        conn = self._late_label_db()
+        built = build(conn, cutoff="2026-01-02")
+        self.assertNotIn("T", built.cutoff)
+        self.assertNotEqual(built.cutoff, "2026-01-02T15:59:59+00:00")
+
+    # ── B. a timestamp is an exact instant ──
+
+    def test_a_timestamp_cutoff_is_not_degraded_to_a_date(self):
+        conn = self._late_label_db()
+        built = build(conn, cutoff=self.EXACT)
+        self.assertEqual(built.cutoff, self.EXACT_UTC)
+        self.assertNotEqual(built.cutoff, "2026-01-02")
+
+    def test_a_label_published_after_the_exact_cutoff_is_never_imported(self):
+        """The leakage repro: same-day evidence, after the freeze, must be out."""
+        conn = self._late_label_db()
+        exact = build(conn, cutoff=self.EXACT)
+        self.assertEqual(exact.eligible_rows, 0)
+        self.assertEqual(reasons(exact).get("future_label"), 1)
+        # The very same evidence *is* inside the day, which is why the date-only
+        # reading legitimately admits it.  The two precisions stay distinct.
+        self.assertNotEqual(exact.fingerprint, build(conn, cutoff="2026-01-02").fingerprint)
+
+    def test_evidence_available_before_the_exact_cutoff_is_accepted(self):
+        sample, reason = self._classify_at(
+            self.EXACT_SEP, feature_available="2026-09-12T09:30:00+08:00"
+        )
+        self.assertIsNotNone(sample, reason)
+
+    def test_evidence_available_after_the_exact_cutoff_is_excluded(self):
+        sample, reason = self._classify_at(
+            self.EXACT_SEP, feature_available="2026-09-12T10:30:00+08:00"
+        )
+        self.assertIsNone(sample)
+        self.assertEqual(reason, "future_feature")
+
+    def test_evidence_available_exactly_at_the_exact_cutoff_is_accepted(self):
+        sample, reason = self._classify_at(
+            self.EXACT_SEP, feature_available="2026-09-12T10:00:00+08:00"
+        )
+        self.assertIsNotNone(sample, reason)
+
+    def test_a_label_available_exactly_at_the_exact_cutoff_is_accepted(self):
+        sample, reason = self._classify_at(
+            self.EXACT_SEP,
+            feature_available="2026-09-12T09:30:00+08:00",
+            label_available="2026-09-12T10:00:00+08:00",
+        )
+        self.assertIsNotNone(sample, reason)
+
+    def test_day_precise_asof_is_not_called_future_by_an_intraday_cutoff(self):
+        """``feature_asof`` is day-precision: compare it on the clock, not as text."""
+        cutoff = "2026-09-12T00:00:01+08:00"
+        canonical = LD._normalize_cutoff(cutoff)
+        self.assertEqual(canonical, "2026-09-11T16:00:01+00:00")
+        _, reason = LD._classify(
+            evidence(
+                asof="2026-09-12",
+                feature_available="2026-09-12T00:00:00+08:00",
+                label_start="2026-09-12",
+                label_end="2026-09-13",
+                label_available="2026-09-12T00:00:00+08:00",
+            ),
+            cutoff=canonical,
+            feature_names=FEATURES,
+        )
+        # The day *began* one second before the freeze, so the asof is inside it.
+        # A raw string compare of "2026-09-12" against the canonical instant
+        # would have refused it here; it must instead fall through to the honest
+        # reason -- the label is not mature yet.
+        self.assertNotEqual(reason, "future_or_invalid_asof")
+        self.assertEqual(reason, "invalid_label_time")
+        # A genuinely later day is still refused, and for the asof reason.
+        _, later = LD._classify(
+            evidence(
+                asof="2026-09-13",
+                feature_available="2026-09-12T00:00:00+08:00",
+                label_start="2026-09-12",
+                label_end="2026-09-14",
+                label_available="2026-09-12T00:00:00+08:00",
+            ),
+            cutoff=canonical,
+            feature_names=FEATURES,
+        )
+        self.assertEqual(later, "future_or_invalid_asof")
+
+    # ── C. equivalent spellings collapse to one identity ──
+
+    def test_equivalent_timestamp_forms_share_one_dataset_identity(self):
+        conn = self._late_label_db()
+        forms = (self.EXACT, "2026-01-02T02:00:00Z", self.EXACT_UTC, "2026-01-02T10:00:00")
+        built = [build(conn, cutoff=form) for form in forms]
+        self.assertEqual({row.cutoff for row in built}, {self.EXACT_UTC})
+        self.assertEqual(len({row.fingerprint for row in built}), 1)
+        self.assertEqual({row.eligible_rows for row in built}, {0})
+
+    def test_a_naive_timestamp_is_read_as_exchange_local(self):
+        self.assertEqual(LD.normalize_cutoff("2026-01-02T10:00:00"), self.EXACT_UTC)
+        conn = self._late_label_db()
+        self.assertEqual(
+            build(conn, cutoff="2026-01-02T10:00:00").fingerprint,
+            build(conn, cutoff=self.EXACT).fingerprint,
+        )
+
+    def test_the_freeze_boundary_is_the_exact_instant(self):
+        conn = self._late_label_db()
+        # The label matures at 06:00Z: one second earlier is too soon, the exact
+        # instant itself is inside the freeze.
+        before = build(conn, cutoff="2026-01-02T13:59:59+08:00")   # 05:59:59Z
+        on = build(conn, cutoff="2026-01-02T14:00:00+08:00")       # 06:00:00Z
+        self.assertEqual(before.eligible_rows, 0)
+        self.assertEqual(on.eligible_rows, 1, reasons(on))
+        self.assertNotEqual(before.fingerprint, on.fingerprint)
+
+    # ── D. manifest / persistence ──
+
+    def test_manifest_records_the_exact_cutoff(self):
+        conn = self._late_label_db()
+        self.assertEqual(build(conn, cutoff=self.EXACT).manifest["cutoff"], self.EXACT_UTC)
+
+    def test_persisted_manifest_round_trips_the_exact_cutoff(self):
+        conn = self._late_label_db()
+        built = build(conn, cutoff=self.EXACT, persist=True)
+        stored = LD.read_manifest(conn, built.fingerprint)
+        self.assertIsNotNone(stored)
+        self.assertEqual(stored["cutoff"], self.EXACT_UTC)
+
+    # ── E. fail closed ──
+
+    def test_an_invalid_explicit_cutoff_raises_instead_of_widening(self):
+        conn = self._late_label_db()
+        for bad in ("not-a-date", "2026-13-45", "2026-02-30", ""):
+            with self.subTest(cutoff=bad):
+                with self.assertRaises(ValueError):
+                    build(conn, cutoff=bad)
+
+    def test_an_invalid_explicit_cutoff_is_unprovable_in_the_gate(self):
+        conn = self._late_label_db()
+        status = LD.contract_status(conn, cutoff="not-a-date")
+        self.assertIsNone(status["cutoff"])
+        self.assertIsNone(status["dataset_fingerprint"])
+        self.assertIn("dataset_cutoff_unprovable", status["dataset_blockers"])
+        # No fallback: it must not quietly become the latest provable day.
+        self.assertEqual(LD._latest_provable_cutoff(conn), "2026-01-01")
+        self.assertNotEqual(status["cutoff"], LD._latest_provable_cutoff(conn))
+
+    def test_the_gate_still_defaults_to_the_latest_provable_cutoff(self):
+        conn = self._late_label_db()
+        status = LD.contract_status(conn)
+        self.assertEqual(status["cutoff"], "2026-01-01")
+        self.assertNotIn("dataset_cutoff_unprovable", status["dataset_blockers"])
+
+    def test_the_gate_preserves_the_exact_cutoff_instant(self):
+        conn = self._late_label_db()
+        status = LD.contract_status(conn, cutoff=self.EXACT)
+        self.assertEqual(status["cutoff"], self.EXACT_UTC)
+        self.assertNotEqual(status["cutoff"], "2026-01-02")
+
+    # ── F. the normalisation helper ──
+
+    def test_normalize_cutoff_is_idempotent_and_fails_closed(self):
+        for value, expected in (
+            ("2026-01-02", "2026-01-02"),
+            ("2026/01/02", "2026-01-02"),
+            (self.EXACT, self.EXACT_UTC),
+            ("2026-01-02T02:00:00Z", self.EXACT_UTC),
+            ("2026-01-02T10:00:00", self.EXACT_UTC),
+        ):
+            with self.subTest(value=value):
+                self.assertEqual(LD.normalize_cutoff(value), expected)
+                self.assertEqual(LD.normalize_cutoff(expected), expected)
+        for bad in ("not-a-date", "2026-13-45", "2026-02-30", "", "   ", None):
+            with self.subTest(bad=bad):
+                self.assertIsNone(LD.normalize_cutoff(bad))
+
+    def test_the_public_helper_matches_the_internal_one(self):
+        for value in ("2026-01-02", self.EXACT, "2026-01-02T02:00:00Z", "nonsense", None):
+            self.assertEqual(LD.normalize_cutoff(value), LD._normalize_cutoff(value), repr(value))
+
+    # ── G. the host clock never leaks in ──
+
+    def test_cutoff_precision_does_not_depend_on_the_host_timezone(self):
+        conn = self._late_label_db()
+        baseline = build(conn, cutoff=self.EXACT)
+        self.assertEqual(baseline.cutoff, self.EXACT_UTC)
+        for zone in ("UTC", "America/New_York", "Asia/Kolkata", "Pacific/Kiritimati"):
+            with self.subTest(tz=zone):
+                with mock.patch.dict(os.environ, {"TZ": zone}):
+                    if hasattr(time, "tzset"):
+                        time.tzset()
+                    try:
+                        observed = build(conn, cutoff=self.EXACT)
+                    finally:
+                        if hasattr(time, "tzset"):
+                            time.tzset()
+                self.assertEqual(observed.cutoff, baseline.cutoff)
+                self.assertEqual(observed.fingerprint, baseline.fingerprint)
 
 
 class NoNetworkTests(DbTestCase):

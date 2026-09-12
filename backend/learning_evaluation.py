@@ -32,6 +32,7 @@ Contracts enforced here (v2 -- every one of them is a refusal, not a warning):
     a prediction whose availability instant was never proven cannot count
     a prediction must predate the label it claims to have predicted
     a date-only cutoff is the END of the exchange-local day (PR-8 freeze)
+    a timestamp cutoff is an exact instant -- never widened back to its day
     every canonical held-out sample must carry exactly one prediction
     the model's training boundary must be proven to stop before the test set
     the model must not have been selected on the held-out partition
@@ -1224,7 +1225,11 @@ def build_evaluation(
     counted under a machine-readable reason, so nothing disappears silently.
     """
     dataset_fingerprint = _text(getattr(dataset, "fingerprint", None)) or ""
-    cutoff = _iso_date(getattr(dataset, "cutoff", None))
+    # The dataset layer already canonicalised its cutoff; re-normalising here
+    # (rather than truncating to a date) keeps an intraday freeze point at its
+    # exact instant, so the evaluation can never score a *wider* window than
+    # the dataset contract was built on.
+    cutoff = LD.normalize_cutoff(getattr(dataset, "cutoff", None))
     holdout = _text(holdout_partition) or DEFAULT_HOLDOUT_PARTITION
     scoring = scoring_spec(
         holdout_partition=holdout,
@@ -1868,14 +1873,14 @@ def _evaluate(
         return build_evaluation(
             _DatasetView(
                 fingerprint=str(dataset_status.get("dataset_fingerprint") or ""),
-                cutoff=_iso_date(dataset_status.get("cutoff")),
+                cutoff=LD.normalize_cutoff(dataset_status.get("cutoff")),
             ),
             [],
             model_id=model_id,
             holdout_partition=holdout_partition,
             dataset_blockers=dataset_blockers,
         )
-    resolved_cutoff = _iso_date(dataset_status.get("cutoff"))
+    resolved_cutoff = LD.normalize_cutoff(dataset_status.get("cutoff"))
     dataset = LD.build_dataset(
         conn, cutoff=resolved_cutoff, max_evidence_rows=max_evidence_rows, persist=False
     )
@@ -1914,12 +1919,12 @@ def evaluate_dataset(
     mutation of the dataset itself.  With ``persist=True`` the resulting
     evaluation manifest is appended (never rewritten).
     """
-    cutoff_date = _iso_date(cutoff)
-    if cutoff is not None and cutoff_date is None:
-        raise ValueError("a parseable cutoff date is required to evaluate a dataset")
+    normalized_cutoff = LD.normalize_cutoff(cutoff)
+    if cutoff is not None and normalized_cutoff is None:
+        raise ValueError("a parseable cutoff is required to evaluate a dataset")
     return _evaluate(
         conn,
-        cutoff=cutoff_date,
+        cutoff=normalized_cutoff,
         model_id=model_id,
         holdout_partition=holdout_partition,
         max_evidence_rows=max_evidence_rows,

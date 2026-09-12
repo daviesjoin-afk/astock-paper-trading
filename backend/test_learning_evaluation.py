@@ -1265,6 +1265,118 @@ class EvaluationCutoffSemanticsTests(DbTestCase):
         self.assertTrue(build_eval.coverage["coverage_complete"])
         self.assertTrue(build_eval.contract_ok, build_eval.blockers)
 
+    # ── the dataset layer's cutoff *precision* must survive into the gate ──
+    #
+    # NB: ``CUTOFF`` (module level) is the panel's last day, i.e. a cutoff that
+    # actually bites.  ``self.CUTOFF`` is a fixed calendar day used by the
+    # instant-level tests above.  Widening the former changes which rows exist,
+    # which is what these tests need to be able to detect.
+
+    def test_the_evaluation_path_reuses_the_dataset_layers_exact_cutoff(self):
+        conn = self.proven()
+        exact = f"{CUTOFF}T10:00:00+08:00"
+        dataset_status = LD.contract_status(conn, cutoff=exact)
+        self.assertEqual(dataset_status["cutoff"], LD.normalize_cutoff(exact))
+        self.assertNotEqual(dataset_status["cutoff"], CUTOFF)
+        # The evaluation resolves its dataset from the *dataset* gate's cutoff,
+        # so it must land on exactly that dataset -- not on the wider one a
+        # date-only cutoff would have produced.
+        self.assertEqual(
+            LE._evaluate(conn, cutoff=exact, persist=False).dataset_fingerprint,
+            dataset_status["dataset_fingerprint"],
+        )
+        # ... and the two really are different datasets, so the assertion above
+        # is not vacuously true.
+        widened = LD.contract_status(conn, cutoff=CUTOFF)
+        self.assertNotEqual(
+            dataset_status["dataset_fingerprint"], widened["dataset_fingerprint"]
+        )
+
+    def test_an_intraday_cutoff_is_not_widened_to_the_end_of_its_day(self):
+        exact = f"{CUTOFF}T10:00:00+08:00"
+        canonical = LD.normalize_cutoff(exact)
+        self.assertEqual(canonical, f"{CUTOFF}T02:00:00+00:00")
+        # A prediction stamped after the freeze but still *inside* the cutoff day
+        # is a lookahead.  Reading the cutoff as a date is exactly what let it
+        # through: 14:00 Shanghai is inside the day, outside the freeze.
+        sample = self._sample()
+        after_freeze = {"prediction_asof": f"{CUTOFF}T14:00:00"}      # 06:00Z
+        before_freeze = {"prediction_asof": f"{CUTOFF}T09:00:00"}     # 01:00Z
+        self.assertTrue(LE._is_future_prediction(after_freeze, sample, canonical))
+        self.assertFalse(LE._is_future_prediction(after_freeze, sample, CUTOFF))
+        self.assertFalse(LE._is_future_prediction(before_freeze, sample, canonical))
+
+    def test_build_evaluation_reads_the_dataset_cutoff_as_an_exact_instant(self):
+        """The evaluator is public API: it must honour whatever cutoff it is given.
+
+        Inside a self-consistent build the freeze rule is shadowed by the
+        label-availability rule, so this test feeds the evaluator a dataset
+        whose recorded freeze is intraday while its partitions still hold
+        evidence from *later that same day* -- the one shape where re-reading
+        the cutoff as a bare date changes the verdict.  A prediction stamped
+        after the freeze yet before the label became available is a lookahead,
+        and the date-only reading is exactly what admits it.
+        """
+        conn = self.proven()
+        build = build_dataset(conn)                        # cutoff = panel's last day
+        build.cutoff = f"{CUTOFF}T10:00:00+08:00"          # ... frozen intraday instead
+        predictions = predictions_for(build, prediction_asof=f"{CUTOFF}T14:00:00")
+        judged = evaluate_build(build, predictions, model_id=MODEL_ID)
+        # The label clock cannot refuse this row (14:00 precedes the 15:15
+        # label), so the freeze rule is the only rule that can and must.
+        last_date = test_dates(build)[-1]
+        late = [row for row in predictions if row["label_start_date"] == last_date]
+        self.assertTrue(late)
+        self.assertLess(
+            LE._availability_instant(late[0]["prediction_asof"]),
+            LE._availability_instant(build.partitions["test"][-1].label_available_at),
+        )
+        self.assertIn("future_prediction", active_exclusions(judged))
+        exact_refusals = active_exclusions(judged)["future_prediction"]
+        # Non-vacuity: read as a bare day, exactly the last-day rows are admitted
+        # instead -- so the refusal above really is the freeze rule at work.
+        build.cutoff = CUTOFF
+        widened = evaluate_build(build, predictions, model_id=MODEL_ID)
+        widened_refusals = active_exclusions(widened).get("future_prediction", 0)
+        self.assertEqual(exact_refusals - widened_refusals, len(late))
+
+    def test_equivalent_cutoff_forms_share_one_evaluation_identity(self):
+        conn = self.proven()
+        forms = (
+            f"{CUTOFF}T10:00:00+08:00",
+            f"{CUTOFF}T02:00:00Z",
+            f"{CUTOFF}T02:00:00+00:00",
+            f"{CUTOFF}T10:00:00",   # naive == exchange-local
+        )
+        statuses = [LD.contract_status(conn, cutoff=form) for form in forms]
+        evaluations = [LE._evaluate(conn, cutoff=form, persist=False) for form in forms]
+        self.assertEqual({row["cutoff"] for row in statuses}, {f"{CUTOFF}T02:00:00+00:00"})
+        self.assertEqual(len({row["dataset_fingerprint"] for row in statuses}), 1)
+        self.assertEqual(len({row.dataset_fingerprint for row in evaluations}), 1)
+        self.assertEqual(len({row.fingerprint for row in evaluations}), 1)
+
+    def test_the_two_gates_agree_on_the_canonical_cutoff(self):
+        """One cutoff, one meaning -- across both contract layers."""
+        conn = self.proven()
+        values = (
+            "2026-01-05", "2026-01-05T10:00:00", "2026-01-05T10:00:00+08:00",
+            "2026-01-05T02:00:00Z", "2026/01/05", "2026-01-05 10:00:00",
+            # A cutoff that does not immediately block the gate, so the
+            # resolvable path (not just the blocked short-circuit) is exercised.
+            f"{CUTOFF}T10:00:00+08:00", f"{CUTOFF}T02:00:00Z",
+            "nonsense", "",
+        )
+        for value in values:
+            with self.subTest(value=value):
+                dataset_status = LD.contract_status(conn, cutoff=value)
+                evaluation_status = LE.contract_status(conn, cutoff=value)
+                self.assertEqual(dataset_status["cutoff"], LD.normalize_cutoff(value))
+                self.assertEqual(
+                    dataset_status["dataset_fingerprint"],
+                    evaluation_status["dataset_fingerprint"],
+                    repr(value),
+                )
+
 
 # ─────────────────────────────── rank IC math ───────────────────────────────
 
