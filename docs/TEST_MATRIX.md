@@ -199,6 +199,29 @@
 | 责任隔离与单一实现（stdlib-only、只写缺失 `paper_accounts`、不持有资格/周期/资金/执行真相、无 import 期调用） | `paper_user_account_provisioning` / `paper_trading` | `test_paper_user_account_provisioning.py`（`ArchitectureGuardTests`） | ✅ |
 | 负向变异验证（N1–N15：状态、资金、周期、已有行、callback、审计、版本、越权查询/import/事务、facade 内联 SQL、benchmark 起点、周期/现金写入；每个真实源码变异均应被新增守卫抓红） | — | 手工执行变异脚本（逐字节备份、`finally` 恢复、sha256 校验；见 PR 描述） | ✅ |
 
+## 用户策略周期挂接边界（Extract User Cycle Attachment Boundary）
+
+| 场景 | 实现位置 | 回归用例 | 状态 |
+| --- | --- | --- | --- |
+| normal cycle 使用调用方已解析的 available capital；zero capital 仍 attach 且不造钱 | `paper_user_cycle_attachment.reconcile_user_cycle_accounts` | `test_paper_user_cycle_attachment.py`（`AttachContractTests`） | ✅ |
+| legacy cycle 严格按 `cycle.capital / max(len(enabled_ids), 1)` 分配 | `paper_user_cycle_attachment.reconcile_user_cycle_accounts` | `AttachContractTests.test_legacy_cycle_divides_by_enabled_ids_only` | ✅ |
+| attach 字段逐字段 golden：cycle/status/spec/capital/benchmark/date/version/risk/max limits | `paper_user_cycle_attachment.reconcile_user_cycle_accounts` | `AttachContractTests.test_normal_cycle_uses_available_capital_and_golden_account_fields` | ✅ |
+| attach 后只清理旧 `paper_nav` 并创建当日初始行 | `paper_user_cycle_attachment.reconcile_user_cycle_accounts` | `AttachContractTests.test_attach_resets_paper_nav_to_one_current_initial_row` | ✅ |
+| attach 后 parameter-version evidence 与 reason/params golden | `paper_user_cycle_attachment.reconcile_user_cycle_accounts` | `AttachContractTests.test_parameter_version_evidence_is_golden` | ✅ |
+| 成功 attach audit event/detail golden；detach 不写该 audit | `paper_user_cycle_attachment.reconcile_user_cycle_accounts` | `AttachContractTests.test_attach_audit_event_and_detail_are_golden`、`DetachContractTests.test_detach_does_not_write_attachment_audit` | ✅ |
+| disabled current-cycle user 精确 detach；只清 cycle/status/initial_cash/cash/updated_at | `paper_user_cycle_attachment.reconcile_user_cycle_accounts` | `DetachContractTests.test_disabled_bound_current_cycle_detaches_exactly` | ✅ |
+| detach 保留历史 `paper_nav` 与 `paper_parameter_versions`；显式 idle 不回落 builtin | `paper_user_cycle_attachment.reconcile_user_cycle_accounts` | `DetachContractTests` | ✅ |
+| lifecycle pause 不改变 caller 已传入的 economic attachment target | `paper_user_cycle_attachment.reconcile_user_cycle_accounts` | `AttachmentDecisionTests.test_lifecycle_pause_does_not_detach_when_caller_keeps_id_enabled` | ✅ |
+| current-cycle 已挂账户不 refresh；other-cycle 账户不抢绑 | `paper_user_cycle_attachment.reconcile_user_cycle_accounts` | `AttachmentDecisionTests.test_already_bound_to_current_cycle_is_not_refreshed`、`test_bound_to_another_cycle_is_not_stolen` | ✅ |
+| 缺失账户跳过且不解析 spec；spec resolution 先于 detach decision；多账户按调用顺序 | `paper_user_cycle_attachment.reconcile_user_cycle_accounts` | `AttachmentDecisionTests` | ✅ |
+| 裸 `row_factory=None` 与 `sqlite3.Row` 均可执行单行读取 | `paper_user_cycle_attachment._row` | `AttachmentDecisionTests.test_sqlite_row_and_bare_tuple_rows_are_both_supported` | ✅ |
+| audit 异常传播，caller rollback 可恢复；模块不拥有事务 | `paper_user_cycle_attachment.reconcile_user_cycle_accounts` | `TransactionAndFacadeTests.test_audit_failure_propagates_and_caller_rollback_restores_state` | ✅ |
+| `_ensure_cycle` 真实生产路径委托新模块，保留两次 version bind 与 shared cash 顺序 | `paper_trading._ensure_cycle` | `TransactionAndFacadeTests.test_production_ensure_cycle_delegates_between_two_version_binds` | ✅ |
+| facade/orchestrator 保留 `all_user_ids`、`USP.user_known_ids`、builtin repair 与 callback 注入 | `paper_trading._ensure_cycle` | `TransactionAndFacadeTests.test_facade_passes_call_time_callbacks_to_attachment_module`、`ArchitectureGuardTests.test_facade_keeps_orchestration_owners_and_order_markers` | ✅ |
+| 模块零 backend import、无 registry/lifecycle/cycle/shared-cash/order/fill/lots/transaction 越权，只写三张允许表 | `paper_user_cycle_attachment` | `ArchitectureGuardTests` | ✅ |
+| user attachment 核心 SQL 只有一份，`paper_trading` 无第二套 attach/NAV/parameter 实现 | `paper_user_cycle_attachment` / `paper_trading` | `ArchitectureGuardTests.test_single_attachment_audit_implementation_and_no_inline_copy` | ✅ |
+| 真实 mutation N1–N16 全部捕获：detach/status/cash/NAV/ownership/capital/zero/legacy/status/抢绑/refresh/parameter/audit/authority/transaction/bare-row | — | 手工执行 N1–N16 变异脚本（逐字节备份、`finally` 恢复、sha256 校验；见 PR 描述） | ✅ |
+
 ## 维护约定
 
 1. 新增门禁必须先在本表加一行，再写测试；表格状态从 ⚠️ → ✅。
