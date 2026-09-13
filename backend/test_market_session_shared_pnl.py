@@ -96,7 +96,6 @@ class MarketSessionSharedPnlTests(unittest.TestCase):
 
 
     def test_build_factor_table_copies_main_force_columns(self):
-        import numpy as np
         import pandas as pd
         import strategies as S
 
