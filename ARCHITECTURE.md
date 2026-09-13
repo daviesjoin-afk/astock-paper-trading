@@ -81,6 +81,12 @@ Reservation aggregation is intentionally cross-cycle：只要仍为 `reserved`�
 
 Recovery exception：`_reconcile_signal_order_states` 仍可直接修复 reservation terminal state，这是跨 signal/order lifecycle 的 crash-recovery 编排；它不是正常 runtime reservation CRUD，故不迁入预占模块。
 
+### 固定周期本金归属边界
+
+`backend/paper_cycle_capital.py` 是固定 cycle 经济本金归属与 late-join 展示参考本金的唯一实现边界。它只读 `paper_accounts.initial_cash`，由调用方在调用时注入权威的 `paper_cycle_ownership` 过滤器、内置账户作用域和数值转换函数；不拥有 schema、事务、审计、共享现金或资金分配。
+
+`paper_trading.py` 保留 `_available_cycle_ledger_capital` 与 `_late_join_reference_capital` 两个兼容 facade，并保持依赖方向 `paper_trading → paper_cycle_capital`；新模块不得反向依赖 `paper_trading`、`paper_cycle_ownership`、`paper_allocation`、`paper_shared_cash` 或 `paper_capital_reservations`。固定 cycle 经济归属不等于动态 allocation engine，late-join reference 也不是真实 pool cash 或资金铸造来源。
+
 ### 待成交席位占用 read model 边界
 
 `backend/paper_slot_occupancy.py` 是待成交 BUY 订单“席位占用 read model”的唯一实现边界：
@@ -204,6 +210,7 @@ PR-49 把这条口径的实现收敛到只读解析器 `backend/paper_cycle_owne
 | 决策审计序列化 | `backend/paper_decision_audit.py` | 决策快照 envelope 的唯一实现（点对点证据序列化、K 线窗口与 future-row 排除、因子贡献）；`paper_trading` 内同名符号仅保留兼容 facade | 不写数据库、不联网、不改变交易规则 |
 | 纸盘账户声明 | `backend/paper_account_specs.py` | 纸盘账户的**声明式**配置：内置五套账户 spec、风格声明、风险画像声明、保守回退 spec，以及返回独立副本的只读访问器；`paper_trading` 内同名符号仅保留兼容别名 | 不回答注册表 active / 生命周期 / 运行时就绪、不回答当期周期所有权与参与者、不回答执行资格与执行许可；不连数据库、不联网、不下单、不启动调度 |
 | 周期所有权解析 | `backend/paper_cycle_ownership.py` | 当期周期**经济所有权**（`enabled_strategies` ∩ `paper_accounts.cycle_id`）、**执行参与者**（经济所有权 − lifecycle pause）、idle / 未配置 / 未挂接的判定来源元数据；`paper_trading` 内同名符号仅保留兼容 facade（别名 + 委托） | 不建周期、不归档、不开户、不改资金、不改账户状态、不下单、不撮合、不做风险决策、不生成信号、不做分配或 sizing；不拥有注册表 active 作用域与风控退出资格；不 import `paper_trading` |
+| 固定周期本金归属 | `backend/paper_cycle_capital.py` | 只读计算固定 cycle 尚未归属的经济本金，以及 funded sleeves 的 late-join 展示/绩效参考本金；过滤器、内置账户作用域和数值转换均由 caller 注入 | 不决定 cycle 所有权或执行资格，不写 shared cash / pool NAV / 账户本金，不做 allocation、sizing、reservation、slot occupancy，不拥有事务；不 import `paper_trading` |
 | 共享现金账本 | `backend/paper_shared_cash.py` | 接收调用方已解析的账户行，完成共享现金/初始资本聚合，以及按既有顺序对明确账户执行现金借记/贷记；唯一写入是 `paper_accounts.cash` 与 `updated_at` | 不解析周期所有权、不决定执行资格、不创建账户或周期、不处理预约/敞口/风控退出、不写订单/成交/持仓；不 import `paper_trading` |
 | 用户策略账户 provisioning | `backend/paper_user_account_provisioning.py` | 接收 facade 已解析的用户策略 ID，幂等创建缺失的 `paper_accounts` 账本身份并写成功开户审计；不自行判断资格 | 不查询注册表/生命周期/runtime/周期，不分配资金、不挂接周期、不改已有行、不授予执行权限；不 commit/rollback、不 import `paper_trading` |
 | 用户策略周期挂接 | `backend/paper_user_cycle_attachment.py` | 接收 facade 已解析的用户账本 ID、enabled 目标和当前周期，幂等执行 `paper_accounts` 的周期挂接/摘除，并在挂接时重置当日 NAV、写参数版本证据和成功审计 | 不选择/创建周期、不解析 enabled/lifecycle/registry、不分配共享现金、不抢绑其他周期、不改变 detach 历史证据；不写 `paper_cycles`/orders/fills/lots、不 commit/rollback、不 import `paper_trading` |
@@ -281,6 +288,7 @@ PR-49 把这条口径的实现收敛到只读解析器 `backend/paper_cycle_owne
     - 风控退出 SELL 委托严格隔离于买入侧容量控制：不占用买入槽位（`pending_position_slots` 仅统计 `side='buy'`），不消耗买入资金预留（`pending_buy_reservations` 仅统计 `side='buy'`），不受 `PAPER_ENTRY_FREEZE` 买入熔断环境变量阻断；
     - 退出执行过程受 savepoint 事务保护：执行失败/异常立即回滚，不产生脏 lot、订单或虚构资金；成功成交后释放的净回款（`amount - fees`）精确归还账户与共享现金池；所有成交流水（seed buy 与 risk sell）严格归属于对应方向与参数的真实订单，禁止错连或对向孤儿；
     - 生产调用链由 `test_paper_risk_exit_production_path.py` 覆盖 A–O 场景与调度入口 `run_slot("risk", ...)`，并经由本地突变套件对真实源码变异 N1–N12 检验（12/12 caught, 0 undetected）。
+15. 固定 cycle 本金归属的实现只有一份（`backend/paper_cycle_capital.py`）：`available_cycle_ledger_capital` 读取 ownership scope 内其他账户的 `initial_cash` 并在有 ownership row 时对 cycle capital 做非负剩余计算；无 row 时沿用 `capital / max(len(builtin_account_ids), 1)` fallback。`late_join_reference_capital` 只读取 funded（`initial_cash > 0`）sleeves 的平均初始本金并精确保留两位小数，否则使用同一分母保护的 rounded fallback。模块纯 stdlib、只读、无事务；caller 在调用时注入 ownership predicate、builtin scope 与 num 函数，`paper_trading` 仅保留两个兼容 facade。固定经济归属 != 动态 allocation engine，late-join reference != shared cash / pool NAV / 真实账户本金；依赖方向单向：`paper_trading` → `paper_cycle_capital`，反向禁止。
 
 ## 学习/研究数据契约（PR-8）
 
