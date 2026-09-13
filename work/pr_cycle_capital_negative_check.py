@@ -24,6 +24,16 @@ def replace_once(source: bytes, before: str, after: str) -> bytes:
     return source.replace(old, new, 1)
 
 
+def run_contract_tests() -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [sys.executable, "-m", "unittest", "backend.test_paper_cycle_capital", "-q"],
+        cwd=ROOT,
+        env={**os.environ, "PYTHONPATH": "backend"},
+        capture_output=True,
+        text=True,
+    )
+
+
 def main() -> int:
     original = TARGET.read_bytes()
     original_sha = sha256(original)
@@ -41,46 +51,73 @@ def main() -> int:
         ("N11", "return round(num_fn(funded[\"s\"]) / int(funded[\"n\"]), 2)", "return round(num_fn(cycle[\"capital\"], 0.0) / max(len(builtin_account_ids), 1), 2)"),
         ("N12", "return round(num_fn(funded[\"s\"]) / int(funded[\"n\"]), 2)", "return round(num_fn(funded[\"s\"]) / int(funded[\"n\"]), 0)"),
     ]
-    results = []
-
-    baseline = subprocess.run(
-        [sys.executable, "-m", "unittest", "backend.test_paper_cycle_capital", "-q"],
-        cwd=ROOT,
-        env={**os.environ, "PYTHONPATH": "backend"},
-        capture_output=True,
-        text=True,
-    )
-    if baseline.returncode != 0:
-        print("baseline: FAILED")
-        print(baseline.stdout, baseline.stderr)
-        return 1
-    print("baseline: PASS")
-
+    results: list[tuple[str, str]] = []
+    pristine_checks: list[bool] = []
+    restore_bytes_checks: list[bool] = []
+    restore_sha_checks: list[bool] = []
     try:
+        baseline = run_contract_tests()
+        if baseline.returncode != 0:
+            print("baseline: FAILED")
+            print(baseline.stdout, baseline.stderr)
+            return 1
+        print("baseline: PASS")
+
         for name, before, after in mutations:
+            before_bytes = TARGET.read_bytes()
+            before_sha = sha256(before_bytes)
+            bytes_match = before_bytes == original
+            sha256_match = before_sha == original_sha
+            pristine_checks.append(bytes_match and sha256_match)
+            print(f"{name} pre: bytes_match={bytes_match} sha256_match={sha256_match}")
+            if not bytes_match or not sha256_match:
+                raise RuntimeError(f"{name} refuses to mutate a non-pristine production source")
+
             mutated = replace_once(original, before, after)
-            TARGET.write_bytes(mutated)
-            run = subprocess.run(
-                [sys.executable, "-m", "unittest", "backend.test_paper_cycle_capital", "-q"],
-                cwd=ROOT,
-                env={**os.environ, "PYTHONPATH": "backend"},
-                capture_output=True,
-                text=True,
+            try:
+                TARGET.write_bytes(mutated)
+                run = run_contract_tests()
+                caught = run.returncode != 0
+                results.append((name, "CAUGHT" if caught else "UNDETECTED"))
+                print(f"{name}: {'CAUGHT' if caught else 'UNDETECTED'}")
+                if not caught:
+                    print(run.stdout, run.stderr)
+            finally:
+                TARGET.write_bytes(original)
+
+            restored = TARGET.read_bytes()
+            restored_sha = sha256(restored)
+            restored_bytes_match = restored == original
+            restored_sha_match = restored_sha == original_sha
+            restore_bytes_checks.append(restored_bytes_match)
+            restore_sha_checks.append(restored_sha_match)
+            print(
+                f"{name} restore: bytes_match={restored_bytes_match} "
+                f"sha256_match={restored_sha_match}"
             )
-            caught = run.returncode != 0
-            results.append((name, "CAUGHT" if caught else "UNDETECTED"))
-            if not caught:
-                print(run.stdout, run.stderr)
+            if not restored_bytes_match or not restored_sha_match:
+                raise RuntimeError(f"{name} restore verification failed; refusing next mutation")
+
+        final = TARGET.read_bytes()
+        final_bytes_match = final == original
+        final_sha_match = sha256(final) == original_sha
+        print(f"final restore: bytes_match={final_bytes_match} sha256_match={final_sha_match}")
+        complete = (
+            len(results) == 12
+            and all(result == "CAUGHT" for _, result in results)
+            and len(pristine_checks) == 12
+            and all(pristine_checks)
+            and len(restore_bytes_checks) == 12
+            and all(restore_bytes_checks)
+            and len(restore_sha_checks) == 12
+            and all(restore_sha_checks)
+            and final_bytes_match
+            and final_sha_match
+        )
+        print(f"original_sha256={original_sha}")
+        return 0 if complete else 1
     finally:
         TARGET.write_bytes(original)
-
-    restored = TARGET.read_bytes()
-    print(f"original_sha256={original_sha}")
-    for name, result in results:
-        print(f"{name}: {result}")
-    print(f"restored_byte_for_byte={restored == original}")
-    print(f"restored_sha256={sha256(restored)}")
-    return 0 if len(results) == 12 and all(result == "CAUGHT" for _, result in results) and restored == original else 1
 
 
 if __name__ == "__main__":

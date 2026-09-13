@@ -242,7 +242,7 @@
 | late-join 只按 funded `initial_cash>0` sleeves 求平均并 `round(..., 2)`；无 funded row 使用 rounded fallback；不读取 `cash` | `paper_cycle_capital.late_join_reference_capital` | `test_paper_cycle_capital.py`（late-join contract tests） | ✅ |
 | callback / SQL 顺序、裸 SQLite 与 `sqlite3.Row` 兼容、只读与 stdlib/import 边界 | `paper_cycle_capital` | `test_paper_cycle_capital.py` | ✅ |
 | 两个 `paper_trading` compatibility facade 保持原签名，并在调用时解析 `_active_cycle_filter`、`ACTIVE_ACCOUNT_IDS`、`_num` | `paper_trading._available_cycle_ledger_capital` / `_late_join_reference_capital` | `test_paper_cycle_capital.py`（facade tests） | ✅ |
-| 真实源码变异 N1–N12 全部捕获，逐字节与 SHA-256 原样恢复 | `paper_cycle_capital` / `paper_trading` | local workspace mutation tooling/evidence: `work/pr_cycle_capital_negative_check.py` | ✅ |
+| 真实源码变异 N1–N12 全部捕获；each mutation restored byte-for-byte and SHA-256 verified before proceeding to the next mutation; final restore/hash also verified | `paper_cycle_capital` / `paper_trading` | local workspace mutation tooling/evidence: `work/pr_cycle_capital_negative_check.py` | ✅ |
 
 ## 待成交席位占用 read model 边界（Extract Pending Slot Occupancy Boundary）
 
