@@ -126,14 +126,31 @@ class PaperRiskExitProductionPathTestCase(unittest.TestCase):
         if remaining_qty is None:
             remaining_qty = qty
         with PT._db(immediate=True) as conn:
-            # Also record an initial buy fill so the account has activity and isn't auto-reset
+            stamp = PT._strategy_stamp(conn, account_id)
+            # 1. Insert a real, terminal, historical BUY seed order
+            cur_order = conn.execute(
+                """INSERT INTO paper_orders(
+                       account_id, side, code, name, qty, planned_price, filled_price,
+                       amount, fees, status, reason, risk_payload, created_at, executed_at,
+                       order_type, origin, strategy_id, strategy_version, strategy_checksum
+                   ) VALUES (?, 'buy', ?, ?, ?, ?, ?, ?, 5.0, 'filled', 'seed_buy',
+                             '{}', ?, ?, 'market', 'seed', ?, ?, ?)""",
+                (account_id, code, f"测试股_{code}", qty, cost, cost, qty * cost,
+                 f"{available_date} 09:30:00", f"{available_date} 09:30:00", *stamp),
+            )
+            seed_order_id = int(cur_order.lastrowid)
+
+            # 2. Insert seed fill with the exact real seed BUY order id
             conn.execute(
                 """INSERT INTO paper_fills(
                        order_id, account_id, side, code, qty, price, amount, fees,
                        fill_date, quote_at, assumption
-                   ) VALUES (1, ?, 'buy', ?, ?, ?, ?, 5.0, ?, ?, 'seed')""",
-                (account_id, code, qty, cost, qty * cost, available_date, f"{available_date} 10:00:00"),
+                   ) VALUES (?, ?, 'buy', ?, ?, ?, ?, 5.0, ?, ?, 'seed')""",
+                (seed_order_id, account_id, code, qty, cost, qty * cost,
+                 available_date, f"{available_date} 09:30:00"),
             )
+
+            # 3. Insert lot
             cur = conn.execute(
                 """INSERT INTO paper_position_lots(
                        cycle_id, account_id, code, name, industry, qty, remaining_qty,
@@ -172,17 +189,44 @@ class TestPaperRiskExitProductionPath(PaperRiskExitProductionPathTestCase):
         self.assertEqual(res["orders"][0]["qty"], 1000)
 
         with PT._db() as conn:
-            orders = conn.execute("SELECT side, code, qty, status FROM paper_orders WHERE account_id=?", (account_id,)).fetchall()
-            self.assertEqual(len(orders), 1)
-            self.assertEqual(orders[0]["side"], "sell")
-            self.assertEqual(orders[0]["qty"], 1000)
-            self.assertEqual(orders[0]["status"], "filled")
+            # Sells: exactly 1 new risk exit sell order
+            sell_orders = conn.execute(
+                "SELECT id, side, code, qty, status FROM paper_orders WHERE account_id=? AND side='sell'",
+                (account_id,),
+            ).fetchall()
+            self.assertEqual(len(sell_orders), 1)
+            self.assertEqual(sell_orders[0]["qty"], 1000)
+            self.assertEqual(sell_orders[0]["status"], "filled")
 
-            fills = conn.execute("SELECT side, code, qty, price, amount, fees FROM paper_fills WHERE account_id=? AND side='sell'", (account_id,)).fetchall()
-            self.assertEqual(len(fills), 1)
-            self.assertEqual(fills[0]["qty"], 1000)
-            fill_amount = fills[0]["amount"]
-            fill_fees = fills[0]["fees"]
+            # Seed buys: historical seed buy order exists and is terminal
+            buy_orders = conn.execute(
+                "SELECT id, side, code, qty, status FROM paper_orders WHERE account_id=? AND side='buy'",
+                (account_id,),
+            ).fetchall()
+            self.assertEqual(len(buy_orders), 1)
+            self.assertEqual(buy_orders[0]["status"], "filled")
+
+            # Fills check
+            sell_fills = conn.execute(
+                "SELECT order_id, side, code, qty, price, amount, fees FROM paper_fills WHERE account_id=? AND side='sell'",
+                (account_id,),
+            ).fetchall()
+            self.assertEqual(len(sell_fills), 1)
+            self.assertEqual(sell_fills[0]["order_id"], sell_orders[0]["id"], "Risk-exit SELL fill must join to SELL order")
+            self.assertEqual(sell_fills[0]["qty"], 1000)
+            fill_amount = sell_fills[0]["amount"]
+            fill_fees = sell_fills[0]["fees"]
+
+            buy_fills = conn.execute(
+                "SELECT order_id, side, code, qty, price, amount, fees FROM paper_fills WHERE account_id=? AND side='buy'",
+                (account_id,),
+            ).fetchall()
+            self.assertEqual(len(buy_fills), 1)
+            self.assertEqual(buy_fills[0]["order_id"], buy_orders[0]["id"], "Seed BUY fill must join to seed BUY order")
+
+            # Invariant: no fill may join to an opposite-side order
+            self.assertNotEqual(sell_fills[0]["order_id"], buy_orders[0]["id"])
+            self.assertNotEqual(buy_fills[0]["order_id"], sell_orders[0]["id"])
 
             lots = conn.execute("SELECT remaining_qty FROM paper_position_lots WHERE account_id=?", (account_id,)).fetchall()
             self.assertEqual(len(lots), 1)
@@ -257,22 +301,65 @@ class TestPaperRiskExitProductionPath(PaperRiskExitProductionPathTestCase):
     # Scenario D: paused / archived 账户 + 0 持仓
     # -------------------------------------------------------------------------
     def test_D_paused_or_archived_account_with_zero_holdings_never_enters_risk_exit(self):
-        account_id = "tq_breakout"
+        paused_account = "tq_breakout"
+        archived_account = "main_force_top10"
         with PT._db(immediate=True) as conn:
-            conn.execute("UPDATE paper_accounts SET status='paused' WHERE id=?", (account_id,))
-            conn.execute("DELETE FROM paper_position_lots WHERE account_id=?", (account_id,))
+            stamp_p = PT._strategy_stamp(conn, paused_account)
+            stamp_a = PT._strategy_stamp(conn, archived_account)
+
+            # Record historical activity so _ensure_cycle treats them as initialized
+            cur_p = conn.execute(
+                """INSERT INTO paper_orders(
+                       account_id, side, code, name, qty, planned_price, filled_price,
+                       amount, fees, status, reason, risk_payload, created_at, executed_at,
+                       order_type, origin, strategy_id, strategy_version, strategy_checksum
+                   ) VALUES (?, 'buy', ?, '测试', 100, 10.0, 10.0, 1000.0, 5.0, 'filled', 'old',
+                             '{}', '2026-08-01 09:30:00', '2026-08-01 09:30:00', 'market', 'seed', ?, ?, ?)""",
+                (paused_account, self.code, *stamp_p),
+            )
+            conn.execute(
+                """INSERT INTO paper_fills(order_id, account_id, side, code, qty, price, amount, fees, fill_date, quote_at, assumption)
+                   VALUES (?, ?, 'buy', ?, 100, 10.0, 1000.0, 5.0, '2026-08-01', '2026-08-01 09:30:00', 'old')""",
+                (cur_p.lastrowid, paused_account, self.code),
+            )
+
+            cur_a = conn.execute(
+                """INSERT INTO paper_orders(
+                       account_id, side, code, name, qty, planned_price, filled_price,
+                       amount, fees, status, reason, risk_payload, created_at, executed_at,
+                       order_type, origin, strategy_id, strategy_version, strategy_checksum
+                   ) VALUES (?, 'buy', ?, '测试', 100, 10.0, 10.0, 1000.0, 5.0, 'filled', 'old',
+                             '{}', '2026-08-01 09:30:00', '2026-08-01 09:30:00', 'market', 'seed', ?, ?, ?)""",
+                (archived_account, self.code, *stamp_a),
+            )
+            conn.execute(
+                """INSERT INTO paper_fills(order_id, account_id, side, code, qty, price, amount, fees, fill_date, quote_at, assumption)
+                   VALUES (?, ?, 'buy', ?, 100, 10.0, 1000.0, 5.0, '2026-08-01', '2026-08-01 09:30:00', 'old')""",
+                (cur_a.lastrowid, archived_account, self.code),
+            )
+
+            # Update statuses: one paused, one archived and out of cycle
+            conn.execute("UPDATE paper_accounts SET status='paused' WHERE id=?", (paused_account,))
+            conn.execute("UPDATE paper_accounts SET status='archived', cycle_id=NULL WHERE id=?", (archived_account,))
+            conn.execute("DELETE FROM paper_position_lots WHERE account_id IN (?, ?)", (paused_account, archived_account))
             PT._sync_positions(conn, asof_day=self.day)
 
-            # Invariant: 0 holdings + paused -> NOT eligible
+            # Invariant: 0 holdings + paused/archived -> strictly NOT eligible for risk exit
             risk_ids = PT._risk_exit_account_ids(conn)
-            self.assertNotIn(account_id, risk_ids)
+            self.assertNotIn(paused_account, risk_ids)
+            self.assertNotIn(archived_account, risk_ids)
 
         self._set_fresh_exit_quote(self.code, price=9.0, pct=-8.0)
         res = PT.monitor_risk(self.day)
-        self.assertEqual(len(res.get("orders", [])), 0)
+        emitted_accounts = {o.get("account_id") for o in res.get("orders", [])}
+        self.assertNotIn(paused_account, emitted_accounts)
+        self.assertNotIn(archived_account, emitted_accounts)
 
         with PT._db() as conn:
-            orders = conn.execute("SELECT * FROM paper_orders WHERE account_id=?", (account_id,)).fetchall()
+            orders = conn.execute(
+                "SELECT * FROM paper_orders WHERE account_id IN (?, ?) AND side='sell'",
+                (paused_account, archived_account),
+            ).fetchall()
             self.assertEqual(len(orders), 0)
 
     # -------------------------------------------------------------------------
@@ -522,6 +609,55 @@ class TestPaperRiskExitProductionPath(PaperRiskExitProductionPathTestCase):
             # 6. paper_capital_reservations: zero change
             self.assertEqual(reservations_after, reservations_before)
 
+            # 7. Relational integrity: every fill joins to an existing order
+            orphan_fills = conn.execute(
+                """SELECT f.id FROM paper_fills f
+                   LEFT JOIN paper_orders o ON o.id = f.order_id
+                   WHERE o.id IS NULL"""
+            ).fetchall()
+            self.assertEqual(len(orphan_fills), 0, "No orphan fill without corresponding paper_orders entry")
+
+            # 8. All seed BUY fills join to seed BUY orders
+            seed_buy_joins = conn.execute(
+                """SELECT f.id, f.order_id, o.side as order_side, o.status as order_status
+                   FROM paper_fills f
+                   JOIN paper_orders o ON o.id = f.order_id
+                   WHERE f.side = 'buy'"""
+            ).fetchall()
+            self.assertGreaterEqual(len(seed_buy_joins), 1)
+            for r in seed_buy_joins:
+                self.assertEqual(r["order_side"], "buy", "Seed BUY fill must join to BUY order")
+                self.assertEqual(r["order_status"], "filled", "Seed BUY order must be terminal filled")
+
+            # 9. All risk-exit SELL fills join to SELL orders
+            risk_sell_joins = conn.execute(
+                """SELECT f.id, f.order_id, o.side as order_side, o.status as order_status
+                   FROM paper_fills f
+                   JOIN paper_orders o ON o.id = f.order_id
+                   WHERE f.side = 'sell'"""
+            ).fetchall()
+            self.assertEqual(len(risk_sell_joins), 1)
+            self.assertEqual(risk_sell_joins[0]["order_side"], "sell", "Risk-exit SELL fill must join to SELL order")
+            self.assertEqual(risk_sell_joins[0]["order_status"], "filled")
+
+            # 10. Invariant: no fill may join to an opposite-side order
+            opposite_side_fills = conn.execute(
+                """SELECT f.id, f.side as f_side, o.side as o_side
+                   FROM paper_fills f
+                   JOIN paper_orders o ON o.id = f.order_id
+                   WHERE (f.side = 'buy' AND o.side = 'sell') OR (f.side = 'sell' AND o.side = 'buy')"""
+            ).fetchall()
+            self.assertEqual(len(opposite_side_fills), 0, "No fill may be linked to an opposite-side order")
+
+            # 11. Strict match on account_id, code, and side
+            mismatches = conn.execute(
+                """SELECT f.id, f.side as f_side, o.side as o_side, f.account_id as f_acct, o.account_id as o_acct, f.code as f_code, o.code as o_code
+                   FROM paper_fills f
+                   JOIN paper_orders o ON o.id = f.order_id
+                   WHERE f.side != o.side OR f.account_id != o.account_id OR f.code != o.code"""
+            ).fetchall()
+            self.assertEqual(len(mismatches), 0, "Fills must strictly match joined orders on side, account_id, and code")
+
     # -------------------------------------------------------------------------
     # Scenario N: 容错与异常回滚（中途抛异常不得污染持仓 lot）
     # -------------------------------------------------------------------------
@@ -529,6 +665,9 @@ class TestPaperRiskExitProductionPath(PaperRiskExitProductionPathTestCase):
         account_id = "tq_breakout"
         lot_id = self._insert_lot(account_id, self.code, 1000, 10.0)
         self._set_fresh_exit_quote(self.code, price=9.0, pct=-8.0)
+
+        with PT._db() as conn:
+            init_cash = conn.execute("SELECT cash FROM paper_accounts WHERE id=?", (account_id,)).fetchone()[0]
 
         # Inject failure during cash credit inside the savepoint
         orig_credit = PT._credit_shared_cash
@@ -552,6 +691,10 @@ class TestPaperRiskExitProductionPath(PaperRiskExitProductionPathTestCase):
                 self.assertEqual(filled_orders, 0)
                 fills = conn.execute("SELECT COUNT(*) FROM paper_fills WHERE side='sell'").fetchone()[0]
                 self.assertEqual(fills, 0)
+
+                # Cash must remain exactly unchanged
+                post_cash = conn.execute("SELECT cash FROM paper_accounts WHERE id=?", (account_id,)).fetchone()[0]
+                self.assertAlmostEqual(post_cash, init_cash, places=4, msg="Cash must not be modified on execution rollback")
         finally:
             PT._credit_shared_cash = orig_credit
 
