@@ -37,6 +37,7 @@ import paper_archive_projection as PAP
 import paper_quote_policy as PQP
 import paper_allocation as PA
 import paper_cycle_service as PCS
+import paper_account_specs as ACS
 import paper_decision_audit as PDA
 import adaptive_selection_compat as ASC
 # ELC / EPD 仍被非 cleanup 路径使用（signal freshness、entry slice plan、
@@ -121,9 +122,11 @@ _NEWS_SCAN_META = {"observed_at": None, "stale": False, "error": None}
 RISK_VERSION = "paper-risk-v4"
 # PR-37：内置策略标识的唯一声明源已移至 strategy_policies（声明式画像模块）。
 NEW_STRATEGY_ID = SPOL.NEW_STRATEGY_ID
-NEW_STRATEGY_VERSION = "reported-profit-breakout-v1"
 MAIN_FORCE_STRATEGY_ID = SPOL.MAIN_FORCE_STRATEGY_ID
-MAIN_FORCE_STRATEGY_VERSION = "main-force-top10-v1"
+# 账户声明层（内置 spec / 风格 / 风险画像 / 保守回退）已迁至
+# ``paper_account_specs``；本模块只保留兼容别名与唯一解析口 ``_spec_for``。
+NEW_STRATEGY_VERSION = ACS.NEW_STRATEGY_VERSION
+MAIN_FORCE_STRATEGY_VERSION = ACS.MAIN_FORCE_STRATEGY_VERSION
 LOT_SIZE = 100
 # 集中化配对约束：席位稀缺时，低于当前周期单席可表达金额的新开仓是
 # "尘埃仓"。阈值按周期声明本金、共享池硬敞口和股票持仓上限动态计算，
@@ -471,53 +474,11 @@ NEW_LISTING_POLICIES = {
     },
 }
 
-STYLE_PROFILES = {
-    "strong": {"name": "强势接力", "source_strategy": "one_to_two"},
-    "pullback": {"name": "趋势回踩", "source_strategy": "bottom_reversal"},
-    "sector": {"name": "板块轮动", "source_strategy": "sentiment_pioneer"},
-    "quality": {"name": "三日策略", "source_strategy": NEW_STRATEGY_ID},
-    "main_force": {"name": "超强主力股", "source_strategy": MAIN_FORCE_STRATEGY_ID},
-}
+# 风格声明的唯一真相在 ``paper_account_specs``；此处只保留兼容别名。
+STYLE_PROFILES = ACS.STYLE_PROFILES
 
-RISK_PROFILES = {
-    # 2026-08-24 集中化改造：总硬上限 15（动态分配），单笔风险预算
-    # 提升至 ~1.2% NAV，使 risk 约束给出的单仓 ≈ ¥16-22K，与 weight 上限
-    # 大致同量级。资金利用率目标从 ~35% 提升到 ~75%。
-    # 单账户最坏并发止损 = 3 × 1.2% = 3.6% NAV，daily_loss/drawdown 同步
-    # 放宽以避免集中仓位在普通波动日频繁触发冷却。
-    "breakout": {
-        "name": "接力快进快出", "max_weight": 0.32, "max_exposure": 0.95,
-        "max_industry": 0.42, "single_risk": 0.012,
-        "daily_loss": 0.035, "drawdown": 0.11,
-        "cooldown_days": 2, "min_cost_edge": 0.006,
-    },
-    "trend": {
-        "name": "趋势集中持有", "max_weight": 0.34, "max_exposure": 0.95,
-        "max_industry": 0.45, "single_risk": 0.012,
-        "daily_loss": 0.040, "drawdown": 0.13,
-        "cooldown_days": 3, "min_cost_edge": 0.004,
-    },
-    "sector": {
-        "name": "热点轮动集中", "max_weight": 0.32, "max_exposure": 0.92,
-        # 热点轮动允许集中，但不能把“板块强势”误当成可无限叠加同业的理由。
-        # 42% 仍保留核心主题表达，同时给后续轮动留出缓冲。
-        "max_industry": 0.42, "single_risk": 0.012,
-        "daily_loss": 0.040, "drawdown": 0.12,
-        "cooldown_days": 2, "min_cost_edge": 0.005,
-    },
-    "core_quality": {
-        "name": "三日策略独立风控", "max_weight": 0.32, "max_exposure": 0.90,
-        "max_industry": 0.38, "single_risk": 0.012,
-        "daily_loss": 0.035, "drawdown": 0.11,
-        "cooldown_days": 3, "min_cost_edge": 0.005,
-    },
-    "main_force": {
-        "name": "主力持续性独立风控", "max_weight": 0.34, "max_exposure": 0.95,
-        "max_industry": 0.45, "single_risk": 0.012,
-        "daily_loss": 0.040, "drawdown": 0.12,
-        "cooldown_days": 2, "min_cost_edge": 0.005,
-    },
-}
+# 风险画像声明的唯一真相在 ``paper_account_specs``；此处只保留兼容别名。
+RISK_PROFILES = ACS.RISK_PROFILES
 
 # Defense-in-depth bounds for versioned risk overlays produced by the adaptive
 # subsystem.  The execution engine clamps every value again even when the
@@ -540,135 +501,9 @@ ADAPTIVE_RISK_BOUNDS = {
     "downside_partial_ratio": (0.20, 0.50),
 }
 
-ACCOUNT_SPECS = {
-    "tq_breakout": {
-        "name": "短线日内做T",
-        "mode": "intraday_t",
-        "source_strategy": "one_to_two",
-        "risk_profile": "breakout",
-        "entry_model_name": "强势日内候选实时确认",
-        # 盘中使用上一交易日完整收盘因子；0 会把正常隔夜数据误判为过期。
-        "max_factor_lag": 1,
-        "allowed_q": ("Q1", "Q2"),
-        "default_style": "strong",
-        "cycle_days": 5,
-        "hold_min": 1,
-        "hold_max": 8,
-        # 高换手也不能靠几十只一手仓分散风险；只保留最强的少数标的。
-        # 2026-08-24 集中化：3 席 × ~30% 权重，替代 5 席 × 15%。
-        "max_positions": 3,
-        "max_weight": 0.32,
-        "max_exposure": 0.95,
-        "hard_stop": -0.05,
-        "trail_after": 0.04,
-        "trail_stop": 0.05,
-        "take_profit": [(0.08, 0.50)],
-        "min_t_score": 0.76,
-        "gap_q1": (-0.015, 0.035),
-        # 盘中追高上限：现价较今日开盘的溢价上限。做T策略允许动量，
-        # 但 5% 以上的日内拉升不再追。
-        "max_open_runup_pct": 0.05,
-        # 5% 以上不是当然不可交易：仅在盘中确认强势时允许小仓试错，
-        # 但仍不模拟涨停板排队成交。
-        "gap_q2": (-0.03, 0.07),
-    },
-    "trend_pullback": {
-        "name": "趋势波段优选",
-        "mode": "swing",
-        "source_strategy": "bottom_reversal",
-        "risk_profile": "trend",
-        "entry_model_name": "趋势回踩结构确认",
-        "max_factor_lag": 2,
-        "allowed_q": ("Q1", "Q2", "Q3"),
-        "default_style": "pullback",
-        "cycle_days": 10,
-        "hold_min": 3,
-        "hold_max": 10,
-        # 波段策略以结构质量为主；集中化后 3 席保证单票有意义的仓位。
-        "max_positions": 3,
-        "max_weight": 0.34,
-        "max_exposure": 0.95,
-        "hard_stop": -0.04,
-        "trail_after": 0.05,
-        "trail_stop": 0.06,
-        "take_profit": [(0.07, 1 / 3), (0.12, 1 / 3)],
-        "min_t_score": 0.72,
-        "gap_q1": (-0.015, 0.025),
-        # 回踩策略只在开盘价附近/回踩位入场，严禁追日内拉升。
-        "max_open_runup_pct": 0.015,
-        "gap_q2": (-0.025, 0.04),
-    },
-    "sector_rotation": {
-        "name": "板块轮动先锋",
-        "mode": "swing",
-        "source_strategy": "sentiment_pioneer",
-        "risk_profile": "sector",
-        "entry_model_name": "热点板块相对强度",
-        "max_factor_lag": 1,
-        "allowed_q": ("Q1", "Q2"),
-        "default_style": "sector",
-        "cycle_days": 5,
-        "hold_min": 2,
-        "hold_max": 7,
-        # 板块轮动保留跨板块比较空间，但不再铺成大量试探仓。
-        "max_positions": 3,
-        "max_weight": 0.32,
-        "max_exposure": 0.92,
-        "hard_stop": -0.045,
-        "trail_after": 0.045,
-        "trail_stop": 0.055,
-        "take_profit": [(0.06, 1 / 3), (0.10, 1 / 3)],
-        "min_t_score": 0.74,
-        "gap_q1": (-0.015, 0.03),
-        # Hot-lane candidates are discovered from live sector/concept flow;
-        # allow a little more room to enter before the move is considered
-        # exhausted, while the separate position scale keeps risk bounded.
-        "max_open_runup_pct": 0.04,
-        "gap_q2": (-0.025, 0.06),
-    },
-    NEW_STRATEGY_ID: {
-        "name": "三日策略",
-        "mode": "swing",
-        "source_strategy": NEW_STRATEGY_ID,
-        "risk_profile": "core_quality",
-        "strategy_version": NEW_STRATEGY_VERSION,
-        "entry_model_name": "已披露财报质量与突破确认",
-        "max_factor_lag": 2,
-        "allowed_q": ("Q1", "Q2"),
-        "default_style": "quality",
-        "cycle_days": 12,
-        "hold_min": 2,
-        "hold_max": 12,
-        "max_positions": 3,
-        "max_weight": 0.32,
-        "max_exposure": 0.90,
-        "hard_stop": -0.055,
-        "trail_after": 0.045,
-        "trail_stop": 0.060,
-        "take_profit": [(0.085, 0.40), (0.15, 0.35)],
-        "min_t_score": 0.74,
-        "gap_q1": (-0.02, 0.03),
-        "max_open_runup_pct": 0.02,
-        "gap_q2": (-0.03, 0.055),
-        "entry_pct_high": 6.5,
-    },
-    MAIN_FORCE_STRATEGY_ID: {
-        "name": "超强主力股", "mode": "swing",
-        "source_strategy": MAIN_FORCE_STRATEGY_ID, "risk_profile": "main_force",
-        "strategy_version": MAIN_FORCE_STRATEGY_VERSION,
-        "entry_model_name": "主力持续性与微观成交确认",
-        "max_factor_lag": 1, "allowed_q": ("Q1", "Q2"),
-        "default_style": "main_force", "cycle_days": 8,
-        "hold_min": 1, "hold_max": 8, "max_positions": 3,
-        "max_weight": 0.34, "max_exposure": 0.95,
-        "hard_stop": -0.05, "trail_after": 0.05, "trail_stop": 0.06,
-        "take_profit": [(0.10, 1 / 3), (0.16, 1 / 3)],
-        "min_t_score": 0.76, "gap_q1": (-0.015, 0.04),
-        "max_open_runup_pct": 0.035, "gap_q2": (-0.025, 0.07),
-        "entry_pct_high": 8.8, "daily_candidate_limit": 10,
-        "ignition_zone": (3.5, 7.5), "first_tranche_cap_pct": 0.12,
-    },
-}
+# 内置账户声明 spec 的唯一真相在 ``paper_account_specs``；此处只保留兼容别名，
+# 生产路径通过 ``_spec_for`` 读取独立副本。
+ACCOUNT_SPECS = ACS.ACCOUNT_SPECS
 
 # The registry is the single source of truth for what a new public cycle may
 # run. All five registered specs receive fresh cycle capital, signals, and
@@ -809,16 +644,9 @@ def current_cycle_participant_ids(conn, cycle_id=None):
 
 # 用户策略声明式 spec 解析（PR-35）。无 conn 时按需开只读连接；底层
 # SRT.get_context 自带缓存，无需在此重复缓存。
-_UNKNOWN_USER_SPEC = {
-    "name": "未知策略账户", "source_strategy": "strategy_dsl", "selection_mode": "dsl",
-    "mode": "swing", "cycle_days": 8, "max_positions": 1, "max_weight": 0.10,
-    "max_exposure": 0.35, "risk_profile": "trend", "strategy_version": "v0",
-    "default_style": "pullback", "entry_model_name": "未知策略账户",
-    "max_factor_lag": 1, "entry_pct_high": 6.5, "gap_q2": (-0.025, 0.07),
-    "hold_min": 1, "hold_max": 8, "hard_stop": -0.05, "trail_after": 0.05,
-    "trail_stop": 0.06, "take_profit": [(0.10, 1 / 3), (0.16, 1 / 3)],
-    "candidate_topn": 10, "lifecycle_stage": "quarantined",
-}
+# 保守回退声明（真相在 ``paper_account_specs``）；唯一解析口 ``_spec_for``
+# 通过 ``ACS.fallback_spec()`` 取独立副本。
+_UNKNOWN_USER_SPEC = ACS.UNKNOWN_USER_SPEC
 
 
 def spec_selection_mode(account_id, conn=None):
@@ -833,13 +661,18 @@ def _user_runtime_context(account_id):
 
 
 def _spec_for(account_id, conn=None):
-    """内置账户取 ACCOUNT_SPECS；用户策略账户按注册表运行时上下文派生。
+    """账户 spec 的唯一解析口：声明层 → 注册表运行时派生 → 保守回退。
 
-    这是固定五套表走向声明化（PR-37）的唯一解析口：所有此前直接索引
+    - 内置账户：声明真相在 ``paper_account_specs``，这里返回**独立副本**，
+      调用方对返回值的改动不会污染声明层；
+    - 用户策略账户：按注册表运行时上下文派生（注册表真相不在声明层）；
+    - 未知/不可解析：保守回退声明，绝不 KeyError，也绝不静默映射到内置身份。
+
+    这是固定五套表走向声明化（PR-37）后仍保留的唯一解析口：所有此前直接索引
     ``ACCOUNT_SPECS[account_id]`` 的生产路径都改走这里，用户策略从此
     不再 KeyError，也不再被排除在风控/评估/退出状态机之外。
     """
-    spec = ACCOUNT_SPECS.get(account_id)
+    spec = ACS.builtin_spec(account_id)
     if spec is not None:
         return spec
     try:
@@ -848,7 +681,7 @@ def _spec_for(account_id, conn=None):
             else _user_runtime_context(account_id)
         )
     except (ValueError, sqlite3.Error):
-        return dict(_UNKNOWN_USER_SPEC)
+        return ACS.fallback_spec()
     return USP.user_spec_for(context, risk_profiles=RISK_PROFILES)
 
 
@@ -2494,7 +2327,7 @@ def _ensure_cycle(conn):
                 (_now(), account_id),
             )
             continue
-        style = current["style"] if current["style"] in STYLE_PROFILES else spec["default_style"]
+        style = current["style"] if ACS.has_style(current["style"]) else spec["default_style"]
         # 旧版数据库新增列的默认值为 pullback；给日内模型纠正为强势风格，且不影响已有成交。
         if account_id == "tq_breakout" and style == "pullback":
             has_fills = conn.execute("SELECT 1 FROM paper_fills WHERE account_id=? LIMIT 1", (account_id,)).fetchone()
@@ -5486,7 +5319,7 @@ def _candidate_rows(account, asof_date, market, sector_rows=None, live_universe=
     factor_date = str(price_f["last_date"].dropna().max())
     factor_oldest_date = str(price_f["last_date"].dropna().min())
     style = (account.get("style") if isinstance(account, dict) else None) or spec["default_style"]
-    profile = STYLE_PROFILES.get(style, STYLE_PROFILES[spec["default_style"]])
+    profile = ACS.style_profile(style, default_style=spec["default_style"])
     # These metadata objects are populated only by the sector strategy, but
     # the common return payload is shared by all four strategies.  Always
     # initialise them so a non-sector scan cannot abort after completing the
@@ -7610,8 +7443,8 @@ def _runtime_parameter_active(effective_date=None, asof_day=None, status=None):
 
 def _risk_profile(account, asof_day=None, conn=None):
     account_id = account.get("id")
-    default_key = (ACCOUNT_SPECS.get(account_id) or {}).get("risk_profile", "trend")
-    profile = dict(RISK_PROFILES.get(account.get("risk_profile"), RISK_PROFILES[default_key]))
+    default_key = ACS.default_risk_profile_key(account_id)
+    profile = dict(ACS.risk_profile(account.get("risk_profile"), default_key=default_key))
     # Expose the shared staged downside guard through the same active risk
     # profile used by sizing/entry.  Without an overlay the three strategy
     # defaults remain exactly those defined by the execution policy.
@@ -14072,7 +13905,7 @@ def _weekly_review(conn, day):
                 f"- 最新净值：{latest_nav:.2f} 元，累计收益：{ret*100:+.2f}%\n"
                 f"- 最大回撤：{max_dd*100:.2f}%\n"
                 f"- 模拟成交：{len(fills)} 笔；已平仓：{len(closed)} 笔；风控拦截/未成交：{rejected} 笔\n"
-                f"- 风格：{STYLE_PROFILES.get(account.get('style'), {}).get('name', account.get('style'))}\n"
+                f"- 风格：{ACS.style_name(account.get('style'), account.get('style'))}\n"
                 f"- 参数版本：{account['version']}（自动微调当日生效，安全边界不可放宽）\n\n"
                 f"## 下周期建议\n" + "\n".join(f"- {x}" for x in advice) + "\n\n"
                 "模拟成交采用快照与滑点假设，不代表实际可成交价格；本报告不构成投资建议。\n")
@@ -14829,7 +14662,7 @@ def _account_metrics(conn, account, quotes=None, positions=None, metric_cache=No
     return {
         "id": account["id"], "name": account["name"], "status": account["status"], "cycle_days": account["cycle_days"],
         "mode": account.get("mode"), "style": account.get("style"),
-        "style_name": STYLE_PROFILES.get(account.get("style"), {}).get("name", account.get("style")),
+        "style_name": ACS.style_name(account.get("style"), account.get("style")),
         "risk_profile": account.get("risk_profile"),
         "risk_profile_name": profile.get("name", account.get("risk_profile")),
         "entry_model_name": spec["entry_model_name"],
@@ -15808,7 +15641,7 @@ def _create_cycle(conn, capital, status="paused", reason="新建模拟周期", d
         max_positions = int(override.get("max_positions", spec["max_positions"]))
         max_weight = float(override.get("max_weight_pct", spec["max_weight"] * 100)) / 100.0
         max_exposure = float(override.get("max_exposure_pct", spec["max_exposure"] * 100)) / 100.0
-        style = override.get("style") if override.get("style") in STYLE_PROFILES else spec["default_style"]
+        style = override.get("style") if ACS.has_style(override.get("style")) else spec["default_style"]
         conn.execute(
             """UPDATE paper_accounts SET name=?,source_strategy=?,status=?,initial_cash=?,cash=?,cycle_days=?,
                max_positions=?,max_weight=?,max_exposure=?,version=?,benchmark_start=?,cycle_id=?,mode=?,style=?,
@@ -15909,7 +15742,7 @@ def reset_cycle(capital=None, include_dashboard=True):
 def set_account_style(account_id, style):
     if account_id not in ACCOUNT_SPECS:
         raise ValueError("未知策略账户")
-    if style not in STYLE_PROFILES:
+    if not ACS.has_style(style):
         raise ValueError("风格必须是 strong、pullback、sector、quality 或 main_force")
     init_db()
     with _db() as conn:
@@ -15917,7 +15750,7 @@ def set_account_style(account_id, style):
         if cycle["status"] == "running":
             raise ValueError("当前周期运行中，暂停后才能调整策略风格")
         conn.execute("UPDATE paper_accounts SET style=?,updated_at=? WHERE id=?", (style, _now(), account_id))
-        _audit(conn, account_id, "style_changed", f"后续候选风格切换为 {STYLE_PROFILES[style]['name']}；已有持仓不强平")
+        _audit(conn, account_id, "style_changed", f"后续候选风格切换为 {ACS.style_name(style)}；已有持仓不强平")
     return dashboard()
 
 

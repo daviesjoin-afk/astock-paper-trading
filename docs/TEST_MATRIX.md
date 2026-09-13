@@ -138,6 +138,21 @@
 | 审计模块无副作用（不 import `paper_trading`；顶层依赖仅 stdlib + pandas；无 DB 写、无网络 I/O） | `paper_decision_audit` | `test_paper_decision_audit_facade.py`（`DecisionAuditArchitectureGuardTests`） | ✅ |
 | 负向变异验证（N1–N18 必须让守卫变红：N1 冻结时钟、N2 冻结 news scan meta、N3 丢掉 kline loader 注入、N4 硬编码 risk version、N5 丢掉 `_with_decision_snapshot` 的 loader 注入、N6 改名复制回一套 serializer、N7 审计模块 import `paper_trading`、N8 审计模块做 DB IO、N9 审计模块调用写侧方法、N10 K 线窗口 120→121、N11 关掉 future row 排除、N12 NaN 字符串化、N13 不再拒绝非法 replay 日期、N14 就地改写调用方 payload、N15 删掉 `strategy_id` 补全、N16 存储根数差一、N17 忽略显式 `decision_at`、N18 把 serializer 复制到无关生产模块（`decision_context.py`），触发全仓 `test_serializer_contract_keys_live_only_in_the_audit_module` 守卫 ⇒ 合计 18/18） | `test_paper_decision_audit_facade.DecisionAuditArchitectureGuardTests.test_serializer_contract_keys_live_only_in_the_audit_module` | 手工执行 N1–N18 变异脚本（源码级变异逐字节备份 + `finally` 还原 + sha256 校验；见 PR #126 描述） | ✅ |
 
+## 纸盘账户声明边界（Extract Paper Account Specs Boundary）
+
+| 场景 | 实现位置 | 回归用例 | 状态 |
+| --- | --- | --- | --- |
+| 声明内容逐字段冻结（五套内置 spec / 风格 / 风险画像 / 保守回退与抽取前一致；golden 为独立字面量，不由生产表反推） | `paper_account_specs.ACCOUNT_SPECS`、`STYLE_PROFILES`、`RISK_PROFILES`、`UNKNOWN_USER_SPEC` | `test_paper_account_specs.py`（`BuiltinSpecContractTests`、`StyleAndRiskProfileContractTests`） | ✅ |
+| 声明键序是契约（内置 id 顺序即分配层 `account_order` 与仪表盘行序，不得重排） | `paper_account_specs.ACCOUNT_SPECS`、`builtin_account_ids` | `test_paper_account_specs.py`（`BuiltinSpecContractTests.test_declaration_order_is_frozen`） | ✅ |
+| 唯一解析口（内置 → 声明层；用户策略 → 注册表 RuntimeContext 派生；未知 → 保守回退，绝不 KeyError、绝不静默映射到内置身份） | `paper_trading._spec_for`、`paper_account_specs.builtin_spec` / `fallback_spec` | `test_paper_account_specs.py`（`SpecResolutionContractTests`、`UserStrategyResolutionTests`）、`test_strategy_spec_resolution.py` | ✅ |
+| 口径分离（`ACTIVE_ACCOUNT_IDS`/`ACTIVE_ACCOUNT_SPECS` 是注册表 active ∩ 声明键的**投影**，定义点留在权威层；声明模块不持有生命周期 / 版本 / 周期所有权 / 执行资格真相） | `paper_trading.ACTIVE_ACCOUNT_IDS`、`ACTIVE_ACCOUNT_SPECS` | `test_paper_account_specs.py`（`RegistryAgreementTests`） | ✅ |
+| 归档 / 回放可解析性（历史账本解码不依赖注册表当前生命周期；孤儿账户兜底不崩仪表盘） | `paper_account_specs.ACCOUNT_SPECS`、`paper_trading._spec_for` | `test_paper_account_specs.py`（`ArchiveReplayResolvabilityTests`）、`test_strategy_archive_replay.py` | ✅ |
+| 可变隔离（所有查询访问器返回独立副本，含嵌套列表；调用方改动不污染声明真相） | `paper_account_specs.builtin_spec` / `fallback_spec` / `style_profile` / `risk_profile` | `test_paper_account_specs.py`（`MutableIsolationTests`） | ✅ |
+| 兼容 facade 只允许别名 / 委托（三个表 + 回退 + 两个版本常量是同一对象或同值别名；`_spec_for` 体内必须出现声明层委托且不得内联第二套解析） | `paper_trading.ACCOUNT_SPECS`、`STYLE_PROFILES`、`RISK_PROFILES`、`_UNKNOWN_USER_SPEC`、`NEW_STRATEGY_VERSION`、`MAIN_FORCE_STRATEGY_VERSION`、`_spec_for` | `test_paper_account_specs.py`（`CompatibilityFacadeTests`） | ✅ |
+| 架构守卫（声明模块不 import `paper_trading` / 注册表 / 运行时 / 账本 / 网络 / 调度 / 执行；import 根白名单；无 DB·网络·订单副作用调用；无 import 期调用即无副作用） | `paper_account_specs` | `test_paper_account_specs.py`（`SpecsArchitectureGuardTests`） | ✅ |
+| 单一实现守卫（AST 按"账户 spec 表形状"全仓扫描：声明模块**有且只有**一张，其他生产模块不得出现第二张；先证检测器非空性再证别处为空） | `paper_account_specs.ACCOUNT_SPECS` | `test_paper_account_specs.py`（`SpecsArchitectureGuardTests.test_detector_finds_the_real_table_in_the_specs_module`、`test_account_spec_table_lives_only_in_the_specs_module`、`test_paper_trading_holds_no_duplicated_spec_values`） | ✅ |
+| 负向变异验证（N1–N10 必须让守卫变红：N1 改内置 `max_positions`、N2 改内置风险画像键、N3 内置查找退化为 `ACCOUNT_SPECS[id]` 直接下标、N4 把完整声明表回抄进 `paper_trading`、N5 声明模块反向 import `paper_trading`、N6 在声明模块 import 期冻结注册表 active 集合、N7 让归档/非 active 策略不可解析、N8 未知账户静默映射到内置身份、N9 查询返回模块级可变 dict、N10 引入 DB 写 / 网络副作用 ⇒ 合计 10/10） | — | 手工执行 N1–N10 变异脚本（源码级变异逐字节备份 + `finally` 还原 + `git hash-object` 校验；见 PR 描述） | ✅ |
+
 ## 维护约定
 
 1. 新增门禁必须先在本表加一行，再写测试；表格状态从 ⚠️ → ✅。
