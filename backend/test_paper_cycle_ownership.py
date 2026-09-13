@@ -782,11 +782,13 @@ class OwnershipArchitectureGuardTests(unittest.TestCase):
         """风控退出 = 执行参与者 ∪ 仍有剩余 lots 的账户；不得并入所有权模块。"""
         tree = _parse(PAPER_PATH)
         func = _find_function(tree, "_risk_exit_account_ids")
-        self.assertIsNotNone(func, "_risk_exit_account_ids 必须留在 paper_trading")
+        self.assertIsNotNone(func, "_risk_exit_account_ids facade 必须留在 paper_trading")
         body = ast.unparse(func)
-        self.assertIn("paper_position_lots", body)
-        self.assertIn("remaining_qty", body)
+        self.assertIn("risk_exit_account_ids", body)
         self.assertIsNone(_find_function(_parse(OWNERSHIP_PATH), "_risk_exit_account_ids"))
+        ownership_src = OWNERSHIP_PATH.read_text(encoding="utf-8")
+        self.assertNotIn("paper_position_lots", ownership_src)
+        self.assertNotIn("remaining_qty", ownership_src)
 
     def test_registry_active_scope_stays_in_the_authoritative_layer(self):
         tree = _parse(PAPER_PATH)
