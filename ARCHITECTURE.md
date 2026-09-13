@@ -273,6 +273,14 @@ PR-49 把这条口径的实现收敛到只读解析器 `backend/paper_cycle_owne
 11. 用户策略账户 provisioning 的实现只有一份（`backend/paper_user_account_provisioning.py`）。它只接收调用方已解析的参与者 ID，只 INSERT 缺失的 `paper_accounts` 账本身份并审计成功创建；已有行完全跳过，且不 commit/rollback。`paper_trading` 只保留 `_ensure_user_strategy_accounts(conn)` 兼容 facade，并在每次调用时注入当前参与资格、`_spec_for`、`_now`、`_audit`。该边界只创建账本身份，不代表经济所有权，不分配资本、不挂接周期、不改变执行资格；依赖方向单向：`paper_trading` → `paper_user_account_provisioning`，反向禁止。
 12. 用户策略周期挂接的实现只有一份（`backend/paper_user_cycle_attachment.py`）。它只接收调用方已经解析好的 `user_account_ids`、`enabled_ids` 与当前周期，按既有 contract 幂等写 `paper_accounts`、attach 后重置 `paper_nav` 并写 `paper_parameter_versions`/成功 audit；不选择周期、不解析 registry/lifecycle/enabled、不抢绑其他周期，detach 不删除历史 NAV/参数证据且不写 detach audit。事务仍由 `_ensure_cycle` 外层拥有，任何 callback/SQL/audit 异常原样传播；依赖方向单向：`paper_trading` → `paper_user_cycle_attachment`，反向禁止。
 13. 风控退出资格 read model 的实现只有一份（`backend/paper_risk_exit_eligibility.py`）：纯 stdlib、只读查询 `paper_position_lots`，零写 SQL、无事务控制、不导入 `paper_trading`；不决定周期所有权，不解释 `enabled_strategies`，不修改账户或持仓。`paper_trading.py` 保留 `_risk_exit_account_ids(conn, status="running")` 兼容 facade，在调用时解析权威活跃账户作用域并委托给只读模块；模块直接从连接读取持仓证据且兼容 `sqlite3.Row` 与裸元组行（`row_factory=None`）；依赖方向单向：`paper_trading` → `paper_risk_exit_eligibility`，反向禁止。特别冻结：风控退出资格 = 执行资格 ∪ 存量持仓账户，绝不收窄为执行参与者，确保 paused/archived/退出周期的存量持仓始终受风控扫描保护。
+14. 风控退出生产链路加固（`backend/test_paper_risk_exit_production_path.py`）：
+    风控退出资格与执行资格严格分离：执行资格是受限的入场/开仓能力（受 lifecycle pause、active cycle enabled 集合与 capacity 限制）；而风控退出是无条件的平仓/释放能力（存量持仓只要存在，就无条件享有退出路径直至完全平仓）。
+    在生产全链路中：
+    - paused、archived、out-of-cycle 账户只要在 `paper_position_lots` 中仍有 `remaining_qty > 0`，就必须持续被风控扫描并能生成/执行平仓卖单；
+    - 平仓完成后，存量敞口归零，账户自动退出风控扫描资格，后续扫描绝不重复下达卖单；
+    - 风控退出 SELL 委托严格隔离于买入侧容量控制：不占用买入槽位（`pending_position_slots` 仅统计 `side='buy'`），不消耗买入资金预留（`pending_buy_reservations` 仅统计 `side='buy'`），不受 `PAPER_ENTRY_FREEZE` 买入熔断环境变量阻断；
+    - 退出执行过程受 savepoint 事务保护：执行失败/异常立即回滚，不产生脏 lot、订单或虚构资金；成功成交后释放的净回款（`amount - fees`）精确归还账户与共享现金池；所有成交流水（seed buy 与 risk sell）严格归属于对应方向与参数的真实订单，禁止错连或对向孤儿；
+    - 生产调用链由 `test_paper_risk_exit_production_path.py` 覆盖 A–O 场景与调度入口 `run_slot("risk", ...)`，并经由本地突变套件对真实源码变异 N1–N12 检验（12/12 caught, 0 undetected）。
 
 ## 学习/研究数据契约（PR-8）
 
