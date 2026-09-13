@@ -41,6 +41,7 @@ import paper_account_specs as ACS
 import paper_cycle_ownership as PCY
 import paper_shared_cash as PSC
 import paper_user_account_provisioning as PUAP
+import paper_user_cycle_attachment as PUCA
 import paper_decision_audit as PDA
 import adaptive_selection_compat as ASC
 # ELC / EPD 仍被非 cleanup 路径使用（signal freshness、entry slice plan、
@@ -2355,46 +2356,20 @@ def _ensure_cycle(conn):
     for account_row in conn.execute("SELECT id FROM paper_accounts").fetchall():
         if account_row[0] and str(account_row[0]) not in ACCOUNT_SPECS:
             all_user_ids.add(str(account_row[0]))
-    for account_id in sorted(all_user_ids):
-        if account_id in ACTIVE_ACCOUNT_SPECS:
-            continue
-        row = conn.execute("SELECT * FROM paper_accounts WHERE id=?", (account_id,)).fetchone()
-        if row is None:
-            continue
-        user_spec = _spec_for(account_id, conn=conn)
-        if account_id not in enabled_ids and row["cycle_id"] == active["id"]:
-            conn.execute(
-                "UPDATE paper_accounts SET cycle_id=NULL,status='paused',initial_cash=0,cash=0,updated_at=? WHERE id=?",
-                (_now(), account_id),
-            )
-            continue
-        if row["cycle_id"] is None and account_id in enabled_ids:
-            capital = _num(active["capital"], 100000.0)
-            account_capital = (
-                capital / max(len(enabled_ids), 1)
-                if str(active["cycle_key"] or "").startswith("legacy-")
-                else _available_cycle_ledger_capital(conn, active, account_id)
-            )
-            benchmark = _benchmark_close()
-            conn.execute(
-                "UPDATE paper_accounts SET cycle_id=?,mode=?,style=?,status=?,initial_cash=?,cash=?,benchmark_start=?,daily_start_nav=?,daily_nav_date=?,risk_profile=?,version=?,max_positions=?,max_weight=?,max_exposure=?,updated_at=? WHERE id=?",
-                (active["id"], user_spec["mode"], user_spec["default_style"], active["status"],
-                 account_capital, account_capital, benchmark, account_capital, _date().isoformat(),
-                 user_spec["risk_profile"], user_spec["strategy_version"], user_spec["max_positions"],
-                 user_spec["max_weight"], user_spec["max_exposure"], _now(), account_id),
-            )
-            conn.execute("DELETE FROM paper_nav WHERE account_id=?", (account_id,))
-            conn.execute(
-                "INSERT INTO paper_nav(account_id,nav_date,cash,market_value,nav,benchmark,created_at) VALUES(?,?,?,?,?,?,?)",
-                (account_id, _date().isoformat(), account_capital, 0.0, account_capital, benchmark, _now()),
-            )
-            conn.execute(
-                "INSERT INTO paper_parameter_versions(cycle_id,account_id,version,style,params,reason,effective_date,created_at) VALUES(?,?,?,?,?,?,?,?)",
-                (active["id"], account_id, user_spec["strategy_version"], user_spec["default_style"], "{}",
-                 "用户策略接入周期", _date().isoformat(), _now()),
-            )
-            _audit(conn, account_id, "user_strategy_cycle_attached",
-                   f"用户策略 {user_spec['name']} 接入周期（{user_spec['lifecycle_stage']} 档）")
+    PUCA.reconcile_user_cycle_accounts(
+        conn,
+        active,
+        enabled_ids,
+        sorted(all_user_ids),
+        builtin_active_ids=tuple(ACTIVE_ACCOUNT_SPECS),
+        spec_for=lambda account_id: _spec_for(account_id, conn=conn),
+        available_capital_fn=lambda account_id: _available_cycle_ledger_capital(conn, active, account_id),
+        benchmark_fn=_benchmark_close,
+        num_fn=_num,
+        date_fn=_date,
+        now_fn=_now,
+        audit_fn=_audit,
+    )
     SR.bind_cycle_versions(conn, active["id"], enabled_ids)
     _reconcile_shared_cash(conn, active["id"])
 
