@@ -729,10 +729,13 @@ def _risk_exit_account_ids(conn, status="running"):
 
     PR-36：风控退出必须覆盖“仍有持仓但已退出当前周期”的账户。
     基础执行/活跃作用域由现有权威路径在调用时解析（支持 status 过滤与调用时依赖）；
-    再委托给只读模块注入 remaining lots 查询进行并集计算。
+    再委托给只读模块进行并集计算。
     """
     base_ids = _active_account_ids(conn, status=status)
-    return PRE.risk_exit_account_ids(conn, base_account_ids=base_ids, rows_fn=_rows)
+    return PRE.risk_exit_account_ids(
+        conn,
+        base_account_ids=base_ids,
+    )
 
 
 def _accounts_by_id(conn, account_ids):

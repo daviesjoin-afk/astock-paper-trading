@@ -261,6 +261,49 @@ class RiskExitEligibilityFacadeContractTests(unittest.TestCase):
             res = PT._risk_exit_account_ids(self.conn)
             self.assertEqual(res, {"another_exec", "holding_account"})
 
+    # Contract P3-2: facade works directly with bare sqlite connection (row_factory=None)
+    def test_facade_bare_sqlite_connection_compatibility(self):
+        conn = sqlite3.connect(":memory:")
+        self.addCleanup(conn.close)
+        self.assertIsNone(conn.row_factory)
+
+        conn.execute(
+            """CREATE TABLE paper_position_lots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                account_id TEXT,
+                remaining_qty REAL
+            )"""
+        )
+        conn.execute("INSERT INTO paper_position_lots (account_id, remaining_qty) VALUES ('held_pos', 10.0)")
+        conn.execute("INSERT INTO paper_position_lots (account_id, remaining_qty) VALUES ('held_zero', 0.0)")
+        conn.execute("INSERT INTO paper_position_lots (account_id, remaining_qty) VALUES ('held_neg', -5.0)")
+
+        with mock.patch.object(PT, "_active_account_ids", return_value=["base_active"]):
+            res = PT._risk_exit_account_ids(conn)
+
+        self.assertEqual(res, {"base_active", "held_pos"})
+
+    # Contract P3-2: facade works with sqlite3.Row connection
+    def test_facade_sqlite_row_connection_compatibility(self):
+        conn = sqlite3.connect(":memory:")
+        self.addCleanup(conn.close)
+        conn.row_factory = sqlite3.Row
+
+        conn.execute(
+            """CREATE TABLE paper_position_lots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                account_id TEXT,
+                remaining_qty REAL
+            )"""
+        )
+        conn.execute("INSERT INTO paper_position_lots (account_id, remaining_qty) VALUES ('row_held_pos', 25.0)")
+        conn.execute("INSERT INTO paper_position_lots (account_id, remaining_qty) VALUES ('row_held_zero', 0.0)")
+
+        with mock.patch.object(PT, "_active_account_ids", return_value=["row_base_active"]):
+            res = PT._risk_exit_account_ids(conn)
+
+        self.assertEqual(res, {"row_base_active", "row_held_pos"})
+
 
 class RiskExitEligibilityArchitectureGuardTests(unittest.TestCase):
     # Contract L: module is strictly read-only (zero write SQL via authorizer and AST)

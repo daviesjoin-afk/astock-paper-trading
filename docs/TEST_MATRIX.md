@@ -273,5 +273,6 @@
 | 契约 M：新模块纯 stdlib，无反向导入 `paper_trading` | `paper_risk_exit_eligibility` | `RiskExitEligibilityArchitectureGuardTests.test_M_module_stdlib_only_and_no_reverse_import` | ✅ |
 | 契约 N：新模块不重新实现周期所有权或执行参与者逻辑，无跨边界表查询 | `paper_risk_exit_eligibility` | `RiskExitEligibilityArchitectureGuardTests.test_N_module_does_not_reimplement_cycle_or_execution` | ✅ |
 | 契约 P3：保持 exact legacy account ID 语义，不得 strip()、normalize 或 validate 账户 ID；base_account_ids 保留原始对象身份；持仓行 raw truthy value 保留 str(val)（包括带空格字符串） | `paper_risk_exit_eligibility.risk_exit_account_ids` | `test_paper_risk_exit_eligibility.py`（`RiskExitEligibilityContractTests.test_exact_legacy_account_id_semantics`、`test_raw_account_id_extraction_without_normalization`） | ✅ |
-| 真实源码变异 N1–N11 全部被测试捕获（11/11 caught，Undetected: 0） | — | `work/pr_risk_exit_eligibility_negative_check.py`（每轮真实变异、逐字节备份与 sha256 还原核验） | ✅ |
+| 契约 P3-2：保持生产 facade 对裸 SQLite 连接（row_factory=None）及 sqlite3.Row 的完全双向兼容；facade 不强制注入 repository 行适配器 | `paper_trading._risk_exit_account_ids` | `test_paper_risk_exit_eligibility.py`（`RiskExitEligibilityFacadeContractTests.test_facade_bare_sqlite_connection_compatibility`、`test_facade_sqlite_row_connection_compatibility`） | ✅ |
+| 真实源码变异 N1–N12 全部被测试捕获（12/12 caught，Undetected: 0） | — | `work/pr_risk_exit_eligibility_negative_check.py`（每轮真实变异、逐字节备份与 sha256 还原核验） | ✅ |
 
