@@ -172,6 +172,20 @@
 | 单一实现守卫（全仓唯一：读取周期快照启用集合的 `SELECT` 只允许出现在解析器；解析面函数名不得在别处重定义；先证检测器非空再证别处为空） | `paper_cycle_ownership.cycle_ledger_filter` | `test_paper_cycle_ownership.py`（`OwnershipArchitectureGuardTests.test_detector_finds_the_ownership_sql_in_the_ownership_module`、`test_cycle_ownership_sql_lives_only_in_the_ownership_module`、`test_no_other_module_redefines_the_resolution_surface`） | ✅ |
 | 负向变异验证（N1–N13 必须让守卫变红：N1 账本所有权错误剔除 paused、N2 执行参与者不再剔除 paused、N3 执行参与者改用注册表 active 作用域、N4 显式空集错误回落内置五套、N5 忽略 `paper_accounts.cycle_id` 绑定、N6 删除 `cycle_not_configured` 回退、N7 删除未挂接周期回退、N8 参与者顺序漂移、N9 把解析器复制回 `paper_trading`、N10 解析器反向 import `paper_trading`、N11 解析器引入写操作、N12 风控退出被收窄为执行参与者、N13 单行 `paper_cycles` 查询退化为裸 `fetchone()` + 字符串键访问 ⇒ 合计 13/13） | — | 手工执行 N1–N13 变异脚本（源码级变异逐字节备份 + `finally` 还原 + `git hash-object` 校验；见 PR 描述） | ✅ |
 
+## 共享现金账本边界（Extract Shared Cash Ledger Boundary）
+
+| 场景 | 实现位置 | 回归用例 | 状态 |
+| --- | --- | --- | --- |
+| 共享现金只聚合调用方已解析账户行 | `paper_shared_cash.shared_cash` | `test_paper_shared_cash.py`（`SharedCashAggregateTests`） | ✅ |
+| 声明资本优先；无声明时沿用账户初始资本/现金回退并保持非负 | `paper_shared_cash.shared_initial_cash`、`paper_trading._shared_initial_cash` | `test_paper_shared_cash.py`（`SharedCashAggregateTests`、`SharedCashFacadeTests`） | ✅ |
+| 借记顺序保持：preferred 优先，其余按现金降序；等现金保持输入顺序 | `paper_shared_cash.debit_shared_cash` | `test_paper_shared_cash.py`（`SharedCashDebitTests`） | ✅ |
+| 借记资金不足先预检，失败不产生部分写入；负数/零值保持旧 fail-closed 行为 | `paper_shared_cash.debit_shared_cash` | `test_paper_shared_cash.py`（`SharedCashDebitTests`） | ✅ |
+| 贷记只写明确目标账户，负数拒绝；零值保持旧的现金不变/时间戳更新行为 | `paper_shared_cash.credit_shared_cash` | `test_paper_shared_cash.py`（`SharedCashCreditTests`） | ✅ |
+| 数据库副作用严格限制为 `paper_accounts.cash` 与 `updated_at` | `paper_shared_cash` | `test_paper_shared_cash.py`（`SharedCashCreditTests`、`SharedCashDebitTests`、`SharedCashArchitectureGuardTests`） | ✅ |
+| 四个旧入口保留原签名并只做 runtime 注入后的委托，不改变调用方账户解析 | `paper_trading._shared_cash`、`_shared_initial_cash`、`_debit_shared_cash`、`_credit_shared_cash` | `test_paper_shared_cash.py`（`SharedCashFacadeTests`） | ✅ |
+| 模块依赖与职责守卫：无周期/注册表/预约/敞口/风控事实，无反向 import，无 import 期副作用 | `paper_shared_cash`、`ARCHITECTURE.md` | `test_paper_shared_cash.py`（`SharedCashArchitectureGuardTests`） | ✅ |
+| 负向变异验证（N1–N13 必须让守卫变红：N1 preferred 优先级、N2 现金降序、N3 资金不足预检、N4 预检后才写、N5 负数借记 fail-closed、N6 零借记无写入、N7 贷记目标不漂移、N8 负数贷记拒绝、N9 引入周期/所有权事实、N10 反向 import、N11 扩大 UPDATE 写入列、N12 facade 不再委托、N13 等现金 tie 顺序漂移 ⇒ 合计 13/13） | — | 手工执行 N1–N13 变异脚本（源码级逐字节备份 + `finally` 还原 + `git hash-object` 校验；见 PR 描述） | ✅ |
+
 ## 维护约定
 
 1. 新增门禁必须先在本表加一行，再写测试；表格状态从 ⚠️ → ✅。

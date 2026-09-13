@@ -39,6 +39,7 @@ import paper_allocation as PA
 import paper_cycle_service as PCS
 import paper_account_specs as ACS
 import paper_cycle_ownership as PCY
+import paper_shared_cash as PSC
 import paper_decision_audit as PDA
 import adaptive_selection_compat as ASC
 # ELC / EPD 仍被非 cleanup 路径使用（signal freshness、entry slice plan、
@@ -2430,11 +2431,9 @@ def _shared_account_rows(conn, cycle_id=None):
 def _shared_initial_cash(conn, cycle=None):
     """Total capital for the current simulation cycle, not per strategy."""
     cycle = cycle or _active_cycle(conn)
-    declared = _num(cycle.get("capital"))
-    if declared > 0:
-        return declared
-    accounts = _shared_account_rows(conn, cycle["id"])
-    return max(sum(_num(row.get("initial_cash")) for row in accounts), 0.0)
+    declared = _num(cycle["capital"])
+    accounts = () if declared > 0 else _shared_account_rows(conn, cycle["id"])
+    return PSC.shared_initial_cash(accounts, declared, num_fn=_num)
 
 
 def _account_reference_capital(account):
@@ -2496,7 +2495,7 @@ def _economic_pool_nav_history(conn, cycle=None):
 
 
 def _shared_cash(conn, cycle_id=None):
-    return sum(_num(row.get("cash")) for row in _shared_account_rows(conn, cycle_id))
+    return PSC.shared_cash(_shared_account_rows(conn, cycle_id), num_fn=_num)
 
 
 def _pending_buy_reservations(conn, cycle_id=None, exclude_order_key=None):
@@ -2614,29 +2613,24 @@ def _finish_capital_reservation(conn, order_key, status):
 
 def _debit_shared_cash(conn, amount, preferred_account_id=None):
     """Debit a shared cash pool while retaining per-strategy audit ownership."""
-    amount = max(0.0, _num(amount))
-    rows = _shared_account_rows(conn)
-    rows.sort(key=lambda row: (0 if row["id"] == preferred_account_id else 1, -_num(row.get("cash"))))
-    if amount > sum(_num(row.get("cash")) for row in rows) + 1e-6:
-        raise ValueError("共享资金池可用现金不足")
-    remaining = amount
-    for row in rows:
-        debit = min(max(0.0, _num(row.get("cash"))), remaining)
-        if debit:
-            conn.execute("UPDATE paper_accounts SET cash=cash-?,updated_at=? WHERE id=?", (debit, _now(), row["id"]))
-            remaining -= debit
-        if remaining <= 1e-6:
-            break
-    return True
+    return PSC.debit_shared_cash(
+        conn,
+        _shared_account_rows(conn),
+        amount,
+        preferred_account_id=preferred_account_id,
+        now_fn=_now,
+        num_fn=_num,
+    )
 
 
 def _credit_shared_cash(conn, amount, account_id):
-    amount = _num(amount)
-    # A negative credit is a debit that bypasses _debit_shared_cash's balance
-    # check and would silently corrupt the pool ledger; refuse it loudly.
-    if amount < 0:
-        raise ValueError(f"_credit_shared_cash 收到负数金额 {amount}（account={account_id}），疑似上游计算错误")
-    conn.execute("UPDATE paper_accounts SET cash=cash+?,updated_at=? WHERE id=?", (amount, _now(), account_id))
+    return PSC.credit_shared_cash(
+        conn,
+        amount,
+        account_id,
+        now_fn=_now,
+        num_fn=_num,
+    )
 
 
 def _shared_account_exposure(conn, quotes, asof_day=None):
