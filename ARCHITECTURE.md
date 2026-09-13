@@ -81,6 +81,28 @@ Reservation aggregation is intentionally cross-cycle：只要仍为 `reserved`�
 
 Recovery exception：`_reconcile_signal_order_states` 仍可直接修复 reservation terminal state，这是跨 signal/order lifecycle 的 crash-recovery 编排；它不是正常 runtime reservation CRUD，故不迁入预占模块。
 
+### 待成交席位占用 read model 边界
+
+`backend/paper_slot_occupancy.py` 是待成交 BUY 订单“席位占用 read model”的唯一实现边界：
+Pending slot occupancy is a read-only capacity projection over caller-provided positions and executable pending BUY orders.
+
+明确职责隔离：
+```text
+slot occupancy
+    != runner slot/preflight service (paper_slot_service.py: 调度器 slot 枚举、验证与 preflight 清理)
+    != capital reservation (paper_capital_reservations.py: BUY 购买力预占账本)
+    != symbol exposure (portfolio_coordinator.py: 组合标的/行业敞口)
+    != order lifecycle (entry_lifecycle.py / execution_dispatch.py)
+    != cycle ownership (paper_cycle_ownership.py)
+    != execution eligibility (strategy_registry.py)
+```
+
+关键不变量：
+- `deferred/waitlist markers do not occupy executable position slots`：`deferred_capacity` 与 `entry_frozen_waitlist` 是排队/重试标记，没有真实席位 claim，严禁计入席位占用。
+- 只有满足 `origin IN ('manual', 'strategy')`、`side='buy'` 且 `status IN occupying_statuses` 的订单才占用新仓席位。
+- 已有完整持仓（`int(qty) >= lot_size`）的 `(account_id, code)` 若有待成交买单，属于对既有持仓加仓，不占用新席位（suppressed）。
+- `paper_trading.py` 保留 `_pending_position_slots(conn, positions=None, exclude_order_key=None)` 兼容 facade，负责解析可选持仓并向新模块注入 `ENTRY_SLOT_OCCUPYING_ORDER_STATUSES`、`LOT_SIZE`、`_num` 与 `_rows`。新模块纯 stdlib，无事务控制，不执行写 SQL，不导入 `paper_trading`。
+
 | 领域 | 代码范围 | 拥有什么 | 不拥有什么 |
 | --- | --- | --- | --- |
 | Strategy Domain | `strategy_registry`、`strategy_service`、`strategy_dsl_*`、`strategy_runtime`、`strategy_risk_*`、`strategy_policies`、`strategy_clusters`、`strategy_champion` | 策略身份、不可变版本、DSL 编译、运行时就绪、生命周期、风险/执行画像 | 订单、成交、资金池、周期账本 |
