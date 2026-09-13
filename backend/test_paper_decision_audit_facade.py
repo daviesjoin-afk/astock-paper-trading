@@ -428,6 +428,23 @@ class DecisionAuditArchitectureGuardTests(unittest.TestCase):
         with_keywords = {keyword.arg for keyword in with_calls[0].keywords}
         self.assertLessEqual(RUNTIME_INJECTION_KEYWORDS, with_keywords)
 
+    def test_serializer_contract_keys_live_only_in_the_audit_module(self):
+        """Single source of truth is a repo-wide claim, not just a
+        ``paper_trading`` one.
+
+        A copy of the serializer in any *other* backend module would satisfy
+        every facade guard above while silently forking the algorithm, so scan
+        all production modules for the envelope's contract keys.
+        """
+        offenders = {}
+        for path in sorted(BACKEND.glob("*.py")):
+            if path == AUDIT_PATH or path.name.startswith("test_"):
+                continue
+            found = _string_constants(_parse(path)) & SERIALIZER_SENTINELS
+            if found:
+                offenders[path.name] = sorted(found)
+        self.assertEqual(offenders, {})
+
     def test_paper_trading_imports_the_audit_module_under_one_alias(self):
         imported = set()
         for node in ast.walk(self.paper_tree):
