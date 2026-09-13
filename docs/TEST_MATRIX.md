@@ -227,3 +227,8 @@
 1. 新增门禁必须先在本表加一行，再写测试；表格状态从 ⚠️ → ✅。
 2. `⚠️` = 逻辑已实现但缺独立离线单测，是贡献者 `good first issue` 的优先候选。
 3. demo 叙事用例（`test_demo_seed` / `test_demo_replay_golden`）作为引擎路径的端到端兜底回归。
+# 资金预占 ledger 边界
+
+`backend/test_paper_capital_reservations.py` 覆盖 reserved BUY 的跨周期聚合、账户金额与费用、排除自身、numeric clamp、裸 SQLite/`sqlite3.Row`、创建与重算、consumed 防重复、资金不足零变更、epsilon 容差、lazy active-cycle/shared-cash/clock 依赖、终态幂等，以及三个 legacy facade 的签名与单一实现守卫。模块禁止反向依赖、订单/持仓/周期 SQL、事务控制和 allocation/sizing/execution 逻辑。
+
+`_reconcile_signal_order_states` 的 reservation UPDATE 属于明确允许的 crash-recovery exception；架构测试只要求正常 runtime INSERT/UPDATE 的唯一实现位于 `paper_capital_reservations.py`，不使用脆弱的全仓字符串禁用守卫。
