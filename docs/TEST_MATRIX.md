@@ -166,7 +166,7 @@
 | 参与者顺序是契约（`dict.fromkeys` 保序 + `ORDER BY id`；集合化 / 逆序即失败） | `paper_cycle_ownership.cycle_participant_resolution` / `cycle_ledger_rows` | `test_paper_cycle_ownership.py`（`test_participant_order_is_deterministic_and_follows_enabled_order`、`test_ledger_rows_are_ordered_by_id`） | ✅ |
 | 只读（无写 SQL / 无 PRAGMA；sqlite authorizer 证明解析期间零 INSERT·UPDATE·DELETE·DDL，且行快照前后一致） | `paper_cycle_ownership` | `test_paper_cycle_ownership.py`（`ReadOnlyResolverTests`、`OwnershipArchitectureGuardTests.test_ownership_module_emits_no_write_sql`） | ✅ |
 | 行读取不假设 `row_factory`（`cursor.description` + `zip` 自组装 dict，裸连接亦可用；单行 `paper_cycles` 查询同样归一化） | `paper_cycle_ownership._rows` / `_row` | `test_paper_cycle_ownership.py`（`test_row_reader_does_not_assume_the_connection_row_factory`、`test_bare_connection_execution_resolution_uses_cycle_snapshot`） | ✅ |
-| 风控退出资格 ≠ 执行资格（paused / 已退出当前周期但仍有 `remaining_qty>0` 的账户必须继续被风控扫描） | `paper_trading._risk_exit_account_ids`（消费迁出后的解析器） | `test_paper_cycle_ownership.py`（`RiskExitEligibilityTests`） | ✅ |
+| 风控退出资格 ≠ 执行资格（paused / 已退出当前周期但仍有 `remaining_qty>0` 的账户必须继续被风控扫描） | `paper_risk_exit_eligibility.risk_exit_account_ids`（`paper_trading._risk_exit_account_ids` facade） | `test_paper_risk_exit_eligibility.py`、`test_paper_cycle_ownership.py` | ✅ |
 | 兼容 facade 只允许别名 / 委托（`paper_trading` 内同名符号必须委托到解析器；函数体不得内联第二套所有权实现；注入的注册表作用域必须**调用时**读取，monkeypatch 立即生效） | `paper_trading._active_cycle_filter` / `_shared_account_rows` / `cycle_ledger_ids` / `execution_participant_ids` / `current_cycle_participant_ids` / `_cycle_participant_resolution` / `_lifecycle_paused_ids` | `test_paper_cycle_ownership.py`（`CompatibilityFacadeTests`） | ✅ |
 | 架构守卫（解析器不 import `paper_trading` / 网络 / 订单 / 注册表 / 执行；import 根白名单；无下单·建周期·开户·归档·改状态调用；不携带执行·风控退出·注册表作用域权威；顶层无 `Call`） | `paper_cycle_ownership` | `test_paper_cycle_ownership.py`（`OwnershipArchitectureGuardTests`） | ✅ |
 | 单一实现守卫（全仓唯一：读取周期快照启用集合的 `SELECT` 只允许出现在解析器；解析面函数名不得在别处重定义；先证检测器非空再证别处为空） | `paper_cycle_ownership.cycle_ledger_filter` | `test_paper_cycle_ownership.py`（`OwnershipArchitectureGuardTests.test_detector_finds_the_ownership_sql_in_the_ownership_module`、`test_cycle_ownership_sql_lives_only_in_the_ownership_module`、`test_no_other_module_redefines_the_resolution_surface`） | ✅ |
@@ -253,4 +253,24 @@
 | 模块纯 stdlib、只读查询 paper_orders、无写 SQL、无事务控制、不导入 paper_trading；facade 内部无内联 SQL | `paper_slot_occupancy` / `paper_trading` | `SlotOccupancyArchitectureGuardTests` | ✅ |
 | 架构文档明确区分 paper_slot_occupancy 与 paper_slot_service，冻结两者不同职责 | `ARCHITECTURE.md` | `SlotOccupancyArchitectureGuardTests.test_architecture_notes_distinguishes_slot_service_and_occupancy` | ✅ |
 | 真实源码变异 N1–N19 全部被测试捕获（19/19 caught，Undetected: 0） | — | `work/pr_slot_occupancy_negative_check.py`（每轮真实变异、逐字节备份与 sha256 还原核验） | ✅ |
+
+## 风控退出资格边界（Extract Risk Exit Eligibility Boundary）
+
+| 场景 | 实现位置 | 回归用例 | 状态 |
+| --- | --- | --- | --- |
+| 契约 A：执行参与者无持仓，仍属于风控退出范围 | `paper_risk_exit_eligibility.risk_exit_account_ids` | `test_paper_risk_exit_eligibility.py`（`RiskExitEligibilityContractTests.test_A_execution_participant_without_holdings_is_eligible`） | ✅ |
+| 契约 B：paused 账户失去执行资格，但有 remaining lots（`remaining_qty > 0`）必须继续进入风控扫描 | `paper_risk_exit_eligibility.risk_exit_account_ids` | `RiskExitEligibilityContractTests.test_B_paused_account_with_positive_remaining_lots_is_eligible` | ✅ |
+| 契约 C：已 archived/retired 账户不在基础执行范围，但有 remaining lots 必须继续进入风控扫描 | `paper_risk_exit_eligibility.risk_exit_account_ids` | `RiskExitEligibilityContractTests.test_C_archived_retired_account_with_positive_remaining_lots_is_eligible` | ✅ |
+| 契约 D：当前周期外历史账户有 remaining lots 必须继续进入风控扫描 | `paper_risk_exit_eligibility.risk_exit_account_ids` | `RiskExitEligibilityContractTests.test_D_account_outside_current_cycle_with_positive_remaining_lots_is_eligible` | ✅ |
+| 契约 E：当前周期外历史账户 zero remaining（`remaining_qty == 0`）不得进入风控退出资格 | `paper_risk_exit_eligibility.risk_exit_account_ids` | `RiskExitEligibilityContractTests.test_E_account_outside_current_cycle_with_zero_remaining_is_not_eligible` | ✅ |
+| 契约 F：负数持仓（`remaining_qty <= 0`）不得制造风控退出资格 | `paper_risk_exit_eligibility.risk_exit_account_ids` | `RiskExitEligibilityContractTests.test_F_negative_remaining_qty_does_not_confer_eligibility` | ✅ |
+| 契约 G：同账户多笔 lots 正确去重，返回集合只含唯一账户 ID | `paper_risk_exit_eligibility.risk_exit_account_ids` | `RiskExitEligibilityContractTests.test_G_multiple_lots_for_same_account_are_deduplicated` | ✅ |
+| 契约 H：多账户混合（执行中无仓、执行中有仓、非执行有仓、非执行零仓/负仓）并集正确 | `paper_risk_exit_eligibility.risk_exit_account_ids` | `RiskExitEligibilityContractTests.test_H_mixed_accounts_union_correctness` | ✅ |
+| 契约 I：facade 原签名保持 `(conn, status="running")`，返回值保持 `set[str]` | `paper_trading._risk_exit_account_ids` | `RiskExitEligibilityFacadeContractTests.test_I_facade_signature_preserved` | ✅ |
+| 契约 J：status 参数旧语义逐字保持（status="paused" 与 status=None 正确传递给 `_active_account_ids`） | `paper_trading._risk_exit_account_ids` | `RiskExitEligibilityFacadeContractTests.test_J_status_parameter_passthrough` | ✅ |
+| 契约 K：facade 使用调用时依赖解析，monkeypatch `_active_account_ids` 立即生效 | `paper_trading._risk_exit_account_ids` | `RiskExitEligibilityFacadeContractTests.test_K_facade_uses_call_time_dependency_resolution` | ✅ |
+| 契约 L：新模块纯只读，sqlite authorizer 拦截写操作码，源码无写 SQL 关键字 | `paper_risk_exit_eligibility` | `RiskExitEligibilityArchitectureGuardTests.test_L_module_is_read_only` | ✅ |
+| 契约 M：新模块纯 stdlib，无反向导入 `paper_trading` | `paper_risk_exit_eligibility` | `RiskExitEligibilityArchitectureGuardTests.test_M_module_stdlib_only_and_no_reverse_import` | ✅ |
+| 契约 N：新模块不重新实现周期所有权或执行参与者逻辑，无跨边界表查询 | `paper_risk_exit_eligibility` | `RiskExitEligibilityArchitectureGuardTests.test_N_module_does_not_reimplement_cycle_or_execution` | ✅ |
+| 真实源码变异 N1–N10 全部被测试捕获（10/10 caught，Undetected: 0） | — | `work/pr_risk_exit_eligibility_negative_check.py`（每轮真实变异、逐字节备份与 sha256 还原核验） | ✅ |
 

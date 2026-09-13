@@ -45,6 +45,7 @@ import paper_user_cycle_attachment as PUCA
 import paper_capital_reservations as PCR
 import paper_decision_audit as PDA
 import paper_slot_occupancy as PSO
+import paper_risk_exit_eligibility as PRE
 import adaptive_selection_compat as ASC
 # ELC / EPD 仍被非 cleanup 路径使用（signal freshness、entry slice plan、
 # dispatch 规划与核验、gated order 查询）。清理动作已移交 paper_slot_service，
@@ -724,18 +725,14 @@ def _active_account_ids(conn, status=None):
 
 
 def _risk_exit_account_ids(conn, status="running"):
-    """PR-36：风控退出必须覆盖“仍有持仓但已退出当前周期”的账户。
+    """兼容 facade：风控退出资格解析（实现见 ``paper_risk_exit_eligibility.risk_exit_account_ids``）。
 
-    策略 paused/retiring/archived 后 supports_new_cycle=0，账户不再出现在
-    _active_account_clause 的名单里；但已有 T+1 持仓仍必须被继续扫描到
-    安全清仓为止——否则归档等于把存量持仓变成无人风控的孤儿敞口。
+    PR-36：风控退出必须覆盖“仍有持仓但已退出当前周期”的账户。
+    基础执行/活跃作用域由现有权威路径在调用时解析（支持 status 过滤与调用时依赖）；
+    再委托给只读模块注入 remaining lots 查询进行并集计算。
     """
-    ids = set(_active_account_ids(conn, status=status))
-    holding = conn.execute(
-        "SELECT DISTINCT account_id FROM paper_position_lots WHERE remaining_qty>0"
-    ).fetchall()
-    ids.update(str(row[0]) for row in holding if row[0])
-    return ids
+    base_ids = _active_account_ids(conn, status=status)
+    return PRE.risk_exit_account_ids(conn, base_account_ids=base_ids, rows_fn=_rows)
 
 
 def _accounts_by_id(conn, account_ids):
