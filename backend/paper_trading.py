@@ -40,6 +40,7 @@ import paper_cycle_service as PCS
 import paper_account_specs as ACS
 import paper_cycle_ownership as PCY
 import paper_shared_cash as PSC
+import paper_user_account_provisioning as PUAP
 import paper_decision_audit as PDA
 import adaptive_selection_compat as ASC
 # ELC / EPD 仍被非 cleanup 路径使用（signal freshness、entry slice plan、
@@ -2043,23 +2044,13 @@ def _ensure_user_strategy_accounts(conn):
     激活绝不私自挪用共享池。策略暂停/归档后行保留（历史账本语义），
     但参与资格消失，不会再被任何周期启用。
     """
-    for account_id in USP.user_participant_ids(conn):
-        exists = conn.execute("SELECT 1 FROM paper_accounts WHERE id=?", (account_id,)).fetchone()
-        if exists:
-            continue
-        spec = _spec_for(account_id, conn=conn)
-        now = _now()
-        conn.execute(
-            """INSERT INTO paper_accounts
-            (id,name,source_strategy,status,initial_cash,cash,cycle_days,max_positions,max_weight,max_exposure,
-             risk_profile,version,benchmark_start,created_at,updated_at)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-            (account_id, spec["name"], spec["source_strategy"], "paused", 0.0, 0.0,
-             spec["cycle_days"], spec["max_positions"], spec["max_weight"], spec["max_exposure"],
-             spec["risk_profile"], spec["strategy_version"], None, now, now),
-        )
-        _audit(conn, account_id, "user_strategy_account_provisioned",
-               f"用户策略 {spec['name']} 已开户（paused，等待周期分配资金；DSL v{spec['dsl_version']}）")
+    return PUAP.provision_user_accounts(
+        conn,
+        USP.user_participant_ids(conn),
+        spec_for=lambda account_id: _spec_for(account_id, conn=conn),
+        now_fn=_now,
+        audit_fn=_audit,
+    )
 
 
 def _reconcile_shared_cash(conn, cycle_id):

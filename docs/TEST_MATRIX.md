@@ -186,6 +186,19 @@
 | 模块依赖与职责守卫：无周期/注册表/预约/敞口/风控事实，无反向 import，无 import 期副作用 | `paper_shared_cash`、`ARCHITECTURE.md` | `test_paper_shared_cash.py`（`SharedCashArchitectureGuardTests`） | ✅ |
 | 负向变异验证（N1–N13 必须让守卫变红：N1 preferred 优先级、N2 现金降序、N3 资金不足预检、N4 预检后才写、N5 负数借记 fail-closed、N6 零借记无写入、N7 贷记目标不漂移、N8 负数贷记拒绝、N9 引入周期/所有权事实、N10 反向 import、N11 扩大 UPDATE 写入列、N12 facade 不再委托、N13 等现金 tie 顺序漂移 ⇒ 合计 13/13） | — | 手工执行 N1–N13 变异脚本（源码级逐字节备份 + `finally` 还原 + `git hash-object` 校验；见 PR 描述） | ✅ |
 
+## 用户策略账户 provisioning 边界（Extract User Account Provisioning Boundary）
+
+| 场景 | 实现位置 | 回归用例 | 状态 |
+| --- | --- | --- | --- |
+| 缺失用户策略账户逐字段创建（paused、零初始资金/现金、无周期、当前 spec 字段、无 benchmark 起点） | `paper_user_account_provisioning.provision_user_accounts` | `test_paper_user_account_provisioning.py`（`ProvisioningContractTests`） | ✅ |
+| 已有账户完全跳过；不调用 spec/clock/audit，不改任何字段 | `paper_user_account_provisioning.provision_user_accounts` | `ProvisioningContractTests.test_existing_account_is_untouched_and_skips_callbacks` | ✅ |
+| 多账户保序、只创建缺失行、成功创建才写精确开户审计 | `paper_user_account_provisioning.provision_user_accounts` | `ProvisioningContractTests.test_multiple_accounts_only_missing_rows_follow_input_order` | ✅ |
+| 空输入无 SQL 变更；重复调用无重复行/审计 | `paper_user_account_provisioning.provision_user_accounts` | `ProvisioningContractTests.test_empty_input_performs_no_sql_mutation`、`test_repeated_call_is_idempotent` | ✅ |
+| spec / INSERT / audit 异常原样传播；模块不拥有 commit/rollback，外层 rollback 可恢复 | `paper_user_account_provisioning.provision_user_accounts` | `ProvisioningContractTests.test_spec_failure_propagates_without_insert_or_audit`、`test_insert_failure_propagates_without_audit`、`test_audit_failure_propagates_without_commit_or_rollback` | ✅ |
+| facade 保留 `(conn)` 签名并在调用时注入当前参与资格、spec、时钟和审计依赖 | `paper_trading._ensure_user_strategy_accounts` | `paper_user_account_provisioning.py`（`FacadeContractTests`） | ✅ |
+| 责任隔离与单一实现（stdlib-only、只写缺失 `paper_accounts`、不持有资格/周期/资金/执行真相、无 import 期调用） | `paper_user_account_provisioning` / `paper_trading` | `test_paper_user_account_provisioning.py`（`ArchitectureGuardTests`） | ✅ |
+| 负向变异验证（N1–N15：状态、资金、周期、已有行、callback、审计、版本、越权查询/import/事务、facade 内联 SQL、benchmark 起点、周期/现金写入；每个真实源码变异均应被新增守卫抓红） | — | 手工执行变异脚本（逐字节备份、`finally` 恢复、sha256 校验；见 PR 描述） | ✅ |
+
 ## 维护约定
 
 1. 新增门禁必须先在本表加一行，再写测试；表格状态从 ⚠️ → ✅。
