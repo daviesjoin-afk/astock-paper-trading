@@ -42,6 +42,7 @@ import paper_cycle_ownership as PCY
 import paper_shared_cash as PSC
 import paper_user_account_provisioning as PUAP
 import paper_user_cycle_attachment as PUCA
+import paper_capital_reservations as PCR
 import paper_decision_audit as PDA
 import adaptive_selection_compat as ASC
 # ELC / EPD 仍被非 cleanup 路径使用（signal freshness、entry slice plan、
@@ -2465,32 +2466,9 @@ def _shared_cash(conn, cycle_id=None):
 
 
 def _pending_buy_reservations(conn, cycle_id=None, exclude_order_key=None):
-    """Return reserved buy capital by strategy and in total.
-
-    Reservations are deliberately separate from the cash ledger: a pending
-    limit order has not filled yet, but its buying power and 82% pool capacity
-    are no longer available to another strategy.  ``exclude_order_key`` is
-    used while rechecking an existing pending order so that the order does
-    not reserve itself twice.
-
-    P3 审计修复：统计不再按 cycle_id 过滤——周期切换后旧周期的手动
-    限价单仍处于 reserved 且其预占真实占用现金；漏统计会让新周期订单
-    重复使用同一笔资金，先后触发时后者误拒。
-    """
-    params = []
-    where = "side='buy' AND status='reserved'"
-    if exclude_order_key is not None:
-        where += " AND order_key<>?"
-        params.append(str(exclude_order_key))
-    rows = _rows(
-        conn,
-        f"""SELECT account_id,COALESCE(SUM(amount+fees),0) AS amount
-            FROM paper_capital_reservations WHERE {where}
-            GROUP BY account_id""",
-        tuple(params),
+    return PCR.pending_buy_reservations(
+        conn, cycle_id, exclude_order_key, num_fn=_num
     )
-    by_account = {row["account_id"]: max(0.0, _num(row.get("amount"))) for row in rows}
-    return by_account, sum(by_account.values())
 
 
 def _pending_position_slots(conn, positions=None, exclude_order_key=None):
@@ -2523,58 +2501,15 @@ def _pending_position_slots(conn, positions=None, exclude_order_key=None):
 
 
 def _reserve_shared_capital(conn, order_key, account_id, code, amount, fees=0.0):
-    """Atomically reserve buying power for a not-yet-finalised buy order.
-
-    This is a second line of defence behind the sizing model.  It prevents
-    two concurrent requests from spending the same cash while the order is
-    still pending, without ever allowing the shared pool's hard 82% ceiling
-    to be bypassed.
-    """
-    order_key = str(order_key)
-    amount = max(0.0, _num(amount))
-    fees = max(0.0, _num(fees))
-    existing = conn.execute(
-        "SELECT status FROM paper_capital_reservations WHERE order_key=?", (order_key,)
-    ).fetchone()
-    if existing and existing["status"] == "consumed":
-        return False, "该订单资金预占已经消费，禁止重复成交"
-
-    # A triggered limit order can have a different fill price/quantity from
-    # its original limit-price reservation.  Re-size the existing reservation
-    # while excluding the old amount belonging to this same order; otherwise
-    # the order appears funded but can consume another order's cash.
-    _, pending_total = _pending_buy_reservations(
-        conn, exclude_order_key=order_key,
+    return PCR.reserve_shared_capital(
+        conn, order_key, account_id, code, amount, fees,
+        num_fn=_num, now_fn=_now, shared_cash_fn=_shared_cash,
+        active_cycle_fn=_active_cycle,
     )
-    available_cash = _shared_cash(conn) - pending_total
-    if amount + fees > available_cash + 1e-6:
-        return False, f"待成交买单已预占 ¥{pending_total:,.2f}，共享可用现金不足"
-    if existing:
-        conn.execute(
-            """UPDATE paper_capital_reservations
-               SET status='reserved',released_at=NULL,amount=?,fees=?,created_at=?
-               WHERE order_key=?""",
-            (amount, fees, _now(), order_key),
-        )
-        return True, None
-    cycle = _active_cycle(conn)
-    conn.execute(
-        """INSERT INTO paper_capital_reservations
-           (cycle_id,order_key,account_id,code,side,amount,fees,status,created_at)
-           VALUES(?,?,?,?,?,?,?,?,?)""",
-        (cycle["id"], order_key, account_id, code, "buy", amount, fees,
-         "reserved", _now()),
-    )
-    return True, None
 
 
 def _finish_capital_reservation(conn, order_key, status):
-    if status not in {"consumed", "released"}:
-        raise ValueError("非法资金预占状态")
-    conn.execute(
-        "UPDATE paper_capital_reservations SET status=?,released_at=? WHERE order_key=? AND status='reserved'",
-        (status, _now(), str(order_key)),
-    )
+    return PCR.finish_capital_reservation(conn, order_key, status, now_fn=_now)
 
 
 def _debit_shared_cash(conn, amount, preferred_account_id=None):

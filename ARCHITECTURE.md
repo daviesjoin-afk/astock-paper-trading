@@ -73,6 +73,14 @@ SQLite 纸盘账本（订单、成交、持仓、NAV、审计、租约）
 
 ## 领域边界（domain boundaries）
 
+### 资金预占 ledger 边界
+
+`backend/paper_capital_reservations.py` 是运行时 BUY 资金预占的唯一实现边界：它负责查询所有 `status='reserved'` 的 BUY 预占、创建/重算预占，以及把预占标记为 `consumed` 或 `released`。预占 ledger 与实际 shared cash、pending slot occupancy、symbol exposure、order lifecycle 和 cycle ownership 各自独立；预占表示尚未最终成交的购买力占用，不是现金扣款、持仓、席位或成交。
+
+Reservation aggregation is intentionally cross-cycle：只要仍为 `reserved`，旧周期手动限价单也继续占用真实共享购买力，因此兼容参数 `cycle_id` 不用于过滤。`paper_trading.py` 只保留 `_pending_buy_reservations`、`_reserve_shared_capital`、`_finish_capital_reservation` 三个调用时注入依赖的兼容 facade。模块不拥有事务，不导入 `paper_trading`，也不负责 schema/DDL。
+
+Recovery exception：`_reconcile_signal_order_states` 仍可直接修复 reservation terminal state，这是跨 signal/order lifecycle 的 crash-recovery 编排；它不是正常 runtime reservation CRUD，故不迁入预占模块。
+
 | 领域 | 代码范围 | 拥有什么 | 不拥有什么 |
 | --- | --- | --- | --- |
 | Strategy Domain | `strategy_registry`、`strategy_service`、`strategy_dsl_*`、`strategy_runtime`、`strategy_risk_*`、`strategy_policies`、`strategy_clusters`、`strategy_champion` | 策略身份、不可变版本、DSL 编译、运行时就绪、生命周期、风险/执行画像 | 订单、成交、资金池、周期账本 |
