@@ -38,6 +38,7 @@ import paper_quote_policy as PQP
 import paper_allocation as PA
 import paper_cycle_service as PCS
 import paper_account_specs as ACS
+import paper_cycle_ownership as PCY
 import paper_decision_audit as PDA
 import adaptive_selection_compat as ASC
 # ELC / EPD 仍被非 cleanup 路径使用（signal freshness、entry slice plan、
@@ -530,105 +531,28 @@ def _active_account_clause(column="id", conn=None):
     return f"{column} IN ({placeholders})", ids
 
 
-# PR-38：执行层参与者解析的权威口径（single-owner）。
-#
-# Registry（``strategy_definitions``）只回答"下一周期能否启用某策略"；
-# 执行层（产生新信号 / 新委托 / 占用共享资金）只认周期快照：
-#
-#     paper_cycles.enabled_strategies  ∩  paper_accounts.cycle_id == 当期 id
-#
-# 否则"注册表里仍是 active"的策略会被执行层偷偷拉回一个已经把它摘掉的
-# 周期，继续占用共享池资金并产生本周期不该存在的信号与委托。
-# lifecycle pause（注册表 lifecycle_status='paused'）可以从执行层临时
-# 禁用新信号，而不必改写周期快照、也不必把账户摘出周期（历史仍可查）。
-_CYCLE_PARTICIPANT_VERSION = "cycle-participant-v1"
-_LIFECYCLE_PAUSED_STATUSES = ("paused",)
+# PR-38 / PR-49：执行层参与者解析的权威口径（single-owner）已迁至
+# ``paper_cycle_ownership``：经济所有权 = ``paper_cycles.enabled_strategies``
+# ∩ ``paper_accounts.cycle_id == 当期 id``；执行资格 = 经济所有权 − lifecycle
+# pause。此处只保留兼容 facade——版本/词表为别名，解析函数为委托，并在
+# **调用时**注入注册表 active 投影 ``ACTIVE_ACCOUNT_IDS``（它是注册表真相，
+# 按不变量 #8 留在权威层，不进入所有权模块，也不得 import 期冻结）。
+_CYCLE_PARTICIPANT_VERSION = PCY.CYCLE_PARTICIPANT_VERSION
+_LIFECYCLE_PAUSED_STATUSES = PCY.LIFECYCLE_PAUSED_STATUSES
 
 
 def _lifecycle_paused_ids(conn) -> frozenset:
-    """注册表中被生命周期暂停的策略 id；执行层据此临时禁用新信号。"""
-    if conn is None:
-        return frozenset()
-    placeholders = ",".join("?" for _ in _LIFECYCLE_PAUSED_STATUSES)
-    try:
-        rows = conn.execute(
-            f"SELECT id FROM strategy_definitions WHERE lifecycle_status IN ({placeholders})",
-            _LIFECYCLE_PAUSED_STATUSES,
-        ).fetchall()
-    except sqlite3.Error:
-        return frozenset()
-    return frozenset(str(row[0]) for row in rows if row[0])
+    """兼容 facade：注册表中被生命周期暂停的策略 id（实现见 ``paper_cycle_ownership``）。"""
+    return PCY.lifecycle_paused_ids(conn)
 
 
 def _cycle_participant_resolution(conn, cycle_id=None):
-    """解析当前周期权威参与者，并给出判定来源供审计。
+    """兼容 facade：当前周期权威参与者与判定来源（实现见 ``paper_cycle_ownership``）。
 
-    返回值：``{"ids", "source", "enabled", "bound", "paused", "cycle_id"}``。
-    ``source`` 只有三种：
-    - ``cycle_snapshot``：启用集合 ∩ 周期挂接（权威路径）；
-    - ``cycle_enabled_unbound_fallback``：周期已声明启用集合但账本尚未
-      挂接（新建周期首轮 / 迁移窗口），退化为启用集合本身，避免整轮空转；
-    - ``no_cycle`` / ``cycle_not_configured`` / ``no_conn``：沿用内置集合
-      （+ 注册表参与者），与 PR-38 之前的行为一致。
+    注入的 ``builtin_scope`` 在函数体内读取 ``ACTIVE_ACCOUNT_IDS``，保证
+    monkeypatch 仍然生效（不得 import 期冻结）。
     """
-    fallback_ids = (
-        tuple(dict.fromkeys([*ACTIVE_ACCOUNT_IDS, *USP.user_participant_ids(conn)]))
-        if conn is not None else tuple(ACTIVE_ACCOUNT_IDS)
-    )
-    if conn is None:
-        return {"ids": fallback_ids, "source": "no_conn", "enabled": (),
-                "bound": frozenset(), "paused": frozenset(), "cycle_id": None,
-                "version": _CYCLE_PARTICIPANT_VERSION}
-    try:
-        if cycle_id is None:
-            cycle_row = conn.execute(
-                "SELECT id,enabled_strategies FROM paper_cycles "
-                "WHERE status IN ('draft','running','paused') ORDER BY id DESC LIMIT 1"
-            ).fetchone()
-        else:
-            cycle_row = conn.execute(
-                "SELECT id,enabled_strategies FROM paper_cycles WHERE id=?", (int(cycle_id),)
-            ).fetchone()
-    except sqlite3.Error:
-        cycle_row = None
-    if cycle_row is None:
-        return {"ids": fallback_ids, "source": "no_cycle", "enabled": (),
-                "bound": frozenset(), "paused": frozenset(), "cycle_id": None,
-                "version": _CYCLE_PARTICIPANT_VERSION}
-    parsed = _loads(cycle_row["enabled_strategies"], None) if cycle_row["enabled_strategies"] else None
-    if not isinstance(parsed, list):
-        # 缺失/损坏 → 旧语义：回落内置五套（未配置 ≠ 零策略）。
-        return {"ids": fallback_ids, "source": "cycle_not_configured", "enabled": (),
-                "bound": frozenset(), "paused": frozenset(), "cycle_id": cycle_row["id"],
-                "version": _CYCLE_PARTICIPANT_VERSION}
-    if not parsed:
-        # PR-47：显式空配置 = 零策略 idle 周期——不产生新参与者，风控扫描、
-        # 存量退出与系统调度照常。不再回落内置五套。
-        return {"ids": (), "source": "cycle_idle", "enabled": (),
-                "bound": frozenset(), "paused": frozenset(), "cycle_id": cycle_row["id"],
-                "version": _CYCLE_PARTICIPANT_VERSION}
-    enabled = tuple(dict.fromkeys(str(item) for item in parsed))
-    try:
-        bound = frozenset(
-            str(row[0]) for row in conn.execute(
-                "SELECT id FROM paper_accounts WHERE cycle_id=?", (cycle_row["id"],),
-            ).fetchall() if row[0]
-        )
-    except sqlite3.Error:
-        bound = frozenset()
-    paused = _lifecycle_paused_ids(conn)
-    ids = tuple(item for item in enabled if item in bound and item not in paused)
-    source = "cycle_snapshot"
-    if not ids:
-        # 周期已声明启用集合但账本尚未挂接：退化为启用集合本身，
-        # 被 lifecycle pause 的 id 仍然不参与执行。
-        ids = tuple(item for item in enabled if item not in paused)
-        source = "cycle_enabled_unbound_fallback"
-    return {
-        "ids": ids, "source": source, "enabled": enabled, "bound": bound,
-        "paused": paused, "cycle_id": cycle_row["id"],
-        "version": _CYCLE_PARTICIPANT_VERSION,
-    }
+    return PCY.cycle_participant_resolution(conn, cycle_id, builtin_scope=ACTIVE_ACCOUNT_IDS)
 
 
 def current_cycle_participant_ids(conn, cycle_id=None):
@@ -639,7 +563,7 @@ def current_cycle_participant_ids(conn, cycle_id=None):
     临时退出执行层（仍保留在周期内，历史可查）。Registry active 只用于
     创建下一周期，不再作为执行层依据。
     """
-    return _cycle_participant_resolution(conn, cycle_id)["ids"]
+    return PCY.current_cycle_participant_ids(conn, cycle_id, builtin_scope=ACTIVE_ACCOUNT_IDS)
 
 
 # 用户策略声明式 spec 解析（PR-35）。无 conn 时按需开只读连接；底层
@@ -823,70 +747,35 @@ def _accounts_by_id(conn, account_ids):
 
 
 def _active_cycle_filter(conn, cycle_id, column="id"):
-    """Scope a cycle to all active sleeves once the active set is complete.
+    """兼容 facade：周期经济所有权谓词（实现见 ``paper_cycle_ownership.cycle_ledger_filter``）。
 
-    PR-48：这里是**经济所有权**口径（= ``cycle_ledger_ids``）——能力位
-    判定用"已知用户策略"（``USP.user_known_ids``，不查 lifecycle/status），
-    因此 lifecycle pause 不会把策略移出账本。小账本/迁移库回退行为保留。
-
-    Small in-memory/unit-test ledgers and pre-migration databases can contain
-    only one newly introduced sleeve plus legacy IDs.  In that transitional
-    shape, falling back to the cycle's own rows preserves cash reconciliation;
-    a normal repository cycle has both active IDs and uses the strict filter.
+    ``builtin_scope`` 在函数体内读取 ``ACTIVE_ACCOUNT_IDS``（调用时解析）。
     """
-    configured_ids = None
-    try:
-        cycle_row = conn.execute("SELECT enabled_strategies FROM paper_cycles WHERE id=?", (cycle_id,)).fetchone()
-        parsed = _loads(cycle_row["enabled_strategies"], None) if cycle_row and cycle_row["enabled_strategies"] else None
-        if isinstance(parsed, list):
-            user_ids = set(USP.user_known_ids(conn))
-            configured_ids = tuple(item for item in parsed if item in ACCOUNT_SPECS or item in user_ids)
-    except Exception:
-        configured_ids = None
-    if configured_ids is not None:
-        # PR-47/48：显式空启用集合 = idle 周期 → 空账本（1=0），不再回落
-        # 内置五套；未配置（None）才走下面的迁移期回退。
-        placeholders = ",".join("?" for _ in configured_ids)
-        active_clause = f"{column} IN ({placeholders})" if configured_ids else "1=0"
-        return active_clause, configured_ids
-    active_ids = tuple(ACTIVE_ACCOUNT_IDS)
-    placeholders = ",".join("?" for _ in active_ids)
-    active_clause = f"{column} IN ({placeholders})" if active_ids else "1=0"
-    count = conn.execute(
-        f"SELECT COUNT(*) FROM paper_accounts WHERE cycle_id=? AND {active_clause}",
-        (cycle_id, *active_ids),
-    ).fetchone()[0]
-    if count >= len(ACTIVE_ACCOUNT_IDS):
-        return active_clause, active_ids
-    return "1=1", ()
+    return PCY.cycle_ledger_filter(conn, cycle_id, column, builtin_scope=ACTIVE_ACCOUNT_IDS)
 
 
 def cycle_ledger_ids(conn, cycle_id=None):
-    """PR-48：周期**经济所有权**账户集合（单一事实来源）。
+    """PR-48：周期**经济所有权**账户集合（单一事实来源，实现见 ``paper_cycle_ownership``）。
 
     语义 = ``cycle.enabled_strategies``（能力位过滤，不查 Registry
-    lifecycle/status）∩ ``paper_accounts.cycle_id == 该周期``。用于：
-    共享现金、NAV、initial capital、configure_capital、资金对账、
-    周期暂停/恢复与经济所有权——**lifecycle pause 不改变这个集合**
-    （Cycle owns capital; lifecycle controls execution permission）。
+    lifecycle/status）∩ ``paper_accounts.cycle_id == 该周期``；**lifecycle
+    pause 不改变这个集合**（Cycle owns capital; lifecycle controls execution
+    permission）。周期选择留在本层（``_active_cycle`` 可能触发旧库补周期）。
     """
     if cycle_id is None:
         cycle_id = _active_cycle(conn)["id"]
-    return tuple(
-        row["id"]
-        for row in _shared_account_rows(conn, cycle_id)
-    )
+    return PCY.cycle_ledger_ids(conn, cycle_id, builtin_scope=ACTIVE_ACCOUNT_IDS)
 
 
 def execution_participant_ids(conn, cycle_id=None):
-    """PR-48：周期**执行资格**账户集合。
+    """PR-48：周期**执行资格**账户集合（实现见 ``paper_cycle_ownership``）。
 
     语义 = ``cycle_ledger_ids`` ∩ 当前可执行 lifecycle（被 lifecycle
     pause 的策略临时退出执行层，但保留在经济账本里）。用于：候选、
     新信号、新开仓、资金预占与新持仓。Risk Exit 另见
     ``_risk_exit_account_ids``（执行参与者 ∪ 仍有剩余 lots 的账户）。
     """
-    return current_cycle_participant_ids(conn, cycle_id)
+    return PCY.execution_participant_ids(conn, cycle_id, builtin_scope=ACTIVE_ACCOUNT_IDS)
 
 
 def strategy_center():
@@ -2527,16 +2416,15 @@ def _active_cycle(conn):
 
 
 def _shared_account_rows(conn, cycle_id=None):
-    """Return the strategy ledgers participating in the shared capital pool."""
+    """Return the strategy ledgers participating in the shared capital pool.
+
+    兼容 facade：所有权谓词与账本行解析在 ``paper_cycle_ownership``；周期
+    选择留在本层（``_active_cycle`` 可能触发旧库补周期）。
+    """
     if cycle_id is None:
         cycle = _active_cycle(conn)
         cycle_id = cycle["id"]
-    active_clause, active_ids = _active_cycle_filter(conn, cycle_id, "id")
-    return _rows(
-        conn,
-        f"SELECT * FROM paper_accounts WHERE cycle_id=? AND {active_clause} ORDER BY id",
-        (cycle_id, *active_ids),
-    )
+    return PCY.cycle_ledger_rows(conn, cycle_id, builtin_scope=ACTIVE_ACCOUNT_IDS)
 
 
 def _shared_initial_cash(conn, cycle=None):
