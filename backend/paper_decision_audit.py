@@ -1,9 +1,11 @@
 # -*- coding: utf-8 -*-
 """Pure point-in-time decision audit helpers for paper trading.
 
-This module mirrors the legacy snapshot serializer. It performs no database
-writes or network I/O. Runtime-only inputs are explicit dependencies so the
-serializer can be parity-tested before the production facade is switched.
+This module owns the decision-snapshot serializer: it is the single source of
+truth for the audit envelope, and ``paper_trading`` exposes a compatibility
+facade that delegates here. It performs no database writes and no network I/O,
+and every runtime-only input (K-line loader, news scan metadata, risk version,
+clock) is an explicit dependency injected by the caller.
 """
 from __future__ import annotations
 
