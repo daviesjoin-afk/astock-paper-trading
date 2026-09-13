@@ -42,6 +42,20 @@ def main() -> int:
         ("N12", "return round(num_fn(funded[\"s\"]) / int(funded[\"n\"]), 2)", "return round(num_fn(funded[\"s\"]) / int(funded[\"n\"]), 0)"),
     ]
     results = []
+
+    baseline = subprocess.run(
+        [sys.executable, "-m", "unittest", "backend.test_paper_cycle_capital", "-q"],
+        cwd=ROOT,
+        env={**os.environ, "PYTHONPATH": "backend"},
+        capture_output=True,
+        text=True,
+    )
+    if baseline.returncode != 0:
+        print("baseline: FAILED")
+        print(baseline.stdout, baseline.stderr)
+        return 1
+    print("baseline: PASS")
+
     try:
         for name, before, after in mutations:
             mutated = replace_once(original, before, after)
