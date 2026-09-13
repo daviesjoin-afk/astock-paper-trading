@@ -37,6 +37,7 @@ import paper_archive_projection as PAP
 import paper_quote_policy as PQP
 import paper_allocation as PA
 import paper_cycle_service as PCS
+import paper_decision_audit as PDA
 import adaptive_selection_compat as ASC
 # ELC / EPD 仍被非 cleanup 路径使用（signal freshness、entry slice plan、
 # dispatch 规划与核验、gated order 查询）。清理动作已移交 paper_slot_service，
@@ -1404,156 +1405,18 @@ def _record_entry_frozen_waitlist(
 # risk review and order can therefore be replayed with one stable envelope,
 # while fields that were not available at decision time stay explicit null/
 # ``unknown`` values instead of being back-filled from a later snapshot.
-DECISION_SNAPSHOT_VERSION = "decision-snapshot-v1"
+#
+# The serializer itself is owned by :mod:`paper_decision_audit`; this block is a
+# compatibility facade that keeps the historical private names importable for
+# existing callers.  It must never grow a second implementation: the aliases
+# below are the extracted functions and nothing else.
+DECISION_SNAPSHOT_VERSION = PDA.DECISION_SNAPSHOT_VERSION
 
-
-def _snapshot_safe(value):
-    """Return JSON-safe values without turning missing evidence into strings."""
-    if value is None:
-        return None
-    if isinstance(value, (dt.datetime, dt.date, dt.time, pd.Timestamp)):
-        return value.isoformat()
-    if isinstance(value, dict):
-        return {str(key): _snapshot_safe(item) for key, item in value.items()}
-    if isinstance(value, (list, tuple, set)):
-        return [_snapshot_safe(item) for item in value]
-    if isinstance(value, float):
-        try:
-            if pd.isna(value):
-                return None
-        except (TypeError, ValueError):
-            pass
-    # numpy scalar values occur in factor/K-line frames.  ``item`` preserves
-    # ordinary numbers while avoiding an import solely for numpy.
-    item = getattr(value, "item", None)
-    if callable(item):
-        try:
-            return _snapshot_safe(item())
-        except (TypeError, ValueError):
-            pass
-    return value
-
-
-def _snapshot_date(value):
-    """Normalise a replay date, returning None for invalid/future-free input."""
-    if value is None or value == "":
-        return None
-    try:
-        return _date(value).isoformat()
-    except (TypeError, ValueError, OverflowError):
-        return None
-
-
-def _snapshot_first(mapping, *keys):
-    if not isinstance(mapping, dict):
-        return None
-    for key in keys:
-        value = mapping.get(key)
-        if value not in (None, ""):
-            return value
-    return None
-
-
-def _snapshot_kline(kline, asof_date=None):
-    """Serialise every completed daily bar and explicitly count future bars."""
-    if kline is None or not hasattr(kline, "iterrows"):
-        return {
-            "source": "unknown", "rows": [], "count": 0,
-            "first_date": None, "last_date": None, "future_rows": 0,
-            "status": "unknown",
-        }
-    cutoff = _snapshot_date(asof_date)
-    rows, future_rows = [], 0
-    raw_columns = getattr(kline, "columns", None)
-    columns = list(raw_columns) if raw_columns is not None else []
-    for index, row in kline.iterrows():
-        try:
-            bar_date = _date(index).isoformat()
-        except (TypeError, ValueError, OverflowError):
-            bar_date = str(index)[:10] or None
-        if cutoff and bar_date and bar_date > cutoff:
-            future_rows += 1
-            continue
-        item = {"date": bar_date}
-        for column in columns:
-            try:
-                item[str(column)] = _snapshot_safe(row[column])
-            except (KeyError, TypeError, IndexError):
-                item[str(column)] = None
-        rows.append(item)
-    dates = [item.get("date") for item in rows if item.get("date")]
-    # Audit payloads are written on every risk decision (every 3 minutes, per
-    # candidate, inside BEGIN IMMEDIATE transactions).  Serialising the full
-    # multi-year bar history made each payload row tens of KB and was a major
-    # driver of paper_risk_decisions growth and memory pressure.  Keep a
-    # bounded recent window as evidence; the summary fields below still
-    # describe the complete series.
-    max_stored_bars = 120
-    omitted_rows = max(0, len(rows) - max_stored_bars)
-    if omitted_rows:
-        rows = rows[-max_stored_bars:]
-    source = _snapshot_safe(getattr(kline, "attrs", {}).get("source")) or "unknown"
-    return {
-        "source": source,
-        "rows": rows,
-        "count": len(rows) + omitted_rows,
-        "rows_stored": len(rows),
-        "omitted_rows": omitted_rows,
-        "first_date": min(dates) if dates else None,
-        "last_date": max(dates) if dates else None,
-        "future_rows": future_rows,
-        "status": (
-            "ok" if rows and not future_rows
-            else ("future_excluded" if future_rows else "unknown")
-        ) + ("_truncated" if omitted_rows else ""),
-    }
-
-
-def _snapshot_factor_evidence(payload):
-    """Extract raw factors and contribution evidence already produced upstream."""
-    payload = payload if isinstance(payload, dict) else {}
-    pick = payload.get("pick") if isinstance(payload.get("pick"), dict) else {}
-    decision = payload.get("decision") if isinstance(payload.get("decision"), dict) else {}
-    entry = decision.get("entry_model") if isinstance(decision.get("entry_model"), dict) else {}
-    raw = dict(pick.get("factor_snapshot") or {})
-    # Preserve scalar factors that pre-date factor_snapshot and any financial
-    # fields passed through by the selection model.
-    for key in (
-        "mom5", "mom20", "mom60", "pe", "pb", "roe", "profit_yoy",
-        "net_profit", "annual_net_profit", "report_date", "annual_report_date",
-        "disclosure_at", "financial_source",
-    ):
-        if key in pick and key not in raw:
-            raw[key] = pick.get(key)
-    components = dict(pick.get("score_components") or {})
-    weights = components.get("weights") if isinstance(components.get("weights"), dict) else {}
-    contributions = {}
-    for key, weight in weights.items():
-        raw_value = raw.get(key)
-        try:
-            contributions[key] = round(float(raw_value) * float(weight), 8) if raw_value is not None else None
-        except (TypeError, ValueError):
-            contributions[key] = None
-    checks = entry.get("checks") if isinstance(entry.get("checks"), list) else []
-    entry_contributions = []
-    for check in checks:
-        if not isinstance(check, dict):
-            continue
-        try:
-            contribution = round(float(check.get("score")) * float(check.get("weight")), 8)
-        except (TypeError, ValueError):
-            contribution = None
-        entry_contributions.append({
-            "name": check.get("name"), "raw_score": check.get("score"),
-            "weight": check.get("weight"), "contribution": contribution,
-            "detail": check.get("detail"),
-        })
-    return {
-        "raw": _snapshot_safe(raw),
-        "contributions": _snapshot_safe(contributions),
-        "score_components": _snapshot_safe(components),
-        "entry_checks": entry_contributions,
-    }
+_snapshot_safe = PDA.snapshot_safe
+_snapshot_date = PDA._snapshot_date
+_snapshot_first = PDA._snapshot_first
+_snapshot_kline = PDA._snapshot_kline
+_snapshot_factor_evidence = PDA._snapshot_factor_evidence
 
 
 def _decision_snapshot(
@@ -1561,148 +1424,42 @@ def _decision_snapshot(
     reason=None, asof_date=None, quote=None, kline=None, news=None,
     final_score=None, decision_at=None,
 ):
-    """Build one point-in-time evidence envelope without changing trade rules."""
-    payload = payload if isinstance(payload, dict) else {}
-    pick = payload.get("pick") if isinstance(payload.get("pick"), dict) else {}
-    model = payload.get("decision") if isinstance(payload.get("decision"), dict) else {}
-    if not model and isinstance(payload.get("model"), dict):
-        model = payload.get("model")
-    if not model and isinstance(payload.get("signal"), dict):
-        model = payload.get("signal")
-    entry = model.get("entry_model") if isinstance(model.get("entry_model"), dict) else {}
-    if not entry and isinstance(payload.get("entry_model"), dict):
-        entry = payload.get("entry_model")
-    quote_data = dict(quote or payload.get("quote") or {})
-    resolved_code = str(code or pick.get("code") or payload.get("code") or "") or None
-    resolved_asof = _snapshot_date(
-        asof_date or payload.get("asof") or payload.get("asof_date")
-        or payload.get("execution_day") or payload.get("signal_date")
-        or payload.get("fill_date")
+    """Compatibility facade for the extracted point-in-time audit serializer.
+
+    Runtime-only dependencies are resolved on every call (never frozen at
+    import time) so callers and tests that patch ``_completed_kline`` /
+    ``_NEWS_SCAN_META`` / ``RISK_VERSION`` / ``_now`` keep their meaning.
+    """
+    return PDA.build_decision_snapshot(
+        payload,
+        account_id=account_id,
+        code=code,
+        side=side,
+        decision=decision,
+        reason=reason,
+        asof_date=asof_date,
+        quote=quote,
+        kline=kline,
+        news=news,
+        final_score=final_score,
+        decision_at=decision_at,
+        kline_loader=_completed_kline,
+        news_scan_meta=_NEWS_SCAN_META,
+        risk_version=RISK_VERSION,
+        now_fn=_now,
     )
-    if kline is None and resolved_code and resolved_asof:
-        try:
-            # This is local-cache only; no network fetch is allowed while
-            # writing an immutable decision record.
-            kline = _completed_kline(resolved_code, resolved_asof, inclusive=True)
-        except Exception:
-            kline = None
-    quote_at = _snapshot_first(quote_data, "quote_at", "time", "timestamp")
-    quote_source = _snapshot_first(quote_data, "quote_source", "source") or "unknown"
-    history = payload.get("history") or payload.get("history_meta") or payload.get("factor", {})
-    history = history if isinstance(history, dict) else {}
-    factor_evidence = _snapshot_factor_evidence(payload)
-    financial_source = _snapshot_first(
-        pick, "financial_source", "finance_source", "fundamental_source"
-    ) or _snapshot_first(history, "financial_source", "finance_source") or "unknown"
-    report_period = _snapshot_first(
-        pick, "report_date", "report_period", "financial_period"
-    ) or _snapshot_first(factor_evidence.get("raw"), "report_date", "report_period")
-    disclosure_at = _snapshot_first(
-        pick, "disclosure_at", "disclosure_time", "announce_at", "announcement_at"
-    ) or _snapshot_first(history, "disclosure_at", "disclosure_time", "announce_at")
-    annual_report_date = _snapshot_first(pick, "annual_report_date") or _snapshot_first(
-        factor_evidence.get("raw"), "annual_report_date"
-    )
-    news_rows = news if news is not None else payload.get("news")
-    news_rows = news_rows if isinstance(news_rows, list) else []
-    news_events = []
-    announcement_times = []
-    for item in news_rows:
-        if not isinstance(item, dict):
-            continue
-        event_time = _snapshot_first(item, "time", "quote_at", "published_at", "announcement_at")
-        event = _snapshot_safe(dict(item))
-        event["event_at"] = event_time
-        news_events.append(event)
-        if item.get("verified") or item.get("source_type") == "announcement_aggregator":
-            if event_time:
-                announcement_times.append(event_time)
-    threshold_context = entry.get("threshold_context") if isinstance(entry.get("threshold_context"), dict) else {}
-    factor_meta = payload.get("factor") if isinstance(payload.get("factor"), dict) else {}
-    selection_meta = factor_meta.get("selection_evolution") if isinstance(factor_meta.get("selection_evolution"), dict) else {}
-    news_learning = entry.get("news_learning") if isinstance(entry.get("news_learning"), dict) else {}
-    components = factor_evidence.get("score_components") or {}
-    threshold_version = (
-        threshold_context.get("version") or selection_meta.get("version")
-        or factor_meta.get("risk_version") or components.get("version")
-        or RISK_VERSION
-    )
-    threshold_value = _snapshot_first(entry, "threshold") or _snapshot_first(threshold_context, "threshold")
-    threshold_delta = _snapshot_first(news_learning, "threshold_delta")
-    if threshold_delta is None:
-        threshold_delta = _snapshot_first(selection_meta, "entry_score_delta")
-    if final_score is None:
-        final_score = (
-            _snapshot_first(entry, "score") or _snapshot_first(model, "final_score", "avg_score")
-            or _snapshot_first(components, "final_score") or _snapshot_first(pick, "score")
-        )
-    final_reason = reason or payload.get("reason") or _snapshot_first(entry, "reason")
-    if not final_reason:
-        reasons = entry.get("reasons") if isinstance(entry.get("reasons"), list) else []
-        blockers = entry.get("blockers") if isinstance(entry.get("blockers"), list) else []
-        final_reason = "；".join(str(item) for item in (reasons or blockers) if item) or None
-    kline_evidence = _snapshot_kline(kline, resolved_asof)
-    history_last = _snapshot_first(history, "last_date", "factor_date")
-    quote_validation = _snapshot_first(quote_data, "quote_validation") or "unknown"
-    data_quality = {
-        "quote": "ok" if quote_at and quote_source != "unknown" and quote_validation in {"cross_source_checked", "range_timestamp_checked"} else ("degraded" if quote_at else "unknown"),
-        "kline": kline_evidence.get("status") or "unknown",
-        "financial": "ok" if report_period else "unknown",
-        "news": "ok" if news_rows else ("stale" if _NEWS_SCAN_META.get("stale") else "unknown"),
-        "history_last_date": history_last,
-        "news_scan": _snapshot_safe(dict(_NEWS_SCAN_META)),
-    }
-    quality_values = [
-        value for key, value in data_quality.items()
-        if key in {"quote", "kline", "financial", "news"} and isinstance(value, str)
-    ]
-    data_quality["overall"] = "degraded" if any(value in {"degraded", "stale", "future_excluded"} for value in quality_values) else (
-        "ok" if all(value in {"ok", None} for value in quality_values[:4]) else "unknown"
-    )
-    return _snapshot_safe({
-        "version": DECISION_SNAPSHOT_VERSION,
-        "decision_at": decision_at or _now(),
-        "asof": resolved_asof,
-        "account_id": account_id,
-        # Account IDs are strategy IDs in the paper ledger.  Persisting the
-        # explicit field keeps audit consumers forward-compatible when a new
-        # account is added without changing the decision schema.
-        "strategy_id": account_id,
-        "code": resolved_code,
-        "side": side,
-        "quote": {
-            "quote_at": quote_at, "source": quote_source,
-            "validation": quote_validation,
-            "cross_check": quote_data.get("quote_cross_check"),
-            "price": quote_data.get("price"), "pct": quote_data.get("pct"),
-        },
-        "kline": kline_evidence,
-        "financial": {
-            "report_period": report_period, "report_date": report_period,
-            "annual_report_date": annual_report_date,
-            "disclosure_at": disclosure_at, "source": financial_source,
-        },
-        "news": {"events": news_events, "announcement_times": announcement_times},
-        "factors": factor_evidence,
-        "threshold": {
-            "version": threshold_version, "value": threshold_value,
-            "delta": threshold_delta,
-            "dynamic": bool(threshold_delta is not None or threshold_context or selection_meta),
-        },
-        "data_quality": data_quality,
-        "final": {
-            "score": final_score, "reason": final_reason,
-            "decision": decision or payload.get("decision_name") or "unknown",
-        },
-    })
 
 
 def _with_decision_snapshot(payload=None, **kwargs):
-    enriched = dict(payload or {}) if isinstance(payload, dict) else {}
-    if kwargs.get("account_id") and "strategy_id" not in enriched:
-        enriched["strategy_id"] = kwargs.get("account_id")
-    enriched["decision_snapshot"] = _decision_snapshot(enriched, **kwargs)
-    return enriched
+    """Compatibility facade that injects runtime dependencies then delegates."""
+    return PDA.with_decision_snapshot(
+        payload,
+        kline_loader=_completed_kline,
+        news_scan_meta=_NEWS_SCAN_META,
+        risk_version=RISK_VERSION,
+        now_fn=_now,
+        **kwargs,
+    )
 
 
 def _order_intent_payload(strategy_id, pick, *, asof_day=None, intended_session=None):
