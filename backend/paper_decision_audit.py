@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
 """Pure point-in-time decision audit helpers for paper trading.
 
-This module serializes evidence only. It deliberately performs no database
-writes and no network I/O. Runtime evidence loaders/state are injected by the
-facade so the audit boundary remains deterministic and independently testable.
+This module mirrors the legacy snapshot serializer. It performs no database
+writes or network I/O. Runtime-only inputs are explicit dependencies so the
+serializer can be parity-tested before the production facade is switched.
 """
 from __future__ import annotations
 
@@ -57,130 +57,193 @@ def snapshot_safe(value):
 
 
 def _snapshot_date(value):
-    if value in (None, ""):
+    """Normalise a replay date, returning None for invalid/future-free input."""
+    if value is None or value == "":
         return None
     try:
         return _date(value).isoformat()
-    except (TypeError, ValueError):
-        text = str(value)
-        return text[:10] or None
+    except (TypeError, ValueError, OverflowError):
+        return None
 
 
-def _snapshot_kline(kline, asof_date):
+def _snapshot_first(mapping, *keys):
+    if not isinstance(mapping, dict):
+        return None
+    for key in keys:
+        value = mapping.get(key)
+        if value not in (None, ""):
+            return value
+    return None
+
+
+def _snapshot_kline(kline, asof_date=None):
+    """Serialise every completed daily bar and explicitly count future bars."""
     if kline is None or not hasattr(kline, "iterrows"):
         return {
-            "status": "unknown", "source": None, "count": 0,
-            "first_date": None, "last_date": None, "omitted_rows": 0,
-            "future_rows": 0, "rows": [],
+            "source": "unknown",
+            "rows": [],
+            "count": 0,
+            "first_date": None,
+            "last_date": None,
+            "future_rows": 0,
+            "status": "unknown",
         }
     cutoff = _snapshot_date(asof_date)
-    rows = []
-    future_rows = 0
+    rows, future_rows = [], 0
+    raw_columns = getattr(kline, "columns", None)
+    columns = list(raw_columns) if raw_columns is not None else []
     for index, row in kline.iterrows():
         try:
             bar_date = _date(index).isoformat()
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             bar_date = str(index)[:10] or None
         if cutoff and bar_date and bar_date > cutoff:
             future_rows += 1
             continue
         item = {"date": bar_date}
-        for column in ("open", "high", "low", "close", "volume", "amount"):
+        for column in columns:
             try:
-                item[column] = snapshot_safe(row[column]) if column in row else None
-            except (KeyError, TypeError, ValueError):
-                item[column] = None
+                item[str(column)] = snapshot_safe(row[column])
+            except (KeyError, TypeError, IndexError):
+                item[str(column)] = None
         rows.append(item)
-    dates = [row["date"] for row in rows if row.get("date")]
-    max_stored_rows = 120
-    omitted_rows = max(0, len(rows) - max_stored_rows)
+    dates = [item.get("date") for item in rows if item.get("date")]
+    max_stored_bars = 120
+    omitted_rows = max(0, len(rows) - max_stored_bars)
     if omitted_rows:
-        rows = rows[-max_stored_rows:]
-    source = snapshot_safe(getattr(kline, "attrs", {}).get("source") or "unknown")
+        rows = rows[-max_stored_bars:]
+    source = snapshot_safe(getattr(kline, "attrs", {}).get("source")) or "unknown"
     return {
-        "status": ("ok" if rows else "unknown") + ("_truncated" if omitted_rows else ""),
         "source": source,
-        "count": len(rows) + omitted_rows,
-        "first_date": dates[0] if dates else None,
-        "last_date": dates[-1] if dates else None,
-        "omitted_rows": omitted_rows,
-        "future_rows": future_rows,
         "rows": rows,
+        "count": len(rows) + omitted_rows,
+        "rows_stored": len(rows),
+        "omitted_rows": omitted_rows,
+        "first_date": min(dates) if dates else None,
+        "last_date": max(dates) if dates else None,
+        "future_rows": future_rows,
+        "status": (
+            "ok"
+            if rows and not future_rows
+            else ("future_excluded" if future_rows else "unknown")
+        )
+        + ("_truncated" if omitted_rows else ""),
     }
 
 
-def _snapshot_factor_evidence(payload, final_score=None):
+def _snapshot_factor_evidence(payload):
+    """Extract raw factors and contribution evidence already produced upstream."""
     payload = payload if isinstance(payload, dict) else {}
     pick = payload.get("pick") if isinstance(payload.get("pick"), dict) else {}
     decision = payload.get("decision") if isinstance(payload.get("decision"), dict) else {}
-    entry = decision.get("entry_model") if isinstance(decision.get("entry_model"), dict) else {}
-
+    entry = (
+        decision.get("entry_model")
+        if isinstance(decision.get("entry_model"), dict)
+        else {}
+    )
     raw = dict(pick.get("factor_snapshot") or {})
     for key in (
-        "score", "price", "pct", "mom5", "mom20", "main_net", "main_pct",
-        "super_net", "vol_ratio", "turnover", "roe", "gross_margin",
-        "net_profit", "annual_net_profit", "profit_source", "report_date",
-        "annual_report_date", "report_published_at", "annual_report_published_at",
-        "industry",
+        "mom5",
+        "mom20",
+        "mom60",
+        "pe",
+        "pb",
+        "roe",
+        "profit_yoy",
+        "net_profit",
+        "annual_net_profit",
+        "report_date",
+        "annual_report_date",
+        "disclosure_at",
+        "financial_source",
     ):
         if key in pick and key not in raw:
             raw[key] = pick.get(key)
-
     components = dict(pick.get("score_components") or {})
-    weights = components.get("weights") if isinstance(components.get("weights"), dict) else {}
-    entry_contributions = {}
+    weights = (
+        components.get("weights")
+        if isinstance(components.get("weights"), dict)
+        else {}
+    )
+    contributions = {}
     for key, weight in weights.items():
         raw_value = raw.get(key)
         try:
-            entry_contributions[str(key)] = (
+            contributions[key] = (
                 round(float(raw_value) * float(weight), 8)
-                if raw_value is not None else None
+                if raw_value is not None
+                else None
             )
         except (TypeError, ValueError):
-            entry_contributions[str(key)] = None
-
-    checks = []
-    for check in entry.get("checks") or []:
+            contributions[key] = None
+    checks = entry.get("checks") if isinstance(entry.get("checks"), list) else []
+    entry_contributions = []
+    for check in checks:
         if not isinstance(check, dict):
             continue
-        item = {key: snapshot_safe(value) for key, value in check.items()}
-        weight = item.get("weight")
-        score = item.get("score")
         try:
-            item["contribution"] = round(float(weight) * float(score), 8)
+            contribution = round(
+                float(check.get("score")) * float(check.get("weight")), 8
+            )
         except (TypeError, ValueError):
-            item["contribution"] = None
-        checks.append(item)
-
+            contribution = None
+        entry_contributions.append(
+            {
+                "name": check.get("name"),
+                "raw_score": check.get("score"),
+                "weight": check.get("weight"),
+                "contribution": contribution,
+                "detail": check.get("detail"),
+            }
+        )
     return {
         "raw": snapshot_safe(raw),
+        "contributions": snapshot_safe(contributions),
         "score_components": snapshot_safe(components),
-        "entry_checks": checks,
-        "entry_weighted_contributions": snapshot_safe(entry_contributions),
-        "selection_score": snapshot_safe(pick.get("score")),
-        "final_score": snapshot_safe(
-            final_score if final_score is not None else entry.get("score")
-        ),
+        "entry_checks": entry_contributions,
     }
 
 
 def build_decision_snapshot(
-    payload=None, *, account_id=None, code=None, side=None, decision=None,
-    reason=None, asof_date=None, quote=None, kline=None, news=None,
-    final_score=None, decision_at=None, kline_loader=None,
-    news_scan_meta=None, risk_version=DEFAULT_RISK_VERSION, now_fn=None,
+    payload=None,
+    *,
+    account_id=None,
+    code=None,
+    side=None,
+    decision=None,
+    reason=None,
+    asof_date=None,
+    quote=None,
+    kline=None,
+    news=None,
+    final_score=None,
+    decision_at=None,
+    kline_loader=None,
+    news_scan_meta=None,
+    risk_version=DEFAULT_RISK_VERSION,
+    now_fn=None,
 ):
     """Build one point-in-time evidence envelope without changing trade rules."""
     payload = payload if isinstance(payload, dict) else {}
-    quote_data = quote if isinstance(quote, dict) else {}
     pick = payload.get("pick") if isinstance(payload.get("pick"), dict) else {}
     model = payload.get("decision") if isinstance(payload.get("decision"), dict) else {}
-    entry = model.get("entry_model") if isinstance(model.get("entry_model"), dict) else {}
-    scan_meta = news_scan_meta if isinstance(news_scan_meta, dict) else _DEFAULT_NEWS_SCAN_META
-
-    resolved_code = str(code or pick.get("code") or quote_data.get("code") or "")
+    if not model and isinstance(payload.get("model"), dict):
+        model = payload.get("model")
+    if not model and isinstance(payload.get("signal"), dict):
+        model = payload.get("signal")
+    entry = (
+        model.get("entry_model")
+        if isinstance(model.get("entry_model"), dict)
+        else {}
+    )
+    if not entry and isinstance(payload.get("entry_model"), dict):
+        entry = payload.get("entry_model")
+    quote_data = dict(quote or payload.get("quote") or {})
+    resolved_code = str(code or pick.get("code") or payload.get("code") or "") or None
     resolved_asof = _snapshot_date(
         asof_date
+        or payload.get("asof")
+        or payload.get("asof_date")
         or payload.get("execution_day")
         or payload.get("signal_date")
         or payload.get("fill_date")
@@ -190,182 +253,202 @@ def build_decision_snapshot(
             kline = kline_loader(resolved_code, resolved_asof, inclusive=True)
         except Exception:
             kline = None
-
-    quote_at = (
-        quote_data.get("quote_at")
-        or quote_data.get("time")
-        or quote_data.get("timestamp")
-        or payload.get("quote_at")
+    quote_at = _snapshot_first(quote_data, "quote_at", "time", "timestamp")
+    quote_source = _snapshot_first(quote_data, "quote_source", "source") or "unknown"
+    history = (
+        payload.get("history")
+        or payload.get("history_meta")
+        or payload.get("factor", {})
     )
-    quote_source = (
-        quote_data.get("source")
-        or quote_data.get("quote_source")
-        or payload.get("quote_source")
-    )
-    quote_validation = (
-        quote_data.get("quote_validation")
-        or payload.get("quote_validation")
-        or quote_data.get("status")
-    )
-
+    history = history if isinstance(history, dict) else {}
+    factor_evidence = _snapshot_factor_evidence(payload)
     financial_source = (
-        pick.get("profit_source")
-        or pick.get("financial_source")
-        or payload.get("financial_source")
+        _snapshot_first(
+            pick, "financial_source", "finance_source", "fundamental_source"
+        )
+        or _snapshot_first(history, "financial_source", "finance_source")
+        or "unknown"
     )
     report_period = (
-        pick.get("report_period")
-        or pick.get("report_date")
-        or payload.get("report_period")
+        _snapshot_first(pick, "report_date", "report_period", "financial_period")
+        or _snapshot_first(factor_evidence.get("raw"), "report_date", "report_period")
     )
     disclosure_at = (
-        pick.get("report_published_at")
-        or pick.get("disclosure_at")
-        or payload.get("disclosure_at")
+        _snapshot_first(
+            pick,
+            "disclosure_at",
+            "disclosure_time",
+            "announce_at",
+            "announcement_at",
+        )
+        or _snapshot_first(
+            history, "disclosure_at", "disclosure_time", "announce_at"
+        )
     )
-    annual_report_period = (
-        pick.get("annual_report_period")
-        or pick.get("annual_report_date")
-        or payload.get("annual_report_period")
-    )
-    annual_disclosure_at = (
-        pick.get("annual_report_published_at")
-        or payload.get("annual_report_published_at")
-    )
-
+    annual_report_date = _snapshot_first(
+        pick, "annual_report_date"
+    ) or _snapshot_first(factor_evidence.get("raw"), "annual_report_date")
+    news_rows = news if news is not None else payload.get("news")
+    news_rows = news_rows if isinstance(news_rows, list) else []
     news_events = []
-    announcement_times = [
-        value for value in (disclosure_at, annual_disclosure_at) if value
-    ]
-    for item in news or payload.get("news") or []:
+    announcement_times = []
+    for item in news_rows:
         if not isinstance(item, dict):
             continue
-        event_time = (
-            item.get("published_at")
-            or item.get("actual_pub_time")
-            or item.get("publication_time")
-            or item.get("time")
-            or item.get("date")
+        event_time = _snapshot_first(
+            item, "time", "quote_at", "published_at", "announcement_at"
         )
-        if event_time:
-            announcement_times.append(event_time)
-        news_events.append({
-            "title": snapshot_safe(item.get("title")),
-            "source": snapshot_safe(item.get("source")),
-            "published_at": snapshot_safe(event_time),
-            "verified": snapshot_safe(item.get("verified")),
-            "risk": snapshot_safe(
-                item.get("risk") if "risk" in item else item.get("negative")
-            ),
-        })
-
-    threshold_context = entry.get("threshold_context")
-    if not isinstance(threshold_context, dict):
-        threshold_context = {}
+        event = snapshot_safe(dict(item))
+        event["event_at"] = event_time
+        news_events.append(event)
+        if item.get("verified") or item.get("source_type") == "announcement_aggregator":
+            if event_time:
+                announcement_times.append(event_time)
+    threshold_context = (
+        entry.get("threshold_context")
+        if isinstance(entry.get("threshold_context"), dict)
+        else {}
+    )
+    factor_meta = payload.get("factor") if isinstance(payload.get("factor"), dict) else {}
+    selection_meta = (
+        factor_meta.get("selection_evolution")
+        if isinstance(factor_meta.get("selection_evolution"), dict)
+        else {}
+    )
+    news_learning = (
+        entry.get("news_learning")
+        if isinstance(entry.get("news_learning"), dict)
+        else {}
+    )
+    components = factor_evidence.get("score_components") or {}
     threshold_version = (
         threshold_context.get("version")
-        or entry.get("model_version")
-        or model.get("version")
-        or payload.get("model_version")
+        or selection_meta.get("version")
+        or factor_meta.get("risk_version")
+        or components.get("version")
+        or risk_version
     )
-    threshold_value = (
-        entry.get("threshold")
-        if entry.get("threshold") is not None
-        else model.get("threshold")
+    threshold_value = _snapshot_first(entry, "threshold") or _snapshot_first(
+        threshold_context, "threshold"
     )
-    factor_evidence = _snapshot_factor_evidence(payload, final_score=final_score)
+    threshold_delta = _snapshot_first(news_learning, "threshold_delta")
+    if threshold_delta is None:
+        threshold_delta = _snapshot_first(selection_meta, "entry_score_delta")
     if final_score is None:
         final_score = (
-            entry.get("score")
-            if entry.get("score") is not None
-            else model.get("score")
+            _snapshot_first(entry, "score")
+            or _snapshot_first(model, "final_score", "avg_score")
+            or _snapshot_first(components, "final_score")
+            or _snapshot_first(pick, "score")
         )
-    final_reason = (
-        reason
-        or payload.get("reason")
-        or model.get("reason")
-        or "no-explicit-reason"
+    final_reason = reason or payload.get("reason") or _snapshot_first(entry, "reason")
+    if not final_reason:
+        reasons = (
+            entry.get("reasons") if isinstance(entry.get("reasons"), list) else []
+        )
+        blockers = (
+            entry.get("blockers") if isinstance(entry.get("blockers"), list) else []
+        )
+        final_reason = (
+            "；".join(str(item) for item in (reasons or blockers) if item) or None
+        )
+    kline_evidence = _snapshot_kline(kline, resolved_asof)
+    history_last = _snapshot_first(history, "last_date", "factor_date")
+    quote_validation = _snapshot_first(quote_data, "quote_validation") or "unknown"
+    scan_meta = (
+        news_scan_meta
+        if isinstance(news_scan_meta, dict)
+        else _DEFAULT_NEWS_SCAN_META
     )
-
-    kline_snapshot = _snapshot_kline(kline, resolved_asof)
-    history_last = kline_snapshot.get("last_date")
-    if resolved_asof and history_last and history_last > resolved_asof:
-        raise ValueError("decision snapshot includes future K-line evidence")
-
     data_quality = {
-        "quote": "ok" if quote_at and quote_source else "unknown",
-        "quote_at": snapshot_safe(quote_at),
-        "quote_source": snapshot_safe(quote_source),
-        "quote_validation": snapshot_safe(quote_validation),
-        "history": kline_snapshot.get("status"),
+        "quote": (
+            "ok"
+            if (
+                quote_at
+                and quote_source != "unknown"
+                and quote_validation
+                in {"cross_source_checked", "range_timestamp_checked"}
+            )
+            else ("degraded" if quote_at else "unknown")
+        ),
+        "kline": kline_evidence.get("status") or "unknown",
+        "financial": "ok" if report_period else "unknown",
+        "news": "ok" if news_rows else ("stale" if scan_meta.get("stale") else "unknown"),
         "history_last_date": history_last,
-        "financial": "ok" if financial_source or disclosure_at else "unknown",
-        "financial_source": snapshot_safe(financial_source),
-        "report_period": snapshot_safe(report_period),
-        "disclosure_at": snapshot_safe(disclosure_at),
-        "annual_report_period": snapshot_safe(annual_report_period),
-        "annual_disclosure_at": snapshot_safe(annual_disclosure_at),
-        "news": "ok" if news_events else "unknown",
-        "news_scan_observed_at": snapshot_safe(scan_meta.get("observed_at")),
+        "news_scan": snapshot_safe(dict(scan_meta)),
     }
     quality_values = [
-        data_quality["quote"], data_quality["history"],
-        data_quality["financial"], data_quality["news"],
+        value
+        for key, value in data_quality.items()
+        if key in {"quote", "kline", "financial", "news"} and isinstance(value, str)
     ]
-    data_quality["status"] = (
-        "ok" if all(value == "ok" for value in quality_values)
-        else "degraded" if any(value == "ok" for value in quality_values)
-        else "unknown"
+    data_quality["overall"] = (
+        "degraded"
+        if any(
+            value in {"degraded", "stale", "future_excluded"}
+            for value in quality_values
+        )
+        else (
+            "ok"
+            if all(value in {"ok", None} for value in quality_values[:4])
+            else "unknown"
+        )
     )
-
     clock = now_fn if callable(now_fn) else _now
-    return snapshot_safe({
-        "version": DECISION_SNAPSHOT_VERSION,
-        "recorded_at": decision_at or clock(),
-        "strategy_id": account_id or payload.get("strategy_id"),
-        "code": resolved_code or None,
-        "side": side or payload.get("side"),
-        "decision": decision or payload.get("decision_name") or "unknown",
-        "reason": final_reason,
-        "asof_date": resolved_asof,
-        "quote": {
-            "price": quote_data.get("price"),
-            "pct": quote_data.get("pct"),
-            "quote_at": quote_at,
-            "source": quote_source,
-            "validation": quote_validation,
-        },
-        "kline": kline_snapshot,
-        "financial": {
-            "source": financial_source,
-            "report_period": report_period,
-            "disclosure_at": disclosure_at,
-            "annual_report_period": annual_report_period,
-            "annual_disclosure_at": annual_disclosure_at,
-        },
-        "news": {
-            "events": news_events,
-            "published_at": announcement_times,
-            "scan_observed_at": scan_meta.get("observed_at"),
-        },
-        "factors": factor_evidence,
-        "threshold": {
-            "version": threshold_version,
-            "value": threshold_value,
-            "context": threshold_context,
-        },
-        "risk_version": risk_version,
-        "data_quality": data_quality,
-        "final": {
-            "score": final_score,
-            "reason": final_reason,
-            "decision": decision or payload.get("decision_name") or "unknown",
-        },
-    })
+    return snapshot_safe(
+        {
+            "version": DECISION_SNAPSHOT_VERSION,
+            "decision_at": decision_at or clock(),
+            "asof": resolved_asof,
+            "account_id": account_id,
+            "strategy_id": account_id,
+            "code": resolved_code,
+            "side": side,
+            "quote": {
+                "quote_at": quote_at,
+                "source": quote_source,
+                "validation": quote_validation,
+                "cross_check": quote_data.get("quote_cross_check"),
+                "price": quote_data.get("price"),
+                "pct": quote_data.get("pct"),
+            },
+            "kline": kline_evidence,
+            "financial": {
+                "report_period": report_period,
+                "report_date": report_period,
+                "annual_report_date": annual_report_date,
+                "disclosure_at": disclosure_at,
+                "source": financial_source,
+            },
+            "news": {
+                "events": news_events,
+                "announcement_times": announcement_times,
+            },
+            "factors": factor_evidence,
+            "threshold": {
+                "version": threshold_version,
+                "value": threshold_value,
+                "delta": threshold_delta,
+                "dynamic": bool(
+                    threshold_delta is not None
+                    or threshold_context
+                    or selection_meta
+                ),
+            },
+            "data_quality": data_quality,
+            "final": {
+                "score": final_score,
+                "reason": final_reason,
+                "decision": decision
+                or payload.get("decision_name")
+                or "unknown",
+            },
+        }
+    )
 
 
 def with_decision_snapshot(payload=None, **kwargs):
-    """Copy ``payload`` and attach a decision snapshot without mutating input."""
+    """Copy payload and attach a parity decision snapshot without mutating input."""
     enriched = dict(payload or {}) if isinstance(payload, dict) else {}
     if kwargs.get("account_id") and "strategy_id" not in enriched:
         enriched["strategy_id"] = kwargs.get("account_id")
