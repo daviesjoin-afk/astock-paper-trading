@@ -14511,12 +14511,14 @@ def _shared_metrics(conn, cycle, positions, quotes):
     _, pending_reserve = _pending_buy_reservations(conn, cycle["id"])
     pool_exposure_cap = RSET.get(conn, "shared_pool_exposure_cap", SHARED_POOL_MAX_EXPOSURE)
     pool_cap = nav * pool_exposure_cap
+    market_session = _market_session()
+    today_available = bool(market_session.get("today_pnl_available"))
     economic_history = _economic_pool_nav_history(conn, cycle)
     previous = next(
         (row for row in reversed(economic_history) if row["nav_date"] < dt.date.today().isoformat()),
         None,
     )
-    today_pnl = nav - _num(previous.get("nav"), None) if previous and _num(previous.get("nav"), None) else None
+    today_pnl = nav - _num(previous.get("nav"), None) if today_available and previous and _num(previous.get("nav"), None) else None
     today_base = _num(previous.get("nav"), None) if previous else None
     pool_nav_rows = [_num(row.get("nav"), 0.0) for row in economic_history]
     pool_nav_rows.append(nav)
@@ -14556,6 +14558,9 @@ def _shared_metrics(conn, cycle, positions, quotes):
         "daily_loss_pct": round(max(0.0, -(today_pnl / today_base * 100)) if today_pnl is not None and today_base else 0.0, 2),
         "max_drawdown_pct": round(pool_drawdown * 100, 2),
         "today_baseline_nav": round(today_base, 2) if today_base else None,
+        "today_pnl_available": today_pnl is not None,
+        "today_pnl_status": market_session["label"] if today_pnl is None else "",
+        "market_session": market_session["code"],
     }
 
 

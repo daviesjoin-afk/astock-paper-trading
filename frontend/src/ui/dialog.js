@@ -7,6 +7,7 @@
    adaptiveConfirm / adaptiveActionNotice / settingsConfirm 保留为兼容包装，
    内部全部走这里，避免出现第二套对话框实现。 */
 import { adaptiveEsc } from "../core/format.js";
+import { setOperatorToken } from "../core/api.js";
 
 var FOCUSABLE = 'button:not([disabled]),[href],input:not([disabled]),select:not([disabled]),textarea:not([disabled]),[tabindex]:not([tabindex="-1"])';
 
@@ -98,7 +99,7 @@ export function confirmDialog(options) {
       + '<h3 id="appConfirmTitle" data-testid="app-confirm-title">' + adaptiveEsc(options.title || '确认操作') + '</h3>'
       + (options.detail ? '<p>' + adaptiveEsc(options.detail) + '</p>' : '')
       + (bullets ? '<ul class="app-modal-list">' + bullets + '</ul>' : '')
-      + (needsInput ? '<label class="app-modal-field">' + adaptiveEsc(options.input.label || '输入') + '<input type="text" data-role="input" value="' + adaptiveEsc(options.input.value || '') + '" placeholder="' + adaptiveEsc(options.input.placeholder || '') + '"></label>' : '')
+      + (needsInput ? '<label class="app-modal-field">' + adaptiveEsc(options.input.label || '输入') + '<input type="' + adaptiveEsc(options.input.type || 'text') + '" data-role="input" value="' + adaptiveEsc(options.input.value || '') + '" placeholder="' + adaptiveEsc(options.input.placeholder || '') + '"></label>' : '')
       + (needsReason ? '<label class="app-modal-field">确认说明<textarea data-role="reason" maxlength="300" placeholder="' + adaptiveEsc(options.placeholder || '请填写原因') + '">' + adaptiveEsc(options.defaultReason || '') + '</textarea></label>' : '')
       + '<footer><button type="button" class="ghost" data-action="cancel">' + adaptiveEsc(options.cancelText || '取消') + '</button>'
       + '<button type="button" class="' + (options.danger ? 'danger' : 'primary') + '" data-action="approve">' + adaptiveEsc(options.confirmText || '确认') + '</button></footer></section>';
@@ -171,4 +172,48 @@ export function adaptiveActionNotice(title, detail) {
 export function settingsConfirm(message) {
   return confirmDialog({ kicker: '设置确认', title: '确认修改设置？', detail: String(message || ''), confirmText: '确认' })
     .then(function (result) { return !!result.approved; });
+}
+
+/** 快捷操作员解锁弹窗：401 时引导用户直接在当前标签页输入 token 解锁并重试 */
+export async function promptOperatorUnlock(options) {
+  options = options || {};
+  var actionName = options.actionName || '此操作';
+  var result = await confirmDialog({
+    kicker: '操作员授权 · 需解锁',
+    title: '需要操作员凭据',
+    detail: '执行「' + actionName + '」需要操作员授权凭据（ASTOCK_OPERATOR_TOKEN）。凭据仅保存在当前标签页，关闭标签页即失效。',
+    bullets: ['请粘贴操作员凭据以解锁当前标签页', '解锁成功后将自动继续执行当前操作'],
+    confirmText: '解锁并继续',
+    cancelText: '取消',
+    input: {
+      type: 'password',
+      label: '操作员凭据 (Token)',
+      placeholder: '粘贴操作员凭据',
+      value: '',
+    },
+  });
+  if (!result.approved || !result.value) {
+    toast('操作已取消（未解锁授权）', { tone: 'warn' });
+    return false;
+  }
+  setOperatorToken(result.value);
+  var stateNode = document.getElementById('operatorUnlockState');
+  if (stateNode) stateNode.textContent = '本标签页已授权';
+  toast('本标签页已成功解锁！');
+  if (typeof options.onUnlocked === 'function') {
+    try {
+      await options.onUnlocked();
+    } catch (err) {
+      toast('重试操作失败：' + (err.message || err), { tone: 'danger' });
+    }
+  }
+  return true;
+}
+
+export async function handleOperatorError(err, actionName, onRetry) {
+  var is401 = err && (err.status === 401 || (String(err.message || '').indexOf('operator authentication') >= 0));
+  if (is401) {
+    return await promptOperatorUnlock({ actionName: actionName, onUnlocked: onRetry });
+  }
+  return false;
 }

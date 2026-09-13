@@ -173,7 +173,7 @@ def run_daily(strategies=None, topn: int = DEFAULT_TOPN, run_date: str | None = 
                     message = str(result.get("message") or "选股数据尚未就绪")
                     factor_date = str(result.get("factor_date") or "")
                 else:
-                    raw = (result or {}).get("picks") or []
+                    raw = (result or {}).get("picks") or (result or {}).get("shadow_picks") or []
                     factor_date = _trade_date_of(result)
                     for index, pick in enumerate(raw[:topn], start=1):
                         news_check = pick.get("news_check") or {}

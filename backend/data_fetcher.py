@@ -1068,7 +1068,7 @@ def _fetch_finance_report(report_date):
     while page <= 60:
         params = {
             "reportName": "RPT_LICO_FN_CPD",
-            "columns": "SECURITY_CODE,SECURITY_NAME_ABBR,WEIGHTAVG_ROE,YSTZ,SJLTZ,PARENT_NETPROFIT,BASIC_EPS,BPS,REPORTDATE",
+            "columns": "SECURITY_CODE,SECURITY_NAME_ABBR,WEIGHTAVG_ROE,YSTZ,SJLTZ,PARENT_NETPROFIT,BASIC_EPS,BPS,REPORTDATE,NOTICE_DATE",
             "filter": f"(REPORTDATE='{report_date}')",
             "pageNumber": page, "pageSize": 500,
             "sortColumns": "SECURITY_CODE", "sortTypes": 1,
@@ -1082,6 +1082,7 @@ def _fetch_finance_report(report_date):
         if not data:
             break
         for d in data:
+            notice_val = d.get("NOTICE_DATE")
             rows.append({
                 "code": str(d.get("SECURITY_CODE")),
                 "name": d.get("SECURITY_NAME_ABBR"),
@@ -1090,6 +1091,8 @@ def _fetch_finance_report(report_date):
                 "net_profit": d.get("PARENT_NETPROFIT"),
                 "eps": d.get("BASIC_EPS"), "bps": d.get("BPS"),
                 "report_date": report_date,
+                "notice_date": notice_val,
+                "report_published_at": notice_val,
             })
         if page >= result.get("pages", 1):
             break

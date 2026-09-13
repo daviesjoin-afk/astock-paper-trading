@@ -4,7 +4,7 @@ import { api, apiPost } from "../core/api.js";
 import { $, setEl } from "../core/dom.js";
 import { adaptiveEsc, adaptiveSafeUrl, adaptiveText, fmt, pctCls, pctTxt } from "../core/format.js";
 import { allocationActionPanel } from "./execution.js";
-import { adaptiveActionNotice, adaptiveConfirm } from "../ui/dialog.js";
+import { adaptiveActionNotice, adaptiveConfirm, handleOperatorError } from "../ui/dialog.js";
 
 export function adaptiveStageClass(stage){
   if(stage==='eligible_for_review'||stage==='advisory') return 'ready';
@@ -455,14 +455,20 @@ export async function runAdaptive(){
       }
     }
   }
-  catch(e){adaptiveActionNotice('模拟盘学习失败',e.message);}
+  catch(e){
+    var handled=await handleOperatorError(e, '运行模拟盘学习', runAdaptive);
+    if(!handled) adaptiveActionNotice('模拟盘学习失败',e.message);
+  }
   finally{if(button){button.disabled=false;button.textContent='运行模拟盘学习';}}
 }
 
 export async function approveAdaptiveNeural(){
   var confirmation=await adaptiveConfirm({title:'批准神经网络影子评分',detail:'神经网络只作为三个短线策略的候选排序参考。',boundary:'不会绕过行情双源、仓位、T+1 或风控门禁；不会直接下单。'}); if(!confirmation.approved) return;
   try{renderAdaptive(await apiPost('/api/adaptive/neural/approve?confirmed=true'));}
-  catch(e){adaptiveActionNotice('神经网络仍未达到放权门槛',e.message);}
+  catch(e){
+    var handled=await handleOperatorError(e, '批准神经网络影子评分', approveAdaptiveNeural);
+    if(!handled) adaptiveActionNotice('神经网络仍未达到放权门槛',e.message);
+  }
 }
 
 /* ─── AI审阅与调参 JavaScript 函数 ─── */
@@ -677,7 +683,10 @@ export async function runAdaptiveAiTuning(){
   var button=$('adaptiveAiTuneButton')||$('adaptiveAiTuneInlineButton');
   if(button){button.disabled=true;button.textContent='AI调参校验中…';}
   try{renderAdaptive(await apiPost('/api/adaptive/ai/tune?trigger=manual-ui&mode=intraday&confirmed=true'));}
-  catch(e){adaptiveActionNotice('AI 有界调参失败',e.message);}
+  catch(e){
+    var handled=await handleOperatorError(e, '运行AI有界调参', runAdaptiveAiTuning);
+    if(!handled) adaptiveActionNotice('AI 有界调参失败',e.message);
+  }
   finally{if(button){button.disabled=false;button.textContent='运行AI有界调参';}}
 }
 
@@ -685,7 +694,10 @@ export async function runNewsLearning(){
   var confirmation=await adaptiveConfirm({title:'运行情报与事件学习',detail:'将采集并校准公告、新闻和事件证据。',boundary:'仅更新研究与影子证据，不会直接触发买卖。'}); if(!confirmation.approved) return;
   var button=$('newsLearningRunButton'); if(button){button.disabled=true;button.textContent='采集与校准中…';}
   try{renderAdaptive(await apiPost('/api/adaptive/news/run?trigger=manual-ui&confirmed=true'));}
-  catch(e){adaptiveActionNotice('新闻学习失败',e.message);}
+  catch(e){
+    var handled=await handleOperatorError(e, '运行情报与事件学习', runNewsLearning);
+    if(!handled) adaptiveActionNotice('新闻学习失败',e.message);
+  }
   finally{if(button){button.disabled=false;button.textContent='运行新闻学习';}}
 }
 
@@ -693,7 +705,10 @@ export async function runAdaptiveAdvisor(){
   var confirmation=await adaptiveConfirm({title:'运行数据质量审阅',detail:'将校验全市场行情、双源一致性与模拟盘账本。',boundary:'审阅只输出证据和异常，不会下单或修改风控。'}); if(!confirmation.approved) return;
   var button=$('advisorRunButton'); if(button){button.disabled=true;button.textContent='审阅中…';}
   try{renderAdaptive(await apiPost('/api/adaptive/advisor/run?trigger=manual-ui&confirmed=true'));}
-  catch(e){adaptiveActionNotice('数据质量审阅失败',e.message);}
+  catch(e){
+    var handled=await handleOperatorError(e, '运行数据质量审阅', runAdaptiveAdvisor);
+    if(!handled) adaptiveActionNotice('数据质量审阅失败',e.message);
+  }
   finally{if(button){button.disabled=false;button.textContent='运行数据质量审阅';}}
 }
 
@@ -701,7 +716,10 @@ export async function runAdaptiveResearchTask(purpose,button){
   var confirmation=await adaptiveConfirm({title:'运行研究任务',detail:'将运行该项 AI 研究并写入可追溯的影子证据。',boundary:'不会直接改变策略参数或交易。'}); if(!confirmation.approved) return;
   if(button){button.disabled=true;button.textContent='运行中…';}
   try{renderAdaptive(await apiPost('/api/adaptive/advisor/run?trigger=manual-ui&purpose='+encodeURIComponent(purpose)+'&confirmed=true'));}
-  catch(e){adaptiveActionNotice('研究任务失败',e.message);}
+  catch(e){
+    var handled=await handleOperatorError(e, '运行研究任务', function(){ return runAdaptiveResearchTask(purpose, button); });
+    if(!handled) adaptiveActionNotice('研究任务失败',e.message);
+  }
   finally{if(button){button.disabled=false;button.textContent='单独运行';}}
 }
 
@@ -709,7 +727,10 @@ export async function runAdaptiveResearchSuite(){
   var confirmation=await adaptiveConfirm({title:'运行全部研究任务',detail:'将依次运行已启用的 AI 研究任务。',boundary:'只生成研究证据，不会直接交易或放宽风控。'}); if(!confirmation.approved) return;
   var button=$('advisorSuiteButton'); if(button){button.disabled=true;button.textContent='研究套件运行中…';}
   try{renderAdaptive(await apiPost('/api/adaptive/advisor/suite?trigger=manual-suite&confirmed=true'));}
-  catch(e){adaptiveActionNotice('研究套件失败',e.message);}
+  catch(e){
+    var handled=await handleOperatorError(e, '运行全部研究任务', runAdaptiveResearchSuite);
+    if(!handled) adaptiveActionNotice('研究套件失败',e.message);
+  }
   finally{if(button){button.disabled=false;button.textContent='运行全部研究任务';}}
 }
 
@@ -718,20 +739,29 @@ export async function recordAdaptiveFeedback(accountId,verdict){
   var confirmation=await adaptiveConfirm({title:verdict==='approve'?'记录人工认可':'记录继续观察',detail:'该反馈会写入策略学习审计。',boundary:'仅影响后续研究证据，不会直接放权或下单。',reason:true,placeholder:'请填写判断依据'}); if(!confirmation.approved) return;
   var note=confirmation.reason;
   try{renderAdaptive(await apiPost('/api/adaptive/feedback?decision_id='+window._adaptiveDecisionId+'&account_id='+encodeURIComponent(accountId)+'&verdict='+encodeURIComponent(verdict)+'&note='+encodeURIComponent(note)+'&confirmed=true'));}
-  catch(e){adaptiveActionNotice('记录人工反馈失败',e.message);}
+  catch(e){
+    var handled=await handleOperatorError(e, '记录人工反馈', function(){ return recordAdaptiveFeedback(accountId, verdict); });
+    if(!handled) adaptiveActionNotice('记录人工反馈失败',e.message);
+  }
 }
 
 export async function applyAdaptiveSelectionCandidate(candidateId){
   if(!candidateId) return;
   var confirmation=await adaptiveConfirm({title:'批准选股进化版本',detail:'批准后会写入对应模拟策略的内部选股参数。',boundary:'仅作用于模拟盘，可在版本管理中回滚；不会改公共选股。'}); if(!confirmation.approved) return;
   try{renderAdaptive(await apiPost('/api/adaptive/selection/apply?candidate_id='+encodeURIComponent(candidateId)+'&approved_by=human-ui&confirmed=true'));}
-  catch(e){adaptiveActionNotice('选股版本未能应用',e.message);}
+  catch(e){
+    var handled=await handleOperatorError(e, '批准选股进化版本', function(){ return applyAdaptiveSelectionCandidate(candidateId); });
+    if(!handled) adaptiveActionNotice('选股版本未能应用',e.message);
+  }
 }
 
 export async function applyAdaptiveRiskCandidate(candidateId){
   var confirmation=await adaptiveConfirm({title:'批准风控进化版本',detail:'批准后会更新对应模拟策略的受限风控参数。',boundary:'仅作用于模拟盘并保留回滚；不会放宽硬风控或连接实盘。'}); if(!confirmation.approved) return;
   try{renderAdaptive(await apiPost('/api/adaptive/risk/apply?candidate_id='+candidateId+'&approved_by=human-ui&confirmed=true'));}
-  catch(e){adaptiveActionNotice('风控版本未能晋级',e.message);}
+  catch(e){
+    var handled=await handleOperatorError(e, '批准风控进化版本', function(){ return applyAdaptiveRiskCandidate(candidateId); });
+    if(!handled) adaptiveActionNotice('风控版本未能晋级',e.message);
+  }
 }
 
 export async function rollbackAdaptiveRisk(accountId){

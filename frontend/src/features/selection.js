@@ -2,6 +2,7 @@
 // 跨模块依赖（由原单文件作用域推导）
 import { api, apiPost } from "../core/api.js";
 import { $, tableScroll } from "../core/dom.js";
+import { handleOperatorError } from "../ui/dialog.js";
 import { adaptiveEsc, dataValidityTone, fmt, pctCls, pctTxt, sellTag, sigTag, yi } from "../core/format.js";
 import { APP_PAGE_KEY } from "../core/navigation.js";
 import { PAPER_NAV_TTL_MS } from "../core/state.js";
@@ -134,7 +135,8 @@ export async function runPaperSelection(){
     var done=(d.strategies||[]).map(function(s){return s.label+' '+s.status+'('+s.picks.length+')';}).join(' · ');
     if(target) target.insertAdjacentHTML('afterbegin','<div class="tag tag-ok">已重跑：'+adaptiveEsc(done)+'</div>');
   }catch(e){
-    if(target) target.innerHTML='<div class="banner">重跑失败：'+adaptiveEsc(e.message||e)+'</div>';
+    var handled = await handleOperatorError(e, '重跑策略选股', runPaperSelection);
+    if(!handled && target) target.innerHTML='<div class="banner">重跑失败：'+adaptiveEsc(e.message||e)+'</div>';
   }finally{ if(btn) btn.disabled=false; }
 }
 
