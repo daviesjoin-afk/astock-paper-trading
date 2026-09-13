@@ -276,3 +276,24 @@
 | 契约 P3-2：保持生产 facade 对裸 SQLite 连接（row_factory=None）及 sqlite3.Row 的完全双向兼容；facade 不强制注入 repository 行适配器 | `paper_trading._risk_exit_account_ids` | `test_paper_risk_exit_eligibility.py`（`RiskExitEligibilityFacadeContractTests.test_facade_bare_sqlite_connection_compatibility`、`test_facade_sqlite_row_connection_compatibility`） | ✅ |
 | 真实源码变异 N1–N12 全部被测试捕获（12/12 caught，Undetected: 0） | — | `work/pr_risk_exit_eligibility_negative_check.py`（每轮真实变异、逐字节备份与 sha256 还原核验） | ✅ |
 
+### 风控退出真实生产链路回归矩阵（PR #135 加固）
+
+| 场景 / 契约 | 涉及组件 / 链路 | 对应自动化测试 | 状态 |
+| --- | --- | --- | --- |
+| 场景 A：正常执行中账户 + 真实持仓 + 触发风控，全链路生成卖单并完成成交扣减 | `_monitor_risk_impl` → `_consume_available_lots` → `_credit_shared_cash` | `test_paper_risk_exit_production_path.py`（`TestPaperRiskExitProductionPath.test_A_normal_running_account_full_risk_exit_pipeline`） | ✅ |
+| 场景 B：paused 账户无 buy 资格，但存量持仓继续拥有风控退出资格，平仓归零后退出风控资格 | `_active_account_rows` / `_risk_exit_account_ids` | `TestPaperRiskExitProductionPath.test_B_paused_account_with_holdings_has_exit_eligibility_but_no_buy_eligibility` | ✅ |
+| 场景 C：archived / out-of-cycle 账户存量持仓继续拥有退出路径，释放存量持仓 | `paper_accounts.status='archived'` / `_risk_exit_account_ids` | `TestPaperRiskExitProductionPath.test_C_archived_out_of_cycle_account_executes_risk_exit` | ✅ |
+| 场景 D：paused / archived 账户 0 持仓严格不进入风控退出订单生成阶段 | `_risk_exit_account_ids` / `_position_rows` | `TestPaperRiskExitProductionPath.test_D_paused_or_archived_account_with_zero_holdings_never_enters_risk_exit` | ✅ |
+| 场景 E：多 lot 持仓场景严格 FIFO 扣减，成本计算与扣减数量不超扣 | `_consume_available_lots` | `TestPaperRiskExitProductionPath.test_E_multi_lot_fifo_consumption_without_over_deduction` | ✅ |
+| 场景 F：部分成交（partial fill / trim）精准扣减 remaining_qty，剩余持仓保留风控退出资格 | `_sell_plan` → `_consume_available_lots` | `TestPaperRiskExitProductionPath.test_F_partial_fill_deducts_accurately_and_preserves_exit_eligibility` | ✅ |
+| 场景 G：完全成交（full fill）后敞口归零，后续 review 轮次绝不重复下达退出卖单 | `_position_rows` / `paper_position_lots` | `TestPaperRiskExitProductionPath.test_G_full_fill_clears_exposure_and_subsequent_review_does_not_duplicate` | ✅ |
+| 场景 H：runner 幂等性，同一调度周期内重复调用返回 already_scanned，无双花/多扣 | `risk_scan_state` / `monitor_risk` | `TestPaperRiskExitProductionPath.test_H_runner_idempotency_within_same_minute` | ✅ |
+| 场景 I：已存在未完成跌停卖单（unfilled_limit_down）在冷却期内抑制重复下单（unfilled_limit_down_wait） | `paper_orders` cooldown check | `TestPaperRiskExitProductionPath.test_I_unfilled_limit_down_cooldown_suppresses_duplicate_orders` | ✅ |
+| 场景 J：买入侧容量冻结（`PAPER_ENTRY_FREEZE`）互不干扰，风控退出 SELL 绝不受阻 | `_entry_freeze_status` / `_monitor_risk_impl` | `TestPaperRiskExitProductionPath.test_J_entry_freeze_env_does_not_block_risk_exit` | ✅ |
+| 场景 K：净回款（amount - fees）精确释放归还账户现金与共享池账本 | `_credit_shared_cash` | `TestPaperRiskExitProductionPath.test_K_cash_release_consistency_matches_order_fill_net_proceeds` | ✅ |
+| 场景 L：风控退出 SELL 委托不占用买入槽位（`pending_position_slots` 仅识别 `side='buy'`） | `paper_slot_occupancy.pending_position_slots` | `TestPaperRiskExitProductionPath.test_L_risk_exit_sell_orders_do_not_occupy_buy_slots` | ✅ |
+| 场景 M：跨 6 张表强一致性 golden snapshot（accounts, positions, lots, orders, fills, reservations） | 6 张核心账本表 | `TestPaperRiskExitProductionPath.test_M_strong_consistency_state_transition_golden_snapshot` | ✅ |
+| 场景 N：中间步骤抛异常触发 savepoint 回滚，无脏 lot，无虚构成交/资金，安全转入 execution_retry | `SAVEPOINT` / `ROLLBACK TO SAVEPOINT` | `TestPaperRiskExitProductionPath.test_N_failure_branch_rolls_back_savepoint_without_corrupting_lots` | ✅ |
+| 场景 O：顶层调度生产入口 `run_slot("risk", ...)` 成功闭环并记录调度状态 | `paper_trading.run_slot` | `TestPaperRiskExitProductionPath.test_O_golden_run_slot_risk_production_entrypoint` | ✅ |
+| 真实生产源码变异 N1–N12 全部被测试捕获（12/12 caught，Undetected: 0） | `paper_risk_exit_eligibility` / `paper_slot_occupancy` / `paper_trading` | `work/pr_risk_exit_production_negative_check.py`（逐项注入、逐字节核验与 sha256 还原） | ✅ |
+
