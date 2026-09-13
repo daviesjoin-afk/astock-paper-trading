@@ -36,15 +36,20 @@ def pending_position_slots(
         if int(num_fn(item.get("qty"))) >= lot_size
     }
     status_list = list(occupying_statuses)
+
+    excluded_id: int | None = None
+    if exclude_order_key is not None:
+        excluded_id = int(exclude_order_key)
+
     if not status_list:
         return set()
 
     placeholders = ",".join("?" for _ in status_list)
     where = f"origin IN ('manual','strategy') AND side='buy' AND status IN ({placeholders})"
     params: list[Any] = list(status_list)
-    if exclude_order_key is not None:
+    if excluded_id is not None:
         where += " AND id<>?"
-        params.append(int(exclude_order_key))
+        params.append(excluded_id)
 
     rows = rows_fn(conn, f"SELECT account_id,code FROM paper_orders WHERE {where}", tuple(params))
     return {

@@ -130,6 +130,22 @@ class SlotOccupancyFilteringTests(OrderDatabaseMixin, unittest.TestCase):
         self.add_order(account_id="acc1", code="600001", origin="strategy", side="buy", status="pending_limit")
         self.assertEqual(set(), self.pending_slots(positions=[], occupying_statuses=()))
 
+    def test_empty_statuses_still_validate_invalid_exclude_before_return(self):
+        rows_fn = mock.MagicMock()
+
+        with self.assertRaises(ValueError):
+            PSO.pending_position_slots(
+                self.conn,
+                [],
+                exclude_order_key="not-an-int",
+                occupying_statuses=(),
+                lot_size=100,
+                num_fn=float,
+                rows_fn=rows_fn,
+            )
+
+        rows_fn.assert_not_called()
+
 
 class SlotOccupancyIdentityAndSuppressionTests(OrderDatabaseMixin, unittest.TestCase):
     def test_distinct_identity_same_account_same_code_is_one_slot(self):
