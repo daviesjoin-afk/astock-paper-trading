@@ -79,6 +79,16 @@ def _rows(conn, sql, params=()):
     return [dict(zip(columns, row, strict=True)) for row in cursor.fetchall()]
 
 
+def _row(conn, sql, params=()):
+    """把单行查询结果组装成普通 dict，不依赖调用方的 ``row_factory``。"""
+    cursor = conn.execute(sql, params)
+    row = cursor.fetchone()
+    if row is None:
+        return None
+    columns = [str(item[0]) for item in cursor.description or ()]
+    return dict(zip(columns, row, strict=True))
+
+
 def _loads(value, default=None):
     """与 ``paper_trading._loads`` 同形的宽松 JSON 解码（缺失 → ``default``）。"""
     try:
@@ -123,7 +133,7 @@ def cycle_ledger_filter(conn, cycle_id, column="id", *, builtin_scope):
     """
     configured_ids = None
     try:
-        cycle_row = conn.execute("SELECT enabled_strategies FROM paper_cycles WHERE id=?", (cycle_id,)).fetchone()
+        cycle_row = _row(conn, "SELECT enabled_strategies FROM paper_cycles WHERE id=?", (cycle_id,))
         parsed = _loads(cycle_row["enabled_strategies"], None) if cycle_row and cycle_row["enabled_strategies"] else None
         if isinstance(parsed, list):
             user_ids = set(USP.user_known_ids(conn))
@@ -199,14 +209,15 @@ def cycle_participant_resolution(conn, cycle_id=None, *, builtin_scope):
                 "version": CYCLE_PARTICIPANT_VERSION}
     try:
         if cycle_id is None:
-            cycle_row = conn.execute(
+            cycle_row = _row(
+                conn,
                 "SELECT id,enabled_strategies FROM paper_cycles "
                 "WHERE status IN ('draft','running','paused') ORDER BY id DESC LIMIT 1"
-            ).fetchone()
+            )
         else:
-            cycle_row = conn.execute(
-                "SELECT id,enabled_strategies FROM paper_cycles WHERE id=?", (int(cycle_id),)
-            ).fetchone()
+            cycle_row = _row(
+                conn, "SELECT id,enabled_strategies FROM paper_cycles WHERE id=?", (int(cycle_id),)
+            )
     except sqlite3.Error:
         cycle_row = None
     if cycle_row is None:

@@ -364,12 +364,40 @@ class EconomicOwnershipContractTests(unittest.TestCase):
             "enabled_strategies TEXT);"
             "CREATE TABLE paper_accounts(id TEXT PRIMARY KEY, cycle_id INTEGER, status TEXT, "
             "cash REAL, initial_cash REAL);"
+            "CREATE TABLE strategy_definitions(id TEXT PRIMARY KEY, origin TEXT, "
+            "lifecycle_status TEXT, supports_new_cycle INTEGER);"
         )
+        _registry(bare, USER_A)
         _cycle(bare, 1, [USER_A])
         _account(bare, USER_A, 1, cash=10.0)
+        _account(bare, "bound_but_not_enabled", 1, cash=20.0)
+        self.assertEqual((USER_A,), PCY.cycle_ledger_ids(bare, 1, builtin_scope=SCOPE))
         rows = PCY.cycle_ledger_rows(bare, 1, builtin_scope=SCOPE)
         self.assertEqual([{"id": USER_A, "cycle_id": 1, "status": "running",
                            "cash": 10.0, "initial_cash": 0.0}], rows)
+        self.assertIsNone(bare.row_factory)
+
+    def test_bare_connection_execution_resolution_uses_cycle_snapshot(self):
+        """执行解析的周期快照读取也必须兼容裸连接。"""
+        bare = sqlite3.connect(":memory:")
+        self.addCleanup(bare.close)
+        bare.executescript(
+            "CREATE TABLE paper_cycles(id INTEGER PRIMARY KEY, status TEXT, capital REAL, "
+            "enabled_strategies TEXT);"
+            "CREATE TABLE paper_accounts(id TEXT PRIMARY KEY, cycle_id INTEGER, status TEXT, "
+            "cash REAL, initial_cash REAL);"
+            "CREATE TABLE strategy_definitions(id TEXT PRIMARY KEY, origin TEXT, "
+            "lifecycle_status TEXT, supports_new_cycle INTEGER);"
+        )
+        _registry(bare, USER_A)
+        _cycle(bare, 7, [USER_A])
+        _account(bare, USER_A, 7)
+        resolution = PCY.cycle_participant_resolution(bare, 7, builtin_scope=SCOPE)
+        self.assertEqual("cycle_snapshot", resolution["source"])
+        self.assertEqual((USER_A,), resolution["ids"])
+        self.assertEqual(7, resolution["cycle_id"])
+        self.assertEqual((USER_A,), resolution["enabled"])
+        self.assertEqual(frozenset({USER_A}), resolution["bound"])
         self.assertIsNone(bare.row_factory)
 
 
