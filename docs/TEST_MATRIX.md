@@ -272,5 +272,6 @@
 | 契约 L：新模块纯只读，sqlite authorizer 拦截写操作码，源码无写 SQL 关键字 | `paper_risk_exit_eligibility` | `RiskExitEligibilityArchitectureGuardTests.test_L_module_is_read_only` | ✅ |
 | 契约 M：新模块纯 stdlib，无反向导入 `paper_trading` | `paper_risk_exit_eligibility` | `RiskExitEligibilityArchitectureGuardTests.test_M_module_stdlib_only_and_no_reverse_import` | ✅ |
 | 契约 N：新模块不重新实现周期所有权或执行参与者逻辑，无跨边界表查询 | `paper_risk_exit_eligibility` | `RiskExitEligibilityArchitectureGuardTests.test_N_module_does_not_reimplement_cycle_or_execution` | ✅ |
-| 真实源码变异 N1–N10 全部被测试捕获（10/10 caught，Undetected: 0） | — | `work/pr_risk_exit_eligibility_negative_check.py`（每轮真实变异、逐字节备份与 sha256 还原核验） | ✅ |
+| 契约 P3：保持 exact legacy account ID 语义，不得 strip()、normalize 或 validate 账户 ID；base_account_ids 保留原始对象身份；持仓行 raw truthy value 保留 str(val)（包括带空格字符串） | `paper_risk_exit_eligibility.risk_exit_account_ids` | `test_paper_risk_exit_eligibility.py`（`RiskExitEligibilityContractTests.test_exact_legacy_account_id_semantics`、`test_raw_account_id_extraction_without_normalization`） | ✅ |
+| 真实源码变异 N1–N11 全部被测试捕获（11/11 caught，Undetected: 0） | — | `work/pr_risk_exit_eligibility_negative_check.py`（每轮真实变异、逐字节备份与 sha256 还原核验） | ✅ |
 

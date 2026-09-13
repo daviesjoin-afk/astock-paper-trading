@@ -169,6 +169,47 @@ class RiskExitEligibilityContractTests(unittest.TestCase):
         self.assertEqual(res, {"base_acc", "dict_acc_1", "dict_acc_2"})
         mock_rows_fn.assert_called_once()
 
+    # Exact legacy account ID semantics (Review 1/2 P3 regression)
+    def test_exact_legacy_account_id_semantics(self):
+        # 1. base ID "  base_id  " remains exactly "  base_id  " (no strip)
+        # 2. base values retain Python identity semantics (not forced through str())
+        sentinel_base = object()
+        base_ids = ["  base_id  ", "normal_base", sentinel_base]
+
+        # 3. holding ID "  held_id  " remains exactly "  held_id  " (no strip)
+        self._add_lot("  held_id  ", 10.0)
+        # 4. holding whitespace-only "   " remains present because truthy
+        self._add_lot("   ", 20.0)
+        # 5. holding empty string is excluded
+        self._add_lot("", 30.0)
+        # 6. holding None is excluded
+        self.conn.execute("INSERT INTO paper_position_lots (account_id, remaining_qty) VALUES (NULL, 40.0)")
+        # 7. ordinary canonical IDs remain unchanged
+        self._add_lot("normal_held", 50.0)
+
+        res = PRE.risk_exit_account_ids(self.conn, base_account_ids=base_ids)
+
+        self.assertIn("  base_id  ", res)
+        self.assertNotIn("base_id", res)
+        self.assertIn("normal_base", res)
+        self.assertIn(sentinel_base, res)
+
+        self.assertIn("  held_id  ", res)
+        self.assertNotIn("held_id", res)
+        self.assertIn("   ", res)
+        self.assertNotIn("", res)
+        self.assertNotIn(None, res)
+        self.assertIn("normal_held", res)
+
+        self.assertEqual(res, {"  base_id  ", "normal_base", sentinel_base, "  held_id  ", "   ", "normal_held"})
+
+    def test_raw_account_id_extraction_without_normalization(self):
+        self.assertEqual(PRE._raw_account_id({"account_id": "  foo  "}), "  foo  ")
+        self.assertEqual(PRE._raw_account_id(("  bar  ",)), "  bar  ")
+        self.assertEqual(PRE._raw_account_id({"account_id": "   "}), "   ")
+        self.assertEqual(PRE._raw_account_id({"account_id": ""}), "")
+        self.assertIsNone(PRE._raw_account_id({"account_id": None}))
+
 
 class RiskExitEligibilityFacadeContractTests(unittest.TestCase):
     def setUp(self):
