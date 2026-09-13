@@ -43,6 +43,7 @@ import paper_shared_cash as PSC
 import paper_user_account_provisioning as PUAP
 import paper_user_cycle_attachment as PUCA
 import paper_capital_reservations as PCR
+import paper_cycle_capital as PCC
 import paper_decision_audit as PDA
 import paper_slot_occupancy as PSO
 import paper_risk_exit_eligibility as PRE
@@ -2117,15 +2118,14 @@ def _reconcile_shared_cash(conn, cycle_id):
 
 def _available_cycle_ledger_capital(conn, cycle, account_id):
     """Return unallocated economic capital without enlarging the cycle."""
-    active_clause, active_ids = _active_cycle_filter(conn, cycle["id"], "id")
-    allocated = conn.execute(
-        f"SELECT COALESCE(SUM(initial_cash),0) s,COUNT(*) n FROM paper_accounts WHERE cycle_id=? AND id<>? AND {active_clause}",
-        (cycle["id"], account_id, *active_ids),
-    ).fetchone()
-    if int(allocated["n"] or 0) <= 0:
-        return _num(cycle["capital"], 0.0) / max(len(ACTIVE_ACCOUNT_IDS), 1)
-    existing_initial = _num(allocated["s"])
-    return max(0.0, _num(cycle["capital"], 0.0) - existing_initial)
+    return PCC.available_cycle_ledger_capital(
+        conn,
+        cycle,
+        account_id,
+        cycle_ledger_filter_fn=_active_cycle_filter,
+        builtin_account_ids=ACTIVE_ACCOUNT_IDS,
+        num_fn=_num,
+    )
 
 
 def _late_join_reference_capital(conn, cycle, account_id):
@@ -2138,15 +2138,14 @@ def _late_join_reference_capital(conn, cycle, account_id):
     funded sleeves hold 75k each while the late joiner would be measured on
     60k, inflating its percentage return for the same P&L.
     """
-    active_clause, active_ids = _active_cycle_filter(conn, cycle["id"], "id")
-    funded = conn.execute(
-        f"""SELECT COALESCE(SUM(initial_cash),0) s, COUNT(*) n
-             FROM paper_accounts WHERE cycle_id=? AND id<>? AND initial_cash>0 AND {active_clause}""",
-        (cycle["id"], account_id, *active_ids),
-    ).fetchone()
-    if int(funded["n"] or 0) > 0 and _num(funded["s"]) > 0:
-        return round(_num(funded["s"]) / int(funded["n"]), 2)
-    return round(_num(cycle["capital"], 0.0) / max(len(ACTIVE_ACCOUNT_IDS), 1), 2)
+    return PCC.late_join_reference_capital(
+        conn,
+        cycle,
+        account_id,
+        cycle_ledger_filter_fn=_active_cycle_filter,
+        builtin_account_ids=ACTIVE_ACCOUNT_IDS,
+        num_fn=_num,
+    )
 
 
 def _ensure_cycle(conn):

@@ -233,6 +233,17 @@
 
 `_reconcile_signal_order_states` 的 reservation UPDATE 属于明确允许的 crash-recovery exception；架构测试用 AST 函数级检测，先证明 recovery exception 存在，再拒绝其它 runtime 直写函数。N17 把 `now_fn()` 提前到新 reservation 的 active-cycle 解析之前，callback-order 回归必须失败；每轮真实突变后均逐字节恢复并核验 SHA-256。
 
+## 固定周期本金归属边界（Extract Fixed-Cycle Capital Attribution Boundary）
+
+| 场景 | 实现位置 | 回归用例 | 状态 |
+| --- | --- | --- | --- |
+| available capital 先解析 caller ownership filter，再读取其他账户 `initial_cash`；target `id<>?` 排除，zero-initial row 仍计数，非 ownership row 不计入 | `paper_cycle_capital.available_cycle_ledger_capital` | `test_paper_cycle_capital.py`（available contract tests） | ✅ |
+| available 无 ownership row 使用 `cycle.capital / max(len(builtin_account_ids), 1)`，有 row 才做剩余本金 `max(0.0, ...)` | `paper_cycle_capital.available_cycle_ledger_capital` | `test_paper_cycle_capital.py` | ✅ |
+| late-join 只按 funded `initial_cash>0` sleeves 求平均并 `round(..., 2)`；无 funded row 使用 rounded fallback；不读取 `cash` | `paper_cycle_capital.late_join_reference_capital` | `test_paper_cycle_capital.py`（late-join contract tests） | ✅ |
+| callback / SQL 顺序、裸 SQLite 与 `sqlite3.Row` 兼容、只读与 stdlib/import 边界 | `paper_cycle_capital` | `test_paper_cycle_capital.py` | ✅ |
+| 两个 `paper_trading` compatibility facade 保持原签名，并在调用时解析 `_active_cycle_filter`、`ACTIVE_ACCOUNT_IDS`、`_num` | `paper_trading._available_cycle_ledger_capital` / `_late_join_reference_capital` | `test_paper_cycle_capital.py`（facade tests） | ✅ |
+| 真实源码变异 N1–N12 全部捕获，逐字节与 SHA-256 原样恢复 | `paper_cycle_capital` / `paper_trading` | local workspace mutation tooling/evidence: `work/pr_cycle_capital_negative_check.py` | ✅ |
+
 ## 待成交席位占用 read model 边界（Extract Pending Slot Occupancy Boundary）
 
 | 场景 | 实现位置 | 回归用例 | 状态 |
@@ -296,4 +307,3 @@
 | 场景 N：中间步骤抛异常触发 savepoint 回滚，无脏 lot，无虚构订单/成交/资金，安全转入 execution_retry | `SAVEPOINT` / `ROLLBACK TO SAVEPOINT` | `TestPaperRiskExitProductionPath.test_N_failure_branch_rolls_back_savepoint_without_corrupting_lots` | ✅ |
 | 场景 O：顶层调度生产入口 `run_slot("risk", ...)` 成功闭环并记录调度状态 | `paper_trading.run_slot` | `TestPaperRiskExitProductionPath.test_O_golden_run_slot_risk_production_entrypoint` | ✅ |
 | 真实生产源码变异 N1–N12 全部被测试捕获（12/12 caught，Undetected: 0） | `paper_risk_exit_eligibility` / `paper_slot_occupancy` / `paper_trading` | 本地突变套件 `pr_risk_exit_production_negative_check.py`（逐项注入、逐字节核验与 sha256 还原） | ✅ |
-
