@@ -153,6 +153,25 @@
 | 单一实现守卫（AST 按"账户 spec 表形状"全仓扫描：声明模块**有且只有**一张，其他生产模块不得出现第二张；先证检测器非空性再证别处为空） | `paper_account_specs.ACCOUNT_SPECS` | `test_paper_account_specs.py`（`SpecsArchitectureGuardTests.test_detector_finds_the_real_table_in_the_specs_module`、`test_account_spec_table_lives_only_in_the_specs_module`、`test_paper_trading_holds_no_duplicated_spec_values`） | ✅ |
 | 负向变异验证（N1–N10 必须让守卫变红：N1 改内置 `max_positions`、N2 改内置风险画像键、N3 内置查找退化为 `ACCOUNT_SPECS[id]` 直接下标、N4 把完整声明表回抄进 `paper_trading`、N5 声明模块反向 import `paper_trading`、N6 在声明模块 import 期冻结注册表 active 集合、N7 让归档/非 active 策略不可解析、N8 未知账户静默映射到内置身份、N9 查询返回模块级可变 dict、N10 引入 DB 写 / 网络副作用 ⇒ 合计 10/10） | — | 手工执行 N1–N10 变异脚本（源码级变异逐字节备份 + `finally` 还原 + `git hash-object` 校验；见 PR 描述） | ✅ |
 
+## 周期所有权解析边界（Extract Cycle Ownership Resolver）
+
+| 场景 | 实现位置 | 回归用例 | 状态 |
+| --- | --- | --- | --- |
+| 经济所有权口径（`enabled_strategies` ∩ `paper_accounts.cycle_id == 目标周期`；只启用未挂接、只挂接未启用都不算所有权；别周期账户不得进入） | `paper_cycle_ownership.cycle_ledger_filter` / `cycle_ledger_rows` / `cycle_ledger_ids` | `test_paper_cycle_ownership.py`（`EconomicOwnershipContractTests`） | ✅ |
+| lifecycle pause 不改变经济所有权（pause 期间仍计入共享池合计与 NAV；`configure_capital` 仍分份额；resume 不凭空放大资本） | `paper_cycle_ownership.cycle_ledger_ids` | `test_paper_cycle_ownership.py`（`EconomicOwnershipContractTests.test_lifecycle_pause_does_not_remove_economic_ownership`）、`test_cycle_ledger_ownership.py` | ✅ |
+| 执行资格 = 经济所有权 − lifecycle pause（pause 立即剔除执行层但不解绑 `cycle_id` / 不清零资金 / 不改写 `enabled_strategies`；resume 恢复） | `paper_cycle_ownership.cycle_participant_resolution` / `current_cycle_participant_ids` / `execution_participant_ids` | `test_paper_cycle_ownership.py`（`ExecutionParticipationContractTests`）、`test_cycle_participant_resolver.py`、`test_strategy_product_line_e2e.py` | ✅ |
+| 显式 idle 周期（`enabled_strategies == []` → `source = "cycle_idle"`，零参与者，绝不回落内置五套） | `paper_cycle_ownership.cycle_participant_resolution` | `test_paper_cycle_ownership.py`（`IdleAndLegacyFallbackContractTests.test_explicit_empty_enabled_set_yields_zero_participants`、`test_idle_cycle_never_falls_back_to_builtin_scope`）、`test_cycle_participant_resolver.py` | ✅ |
+| 未配置 / 未挂接 / 无周期 / 无连接的 legacy 回退（`cycle_not_configured`、`cycle_enabled_unbound_fallback`、`no_cycle`、`no_conn` 逐字保留；与 idle **不得合并**） | `paper_cycle_ownership.cycle_participant_resolution` | `test_paper_cycle_ownership.py`（`IdleAndLegacyFallbackContractTests`） | ✅ |
+| 判定来源与版本元数据（`ids` / `source` / `enabled` / `bound` / `paused` / `cycle_id` / `version`） | `paper_cycle_ownership.cycle_participant_resolution` | `test_paper_cycle_ownership.py`（`test_resolution_metadata_is_preserved`） | ✅ |
+| 参与者顺序是契约（`dict.fromkeys` 保序 + `ORDER BY id`；集合化 / 逆序即失败） | `paper_cycle_ownership.cycle_participant_resolution` / `cycle_ledger_rows` | `test_paper_cycle_ownership.py`（`test_participant_order_is_deterministic_and_follows_enabled_order`、`test_ledger_rows_are_ordered_by_id`） | ✅ |
+| 只读（无写 SQL / 无 PRAGMA；sqlite authorizer 证明解析期间零 INSERT·UPDATE·DELETE·DDL，且行快照前后一致） | `paper_cycle_ownership` | `test_paper_cycle_ownership.py`（`ReadOnlyResolverTests`、`OwnershipArchitectureGuardTests.test_ownership_module_emits_no_write_sql`） | ✅ |
+| 行读取不假设 `row_factory`（`cursor.description` + `zip` 自组装 dict，裸连接亦可用；单行 `paper_cycles` 查询同样归一化） | `paper_cycle_ownership._rows` / `_row` | `test_paper_cycle_ownership.py`（`test_row_reader_does_not_assume_the_connection_row_factory`、`test_bare_connection_execution_resolution_uses_cycle_snapshot`） | ✅ |
+| 风控退出资格 ≠ 执行资格（paused / 已退出当前周期但仍有 `remaining_qty>0` 的账户必须继续被风控扫描） | `paper_trading._risk_exit_account_ids`（消费迁出后的解析器） | `test_paper_cycle_ownership.py`（`RiskExitEligibilityTests`） | ✅ |
+| 兼容 facade 只允许别名 / 委托（`paper_trading` 内同名符号必须委托到解析器；函数体不得内联第二套所有权实现；注入的注册表作用域必须**调用时**读取，monkeypatch 立即生效） | `paper_trading._active_cycle_filter` / `_shared_account_rows` / `cycle_ledger_ids` / `execution_participant_ids` / `current_cycle_participant_ids` / `_cycle_participant_resolution` / `_lifecycle_paused_ids` | `test_paper_cycle_ownership.py`（`CompatibilityFacadeTests`） | ✅ |
+| 架构守卫（解析器不 import `paper_trading` / 网络 / 订单 / 注册表 / 执行；import 根白名单；无下单·建周期·开户·归档·改状态调用；不携带执行·风控退出·注册表作用域权威；顶层无 `Call`） | `paper_cycle_ownership` | `test_paper_cycle_ownership.py`（`OwnershipArchitectureGuardTests`） | ✅ |
+| 单一实现守卫（全仓唯一：读取周期快照启用集合的 `SELECT` 只允许出现在解析器；解析面函数名不得在别处重定义；先证检测器非空再证别处为空） | `paper_cycle_ownership.cycle_ledger_filter` | `test_paper_cycle_ownership.py`（`OwnershipArchitectureGuardTests.test_detector_finds_the_ownership_sql_in_the_ownership_module`、`test_cycle_ownership_sql_lives_only_in_the_ownership_module`、`test_no_other_module_redefines_the_resolution_surface`） | ✅ |
+| 负向变异验证（N1–N13 必须让守卫变红：N1 账本所有权错误剔除 paused、N2 执行参与者不再剔除 paused、N3 执行参与者改用注册表 active 作用域、N4 显式空集错误回落内置五套、N5 忽略 `paper_accounts.cycle_id` 绑定、N6 删除 `cycle_not_configured` 回退、N7 删除未挂接周期回退、N8 参与者顺序漂移、N9 把解析器复制回 `paper_trading`、N10 解析器反向 import `paper_trading`、N11 解析器引入写操作、N12 风控退出被收窄为执行参与者、N13 单行 `paper_cycles` 查询退化为裸 `fetchone()` + 字符串键访问 ⇒ 合计 13/13） | — | 手工执行 N1–N13 变异脚本（源码级变异逐字节备份 + `finally` 还原 + `git hash-object` 校验；见 PR 描述） | ✅ |
+
 ## 维护约定
 
 1. 新增门禁必须先在本表加一行，再写测试；表格状态从 ⚠️ → ✅。

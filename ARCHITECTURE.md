@@ -121,7 +121,7 @@ Position Risk（单笔，执行前复核）
 - **System Risk 不能被策略削弱**：策略画像里不含系统键，合并与门禁都在平台侧；`strategy_risk_enforcement` 只做 `min(生产现值, 模板值)` 方向的收紧。
 - 影子/研究层（`adaptive_*`、`evolution_*`）只能产生证据与候选，不能修改上述任何一层。
 
-## 周期所有权与执行资格（PR-48）
+## 周期所有权与执行资格（PR-48 / PR-49）
 
 运行时的两条口径必须分开理解：
 
@@ -133,6 +133,25 @@ Position Risk（单笔，执行前复核）
 | `resume` 后 | 不变（不会凭空放大资本） | 恢复 |
 
 因此"暂停一个策略"不是把它从周期里删掉，而是关闭它的执行资格；经济所有权仍留在周期账本里，直到周期结束归档。回归见 `backend/test_cycle_ledger_ownership.py` 与 `backend/test_cycle_participant_resolver.py`。
+
+PR-49 把这条口径的实现收敛到只读解析器 `backend/paper_cycle_ownership.py`，并显式冻结**四口径互不等价**：
+
+| 口径 | 定义式 | 落点 |
+| --- | --- | --- |
+| 经济所有权 | `paper_cycles.enabled_strategies`（能力位过滤，**不查** lifecycle）∩ `paper_accounts.cycle_id == 目标周期` | `cycle_ledger_filter` / `cycle_ledger_rows` / `cycle_ledger_ids` |
+| 执行资格 | 经济所有权 − `strategy_definitions.lifecycle_status ∈ ('paused',)` | `cycle_participant_resolution` / `current_cycle_participant_ids` / `execution_participant_ids` |
+| 注册表 active 作用域 | `SR.active_ids() ∩ 声明键` ∪ `USP.user_participant_ids(conn)` | `paper_trading.ACTIVE_ACCOUNT_IDS` / `_active_account_clause`（**不在**解析器内） |
+| 风控退出资格 | 执行资格 ∪ `paper_position_lots.remaining_qty > 0` 的账户 | `paper_trading._risk_exit_account_ids`（**不在**解析器内） |
+
+锁句：**Cycle owns capital. Lifecycle controls execution permission. Existing exposure still owns risk-exit rights.** 禁止用 `SR.active_ids()` 替代经济所有权，也禁止把风控退出"统一"成执行参与者——否则已 pause / 已退出当前周期的存量持仓会变成无人风控的孤儿敞口。
+
+两条**不得合并**的边界语义：
+
+- **显式 idle 周期**：`enabled_strategies == []` 是合法的零策略周期（`source = "cycle_idle"`，参与者为空，绝不回落内置五套）。
+- **未配置周期**：`NULL` 或不可解析才是「未配置」（`source = "cycle_not_configured"`），保留 legacy 回退（内置作用域 + 注册表用户参与者），避免早期/迁移库整轮空转。
+- 周期已声明启用集合但账本尚未挂接时走 `cycle_enabled_unbound_fallback`（新建周期首轮 / 迁移窗口），仍剔除 lifecycle pause。
+
+注册表 active 投影（`ACTIVE_ACCOUNT_IDS`）按不变量 #8 留在权威层，由 `paper_trading` 以 `builtin_scope` 参数**在调用时**注入解析器（不得 import 期冻结）。周期选择（`_active_cycle`，可能触发旧库补周期）同样留在权威层，解析器的 `cycle_id` 因此是必填。
 
 ## 模块职责速查
 
@@ -154,6 +173,7 @@ Position Risk（单笔，执行前复核）
 | 风控与审计 | `risk_center.py`, `adaptive_risk.py`, `adaptive_shadow_risk.py` | 风险状态机、下行保护、风险仪表盘、影子风控和结构化审计原因 | 影子层不能越权提交订单 |
 | 决策审计序列化 | `backend/paper_decision_audit.py` | 决策快照 envelope 的唯一实现（点对点证据序列化、K 线窗口与 future-row 排除、因子贡献）；`paper_trading` 内同名符号仅保留兼容 facade | 不写数据库、不联网、不改变交易规则 |
 | 纸盘账户声明 | `backend/paper_account_specs.py` | 纸盘账户的**声明式**配置：内置五套账户 spec、风格声明、风险画像声明、保守回退 spec，以及返回独立副本的只读访问器；`paper_trading` 内同名符号仅保留兼容别名 | 不回答注册表 active / 生命周期 / 运行时就绪、不回答当期周期所有权与参与者、不回答执行资格与执行许可；不连数据库、不联网、不下单、不启动调度 |
+| 周期所有权解析 | `backend/paper_cycle_ownership.py` | 当期周期**经济所有权**（`enabled_strategies` ∩ `paper_accounts.cycle_id`）、**执行参与者**（经济所有权 − lifecycle pause）、idle / 未配置 / 未挂接的判定来源元数据；`paper_trading` 内同名符号仅保留兼容 facade（别名 + 委托） | 不建周期、不归档、不开户、不改资金、不改账户状态、不下单、不撮合、不做风险决策、不生成信号、不做分配或 sizing；不拥有注册表 active 作用域与风控退出资格；不 import `paper_trading` |
 | 自适应/新闻 | `adaptive_engine.py`, `adaptive_runner.py`, `adaptive_learning_*`, `news_learning.py`, `news_runner.py` | 研究样本、奖励、新闻证据和参数候选；通过 outbox/人工确认与正式路径隔离 | 不直接修改正式成交规则 |
 | 研究工具 | `backtest.py`, `optimizer.py`, `selection_tracking.py`, `selection_runner.py` | 回测、参数比较、选股跟踪和盘后候选固化 | 不替代正式纸盘撮合 |
 | 前端 | `frontend/src/**`（ESM 模块）, `frontend/styles/**`（CSS 片段）, `frontend/build.mjs` | 单页看板、策略模拟、委托、风控审计、数据有效性和研究页面；esbuild 打包到已提交的 `frontend/dist/`（运行时只伺服产物 `/app.js`、`/app.css`） | 不在浏览器本地决定最终成交 |
@@ -191,6 +211,7 @@ Position Risk（单笔，执行前复核）
 - `backend/paper_repository.py` 提供通用 ledger 行读取、审计写入、dashboard 账户批量投影和活动订单轻量投影；`paper_trading.py` 保留旧 `_rows`/`_audit`/`_account_metric_inputs` 包装，后续再迁移对象级 SQL。
 - `backend/paper_account_specs.py` 承载纸盘账户**声明层**（内置 spec / 风格 / 风险画像 / 保守回退 + 返回独立副本的只读访问器）；`paper_trading.py` 只保留同名兼容别名与唯一解析口 `_spec_for`（内置与回退分支委托给声明层）。注册表投影 `ACTIVE_ACCOUNT_IDS`/`ACTIVE_ACCOUNT_SPECS`、周期参与者解析与用户策略开户**仍留在** `paper_trading.py`——它们是注册表/周期真相，不是账户声明。
 - `backend/paper_performance.py` 负责今日报价新鲜度、持仓今日盈亏和卖出贡献的纯计算；`paper_trading.py` 保留 `_today_*` 兼容包装。
+- `backend/paper_cycle_ownership.py` 承载**当期周期所有权解析**（经济所有权 / 执行参与者 / lifecycle pause 过滤 / 判定来源元数据），是只读解析器：无写 SQL、无网络、无订单、无周期创建与归档、无模块级调用。`paper_trading.py` 只保留同名兼容 facade（`_active_cycle_filter`、`_shared_account_rows`、`cycle_ledger_ids`、`execution_participant_ids`、`current_cycle_participant_ids`、`_cycle_participant_resolution`、`_lifecycle_paused_ids` 与两个版本常量），并以 `builtin_scope=ACTIVE_ACCOUNT_IDS` 在**调用时**注入注册表 active 投影。注册表 active 作用域（`ACTIVE_ACCOUNT_IDS` / `_active_account_clause`）、周期选择（`_active_cycle` / `_ensure_cycle`）与风控退出资格（`_risk_exit_account_ids`）**仍留在** `paper_trading.py`。三个垂直互不越界：`paper_cycle_service`（持久归档/快照/清理）、`paper_account_specs`（账户声明）、`paper_cycle_ownership`（当期所有权）。
 - `backend/paper_schema_migrations.py` 集中 paper ledger 的增量字段、运行时租约字段和点火影子表迁移；`db_migrate.py` 通过版本号调用这些幂等操作，应用前使用 SQLite backup API 创建一致性副本，运行引擎不再内联 `ALTER TABLE`。
 - `backend/adaptive_risk.py` 使用 outbox（跨数据库操作意图表）保证纸盘提交后，adaptive 账本可重放收敛。
 - `backend/test_adaptive_dependency_boundary.py` 以 AST（源码语法树）守护 adaptive 不直接导入纸盘订单 API，也不出现订单提交/取消调用。
@@ -209,6 +230,7 @@ Position Risk（单笔，执行前复核）
 6. 学习/研究数据集就绪不授予任何执行权限：不能下单、不能放宽风控、不能自我晋升。
 7. 决策审计序列化的实现只有一份（`backend/paper_decision_audit.py`）。`backend/paper_trading.py` 只保留兼容 facade（别名 + 委托，并在调用时注入 runtime 依赖），不得再复制第二套实现；依赖方向单向：`paper_trading` → `paper_decision_audit` → pandas / stdlib，反向禁止。
 8. 纸盘账户**声明式**配置的实现只有一份（`backend/paper_account_specs.py`）：内置账户 spec、风格声明、风险画像声明、保守回退 spec，以及只读查询访问器。`backend/paper_trading.py` 只保留兼容别名与唯一解析口 `_spec_for`（内置分支返回独立副本），不得再声明第二张账户表或第二套回退。依赖方向单向：`paper_trading` → `paper_account_specs` → `strategy_policies` / stdlib，反向禁止。声明层**不拥有**任何权威真相：注册表 active 作用域与生命周期（`strategy_registry`）、运行时就绪/版本/checksum（`strategy_runtime`）、当期周期所有权与参与者（`paper_cycles.enabled_strategies` ∩ `paper_accounts.cycle_id`）、执行资格与执行许可（系统风控层）一律不在本模块，也不得被 import 期冻结成常量。四者口径互不等价：`account declarative specs != strategy registry/runtime truth != current cycle ownership != execution eligibility`。
+9. 当期**周期所有权 / 执行参与者解析**的实现只有一份（`backend/paper_cycle_ownership.py`），且必须是**只读**的：无 `INSERT`/`UPDATE`/`DELETE`、无网络、无行情、无订单与撮合、无资金或账户状态变更、无周期创建与归档、无模块级调用。`backend/paper_trading.py` 只保留兼容 facade（别名 + 委托），并在调用时注入注册表 active 投影；不得再内联第二套所有权谓词或第二份解析。依赖方向单向：`paper_trading` → `paper_cycle_ownership` → `paper_account_specs` / `user_strategy_participation` / stdlib，反向禁止。四口径互不等价且不得互相替代：`cycle economic ownership != execution eligibility != registry active scope != risk-exit eligibility`；风控退出资格（执行参与者 ∪ 仍有剩余 lots 的账户）留在权威层，不得收窄为执行参与者。`enabled_strategies == []`（合法零策略 idle 周期，零参与者）与 `NULL`/不可解析（未配置，保留 legacy 回退）**不得合并**。
 
 ## 学习/研究数据契约（PR-8）
 
