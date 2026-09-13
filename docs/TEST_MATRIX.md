@@ -232,3 +232,25 @@
 `backend/test_paper_capital_reservations.py` 覆盖 reserved BUY 的跨周期聚合、账户金额与费用、排除自身、numeric clamp、裸 SQLite/`sqlite3.Row`、创建与重算、consumed 防重复、资金不足零变更、epsilon 容差、lazy active-cycle/shared-cash/clock 依赖、终态幂等，以及三个 legacy facade 的签名与单一实现守卫。模块禁止反向依赖、订单/持仓/周期 SQL、事务控制和 allocation/sizing/execution 逻辑。
 
 `_reconcile_signal_order_states` 的 reservation UPDATE 属于明确允许的 crash-recovery exception；架构测试用 AST 函数级检测，先证明 recovery exception 存在，再拒绝其它 runtime 直写函数。N17 把 `now_fn()` 提前到新 reservation 的 active-cycle 解析之前，callback-order 回归必须失败；每轮真实突变后均逐字节恢复并核验 SHA-256。
+
+## 待成交席位占用 read model 边界（Extract Pending Slot Occupancy Boundary）
+
+| 场景 | 实现位置 | 回归用例 | 状态 |
+| --- | --- | --- | --- |
+| 可执行待买订单（manual/strategy + buy + pending_limit/retry statuses）计入席位占用 | `paper_slot_occupancy.pending_position_slots` | `test_paper_slot_occupancy.py`（`SlotOccupancyFilteringTests.test_order_filtering_counts_executable_buys`） | ✅ |
+| 卖单与非 manual/strategy 来源完全忽略，不占席位 | `paper_slot_occupancy.pending_position_slots` | `SlotOccupancyFilteringTests.test_order_filtering_ignores_sell_orders`、`test_order_filtering_ignores_other_origins` | ✅ |
+| 终态（filled/cancelled/rejected/released/expired）与其它状态不占席位 | `paper_slot_occupancy.pending_position_slots` | `SlotOccupancyFilteringTests.test_order_filtering_ignores_terminal_and_non_occupying_statuses` | ✅ |
+| 关键不变量：deferred_capacity 与 entry_frozen_waitlist 仅为排队标记，不占席位 | `paper_slot_occupancy.pending_position_slots` | `SlotOccupancyFilteringTests.test_waitlist_and_deferred_do_not_occupy_slots`、`test_capacity_waitlist_slots.py` | ✅ |
+| 未在 occupying_statuses tuple 里的 pending-like 状态不占席位；空状态集合直接返回空集 | `paper_slot_occupancy.pending_position_slots` | `SlotOccupancyFilteringTests.test_pending_like_statuses_outside_occupying_tuple_ignored`、`test_empty_occupying_statuses_returns_empty_set` | ✅ |
+| 空状态与非法排除键交叉组合：空 occupying_statuses 仍先校验 exclude_order_key 合法性并抛出 ValueError，不绕过校验 | `paper_slot_occupancy.pending_position_slots` | `SlotOccupancyFilteringTests.test_empty_statuses_still_validate_invalid_exclude_before_return` | ✅ |
+| 席位身份为 (account_id, code)；同账户同代码多单去重为 1 席位，不同账户同代码为独立席位 | `paper_slot_occupancy.pending_position_slots` | `SlotOccupancyIdentityAndSuppressionTests.test_distinct_identity_same_account_same_code_is_one_slot`、`test_distinct_identity_different_accounts_same_code_are_two_slots` | ✅ |
+| 既有持仓加仓抑制：已有 >= LOT_SIZE 完整持仓的 (account, code) 待买单不占用新席位 | `paper_slot_occupancy.pending_position_slots` | `SlotOccupancyIdentityAndSuppressionTests.test_existing_full_position_suppresses_pending_order` | ✅ |
+| 碎股边界严格判定：qty=99 不抑制，qty=100 抑制，qty=100.9 取整抑制 | `paper_slot_occupancy.pending_position_slots` | `SlotOccupancyIdentityAndSuppressionTests.test_sub_lot_boundary_qty_99_does_not_suppress`、`test_sub_lot_boundary_qty_100_suppresses`、`test_sub_lot_boundary_fractional_qty_100_9_suppresses` | ✅ |
+| exclude_order_key 严格按 paper_orders.id 排除，数字字符串先 int() 转换，非法字符串抛出 ValueError 且不执行查询 | `paper_slot_occupancy.pending_position_slots` | `SlotOccupancyIdentityAndSuppressionTests.test_exclude_order_key_filters_exact_id_and_coerces_string`、`test_exclude_order_key_invalid_string_raises_value_error_without_query` | ✅ |
+| facade 保留原签名 `(conn, positions=None, exclude_order_key=None)`；显式 `positions=[]` 不触发回退，`positions=None` 触发 `_position_rows(conn)` | `paper_trading._pending_position_slots` | `SlotOccupancyFacadeContractTests.test_facade_signature_exact_match`、`test_explicit_empty_positions_skips_position_rows_sentinel`、`test_none_positions_invokes_position_rows_sentinel` | ✅ |
+| facade 调用时向新模块注入当前 occupying_statuses、lot_size、_num 与 _rows | `paper_trading._pending_position_slots` | `SlotOccupancyFacadeContractTests.test_call_time_dependency_injection` | ✅ |
+| 生产调用方（dashboard_queries、manual_orders、_plan_strategy_entry、_resolve_slot_borrow_candidate）统一经 facade 获取席位占用 | `dashboard_queries`、`manual_orders`、`paper_trading` | `SlotOccupancyFacadeContractTests.test_production_consumers_parity` | ✅ |
+| 模块纯 stdlib、只读查询 paper_orders、无写 SQL、无事务控制、不导入 paper_trading；facade 内部无内联 SQL | `paper_slot_occupancy` / `paper_trading` | `SlotOccupancyArchitectureGuardTests` | ✅ |
+| 架构文档明确区分 paper_slot_occupancy 与 paper_slot_service，冻结两者不同职责 | `ARCHITECTURE.md` | `SlotOccupancyArchitectureGuardTests.test_architecture_notes_distinguishes_slot_service_and_occupancy` | ✅ |
+| 真实源码变异 N1–N19 全部被测试捕获（19/19 caught，Undetected: 0） | — | `work/pr_slot_occupancy_negative_check.py`（每轮真实变异、逐字节备份与 sha256 还原核验） | ✅ |
+

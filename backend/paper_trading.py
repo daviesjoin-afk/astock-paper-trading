@@ -44,6 +44,7 @@ import paper_user_account_provisioning as PUAP
 import paper_user_cycle_attachment as PUCA
 import paper_capital_reservations as PCR
 import paper_decision_audit as PDA
+import paper_slot_occupancy as PSO
 import adaptive_selection_compat as ASC
 # ELC / EPD 仍被非 cleanup 路径使用（signal freshness、entry slice plan、
 # dispatch 规划与核验、gated order 查询）。清理动作已移交 paper_slot_service，
@@ -2480,24 +2481,20 @@ def _pending_position_slots(conn, positions=None, exclude_order_key=None):
     a phantom position and can permanently report impossible values such as
     62/15 occupied seats.
     """
-    positions = positions if positions is not None else _position_rows(conn)
-    existing = {
-        (str(item.get("account_id")), str(item.get("code")))
-        for item in positions if int(_num(item.get("qty"))) >= LOT_SIZE
-    }
-    params = []
-    placeholders = ",".join("?" for _ in ENTRY_SLOT_OCCUPYING_ORDER_STATUSES)
-    where = f"origin IN ('manual','strategy') AND side='buy' AND status IN ({placeholders})"
-    params.extend(ENTRY_SLOT_OCCUPYING_ORDER_STATUSES)
-    if exclude_order_key is not None:
-        where += " AND id<>?"
-        params.append(int(exclude_order_key))
-    rows = _rows(conn, f"SELECT account_id,code FROM paper_orders WHERE {where}", tuple(params))
-    return {
-        (str(row.get("account_id")), str(row.get("code")))
-        for row in rows
-        if (str(row.get("account_id")), str(row.get("code"))) not in existing
-    }
+    resolved_positions = (
+        _position_rows(conn)
+        if positions is None
+        else positions
+    )
+    return PSO.pending_position_slots(
+        conn,
+        resolved_positions,
+        exclude_order_key,
+        occupying_statuses=ENTRY_SLOT_OCCUPYING_ORDER_STATUSES,
+        lot_size=LOT_SIZE,
+        num_fn=_num,
+        rows_fn=_rows,
+    )
 
 
 def _reserve_shared_capital(conn, order_key, account_id, code, amount, fees=0.0):
