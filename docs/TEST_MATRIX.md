@@ -128,6 +128,16 @@
 | 无网络 / 无训练 / 无执行（无 ML 依赖、无 `.fit` / 下单调用、只读不改库） | `learning_evaluation` | `test_learning_evaluation.py`（`SafetyTests`） | ✅ |
 | 负向变异验证（N1–N7 必须让守卫变红：N1 数据集绑定、N2 held-out、N3 前瞻泄漏、N4 并列秩、N5 点估计当置信下界、N6 证据摘要、N7 预测身份；**N8–N13 必须让 v2 守卫变红：N8 放开 held-out 分区、N9 关闭覆盖门禁、N10 接受无训练溯源、N11 接受 selection=test、N12 prediction_id 不绑定 asof、N13 关闭尾部退化门禁；N14 把 cutoff 退回 availability 时钟、N15 把 tail 退回"产生过 IC 的日期"** ⇒ 合计 15/15） | — | 手工执行 N1–N7 / N8–N15 变异脚本（源码级变异逐字节备份 + `finally` 还原 + sha256 校验；见 PR 描述） | ✅ |
 
+## 决策审计序列化契约（issue #124）
+
+| 场景 | 实现位置 | 回归用例 | 状态 |
+| --- | --- | --- | --- |
+| 快照序列化单一真相源（实现只存在于审计模块；`paper_trading` 只保留兼容 facade，六个符号为别名、两个入口为委托，不得再复制实现） | `paper_decision_audit.build_decision_snapshot`、`paper_trading._decision_snapshot`、`_with_decision_snapshot` | `test_paper_decision_audit_facade.py`（`CompatibilityFacadeSurfaceTests`、`DecisionAuditArchitectureGuardTests`） | ✅ |
+| 快照输出契约冻结（`decision-snapshot-v1` envelope 逐字段 golden：K 线 120 根窗口与 `omitted_rows` 计数、future row 排除、NaN→null 且缺失证据保持 `null`、自定义 K 线列、因子加权贡献、model / signal / entry_model 回退、quote 校验门、news 公告时间） | `paper_decision_audit.build_decision_snapshot`、`_snapshot_kline`、`_snapshot_factor_evidence`、`snapshot_safe` | `test_paper_decision_audit.py`（契约测试 + `GOLDEN_ENVELOPE`） | ✅ |
+| runtime 依赖调用时注入（`kline_loader` / `news_scan_meta` / `risk_version` / `now_fn` 必须取**当前**模块属性，不得 import 时冻结；facade 行为上确实使用 patched 值，且不修改调用方 payload） | `paper_trading._decision_snapshot`、`_with_decision_snapshot` | `test_paper_decision_audit_facade.py`（`DecisionSnapshotFacadeDelegationTests`、`WithDecisionSnapshotFacadeDelegationTests`） | ✅ |
+| 审计模块无副作用（不 import `paper_trading`；顶层依赖仅 stdlib + pandas；无 DB 写、无网络 I/O） | `paper_decision_audit` | `test_paper_decision_audit_facade.py`（`DecisionAuditArchitectureGuardTests`） | ✅ |
+| 负向变异验证（N1–N17 必须让守卫变红：N1 冻结时钟、N2 冻结 news scan meta、N3 丢掉 kline loader 注入、N4 硬编码 risk version、N5 丢掉 `_with_decision_snapshot` 的 loader 注入、N6 改名复制回一套 serializer、N7 审计模块 import `paper_trading`、N8 审计模块做 DB IO、N9 审计模块调用写侧方法、N10 K 线窗口 120→121、N11 关掉 future row 排除、N12 NaN 字符串化、N13 不再拒绝非法 replay 日期、N14 就地改写调用方 payload、N15 删掉 `strategy_id` 补全、N16 存储根数差一、N17 忽略显式 `decision_at` ⇒ 合计 17/17） | — | 手工执行 N1–N17 变异脚本（源码级变异逐字节备份 + `finally` 还原 + sha256 校验；见 PR #126 描述） | ✅ |
+
 ## 维护约定
 
 1. 新增门禁必须先在本表加一行，再写测试；表格状态从 ⚠️ → ✅。
