@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import ast
 import os
+import pathlib
 import sqlite3
 import tempfile
 import unittest
@@ -28,7 +29,7 @@ import strategy_runtime as SRT
 
 BACKEND = os.path.dirname(os.path.abspath(__file__))
 SPECS_PATH = os.path.join(BACKEND, "paper_account_specs.py")
-PAPER_PATH = os.path.join(BACKEND, "paper_trading.py")
+PAPER_PATH = pathlib.Path(BACKEND, "paper_trading.py")
 
 BUILTIN_IDS = (
     "tq_breakout",
@@ -632,7 +633,7 @@ class SpecsArchitectureGuardTests(unittest.TestCase):
 
     def test_paper_trading_holds_no_duplicated_spec_values(self):
         """别名之外的任何一份内置 spec 字段副本都必须被守卫抓到。"""
-        source = open(PAPER_PATH, encoding="utf-8").read()
+        source = PAPER_PATH.read_text(encoding="utf-8")
         # entry_model_name 是账户 spec 独有文案；它们只允许出现在声明模块。
         for unique_field_value in (
             "强势日内候选实时确认",
