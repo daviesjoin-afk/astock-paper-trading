@@ -231,4 +231,4 @@
 
 `backend/test_paper_capital_reservations.py` 覆盖 reserved BUY 的跨周期聚合、账户金额与费用、排除自身、numeric clamp、裸 SQLite/`sqlite3.Row`、创建与重算、consumed 防重复、资金不足零变更、epsilon 容差、lazy active-cycle/shared-cash/clock 依赖、终态幂等，以及三个 legacy facade 的签名与单一实现守卫。模块禁止反向依赖、订单/持仓/周期 SQL、事务控制和 allocation/sizing/execution 逻辑。
 
-`_reconcile_signal_order_states` 的 reservation UPDATE 属于明确允许的 crash-recovery exception；架构测试只要求正常 runtime INSERT/UPDATE 的唯一实现位于 `paper_capital_reservations.py`，不使用脆弱的全仓字符串禁用守卫。
+`_reconcile_signal_order_states` 的 reservation UPDATE 属于明确允许的 crash-recovery exception；架构测试用 AST 函数级检测，先证明 recovery exception 存在，再拒绝其它 runtime 直写函数。N17 把 `now_fn()` 提前到新 reservation 的 active-cycle 解析之前，callback-order 回归必须失败；每轮真实突变后均逐字节恢复并核验 SHA-256。

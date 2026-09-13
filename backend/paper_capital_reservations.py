@@ -82,13 +82,12 @@ def reserve_shared_capital(
     if amount + fees > available_cash + 1e-6:
         return False, f"待成交买单已预占 ¥{pending_total:,.2f}，共享可用现金不足"
 
-    created_at = now_fn()
     if existing:
         conn.execute(
             """UPDATE paper_capital_reservations
                SET status='reserved',released_at=NULL,amount=?,fees=?,created_at=?
                WHERE order_key=?""",
-            (amount, fees, created_at, order_key),
+            (amount, fees, now_fn(), order_key),
         )
         return True, None
 
@@ -98,7 +97,7 @@ def reserve_shared_capital(
            (cycle_id,order_key,account_id,code,side,amount,fees,status,created_at)
            VALUES(?,?,?,?,?,?,?,?,?)""",
         (cycle["id"], order_key, account_id, code, "buy", amount, fees,
-         "reserved", created_at),
+         "reserved", now_fn()),
     )
     return True, None
 

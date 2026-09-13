@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import inspect
+import ast
 import pathlib
 import sqlite3
 import unittest
@@ -107,6 +108,32 @@ class ReserveCapitalTests(ReservationDatabaseMixin, unittest.TestCase):
         self.assertEqual((True, None), self.reserve(active_cycle_fn=active))
         active.assert_called_once_with(self.conn)
 
+    def test_new_reservation_calls_cycle_then_clock(self):
+        events = []
+
+        def active_cycle(conn):
+            events.append("cycle")
+            return {"id": 8}
+
+        def now():
+            events.append("now")
+            return "now"
+
+        self.assertEqual((True, None), self.reserve(active_cycle_fn=active_cycle, now_fn=now))
+        self.assertEqual(["cycle", "now"], events)
+
+    def test_new_cycle_failure_never_calls_clock_or_writes(self):
+        now = mock.Mock(return_value="now")
+        before = self.conn.total_changes
+        with self.assertRaisesRegex(RuntimeError, "^cycle unavailable$"):
+            self.reserve(
+                active_cycle_fn=mock.Mock(side_effect=RuntimeError("cycle unavailable")),
+                now_fn=now,
+            )
+        now.assert_not_called()
+        self.assertEqual(before, self.conn.total_changes)
+        self.assertEqual(0, self.conn.execute("SELECT COUNT(*) FROM paper_capital_reservations").fetchone()[0])
+
     def test_negative_amount_and_fees_clamp_to_zero(self):
         self.assertEqual((True, None), self.reserve())
         self.conn.execute("DELETE FROM paper_capital_reservations")
@@ -137,6 +164,18 @@ class ReserveCapitalTests(ReservationDatabaseMixin, unittest.TestCase):
         active = mock.Mock(side_effect=AssertionError("existing rows must not resolve cycle"))
         self.assertEqual((True, None), self.reserve(active_cycle_fn=active))
         active.assert_not_called()
+
+    def test_existing_row_calls_clock_only_for_update(self):
+        self.add_row("new", status="released")
+        events = []
+        self.assertEqual(
+            (True, None),
+            self.reserve(
+                active_cycle_fn=lambda conn: events.append("cycle") or {"id": 7},
+                now_fn=lambda: events.append("now") or "now",
+            ),
+        )
+        self.assertEqual(["now"], events)
 
     def test_exact_cash_and_epsilon_succeed_but_insufficient_does_not_mutate(self):
         self.assertEqual((True, None), self.reserve(shared_cash_fn=lambda conn: 12.0))
@@ -173,12 +212,20 @@ class FinishReservationTests(ReservationDatabaseMixin, unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "^非法资金预占状态$"):
             self.finish("reserved")
 
-    def test_terminal_unknown_and_repeated_transitions_are_noops(self):
+    def test_consumed_row_is_noop(self):
         self.add_row("x", status="consumed")
-        self.add_row("y", status="released")
         before = self.conn.total_changes
         self.finish("released")
+        self.assertEqual(before, self.conn.total_changes)
+
+    def test_released_row_is_noop(self):
+        self.add_row("x", status="released")
+        before = self.conn.total_changes
         self.finish("consumed")
+        self.assertEqual(before, self.conn.total_changes)
+
+    def test_unknown_order_key_is_noop(self):
+        before = self.conn.total_changes
         self.finish("consumed")
         self.assertEqual(before, self.conn.total_changes)
 
@@ -249,6 +296,40 @@ class ArchitectureGuardTests(unittest.TestCase):
         architecture = architecture_path.read_text(encoding="utf-8")
         self.assertIn("recovery exception", architecture.lower())
         self.assertIn("cross-cycle", architecture.lower())
+
+    def test_recovery_exception_source_is_enforced(self):
+        source = TRADING_PATH.read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        function_sources = {
+            node.name: ast.get_source_segment(source, node) or ""
+            for node in tree.body
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        }
+        facade_region = "\n".join(
+            function_sources[name]
+            for name in (
+                "_pending_buy_reservations",
+                "_reserve_shared_capital",
+                "_finish_capital_reservation",
+            )
+        )
+        self.assertNotIn("paper_capital_reservations", facade_region)
+        self.assertNotIn("INSERT", facade_region)
+        self.assertNotIn("UPDATE", facade_region)
+
+        direct_mutators = {
+            name for name, body in function_sources.items()
+            if "paper_capital_reservations" in body
+            and ("INSERT INTO" in body or "UPDATE paper_capital_reservations" in body)
+        }
+        # ``init_db`` is bootstrap/schema reconciliation, not normal runtime
+        # CRUD.  Prove that classification before excluding it from the
+        # runtime set; this keeps the recovery detector non-vacuous.
+        self.assertIn("init_db", direct_mutators)
+        self.assertIn("CREATE TABLE IF NOT EXISTS paper_capital_reservations", function_sources["init_db"])
+        runtime_mutators = direct_mutators - {"init_db"}
+        self.assertIn("_reconcile_signal_order_states", runtime_mutators)
+        self.assertEqual({"_reconcile_signal_order_states"}, runtime_mutators)
 
 
 if __name__ == "__main__":
