@@ -3773,7 +3773,9 @@ def _attribute_one_tracking(conn, tracking_row, paper_db_path=None):
       的评估，而不是另挑一条 reward —— 首次决定不可改写。
     - 账户选择确定化：按 (effective_from, account_id) 排序取第一个有合规 reward
       的账户，避免同一 run 覆盖多账户时结果随机。
-    - 一条 reward 只服务一次归因，防止把同一次收益重复算进多条 tracking。
+    - reward 选择确定化：取**生效之后最早**的合规窗口（`start_date` 升序），
+      使同一 tracking 的评估结果不随周期漂移；一条 reward 只服务一次归因，
+      防止把同一次收益重复算进多条 tracking。
     """
     tracking_id = int(tracking_row["id"])
 

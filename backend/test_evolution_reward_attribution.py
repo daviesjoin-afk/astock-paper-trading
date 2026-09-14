@@ -319,6 +319,29 @@ class EffectiveTuningPositivePathTests(RewardAttributionTestBase):
         self.assertEqual(links[0]["account_id"], ACCOUNT_ID)
         self.assertEqual(links[0]["linkage_source"], SE.ATTRIBUTION_LINKAGE_SOURCE)
 
+    def test_F_picks_earliest_post_effective_reward_deterministically(self):
+        """同一 tracking 的 reward 选择必须确定：取生效之后最早的合规窗口。"""
+        run_id = self._seed_tuner_run()
+        tracking_id = self._track_run(run_id)
+        self._apply_run(run_id)
+        effective_from = self._effective_from()
+
+        earliest = self._seed_reward(
+            (effective_from + dt.timedelta(days=1)).isoformat(),
+            (effective_from + dt.timedelta(days=2)).isoformat(),
+            raw_reward=0.4, horizon=1)
+        later = self._seed_reward(
+            (effective_from + dt.timedelta(days=3)).isoformat(),
+            (effective_from + dt.timedelta(days=8)).isoformat(),
+            raw_reward=0.95, horizon=5)
+        self.assertNotEqual(earliest, later)
+
+        report = self._reconcile()
+        self.assertEqual(len(report["evaluated"]), 1, report)
+        self.assertEqual(report["evaluated"][0]["reward_id"], earliest)
+        self.assertAlmostEqual(
+            self._tracking(tracking_id)["eval_score"], math.tanh(0.4), places=9)
+
 
 class PreEffectiveRewardTests(RewardAttributionTestBase):
     """A：生效之前的 reward 必须被拒绝。"""
