@@ -4,7 +4,7 @@ import { api, apiPost } from "../core/api.js";
 import { $, setEl } from "../core/dom.js";
 import { adaptiveEsc, adaptiveSafeUrl, adaptiveText, fmt, pctCls, pctTxt } from "../core/format.js";
 import { allocationActionPanel } from "./execution.js";
-import { adaptiveActionNotice, adaptiveConfirm, handleOperatorError } from "../ui/dialog.js";
+import { adaptiveActionNotice, adaptiveConfirm, handleOperatorError, toast } from "../ui/dialog.js";
 
 export function adaptiveStageClass(stage){
   if(stage==='eligible_for_review'||stage==='advisory') return 'ready';
@@ -451,6 +451,7 @@ export async function runAdaptive(){
         if(!stillRunning){
           if(state.status==='failed'||state.error) throw new Error(state.error||'后台学习失败');
           await loadAdaptive();
+          toast('模拟盘学习已完成！证据已刷新。');
           break;
       }
     }
@@ -623,29 +624,33 @@ export function renderEvolutionLog(log){
 }
 
 export async function triggerEvolution(){
-  if(!confirm('确认手动触发一次自进化？\n\n注意：进化只生成候选参数，不会立即生效；需要显式激活后才会改变调参边界。')) return;
+  var confirmation=await adaptiveConfirm({title:'手动触发自进化',detail:'确认手动触发一次自进化？\n\n注意：进化只生成候选参数，不会立即生效；需要显式激活后才会改变调参边界。',boundary:'不会直接下单或修改实盘。'}); if(!confirmation.approved) return;
   try{
     var r=await apiPost('/api/adaptive/evolution/evolve?confirmed=true');
     if(r.evolved){
-      alert('已生成进化候选 #'+(r.new_params_id||'-')+'（调整 '+((r.changed_keys||[]).length)+' 个参数）。\n'
-        +'状态：'+(r.validation_state||'candidate')+'\n\n'
-        +'该候选尚未生效，需显式激活后才会改变调参边界。');
+      toast('已生成进化候选 #'+(r.new_params_id||'-')+'（调整 '+((r.changed_keys||[]).length)+' 个参数）');
     }else{
-      alert('无需进化：'+(r.reason||r.metrics?'当前状态稳定':'无数据'));
+      toast('无需进化：'+(r.reason||r.metrics?'当前状态稳定':'无数据'), { tone: 'info' });
     }
     loadEvolutionStatus();
-  }catch(e){alert('进化失败：'+e.message);}
+  }catch(e){
+    var handled=await handleOperatorError(e, '手动触发自进化', triggerEvolution);
+    if(!handled) adaptiveActionNotice('进化失败',e.message);
+  }
 }
 
 export async function runDualAiTuning(){
-  if(!confirm('确认运行一次双AI共识调参？')) return;
+  var confirmation=await adaptiveConfirm({title:'运行双AI共识调参',detail:'确认运行一次双AI共识调参？',boundary:'不会直接修改现有参数，结果需人工审阅确认。'}); if(!confirmation.approved) return;
   try{
     var r=await apiPost('/api/adaptive/dual-ai/tune?trigger=manual&mode=intraday&confirmed=true');
-    var msg='调参完成\n状态：'+r.status+'\n共识：'+(r.consensus?'是':'否')+'\n原因：'+(r.consensus_reason||'');
-    if(r.evolution_triggered) msg+='\n\n⚡ 自动进化已触发';
-    alert(msg);
+    var msg='调参完成 · 状态：'+r.status+' · 共识：'+(r.consensus?'是':'否');
+    if(r.evolution_triggered) msg+=' · 自动进化已触发';
+    toast(msg);
     loadEvolutionStatus();
-  }catch(e){alert('双AI调参失败：'+e.message);}
+  }catch(e){
+    var handled=await handleOperatorError(e, '运行双AI共识调参', runDualAiTuning);
+    if(!handled) adaptiveActionNotice('双AI调参失败',e.message);
+  }
 }
 
 export async function testModlensRead(){
@@ -768,19 +773,28 @@ export async function rollbackAdaptiveRisk(accountId){
   var confirmation=await adaptiveConfirm({title:'回滚风控版本',detail:'将恢复该策略上一版模拟盘风控参数。',boundary:'只影响该模拟策略，可再次审阅后重新批准。',reason:true,defaultReason:'人工复核后回滚'}); if(!confirmation.approved) return;
   var reason=confirmation.reason;
   try{renderAdaptive(await apiPost('/api/adaptive/risk/rollback?account_id='+encodeURIComponent(accountId)+'&reason='+encodeURIComponent(reason)+'&confirmed=true'));}
-  catch(e){adaptiveActionNotice('风控版本回滚失败',e.message);}
+  catch(e){
+    var handled=await handleOperatorError(e, '回滚风控版本', function(){ return rollbackAdaptiveRisk(accountId); });
+    if(!handled) adaptiveActionNotice('风控版本回滚失败',e.message);
+  }
 }
 
 export async function rollbackAdaptiveSelection(accountId){
   var confirmation=await adaptiveConfirm({title:'回滚选股版本',detail:'将恢复该策略上一版模拟盘内部选股权重。',boundary:'只影响该模拟策略，不影响公共选股。',reason:true,defaultReason:'人工复核后回滚'}); if(!confirmation.approved) return;
   var reason=confirmation.reason;
   try{renderAdaptive(await apiPost('/api/adaptive/selection/rollback?account_id='+encodeURIComponent(accountId)+'&reason='+encodeURIComponent(reason)+'&confirmed=true'));}
-  catch(e){adaptiveActionNotice('选股版本回滚失败',e.message);}
+  catch(e){
+    var handled=await handleOperatorError(e, '回滚选股版本', function(){ return rollbackAdaptiveSelection(accountId); });
+    if(!handled) adaptiveActionNotice('选股版本回滚失败',e.message);
+  }
 }
 
 export async function rollbackAdaptiveRebalance(accountId){
   var confirmation=await adaptiveConfirm({title:'回滚调仓版本',detail:'将恢复该策略上一版模拟盘调仓参数。',boundary:'只影响该模拟策略，不会改动历史成交。',reason:true,defaultReason:'人工复核后回滚调仓'}); if(!confirmation.approved) return;
   var reason=confirmation.reason;
   try{renderAdaptive(await apiPost('/api/adaptive/rebalance/rollback?account_id='+encodeURIComponent(accountId)+'&reason='+encodeURIComponent(reason)+'&confirmed=true'));}
-  catch(e){adaptiveActionNotice('调仓版本回滚失败',e.message);}
+  catch(e){
+    var handled=await handleOperatorError(e, '回滚调仓版本', function(){ return rollbackAdaptiveRebalance(accountId); });
+    if(!handled) adaptiveActionNotice('调仓版本回滚失败',e.message);
+  }
 }

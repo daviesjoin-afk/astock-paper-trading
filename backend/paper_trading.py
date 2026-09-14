@@ -886,7 +886,7 @@ def _market_session(now=None):
     时间使用服务器本地时区（生产环境为 Asia/Shanghai）。
     """
     now = now if isinstance(now, dt.datetime) else dt.datetime.now()
-    if now.weekday() >= 5:
+    if now.weekday() >= 5 or not U.is_trade_day(now.date()):
         return {"code": "non_trading_day", "label": "非交易日，暂无当日收益", "today_pnl_available": False}
     current = now.time()
     if current < dt.time(9, 15):

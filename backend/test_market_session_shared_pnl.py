@@ -137,7 +137,23 @@ class MarketSessionSharedPnlTests(unittest.TestCase):
         self.assertEqual(table.loc["000001", "main_pct"], 12.5)
         self.assertEqual(table.loc["000001", "main_net"], 50000000.0)
 
-    def test_paper_selection_falls_back_to_shadow_picks(self):
+    def test_market_session_holiday_shows_non_trading_day(self):
+        # Thursday 10:00 on National Day holiday (2026-10-01)
+        holiday_dt = dt.datetime(2026, 10, 1, 10, 0, 0)
+        session = P._market_session(holiday_dt)
+        self.assertEqual(session["code"], "non_trading_day")
+        self.assertFalse(session["today_pnl_available"])
+        self.assertIn("非交易日", session["label"])
+
+    def test_market_session_weekday_pre_open(self):
+        # Monday 02:00 on a normal trading day (2026-09-14)
+        pre_open_dt = dt.datetime(2026, 9, 14, 2, 0, 0)
+        session = P._market_session(pre_open_dt)
+        self.assertEqual(session["code"], "pre_open")
+        self.assertFalse(session["today_pnl_available"])
+        self.assertEqual(session["label"], "盘前未开盘")
+
+    def test_paper_selection_keeps_shadow_out_of_official_picks(self):
         import paper_selection as PS
 
         fake_res = {
@@ -160,8 +176,8 @@ class MarketSessionSharedPnlTests(unittest.TestCase):
         with mock.patch.object(PS, "_run_one", return_value=fake_res):
             res = PS.run_daily(topn=5, run_date="2026-09-11")
             strat = res["strategies"][0]
-            self.assertEqual(len(strat["picks"]), 1)
-            self.assertEqual(strat["picks"][0]["code"], "600001")
+            self.assertEqual(len(strat["picks"]), 0)
+            self.assertEqual(strat["status"], "empty")
 
 
 if __name__ == "__main__":
