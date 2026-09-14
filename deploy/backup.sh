@@ -1,13 +1,17 @@
 #!/bin/bash
-# A股模拟盘每日自动备份：SQLite 在线备份 + 关键配置，保留 N 天
+# A股模拟盘每日自动备份：SQLite 在线备份 + 关键配置，保留 N 个最新快照
 # 用法：backup.sh [--keep 7]
 # 在宿主机执行（不需要容器权限），SQLite .backup 保证一致性且不锁主库。
 # 项目目录自动探测：优先 /opt/astock-codex（开源部署），回退 /root/codex（腾讯云单机）。
 set -euo pipefail
 
-KEEP_DAYS=7
+KEEP_COUNT=7
 if [[ "${1:-}" == "--keep" ]]; then
-  KEEP_DAYS="${2:-7}"
+  KEEP_COUNT="${2:-7}"
+fi
+if ! [[ "$KEEP_COUNT" =~ ^[1-9][0-9]*$ ]]; then
+  echo "backup failed: --keep 必须是正整数" >&2
+  exit 2
 fi
 
 if [[ -n "${APP_DIR:-}" ]]; then
@@ -56,8 +60,21 @@ printf 'created_at=%s\nsource=%s\n' "$(date -Is)" "$PROJECT_DIR" > "$DEST/backup
   exit 1
 }
 
-# 5. 清理过期备份
-find "${BACKUP_ROOT:-/var/backups/astock-codex}/daily" -mindepth 1 -maxdepth 1 -type d -mtime +"$KEEP_DAYS" -exec rm -rf {} + 2>/dev/null || true
+# 5. 按快照数而非 mtime 回收。部署前也会创建备份；若只按天数回收，
+# 同一天的多次部署会累积完整账本备份并填满磁盘。
+BACKUP_DAILY_ROOT="${BACKUP_ROOT:-/var/backups/astock-codex}/daily"
+mapfile -t BACKUP_DIRS < <(
+  find "$BACKUP_DAILY_ROOT" -mindepth 1 -maxdepth 1 -type d -name '20????????-????' -printf '%f\n' | sort -r
+)
+for ((index = KEEP_COUNT; index < ${#BACKUP_DIRS[@]}; index++)); do
+  stale_backup="$BACKUP_DAILY_ROOT/${BACKUP_DIRS[$index]}"
+  [[ "$stale_backup" == "$BACKUP_DAILY_ROOT"/20????????-???? ]] || {
+    echo "backup failed: 拒绝删除非标准备份目录 $stale_backup" >&2
+    exit 1
+  }
+  rm -rf -- "$stale_backup"
+  echo "pruned backup: $stale_backup"
+done
 
 echo "backup done: $DEST"
 ls -lh "$DEST"
