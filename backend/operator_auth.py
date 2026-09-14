@@ -193,7 +193,7 @@ def read_token_config(env=None):
     """读取并分类当前 token 配置，返回 :class:`TokenConfig`。
 
     - 环境变量不存在 / trim 后为空  → UNSET
-    - trim 后长度 >= 24 且字符合法  → VALID
+    - trim 后长度 >= 8 且字符合法   → VALID
     - 存在但强度不足                → INVALID
 
     **空值（``""`` 或纯空白）属于 UNSET，不是 INVALID。** 这一点是刻意的：
