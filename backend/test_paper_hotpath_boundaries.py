@@ -124,6 +124,7 @@ class PaperHotpathBoundaryTests(unittest.TestCase):
 
     def test_run_slot_nested_context_restores_outer_token(self):
         """Nested run_slot invocations must restore the outer caller's ContextVar token."""
+        from unittest.mock import patch
         import paper_trading as PT
 
         self.assertFalse(PT._SLOT_HOT_PATH.get())
@@ -131,8 +132,13 @@ class PaperHotpathBoundaryTests(unittest.TestCase):
         try:
             self.assertTrue(PT._SLOT_HOT_PATH.get())
             # Run cold slot which sets False inside and must restore to True on exit
-            res = PT.run_slot("weekly-review", asof_date="2026-09-13", force=False)
-            self.assertIn(res.get("status"), ("completed", "skipped", "already_done"))
+            def _check_inner(*args, **kwargs):
+                self.assertFalse(PT._SLOT_HOT_PATH.get(), "Inside cold slot, ContextVar must be False")
+                return {"status": "completed"}
+
+            with patch.object(PT, "_run_slot_impl", side_effect=_check_inner):
+                res = PT.run_slot("close", asof_date="2026-09-13", force=False)
+                self.assertEqual(res.get("status"), "completed")
             self.assertTrue(PT._SLOT_HOT_PATH.get(), "Nested cold run_slot must restore outer True token")
         finally:
             PT._SLOT_HOT_PATH.reset(token)
