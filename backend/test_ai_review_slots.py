@@ -637,7 +637,7 @@ class ReviewRegressionTests(AiReviewSlotTestBase):
         self.assertFalse(AE.ai_review_preflight({"single_ready": True})[0])
         self.assertTrue(AE.ai_review_preflight({"review_mode": "dual", "dual_ready": True})[0])
 
-    def test_t27_legacy_environment_credentials_are_honored_when_no_row_exists(self):
+    def test_t27_legacy_environment_is_bootstrapped_once_into_persisted_slots(self):
         legacy_env = {
             "MIMO_API_KEY": "fake-legacy-mimo-key",
             "MIMO_BASE_URL": "https://legacy-mimo.example.com/v1/",
@@ -651,7 +651,10 @@ class ReviewRegressionTests(AiReviewSlotTestBase):
             self.assertEqual("https://legacy-mimo.example.com/v1", cfg["base_url"])
             self.assertEqual("legacy-model-one", cfg["model"])
             self.assertEqual(50, cfg["timeout_seconds"])
-            self.assertEqual("environment", cfg["source"])
+            # 显式设过的值一律沿用；bootstrap 会把它**落库**成槽位配置
+            self.assertEqual("database", cfg["source"])
+        self.assertEqual(1, self.scalar("SELECT COUNT(*) FROM ai_provider_slots WHERE slot='ai1'"))
+        self.assertTrue(self.slots()["ai1"]["ready"])
 
     def test_t28_new_env_wins_and_a_db_row_disables_env_entirely(self):
         env = {
@@ -692,6 +695,103 @@ class ReviewRegressionTests(AiReviewSlotTestBase):
         row = self.audit(outcome["id"])
         self.assertEqual("single_review_failed", row["status"])
         self.assertIn("response_not_object", str(row["reviewers"] or ""))
+
+
+    def test_t30_legacy_key_only_deployment_keeps_pre_upgrade_behaviour(self):
+        """阻塞回归：老部署**只设了厂商 API Key**（无 URL/model），升级后必须照旧可用。
+
+        基线 ``dual_ai_tuner`` 对每个厂商自带默认端点/模型，所以"只有 Key"过去也能
+        跑；通用化后若不 bootstrap，这类部署会静默变成 ready=false。
+        """
+        with mock.patch.dict(os.environ, {"MIMO_API_KEY": "fake-legacy-mimo-key"}, clear=True):
+            with self.factory() as conn:
+                S.ensure_schema(conn)
+            slot = self.slots()["ai1"]
+        self.assertEqual("https://api.mimo.ai/v1", slot["base_url"], "旧版 MiMo 默认端点必须补齐")
+        self.assertEqual("mimo-v1", slot["model"], "旧版 MiMo 默认模型必须补齐")
+        self.assertTrue(slot["ready"], "只配 Key 的老部署升级后仍必须就绪")
+
+        with mock.patch.dict(os.environ, {"DEEPSEEK_API_KEY": "fake-legacy-ds-key"}, clear=True):
+            with self.factory() as conn:
+                S.ensure_schema(conn)
+            slot2 = self.slots()["ai2"]
+        self.assertEqual("https://api.deepseek.com", slot2["base_url"])
+        self.assertEqual("deepseek-v4-flash", slot2["model"])
+        self.assertTrue(slot2["ready"])
+        # 两个槽位都补齐后，双AI模式也应当就绪
+        with mock.patch.dict(os.environ, {}, clear=True):
+            with self.factory() as conn:
+                self.assertTrue(S.review_settings_view(conn)["dual_ready"])
+
+    def test_t31_new_style_env_takes_precedence_and_is_not_persisted(self):
+        env = {
+            "AI_SLOT_AI1_API_KEY": "fake-new-style-key",
+            "MIMO_API_KEY": "fake-legacy-mimo-key",
+        }
+        with mock.patch.dict(os.environ, env, clear=True):
+            with self.factory() as conn:
+                S.ensure_schema(conn)
+                cfg = S.get_slot_config(conn, "ai1")
+        self.assertEqual("fake-new-style-key", cfg["api_key"])
+        self.assertEqual("environment", cfg["source"], "新式 env 提供 Key 时不得落库")
+        self.assertEqual(0, self.scalar("SELECT COUNT(*) FROM ai_provider_slots WHERE slot='ai1'"))
+        self.assertEqual("", cfg["base_url"], "更不允许把厂商默认端点混进新式配置")
+
+    def test_t32_connection_test_requires_a_well_formed_response(self):
+        with self.factory() as conn:
+            S.update_slot(conn, "ai1", api_key="fake-slot-key",
+                          base_url="https://ai1.example.com/v1", model="model-one", enabled=True)
+        # 合法 JSON 但不是对象 → 协议不合法：ok 必须为 false，并给出明确原因
+        with mock.patch.object(S, "_call_slot", return_value=([], 1, 1, 5)):
+            with self.factory() as conn:
+                result = S.test_slot(conn, "ai1")
+        self.assertFalse(result["ok"], "协议不合法的响应绝不能被显示成连接成功")
+        self.assertFalse(result["response_ok"])
+        self.assertEqual("invalid_response_schema", result["error"])
+        # 合法对象 → ok 为 true
+        with mock.patch.object(S, "_call_slot", return_value=({"ok": True}, 1, 1, 7)):
+            with self.factory() as conn:
+                ok_result = S.test_slot(conn, "ai1")
+        self.assertTrue(ok_result["ok"])
+        self.assertTrue(ok_result["response_ok"])
+        self.assertIsNone(ok_result["error"])
+
+    def test_t33_base_url_is_validated_on_save(self):
+        # 全部用保留域名（example.com）承载 host，避免把真实远端主机名写进用例
+        for value in ["abc", "123", "://wrong", "ftp://example.com/v1", "http://",
+                      "https://example.com/a b"]:
+            with self.assertRaises(ValueError, msg="%r 必须被拒绝" % value):
+                with self.factory() as conn:
+                    S.update_slot(conn, "ai1", api_key="fake-slot-key",
+                                  base_url=value, model="model-one")
+        with self.factory() as conn:
+            S.update_slot(conn, "ai1", api_key="fake-slot-key",
+                          base_url="https://ai1.example.com/v1/", model="model-one")
+        self.assertEqual("https://ai1.example.com/v1", self.slots()["ai1"]["base_url"])
+        # 直接粘贴完整接口地址也接受（归一化掉 /chat/completions 后缀）
+        with self.factory() as conn:
+            S.update_slot(conn, "ai1", base_url="https://ai1.example.com/v1/chat/completions")
+        self.assertEqual("https://ai1.example.com/v1", self.slots()["ai1"]["base_url"])
+        # 空串 = 清空该字段（允许保存，但 readiness 必须转为未就绪）
+        with self.factory() as conn:
+            S.update_slot(conn, "ai1", base_url="")
+        self.assertEqual("", self.slots()["ai1"]["base_url"])
+        self.assertFalse(self.slots()["ai1"]["ready"])
+
+    def test_t34_readiness_rejects_a_non_url_base_url_from_legacy_rows(self):
+        # 直接写库模拟历史脏数据（绕过保存校验）：readiness 也必须拦下
+        with self.factory() as conn:
+            S.ensure_schema(conn)
+            conn.execute(
+                "INSERT INTO ai_provider_slots(slot,display_name,api_key,base_url,model,"
+                "enabled,timeout_seconds,updated_at) VALUES('ai1','AI 1','fake-slot-key',"
+                "'abc','model-one',1,40,'2026-01-01')")
+            conn.commit()
+        slot = self.slots()["ai1"]
+        self.assertTrue(slot["configured"])
+        self.assertFalse(slot["ready"], "非 URL 的 base_url 不得报告就绪")
+        with self.factory() as conn:
+            self.assertFalse(S.review_settings_view(conn)["single_ready"])
 
 
 if __name__ == "__main__":  # pragma: no cover

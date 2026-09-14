@@ -43,6 +43,7 @@ import json
 import os
 import sqlite3
 import time
+import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -77,6 +78,18 @@ _CHAT_COMPLETIONS_SUFFIX = "/chat/completions"
 # 仅为方便操作员认出"哪个槽位原来是哪家"，之后完全可改。
 LEGACY_PROVIDER_SLOTS = (("mimo", "ai1"), ("deepseek", "ai2"))
 LEGACY_DISPLAY_LABELS = {"ai1": "MiMo", "ai2": "DeepSeek"}
+
+# 旧版 dual_ai_tuner 对每个厂商**自带**默认端点/模型/超时，因此"只设了 API Key"的
+# 部署过去也能跑。这些值**只在一次性 bootstrap 迁移**
+# （``migrate_legacy_env_providers``）里使用，用来把这类老部署补齐成完整槽位配置
+# 并落库；落库之后运行期只读数据库，厂商默认值不会进入通用调用层。
+# 取值与基线 ``dual_ai_tuner.MIMO_DEFAULTS`` / ``DEEPSEEK_DEFAULTS`` 逐字一致，
+# 以保证升级前后行为不变。
+LEGACY_PROVIDER_DEFAULTS = {
+    "mimo": {"base_url": "https://api.mimo.ai/v1", "model": "mimo-v1", "timeout_seconds": 40},
+    "deepseek": {"base_url": "https://api.deepseek.com", "model": "deepseek-v4-flash",
+                 "timeout_seconds": 35},
+}
 
 # 无行（从未在界面配置过）时的通用环境变量兜底：AI_SLOT_AI1_API_KEY 等。
 # 刻意用"槽位"而不是"厂商"命名，避免把厂商身份重新焊回业务层。
@@ -136,6 +149,45 @@ def chat_completions_url(base_url):
     if not base:
         raise ValueError("base_url_missing")
     return base + _CHAT_COMPLETIONS_SUFFIX
+
+
+def is_usable_base_url(value):
+    """base_url 是否是**真能发请求**的地址：scheme ∈ {http, https} 且 hostname 非空。
+
+    这是 readiness 用的宽松判定（不抛异常），既兜住保存校验，也兜住历史脏数据。
+    """
+    text = normalize_base_url(value)
+    if not text or any(ch.isspace() for ch in text):
+        return False
+    try:
+        parts = urllib.parse.urlsplit(text)
+        hostname = parts.hostname
+    except ValueError:  # 例如非法 IPv6 字面量
+        return False
+    return parts.scheme.lower() in ("http", "https") and bool(hostname)
+
+
+def validate_base_url(value):
+    """保存时的严格校验：不合法直接 ``ValueError``，把清晰原因回给调用方。
+
+    刻意**不**依赖浏览器 ``<input type=url>`` —— 接口可能被直接调用，校验必须在
+    后端。空字符串表示"未配置 / 清除该字段"，允许通过（由 readiness 拦下）。
+    """
+    text = normalize_base_url(value)
+    if not text:
+        return ""
+    if any(ch.isspace() for ch in text):
+        raise ValueError("base_url 不能包含空白字符")
+    try:
+        parts = urllib.parse.urlsplit(text)
+        hostname = parts.hostname
+    except ValueError as exc:
+        raise ValueError("base_url 无法解析：%s" % exc) from exc
+    if parts.scheme.lower() not in ("http", "https"):
+        raise ValueError("base_url 必须以 http:// 或 https:// 开头")
+    if not hostname:
+        raise ValueError("base_url 缺少主机名")
+    return text
 
 
 def _clamp_timeout(value):
@@ -260,6 +312,9 @@ def ensure_schema(conn):
         (DEFAULT_REVIEW_MODE, DEFAULT_SINGLE_REVIEWER_SLOT, _now()),
     )
     migrate_legacy_providers(conn)
+    # 数据库里没有可迁移的历史配置时，再看一次性环境变量 bootstrap：
+    # 只配了厂商 API Key 的老部署需要在这里补齐默认端点/模型并落库。
+    migrate_legacy_env_providers(conn)
 
 
 def _table_exists(conn, name):
@@ -322,6 +377,51 @@ def migrate_legacy_providers(conn):
              str(row[3] or "").strip(), int(bool(row[4])), DEFAULT_TIMEOUT_SECONDS, _now()),
         )
         migrated[slot] = legacy_provider
+    return migrated
+
+
+def migrate_legacy_env_providers(conn):
+    """把"只配置了厂商 API Key"的老部署一次性补齐成槽位配置并落库。
+
+    旧实现（基线 ``dual_ai_tuner``）对每个厂商自带默认 ``base_url`` / ``model``，
+    所以只设了 ``MIMO_API_KEY``（或 ``DEEPSEEK_API_KEY``）的部署过去也能正常审核。
+    通用化之后运行期不再内置任何厂商默认值；若不迁移，这类部署升级后会静默变成
+    "未就绪"（本 PR 引入的向后兼容回归），因此兼容被**收敛在这一层**：
+
+    - **逐槽位**判定（"该槽位尚无持久化配置"）：仅在 ``ai_provider_slots`` 里
+      没有这个槽位的任何一行时执行 —— 绝不覆盖用户配置，也不复活已
+      ``clear_api_key`` 的槽位（清除会留下行）；
+    - 仅在该槽位**没有**新式 ``AI_SLOT_*_API_KEY`` 时处理，绝不抢在新式配置前面；
+    - 只把**缺失**的 base_url / model / 超时用旧厂商默认值补齐，显式设过的沿用。
+
+    落库后运行期一律读数据库，厂商默认值不会进入通用调用层。
+    返回 ``{slot: legacy_provider}``（本次真正初始化了哪些）。
+    """
+    _ensure_slot_tables(conn)
+    migrated = {}
+    for legacy, slot in LEGACY_PROVIDER_SLOTS:
+        if _slot_row(conn, slot) is not None:
+            continue  # 该槽位已有持久化配置（含"已清除"）→ 一律不动
+        prefix = legacy.upper()
+        if str(os.getenv(_env_key(slot, "API_KEY")) or "").strip():
+            continue  # 新式环境变量已提供 Key → 交给通用兜底，不落库
+        api_key = str(os.getenv(prefix + "_API_KEY") or "").strip()
+        if not api_key:
+            continue
+        defaults = LEGACY_PROVIDER_DEFAULTS.get(legacy, {})
+        base_url = (normalize_base_url(os.getenv(prefix + "_BASE_URL") or "")
+                    or defaults.get("base_url", ""))
+        model = str(os.getenv(prefix + "_MODEL") or "").strip() or defaults.get("model", "")
+        raw_timeout = os.getenv(prefix + "_TIMEOUT_SECONDS")
+        timeout = (_clamp_timeout(raw_timeout) if raw_timeout not in (None, "")
+                   else int(defaults.get("timeout_seconds", DEFAULT_TIMEOUT_SECONDS)))
+        conn.execute(
+            "INSERT INTO ai_provider_slots(slot,display_name,api_key,base_url,model,"
+            "enabled,timeout_seconds,updated_at) VALUES(?,?,?,?,?,?,?,?)",
+            (slot, LEGACY_DISPLAY_LABELS.get(slot, DEFAULT_DISPLAY_NAMES[slot]), api_key,
+             base_url, model, 1, timeout, _now()),
+        )
+        migrated[slot] = legacy
     return migrated
 
 
@@ -394,13 +494,13 @@ def slot_public_view(cfg):
         "timeout_seconds": cfg.get("timeout_seconds"),
         "updated_at": cfg.get("updated_at"),
         "source": cfg.get("source"),
-        # 就绪 = 真正能发出一次请求所需的**全部**字段：Key、启用、地址、模型。
-        # 只判 Key+启用会让"缺 base_url/model"的半配置对外显示就绪，实际调用却
-        # 立刻被 chat_completions_url / build_request_body 拒绝。
+        # 就绪 = 真正能发出一次请求所需的**全部**字段：Key、启用、合法地址、模型。
+        # 地址不只看非空——``abc`` / ``123`` / ``://wrong`` 这类不是可请求的 URL，
+        # 历史脏数据也要被这里拦下（保存路径另有 validate_base_url 严格拒绝）。
         "ready": (
             bool(api_key.strip())
             and bool(cfg.get("enabled"))
-            and bool(str(cfg.get("base_url") or "").strip())
+            and is_usable_base_url(cfg.get("base_url"))
             and bool(str(cfg.get("model") or "").strip())
         ),
     }
@@ -458,7 +558,9 @@ def update_slot(conn, slot, api_key=None, base_url=None, model=None, enabled=Non
         if cleaned_key:  # 空输入 = 保持旧 Key
             state["api_key"] = cleaned_key
     if base_url is not None:
-        state["base_url"] = normalize_base_url(
+        # 保存即校验：scheme / hostname 不合法直接拒绝（空串 = 清空该字段）。
+        # 不能只靠浏览器 <input type=url>，接口可能被直接调用。
+        state["base_url"] = validate_base_url(
             _clean_text(base_url, MAX_BASE_URL_LENGTH, "base_url"))
     if model is not None:
         state["model"] = _clean_text(model, MAX_MODEL_LENGTH, "model")
@@ -613,6 +715,14 @@ def slot_config_snapshot(cfg):
 def test_slot(conn, slot):
     """对一个槽位做一次真实连通性探测。返回结构**绝不含 API Key**。
 
+    语义（"连接正常"必须等于"这个槽位真的能被系统用起来"）：
+
+        ``ok`` = 网络成功 AND HTTP 成功 AND JSON 可解析 AND 响应满足最低协议结构
+
+    最低协议结构 = 助手消息内容解析后是一个 **JSON 对象**（审核管线本身只接受
+    对象），非对象一律 ``ok=false`` + ``error="invalid_response_schema"``，
+    绝不让协议不合法的响应显示成"连接成功"。
+
     只做一次极小的 Chat Completions 往返，用于页面上的"测试连接"按钮；
     CI 不会调用它（会触发真实付费请求），所以测试用例只覆盖拒绝路径。
     """
@@ -633,15 +743,24 @@ def test_slot(conn, slot):
     if not cfg["enabled"]:
         result["error"] = "slot_disabled"
         return result
+    if not is_usable_base_url(cfg["base_url"]):
+        result["error"] = "invalid_base_url"
+        return result
+    if not str(cfg.get("model") or "").strip():
+        result["error"] = "model_missing"
+        return result
     try:
         parsed, _in_tokens, _out_tokens, latency = _call_slot(
             cfg, "你是连通性探针。只输出严格JSON。", '只输出 {"ok": true}', max_tokens=64)
     except Exception as exc:  # noqa: BLE001 - 探测结果必须结构化返回
         result["error"] = "%s: %s" % (type(exc).__name__, str(exc)[:200])
         return result
-    result["ok"] = True
     result["latency_ms"] = latency
     result["response_ok"] = isinstance(parsed, dict)
+    if not result["response_ok"]:
+        result["error"] = "invalid_response_schema"
+        return result
+    result["ok"] = True
     return result
 
 
