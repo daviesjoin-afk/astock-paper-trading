@@ -131,11 +131,12 @@ def _cclear(prefix=None):
 
 
 def _call_with_retry(fn, *args, retries=3, delay=2, **kwargs):
+    from paper_storage import is_sqlite_busy_error
     for i in range(retries):
         try:
             return fn(*args, **kwargs)
         except Exception as e:
-            if "database is locked" in str(e) and i < retries - 1:
+            if is_sqlite_busy_error(e) and i < retries - 1:
                 time.sleep(delay)
                 continue
             raise

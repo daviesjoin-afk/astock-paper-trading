@@ -27,7 +27,18 @@ import strategies as S
 import universe as U
 import risk_center as RC
 import news_learning as NL
-import paper_research as PR
+# PR (paper_research) 与 SE (self_evolution) 仅在盘后收盘研究与 Challenger 管理路径使用，
+# 采用懒加载避免在交易热路径（如 fast-entry, intraday）启动时加载不必要的大模块。
+def _get_pr():
+    import paper_research as _pr
+    return _pr
+
+
+def _get_se():
+    import self_evolution as _se
+    return _se
+
+
 import paper_storage as PST
 import paper_portfolio as PP
 import paper_repository as PRP
@@ -55,7 +66,6 @@ import entry_lifecycle as ELC
 import execution_dispatch as EPD
 import paper_slot_service as PSS
 import portfolio_coordinator as PCO
-import self_evolution as SE
 import strategy_champion as SCM
 import strategy_clusters as SC
 import execution_profiles as EPF
@@ -6944,7 +6954,7 @@ def generate_signals(asof_date=None):
     # They use only the close snapshot available in this run and cannot affect
     # the pending signals created below.
     try:
-        summary["research_observations"] = PR.update_observations(day, close_universe)
+        summary["research_observations"] = _get_pr().update_observations(day, close_universe)
     except Exception as exc:
         summary["research_observations"] = {
             "status": "failed", "error": f"{type(exc).__name__}: {exc}"
@@ -7005,7 +7015,7 @@ def generate_signals(asof_date=None):
             research["candidate_snapshot_error"] = f"{type(exc).__name__}: {exc}"
         if not meta.get("blocked"):
             try:
-                research["shadow"] = PR.record_shadow_run(
+                research["shadow"] = _get_pr().record_shadow_run(
                     account_id, candidates, meta=meta, market=market, signal_date=day,
                 )
             except Exception as exc:
@@ -7114,7 +7124,7 @@ def backfill_research_shadow(asof_date=None):
         return {"status": "skipped", "date": day.isoformat(), "reason": "全市场收盘快照为空"}
     market = _market_state(day, live_universe=close_universe)
     try:
-        PR.update_observations(day, close_universe)
+        _get_pr().update_observations(day, close_universe)
     except Exception:
         # Observation backfill is best effort.  Candidate evidence remains safe
         # to write and will receive its next close observation on a later run.
@@ -7145,7 +7155,7 @@ def backfill_research_shadow(asof_date=None):
                 })
                 continue
             try:
-                saved = PR.record_shadow_run(
+                saved = _get_pr().record_shadow_run(
                     account["id"], candidates, meta=meta, market=market, signal_date=day,
                 )
             except Exception as exc:
@@ -8073,7 +8083,7 @@ def strategy_champion_overview():
         SCM.ensure_schema(conn)
         evo_conn = _evolution_conn()
         try:
-            SE.ensure_schema(evo_conn)
+            _get_se().ensure_schema(evo_conn)
             evaluations = {
                 account_id: SCM.evaluate_challenger(conn, evo_conn, account_id)
                 for account_id in ACCOUNT_SPECS
@@ -8103,7 +8113,7 @@ def open_strategy_challenger(strategy_id, params, source="manual", evidence_coun
         SCM.ensure_schema(conn)
         evo_conn = _evolution_conn()
         try:
-            SE.ensure_schema(evo_conn)
+            _get_se().ensure_schema(evo_conn)
             return SCM.open_challenger(
                 conn, evo_conn, strategy_id, params,
                 source=source, evidence_count=evidence_count,
@@ -8119,7 +8129,7 @@ def promote_strategy_challenger(strategy_id):
         SCM.ensure_schema(conn)
         evo_conn = _evolution_conn()
         try:
-            SE.ensure_schema(evo_conn)
+            _get_se().ensure_schema(evo_conn)
             return SCM.promote_challenger(conn, evo_conn, strategy_id)
         finally:
             evo_conn.close()
@@ -8132,7 +8142,7 @@ def rollback_strategy_challenger(strategy_id, reason="manual_rollback"):
         SCM.ensure_schema(conn)
         evo_conn = _evolution_conn()
         try:
-            SE.ensure_schema(evo_conn)
+            _get_se().ensure_schema(evo_conn)
             return SCM.rollback_challenger(conn, evo_conn, strategy_id, reason=reason)
         finally:
             evo_conn.close()
@@ -13740,8 +13750,8 @@ def _claim_runtime_lease(conn, lock_key, owner_key, slot, ttl_seconds=720):
                     return False, row[0], row[3]
                 return False, "unknown", None
         except sqlite3.OperationalError as e:
-            if "database is locked" in str(e) and _retry < 4:
-                time.sleep(2)
+            if PST.is_sqlite_busy_error(e) and _retry < 4:
+                time.sleep(PST.sqlite_busy_backoff(_retry, hot_path=True))
                 continue
             raise
     return False, "database_locked", None
@@ -14732,7 +14742,7 @@ def dashboard(include_activity=False, include_history_symbols=False):
 
 def research_validation_dashboard(limit=40):
     """Return only the shadow-research ledger for the five paper strategies."""
-    result = PR.dashboard(limit=limit)
+    result = _get_pr().dashboard(limit=limit)
     now = dt.datetime.now()
     today = now.date()
     after_close = bool(_is_trade_weekday(today) and now.time() >= dt.time(15, 5))

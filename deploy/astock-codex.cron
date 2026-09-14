@@ -59,10 +59,13 @@ HOME=/opt/astock-codex
 # 15:15 收盘快照确认：强制刷新全市场行情，仅采集数据，不下单、不改参数。
 15 15 * * 1-5 root flock -n /opt/astock-codex/.locks/resource-heavy.lock docker exec astock-data-worker python backend/close_snapshot_runner.py >>/opt/astock-codex/reports/close-snapshot-scheduler.log 2>&1
 
-# 盘后自进化闭环（observe→evaluate→mutate→validate→apply）：此前无任何调度，
-# evolution_params 从未被驱动。16:45 在收盘学习（15:35/15:55/16:15）之后运行，
-# time-budget 保证不跨时段久占；失败自然由下一个交易日续跑（不自动重放）。
-45 16 * * 1-5 root flock -n /opt/astock-codex/.locks/adaptive-close.lock docker exec astock-task-worker python backend/evolution_loop_runner.py --generations 1 --time-budget 240 >>/opt/astock-codex/reports/evolution-loop.log 2>&1
+# 盘后自进化闭环（observe→evaluate→mutate→validate→apply）：
+# 16:45 首跑；17:05、17:35 重试窗口。
+# run_evolution_loop.sh 内置 flock -w 180 锁等待；
+# runner 传 --daily，内置交易日守卫与当天已完成守护（已完成则 exit 0 幂等跳过）。
+45 16 * * 1-5 root /opt/astock-codex/deploy/run_evolution_loop.sh >>/opt/astock-codex/reports/evolution-loop.log 2>&1
+5 17 * * 1-5 root /opt/astock-codex/deploy/run_evolution_loop.sh >>/opt/astock-codex/reports/evolution-loop.log 2>&1
+35 17 * * 1-5 root /opt/astock-codex/deploy/run_evolution_loop.sh >>/opt/astock-codex/reports/evolution-loop.log 2>&1
 
 # 盘后自进化：使用完整收盘数据更新盘面画像、多周期奖励与 Bandit 影子权重，不改实盘、不下单。
 35 15 * * 1-5 root flock -n /opt/astock-codex/.locks/adaptive-close.lock docker exec astock-task-worker python backend/adaptive_runner.py --trigger scheduled-close >>/opt/astock-codex/reports/adaptive-scheduler.log 2>&1

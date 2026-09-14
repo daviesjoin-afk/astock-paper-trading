@@ -119,6 +119,15 @@ def ensure_loop_schema(conn: sqlite3.Connection) -> None:
         );
         """
     )
+    # 动态补齐 candidate 生命周期列
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(evolution_loop_state)").fetchall()}
+    if "candidate_params_id" not in cols:
+        conn.execute("ALTER TABLE evolution_loop_state ADD COLUMN candidate_params_id INTEGER")
+    if "candidate_validation_state" not in cols:
+        conn.execute("ALTER TABLE evolution_loop_state ADD COLUMN candidate_validation_state TEXT")
+    if "candidate_pending_activation" not in cols:
+        conn.execute("ALTER TABLE evolution_loop_state ADD COLUMN candidate_pending_activation BOOLEAN DEFAULT 0")
+
     # 复用 self_evolution 的表（进化参数 / 追踪 / 日志）。
     import self_evolution as SE
     SE.ensure_schema(conn)
@@ -182,26 +191,55 @@ class ProductionBackend(Backend):
 
     def mutate(self, conn, generation, ctx):
         import self_evolution as SE
+        cur = SE.get_current_params(conn)
+        active_id = cur["id"]
         result = SE.auto_evolve_if_needed(conn)
         # 自动进化只生成候选，绝不激活。这里回填的必须是"仍然生效的"参数 id：
         # 把候选 id 写进 params_id_end 会让代际快照看起来像是已经生效了，
         # 那正是 latest row == active 的老毛病。
-        cur = SE.get_current_params(conn)
         if result is None:
-            return {"mutated": False, "params_id": cur["id"]}
+            return {
+                "mutated": False,
+                "params_id": active_id,
+                "active_params_id": active_id,
+                "candidate_params_id": None,
+                "candidate_created": False,
+                "candidate_pending_activation": False,
+            }
+        cand_id = result.get("new_params_id")
         return {
             "mutated": True,
-            "params_id": cur["id"],
-            "candidate_params_id": result.get("new_params_id"),
+            "params_id": active_id,
+            "active_params_id": active_id,
+            "candidate_params_id": cand_id,
+            "candidate_created": True,
             "candidate_validation_state": result.get("validation_state"),
+            "candidate_pending_activation": True,
             "adjustments": result.get("adjustments", []),
             "changed_keys": result.get("changed_keys", []),
         }
 
     def validate(self, conn, generation, ctx):
         import self_evolution as SE
-        pid = ctx.get("params_id_end") or ctx.get("params_id_start")
+        import evolution_activation as EA
         cur = SE.get_current_params(conn)
+        active_id = cur["id"]
+        cand_id = ctx.get("candidate_params_id")
+        cand_val_result = None
+        cand_val_state = None
+        if cand_id is not None:
+            # 真实生命周期校验：复用 evolution_activation.validate_candidate 跑不可变校验
+            cand_val_result = EA.validate_candidate(conn, int(cand_id))
+            cand_val_state = cand_val_result.get("validation_state")
+            if not cand_val_result.get("valid"):
+                return {
+                    "valid": False,
+                    "active_params_id": active_id,
+                    "candidate_params_id": cand_id,
+                    "candidate_validation_state": cand_val_state,
+                    "violations": cand_val_result.get("violations") or [],
+                }
+
         # 校验当前生效参数仍在合法边界内（防退化 / 越界）。
         clamped = SE._clamp_params(cur["params"])
         degenerate = any(
@@ -210,16 +248,52 @@ class ProductionBackend(Backend):
         )
         return {
             "valid": True,
-            "params_id": pid,
+            "active_params_id": active_id,
+            "candidate_params_id": cand_id,
+            "candidate_validation_state": cand_val_state,
+            "candidate_validation_detail": cand_val_result,
             "out_of_bounds_corrected": degenerate,
             "params": clamped,
         }
 
     def apply(self, conn, generation, ctx):
         import self_evolution as SE
-        pid = ctx.get("params_id_end") or ctx.get("params_id_start")
+        import evolution_activation as EA
+        start_id = ctx.get("params_id_start")
         cur = SE.get_current_params(conn)
-        return {"applied_params_id": pid, "active_params_id": cur["id"]}
+        end_id = cur["id"]
+
+        # 强不变量：确认当前 active 指针未被 mutation 偷改
+        if start_id is not None and end_id != start_id:
+            raise RuntimeError(
+                f"Active params pointer was modified without authorization! start={start_id}, current={end_id}"
+            )
+
+        cand_id = ctx.get("candidate_params_id")
+        if cand_id is not None:
+            row = EA._params_row(conn, int(cand_id))
+            if row is None:
+                raise EA.CandidateNotFound(f"Candidate {cand_id} not found at apply stage")
+            return {
+                "applied_to_runtime": False,
+                "pending_activation": True,
+                "active_params_id_start": start_id,
+                "active_params_id_end": end_id,
+                "active_params_id": end_id,
+                "applied_params_id": None,
+                "candidate_params_id": cand_id,
+                "candidate_validation_state": row["validation_state"],
+            }
+
+        return {
+            "applied_to_runtime": False,
+            "pending_activation": False,
+            "active_params_id_start": start_id,
+            "active_params_id_end": end_id,
+            "active_params_id": end_id,
+            "applied_params_id": None,
+            "candidate_params_id": None,
+        }
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -322,7 +396,9 @@ def _run_generation(conn, backend: Backend, generation: int, resume_from: Option
     _log(conn, generation, "*", "resume" if resume_from else "gen_start", {"resume_from": resume_from})
 
     row = conn.execute(
-        "SELECT done_stages, attempts, params_id_start, observe_ctx_json FROM evolution_loop_state WHERE generation=?",
+        """SELECT done_stages, attempts, params_id_start, observe_ctx_json,
+                  candidate_params_id, candidate_validation_state, candidate_pending_activation
+           FROM evolution_loop_state WHERE generation=?""",
         (generation,),
     ).fetchone()
     done_stages = _loads(row[0], []) if row else []
@@ -332,6 +408,14 @@ def _run_generation(conn, backend: Backend, generation: int, resume_from: Option
     ctx: dict = {"params_id_start": params_id_start}
     if row and row[3]:
         ctx.update(_loads(row[3], {}))
+    if row and len(row) > 4:
+        if row[4] is not None:
+            ctx["candidate_params_id"] = row[4]
+            ctx["candidate_created"] = True
+        if row[5] is not None:
+            ctx["candidate_validation_state"] = row[5]
+        if row[6] is not None:
+            ctx["candidate_pending_activation"] = bool(row[6])
 
     # 初始化 / 续跑状态行。
     if not row:
@@ -352,8 +436,22 @@ def _run_generation(conn, backend: Backend, generation: int, resume_from: Option
     stages_skipped = 0
 
     ordered = STAGES[(STAGES.index(resume_from) if resume_from in STAGES else 0):]
+    upstream_failed = False
+    upstream_failure_stage = None
 
     for stage in ordered:
+        if upstream_failed:
+            # 因果依赖：上游阶段发生异常，下游阶段禁止执行，避免生成错误候选或伪装完成
+            skip_reason = f"skipped_upstream_failure_{upstream_failure_stage}"
+            _log(conn, generation, stage, "stage_skipped", {"reason": skip_reason})
+            stages_skipped += 1
+            conn.execute(
+                "UPDATE evolution_loop_state SET current_stage=?, stage_status='skipped', updated_at=? WHERE generation=?",
+                (stage, _now(), generation),
+            )
+            conn.commit()
+            continue
+
         _log(conn, generation, stage, "stage_start")
         conn.execute(
             "UPDATE evolution_loop_state SET current_stage=?, updated_at=? WHERE generation=?",
@@ -367,15 +465,21 @@ def _run_generation(conn, backend: Backend, generation: int, resume_from: Option
         if action == "skip":
             _log(conn, generation, stage, "stage_skipped", {"reason": "; ".join(issues)})
             stages_skipped += 1
+            done_stages.append(stage)
             conn.execute(
                 "UPDATE evolution_loop_state SET stage_status='skipped', done_stages=?, updated_at=? WHERE generation=?",
-                (_json(done_stages + [stage]), _now(), generation),
+                (_json(done_stages), _now(), generation),
             )
             conn.commit()
             continue
 
         try:
             result = _run_stage(conn, backend, generation, stage, ctx)
+            if not isinstance(result, dict):
+                raise ValueError(f"Stage {stage} returned non-dict result: {type(result)}")
+            if stage == "validate" and result.get("valid") is False:
+                raise ValueError(f"Candidate validation failed: {result.get('violations')}")
+
             # 阶段产物回写 ctx，供后续阶段与下一代使用。
             if stage == "observe":
                 ctx["params_id_start"] = result.get("params_id")
@@ -396,14 +500,47 @@ def _run_generation(conn, backend: Backend, generation: int, resume_from: Option
                         (params_id_start, generation),
                     )
             elif stage == "mutate":
-                if result.get("mutated"):
-                    ctx["params_id_end"] = result.get("params_id")
-                    conn.execute(
-                        "UPDATE evolution_loop_state SET params_id_end=? WHERE generation=?",
-                        (result.get("params_id"), generation),
-                    )
+                active_id = result.get("active_params_id") or result.get("params_id") or params_id_start
+                ctx["params_id_end"] = active_id
+                if result.get("candidate_params_id") is not None:
+                    ctx["candidate_params_id"] = result.get("candidate_params_id")
+                    ctx["candidate_created"] = True
+                    ctx["candidate_validation_state"] = result.get("candidate_validation_state")
+                    ctx["candidate_pending_activation"] = True
+                else:
+                    ctx["candidate_params_id"] = None
+                    ctx["candidate_created"] = False
+                    ctx["candidate_pending_activation"] = False
+                conn.execute(
+                    """UPDATE evolution_loop_state SET params_id_end=?,
+                       candidate_params_id=?, candidate_validation_state=?, candidate_pending_activation=?
+                       WHERE generation=?""",
+                    (ctx["params_id_end"], ctx.get("candidate_params_id"),
+                     ctx.get("candidate_validation_state"),
+                     1 if ctx.get("candidate_pending_activation") else 0,
+                     generation),
+                )
             elif stage == "evaluate":
                 ctx["intelligence_score"] = result.get("intelligence_score")
+            elif stage == "validate":
+                if result.get("candidate_validation_state"):
+                    ctx["candidate_validation_state"] = result.get("candidate_validation_state")
+                conn.execute(
+                    "UPDATE evolution_loop_state SET candidate_validation_state=? WHERE generation=?",
+                    (ctx.get("candidate_validation_state"), generation),
+                )
+            elif stage == "apply":
+                if result.get("active_params_id_end"):
+                    ctx["params_id_end"] = result.get("active_params_id_end")
+                ctx["candidate_pending_activation"] = result.get(
+                    "pending_activation", ctx.get("candidate_pending_activation", False)
+                )
+                conn.execute(
+                    """UPDATE evolution_loop_state SET params_id_end=?, candidate_pending_activation=?
+                       WHERE generation=?""",
+                    (ctx.get("params_id_end"), 1 if ctx.get("candidate_pending_activation") else 0, generation),
+                )
+
             done_stages.append(stage)
             conn.execute(
                 "UPDATE evolution_loop_state SET stage_status='done', done_stages=?, updated_at=? WHERE generation=?",
@@ -411,23 +548,21 @@ def _run_generation(conn, backend: Backend, generation: int, resume_from: Option
             )
             conn.commit()
             _log(conn, generation, stage, "stage_done", _truncate(result))
-        except Exception as exc:  # 整轮继续，异常被隔离
+        except Exception as exc:  # 阶段执行故障：隔离并阻断下游
             stages_failed += 1
+            upstream_failed = True
+            upstream_failure_stage = stage
             conn.execute(
                 "UPDATE evolution_loop_state SET stage_status='failed', last_error=?, updated_at=? WHERE generation=?",
                 (f"{type(exc).__name__}: {exc}", _now(), generation),
             )
             conn.commit()
             _log(conn, generation, stage, "stage_failed", {"error": f"{type(exc).__name__}: {exc}"})
-            recover_ok = _recover(conn, generation, stage, exc)
-            if not recover_ok or not CONTINUE_AFTER_STAGE_FAILURE:
-                break
+            _recover(conn, generation, stage, exc)
 
     finished = _now()
     all_done = len(done_stages) == len(STAGES)
-    status = "completed" if (all_done and stages_failed == 0) else (
-        "interrupted" if stages_failed > 0 else "completed"
-    )
+    status = "completed" if (all_done and stages_failed == 0) else "interrupted"
 
     # 写逐代快照（intelligence + 改进）。
     intel = _num(ctx.get("intelligence_score"))
@@ -441,8 +576,16 @@ def _run_generation(conn, backend: Backend, generation: int, resume_from: Option
             generation, params_id_start, params_id_end, mutation_summary,
             eval_before, eval_after, intelligence_score, improvement, created_at)
            VALUES(?,?,?,?,?,?,?,?,?)""",
-        (generation, params_id_start, ctx.get("params_id_end"),
-         _json({"stages_done": done_stages, "stages_skipped": stages_skipped, "stages_failed": stages_failed}),
+        (generation, params_id_start, ctx.get("params_id_end") or params_id_start,
+         _json({
+             "stages_done": done_stages,
+             "stages_skipped": stages_skipped,
+             "stages_failed": stages_failed,
+             "candidate_params_id": ctx.get("candidate_params_id"),
+             "candidate_validation_state": ctx.get("candidate_validation_state"),
+             "candidate_created": ctx.get("candidate_created", False),
+             "candidate_pending_activation": ctx.get("candidate_pending_activation", False),
+         }),
          _json({"prev_intelligence": prev_score}),
          _json({"intelligence": intel}),
          intel, improvement, finished),
@@ -450,12 +593,21 @@ def _run_generation(conn, backend: Backend, generation: int, resume_from: Option
 
     conn.execute(
         """UPDATE evolution_loop_state SET status=?, finished_at=?, updated_at=?,
-           metrics_json=?, health_json=? WHERE generation=?""",
+           metrics_json=?, health_json=?, params_id_end=?,
+           candidate_params_id=?, candidate_validation_state=?, candidate_pending_activation=?
+           WHERE generation=?""",
         (status, finished if status == "completed" else None, finished,
          _json({"intelligence_score": intel, "improvement": improvement,
                 "stages_done": done_stages, "stages_skipped": stages_skipped,
-                "stages_failed": stages_failed}),
-         _json(health), generation),
+                "stages_failed": stages_failed,
+                "candidate_params_id": ctx.get("candidate_params_id"),
+                "candidate_validation_state": ctx.get("candidate_validation_state"),
+                "candidate_created": ctx.get("candidate_created", False),
+                "candidate_pending_activation": ctx.get("candidate_pending_activation", False)}),
+         _json(health), ctx.get("params_id_end") or params_id_start,
+         ctx.get("candidate_params_id"), ctx.get("candidate_validation_state"),
+         1 if ctx.get("candidate_pending_activation") else 0,
+         generation),
     )
     conn.commit()
 
@@ -467,8 +619,14 @@ def _run_generation(conn, backend: Backend, generation: int, resume_from: Option
         "stages_failed": stages_failed,
         "intelligence_score": intel,
         "improvement": improvement,
+        "active_params_id_start": params_id_start,
+        "active_params_id_end": ctx.get("params_id_end") or params_id_start,
+        "candidate_params_id": ctx.get("candidate_params_id"),
+        "candidate_validation_state": ctx.get("candidate_validation_state"),
+        "candidate_created": ctx.get("candidate_created", False),
+        "candidate_pending_activation": ctx.get("candidate_pending_activation", False),
         "params_id_start": params_id_start,
-        "params_id_end": ctx.get("params_id_end"),
+        "params_id_end": ctx.get("params_id_end") or params_id_start,
     }
 
 
@@ -615,3 +773,37 @@ def loop_status(conn: sqlite3.Connection) -> dict:
         ],
         "max_gen_attempts": MAX_GEN_ATTEMPTS,
     }
+
+
+def is_today_generation_completed(conn: sqlite3.Connection, today_str: Optional[str] = None) -> bool:
+    """检查今天是否已成功完成至少一代自进化。
+    
+    幂等性保障：如果今天已有完成的代且无进行中/中断的代，同日重试直接 no-op。
+    """
+    ensure_loop_schema(conn)
+    target_date = today_str or _now()[:10]
+    # 先检查是否有正在运行或中断待续跑的代：如果有，则尚未完全结束，不应视为 completed
+    pending = conn.execute(
+        """SELECT generation FROM evolution_loop_state
+           WHERE status IN ('running', 'interrupted')
+           LIMIT 1"""
+    ).fetchone()
+    if pending is not None:
+        return False
+
+    row = conn.execute(
+        """SELECT generation FROM evolution_loop_state
+           WHERE status = 'completed' AND finished_at >= ? AND finished_at < ?
+           LIMIT 1""",
+        (f"{target_date}T00:00:00", f"{target_date}T23:59:59.999999")
+    ).fetchone()
+    if row is not None:
+        return True
+
+    gen_row = conn.execute(
+        """SELECT generation FROM evolution_generation
+           WHERE created_at >= ? AND created_at < ?
+           LIMIT 1""",
+        (f"{target_date}T00:00:00", f"{target_date}T23:59:59.999999")
+    ).fetchone()
+    return gen_row is not None

@@ -7,9 +7,46 @@
 """
 from __future__ import annotations
 
+import random
 import sqlite3
 import time
 from contextlib import contextmanager
+
+
+def is_sqlite_busy_error(exc: Exception) -> bool:
+    """Check whether an exception represents an SQLite busy / locked condition.
+
+    Checks in priority order:
+    1. Modern Python sqlite_errorname (e.g. SQLITE_BUSY, SQLITE_LOCKED)
+    2. sqlite_errorcode attribute (e.g. 5, 6, 261, 517)
+    3. String pattern matching fallback
+    """
+    if not isinstance(exc, (sqlite3.OperationalError, sqlite3.DatabaseError)):
+        return False
+    errorname = getattr(exc, "sqlite_errorname", None)
+    if errorname in ("SQLITE_BUSY", "SQLITE_LOCKED", "SQLITE_BUSY_RECOVERY", "SQLITE_BUSY_SNAPSHOT"):
+        return True
+    errorcode = getattr(exc, "sqlite_errorcode", None)
+    if errorcode in (5, 6, 261, 517):
+        return True
+    msg = str(exc).lower()
+    return any(p in msg for p in ("database is locked", "database table is locked", "busy", "locked"))
+
+
+def sqlite_busy_backoff(attempt: int, hot_path: bool = False) -> float:
+    """Calculate backoff duration for SQLite busy retry.
+
+    Hot paths (trading slots): short bounded exponential backoff with jitter (10ms - 200ms).
+    Cold / heavy paths: standard exponential backoff with jitter (100ms - 1000ms).
+    """
+    if hot_path:
+        base = min(0.2, 0.02 * (2 ** attempt))
+        jitter = random.uniform(0.005, 0.03)
+        return base + jitter
+    else:
+        base = min(1.0, 0.1 * (2 ** attempt))
+        jitter = random.uniform(0.02, 0.1)
+        return base + jitter
 
 
 @contextmanager
@@ -40,10 +77,10 @@ def db(db_path, immediate=False):
         try:
             conn.commit()
         except sqlite3.OperationalError as exc:
-            if "database is locked" in str(exc):
+            if is_sqlite_busy_error(exc):
                 # 锁冲突：写入仍在事务里，必须原样重试；二次失败先回滚，
                 # 不能让 close() 对半提交状态做隐式处理。
-                time.sleep(0.2)
+                time.sleep(sqlite_busy_backoff(0, hot_path=immediate))
                 try:
                     conn.commit()
                 except Exception:
@@ -83,9 +120,9 @@ def execute_with_retry(conn, sql, params=(), max_retries=3):
     for attempt in range(max_retries):
         try:
             return conn.execute(sql, params)
-        except sqlite3.OperationalError as exc:
-            if "database is locked" in str(exc) and attempt < max_retries - 1:
-                time.sleep(0.1 * (attempt + 1))
+        except Exception as exc:
+            if is_sqlite_busy_error(exc) and attempt < max_retries - 1:
+                time.sleep(sqlite_busy_backoff(attempt, hot_path=True))
                 continue
             raise
 
@@ -95,9 +132,9 @@ def executemany_with_retry(conn, sql, params_list, max_retries=3):
     for attempt in range(max_retries):
         try:
             return conn.executemany(sql, params_list)
-        except sqlite3.OperationalError as exc:
-            if "database is locked" in str(exc) and attempt < max_retries - 1:
-                time.sleep(0.1 * (attempt + 1))
+        except Exception as exc:
+            if is_sqlite_busy_error(exc) and attempt < max_retries - 1:
+                time.sleep(sqlite_busy_backoff(attempt, hot_path=True))
                 continue
             raise
 
@@ -108,9 +145,9 @@ def commit_with_retry(conn, max_retries=3):
         try:
             conn.commit()
             return
-        except sqlite3.OperationalError as exc:
-            if "database is locked" in str(exc) and attempt < max_retries - 1:
-                time.sleep(0.1 * (attempt + 1))
+        except Exception as exc:
+            if is_sqlite_busy_error(exc) and attempt < max_retries - 1:
+                time.sleep(sqlite_busy_backoff(attempt, hot_path=True))
                 continue
             raise
 
