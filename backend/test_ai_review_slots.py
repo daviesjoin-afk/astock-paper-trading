@@ -589,5 +589,110 @@ class SettingsEndpointContractTests(unittest.TestCase):
                             "%s 缺少方法 %s（现有 %s）" % (path, methods - available, available))
 
 
+# ───────── T25–T29：评审回归（调度预检模式 / 旧 env 兜底 / 就绪口径 / 响应形状）─────────
+
+
+class ReviewRegressionTests(AiReviewSlotTestBase):
+    """2026-09-14 代码评审发现的回归护栏。
+
+    每条都对应一个真实缺陷：
+
+    - 调度预检不认 ``single`` 模式（合法单槽配置被永久误判 skipped）；
+    - 只靠 ``MIMO_*`` / ``DEEPSEEK_*`` 环境变量配置的部署升级后静默失去凭据；
+    - "就绪"只判 Key+启用，缺 ``base_url`` / ``model`` 也报告就绪；
+    - 上游返回合法 JSON 但不是对象时，``_call_reviewer`` 抛异常逃逸（单AI裸调用
+      会变成服务端 500 且**不写审计行**）。
+    """
+
+    def test_t25_readiness_requires_endpoint_and_model(self):
+        with self.factory() as conn:
+            S.update_slot(conn, "ai1", api_key="fake-partial-key", enabled=True)
+        view = self.slots()["ai1"]
+        self.assertTrue(view["configured"])
+        self.assertTrue(view["enabled"])
+        self.assertFalse(view["ready"], "只有 Key+启用、缺地址/模型时不得报告就绪")
+        with self.factory() as conn:
+            settings = S.review_settings_view(conn)
+        self.assertFalse(settings["single_ready"])
+        self.assertFalse(settings["dual_ready"])
+        with self.factory() as conn:
+            S.update_slot(conn, "ai1", base_url="https://ai1.example.com/v1", model="model-one")
+            settings = S.review_settings_view(conn)
+        self.assertTrue(settings["single_ready"], "补齐地址与模型后单AI必须就绪")
+        self.assertFalse(settings["dual_ready"], "另一槽位仍为空，双AI不得就绪")
+
+    def test_t26_scheduler_preflight_follows_the_configured_review_mode(self):
+        import adaptive_engine as AE
+
+        # single：只看所选槽位——另一个槽位没配也**必须**放行
+        ready, reason = AE.ai_review_preflight(
+            {"review_mode": "single", "single_ready": True, "dual_ready": False})
+        self.assertTrue(ready, "single 模式不得因为另一槽位未配置而被跳过")
+        self.assertIn("单AI", reason)
+        # dual：两个槽位缺一不可
+        ready, _ = AE.ai_review_preflight(
+            {"review_mode": "dual", "single_ready": True, "dual_ready": False})
+        self.assertFalse(ready, "dual 模式缺槽位必须拦截")
+        # 模式缺失/未知：按更严格的 dual 处理，绝不放宽
+        self.assertFalse(AE.ai_review_preflight({"single_ready": True})[0])
+        self.assertTrue(AE.ai_review_preflight({"review_mode": "dual", "dual_ready": True})[0])
+
+    def test_t27_legacy_environment_credentials_are_honored_when_no_row_exists(self):
+        legacy_env = {
+            "MIMO_API_KEY": "fake-legacy-mimo-key",
+            "MIMO_BASE_URL": "https://legacy-mimo.example.com/v1/",
+            "MIMO_MODEL": "legacy-model-one",
+            "MIMO_TIMEOUT_SECONDS": "50",
+        }
+        with mock.patch.dict(os.environ, legacy_env, clear=True):
+            with self.factory() as conn:
+                cfg = S.get_slot_config(conn, "ai1")
+            self.assertEqual("fake-legacy-mimo-key", cfg["api_key"])
+            self.assertEqual("https://legacy-mimo.example.com/v1", cfg["base_url"])
+            self.assertEqual("legacy-model-one", cfg["model"])
+            self.assertEqual(50, cfg["timeout_seconds"])
+            self.assertEqual("environment", cfg["source"])
+
+    def test_t28_new_env_wins_and_a_db_row_disables_env_entirely(self):
+        env = {
+            "AI_SLOT_AI1_API_KEY": "fake-new-style-key",
+            "MIMO_API_KEY": "fake-legacy-mimo-key",
+        }
+        with mock.patch.dict(os.environ, env, clear=True):
+            with self.factory() as conn:
+                self.assertEqual("fake-new-style-key", S.get_slot_config(conn, "ai1")["api_key"])
+        # 只要写过一行（这里随后显式清空 Key），环境变量就必须彻底失效
+        with mock.patch.dict(os.environ, env, clear=True):
+            with self.factory() as conn:
+                S.update_slot(conn, "ai1", api_key="fake-temp-key",
+                              base_url="https://ai1.example.com/v1", model="model-one")
+                S.update_slot(conn, "ai1", clear_api_key=True)
+            with self.factory() as conn:
+                cfg = S.get_slot_config(conn, "ai1")
+            self.assertEqual("", cfg["api_key"], "显式清除的 Key 绝不能被环境变量复活")
+            self.assertEqual("database", cfg["source"])
+
+    def test_t29_non_object_json_is_a_structured_failure_and_single_mode_still_audits(self):
+        cfg = {"slot": "ai1", "display_name": "主审核", "model": "model-one",
+               "api_key": "fake-slot-key", "enabled": True}
+        with mock.patch.object(S, "_call_slot", return_value=([], 1, 1, 5)):
+            reviewer = S._call_reviewer("ai1", cfg, "sys", "user")
+        self.assertEqual("failed", reviewer["status"], "_call_reviewer 绝不允许抛异常")
+        self.assertIn("response_not_object", reviewer["error"])
+
+        self.configure_slots()
+        with self.factory() as conn:
+            S.update_review_settings(conn, review_mode="single", single_reviewer_slot="ai1")
+        with mock.patch.object(S, "_call_slot", return_value=([], 1, 1, 5)):
+            outcome = self.run_review()
+        self.assertEqual(S.MODE_SINGLE_REVIEW, outcome["mode"])
+        self.assertEqual("single_review_failed", outcome["status"])
+        self.assertFalse(outcome["consensus"])
+        # 关键：异常已被归一为结构化失败，所以审计行必须落库（而不是 500 无记录）
+        row = self.audit(outcome["id"])
+        self.assertEqual("single_review_failed", row["status"])
+        self.assertIn("response_not_object", str(row["reviewers"] or ""))
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()

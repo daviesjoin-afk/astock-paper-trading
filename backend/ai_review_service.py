@@ -150,12 +150,35 @@ def _env_key(slot, suffix):
     return SLOT_ENV_PREFIX + slot.upper() + "_" + suffix
 
 
+# 槽位 → 历史厂商环境变量前缀（mimo → MIMO / deepseek → DEEPSEEK）。
+# 只用于"数据库里从未配置过该槽位"时的一次性兜底，属于配置来源，不是运行期的
+# 厂商身份分支：调用层永远不认识任何厂商。
+_LEGACY_ENV_PREFIX = {slot: legacy.upper() for legacy, slot in LEGACY_PROVIDER_SLOTS}
+
+
 def env_slot_defaults(slot):
-    """无数据库行时的通用兜底（槽位命名，与厂商无关）。"""
+    """无数据库行时的通用兜底（槽位命名，与厂商无关）。
+
+    优先读 ``AI_SLOT_AI{1,2}_*``；若这组全为空，再退回**历史厂商环境变量**
+    （``MIMO_*`` / ``DEEPSEEK_*``），使"只靠环境变量配置过旧调参器"的部署在升级后
+    不会静默失去凭据。这里只读运维自己设置的值，**不内置任何厂商的默认地址/模型**
+    ——那正是本 PR 要消灭的厂商耦合，缺失时应由使用方显式填写。
+
+    本函数只在**数据库里没有该槽位的任何行**时被调用（见 ``get_slot_config`` /
+    ``update_slot``），因此显式 ``clear_api_key`` 过的槽位不会被环境变量复活。
+    """
+    slot = resolve_slot(slot)
     api_key = str(os.getenv(_env_key(slot, "API_KEY")) or "").strip()
     base_url = normalize_base_url(os.getenv(_env_key(slot, "BASE_URL")) or "")
     model = str(os.getenv(_env_key(slot, "MODEL")) or "").strip()
     raw_timeout = os.getenv(_env_key(slot, "TIMEOUT_SECONDS"))
+    if not (api_key or base_url or model or raw_timeout):
+        legacy = _LEGACY_ENV_PREFIX.get(slot)
+        if legacy:
+            api_key = str(os.getenv(legacy + "_API_KEY") or "").strip()
+            base_url = normalize_base_url(os.getenv(legacy + "_BASE_URL") or "")
+            model = str(os.getenv(legacy + "_MODEL") or "").strip()
+            raw_timeout = os.getenv(legacy + "_TIMEOUT_SECONDS")
     timeout = _clamp_timeout(raw_timeout) if raw_timeout not in (None, "") else DEFAULT_TIMEOUT_SECONDS
     return {"api_key": api_key, "base_url": base_url, "model": model, "timeout_seconds": timeout}
 
@@ -315,8 +338,12 @@ def get_slot_config(conn, slot):
 
     有数据库行 → 数据库就是权威（含空值，否则 ``clear_api_key`` 会被环境变量悄悄
     复活）；没有行 → 使用通用环境变量兜底，再退回空默认值。
+
+    与 ``get_review_settings`` 一致，读函数自身保证 schema 已建，避免在全新库上
+    "读槽位"直接 ``no such table`` 崩掉。
     """
     slot = resolve_slot(slot)
+    ensure_schema(conn)
     row = _slot_row(conn, slot)
     if row is not None:
         return {
@@ -367,7 +394,15 @@ def slot_public_view(cfg):
         "timeout_seconds": cfg.get("timeout_seconds"),
         "updated_at": cfg.get("updated_at"),
         "source": cfg.get("source"),
-        "ready": bool(api_key.strip()) and bool(cfg.get("enabled")),
+        # 就绪 = 真正能发出一次请求所需的**全部**字段：Key、启用、地址、模型。
+        # 只判 Key+启用会让"缺 base_url/model"的半配置对外显示就绪，实际调用却
+        # 立刻被 chat_completions_url / build_request_body 拒绝。
+        "ready": (
+            bool(api_key.strip())
+            and bool(cfg.get("enabled"))
+            and bool(str(cfg.get("base_url") or "").strip())
+            and bool(str(cfg.get("model") or "").strip())
+        ),
     }
 
 
@@ -505,8 +540,10 @@ def review_settings_view(conn):
         "updated_at": settings["updated_at"],
         "slots": slots,
         "slot_order": list(AI_SLOTS),
-        "single_ready": bool(slots[active]["configured"] and slots[active]["enabled"]),
-        "dual_ready": all(slots[s]["configured"] and slots[s]["enabled"] for s in AI_SLOTS),
+        # 单/双就绪直接取自槽位视图的 ready（含 base_url + model 校验），
+        # 保证调度预检与页面展示的口径完全一致。
+        "single_ready": bool(slots[active]["ready"]),
+        "dual_ready": all(slots[s]["ready"] for s in AI_SLOTS),
         "review_modes": [
             {"value": "single", "label": "单AI审阅", "description": "只用选定的一个槽位；结果仅供参考，不构成共识。"},
             {"value": "dual", "label": "双AI共识", "description": "两个槽位独立分析，方向一致且幅度接近才合并。"},
@@ -866,30 +903,38 @@ def _empty_reviewer(slot, cfg, status, error=None):
 
 
 def _call_reviewer(slot, cfg, system_prompt, user_prompt):
-    """调用一个槽位并把结果整理成统一的 reviewer 结构；异常一律转成 failed。"""
+    """调用一个槽位并把结果整理成统一的 reviewer 结构；异常一律转成 failed。
+
+    本函数**必须永不抛出**：单AI模式是裸调用（不像双AI那样在 future 里再包一层
+    try），任何逃逸的异常都会变成服务端 500 且**不写审计行**。因此"合法 JSON 但
+    不是对象"（例如 ``[]``）也在函数内归一为结构化失败，而不是让 ``.get`` 抛
+    AttributeError 逃出去。
+    """
     try:
         parsed, in_tok, out_tok, latency = _call_slot(cfg, system_prompt, user_prompt)
+        if not isinstance(parsed, dict):
+            raise RuntimeError("%s_response_not_object" % slot)
+        proposals = parsed.get("proposals") or []
+        if not isinstance(proposals, list):
+            proposals = []
+        return {
+            "slot": slot,
+            "display_name": cfg.get("display_name") or DEFAULT_DISPLAY_NAMES[slot],
+            "model": cfg.get("model") or "",
+            "status": "completed",
+            "decision": parsed.get("decision", "hold"),
+            "confidence": parsed.get("confidence", 0),
+            "market_regime": parsed.get("market_regime", "unclassified"),
+            "summary": parsed.get("summary", ""),
+            "proposals": proposals,
+            "proposals_count": len(proposals),
+            "latency_ms": latency,
+            "error": None,
+            "input_tokens": in_tok,
+            "output_tokens": out_tok,
+        }
     except Exception as exc:  # noqa: BLE001 - 上游必须拿到结构化失败而不是异常
         return _empty_reviewer(slot, cfg, "failed", error="%s: %s" % (type(exc).__name__, str(exc)[:200]))
-    proposals = parsed.get("proposals") or []
-    if not isinstance(proposals, list):
-        proposals = []
-    return {
-        "slot": slot,
-        "display_name": cfg.get("display_name") or DEFAULT_DISPLAY_NAMES[slot],
-        "model": cfg.get("model") or "",
-        "status": "completed",
-        "decision": parsed.get("decision", "hold"),
-        "confidence": parsed.get("confidence", 0),
-        "market_regime": parsed.get("market_regime", "unclassified"),
-        "summary": parsed.get("summary", ""),
-        "proposals": proposals,
-        "proposals_count": len(proposals),
-        "latency_ms": latency,
-        "error": None,
-        "input_tokens": in_tok,
-        "output_tokens": out_tok,
-    }
 
 
 def _evolution_bounds(connect_factory, accounts_map):
