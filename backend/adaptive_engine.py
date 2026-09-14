@@ -23,6 +23,7 @@ import time
 from bisect import bisect_right as _bisect_right
 from collections import Counter, defaultdict
 from contextlib import contextmanager
+from typing import Any
 from zoneinfo import ZoneInfo
 
 import adaptive_risk as risk_evolution
@@ -3461,6 +3462,97 @@ def evolution_log_fn(limit=50):
     with _connect() as conn:
         self_evolution.ensure_schema(conn)
         return self_evolution.get_evolution_log(conn, limit)
+
+
+EVOLUTION_REWARD_SCORE_VERSION = "adaptive-reward-v1"
+
+
+def _reward_to_evolution_score(raw_reward: Any) -> float:
+    """Map production raw_reward into a bounded evolution eval_score in [-1.0, 1.0].
+
+    Fails closed on missing, non-numeric, NaN, or infinite values.
+    """
+    if raw_reward is None:
+        raise ValueError("raw_reward cannot be None")
+    try:
+        val = float(raw_reward)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"raw_reward must be a valid float: {raw_reward!r}") from exc
+    if not math.isfinite(val):
+        raise ValueError(f"raw_reward must be a finite number: {val!r}")
+
+    if abs(val) > 1.0:
+        score = val / 10.0
+    else:
+        score = val
+    return max(-1.0, min(1.0, float(score)))
+
+
+def evaluate_tuning_from_reward(
+    tracking_id: int, reward_id: int, conn: sqlite3.Connection | None = None
+) -> dict:
+    """Evaluate an evolution tuning run directly from an adaptive_rewards row.
+
+    Reads the specified reward_id from the adaptive DB, derives the bounded
+    evolution score, generates an auditable eval_detail, and updates the tracking run.
+    """
+    if tracking_id is None or int(tracking_id) <= 0:
+        raise ValueError(f"Invalid tracking_id: {tracking_id!r}")
+    if reward_id is None or int(reward_id) <= 0:
+        raise ValueError(f"Invalid reward_id: {reward_id!r}")
+
+    def _execute(active_conn: sqlite3.Connection) -> dict:
+        self_evolution.ensure_schema(active_conn)
+        tracking_row = active_conn.execute(
+            "SELECT id FROM evolution_tracking WHERE id = ?", (int(tracking_id),)
+        ).fetchone()
+        if not tracking_row:
+            raise KeyError(f"Tracking record id={tracking_id} not found in evolution_tracking")
+
+        row = active_conn.execute(
+            """SELECT id, account_id, horizon, start_date, end_date, regime,
+                      strategy_return_pct, benchmark_return_pct, excess_return_pct,
+                      drawdown_pct, turnover_pct, raw_reward, weighted_reward, created_at
+               FROM adaptive_rewards WHERE id = ?""",
+            (int(reward_id),),
+        ).fetchone()
+        if not row:
+            raise KeyError(f"Reward record id={reward_id} not found in adaptive_rewards")
+
+        raw_reward = row["raw_reward"]
+        eval_score = _reward_to_evolution_score(raw_reward)
+
+        eval_detail = {
+            "source": "adaptive_rewards",
+            "reward_id": int(row["id"]),
+            "account_id": str(row["account_id"]),
+            "horizon": int(row["horizon"]),
+            "start_date": str(row["start_date"]),
+            "end_date": str(row["end_date"]),
+            "regime": str(row["regime"]),
+            "strategy_return_pct": float(row["strategy_return_pct"]),
+            "benchmark_return_pct": float(row["benchmark_return_pct"]),
+            "excess_return_pct": float(row["excess_return_pct"]),
+            "drawdown_pct": float(row["drawdown_pct"]),
+            "turnover_pct": float(row["turnover_pct"]),
+            "raw_reward": float(row["raw_reward"]),
+            "weighted_reward": float(row["weighted_reward"]),
+            "score_mapping_version": EVOLUTION_REWARD_SCORE_VERSION,
+        }
+
+        self_evolution.evaluate_run(active_conn, int(tracking_id), eval_score, eval_detail)
+        return {
+            "success": True,
+            "tracking_id": int(tracking_id),
+            "reward_id": int(reward_id),
+            "eval_score": eval_score,
+            "eval_detail": eval_detail,
+        }
+
+    if conn is not None:
+        return _execute(conn)
+    with _connect() as active_conn:
+        return _execute(active_conn)
 
 
 def evaluate_tuning_fn(tracking_id, eval_score, eval_detail=None):

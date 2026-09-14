@@ -33,6 +33,8 @@ import sys
 import tempfile
 import unittest
 
+import pandas as pd
+
 BACKEND = os.path.dirname(os.path.abspath(__file__))
 if BACKEND not in sys.path:
     sys.path.insert(0, BACKEND)
@@ -1230,6 +1232,167 @@ class ReplayClockContractTests(OfflinePaperEnv, unittest.TestCase):
             PT._selection_factor_manifest_signature = original_sig
             with open(meta_path, "w", encoding="utf-8") as f:
                 json.dump(saved_meta, f)
+
+    def test_entry_freeze_degraded_fallback_semantic_positive_proof_contract(self):
+        """Strict positive proof contract for prior-day (lag=1) degraded fallback: 5 exhaustive cases."""
+        original_sig = PT._selection_factor_manifest_signature
+        meta_path = PT.SELECTION_META_PATH
+        with open(meta_path, "r", encoding="utf-8") as f:
+            saved_meta = json.load(f)
+        try:
+            # Base prior-day metadata: factor_date=D0 (lag=1 vs expected D1), fresh built_at
+            base_prior_meta = dict(saved_meta)
+            base_prior_meta["factor_date"] = D0.isoformat()
+            base_prior_meta["built_at"] = dt.datetime.now(dt.timezone.utc).isoformat()
+            base_prior_meta["signature"] = {
+                "content_fingerprint": "valid_degraded_content_fp_1234",
+                "mtime": 1700000000.0,
+                "size": 50000,
+                "version": "v1",
+            }
+            with open(meta_path, "w", encoding="utf-8") as f:
+                json.dump(base_prior_meta, f)
+
+            # Case D1: matching fingerprint & version (even if mtime differs) -> unfreeze
+            PT._selection_factor_manifest_signature = lambda: {
+                "content_fingerprint": "valid_degraded_content_fp_1234",
+                "mtime": 1700000500.0,
+                "size": 50000,
+                "version": "v1",
+            }
+            status1 = PT._entry_freeze_status(force=True)
+            factor1 = status1["checks"]["factor_cache"]
+            self.assertEqual(factor1["factor_lag"], 1)
+            self.assertFalse(factor1["manifest_signature_ok"], "mtime mismatch makes exact signature False")
+            self.assertTrue(factor1.get("content_fingerprint_ok"), "Matching fingerprint & version must be positive proof")
+            self.assertTrue(factor1["degraded_fallback"], "Lag 1 + matching semantic proof must enable degraded fallback")
+            self.assertTrue(factor1["passed"], status1)
+            self.assertFalse(status1["enabled"], "System must unfreeze on valid degraded fallback with positive semantic proof")
+
+            # Case D2: version mismatch (v1 vs v2) -> freeze
+            PT._selection_factor_manifest_signature = lambda: {
+                "content_fingerprint": "valid_degraded_content_fp_1234",
+                "mtime": 1700000500.0,
+                "size": 50000,
+                "version": "v2",
+            }
+            status2 = PT._entry_freeze_status(force=True)
+            factor2 = status2["checks"]["factor_cache"]
+            self.assertEqual(factor2["factor_lag"], 1)
+            self.assertFalse(factor2["manifest_signature_ok"])
+            self.assertFalse(factor2.get("content_fingerprint_ok", True), "Version mismatch must fail positive proof")
+            self.assertFalse(factor2["degraded_fallback"], "Version mismatch must reject degraded fallback")
+            self.assertFalse(factor2["passed"])
+            self.assertTrue(status2["enabled"], "System must remain frozen on degraded version mismatch")
+
+            # Case D3: fingerprint mismatch -> freeze
+            PT._selection_factor_manifest_signature = lambda: {
+                "content_fingerprint": "mutated_content_hash_9999",
+                "mtime": 1700000500.0,
+                "size": 50000,
+                "version": "v1",
+            }
+            status3 = PT._entry_freeze_status(force=True)
+            factor3 = status3["checks"]["factor_cache"]
+            self.assertEqual(factor3["factor_lag"], 1)
+            self.assertFalse(factor3["manifest_signature_ok"])
+            self.assertFalse(factor3.get("content_fingerprint_ok", True), "Fingerprint mismatch must fail positive proof")
+            self.assertFalse(factor3["degraded_fallback"], "Fingerprint mismatch must reject degraded fallback")
+            self.assertFalse(factor3["passed"])
+            self.assertTrue(status3["enabled"], "System must remain frozen on degraded fingerprint mismatch")
+
+            # Case D4: legacy list signature -> freeze
+            legacy_meta = dict(base_prior_meta)
+            legacy_meta["signature"] = ["legacy-list-signature-item"]
+            with open(meta_path, "w", encoding="utf-8") as f:
+                json.dump(legacy_meta, f)
+            PT._selection_factor_manifest_signature = lambda: {
+                "content_fingerprint": "valid_degraded_content_fp_1234",
+                "mtime": 1700000500.0,
+                "size": 50000,
+                "version": "v1",
+            }
+            status4 = PT._entry_freeze_status(force=True)
+            factor4 = status4["checks"]["factor_cache"]
+            self.assertEqual(factor4["factor_lag"], 1)
+            self.assertFalse(factor4["manifest_signature_ok"])
+            self.assertFalse(factor4.get("content_fingerprint_ok", True), "Non-dict signature must fail positive proof")
+            self.assertFalse(factor4["degraded_fallback"], "Legacy signature format must reject degraded fallback")
+            self.assertFalse(factor4["passed"])
+            self.assertTrue(status4["enabled"], "System must remain frozen on legacy list format")
+
+            # Restore base_prior_meta for Case D5
+            with open(meta_path, "w", encoding="utf-8") as f:
+                json.dump(base_prior_meta, f)
+
+            # Case D5: missing fingerprint -> freeze
+            PT._selection_factor_manifest_signature = lambda: {
+                "content_fingerprint": None,
+                "mtime": 1700000500.0,
+                "size": 50000,
+                "version": "v1",
+            }
+            status5 = PT._entry_freeze_status(force=True)
+            factor5 = status5["checks"]["factor_cache"]
+            self.assertEqual(factor5["factor_lag"], 1)
+            self.assertFalse(factor5["manifest_signature_ok"])
+            self.assertFalse(factor5.get("content_fingerprint_ok", True), "Missing fingerprint must fail positive proof")
+            self.assertFalse(factor5["degraded_fallback"], "Missing fingerprint must reject degraded fallback")
+            self.assertFalse(factor5["passed"])
+            self.assertTrue(status5["enabled"], "System must remain frozen when fingerprint is None")
+        finally:
+            PT._selection_factor_manifest_signature = original_sig
+            with open(meta_path, "w", encoding="utf-8") as f:
+                json.dump(saved_meta, f)
+
+    def test_selection_factor_freshness_prior_day_semantic_contract(self):
+        """Direct contract test for _selection_factor_freshness requiring positive semantic proof on prior-day data."""
+        original_sig = PT._selection_factor_manifest_signature
+        try:
+            codes = list(PASS_CODES)
+            price_f = pd.DataFrame({"last_date": [D0.isoformat()] * len(codes)}, index=codes)
+            universe = [{"code": c, "name": NAMES.get(c, c), "risk_flag": 0} for c in codes]
+            asof_date = D1
+            cached_sig = {
+                "content_fingerprint": "freshness_fp_5678",
+                "mtime": 1700000000.0,
+                "size": 50000,
+                "version": "v1",
+            }
+            meta = {
+                "factor_date": D0.isoformat(),
+                "built_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+                "factor_rows": len(codes),
+                "eligible_factor_coverage_pct": 100.0,
+                "signature": cached_sig,
+            }
+
+            # Subtest A: Version mismatch fails closed
+            PT._selection_factor_manifest_signature = lambda: {
+                "content_fingerprint": "freshness_fp_5678",
+                "mtime": 1700000500.0,
+                "size": 50000,
+                "version": "v2",
+            }
+            res_mismatch = PT._selection_factor_freshness(price_f, universe, asof_date, meta=meta)
+            self.assertFalse(res_mismatch["passed"], "Version mismatch must fail freshness check")
+            self.assertFalse(res_mismatch["content_fingerprint_ok"], "Version mismatch must not have content_fingerprint_ok")
+            self.assertFalse(res_mismatch["degraded_fallback"], "Version mismatch must not activate degraded fallback")
+
+            # Subtest B: Matching fingerprint & version allows degraded fallback
+            PT._selection_factor_manifest_signature = lambda: {
+                "content_fingerprint": "freshness_fp_5678",
+                "mtime": 1700000500.0,
+                "size": 50000,
+                "version": "v1",
+            }
+            res_match = PT._selection_factor_freshness(price_f, universe, asof_date, meta=meta)
+            self.assertTrue(res_match["passed"], "Valid positive semantic proof must pass freshness check")
+            self.assertTrue(res_match["content_fingerprint_ok"], "Matching fingerprint and version must set content_fingerprint_ok")
+            self.assertTrue(res_match["degraded_fallback"], "Must activate degraded fallback")
+            self.assertEqual(res_match["fallback_factor_date"], D0.isoformat())
+        finally:
+            PT._selection_factor_manifest_signature = original_sig
 
 
 if __name__ == "__main__":

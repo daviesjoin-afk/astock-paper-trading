@@ -18,6 +18,7 @@ import json
 import os
 import sqlite3
 import sys
+import tempfile
 import unittest
 from unittest.mock import patch
 
@@ -308,15 +309,25 @@ class DualClosedLoopProductionPathTests(OfflinePaperEnv, unittest.TestCase):
                     self.assertIsNotNone(tracking_row, "run_dual_ai_tuning 必须在 evolution_tracking 中记录追踪行")
                     tracking_id = tracking_row[0]
 
-                # 从生产收益评估结果 raw_reward 衍生评估得分
-                raw_val = float(r["raw_reward"])
-                eval_score = max(-1.0, min(1.0, raw_val / 10.0 if abs(raw_val) > 1.0 else raw_val))
-                eval_res = AE.evaluate_tuning_fn(
+                # 生产调参评估服务：直接基于生产收益 adaptive_rewards 评估调参效果，零测试端自算
+                eval_res = AE.evaluate_tuning_from_reward(
                     tracking_id=tracking_id,
-                    eval_score=eval_score,
-                    eval_detail=dict(r),
+                    reward_id=r["id"],
                 )
                 self.assertTrue(eval_res.get("success"))
+                self.assertEqual(eval_res.get("reward_id"), r["id"])
+                self.assertIsNotNone(eval_res.get("eval_score"))
+
+                with self._adaptive_conn() as a_conn:
+                    verified_tr = a_conn.execute(
+                        "SELECT evaluated, eval_score, eval_detail FROM evolution_tracking WHERE id=?",
+                        (tracking_id,),
+                    ).fetchone()
+                    self.assertEqual(verified_tr["evaluated"], 1)
+                    self.assertEqual(verified_tr["eval_score"], eval_res["eval_score"])
+                    detail_obj = json.loads(verified_tr["eval_detail"])
+                    self.assertEqual(detail_obj.get("source"), "adaptive_rewards")
+                    self.assertEqual(detail_obj.get("score_mapping_version"), AE.EVOLUTION_REWARD_SCORE_VERSION)
 
         # ─────────────────────────────────────────────────────────────────
         # 7. 演化引擎闭环（Generation 1）：observe -> evaluate -> mutate -> validate -> apply
@@ -423,6 +434,60 @@ class DualClosedLoopProductionPathTests(OfflinePaperEnv, unittest.TestCase):
             self.assertGreaterEqual(a_tracking, 5, "Adaptive DB 必须包含自进化追踪记录")
             self.assertGreaterEqual(a_params, 2, "Adaptive DB 必须包含候选 A 与候选 B 参数版本")
             self.assertEqual(a_loop, 1, "Adaptive DB 必须包含 1 代循环执行记录")
+
+
+class EvolutionRewardScoreServiceTests(unittest.TestCase):
+    """Unit tests for production helper _reward_to_evolution_score and evaluate_tuning_from_reward."""
+
+    def test_reward_to_evolution_score_positive(self):
+        score = AE._reward_to_evolution_score(0.75)
+        self.assertGreater(score, 0.0)
+        self.assertLessEqual(score, 1.0)
+        self.assertEqual(score, 0.75)
+
+    def test_reward_to_evolution_score_negative(self):
+        score = AE._reward_to_evolution_score(-0.45)
+        self.assertLess(score, 0.0)
+        self.assertGreaterEqual(score, -1.0)
+        self.assertEqual(score, -0.45)
+
+    def test_reward_to_evolution_score_large_magnitude_clamps(self):
+        score_pos = AE._reward_to_evolution_score(15.0)
+        self.assertEqual(score_pos, 1.0, "Large positive reward must clamp to 1.0")
+
+        score_neg = AE._reward_to_evolution_score(-25.0)
+        self.assertEqual(score_neg, -1.0, "Large negative reward must clamp to -1.0")
+
+    def test_reward_to_evolution_score_non_finite_fails(self):
+        for invalid in (float("nan"), float("inf"), float("-inf"), None, "not-a-number"):
+            with self.assertRaises(ValueError):
+                AE._reward_to_evolution_score(invalid)
+
+    def test_evaluate_tuning_from_reward_missing_records_fail_closed(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            test_db = os.path.join(tmpdir, "adaptive_test.sqlite3")
+            conn = sqlite3.connect(test_db)
+            conn.row_factory = sqlite3.Row
+            try:
+                AE._init_schema(conn)
+                SE.ensure_schema(conn)
+                # 1. Missing tracking_id
+                with self.assertRaises(KeyError):
+                    AE.evaluate_tuning_from_reward(tracking_id=99999, reward_id=1, conn=conn)
+
+                # Insert dummy tracking run
+                conn.execute(
+                    """INSERT INTO evolution_tracking(run_id, trigger, mode, status, created_at)
+                       VALUES(1, 'test', 'test', 'consensus', '2026-09-14')"""
+                )
+                conn.commit()
+                tracking_id = conn.execute("SELECT id FROM evolution_tracking WHERE run_id=1").fetchone()[0]
+
+                # 2. Missing reward_id
+                with self.assertRaises(KeyError):
+                    AE.evaluate_tuning_from_reward(tracking_id=tracking_id, reward_id=88888, conn=conn)
+            finally:
+                conn.close()
 
 
 if __name__ == "__main__":

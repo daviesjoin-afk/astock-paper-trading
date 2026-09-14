@@ -943,6 +943,18 @@ def _entry_freeze_enabled():
     return bool(_entry_freeze_status().get("enabled", True))
 
 
+def _manifest_semantic_match(cached_signature, current_signature) -> bool:
+    """Return True if both signatures are structured dicts with identical content_fingerprint and version."""
+    return bool(
+        isinstance(cached_signature, dict)
+        and isinstance(current_signature, dict)
+        and cached_signature.get("content_fingerprint")
+        and current_signature.get("content_fingerprint")
+        and cached_signature["content_fingerprint"] == current_signature["content_fingerprint"]
+        and cached_signature.get("version") == current_signature.get("version")
+    )
+
+
 def _entry_freeze_status(force=False):
     """Return the live entry circuit-breaker state.
 
@@ -1034,20 +1046,10 @@ def _entry_freeze_status(force=False):
             )
             current_signature = _selection_factor_manifest_signature()
             cached_signature = factor_meta.get("signature")
-            signature_ok = bool(current_signature and cached_signature == current_signature)
+            exact_signature_ok = bool(current_signature and cached_signature == current_signature)
 
             # 语义指纹比对：区分良性 mtime 刷新与破坏性内容变更（严格正向证明）。
-            structured_signatures = (
-                isinstance(cached_signature, dict)
-                and isinstance(current_signature, dict)
-            )
-            semantic_fingerprint_ok = bool(
-                structured_signatures
-                and cached_signature.get("content_fingerprint")
-                and current_signature.get("content_fingerprint")
-                and cached_signature["content_fingerprint"] == current_signature["content_fingerprint"]
-                and cached_signature.get("version") == current_signature.get("version")
-            )
+            semantic_fingerprint_ok = _manifest_semantic_match(cached_signature, current_signature)
 
             # The manifest is also updated as the recovery job records a
             # completed same-day K-line.  Its file mtime is deliberately part
@@ -1060,7 +1062,7 @@ def _entry_freeze_status(force=False):
             # current-date, bounded-age factor artifact whose semantic content
             # has not suffered a conflicting mutation.
             same_day_manifest_refresh_ok = bool(
-                not signature_ok
+                not exact_signature_ok
                 and semantic_fingerprint_ok
                 and cached_factor_date == expected_factor_date
                 and int(factor_meta.get("factor_rows") or 0) >= CANDIDATE_FACTOR_MIN_ROWS
@@ -1069,22 +1071,23 @@ def _entry_freeze_status(force=False):
             )
             degraded_signature_ok = bool(
                 factor_lag == 1
+                and semantic_fingerprint_ok
                 and int(factor_meta.get("factor_rows") or 0) >= CANDIDATE_FACTOR_MIN_ROWS
                 and cached_coverage >= CANDIDATE_FACTOR_MIN_COVERAGE * 100
             )
             factor_ok = (int(factor_meta.get("factor_rows") or 0) >= CANDIDATE_FACTOR_MIN_ROWS
                          and built_age is not None and built_age <= SELECTION_FACTOR_MAX_CACHE_AGE_SECONDS
                          and cached_coverage >= CANDIDATE_FACTOR_MIN_COVERAGE * 100
-                         and factor_date_ok and (signature_ok or same_day_manifest_refresh_ok)
+                         and factor_date_ok and (exact_signature_ok or same_day_manifest_refresh_ok)
                          and os.path.exists(SELECTION_FACTORS_PATH))
             if not factor_ok and degraded_signature_ok and built_age is not None and built_age <= 4 * 86400 and os.path.exists(SELECTION_FACTORS_PATH):
                 factor_ok = True
             checks["factor_cache"] = {"rows": int(factor_meta.get("factor_rows") or 0),
                                        "age_seconds": built_age, "max_age_seconds": ENTRY_AUTO_FACTOR_MAX_AGE_SECONDS,
                                        "factor_date": cached_factor_date, "expected_factor_date": expected_factor_date,
-                                       "factor_lag": factor_lag, "degraded_fallback": bool(degraded_signature_ok and not signature_ok),
+                                       "factor_lag": factor_lag, "degraded_fallback": bool(degraded_signature_ok and not exact_signature_ok),
                                        "eligible_factor_coverage_pct": cached_coverage,
-                                       "factor_date_ok": factor_date_ok, "manifest_signature_ok": signature_ok,
+                                       "factor_date_ok": factor_date_ok, "manifest_signature_ok": exact_signature_ok,
                                        "content_fingerprint_ok": semantic_fingerprint_ok,
                                        "same_day_manifest_refresh_ok": same_day_manifest_refresh_ok,
                                        "passed": factor_ok}
@@ -3472,24 +3475,9 @@ def _selection_factor_freshness(price_f, universe, asof_date, meta=None):
     cached_date = str(meta.get("factor_date") or "")[:10]
     current_signature = _selection_factor_manifest_signature()
     cached_signature = meta.get("signature")
-    structured_signatures = (
-        isinstance(cached_signature, dict)
-        and isinstance(current_signature, dict)
-    )
-    semantic_fingerprint_ok = bool(
-        structured_signatures
-        and cached_signature.get("content_fingerprint")
-        and current_signature.get("content_fingerprint")
-        and cached_signature["content_fingerprint"] == current_signature["content_fingerprint"]
-        and cached_signature.get("version") == current_signature.get("version")
-    )
-    signature_ok = bool(
-        current_signature
-        and (
-            cached_signature == current_signature
-            or semantic_fingerprint_ok
-        )
-    )
+    exact_signature_ok = bool(current_signature and cached_signature == current_signature)
+    semantic_fingerprint_ok = _manifest_semantic_match(cached_signature, current_signature)
+    signature_ok = bool(exact_signature_ok or semantic_fingerprint_ok)
     try:
         built_at = dt.datetime.fromisoformat(str(meta.get("built_at")).replace("Z", "+00:00"))
         if built_at.tzinfo is None:
@@ -3514,6 +3502,7 @@ def _selection_factor_freshness(price_f, universe, asof_date, meta=None):
     fallback_coverage = fallback_eligible / max(len(eligible_codes), 1)
     degraded_factor_fallback = bool(
         cached_lag == 1
+        and semantic_fingerprint_ok
         and (exact_eligible < len(eligible_codes) * CANDIDATE_FACTOR_MIN_COVERAGE)
         and factor_rows >= CANDIDATE_FACTOR_MIN_ROWS
         and fallback_rows == factor_rows
@@ -3521,17 +3510,19 @@ def _selection_factor_freshness(price_f, universe, asof_date, meta=None):
         and age_ok
     )
     calendar_degraded_fallback = bool(
-        factor_rows >= CANDIDATE_FACTOR_MIN_ROWS
+        semantic_fingerprint_ok
+        and factor_rows >= CANDIDATE_FACTOR_MIN_ROWS
         and exact_rows == factor_rows
         and cached_date == target_text
         and eligible_coverage >= CANDIDATE_FACTOR_MIN_COVERAGE
         and calendar_age_ok
-        and not signature_ok
+        and not exact_signature_ok
     )
     # 旁车元数据与行情 manifest 的 mtime 可能因盘后增量重试而变化；
     # 只要 CSV 是单一已知日期且 sidecar 覆盖达标，允许继续用该完整快照。
     sidecar_degraded_fallback = bool(
-        cached_date
+        semantic_fingerprint_ok
+        and cached_date
         and factor_dates.nunique(dropna=True) == 1
         and str(factor_dates.dropna().iloc[0])[:10] == cached_date
         and int(meta.get("factor_rows") or 0) >= CANDIDATE_FACTOR_MIN_ROWS
@@ -3553,7 +3544,8 @@ def _selection_factor_freshness(price_f, universe, asof_date, meta=None):
         "factor_rows": factor_rows, "exact_date_rows": exact_rows,
         "eligible_factor_rows": exact_eligible, "eligible_universe_rows": len(eligible_codes),
         "eligible_factor_coverage_pct": round(eligible_coverage * 100, 2),
-        "manifest_signature_ok": signature_ok,
+        "manifest_signature_ok": exact_signature_ok,
+        "content_fingerprint_ok": semantic_fingerprint_ok,
         "built_age_seconds": built_age, "max_cache_age_seconds": SELECTION_FACTOR_MAX_CACHE_AGE_SECONDS,
         "degraded_fallback": bool(degraded_factor_fallback or calendar_degraded_fallback or sidecar_degraded_fallback),
         "fallback_factor_date": cached_date if (degraded_factor_fallback or calendar_degraded_fallback or sidecar_degraded_fallback) else None,
