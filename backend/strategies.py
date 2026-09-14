@@ -438,6 +438,8 @@ def build_factor_table(
     table["pct"] = fund["pct_today"] if "pct_today" in fund else np.nan
     table["amount"] = price["amount"] if "amount" in price else np.nan
     table["turnover"] = price["turnover"] if "turnover" in price else np.nan
+    table["main_pct"] = price["main_pct"] if "main_pct" in price else (fund["main_pct"] if "main_pct" in fund else np.nan)
+    table["main_net"] = price["main_net"] if "main_net" in price else (fund["main_net"] if "main_net" in fund else np.nan)
     table["mom5_raw"] = price["mom5"]
     table["mom20_raw"] = price["mom20"]
     table["mom60_raw"] = price["mom60"]

@@ -1312,10 +1312,12 @@ def _select_uncached(
     # 必须来自盘中实时快照，不能把初始化时写入 universe.json 的旧值标为“今日”。
     # 保留基础库的风险/板块字段，再由实时字段覆盖可变行情字段。
     today = datetime.date.today()
-    expected_live_date = (
-        today.isoformat() if U.is_trade_day(today)
-        else U.previous_trade_day(today).isoformat()
-    )
+    now_clock = datetime.datetime.now().time()
+    is_open_session = datetime.time(9, 15) <= now_clock <= datetime.time(15, 10)
+    if U.is_trade_day(today) and now_clock >= datetime.time(9, 15):
+        expected_live_date = today.isoformat()
+    else:
+        expected_live_date = U.previous_trade_day(today).isoformat()
     def _quote_age_ok(value, max_minutes=20):
         text = str(value or "").strip()
         if not text:
@@ -1331,13 +1333,10 @@ def _select_uncached(
 
     required_live = max(4000, int(len(eligible_codes) * 0.90 + 0.9999))
 
-    now_clock = datetime.datetime.now().time()
-    is_open_session = datetime.time(9, 15) <= now_clock <= datetime.time(15, 10)
     # During the session require a genuinely recent quote.  After the close,
-    # the last complete closing snapshot remains valid for research/selection
-    # and must not trigger an endless refresh loop merely because it is older
-    # than 20 minutes.
-    quote_age_limit = 20 if expected_live_date == datetime.date.today().isoformat() and is_open_session else 24 * 60
+    # overnight, or on weekends/holidays before open, the last complete closing
+    # snapshot remains valid for research/selection. Allow up to 14 days for holidays.
+    quote_age_limit = 20 if expected_live_date == datetime.date.today().isoformat() and is_open_session else 14 * 24 * 60
 
     def _valid_live_rows(rows):
         return [
@@ -1428,6 +1427,13 @@ def _select_uncached(
             if value is not None and str(value).strip() not in {"", "--", "-"}:
                 price_f.loc[code, target] = value
     sentiment = _LIVE_CACHE["sentiment"]
+    if not sentiment:
+        try:
+            sentiment = F.compute_sentiment_factors(eligible_codes)
+            if sentiment:
+                _LIVE_CACHE["sentiment"] = sentiment
+        except Exception:
+            sentiment = {}
     # 实时资金流直接从同一份行情取（含 f62/f184），省去一次全市场排行抓取
     realtime_flow = {
         s["code"]: (
@@ -1441,6 +1447,18 @@ def _select_uncached(
         super_rows = _load_super_flow(topn=max(len(snap_f), 100))
     except Exception:
         super_rows = []
+    has_expected_super = any(
+        str(r.get("quote_at") or "")[:10] == expected_live_date
+        and _quote_age_ok(r.get("quote_at"), quote_age_limit)
+        for r in (super_rows or [])
+    )
+    if not has_expected_super:
+        try:
+            _refresh_super_flow(topn=max(len(snap_f), 100))
+            with _SUPER_FLOW_LOCK:
+                super_rows = _SUPER_FLOW_CACHE.get("data") or []
+        except Exception:
+            pass
     # The flow rank endpoint is cached independently from the quote snapshot.
     # Never inject a row with an absent/old timestamp into today's cross-section;
     # such rows silently turn stale capital-flow data into a live factor.
