@@ -13,9 +13,48 @@ if BACKEND not in sys.path:
 from evolution_loop_runner import _result_exit_code, main
 import evolution_loop as EL
 import universe as U
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 from contextlib import contextmanager
 import tempfile
+
+
+class DeterministicBackend(EL.Backend):
+    """Deterministic EL backend that successfully completes all 5 stages for persistence testing."""
+
+    def __init__(self):
+        self.params = {"learning_rate": 0.05, "threshold": 0.50}
+
+    def observe(self, conn, generation, ctx=None):
+        return {
+            "params_id": generation,
+            "params": dict(self.params),
+            "has_data": True,
+            "sample_count": 10,
+            "evidence_count": 10,
+        }
+
+    def evaluate(self, conn, generation, ctx=None):
+        return {"intelligence_score": 0.85}
+
+    def mutate(self, conn, generation, ctx=None):
+        self.params["learning_rate"] = round(self.params["learning_rate"] + 0.01, 4)
+        return {
+            "mutated": True,
+            "params_id": generation,
+            "adjustments": ["lr+0.01"],
+            "changed_keys": ["learning_rate"],
+        }
+
+    def validate(self, conn, generation, ctx=None):
+        return {
+            "valid": True,
+            "params_id": generation,
+            "out_of_bounds_corrected": False,
+            "params": dict(self.params),
+        }
+
+    def apply(self, conn, generation, ctx=None):
+        return {"applied_params_id": generation, "active_params_id": generation}
 
 
 class TestEvolutionRunnerContract(unittest.TestCase):
@@ -241,6 +280,74 @@ class TestEvolutionRunnerContract(unittest.TestCase):
                 code_w3 = main(["--db", db_path, "--daily"])
                 self.assertEqual(code_w3, 0)
                 mock_run.assert_not_called()
+
+    def test_main_runner_three_window_real_db_persistence_flow(self):
+        """Verify real SQLite persistence across 3 scheduler windows:
+        Window 1: heavy lease denied -> exit 75, DB rows = 0
+        Window 2: heavy lease allowed -> real run_loop with DeterministicBackend completes -> exit 0, DB rows = 1
+        Window 3: real is_today_generation_completed checks DB -> already_done exit 0, lease never called, DB rows = 1
+        """
+        import sqlite3
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as d:
+            db_path = os.path.join(d, "real_flow.sqlite3")
+
+            # --- Window 1: Heavy lease busy ---
+            @contextmanager
+            def lease_denied(name):
+                yield {"allowed": False, "reason": "worker_lease_busy"}
+
+            with patch.object(U, "is_trade_day", return_value=True), \
+                 patch("evolution_loop_runner.heavy_job_lease", side_effect=lease_denied):
+                code_w1 = main(["--db", db_path, "--daily"])
+                self.assertEqual(code_w1, 75)
+
+            # Assert 0 completed generations persisted in DB
+            conn = sqlite3.connect(db_path)
+            try:
+                count_w1 = conn.execute("SELECT count(*) FROM evolution_loop_state WHERE status='completed'").fetchone()[0]
+                self.assertEqual(count_w1, 0, "Window 1 deferred run must persist 0 completed generations")
+            finally:
+                conn.close()
+
+            # --- Window 2: Heavy lease granted, real run_loop execution ---
+            @contextmanager
+            def lease_granted(name):
+                yield {"allowed": True}
+
+            with patch.object(U, "is_trade_day", return_value=True), \
+                 patch("evolution_loop_runner.heavy_job_lease", side_effect=lease_granted), \
+                 patch("evolution_loop_runner.ProductionBackend", DeterministicBackend):
+                code_w2 = main(["--db", db_path, "--daily"])
+                self.assertEqual(code_w2, 0)
+
+            # Assert exactly 1 completed generation persisted in DB
+            conn = sqlite3.connect(db_path)
+            try:
+                rows_w2 = conn.execute("SELECT generation, status, finished_at FROM evolution_loop_state").fetchall()
+                self.assertEqual(len(rows_w2), 1, "Window 2 must persist exactly 1 completed generation row")
+                self.assertEqual(rows_w2[0][1], "completed")
+                self.assertIsNotNone(rows_w2[0][2])
+            finally:
+                conn.close()
+
+            # --- Window 3: Real DB query finds today's completed generation, skips lease & run ---
+            lease_mock = Mock(side_effect=AssertionError("Heavy lease must NOT be acquired when already done"))
+            with patch.object(U, "is_trade_day", return_value=True), \
+                 patch("evolution_loop_runner.heavy_job_lease", lease_mock), \
+                 patch.object(EL, "run_loop") as mock_run_loop:
+                code_w3 = main(["--db", db_path, "--daily"])
+                self.assertEqual(code_w3, 0)
+                mock_run_loop.assert_not_called()
+                lease_mock.assert_not_called()
+
+            # Assert row count remains 1 (idempotent)
+            conn = sqlite3.connect(db_path)
+            try:
+                count_w3 = conn.execute("SELECT count(*) FROM evolution_loop_state").fetchone()[0]
+                self.assertEqual(count_w3, 1, "Window 3 must not add any new generations")
+            finally:
+                conn.close()
 
 
 if __name__ == "__main__":

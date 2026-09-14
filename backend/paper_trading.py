@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import contextvars
 import datetime as dt
+import functools
 import gc
 import hashlib
 import json
@@ -1035,13 +1036,18 @@ def _entry_freeze_status(force=False):
             cached_signature = factor_meta.get("signature")
             signature_ok = bool(current_signature and cached_signature == current_signature)
 
-            # 语义指纹比对：区分良性 mtime 刷新与破坏性内容变更。
-            cached_fp = cached_signature.get("content_fingerprint") if isinstance(cached_signature, dict) else None
-            curr_fp = current_signature.get("content_fingerprint") if isinstance(current_signature, dict) else None
-            semantic_fingerprint_mismatch = bool(
-                cached_fp is not None and curr_fp is not None and cached_fp != curr_fp
+            # 语义指纹比对：区分良性 mtime 刷新与破坏性内容变更（严格正向证明）。
+            structured_signatures = (
+                isinstance(cached_signature, dict)
+                and isinstance(current_signature, dict)
             )
-            semantic_fingerprint_ok = not semantic_fingerprint_mismatch
+            semantic_fingerprint_ok = bool(
+                structured_signatures
+                and cached_signature.get("content_fingerprint")
+                and current_signature.get("content_fingerprint")
+                and cached_signature["content_fingerprint"] == current_signature["content_fingerprint"]
+                and cached_signature.get("version") == current_signature.get("version")
+            )
 
             # The manifest is also updated as the recovery job records a
             # completed same-day K-line.  Its file mtime is deliberately part
@@ -3466,16 +3472,22 @@ def _selection_factor_freshness(price_f, universe, asof_date, meta=None):
     cached_date = str(meta.get("factor_date") or "")[:10]
     current_signature = _selection_factor_manifest_signature()
     cached_signature = meta.get("signature")
+    structured_signatures = (
+        isinstance(cached_signature, dict)
+        and isinstance(current_signature, dict)
+    )
+    semantic_fingerprint_ok = bool(
+        structured_signatures
+        and cached_signature.get("content_fingerprint")
+        and current_signature.get("content_fingerprint")
+        and cached_signature["content_fingerprint"] == current_signature["content_fingerprint"]
+        and cached_signature.get("version") == current_signature.get("version")
+    )
     signature_ok = bool(
         current_signature
         and (
             cached_signature == current_signature
-            or (
-                isinstance(cached_signature, dict)
-                and isinstance(current_signature, dict)
-                and cached_signature.get("content_fingerprint") is not None
-                and cached_signature.get("content_fingerprint") == current_signature.get("content_fingerprint")
-            )
+            or semantic_fingerprint_ok
         )
     )
     try:
@@ -14029,10 +14041,22 @@ def _cleanup_stale_data():
 
     return cleaned
 
+def _hot_path_slot_context(func):
+    """Context decorator ensuring _SLOT_HOT_PATH ContextVar is bound and reset per slot execution."""
+    @functools.wraps(func)
+    def wrapper(slot, asof_date=None, force=False):
+        token = _SLOT_HOT_PATH.set(_is_hot_path_slot(slot))
+        try:
+            return func(slot, asof_date=asof_date, force=force)
+        finally:
+            _SLOT_HOT_PATH.reset(token)
+    return wrapper
+
+
+@_hot_path_slot_context
 def run_slot(slot, asof_date=None, force=False):
     """统一幂等入口；计划任务和页面的“立即检查”都使用同一事务键。"""
     PSS.validate_slot(slot)
-    _SLOT_HOT_PATH.set(_is_hot_path_slot(slot))
     init_db()
     PSS.run_preflight(
         db_factory=_db,
@@ -14040,6 +14064,10 @@ def run_slot(slot, asof_date=None, force=False):
         resolve_asof_day=lambda: _date(asof_date),
     )
     day = _date(asof_date)
+    return _run_slot_impl(slot, day=day, force=force)
+
+
+def _run_slot_impl(slot, day, force=False):
     if slot == "weekly-review" and not force:
         # Anchor the weekly review to the last *trading* day of the ISO week.
         # Previously a statutory holiday on Friday left the entire week without
@@ -14381,7 +14409,6 @@ def run_slot(slot, asof_date=None, force=False):
                     "note": "幽灵租约将在 TTL 过期后由 _claim_runtime_lease 自动回收",
                 }, ensure_ascii=False), flush=True)
         _clear_lease_context()
-        _SLOT_HOT_PATH.set(False)
 
 
 def _account_metric_inputs(conn, account_ids, today):

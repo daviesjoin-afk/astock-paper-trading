@@ -112,6 +112,44 @@ class PaperHotpathBoundaryTests(unittest.TestCase):
             PT.run_slot("close", force=True)
             self.assertTrue(all(hp is False for hp in captured_calls), "Cold slot 'close' must keep hot_path=False")
 
+    def test_run_slot_early_return_restores_context_var(self):
+        """Early return from run_slot (e.g. non-trading day) must cleanly restore ContextVar."""
+        import paper_trading as PT
+
+        self.assertFalse(PT._SLOT_HOT_PATH.get())
+        # Sunday: non-trading day -> early return
+        res = PT.run_slot("intraday", asof_date="2026-09-13", force=False)
+        self.assertEqual(res.get("status"), "skipped")
+        self.assertFalse(PT._SLOT_HOT_PATH.get(), "ContextVar must be restored to False after early return")
+
+    def test_run_slot_nested_context_restores_outer_token(self):
+        """Nested run_slot invocations must restore the outer caller's ContextVar token."""
+        import paper_trading as PT
+
+        self.assertFalse(PT._SLOT_HOT_PATH.get())
+        token = PT._SLOT_HOT_PATH.set(True)
+        try:
+            self.assertTrue(PT._SLOT_HOT_PATH.get())
+            # Run cold slot which sets False inside and must restore to True on exit
+            res = PT.run_slot("weekly-review", asof_date="2026-09-13", force=False)
+            self.assertIn(res.get("status"), ("completed", "skipped", "already_done"))
+            self.assertTrue(PT._SLOT_HOT_PATH.get(), "Nested cold run_slot must restore outer True token")
+        finally:
+            PT._SLOT_HOT_PATH.reset(token)
+        self.assertFalse(PT._SLOT_HOT_PATH.get())
+
+    def test_run_slot_exception_restores_context_var(self):
+        """Exceptions raised within run_slot implementation must cleanly restore ContextVar."""
+        from unittest.mock import patch
+        import paper_trading as PT
+
+        self.assertFalse(PT._SLOT_HOT_PATH.get())
+        with patch.object(PT, "_run_slot_impl", side_effect=RuntimeError("simulated slot failure")):
+            with self.assertRaises(RuntimeError):
+                PT.run_slot("intraday", force=True)
+        self.assertFalse(PT._SLOT_HOT_PATH.get(), "ContextVar must be restored to False after exception")
+
 
 if __name__ == "__main__":
     unittest.main()
+
