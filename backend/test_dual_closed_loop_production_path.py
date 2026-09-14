@@ -39,6 +39,7 @@ if BACKEND not in sys.path:
 
 import adaptive_engine as AE
 import adaptive_selection as AS
+import ai_review_service
 import deepseek_advisor
 import dual_ai_tuner
 import evolution_activation as EA
@@ -104,7 +105,7 @@ def _frozen_clock(moment: dt.datetime):
     stamp = moment.isoformat(timespec="seconds")
     with patch.object(evolution_apply, "dt", _Shim), \
             patch.object(evolution_apply, "_now", lambda: stamp), \
-            patch.object(dual_ai_tuner, "_now", lambda: stamp):
+            patch.object(ai_review_service, "_now", lambda: stamp):
         yield stamp
 
 
@@ -324,21 +325,24 @@ class DualClosedLoopProductionPathTests(OfflinePaperEnv, unittest.TestCase):
             ).fetchall()
             self.assertGreaterEqual(len(reward_rows), 5)
 
-            # 配置 AI Provider Key（双AI均配置且启用 —— 缺一不可，见 fail-closed 约束）
+            # 配置 AI 槽位凭据（双AI均配置且启用 —— 缺一不可，见 fail-closed 约束）。
+            # 这里刻意走历史入口 update_api_key：mimo/deepseek 是 ai1/ai2 的别名，
+            # 用来同时锁住"别名映射后仍然双槽位就绪"这条兼容路径。
             dual_ai_tuner.update_api_key(a_conn, "mimo", api_key="test-mimo-key", enabled=True)
             dual_ai_tuner.update_api_key(a_conn, "deepseek", api_key="test-ds-key", enabled=True)
 
-        def _stub_call_single_ai(provider_config, system_prompt, user_prompt, max_tokens=1800):
-            prov = provider_config.get("provider")
+        def _stub_call_slot(slot_config, system_prompt, user_prompt, max_tokens=1800):
+            # 生产路径已收敛到通用槽位（ai1/ai2）：只按稳定 id 区分，不认厂商身份。
+            slot = slot_config.get("slot")
             parsed = {
                 "decision": "propose",
-                "confidence": 85 if prov == "mimo" else 88,
+                "confidence": 85 if slot == "ai1" else 88,
                 "market_regime": "trend",
                 "summary": "Dual loop trading evidence confirms strategy execution and exit",
                 "proposals": [
                     {
                         "account_id": STRATEGY_ID,
-                        "confidence": 85 if prov == "mimo" else 88,
+                        "confidence": 85 if slot == "ai1" else 88,
                         "rationale": "Slight adjustment based on real fill attribution",
                         "weights": dict(base_weights),
                         "entry_score_delta": 0.0,
@@ -400,7 +404,7 @@ class DualClosedLoopProductionPathTests(OfflinePaperEnv, unittest.TestCase):
         #      -> evolution_tracking.evaluated=1
         #    评分全部由生产服务从 adaptive_rewards.raw_reward 计算，测试端零注入。
         # ─────────────────────────────────────────────────────────────────
-        with patch.object(dual_ai_tuner, "_call_single_ai", side_effect=_stub_call_single_ai), \
+        with patch.object(ai_review_service, "_call_slot", side_effect=_stub_call_slot), \
                 patch.object(SR, "labels",
                              lambda **kwargs: _ORIGINAL_LABELS(db_path=self.paper_db_path)):
             stale_reward = min(reward_rows, key=lambda r: (r["start_date"], r["id"]))

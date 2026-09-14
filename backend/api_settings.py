@@ -80,9 +80,11 @@ def _snapshot() -> dict:
     try:
         ai_schema = adaptive.ai_settings_schema()
         ai_keys = adaptive.get_dual_ai_api_keys_fn()
+        ai_review = adaptive.ai_review_settings_fn()
     except Exception as exc:
         ai_schema = {"settings": {}, "parameters": {}, "providers": {}}
         ai_keys = {}
+        ai_review = {"slots": {}, "review_mode": None, "single_reviewer_slot": None}
         ai_error = f"{type(exc).__name__}: {exc}"
     else:
         ai_error = None
@@ -114,6 +116,9 @@ def _snapshot() -> dict:
             "parameters": ai_schema.get("parameters", {}),
             "providers": ai_schema.get("providers", {}),
             "keys": ai_keys,
+            # 通用槽位权威视图（review_mode + ai1/ai2 掩码状态），
+            # 绝不含明文 Key；前端与其它调用方都应优先读这里。
+            "review": ai_review,
             "error": ai_error,
         },
         "audit": audit,
@@ -169,24 +174,122 @@ async def update_settings(request: Request, confirmed: bool = Query(False)):
 
 @router.post("/ai-key")
 async def update_ai_key(request: Request, confirmed: bool = Query(False)):
+    """历史入口（兼容保留）：``provider`` 作为 ``ai1``/``ai2`` 的别名。
+
+    新代码请用 ``PUT /api/settings/ai-review/slots/{slot}``；本路由的返回结构与
+    ``/ai-review`` 完全一致，不再返回厂商专属视图。
+    """
     _require_confirmation(confirmed, "保存AI接口配置")
     try:
         body = await request.json()
     except Exception as exc:
         raise HTTPException(status_code=422, detail="AI接口配置必须是JSON对象") from exc
-    if not isinstance(body, dict) or body.get("provider") not in {"mimo", "deepseek"}:
-        raise HTTPException(status_code=422, detail="provider必须是 mimo 或 deepseek")
+    if not isinstance(body, dict) or body.get("provider") is None:
+        raise HTTPException(status_code=422, detail="provider必须是 ai1 或 ai2（兼容 mimo/deepseek 别名）")
     api_key = body.get("api_key")
     if api_key is not None and (not isinstance(api_key, str) or len(api_key) > 200):
         raise HTTPException(status_code=422, detail="API Key格式无效")
     try:
-        adaptive.update_dual_ai_api_key_fn(
-            body["provider"], api_key=api_key,
-            base_url=body.get("base_url"), model=body.get("model"), enabled=body.get("enabled"),
+        adaptive.update_ai_slot_fn(
+            body["provider"],
+            api_key=api_key, base_url=body.get("base_url"), model=body.get("model"),
+            enabled=body.get("enabled"),
         )
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     return _snapshot()
+
+
+# ─── 通用 AI 槽位设置（ai1 / ai2）───
+# 这是设置页唯一的 AI 权威接口：GET 永不返回明文 Key，PUT 用空 api_key 保持旧 Key，
+# 需要清空必须显式 clear_api_key=true。
+
+_AI_REVIEW_KEYS = {"review_mode", "single_reviewer_slot"}
+_AI_SLOT_KEYS = {
+    "api_key", "base_url", "model", "enabled",
+    "display_name", "timeout_seconds", "clear_api_key",
+}
+
+
+async def _read_json_object(request: Request, message: str) -> dict:
+    try:
+        body = await request.json()
+    except Exception as exc:
+        raise HTTPException(status_code=422, detail=message) from exc
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=422, detail=message)
+    return body
+
+
+@router.get("/ai-review")
+def ai_review_snapshot():
+    try:
+        return adaptive.ai_review_settings_fn()
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"读取AI审核设置失败：{type(exc).__name__}") from exc
+
+
+@router.put("/ai-review")
+async def update_ai_review(request: Request, confirmed: bool = Query(False)):
+    _require_confirmation(confirmed, "切换AI审核模式")
+    body = await _read_json_object(request, "AI审核设置必须是JSON对象")
+    unknown = set(body) - _AI_REVIEW_KEYS
+    if unknown:
+        raise HTTPException(status_code=422, detail="未知设置项: " + ",".join(sorted(unknown)))
+    if not body:
+        raise HTTPException(status_code=422, detail="至少需要提供 review_mode 或 single_reviewer_slot")
+    try:
+        return adaptive.update_ai_review_settings_fn(
+            review_mode=body.get("review_mode"),
+            single_reviewer_slot=body.get("single_reviewer_slot"),
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"保存AI审核设置失败：{type(exc).__name__}") from exc
+
+
+@router.put("/ai-review/slots/{slot}")
+async def update_ai_review_slot(slot: str, request: Request, confirmed: bool = Query(False)):
+    _require_confirmation(confirmed, "保存AI槽位配置")
+    body = await _read_json_object(request, "AI槽位配置必须是JSON对象")
+    unknown = set(body) - _AI_SLOT_KEYS
+    if unknown:
+        raise HTTPException(status_code=422, detail="未知设置项: " + ",".join(sorted(unknown)))
+    api_key = body.get("api_key")
+    if api_key is not None and (not isinstance(api_key, str) or len(api_key) > 200):
+        raise HTTPException(status_code=422, detail="API Key格式无效")
+    if "enabled" in body and not isinstance(body["enabled"], bool):
+        raise HTTPException(status_code=422, detail="enabled必须是布尔值")
+    if "clear_api_key" in body and not isinstance(body["clear_api_key"], bool):
+        raise HTTPException(status_code=422, detail="clear_api_key必须是布尔值")
+    try:
+        return adaptive.update_ai_slot_fn(
+            slot,
+            api_key=api_key,
+            base_url=body.get("base_url"),
+            model=body.get("model"),
+            enabled=body.get("enabled"),
+            display_name=body.get("display_name"),
+            timeout_seconds=body.get("timeout_seconds"),
+            clear_api_key=bool(body.get("clear_api_key")),
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"保存AI槽位失败：{type(exc).__name__}") from exc
+
+
+@router.post("/ai-review/slots/{slot}/test")
+def test_ai_review_slot(slot: str, confirmed: bool = Query(False)):
+    """对指定槽位做一次真实连通性探测；返回结构绝不含明文 Key。"""
+    _require_confirmation(confirmed, "测试AI槽位连通性")
+    try:
+        return adaptive.test_ai_slot_fn(slot)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"测试AI槽位失败：{type(exc).__name__}") from exc
 
 
 @router.get("/audit")

@@ -1,6 +1,6 @@
 /* PR-55：由 frontend/app.js 拆分（纯搬运，逻辑/文案未改） */
 // 跨模块依赖（由原单文件作用域推导）
-import { api, apiPostJson, getOperatorToken, setOperatorToken, clearOperatorToken } from "../core/api.js";
+import { api, apiPostJson, apiJson, getOperatorToken, setOperatorToken, clearOperatorToken } from "../core/api.js";
 import { $ } from "../core/dom.js";
 import { adaptiveEsc, riskText } from "../core/format.js";
 import { SETTINGS_SECTION_KEY, activatePage } from "../core/navigation.js";
@@ -175,19 +175,53 @@ export function renderSettings(data){
       +'<div class="settings-note"><strong>边界说明：</strong>这是一道单操作员共享密钥边界，不是 RBAC；它不替代既有的风险与人工确认门禁，也不会把凭据写入日志或页面。</div>'
       +'</section>'+settingsPreviewHtml(data,section)+'</div>';
   }else{
-    var ais=ai.settings||{}; var keyMap=ai.keys||{}; var activeProvider=ais.llm_provider||'deepseek'; var activeKey=keyMap[activeProvider]||{};
-    html='<div class="settings-grid"><section class="settings-panel"><h3>AI 与自进化</h3><p>AI 只生成审阅和有界候选，默认需要人工确认；API Key 只写入后端安全存储，页面和日志永远不回显明文。</p><div class="settings-form">'
+    var ais=ai.settings||{}, review=ai.review||{}, reviewSlots=review.slots||{}, slotOrder=review.slot_order||['ai1','ai2'], reviewMode=review.review_mode==='single'?'single':'dual';
+    var aiSlotCards=slotOrder.map(function(slot){
+      var s=reviewSlots[slot]||{}, enabled=!!s.enabled;
+      return '<div class="settings-panel" data-testid="ai-slot-'+slot+'" style="margin-top:14px;padding:14px">'
+        +'<h4>'+adaptiveEsc(s.display_name||slot)+' <small class="setting-help">'+adaptiveEsc(slot)+'</small></h4>'
+        +'<div class="setting-row"><div class="setting-label"><b>配置状态</b><small>页面永不回显明文 Key；Key 留空表示保持现有值。</small></div>'
+        +'<div class="setting-control"><span data-testid="ai-slot-'+slot+'-status" class="setting-value-preview">'+(s.configured?('已配置 '+adaptiveEsc(s.key_preview||'')):'未配置')+'</span></div></div>'
+        +'<div class="setting-control"><label for="aiSlot_'+slot+'_displayName">显示名称</label><input data-testid="ai-slot-'+slot+'-display-name" id="aiSlot_'+slot+'_displayName" type="text" maxlength="40" value="'+adaptiveEsc(s.display_name||'')+'" placeholder="自定义名称，与稳定 id 解耦"></div>'
+        +'<div class="setting-control"><label for="aiSlot_'+slot+'_baseUrl">Base URL</label><input data-testid="ai-slot-'+slot+'-base-url" id="aiSlot_'+slot+'_baseUrl" type="url" maxlength="500" value="'+adaptiveEsc(s.base_url||'')+'" placeholder="https://example.com/v1"></div>'
+        +'<div class="setting-control"><label for="aiSlot_'+slot+'_model">模型名称</label><input data-testid="ai-slot-'+slot+'-model" id="aiSlot_'+slot+'_model" type="text" maxlength="100" value="'+adaptiveEsc(s.model||'')+'" placeholder="由你填写，后端不做任何厂商假设"></div>'
+        +'<div class="setting-control"><label for="aiSlot_'+slot+'_apiKey">API Key</label><input data-testid="ai-slot-'+slot+'-api-key" id="aiSlot_'+slot+'_apiKey" type="password" autocomplete="new-password" placeholder="留空表示保持现有 Key"></div>'
+        +'<div class="setting-control"><label for="aiSlot_'+slot+'_timeout">超时（秒）</label><input data-testid="ai-slot-'+slot+'-timeout" id="aiSlot_'+slot+'_timeout" type="number" min="5" max="300" step="1" value="'+Number(s.timeout_seconds||40)+'"></div>'
+        +'<div class="setting-control"><label class="settings-exec-toggle"><input data-testid="ai-slot-'+slot+'-enabled" id="aiSlot_'+slot+'_enabled" type="checkbox"'+settingsChecked(enabled)+'><span>'+(enabled?'启用':'停用')+'</span></label></div>'
+        +'<div class="settings-actions">'
+        +'<button data-testid="ai-slot-'+slot+'-save" onclick="saveAiSlot(\''+slot+'\')">保存该槽位</button>'
+        +'<button class="ghost" data-testid="ai-slot-'+slot+'-test" onclick="testAiSlot(\''+slot+'\')">测试连接</button>'
+        +'<button class="ghost" data-testid="ai-slot-'+slot+'-clear" onclick="clearAiSlotKey(\''+slot+'\')">清除 Key</button>'
+        +'</div>'
+        +'<div class="setting-help" data-testid="ai-slot-'+slot+'-feedback"></div>'
+        +'</div>';
+    }).join('');
+    var singleSlotOptions=slotOrder.map(function(slot){
+      var s=reviewSlots[slot]||{};
+      return '<option value="'+slot+'"'+(review.single_reviewer_slot===slot?' selected':'')+'>'+adaptiveEsc((s.display_name||slot)+' · '+slot)+'</option>';
+    }).join('');
+    html='<div class="settings-grid"><section class="settings-panel"><h3>AI 审核</h3>'
+      +'<p>这里管理<strong>两个完全独立</strong>的 AI 槽位与审核模式。名称、地址、模型全部由你填写；后端不认识任何厂商身份，请求体是最小公共的 OpenAI 兼容格式。</p>'
+      +'<div class="settings-form">'
       +settingsInputRow('evolution_interval_hours','自进化周期','收盘学习任务之间的最短间隔，范围 1–168 小时。','<input id="settingEvolutionInterval" type="number" min="1" max="168" step="1" value="'+Number(evo.evolution_interval_hours||24)+'"> <span class="setting-value-preview">小时</span>')
-      +settingsInputRow('llm_provider','AI供应商','当前支持 DeepSeek；其他供应商仅保留兼容入口。','<select id="settingAiProvider"><option value="deepseek"'+(activeProvider==='deepseek'?' selected':'')+'>DeepSeek</option><option value="mimo"'+(activeProvider==='mimo'?' selected':'')+'>MiMo</option></select>')
+      +'<div class="setting-row"><div class="setting-label"><b>审核模式</b><small>单AI：只用选定槽位，结果仅供参考、永不构成共识。双AI：两个槽位独立分析后过共识门禁，缺一个即整体拦截，绝不降级成单AI。</small></div>'
+      +'<div class="setting-control"><label><input data-testid="ai-review-mode-single" type="radio" name="settingReviewMode" value="single"'+(reviewMode==='single'?' checked':'')+'><span>单AI审阅</span></label>'
+      +'<label><input data-testid="ai-review-mode-dual" type="radio" name="settingReviewMode" value="dual"'+(reviewMode==='dual'?' checked':'')+'><span>双AI共识</span></label></div></div>'
+      +'<div class="setting-row" id="settingSingleSlotRow" data-testid="ai-review-single-slot-row"><div class="setting-label"><b>单AI审阅槽位</b><small>只在“单AI审阅”模式下生效，双AI模式不使用该项。</small></div>'
+      +'<div class="setting-control"><select data-testid="ai-review-single-slot" id="settingSingleReviewerSlot">'+singleSlotOptions+'</select>'
+      +'<span data-testid="ai-review-readiness" class="setting-value-preview">'+(reviewMode==='single'?(review.single_ready?'就绪':'未就绪'):(review.dual_ready?'双AI就绪':'双AI未就绪'))+'</span></div></div>'
       +'<div class="setting-row"><div class="setting-label"><b>AI运行开关</b><small>只影响审阅/候选生成，不直接下单。</small></div><div class="setting-control"><label><input id="settingAiAdvisor" type="checkbox"'+settingsChecked(ais.llm_advisor_enabled)+'><span>启用 AI 审阅</span></label><label><input id="settingAiRealtime" type="checkbox"'+settingsChecked(ais.llm_realtime_tuning_enabled)+'><span>启用有界调参</span></label><label><input type="checkbox" checked disabled><span>人工确认候选（强制）</span></label></div></div>'
       +'<div class="setting-row"><div class="setting-label"><b>调参模式</b><small>shadow 最稳，intraday 更及时，close 只在收盘运行。</small></div><div class="setting-control"><select id="settingAiMode"><option value="shadow"'+(ais.llm_realtime_mode==='shadow'?' selected':'')+'>shadow · 只观察</option><option value="intraday"'+(ais.llm_realtime_mode==='intraday'?' selected':'')+'>intraday · 盘中候选</option><option value="close"'+(ais.llm_realtime_mode==='close'?' selected':'')+'>close · 收盘候选</option></select></div></div>'
-      +'</div><div class="settings-actions"><button onclick="saveSettingsSection(\'evolution\')">保存 AI 与调度</button><button class="ghost" onclick="resetSettingsSection(\'evolution\')">恢复默认</button></div>'
-      +'<div class="settings-note"><strong>自动应用：</strong>后端固定关闭，任何 AI 候选都要经过数据质量、跨源和人工确认门禁。自进化周期只控制后台学习频率，不会改变已启用策略的交易硬规则。</div>'
-      +'<div class="settings-panel" style="margin-top:14px;padding:14px"><h4>接口凭据（仅显示掩码状态）</h4><div class="setting-control"><label for="settingKeyProvider">供应商</label><select id="settingKeyProvider" onchange="refreshSettingsKeyForm()"><option value="deepseek"'+(activeProvider==='deepseek'?' selected':'')+'>DeepSeek</option><option value="mimo"'+(activeProvider==='mimo'?' selected':'')+'>MiMo</option></select><span id="settingsKeyStatus" class="setting-value-preview">'+(activeKey.configured?'已配置 '+adaptiveEsc(activeKey.key_preview||''):'未配置')+'</span></div><div class="setting-control"><label for="settingApiKey">API Key</label><input id="settingApiKey" type="password" autocomplete="new-password" placeholder="留空表示保持现有 Key"></div><div class="setting-control"><label for="settingBaseUrl">Base URL</label><input id="settingBaseUrl" type="url" value="'+adaptiveEsc(activeKey.base_url||'')+'"></div><div class="setting-control"><label for="settingAiModel">模型</label><input id="settingAiModel" type="text" value="'+adaptiveEsc(activeKey.model||'')+'"></div><div class="settings-actions"><button class="ghost" onclick="saveSettingsKey()">保存接口配置</button></div></div></section>'+settingsPreviewHtml(data,section)+'</div>';
+      +'</div><div class="settings-actions"><button data-testid="settings-save-ai-review" onclick="saveAiReviewMode()">保存审核模式</button><button class="ghost" data-testid="settings-save-ai-switches" onclick="saveSettingsSection(\'evolution\')">保存 AI 开关</button><button class="ghost" onclick="resetSettingsSection(\'evolution\')">恢复默认</button></div>'
+      +'<div class="settings-note"><strong>安全边界：</strong>单AI审阅的运行状态是 <code>single_review</code>，不是 <code>consensus</code>，因此永远无法穿过人工应用门禁；双AI的共识提案仍需人工确认后才生效。自进化周期只控制后台学习频率，不改变已启用策略的交易硬规则。</div>'
+      + aiSlotCards
+      +'</section>'+settingsPreviewHtml(data,section)+'</div>';
   }
   target.innerHTML=html;
   document.querySelectorAll('#p-settings .settings-section-tab').forEach(function(item){var active=item.dataset.settingsSection===section;item.classList.toggle('active',active);item.setAttribute('aria-selected',active?'true':'false');});
   document.querySelectorAll('#p-settings [data-settings-preview-input]').forEach(function(item){item.addEventListener('input',updateSettingsPreview);item.addEventListener('change',updateSettingsPreview);});
+  document.querySelectorAll('#p-settings input[name="settingReviewMode"]').forEach(function(item){item.addEventListener('change',refreshAiReviewModeUi);});
+  refreshAiReviewModeUi();
   updateSettingsPreview();
   var head=$('settingsHeadState'); if(head) head.textContent='默认安全边界已加载 · 最近审计 '+(Array.isArray(data.audit)?data.audit.length:0)+' 条';
 }
@@ -267,7 +301,7 @@ export async function saveSettingsSection(section){
   if(section==='risk') payload.risk={shared_pool_position_limit:Number($('settingPoolLimit').value),shared_pool_exposure_cap:Number($('settingExposureCap').value)/100,single_position_max_amount:Number($('settingSingleMax').value),minimum_entry_slot_utilization:Number($('settingSlotUtilization').value)/100};
   if(section==='strategy') payload.strategy={strategy_overrides:collectStrategyOverrides()};
   if(section==='evolution') payload.evolution={evolution_interval_hours:Number($('settingEvolutionInterval').value)};
-  if(section==='execution') payload.execution={execution_batch_gate:!!($('settingExec_execution_batch_gate')||{}).checked,execution_verification_gate:!!($('settingExec_execution_verification_gate')||{}).checked,execution_ttl_sweep:!!($('settingExec_execution_ttl_sweep')||{}).checked}; payload.ai=section==='evolution'?{llm_provider:$('settingAiProvider').value,llm_advisor_enabled:$('settingAiAdvisor').checked,llm_realtime_tuning_enabled:$('settingAiRealtime').checked,llm_realtime_mode:$('settingAiMode').value}:undefined;
+  if(section==='execution') payload.execution={execution_batch_gate:!!($('settingExec_execution_batch_gate')||{}).checked,execution_verification_gate:!!($('settingExec_execution_verification_gate')||{}).checked,execution_ttl_sweep:!!($('settingExec_execution_ttl_sweep')||{}).checked}; payload.ai=section==='evolution'?{llm_advisor_enabled:$('settingAiAdvisor').checked,llm_realtime_tuning_enabled:$('settingAiRealtime').checked,llm_realtime_mode:$('settingAiMode').value}:undefined;
   try{var data=await apiPostJson('/api/settings/?confirmed=true',payload);renderSettings(data);toast('设置已保存并记录审计。');if(section==='risk'&&typeof loadPaper==='function') loadPaper({force:true});}catch(e){toast('保存失败：'+((e&&e.message)||e), { tone: 'danger' });}
 }
 
@@ -285,22 +319,97 @@ export async function resetSettingsSection(section){
   try{var data=await apiPostJson('/api/settings/?confirmed=true',payload);renderSettings(data);toast('已恢复该分组默认值。');}catch(e){inlineError($('settingsResult'), e, { title:'恢复默认失败', retryLabel:'重试', onRetry:function(){ resetSettingsSection(section); } });}
 }
 
-export function refreshSettingsKeyForm(){
-  var provider=$('settingKeyProvider')&&$('settingKeyProvider').value, keys=((window._settingsPayload||{}).ai||{}).keys||{}, item=keys[provider]||{};
-  if($('settingsKeyStatus')) $('settingsKeyStatus').textContent=item.configured?'已配置 '+(item.key_preview||''):'未配置';
-  if($('settingBaseUrl')) $('settingBaseUrl').value=item.base_url||'';
-  if($('settingAiModel')) $('settingAiModel').value=item.model||'';
-  if($('settingApiKey')) $('settingApiKey').value='';
+// ---------- 通用 AI 槽位（ai1 / ai2）----------
+// 全部走 /api/settings/ai-review*：GET 永不回显明文 Key，保存时空 Key = 保持旧 Key，
+// 清空必须显式走“清除 Key”按钮（后端 clear_api_key=true）。
+export function aiSlotFeedback(slot,message,tone){
+  var node=document.querySelector('[data-testid="ai-slot-'+slot+'-feedback"]');
+  if(!node) return;
+  node.textContent=message||'';
+  node.style.color=tone==='danger'?'var(--danger)':(tone==='ok'?'var(--up,#c0392b)':'');
 }
 
-export async function saveSettingsKey(){
-  var aiAnswer=await confirmDialog({
-    kicker:'设置 · AI 接口',
-    title:'保存该 AI 接口配置？',
-    bullets:['Key 只写入后端，页面不会回显明文。','AI 仅用于审阅与候选生成，不直接下单。'],
-    confirmText:'保存配置',
+export function refreshAiReviewModeUi(){
+  var single=document.querySelector('#p-settings input[name="settingReviewMode"][value="single"]');
+  var row=$('settingSingleSlotRow');
+  if(row) row.style.display=(single&&single.checked)?'':'none';
+}
+
+export async function saveAiReviewMode(){
+  var picked=document.querySelector('#p-settings input[name="settingReviewMode"]:checked');
+  var mode=picked?picked.value:'dual';
+  var slotNode=$('settingSingleReviewerSlot');
+  var answer=await confirmDialog({
+    kicker:'设置 · AI 审核模式',
+    title:'切换为“'+(mode==='single'?'单AI审阅':'双AI共识')+'”？',
+    bullets:['单AI审阅结果标记为 single_review，仅供参考，永远不构成共识。','双AI共识要求两个槽位都配置且启用；缺一个就整体 fail-closed。','不会关闭人工确认门禁，也不会改变交易硬规则。'],
+    confirmText:'切换模式',
   });
-  if(!aiAnswer.approved) return;
-  var body={provider:$('settingKeyProvider').value,api_key:$('settingApiKey').value||undefined,base_url:$('settingBaseUrl').value||undefined,model:$('settingAiModel').value||undefined};
-  try{var data=await apiPostJson('/api/settings/ai-key?confirmed=true',body);renderSettings(data);toast('AI 接口配置已保存（页面仅显示掩码状态）。');}catch(e){inlineError($('settingsResult'), (e&&e.message)||e, { title:'接口保存失败', retryLabel:'重试', onRetry:function(){ saveSettingsKey(); } }); toast('接口保存失败：'+(e.message||e));}
+  if(!answer.approved) return;
+  var body={review_mode:mode};
+  if(mode==='single'&&slotNode&&slotNode.value) body.single_reviewer_slot=slotNode.value;
+  try{await apiJson('/api/settings/ai-review?confirmed=true','PUT',body);await loadSettings(true);toast('AI 审核模式已保存。');}
+  catch(e){toast('保存失败：'+((e&&e.message)||e), { tone: 'danger' });}
+}
+
+export async function saveAiSlot(slot){
+  var read=function(suffix){var node=$('aiSlot_'+slot+'_'+suffix);return node?String(node.value||'').trim():'';};
+  var enabledNode=$('aiSlot_'+slot+'_enabled');
+  var body={
+    display_name:read('displayName'),
+    base_url:read('baseUrl'),
+    model:read('model'),
+    enabled:!!(enabledNode&&enabledNode.checked),
+  };
+  var timeoutRaw=read('timeout');
+  if(timeoutRaw) body.timeout_seconds=Number(timeoutRaw);
+  var apiKey=read('apiKey');
+  if(apiKey) body.api_key=apiKey;
+  var answer=await confirmDialog({
+    kicker:'设置 · AI 槽位 '+slot,
+    title:'保存槽位 '+slot+' 的接口配置？',
+    bullets:['API Key 只写入后端安全存储，页面和日志不回显明文。','留空 Key 表示保持现有 Key；要清空请用“清除 Key”。','两个槽位完全独立，保存本槽位不会改动另一个。'],
+    confirmText:'保存槽位',
+  });
+  if(!answer.approved) return;
+  try{
+    await apiJson('/api/settings/ai-review/slots/'+slot+'?confirmed=true','PUT',body);
+    await loadSettings(true);
+    toast('槽位 '+slot+' 已保存（页面仅显示掩码状态）。');
+  }catch(e){
+    aiSlotFeedback(slot,'保存失败：'+((e&&e.message)||e),'danger');
+    toast('保存失败：'+((e&&e.message)||e), { tone: 'danger' });
+  }
+}
+
+export async function clearAiSlotKey(slot){
+  var answer=await confirmDialog({
+    kicker:'设置 · 清除 Key',
+    title:'清除槽位 '+slot+' 的 API Key？',
+    bullets:['清除后该槽位变为未配置：单AI模式 fail-closed，双AI模式整体阻断。','地址、模型、开关与超时保持不变。','清除立即生效，无需重启扫描。'],
+    confirmText:'清除 Key',
+  });
+  if(!answer.approved) return;
+  try{
+    await apiJson('/api/settings/ai-review/slots/'+slot+'?confirmed=true','PUT',{clear_api_key:true});
+    await loadSettings(true);
+    toast('已清除槽位 '+slot+' 的 API Key。');
+  }catch(e){toast('清除失败：'+((e&&e.message)||e), { tone: 'danger' });}
+}
+
+export async function testAiSlot(slot){
+  aiSlotFeedback(slot,'正在测试连接…');
+  try{
+    var result=await apiJson('/api/settings/ai-review/slots/'+slot+'/test?confirmed=true','POST');
+    if(result&&result.ok){
+      aiSlotFeedback(slot,'连接正常 · '+Number(result.latency_ms||0)+' ms（模型 '+(result.model||'—')+'）','ok');
+      toast('槽位 '+slot+' 连接正常。');
+    }else{
+      aiSlotFeedback(slot,'连接失败：'+String((result&&result.error)||'unknown'),'danger');
+      toast('槽位 '+slot+' 连接失败。', { tone: 'danger' });
+    }
+  }catch(e){
+    aiSlotFeedback(slot,'测试失败：'+((e&&e.message)||e),'danger');
+    toast('测试失败：'+((e&&e.message)||e), { tone: 'danger' });
+  }
 }

@@ -3938,6 +3938,52 @@ def run_dual_ai_tuning_fn(trigger="manual", mode="intraday"):
     )
 
 
+# ─── 通用 AI 槽位（ai1 / ai2）接线 ───
+# 下面四个函数是设置页唯一的 AI 入口：槽位与审核模式完全由用户配置，
+# 业务层不再认识任何厂商身份。
+
+def ai_review_settings_fn():
+    """返回通用 AI 审核设置（含两个槽位的掩码状态与就绪度）。"""
+    import ai_review_service
+    with _connect() as conn:
+        return ai_review_service.review_settings_view(conn)
+
+
+def update_ai_review_settings_fn(review_mode=None, single_reviewer_slot=None):
+    """更新全局审核模式（single / dual）与单AI审阅槽位。"""
+    import ai_review_service
+    with _connect() as conn:
+        ai_review_service.update_review_settings(
+            conn, review_mode=review_mode, single_reviewer_slot=single_reviewer_slot)
+        return ai_review_service.review_settings_view(conn)
+
+
+def update_ai_slot_fn(slot, api_key=None, base_url=None, model=None, enabled=None,
+                      display_name=None, timeout_seconds=None, clear_api_key=False):
+    """更新单个 AI 槽位配置；只影响该槽位。"""
+    import ai_review_service
+    with _connect() as conn:
+        ai_review_service.update_slot(
+            conn, slot, api_key=api_key, base_url=base_url, model=model, enabled=enabled,
+            display_name=display_name, timeout_seconds=timeout_seconds,
+            clear_api_key=clear_api_key)
+        return ai_review_service.review_settings_view(conn)
+
+
+def ai_review_status_fn():
+    """返回通用 AI 审核系统状态（含最近运行与共识规则）。"""
+    import ai_review_service
+    with _connect() as conn:
+        return ai_review_service.review_status(conn)
+
+
+def test_ai_slot_fn(slot):
+    """对一个 AI 槽位做连通性探测（会发起真实请求，CI 不调用）。"""
+    import ai_review_service
+    with _connect() as conn:
+        return ai_review_service.test_slot(conn, slot)
+
+
 def _current_profile_snapshot():
     """读取当前市场画像快照，供双AI调参使用。"""
     try:

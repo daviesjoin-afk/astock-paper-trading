@@ -155,8 +155,8 @@ export function setAdaptiveSection(section,button){
       +'<button class="ghost" onclick="runDualAiTuning()">运行双AI调参</button>'
       +'</div></header>'
       +'<div class="ai-status-cards" id="aiStatusCards">'
-      +'<div class="ai-card"><small>MiMo</small><b id="aiMiMoStatus">检测中…</b></div>'
-      +'<div class="ai-card"><small>DeepSeek</small><b id="aiDeepSeekStatus">检测中…</b></div>'
+      +'<div class="ai-card"><small id="aiSlotAi1Label">AI 1</small><b id="aiSlotAi1Status">检测中…</b></div>'
+      +'<div class="ai-card"><small id="aiSlotAi2Label">AI 2</small><b id="aiSlotAi2Status">检测中…</b></div>'
       +'<div class="ai-card"><small>modlens</small><b id="aiModlensStatus">检测中…</b></div>'
       +'<div class="ai-card"><small>共识率</small><b id="aiConsensusRate">—</b></div>'
       +'<div class="ai-card"><small>进化状态</small><b id="aiEvolutionState">检测中…</b></div>'
@@ -170,7 +170,7 @@ export function setAdaptiveSection(section,button){
       +'<div class="controls"><input id="aiImageUrl" type="text" placeholder="输入图片URL" style="width:400px">'
       +'<button class="ghost" onclick="testModlensRead()">读取</button></div>'
       +'<div id="aiModlensResult"></div></div>'
-      +'<div class="adaptive-notice">双AI共识：MiMo + DeepSeek 独立分析，方向一致且幅度接近才执行。自进化系统自动优化调参策略。</div>'
+      +'<div class="adaptive-notice">双AI共识：两个独立 AI 槽位分别分析，方向一致且幅度接近才执行。自进化系统自动优化调参策略。</div>'
       +'</section>';
     shell.insertAdjacentHTML('beforeend',aiHtml);
   }
@@ -349,8 +349,8 @@ export function renderAdaptive(d){
       +'</div></header>'
       /* 双AI状态卡片 */
       +'<div class="ai-status-cards" id="aiStatusCards">'
-      +'<div class="ai-card"><small>MiMo v2.5 Pro</small><b id="aiMiMoStatus">检测中…</b></div>'
-      +'<div class="ai-card"><small>DeepSeek</small><b id="aiDeepSeekStatus">检测中…</b></div>'
+      +'<div class="ai-card"><small id="aiSlotAi1Label">AI 1</small><b id="aiSlotAi1Status">检测中…</b></div>'
+      +'<div class="ai-card"><small id="aiSlotAi2Label">AI 2</small><b id="aiSlotAi2Status">检测中…</b></div>'
       +'<div class="ai-card"><small>modlens 视觉</small><b id="aiModlensStatus">检测中…</b></div>'
       +'<div class="ai-card"><small>共识率</small><b id="aiConsensusRate">—</b></div>'
       +'<div class="ai-card"><small>进化状态</small><b id="aiEvolutionState">检测中…</b></div>'
@@ -383,7 +383,7 @@ export function renderAdaptive(d){
       +'<button class="ghost" onclick="testModlensRead()">读取图片</button></div>'
       +'<div id="aiModlensResult" style="margin-top:10px"></div>'
       +'</div>'
-      +'<div class="adaptive-notice">双AI共识调参：MiMo + DeepSeek 独立分析同一份市场证据，双方提案方向一致且幅度接近时才合并执行。自进化系统根据历史表现自动调整调参策略参数。modlens 为纯文本模型提供视觉能力。</div>'
+      +'<div class="adaptive-notice">双AI共识：两个独立 AI 槽位分析同一份市场证据，方向一致且幅度接近时才合并执行；单AI审阅仅供参考，永不构成共识。自进化系统根据历史表现自动调整调参策略参数。modlens 为纯文本模型提供视觉能力。</div>'
       +'</section>';
     shell.insertAdjacentHTML('beforeend', aiSectionHtml);
 
@@ -477,11 +477,13 @@ export async function loadEvolutionStatus(){
   try{
     /* 加载双AI状态 */
     var dualAi=await api('/api/adaptive/dual-ai/status');
-    var keys=dualAi.providers||{};
-    var mimo=keys.mimo||{};
-    var ds=keys.deepseek||{};
-    setEl('aiMiMoStatus', mimo.configured?'已配置 '+adaptiveEsc(mimo.model||''):'未配置');
-    setEl('aiDeepSeekStatus', ds.configured?'已配置 '+adaptiveEsc(ds.model||''):'未配置');
+    /* 通用槽位视图：显示名来自用户配置，前端不再硬编码任何厂商名。 */
+    var slots=dualAi.slots||{};
+    [['ai1','Ai1'],['ai2','Ai2']].forEach(function(pair){
+      var info=slots[pair[0]]||{};
+      setEl('aiSlot'+pair[1]+'Label', adaptiveEsc(info.display_name||pair[0]));
+      setEl('aiSlot'+pair[1]+'Status', info.configured?(info.enabled?'已配置 '+adaptiveEsc(info.model||''):'已停用'):'未配置');
+    });
     setEl('aiConsensusRate', dualAi.consensus_rules?adaptiveValue(dualAi.consensus_rules.weight_magnitude_ratio*100,'%'): '—');
     /* 加载modlens状态 */
     try{
@@ -506,8 +508,8 @@ export async function loadEvolutionStatus(){
       setEl('aiParamsVersion','默认');
     }
   }catch(e){
-    setEl('aiMiMoStatus','加载失败');
-    setEl('aiDeepSeekStatus','加载失败');
+    setEl('aiSlotAi1Status','加载失败');
+    setEl('aiSlotAi2Status','加载失败');
   }
   /* 加载调参记录 */
   try{
@@ -574,11 +576,12 @@ export function renderEvolutionMetrics(m){
 
 export function renderDualAiRuns(runs){
   if(!runs.length){setEl('aiRunsTable','<p>暂无调参记录</p>');return;}
-  var h='<table class="adaptive-table"><thead><tr><th>ID</th><th>触发</th><th>模式</th><th>状态</th><th>MiMo</th><th>DeepSeek</th><th>共识</th><th>时间</th><th>落地</th></tr></thead><tbody>';
+  var h='<table class="adaptive-table"><thead><tr><th>ID</th><th>触发</th><th>模式</th><th>状态</th><th>AI 1</th><th>AI 2</th><th>共识</th><th>时间</th><th>落地</th></tr></thead><tbody>';
   runs.forEach(function(r){
     var statusClass=r.status==='consensus'?'up':(r.status==='failed'?'down':'');
-    var mimo=r.mimo||{};
-    var ds=r.deepseek||{};
+    var reviewers=r.reviewers||{};
+    var ai1=reviewers.ai1||{};
+    var ai2=reviewers.ai2||{};
     var applied=Array.isArray(r.applied_ids)?r.applied_ids:(r.applied_ids?String(r.applied_ids):null);
     var proposalCount=Array.isArray(r.merged_proposals)?r.merged_proposals.length:0;
     var action='';
@@ -593,8 +596,8 @@ export function renderDualAiRuns(runs){
       +'<td>'+adaptiveEsc(r.trigger)+'</td>'
       +'<td>'+adaptiveEsc(r.mode)+'</td>'
       +'<td class="'+statusClass+'">'+adaptiveEsc(r.status)+'</td>'
-      +'<td>'+adaptiveEsc(mimo.status)+(mimo.latency_ms?' ('+mimo.latency_ms+'ms)':'')+'</td>'
-      +'<td>'+adaptiveEsc(ds.status)+(ds.latency_ms?' ('+ds.latency_ms+'ms)':'')+'</td>'
+      +'<td>'+adaptiveEsc(ai1.status)+(ai1.latency_ms?' ('+ai1.latency_ms+'ms)':'')+'</td>'
+      +'<td>'+adaptiveEsc(ai2.status)+(ai2.latency_ms?' ('+ai2.latency_ms+'ms)':'')+'</td>'
       +'<td>'+adaptiveEsc(r.consensus_reason||'').substring(0,40)+'</td>'
       +'<td>'+adaptiveEsc(r.created_at||'').replace('T',' ').substring(0,19)+'</td>'
       +'<td>'+action+'</td>'
