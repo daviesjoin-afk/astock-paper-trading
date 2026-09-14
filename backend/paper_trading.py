@@ -1338,9 +1338,9 @@ def _rebuild_realized_pnl(conn):
 
 
 @contextmanager
-def _db(immediate=False):
+def _db(immediate=False, hot_path=False):
     """获取数据库连接（兼容包装，实际实现位于 ``paper_storage``）。"""
-    with PST.db(DB_PATH, immediate=immediate) as conn:
+    with PST.db(DB_PATH, immediate=immediate, hot_path=hot_path) as conn:
         yield conn
 
 
@@ -1349,21 +1349,21 @@ def _wal_checkpoint():
     PST.wal_checkpoint(DB_PATH)
 
 
-def _execute_with_retry(conn, sql, params=(), max_retries=3):
+def _execute_with_retry(conn, sql, params=(), max_retries=3, hot_path=True):
     """执行 SQL 并在数据库锁定时重试（兼容包装）。"""
-    return PST.execute_with_retry(conn, sql, params=params, max_retries=max_retries)
+    return PST.execute_with_retry(conn, sql, params=params, max_retries=max_retries, hot_path=hot_path)
 
 
-def _executemany_with_retry(conn, sql, params_list, max_retries=3):
+def _executemany_with_retry(conn, sql, params_list, max_retries=3, hot_path=True):
     """执行批量 SQL 并在数据库锁定时重试（兼容包装）。"""
     return PST.executemany_with_retry(
-        conn, sql, params_list, max_retries=max_retries
+        conn, sql, params_list, max_retries=max_retries, hot_path=hot_path
     )
 
 
-def _commit_with_retry(conn, max_retries=3):
+def _commit_with_retry(conn, max_retries=3, hot_path=True):
     """提交事务并在数据库锁定时重试（兼容包装）。"""
-    return PST.commit_with_retry(conn, max_retries=max_retries)
+    return PST.commit_with_retry(conn, max_retries=max_retries, hot_path=hot_path)
 
 @contextmanager
 def _db_readonly():

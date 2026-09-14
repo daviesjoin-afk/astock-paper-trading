@@ -276,6 +276,9 @@ class ReliabilityFailureInjectionTests(unittest.TestCase):
 
         # 窗口 1 (16:45)：模拟资源锁冲突被拒 (未完成)
         self.assertFalse(EL.is_today_generation_completed(conn, today))
+        # 验证资源锁冲突时上报 deferred 并返回重试退出码 75
+        deferred_rep = {"status": "deferred", "reason": "heavy_job_busy", "retryable": True}
+        self.assertEqual(ELR._result_exit_code(deferred_rep), 75)
 
         # 窗口 2 (17:05)：获得锁并成功执行一轮自进化
         class FastSuccessBackend(EL.Backend):
@@ -311,6 +314,10 @@ class ReliabilityFailureInjectionTests(unittest.TestCase):
         # runner 跳过，返回 0，数据库未生成任何新代数
         gen_count = conn.execute("SELECT COUNT(*) FROM evolution_loop_state").fetchone()[0]
         self.assertEqual(gen_count, 1)
+
+        # 非交易日守护：休市日报告 status: skipped, reason: non_trading_day 返回退出码 0
+        non_trade_rep = {"status": "skipped", "reason": "non_trading_day", "completed": 0, "failed": 0, "interrupted": 0, "total_stage_errors": 0}
+        self.assertEqual(ELR._result_exit_code(non_trade_rep), 0)
 
     def test_f6_malformed_evolution_report_fails_closed(self):
         """F6: malformed evolution report -> runner fail closed with exit code != 0."""

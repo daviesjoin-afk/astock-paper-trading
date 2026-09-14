@@ -50,13 +50,15 @@ def sqlite_busy_backoff(attempt: int, hot_path: bool = False) -> float:
 
 
 @contextmanager
-def db(db_path, immediate=False):
+def db(db_path, immediate=False, hot_path=False):
     """获取数据库连接并保证事务在关闭前明确提交或回滚。"""
-    conn = sqlite3.connect(db_path, timeout=120)
+    timeout = 1.0 if hot_path else 120.0
+    busy_timeout_ms = 800 if hot_path else 60000
+    conn = sqlite3.connect(db_path, timeout=timeout)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys=ON")
     conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA busy_timeout=60000")
+    conn.execute(f"PRAGMA busy_timeout={busy_timeout_ms}")
     conn.execute("PRAGMA synchronous=NORMAL")
     conn.execute("PRAGMA cache_size=-32000")
     conn.execute("PRAGMA temp_store=MEMORY")
@@ -80,7 +82,7 @@ def db(db_path, immediate=False):
             if is_sqlite_busy_error(exc):
                 # 锁冲突：写入仍在事务里，必须原样重试；二次失败先回滚，
                 # 不能让 close() 对半提交状态做隐式处理。
-                time.sleep(sqlite_busy_backoff(0, hot_path=immediate))
+                time.sleep(sqlite_busy_backoff(0, hot_path=hot_path or immediate))
                 try:
                     conn.commit()
                 except Exception:
@@ -115,31 +117,31 @@ def wal_checkpoint(db_path):
         pass
 
 
-def execute_with_retry(conn, sql, params=(), max_retries=3):
+def execute_with_retry(conn, sql, params=(), max_retries=3, hot_path=True):
     """执行 SQL，并在数据库锁定时按递增间隔重试。"""
     for attempt in range(max_retries):
         try:
             return conn.execute(sql, params)
         except Exception as exc:
             if is_sqlite_busy_error(exc) and attempt < max_retries - 1:
-                time.sleep(sqlite_busy_backoff(attempt, hot_path=True))
+                time.sleep(sqlite_busy_backoff(attempt, hot_path=hot_path))
                 continue
             raise
 
 
-def executemany_with_retry(conn, sql, params_list, max_retries=3):
+def executemany_with_retry(conn, sql, params_list, max_retries=3, hot_path=True):
     """批量执行 SQL，并在数据库锁定时按递增间隔重试。"""
     for attempt in range(max_retries):
         try:
             return conn.executemany(sql, params_list)
         except Exception as exc:
             if is_sqlite_busy_error(exc) and attempt < max_retries - 1:
-                time.sleep(sqlite_busy_backoff(attempt, hot_path=True))
+                time.sleep(sqlite_busy_backoff(attempt, hot_path=hot_path))
                 continue
             raise
 
 
-def commit_with_retry(conn, max_retries=3):
+def commit_with_retry(conn, max_retries=3, hot_path=True):
     """提交事务，并在数据库锁定时按递增间隔重试。"""
     for attempt in range(max_retries):
         try:
@@ -147,7 +149,7 @@ def commit_with_retry(conn, max_retries=3):
             return
         except Exception as exc:
             if is_sqlite_busy_error(exc) and attempt < max_retries - 1:
-                time.sleep(sqlite_busy_backoff(attempt, hot_path=True))
+                time.sleep(sqlite_busy_backoff(attempt, hot_path=hot_path))
                 continue
             raise
 

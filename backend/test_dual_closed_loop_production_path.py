@@ -68,7 +68,7 @@ class DualClosedLoopProductionPathTests(OfflinePaperEnv, unittest.TestCase):
             res_a = EA.create_candidate(
                 conn,
                 initial_params,
-                strategy_id=STRATEGY_ID,
+                strategy_id=None,
                 source="manual_init",
                 reason="seed version A",
                 evidence_count=20,
@@ -175,68 +175,36 @@ class DualClosedLoopProductionPathTests(OfflinePaperEnv, unittest.TestCase):
             self.assertEqual(int(remaining_pos["n"]), 0, "持仓全清")
 
         # ─────────────────────────────────────────────────────────────────
-        # 5. 自进化闭环：基于真实运行环境驱动（Backend 产生候选 Candidate B）
+        # 5. 自进化闭环：直接使用生产适配器 ProductionBackend（基于真实交易证据）
         # ─────────────────────────────────────────────────────────────────
-        class AcceptanceEvolutionBackend(EL.Backend):
-            def observe(self, conn, generation, ctx):
-                active = EA.resolve_effective(conn, strategy_id=STRATEGY_ID)["active"]
-                return {
-                    "params_id": active["id"],
-                    "params": active["params"],
-                    "has_data": True,
-                    "sample_count": 10,
-                }
-
-            def evaluate(self, conn, generation, ctx):
-                return {"intelligence_score": 0.85}
-
-            def mutate(self, conn, generation, ctx):
-                # 提出改进候选参数 B (保守收紧 hold_bias: 0.10 -> 0.12)
-                active = EA.resolve_effective(conn, strategy_id=STRATEGY_ID)["active"]
-                mutated = dict(active["params"])
-                mutated["hold_bias"] = 0.12
-                res = EA.create_candidate(
-                    conn,
-                    mutated,
-                    strategy_id=STRATEGY_ID,
-                    source="challenger_promotion",
-                    reason=f"gen_{generation}_optimization",
-                    parent_id=ctx["params_id_start"],
-                    evidence_count=20,
-                    validate=False,
-                )
-                return {
-                    "mutated": True,
-                    "active_params_id": ctx["params_id_start"],
-                    "candidate_params_id": res["params_id"],
-                    "candidate_validation_state": "candidate",
-                }
-
-            def validate(self, conn, generation, ctx):
-                cand_id = ctx.get("candidate_params_id")
-                val_res = EA.validate_candidate(conn, cand_id)
-                return {
-                    "valid": val_res["valid"],
-                    "candidate_params_id": cand_id,
-                    "candidate_validation_state": "validated",
-                }
-
-            def apply(self, conn, generation, ctx):
-                # 严格遵守契约：apply 绝不自动激活！active 保持不变
-                return {
-                    "applied": False,
-                    "active_params_id_start": ctx["params_id_start"],
-                    "active_params_id_end": ctx["params_id_start"],
-                    "pending_activation": True,
-                    "candidate_params_id": ctx.get("candidate_params_id"),
-                }
-
         with self._conn() as conn:
+            # 真实闭环审计与证据落库：将真实成交/平仓产生的交易证据写入 evolution_tracking
+            for i in range(6):
+                tid = SE.track_run(
+                    conn,
+                    run_id=100 + i,
+                    trigger="trade_cycle_attribution",
+                    mode="production_acceptance",
+                    status="consensus",
+                    market_regime="trend",
+                    applied=True,
+                    applied_count=len(fills),
+                    mimo_confidence=0.85,
+                    deepseek_confidence=0.88,
+                )
+                SE.evaluate_run(
+                    conn,
+                    tracking_id=tid,
+                    eval_score=0.42,
+                    eval_detail={"fills": len(fills), "remaining_pos": 0},
+                )
+
             EL.ensure_loop_schema(conn)
-            loop_rep = EL.run_loop(conn, AcceptanceEvolutionBackend(), generations=1)
+            loop_rep = EL.run_loop(conn, EL.ProductionBackend(), generations=1)
 
         self.assertEqual(loop_rep["generations_run"], 1)
         self.assertEqual(loop_rep["completed"], 1)
+        self.assertEqual(loop_rep["total_stage_errors"], 0)
 
         # ─────────────────────────────────────────────────────────────────
         # 6. 不变量断言：未显式激活前，Runtime 必须继续读取并使用 Active Version A
@@ -273,7 +241,7 @@ class DualClosedLoopProductionPathTests(OfflinePaperEnv, unittest.TestCase):
 
             new_active = EA.resolve_effective(conn, strategy_id=STRATEGY_ID)["active"]
             self.assertEqual(new_active["id"], cand_b_id)
-            self.assertEqual(new_active["params"]["hold_bias"], 0.12)
+            self.assertNotEqual(new_active["id"], cand_a_id)
 
             # ─────────────────────────────────────────────────────────────────
             # 8. 下一轮 Runtime 观测与历史审计完整性断言
@@ -281,7 +249,7 @@ class DualClosedLoopProductionPathTests(OfflinePaperEnv, unittest.TestCase):
             history = conn.execute(
                 "SELECT action, from_pointer_params_id, to_params_id, actor FROM evolution_activation_history "
                 "WHERE scope_key=? ORDER BY id ASC",
-                (f"strategy:{STRATEGY_ID}",),
+                (EA.SCOPE_GLOBAL,),
             ).fetchall()
             self.assertEqual(len(history), 2)
             self.assertEqual(history[0]["action"], "activate")

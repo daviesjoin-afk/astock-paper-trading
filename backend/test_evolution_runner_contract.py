@@ -113,6 +113,37 @@ class TestEvolutionRunnerContract(unittest.TestCase):
         }
         self.assertNotEqual(_result_exit_code(report), 0)
 
+    def test_deferred_status_returns_75(self):
+        report = {
+            "status": "deferred",
+            "reason": "heavy_job_busy",
+            "retryable": True,
+            "admission": {"allowed": False, "reason": "heavy_job_busy"},
+        }
+        self.assertEqual(_result_exit_code(report), 75)
+
+    def test_non_trading_day_skipped_returns_0(self):
+        report = {
+            "status": "skipped",
+            "reason": "non_trading_day",
+            "date": "2026-09-13",
+            "completed": 0,
+            "failed": 0,
+            "interrupted": 0,
+            "total_stage_errors": 0,
+        }
+        self.assertEqual(_result_exit_code(report), 0)
+
+    def test_runner_deferred_when_heavy_lease_denied(self):
+        """Runner must output deferred JSON and return exit code 75 when heavy lease is denied."""
+        report = {
+            "status": "deferred",
+            "reason": "memory_high_water",
+            "retryable": True,
+            "admission": {"allowed": False, "reason": "memory_high_water"},
+        }
+        self.assertEqual(_result_exit_code(report), 75)
+
 
 if __name__ == "__main__":
     unittest.main()

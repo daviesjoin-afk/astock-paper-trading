@@ -15,12 +15,14 @@
    ``run_loop`` 会先 ``_resume_pending`` 续跑被中断的那一代，绝不丢代、绝不死等。
 2. 不卡死：每代受 ``time_budget_seconds`` 约束；缺数据 / 样本不足时阶段进入
    ``skipped``（带原因），而不是阻塞或抛错中止整轮。
-3. 数据流不中断：阶段间通过检查点表 + ``evolution_generation`` 表传递参数版本与
-   评估快照；APPLY 把新参数版本写回，下一轮 OBSERVE 即在新参数下观测。
-4. 整轮异常恢复：每个阶段独立 try/except，异常被记入 ``evolution_loop_log``，
-   标记 ``failed`` 后**整轮继续**（进入下一阶段 / 下一轮），并通过 ``_recover``
-   做隔离（回滚半成品参数、重置瞬时态）。同一代失败超过 ``MAX_GEN_ATTEMPTS``
-   才判定永久 ``failed``，避免无限重试。
+3. 生命周期严格隔离（candidate != validated != active != latest）：
+   MUTATE 阶段产出候选参数（validation_state=candidate），VALIDATE 阶段跑边界与画像校验（validation_state=validated），
+   APPLY 阶段记录待激活状态（pending_activation=True）。APPLY 绝不自动激活参数；生效指针保持不变，
+   必须由显式审核/审批后通过 ``activate_params_candidate`` 推进，防止未经验证的突变直接污染实盘运行时。
+4. 故障隔离与因果阻断（Fail-Closed）：
+   每个阶段独立监控与落盘；上游阶段若发生异常（如 EVALUATE 或 MUTATE 崩溃），直接阻断下游阶段执行
+   （下游标记 skipped_upstream_failure_*），并将本代标记为 interrupted，拒绝将失败代伪装为 completed，
+   防止脏状态蔓延。同一代失败超过 ``MAX_GEN_ATTEMPTS`` 才判定永久 ``failed``，避免无限重试。
 5. 状态自检：``self_check`` 在每个阶段前校验前置条件（数据新鲜度、样本量、
    边界合法性），不健康则降级执行而非崩。
 6. 参数动态演化：MUTATE 阶段调用 ``self_evolution.auto_evolve_if_needed``，
@@ -50,8 +52,6 @@ STAGES = ("observe", "evaluate", "mutate", "validate", "apply")
 
 # 单代最大重试次数（含续跑），超过则永久 failed，防止无限重试。
 MAX_GEN_ATTEMPTS = 3
-# 阶段级自愈后，是否允许在异常时继续推进到下一阶段（best-effort）。
-CONTINUE_AFTER_STAGE_FAILURE = True
 
 EVOLUTION_VERSION = "evolution-loop-v1"
 

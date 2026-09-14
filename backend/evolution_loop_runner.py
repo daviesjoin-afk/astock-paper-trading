@@ -18,12 +18,15 @@
 （如每个交易日收盘后），由 time-budget 保证不跨时段久占。
 """
 import argparse
+import datetime as dt
 import json
 import sqlite3
 
 import evolution_loop as EL
 from evolution_loop import ProductionBackend
+from resource_guard import heavy_job_lease
 import self_evolution as SE  # B1：接线确保 self_evolution 表存在且已有初始参数版本
+import universe as U
 
 
 def _result_exit_code(report) -> int:
@@ -46,6 +49,8 @@ def _result_exit_code(report) -> int:
 
     # Check explicit status
     status = str(report.get("status") or "").strip().lower()
+    if status == "deferred":
+        return 75
     if status in ("already_done", "skipped", "noop", "no-op"):
         return 0
     if status in ("error", "failed", "interrupted"):
@@ -139,31 +144,67 @@ def main() -> int:
             print(json.dumps(status, ensure_ascii=False, indent=2, default=str))
             return 0
 
-        if args.daily and EL.is_today_generation_completed(conn):
-            report = {
-                "status": "already_done",
-                "reason": "already_done",
-                "date": EL._now()[:10],
-                "generations_run": 0,
-                "completed": 0,
-                "interrupted": 0,
-                "failed": 0,
-                "total_stage_errors": 0,
-                "total_stages_skipped": 0,
-                "message": "Today's evolution generation already completed",
-            }
+        if args.daily:
+            today_cn = dt.datetime.now(dt.timezone(dt.timedelta(hours=8))).date()
+            if not U.is_trade_day(today_cn):
+                report = {
+                    "status": "skipped",
+                    "reason": "non_trading_day",
+                    "date": today_cn.isoformat(),
+                    "generations_run": 0,
+                    "completed": 0,
+                    "interrupted": 0,
+                    "failed": 0,
+                    "total_stage_errors": 0,
+                    "total_stages_skipped": 0,
+                    "message": f"{today_cn} is not an A-share trading day",
+                }
+                print(json.dumps(report, ensure_ascii=False, indent=2, default=str))
+                return _result_exit_code(report)
+
+            if EL.is_today_generation_completed(conn):
+                report = {
+                    "status": "already_done",
+                    "reason": "already_done",
+                    "date": today_cn.isoformat(),
+                    "generations_run": 0,
+                    "completed": 0,
+                    "interrupted": 0,
+                    "failed": 0,
+                    "total_stage_errors": 0,
+                    "total_stages_skipped": 0,
+                    "message": "Today's evolution generation already completed",
+                }
+                print(json.dumps(report, ensure_ascii=False, indent=2, default=str))
+                return _result_exit_code(report)
+
+        with heavy_job_lease("evolution-loop") as admission:
+            if not admission.get("allowed"):
+                report = {
+                    "status": "deferred",
+                    "reason": admission.get("reason"),
+                    "retryable": True,
+                    "admission": admission,
+                    "generations_run": 0,
+                    "completed": 0,
+                    "interrupted": 0,
+                    "failed": 0,
+                    "total_stage_errors": 0,
+                    "total_stages_skipped": 0,
+                    "message": f"Evolution loop deferred: {admission.get('reason')}",
+                }
+                print(json.dumps(report, ensure_ascii=False, indent=2, default=str))
+                return _result_exit_code(report)
+
+            report = EL.run_loop(
+                conn,
+                ProductionBackend(),
+                generations=args.generations,
+                time_budget_seconds=args.time_budget,
+                resume=not args.no_resume,
+            )
             print(json.dumps(report, ensure_ascii=False, indent=2, default=str))
             return _result_exit_code(report)
-
-        report = EL.run_loop(
-            conn,
-            ProductionBackend(),
-            generations=args.generations,
-            time_budget_seconds=args.time_budget,
-            resume=not args.no_resume,
-        )
-        print(json.dumps(report, ensure_ascii=False, indent=2, default=str))
-        return _result_exit_code(report)
     except Exception as exc:
         err_report = {
             "status": "failed",
