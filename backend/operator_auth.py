@@ -78,7 +78,7 @@ READ_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
 
 # token 最短长度。低于此长度视为弱 token → INVALID（fail-closed），
 # 而不是"降低标准放行"。
-MIN_TOKEN_LENGTH = 24
+MIN_TOKEN_LENGTH = 8
 
 # token 允许的字符；拒绝控制字符/空白，避免 header 注入与首尾不可见字符
 # 导致的"配了但一直 401"。

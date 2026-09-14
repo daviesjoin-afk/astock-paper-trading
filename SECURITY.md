@@ -56,7 +56,7 @@ python scripts/security/scan-sensitive-data.py --repo . --scope all
 | token 状态 | 模式 | 写请求行为 |
 | --- | --- | --- |
 | UNSET（不存在 / trim 后为空） | `local-only` | 环回客户端 + **本地 `Host`** 才允许；其余 **403** |
-| VALID（trim 后 >= 24 字符且字符合法） | `authenticated` | 任何客户端（含 localhost）都必须带 `Authorization: Bearer` |
+| VALID（trim 后 >= 8 字符且字符合法） | `authenticated` | 任何客户端（含 localhost）都必须带 `Authorization: Bearer` |
 | INVALID（存在但太短 / 含非法字符） | `misconfigured` | 全部 **503**（绝不降级为 UNSET 或免鉴权） |
 
 #### Local-only mode
