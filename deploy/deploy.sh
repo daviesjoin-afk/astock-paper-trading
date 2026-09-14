@@ -48,11 +48,9 @@ fi
 #    覆盖服务器手工版后出现"路径指向不存在的目录 → 所有任务静默失败"）。
 #    2026-09-08 事故：仓库模板路径 /opt/astock-codex 覆盖了服务器 /root/codex
 #    手工版，/opt 下无 deploy/reports，11:06 起盘中监控全部秒失败。
-if [[ "$(id -u)" == "0" && -d /etc/cron.d ]]; then
+if [[ "$(id -u)" == "0" && -d "${ASTOCK_CRON_DIR:-/etc/cron.d}" ]]; then
   echo "▶ [5/6] 同步 cron（路径随部署目录 $ROOT）..."
-  cp -a /etc/cron.d/astock-codex "/etc/cron.d/astock-codex.bak-$(date +%Y%m%d%H%M%S)" 2>/dev/null || true
-  sed "s|/opt/astock-codex|$ROOT|g" deploy/astock-codex.cron > /etc/cron.d/astock-codex
-  chmod 644 /etc/cron.d/astock-codex
+  ASTOCK_DEPLOY_ROOT="$ROOT" bash deploy/sync-cron.sh
 else
   echo "▶ [5/6] 跳过 cron 同步（非 root 或无 /etc/cron.d）"
 fi
