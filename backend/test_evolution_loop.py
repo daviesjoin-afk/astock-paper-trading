@@ -74,6 +74,28 @@ def _mem_conn():
 # 测试
 # ──────────────────────────────────────────────────────────────────────────
 class EvolutionLoopTests(unittest.TestCase):
+    def test_daily_completion_requires_completed_state_even_with_snapshot(self):
+        today = "2026-09-14"
+        for status in ("interrupted", "failed", "running", "completed"):
+            with self.subTest(status=status):
+                conn = _mem_conn()
+                self.addCleanup(conn.close)
+                EL.ensure_loop_schema(conn)
+                conn.execute(
+                    """INSERT INTO evolution_loop_state
+                       (generation, status, finished_at) VALUES (1, ?, ?)""",
+                    (status, f"{today}T16:45:00"),
+                )
+                conn.execute(
+                    """INSERT INTO evolution_generation
+                       (generation, created_at) VALUES (1, ?)""",
+                    (f"{today}T16:45:00",),
+                )
+                self.assertIs(
+                    EL.is_today_generation_completed(conn, today_str=today),
+                    status == "completed",
+                )
+
     def test_full_multi_generation_run(self):
         """连续跑 5 代，全部完成且无异常、无丢失。"""
         conn = _mem_conn()

@@ -58,6 +58,45 @@ class DeterministicBackend(EL.Backend):
 
 
 class TestEvolutionRunnerContract(unittest.TestCase):
+    def test_failed_snapshot_does_not_consume_next_daily_retry_window(self):
+        """A failed generation snapshot must let the next daily runner enter run_loop."""
+        import sqlite3
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as d:
+            db_path = os.path.join(d, "failed_snapshot.sqlite3")
+            conn = sqlite3.connect(db_path)
+            try:
+                EL.ensure_loop_schema(conn)
+                conn.execute(
+                    """INSERT INTO evolution_loop_state
+                       (generation, status, finished_at) VALUES (1, 'failed', ?)""",
+                    (f"{EL._now()[:10]}T16:45:00",),
+                )
+                conn.execute(
+                    """INSERT INTO evolution_generation
+                       (generation, created_at) VALUES (1, ?)""",
+                    (f"{EL._now()[:10]}T16:45:00",),
+                )
+                conn.commit()
+                self.assertFalse(EL.is_today_generation_completed(conn))
+            finally:
+                conn.close()
+
+            @contextmanager
+            def lease_granted(name):
+                yield {"allowed": True}
+
+            report = {
+                "completed": 1, "failed": 0, "interrupted": 0,
+                "total_stage_errors": 0, "generations_run": 1,
+                "details": [{"generation": 2, "status": "completed"}],
+            }
+            with patch.object(U, "is_trade_day", return_value=True), \
+                 patch("evolution_loop_runner.heavy_job_lease", side_effect=lease_granted), \
+                 patch.object(EL, "run_loop", return_value=report) as mock_run:
+                self.assertEqual(main(["--db", db_path, "--daily"]), 0)
+                mock_run.assert_called_once()
+
     def test_all_completed_returns_exit_0(self):
         report = {
             "completed": 1,

@@ -19,6 +19,7 @@ from __future__ import annotations
 import ast
 import os
 import re
+import subprocess
 import sys
 import unittest
 
@@ -112,6 +113,26 @@ class ZeroByteSourceTests(unittest.TestCase):
             [], offenders,
             "出现 0 字节生产源码；删除，或在 ZERO_BYTE_ALLOWLIST 里显式登记原因",
         )
+
+
+class CronWrapperModeTests(unittest.TestCase):
+    def test_evolution_cron_wrapper_is_executable(self):
+        path = os.path.join(ROOT, "deploy", "run_evolution_loop.sh")
+        self.assertTrue(os.path.isfile(path))
+        if os.path.isdir(os.path.join(ROOT, ".git")):
+            result = subprocess.run(
+                ["git", "ls-files", "-s", "--", "deploy/run_evolution_loop.sh"],
+                cwd=ROOT, check=True, capture_output=True, text=True,
+            )
+            self.assertTrue(
+                result.stdout.startswith("100755 "),
+                "deploy/run_evolution_loop.sh is invoked directly by cron and must have Git mode 100755",
+            )
+        else:
+            self.assertTrue(
+                os.access(path, os.X_OK),
+                "deploy/run_evolution_loop.sh is invoked directly by cron and must be executable",
+            )
 
 
 class RemovedArtifactTests(unittest.TestCase):

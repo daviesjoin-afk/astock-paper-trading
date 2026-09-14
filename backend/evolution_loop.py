@@ -805,10 +805,6 @@ def is_today_generation_completed(conn: sqlite3.Connection, today_str: Optional[
     if row is not None:
         return True
 
-    gen_row = conn.execute(
-        """SELECT generation FROM evolution_generation
-           WHERE created_at >= ? AND created_at < ?
-           LIMIT 1""",
-        (f"{target_date}T00:00:00", f"{target_date}T23:59:59.999999")
-    ).fetchone()
-    return gen_row is not None
+    # evolution_generation is written even for interrupted/failed attempts.
+    # Only a completed state can satisfy the daily idempotency guard.
+    return False
