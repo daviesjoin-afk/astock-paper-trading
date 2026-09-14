@@ -232,7 +232,7 @@ require an operator credential, while `GET` is read-only and needs none. There a
 - **No token configured** (local-only): only a loopback client **with a loopback `Host`** may write;
   everything else gets `403` (`Host` must be `localhost` or a loopback IP literal — this blocks DNS
   rebinding).
-- **Valid token configured** (>= 24 chars, authenticated): every client, including localhost, must
+- **Valid token configured** (>= 8 chars, authenticated): every client, including localhost, must
   send the standard Authorization header using the Bearer scheme (value: `Bearer <credential>`).
 - **Invalid token** (misconfigured): all writes get `503`.
 

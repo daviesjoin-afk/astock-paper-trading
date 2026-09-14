@@ -268,7 +268,7 @@ HTTP 控制面有统一的操作员边界（PR-2）：`POST`/`PUT`/`PATCH`/`DELE
 
 - **未配置 token**（local-only）：仅"本机环回地址 + 本地 `Host`"可写，其余写请求
   `403`（`Host` 必须是 `localhost` 或环回 IP 字面量，用以挡住 DNS rebinding）；
-- **配置合法 token**（>= 24 字符，authenticated）：任何客户端的写请求都必须带
+- **配置合法 token**（>= 8 字符，authenticated）：任何客户端的写请求都必须带
   标准 Authorization 头（Bearer 方案，值形如「Bearer <凭据>」），localhost 无豁免；
 - **token 非法**（misconfigured）：所有写请求 `503`。
 

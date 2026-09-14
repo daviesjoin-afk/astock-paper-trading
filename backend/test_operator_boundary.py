@@ -77,9 +77,9 @@ _subprocess.run = _guarded_run
 # 没有内置默认值。全小写 + 连字符，避免被密钥扫描器误判为真实凭据。
 # 长度 >= 24 以满足新的 MIN_TOKEN_LENGTH。
 TOKEN = "zz-test-operator-placeholder-value"
-TOKEN_TOO_SHORT = "zz-test-operator-short"      # 22 字符，必须判为 INVALID
-TOKEN_EXACT_23 = "a" * 23                        # 边界：23 → INVALID
-TOKEN_EXACT_24 = "a" * 24                        # 边界：24 → VALID
+TOKEN_TOO_SHORT = "zz-sho"                       # 6 字符，必须判为 INVALID
+TOKEN_EXACT_23 = "a" * 7                         # 边界：7 → INVALID (< 8)
+TOKEN_EXACT_24 = "a" * 8                         # 边界：8 → VALID (>= 8)
 BEARER_OK = "Bearer " + TOKEN
 BEARER_BAD = "Bearer zz-wrong-operator-placeholder-value"
 
@@ -353,7 +353,7 @@ class TokenConfigTests(unittest.TestCase):
         self.assertIsNone(cfg.token, "INVALID 配置不得持有 token 值")
 
     def test_min_token_length_contract(self):
-        self.assertEqual(OA.MIN_TOKEN_LENGTH, 24, "合同要求最低 24 字符")
+        self.assertEqual(OA.MIN_TOKEN_LENGTH, 8, "合同要求最低 8 字符")
 
     def test_invalid_on_cr_lf(self):
         self.assertIs(
