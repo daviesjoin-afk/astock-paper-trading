@@ -603,16 +603,17 @@ def run_dual_ai_tuning(connect_factory, paper_db_path, snapshot_paths, evidence_
             # 绝不让追踪/进化库的异常阻塞调参主流程）。
             try:
                 import self_evolution as _SE
-                _SE.ensure_schema(conn)
-                _evolution_params = _SE.get_current_params(conn).get("params") or {}
-                # 策略级进化画像：逐账户叠加策略专属参数版本。
-                _evolution_by_account = {}
-                for _account_id in (accounts_map or {}):
-                    try:
-                        _evolution_by_account[_account_id] = _SE.get_strategy_params(
-                            conn, _account_id).get("params") or {}
-                    except Exception:
-                        continue
+                with connect_factory() as conn:
+                    _SE.ensure_schema(conn)
+                    _evolution_params = _SE.get_current_params(conn).get("params") or {}
+                    # 策略级进化画像：逐账户叠加策略专属参数版本。
+                    _evolution_by_account = {}
+                    for _account_id in (accounts_map or {}):
+                        try:
+                            _evolution_by_account[_account_id] = _SE.get_strategy_params(
+                                conn, _account_id).get("params") or {}
+                        except Exception:
+                            continue
             except Exception:
                 _evolution_params = {}
                 _evolution_by_account = {}

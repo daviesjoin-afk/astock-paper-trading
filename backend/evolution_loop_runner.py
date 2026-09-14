@@ -18,12 +18,71 @@
 （如每个交易日收盘后），由 time-budget 保证不跨时段久占。
 """
 import argparse
+import datetime as dt
 import json
 import sqlite3
 
 import evolution_loop as EL
 from evolution_loop import ProductionBackend
+from resource_guard import heavy_job_lease
 import self_evolution as SE  # B1：接线确保 self_evolution 表存在且已有初始参数版本
+import universe as U
+
+
+def _result_exit_code(report) -> int:
+    """Map evolution report to a scheduler-visible process exit code.
+
+    Success (exit 0):
+      - completed > 0 and failed == 0 and interrupted == 0 and total_stage_errors == 0
+      - or legitimate expected business states (e.g. status in ('already_done', 'skipped', 'noop'))
+        with failed == 0 and interrupted == 0 and total_stage_errors == 0.
+
+    Failure (exit non-zero):
+      - failed > 0
+      - interrupted > 0
+      - total_stage_errors > 0
+      - malformed report / not a dict / missing required metrics
+      - uncaught exceptions / DB errors / lifecycle corruption
+    """
+    if not isinstance(report, dict):
+        return 1
+
+    # Check explicit status
+    status = str(report.get("status") or "").strip().lower()
+    if status == "deferred":
+        return 75
+    if status in ("already_done", "skipped", "noop", "no-op"):
+        return 0
+    if status in ("error", "failed", "interrupted"):
+        return 1
+
+    # Check required fields
+    for field in ("completed", "failed", "interrupted", "total_stage_errors"):
+        if field not in report:
+            return 1
+
+    failed = int(report.get("failed") or 0)
+    interrupted = int(report.get("interrupted") or 0)
+    stage_errors = int(report.get("total_stage_errors") or 0)
+    completed = int(report.get("completed") or 0)
+
+    if failed > 0 or interrupted > 0 or stage_errors > 0:
+        return 1
+
+    if completed > 0:
+        return 0
+
+    # If completed == 0 and no errors:
+    # Check if this was a valid no-data/skip situation or legitimate reason
+    if report.get("reason") in ("already_done", "insufficient_data", "no_data", "budget_exceeded"):
+        return 0
+    details = report.get("details")
+    if isinstance(details, list) and len(details) > 0:
+        if all(d.get("status") in ("completed", "skipped", "noop") for d in details):
+            return 0
+
+    # Otherwise fail closed
+    return 1
 
 
 def _connect(db_path: str) -> sqlite3.Connection:
@@ -38,7 +97,7 @@ def _connect(db_path: str) -> sqlite3.Connection:
     return conn
 
 
-def main():
+def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description="自进化逻辑闭环驱动")
     parser.add_argument("--db", default=None,
                         help="SQLite 路径（默认用 paper_trading 的 DB_PATH）")
@@ -49,7 +108,9 @@ def main():
                         help="不续跑被中断的代，直接开新代")
     parser.add_argument("--status", action="store_true",
                         help="仅打印闭环状态后退出")
-    args = parser.parse_args()
+    parser.add_argument("--daily", action="store_true",
+                        help="同日幂等守卫：若当日已有完成代且无中断待续跑，直接 no-op exit 0")
+    args = parser.parse_args(argv)
 
     if args.db:
         db_path = args.db
@@ -63,24 +124,101 @@ def main():
         except Exception:
             db_path = "data_cache/adaptive_learning.sqlite3"
 
-    conn = _connect(db_path)
+    try:
+        conn = _connect(db_path)
+    except Exception as exc:
+        err_report = {
+            "status": "failed",
+            "error": f"DB initialization failed: {type(exc).__name__}: {exc}",
+            "failed": 1,
+            "interrupted": 0,
+            "completed": 0,
+            "total_stage_errors": 1,
+        }
+        print(json.dumps(err_report, ensure_ascii=False, indent=2, default=str))
+        return 1
+
     try:
         if args.status:
             status = EL.loop_status(conn)
             print(json.dumps(status, ensure_ascii=False, indent=2, default=str))
-            return
+            return 0
 
-        report = EL.run_loop(
-            conn,
-            ProductionBackend(),
-            generations=args.generations,
-            time_budget_seconds=args.time_budget,
-            resume=not args.no_resume,
-        )
-        print(json.dumps(report, ensure_ascii=False, indent=2, default=str))
+        if args.daily:
+            today_cn = dt.datetime.now(dt.timezone(dt.timedelta(hours=8))).date()
+            if not U.is_trade_day(today_cn):
+                report = {
+                    "status": "skipped",
+                    "reason": "non_trading_day",
+                    "date": today_cn.isoformat(),
+                    "generations_run": 0,
+                    "completed": 0,
+                    "interrupted": 0,
+                    "failed": 0,
+                    "total_stage_errors": 0,
+                    "total_stages_skipped": 0,
+                    "message": f"{today_cn} is not an A-share trading day",
+                }
+                print(json.dumps(report, ensure_ascii=False, indent=2, default=str))
+                return _result_exit_code(report)
+
+            if EL.is_today_generation_completed(conn):
+                report = {
+                    "status": "already_done",
+                    "reason": "already_done",
+                    "date": today_cn.isoformat(),
+                    "generations_run": 0,
+                    "completed": 0,
+                    "interrupted": 0,
+                    "failed": 0,
+                    "total_stage_errors": 0,
+                    "total_stages_skipped": 0,
+                    "message": "Today's evolution generation already completed",
+                }
+                print(json.dumps(report, ensure_ascii=False, indent=2, default=str))
+                return _result_exit_code(report)
+
+        with heavy_job_lease("evolution-loop") as admission:
+            if not admission.get("allowed"):
+                report = {
+                    "status": "deferred",
+                    "reason": admission.get("reason"),
+                    "retryable": True,
+                    "admission": admission,
+                    "generations_run": 0,
+                    "completed": 0,
+                    "interrupted": 0,
+                    "failed": 0,
+                    "total_stage_errors": 0,
+                    "total_stages_skipped": 0,
+                    "message": f"Evolution loop deferred: {admission.get('reason')}",
+                }
+                print(json.dumps(report, ensure_ascii=False, indent=2, default=str))
+                return _result_exit_code(report)
+
+            report = EL.run_loop(
+                conn,
+                ProductionBackend(),
+                generations=args.generations,
+                time_budget_seconds=args.time_budget,
+                resume=not args.no_resume,
+            )
+            print(json.dumps(report, ensure_ascii=False, indent=2, default=str))
+            return _result_exit_code(report)
+    except Exception as exc:
+        err_report = {
+            "status": "failed",
+            "error": f"Runner uncaught exception: {type(exc).__name__}: {exc}",
+            "failed": 1,
+            "interrupted": 0,
+            "completed": 0,
+            "total_stage_errors": 1,
+        }
+        print(json.dumps(err_report, ensure_ascii=False, indent=2, default=str))
+        return 1
     finally:
         conn.close()
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

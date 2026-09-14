@@ -8,8 +8,13 @@ from __future__ import annotations
 
 import os
 import sqlite3
+import sys
 import tempfile
 import unittest
+
+BACKEND = os.path.dirname(os.path.abspath(__file__))
+if BACKEND not in sys.path:
+    sys.path.insert(0, BACKEND)
 
 import evolution_loop as EL
 from evolution_loop import Backend, ProductionBackend
@@ -69,6 +74,28 @@ def _mem_conn():
 # 测试
 # ──────────────────────────────────────────────────────────────────────────
 class EvolutionLoopTests(unittest.TestCase):
+    def test_daily_completion_requires_completed_state_even_with_snapshot(self):
+        today = "2026-09-14"
+        for status in ("interrupted", "failed", "running", "completed"):
+            with self.subTest(status=status):
+                conn = _mem_conn()
+                self.addCleanup(conn.close)
+                EL.ensure_loop_schema(conn)
+                conn.execute(
+                    """INSERT INTO evolution_loop_state
+                       (generation, status, finished_at) VALUES (1, ?, ?)""",
+                    (status, f"{today}T16:45:00"),
+                )
+                conn.execute(
+                    """INSERT INTO evolution_generation
+                       (generation, created_at) VALUES (1, ?)""",
+                    (f"{today}T16:45:00",),
+                )
+                self.assertIs(
+                    EL.is_today_generation_completed(conn, today_str=today),
+                    status == "completed",
+                )
+
     def test_full_multi_generation_run(self):
         """连续跑 5 代，全部完成且无异常、无丢失。"""
         conn = _mem_conn()
@@ -107,20 +134,30 @@ class EvolutionLoopTests(unittest.TestCase):
         self.assertEqual(EL._loads(row["done_stages"], []), list(EL.STAGES))
 
     def test_stage_exception_isolated_loop_continues(self):
-        """某阶段抛异常，整轮不崩，循环继续跑完后续代。"""
+        """某阶段抛异常，整轮不崩，循环继续跑完后续代；但下游依赖阶段严格 fail-closed。"""
         conn = _mem_conn()
         self.addCleanup(conn.close)
         EL.ensure_loop_schema(conn)
         rep = EL.run_loop(conn, FakeBackend(fail_stage="evaluate"), generations=3)
-        # 三代数全部被驱动（循环未死）。
+        # 三代数全部被驱动（循环未死，runner 可继续）。
         self.assertEqual(rep["generations_run"], 3)
         self.assertGreaterEqual(rep["total_stage_errors"], 1)
-        # 即便 evaluate 失败，每代仍走完 observe/mutate/validate/apply（best-effort）。
-        for gen in (1, 2, 3):
-            ds = conn.execute(
-                "SELECT done_stages FROM evolution_loop_state WHERE generation=?", (gen,)
-            ).fetchone()[0]
-            ds = EL._loads(ds, [])
+        # 因果链守卫：第 1 代 evaluate 异常失败，下游 mutate 绝不执行，避免污染候选
+        row1 = conn.execute(
+            "SELECT status, done_stages FROM evolution_loop_state WHERE generation=1"
+        ).fetchone()
+        self.assertEqual(row1[0], "interrupted")
+        ds1 = EL._loads(row1[1], [])
+        self.assertIn("observe", ds1)
+        self.assertNotIn("mutate", ds1)
+
+        # 故障隔离性：后序代未受上一代异常污染，瞬时故障自愈后正常跑完全流程
+        for gen in (2, 3):
+            row = conn.execute(
+                "SELECT status, done_stages FROM evolution_loop_state WHERE generation=?", (gen,)
+            ).fetchone()
+            self.assertEqual(row[0], "completed")
+            ds = EL._loads(row[1], [])
             self.assertIn("observe", ds)
             self.assertIn("mutate", ds)
 
