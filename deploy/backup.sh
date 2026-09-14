@@ -64,11 +64,11 @@ printf 'created_at=%s\nsource=%s\n' "$(date -Is)" "$PROJECT_DIR" > "$DEST/backup
 # 同一天的多次部署会累积完整账本备份并填满磁盘。
 BACKUP_DAILY_ROOT="${BACKUP_ROOT:-/var/backups/astock-codex}/daily"
 mapfile -t BACKUP_DIRS < <(
-  find "$BACKUP_DAILY_ROOT" -mindepth 1 -maxdepth 1 -type d -name '20????????-????' -printf '%f\n' | sort -r
+  find "$BACKUP_DAILY_ROOT" -mindepth 1 -maxdepth 1 -type d -name '20??????-????' -printf '%f\n' | sort -r
 )
 for ((index = KEEP_COUNT; index < ${#BACKUP_DIRS[@]}; index++)); do
   stale_backup="$BACKUP_DAILY_ROOT/${BACKUP_DIRS[$index]}"
-  [[ "$stale_backup" == "$BACKUP_DAILY_ROOT"/20????????-???? ]] || {
+  [[ "$stale_backup" == "$BACKUP_DAILY_ROOT"/20??????-???? ]] || {
     echo "backup failed: 拒绝删除非标准备份目录 $stale_backup" >&2
     exit 1
   }
