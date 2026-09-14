@@ -21,7 +21,7 @@ class PaperHotpathBoundaryTests(unittest.TestCase):
     def _run_subproc(self, code: str):
         env = dict(os.environ)
         current_pp = env.get("PYTHONPATH", "")
-        env["PYTHONPATH"] = f"{BACKEND}:{current_pp}" if current_pp else BACKEND
+        env["PYTHONPATH"] = f"{BACKEND}{os.pathsep}{current_pp}" if current_pp else BACKEND
         return subprocess.run(
             [sys.executable, "-c", code],
             capture_output=True,

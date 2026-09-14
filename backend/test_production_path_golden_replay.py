@@ -996,6 +996,105 @@ class ReplayClockContractTests(OfflinePaperEnv, unittest.TestCase):
         self.assertTrue(status["checks"]["factor_cache"]["passed"], status)
         self.assertFalse(status["enabled"], status)
 
+    def test_entry_freeze_allows_current_day_factor_after_manifest_refresh(self):
+        """A recovery manifest mtime bump must not freeze a valid same-day factor."""
+        original = PT._selection_factor_manifest_signature
+        try:
+            PT._selection_factor_manifest_signature = lambda: ["manifest-updated-after-factor"]
+            status = PT._entry_freeze_status(force=True)
+        finally:
+            PT._selection_factor_manifest_signature = original
+        factor = status["checks"]["factor_cache"]
+        self.assertFalse(factor["manifest_signature_ok"], status)
+        self.assertTrue(factor["same_day_manifest_refresh_ok"], status)
+        self.assertTrue(factor["passed"], status)
+        self.assertFalse(status["enabled"], status)
+
+    def test_entry_freeze_continues_when_same_day_factor_expired(self):
+        """Even with same-day date and manifest mismatch, an expired cache must remain frozen."""
+        original_sig = PT._selection_factor_manifest_signature
+        meta_path = PT.SELECTION_META_PATH
+        with open(meta_path, "r", encoding="utf-8") as f:
+            saved_meta = json.load(f)
+        try:
+            PT._selection_factor_manifest_signature = lambda: ["mismatched-sig"]
+            expired_meta = dict(saved_meta)
+            # Set built_at to 10 days ago (exceeding SELECTION_FACTOR_MAX_CACHE_AGE_SECONDS)
+            expired_meta["built_at"] = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=10)).isoformat()
+            with open(meta_path, "w", encoding="utf-8") as f:
+                json.dump(expired_meta, f)
+            status = PT._entry_freeze_status(force=True)
+            factor = status["checks"]["factor_cache"]
+            self.assertFalse(factor["passed"], status)
+            self.assertTrue(status["enabled"], status)
+        finally:
+            PT._selection_factor_manifest_signature = original_sig
+            with open(meta_path, "w", encoding="utf-8") as f:
+                json.dump(saved_meta, f)
+
+    def test_entry_freeze_continues_when_factor_file_missing(self):
+        """If SELECTION_FACTORS_PATH is missing, must continue to freeze."""
+        original_sig = PT._selection_factor_manifest_signature
+        factors_path = PT.SELECTION_FACTORS_PATH
+        factors_bak = factors_path + ".bak"
+        try:
+            PT._selection_factor_manifest_signature = lambda: ["mismatched-sig"]
+            if os.path.exists(factors_path):
+                os.rename(factors_path, factors_bak)
+            status = PT._entry_freeze_status(force=True)
+            factor = status["checks"]["factor_cache"]
+            self.assertFalse(factor["same_day_manifest_refresh_ok"], status)
+            self.assertFalse(factor["passed"], status)
+            self.assertTrue(status["enabled"], status)
+        finally:
+            PT._selection_factor_manifest_signature = original_sig
+            if os.path.exists(factors_bak):
+                os.rename(factors_bak, factors_path)
+
+    def test_entry_freeze_continues_when_coverage_insufficient(self):
+        """If coverage drops below CANDIDATE_FACTOR_MIN_COVERAGE, must continue to freeze."""
+        original_sig = PT._selection_factor_manifest_signature
+        meta_path = PT.SELECTION_META_PATH
+        with open(meta_path, "r", encoding="utf-8") as f:
+            saved_meta = json.load(f)
+        try:
+            PT._selection_factor_manifest_signature = lambda: ["mismatched-sig"]
+            low_cov_meta = dict(saved_meta)
+            low_cov_meta["eligible_factor_coverage_pct"] = 70.0  # below 80% threshold
+            with open(meta_path, "w", encoding="utf-8") as f:
+                json.dump(low_cov_meta, f)
+            status = PT._entry_freeze_status(force=True)
+            factor = status["checks"]["factor_cache"]
+            self.assertFalse(factor["same_day_manifest_refresh_ok"], status)
+            self.assertFalse(factor["passed"], status)
+            self.assertTrue(status["enabled"], status)
+        finally:
+            PT._selection_factor_manifest_signature = original_sig
+            with open(meta_path, "w", encoding="utf-8") as f:
+                json.dump(saved_meta, f)
+
+    def test_entry_freeze_continues_when_rows_insufficient(self):
+        """If factor_rows < CANDIDATE_FACTOR_MIN_ROWS, must continue to freeze."""
+        original_sig = PT._selection_factor_manifest_signature
+        meta_path = PT.SELECTION_META_PATH
+        with open(meta_path, "r", encoding="utf-8") as f:
+            saved_meta = json.load(f)
+        try:
+            PT._selection_factor_manifest_signature = lambda: ["mismatched-sig"]
+            low_rows_meta = dict(saved_meta)
+            low_rows_meta["factor_rows"] = 0  # below CANDIDATE_FACTOR_MIN_ROWS
+            with open(meta_path, "w", encoding="utf-8") as f:
+                json.dump(low_rows_meta, f)
+            status = PT._entry_freeze_status(force=True)
+            factor = status["checks"]["factor_cache"]
+            self.assertFalse(factor["same_day_manifest_refresh_ok"], status)
+            self.assertFalse(factor["passed"], status)
+            self.assertTrue(status["enabled"], status)
+        finally:
+            PT._selection_factor_manifest_signature = original_sig
+            with open(meta_path, "w", encoding="utf-8") as f:
+                json.dump(saved_meta, f)
+
 
 if __name__ == "__main__":
     unittest.main()
