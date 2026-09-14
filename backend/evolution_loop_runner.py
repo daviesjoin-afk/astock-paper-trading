@@ -97,7 +97,7 @@ def _connect(db_path: str) -> sqlite3.Connection:
     return conn
 
 
-def main() -> int:
+def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description="自进化逻辑闭环驱动")
     parser.add_argument("--db", default=None,
                         help="SQLite 路径（默认用 paper_trading 的 DB_PATH）")
@@ -110,7 +110,7 @@ def main() -> int:
                         help="仅打印闭环状态后退出")
     parser.add_argument("--daily", action="store_true",
                         help="同日幂等守卫：若当日已有完成代且无中断待续跑，直接 no-op exit 0")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     if args.db:
         db_path = args.db

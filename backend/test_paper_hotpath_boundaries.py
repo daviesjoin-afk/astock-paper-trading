@@ -70,6 +70,52 @@ class PaperHotpathBoundaryTests(unittest.TestCase):
         self.assertIsNotNone(se)
         self.assertTrue(hasattr(se, "EVOLUTION_VERSION") or hasattr(se, "BOUNDS"))
 
+    def test_hot_path_slots_definition_and_classification(self):
+        """HOT_PATH_SLOTS must contain the SLA-critical trading slots."""
+        import paper_trading as PT
+
+        expected_hot = {"auction", "open", "risk", "intraday", "fast-entry"}
+        self.assertEqual(PT.HOT_PATH_SLOTS, expected_hot)
+
+        for slot in expected_hot:
+            self.assertTrue(PT._is_hot_path_slot(slot), f"Slot {slot} must be classified as hot path")
+            self.assertTrue(PT._is_hot_path_slot(slot.upper()), f"Slot {slot.upper()} must be case-insensitive")
+
+        cold_slots = ["close", "sync-kline", "rebuild-factors", "daily-report", "history-recovery", None, ""]
+        for slot in cold_slots:
+            self.assertFalse(PT._is_hot_path_slot(slot), f"Slot {slot} must not be classified as hot path")
+
+    def test_run_slot_wires_hot_path_profile_to_storage_db(self):
+        """run_slot must pass hot_path=True to _db on hot slots and False on cold slots."""
+        from unittest.mock import patch, MagicMock
+        import paper_trading as PT
+
+        captured_calls = []
+        real_db = PT._db
+
+        def capturing_db(*args, **kwargs):
+            captured_calls.append(kwargs.get("hot_path", False))
+            return real_db(*args, **kwargs)
+
+        with patch.object(PT, "_is_trade_weekday", return_value=False):
+            # Non-trading day returns early before DB, so let's allow trading day
+            pass
+
+        with patch.object(PT, "_is_trade_weekday", return_value=True), \
+             patch.object(PT, "_db", side_effect=capturing_db), \
+             patch.object(PT, "_assert_active_lease", return_value=None), \
+             patch.object(PT, "_claim_runtime_lease", return_value=(False, "other", "exp")):
+
+            # Run hot slot: "intraday"
+            captured_calls.clear()
+            res_intraday = PT.run_slot("intraday", force=True)
+            self.assertIn(True, captured_calls, "Hot slot 'intraday' must wire hot_path=True into _db")
+
+            # Run cold slot: "close"
+            captured_calls.clear()
+            res_close = PT.run_slot("close", force=True)
+            self.assertTrue(all(hp is False for hp in captured_calls), "Cold slot 'close' must keep hot_path=False")
+
 
 if __name__ == "__main__":
     unittest.main()

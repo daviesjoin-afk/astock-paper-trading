@@ -171,25 +171,28 @@ class ProductionBackend(Backend):
     完成；本闭环负责"编排 + 韧性 + 参数动态演化"这一层。
     """
 
-    def observe(self, conn, generation, ctx):
+    def observe(self, conn, generation, ctx=None):
         import self_evolution as SE
         cur = SE.get_current_params(conn)
         metrics = SE.get_performance_metrics(conn, 20)
+        sample_count = metrics.get("sample_count", 0)
         return {
             "params_id": cur["id"],
             "params": cur["params"],
             "metrics": metrics,
+            "samples": metrics,
             "has_data": metrics.get("has_data", False),
-            "sample_count": metrics.get("sample_count", 0),
+            "sample_count": sample_count,
+            "evidence_count": sample_count,
         }
 
-    def evaluate(self, conn, generation, ctx):
+    def evaluate(self, conn, generation, ctx=None):
         import self_evolution as SE
         metrics = SE.get_performance_metrics(conn, 20)
         score = _intelligence_score(metrics)
         return {"intelligence_score": score, "metrics": metrics}
 
-    def mutate(self, conn, generation, ctx):
+    def mutate(self, conn, generation, ctx=None):
         import self_evolution as SE
         cur = SE.get_current_params(conn)
         active_id = cur["id"]
@@ -219,9 +222,10 @@ class ProductionBackend(Backend):
             "changed_keys": result.get("changed_keys", []),
         }
 
-    def validate(self, conn, generation, ctx):
+    def validate(self, conn, generation, ctx=None):
         import self_evolution as SE
         import evolution_activation as EA
+        ctx = ctx or {}
         cur = SE.get_current_params(conn)
         active_id = cur["id"]
         cand_id = ctx.get("candidate_params_id")
@@ -256,9 +260,10 @@ class ProductionBackend(Backend):
             "params": clamped,
         }
 
-    def apply(self, conn, generation, ctx):
+    def apply(self, conn, generation, ctx=None):
         import self_evolution as SE
         import evolution_activation as EA
+        ctx = ctx or {}
         start_id = ctx.get("params_id_start")
         cur = SE.get_current_params(conn)
         end_id = cur["id"]

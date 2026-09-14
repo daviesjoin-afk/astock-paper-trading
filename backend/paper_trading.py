@@ -6,6 +6,7 @@
 """
 from __future__ import annotations
 
+import contextvars
 import datetime as dt
 import gc
 import hashlib
@@ -1031,7 +1032,17 @@ def _entry_freeze_status(force=False):
                 factor_lag == 1 and cached_coverage >= CANDIDATE_FACTOR_MIN_COVERAGE * 100
             )
             current_signature = _selection_factor_manifest_signature()
-            signature_ok = bool(current_signature and factor_meta.get("signature") == current_signature)
+            cached_signature = factor_meta.get("signature")
+            signature_ok = bool(current_signature and cached_signature == current_signature)
+
+            # 语义指纹比对：区分良性 mtime 刷新与破坏性内容变更。
+            cached_fp = cached_signature.get("content_fingerprint") if isinstance(cached_signature, dict) else None
+            curr_fp = current_signature.get("content_fingerprint") if isinstance(current_signature, dict) else None
+            semantic_fingerprint_mismatch = bool(
+                cached_fp is not None and curr_fp is not None and cached_fp != curr_fp
+            )
+            semantic_fingerprint_ok = not semantic_fingerprint_mismatch
+
             # The manifest is also updated as the recovery job records a
             # completed same-day K-line.  Its file mtime is deliberately part
             # of the signature, so that update can happen *after* a valid
@@ -1040,9 +1051,11 @@ def _entry_freeze_status(force=False):
             # proves it covers the current completed trading day and meets the
             # eligible-universe threshold.  Keep a one-day-old snapshot on
             # the stricter degraded path below; this exception is only for a
-            # current-date, bounded-age factor artifact.
+            # current-date, bounded-age factor artifact whose semantic content
+            # has not suffered a conflicting mutation.
             same_day_manifest_refresh_ok = bool(
                 not signature_ok
+                and semantic_fingerprint_ok
                 and cached_factor_date == expected_factor_date
                 and int(factor_meta.get("factor_rows") or 0) >= CANDIDATE_FACTOR_MIN_ROWS
                 and cached_coverage >= CANDIDATE_FACTOR_MIN_COVERAGE * 100
@@ -1066,6 +1079,7 @@ def _entry_freeze_status(force=False):
                                        "factor_lag": factor_lag, "degraded_fallback": bool(degraded_signature_ok and not signature_ok),
                                        "eligible_factor_coverage_pct": cached_coverage,
                                        "factor_date_ok": factor_date_ok, "manifest_signature_ok": signature_ok,
+                                       "content_fingerprint_ok": semantic_fingerprint_ok,
                                        "same_day_manifest_refresh_ok": same_day_manifest_refresh_ok,
                                        "passed": factor_ok}
         except (OSError, TypeError, ValueError, RuntimeError):
@@ -1354,11 +1368,28 @@ def _rebuild_realized_pnl(conn):
             realized = _num(order.get("amount")) - _num(order.get("fees")) - cost_amount
             conn.execute("UPDATE paper_orders SET realized_pnl=? WHERE id=?", (realized, order["id"]))
 
+HOT_PATH_SLOTS = {
+    "auction",
+    "open",
+    "risk",
+    "intraday",
+    "fast-entry",
+}
+
+
+def _is_hot_path_slot(slot: Optional[str]) -> bool:
+    """判断给定 slot 是否属于对延迟和锁等待敏感的交易热路径。"""
+    return bool(slot and str(slot).lower() in HOT_PATH_SLOTS)
+
+
+_SLOT_HOT_PATH = contextvars.ContextVar("slot_hot_path", default=False)
+
 
 @contextmanager
 def _db(immediate=False, hot_path=False):
     """获取数据库连接（兼容包装，实际实现位于 ``paper_storage``）。"""
-    with PST.db(DB_PATH, immediate=immediate, hot_path=hot_path) as conn:
+    effective_hot_path = bool(hot_path or _SLOT_HOT_PATH.get())
+    with PST.db(DB_PATH, immediate=immediate, hot_path=effective_hot_path) as conn:
         yield conn
 
 
@@ -3348,14 +3379,60 @@ def _selection_factor_cache_meta():
         return {}
 
 
+_MANIFEST_FP_CACHE = {"key": None, "fingerprint": None}
+
+
+def _compute_manifest_content_fingerprint(manifest_path=None):
+    """计算日线清单的语义内容指纹（基于排好序的 stock code, last_date, rows）。"""
+    path = manifest_path or getattr(dfc, "KLINE_MANIFEST_PATH", None)
+    if not path:
+        return None
+    try:
+        if not os.path.exists(path):
+            return None
+        stat = os.stat(path)
+        cache_key = (path, stat.st_mtime_ns, stat.st_size)
+        if _MANIFEST_FP_CACHE.get("key") == cache_key:
+            return _MANIFEST_FP_CACHE.get("fingerprint")
+        with open(path, "r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+        stocks = payload.get("stocks", {}) if isinstance(payload, dict) else {}
+        if not isinstance(stocks, dict):
+            return None
+        items = []
+        for code in sorted(stocks.keys()):
+            entry = stocks[code]
+            if isinstance(entry, dict):
+                items.append((
+                    str(code),
+                    str(entry.get("last_date", "")),
+                    int(entry.get("rows", 0) or entry.get("bars", 0) or 0),
+                ))
+            else:
+                items.append((str(code), "", 0))
+        hasher = hashlib.sha256()
+        hasher.update(json.dumps(items, sort_keys=True).encode("utf-8"))
+        fp = hasher.hexdigest()[:16]
+        _MANIFEST_FP_CACHE["key"] = cache_key
+        _MANIFEST_FP_CACHE["fingerprint"] = fp
+        return fp
+    except Exception:
+        return None
+
+
 def _selection_factor_manifest_signature():
     """Return the history-manifest identity used to build the factor cache."""
     try:
-        return [
-            os.path.getmtime(dfc.KLINE_MANIFEST_PATH),
-            os.path.getsize(dfc.KLINE_MANIFEST_PATH),
-            dfc.SHARED_KLINE_SOURCE_VERSION,
-        ]
+        mtime = os.path.getmtime(dfc.KLINE_MANIFEST_PATH)
+        size = os.path.getsize(dfc.KLINE_MANIFEST_PATH)
+        version = dfc.SHARED_KLINE_SOURCE_VERSION
+        fingerprint = _compute_manifest_content_fingerprint(dfc.KLINE_MANIFEST_PATH)
+        return {
+            "content_fingerprint": fingerprint,
+            "mtime": mtime,
+            "size": size,
+            "version": version,
+        }
     except (OSError, AttributeError):
         return None
 
@@ -3389,8 +3466,18 @@ def _selection_factor_freshness(price_f, universe, asof_date, meta=None):
     cached_date = str(meta.get("factor_date") or "")[:10]
     current_signature = _selection_factor_manifest_signature()
     cached_signature = meta.get("signature")
-    signature_ok = bool(current_signature and isinstance(cached_signature, list)
-                        and cached_signature == current_signature)
+    signature_ok = bool(
+        current_signature
+        and (
+            cached_signature == current_signature
+            or (
+                isinstance(cached_signature, dict)
+                and isinstance(current_signature, dict)
+                and cached_signature.get("content_fingerprint") is not None
+                and cached_signature.get("content_fingerprint") == current_signature.get("content_fingerprint")
+            )
+        )
+    )
     try:
         built_at = dt.datetime.fromisoformat(str(meta.get("built_at")).replace("Z", "+00:00"))
         if built_at.tzinfo is None:
@@ -3532,13 +3619,11 @@ def _rebuild_selection_factor_cache(asof_date=None):
     } if cutoff is not None else set()
     factor_coverage = len(exact_codes & eligible_codes) / max(len(eligible_codes), 1)
     try:
-        signature = [
-            os.path.getmtime(dfc.KLINE_MANIFEST_PATH),
-            os.path.getsize(dfc.KLINE_MANIFEST_PATH),
-            dfc.SHARED_KLINE_SOURCE_VERSION,
-        ]
-    except OSError:
-        signature = [0, 0]
+        signature = _selection_factor_manifest_signature()
+        if signature is None:
+            signature = {"content_fingerprint": None, "mtime": 0, "size": 0, "version": getattr(dfc, "SHARED_KLINE_SOURCE_VERSION", "v1")}
+    except Exception:
+        signature = {"content_fingerprint": None, "mtime": 0, "size": 0, "version": "unknown"}
     if (
         cutoff is not None
         and (
@@ -8337,7 +8422,7 @@ def strategy_creation_preview(draft=None):
 def resolve_execution_verification(order_id, approved, operator="", note=""):
     """PR-11：人工核验结论——放行（放回重试管道）或驳回（终态作废）。"""
     init_db()
-    with _db(immediate=True) as conn:
+    with _db(immediate=True, hot_path=True) as conn:
         return EPD.resolve_verification(
             conn, int(order_id), approved=bool(approved),
             operator=str(operator or "")[:64], note=str(note or "")[:500],
@@ -9568,7 +9653,7 @@ def execute_open(asof_date=None):
     prefetch_market = _market_state(day) if prefetch_codes else None
     prefetch_news = _news_for(prefetch_names) if prefetch_codes else []
     prefetch_quotes = _quotes(prefetch_codes, asof_date=day) if prefetch_codes else {}
-    with _db(immediate=True) as conn:
+    with _db(immediate=True, hot_path=True) as conn:
         accounts = _active_account_rows(conn, status="running")
         # Limited slots must be won by the strongest live candidate, not by
         # whichever signal happened to be inserted first.
@@ -11003,7 +11088,7 @@ def _monitor_risk_impl(asof_date=None):
     # 14:50 risk slot without holding a database transaction across network
     # quote requests.
     scan_minute = dt.datetime.now().strftime("%Y-%m-%d %H:%M")
-    with _db(immediate=True) as conn:
+    with _db(immediate=True, hot_path=True) as conn:
         _assert_active_lease(conn, "risk scan marker")
         scan_marker = conn.execute(
             "SELECT event,detail FROM paper_audit WHERE event='risk_scan_state' "
@@ -11059,7 +11144,7 @@ def _monitor_risk_impl(asof_date=None):
     else:
         quote_map, news, flow_trajectory_map = {}, [], {}
     if not positions:
-        with _db(immediate=True) as conn:
+        with _db(immediate=True, hot_path=True) as conn:
             _sync_positions(conn, asof_day=day)
             _record_nav(conn, day, quotes=quote_map)
         try:
@@ -11067,10 +11152,10 @@ def _monitor_risk_impl(asof_date=None):
         except Exception as exc:
             manual_orders = [{"status": "pending_batch_retry", "reason": str(exc)}]
         result = {"slot": "risk", "date": day.isoformat(), "orders": [], "manual_orders": manual_orders}
-        with _db(immediate=True) as conn:
+        with _db(immediate=True, hot_path=True) as conn:
             _audit(conn, None, "risk_scan_state", _json({"scan_minute": scan_minute, "status": "completed", "finished_at": _now()}))
         return result
-    with _db(immediate=True) as conn:
+    with _db(immediate=True, hot_path=True) as conn:
         risk_ids = _risk_exit_account_ids(conn)
         positions = [p for p in _position_rows(conn, asof_day=day) if p["account_id"] in risk_ids]
         cycle = _active_cycle(conn)
@@ -11649,10 +11734,10 @@ def _monitor_risk_impl(asof_date=None):
         if _lease_lost(exc):
             raise
         manual_orders = [{"status": "pending_batch_retry", "reason": str(exc)}]
-        with _db(immediate=True) as audit_conn:
+        with _db(immediate=True, hot_path=True) as audit_conn:
             _audit(audit_conn, None, "pending_manual_batch_retry", str(exc))
     risk_result["manual_orders"] = manual_orders
-    with _db(immediate=True) as conn:
+    with _db(immediate=True, hot_path=True) as conn:
         _assert_active_lease(conn, "risk scan completion")
         _audit(conn, None, "risk_scan_state", _json({
             "scan_minute": scan_minute, "status": "completed", "finished_at": _now(),
@@ -11675,7 +11760,7 @@ def monitor_risk(asof_date=None):
         if _lease_lost(exc):
             raise
         try:
-            with _db(immediate=True) as conn:
+            with _db(immediate=True, hot_path=True) as conn:
                 _audit(conn, None, "risk_scan_state", _json({
                     "scan_minute": scan_minute,
                     "status": "failed",
@@ -12974,7 +13059,7 @@ def monitor_opening_events(asof_date=None, event_clock=None):
     quotes = _quotes(sorted({str(p["code"]) for p in positions}), asof_date=day)
     # P2-1 审计修复（2026-09-02）：开盘事件 NAV 同样用本地快照兜底。
     nav_quotes = _nav_quotes_with_snapshot_fallback(quotes)
-    with _db(immediate=True) as conn:
+    with _db(immediate=True, hot_path=True) as conn:
         # Re-read mutable account/position state after network evidence is
         # ready; a concurrent pause/reset can only reduce the work performed.
         cycle = _active_cycle(conn)
@@ -13105,7 +13190,7 @@ def monitor_fast_entries(asof_datetime=None, force=False):
     lock_key = "paper-runner-global"
     owner_seed = f"fast-entry:{now.isoformat()}:{os.getpid()}"
     owner_key = hashlib.sha1(owner_seed.encode("utf-8")).hexdigest()[:20]
-    with _db(immediate=True) as lock_conn:
+    with _db(immediate=True, hot_path=True) as lock_conn:
         acquired, owner, expires_at = _claim_runtime_lease(
             lock_conn, lock_key, owner_key, "fast-entry", ttl_seconds=90,
         )
@@ -13176,7 +13261,7 @@ def monitor_fast_entries(asof_datetime=None, force=False):
         confirmed = []
         observations = []
         checked = 0
-        with _db(immediate=True) as conn:
+        with _db(immediate=True, hot_path=True) as conn:
             for signal in candidates:
                 _assert_active_lease(conn, "fast entry candidate")
                 account = accounts.get(signal.get("account_id"))
@@ -13262,7 +13347,7 @@ def monitor_fast_entries(asof_datetime=None, force=False):
         }
     finally:
         try:
-            with _db(immediate=True) as release_conn:
+            with _db(immediate=True, hot_path=True) as release_conn:
                 _release_runtime_lease(
                     release_conn, lock_key, owner, fencing_token,
                 )
@@ -13441,7 +13526,7 @@ def monitor_intraday(asof_datetime=None, force=False):
     # _quotes 因防陈旧而置 None 的持仓价格（估值非成交，动作循环仍用
     # 未污染的 quotes）。必须在写事务外生成——内部读取本地快照文件。
     nav_quotes = _nav_quotes_with_snapshot_fallback(quotes)
-    with _db(immediate=True) as conn:
+    with _db(immediate=True, hot_path=True) as conn:
         cycle = _active_cycle(conn)
         accounts = _active_account_rows(conn, status="running")
         positions = [p for account in accounts for p in _position_rows(conn, account["id"], day)]
@@ -13947,6 +14032,7 @@ def _cleanup_stale_data():
 def run_slot(slot, asof_date=None, force=False):
     """统一幂等入口；计划任务和页面的“立即检查”都使用同一事务键。"""
     PSS.validate_slot(slot)
+    _SLOT_HOT_PATH.set(_is_hot_path_slot(slot))
     init_db()
     PSS.run_preflight(
         db_factory=_db,
@@ -13976,6 +14062,7 @@ def run_slot(slot, asof_date=None, force=False):
         return {"status": "skipped", "slot": slot, "reason": "非交易工作日"}
     run_asof = dt.datetime.now()
     intraday_key = _intraday_business_key(run_asof) if slot == "intraday" else None
+    hot_path = _is_hot_path_slot(slot)
     max_auto_retries = 2
     retry_count = 0
     # One lease spans every scheduled slot: a 15:05 full-market factor rebuild
@@ -14003,7 +14090,7 @@ def run_slot(slot, asof_date=None, force=False):
     owner_seed = f"{slot}:{day.isoformat()}:{intraday_key or 'daily'}:{os.getpid()}:{_now()}"
     runtime_owner = hashlib.sha1(owner_seed.encode("utf-8")).hexdigest()[:20]
     runtime_lock_acquired = False
-    with _db(immediate=True) as conn:
+    with _db(immediate=True, hot_path=hot_path) as conn:
         new_run = True
         prior_detail = {}
         if intraday_key:
@@ -14150,7 +14237,7 @@ def run_slot(slot, asof_date=None, force=False):
         renew_interval = max(60.0, runtime_lock_ttl / 4.0)
         while not lease_renewal_stop.wait(renew_interval):
             try:
-                with _db(immediate=True) as renew_conn:
+                with _db(immediate=True, hot_path=hot_path) as renew_conn:
                     heartbeat_at = _now()
                     expires = (dt.datetime.now() + dt.timedelta(seconds=runtime_lock_ttl)).strftime("%Y-%m-%d %H:%M:%S")
                     lock_cursor = renew_conn.execute(
@@ -14235,7 +14322,7 @@ def run_slot(slot, asof_date=None, force=False):
                 detail["risk_snapshot_at"] = (prior or {}).get("asof")
             except Exception:
                 pass
-        with _db(immediate=True) as conn:
+        with _db(immediate=True, hot_path=hot_path) as conn:
             _assert_active_lease(conn, "job completion")
             if intraday_key:
                 cursor = conn.execute(
@@ -14253,7 +14340,7 @@ def run_slot(slot, asof_date=None, force=False):
                 raise RuntimeError("paper lease lost: completion CAS")
         return {"status": "completed", **detail}
     except Exception as exc:
-        with _db(immediate=True) as conn:
+        with _db(immediate=True, hot_path=hot_path) as conn:
             if _lease_lost(exc) or lease_lost_event.is_set():
                 raise
             if intraday_key:
@@ -14278,7 +14365,7 @@ def run_slot(slot, asof_date=None, force=False):
             if lease_renewal_thread is not None:
                 lease_renewal_thread.join(timeout=5)
             try:
-                with _db(immediate=True) as conn:
+                with _db(immediate=True, hot_path=hot_path) as conn:
                     # 修复：必须用 _claim_runtime_lease 返回的完整 owner_value
                     # （"sha1:时间戳"），裸 runtime_owner（sha1 前缀）与表中
                     # owner_key 永不匹配，DELETE 0 行 → 幽灵租约残留至 TTL 过期，
@@ -14294,6 +14381,7 @@ def run_slot(slot, asof_date=None, force=False):
                     "note": "幽灵租约将在 TTL 过期后由 _claim_runtime_lease 自动回收",
                 }, ensure_ascii=False), flush=True)
         _clear_lease_context()
+        _SLOT_HOT_PATH.set(False)
 
 
 def _account_metric_inputs(conn, account_ids, today):

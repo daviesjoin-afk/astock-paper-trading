@@ -1095,6 +1095,60 @@ class ReplayClockContractTests(OfflinePaperEnv, unittest.TestCase):
             with open(meta_path, "w", encoding="utf-8") as f:
                 json.dump(saved_meta, f)
 
+    def test_entry_freeze_continues_when_manifest_semantic_content_changed(self):
+        """When manifest semantic content is altered/corrupted, gate must continue to freeze."""
+        original_sig = PT._selection_factor_manifest_signature
+        meta_path = PT.SELECTION_META_PATH
+        with open(meta_path, "r", encoding="utf-8") as f:
+            saved_meta = json.load(f)
+        try:
+            # Set cached factor meta to have a valid structured signature
+            valid_cached_sig = {
+                "content_fingerprint": "valid_content_hash_1234",
+                "mtime": 1700000000.0,
+                "size": 50000,
+                "version": "v1",
+            }
+            structured_meta = dict(saved_meta)
+            structured_meta["signature"] = valid_cached_sig
+            with open(meta_path, "w", encoding="utf-8") as f:
+                json.dump(structured_meta, f)
+
+            # Scenario 1: Manifest semantic content changed (fingerprint mismatch)
+            PT._selection_factor_manifest_signature = lambda: {
+                "content_fingerprint": "corrupted_content_hash_9999",
+                "mtime": 1700000100.0,
+                "size": 49000,
+                "version": "v1",
+            }
+            status = PT._entry_freeze_status(force=True)
+            factor = status["checks"]["factor_cache"]
+            self.assertFalse(factor["manifest_signature_ok"], status)
+            self.assertFalse(factor.get("content_fingerprint_ok", True), status)
+            self.assertFalse(factor["same_day_manifest_refresh_ok"], status)
+            self.assertFalse(factor["passed"], status)
+            self.assertTrue(status["enabled"], status)
+            self.assertIn("因子缓存不存在、行数不足或已过期", status["reason"])
+
+            # Scenario 2: Same semantic content fingerprint, only mtime changed -> safe refresh unfreezes
+            PT._selection_factor_manifest_signature = lambda: {
+                "content_fingerprint": "valid_content_hash_1234",
+                "mtime": 1700000500.0,
+                "size": 50000,
+                "version": "v1",
+            }
+            status2 = PT._entry_freeze_status(force=True)
+            factor2 = status2["checks"]["factor_cache"]
+            self.assertFalse(factor2["manifest_signature_ok"], status2)
+            self.assertTrue(factor2.get("content_fingerprint_ok", False), status2)
+            self.assertTrue(factor2["same_day_manifest_refresh_ok"], status2)
+            self.assertTrue(factor2["passed"], status2)
+            self.assertFalse(status2["enabled"], status2)
+        finally:
+            PT._selection_factor_manifest_signature = original_sig
+            with open(meta_path, "w", encoding="utf-8") as f:
+                json.dump(saved_meta, f)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -82,7 +82,7 @@ def db(db_path, immediate=False, hot_path=False):
             if is_sqlite_busy_error(exc):
                 # 锁冲突：写入仍在事务里，必须原样重试；二次失败先回滚，
                 # 不能让 close() 对半提交状态做隐式处理。
-                time.sleep(sqlite_busy_backoff(0, hot_path=hot_path or immediate))
+                time.sleep(sqlite_busy_backoff(0, hot_path=hot_path))
                 try:
                     conn.commit()
                 except Exception:

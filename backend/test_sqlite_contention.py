@@ -101,6 +101,55 @@ class SQLiteContentionTests(unittest.TestCase):
                 res = conn.execute("PRAGMA busy_timeout").fetchone()[0]
                 self.assertEqual(res, 800)
 
+    def test_production_run_slot_contention_fails_fast_and_recovers(self):
+        """Production run_slot on hot path fails fast under lock contention and recovers cleanly."""
+        import paper_trading as PT
+        from unittest.mock import patch
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as directory:
+            db_path = os.path.join(directory, "paper_contention.sqlite3")
+            old_db_path = PT.DB_PATH
+            PT.DB_PATH = db_path
+            try:
+                PT.init_db()
+
+                # Connection A locks the database
+                conn_a = sqlite3.connect(db_path, timeout=120)
+                conn_a.execute("PRAGMA journal_mode=WAL")
+                conn_a.execute("BEGIN IMMEDIATE")
+                conn_a.execute("INSERT INTO paper_audit(event, detail, created_at) VALUES('lock_holder', '{}', '2026-09-14')")
+
+                try:
+                    start_time = time.monotonic()
+                    with patch.object(PT, "_is_trade_weekday", return_value=True):
+                        caught_exc = None
+                        try:
+                            PT.run_slot("intraday", force=True)
+                        except Exception as exc:
+                            caught_exc = exc
+                    elapsed = time.monotonic() - start_time
+
+                    self.assertIsNotNone(caught_exc, "run_slot must fail when DB is locked")
+                    self.assertTrue(
+                        storage.is_sqlite_busy_error(caught_exc),
+                        f"Exception must be recognized as sqlite busy error: {caught_exc}",
+                    )
+                    self.assertLess(
+                        elapsed,
+                        3.5,
+                        f"Hot path run_slot must fail fast under 3.5s, took {elapsed:.2f}s",
+                    )
+                finally:
+                    conn_a.rollback()
+                    conn_a.close()
+
+                # After Connection A releases lock, run_slot recovers and completes
+                with patch.object(PT, "_is_trade_weekday", return_value=True):
+                    res = PT.run_slot("intraday", force=True)
+                self.assertEqual(res.get("status"), "completed")
+            finally:
+                PT.DB_PATH = old_db_path
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -12,6 +12,7 @@ Strict invariants enforced:
 """
 from __future__ import annotations
 
+import json
 import os
 import sys
 import unittest
@@ -20,6 +21,7 @@ BACKEND = os.path.dirname(os.path.abspath(__file__))
 if BACKEND not in sys.path:
     sys.path.insert(0, BACKEND)
 
+import adaptive_selection as AS
 import evolution_activation as EA
 import evolution_loop as EL
 import paper_trading as PT
@@ -27,6 +29,10 @@ import runtime_settings as RSET
 import self_evolution as SE
 import strategy_registry as SR
 import strategy_runtime as SRT
+import adaptive_engine as AE
+import deepseek_advisor
+import dual_ai_tuner
+from unittest.mock import patch
 from test_production_path_golden_replay import (
     CAPITAL,
     D0,
@@ -44,8 +50,18 @@ from test_production_path_golden_replay import (
 class DualClosedLoopProductionPathTests(OfflinePaperEnv, unittest.TestCase):
 
     def setUp(self):
+        super().setUp()
         QUOTE_PRICES.clear()
         QUOTE_SCENARIOS.clear()
+        self.old_ae_db = AE.DB_PATH
+        self.old_ae_paper_db = AE.PAPER_DB_PATH
+        AE.DB_PATH = PT.DB_PATH
+        AE.PAPER_DB_PATH = PT.DB_PATH
+
+    def tearDown(self):
+        AE.DB_PATH = self.old_ae_db
+        AE.PAPER_DB_PATH = self.old_ae_paper_db
+        super().tearDown()
 
     def test_dual_closed_loop_production_path(self):
         """End-to-end dual closed loop execution with real services and zero fake fills."""
@@ -175,31 +191,97 @@ class DualClosedLoopProductionPathTests(OfflinePaperEnv, unittest.TestCase):
             self.assertEqual(int(remaining_pos["n"]), 0, "持仓全清")
 
         # ─────────────────────────────────────────────────────────────────
-        # 5. 自进化闭环：直接使用生产适配器 ProductionBackend（基于真实交易证据）
+        # 5. 自进化闭环：由生产自学习桥接入口驱动真实写入
+        #    （dual_ai_tuner.run_dual_ai_tuning + adaptive_engine.evaluate_tuning_fn）
         # ─────────────────────────────────────────────────────────────────
+        base_weights = dict(AS.BASE_WEIGHTS["one_to_two"])
         with self._conn() as conn:
-            # 真实闭环审计与证据落库：将真实成交/平仓产生的交易证据写入 evolution_tracking
+            AE._init_schema(conn)
+            dual_ai_tuner.ensure_schema(conn)
+            dual_ai_tuner.update_api_key(conn, "mimo", api_key="test-mimo-key", enabled=True)
+            dual_ai_tuner.update_api_key(conn, "deepseek", api_key="test-ds-key", enabled=True)
+            strategy_params = {"adaptive_selection": {"weights": base_weights, "entry_score_delta": 0.0, "conditions": {}}}
+            conn.execute(
+                "UPDATE paper_accounts SET params=? WHERE id=?",
+                (json.dumps(strategy_params), STRATEGY_ID),
+            )
+
+        # 针对 AI Provider Transport 进行确定性受控 stub，模拟双方达成共识的 proposal
+        def _stub_call_single_ai(provider_config, system_prompt, user_prompt, max_tokens=1800):
+            prov = provider_config.get("provider")
+            parsed = {
+                "decision": "propose",
+                "confidence": 85 if prov == "mimo" else 88,
+                "market_regime": "trend",
+                "summary": "Dual loop trading evidence confirms strategy execution and exit",
+                "proposals": [
+                    {
+                        "account_id": STRATEGY_ID,
+                        "confidence": 85 if prov == "mimo" else 88,
+                        "rationale": "Slight adjustment based on real fill attribution",
+                        "weights": dict(base_weights),
+                        "entry_score_delta": 0.0,
+                        "conditions": {},
+                    }
+                ],
+            }
+            return parsed, 150, 80, 20
+
+        # 基于真实成交与风控退出结果衍生归因评估分数
+        realized_attribution_score = 0.42 if len(sells) > 0 else 0.10
+        attribution_detail = {
+            "buy_fills": len(fills),
+            "sell_fills": len(sells),
+            "remaining_positions": 0,
+            "cost": cost,
+            "derived_from": "production_trade_attribution",
+        }
+
+        with patch.object(dual_ai_tuner, "_call_single_ai", side_effect=_stub_call_single_ai):
+            # 通过生产入口 run_dual_ai_tuning 产生自学习记录，由 evaluate_tuning_fn 进行事后效果评估
             for i in range(6):
-                tid = SE.track_run(
-                    conn,
-                    run_id=100 + i,
+                tuning_res = dual_ai_tuner.run_dual_ai_tuning(
+                    connect_factory=self._conn,
+                    paper_db_path=PT.DB_PATH,
+                    snapshot_paths=[],
+                    evidence_collector=deepseek_advisor.collect_evidence,
+                    tuning_accounts_fn=deepseek_advisor._tuning_accounts,
+                    profile={"profile_date": D2.isoformat(), "regime": "trend", "quality": "high"},
                     trigger="trade_cycle_attribution",
                     mode="production_acceptance",
-                    status="consensus",
-                    market_regime="trend",
-                    applied=True,
-                    applied_count=len(fills),
-                    mimo_confidence=0.85,
-                    deepseek_confidence=0.88,
                 )
-                SE.evaluate_run(
-                    conn,
-                    tracking_id=tid,
-                    eval_score=0.42,
-                    eval_detail={"fills": len(fills), "remaining_pos": 0},
-                )
+                self.assertEqual(tuning_res.get("status"), "consensus")
+                run_id = tuning_res["id"]
 
+                with self._conn() as conn:
+                    tracking_row = conn.execute(
+                        "SELECT id FROM evolution_tracking WHERE run_id=? ORDER BY id DESC LIMIT 1",
+                        (run_id,),
+                    ).fetchone()
+                    self.assertIsNotNone(tracking_row, "run_dual_ai_tuning 必须在 evolution_tracking 中记录追踪行")
+                    tracking_id = tracking_row[0]
+
+                # 驱动生产自学习评估服务，事后评估调参效果
+                eval_res = AE.evaluate_tuning_fn(
+                    tracking_id=tracking_id,
+                    eval_score=realized_attribution_score,
+                    eval_detail=attribution_detail,
+                )
+                self.assertTrue(eval_res.get("success"))
+
+        with self._conn() as conn:
             EL.ensure_loop_schema(conn)
+
+            # 断言 ProductionBackend.observe 读取真实自学习管线写入的数据
+            obs = EL.ProductionBackend().observe(conn, generation=1)
+            self.assertTrue(obs["has_data"], "必须有真实学习数据")
+            self.assertGreaterEqual(obs["sample_count"], 5, "样本数必须 >= 5")
+            self.assertGreaterEqual(obs.get("evidence_count", 0), 5, "证据数必须 >= 5")
+            self.assertIsNotNone(obs["samples"])
+            self.assertEqual(obs["samples"].get("sample_count"), 6)
+            self.assertEqual(obs["samples"].get("evaluated_count"), 6)
+            self.assertAlmostEqual(obs["samples"].get("avg_eval_score"), realized_attribution_score, places=2)
+
             loop_rep = EL.run_loop(conn, EL.ProductionBackend(), generations=1)
 
         self.assertEqual(loop_rep["generations_run"], 1)
@@ -244,10 +326,14 @@ class DualClosedLoopProductionPathTests(OfflinePaperEnv, unittest.TestCase):
             self.assertNotEqual(new_active["id"], cand_a_id)
 
             # ─────────────────────────────────────────────────────────────────
-            # 8. 下一轮 Runtime 观测与历史审计完整性断言
+            # 8. 下一代/运行时读取方观测与历史审计完整性断言
             # ─────────────────────────────────────────────────────────────────
+            obs_gen2 = EL.ProductionBackend().observe(conn, generation=2)
+            self.assertEqual(obs_gen2["params_id"], cand_b_id, "下一代 observe 必须读取已显式激活的候选 B")
+            self.assertEqual(obs_gen2["params"]["max_weight_delta"], new_active["params"]["max_weight_delta"])
+
             history = conn.execute(
-                "SELECT action, from_pointer_params_id, to_params_id, actor FROM evolution_activation_history "
+                "SELECT action, from_pointer_params_id, to_params_id, actor, reason FROM evolution_activation_history "
                 "WHERE scope_key=? ORDER BY id ASC",
                 (EA.SCOPE_GLOBAL,),
             ).fetchall()
@@ -257,6 +343,8 @@ class DualClosedLoopProductionPathTests(OfflinePaperEnv, unittest.TestCase):
             self.assertEqual(history[1]["action"], "activate")
             self.assertEqual(history[1]["from_pointer_params_id"], cand_a_id)
             self.assertEqual(history[1]["to_params_id"], cand_b_id)
+            self.assertEqual(history[1]["actor"], "acceptance_operator")
+            self.assertEqual(history[1]["reason"], "manual approval after validation")
 
             # 订单回放确定性与可追溯性
             orders = conn.execute(
