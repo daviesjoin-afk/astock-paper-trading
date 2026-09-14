@@ -2,18 +2,26 @@
 """Dual closed-loop production path acceptance test.
 
 Verifies end-to-end integration of both closed loops without fake order inserts:
-Loop 1: Trading Closed Loop (signal -> OrderIntent -> allocation -> planner -> fill -> position -> T+1 exit -> attribution)
+Loop 1: Trading Closed Loop (signal -> OrderIntent -> allocation -> planner -> fill -> position -> T+1 exit -> NAV -> reward)
 Loop 2: Evolution Closed Loop (observe -> evaluate -> mutate -> validate -> apply/activation)
 
 Strict invariants enforced:
 - Separate databases: paper_db != adaptive_db
 - candidate != validated != active != latest
 - No direct INSERT INTO paper_orders / paper_fills
-- Real reward evaluation pipeline (AE._evaluate_rewards) deriving scores from trade NAV
+- Real reward evaluation pipeline (AE._evaluate_rewards) deriving rewards from trade NAV
+- **真实因果顺序**的调参评估：只有经由显式 apply 生命周期真正生效的调参，才能消费
+  其生效之后成熟的 reward：
+      effective tuning -> 明确 account/strategy -> 明确 effective time
+        -> 其后成熟的 reward -> 归因落库 -> evaluate_tuning_from_reward()
+        -> evolution_tracking.evaluated=1
+- 测试端**绝不**自算 ``math.tanh(raw_reward)`` 并注入生产接口；评分一律由生产服务给出，
+  测试只做等值断言。
 - Runtime is strictly isolated from unactivated candidate mutations
 """
 from __future__ import annotations
 
+import datetime as dt
 import json
 import math
 import os
@@ -21,7 +29,9 @@ import sqlite3
 import sys
 import tempfile
 import unittest
+from contextlib import contextmanager
 from unittest.mock import patch
+from zoneinfo import ZoneInfo
 
 BACKEND = os.path.dirname(os.path.abspath(__file__))
 if BACKEND not in sys.path:
@@ -32,6 +42,7 @@ import adaptive_selection as AS
 import deepseek_advisor
 import dual_ai_tuner
 import evolution_activation as EA
+import evolution_apply
 import evolution_loop as EL
 import paper_trading as PT
 import runtime_settings as RSET
@@ -50,6 +61,51 @@ from test_production_path_golden_replay import (
     QUOTE_PRICES,
     QUOTE_SCENARIOS,
 )
+
+TZ = ZoneInfo("Asia/Shanghai")
+
+#: 保留原始 registry 读口：生产 apply 通道会在内部调用 ``strategy_registry.labels()``，
+#: 而它默认解析"仓库默认库"。测试需要让它读**同一个**临时 paper 库（账户与注册表
+#: 必须来自同一个库，否则账户会被判成未知）。
+_ORIGINAL_LABELS = SR.labels
+
+# 合成净值窗口：结束于 T+1 开仓日之前，与真实成交链路的净值行互不覆盖。
+NAV_WINDOW_DAYS = 14
+NAV_DAILY_RETURN = 0.009
+BENCH_DAILY_RETURN = 0.001
+# 五组"真实生效"的调参时刻，全部落在合成净值窗口内（真实证据自然 >= MIN_SAMPLES_FOR_EVOLUTION）。
+EFFECTIVE_DAY_OFFSETS = (12, 10, 8, 6, 4)
+
+
+class _FrozenDateTime(dt.datetime):
+    """把 apply / 调参观测到的"现在"固定在某个时刻。"""
+
+    frozen: dt.datetime = None  # type: ignore[assignment]
+
+    @classmethod
+    def now(cls, tz=None):  # noqa: ARG003 - 固定时刻，忽略 tz
+        return cls.frozen
+
+
+@contextmanager
+def _frozen_clock(moment: dt.datetime):
+    """把 apply 与调参**事件发生的时刻**固定到 ``moment``。
+
+    只冻结时间，不伪造任何生效证据：``dual_ai_tuning_runs.applied_ids`` 与账户运行
+    参数覆盖仍然由真实生产代码写入。
+    """
+
+    class _Shim:
+        datetime = _FrozenDateTime
+        date = dt.date
+        timedelta = dt.timedelta
+
+    _FrozenDateTime.frozen = moment
+    stamp = moment.isoformat(timespec="seconds")
+    with patch.object(evolution_apply, "dt", _Shim), \
+            patch.object(evolution_apply, "_now", lambda: stamp), \
+            patch.object(dual_ai_tuner, "_now", lambda: stamp):
+        yield stamp
 
 
 class DualClosedLoopProductionPathTests(OfflinePaperEnv, unittest.TestCase):
@@ -79,6 +135,12 @@ class DualClosedLoopProductionPathTests(OfflinePaperEnv, unittest.TestCase):
         conn = sqlite3.connect(self.adaptive_db_path, timeout=30)
         conn.row_factory = sqlite3.Row
         return conn
+
+    def _account_params(self):
+        with self._paper_conn() as p_conn:
+            row = self._one(
+                p_conn, "SELECT params FROM paper_accounts WHERE id=?", (STRATEGY_ID,))
+        return json.loads(row["params"] or "{}") or {}
 
     def test_dual_closed_loop_production_path(self):
         """End-to-end dual closed loop execution with real services, separate DBs, and zero fake fills."""
@@ -214,29 +276,31 @@ class DualClosedLoopProductionPathTests(OfflinePaperEnv, unittest.TestCase):
 
         # ─────────────────────────────────────────────────────────────────
         # 5. 生产收益评估管线：写入真实交易生命周期净值序列，驱动 AE._evaluate_rewards
+        #    —— 此时产生的全部 reward 都早于后面的调参生效时刻，是"旧 reward"。
         # ─────────────────────────────────────────────────────────────────
-        nav_points = [
-            ("2026-09-01", 1000000.0, 0.0, 1.0000, 1.0000),
-            ("2026-09-02", 900000.0, 105000.0, 1.0050, 1.0010),
-            ("2026-09-03", 900000.0, 112000.0, 1.0120, 1.0020),
-            ("2026-09-04", 900000.0, 120000.0, 1.0200, 1.0030),
-            ("2026-09-05", 900000.0, 118000.0, 1.0180, 1.0025),
-            ("2026-09-06", 900000.0, 125000.0, 1.0250, 1.0040),
-            ("2026-09-07", 1032000.0, 0.0, 1.0320, 1.0050),
-        ]
+        nav_end = D1 - dt.timedelta(days=1)
+        nav_dates = [nav_end - dt.timedelta(days=NAV_WINDOW_DAYS - 1 - i)
+                     for i in range(NAV_WINDOW_DAYS)]
+        # 账户声明的因子基线：deepseek_advisor._tuning_accounts 只把这个 overlay
+        # 当作"当前已有因子"暴露给模型。注意这里**没有** adaptive_selection_meta，
+        # 所以它不是生效覆盖 —— 调参前 runtime 仍按策略基准运行。
+        base_weights = dict(AS.BASE_WEIGHTS["one_to_two"])
         with self._paper_conn() as p_conn:
-            for date_str, cash, mval, nav, bench in nav_points:
+            p_conn.execute(
+                "UPDATE paper_accounts SET params=? WHERE id=?",
+                (json.dumps({"adaptive_selection": {
+                    "weights": base_weights, "entry_score_delta": 0.0, "conditions": {}}}),
+                 STRATEGY_ID),
+            )
+            for index, day in enumerate(nav_dates):
+                nav = round((1.0 + NAV_DAILY_RETURN) ** index, 4)
+                bench = round((1.0 + BENCH_DAILY_RETURN) ** index, 4)
                 p_conn.execute(
                     """INSERT OR REPLACE INTO paper_nav(account_id, nav_date, cash, market_value, nav, benchmark, created_at)
                        VALUES(?, ?, ?, ?, ?, ?, ?)""",
-                    (STRATEGY_ID, date_str, cash, mval, nav, bench, f"{date_str} 15:05:00"),
+                    (STRATEGY_ID, day.isoformat(), round(nav * 200_000, 2),
+                     round(nav * 800_000, 2), nav, bench, f"{day.isoformat()} 15:05:00"),
                 )
-            base_weights = dict(AS.BASE_WEIGHTS["one_to_two"])
-            strategy_params = {"adaptive_selection": {"weights": base_weights, "entry_score_delta": 0.0, "conditions": {}}}
-            p_conn.execute(
-                "UPDATE paper_accounts SET params=? WHERE id=?",
-                (json.dumps(strategy_params), STRATEGY_ID),
-            )
             p_conn.commit()
 
         # 在 Adaptive DB 注册市场状态，使奖励归因带上确定性 regime
@@ -245,8 +309,9 @@ class DualClosedLoopProductionPathTests(OfflinePaperEnv, unittest.TestCase):
                 """INSERT OR REPLACE INTO adaptive_market_profiles(
                        profile_date, observed_at, source_at, regime, quality, valid_rows, features, drivers, created_at, updated_at
                    ) VALUES (
-                       '2026-09-01', '2026-09-01 15:00:00', '2026-09-01 15:00:00', 'trend', 'high', 5000, '{}', '{}', '2026-09-01 15:00:00', '2026-09-01 15:00:00'
-                   )"""
+                       ?, '2026-09-01 15:00:00', '2026-09-01 15:00:00', 'trend', 'high', 5000, '{}', '{}', '2026-09-01 15:00:00', '2026-09-01 15:00:00'
+                   )""",
+                (nav_dates[0].isoformat(),),
             )
             a_conn.commit()
 
@@ -259,7 +324,7 @@ class DualClosedLoopProductionPathTests(OfflinePaperEnv, unittest.TestCase):
             ).fetchall()
             self.assertGreaterEqual(len(reward_rows), 5)
 
-            # 配置 AI Provider Key
+            # 配置 AI Provider Key（双AI均配置且启用 —— 缺一不可，见 fail-closed 约束）
             dual_ai_tuner.update_api_key(a_conn, "mimo", api_key="test-mimo-key", enabled=True)
             dual_ai_tuner.update_api_key(a_conn, "deepseek", api_key="test-ds-key", enabled=True)
 
@@ -283,52 +348,168 @@ class DualClosedLoopProductionPathTests(OfflinePaperEnv, unittest.TestCase):
             }
             return parsed, 150, 80, 20
 
-        # ─────────────────────────────────────────────────────────────────
-        # 6. 自进化闭环：由生产调参入口 run_dual_ai_tuning 与评估服务 evaluate_tuning_fn 串联
-        #    评分严格从生产收益评估管线 raw_reward 衍生，杜绝硬编码
-        # ─────────────────────────────────────────────────────────────────
-        with patch.object(dual_ai_tuner, "_call_single_ai", side_effect=_stub_call_single_ai):
-            for r in reward_rows[:6]:
-                tuning_res = dual_ai_tuner.run_dual_ai_tuning(
+        def _run_one_tuning(effective_day):
+            """真实时间顺序：创建调参 -> 显式 apply -> 生效证据 -> 归因 -> 评估。"""
+            moment = dt.datetime(effective_day.year, effective_day.month,
+                                 effective_day.day, 15, 30, tzinfo=TZ)
+            with _frozen_clock(moment):
+                tuning = dual_ai_tuner.run_dual_ai_tuning(
                     connect_factory=self._adaptive_conn,
                     paper_db_path=self.paper_db_path,
                     snapshot_paths=[],
                     evidence_collector=deepseek_advisor.collect_evidence,
                     tuning_accounts_fn=deepseek_advisor._tuning_accounts,
-                    profile={"profile_date": r["end_date"], "regime": r["regime"] or "trend", "quality": "high"},
+                    profile={"profile_date": effective_day.isoformat(),
+                             "regime": "trend", "quality": "high"},
                     trigger="trade_cycle_attribution",
                     mode="production_acceptance",
                 )
-                self.assertEqual(tuning_res.get("status"), "consensus")
-                run_id = tuning_res["id"]
+                self.assertEqual(tuning.get("status"), "consensus")
+                run_id = tuning["id"]
 
                 with self._adaptive_conn() as a_conn:
-                    tracking_row = a_conn.execute(
+                    tracking_id = a_conn.execute(
                         "SELECT id FROM evolution_tracking WHERE run_id=? ORDER BY id DESC LIMIT 1",
                         (run_id,),
-                    ).fetchone()
-                    self.assertIsNotNone(tracking_row, "run_dual_ai_tuning 必须在 evolution_tracking 中记录追踪行")
-                    tracking_id = tracking_row[0]
+                    ).fetchone()[0]
+                    self.assertIsNotNone(tracking_id)
 
-                # 生产调参评估服务：直接基于生产收益 adaptive_rewards 评估调参效果，零测试端自算
-                eval_res = AE.evaluate_tuning_from_reward(
-                    tracking_id=tracking_id,
-                    reward_id=r["id"],
+                # 真实生效证据：显式 apply 生命周期（不是测试手写的标记位）
+                apply_res = evolution_apply.apply_tuner_proposals(
+                    self._adaptive_conn, self.paper_db_path, run_id,
+                    approved_by="acceptance_operator", confirmed=True,
+                    base_weights_fn=lambda account_id: dict(base_weights),
                 )
-                self.assertTrue(eval_res.get("success"))
-                self.assertEqual(eval_res.get("reward_id"), r["id"])
-                self.assertIsNotNone(eval_res.get("eval_score"))
+                self.assertTrue(apply_res["applied"])
+                self.assertEqual(apply_res["accounts"], [STRATEGY_ID])
+                self.assertEqual(apply_res["effective_date"], effective_day.isoformat())
+
+                meta = self._account_params()["adaptive_selection_meta"]
+                self.assertEqual(meta["tier"], "llm_consensus")
+                self.assertEqual(meta["status"], "active")
+                self.assertEqual(meta["run_id"], run_id)
+                effective_from = dt.date.fromisoformat(str(meta["effective_date"])[:10])
+                self.assertEqual(effective_from, effective_day)
+
+            return run_id, tracking_id, effective_from
+
+        # ─────────────────────────────────────────────────────────────────
+        # 6. 自进化闭环：真实因果顺序
+        #    effective tuning -> 明确 account -> 明确 effective time
+        #      -> 其后成熟的 reward -> 归因落库 -> evaluate_tuning_from_reward()
+        #      -> evolution_tracking.evaluated=1
+        #    评分全部由生产服务从 adaptive_rewards.raw_reward 计算，测试端零注入。
+        # ─────────────────────────────────────────────────────────────────
+        with patch.object(dual_ai_tuner, "_call_single_ai", side_effect=_stub_call_single_ai), \
+                patch.object(SR, "labels",
+                             lambda **kwargs: _ORIGINAL_LABELS(db_path=self.paper_db_path)):
+            stale_reward = min(reward_rows, key=lambda r: (r["start_date"], r["id"]))
+            attribution_evidence = []
+
+            for index, offset in enumerate(EFFECTIVE_DAY_OFFSETS):
+                effective_day = nav_end - dt.timedelta(days=offset)
+                self.assertGreaterEqual(effective_day, nav_dates[0])
+
+                run_id, tracking_id, effective_from = _run_one_tuning(effective_day)
+
+                if index == 0:
+                    # ── 负向验证（§1）：旧 reward + 新 tracking => reject ──
+                    # 生效之前的 reward 不得评估新调参；即使强行建立归因，时间窗口
+                    # 也要被独立复核（归因不是免检通行证）。
+                    self.assertLess(stale_reward["start_date"], effective_from.isoformat())
+                    with self._adaptive_conn() as a_conn:
+                        with self.assertRaises(KeyError):
+                            AE.evaluate_tuning_from_reward(
+                                tracking_id=tracking_id,
+                                reward_id=stale_reward["id"],
+                                conn=a_conn,
+                            )
+                        SE.record_reward_attribution(
+                            a_conn, tracking_id, stale_reward["id"], STRATEGY_ID,
+                            effective_from.isoformat())
+                        with self.assertRaises(ValueError) as ctx:
+                            AE.evaluate_tuning_from_reward(
+                                tracking_id=tracking_id,
+                                reward_id=stale_reward["id"],
+                                conn=a_conn,
+                            )
+                        self.assertIn("生效", str(ctx.exception))
+                        # 清掉这次刻意的无效探针，避免污染"首次决定"的归因
+                        a_conn.execute(
+                            "DELETE FROM evolution_reward_attribution WHERE tracking_id=? AND reward_id=?",
+                            (tracking_id, stale_reward["id"]))
+                        a_conn.commit()
+                    with self._adaptive_conn() as a_conn:
+                        self.assertEqual(
+                            a_conn.execute(
+                                "SELECT evaluated FROM evolution_tracking WHERE id=?",
+                                (tracking_id,)).fetchone()[0], 0)
+
+                # 生产归因匹配器：证明匹配并驱动评估
+                with self._adaptive_conn() as a_conn:
+                    report = AE.reconcile_tuning_reward_attribution(a_conn)
+                self.assertEqual(report["status"], "ok", report)
+                self.assertEqual(report["failed"], [], report)
+                self.assertEqual(len(report["evaluated"]), 1, report)
+                outcome = report["evaluated"][0]
+                self.assertEqual(outcome["tracking_id"], tracking_id)
+                self.assertEqual(outcome["account_id"], STRATEGY_ID)
+                self.assertEqual(outcome["effective_from"], effective_from.isoformat())
+                self.assertTrue(outcome["attribution_created"])
 
                 with self._adaptive_conn() as a_conn:
-                    verified_tr = a_conn.execute(
+                    reward = a_conn.execute(
+                        "SELECT * FROM adaptive_rewards WHERE id=?",
+                        (outcome["reward_id"],)).fetchone()
+                    tracking = a_conn.execute(
                         "SELECT evaluated, eval_score, eval_detail FROM evolution_tracking WHERE id=?",
-                        (tracking_id,),
-                    ).fetchone()
-                    self.assertEqual(verified_tr["evaluated"], 1)
-                    self.assertEqual(verified_tr["eval_score"], eval_res["eval_score"])
-                    detail_obj = json.loads(verified_tr["eval_detail"])
-                    self.assertEqual(detail_obj.get("source"), "adaptive_rewards")
-                    self.assertEqual(detail_obj.get("score_mapping_version"), AE.EVOLUTION_REWARD_SCORE_VERSION)
+                        (tracking_id,)).fetchone()
+                    links = SE.list_reward_attributions(a_conn, tracking_id)
+
+                # reward 必须整体落在生效之后（旧 reward 被排除）
+                self.assertGreaterEqual(reward["start_date"], effective_from.isoformat())
+                self.assertGreater(reward["end_date"], effective_from.isoformat())
+                self.assertNotEqual(reward["id"], stale_reward["id"])
+
+                # 评分必须由生产服务给出，并严格等于 raw_reward 的 tanh 映射
+                self.assertEqual(tracking["evaluated"], 1)
+                self.assertAlmostEqual(
+                    tracking["eval_score"], math.tanh(reward["raw_reward"]), places=9)
+                detail = json.loads(tracking["eval_detail"])
+                self.assertEqual(detail["source"], "adaptive_rewards")
+                self.assertEqual(detail["score_mapping_version"], AE.EVOLUTION_REWARD_SCORE_VERSION)
+                self.assertEqual(detail["raw_reward"], reward["raw_reward"])
+                self.assertEqual(detail["attribution"]["account_id"], STRATEGY_ID)
+                self.assertEqual(detail["attribution"]["effective_from"], effective_from.isoformat())
+                self.assertEqual(detail["attribution"]["linkage_source"], SE.ATTRIBUTION_LINKAGE_SOURCE)
+
+                # 归因契约落库：一条 tracking 恰好一条归因
+                self.assertEqual(len(links), 1)
+                self.assertEqual(links[0]["reward_id"], reward["id"])
+                self.assertEqual(links[0]["account_id"], STRATEGY_ID)
+                attribution_evidence.append((tracking_id, reward["id"]))
+
+                # 幂等：重复周期不得新增归因、不得改写首次决定
+                with self._adaptive_conn() as a_conn:
+                    repeat = AE.reconcile_tuning_reward_attribution(a_conn)
+                    self.assertEqual(repeat["evaluated"], [], repeat)
+                    self.assertEqual(repeat["failed"], [], repeat)
+                    self.assertEqual(len(SE.list_reward_attributions(a_conn, tracking_id)), 1)
+                    self.assertEqual(
+                        a_conn.execute(
+                            "SELECT eval_score FROM evolution_tracking WHERE id=?",
+                            (tracking_id,)).fetchone()[0], tracking["eval_score"])
+
+                # 释放覆盖，为下一次调参让出生效通道（rollback 后该 tracking 不再生效，
+                # 但它已经完成的评估保持不变 —— 首次决定不可改写）。
+                evolution_apply.rollback_tuner_overlay(
+                    self._adaptive_conn, self.paper_db_path, STRATEGY_ID,
+                    reason="dual loop next tuning", confirmed=True)
+
+            self.assertEqual(len(attribution_evidence), len(EFFECTIVE_DAY_OFFSETS))
+            self.assertEqual(
+                len({tracking_id for tracking_id, _ in attribution_evidence}),
+                len(EFFECTIVE_DAY_OFFSETS), "每次调参必须各自独立评估")
 
         # ─────────────────────────────────────────────────────────────────
         # 7. 演化引擎闭环（Generation 1）：observe -> evaluate -> mutate -> validate -> apply
@@ -340,7 +521,8 @@ class DualClosedLoopProductionPathTests(OfflinePaperEnv, unittest.TestCase):
             self.assertGreaterEqual(obs.get("evidence_count", 0), 5, "证据数必须 >= 5")
             self.assertIsNotNone(obs["samples"])
             self.assertGreaterEqual(obs["samples"].get("sample_count", 0), 5)
-            self.assertGreaterEqual(obs["samples"].get("evaluated_count", 0), 5)
+            self.assertGreaterEqual(obs["samples"].get("evaluated_count", 0), 5,
+                                    "评估样本必须来自真实生效调参，不得人工凑数")
 
             eval_res = EL.ProductionBackend().evaluate(a_conn, generation=1)
             self.assertIn("intelligence_score", eval_res)
@@ -428,11 +610,17 @@ class DualClosedLoopProductionPathTests(OfflinePaperEnv, unittest.TestCase):
             a_rewards = a_conn.execute("SELECT count(*) FROM adaptive_rewards WHERE account_id=?", (STRATEGY_ID,)).fetchone()[0]
             a_runs = a_conn.execute("SELECT count(*) FROM dual_ai_tuning_runs").fetchone()[0]
             a_tracking = a_conn.execute("SELECT count(*) FROM evolution_tracking").fetchone()[0]
+            a_evaluated = a_conn.execute("SELECT count(*) FROM evolution_tracking WHERE evaluated=1").fetchone()[0]
             a_params = a_conn.execute("SELECT count(*) FROM evolution_params").fetchone()[0]
             a_loop = a_conn.execute("SELECT count(*) FROM evolution_loop_state").fetchone()[0]
+            a_attributions = a_conn.execute("SELECT count(*) FROM evolution_reward_attribution").fetchone()[0]
             self.assertGreaterEqual(a_rewards, 5, "Adaptive DB 必须包含 >= 5 条奖励样本")
-            self.assertGreaterEqual(a_runs, 5, "Adaptive DB 必须包含调参运行记录")
-            self.assertGreaterEqual(a_tracking, 5, "Adaptive DB 必须包含自进化追踪记录")
+            self.assertGreaterEqual(a_runs, len(EFFECTIVE_DAY_OFFSETS), "Adaptive DB 必须包含调参运行记录")
+            self.assertGreaterEqual(a_tracking, len(EFFECTIVE_DAY_OFFSETS), "Adaptive DB 必须包含自进化追踪记录")
+            self.assertEqual(a_evaluated, len(EFFECTIVE_DAY_OFFSETS),
+                             "只有真实生效的调参才能被评估")
+            self.assertEqual(a_attributions, len(EFFECTIVE_DAY_OFFSETS),
+                             "每个真实生效的调参恰好落一条 reward 归因契约")
             self.assertGreaterEqual(a_params, 2, "Adaptive DB 必须包含候选 A 与候选 B 参数版本")
             self.assertEqual(a_loop, 1, "Adaptive DB 必须包含 1 代循环执行记录")
 

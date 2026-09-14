@@ -65,6 +65,12 @@ EVOLUTION_COOLDOWN_SECONDS = 3600  # 1小时
 ROLLBACK_WINDOW = 10
 ROLLBACK_THRESHOLD = 0.3  # 成功率低于30%触发回滚
 
+#: 归因证据来源标记：只有当一次调参经由项目已有的显式 apply 生命周期
+#: （``evolution_apply.apply_tuner_proposals``）真正写入了账户运行参数覆盖，
+#: 并且该覆盖当前仍然指向同一次 run 时，才允许把后续 reward 归因到它。
+#: ``status='consensus'`` 或 ``merged_proposals != []`` **不**构成生效证据。
+ATTRIBUTION_LINKAGE_SOURCE = "explicit_tuner_apply_overlay"
+
 
 def _num(value, default=None):
     try:
@@ -127,6 +133,23 @@ def ensure_schema(conn):
         CREATE INDEX IF NOT EXISTS idx_evolution_tracking_status
             ON evolution_tracking(status, created_at DESC);
 
+        -- 奖励归因契约表：把"某次调参的生效窗口"与"其后成熟的 reward"显式绑定。
+        -- 每个 tracking/account 只能绑定首次 reward，reward 全局不能重复消费。
+        -- 新旧表都在下方补建唯一索引，不依赖 CREATE TABLE 更新已有表。
+        CREATE TABLE IF NOT EXISTS evolution_reward_attribution(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            tracking_id INTEGER NOT NULL,   -- evolution_tracking.id
+            reward_id INTEGER NOT NULL,     -- adaptive_rewards.id
+            account_id TEXT NOT NULL,       -- 被这次调参真实影响的账户（=策略账户 id）
+            effective_from TEXT NOT NULL,   -- 该账户上这次调参开始影响 runtime 的日期
+            linkage_source TEXT NOT NULL,   -- 归因证据来源（显式 apply 生命周期）
+            created_at TEXT NOT NULL,
+            UNIQUE(tracking_id, reward_id),
+            FOREIGN KEY (tracking_id) REFERENCES evolution_tracking(id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_evolution_reward_attribution_tracking
+            ON evolution_reward_attribution(tracking_id, reward_id);
+
         -- 进化事件日志
         CREATE TABLE IF NOT EXISTS evolution_log(
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -138,6 +161,19 @@ def ensure_schema(conn):
             FOREIGN KEY (params_id) REFERENCES evolution_params(id)
         );
     """)
+    # 原子安装两个索引：兼容旧 schema，保留 id/证据/评估。旧数据冲突时
+    # fail closed，回滚索引安装而不是猜测赢家、删除或重新归因历史记录。
+    conn.execute("SAVEPOINT attribution_uniqueness")
+    try:
+        conn.execute("""CREATE UNIQUE INDEX IF NOT EXISTS uq_evolution_attribution_account
+                        ON evolution_reward_attribution(tracking_id, account_id)""")
+        conn.execute("""CREATE UNIQUE INDEX IF NOT EXISTS uq_evolution_attribution_reward
+                        ON evolution_reward_attribution(reward_id)""")
+    except sqlite3.Error:
+        conn.execute("ROLLBACK TO attribution_uniqueness")
+        conn.execute("RELEASE attribution_uniqueness")
+        raise
+    conn.execute("RELEASE attribution_uniqueness")
     # 生命周期表（显式 active 指针 / 激活历史 / 迁移标记），并跑一次性
     # legacy bootstrap 把旧库的 latest row 语义固化成初始指针。
     EA.ensure_schema(conn)
@@ -281,6 +317,115 @@ def evaluate_run(conn, tracking_id: int, eval_score: float, eval_detail: dict = 
         (max(-1.0, min(1.0, eval_score)), _json(eval_detail or {}), _now(), tracking_id)
     )
     conn.commit()
+
+
+def get_tracking(conn, tracking_id: int) -> Optional[dict]:
+    """读取一条 evolution_tracking 追踪行（不存在返回 None）。"""
+    row = conn.execute(
+        """SELECT id, run_id, trigger, mode, status, market_regime, applied,
+                  applied_count, evaluated, eval_score, eval_detail, eval_at,
+                  evolution_params_id, created_at
+           FROM evolution_tracking WHERE id=?""",
+        (int(tracking_id),),
+    ).fetchone()
+    return dict(row) if row is not None else None
+
+
+def _attribution_row(row) -> Optional[dict]:
+    if row is None:
+        return None
+    return {
+        "id": int(row["id"]),
+        "tracking_id": int(row["tracking_id"]),
+        "reward_id": int(row["reward_id"]),
+        "account_id": str(row["account_id"]),
+        "effective_from": str(row["effective_from"]),
+        "linkage_source": str(row["linkage_source"]),
+        "created_at": str(row["created_at"]),
+    }
+
+
+_ATTRIBUTION_COLUMNS = (
+    "id, tracking_id, reward_id, account_id, effective_from, linkage_source, created_at"
+)
+
+
+def get_reward_attribution(conn, tracking_id: int, reward_id: int) -> Optional[dict]:
+    """读取 ``(tracking_id, reward_id)`` 的归因记录（不存在返回 None）。"""
+    row = conn.execute(
+        f"SELECT {_ATTRIBUTION_COLUMNS} FROM evolution_reward_attribution "
+        "WHERE tracking_id=? AND reward_id=?",
+        (int(tracking_id), int(reward_id)),
+    ).fetchone()
+    return _attribution_row(row)
+
+
+def list_reward_attributions(conn, tracking_id: int = None, limit: int | None = 100) -> list:
+    """按 tracking 列出归因；评估用 limit=None，不能截断 run 的完整证据集。"""
+    sql = f"SELECT {_ATTRIBUTION_COLUMNS} FROM evolution_reward_attribution"
+    args = []
+    if tracking_id is not None:
+        sql += " WHERE tracking_id=?"
+        args.append(int(tracking_id))
+    sql += " ORDER BY id ASC"
+    if limit is not None:
+        sql += " LIMIT ?"
+        args.append(int(limit))
+    return [_attribution_row(row) for row in conn.execute(sql, args).fetchall()]
+
+
+def record_reward_attribution(conn, tracking_id: int, reward_id: int, account_id: str,
+                              effective_from: str,
+                              linkage_source: str = ATTRIBUTION_LINKAGE_SOURCE):
+    """幂等写入一条"调参 → reward"归因记录。
+
+    返回 ``(row, created)``：``created=True`` 表示本次真正落库，``False`` 表示
+    ``(tracking_id, reward_id)`` 已存在**且字段完全一致**（重复的调度/学习周期
+    重复到达同一结论，属于幂等成功）。
+
+    已存在但 account_id / effective_from / linkage_source 任一不同 → 抛
+    ``ValueError``（fail closed：绝不改写首次决定的归因）。
+    """
+    tracking_id = int(tracking_id)
+    reward_id = int(reward_id)
+    account_id = str(account_id or "")
+    effective_from = str(effective_from or "")
+    linkage_source = str(linkage_source or "")
+    if tracking_id <= 0 or reward_id <= 0:
+        raise ValueError(
+            f"归因必须绑定真实记录: tracking_id={tracking_id!r} reward_id={reward_id!r}"
+        )
+    if not account_id or not effective_from or not linkage_source:
+        raise ValueError("归因缺少 account_id / effective_from / linkage_source")
+
+    existing = get_reward_attribution(conn, tracking_id, reward_id)
+    if existing is not None:
+        conflict = (
+            existing["account_id"] != account_id
+            or existing["effective_from"] != effective_from
+            or existing["linkage_source"] != linkage_source
+        )
+        if conflict:
+            raise ValueError(
+                f"归因已存在且字段冲突（tracking_id={tracking_id} reward_id={reward_id}）："
+                f"已记录 account={existing['account_id']} effective_from={existing['effective_from']} "
+                f"source={existing['linkage_source']}，"
+                f"新值 account={account_id} effective_from={effective_from} "
+                f"source={linkage_source}，拒绝改写首次决定"
+            )
+        return existing, False
+
+    conn.execute(
+        """INSERT INTO evolution_reward_attribution(
+               tracking_id, reward_id, account_id, effective_from, linkage_source, created_at)
+           VALUES(?,?,?,?,?,?)""",
+        (tracking_id, reward_id, account_id, effective_from, linkage_source, _now()),
+    )
+    conn.commit()
+    row = get_reward_attribution(conn, tracking_id, reward_id)
+    if row is None:  # pragma: no cover - 仅在并发删除等异常情况下发生
+        raise sqlite3.IntegrityError("归因写入后立即丢失")
+    return row, True
 
 
 def get_performance_metrics(conn, window: int = 20) -> dict:
