@@ -87,7 +87,7 @@ class PaperHotpathBoundaryTests(unittest.TestCase):
 
     def test_run_slot_wires_hot_path_profile_to_storage_db(self):
         """run_slot must pass hot_path=True to _db on hot slots and False on cold slots."""
-        from unittest.mock import patch, MagicMock
+        from unittest.mock import patch
         import paper_trading as PT
 
         captured_calls = []
@@ -97,10 +97,6 @@ class PaperHotpathBoundaryTests(unittest.TestCase):
             captured_calls.append(kwargs.get("hot_path", False))
             return real_db(*args, **kwargs)
 
-        with patch.object(PT, "_is_trade_weekday", return_value=False):
-            # Non-trading day returns early before DB, so let's allow trading day
-            pass
-
         with patch.object(PT, "_is_trade_weekday", return_value=True), \
              patch.object(PT, "_db", side_effect=capturing_db), \
              patch.object(PT, "_assert_active_lease", return_value=None), \
@@ -108,12 +104,12 @@ class PaperHotpathBoundaryTests(unittest.TestCase):
 
             # Run hot slot: "intraday"
             captured_calls.clear()
-            res_intraday = PT.run_slot("intraday", force=True)
+            PT.run_slot("intraday", force=True)
             self.assertIn(True, captured_calls, "Hot slot 'intraday' must wire hot_path=True into _db")
 
             # Run cold slot: "close"
             captured_calls.clear()
-            res_close = PT.run_slot("close", force=True)
+            PT.run_slot("close", force=True)
             self.assertTrue(all(hp is False for hp in captured_calls), "Cold slot 'close' must keep hot_path=False")
 
 

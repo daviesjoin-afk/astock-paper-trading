@@ -1377,7 +1377,7 @@ HOT_PATH_SLOTS = {
 }
 
 
-def _is_hot_path_slot(slot: Optional[str]) -> bool:
+def _is_hot_path_slot(slot: str | None) -> bool:
     """判断给定 slot 是否属于对延迟和锁等待敏感的交易热路径。"""
     return bool(slot and str(slot).lower() in HOT_PATH_SLOTS)
 

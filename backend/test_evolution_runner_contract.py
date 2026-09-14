@@ -11,10 +11,9 @@ if BACKEND not in sys.path:
     sys.path.insert(0, BACKEND)
 
 from evolution_loop_runner import _result_exit_code, main
-import evolution_loop_runner as runner
 import evolution_loop as EL
 import universe as U
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch
 from contextlib import contextmanager
 import tempfile
 
