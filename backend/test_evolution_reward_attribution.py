@@ -45,6 +45,7 @@ if BACKEND not in sys.path:
     sys.path.insert(0, BACKEND)
 
 import adaptive_engine as AE
+import adaptive_selection as ASEL
 import evolution_apply
 import self_evolution as SE
 
@@ -173,6 +174,10 @@ class RewardAttributionTestBase(unittest.TestCase):
                 CREATE TABLE IF NOT EXISTS paper_audit(
                     id INTEGER PRIMARY KEY AUTOINCREMENT, account_id TEXT,
                     event TEXT NOT NULL, detail TEXT, created_at TEXT NOT NULL);
+                CREATE TABLE IF NOT EXISTS paper_parameter_versions(
+                    id INTEGER PRIMARY KEY AUTOINCREMENT, cycle_id INTEGER,
+                    account_id TEXT, version TEXT, style TEXT, params TEXT,
+                    reason TEXT, effective_date TEXT, created_at TEXT);
                 """
             )
             conn.execute(
@@ -560,6 +565,82 @@ class NotEffectiveTrackingTests(RewardAttributionTestBase):
         report = self._reconcile()
         self.assertEqual(report["evaluated"], [])
         self.assertEqual([w["tracking_id"] for w in report["waiting_evidence"]], [tracking_id])
+
+
+class OverlaySupersedeTests(RewardAttributionTestBase):
+    """生效是**活**属性：overlay 被别的通道顶掉后，这次调参不再生效。
+
+    这是"双条件"里第二条件真正吃劲的场景。``applied_ids`` 单独并不足够：
+    ``rollback_tuner_overlay`` 会顺手把账户从 ``applied_ids`` 里摘掉，所以回滚
+    由 ``applied_ids`` 就能挡住；但**选股进化通道**
+    （``adaptive_selection.apply_candidate``）写入 ``adaptive_selection`` /
+    ``adaptive_selection_meta`` 时**不检查**账户上是否已有生效的 tuner 覆盖，
+    于是 ``applied_ids`` 仍列着该账户、而 overlay 已经指向别人的版本。
+    此时只有"当前 meta 是否仍指向这次 run"能判定它已经不再生效。
+    """
+
+    def _supersede_via_selection_channel(self, effective_day):
+        """走真实选股进化 apply 通道，用另一条版本覆盖账户 overlay。"""
+        with self._adaptive_ctx() as conn:
+            ASEL.ensure_schema(conn)
+            cursor = conn.execute(
+                """INSERT INTO adaptive_selection_candidates(
+                       run_date,account_id,regime,model_id,baseline_params,candidate_params,
+                       evidence,status,tier,reason,created_at,updated_at)
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (effective_day.isoformat(), ACCOUNT_ID, "trend", SOURCE_STRATEGY,
+                 json.dumps({"weights": _base_weights()}),
+                 json.dumps({"weights": _base_weights()}),
+                 "{}", "eligible_manual_review", "manual_review",
+                 "supersede an active tuner overlay",
+                 "2026-01-01T00:00:00+08:00", "2026-01-01T00:00:00+08:00"),
+            )
+            conn.commit()
+            candidate_id = cursor.lastrowid
+        conn = self._adaptive()
+        try:
+            ASEL.apply_candidate(
+                conn, self.paper_path, candidate_id,
+                lambda: "2026-01-01T00:00:00+08:00", approved_by="acceptance_operator")
+        finally:
+            conn.close()
+        return candidate_id
+
+    def test_D_superseded_overlay_is_no_longer_effective(self):
+        run_id = self._seed_tuner_run()
+        tracking_id = self._track_run(run_id)
+        self._apply_run(run_id)
+        effective_from = self._effective_from()
+        reward_id = self._seed_reward(
+            (effective_from + dt.timedelta(days=1)).isoformat(),
+            (effective_from + dt.timedelta(days=3)).isoformat())
+
+        self._supersede_via_selection_channel(effective_from)
+
+        # 前置事实：applied_ids 仍列着该账户（所以光看它挡不住）
+        with self._adaptive_ctx() as conn:
+            applied_ids = json.loads(conn.execute(
+                "SELECT applied_ids FROM dual_ai_tuning_runs WHERE id=?", (run_id,)
+            ).fetchone()[0])
+        with self._paper_ctx() as conn:
+            meta = json.loads(conn.execute(
+                "SELECT params FROM paper_accounts WHERE id=?", (ACCOUNT_ID,)
+            ).fetchone()[0])["adaptive_selection_meta"]
+        self.assertEqual(applied_ids, [ACCOUNT_ID])
+        self.assertNotEqual(meta.get("run_id"), run_id)
+
+        report = self._reconcile()
+        self.assertEqual(report["evaluated"], [])
+        self.assertEqual([w["tracking_id"] for w in report["waiting_evidence"]], [tracking_id])
+
+        with self._adaptive_ctx() as conn:
+            SE.record_reward_attribution(
+                conn, tracking_id, reward_id, ACCOUNT_ID, effective_from.isoformat())
+            with self.assertRaises(ValueError) as ctx:
+                AE.evaluate_tuning_from_reward(
+                    tracking_id=tracking_id, reward_id=reward_id, conn=conn)
+        self.assertIn("未真正进入生效状态", str(ctx.exception))
+        self.assertEqual(self._tracking(tracking_id)["evaluated"], 0)
 
 
 class MissingAttributionTests(RewardAttributionTestBase):
