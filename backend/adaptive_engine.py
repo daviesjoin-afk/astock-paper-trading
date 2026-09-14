@@ -3464,13 +3464,15 @@ def evolution_log_fn(limit=50):
         return self_evolution.get_evolution_log(conn, limit)
 
 
-EVOLUTION_REWARD_SCORE_VERSION = "adaptive-reward-v1"
+EVOLUTION_REWARD_SCORE_VERSION = "adaptive-reward-v2"
 
 
 def _reward_to_evolution_score(raw_reward: Any) -> float:
     """Map production raw_reward into a bounded evolution eval_score in [-1.0, 1.0].
 
     Fails closed on missing, non-numeric, NaN, or infinite values.
+    Uses continuous, monotonic math.tanh to ensure strict sign preservation,
+    smooth saturation, and no artificial segment boundaries.
     """
     if raw_reward is None:
         raise ValueError("raw_reward cannot be None")
@@ -3481,11 +3483,7 @@ def _reward_to_evolution_score(raw_reward: Any) -> float:
     if not math.isfinite(val):
         raise ValueError(f"raw_reward must be a finite number: {val!r}")
 
-    if abs(val) > 1.0:
-        score = val / 10.0
-    else:
-        score = val
-    return max(-1.0, min(1.0, float(score)))
+    return float(math.tanh(val))
 
 
 def evaluate_tuning_from_reward(

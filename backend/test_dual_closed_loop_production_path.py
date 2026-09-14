@@ -15,6 +15,7 @@ Strict invariants enforced:
 from __future__ import annotations
 
 import json
+import math
 import os
 import sqlite3
 import sys
@@ -442,21 +443,58 @@ class EvolutionRewardScoreServiceTests(unittest.TestCase):
     def test_reward_to_evolution_score_positive(self):
         score = AE._reward_to_evolution_score(0.75)
         self.assertGreater(score, 0.0)
-        self.assertLessEqual(score, 1.0)
-        self.assertEqual(score, 0.75)
+        self.assertLess(score, 1.0)
+        self.assertAlmostEqual(score, math.tanh(0.75), places=7)
 
     def test_reward_to_evolution_score_negative(self):
         score = AE._reward_to_evolution_score(-0.45)
         self.assertLess(score, 0.0)
-        self.assertGreaterEqual(score, -1.0)
-        self.assertEqual(score, -0.45)
+        self.assertGreater(score, -1.0)
+        self.assertAlmostEqual(score, math.tanh(-0.45), places=7)
 
     def test_reward_to_evolution_score_large_magnitude_clamps(self):
         score_pos = AE._reward_to_evolution_score(15.0)
-        self.assertEqual(score_pos, 1.0, "Large positive reward must clamp to 1.0")
+        self.assertGreater(score_pos, 0.9999)
+        self.assertLessEqual(score_pos, 1.0)
 
         score_neg = AE._reward_to_evolution_score(-25.0)
-        self.assertEqual(score_neg, -1.0, "Large negative reward must clamp to -1.0")
+        self.assertLess(score_neg, -0.9999)
+        self.assertGreaterEqual(score_neg, -1.0)
+
+    def test_reward_score_is_monotonic_across_old_boundary(self):
+        values = [0.0, 0.5, 0.99, 1.0, 1.01, 2.0, 10.0]
+        scores = [AE._reward_to_evolution_score(x) for x in values]
+        for left, right in zip(scores, scores[1:], strict=False):
+            self.assertLess(left, right)
+
+        neg_values = [-10.0, -2.0, -1.01, -1.0, -0.99, -0.5, 0.0]
+        neg_scores = [AE._reward_to_evolution_score(x) for x in neg_values]
+        for left, right in zip(neg_scores, neg_scores[1:], strict=False):
+            self.assertLess(left, right)
+
+        self.assertEqual(AE._reward_to_evolution_score(0.0), 0.0)
+        self.assertGreater(AE._reward_to_evolution_score(0.5), 0.0)
+        self.assertLess(AE._reward_to_evolution_score(-0.5), 0.0)
+        self.assertAlmostEqual(
+            AE._reward_to_evolution_score(-0.75),
+            -AE._reward_to_evolution_score(0.75),
+            places=9,
+        )
+        for v in values + neg_values:
+            self.assertLess(abs(AE._reward_to_evolution_score(v)), 1.0)
+
+        # Critical regression: no inversion or drop at +-1.0 boundary
+        s_099 = AE._reward_to_evolution_score(0.99)
+        s_100 = AE._reward_to_evolution_score(1.00)
+        s_101 = AE._reward_to_evolution_score(1.01)
+        self.assertGreater(s_101, s_100)
+        self.assertGreater(s_100, s_099)
+
+        s_neg_099 = AE._reward_to_evolution_score(-0.99)
+        s_neg_100 = AE._reward_to_evolution_score(-1.00)
+        s_neg_101 = AE._reward_to_evolution_score(-1.01)
+        self.assertGreater(s_neg_099, s_neg_100)
+        self.assertGreater(s_neg_100, s_neg_101)
 
     def test_reward_to_evolution_score_non_finite_fails(self):
         for invalid in (float("nan"), float("inf"), float("-inf"), None, "not-a-number"):
