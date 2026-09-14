@@ -1022,6 +1022,22 @@ def _entry_freeze_status(force=False):
             )
             current_signature = _selection_factor_manifest_signature()
             signature_ok = bool(current_signature and factor_meta.get("signature") == current_signature)
+            # The manifest is also updated as the recovery job records a
+            # completed same-day K-line.  Its file mtime is deliberately part
+            # of the signature, so that update can happen *after* a valid
+            # factor snapshot was persisted.  Freezing every new entry in
+            # that situation is needlessly disruptive: the snapshot already
+            # proves it covers the current completed trading day and meets the
+            # eligible-universe threshold.  Keep a one-day-old snapshot on
+            # the stricter degraded path below; this exception is only for a
+            # current-date, bounded-age factor artifact.
+            same_day_manifest_refresh_ok = bool(
+                not signature_ok
+                and cached_factor_date == expected_factor_date
+                and int(factor_meta.get("factor_rows") or 0) >= CANDIDATE_FACTOR_MIN_ROWS
+                and cached_coverage >= CANDIDATE_FACTOR_MIN_COVERAGE * 100
+                and os.path.exists(SELECTION_FACTORS_PATH)
+            )
             degraded_signature_ok = bool(
                 factor_lag == 1
                 and int(factor_meta.get("factor_rows") or 0) >= CANDIDATE_FACTOR_MIN_ROWS
@@ -1030,7 +1046,8 @@ def _entry_freeze_status(force=False):
             factor_ok = (int(factor_meta.get("factor_rows") or 0) >= CANDIDATE_FACTOR_MIN_ROWS
                          and built_age is not None and built_age <= SELECTION_FACTOR_MAX_CACHE_AGE_SECONDS
                          and cached_coverage >= CANDIDATE_FACTOR_MIN_COVERAGE * 100
-                         and factor_date_ok and signature_ok and os.path.exists(SELECTION_FACTORS_PATH))
+                         and factor_date_ok and (signature_ok or same_day_manifest_refresh_ok)
+                         and os.path.exists(SELECTION_FACTORS_PATH))
             if not factor_ok and degraded_signature_ok and built_age is not None and built_age <= 4 * 86400 and os.path.exists(SELECTION_FACTORS_PATH):
                 factor_ok = True
             checks["factor_cache"] = {"rows": int(factor_meta.get("factor_rows") or 0),
@@ -1039,6 +1056,7 @@ def _entry_freeze_status(force=False):
                                        "factor_lag": factor_lag, "degraded_fallback": bool(degraded_signature_ok and not signature_ok),
                                        "eligible_factor_coverage_pct": cached_coverage,
                                        "factor_date_ok": factor_date_ok, "manifest_signature_ok": signature_ok,
+                                       "same_day_manifest_refresh_ok": same_day_manifest_refresh_ok,
                                        "passed": factor_ok}
         except (OSError, TypeError, ValueError, RuntimeError):
             checks["factor_cache"] = {"rows": 0, "age_seconds": None, "passed": False}

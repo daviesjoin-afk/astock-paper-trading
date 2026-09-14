@@ -65,6 +65,14 @@ LEARNING_HEARTBEAT = os.path.join(CACHE_DIR, ".learning_cycle.heartbeat")
 # recovery after OOM/restart; completed rows remain untouched.
 _LEARNING_STALE_HOURS = 2
 
+# Schema changes are a deployment/startup concern, not a read-model concern.
+# Calling additive DDL and INSERT OR IGNORE from every GET turns harmless
+# dashboard polling into a SQLite writer that competes with the scheduled
+# learning worker.  Keep a process-local readiness marker; each long-lived
+# process bootstraps once and normal connections remain read-safe.
+_SCHEMA_READY = False
+_SCHEMA_READY_LOCK = threading.RLock()
+
 
 def _learning_heartbeat_write(started_at: str) -> None:
     try:
@@ -274,17 +282,42 @@ def _median(values, default=0.0):
 
 @contextmanager
 def _connect():
+    initialize_schema()
     os.makedirs(CACHE_DIR, exist_ok=True)
     conn = sqlite3.connect(DB_PATH, timeout=30)
     conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA busy_timeout=30000")
     try:
-        _init_schema(conn)
         yield conn
         conn.commit()
     finally:
         conn.close()
+
+
+def initialize_schema():
+    """Initialize/migrate the adaptive store once for this process.
+
+    SQLite persists WAL mode at the database level, so repeating it (and the
+    additive schema writes) per request only increases writer contention.
+    ``timeout`` plus the lock keeps concurrent startup requests from treating
+    a transient worker write as a permanent API failure.
+    """
+    global _SCHEMA_READY
+    if _SCHEMA_READY:
+        return
+    with _SCHEMA_READY_LOCK:
+        if _SCHEMA_READY:
+            return
+        os.makedirs(CACHE_DIR, exist_ok=True)
+        conn = sqlite3.connect(DB_PATH, timeout=30)
+        try:
+            conn.execute("PRAGMA busy_timeout=30000")
+            conn.execute("PRAGMA journal_mode=WAL")
+            _init_schema(conn)
+            conn.commit()
+            _SCHEMA_READY = True
+        finally:
+            conn.close()
 
 
 def _init_schema(conn):

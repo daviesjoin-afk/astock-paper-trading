@@ -27,6 +27,7 @@ import paper_trading as P
 import selection_tracking as ST
 import metrics as MET
 import operator_auth
+import adaptive_engine as ADAPTIVE
 from fastapi.exception_handlers import request_validation_exception_handler
 from fastapi.exceptions import RequestValidationError
 from api_paper import risk_refresh_status, router as paper_router
@@ -463,6 +464,10 @@ async def _lifespan(_app):
     # 请求中调用 init_db()，因此必须在服务启动阶段为全新克隆创建基础表；
     # 否则空数据卷会出现首页/风险页因 paper_jobs/paper_cycles 缺表而 500。
     P.init_db()
+    # Adaptive schema migration is intentionally startup-only.  Read APIs
+    # must not execute DDL/default writes while the scheduled worker owns a
+    # SQLite transaction.
+    ADAPTIVE.initialize_schema()
     # Deterministic demo mode: ASTOCK_DEMO=1 seeds a fully synthetic universe
     # and a narrated paper ledger (T+1 reject, stale-quote reject, hard-stop
     # sell, limit-up buy, NAV curve) so a fresh clone shows the whole

@@ -996,6 +996,20 @@ class ReplayClockContractTests(OfflinePaperEnv, unittest.TestCase):
         self.assertTrue(status["checks"]["factor_cache"]["passed"], status)
         self.assertFalse(status["enabled"], status)
 
+    def test_entry_freeze_allows_current_day_factor_after_manifest_refresh(self):
+        """A recovery manifest mtime bump must not freeze a valid same-day factor."""
+        original = PT._selection_factor_manifest_signature
+        try:
+            PT._selection_factor_manifest_signature = lambda: ["manifest-updated-after-factor"]
+            status = PT._entry_freeze_status(force=True)
+        finally:
+            PT._selection_factor_manifest_signature = original
+        factor = status["checks"]["factor_cache"]
+        self.assertFalse(factor["manifest_signature_ok"], status)
+        self.assertTrue(factor["same_day_manifest_refresh_ok"], status)
+        self.assertTrue(factor["passed"], status)
+        self.assertFalse(status["enabled"], status)
+
 
 if __name__ == "__main__":
     unittest.main()

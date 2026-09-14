@@ -25,7 +25,7 @@ _METRICS_TTL_SECONDS = 10.0
 def _safe_float(value, default=0.0):
     try:
         num = float(value)
-        return num if num != num else default  # NaN check
+        return num if num == num else default  # NaN check
     except (TypeError, ValueError):
         return default
 
