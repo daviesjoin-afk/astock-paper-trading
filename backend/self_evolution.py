@@ -134,8 +134,8 @@ def ensure_schema(conn):
             ON evolution_tracking(status, created_at DESC);
 
         -- 奖励归因契约表：把"某次调参的生效窗口"与"其后成熟的 reward"显式绑定。
-        -- 因果关系必须落库（不能只放在 JSON 里），UNIQUE(tracking_id,reward_id)
-        -- 让重复的学习周期/调度周期天然幂等。
+        -- 每个 tracking/account 只能绑定首次 reward，reward 全局不能重复消费。
+        -- 新旧表都在下方补建唯一索引，不依赖 CREATE TABLE 更新已有表。
         CREATE TABLE IF NOT EXISTS evolution_reward_attribution(
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             tracking_id INTEGER NOT NULL,   -- evolution_tracking.id
@@ -161,6 +161,19 @@ def ensure_schema(conn):
             FOREIGN KEY (params_id) REFERENCES evolution_params(id)
         );
     """)
+    # 原子安装两个索引：兼容旧 schema，保留 id/证据/评估。旧数据冲突时
+    # fail closed，回滚索引安装而不是猜测赢家、删除或重新归因历史记录。
+    conn.execute("SAVEPOINT attribution_uniqueness")
+    try:
+        conn.execute("""CREATE UNIQUE INDEX IF NOT EXISTS uq_evolution_attribution_account
+                        ON evolution_reward_attribution(tracking_id, account_id)""")
+        conn.execute("""CREATE UNIQUE INDEX IF NOT EXISTS uq_evolution_attribution_reward
+                        ON evolution_reward_attribution(reward_id)""")
+    except sqlite3.Error:
+        conn.execute("ROLLBACK TO attribution_uniqueness")
+        conn.execute("RELEASE attribution_uniqueness")
+        raise
+    conn.execute("RELEASE attribution_uniqueness")
     # 生命周期表（显式 active 指针 / 激活历史 / 迁移标记），并跑一次性
     # legacy bootstrap 把旧库的 latest row 语义固化成初始指针。
     EA.ensure_schema(conn)
@@ -347,21 +360,18 @@ def get_reward_attribution(conn, tracking_id: int, reward_id: int) -> Optional[d
     return _attribution_row(row)
 
 
-def list_reward_attributions(conn, tracking_id: int = None, limit: int = 100) -> list:
-    """按 tracking（可选）列出归因记录，供审计与测试断言使用。"""
-    if tracking_id is None:
-        rows = conn.execute(
-            f"SELECT {_ATTRIBUTION_COLUMNS} FROM evolution_reward_attribution "
-            "ORDER BY id ASC LIMIT ?",
-            (int(limit),),
-        ).fetchall()
-    else:
-        rows = conn.execute(
-            f"SELECT {_ATTRIBUTION_COLUMNS} FROM evolution_reward_attribution "
-            "WHERE tracking_id=? ORDER BY id ASC LIMIT ?",
-            (int(tracking_id), int(limit)),
-        ).fetchall()
-    return [_attribution_row(row) for row in rows]
+def list_reward_attributions(conn, tracking_id: int = None, limit: int | None = 100) -> list:
+    """按 tracking 列出归因；评估用 limit=None，不能截断 run 的完整证据集。"""
+    sql = f"SELECT {_ATTRIBUTION_COLUMNS} FROM evolution_reward_attribution"
+    args = []
+    if tracking_id is not None:
+        sql += " WHERE tracking_id=?"
+        args.append(int(tracking_id))
+    sql += " ORDER BY id ASC"
+    if limit is not None:
+        sql += " LIMIT ?"
+        args.append(int(limit))
+    return [_attribution_row(row) for row in conn.execute(sql, args).fetchall()]
 
 
 def record_reward_attribution(conn, tracking_id: int, reward_id: int, account_id: str,

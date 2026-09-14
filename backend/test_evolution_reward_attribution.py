@@ -86,9 +86,9 @@ def _frozen_apply_clock(moment: dt.datetime):
         yield stamp
 
 
-def _base_weights():
+def _base_weights(source_strategy=SOURCE_STRATEGY):
     import strategies as S
-    return dict(S.PAPER_WEIGHTS[SOURCE_STRATEGY])
+    return dict(S.PAPER_WEIGHTS[source_strategy])
 
 
 class RewardAttributionTestBase(unittest.TestCase):
@@ -180,15 +180,19 @@ class RewardAttributionTestBase(unittest.TestCase):
                     reason TEXT, effective_date TEXT, created_at TEXT);
                 """
             )
+        self._seed_account(ACCOUNT_ID, SOURCE_STRATEGY)
+
+    # -- seeders -----------------------------------------------------------
+    def _seed_account(self, account_id, source_strategy):
+        with self._paper_ctx() as conn:
             conn.execute(
                 "INSERT INTO paper_accounts(id,name,source_strategy,status,initial_cash,"
                 "cash,cycle_days,max_positions,max_weight,max_exposure,version,params,updated_at) "
                 "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                (ACCOUNT_ID, ACCOUNT_ID, SOURCE_STRATEGY, "active", 100000.0, 100000.0,
+                (account_id, account_id, source_strategy, "active", 100000.0, 100000.0,
                  60, 15, 0.10, 0.80, "v1", "{}", "2026-01-01T00:00:00+08:00"),
             )
 
-    # -- seeders -----------------------------------------------------------
     def _seed_tuner_run(self, status="consensus", applied_ids=None,
                         proposals=None, created_at=None):
         """写入一条调参运行（真实 dual_ai_tuner 也写这张表）。"""
@@ -204,10 +208,11 @@ class RewardAttributionTestBase(unittest.TestCase):
             )
             return cursor.lastrowid
 
-    def _proposal(self, delta=0.02):
+    def _proposal(self, delta=0.02, account_id=ACCOUNT_ID,
+                  source_strategy=SOURCE_STRATEGY):
         return {
-            "account_id": ACCOUNT_ID,
-            "weights": {k: v + delta for k, v in _base_weights().items()},
+            "account_id": account_id,
+            "weights": {k: v + delta for k, v in _base_weights(source_strategy).items()},
             "entry_score_delta": 0.0,
             "conditions": {},
         }
@@ -264,6 +269,16 @@ class RewardAttributionTestBase(unittest.TestCase):
         with self._adaptive_ctx() as conn:
             return SE.list_reward_attributions(conn, tracking_id)
 
+    def _snapshot(self):
+        # SELECT * 覆盖 get_tracking 未返回的列，也保留原始 eval_detail 字符串。
+        with self._adaptive_ctx() as conn:
+            return (
+                [dict(row) for row in conn.execute(
+                    "SELECT * FROM evolution_tracking ORDER BY id")],
+                [dict(row) for row in conn.execute(
+                    "SELECT * FROM evolution_reward_attribution ORDER BY id")],
+            )
+
 
 class EffectiveTuningPositivePathTests(RewardAttributionTestBase):
     """F：真实因果顺序的正向路径。"""
@@ -308,8 +323,20 @@ class EffectiveTuningPositivePathTests(RewardAttributionTestBase):
         self.assertAlmostEqual(tracking["eval_score"], math.tanh(0.8), places=9)
         detail = json.loads(tracking["eval_detail"])
         self.assertEqual(detail["source"], "adaptive_rewards")
+        self.assertEqual(detail["score_mapping_version"], "adaptive-reward-v2")
         self.assertEqual(detail["score_mapping_version"], AE.EVOLUTION_REWARD_SCORE_VERSION)
-        self.assertEqual(detail["raw_reward"], 0.8)
+        self.assertEqual(detail["mapping_version"], "adaptive-reward-v2/account-mean-v1")
+        self.assertEqual(detail["aggregate_method"], "account-mean-v1")
+        self.assertEqual(detail["aggregate_score"], detail["accounts"][ACCOUNT_ID]["mapped_score"])
+        for key, expected in {
+            "reward_id": target_id, "account_id": ACCOUNT_ID, "horizon": 3,
+            "start_date": (effective_from + dt.timedelta(days=1)).isoformat(),
+            "end_date": (effective_from + dt.timedelta(days=5)).isoformat(),
+            "regime": "trend", "strategy_return_pct": 1.0, "benchmark_return_pct": 0.5,
+            "excess_return_pct": 0.5, "drawdown_pct": -1.0, "turnover_pct": 10.0,
+            "raw_reward": 0.8, "weighted_reward": 0.8,
+        }.items():
+            self.assertEqual(detail[key], expected, key)
         self.assertEqual(detail["attribution"]["account_id"], ACCOUNT_ID)
         self.assertEqual(detail["attribution"]["effective_from"], effective_from.isoformat())
 
@@ -796,9 +823,11 @@ class IdempotencyTests(RewardAttributionTestBase):
             (effective_from + dt.timedelta(days=8)).isoformat(),
             raw_reward=-0.9, horizon=5)
 
+        before = self._snapshot()
         with self._adaptive_ctx() as conn:
-            SE.record_reward_attribution(
-                conn, tracking_id, second_reward, ACCOUNT_ID, effective_from.isoformat())
+            with self.assertRaises((ValueError, sqlite3.IntegrityError)):
+                SE.record_reward_attribution(
+                    conn, tracking_id, second_reward, ACCOUNT_ID, effective_from.isoformat())
             with self.assertRaises(ValueError):
                 AE.evaluate_tuning_from_reward(
                     tracking_id=tracking_id, reward_id=second_reward, conn=conn)
@@ -806,6 +835,433 @@ class IdempotencyTests(RewardAttributionTestBase):
         tracking = self._tracking(tracking_id)
         self.assertEqual(tracking["eval_score"], first_score)
         self.assertNotEqual(first_reward, second_reward)
+        self.assertEqual(self._snapshot(), before)
+
+    def test_G_same_score_unbound_reward_cannot_replay_or_add_link(self):
+        tracking_id, first_reward, effective_from = self._positive_setup()
+        report = self._reconcile()
+        self.assertEqual(len(report["evaluated"]), 1, report)
+        second_reward = self._seed_reward(
+            (effective_from + dt.timedelta(days=6)).isoformat(),
+            (effective_from + dt.timedelta(days=8)).isoformat(),
+            raw_reward=0.6, horizon=5)
+        self.assertNotEqual(first_reward, second_reward)
+        before = self._snapshot()
+        self.assertEqual(before[0][0]["evaluated"], 1)
+        self.assertEqual([row["reward_id"] for row in before[1]], [first_reward])
+
+        # 第二条 reward 未绑定且同分；已评估时必须是身份冲突而非缺 link 的 KeyError。
+        with self._adaptive_ctx() as conn:
+            with self.assertRaises(ValueError):
+                AE.evaluate_tuning_from_reward(
+                    tracking_id=tracking_id, reward_id=second_reward, conn=conn)
+        self.assertEqual(self._snapshot(), before)
+        with self._adaptive_ctx() as conn:
+            with self.assertRaises((ValueError, sqlite3.IntegrityError)):
+                SE.record_reward_attribution(
+                    conn, tracking_id, second_reward, ACCOUNT_ID, effective_from.isoformat())
+        self.assertEqual(self._snapshot(), before)
+
+
+class MultiAccountAttributionTests(RewardAttributionTestBase):
+    """同一真实 apply 的全部生效账户共用一条 tracking、一个评估样本。"""
+
+    def setUp(self):
+        super().setUp()
+        self._seed_account("sector_rotation", "sentiment_pioneer")
+        proposals = [self._proposal(), self._proposal(
+            account_id="sector_rotation", source_strategy="sentiment_pioneer")]
+        self.run_id = self._seed_tuner_run(proposals=proposals)
+        self.tracking_id = self._track_run(self.run_id)
+        applied = self._apply_run(self.run_id)
+        self.assertTrue(applied["applied"])
+        self.assertCountEqual(applied["accounts"], [ACCOUNT_ID, "sector_rotation"])
+        with self._paper_ctx() as conn:
+            for proposal in proposals:
+                row = conn.execute("SELECT params FROM paper_accounts WHERE id=?",
+                                   (proposal["account_id"],)).fetchone()
+                params = json.loads(row["params"])
+                self.assertEqual(params["adaptive_selection"]["weights"], proposal["weights"])
+                self.assertEqual(params["adaptive_selection_meta"]["run_id"], self.run_id)
+                self.assertEqual(params["adaptive_selection_meta"]["status"], "active")
+        with self._adaptive_ctx() as conn:
+            self.evidence = AE._tuner_effectiveness(
+                conn, SE.get_tracking(conn, self.tracking_id), self.paper_path)
+        self.assertEqual(self.evidence, {
+            ACCOUNT_ID: self.applied_day, "sector_rotation": self.applied_day})
+
+    def _seed_pair(self):
+        return [self._seed_reward(
+            (self.applied_day + dt.timedelta(days=1)).isoformat(),
+            (self.applied_day + dt.timedelta(days=6)).isoformat(),
+            account_id=account_id, raw_reward=raw, horizon=horizon)
+            for account_id, raw, horizon in ((ACCOUNT_ID, 0.6, 1), ("sector_rotation", -0.2, 5))]
+
+    def _evaluated_pair(self):
+        reward_ids = self._seed_pair()
+        with self._adaptive_ctx() as conn:
+            for account_id, reward_id in zip((ACCOUNT_ID, "sector_rotation"), reward_ids, strict=True):
+                SE.record_reward_attribution(
+                    conn, self.tracking_id, reward_id, account_id,
+                    self.evidence[account_id].isoformat())
+            result = AE.evaluate_tuning_from_reward(
+                self.tracking_id, conn=conn, reward_ids=reward_ids,
+                paper_db_path=self.paper_path)
+        self.assertTrue(result["success"])
+        self.assertFalse(result["already_evaluated"])
+        self._assert_account_mean(reward_ids)
+        return reward_ids
+
+    def _assert_account_mean(self, reward_ids):
+        tracking = self._tracking(self.tracking_id)
+        self.assertEqual(tracking["evaluated"], 1)
+        detail = json.loads(tracking["eval_detail"])
+        self.assertEqual(detail["source"], "adaptive_rewards")
+        self.assertEqual(detail["score_mapping_version"], "adaptive-reward-v2")
+        self.assertEqual(detail["mapping_version"], "adaptive-reward-v2/account-mean-v1")
+        self.assertEqual(detail["aggregate_method"], "account-mean-v1")
+        self.assertEqual(set(detail["accounts"]), set(self.evidence))
+        with self._adaptive_ctx() as conn:
+            rewards = [dict(conn.execute("SELECT * FROM adaptive_rewards WHERE id=?",
+                                        (reward_id,)).fetchone()) for reward_id in reward_ids]
+            self.assertEqual(conn.execute(
+                "SELECT COUNT(*) FROM evolution_tracking WHERE run_id=?",
+                (self.run_id,)).fetchone()[0], 1)
+            self.assertEqual(SE.get_performance_metrics(conn)["sample_count"], 1)
+        score = math.fsum(math.tanh(row["raw_reward"]) for row in rewards) / 2
+        self.assertAlmostEqual(tracking["eval_score"], score, places=12)
+        self.assertAlmostEqual(detail["aggregate_score"], score, places=12)
+        links = self._attributions(self.tracking_id)
+        self.assertEqual(len(links), 2)
+        self.assertEqual({row["account_id"] for row in links}, set(self.evidence))
+        self.assertEqual({row["reward_id"] for row in links}, set(reward_ids))
+        for row in rewards:
+            account_id = row["account_id"]
+            item = detail["accounts"][account_id]
+            self.assertEqual(item["reward_id"], row["id"])
+            self.assertEqual(item["effective_from"], self.evidence[account_id].isoformat())
+            self.assertAlmostEqual(item["mapped_score"], math.tanh(row["raw_reward"]), places=12)
+            for key in ("raw_reward", "weighted_reward", "horizon", "start_date", "end_date",
+                        "regime", "strategy_return_pct", "benchmark_return_pct",
+                        "excess_return_pct", "drawdown_pct", "turnover_pct"):
+                self.assertEqual(item[key], row[key], (account_id, key))
+
+    def test_M1_waits_for_all_accounts_and_preserves_first_attribution(self):
+        first_reward = self._seed_reward(
+            (self.applied_day + dt.timedelta(days=2)).isoformat(),
+            (self.applied_day + dt.timedelta(days=3)).isoformat(), raw_reward=0.6)
+        report = self._reconcile()
+        self.assertEqual(report["status"], "ok", report)
+        self.assertEqual(report["evaluated"], [], report)
+        self.assertEqual(report["failed"], [], report)
+        self.assertEqual([row["tracking_id"] for row in report["waiting_evidence"]],
+                         [self.tracking_id])
+        tracking = self._tracking(self.tracking_id)
+        self.assertEqual(tracking["evaluated"], 0)
+        self.assertIsNone(tracking["eval_score"])
+        self.assertIsNone(tracking["eval_detail"])
+        first_links = self._attributions(self.tracking_id)
+        self.assertEqual(len(first_links), 1)
+        self.assertEqual(first_links[0]["reward_id"], first_reward)
+        self.assertEqual(first_links[0]["account_id"], ACCOUNT_ID)
+
+        # A 已落库后再出现一个时间更早、分数更高的窗口，也不能替换首次归因。
+        self._seed_reward(
+            (self.applied_day + dt.timedelta(days=1)).isoformat(),
+            (self.applied_day + dt.timedelta(days=2)).isoformat(), raw_reward=0.95)
+        waiting_snapshot = self._snapshot()
+        again = self._reconcile()
+        self.assertEqual(again["evaluated"], [], again)
+        self.assertEqual(again["failed"], [], again)
+        self.assertEqual([row["tracking_id"] for row in again["waiting_evidence"]],
+                         [self.tracking_id])
+        self.assertEqual(self._snapshot(), waiting_snapshot)
+
+        second_reward = self._seed_reward(
+            (self.applied_day + dt.timedelta(days=1)).isoformat(),
+            (self.applied_day + dt.timedelta(days=6)).isoformat(),
+            raw_reward=-0.2, account_id="sector_rotation", horizon=5)
+        ready = self._reconcile()
+        self.assertEqual(ready["status"], "ok", ready)
+        self.assertEqual(ready["failed"], [], ready)
+        self.assertEqual(ready["waiting_evidence"], [], ready)
+        self.assertEqual(len(ready["evaluated"]), 1, ready)
+        self.assertEqual(ready["evaluated"][0]["tracking_id"], self.tracking_id)
+        self._assert_account_mean([first_reward, second_reward])
+        self.assertEqual([row for row in self._attributions(self.tracking_id)
+                          if row["account_id"] == ACCOUNT_ID], first_links)
+        evaluated_snapshot = self._snapshot()
+        for _ in range(2):
+            repeat = self._reconcile()
+            self.assertEqual(repeat["evaluated"], [], repeat)
+            self.assertEqual(repeat["waiting_evidence"], [], repeat)
+            self.assertEqual(repeat["failed"], [], repeat)
+            self.assertEqual(self._snapshot(), evaluated_snapshot)
+
+    def test_M1_direct_multi_evaluation_uses_account_mean(self):
+        self._evaluated_pair()
+
+    def test_M2_multi_replay_accepts_same_ids_in_any_order(self):
+        reward_ids = self._evaluated_pair()
+        before = self._snapshot()
+        for incoming in (reward_ids, list(reversed(reward_ids))):
+            with self.subTest(reward_ids=incoming), self._adaptive_ctx() as conn:
+                result = AE.evaluate_tuning_from_reward(
+                    self.tracking_id, conn=conn, reward_ids=incoming,
+                    paper_db_path=self.paper_path)
+                self.assertTrue(result["success"])
+                self.assertTrue(result["already_evaluated"])
+                self.assertEqual(result["eval_score"], before[0][0]["eval_score"])
+                self.assertEqual(result["eval_detail"], json.loads(before[0][0]["eval_detail"]))
+            self.assertEqual(self._snapshot(), before)
+
+    def test_M2_multi_replay_rejects_missing_account(self):
+        reward_ids = self._evaluated_pair()
+        before = self._snapshot()
+        for reward_id in reward_ids:
+            with self.subTest(reward_id=reward_id), self._adaptive_ctx() as conn:
+                with self.assertRaises(ValueError):
+                    AE.evaluate_tuning_from_reward(
+                        self.tracking_id, conn=conn, reward_ids=[reward_id],
+                        paper_db_path=self.paper_path)
+                with self.assertRaises(ValueError):
+                    AE.evaluate_tuning_from_reward(self.tracking_id, reward_id, conn)
+            self.assertEqual(self._snapshot(), before)
+
+    def test_M2_multi_replay_rejects_same_score_replacement(self):
+        reward_ids = self._evaluated_pair()
+        before = self._snapshot()
+        for index, (account_id, raw) in enumerate(((ACCOUNT_ID, 0.6), ("sector_rotation", -0.2))):
+            replacement = self._seed_reward(
+                (self.applied_day + dt.timedelta(days=7)).isoformat(),
+                (self.applied_day + dt.timedelta(days=8)).isoformat(),
+                raw_reward=raw, account_id=account_id, horizon=1)
+            incoming = list(reward_ids)
+            incoming[index] = replacement
+            self.assertNotIn(replacement, reward_ids)
+            with self.subTest(account_id=account_id), self._adaptive_ctx() as conn:
+                with self.assertRaises(ValueError):
+                    AE.evaluate_tuning_from_reward(
+                        self.tracking_id, conn=conn, reward_ids=incoming,
+                        paper_db_path=self.paper_path)
+            self.assertEqual(self._snapshot(), before)
+
+    def _assert_tampered_replay_rejected(self, field, value):
+        reward_ids = self._evaluated_pair()
+        evaluated_tracking = self._snapshot()[0]
+        with self._adaptive_ctx() as conn:
+            conn.execute(f"UPDATE evolution_reward_attribution SET {field}=? "
+                         "WHERE tracking_id=? AND reward_id=?",
+                         (value, self.tracking_id, reward_ids[0]))
+        tampered = self._snapshot()
+        self.assertEqual(tampered[0], evaluated_tracking)
+        self.assertEqual(tampered[1][0][field], value)
+        with self._adaptive_ctx() as conn:
+            with self.assertRaises(ValueError):
+                AE.evaluate_tuning_from_reward(
+                    self.tracking_id, conn=conn, reward_ids=reward_ids,
+                    paper_db_path=self.paper_path)
+        # 比较的是 SQL 篡改之前的已评估 tracking；不能拿一次失败的新结果作基准。
+        self.assertEqual(self._snapshot()[0], evaluated_tracking)
+        self.assertEqual(self._snapshot(), tampered)
+
+    def test_M2_multi_replay_rejects_persisted_account_tampering(self):
+        self._assert_tampered_replay_rejected("account_id", "unrelated_account")
+
+    def test_M2_multi_replay_rejects_persisted_effective_from_tampering(self):
+        # 提前一天仍满足 reward 窗口，专门检验归因身份，而不是窗口校验碰巧拒绝。
+        self._assert_tampered_replay_rejected(
+            "effective_from", (self.applied_day - dt.timedelta(days=1)).isoformat())
+
+    def test_M2_multi_missing_link_before_evaluation_is_key_error(self):
+        reward_ids = self._seed_pair()
+        with self._adaptive_ctx() as conn:
+            SE.record_reward_attribution(
+                conn, self.tracking_id, reward_ids[0], ACCOUNT_ID,
+                self.evidence[ACCOUNT_ID].isoformat())
+        before = self._snapshot()
+        self.assertEqual(before[0][0]["evaluated"], 0)
+        with self._adaptive_ctx() as conn:
+            with self.assertRaises(KeyError):
+                AE.evaluate_tuning_from_reward(
+                    self.tracking_id, conn=conn, reward_ids=reward_ids,
+                    paper_db_path=self.paper_path)
+        self.assertEqual(self._snapshot(), before)
+
+
+class AttributionStorageTests(RewardAttributionTestBase):
+    """归因唯一性必须由 SQLite 托底，包括从 reviewed 旧表原地迁移。"""
+
+    def setUp(self):
+        super().setUp()
+        self.first_tracking = self._track_run(self._seed_tuner_run())
+        self.second_tracking = self._track_run(self._seed_tuner_run())
+        self.first_reward = self._seed_reward(
+            self.applied_day.isoformat(), self.applied_day.isoformat(), raw_reward=0.6)
+        self.second_reward = self._seed_reward(
+            (self.applied_day + dt.timedelta(days=1)).isoformat(),
+            (self.applied_day + dt.timedelta(days=2)).isoformat(), raw_reward=0.6)
+        with self._adaptive_ctx() as conn:
+            SE.record_reward_attribution(
+                conn, self.first_tracking, self.first_reward, ACCOUNT_ID,
+                self.applied_day.isoformat())
+
+    def _insert_link(self, conn, tracking_id, reward_id, account_id=ACCOUNT_ID):
+        conn.execute(
+            "INSERT INTO evolution_reward_attribution "
+            "(tracking_id,reward_id,account_id,effective_from,linkage_source,created_at) "
+            "VALUES(?,?,?,?,?,?)",
+            (tracking_id, reward_id, account_id, self.applied_day.isoformat(),
+             SE.ATTRIBUTION_LINKAGE_SOURCE, "2026-09-14T00:30:00+08:00"))
+
+    def _restore_reviewed_schema(self):
+        before = self._snapshot()
+        with self._adaptive_ctx() as conn:
+            # 仅重建临时测试库的旧表，不能靠新建库来冒充升级验证。
+            conn.executescript("""
+                DROP INDEX IF EXISTS uq_evolution_attribution_account;
+                DROP INDEX IF EXISTS uq_evolution_attribution_reward;
+                ALTER TABLE evolution_reward_attribution RENAME TO attribution_before_migration;
+                CREATE TABLE evolution_reward_attribution(
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    tracking_id INTEGER NOT NULL,
+                    reward_id INTEGER NOT NULL,
+                    account_id TEXT NOT NULL,
+                    effective_from TEXT NOT NULL,
+                    linkage_source TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    UNIQUE(tracking_id, reward_id),
+                    FOREIGN KEY (tracking_id) REFERENCES evolution_tracking(id)
+                );
+                INSERT INTO evolution_reward_attribution
+                    (id,tracking_id,reward_id,account_id,effective_from,linkage_source,created_at)
+                SELECT id,tracking_id,reward_id,account_id,effective_from,linkage_source,created_at
+                    FROM attribution_before_migration;
+                DROP TABLE attribution_before_migration;
+                CREATE INDEX idx_evolution_reward_attribution_tracking
+                    ON evolution_reward_attribution(tracking_id,reward_id);
+            """)
+            indexes = {row["name"] for row in conn.execute(
+                "PRAGMA index_list(evolution_reward_attribution)")}
+            self.assertNotIn("uq_evolution_attribution_account", indexes)
+            self.assertNotIn("uq_evolution_attribution_reward", indexes)
+        self.assertEqual(self._snapshot(), before)
+
+    def test_M3_record_rejects_reward_shared_across_trackings(self):
+        before = self._snapshot()
+        self.assertNotEqual(self.first_tracking, self.second_tracking)
+        with self._adaptive_ctx() as conn:
+            with self.assertRaises(sqlite3.IntegrityError):
+                SE.record_reward_attribution(
+                    conn, self.second_tracking, self.first_reward, ACCOUNT_ID,
+                    self.applied_day.isoformat())
+        self.assertEqual(self._snapshot(), before)
+
+    def test_M3_sql_rejects_reward_shared_across_trackings(self):
+        before = self._snapshot()
+        with self._adaptive_ctx() as conn:
+            with self.assertRaisesRegex(sqlite3.IntegrityError, "UNIQUE constraint failed"):
+                self._insert_link(conn, self.second_tracking, self.first_reward)
+        self.assertEqual(self._snapshot(), before)
+
+    def test_M3_sql_rejects_second_reward_for_same_tracking_account(self):
+        before = self._snapshot()
+        self.assertNotEqual(self.first_reward, self.second_reward)
+        with self._adaptive_ctx() as conn:
+            with self.assertRaisesRegex(sqlite3.IntegrityError, "UNIQUE constraint failed"):
+                self._insert_link(conn, self.first_tracking, self.second_reward)
+        self.assertEqual(self._snapshot(), before)
+
+    def test_M3_legacy_schema_migrates_uniqueness_without_rewriting_rows(self):
+        with self._adaptive_ctx() as conn:
+            self._insert_link(conn, self.second_tracking, self.second_reward)
+        self._restore_reviewed_schema()
+        before = self._snapshot()
+        self.assertEqual(len(before[1]), 2)
+        for _ in range(2):
+            with self._adaptive_ctx() as conn:
+                SE.ensure_schema(conn)
+                indexes = {row["name"]: row for row in conn.execute(
+                    "PRAGMA index_list(evolution_reward_attribution)")}
+                for name, columns in {
+                    "uq_evolution_attribution_account": ["tracking_id", "account_id"],
+                    "uq_evolution_attribution_reward": ["reward_id"],
+                }.items():
+                    self.assertIn(name, indexes)
+                    self.assertEqual(indexes[name]["unique"], 1)
+                    self.assertEqual(indexes[name]["partial"], 0)
+                    self.assertEqual([row["name"] for row in conn.execute(
+                        f"PRAGMA index_info({name})")], columns)
+            self.assertEqual(self._snapshot(), before)
+
+        unused_reward = self._seed_reward(
+            (self.applied_day + dt.timedelta(days=3)).isoformat(),
+            (self.applied_day + dt.timedelta(days=4)).isoformat())
+        with self._adaptive_ctx() as conn:
+            with self.assertRaisesRegex(sqlite3.IntegrityError, "UNIQUE constraint failed"):
+                self._insert_link(conn, self.first_tracking, unused_reward)
+            # 换账户以排除 account pair 冲突，单独证明 reward 唯一约束有效。
+            with self.assertRaisesRegex(sqlite3.IntegrityError, "UNIQUE constraint failed"):
+                self._insert_link(conn, self.second_tracking, self.first_reward, "sector_rotation")
+        self.assertEqual(self._snapshot(), before)
+
+    def _assert_legacy_duplicates_preserved(self, conflicting_tracking, conflicting_reward):
+        self._restore_reviewed_schema()
+        with self._adaptive_ctx() as conn:
+            self._insert_link(conn, conflicting_tracking, conflicting_reward)
+        before = self._snapshot()
+        self.assertEqual(len(before[1]), 2)
+        for _ in range(2):
+            with self._adaptive_ctx() as conn:
+                with self.assertRaises(sqlite3.IntegrityError):
+                    SE.ensure_schema(conn)
+            # 重开连接查原始全行，不能静默去重、替换 id 或重写 tracking。
+            self.assertEqual(self._snapshot(), before)
+
+    def test_M3_legacy_duplicate_account_fails_migration_without_data_loss(self):
+        self._assert_legacy_duplicates_preserved(self.first_tracking, self.second_reward)
+
+    def test_M3_legacy_shared_reward_fails_migration_without_data_loss(self):
+        self._assert_legacy_duplicates_preserved(self.second_tracking, self.first_reward)
+
+
+class ShanghaiEffectivenessTests(RewardAttributionTestBase):
+    def test_M4_effectiveness_uses_shanghai_date_at_utc_boundary(self):
+        self.applied_day = dt.date(2026, 9, 14)
+        self.applied_moment = dt.datetime(2026, 9, 14, 0, 30, tzinfo=TZ)
+        run_id = self._seed_tuner_run()
+        tracking_id = self._track_run(run_id)
+        self._apply_run(run_id)
+        self.assertEqual(self._effective_from(), self.applied_day)
+        fixed_utc = dt.datetime(2026, 9, 13, 16, 30, tzinfo=dt.timezone.utc)
+        calls = []
+
+        class BoundaryDateTime(dt.datetime):
+            @classmethod
+            def now(cls, tz=None):
+                calls.append(tz)
+                return fixed_utc.astimezone(tz) if tz is not None else fixed_utc.replace(tzinfo=None)
+
+        class BoundaryDate(dt.date):
+            @classmethod
+            def today(cls):
+                return dt.date(2026, 9, 13)
+
+        class ClockShim:
+            datetime = BoundaryDateTime
+            date = BoundaryDate
+            timedelta = dt.timedelta
+
+        self.assertEqual(ClockShim.date.today(), dt.date(2026, 9, 13))
+        self.assertEqual(AE.TZ.key, "Asia/Shanghai")
+        with self._adaptive_ctx() as conn, patch.object(AE, "dt", ClockShim):
+            evidence = AE._tuner_effectiveness(
+                conn, SE.get_tracking(conn, tracking_id), paper_db_path=self.paper_path)
+        self.assertEqual(evidence, {ACCOUNT_ID: dt.date(2026, 9, 14)})
+        self.assertTrue(calls, "生效判定必须显式调用 datetime.now(AE.TZ)")
+        for tz in calls:
+            self.assertIs(tz, AE.TZ)
+            self.assertEqual(tz.key, "Asia/Shanghai")
 
 
 class NoEvidenceTests(RewardAttributionTestBase):

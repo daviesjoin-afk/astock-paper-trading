@@ -3572,7 +3572,7 @@ def _tuner_effectiveness(conn, tracking_row, paper_db_path=None) -> dict:
         return {}
     if not paper_db_path or not os.path.exists(paper_db_path):
         return {}
-    today = dt.date.today()
+    today = dt.datetime.now(TZ).date()
     evidence = {}
     paper = paper_reader.connect(paper_db_path, timeout=30)
     try:
@@ -3622,139 +3622,138 @@ def _reward_after_effective(reward_row, effective_from):
     return start is not None and start >= effective_from
 
 
+EVOLUTION_RUN_SCORE_VERSION = "adaptive-reward-v2/account-mean-v1"
+
+
+def _aggregate_account_scores(scores) -> float:
+    """Production-owned equal account mean; caller supplies all account scores."""
+    values = list(scores)
+    if not values or any(not math.isfinite(v) or not -1 <= v <= 1 for v in values):
+        raise ValueError("run 聚合要求非空、有限的账户映射分数")
+    return math.fsum(values) / len(values)
+
+
+def _attribution_identity(links):
+    return sorted((str(link["account_id"]), int(link["reward_id"]),
+                   str(link["effective_from"])) for link in links)
+
+
+def _evaluation_identity(detail):
+    """Read the persisted evaluation snapshot, including reviewed-head singletons."""
+    accounts = detail.get("accounts")
+    if isinstance(accounts, dict) and accounts:
+        return sorted((str(account), int(item["reward_id"]), str(item["effective_from"]))
+                      for account, item in accounts.items())
+    link = detail.get("attribution") or {}
+    if detail.get("source") == "adaptive_rewards" and detail.get("reward_id") and link:
+        return [(str(link["account_id"]), int(detail["reward_id"]), str(link["effective_from"]))]
+    return []
+
+
 def evaluate_tuning_from_reward(
-    tracking_id: int, reward_id: int, conn: sqlite3.Connection | None = None
+    tracking_id: int, reward_id: int | None = None, conn: sqlite3.Connection | None = None,
+    *, reward_ids=None, paper_db_path=None,
 ) -> dict:
-    """Evaluate an evolution tuning run from an **attributable** adaptive_rewards row.
+    """Evaluate one run from its complete persisted account attribution set.
 
-    与只校验"两条记录都存在"的旧实现不同，这里要求在
-    ``(tracking_id, reward_id)`` 之间存在**已落库的归因契约**，并且该归因至今
-    仍然成立：账户匹配、reward 窗口整体落在 ``effective_from`` 之后、tracking
-    仍能证明自己真实生效。任一不成立即 fail closed（``KeyError``/``ValueError``），
-    绝不把不可归因的收益算成调参效果。
-
-    幂等：同一条归因、同一个结果重复到达 → ``already_evaluated=True`` 的成功；
-    tracking 已由**另一条** reward 评估过 → 拒绝改写首次决定。
-
-    评分映射保持不变：``raw_reward → adaptive-reward-v2 → tanh → eval_score``。
+    reward_id preserves the singleton API; multi-account callers pass reward_ids.
+    Each account contributes tanh(raw_reward); the run contributes ONE equal-mean
+    sample. Replay identity is account/reward/effective_from, never the score.
     """
     if tracking_id is None or int(tracking_id) <= 0:
         raise ValueError(f"Invalid tracking_id: {tracking_id!r}")
-    if reward_id is None or int(reward_id) <= 0:
-        raise ValueError(f"Invalid reward_id: {reward_id!r}")
+    if reward_ids is not None and reward_id is not None:
+        raise ValueError("Specify reward_id or reward_ids, not both")
+    requested = [reward_id] if reward_ids is None else list(reward_ids)
+    if not requested or any(value is None or int(value) <= 0 for value in requested):
+        raise ValueError("Invalid reward ids")
+    requested = sorted(int(value) for value in requested)
+    if len(requested) != len(set(requested)):
+        raise ValueError("Duplicate reward ids")
 
     def _execute(active_conn: sqlite3.Connection) -> dict:
         self_evolution.ensure_schema(active_conn)
         tracking_row = self_evolution.get_tracking(active_conn, int(tracking_id))
         if not tracking_row:
             raise KeyError(f"Tracking record id={tracking_id} not found in evolution_tracking")
+        links = self_evolution.list_reward_attributions(active_conn, int(tracking_id), limit=None)
+        identity = _attribution_identity(links)
+        prior_detail = _loads(tracking_row["eval_detail"], {}) or {}
+        evaluated = int(tracking_row["evaluated"] or 0) == 1
 
-        row = active_conn.execute(
-            """SELECT id, account_id, horizon, start_date, end_date, regime,
-                      strategy_return_pct, benchmark_return_pct, excess_return_pct,
-                      drawdown_pct, turnover_pct, raw_reward, weighted_reward, created_at
-               FROM adaptive_rewards WHERE id = ?""",
-            (int(reward_id),),
-        ).fetchone()
-        if not row:
-            raise KeyError(f"Reward record id={reward_id} not found in adaptive_rewards")
+        # All three identities must agree: request, persisted attribution, and the
+        # original evaluation snapshot. Equal scores prove none of these facts.
+        if evaluated:
+            if (requested != sorted(link["reward_id"] for link in links)
+                    or not identity or identity != _evaluation_identity(prior_detail)):
+                raise ValueError("已评估 tracking 的归因身份冲突，拒绝改写首次决定")
+        elif requested != sorted(link["reward_id"] for link in links):
+            raise KeyError("归因记录不存在或请求不是完整归因集合")
 
-        link = self_evolution.get_reward_attribution(
-            active_conn, int(tracking_id), int(reward_id))
-        if link is None:
-            raise KeyError(
-                f"归因记录不存在：tracking_id={tracking_id} reward_id={reward_id}。"
-                "调参效果只能由其生效之后、且已建立归因契约的 reward 评估"
-            )
+        accounts = {}
+        for link in sorted(links, key=lambda item: item["account_id"]):
+            row = active_conn.execute(
+                "SELECT * FROM adaptive_rewards WHERE id=?", (int(link["reward_id"]),)
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"Reward record id={link['reward_id']} not found in adaptive_rewards")
+            account_id = str(link["account_id"])
+            if account_id != str(row["account_id"]):
+                raise ValueError("归因账户与 reward 账户不一致，禁止跨账户评估")
+            effective_from = _iso_date(link["effective_from"])
+            if effective_from is None or not _reward_after_effective(row, effective_from):
+                raise ValueError("reward 窗口不是整体落在调参生效时间之后")
+            if account_id in accounts:
+                raise ValueError("同一账户存在多条归因，拒绝评估")
+            component = {key: row[key] for key in (
+                "horizon", "start_date", "end_date", "regime", "strategy_return_pct",
+                "benchmark_return_pct", "excess_return_pct", "drawdown_pct", "turnover_pct",
+                "raw_reward", "weighted_reward")}
+            component.update({
+                "reward_id": int(row["id"]), "account_id": account_id,
+                "effective_from": link["effective_from"],
+                "mapped_score": _reward_to_evolution_score(row["raw_reward"]),
+                "attribution": {
+                    "account_id": account_id, "effective_from": link["effective_from"],
+                    "linkage_source": link["linkage_source"], "created_at": link["created_at"],
+                },
+            })
+            accounts[account_id] = component
 
-        # 账户匹配 + 时间窗口：一律使用**已落库**的归因，而不是重新从可变
-        # overlay 推断 —— 否则后续 overlay 变化会把已被拒绝的 reward 追溯性放行。
-        account_id = str(link["account_id"])
-        if account_id != str(row["account_id"]):
-            raise ValueError(
-                f"归因账户 {account_id} 与 reward 账户 {row['account_id']} 不一致，"
-                "禁止跨账户评估"
-            )
-        effective_from = _iso_date(link["effective_from"])
-        if effective_from is None:
-            raise ValueError(f"归因 effective_from 不可解析: {link['effective_from']!r}")
-        if not _reward_after_effective(row, effective_from):
-            raise ValueError(
-                f"reward 窗口 [{row['start_date']} ~ {row['end_date']}] 不是整体落在"
-                f"调参生效时间 {effective_from.isoformat()} 之后，"
-                "跨越新旧参数的收益不能作为纯证据"
-            )
-
-        raw_reward = row["raw_reward"]
-        eval_score = _reward_to_evolution_score(raw_reward)
-
-        # 幂等：同一条归因、同一个结果 → 幂等成功，不重复产生评估样本。
-        if int(tracking_row["evaluated"] or 0) == 1:
-            previous = tracking_row["eval_score"]
-            if previous is not None and abs(float(previous) - eval_score) < 1e-9:
-                return {
-                    "success": True,
-                    "already_evaluated": True,
-                    "tracking_id": int(tracking_id),
-                    "reward_id": int(reward_id),
-                    "account_id": account_id,
-                    "effective_from": effective_from.isoformat(),
-                    "eval_score": float(previous),
-                    "eval_detail": _loads(tracking_row["eval_detail"], {}) or {},
-                }
-            raise ValueError(
-                f"tracking_id={tracking_id} 已由另一条 reward 评估过"
-                f"（现有 eval_score={previous!r}），拒绝改写首次决定的归因"
-            )
-
-        # 首次评估：tracking 必须**至今**仍能证明自己真实生效。
-        evidence = _tuner_effectiveness(active_conn, tracking_row)
-        if account_id not in evidence:
-            raise ValueError(
-                f"调参未真正进入生效状态（tracking_id={tracking_id} account={account_id}）："
-                "缺少显式 apply 证据，或覆盖已被回滚/被后续调参替换"
-            )
-        if evidence[account_id] != effective_from:
-            raise ValueError(
-                f"归因 effective_from={effective_from.isoformat()} 与当前生效证据 "
-                f"{evidence[account_id].isoformat()} 不一致，拒绝评估"
-            )
-
-        eval_detail = {
-            "source": "adaptive_rewards",
-            "reward_id": int(row["id"]),
-            "account_id": str(row["account_id"]),
-            "horizon": int(row["horizon"]),
-            "start_date": str(row["start_date"]),
-            "end_date": str(row["end_date"]),
-            "regime": str(row["regime"]),
-            "strategy_return_pct": float(row["strategy_return_pct"]),
-            "benchmark_return_pct": float(row["benchmark_return_pct"]),
-            "excess_return_pct": float(row["excess_return_pct"]),
-            "drawdown_pct": float(row["drawdown_pct"]),
-            "turnover_pct": float(row["turnover_pct"]),
-            "raw_reward": float(row["raw_reward"]),
-            "weighted_reward": float(row["weighted_reward"]),
-            "score_mapping_version": EVOLUTION_REWARD_SCORE_VERSION,
-            "attribution": {
-                "linkage_source": link["linkage_source"],
-                "effective_from": effective_from.isoformat(),
-                "account_id": account_id,
-                "created_at": link["created_at"],
-            },
+        eval_score = _aggregate_account_scores(item["mapped_score"] for item in accounts.values())
+        if evaluated:
+            # Identity has already been checked. Do not recompute/overwrite history
+            # or consult the now mutable overlay on an exact replay.
+            eval_detail = prior_detail
+            eval_score = float(tracking_row["eval_score"])
+        else:
+            evidence = _tuner_effectiveness(active_conn, tracking_row, paper_db_path)
+            if not evidence or set(accounts) - set(evidence):
+                raise ValueError("调参未真正进入生效状态，缺少显式 apply 证据或已被替换")
+            if set(accounts) != set(evidence):
+                raise ValueError("waiting_evidence：必须覆盖全部生效账户才能评估 run")
+            for account_id, effective_from in evidence.items():
+                if accounts[account_id]["effective_from"] != effective_from.isoformat():
+                    raise ValueError("归因 effective_from 与当前生效证据不一致，拒绝评估")
+            eval_detail = {
+                "source": "adaptive_rewards", "accounts": accounts,
+                "aggregate_method": "account-mean-v1", "aggregate_score": eval_score,
+                "mapping_version": EVOLUTION_RUN_SCORE_VERSION,
+                "score_mapping_version": EVOLUTION_REWARD_SCORE_VERSION,
+            }
+            # Keep existing single-account audit consumers compatible.
+            if len(accounts) == 1:
+                eval_detail.update(next(iter(accounts.values())))
+            self_evolution.evaluate_run(active_conn, int(tracking_id), eval_score, eval_detail)
+        result = {
+            "success": True, "already_evaluated": evaluated,
+            "tracking_id": int(tracking_id), "reward_ids": requested,
+            "eval_score": eval_score, "eval_detail": eval_detail,
         }
-
-        self_evolution.evaluate_run(active_conn, int(tracking_id), eval_score, eval_detail)
-        return {
-            "success": True,
-            "already_evaluated": False,
-            "tracking_id": int(tracking_id),
-            "reward_id": int(reward_id),
-            "account_id": account_id,
-            "effective_from": effective_from.isoformat(),
-            "eval_score": eval_score,
-            "eval_detail": eval_detail,
-        }
+        if len(accounts) == 1:
+            component = next(iter(accounts.values()))
+            result.update({key: component[key] for key in ("reward_id", "account_id", "effective_from")})
+        return result
 
     if conn is not None:
         return _execute(conn)
@@ -3763,37 +3762,26 @@ def evaluate_tuning_from_reward(
 
 
 def _attribute_one_tracking(conn, tracking_row, paper_db_path=None):
-    """为单条未评估的 tracking 找到**其生效之后**成熟的 reward 并驱动评估。
+    """Bind each effective account's first reward; evaluate only the complete run.
 
-    返回 ``None`` 表示"暂无证据"（waiting_evidence）—— 这是正常状态，不是失败。
-
-    规则：
-    - 只认**已落库的归因**；一旦首次归因确定就不再改写（幂等 / 不重复取样）。
-      若上一次周期在"落库归因"与"写入评估"之间被中断，这里会**续做**同一条归因
-      的评估，而不是另挑一条 reward —— 首次决定不可改写。
-    - 账户选择确定化：按 (effective_from, account_id) 排序取第一个有合规 reward
-      的账户，避免同一 run 覆盖多账户时结果随机。
-    - reward 选择确定化：取**生效之后最早**的合规窗口（`start_date` 升序），
-      使同一 tracking 的评估结果不随周期漂移；一条 reward 只服务一次归因，
-      防止把同一次收益重复算进多条 tracking。
+    Partial attributions are durable and resumed unchanged on the next cycle.
+    Missing evidence is normal (None); never select only the first ready account.
     """
     tracking_id = int(tracking_row["id"])
-
-    existing = self_evolution.list_reward_attributions(conn, tracking_id, limit=1)
-    if existing:
-        link = existing[0]
-        result = evaluate_tuning_from_reward(
-            tracking_id=tracking_id, reward_id=int(link["reward_id"]), conn=conn)
-        result["attribution_created"] = False
-        result["linkage_source"] = link["linkage_source"]
-        return result
-
     evidence = _tuner_effectiveness(conn, tracking_row, paper_db_path)
     if not evidence:
         return None
-
+    existing = self_evolution.list_reward_attributions(conn, tracking_id, limit=None)
+    links = {link["account_id"]: link for link in existing}
+    if set(links) - set(evidence):
+        raise ValueError("已绑定归因账户未真正进入生效状态或已被替换")
+    created_any = False
     for account_id in sorted(evidence, key=lambda a: (evidence[a], a)):
         effective_from = evidence[account_id]
+        if account_id in links:
+            if links[account_id]["effective_from"] != effective_from.isoformat():
+                raise ValueError("已绑定归因 effective_from 与当前生效证据冲突")
+            continue
         reward = conn.execute(
             """SELECT id, account_id, start_date, end_date, raw_reward
                FROM adaptive_rewards
@@ -3805,15 +3793,17 @@ def _attribute_one_tracking(conn, tracking_row, paper_db_path=None):
         if reward is None:
             continue
         link, created = self_evolution.record_reward_attribution(
-            conn, tracking_id, int(reward["id"]), account_id,
-            effective_from.isoformat(),
-        )
-        result = evaluate_tuning_from_reward(
-            tracking_id=tracking_id, reward_id=int(reward["id"]), conn=conn)
-        result["attribution_created"] = bool(created)
-        result["linkage_source"] = link["linkage_source"]
-        return result
-    return None
+            conn, tracking_id, int(reward["id"]), account_id, effective_from.isoformat())
+        links[account_id] = link
+        created_any = created_any or created
+    if set(links) != set(evidence):
+        return None
+    result = evaluate_tuning_from_reward(
+        tracking_id=tracking_id, reward_ids=[link["reward_id"] for link in links.values()],
+        conn=conn, paper_db_path=paper_db_path)
+    result["attribution_created"] = created_any
+    result["linkage_source"] = self_evolution.ATTRIBUTION_LINKAGE_SOURCE
+    return result
 
 
 def reconcile_tuning_reward_attribution(conn, paper_db_path=None, limit: int = 200) -> dict:
