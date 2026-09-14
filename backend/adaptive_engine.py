@@ -1904,6 +1904,26 @@ def run_learning_cycle(trigger="manual"):
         with _connect() as conn:
             new_rewards = _evaluate_rewards(conn)
         print(f"[learning-cycle] stage2 rewards done new_rewards={new_rewards}", flush=True)
+        # —— 阶段 2.5：调参 → 奖励归因（独立事务）——
+        # 真实因果顺序：只有**已证明生效**的调参才能消费其生效之后成熟的 reward。
+        # 没有证据 = waiting_evidence，是正常状态，绝不作为学习周期失败。
+        _learning_update_stage(run_id, "reward_attribution")
+        try:
+            with _connect() as conn:
+                reward_attribution = reconcile_tuning_reward_attribution(conn)
+        except Exception as exc:
+            # 归因是"锦上添花"的证据链，绝不是学习周期的硬依赖：
+            # 找不到证据 / 归因链路暂时不可用都不得让整轮学习失败。
+            reward_attribution = {
+                "status": "failed",
+                "error": f"{type(exc).__name__}: {exc}"[:200],
+                "evaluated": [], "already_evaluated": [],
+                "waiting_evidence": [], "failed": [],
+            }
+        print(f"[learning-cycle] stage2.5 attribution done "
+              f"evaluated={len(reward_attribution.get('evaluated') or [])} "
+              f"waiting={len(reward_attribution.get('waiting_evidence') or [])} "
+              f"failed={len(reward_attribution.get('failed') or [])}", flush=True)
         # —— 阶段 3：执行证据 + bandit 影子决策（独立事务）——
         _learning_update_stage(run_id, "bandit_decision")
         with _connect() as conn:
@@ -1971,6 +1991,13 @@ def run_learning_cycle(trigger="manual"):
                             "consensus_reason": str((dual_ai_tuning or {}).get("consensus_reason") or "")[:120],
                             "merged_proposals": len((dual_ai_tuning or {}).get("merged_proposals") or []),
                         } if dual_ai_tuning else None,
+                        "reward_attribution": {
+                            "status": reward_attribution.get("status"),
+                            "evaluated": len(reward_attribution.get("evaluated") or []),
+                            "already_evaluated": len(reward_attribution.get("already_evaluated") or []),
+                            "waiting_evidence": len(reward_attribution.get("waiting_evidence") or []),
+                            "failed": len(reward_attribution.get("failed") or []),
+                        },
                         "trade_attribution": {
                              "status": trade_attribution_result.get("status"),
                              "trade_date": trade_attribution_result.get("trade_date"),
@@ -3376,6 +3403,7 @@ def self_test():
         _mature_alpha_returns(conn)
         alpha_lab = _run_alpha_lab(conn, profile["profile_date"])
         _evaluate_rewards(conn)
+        reconcile_tuning_reward_attribution(conn)
         decision = _bandit_decision(conn, profile, conn.execute(
             "SELECT id FROM adaptive_market_profiles WHERE profile_date=?", (profile["profile_date"],)
         ).fetchone()["id"])
@@ -3486,13 +3514,129 @@ def _reward_to_evolution_score(raw_reward: Any) -> float:
     return float(math.tanh(val))
 
 
+# ─── 调参 → 奖励 归因契约（真实因果顺序，fail-closed）───
+#
+# 生产里同时存在 "paper trading → NAV → adaptive_rewards" 与
+# "dual_ai_tuning_runs → evolution_tracking" 两条链路，但此前没有任何可信的
+# 因果归因。本段建立并强制下面的顺序：
+#
+#   effective tuning → 明确 account/strategy → 明确 effective time
+#     → 其后成熟的 reward → 归因落库 → evaluate_tuning_from_reward()
+#     → evolution_tracking.evaluated=1
+#
+# 重点：**不是** "最新 tracking + 最新 reward" 配对。只有能证明自己真正进入
+# 生效状态的调参才允许消费账户收益；`status='consensus'`、`applied_count>0`、
+# `merged_proposals != []` 都不构成生效证据 —— 唯一可信证据来自项目已有的显式
+# apply 生命周期（evolution_apply.apply_tuner_proposals 写入 applied_ids 与
+# 账户运行参数覆盖）。
+
+
+def _iso_date(value):
+    """严格解析 ISO 日期（YYYY-MM-DD）；不可解析返回 None（fail closed）。"""
+    text = str(value or "").strip()
+    if len(text) < 10:
+        return None
+    try:
+        return dt.date.fromisoformat(text[:10])
+    except ValueError:
+        return None
+
+
+def _tuner_effectiveness(conn, tracking_row, paper_db_path=None) -> dict:
+    """判定一次调参是否**真正进入生效状态**，返回 ``{account_id: effective_from}``。
+
+    证据必须同时来自项目已有的显式 apply 生命周期，缺一不可：
+
+    1. ``dual_ai_tuning_runs.applied_ids`` 明确列出该账户 —— 由
+       ``evolution_apply.apply_tuner_proposals`` 在真实写入账户运行参数后落库；
+    2. 该账户当前的 ``paper_accounts.params.adaptive_selection_meta`` 仍然指向
+       这次 run（``tier='llm_consensus'``、``status='active'``、``run_id`` 匹配），
+       且覆盖真的带着 weights —— 即没有被 rollback 或后续覆盖顶掉。
+
+    ``effective_from`` 取该 meta 中 ``applied_at`` 与 ``effective_date`` **较晚**
+    的那个日期：这是我们能证明 overlay 已开始支配 runtime 的最早日期。
+
+    影子提案、仅 consensus 的 run、已回滚的 run 一律返回 ``{}``。
+    """
+    paper_db_path = paper_db_path or PAPER_DB_PATH
+    run_id = tracking_row["run_id"]
+    if run_id is None:
+        return {}
+    run = conn.execute(
+        "SELECT applied_ids FROM dual_ai_tuning_runs WHERE id=?", (int(run_id),)
+    ).fetchone()
+    if run is None:
+        return {}
+    applied_ids = _loads(run["applied_ids"], None)
+    if not isinstance(applied_ids, list) or not applied_ids:
+        return {}
+    if not paper_db_path or not os.path.exists(paper_db_path):
+        return {}
+    today = dt.date.today()
+    evidence = {}
+    paper = paper_reader.connect(paper_db_path, timeout=30)
+    try:
+        for raw_account in applied_ids:
+            account_id = str(raw_account or "")
+            if not account_id:
+                continue
+            row = paper.execute(
+                "SELECT params FROM paper_accounts WHERE id=?", (account_id,)
+            ).fetchone()
+            if row is None:
+                continue
+            params = _loads(row["params"], {}) or {}
+            meta = params.get("adaptive_selection_meta") or {}
+            if str(meta.get("tier") or "") != "llm_consensus":
+                continue
+            if str(meta.get("status") or "") != "active":
+                continue
+            if str(meta.get("run_id") or "") != str(run_id):
+                continue
+            if not (params.get("adaptive_selection") or {}).get("weights"):
+                continue
+            candidates = [
+                d for d in (_iso_date(meta.get("applied_at")),
+                            _iso_date(meta.get("effective_date")))
+                if d is not None
+            ]
+            if not candidates:
+                continue
+            effective_from = max(candidates)
+            if effective_from > today:
+                # 还没真正开始影响 runtime 的调参不能消费历史收益。
+                continue
+            evidence[account_id] = effective_from
+    finally:
+        paper.close()
+    return evidence
+
+
+def _reward_after_effective(reward_row, effective_from):
+    """reward 窗口是否整体落在生效时间之后（跨新旧参数的窗口不算纯证据）。
+
+    ``start_date >= effective_from`` 是首选口径，它同时排除了
+    ``start_date < effective_from <= end_date`` 的跨越窗口。
+    """
+    start = _iso_date(reward_row["start_date"])
+    return start is not None and start >= effective_from
+
+
 def evaluate_tuning_from_reward(
     tracking_id: int, reward_id: int, conn: sqlite3.Connection | None = None
 ) -> dict:
-    """Evaluate an evolution tuning run directly from an adaptive_rewards row.
+    """Evaluate an evolution tuning run from an **attributable** adaptive_rewards row.
 
-    Reads the specified reward_id from the adaptive DB, derives the bounded
-    evolution score, generates an auditable eval_detail, and updates the tracking run.
+    与只校验"两条记录都存在"的旧实现不同，这里要求在
+    ``(tracking_id, reward_id)`` 之间存在**已落库的归因契约**，并且该归因至今
+    仍然成立：账户匹配、reward 窗口整体落在 ``effective_from`` 之后、tracking
+    仍能证明自己真实生效。任一不成立即 fail closed（``KeyError``/``ValueError``），
+    绝不把不可归因的收益算成调参效果。
+
+    幂等：同一条归因、同一个结果重复到达 → ``already_evaluated=True`` 的成功；
+    tracking 已由**另一条** reward 评估过 → 拒绝改写首次决定。
+
+    评分映射保持不变：``raw_reward → adaptive-reward-v2 → tanh → eval_score``。
     """
     if tracking_id is None or int(tracking_id) <= 0:
         raise ValueError(f"Invalid tracking_id: {tracking_id!r}")
@@ -3501,9 +3645,7 @@ def evaluate_tuning_from_reward(
 
     def _execute(active_conn: sqlite3.Connection) -> dict:
         self_evolution.ensure_schema(active_conn)
-        tracking_row = active_conn.execute(
-            "SELECT id FROM evolution_tracking WHERE id = ?", (int(tracking_id),)
-        ).fetchone()
+        tracking_row = self_evolution.get_tracking(active_conn, int(tracking_id))
         if not tracking_row:
             raise KeyError(f"Tracking record id={tracking_id} not found in evolution_tracking")
 
@@ -3517,8 +3659,66 @@ def evaluate_tuning_from_reward(
         if not row:
             raise KeyError(f"Reward record id={reward_id} not found in adaptive_rewards")
 
+        link = self_evolution.get_reward_attribution(
+            active_conn, int(tracking_id), int(reward_id))
+        if link is None:
+            raise KeyError(
+                f"归因记录不存在：tracking_id={tracking_id} reward_id={reward_id}。"
+                "调参效果只能由其生效之后、且已建立归因契约的 reward 评估"
+            )
+
+        # 账户匹配 + 时间窗口：一律使用**已落库**的归因，而不是重新从可变
+        # overlay 推断 —— 否则后续 overlay 变化会把已被拒绝的 reward 追溯性放行。
+        account_id = str(link["account_id"])
+        if account_id != str(row["account_id"]):
+            raise ValueError(
+                f"归因账户 {account_id} 与 reward 账户 {row['account_id']} 不一致，"
+                "禁止跨账户评估"
+            )
+        effective_from = _iso_date(link["effective_from"])
+        if effective_from is None:
+            raise ValueError(f"归因 effective_from 不可解析: {link['effective_from']!r}")
+        if not _reward_after_effective(row, effective_from):
+            raise ValueError(
+                f"reward 窗口 [{row['start_date']} ~ {row['end_date']}] 不是整体落在"
+                f"调参生效时间 {effective_from.isoformat()} 之后，"
+                "跨越新旧参数的收益不能作为纯证据"
+            )
+
         raw_reward = row["raw_reward"]
         eval_score = _reward_to_evolution_score(raw_reward)
+
+        # 幂等：同一条归因、同一个结果 → 幂等成功，不重复产生评估样本。
+        if int(tracking_row["evaluated"] or 0) == 1:
+            previous = tracking_row["eval_score"]
+            if previous is not None and abs(float(previous) - eval_score) < 1e-9:
+                return {
+                    "success": True,
+                    "already_evaluated": True,
+                    "tracking_id": int(tracking_id),
+                    "reward_id": int(reward_id),
+                    "account_id": account_id,
+                    "effective_from": effective_from.isoformat(),
+                    "eval_score": float(previous),
+                    "eval_detail": _loads(tracking_row["eval_detail"], {}) or {},
+                }
+            raise ValueError(
+                f"tracking_id={tracking_id} 已由另一条 reward 评估过"
+                f"（现有 eval_score={previous!r}），拒绝改写首次决定的归因"
+            )
+
+        # 首次评估：tracking 必须**至今**仍能证明自己真实生效。
+        evidence = _tuner_effectiveness(active_conn, tracking_row)
+        if account_id not in evidence:
+            raise ValueError(
+                f"调参未真正进入生效状态（tracking_id={tracking_id} account={account_id}）："
+                "缺少显式 apply 证据，或覆盖已被回滚/被后续调参替换"
+            )
+        if evidence[account_id] != effective_from:
+            raise ValueError(
+                f"归因 effective_from={effective_from.isoformat()} 与当前生效证据 "
+                f"{evidence[account_id].isoformat()} 不一致，拒绝评估"
+            )
 
         eval_detail = {
             "source": "adaptive_rewards",
@@ -3536,13 +3736,22 @@ def evaluate_tuning_from_reward(
             "raw_reward": float(row["raw_reward"]),
             "weighted_reward": float(row["weighted_reward"]),
             "score_mapping_version": EVOLUTION_REWARD_SCORE_VERSION,
+            "attribution": {
+                "linkage_source": link["linkage_source"],
+                "effective_from": effective_from.isoformat(),
+                "account_id": account_id,
+                "created_at": link["created_at"],
+            },
         }
 
         self_evolution.evaluate_run(active_conn, int(tracking_id), eval_score, eval_detail)
         return {
             "success": True,
+            "already_evaluated": False,
             "tracking_id": int(tracking_id),
             "reward_id": int(reward_id),
+            "account_id": account_id,
+            "effective_from": effective_from.isoformat(),
             "eval_score": eval_score,
             "eval_detail": eval_detail,
         }
@@ -3553,10 +3762,130 @@ def evaluate_tuning_from_reward(
         return _execute(active_conn)
 
 
+def _attribute_one_tracking(conn, tracking_row, paper_db_path=None):
+    """为单条未评估的 tracking 找到**其生效之后**成熟的 reward 并驱动评估。
+
+    返回 ``None`` 表示"暂无证据"（waiting_evidence）—— 这是正常状态，不是失败。
+
+    规则：
+    - 只认**已落库的归因**；一旦首次归因确定就不再改写（幂等 / 不重复取样）。
+      若上一次周期在"落库归因"与"写入评估"之间被中断，这里会**续做**同一条归因
+      的评估，而不是另挑一条 reward —— 首次决定不可改写。
+    - 账户选择确定化：按 (effective_from, account_id) 排序取第一个有合规 reward
+      的账户，避免同一 run 覆盖多账户时结果随机。
+    - 一条 reward 只服务一次归因，防止把同一次收益重复算进多条 tracking。
+    """
+    tracking_id = int(tracking_row["id"])
+
+    existing = self_evolution.list_reward_attributions(conn, tracking_id, limit=1)
+    if existing:
+        link = existing[0]
+        result = evaluate_tuning_from_reward(
+            tracking_id=tracking_id, reward_id=int(link["reward_id"]), conn=conn)
+        result["attribution_created"] = False
+        result["linkage_source"] = link["linkage_source"]
+        return result
+
+    evidence = _tuner_effectiveness(conn, tracking_row, paper_db_path)
+    if not evidence:
+        return None
+
+    for account_id in sorted(evidence, key=lambda a: (evidence[a], a)):
+        effective_from = evidence[account_id]
+        reward = conn.execute(
+            """SELECT id, account_id, start_date, end_date, raw_reward
+               FROM adaptive_rewards
+               WHERE account_id=? AND start_date>=?
+                 AND id NOT IN (SELECT reward_id FROM evolution_reward_attribution)
+               ORDER BY start_date ASC, id ASC LIMIT 1""",
+            (account_id, effective_from.isoformat()),
+        ).fetchone()
+        if reward is None:
+            continue
+        link, created = self_evolution.record_reward_attribution(
+            conn, tracking_id, int(reward["id"]), account_id,
+            effective_from.isoformat(),
+        )
+        result = evaluate_tuning_from_reward(
+            tracking_id=tracking_id, reward_id=int(reward["id"]), conn=conn)
+        result["attribution_created"] = bool(created)
+        result["linkage_source"] = link["linkage_source"]
+        return result
+    return None
+
+
+def reconcile_tuning_reward_attribution(conn, paper_db_path=None, limit: int = 200) -> dict:
+    """把"真实生效的调参"归因到"其后成熟的 reward"，并驱动生产评估。
+
+    在 ``_evaluate_rewards()`` 产出新 reward 之后调用。完整因果顺序：
+
+        effective tuning → 明确 account/strategy → 明确 effective time
+          → 其后成熟的 reward → 归因落库 → evaluate_tuning_from_reward()
+          → evolution_tracking.evaluated=1
+
+    **找不到证据是正常状态**（``waiting_evidence``），既不算失败也不会影响学习
+    周期：本函数不向上抛异常，异常只记入返回报告的 ``failed``。
+
+    明确禁止：``tracking=最新一行`` + ``reward=最新一行`` 然后假定相关；也禁止把
+    历史 reward 批量挂到新 tracking 上凑 ``MIN_SAMPLES_FOR_EVOLUTION``。
+    """
+    report = {
+        "status": "ok",
+        "evaluated": [],
+        "already_evaluated": [],
+        "waiting_evidence": [],
+        "failed": [],
+    }
+    try:
+        self_evolution.ensure_schema(conn)
+        rows = conn.execute(
+            """SELECT id, run_id, status, applied, evaluated
+               FROM evolution_tracking
+               WHERE COALESCE(evaluated,0)=0
+               ORDER BY id ASC LIMIT ?""",
+            (int(limit),),
+        ).fetchall()
+        for tracking_row in rows:
+            tracking_id = int(tracking_row["id"])
+            try:
+                outcome = _attribute_one_tracking(conn, tracking_row, paper_db_path)
+            except Exception as exc:
+                report["failed"].append({
+                    "tracking_id": tracking_id,
+                    "error": f"{type(exc).__name__}: {exc}"[:200],
+                })
+                continue
+            if outcome is None:
+                report["waiting_evidence"].append({"tracking_id": tracking_id})
+            elif outcome.get("already_evaluated"):
+                report["already_evaluated"].append(outcome)
+            else:
+                report["evaluated"].append(outcome)
+    except Exception as exc:
+        report["status"] = "failed"
+        report["error"] = f"{type(exc).__name__}: {exc}"[:200]
+    return report
+
+
 def evaluate_tuning_fn(tracking_id, eval_score, eval_detail=None):
-    """事后评估一次调参的效果。"""
+    """人工事后评估一次调参的效果（**仅限当前真实生效的调参**）。
+
+    这是运维侧的手动入口，不是 reward 归因通道：分数由调用方给出。为了防止影子 /
+    未生效的 tracking 被手工标记 ``evaluated=1`` 从而污染 ``should_evolve`` 的
+    评估样本（即"人工凑 ``MIN_SAMPLES_FOR_EVOLUTION``"），这里仍然要求该调参
+    **当前**能证明自己真实生效：显式 apply 证据仍在、账户覆盖未被回滚或被后续
+    调参替换。不生效一律拒绝，绝不写入 ``evaluated=1``。
+    """
     with _connect() as conn:
         self_evolution.ensure_schema(conn)
+        tracking_row = self_evolution.get_tracking(conn, int(tracking_id))
+        if not tracking_row:
+            raise KeyError(f"Tracking record id={tracking_id} not found in evolution_tracking")
+        if not _tuner_effectiveness(conn, tracking_row):
+            raise ValueError(
+                f"tracking_id={tracking_id} 未真正进入生效状态，"
+                "拒绝人工标记为已评估（未生效的调参不得进入评估样本）"
+            )
         self_evolution.evaluate_run(conn, tracking_id, eval_score, eval_detail)
         return {"success": True, "tracking_id": tracking_id, "eval_score": eval_score}
 

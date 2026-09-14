@@ -683,7 +683,12 @@ def run_dual_ai_tuning(connect_factory, paper_db_path, snapshot_paths, evidence_
                 trigger=str(trigger)[:80], mode=mode,
                 status=_track_status,
                 market_regime=profile.get("regime"),
-                applied=False, applied_count=len(merged_proposals or []),
+                # applied_count 只在**真正 apply 之后**由
+                # evolution_apply.apply_tuner_proposals 回填。这里调参刚跑完、
+                # 提案还没经过人工门禁，所以必须写 0：把 merged_proposals 的
+                # 条数写进 applied_count 会让"有提案"看起来像"已落地"，
+                # 正是 reward 归因要拒绝的伪证据。
+                applied=False, applied_count=0,
                 mimo_latency_ms=mimo_r.get("latency_ms"),
                 deepseek_latency_ms=ds_r.get("latency_ms"),
                 total_latency_ms=total_latency,
