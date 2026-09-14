@@ -19,8 +19,10 @@ from __future__ import annotations
 import ast
 import os
 import re
+import shutil
 import subprocess
 import sys
+import tempfile
 import unittest
 
 BACKEND = os.path.dirname(os.path.abspath(__file__))
@@ -119,7 +121,7 @@ class CronWrapperModeTests(unittest.TestCase):
     def test_evolution_cron_wrapper_is_executable(self):
         path = os.path.join(ROOT, "deploy", "run_evolution_loop.sh")
         self.assertTrue(os.path.isfile(path))
-        if os.path.isdir(os.path.join(ROOT, ".git")):
+        if os.path.isdir(os.path.join(ROOT, ".git")) and shutil.which("git"):
             result = subprocess.run(
                 ["git", "ls-files", "-s", "--", "deploy/run_evolution_loop.sh"],
                 cwd=ROOT, check=True, capture_output=True, text=True,
@@ -133,6 +135,62 @@ class CronWrapperModeTests(unittest.TestCase):
                 os.access(path, os.X_OK),
                 "deploy/run_evolution_loop.sh is invoked directly by cron and must be executable",
             )
+
+
+class CronBackupHygieneTests(unittest.TestCase):
+    """Cron backups must never remain in cron's active scan directory."""
+
+    def test_deploy_delegates_cron_sync_without_active_backup_path(self):
+        deploy_path = os.path.join(ROOT, "deploy", "deploy.sh")
+        with open(deploy_path, encoding="utf-8") as handle:
+            deploy_text = handle.read()
+        self.assertIn("deploy/sync-cron.sh", deploy_text)
+        self.assertNotIn("/etc/cron.d/astock-codex.bak-", deploy_text)
+        sync_path = os.path.join(ROOT, "deploy", "sync-cron.sh")
+        with open(sync_path, encoding="utf-8") as handle:
+            sync_text = handle.read()
+        self.assertIn('CRON_DIR="${ASTOCK_CRON_DIR:-/etc/cron.d}"', sync_text)
+        self.assertIn(
+            'CRON_BACKUP_DIR="${ASTOCK_CRON_BACKUP_DIR:-/var/backups/astock-codex/cron}"',
+            sync_text,
+        )
+        self.assertIn('install -o root -g root -m 0644 "$tmp" "$CRON_FILE"', sync_text)
+
+    @unittest.skipUnless(os.name != "nt", "requires a POSIX shell")
+    def test_sync_moves_legacy_backups_out_of_active_cron_dir(self):
+        sync_script = os.path.join(ROOT, "deploy", "sync-cron.sh")
+        with tempfile.TemporaryDirectory() as temp_dir:
+            cron_dir = os.path.join(temp_dir, "cron.d")
+            backup_dir = os.path.join(temp_dir, "backup-dir")
+            os.mkdir(cron_dir)
+            active = os.path.join(cron_dir, "astock-codex")
+            with open(active, "w", encoding="utf-8") as handle:
+                handle.write("# existing active cron\\n")
+            legacy_names = ("astock-codex.bak-20260901", "astock-codex.bak-20260902")
+            for name in legacy_names:
+                with open(os.path.join(cron_dir, name), "w", encoding="utf-8") as handle:
+                    handle.write("# stale backup\\n")
+
+            env = os.environ.copy()
+            env.update({
+                "ASTOCK_DEPLOY_ROOT": ROOT,
+                "ASTOCK_CRON_DIR": cron_dir,
+                "ASTOCK_CRON_BACKUP_DIR": backup_dir,
+            })
+            result = subprocess.run(
+                ["bash", sync_script], cwd=ROOT, env=env,
+                check=True, capture_output=True, text=True,
+            )
+
+            self.assertIn("已迁出历史 cron 备份: 2", result.stdout)
+            self.assertEqual(["astock-codex"], sorted(os.listdir(cron_dir)))
+            self.assertTrue(os.path.isfile(os.path.join(backup_dir, legacy_names[0])))
+            self.assertTrue(os.path.isfile(os.path.join(backup_dir, legacy_names[1])))
+            with open(active, encoding="utf-8") as handle:
+                synced = handle.read()
+            with open(os.path.join(ROOT, "deploy", "astock-codex.cron"), encoding="utf-8") as handle:
+                expected = handle.read().replace("/opt/astock-codex", ROOT)
+            self.assertEqual(expected, synced)
 
 
 class RemovedArtifactTests(unittest.TestCase):
