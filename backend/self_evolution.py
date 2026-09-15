@@ -481,10 +481,11 @@ def get_performance_metrics(conn, window: int = 20) -> dict:
     （那是一条隐性污染路径）：
 
     - ``learning_sample_count`` = consensus + hold + no_consensus
-    - ``learning_consensus_rate`` / ``learning_success_rate`` /
-      ``learning_hold_rate`` / ``learning_no_consensus_rate``
+    - ``learning_consensus_rate`` / ``learning_propose_rate`` /
+      ``learning_success_rate`` / ``learning_hold_rate`` /
+      ``learning_no_consensus_rate``
 
-    当 ``learning_sample_count == 0`` 时，上述四个 learning rate 一律返回
+    当 ``learning_sample_count == 0`` 时，上述五个 learning rate 一律返回
     ``None``，**不返回 ``0.0``**：``没有语义样本`` ≠ ``共识率为 0%``。
 
     状态语义（与 ``ai_review_service`` 的 dual 结果状态机一一对应）：
@@ -528,8 +529,15 @@ def get_performance_metrics(conn, window: int = 20) -> dict:
 
     # 语义学习样本：只有 reviewer 正常完成的 run 才计入分母。failed 被显式排除
     # —— 它是 reviewer 可靠性事实，不是"AI 谈不拢"的语义样本。
+    #
+    # ``learning_propose_rate`` 是 propose 率的 learning 口径。当前 ``propose_count``
+    # 与 ``consensus_count`` 取同一 status，所以它与 ``learning_consensus_rate`` 恒等；
+    # 保留独立字段是为了让"共识率过高"判据**永远不读 raw 分母**：只要 raw 分母里
+    # 混着 failed，同样的语义证据（5 次全 consensus）在"另有 5 次超时"时会被稀释到
+    # 50%，从而抑制一次本该发生的共识阈值学习 —— 那是反向的污染路径。
     learning_sample_count = consensus_count + hold_count + no_consensus_count
     learning_consensus_rate = _rate(consensus_count, learning_sample_count)
+    learning_propose_rate = _rate(propose_count, learning_sample_count)
     learning_success_rate = _rate(success_count, learning_sample_count)
     learning_hold_rate = _rate(hold_count, learning_sample_count)
     learning_no_consensus_rate = _rate(no_consensus_count, learning_sample_count)
@@ -572,6 +580,7 @@ def get_performance_metrics(conn, window: int = 20) -> dict:
         # 语义学习样本（failed 不进分母）
         "learning_sample_count": learning_sample_count,
         "learning_consensus_rate": learning_consensus_rate,
+        "learning_propose_rate": learning_propose_rate,
         "learning_success_rate": learning_success_rate,
         "learning_hold_rate": learning_hold_rate,
         "learning_no_consensus_rate": learning_no_consensus_rate,
@@ -639,14 +648,18 @@ def should_evolve(conn) -> tuple[bool, str]:
     if learning_samples <= 0:
         return False, "仅有 reviewer 可靠性失败样本，不构成策略进化证据"
 
-    # 检查共识率：只用 reviewer 正常完成的样本做分母。
+    # 检查共识率：**两个条件都只用 reviewer 正常完成的样本做分母**。
     # reason 里报的是 learning 口径的比率，运维看到的"共识率"与策略学习依据一致。
+    # ``learning_propose_rate`` 也必须走 learning 口径：若这里回退成 raw
+    # ``propose_rate``，同样的语义证据会因为窗口里另有 reviewer 超时而被稀释，
+    # 从而**抑制**一次本该发生的共识学习 —— reviewer 可靠性同样不得反向干扰学习。
     learning_consensus_rate = metrics.get("learning_consensus_rate")
+    learning_propose_rate = metrics.get("learning_propose_rate")
     if learning_consensus_rate is not None:
         if learning_consensus_rate < 0.3 and learning_samples >= CONSENSUS_MIN_LEARNING_SAMPLES:
             return True, f"共识率过低 ({learning_consensus_rate:.1%})，需要调整共识阈值"
         if learning_consensus_rate > 0.8 and learning_samples >= MIN_SAMPLES_FOR_EVOLUTION \
-                and metrics["propose_rate"] > 0.6:
+                and (learning_propose_rate or 0.0) > 0.6:
             return True, f"共识率过高 ({learning_consensus_rate:.1%})，可能阈值太松"
 
     return False, "当前状态稳定，无需进化"

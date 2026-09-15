@@ -1547,6 +1547,43 @@ class ReviewerFailureIsolationTests(AiReviewSlotTestBase):
         self.assertTrue(any("适度放大权重步长" in str(a) for a in result.get("adjustments", [])))
 
     # ─────────────────────── T62：raw 字段语义未被偷改 ───────────────────────
+    def test_t58c_reviewer_failure_cannot_suppress_the_high_consensus_gate(self):
+        """reviewer 失败也不得**反向**干扰学习：不得稀释掉"共识率过高"判据。
+
+        同一份语义证据（5 次全 consensus）在"另有 5 次 reviewer 超时"时，raw
+        ``propose_rate`` 只有 50%，会低于 0.6 门槛；learning 口径仍是 100%。
+        两种窗口必须给出同一个进化结论 —— 否则 reviewer outage 就能反向压制
+        一次本该发生的共识阈值学习。
+        """
+        # 对照：同一份语义证据、没有 reviewer 失败
+        self._seed(["consensus"] * 5)
+        clean_should, clean_reason = self._should_evolve()
+        self.assertTrue(clean_should, f"5 次全 consensus 应触发共识学习：{clean_reason}")
+        self.assertIn("共识率过高", clean_reason)
+
+        # 实验组：同一份语义证据 + 5 次 reviewer 失败
+        with self.factory() as conn:
+            conn.execute("DELETE FROM evolution_tracking")
+            conn.commit()
+        self._init()
+        self._seed(["consensus"] * 5 + ["failed"] * 5)
+        metrics = self._metrics()
+        self.assertEqual(10, metrics["sample_count"])
+        self.assertEqual(5, metrics["learning_sample_count"])
+        self.assertAlmostEqual(0.5, metrics["propose_rate"])          # raw 口径已被稀释
+        self.assertAlmostEqual(1.0, metrics["learning_propose_rate"])  # learning 口径不受影响
+        self.assertAlmostEqual(1.0, metrics["learning_consensus_rate"])
+
+        should, reason = self._should_evolve()
+        self.assertTrue(
+            should,
+            f"reviewer 失败不得抑制共识学习：{reason}")
+        self.assertIn("共识率过高", reason)
+
+        result = self._evolve()
+        self.assertTrue(result.get("evolved"))
+        self.assertGreater(result["new_params"]["consensus_weight_ratio"], 0.6)
+
     def test_t62_legacy_metrics_keep_their_meaning(self):
         """旧字段必须仍存在、仍是 raw 口径；新字段不得悄悄改写旧语义。"""
         self._seed(["failed"] * 6 + ["consensus"] * 4 + ["both_hold"] * 4)
