@@ -135,16 +135,18 @@ def benchmark_map(dates, horizon, sessions, *, asof, security_state_fn=None):
 
     逐股仍走同一个标签契约：``pending`` / ``unavailable`` 绝不填 0 混进基准。
     """
+    empty = {"market": {}, "executable": None, "coverage": {"required": 0, "resolved": 0}}
     try:
         codes = [f[:-4] for f in os.listdir(KLINE_DIR) if f.endswith(".csv")]
     except OSError:
-        return {"market": {}, "executable": None}
+        return dict(empty)
     if not codes:
-        return {"market": {}, "executable": None}
+        return dict(empty)
     random.seed(20260828)
     sample = random.sample(codes, min(BENCH_N, len(codes)))
     per_date = {}
     exec_rows = []
+    coverage = {"required": 0, "resolved": 0}
     for code in sample:
         kline = load_kline(code)
         for day in dates:
@@ -154,13 +156,13 @@ def benchmark_map(dates, horizon, sessions, *, asof, security_state_fn=None):
             per_date.setdefault(day, []).append(result.raw_forward_return)
             if security_state_fn is None:
                 continue
-            entry_name, entry_flag = _action_security_state(
+            entry_name, entry_flag = _resolve_action_state(
                 code, result.entry_date, decision_day=day, decision_name=None,
-                security_state_fn=security_state_fn,
+                security_state_fn=security_state_fn, coverage=coverage,
             )
-            exit_name, exit_flag = _action_security_state(
+            exit_name, exit_flag = _resolve_action_state(
                 code, result.exit_date, decision_day=day, decision_name=None,
-                security_state_fn=security_state_fn,
+                security_state_fn=security_state_fn, coverage=coverage,
             )
             exec_rows.append(
                 ST.SelectionRow(
@@ -182,7 +184,7 @@ def benchmark_map(dates, horizon, sessions, *, asof, security_state_fn=None):
     market = {day: statistics.mean(v) for day, v in per_date.items() if v}
     if security_state_fn is None:
         # 没有可信历史状态源 → 可执行基准**不可得**（None 而非未过滤均值）。
-        return {"market": market, "executable": None}
+        return {"market": market, "executable": None, "coverage": coverage}
     built = ST.build_executable_outcomes(exec_rows)
     per_date_exec = {}
     for outcome in built["outcomes"]:
@@ -191,7 +193,9 @@ def benchmark_map(dates, horizon, sessions, *, asof, security_state_fn=None):
         day = outcome.sample_key.rsplit("|", 1)[-1]
         per_date_exec.setdefault(day, []).append(outcome.executable_return)
     executable = {day: statistics.mean(v) for day, v in per_date_exec.items() if v}
-    return {"market": market, "executable": executable}
+    # ``coverage`` 让调用方区分"provider 存在"与"基准样本真的解析出了动作状态"：
+    # provider 对每个 session 都返回 None 时，这里 resolved == 0。
+    return {"market": market, "executable": executable, "coverage": coverage}
 
 
 def _previous_close(kline, session):
@@ -271,6 +275,30 @@ def _tradability_evidence(code, name, risk_flag, session, price, kline):
     )
 
 
+def _resolve_action_state(code, session, *, decision_day, decision_name,
+                          security_state_fn, coverage):
+    """调用 :func:`_action_security_state` 并记录**动作状态覆盖度**。
+
+    ``coverage`` 会累计：
+
+    * ``required`` —— 需要动作时状态的 (code, session) 次数；
+    * ``resolved`` —— 真的拿到可用 name / risk_flag 的次数。
+
+    "provider 对象存在"与"动作状态真的解析出来了"是两件事：一个 provider 可能
+    对每个 session 都返回 ``None``，此时 executable 覆盖度是 0，报告不得声称
+    可执行指标可用。
+    """
+    name, flag = _action_security_state(
+        code, session, decision_day=decision_day, decision_name=decision_name,
+        security_state_fn=security_state_fn,
+    )
+    if session is not None:
+        coverage["required"] += 1
+        if name is not None or flag is not None:
+            coverage["resolved"] += 1
+    return name, flag
+
+
 def evaluate(picks, horizon, label, sessions, *, asof,
              tradability_mode=ST.MODE_EXECUTABLE, security_state_fn=None,
              state_source_status=None):
@@ -298,9 +326,12 @@ def evaluate(picks, horizon, label, sessions, *, asof,
     )
     bench = benches.get("market") or {}
     bench_exec = benches.get("executable")
-    # 可执行基准是否**可得**：需要同口径的 PIT 历史状态源。缺证据时它是 None，
+    # 动作状态覆盖度：区分"provider 对象存在"与"动作状态真的解析出来"。
+    coverage = {"required": 0, "resolved": 0}
+    # 可执行基准是否**可得**：既要有 provider，也要真的解析出动作状态
+    # （见下方 `executable_benchmark_available` 的最终判定）。缺证据时它是 None，
     # 绝不用未过滤的 market 均值冒充。
-    executable_benchmark_available = bench_exec is not None
+    bench_exec_present = bench_exec is not None
     status_counts = {status: 0 for status in SL.LABEL_STATUSES}
     verified = []
     for pick in picks:
@@ -318,13 +349,13 @@ def evaluate(picks, horizon, label, sessions, *, asof,
     # 可成交性判定走唯一权威实现，不在报告层复制任何规则。
     rows = []
     for strategy, day, code, name, result, kline in verified:
-        entry_name, entry_flag = _action_security_state(
+        entry_name, entry_flag = _resolve_action_state(
             code, result.entry_date, decision_day=day, decision_name=name,
-            security_state_fn=security_state_fn,
+            security_state_fn=security_state_fn, coverage=coverage,
         )
-        exit_name, exit_flag = _action_security_state(
+        exit_name, exit_flag = _resolve_action_state(
             code, result.exit_date, decision_day=day, decision_name=name,
-            security_state_fn=security_state_fn,
+            security_state_fn=security_state_fn, coverage=coverage,
         )
         rows.append(
             ST.SelectionRow(
@@ -350,6 +381,19 @@ def evaluate(picks, horizon, label, sessions, *, asof,
     entry_counts = {
         bucket: built["report"][bucket] for bucket in ST.OUTCOME_BUCKETS
     }
+
+    # ── 可执行覆盖度：provider 存在 ≠ 指标可用 ──
+    # 需要同时满足：
+    #   1. 有 provider 且基准侧真的解析出动作状态（bench_exec_present）；
+    #   2. 选股侧至少解析出**一个**动作状态（coverage.resolved > 0）。
+    # 否则 executable 指标与 executable 基准都必须标为不可用，绝不能因为
+    # "传了一个 provider 对象"就声称可用。
+    state_coverage_available = coverage["resolved"] > 0
+    executable_benchmark_available = (
+        bool(bench_exec_present) and state_coverage_available
+    )
+    executable_metrics_available = executable_benchmark_available
+
     for strategy, day, code, name, result, kline in verified:
         outcome = outcomes[f"{strategy}|{day}|{code}"]
         # 逐策略计数必须在**执行过滤之前**完成：否则"策略选了 2 条、1 条买不进"
@@ -432,9 +476,15 @@ def evaluate(picks, horizon, label, sessions, *, asof,
         f"（当前：{bench_available_text}）。"
         "两者 population 不同，**不得**相互替代或合并。"
     )
+    lines.append(
+        "动作状态覆盖度："
+        f"选股侧 {coverage['resolved']}/{coverage['required']} 个动作 session 解析出 "
+        "PIT 历史状态；provider 对象存在**不等于**可执行指标可用。"
+    )
     if not executable_benchmark_available:
         lines.append(
-            "⚠️ 可执行基准**不可得**（无同口径 PIT 历史证券状态源）："
+            "⚠️ 可执行指标/基准**不可用**：缺少同口径 PIT 历史证券状态源，"
+            "或该源未能解析出任何动作 session 状态。"
             "executable_excess 一栏为 —，绝不拿未做 tradability 过滤的 market 基准冒充。"
         )
     if entry_counts["unproven"] and not entry_counts["executable"]:
@@ -461,6 +511,13 @@ def evaluate(picks, horizon, label, sessions, *, asof,
         "executable_excess": (
             round(statistics.mean(all_exec_x) * 100, 2) if all_exec_x else None
         ),
+        # 覆盖度证据：provider 存在 ≠ 指标可用，因此把"要求/解析"都报出来。
+        "action_state_coverage": {
+            "required": coverage["required"],
+            "resolved": coverage["resolved"],
+        },
+        "action_state_coverage_available": state_coverage_available,
+        "executable_metrics_available": executable_metrics_available,
         "executable_benchmark_available": executable_benchmark_available,
         "label_status_counts": status_counts,
     }
@@ -558,36 +615,7 @@ def main(security_state_fn=None, *, archive_path=None):
             "source": "explicit",
             "rows": None,
         }
-    executable_coverage_available = state_fn is not None
-    report = [
-        "# 选股 Alpha 周报",
-        "",
-        f"生成时间：{datetime.datetime.now().isoformat(timespec='seconds')}；"
-        f"窗口：最近 {WINDOW_DAYS} 天；评估时点：{asof}；"
-        f"基准：同日随机 {BENCH_N} 只股票均值（仅 verified 样本）。",
-        "",
-        f"标签口径：`{LABEL_VERSION}`，由 backend/selection_labels.py 唯一权威生成；"
-        f"市场交易日序列 {len(sessions)} 个。"
-        "entry = 决策日之后第一个交易日收盘（收盘后形成的信号不可回填当日成交）。",
-        "",
-        "判读：超额为负 = 选股弱于随机买入，排序因子在损耗净值；连续两周为负需回滚或重检排序。",
-        "",
-        "## 口径边界（诚实声明）",
-        "",
-        "- market counterfactual（市场反事实）指标：**可用**，基于已验证标签。",
-        f"- executable 指标：**{'可用' if executable_coverage_available else '不可用'}**。"
-        + (
-            "已接入 PIT 历史证券状态源，action-time 的 name / risk_flag 由该源提供。"
-            if executable_coverage_available
-            else
-            "**没有**可信的 PIT 历史证券状态源（可回答 ``security_state_at(code, session)`` "
-            "的归档）。因此 entry/exit 时点的 ST 资格无法证明，可执行样本一律 fail closed "
-            "判为 ``unproven``；本报告**不**声称已得到 executable 指标，也**不**用当前快照或"
-            "决策日名称补齐。"
-        ),
-        f"- 状态源：`{state_status.get('status')}`"
-        + (f"（source={state_status.get('source')}）" if state_status.get("source") else ""),
-    ]
+    provider_present = state_fn is not None
     summaries = []
 
     def _sections(picks, horizon, label, view):
@@ -612,6 +640,28 @@ def main(security_state_fn=None, *, archive_path=None):
         summaries.append(summary)
         return lines
 
+    # 先算完全部分节，再据此写"口径边界"：executable 是否真的可用由**实际
+    # 覆盖度**决定（每个 summary 的 executable_metrics_available），而不是由
+    # "有没有 provider 对象"决定。
+    report_head = [
+        "# 选股 Alpha 周报",
+        "",
+        f"生成时间：{datetime.datetime.now().isoformat(timespec='seconds')}；"
+        f"窗口：最近 {WINDOW_DAYS} 天；评估时点：{asof}；"
+        f"基准：同日随机 {BENCH_N} 只股票均值（仅 verified 样本）。",
+        "",
+        f"标签口径：`{LABEL_VERSION}`，由 backend/selection_labels.py 唯一权威生成；"
+        f"市场交易日序列 {len(sessions)} 个。"
+        "entry = 决策日之后第一个交易日收盘（收盘后形成的信号不可回填当日成交）。",
+        "",
+        "判读：超额为负 = 选股弱于随机买入，排序因子在损耗净值；连续两周为负需回滚或重检排序。",
+        "",
+        "## 口径边界（诚实声明）",
+        "",
+        "- market counterfactual（市场反事实）指标：**可用**，基于已验证标签。",
+    ]
+    report = list(report_head)
+
     if tracking:
         for view in ("market_counterfactual", "executable"):
             report.append(f"\n#### 每日 topN 候选 · {view}")
@@ -625,13 +675,54 @@ def main(security_state_fn=None, *, archive_path=None):
             report += _sections(filled, 1, "模拟盘实际成交信号", view)
     else:
         report.append("\npaper_signals 无 filled 样本。")
+
+    # ── 口径边界：用**实际覆盖度**判定，而不是 provider 是否存在 ──
+    exec_summaries = [s for s in summaries if s.get("view") == "executable"]
+    required = sum(s.get("action_state_coverage", {}).get("required", 0)
+                   for s in exec_summaries)
+    resolved = sum(s.get("action_state_coverage", {}).get("resolved", 0)
+                   for s in exec_summaries)
+    # executable 指标可用 ⟺ 有 provider **且** 至少解析出一个动作状态。
+    executable_metrics_available = bool(provider_present) and resolved > 0
+    if executable_metrics_available:
+        boundary = (
+            f"- executable 指标：**可用**。PIT 历史证券状态源已接入，"
+            f"动作状态覆盖度 {resolved}/{required}。"
+        )
+    elif provider_present:
+        boundary = (
+            f"- executable 指标：**不可用**。虽然提供了状态源对象，但它在 "
+            f"{required} 个动作 session 上一个可用状态都没有解析出来"
+            f"（覆盖度 {resolved}/{required}）。因此本报告**不**声称已得到 "
+            "executable 指标；executable_excess 一栏为 —。"
+        )
+    else:
+        boundary = (
+            "- executable 指标：**不可用**。**没有**可信的 PIT 历史证券状态源"
+            "（可回答 ``security_state_at(code, session)`` 的归档）。因此 entry/exit "
+            "时点的 ST 资格无法证明，可执行样本一律 fail closed 判为 ``unproven``；"
+            "本报告**不**声称已得到 executable 指标，也**不**用当前快照或决策日名称补齐。"
+        )
+    boundary_lines = [
+        boundary,
+        f"- 状态源：`{state_status.get('status')}`"
+        + (f"（source={state_status.get('source')}）" if state_status.get("source") else ""),
+        f"- 动作状态覆盖度：{resolved}/{required}"
+        "（provider 对象存在**不等于**可执行指标可用）。",
+    ]
+    report = report_head + boundary_lines + report[len(report_head):]
+
     os.makedirs(os.path.dirname(REPORT_PATH), exist_ok=True)
     with open(REPORT_PATH, "w", encoding="utf-8") as fh:
         fh.write("\n".join(report) + "\n")
     print(json.dumps({
         "report": REPORT_PATH,
         "security_state_source": state_status,
-        "executable_coverage_available": executable_coverage_available,
+        "provider_present": provider_present,
+        "executable_metrics_available": executable_metrics_available,
+        "action_state_coverage": {"required": required, "resolved": resolved},
+        # 兼容字段：含义已收紧为"实际覆盖可用"，不再是"provider 存在"。
+        "executable_coverage_available": executable_metrics_available,
         "summaries": summaries,
     }, ensure_ascii=False))
 

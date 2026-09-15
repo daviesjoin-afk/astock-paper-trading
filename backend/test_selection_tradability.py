@@ -892,17 +892,19 @@ class DelegationGuardTest(unittest.TestCase):
         )
 
     def test_no_universal_price_limit_magic_number(self):
-        """禁止把涨跌停写成统一的 10%（或任何板块常量）。
+        """禁止把涨跌停写成统一的 10%（或**任何**本地板块/ST 常量）。
 
         用 AST 只看**数值常量**，因此文档字符串里解释 9.5/19.5/29.5 不受影响。
+
+        此前这里给 ``ST_LIMIT_PCT = 5.0`` 开了例外，理由是"唯一允许的本地常量"。
+        那是错的：ST 上限必须**唯一**来自 :func:`paper_trading_rules.limit_pct`，
+        本地复制会在权威口径变化时静默漂移。现在没有任何例外。
         """
         forbidden = {
             0.1, 0.095, 0.195, 0.295,
             9.5, 19.5, 29.5,
-            0.05, 5.0,  # ST 上限必须来自权威实现，不能是本地常量以外的猜值
+            0.05, 5.0,
         }
-        # ST_LIMIT_PCT 是唯一允许的本地常量，且必须与权威口径一致。
-        self.assertEqual(PTR.limit_pct(MAIN_BOARD, "*ST某某"), ST.ST_LIMIT_PCT)
         source = pathlib.Path(ST.__file__).read_text(encoding="utf-8")
         tree = ast.parse(source)
         found = []
@@ -910,9 +912,23 @@ class DelegationGuardTest(unittest.TestCase):
             if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
                 if isinstance(node.value, bool):
                     continue
-                if node.value in forbidden and node.value != ST.ST_LIMIT_PCT:
+                if node.value in forbidden:
                     found.append((node.lineno, node.value))
         self.assertEqual([], found, f"local price-limit constants: {found}")
+
+    def test_st_limit_is_derived_from_the_authoritative_rule(self):
+        """ST 上限逐板块与权威实现一致，且不依赖任何本地常量。"""
+        self.assertFalse(hasattr(ST, "ST_LIMIT_PCT"), "ST_LIMIT_PCT must be gone")
+        for code in (MAIN_BOARD, CHINEXT):
+            self.assertEqual(
+                PTR.limit_pct(code, "*ST某某", True),
+                ST.st_limit_pct(code, name="*ST某某", risk_flag=True),
+            )
+            # 强制 ST 口径 = 权威实现按 ST 解析的结果。
+            self.assertEqual(
+                PTR.limit_pct(code, None, True),
+                ST.st_limit_pct(code, name=None, risk_flag=True),
+            )
 
 
 class ProductionEvaluatorWiringTest(unittest.TestCase):
@@ -1645,6 +1661,245 @@ class SecurityStateArchiveTest(unittest.TestCase):
                 archive_path=_os.path.join(tmp, "nope.json"))
         self.assertIsNone(fn)
         self.assertEqual(SS.SOURCE_MISSING, provenance["status"])
+
+
+class StrictBooleanNormalizationTest(unittest.TestCase):
+    """Round 4 / F1：声明性布尔必须严格归一，``bool("false")`` 绝不为 True。"""
+
+    def test_as_strict_bool_truth_table(self):
+        import point_in_time as PIT
+
+        # 真值
+        for value in (True, 1, 1.0, "true", "TRUE", "True", "1", "yes", "Y", "on", " t "):
+            self.assertIs(True, PIT.as_strict_bool(value), value)
+        # 假值 —— 关键：字符串 "false" / "0" 绝不能被 bool() 读成 True。
+        for value in (False, 0, 0.0, "false", "FALSE", "False", "0", "no", "N", "off", " f "):
+            self.assertIs(False, PIT.as_strict_bool(value), value)
+        # 无法判定
+        for value in (None, "", "maybe", "2", [], {}, float("nan")):
+            self.assertIsNone(PIT.as_strict_bool(value), value)
+
+    def test_archive_complete_flag_string_false_is_not_complete(self):
+        """``"historical_membership_complete": "false"`` 不得被读成完整归档。"""
+        payload = {
+            "kind": "historical_archive",
+            "historical_membership_complete": "false",
+            "rows": [{"code": "600001", "effective_from": "2024-06-14",
+                      "name": "某某股份", "risk_flag": False}],
+        }
+        self.assertEqual(
+            SS.SOURCE_INCOMPLETE, SS.archive_provenance(payload)["status"])
+        self.assertIsNone(SS.SecurityStateArchive.from_payload(payload))
+
+    def test_archive_complete_flag_string_zero_is_not_complete(self):
+        payload = {
+            "kind": "historical_archive",
+            "historical_membership_complete": "0",
+            "rows": [{"code": "600001", "effective_from": "2024-06-14",
+                      "name": "某某股份", "risk_flag": False}],
+        }
+        self.assertEqual(
+            SS.SOURCE_INCOMPLETE, SS.archive_provenance(payload)["status"])
+
+    def test_archive_complete_flag_explicit_true_string_is_complete(self):
+        """显式 ``"true"`` 仍应被接受（严格归一不是"只认 bool 类型"）。"""
+        payload = {
+            "kind": "historical_archive",
+            "historical_membership_complete": "true",
+            "rows": [{"code": "600001", "effective_from": "2024-06-14",
+                      "name": "某某股份", "risk_flag": False}],
+        }
+        self.assertEqual(SS.SOURCE_OK, SS.archive_provenance(payload)["status"])
+
+    def test_unknown_complete_flag_is_not_complete(self):
+        payload = {
+            "kind": "historical_archive",
+            "historical_membership_complete": "maybe",
+            "rows": [{"code": "600001", "effective_from": "2024-06-14",
+                      "name": "某某股份", "risk_flag": False}],
+        }
+        self.assertEqual(
+            SS.SOURCE_INCOMPLETE, SS.archive_provenance(payload)["status"])
+
+    def test_risk_flag_string_false_is_not_st(self):
+        """``risk_flag="false"`` 必须读成非 ST，不能靠 bool() 变成 ST。"""
+        self.assertIs(False, ST.normalize_risk_flag("false"))
+        self.assertIs(False, ST.normalize_risk_flag("0"))
+        self.assertIs(True, ST.normalize_risk_flag("true"))
+        self.assertIs(True, ST.normalize_risk_flag(1))
+        self.assertIsNone(ST.normalize_risk_flag("maybe"))
+
+    def test_risk_flag_string_false_does_not_block_a_normal_stock(self):
+        """``risk_flag="false"`` 的正常股票必须可执行（不是被误判成 ST 而 blocked）。"""
+        ev = evidence(price=106.0, reference=100.0, name="某某股份", risk_flag="false")
+        verdict = buy(ev)
+        self.assertEqual(ST.STATUS_EXECUTABLE, verdict.status)
+        self.assertEqual(ST.REASON_OK, verdict.reason)
+
+    def test_risk_flag_string_false_still_applies_st_limit_from_the_name(self):
+        """名称本身含 ST 时，``risk_flag="false"`` 不能把 ST 规则关掉。
+
+        直接测解析器：名称 ST 必须给出权威 ST 上限（当前 5.0），而不是板块上限。
+        """
+        limit_pct, reason = ST.resolve_limit_pct(
+            MAIN_BOARD, name="*ST某某", risk_flag="false", pct_change=0.06
+        )
+        self.assertIsNone(reason)
+        self.assertEqual(PTR.limit_pct(MAIN_BOARD, "*ST某某"), limit_pct)
+        # 6% 的涨幅在 ST 口径下已触及涨停 → 买入方向被拦。
+        self.assertEqual(
+            ST.STATUS_BLOCKED,
+            buy(evidence(price=106.0, reference=100.0, name="*ST某某",
+                         risk_flag="false")).status,
+        )
+
+    def test_risk_flag_unknown_spelling_fails_closed(self):
+        """``risk_flag="maybe"`` 无法判定 → unproven，绝不默认非 ST。
+
+        名称**存在**（所以不是"什么都没给"那条门禁），只有风险标记的写法无法
+        判定 —— 这正是"字段存在但不可信"的路径。
+        """
+        ev = evidence(price=100.5, reference=100.0, name="某某股份", risk_flag="maybe")
+        verdict = buy(ev)
+        self.assertEqual(ST.STATUS_UNPROVEN, verdict.status)
+        self.assertEqual(ST.REASON_UNKNOWN_ST_STATUS, verdict.reason)
+
+    def test_security_permission_does_not_use_plain_bool(self):
+        """``security_permission`` 对 ``"false"`` 必须按非 ST 处理。"""
+        self.assertEqual(
+            PTR.security_scope(MAIN_BOARD, None, False),
+            ST.security_permission(MAIN_BOARD, name=None, risk_flag="false"),
+        )
+
+
+class ExecutableCoverageHonestyTest(unittest.TestCase):
+    """Round 4 / F3：provider 对象存在 ≠ 可执行覆盖可用。"""
+
+    KLINES = ProductionEvaluatorWiringTest.KLINES
+
+    def _evaluate(self, picks, *, security_state_fn=None):
+        with _FakeKlineReport(self.KLINES) as AR:
+            sessions = SL.normalize_sessions(
+                sorted({day for bars in self.KLINES.values() for day in bars})
+            )
+            return AR.evaluate(
+                picks, 1, "选股质量", sessions, asof="2024-06-30",
+                security_state_fn=security_state_fn,
+            )
+
+    def test_provider_that_resolves_nothing_reports_unavailable(self):
+        """provider 存在但每个 session 都返回 None → 覆盖度 0，指标不可用。"""
+        picks = [("s1", "2024-06-14", "600001", "某某股份")]
+
+        def empty_provider(code, session):
+            return None
+
+        lines, summary = self._evaluate(picks, security_state_fn=empty_provider)
+        self.assertGreater(summary["action_state_coverage"]["required"], 0)
+        self.assertEqual(0, summary["action_state_coverage"]["resolved"])
+        self.assertFalse(summary["action_state_coverage_available"])
+        self.assertFalse(summary["executable_metrics_available"])
+        self.assertFalse(summary["executable_benchmark_available"])
+        self.assertIsNone(summary["executable_excess"])
+        self.assertIn("不可用", "\n".join(lines))
+
+    def test_provider_that_resolves_states_reports_available(self):
+        picks = [("s1", "2024-06-14", "600001", "某某股份")]
+
+        def provider(code, session):
+            return {"name": "某某股份", "risk_flag": False}
+
+        _, summary = self._evaluate(picks, security_state_fn=provider)
+        self.assertGreater(summary["action_state_coverage"]["resolved"], 0)
+        self.assertTrue(summary["action_state_coverage_available"])
+        self.assertTrue(summary["executable_metrics_available"])
+
+    def test_partial_coverage_is_reported_as_a_ratio(self):
+        """只有 entry 能解析、exit 不能 → 覆盖度必须如实报出分数。"""
+        picks = [("s1", "2024-06-14", "600001", "某某股份")]
+
+        def partial(code, session):
+            if session == "2024-06-17":
+                return {"name": "某某股份", "risk_flag": False}
+            return None
+
+        _, summary = self._evaluate(picks, security_state_fn=partial)
+        cov = summary["action_state_coverage"]
+        self.assertEqual(1, cov["resolved"])
+        self.assertGreater(cov["required"], cov["resolved"])
+
+    def test_real_main_reports_coverage_not_just_provider_presence(self):
+        """真实 ``main()``：归档存在但**不覆盖**动作 session → 指标不可用。"""
+        import json as _json
+        import os as _os
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db = _os.path.join(tmp, "selection_tracking.db")
+            import sqlite3 as sq
+
+            conn = sq.connect(db)
+            conn.execute(
+                "CREATE TABLE selection_runs(id INTEGER PRIMARY KEY, strategy TEXT,"
+                " data_asof_date TEXT)"
+            )
+            conn.execute(
+                "CREATE TABLE selection_picks(run_id INTEGER, code TEXT,"
+                " rank_no INTEGER, name TEXT)"
+            )
+            conn.execute("INSERT INTO selection_runs VALUES(1,'s1','2024-06-14')")
+            conn.execute("INSERT INTO selection_picks VALUES(1,'600001',1,'某某股份')")
+            conn.commit()
+            conn.close()
+            # 归档只覆盖决策日 06-14，而 entry 是 06-17、exit 是 06-18。
+            archive = _os.path.join(tmp, "security_state_history.json")
+            with open(archive, "w", encoding="utf-8") as handle:
+                _json.dump({
+                    "kind": "historical_archive",
+                    "historical_membership_complete": True,
+                    "availability_basis": "session_close",
+                    "rows": [{"code": "600001", "effective_from": "2024-06-14",
+                              "effective_to": "2024-06-14", "name": "某某股份",
+                              "risk_flag": False}],
+                }, handle, ensure_ascii=False)
+
+            import selection_alpha_report as AR
+
+            original = dict(
+                DATA_DIR=AR.DATA_DIR, KLINE_DIR=AR.KLINE_DIR,
+                REPORT_PATH=AR.REPORT_PATH, load_kline=AR.load_kline,
+                listdir=AR.os.listdir, WINDOW_DAYS=AR.WINDOW_DAYS,
+            )
+            AR.DATA_DIR = tmp
+            AR.KLINE_DIR = _os.path.join(tmp, "klines")
+            AR.REPORT_PATH = _os.path.join(tmp, "reports", "alpha.md")
+            AR.WINDOW_DAYS = 3650
+            AR.load_kline = lambda code: dict(self.KLINES.get(code) or {})
+            AR.os.listdir = lambda path: (
+                [f"{code}.csv" for code in self.KLINES]
+                if str(path) == str(AR.KLINE_DIR) else original["listdir"](path)
+            )
+            try:
+                from contextlib import redirect_stdout
+                import io
+
+                buf = io.StringIO()
+                with redirect_stdout(buf):
+                    AR.main(archive_path=archive)
+                payload = _json.loads(buf.getvalue().strip().splitlines()[-1])
+            finally:
+                AR.DATA_DIR = original["DATA_DIR"]
+                AR.KLINE_DIR = original["KLINE_DIR"]
+                AR.REPORT_PATH = original["REPORT_PATH"]
+                AR.load_kline = original["load_kline"]
+                AR.os.listdir = original["listdir"]
+                AR.WINDOW_DAYS = original["WINDOW_DAYS"]
+
+        # provider 存在（归档合法），但没有任何动作 session 能解析 → 不可用。
+        self.assertTrue(payload["provider_present"])
+        self.assertEqual(0, payload["action_state_coverage"]["resolved"])
+        self.assertFalse(payload["executable_metrics_available"])
+        self.assertFalse(payload["executable_coverage_available"])
 
 
 if __name__ == "__main__":

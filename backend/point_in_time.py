@@ -78,6 +78,7 @@ __all__ = [
     "UNIVERSE_LIST_DATE_KEYS",
     "UNIVERSE_DELIST_DATE_KEYS",
     "china_tz",
+    "as_strict_bool",
     "parse_asof",
     "parse_available_at",
     "asof_is_strict",
@@ -249,6 +250,48 @@ def _is_missing(value: Any) -> bool:
     if isinstance(value, str):
         return value.strip().lower() in _MISSING_STRINGS
     return False
+
+
+#: 字符串真值表。**只**承认显式列出的写法：``"false"`` / ``"0"`` / ``"no"`` /
+#: ``"off"`` 等一律为 ``False``，绝不允许 ``bool("false") == True`` 这种把
+#: "未声明完整"读成"已声明完整"的错误。
+_TRUE_STRINGS = {"true", "1", "yes", "y", "on", "t"}
+_FALSE_STRINGS = {"false", "0", "no", "n", "off", "f"}
+
+
+def as_strict_bool(value: Any) -> Optional[bool]:
+    """把声明性标志严格归一成 ``True`` / ``False`` / ``None``。
+
+    ``None`` 表示**无法判定**（未声明、空值或未知写法），与显式 ``False``
+    区分开：调用方必须把"不知道"当成不满足，而不是默认通过。
+
+    * ``bool`` → 原值；
+    * ``int`` / ``float`` → ``0`` 为假、非 0 为真（``NaN`` → ``None``）；
+    * 字符串 → 只认 :data:`_TRUE_STRINGS` / :data:`_FALSE_STRINGS`（大小写与
+      首尾空白无关）；其余字符串 → ``None``；
+    * 其他类型 → ``None``。
+
+    **绝不**使用内置 ``bool(value)`` 做这层转换：``bool("false")`` 是 ``True``，
+    那会把一个显式否定的归档声明读成"完整"。
+    """
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, float):
+        if math.isnan(value):
+            return None
+        return value != 0.0
+    if isinstance(value, int):
+        return value != 0
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in _TRUE_STRINGS:
+            return True
+        if text in _FALSE_STRINGS:
+            return False
+        return None
+    return None
 
 
 def _parse(value: Any) -> tuple[Optional[_dt.datetime], bool, str]:
@@ -721,12 +764,15 @@ def universe_source_provenance(source: Any, asof: Any = None) -> dict:
         return out
     out["historical_membership_asof"] = _iso(archive_moment)
 
-    complete_flag = False
+    complete_flag = None
     for key in UNIVERSE_SOURCE_COMPLETE_KEYS:
-        if data.get(key) is True:
-            complete_flag = True
-            break
-    if not complete_flag:
+        if key not in data:
+            continue
+        # 严格归一：``"false"`` / ``"0"`` 必须读成"未声明完整"，不能因为
+        # 非空字符串就让 ``bool(...)`` 变成 True。
+        complete_flag = as_strict_bool(data.get(key))
+        break
+    if complete_flag is not True:
         out["status"] = UNIVERSE_SOURCE_INCOMPLETE
         return out
     # 归档只覆盖到某日：它无法为更晚的决策时点证明成员资格。

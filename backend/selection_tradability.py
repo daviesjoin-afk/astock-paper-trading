@@ -146,8 +146,9 @@ TRADABILITY_REASONS = (
     REASON_MISSING_CODE,
 )
 
-#: ST 证券的涨跌停幅度（仓库口径，见 :func:`paper_trading_rules.limit_pct`）。
-ST_LIMIT_PCT = 5.0
+# ST 涨跌停幅度**没有本地常量**：唯一权威来源是
+# :func:`paper_trading_rules.limit_pct`（它按板块 + ST 决定）。这里只暴露一个
+# 强制 ST 口径的薄包装，供"歧义区间"判定复用，绝不复制那个数字。
 
 
 class TradabilityContractError(ValueError):
@@ -176,6 +177,19 @@ def _finite(value: Any) -> Optional[float]:
 def _instant(value: Any) -> Optional[str]:
     moment = PIT.parse_available_at(value)
     return None if moment is None else moment.isoformat(timespec="seconds")
+
+
+def normalize_risk_flag(value: Any) -> Optional[bool]:
+    """把风险警示标记严格归一成 ``True`` / ``False`` / ``None``。
+
+    委托 :func:`point_in_time.as_strict_bool`。``None`` 表示**无法判定**
+    （未声明或未知写法），不是"非 ST"。
+
+    **绝不**用内置 ``bool()``：``bool("false") == True``，一个显式写
+    ``"risk_flag": "false"`` 的历史归档会因此被读成 ST（或被误判为非 ST），
+    两种方向都是"用错误的状态重写历史结论"。
+    """
+    return PIT.as_strict_bool(value)
 
 
 def is_visible_at(available_at: Any, asof: Any) -> bool:
@@ -331,6 +345,18 @@ def board_limit_pct(code: Any) -> Optional[float]:
     return float(PTR.limit_pct(str(code), None, False))
 
 
+def st_limit_pct(code: Any, *, name: Any = None, risk_flag: Any = True) -> Optional[float]:
+    """ST 口径的涨跌停幅度。**不写常量**，委托 :func:`paper_trading_rules.limit_pct`。
+
+    传 ``risk_flag=True`` 即强制走 ST 分支，因此返回的是权威实现给出的 ST 上限
+    （当前为 5.0）。权威口径若调整，这里自动跟随；本地复制的数字则会静默漂移。
+    """
+    if code in (None, ""):
+        return None
+    flag = normalize_risk_flag(risk_flag)
+    return float(PTR.limit_pct(str(code), name, flag if flag is not None else True))
+
+
 def resolve_limit_pct(
     code: Any,
     *,
@@ -352,21 +378,35 @@ def resolve_limit_pct(
     board_pct = board_limit_pct(code)
     if board_pct is None:
         return None, REASON_MISSING_CODE
-    if name is not None or risk_flag is not None:
-        is_st = bool(PTR.is_st_or_delisting(name, bool(risk_flag)))
-        return (ST_LIMIT_PCT if is_st else board_pct), None
+    flag = normalize_risk_flag(risk_flag)
+    if risk_flag is not None and flag is None:
+        # 字段存在但写法无法判定（例如 ``"maybe"``）：不能当作非 ST 静默放行。
+        return None, REASON_UNKNOWN_PRICE_LIMIT
+    if name is not None or flag is not None:
+        # ST 与否**以及**对应幅度全部委托 :func:`paper_trading_rules.limit_pct`
+        # 这一唯一权威实现：它内部决定 ST 是 5.0、主板 9.5 等。本地复制任何一个
+        # 数字（例如 ``ST_LIMIT_PCT``）都会在权威口径变化时静默漂移。
+        return float(PTR.limit_pct(str(code), name, flag if flag is not None else False)), None
     if pct_change is None:
         return None, REASON_UNKNOWN_PRICE_LIMIT
     magnitude = abs(pct_change)
-    if magnitude < ST_LIMIT_PCT / 100.0 or magnitude >= board_pct / 100.0:
+    st_pct = st_limit_pct(code, name=None, risk_flag=True)
+    if magnitude < st_pct / 100.0 or magnitude >= board_pct / 100.0:
         # 无论 ST 与否结论都一样 → ST 状态不影响判定。
         return board_pct, None
     return None, REASON_UNKNOWN_PRICE_LIMIT
 
 
 def security_permission(code: Any, *, name: Any, risk_flag: Any) -> dict:
-    """账户证券权限（板块 / ST / 证券类型）。委托仓库唯一入口。"""
-    return dict(PTR.security_scope(str(code or ""), name, bool(risk_flag)))
+    """账户证券权限（板块 / ST / 证券类型）。委托仓库唯一入口。
+
+    ``risk_flag`` 先严格归一，**绝不**用 ``bool(risk_flag)``（``"false"`` 会变成
+    True）。无法判定（``None``）时按保守方向处理 —— 交给
+    :func:`paper_trading_rules.security_scope` 决定，并保持"缺证据即 fail closed"
+    的上游门禁语义。
+    """
+    flag = normalize_risk_flag(risk_flag)
+    return dict(PTR.security_scope(str(code or ""), name, flag is True))
 
 
 def earliest_sellable_session(code: Any, *, name: Any, entry_session: Any) -> Optional[str]:
@@ -453,7 +493,17 @@ def tradability_at(
         )
 
     # ── 4. 证据派生权限：**当时的**名称 / 风险标记（已过 PIT） ──
-    if evidence.name is None and evidence.risk_flag is None:
+    # 风险标记先严格归一：``"false"`` / ``"0"`` 必须读成"非 ST"，不能靠
+    # ``bool("false") == True`` 把一只正常股票判成 ST（反向亦然）。归一结果为
+    # ``None`` 表示**该字段存在但无法判定**（未知写法），同样 fail closed。
+    risk_flag_value = normalize_risk_flag(evidence.risk_flag)
+    if evidence.risk_flag is not None and risk_flag_value is None:
+        return _verdict(
+            status=STATUS_UNPROVEN, reason=REASON_UNKNOWN_ST_STATUS, side=side,
+            code=code_text, action_at=moment, evidence=evidence,
+            board=str(board_scope.get("board") or "") or None,
+        )
+    if evidence.name is None and risk_flag_value is None:
         # "不知道当时是不是 ST" 不等于"当时不是 ST"：账户权限无法证明 → fail closed。
         return _verdict(
             status=STATUS_UNPROVEN, reason=REASON_UNKNOWN_ST_STATUS, side=side,
@@ -461,7 +511,7 @@ def tradability_at(
             board=str(board_scope.get("board") or "") or None,
         )
     permission = security_permission(
-        code_text, name=evidence.name, risk_flag=evidence.risk_flag
+        code_text, name=evidence.name, risk_flag=risk_flag_value
     )
     board = str(permission.get("board") or "") or None
     if not permission.get("allowed"):

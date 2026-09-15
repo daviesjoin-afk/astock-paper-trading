@@ -179,7 +179,10 @@ def archive_provenance(
     complete = None
     for key in PIT.UNIVERSE_SOURCE_COMPLETE_KEYS:
         if key in payload:
-            complete = bool(payload.get(key))
+            # 严格归一（委托 :func:`point_in_time.as_strict_bool`）：``"false"`` /
+            # ``"0"`` 必须读成"未声明完整"，绝不能靠 ``bool("false") == True``
+            # 把一份显式否定的归档当成完整历史源。
+            complete = PIT.as_strict_bool(payload.get(key))
             break
     if complete is not True:
         return {
