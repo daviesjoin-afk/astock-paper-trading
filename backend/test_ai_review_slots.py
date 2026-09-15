@@ -1,7 +1,11 @@
 # -*- coding: utf-8 -*-
-"""通用 AI 审核槽位（``ai1`` / ``ai2``）契约测试：T1–T24。
+"""通用 AI 审核槽位（``ai1`` / ``ai2``）契约测试：T1–T52（含 C1–C6）。
 
-对应 PR「refactor: generalize AI review into configurable AI1/AI2 slots」的验收清单。
+对应两组 PR 的验收清单：
+
+- 「refactor: generalize AI review into configurable AI1/AI2 slots」（T1–T34）
+- 「fix(ai-review): distinguish hold, disagreement, and reviewer failure」
+  （T35–T52 + C1–C6：dual 结果状态机、reviewer 响应可用性校验、指标分层、apply 门禁）
 
 **全部离线**：不联网、不调用任何真实付费 AI API。所有"调用"都被
 ``ai_review_service._call_slot`` 的桩替换；需要真实 key 的地方一律用假字符串。
@@ -802,7 +806,7 @@ class ReviewRegressionTests(AiReviewSlotTestBase):
             self.assertFalse(S.review_settings_view(conn)["single_ready"])
 
 
-# ───────────────── T35–T46：dual 结果状态机（outcome taxonomy）─────────────────
+# ───────────────── T35–T52：dual 结果状态机（outcome taxonomy）─────────────────
 
 def _decide(a1, a2, proposals1=None, proposals2=None, confidence=86):
     """两端各给一个 decision 的桩。``proposals=None`` 表示该端提一个合法提案。"""
@@ -815,6 +819,23 @@ def _decide(a1, a2, proposals1=None, proposals2=None, confidence=86):
 
 def _reviewer(status, decision=None):
     return {"slot": "x", "status": status, "decision": decision, "error": None}
+
+
+def _raw_response(payload):
+    """按**原样**返回 ``payload`` 的槽位桩。
+
+    ``_response`` 会把 ``proposals`` 强制 ``list(...)``，因此构造"畸形提案"这类
+    协议级响应必须绕开它 —— 否则测不到被校验的边界。
+    """
+    return ({**payload, "confidence": 86, "market_regime": "trend", "summary": "stub"},
+            11, 7, 9)
+
+
+def _raw_by_slot(payloads):
+    """每个槽位返回不同原样 payload 的桩。"""
+    def side_effect(slot_config, system_prompt, user_prompt, max_tokens=1800):
+        return _raw_response(payloads[slot_config["slot"]])
+    return side_effect
 
 
 class OutcomeClassifierContractTests(unittest.TestCase):
@@ -859,9 +880,34 @@ class OutcomeClassifierContractTests(unittest.TestCase):
             with self.subTest(value=value):
                 self.assertTrue(S.normalize_reviewer_decision(value)[1])
 
+    def test_c6_reviewer_proposals_validation_is_strict(self):
+        """propose 必须给出**非空对象列表**；任何畸形形状都不可用。
+
+        畸形值绝不能被静默替换成 ``[]`` —— 那会把协议失败伪装成
+        "双方成功但提案谈不拢"（``no_consensus``）。
+        """
+        # propose：合法形状
+        good = [{"account_id": "a", "weights": {"mom": 0.5}}]
+        self.assertEqual((good, True), S.normalize_reviewer_proposals("propose", good))
+        self.assertEqual((good, True), S.normalize_reviewer_proposals("propose", list(good)))
+        # propose：畸形/空的形状
+        for value in (None, "", "oops", {"account_id": "a"}, 0, [], [1, 2], ["x"], [good, "bad"]):
+            with self.subTest(decision="propose", value=value):
+                proposals, ok = S.normalize_reviewer_proposals("propose", value)
+                self.assertFalse(ok, "propose 的畸形提案必须判为不可用")
+                self.assertIsNone(proposals)
+        # hold：缺省/空列表合法，给了值则仍须是对象列表
+        for value in (None, []):
+            with self.subTest(decision="hold", value=value):
+                self.assertEqual(([], True), S.normalize_reviewer_proposals("hold", value))
+        self.assertEqual((good, True), S.normalize_reviewer_proposals("hold", good))
+        for value in ("oops", {"a": 1}, 3, [1], [good, "bad"]):
+            with self.subTest(decision="hold", value=value):
+                self.assertFalse(S.normalize_reviewer_proposals("hold", value)[1])
+
 
 class OutcomeTaxonomyTests(AiReviewSlotTestBase):
-    """T35–T46：真实 ``run_ai_review`` 路径上的状态机（含审计落库）。"""
+    """T35–T52：真实 ``run_ai_review`` 路径上的状态机（含审计落库）。"""
 
     def setUp(self):
         super().setUp()
@@ -1006,6 +1052,83 @@ class OutcomeTaxonomyTests(AiReviewSlotTestBase):
                 self.assertNotIn(result["status"], ("both_hold", "no_consensus"))
                 self.assertIn("unusable_decision", result["reason"])
                 self.assertFalse(result["consensus"])
+
+    def test_t49_propose_with_object_proposals_is_failed_not_no_consensus(self):
+        """propose 却给出**对象**形状的 proposals → 协议失败，必须是 ``failed``。
+
+        回归的是 "静默替换成 ``[]``"：旧实现会把畸形提案吞成空列表，于是这次
+        **协议失败**最终落成 ``no_consensus``，与"双方成功但真的谈不拢"无法区分，
+        并从 ``failure_rate`` 里蒸发。
+        """
+        result = self._run(_raw_by_slot({
+            "ai1": {"decision": "propose", "proposals": {"account_id": ACCOUNT}},
+            "ai2": {"decision": "propose", "proposals": [_proposal()]},
+        }))
+        self.assertEqual("failed", result["status"])
+        self.assertNotEqual("no_consensus", result["status"], "协议失败不是语义分歧")
+        self.assertNotEqual("both_hold", result["status"])
+        self.assertIn("unusable_proposals", result["reason"])
+        self.assertIn("ai1 reviewer failed", result["reason"])
+        self.assertEqual("failed", result["reviewers"]["ai1"]["status"])
+        self.assertEqual("completed", result["reviewers"]["ai2"]["status"],
+                         "另一端是好的，不得被连坐成失败")
+        self.assertFalse(result["consensus"])
+        self.assertEqual([], result["proposals"])
+        self.assertEqual("failed", self.audit(result["id"])["status"])
+
+    def test_t50_propose_with_string_proposals_on_ai2_is_failed(self):
+        result = self._run(_raw_by_slot({
+            "ai1": {"decision": "propose", "proposals": [_proposal()]},
+            "ai2": {"decision": "propose", "proposals": "oops"},
+        }))
+        self.assertEqual("failed", result["status"])
+        self.assertIn("unusable_proposals", result["reason"])
+        self.assertIn("ai2 reviewer failed", result["reason"])
+        self.assertNotIn("ai1 reviewer failed", result["reason"])
+        self.assertEqual("failed", result["reviewers"]["ai2"]["status"])
+
+    def test_t51_propose_with_empty_proposals_is_failed(self):
+        """``propose`` 却没有任何提案 = 自相矛盾的响应，同样是协议失败。"""
+        result = self._run(_raw_by_slot({
+            "ai1": {"decision": "propose", "proposals": []},
+            "ai2": {"decision": "propose", "proposals": [_proposal()]},
+        }))
+        self.assertEqual("failed", result["status"])
+        self.assertNotEqual("no_consensus", result["status"])
+        self.assertIn("unusable_proposals", result["reason"])
+        self.assertFalse(result["consensus"])
+
+    def test_t52_wellformed_proposals_are_still_accepted(self):
+        """负向对照：新校验绝不能误伤合法响应。
+
+        合法 ``propose`` 仍照常进入共识门禁（达成 → ``consensus``；谈不拢 →
+        ``no_consensus``），绝不因为本次收紧而变成 ``failed``。
+        """
+        agreed = self._run(_raw_by_slot({
+            "ai1": {"decision": "propose", "proposals": [_proposal()]},
+            "ai2": {"decision": "propose", "proposals": [_proposal()]},
+        }))
+        self.assertNotEqual("failed", agreed["status"])
+        self.assertEqual("consensus", agreed["status"])
+        self.assertNotIn("unusable_proposals", agreed["reason"])
+
+        # 合法但方向相反的提案 → 是**真正的**语义分歧，仍应是 no_consensus
+        split = self._run(_raw_by_slot({
+            "ai1": {"decision": "propose",
+                    "proposals": [_proposal({"mom": 0.53, "sentiment": 0.47})]},
+            "ai2": {"decision": "propose",
+                    "proposals": [_proposal({"mom": 0.47, "sentiment": 0.53})]},
+        }))
+        self.assertEqual("no_consensus", split["status"])
+        self.assertNotIn("unusable_proposals", split["reason"])
+
+        # hold 侧完全不提 proposals 仍然是合法的（不是畸形响应）
+        held = self._run(_raw_by_slot({
+            "ai1": {"decision": "hold"},
+            "ai2": {"decision": "hold"},
+        }))
+        self.assertEqual("both_hold", held["status"])
+        self.assertNotIn("failed", held["reason"])
 
 
 class SelfEvolutionMetricTests(AiReviewSlotTestBase):

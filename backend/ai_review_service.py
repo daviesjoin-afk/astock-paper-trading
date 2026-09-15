@@ -36,7 +36,7 @@ propose / hold   ``no_consensus`` 同上
 propose/propose  ``no_consensus`` 两个 reviewer 都成功，但 proposals 无法共识
 但无法共识
 任一 reviewer    ``failed``       **调用之后**失败/超时/HTTP 错误/响应不可用
-调用后失败
+调用后失败                        （decision 非法，或 propose 却给出畸形/空提案）
 ==============  =========  ==================================================
 
 核心不变式：``both_hold ≠ 没有 merged proposal``。``both_hold`` 要求两端都
@@ -1115,6 +1115,39 @@ def normalize_reviewer_decision(value):
     return decision, True
 
 
+def normalize_reviewer_proposals(decision, value):
+    """归一化并校验 reviewer 的 ``proposals``，返回 ``(proposals, ok)``。
+
+    这是 ``normalize_reviewer_decision`` 的姐妹校验，堵的是同一类
+    "协议失败伪装成语义分歧"的口子：
+
+    ``propose``
+        ``proposals`` **必须**是非空列表且每个元素是对象。这不是风格偏好：
+        ``_check_consensus`` 要把两侧提案逐账户比对方向与幅度，没有可比的提案
+        就根本无从谈共识。若这里把畸形值悄悄替换成 ``[]``，一次**协议失败**会在
+        ``_check_consensus`` 里被记成"至少一个AI未提出有效提案"，最终落成
+        ``no_consensus`` —— 与"双方都成功、只是真的谈不拢"无法区分，还会从
+        ``failure_rate`` 里蒸发。因此判为"该 reviewer 不可用"。
+    ``hold``
+        提案在语义上不适用（"保持现状"不含任何可执行补丁），**缺省或空列表是
+        合法的**；但一旦给了值，它仍须是列表（元素须是对象），否则同样是畸形响应。
+
+    无论哪种 decision，只要 ``proposals`` 以**非列表**的形状出现（字符串、对象、
+    数字…），都判为不可用 —— "静默替换成 ``[]``"正是被修复的 bug 类。
+    """
+    if value is None:
+        proposals = []
+    elif isinstance(value, list):
+        if any(not isinstance(item, dict) for item in value):
+            return None, False
+        proposals = list(value)
+    else:
+        return None, False
+    if decision == "propose" and not proposals:
+        return None, False
+    return proposals, True
+
+
 def reviewer_is_usable(reviewer):
     """reviewer 是否"完整成功"：调用成功 **且** 给出了合法 decision。
 
@@ -1191,6 +1224,12 @@ def _call_reviewer(slot, cfg, system_prompt, user_prompt):
     都算"这个 reviewer 不可用"（转成结构化 failed），而不是被默认成 ``hold``。
     这样"响应没说结论"就不会再伪装成"双方一致 hold"。校验集中在本边界，
     不散落到 ``_run_dual_review`` 的各分支里。
+
+    ``proposals`` 同样在本边界校验（见 ``normalize_reviewer_proposals``）：
+    ``decision="propose"`` 却给出对象/字符串/空列表等畸形提案时，响应在协议层
+    不可用，一律转成结构化 failed。**绝不静默替换成 ``[]``** —— 那会把协议失败
+    伪装成"双方成功但提案谈不拢"（``no_consensus``），既与真正的语义分歧混淆，
+    也从 ``failure_rate`` 里蒸发。
     """
     try:
         parsed, in_tok, out_tok, latency = _call_slot(cfg, system_prompt, user_prompt)
@@ -1199,9 +1238,10 @@ def _call_reviewer(slot, cfg, system_prompt, user_prompt):
         decision, decision_ok = normalize_reviewer_decision(parsed.get("decision"))
         if not decision_ok:
             raise RuntimeError("%s_unusable_decision" % slot)
-        proposals = parsed.get("proposals") or []
-        if not isinstance(proposals, list):
-            proposals = []
+        proposals, proposals_ok = normalize_reviewer_proposals(
+            decision, parsed.get("proposals"))
+        if not proposals_ok:
+            raise RuntimeError("%s_unusable_proposals" % slot)
         return {
             "slot": slot,
             "display_name": cfg.get("display_name") or DEFAULT_DISPLAY_NAMES[slot],
