@@ -62,6 +62,16 @@ entry 或 exit 无法成交 → ``unavailable``（fail closed，不自行发明�
 authoritative basis 是 ``raw-return``；``excess-return`` 只在调用方
 真的提供了 PIT benchmark 证据时才可用，且此时 benchmark 缺失 = fail closed，
 绝不悄悄退回 raw。
+
+``label_version`` 是**唯一**的 authoritative 口径来源，``basis`` 是随记录
+一起持久化的**冗余校验字段**（:data:`LABEL_RECORD_FIELDS` 必须包含它）。
+:func:`basis_from_label_version` 是唯一的"版本 → 口径"解析点；
+:func:`verified_evidence` 先解析版本、再要求 ``basis`` 与之一致，三者
+（版本可解析 / ``basis`` 存在 / 两者一致）全部成立才继续做收益一致性校验。
+缺失或冲突一律 fail closed（``missing_label_basis`` / ``basis_version_mismatch``
+/ ``unsupported_label_version``）：**绝不** ``record.get("basis") or DEFAULT_BASIS``，
+那会把一条合法的 excess-return 标签在反序列化后静默读成 raw-return，
+再用 ``label_score == raw_forward_return`` 去否定它。
 """
 
 from __future__ import annotations
@@ -96,6 +106,22 @@ def label_version(basis: str = DEFAULT_BASIS) -> str:
     if text not in LABEL_BASES:
         raise ValueError(f"unsupported label basis: {basis!r}")
     return f"{LABEL_VERSION}/{text}"
+
+
+def basis_from_label_version(version: Any) -> Optional[str]:
+    """``selection-label-v1/<basis>`` → ``<basis>``；不可解析 → ``None``。
+
+    **唯一**的版本→口径解析点。``label_version`` 是 authoritative 的那一个：
+    ``basis`` 只是冗余校验字段。任何需要知道"这条标签用的是哪个口径"的代码
+    都必须走这里，禁止各处自行 ``version.split("/")`` 或在缺 ``basis`` 时
+    退回 ``DEFAULT_BASIS`` —— 后者会把一条超额标签静默读成 raw。
+    """
+    text = str(version or "").strip()
+    prefix = f"{LABEL_VERSION}/"
+    if not text.startswith(prefix):
+        return None
+    suffix = text[len(prefix):].strip().lower()
+    return suffix if suffix in LABEL_BASES else None
 
 
 # ───────────────────────────── label status ─────────────────────────────
@@ -491,7 +517,11 @@ def selection_label(
         它让本函数**可复现**：同一份证据 + 同一个 ``asof`` = 同一个结果。
     """
     version = label_version(basis)
-    clean_basis = version.split("/", 1)[1]
+    # 口径从 version 反解，而不是把入参 ``basis`` 再抄一遍 —— 全模块只有这一个
+    # 解析点，``basis`` 与 ``label_version`` 不可能各自漂移。
+    clean_basis = basis_from_label_version(version)
+    if clean_basis is None:  # pragma: no cover - ``label_version()`` 只产出合法版本
+        raise ValueError(f"unresolvable label version: {version!r}")
     moment = PIT.parse_asof(decision_at)
     if moment is None:
         return _unresolved(
@@ -775,11 +805,15 @@ FEATURE_RECORD_FIELDS = (
 #: 标签记录允许携带的键。``sample_key`` 必须在其中：它是样本身份本身，
 #: 丢掉它会让 "只按 code join" 这类错配重新变得可能，而
 #: ``learning_dataset.selection_label_evidence()`` 也确实读这个字段。
+#: ``basis`` 也必须在其中：``verified_evidence()`` 需要它来交叉校验
+#: ``label_version``，丢掉它会让一条合法的 excess-return 标签在反序列化后
+#: 被当成 raw-return 重新校验（收益口径不同 → 误判 ``inconsistent_outcome``）。
 LABEL_RECORD_FIELDS = (
     "code",
     "decision_at",
     "horizon",
     "label_version",
+    "basis",
     "sample_key",
     "label_status",
     "label_reason",
@@ -870,6 +904,9 @@ EVIDENCE_SCORE_MISSING = "missing_label_score"
 EVIDENCE_TIME_ORDER_INVALID = "invalid_label_time"
 EVIDENCE_OUTCOME_INCONSISTENT = "inconsistent_outcome"
 EVIDENCE_VERSION_MISSING = "missing_label_version"
+EVIDENCE_VERSION_UNSUPPORTED = "unsupported_label_version"
+EVIDENCE_BASIS_MISSING = "missing_label_basis"
+EVIDENCE_BASIS_VERSION_MISMATCH = "basis_version_mismatch"
 
 #: ``raw_forward_return`` 与 ``exit_price / entry_price - 1`` 的一致性容差。
 #: 两者由同一个公式产生，因此这里几乎是精确相等；容差只为浮点表示留余量。
@@ -889,6 +926,14 @@ def verified_evidence(record: Mapping[str, Any]) -> dict:
     ``claimed_verified`` 单独暴露"自称"这一事实，便于调用方区分
     "非 verified 状态"（正常的 pending/unavailable/invalid）与
     "自称 verified 但证据不成立"（必须 fail closed 的损坏记录）。
+
+    口径（``basis``）**必须**先立住，收益一致性才有意义：同一条记录用 raw 口径
+    校验还是用 excess 口径校验会给出不同结论。因此这里先解析
+    ``label_version``（authoritative），再要求持久化的 ``basis`` 与它逐字一致，
+    三者（version 可解析 / basis 存在 / basis == version 口径）全部成立才继续。
+    缺失或冲突一律 fail closed —— **绝不** ``record.get("basis") or DEFAULT_BASIS``：
+    那会把一条合法的 excess-return 标签静默读成 raw-return，并用
+    ``label_score == raw_forward_return`` 去否定它。
     """
     declared = str(record.get("label_status") or "")
     claimed = declared == STATUS_VERIFIED
@@ -900,13 +945,26 @@ def verified_evidence(record: Mapping[str, Any]) -> dict:
     score = _finite(record.get("label_score"))
     raw_return = _finite(record.get("raw_forward_return"))
     excess_return = _finite(record.get("excess_return"))
-    basis = str(record.get("basis") or DEFAULT_BASIS)
+    benchmark_return = _finite(record.get("benchmark_return"))
     version = str(record.get("label_version") or "").strip()
+    declared_basis = str(record.get("basis") or "").strip().lower()
+    # 口径只由 version 决定。``basis`` 是冗余校验字段，不是第二个真相源。
+    version_basis = basis_from_label_version(version)
 
     reason = EVIDENCE_OK
     if claimed:
         if not version:
             reason = EVIDENCE_VERSION_MISSING
+        elif version_basis is None:
+            # 版本解析不出受支持的 basis → 无法判断该用哪条一致性规则。
+            # "不知道 basis" 不等于 "basis 是 raw-return"。
+            reason = EVIDENCE_VERSION_UNSUPPORTED
+        elif not declared_basis:
+            # 声称 verified 却连 basis 都没有持久化 → 拒绝，不推断。
+            reason = EVIDENCE_BASIS_MISSING
+        elif declared_basis != version_basis:
+            # 冲突证据 != 可猜测证据：不自动修正，直接拒绝。
+            reason = EVIDENCE_BASIS_VERSION_MISMATCH
         elif exit_date is None:
             reason = EVIDENCE_EXIT_MISSING
         elif entry_date is None or entry_price is None or entry_price <= 0:
@@ -920,11 +978,15 @@ def verified_evidence(record: Mapping[str, Any]) -> dict:
             reason = EVIDENCE_OUTCOME_INCONSISTENT
         elif abs(raw_return - (exit_price / entry_price - 1.0)) > _OUTCOME_TOLERANCE:
             reason = EVIDENCE_OUTCOME_INCONSISTENT
-        elif basis == BASIS_EXCESS and (
-            excess_return is None or abs(score - excess_return) > _OUTCOME_TOLERANCE
-        ):
-            reason = EVIDENCE_OUTCOME_INCONSISTENT
-        elif basis != BASIS_EXCESS and abs(score - raw_return) > _OUTCOME_TOLERANCE:
+        elif version_basis == BASIS_EXCESS:
+            # 超额口径：既要 score 等于 excess，也要基准证据确实存在。
+            if (
+                benchmark_return is None
+                or excess_return is None
+                or abs(score - excess_return) > _OUTCOME_TOLERANCE
+            ):
+                reason = EVIDENCE_OUTCOME_INCONSISTENT
+        elif abs(score - raw_return) > _OUTCOME_TOLERANCE:
             reason = EVIDENCE_OUTCOME_INCONSISTENT
 
     verified = claimed and reason == EVIDENCE_OK
@@ -947,6 +1009,8 @@ def verified_evidence(record: Mapping[str, Any]) -> dict:
         "reason": reason,
         "sample_key": key_text,
         "label_version": version or None,
+        # 口径来自校验过的 version（此时它必然可解析），而不是调用方给的字符串。
+        "basis": version_basis if verified else None,
         # 日期是**结构**（entry/exit 落在哪两个 session），即使还没到期也如实保留；
         # 价格/收益/score 是**证据**，不是 verified 就一律为 None。
         "entry_date": entry_date,
@@ -954,6 +1018,7 @@ def verified_evidence(record: Mapping[str, Any]) -> dict:
         "entry_price": entry_price if verified else None,
         "exit_price": exit_price if verified else None,
         "raw_forward_return": raw_return if verified else None,
+        "benchmark_return": benchmark_return if verified else None,
         "excess_return": excess_return if verified else None,
         "label_score": score if verified else None,
     }
@@ -1073,6 +1138,9 @@ def assemble_learning_rows(
                 "decision_at": feature["decision_at"],
                 "horizon": feature["horizon"],
                 "label_version": feature.get("label_version") or label.get("label_version"),
+                # 口径随行下发：consumer 不必自己从 ``label_version`` 再解析一遍，
+                # 也就不会各自实现一套"缺 basis 就退回 raw"的回退。
+                "basis": evidence["basis"],
                 "features": dict(feature.get("features") or {}),
                 "selected": feature.get("selected"),
                 "score": feature.get("score"),

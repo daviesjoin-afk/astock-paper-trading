@@ -1067,5 +1067,245 @@ class NonFiniteQuotaTest(unittest.TestCase):
             self.assertAlmostEqual(0.0, row["excess_return_pct"], places=12)
 
 
+# ───── review round 3: P30–P32 (excess-return serialization contract) ─────
+
+
+#: entry 2024-06-17 收 10 → exit 2024-06-19 收 11（raw +10%）。
+#: 同窗口基准 100 → 105（+5%）→ excess +5%。raw != excess，正是本轮要证明的那类样本。
+EXCESS_PRICES = {**{d: 10.0 for d in SESSIONS}, "2024-06-17": 10.0, "2024-06-19": 11.0}
+EXCESS_BENCHMARK = {**{d: 100.0 for d in SESSIONS}, "2024-06-17": 100.0, "2024-06-19": 105.0}
+
+
+def _excess_label(**overrides):
+    kwargs = {
+        "code": "600001",
+        "decision_at": T_AFTER_CLOSE,
+        "horizon": 2,
+        "sessions": SESSIONS,
+        "prices": EXCESS_PRICES,
+        "asof": ASOF,
+        "basis": SL.BASIS_EXCESS,
+        "benchmark_prices": EXCESS_BENCHMARK,
+    }
+    kwargs.update(overrides)
+    return SL.selection_label(**kwargs)
+
+
+class ExcessReturnSerializationTest(unittest.TestCase):
+    """excess-return 标签必须能走完 ``label_record`` → dataset 的完整链路。
+
+    修复前 ``LABEL_RECORD_FIELDS`` 不含 ``basis``，``verified_evidence()`` 便用
+    ``record.get("basis") or DEFAULT_BASIS`` 把每条超额标签读成 raw-return，
+    再用 ``label_score == raw_forward_return`` 去否定它（raw +10% vs excess +5%）
+    → 合法标签被降级成 ``inconsistent_outcome``。P8/P15 只证明标签**被算出来**，
+    P20b 只证明 raw/excess **不匹配**；下面这条才是"能进数据集"的正面证明。
+    """
+
+    def test_p30_excess_return_survives_the_canonical_record_path(self):
+        """P30：raw != excess 的真实超额标签，经 canonical 序列化后仍被放行。"""
+        import learning_dataset as LD
+
+        label = _excess_label()
+        # 前提：这确实是一条 raw != excess 的样本，否则整条测试没有区分力。
+        self.assertEqual(SL.STATUS_VERIFIED, label.label_status)
+        self.assertAlmostEqual(0.10, label.raw_forward_return, places=12)
+        self.assertAlmostEqual(0.05, label.benchmark_return, places=12)
+        self.assertAlmostEqual(0.05, label.excess_return, places=12)
+        self.assertAlmostEqual(0.05, label.label_score, places=12)
+        self.assertNotAlmostEqual(label.raw_forward_return, label.label_score, places=6)
+        self.assertEqual(SL.BASIS_EXCESS, label.basis)
+        self.assertEqual("selection-label-v1/excess-return", label.label_version)
+
+        record = SL.label_record(label)
+        self.assertEqual("excess-return", record["basis"])
+        self.assertEqual("selection-label-v1/excess-return", record["label_version"])
+
+        verdict = SL.verified_evidence(record)
+        self.assertTrue(verdict["verified"], verdict)
+        self.assertEqual(SL.STATUS_VERIFIED, verdict["status"])
+        self.assertEqual(SL.EVIDENCE_OK, verdict["reason"])
+        self.assertAlmostEqual(label.excess_return, verdict["label_score"], places=12)
+        self.assertEqual(SL.BASIS_EXCESS, verdict["basis"])
+
+        evidence = LD.selection_label_evidence(record)
+        self.assertTrue(evidence["verified"], evidence)
+        self.assertEqual(LD.PIT_VERIFIED, evidence["pit_status"])
+        self.assertAlmostEqual(label.excess_return, evidence["label_score"], places=12)
+
+        feature = SL.feature_record(
+            code="600001", decision_at=T_AFTER_CLOSE, horizon=2,
+            version=SL.label_version(SL.BASIS_EXCESS), features={"momentum": 0.1},
+        )
+        assembled = SL.assemble_learning_rows([feature], [record])
+        self.assertEqual(1, assembled["report"]["assembled_rows"])
+        self.assertEqual(1, len(assembled["rows"]))
+        row = assembled["rows"][0]
+        self.assertAlmostEqual(label.excess_return, row["label_score"], places=12)
+        self.assertEqual("selection-label-v1/excess-return", row["label_version"])
+        self.assertEqual(SL.BASIS_EXCESS, row["basis"])
+        self.assertAlmostEqual(0.10, row["raw_forward_return"], places=12)
+        self.assertAlmostEqual(0.05, row["benchmark_return"], places=12)
+        self.assertEqual(0, assembled["report"]["excluded"]["invalid_verified_evidence"])
+
+        # 反向控制：同一个标签配一条 raw-version 特征 → 不匹配，不能混进数据集。
+        raw_feature = SL.feature_record(
+            code="600001", decision_at=T_AFTER_CLOSE, horizon=2,
+            version=SL.label_version(SL.BASIS_RAW), features={"momentum": 0.1},
+        )
+        crossed = SL.assemble_learning_rows([raw_feature], [record])
+        self.assertEqual([], crossed["rows"])
+        self.assertEqual(1, crossed["report"]["excluded"]["missing_label"])
+
+        # 批量桥同样只放行这一条。
+        outcome = LD.selection_outcome_rows([record])
+        self.assertEqual(1, outcome["report"]["accepted_rows"])
+        self.assertTrue(all(item["verified"] for item in outcome["rows"]))
+
+    def test_p30b_the_raw_return_path_is_unchanged(self):
+        """P30b：raw-return 正常路径逐段不变（回归保护）。"""
+        import learning_dataset as LD
+
+        label = _label(prices=PRICES_UP)
+        self.assertEqual(SL.BASIS_RAW, label.basis)
+        self.assertEqual("selection-label-v1/raw-return", label.label_version)
+        self.assertAlmostEqual(label.raw_forward_return, label.label_score, places=12)
+
+        record = SL.label_record(label)
+        self.assertEqual("raw-return", record["basis"])
+        verdict = SL.verified_evidence(record)
+        self.assertTrue(verdict["verified"], verdict)
+        self.assertEqual(SL.BASIS_RAW, verdict["basis"])
+        self.assertAlmostEqual(label.raw_forward_return, verdict["label_score"], places=12)
+        self.assertTrue(LD.selection_label_evidence(record)["verified"])
+
+        feature = SL.feature_record(
+            code="600001", decision_at=T_AFTER_CLOSE, horizon=2,
+            version=SL.label_version(SL.BASIS_RAW), features={"momentum": 0.1},
+        )
+        assembled = SL.assemble_learning_rows([feature], [record])
+        self.assertEqual(1, assembled["report"]["assembled_rows"])
+        self.assertAlmostEqual(label.raw_forward_return,
+                               assembled["rows"][0]["label_score"], places=12)
+        self.assertEqual(SL.BASIS_RAW, assembled["rows"][0]["basis"])
+
+
+class BasisVersionConsistencyTest(unittest.TestCase):
+    """``label_version`` 是 authoritative；``basis`` 是冗余校验字段。
+
+    冲突 / 缺失 / 不可解析一律 fail closed，且**不得自动修正**：
+    "冲突证据 != 可猜测证据"。降级后仍不得进入任何数据集。
+    """
+
+    def _feature(self, code="600001", version=None):
+        return SL.feature_record(
+            code=code, decision_at=T_AFTER_CLOSE, horizon=2,
+            version=version or SL.label_version(SL.BASIS_EXCESS),
+            features={"momentum": 0.1},
+        )
+
+    def _assert_refused(self, record, expected_reason, feature=None):
+        import learning_dataset as LD
+
+        verdict = SL.verified_evidence(record)
+        self.assertFalse(verdict["verified"], record)
+        self.assertTrue(verdict["claimed_verified"], record)
+        self.assertEqual(expected_reason, verdict["reason"], record)
+        self.assertEqual(SL.STATUS_UNAVAILABLE, verdict["status"], record)
+        self.assertIsNone(verdict["label_score"], record)
+        self.assertIsNone(verdict["basis"], record)
+
+        # 桥与 assembler 必须给出同一个判定（同一个 validator）。
+        evidence = LD.selection_label_evidence(record)
+        self.assertFalse(evidence["verified"], record)
+        self.assertEqual(LD.PIT_UNPROVEN, evidence["pit_status"], record)
+        self.assertIsNone(evidence["label_score"], record)
+
+        feature = feature if feature is not None else self._feature()
+        for require in (True, False):
+            assembled = SL.assemble_learning_rows([feature], [record],
+                                                 require_verified=require)
+            self.assertEqual([], assembled["rows"], (record, require))
+            self.assertEqual(1, assembled["report"]["excluded"]["invalid_verified_evidence"],
+                             (record, require))
+        # 拒绝的原因是 basis 契约，而不是顺带被身份错配兜住。
+        outcome = LD.selection_outcome_rows([record], require_verified=True)
+        self.assertEqual(0, outcome["report"]["accepted_rows"], record)
+
+    def test_p31_version_basis_conflicts_are_refused_not_repaired(self):
+        """P31：version/basis 冲突、缺失、不可解析 → fail closed，不自动修正。"""
+        good = SL.label_record(_excess_label())
+        self.assertTrue(SL.verified_evidence(good)["verified"])
+
+        # case 1：version=excess-return，basis=raw-return。身份键未变，
+        # 因此唯一能拦住它的就是 basis/version 一致性校验。
+        case_1 = {**good, "basis": SL.BASIS_RAW}
+        before = dict(case_1)
+        self._assert_refused(case_1, SL.EVIDENCE_BASIS_VERSION_MISMATCH)
+        self.assertEqual(before, case_1, "拒绝时不得就地修正记录")
+        assembled = SL.assemble_learning_rows([self._feature()], [case_1])
+        self.assertEqual(0, assembled["report"]["excluded"]["sample_key_mismatch"])
+
+        # case 2：version=raw-return，basis=excess-return。version 变了，
+        # 身份也要跟着重算 —— 否则会被 sample_key 校验先拦下，测不到 basis 契约。
+        raw_version = SL.label_version(SL.BASIS_RAW)
+        case_2 = {
+            **good,
+            "label_version": raw_version,
+            "basis": SL.BASIS_EXCESS,
+            "sample_key": SL.sample_identity(good["code"], good["decision_at"],
+                                             good["horizon"], raw_version),
+        }
+        before = dict(case_2)
+        self._assert_refused(
+            case_2, SL.EVIDENCE_BASIS_VERSION_MISMATCH,
+            feature=self._feature(version=raw_version),
+        )
+        self.assertEqual(before, case_2, "拒绝时不得就地修正记录")
+        assembled = SL.assemble_learning_rows(
+            [self._feature(version=raw_version)], [case_2]
+        )
+        self.assertEqual(0, assembled["report"]["excluded"]["sample_key_mismatch"])
+
+        # 缺失 basis：新契约要求持久化，缺了就拒绝，绝不 ``or DEFAULT_BASIS``。
+        missing_basis = {key: value for key, value in good.items() if key != "basis"}
+        self._assert_refused(missing_basis, SL.EVIDENCE_BASIS_MISSING)
+        # 空串与缺失同等对待。
+        self._assert_refused({**good, "basis": ""}, SL.EVIDENCE_BASIS_MISSING)
+
+        # 版本不可解析（未知 v2 / 未知口径）→ 无法判断该用哪条规则，同样拒绝。
+        for bad_version in ("selection-label-v2/raw-return",
+                            "selection-label-v1/nonsense", "raw-return"):
+            record = {
+                **good,
+                "label_version": bad_version,
+                "sample_key": SL.sample_identity(good["code"], good["decision_at"],
+                                                 good["horizon"], bad_version),
+            }
+            self._assert_refused(
+                record, SL.EVIDENCE_VERSION_UNSUPPORTED,
+                feature=self._feature(version=bad_version),
+            )
+
+    def test_p32_basis_is_a_label_only_field(self):
+        """P32：``basis`` 只能出现在标签侧；特征记录携带它会被结构性拒绝。"""
+        self.assertIn("basis", SL.LABEL_RECORD_FIELDS)
+        self.assertNotIn("basis", SL.FEATURE_RECORD_FIELDS)
+        self.assertIn("basis", SL.LABEL_ONLY_FIELDS)
+        with self.assertRaises(ValueError):
+            SL.assert_feature_record({
+                "code": "600001", "decision_at": T_AFTER_CLOSE, "horizon": 2,
+                "label_version": SL.label_version(SL.BASIS_EXCESS),
+                "features": {}, "basis": SL.BASIS_EXCESS,
+            })
+        # 版本→口径的解析只有一处，且对坏输入返回 None（不猜）。
+        self.assertEqual(SL.BASIS_EXCESS,
+                         SL.basis_from_label_version("selection-label-v1/excess-return"))
+        self.assertEqual(SL.BASIS_RAW,
+                         SL.basis_from_label_version("selection-label-v1/raw-return"))
+        for bad in ("", None, "selection-label-v1", "selection-label-v1/",
+                    "selection-label-v1/other", "selection-label-v2/raw-return"):
+            self.assertIsNone(SL.basis_from_label_version(bad), bad)
+
+
 if __name__ == "__main__":
     unittest.main()
