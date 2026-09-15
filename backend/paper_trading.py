@@ -3593,21 +3593,27 @@ def _rebuild_selection_factor_cache(asof_date=None):
     universe = U.load_universe()
     universe_membership = None
     if cutoff is not None:
-        # strict historical：成员资格**必须已被证明**。`membership_unknown`
-        # （缺 list/delist metadata）一律不得进入候选 universe —— "没有证据证明
-        # 未上市"不等于"当时已上市"，更不允许回退到当前 universe 来把候选凑齐。
-        membership = U.asof_members(universe, cutoff, drop_unproven=True)
-        universe = membership["members"]
-        universe_membership = membership["report"]
-        if not universe:
-            # 全部成分都无法证明历史成员资格 → PIT 不可用（fail closed）。
-            # 保留诊断 report，绝不 fallback 到当前 universe。
+        # strict historical 需要**两件**事同时成立：
+        #   1) 逐行成员资格已证明（drop_unproven=True，缺 list/delist 的一律不留）；
+        #   2) **源级**完整性已证明——逐行日期只能证明"这条现存 row 在 asof 属于
+        #      市场"，不能证明 `current universe == historical universe at T`：
+        #      已退市且今天不在快照里的证券根本不在输入里。
+        # 今天的 universe.json 是当前快照，无权自称历史完整，所以生产历史重建
+        # 会 fail closed，直到有真正持有上市/退市史的归档方显式声明完整性。
+        pit_gate = U.historical_universe(universe, cutoff, drop_unproven=True)
+        universe = pit_gate["members"]
+        universe_membership = pit_gate["report"]
+        if not pit_gate["passed"]:
+            missing_source = not universe_membership["historical_membership_complete"]
             return {
                 "status": "blocked",
-                "reason": "历史 universe 无任何已证明成员资格（PIT unavailable），"
-                          "拒绝回退到当前 universe",
+                "reason": ("历史 universe 源未证明完整性（PIT unavailable），"
+                           "拒绝回退到当前 universe" if missing_source else
+                           "历史 universe 无任何已证明成员资格（PIT unavailable），"
+                           "拒绝回退到当前 universe"),
                 "pit_unavailable": True,
-                "required": "上市日/退市日 metadata 缺失；历史选股无法证明成分合法",
+                "required": ("需要显式声明 historical_archive 完整性的历史成员源"
+                             "（含上市/退市史）；当前快照不构成证据"),
                 "universe_membership": universe_membership,
             }
         gate = _selection_factor_history_gate(universe, cutoff)

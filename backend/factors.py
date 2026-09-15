@@ -25,9 +25,10 @@ def _bar_availability(index):
 
     日线 bar 只有日期（生产解析器产出 naive midnight）→ 当日**收盘 15:00**
     （Asia/Shanghai）；索引带显式时刻（分钟 bar、或已带收盘时刻）→ 原样信任。
-    无法解释的索引 → NaT，strict 模式下被丢弃（fail closed，绝不猜）。
+    无法解释的索引项 → NaT（**不猜日期**）；调用方据此把该 code 整条排除。
     """
-    stamps = pd.DatetimeIndex(index)
+    naive = pd.to_datetime(pd.Index(index), errors="coerce")
+    stamps = pd.DatetimeIndex(naive)
     if stamps.tz is not None:
         naive = stamps.tz_convert(PIT.china_tz()).tz_localize(None)
     else:
@@ -90,6 +91,9 @@ def compute_price_factors(klines: dict, asof=None):
     ``price_pit_safe`` 不只是 metadata，它直接决定数据准入。剔除的数量记在
     ``frame.attrs["pit"]["codes_excluded_unproven_adjustment"]``（独立诊断，不保留
     alpha 值）。
+
+    索引不可解释（脏日期字符串 / 解析器抛异常）时同样只影响**该 code**：它被排除
+    并计入 ``codes_unreadable_index``，其余 code 照常计算——一只坏票绝不终止整个截面。
     """
     strict = PIT.asof_is_strict(asof)
     asof_moment = PIT.parse_asof(asof) if strict else None
@@ -100,6 +104,7 @@ def compute_price_factors(klines: dict, asof=None):
         _manifest = {}
     bars_dropped_future = 0
     bars_unreadable_index = 0
+    codes_unreadable_index = 0
     adjustments_unproven = 0
     rows = []
     for code, df in klines.items():
@@ -109,10 +114,24 @@ def compute_price_factors(klines: dict, asof=None):
             # 无法解析的 asof 不是历史回放的合法依据 → fail closed。
             if asof_moment is None:
                 continue
-            available = _bar_availability(df.index)
-            keep = available.notna() & (available <= asof_moment)
-            bars_dropped_future += int((available.notna() & ~keep).sum())
-            bars_unreadable_index += int(available.isna().sum())
+            # 索引解析必须落在**该 code 自己的** fail-closed 边界内：一只坏票
+            # 绝不能终止整个截面。解析器抛异常，或出现无法解释的日期项，都只
+            # 影响这一只，其它票照常计算。
+            try:
+                available = _bar_availability(df.index)
+            except Exception:
+                bars_unreadable_index += int(len(df.index))
+                codes_unreadable_index += 1
+                continue
+            unreadable = int(available.isna().sum())
+            if unreadable:
+                # 索引里混入无法解析的日期（或时区不可消歧）→ 整条序列的日期轴
+                # 都不可信：该 code 一律排除，不猜日期、也不使用它的任何 alpha。
+                bars_unreadable_index += unreadable
+                codes_unreadable_index += 1
+                continue
+            keep = available <= asof_moment
+            bars_dropped_future += int((~keep).sum())
             d = df.loc[keep]
         else:
             d = df
@@ -230,6 +249,7 @@ def compute_price_factors(klines: dict, asof=None):
         price_pit_safe=bool(strict and rows and adjustments_unproven == 0),
         bars_dropped_future=bars_dropped_future,
         bars_unreadable_index=bars_unreadable_index,
+        codes_unreadable_index=codes_unreadable_index,
         codes_excluded_unproven_adjustment=adjustments_unproven,
         codes_without_proven_adjustment=adjustments_unproven,
     )

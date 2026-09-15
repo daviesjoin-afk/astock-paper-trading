@@ -185,6 +185,14 @@ def _seed_market(tmp: str) -> None:
     universe = {
         "built_at": f"{D0.isoformat()} 08:00:00",
         "scope": "all_a_shares", "requested_limit": None,
+        # PIT：strict 历史不仅要求逐行 ``list_date``，还要求**源级**完整性声明——
+        # 逐行日期只能证明"这条现存 row 在 asof 属于市场"，无法证明"今天不在快照
+        # 里的退市证券没有被漏掉"。本 fixture 在这里扮演"持有完整历史成员史"的
+        # 归档源；真实生产没有这样的源，所以生产历史重建会 fail closed。
+        "kind": "historical_archive",
+        "historical_membership_complete": True,
+        "historical_membership_asof": "2026-12-31",
+        "historical_membership_source": "unit_test_injection",
         "stocks": stocks,
     }
     with open(U.UNIVERSE_PATH, "w", encoding="utf-8") as handle:

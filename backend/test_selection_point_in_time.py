@@ -326,6 +326,68 @@ class PricePointInTimeTests(PointInTimeBase):
         self.assertFalse(out.attrs["pit"]["price_pit_safe"])
         self.assertEqual(1, out.attrs["pit"]["codes_without_proven_adjustment"])
 
+    def test_p20_a_malformed_index_code_is_excluded_per_code(self):
+        """索引里混入无法解析的日期 → 该 code 整条排除，其它 code 照常计算。"""
+        good = daily_frame(series(HISTORY_START, ASOF_DAY, 20.0))
+        bad = daily_frame(series(HISTORY_START, ASOF_DAY, 20.0))
+        labels = list(bad.index)
+        labels[5] = "not-a-date"
+        bad.index = pd.Index(labels)
+
+        out = F.compute_price_factors({"bad": bad, "good": good}, asof=ASOF)
+
+        self.assertNotIn("bad", out.index)
+        self.assertIn("good", out.index)
+        self.assertEqual("2024-06-14", out.loc["good", "last_date"])
+        self.assertEqual(1, out.attrs["pit"]["codes_unreadable_index"])
+        self.assertGreaterEqual(out.attrs["pit"]["bars_unreadable_index"], 1)
+
+    def test_p20b_a_wholly_unparseable_index_is_excluded_without_raising(self):
+        good = daily_frame(series(HISTORY_START, ASOF_DAY, 20.0))
+        bad = daily_frame(series(HISTORY_START, ASOF_DAY, 20.0))
+        bad.index = pd.Index(["nope"] * len(bad))
+
+        out = F.compute_price_factors({"bad": bad, "good": good}, asof=ASOF)
+
+        self.assertNotIn("bad", out.index)
+        self.assertIn("good", out.index)
+        self.assertEqual(1, out.attrs["pit"]["codes_unreadable_index"])
+        self.assertEqual(len(bad), out.attrs["pit"]["bars_unreadable_index"])
+
+    def test_p20c_a_raising_index_parser_is_contained_per_code(self):
+        """即使索引解析本身抛异常，也必须在 per-code 边界内被吸收，不终止整轮。"""
+        good = daily_frame(series(HISTORY_START, ASOF_DAY, 20.0))
+        bad = daily_frame(series(HISTORY_START, ASOF_DAY, 20.0))
+        bad.index = pd.Index(["RAISE"] * len(bad))
+        seen = {"raised": 0}
+        real = F._bar_availability
+
+        def flaky(index):
+            if len(index) and str(index[0]) == "RAISE":
+                seen["raised"] += 1
+                raise ValueError("simulated unreadable index")
+            return real(index)
+
+        with mock.patch.object(F, "_bar_availability", side_effect=flaky):
+            out = F.compute_price_factors({"bad": bad, "good": good}, asof=ASOF)
+
+        self.assertEqual(1, seen["raised"])
+        self.assertNotIn("bad", out.index)
+        self.assertIn("good", out.index)
+        self.assertEqual(1, out.attrs["pit"]["codes_unreadable_index"])
+        self.assertEqual(len(bad), out.attrs["pit"]["bars_unreadable_index"])
+
+    def test_p20d_live_mode_does_not_apply_the_index_gate(self):
+        """live 兼容：坏索引不触发新的 PIT 日期轴门禁（strict 才校验）。"""
+        bad = daily_frame(series(HISTORY_START, ASOF_DAY, 20.0))
+        bad.index = pd.Index(["nope"] * len(bad))
+
+        out = F.compute_price_factors({"bad": bad})
+
+        self.assertEqual("live", out.attrs["pit"]["mode"])
+        self.assertEqual(0, out.attrs["pit"]["codes_unreadable_index"])
+        self.assertEqual(0, out.attrs["pit"]["bars_unreadable_index"])
+
     def test_p15_unsafe_adjustment_price_evidence_cannot_reach_alpha(self):
         """未经 PIT 证明的 qfq 序列：即使人为造出 +900% 动量，也不得影响选股。
 
@@ -891,6 +953,14 @@ class LiveSnapshotCutoffTests(PointInTimeBase):
 
 
 class ReplayWiringTests(PointInTimeBase):
+    #: 显式声明"持有完整历史成员史"的合法历史源。
+    HISTORICAL_SOURCE = {
+        "kind": "historical_archive",
+        "historical_membership_complete": True,
+        "historical_membership_asof": "2026-12-31",
+        "historical_membership_source": "unit_test_archive",
+    }
+
     def test_p14_historical_rebuild_filters_the_universe_by_asof(self):
         """回放重建必须先按 asof 过滤历史成分，且**未证明**的成分不得进入下游。"""
         import paper_trading as PT
@@ -906,6 +976,8 @@ class ReplayWiringTests(PointInTimeBase):
             return {"passed": False, "reason": "stub"}
 
         with mock.patch.object(PT.U, "load_universe", return_value=universe), \
+                mock.patch.object(PT.U, "load_universe_source",
+                                  return_value=self.HISTORICAL_SOURCE), \
                 mock.patch.object(PT, "_selection_factor_history_gate", side_effect=gate_spy):
             out = PT._rebuild_selection_factor_cache("2024-06-14")
 
@@ -916,6 +988,191 @@ class ReplayWiringTests(PointInTimeBase):
         self.assertIsNotNone(out["universe_membership"])
         self.assertEqual(1, out["universe_membership"]["counts"][PIT.MEMBERSHIP_NOT_LISTED_YET])
         self.assertEqual(1, out["universe_membership"]["unproven"])
+
+    def test_p17_complete_rows_do_not_prove_a_complete_historical_universe(self):
+        """每一行都有合法 list_date，但源只是**当前快照** → 仍然 fail closed。
+
+        逐行日期只能证明"这条现存 row 在 asof 属于市场"，不能证明
+        `current universe == historical universe at T`：已退市且今天不在快照里的
+        证券根本不在输入里，任何逐行校验都发现不了它们缺失。
+        """
+        import paper_trading as PT
+
+        universe = [{"code": "600001", "name": "甲", "list_date": "2015-01-05"},
+                    {"code": "600002", "name": "乙", "list_date": "2016-03-01"}]
+        seen = {"gate": False, "klines": [], "price": []}
+
+        def gate_spy(rows, cutoff):
+            seen["gate"] = True
+            return {"passed": True}
+
+        def kline_spy(code):
+            seen["klines"].append(code)
+            return None
+
+        def price_spy(*args, **kwargs):
+            seen["price"].append(kwargs.get("asof"))
+            raise AssertionError("current snapshot 不得进入历史因子计算")
+
+        current_snapshot_source = {
+            "kind": "current_snapshot",
+            "built_at": "2026-09-15 08:00:00",
+            "scope": "all_a_shares",
+        }
+        with mock.patch.object(PT.U, "load_universe", return_value=universe), \
+                mock.patch.object(PT.U, "load_universe_source",
+                                  return_value=current_snapshot_source), \
+                mock.patch.object(PT, "_selection_factor_history_gate", side_effect=gate_spy), \
+                mock.patch.object(PT.dfc, "load_shared_kline", side_effect=kline_spy), \
+                mock.patch.object(PT.F, "compute_price_factors", side_effect=price_spy):
+            out = PT._rebuild_selection_factor_cache("2024-06-14")
+
+        self.assertEqual("blocked", out["status"])
+        self.assertTrue(out["pit_unavailable"])
+        self.assertNotIn("refresh_gate", out)
+        report = out["universe_membership"]
+        self.assertFalse(report["historical_membership_complete"])
+        self.assertEqual(PIT.UNIVERSE_SOURCE_NOT_HISTORICAL, report["status"])
+        # 逐行成员资格本身是通过的 —— 被挡住的是"源完整性"
+        self.assertTrue(report["row_membership_passed"])
+        self.assertEqual(2, report["kept"])
+        # 没有进入任何候选/因子路径
+        self.assertFalse(seen["gate"])
+        self.assertEqual([], seen["klines"])
+        self.assertEqual([], seen["price"])
+
+    def test_p17b_adding_list_dates_alone_never_unlocks_historical_selection(self):
+        """反向对照：单纯补 list_date 不得自动解锁；缺源声明时必须仍被拒。"""
+        import paper_trading as PT
+
+        universe = [{"code": "600001", "list_date": "2015-01-05"}]
+        for source in (None, {}, {"kind": "current_snapshot"}, "universe.json"):
+            with mock.patch.object(PT.U, "load_universe", return_value=universe), \
+                    mock.patch.object(PT.U, "load_universe_source", return_value=source):
+                out = PT._rebuild_selection_factor_cache("2024-06-14")
+            self.assertEqual("blocked", out["status"], source)
+            self.assertTrue(out["pit_unavailable"], source)
+            self.assertFalse(
+                out["universe_membership"]["historical_membership_complete"], source)
+
+    def test_p18_an_explicitly_complete_archive_source_passes_the_gate(self):
+        """显式声明 historical-archive 完整的源可以进入后续路径。"""
+        import paper_trading as PT
+
+        universe = [{"code": "600001", "list_date": "2015-01-05"},
+                    {"code": "600002", "list_date": "2030-01-01"}]
+        seen = {}
+
+        def gate_spy(rows, cutoff):
+            seen["codes"] = sorted(str(r.get("code")) for r in rows)
+            seen["cutoff"] = cutoff
+            return {"passed": False, "reason": "coverage-stub"}
+
+        with mock.patch.object(PT.U, "load_universe", return_value=universe), \
+                mock.patch.object(PT.U, "load_universe_source",
+                                  return_value=self.HISTORICAL_SOURCE), \
+                mock.patch.object(PT, "_selection_factor_history_gate", side_effect=gate_spy):
+            out = PT._rebuild_selection_factor_cache("2024-06-14")
+
+        # 通过了 PIT 门禁 → 进入覆盖门禁（下一阶段），而不是 pit_unavailable
+        self.assertNotIn("pit_unavailable", out)
+        self.assertEqual("blocked", out["status"])
+        self.assertEqual("coverage-stub", out["refresh_gate"]["reason"])
+        self.assertEqual(["600001"], seen["codes"])
+        self.assertTrue(out["universe_membership"]["historical_membership_complete"])
+        self.assertEqual(PIT.UNIVERSE_SOURCE_OK, out["universe_membership"]["status"])
+
+    def test_p18b_source_gate_rejects_stale_or_incomplete_archives(self):
+        universe = [{"code": "600001", "list_date": "2015-01-05"}]
+        cases = [
+            ({"kind": "historical_archive"}, PIT.UNIVERSE_SOURCE_ASOF_INVALID),
+            ({"kind": "historical_archive", "historical_membership_asof": "2024-01-01",
+              "historical_membership_complete": True}, PIT.UNIVERSE_SOURCE_ASOF_STALE),
+            ({"kind": "historical_archive", "historical_membership_asof": "2026-12-31"},
+             PIT.UNIVERSE_SOURCE_INCOMPLETE),
+            ({"kind": "historical_archive", "historical_membership_asof": "not-a-date",
+              "historical_membership_complete": True}, PIT.UNIVERSE_SOURCE_ASOF_INVALID),
+            ("universe.json", PIT.UNIVERSE_SOURCE_UNKNOWN),
+            (None, PIT.UNIVERSE_SOURCE_UNKNOWN),
+        ]
+        for source, expected in cases:
+            out = PIT.historical_universe(universe, ASOF, source=source)
+            self.assertFalse(out["passed"], source)
+            self.assertEqual(expected, out["report"]["status"], source)
+            self.assertEqual([], out["members"], source)
+
+    def test_p18c_source_gate_ignores_a_generic_complete_flag(self):
+        """只认显式命名的完整性标志：通用 ``complete`` 可能是分页语义。"""
+        out = PIT.universe_source_provenance(
+            {"kind": "historical_archive", "complete": True,
+             "historical_membership_asof": "2026-12-31"}, ASOF)
+        self.assertFalse(out["historical_membership_complete"])
+        self.assertEqual(PIT.UNIVERSE_SOURCE_INCOMPLETE, out["status"])
+
+    def test_p18d_live_mode_is_never_gated_by_the_source_contract(self):
+        rows = [{"code": "600001"}]
+        out = PIT.historical_universe(rows, None, source=None)
+        self.assertTrue(out["passed"])
+        self.assertEqual(rows, out["members"])
+        self.assertEqual("live", out["report"]["mode"])
+
+    def test_p14b_live_rebuild_never_filters(self):
+        """``asof_date=None``（live）不套用历史成员资格，且不报 unproven。"""
+        import paper_trading as PT
+
+        with mock.patch.object(PT.U, "load_universe",
+                               return_value=[{"code": "600001"}]), \
+                mock.patch.object(PT, "_selection_factor_history_gate",
+                                  side_effect=AssertionError("live 不应调用覆盖门禁")):
+            out = PT._rebuild_selection_factor_cache(None)
+        self.assertIsNone(out.get("universe_membership"))
+
+    def test_p14c_production_rebuild_wires_the_pit_gate_and_source_reader(self):
+        """生产重建必须真的走 PIT 门禁并读取 universe 源声明（不能硬编码"可信"）。"""
+        import inspect
+
+        import paper_trading as PT
+
+        source = inspect.getsource(PT._rebuild_selection_factor_cache)
+        # 断言**调用本身**（而不是松散子串——注释里也出现过这个词）
+        self.assertIn("U.historical_universe(universe, cutoff, drop_unproven=True)", source)
+        self.assertNotIn("U.asof_members(", source)
+        self.assertIn("def load_universe_source", inspect.getsource(PT.U))
+
+    def test_p17c_a_real_universe_file_never_claims_historical_completeness(self):
+        """走**真实** ``load_universe_source``：当前快照格式的 universe.json 不得被当成历史归档。
+
+        这条用例刻意不 patch 读取函数——否则"把来源硬编码成可信"的回归测不出来。
+        """
+        import json
+        import tempfile
+
+        import universe as U
+
+        payload = {
+            "built_at": "2026-09-15 08:00:00",
+            "scope": "all_a_shares", "requested_limit": None,
+            "stocks": [{"code": "600001", "list_date": "2015-01-05"}],
+        }
+        with tempfile.TemporaryDirectory(prefix="pit-universe-") as tmp:
+            path = os.path.join(tmp, "universe.json")
+            with open(path, "w", encoding="utf-8") as handle:
+                json.dump(payload, handle, ensure_ascii=False)
+            with mock.patch.object(U, "UNIVERSE_PATH", path):
+                source = U.load_universe_source()
+                out = U.historical_universe(payload["stocks"], ASOF)
+                with tempfile.TemporaryDirectory(prefix="pit-missing-") as tmp2:
+                    with mock.patch.object(U, "UNIVERSE_PATH",
+                                           os.path.join(tmp2, "absent.json")):
+                        missing = U.historical_universe(payload["stocks"], ASOF)
+
+        self.assertNotIn("stocks", source)
+        self.assertFalse(out["passed"])
+        self.assertEqual(PIT.UNIVERSE_SOURCE_NOT_HISTORICAL, out["report"]["status"])
+        self.assertFalse(out["report"]["historical_membership_complete"])
+        # 读不到文件同样是"未证明"，而不是"默认可信"
+        self.assertFalse(missing["passed"])
+        self.assertEqual(PIT.UNIVERSE_SOURCE_UNKNOWN, missing["report"]["status"])
 
     def test_p16_historical_rebuild_fails_closed_without_membership_metadata(self):
         """只有今天的成分、且完全没有 list/delist metadata → 历史选股不得产出候选。
@@ -942,6 +1199,8 @@ class ReplayWiringTests(PointInTimeBase):
             raise AssertionError("不得为未证明的历史成分计算价格因子")
 
         with mock.patch.object(PT.U, "load_universe", return_value=universe), \
+                mock.patch.object(PT.U, "load_universe_source",
+                                  return_value=self.HISTORICAL_SOURCE), \
                 mock.patch.object(PT, "_selection_factor_history_gate", side_effect=gate_spy), \
                 mock.patch.object(PT.dfc, "load_shared_kline", side_effect=kline_spy), \
                 mock.patch.object(PT.F, "compute_price_factors", side_effect=price_spy):
@@ -954,21 +1213,13 @@ class ReplayWiringTests(PointInTimeBase):
         self.assertEqual(0, report["kept"])
         self.assertEqual(2, report["unproven"])
         self.assertEqual(0, report["counts"][PIT.MEMBERSHIP_MEMBER])
+        # 源本身是合法的历史归档，所以这条失败纯粹来自逐行成员资格未证明
+        self.assertTrue(report["historical_membership_complete"])
+        self.assertFalse(report["row_membership_passed"])
         # 没有进入任何候选/因子路径
         self.assertFalse(seen["gate"])
         self.assertEqual([], seen["klines"])
         self.assertEqual([], seen["price"])
-
-    def test_p14b_live_rebuild_never_filters(self):
-        """``asof_date=None``（live）不套用历史成员资格，且不报 unproven。"""
-        import paper_trading as PT
-
-        with mock.patch.object(PT.U, "load_universe",
-                               return_value=[{"code": "600001"}]), \
-                mock.patch.object(PT, "_selection_factor_history_gate",
-                                  side_effect=AssertionError("live 不应调用覆盖门禁")):
-            out = PT._rebuild_selection_factor_cache(None)
-        self.assertIsNone(out.get("universe_membership"))
 
 
 # ─────────────────────────────────────────────────────────────────────────────

@@ -61,6 +61,14 @@ __all__ = [
     "MEMBERSHIP_NOT_LISTED_YET",
     "MEMBERSHIP_DELISTED",
     "MEMBERSHIP_UNKNOWN",
+    "UNIVERSE_SOURCE_KIND_HISTORICAL",
+    "UNIVERSE_SOURCE_KIND_CURRENT",
+    "UNIVERSE_SOURCE_OK",
+    "UNIVERSE_SOURCE_NOT_HISTORICAL",
+    "UNIVERSE_SOURCE_INCOMPLETE",
+    "UNIVERSE_SOURCE_UNKNOWN",
+    "UNIVERSE_SOURCE_ASOF_INVALID",
+    "UNIVERSE_SOURCE_ASOF_STALE",
     "CHINA_TZ_NAME",
     "CN_MARKET_CLOSE",
     "SNAPSHOT_AVAILABLE_AT_KEYS",
@@ -81,6 +89,8 @@ __all__ = [
     "classification_visibility",
     "universe_membership",
     "universe_asof_members",
+    "universe_source_provenance",
+    "historical_universe",
     "pit_flags",
 ]
 
@@ -159,6 +169,46 @@ UNIVERSE_DELIST_DATE_KEYS = (
     "DELIST_DATE",
     "out_date",
 )
+
+# ── universe **源级**完整性（历史成员源 provenance）────────────────────────────
+#
+# 逐行有 ``list_date`` / ``delist_date`` 只能证明"这条**现存** row 在 asof 是否
+# 属于市场"，**不能**证明 ``current universe == historical universe at T``：
+# 已经退市、今天不在 current snapshot 里的证券根本不会出现在输入里。因此
+# strict 历史还必须要求**源本身**显式声明是完整历史归档。该声明只能由真正持有
+# 历史归档的一方给出——今天的快照 / universe.json **永远无权**自称 historical complete。
+
+#: 唯一被承认的"完整历史成员源"类型。
+UNIVERSE_SOURCE_KIND_HISTORICAL = "historical_archive"
+#: 今天的快照：**永远**不构成历史完整性证据（仅用于可读性/诊断）。
+UNIVERSE_SOURCE_KIND_CURRENT = "current_snapshot"
+
+UNIVERSE_SOURCE_KIND_KEYS = ("kind", "source_kind")
+#: 完整性标志只认显式命名，绝不读通用的 ``complete``（行情快照分页也用这个词）。
+UNIVERSE_SOURCE_COMPLETE_KEYS = (
+    "historical_membership_complete",
+    "membership_complete",
+    "historical_complete",
+)
+UNIVERSE_SOURCE_ASOF_KEYS = (
+    "historical_membership_asof",
+    "archive_asof",
+    "as_of",
+    "asof",
+)
+UNIVERSE_SOURCE_NAME_KEYS = (
+    "historical_membership_source",
+    "archive_source",
+    "source_name",
+)
+
+#: 源级完整性状态码（独立词汇表，机器只读 status）。
+UNIVERSE_SOURCE_OK = "historical_archive_complete"
+UNIVERSE_SOURCE_NOT_HISTORICAL = "not_a_historical_source"
+UNIVERSE_SOURCE_INCOMPLETE = "archive_incomplete"
+UNIVERSE_SOURCE_UNKNOWN = "source_unknown"
+UNIVERSE_SOURCE_ASOF_INVALID = "invalid_archive_asof"
+UNIVERSE_SOURCE_ASOF_STALE = "archive_asof_before_decision"
 
 _MISSING_STRINGS = {"", "nan", "nat", "none", "null", "-", "--"}
 _DATE_ONLY = re.compile(r"^\d{4}[-/]\d{1,2}[-/]\d{1,2}$")
@@ -569,7 +619,7 @@ def universe_membership(row: Optional[Mapping[str, Any]], asof: Any, *,
 def universe_asof_members(rows: Optional[Iterable[Any]], asof: Any, *,
                           strict: bool = True, drop_unproven: bool = False,
                           key: Optional[str] = None) -> dict:
-    """按 ``asof`` 过滤历史 universe 成分。
+    """按 ``asof`` 过滤历史 universe 成分（**逐行**成员资格）。
 
     ``strict=True``（默认）时丢弃 ``not_listed_yet`` 与 ``delisted`` 两类。
     ``membership_unknown`` 的行默认**保留**但计入 ``report["unproven"]``：
@@ -599,6 +649,118 @@ def universe_asof_members(rows: Optional[Iterable[Any]], asof: Any, *,
         "counts": counts,
     }
     return {"members": kept, "report": report}
+
+
+def universe_source_provenance(source: Any, asof: Any = None) -> dict:
+    """``universe`` 输入**本身**是否是一个完整的历史成员源。
+
+    逐行 ``list_date``/``delist_date`` 只能证明"这条**现存** row 在 asof 属于市场"，
+    不能证明 ``current universe == historical universe at T``：已经退市、今天不在
+    current snapshot 里的证券根本不会出现在输入里，所以只看现存行永远无法识别
+    缺失的退市成分。
+
+    因此完整性必须是**源级显式声明**，且只有 ``kind == "historical_archive"`` 的源
+    才有资格声明。今天的快照 / ``universe.json`` 没有该声明 → 一律判为未证明。
+    给当前股票补 ``list_date`` **不会**自动解锁历史选股。
+
+    返回 ``{"historical_membership_complete", "historical_membership_asof",
+    "historical_membership_source", "status"}``（机器只读 ``status``）。
+    """
+    data = source if isinstance(source, Mapping) else None
+    asof_moment = parse_asof(asof) if asof_is_strict(asof) else None
+    requested = _iso(asof_moment) if asof_moment else None
+
+    kind = None
+    if data is not None:
+        for name in UNIVERSE_SOURCE_KIND_KEYS:
+            value = data.get(name)
+            if not _is_missing(value):
+                kind = str(value).strip().lower()
+                break
+    name_value = None
+    if data is not None:
+        for key in UNIVERSE_SOURCE_NAME_KEYS:
+            value = data.get(key)
+            if not _is_missing(value):
+                name_value = str(value).strip()
+                break
+
+    out = {
+        "historical_membership_complete": False,
+        "historical_membership_asof": None,
+        "historical_membership_source": name_value,
+        "historical_membership_source_kind": kind,
+        "requested_asof": requested,
+        "status": UNIVERSE_SOURCE_UNKNOWN,
+    }
+    if data is None or kind is None:
+        return out
+    if kind != UNIVERSE_SOURCE_KIND_HISTORICAL:
+        out["status"] = UNIVERSE_SOURCE_NOT_HISTORICAL
+        return out
+
+    raw_asof = None
+    for key in UNIVERSE_SOURCE_ASOF_KEYS:
+        value = data.get(key)
+        if not _is_missing(value):
+            raw_asof = value
+            break
+    archive_moment, _has_time, status = _parse(raw_asof)
+    if status != "ok" or archive_moment is None:
+        out["status"] = UNIVERSE_SOURCE_ASOF_INVALID
+        return out
+    out["historical_membership_asof"] = _iso(archive_moment)
+
+    complete_flag = False
+    for key in UNIVERSE_SOURCE_COMPLETE_KEYS:
+        if data.get(key) is True:
+            complete_flag = True
+            break
+    if not complete_flag:
+        out["status"] = UNIVERSE_SOURCE_INCOMPLETE
+        return out
+    # 归档只覆盖到某日：它无法为更晚的决策时点证明成员资格。
+    if asof_moment is not None and archive_moment < asof_moment:
+        out["status"] = UNIVERSE_SOURCE_ASOF_STALE
+        return out
+    out["historical_membership_complete"] = True
+    out["status"] = UNIVERSE_SOURCE_OK
+    return out
+
+
+def historical_universe(rows: Optional[Iterable[Any]], asof: Any, *,
+                        source: Any = None, drop_unproven: bool = True,
+                        key: Optional[str] = None) -> dict:
+    """strict 历史 universe 的**唯一入口**：逐行成员资格 **且** 源级完整性。
+
+    两者必须同时成立才算通过：只有现存 row 的日期证据不足以排除"缺失的退市
+    成分"，所以源还必须显式声明自己是完整历史归档。
+
+    ``asof is None`` → live compatibility，原样返回且 ``passed=True``（live 不套用
+    任何历史成员资格门禁）。
+
+    未通过时 ``members`` 返回**空列表**——失败即空，避免调用方误用。
+    返回 ``{"passed", "members", "report"}``。
+    """
+    result = universe_asof_members(rows, asof, strict=True,
+                                   drop_unproven=drop_unproven, key=key)
+    report = dict(result["report"])
+    if not asof_is_strict(asof):
+        report["passed"] = True
+        report["row_membership_passed"] = True
+        report["historical_membership_complete"] = False
+        report["status"] = UNIVERSE_SOURCE_UNKNOWN
+        return {"passed": True, "members": result["members"], "report": report}
+    provenance = universe_source_provenance(source, asof)
+    report.update(provenance)
+    row_passed = bool(result["members"])
+    report["row_membership_passed"] = row_passed
+    report["passed"] = bool(row_passed and provenance["historical_membership_complete"])
+    return {
+        "passed": report["passed"],
+        "members": result["members"] if report["passed"] else [],
+        "report": report,
+    }
 
 
 # ─────────────────────────────────────────────────────────────────────────────
