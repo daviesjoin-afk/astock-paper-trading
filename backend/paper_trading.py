@@ -3593,13 +3593,23 @@ def _rebuild_selection_factor_cache(asof_date=None):
     universe = U.load_universe()
     universe_membership = None
     if cutoff is not None:
-        # 历史成分必须先过 PIT 成员资格，否则"取今天仍上市的股票再回放过去"
-        # 会同时引入未来上市与漏掉退市两类幸存者偏差。当前数据源没有上市/
-        # 退市日期，无法证明的成分计入 unproven（原样保留）而**不是**被默认
-        # 当作"当时已上市"。
-        membership = U.asof_members(universe, cutoff)
+        # strict historical：成员资格**必须已被证明**。`membership_unknown`
+        # （缺 list/delist metadata）一律不得进入候选 universe —— "没有证据证明
+        # 未上市"不等于"当时已上市"，更不允许回退到当前 universe 来把候选凑齐。
+        membership = U.asof_members(universe, cutoff, drop_unproven=True)
         universe = membership["members"]
         universe_membership = membership["report"]
+        if not universe:
+            # 全部成分都无法证明历史成员资格 → PIT 不可用（fail closed）。
+            # 保留诊断 report，绝不 fallback 到当前 universe。
+            return {
+                "status": "blocked",
+                "reason": "历史 universe 无任何已证明成员资格（PIT unavailable），"
+                          "拒绝回退到当前 universe",
+                "pit_unavailable": True,
+                "required": "上市日/退市日 metadata 缺失；历史选股无法证明成分合法",
+                "universe_membership": universe_membership,
+            }
         gate = _selection_factor_history_gate(universe, cutoff)
         if not gate["passed"]:
             return {

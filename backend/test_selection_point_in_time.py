@@ -153,11 +153,30 @@ def snapshot_row(code, **extra):
     return row
 
 
+class PitSafeManifest(dict):
+    """任何 code 都有**可证明** PIT-safe 复权口径的 manifest（不复权源）。
+
+    strict 模式下"复权口径不可证明"会让该 code 的价格因子整行被剔除，
+    那会掩盖其它 PIT 断言。所以默认给测试数据一套可证明的来源；
+    需要"不可证明"场景的用例向它塞一个显式条目即可覆盖默认值。
+    """
+
+    def get(self, key, default=None):
+        if key in self:
+            return dict.__getitem__(self, key)
+        return {"source": "eastmoney", "adjustment": "none"}
+
+
+def pit_safe_manifest():
+    return PitSafeManifest()
+
+
 class PointInTimeBase(unittest.TestCase):
     """所有因子调用都 patch 掉 manifest，避免依赖本机 data_cache。"""
 
     def setUp(self):
-        patcher = mock.patch.object(F.dfc, "get_kline_manifest", return_value={})
+        patcher = mock.patch.object(F.dfc, "get_kline_manifest",
+                                    return_value=pit_safe_manifest())
         patcher.start()
         self.addCleanup(patcher.stop)
         hot = mock.patch.object(F.dfc, "fetch_hot_rank", return_value=[])
@@ -277,7 +296,7 @@ class PricePointInTimeTests(PointInTimeBase):
         self.assertTrue(out.empty)
 
     def test_p2e_adjustment_provenance_is_explicit(self):
-        """复权口径必须显式 provenance：证明不了就不声称 PIT-safe。"""
+        """复权口径必须显式 provenance：证明不了就**不产出价格因子**。"""
         klines = {TARGET: daily_frame(series(HISTORY_START, ASOF_DAY, 20.0))}
         manifest = {
             "raw": {"source": "sina", "adjustment": "none"},
@@ -288,17 +307,78 @@ class PricePointInTimeTests(PointInTimeBase):
             "unknown": {"source": "unknown", "adjustment": "unknown"},
         }
         with mock.patch.object(F.dfc, "get_kline_manifest", return_value=manifest):
-            for code, expected in (("raw", True), ("qfq_before_asof", True),
-                                   ("qfq_after_asof", False), ("unknown", False)):
+            for code, safe in (("raw", True), ("qfq_before_asof", True),
+                               ("qfq_after_asof", False), ("unknown", False)):
                 out = F.compute_price_factors({code: klines[TARGET]}, asof=ASOF)
-                self.assertEqual(expected, bool(out.loc[code, "adjustment_pit_safe"]),
-                                 "adjustment_pit_safe mismatch for %s" % code)
-        # 全票都不可证明复权口径时，聚合 flag 必须为 False（而不是含糊的 True）
+                if safe:
+                    self.assertEqual(True, bool(out.loc[code, "adjustment_pit_safe"]), code)
+                    self.assertEqual(True, bool(out.loc[code, "price_pit_safe"]), code)
+                else:
+                    # 不可证明 → 该 code 的价格 alpha **整行不可用**（不是标记后照用）
+                    self.assertNotIn(code, out.index)
+                    self.assertEqual(1, out.attrs["pit"]["codes_excluded_unproven_adjustment"])
+                    self.assertFalse(out.attrs["pit"]["price_pit_safe"])
+        # 全票都不可证明复权口径时，结果必须为空表（fail closed）
         with mock.patch.object(F.dfc, "get_kline_manifest",
                                return_value={"qfq_after_asof": manifest["qfq_after_asof"]}):
             out = F.compute_price_factors({"qfq_after_asof": klines[TARGET]}, asof=ASOF)
+        self.assertTrue(out.empty)
         self.assertFalse(out.attrs["pit"]["price_pit_safe"])
         self.assertEqual(1, out.attrs["pit"]["codes_without_proven_adjustment"])
+
+    def test_p15_unsafe_adjustment_price_evidence_cannot_reach_alpha(self):
+        """未经 PIT 证明的 qfq 序列：即使人为造出 +900% 动量，也不得影响选股。
+
+        断言口径与"这条 unsafe price evidence 完全不存在"时一致：
+        截面里其它票的分数与排名逐值不变，且该 code 不在结果里。
+        """
+        codes = CONTROLS[:6]
+        base = {code: daily_frame(series(HISTORY_START, ASOF_DAY, 10.0 + i * 0.1))
+                for i, code in enumerate(codes)}
+
+        # 伪造一条"按今天公司行为重算过"的历史序列，尾段暴涨制造极端动量
+        unsafe_rows = series(HISTORY_START, ASOF_DAY, 10.0)
+        unsafe_rows[-1] = (unsafe_rows[-1][0], unsafe_rows[-1][1] * 10.0, 9.0e9)
+        unsafe = daily_frame(unsafe_rows)
+
+        unsafe_manifest = PitSafeManifest()
+        unsafe_manifest["qfq_after_asof"] = {
+            "source": "tencent", "adjustment": "qfq",
+            "updated_at": "2026-09-15 09:00:00",
+        }
+
+        snapshot = [snapshot_row(code, observed_at=ASOF) for code in codes]
+        snapshot.append(snapshot_row("qfq_after_asof", observed_at=ASOF))
+        finance = {"data": {row["code"]: finance_record() for row in snapshot}}
+
+        def run(klines):
+            price_f = F.compute_price_factors(klines, asof=ASOF)
+            fund_f = F.compute_fundamental_factors(snapshot, finance, asof=ASOF)
+            return S.build_factor_table(price_f, fund_f, {}), price_f
+
+        with mock.patch.object(F.dfc, "get_kline_manifest", return_value=unsafe_manifest):
+            with_unsafe, price_with = run({**base, "qfq_after_asof": unsafe})
+            without_unsafe, price_without = run(dict(base))
+
+        # unsafe 证据完全不存在
+        self.assertNotIn("qfq_after_asof", price_with.index)
+        self.assertEqual(1, price_with.attrs["pit"]["codes_excluded_unproven_adjustment"])
+        self.assertFalse(price_with.attrs["pit"]["price_pit_safe"])
+        # 截面分数 / 排名逐值一致（含 z-score，不会被"极端动量"带偏）
+        pd.testing.assert_frame_equal(with_unsafe, without_unsafe, check_exact=True)
+        pd.testing.assert_frame_equal(price_with, price_without, check_exact=True)
+
+    def test_p15b_live_mode_still_keeps_the_same_series(self):
+        """反向对照：live 模式下该序列照常参与（证明剔除只发生在 strict history）。"""
+        rows = series(HISTORY_START, ASOF_DAY, 10.0)
+        rows[-1] = (rows[-1][0], rows[-1][1] * 10.0, 9.0e9)
+        manifest = {"code": {"source": "tencent", "adjustment": "qfq",
+                             "updated_at": "2026-09-15 09:00:00"}}
+        with mock.patch.object(F.dfc, "get_kline_manifest", return_value=manifest):
+            live = F.compute_price_factors({"code": daily_frame(rows)})
+        self.assertIn("code", live.index)
+        self.assertFalse(bool(live.loc["code", "adjustment_pit_safe"]))
+        self.assertFalse(bool(live.loc["code", "price_pit_safe"]))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -450,12 +530,19 @@ class UniversePointInTimeTests(unittest.TestCase):
         self.assertEqual("membership_unknown", PIT.universe_membership(rows[3], ASOF)["status"])
 
     def test_p9c_unproven_membership_is_reported_not_faked(self):
+        """低层 API 的兼容默认：保留未证明成分，但**必须**如实报 unproven。
+
+        production strict history 不允许用这个默认值 —— 它显式传
+        ``drop_unproven=True``（见 P14 / P16）。
+        """
         rows = [{"code": "600001"}, {"code": "600002"}]
         default = PIT.universe_asof_members(rows, ASOF)
         self.assertEqual(2, default["report"]["unproven"])
         self.assertEqual(2, len(default["members"]))
         strict = PIT.universe_asof_members(rows, ASOF, drop_unproven=True)
         self.assertEqual([], strict["members"])
+        self.assertEqual(2, strict["report"]["unproven"])
+        self.assertEqual(0, strict["report"]["kept"])
 
     def test_p9d_live_mode_never_filters_the_universe(self):
         rows = [{"code": "600001", "list_date": "2025-01-01"}]
@@ -805,11 +892,12 @@ class LiveSnapshotCutoffTests(PointInTimeBase):
 
 class ReplayWiringTests(PointInTimeBase):
     def test_p14_historical_rebuild_filters_the_universe_by_asof(self):
-        """回放重建必须先按 asof 过滤历史成分，而不是直接吃今天的成分。"""
+        """回放重建必须先按 asof 过滤历史成分，且**未证明**的成分不得进入下游。"""
         import paper_trading as PT
 
         universe = [{"code": "600001", "name": "老股", "list_date": "2020-01-01"},
-                    {"code": "600002", "name": "未来上市", "list_date": "2030-01-01"}]
+                    {"code": "600002", "name": "未来上市", "list_date": "2030-01-01"},
+                    {"code": "600003", "name": "无日期（未证明）"}]
         seen = {}
 
         def gate_spy(rows, cutoff):
@@ -822,11 +910,54 @@ class ReplayWiringTests(PointInTimeBase):
             out = PT._rebuild_selection_factor_cache("2024-06-14")
 
         self.assertEqual(dt.date(2024, 6, 14), seen["cutoff"])
-        # 未来上市的股票在进入覆盖门禁之前就被剔除
+        # 未来上市 + 未证明 都被剔除；下游（覆盖门禁 / 因子 / selector）只看到已证明的
         self.assertEqual(["600001"], seen["codes"])
         self.assertEqual("blocked", out["status"])
         self.assertIsNotNone(out["universe_membership"])
         self.assertEqual(1, out["universe_membership"]["counts"][PIT.MEMBERSHIP_NOT_LISTED_YET])
+        self.assertEqual(1, out["universe_membership"]["unproven"])
+
+    def test_p16_historical_rebuild_fails_closed_without_membership_metadata(self):
+        """只有今天的成分、且完全没有 list/delist metadata → 历史选股不得产出候选。
+
+        绝不 fallback 到当前 universe，也绝不因为"没有证据证明未上市"就把这些股票
+        送进 selector。
+        """
+        import paper_trading as PT
+
+        universe = [{"code": "600001", "name": "只有今天的成分"},
+                    {"code": "600002", "name": "同样没有日期"}]
+        seen = {"gate": False, "klines": [], "price": []}
+
+        def gate_spy(rows, cutoff):
+            seen["gate"] = True
+            return {"passed": True}
+
+        def kline_spy(code):
+            seen["klines"].append(code)
+            return None
+
+        def price_spy(*args, **kwargs):
+            seen["price"].append(kwargs.get("asof"))
+            raise AssertionError("不得为未证明的历史成分计算价格因子")
+
+        with mock.patch.object(PT.U, "load_universe", return_value=universe), \
+                mock.patch.object(PT, "_selection_factor_history_gate", side_effect=gate_spy), \
+                mock.patch.object(PT.dfc, "load_shared_kline", side_effect=kline_spy), \
+                mock.patch.object(PT.F, "compute_price_factors", side_effect=price_spy):
+            out = PT._rebuild_selection_factor_cache("2024-06-14")
+
+        self.assertEqual("blocked", out["status"])
+        self.assertTrue(out["pit_unavailable"])
+        self.assertNotIn("refresh_gate", out)
+        report = out["universe_membership"]
+        self.assertEqual(0, report["kept"])
+        self.assertEqual(2, report["unproven"])
+        self.assertEqual(0, report["counts"][PIT.MEMBERSHIP_MEMBER])
+        # 没有进入任何候选/因子路径
+        self.assertFalse(seen["gate"])
+        self.assertEqual([], seen["klines"])
+        self.assertEqual([], seen["price"])
 
     def test_p14b_live_rebuild_never_filters(self):
         """``asof_date=None``（live）不套用历史成员资格，且不报 unproven。"""

@@ -85,6 +85,11 @@ def compute_price_factors(klines: dict, asof=None):
       的 bar 参与计算。日线 bar 在**当日收盘 15:00（Asia/Shanghai）**才可用，因此
       ``asof = 当日 10:00`` 看不到当日那根完整 OHLCV；``asof`` 之后的 bar 一律不进入
       任何因子。索引无法解释、或 ``asof`` 无法解析时直接跳过该票，而不是猜。
+
+    另外，strict 模式下**复权口径无法证明在 asof 当时成立的 code 会被整行剔除**：
+    ``price_pit_safe`` 不只是 metadata，它直接决定数据准入。剔除的数量记在
+    ``frame.attrs["pit"]["codes_excluded_unproven_adjustment"]``（独立诊断，不保留
+    alpha 值）。
     """
     strict = PIT.asof_is_strict(asof)
     asof_moment = PIT.parse_asof(asof) if strict else None
@@ -203,11 +208,16 @@ def compute_price_factors(klines: dict, asof=None):
             # PIT provenance：区分"bar 已按 decision_asof 截断"与
             # "复权口径可证明在 asof 当时成立"。两者都不成立时不得声称 PIT-safe。
             adjustment_safe = _adjustment_pit_safe(meta, asof_moment)
+            if strict and not adjustment_safe:
+                # 复权口径无法证明在 asof 当时成立 → 价格 alpha **不可用**：
+                # 整行不进入因子表。只标一个 metadata 却继续 append，等于让一个
+                # 可能"按今天最新公司行为整段重算"过的序列参与动量/反转/波动/
+                # 资金/RSI/MACD。计数留作独立诊断，不保留 alpha 值。
+                adjustments_unproven += 1
+                continue
             row_data["bar_pit_safe"] = bool(strict)
             row_data["adjustment_pit_safe"] = bool(adjustment_safe)
             row_data["price_pit_safe"] = bool(strict and adjustment_safe)
-            if strict and not adjustment_safe:
-                adjustments_unproven += 1
             rows.append(row_data)
         except Exception:
             continue
@@ -215,9 +225,12 @@ def compute_price_factors(klines: dict, asof=None):
     frame.attrs["pit"] = PIT.pit_flags(
         mode="strict" if strict else "live",
         decision_asof=PIT.parse_asof(asof).isoformat(timespec="seconds") if asof_moment else None,
+        # 聚合语义：请求的整个截面是否都 PIT-safe。strict 下有任何一个 code
+        # 因复权口径不可证明而被剔除，这里就是 False（保守读法）。
         price_pit_safe=bool(strict and rows and adjustments_unproven == 0),
         bars_dropped_future=bars_dropped_future,
         bars_unreadable_index=bars_unreadable_index,
+        codes_excluded_unproven_adjustment=adjustments_unproven,
         codes_without_proven_adjustment=adjustments_unproven,
     )
     return frame
