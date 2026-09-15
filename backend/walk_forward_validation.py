@@ -677,15 +677,41 @@ def select_candidate(
 # ───────────────────────────── the splitter ─────────────────────────────
 
 
+def _session_of(row: Any) -> Optional[str]:
+    """样本的 canonical 决策 session（``YYYY-MM-DD``）。
+
+    **所有**读取 ``decision_session`` 的地方都走这里：``2024/06/03`` 与
+    ``2024-06-03`` 必须是**同一个** session，否则同一天会被拆成两天，或者与
+    显式给出的 canonical ``sessions`` 静默匹配不上。
+    """
+    return _date_text(getattr(row, "decision_session", None))
+
+
 def _normalize_samples(samples: Sequence[Any], *, label_version: Optional[str]) -> tuple:
-    """全局预过滤：身份、去重、verified gate、有限 target。"""
+    """全局预过滤：身份、去重、verified gate、有限 target。
+
+    返回 ``(eligible, timeline, reasons, unverified_by_status)``。
+
+    ``timeline`` 是**独立的决策 session 时间轴**：只要一条输入行的
+    ``decision_session`` 结构上可解析就计入，**不看**它的标签是否 verified /
+    是否 pending / target 是否有限 / 是否与别人冲突。
+
+    Fold 边界必须由这条时间轴决定。若用"已经通过 verified gate 的样本"反推，
+    一个全部标签仍 pending 的最近 session 会从时间轴上直接消失，validation/test
+    边界随之左移 —— 真实的 fold 不是 ``not_ready``，而是根本不存在。标签状态
+    只能决定 eligibility / readiness，不能决定"这一天是否存在"。
+    """
     reasons = {reason: 0 for reason in FOLD_EXCLUSION_REASONS}
     unverified_by_status: dict = {}
+    timeline = set()
     chosen: dict = {}
     conflicted = set()
     for raw in samples or ():
         key = str(getattr(raw, "sample_key", "") or "").strip()
-        session = _date_text(getattr(raw, "decision_session", None))
+        session = _session_of(raw)
+        if session is not None:
+            # 结构上合法的一天 —— 无论标签什么状态，这一天都真实存在过。
+            timeline.add(session)
         available = _instant(getattr(raw, "label_available_at", None))
         if not key or session is None or available is None:
             reasons["invalid_sample_identity"] += 1
@@ -719,8 +745,8 @@ def _normalize_samples(samples: Sequence[Any], *, label_version: Optional[str]) 
         del chosen[key]
         conflicted.add(key)
         reasons["duplicate_sample"] += 2
-    ordered = sorted(chosen.values(), key=lambda row: (row.decision_session, row.sample_key))
-    return ordered, reasons, unverified_by_status
+    ordered = sorted(chosen.values(), key=lambda row: (_session_of(row) or "", row.sample_key))
+    return ordered, sorted(timeline), reasons, unverified_by_status
 
 
 def _empty_fold(fold_id: int, status: str, reason: str, metadata: dict, reasons: dict) -> WalkForwardFold:
@@ -746,6 +772,7 @@ def _base_metadata(
         "test_start_at": test_start_at,
         "purge_cutoff_at": validation_start_at,
         "embargo_sessions": int(config.embargo_sessions),
+        "min_train_sessions": int(config.min_train_sessions),
         "max_train_sessions": config.max_train_sessions,
         "window": "rolling" if config.max_train_sessions is not None else "expanding",
         "label_version": label_version,
@@ -770,6 +797,7 @@ def _base_metadata(
         "validation_decision_sessions": [],
         "test_decision_sessions": [],
         "train_decision_session_count": 0,
+        "train_final_session_count": 0,
         "validation_decision_session_count": 0,
         "test_decision_session_count": 0,
         "train_max_label_available_at": None,
@@ -778,6 +806,28 @@ def _base_metadata(
         "disjoint_ok": True,
         "boundary_ok": True,
     }
+
+
+def label_ready_by_asof(sample: Any, *, asof: Any) -> bool:
+    """标签在 ``asof`` 时点是否**已经可见**。
+
+    这是 #146 的 PIT 可见性契约（:func:`point_in_time.is_visible_at`，
+    ``available_at > asof → future``，即 ``available_at <= asof`` 才可见），
+    与 #147 的 ``selection_label()`` 判定 ``pending`` 的口径一致
+    （``asof < exit_available_at`` 才是 pending）。
+
+    刻意与 :func:`train_eligible` 分开：训练证据要求**严格**早于评估开始
+    （``<``），而"截至 asof 这条标签成熟了没有"是 ``<=``。两者混用会把
+    ``label_available_at == asof`` 这种**已经可见**的标签误判成未成熟 ——
+    例如 exit 收盘 15:00 可用、``asof`` 也是 15:00 时，#147 已经放行。
+    """
+    available = getattr(sample, "label_available_at", None)
+    if _instant(available) is None:
+        return False
+    try:
+        return bool(PIT.is_visible_at(available, asof).get("visible"))
+    except Exception:  # pragma: no cover - is_visible_at 不抛异常
+        return False
 
 
 def _finalize_report(report: dict, folds: Sequence[WalkForwardFold]) -> dict:
@@ -805,32 +855,46 @@ def build_walk_forward_folds(
     """把已经 PIT 化的样本切成 chronological、past-only 的 walk-forward folds。
 
     ``sessions``
-        权威交易日序列（升序）。不给时用样本里出现过的 ``decision_session``
-        去重升序。embargo 按这个序列计**交易日**，因此给它真实日历才能让
-        "N 个 session"不等于"N 个自然日"。
+        权威交易日序列（升序）。不给时，fold 边界来自**独立的决策 session
+        时间轴** —— 只要一条输入行的 ``decision_session`` 结构上可解析就计入，
+        **不看**标签是否 verified。用一个"全部标签仍 pending"的最近 session 去
+        反推日历，会让那一天从时间轴上消失、边界左移；标签状态只能决定
+        eligibility / readiness，不能决定"这一天是否存在"。embargo 也按这条
+        序列计**交易日**，因此给它真实日历才能让 "N 个 session" 不等于
+        "N 个自然日"。
     ``asof``
-        评估时点。给了以后，test 窗口越过 ``asof`` 的 fold 一律
+        评估时点。给了以后，只要有一条 test 标签在 ``asof`` 时点**尚不可见**
+        （#146 的 PIT 可见性，``label_available_at <= asof``），该 fold 一律
         ``not_ready / window_not_matured`` —— 绝不缩短 horizon、绝不把尚未成熟
         的 test 当 ready。
     ``label_version``
         只保留该版本的标签（其余计入 ``label_version_mismatch``）。不同 horizon
         的样本按各自 ``label_available_at`` 独立判定，不会被一起 purge。
+
+    ``min_train_sessions`` 是**最终**训练集的 session 数下限：purge / embargo /
+    rolling 之后不足就 ``insufficient_train_history``（不给任何可训练数据），
+    但循环继续，后面的 fold 仍可 ready。
     """
     if not isinstance(config, WalkForwardConfig):
         raise WalkForwardContractError("config must be a WalkForwardConfig")
 
-    ordered, reasons, unverified_by_status = _normalize_samples(
+    ordered, timeline, reasons, unverified_by_status = _normalize_samples(
         samples, label_version=label_version
     )
 
     if sessions:
         calendar = sorted({day for day in (_date_text(item) for item in sessions) if day})
+        timeline_source = "explicit_sessions"
     else:
-        calendar = sorted({row.decision_session for row in ordered})
+        # Fold 边界来自**独立的决策 session 时间轴**，不是"已通过 verified gate
+        # 的样本"—— 否则一个全部标签仍 pending 的最近 session 会从时间轴上消失，
+        # 后续 validation/test 边界随标签成熟状态左移。
+        calendar = list(timeline)
+        timeline_source = "decision_timeline"
 
     by_session: dict = {}
     for row in ordered:
-        by_session.setdefault(row.decision_session, []).append(row)
+        by_session.setdefault(_session_of(row) or "", []).append(row)
 
     asof_instant = _instant(asof) if asof is not None else None
     if asof is not None and asof_instant is None:
@@ -845,6 +909,8 @@ def build_walk_forward_folds(
         "ready_folds": 0,
         "ready": False,
         "fold_statuses": [],
+        "timeline_source": timeline_source,
+        "timeline_session_count": len(calendar),
         "exclusion_reasons": dict(reasons),
         "unverified_label_by_status": dict(sorted(unverified_by_status.items())),
         "config": {
@@ -919,13 +985,15 @@ def build_walk_forward_folds(
         ]
         test_rows = [row for day in test_window for row in by_session.get(day, ())]
 
-        # readiness 按**每个 test 标签的可用时点**判定，不是按 test 最后一个决策
+        # readiness 按**每个 test 标签是否已经可见**判定，不是按 test 最后一个决策
         # session 的日期：一个 06-27 的决策，horizon 2 的标签要到 07-01 才成熟，
-        # 用日期比较会把它当成"已经可以评分"。``asof`` 走 PIT 的时点语义
-        # （date-only = 当日结束，带时刻 = 精确时点），因此盘中 cutoff 不会被
-        # 放大成整天。
+        # 用日期比较会把它当成"已经可以评分"。判据是 #146 的 PIT 可见性
+        # （``label_available_at <= asof``），**不是** train 侧的严格 ``<`` ——
+        # 一条恰好在 asof 时刻可见的标签（exit 收盘 15:00、asof 也是 15:00）
+        # 已经可评分。``asof`` 走 PIT 的时点语义（date-only = 当日结束，
+        # 带时刻 = 精确时点），因此盘中 cutoff 不会被放大成整天。
         if asof_instant is not None and any(
-            not train_eligible(row, evaluation_start_at=asof_instant) for row in test_rows
+            not label_ready_by_asof(row, asof=asof) for row in test_rows
         ):
             metadata["asof"] = asof_instant.isoformat(timespec="seconds")
             metadata["window_excluded_rows"] = len(ordered)
@@ -953,15 +1021,42 @@ def build_walk_forward_folds(
                 metadata["train_purged_rows"] += 1
                 fold_reasons["label_not_available_before_fold"] += 1
                 continue
-            if row.decision_session in embargoed:
+            session = _session_of(row)
+            if session in embargoed:
                 metadata["train_embargoed_rows"] += 1
                 fold_reasons["embargo"] += 1
                 continue
-            if row.decision_session not in window_days:
+            if session not in window_days:
                 metadata["train_window_excluded_rows"] += 1
                 fold_reasons["outside_fold_window"] += 1
                 continue
             train_rows.append(row)
+
+        # ``min_train_sessions`` 是**最终**训练集的 session 数下限，不是"purge 前
+        # 有多少个 prior session"。purge / embargo / rolling 之后不够，就 fail
+        # closed：这个 fold 不给任何可训练数据，但循环继续，后面的 fold 仍可 ready。
+        # 计数先落进 metadata，这样 not-ready 的 fold 也自带完整审计记录。
+        metadata["train_candidate_rows"] = len(train_candidates)
+        metadata["train_final_rows"] = len(train_rows)
+        train_sessions = sorted({_session_of(row) or "" for row in train_rows})
+        metadata["train_decision_sessions"] = train_sessions
+        metadata["train_decision_session_count"] = len(train_sessions)
+        metadata["train_final_session_count"] = len(train_sessions)
+        if len(train_sessions) < config.min_train_sessions:
+            metadata["insufficient_train_history"] = True
+            fold_reasons["insufficient_history"] = len(train_candidates)
+            folds.append(
+                _empty_fold(
+                    fold_id,
+                    STATUS_INSUFFICIENT_TRAIN_HISTORY,
+                    REASON_INSUFFICIENT_HISTORY,
+                    metadata,
+                    fold_reasons,
+                )
+            )
+            fold_id += 1
+            train_end += step
+            continue
 
         # ── validation 侧同样要按 **test 起点** purge ──
         # 一条在 test 期内才成熟的 validation 标签，其 exit 价就在 held-out 区间里：
@@ -985,8 +1080,6 @@ def build_walk_forward_folds(
                 continue
             refit_rows.append(row)
 
-        metadata["train_candidate_rows"] = len(train_candidates)
-        metadata["train_final_rows"] = len(train_rows)
         metadata["validation_candidate_rows"] = len(validation_candidates)
         metadata["validation_purged_rows"] = validation_purged
         metadata["validation_rows"] = len(validation_rows)
@@ -999,14 +1092,12 @@ def build_walk_forward_folds(
                 row.label_available_at for row in validation_rows
             )
         if train_rows:
-            metadata["train_decision_start"] = train_rows[0].decision_session
-            metadata["train_decision_end"] = train_rows[-1].decision_session
+            metadata["train_decision_start"] = train_sessions[0]
+            metadata["train_decision_end"] = train_sessions[-1]
             metadata["train_max_label_available_at"] = max(
                 row.label_available_at for row in train_rows
             )
-            metadata["train_decision_max"] = max(row.decision_session for row in train_rows)
-        metadata["train_decision_sessions"] = sorted({row.decision_session for row in train_rows})
-        metadata["train_decision_session_count"] = len(metadata["train_decision_sessions"])
+            metadata["train_decision_max"] = train_sessions[-1]
         limit = _instant(validation_start_at)
         metadata["boundary_ok"] = bool(train_rows) and all(
             (_instant(row.label_available_at) or limit) < limit for row in train_rows
@@ -1075,16 +1166,17 @@ def _self_check() -> None:
     sessions = [f"2024-06-{day:02d}" for day in range(3, 29)]
     samples = []
     for index, day in enumerate(sessions):
+        exit_day = sessions[min(index + 2, len(sessions) - 1)]
         samples.append(
             ValidationSample(
                 sample_key=f"k{index:03d}",
                 code="600001",
                 decision_session=day,
-                label_available_at=label_available_at_for_close(day),
+                label_available_at=label_available_at_for_close(exit_day),
                 target=0.01,
                 horizon=2,
                 label_version="selection-label-v1/raw-return",
-                exit_date=day,
+                exit_date=exit_day,
                 pit_status=PIT_VERIFIED,
                 features={"momentum": float(index)},
             )
@@ -1094,11 +1186,18 @@ def _self_check() -> None:
     )
     built = build_walk_forward_folds(samples, config)
     folds = built["folds"]
-    assert folds and all(fold.ready for fold in folds), built["report"]
-    for fold in folds:
+    # 第一折的 prior 窗口恰好等于 ``min_train_sessions``，而 purge 会从尾部拿走
+    # horizon 条 → 第一折按定义不够，必须是显式的 insufficient_train_history，
+    # 而不是"消失"或"降级为 ready"。
+    assert folds[0].status == STATUS_INSUFFICIENT_TRAIN_HISTORY, folds[0].status
+    ready = [fold for fold in folds if fold.ready]
+    assert ready, built["report"]
+    for fold in ready:
         assert_train_boundary(fold)
         assert_fold_disjoint(fold)
+        assert fold.metadata["train_decision_session_count"] >= config.min_train_sessions
         assert fold.validation_start_at is not None
+    assert built["report"]["timeline_source"] == "decision_timeline"
     print("walk_forward_validation self-check: ok")
 
 

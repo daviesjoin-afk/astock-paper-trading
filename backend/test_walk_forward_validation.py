@@ -19,10 +19,12 @@ import walk_forward_validation as WFV
 
 # ───────────────────────────── shared fixtures ─────────────────────────────
 
-#: 六个交易周，含两个缺口：
+#: 七个交易周，含两个缺口：
 #:   * 2024-06-10（周一）是节假日 → 06-07(周五) 与 06-11(周二) 之间没有 session；
 #:   * 每个周末都跨自然日。
-#: 28 个 session，足以在 (10, 4, 4) 配置下生成 2 折。
+#: 36 个 session。在 (10, 4, 4) 配置下：第 0 折的 prior 窗口恰好等于
+#: ``min_train_sessions``，purge 又从尾部拿走 horizon 条 → 第 0 折按定义不够，
+#: 必须是显式的 ``insufficient_train_history``；第 1、2 折才是 ready。
 CALENDAR = [
     "2024-06-03", "2024-06-04", "2024-06-05", "2024-06-06", "2024-06-07",
     "2024-06-11", "2024-06-12", "2024-06-13", "2024-06-14",
@@ -33,6 +35,23 @@ CALENDAR = [
     "2024-07-01", "2024-07-02", "2024-07-03",
     "2024-07-04", "2024-07-05",
     "2024-07-08", "2024-07-09", "2024-07-10", "2024-07-11",
+    "2024-07-12",
+    "2024-07-15", "2024-07-16", "2024-07-17", "2024-07-18", "2024-07-19",
+    "2024-07-22", "2024-07-23",
+]
+
+#: 专门用来证明"purge 按标签可用时点、不按自然日减法"的日历：
+#: 2024-06-07(周五) 与 2024-06-11(周二) 之间有 4 个自然日、只有 1 个 session。
+#: 配 min_train=7 时第 1 折的 validation 恰好从 06-11 开始，于是 06-07 决策、
+#: horizon 1 的样本必须被 purge，而"validation_start 减 1 天 = 06-10"的
+#: 自然日减法会错误地保留它。
+GAP_CALENDAR = [
+    "2024-05-20", "2024-05-21", "2024-05-22", "2024-05-23", "2024-05-24",
+    "2024-05-27", "2024-05-28", "2024-05-29", "2024-05-30", "2024-05-31",
+    "2024-06-03", "2024-06-04", "2024-06-05", "2024-06-06", "2024-06-07",
+    "2024-06-11", "2024-06-12", "2024-06-13", "2024-06-14",
+    "2024-06-17", "2024-06-18", "2024-06-19", "2024-06-20",
+    "2024-06-21", "2024-06-24", "2024-06-25", "2024-06-26", "2024-06-27",
 ]
 
 CODES = ("600001", "600002", "600003", "300001")
@@ -114,6 +133,13 @@ class ChronologicalBoundaryTest(unittest.TestCase):
         built = build(full_dataset())
         folds = ready_folds(built)
         self.assertEqual(2, len(folds), built["report"])
+        self.assertEqual([1, 2], [fold.fold_id for fold in folds])
+        # 第 0 折的 prior 窗口恰好 == min_train_sessions，purge 又从尾部拿走
+        # horizon 条 → 它是显式的 insufficient_train_history，而不是消失或降级。
+        self.assertEqual(
+            WFV.STATUS_INSUFFICIENT_TRAIN_HISTORY, built["folds"][0].status
+        )
+        self.assertEqual((), built["folds"][0].train_rows)
         for fold in folds:
             train_max = max(row.decision_session for row in fold.train_rows)
             val_sessions = fold.metadata["validation_decision_sessions"]
@@ -160,36 +186,38 @@ class ChronologicalBoundaryTest(unittest.TestCase):
     def test_p4_train_decision_before_validation_but_label_after_is_purged(self):
         """P4（核心 leakage sentinel）：决策在验证期之前、标签却在验证期之后 → purge。
 
-        index 8 = 2024-06-14，horizon 2 → 标签要等到 2024-06-18（= validation 起点）
-        的收盘才成熟。只比较 ``decision_at < validation_start`` 会把它放进 train。
+        fold 1 的 validation 从 2024-06-28 开始。06-26 决策、horizon 2 的样本，
+        标签要等到 06-28 的收盘才成熟 —— 只比较 ``decision_at < validation_start``
+        会把它放进 train。
         """
         built = build(full_dataset())
         fold = ready_folds(built)[0]
-        self.assertEqual("2024-06-18", fold.validation_start_at[:10])
+        self.assertEqual("2024-06-28", fold.validation_start_at[:10])
+        purged_sessions = {"2024-06-26", "2024-06-27"}
         purged = {
             row.sample_key
             for row in full_dataset()
-            if row.decision_session == "2024-06-14"
+            if row.decision_session in purged_sessions
         }
         self.assertTrue(purged)
         for key in purged:
             self.assertNotIn(key, fold.keys("train"), key)
-        self.assertGreaterEqual(fold.metadata["train_purged_rows"], len(CODES))
+        self.assertGreaterEqual(fold.metadata["train_purged_rows"], 2 * len(CODES))
         self.assertGreaterEqual(
-            fold.exclusion_reasons["label_not_available_before_fold"], len(CODES)
+            fold.exclusion_reasons["label_not_available_before_fold"], 2 * len(CODES)
         )
         # 这些样本的决策**确实**早于 validation 起点 —— 因此拦住它们的只能是
         # label_available_at，不是 decision_session。
         for row in full_dataset():
-            if row.decision_session == "2024-06-14":
+            if row.decision_session in purged_sessions:
                 self.assertLess(row.decision_session, fold.validation_start_at[:10])
 
     def test_p5_label_available_exactly_at_cutoff_is_purged(self):
         """P5：``label_available_at == validation_start_at`` 也必须 purge（严格 <）。"""
-        cutoff = WFV.session_start_at("2024-06-18")
+        cutoff = WFV.session_start_at("2024-06-28")
         samples = full_dataset()
         samples.append(
-            sample_at(8, code="600009", key="boundary-equal", available=cutoff)
+            sample_at(16, code="600009", key="boundary-equal", available=cutoff)
         )
         built = build(samples)
         fold = ready_folds(built)[0]
@@ -200,45 +228,56 @@ class ChronologicalBoundaryTest(unittest.TestCase):
 
     def test_p6_label_available_just_before_cutoff_is_allowed(self):
         """P6：``label_available_at`` 紧邻验证起点之前 → 允许进入 train。"""
-        cutoff = WFV.session_start_at("2024-06-18")
+        cutoff = WFV.session_start_at("2024-06-28")
         before = (
             _dt.datetime.fromisoformat(cutoff) - _dt.timedelta(seconds=1)
         ).isoformat(timespec="seconds")
         samples = full_dataset()
-        samples.append(sample_at(8, code="600009", key="boundary-before", available=before))
+        samples.append(sample_at(16, code="600009", key="boundary-before", available=before))
         built = build(samples)
         fold = ready_folds(built)[0]
         self.assertIn("boundary-before", fold.keys("train"))
 
     def test_p7_purge_uses_label_availability_not_a_calendar_day_guess(self):
-        """P7：固定"自然日减法"会算错 —— 周末/节假日会跨过更多自然日。
+        """P7：固定"自然日减法"会算错 —— 节假日会跨过更多自然日。
 
-        2024-06-14 决策、horizon 2 → 标签成熟于 2024-06-18（validation 起点）。
-        ``validation_start - 2 天 = 2024-06-16`` 的自然日减法会错误地保留它。
+        ``GAP_CALENDAR`` 里 06-07(周五) 与 06-11(周二) 之间有 4 个自然日、
+        只有 1 个 session。第 1 折的 validation 从 06-11 开始，于是
+        "06-07 决策、horizon 1" 的样本必须被 purge；而
+        ``validation_start - 1 天 = 06-10`` 的自然日减法会**错误地保留**它。
         """
         naive_cutoff = (
-            _dt.date.fromisoformat("2024-06-18") - _dt.timedelta(days=2)
+            _dt.date.fromisoformat("2024-06-11") - _dt.timedelta(days=1)
         ).isoformat()
-        self.assertEqual("2024-06-16", naive_cutoff)  # 非交易日，但减法"看起来没问题"
-        built = build(full_dataset())
+        self.assertEqual("2024-06-10", naive_cutoff)
+        config = WFV.WalkForwardConfig(
+            min_train_sessions=7, validation_sessions=4, test_sessions=4
+        )
+        samples = [
+            sample_at(index, horizon=1, calendar=GAP_CALENDAR,
+                      key=f"{GAP_CALENDAR[index]}:600001:h1")
+            for index in range(len(GAP_CALENDAR))
+        ]
+        built = build(samples, config)
         fold = ready_folds(built)[0]
-        for row in full_dataset():
-            if row.decision_session != "2024-06-14":
-                continue
-            self.assertLess(row.decision_session, naive_cutoff)
-            self.assertNotIn(row.sample_key, fold.keys("train"), row.sample_key)
+        self.assertEqual("2024-06-11", fold.validation_start_at[:10])
+        # 06-07 在自然日减法下"看起来安全"，但它的标签要到 06-11 收盘才成熟。
+        self.assertLess("2024-06-07", naive_cutoff)
+        self.assertNotIn("2024-06-07:600001:h1", fold.keys("train"))
+        # 对照：06-06 决策、horizon 1 → 标签 06-07 成熟 → 允许。
+        self.assertIn("2024-06-06:600001:h1", fold.keys("train"))
 
     def test_p8_different_horizons_on_one_session_are_purged_independently(self):
         """P8：同一 decision session、不同 horizon 各自按自己的标签窗口判定。"""
         samples = full_dataset(horizon=2)
         # 同一个 session 上加一条短 horizon 样本：标签在验证期之前就成熟。
-        samples.append(sample_at(8, code="600009", horizon=1, key="short-h1"))
+        samples.append(sample_at(16, code="600009", horizon=1, key="short-h1"))
         built = build(samples)
         fold = ready_folds(built)[0]
         self.assertIn("short-h1", fold.keys("train"))
         # 同一天的长 horizon 样本仍然必须被 purge。
-        self.assertNotIn(f"{CALENDAR[8]}:600001:h2", fold.keys("train"))
-        self.assertEqual("2024-06-14", CALENDAR[8])
+        self.assertNotIn(f"{CALENDAR[16]}:600001:h2", fold.keys("train"))
+        self.assertEqual("2024-06-26", CALENDAR[16])
 
 
 # ─────────────────────── P9–P11: verified label gate ───────────────────────
@@ -318,20 +357,28 @@ class EmbargoTest(unittest.TestCase):
         """P13：``embargo_sessions=N`` 恰好删掉验证期之前最近的 N 个 session。"""
         samples = self._samples()
         config = dataclasses.replace(CONFIG, embargo_sessions=2)
-        fold = ready_folds(build(samples, config))[0]
+        built = build(samples, config)
+        fold = ready_folds(built)[0]
+        self.assertEqual(1, fold.fold_id)
         self.assertEqual(2, fold.metadata["train_embargoed_rows"])
         self.assertEqual(2, fold.exclusion_reasons["embargo"])
-        self.assertEqual(8, fold.metadata["train_final_rows"])
-        self.assertNotIn(CALENDAR[8], fold.metadata["train_decision_sessions"])
-        self.assertNotIn(CALENDAR[9], fold.metadata["train_decision_sessions"])
-        self.assertIn(CALENDAR[7], fold.metadata["train_decision_sessions"])
+        self.assertEqual(16, fold.metadata["train_final_rows"])
+        self.assertNotIn("2024-06-26", fold.metadata["train_decision_sessions"])
+        self.assertNotIn("2024-06-27", fold.metadata["train_decision_sessions"])
+        self.assertIn("2024-06-25", fold.metadata["train_decision_sessions"])
+        # 第 0 折的 prior 只有 10 个 session，embargo 拿走 2 个后低于下限 →
+        # 显式 fail closed（这正是 min_train_sessions 的新语义）。
+        self.assertEqual(
+            WFV.STATUS_INSUFFICIENT_TRAIN_HISTORY, built["folds"][0].status
+        )
+        self.assertEqual(8, built["folds"][0].metadata["train_final_rows"])
 
     def test_p14_embargo_counts_trading_sessions_not_calendar_days(self):
         """P14：embargo 计的是**交易日**，不是自然日。
 
-        验证期起点是 2024-06-18（周二）。最近 2 个 session 是 06-17（周一）与
-        06-14（周五）—— 06-14 距离 06-18 有 4 个自然日。按自然日减 2 天只会
-        排除 06-16/06-17，从而错误地保留 06-14。
+        第 0 折的 validation 从 2024-06-18（周二）开始，它之前最近 2 个 session
+        是 06-17（周一）与 06-14（周五）—— 06-14 距离 06-18 有 4 个自然日。
+        按自然日减 2 天只会排除 06-16/06-17，从而错误地保留 06-14。
         """
         naive_window = [
             (_dt.date.fromisoformat("2024-06-18") - _dt.timedelta(days=offset)).isoformat()
@@ -340,9 +387,10 @@ class EmbargoTest(unittest.TestCase):
         self.assertNotIn("2024-06-14", naive_window)
         samples = self._samples()
         config = dataclasses.replace(CONFIG, embargo_sessions=2)
-        fold = ready_folds(build(samples, config))[0]
+        fold = build(samples, config)["folds"][0]
         self.assertNotIn("2024-06-14", fold.metadata["train_decision_sessions"])
         self.assertNotIn("2024-06-17", fold.metadata["train_decision_sessions"])
+        self.assertEqual(2, fold.exclusion_reasons["embargo"])
 
     def test_p14b_embargo_never_reaches_into_validation_or_test(self):
         """P14b：embargo 只作用于 train 侧，不会删掉 validation/test 样本。"""
@@ -417,30 +465,39 @@ class OrderAndWindowTest(unittest.TestCase):
         上限"的独立效果测出来。
         """
         samples = full_dataset(codes=("600001",), horizon=0)
-        config = dataclasses.replace(CONFIG, max_train_sessions=4)
+        config = dataclasses.replace(
+            CONFIG, min_train_sessions=4, max_train_sessions=4
+        )
         built = build(samples, config)
-        for fold in ready_folds(built):
+        ready = ready_folds(built)
+        self.assertTrue(ready)
+        for fold in ready:
             self.assertEqual("rolling", fold.metadata["window"])
             self.assertEqual(4, fold.metadata["train_decision_session_count"])
-            self.assertLessEqual(fold.metadata["train_decision_session_count"], 4)
-        # 10 个 prior session 只留最近 4 个 → 其余 6 个计入 outside_fold_window。
-        self.assertEqual(6, ready_folds(built)[0].metadata["train_window_excluded_rows"])
-        expanding = build(samples)
+        expanding = build(samples, dataclasses.replace(config, max_train_sessions=None))
         self.assertEqual("expanding", ready_folds(expanding)[0].metadata["window"])
         self.assertGreater(
-            ready_folds(expanding)[0].metadata["train_decision_session_count"], 4
+            max(
+                fold.metadata["train_decision_session_count"]
+                for fold in ready_folds(expanding)
+            ),
+            4,
         )
 
     def test_p16c_rolling_window_drops_sessions_outside_the_cap(self):
         """P16c：rolling window 之外的 session 计入 ``outside_fold_window``。"""
         samples = full_dataset(codes=("600001",), horizon=0)
-        config = dataclasses.replace(CONFIG, max_train_sessions=3)
-        fold = ready_folds(build(samples, config))[0]
+        config = dataclasses.replace(
+            CONFIG, min_train_sessions=3, max_train_sessions=3
+        )
+        built = build(samples, config)
+        # 第 1 折的 prior 有 11 个 session，只留最近 3 个。
+        fold = ready_folds(built)[1]
         self.assertEqual(3, fold.metadata["train_decision_session_count"])
-        self.assertEqual(7, fold.metadata["train_window_excluded_rows"])
-        self.assertEqual(7, fold.exclusion_reasons["outside_fold_window"])
+        self.assertEqual(8, fold.metadata["train_window_excluded_rows"])
+        self.assertEqual(8, fold.exclusion_reasons["outside_fold_window"])
         self.assertEqual(
-            ["2024-06-13", "2024-06-14", "2024-06-17"],
+            ["2024-06-14", "2024-06-17", "2024-06-18"],
             fold.metadata["train_decision_sessions"],
         )
 
@@ -651,6 +708,8 @@ class PitInputsAndReadinessTest(unittest.TestCase):
             "test_decision_sessions",
             "train_max_label_available_at",
             "label_version",
+            "train_final_session_count",
+            "min_train_sessions",
         )
         for fold in ready_folds(built):
             WFV.assert_fold_ready(fold)
@@ -676,6 +735,15 @@ class PitInputsAndReadinessTest(unittest.TestCase):
                 + fold.metadata["train_embargoed_rows"]
                 + fold.metadata["train_window_excluded_rows"]
                 + fold.metadata["train_final_rows"],
+            )
+            # ``min_train_sessions`` 是**最终**训练集的 session 数下限。
+            self.assertGreaterEqual(
+                fold.metadata["train_decision_session_count"],
+                fold.metadata["min_train_sessions"],
+            )
+            self.assertEqual(
+                fold.metadata["train_decision_session_count"],
+                fold.metadata["train_final_session_count"],
             )
             self.assertEqual(fold.metadata["train_final_rows"], len(fold.train_rows))
             self.assertEqual(
@@ -703,16 +771,16 @@ class FinalRefitTest(unittest.TestCase):
         区间里；把它留在 ``validation_labels`` 里，模型选择就会看见 test。
         只从 ``refit_rows`` 里去掉它是不够的。
         """
-        # fold0: validation = CALENDAR[10..13]，test 起点 = CALENDAR[14] = 2024-06-24。
-        # 在 validation 第一个 session（index 10）上放一条 horizon 5 的样本：
-        # 决策 2024-06-18 < 2024-06-24，但标签要到 2024-06-25 才成熟。
+        # fold 1 的 validation = CALENDAR[18..21]，test 起点 = CALENDAR[22] = 2024-07-04。
+        # 在 validation 第一个 session（index 18 = 06-28）上放一条 horizon 5 的样本：
+        # 决策 06-28 < 07-04，但标签要到 07-05 才成熟。
         samples = full_dataset()
         samples.append(
-            sample_at(10, code="600009", horizon=5, key="late-validation-label")
+            sample_at(18, code="600009", horizon=5, key="late-validation-label")
         )
         built = build(samples)
         fold = ready_folds(built)[0]
-        self.assertEqual("2024-06-24", fold.test_start_at[:10])
+        self.assertEqual("2024-07-04", fold.test_start_at[:10])
         self.assertNotIn("late-validation-label", fold.keys("validation"))
         self.assertNotIn("late-validation-label", {row.sample_key for row in fold.refit_rows})
         self.assertGreaterEqual(fold.metadata["validation_purged_rows"], 1)
@@ -721,7 +789,7 @@ class FinalRefitTest(unittest.TestCase):
         )
 
         # 对照：标签在 test 起点之前成熟的 validation 样本仍然可用。
-        samples.append(sample_at(10, code="600010", horizon=2, key="early-validation-label"))
+        samples.append(sample_at(18, code="600010", horizon=2, key="early-validation-label"))
         fold = ready_folds(build(samples))[0]
         self.assertIn("early-validation-label", fold.keys("validation"))
         self.assertIn("early-validation-label", {row.sample_key for row in fold.refit_rows})
@@ -748,7 +816,7 @@ class FinalRefitTest(unittest.TestCase):
         """P25c：readiness 按**每个 test 标签的可用时点**判定，而不是 test 末个
         session 的日期。
 
-        fold0 的 test 决策在 2024-06-24..06-27，horizon 2 的标签分别成熟于
+        fold 0 的 test 决策在 2024-06-24..06-27，horizon 2 的标签分别成熟于
         06-26 / 06-27 / 06-28 / 07-01。``asof = 2024-06-27`` 只覆盖到 06-27，
         因此这个 fold 还不能评分。
         """
@@ -758,17 +826,41 @@ class FinalRefitTest(unittest.TestCase):
         self.assertEqual(WFV.REASON_WINDOW_NOT_MATURED, fold.reason)
         self.assertEqual((), fold.train_rows)
         self.assertEqual((), fold.test_labels)
-        self.assertEqual(
-            "2024-06-27T23:59:59+08:00", fold.metadata["asof"]
-        )
+        self.assertEqual("2024-06-27T23:59:59+08:00", fold.metadata["asof"])
 
-        # 所有 test 标签都成熟之后 → ready。
-        later = build(full_dataset(), asof="2024-07-02")
-        self.assertTrue(ready_folds(later)[0].ready)
+        # 所有 test 标签都成熟之后 → 有 fold 变 ready。
+        later = build(full_dataset(), asof="2024-07-24")
+        self.assertTrue(ready_folds(later))
 
         # 盘中 cutoff 不会被放大成整天：06-27 10:00 看不到 06-27 收盘的标签。
         intraday = build(full_dataset(), asof="2024-06-27T10:00:00+08:00")
         self.assertEqual(WFV.STATUS_NOT_READY, intraday["folds"][0].status)
+
+    def test_p25d_readiness_uses_pit_visibility_not_the_strict_train_cutoff(self):
+        """P25d：readiness 用 #146 的 PIT 可见性（``<=``），不是 train 的严格 ``<``。
+
+        fold 1 的最后一条 test 标签在 2024-07-11 收盘（15:00）可用。``asof`` 正好
+        等于 15:00 时它**已经可见**（#147 也已放行），因此 fold 必须 ready；
+        早一秒才 not_ready。
+        """
+        sample = sample_at(0, key="eq", available="2024-07-11T15:00:00+08:00")
+        cutoff = "2024-07-11T15:00:00+08:00"
+        # 训练边界仍然是严格 `<`：等于评估起点必须 purge。
+        self.assertFalse(WFV.train_eligible(sample, evaluation_start_at=cutoff))
+        # 但"截至 asof 可见吗"是 `<=`。
+        self.assertTrue(WFV.label_ready_by_asof(sample, asof=cutoff))
+        self.assertFalse(
+            WFV.label_ready_by_asof(sample, asof="2024-07-11T14:59:59+08:00")
+        )
+
+        built = build(full_dataset(), asof=cutoff)
+        fold = ready_folds(built)[0]
+        self.assertEqual(1, fold.fold_id)
+        self.assertTrue(fold.ready)
+
+        earlier = build(full_dataset(), asof="2024-07-11T14:59:59+08:00")
+        self.assertNotEqual(WFV.STATUS_READY, earlier["folds"][1].status)
+        self.assertEqual((), earlier["folds"][1].train_rows)
 
 
 # ──────────────── P26–P30: adapters, identity, guards ────────────────
@@ -1013,6 +1105,134 @@ class SinglePurgeRuleTest(unittest.TestCase):
                 ),
                 evaluation_start_at=cutoff,
             )
+        )
+
+
+class TimelineAndTrainingFloorTest(unittest.TestCase):
+    """Fold 边界来自独立的决策 session 时间轴；``min_train_sessions`` 管的是最终训练集。"""
+
+    def test_p32_fold_timeline_does_not_depend_on_label_maturity(self):
+        """P32：把某个完整未来 session 的标签全部改成 pending，fold 的 session
+        边界必须**完全不变** —— 受影响的 fold 变成显式 not_ready，而不是消失
+        或左移。
+
+        若日历由"已经通过 verified gate 的样本"反推，这一天会从时间轴上消失，
+        validation/test 边界随之移动，真实的最新 fold 根本不存在。
+        """
+        baseline = build(full_dataset())
+        self.assertEqual(3, len(baseline["folds"]))
+        self.assertEqual(WFV.STATUS_READY, baseline["folds"][2].status)
+
+        # fold 2 的 test 窗口 = CALENDAR[30..33]。
+        blind = set(CALENDAR[30:34])
+        mutated_samples = [
+            dataclasses.replace(row, pit_status="pending")
+            if row.decision_session in blind
+            else row
+            for row in full_dataset()
+        ]
+        mutated = build(mutated_samples)
+
+        self.assertEqual(
+            [fold.metadata["validation_decision_start"] for fold in baseline["folds"]],
+            [fold.metadata["validation_decision_start"] for fold in mutated["folds"]],
+        )
+        self.assertEqual(
+            [fold.metadata["test_decision_start"] for fold in baseline["folds"]],
+            [fold.metadata["test_decision_start"] for fold in mutated["folds"]],
+        )
+        self.assertEqual(
+            baseline["report"]["timeline_session_count"],
+            mutated["report"]["timeline_session_count"],
+        )
+        self.assertEqual(
+            baseline["report"]["timeline_source"], "decision_timeline"
+        )
+        # 受影响的 fold 仍然**存在**，只是显式 not_ready。
+        self.assertEqual(3, len(mutated["folds"]))
+        self.assertEqual(
+            WFV.STATUS_INSUFFICIENT_VERIFIED_LABELS, mutated["folds"][2].status
+        )
+        self.assertEqual((), mutated["folds"][2].train_rows)
+        self.assertEqual(
+            WFV.STATUS_READY, mutated["folds"][1].status
+        )
+
+    def test_p32b_explicit_sessions_define_the_timeline(self):
+        """P32b：显式 ``sessions`` 决定时间轴，即使没有任何样本落在某些 session 上。"""
+        samples = full_dataset(indices=range(0, 26))
+        padded = CALENDAR + ["2024-07-24", "2024-07-25", "2024-07-26", "2024-07-29"]
+        built = build(samples, sessions=padded)
+        self.assertEqual("explicit_sessions", built["report"]["timeline_source"])
+        self.assertEqual(len(padded), built["report"]["timeline_session_count"])
+        # 样本只到 CALENDAR[25]，但时间轴更长 → fold 2 仍然存在。
+        self.assertEqual(3, len(built["folds"]))
+        self.assertEqual(
+            "2024-07-16", built["folds"][2].metadata["test_decision_start"]
+        )
+
+    def test_p33_min_train_sessions_applies_to_the_final_train_set(self):
+        """P33：``min_train_sessions`` 是 purge/embargo/rolling 之后**最终**
+        训练集的 session 数下限，不是"purge 前有多少个 prior session"。"""
+        built = build(full_dataset())
+        fold0 = built["folds"][0]
+        # 第 0 折的 prior 恰好 10 个 session（== min_train_sessions），
+        # purge 又从尾部拿走 2 个 → 最终只有 8 < 10 → fail closed。
+        self.assertEqual(WFV.STATUS_INSUFFICIENT_TRAIN_HISTORY, fold0.status)
+        self.assertLess(
+            fold0.metadata["train_final_session_count"], CONFIG.min_train_sessions
+        )
+        self.assertEqual((), fold0.train_rows)
+        for fold in ready_folds(built):
+            self.assertGreaterEqual(
+                fold.metadata["train_decision_session_count"],
+                CONFIG.min_train_sessions,
+            )
+
+        # 一个足够大的 embargo 可以把原本 ready 的 fold 压到下限以下 → 全部 fail closed。
+        crushed = build(
+            full_dataset(), dataclasses.replace(CONFIG, embargo_sessions=22)
+        )
+        self.assertEqual([], ready_folds(crushed))
+        for fold in crushed["folds"]:
+            self.assertNotEqual(WFV.STATUS_READY, fold.status)
+        self.assertEqual(
+            WFV.STATUS_INSUFFICIENT_TRAIN_HISTORY, crushed["folds"][1].status
+        )
+
+    def test_p35_session_spelling_is_canonicalised(self):
+        """P35：``2024/06/03`` 与 ``2024-06-03`` 必须是**同一个** session。"""
+        samples = full_dataset()
+        slashy = [
+            dataclasses.replace(
+                row, decision_session=row.decision_session.replace("-", "/")
+            )
+            for row in samples
+        ]
+        baseline = build(samples)
+        other = build(slashy)
+        for left, right in zip(baseline["folds"], other["folds"], strict=True):
+            self.assertEqual(left.status, right.status)
+            self.assertEqual(left.keys("train"), right.keys("train"))
+            self.assertEqual(left.keys("validation"), right.keys("validation"))
+            self.assertEqual(left.keys("test"), right.keys("test"))
+            self.assertEqual(
+                left.metadata["train_decision_sessions"],
+                right.metadata["train_decision_sessions"],
+            )
+        self.assertEqual(
+            baseline["report"]["timeline_session_count"],
+            other["report"]["timeline_session_count"],
+        )
+        # 显式 canonical ``sessions`` 时也不会静默匹配不上。
+        explicit = build(slashy, sessions=CALENDAR)
+        self.assertEqual(
+            [fold.keys("train") for fold in ready_folds(baseline)],
+            [fold.keys("train") for fold in ready_folds(explicit)],
+        )
+        self.assertEqual(
+            [fold.keys("validation") for fold in ready_folds(baseline)],
+            [fold.keys("validation") for fold in ready_folds(explicit)],
         )
 
 
