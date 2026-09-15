@@ -100,6 +100,25 @@ cp .env.example .env
 
 不填不影响模拟盘核心。
 
+### 6.1 AI 审核槽位（ai1 / ai2）
+
+「AI 审核」不再绑定任何厂商身份：只有两个稳定槽位 `ai1` 与 `ai2`，名称、地址、模型
+全部由使用者在「设置 → AI 审核」里填写，后端按最小公共的 OpenAI 兼容 Chat Completions
+协议调用。
+
+- **审核模式**：`单AI审阅` 只用选定的一个槽位，结果状态是 `single_review`（仅供参考，
+  永不等于 `consensus`，因此永远无法通过人工应用门禁）；`双AI共识` 要求两个槽位都
+  已配置且启用，各自独立调用后过共识门禁，缺任一个即整体拦截，**不会降级成单AI**。
+- **凭据**：`GET /api/settings/ai-review` 永不返回明文 Key，只返回 `configured` 与
+  `key_preview`；保存时留空 Key 表示保持旧值，清空必须显式声明 `clear_api_key=true`
+  （设置页的「清除 Key」按钮）。
+- **无界面部署**：可用 `AI_SLOT_AI1_*` / `AI_SLOT_AI2_*` 环境变量给"从未配置过"的
+  槽位设初值，见 `.env.example`。一旦在设置页保存过该槽位，数据库即为权威。
+- **历史迁移**：升级时会一次性把旧的 `dual_ai_api_keys` 里的 `mimo` / `deepseek`
+  回填成 `ai1` / `ai2`（旧标签只作为展示名保留，可随时改）。旧表保留不删，便于回滚。
+- **历史接口**：`/api/settings/ai-key` 与 `/api/adaptive/dual-ai/*` 仍可用，`mimo` /
+  `deepseek` 作为 `ai1` / `ai2` 的别名被接受，返回结构也保持兼容。
+
 ## 7. 运行时数据与重置
 
 - 全部运行时数据位于 `data_cache/`（已 gitignore，不入库）：SQLite、`universe.json`、日K 缓存、快照缓存；仓库克隆和 Docker 首次启动均从空账本开始，自进化样本不会从维护机迁移

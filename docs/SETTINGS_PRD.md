@@ -13,7 +13,7 @@
 1. **模拟盘与资金**：默认启动金额、模拟周期、下一周期启用策略。
 2. **仓位与风控**：共享池席位、共享敞口、单票金额、动态最小建仓利用率。
 3. **策略参数**：按 Registry 渲染的策略级运行参数（内置模板与用户策略各自）——风格、最大席位、单票权重和策略敞口。定义本身的编辑在策略工坊。
-4. **AI 与自进化**：AI 供应商、审阅/调参开关、调参模式、API Key 掩码状态、自进化周期。
+4. **AI 审核与自进化**：审核模式（单AI/双AI）、单AI审阅槽位、两个通用 AI 槽位（`ai1`/`ai2`）的名称/地址/模型/Key 掩码状态/开关/超时、审阅与调参开关、调参模式、自进化周期。**槽位与厂商身份解耦**：页面不出现任何固定供应商选项，名称只是可改的展示值。
 
 一级菜单、二级菜单和当前值都支持刷新后恢复；地址栏使用 `#settings/<section>`，便于直接打开指定分组。
 
@@ -29,10 +29,13 @@
 | 风控 | 单票最大金额 | 自动（0） | 下一次扫描 |
 | 风控 | 最小建仓席位利用率 | 60% | 下一次扫描 |
 | 自进化 | 收盘学习最短间隔 | 24 小时 | 下一次调度 |
-| AI | DeepSeek 审阅 | 关闭 | 保存后 |
+| AI | 审核模式 | 双AI共识（`dual`） | 保存后 |
+| AI | 单AI审阅槽位 | `ai1` | 保存后 |
+| AI | 槽位 `ai1` / `ai2` 凭据 | 未配置（或由一次性迁移/`AI_SLOT_*` 环境变量给初值） | 保存后 |
+| AI | AI 审阅开关 | 关闭 | 保存后 |
 | AI | 有界调参 | 开启 | 保存后 |
 | AI | 自动应用候选 | 强制关闭 | 不可由 UI 放开 |
-| AI | 模式 | intraday | 保存后 |
+| AI | 调参模式 | intraday | 保存后 |
 
 周期选项固定为 **15、30、60、90、180 个交易日或长期**。长期以 `0` 存储，表示不设置计划到期日。
 
@@ -81,7 +84,11 @@
 
 - `GET /api/settings/`：返回分组设置、默认值、元数据、当前/下一周期、生效预览、掩码 AI 状态和最近审计。
 - `POST /api/settings/?confirmed=true`：JSON body 可含 `simulation`、`risk`、`strategy`、`evolution`、`ai` 分组；仅返回脱敏快照。
-- `POST /api/settings/ai-key?confirmed=true`：JSON body 含 provider、可选 api_key/base_url/model/enabled；响应不回显明文 Key。
+- `GET /api/settings/ai-review`：返回审核模式、单AI槽位与两个槽位的掩码状态/就绪度（**绝不含明文 Key**）。
+- `PUT /api/settings/ai-review?confirmed=true`：JSON body 含 `review_mode`（`single`/`dual`）与可选 `single_reviewer_slot`。
+- `PUT /api/settings/ai-review/slots/{slot}?confirmed=true`：更新 `ai1`/`ai2` 的 `display_name`/`base_url`/`model`/`api_key`/`enabled`/`timeout_seconds`；`api_key` 留空或省略表示**保持旧 Key**，清空必须显式 `clear_api_key=true`。
+- `POST /api/settings/ai-review/slots/{slot}/test?confirmed=true`：一次性连通性探测；返回结构不含明文 Key。
+- `POST /api/settings/ai-key?confirmed=true`：**历史入口**（兼容保留），`provider` 接受 `ai1`/`ai2` 及别名 `mimo`/`deepseek`。
 - `GET /api/settings/audit`：分页上限 200 的最近设置审计。
 
 ## 7. 验收标准

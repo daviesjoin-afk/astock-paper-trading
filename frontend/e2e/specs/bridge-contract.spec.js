@@ -35,6 +35,9 @@ test.describe("inline handler 桥接契约", () => {
   test("设置中心：DOM 上的 onclick 处理器都已在 window 上桥接", async ({ page }) => {
     await gotoPage(page, "settings-nav");
     await expect(page.getByTestId("settings-result")).not.toContainText("正在读取");
+    // AI 槽位属于独立分区，切过去后 DOM 才会出现 saveAiSlot / testAiSlot / clearAiSlotKey。
+    await page.getByTestId("settings-section-evolution").click();
+    await expect(page.getByTestId("ai-slot-ai1")).toBeVisible();
     const names = await collectInlineHandlers(page);
     const missing = await page.evaluate(
       (list) => list.filter((n) => typeof window[n] !== "function"),
@@ -44,15 +47,15 @@ test.describe("inline handler 桥接契约", () => {
     expect(names.length, "未采集到任何 inline 处理器，说明采集逻辑失效（测试将是空转）").toBeGreaterThan(0);
   });
 
-  test("关键桥接函数显式存在（空态复制内置策略 / AI 配置保存）", async ({ page }) => {
+  test("关键桥接函数显式存在（空态复制内置策略 / AI 槽位保存）", async ({ page }) => {
     await openWorkbench(page);
     const present = await page.evaluate(() => ({
       cloneFirstBuiltin: typeof window.wbCloneFirstBuiltin,
       cloneStrategy: typeof window.wbCloneStrategy,
-      saveSettingsKey: typeof window.saveSettingsKey,
+      saveAiSlot: typeof window.saveAiSlot,
     }));
     expect(present.cloneFirstBuiltin).toBe("function");
     expect(present.cloneStrategy).toBe("function");
-    expect(present.saveSettingsKey).toBe("function");
+    expect(present.saveAiSlot).toBe("function");
   });
 });

@@ -272,7 +272,9 @@ class ReliabilityFailureInjectionTests(unittest.TestCase):
         conn = _mem_db()
         self.addCleanup(conn.close)
         active_id = _seed_active_global(conn)
-        today = "2026-09-14"
+        # 用生产同款时钟推导“今天”，而不是写死日期：run_loop 落库的 finished_at
+        # 来自 _now()（Asia/Shanghai），写死日期会在跨零点后与它错位而假失败。
+        today = EL._now()[:10]
 
         # 窗口 1 (16:45)：模拟资源锁冲突被拒 (未完成)
         self.assertFalse(EL.is_today_generation_completed(conn, today))

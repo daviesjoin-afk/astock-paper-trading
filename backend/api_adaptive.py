@@ -628,7 +628,9 @@ def get_rebalance_plans(status: str = Query("all")):
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"获取计划失败：{type(exc).__name__}") from exc
 
-# ─── 双AI调参路由 ───
+# ─── AI 审核（通用槽位 ai1 / ai2）路由 ───
+# 下面这组路由保留历史路径与字段名，方便旧界面/旧脚本继续工作；权威数据来自
+# ai_review_service —— 运行期不存在任何"按厂商身份分支"的逻辑。
 
 @router.get("/dual-ai/status")
 def dual_ai_status():
@@ -636,11 +638,17 @@ def dual_ai_status():
     if cached is not None:
         return cached
     try:
-        result = adaptive.dual_ai_status_fn()
+        result = adaptive.ai_review_status_fn()
         _cache_set("dual_ai_status", result)
         return result
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"双AI状态失败：{type(exc).__name__}") from exc
+
+
+@router.get("/ai-review/status")
+def ai_review_status():
+    """通用槽位状态的显式入口（与 /dual-ai/status 同源）。"""
+    return dual_ai_status()
 
 
 @router.get("/dual-ai/keys")
@@ -660,13 +668,14 @@ def update_dual_ai_api_key(
     enabled: bool = Query(None),
     confirmed: bool = Query(False),
 ):
-    if provider not in ("mimo", "deepseek"):
-        raise HTTPException(status_code=422, detail="provider必须是 mimo 或 deepseek")
+    """历史入口：``provider`` 作为槽位别名（mimo→ai1、deepseek→ai2）。"""
     _require_confirmation(confirmed, f"保存 {provider} API配置")
     try:
-        return {"keys": adaptive.update_dual_ai_api_key_fn(provider, api_key=api_key, base_url=base_url, model=model, enabled=enabled)}
+        adaptive.update_ai_slot_fn(
+            provider, api_key=api_key, base_url=base_url, model=model, enabled=enabled)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return {"keys": adaptive.get_dual_ai_api_keys_fn()}
 
 
 @router.post("/dual-ai/tune")

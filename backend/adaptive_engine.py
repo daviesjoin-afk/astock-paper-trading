@@ -1943,24 +1943,24 @@ def run_learning_cycle(trigger="manual"):
             advisor_config = _config(conn)
             selection_result = selection_evolution.evaluate(conn, profile, advisor_config, PAPER_DB_PATH, _now)
         print(f"[learning-cycle] stage5 selection done candidates={selection_result.get('candidates', 0)}", flush=True)
-        # —— 阶段 5.5：双AI共识调参（独立于学习事务；缺 key 自动跳过，失败不阻塞）——
+        # —— 阶段 5.5：AI 审核调参（独立于学习事务；未就绪自动跳过，失败不阻塞）——
         # D1 接线：调参结果经 dual_ai_tuner.track_run 落入 evolution_tracking，
         # 供 evolution_loop 的 EVALUATE / MUTATE 消费，形成"越调越准"数据闭环。
+        #
+        # 预检必须按**当前审核模式**判断，不能一律要求两个槽位：single 模式只需要
+        # 所选槽位就绪，否则合法配置会被永久误判为 skipped（只能手动触发）。
         dual_ai_tuning = None
         _learning_update_stage(run_id, "dual_ai")
         try:
             with _connect() as conn:
                 dual_ai_tuner.ensure_schema(conn)
-                _keys = dual_ai_tuner.get_api_keys(conn)
-            _mimo = _keys.get("mimo") or {}
-            _ds = _keys.get("deepseek") or {}
-            if _mimo.get("configured") and _mimo.get("enabled") \
-                    and _ds.get("configured") and _ds.get("enabled"):
+                _review = dual_ai_tuner.dual_ai_status(conn)
+            _ready, _reason = ai_review_preflight(_review)
+            if _ready:
                 dual_ai_tuning = run_dual_ai_tuning_fn(
                     trigger=str(trigger or "manual"), mode="intraday")
             else:
-                dual_ai_tuning = {"status": "skipped",
-                                  "reason": "双AI未就绪（需配置并启用 MiMo 与 DeepSeek）"}
+                dual_ai_tuning = {"status": "skipped", "reason": _reason}
         except Exception as exc:
             dual_ai_tuning = {"status": "failed", "error": f"{type(exc).__name__}: {exc}"}
         print(f"[learning-cycle] stage5.5 dual_ai done status={dual_ai_tuning.get('status')}", flush=True)
@@ -3936,6 +3936,68 @@ def run_dual_ai_tuning_fn(trigger="manual", mode="intraday"):
         trigger=trigger,
         mode=mode,
     )
+
+
+# ─── 通用 AI 槽位（ai1 / ai2）接线 ───
+# 下面四个函数是设置页唯一的 AI 入口：槽位与审核模式完全由用户配置，
+# 业务层不再认识任何厂商身份。
+
+def ai_review_preflight(review_view):
+    """按**当前审核模式**判断调度预检是否放行，返回 ``(ready, reason)``。
+
+    - ``single``：只要求所选槽位就绪（它的就绪度含 Key/启用/地址/模型四项）；
+    - ``dual``（含模式缺失/未知）：要求两个槽位都就绪——未知一律按更严格的
+      dual 处理，绝不放宽门禁。
+
+    约束：single 模式**不得**因为"另一个槽位没配"而被判未就绪，否则合法配置会被
+    永久误判为 skipped，只能手动触发。
+    """
+    view = review_view or {}
+    if view.get("review_mode") == "single":
+        return bool(view.get("single_ready")), "单AI审阅未就绪（需配置并启用所选槽位）"
+    return bool(view.get("dual_ready")), "双AI未就绪（需配置并启用两个槽位）"
+
+
+def ai_review_settings_fn():
+    """返回通用 AI 审核设置（含两个槽位的掩码状态与就绪度）。"""
+    import ai_review_service
+    with _connect() as conn:
+        return ai_review_service.review_settings_view(conn)
+
+
+def update_ai_review_settings_fn(review_mode=None, single_reviewer_slot=None):
+    """更新全局审核模式（single / dual）与单AI审阅槽位。"""
+    import ai_review_service
+    with _connect() as conn:
+        ai_review_service.update_review_settings(
+            conn, review_mode=review_mode, single_reviewer_slot=single_reviewer_slot)
+        return ai_review_service.review_settings_view(conn)
+
+
+def update_ai_slot_fn(slot, api_key=None, base_url=None, model=None, enabled=None,
+                      display_name=None, timeout_seconds=None, clear_api_key=False):
+    """更新单个 AI 槽位配置；只影响该槽位。"""
+    import ai_review_service
+    with _connect() as conn:
+        ai_review_service.update_slot(
+            conn, slot, api_key=api_key, base_url=base_url, model=model, enabled=enabled,
+            display_name=display_name, timeout_seconds=timeout_seconds,
+            clear_api_key=clear_api_key)
+        return ai_review_service.review_settings_view(conn)
+
+
+def ai_review_status_fn():
+    """返回通用 AI 审核系统状态（含最近运行与共识规则）。"""
+    import ai_review_service
+    with _connect() as conn:
+        return ai_review_service.review_status(conn)
+
+
+def test_ai_slot_fn(slot):
+    """对一个 AI 槽位做连通性探测（会发起真实请求，CI 不调用）。"""
+    import ai_review_service
+    with _connect() as conn:
+        return ai_review_service.test_slot(conn, slot)
 
 
 def _current_profile_snapshot():
