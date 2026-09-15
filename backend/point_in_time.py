@@ -266,10 +266,18 @@ def as_strict_bool(value: Any) -> Optional[bool]:
     区分开：调用方必须把"不知道"当成不满足，而不是默认通过。
 
     * ``bool`` → 原值；
-    * ``int`` / ``float`` → ``0`` 为假、非 0 为真（``NaN`` → ``None``）；
+    * ``int`` / ``float`` → **只认精确的 ``0`` 与 ``1``**：``0`` 为假、``1`` 为真，
+      其余数值（``2`` / ``-1`` / ``0.5`` / ``inf`` / ``NaN``）一律 ``None``；
     * 字符串 → 只认 :data:`_TRUE_STRINGS` / :data:`_FALSE_STRINGS`（大小写与
       首尾空白无关）；其余字符串 → ``None``；
     * 其他类型 → ``None``。
+
+    为什么数值也必须是精确的 0/1：本函数归一的是**声明性**元数据（"这份归档
+    是否完整"、"该 session 是否风险警示"），不是计数或强度。``2`` / ``-1`` 这类
+    值说明生产者与消费者对字段语义的理解已经不一致，此时**任何**猜测都是在
+    替对方编造声明；``as_strict_bool`` 的职责是拒绝，而不是解释。曾经的行为
+    （"非零即真"）会让 ``historical_membership_complete: 2`` 或 ``-1`` 直接解锁
+    历史完整模式，把一份语义可疑的元数据当成可信证据。
 
     **绝不**使用内置 ``bool(value)`` 做这层转换：``bool("false")`` 是 ``True``，
     那会把一个显式否定的归档声明读成"完整"。
@@ -279,11 +287,20 @@ def as_strict_bool(value: Any) -> Optional[bool]:
     if isinstance(value, bool):
         return value
     if isinstance(value, float):
-        if math.isnan(value):
+        # NaN / ±inf 没有"是 0 还是 1"的答案；非 0/1 的有限值同样无法判定。
+        if math.isnan(value) or math.isinf(value):
             return None
-        return value != 0.0
+        if value == 0.0:
+            return False
+        if value == 1.0:
+            return True
+        return None
     if isinstance(value, int):
-        return value != 0
+        if value == 0:
+            return False
+        if value == 1:
+            return True
+        return None
     if isinstance(value, str):
         text = value.strip().lower()
         if text in _TRUE_STRINGS:

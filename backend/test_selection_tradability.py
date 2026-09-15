@@ -1655,11 +1655,14 @@ class SecurityStateArchiveTest(unittest.TestCase):
         "historical_membership_complete": True,
         "archive_source": "unit-test",
         "availability_basis": "session_close",
+        # 半开区间：``[effective_from, effective_to)``。相邻窗口必须首尾相接而不
+        # 重叠 —— ``[06-14, 06-18)`` + ``[06-18, 06-30)`` 表示"06-18 起换成 ST"，
+        # 这正是生产归档该写的样子（``effective_to`` 是**下一个**窗口的起点）。
         "rows": [
             {"code": "600001", "effective_from": "2024-06-14",
              "effective_to": "2024-06-30", "name": "某某股份", "risk_flag": False},
             {"code": "600002", "effective_from": "2024-06-14",
-             "effective_to": "2024-06-17", "name": "某某股份", "risk_flag": False},
+             "effective_to": "2024-06-18", "name": "某某股份", "risk_flag": False},
             {"code": "600002", "effective_from": "2024-06-18",
              "effective_to": "2024-06-30", "name": "某某股份ST", "risk_flag": True},
         ],
@@ -1969,7 +1972,8 @@ class ExecutableCoverageHonestyTest(unittest.TestCase):
             conn.execute("INSERT INTO selection_picks VALUES(1,'600001',1,'某某股份')")
             conn.commit()
             conn.close()
-            # 归档只覆盖决策日 06-14，而 entry 是 06-17、exit 是 06-18。
+            # 归档只覆盖决策日 06-14（半开区间 `[06-14, 06-15)`），而 entry 是 06-17、
+            # exit 是 06-18 —— 因此没有任何动作 session 能解析出状态。
             archive = _os.path.join(tmp, "security_state_history.json")
             with open(archive, "w", encoding="utf-8") as handle:
                 _json.dump({
@@ -1977,7 +1981,7 @@ class ExecutableCoverageHonestyTest(unittest.TestCase):
                     "historical_membership_complete": True,
                     "availability_basis": "session_close",
                     "rows": [{"code": "600001", "effective_from": "2024-06-14",
-                              "effective_to": "2024-06-14", "name": "某某股份",
+                              "effective_to": "2024-06-15", "name": "某某股份",
                               "risk_flag": False}],
                 }, handle, ensure_ascii=False)
 
@@ -2018,6 +2022,565 @@ class ExecutableCoverageHonestyTest(unittest.TestCase):
         self.assertEqual(0, payload["action_state_coverage"]["resolved"])
         self.assertFalse(payload["executable_metrics_available"])
         self.assertFalse(payload["executable_coverage_available"])
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Round 5 — the four findings and where they are fixed
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+class ExecutableBenchmarkCoverageSemanticsTest(unittest.TestCase):
+    """R5-F1：``executable_benchmark_available`` 必须由**基准侧**实际覆盖决定。
+
+    ``benchmark_map()`` 早就分开返回了 benchmark 侧的 ``{required, resolved}``
+    覆盖度，但 ``evaluate()`` 当时把它丢掉了，只看 ``bench_exec is not None``
+    —— 那最多只能说明"调用方传了 provider 对象"。一个 provider 可以**解析出
+    被选中的票、却一条随机基准样本都解析不出来**（策略票与随机票池是两个
+    population），此时 executable 基准并不存在，指标必须标为不可得。
+    """
+
+    #: 与 ProductionEvaluatorWiringTest 同一批行情：06-17 = entry，06-18 = exit。
+    KLINES = ProductionEvaluatorWiringTest.KLINES
+
+    def _evaluate(self, picks, *, security_state_fn=None, **kwargs):
+        with _FakeKlineReport(self.KLINES) as AR:
+            sessions = SL.normalize_sessions(
+                sorted({day for bars in self.KLINES.values() for day in bars})
+            )
+            return AR.evaluate(
+                picks, 1, "选股质量", sessions, asof="2024-06-30",
+                security_state_fn=security_state_fn, **kwargs,
+            )
+
+    def test_selected_coverage_without_benchmark_coverage_is_unavailable(self):
+        """**核心回归**：选股侧覆盖度 > 0、基准侧覆盖度 = 0 → 基准与指标均不可得。
+
+        provider 解析出了被选中的票的动作状态，却**一条随机基准样本都没解析出来**
+        （两个 population 不同：随机票池与策略选中的票）。``benchmark_map()`` 已经把
+        这个事实作为 ``coverage`` 返回，但旧实现把它丢掉，只看
+        ``bench_exec is not None``（"调用方传了 provider 对象"）——于是报告声称
+        可执行基准可用，而 ``executable_excess`` 其实一条都算不出来。
+
+        这里直接把 ``benchmark_map`` 的返回值固定成该覆盖度组合，使断言精确落在
+        "``evaluate()`` 是否真的消费基准侧覆盖度"这一条契约上。
+        """
+        picks = [("s1", "2024-06-14", "600001", "某某股份")]
+
+        def provider(code, session):
+            return {"name": "某某股份", "risk_flag": False}
+
+        with _FakeKlineReport(self.KLINES) as AR:
+            sessions = SL.normalize_sessions(
+                sorted({day for bars in self.KLINES.values() for day in bars})
+            )
+            original = AR.benchmark_map
+            AR.benchmark_map = lambda *a, **k: {
+                # market 侧照常有值（只依赖 verified 标签）。
+                "market": {"2024-06-14": 0.01},
+                # 基准侧**一个动作状态都没解析出来** → 可执行基准为空 dict。
+                "executable": {},
+                "coverage": {"required": 6, "resolved": 0},
+            }
+            try:
+                lines, summary = AR.evaluate(
+                    picks, 1, "选股质量", sessions, asof="2024-06-30",
+                    security_state_fn=provider,
+                )
+            finally:
+                AR.benchmark_map = original
+
+        # 选股侧确实解析出了状态 —— 这正是旧判据会误判为"可用"的前提。
+        self.assertGreater(summary["action_state_coverage"]["resolved"], 0)
+        self.assertTrue(summary["action_state_coverage_available"])
+        # 基准侧一个都没解析出来。
+        self.assertEqual(0, summary["benchmark_state_coverage"]["resolved"])
+        self.assertEqual(6, summary["benchmark_state_coverage"]["required"])
+        self.assertFalse(summary["benchmark_state_coverage_available"])
+        # 因此基准不可得、指标不可得、executable_excess 为 None。
+        self.assertFalse(summary["executable_benchmark_available"])
+        self.assertFalse(summary["executable_metrics_available"])
+        self.assertIsNone(summary["executable_excess"])
+        self.assertEqual([], summary["executable_benchmark_days"])
+        joined = "\n".join(lines)
+        self.assertIn("不可用", joined)
+        # 覆盖度行必须**同时**给出两侧数字，读者才能看出是基准侧拖的后腿。
+        self.assertIn("基准侧", joined)
+
+    def test_benchmark_coverage_on_a_date_outside_the_evaluation_is_unavailable(self):
+        """基准只在**别的**决策日有值 → 本次评估减不出超额，仍判不可得。"""
+        picks = [("s1", "2024-06-14", "600001", "某某股份")]
+
+        def provider(code, session):
+            return {"name": "某某股份", "risk_flag": False}
+
+        with _FakeKlineReport(self.KLINES) as AR:
+            sessions = SL.normalize_sessions(
+                sorted({day for bars in self.KLINES.values() for day in bars})
+            )
+            original = AR.benchmark_map
+            AR.benchmark_map = lambda *a, **k: {
+                "market": {"2024-06-14": 0.01, "2024-06-17": 0.02},
+                # 基准解析成功，但只在 06-17；本次评估的决策日是 06-14。
+                "executable": {"2024-06-17": 0.02},
+                "coverage": {"required": 4, "resolved": 4},
+            }
+            try:
+                _, summary = AR.evaluate(
+                    picks, 1, "选股质量", sessions, asof="2024-06-30",
+                    security_state_fn=provider,
+                )
+            finally:
+                AR.benchmark_map = original
+
+        # 基准侧解析成功，但被评估的决策日（06-14）上没有任何可执行基准样本。
+        self.assertTrue(summary["benchmark_state_coverage_available"])
+        self.assertEqual([], summary["executable_benchmark_days"])
+        self.assertFalse(summary["executable_benchmark_available"])
+        self.assertIsNone(summary["executable_excess"])
+
+    def test_blocked_benchmark_samples_make_the_benchmark_unavailable(self):
+        """端到端（真实 provider）：基准样本全部买不进 → 无可用可执行基准。
+
+        provider 对每个 (code, session) 都作答（因此基准侧 ``resolved > 0``），
+        但基准票池的 entry 全部涨停 → 可执行基准一条样本都没有，基准与指标都必须
+        标为不可得，而不是"有覆盖度就算可用"。
+        """
+        # 唯一一只票在 entry 当天正好 +10%（主板涨停 → 买不进）。
+        klines = {
+            "600002": {
+                "2024-06-14": (10.0, 10.0),
+                "2024-06-17": (10.0, 11.0),
+                "2024-06-18": (11.0, 11.5),
+                "2024-06-19": (11.5, 11.6),
+            },
+        }
+
+        def provider(code, session):
+            return {"name": "某某股份", "risk_flag": False}
+
+        with _FakeKlineReport(klines) as AR:
+            sessions = SL.normalize_sessions(
+                sorted({day for bars in klines.values() for day in bars})
+            )
+            _, summary = AR.evaluate(
+                [("s1", "2024-06-14", "600002", "某某股份")], 1, "选股质量",
+                sessions, asof="2024-06-30", security_state_fn=provider,
+            )
+        # 基准侧解析出了状态……
+        self.assertGreater(summary["benchmark_state_coverage"]["resolved"], 0)
+        self.assertTrue(summary["benchmark_state_coverage_available"])
+        # ……但没有任何可执行基准样本落在被评估的决策日上。
+        self.assertEqual([], summary["executable_benchmark_days"])
+        self.assertFalse(summary["executable_benchmark_available"])
+        self.assertIsNone(summary["executable_excess"])
+
+    def test_full_coverage_on_the_evaluated_date_stays_available(self):
+        """对照：两侧都解析成功且日期对得上 → 基准可用（防止过度收紧）。"""
+        picks = [
+            ("s1", "2024-06-14", "600001", "某某股份"),
+            ("s1", "2024-06-14", "600002", "某某股份"),
+        ]
+
+        def provider(code, session):
+            return {"name": "某某股份", "risk_flag": False}
+
+        _, summary = self._evaluate(picks, security_state_fn=provider)
+        self.assertTrue(summary["benchmark_state_coverage_available"])
+        self.assertGreater(summary["benchmark_state_coverage"]["resolved"], 0)
+        self.assertIn("2024-06-14", summary["executable_benchmark_days"])
+        self.assertTrue(summary["executable_benchmark_available"])
+        self.assertTrue(summary["executable_metrics_available"])
+
+    def test_benchmark_coverage_is_reported_separately_from_selected_coverage(self):
+        """两个覆盖度必须是**两个**字段，绝不合并成一个"动作状态覆盖度"。"""
+        picks = [("s1", "2024-06-14", "600001", "某某股份")]
+
+        def provider(code, session):
+            return {"name": "某某股份", "risk_flag": False}
+
+        _, summary = self._evaluate(picks, security_state_fn=provider)
+        self.assertIn("action_state_coverage", summary)
+        self.assertIn("benchmark_state_coverage", summary)
+        self.assertIn("benchmark_state_coverage_available", summary)
+        self.assertIn("action_state_coverage_available", summary)
+        # 两者是独立对象：改一个不会连带改另一个。
+        self.assertIsNot(summary["action_state_coverage"],
+                         summary["benchmark_state_coverage"])
+
+    def test_real_main_reports_benchmark_coverage_separately(self):
+        """真实 ``main()`` 也必须分开报两侧覆盖度。"""
+        import os as _os
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db = _os.path.join(tmp, "selection_tracking.db")
+            import sqlite3 as sq
+
+            conn = sq.connect(db)
+            conn.execute(
+                "CREATE TABLE selection_runs(id INTEGER PRIMARY KEY, strategy TEXT,"
+                " data_asof_date TEXT)"
+            )
+            conn.execute(
+                "CREATE TABLE selection_picks(run_id INTEGER, code TEXT,"
+                " rank_no INTEGER, name TEXT)"
+            )
+            conn.execute("INSERT INTO selection_runs VALUES(1,'s1','2024-06-14')")
+            conn.execute("INSERT INTO selection_picks VALUES(1,'600001',1,'某某股份')")
+            conn.commit()
+            conn.close()
+
+            import selection_alpha_report as AR
+
+            original = dict(
+                DATA_DIR=AR.DATA_DIR, KLINE_DIR=AR.KLINE_DIR,
+                REPORT_PATH=AR.REPORT_PATH, load_kline=AR.load_kline,
+                listdir=AR.os.listdir, WINDOW_DAYS=AR.WINDOW_DAYS,
+            )
+            AR.DATA_DIR = tmp
+            AR.KLINE_DIR = _os.path.join(tmp, "klines")
+            AR.REPORT_PATH = _os.path.join(tmp, "reports", "alpha.md")
+            AR.WINDOW_DAYS = 3650
+            AR.load_kline = lambda code: dict(self.KLINES.get(code) or {})
+            AR.os.listdir = lambda path: (
+                [f"{code}.csv" for code in self.KLINES]
+                if str(path) == str(AR.KLINE_DIR) else original["listdir"](path)
+            )
+            try:
+                from contextlib import redirect_stdout
+                import io
+
+                buf = io.StringIO()
+                with redirect_stdout(buf):
+                    AR.main(security_state_fn=lambda code, session: {
+                        "name": "某某股份", "risk_flag": False})
+                payload = _json_loads(buf.getvalue().strip().splitlines()[-1])
+            finally:
+                AR.DATA_DIR = original["DATA_DIR"]
+                AR.KLINE_DIR = original["KLINE_DIR"]
+                AR.REPORT_PATH = original["REPORT_PATH"]
+                AR.load_kline = original["load_kline"]
+                AR.os.listdir = original["listdir"]
+                AR.WINDOW_DAYS = original["WINDOW_DAYS"]
+
+        self.assertIn("action_state_coverage", payload)
+        self.assertIn("benchmark_state_coverage", payload)
+        self.assertGreater(payload["benchmark_state_coverage"]["required"], 0)
+
+
+class ResolvedSessionPropagationTest(unittest.TestCase):
+    """R5-F2：``actual_*_session`` 必须写**解析出的** session，而不是原始输入。
+
+    ``intended_entry_session`` / ``intended_exit_session`` 都是可省略字段
+    （契约显式允许：省略时由带日期的证据给出动作 session）。旧实现把
+    ``row.intended_*_session`` 直接抄进 ``actual_*_session``，于是
+    "两边都省略、证据日期不同、成交成立"的行会得到
+    ``executable=True`` + 非空 ``executable_return``，而 ``actual_entry_session``
+    与 ``actual_exit_session`` **双双为 None** —— 审计记录自相矛盾，且丢掉了
+    T+1 逻辑本来就依赖的那个成交 session。
+    """
+
+    def test_both_intended_sessions_omitted_are_filled_from_the_evidence(self):
+        """**核心回归**：两侧 intended 都省略，成交成立 → actual 必须等于证据日期。"""
+        entry_ev = evidence(session=SESSION, price=102.0, reference=100.0)
+        exit_ev = evidence(session=NEXT_SESSION, price=103.0, reference=102.0)
+        built = ST.build_executable_outcomes([
+            ST.SelectionRow(
+                sample_key="omitted-both",
+                code=MAIN_BOARD,
+                selected=True,
+                # 故意两侧都不传 intended_*。
+                entry_evidence=entry_ev,
+                exit_evidence=exit_ev,
+                market_label_status="verified",
+                market_label_value=0.05,
+            )
+        ])
+        outcome = built["outcomes"][0]
+        self.assertTrue(outcome.executable)
+        self.assertIsNotNone(outcome.executable_return)
+        self.assertIsNone(outcome.intended_entry_session)
+        self.assertIsNone(outcome.intended_exit_session)
+        # 成交 session 由证据解析而来 —— 绝不是 None。
+        self.assertEqual(SESSION, outcome.actual_entry_session)
+        self.assertEqual(NEXT_SESSION, outcome.actual_exit_session)
+        # 且两者是**不同**的 session（T+1 成立）。
+        self.assertNotEqual(outcome.actual_entry_session, outcome.actual_exit_session)
+        self.assertEqual(1, built["report"]["executable"])
+        self.assertTrue(ST.audit_totals(built["report"])["complete"])
+
+    def test_only_entry_intended_omitted_is_filled_from_the_evidence(self):
+        """只省略入场：exit 侧仍按输入/证据正确落地。"""
+        entry_ev = evidence(session=SESSION, price=102.0, reference=100.0)
+        exit_ev = evidence(session=NEXT_SESSION, price=103.0, reference=102.0)
+        built = ST.build_executable_outcomes([
+            ST.SelectionRow(
+                sample_key="omitted-entry",
+                code=MAIN_BOARD,
+                selected=True,
+                entry_evidence=entry_ev,
+                intended_exit_session=NEXT_SESSION,
+                exit_evidence=exit_ev,
+                market_label_status="verified", market_label_value=0.05,
+            )
+        ])
+        outcome = built["outcomes"][0]
+        self.assertTrue(outcome.executable)
+        self.assertEqual(SESSION, outcome.actual_entry_session)
+        self.assertEqual(NEXT_SESSION, outcome.actual_exit_session)
+
+    def test_actual_session_stays_none_when_no_fill_was_established(self):
+        """对照：没有确立成交（blocked）时 ``actual_*`` 必须保持 ``None``。
+
+        "从证据补 session"只适用于**已成立**的成交；把被拦的动作也补上 session
+        就等于凭空制造了一笔成交 —— 那是本契约明令禁止的静默顺延。
+        """
+        limit_up = evidence(session=SESSION, price=110.0, reference=100.0)
+        built = ST.build_executable_outcomes([
+            ST.SelectionRow(
+                sample_key="blocked-entry", code=MAIN_BOARD, selected=True,
+                entry_evidence=limit_up,
+                intended_exit_session=NEXT_SESSION,
+                exit_evidence=evidence(session=NEXT_SESSION, price=101.0,
+                                       reference=100.0),
+                market_label_status="verified", market_label_value=0.25,
+            )
+        ])
+        outcome = built["outcomes"][0]
+        self.assertFalse(outcome.executable)
+        self.assertIsNone(outcome.actual_entry_session)
+        self.assertIsNone(outcome.actual_exit_session)
+        self.assertIsNone(outcome.executable_return)
+
+    def test_actual_session_is_normalized_to_the_session_date(self):
+        """审计字段与 ``intended_*`` 必须同一书写口径（10 字符日期）。"""
+        entry_ev = ST.MarketEvidence(
+            session="2024-06-18T00:00:00+08:00",
+            available_at=ST.session_close_at("2024-06-18"),
+            price=102.0, reference_price=100.0, halted=False, name="某某股份",
+        )
+        exit_ev = ST.MarketEvidence(
+            session="2024-06-19T00:00:00+08:00",
+            available_at=ST.session_close_at("2024-06-19"),
+            price=103.0, reference_price=102.0, halted=False, name="某某股份",
+        )
+        built = ST.build_executable_outcomes([
+            ST.SelectionRow(
+                sample_key="iso-sessions", code=MAIN_BOARD, selected=True,
+                entry_evidence=entry_ev, exit_evidence=exit_ev,
+                market_label_status="verified", market_label_value=0.05,
+            )
+        ])
+        outcome = built["outcomes"][0]
+        self.assertEqual(SESSION, outcome.actual_entry_session)
+        self.assertEqual(NEXT_SESSION, outcome.actual_exit_session)
+
+
+class StrictNumericBooleanTest(unittest.TestCase):
+    """R5-F3：声明性布尔的**数值**兼容也只认精确的 0 / 1。
+
+    旧实现把"非零即真"当作兼容：``historical_membership_complete: 2`` 或 ``-1``
+    会直接解锁历史完整模式。这类值说明生产者与消费者对字段语义的理解已经不一致，
+    继续猜测等于替对方编造一份声明。风险标记（``risk_flag``）走同一语义。
+    """
+
+    def test_numeric_truth_table_only_accepts_exact_zero_and_one(self):
+        import point_in_time as PIT
+
+        # 精确的 0 / 1（含 float 与 bool）→ 明确判定。
+        self.assertIs(True, PIT.as_strict_bool(1))
+        self.assertIs(True, PIT.as_strict_bool(1.0))
+        self.assertIs(True, PIT.as_strict_bool(True))
+        self.assertIs(False, PIT.as_strict_bool(0))
+        self.assertIs(False, PIT.as_strict_bool(0.0))
+        self.assertIs(False, PIT.as_strict_bool(False))
+        # 其他数值一律"无法判定"，绝不当成 True。
+        for value in (2, -1, -2, 3, 0.5, -0.5, 1.5, 100, -100):
+            self.assertIsNone(PIT.as_strict_bool(value), value)
+        # 无穷与 NaN 同样无法判定。
+        for value in (float("inf"), float("-inf"), float("nan")):
+            self.assertIsNone(PIT.as_strict_bool(value), value)
+
+    def test_risk_flags_use_the_same_numeric_semantics(self):
+        """风险标记复用同一真值表：``2`` / ``-1`` 不得被读成 ST。"""
+        self.assertIs(True, ST.normalize_risk_flag(1))
+        self.assertIs(False, ST.normalize_risk_flag(0))
+        for value in (2, -1, 0.5, float("inf"), float("nan")):
+            self.assertIsNone(ST.normalize_risk_flag(value), value)
+
+    def test_malformed_complete_flag_cannot_unlock_historical_mode(self):
+        """``historical_membership_complete: 2`` / ``-1`` 不得解锁历史完整模式。"""
+        for value in (2, -1, 0.5, float("inf"), float("nan")):
+            payload = {
+                "kind": "historical_archive",
+                "historical_membership_complete": value,
+                "rows": [{"code": "600001", "effective_from": "2024-06-14",
+                          "name": "某某股份", "risk_flag": False}],
+            }
+            self.assertEqual(
+                SS.SOURCE_INCOMPLETE, SS.archive_provenance(payload)["status"],
+                f"value={value!r}")
+            self.assertIsNone(
+                SS.SecurityStateArchive.from_payload(payload), f"value={value!r}")
+
+    def test_universe_source_complete_flag_rejects_non_boolean_numbers(self):
+        """``point_in_time.universe_source_provenance`` 同样不得被 2 / -1 解锁。"""
+        import point_in_time as PIT
+
+        for value in (2, -1, 0.5, float("inf"), float("nan")):
+            out = PIT.universe_source_provenance(
+                {"kind": "historical_archive",
+                 "historical_membership_asof": "2026-12-31",
+                 "historical_membership_complete": value}, "2024-06-14")
+            self.assertFalse(out["historical_membership_complete"], f"value={value!r}")
+            self.assertEqual(
+                PIT.UNIVERSE_SOURCE_INCOMPLETE, out["status"], f"value={value!r}")
+
+    def test_exact_one_and_zero_still_work_end_to_end(self):
+        """对照：合法的 1 / 0 仍必须被接受（严格不等于只认 bool 类型）。"""
+        ok_payload = {
+            "kind": "historical_archive",
+            "historical_membership_complete": 1,
+            "rows": [{"code": "600001", "effective_from": "2024-06-14",
+                      "name": "某某股份", "risk_flag": 0}],
+        }
+        self.assertEqual(SS.SOURCE_OK, SS.archive_provenance(ok_payload)["status"])
+        archive = SS.SecurityStateArchive.from_payload(ok_payload)
+        self.assertIsNotNone(archive)
+
+    def test_malformed_risk_flag_number_fails_closed_in_the_verdict(self):
+        """``risk_flag=2`` 无法判定 → unproven，绝不默认非 ST。"""
+        verdict = buy(evidence(price=100.5, reference=100.0, name="某某股份",
+                               risk_flag=2))
+        self.assertEqual(ST.STATUS_UNPROVEN, verdict.status)
+        self.assertEqual(ST.REASON_UNKNOWN_ST_STATUS, verdict.reason)
+
+
+class EffectiveToContractTest(unittest.TestCase):
+    """R5-F4：``effective_to`` 的语义被固定为**半开区间**，文档/实现/测试一致。
+
+    归档文档曾写 ``effective_from <= session < effective_to``（半开），而
+    ``state_at()`` 实现的是闭区间（``<= end``）。两种口径下"``effective_to`` 当天
+    算不算本行"给出相反答案，生产者无法据此写出正确的归档。现在统一为半开：
+    ``[effective_from, effective_to)``，与
+    :func:`point_in_time.classification_visibility` /
+    :func:`point_in_time.universe_membership` 完全一致 —— 相邻窗口首尾相接且
+    不重叠，生产者不需要靠"哪一行生效更晚"的兜底规则来消歧。
+    """
+
+    @staticmethod
+    def _archive(*rows, availability_basis="session_close"):
+        return SS.SecurityStateArchive.from_payload({
+            "kind": "historical_archive",
+            "historical_membership_complete": True,
+            "availability_basis": availability_basis,
+            "rows": list(rows),
+        })
+
+    def test_effective_to_date_itself_is_outside_the_window(self):
+        """**边界**：``session == effective_to`` → **不**属于本行（窗口已结束）。"""
+        archive = self._archive(
+            {"code": "600001", "effective_from": "2024-06-14",
+             "effective_to": "2024-06-18", "name": "某某股份", "risk_flag": False},
+        )
+        # 窗口内最后一个 session 仍可见。
+        self.assertEqual(
+            "某某股份", archive.state_at("600001", "2024-06-17")["name"])
+        # effective_to 当日**不在**窗口内。
+        self.assertIsNone(archive.state_at("600001", "2024-06-18"))
+        # 之后同样不可见（不沿用旧值）。
+        self.assertIsNone(archive.state_at("600001", "2024-06-19"))
+
+    def test_the_following_date_belongs_to_the_next_window(self):
+        """**边界**：``effective_to`` 当日属于**下一个**窗口。"""
+        archive = self._archive(
+            {"code": "600001", "effective_from": "2024-06-14",
+             "effective_to": "2024-06-18", "name": "某某股份", "risk_flag": False},
+            {"code": "600001", "effective_from": "2024-06-18",
+             "effective_to": "2024-06-30", "name": "某某股份ST", "risk_flag": True},
+        )
+        self.assertEqual("某某股份", archive.state_at("600001", "2024-06-17")["name"])
+        boundary = archive.state_at("600001", "2024-06-18")
+        self.assertEqual("某某股份ST", boundary["name"])
+        self.assertTrue(boundary["risk_flag"])
+        self.assertEqual("2024-06-18", boundary["effective_from"])
+
+    def test_effective_from_date_itself_is_inside_the_window(self):
+        """**边界**：``session == effective_from`` → 属于本行（左闭）。"""
+        archive = self._archive(
+            {"code": "600001", "effective_from": "2024-06-14",
+             "effective_to": "2024-06-30", "name": "某某股份", "risk_flag": False},
+        )
+        state = archive.state_at("600001", "2024-06-14")
+        self.assertIsNotNone(state)
+        self.assertEqual("2024-06-14", state["effective_from"])
+        # 前一天不可见。
+        self.assertIsNone(archive.state_at("600001", "2024-06-13"))
+
+    def test_effective_to_equal_to_effective_from_is_an_empty_window(self):
+        """``effective_to == effective_from`` 是空窗口 → 不覆盖任何 session。"""
+        archive = self._archive(
+            {"code": "600001", "effective_from": "2024-06-14",
+             "effective_to": "2024-06-14", "name": "某某股份", "risk_flag": False},
+        )
+        self.assertIsNone(archive.state_at("600001", "2024-06-14"))
+        self.assertIsNone(archive.state_at("600001", "2024-06-13"))
+
+    def test_absent_effective_to_covers_exactly_its_own_session(self):
+        """缺省 ``effective_to`` = 只覆盖 ``effective_from`` 当天（半开写法）。"""
+        archive = self._archive(
+            {"code": "600001", "effective_from": "2024-06-14",
+             "name": "某某股份", "risk_flag": False},
+        )
+        self.assertIsNotNone(archive.state_at("600001", "2024-06-14"))
+        self.assertIsNone(archive.state_at("600001", "2024-06-15"))
+
+    def test_documentation_and_implementation_agree_on_the_boundary(self):
+        """文档、实现、测试必须对 ``effective_to`` 给出同一个答案。
+
+        这条测试直接读 ``security_state_point_in_time`` 的模块文档串，断言它写的是
+        半开区间；同时用实现验证同一语义。文档若被改回闭区间，这里立刻失败 ——
+        契约不得在生产者面前保持歧义。
+
+        对比对象 :func:`point_in_time.classification_visibility` 用的是**同一口径**：
+        它把 date-only 的 ``effective_to`` 解释为该自然日结束，因此 date-only 的
+        ``asof`` 落在 ``effective_to`` 当天时同样判为**窗口已结束**。两条契约在
+        日粒度上必须给出同一个答案，否则"归档生产者按哪一条写"就又变成了猜测。
+        """
+        import security_state_point_in_time as SS_MOD
+
+        doc = SS_MOD.__doc__ or ""
+        self.assertIn("effective_from <= session", doc)
+        self.assertIn("< effective_to", doc)
+        self.assertNotIn("<= effective_to", doc)
+
+        archive = self._archive(
+            {"code": "600001", "effective_from": "2024-06-14",
+             "effective_to": "2024-06-18", "name": "某某股份", "risk_flag": False},
+        )
+        # 与 :func:`point_in_time.classification_visibility` 的区间口径一致：
+        # effective_to 当日 → 窗口已结束（两条契约都判"不可见"）。
+        import point_in_time as PIT
+
+        at_boundary = PIT.classification_visibility(
+            {"industry": "银行", "industry_effective_from": "2024-06-14",
+             "industry_effective_to": "2024-06-18"}, "2024-06-18")
+        self.assertFalse(at_boundary["visible"])
+        self.assertEqual("effective_window_expired", at_boundary["basis"])
+        self.assertIsNone(archive.state_at("600001", "2024-06-18"))
+
+        # 窗口内的最后一个 session：两条契约都判"可见"。
+        inside = PIT.classification_visibility(
+            {"industry": "银行", "industry_effective_from": "2024-06-14",
+             "industry_effective_to": "2024-06-18"}, "2024-06-17")
+        self.assertTrue(inside["visible"])
+        self.assertEqual("某某股份", archive.state_at("600001", "2024-06-17")["name"])
+
+
+def _json_loads(text):
+    import json as _json
+
+    return _json.loads(text)
 
 
 if __name__ == "__main__":

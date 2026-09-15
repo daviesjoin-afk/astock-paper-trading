@@ -132,6 +132,11 @@ def benchmark_map(dates, horizon, sessions, *, asof, security_state_fn=None):
       两侧都 ``executable`` 才计入）。**若没有可信的 PIT 历史状态源
       （``security_state_fn is None``），该键整体缺席** —— 报告必须写
       "可执行基准不可得"，而不是把未过滤的均值冒充成可执行基准。
+    * ``coverage``：**基准侧**的动作状态覆盖度 ``{required, resolved}``。调用方
+      必须用它判断基准是否真的成立：``executable`` 是空 dict（例如 provider 对
+      随机基准样本全部返回 ``None``）与"没有 provider"（``None``）是**两种不同**
+      的不可得，两者都不得被当成"基准可用"。随机基准票池与策略选中的票是两个
+      population，选股侧的覆盖度不能替基准侧作证。
 
     逐股仍走同一个标签契约：``pending`` / ``unavailable`` 绝不填 0 混进基准。
     """
@@ -326,12 +331,12 @@ def evaluate(picks, horizon, label, sessions, *, asof,
     )
     bench = benches.get("market") or {}
     bench_exec = benches.get("executable")
-    # 动作状态覆盖度：区分"provider 对象存在"与"动作状态真的解析出来"。
+    # 基准侧的**动作状态覆盖度**（由 ``benchmark_map`` 累计，作用域是随机基准样本）。
+    # 它必须与选股侧的覆盖度**分开**统计：两侧的 population 不同（随机票池 vs
+    # 策略选出的票），一侧解析成功完全不能证明另一侧也解析成功。
+    bench_coverage = dict(benches.get("coverage") or {"required": 0, "resolved": 0})
+    # 选股侧的**动作状态覆盖度**：区分"provider 对象存在"与"动作状态真的解析出来"。
     coverage = {"required": 0, "resolved": 0}
-    # 可执行基准是否**可得**：既要有 provider，也要真的解析出动作状态
-    # （见下方 `executable_benchmark_available` 的最终判定）。缺证据时它是 None，
-    # 绝不用未过滤的 market 均值冒充。
-    bench_exec_present = bench_exec is not None
     status_counts = {status: 0 for status in SL.LABEL_STATUSES}
     verified = []
     for pick in picks:
@@ -383,14 +388,25 @@ def evaluate(picks, horizon, label, sessions, *, asof,
     }
 
     # ── 可执行覆盖度：provider 存在 ≠ 指标可用 ──
-    # 需要同时满足：
-    #   1. 有 provider 且基准侧真的解析出动作状态（bench_exec_present）；
-    #   2. 选股侧至少解析出**一个**动作状态（coverage.resolved > 0）。
-    # 否则 executable 指标与 executable 基准都必须标为不可用，绝不能因为
-    # "传了一个 provider 对象"就声称可用。
+    # executable 基准**可得**必须同时满足三个条件，缺一即"不可得"：
+    #   1. 有可信状态源（``bench_exec is not None``，即调用方给了 provider）；
+    #   2. **基准侧**真的解析出了动作状态（``bench_coverage["resolved"] > 0``）。
+    #      随机基准票池可能一条都解析不出来 —— 例如 provider 只覆盖策略选中的票，
+    #      或者归档恰好不覆盖随机样本。此时"选股侧解析成功"完全不能替代它，
+    #      两个 population 必须各自证明自己的覆盖；
+    #   3. 至少在**一个被评估的决策日**上真的存在可执行基准样本。基准可能在
+    #      别的日期有值，而本次评估的日期上一个都没有 —— 那样 executable_excess
+    #      一条也减不出来，报告不得声称基准可用。
+    # 选股侧覆盖度单独记录，只用于说明"哪些样本具备可执行判定所需的证据"，
+    # **不再**作为基准可用性的替代证据。
     state_coverage_available = coverage["resolved"] > 0
-    executable_benchmark_available = (
-        bool(bench_exec_present) and state_coverage_available
+    sample_days = {item[1] for item in verified}
+    bench_exec_days = sorted(set(bench_exec or {}) & sample_days)
+    benchmark_state_coverage_available = bench_coverage.get("resolved", 0) > 0
+    executable_benchmark_available = bool(
+        bench_exec is not None
+        and benchmark_state_coverage_available
+        and bench_exec_days
     )
     executable_metrics_available = executable_benchmark_available
 
@@ -486,12 +502,16 @@ def evaluate(picks, horizon, label, sessions, *, asof,
     lines.append(
         "动作状态覆盖度："
         f"选股侧 {coverage['resolved']}/{coverage['required']} 个动作 session 解析出 "
-        "PIT 历史状态；provider 对象存在**不等于**可执行指标可用。"
+        "PIT 历史状态；"
+        f"基准侧 {bench_coverage.get('resolved', 0)}/{bench_coverage.get('required', 0)} 个。"
+        "两侧 population 不同，**必须分开统计**：provider 对象存在不等于可执行指标可用，"
+        "选股侧解析成功也不等于随机基准侧解析成功。"
     )
     if not executable_benchmark_available:
         lines.append(
             "⚠️ 可执行指标/基准**不可用**：缺少同口径 PIT 历史证券状态源，"
-            "或该源未能解析出任何动作 session 状态。"
+            "或该源在**选股侧或基准侧**未能解析出任何动作 session 状态，"
+            "或本次评估的决策日上不存在任何可执行基准样本。"
             "executable_excess 一栏为 —，绝不拿未做 tradability 过滤的 market 基准冒充。"
         )
     if entry_counts["unproven"] and not entry_counts["executable"]:
@@ -518,12 +538,20 @@ def evaluate(picks, horizon, label, sessions, *, asof,
         "executable_excess": (
             round(statistics.mean(all_exec_x) * 100, 2) if all_exec_x else None
         ),
-        # 覆盖度证据：provider 存在 ≠ 指标可用，因此把"要求/解析"都报出来。
+        # 覆盖度证据：provider 存在 ≠ 指标可用，因此把**两侧**的"要求/解析"
+        # 都报出来，调用方可以据此区分"选股侧没证据"与"基准侧没证据"。
         "action_state_coverage": {
             "required": coverage["required"],
             "resolved": coverage["resolved"],
         },
+        "benchmark_state_coverage": {
+            "required": bench_coverage.get("required", 0),
+            "resolved": bench_coverage.get("resolved", 0),
+        },
         "action_state_coverage_available": state_coverage_available,
+        "benchmark_state_coverage_available": benchmark_state_coverage_available,
+        # 实际用于 executable_excess 的可执行基准决策日（可能为空 → 基准不可得）。
+        "executable_benchmark_days": bench_exec_days,
         "executable_metrics_available": executable_metrics_available,
         "executable_benchmark_available": executable_benchmark_available,
         "label_status_counts": status_counts,
@@ -684,24 +712,37 @@ def main(security_state_fn=None, *, archive_path=None):
         report.append("\npaper_signals 无 filled 样本。")
 
     # ── 口径边界：用**实际覆盖度**判定，而不是 provider 是否存在 ──
+    # 选股侧与基准侧**分开**汇总：executable 指标可用要求 executable 视图自己
+    # 判定为可用（该判定已包含"基准侧解析出状态"与"被评估日期上存在可执行基准
+    # 样本"两个条件）。
     exec_summaries = [s for s in summaries if s.get("view") == "executable"]
     required = sum(s.get("action_state_coverage", {}).get("required", 0)
                    for s in exec_summaries)
     resolved = sum(s.get("action_state_coverage", {}).get("resolved", 0)
                    for s in exec_summaries)
-    # executable 指标可用 ⟺ 有 provider **且** 至少解析出一个动作状态。
-    executable_metrics_available = bool(provider_present) and resolved > 0
+    bench_required = sum(s.get("benchmark_state_coverage", {}).get("required", 0)
+                         for s in exec_summaries)
+    bench_resolved = sum(s.get("benchmark_state_coverage", {}).get("resolved", 0)
+                         for s in exec_summaries)
+    # executable 指标可用 ⟺ 至少一个 executable 视图真的算出了同口径基准。
+    # 这里**不**再用"选股侧 resolved > 0"作为基准可用性的替代证据：随机基准票池
+    # 可能一条都解析不出来，那时基准与指标都不可得。
+    executable_metrics_available = any(
+        s.get("executable_metrics_available") for s in exec_summaries
+    )
     if executable_metrics_available:
         boundary = (
             f"- executable 指标：**可用**。PIT 历史证券状态源已接入，"
-            f"动作状态覆盖度 {resolved}/{required}。"
+            f"选股侧动作状态覆盖度 {resolved}/{required}，"
+            f"基准侧 {bench_resolved}/{bench_required}。"
         )
     elif provider_present:
         boundary = (
-            f"- executable 指标：**不可用**。虽然提供了状态源对象，但它在 "
-            f"{required} 个动作 session 上一个可用状态都没有解析出来"
-            f"（覆盖度 {resolved}/{required}）。因此本报告**不**声称已得到 "
-            "executable 指标；executable_excess 一栏为 —。"
+            f"- executable 指标：**不可用**。虽然提供了状态源对象，但同口径的可执行"
+            f"基准并不成立（选股侧覆盖度 {resolved}/{required}，"
+            f"基准侧 {bench_resolved}/{bench_required}）——可能是随机基准样本一条都"
+            "没有解析出动作状态，或本次评估的决策日上不存在任何可执行基准样本。"
+            "因此本报告**不**声称已得到 executable 指标；executable_excess 一栏为 —。"
         )
     else:
         boundary = (
@@ -714,8 +755,8 @@ def main(security_state_fn=None, *, archive_path=None):
         boundary,
         f"- 状态源：`{state_status.get('status')}`"
         + (f"（source={state_status.get('source')}）" if state_status.get("source") else ""),
-        f"- 动作状态覆盖度：{resolved}/{required}"
-        "（provider 对象存在**不等于**可执行指标可用）。",
+        f"- 动作状态覆盖度：选股侧 {resolved}/{required}，基准侧 {bench_resolved}/{bench_required}"
+        "（两侧 population 不同；provider 对象存在**不等于**可执行指标可用）。",
     ]
     report = report_head + boundary_lines + report[len(report_head):]
 
@@ -728,6 +769,9 @@ def main(security_state_fn=None, *, archive_path=None):
         "provider_present": provider_present,
         "executable_metrics_available": executable_metrics_available,
         "action_state_coverage": {"required": required, "resolved": resolved},
+        "benchmark_state_coverage": {
+            "required": bench_required, "resolved": bench_resolved,
+        },
         # 兼容字段：含义已收紧为"实际覆盖可用"，不再是"provider 存在"。
         "executable_coverage_available": executable_metrics_available,
         "summaries": summaries,

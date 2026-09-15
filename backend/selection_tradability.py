@@ -179,6 +179,20 @@ def _instant(value: Any) -> Optional[str]:
     return None if moment is None else moment.isoformat(timespec="seconds")
 
 
+def _session_text(value: Any) -> Optional[str]:
+    """把 session 归一成 ``YYYY-MM-DD``（10 字符）；无法判定 → ``None``。
+
+    ``actual_entry_session`` / ``actual_exit_session`` 是审计字段，必须与
+    ``intended_*`` / ``evidence.session`` 用**同一个**书写口径，否则同一笔成交在
+    记录里会出现 ``2024-06-18`` 与 ``2024-06-18T00:00:00+08:00`` 两种写法，
+    下游按字符串比较就会漏配。
+    """
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text[:10] or None
+
+
 def normalize_risk_flag(value: Any) -> Optional[bool]:
     """把风险警示标记严格归一成 ``True`` / ``False`` / ``None``。
 
@@ -879,18 +893,29 @@ def build_executable_outcomes(rows: Sequence[SelectionRow]) -> dict:
         )
         _bump(entry.reason)
 
+        # **解析出的**入场 session：契约允许 ``intended_entry_session`` 省略，此时
+        # 动作 session 由带日期的证据给出（``_resolve_action_session`` 明确支持）。
+        # 权威来源依次是：入场 verdict 记下的 session → 入场证据自身的 session →
+        # 调用方声明的 intended session。绝不因为 intended 为 None 就让一个
+        # 已经判成 executable 的成交记录缺 session。
+        entry_session_resolved = _session_text(entry.session) or _session_text(
+            entry_evidence.session
+        )
+        if entry_session_resolved is None:
+            entry_session_resolved = _session_text(row.intended_entry_session)
+
         # T+1 的基准 session 必须是**已解析出的**入场 session，而不是可能为 None 的
         # ``row.intended_entry_session``：当调用方省略 intended_entry_session 但提供了
         # 带日期的入场证据时（契约显式允许），传 None 会让 ``tradability_at`` 整段跳过
-        # T+1，于是"同日买、同日卖"会被判成可执行。优先用权威 verdict 记下的 session，
-        # 其次退回入场证据自身的 session。
-        entry_session_for_t1 = row.intended_entry_session
+        # T+1，于是"同日买、同日卖"会被判成可执行。
+        entry_session_for_t1 = _session_text(row.intended_entry_session)
         if entry_session_for_t1 is None:
-            entry_session_for_t1 = entry.session or entry_evidence.session
+            entry_session_for_t1 = entry_session_resolved
 
         exit_status = None
         exit_reason = None
         exit_verdict = None
+        exit_session_resolved = None
         if row.intended_exit_session is not None or row.exit_evidence is not None:
             exit_evidence = row.exit_evidence or MarketEvidence(
                 session=row.intended_exit_session
@@ -903,6 +928,12 @@ def build_executable_outcomes(rows: Sequence[SelectionRow]) -> dict:
             )
             exit_status = exit_verdict.status
             exit_reason = exit_verdict.reason
+            # 同理：离场 session 也取**解析出的**那一个。
+            exit_session_resolved = _session_text(exit_verdict.session) or _session_text(
+                exit_evidence.session
+            )
+            if exit_session_resolved is None:
+                exit_session_resolved = _session_text(row.intended_exit_session)
         else:
             # 没有离场证据 = 这笔完整交易的可执行性**无法成立**，而不是"离场没问题"。
             # 明确记成 unproven + 机器 reason，而不是留一个 None 让上层当成通过。
@@ -923,15 +954,19 @@ def build_executable_outcomes(rows: Sequence[SelectionRow]) -> dict:
             entry_status=entry.status,
             entry_reason=entry.reason,
             intended_entry_session=row.intended_entry_session,
-            # blocked / unproven 一律不顺延：没有权威 retry 证据就不编一个成交日。
+            # 成交 session 取**已解析出的**那一个：``intended_*`` 是可省略的输入，
+            # 而 verdict/证据里的 session 才是权威。``None`` 只保留给"没有确立成交"
+            # 的情况（blocked / unproven / invalid），绝不用来掩盖一个已经判成
+            # executable 的成交缺 session —— 那会让审计记录自相矛盾：一边
+            # ``executable=True`` + 非空 executable return，一边 session 为 null。
             actual_entry_session=(
-                row.intended_entry_session if entry_ok else None
+                entry_session_resolved if entry_ok else None
             ),
             exit_status=exit_status,
             exit_reason=exit_reason,
             intended_exit_session=row.intended_exit_session,
             actual_exit_session=(
-                row.intended_exit_session if executable else None
+                exit_session_resolved if executable else None
             ),
             entry_executable=entry_ok,
             executable=executable,

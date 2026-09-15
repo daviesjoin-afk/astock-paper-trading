@@ -44,13 +44,26 @@
       ]
     }
 
+上例的生效区间是 ``[2024-06-14, 2024-06-20)`` —— 覆盖 06-14 到 06-19，**不含**
+06-20。要让状态在 06-20 当天生效，应写 ``"effective_to": "2024-06-21"``（或另起
+一行以 06-20 为 ``effective_from``）。生产者必须按**半开**区间书写：这正是
+:func:`point_in_time.classification_visibility` 与
+:func:`point_in_time.universe_membership` 用的口径，相邻窗口因此可以首尾相接而不
+重叠。
+
 判定规则（先到先判，全部 fail closed）：
 
 1. ``kind`` 必须是 :data:`point_in_time.UNIVERSE_SOURCE_KIND_HISTORICAL`
    （``"historical_archive"``）。当前快照无权自称历史归档 → 整个源不可用。
-2. 逐行：``code`` 必须匹配；``effective_from``（缺省取 ``available_at`` 的日期）
-   ``<= session < effective_to``（``effective_to`` 缺省为 ``effective_from`` 当日，
-   即只覆盖当天）。
+2. 逐行：``code`` 必须匹配；生效区间是**半开区间** ``effective_from <= session
+   < effective_to``（``effective_to`` 缺省为 ``effective_from`` 的**次日**，即只
+   覆盖当天）。半开是本仓库统一的 PIT 区间口径（与
+   :func:`point_in_time.classification_visibility` 的 ``effective_from <= asof <
+   effective_to``、:func:`point_in_time.universe_membership` 的 ``list_date <=
+   asof < delist_date`` 一致）：相邻窗口 ``[a, b)`` + ``[b, c)`` 无缝且**不重叠**，
+   生产者不需要靠"哪一行生效更晚"的兜底规则来消歧。
+   ``effective_to`` 当日**不在**窗口内；``effective_to == effective_from`` 是空
+   窗口（不覆盖任何 session，fail closed 为"未知"，不静默覆盖当天）。
 3. 可用时点：显式 ``available_at`` 优先；缺失时**只有**归档声明
    ``"availability_basis": "session_close"`` 才允许用该 session 的收盘时点兜底
    （"这条状态是收盘时记下的"是显式声明，不是默认假设）。两者都没有 →
@@ -63,6 +76,7 @@
 
 from __future__ import annotations
 
+import datetime as _dt
 import json
 import os
 from typing import Any, Callable, Mapping, Optional, Sequence
@@ -122,6 +136,20 @@ def _session_of(value: Any) -> Optional[str]:
     if moment is None:
         return None
     return moment.date().isoformat()
+
+
+def _next_day(session: str) -> Optional[str]:
+    """``YYYY-MM-DD`` 的**次日**（日历日）；无法解析 → ``None``。
+
+    只用于把"只覆盖当天"表达成半开区间 ``[start, start+1)``。这里用的是自然日
+    而不是交易日：窗口比较的对象是 session 字符串本身，``start`` 之后的任何
+    session 都不小于次日，因此无需交易日历也能得到正确的排除效果。
+    """
+    try:
+        day = _dt.date.fromisoformat(str(session)[:10])
+    except (TypeError, ValueError):
+        return None
+    return (day + _dt.timedelta(days=1)).isoformat()
 
 
 def default_archive_path() -> str:
@@ -251,8 +279,8 @@ class SecurityStateArchive:
             return None, None
         raw_to = self._row_value(row, ROW_EFFECTIVE_TO_KEYS)
         if raw_to is None:
-            # 缺省：这条状态只覆盖 ``start`` 当天。
-            return start, start
+            # 缺省：这条状态只覆盖 ``start`` 当天。半开区间下即 ``[start, start+1)``。
+            return start, _next_day(start)
         end = _session_of(raw_to)
         if end is None:
             return None, None
@@ -281,7 +309,14 @@ class SecurityStateArchive:
         return None
 
     def state_at(self, code: Any, session: Any) -> Optional[dict]:
-        """``code`` 在 ``session`` 当时的状态；证据不足 → ``None``（fail closed）。"""
+        """``code`` 在 ``session`` 当时的状态；证据不足 → ``None``（fail closed）。
+
+        生效区间是**半开**的 ``effective_from <= session < effective_to`` —— 与
+        :func:`point_in_time.classification_visibility` /
+        :func:`point_in_time.universe_membership` 同一口径。``effective_to`` 当日
+        属于**下一个**窗口（或"窗口已结束"），不属于本行；``effective_to ==
+        effective_from`` 是空窗口，不覆盖任何 session。
+        """
         code_text = str(code or "").strip()
         target = _session_of(session)
         if not code_text or target is None:
@@ -289,9 +324,9 @@ class SecurityStateArchive:
         candidates = []
         for row in self._by_code.get(code_text, ()):
             start, end = self._row_window(row)
-            if start is None:
+            if start is None or end is None:
                 continue
-            if not (start <= target <= end):
+            if not (start <= target < end):
                 continue
             available_at = self._row_available_at(row, start)
             if available_at is None:
