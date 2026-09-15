@@ -1289,9 +1289,14 @@ def _normalize_genome(weights):
 def _alpha_dataset(conn, max_rows_per_window=ALPHA_MAX_ROWS_PER_WINDOW):
     """Build a bounded GA dataset without materializing the full join."""
     cap = max(100, int(max_rows_per_window))
+    # ``BETWEEN`` 顺带把 ±Inf 挡在 center 之外：SQLite 会把 NaN 存成 NULL
+    # （因此被 ``NOT NULL`` 拒绝），但 ±Inf 是**能落库**的。一个 Inf 就能把
+    # 同窗口的 ``AVG`` 拉成 ±Inf，进而把该窗口**所有**样本的 excess 变成 ±Inf。
+    # 非有限的未来收益不是证据，不得参与 center。
     windows = conn.execute(
         """SELECT start_date,horizon,AVG(forward_return_pct) AS center
              FROM adaptive_alpha_returns
+            WHERE forward_return_pct BETWEEN -9e307 AND 9e307
             GROUP BY start_date,horizon ORDER BY start_date,horizon"""
     ).fetchall()
     rows = []
@@ -1306,7 +1311,12 @@ def _alpha_dataset(conn, max_rows_per_window=ALPHA_MAX_ROWS_PER_WINDOW):
         center = float(window["center"] or 0.0)
         for raw in conn.execute(query, (window["start_date"], window["horizon"], cap)):
             row = dict(raw)
-            row["excess_return_pct"] = float(row["forward_return_pct"] or 0.0) - center
+            forward = _num(row["forward_return_pct"], None)
+            if forward is None:
+                # 非有限/缺失的未来收益 != 0% 收益：既不 impute 成平盘，也不让
+                # 它进数据集。不知道就没有样本，不是 0 收益样本。
+                continue
+            row["excess_return_pct"] = forward - center
             rows.append(row)
     return rows
 

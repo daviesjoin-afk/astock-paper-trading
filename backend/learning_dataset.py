@@ -1595,6 +1595,103 @@ def build_dataset(
     )
 
 
+# ─────────────── selection-label bridge (additive, opt-in) ───────────────
+#
+# ``selection_labels`` 是选股未来结果的唯一权威实现。这里的桥只做一件事：
+# 把一个标签记录的 ``label_status`` 翻译成 dataset 层已经认识的
+# ``pit_status`` / 排除原因，**不重复实现任何标签逻辑**。
+#
+# 只有 ``verified`` 能映射成 ``verified``。``pending`` 不是负例、
+# ``unavailable`` 不是 0%、``invalid`` 不是坏股票 —— 它们只是“不能进
+# strict 数据集”，因此在这里全部降级为 ``unproven``。
+
+#: ``selection_labels`` 状态 → dataset 层 ``pit_status``。
+SELECTION_LABEL_STATUS_TO_PIT = {
+    "verified": PIT_VERIFIED,
+    "pending": PIT_UNPROVEN,
+    "unavailable": PIT_UNPROVEN,
+    "invalid": PIT_UNPROVEN,
+}
+
+#: 非 ``verified`` 状态对应的排除原因。复用既有受控词表，不再造同义词。
+SELECTION_LABEL_STATUS_TO_EXCLUSION = {
+    "verified": None,
+    "pending": "immature_label",
+    "unavailable": "missing_label",
+    "invalid": "invalid_label_time",
+}
+
+#: close-to-close 标签的证据在 ``exit`` 交易日**收市时刻**才可能被任何人读到。
+#: 这是契约定义，不是对未知发布时间的猜测。
+SELECTION_LABEL_EVIDENCE_CLOSE_TIME = "15:00:00"
+
+
+def selection_label_evidence(record: Mapping[str, Any]) -> dict:
+    """把一条 ``selection_labels`` 标签记录映射成 dataset 可消费的证据。
+
+    这是 selection outcome 进入学习数据集的唯一入口，也是“verified 学习集
+    只接受 verified outcome”这句话在代码里的落点：一条声称 ``verified``
+    却没有有限 ``label_score`` 或没有 ``exit_date`` 的记录**不会**被放行，
+    因为那只是标签，不是证据。
+    """
+    declared = _text(record.get("label_status"))
+    status = declared if declared in SELECTION_LABEL_STATUS_TO_PIT else PIT_UNPROVEN
+
+    exit_date = _date_text(record.get("exit_date"))
+    score = _finite(record.get("label_score"))
+    verified = status == PIT_VERIFIED and exit_date is not None and score is not None
+    if status == PIT_VERIFIED and not verified:
+        # 声称 verified、证据却不完整 → 降级，绝不补齐。
+        status = PIT_UNPROVEN
+
+    return {
+        "declared_status": declared,
+        # 原始 selection 状态（审计用）；未识别的状态在这里显示为 ``unproven``。
+        "selection_status": status,
+        "label_status": status,
+        "verified": verified,
+        "sample_key": _text(record.get("sample_key")),
+        "label_version": _text(record.get("label_version")),
+        "pit_status": PIT_VERIFIED if verified else PIT_UNPROVEN,
+        "label_end_date": exit_date,
+        "label_available_at": (
+            f"{exit_date}T{SELECTION_LABEL_EVIDENCE_CLOSE_TIME}+08:00" if verified else None
+        ),
+        "label_score": score if verified else None,
+        "exclusion_reason": (
+            None if verified else SELECTION_LABEL_STATUS_TO_EXCLUSION.get(status, "missing_label")
+        ),
+    }
+
+
+def selection_outcome_rows(
+    records: Sequence[Mapping[str, Any]], *, require_verified: bool = True
+) -> dict:
+    """把标签记录批量过桥，并**逐个状态计数**上报，绝不静默丢弃。"""
+    status_keys = tuple(SELECTION_LABEL_STATUS_TO_PIT) + (PIT_UNPROVEN,)
+    report = {
+        "input_rows": 0,
+        "accepted_rows": 0,
+        "status_counts": {status: 0 for status in status_keys},
+        "exclusion_reasons": {reason: 0 for reason in EXCLUSION_REASONS},
+        "require_verified": bool(require_verified),
+    }
+    rows = []
+    for record in records or ():
+        report["input_rows"] += 1
+        evidence = selection_label_evidence(record)
+        key = evidence["selection_status"]
+        report["status_counts"][key] = report["status_counts"].get(key, 0) + 1
+        if not evidence["verified"]:
+            reason = evidence["exclusion_reason"] or "missing_label"
+            report["exclusion_reasons"][reason] = report["exclusion_reasons"].get(reason, 0) + 1
+            if require_verified:
+                continue
+        rows.append(evidence)
+    report["accepted_rows"] = len(rows)
+    return {"rows": rows, "report": report}
+
+
 # ─────────────────── read-only readiness gate for consumers ───────────────────
 
 
