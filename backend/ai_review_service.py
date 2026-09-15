@@ -972,28 +972,38 @@ def _check_consensus(proposals_by_slot, accounts_map, evolution=None,
         if aid:
             right_map[aid] = p
 
-    common_accounts = set(left_map.keys()) & set(right_map.keys())
-    if not common_accounts:
-        if not left_map or not right_map:
-            return False, "至少一个AI未提出有效提案", [], [{"code": DISAGREEMENT_PROPOSAL_ACCOUNT_MISSING}]
-        return False, ("两个AI针对不同账户提出提案（%s:%s, %s:%s）" % (
-            left_label, list(left_map.keys()), right_label, list(right_map.keys()))), [], [{
-                "code": DISAGREEMENT_ACCOUNT_SCOPE_MISMATCH,
-                "ai1_accounts": sorted(list(left_map.keys())),
-                "ai2_accounts": sorted(list(right_map.keys())),
-                "common_accounts": sorted(list(common_accounts)),
-            }]
-
     merged = []
     disagreements = []
     issues = []
 
+    # "缺账户ID"是**提案自身**的机器事实，与两侧账户是否交集无关，因此必须在任何
+    # 基于 common_accounts 的提前返回**之前**判定并落库 —— 否则只要账户不交集，
+    # 这条证据就会跟着提前返回一起丢掉。
     missing_account_proposals = any(
         _account_key(p) is None for p in left_proposals + right_proposals
     )
     if missing_account_proposals:
         issues.append({"code": DISAGREEMENT_PROPOSAL_ACCOUNT_MISSING})
         disagreements.append("提案缺少有效账户ID")
+
+    common_accounts = set(left_map.keys()) & set(right_map.keys())
+    if not common_accounts:
+        if not left_map or not right_map:
+            # 至少一侧完全没有可用账户提案：保持既有 fail-closed 语义，
+            # 但已确认的 machine fact 不能丢（此时 issues 通常已含该项）。
+            if not issues:
+                issues = [{"code": DISAGREEMENT_PROPOSAL_ACCOUNT_MISSING}]
+            return False, "至少一个AI未提出有效提案", [], issues
+        # 两侧账户不交集：account_scope_mismatch 是主证据，但"缺账户ID"这条
+        # 已知事实要一并返回，不能只报一条。
+        issues.append({
+            "code": DISAGREEMENT_ACCOUNT_SCOPE_MISMATCH,
+            "ai1_accounts": sorted(list(left_map.keys())),
+            "ai2_accounts": sorted(list(right_map.keys())),
+            "common_accounts": sorted(list(common_accounts)),
+        })
+        return False, ("两个AI针对不同账户提出提案（%s:%s, %s:%s）" % (
+            left_label, list(left_map.keys()), right_label, list(right_map.keys()))), [], issues
 
     for account_id in sorted(common_accounts):
         lp = left_map[account_id]

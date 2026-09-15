@@ -2219,6 +2219,57 @@ class DisagreementTaxonomyTests(AiReviewSlotTestBase):
         row = self.audit(res["id"])
         self.assertIsNone(row["merged_proposals"])
 
+    def test_t85_missing_account_evidence_survives_disjoint_account_sets(self):
+        """账户不交集时，"缺账户ID"这条已知 machine fact 必须一并保留。
+
+        回归：`missing_account_proposals` 原本在 `common_accounts` 判定**之后**才算，
+        于是只要两侧账户不交集就提前 return，只报一条 ``account_scope_mismatch``，
+        把**已经确认**的 ``proposal_account_missing`` 丢掉。真实已知事实是两条，
+        机器证据不得因提前返回而缺一条。
+        """
+        self.configure_slots()
+
+        def side_effect(slot_config, *args, **kwargs):
+            if slot_config["slot"] == "ai1":
+                null_id = _proposal()
+                null_id["account_id"] = None
+                on_a = _proposal()
+                on_a["account_id"] = "account_a"
+                return _response(proposals=[null_id, on_a])
+            on_b = _proposal()
+            on_b["account_id"] = "account_b"
+            return _response(proposals=[on_b])
+
+        with self.stub(side_effect):
+            res = self.run_review()
+
+        self.assertEqual(S.OUTCOME_NO_CONSENSUS, res["status"])
+        self.assertFalse(res["consensus"])
+        detail = res.get("outcome_detail")
+        self.assertIsNotNone(detail)
+        # 稳定排序后的机器事实：两条都必须出现
+        self.assertEqual(
+            [S.DISAGREEMENT_ACCOUNT_SCOPE_MISMATCH, S.DISAGREEMENT_PROPOSAL_ACCOUNT_MISSING],
+            detail["disagreement_codes"])
+        self.assertEqual(2, len(detail["issues"]))
+        codes = [i["code"] for i in detail["issues"]]
+        self.assertIn(S.DISAGREEMENT_ACCOUNT_SCOPE_MISMATCH, codes)
+        self.assertIn(S.DISAGREEMENT_PROPOSAL_ACCOUNT_MISSING, codes)
+        scope = next(
+            i for i in detail["issues"]
+            if i["code"] == S.DISAGREEMENT_ACCOUNT_SCOPE_MISMATCH)
+        self.assertEqual(["account_a"], scope["ai1_accounts"])
+        self.assertEqual(["account_b"], scope["ai2_accounts"])
+        self.assertEqual([], scope["common_accounts"])
+        # 绝不允许把 str(None) 的产物当成账户名
+        self.assertNotIn("None", scope["ai1_accounts"])
+        self.assertNotIn("None", scope["ai2_accounts"])
+        # 人类可读理由仍允许截断；机器 issues 不允许
+        self.assertLessEqual(len(res["reason"].split("; ")), 5)
+        # 账户不交集 → 不允许落下任何合并提案
+        self.assertEqual([], res["proposals"])
+        self.assertIsNone(self.audit(res["id"])["merged_proposals"])
+
 
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()
