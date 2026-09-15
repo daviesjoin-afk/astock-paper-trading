@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
-"""通用 AI 审核槽位（``ai1`` / ``ai2``）契约测试：T1–T62（含 C1–C6）。
+"""通用 AI 审核槽位（``ai1`` / ``ai2``）契约测试：T1–T80（含 C1–C6）。
 
-对应三组 PR 的验收清单：
+对应四组 PR 的验收清单：
 
 - 「refactor: generalize AI review into configurable AI1/AI2 slots」（T1–T34）
 - 「fix(ai-review): distinguish hold, disagreement, and reviewer failure」
@@ -9,6 +9,8 @@
 - 「fix(evolution): isolate reviewer failures from strategy learning」
   （T53–T62：reviewer 可靠性证据与策略学习证据的**分层**；``failed`` 不进
   learning denominator；raw 兼容字段与 learning 字段并存）
+- 「feat(ai-review): persist structured disagreement taxonomy」
+  （T63–T80：结构化分歧分类法、outcome_detail 审计契约与独立性验证）
 
 **全部离线**：不联网、不调用任何真实付费 AI API。所有"调用"都被
 ``ai_review_service._call_slot`` 的桩替换；需要真实 key 的地方一律用假字符串。
@@ -1625,5 +1627,483 @@ class ReviewerFailureIsolationTests(AiReviewSlotTestBase):
         self.assertEqual("无历史数据", reason)
 
 
+# ───────────────────────── T63–T80：Disagreement Taxonomy ─────────────────────────
+
+class DisagreementTaxonomyTests(AiReviewSlotTestBase):
+    def test_t63_decision_mismatch_hold_propose(self):
+        self.configure_slots()
+
+        def side_effect(slot_config, *args, **kwargs):
+            slot = slot_config["slot"]
+            if slot == "ai1":
+                return _response(decision="hold", proposals=[])
+            return _response(decision="propose", proposals=[_proposal()])
+
+        with self.stub(side_effect):
+            res = self.run_review()
+
+        self.assertEqual(S.OUTCOME_NO_CONSENSUS, res["status"])
+        detail = res.get("outcome_detail")
+        self.assertIsNotNone(detail)
+        self.assertEqual(S.OUTCOME_DETAIL_SCHEMA_VERSION, detail["schema_version"])
+        self.assertEqual(S.OUTCOME_NO_CONSENSUS, detail["status"])
+        self.assertEqual({"ai1": "hold", "ai2": "propose"}, detail["decisions"])
+        self.assertEqual([S.DISAGREEMENT_DECISION_MISMATCH], detail["disagreement_codes"])
+        self.assertEqual(1, len(detail["issues"]))
+        issue = detail["issues"][0]
+        self.assertEqual(S.DISAGREEMENT_DECISION_MISMATCH, issue["code"])
+        self.assertEqual("hold", issue["left"])
+        self.assertEqual("propose", issue["right"])
+
+    def test_t64_decision_mismatch_propose_hold(self):
+        self.configure_slots()
+
+        def side_effect(slot_config, *args, **kwargs):
+            slot = slot_config["slot"]
+            if slot == "ai1":
+                return _response(decision="propose", proposals=[_proposal()])
+            return _response(decision="hold", proposals=[])
+
+        with self.stub(side_effect):
+            res = self.run_review()
+
+        self.assertEqual(S.OUTCOME_NO_CONSENSUS, res["status"])
+        detail = res.get("outcome_detail")
+        self.assertIsNotNone(detail)
+        self.assertEqual(S.OUTCOME_DETAIL_SCHEMA_VERSION, detail["schema_version"])
+        self.assertEqual({"ai1": "propose", "ai2": "hold"}, detail["decisions"])
+        self.assertEqual([S.DISAGREEMENT_DECISION_MISMATCH], detail["disagreement_codes"])
+        self.assertEqual(1, len(detail["issues"]))
+        issue = detail["issues"][0]
+        self.assertEqual(S.DISAGREEMENT_DECISION_MISMATCH, issue["code"])
+        self.assertEqual("propose", issue["left"])
+        self.assertEqual("hold", issue["right"])
+
+    def test_t65_account_scope_mismatch(self):
+        self.configure_slots()
+
+        def side_effect(slot_config, *args, **kwargs):
+            slot = slot_config["slot"]
+            if slot == "ai1":
+                p = _proposal()
+                p["account_id"] = "account_beta"
+                return _response(proposals=[p])
+            p = _proposal()
+            p["account_id"] = "account_alpha"
+            return _response(proposals=[p])
+
+        with self.stub(side_effect):
+            res = self.run_review()
+
+        self.assertEqual(S.OUTCOME_NO_CONSENSUS, res["status"])
+        detail = res.get("outcome_detail")
+        self.assertEqual([S.DISAGREEMENT_ACCOUNT_SCOPE_MISMATCH], detail["disagreement_codes"])
+        self.assertEqual(1, len(detail["issues"]))
+        issue = detail["issues"][0]
+        self.assertEqual(S.DISAGREEMENT_ACCOUNT_SCOPE_MISMATCH, issue["code"])
+        self.assertEqual(["account_beta"], issue["ai1_accounts"])
+        self.assertEqual(["account_alpha"], issue["ai2_accounts"])
+        self.assertEqual([], issue["common_accounts"])
+
+    def test_t66_confidence_below_threshold(self):
+        self.configure_slots()
+
+        def side_effect(slot_config, *args, **kwargs):
+            slot = slot_config["slot"]
+            if slot == "ai1":
+                return _response(confidence=65.0, proposals=[_proposal(confidence=65.0)])
+            return _response(confidence=82.0, proposals=[_proposal(confidence=82.0)])
+
+        with self.stub(side_effect):
+            res = self.run_review()
+
+        self.assertEqual(S.OUTCOME_NO_CONSENSUS, res["status"])
+        detail = res.get("outcome_detail")
+        self.assertEqual([S.DISAGREEMENT_CONFIDENCE_BELOW_THRESHOLD], detail["disagreement_codes"])
+        self.assertEqual(1, len(detail["issues"]))
+        issue = detail["issues"][0]
+        self.assertEqual(S.DISAGREEMENT_CONFIDENCE_BELOW_THRESHOLD, issue["code"])
+        self.assertEqual(ACCOUNT, issue["account_id"])
+        self.assertEqual(65.0, issue["ai1_confidence"])
+        self.assertEqual(82.0, issue["ai2_confidence"])
+        self.assertEqual(70.0, issue["threshold"])
+
+    def test_t67_weight_direction_mismatch(self):
+        self.configure_slots()
+
+        def side_effect(slot_config, *args, **kwargs):
+            slot = slot_config["slot"]
+            if slot == "ai1":
+                return _response(proposals=[_proposal(weights={"mom": 0.53, "sentiment": 0.47})])
+            return _response(proposals=[_proposal(weights={"mom": 0.48, "sentiment": 0.52})])
+
+        with self.stub(side_effect):
+            res = self.run_review()
+
+        self.assertEqual(S.OUTCOME_NO_CONSENSUS, res["status"])
+        detail = res.get("outcome_detail")
+        self.assertIn(S.DISAGREEMENT_WEIGHT_DIRECTION_MISMATCH, detail["disagreement_codes"])
+        issue = next(i for i in detail["issues"] if i["code"] == S.DISAGREEMENT_WEIGHT_DIRECTION_MISMATCH)
+        self.assertEqual(ACCOUNT, issue["account_id"])
+        self.assertEqual("weights.mom", issue["field"])
+        self.assertAlmostEqual(0.03, issue["ai1_delta"])
+        self.assertAlmostEqual(-0.02, issue["ai2_delta"])
+        self.assertAlmostEqual(0.005, issue["threshold"])
+
+    def test_t68_weight_magnitude_mismatch_and_override(self):
+        self.configure_slots()
+
+        def side_effect(slot_config, *args, **kwargs):
+            slot = slot_config["slot"]
+            if slot == "ai1":
+                return _response(proposals=[_proposal(weights={"mom": 0.53, "sentiment": 0.47})])
+            return _response(proposals=[_proposal(weights={"mom": 0.51, "sentiment": 0.49})])
+
+        with self.stub(side_effect):
+            res = self.run_review()
+
+        self.assertEqual(S.OUTCOME_NO_CONSENSUS, res["status"])
+        detail = res.get("outcome_detail")
+        self.assertIn(S.DISAGREEMENT_WEIGHT_MAGNITUDE_MISMATCH, detail["disagreement_codes"])
+        issue = next(i for i in detail["issues"] if i["code"] == S.DISAGREEMENT_WEIGHT_MAGNITUDE_MISMATCH)
+        self.assertEqual(ACCOUNT, issue["account_id"])
+        self.assertEqual("weights.mom", issue["field"])
+        self.assertAlmostEqual(0.3333, issue["ratio"], places=3)
+        self.assertEqual(0.60, issue["required_ratio"])
+
+        # Test account-level evolution override
+        with mock.patch("ai_review_service._evolution_bounds", return_value=({}, {ACCOUNT: {"consensus_weight_ratio": 0.75}})):
+            with self.stub(side_effect):
+                res_override = self.run_review()
+
+        detail_override = res_override.get("outcome_detail")
+        issue_override = next(i for i in detail_override["issues"] if i["code"] == S.DISAGREEMENT_WEIGHT_MAGNITUDE_MISMATCH)
+        self.assertEqual(0.75, issue_override["required_ratio"])
+
+    def test_t69_entry_direction_mismatch(self):
+        self.configure_slots()
+
+        def side_effect(slot_config, *args, **kwargs):
+            slot = slot_config["slot"]
+            if slot == "ai1":
+                return _response(proposals=[_proposal(entry_score_delta=0.003)])
+            return _response(proposals=[_proposal(entry_score_delta=-0.003)])
+
+        with self.stub(side_effect):
+            res = self.run_review()
+
+        self.assertEqual(S.OUTCOME_NO_CONSENSUS, res["status"])
+        detail = res.get("outcome_detail")
+        self.assertIn(S.DISAGREEMENT_ENTRY_DIRECTION_MISMATCH, detail["disagreement_codes"])
+        issue = next(i for i in detail["issues"] if i["code"] == S.DISAGREEMENT_ENTRY_DIRECTION_MISMATCH)
+        self.assertEqual(ACCOUNT, issue["account_id"])
+        self.assertEqual("entry_score_delta", issue["field"])
+        self.assertAlmostEqual(0.003, issue["ai1_delta"])
+        self.assertAlmostEqual(-0.003, issue["ai2_delta"])
+        self.assertAlmostEqual(0.001, issue["threshold"])
+
+    def test_t70_condition_direction_mismatch(self):
+        self.configure_slots()
+
+        def side_effect(slot_config, *args, **kwargs):
+            slot = slot_config["slot"]
+            if slot == "ai1":
+                return _response(proposals=[_proposal(conditions={"vol_mult": 1.05})])
+            return _response(proposals=[_proposal(conditions={"vol_mult": 0.95})])
+
+        with mock.patch.object(self, "_accounts", return_value=[{
+            "account_id": ACCOUNT, "weights": dict(BASE_WEIGHTS), "conditions": {"vol_mult": 1.0}
+        }]):
+            with self.stub(side_effect):
+                res = self.run_review()
+
+        self.assertEqual(S.OUTCOME_NO_CONSENSUS, res["status"])
+        detail = res.get("outcome_detail")
+        self.assertIn(S.DISAGREEMENT_CONDITION_DIRECTION_MISMATCH, detail["disagreement_codes"])
+        issue = next(i for i in detail["issues"] if i["code"] == S.DISAGREEMENT_CONDITION_DIRECTION_MISMATCH)
+        self.assertEqual(ACCOUNT, issue["account_id"])
+        self.assertEqual("conditions.vol_mult", issue["field"])
+        self.assertAlmostEqual(0.05, issue["ai1_delta"])
+        self.assertAlmostEqual(-0.05, issue["ai2_delta"])
+
+    def test_t71_condition_magnitude_mismatch(self):
+        self.configure_slots()
+
+        def side_effect(slot_config, *args, **kwargs):
+            slot = slot_config["slot"]
+            if slot == "ai1":
+                return _response(proposals=[_proposal(conditions={"vol_mult": 1.10})])
+            return _response(proposals=[_proposal(conditions={"vol_mult": 1.02})])
+
+        with mock.patch.object(self, "_accounts", return_value=[{
+            "account_id": ACCOUNT, "weights": dict(BASE_WEIGHTS), "conditions": {"vol_mult": 1.0}
+        }]):
+            with self.stub(side_effect):
+                res = self.run_review()
+
+        self.assertEqual(S.OUTCOME_NO_CONSENSUS, res["status"])
+        detail = res.get("outcome_detail")
+        self.assertIn(S.DISAGREEMENT_CONDITION_MAGNITUDE_MISMATCH, detail["disagreement_codes"])
+        issue = next(i for i in detail["issues"] if i["code"] == S.DISAGREEMENT_CONDITION_MAGNITUDE_MISMATCH)
+        self.assertEqual(ACCOUNT, issue["account_id"])
+        self.assertEqual("conditions.vol_mult", issue["field"])
+        self.assertAlmostEqual(0.20, issue["ratio"])
+        self.assertEqual(0.50, issue["required_ratio"])
+
+    def test_t72_unknown_factor(self):
+        self.configure_slots()
+
+        def side_effect(slot_config, *args, **kwargs):
+            slot = slot_config["slot"]
+            if slot == "ai1":
+                return _response(proposals=[_proposal(weights={"mom": 0.5, "sentiment": 0.5, "zeta": 0.1, "alpha": 0.1})])
+            return _response(proposals=[_proposal()])
+
+        with self.stub(side_effect):
+            res = self.run_review()
+
+        self.assertEqual(S.OUTCOME_NO_CONSENSUS, res["status"])
+        detail = res.get("outcome_detail")
+        self.assertEqual([S.DISAGREEMENT_UNKNOWN_FACTOR], detail["disagreement_codes"])
+        issue = detail["issues"][0]
+        self.assertEqual(S.DISAGREEMENT_UNKNOWN_FACTOR, issue["code"])
+        self.assertEqual(ACCOUNT, issue["account_id"])
+        self.assertEqual(["alpha", "zeta"], issue["ai1_unknown"])
+        self.assertEqual([], issue["ai2_unknown"])
+
+    def test_t73_normalized_weight_step_exceeded(self):
+        self.configure_slots()
+        base_w = {"mom": 0.10, "sentiment": 0.90}
+
+        def side_effect(slot_config, *args, **kwargs):
+            return _response(proposals=[{
+                "account_id": ACCOUNT, "reason": "step-test", "confidence": 85,
+                "weights": {"mom": 0.13, "sentiment": 0.50},
+                "entry_score_delta": 0.0, "conditions": {},
+            }])
+
+        with mock.patch.object(self, "_accounts", return_value=[{
+            "account_id": ACCOUNT, "weights": base_w, "conditions": {}
+        }]):
+            with self.stub(side_effect):
+                res = self.run_review()
+
+        self.assertEqual(S.OUTCOME_NO_CONSENSUS, res["status"])
+        detail = res.get("outcome_detail")
+        self.assertIn(S.DISAGREEMENT_NORMALIZED_WEIGHT_STEP_EXCEEDED, detail["disagreement_codes"])
+        issue = next(i for i in detail["issues"] if i["code"] == S.DISAGREEMENT_NORMALIZED_WEIGHT_STEP_EXCEEDED)
+        self.assertEqual(ACCOUNT, issue["account_id"])
+        self.assertEqual(0.03, issue["max_step"])
+        self.assertIn("weights.mom", issue.get("affected_fields", []))
+
+    def test_t74_multi_account_multi_issue_no_truncation(self):
+        accounts = [
+            {"account_id": f"acc_{i}", "weights": {"f1": 0.5, "f2": 0.5}, "conditions": {"c1": 1.0}}
+            for i in range(1, 8)
+        ]
+        self.configure_slots()
+
+        def side_effect(slot_config, *args, **kwargs):
+            slot = slot_config["slot"]
+            props = [
+                # acc_1: weight direction mismatch
+                {
+                    "account_id": "acc_1", "confidence": 85,
+                    "weights": {"f1": 0.53, "f2": 0.50} if slot == "ai1" else {"f1": 0.47, "f2": 0.50},
+                    "entry_score_delta": 0.0, "conditions": {"c1": 1.0},
+                },
+                # acc_2: confidence below threshold
+                {
+                    "account_id": "acc_2", "confidence": 60 if slot == "ai1" else 85,
+                    "weights": {"f1": 0.50, "f2": 0.50},
+                    "entry_score_delta": 0.0, "conditions": {"c1": 1.0},
+                },
+                # acc_3: unknown factor
+                {
+                    "account_id": "acc_3", "confidence": 85,
+                    "weights": {"f1": 0.5, "f2": 0.5, "f_extra": 0.1} if slot == "ai1" else {"f1": 0.5, "f2": 0.5},
+                    "entry_score_delta": 0.0, "conditions": {"c1": 1.0},
+                },
+                # acc_4: weight magnitude mismatch
+                {
+                    "account_id": "acc_4", "confidence": 85,
+                    "weights": {"f1": 0.53, "f2": 0.50} if slot == "ai1" else {"f1": 0.51, "f2": 0.50},
+                    "entry_score_delta": 0.0, "conditions": {"c1": 1.0},
+                },
+                # acc_5: entry direction mismatch
+                {
+                    "account_id": "acc_5", "confidence": 85,
+                    "weights": {"f1": 0.50, "f2": 0.50},
+                    "entry_score_delta": 0.003 if slot == "ai1" else -0.003,
+                    "conditions": {"c1": 1.0},
+                },
+                # acc_6: condition direction mismatch
+                {
+                    "account_id": "acc_6", "confidence": 85,
+                    "weights": {"f1": 0.50, "f2": 0.50},
+                    "entry_score_delta": 0.0,
+                    "conditions": {"c1": 1.05} if slot == "ai1" else {"c1": 0.95},
+                },
+                # acc_7: condition magnitude mismatch
+                {
+                    "account_id": "acc_7", "confidence": 85,
+                    "weights": {"f1": 0.50, "f2": 0.50},
+                    "entry_score_delta": 0.0,
+                    "conditions": {"c1": 1.10} if slot == "ai1" else {"c1": 1.02},
+                },
+            ]
+            return _response(proposals=props)
+
+        with mock.patch.object(self, "_accounts", return_value=accounts):
+            with self.stub(side_effect):
+                res = self.run_review()
+
+        self.assertEqual(S.OUTCOME_NO_CONSENSUS, res["status"])
+        detail = res.get("outcome_detail")
+        self.assertIsNotNone(detail)
+        # Reason has human truncation (semicolon delimited at most 5 items)
+        self.assertLessEqual(len(res["reason"].split("; ")), 5)
+        # Machine issues must NOT be truncated, preserving all 7 issues
+        self.assertEqual(7, len(detail["issues"]))
+        # disagreement_codes must be deduplicated and sorted
+        self.assertEqual(sorted(list(set(detail["disagreement_codes"]))), detail["disagreement_codes"])
+        self.assertGreaterEqual(len(detail["disagreement_codes"]), 5)
+
+    def test_t75_consensus_success(self):
+        self.configure_slots()
+        with self.stub(self.agreeing):
+            res = self.run_review()
+        self.assertEqual(S.OUTCOME_CONSENSUS, res["status"])
+        detail = res.get("outcome_detail")
+        self.assertIsNotNone(detail)
+        self.assertEqual(S.OUTCOME_CONSENSUS, detail["status"])
+        self.assertEqual({"ai1": "propose", "ai2": "propose"}, detail["decisions"])
+        self.assertEqual([], detail["disagreement_codes"])
+        self.assertEqual([], detail["issues"])
+
+    def test_t76_both_hold(self):
+        self.configure_slots()
+
+        def side_effect(slot_config, *args, **kwargs):
+            return _response(decision="hold", proposals=[])
+
+        with self.stub(side_effect):
+            res = self.run_review()
+        self.assertEqual(S.OUTCOME_BOTH_HOLD, res["status"])
+        detail = res.get("outcome_detail")
+        self.assertIsNotNone(detail)
+        self.assertEqual(S.OUTCOME_BOTH_HOLD, detail["status"])
+        self.assertEqual({"ai1": "hold", "ai2": "hold"}, detail["decisions"])
+        self.assertEqual([], detail["disagreement_codes"])
+        self.assertEqual([], detail["issues"])
+
+    def test_t77_reviewer_runtime_failure(self):
+        self.configure_slots()
+
+        def side_effect(slot_config, *args, **kwargs):
+            if slot_config["slot"] == "ai1":
+                raise RuntimeError("HTTP connection reset 500")
+            return _response(decision="propose", proposals=[_proposal()])
+
+        with self.stub(side_effect):
+            res = self.run_review()
+        self.assertEqual(S.OUTCOME_FAILED, res["status"])
+        detail = res.get("outcome_detail")
+        self.assertIsNotNone(detail)
+        self.assertEqual(S.OUTCOME_FAILED, detail["status"])
+        self.assertEqual([], detail["disagreement_codes"])
+        self.assertEqual([], detail["issues"])
+
+    def test_t78_audit_round_trip_and_historical_null(self):
+        self.configure_slots()
+
+        def side_effect(slot_config, *args, **kwargs):
+            if slot_config["slot"] == "ai1":
+                return _response(decision="hold", proposals=[])
+            return _response(decision="propose", proposals=[_proposal()])
+
+        with self.stub(side_effect):
+            res = self.run_review()
+        run_id = res["id"]
+        row = self.audit(run_id)
+        stored_json = row["outcome_detail"]
+        self.assertIsNotNone(stored_json)
+        stored = json.loads(stored_json)
+        self.assertEqual(res["outcome_detail"], stored)
+
+        with self.factory() as conn:
+            runs = S.recent_runs(conn, 5)
+        self.assertEqual(stored, runs[0]["outcome_detail"])
+
+        # Historical row with NULL outcome_detail
+        with self.factory() as conn:
+            conn.execute(
+                "INSERT INTO dual_ai_tuning_runs(trigger, mode, status, evidence_hash, evidence, created_at, finished_at, outcome_detail) "
+                "VALUES('hist', 'intraday', 'both_hold', 'h1', '{}', '2026-01-01', '2026-01-01', NULL)"
+            )
+            conn.commit()
+            hist_runs = S.recent_runs(conn, 5)
+        self.assertIsNone(hist_runs[0]["outcome_detail"])
+
+    def test_t79_reason_wording_independence(self):
+        self.configure_slots()
+
+        def side_effect(slot_config, *args, **kwargs):
+            if slot_config["slot"] == "ai1":
+                return _response(decision="hold", proposals=[])
+            return _response(decision="propose", proposals=[_proposal()])
+
+        with self.stub(side_effect):
+            res1 = self.run_review()
+
+        with mock.patch("ai_review_service._decision_disagreement_reason", return_value="自定义完全不同的人类文案"):
+            with self.stub(side_effect):
+                res2 = self.run_review()
+
+        self.assertEqual("自定义完全不同的人类文案", res2["reason"])
+        self.assertEqual(res1["outcome_detail"], res2["outcome_detail"])
+        self.assertEqual([S.DISAGREEMENT_DECISION_MISMATCH], res2["outcome_detail"]["disagreement_codes"])
+
+    def test_t80_taxonomy_does_not_drive_evolution(self):
+        import self_evolution as SE
+        with self.factory() as conn:
+            S.ensure_schema(conn)
+            SE.ensure_schema(conn)
+            SE.init_params(conn)
+            conn.execute(
+                "INSERT INTO dual_ai_tuning_runs(trigger, mode, status, evidence_hash, evidence, created_at, finished_at, outcome_detail) "
+                "VALUES('t', 'intraday', 'no_consensus', 'h1', '{}', '2026-01-01', '2026-01-01', ?)",
+                (json.dumps({"disagreement_codes": ["weight_direction_mismatch"]}),)
+            )
+            r1 = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+            SE.track_run(conn, r1, trigger="t", mode="intraday", status="no_consensus", applied=False)
+
+            metrics1 = SE.get_performance_metrics(conn, 20)
+            should1, reason1 = SE.should_evolve(conn)
+
+        with tempfile.TemporaryDirectory(prefix="t80-") as tmp2:
+            p2 = os.path.join(tmp2, "db.sqlite3")
+            conn2 = sqlite3.connect(p2)
+            conn2.row_factory = sqlite3.Row
+            S.ensure_schema(conn2)
+            SE.ensure_schema(conn2)
+            SE.init_params(conn2)
+            conn2.execute(
+                "INSERT INTO dual_ai_tuning_runs(trigger, mode, status, evidence_hash, evidence, created_at, finished_at, outcome_detail) "
+                "VALUES('t', 'intraday', 'no_consensus', 'h1', '{}', '2026-01-01', '2026-01-01', ?)",
+                (json.dumps({"disagreement_codes": ["confidence_below_threshold", "unknown_factor"]}),)
+            )
+            r2 = conn2.execute("SELECT last_insert_rowid()").fetchone()[0]
+            SE.track_run(conn2, r2, trigger="t", mode="intraday", status="no_consensus", applied=False)
+
+            metrics2 = SE.get_performance_metrics(conn2, 20)
+            should2, reason2 = SE.should_evolve(conn2)
+            conn2.close()
+
+        self.assertEqual(metrics1, metrics2)
+        self.assertEqual((should1, reason1), (should2, reason2))
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()
+

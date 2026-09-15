@@ -72,10 +72,11 @@ def _get_provider_config(conn, provider):
 def _check_consensus(mimo_proposals, deepseek_proposals, accounts_map, evolution=None,
                      evolution_by_account=None, labels=None):
     """历史入口：把两个提案列表适配成 ``{"ai1": …, "ai2": …}`` 后交给通用共识门禁。"""
-    return _S._check_consensus(
+    res = _S._check_consensus(
         {"ai1": mimo_proposals, "ai2": deepseek_proposals}, accounts_map,
         evolution=evolution, evolution_by_account=evolution_by_account, labels=labels,
     )
+    return res[0], res[1], res[2]
 
 
 def _build_tuning_system_prompt():

@@ -108,6 +108,38 @@ VALID_REVIEWER_DECISIONS = ("hold", "propose")
 
 
 AI_REVIEW_VERSION = "ai-review-v1"
+OUTCOME_DETAIL_SCHEMA_VERSION = "dual-review-outcome-v1"
+
+# ─── Disagreement Taxonomy (Machine Codes) ───
+DISAGREEMENT_DECISION_MISMATCH = "decision_mismatch"
+DISAGREEMENT_PROPOSAL_ACCOUNT_MISSING = "proposal_account_missing"
+DISAGREEMENT_ACCOUNT_SCOPE_MISMATCH = "account_scope_mismatch"
+DISAGREEMENT_CONFIDENCE_BELOW_THRESHOLD = "confidence_below_threshold"
+DISAGREEMENT_WEIGHT_FORMAT_INVALID = "weight_format_invalid"
+DISAGREEMENT_UNKNOWN_FACTOR = "unknown_factor"
+DISAGREEMENT_WEIGHT_DIRECTION_MISMATCH = "weight_direction_mismatch"
+DISAGREEMENT_WEIGHT_MAGNITUDE_MISMATCH = "weight_magnitude_mismatch"
+DISAGREEMENT_ENTRY_DIRECTION_MISMATCH = "entry_direction_mismatch"
+DISAGREEMENT_CONDITION_DIRECTION_MISMATCH = "condition_direction_mismatch"
+DISAGREEMENT_CONDITION_MAGNITUDE_MISMATCH = "condition_magnitude_mismatch"
+DISAGREEMENT_NORMALIZED_WEIGHT_STEP_EXCEEDED = "normalized_weight_step_exceeded"
+DISAGREEMENT_NO_MERGEABLE_PROPOSAL = "no_mergeable_proposal"
+
+DISAGREEMENT_CODES = (
+    DISAGREEMENT_DECISION_MISMATCH,
+    DISAGREEMENT_PROPOSAL_ACCOUNT_MISSING,
+    DISAGREEMENT_ACCOUNT_SCOPE_MISMATCH,
+    DISAGREEMENT_CONFIDENCE_BELOW_THRESHOLD,
+    DISAGREEMENT_WEIGHT_FORMAT_INVALID,
+    DISAGREEMENT_UNKNOWN_FACTOR,
+    DISAGREEMENT_WEIGHT_DIRECTION_MISMATCH,
+    DISAGREEMENT_WEIGHT_MAGNITUDE_MISMATCH,
+    DISAGREEMENT_ENTRY_DIRECTION_MISMATCH,
+    DISAGREEMENT_CONDITION_DIRECTION_MISMATCH,
+    DISAGREEMENT_CONDITION_MAGNITUDE_MISMATCH,
+    DISAGREEMENT_NORMALIZED_WEIGHT_STEP_EXCEEDED,
+    DISAGREEMENT_NO_MERGEABLE_PROPOSAL,
+)
 
 # ─── 字段边界 ───
 MAX_API_KEY_LENGTH = 200
@@ -156,6 +188,7 @@ _AUDIT_EXTRA_COLUMNS = {
     "result_mode": "TEXT",
     "config_snapshot": "TEXT",
     "reviewers": "TEXT",
+    "outcome_detail": "TEXT",
 }
 
 
@@ -346,7 +379,8 @@ def ensure_schema(conn):
             review_mode TEXT,
             result_mode TEXT,
             config_snapshot TEXT,
-            reviewers TEXT
+            reviewers TEXT,
+            outcome_detail TEXT
         );
         CREATE INDEX IF NOT EXISTS idx_dual_ai_runs_recent
             ON dual_ai_tuning_runs(id DESC);
@@ -849,6 +883,45 @@ def _build_tuning_user_prompt(evidence, accounts, mode):
 # 共识门禁（槽位无关）
 # ─────────────────────────────────────────────────────────────────────────────
 
+def build_outcome_detail(status, decisions, issues=None):
+    """构造稳定、结构化、版本化的 outcome_detail 字典。
+
+    所有 status 均返回统一的基础五字段：
+    - schema_version
+    - status
+    - decisions: {"ai1": ..., "ai2": ...}
+    - disagreement_codes (仅 no_consensus 时非空，去重且稳定排序)
+    - issues (仅 no_consensus 时非空，完整保留无截断)
+    """
+    if isinstance(decisions, dict):
+        d_map = {"ai1": decisions.get("ai1"), "ai2": decisions.get("ai2")}
+    elif isinstance(decisions, (list, tuple)):
+        d_map = {
+            "ai1": decisions[0] if len(decisions) > 0 else None,
+            "ai2": decisions[1] if len(decisions) > 1 else None,
+        }
+    else:
+        d_map = {"ai1": None, "ai2": None}
+
+    if status == OUTCOME_NO_CONSENSUS:
+        raw_issues = list(issues or [])
+        if not raw_issues:
+            raw_issues = [{"code": DISAGREEMENT_NO_MERGEABLE_PROPOSAL}]
+        codes = sorted(list({str(i["code"]) for i in raw_issues if isinstance(i, dict) and "code" in i}))
+        clean_issues = raw_issues
+    else:
+        codes = []
+        clean_issues = []
+
+    return {
+        "schema_version": OUTCOME_DETAIL_SCHEMA_VERSION,
+        "status": status,
+        "decisions": d_map,
+        "disagreement_codes": codes,
+        "issues": clean_issues,
+    }
+
+
 def _check_consensus(proposals_by_slot, accounts_map, evolution=None,
                      evolution_by_account=None, labels=None):
     """检查两个槽位的提案是否达成共识。
@@ -860,7 +933,7 @@ def _check_consensus(proposals_by_slot, accounts_map, evolution=None,
     4. 入场阈值调整方向一致；
     5. 双方置信度均 >= 70。
 
-    返回 ``(consensus: bool, reason: str, merged: list)``。
+    返回 ``(consensus: bool, reason: str, merged: list, issues: list)``。
     """
     evolution = evolution or {}
     labels = labels or {}
@@ -871,7 +944,7 @@ def _check_consensus(proposals_by_slot, accounts_map, evolution=None,
 
     max_proposals = max(1, int(_num(evolution.get("max_proposals_per_run"), 3)))
     if not left_proposals or not right_proposals:
-        return False, "至少一个AI未提出有效提案", []
+        return False, "至少一个AI未提出有效提案", [], [{"code": DISAGREEMENT_PROPOSAL_ACCOUNT_MISSING}]
 
     left_map = {}
     for p in left_proposals:
@@ -886,11 +959,26 @@ def _check_consensus(proposals_by_slot, accounts_map, evolution=None,
 
     common_accounts = set(left_map.keys()) & set(right_map.keys())
     if not common_accounts:
+        if not left_map or not right_map:
+            return False, "至少一个AI未提出有效提案", [], [{"code": DISAGREEMENT_PROPOSAL_ACCOUNT_MISSING}]
         return False, ("两个AI针对不同账户提出提案（%s:%s, %s:%s）" % (
-            left_label, list(left_map.keys()), right_label, list(right_map.keys()))), []
+            left_label, list(left_map.keys()), right_label, list(right_map.keys()))), [], [{
+                "code": DISAGREEMENT_ACCOUNT_SCOPE_MISMATCH,
+                "ai1_accounts": sorted(list(left_map.keys())),
+                "ai2_accounts": sorted(list(right_map.keys())),
+                "common_accounts": sorted(list(common_accounts)),
+            }]
 
     merged = []
     disagreements = []
+    issues = []
+
+    missing_account_proposals = any(
+        not str(p.get("account_id", "")).strip() for p in left_proposals + right_proposals
+    )
+    if missing_account_proposals:
+        issues.append({"code": DISAGREEMENT_PROPOSAL_ACCOUNT_MISSING})
+        disagreements.append("提案缺少有效账户ID")
 
     for account_id in sorted(common_accounts):
         lp = left_map[account_id]
@@ -917,6 +1005,13 @@ def _check_consensus(proposals_by_slot, accounts_map, evolution=None,
             disagreements.append(
                 "[%s] 置信度不足：%s=%.0f，%s=%.0f（要求均≥%.0f）" % (
                     account_id, left_label, l_conf, right_label, r_conf, CONSENSUS_MIN_CONFIDENCE))
+            issues.append({
+                "code": DISAGREEMENT_CONFIDENCE_BELOW_THRESHOLD,
+                "account_id": account_id,
+                "ai1_confidence": l_conf,
+                "ai2_confidence": r_conf,
+                "threshold": CONSENSUS_MIN_CONFIDENCE,
+            })
             continue
 
         lw = lp.get("weights") or {}
@@ -925,6 +1020,10 @@ def _check_consensus(proposals_by_slot, accounts_map, evolution=None,
         if (not isinstance(lw, dict) or not isinstance(rw, dict)
                 or not isinstance(base_weights, dict) or not base_weights):
             disagreements.append("[%s] 权重格式无效" % account_id)
+            issues.append({
+                "code": DISAGREEMENT_WEIGHT_FORMAT_INVALID,
+                "account_id": account_id,
+            })
             continue
         unknown_left = sorted(set(lw) - set(base_weights))
         unknown_right = sorted(set(rw) - set(base_weights))
@@ -933,8 +1032,14 @@ def _check_consensus(proposals_by_slot, accounts_map, evolution=None,
             # 并泄漏进影子账本。
             disagreements.append("[%s] 未知因子拒绝：%s=%s, %s=%s" % (
                 account_id, left_label, unknown_left, right_label, unknown_right))
+            issues.append({
+                "code": DISAGREEMENT_UNKNOWN_FACTOR,
+                "account_id": account_id,
+                "ai1_unknown": sorted(list(unknown_left)),
+                "ai2_unknown": sorted(list(unknown_right)),
+            })
             continue
-        all_factors = set(list(base_weights.keys()) + list(lw.keys()) + list(rw.keys()))
+        all_factors = sorted(list(set(list(base_weights.keys()) + list(lw.keys()) + list(rw.keys()))))
 
         weight_consensus = True
         weight_details = {}
@@ -949,6 +1054,16 @@ def _check_consensus(proposals_by_slot, accounts_map, evolution=None,
                 weight_consensus = False
                 disagreements.append("[%s] %s: %s=%+.4f vs %s=%+.4f 方向相反" % (
                     account_id, factor, left_label, l_delta, right_label, r_delta))
+                issues.append({
+                    "code": DISAGREEMENT_WEIGHT_DIRECTION_MISMATCH,
+                    "account_id": account_id,
+                    "field": "weights.%s" % factor,
+                    "ai1_delta": round(l_delta, 6),
+                    "ai2_delta": round(r_delta, 6),
+                    "left": round(l_delta, 6),
+                    "right": round(r_delta, 6),
+                    "threshold": CONSENSUS_WEIGHT_DIRECTION_THRESHOLD,
+                })
                 continue
 
             if abs(l_delta) > 0.005 and abs(r_delta) > 0.005:
@@ -957,6 +1072,15 @@ def _check_consensus(proposals_by_slot, accounts_map, evolution=None,
                     weight_consensus = False
                     disagreements.append("[%s] %s: 幅度比=%.2f < %s" % (
                         account_id, factor, ratio, weight_magnitude_ratio))
+                    issues.append({
+                        "code": DISAGREEMENT_WEIGHT_MAGNITUDE_MISMATCH,
+                        "account_id": account_id,
+                        "field": "weights.%s" % factor,
+                        "ai1_delta": round(l_delta, 6),
+                        "ai2_delta": round(r_delta, 6),
+                        "ratio": round(ratio, 4),
+                        "required_ratio": weight_magnitude_ratio,
+                    })
                     continue
 
             weight_details[factor] = round((l_val + r_val) / 2, 6)
@@ -970,6 +1094,14 @@ def _check_consensus(proposals_by_slot, accounts_map, evolution=None,
                 delta_consensus = False
                 disagreements.append("[%s] 入场阈值: %s=%+.4f vs %s=%+.4f 方向相反" % (
                     account_id, left_label, l_delta, right_label, r_delta))
+                issues.append({
+                    "code": DISAGREEMENT_ENTRY_DIRECTION_MISMATCH,
+                    "account_id": account_id,
+                    "field": "entry_score_delta",
+                    "ai1_delta": round(l_delta, 6),
+                    "ai2_delta": round(r_delta, 6),
+                    "threshold": CONSENSUS_DELTA_DIRECTION_THRESHOLD,
+                })
         merged_delta = round((l_delta + r_delta) / 2, 6)
 
         lc = lp.get("conditions") or {}
@@ -977,7 +1109,7 @@ def _check_consensus(proposals_by_slot, accounts_map, evolution=None,
         base_conditions = base.get("conditions") or {}
         condition_consensus = True
         merged_conditions = {}
-        for key in set(list(base_conditions.keys()) + list(lc.keys()) + list(rc.keys())):
+        for key in sorted(list(set(list(base_conditions.keys()) + list(lc.keys()) + list(rc.keys())))):
             if key == "enabled":
                 merged_conditions["enabled"] = base_conditions.get("enabled", {})
                 continue
@@ -990,11 +1122,27 @@ def _check_consensus(proposals_by_slot, accounts_map, evolution=None,
                 if l_delta_c * r_delta_c < 0:
                     condition_consensus = False
                     disagreements.append("[%s] 条件 %s: 方向相反" % (account_id, key))
+                    issues.append({
+                        "code": DISAGREEMENT_CONDITION_DIRECTION_MISMATCH,
+                        "account_id": account_id,
+                        "field": "conditions.%s" % key,
+                        "ai1_delta": round(l_delta_c, 6),
+                        "ai2_delta": round(r_delta_c, 6),
+                    })
                     continue
                 ratio = min(abs(l_delta_c), abs(r_delta_c)) / max(abs(l_delta_c), abs(r_delta_c))
                 if ratio < CONSENSUS_CONDITION_MAGNITUDE_RATIO:
                     condition_consensus = False
                     disagreements.append("[%s] 条件 %s: 幅度比=%.2f" % (account_id, key, ratio))
+                    issues.append({
+                        "code": DISAGREEMENT_CONDITION_MAGNITUDE_MISMATCH,
+                        "account_id": account_id,
+                        "field": "conditions.%s" % key,
+                        "ai1_delta": round(l_delta_c, 6),
+                        "ai2_delta": round(r_delta_c, 6),
+                        "ratio": round(ratio, 4),
+                        "required_ratio": CONSENSUS_CONDITION_MAGNITUDE_RATIO,
+                    })
                     continue
             merged_conditions[key] = round((l_val + r_val) / 2, 6)
 
@@ -1016,6 +1164,18 @@ def _check_consensus(proposals_by_slot, accounts_map, evolution=None,
                     for key in base_weights):
                 disagreements.append(
                     "[%s] 归一化后单因子权重变化超过±%.3f，拒绝共识" % (account_id, weight_step))
+                affected = sorted([
+                    key for key in base_weights
+                    if abs(_num(bounded_weights.get(key), 0.0) - _num(base_weights.get(key), 0.0)) > weight_step + 1e-6
+                ])
+                norm_issue = {
+                    "code": DISAGREEMENT_NORMALIZED_WEIGHT_STEP_EXCEEDED,
+                    "account_id": account_id,
+                    "max_step": weight_step,
+                }
+                if affected:
+                    norm_issue["affected_fields"] = ["weights.%s" % f for f in affected]
+                issues.append(norm_issue)
                 continue
             current_entry = _num(base.get("entry_score_delta"), merged_delta)
             merged_delta = round(
@@ -1038,13 +1198,15 @@ def _check_consensus(proposals_by_slot, accounts_map, evolution=None,
             })
 
     if disagreements:
-        return False, "分歧：" + "; ".join(disagreements[:5]), []
+        return False, "分歧：" + "; ".join(disagreements[:5]), [], issues
 
     if not merged:
-        return False, "无有效共识提案", []
+        if not issues:
+            issues = [{"code": DISAGREEMENT_NO_MERGEABLE_PROPOSAL}]
+        return False, "无有效共识提案", [], issues
 
     merged = merged[:max_proposals]
-    return True, "双AI对 %d 个账户达成共识" % len(merged), merged
+    return True, "双AI对 %d 个账户达成共识" % len(merged), merged, []
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1286,7 +1448,7 @@ def _evolution_bounds(connect_factory, accounts_map):
 
 def _base_outcome(result_mode, review_mode, status, reviewers, consensus, reason,
                   proposals, run_id, total_latency, evidence_hash, config_snapshot,
-                  single_reviewer_slot=None):
+                  single_reviewer_slot=None, outcome_detail=None):
     return {
         "id": run_id,
         "version": AI_REVIEW_VERSION,
@@ -1301,13 +1463,14 @@ def _base_outcome(result_mode, review_mode, status, reviewers, consensus, reason
         "single_reviewer_slot": single_reviewer_slot,
         "total_latency_ms": total_latency,
         "evidence_hash": evidence_hash,
+        "outcome_detail": outcome_detail,
     }
 
 
 def _write_audit(connect_factory, trigger, mode, status, review_mode, result_mode,
                  profile, evidence, evidence_hash, config_snapshot, reviewers,
                  consensus, reason, audit_merged, started_at, started,
-                 total_latency_ms=None, track_evolution=False):
+                 total_latency_ms=None, track_evolution=False, outcome_detail=None):
     """写入审计行（沿用历史表与列语义），必要时接线进化追踪。"""
     finished_at = _now()
     total_latency = (total_latency_ms if total_latency_ms is not None
@@ -1323,8 +1486,8 @@ def _write_audit(connect_factory, trigger, mode, status, review_mode, result_mod
                 deepseek_status, deepseek_model, deepseek_response, deepseek_proposals, deepseek_latency_ms, deepseek_error,
                 consensus_result, consensus_reason, merged_proposals, applied_ids,
                 evidence_hash, evidence, total_latency_ms, created_at, finished_at,
-                review_mode, result_mode, config_snapshot, reviewers
-            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                review_mode, result_mode, config_snapshot, reviewers, outcome_detail
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 str(trigger)[:80], mode, status,
                 profile.get("profile_date"), profile.get("regime"),
@@ -1349,6 +1512,7 @@ def _write_audit(connect_factory, trigger, mode, status, review_mode, result_mod
                 total_latency, started_at, finished_at,
                 review_mode, result_mode,
                 _json(config_snapshot), _json(reviewers),
+                _json(outcome_detail) if outcome_detail is not None else None,
             ),
         )
         run_id = cursor.lastrowid
@@ -1437,17 +1601,18 @@ def run_ai_review(connect_factory, paper_db_path, snapshot_paths, evidence_colle
 
 
 def _context_audit(context, result_mode, status, reviewers, consensus, reason,
-                   audit_merged, proposals, track_evolution):
+                   audit_merged, proposals, track_evolution, outcome_detail=None):
     run_id, total_latency = _write_audit(
         context["connect_factory"], context["trigger"], context["mode"], status,
         context["review_mode"], result_mode, context["profile"], context["evidence"],
         context["evidence_hash"], context["config_snapshot"], reviewers, consensus,
         reason, audit_merged, context["started_at"], context["started"],
-        track_evolution=track_evolution,
+        track_evolution=track_evolution, outcome_detail=outcome_detail,
     )
     return _base_outcome(
         result_mode, context["review_mode"], status, reviewers, consensus, reason,
         proposals, run_id, total_latency, context["evidence_hash"], context["config_snapshot"],
+        outcome_detail=outcome_detail,
     )
 
 
@@ -1460,17 +1625,21 @@ def _run_single_review(context, slot):
 
     if not str(cfg["api_key"]).strip():
         reviewers[slot] = _empty_reviewer(slot, cfg, "not_configured")
+        status = "single_slot_not_configured"
+        outcome_detail = build_outcome_detail(status, {"ai1": None, "ai2": None}, [])
         return _context_audit(
-            context, MODE_SINGLE_REVIEW, "single_slot_not_configured", reviewers, False,
+            context, MODE_SINGLE_REVIEW, status, reviewers, False,
             "%s 未配置 API Key，单AI审阅按 fail-closed 终止" % labels[slot],
-            None, [], track_evolution=False,
+            None, [], track_evolution=False, outcome_detail=outcome_detail,
         )
     if not cfg["enabled"]:
         reviewers[slot] = _empty_reviewer(slot, cfg, "disabled")
+        status = "single_slot_disabled"
+        outcome_detail = build_outcome_detail(status, {"ai1": None, "ai2": None}, [])
         return _context_audit(
-            context, MODE_SINGLE_REVIEW, "single_slot_disabled", reviewers, False,
+            context, MODE_SINGLE_REVIEW, status, reviewers, False,
             "%s 已禁用，单AI审阅按 fail-closed 终止" % labels[slot],
-            None, [], track_evolution=False,
+            None, [], track_evolution=False, outcome_detail=outcome_detail,
         )
 
     system_prompt = _build_tuning_system_prompt()
@@ -1478,17 +1647,25 @@ def _run_single_review(context, slot):
     reviewers[slot] = _call_reviewer(slot, cfg, system_prompt, user_prompt)
     result = reviewers[slot]
     if result["status"] != "completed":
+        status = "single_review_failed"
+        outcome_detail = build_outcome_detail(status, {"ai1": None, "ai2": None}, [])
         return _context_audit(
-            context, MODE_SINGLE_REVIEW, "single_review_failed", reviewers, False,
+            context, MODE_SINGLE_REVIEW, status, reviewers, False,
             "%s 调用失败：%s" % (labels[slot], result.get("error")),
-            None, [], track_evolution=False,
+            None, [], track_evolution=False, outcome_detail=outcome_detail,
         )
 
     proposals = list(result.get("proposals") or [])
     reason = "单AI审阅（%s）完成，仅供参考；单AI结果不构成共识，不会进入应用门禁" % labels[slot]
+    status = "single_review"
+    outcome_detail = build_outcome_detail(
+        status,
+        {"ai1": reviewers["ai1"].get("decision"), "ai2": reviewers["ai2"].get("decision")},
+        [],
+    )
     outcome = _context_audit(
-        context, MODE_SINGLE_REVIEW, "single_review", reviewers, False, reason,
-        None, proposals, track_evolution=False,
+        context, MODE_SINGLE_REVIEW, status, reviewers, False, reason,
+        None, proposals, track_evolution=False, outcome_detail=outcome_detail,
     )
     outcome["single_reviewer_slot"] = slot
     return outcome
@@ -1504,18 +1681,22 @@ def _run_dual_review(context):
         cfg = slot_configs[slot]
         if not str(cfg["api_key"]).strip():
             reviewers[slot] = _empty_reviewer(slot, cfg, "not_configured")
+            status = "%s_not_configured" % slot
+            outcome_detail = build_outcome_detail(status, {"ai1": None, "ai2": None}, [])
             return _context_audit(
-                context, MODE_DUAL_REVIEW, "%s_not_configured" % slot, reviewers, False,
+                context, MODE_DUAL_REVIEW, status, reviewers, False,
                 "%s API Key 未配置，双AI共识按 fail-closed 终止（不降级为单AI）" % labels[slot],
-                None, [], track_evolution=False,
+                None, [], track_evolution=False, outcome_detail=outcome_detail,
             )
     for slot in AI_SLOTS:
         if not slot_configs[slot]["enabled"]:
             reviewers[slot] = _empty_reviewer(slot, slot_configs[slot], "disabled")
+            status = "%s_disabled" % slot
+            outcome_detail = build_outcome_detail(status, {"ai1": None, "ai2": None}, [])
             return _context_audit(
-                context, MODE_DUAL_REVIEW, "%s_disabled" % slot, reviewers, False,
+                context, MODE_DUAL_REVIEW, status, reviewers, False,
                 "%s 已禁用，双AI共识按 fail-closed 终止（不降级为单AI）" % labels[slot],
-                None, [], track_evolution=False,
+                None, [], track_evolution=False, outcome_detail=outcome_detail,
             )
 
     system_prompt = _build_tuning_system_prompt()
@@ -1544,6 +1725,7 @@ def _run_dual_review(context):
 
     consensus = False
     merged = []
+    issues = []
     if not both_ok:
         # 运行失败 ≠ 意见不一致：这里一律是系统故障（failed）。
         reason = _reviewer_failure_reason(reviewers)
@@ -1552,20 +1734,26 @@ def _run_dual_review(context):
     elif decisions == ["propose", "propose"]:
         evolution, evolution_by_account = _evolution_bounds(
             context["connect_factory"], context["accounts_map"])
-        consensus, reason, merged = _check_consensus(
+        consensus, reason, merged, issues = _check_consensus(
             {"ai1": left["proposals"], "ai2": right["proposals"]},
             context["accounts_map"], evolution=evolution,
             evolution_by_account=evolution_by_account, labels=labels,
         )
     else:
         reason = _decision_disagreement_reason(decisions)
+        issues = [{
+            "code": DISAGREEMENT_DECISION_MISMATCH,
+            "left": decisions[0] if len(decisions) > 0 else None,
+            "right": decisions[1] if len(decisions) > 1 else None,
+        }]
 
     status = classify_dual_review_outcome(reviewers, decisions, consensus, merged)
+    outcome_detail = build_outcome_detail(status, decisions, issues)
     # 状态机保证：merged 非空只可能出现在 consensus 分支（_check_consensus 的
     # 成功返回必然带非空合并且已由分类函数复核），因此这里无需再清洗一次。
     return _context_audit(
         context, MODE_DUAL_REVIEW, status, reviewers, consensus, reason,
-        merged, merged, track_evolution=True,
+        merged, merged, track_evolution=True, outcome_detail=outcome_detail,
     )
 
 
@@ -1582,7 +1770,8 @@ def recent_runs(conn, limit=20):
                   deepseek_status, deepseek_model, deepseek_latency_ms, deepseek_error,
                   consensus_result, consensus_reason, merged_proposals,
                   total_latency_ms, created_at, finished_at, applied_ids,
-                  review_mode, result_mode, config_snapshot, reviewers
+                  review_mode, result_mode, config_snapshot, reviewers,
+                  outcome_detail
            FROM dual_ai_tuning_runs ORDER BY id DESC LIMIT ?""",
         (limit,),
     ).fetchall()
@@ -1596,6 +1785,8 @@ def recent_runs(conn, limit=20):
         right = stored_reviewers.get("ai2") or {
             "status": row[10], "model": row[11], "latency_ms": row[12], "error": row[13]}
         merged = _loads(row[16], [])
+        raw_detail = row[25] if len(row) > 25 else None
+        outcome_detail = _loads(raw_detail, None) if raw_detail is not None else None
         result.append({
             "id": row[0], "trigger": row[1], "mode": row[2], "status": row[3],
             "profile_date": row[4], "market_regime": row[5],
@@ -1610,6 +1801,7 @@ def recent_runs(conn, limit=20):
             "merged_proposals": merged, "proposals": merged,
             "total_latency_ms": row[17], "created_at": row[18], "finished_at": row[19],
             "applied_ids": _loads(row[20], None),
+            "outcome_detail": outcome_detail,
         })
     return result
 
