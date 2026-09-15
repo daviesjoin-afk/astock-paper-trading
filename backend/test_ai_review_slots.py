@@ -2103,6 +2103,122 @@ class DisagreementTaxonomyTests(AiReviewSlotTestBase):
         self.assertEqual(metrics1, metrics2)
         self.assertEqual((should1, reason1), (should2, reason2))
 
+    def test_t81_null_account_id_is_missing_not_a_bogus_account(self):
+        """``account_id: null`` 不得被 ``str(None)`` 伪装成合法账户名 ``"None"``。
+
+        回归：修复前 ``str(None)`` == ``"None"``（真值）会被当成有效账户进 map，
+        于是两侧落在不同键上，机器读到的是 ``account_scope_mismatch``，
+        真正的 ``proposal_account_missing`` 被吞掉。
+        """
+        self.configure_slots()
+
+        def side_effect(slot_config, *args, **kwargs):
+            p = _proposal()
+            if slot_config["slot"] == "ai1":
+                p["account_id"] = None
+            return _response(proposals=[p])
+
+        with self.stub(side_effect):
+            res = self.run_review()
+
+        self.assertEqual(S.OUTCOME_NO_CONSENSUS, res["status"])
+        self.assertFalse(res["consensus"])
+        detail = res.get("outcome_detail")
+        self.assertEqual([S.DISAGREEMENT_PROPOSAL_ACCOUNT_MISSING], detail["disagreement_codes"])
+        self.assertEqual([S.DISAGREEMENT_PROPOSAL_ACCOUNT_MISSING],
+                         [i["code"] for i in detail["issues"]])
+        self.assertNotIn(S.DISAGREEMENT_ACCOUNT_SCOPE_MISMATCH, detail["disagreement_codes"])
+        self.assertNotIn("None", [i.get("ai1_accounts") for i in detail["issues"]])
+
+    def test_t82_malformed_weights_payload_is_invalid_not_silently_empty(self):
+        """``weights: []`` 必须判为格式无效，绝不能回退成 ``{}`` 后合并出假共识。
+
+        回归：修复前 ``[] or {}`` == ``{}``，通过 isinstance(float) 检查，
+        两侧都被洗白成"无权重调整"，最终被判为 consensus。
+        """
+        self.configure_slots()
+
+        def side_effect(slot_config, *args, **kwargs):
+            p = _proposal()
+            p["weights"] = []
+            return _response(proposals=[p])
+
+        with self.stub(side_effect):
+            res = self.run_review()
+
+        self.assertEqual(S.OUTCOME_NO_CONSENSUS, res["status"])
+        self.assertFalse(res["consensus"])
+        self.assertEqual([], res.get("proposals") or [])
+        detail = res.get("outcome_detail")
+        self.assertEqual([S.DISAGREEMENT_WEIGHT_FORMAT_INVALID], detail["disagreement_codes"])
+        issue = detail["issues"][0]
+        self.assertEqual(S.DISAGREEMENT_WEIGHT_FORMAT_INVALID, issue["code"])
+        self.assertEqual(ACCOUNT, issue["account_id"])
+
+    def test_t83_low_confidence_does_not_truncate_other_issues(self):
+        """置信度不足只否决合并，不裁剪证据：同账户的权重/入场分歧仍须全部采集。
+
+        回归：修复前置信度分支 ``continue``，该账户剩余的权重方向、幅度、
+        入场、条件检查全部跳过，机器可见 issue 被人为截短成 1 条。
+        """
+        self.configure_slots()
+
+        def side_effect(slot_config, *args, **kwargs):
+            slot = slot_config["slot"]
+            if slot == "ai1":
+                return _response(confidence=60.0, proposals=[_proposal(
+                    confidence=60.0,
+                    weights={"mom": 0.53, "sentiment": 0.47},
+                    entry_score_delta=0.003,
+                )])
+            return _response(confidence=60.0, proposals=[_proposal(
+                confidence=60.0,
+                weights={"mom": 0.47, "sentiment": 0.53},
+                entry_score_delta=-0.003,
+            )])
+
+        with self.stub(side_effect):
+            res = self.run_review()
+
+        self.assertEqual(S.OUTCOME_NO_CONSENSUS, res["status"])
+        self.assertFalse(res["consensus"])
+        detail = res.get("outcome_detail")
+        codes = [i["code"] for i in detail["issues"]]
+        # 人类可读理由允许截断，机器 issue 不允许
+        self.assertLessEqual(len(res["reason"].split("; ")), 5)
+        self.assertIn(S.DISAGREEMENT_CONFIDENCE_BELOW_THRESHOLD, codes)
+        self.assertEqual(2, codes.count(S.DISAGREEMENT_WEIGHT_DIRECTION_MISMATCH))
+        self.assertIn(S.DISAGREEMENT_ENTRY_DIRECTION_MISMATCH, codes)
+        self.assertEqual(4, len(codes))
+        self.assertEqual(sorted(set(codes)), detail["disagreement_codes"])
+        # 该账户权重方向相反，无论如何都不允许出现在合并结果里
+        self.assertEqual([], res.get("proposals") or [])
+
+    def test_t84_low_confidence_never_yields_a_merged_proposal(self):
+        """置信度不足（其余条件全部一致）时 merged 必须为空。
+
+        ``_check_consensus`` 只要 ``disagreements`` 非空就返回 ``consensus=False``，
+        因此"漏掉置信度条件"不会改变 status；但合并门禁若不同时要求置信度，
+        ``merged`` 仍会被填上 —— 状态是 no_consensus，审计行 ``merged_proposals``
+        却记下了一笔"已合并提案"，与"merged 非空只可能出现在 consensus"的不变式冲突。
+        """
+        self.configure_slots()
+
+        def side_effect(slot_config, *args, **kwargs):
+            conf = 65.0 if slot_config["slot"] == "ai1" else 82.0
+            return _response(confidence=conf, proposals=[_proposal(confidence=conf)])
+
+        with self.stub(side_effect):
+            res = self.run_review()
+
+        self.assertEqual(S.OUTCOME_NO_CONSENSUS, res["status"])
+        self.assertFalse(res["consensus"])
+        self.assertEqual([], res["proposals"])
+        self.assertEqual([S.DISAGREEMENT_CONFIDENCE_BELOW_THRESHOLD],
+                         res["outcome_detail"]["disagreement_codes"])
+        row = self.audit(res["id"])
+        self.assertIsNone(row["merged_proposals"])
+
 
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()

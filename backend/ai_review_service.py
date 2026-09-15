@@ -934,6 +934,9 @@ def _check_consensus(proposals_by_slot, accounts_map, evolution=None,
     5. 双方置信度均 >= 70。
 
     返回 ``(consensus: bool, reason: str, merged: list, issues: list)``。
+
+    ``reason`` 面向人，允许截断（只展示前几条）；``issues`` 面向机器，**永不截断**：
+    只要发现了分歧代码就全部记录，一次运行可跨多个账户累积多条。
     """
     evolution = evolution or {}
     labels = labels or {}
@@ -946,14 +949,26 @@ def _check_consensus(proposals_by_slot, accounts_map, evolution=None,
     if not left_proposals or not right_proposals:
         return False, "至少一个AI未提出有效提案", [], [{"code": DISAGREEMENT_PROPOSAL_ACCOUNT_MISSING}]
 
+    def _account_key(proposal):
+        """提取可用的账户键；无效（缺失/None/非字符串/纯空白）一律返回 ``None``。
+
+        绝不能用 ``str()`` 兜底：``str(None)`` 会得到**真值字符串** ``"None"``，
+        于是 ``account_id: null`` 会被伪装成一个合法账户并进入逐账户比对，
+        真正的 ``proposal_account_missing`` 分歧随之被吞掉。
+        """
+        raw = proposal.get("account_id")
+        if isinstance(raw, str) and raw.strip():
+            return raw
+        return None
+
     left_map = {}
     for p in left_proposals:
-        aid = str(p.get("account_id", ""))
+        aid = _account_key(p)
         if aid:
             left_map[aid] = p
     right_map = {}
     for p in right_proposals:
-        aid = str(p.get("account_id", ""))
+        aid = _account_key(p)
         if aid:
             right_map[aid] = p
 
@@ -974,7 +989,7 @@ def _check_consensus(proposals_by_slot, accounts_map, evolution=None,
     issues = []
 
     missing_account_proposals = any(
-        not str(p.get("account_id", "")).strip() for p in left_proposals + right_proposals
+        _account_key(p) is None for p in left_proposals + right_proposals
     )
     if missing_account_proposals:
         issues.append({"code": DISAGREEMENT_PROPOSAL_ACCOUNT_MISSING})
@@ -1001,7 +1016,11 @@ def _check_consensus(proposals_by_slot, accounts_map, evolution=None,
 
         l_conf = _norm_confidence(lp.get("confidence"))
         r_conf = _norm_confidence(rp.get("confidence"))
-        if l_conf < CONSENSUS_MIN_CONFIDENCE or r_conf < CONSENSUS_MIN_CONFIDENCE:
+        confidence_ok = (l_conf >= CONSENSUS_MIN_CONFIDENCE
+                         and r_conf >= CONSENSUS_MIN_CONFIDENCE)
+        if not confidence_ok:
+            # 置信度不足只否决**合并**，不截断**证据**：这个账户的权重/入场/条件
+            # 分歧仍要继续采集，否则机器读到的 issues 会被人为裁短。
             disagreements.append(
                 "[%s] 置信度不足：%s=%.0f，%s=%.0f（要求均≥%.0f）" % (
                     account_id, left_label, l_conf, right_label, r_conf, CONSENSUS_MIN_CONFIDENCE))
@@ -1012,11 +1031,19 @@ def _check_consensus(proposals_by_slot, accounts_map, evolution=None,
                 "ai2_confidence": r_conf,
                 "threshold": CONSENSUS_MIN_CONFIDENCE,
             })
-            continue
 
-        lw = lp.get("weights") or {}
-        rw = rp.get("weights") or {}
-        base_weights = base.get("weights") or {}
+        # 仅在"未提供"（None）时回退为空字典；``weights: []`` 之类的畸形载荷必须
+        # 原样保留，才能被下面的 isinstance 检查判成 weight_format_invalid，而不是
+        # 被 ``or {}`` 悄悄洗白成"无权重调整"后与另一侧合并出假共识。
+        lw = lp.get("weights")
+        if lw is None:
+            lw = {}
+        rw = rp.get("weights")
+        if rw is None:
+            rw = {}
+        base_weights = base.get("weights")
+        if base_weights is None:
+            base_weights = {}
         if (not isinstance(lw, dict) or not isinstance(rw, dict)
                 or not isinstance(base_weights, dict) or not base_weights):
             disagreements.append("[%s] 权重格式无效" % account_id)
@@ -1146,7 +1173,7 @@ def _check_consensus(proposals_by_slot, accounts_map, evolution=None,
                     continue
             merged_conditions[key] = round((l_val + r_val) / 2, 6)
 
-        if weight_consensus and delta_consensus and condition_consensus:
+        if confidence_ok and weight_consensus and delta_consensus and condition_consensus:
             bounded_weights = {}
             for factor, value in weight_details.items():
                 base_val = _num(base_weights.get(factor), value)
