@@ -563,6 +563,33 @@ class PolicyAndAuditTest(unittest.TestCase):
         )
         self.assertEqual(ST.STATUS_EXECUTABLE, next_day.status)
 
+    def test_p21c_t1_uses_the_resolved_entry_session_when_intended_is_omitted(self):
+        """``intended_entry_session`` 省略时，T+1 仍必须用**已解析的**入场 session。
+
+        契约显式允许只给带日期的入场证据。此时若把 ``None`` 传进 T+1 检查，
+        ``tradability_at`` 会整段跳过 T+1，于是"同日买、同日卖"被判成可执行。
+        """
+        same_day_evidence = evidence(session=SESSION, price=102.0, reference=100.0)
+        built = ST.build_executable_outcomes([
+            ST.SelectionRow(
+                sample_key="omitted-intended-entry", code=MAIN_BOARD, selected=True,
+                # 故意不传 intended_entry_session。
+                entry_evidence=same_day_evidence,
+                intended_exit_session=SESSION,
+                exit_evidence=same_day_evidence,
+                market_label_status="verified", market_label_value=0.2,
+            )
+        ])
+        outcome = built["outcomes"][0]
+        # 同日卖出违反 T+1 → 不得可执行，也不得有 executable return。
+        self.assertEqual(ST.STATUS_BLOCKED, outcome.exit_status)
+        self.assertEqual(ST.REASON_T1_NOT_SELLABLE, outcome.exit_reason)
+        self.assertFalse(outcome.executable)
+        self.assertIsNone(outcome.executable_return)
+        self.assertEqual(0, built["report"]["executable"])
+        self.assertEqual(1, built["report"]["blocked_exit"])
+        self.assertTrue(ST.audit_totals(built["report"])["complete"])
+
     def test_p21b_etf_t0_branch_delegates_to_the_authoritative_classifier(self):
         """P21b：T+0 ETF 的分类委托权威实现（当前账户权限把 ETF 挡在前面）。"""
         self.assertEqual("etf_t0", PTR.asset_type(ETF, "沪深300ETF"))
@@ -1468,6 +1495,59 @@ class ExecutableBenchmarkSeparationTest(unittest.TestCase):
     def _non_st(code, session):
         return {"name": "某某股份", "risk_flag": False}
 
+    #: 两条样本收益**刻意不同**，才能证伪"blocked 样本被混进 executable_excess"：
+    #:   600001 可执行，entry 06-17 +5%、exit 06-18 +10%  → 收益 +10%
+    #:   600002 entry 06-17 +10%（涨停买不进）→ blocked_entry，收益 +25%
+    MIXED_KLINES = {
+        "600001": {
+            "2024-06-14": (10.0, 10.0),
+            "2024-06-17": (10.0, 10.5),
+            "2024-06-18": (10.5, 11.55),
+            "2024-06-19": (11.5, 11.6),
+        },
+        "600002": {
+            "2024-06-14": (10.0, 10.0),
+            "2024-06-17": (10.0, 11.0),
+            "2024-06-18": (11.0, 12.5),
+            "2024-06-19": (12.5, 12.6),
+        },
+    }
+
+    def test_market_view_executable_excess_only_uses_executable_selections(self):
+        """market 视图下 ``executable_excess`` 只能用真正可执行的选股样本。
+
+        blocked / unproven 的样本在 market 视图里会进入收益统计（这是该口径的
+        本意），但它们**不得**被拿去减可执行基准 —— 那会重新制造 population 错配。
+        这里两条样本收益刻意不同，因此把 blocked 样本混进来会**改变数值**。
+        """
+        picks = [
+            ("s1", "2024-06-14", "600001", "某某股份"),  # 可执行
+            ("s1", "2024-06-14", "600002", "某某股份"),  # entry 涨停 → blocked
+        ]
+        with _FakeKlineReport(self.MIXED_KLINES) as AR:
+            sessions = SL.normalize_sessions(
+                sorted({day for bars in self.MIXED_KLINES.values() for day in bars})
+            )
+            lines, summary = AR.evaluate(
+                picks, 1, "选股质量", sessions, asof="2024-06-30",
+                tradability_mode=ST.MODE_MARKET,
+                security_state_fn=self._non_st,
+            )
+        # market 视图保留两条样本的收益。
+        self.assertEqual(2, summary["n"])
+        self.assertEqual(1, summary["entry_counts"]["blocked_entry"])
+        row = [line for line in lines if line.startswith("| s1 |")][0]
+        cells = [cell.strip() for cell in row.strip("|").split("|")]
+        # 可执行样本列仍是 1（只有一条真能成交）。
+        self.assertEqual("1", cells[2], row)
+        # executable_excess 必须只用可执行样本：这里只有 600001。
+        self.assertIsNotNone(summary["executable_excess"])
+        # 基准是随机样本（这里恰好就是这两只票）的可执行子集，即 600001 的 +10%。
+        # 因此正确值 = 10% - 10% = 0%。若把 blocked 的 600002(+25%) 混进来，
+        # 均值会变成 17.5% - 10% = +7.5%，测试立刻失败。
+        self.assertAlmostEqual(0.0, summary["executable_excess"], places=6)
+        self.assertIn("executable_excess", "\n".join(lines))
+
     def test_production_report_buckets_match_the_contract(self):
         """冲突状态（entry unproven + exit blocked）在**生产报告**里也是 unproven。
 
@@ -1661,6 +1741,44 @@ class SecurityStateArchiveTest(unittest.TestCase):
                 archive_path=_os.path.join(tmp, "nope.json"))
         self.assertIsNone(fn)
         self.assertEqual(SS.SOURCE_MISSING, provenance["status"])
+
+    def test_malformed_explicit_available_at_rejects_the_row(self):
+        """显式但不可解析的 ``available_at`` 必须整行拒绝，**不得**回落到收盘时点。
+
+        ``availability_basis="session_close"`` 的兜底只适用于字段**缺失**。
+        若一个写坏的显式时间戳被当作"没写"而回落，等于把不可信的可用性证据
+        伪造成一个可见时点，让未来才记下的状态证明更早的动作可执行。
+        """
+        payload = {
+            "kind": "historical_archive",
+            "historical_membership_complete": True,
+            "availability_basis": "session_close",
+            "rows": [
+                {"code": "600001", "effective_from": "2024-06-14",
+                 "effective_to": "2024-06-30", "name": "某某股份",
+                 "risk_flag": False, "available_at": "not-a-date"},
+            ],
+        }
+        archive = SS.SecurityStateArchive.from_payload(payload)
+        self.assertIsNotNone(archive)
+        self.assertIsNone(archive.state_at("600001", "2024-06-14"))
+
+    def test_absent_available_at_still_uses_the_session_close_fallback(self):
+        """对照：字段**缺失**时才允许 session_close 兜底（回归保护，避免误伤）。"""
+        payload = {
+            "kind": "historical_archive",
+            "historical_membership_complete": True,
+            "availability_basis": "session_close",
+            "rows": [
+                {"code": "600001", "effective_from": "2024-06-14",
+                 "effective_to": "2024-06-30", "name": "某某股份",
+                 "risk_flag": False},
+            ],
+        }
+        archive = SS.SecurityStateArchive.from_payload(payload)
+        state = archive.state_at("600001", "2024-06-14")
+        self.assertIsNotNone(state)
+        self.assertEqual("某某股份", state["name"])
 
 
 class StrictBooleanNormalizationTest(unittest.TestCase):

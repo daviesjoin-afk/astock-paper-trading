@@ -879,6 +879,15 @@ def build_executable_outcomes(rows: Sequence[SelectionRow]) -> dict:
         )
         _bump(entry.reason)
 
+        # T+1 的基准 session 必须是**已解析出的**入场 session，而不是可能为 None 的
+        # ``row.intended_entry_session``：当调用方省略 intended_entry_session 但提供了
+        # 带日期的入场证据时（契约显式允许），传 None 会让 ``tradability_at`` 整段跳过
+        # T+1，于是"同日买、同日卖"会被判成可执行。优先用权威 verdict 记下的 session，
+        # 其次退回入场证据自身的 session。
+        entry_session_for_t1 = row.intended_entry_session
+        if entry_session_for_t1 is None:
+            entry_session_for_t1 = entry.session or entry_evidence.session
+
         exit_status = None
         exit_reason = None
         exit_verdict = None
@@ -890,7 +899,7 @@ def build_executable_outcomes(rows: Sequence[SelectionRow]) -> dict:
                 exit_evidence,
                 code=row.code,
                 exit_session=row.intended_exit_session,
-                entry_session=row.intended_entry_session,
+                entry_session=entry_session_for_t1,
             )
             exit_status = exit_verdict.status
             exit_reason = exit_verdict.reason

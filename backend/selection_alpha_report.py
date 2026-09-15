@@ -413,7 +413,14 @@ def evaluate(picks, horizon, label, sessions, *, asof,
         # 两个 excess **分开**累积，绝不混为一个数字。
         if day in bench:
             item["market_excess"].append(result.raw_forward_return - bench[day])
-        if executable_benchmark_available and day in (bench_exec or {}):
+        # executable_excess **只**用真正可执行的选股样本，且必须与同口径的
+        # 可执行基准相减。在 market 视图下 blocked / unproven 的样本会走到这里，
+        # 若把它们也减去可执行基准，就重新制造了本 PR 要消除的 population 错配。
+        if (
+            outcome.executable
+            and executable_benchmark_available
+            and day in (bench_exec or {})
+        ):
             item["executable_excess"].append(
                 result.raw_forward_return - bench_exec[day]
             )

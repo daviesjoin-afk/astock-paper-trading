@@ -259,11 +259,20 @@ class SecurityStateArchive:
         return start, end
 
     def _row_available_at(self, row: Mapping[str, Any], start: str) -> Optional[str]:
+        """该行的可用时点；**显式但不可解析**的值必须整行拒绝（返回 ``None``）。
+
+        兜底（``session_close``）只允许在字段**缺失**时使用。如果归档写了一个
+        显式 ``available_at`` 但格式坏了，把它当成"没写"而回落到 session 收盘，
+        就等于把**不可信的可用性证据伪造成一个可见时点** —— 一条"未来才记下"的
+        状态会因此被当成动作当时就可见。显式值不可解析 → 这一行不是历史证据。
+        """
         raw_available = self._row_value(row, ROW_AVAILABLE_AT_KEYS)
         if raw_available is not None:
             moment = PIT.parse_available_at(raw_available)
-            if moment is not None:
-                return moment.isoformat(timespec="seconds")
+            if moment is None:
+                # 显式值存在但无法解析：拒绝该行，绝不回落。
+                return None
+            return moment.isoformat(timespec="seconds")
         if self._session_close_fallback:
             # 显式声明"状态在 session 收盘时记下"，才允许用收盘时点兜底。
             # 委托 point_in_time（与 #147 的 label 成熟口径同一条规则）。
