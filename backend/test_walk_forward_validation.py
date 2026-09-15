@@ -350,14 +350,20 @@ class EmbargoTest(unittest.TestCase):
         config = dataclasses.replace(CONFIG, embargo_sessions=3)
         built = build(samples, config)
         for fold in ready_folds(built):
-            for session in fold.metadata["validation_decision_sessions"]:
-                self.assertNotEqual(
-                    0,
-                    len([r for r in fold.validation_features if r.decision_session == session]),
-                )
+            # horizon 0 的标签在决策当日收盘就成熟，所以没有任何 validation 行
+            # 会因为 test 起点而被 purge —— 掉的行只可能来自 embargo。
+            self.assertEqual(
+                fold.metadata["validation_candidate_rows"],
+                fold.metadata["validation_rows"],
+            )
+            self.assertEqual(0, fold.metadata["validation_purged_rows"])
             self.assertEqual(
                 len(fold.metadata["validation_decision_sessions"]),
-                len({r.decision_session for r in fold.validation_features}),
+                len({row.decision_session for row in fold.validation_features}),
+            )
+            self.assertEqual(
+                len(fold.metadata["test_decision_sessions"]),
+                len({row.decision_session for row in fold.test_features}),
             )
 
 
@@ -672,22 +678,30 @@ class PitInputsAndReadinessTest(unittest.TestCase):
                 + fold.metadata["train_final_rows"],
             )
             self.assertEqual(fold.metadata["train_final_rows"], len(fold.train_rows))
+            self.assertEqual(
+                fold.metadata["validation_candidate_rows"],
+                fold.metadata["validation_purged_rows"] + fold.metadata["validation_rows"],
+            )
             self.assertEqual(fold.metadata["validation_rows"], len(fold.validation_features))
             self.assertEqual(fold.metadata["validation_rows"], len(fold.validation_labels))
             self.assertEqual(fold.metadata["test_rows"], len(fold.test_features))
             self.assertEqual(fold.metadata["test_rows"], len(fold.test_labels))
+            # validation 与 refit 都不允许出现"标签在 test 起点之后才可用"的行。
+            limit = WFV._instant(fold.test_start_at)
+            for row in tuple(fold.refit_rows) + tuple(fold.validation_labels):
+                self.assertLess(WFV._instant(row.label_available_at), limit)
 
 
 # ──────────────── P25: final refit eligibility (§30) ────────────────
 
 
 class FinalRefitTest(unittest.TestCase):
-    def test_p25_validation_label_maturing_after_test_start_is_excluded_from_refit(self):
-        """P25：validation 决策早于 test，但标签在 test 起点之后才成熟 → 不得进 refit。
+    def test_p25_validation_labels_are_purged_against_the_test_start(self):
+        """P25：validation 侧也必须按 **test 起点** purge。
 
-        ``refit`` 的 eligibility 是 ``label_available_at < test_start_at``，
-        不是 ``decision_at < test_start_at``；否则长 horizon 的 validation 样本
-        会把 test 期的价格偷进最终拟合。
+        一条在 test 期内才成熟的 validation 标签，它的 exit 价就在 held-out
+        区间里；把它留在 ``validation_labels`` 里，模型选择就会看见 test。
+        只从 ``refit_rows`` 里去掉它是不够的。
         """
         # fold0: validation = CALENDAR[10..13]，test 起点 = CALENDAR[14] = 2024-06-24。
         # 在 validation 第一个 session（index 10）上放一条 horizon 5 的样本：
@@ -699,14 +713,25 @@ class FinalRefitTest(unittest.TestCase):
         built = build(samples)
         fold = ready_folds(built)[0]
         self.assertEqual("2024-06-24", fold.test_start_at[:10])
-        self.assertIn("late-validation-label", fold.keys("validation"))
+        self.assertNotIn("late-validation-label", fold.keys("validation"))
         self.assertNotIn("late-validation-label", {row.sample_key for row in fold.refit_rows})
-        self.assertGreaterEqual(fold.metadata["refit_excluded_rows"], 1)
+        self.assertGreaterEqual(fold.metadata["validation_purged_rows"], 1)
+        self.assertGreaterEqual(
+            fold.exclusion_reasons["validation_label_overlaps_test"], 1
+        )
 
-        # 对照：标签在 test 起点之前成熟的 validation 样本**可以**进 refit。
+        # 对照：标签在 test 起点之前成熟的 validation 样本仍然可用。
         samples.append(sample_at(10, code="600010", horizon=2, key="early-validation-label"))
         fold = ready_folds(build(samples))[0]
+        self.assertIn("early-validation-label", fold.keys("validation"))
         self.assertIn("early-validation-label", {row.sample_key for row in fold.refit_rows})
+
+        # 不变量：没有任何进入 tuning / refit 的标签在 test 起点之后才可用。
+        limit = WFV._instant(fold.test_start_at)
+        for row in fold.refit_rows:
+            self.assertLess(WFV._instant(row.label_available_at), limit)
+        for label in fold.validation_labels:
+            self.assertLess(WFV._instant(label.label_available_at), limit)
 
     def test_p25b_refit_is_train_plus_validation_only(self):
         """P25b：refit 只由 train + validation 组成，绝不包含 test。"""
@@ -718,6 +743,32 @@ class FinalRefitTest(unittest.TestCase):
         limit = WFV._instant(fold.test_start_at)
         for row in fold.refit_rows:
             self.assertLess(WFV._instant(row.label_available_at), limit)
+
+    def test_p25c_readiness_uses_each_test_label_availability_instant(self):
+        """P25c：readiness 按**每个 test 标签的可用时点**判定，而不是 test 末个
+        session 的日期。
+
+        fold0 的 test 决策在 2024-06-24..06-27，horizon 2 的标签分别成熟于
+        06-26 / 06-27 / 06-28 / 07-01。``asof = 2024-06-27`` 只覆盖到 06-27，
+        因此这个 fold 还不能评分。
+        """
+        built = build(full_dataset(), asof="2024-06-27")
+        fold = built["folds"][0]
+        self.assertEqual(WFV.STATUS_NOT_READY, fold.status)
+        self.assertEqual(WFV.REASON_WINDOW_NOT_MATURED, fold.reason)
+        self.assertEqual((), fold.train_rows)
+        self.assertEqual((), fold.test_labels)
+        self.assertEqual(
+            "2024-06-27T23:59:59+08:00", fold.metadata["asof"]
+        )
+
+        # 所有 test 标签都成熟之后 → ready。
+        later = build(full_dataset(), asof="2024-07-02")
+        self.assertTrue(ready_folds(later)[0].ready)
+
+        # 盘中 cutoff 不会被放大成整天：06-27 10:00 看不到 06-27 收盘的标签。
+        intraday = build(full_dataset(), asof="2024-06-27T10:00:00+08:00")
+        self.assertEqual(WFV.STATUS_NOT_READY, intraday["folds"][0].status)
 
 
 # ──────────────── P26–P30: adapters, identity, guards ────────────────

@@ -143,6 +143,7 @@ REASON_INSUFFICIENT_HISTORY = "insufficient_history"
 #: 使单条 fold 记录自成完整审计）。
 FOLD_EXCLUSION_REASONS = (
     "label_not_available_before_fold",
+    "validation_label_overlaps_test",
     "embargo",
     "outside_fold_window",
     "insufficient_history",
@@ -759,6 +760,8 @@ def _base_metadata(
         "train_embargoed_rows": 0,
         "train_window_excluded_rows": 0,
         "train_final_rows": 0,
+        "validation_candidate_rows": 0,
+        "validation_purged_rows": 0,
         "validation_rows": 0,
         "test_rows": 0,
         "refit_rows": 0,
@@ -770,10 +773,25 @@ def _base_metadata(
         "validation_decision_session_count": 0,
         "test_decision_session_count": 0,
         "train_max_label_available_at": None,
+        "validation_max_label_available_at": None,
         "train_decision_max": None,
         "disjoint_ok": True,
         "boundary_ok": True,
     }
+
+
+def _finalize_report(report: dict, folds: Sequence[WalkForwardFold]) -> dict:
+    """把 fold 汇总写进 report —— **每一条返回路径**都必须经过这里。
+
+    提前返回（历史不足）与正常返回如果各自拼一份 report，就会在"恰恰是
+    not-ready 的那种情况"下给出互相矛盾的 fold 计数，或者干脆缺键。
+    """
+    report["folds"] = len(folds)
+    report["ready_folds"] = sum(1 for fold in folds if fold.ready)
+    report["fold_statuses"] = sorted({fold.status for fold in folds})
+    report["ready"] = report["ready_folds"] > 0
+    report["fold_ids"] = [fold.fold_id for fold in folds]
+    return report
 
 
 def build_walk_forward_folds(
@@ -814,9 +832,9 @@ def build_walk_forward_folds(
     for row in ordered:
         by_session.setdefault(row.decision_session, []).append(row)
 
-    asof_session = _date_text(asof) if asof is not None else None
-    if asof is not None and asof_session is None:
-        raise WalkForwardContractError("asof must be a parseable date")
+    asof_instant = _instant(asof) if asof is not None else None
+    if asof is not None and asof_instant is None:
+        raise WalkForwardContractError("asof must be a parseable instant")
 
     report = {
         "contract_version": WALK_FORWARD_CONTRACT_VERSION,
@@ -825,6 +843,8 @@ def build_walk_forward_folds(
         "sessions": len(calendar),
         "folds": 0,
         "ready_folds": 0,
+        "ready": False,
+        "fold_statuses": [],
         "exclusion_reasons": dict(reasons),
         "unverified_label_by_status": dict(sorted(unverified_by_status.items())),
         "config": {
@@ -858,6 +878,7 @@ def build_walk_forward_folds(
             {**reasons, "insufficient_history": len(ordered)},
         )
         report["exclusion_reasons"]["insufficient_history"] = len(ordered)
+        _finalize_report(report, [fold])
         return {"folds": [fold], "report": report}
 
     folds = []
@@ -893,9 +914,20 @@ def build_walk_forward_folds(
 
         fold_reasons = {name: int(reasons.get(name, 0)) for name in FOLD_EXCLUSION_REASONS}
 
-        if asof_session is not None and test_window[-1] > asof_session:
-            # test 窗口尚未成熟：不缩短、不假装 ready。
-            metadata["asof"] = asof_session
+        validation_candidates = [
+            row for day in validation_window for row in by_session.get(day, ())
+        ]
+        test_rows = [row for day in test_window for row in by_session.get(day, ())]
+
+        # readiness 按**每个 test 标签的可用时点**判定，不是按 test 最后一个决策
+        # session 的日期：一个 06-27 的决策，horizon 2 的标签要到 07-01 才成熟，
+        # 用日期比较会把它当成"已经可以评分"。``asof`` 走 PIT 的时点语义
+        # （date-only = 当日结束，带时刻 = 精确时点），因此盘中 cutoff 不会被
+        # 放大成整天。
+        if asof_instant is not None and any(
+            not train_eligible(row, evaluation_start_at=asof_instant) for row in test_rows
+        ):
+            metadata["asof"] = asof_instant.isoformat(timespec="seconds")
             metadata["window_excluded_rows"] = len(ordered)
             fold_reasons[REASON_WINDOW_NOT_MATURED] = len(ordered)
             folds.append(
@@ -931,10 +963,20 @@ def build_walk_forward_folds(
                 continue
             train_rows.append(row)
 
-        validation_rows = [row for day in validation_window for row in by_session.get(day, ())]
-        test_rows = [row for day in test_window for row in by_session.get(day, ())]
+        # ── validation 侧同样要按 **test 起点** purge ──
+        # 一条在 test 期内才成熟的 validation 标签，其 exit 价就在 held-out 区间里：
+        # 用它选超参等于让模型选择看见 test。只把它从 ``refit_rows`` 里去掉是不够的。
+        validation_rows = []
+        validation_purged = 0
+        for row in validation_candidates:
+            if not train_eligible(row, evaluation_start_at=test_start_at):
+                validation_purged += 1
+                continue
+            validation_rows.append(row)
 
         # ── refit（train + validation）的 eligibility 是 label < test_start ──
+        # 上面的 validation purge 已经保证了这一点；这里保留一次显式检查作为
+        # 纵深防御：将来若有人放宽 validation 的 purge 规则，最终拟合仍然安全。
         refit_rows = []
         refit_excluded = 0
         for row in train_rows + validation_rows:
@@ -945,10 +987,17 @@ def build_walk_forward_folds(
 
         metadata["train_candidate_rows"] = len(train_candidates)
         metadata["train_final_rows"] = len(train_rows)
+        metadata["validation_candidate_rows"] = len(validation_candidates)
+        metadata["validation_purged_rows"] = validation_purged
         metadata["validation_rows"] = len(validation_rows)
         metadata["test_rows"] = len(test_rows)
         metadata["refit_rows"] = len(refit_rows)
         metadata["refit_excluded_rows"] = refit_excluded
+        fold_reasons["validation_label_overlaps_test"] = validation_purged
+        if validation_rows:
+            metadata["validation_max_label_available_at"] = max(
+                row.label_available_at for row in validation_rows
+            )
         if train_rows:
             metadata["train_decision_start"] = train_rows[0].decision_session
             metadata["train_decision_end"] = train_rows[-1].decision_session
@@ -1015,10 +1064,7 @@ def build_walk_forward_folds(
             )
         )
 
-    report["folds"] = len(folds)
-    report["ready_folds"] = sum(1 for fold in folds if fold.ready)
-    report["fold_statuses"] = sorted({fold.status for fold in folds})
-    report["ready"] = report["ready_folds"] > 0
+    _finalize_report(report, folds)
     return {"folds": folds, "report": report}
 
 
