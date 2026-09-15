@@ -172,8 +172,8 @@ MAIN_FORCE_PRIORITY_FLOOR_PCT = 0.15
 ALLOCATION_SLOT_CAPS = {MAIN_FORCE_STRATEGY_ID: 3}
 ALLOCATION_PRIORITY_FLOOR_PCT = {MAIN_FORCE_STRATEGY_ID: MAIN_FORCE_PRIORITY_FLOOR_PCT}
 ALLOCATION_OWN_EXPOSURE_CAP_PCT = {"sector_rotation": 1.0}
-# 三分钟频率兼顾开盘/午后节奏与全市场双源校验耗时；09:30、13:00 仍由首轮立即触发。
-INTRADAY_INTERVAL_MINUTES = 3
+# 两分钟频率兼顾开盘/午后节奏与全市场双源校验耗时；09:30、13:00 仍由首轮立即触发。
+INTRADAY_INTERVAL_MINUTES = 2
 INTRADAY_WINDOWS = (("09:30", "11:25"), ("13:00", "14:55"))
 # 开盘事件是共享执行引擎，五套策略只通过各自的策略画像决定阈值和仓位比例。
 # 这样既能在 09:30/09:31 抓住冲高回落，也不会把趋势/轮动策略改造成追涨策略。
@@ -13639,7 +13639,7 @@ def monitor_intraday(asof_datetime=None, force=False):
                 "opening_event": open_result.get("opening_event"),
                 "data_source_health": data_source_health,
                 "live_universe_coverage": len(live_universe),
-                "note": "3分钟监控仅观察；未满足阈值时不生成订单"}
+                "note": f"{INTRADAY_INTERVAL_MINUTES}分钟监控仅观察；未满足阈值时不生成订单"}
 
 
 def _nav_quotes_with_snapshot_fallback(quotes):
@@ -14093,7 +14093,7 @@ def _run_slot_impl(slot, day, force=False):
     # 下一轮 cron 会抢到过期租约与未结束的 run 并发写候选/订单。
     # - auction/open 为秒级~分钟级任务：300s/600s 足够，且即使释放失败，
     #   幽灵租约也会在几分钟内自动过期，不会挡住后续开盘/盘中任务；
-    # - intraday 每 3 分钟一轮（INTRADAY_INTERVAL_MINUTES=3）：正常单轮
+    # - intraday 每 2 分钟一轮（INTRADAY_INTERVAL_MINUTES=2）：正常单轮
     #   155~204s。2026-09-02 巡检发现 4 轮挂起 10~12 分钟才被回收——旧
     #   TTL 600s 把挂死扫描的盲区放大到 ~10 分钟。进程存活期间心跳线程
     #   每 TTL/4 续期（300s→75s），活进程不会被误抢；TTL 只决定挂死/
@@ -15751,7 +15751,7 @@ def schedule_status():
         "latest_intraday_runs": intraday,
         "runtime_status": "异常" if failed else ("已执行" if latest or intraday else "等待首个任务"),
         "runtime_failed_count": len(failed),
-        "note": "09:25采集集合竞价快照做预选；09:30、09:31、13:00先执行共享开盘事件扫描（冲高回落可减仓，回补需后续反弹确认），09:31再用最新双源行情审批新开仓；其后每3分钟执行至11:25和14:55；15:05盘后评分和周五15:20复盘。失败任务会由同一时段的兜底计划自动重试，页面显示数据库中的实际运行记录。"
+        "note": f"09:25采集集合竞价快照做预选；09:30、09:31、13:00先执行共享开盘事件扫描（冲高回落可减仓，回补需后续反弹确认），09:31再用最新双源行情审批新开仓；其后每{INTRADAY_INTERVAL_MINUTES}分钟执行至11:25和14:55；15:05盘后评分和周五15:20复盘。失败任务会由同一时段的兜底计划自动重试，页面显示数据库中的实际运行记录。"
     }
 
 

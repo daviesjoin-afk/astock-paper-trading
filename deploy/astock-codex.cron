@@ -12,12 +12,12 @@ HOME=/opt/astock-codex
 27 9 * * 1-5 root flock -n /opt/astock-codex/.locks/auction.lock /opt/astock-codex/deploy/run_paper_slot.sh auction >>/opt/astock-codex/reports/scheduler.log 2>&1
 29 9 * * 1-5 root flock -n /opt/astock-codex/.locks/auction.lock /opt/astock-codex/deploy/run_paper_slot.sh auction >>/opt/astock-codex/reports/scheduler.log 2>&1
 
-# A股交易日内监控：09:30-11:25、13:00-14:55，每3分钟一次；开市首分钟只扫描。
-33-59/3 9 * * 1-5 root flock -n /opt/astock-codex/.locks/intraday.lock /opt/astock-codex/deploy/run_paper_slot.sh intraday >>/opt/astock-codex/reports/scheduler.log 2>&1
-*/3 10 * * 1-5 root flock -n /opt/astock-codex/.locks/intraday.lock /opt/astock-codex/deploy/run_paper_slot.sh intraday >>/opt/astock-codex/reports/scheduler.log 2>&1
-0-25/3 11 * * 1-5 root flock -n /opt/astock-codex/.locks/intraday.lock /opt/astock-codex/deploy/run_paper_slot.sh intraday >>/opt/astock-codex/reports/scheduler.log 2>&1
-0-55/3 13 * * 1-5 root flock -n /opt/astock-codex/.locks/intraday.lock /opt/astock-codex/deploy/run_paper_slot.sh intraday >>/opt/astock-codex/reports/scheduler.log 2>&1
-*/3 14 * * 1-5 root flock -n /opt/astock-codex/.locks/intraday.lock /opt/astock-codex/deploy/run_paper_slot.sh intraday >>/opt/astock-codex/reports/scheduler.log 2>&1
+# A股交易日内监控：09:30-11:25、13:00-14:55，每2分钟一次；开市首分钟只扫描。
+32-58/2 9 * * 1-5 root flock -n /opt/astock-codex/.locks/intraday.lock /opt/astock-codex/deploy/run_paper_slot.sh intraday >>/opt/astock-codex/reports/scheduler.log 2>&1
+*/2 10 * * 1-5 root flock -n /opt/astock-codex/.locks/intraday.lock /opt/astock-codex/deploy/run_paper_slot.sh intraday >>/opt/astock-codex/reports/scheduler.log 2>&1
+0-24/2 11 * * 1-5 root flock -n /opt/astock-codex/.locks/intraday.lock /opt/astock-codex/deploy/run_paper_slot.sh intraday >>/opt/astock-codex/reports/scheduler.log 2>&1
+*/2 13 * * 1-5 root flock -n /opt/astock-codex/.locks/intraday.lock /opt/astock-codex/deploy/run_paper_slot.sh intraday >>/opt/astock-codex/reports/scheduler.log 2>&1
+0-54/2 14 * * 1-5 root flock -n /opt/astock-codex/.locks/intraday.lock /opt/astock-codex/deploy/run_paper_slot.sh intraday >>/opt/astock-codex/reports/scheduler.log 2>&1
 
 31 9 * * 1-5 root flock -n /opt/astock-codex/.locks/open.lock /opt/astock-codex/deploy/run_paper_slot.sh open >>/opt/astock-codex/reports/scheduler.log 2>&1
 # 开盘审批与盘后因子失败时的单次兜底；已完成的日任务不会重复执行。

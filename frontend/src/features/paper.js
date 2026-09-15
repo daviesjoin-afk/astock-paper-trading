@@ -67,7 +67,7 @@ export async function startPaper(){
   $('paperStart').disabled = true;
   try{
     var d = await apiPost('/api/paper/start?capital='+encodeURIComponent(capital));
-    var note = d.schedule && d.schedule.ok ? '新周期已启动，3分钟监控任务已注册。' : '新周期已启动；计划任务未完全安装时可运行 setup_paper_schedule.bat。';
+    var note = d.schedule && d.schedule.ok ? '新周期已启动，2分钟监控任务已注册。' : '新周期已启动；计划任务未完全安装时可运行 setup_paper_schedule.bat。';
     paperNotice(note);
     await loadPaper({force:true});
   }catch(e){ paperNotice('启用失败：'+e.message); }
@@ -750,20 +750,20 @@ export async function renderPaperDashboard(d,auditRequest){
     var monitorLabel=monitorState==='completed'?'已完成':(monitorState==='running'?'检查中':'异常');
     var monitorText=latestMonitor
       ? '最近监控 '+String(latestMonitor.started_at||'').slice(5,16)+' · '+monitorLabel+' · '+(monitorReason||('检查 '+(monitorDetail.observed||0)+' 个底仓'))
-      : '尚未收到3分钟监控心跳';
-    $('paperTerminalBoard').innerHTML='<div class="paper-terminal-head"><h3>\u5f53\u524d\u6301\u4ed3</h3><span style="color:var(--text-secondary);font-size:12px">'+running+' / '+(accounts.length||4)+' \u8d26\u6237\u8fd0\u884c \u00b7 '+monitorText+'</span></div>'
-      +'<div class="paper-terminal-section"><div class="paper-terminal-section-title"><span>\u53ef\u64cd\u4f5c\u5e95\u4ed3</span><div class="paper-filter-bar"><label>\u7b56\u7565</label><select id="paperPositionFilter" onchange="setPaperTerminalFilter(\'position\',this.value)">'+accountFilterOptions+'</select><label>\u72b6\u6001</label><select id="paperPositionStateFilter" onchange="setPaperTerminalFilter(\'positionState\',this.value)"><option value="all">\u5168\u90e8</option><option value="profit">\u6d6e\u76c8</option><option value="loss">\u6d6e\u4e8f</option><option value="sellable">\u53ef\u5356</option><option value="locked">T+1\u9501\u5b9a</option></select><span id="paperPositionVisible" class="paper-filter-count"></span></div></div><div class="paper-position-list">'+quickPositions+'<div id="paperPositionEmpty" class="paper-empty" hidden>\u8be5\u7b56\u7565\u5f53\u524d\u6ca1\u6709\u6301\u4ed3\u3002</div></div></div>';
-    $('paperActivityBoard').innerHTML='<div class="paper-terminal-head"><h3>\u59d4\u6258\u64cd\u4f5c\u8bb0\u5f55</h3><span style="color:var(--text-secondary);font-size:12px">\u6309\u65e5\u671f\u4e0e\u7b56\u7565\u7b5b\u9009</span></div><div class="paper-terminal-section"><div class="paper-terminal-section-title"><span>\u6700\u8fd1\u59d4\u6258</span><div class="paper-filter-bar"><label>\u65e5\u671f</label><input id="paperOrderDateFilter" type="date" value="'+window._paperOrderDateFilter+'" onchange="setPaperTerminalFilter(\'orderDate\',this.value)"><button class="paper-filter-clear" onclick="clearPaperOrderDate()">\u5168\u90e8\u65e5\u671f</button><label>\u7b56\u7565</label><select id="paperOrderAccountFilter" onchange="setPaperTerminalFilter(\'orderAccount\',this.value)">'+accountFilterOptions+'</select><label>\u65b9\u5411</label><select id="paperOrderSideFilter" onchange="setPaperTerminalFilter(\'orderSide\',this.value)"><option value="all">\u5168\u90e8</option><option value="buy">\u4e70\u5165</option><option value="sell">\u5356\u51fa</option></select><label>\u7ed3\u679c</label><select id="paperOrderStatusFilter" onchange="setPaperTerminalFilter(\'orderStatus\',this.value)"><option value="all">\u5168\u90e8</option><option value="filled">\u5df2\u6210\u4ea4</option><option value="pending_limit">\u5f85\u89e6\u53d1</option><option value="risk_rejected">\u98ce\u63a7\u62d2\u7edd</option><option value="cancelled">\u5df2\u64a4\u9500</option><option value="expired">\u5df2\u8fc7\u671f</option></select><span id="paperOrderVisible" class="paper-filter-count"></span></div></div><div class="paper-order-scroll"><div class="paper-order-list">'+recentOrders+'<div id="paperOrderEmpty" class="paper-empty" hidden>\u6240\u9009\u65e5\u671f\u548c\u7b56\u7565\u6ca1\u6709\u59d4\u6258\u64cd\u4f5c\u3002</div></div></div></div>';
+      : '尚未收到2分钟监控心跳';
+    $('paperTerminalBoard').innerHTML='<div class="paper-terminal-head"><h3>当前持仓</h3><span style="color:var(--text-secondary);font-size:12px">'+running+' / '+(accounts.length||4)+' 账户运行 · '+monitorText+'</span></div>'
+      +'<div class="paper-terminal-section"><div class="paper-terminal-section-title"><span>可操作底仓</span><div class="paper-filter-bar"><label>策略</label><select id="paperPositionFilter" onchange="setPaperTerminalFilter(\'position\',this.value)">'+accountFilterOptions+'</select><label>状态</label><select id="paperPositionStateFilter" onchange="setPaperTerminalFilter(\'positionState\',this.value)"><option value="all">全部</option><option value="profit">浮盈</option><option value="loss">浮亏</option><option value="sellable">可卖</option><option value="locked">T+1锁定</option></select><span id="paperPositionVisible" class="paper-filter-count"></span></div></div><div class="paper-position-list">'+quickPositions+'<div id="paperPositionEmpty" class="paper-empty" hidden>该策略当前没有持仓。</div></div></div>';
+    $('paperActivityBoard').innerHTML='<div class="paper-terminal-head"><h3>委托操作记录</h3><span style="color:var(--text-secondary);font-size:12px">'+monitorText+'</span></div><div class="paper-terminal-section"><div class="paper-terminal-section-title"><span>最近委托</span><div class="paper-filter-bar"><label>日期</label><input id="paperOrderDateFilter" type="date" value="'+window._paperOrderDateFilter+'" onchange="setPaperTerminalFilter(\'orderDate\',this.value)"><button class="paper-filter-clear" onclick="clearPaperOrderDate()">全部日期</button><label>策略</label><select id="paperOrderAccountFilter" onchange="setPaperTerminalFilter(\'orderAccount\',this.value)">'+accountFilterOptions+'</select><label>方向</label><select id="paperOrderSideFilter" onchange="setPaperTerminalFilter(\'orderSide\',this.value)"><option value="all">全部</option><option value="buy">买入</option><option value="sell">卖出</option></select><label>结果</label><select id="paperOrderStatusFilter" onchange="setPaperTerminalFilter(\'orderStatus\',this.value)"><option value="all">全部</option><option value="filled">已成交</option><option value="pending_limit">待触发</option><option value="risk_rejected">风控拒绝</option><option value="cancelled">已撤销</option><option value="expired">已过期</option></select><span id="paperOrderVisible" class="paper-filter-count"></span></div></div><div class="paper-order-scroll"><div class="paper-order-list">'+recentOrders+'<div id="paperOrderEmpty" class="paper-empty" hidden>所选日期和策略没有委托操作。</div></div></div></div>';
     if(window._paperWorkspace==='activity'){
       try{
         // The shared overview request may have started while another tab was
-        // active, in which case auditRequest is null.  Fetch it now instead of
-        // awaiting null and passing that value into renderPaperAudit().
-        var auditDashboard=auditRequest||window._paperAuditCache;
+        // active, in which case auditRequest is null. Fetch it now instead of
+        // passing an unawaited Promise into renderPaperAudit().
+        var auditDashboard=auditRequest ? await auditRequest : window._paperAuditCache;
         if(!auditDashboard){
           auditDashboard=await api('/api/paper/risk-audit?limit=160');
-          window._paperAuditCache=auditDashboard;
         }
+        window._paperAuditCache=auditDashboard;
         var auditBoard=$('paperActivityBoard');
         if(auditBoard){
           // loadPaper() may overlap after a fast refresh/navigation. Keep one audit section.
@@ -784,7 +784,7 @@ export async function renderPaperDashboard(d,auditRequest){
     $('paperOrderDateFilter').value=window._paperOrderDateFilter;
     filterPaperTerminal();
     $('paperStatus').innerHTML = running
-      ? '<span class="tag tag-ok">'+running+' / '+(accounts.length||5)+' 策略运行中</span> 周期 '+(cycle.cycle_key||'-')+'；每3分钟观察，满足全部条件才交易。'
+      ? '<span class="tag tag-ok">'+running+' / '+(accounts.length||5)+' 策略运行中</span> 周期 '+(cycle.cycle_key||'-')+'；每2分钟观察，满足全部条件才交易。'
       : (legacyEmpty
         ? '<span class="tag tag-info">待创建新周期</span> 旧 ¥20,000 空配置仍在归档前；输入框的 ¥100,000 会在点击“保存并启动新周期”后写入账本。'
         : '<span class="tag tag-info">当前周期已暂停</span> 资金已锁定；可恢复，或归档后新建周期。');
@@ -862,7 +862,7 @@ export async function renderPaperDashboard(d,auditRequest){
       : '<div class="paper-empty">暂无成交记录。</div>';
     var observationsAudit = observations
       ? tableScroll('<table><tr><th>时间</th><th>策略</th><th>标的</th><th>报价</th><th>结论</th><th>原因</th></tr>'+observations+'</table>',820)
-      : '<div class="paper-empty">暂无日内观察；仅在交易时段内每3分钟检查。</div>';
+      : '<div class="paper-empty">暂无日内观察；仅在交易时段内每2分钟检查。</div>';
     var paramsAudit = params
       ? tableScroll('<table><tr><th>记录时间</th><th>策略</th><th>版本</th><th>风格</th><th>生效日</th><th>原因</th></tr>'+params+'</table>',820)
       : '<div class="paper-empty">尚无参数版本记录。</div>';

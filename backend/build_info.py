@@ -14,8 +14,8 @@
 from __future__ import annotations
 
 APP_NAME = "astock-paper-trading"
-APP_BUILD_ID = "20260910-strategy-console-v1"
-APP_BUILD_LABEL = "Custom Strategy Web 产品线收口（PR-45 → PR-49）"
+APP_BUILD_ID = "20260915-paper-2min-risk-fix-v1"
+APP_BUILD_LABEL = "Paper Trading 2-Minute Cadence & Risk Center Hotfix"
 
 
 def build_payload() -> dict:

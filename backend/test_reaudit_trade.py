@@ -72,14 +72,18 @@ class LeaseAndFreshnessTests(unittest.TestCase):
             P._assert_active_lease(conn, "stale worker")
         P._clear_lease_context()
 
-    def test_intraday_key_is_three_minute_bucket(self):
+    def test_intraday_key_is_two_minute_bucket(self):
         self.assertEqual(
             P._intraday_business_key(dt.datetime(2026, 8, 25, 13, 2, 59)),
-            "intraday:202608251300",
+            "intraday:202608251302",
         )
         self.assertEqual(
             P._intraday_business_key(dt.datetime(2026, 8, 25, 13, 3, 0)),
-            "intraday:202608251303",
+            "intraday:202608251302",
+        )
+        self.assertEqual(
+            P._intraday_business_key(dt.datetime(2026, 8, 25, 13, 4, 0)),
+            "intraday:202608251304",
         )
 
     def test_today_pnl_quote_requires_fresh_live_mark(self):

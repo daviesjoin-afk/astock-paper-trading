@@ -22,7 +22,7 @@ class FrontendRiskAuditRaceTests(unittest.TestCase):
         切换到 activity 页时审计记录一定出现（而不是静默缺失）。
         """
         source = SOURCE()
-        self.assertIn("auditDashboard=auditRequest||window._paperAuditCache", source)
+        self.assertIn("auditDashboard=auditRequest ? await auditRequest : window._paperAuditCache", source)
         self.assertIn("auditDashboard=await api('/api/paper/risk-audit?limit=160')", source)
         self.assertIn("window._paperAuditCache=auditDashboard", source)
 
