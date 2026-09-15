@@ -455,7 +455,12 @@ class DualModeTests(AiReviewSlotTestBase):
         self.assertEqual("ai2_disabled", result["status"])
         self.assertFalse(result["consensus"])
 
-    def test_t21_dual_mode_one_failed_call_yields_no_consensus_and_no_fallback(self):
+    def test_t21_dual_mode_one_failed_call_yields_failed_and_no_fallback(self):
+        """运行失败是 ``failed``，不是"意见不一致"。
+
+        （本用例在引入 dual 结果状态机前断言 ``no_consensus``；那个期望本身编码了
+        被修复的分类 bug —— reviewer 调用失败与"双方成功但语义分歧"是两回事。）
+        """
         self.configure_slots()
 
         def half_fail(slot_config, system_prompt, user_prompt, max_tokens=1800):
@@ -467,10 +472,13 @@ class DualModeTests(AiReviewSlotTestBase):
             result = self.run_review()
         self.assertEqual(["ai1", "ai2"], sorted(self.calls))
         self.assertEqual("dual_review", result["mode"])
-        self.assertEqual("no_consensus", result["status"])
+        self.assertEqual("failed", result["status"])
         self.assertFalse(result["consensus"])
         self.assertEqual([], result["proposals"])
         self.assertEqual("failed", result["reviewers"]["ai1"]["status"])
+        # 失败原因必须指明是哪个 slot（且不含凭据/查询串）
+        self.assertIn("ai1 reviewer failed", result["reason"])
+        self.assertNotIn("ai2 reviewer failed", result["reason"])
 
 
 # ───────────────────────── T22：审计快照 ─────────────────────────
@@ -792,6 +800,353 @@ class ReviewRegressionTests(AiReviewSlotTestBase):
         self.assertFalse(slot["ready"], "非 URL 的 base_url 不得报告就绪")
         with self.factory() as conn:
             self.assertFalse(S.review_settings_view(conn)["single_ready"])
+
+
+# ───────────────── T35–T46：dual 结果状态机（outcome taxonomy）─────────────────
+
+def _decide(a1, a2, proposals1=None, proposals2=None, confidence=86):
+    """两端各给一个 decision 的桩。``proposals=None`` 表示该端提一个合法提案。"""
+    def side_effect(slot_config, system_prompt, user_prompt, max_tokens=1800):
+        if slot_config["slot"] == "ai1":
+            return _response(decision=a1, proposals=proposals1, confidence=confidence)
+        return _response(decision=a2, proposals=proposals2, confidence=confidence)
+    return side_effect
+
+
+def _reviewer(status, decision=None):
+    return {"slot": "x", "status": status, "decision": decision, "error": None}
+
+
+class OutcomeClassifierContractTests(unittest.TestCase):
+    """纯函数 ``classify_dual_review_outcome`` 的契约（不碰 DB、不碰网络）。"""
+
+    def _classify(self, reviewers, decisions, consensus=False, merged=None):
+        return S.classify_dual_review_outcome(reviewers, decisions, consensus, merged or [])
+
+    def test_c1_hold_hold_is_both_hold_not_a_merged_signal(self):
+        reviewers = {"ai1": _reviewer("completed", "hold"), "ai2": _reviewer("completed", "hold")}
+        self.assertEqual(S.OUTCOME_BOTH_HOLD, self._classify(reviewers, ["hold", "hold"]))
+
+    def test_c2_empty_merged_never_implies_both_hold(self):
+        # hold/propose 与 propose/hold 都是 no_consensus：merged 为空 ≠ 双方 hold
+        for decisions in (["hold", "propose"], ["propose", "hold"]):
+            with self.subTest(decisions=decisions):
+                reviewers = {"ai1": _reviewer("completed", decisions[0]),
+                             "ai2": _reviewer("completed", decisions[1])}
+                self.assertEqual(S.OUTCOME_NO_CONSENSUS, self._classify(reviewers, decisions))
+
+    def test_c3_unusable_reviewer_is_failed_even_with_valid_other_side(self):
+        reviewers = {"ai1": _reviewer("failed"), "ai2": _reviewer("completed", "propose")}
+        self.assertEqual(S.OUTCOME_FAILED, self._classify(reviewers, [None, "propose"]))
+
+    def test_c4_consensus_requires_agreement_and_a_merged_proposal(self):
+        reviewers = {"ai1": _reviewer("completed", "propose"),
+                     "ai2": _reviewer("completed", "propose")}
+        self.assertEqual(S.OUTCOME_NO_CONSENSUS,
+                         self._classify(reviewers, ["propose", "propose"], consensus=False))
+        self.assertEqual(S.OUTCOME_NO_CONSENSUS,
+                         self._classify(reviewers, ["propose", "propose"], consensus=True, merged=[]))
+        self.assertEqual(S.OUTCOME_CONSENSUS,
+                         self._classify(reviewers, ["propose", "propose"], consensus=True,
+                                        merged=[{"account_id": "a"}]))
+
+    def test_c5_reviewer_decision_validation_is_strict(self):
+        for value in (None, "", "maybe", "unknown", "HOLD!"):
+            with self.subTest(value=value):
+                self.assertFalse(S.normalize_reviewer_decision(value)[1])
+                self.assertFalse(S.reviewer_is_usable(_reviewer("completed", value)))
+        for value in ("hold", "propose", " Hold ", "PROPOSE"):
+            with self.subTest(value=value):
+                self.assertTrue(S.normalize_reviewer_decision(value)[1])
+
+
+class OutcomeTaxonomyTests(AiReviewSlotTestBase):
+    """T35–T46：真实 ``run_ai_review`` 路径上的状态机（含审计落库）。"""
+
+    def setUp(self):
+        super().setUp()
+        self.configure_slots()
+
+    def _run(self, side_effect):
+        with self.stub(side_effect):
+            return self.run_review()
+
+    def test_t35_hold_hold_is_both_hold(self):
+        result = self._run(_decide("hold", "hold", proposals1=[], proposals2=[]))
+        self.assertEqual("both_hold", result["status"])
+        self.assertFalse(result["consensus"])
+        self.assertEqual([], result["proposals"])
+        self.assertEqual("两个 AI 均明确建议保持当前配置", result["reason"])
+
+    def test_t36_hold_propose_is_no_consensus_never_both_hold(self):
+        result = self._run(_decide("hold", "propose", proposals1=[]))
+        self.assertEqual("no_consensus", result["status"])
+        self.assertNotEqual("both_hold", result["status"], "hold/propose 绝不能被归成 both_hold")
+        self.assertFalse(result["consensus"])
+        self.assertEqual([], result["proposals"])
+        self.assertIn("双AI决策不一致: ai1=hold ai2=propose", result["reason"])
+
+    def test_t37_propose_hold_is_no_consensus_never_both_hold(self):
+        result = self._run(_decide("propose", "hold", proposals2=[]))
+        self.assertEqual("no_consensus", result["status"])
+        self.assertNotEqual("both_hold", result["status"])
+        self.assertFalse(result["consensus"])
+        self.assertEqual([], result["proposals"])
+        self.assertIn("双AI决策不一致: ai1=propose ai2=hold", result["reason"])
+
+    def test_t38_propose_propose_with_agreement_is_consensus(self):
+        result = self._run(self.agreeing)
+        self.assertEqual("consensus", result["status"])
+        self.assertTrue(result["consensus"])
+        self.assertTrue(result["proposals"])
+        row = self.audit(result["id"])
+        self.assertEqual("consensus", row["status"])
+        self.assertEqual("consensus", row["consensus_result"])
+        self.assertIsNotNone(row["merged_proposals"])
+
+    def test_t39_propose_propose_without_agreement_is_no_consensus(self):
+        # 方向分歧：ai1 把 mom 权重上调、ai2 下调
+        direction = _decide(
+            "propose", "propose",
+            proposals1=[_proposal({"mom": 0.53, "sentiment": 0.47})],
+            proposals2=[_proposal({"mom": 0.47, "sentiment": 0.53})],
+        )
+        result = self._run(direction)
+        self.assertEqual("no_consensus", result["status"])
+        self.assertNotEqual("both_hold", result["status"], "提案分歧绝不能降级成 both_hold")
+        self.assertFalse(result["consensus"])
+        self.assertEqual([], result["proposals"])
+        # 幅度分歧：同向但幅度比过低（0.01/0.03 = 0.33 < 0.60）
+        magnitude = _decide(
+            "propose", "propose",
+            proposals1=[_proposal({"mom": 0.53, "sentiment": 0.47})],
+            proposals2=[_proposal({"mom": 0.51, "sentiment": 0.49})],
+        )
+        result2 = self._run(magnitude)
+        self.assertEqual("no_consensus", result2["status"])
+        self.assertNotEqual("both_hold", result2["status"])
+        self.assertFalse(result2["consensus"])
+        self.assertEqual([], result2["proposals"])
+
+    def test_t40_ai1_runtime_failure_is_failed(self):
+        def timeout(slot_config, system_prompt, user_prompt, max_tokens=1800):
+            if slot_config["slot"] == "ai1":
+                raise TimeoutError("upstream did not respond")
+            return _response()
+
+        result = self._run(timeout)
+        self.assertEqual("failed", result["status"])
+        self.assertNotEqual("no_consensus", result["status"], "调用失败不是意见分歧")
+        self.assertIn("ai1 reviewer failed", result["reason"])
+        self.assertIn("TimeoutError", result["reason"])
+        self.assertFalse(result["consensus"])
+        self.assertEqual([], result["proposals"])
+
+    def test_t41_ai2_unusable_response_is_failed(self):
+        # 合法 JSON 但不是对象 → 协议层不可用（既非 hold 也非 propose）
+        def malformed(slot_config, system_prompt, user_prompt, max_tokens=1800):
+            if slot_config["slot"] == "ai2":
+                return ([], 1, 1, 5)
+            return _response()
+
+        result = self._run(malformed)
+        self.assertEqual("failed", result["status"])
+        self.assertIn("ai2 reviewer failed", result["reason"])
+        self.assertIn("response_not_object", result["reason"])
+        self.assertEqual("failed", result["reviewers"]["ai2"]["status"])
+
+    def test_t42_both_reviewers_failing_is_failed(self):
+        def both_fail(slot_config, system_prompt, user_prompt, max_tokens=1800):
+            raise RuntimeError("%s-down" % slot_config["slot"])
+
+        result = self._run(both_fail)
+        self.assertEqual("failed", result["status"])
+        self.assertIn("ai1 reviewer failed", result["reason"])
+        self.assertIn("ai2 reviewer failed", result["reason"])
+        self.assertFalse(result["consensus"])
+        self.assertEqual([], result["proposals"])
+
+    def test_t43_audit_persists_no_consensus(self):
+        result = self._run(_decide("hold", "propose", proposals1=[]))
+        row = self.audit(result["id"])
+        self.assertEqual("no_consensus", row["status"])
+        self.assertEqual("no_consensus", row["consensus_result"])
+        self.assertIsNone(row["merged_proposals"])
+        # 审计行的 reviewers 明细必须能区分"两侧都成功"
+        reviewers = json.loads(row["reviewers"])
+        self.assertEqual("completed", reviewers["ai1"]["status"])
+        self.assertEqual("completed", reviewers["ai2"]["status"])
+        self.assertEqual("hold", reviewers["ai1"]["decision"])
+        self.assertEqual("propose", reviewers["ai2"]["decision"])
+
+    def test_t44_audit_persists_both_hold_exactly(self):
+        result = self._run(_decide("hold", "hold", proposals1=[], proposals2=[]))
+        row = self.audit(result["id"])
+        self.assertEqual("both_hold", row["status"])
+        self.assertEqual("no_consensus", row["consensus_result"])
+        self.assertIsNone(row["merged_proposals"])
+
+    def test_t46_invalid_or_missing_decision_is_failed(self):
+        cases = [
+            {"decision": "maybe", "proposals": [_proposal()]},
+            {"proposals": [_proposal()]},          # decision 缺失
+            {"decision": "", "proposals": [_proposal()]},
+        ]
+        for payload in cases:
+            with self.subTest(payload=payload):
+                def side_effect(slot_config, system_prompt, user_prompt, max_tokens=1800,
+                                _payload=payload):
+                    if slot_config["slot"] == "ai1":
+                        return ({**_payload, "confidence": 86, "market_regime": "trend",
+                                 "summary": "stub"}, 11, 7, 9)
+                    return _response()          # ai2 是合法 propose
+                result = self._run(side_effect)
+                self.assertEqual("failed", result["status"],
+                                 "非法 decision 的 reviewer 不可用，双AI必须判 failed")
+                self.assertNotIn(result["status"], ("both_hold", "no_consensus"))
+                self.assertIn("unusable_decision", result["reason"])
+                self.assertFalse(result["consensus"])
+
+
+class SelfEvolutionMetricTests(AiReviewSlotTestBase):
+    """T45：self_evolution 指标必须按状态语义分层，no_consensus 不污染任何一项。"""
+
+    def _seed(self, statuses):
+        import self_evolution as SE
+        with self.factory() as conn:
+            SE.ensure_schema(conn)
+            for index, status in enumerate(statuses):
+                conn.execute(
+                    "INSERT INTO evolution_tracking(run_id, trigger, mode, status, market_regime,"
+                    " applied, applied_count, created_at) VALUES(?,?,?,?,?,?,?,?)",
+                    (index + 1, "test", "intraday", status, "trend", 0, 0, "2026-09-15 09:00:00"))
+            conn.commit()
+            return SE.get_performance_metrics(conn, 20)
+
+    def test_t45_metric_layering(self):
+        metrics = self._seed(["consensus", "both_hold", "no_consensus", "failed"])
+        self.assertEqual(4, metrics["sample_count"])
+        self.assertEqual(2, metrics["success_count"])
+        self.assertEqual(1, metrics["hold_count"])
+        self.assertEqual(1, metrics["failed_count"])
+        self.assertEqual(1, metrics["no_consensus_count"])
+        self.assertEqual(1, metrics["consensus_count"])
+        self.assertEqual(0.5, metrics["success_rate"])
+        self.assertEqual(0.25, metrics["hold_rate"])
+        self.assertEqual(0.25, metrics["failure_rate"])
+        self.assertEqual(0.25, metrics["no_consensus_rate"])
+        # no_consensus 不得被计入 success / hold / failure
+        self.assertEqual(metrics["success_count"], metrics["consensus_count"] + metrics["hold_count"])
+        self.assertEqual(metrics["success_count"], 2, "no_consensus 不得算 success")
+        self.assertEqual(metrics["hold_count"], 1, "no_consensus 不得算 hold")
+        self.assertEqual(metrics["failed_count"], 1, "no_consensus 不得算 failure")
+        # 四类互斥且完备：把 no_consensus 加回任一项都会让它不再等于样本数
+        self.assertEqual(
+            metrics["success_count"] + metrics["no_consensus_count"] + metrics["failed_count"],
+            metrics["sample_count"],
+            "success / no_consensus / failed 三类必须恰好覆盖全部样本",
+        )
+
+    def test_t45b_rates_track_their_own_buckets(self):
+        metrics = self._seed(["consensus", "consensus", "both_hold",
+                              "no_consensus", "no_consensus", "no_consensus", "failed"])
+        self.assertEqual(7, metrics["sample_count"])
+        self.assertEqual(3, metrics["success_count"])
+        self.assertEqual(1, metrics["hold_count"])
+        self.assertEqual(1, metrics["failed_count"])
+        self.assertEqual(3, metrics["no_consensus_count"])
+        self.assertAlmostEqual(3 / 7, metrics["success_rate"])
+        self.assertAlmostEqual(1 / 7, metrics["hold_rate"])
+        self.assertAlmostEqual(1 / 7, metrics["failure_rate"])
+        self.assertAlmostEqual(3 / 7, metrics["no_consensus_rate"])
+        self.assertAlmostEqual(2 / 7, metrics["consensus_rate"])
+
+
+class SingleModeRegressionTests(AiReviewSlotTestBase):
+    """T47：single 模式的既有语义不得被状态机改动。"""
+
+    def setUp(self):
+        super().setUp()
+        self.configure_slots()
+        with self.factory() as conn:
+            S.update_review_settings(conn, review_mode="single", single_reviewer_slot="ai1")
+
+    def test_t47_single_success_stays_single_review(self):
+        for decision, proposals in (("propose", None), ("hold", [])):
+            with self.subTest(decision=decision):
+                def side_effect(slot_config, system_prompt, user_prompt, max_tokens=1800,
+                                _d=decision, _p=proposals):
+                    return _response(decision=_d, proposals=_p)
+                with self.stub(side_effect):
+                    result = self.run_review(review_mode="single", single_reviewer_slot="ai1")
+                self.assertEqual(S.MODE_SINGLE_REVIEW, result["mode"])
+                self.assertEqual("single_review", result["status"])
+                self.assertFalse(result["consensus"])
+                row = self.audit(result["id"])
+                self.assertEqual("single_review", row["consensus_result"])
+
+    def test_t47b_single_failure_stays_single_review_failed(self):
+        def boom(slot_config, system_prompt, user_prompt, max_tokens=1800):
+            raise RuntimeError("down")
+        with self.stub(boom):
+            result = self.run_review(review_mode="single", single_reviewer_slot="ai1")
+        self.assertEqual("single_review_failed", result["status"])
+        self.assertFalse(result["consensus"])
+
+
+class ApplyGateRegressionTests(AiReviewSlotTestBase):
+    """T48：只有 consensus 能穿过 apply 门禁；其它四种状态一律不可 apply。"""
+
+    def setUp(self):
+        super().setUp()
+        self.configure_slots()
+        self.paper_path = os.path.join(self._tmp, "unused-paper.sqlite3")
+
+    def _apply(self, run_id):
+        import evolution_apply
+        return evolution_apply.apply_tuner_proposals(
+            self.factory, self.paper_path, run_id, confirmed=True)
+
+    def _gate_error(self, run_id):
+        with self.assertRaises(ValueError) as ctx:
+            self._apply(run_id)
+        return str(ctx.exception)
+
+    def test_t48_non_consensus_states_cannot_apply(self):
+        def boom(slot_config, system_prompt, user_prompt, max_tokens=1800):
+            raise RuntimeError("down")
+
+        cases = {
+            "both_hold": _decide("hold", "hold", proposals1=[], proposals2=[]),
+            "no_consensus": _decide("hold", "propose", proposals1=[]),
+            "failed": boom,
+        }
+        for expected_status, side_effect in cases.items():
+            with self.subTest(status=expected_status):
+                with self.stub(side_effect):
+                    run = self.run_review()
+                self.assertEqual(expected_status, run["status"])
+                self.assertEqual("只有 consensus 状态的运行可以应用", self._gate_error(run["id"]))
+
+        with self.factory() as conn:
+            S.update_review_settings(conn, review_mode="single", single_reviewer_slot="ai1")
+        with self.stub(self.agreeing):
+            single = self.run_review(review_mode="single", single_reviewer_slot="ai1")
+        self.assertEqual("single_review", single["status"])
+        self.assertEqual("只有 consensus 状态的运行可以应用", self._gate_error(single["id"]))
+
+    def test_t48b_consensus_still_reaches_the_next_gate(self):
+        # 负向对照：同一个 both_hold 行一旦被改成 consensus，拒绝原因就不再是状态门禁
+        with self.stub(_decide("hold", "hold", proposals1=[], proposals2=[])):
+            run = self.run_review()
+        self.assertEqual("both_hold", run["status"])
+        with self.factory() as conn:
+            conn.execute("UPDATE dual_ai_tuning_runs SET status='consensus' WHERE id=?",
+                         (run["id"],))
+            conn.commit()
+        message = self._gate_error(run["id"])
+        self.assertNotIn("只有 consensus 状态的运行可以应用", message)
+        self.assertIn("没有可应用的共识提案", message)
 
 
 if __name__ == "__main__":  # pragma: no cover
