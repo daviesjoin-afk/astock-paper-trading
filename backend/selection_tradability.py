@@ -113,7 +113,10 @@ REASON_UNKNOWN_PRICE_LIMIT = "unknown_price_limit"
 REASON_UNKNOWN_SUSPENSION_STATUS = "unknown_suspension_status"
 REASON_T1_NOT_SELLABLE = "t1_not_sellable"
 REASON_UNSUPPORTED_SECURITY_TYPE = "unsupported_security_type"
+REASON_UNKNOWN_ST_STATUS = "unknown_st_status"
 REASON_EVIDENCE_NOT_VISIBLE = "evidence_not_visible_at_action"
+REASON_EVIDENCE_SESSION_MISMATCH = "evidence_session_mismatch"
+REASON_EXIT_EVIDENCE_MISSING = "exit_evidence_missing"
 REASON_INVALID_SIDE = "invalid_side"
 REASON_INVALID_ACTION_TIME = "invalid_action_time"
 REASON_MISSING_CODE = "missing_security_code"
@@ -134,7 +137,10 @@ TRADABILITY_REASONS = (
     REASON_UNKNOWN_SUSPENSION_STATUS,
     REASON_T1_NOT_SELLABLE,
     REASON_UNSUPPORTED_SECURITY_TYPE,
+    REASON_UNKNOWN_ST_STATUS,
     REASON_EVIDENCE_NOT_VISIBLE,
+    REASON_EVIDENCE_SESSION_MISMATCH,
+    REASON_EXIT_EVIDENCE_MISSING,
     REASON_INVALID_SIDE,
     REASON_INVALID_ACTION_TIME,
     REASON_MISSING_CODE,
@@ -202,7 +208,13 @@ class MarketEvidence:
         ``halted=True``。
     ``name`` / ``risk_flag``
         **该 session 当时的**证券名称与风险警示标记，用于 ST 判定与账户权限。
-        缺失不是"非 ST"，而是"ST 状态未知"。
+        缺失不是"非 ST"，而是"ST 状态未知" → ``unproven / unknown_st_status``。
+        仓库里 ``selection_picks`` / ``paper_signals`` 都记了决策当时的 ``name``，
+        那是 PIT 正确的历史证据；**当前**快照里的名称不是。
+    ``volume_required``
+        该证据是否需要成交量才算完整。默认 ``False``：一个收盘价有效的 bar 本身
+        就证明当天成交过，成交量是冗余佐证。需要更严的调用方可以显式打开，
+        此时缺成交量 → ``unproven / missing_volume``。
     """
 
     session: Optional[str] = None
@@ -215,6 +227,7 @@ class MarketEvidence:
     halted: Optional[bool] = None
     name: Any = None
     risk_flag: Any = None
+    volume_required: bool = False
     provenance: Mapping[str, Any] = field(default_factory=dict)
 
 
@@ -405,13 +418,32 @@ def tradability_at(
         )
 
     # ── 2. 账户权限（不依赖行情证据，先判） ──
-    permission = security_permission(code_text, name=evidence.name, risk_flag=evidence.risk_flag)
+    # 板块由**代码段**决定，历史上完全可知；ST 由**当时的名称**决定，必须有证据。
+    # 两者分开：板块层面就已经出局的直接 blocked；板块在范围内但 ST 未知 → unproven。
+    board_scope = dict(PTR.security_scope(code_text, None, False))
+    if not board_scope.get("allowed"):
+        return _verdict(
+            status=STATUS_BLOCKED, reason=REASON_UNSUPPORTED_SECURITY_TYPE, side=side,
+            code=code_text, action_at=moment, evidence=evidence,
+            board=str(board_scope.get("board") or "") or None,
+            detail={"permission": board_scope.get("reason"), "basis": "security_code"},
+        )
+    if evidence.name is None and evidence.risk_flag is None:
+        # "不知道当时是不是 ST" 不等于"当时不是 ST"：账户权限无法证明 → fail closed。
+        return _verdict(
+            status=STATUS_UNPROVEN, reason=REASON_UNKNOWN_ST_STATUS, side=side,
+            code=code_text, action_at=moment, evidence=evidence,
+            board=str(board_scope.get("board") or "") or None,
+        )
+    permission = security_permission(
+        code_text, name=evidence.name, risk_flag=evidence.risk_flag
+    )
     board = str(permission.get("board") or "") or None
     if not permission.get("allowed"):
         return _verdict(
             status=STATUS_BLOCKED, reason=REASON_UNSUPPORTED_SECURITY_TYPE, side=side,
             code=code_text, action_at=moment, evidence=evidence, board=board,
-            detail={"permission": permission.get("reason")},
+            detail={"permission": permission.get("reason"), "basis": "historical_name"},
         )
 
     # ── 3. PIT：证据必须在动作时点已经可见 ──
@@ -456,14 +488,16 @@ def tradability_at(
         )
 
     # ── 7. 成交量证据 ──
+    # 一个收盘价有效的 bar 本身就证明当天成交过；成交量是冗余佐证。只有调用方
+    # 显式要求（``volume_required``）时缺失才算证据不足；显式 0 则是矛盾数据 → block。
     volume_value = _finite(evidence.volume)
-    if volume_value is None:
+    if volume_value is None and evidence.volume_required:
         return _verdict(
             status=STATUS_UNPROVEN, reason=REASON_MISSING_VOLUME, side=side,
             code=code_text, action_at=moment, evidence=evidence, board=board,
             price=price_value,
         )
-    if volume_value <= 0:
+    if volume_value is not None and volume_value <= 0:
         return _verdict(
             status=STATUS_BLOCKED, reason=REASON_ZERO_VOLUME, side=side,
             code=code_text, action_at=moment, evidence=evidence, board=board,
@@ -515,11 +549,41 @@ def tradability_at(
     )
 
 
+def _resolve_action_session(
+    evidence: MarketEvidence, *, intended_session: Any, side: str, code: str
+) -> tuple:
+    """动作 session 只能来自**调用方声明的目标 session**，不能由证据自己改。
+
+    若 evidence 带的是**另一个 session** 的 bar，绝不能"就地按它的收盘判定"，
+    否则一条目标 entry=06-18 的行配上一根 06-19 的 bar，会被判成可执行并记成
+    ``actual_entry_session=06-19`` —— 那正是契约禁止的"静默顺延到下一个 session"。
+    返回 ``(session | None, mismatch | None)``。
+    """
+    intended = str(intended_session)[:10] if intended_session is not None else None
+    actual = str(evidence.session)[:10] if evidence.session is not None else None
+    if intended is None:
+        return actual, None
+    if actual is None:
+        return intended, None
+    if actual != intended:
+        return None, {"intended_session": intended, "evidence_session": actual}
+    return intended, None
+
+
 def entry_tradability(
     evidence: MarketEvidence, *, code: Any, entry_session: Any = None
 ) -> TradabilityVerdict:
     """入场（买入方向）。``action_at`` = 目标 entry session 的收盘可用时点。"""
-    session = evidence.session or entry_session
+    session, mismatch = _resolve_action_session(
+        evidence, intended_session=entry_session, side=SIDE_BUY, code=str(code or "")
+    )
+    if mismatch is not None:
+        return _verdict(
+            status=STATUS_INVALID, reason=REASON_EVIDENCE_SESSION_MISMATCH,
+            side=SIDE_BUY, code=str(code or ""),
+            action_at=session_close_at(mismatch["intended_session"]), evidence=evidence,
+            detail=mismatch,
+        )
     return tradability_at(
         evidence, code=code, side=SIDE_BUY, action_at=session_close_at(session)
     )
@@ -533,7 +597,16 @@ def exit_tradability(
     entry_session: Any = None,
 ) -> TradabilityVerdict:
     """离场（卖出方向）。``entry_session`` 给了就一并校验 T+1。"""
-    session = evidence.session or exit_session
+    session, mismatch = _resolve_action_session(
+        evidence, intended_session=exit_session, side=SIDE_SELL, code=str(code or "")
+    )
+    if mismatch is not None:
+        return _verdict(
+            status=STATUS_INVALID, reason=REASON_EVIDENCE_SESSION_MISMATCH,
+            side=SIDE_SELL, code=str(code or ""),
+            action_at=session_close_at(mismatch["intended_session"]), evidence=evidence,
+            detail=mismatch,
+        )
     return tradability_at(
         evidence,
         code=code,
@@ -569,6 +642,11 @@ class ExecutableSelectionOutcome:
     intended_exit_session: Optional[str] = None
     actual_exit_session: Optional[str] = None
 
+    #: **入场侧**是否可执行。它与 :attr:`executable` 不是一回事：一条只建模了
+    #: 入场（未提供离场证据）的样本可以 ``entry_executable=True`` 而
+    #: ``executable=False`` —— "买得进"不等于"这笔完整交易可执行"。
+    entry_executable: bool = False
+    #: 入场**与**离场都真正可执行，才算一个完整的 executable outcome。
     executable: bool = False
 
     market_label_status: Optional[str] = None
@@ -590,6 +668,7 @@ class ExecutableSelectionOutcome:
             "exit_reason": self.exit_reason,
             "intended_exit_session": self.intended_exit_session,
             "actual_exit_session": self.actual_exit_session,
+            "entry_executable": self.entry_executable,
             "executable": self.executable,
             "market_label_status": self.market_label_status,
             "market_label_value": self.market_label_value,
@@ -682,17 +761,24 @@ def build_executable_outcomes(rows: Sequence[SelectionRow]) -> dict:
                 exit_evidence,
                 code=row.code,
                 exit_session=row.intended_exit_session,
-                entry_session=entry_evidence.session or row.intended_entry_session,
+                entry_session=row.intended_entry_session,
             )
             exit_status = exit_verdict.status
             exit_reason = exit_verdict.reason
-            _bump(exit_reason)
+        else:
+            # 没有离场证据 = 这笔完整交易的可执行性**无法成立**，而不是"离场没问题"。
+            # 明确记成 unproven + 机器 reason，而不是留一个 None 让上层当成通过。
+            exit_status = STATUS_UNPROVEN
+            exit_reason = REASON_EXIT_EVIDENCE_MISSING
+        _bump(exit_reason)
 
         entry_ok = entry.status == STATUS_EXECUTABLE
-        exit_ok = exit_verdict is None or exit_verdict.status == STATUS_EXECUTABLE
+        # 完整 executable outcome 要求**两侧**都真正可执行：只有入场可执行、
+        # 没有离场证据的样本，只是"买得进"，不是一笔可执行交易。
+        exit_ok = exit_verdict is not None and exit_verdict.status == STATUS_EXECUTABLE
         executable = bool(entry_ok and exit_ok)
 
-        if entry_ok and (exit_verdict is None or exit_ok):
+        if executable:
             report["executable"] += 1
         elif not entry_ok:
             if entry.status == STATUS_BLOCKED:
@@ -702,16 +788,14 @@ def build_executable_outcomes(rows: Sequence[SelectionRow]) -> dict:
             else:
                 report["invalid"] += 1
         else:
-            if exit_verdict.status == STATUS_BLOCKED:
-                report["blocked_exit"] += 1
-            elif exit_verdict.status == STATUS_UNPROVEN:
+            if exit_verdict is None or exit_verdict.status == STATUS_UNPROVEN:
                 report["unproven"] += 1
+            elif exit_verdict.status == STATUS_BLOCKED:
+                report["blocked_exit"] += 1
             else:
                 report["invalid"] += 1
 
-        if entry.status == STATUS_EXECUTABLE and exit_verdict is not None:
-            report["tradability_verified"] += 1
-        elif entry.status == STATUS_EXECUTABLE:
+        if entry_ok:
             report["tradability_verified"] += 1
 
         outcomes.append(
@@ -724,18 +808,15 @@ def build_executable_outcomes(rows: Sequence[SelectionRow]) -> dict:
                 intended_entry_session=row.intended_entry_session,
                 # blocked / unproven 一律不顺延：没有权威 retry 证据就不编一个成交日。
                 actual_entry_session=(
-                    entry_evidence.session or row.intended_entry_session
-                    if entry.status == STATUS_EXECUTABLE
-                    else None
+                    row.intended_entry_session if entry_ok else None
                 ),
                 exit_status=exit_status,
                 exit_reason=exit_reason,
                 intended_exit_session=row.intended_exit_session,
                 actual_exit_session=(
-                    (row.exit_evidence.session if row.exit_evidence else row.intended_exit_session)
-                    if executable
-                    else None
+                    row.intended_exit_session if executable else None
                 ),
+                entry_executable=entry_ok,
                 executable=executable,
                 market_label_status=row.market_label_status,
                 market_label_value=_finite(row.market_label_value),
@@ -810,6 +891,7 @@ def _self_check() -> None:
     ok = MarketEvidence(
         session="2024-06-18", available_at=session_close_at("2024-06-18"),
         price=10.2, reference_price=10.0, volume=1_000_000.0, halted=False,
+        name="某某股份",
     )
     verdict = entry_tradability(ok, code="600001", entry_session="2024-06-18")
     assert verdict.status == STATUS_EXECUTABLE, verdict
@@ -818,6 +900,7 @@ def _self_check() -> None:
     limit_up = MarketEvidence(
         session="2024-06-18", available_at=session_close_at("2024-06-18"),
         price=11.0, reference_price=10.0, volume=1_000_000.0, halted=False,
+        name="某某股份",
     )
     buy = entry_tradability(limit_up, code="600001", entry_session="2024-06-18")
     assert buy.status == STATUS_BLOCKED and buy.reason == REASON_LIMIT_UP_BUY_BLOCKED, buy
@@ -832,6 +915,7 @@ def _self_check() -> None:
                 exit_evidence=MarketEvidence(
                     session="2024-06-20", available_at=session_close_at("2024-06-20"),
                     price=11.5, reference_price=11.0, volume=900_000.0, halted=False,
+                    name="某某股份",
                 ),
                 market_label_status="verified", market_label_value=0.045,
             ),

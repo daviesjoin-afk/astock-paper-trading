@@ -13,6 +13,7 @@ import random
 import unittest
 
 import paper_trading_rules as PTR
+import selection_labels as SL
 import selection_tradability as ST
 import walk_forward_validation as WFV
 
@@ -33,10 +34,12 @@ def evidence(
     reference=10.0,
     volume=1_000_000.0,
     halted=False,
-    name=None,
+    name="某某股份",
     risk_flag=None,
     available_at=None,
+    volume_required=False,
 ):
+    """一条 PIT 证据。``name`` 默认给出**历史**名称 —— 缺了它就是 ST 未知。"""
     return ST.MarketEvidence(
         session=session,
         available_at=(
@@ -48,6 +51,7 @@ def evidence(
         halted=halted,
         name=name,
         risk_flag=risk_flag,
+        volume_required=volume_required,
     )
 
 
@@ -177,22 +181,59 @@ class CoreVerdictTest(unittest.TestCase):
         self.assertFalse(verdict.executable)
 
     def test_p7_unknown_price_limit_evidence_is_unproven_where_it_matters(self):
-        """P7：只有 ST 状态会改变结论时才判 ``unknown_price_limit``。"""
-        # 主板：+7% 落在 [5%, 9.5%) 的歧义区间 → unproven。
-        ambiguous = buy(evidence(price=107.0, reference=100.0))
-        self.assertEqual(ST.STATUS_UNPROVEN, ambiguous.status)
-        self.assertEqual(ST.REASON_UNKNOWN_PRICE_LIMIT, ambiguous.reason)
-        # +2%：无论 ST 与否都碰不到涨跌停 → 与 ST 无关，直接可执行。
+        """P7：``resolve_limit_pct`` 只在 ST 会改变结论的区间里要求 ST 证据。
+
+        这是底层解析器的语义；``tradability_at`` 更早就会因 ST 未知而
+        ``unproven / unknown_st_status``（见 P7b），所以这里直接测解析器。
+        """
+        # 主板：+7% 落在 [5%, 9.5%) 的歧义区间 → 无法判定。
         self.assertEqual(
-            ST.STATUS_EXECUTABLE, buy(evidence(price=102.0, reference=100.0)).status
+            (None, ST.REASON_UNKNOWN_PRICE_LIMIT),
+            ST.resolve_limit_pct(MAIN_BOARD, name=None, risk_flag=None, pct_change=0.07),
         )
-        # +10%：无论 ST 与否都会被拦 → 与 ST 无关，直接 blocked。
+        # +2%：无论 ST 与否都碰不到涨跌停 → 与 ST 无关。
         self.assertEqual(
-            ST.STATUS_BLOCKED, buy(evidence(price=110.0, reference=100.0)).status
+            (9.5, None),
+            ST.resolve_limit_pct(MAIN_BOARD, name=None, risk_flag=None, pct_change=0.02),
         )
-        # 给出历史名称（非 ST）→ 歧义消失。
-        named = buy(evidence(price=107.0, reference=100.0, name="某某股份"))
-        self.assertEqual(ST.STATUS_EXECUTABLE, named.status)
+        # +10%：无论 ST 与否都会被拦 → 与 ST 无关。
+        self.assertEqual(
+            (9.5, None),
+            ST.resolve_limit_pct(MAIN_BOARD, name=None, risk_flag=None, pct_change=0.10),
+        )
+        # 给出历史名称 → 歧义消失。
+        self.assertEqual(
+            (9.5, None),
+            ST.resolve_limit_pct(
+                MAIN_BOARD, name="某某股份", risk_flag=None, pct_change=0.07
+            ),
+        )
+
+    def test_p7b_unknown_historical_st_status_fails_closed(self):
+        """P7b：**历史** ST 状态未知时，账户权限无法证明 → ``unproven``。
+
+        "不知道当时是不是 ST" 不等于"当时不是 ST"：ST 证券不在账户权限范围内，
+        所以缺名称/风险标记时不能放行。板块层面（由代码段决定）仍然照常判定。
+        """
+        unknown = buy(evidence(price=102.0, reference=100.0, name=None, risk_flag=None))
+        self.assertEqual(ST.STATUS_UNPROVEN, unknown.status)
+        self.assertEqual(ST.REASON_UNKNOWN_ST_STATUS, unknown.reason)
+        self.assertFalse(unknown.executable)
+        # 给出历史名称（非 ST）→ 可执行。
+        self.assertEqual(
+            ST.STATUS_EXECUTABLE,
+            buy(evidence(price=102.0, reference=100.0, name="某某股份")).status,
+        )
+        # 板块层面就出局的（科创板/北交所/其他）不需要 ST 证据也是 blocked。
+        for code in (STAR, BSE, "900001"):
+            verdict = buy(evidence(price=102.0, reference=100.0, name=None), code=code)
+            self.assertEqual(ST.STATUS_BLOCKED, verdict.status, code)
+            self.assertEqual(ST.REASON_UNSUPPORTED_SECURITY_TYPE, verdict.reason, code)
+        # risk_flag 单独给出也算 ST 证据。
+        self.assertEqual(
+            ST.STATUS_BLOCKED,
+            buy(evidence(price=102.0, reference=100.0, name=None, risk_flag=True)).status,
+        )
 
     def test_p8_missing_or_invalid_price_is_never_coerced_to_zero(self):
         """P8：缺失/非法价格绝不变成 0，也绝不成交。"""
@@ -206,13 +247,21 @@ class CoreVerdictTest(unittest.TestCase):
         self.assertIsNone(missing.price)
 
     def test_p9_zero_and_missing_volume_are_explicit(self):
-        """P9：0 成交量与缺成交量是两种显式状态，不是同一个"没问题"。"""
+        """P9：0 成交量与缺成交量是两种显式状态。
+
+        一个收盘价有效的 bar 本身就证明当天成交过，成交量是冗余佐证，所以默认
+        **不**要求它；显式 0 是矛盾数据 → blocked。需要更严的调用方显式打开
+        ``volume_required``。
+        """
         zero = buy(evidence(volume=0))
         self.assertEqual(ST.STATUS_BLOCKED, zero.status)
         self.assertEqual(ST.REASON_ZERO_VOLUME, zero.reason)
-        missing = buy(evidence(volume=None))
-        self.assertEqual(ST.STATUS_UNPROVEN, missing.status)
-        self.assertEqual(ST.REASON_MISSING_VOLUME, missing.reason)
+        # 默认：缺成交量不阻塞（bar 本身是成交证据）。
+        self.assertEqual(ST.STATUS_EXECUTABLE, buy(evidence(volume=None)).status)
+        # 显式要求成交量时：缺失 → unproven。
+        strict = buy(evidence(volume=None, volume_required=True))
+        self.assertEqual(ST.STATUS_UNPROVEN, strict.status)
+        self.assertEqual(ST.REASON_MISSING_VOLUME, strict.reason)
 
 
 # ─────────────────── P10–P14: PIT / current-state sentinels ───────────────────
@@ -391,6 +440,78 @@ class NoSilentCarryForwardTest(unittest.TestCase):
         self.assertEqual(
             "2024-06-17",
             ST.earliest_sellable_session(MAIN_BOARD, name=None, entry_session="2024-06-14"),
+        )
+
+    def test_p31_evidence_from_another_session_is_rejected(self):
+        """P31：evidence 带的是**另一个 session** 的 bar 时，绝不"就地按它的收盘判定"。
+
+        一条目标 entry=06-18 的行配上一根 06-19 的 bar，若按 06-19 收盘判定，
+        就会被判成可执行并记成 ``actual_entry_session=06-19`` —— 正是契约禁止的
+        "静默顺延到下一个 session"。
+        """
+        wrong_session = evidence(session=NEXT_SESSION, price=102.0, reference=100.0)
+        verdict = ST.entry_tradability(
+            wrong_session, code=MAIN_BOARD, entry_session=SESSION
+        )
+        self.assertEqual(ST.STATUS_INVALID, verdict.status)
+        self.assertEqual(ST.REASON_EVIDENCE_SESSION_MISMATCH, verdict.reason)
+        self.assertFalse(verdict.executable)
+        self.assertEqual(SESSION, verdict.detail["intended_session"])
+        self.assertEqual(NEXT_SESSION, verdict.detail["evidence_session"])
+
+        # 出口侧同样拒绝。
+        exit_verdict = ST.exit_tradability(
+            evidence(session="2024-06-20", price=102.0, reference=100.0),
+            code=MAIN_BOARD, exit_session="2024-06-19", entry_session=SESSION,
+        )
+        self.assertEqual(ST.STATUS_INVALID, exit_verdict.status)
+        self.assertEqual(ST.REASON_EVIDENCE_SESSION_MISMATCH, exit_verdict.reason)
+
+        # 端到端：错位证据不得制造一次成交。
+        built = ST.build_executable_outcomes(
+            [
+                ST.SelectionRow(
+                    sample_key="a", code=MAIN_BOARD, selected=True,
+                    intended_entry_session=SESSION,
+                    entry_evidence=evidence(session=NEXT_SESSION, price=102.0, reference=100.0),
+                    market_label_status="verified", market_label_value=0.2,
+                )
+            ]
+        )
+        outcome = built["outcomes"][0]
+        self.assertFalse(outcome.executable)
+        self.assertIsNone(outcome.actual_entry_session)
+        self.assertIsNone(outcome.executable_return)
+
+    def test_p32_missing_exit_evidence_is_not_a_successful_exit(self):
+        """P32：没有离场证据 ≠ 离场没问题 —— 完整 executable outcome 要求两侧都可执行。"""
+        built = ST.build_executable_outcomes(
+            [
+                ST.SelectionRow(
+                    sample_key="entry-only", code=MAIN_BOARD, selected=True,
+                    intended_entry_session=SESSION,
+                    entry_evidence=evidence(price=102.0, reference=100.0),
+                    market_label_status="verified", market_label_value=0.2,
+                )
+            ]
+        )
+        outcome = built["outcomes"][0]
+        # 入场侧确实可执行，但那只是"买得进"。
+        self.assertTrue(outcome.entry_executable)
+        self.assertFalse(outcome.executable)
+        self.assertEqual(ST.STATUS_UNPROVEN, outcome.exit_status)
+        self.assertEqual(ST.REASON_EXIT_EVIDENCE_MISSING, outcome.exit_reason)
+        self.assertIsNone(outcome.actual_exit_session)
+        self.assertIsNone(outcome.executable_return)
+        self.assertEqual(0, built["report"]["executable"])
+        self.assertEqual(1, built["report"]["unproven"])
+        self.assertTrue(ST.audit_totals(built["report"])["complete"])
+        # executable-only 口径不得收下它。
+        self.assertEqual(
+            [],
+            ST.evaluation_eligibility(
+                built["outcomes"], mode=ST.MODE_EXECUTABLE
+            )["sample_keys"],
         )
 
 
@@ -762,6 +883,120 @@ class DelegationGuardTest(unittest.TestCase):
                 if node.value in forbidden and node.value != ST.ST_LIMIT_PCT:
                     found.append((node.lineno, node.value))
         self.assertEqual([], found, f"local price-limit constants: {found}")
+
+
+class ProductionEvaluatorWiringTest(unittest.TestCase):
+    """生产评估路径真的在用可执行子集，而不是"只加了个没人调用的模式"。"""
+
+    #: 06-17 是 06-14 决策之后的第一个交易日（entry），06-18 是 exit。
+    KLINES = {
+        # entry +5%，exit +10%：买入方向没被拦（卖出方向不看涨停）→ 可执行。
+        "600001": {
+            "2024-06-14": (10.0, 10.0),
+            "2024-06-17": (10.0, 10.5),
+            "2024-06-18": (10.5, 11.55),
+            "2024-06-19": (11.5, 11.6),
+        },
+        # entry 正好 +10%：主板涨停买不进 → blocked_entry。
+        "600002": {
+            "2024-06-14": (10.0, 10.0),
+            "2024-06-17": (10.0, 11.0),
+            "2024-06-18": (11.0, 11.5),
+            "2024-06-19": (11.5, 11.6),
+        },
+    }
+
+    def _evaluate(self, picks, **kwargs):
+        import selection_alpha_report as AR
+
+        original = AR.load_kline
+        AR.load_kline = lambda code: dict(self.KLINES.get(code) or {})
+        try:
+            sessions = SL.normalize_sessions(
+                sorted({day for bars in self.KLINES.values() for day in bars})
+            )
+            return AR.evaluate(
+                picks, 1, "选股质量", sessions, asof="2024-06-30", **kwargs
+            )
+        finally:
+            AR.load_kline = original
+
+    def test_production_evaluator_excludes_unexecutable_picks_by_default(self):
+        """生产默认口径 = executable only：买不进的样本不再进均值。"""
+        picks = [
+            ("s1", "2024-06-14", "600001", "某某股份"),
+            ("s1", "2024-06-14", "600002", "某某股份"),
+        ]
+        lines, summary = self._evaluate(picks)
+        self.assertEqual(ST.MODE_EXECUTABLE, summary["tradability_mode"])
+        self.assertEqual(1, summary["entry_counts"]["executable"])
+        self.assertEqual(1, summary["entry_counts"]["blocked_entry"])
+        # 只有可执行的那一条进入均值 —— 这就是"生产指标真的变了"。
+        self.assertEqual(1, summary["n"])
+        self.assertIsNotNone(summary["mean_return"])
+        # 但被拦的那条**没有消失**，它在计数里。
+        self.assertEqual(
+            1, summary["tradability_counts"][ST.REASON_LIMIT_UP_BUY_BLOCKED]
+        )
+        joined = "\n".join(lines)
+        self.assertIn("可成交性：", joined)
+        self.assertIn("可执行样本", joined)
+
+    def test_production_evaluator_market_mode_is_explicit(self):
+        """market counterfactual 口径必须显式选择，且两条都保留。"""
+        picks = [
+            ("s1", "2024-06-14", "600001", "某某股份"),
+            ("s1", "2024-06-14", "600002", "某某股份"),
+        ]
+        _, summary = self._evaluate(picks, tradability_mode=ST.MODE_MARKET)
+        self.assertEqual(2, summary["n"])
+        self.assertEqual(1, summary["entry_counts"]["blocked_entry"])
+        # 未知口径直接拒绝。
+        with self.assertRaises(ValueError):
+            self._evaluate(picks, tradability_mode="nope")
+
+    def test_production_evaluator_fails_closed_without_historical_name(self):
+        """没有**历史**名称 → ST 未知 → unproven → 不进可执行均值（fail closed）。"""
+        picks = [("s1", "2024-06-14", "600001", None)]
+        lines, summary = self._evaluate(picks)
+        self.assertEqual(0, summary["n"])
+        self.assertEqual(1, summary["entry_counts"]["unproven"])
+        # entry 与 exit 两侧都因 ST 未知而 unproven，所以该 reason 计数是 2。
+        self.assertEqual(
+            2, summary["tradability_counts"][ST.REASON_UNKNOWN_ST_STATUS]
+        )
+        self.assertIn("没有任何样本能证明可执行", "\n".join(lines))
+
+    def test_production_evaluator_reads_the_name_recorded_at_decision_time(self):
+        """pick 加载器带回**决策当时**记录的 name，而不是当前快照的名称。"""
+        import os
+        import sqlite3 as sq
+        import tempfile
+
+        import selection_alpha_report as AR
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db = os.path.join(tmp, "selection_tracking.db")
+            conn = sq.connect(db)
+            conn.execute(
+                "CREATE TABLE selection_runs(id INTEGER PRIMARY KEY, strategy TEXT,"
+                " data_asof_date TEXT)"
+            )
+            conn.execute(
+                "CREATE TABLE selection_picks(run_id INTEGER, code TEXT, rank_no INTEGER,"
+                " name TEXT)"
+            )
+            conn.execute("INSERT INTO selection_runs VALUES(1,'s1','2024-06-14')")
+            conn.execute("INSERT INTO selection_picks VALUES(1,'600001',1,'某某股份')")
+            conn.commit()
+            conn.close()
+            original = AR.DATA_DIR
+            AR.DATA_DIR = tmp
+            try:
+                picks = AR.picks_from_tracking(3650)
+            finally:
+                AR.DATA_DIR = original
+        self.assertEqual([("s1", "2024-06-14", "600001", "某某股份")], picks)
 
 
 if __name__ == "__main__":

@@ -32,6 +32,7 @@ import sqlite3
 import statistics
 
 import selection_labels as SL
+import selection_tradability as ST
 
 BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DATA_DIR = os.path.join(BASE, "data_cache")
@@ -140,14 +141,66 @@ def benchmark_map(dates, horizon, sessions, *, asof):
     return {day: statistics.mean(v) for day, v in per_date.items() if v}
 
 
-def evaluate(picks, horizon, label, sessions, *, asof):
-    """picks: list of (strategy, decision_day, code). Returns (lines, summary)."""
+def _previous_close(kline, session):
+    """``session`` 之前最近一个交易日的收盘价（涨跌停的参考价）。
+
+    只读**该 session 之前**的 bar，绝不使用当日或之后的成交信息。
+    """
+    if not kline or session is None:
+        return None
+    prior = [day for day in sorted(kline) if day < str(session)[:10]]
+    if not prior:
+        return None
+    try:
+        return float(kline[prior[-1]][1])
+    except (IndexError, TypeError, ValueError):
+        return None
+
+
+def _tradability_evidence(code, name, session, price, kline):
+    """把一条 #147 标签 + 日线 + 决策当时的名称适配成 tradability 证据。
+
+    ``halted=False`` 有依据：标签是 ``verified``，意味着 entry/exit 价格已经过了
+    ``selection_labels.price_point``（它把 ``halted`` / ``missing`` / ``invalid``
+    严格分开）—— 我们没有在这里重新判断停牌，而是消费 #147 已经建立的证据。
+
+    ``name`` 必须是**决策当时**记录的名称（``selection_picks.name`` /
+    ``paper_signals.name``）；拿当前快照的名称来重写历史是 PIT 违规。
+    """
+    if session is None:
+        return None
+    return ST.MarketEvidence(
+        session=str(session)[:10],
+        available_at=ST.session_close_at(str(session)[:10]),
+        price=price,
+        reference_price=_previous_close(kline, session),
+        halted=False,
+        name=name,
+    )
+
+
+def evaluate(picks, horizon, label, sessions, *, asof,
+             tradability_mode=ST.MODE_EXECUTABLE):
+    """picks: list of (strategy, decision_day, code[, name]). Returns (lines, summary).
+
+    ``tradability_mode``
+        生产选股质量默认用 ``executable_only``（§22）：只有 entry 与 exit 都真正
+        可执行的样本才进入均值/胜率/超额。被拦或证据不足的样本**不会消失** ——
+        它们进入 ``tradability_counts`` 与报告里的"可执行"一栏，所以"策略选了 100
+        条、其中 80 条真能成交"是可读的。需要 market counterfactual 口径的调用方
+        显式传 ``ST.MODE_MARKET``。
+    """
+    if tradability_mode not in ST.EVALUATION_MODES:
+        raise ValueError(f"unknown tradability_mode: {tradability_mode!r}")
     by_strategy = {}
     kline_cache = {}
-    dates = {day for _, day, _ in picks}
+    dates = {pick[1] for pick in picks}
     bench = benchmark_map(dates, horizon, sessions, asof=asof)
     status_counts = {status: 0 for status in SL.LABEL_STATUSES}
-    for strategy, day, code in picks:
+    verified = []
+    for pick in picks:
+        strategy, day, code = pick[0], pick[1], pick[2]
+        name = pick[3] if len(pick) > 3 else None
         kline = kline_cache.setdefault(code, load_kline(code))
         result = label_for(code, day, horizon, sessions, asof=asof, kline=kline)
         status_counts[result.label_status] += 1
@@ -155,15 +208,59 @@ def evaluate(picks, horizon, label, sessions, *, asof):
             # pending（未走完）/ unavailable（缺证据）明确计数，
             # 既不进均值也不当负例。
             continue
-        item = by_strategy.setdefault(strategy, {"r": [], "excess": []})
+        verified.append((strategy, day, code, name, result, kline))
+
+    # 可成交性判定走唯一权威实现，不在报告层复制任何规则。
+    rows = [
+        ST.SelectionRow(
+            sample_key=f"{strategy}|{day}|{code}",
+            code=code,
+            selected=True,
+            intended_entry_session=result.entry_date,
+            entry_evidence=_tradability_evidence(code, name, result.entry_date,
+                                                 result.entry_price, kline),
+            intended_exit_session=result.exit_date,
+            exit_evidence=_tradability_evidence(code, name, result.exit_date,
+                                                result.exit_price, kline),
+            market_label_status=result.label_status,
+            market_label_value=result.raw_forward_return,
+        )
+        for strategy, day, code, name, result, kline in verified
+    ]
+    built = ST.build_executable_outcomes(rows)
+    outcomes = {outcome.sample_key: outcome for outcome in built["outcomes"]}
+    tradability_counts = dict(built["report"]["reason_counts"])
+    entry_counts = {
+        "executable": 0, "blocked_entry": 0, "blocked_exit": 0,
+        "unproven": 0, "invalid": 0,
+    }
+    for strategy, day, code, name, result, kline in verified:
+        outcome = outcomes[f"{strategy}|{day}|{code}"]
+        if outcome.executable:
+            entry_counts["executable"] += 1
+        elif outcome.entry_status == ST.STATUS_BLOCKED:
+            entry_counts["blocked_entry"] += 1
+        elif outcome.exit_status == ST.STATUS_BLOCKED:
+            entry_counts["blocked_exit"] += 1
+        elif outcome.entry_status == ST.STATUS_INVALID or outcome.exit_status == ST.STATUS_INVALID:
+            entry_counts["invalid"] += 1
+        else:
+            entry_counts["unproven"] += 1
+        if tradability_mode == ST.MODE_EXECUTABLE and not outcome.executable:
+            continue
+        item = by_strategy.setdefault(
+            strategy, {"r": [], "excess": [], "executable": 0}
+        )
         item["r"].append(result.raw_forward_return)
+        item["executable"] += 1 if outcome.executable else 0
         if day in bench:
             item["excess"].append(result.raw_forward_return - bench[day])
+
     lines = [
         f"\n### {label}（T+{horizon} 交易日，entry = 决策后首个交易日收盘；"
-        f"标签口径 {LABEL_VERSION}）\n",
-        "| 策略 | 已验证样本 | 均值收益 | 胜率 | 超额(vs同日抽样均值) | 基准 |",
-        "|---|---|---|---|---|---|",
+        f"标签口径 {LABEL_VERSION}；可成交口径 {tradability_mode}）\n",
+        "| 策略 | 已验证样本 | 可执行样本 | 均值收益 | 胜率 | 超额(vs同日抽样均值) | 基准 |",
+        "|---|---|---|---|---|---|---|",
     ]
     all_r, all_x = [], []
     for strategy in sorted(by_strategy):
@@ -173,7 +270,8 @@ def evaluate(picks, horizon, label, sessions, *, asof):
         mean_x = statistics.mean(item["excess"]) if item["excess"] else None
         bench_mean = statistics.mean(bench.values()) if bench else None
         lines.append(
-            f"| {strategy} | {len(item['r'])} | {mean_r * 100:+.2f}% | {win * 100:.0f}% | "
+            f"| {strategy} | {len(item['r'])} | {item['executable']} | "
+            f"{mean_r * 100:+.2f}% | {win * 100:.0f}% | "
             f"{(mean_x * 100) if mean_x is not None else float('nan'):+.2f}% | "
             f"{(bench_mean * 100) if bench_mean is not None else float('nan'):+.2f}% |"
         )
@@ -185,16 +283,36 @@ def evaluate(picks, horizon, label, sessions, *, asof):
         )
         + "（非 verified 的样本不计入任何均值或胜率）"
     )
+    lines.append(
+        "可成交性："
+        + "，".join(f"{name} {count}" for name, count in entry_counts.items())
+        + f"（口径 {tradability_mode}；不可执行的样本保留在计数里，不静默丢弃）"
+    )
+    if entry_counts["unproven"] and not entry_counts["executable"]:
+        lines.append(
+            "⚠️ 没有任何样本能证明可执行：历史 ST 名称/涨跌停参考价等证据不足时，"
+            "本 contract 一律 fail closed 判为 unproven，而不是默认可成交。"
+        )
     summary = {
         "label": label,
         "horizon": horizon,
         "label_version": LABEL_VERSION,
+        "tradability_mode": tradability_mode,
+        "tradability_counts": tradability_counts,
+        "entry_counts": entry_counts,
         "n": len(all_r),
         "mean_return": round(statistics.mean(all_r) * 100, 2) if all_r else None,
         "mean_excess": round(statistics.mean(all_x) * 100, 2) if all_x else None,
         "label_status_counts": status_counts,
     }
     return lines, summary
+
+
+def _table_columns(conn, table):
+    try:
+        return {str(row[1]) for row in conn.execute(f"PRAGMA table_info({table})")}
+    except sqlite3.Error:
+        return set()
 
 
 def picks_from_tracking(days):
@@ -204,15 +322,23 @@ def picks_from_tracking(days):
     cutoff = (datetime.date.today() - datetime.timedelta(days=days)).isoformat()
     conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
     try:
+        # ``selection_picks.name`` 是**决策当时**记录的名称 —— 可成交性判定需要它
+        # 来判断历史 ST 状态；拿当前快照的名称重写历史是 PIT 违规。
+        has_name = "name" in _table_columns(conn, "selection_picks")
+        columns = "p.code, p.rank_no" + (", p.name" if has_name else "")
         rows = conn.execute(
-            """SELECT r.strategy, r.data_asof_date, p.code, p.rank_no
+            f"""SELECT r.strategy, r.data_asof_date, {columns}
                  FROM selection_picks p JOIN selection_runs r ON r.id = p.run_id
                  WHERE r.data_asof_date >= ? AND r.data_asof_date IS NOT NULL""",
             (cutoff,),
         ).fetchall()
     finally:
         conn.close()
-    return [(str(r[0]), str(r[1])[:10], str(r[2])) for r in rows]
+    picks = []
+    for row in rows:
+        name = str(row[4]) if has_name and row[4] is not None else None
+        picks.append((str(row[0]), str(row[1])[:10], str(row[2]), name))
+    return picks
 
 
 def picks_from_signals(days):
@@ -230,14 +356,20 @@ def picks_from_signals(days):
     cutoff = (datetime.date.today() - datetime.timedelta(days=days)).isoformat()
     conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
     try:
+        has_name = "name" in _table_columns(conn, "paper_signals")
+        columns = "account_id, signal_date, code" + (", name" if has_name else "")
         rows = conn.execute(
-            """SELECT account_id, signal_date, code FROM paper_signals
+            f"""SELECT {columns} FROM paper_signals
                 WHERE status='filled' AND signal_date IS NOT NULL AND signal_date >= ?""",
             (cutoff,),
         ).fetchall()
     finally:
         conn.close()
-    return [(f"filled:{r[0]}", str(r[1])[:10], str(r[2])) for r in rows]
+    picks = []
+    for row in rows:
+        name = str(row[3]) if has_name and row[3] is not None else None
+        picks.append((f"filled:{row[0]}", str(row[1])[:10], str(row[2]), name))
+    return picks
 
 
 def main():
