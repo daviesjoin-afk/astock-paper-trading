@@ -1,11 +1,14 @@
 # -*- coding: utf-8 -*-
-"""通用 AI 审核槽位（``ai1`` / ``ai2``）契约测试：T1–T52（含 C1–C6）。
+"""通用 AI 审核槽位（``ai1`` / ``ai2``）契约测试：T1–T62（含 C1–C6）。
 
-对应两组 PR 的验收清单：
+对应三组 PR 的验收清单：
 
 - 「refactor: generalize AI review into configurable AI1/AI2 slots」（T1–T34）
 - 「fix(ai-review): distinguish hold, disagreement, and reviewer failure」
   （T35–T52 + C1–C6：dual 结果状态机、reviewer 响应可用性校验、指标分层、apply 门禁）
+- 「fix(evolution): isolate reviewer failures from strategy learning」
+  （T53–T62：reviewer 可靠性证据与策略学习证据的**分层**；``failed`` 不进
+  learning denominator；raw 兼容字段与 learning 字段并存）
 
 **全部离线**：不联网、不调用任何真实付费 AI API。所有"调用"都被
 ``ai_review_service._call_slot`` 的桩替换；需要真实 key 的地方一律用假字符串。
@@ -1270,6 +1273,356 @@ class ApplyGateRegressionTests(AiReviewSlotTestBase):
         message = self._gate_error(run["id"])
         self.assertNotIn("只有 consensus 状态的运行可以应用", message)
         self.assertIn("没有可应用的共识提案", message)
+
+
+class ReviewerFailureIsolationTests(AiReviewSlotTestBase):
+    """T53–T62：reviewer 可靠性失败不得污染策略学习。
+
+    被测契约（``backend/self_evolution.py``）：
+
+    ```text
+    reviewer reliability evidence   -> 观测 / 诊断 / 告警（不驱动 evolution）
+    learning / semantic evidence    -> 共识阈值学习（分母只含 reviewer 正常完成的样本）
+    evaluation evidence             -> 真实效果学习（步长调整、回滚依据）
+    ```
+
+    这里锁的是**证据分层**，不是"把共识学习关掉"：真正的低共识仍必须能触发
+    共识阈值调整（T59），真实效果证据仍必须能调整步长（T60 / T61）。
+    """
+
+    # ── 基础设施 ──
+    def _init(self):
+        """建立 active 指针：把库带到与生产一致的起点。"""
+        import self_evolution as SE
+        with self.factory() as conn:
+            SE.ensure_schema(conn)
+            return SE.init_params(conn, source="init")
+
+    def _seed(self, statuses, *, params_id=None, eval_scores=None):
+        """按 status 序列落 evolution_tracking 行（不触碰任何历史行）。"""
+        import self_evolution as SE
+        with self.factory() as conn:
+            SE.ensure_schema(conn)
+            scores = list(eval_scores or [])
+            for index, status in enumerate(statuses):
+                score = scores[index] if index < len(scores) else None
+                conn.execute(
+                    "INSERT INTO evolution_tracking(run_id, trigger, mode, status, market_regime,"
+                    " applied, applied_count, evaluated, eval_score, evolution_params_id, created_at)"
+                    " VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                    (index + 1, "test", "intraday", status, "trend", 0, 0,
+                     1 if score is not None else 0, score, params_id,
+                     "2026-09-15 09:00:00"),
+                )
+            conn.commit()
+
+    def _metrics(self):
+        import self_evolution as SE
+        with self.factory() as conn:
+            return SE.get_performance_metrics(conn, 20)
+
+    def _should_evolve(self):
+        import self_evolution as SE
+        with self.factory() as conn:
+            return SE.should_evolve(conn)
+
+    def _evolve(self, reason="isolation-test"):
+        import self_evolution as SE
+        with self.factory() as conn:
+            return SE.evolve(conn, reason=reason)
+
+    def _active_params(self):
+        import self_evolution as SE
+        with self.factory() as conn:
+            # 断言"当前生效参数"走模块公开读模型，不用私有实现。
+            return SE.get_current_params(conn)["params"]
+
+    # ─────────────────────── T53–T55：learning denominator ───────────────────
+    def test_t53_failed_is_not_a_learning_sample(self):
+        """``failed`` 属于 reviewer 可靠性事实，不进入 learning denominator。"""
+        self._seed(["consensus", "both_hold", "no_consensus", "failed"])
+        metrics = self._metrics()
+
+        # raw / compatibility 口径：窗口内**全部** tracked run
+        self.assertEqual(4, metrics["sample_count"])
+        self.assertEqual(1, metrics["failed_count"])
+        self.assertEqual(1, metrics["reviewer_failure_count"])
+        self.assertEqual(0.25, metrics["reviewer_failure_rate"])
+
+        # learning 口径：只有 reviewer 正常完成的 3 条
+        self.assertEqual(3, metrics["learning_sample_count"])
+        self.assertAlmostEqual(1 / 3, metrics["learning_consensus_rate"])
+        self.assertAlmostEqual(1 / 3, metrics["learning_hold_rate"])
+        self.assertAlmostEqual(1 / 3, metrics["learning_no_consensus_rate"])
+        self.assertAlmostEqual(2 / 3, metrics["learning_success_rate"])
+        # 关键：绝不能算成 1/4（那等于让一次 API 失败稀释语义样本）
+        self.assertNotAlmostEqual(1 / 4, metrics["learning_consensus_rate"])
+
+    def test_t54_all_failed_has_no_learning_rate_at_all(self):
+        """全部 failed：learning rate 必须是 ``None``，不是 ``0.0``。
+
+        ``没有语义样本`` ≠ ``共识率为 0%`` —— 把前者折叠成后者，等于用
+        reviewer outage 冒充"AI 完全无法达成共识"。
+        """
+        self._seed(["failed"] * 10)
+        metrics = self._metrics()
+
+        self.assertEqual(10, metrics["sample_count"])
+        self.assertEqual(10, metrics["reviewer_failure_count"])
+        self.assertEqual(1.0, metrics["reviewer_failure_rate"])
+        self.assertEqual(0, metrics["learning_sample_count"])
+        for key in ("learning_consensus_rate", "learning_hold_rate",
+                    "learning_no_consensus_rate", "learning_success_rate"):
+            self.assertIsNone(metrics[key], f"{key} 必须为 None（无样本），不得为 0.0")
+
+        should, reason = self._should_evolve()
+        self.assertFalse(should, f"全失败不得触发进化：{reason}")
+
+    def test_t55_reviewer_outage_cannot_trigger_evolution(self):
+        """20 次全 failed（failure_rate = 100%）也不得触发 evolution。
+
+        旧实现在这里命中 ``failure_rate > ROLLBACK_THRESHOLD and
+        sample_count >= ROLLBACK_WINDOW`` 并返回 True —— 那正是
+        ``AI API 超时 → 策略回滚/改参`` 这条错误因果链的入口。
+        """
+        self._seed(["failed"] * 20)
+        metrics = self._metrics()
+        self.assertEqual(1.0, metrics["failure_rate"])
+        self.assertGreater(metrics["failure_rate"], 0.3)  # 旧 ROLLBACK_THRESHOLD
+        self.assertGreaterEqual(metrics["sample_count"], 10)  # 旧 ROLLBACK_WINDOW
+
+        should, reason = self._should_evolve()
+        self.assertFalse(should, "reviewer 可靠性失败不能单独产生 should_evolve=True")
+        self.assertIn("可靠性", reason)
+        for forbidden in ("失败率过高", "回滚", "共识率过低"):
+            self.assertNotIn(forbidden, reason)
+
+    # ─────────────────── T56–T57：failure 不得改参 / 不得回滚 ────────────────
+    def test_t56_reviewer_failure_never_raises_hold_bias(self):
+        """高 reviewer failure 与 "模型应该更倾向 HOLD" 没有因果关系。"""
+        self._init()
+        before = self._active_params()
+        self._seed(["failed"] * 20)
+
+        result = self._evolve()
+        adjustments = result.get("adjustments", []) or []
+
+        self.assertFalse(
+            any("失败率" in str(a) for a in adjustments),
+            f"不得出现「失败率高 → 增大 hold 倾向」式调整：{adjustments}")
+        self.assertNotIn("hold_bias", result.get("new_params", {}) or {})
+        active = self._active_params()
+        self.assertEqual(before["hold_bias"], active["hold_bias"], "hold_bias 必须原封不动")
+
+    def test_t57_reviewer_failure_never_triggers_rollback(self):
+        """即使 ``_find_rollback_target`` 真能找到目标，failure 也不能回滚。
+
+        前置条件被显式断言：先造出两个真实生效过的全局版本 + 足够的成功追踪行，
+        让回滚目标**确实存在** —— 否则这个用例会退化成"回滚路径本来就不可达"的假绿灯。
+        """
+        import self_evolution as SE
+
+        v1 = self._init()
+        with self.factory() as conn:
+            created = SE.manual_adjust(conn, {"max_weight_delta": 0.027}, reason="t57-setup")
+            SE.activate_params_candidate(conn, created["new_params_id"], actor="t57-setup")
+            v2_id = SE.get_current_params(conn)["id"]
+        self.assertNotEqual(v1["id"], v2_id, "前置条件：必须有两个生效过的版本")
+
+        # 3 条 consensus 挂在 v1 上 → v1 满足 _find_rollback_target 的胜率门槛
+        self._seed(["consensus"] * 3, params_id=v1["id"])
+        # 窗口内：reviewer 失败占绝对多数，但仍有语义样本让 evolve 有正当调整对象
+        self._seed(["consensus"] * 4 + ["failed"] * 16)
+
+        with self.factory() as conn:
+            target = SE._find_rollback_target(conn)
+        self.assertIsNotNone(target, "前置条件：必须存在真实可回滚目标")
+        self.assertEqual(v1["id"], target["id"])
+        self.assertAlmostEqual(0.03, target["params"]["max_weight_delta"])
+
+        result = self._evolve()
+        adjustments = result.get("adjustments", []) or []
+        self.assertFalse(
+            any("回滚" in str(a) for a in adjustments),
+            f"reviewer failure 绝不能触发回滚：{adjustments}")
+        self.assertNotIn("max_weight_delta", result.get("new_params", {}) or {})
+
+        with self.factory() as conn:
+            row = conn.execute("SELECT params FROM evolution_params WHERE id=?",
+                               (result["new_params_id"],)).fetchone()
+            candidate_params = json.loads(row["params"])
+            active_id = SE.get_current_params(conn)["id"]
+        self.assertAlmostEqual(
+            0.027, candidate_params["max_weight_delta"],
+            msg="候选参数不得被回滚目标覆盖")
+        self.assertEqual(v2_id, active_id, "active 指针不得因 reviewer failure 切换")
+
+    # ─────────────────── T58–T59：denominator 正确性与负向对照 ───────────────
+    def test_t58_denominator_contamination_regression(self):
+        """raw 28.6% vs learning 50%：绝不能因 6 次 API failure 放宽共识门槛。"""
+        self._seed(["failed"] * 6 + ["consensus"] * 4 + ["both_hold"] * 4)
+        metrics = self._metrics()
+
+        self.assertEqual(14, metrics["sample_count"])
+        self.assertEqual(8, metrics["learning_sample_count"])
+        self.assertEqual(0.5, metrics["learning_consensus_rate"])
+        # 旧口径确实低于 30%（这就是当年会误触发"共识率过低"的原因）
+        self.assertLess(metrics["consensus_rate"], 0.3)
+
+        should, reason = self._should_evolve()
+        self.assertFalse(should, f"learning 共识率 50% 不该触发任何共识调整：{reason}")
+        self.assertNotIn("共识率过低", reason)
+
+    def test_t58b_min_samples_must_count_learning_samples(self):
+        """样本门槛看 ``learning_sample_count``，不是 raw ``sample_count``。
+
+        14 条里只有 4 条是语义样本：raw 达标（>=8）不代表学习样本充足。
+        """
+        self._seed(["failed"] * 10 + ["consensus"] + ["no_consensus"] * 3)
+        metrics = self._metrics()
+        self.assertEqual(14, metrics["sample_count"])
+        self.assertEqual(4, metrics["learning_sample_count"])
+        self.assertAlmostEqual(0.25, metrics["learning_consensus_rate"])
+
+        should, reason = self._should_evolve()
+        self.assertFalse(should, f"语义样本仅 4 条，不构成共识学习证据：{reason}")
+        self.assertNotIn("共识率过低", reason)
+
+    def test_t59_genuine_low_consensus_still_evolves(self):
+        """负向对照：真正（reviewer 全部成功）的低共识仍必须触发共识阈值调整。
+
+        证明本 PR 是"隔离噪声"，不是"关掉共识学习"。
+        """
+        self._seed(["consensus"] + ["both_hold"] + ["no_consensus"] * 6)
+        metrics = self._metrics()
+        self.assertEqual(8, metrics["learning_sample_count"])
+        self.assertEqual(0, metrics["reviewer_failure_count"])
+        self.assertAlmostEqual(1 / 8, metrics["learning_consensus_rate"])
+
+        should, reason = self._should_evolve()
+        self.assertTrue(should, "真实低共识必须仍能触发进化")
+        self.assertIn("共识率过低", reason)
+
+        self._init()
+        result = self._evolve()
+        self.assertTrue(result.get("evolved"))
+        self.assertIn("consensus_weight_ratio", result.get("new_params", {}))
+        self.assertLess(result["new_params"]["consensus_weight_ratio"], 0.6)
+        self.assertFalse(any("失败率" in str(a) for a in result.get("adjustments", [])))
+
+    # ─────────────────── T60–T61：真实效果证据不得被误伤 ─────────────────────
+    def test_t60_negative_evaluation_still_shrinks_step(self):
+        """``avg_eval_score < -0.2`` 仍必须缩小 ``max_weight_delta``。
+
+        reviewer failure isolation 不能误伤 #141 建立的真实 reward 反馈：
+        这里刻意让窗口里**同时**存在大量 reviewer 失败 —— 真实效果证据必须在
+        reviewer 不可靠时依然完整可用（两类证据彼此独立，不是互相门禁）。
+        """
+        self._init()
+        self._seed(["consensus"] * 6 + ["failed"] * 10, eval_scores=[-0.5] * 6)
+        metrics = self._metrics()
+        self.assertEqual(6, metrics["evaluated_count"])
+        self.assertAlmostEqual(-0.5, metrics["avg_eval_score"])
+        self.assertGreater(metrics["reviewer_failure_rate"], 0.4)
+
+        should, reason = self._should_evolve()
+        self.assertTrue(should, "评估证据必须仍能触发进化")
+        self.assertIn("平均评估分数过低", reason)
+
+        result = self._evolve()
+        self.assertTrue(result.get("evolved"))
+        self.assertIn("max_weight_delta", result.get("new_params", {}))
+        self.assertAlmostEqual(0.027, result["new_params"]["max_weight_delta"])
+        self.assertTrue(any("缩小权重步长" in str(a) for a in result.get("adjustments", [])))
+
+    def test_t61_positive_evaluation_still_widens_step(self):
+        """``avg_eval_score > 0.3`` 仍可适度放大 ``max_weight_delta``。"""
+        self._init()
+        self._seed(["consensus"] * 6 + ["failed"] * 10, eval_scores=[0.5] * 6)
+        self.assertAlmostEqual(0.5, self._metrics()["avg_eval_score"])
+
+        result = self._evolve()
+        self.assertTrue(result.get("evolved"))
+        self.assertAlmostEqual(0.0315, result["new_params"]["max_weight_delta"])
+        self.assertTrue(any("适度放大权重步长" in str(a) for a in result.get("adjustments", [])))
+
+    # ─────────────────────── T62：raw 字段语义未被偷改 ───────────────────────
+    def test_t58c_reviewer_failure_cannot_suppress_the_high_consensus_gate(self):
+        """reviewer 失败也不得**反向**干扰学习：不得稀释掉"共识率过高"判据。
+
+        同一份语义证据（5 次全 consensus）在"另有 5 次 reviewer 超时"时，raw
+        ``propose_rate`` 只有 50%，会低于 0.6 门槛；learning 口径仍是 100%。
+        两种窗口必须给出同一个进化结论 —— 否则 reviewer outage 就能反向压制
+        一次本该发生的共识阈值学习。
+        """
+        # 对照：同一份语义证据、没有 reviewer 失败
+        self._seed(["consensus"] * 5)
+        clean_should, clean_reason = self._should_evolve()
+        self.assertTrue(clean_should, f"5 次全 consensus 应触发共识学习：{clean_reason}")
+        self.assertIn("共识率过高", clean_reason)
+
+        # 实验组：同一份语义证据 + 5 次 reviewer 失败
+        with self.factory() as conn:
+            conn.execute("DELETE FROM evolution_tracking")
+            conn.commit()
+        self._init()
+        self._seed(["consensus"] * 5 + ["failed"] * 5)
+        metrics = self._metrics()
+        self.assertEqual(10, metrics["sample_count"])
+        self.assertEqual(5, metrics["learning_sample_count"])
+        self.assertAlmostEqual(0.5, metrics["propose_rate"])          # raw 口径已被稀释
+        self.assertAlmostEqual(1.0, metrics["learning_propose_rate"])  # learning 口径不受影响
+        self.assertAlmostEqual(1.0, metrics["learning_consensus_rate"])
+
+        should, reason = self._should_evolve()
+        self.assertTrue(
+            should,
+            f"reviewer 失败不得抑制共识学习：{reason}")
+        self.assertIn("共识率过高", reason)
+
+        result = self._evolve()
+        self.assertTrue(result.get("evolved"))
+        self.assertGreater(result["new_params"]["consensus_weight_ratio"], 0.6)
+
+    def test_t62_legacy_metrics_keep_their_meaning(self):
+        """旧字段必须仍存在、仍是 raw 口径；新字段不得悄悄改写旧语义。"""
+        self._seed(["failed"] * 6 + ["consensus"] * 4 + ["both_hold"] * 4)
+        metrics = self._metrics()
+
+        for key in ("sample_count", "failed_count", "failure_rate", "consensus_rate",
+                    "hold_rate", "no_consensus_rate", "success_rate", "applied_rate"):
+            self.assertIn(key, metrics, f"兼容字段 {key} 不得消失")
+
+        # raw 口径 = 全部 tracked run
+        self.assertEqual(14, metrics["sample_count"])
+        self.assertEqual(6, metrics["failed_count"])
+        self.assertAlmostEqual(6 / 14, metrics["failure_rate"])
+        self.assertAlmostEqual(4 / 14, metrics["consensus_rate"])
+        self.assertAlmostEqual(4 / 14, metrics["hold_rate"])
+        self.assertAlmostEqual(8 / 14, metrics["success_rate"])
+
+        # 新字段是旧字段的语义别名，逐值相等
+        self.assertEqual(metrics["failed_count"], metrics["reviewer_failure_count"])
+        self.assertEqual(metrics["failure_rate"], metrics["reviewer_failure_rate"])
+        # 同一份数据在两种证据口径下结论完全不同 —— 这正是分层要守住的东西：
+        # "6/14 次 reviewer 调用不可靠" 与 "语义层 8/8 次成功" 必须同时成立。
+        self.assertAlmostEqual(6 / 14, metrics["reviewer_failure_rate"])
+        self.assertAlmostEqual(4 / 8, metrics["learning_consensus_rate"])
+        self.assertAlmostEqual(4 / 8, metrics["learning_hold_rate"])
+        self.assertAlmostEqual(1.0, metrics["learning_success_rate"])
+        self.assertAlmostEqual(0.0, metrics["learning_no_consensus_rate"])
+
+    def test_t62b_empty_window_contract_is_unchanged(self):
+        """无数据窗口：旧 empty 返回保持原样，且不得让 should_evolve 抛 KeyError。"""
+        import self_evolution as SE
+        with self.factory() as conn:
+            SE.ensure_schema(conn)
+            metrics = SE.get_performance_metrics(conn, 20)
+        self.assertEqual({"sample_count": 0, "has_data": False}, metrics)
+
+        should, reason = self._should_evolve()
+        self.assertFalse(should)
+        self.assertEqual("无历史数据", reason)
 
 
 if __name__ == "__main__":  # pragma: no cover

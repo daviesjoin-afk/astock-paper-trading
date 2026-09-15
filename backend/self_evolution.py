@@ -59,9 +59,15 @@ BOUNDS = {
 
 # 最小样本量：少于此数量不触发进化
 MIN_SAMPLES_FOR_EVOLUTION = 5
+# 共识率判据的最小**语义**样本量。原实现用 raw ``sample_count``（含 failed），
+# 于是"6 次 reviewer 超时 + 2 次真审核"只要总数够 8 就能驱动共识阈值学习。
+# 语义学习只认 reviewer 正常完成的样本 → 门槛改成看 ``learning_sample_count``。
+CONSENSUS_MIN_LEARNING_SAMPLES = 8
 # 进化冷却期（秒）：两次进化之间最少间隔
 EVOLUTION_COOLDOWN_SECONDS = 3600  # 1小时
-# 回滚窗口：最近N次调参中如果成功率骤降，触发回滚
+# 回滚窗口 / 回滚阈值：**仅用于 reviewer 可靠性观测**（健康度、告警、诊断）。
+# 绝不用来触发 evolution 或回滚策略参数 —— reviewer 调用失败不构成
+# "交易参数有问题"的证据，见 ``should_evolve`` / ``evolve`` 的分层注释。
 ROLLBACK_WINDOW = 10
 ROLLBACK_THRESHOLD = 0.3  # 成功率低于30%触发回滚
 
@@ -78,6 +84,26 @@ def _num(value, default=None):
         return v if abs(v) < 1e15 else default
     except (TypeError, ValueError):
         return default
+
+
+def _rate(numerator: int, denominator: int) -> Optional[float]:
+    """比率，**分母为 0 时返回 ``None`` 而不是 ``0.0``**。
+
+    ``没有语义样本`` 与 ``共识率为 0%`` 是两个不同的结论：前者是"无从判断"，
+    后者是"判断为差"。把前者折叠成 0.0 会让"reviewer 全部失败"看起来像
+    "AI 完全无法达成共识"，进而驱动错误的策略调整。
+    """
+    if denominator <= 0:
+        return None
+    return numerator / denominator
+
+
+def _learning_sample_count(metrics: dict) -> int:
+    """语义学习样本量；老 metrics（无该键）按 0 处理，绝不回退成 raw sample_count。"""
+    try:
+        return int(metrics.get("learning_sample_count") or 0)
+    except (TypeError, ValueError):
+        return 0
 
 
 def ensure_schema(conn):
@@ -431,15 +457,50 @@ def record_reward_attribution(conn, tracking_id: int, reward_id: int, account_id
 def get_performance_metrics(conn, window: int = 20) -> dict:
     """计算最近N次调参的性能指标。
 
+    本函数同时提供**两套彼此分离**的统计，因为它们回答的是两个完全不同的问题：
+
+    ── (A) reviewer 可靠性（operational reliability evidence）──
+
+    ``reviewer 调用是否正常完成？``
+
+    - ``failure_rate`` = 仅 ``failed``（**调用之后**失败/超时/HTTP 错误/响应不可用）
+    - ``failed_count`` / ``sample_count``
+
+    **``failure_rate`` 是 reviewer reliability metric，不是 strategy learning
+    signal。** 它只能用于监控、日志、健康度、告警、运维诊断；不得用来推断
+    "交易参数有问题 / 共识阈值有问题 / 应该回滚"。``sample_count`` 继续表示窗口
+    内全部 tracked run（含失败）。``reviewer_failure_count`` /
+    ``reviewer_failure_rate`` 是与 ``failed_count`` / ``failure_rate`` **逐值相等**
+    的语义别名（同一事实的显式命名，便于调用点区分证据类型）。
+
+    ── (B) 语义学习样本（learning / semantic evidence）──
+
+    只有 reviewer **正常完成**之后的 ``consensus`` / ``both_hold`` /
+    ``no_consensus`` 才是 AI 审核的语义样本。``failed`` **不进入 learning
+    denominator**，所以 reviewer 大面积超时不会被误读成"AI 越来越难达成共识"
+    （那是一条隐性污染路径）：
+
+    - ``learning_sample_count`` = consensus + hold + no_consensus
+    - ``learning_consensus_rate`` / ``learning_propose_rate`` /
+      ``learning_success_rate`` / ``learning_hold_rate`` /
+      ``learning_no_consensus_rate``
+
+    当 ``learning_sample_count == 0`` 时，上述五个 learning rate 一律返回
+    ``None``，**不返回 ``0.0``**：``没有语义样本`` ≠ ``共识率为 0%``。
+
     状态语义（与 ``ai_review_service`` 的 dual 结果状态机一一对应）：
 
     - ``success_rate`` = ``consensus`` + ``both_hold``（系统跑完且双方一致）
     - ``hold_rate``    = 仅 ``both_hold``
-    - ``failure_rate`` = 仅 ``failed``（**调用之后**失败/超时/响应不可用）
     - ``no_consensus_rate`` = 仅 ``no_consensus``
 
     ``no_consensus``（两个 reviewer 都正常完成、只是语义未达成一致）**不计入**
     success / hold / failure 任何一项 —— 那是系统正常工作，不是故障。
+
+    旧字段（``sample_count`` / ``failed_count`` / ``failure_rate`` /
+    ``consensus_rate`` / ``hold_rate`` / ``no_consensus_rate`` / ``success_rate``
+    …）**全部保留原含义**，作为 raw / compatibility metrics；新字段是 additive。
+
     本函数只做统计，不改变任何阈值或自适应策略。
     """
     rows = conn.execute(
@@ -465,6 +526,21 @@ def get_performance_metrics(conn, window: int = 20) -> dict:
     # no_consensus 表示"两个 reviewer 都正常完成，但语义层未达成一致"，它是
     # 系统正常工作的证据，既不算 success、也不算 hold、更不算 failure。
     success_count = consensus_count + hold_count
+
+    # 语义学习样本：只有 reviewer 正常完成的 run 才计入分母。failed 被显式排除
+    # —— 它是 reviewer 可靠性事实，不是"AI 谈不拢"的语义样本。
+    #
+    # ``learning_propose_rate`` 是 propose 率的 learning 口径。当前 ``propose_count``
+    # 与 ``consensus_count`` 取同一 status，所以它与 ``learning_consensus_rate`` 恒等；
+    # 保留独立字段是为了让"共识率过高"判据**永远不读 raw 分母**：只要 raw 分母里
+    # 混着 failed，同样的语义证据（5 次全 consensus）在"另有 5 次超时"时会被稀释到
+    # 50%，从而抑制一次本该发生的共识阈值学习 —— 那是反向的污染路径。
+    learning_sample_count = consensus_count + hold_count + no_consensus_count
+    learning_consensus_rate = _rate(consensus_count, learning_sample_count)
+    learning_propose_rate = _rate(propose_count, learning_sample_count)
+    learning_success_rate = _rate(success_count, learning_sample_count)
+    learning_hold_rate = _rate(hold_count, learning_sample_count)
+    learning_no_consensus_rate = _rate(no_consensus_count, learning_sample_count)
 
     # 评估统计
     evaluated = [(r[2], r[3]) for r in rows if r[2] is not None]
@@ -498,6 +574,16 @@ def get_performance_metrics(conn, window: int = 20) -> dict:
         "no_consensus_rate": no_consensus_count / total,
         "applied_rate": applied_count / total,
         "failure_rate": failed_count / total,
+        # reviewer 可靠性（= 旧字段的显式语义别名，逐值相等）
+        "reviewer_failure_count": failed_count,
+        "reviewer_failure_rate": failed_count / total,
+        # 语义学习样本（failed 不进分母）
+        "learning_sample_count": learning_sample_count,
+        "learning_consensus_rate": learning_consensus_rate,
+        "learning_propose_rate": learning_propose_rate,
+        "learning_success_rate": learning_success_rate,
+        "learning_hold_rate": learning_hold_rate,
+        "learning_no_consensus_rate": learning_no_consensus_rate,
         "avg_eval_score": avg_eval,
         "positive_eval_rate": positive_evals / len(evaluated) if evaluated else None,
         "negative_eval_rate": negative_evals / len(evaluated) if evaluated else None,
@@ -509,6 +595,17 @@ def get_performance_metrics(conn, window: int = 20) -> dict:
 
 def should_evolve(conn) -> tuple[bool, str]:
     """判断是否应该触发进化。
+
+    证据分层（本函数是这条边界的执行点）：
+
+    - **reviewer 可靠性证据**（``failed`` / ``timeout`` / HTTP 错误 / 协议失败）
+      只用于监控、日志、健康度、告警、运维诊断。它**不能单独**产生
+      ``should_evolve = True``：``AI API 超时`` 与 ``策略参数该改`` 之间没有因果关系。
+    - **语义学习证据**（``consensus`` / ``both_hold`` / ``no_consensus``，即
+      reviewer 正常完成的样本）才参与共识阈值学习，且分母是
+      ``learning_sample_count``。
+    - **真实效果证据**（``evaluated_count`` / ``avg_eval_score``、与 reward
+      attribution 链路）仍然是评价"调参好不好"的核心依据，逻辑保持不变。
 
     Returns:
         (should_evolve: bool, reason: str)
@@ -536,11 +633,7 @@ def should_evolve(conn) -> tuple[bool, str]:
         except (ValueError, TypeError):
             pass
 
-    # 检查是否需要回滚
-    if metrics["failure_rate"] > ROLLBACK_THRESHOLD and metrics["sample_count"] >= ROLLBACK_WINDOW:
-        return True, f"失败率过高 ({metrics['failure_rate']:.1%} > {ROLLBACK_THRESHOLD:.0%})，需要回滚或进化"
-
-    # 检查评估数据
+    # 检查评估数据（真实效果证据：这条路径必须继续工作，不受 reviewer 可靠性影响）
     if metrics["evaluated_count"] >= MIN_SAMPLES_FOR_EVOLUTION:
         avg_score = metrics["avg_eval_score"]
         if avg_score is not None and avg_score < -0.1:
@@ -548,11 +641,26 @@ def should_evolve(conn) -> tuple[bool, str]:
         if avg_score is not None and avg_score > 0.3:
             return True, f"平均评估分数良好 ({avg_score:.3f})，可以适度放宽策略"
 
-    # 检查共识率
-    if metrics["consensus_rate"] < 0.3 and metrics["sample_count"] >= 8:
-        return True, f"共识率过低 ({metrics['consensus_rate']:.1%})，需要调整共识阈值"
-    if metrics["consensus_rate"] > 0.8 and metrics["propose_rate"] > 0.6:
-        return True, f"共识率过高 ({metrics['consensus_rate']:.1%})，可能阈值太松"
+    # 语义学习样本可用性：reviewer 调用失败既不是"谈不拢"也不是"策略差"，
+    # 它只说明 AI 审核服务没正常跑完。窗口里只有这类样本时，唯一正确的结论是
+    # "没有可供学习的语义证据"，绝不据此改参数或回滚。
+    learning_samples = _learning_sample_count(metrics)
+    if learning_samples <= 0:
+        return False, "仅有 reviewer 可靠性失败样本，不构成策略进化证据"
+
+    # 检查共识率：**两个条件都只用 reviewer 正常完成的样本做分母**。
+    # reason 里报的是 learning 口径的比率，运维看到的"共识率"与策略学习依据一致。
+    # ``learning_propose_rate`` 也必须走 learning 口径：若这里回退成 raw
+    # ``propose_rate``，同样的语义证据会因为窗口里另有 reviewer 超时而被稀释，
+    # 从而**抑制**一次本该发生的共识学习 —— reviewer 可靠性同样不得反向干扰学习。
+    learning_consensus_rate = metrics.get("learning_consensus_rate")
+    learning_propose_rate = metrics.get("learning_propose_rate")
+    if learning_consensus_rate is not None:
+        if learning_consensus_rate < 0.3 and learning_samples >= CONSENSUS_MIN_LEARNING_SAMPLES:
+            return True, f"共识率过低 ({learning_consensus_rate:.1%})，需要调整共识阈值"
+        if learning_consensus_rate > 0.8 and learning_samples >= MIN_SAMPLES_FOR_EVOLUTION \
+                and (learning_propose_rate or 0.0) > 0.6:
+            return True, f"共识率过高 ({learning_consensus_rate:.1%})，可能阈值太松"
 
     return False, "当前状态稳定，无需进化"
 
@@ -567,6 +675,16 @@ def evolve(conn, reason: str = "auto") -> dict:
     4. 验证边界约束
     5. 保存新参数
 
+    **证据边界（本函数的硬约束）**：只有语义学习证据（reviewer 正常完成的
+    ``consensus`` / ``both_hold`` / ``no_consensus``）与真实效果证据
+    （``avg_eval_score``）可以调整参数。``failure_rate`` **不参与任何调整决策**：
+
+    - ``AI API 经常失败`` ⇏ ``模型应该更倾向 HOLD``（旧策略1，已删除）
+    - ``AI API 经常失败`` ⇏ ``回滚 max_weight_delta / consensus_weight_ratio /
+      hold_bias``（旧策略5，已删除）
+
+    reviewer outage 是运维事件，不是策略质量信号。
+
     Returns:
         dict 包含进化结果
     """
@@ -576,31 +694,27 @@ def evolve(conn, reason: str = "auto") -> dict:
     new_params = dict(old_params)
     adjustments = []
 
-    # ─── 策略1：根据失败率调整 ───
-    if metrics.get("failure_rate", 0) > 0.4:
-        # 高失败率 → 更保守
-        new_params["hold_bias"] = min(BOUNDS["hold_bias"]["max"],
-                                      old_params.get("hold_bias", 0.1) + BOUNDS["hold_bias"]["step"] * 2)
-        adjustments.append(f"失败率高({metrics['failure_rate']:.0%})→增大hold倾向")
+    # ─── 策略1：根据共识率调整阈值（只用语义学习样本）───
+    # 没有语义样本 → ``None``：不猜 0.5、不猜 0、不改参数。
+    # "无从判断"绝不能被折叠成"共识率很低"或"共识率很高"。
+    consensus_rate = metrics.get("learning_consensus_rate")
+    if consensus_rate is not None:
+        if consensus_rate < 0.3:
+            # 共识率太低 → 放宽共识要求
+            new_params["consensus_weight_ratio"] = max(
+                BOUNDS["consensus_weight_ratio"]["min"],
+                old_params.get("consensus_weight_ratio", 0.6) - BOUNDS["consensus_weight_ratio"]["step"]
+            )
+            adjustments.append(f"共识率低({consensus_rate:.0%})→放宽共识幅度比")
+        elif consensus_rate > 0.8:
+            # 共识率太高 → 可能太松，收紧
+            new_params["consensus_weight_ratio"] = min(
+                BOUNDS["consensus_weight_ratio"]["max"],
+                old_params.get("consensus_weight_ratio", 0.6) + BOUNDS["consensus_weight_ratio"]["step"]
+            )
+            adjustments.append(f"共识率高({consensus_rate:.0%})→收紧共识幅度比")
 
-    # ─── 策略2：根据共识率调整阈值 ───
-    consensus_rate = metrics.get("consensus_rate", 0.5)
-    if consensus_rate < 0.3:
-        # 共识率太低 → 放宽共识要求
-        new_params["consensus_weight_ratio"] = max(
-            BOUNDS["consensus_weight_ratio"]["min"],
-            old_params.get("consensus_weight_ratio", 0.6) - BOUNDS["consensus_weight_ratio"]["step"]
-        )
-        adjustments.append(f"共识率低({consensus_rate:.0%})→放宽共识幅度比")
-    elif consensus_rate > 0.8:
-        # 共识率太高 → 可能太松，收紧
-        new_params["consensus_weight_ratio"] = min(
-            BOUNDS["consensus_weight_ratio"]["max"],
-            old_params.get("consensus_weight_ratio", 0.6) + BOUNDS["consensus_weight_ratio"]["step"]
-        )
-        adjustments.append(f"共识率高({consensus_rate:.0%})→收紧共识幅度比")
-
-    # ─── 策略3：根据评估分数调整步长 ───
+    # ─── 策略2：根据评估分数调整步长（真实效果证据，保持不变）───
     avg_eval = metrics.get("avg_eval_score")
     if avg_eval is not None:
         if avg_eval < -0.2:
@@ -618,18 +732,18 @@ def evolve(conn, reason: str = "auto") -> dict:
             )
             adjustments.append(f"评估好({avg_eval:.3f})→适度放大权重步长")
 
-    # ─── 策略4：根据置信度分布调整阈值 ───
+    # ─── 策略3：根据置信度分布调整阈值 ───
     # 如果大多数调参的置信度都很高，可以提高阈值
     # 如果大多数置信度都低，降低阈值
     # （这里用propose率作为代理指标）
 
-    # ─── 策略5：需要回滚的情况 ───
-    if metrics.get("failure_rate", 0) > ROLLBACK_THRESHOLD:
-        # 回滚到上一个稳定的参数版本
-        rollback_target = _find_rollback_target(conn)
-        if rollback_target:
-            new_params = rollback_target["params"]
-            adjustments.append(f"失败率过高→回滚到参数版本#{rollback_target['id']}")
+    # ─── 已删除：失败率驱动的参数调整与回滚 ───
+    # 旧实现在这里做了两件事，两者都把 reviewer 可靠性故障当成了策略证据：
+    #   (a) ``failure_rate > 0.4`` → 增大 ``hold_bias``
+    #   (b) ``failure_rate > ROLLBACK_THRESHOLD`` → 回滚到旧参数版本
+    # 它们制造了 ``AI API timeout → 交易策略回滚`` 这条错误因果链。
+    # 回滚策略参数只能由**真实效果证据**（评估分数 / 已验证 apply 后的真实表现）
+    # 驱动；这里不再有任何路径让 reviewer failure 改动或回滚 evolution params。
 
     # 边界约束
     new_params = _clamp_params(new_params)
@@ -689,6 +803,11 @@ def _find_rollback_target(conn) -> Optional[dict]:
     候选可能从未生效，把它当回滚目标会退回到一个从未跑过的参数组合。
     现在只认 activation history 里的版本，且它们天然满足"回滚式候选"的
     步长豁免（见 ``evolution_activation._matches_activated_row``）。
+
+    **调用契约**：回滚目标只能由真实效果证据（评估分数 / reward attribution
+    / 已验证 apply 后的真实表现）驱动。``evolve`` 里那条
+    ``failure_rate > ROLLBACK_THRESHOLD → 回滚`` 的路径已删除 —— 本函数
+    不得再被 reviewer 可靠性失败触发，即使它确实能找到一个可用目标。
     """
     rows = conn.execute(
         f"""SELECT ep.id, ep.params
