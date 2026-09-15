@@ -10,6 +10,11 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import data_fetcher as dfc
 
 try:
+    import point_in_time as PIT
+except ImportError:  # Allow ``backend.universe`` package-style test imports.
+    from . import point_in_time as PIT
+
+try:
     import chinese_calendar as _cn_calendar
 except ImportError:  # pragma: no cover - requirements installs the provider.
     _cn_calendar = None
@@ -290,6 +295,22 @@ def latest_complete_trade_date(asof_day=None, now=None):
     if day == clock.date() and clock.time() < dt.time(15, 5):
         return _previous_trade_weekday(day)
     return day
+
+
+def asof_members(rows, asof, *, strict=True, drop_unproven=False):
+    """按 ``asof`` 过滤历史 universe 成分（PIT 契约，见 ``point_in_time``）。
+
+    历史选股成分必须满足 ``list_date <= asof < delist_date``。绝不允许
+    "先取今天仍上市的股票再回放五年前"——那会同时引入未来上市与漏掉退市
+    两类幸存者偏差。
+
+    ``asof is None`` 时原样返回（live compatibility）。当前数据源不含上市/
+    退市日期，因此无法证明的成分会被计入 ``report["unproven"]`` 而**不是**
+    被默认当作"当时已上市"；需要完全 fail-closed 的调用方传
+    ``drop_unproven=True``。
+    """
+    return PIT.universe_asof_members(rows, asof, strict=strict,
+                                     drop_unproven=drop_unproven)
 
 
 def _history_is_fresh(last_date, asof_day=None):

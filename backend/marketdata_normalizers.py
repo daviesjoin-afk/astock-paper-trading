@@ -46,6 +46,26 @@ def quote_at(value):
     return dt.datetime.fromtimestamp(value, china_tz).isoformat(timespec="seconds")
 
 
+_CHINA_TZ = dt.timezone(dt.timedelta(hours=8))
+
+
+def observed_at(value, *, now=None):
+    """该行情行的**可信观测时点**，供 PIT 可用性判定使用。
+
+    优先行情揭示时间（东财 f124 → 中国时区）；缺失时退回"本地抓取时刻"——
+    那不是编造，而是"我们何时观测到这一行"这一事实本身。缺这个字段，
+    strict 历史模式只能把该行判成 ``availability_unknown``（不可用），
+    所以生产路径必须始终为每一行提供它。
+    """
+    stamp = quote_at(value)
+    if stamp:
+        return stamp
+    moment = now or dt.datetime.now(dt.timezone.utc)
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=dt.timezone.utc)
+    return moment.astimezone(_CHINA_TZ).isoformat(timespec="seconds")
+
+
 def sanitize_market_row(row):
     """Drop impossible OHLC values instead of feeding them to risk models."""
     price = finite_number(row.get("price"))
@@ -68,6 +88,7 @@ def realtime_row_from_ulist(raw, *, quote_at_fn=quote_at):
     code = str(raw.get("f12") or "")
     if not code:
         return None
+    quote = quote_at_fn(raw.get("f124"))
     return {
         "code": code, "name": raw.get("f14"),
         "price": raw.get("f2"), "pct": raw.get("f3"),
@@ -80,7 +101,9 @@ def realtime_row_from_ulist(raw, *, quote_at_fn=quote_at):
         "super_net": raw.get("f66"), "big_net": raw.get("f72"),
         "mid_net": raw.get("f78"), "small_net": raw.get("f84"),
         "main_pct": raw.get("f184"), "industry": raw.get("f100"),
-        "quote_ts": raw.get("f124"), "quote_at": quote_at_fn(raw.get("f124")),
+        "quote_ts": raw.get("f124"), "quote_at": quote,
+        # PIT：每一行都必须带可信观测时点，否则 strict 历史模式只能判其不可用。
+        "observed_at": quote or observed_at(raw.get("f124")),
     }
 
 

@@ -14,6 +14,55 @@ try:
     import factor_calibration as FC
 except ImportError:  # Allow ``backend.factors`` package-style test imports.
     from . import factor_calibration as FC
+try:
+    import point_in_time as PIT
+except ImportError:  # Allow ``backend.factors`` package-style test imports.
+    from . import point_in_time as PIT
+
+
+def _bar_availability(index):
+    """把 K 线索引映射成"该 bar 何时真正可用"的 tz-aware 索引。
+
+    日线 bar 只有日期（生产解析器产出 naive midnight）→ 当日**收盘 15:00**
+    （Asia/Shanghai）；索引带显式时刻（分钟 bar、或已带收盘时刻）→ 原样信任。
+    无法解释的索引 → NaT，strict 模式下被丢弃（fail closed，绝不猜）。
+    """
+    stamps = pd.DatetimeIndex(index)
+    if stamps.tz is not None:
+        naive = stamps.tz_convert(PIT.china_tz()).tz_localize(None)
+    else:
+        naive = stamps
+    date_only = naive == naive.normalize()
+    closed = naive.normalize() + pd.Timedelta(
+        hours=PIT.CN_MARKET_CLOSE.hour, minutes=PIT.CN_MARKET_CLOSE.minute)
+    combined = naive.where(~date_only, closed)
+    return combined.tz_localize(
+        PIT.china_tz(), ambiguous="NaT", nonexistent="NaT")
+
+
+def _adjustment_pit_safe(meta, asof_moment):
+    """该票的价格序列在 ``asof`` 时点是否**可证明** PIT-safe。
+
+    * 不复权（``adjustment == "none"``）：原始 OHLCV 不会被公司行为回溯重算 → safe。
+    * 前复权（``qfq``）：qfq 是按"抓取当时已知的全部公司行为"整段重算的，只有在
+      能证明这份数据在 ``asof`` 之前就已经写成时才可认为当时能拿到同样的调整，
+      即 manifest 的 ``updated_at <= asof``；否则**无法证明** → 标记 unsafe。
+    * 其它/未知 → unsafe。
+
+    本 PR 不实现公司行为数据库：证明不了就标记，绝不把"无法证明"当成"可信"。
+    """
+    adjustment = str(meta.get("adjustment") or "").strip().lower()
+    if adjustment == "none":
+        return True
+    if adjustment != "qfq":
+        return False
+    if asof_moment is None:
+        return False
+    updated = PIT.parse_available_at(meta.get("updated_at"))
+    if updated is None:
+        return False
+    return updated <= asof_moment
+
 
 def zscore(series, fill_missing=True):
     """横截面标准分；可选择保留缺失值以便调用方使用可信代理回填。"""
@@ -28,17 +77,40 @@ def zscore(series, fill_missing=True):
 
 def compute_price_factors(klines: dict, asof=None):
     """基于历史K线的因子：动量/反转/波动/量能。klines: {code: df}
-    asof: 截止日期（回测用，防前视偏差——只用 asof 及之前的数据）"""
+
+    ``asof`` 是决策时点，两种模式必须严格分层：
+
+    * ``asof is None`` → **live compatibility mode**，行为与改造前逐值一致。
+    * ``asof is not None`` → **strict PIT historical mode**：只有"可用时点 <= asof"
+      的 bar 参与计算。日线 bar 在**当日收盘 15:00（Asia/Shanghai）**才可用，因此
+      ``asof = 当日 10:00`` 看不到当日那根完整 OHLCV；``asof`` 之后的 bar 一律不进入
+      任何因子。索引无法解释、或 ``asof`` 无法解析时直接跳过该票，而不是猜。
+    """
+    strict = PIT.asof_is_strict(asof)
+    asof_moment = PIT.parse_asof(asof) if strict else None
     # #7: 预加载 manifest 用于检测不复权数据
     try:
         _manifest = dfc.get_kline_manifest()
     except Exception:
         _manifest = {}
+    bars_dropped_future = 0
+    bars_unreadable_index = 0
+    adjustments_unproven = 0
     rows = []
     for code, df in klines.items():
         if df is None or df.empty:
             continue
-        d = df if asof is None else df[df.index <= asof]
+        if strict:
+            # 无法解析的 asof 不是历史回放的合法依据 → fail closed。
+            if asof_moment is None:
+                continue
+            available = _bar_availability(df.index)
+            keep = available.notna() & (available <= asof_moment)
+            bars_dropped_future += int((available.notna() & ~keep).sum())
+            bars_unreadable_index += int(available.isna().sum())
+            d = df.loc[keep]
+        else:
+            d = df
         if len(d) < 65:
             continue
         c = d["close"]
@@ -128,10 +200,27 @@ def compute_price_factors(klines: dict, asof=None):
             row_data["price_evidence_quality"] = (
                 FC.UNADJUSTED_PRICE_QUALITY if unadjusted else FC.FULL_QUALITY
             )
+            # PIT provenance：区分"bar 已按 decision_asof 截断"与
+            # "复权口径可证明在 asof 当时成立"。两者都不成立时不得声称 PIT-safe。
+            adjustment_safe = _adjustment_pit_safe(meta, asof_moment)
+            row_data["bar_pit_safe"] = bool(strict)
+            row_data["adjustment_pit_safe"] = bool(adjustment_safe)
+            row_data["price_pit_safe"] = bool(strict and adjustment_safe)
+            if strict and not adjustment_safe:
+                adjustments_unproven += 1
             rows.append(row_data)
         except Exception:
             continue
-    return pd.DataFrame(rows).set_index("code") if rows else pd.DataFrame()
+    frame = pd.DataFrame(rows).set_index("code") if rows else pd.DataFrame()
+    frame.attrs["pit"] = PIT.pit_flags(
+        mode="strict" if strict else "live",
+        decision_asof=PIT.parse_asof(asof).isoformat(timespec="seconds") if asof_moment else None,
+        price_pit_safe=bool(strict and rows and adjustments_unproven == 0),
+        bars_dropped_future=bars_dropped_future,
+        bars_unreadable_index=bars_unreadable_index,
+        codes_without_proven_adjustment=adjustments_unproven,
+    )
+    return frame
 
 def _first_finance_value(record, keys):
     """Return the first explicit non-empty field without inventing metadata."""
@@ -159,9 +248,19 @@ def _has_finance_value(record, keys):
 def compute_fundamental_factors(snapshot, finance, asof=None):
     """价值/质量因子，并附带保守的财务报告点时元数据。
 
-    ``asof`` 是可选的历史回放截止日；不传时保持现有实时策略口径。
-    当前财务接口仅返回报告期（``report_date``），没有披露时间，因此
-    未知披露时间的实时值标记为 ``shadow``，历史回放会隐藏该值。
+    ``asof is None`` → **live compatibility mode**：保持现有实时策略口径。
+    ``asof is not None`` → **strict PIT historical mode**，两类数据分别收紧：
+
+    * **财务数值**（roe/rev_yoy/profit_yoy/net_profit/annual_net_profit）继续由
+      ``financial_point_in_time.financial_visibility`` 判定：报告期**永不**充当
+      披露时间，缺披露时间戳 → 不可见。
+    * **snapshot 动态字段与行业分类**（pe/pb/mktcap/float_cap/main_net/super_net/
+      turnover/pct_today/industry）改为按可用时点判定：快照行必须有可信
+      ``observed_at``（或 ``quote_at``/``quote_ts``/``available_at``）且
+      ``<= asof`` 才可见；行业还必须满足分类生效区间或"该行本身在 asof 前被观测到"。
+
+    历史模式下不可见即**缺失**：动态数值 → ``NaN``，分类 → ``None``。
+    绝不回退到"今天的数据"，也绝不用降低权重的方式假装处理。
     """
     finance_payload = finance if isinstance(finance, dict) else {}
     fin = finance_payload.get("data", {})
@@ -172,6 +271,8 @@ def compute_fundamental_factors(snapshot, finance, asof=None):
         # existing callers leave it absent and remain in live compatibility mode.
         asof = finance_payload.get("asof_date")
     rows = []
+    snapshot_hidden = 0
+    industry_hidden = 0
     for s in snapshot or []:
         if not isinstance(s, dict) or not s.get("code"):
             continue
@@ -183,6 +284,16 @@ def compute_fundamental_factors(snapshot, finance, asof=None):
         row_asof = asof if asof is not None else f.get("asof_date")
         if row_asof is None:
             row_asof = s.get("asof_date")
+
+        # snapshot 动态字段 + 行业分类的可用性判定（strict 模式下未知 = 不可见）
+        snapshot_at_raw, _snapshot_at_iso = PIT.snapshot_available_at(s)
+        snapshot_verdict = PIT.is_visible_at(snapshot_at_raw, row_asof)
+        classification_verdict = PIT.classification_visibility(s, row_asof)
+        snapshot_visible = bool(snapshot_verdict["visible"])
+        if PIT.asof_is_strict(row_asof) and not snapshot_visible:
+            snapshot_hidden += 1
+        if PIT.asof_is_strict(row_asof) and not classification_verdict["visible"]:
+            industry_hidden += 1
         latest_meta = financial_visibility(f, row_asof)
         annual_record = {
             "annual_report_period": _first_finance_value(f, ("annual_report_period", "annual_report_date")),
@@ -224,10 +335,16 @@ def compute_fundamental_factors(snapshot, finance, asof=None):
         def _value(key, visible, _factor=f):
             return _factor.get(key) if visible else np.nan
 
-        pe = s.get("pe")
-        pb = s.get("pb")
+        pe = s.get("pe") if snapshot_visible else None
+        pb = s.get("pb") if snapshot_visible else None
+
+        def _dynamic(key, _visible=snapshot_visible, _row=s):
+            """snapshot 动态数值：可见才透传，strict 不可见统一缺失为 NaN。"""
+            return _row.get(key) if _visible else np.nan
+
         rows.append({
-            "code": code, "name": s.get("name"), "industry": s.get("industry"),
+            "code": code, "name": s.get("name"),
+            "industry": classification_verdict["value"],
             "pe": pe if isinstance(pe, (int, float)) and pe > 0 else np.nan,
             "pb": pb if isinstance(pb, (int, float)) and pb > 0 else np.nan,
             "roe": _value("roe", latest_visible), "rev_yoy": _value("rev_yoy", latest_visible),
@@ -244,14 +361,40 @@ def compute_fundamental_factors(snapshot, finance, asof=None):
             "annual_report_period": annual_meta["report_period"],
             "annual_report_published_at": annual_meta["report_published_at"],
             "annual_report_age_days": annual_meta["report_age_days"],
-            "mktcap": s.get("mktcap"), "float_cap": s.get("float_cap"),
-            "main_net": s.get("main_net"), "super_net": s.get("super_net"),
-            "turnover": s.get("turnover"), "pct_today": s.get("pct"),
+            "mktcap": _dynamic("mktcap"), "float_cap": _dynamic("float_cap"),
+            "main_net": _dynamic("main_net"), "super_net": _dynamic("super_net"),
+            "turnover": _dynamic("turnover"), "pct_today": _dynamic("pct"),
+            # 按数据类分层的可审计判定（机器只读 reason，不解析自然语言）
+            "snapshot_pit_reason": snapshot_verdict["reason"],
+            "snapshot_observed_at": snapshot_verdict["available_at"],
+            "classification_pit_reason": classification_verdict["reason"],
+            "classification_basis": classification_verdict["basis"],
         })
-    return pd.DataFrame(rows).set_index("code") if rows else pd.DataFrame()
+    frame = pd.DataFrame(rows).set_index("code") if rows else pd.DataFrame()
+    strict = PIT.asof_is_strict(asof)
+    total = len(rows)
+    frame.attrs["pit"] = PIT.pit_flags(
+        mode="strict" if strict else "live",
+        decision_asof=PIT.parse_asof(asof).isoformat(timespec="seconds") if strict and PIT.parse_asof(asof) else None,
+        snapshot_pit_safe=bool(strict and total and snapshot_hidden == 0),
+        classification_pit_safe=bool(strict and total and industry_hidden == 0),
+        financial_pit_safe=bool(strict and total),
+        rows_with_hidden_snapshot=snapshot_hidden,
+        rows_with_hidden_industry=industry_hidden,
+    )
+    return frame
 
-def compute_sentiment_factors(universe_codes):
-    """情绪因子：人气榜排名 + 排名飙升。来源：东方财富股票人气榜（实时）"""
+def compute_sentiment_factors(universe_codes, asof=None):
+    """情绪因子：人气榜排名 + 排名飙升。来源：东方财富股票人气榜（实时）
+
+    ``asof is None`` → **live compatibility mode**，行为不变。
+    ``asof is not None`` → **strict PIT historical mode**：人气榜只有实时接口、
+    没有任何历史归档或 ``observed_at``，因此历史时点**必然**不可用。此时
+    直接返回空 dict，并且**绝不发起实时网络调用**——回放 2024 年时去调今天
+    的热榜 API 是最典型的前视泄漏。
+    """
+    if PIT.asof_is_strict(asof):
+        return {}
     hot = dfc.fetch_hot_rank(topn=100)
     scores = {}
     for h in hot:
@@ -263,6 +406,31 @@ def compute_sentiment_factors(universe_codes):
         scores[code] = {"hot_rank": h["rank"], "rank_chg": h.get("rank_chg"), 
                         "sentiment": 0.6 * rank_score + 0.4 * surge}
     return scores
+
+
+def pit_provenance(price=None, fund=None, sentiment=None, asof=None):
+    """按数据类汇总 PIT 证据，回答"这次结果的每类数据是否 PIT-safe？"。
+
+    刻意**不用**单个模糊的 ``data_ok=True``：价格截断、复权口径、快照观测时点、
+    行业分类生效区间、情绪源归档是五件独立的事，任何一件不成立都不能靠另一件掩盖。
+    ``sentiment`` 为历史模式下返回的空 dict 时，``sentiment_pit_safe`` 记为 True
+    （"正确地判定为不可用"本身就是 PIT-safe），而不是把它伪装成"有数据且安全"。
+    """
+    price_flags = dict(getattr(price, "attrs", {}).get("pit") or {})
+    fund_flags = dict(getattr(fund, "attrs", {}).get("pit") or {})
+    strict = PIT.asof_is_strict(asof)
+    out = PIT.pit_flags(
+        mode="strict" if strict else "live",
+        decision_asof=PIT.parse_asof(asof).isoformat(timespec="seconds")
+        if strict and PIT.parse_asof(asof) else None,
+    )
+    for flag in ("price_pit_safe", "snapshot_pit_safe",
+                 "classification_pit_safe", "financial_pit_safe"):
+        out[flag] = bool((price_flags if flag == "price_pit_safe" else fund_flags).get(flag))
+    out["sentiment_pit_safe"] = bool(sentiment is not None and not sentiment) if strict else False
+    out["price"] = price_flags
+    out["fundamental"] = fund_flags
+    return out
 
 def overseas_risk_gate(history=None):
     """海外风险门控：绿/黄/红。合成规则（可回测）：

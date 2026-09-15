@@ -3608,7 +3608,9 @@ def _rebuild_selection_factor_cache(asof_date=None):
             frame = frame.loc[frame.index.date <= cutoff]
         if frame is not None and len(frame) > 65:
             klines[code] = frame
-    price_f = F.compute_price_factors(klines)
+    # cutoff 同时作为 strict PIT 的 decision_asof：因子内部再按"bar 可用时点"
+    # 复核一遍（日线在当日收盘才可用），而不是只靠上面的日期预裁剪。
+    price_f = F.compute_price_factors(klines, asof=cutoff)
     eligible_codes = {
         str(row.get("code") or "")
         for row in (universe or [])
