@@ -3591,13 +3591,38 @@ def _rebuild_selection_factor_cache(asof_date=None):
     """在收盘历史库更新成功后重建盘中读取的紧凑因子文件。"""
     cutoff = _date(asof_date) if asof_date is not None else None
     universe = U.load_universe()
+    universe_membership = None
     if cutoff is not None:
+        # strict historical 需要**两件**事同时成立：
+        #   1) 逐行成员资格已证明（drop_unproven=True，缺 list/delist 的一律不留）；
+        #   2) **源级**完整性已证明——逐行日期只能证明"这条现存 row 在 asof 属于
+        #      市场"，不能证明 `current universe == historical universe at T`：
+        #      已退市且今天不在快照里的证券根本不在输入里。
+        # 今天的 universe.json 是当前快照，无权自称历史完整，所以生产历史重建
+        # 会 fail closed，直到有真正持有上市/退市史的归档方显式声明完整性。
+        pit_gate = U.historical_universe(universe, cutoff, drop_unproven=True)
+        universe = pit_gate["members"]
+        universe_membership = pit_gate["report"]
+        if not pit_gate["passed"]:
+            missing_source = not universe_membership["historical_membership_complete"]
+            return {
+                "status": "blocked",
+                "reason": ("历史 universe 源未证明完整性（PIT unavailable），"
+                           "拒绝回退到当前 universe" if missing_source else
+                           "历史 universe 无任何已证明成员资格（PIT unavailable），"
+                           "拒绝回退到当前 universe"),
+                "pit_unavailable": True,
+                "required": ("需要显式声明 historical_archive 完整性的历史成员源"
+                             "（含上市/退市史）；当前快照不构成证据"),
+                "universe_membership": universe_membership,
+            }
         gate = _selection_factor_history_gate(universe, cutoff)
         if not gate["passed"]:
             return {
                 "status": "blocked",
                 "reason": "完整日线覆盖不足，保留上一有效因子版本",
                 "refresh_gate": gate,
+                "universe_membership": universe_membership,
             }
     klines = {}
     for row in universe:
@@ -3608,7 +3633,9 @@ def _rebuild_selection_factor_cache(asof_date=None):
             frame = frame.loc[frame.index.date <= cutoff]
         if frame is not None and len(frame) > 65:
             klines[code] = frame
-    price_f = F.compute_price_factors(klines)
+    # cutoff 同时作为 strict PIT 的 decision_asof：因子内部再按"bar 可用时点"
+    # 复核一遍（日线在当日收盘才可用），而不是只靠上面的日期预裁剪。
+    price_f = F.compute_price_factors(klines, asof=cutoff)
     eligible_codes = {
         str(row.get("code") or "")
         for row in (universe or [])
@@ -3677,7 +3704,8 @@ def _rebuild_selection_factor_cache(asof_date=None):
     latest = None
     if "last_date" in price_f and not price_f.empty:
         latest = str(price_f["last_date"].dropna().max())[:10]
-    return {"status": "ok", "factor_rows": len(price_f), "factor_date": latest}
+    return {"status": "ok", "factor_rows": len(price_f), "factor_date": latest,
+            "universe_membership": universe_membership}
 
 
 def _history_manifest():
@@ -5312,7 +5340,11 @@ def _candidate_rows(account, asof_date, market, sector_rows=None, live_universe=
     # ``shadow`` for this one model; the strategy still requires an explicit
     # publication record before a formal pick is returned.
     finance_asof = None if account_id == NEW_STRATEGY_ID else asof_date
-    fund = F.compute_fundamental_factors(universe, finance, asof=finance_asof)
+    # ``universe`` 由当前 universe.json 与当日 live_map 组成，即**当前实时截面**：
+    # 它的决策时点是现在，不是已收盘日线 cutoff。用 cutoff 判它会清空 PE/PB/
+    # 换手/资金/行业（``build_factor_table`` 的 pct 正取自这里），直接打掉盘中扫描。
+    fund = F.compute_fundamental_factors(
+        universe, finance, asof=finance_asof, snapshot_asof=F.live_snapshot_asof())
     live_flow = {
         str(code): row.get("main_pct")
         for code, row in live_map.items()

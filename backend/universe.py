@@ -10,6 +10,11 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import data_fetcher as dfc
 
 try:
+    import point_in_time as PIT
+except ImportError:  # Allow ``backend.universe`` package-style test imports.
+    from . import point_in_time as PIT
+
+try:
     import chinese_calendar as _cn_calendar
 except ImportError:  # pragma: no cover - requirements installs the provider.
     _cn_calendar = None
@@ -290,6 +295,61 @@ def latest_complete_trade_date(asof_day=None, now=None):
     if day == clock.date() and clock.time() < dt.time(15, 5):
         return _previous_trade_weekday(day)
     return day
+
+
+def asof_members(rows, asof, *, strict=True, drop_unproven=False):
+    """按 ``asof`` 过滤历史 universe 成分（PIT 契约，见 ``point_in_time``）。
+
+    历史选股成分必须满足 ``list_date <= asof < delist_date``。绝不允许
+    "先取今天仍上市的股票再回放五年前"——那会同时引入未来上市与漏掉退市
+    两类幸存者偏差。
+
+    ``asof is None`` 时原样返回（live compatibility）。当前数据源不含上市/
+    退市日期，因此无法证明的成分会被计入 ``report["unproven"]`` 而**不是**
+    被默认当作"当时已上市"；需要完全 fail-closed 的调用方传
+    ``drop_unproven=True``。
+
+    ⚠️ 这**只**证明逐行成员资格。它无法排除"已经退市、今天不在快照里的证券
+    根本不在输入里"这种情况——strict 历史必须再走
+    :func:`historical_universe`（源级完整性）。
+    """
+    return PIT.universe_asof_members(rows, asof, strict=strict,
+                                     drop_unproven=drop_unproven)
+
+
+def load_universe_source():
+    """当前 universe 文件的**来源声明**（不含 ``stocks`` 列表）。
+
+    今天写出的 ``universe.json`` 是**当前快照**：它没有 ``historical_archive``
+    声明，因此严格历史模式必须据此 fail closed，绝不"自称历史完整"。
+    读不到文件时返回 ``None``（同样视为未证明）。
+    """
+    try:
+        with open(UNIVERSE_PATH, encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except (OSError, ValueError, TypeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    source = {key: value for key, value in payload.items() if key != "stocks"}
+    if not any(key in payload for key in PIT.UNIVERSE_SOURCE_KIND_KEYS):
+        # 本仓库写出的 universe.json 是**当前快照**（由实时快照派生）。没有显式
+        # 声明 kind 的文件一律按当前快照对待——绝不能因为"没声明"就默认可信。
+        source["kind"] = PIT.UNIVERSE_SOURCE_KIND_CURRENT
+    return source
+
+
+def historical_universe(rows, asof, *, source=None, drop_unproven=True):
+    """strict 历史 universe 的**唯一入口**（逐行成员资格 + 源级完整性）。
+
+    ``source`` 缺省时自动读取当前 ``universe.json`` 的来源声明；当前快照永远
+    不构成历史完整性证据，所以生产历史重建会 fail closed，直到有真正持有
+    上市/退市史的归档方显式声明 ``kind="historical_archive"`` 且完整。
+    """
+    if source is None:
+        source = load_universe_source()
+    return PIT.historical_universe(rows, asof, source=source,
+                                   drop_unproven=drop_unproven)
 
 
 def _history_is_fresh(last_date, asof_day=None):

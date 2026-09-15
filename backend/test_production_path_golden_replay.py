@@ -72,6 +72,8 @@ _REAL_LATEST_COMPLETE_TRADE_DATE = U.latest_complete_trade_date
 PASS_CODES = ("600901", "600902")
 FAIL_CODES = ("600903", "600904", "600905", "600906")
 ALL_CODES = PASS_CODES + FAIL_CODES
+#: PIT：合成股票在**回放窗口之前**就已上市，因此历史成员资格可被证明。
+SYNTHETIC_LIST_DATE = "2015-01-05"
 NAMES = {
     "600901": "回放甲", "600902": "回放乙", "600903": "回放丙",
     "600904": "回放丁", "600905": "回放戊", "600906": "回放己",
@@ -140,7 +142,10 @@ def _synthetic_kline(code: str):
     )
     frame.index.name = "date"
     frame.attrs["source"] = "unit_test_injection"
-    frame.attrs["adjustment"] = "qfq"
+    # PIT：这条合成序列按构造不会被公司行为回溯重算，所以声明为不复权——
+    # 也就是"复权口径可证明在历史 asof 当时成立"。若声明成 qfq，strict 历史模式
+    # 会（正确地）拒绝它，因为无法证明当时就能拿到同样的调整基准。
+    frame.attrs["adjustment"] = "none"
     LAST_CLOSE[code] = round(closes[-1], 2)
     return frame
 
@@ -154,6 +159,9 @@ def _seed_market(tmp: str) -> None:
         stocks.append({
             "code": code, "name": NAMES.get(code, code), "board": "主板",
             "risk_flag": 0, "snapshot_tradable": True, "listing_status": "listed",
+            # PIT：strict 历史选股要求成员资格**已被证明**（list_date <= asof <
+            # delist_date）。合成的"老股"上市日固定在一个远早于回放窗口的日期上。
+            "list_date": SYNTHETIC_LIST_DATE,
             "price": LAST_CLOSE[code], "pct": 0.6, "industry": INDUSTRY,
         })
     # 基准指数：缓步上行，保证 _market_state 具备 21 根完整日线。
@@ -170,13 +178,21 @@ def _seed_market(tmp: str) -> None:
     )
     bench.index.name = "date"
     bench.attrs["source"] = "unit_test_injection"
-    bench.attrs["adjustment"] = "qfq"
+    bench.attrs["adjustment"] = "none"
     dfc.save_kline("BENCH_000300", bench)
     # save_kline 的 manifest 攒批 50 次才落盘；测试规模小，显式刷盘。
     dfc._flush_kline_manifest_unlocked()
     universe = {
         "built_at": f"{D0.isoformat()} 08:00:00",
         "scope": "all_a_shares", "requested_limit": None,
+        # PIT：strict 历史不仅要求逐行 ``list_date``，还要求**源级**完整性声明——
+        # 逐行日期只能证明"这条现存 row 在 asof 属于市场"，无法证明"今天不在快照
+        # 里的退市证券没有被漏掉"。本 fixture 在这里扮演"持有完整历史成员史"的
+        # 归档源；真实生产没有这样的源，所以生产历史重建会 fail closed。
+        "kind": "historical_archive",
+        "historical_membership_complete": True,
+        "historical_membership_asof": "2026-12-31",
+        "historical_membership_source": "unit_test_injection",
         "stocks": stocks,
     }
     with open(U.UNIVERSE_PATH, "w", encoding="utf-8") as handle:

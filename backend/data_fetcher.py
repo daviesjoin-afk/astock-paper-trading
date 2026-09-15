@@ -567,6 +567,9 @@ def fetch_market_snapshot(pages=None, allow_disk_fallback=True):
                 "small_net": d.get("f84"),
                 "main_pct": d.get("f184"),
                 "quote_ts": d.get("f124"), "quote_at": _quote_at(d.get("f124")),
+                # PIT：每行都带可信观测时点（优先行情揭示时间，缺失则本地抓取时刻）。
+                # 没有它，strict 历史模式只能把这些动态字段判成不可用。
+                "observed_at": MN.observed_at(d.get("f124")),
             }))
         # 全市场任务不得用少量残页覆盖上一份完整快照。部分市场数据会
         # 严重扭曲市场宽度、热点排序和候选覆盖率。
