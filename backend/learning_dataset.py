@@ -1634,15 +1634,21 @@ def selection_label_evidence(record: Mapping[str, Any]) -> dict:
     却没有有限 ``label_score`` 或没有 ``exit_date`` 的记录**不会**被放行，
     因为那只是标签，不是证据。
     """
+    # "自称 verified"与"证据成立"是两件事，判定只做一次 —— 在
+    # ``selection_labels.verified_evidence`` 里。桥不重复实现标签逻辑。
+    import selection_labels as SL
+
+    verdict = SL.verified_evidence(record)
+
     declared = _text(record.get("label_status"))
     status = declared if declared in SELECTION_LABEL_STATUS_TO_PIT else PIT_UNPROVEN
-
-    exit_date = _date_text(record.get("exit_date"))
-    score = _finite(record.get("label_score"))
-    verified = status == PIT_VERIFIED and exit_date is not None and score is not None
-    if status == PIT_VERIFIED and not verified:
-        # 声称 verified、证据却不完整 → 降级，绝不补齐。
+    if declared == SL.STATUS_VERIFIED and not verdict["verified"]:
+        # 声称 verified、证据却不完整（缺有限 score / 缺 exit 证据 / 收益与价格
+        # 矛盾）→ 降级，绝不补齐。
         status = PIT_UNPROVEN
+
+    verified = bool(verdict["verified"])
+    exit_date = verdict["exit_date"]
 
     return {
         "declared_status": declared,
@@ -1650,14 +1656,14 @@ def selection_label_evidence(record: Mapping[str, Any]) -> dict:
         "selection_status": status,
         "label_status": status,
         "verified": verified,
-        "sample_key": _text(record.get("sample_key")),
-        "label_version": _text(record.get("label_version")),
+        "sample_key": verdict["sample_key"],
+        "label_version": verdict["label_version"],
         "pit_status": PIT_VERIFIED if verified else PIT_UNPROVEN,
         "label_end_date": exit_date,
         "label_available_at": (
             f"{exit_date}T{SELECTION_LABEL_EVIDENCE_CLOSE_TIME}+08:00" if verified else None
         ),
-        "label_score": score if verified else None,
+        "label_score": verdict["label_score"],
         "exclusion_reason": (
             None if verified else SELECTION_LABEL_STATUS_TO_EXCLUSION.get(status, "missing_label")
         ),

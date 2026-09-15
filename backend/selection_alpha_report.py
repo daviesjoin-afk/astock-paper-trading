@@ -216,6 +216,14 @@ def picks_from_tracking(days):
 
 
 def picks_from_signals(days):
+    """模拟盘已成交信号 → picks，决策日取 ``signal_date``。
+
+    ``paper_signals`` 把**决策**记在 ``signal_date``（收盘后形成信号），把
+    **执行**记在 ``intended_date``（下一个交易日）。契约的 entry 已经是
+    "决策日之后第一个交易日"，因此这里必须传 ``signal_date``：传
+    ``intended_date`` 会把它当成一个收盘后决策，entry 再往后多推一个交易日，
+    于是周一决策、周二成交的样本会被报成周三收盘入场，整条收益与 horizon 全错位。
+    """
     db = os.path.join(DATA_DIR, "paper_trading.sqlite3")
     if not os.path.exists(db):
         return []
@@ -223,8 +231,8 @@ def picks_from_signals(days):
     conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
     try:
         rows = conn.execute(
-            """SELECT account_id, intended_date, code FROM paper_signals
-                WHERE status='filled' AND intended_date >= ?""",
+            """SELECT account_id, signal_date, code FROM paper_signals
+                WHERE status='filled' AND signal_date IS NOT NULL AND signal_date >= ?""",
             (cutoff,),
         ).fetchall()
     finally:

@@ -1300,11 +1300,15 @@ def _alpha_dataset(conn, max_rows_per_window=ALPHA_MAX_ROWS_PER_WINDOW):
             GROUP BY start_date,horizon ORDER BY start_date,horizon"""
     ).fetchall()
     rows = []
+    # 有限性谓词必须在 SQL 里，而不是取完 ``LIMIT`` 再在 Python 里过滤：
+    # 否则 ±Inf 行照样占掉每个窗口的配额，排在前面时会把有效样本整窗挤掉，
+    # 让 GA 窗口凭空缩小甚至变空。
     query = """SELECT s.profile_date,s.code,s.regime,s.price_momentum,s.main_flow,s.turnover,
                       s.volume_ratio,s.small_size,s.value,r.horizon,r.forward_return_pct
                  FROM adaptive_alpha_samples s JOIN adaptive_alpha_returns r
                    ON r.start_date=s.profile_date AND r.code=s.code
-                WHERE r.start_date=? AND r.horizon=?
+                 WHERE r.start_date=? AND r.horizon=?
+                  AND r.forward_return_pct BETWEEN -9e307 AND 9e307
                 ORDER BY ((CAST(s.code AS INTEGER) * 1103515245 + r.horizon * 12345) & 2147483647)
                 LIMIT ?"""
     for window in windows:

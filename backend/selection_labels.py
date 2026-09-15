@@ -411,6 +411,10 @@ def _unresolved(
     这就是“不知道 != 失败”“尚未发生 != 失败”“缺数据 != 0%”在类型层面的落点。
     """
     canonical = _canonical_decision(moment) if moment is not None else None
+    # 非法 horizon（例如反序列化得到的 ``'bad'``）**绝不能**在这里抛异常：
+    # 契约保证任何坏输入都收敛成一条 ``invalid`` 标签，而不是让整批标注中断。
+    # 身份用中性哨兵构造，原始非法值不参与哈希，也不冒充一个真实 horizon。
+    safe_horizon = horizon if isinstance(horizon, int) and not isinstance(horizon, bool) else 0
     return SelectionLabel(
         code=str(code or "").strip(),
         decision_at=canonical,
@@ -418,7 +422,7 @@ def _unresolved(
         decision_phase=phase,
         entry_date=_date_text(entry_date),
         entry_price=entry_price,
-        horizon=int(horizon) if isinstance(horizon, int) and not isinstance(horizon, bool) else 0,
+        horizon=safe_horizon,
         exit_date=_date_text(exit_date),
         exit_price=None,
         raw_forward_return=None,
@@ -431,9 +435,23 @@ def _unresolved(
         label_reason=reason,
         label_version=version,
         basis=basis,
-        sample_key=sample_identity(code, canonical or "", horizon if horizon is not None else 0, version),
+        sample_key=sample_identity(code, canonical or "", safe_horizon, version),
         evidence=dict(evidence or {}),
     )
+
+
+def _close_available_at(day: Any) -> Optional[_dt.datetime]:
+    """某个交易日**收盘价**最早可能被任何人读到的时刻。
+
+    复用 :func:`point_in_time.bar_available_at`（日线 bar 的权威可用时点：
+    只有日期 → 当日 15:00 收市）。因此 ``asof`` 落在 exit 日的 10:00 时，
+    当日收盘价**还没发生**，标签只能是 ``pending``：只比较日期会把一个
+    尚未产生的收盘价提前消费成"已证明的未来收益"。
+    """
+    try:
+        return PIT.bar_available_at(day)
+    except Exception:  # pragma: no cover - 日历里的日期必然可解析
+        return None
 
 
 def _phase_of(moment: _dt.datetime, phase: Any) -> str:
@@ -513,11 +531,14 @@ def selection_label(
             version=version, basis=clean_basis, status=STATUS_INVALID,
             reason=REASON_INVALID_EVALUATION_ASOF,
         )
-    asof_day = evaluation.astimezone(PIT.china_tz()).date().isoformat()
+    asof_moment = evaluation.astimezone(PIT.china_tz())
+    asof_day = asof_moment.date().isoformat()
     trade_date = moment.astimezone(PIT.china_tz()).date().isoformat()
 
-    if trade_date > asof_day:
-        # 决策发生在评估时点之后 —— 这不是一个可评估的历史样本。
+    if moment > evaluation:
+        # 决策发生在评估时点之后 —— 这是**完整 timestamp** 比较，不是日期比较。
+        # 同为 2024-06-14 的 16:00 决策，在 10:00 的评估时点下尚未发生；
+        # 只比日期会把它伪装成一个可评估的历史样本。
         return _unresolved(
             code=text_code, moment=moment, phase=phase, horizon=clean_horizon,
             version=version, basis=clean_basis, status=STATUS_INVALID,
@@ -564,7 +585,11 @@ def selection_label(
         )
     exit_date = calendar[exit_index]
 
-    if exit_date > asof_day:
+    # exit 收盘价的可用时刻 vs 评估时点：``asof = exit 日 10:00`` 看不到当日
+    # 收盘价，所以标签只能是 pending。日期比较保留为兜底（可用时刻解析不出来
+    # 时仍然不会泄漏）。entry 收盘价必然早于 exit，无需单独判定。
+    exit_available_at = _close_available_at(exit_date)
+    if exit_date > asof_day or (exit_available_at is not None and asof_moment < exit_available_at):
         # 未来窗口尚未走完。**不得**因此判成负例。
         return _unresolved(
             code=text_code, moment=moment, phase=phase, horizon=clean_horizon,
@@ -747,12 +772,15 @@ FEATURE_RECORD_FIELDS = (
     "score",
 )
 
-#: 标签记录允许携带的键。
+#: 标签记录允许携带的键。``sample_key`` 必须在其中：它是样本身份本身，
+#: 丢掉它会让 "只按 code join" 这类错配重新变得可能，而
+#: ``learning_dataset.selection_label_evidence()`` 也确实读这个字段。
 LABEL_RECORD_FIELDS = (
     "code",
     "decision_at",
     "horizon",
     "label_version",
+    "sample_key",
     "label_status",
     "label_reason",
     "label_score",
@@ -834,6 +862,103 @@ def feature_record(
     )
 
 
+#: 声称 ``verified`` 却拿不出证据时的降级原因（受控词表，机器可读）。
+EVIDENCE_OK = "ok"
+EVIDENCE_EXIT_MISSING = "missing_exit_evidence"
+EVIDENCE_ENTRY_MISSING = "missing_entry_evidence"
+EVIDENCE_SCORE_MISSING = "missing_label_score"
+EVIDENCE_TIME_ORDER_INVALID = "invalid_label_time"
+EVIDENCE_OUTCOME_INCONSISTENT = "inconsistent_outcome"
+EVIDENCE_VERSION_MISSING = "missing_label_version"
+
+#: ``raw_forward_return`` 与 ``exit_price / entry_price - 1`` 的一致性容差。
+#: 两者由同一个公式产生，因此这里几乎是精确相等；容差只为浮点表示留余量。
+_OUTCOME_TOLERANCE = 1e-9
+
+
+def verified_evidence(record: Mapping[str, Any]) -> dict:
+    """一条标签记录**是否真的有** ``verified`` 所要求的证据。
+
+    ``label_status='verified'`` 只是一句自称。被反序列化的、部分损坏的或伪造的
+    记录完全可以带着这个字符串却没有有限 score、没有 exit 证据，或者收益与
+    价格互相矛盾。本函数是 "verified 学习集只接受 verified outcome" 这句话的
+    **唯一**判定点：:func:`assemble_learning_rows` 与
+    ``learning_dataset.selection_label_evidence`` 都走这里，不再各写一套。
+
+    返回的 ``verified`` 只在"状态自称 verified **且** 证据完整自洽"时为 ``True``；
+    ``claimed_verified`` 单独暴露"自称"这一事实，便于调用方区分
+    "非 verified 状态"（正常的 pending/unavailable/invalid）与
+    "自称 verified 但证据不成立"（必须 fail closed 的损坏记录）。
+    """
+    declared = str(record.get("label_status") or "")
+    claimed = declared == STATUS_VERIFIED
+
+    entry_date = _date_text(record.get("entry_date"))
+    exit_date = _date_text(record.get("exit_date"))
+    entry_price = _finite(record.get("entry_price"))
+    exit_price = _finite(record.get("exit_price"))
+    score = _finite(record.get("label_score"))
+    raw_return = _finite(record.get("raw_forward_return"))
+    excess_return = _finite(record.get("excess_return"))
+    basis = str(record.get("basis") or DEFAULT_BASIS)
+    version = str(record.get("label_version") or "").strip()
+
+    reason = EVIDENCE_OK
+    if claimed:
+        if not version:
+            reason = EVIDENCE_VERSION_MISSING
+        elif exit_date is None:
+            reason = EVIDENCE_EXIT_MISSING
+        elif entry_date is None or entry_price is None or entry_price <= 0:
+            reason = EVIDENCE_ENTRY_MISSING
+        elif score is None:
+            reason = EVIDENCE_SCORE_MISSING
+        elif exit_date <= entry_date:
+            # 时间关系非法：exit 必须严格晚于 entry。
+            reason = EVIDENCE_TIME_ORDER_INVALID
+        elif raw_return is None or exit_price is None:
+            reason = EVIDENCE_OUTCOME_INCONSISTENT
+        elif abs(raw_return - (exit_price / entry_price - 1.0)) > _OUTCOME_TOLERANCE:
+            reason = EVIDENCE_OUTCOME_INCONSISTENT
+        elif basis == BASIS_EXCESS and (
+            excess_return is None or abs(score - excess_return) > _OUTCOME_TOLERANCE
+        ):
+            reason = EVIDENCE_OUTCOME_INCONSISTENT
+        elif basis != BASIS_EXCESS and abs(score - raw_return) > _OUTCOME_TOLERANCE:
+            reason = EVIDENCE_OUTCOME_INCONSISTENT
+
+    verified = claimed and reason == EVIDENCE_OK
+    if verified:
+        status = STATUS_VERIFIED
+    elif claimed:
+        # 自称 verified、证据却不成立 → 降级为 unavailable，绝不补齐。
+        status = STATUS_UNAVAILABLE
+    else:
+        status = declared
+
+    raw_key = record.get("sample_key")
+    key_text = None if raw_key is None else (str(raw_key).strip() or None)
+
+    return {
+        "declared_status": declared,
+        "claimed_verified": claimed,
+        "verified": verified,
+        "status": status,
+        "reason": reason,
+        "sample_key": key_text,
+        "label_version": version or None,
+        # 日期是**结构**（entry/exit 落在哪两个 session），即使还没到期也如实保留；
+        # 价格/收益/score 是**证据**，不是 verified 就一律为 None。
+        "entry_date": entry_date,
+        "exit_date": exit_date,
+        "entry_price": entry_price if verified else None,
+        "exit_price": exit_price if verified else None,
+        "raw_forward_return": raw_return if verified else None,
+        "excess_return": excess_return if verified else None,
+        "label_score": score if verified else None,
+    }
+
+
 def _record_identity(record: Mapping[str, Any], *, join_on_version: bool) -> Optional[str]:
     code = str(record.get("code") or "").strip()
     horizon = record.get("horizon")
@@ -870,6 +995,10 @@ def assemble_learning_rows(
             "unverified_label": 0,
             "invalid_feature_identity": 0,
             "invalid_label_identity": 0,
+            "sample_key_mismatch": 0,
+            "invalid_verified_evidence": 0,
+            "duplicate_label": 0,
+            "conflicting_label": 0,
         },
         "require_verified": bool(require_verified),
         "join_on_version": bool(join_on_version),
@@ -886,6 +1015,7 @@ def assemble_learning_rows(
         features_by_key[key] = record
 
     labels_by_key = {}
+    conflicted = set()
     for raw in label_records or ():
         record = assert_label_record(raw)
         report["label_rows"] += 1
@@ -896,7 +1026,30 @@ def assemble_learning_rows(
         if key is None:
             report["excluded"]["invalid_label_identity"] += 1
             continue
-        labels_by_key[key] = record
+        declared_key = record.get("sample_key")
+        if join_on_version and declared_key not in (None, ""):
+            if str(declared_key).strip() != key:
+                # 自称身份与由（code, decision_at, horizon, label_version）重算出的
+                # 身份不符 → 拒绝。静默采信等于让一条贴错标签的记录进数据集。
+                report["excluded"]["sample_key_mismatch"] += 1
+                continue
+        if key in conflicted:
+            report["excluded"]["conflicting_label"] += 1
+            continue
+        previous = labels_by_key.get(key)
+        if previous is None:
+            labels_by_key[key] = record
+            continue
+        if previous == record:
+            # 逐字节相同的重复：任何输入顺序都得到同一个结果，安全去重。
+            report["excluded"]["duplicate_label"] += 1
+            continue
+        # 同一身份、不同结论：不选第一个也不选最后一个 —— 全部拒绝。
+        # 沿用 learning_dataset ``_ambiguous_identities`` 的既有约定：冲突绝不由
+        # 行序决定，否则数据集会随输入顺序变化。
+        del labels_by_key[key]
+        conflicted.add(key)
+        report["excluded"]["conflicting_label"] += 2
 
     rows = []
     for key, feature in sorted(features_by_key.items()):
@@ -906,6 +1059,12 @@ def assemble_learning_rows(
             continue
         if require_verified and label.get("label_status") != STATUS_VERIFIED:
             report["excluded"]["unverified_label"] += 1
+            continue
+        evidence = verified_evidence(label)
+        if evidence["claimed_verified"] and not evidence["verified"]:
+            # 自称 verified 却没有有限 score / 没有 exit 证据 / 收益与价格矛盾：
+            # 这不是可用样本，无论 require_verified 取什么值都不进数据集。
+            report["excluded"]["invalid_verified_evidence"] += 1
             continue
         rows.append(
             {
@@ -917,14 +1076,14 @@ def assemble_learning_rows(
                 "features": dict(feature.get("features") or {}),
                 "selected": feature.get("selected"),
                 "score": feature.get("score"),
-                "label_status": label.get("label_status"),
-                "label_score": label.get("label_score"),
-                "label_class": label.get("label_class"),
-                "raw_forward_return": label.get("raw_forward_return"),
-                "benchmark_return": label.get("benchmark_return"),
-                "excess_return": label.get("excess_return"),
-                "entry_date": label.get("entry_date"),
-                "exit_date": label.get("exit_date"),
+                "label_status": evidence["status"],
+                "label_score": evidence["label_score"],
+                "label_class": label.get("label_class") if evidence["verified"] else None,
+                "raw_forward_return": evidence["raw_forward_return"],
+                "benchmark_return": label.get("benchmark_return") if evidence["verified"] else None,
+                "excess_return": evidence["excess_return"],
+                "entry_date": evidence["entry_date"],
+                "exit_date": evidence["exit_date"],
             }
         )
     for key in labels_by_key:

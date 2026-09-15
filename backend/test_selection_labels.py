@@ -757,5 +757,315 @@ class NonFiniteOutcomeTest(unittest.TestCase):
             self.assertTrue(math.isfinite(row["excess_return_pct"]), row)
 
 
+# ─────────── review round 2: P22–P30 (exact-head blockers) ───────────
+
+
+#: 一只上涨的票：entry 2024-06-17 收 10 → exit 2024-06-19 收 11（+10%）。
+PRICES_UP = {**{d: 10.0 for d in SESSIONS}, "2024-06-19": 11.0}
+
+
+class EvidenceAvailabilityTest(unittest.TestCase):
+    """证据可用时点：收盘价在**收市时刻**才存在，asof 必须按完整 timestamp 比。"""
+
+    def test_p22_intraday_asof_on_the_exit_day_cannot_consume_that_close(self):
+        """P22：exit 日盘中评估看不到当日收盘价 —— pending，不是已验证收益。"""
+        cases = (
+            "2024-06-19T09:30:00+08:00",
+            "2024-06-19T10:00:00+08:00",
+            "2024-06-19T14:59:59+08:00",
+        )
+        for asof in cases:
+            label = _label(prices=PRICES_UP, asof=asof)
+            self.assertEqual(SL.STATUS_PENDING, label.label_status, asof)
+            self.assertEqual(SL.REASON_HORIZON_NOT_MATURED, label.label_reason, asof)
+            self.assertFalse(label.verified, asof)
+            # 尚未发生的收盘价不得被消费成一个"已证明"的未来收益。
+            self.assertIsNone(label.label_score, asof)
+            self.assertIsNone(label.raw_forward_return, asof)
+            self.assertIsNone(label.exit_price, asof)
+            # 也绝不能因此被当成负例。
+            self.assertNotEqual(SL.CLASS_NEGATIVE, label.label_class, asof)
+
+        # 收市时刻与 date-only（= 该交易日的结束）之后才是完整证据。
+        for asof in ("2024-06-19T15:00:00+08:00", "2024-06-19", ASOF):
+            label = _label(prices=PRICES_UP, asof=asof)
+            self.assertEqual(SL.STATUS_VERIFIED, label.label_status, asof)
+            self.assertAlmostEqual(0.1, label.raw_forward_return, places=12)
+
+        # 盘中标签与收市后标签是**同一个样本身份**，只是证据成熟度不同。
+        self.assertEqual(
+            _label(prices=PRICES_UP, asof="2024-06-19T10:00:00+08:00").sample_key,
+            _label(prices=PRICES_UP, asof="2024-06-19").sample_key,
+        )
+
+    def test_p23_decision_at_is_compared_as_a_full_timestamp(self):
+        """P23：decision_at 与 asof 必须按完整 timestamp 比，不能只比日期。"""
+        later = _label(
+            prices=PRICES_UP,
+            decision_at="2024-06-14T16:00:00+08:00",
+            asof="2024-06-14T10:00:00+08:00",
+        )
+        self.assertEqual(SL.STATUS_INVALID, later.label_status)
+        self.assertEqual(SL.REASON_DECISION_AFTER_EVALUATION, later.label_reason)
+        self.assertIsNone(later.label_score)
+        self.assertIsNone(later.raw_forward_return)
+        self.assertNotEqual(SL.CLASS_NEGATIVE, later.label_class)
+        # 决策时点被如实保留，便于审计（而不是被静默改写成 asof）。
+        self.assertEqual("2024-06-14", later.decision_trade_date)
+
+        # 同一瞬间不算"之后"；date-only asof = 该自然日结束。
+        same_moment = _label(
+            prices=PRICES_UP,
+            decision_at="2024-06-14T16:00:00+08:00",
+            asof="2024-06-14T16:00:00+08:00",
+        )
+        self.assertEqual(SL.STATUS_PENDING, same_moment.label_status)
+        date_only = _label(prices=PRICES_UP, asof="2024-06-14")
+        self.assertEqual(SL.STATUS_PENDING, date_only.label_status)
+
+    def test_p24_nonnumeric_horizon_is_invalid_not_an_exception(self):
+        """P24：非数值 horizon 收敛成 invalid 标签，绝不让整批标注中断。"""
+        for horizon in ("bad", "", "  ", "two", [], {}, float("nan")):
+            label = _label(horizon=horizon)
+            self.assertEqual(SL.STATUS_INVALID, label.label_status, horizon)
+            self.assertEqual(SL.REASON_INVALID_HORIZON, label.label_reason, horizon)
+            self.assertIsNone(label.label_score, horizon)
+            self.assertFalse(label.verified, horizon)
+        # 身份哨兵稳定（同一个坏值永远同一个 key），且绝不冒充一个真实 horizon。
+        # 所有非法 horizon 共用哨兵身份是**有意**的：它们全都是 invalid，
+        # 永远不会进入任何数据集，不需要靠身份区分彼此。
+        self.assertEqual(
+            _label(horizon="bad").sample_key, _label(horizon="bad").sample_key
+        )
+        self.assertNotEqual(_label(horizon="bad").sample_key, _label(horizon=2).sample_key)
+        self.assertNotEqual(_label(horizon="bad").sample_key, _label(horizon=1).sample_key)
+
+
+class VerifiedEvidenceTest(unittest.TestCase):
+    """``label_status='verified'`` 是自称；证据不成立就必须 fail closed。"""
+
+    def _feature(self, code="600001"):
+        return SL.feature_record(
+            code=code, decision_at=T_AFTER_CLOSE, horizon=2, features={"momentum": 0.1}
+        )
+
+    def test_p25_verified_claims_without_evidence_never_enter_the_dataset(self):
+        """P25：只有状态字符串、没有证据的记录不得进 verified 学习集。"""
+        import learning_dataset as LD
+
+        good = SL.label_record(_label(prices=PRICES_UP))
+        broken_cases = {
+            "no_score": ({"label_score": None}, "invalid_verified_evidence"),
+            "nan_score": ({"label_score": float("nan")}, "invalid_verified_evidence"),
+            "no_exit_date": ({"exit_date": None}, "invalid_verified_evidence"),
+            "no_entry_price": ({"entry_price": None}, "invalid_verified_evidence"),
+            "zero_entry_price": ({"entry_price": 0.0}, "invalid_verified_evidence"),
+            "inconsistent_raw": ({"raw_forward_return": 0.99}, "invalid_verified_evidence"),
+            "inconsistent_score": ({"label_score": 0.99}, "invalid_verified_evidence"),
+            "reversed_dates": ({"entry_date": "2024-06-20"}, "invalid_verified_evidence"),
+            "nan_exit_price": ({"exit_price": float("nan")}, "invalid_verified_evidence"),
+            # 空版本同时让样本身份对不上 → 由身份校验先拦下（同样是拒绝）。
+            "no_version": ({"label_version": ""}, "sample_key_mismatch"),
+        }
+        for name, (patch, counter) in broken_cases.items():
+            record = {**good, **patch}
+            self.assertFalse(SL.verified_evidence(record)["verified"], name)
+            self.assertTrue(SL.verified_evidence(record)["claimed_verified"], name)
+            # 两个消费者必须给出一致判定：桥不重复实现标签逻辑。
+            self.assertEqual(
+                SL.verified_evidence(record)["verified"],
+                LD.selection_label_evidence(record)["verified"],
+                name,
+            )
+            for require in (True, False):
+                result = SL.assemble_learning_rows([self._feature()], [record],
+                                                   require_verified=require)
+                self.assertEqual([], result["rows"], (name, require))
+                self.assertEqual(1, result["report"]["excluded"][counter], (name, require))
+
+        # 身份不参与版本时，空版本仍然被**证据**校验拦下，不是靠身份错配兜住。
+        result = SL.assemble_learning_rows(
+            [self._feature()], [{**good, "label_version": ""}], join_on_version=False
+        )
+        self.assertEqual([], result["rows"])
+        self.assertEqual(0, result["report"]["excluded"]["sample_key_mismatch"])
+        self.assertEqual(1, result["report"]["excluded"]["invalid_verified_evidence"])
+
+        # 真有证据的记录照常通过，且带的是校验过的数字。
+        result = SL.assemble_learning_rows([self._feature()], [good])
+        self.assertEqual(1, len(result["rows"]))
+        row = result["rows"][0]
+        self.assertEqual(SL.STATUS_VERIFIED, row["label_status"])
+        self.assertIsNotNone(row["label_score"])
+        self.assertEqual(good["exit_date"], row["exit_date"])
+        self.assertEqual(0, result["report"]["excluded"]["invalid_verified_evidence"])
+
+    def test_p26_conflicting_labels_are_refused_and_order_independent(self):
+        """P26：同一身份的不同结论不得 last-write-wins，必须整体拒绝。"""
+        up = SL.label_record(_label(prices=PRICES_UP))
+        down = SL.label_record(
+            _label(prices={**{d: 10.0 for d in SESSIONS}, "2024-06-19": 9.0})
+        )
+        self.assertEqual(up["sample_key"], down["sample_key"])
+        self.assertNotEqual(up["raw_forward_return"], down["raw_forward_return"])
+
+        feature = self._feature()
+        for records in ([up, down], [down, up]):
+            result = SL.assemble_learning_rows([feature], records)
+            self.assertEqual([], result["rows"], records)
+            self.assertEqual(2, result["report"]["excluded"]["conflicting_label"])
+            self.assertEqual(0, result["report"]["excluded"]["duplicate_label"])
+
+        # 第三条同身份记录也不会让被拒绝的样本复活。
+        result = SL.assemble_learning_rows([feature], [up, down, up])
+        self.assertEqual([], result["rows"])
+        self.assertEqual(3, result["report"]["excluded"]["conflicting_label"])
+
+        # 逐字节相同的重复：任何顺序都得到同一条，安全去重、不算冲突。
+        for records in ([up, dict(up), up], [up, up, dict(up)]):
+            result = SL.assemble_learning_rows([feature], records)
+            self.assertEqual(1, len(result["rows"]))
+            self.assertEqual(2, result["report"]["excluded"]["duplicate_label"])
+            self.assertEqual(0, result["report"]["excluded"]["conflicting_label"])
+
+    def test_p27_sample_identity_survives_the_label_record_bridge(self):
+        """P27：``label_record`` 必须携带 sample identity，贴错身份的要被拒。"""
+        import learning_dataset as LD
+
+        good = _label(prices=PRICES_UP)
+        record = SL.label_record(good)
+        self.assertEqual(good.sample_key, record["sample_key"])
+        self.assertEqual(
+            good.sample_key,
+            SL.sample_identity(record["code"], record["decision_at"],
+                               record["horizon"], record["label_version"]),
+        )
+        # 桥接层拿到的是同一个身份，而不是 None / 空串。
+        self.assertEqual(good.sample_key, LD.selection_label_evidence(record)["sample_key"])
+
+        feature = self._feature()
+        foreign = {
+            **record,
+            "sample_key": SL.sample_identity(
+                "000002", good.decision_at, good.horizon, good.label_version
+            ),
+        }
+        result = SL.assemble_learning_rows([feature], [foreign])
+        self.assertEqual([], result["rows"])
+        self.assertEqual(1, result["report"]["excluded"]["sample_key_mismatch"])
+        # 正确身份的记录不受影响。
+        ok = SL.assemble_learning_rows([feature], [record])
+        self.assertEqual(1, len(ok["rows"]))
+        self.assertEqual(record["sample_key"], ok["rows"][0]["sample_key"])
+
+
+class FilledSignalDecisionDayTest(unittest.TestCase):
+    """模拟盘成交样本的决策日必须是 ``signal_date``，不是执行日 ``intended_date``。"""
+
+    KLINE = {
+        "2024-06-13": (10.0, 10.0),
+        "2024-06-14": (10.0, 10.0),
+        "2024-06-17": (10.0, 10.0),   # 周一收盘后形成信号
+        "2024-06-18": (10.5, 10.5),   # 周二成交
+        "2024-06-19": (11.0, 11.0),
+        "2024-06-20": (11.2, 11.2),
+    }
+
+    def test_p28_filled_signals_are_labelled_from_the_signal_date(self):
+        """P28：用 signal_date 作决策日 → entry 正好是 intended_date 那个成交日。"""
+        import os
+        import sqlite3 as sq
+        import tempfile
+
+        import selection_alpha_report as AR
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db = os.path.join(tmp, "paper_trading.sqlite3")
+            conn = sq.connect(db)
+            conn.execute(
+                "CREATE TABLE paper_signals(account_id TEXT, signal_date TEXT,"
+                " intended_date TEXT, code TEXT, status TEXT)"
+            )
+            conn.execute(
+                "INSERT INTO paper_signals VALUES('acc','2024-06-17','2024-06-18','600001','filled')"
+            )
+            # 未成交的信号不参与，且不能被当成样本。
+            conn.execute(
+                "INSERT INTO paper_signals VALUES('acc','2024-06-17','2024-06-18','600002','pending')"
+            )
+            conn.commit()
+            conn.close()
+
+            original = AR.DATA_DIR
+            AR.DATA_DIR = tmp
+            try:
+                picks = AR.picks_from_signals(3650)
+            finally:
+                AR.DATA_DIR = original
+
+        self.assertEqual([("filled:acc", "2024-06-17", "600001")], picks)
+
+        sessions = SL.normalize_sessions(self.KLINE)
+        correct = AR.label_for("600001", picks[0][1], 2, sessions,
+                               asof="2024-06-30", kline=self.KLINE)
+        self.assertEqual(SL.STATUS_VERIFIED, correct.label_status)
+        # 决策日 06-17 → entry = 06-18 = 真实成交日。
+        self.assertEqual("2024-06-18", correct.entry_date)
+        self.assertEqual("2024-06-20", correct.exit_date)
+
+        # 用 intended_date 当决策日会把 entry 再往后推一个交易日 → 整条收益错位。
+        shifted = AR.label_for("600001", "2024-06-18", 1, sessions,
+                               asof="2024-06-30", kline=self.KLINE)
+        self.assertEqual(SL.STATUS_VERIFIED, shifted.label_status)
+        self.assertEqual("2024-06-19", shifted.entry_date)
+        signal_day = AR.label_for("600001", "2024-06-17", 1, sessions,
+                                  asof="2024-06-30", kline=self.KLINE)
+        self.assertEqual("2024-06-18", signal_day.entry_date)
+        self.assertNotAlmostEqual(signal_day.raw_forward_return, shifted.raw_forward_return)
+
+
+class NonFiniteQuotaTest(unittest.TestCase):
+    """非有限收益不得占用每个窗口的样本配额。"""
+
+    SCHEMA = NonFiniteOutcomeTest.SCHEMA
+    HORIZON = 2
+
+    def _order_key(self, code):
+        return (int(code) * 1103515245 + self.HORIZON * 12345) & 2147483647
+
+    def test_p29_infinite_rows_do_not_consume_the_window_quota(self):
+        """P29：有限性谓词必须在 SQL 里，坏行不能挤掉有效样本。"""
+        import adaptive_engine as AE
+
+        # 120 只票，按 SQL 的确定性排序键把最小的 105 只全部塞成 Inf ——
+        # 配额会被坏行占满，排在后面的有限样本原本根本轮不到。
+        # 生产默认配额（1200）远大于这个 fixture，所以这里把配额钉在下限 100，
+        # 让 ``LIMIT`` 真正成为瓶颈；否则这个测试对"先 LIMIT 后过滤"是盲的。
+        codes = sorted((str(600000 + i) for i in range(120)), key=self._order_key)
+        poisoned, clean = codes[:105], codes[105:]
+        self.assertGreater(len(poisoned), 100)
+        self.assertTrue(set(poisoned).isdisjoint(clean))
+
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        conn.executescript(self.SCHEMA)
+        for code, value in [(c, float("inf")) for c in poisoned] + [(c, 3.0) for c in clean]:
+            conn.execute(
+                "INSERT INTO adaptive_alpha_samples VALUES(?,?,?,?,?,?,?,?,?)",
+                ("2024-06-14", code, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0),
+            )
+            conn.execute(
+                "INSERT INTO adaptive_alpha_returns VALUES(?,?,?,?,?)",
+                ("2024-06-14", "2024-06-19", self.HORIZON, code, value),
+            )
+
+        dataset = AE._alpha_dataset(conn, max_rows_per_window=100)
+        self.assertEqual(set(clean), {row["code"] for row in dataset})
+        for row in dataset:
+            self.assertTrue(math.isfinite(row["excess_return_pct"]), row)
+            # center 只由有限样本构成 → 3.0 的均值，excess 恒为 0。
+            self.assertAlmostEqual(0.0, row["excess_return_pct"], places=12)
+
+
 if __name__ == "__main__":
     unittest.main()
