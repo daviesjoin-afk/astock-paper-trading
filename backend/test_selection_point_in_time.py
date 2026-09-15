@@ -579,17 +579,64 @@ class UniversePointInTimeTests(unittest.TestCase):
         self.assertEqual(2, result["report"]["counts"][PIT.MEMBERSHIP_NOT_LISTED_YET])
 
     def test_p9b_delisting_boundary(self):
+        """退市边界：``asof < delist_date`` 才在市；每行都带**合法 list_date**。
+
+        只有 ``delist_date`` 的行证明不了"asof 时已上市"（见 P9f），所以真正的
+        退市边界必须用"上市日 + 退市日"成对的数据来测。
+        """
         rows = [
-            {"code": "600001", "delist_date": "2024-06-01"},   # 已退市
-            {"code": "600002", "delist_date": "2024-06-14"},   # asof 当日 → 已退市（asof < delist 才有效）
-            {"code": "600003", "delist_date": "2024-06-17"},   # 仍在市
-            {"code": "600004"},                                # 无日期 → 未证明
+            {"code": "600001", "list_date": "2020-01-01", "delist_date": "2024-06-01"},   # 已退市
+            {"code": "600002", "list_date": "2020-01-01", "delist_date": "2024-06-14"},   # asof 当日 → 已退市（asof < delist 才有效）
+            {"code": "600003", "list_date": "2020-01-01", "delist_date": "2024-06-17"},   # 仍在市
+            {"code": "600004"},                                                            # 无日期 → 未证明
         ]
         result = PIT.universe_asof_members(rows, ASOF)
         kept = [row["code"] for row in result["members"]]
         self.assertEqual(["600003", "600004"], kept)
         self.assertEqual(2, result["report"]["counts"][PIT.MEMBERSHIP_DELISTED])
+        boundary = PIT.universe_membership(rows[2], ASOF)
+        self.assertEqual("member", boundary["status"])
+        self.assertTrue(boundary["proven"])
+        self.assertEqual("2020-01-01", boundary["list_date"])
+        self.assertEqual("2024-06-17", boundary["delist_date"])
         self.assertEqual("membership_unknown", PIT.universe_membership(rows[3], ASOF)["status"])
+        self.assertFalse(PIT.universe_membership(rows[3], ASOF)["proven"])
+
+    def test_p9f_future_delist_date_alone_never_proves_membership(self):
+        """只有 future ``delist_date``（缺 ``list_date``）绝不能被判成 member。
+
+        ``delist_date = 2026-01-01`` 只证明"到该日之后不能再持有"，**不能反证**
+        asof 时已经上市——真实 ``list_date`` 完全可能是 ``2025-01-01``。
+        """
+        future_only = {"code": "600009", "delist_date": "2026-01-01"}
+        verdict = PIT.universe_membership(future_only, ASOF)
+        self.assertEqual("membership_unknown", verdict["status"])
+        self.assertFalse(verdict["proven"])
+        self.assertIsNone(verdict["list_date"])
+        self.assertEqual("2026-01-01", verdict["delist_date"])
+
+        # 反向对照 1：缺 list_date 且无 delist_date → 同样未知（不猜）
+        bare = {"code": "600010"}
+        bare_verdict = PIT.universe_membership(bare, ASOF)
+        self.assertEqual("membership_unknown", bare_verdict["status"])
+        self.assertFalse(bare_verdict["proven"])
+
+        # 反向对照 2：非法 list_date + future delist_date → 仍未知（不得用 delist 补证）
+        broken = {"code": "600011", "list_date": "not-a-date", "delist_date": "2026-01-01"}
+        broken_verdict = PIT.universe_membership(broken, ASOF)
+        self.assertEqual("membership_unknown", broken_verdict["status"])
+        self.assertFalse(broken_verdict["proven"])
+
+        # 反向对照 3：**已退市**的排除不依赖 list_date（asof >= delist 是安全的排除）
+        gone_verdict = PIT.universe_membership({"code": "600012", "delist_date": "2024-06-01"}, ASOF)
+        self.assertEqual("delisted", gone_verdict["status"])
+        self.assertFalse(gone_verdict["member"])
+
+        # 生产 strict（drop_unproven=True）必须真的把 future-delist-only 剔除
+        rows = [future_only, {"code": "600013", "list_date": "2020-01-01"}]
+        strict = PIT.universe_asof_members(rows, ASOF, drop_unproven=True)
+        self.assertEqual(["600013"], [row["code"] for row in strict["members"]])
+        self.assertEqual(1, strict["report"]["unproven"])
 
     def test_p9c_unproven_membership_is_reported_not_faked(self):
         """低层 API 的兼容默认：保留未证明成分，但**必须**如实报 unproven。
@@ -1220,6 +1267,64 @@ class ReplayWiringTests(PointInTimeBase):
         self.assertFalse(seen["gate"])
         self.assertEqual([], seen["klines"])
         self.assertEqual([], seen["price"])
+
+    def test_p16b_future_delist_date_cannot_smuggle_a_code_into_the_universe(self):
+        """只有 future ``delist_date``（缺 ``list_date``）的成分不得进入历史下游。
+
+        源级门禁已通过（显式 ``historical_archive`` + ``historical_membership_complete``），
+        所以这里只可能是**逐行**成员资格挡住它：``delist_date = 2026-01-01`` 不能反证
+        2024 时已经上市。断言 B **从未**进入覆盖门禁 / K 线读取 / 因子阶段。
+        """
+        import paper_trading as PT
+
+        universe = [{"code": "600001", "name": "老股", "list_date": "2020-01-01"},
+                    {"code": "600002", "name": "只有未来退市日", "delist_date": "2026-01-01"}]
+        state = {"coverage_gate_passed": False}
+        seen = {"coverage": [], "klines": [], "price_asof": []}
+
+        def coverage_spy(rows, cutoff):
+            seen["coverage"].append(sorted(str(r.get("code")) for r in rows))
+            return {"passed": state["coverage_gate_passed"], "reason": "coverage-stub"}
+
+        def kline_spy(code):
+            seen["klines"].append(str(code))
+            return None
+
+        def price_spy(*args, **kwargs):
+            seen["price_asof"].append(kwargs.get("asof"))
+            return pd.DataFrame()
+
+        with mock.patch.object(PT.U, "load_universe", return_value=universe), \
+                mock.patch.object(PT.U, "load_universe_source",
+                                  return_value=self.HISTORICAL_SOURCE), \
+                mock.patch.object(PT, "_selection_factor_history_gate", side_effect=coverage_spy), \
+                mock.patch.object(PT.dfc, "load_shared_kline", side_effect=kline_spy), \
+                mock.patch.object(PT.F, "compute_price_factors", side_effect=price_spy):
+            blocked_at_coverage = PT._rebuild_selection_factor_cache("2024-06-14")
+            state["coverage_gate_passed"] = True
+            reached_kline = PT._rebuild_selection_factor_cache("2024-06-14")
+
+        # 覆盖门禁只看到已证明的 A
+        self.assertEqual([["600001"], ["600001"]], seen["coverage"])
+        # 覆盖门禁放开后，只有 A 被读取 K 线、只有 A 进入因子阶段
+        self.assertEqual(["600001"], seen["klines"])
+        self.assertEqual([dt.date(2024, 6, 14)], seen["price_asof"])
+        self.assertEqual(1, reached_kline["eligible_universe_rows"])
+        # B 从未出现在任何下游
+        self.assertNotIn("600002", seen["klines"])
+        self.assertNotIn("600002", [c for codes in seen["coverage"] for c in codes])
+
+        for out in (blocked_at_coverage, reached_kline):
+            self.assertEqual("blocked", out["status"])
+            # 源是合法历史归档 → 失败只来自逐行成员资格，不是 pit_unavailable
+            self.assertNotIn("pit_unavailable", out)
+        report = blocked_at_coverage["universe_membership"]
+        self.assertTrue(report["historical_membership_complete"])
+        self.assertTrue(report["row_membership_passed"])
+        self.assertEqual(1, report["kept"])
+        self.assertEqual(1, report["counts"][PIT.MEMBERSHIP_MEMBER])
+        self.assertEqual(1, report["counts"][PIT.MEMBERSHIP_UNKNOWN])
+        self.assertEqual(1, report["unproven"])
 
 
 # ─────────────────────────────────────────────────────────────────────────────

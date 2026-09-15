@@ -569,10 +569,18 @@ def universe_membership(row: Optional[Mapping[str, Any]], asof: Any, *,
     历史选股绝不允许"先取今天仍上市的股票，再回放五年前"——那会同时引入
     "未来上市"与"漏掉退市"两类幸存者偏差。
 
-    ``proven`` 表示成员资格是否有明确日期证据。缺少上市/退市日期数据时
-    不会伪装成已证明：``status = membership_unknown`` 且 ``proven = False``，
-    由调用方决定是否 fail closed（``strict`` 模式下 ``member`` 仍为 True，
-    因为"没有证据"不等于"证据表明未上市"——把全市场判成未上市是另一种编造）。
+    ``proven`` 表示成员资格是否有明确日期证据，而且**只有合法的 ``list_date``
+    能提供这份证据**：未来的 ``delist_date`` 只证明"到该日之后不能再持有"，
+    不能反向证明 asof 时**已经上市**。所以：
+
+    * ``list_date > asof`` → ``not_listed_yet``（有日期即排除）；
+    * ``delist_date <= asof`` → ``delisted``（已退市，无需 ``list_date`` 即可排除）；
+    * 缺 ``list_date``（或非法）+ ``delist_date > asof`` → ``membership_unknown``
+      且 ``proven = False``，由调用方（生产 strict 传 ``drop_unproven=True``）剔除。
+
+    缺少上市/退市日期数据时不会伪装成已证明：``status = membership_unknown`` 且
+    ``proven = False``，由调用方决定是否 fail closed（``strict`` 模式下 ``member``
+    仍为 True，因为"没有证据"不等于"证据表明未上市"——把全市场判成未上市是另一种编造）。
     """
     data = row if isinstance(row, Mapping) else {}
     raw_list = next((data.get(k) for k in list_keys if not _is_missing(data.get(k))), None)
@@ -606,7 +614,9 @@ def universe_membership(row: Optional[Mapping[str, Any]], asof: Any, *,
         delisted, _has, status = _parse(raw_delist)
         if status == "ok" and delisted is not None:
             base["delist_date"] = delisted.date().isoformat()
-            base["proven"] = True
+            # 退市日期**不提供** proven：它只能证明"到该日之后不能再持有"，
+            # 不能反证 asof 时已经上市。缺 list_date 时它只允许做"排除"
+            # （asof >= delist → delisted），绝不允许判定 member。
             if asof_moment >= delisted:
                 base.update({"member": False, "status": MEMBERSHIP_DELISTED})
                 return base
