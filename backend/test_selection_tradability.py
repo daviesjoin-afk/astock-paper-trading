@@ -921,13 +921,18 @@ class ProductionEvaluatorWiringTest(unittest.TestCase):
         finally:
             AR.load_kline = original
 
+    #: 动作 session 当时的状态来源：entry/exit 都不是决策日，必须显式提供。
+    @staticmethod
+    def _action_state(code, session):
+        return {"name": "某某股份", "risk_flag": False}
+
     def test_production_evaluator_excludes_unexecutable_picks_by_default(self):
         """生产默认口径 = executable only：买不进的样本不再进均值。"""
         picks = [
             ("s1", "2024-06-14", "600001", "某某股份"),
             ("s1", "2024-06-14", "600002", "某某股份"),
         ]
-        lines, summary = self._evaluate(picks)
+        lines, summary = self._evaluate(picks, security_state_fn=self._action_state)
         self.assertEqual(ST.MODE_EXECUTABLE, summary["tradability_mode"])
         self.assertEqual(1, summary["entry_counts"]["executable"])
         self.assertEqual(1, summary["entry_counts"]["blocked_entry"])
@@ -948,7 +953,9 @@ class ProductionEvaluatorWiringTest(unittest.TestCase):
             ("s1", "2024-06-14", "600001", "某某股份"),
             ("s1", "2024-06-14", "600002", "某某股份"),
         ]
-        _, summary = self._evaluate(picks, tradability_mode=ST.MODE_MARKET)
+        _, summary = self._evaluate(
+            picks, tradability_mode=ST.MODE_MARKET,
+            security_state_fn=self._action_state)
         self.assertEqual(2, summary["n"])
         self.assertEqual(1, summary["entry_counts"]["blocked_entry"])
         # 未知口径直接拒绝。
@@ -997,6 +1004,139 @@ class ProductionEvaluatorWiringTest(unittest.TestCase):
             finally:
                 AR.DATA_DIR = original
         self.assertEqual([("s1", "2024-06-14", "600001", "某某股份")], picks)
+
+
+class PitOrderingAndActionTimeStateTest(unittest.TestCase):
+    """Round-2 三个 blocker 的回归：
+
+    1. PIT 可见性必须先于一切**证据派生**字段（名称 / 风险标记 / 停牌 / 价格 / 量）；
+    2. entry/exit 的资格证据必须是**动作 session 当时**的状态，不是决策日名称；
+    3. 逐策略"已验证样本"必须在执行过滤**之前**计数。
+    """
+
+    KLINES = ProductionEvaluatorWiringTest.KLINES
+
+    @staticmethod
+    def _non_st(code, session):
+        return {"name": "某某股份", "risk_flag": False}
+
+    def _evaluate(self, picks, **kwargs):
+        import selection_alpha_report as AR
+
+        original = AR.load_kline
+        AR.load_kline = lambda code: dict(self.KLINES.get(code) or {})
+        try:
+            sessions = SL.normalize_sessions(
+                sorted({day for bars in self.KLINES.values() for day in bars})
+            )
+            return AR.evaluate(
+                picks, 1, "选股质量", sessions, asof="2024-06-30", **kwargs
+            )
+        finally:
+            AR.load_kline = original
+
+    def _tradability(self, evidence, action_session):
+        return ST.tradability_at(
+            evidence, code="600001", side=ST.SIDE_BUY,
+            action_at=ST.session_close_at(action_session),
+        )
+
+    def test_p33_future_visible_st_name_cannot_rewrite_an_earlier_verdict(self):
+        """动作时点看不到的 *ST 名称，不得把更早的动作改成 blocked。"""
+        future_only = ST.MarketEvidence(
+            session="2024-06-20",
+            available_at=ST.session_close_at("2024-06-20"),
+            price=10.2, reference_price=10.0, halted=False,
+            name="某某股份ST",
+        )
+        verdict = self._tradability(future_only, "2024-06-18")
+        self.assertEqual(ST.STATUS_UNPROVEN, verdict.status)
+        self.assertEqual(ST.REASON_EVIDENCE_NOT_VISIBLE, verdict.reason)
+
+    def test_p33b_future_visible_risk_flag_cannot_rewrite_an_earlier_verdict(self):
+        future_only = ST.MarketEvidence(
+            session="2024-06-20",
+            available_at=ST.session_close_at("2024-06-20"),
+            price=10.2, reference_price=10.0, halted=False,
+            name="某某股份", risk_flag=True,
+        )
+        verdict = self._tradability(future_only, "2024-06-18")
+        self.assertEqual(ST.STATUS_UNPROVEN, verdict.status)
+        self.assertEqual(ST.REASON_EVIDENCE_NOT_VISIBLE, verdict.reason)
+
+    def test_p33c_visible_state_still_decides_normally(self):
+        """可见性通过后，证据派生权限照常生效（不是把门禁变成永久 unproven）。"""
+        visible_st = ST.MarketEvidence(
+            session="2024-06-18",
+            available_at=ST.session_close_at("2024-06-18"),
+            price=10.2, reference_price=10.0, halted=False,
+            name="某某股份ST",
+        )
+        verdict = self._tradability(visible_st, "2024-06-18")
+        self.assertEqual(ST.STATUS_BLOCKED, verdict.status)
+        self.assertEqual(ST.REASON_UNSUPPORTED_SECURITY_TYPE, verdict.reason)
+        self.assertEqual("historical_name", verdict.detail.get("basis"))
+
+    def test_p34_decision_day_name_is_not_action_time_evidence(self):
+        """没有动作时状态来源 → entry/exit 一律 ST 未知 → unproven（fail closed）。"""
+        picks = [("s1", "2024-06-14", "600001", "某某股份")]
+        _, summary = self._evaluate(picks)
+        self.assertEqual(0, summary["entry_counts"]["executable"])
+        self.assertEqual(1, summary["entry_counts"]["unproven"])
+        self.assertEqual(0, summary["n"])
+        self.assertEqual(
+            2, summary["tradability_counts"][ST.REASON_UNKNOWN_ST_STATUS])
+
+    def test_p35_st_change_before_entry_blocks_the_stale_decision_name(self):
+        """决策日非 ST、entry 时已是 ST → 过期名称不得让交易保持可执行。"""
+        picks = [("s1", "2024-06-14", "600001", "某某股份")]
+
+        def provider(code, session):
+            if session == "2024-06-17":
+                return {"name": "某某股份ST", "risk_flag": True}
+            return {"name": "某某股份", "risk_flag": False}
+
+        _, summary = self._evaluate(picks, security_state_fn=provider)
+        self.assertEqual(0, summary["entry_counts"]["executable"])
+        self.assertEqual(1, summary["entry_counts"]["blocked_entry"])
+        self.assertEqual(0, summary["n"])
+
+    def test_p35b_action_time_state_proves_executability(self):
+        picks = [("s1", "2024-06-14", "600001", "某某股份")]
+        _, summary = self._evaluate(picks, security_state_fn=self._non_st)
+        self.assertEqual(1, summary["entry_counts"]["executable"])
+        self.assertEqual(1, summary["n"])
+
+    def test_p36_per_strategy_verified_counts_survive_execution_filtering(self):
+        """2 条 verified、1 条可执行 → 策略行必须打印 ``2 / 1``。"""
+        picks = [
+            ("s1", "2024-06-14", "600001", "某某股份"),
+            ("s1", "2024-06-14", "600002", "某某股份"),
+        ]
+        lines, summary = self._evaluate(picks, security_state_fn=self._non_st)
+        self.assertEqual(1, summary["entry_counts"]["executable"])
+        self.assertEqual(1, summary["entry_counts"]["blocked_entry"])
+        # 指标仍然只用可执行的那一条。
+        self.assertEqual(1, summary["n"])
+        self.assertIsNotNone(summary["mean_return"])
+        row = [line for line in lines if line.startswith("| s1 |")][0]
+        cells = [cell.strip() for cell in row.strip("|").split("|")]
+        self.assertEqual("2", cells[1], row)
+        self.assertEqual("1", cells[2], row)
+
+    def test_p36b_market_mode_keeps_verified_and_executable_distinct(self):
+        picks = [
+            ("s1", "2024-06-14", "600001", "某某股份"),
+            ("s1", "2024-06-14", "600002", "某某股份"),
+        ]
+        lines, summary = self._evaluate(
+            picks, tradability_mode=ST.MODE_MARKET,
+            security_state_fn=self._non_st)
+        self.assertEqual(2, summary["n"])
+        row = [line for line in lines if line.startswith("| s1 |")][0]
+        cells = [cell.strip() for cell in row.strip("|").split("|")]
+        self.assertEqual("2", cells[1], row)
+        self.assertEqual("1", cells[2], row)
 
 
 if __name__ == "__main__":

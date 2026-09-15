@@ -390,14 +390,16 @@ def tradability_at(
     判定顺序（先到先判，绝不"降级为可用"）：
 
     1. 身份与方向合法（code / side / action_at 可解析）。
-    2. 账户证券权限（板块 / ST / 证券类型）。
+    2. 代码段证券权限（板块 / 证券类型；**不消费证据**）。
     3. 证据可见性（``available_at <= action_at``，PIT 硬门禁）。
-    4. T+1（仅卖出方向，且调用方给了 ``entry_session``）。
-    5. 停牌。
-    6. 价格证据（ok / halted / missing / invalid）。
-    7. 成交量证据（缺失 / 0）。
-    8. 涨跌停参考价与幅度。
-    9. 该方向的涨跌停是否被触及。
+       必须先于一切**证据派生**字段：名称、风险标记、停牌、价格、成交量、参考价。
+    4. 证据派生证券权限（当时的名称 / 风险标记 → ST 与板块）。
+    5. T+1（仅卖出方向，且调用方给了 ``entry_session``）。
+    6. 停牌。
+    7. 价格证据（ok / halted / missing / invalid）。
+    8. 成交量证据（缺失 / 0）。
+    9. 涨跌停参考价与幅度。
+    10. 该方向的涨跌停是否被触及。
     """
     code_text = str(code or "").strip()
     if not code_text:
@@ -417,9 +419,8 @@ def tradability_at(
             code=code_text, action_at=None, evidence=evidence,
         )
 
-    # ── 2. 账户权限（不依赖行情证据，先判） ──
-    # 板块由**代码段**决定，历史上完全可知；ST 由**当时的名称**决定，必须有证据。
-    # 两者分开：板块层面就已经出局的直接 blocked；板块在范围内但 ST 未知 → unproven。
+    # ── 2. 代码段权限（**不消费任何行情/名称证据**，因此可以先判） ──
+    # 板块由**代码段**决定，历史上完全可知。这里只用 code，不碰 name/risk_flag。
     board_scope = dict(PTR.security_scope(code_text, None, False))
     if not board_scope.get("allowed"):
         return _verdict(
@@ -428,6 +429,21 @@ def tradability_at(
             board=str(board_scope.get("board") or "") or None,
             detail={"permission": board_scope.get("reason"), "basis": "security_code"},
         )
+
+    # ── 3. PIT：证据必须在动作时点已经可见（**先于任何证据派生字段**） ──
+    # 顺序本身是契约的一部分：name / risk_flag / halted / price / volume /
+    # reference 全是**证据派生**字段，只能在可见性通过之后才允许消费。
+    # 否则一条"未来才可见"的 *ST 名称/风险标记就能把更早的动作从
+    # unproven/evidence_not_visible_at_action 改写成
+    # blocked/unsupported_security_type —— 那就是用未来信息重写历史结论。
+    if not bool(PIT.is_visible_at(evidence.available_at, action_at).get("visible")):
+        return _verdict(
+            status=STATUS_UNPROVEN, reason=REASON_EVIDENCE_NOT_VISIBLE, side=side,
+            code=code_text, action_at=moment, evidence=evidence,
+            board=str(board_scope.get("board") or "") or None,
+        )
+
+    # ── 4. 证据派生权限：**当时的**名称 / 风险标记（已过 PIT） ──
     if evidence.name is None and evidence.risk_flag is None:
         # "不知道当时是不是 ST" 不等于"当时不是 ST"：账户权限无法证明 → fail closed。
         return _verdict(
@@ -446,14 +462,7 @@ def tradability_at(
             detail={"permission": permission.get("reason"), "basis": "historical_name"},
         )
 
-    # ── 3. PIT：证据必须在动作时点已经可见 ──
-    if not bool(PIT.is_visible_at(evidence.available_at, action_at).get("visible")):
-        return _verdict(
-            status=STATUS_UNPROVEN, reason=REASON_EVIDENCE_NOT_VISIBLE, side=side,
-            code=code_text, action_at=moment, evidence=evidence, board=board,
-        )
-
-    # ── 4. T+1（只有卖出方向才有意义） ──
+    # ── 5. T+1（只有卖出方向才有意义） ──
     if side == SIDE_SELL and entry_session is not None:
         earliest = earliest_sellable_session(
             code_text, name=evidence.name, entry_session=entry_session
@@ -466,7 +475,7 @@ def tradability_at(
                 detail={"entry_session": str(entry_session)[:10], "earliest_sellable": earliest},
             )
 
-    # ── 5. 停牌 ──
+    # ── 6. 停牌 ──
     price_value, price_state = SL.price_point(evidence.price)
     if evidence.halted is True or price_state == SL.PRICE_HALTED:
         return _verdict(
@@ -474,7 +483,7 @@ def tradability_at(
             code=code_text, action_at=moment, evidence=evidence, board=board,
         )
 
-    # ── 6. 价格证据 ──
+    # ── 7. 价格证据 ──
     if price_state == SL.PRICE_INVALID:
         return _verdict(
             status=STATUS_INVALID, reason=REASON_INVALID_PRICE, side=side,
@@ -487,7 +496,7 @@ def tradability_at(
             code=code_text, action_at=moment, evidence=evidence, board=board,
         )
 
-    # ── 7. 成交量证据 ──
+    # ── 8. 成交量证据 ──
     # 一个收盘价有效的 bar 本身就证明当天成交过；成交量是冗余佐证。只有调用方
     # 显式要求（``volume_required``）时缺失才算证据不足；显式 0 则是矛盾数据 → block。
     volume_value = _finite(evidence.volume)
@@ -504,7 +513,7 @@ def tradability_at(
             price=price_value, volume=volume_value,
         )
 
-    # ── 8. 涨跌停参考价与幅度 ──
+    # ── 9. 涨跌停参考价与幅度 ──
     reference_value = _finite(evidence.reference_price)
     if reference_value is None or reference_value <= 0:
         return _verdict(
@@ -524,7 +533,7 @@ def tradability_at(
             pct_change=pct_change,
         )
 
-    # ── 9. 方向性：买入只看涨停，卖出只看跌停 ──
+    # ── 10. 方向性：买入只看涨停，卖出只看跌停 ──
     threshold = limit_pct / 100.0
     if side == SIDE_BUY and pct_change >= threshold:
         return _verdict(

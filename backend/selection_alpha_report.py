@@ -157,15 +157,45 @@ def _previous_close(kline, session):
         return None
 
 
-def _tradability_evidence(code, name, session, price, kline):
-    """把一条 #147 标签 + 日线 + 决策当时的名称适配成 tradability 证据。
+def _action_security_state(code, session, *, decision_day, decision_name,
+                           security_state_fn):
+    """动作 session **当时**的证券名称 / 风险标记（PIT）。
+
+    ``selection_picks.name`` / ``paper_signals.name`` 只证明**决策日**的名称；
+    而 entry 是"决策日之后第一个交易日"、exit 还在更后面。ST / 退市状态可以在
+    决策与动作之间发生变化，所以**过期名称不得被当成动作时的资格证据**。
+
+    取值顺序：
+
+    1. 调用方给了 ``security_state_fn`` → 用该 session 的历史状态；
+    2. 否则只有"动作 session == 决策日"时才允许复用决策当时的名称；
+    3. 其余情况一律 ``(None, None)`` —— 由 contract 判 ``unproven``（fail closed），
+       **绝不**用决策日的名称把之后的动作"证明"成可执行。
+    """
+    if session is None:
+        return None, None
+    action_session = str(session)[:10]
+    if security_state_fn is not None:
+        state = security_state_fn(str(code or ""), action_session)
+        if isinstance(state, dict):
+            return state.get("name"), state.get("risk_flag")
+        if state is None:
+            return None, None
+        return state, None
+    if decision_day is not None and action_session == str(decision_day)[:10]:
+        return decision_name, None
+    return None, None
+
+
+def _tradability_evidence(code, name, risk_flag, session, price, kline):
+    """把一条 #147 标签 + 日线 + **动作 session 当时**的证券状态适配成 tradability 证据。
 
     ``halted=False`` 有依据：标签是 ``verified``，意味着 entry/exit 价格已经过了
     ``selection_labels.price_point``（它把 ``halted`` / ``missing`` / ``invalid``
     严格分开）—— 我们没有在这里重新判断停牌，而是消费 #147 已经建立的证据。
 
-    ``name`` 必须是**决策当时**记录的名称（``selection_picks.name`` /
-    ``paper_signals.name``）；拿当前快照的名称来重写历史是 PIT 违规。
+    ``name`` / ``risk_flag`` 必须来自 :func:`_action_security_state`，即**该动作
+    session 当时**的状态；用决策日的名称或当前快照的名称都是 PIT 违规。
     """
     if session is None:
         return None
@@ -176,11 +206,12 @@ def _tradability_evidence(code, name, session, price, kline):
         reference_price=_previous_close(kline, session),
         halted=False,
         name=name,
+        risk_flag=risk_flag,
     )
 
 
 def evaluate(picks, horizon, label, sessions, *, asof,
-             tradability_mode=ST.MODE_EXECUTABLE):
+             tradability_mode=ST.MODE_EXECUTABLE, security_state_fn=None):
     """picks: list of (strategy, decision_day, code[, name]). Returns (lines, summary).
 
     ``tradability_mode``
@@ -189,6 +220,11 @@ def evaluate(picks, horizon, label, sessions, *, asof,
         它们进入 ``tradability_counts`` 与报告里的"可执行"一栏，所以"策略选了 100
         条、其中 80 条真能成交"是可读的。需要 market counterfactual 口径的调用方
         显式传 ``ST.MODE_MARKET``。
+
+    ``security_state_fn(code, session) -> {"name":..., "risk_flag":...} | None``
+        **动作 session 当时**的证券状态来源（PIT）。entry/exit 与决策日不是同一天，
+        决策当时记录的名称不能证明那时的 ST 资格；没有这个来源时，除"动作 session
+        恰为决策日"外一律按 ST 未知 fail closed（``unproven``）。
     """
     if tradability_mode not in ST.EVALUATION_MODES:
         raise ValueError(f"unknown tradability_mode: {tradability_mode!r}")
@@ -211,22 +247,33 @@ def evaluate(picks, horizon, label, sessions, *, asof,
         verified.append((strategy, day, code, name, result, kline))
 
     # 可成交性判定走唯一权威实现，不在报告层复制任何规则。
-    rows = [
-        ST.SelectionRow(
-            sample_key=f"{strategy}|{day}|{code}",
-            code=code,
-            selected=True,
-            intended_entry_session=result.entry_date,
-            entry_evidence=_tradability_evidence(code, name, result.entry_date,
-                                                 result.entry_price, kline),
-            intended_exit_session=result.exit_date,
-            exit_evidence=_tradability_evidence(code, name, result.exit_date,
-                                                result.exit_price, kline),
-            market_label_status=result.label_status,
-            market_label_value=result.raw_forward_return,
+    rows = []
+    for strategy, day, code, name, result, kline in verified:
+        entry_name, entry_flag = _action_security_state(
+            code, result.entry_date, decision_day=day, decision_name=name,
+            security_state_fn=security_state_fn,
         )
-        for strategy, day, code, name, result, kline in verified
-    ]
+        exit_name, exit_flag = _action_security_state(
+            code, result.exit_date, decision_day=day, decision_name=name,
+            security_state_fn=security_state_fn,
+        )
+        rows.append(
+            ST.SelectionRow(
+                sample_key=f"{strategy}|{day}|{code}",
+                code=code,
+                selected=True,
+                intended_entry_session=result.entry_date,
+                entry_evidence=_tradability_evidence(
+                    code, entry_name, entry_flag, result.entry_date,
+                    result.entry_price, kline),
+                intended_exit_session=result.exit_date,
+                exit_evidence=_tradability_evidence(
+                    code, exit_name, exit_flag, result.exit_date,
+                    result.exit_price, kline),
+                market_label_status=result.label_status,
+                market_label_value=result.raw_forward_return,
+            )
+        )
     built = ST.build_executable_outcomes(rows)
     outcomes = {outcome.sample_key: outcome for outcome in built["outcomes"]}
     tradability_counts = dict(built["report"]["reason_counts"])
@@ -246,11 +293,14 @@ def evaluate(picks, horizon, label, sessions, *, asof,
             entry_counts["invalid"] += 1
         else:
             entry_counts["unproven"] += 1
+        # 逐策略计数必须在**执行过滤之前**完成：否则"策略选了 2 条、1 条买不进"
+        # 会在策略行里显示成 1/1，把被拦的那条藏掉，而全局计数却仍保留它。
+        item = by_strategy.setdefault(
+            strategy, {"r": [], "excess": [], "executable": 0, "verified": 0}
+        )
+        item["verified"] += 1
         if tradability_mode == ST.MODE_EXECUTABLE and not outcome.executable:
             continue
-        item = by_strategy.setdefault(
-            strategy, {"r": [], "excess": [], "executable": 0}
-        )
         item["r"].append(result.raw_forward_return)
         item["executable"] += 1 if outcome.executable else 0
         if day in bench:
@@ -265,13 +315,22 @@ def evaluate(picks, horizon, label, sessions, *, asof,
     all_r, all_x = [], []
     for strategy in sorted(by_strategy):
         item = by_strategy[strategy]
-        mean_r = statistics.mean(item["r"])
-        win = sum(value > 0 for value in item["r"]) / len(item["r"])
+        # 该策略可能有 verified 样本、但在当前口径下一条都不 eligible（例如全部被
+        # 执行过滤拦下）。这时必须照实打印"已验证 N / 可执行 0"，指标列写 "—"，
+        # 而不是让 statistics.mean 在空序列上抛错、也不是把整行藏掉。
+        if item["r"]:
+            mean_r = statistics.mean(item["r"])
+            win = sum(value > 0 for value in item["r"]) / len(item["r"])
+            mean_r_text = f"{mean_r * 100:+.2f}%"
+            win_text = f"{win * 100:.0f}%"
+        else:
+            mean_r_text = "—"
+            win_text = "—"
         mean_x = statistics.mean(item["excess"]) if item["excess"] else None
         bench_mean = statistics.mean(bench.values()) if bench else None
         lines.append(
-            f"| {strategy} | {len(item['r'])} | {item['executable']} | "
-            f"{mean_r * 100:+.2f}% | {win * 100:.0f}% | "
+            f"| {strategy} | {item['verified']} | {item['executable']} | "
+            f"{mean_r_text} | {win_text} | "
             f"{(mean_x * 100) if mean_x is not None else float('nan'):+.2f}% | "
             f"{(bench_mean * 100) if bench_mean is not None else float('nan'):+.2f}% |"
         )
