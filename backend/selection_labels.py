@@ -978,6 +978,16 @@ def verified_evidence(record: Mapping[str, Any]) -> dict:
             reason = EVIDENCE_OUTCOME_INCONSISTENT
         elif abs(raw_return - (exit_price / entry_price - 1.0)) > _OUTCOME_TOLERANCE:
             reason = EVIDENCE_OUTCOME_INCONSISTENT
+        elif (
+            benchmark_return is not None
+            and excess_return is not None
+            and abs(excess_return - (raw_return - benchmark_return)) > _OUTCOME_TOLERANCE
+        ):
+            # 三个收益字段是**同一个公式的三个视图**（``excess = raw - benchmark``）。
+            # 只校验 score 与其中一个是自相矛盾的：raw=10%、benchmark=5%、excess=99%
+            # 且 score=99% 的记录能同时满足"score == excess"，却描述不出任何真实窗口。
+            # 只要基准与超额都给出了，这条恒等式就必须成立。
+            reason = EVIDENCE_OUTCOME_INCONSISTENT
         elif version_basis == BASIS_EXCESS:
             # 超额口径：既要 score 等于 excess，也要基准证据确实存在。
             if (

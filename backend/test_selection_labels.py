@@ -864,6 +864,10 @@ class VerifiedEvidenceTest(unittest.TestCase):
             "inconsistent_score": ({"label_score": 0.99}, "invalid_verified_evidence"),
             "reversed_dates": ({"entry_date": "2024-06-20"}, "invalid_verified_evidence"),
             "nan_exit_price": ({"exit_price": float("nan")}, "invalid_verified_evidence"),
+            # 三个收益字段必须互相自洽（excess == raw - benchmark）：只对上 score
+            # 还不足以证明这条记录描述了一个真实窗口。
+            "excess_arithmetic": ({"benchmark_return": 0.05, "excess_return": 0.99},
+                                  "invalid_verified_evidence"),
             # 空版本同时让样本身份对不上 → 由身份校验先拦下（同样是拒绝）。
             "no_version": ({"label_version": ""}, "sample_key_mismatch"),
         }
@@ -1187,6 +1191,52 @@ class ExcessReturnSerializationTest(unittest.TestCase):
         self.assertAlmostEqual(label.raw_forward_return,
                                assembled["rows"][0]["label_score"], places=12)
         self.assertEqual(SL.BASIS_RAW, assembled["rows"][0]["basis"])
+
+    def test_p30c_an_internally_contradictory_excess_triple_is_refused(self):
+        """P30c：三个收益字段必须互相自洽 —— ``excess == raw - benchmark``。
+
+        只校验 ``score`` 与其中一个收益字段是自相矛盾的：把 ``label_score`` 和
+        ``excess_return`` 一起改大，``score == excess`` 依然成立，但这条记录
+        描述不出任何真实窗口。
+        """
+        import learning_dataset as LD
+
+        good = SL.label_record(_excess_label())
+        self.assertTrue(SL.verified_evidence(good)["verified"])
+        # 前提：这条记录的三元组确实自洽，否则下面测不出"破坏自洽"这件事。
+        self.assertAlmostEqual(good["excess_return"],
+                               good["raw_forward_return"] - good["benchmark_return"],
+                               places=12)
+
+        feature = SL.feature_record(
+            code="600001", decision_at=T_AFTER_CLOSE, horizon=2,
+            version=SL.label_version(SL.BASIS_EXCESS), features={"momentum": 0.1},
+        )
+
+        forged = {**good, "excess_return": 0.99, "label_score": 0.99}
+        self.assertAlmostEqual(forged["label_score"], forged["excess_return"], places=12)
+        verdict = SL.verified_evidence(forged)
+        self.assertFalse(verdict["verified"], verdict)
+        self.assertEqual(SL.EVIDENCE_OUTCOME_INCONSISTENT, verdict["reason"])
+        self.assertFalse(LD.selection_label_evidence(forged)["verified"])
+        broken = SL.assemble_learning_rows([feature], [forged])
+        self.assertEqual([], broken["rows"])
+        self.assertEqual(1, broken["report"]["excluded"]["invalid_verified_evidence"])
+
+        # 只把基准改坏，excess 与 score 保持原样 —— 同样必须被拒。
+        self.assertFalse(SL.verified_evidence({**good, "benchmark_return": 0.99})["verified"])
+        # 只把 raw 改坏（价格与 raw 仍然自洽，但 raw - benchmark != excess）。
+        self.assertFalse(
+            SL.verified_evidence(
+                {**good, "raw_forward_return": 0.5,
+                 "exit_price": good["entry_price"] * 1.5}
+            )["verified"]
+        )
+
+        # 反向控制：换成另一个**自洽**的三元组仍然被放行。
+        consistent = {**good, "benchmark_return": 0.02, "excess_return": 0.08,
+                      "label_score": 0.08}
+        self.assertTrue(SL.verified_evidence(consistent)["verified"])
 
 
 class BasisVersionConsistencyTest(unittest.TestCase):
