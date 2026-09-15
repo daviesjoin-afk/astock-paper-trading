@@ -245,7 +245,7 @@ def _has_finance_value(record, keys):
     return False
 
 
-def compute_fundamental_factors(snapshot, finance, asof=None):
+def compute_fundamental_factors(snapshot, finance, asof=None, *, snapshot_asof=None):
     """价值/质量因子，并附带保守的财务报告点时元数据。
 
     ``asof is None`` → **live compatibility mode**：保持现有实时策略口径。
@@ -257,7 +257,21 @@ def compute_fundamental_factors(snapshot, finance, asof=None):
     * **snapshot 动态字段与行业分类**（pe/pb/mktcap/float_cap/main_net/super_net/
       turnover/pct_today/industry）改为按可用时点判定：快照行必须有可信
       ``observed_at``（或 ``quote_at``/``quote_ts``/``available_at``）且
-      ``<= asof`` 才可见；行业还必须满足分类生效区间或"该行本身在 asof 前被观测到"。
+      ``<= snapshot_asof`` 才可见；行业还必须满足分类生效区间或"该行本身在
+      snapshot_asof 前被观测到"。
+
+    ``snapshot_asof``（仅关键字）是**每日实时截面**的决策时点，默认等于 ``asof``。
+    这是必需的：实时选股有两套不同的 cutoff，混用会误伤生产。
+
+    * 已收盘日线 / 财务披露的 cutoff 是**最近一个完整交易日**（盘中即昨天，
+      因为今天的日线还没收完）；
+    * 当日实时截面（上面那些动态字段）的决策时点就是**现在**。
+
+    若拿"最近完整交易日"去判当日实时行，盘中每一行都会被判成 ``future``，
+    PE/PB/换手/资金/行业整列缺失（``strategies.build_factor_table`` 的 ``pct``
+    正是取自 ``fund_f``，会直接打掉盘中扫描）。因此 **live 调用方必须显式传
+    ``snapshot_asof=point_in_time.live_decision_time()``**；历史回放不传，
+    于是默认沿用 ``asof``，保持 fail-closed。
 
     历史模式下不可见即**缺失**：动态数值 → ``NaN``，分类 → ``None``。
     绝不回退到"今天的数据"，也绝不用降低权重的方式假装处理。
@@ -273,6 +287,7 @@ def compute_fundamental_factors(snapshot, finance, asof=None):
     rows = []
     snapshot_hidden = 0
     industry_hidden = 0
+    snapshot_strict = False
     for s in snapshot or []:
         if not isinstance(s, dict) or not s.get("code"):
             continue
@@ -284,15 +299,19 @@ def compute_fundamental_factors(snapshot, finance, asof=None):
         row_asof = asof if asof is not None else f.get("asof_date")
         if row_asof is None:
             row_asof = s.get("asof_date")
+        # 快照截面的决策时点：没显式声明就沿用 asof（历史回放 = fail closed）。
+        row_snapshot_asof = snapshot_asof if snapshot_asof is not None else row_asof
 
         # snapshot 动态字段 + 行业分类的可用性判定（strict 模式下未知 = 不可见）
         snapshot_at_raw, _snapshot_at_iso = PIT.snapshot_available_at(s)
-        snapshot_verdict = PIT.is_visible_at(snapshot_at_raw, row_asof)
-        classification_verdict = PIT.classification_visibility(s, row_asof)
+        snapshot_verdict = PIT.is_visible_at(snapshot_at_raw, row_snapshot_asof)
+        classification_verdict = PIT.classification_visibility(s, row_snapshot_asof)
         snapshot_visible = bool(snapshot_verdict["visible"])
-        if PIT.asof_is_strict(row_asof) and not snapshot_visible:
+        snapshot_row_strict = PIT.asof_is_strict(row_snapshot_asof)
+        snapshot_strict = snapshot_strict or snapshot_row_strict
+        if snapshot_row_strict and not snapshot_visible:
             snapshot_hidden += 1
-        if PIT.asof_is_strict(row_asof) and not classification_verdict["visible"]:
+        if snapshot_row_strict and not classification_verdict["visible"]:
             industry_hidden += 1
         latest_meta = financial_visibility(f, row_asof)
         annual_record = {
@@ -375,14 +394,27 @@ def compute_fundamental_factors(snapshot, finance, asof=None):
     total = len(rows)
     frame.attrs["pit"] = PIT.pit_flags(
         mode="strict" if strict else "live",
+        snapshot_mode="strict" if snapshot_strict else "live",
         decision_asof=PIT.parse_asof(asof).isoformat(timespec="seconds") if strict and PIT.parse_asof(asof) else None,
-        snapshot_pit_safe=bool(strict and total and snapshot_hidden == 0),
-        classification_pit_safe=bool(strict and total and industry_hidden == 0),
+        snapshot_asof=PIT.parse_asof(snapshot_asof).isoformat(timespec="seconds")
+        if snapshot_asof is not None and PIT.parse_asof(snapshot_asof) else None,
+        snapshot_pit_safe=bool(snapshot_strict and total and snapshot_hidden == 0),
+        classification_pit_safe=bool(snapshot_strict and total and industry_hidden == 0),
         financial_pit_safe=bool(strict and total),
         rows_with_hidden_snapshot=snapshot_hidden,
         rows_with_hidden_industry=industry_hidden,
     )
     return frame
+
+def live_snapshot_asof(now=None):
+    """live 调用方应传给 ``snapshot_asof`` 的决策时点（当前实时截面）。
+
+    与"最近完整交易日"是**两回事**：已收盘日线/财务的 cutoff 盘中是昨天，
+    而当日快照的决策时点就是现在。生产实时选股必须传它，否则盘中会把当日
+    实时行全部判成 ``future``，PE/PB/换手/资金/行业整列缺失。
+    """
+    return PIT.live_decision_time(now).isoformat(timespec="seconds")
+
 
 def compute_sentiment_factors(universe_codes, asof=None):
     """情绪因子：人气榜排名 + 排名飙升。来源：东方财富股票人气榜（实时）

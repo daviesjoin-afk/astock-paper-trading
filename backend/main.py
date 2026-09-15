@@ -1410,7 +1410,11 @@ def _select_uncached(
         except Exception:
             finance = {"data": {}, "report_dates": []}
         _LIVE_CACHE["finance"] = finance
-    fund_f = F.compute_fundamental_factors(snap_f, finance, asof=complete_cutoff)
+    # 两套 cutoff 必须分开：``complete_cutoff`` 是"最近完整交易日"（盘中即昨天），
+    # 只用于已收盘日线与财务披露；当日实时截面（PE/PB/换手/资金/行业）的决策时点
+    # 是**现在**。混用会把盘中每一行都判成 future 并清空这些列。
+    fund_f = F.compute_fundamental_factors(
+        snap_f, finance, asof=complete_cutoff, snapshot_asof=F.live_snapshot_asof())
     # Technical factors remain anchored to downloaded complete daily K-lines;
     # mutable same-day fields must come from this validated live snapshot.
     price_f = price_f.copy()
@@ -1782,7 +1786,9 @@ def scanner(pe_max: float = None, pb_max: float = None, roe_min: float = None,
     # visible by the completed daily cutoff, never merely because its period
     # end date is old enough.
     fund_f = F.compute_fundamental_factors(
-        snap_f, finance, asof=U.latest_complete_trade_date(datetime.date.today()).isoformat()
+        snap_f, finance,
+        asof=U.latest_complete_trade_date(datetime.date.today()).isoformat(),
+        snapshot_asof=F.live_snapshot_asof(),
     )
     sentiment = F.compute_sentiment_factors(set(klines.keys()))
     realtime_flow = {s["code"]: s.get("main_pct") for s in snap_f}

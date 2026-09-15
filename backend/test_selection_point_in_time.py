@@ -709,6 +709,138 @@ class LeakSentinelTests(PointInTimeBase):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# P13–P14 实时盘中截面 与 回放接线
+# ─────────────────────────────────────────────────────────────────────────────
+
+class LiveSnapshotCutoffTests(PointInTimeBase):
+    """实时选股有两套 cutoff，混用会打掉盘中扫描（P1 review finding）。"""
+
+    TODAY = "2026-09-15"           # 盘中
+    COMPLETE_CUTOFF = "2026-09-14"  # 最近一个完整交易日（盘中即昨天）
+    NOW = "2026-09-15T10:06:00+08:00"
+    QUOTE_AT = "2026-09-15T10:05:00+08:00"
+    PRICE_CODE = "600000"
+
+    def _inputs(self):
+        days = weekdays(dt.date(2026, 4, 1), dt.date(2026, 9, 14))
+        klines = {self.PRICE_CODE: daily_frame(
+            [(day, 10.0 + i * 0.01, 1.0e8 + i) for i, day in enumerate(days)])}
+        snapshot = [snapshot_row(self.PRICE_CODE, observed_at=self.QUOTE_AT)]
+        finance = {"data": {self.PRICE_CODE: finance_record(
+            report_date="2026-06-30", report_published_at="2026-08-20")}}
+        return klines, snapshot, finance
+
+    def _fund(self, *, declare_snapshot_cutoff):
+        _klines, snapshot, finance = self._inputs()
+        kwargs = {"asof": self.COMPLETE_CUTOFF}
+        if declare_snapshot_cutoff:
+            kwargs["snapshot_asof"] = self.NOW
+        return F.compute_fundamental_factors(snapshot, finance, **kwargs)
+
+    def test_p13_live_intraday_rows_survive_the_completed_daily_cutoff(self):
+        """声明了实时截面决策时点后，当日实时行必须可用。"""
+        out = self._fund(declare_snapshot_cutoff=True)
+        row = out.loc[self.PRICE_CODE]
+        self.assertEqual(8.0, row["pe"])
+        self.assertEqual(0.9, row["pb"])
+        self.assertEqual("银行", row["industry"])
+        self.assertEqual(1.0, row["pct_today"])
+        self.assertEqual(2.0, row["turnover"])
+        self.assertEqual(1.0e10, row["mktcap"])
+        self.assertEqual(1.0e6, row["main_net"])
+        self.assertEqual("visible", row["snapshot_pit_reason"])
+        self.assertEqual(0, out.attrs["pit"]["rows_with_hidden_snapshot"])
+        self.assertEqual("strict", out.attrs["pit"]["snapshot_mode"])
+        self.assertEqual(self.NOW, out.attrs["pit"]["snapshot_asof"])
+
+    def test_p13b_without_the_declaration_it_stays_fail_closed(self):
+        """不声明 → 沿用 asof，当日实时行被判 future（历史回放的默认行为）。"""
+        out = self._fund(declare_snapshot_cutoff=False)
+        row = out.loc[self.PRICE_CODE]
+        self.assertTrue(pd.isna(row["pe"]))
+        self.assertIsNone(row["industry"])
+        self.assertTrue(pd.isna(row["pct_today"]))
+        self.assertEqual("future", row["snapshot_pit_reason"])
+
+    def test_p13c_live_scan_keeps_the_required_pct_column(self):
+        """``build_factor_table`` 的 ``pct`` 取自 ``fund_f``：盘中不能整列丢失。"""
+        klines, snapshot, finance = self._inputs()
+
+        def table(declare):
+            price_f = F.compute_price_factors(klines, asof=self.COMPLETE_CUTOFF)
+            kwargs = {"asof": self.COMPLETE_CUTOFF}
+            if declare:
+                kwargs["snapshot_asof"] = self.NOW
+            fund_f = F.compute_fundamental_factors(snapshot, finance, **kwargs)
+            return S.build_factor_table(price_f, fund_f, {})
+
+        declared = table(True)
+        undeclared = table(False)
+        # table["pct"] 只来自 fund_f（price_f 不产出该列）——盘中一旦整列丢失，
+        # 生产扫描的必填列校验就会报警。
+        self.assertEqual(1.0, declared.loc[self.PRICE_CODE, "pct"])
+        # main_net 在 price 缺失时回落到 fund，同样会被清空
+        self.assertEqual(1.0e6, declared.loc[self.PRICE_CODE, "main_net"])
+        self.assertTrue(pd.isna(undeclared.loc[self.PRICE_CODE, "pct"]))
+        self.assertNotIn("pct", declared.attrs.get("factor_warnings") or [])
+
+    def test_p13d_live_decision_time_is_now_not_the_previous_trading_day(self):
+        frozen = dt.datetime(2026, 9, 15, 2, 6, tzinfo=dt.timezone.utc)  # 10:06 +08:00
+        moment = PIT.live_decision_time(frozen)
+        self.assertEqual("2026-09-15T10:06:00+08:00", moment.isoformat(timespec="seconds"))
+
+    def test_p13e_production_live_call_sites_declare_the_snapshot_cutoff(self):
+        """三处生产 live 调用点都必须显式声明实时截面的决策时点。"""
+        import inspect
+
+        import main as M
+        import paper_trading as PT
+
+        for module, name in ((M, "_select_uncached"), (M, "scanner"),
+                             (PT, "_candidate_rows")):
+            source = inspect.getsource(getattr(module, name))
+            self.assertIn("snapshot_asof=F.live_snapshot_asof()", source,
+                          "%s.%s 未声明实时截面决策时点" % (module.__name__, name))
+
+
+class ReplayWiringTests(PointInTimeBase):
+    def test_p14_historical_rebuild_filters_the_universe_by_asof(self):
+        """回放重建必须先按 asof 过滤历史成分，而不是直接吃今天的成分。"""
+        import paper_trading as PT
+
+        universe = [{"code": "600001", "name": "老股", "list_date": "2020-01-01"},
+                    {"code": "600002", "name": "未来上市", "list_date": "2030-01-01"}]
+        seen = {}
+
+        def gate_spy(rows, cutoff):
+            seen["codes"] = sorted(str(r.get("code")) for r in rows)
+            seen["cutoff"] = cutoff
+            return {"passed": False, "reason": "stub"}
+
+        with mock.patch.object(PT.U, "load_universe", return_value=universe), \
+                mock.patch.object(PT, "_selection_factor_history_gate", side_effect=gate_spy):
+            out = PT._rebuild_selection_factor_cache("2024-06-14")
+
+        self.assertEqual(dt.date(2024, 6, 14), seen["cutoff"])
+        # 未来上市的股票在进入覆盖门禁之前就被剔除
+        self.assertEqual(["600001"], seen["codes"])
+        self.assertEqual("blocked", out["status"])
+        self.assertIsNotNone(out["universe_membership"])
+        self.assertEqual(1, out["universe_membership"]["counts"][PIT.MEMBERSHIP_NOT_LISTED_YET])
+
+    def test_p14b_live_rebuild_never_filters(self):
+        """``asof_date=None``（live）不套用历史成员资格，且不报 unproven。"""
+        import paper_trading as PT
+
+        with mock.patch.object(PT.U, "load_universe",
+                               return_value=[{"code": "600001"}]), \
+                mock.patch.object(PT, "_selection_factor_history_gate",
+                                  side_effect=AssertionError("live 不应调用覆盖门禁")):
+            out = PT._rebuild_selection_factor_cache(None)
+        self.assertIsNone(out.get("universe_membership"))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # 契约本身
 # ─────────────────────────────────────────────────────────────────────────────
 

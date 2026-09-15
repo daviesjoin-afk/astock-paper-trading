@@ -72,6 +72,8 @@ __all__ = [
     "china_tz",
     "parse_asof",
     "parse_available_at",
+    "asof_is_strict",
+    "live_decision_time",
     "is_visible_at",
     "filter_visible_rows",
     "bar_available_at",
@@ -269,6 +271,28 @@ def parse_available_at(value: Any) -> Optional[_dt.datetime]:
 def asof_is_strict(asof: Any) -> bool:
     """``asof`` 是否请求 strict PIT historical mode。"""
     return not _is_missing(asof)
+
+
+def live_decision_time(now: Any = None) -> _dt.datetime:
+    """live 路径当前**实时截面**的决策时点（tz-aware，Asia/Shanghai）。
+
+    实时选股有两套不同的 cutoff，绝不能混用：
+
+    * **已收盘日线 / 财务披露** 的 cutoff = 最近一个完整交易日
+      （盘中就是昨天，因为今天的日线还没收完）；
+    * **当日实时截面**（快照 PE/PB/换手/资金/行业）的决策时点 = **现在**——
+      它就是在这一刻被观测到的。
+
+    拿"最近完整交易日"去判当日实时行，会把每一行都判成 ``future`` 并清空
+    PE/PB/换手/行业（这会直接打掉生产盘中扫描）。历史回放**不得**使用本函数。
+    """
+    moment = now or _dt.datetime.now(_dt.timezone.utc)
+    if not isinstance(moment, _dt.datetime):
+        parsed = parse_asof(moment)
+        return parsed or _dt.datetime.now(_dt.timezone.utc).astimezone(china_tz())
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=_dt.timezone.utc)
+    return moment.astimezone(china_tz())
 
 
 def _iso(value: Optional[_dt.datetime]) -> Optional[str]:

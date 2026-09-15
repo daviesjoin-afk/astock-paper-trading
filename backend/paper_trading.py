@@ -3591,13 +3591,22 @@ def _rebuild_selection_factor_cache(asof_date=None):
     """在收盘历史库更新成功后重建盘中读取的紧凑因子文件。"""
     cutoff = _date(asof_date) if asof_date is not None else None
     universe = U.load_universe()
+    universe_membership = None
     if cutoff is not None:
+        # 历史成分必须先过 PIT 成员资格，否则"取今天仍上市的股票再回放过去"
+        # 会同时引入未来上市与漏掉退市两类幸存者偏差。当前数据源没有上市/
+        # 退市日期，无法证明的成分计入 unproven（原样保留）而**不是**被默认
+        # 当作"当时已上市"。
+        membership = U.asof_members(universe, cutoff)
+        universe = membership["members"]
+        universe_membership = membership["report"]
         gate = _selection_factor_history_gate(universe, cutoff)
         if not gate["passed"]:
             return {
                 "status": "blocked",
                 "reason": "完整日线覆盖不足，保留上一有效因子版本",
                 "refresh_gate": gate,
+                "universe_membership": universe_membership,
             }
     klines = {}
     for row in universe:
@@ -3679,7 +3688,8 @@ def _rebuild_selection_factor_cache(asof_date=None):
     latest = None
     if "last_date" in price_f and not price_f.empty:
         latest = str(price_f["last_date"].dropna().max())[:10]
-    return {"status": "ok", "factor_rows": len(price_f), "factor_date": latest}
+    return {"status": "ok", "factor_rows": len(price_f), "factor_date": latest,
+            "universe_membership": universe_membership}
 
 
 def _history_manifest():
@@ -5314,7 +5324,11 @@ def _candidate_rows(account, asof_date, market, sector_rows=None, live_universe=
     # ``shadow`` for this one model; the strategy still requires an explicit
     # publication record before a formal pick is returned.
     finance_asof = None if account_id == NEW_STRATEGY_ID else asof_date
-    fund = F.compute_fundamental_factors(universe, finance, asof=finance_asof)
+    # ``universe`` 由当前 universe.json 与当日 live_map 组成，即**当前实时截面**：
+    # 它的决策时点是现在，不是已收盘日线 cutoff。用 cutoff 判它会清空 PE/PB/
+    # 换手/资金/行业（``build_factor_table`` 的 pct 正取自这里），直接打掉盘中扫描。
+    fund = F.compute_fundamental_factors(
+        universe, finance, asof=finance_asof, snapshot_asof=F.live_snapshot_asof())
     live_flow = {
         str(code): row.get("main_pct")
         for code, row in live_map.items()
