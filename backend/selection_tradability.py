@@ -178,6 +178,15 @@ def _instant(value: Any) -> Optional[str]:
     return None if moment is None else moment.isoformat(timespec="seconds")
 
 
+def is_visible_at(available_at: Any, asof: Any) -> bool:
+    """PIT 可见性（``available_at <= asof``）。委托 :func:`point_in_time.is_visible_at`。
+
+    暴露成 contract 的一部分，让消费者（报告层、状态源适配器）不必自己重新
+    实现可见性比较——那正是容易写出"未来状态重写历史"的地方。
+    """
+    return bool(PIT.is_visible_at(available_at, asof).get("visible"))
+
+
 def session_close_at(session: Any) -> Optional[str]:
     """某个 session 的收盘时点（``15:00`` Asia/Shanghai），即该 bar 的可用时点。
 
@@ -686,6 +695,67 @@ class ExecutableSelectionOutcome:
         }
 
 
+# ─────────────────── authoritative outcome buckets ───────────────────
+#: outcome 桶的**唯一权威分类**。``build_executable_outcomes`` 与所有 report /
+#: 消费者都必须调用 :func:`outcome_bucket`，**不得**各自复制一套优先级。
+OUTCOME_BUCKET_EXECUTABLE = "executable"
+OUTCOME_BUCKET_BLOCKED_ENTRY = "blocked_entry"
+OUTCOME_BUCKET_BLOCKED_EXIT = "blocked_exit"
+OUTCOME_BUCKET_UNPROVEN = "unproven"
+OUTCOME_BUCKET_INVALID = "invalid"
+OUTCOME_BUCKET_NOT_SELECTED = "not_selected"
+#: 选股口径的桶（不含 ``not_selected``）。
+OUTCOME_BUCKETS = (
+    OUTCOME_BUCKET_EXECUTABLE,
+    OUTCOME_BUCKET_BLOCKED_ENTRY,
+    OUTCOME_BUCKET_BLOCKED_EXIT,
+    OUTCOME_BUCKET_UNPROVEN,
+    OUTCOME_BUCKET_INVALID,
+)
+#: 含 ``not_selected`` 的完整键集合（审计计数用）。
+OUTCOME_BUCKET_KEYS = (OUTCOME_BUCKET_NOT_SELECTED,) + OUTCOME_BUCKETS
+
+
+def outcome_bucket(outcome: "ExecutableSelectionOutcome") -> str:
+    """一条 outcome 的权威桶。**唯一**实现，优先级与 ``build_executable_outcomes`` 一致。
+
+    判定顺序（先到先判）：
+
+    1. ``selected is False`` → ``not_selected``（不是选股样本，不进选股口径）；
+    2. entry 与 exit 都真正可执行 → ``executable``；
+    3. entry 未通过 → 按 **entry** 状态判 ``blocked_entry`` / ``unproven`` / ``invalid``；
+    4. entry 通过但 exit 未通过 → 按 **exit** 状态判 ``blocked_exit`` / ``unproven`` / ``invalid``。
+
+    第 3 步是关键：``entry=unproven`` 且 ``exit=blocked`` 时桶是 ``unproven``
+    —— entry 先失败，exit 的 blocked 不再决定分类。report 层若自行按
+    "先看 exit 是否 blocked" 排序，就会得到 ``blocked_exit``，产生与 contract
+    不一致的数字。这正是本函数要消灭的语义漂移。
+    """
+    if not outcome.selected:
+        return OUTCOME_BUCKET_NOT_SELECTED
+    if outcome.executable:
+        return OUTCOME_BUCKET_EXECUTABLE
+    if outcome.entry_status != STATUS_EXECUTABLE:
+        if outcome.entry_status == STATUS_BLOCKED:
+            return OUTCOME_BUCKET_BLOCKED_ENTRY
+        if outcome.entry_status == STATUS_UNPROVEN:
+            return OUTCOME_BUCKET_UNPROVEN
+        return OUTCOME_BUCKET_INVALID
+    if outcome.exit_status is None or outcome.exit_status == STATUS_UNPROVEN:
+        return OUTCOME_BUCKET_UNPROVEN
+    if outcome.exit_status == STATUS_BLOCKED:
+        return OUTCOME_BUCKET_BLOCKED_EXIT
+    return OUTCOME_BUCKET_INVALID
+
+
+def outcome_bucket_counts(outcomes: Sequence["ExecutableSelectionOutcome"]) -> dict:
+    """按权威 :func:`outcome_bucket` 统计每个桶的样本数（含 ``not_selected``）。"""
+    counts = {key: 0 for key in OUTCOME_BUCKET_KEYS}
+    for outcome in outcomes or ():
+        counts[outcome_bucket(outcome)] += 1
+    return counts
+
+
 @dataclass(frozen=True, slots=True)
 class SelectionRow:
     """一条待判定的选股。``entry_evidence`` / ``exit_evidence`` 必须是 PIT 证据。"""
@@ -787,54 +857,40 @@ def build_executable_outcomes(rows: Sequence[SelectionRow]) -> dict:
         exit_ok = exit_verdict is not None and exit_verdict.status == STATUS_EXECUTABLE
         executable = bool(entry_ok and exit_ok)
 
-        if executable:
-            report["executable"] += 1
-        elif not entry_ok:
-            if entry.status == STATUS_BLOCKED:
-                report["blocked_entry"] += 1
-            elif entry.status == STATUS_UNPROVEN:
-                report["unproven"] += 1
-            else:
-                report["invalid"] += 1
-        else:
-            if exit_verdict is None or exit_verdict.status == STATUS_UNPROVEN:
-                report["unproven"] += 1
-            elif exit_verdict.status == STATUS_BLOCKED:
-                report["blocked_exit"] += 1
-            else:
-                report["invalid"] += 1
+        outcome = ExecutableSelectionOutcome(
+            sample_key=row.sample_key,
+            security_code=str(row.code or ""),
+            selected=True,
+            entry_status=entry.status,
+            entry_reason=entry.reason,
+            intended_entry_session=row.intended_entry_session,
+            # blocked / unproven 一律不顺延：没有权威 retry 证据就不编一个成交日。
+            actual_entry_session=(
+                row.intended_entry_session if entry_ok else None
+            ),
+            exit_status=exit_status,
+            exit_reason=exit_reason,
+            intended_exit_session=row.intended_exit_session,
+            actual_exit_session=(
+                row.intended_exit_session if executable else None
+            ),
+            entry_executable=entry_ok,
+            executable=executable,
+            market_label_status=row.market_label_status,
+            market_label_value=_finite(row.market_label_value),
+            # 只有 entry 与 exit 都真正可执行时才有 executable return。
+            executable_return=(
+                _finite(row.market_label_value) if executable else None
+            ),
+        )
+        outcomes.append(outcome)
+        # 桶分类只有一处实现（``outcome_bucket``）：report 计数**消费**它，
+        # 绝不在这里再写一份优先级。否则 entry=unproven + exit=blocked 这类
+        # 冲突组合会在两处给出不同的桶。
+        report[outcome_bucket(outcome)] += 1
 
         if entry_ok:
             report["tradability_verified"] += 1
-
-        outcomes.append(
-            ExecutableSelectionOutcome(
-                sample_key=row.sample_key,
-                security_code=str(row.code or ""),
-                selected=True,
-                entry_status=entry.status,
-                entry_reason=entry.reason,
-                intended_entry_session=row.intended_entry_session,
-                # blocked / unproven 一律不顺延：没有权威 retry 证据就不编一个成交日。
-                actual_entry_session=(
-                    row.intended_entry_session if entry_ok else None
-                ),
-                exit_status=exit_status,
-                exit_reason=exit_reason,
-                intended_exit_session=row.intended_exit_session,
-                actual_exit_session=(
-                    row.intended_exit_session if executable else None
-                ),
-                entry_executable=entry_ok,
-                executable=executable,
-                market_label_status=row.market_label_status,
-                market_label_value=_finite(row.market_label_value),
-                # 只有 entry 与 exit 都真正可执行时才有 executable return。
-                executable_return=(
-                    _finite(row.market_label_value) if executable else None
-                ),
-            )
-        )
 
     return {"outcomes": outcomes, "report": report}
 

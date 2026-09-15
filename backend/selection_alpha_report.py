@@ -33,6 +33,7 @@ import statistics
 
 import selection_labels as SL
 import selection_tradability as ST
+import security_state_point_in_time as SS
 
 BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DATA_DIR = os.path.join(BASE, "data_cache")
@@ -117,28 +118,80 @@ def label_for(code, day, horizon, sessions, *, asof, kline=None):
     )
 
 
-def benchmark_map(dates, horizon, sessions, *, asof):
-    """同日随机 300 只股票的**同期**前向收益均值（报告层对照口径）。
+def benchmark_map(dates, horizon, sessions, *, asof, security_state_fn=None):
+    """同日随机 300 只股票的**同期**前向收益均值 —— 两个口径**分开**返回。
 
-    逐股走同一个标签契约：只有 ``verified`` 的样本参与均值，
-    ``pending`` / ``unavailable`` 绝不填 0 混进基准。
+    此前 benchmark 只要求 label ``verified``，而 selected 侧在
+    ``MODE_EXECUTABLE`` 下还要过 tradability filter。两个 population 不同却相减
+    成一个叫"超额"的数字，等于拿"能成交的策略样本"去比"全部随机样本"。
+
+    因此这里返回两个独立的 map：
+
+    * ``market``：只要求 label ``verified``（市场反事实口径）。这是原行为。
+    * ``executable``：与 selected 侧**同口径**走 PIT 可成交性契约（entry/exit
+      两侧都 ``executable`` 才计入）。**若没有可信的 PIT 历史状态源
+      （``security_state_fn is None``），该键整体缺席** —— 报告必须写
+      "可执行基准不可得"，而不是把未过滤的均值冒充成可执行基准。
+
+    逐股仍走同一个标签契约：``pending`` / ``unavailable`` 绝不填 0 混进基准。
     """
     try:
         codes = [f[:-4] for f in os.listdir(KLINE_DIR) if f.endswith(".csv")]
     except OSError:
-        return {}
+        return {"market": {}, "executable": None}
     if not codes:
-        return {}
+        return {"market": {}, "executable": None}
     random.seed(20260828)
     sample = random.sample(codes, min(BENCH_N, len(codes)))
     per_date = {}
+    exec_rows = []
     for code in sample:
         kline = load_kline(code)
         for day in dates:
             result = label_for(code, day, horizon, sessions, asof=asof, kline=kline)
-            if result.verified:
-                per_date.setdefault(day, []).append(result.raw_forward_return)
-    return {day: statistics.mean(v) for day, v in per_date.items() if v}
+            if not result.verified:
+                continue
+            per_date.setdefault(day, []).append(result.raw_forward_return)
+            if security_state_fn is None:
+                continue
+            entry_name, entry_flag = _action_security_state(
+                code, result.entry_date, decision_day=day, decision_name=None,
+                security_state_fn=security_state_fn,
+            )
+            exit_name, exit_flag = _action_security_state(
+                code, result.exit_date, decision_day=day, decision_name=None,
+                security_state_fn=security_state_fn,
+            )
+            exec_rows.append(
+                ST.SelectionRow(
+                    sample_key=f"bench|{code}|{day}",
+                    code=code,
+                    selected=True,
+                    intended_entry_session=result.entry_date,
+                    entry_evidence=_tradability_evidence(
+                        code, entry_name, entry_flag, result.entry_date,
+                        result.entry_price, kline),
+                    intended_exit_session=result.exit_date,
+                    exit_evidence=_tradability_evidence(
+                        code, exit_name, exit_flag, result.exit_date,
+                        result.exit_price, kline),
+                    market_label_status=result.label_status,
+                    market_label_value=result.raw_forward_return,
+                )
+            )
+    market = {day: statistics.mean(v) for day, v in per_date.items() if v}
+    if security_state_fn is None:
+        # 没有可信历史状态源 → 可执行基准**不可得**（None 而非未过滤均值）。
+        return {"market": market, "executable": None}
+    built = ST.build_executable_outcomes(exec_rows)
+    per_date_exec = {}
+    for outcome in built["outcomes"]:
+        if not outcome.executable:
+            continue
+        day = outcome.sample_key.rsplit("|", 1)[-1]
+        per_date_exec.setdefault(day, []).append(outcome.executable_return)
+    executable = {day: statistics.mean(v) for day, v in per_date_exec.items() if v}
+    return {"market": market, "executable": executable}
 
 
 def _previous_close(kline, session):
@@ -177,11 +230,19 @@ def _action_security_state(code, session, *, decision_day, decision_name,
     action_session = str(session)[:10]
     if security_state_fn is not None:
         state = security_state_fn(str(code or ""), action_session)
-        if isinstance(state, dict):
-            return state.get("name"), state.get("risk_flag")
         if state is None:
             return None, None
-        return state, None
+        if not isinstance(state, dict):
+            return state, None
+        # provider 若声明了该状态自身的可用时点，就必须**在动作时点可见**才准用：
+        # 一条"之后才记下的"名称不能证明更早的动作可执行（PIT 硬门禁）。
+        if state.get("available_at") is not None:
+            visible = ST.is_visible_at(
+                state.get("available_at"), ST.session_close_at(action_session)
+            )
+            if not visible:
+                return None, None
+        return state.get("name"), state.get("risk_flag")
     if decision_day is not None and action_session == str(decision_day)[:10]:
         return decision_name, None
     return None, None
@@ -211,7 +272,8 @@ def _tradability_evidence(code, name, risk_flag, session, price, kline):
 
 
 def evaluate(picks, horizon, label, sessions, *, asof,
-             tradability_mode=ST.MODE_EXECUTABLE, security_state_fn=None):
+             tradability_mode=ST.MODE_EXECUTABLE, security_state_fn=None,
+             state_source_status=None):
     """picks: list of (strategy, decision_day, code[, name]). Returns (lines, summary).
 
     ``tradability_mode``
@@ -231,7 +293,14 @@ def evaluate(picks, horizon, label, sessions, *, asof,
     by_strategy = {}
     kline_cache = {}
     dates = {pick[1] for pick in picks}
-    bench = benchmark_map(dates, horizon, sessions, asof=asof)
+    benches = benchmark_map(
+        dates, horizon, sessions, asof=asof, security_state_fn=security_state_fn
+    )
+    bench = benches.get("market") or {}
+    bench_exec = benches.get("executable")
+    # 可执行基准是否**可得**：需要同口径的 PIT 历史状态源。缺证据时它是 None，
+    # 绝不用未过滤的 market 均值冒充。
+    executable_benchmark_available = bench_exec is not None
     status_counts = {status: 0 for status in SL.LABEL_STATUSES}
     verified = []
     for pick in picks:
@@ -277,42 +346,44 @@ def evaluate(picks, horizon, label, sessions, *, asof,
     built = ST.build_executable_outcomes(rows)
     outcomes = {outcome.sample_key: outcome for outcome in built["outcomes"]}
     tradability_counts = dict(built["report"]["reason_counts"])
+    # 桶分类**只消费** contract 的权威实现，report 层不再复制优先级。
     entry_counts = {
-        "executable": 0, "blocked_entry": 0, "blocked_exit": 0,
-        "unproven": 0, "invalid": 0,
+        bucket: built["report"][bucket] for bucket in ST.OUTCOME_BUCKETS
     }
     for strategy, day, code, name, result, kline in verified:
         outcome = outcomes[f"{strategy}|{day}|{code}"]
-        if outcome.executable:
-            entry_counts["executable"] += 1
-        elif outcome.entry_status == ST.STATUS_BLOCKED:
-            entry_counts["blocked_entry"] += 1
-        elif outcome.exit_status == ST.STATUS_BLOCKED:
-            entry_counts["blocked_exit"] += 1
-        elif outcome.entry_status == ST.STATUS_INVALID or outcome.exit_status == ST.STATUS_INVALID:
-            entry_counts["invalid"] += 1
-        else:
-            entry_counts["unproven"] += 1
         # 逐策略计数必须在**执行过滤之前**完成：否则"策略选了 2 条、1 条买不进"
         # 会在策略行里显示成 1/1，把被拦的那条藏掉，而全局计数却仍保留它。
         item = by_strategy.setdefault(
-            strategy, {"r": [], "excess": [], "executable": 0, "verified": 0}
+            strategy,
+            {
+                "r": [], "market_excess": [], "executable_excess": [],
+                "executable": 0, "verified": 0,
+            },
         )
         item["verified"] += 1
         if tradability_mode == ST.MODE_EXECUTABLE and not outcome.executable:
             continue
         item["r"].append(result.raw_forward_return)
         item["executable"] += 1 if outcome.executable else 0
+        # 两个 excess **分开**累积，绝不混为一个数字。
         if day in bench:
-            item["excess"].append(result.raw_forward_return - bench[day])
+            item["market_excess"].append(result.raw_forward_return - bench[day])
+        if executable_benchmark_available and day in (bench_exec or {}):
+            item["executable_excess"].append(
+                result.raw_forward_return - bench_exec[day]
+            )
 
+    bench_available_text = "可得" if executable_benchmark_available else "不可得"
     lines = [
         f"\n### {label}（T+{horizon} 交易日，entry = 决策后首个交易日收盘；"
         f"标签口径 {LABEL_VERSION}；可成交口径 {tradability_mode}）\n",
-        "| 策略 | 已验证样本 | 可执行样本 | 均值收益 | 胜率 | 超额(vs同日抽样均值) | 基准 |",
-        "|---|---|---|---|---|---|---|",
+        "| 策略 | 已验证样本 | 可执行样本 | 均值收益 | 胜率 | "
+        "market_counterfactual_excess | executable_excess | 基准 |",
+        "|---|---|---|---|---|---|---|---|",
     ]
     all_r, all_x = [], []
+    all_exec_x = []
     for strategy in sorted(by_strategy):
         item = by_strategy[strategy]
         # 该策略可能有 verified 样本、但在当前口径下一条都不 eligible（例如全部被
@@ -326,16 +397,24 @@ def evaluate(picks, horizon, label, sessions, *, asof,
         else:
             mean_r_text = "—"
             win_text = "—"
-        mean_x = statistics.mean(item["excess"]) if item["excess"] else None
+        mean_market_x = (
+            statistics.mean(item["market_excess"]) if item["market_excess"] else None
+        )
+        mean_exec_x = (
+            statistics.mean(item["executable_excess"])
+            if item["executable_excess"] else None
+        )
         bench_mean = statistics.mean(bench.values()) if bench else None
         lines.append(
             f"| {strategy} | {item['verified']} | {item['executable']} | "
             f"{mean_r_text} | {win_text} | "
-            f"{(mean_x * 100) if mean_x is not None else float('nan'):+.2f}% | "
+            f"{(mean_market_x * 100) if mean_market_x is not None else float('nan'):+.2f}% | "
+            f"{(mean_exec_x * 100) if mean_exec_x is not None else float('nan'):+.2f}% | "
             f"{(bench_mean * 100) if bench_mean is not None else float('nan'):+.2f}% |"
         )
         all_r.extend(item["r"])
-        all_x.extend(item["excess"])
+        all_x.extend(item["market_excess"])
+        all_exec_x.extend(item["executable_excess"])
     lines.append(
         "样本状态：" + "，".join(
             f"{status} {status_counts[status]}" for status in SL.LABEL_STATUSES
@@ -347,6 +426,17 @@ def evaluate(picks, horizon, label, sessions, *, asof,
         + "，".join(f"{name} {count}" for name, count in entry_counts.items())
         + f"（口径 {tradability_mode}；不可执行的样本保留在计数里，不静默丢弃）"
     )
+    lines.append(
+        "基准口径：market_counterfactual_excess 用『仅 verified』的随机样本均值；"
+        "executable_excess 用**同口径可执行**随机样本均值"
+        f"（当前：{bench_available_text}）。"
+        "两者 population 不同，**不得**相互替代或合并。"
+    )
+    if not executable_benchmark_available:
+        lines.append(
+            "⚠️ 可执行基准**不可得**（无同口径 PIT 历史证券状态源）："
+            "executable_excess 一栏为 —，绝不拿未做 tradability 过滤的 market 基准冒充。"
+        )
     if entry_counts["unproven"] and not entry_counts["executable"]:
         lines.append(
             "⚠️ 没有任何样本能证明可执行：历史 ST 名称/涨跌停参考价等证据不足时，"
@@ -359,11 +449,23 @@ def evaluate(picks, horizon, label, sessions, *, asof,
         "tradability_mode": tradability_mode,
         "tradability_counts": tradability_counts,
         "entry_counts": entry_counts,
+        "outcome_buckets": dict(entry_counts),
         "n": len(all_r),
         "mean_return": round(statistics.mean(all_r) * 100, 2) if all_r else None,
+        # market counterfactual excess（原字段名保留给既有消费者）。
         "mean_excess": round(statistics.mean(all_x) * 100, 2) if all_x else None,
+        "market_counterfactual_excess": (
+            round(statistics.mean(all_x) * 100, 2) if all_x else None
+        ),
+        # 可执行 excess：基准不可得时是 None（unavailable），不是估算值。
+        "executable_excess": (
+            round(statistics.mean(all_exec_x) * 100, 2) if all_exec_x else None
+        ),
+        "executable_benchmark_available": executable_benchmark_available,
         "label_status_counts": status_counts,
     }
+    if state_source_status is not None:
+        summary["security_state_source"] = dict(state_source_status)
     return lines, summary
 
 
@@ -431,11 +533,32 @@ def picks_from_signals(days):
     return picks
 
 
-def main():
+def production_security_state_fn(*, archive_path=None):
+    """生产路径的 action-time 状态源。
+
+    返回 ``(security_state_fn | None, provenance)``。**只**承认显式声明为历史
+    归档的 PIT 状态源（:mod:`security_state_point_in_time`）；归档不存在时返回
+    ``(None, provenance)``，调用方据此诚实降级 —— 绝不用当前快照或决策日名称
+    补位（那正是 PIT 违规）。
+    """
+    return SS.resolve_security_state_fn(archive_path=archive_path)
+
+
+def main(security_state_fn=None, *, archive_path=None):
     asof = datetime.date.today().isoformat()
     sessions = market_sessions()
     tracking = picks_from_tracking(WINDOW_DAYS)
     filled = picks_from_signals(WINDOW_DAYS)
+    state_fn, state_status = production_security_state_fn(archive_path=archive_path)
+    if security_state_fn is not None:
+        state_fn = security_state_fn
+        state_status = {
+            "status": SS.SOURCE_OK,
+            "kind": "injected_provider",
+            "source": "explicit",
+            "rows": None,
+        }
+    executable_coverage_available = state_fn is not None
     report = [
         "# 选股 Alpha 周报",
         "",
@@ -448,27 +571,69 @@ def main():
         "entry = 决策日之后第一个交易日收盘（收盘后形成的信号不可回填当日成交）。",
         "",
         "判读：超额为负 = 选股弱于随机买入，排序因子在损耗净值；连续两周为负需回滚或重检排序。",
+        "",
+        "## 口径边界（诚实声明）",
+        "",
+        "- market counterfactual（市场反事实）指标：**可用**，基于已验证标签。",
+        f"- executable 指标：**{'可用' if executable_coverage_available else '不可用'}**。"
+        + (
+            "已接入 PIT 历史证券状态源，action-time 的 name / risk_flag 由该源提供。"
+            if executable_coverage_available
+            else
+            "**没有**可信的 PIT 历史证券状态源（可回答 ``security_state_at(code, session)`` "
+            "的归档）。因此 entry/exit 时点的 ST 资格无法证明，可执行样本一律 fail closed "
+            "判为 ``unproven``；本报告**不**声称已得到 executable 指标，也**不**用当前快照或"
+            "决策日名称补齐。"
+        ),
+        f"- 状态源：`{state_status.get('status')}`"
+        + (f"（source={state_status.get('source')}）" if state_status.get("source") else ""),
     ]
     summaries = []
+
+    def _sections(picks, horizon, label, view):
+        """同一个样本集分别产出 market counterfactual 与 executable 两套指标。
+
+        ``MODE_MARKET`` 只依赖已验证标签，**永远可得**；
+        ``MODE_EXECUTABLE`` 依赖同口径 PIT 历史状态源，不可得时它诚实地什么都不给。
+        """
+        if view == "market_counterfactual":
+            lines, summary = evaluate(
+                picks, horizon, label, sessions, asof=asof,
+                tradability_mode=ST.MODE_MARKET,
+                security_state_fn=state_fn, state_source_status=state_status,
+            )
+        else:
+            lines, summary = evaluate(
+                picks, horizon, label, sessions, asof=asof,
+                tradability_mode=ST.MODE_EXECUTABLE,
+                security_state_fn=state_fn, state_source_status=state_status,
+            )
+        summary["view"] = view
+        summaries.append(summary)
+        return lines
+
     if tracking:
-        lines, s1 = evaluate(tracking, 1, "每日 topN 候选", sessions, asof=asof)
-        report += lines
-        summaries.append(s1)
-        lines, s3 = evaluate(tracking, 3, "每日 topN 候选", sessions, asof=asof)
-        report += lines
-        summaries.append(s3)
+        for view in ("market_counterfactual", "executable"):
+            report.append(f"\n#### 每日 topN 候选 · {view}")
+            report += _sections(tracking, 1, "每日 topN 候选", view)
+            report += _sections(tracking, 3, "每日 topN 候选", view)
     else:
         report.append("\nselection_tracking.db 无样本（selection_picks 为空或库缺失）。")
     if filled:
-        lines, s2 = evaluate(filled, 1, "模拟盘实际成交信号", sessions, asof=asof)
-        report += lines
-        summaries.append(s2)
+        for view in ("market_counterfactual", "executable"):
+            report.append(f"\n#### 模拟盘实际成交信号 · {view}")
+            report += _sections(filled, 1, "模拟盘实际成交信号", view)
     else:
         report.append("\npaper_signals 无 filled 样本。")
     os.makedirs(os.path.dirname(REPORT_PATH), exist_ok=True)
     with open(REPORT_PATH, "w", encoding="utf-8") as fh:
         fh.write("\n".join(report) + "\n")
-    print(json.dumps({"report": REPORT_PATH, "summaries": summaries}, ensure_ascii=False))
+    print(json.dumps({
+        "report": REPORT_PATH,
+        "security_state_source": state_status,
+        "executable_coverage_available": executable_coverage_available,
+        "summaries": summaries,
+    }, ensure_ascii=False))
 
 
 if __name__ == "__main__":

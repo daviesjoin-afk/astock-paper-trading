@@ -13,6 +13,7 @@ import random
 import unittest
 
 import paper_trading_rules as PTR
+import security_state_point_in_time as SS
 import selection_labels as SL
 import selection_tradability as ST
 import walk_forward_validation as WFV
@@ -81,6 +82,35 @@ def row(sample_key, code=MAIN_BOARD, *, entry_ev=None, exit_ev=None,
         market_label_status=label_status,
         market_label_value=label_value,
     )
+
+
+class _FakeKlineReport:
+    """把 ``selection_alpha_report`` 的 K 线读取换成本测试自带的行情。
+
+    ``benchmark_map`` 会 ``os.listdir(KLINE_DIR)`` 取基准票池，因此只换
+    ``load_kline`` 不够 —— 必须同时把目录列举也换掉，否则测试依赖运行环境里
+    有没有真实 ``data_cache/klines``。
+    """
+
+    def __init__(self, klines):
+        self.klines = klines
+
+    def __enter__(self):
+        import selection_alpha_report as AR
+
+        self._AR = AR
+        self._orig_load = AR.load_kline
+        self._orig_listdir = AR.os.listdir
+        AR.load_kline = lambda code: dict(self.klines.get(code) or {})
+        AR.os.listdir = lambda path: [
+            f"{code}.csv" for code in self.klines
+        ] if str(path) == str(AR.KLINE_DIR) else self._orig_listdir(path)
+        return AR
+
+    def __exit__(self, *exc):
+        self._AR.load_kline = self._orig_load
+        self._AR.os.listdir = self._orig_listdir
+        return False
 
 
 # ─────────────────────── P1–P9: the core verdict ───────────────────────
@@ -907,19 +937,13 @@ class ProductionEvaluatorWiringTest(unittest.TestCase):
     }
 
     def _evaluate(self, picks, **kwargs):
-        import selection_alpha_report as AR
-
-        original = AR.load_kline
-        AR.load_kline = lambda code: dict(self.KLINES.get(code) or {})
-        try:
+        with _FakeKlineReport(self.KLINES) as AR:
             sessions = SL.normalize_sessions(
                 sorted({day for bars in self.KLINES.values() for day in bars})
             )
             return AR.evaluate(
                 picks, 1, "选股质量", sessions, asof="2024-06-30", **kwargs
             )
-        finally:
-            AR.load_kline = original
 
     #: 动作 session 当时的状态来源：entry/exit 都不是决策日，必须显式提供。
     @staticmethod
@@ -1021,19 +1045,13 @@ class PitOrderingAndActionTimeStateTest(unittest.TestCase):
         return {"name": "某某股份", "risk_flag": False}
 
     def _evaluate(self, picks, **kwargs):
-        import selection_alpha_report as AR
-
-        original = AR.load_kline
-        AR.load_kline = lambda code: dict(self.KLINES.get(code) or {})
-        try:
+        with _FakeKlineReport(self.KLINES) as AR:
             sessions = SL.normalize_sessions(
                 sorted({day for bars in self.KLINES.values() for day in bars})
             )
             return AR.evaluate(
                 picks, 1, "选股质量", sessions, asof="2024-06-30", **kwargs
             )
-        finally:
-            AR.load_kline = original
 
     def _tradability(self, evidence, action_session):
         return ST.tradability_at(
@@ -1137,6 +1155,496 @@ class PitOrderingAndActionTimeStateTest(unittest.TestCase):
         cells = [cell.strip() for cell in row.strip("|").split("|")]
         self.assertEqual("2", cells[1], row)
         self.assertEqual("1", cells[2], row)
+
+
+class OutcomeBucketAuthorityTest(unittest.TestCase):
+    """P2（round 3）第 3 项：桶分类只能有一处实现。
+
+    ``build_executable_outcomes`` 的 ``report`` 计数与 :func:`ST.outcome_bucket`
+    必须对**冲突状态组合**给出同一个桶。report 层若自行按另一套优先级手写，
+    ``entry=unproven + exit=blocked`` 这类样本就会在两个地方被算进不同的桶。
+    """
+
+    def _make_outcome(self, *, entry_status, exit_status, entry_reason="r",
+                      exit_reason="r", executable=False):
+        return ST.ExecutableSelectionOutcome(
+            sample_key="k",
+            security_code=MAIN_BOARD,
+            selected=True,
+            entry_status=entry_status,
+            entry_reason=entry_reason,
+            exit_status=exit_status,
+            exit_reason=exit_reason,
+            entry_executable=entry_status == ST.STATUS_EXECUTABLE,
+            executable=executable,
+        )
+
+    def test_conflicting_entry_unproven_exit_blocked_is_unproven(self):
+        """entry 先失败 → 桶由 entry 决定，而不是"看到 exit blocked 就算 blocked_exit"。"""
+        outcome = self._make_outcome(
+            entry_status=ST.STATUS_UNPROVEN, exit_status=ST.STATUS_BLOCKED)
+        self.assertEqual(ST.OUTCOME_BUCKET_UNPROVEN, ST.outcome_bucket(outcome))
+
+    def test_conflicting_entry_invalid_exit_blocked_is_invalid(self):
+        outcome = self._make_outcome(
+            entry_status=ST.STATUS_INVALID, exit_status=ST.STATUS_BLOCKED)
+        self.assertEqual(ST.OUTCOME_BUCKET_INVALID, ST.outcome_bucket(outcome))
+
+    def test_conflicting_entry_unproven_exit_invalid_is_unproven(self):
+        outcome = self._make_outcome(
+            entry_status=ST.STATUS_UNPROVEN, exit_status=ST.STATUS_INVALID)
+        self.assertEqual(ST.OUTCOME_BUCKET_UNPROVEN, ST.outcome_bucket(outcome))
+
+    def test_entry_ok_exit_blocked_is_blocked_exit(self):
+        outcome = self._make_outcome(
+            entry_status=ST.STATUS_EXECUTABLE, exit_status=ST.STATUS_BLOCKED)
+        self.assertEqual(ST.OUTCOME_BUCKET_BLOCKED_EXIT, ST.outcome_bucket(outcome))
+
+    def test_not_selected_has_its_own_bucket(self):
+        outcome = ST.ExecutableSelectionOutcome(
+            sample_key="k", security_code=MAIN_BOARD, selected=False,
+            entry_status=ST.STATUS_UNPROVEN, entry_reason=ST.REASON_OK,
+        )
+        self.assertEqual(ST.OUTCOME_BUCKET_NOT_SELECTED, ST.outcome_bucket(outcome))
+
+    def test_contract_report_counts_agree_with_outcome_bucket(self):
+        """contract 的 ``report`` 计数 == 逐条 ``outcome_bucket`` 统计（冲突组合在内）。"""
+        rows = [
+            # entry unproven（ST 未知）+ exit blocked（跌停）→ unproven。
+            row("c1", entry_ev=ST.MarketEvidence(
+                session=SESSION, available_at=ST.session_close_at(SESSION),
+                price=10.2, reference_price=10.0, halted=False, name=None),
+                exit_ev=ST.MarketEvidence(
+                    session=NEXT_SESSION,
+                    available_at=ST.session_close_at(NEXT_SESSION),
+                    price=9.0, reference_price=10.0, halted=False, name="某某股份"),
+                exit_session=NEXT_SESSION),
+            # entry invalid（价格非法）+ exit blocked → invalid。
+            row("c2", entry_ev=ST.MarketEvidence(
+                session=SESSION, available_at=ST.session_close_at(SESSION),
+                price=-1.0, reference_price=10.0, halted=False, name="某某股份"),
+                exit_ev=ST.MarketEvidence(
+                    session=NEXT_SESSION,
+                    available_at=ST.session_close_at(NEXT_SESSION),
+                    price=9.0, reference_price=10.0, halted=False, name="某某股份"),
+                exit_session=NEXT_SESSION),
+            # entry ok + exit blocked → blocked_exit。
+            row("c3", entry_ev=evidence(),
+                exit_ev=ST.MarketEvidence(
+                    session=NEXT_SESSION,
+                    available_at=ST.session_close_at(NEXT_SESSION),
+                    price=9.0, reference_price=10.0, halted=False, name="某某股份"),
+                exit_session=NEXT_SESSION),
+            row("c4", entry_ev=evidence(), exit_ev=evidence(session=NEXT_SESSION),
+                exit_session=NEXT_SESSION),
+            row("c5", selected=False, entry_ev=evidence()),
+        ]
+        built = ST.build_executable_outcomes(rows)
+        counts = ST.outcome_bucket_counts(built["outcomes"])
+        for bucket in ST.OUTCOME_BUCKET_KEYS:
+            self.assertEqual(
+                built["report"][bucket], counts[bucket],
+                f"bucket {bucket}: report={built['report'][bucket]} vs "
+                f"outcome_bucket={counts[bucket]}",
+            )
+        self.assertEqual(1, counts[ST.OUTCOME_BUCKET_UNPROVEN])
+        self.assertEqual(1, counts[ST.OUTCOME_BUCKET_INVALID])
+        self.assertEqual(1, counts[ST.OUTCOME_BUCKET_BLOCKED_EXIT])
+        self.assertEqual(1, counts[ST.OUTCOME_BUCKET_EXECUTABLE])
+        self.assertEqual(1, counts[ST.OUTCOME_BUCKET_NOT_SELECTED])
+
+
+class ProductionSecurityStateWiringTest(unittest.TestCase):
+    """P1（round 3）：生产 ``main()`` 必须真的接线，而不是只有测试注入才有样本。"""
+
+    KLINES = ProductionEvaluatorWiringTest.KLINES
+
+    def _run_main(self, tmp, **kwargs):
+        """直接调用**真实** ``main()``，只把数据目录与归档路径换到临时目录。"""
+        import json as _json
+        import os as _os
+
+        import selection_alpha_report as AR
+
+        original_dir = AR.DATA_DIR
+        original_kline_dir = AR.KLINE_DIR
+        original_report = AR.REPORT_PATH
+        original_loader = AR.load_kline
+        original_listdir = AR.os.listdir
+        original_window = AR.WINDOW_DAYS
+        # 夹具用的是固定历史日期，必须把"最近 N 天"窗口放开，否则会被
+        # ``data_asof_date >= cutoff`` 全部滤掉，测试变成空跑。
+        AR.WINDOW_DAYS = 3650
+        AR.DATA_DIR = tmp
+        AR.KLINE_DIR = _os.path.join(tmp, "klines")
+        AR.REPORT_PATH = _os.path.join(tmp, "reports", "alpha.md")
+        AR.load_kline = lambda code: dict(self.KLINES.get(code) or {})
+        # ``market_sessions()`` / ``benchmark_map()`` 都列举 KLINE_DIR；必须一起换，
+        # 否则报告会退回"真实 data_cache 不存在"的空路径。
+        AR.os.listdir = lambda path: (
+            [f"{code}.csv" for code in self.KLINES]
+            if str(path) == str(AR.KLINE_DIR) else original_listdir(path)
+        )
+        try:
+            from contextlib import redirect_stdout
+            import io
+
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                AR.main(**kwargs)
+            return _json.loads(buf.getvalue().strip().splitlines()[-1])
+        finally:
+            AR.DATA_DIR = original_dir
+            AR.KLINE_DIR = original_kline_dir
+            AR.REPORT_PATH = original_report
+            AR.load_kline = original_loader
+            AR.os.listdir = original_listdir
+            AR.WINDOW_DAYS = original_window
+
+    def _seed_tracking_db(self, tmp, rows):
+        import os as _os
+        import sqlite3 as sq
+
+        db = _os.path.join(tmp, "selection_tracking.db")
+        conn = sq.connect(db)
+        conn.execute(
+            "CREATE TABLE selection_runs(id INTEGER PRIMARY KEY, strategy TEXT,"
+            " data_asof_date TEXT)"
+        )
+        conn.execute(
+            "CREATE TABLE selection_picks(run_id INTEGER, code TEXT, rank_no INTEGER,"
+            " name TEXT)"
+        )
+        for index, (strategy, day, code, name) in enumerate(rows, start=1):
+            conn.execute(
+                "INSERT INTO selection_runs VALUES(?,?,?)", (index, strategy, day)
+            )
+            conn.execute(
+                "INSERT INTO selection_picks VALUES(?,?,?,?)", (index, code, 1, name)
+            )
+        conn.commit()
+        conn.close()
+
+    def _write_archive(self, tmp, rows):
+        import json as _json
+        import os as _os
+
+        path = _os.path.join(tmp, "security_state_history.json")
+        with open(path, "w", encoding="utf-8") as handle:
+            _json.dump(
+                {
+                    "kind": "historical_archive",
+                    "historical_membership_complete": True,
+                    "archive_source": "unit-test archive",
+                    "availability_basis": "session_close",
+                    "rows": rows,
+                },
+                handle,
+                ensure_ascii=False,
+            )
+        return path
+
+    def test_real_main_produces_executable_samples_with_an_archive(self):
+        """真实 ``main()`` + 历史归档 → 生产路径真的产出 executable 样本。"""
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            self._seed_tracking_db(
+                tmp, [("s1", "2024-06-14", "600001", "某某股份")]
+            )
+            archive = self._write_archive(tmp, [
+                {"code": "600001", "effective_from": "2024-06-14",
+                 "effective_to": "2024-06-30", "name": "某某股份", "risk_flag": False},
+            ])
+            payload = self._run_main(tmp, archive_path=archive)
+        self.assertTrue(payload["executable_coverage_available"])
+        self.assertEqual(SS.SOURCE_OK, payload["security_state_source"]["status"])
+        exec_summaries = [
+            s for s in payload["summaries"] if s["view"] == "executable"
+        ]
+        self.assertTrue(exec_summaries, payload["summaries"])
+        # 不是只有 unit test 注入 provider 时才有 executable sample：
+        # 这条走的是 main() 自己加载归档的路径。
+        self.assertTrue(
+            any(s["entry_counts"]["executable"] >= 1 for s in exec_summaries),
+            exec_summaries,
+        )
+        self.assertTrue(any(s["n"] >= 1 for s in exec_summaries), exec_summaries)
+
+    def test_real_main_degrades_honestly_without_an_archive(self):
+        """没有历史归档 → 明确区分 market 可用 / executable 不可用，不假装有指标。"""
+        import os as _os
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            self._seed_tracking_db(
+                tmp, [("s1", "2024-06-14", "600001", "某某股份")]
+            )
+            payload = self._run_main(
+                tmp, archive_path=_os.path.join(tmp, "does-not-exist.json")
+            )
+        self.assertFalse(payload["executable_coverage_available"])
+        self.assertEqual(
+            SS.SOURCE_MISSING, payload["security_state_source"]["status"])
+        market = [s for s in payload["summaries"] if s["view"] == "market_counterfactual"]
+        executable = [s for s in payload["summaries"] if s["view"] == "executable"]
+        self.assertTrue(market and executable)
+        # market 视图仍有指标（基于已验证标签）。
+        self.assertTrue(any(s["n"] >= 1 for s in market), market)
+        # executable 视图诚实降级：样本全部 unproven，且没有 executable 基准。
+        self.assertTrue(
+            all(s["entry_counts"]["executable"] == 0 for s in executable), executable
+        )
+        # 有已验证样本的 executable 视图必须诚实记为 unproven（不是 executable）。
+        scored = [s for s in executable if s["label_status_counts"]["verified"]]
+        self.assertTrue(scored, executable)
+        self.assertTrue(
+            all(s["entry_counts"]["unproven"] >= 1 for s in scored), scored
+        )
+        self.assertTrue(
+            all(s["executable_benchmark_available"] is False for s in executable),
+            executable,
+        )
+        self.assertTrue(all(s["executable_excess"] is None for s in executable))
+        # 可执行基准不可得时，绝不用未过滤的 market 基准冒充。
+        self.assertTrue(all(s["mean_excess"] is None for s in executable), executable)
+
+    def test_main_never_uses_a_current_snapshot_as_history(self):
+        """归档 kind 不是 historical_archive → 一律降级（当前快照无权充当历史）。"""
+        import os as _os
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            self._seed_tracking_db(
+                tmp, [("s1", "2024-06-14", "600001", "某某股份")]
+            )
+            path = _os.path.join(tmp, "security_state_history.json")
+            with open(path, "w", encoding="utf-8") as handle:
+                import json as _json
+
+                _json.dump({
+                    "kind": "current_snapshot",
+                    "rows": [{"code": "600001", "effective_from": "2024-06-14",
+                              "name": "某某股份", "risk_flag": False}],
+                }, handle, ensure_ascii=False)
+            payload = self._run_main(tmp, archive_path=path)
+        self.assertFalse(payload["executable_coverage_available"])
+        self.assertEqual(
+            SS.SOURCE_NOT_HISTORICAL, payload["security_state_source"]["status"])
+
+
+class ExecutableBenchmarkSeparationTest(unittest.TestCase):
+    """P2（round 3）第 2 项：executable 收益不得与未过滤 benchmark 相减。"""
+
+    KLINES = ProductionEvaluatorWiringTest.KLINES
+
+    def _evaluate(self, picks, *, security_state_fn=None):
+        with _FakeKlineReport(self.KLINES) as AR:
+            sessions = SL.normalize_sessions(
+                sorted({day for bars in self.KLINES.values() for day in bars})
+            )
+            return AR.evaluate(
+                picks, 1, "选股质量", sessions, asof="2024-06-30",
+                security_state_fn=security_state_fn,
+            )
+
+    @staticmethod
+    def _non_st(code, session):
+        return {"name": "某某股份", "risk_flag": False}
+
+    def test_production_report_buckets_match_the_contract(self):
+        """冲突状态（entry unproven + exit blocked）在**生产报告**里也是 unproven。
+
+        report 层若自行按"先看 exit blocked"分类，这里会得到 ``blocked_exit``。
+        """
+        # entry 06-17 +5%（买入不拦）；exit 06-18 -10%（卖出跌停 → exit blocked）。
+        klines = {
+            "600001": {
+                "2024-06-14": (10.0, 10.0),
+                "2024-06-17": (10.0, 10.5),
+                "2024-06-18": (10.5, 9.45),
+                "2024-06-19": (9.4, 9.5),
+            },
+        }
+        picks = [("s1", "2024-06-14", "600001", None)]
+
+        def provider(code, session):
+            if session == "2024-06-17":
+                # entry 时点没有历史状态 → ST 未知 → entry unproven。
+                return None
+            return {"name": "某某股份", "risk_flag": False}
+
+        with _FakeKlineReport(klines) as AR:
+            sessions = SL.normalize_sessions(
+                sorted({day for bars in klines.values() for day in bars})
+            )
+            _, summary = AR.evaluate(
+                picks, 1, "选股质量", sessions, asof="2024-06-30",
+                security_state_fn=provider,
+            )
+        self.assertEqual(1, summary["entry_counts"]["unproven"])
+        self.assertEqual(0, summary["entry_counts"]["blocked_exit"])
+        # production 的桶必须与 contract 的权威分类逐键一致。
+        self.assertEqual(
+            {bucket: summary["entry_counts"][bucket] for bucket in ST.OUTCOME_BUCKETS},
+            summary["outcome_buckets"],
+        )
+
+    def test_executable_excess_is_unavailable_without_an_executable_benchmark(self):
+        """没有同口径 PIT 状态源 → executable_excess 是 None，而不是 market 值。"""
+        picks = [("s1", "2024-06-14", "600001", "某某股份")]
+        _, summary = self._evaluate(picks)
+        self.assertFalse(summary["executable_benchmark_available"])
+        self.assertIsNone(summary["executable_excess"])
+        self.assertIsNone(summary["mean_excess"])
+
+    def test_executable_excess_uses_the_executable_population(self):
+        """同口径可得时，两个 excess 是**两个独立**的数字（population 不同）。"""
+        picks = [
+            ("s1", "2024-06-14", "600001", "某某股份"),
+            ("s1", "2024-06-14", "600002", "某某股份"),
+        ]
+        lines, summary = self._evaluate(
+            picks, security_state_fn=self._non_st)
+        self.assertTrue(summary["executable_benchmark_available"])
+        self.assertIsNotNone(summary["executable_excess"])
+        self.assertIsNotNone(summary["mean_excess"])
+        # 两个指标必须是分开的字段，且表头同时出现，不能共用一个"超额"。
+        joined = "\n".join(lines)
+        self.assertIn("market_counterfactual_excess", joined)
+        self.assertIn("executable_excess", joined)
+
+    def test_benchmark_blocked_sample_is_not_counted_as_executable_baseline(self):
+        """benchmark 里买不进的样本（涨停）不得进可执行基准 population。"""
+        # 只放一只票作为基准样本：entry 恰好 +10%（主板涨停 → 买不进）。
+        klines = {
+            "600002": {
+                "2024-06-14": (10.0, 10.0),
+                "2024-06-17": (10.0, 11.0),
+                "2024-06-18": (11.0, 11.5),
+                "2024-06-19": (11.5, 11.6),
+            },
+        }
+        with _FakeKlineReport(klines) as AR:
+            sessions = SL.normalize_sessions(
+                sorted({day for bars in klines.values() for day in bars})
+            )
+            benches = AR.benchmark_map(
+                {"2024-06-14"}, 1, sessions, asof="2024-06-30",
+                security_state_fn=self._non_st,
+            )
+        # market 口径：verified 标签在 → 有值。
+        self.assertIn("2024-06-14", benches["market"])
+        # 可执行口径：这条被涨停拦下 → 该日**没有**可执行基准样本。
+        self.assertNotIn("2024-06-14", benches["executable"])
+
+    def test_benchmark_executable_key_absent_without_a_state_source(self):
+        """没有状态源 → ``executable`` 键整体为 None（不可得），不是空 dict 冒充。"""
+        with _FakeKlineReport(self.KLINES) as AR:
+            sessions = SL.normalize_sessions(
+                sorted({day for bars in self.KLINES.values() for day in bars})
+            )
+            benches = AR.benchmark_map(
+                {"2024-06-14"}, 1, sessions, asof="2024-06-30",
+                security_state_fn=None,
+            )
+        self.assertIsNone(benches["executable"])
+
+
+class SecurityStateArchiveTest(unittest.TestCase):
+    """P1（round 3）：归档源的 PIT 语义。"""
+
+    PAYLOAD = {
+        "kind": "historical_archive",
+        "historical_membership_complete": True,
+        "archive_source": "unit-test",
+        "availability_basis": "session_close",
+        "rows": [
+            {"code": "600001", "effective_from": "2024-06-14",
+             "effective_to": "2024-06-30", "name": "某某股份", "risk_flag": False},
+            {"code": "600002", "effective_from": "2024-06-14",
+             "effective_to": "2024-06-17", "name": "某某股份", "risk_flag": False},
+            {"code": "600002", "effective_from": "2024-06-18",
+             "effective_to": "2024-06-30", "name": "某某股份ST", "risk_flag": True},
+        ],
+    }
+
+    def _archive(self):
+        archive = SS.SecurityStateArchive.from_payload(self.PAYLOAD)
+        self.assertIsNotNone(archive)
+        return archive
+
+    def test_state_is_scoped_to_its_effective_window(self):
+        archive = self._archive()
+        self.assertEqual("某某股份", archive.state_at("600001", "2024-06-18")["name"])
+        # 窗口之外 → 未知（None），绝不沿用旧值。
+        self.assertIsNone(archive.state_at("600001", "2024-07-01"))
+
+    def test_st_change_is_reported_at_the_right_session(self):
+        archive = self._archive()
+        before = archive.state_at("600002", "2024-06-17")
+        after = archive.state_at("600002", "2024-06-18")
+        self.assertEqual("某某股份", before["name"])
+        self.assertTrue(after["risk_flag"])
+
+    def test_archive_state_is_visible_at_its_own_session_close(self):
+        archive = self._archive()
+        state = archive.state_at("600001", "2024-06-18")
+        self.assertTrue(
+            ST.is_visible_at(state["available_at"], ST.session_close_at("2024-06-18"))
+        )
+
+    def test_provider_never_falls_back_to_a_decision_day_name(self):
+        """provider 给不出状态 → ``(None, None)``，由 contract 判 unproven。"""
+        import selection_alpha_report as AR
+
+        provider = SS.make_state_provider(self._archive())
+        self.assertEqual((None, None), AR._action_security_state(
+            "600001", "2024-07-01", decision_day="2024-06-14",
+            decision_name="某某股份", security_state_fn=provider))
+
+    def test_future_only_state_cannot_prove_an_earlier_action(self):
+        """归档里一条 available_at 晚于动作时点的状态 → 不得用于更早的动作。"""
+        import selection_alpha_report as AR
+
+        payload = {
+            "kind": "historical_archive",
+            "historical_membership_complete": True,
+            "rows": [
+                {"code": "600001", "effective_from": "2024-06-14",
+                 "effective_to": "2024-06-30", "name": "某某股份",
+                 "risk_flag": False,
+                 "available_at": "2024-06-20T15:00:00+08:00"},
+            ],
+        }
+        provider = SS.make_state_provider(
+            SS.SecurityStateArchive.from_payload(payload))
+        self.assertEqual((None, None), AR._action_security_state(
+            "600001", "2024-06-14", decision_day="2024-06-14",
+            decision_name="某某股份", security_state_fn=provider))
+
+    def test_current_snapshot_is_not_a_historical_source(self):
+        self.assertEqual(
+            SS.SOURCE_NOT_HISTORICAL,
+            SS.archive_provenance({"kind": "current_snapshot", "rows": [{}]})["status"],
+        )
+
+    def test_incomplete_archive_is_refused(self):
+        self.assertEqual(
+            SS.SOURCE_INCOMPLETE,
+            SS.archive_provenance(
+                {"kind": "historical_archive", "rows": [{}]})["status"],
+        )
+
+    def test_resolve_without_an_archive_returns_none(self):
+        import os as _os
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            fn, provenance = SS.resolve_security_state_fn(
+                archive_path=_os.path.join(tmp, "nope.json"))
+        self.assertIsNone(fn)
+        self.assertEqual(SS.SOURCE_MISSING, provenance["status"])
 
 
 if __name__ == "__main__":
