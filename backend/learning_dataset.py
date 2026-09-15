@@ -63,6 +63,7 @@ from dataclasses import dataclass, field
 from typing import Any, Mapping, Optional, Sequence
 
 import financial_point_in_time as PIT
+import walk_forward_validation as WFV
 
 
 CONTRACT_VERSION = "learning-dataset-v1"
@@ -1269,13 +1270,27 @@ def chronological_split(
     )
     test_start = dates[boundaries["test"][0]] if boundaries["test"][0] < len(dates) else None
 
+    # purge 判据**只有一份**：``walk_forward_validation.train_eligible``。
+    # 它比较的是 ``label_available_at`` 这个**时点**（严格 <），而不是日期。
+    # 对 close-to-close 标签两者结果一致（标签在 exit 日 15:00 成熟，必然晚于
+    # 当日 00:00），但时点版本还能正确处理"可用时刻落在评估起点当天、却晚于
+    # 起点"的情形，并且缺 ``label_available_at`` 时 fail closed。
+    validation_start_at = (
+        WFV.session_start_at(validation_start) if validation_start else None
+    )
+    test_start_at = WFV.session_start_at(test_start) if test_start else None
+
     for sample in grouped["train"]:
-        if validation_start is not None and sample.label_end_date >= validation_start:
+        if validation_start_at is not None and not WFV.train_eligible(
+            sample, evaluation_start_at=validation_start_at
+        ):
             purge_counts["train"] += 1
             continue
         partitions["train"].append(sample.with_partition("train"))
     for sample in grouped["validation"]:
-        if test_start is not None and sample.label_end_date >= test_start:
+        if test_start_at is not None and not WFV.train_eligible(
+            sample, evaluation_start_at=test_start_at
+        ):
             purge_counts["validation"] += 1
             continue
         partitions["validation"].append(sample.with_partition("validation"))
