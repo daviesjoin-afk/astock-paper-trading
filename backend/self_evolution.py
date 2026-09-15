@@ -429,7 +429,19 @@ def record_reward_attribution(conn, tracking_id: int, reward_id: int, account_id
 
 
 def get_performance_metrics(conn, window: int = 20) -> dict:
-    """计算最近N次调参的性能指标。"""
+    """计算最近N次调参的性能指标。
+
+    状态语义（与 ``ai_review_service`` 的 dual 结果状态机一一对应）：
+
+    - ``success_rate`` = ``consensus`` + ``both_hold``（系统跑完且双方一致）
+    - ``hold_rate``    = 仅 ``both_hold``
+    - ``failure_rate`` = 仅 ``failed``（**调用之后**失败/超时/响应不可用）
+    - ``no_consensus_rate`` = 仅 ``no_consensus``
+
+    ``no_consensus``（两个 reviewer 都正常完成、只是语义未达成一致）**不计入**
+    success / hold / failure 任何一项 —— 那是系统正常工作，不是故障。
+    本函数只做统计，不改变任何阈值或自适应策略。
+    """
     rows = conn.execute(
         """SELECT status, applied, eval_score, consensus_confidence,
                   mimo_latency_ms, deepseek_latency_ms, market_regime, created_at
@@ -442,10 +454,17 @@ def get_performance_metrics(conn, window: int = 20) -> dict:
 
     total = len(rows)
     consensus_count = sum(1 for r in rows if r[0] == "consensus")
-    hold_count = sum(1 for r in rows if r[0] in ("both_hold", "consensus"))
+    # hold 只统计 both_hold：两端都**完整成功**且都明确 hold。
+    hold_count = sum(1 for r in rows if r[0] == "both_hold")
     propose_count = sum(1 for r in rows if r[0] == "consensus")
+    no_consensus_count = sum(1 for r in rows if r[0] == "no_consensus")
     applied_count = sum(1 for r in rows if r[1])
     failed_count = sum(1 for r in rows if r[0] == "failed")
+
+    # success = 系统跑完并达成一致（consensus）或双方一致 hold（both_hold）。
+    # no_consensus 表示"两个 reviewer 都正常完成，但语义层未达成一致"，它是
+    # 系统正常工作的证据，既不算 success、也不算 hold、更不算 failure。
+    success_count = consensus_count + hold_count
 
     # 评估统计
     evaluated = [(r[2], r[3]) for r in rows if r[2] is not None]
@@ -466,9 +485,17 @@ def get_performance_metrics(conn, window: int = 20) -> dict:
     return {
         "sample_count": total,
         "has_data": True,
+        "consensus_count": consensus_count,
+        "hold_count": hold_count,
+        "success_count": success_count,
+        "no_consensus_count": no_consensus_count,
+        "failed_count": failed_count,
+        "applied_count": applied_count,
         "consensus_rate": consensus_count / total,
         "propose_rate": propose_count / total,
-        "hold_rate": (hold_count - propose_count) / total if hold_count > propose_count else 0,
+        "success_rate": success_count / total,
+        "hold_rate": hold_count / total,
+        "no_consensus_rate": no_consensus_count / total,
         "applied_rate": applied_count / total,
         "failure_rate": failed_count / total,
         "avg_eval_score": avg_eval,

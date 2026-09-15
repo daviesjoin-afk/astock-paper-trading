@@ -20,6 +20,36 @@
       两个槽位都必须"已配置且启用"，各自独立调用，全部成功后过共识门禁。
       **dual 绝不降级成 single**：任一槽位缺失或失败都直接判未达成共识。
 
+结果状态机（dual，唯一权威定义）
+--------------------------------
+``status`` 必须由**运行事实**推出（reviewer 是否可用 + 归一化后的 decision +
+共识结果），**禁止**从 ``not merged`` 这类间接信号反推：
+
+==============  =========  ==================================================
+运行情况          status     含义
+==============  =========  ==================================================
+hold / hold      ``both_hold``    两个 reviewer 都成功完成审核 **且** 都明确 hold
+propose/propose  ``consensus``    两个 reviewer 都成功，且 proposals 达成共识
+                 且达成共识
+hold / propose   ``no_consensus`` 两个 reviewer 都成功，但语义未达成一致
+propose / hold   ``no_consensus`` 同上
+propose/propose  ``no_consensus`` 两个 reviewer 都成功，但 proposals 无法共识
+但无法共识
+任一 reviewer    ``failed``       **调用之后**失败/超时/HTTP 错误/响应不可用
+调用后失败                        （decision 非法，或 propose 却给出畸形/空提案）
+==============  =========  ==================================================
+
+核心不变式：``both_hold ≠ 没有 merged proposal``。``both_hold`` 要求两端都
+**完整成功**且 decision 都明确是 ``hold``；``merged`` 为空只说明"没有可应用的
+提案"，那是 ``no_consensus``。同理，reviewer 运行失败**不等于**意见不一致 ——
+前者是系统故障（``failed``），后者是系统正常工作但语义分歧（``no_consensus``）。
+
+安全性（结果状态机）
+--------------------
+``consensus`` 是唯一能穿过 apply 门禁的状态；``both_hold`` / ``no_consensus`` /
+``failed`` / ``single_review`` / ``single_review_failed`` 一律不可 apply
+（门禁在 ``evolution_apply.apply_tuner_proposals``，本模块不参与其判定）。
+
 安全边界（不可被 review_mode 绕过）
 ----------------------------------
 ``evolution_apply.apply_tuner_proposals`` 只接受 ``status == "consensus"`` 的运行。
@@ -36,11 +66,15 @@ reward_uniqueness → Shanghai_timezone）。
 ``review_mode`` / ``result_mode`` / ``config_snapshot`` / ``reviewers`` 四个通用列。
 ``config_snapshot`` 只记录执行时刻的 ``display_name`` / ``base_url`` / ``model`` /
 ``enabled``，**永不记录 API Key**。
+
+历史兼容字段 ``consensus_result`` 仍是二值列（``consensus`` / ``no_consensus``，
+single 模式为 ``single_review``），**不随本状态机改名**：权威字段是 ``status``。
 """
 from __future__ import annotations
 
 import json
 import os
+import re
 import sqlite3
 import time
 import urllib.parse
@@ -59,6 +93,19 @@ DEFAULT_DISPLAY_NAMES = {"ai1": "AI 1", "ai2": "AI 2"}
 # 结果模式（与外层 review_mode 区分：这是"实际怎么跑的"）
 MODE_SINGLE_REVIEW = "single_review"
 MODE_DUAL_REVIEW = "dual_review"
+
+# ─── dual 结果状态机（唯一权威取值，见模块 docstring）───
+OUTCOME_CONSENSUS = "consensus"
+OUTCOME_BOTH_HOLD = "both_hold"
+OUTCOME_NO_CONSENSUS = "no_consensus"
+OUTCOME_FAILED = "failed"
+DUAL_REVIEW_OUTCOMES = (
+    OUTCOME_CONSENSUS, OUTCOME_BOTH_HOLD, OUTCOME_NO_CONSENSUS, OUTCOME_FAILED,
+)
+
+#: reviewer 只有给出这两个 decision 才算"系统可理解的合法结论"。
+VALID_REVIEWER_DECISIONS = ("hold", "propose")
+
 
 AI_REVIEW_VERSION = "ai-review-v1"
 
@@ -1021,6 +1068,150 @@ def _empty_reviewer(slot, cfg, status, error=None):
     }
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# 结果分类（纯函数；dual 状态机的唯一实现）
+# ─────────────────────────────────────────────────────────────────────────────
+
+#: `reason` / reviewer.error 里绝不回显的敏感片段。reviewer 的异常文本可能来自
+#: HTTP 层，天然可能带上完整 URL（含查询串）或 Authorization 头，所以在**进入
+#: 审计行之前**统一脱敏，而不是只依赖调用方自觉。
+_ERROR_REDACTIONS = (
+    (re.compile(r"(?i)\b(bearer)\s+[A-Za-z0-9._\-]{4,}"), r"\1 <redacted>"),
+    (re.compile(r"(?i)\b(api[_-]?key|apikey|access[_-]?token|auth[_-]?token|authorization"
+                r"|token|secret|password)\b(\s*[:=]\s*)([^\s,;&\"')\]]+)"), r"\1\2<redacted>"),
+    (re.compile(r"(?i)([?&](?:api[_-]?key|key|token|access_token|auth)=)[^&\s]+"),
+     r"\1<redacted>"),
+    (re.compile(r"\bsk-[A-Za-z0-9._\-]{6,}"), "<redacted>"),
+)
+
+
+def sanitize_review_error(value, limit=200):
+    """把 reviewer 错误文本脱敏并截断；**永不抛出**。
+
+    脱敏对象：Bearer 凭据、``api_key=`` / ``token=`` 等键值、URL 查询串里的密钥、
+    ``sk-`` 前缀密钥。这是 `reason` 不得泄漏凭据这条约束的最后一道防线。
+    """
+    text = "" if value is None else str(value)
+    for pattern, replacement in _ERROR_REDACTIONS:
+        try:
+            text = pattern.sub(replacement, text)
+        except Exception:  # noqa: BLE001 - 脱敏失败也绝不能影响审核主流程
+            continue
+    return text[:limit]
+
+
+def normalize_reviewer_decision(value):
+    """归一化 reviewer 的 decision，返回 ``(decision, ok)``。
+
+    只有 ``hold`` / ``propose`` 是系统可理解的结论（大小写与首尾空白被容忍）。
+    缺失、``""``、``unknown``、``maybe`` 等一律 ``ok=False`` —— 它们既不是
+    "hold"也不是"propose"，因此**不能**被当作"双方成功但意见不一致"。
+    """
+    if not isinstance(value, str):
+        return None, False
+    decision = value.strip().lower()
+    if decision not in VALID_REVIEWER_DECISIONS:
+        return None, False
+    return decision, True
+
+
+def normalize_reviewer_proposals(decision, value):
+    """归一化并校验 reviewer 的 ``proposals``，返回 ``(proposals, ok)``。
+
+    这是 ``normalize_reviewer_decision`` 的姐妹校验，堵的是同一类
+    "协议失败伪装成语义分歧"的口子：
+
+    ``propose``
+        ``proposals`` **必须**是非空列表且每个元素是对象。这不是风格偏好：
+        ``_check_consensus`` 要把两侧提案逐账户比对方向与幅度，没有可比的提案
+        就根本无从谈共识。若这里把畸形值悄悄替换成 ``[]``，一次**协议失败**会在
+        ``_check_consensus`` 里被记成"至少一个AI未提出有效提案"，最终落成
+        ``no_consensus`` —— 与"双方都成功、只是真的谈不拢"无法区分，还会从
+        ``failure_rate`` 里蒸发。因此判为"该 reviewer 不可用"。
+    ``hold``
+        提案在语义上不适用（"保持现状"不含任何可执行补丁），**缺省或空列表是
+        合法的**；但一旦给了值，它仍须是列表（元素须是对象），否则同样是畸形响应。
+
+    无论哪种 decision，只要 ``proposals`` 以**非列表**的形状出现（字符串、对象、
+    数字…），都判为不可用 —— "静默替换成 ``[]``"正是被修复的 bug 类。
+    """
+    if value is None:
+        proposals = []
+    elif isinstance(value, list):
+        if any(not isinstance(item, dict) for item in value):
+            return None, False
+        proposals = list(value)
+    else:
+        return None, False
+    if decision == "propose" and not proposals:
+        return None, False
+    return proposals, True
+
+
+def reviewer_is_usable(reviewer):
+    """reviewer 是否"完整成功"：调用成功 **且** 给出了合法 decision。
+
+    两个条件缺一不可 —— 引入 decision 校验是本次修复的关键：过去响应里没有
+    ``decision`` 会被默认成 ``hold``，"成功但没给结论"于是被伪装成"双方 hold"。
+    """
+    if not isinstance(reviewer, dict):
+        return False
+    if reviewer.get("status") != "completed":
+        return False
+    return normalize_reviewer_decision(reviewer.get("decision"))[1]
+
+
+def classify_dual_review_outcome(reviewers, decisions, consensus, merged):
+    """纯函数：把 dual review 的运行事实映射成唯一的 ``status``。
+
+    输入（不读取任何外部状态，也不修改入参）：
+
+    ``reviewers``
+        ``{slot: reviewer}``，用来判定两端是否**完整成功**。
+    ``decisions``
+        ``[ai1_decision, ai2_decision]``，已归一化。
+    ``consensus`` / ``merged``
+        ``_check_consensus`` 的结果；``merged`` 非空才可能判 ``consensus``。
+
+    判定顺序即优先级：**任何一端不可用 ⇒ failed**（系统故障优先于语义分歧），
+    只有在两端都完整成功之后，才允许进入"两端都成功但意见不一致"的 no_consensus。
+    """
+    if not all(reviewer_is_usable((reviewers or {}).get(slot)) for slot in AI_SLOTS):
+        return OUTCOME_FAILED
+    normalized = list(decisions or [])
+    if normalized == ["hold", "hold"]:
+        return OUTCOME_BOTH_HOLD
+    if normalized == ["propose", "propose"] and consensus and merged:
+        return OUTCOME_CONSENSUS
+    return OUTCOME_NO_CONSENSUS
+
+
+def _reviewer_failure_reason(reviewers):
+    """失败原因：指明**哪个 slot**失败及安全的错误类别，绝不回显凭据与查询串。"""
+    parts = []
+    for slot in AI_SLOTS:
+        reviewer = (reviewers or {}).get(slot) or {}
+        if reviewer_is_usable(reviewer):
+            continue
+        status = reviewer.get("status")
+        if status == "failed":
+            detail = sanitize_review_error(reviewer.get("error")) or "unknown_error"
+            parts.append("%s reviewer failed: %s" % (slot, detail))
+        else:
+            parts.append("%s reviewer failed: unusable_status(%s)"
+                         % (slot, status or "missing"))
+    return "; ".join(parts) or "dual review 未完成"
+
+
+def _decision_disagreement_reason(decisions):
+    """决策分歧文案（人读用；程序逻辑只看 status/decision，不解析本字符串）。"""
+    pairs = " ".join(
+        "%s=%s" % (slot, decisions[i] if i < len(decisions) else None)
+        for i, slot in enumerate(AI_SLOTS)
+    )
+    return "双AI决策不一致: " + pairs
+
+
 def _call_reviewer(slot, cfg, system_prompt, user_prompt):
     """调用一个槽位并把结果整理成统一的 reviewer 结构；异常一律转成 failed。
 
@@ -1028,20 +1219,35 @@ def _call_reviewer(slot, cfg, system_prompt, user_prompt):
     try），任何逃逸的异常都会变成服务端 500 且**不写审计行**。因此"合法 JSON 但
     不是对象"（例如 ``[]``）也在函数内归一为结构化失败，而不是让 ``.get`` 抛
     AttributeError 逃出去。
+
+    ``decision`` 在这里被**归一化并校验**：缺失 / ``unknown`` / ``""`` / 其它非法值
+    都算"这个 reviewer 不可用"（转成结构化 failed），而不是被默认成 ``hold``。
+    这样"响应没说结论"就不会再伪装成"双方一致 hold"。校验集中在本边界，
+    不散落到 ``_run_dual_review`` 的各分支里。
+
+    ``proposals`` 同样在本边界校验（见 ``normalize_reviewer_proposals``）：
+    ``decision="propose"`` 却给出对象/字符串/空列表等畸形提案时，响应在协议层
+    不可用，一律转成结构化 failed。**绝不静默替换成 ``[]``** —— 那会把协议失败
+    伪装成"双方成功但提案谈不拢"（``no_consensus``），既与真正的语义分歧混淆，
+    也从 ``failure_rate`` 里蒸发。
     """
     try:
         parsed, in_tok, out_tok, latency = _call_slot(cfg, system_prompt, user_prompt)
         if not isinstance(parsed, dict):
             raise RuntimeError("%s_response_not_object" % slot)
-        proposals = parsed.get("proposals") or []
-        if not isinstance(proposals, list):
-            proposals = []
+        decision, decision_ok = normalize_reviewer_decision(parsed.get("decision"))
+        if not decision_ok:
+            raise RuntimeError("%s_unusable_decision" % slot)
+        proposals, proposals_ok = normalize_reviewer_proposals(
+            decision, parsed.get("proposals"))
+        if not proposals_ok:
+            raise RuntimeError("%s_unusable_proposals" % slot)
         return {
             "slot": slot,
             "display_name": cfg.get("display_name") or DEFAULT_DISPLAY_NAMES[slot],
             "model": cfg.get("model") or "",
             "status": "completed",
-            "decision": parsed.get("decision", "hold"),
+            "decision": decision,
             "confidence": parsed.get("confidence", 0),
             "market_regime": parsed.get("market_regime", "unclassified"),
             "summary": parsed.get("summary", ""),
@@ -1053,7 +1259,10 @@ def _call_reviewer(slot, cfg, system_prompt, user_prompt):
             "output_tokens": out_tok,
         }
     except Exception as exc:  # noqa: BLE001 - 上游必须拿到结构化失败而不是异常
-        return _empty_reviewer(slot, cfg, "failed", error="%s: %s" % (type(exc).__name__, str(exc)[:200]))
+        return _empty_reviewer(
+            slot, cfg, "failed",
+            error="%s: %s" % (type(exc).__name__, sanitize_review_error(exc)),
+        )
 
 
 def _evolution_bounds(connect_factory, accounts_map):
@@ -1127,6 +1336,10 @@ def _write_audit(connect_factory, trigger, mode, status, review_mode, result_mod
                 _json(right.get("proposals")) if right.get("status") == "completed" else None,
                 _json(right.get("proposals")) if right.get("proposals") else None,
                 right.get("latency_ms"), right.get("error"),
+                # consensus_result 是历史二值兼容列（旧消费者按它读），刻意**不**跟着
+                # 新状态机改名：consensus→consensus，其余（both_hold / no_consensus /
+                # failed / single_review）→ no_consensus，single 模式保持 single_review。
+                # 表达运行语义的权威字段是 status。
                 "consensus" if consensus else ("single_review" if result_mode == MODE_SINGLE_REVIEW else "no_consensus"),
                 str(reason or "")[:500],
                 _json(audit_merged) if audit_merged else None,
@@ -1318,40 +1531,38 @@ def _run_dual_review(context):
             try:
                 reviewers[slot] = future.result()
             except Exception as exc:  # noqa: BLE001
-                reviewers[slot] = _empty_reviewer(slot, slot_configs[slot], "failed", error=str(exc)[:200])
+                reviewers[slot] = _empty_reviewer(
+                    slot, slot_configs[slot], "failed",
+                    error=sanitize_review_error(str(exc)),
+                )
 
     left = reviewers["ai1"]
     right = reviewers["ai2"]
-    both_ok = left["status"] == "completed" and right["status"] == "completed"
+    decisions = [left.get("decision"), right.get("decision")]
+    # 只有两端都"完整成功"（状态 completed 且 decision 合法）才允许进入语义判断。
+    both_ok = all(reviewer_is_usable(reviewers[slot]) for slot in AI_SLOTS)
 
     consensus = False
-    reason = ""
     merged = []
-    if both_ok:
-        if left["decision"] == "hold" and right["decision"] == "hold":
-            reason = "双AI一致认为当前证据不足，保持现状"
-        elif left["decision"] == "propose" and right["decision"] == "propose":
-            evolution, evolution_by_account = _evolution_bounds(
-                context["connect_factory"], context["accounts_map"])
-            consensus, reason, merged = _check_consensus(
-                {"ai1": left["proposals"], "ai2": right["proposals"]},
-                context["accounts_map"], evolution=evolution,
-                evolution_by_account=evolution_by_account, labels=labels,
-            )
-        else:
-            reason = "决策分歧：%s=%s, %s=%s" % (
-                labels["ai1"], left["decision"], labels["ai2"], right["decision"])
+    if not both_ok:
+        # 运行失败 ≠ 意见不一致：这里一律是系统故障（failed）。
+        reason = _reviewer_failure_reason(reviewers)
+    elif decisions == ["hold", "hold"]:
+        reason = "两个 AI 均明确建议保持当前配置"
+    elif decisions == ["propose", "propose"]:
+        evolution, evolution_by_account = _evolution_bounds(
+            context["connect_factory"], context["accounts_map"])
+        consensus, reason, merged = _check_consensus(
+            {"ai1": left["proposals"], "ai2": right["proposals"]},
+            context["accounts_map"], evolution=evolution,
+            evolution_by_account=evolution_by_account, labels=labels,
+        )
     else:
-        errors = []
-        for slot in AI_SLOTS:
-            reviewer = reviewers[slot]
-            if reviewer["status"] == "failed":
-                errors.append("%s失败: %s" % (labels[slot], reviewer.get("error")))
-            elif reviewer["status"] != "completed":
-                errors.append("%s未完成(%s)" % (labels[slot], reviewer["status"]))
-        reason = "; ".join(errors) or "双AI调用未完成"
+        reason = _decision_disagreement_reason(decisions)
 
-    status = "consensus" if consensus else ("both_hold" if both_ok and not merged else "no_consensus")
+    status = classify_dual_review_outcome(reviewers, decisions, consensus, merged)
+    # 状态机保证：merged 非空只可能出现在 consensus 分支（_check_consensus 的
+    # 成功返回必然带非空合并且已由分类函数复核），因此这里无需再清洗一次。
     return _context_audit(
         context, MODE_DUAL_REVIEW, status, reviewers, consensus, reason,
         merged, merged, track_evolution=True,
