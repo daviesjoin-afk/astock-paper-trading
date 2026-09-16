@@ -21,26 +21,74 @@ NOW = "2026-09-08 10:00:00"
 LATE = "2026-09-08 15:00:00"
 
 
+def _order_row(**overrides):
+    """A filled buy order row as `paper_orders` would return it."""
+    row = {
+        "id": 7, "account_id": "tq_breakout", "signal_id": None, "side": "buy",
+        "code": "002241", "name": None, "qty": 100, "planned_price": 21.5,
+        "filled_price": 21.5, "amount": 2150.0, "fees": 2.15, "status": "filled",
+        "reason": "\u7a81\u7834\u4e70\u5165", "risk_payload": "{}", "realized_pnl": None,
+        "created_at": NOW, "executed_at": NOW, "order_type": "limit",
+        "origin": "strategy", "expires_at": None, "cancelled_at": None,
+        "strategy_id": None, "strategy_version": None, "strategy_checksum": None,
+        "retry_of_order_id": None,
+    }
+    row.update(overrides)
+    return row
+
+
+def _fill_row(**overrides):
+    """The matching `paper_fills` row: same qty as requested, so the verdict is verified."""
+    row = {
+        "id": 1, "order_id": 7, "account_id": "tq_breakout", "side": "buy",
+        "code": "002241", "qty": 100, "price": 21.5, "amount": 2150.0,
+        "fees": 2.15, "fill_date": "2026-09-08", "quote_at": NOW,
+        "assumption": "local snapshot",
+    }
+    row.update(overrides)
+    return row
+
+
 class _FakeResult:
-    def __init__(self, value):
+    def __init__(self, value=None, row=None, rows=None):
         self._value = value
+        self._row = row
+        self._rows = rows
 
     def fetchone(self):
+        if self._row is not None:
+            return self._row
         return (self._value,)
+
+    def fetchall(self):
+        return list(self._rows or ())
 
 
 class _FakeConn:
-    """Only records the signal-interest query this planner makes."""
+    """Records the queries this planner makes, including the verification read-back.
 
-    def __init__(self, interest=0, raises=False):
+    ``commit_fill`` stamps the execution-verification verdict after writing the
+    fill row, which means it reads the order back and lists its fill rows. The
+    double therefore answers three shapes: the signal-interest count, the
+    ``paper_orders`` row, and the ``paper_fills`` rows.
+    """
+
+    def __init__(self, interest=0, raises=False, order_row=None, fill_rows=()):
         self.interest = interest
         self.raises = raises
         self.queries = []
+        self.order_row = order_row
+        self.fill_rows = list(fill_rows)
 
     def execute(self, sql, params=()):
         self.queries.append((sql, tuple(params)))
         if self.raises:
             raise RuntimeError("db unavailable")
+        text = " ".join(str(sql).split()).lower()
+        if text.startswith("select * from paper_fills"):
+            return _FakeResult(rows=self.fill_rows)
+        if text.startswith("select * from paper_orders where id"):
+            return _FakeResult(row=self.order_row)
         return _FakeResult(self.interest)
 
 
@@ -246,7 +294,10 @@ class CommitFillTests(_StubbedPlannerTest):
             _audit=lambda *args, **kwargs: calls.append(("audit", args[2], args[3])),
             _sync_positions=lambda conn, account_id, day: calls.append(("sync",)),
         )
-        conn = _FakeConn()
+        conn = _FakeConn(
+            order_row=_order_row(),
+            fill_rows=[_fill_row()],
+        )
         plan = {
             "side": "buy", "code": "002241", "qty": 100, "amount": 2150.0,
             "fees": 2.15, "fill_price": 21.5, "quote_at": "2026-09-08T10:00:00",
@@ -292,7 +343,8 @@ class CommitFillTests(_StubbedPlannerTest):
         }
         with mock.patch.object(EP, "_pt", lambda: stub):
             EP.commit_fill(
-                _FakeConn(), account={"id": "tq_breakout"}, plan=plan, order_id=9,
+                _FakeConn(order_row=_order_row(id=9), fill_rows=[_fill_row(order_id=9)]),
+                account={"id": "tq_breakout"}, plan=plan, order_id=9,
                 asof_day=dt.date(2026, 9, 8), reserved=True,
                 risk_log_reason="手动模拟委托通过模型门禁并成交",
                 reason="手动模拟委托经模型复核后成交",
@@ -325,7 +377,8 @@ class CommitFillTests(_StubbedPlannerTest):
         }
         with mock.patch.object(EP, "_pt", lambda: stub):
             EP.commit_fill(
-                _FakeConn(), account={"id": "tq_breakout"}, plan=plan, order_id=11,
+                _FakeConn(order_row=_order_row(id=11), fill_rows=[_fill_row(order_id=11)]),
+                account={"id": "tq_breakout"}, plan=plan, order_id=11,
                 asof_day=dt.date(2026, 9, 8), reserved=False, action="strategy_buy",
             )
         self.assertEqual(1, [item[0] for item in calls].count("risk_log"))
@@ -365,7 +418,9 @@ class CommitFillTests(_StubbedPlannerTest):
                 "fees": 4.0, "fill_price": 20.0, "quote_at": None, "risk": {}}
         with mock.patch.object(EP, "_pt", lambda: stub):
             with self.assertRaises(RuntimeError):
-                EP.commit_fill(_FakeConn(), account={"id": "tq_breakout"}, plan=plan,
+                EP.commit_fill(
+                    _FakeConn(order_row=_order_row(), fill_rows=[_fill_row()]),
+                    account={"id": "tq_breakout"}, plan=plan,
                                order_id=11, asof_day=dt.date(2026, 9, 8), reserved=True)
 
 

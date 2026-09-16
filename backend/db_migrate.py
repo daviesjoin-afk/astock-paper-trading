@@ -60,6 +60,10 @@ MIGRATIONS = {
         # 幂等由 schema_version 保证；重复启动 migrated=0 且不产生重复 audit。
         (10, "迁移 legacy 选股动量 overlay 单位（2.0 -> 0.02）",
          selection_compat.migrate_legacy_selection_units),
+        # PR-150 wiring：执行验证闸门三列。历史行保持 NULL（= 未验证），
+        # 绝不因为 status='filled' 就自动升级为真实成交。
+        (11, "新增执行验证闸门字段（execution_status/verified/evidence_source）",
+         paper_schema.ensure_execution_verification_columns),
     ],
     "adaptive_learning": [
         (1, "创建 schema_version 表", """
