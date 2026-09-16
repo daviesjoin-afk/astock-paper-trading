@@ -346,7 +346,7 @@
 | 只读集成：从真实 `paper_orders` + `paper_fills` 读证据，且所选列必须存在于生产 DDL | `execution_evidence.load_execution_evidence` | `LoadExecutionEvidenceTests`（含 `test_selected_columns_exist_in_the_production_schema` 直接解析 `paper_trading.py` 的 DDL） | ✅ |
 | 新模块纯 stdlib、只读、不导入 `paper_trading`；不触碰 orders/fills 之外的表 | `execution_evidence` / `execution_lifecycle` | `test_execution_evidence.py`（`ArchitectureGuardTests`）、`test_execution_lifecycle.py`（`ArchitectureGuardTests`） | ✅ |
 | 状态机与证据层结论一致：无成交证据的 `filled` 行不能走到 `FILLED` | `execution_lifecycle` + `execution_evidence` | `test_execution_outcome.py`（`LifecycleBridgeTests`） | ✅ |
-| 真实源码变异 M51–M59 全部被测试捕获（9/9 caught，Undetected: 0）；哨兵 S0（仅改注释）必须 UNDETECTED 以证明矩阵非空转 | `execution_evidence` / `execution_lifecycle` / `execution_outcome` | `work/execution_reality_mutation_check.py`（逐项注入、每轮清字节码缓存、逐字节 + sha256 还原核验；含基线 green 前置检查） | ✅ |
+| 真实源码变异 M51–M60 全部被测试捕获（10/10 caught，Undetected: 0）；哨兵 S0（仅改注释）必须 UNDETECTED 以证明矩阵非空转 | `execution_evidence` / `execution_lifecycle` / `execution_outcome` | `work/execution_reality_mutation_check.py`（逐项注入、每轮清字节码缓存、逐字节 + sha256 还原核验；含基线 green 前置检查） | ✅ |
 
 变异明细：
 
@@ -361,5 +361,6 @@
 | M57 | equal partial fills treated as a clean round trip（等量部分成交被当成干净往返并算出已知收益） | CAUGHT |
 | M58 | mismatched fill rows still aggregated（身份不符的流水只上报、仍被聚合为成交证据） | CAUGHT |
 | M59 | fill identity columns not selected（loader 退回只按 `order_id` 关联，不读身份列） | CAUGHT |
+| M60 | identity check self-attested without identity rows（省略身份行也自称核对过） | CAUGHT |
 | S0 | 哨兵：只改注释 | UNDETECTED（预期） |
 

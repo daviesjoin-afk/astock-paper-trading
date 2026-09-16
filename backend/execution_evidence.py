@@ -590,7 +590,7 @@ def evidence_from_order(
     available_source: Optional[str] = None,
     source: str = "paper_orders+paper_fills",
     fill_identity_rows: Any = None,
-    fill_identity_known: bool = True,
+    fill_identity_known: Optional[bool] = None,
 ) -> ExecutionEvidence:
     """把一行 ``paper_orders``（+ 它的 ``paper_fills``）翻译成执行证据。
 
@@ -599,12 +599,18 @@ def evidence_from_order(
 
     ``fill_identity_rows`` 是同一批流水的身份列（``account_id`` / ``side`` /
     ``code``），用于核对"这条流水真的属于这笔委托"。**按 order_id 关联**的调用方
-    应当传入（见 :func:`load_execution_evidence`）；按构造期自带身份的调用方可以
-    不传，此时 ``fill_identity_known`` 必须显式给 ``False``：没有检查就不许声称
-    检查过（否则"未核对"会被读成"核对通过"）。
+    应当传入（见 :func:`load_execution_evidence`）。
+
+    ``fill_identity_known`` 默认由**证据本身**决定：传了身份行就是核对过，没传就是
+    没核对。这个默认值刻意做成"没有证据就不能自称核对过"——若它默认 ``True``，
+    调用方只要省略 ``fill_identity_rows`` 就能在 ``provenance`` 里留下
+    ``fill_identity_checked=True``，而实际**一项都没比对**，"未核对"被读成
+    "核对通过"，身份不符的流水照样能把委托验证成成交。
     """
     order = order if order is not None else {}
     aggregated = _aggregate_fills(fill_rows)
+    if fill_identity_known is None:
+        fill_identity_known = fill_identity_rows is not None
     identity_mismatches = _fill_identity_mismatches(
         order,
         fill_rows,

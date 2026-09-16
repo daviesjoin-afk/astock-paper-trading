@@ -544,6 +544,41 @@ class LoadExecutionEvidenceTests(unittest.TestCase):
         # 流水本身仍然是有效成交证据（未核对只影响"归属"，不影响"这笔流水是什么"）。
         self.assertTrue(evidence.proves_fill())
 
+    def test_omitting_the_identity_rows_does_not_claim_they_were_checked(self):
+        """没有身份证据就**不能**自称核对过。
+
+        默认 ``fill_identity_known`` 若为 ``True``，调用方只要省略
+        ``fill_identity_rows`` 就会留下 ``fill_identity_checked=True`` 而一项都没
+        比对：身份完全不符的流水照样把委托验证成成交。
+        """
+        mismatched = dict(fill(), account_id="acc-other", side="sell", code="600002")
+        evidence = EE.evidence_from_order(order(), [mismatched])
+        self.assertFalse(evidence.provenance["fill_identity_checked"])
+        self.assertEqual([], evidence.provenance["fill_identity_mismatches"])
+        self.assertNotIn(
+            EE.INCONSISTENCY_FILL_IDENTITY_MISMATCH, evidence.inconsistencies()
+        )
+
+    def test_passing_identity_rows_claims_the_check_was_made(self):
+        """传了身份行才算核对过；一致时不得报违规，不一致时必须报。"""
+        matching = dict(fill(), account_id="main_force_top10", side="buy", code="600001")
+        checked = EE.evidence_from_order(
+            order(), [matching], fill_identity_rows=[matching]
+        )
+        self.assertTrue(checked.provenance["fill_identity_checked"])
+        self.assertEqual([], checked.provenance["fill_identity_mismatches"])
+        self.assertTrue(checked.proves_fill())
+
+        mismatched = dict(fill(), account_id="acc-other", side="sell", code="600002")
+        caught = EE.evidence_from_order(
+            order(), [mismatched], fill_identity_rows=[mismatched]
+        )
+        self.assertTrue(caught.provenance["fill_identity_checked"])
+        self.assertFalse(caught.proves_fill())
+        self.assertIn(
+            EE.INCONSISTENCY_FILL_IDENTITY_MISMATCH, caught.inconsistencies()
+        )
+
     def test_a_fill_row_without_identity_columns_is_not_a_mismatch(self):
         """没有可比对的证据就不判违规。"""
         evidence = EE.evidence_from_order(order(), [fill()], fill_identity_known=True)
