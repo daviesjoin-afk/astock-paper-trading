@@ -78,6 +78,7 @@ __all__ = [
     "UNIVERSE_LIST_DATE_KEYS",
     "UNIVERSE_DELIST_DATE_KEYS",
     "china_tz",
+    "as_strict_bool",
     "parse_asof",
     "parse_available_at",
     "asof_is_strict",
@@ -249,6 +250,65 @@ def _is_missing(value: Any) -> bool:
     if isinstance(value, str):
         return value.strip().lower() in _MISSING_STRINGS
     return False
+
+
+#: 字符串真值表。**只**承认显式列出的写法：``"false"`` / ``"0"`` / ``"no"`` /
+#: ``"off"`` 等一律为 ``False``，绝不允许 ``bool("false") == True`` 这种把
+#: "未声明完整"读成"已声明完整"的错误。
+_TRUE_STRINGS = {"true", "1", "yes", "y", "on", "t"}
+_FALSE_STRINGS = {"false", "0", "no", "n", "off", "f"}
+
+
+def as_strict_bool(value: Any) -> Optional[bool]:
+    """把声明性标志严格归一成 ``True`` / ``False`` / ``None``。
+
+    ``None`` 表示**无法判定**（未声明、空值或未知写法），与显式 ``False``
+    区分开：调用方必须把"不知道"当成不满足，而不是默认通过。
+
+    * ``bool`` → 原值；
+    * ``int`` / ``float`` → **只认精确的 ``0`` 与 ``1``**：``0`` 为假、``1`` 为真，
+      其余数值（``2`` / ``-1`` / ``0.5`` / ``inf`` / ``NaN``）一律 ``None``；
+    * 字符串 → 只认 :data:`_TRUE_STRINGS` / :data:`_FALSE_STRINGS`（大小写与
+      首尾空白无关）；其余字符串 → ``None``；
+    * 其他类型 → ``None``。
+
+    为什么数值也必须是精确的 0/1：本函数归一的是**声明性**元数据（"这份归档
+    是否完整"、"该 session 是否风险警示"），不是计数或强度。``2`` / ``-1`` 这类
+    值说明生产者与消费者对字段语义的理解已经不一致，此时**任何**猜测都是在
+    替对方编造声明；``as_strict_bool`` 的职责是拒绝，而不是解释。曾经的行为
+    （"非零即真"）会让 ``historical_membership_complete: 2`` 或 ``-1`` 直接解锁
+    历史完整模式，把一份语义可疑的元数据当成可信证据。
+
+    **绝不**使用内置 ``bool(value)`` 做这层转换：``bool("false")`` 是 ``True``，
+    那会把一个显式否定的归档声明读成"完整"。
+    """
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, float):
+        # NaN / ±inf 没有"是 0 还是 1"的答案；非 0/1 的有限值同样无法判定。
+        if math.isnan(value) or math.isinf(value):
+            return None
+        if value == 0.0:
+            return False
+        if value == 1.0:
+            return True
+        return None
+    if isinstance(value, int):
+        if value == 0:
+            return False
+        if value == 1:
+            return True
+        return None
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in _TRUE_STRINGS:
+            return True
+        if text in _FALSE_STRINGS:
+            return False
+        return None
+    return None
 
 
 def _parse(value: Any) -> tuple[Optional[_dt.datetime], bool, str]:
@@ -721,12 +781,15 @@ def universe_source_provenance(source: Any, asof: Any = None) -> dict:
         return out
     out["historical_membership_asof"] = _iso(archive_moment)
 
-    complete_flag = False
+    complete_flag = None
     for key in UNIVERSE_SOURCE_COMPLETE_KEYS:
-        if data.get(key) is True:
-            complete_flag = True
-            break
-    if not complete_flag:
+        if key not in data:
+            continue
+        # 严格归一：``"false"`` / ``"0"`` 必须读成"未声明完整"，不能因为
+        # 非空字符串就让 ``bool(...)`` 变成 True。
+        complete_flag = as_strict_bool(data.get(key))
+        break
+    if complete_flag is not True:
         out["status"] = UNIVERSE_SOURCE_INCOMPLETE
         return out
     # 归档只覆盖到某日：它无法为更晚的决策时点证明成员资格。

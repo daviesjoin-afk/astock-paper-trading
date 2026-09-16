@@ -1007,7 +1007,12 @@ class FilledSignalDecisionDayTest(unittest.TestCase):
             finally:
                 AR.DATA_DIR = original
 
-        self.assertEqual([("filled:acc", "2024-06-17", "600001")], picks)
+        # 第 4 项是**决策当时**记录的名称（可成交性契约要用它判断历史 ST 状态）。
+        # 该测试表没有 name 列，因此这里是 None —— 缺名称不等于"非 ST"，
+        # 可成交性判定会 fail closed 成 unproven。
+        self.assertEqual([("filled:acc", "2024-06-17", "600001", None)], picks)
+        # 决策日仍然是 signal_date（不是 intended_date），这一点没变。
+        self.assertEqual("2024-06-17", picks[0][1])
 
         sessions = SL.normalize_sessions(self.KLINE)
         correct = AR.label_for("600001", picks[0][1], 2, sessions,

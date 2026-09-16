@@ -1156,6 +1156,51 @@ class ReplayWiringTests(PointInTimeBase):
         self.assertFalse(out["historical_membership_complete"])
         self.assertEqual(PIT.UNIVERSE_SOURCE_INCOMPLETE, out["status"])
 
+    def test_p18e_source_gate_normalizes_the_complete_flag_strictly(self):
+        """完整性标志必须**严格**归一：``"false"`` / ``"0"`` 绝不为完整。
+
+        ``bool("false") == True``，因此任何用内置 ``bool()`` 读这个标志的实现都会
+        把一份显式否定的归档当成完整历史源 —— 那正是"未声明完整却解锁历史模式"。
+        """
+        # 假值字符串：不得算完整。
+        for value in ("false", "0", "no", "off", "FALSE", 0, False):
+            out = PIT.universe_source_provenance(
+                {"kind": "historical_archive",
+                 "historical_membership_asof": "2026-12-31",
+                 "historical_membership_complete": value}, ASOF)
+            self.assertFalse(
+                out["historical_membership_complete"], f"value={value!r}")
+            self.assertEqual(
+                PIT.UNIVERSE_SOURCE_INCOMPLETE, out["status"], f"value={value!r}")
+        # 真值字符串：显式声明完整，应当被接受。
+        for value in ("true", "1", "yes", "on", True, 1):
+            out = PIT.universe_source_provenance(
+                {"kind": "historical_archive",
+                 "historical_membership_asof": "2026-12-31",
+                 "historical_membership_complete": value}, ASOF)
+            self.assertTrue(
+                out["historical_membership_complete"], f"value={value!r}")
+            self.assertEqual(PIT.UNIVERSE_SOURCE_OK, out["status"], f"value={value!r}")
+        # 未知写法：无法判定 → 不完整（fail closed）。
+        for value in ("maybe", "2", [], {}):
+            out = PIT.universe_source_provenance(
+                {"kind": "historical_archive",
+                 "historical_membership_asof": "2026-12-31",
+                 "historical_membership_complete": value}, ASOF)
+            self.assertFalse(
+                out["historical_membership_complete"], f"value={value!r}")
+            self.assertEqual(
+                PIT.UNIVERSE_SOURCE_INCOMPLETE, out["status"], f"value={value!r}")
+
+    def test_as_strict_bool_truth_table(self):
+        """``as_strict_bool`` 的真值表（供所有声明性标志复用）。"""
+        for value in (True, 1, 1.0, "true", "TRUE", "1", "yes", "Y", "on"):
+            self.assertIs(True, PIT.as_strict_bool(value), value)
+        for value in (False, 0, 0.0, "false", "FALSE", "0", "no", "N", "off"):
+            self.assertIs(False, PIT.as_strict_bool(value), value)
+        for value in (None, "", "maybe", "2", [], {}, float("nan")):
+            self.assertIsNone(PIT.as_strict_bool(value), value)
+
     def test_p18d_live_mode_is_never_gated_by_the_source_contract(self):
         rows = [{"code": "600001"}]
         out = PIT.historical_universe(rows, None, source=None)
