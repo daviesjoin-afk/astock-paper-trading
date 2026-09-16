@@ -71,6 +71,7 @@ import portfolio_coordinator as PCO
 import strategy_champion as SCM
 import strategy_clusters as SC
 import execution_profiles as EPF
+import execution_verification as EV
 import paper_sizing as PSZ
 import order_intent as OI
 import strategy_policies as SPOL
@@ -1345,13 +1346,31 @@ def _enforce_order_intent(conn, account, code, payload, *, signal_id=None):
     return intent, None
 
 
+def _execution_verified_predicate() -> str:
+    """执行验证闸门的**唯一** SQL 谓词（委托 :mod:`execution_verification`）。
+
+    读路径一律引用这个函数，不各写一份 ``execution_verified=1``：谓词同时要求
+    ``execution_verified=1`` 与 ``execution_status='verified'``，两列不一致的行
+    fail closed；历史 NULL 行被 ``COALESCE`` 取成 0 而排除。
+    """
+    return EV.VERIFIED_PREDICATE
+
+
 def _rebuild_realized_pnl(conn):
-    """按成交流水 FIFO 重放卖出成本，兼容升级前未含买入费用的历史记录。"""
+    """按成交流水 FIFO 重放卖出成本，兼容升级前未含买入费用的历史记录。
+
+    **执行验证闸门（PR-150）**：只重放 ``execution_verified`` 的行。没有成交流水
+    证据的旧行（``execution_status`` 为 NULL 或非 ``verified``）不参与已实现盈亏
+    重算 —— 那是"账本自称成交"，不是证据证明的成交。它们保留原账面值供审计，
+    绝不因为 ``status='filled'`` 就被当成真实成交收益。
+    """
     lots = {}
     rows = _rows(
         conn,
-        """SELECT id,account_id,code,side,qty,amount,filled_price,fees,status
-           FROM paper_orders WHERE status='filled' ORDER BY id""",
+        "SELECT id,account_id,code,side,qty,amount,filled_price,fees,status"
+        " FROM paper_orders WHERE status='filled' AND "
+        + _execution_verified_predicate()
+        + " ORDER BY id",
     )
     for order in rows:
         key = (order["account_id"], order["code"])
@@ -1754,6 +1773,7 @@ def init_db():
                 RSET.ensure_schema(conn)
                 SR.ensure_schema(conn)
                 PSM.ensure_strategy_reference_columns(conn)
+                PSM.ensure_execution_verification_columns(conn)
                 _ensure_accounts(conn)
                 _ensure_user_strategy_accounts(conn)
                 _ensure_cycle(conn)
@@ -1794,7 +1814,8 @@ def init_db():
                 order_type TEXT NOT NULL DEFAULT 'market',
                 origin TEXT NOT NULL DEFAULT 'strategy', expires_at TEXT, cancelled_at TEXT,
                 strategy_id TEXT, strategy_version INTEGER, strategy_checksum TEXT,
-                retry_of_order_id INTEGER
+                retry_of_order_id INTEGER,
+                execution_status TEXT, execution_verified INTEGER, execution_evidence_source TEXT
             );
             -- 归档表：列集与活跃表严格一致（清理函数用 SELECT * 归档），避免列错位。
             CREATE TABLE IF NOT EXISTS paper_orders_archive (
@@ -1803,7 +1824,8 @@ def init_db():
                 status TEXT, reason TEXT, risk_payload TEXT, realized_pnl REAL,
                 created_at TEXT, executed_at TEXT, order_type TEXT, origin TEXT,
                 expires_at TEXT, cancelled_at TEXT, strategy_id TEXT,
-                strategy_version INTEGER, strategy_checksum TEXT, retry_of_order_id INTEGER
+                strategy_version INTEGER, strategy_checksum TEXT, retry_of_order_id INTEGER,
+                execution_status TEXT, execution_verified INTEGER, execution_evidence_source TEXT
             );
             CREATE TABLE IF NOT EXISTS paper_signals_archive (
                 id INTEGER, account_id TEXT, signal_date TEXT, intended_date TEXT, code TEXT, name TEXT,
@@ -1988,6 +2010,7 @@ def init_db():
         )
         RSET.ensure_schema(conn)
         PSM.ensure_paper_columns(conn)
+        PSM.ensure_execution_verification_columns(conn)
         # 升级前的 lot 只记录成交价。来源订单存在时，将已实际扣除的买入费用
         # 分摊到每股成本；无来源的历史兼容 lot 不臆造费用，保留原始成本。
         conn.execute(
@@ -2993,7 +3016,9 @@ def _position_rows(conn, account_id=None, asof_day=None, readonly=False):
             """SELECT account_id,code,
                       SUM(CASE WHEN side='buy' THEN COALESCE(amount,0)+COALESCE(fees,0) ELSE 0 END) AS buy_cash,
                       SUM(CASE WHEN side='sell' THEN COALESCE(amount,0)-COALESCE(fees,0) ELSE 0 END) AS sell_cash
-                 FROM paper_orders WHERE status='filled' GROUP BY account_id,code""",
+                 FROM paper_orders WHERE status='filled' AND """
+            + _execution_verified_predicate()
+            + " GROUP BY account_id,code",
         )
     }
     return PP.aggregate_positions(
@@ -7555,6 +7580,7 @@ def _strategy_return_series(conn, account_ids, *, days=30):
                       COALESCE(SUM(COALESCE(realized_pnl,0)),0) AS pnl
                  FROM paper_orders
                 WHERE side='sell' AND status='filled' AND executed_at>=?
+                  AND {_execution_verified_predicate()}
                   AND account_id IN ({placeholders})
                 GROUP BY account_id, day ORDER BY day""",
             (since, *account_ids),

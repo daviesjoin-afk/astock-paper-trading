@@ -29,6 +29,7 @@ def dashboard(include_activity=False, include_history_symbols=False):
         _pending_position_slots, _position_rows, _recent_orders_with_archives, _rows,
         _schedule_cache, _shared_initial_cash, _shared_metrics, _strategy_pool_budget,
         _today_position_performance, dfc, schedule_status,
+        _execution_verified_predicate,
     )
 
     # Cache schedule_status to avoid repeated init_db() calls
@@ -49,7 +50,9 @@ def dashboard(include_activity=False, include_history_symbols=False):
             str(row["code"]) for row in conn.execute(
                 """SELECT DISTINCT code FROM paper_orders
                    WHERE side='sell' AND status='filled'
-                     AND substr(COALESCE(executed_at,created_at),1,10)=?""",
+                     AND substr(COALESCE(executed_at,created_at),1,10)=?
+                     AND """
+                + _execution_verified_predicate(),
                 (today,),
             ).fetchall()
         }
