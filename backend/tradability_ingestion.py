@@ -341,7 +341,9 @@ class SuspensionHistoryProvider(TradabilityFactProvider):
     半开区间 ``effective_from <= session < effective_to`` → 停牌中。区间之外**不**
     因为"今天查询不是停牌"就推广为"历史任何日期都没停牌"：只有归档显式声明
     ``complete``（完整覆盖该 code 的停牌史）时，落在所有区间之外的 session 才判
-    ``is_suspended=False``（已复牌）；否则 → ``unknown``。没有源 → ``unknown``。
+    ``is_suspended=False``（已复牌）——**包括该 code 在归档里完全没有记录**的情况：
+    完整归档里"没有记录"就是"没有停牌"。否则 → ``unknown``。来源不完整（
+    ``complete=False``）→ ``unknown``。
 
     "未停牌"这个**否定事实**同样需要可证明的观测时点：仅当 ``complete=True`` 且
     ``availability_basis="session_close"``（归档声明"状态在该 session 收盘时记下"）
@@ -375,9 +377,7 @@ class SuspensionHistoryProvider(TradabilityFactProvider):
             self._by_code.setdefault(code, []).append(dict(row))
 
     def fetch(self, code: str, session: str) -> ProviderResult:
-        rows = self._by_code.get(str(code))
-        if not rows:
-            return _result(self, OUTCOME_UNKNOWN)
+        rows = self._by_code.get(str(code)) or ()
         target = _text(session)
         for row in rows:
             start = _text(row.get("effective_from"))
@@ -395,7 +395,9 @@ class SuspensionHistoryProvider(TradabilityFactProvider):
                     observed_at=_text(row.get("available_at")),
                     effective_at=start,
                 )
-        # 落在所有区间之外：只有完整归档才敢判"已复牌"。
+        # 落在所有区间之外——**包括该 code 在归档里完全没有记录**。
+        # 声明完整的归档里"没有记录"就是"没有停牌"，与"区间不覆盖该 session"
+        # 是同一条否定事实，走同一路径；只有来源不完整时才退回 unknown。
         if self._complete:
             effective_at = PIT.bar_available_at(session)
             if self._session_close_basis and effective_at is not None:
@@ -842,6 +844,7 @@ class IngestionService:
         started_at = _now_utc()
 
         persisted: list = []
+        normalized_evidence: list = []
         conflicts: list = []
         unprovable: list = []
         raw_records = 0
@@ -908,6 +911,7 @@ class IngestionService:
                         skipped_records += 1
                         continue
                     normalized_records += 1
+                    normalized_evidence.append(evidence)
                     inserted = self._repo.save(evidence)
                     if inserted:
                         persisted.append(evidence)
@@ -925,7 +929,7 @@ class IngestionService:
         status = self._run_status(error_records, unknown_records, conflicts, unprovable)
         coverage = self._build_coverage(per_session, sessions, codes, source_counts)
         run_fingerprint = self._run_fingerprint(
-            run_id, codes, sessions, self._cutoff, persisted
+            run_id, codes, sessions, self._cutoff, normalized_evidence
         )
 
         self._persist_run(
@@ -1055,9 +1059,10 @@ class IngestionService:
                     "coverage_ratio",
                 )
             }
-        # 分母口径：requested-code coverage（调用方传入的 code list）。
+        # 分母口径：requested code-session pairs（调用方传入的 code × session 全笛卡尔积）。
         # 绝不宣称 whole_market_coverage，除非历史 universe 本身也是 PIT 可证明。
         total_requested = len(codes)
+        requested_pairs = total_requested * len(sessions)
         total_present = sum(s["evidence_present"] for s in summary.values())
         total_fully = sum(s["fully_proven"] for s in summary.values())
         total_conflicts = sum(s["conflicts"] for s in summary.values())
@@ -1072,14 +1077,15 @@ class IngestionService:
             "scope": "requested_code_coverage",
             "requested_symbols": total_requested,
             "requested_sessions": len(sessions),
+            "requested_pairs": requested_pairs,
             "evidence_present": total_present,
             "fully_proven": total_fully,
             "unknown_fields": total_unknown,
             "conflicts": total_conflicts,
             "unprovable_observed_at": total_unprovable,
             "source_counts": dict(source_counts),
-            "coverage_ratio": round(total_present / total_requested * 100, 1)
-            if total_requested
+            "coverage_ratio": round(total_present / requested_pairs * 100, 1)
+            if requested_pairs
             else 0.0,
             "sessions": summary,
         }
@@ -1096,17 +1102,22 @@ class IngestionService:
     @staticmethod
     def _run_fingerprint(
         run_id: str, codes: Sequence[str], sessions: Sequence[str], cutoff: str,
-        persisted: Sequence[TA.TradabilityEvidence],
+        normalized: Sequence[TA.TradabilityEvidence],
     ) -> str:
         """同一 source payload + provider versions + requested scope + PIT timestamps
-        应产生稳定指纹；数据变化时指纹必须变化。"""
+        应产生稳定指纹；数据变化时指纹必须变化。
+
+        输入是**规范化后的证据**而非本次新插入的 persisted 行：幂等重放时第二次
+        ``ingest`` 不会产生任何新插入（唯一键命中），若用 persisted 作输入，同一份
+        输入的指纹会在第一次与第二次 replay 之间漂移，破坏 idempotent replay 的语义。
+        """
         payload = {
             "version": FINGERPRINT_VERSION,
             "run_id": run_id,
             "codes": sorted(codes),
             "sessions": sorted(sessions),
             "cutoff": cutoff,
-            "evidence_fingerprints": sorted(TA.evidence_fingerprint(e) for e in persisted),
+            "evidence_fingerprints": sorted(TA.evidence_fingerprint(e) for e in normalized),
         }
         return _sha256(payload)
 

@@ -132,6 +132,31 @@ def _resolve_codes(args) -> list:
     return sorted(listing.keys())
 
 
+def run_backfill(conn, providers, codes, sessions, *, write=True, run_id=None):
+    """核心回填：建 service、ingest、commit/rollback。
+
+    * ``write=True``（生产回填）：显式注入 ``audit_conn``（修复 run audit 永远为空），
+      成功路径 ``commit()``，失败路径 ``rollback()``——否则 CLI 报告 ``persisted>0``
+      但数据库为空（SQLite 关闭连接时回滚未提交事务，``repository.save`` 只是
+      execute，不会自行 commit）。
+    * ``write=False``（dry-run）：不传 ``audit_conn``，只测量不落任何东西——
+      archive 与 ``tradability_ingestion_runs`` 都保持空。
+    """
+    repo = TA.TradabilityArchiveRepository(conn)
+    # dry-run 不写 audit：IngestionService 的 audit_conn 缺省即"只测量不落 run"。
+    audit_conn = conn if write else None
+    service = TI.IngestionService(providers, repo, audit_conn=audit_conn)
+    run_id = run_id or uuid.uuid4().hex
+    try:
+        result = service.ingest(codes, sessions, write=write, run_id=run_id)
+    except Exception:
+        conn.rollback()
+        raise
+    else:
+        conn.commit()
+    return result
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description="Historical Tradability Archive 回填")
     parser.add_argument("--session", help="单个 session（YYYY-MM-DD）")
@@ -165,15 +190,14 @@ def main(argv=None) -> int:
     try:
         TA.ensure_schema(conn)
         TI.ensure_ingestion_schema(conn)
-        repo = TA.TradabilityArchiveRepository(conn)
         providers = _default_providers()
-        service = TI.IngestionService(providers, repo)
-        run_id = args.run_id or uuid.uuid4().hex
-        result = service.ingest(
+        result = run_backfill(
+            conn,
+            providers,
             codes,
             sessions,
             write=bool(args.write and not args.dry_run),
-            run_id=run_id,
+            run_id=args.run_id,
         )
     finally:
         conn.close()

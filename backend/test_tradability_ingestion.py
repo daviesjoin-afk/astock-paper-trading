@@ -15,12 +15,20 @@ import ast
 import os
 import sqlite3
 import sys
+import tempfile
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import tradability_archive as TA  # noqa: E402
 import tradability_ingestion as TI  # noqa: E402
+
+_WORK_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "work")
+if _WORK_DIR not in sys.path:
+    sys.path.insert(0, _WORK_DIR)
+
+import backfill_tradability_archive as BF  # noqa: E402
 
 
 def open_db():
@@ -756,6 +764,146 @@ class ProvidersNeverWriteTheArchive(IngestionTestCase):
         tree = ast.parse(source)
         cls = next(n for n in ast.walk(tree) if isinstance(n, ast.ClassDef))
         self.assertTrue(_writes_archive(cls))
+
+
+# ───────────────────────────── 23. Backfill commit / rollback（fix #1/#2） ─────────────────
+
+
+class BackfillCommit(IngestionTestCase):
+    def _providers(self):
+        return [
+            TI.ListingStatusProvider(
+                {"000001": {"listing_date": "2010-01-01"}},
+                observed_kind=TI.OBSERVED_SNAPSHOT_TIMESTAMP,
+                observed_at="2025-01-01T09:00:00+08:00",
+            )
+        ]
+
+    def _file_db(self):
+        fd, path = tempfile.mkstemp(suffix=".sqlite3")
+        os.close(fd)
+        self.addCleanup(lambda: os.path.exists(path) and os.unlink(path))
+        return path
+
+    def test_dry_run_writes_nothing(self):
+        result = BF.run_backfill(
+            self.conn, self._providers(), ["000001"], ["2024-01-10"],
+            write=False, run_id="dry-run",
+        )
+        del result
+        self.assertEqual(0, self.repo.count("000001"))
+        row = self.conn.execute(
+            "SELECT * FROM tradability_ingestion_runs WHERE run_id=?", ("dry-run",)
+        ).fetchone()
+        self.assertIsNone(row)
+
+    def test_write_persists_after_reopen(self):
+        path = self._file_db()
+        conn = sqlite3.connect(path)
+        try:
+            TA.ensure_schema(conn)
+            TI.ensure_ingestion_schema(conn)
+            BF.run_backfill(
+                conn, self._providers(), ["000001"], ["2024-01-10"],
+                write=True, run_id="write-run",
+            )
+        finally:
+            conn.close()
+        # 重新打开数据库：commit 生效，记录仍在。
+        conn2 = sqlite3.connect(path)
+        conn2.row_factory = sqlite3.Row
+        try:
+            repo2 = TA.TradabilityArchiveRepository(conn2)
+            self.assertGreater(repo2.count("000001"), 0)
+            row = conn2.execute(
+                "SELECT * FROM tradability_ingestion_runs WHERE run_id=?", ("write-run",)
+            ).fetchone()
+            self.assertIsNotNone(row)
+            data = dict(row)
+            # fix #2：生产 backfill 显式注入 audit_conn，run audit 字段齐全。
+            self.assertEqual("write-run", data["run_id"])
+            self.assertIsNotNone(data["provider_set"])
+            self.assertIsNotNone(data["status"])
+            self.assertIsNotNone(data["run_fingerprint"])
+            self.assertGreaterEqual(data["persisted_records"], 1)
+        finally:
+            conn2.close()
+
+    def test_failure_rolls_back(self):
+        with mock.patch.object(TI.IngestionService, "ingest", side_effect=RuntimeError("boom")):
+            with self.assertRaises(RuntimeError):
+                BF.run_backfill(
+                    self.conn, self._providers(), ["000001"], ["2024-01-10"],
+                    write=True, run_id="fail-run",
+                )
+        # rollback 后：archive 空、audit 无残留，绝不出现 persisted>0 但库为空。
+        self.assertEqual(0, self.repo.count("000001"))
+        self.assertIsNone(
+            self.conn.execute(
+                "SELECT * FROM tradability_ingestion_runs WHERE run_id=?", ("fail-run",)
+            ).fetchone()
+        )
+
+
+# ───────────────────────────── 24. Fingerprint replay 稳定性（fix #5） ─────────────────
+
+
+class FingerprintReplayStability(IngestionTestCase):
+    def test_replay_same_fingerprint_and_archive_count(self):
+        provider = TI.ListingStatusProvider(
+            {"000001": {"listing_date": "2010-01-01"}},
+            observed_kind=TI.OBSERVED_SNAPSHOT_TIMESTAMP,
+            observed_at="2025-01-01T09:00:00+08:00",
+        )
+        service = self.make_service([provider])
+        r1 = service.ingest(["000001"], ["2024-01-10"], write=True, run_id="stable-run")
+        count1 = self.repo.count("000001")
+        r2 = service.ingest(["000001"], ["2024-01-10"], write=True, run_id="stable-run")
+        count2 = self.repo.count("000001")
+        # 同一输入：第一次与第二次 replay 的指纹必须一致，archive 不增长。
+        self.assertEqual(count1, count2)
+        self.assertEqual(1, count1)
+        self.assertEqual(r1.run_fingerprint, r2.run_fingerprint)
+
+
+# ───────────────────────────── 25. Coverage denominator（fix #3） ─────────────────
+
+
+class CoverageDenominatorPairs(IngestionTestCase):
+    def test_multi_session_denominator_is_code_session_pairs(self):
+        provider = TI.ListingStatusProvider(
+            {"000001": {"listing_date": "2010-01-01"}},
+            observed_kind=TI.OBSERVED_SNAPSHOT_TIMESTAMP,
+            observed_at="2025-01-01T09:00:00+08:00",
+        )
+        result = self.make_service([provider]).ingest(
+            ["000001"], ["2024-01-10", "2024-01-11"], write=True
+        )
+        self.assertEqual(1, result.coverage["requested_symbols"])
+        self.assertEqual(2, result.coverage["requested_sessions"])
+        self.assertEqual(2, result.coverage["requested_pairs"])
+        # 两个 session 均有 evidence：2/2 = 100，绝不超过 100。
+        self.assertEqual(100.0, result.coverage["coverage_ratio"])
+
+
+# ───────────────────────────── 26. Complete suspension archive 语义（fix #4） ───────────
+
+
+class CompleteSuspensionArchive(IngestionTestCase):
+    def test_complete_no_intervals_is_not_suspended(self):
+        provider = TI.SuspensionHistoryProvider(
+            [], complete=True, availability_basis="session_close"
+        )
+        result = self.make_service([provider]).ingest(["000001"], ["2025-06-10"], write=True)
+        ev = self.repo.evidence_at("000001", "2025-06-10", "2025-06-11T09:00:00+08:00")
+        self.assertIsNotNone(ev)
+        self.assertFalse(ev.is_suspended)
+        self.assertEqual(0, result.coverage["sessions"]["2025-06-10"]["unknown_suspension"])
+
+    def test_incomplete_no_intervals_is_unknown(self):
+        provider = TI.SuspensionHistoryProvider([], complete=False)
+        result = self.make_service([provider]).ingest(["000001"], ["2025-06-10"], write=True)
+        self.assertEqual(1, result.coverage["sessions"]["2025-06-10"]["unknown_suspension"])
 
 
 if __name__ == "__main__":
