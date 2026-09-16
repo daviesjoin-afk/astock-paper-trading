@@ -479,5 +479,99 @@ class ExecutionAndLearningDoNotConsumeIngestion(unittest.TestCase):
         )
 
 
+# ───────────────────────── Docker runtime 边界护栏 ─────────────────────────
+#
+# docker-smoke 在镜像内（Dockerfile 只 COPY backend/frontend/deploy）跑
+# `unittest discover -s backend`。任何 backend test 依赖 work/ 下的模块都会让
+# 整个测试文件在镜像内 ImportError，把不依赖 work/ 的契约测试一并带走。
+# 这条护栏禁止 backend test 再次 `sys.path.append("../work")` + import
+# 操作员脚本；回填编排逻辑必须住在 backend/（见 tradability_backfill.py）。
+
+#: work/ 下不可被 backend test import 的模块名。
+WORK_ONLY_MODULES = ("backfill_tradability_archive",)
+
+
+def _test_module_paths() -> list:
+    return sorted((BACKEND).glob("test_*.py"))
+
+
+def _imports_work_module(tree) -> list:
+    offenders = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name.split(".")[0] in WORK_ONLY_MODULES:
+                    offenders.append(f"import {alias.name}")
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            if node.module.split(".")[0] in WORK_ONLY_MODULES:
+                offenders.append(f"from {node.module}")
+    return offenders
+
+
+def _appends_work_to_sys_path(tree) -> list:
+    offenders = []
+    for node in ast.walk(tree):
+        # sys.path.insert(0, "...work...") / sys.path.append("...work...")
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        if not isinstance(func, ast.Attribute) or func.attr not in ("insert", "append"):
+            continue
+        for arg in node.args:
+            for part in ast.walk(arg):
+                if isinstance(part, ast.Constant) and isinstance(part.value, str):
+                    if "work" in part.value.replace("\\", "/").lower():
+                        offenders.append(ast.unparse(node))
+    return offenders
+
+
+class BackendTestsMustNotDependOnWorkModules(unittest.TestCase):
+    def test_no_backend_test_imports_a_work_only_module(self):
+        offenders = []
+        for path in _test_module_paths():
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+            hits = _imports_work_module(tree)
+            for hit in hits:
+                offenders.append(f"{path.name}: {hit}")
+        self.assertEqual(
+            [], offenders,
+            "backend test 不得 import work/ 下的模块；编排逻辑必须在 backend/",
+        )
+
+    def test_no_backend_test_appends_work_to_sys_path(self):
+        offenders = []
+        for path in _test_module_paths():
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+            hits = _appends_work_to_sys_path(tree)
+            for hit in hits:
+                offenders.append(f"{path.name}: {hit}")
+        self.assertEqual(
+            [], offenders,
+            "backend test 不得 sys.path.append(work/)，否则镜像内 discover 会 ImportError",
+        )
+
+    def test_guard_detects_a_work_import(self):
+        source = "import backfill_tradability_archive\n"
+        self.assertTrue(_imports_work_module(ast.parse(source)))
+
+    def test_guard_detects_a_work_sys_path_append(self):
+        source = (
+            "import sys\n"
+            "sys.path.append('/repo/work')\n"
+        )
+        self.assertTrue(_appends_work_to_sys_path(ast.parse(source)))
+
+    def test_guard_ignores_benign_imports(self):
+        source = "import tradability_backfill\nimport tradability_archive\n"
+        self.assertEqual([], _imports_work_module(ast.parse(source)))
+
+    def test_guard_ignores_benign_sys_path(self):
+        source = (
+            "import sys\n"
+            "sys.path.append('/repo/backend')\n"
+        )
+        self.assertEqual([], _appends_work_to_sys_path(ast.parse(source)))
+
+
 if __name__ == "__main__":
     unittest.main()

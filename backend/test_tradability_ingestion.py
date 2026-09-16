@@ -22,13 +22,8 @@ from unittest import mock
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import tradability_archive as TA  # noqa: E402
+import tradability_backfill as TB  # noqa: E402
 import tradability_ingestion as TI  # noqa: E402
-
-_WORK_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "work")
-if _WORK_DIR not in sys.path:
-    sys.path.insert(0, _WORK_DIR)
-
-import backfill_tradability_archive as BF  # noqa: E402
 
 
 def open_db():
@@ -786,7 +781,7 @@ class BackfillCommit(IngestionTestCase):
         return path
 
     def test_dry_run_writes_nothing(self):
-        result = BF.run_backfill(
+        result = TB.run_backfill(
             self.conn, self._providers(), ["000001"], ["2024-01-10"],
             write=False, run_id="dry-run",
         )
@@ -803,7 +798,7 @@ class BackfillCommit(IngestionTestCase):
         try:
             TA.ensure_schema(conn)
             TI.ensure_ingestion_schema(conn)
-            BF.run_backfill(
+            TB.run_backfill(
                 conn, self._providers(), ["000001"], ["2024-01-10"],
                 write=True, run_id="write-run",
             )
@@ -832,7 +827,7 @@ class BackfillCommit(IngestionTestCase):
     def test_failure_rolls_back(self):
         with mock.patch.object(TI.IngestionService, "ingest", side_effect=RuntimeError("boom")):
             with self.assertRaises(RuntimeError):
-                BF.run_backfill(
+                TB.run_backfill(
                     self.conn, self._providers(), ["000001"], ["2024-01-10"],
                     write=True, run_id="fail-run",
                 )

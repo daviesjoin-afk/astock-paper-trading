@@ -915,15 +915,20 @@ class IngestionService:
                         source_counts.get(source_id.provider_id, 0) + 1
                     )
 
+                # 规范化在 persistence gate **之外**完成：canonical normalized
+                # evidence 必须与 write=False / write=True 无关——run_fingerprint
+                # 只由事实输入 + scope + cutoff + provider/provenance identity 决定，
+                # 绝不随"这次有没有真正 INSERT"漂移。dry-run 与幂等重放都产生同一
+                # 份 normalized evidence，从而得到相同的 fingerprint。
+                try:
+                    evidence = TA.normalize_record(record)
+                except TA.TradabilityArchiveError:
+                    # 规范化失败（缺失时点/来源）→ 记 skipped，不落库、不抛散。
+                    skipped_records += 1
+                    continue
+                normalized_records += 1
+                normalized_evidence.append(evidence)
                 if write:
-                    try:
-                        evidence = TA.normalize_record(record)
-                    except TA.TradabilityArchiveError:
-                        # 规范化失败（缺失时点/来源）→ 记 skipped，不落库、不抛散。
-                        skipped_records += 1
-                        continue
-                    normalized_records += 1
-                    normalized_evidence.append(evidence)
                     inserted = self._repo.save(evidence)
                     if inserted:
                         persisted.append(evidence)
@@ -1092,12 +1097,16 @@ class IngestionService:
             "version": CONTRACT_VERSION,
             "scope": "requested_code_coverage",
             "requested_symbols": total_requested,
+            "requested_codes": total_requested,
             "requested_sessions": len(sessions),
             "requested_pairs": requested_pairs,
             "evidence_present": total_present,
+            "known": total_present,
             "fully_proven": total_fully,
             "unknown_fields": total_unknown,
+            "unknown": total_unknown,
             "conflicts": total_conflicts,
+            "conflict": total_conflicts,
             "unprovable_observed_at": total_unprovable,
             "source_counts": dict(source_counts),
             "coverage_ratio": round(total_present / requested_pairs * 100, 1)
@@ -1115,8 +1124,8 @@ class IngestionService:
         # UNKNOWN 是数据事实，不是失败；只有 provider error 才构成 gap。
         return STATUS_COMPLETED
 
-    @staticmethod
     def _run_fingerprint(
+        self,
         run_id: str, codes: Sequence[str], sessions: Sequence[str], cutoff: str,
         normalized: Sequence[TA.TradabilityEvidence],
     ) -> str:
@@ -1126,6 +1135,9 @@ class IngestionService:
         输入是**规范化后的证据**而非本次新插入的 persisted 行：幂等重放时第二次
         ``ingest`` 不会产生任何新插入（唯一键命中），若用 persisted 作输入，同一份
         输入的指纹会在第一次与第二次 replay 之间漂移，破坏 idempotent replay 的语义。
+
+        同时把 **provider/provenance identity**（provider_id → provider_version）
+        纳入指纹：version 属于 provenance 身份，改变它必须改变指纹。
         """
         payload = {
             "version": FINGERPRINT_VERSION,
@@ -1133,6 +1145,7 @@ class IngestionService:
             "codes": sorted(codes),
             "sessions": sorted(sessions),
             "cutoff": cutoff,
+            "provider_versions": dict(sorted(self.provider_versions.items())),
             "evidence_fingerprints": sorted(TA.evidence_fingerprint(e) for e in normalized),
         }
         return _sha256(payload)

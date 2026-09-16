@@ -32,6 +32,31 @@ TEST_MODULES = (
 )
 
 INGESTION = "backend/tradability_ingestion.py"
+BACKFILL = "backend/tradability_backfill.py"
+INGESTION_TEST = "backend/test_tradability_ingestion.py"
+
+# 每个变异条目缺省跑的契约测试模块；某些条目（跨文件的 Docker / dry-run /
+# fingerprint / session 契约）需要额外模块，用 TEST_MODULES_BY_ID 覆盖。
+TEST_MODULES_BY_ID = {
+    # M-D1 改的是 test 文件：只跑架构护栏（AST 静态扫描 test_*.py 的 work import），
+    # 不 import 被注入的 test 文件，避免"运行时 import 失败"遮蔽"guard 抓到"的信号。
+    "M-D1": ("test_tradability_architecture_guard",),
+    # M-S1 / M-DR1 改的是 tradability_backfill.py，由回填契约测试抓住。
+    "M-S1": ("test_tradability_backfill",),
+    "M-DR1": ("test_tradability_backfill",),
+    # M-F1/M-F2 改的是 tradability_ingestion.py：dry-run≠write 与 replay 漂移
+    # 由回填契约测试的 fingerprint 断言抓住。
+    "M-F1": ("test_tradability_backfill",),
+    "M-F2": ("test_tradability_backfill", "test_tradability_ingestion"),
+}
+
+# 每个条目 import-check 的目标模块（排除"生产代码变异后语法错误无法 import"的假杀）。
+# 缺省检查 tradability_ingestion；改 test 文件或别的生产模块时覆盖。
+IMPORT_MODULE_BY_ID = {
+    "M-D1": "tradability_ingestion",   # 改的是 test 文件，生产代码未动
+    "M-S1": "tradability_backfill",
+    "M-DR1": "tradability_backfill",
+}
 
 # (id, 目标文件, 变异前源码片段, 变异后源码片段, 说明)
 MUTATIONS = (
@@ -172,6 +197,57 @@ MUTATIONS = (
         "        self._repo.save(record)  # MUTANT TTI12: provider writes archive directly\n",
         "Provider 直接绕过 ingestion 写 archive（写 authority 逃逸到 adapter 层）",
     ),
+    (
+        "M-D1",
+        INGESTION_TEST,
+        "import tradability_ingestion as TI  # noqa: E402\n",
+        "import tradability_ingestion as TI  # noqa: E402\n"
+        "import backfill_tradability_archive as BF  # noqa: E402  # MUTANT M-D1: work-only import\n",
+        "backend test 重新 import work-only 模块（镜像内 ImportError，回归事故根因）",
+    ),
+    (
+        "M-F1",
+        INGESTION,
+        "                normalized_records += 1\n"
+        "                normalized_evidence.append(evidence)\n"
+        "                if write:\n",
+        "                normalized_records += 1\n"
+        "                if write:\n"
+        "                    normalized_evidence.append(evidence)\n"
+        "                if write:\n",
+        "normalized evidence 收集被移回 write gate（dry-run fingerprint 漂移）",
+    ),
+    (
+        "M-F2",
+        INGESTION,
+        "            run_id, codes, sessions, self._cutoff, normalized_evidence\n",
+        "            run_id, codes, sessions, self._cutoff, persisted\n",
+        "fingerprint 使用本次 inserted rows（幂等重放后指纹漂移）",
+    ),
+    (
+        "M-S1",
+        BACKFILL,
+        "    if calendar is None:\n"
+        "        return sessions_between(first, last)\n"
+        "    return sessions_between(first, last, calendar=calendar)\n",
+        "    if calendar is None:\n"
+        "        return sessions_between(first, last)\n"
+        "    _f = _dt.date.fromisoformat(str(first)[:10])  # MUTANT M-S1\n"
+        "    _l = _dt.date.fromisoformat(str(last)[:10])\n"
+        "    return [(_f + _dt.timedelta(days=i)).isoformat() for i in range((_l - _f).days + 1)]\n",
+        "日期范围恢复自然日枚举（注入 calendar 也被忽略，周末/法定休市进入 denominator）",
+    ),
+    (
+        "M-DR1",
+        BACKFILL,
+        "    if not write:\n"
+        "        return service.ingest(codes, sessions, write=False, run_id=run_id)\n",
+        "    if not write:\n"
+        "        TA.ensure_schema(conn)  # MUTANT M-DR1: dry-run mutates schema\n"
+        "        TI.ensure_ingestion_schema(conn)\n"
+        "        return service.ingest(codes, sessions, write=False, run_id=run_id)\n",
+        "dry-run 恢复 schema mutation（悄悄建表，违反无副作用契约）",
+    ),
 )
 
 # 自检哨兵：只改注释。它必须 UNDETECTED。
@@ -209,18 +285,19 @@ def clear_bytecode(relative_path: str) -> None:
             pass
 
 
-def run_contract_tests() -> subprocess.CompletedProcess:
+def run_contract_tests(modules=None) -> subprocess.CompletedProcess:
     env = {**os.environ, "PYTHONPATH": "backend", "PYTHONDONTWRITEBYTECODE": "1"}
+    targets = list(modules) if modules is not None else list(TEST_MODULES)
     return subprocess.run(
-        [sys.executable, "-m", "unittest", "-q", *TEST_MODULES],
+        [sys.executable, "-m", "unittest", "-q", *targets],
         cwd=str(ROOT), env=env, capture_output=True, text=True,
     )
 
 
-def _import_check() -> bool:
+def _import_check(module: str = "tradability_ingestion") -> bool:
     env = {**os.environ, "PYTHONPATH": "backend", "PYTHONDONTWRITEBYTECODE": "1"}
     run = subprocess.run(
-        [sys.executable, "-c", "import tradability_ingestion"],
+        [sys.executable, "-c", f"import {module}"],
         cwd=str(ROOT), env=env, capture_output=True, text=True,
     )
     if run.returncode != 0:
@@ -251,9 +328,11 @@ def apply_and_run(entry) -> str:
     try:
         clear_bytecode(relative_path)
         target.write_bytes(mutated)
-        if not _import_check():
+        import_module = IMPORT_MODULE_BY_ID.get(name, "tradability_ingestion")
+        if not _import_check(import_module):
             return "IMPORT-FAILED"
-        result = run_contract_tests()
+        modules = TEST_MODULES_BY_ID.get(name)
+        result = run_contract_tests(modules)
         caught = result.returncode != 0
         if not caught:
             print(result.stdout)
