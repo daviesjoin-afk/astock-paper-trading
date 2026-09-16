@@ -9549,6 +9549,10 @@ def _buy_order(conn, account, signal, quote, market, news, asof_day, *, all_quot
             "UPDATE paper_orders SET status='filled',filled_price=?,amount=?,fees=?,executed_at=? WHERE id=?",
             (fill_price, amount, fees, _now(), order_id),
         )
+        # 执行验证闸门（PR150 消费层）：**每一条**真实成交路径都必须在流水写入后盖章，
+        # 否则该笔委托的验证列永远为 NULL，被闸门当成"没有证据"而从已实现盈亏、
+        # 持仓现金流与执行绩效里剔除 —— 一笔真实成交被记成没发生。
+        EV.stamp_order(conn, order_id)
         conn.execute(f"RELEASE SAVEPOINT {savepoint}")
     except Exception as exc:
         conn.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
@@ -11678,6 +11682,9 @@ def _monitor_risk_impl(asof_date=None):
                 conn.execute("INSERT INTO paper_fills(order_id,account_id,side,code,qty,price,amount,fees,fill_date,quote_at,assumption) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
                              (cursor.lastrowid, position["account_id"], "sell", position["code"], qty, fill_price, amount, fees,
                               day.isoformat(), quote.get("quote_at") or _now(), "实时价 - 0.10% 滑点，含佣金及印花税"))
+                # 风控退出是生产成交路径之一：流水写入后必须盖章，否则这笔真实卖出
+                # 的验证列为 NULL，被闸门从已实现盈亏/NAV/执行绩效里剔除。
+                EV.stamp_order(conn, cursor.lastrowid)
                 _risk_log(conn, position["account_id"], position["code"], "sell", "filled", reason, detail)
                 _audit(conn, position["account_id"], "sell_filled", f"{position['code']} {qty}股 @ {fill_price:.2f}")
                 # 2026-08-28：partial 减仓时仓位仍在，不产生回补观察；
@@ -12789,6 +12796,8 @@ def _intraday_sell(conn, account, position, quote, asof_day, profile, cycle, ope
     conn.execute("INSERT INTO paper_fills(order_id,account_id,side,code,qty,price,amount,fees,fill_date,quote_at,assumption) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
                  (cursor.lastrowid, account["id"], "sell", position["code"], qty, fill, amount, fees,
                  _date(asof_day).isoformat(), quote.get("quote_at"), "开盘/5分钟实时快照高抛，含滑点、佣金、印花税"))
+    # 日内做T高抛同样是生产成交路径：流水写入后盖章，否则这笔真实卖出被闸门剔除。
+    EV.stamp_order(conn, cursor.lastrowid)
     _risk_log(conn, account["id"], position["code"], "sell", audit_action, "开盘事件高抛通过" if opening_event else "日内高抛通过", payload)
     _audit(conn, account["id"], audit_action, f"{position['code']} {qty}股 @ {fill:.2f}")
     return {
@@ -13778,8 +13787,9 @@ def _record_nav(conn, asof_day, quotes=None):
             for p in account_positions
         )
         realized = _num(conn.execute(
-            """SELECT COALESCE(SUM(realized_pnl),0) FROM paper_orders
-               WHERE account_id=? AND side='sell' AND status='filled'""",
+            "SELECT COALESCE(SUM(realized_pnl),0) FROM paper_orders"
+            " WHERE account_id=? AND side='sell' AND status='filled' AND "
+            + _execution_verified_predicate(),
             (account["id"],),
         ).fetchone()[0])
         # In shared-pool mode account.cash is only an attribution bucket.  A

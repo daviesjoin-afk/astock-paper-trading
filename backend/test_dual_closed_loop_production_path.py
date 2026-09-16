@@ -240,6 +240,11 @@ class DualClosedLoopProductionPathTests(OfflinePaperEnv, unittest.TestCase):
             order = self._one(p_conn, "SELECT * FROM paper_orders WHERE id=?", (buy_fill["order_id"],))
             self.assertEqual(order["status"], "filled")
             self.assertEqual(order["strategy_id"], STRATEGY_ID)
+            # 执行验证闸门：**每一条**真实成交路径都必须在流水写入后盖章。
+            # 这里走的是 _buy_order 的直写路径（不是 planner.commit_fill），
+            # 漏盖章会让这笔真实买入被闸门从已实现盈亏/持仓现金流里剔除。
+            self.assertEqual(order["execution_status"], "verified", "买入成交必须已盖章")
+            self.assertEqual(int(order["execution_verified"]), 1)
 
             position = self._one(
                 p_conn, "SELECT * FROM paper_positions WHERE account_id=? AND qty>0", (STRATEGY_ID,)
@@ -269,6 +274,16 @@ class DualClosedLoopProductionPathTests(OfflinePaperEnv, unittest.TestCase):
                 (STRATEGY_ID,),
             ).fetchall()
             self.assertTrue(sells, "风控触发后必须产生真实卖出成交")
+            # 风控退出路径同样必须盖章：否则这笔真实卖出的验证列为 NULL，
+            # 被闸门从已实现盈亏与 NAV 历史里剔除。
+            for sell in sells:
+                sell_order = self._one(
+                    p_conn, "SELECT * FROM paper_orders WHERE id=?", (sell["order_id"],)
+                )
+                self.assertEqual(
+                    sell_order["execution_status"], "verified", "风控卖出必须已盖章"
+                )
+                self.assertEqual(int(sell_order["execution_verified"]), 1)
             remaining_pos = self._one(
                 p_conn, "SELECT COALESCE(SUM(qty), 0) AS n FROM paper_positions WHERE account_id=?",
                 (STRATEGY_ID,),

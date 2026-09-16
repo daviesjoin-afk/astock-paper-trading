@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""执行真实性层（execution reality layer）本地变异验证工具 M51–M60。
+"""执行真实性层（execution reality layer）本地变异验证工具 M51–M63。
 
 用法::
 
@@ -35,6 +35,9 @@ TEST_MODULES = (
     "test_execution_evidence",
     "test_execution_lifecycle",
     "test_execution_outcome",
+    "test_execution_verification_gate",
+    "test_paper_portfolio",
+    "test_dual_closed_loop_production_path",
 )
 
 # (id, 目标文件, 变异前源码片段, 变异后源码片段, 说明)
@@ -125,6 +128,27 @@ MUTATIONS = (
         '    if fill_identity_known is None:\n        fill_identity_known = fill_identity_rows is not None\n',
         '    if fill_identity_known is None:\n        fill_identity_known = True\n',
         'identity check self-attested without identity rows',
+    ),
+    (
+        'M61',
+        'backend/paper_trading.py',
+        '        EV.stamp_order(conn, order_id)\n        conn.execute(f"RELEASE SAVEPOINT {savepoint}")\n',
+        '        conn.execute(f"RELEASE SAVEPOINT {savepoint}")\n',
+        '_buy_order fill path not stamped',
+    ),
+    (
+        'M62',
+        'backend/paper_trading.py',
+        '                EV.stamp_order(conn, cursor.lastrowid)\n                _risk_log(',
+        '                _risk_log(',
+        'risk exit fill path not stamped',
+    ),
+    (
+        'M63',
+        'backend/paper_portfolio.py',
+        '        if flow is None:\n            item["display_cost"] = item["cost"]\n',
+        '        if flow is None:\n            item["display_cost"] = 0.0\n',
+        'missing cash flow collapses to a defined zero display cost',
     ),
 )
 
