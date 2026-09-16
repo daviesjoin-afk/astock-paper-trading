@@ -90,6 +90,17 @@ DEFAULT_CACHE_SIZE = 4096
 
 SESSION_RE = re.compile(r"\d{4}-\d{2}-\d{2}")
 
+# 归档表的**查询列序**。显式列清单而非 ``SELECT *``：位置取值依赖顺序稳定，
+# 而 ``SELECT *`` 的顺序由建表决定、也会随 schema 演进漂移。读取时两种行形态
+# （sqlite3.Row 与默认连接的 tuple）都按这份清单对齐。
+ARCHIVE_COLUMNS = (
+    "id", "code", "session_date", "effective_at", "observed_at",
+    "is_listed", "is_st", "is_suspended", "is_price_limit_locked",
+    "price_limit_direction", "has_market_quote", "has_trade_volume",
+    "source", "listing_date", "delisting_date", "suspension_reason",
+    "created_at",
+)
+
 # 涨跌停方向。沿用 selection_tradability 的方向性语义：涨停只拦买、跌停只拦卖。
 PRICE_LIMIT_UP = "up"
 PRICE_LIMIT_DOWN = "down"
@@ -211,7 +222,15 @@ def _canonical_instant(value: Any) -> Optional[str]:
     moment = _instant(value)
     if moment is None:
         return None
-    return moment.isoformat(timespec="seconds")
+    # 保留解析出来的**全部**精度（默认 isoformat 不截断）。
+    #
+    # 曾经写成 timespec="seconds"，后果有二：同一秒内被观察到的两次修订
+    # （如 15:00:00.100 与 15:00:00.900）会塌缩成同一个身份，后者被唯一键静默
+    # 丢弃；且截断会把证据的可见时点**提前**到该秒起点，让它比实际更早可见。
+    return moment.isoformat()
+
+
+_COLUMN_LIST = ", ".join(ARCHIVE_COLUMNS)
 
 
 def _now() -> str:
@@ -507,29 +526,67 @@ def ensure_schema(conn: sqlite3.Connection) -> dict:
 
 
 def _row_to_evidence(row: Any) -> TradabilityEvidence:
+    """把一行归档记录转成事实对象。
+
+    必须同时支持两种行形态：``sqlite3.Row`` / 映射（按列名取），以及调用方用
+    ``sqlite3.connect()`` 默认配置时得到的**普通 tuple**（按位置取）。
+
+    只支持命名取值的后果很严重：默认连接的 ``SELECT *`` 返回 tuple，按下标用
+    字符串取值会抛 ``TypeError``，被旧实现吞成 ``None``，于是每一列都变成未知、
+    ``_visible_at`` 拒绝所有已落库的行，归档永久返回 ``UNKNOWN_STATE``——
+    事实层静默失效，而且看起来像"没有数据"而不是像 bug。
+
+    位置取值依赖 :data:`ARCHIVE_COLUMNS` 与建表/查询顺序一致，因此查询一律用
+    显式列清单（``SELECT {ARCHIVE_COLUMNS}``），不使用 ``SELECT *``。
+    """
+    named = _row_mapping(row)
+    if named is None:
+        values = list(row)
+        named = {
+            column: values[index]
+            for index, column in enumerate(ARCHIVE_COLUMNS)
+            if index < len(values)
+        }
+
     def _value(key: str) -> Any:
-        try:
-            return row[key]
-        except (IndexError, KeyError, TypeError):  # pragma: no cover - 非 Row 行
-            return None
+        return named.get(key)
+
+    def _text_or_none(key: str) -> Optional[str]:
+        raw = named.get(key)
+        return None if raw is None else str(raw)
 
     return TradabilityEvidence(
-        code=str(_value("code")),
-        session_date=str(_value("session_date")),
+        code=str(named.get("code") or ""),
+        session_date=str(named.get("session_date") or ""),
         is_listed=_flag(_value("is_listed")),
-        listing_date=_text(_value("listing_date")),
-        delisting_date=_text(_value("delisting_date")),
+        listing_date=_text_or_none("listing_date"),
+        delisting_date=_text_or_none("delisting_date"),
         is_st=_flag(_value("is_st")),
         is_suspended=_flag(_value("is_suspended")),
-        suspension_reason=_text(_value("suspension_reason")),
+        suspension_reason=_text_or_none("suspension_reason"),
         has_market_quote=_flag(_value("has_market_quote")),
         has_trade_volume=_flag(_value("has_trade_volume")),
         is_price_limit_locked=_flag(_value("is_price_limit_locked")),
         price_limit_direction=_direction(_value("price_limit_direction")),
-        source=str(_value("source")),
-        observed_at=str(_value("observed_at")),
-        effective_at=str(_value("effective_at")),
+        source=str(named.get("source") or ""),
+        observed_at=str(named.get("observed_at") or ""),
+        effective_at=str(named.get("effective_at") or ""),
     )
+
+
+def _row_mapping(row: Any) -> Optional[dict]:
+    """行 → 列名到值的映射；无法按名字取值时返回 ``None``（交给位置映射）。"""
+    if row is None:
+        return None
+    keys = getattr(row, "keys", None)
+    if callable(keys):
+        try:
+            return {key: row[key] for key in keys()}
+        except (IndexError, KeyError, TypeError):
+            return None
+    if isinstance(row, Mapping):
+        return dict(row)
+    return None
 
 
 def _visible_at(evidence: TradabilityEvidence, decision_time: Any) -> bool:
@@ -565,6 +622,8 @@ class TradabilityArchiveRepository:
         self._conn = conn
         self._cache_size = max(0, int(cache_size))
         self._cache: "OrderedDict[tuple, Optional[TradabilityEvidence]]" = OrderedDict()
+        # 上次对齐的数据库版本号，用来发现**别的连接**写入过归档。
+        self._cache_version: Optional[int] = None
 
     # ── 写 ──
     def ensure_schema(self) -> dict:
@@ -616,7 +675,8 @@ class TradabilityArchiveRepository:
         if code_text is None or session_text is None:
             return []
         rows = self._conn.execute(
-            f"SELECT * FROM {ARCHIVE_TABLE} WHERE code=? AND session_date=?",
+            f"SELECT {_COLUMN_LIST} FROM {ARCHIVE_TABLE} "
+            "WHERE code=? AND session_date=?",
             (code_text, session_text),
         ).fetchall()
         visible = [
@@ -635,12 +695,18 @@ class TradabilityArchiveRepository:
         缓存键是 ``(code, session, decision_time)`` 三元组，而不是 ``(code, date)``：
         同一个日期在不同 ``decision_time`` 下的可见集合本来就不同，用二元键会把
         某个时点的结论错给另一个时点——那正是 PIT 污染本身。
+
+        缓存还会按**数据库版本**失效（见 :meth:`_data_version`）。只在自己
+        ``save()`` 时清缓存是不够的：入库与查询常常是两个实例、两条连接（摄取进程
+        写、服务进程读），写入方清自己的私有缓存，读方的缓存却毫不知情，于是这个
+        快速路径会**无限期**返回过期事实——后到的修正在读侧等于不存在。
         """
         code_text = _text(code)
         session_text = _session(session)
         reference = _canonical_instant(decision_time)
         if code_text is None or session_text is None or reference is None:
             return None
+        self._sync_cache_with_database()
         key = (code_text, session_text, reference)
         if key in self._cache:
             self._cache.move_to_end(key)
@@ -653,6 +719,36 @@ class TradabilityArchiveRepository:
             while len(self._cache) > self._cache_size:
                 self._cache.popitem(last=False)
         return chosen
+
+    def _data_version(self) -> Optional[int]:
+        """本连接看到的数据库版本号。
+
+        SQLite 的 ``PRAGMA data_version`` 在**其他连接**提交后递增，在本连接自己
+        写入时不变——正好是"外部是否改过归档"的信号。取不到时返回 ``None``，
+        调用方据此退化为按自身写入失效（旧行为），而不会误判为"没变过"。
+        """
+        try:
+            row = self._conn.execute("PRAGMA data_version").fetchone()
+        except sqlite3.Error:  # pragma: no cover - 驱动/库不支持
+            return None
+        if row is None:
+            return None
+        try:
+            return int(row[0])
+        except (TypeError, ValueError, IndexError):  # pragma: no cover
+            return None
+
+    def _sync_cache_with_database(self) -> None:
+        """数据库被外部改动过就丢掉整份缓存；版本不可得时不动缓存。"""
+        current = self._data_version()
+        if current is None:
+            return
+        if self._cache_version is None:
+            self._cache_version = current
+            return
+        if current != self._cache_version:
+            self._cache.clear()
+            self._cache_version = current
 
     def fingerprint(
         self, code: Any, session: Any, decision_time: Any

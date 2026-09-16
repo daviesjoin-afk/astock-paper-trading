@@ -183,6 +183,38 @@ MUTATIONS = (
         "            UNIQUE(code, session_date, effective_at)\n",
         "唯一键丢掉观测维度（同一生效时点的上游修正被静默丢弃）",
     ),
+    (
+        "TTA11",
+        ARCHIVE,
+        "    return moment.isoformat()\n",
+        "    return moment.isoformat(timespec=\"seconds\")\n",
+        "观测时点截断到整秒（同秒内两次修订塌缩，且证据提前可见）",
+    ),
+    (
+        "TTA12",
+        ARCHIVE,
+        (
+            "    named = _row_mapping(row)\n"
+            "    if named is None:\n"
+            "        values = list(row)\n"
+            "        named = {\n"
+            "            column: values[index]\n"
+            "            for index, column in enumerate(ARCHIVE_COLUMNS)\n"
+            "            if index < len(values)\n"
+            "        }\n",
+        ),
+        (
+            "    named = _row_mapping(row) or {}\n",
+        ),
+        "只支持具名行（默认连接的 tuple 行整表退化为未知）",
+    ),
+    (
+        "TTA13",
+        ARCHIVE,
+        "        self._sync_cache_with_database()\n",
+        "        pass  # MUTANT TTA13: external writes never invalidate the cache\n",
+        "外部写入不失效缓存（读侧无限期返回过期事实）",
+    ),
 )
 
 # 自检哨兵：只改注释。它必须 UNDETECTED。

@@ -553,6 +553,143 @@ class RepositorySemantics(ArchiveTestCase):
                                  effective="2025-05-05T14:30:00"))
         self.assertEqual(2, self.repo.count())
 
+    def test_default_tuple_rows_are_read_correctly(self):
+        """默认 ``sqlite3.connect()``（无 row_factory）必须照常工作。
+
+        ``SELECT *`` 在默认连接上返回 tuple，按列名取值会抛 TypeError；旧实现把它
+        吞成 None，于是每一列都未知、所有已落库行被 ``_visible_at`` 拒绝，归档
+        永久返回 UNKNOWN_STATE。这种失效看起来像"没有数据"，而不是像 bug。
+        """
+        conn = sqlite3.connect(":memory:")  # 故意不设 row_factory
+        self.addCleanup(conn.close)
+        TA.ensure_schema(conn)
+        repo = TA.TradabilityArchiveRepository(conn)
+        repo.save(TA.normalize_record({
+            "code": "000001", "session_date": "2025-06-10", "source": SOURCE,
+            "observed_at": "2025-06-10T15:05:00", "effective_at": "2025-06-10T09:30:00",
+            "is_listed": True, "is_st": False, "is_suspended": False,
+            "has_market_quote": True, "has_trade_volume": True,
+        }))
+        decision = TA.tradability_at(
+            "000001", "2025-06-10",
+            decision_time="2025-06-11T09:00:00", repository=repo,
+        )
+        self.assertTrue(decision.evidence_present, "默认 tuple 连接下事实必须被读到")
+        self.assertEqual(TA.TradabilityReason.OK, decision.buy_block_reason)
+        self.assertEqual(SOURCE, decision.source)
+
+    def test_positional_row_mapping_follows_the_declared_column_order(self):
+        """位置取值必须与建表列序一致 —— 用一整行 tuple 直接验证。"""
+        conn = sqlite3.connect(":memory:")
+        self.addCleanup(conn.close)
+        TA.ensure_schema(conn)
+        conn.execute(
+            f"INSERT INTO {TA.ARCHIVE_TABLE}("
+            + ", ".join(TA.ARCHIVE_COLUMNS) + ") VALUES("
+            + ", ".join("?" for _ in TA.ARCHIVE_COLUMNS) + ")",
+            (
+                1, "000001", "2025-06-10", "2025-06-10T09:30:00", "2025-06-10T15:05:00",
+                1, 0, 0, 0, "up", 1, 1,
+                SOURCE, None, None, None, "2025-06-10T15:06:00",
+            ),
+        )
+        row = conn.execute(
+            f"SELECT {TA._COLUMN_LIST} FROM {TA.ARCHIVE_TABLE}"
+        ).fetchone()
+        self.assertIsInstance(row, tuple)
+        evidence = TA._row_to_evidence(row)
+        self.assertEqual("000001", evidence.code)
+        self.assertEqual("2025-06-10", evidence.session_date)
+        self.assertIs(True, evidence.is_listed)
+        self.assertIs(False, evidence.is_st)
+        self.assertEqual("up", evidence.price_limit_direction)
+        self.assertIs(True, evidence.has_trade_volume)
+        self.assertEqual(SOURCE, evidence.source)
+
+    def test_subsecond_observations_stay_distinct(self):
+        """同一秒内的两次观测必须是两个身份，否则后到的修正被静默丢弃。"""
+        self.assertNotEqual(
+            TA._canonical_instant("2025-06-10T15:00:00.100"),
+            TA._canonical_instant("2025-06-10T15:00:00.900"),
+        )
+        self.assertNotEqual(
+            TA._canonical_instant("2025-06-10T15:00:00.100000"),
+            TA._canonical_instant("2025-06-10T15:00:00.900000"),
+        )
+
+        self.add("2025-06-10", is_st=False, observed="2025-06-10T15:00:00.100",
+                 effective="2025-06-10T09:30:00")
+        self.assertTrue(self.add("2025-06-10", is_st=True,
+                                 observed="2025-06-10T15:00:00.900",
+                                 effective="2025-06-10T09:30:00"))
+        self.assertEqual(2, self.repo.count())
+
+    def test_truncation_does_not_make_evidence_visible_early(self):
+        """截断到整秒会把证据的可见时点提前，必须保留原始精度。"""
+        self.add("2025-06-10", is_st=True, observed="2025-06-10T15:00:00.900",
+                 effective="2025-06-10T09:30:00")
+        # 决策时点落在同一秒内但**早于**观测时刻 → 当时还没观察到。
+        early = self.decide("2025-06-10", at="2025-06-10T15:00:00.100")
+        self.assertFalse(early.evidence_present)
+        self.assertEqual(TA.TradabilityReason.UNKNOWN_STATE, early.buy_block_reason)
+        # 观测时刻之后 → 可见。
+        later = self.decide("2025-06-10", at="2025-06-10T15:00:01")
+        self.assertTrue(later.evidence_present)
+
+    def test_external_write_invalidates_another_instances_cache(self):
+        """另一条连接写入后，本实例的缓存必须失效，而不是无限期返回旧事实。
+
+        摄取进程写、服务进程读是自然分工；只在自己 save() 时清缓存的话，读侧的
+        缓存对别人的写入毫不知情，后到的修正在读侧等于不存在。
+        """
+        import tempfile
+
+        handle = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        handle.close()
+        path = handle.name
+        self.addCleanup(lambda: os.path.exists(path) and os.remove(path))
+
+        def connect():
+            conn = sqlite3.connect(path, isolation_level=None)
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA journal_mode=WAL")
+            TA.ensure_schema(conn)
+            self.addCleanup(conn.close)
+            return conn
+
+        reader = TA.TradabilityArchiveRepository(connect())
+        reader.save(TA.normalize_record({
+            "code": "000001", "session_date": "2025-06-10", "source": SOURCE,
+            "observed_at": "2025-06-10T15:05:00", "effective_at": "2025-06-10T09:30:00",
+            "is_listed": True, "is_st": False, "is_suspended": False,
+            "has_market_quote": True, "has_trade_volume": True,
+        }))
+
+        # 先把该时点的结论灌进 reader 的缓存。
+        first = TA.tradability_at(
+            "000001", "2025-06-10",
+            decision_time="2025-06-13T09:00:00", repository=reader,
+        )
+        self.assertEqual(TA.TradabilityReason.OK, first.buy_block_reason)
+
+        # 另一条连接写入修正。
+        writer = TA.TradabilityArchiveRepository(connect())
+        writer.save(TA.normalize_record({
+            "code": "000001", "session_date": "2025-06-10", "source": SOURCE,
+            "observed_at": "2025-06-12T15:05:00", "effective_at": "2025-06-10T09:30:00",
+            "is_listed": True, "is_st": True, "is_suspended": False,
+            "has_market_quote": True, "has_trade_volume": True,
+        }))
+
+        again = TA.tradability_at(
+            "000001", "2025-06-10",
+            decision_time="2025-06-13T09:00:00", repository=reader,
+        )
+        self.assertEqual(
+            TA.TradabilityReason.ST_RESTRICTED, again.buy_block_reason,
+            "外部写入后缓存必须失效",
+        )
+
     def test_decision_time_is_part_of_the_cache_identity(self):
         """缓存键必须含 decision_time，否则会把某时点的结论错给另一时点。"""
         self.add("2025-03-10", is_st=False)
