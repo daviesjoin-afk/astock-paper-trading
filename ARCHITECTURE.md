@@ -73,6 +73,48 @@ SQLite 纸盘账本（订单、成交、持仓、NAV、审计、租约）
 
 ## 领域边界（domain boundaries）
 
+### 执行真实性证据边界
+
+`backend/execution_evidence.py`、`backend/execution_lifecycle.py`、`backend/execution_outcome.py`
+共同构成"选出来 ≠ 能成交 ≠ 成交价格可信"的执行真实性层。它建立在 PR149 的
+`selection_tradability`（点时可成交性契约）**之上**，不修改后者的任何判定口径：
+
+```text
+selection_score        策略认为股票有多好              （决策层）
+tradability            那个历史时点能不能执行           （selection_tradability)
+execution_evidence     实际有没有成交、成交价是否可信    （execution_evidence）
+```
+
+三个模块的职责是分开的：
+
+| 模块 | 负责 | 不负责 |
+| --- | --- | --- |
+| `execution_evidence` | 12 个执行证据字段的三态契约（`known` / `unknown` / `not_applicable`）、`fill_verdict` 六分类、从 `paper_orders` + `paper_fills` 只读投影证据 | 不撮合、不写账本、不决定买什么、不重建仓库没有的历史数据 |
+| `execution_lifecycle` | 九个成交状态与合法边表、非法跳转拒绝、成交数量/价格/时段不变式、stored status → 权威状态的唯一映射 | 不读数据库、不碰资金、不导入 `execution_evidence` |
+| `execution_outcome` | `selection_executable` 与 `execution_verified` 两个正交概念、`market_return` / `selection_return` / `execution_return` 三层收益、执行真实性审计报告 | 不改写 selection outcome、不把市场标签当执行收益 |
+
+关键不变量：
+
+- **`None` 不等于零**：`EvidenceField.known` 必须携带非 `None` 值，`unknown` / `not_applicable`
+  必须不携带值，构造期即拒绝。"未知"、"已知零"、"没有成交"、"被拒绝"、
+  "从未提交"是五种互不相同的表示。
+- **没有 submit/accept 证据不能成交**：`CREATED -> FILLED`、`SUBMITTED -> FILLED`
+  一律非法。`REJECTED -> FILLED` 只能在**新的**委托生命周期（新 order_id +
+  `retry_of_order_id`）里发生，与仓库"终态 order row 永不原地改写"的口径一致。
+- **部分成交不得提升为全部成交**：`PARTIAL_FILLED` 要求 `0 < filled_qty < requested_qty`，
+  `FILLED` 要求两者相等**且**成交价为正、成交时段非空。
+- **`ACCEPTED_STORED_STATUSES` 是空集**：仓库没有券商/交易所客户端，也就没有独立的
+  场所受理回报，任何 stored status 都不允许自称受理过。`shadow_q3` 这类影子记录映射到
+  `CREATED`，因此永远不能走到 `FILLED`。
+- **没有成交就没有执行收益**：`execution_return` 在无成交证据时为 `not_applicable`，
+  `market_label_value`（反事实标签）**不得**顶替它；`execution_return` 一旦为
+  `known`，来源必须是 `realized_fill_round_trip` 且 `execution_verified` 为真。
+- **`selection_executable=True` + `execution_verified=False` 必须允许存在**：
+  "选出来但买不进/没成交"正是本层要暴露的现场，不得被静默合并成一种结论。
+
+三个模块都是纯 stdlib、只读、不导入 `paper_trading`；写入与撮合仍由
+`execution_planner` / `manual_orders` / `paper_trading` 负责。
+
 ### 资金预占 ledger 边界
 
 `backend/paper_capital_reservations.py` 是运行时 BUY 资金预占的唯一实现边界：它负责查询所有 `status='reserved'` 的 BUY 预占、创建/重算预占，以及把预占标记为 `consumed` 或 `released`。预占 ledger 与实际 shared cash、pending slot occupancy、symbol exposure、order lifecycle 和 cycle ownership 各自独立；预占表示尚未最终成交的购买力占用，不是现金扣款、持仓、席位或成交。
@@ -115,6 +157,7 @@ slot occupancy
 | Paper / Cycle Domain | `paper_trading`、`paper_storage`、`paper_repository`、`paper_schema_migrations`、`db_migrate` | 周期生命周期、账本、撮合、NAV、审计、租约与幂等 | 策略规则本身、行情抓取 |
 | Allocation | `paper_allocation`、`paper_sizing`、`strategy_clusters`、`portfolio_coordinator` | 共享池席位/预算分配、股数计算、同构归簇与组合协调 | 不放宽系统门禁、不决定方向 |
 | Execution | `execution_planner`、`execution_dispatch`、`entry_lifecycle`、`entry_timing`、`order_intent`、`manual_orders` | 能不能下、怎么下（计划/复核/落库）、订单意图契约、分批与 TTL | 不决定买什么（候选来自策略/决策层） |
+| Execution Reality | `execution_evidence`、`execution_lifecycle`、`execution_outcome` | 成交证据三态契约（known/unknown/not_applicable）、委托成交状态机、selection executable × execution verified 的连接与收益分层 | 不撮合、不写账本、不决定买什么、不改写 selection outcome |
 | Risk | `risk_center`、`paper_trading_rules`、`paper_quote_policy`、`asymmetric_risk`、`strategy_risk_enforcement`、`adaptive_shadow_risk` | 系统硬边界、行情/证券门禁、分层风控状态机、非对称风险门 | 不写订单、不抓行情 |
 | Market Data | `data_fetcher`、`marketdata_*`、`universe`、`factors` | 多源抓取、重试/熔断、标准化、缓存、覆盖率与新鲜度 | 不伪造实时价、不写账本 |
 | Evolution | `evolution_loop`、`evolution_apply`、`evolution_validation`、`self_evolution`、`strategy_champion`、`adaptive_*` | 证据→提案→验证→晋升、影子账本、参数落地通道 | 不直接改正式账本、不绕过风险门 |
@@ -202,6 +245,7 @@ PR-49 把这条口径的实现收敛到只读解析器 `backend/paper_cycle_owne
 | 调度边界 | `backend/paper_runner.py` | 把一个 slot 运行成一次性进程，并用退出码告诉 cron 是否应重试 | 不常驻、不拥有第二套账本 |
 | 策略与决策 | `strategies.py`, `strategy_registry.py`, `strategy_service.py`, `strategy_api_models.py`, `strategy_dsl_schema.py`, `strategy_dsl_evaluator.py`, `strategy_runtime.py`, `strategy_risk_fingerprint.py`, `strategy_risk_profiles.py`, `strategy_risk_enforcement.py`, `strategy_parameter_schema.py`, `strategy_policies.py`, `strategy_clusters.py`, `strategy_champion.py`, `user_strategy_participation.py`, `decision_engine.py`, `decision_context.py`, `decision_rules.py` | 策略身份与不可变版本、DSL 编译、运行时就绪与 RuntimeContext、风险/执行画像、生命周期与治理、候选车道与纯规则评分 | 不读取真实券商账户，不写订单/成交 |
 | 订单意图与执行计划 | `order_intent.py`, `execution_planner.py`, `execution_dispatch.py`, `entry_lifecycle.py` | 策略→执行器的意图契约（拒绝数量越权）、计划/复核/落库统一口径、分批与 TTL | 不决定买什么，不计算资金池分配 |
+| 执行真实性证据 | `backend/execution_evidence.py`, `backend/execution_lifecycle.py`, `backend/execution_outcome.py` | 执行证据三态契约（`known`/`unknown`/`not_applicable`）、成交六分类、委托成交状态机与非法跳转拒绝、`selection_executable` × `execution_verified` 连接、`market`/`selection`/`execution` 三层收益 | 不撮合、不写订单/成交/资金、不重建仓库没有的历史数据、不改写 PR149 selection outcome、不用市场标签顶替执行收益；不 import `paper_trading` |
 | 行情基础设施 | `data_fetcher.py`, `marketdata_transport.py`, `marketdata_providers.py`, `marketdata_normalizers.py`, `marketdata_cache.py` | 多源请求、重试/熔断、解析标准化、缓存、覆盖率和新鲜度元数据 | 不在缓存陈旧时伪造实时价 |
 | 交易门禁 | `paper_trading_rules.py`, `paper_quote_policy.py`, `entry_timing.py` | 交易日、费用、证券权限、T+1、整手、涨跌停、行情新鲜度和入场时机 | 不负责持久化订单 |
 | 资金与仓位 | `paper_allocation.py`, `paper_sizing.py`, `paper_portfolio.py`, `paper_performance.py` | 共享池预算、席位、下单股数、持仓 lot 聚合、今日盈亏纯计算 | 不调用外部行情源 |

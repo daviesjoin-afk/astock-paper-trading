@@ -307,3 +307,52 @@
 | 场景 N：中间步骤抛异常触发 savepoint 回滚，无脏 lot，无虚构订单/成交/资金，安全转入 execution_retry | `SAVEPOINT` / `ROLLBACK TO SAVEPOINT` | `TestPaperRiskExitProductionPath.test_N_failure_branch_rolls_back_savepoint_without_corrupting_lots` | ✅ |
 | 场景 O：顶层调度生产入口 `run_slot("risk", ...)` 成功闭环并记录调度状态 | `paper_trading.run_slot` | `TestPaperRiskExitProductionPath.test_O_golden_run_slot_risk_production_entrypoint` | ✅ |
 | 真实生产源码变异 N1–N12 全部被测试捕获（12/12 caught，Undetected: 0） | `paper_risk_exit_eligibility` / `paper_slot_occupancy` / `paper_trading` | 本地突变套件 `pr_risk_exit_production_negative_check.py`（逐项注入、逐字节核验与 sha256 还原） | ✅ |
+
+## 执行真实性证据层（Execution Reality Layer）
+
+对应目标："选出来 ≠ 能成交 ≠ 成交价格可信"。本层建立在 PR149 的
+`selection_tradability` 之上，**不修改**其任何判定口径；`test_execution_outcome.py`
+的 `Pr149ContractPreservationTests` 会把"改动 PR149 契约"直接测红。
+
+| 场景 / 契约 | 实现位置 | 回归用例 | 状态 |
+| --- | --- | --- | --- |
+| 三态证据：`known` 必须携带非 None 值，`unknown` / `not_applicable` 必须不携带值 | `execution_evidence.EvidenceField.__post_init__` | `test_execution_evidence.py`（`EvidenceFieldStateTests`） | ✅ |
+| `None` 不得混同零 / 没成交 / 被拒绝：三种表示互不相同 | `execution_evidence` | `EvidenceFieldStateTests.test_known_zero_is_readable_and_distinguishable_from_unknown`、`test_unknown_and_not_applicable_are_distinguishable` | ✅ |
+| 成交六分类（verified / partial / pending / none_confirmed / not_attempted / unknown）互不塌缩 | `execution_evidence.fill_verdict` | `FillVerdictTests.test_the_three_no_fill_situations_are_mutually_distinct`、`test_never_submitted_order_is_not_attempted_not_none_confirmed`、`test_in_flight_order_is_pending_not_none_confirmed` | ✅ |
+| 订单写着 `filled` 但没有成交流水 → 成交数量必须 `unknown`，绝不按目标量充数 | `execution_evidence._filled_qty_field` | `FillVerdictTests.test_stored_filled_without_any_fill_row_is_unknown_not_filled` | ✅ |
+| 成交必须同时有数量、可信价格、成交时段才算 verified | `execution_evidence.fill_verdict` + `execution_lifecycle.observed_fill_supported` | `FillVerdictTests.test_fill_verdict_requires_a_trustworthy_price`、`test_fill_verdict_requires_a_fill_session`、`ObservedFillSupportedTests.test_full_fill_needs_quantity_price_and_session` | ✅ |
+| 卖出侧 `available_qty` 无法从历史委托重建 → 缺证据一律 `unknown`，绝不用当前持仓冒充 | `execution_evidence._available_qty_field` | `SideSpecificEvidenceTests.test_sell_available_qty_is_unknown_without_explicit_evidence`、`test_buy_available_qty_does_not_apply` | ✅ |
+| 佣金只在能用权威费用模型逐分对账时才 `known`；只有合并 `fees` 字段时如实报 `unknown` | `execution_evidence.reconcile_fees` | `FeeAndSlippageTests.test_commission_is_known_when_fees_match_the_authoritative_model`、`test_sell_commission_excludes_the_stamp_tax`、`test_commission_is_unknown_when_fees_do_not_reconcile` | ✅ |
+| 滑点由 `filled_price` vs `planned_price` 派生，两侧符号统一为"正=不利"；缺一即 `unknown` | `execution_evidence._slippage_field` | `FeeAndSlippageTests.test_slippage_is_adverse_positive_for_both_sides`、`test_slippage_is_unknown_without_a_planned_price` | ✅ |
+| 九个状态与合法边表完备；终态不可离开 | `execution_lifecycle.ALLOWED_TRANSITIONS` | `test_execution_lifecycle.py`（`StateSetTests.test_terminal_states_cannot_be_left`、`test_every_state_has_a_transition_row_and_only_declared_targets`） | ✅ |
+| 非法跳转必须失败：`CREATED -> FILLED`、`SUBMITTED -> FILLED`、`PARTIAL_FILLED -> REJECTED`、`ACCEPTED -> REJECTED` 等 17 条边 | `execution_lifecycle.can_transition` / `OrderLifecycle.advance` | `IllegalTransitionTests`（`test_every_declared_illegal_edge_is_rejected`、`test_created_cannot_reach_filled_without_submit_and_accept_evidence`、`test_submitted_cannot_reach_filled_without_accept_evidence`） | ✅ |
+| `REJECTED -> FILLED` 只能通过**新的**委托生命周期表达 | `execution_lifecycle.OrderLifecycle.retry` | `RetrySemanticsTests.test_retry_creates_a_fresh_lifecycle_linked_to_the_previous_order`、`test_a_retried_lifecycle_can_fill_because_it_is_a_new_order`、`test_a_filled_order_cannot_be_retried` | ✅ |
+| 部分成交不得提升为全部成交；`FILLED` 要求 `filled == requested` | `execution_lifecycle._validate_quantities` | `QuantityInvariantTests.test_filled_rejects_a_partial_quantity`、`test_partial_filled_rejects_a_full_quantity`、`ObservedFillSupportedTests.test_partial_fill_requires_a_strictly_partial_quantity` | ✅ |
+| 撤单/过期可携带部分成交，但不能携带完整成交（那属于 `FILLED`） | `execution_lifecycle._validate_quantities` | `QuantityInvariantTests.test_cancelled_may_carry_a_partial_fill`、`test_cancelled_cannot_carry_a_complete_fill` | ✅ |
+| stored status → 权威状态唯一映射；未知字符串 `UNKNOWN`，不猜测 | `execution_lifecycle.canonical_state` | `CanonicalStateTests.test_documented_mapping` | ✅ |
+| 仓库无场所受理证据：`ACCEPTED_STORED_STATUSES` 为空集，任何 stored status 不得自称受理 | `execution_lifecycle` | `CanonicalStateTests.test_no_stored_status_may_claim_acceptance` | ✅ |
+| 影子记录（`shadow_q3`）映射到 `CREATED`，永远不能合法成交 | `execution_lifecycle.canonical_state` | `CanonicalStateTests.test_shadow_records_are_created_not_submitted` | ✅ |
+| "订单写着成交了"必须能被证据自证；自证不了的进 `unsupported_fill_claims` 审计 | `execution_lifecycle.observed_fill_supported` / `audit_stored_rows` | `ObservedFillSupportedTests`、`AuditStoredRowsTests` | ✅ |
+| `selection_executable` 与 `execution_verified` 正交，四种组合都合法且互斥 | `execution_outcome.execution_bucket` | `test_execution_outcome.py`（`ConceptSeparationTests.test_all_four_combinations_are_legal_and_mutually_exclusive`） | ✅ |
+| **必须允许** `selection_executable=True` + `execution_verified=False` | `execution_outcome.link_execution_outcome` | `ConceptSeparationTests.test_selection_executable_with_unverified_execution_is_allowed` | ✅ |
+| 三层收益不得互相替代：来源分别为 `market_label_value` / `executable_selection_market_label` / `realized_fill_round_trip` | `execution_outcome` | `ReturnLayeringTests.test_the_three_return_layers_are_mutually_distinct`、`test_selection_return_is_a_counterfactual_not_a_fill` | ✅ |
+| 没有成交 → `execution_return` 不成立（`not_applicable`，`maybe()` 为 `None`） | `execution_outcome.realized_execution_return` | `ReturnLayeringTests.test_no_fill_means_execution_return_is_not_defined`、`test_entry_only_fill_leaves_the_execution_return_unknown` | ✅ |
+| `market_label_value` **绝不**顶替执行收益；顶替即抛 `MarketLabelSubstitution` | `execution_outcome.assert_no_market_label_substitution` | `ReturnLayeringTests.test_the_market_label_is_never_substituted_for_the_execution_return`、`test_a_known_execution_return_requires_a_verified_execution` | ✅ |
+| 执行收益由真实成交往返净额计算；数量不等/费用缺失一律 `unknown` | `execution_outcome.realized_execution_return` | `ReturnLayeringTests.test_execution_return_is_computed_from_real_fills`、`test_execution_return_refuses_a_non_clean_round_trip`、`test_execution_return_is_unknown_when_fee_evidence_is_missing` | ✅ |
+| PR149 selection outcome 契约字段与 `outcome_bucket` 权威分类**不被本层改动** | `selection_tradability` / `execution_outcome` | `Pr149ContractPreservationTests`（4 用例，含 `test_module_does_not_reimplement_the_tradability_bucket_priority`） | ✅ |
+| 只读集成：从真实 `paper_orders` + `paper_fills` 读证据，且所选列必须存在于生产 DDL | `execution_evidence.load_execution_evidence` | `LoadExecutionEvidenceTests`（含 `test_selected_columns_exist_in_the_production_schema` 直接解析 `paper_trading.py` 的 DDL） | ✅ |
+| 新模块纯 stdlib、只读、不导入 `paper_trading`；不触碰 orders/fills 之外的表 | `execution_evidence` / `execution_lifecycle` | `test_execution_evidence.py`（`ArchitectureGuardTests`）、`test_execution_lifecycle.py`（`ArchitectureGuardTests`） | ✅ |
+| 状态机与证据层结论一致：无成交证据的 `filled` 行不能走到 `FILLED` | `execution_lifecycle` + `execution_evidence` | `test_execution_outcome.py`（`LifecycleBridgeTests`） | ✅ |
+| 真实源码变异 M51–M55 全部被测试捕获（5/5 caught，Undetected: 0）；哨兵 S0（仅改注释）必须 UNDETECTED 以证明矩阵非空转 | `execution_evidence` / `execution_lifecycle` / `execution_outcome` | `work/execution_reality_mutation_check.py`（逐项注入、每轮清字节码缓存、逐字节 + sha256 还原核验；含基线 green 前置检查） | ✅ |
+
+变异明细：
+
+| ID | 注入的缺陷 | 结果 |
+| --- | --- | --- |
+| M51 | missing fill => assume filled（`fill_verdict` 把未知成交判成 verified） | CAUGHT |
+| M52 | reject => filled（`canonical_state` 把 `risk_rejected` 映射成 `FILLED`） | CAUGHT |
+| M53 | partial fill => full fill（`FILLED` 的数量不变式放宽为 `filled > requested`） | CAUGHT |
+| M54 | execution return fallback market return（无成交时回落到 `market_field`） | CAUGHT |
+| M55 | illegal lifecycle transition accepted（`CREATED` 的合法边集合加入 `FILLED`） | CAUGHT |
+| S0 | 哨兵：只改注释 | UNDETECTED（预期） |
+

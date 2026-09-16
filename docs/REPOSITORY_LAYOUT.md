@@ -54,6 +54,9 @@ Dockerfile          应用镜像；docker-compose*.yml 本地与服务器编排
   `user_strategy_participation`（用户策略接入生产链路）
 - **订单意图与执行**：`order_intent`（意图契约，拒绝数量越权）、`execution_planner`
   （中央计划/复核/落库）、`execution_dispatch`
+- **执行真实性证据**：`execution_evidence`（三态成交证据契约）、`execution_lifecycle`
+  （成交状态机与非法跳转拒绝）、`execution_outcome`（`selection_executable` ×
+  `execution_verified` 连接与收益分层）
 - **治理与进化**：`strategy_clusters`（同构归簇）、`strategy_champion`（晋升/回滚）、
   `strategy_policies`（策略级策略表）、`evolution_loop`、`evolution_apply`、
   `evolution_validation`、`asymmetric_risk`、`self_evolution`
