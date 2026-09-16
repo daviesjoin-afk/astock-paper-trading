@@ -10,6 +10,7 @@ import statistics
 
 import strategies as S
 import paper_repository as PRP
+import execution_verification as EV
 import adaptive_selection_compat as UNIT_COMPAT
 from strategy_registry import labels as strategy_labels
 from adaptive_common import _loads, _json  # C3: 收敛重复工具函数
@@ -283,11 +284,14 @@ def _blend_conditions(model_id, current, target, tier):
 
 def _evidence(adaptive, paper, account_id, regime=None):
     nav_days = paper.execute("SELECT COUNT(*) FROM paper_nav WHERE account_id=?", (account_id,)).fetchone()[0]
+    # 证据量口径：只有被证据证明成交的行才算执行样本（与 adaptive_risk 同口径）。
     closed = paper.execute(
-        "SELECT COUNT(*) FROM paper_orders WHERE account_id=? AND side='sell' AND status='filled'", (account_id,)
+        "SELECT COUNT(*) FROM paper_orders WHERE account_id=? AND side='sell'"
+        " AND status='filled' AND " + EV.VERIFIED_PREDICATE, (account_id,)
     ).fetchone()[0]
     fills = paper.execute(
-        "SELECT COUNT(*) FROM paper_orders WHERE account_id=? AND status='filled'", (account_id,)
+        "SELECT COUNT(*) FROM paper_orders WHERE account_id=? AND status='filled'"
+        " AND " + EV.VERIFIED_PREDICATE, (account_id,)
     ).fetchone()[0]
     rewards = adaptive.execute(
         "SELECT regime,raw_reward,excess_return_pct,created_at FROM adaptive_rewards WHERE account_id=? ORDER BY id DESC",

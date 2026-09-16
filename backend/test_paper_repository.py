@@ -32,22 +32,33 @@ class PaperRepositoryTests(unittest.TestCase):
         })
 
     def test_account_metric_inputs_batches_legacy_safe_projection(self):
+        """卖出投影必须走唯一的验证谓词：自称成交但无证据的行不得进入绩效口径。
+
+        仓库对**可选列**（realized_pnl / executed_at）保留兼容探测，但闸门列不是
+        可选项：探测不到就把谓词关掉是 fail open，会让同一份投影静默降级。
+        """
         self.conn.executescript(
             """
             CREATE TABLE paper_orders(
                 id INTEGER PRIMARY KEY, account_id TEXT, code TEXT, qty INTEGER,
                 filled_price REAL, amount REAL, fees REAL, status TEXT, side TEXT,
-                created_at TEXT
+                created_at TEXT, execution_status TEXT, execution_verified INTEGER
             );
             CREATE TABLE paper_fills(account_id TEXT, side TEXT);
             CREATE TABLE paper_nav(account_id TEXT, nav_date TEXT, nav REAL, benchmark REAL, created_at TEXT);
-            INSERT INTO paper_orders VALUES(1,'acct','000001',100,10,1000,1,'filled','sell','2026-09-03 10:00:00');
+            INSERT INTO paper_orders VALUES(1,'acct','000001',100,10,1000,1,'filled','sell','2026-09-03 10:00:00','verified',1);
+            INSERT INTO paper_orders VALUES(2,'acct','000002',100,10,1000,1,'filled','sell','2026-09-03 10:00:00',NULL,NULL);
+            INSERT INTO paper_orders VALUES(3,'acct','000003',100,10,1000,1,'filled','sell','2026-09-03 10:00:00','unknown',0);
+            INSERT INTO paper_orders VALUES(4,'acct','000004',100,10,1000,1,'filled','sell','2026-09-03 10:00:00','verified',0);
             INSERT INTO paper_fills VALUES('acct','buy');
             INSERT INTO paper_nav VALUES('acct','2026-09-02',100000,1,'2026-09-02 15:00:00');
             """
         )
         result = repository.account_metric_inputs(self.conn, ["acct"], "2026-09-03")
         self.assertEqual(result["buy_count"], {"acct": 1})
+        # 只有 #1（两列一致且为 verified）进入卖出投影；#2 旧行 NULL、#3 未验证、
+        # #4 两列自相矛盾 —— 全部 fail closed。
+        self.assertEqual([row["id"] for row in result["sells"]["acct"]], [1])
         self.assertEqual(result["sells"]["acct"][0]["realized_pnl"], None)
         self.assertEqual(result["previous_nav"]["acct"]["nav_date"], "2026-09-02")
 

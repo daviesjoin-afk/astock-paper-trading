@@ -26,7 +26,8 @@ class AccountMetricBatchTests(unittest.TestCase):
             CREATE TABLE paper_orders(
                 id INTEGER PRIMARY KEY, account_id TEXT, code TEXT, qty INTEGER,
                 filled_price REAL, amount REAL, fees REAL, status TEXT,
-                realized_pnl REAL, created_at TEXT, executed_at TEXT, side TEXT
+                realized_pnl REAL, created_at TEXT, executed_at TEXT, side TEXT,
+                execution_status TEXT, execution_verified INTEGER
             );
             CREATE TABLE paper_fills(
                 id INTEGER PRIMARY KEY, order_id INTEGER, account_id TEXT,
@@ -47,12 +48,18 @@ class AccountMetricBatchTests(unittest.TestCase):
             "version": "test", "params": "{}", "benchmark_start": 100.0,
         }
         self.conn.executemany(
-            "INSERT INTO paper_orders VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO paper_orders VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             [
                 (1, self.account_id, "000001", 100, 10.0, 1000.0, 5.0,
-                 "filled", 42.5, "2026-08-20 10:00:00", "2026-08-20 10:00:01", "sell"),
+                 "filled", 42.5, "2026-08-20 10:00:00", "2026-08-20 10:00:01", "sell",
+                 "verified", 1),
                 (2, self.account_id, "000002", 100, 11.0, 1100.0, 5.0,
-                 "risk_rejected", None, "2026-08-20 10:01:00", None, "buy"),
+                 "risk_rejected", None, "2026-08-20 10:01:00", None, "buy",
+                 "not_executed", 0),
+                # 自称成交但没有验证列结论：批量与直查两条路径都不得收进去。
+                (4, self.account_id, "000003", 100, 12.0, 1200.0, 5.0,
+                 "filled", 7.5, "2026-08-20 10:02:00", "2026-08-20 10:02:01", "sell",
+                 None, None),
             ],
         )
         self.conn.execute(
@@ -86,6 +93,12 @@ class AccountMetricBatchTests(unittest.TestCase):
         for key in ("trade_count", "risk_blocks", "realized_pnl", "total_pnl",
                     "nav", "max_drawdown_pct", "today_pnl"):
             self.assertEqual(batched[key], uncached[key], key)
+        # 两条路径不仅必须相等，还必须**都被闸门过滤到同一批成交**：
+        # #1 已验证 → 计入；#4 自称成交但缺验证列 → 两条路径都要排除。
+        cache_sells = [row["id"] for row in cache["sells"][self.account_id]]
+        self.assertEqual(cache_sells, [1], cache_sells)
+        self.assertEqual(uncached["trade_count"], batched["trade_count"])
+        self.assertEqual(uncached["realized_pnl"], 42.5)
 
 
 class ApiCacheSingleFlightTests(unittest.TestCase):

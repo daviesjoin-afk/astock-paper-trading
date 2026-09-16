@@ -9,6 +9,7 @@ import time
 import urllib.error
 
 import deepseek_advisor as advisor
+import execution_verification as EV
 
 
 TASKS = {
@@ -75,8 +76,11 @@ def _pnl_evidence(adaptive_conn, paper_db_path):
                 "nav_observations": len(navs),
             })
         asof = max(asof_dates) if asof_dates else None
+        # 归因报告是**执行绩效**：只有被证据证明成交的委托才进入成交明细、
+        # 费用与已实现盈亏汇总。没有验证列的旧行按 fail closed 排除。
         trades = _rows(paper, """SELECT account_id,side,code,name,qty,filled_price,amount,fees,realized_pnl,executed_at
                                   FROM paper_orders WHERE status='filled' AND substr(executed_at,1,10)=?
+                                    AND """ + EV.VERIFIED_PREDICATE + """
                                   ORDER BY abs(COALESCE(realized_pnl,0)) DESC,id DESC LIMIT 30""", (asof,)) if asof else []
         fee_total = round(sum(float(row.get("fees") or 0) for row in trades), 2)
         realized_total = round(sum(float(row.get("realized_pnl") or 0) for row in trades), 2)

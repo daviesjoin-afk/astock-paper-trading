@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""执行真实性层（execution reality layer）本地变异验证工具 M51–M60。
+"""执行真实性层（execution reality layer）本地变异验证工具 M51–M69。
 
 用法::
 
@@ -35,6 +35,13 @@ TEST_MODULES = (
     "test_execution_evidence",
     "test_execution_lifecycle",
     "test_execution_outcome",
+    # PR-150 wiring 的消费层回归：契约本身（上三个）+ 闸门单元 + 接线门禁 +
+    # 生产探针 + 被闸门影响的读模型（指标缓存一致性、仓储投影）。
+    "test_execution_verification",
+    "test_execution_verification_wiring",
+    "test_execution_verification_probe",
+    "test_read_optimizations",
+    "test_paper_repository",
 )
 
 # (id, 目标文件, 变异前源码片段, 变异后源码片段, 说明)
@@ -125,6 +132,82 @@ MUTATIONS = (
         '    if fill_identity_known is None:\n        fill_identity_known = fill_identity_rows is not None\n',
         '    if fill_identity_known is None:\n        fill_identity_known = True\n',
         'identity check self-attested without identity rows',
+    ),
+    # ── PR-150 wiring（消费层接线）：写路径必须盖章、读路径必须同一谓词 ──
+    (
+        'M61',
+        'backend/paper_trading.py',
+        '        EV.stamp_order(conn, order_id)\n        conn.execute(f"RELEASE SAVEPOINT {savepoint}")\n',
+        '        conn.execute(f"RELEASE SAVEPOINT {savepoint}")\n',
+        'strategy buy fill path not stamped',
+    ),
+    (
+        'M62',
+        'backend/paper_trading.py',
+        '                EV.stamp_order(conn, cursor.lastrowid)\n                _risk_log(',
+        '                _risk_log(',
+        'risk exit fill path not stamped',
+    ),
+    (
+        'M63',
+        'backend/paper_trading.py',
+        '    # 日内做T高抛同样是生产成交路径：流水写入后盖章，否则这笔真实卖出被闸门剔除。\n'
+        '    EV.stamp_order(conn, cursor.lastrowid)\n',
+        '',
+        'intraday T sell fill path not stamped',
+    ),
+    (
+        'M64',
+        'backend/paper_trading.py',
+        '            " WHERE account_id=? AND side=\'sell\' AND status=\'filled\' AND "\n'
+        '            + _execution_verified_predicate(),\n',
+        '            " WHERE account_id=? AND side=\'sell\' AND status=\'filled\'",\n',
+        'NAV realized PnL ignores the verification gate',
+    ),
+    (
+        'M65',
+        'backend/paper_repository.py',
+        '        f"AND {EV.VERIFIED_PREDICATE}",\n',
+        '        "",\n',
+        'metric projection ignores the verification gate',
+    ),
+    (
+        'M66',
+        'backend/paper_trading.py',
+        '        sells = list(\n'
+        '            (\n'
+        '                _account_metric_inputs(conn, [account["id"]], today).get("sells") or {}\n'
+        '            ).get(account["id"], [])\n'
+        '        )\n',
+        '        sells = _rows(\n'
+        '            conn,\n'
+        '            "SELECT id,account_id,code,qty,filled_price,amount,fees,status,"\n'
+        '            "realized_pnl,created_at,executed_at FROM paper_orders"\n'
+        '            " WHERE account_id=? AND side=\'sell\' AND status=\'filled\'",\n'
+        '            (account["id"],),\n'
+        '        )\n',
+        'uncached metrics fall back to an ungated query',
+    ),
+    (
+        'M67',
+        'backend/execution_verification.py',
+        '    return numeric == 1 and str(status) == EXECUTION_STATUS_VERIFIED\n',
+        '    return bool(status)\n',
+        'row predicate stops requiring the verified flag',
+    ),
+    (
+        'M68',
+        'backend/execution_verification.py',
+        '        is_verified = bool(verdict["execution_verified"])\n',
+        '        is_verified = True\n',
+        'legacy backfill upgrades rows without evidence',
+    ),
+    (
+        'M69',
+        'backend/paper_trading.py',
+        '    return EV.VERIFIED_PREDICATE\n',
+        '    return "(COALESCE(execution_verified, 0) = 1 AND execution_status = \'verified\')"\n',
+        'second copy of the verification predicate',
     ),
 )
 

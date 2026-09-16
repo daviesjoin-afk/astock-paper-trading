@@ -16,6 +16,7 @@ import statistics
 from collections import Counter
 from adaptive_common import _loads, _json, _clamp  # C3: 收敛重复工具函数
 import paper_repository as PRP
+import execution_verification as EV
 from strategy_registry import labels as strategy_labels
 
 ACCOUNT_NAMES = {
@@ -391,12 +392,16 @@ def _evidence(adaptive, paper, account_id):
         "SELECT regime,raw_reward,excess_return_pct,drawdown_pct FROM adaptive_rewards WHERE account_id=?",
         (account_id,),
     ).fetchall()
+    # 证据量口径：只有**被证据证明**的成交才算执行样本。``status='filled'`` 是
+    # 账本自称，缺验证列的旧行不得抬高自适应学习所依赖的样本量。
     closed_trades = paper.execute(
-        "SELECT COUNT(*) FROM paper_orders WHERE account_id=? AND side='sell' AND status='filled'",
+        "SELECT COUNT(*) FROM paper_orders WHERE account_id=? AND side='sell'"
+        " AND status='filled' AND " + EV.VERIFIED_PREDICATE,
         (account_id,),
     ).fetchone()[0]
     filled_orders = paper.execute(
-        "SELECT COUNT(*) FROM paper_orders WHERE account_id=? AND status='filled'",
+        "SELECT COUNT(*) FROM paper_orders WHERE account_id=? AND status='filled'"
+        " AND " + EV.VERIFIED_PREDICATE,
         (account_id,),
     ).fetchone()[0]
     regimes = sorted({row["regime"] for row in reward_rows if row["regime"] != "unclassified"})
@@ -563,7 +568,9 @@ def _capture_daily_outcomes(adaptive, paper, now):
             # 当日数据被错误归属到旧版本（订单级归因正确，两层口径矛盾）。
             version, candidate_id, _ = _version_context(paper, account["id"], f"{day} 23:59:59")
             order_rows = paper.execute(
-                "SELECT status,side,reason,COALESCE(realized_pnl,0) pnl FROM paper_orders WHERE account_id=? AND substr(created_at,1,10)=?",
+                "SELECT status,side,reason,COALESCE(realized_pnl,0) pnl,"
+                " execution_status,execution_verified"
+                " FROM paper_orders WHERE account_id=? AND substr(created_at,1,10)=?",
                 (account["id"], day),
             ).fetchall()
             attribution = adaptive.execute(
@@ -572,6 +579,10 @@ def _capture_daily_outcomes(adaptive, paper, now):
                 (account["id"], day),
             ).fetchone()
             total = int(attribution["total"] or 0) if attribution else 0
+            # 成交笔数与已实现盈亏是**执行绩效**：只统计被证据证明成交的行。
+            # ``orders`` / 各 status 分布 / stop_exits 记的是当日委托活动本身，
+            # 不声称成交，保持原样。
+            verified_rows = [row for row in order_rows if EV.is_verified_row(row)]
             detail = {"order_statuses": dict((status, sum(1 for row in order_rows if row["status"] == status)) for status in {row["status"] for row in order_rows})}
             adaptive.execute(
                 """INSERT INTO adaptive_risk_daily_outcomes(
@@ -589,10 +600,10 @@ def _capture_daily_outcomes(adaptive, paper, now):
                        execution_integrity_pct=excluded.execution_integrity_pct,
                        detail=excluded.detail,updated_at=excluded.updated_at""",
                 (account["id"], day, version, candidate_id, nav, daily_return, drawdown, len(order_rows),
-                 sum(row["status"] == "filled" for row in order_rows),
+                 sum(row["status"] == "filled" for row in verified_rows),
                  sum(row["status"] == "risk_rejected" for row in order_rows),
                  sum(row["status"] == "deferred_capacity" for row in order_rows),
-                 sum(_num(row["pnl"]) for row in order_rows),
+                 sum(_num(row["pnl"]) for row in verified_rows),
                  sum(row["side"] == "sell" and "止损" in str(row["reason"] or "") for row in order_rows),
                  round(100 * _num(attribution["linked"]) / max(total, 1), 1) if attribution else 0.0,
                  round(100 * _num(attribution["integrity"]) / max(total, 1), 1) if attribution else 100.0,

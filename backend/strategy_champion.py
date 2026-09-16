@@ -13,6 +13,7 @@ import json
 from typing import Any, Mapping
 
 import promotion_science as PS
+import execution_verification as EV
 
 __all__ = [
     "STRATEGY_CHAMPION_VERSION", "ROLE_CHAMPION", "ROLE_CHALLENGER",
@@ -166,10 +167,15 @@ def _metric_result(*, realized, denom, buy_amount, attempts, filled_buys, per_co
 
 
 def collect_ledger_metrics(conn, strategy_id: str, since: str, until: str) -> dict[str, Any]:
-    """Legacy formal-ledger helper retained for callers outside promotion."""
+    """Legacy formal-ledger helper retained for callers outside promotion.
+
+    执行绩效（收益 / 回撤 / 换手 / 成交率）只统计**已验证**成交：``status='filled'``
+    只是账本自称，没有成交流水证据的行不得参与策略排名。
+    """
     orders = [dict(row) for row in conn.execute(
         """SELECT side,status,code,COALESCE(amount,0) amount,COALESCE(realized_pnl,0) realized_pnl,
                   executed_at,created_at FROM paper_orders WHERE account_id=? AND status='filled'
+               AND """ + EV.VERIFIED_PREDICATE + """
                AND executed_at IS NOT NULL AND executed_at>=? AND executed_at<? AND COALESCE(amount,0)>0""",
         (str(strategy_id), str(since), str(until)),
     ).fetchall()]

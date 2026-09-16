@@ -201,6 +201,42 @@ class LegacyCompatibilityTest(unittest.TestCase):
             (verified,)).fetchone()
         self.assertEqual(1, row["execution_verified"], "已验证的行不得被回填改写")
 
+    def test_backfill_verifies_a_legacy_row_that_has_fill_evidence(self):
+        """对照：有**完整成交流水证据**的旧行必须被回填成 ``verified``。
+
+        升级前由生产写路径落库、只是没有盖章的那些行就是真实成交。回填若一律
+        只写 ``unknown``，上线后这些真实成交会永久停在"没有证据"，被闸门从
+        已实现盈亏 / NAV / 执行绩效里整批剔除。
+        """
+        conn = _db()
+        order_id = _insert_order(conn, status="filled")
+        _insert_fill(conn, order_id)
+        conn.execute(
+            "UPDATE paper_orders SET execution_status=NULL,execution_verified=NULL"
+            " WHERE id=?", (order_id,))
+        result = EV.backfill_legacy_orders(conn)
+        self.assertEqual(1, result["stamped"])
+        self.assertEqual(1, result["verified"], "有证据的旧行必须被回填成已验证")
+        row = conn.execute(
+            "SELECT execution_status,execution_verified FROM paper_orders WHERE id=?",
+            (order_id,)).fetchone()
+        self.assertEqual(EV.EXECUTION_STATUS_VERIFIED, row["execution_status"])
+        self.assertEqual(1, row["execution_verified"])
+
+    def test_backfill_never_upgrades_a_row_without_evidence(self):
+        """对照的另一半：没有证据的旧行**绝不**升级 —— 那正是本层要消灭的幻觉。"""
+        conn = _db()
+        order_id = _insert_order(conn, status="filled")
+        conn.execute(
+            "UPDATE paper_orders SET execution_status=NULL,execution_verified=NULL"
+            " WHERE id=?", (order_id,))
+        result = EV.backfill_legacy_orders(conn)
+        self.assertEqual(0, result["verified"])
+        row = conn.execute(
+            "SELECT execution_verified FROM paper_orders WHERE id=?",
+            (order_id,)).fetchone()
+        self.assertEqual(0, row["execution_verified"])
+
     def test_gate_predicate_excludes_null_legacy_rows(self):
         """谓词必须 fail closed：NULL 行被 ``COALESCE`` 取 0 而排除。"""
         conn = _db()
@@ -603,6 +639,59 @@ class CommitFillStampsTest(unittest.TestCase):
         self.assertEqual(EV.EXECUTION_STATUS_VERIFIED, row["execution_status"],
                          "commit_fill 必须为它刚写入的成交盖章 verified")
         self.assertEqual(1, row["execution_verified"])
+
+
+class RowPredicateAgreementTest(unittest.TestCase):
+    """Python 侧谓词必须与 SQL 谓词**逐字对齐**并同样 fail closed。
+
+    两边不一致时，同一行会在"SQL 读路径"与"行列已在手的读路径"之间得到相反
+    结论 —— 执行绩效就会出现两个数字。这条测试把两份谓词钉在一起。
+    """
+
+    CASES = (
+        ("verified", 1, True),
+        ("verified", 0, False),      # 两列不一致 → fail closed
+        ("unknown", 1, False),
+        ("partial", 1, False),
+        ("not_executed", 1, False),
+        (None, None, False),         # 旧行
+        (None, 1, False),
+        ("verified", None, False),
+        ("", 1, False),
+    )
+
+    def test_row_predicate_agrees_with_the_sql_predicate(self):
+        conn = _db()
+        expected = set()
+        for index, (status, flag, verified) in enumerate(self.CASES, start=1):
+            order_id = _insert_order(conn, status="filled")
+            conn.execute(
+                "UPDATE paper_orders SET execution_status=?,execution_verified=?"
+                " WHERE id=?", (status, flag, order_id))
+            if verified:
+                expected.add(order_id)
+        rows = [dict(row) for row in conn.execute(
+            "SELECT id,execution_status,execution_verified FROM paper_orders")]
+        sql_verified = {
+            int(row["id"]) for row in conn.execute(
+                f"SELECT id FROM paper_orders WHERE {EV.VERIFIED_PREDICATE}")
+        }
+        py_verified = {int(row["id"]) for row in rows if EV.is_verified_row(row)}
+        self.assertEqual(sql_verified, py_verified,
+                         "SQL 谓词与 Python 谓词对同一批行给出了不同结论")
+        self.assertEqual(expected, sql_verified,
+                         "只有两列一致且为 verified 的行才算已验证")
+        self.assertTrue(expected, "用例集本身不能空转")
+
+    def test_row_predicate_rejects_rows_without_the_columns(self):
+        """归档快照 / 旧形状的行没有这两列 → 一律不算成交（fail closed）。"""
+        self.assertFalse(EV.is_verified_row({"status": "filled", "side": "sell"}))
+        self.assertFalse(EV.is_verified_row({"execution_status": "verified"}))
+        self.assertFalse(EV.is_verified_row(None))
+        self.assertFalse(EV.is_verified_row({"execution_status": "verified",
+                                             "execution_verified": "yes"}))
+        self.assertTrue(EV.is_verified_row({"execution_status": "verified",
+                                            "execution_verified": True}))
 
 
 if __name__ == "__main__":

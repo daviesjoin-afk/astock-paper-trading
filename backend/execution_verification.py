@@ -54,6 +54,7 @@
 
 from __future__ import annotations
 
+import sqlite3
 from typing import Any, Mapping
 
 try:  # ``backend`` on sys.path（生产与 ``cd backend`` 测试）
@@ -116,6 +117,13 @@ VERIFIED_PREDICATE = (
 #: 未验证谓词（统计"被闸门拦下多少"用，不是用来放行的）。
 UNVERIFIED_PREDICATE = "NOT " + VERIFIED_PREDICATE
 
+#: 谓词里要求的两列。**任何**模块都不得自己拼这两列的字面量条件 ——
+#: 需要 SQL 就用 :data:`VERIFIED_PREDICATE`，需要判断一行用
+#: :func:`is_verified_row`。架构测试会拒绝重复实现。
+VERIFIED_PREDICATE_COLUMNS = ("execution_verified", "execution_status")
+#: 架构测试据此识别"有人在 SQL 里手写了一份谓词"。
+VERIFIED_PREDICATE_SIGNATURE = "execution_status = 'verified'"
+
 
 def status_from_verdict(verdict: Any) -> str:
     """把 PR150 的 ``fill_verdict`` 映射成本层四态。
@@ -128,6 +136,48 @@ def status_from_verdict(verdict: Any) -> str:
 def is_verified_status(status: Any) -> bool:
     """只有 ``verified`` 才是 ``execution_verified = True``。"""
     return str(status or "") == EXECUTION_STATUS_VERIFIED
+
+
+def _row_field(row: Any, name: str) -> Any:
+    """从 dict / sqlite3.Row / 普通对象里取一个字段；取不到给 ``None``。"""
+    if isinstance(row, Mapping):
+        return row.get(name)
+    keys = getattr(row, "keys", None)
+    if callable(keys):
+        try:
+            if name in row.keys():
+                return row[name]
+        except Exception:  # pragma: no cover - 防御未来行类型
+            return None
+        return None
+    return getattr(row, name, None)
+
+
+def is_verified_row(row: Any) -> bool:
+    """Python 侧的 :data:`VERIFIED_PREDICATE`：一行账本是否被证明成交。
+
+    SQL 读路径必须用 :data:`VERIFIED_PREDICATE`；只有在行的列已经在手
+    （归档快照、已读出的 dict / sqlite3.Row）时才用本函数，避免再下发一次查询。
+
+    与 SQL 谓词**逐字对齐**：同时要求 ``execution_verified`` 为真与
+    ``execution_status == 'verified'``。缺列、``NULL``、两列不一致一律
+    ``False``（fail closed）—— 旧行与归档快照里没有这两列，因此**不会**
+    因为 ``status='filled'`` 就被当成成交。
+    """
+    if row is None:
+        return False
+    flag = _row_field(row, "execution_verified")
+    status = _row_field(row, "execution_status")
+    if flag is None or status is None:
+        return False
+    try:
+        # 与 SQL 的 ``COALESCE(execution_verified,0) = 1`` 对齐：只有数值 1 通过。
+        # 非数值（例如被塞进 'yes'）在 SQLite 里会被当作 TEXT，比较结果为假，
+        # 这里也必须是假，否则两侧谓词就会给出不同结论。
+        numeric = int(flag)
+    except (TypeError, ValueError):
+        return False
+    return numeric == 1 and str(status) == EXECUTION_STATUS_VERIFIED
 
 
 def verification_from_evidence(evidence: Any, *, fill_rows_present: bool = True) -> dict:
@@ -244,6 +294,31 @@ def _load_fills_with_identity(conn, order_id: Any) -> list:
     return [dict(row) for row in rows]
 
 
+#: 批量读流水时每批的订单数上限（SQLite 变量数量上限是 999）。
+_FILL_FETCH_CHUNK = 400
+
+
+def _fills_for_orders(conn, order_ids: Any) -> dict:
+    """一次批量读出多笔委托的流水，避免逐行回填把启动拖成 O(n) 次查询。"""
+    grouped: dict = {}
+    ids = [int(value) for value in order_ids]
+    for start in range(0, len(ids), _FILL_FETCH_CHUNK):
+        chunk = ids[start:start + _FILL_FETCH_CHUNK]
+        placeholders = ",".join("?" for _ in chunk)
+        try:
+            rows = conn.execute(
+                "SELECT order_id,account_id,side,code,qty,price,amount,fees,fill_date,quote_at"
+                f" FROM paper_fills WHERE order_id IN ({placeholders}) ORDER BY id",
+                tuple(chunk),
+            ).fetchall()
+        except sqlite3.OperationalError:
+            # 流水表还不存在（新库/最小 fixture 上跑迁移）→ 没有任何成交证据。
+            return grouped
+        for row in rows:
+            grouped.setdefault(int(row["order_id"]), []).append(dict(row))
+    return grouped
+
+
 def stamp_order(conn, order_id: Any) -> dict:
     """把验证结论写回 ``paper_orders`` 的三列。返回写入的结论。
 
@@ -270,35 +345,59 @@ def stamp_order(conn, order_id: Any) -> dict:
     return verdict
 
 
-def backfill_legacy_orders(conn) -> dict:
-    """给尚未盖章的旧行补上**未知**结论（幂等）。
+def backfill_legacy_orders(conn, *, limit: Any = None) -> dict:
+    """给尚未盖章的行补上结论（幂等，批量）。
 
-    Phase 4：旧行没有证据 → ``unknown``，且**不**自动升级为 ``verified``。
-    这里只写"未知"，不碰任何 ``execution_verified=1`` 的行。
+    Phase 4：旧行的结论**由证据决定**，不按 ``status`` 猜：
+
+    * 没有成交流水（或流水不足以证明满额成交）→ ``unknown``，
+      **不**自动升级为 ``verified``；
+    * 有**完整**成交流水证据（数量对得上、价格与时段可信）→ ``verified``。
+      这正是升级前由生产写路径落库、却因为没有盖章而从统计里消失的**真实成交**，
+      回填把它们的结论一次算清，避免"上线即把历史真实成交当成没发生"。
+
+    只处理 ``execution_status IS NULL`` 的行，已经盖过章的行永不重写（幂等）。
+    读路径**不得**调用它（写库会与 3 分钟 worker 抢锁）；它只属于迁移与
+    显式的运维入口。
     """
-    rows = conn.execute(
-        "SELECT id FROM paper_orders WHERE execution_status IS NULL"
-    ).fetchall()
-    stamped = 0
-    for row in rows:
-        order_row = conn.execute(
-            "SELECT * FROM paper_orders WHERE id=?", (row["id"],)
-        ).fetchone()
+    sql = "SELECT * FROM paper_orders WHERE execution_status IS NULL"
+    params: tuple = ()
+    if limit:
+        sql += " LIMIT ?"
+        params = (int(limit),)
+    try:
+        cursor = conn.execute(sql, params)
+        columns = [item[0] for item in cursor.description]
+        # 连接可能没有设 ``row_factory``（迁移器用的是裸连接）→ 按列名转字典，
+        # 不依赖行对象支持字符串下标。
+        orders = [dict(zip(columns, row, strict=True)) for row in cursor.fetchall()]
+    except sqlite3.OperationalError:
+        # 迁移会在"表还不存在"的库上运行（新建库 / 最小 fixture）：
+        # 没有订单可回填，按"零行"返回，绝不因此让迁移失败。
+        return {"stamped": 0, "verified": 0, "scanned": 0}
+    if not orders:
+        return {"stamped": 0, "verified": 0, "scanned": 0}
+    fills_by_order = _fills_for_orders(conn, [row["id"] for row in orders])
+    updates = []
+    verified = 0
+    for row in orders:
         verdict = verification_for_order(
-            dict(order_row), _load_fills_with_identity(conn, row["id"])
+            dict(row), fills_by_order.get(int(row["id"]), [])
         )
-        conn.execute(
-            "UPDATE paper_orders SET execution_status=?, execution_verified=?,"
-            " execution_evidence_source=? WHERE id=?",
-            (
-                verdict["execution_status"],
-                int(bool(verdict["execution_verified"])),
-                verdict["execution_evidence_source"],
-                row["id"],
-            ),
-        )
-        stamped += 1
-    return {"stamped": stamped}
+        is_verified = bool(verdict["execution_verified"])
+        verified += int(is_verified)
+        updates.append((
+            verdict["execution_status"],
+            int(is_verified),
+            verdict["execution_evidence_source"],
+            row["id"],
+        ))
+    conn.executemany(
+        "UPDATE paper_orders SET execution_status=?, execution_verified=?,"
+        " execution_evidence_source=? WHERE id=?",
+        updates,
+    )
+    return {"stamped": len(updates), "verified": verified, "scanned": len(orders)}
 
 
 def gate_report(rows: Any) -> dict:
@@ -363,6 +462,14 @@ def _self_check() -> None:
     # 谓词必须是 fail closed 的：NULL 行被排除。
     assert "COALESCE(execution_verified, 0) = 1" in VERIFIED_PREDICATE
     assert "execution_status = 'verified'" in VERIFIED_PREDICATE
+
+    # Python 侧谓词与 SQL 谓词逐字对齐，且同样 fail closed。
+    assert is_verified_row({"execution_status": "verified", "execution_verified": 1})
+    assert not is_verified_row({"execution_status": "verified", "execution_verified": 0})
+    assert not is_verified_row({"execution_status": "unknown", "execution_verified": 1})
+    assert not is_verified_row({"status": "filled"}), "旧行缺列不得被当成成交"
+    assert not is_verified_row({"execution_status": None, "execution_verified": None})
+    assert not is_verified_row(None)
 
     report = gate_report([
         {"execution_status": EXECUTION_STATUS_VERIFIED},

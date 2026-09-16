@@ -34,6 +34,25 @@ def _ensure_strategy_versioning(conn):
     strategy_registry.ensure_schema(conn)
     return paper_schema.ensure_strategy_reference_columns(conn)
 
+
+def _backfill_execution_verification(conn):
+    """按**证据**回填执行验证结论（v11 建列之后的第二步，幂等）。
+
+    只处理 ``execution_status IS NULL`` 的行，逐行由
+    :func:`execution_verification.backfill_legacy_orders` 判定：
+
+    * 有完整成交流水证据 → ``verified``（升级前由生产写路径落库、却因为没有
+      盖章而从统计里消失的**真实成交**，一次算清）；
+    * 没有证据或证据不足 → ``unknown``，**绝不**因为 ``status='filled'`` 升级。
+
+    只把"账本自称"升级成"证据证明"是这一层唯一禁止的事；按证据判定本身就是
+    闸门的定义，因此回填不是数据改写而是结论材料化。
+    """
+    import execution_verification as EV
+
+    return EV.backfill_legacy_orders(conn)
+
+
 # 迁移注册表：db_name -> [(version, description, sql_or_callable), ...]
 MIGRATIONS = {
     "paper_trading": [
@@ -64,6 +83,10 @@ MIGRATIONS = {
         # 绝不因为 status='filled' 就自动升级为真实成交。
         (11, "新增执行验证闸门字段（execution_status/verified/evidence_source）",
          paper_schema.ensure_execution_verification_columns),
+        # PR-150 wiring（补完）：把历史行的验证结论按**证据**一次性算清。没有这步，
+        # 升级前由生产写路径落库的真实成交会永久停在 NULL，被闸门当成"没有证据"
+        # 而从已实现盈亏 / NAV / 执行绩效里消失。
+        (12, "按成交流水证据回填执行验证结论（幂等）", _backfill_execution_verification),
     ],
     "adaptive_learning": [
         (1, "创建 schema_version 表", """

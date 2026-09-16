@@ -16,6 +16,8 @@ import math
 import os
 import sqlite3
 from collections import Counter, defaultdict
+
+import execution_verification as EV
 try:
     from zoneinfo import ZoneInfo
     TZ = ZoneInfo("Asia/Shanghai")
@@ -542,11 +544,15 @@ def _paper_orders(paper_db_path, target_date):
             """SELECT o.id,o.account_id,o.side,o.code,o.name,o.qty,
                       o.planned_price,o.amount,o.fees,o.status,o.reason,
                       o.realized_pnl,o.created_at,o.executed_at,
+                      o.execution_status,o.execution_verified,
                       length(COALESCE(o.risk_payload,'')) AS risk_payload_bytes,
                       f.id AS fill_id,f.price AS fill_price,f.amount AS fill_amount,
                       f.fees AS fill_fees,f.fill_date,f.quote_at AS fill_quote_at,f.assumption AS fill_assumption
                  FROM paper_orders o LEFT JOIN paper_fills f ON f.order_id=o.id
                 WHERE substr(COALESCE(f.fill_date,o.executed_at,o.created_at),1,10)<=?
+                  -- 归因是**执行绩效**：只排除"自称成交却没有证据"的行；
+                  -- 被拒/撤单/过期等从未声称成交的行照旧保留，拒绝分析不受影响。
+                  AND (o.status<>'filled' OR """ + EV.VERIFIED_PREDICATE + """)
                 ORDER BY o.id""",
             (target_date.isoformat(),),
         ).fetchall()
@@ -706,6 +712,9 @@ def _pending_items(conn, target_date):
                   CASE WHEN json_valid(context) THEN json_extract(context,'$.order_reason') END AS order_reason
              FROM adaptive_trade_attributions
            WHERE fill_date<=? AND order_status='filled'
+             -- 归因表里的"成交"证据就是 fill_id：没有流水的旧行不得占用 AI 归因
+             -- 预算，也不得进入归因统计（与 paper_orders 的验证闸门同一口径）。
+             AND fill_id IS NOT NULL
              AND (ai_status IN ('pending','failed_fallback','deterministic_fallback') OR ai_summary IS NULL)
            ORDER BY id DESC LIMIT 120""",
         (target_date.isoformat(),),
@@ -803,7 +812,12 @@ def summary_from_conn(conn, limit=120):
             reason_counts[str(reason)] += 1
     account_summary = {}
     for account_id, items in by_account.items():
-        filled = [row for row in items if row.get("order_status") == "filled"]
+        # 成交样本要求有成交流水证据（fill_id）。先前写入的"自称成交但无流水"
+        # 的归因行保留在明细里供审计，但不得抬高均值样本量。
+        filled = [
+            row for row in items
+            if row.get("order_status") == "filled" and row.get("fill_id") is not None
+        ]
         moves = [_num(row.get("stock_move_pct")) for row in filled]
         alphas = [_num(row.get("stock_alpha_pct")) for row in filled]
         news = [_num(row.get("news_impact_score"), 0.0) for row in filled]
