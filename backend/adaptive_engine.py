@@ -1273,6 +1273,7 @@ def _persist_research_dataset(conn, cutoff):
     )
     return {
         "status": "ok",
+        "build": build,
         "contract_version": build.contract_version,
         "dataset_fingerprint": build.fingerprint,
         "eligible_rows": build.eligible_rows,
@@ -1287,7 +1288,15 @@ def _normalize_genome(weights):
 
 
 def _alpha_dataset(conn, max_rows_per_window=ALPHA_MAX_ROWS_PER_WINDOW):
-    """Build a bounded GA dataset without materializing the full join."""
+    """Bounded raw row set -- raw evidence only, never a partition authority.
+
+    A chronological-looking slice of this set is *not* scientific evidence: it
+    knows nothing about PIT availability, label maturity, overlapping future
+    labels, the canonical cutoff or the dataset fingerprint.  Since the
+    learning-closure change, only ``learning_dataset.build_dataset()`` may decide
+    train/validation/test boundaries.  Kept because callers still want a cheap
+    raw cross-section for display and diagnostics.
+    """
     cap = max(100, int(max_rows_per_window))
     # ``BETWEEN`` 顺带把 ±Inf 挡在 center 之外：SQLite 会把 NaN 存成 NULL
     # （因此被 ``NOT NULL`` 拒绝），但 ±Inf 是**能落库**的。一个 Inf 就能把
@@ -1358,7 +1367,244 @@ def _crossover(left, right, rng):
     return AG.crossover(left, right, rng, ALPHA_FEATURES)
 
 
-def _run_alpha_lab(conn, run_date):
+class _AlphaLabBlocked(Exception):
+    """Canonical dataset cannot serve as scientific evidence: fail closed.
+
+    Carries a machine-readable ``status`` so the run is auditable, and never
+    carries a fallback that would let candidate selection continue.
+    """
+
+    def __init__(self, status, detail):
+        super().__init__(str(detail.get("reason") or status))
+        self.status = status
+        self.detail = detail
+
+
+def _canonical_dataset_detail(build):
+    """The dataset identity every alpha run must be able to report (§8).
+
+    Purely additive audit payload: it is written into the existing
+    ``adaptive_alpha_runs.detail`` JSON column, so no schema migration is needed.
+    """
+    parts = build.partitions
+
+    def _dates(name):
+        return sorted({str(sample.feature_asof) for sample in (parts.get(name) or [])})
+
+    return {
+        "dataset_contract_version": build.contract_version,
+        "dataset_fingerprint": build.fingerprint,
+        "cutoff": build.cutoff,
+        "split_spec": {name: build.split_spec[name] for name in learning_dataset.PARTITIONS},
+        "split_source": "learning_dataset",
+        "partition_rows": {
+            name: len(parts.get(name) or []) for name in learning_dataset.PARTITIONS
+        },
+        "purge_counts": {
+            name: int(build.purge_counts.get(name, 0)) for name in learning_dataset.PARTITIONS
+        },
+        "train_dates": _dates("train"),
+        "validation_dates": _dates("validation"),
+        "test_dates": _dates("test"),
+        "truncated": bool(build.truncated),
+        # Explicitly recorded rather than silently assumed: no walk-forward
+        # window is invented by this PR, but the pipeline stays embargo-aware
+        # instead of hard-coding "embargo can never exist".
+        "embargo_sessions": 0,
+        "embargo_reason": (
+            "no established business convention; no tuning introduced in this PR"
+        ),
+        "execution_authority": "none",
+    }
+
+
+def _canonical_dataset_blocker(build, prior):
+    """Return a blocker detail when ``build`` may not serve as evidence, else None.
+
+    Applied to BOTH dataset sources.  A build handed over by the learning cycle
+    is not automatically trustworthy: it gets the same contract validation as a
+    deterministically rebuilt one, so a truncated or empty dataset can never
+    reach candidate selection just because it arrived via option A.
+    """
+    base = {"feature_transformer": list(ALPHA_FEATURES), "neural_network": False}
+    if not getattr(build, "fingerprint", None) or not getattr(build, "manifest", None):
+        detail = dict(base)
+        detail.update({
+            "reason": "canonical dataset produced no manifest or fingerprint",
+            "blocker": "dataset_contract_blocker",
+        })
+        return detail
+    if prior and str(prior) != str(build.fingerprint):
+        detail = dict(base)
+        detail.update({
+            "reason": (
+                "alpha lab is not using the dataset whose fingerprint the "
+                "learning cycle persisted; candidate selection is blocked"
+            ),
+            "blocker": "dataset_fingerprint_mismatch",
+            "persisted_fingerprint": str(prior),
+            "rebuilt_fingerprint": str(build.fingerprint),
+            "cutoff": build.cutoff,
+        })
+        return detail
+    if build.truncated:
+        detail = dict(base)
+        detail.update({
+            "reason": "canonical evidence was truncated; the dataset is not provably complete",
+            "blocker": "truncated_evidence",
+            "cutoff": build.cutoff,
+        })
+        return detail
+    if build.eligible_rows <= 0:
+        detail = dict(base)
+        detail.update({
+            "reason": "canonical dataset has no PIT-eligible rows",
+            "blocker": "pit_eligible_rows_empty",
+            "cutoff": build.cutoff,
+        })
+        return detail
+    return None
+
+
+def _canonical_alpha_build(conn, run_date, *, dataset_build=None, expected_fingerprint=None):
+    """Return the canonical dataset for this alpha run, or refuse to continue.
+
+    Two accepted shapes (option A is preferred):
+
+    A. the caller hands over the ``DatasetBuild`` produced earlier in the same
+       learning cycle, so train/validation/test provably come from the very
+       dataset whose fingerprint the cycle already recorded;
+    B. this function deterministically rebuilds it, in which case the rebuilt
+       fingerprint must equal the previously persisted one.  A mismatch is a
+       hard blocker -- never a warning, never "they should be the same anyway".
+    """
+    prior = expected_fingerprint
+    if prior is None:
+        # Look up the prior manifest *before* building, so a build triggered
+        # here can never be compared against itself.
+        row = conn.execute(
+            f"SELECT dataset_fingerprint FROM {learning_dataset.MANIFEST_TABLE} "
+            "WHERE cutoff=? AND code_build_identity=? ORDER BY created_at DESC LIMIT 1",
+            (run_date, ENGINE_VERSION),
+        ).fetchone()
+        prior = (row[0] if row is not None else None)
+
+    if dataset_build is not None:
+        detail = _canonical_dataset_blocker(dataset_build, prior)
+        if detail is not None:
+            raise _AlphaLabBlocked("waiting_dataset", detail)
+        return dataset_build
+
+    try:
+        build = learning_dataset.build_dataset(
+            conn,
+            cutoff=run_date,
+            code_build_identity=ENGINE_VERSION,
+            persist=False,
+        )
+    except ValueError as exc:
+        # An unparseable cutoff must block the run, not silently widen the
+        # window to the end of the day.
+        raise _AlphaLabBlocked("waiting_dataset", {
+            "reason": f"learning cutoff is not provable: {exc}",
+            "blocker": "unprovable_cutoff",
+            "cutoff": run_date,
+            "feature_transformer": list(ALPHA_FEATURES),
+            "neural_network": False,
+        }) from exc
+
+    detail = _canonical_dataset_blocker(build, prior)
+    if detail is not None:
+        raise _AlphaLabBlocked("waiting_dataset", detail)
+    # Idempotent: the fingerprint is the primary key, so re-recording the same
+    # dataset is a no-op and can never rewrite a previously recorded fact.
+    learning_dataset.persist_manifest(conn, build.manifest)
+    return build
+
+
+def _canonical_alpha_frame(build, *, max_rows_per_window=ALPHA_MAX_ROWS_PER_WINDOW):
+    """Project canonical partitions into the GA row contract, one partition at a time.
+
+    Cross-sectional excess is centred **inside each partition**: the benchmark
+    for the validation window is computed from validation rows only.  Centring
+    over the union would let a test-period outcome move a train row's fitness,
+    which is exactly the leakage this PR exists to close.
+
+    Rows are keyed and capped deterministically by canonical identity, so
+    SQLite row order can never change the GA input.
+    """
+    frame = {}
+    cap = max(100, int(max_rows_per_window))
+    for name in learning_dataset.PARTITIONS:
+        grouped = defaultdict(list)
+        for sample in (build.partitions.get(name) or []):
+            grouped[(str(sample.feature_asof), int(sample.horizon))].append(sample)
+        rows = []
+        for key in sorted(grouped):
+            window = grouped[key]
+            values = [_num(sample.target, None) for sample in window]
+            finite = [value for value in values if value is not None]
+            if not finite:
+                # A window with no finite outcome contributes no samples: an
+                # unknown future return is not a 0% return.
+                continue
+            center = sum(finite) / len(finite)
+            window_rows = []
+            for sample, value in zip(window, values, strict=True):
+                if value is None:
+                    continue
+                row = {str(feature): sample.features[feature] for feature in sample.features}
+                row["profile_date"] = key[0]
+                row["code"] = str(sample.code)
+                row["horizon"] = key[1]
+                row["excess_return_pct"] = value - center
+                window_rows.append(row)
+            window_rows.sort(key=lambda item: (item["profile_date"], item["horizon"], item["code"]))
+            if len(window_rows) > cap:
+                salt = f"{key[0]}:{key[1]}:"
+                window_rows = sorted(
+                    window_rows,
+                    key=lambda item: hashlib.sha256(
+                        f"{salt}{item['code']}".encode("utf-8")
+                    ).digest(),
+                )[:cap]
+            rows.extend(window_rows)
+        frame[name] = rows
+    return frame
+
+
+def _invalidate_alpha_candidates(conn, run_date):
+    """Drop this date's candidate rows when the run does not select any.
+
+    ``adaptive_alpha_candidates`` is read independently of the run status -- by
+    ``_overview_uncached()`` and ``deepseek_research._overfit_evidence()`` -- so a
+    run that previously completed and is now blocked (or short of samples) would
+    otherwise keep presenting stale rows, including ``shadow_candidate`` entries,
+    as valid.  A hard blocker must retract the claim it is blocking.
+
+    Deleting rather than marking: the rows describe a candidate set that this run
+    no longer stands behind, and no downstream reader honours an invalidation
+    flag.  Called in the same transaction as the run record, so readers never see
+    a blocked run alongside live candidates.
+    """
+    conn.execute("DELETE FROM adaptive_alpha_candidates WHERE run_date=?", (run_date,))
+
+
+def _record_blocked_alpha_run(conn, run_date, status, profile_days, mature_rows, detail):
+    """Persist a fail-closed alpha run and return it.  No candidate is written."""
+    now = _now()
+    _invalidate_alpha_candidates(conn, run_date)
+    conn.execute(
+        """INSERT INTO adaptive_alpha_runs(run_date,status,profile_days,mature_rows,generations,detail,created_at,updated_at)
+           VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(run_date) DO UPDATE SET status=excluded.status,
+           profile_days=excluded.profile_days,mature_rows=excluded.mature_rows,generations=excluded.generations,
+           detail=excluded.detail,updated_at=excluded.updated_at""",
+        (run_date, status, profile_days, mature_rows, 0, _json(detail), now, now),
+    )
+    return {"status": status, "profile_days": profile_days, "mature_rows": mature_rows, "detail": detail}
+
+
+def _run_alpha_lab(conn, run_date, *, dataset_build=None, expected_fingerprint=None):
     profile_days = conn.execute(
         "SELECT COUNT(DISTINCT profile_date) FROM adaptive_alpha_samples"
     ).fetchone()[0]
@@ -1372,6 +1618,9 @@ def _run_alpha_lab(conn, run_date):
             "feature_transformer": list(ALPHA_FEATURES),
             "neural_network": False,
         }
+        # Same retraction rule as a blocked run: falling below the sample gate
+        # must not leave a previous run's candidates standing.
+        _invalidate_alpha_candidates(conn, run_date)
         conn.execute(
             """INSERT INTO adaptive_alpha_runs(run_date,status,profile_days,mature_rows,generations,detail,created_at,updated_at)
                VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(run_date) DO UPDATE SET status=excluded.status,
@@ -1380,16 +1629,63 @@ def _run_alpha_lab(conn, run_date):
         )
         return {"status": "waiting_data", "profile_days": profile_days, "mature_rows": mature_rows, "detail": detail}
 
-    dataset = _alpha_dataset(conn)
-    dates = sorted({row["profile_date"] for row in dataset})
-    split = max(1, int(len(dates) * 0.70))
-    train_dates, validation_dates = set(dates[:split]), set(dates[split:])
-    train = [row for row in dataset if row["profile_date"] in train_dates]
-    validation = [row for row in dataset if row["profile_date"] in validation_dates]
-    if len(validation_dates) < 2:
-        return {"status": "waiting_validation_window", "profile_days": profile_days, "mature_rows": mature_rows}
+    # ── canonical dataset: the ONLY authority for train/validation/test ──
+    # The raw ``_alpha_dataset()`` row set is deliberately NOT used to decide
+    # partition boundaries: it knows nothing about PIT availability, label
+    # maturity, overlapping future labels, the canonical cutoff or the dataset
+    # fingerprint, so a chronological-looking 70/30 of it is not evidence.
+    try:
+        build = _canonical_alpha_build(
+            conn, run_date,
+            dataset_build=dataset_build,
+            expected_fingerprint=expected_fingerprint,
+        )
+    except _AlphaLabBlocked as blocked:
+        return _record_blocked_alpha_run(
+            conn, run_date, blocked.status, profile_days, mature_rows, blocked.detail
+        )
 
-    rng = random.Random(f"{ENGINE_VERSION}:{run_date}")
+    frame = _canonical_alpha_frame(build)
+    train, validation, test = frame["train"], frame["validation"], frame["test"]
+    validation_dates = sorted({row["profile_date"] for row in validation})
+    test_dates = sorted({row["profile_date"] for row in test})
+
+    # Fail closed.  An unusable partition is never repaired by shrinking the
+    # window, lowering the bar, or borrowing rows from another partition --
+    # that is a policy decision, not something code may decide silently.
+    for partition_name, partition_rows in (("train", train), ("validation", validation), ("test", test)):
+        if partition_rows:
+            continue
+        detail = dict(_canonical_dataset_detail(build))
+        detail.update({
+            "reason": (
+                f"canonical {partition_name} partition is empty; "
+                "candidate selection is blocked"
+            ),
+            "blocker": f"empty_{partition_name}_partition",
+            "feature_transformer": list(ALPHA_FEATURES),
+            "neural_network": False,
+        })
+        return _record_blocked_alpha_run(
+            conn, run_date, "waiting_validation_window", profile_days, mature_rows, detail
+        )
+    if len(validation_dates) < 2:
+        detail = dict(_canonical_dataset_detail(build))
+        detail.update({
+            "reason": "canonical validation window spans fewer than two sessions",
+            "blocker": "validation_window_too_short",
+            "feature_transformer": list(ALPHA_FEATURES),
+            "neural_network": False,
+        })
+        return _record_blocked_alpha_run(
+            conn, run_date, "waiting_validation_window", profile_days, mature_rows, detail
+        )
+
+    # Generation is bound to the dataset identity, not merely to the day: if the
+    # underlying evidence changes, the run must not masquerade as the same
+    # experiment.  ``random.Random`` seeds a str deterministically across
+    # processes, unlike the built-in ``hash()``.
+    rng = random.Random(f"{ENGINE_VERSION}:{run_date}:{build.fingerprint}")
     seeds = [
         _normalize_genome({"price_momentum": .35, "main_flow": .35, "turnover": .08, "volume_ratio": .12, "small_size": .05, "value": .05}),
         _normalize_genome({"price_momentum": -.15, "main_flow": .35, "turnover": -.15, "volume_ratio": .10, "small_size": .10, "value": .15}),
@@ -1444,13 +1740,17 @@ def _run_alpha_lab(conn, run_date):
     detail = {
         "population": 32,
         "generations": generations,
-        "fitness_rows": len(dataset),
+        "fitness_rows": len(train) + len(validation) + len(test),
         "max_rows_per_window": ALPHA_MAX_ROWS_PER_WINDOW,
-        "train_dates": sorted(train_dates),
-        "validation_dates": sorted(validation_dates),
         "feature_transformer": list(ALPHA_FEATURES),
         "neural_network": False,
         "leaders": leaders,
+        # ── canonical dataset identity.  ``train_dates`` / ``validation_dates``
+        # are still recorded, but they are now derived from the canonical
+        # partition rather than decided by this module. ──
+        "dataset": _canonical_dataset_detail(build),
+        "heldout_test_rows": len(test),
+        "heldout_test_dates": test_dates,
     }
     conn.execute(
         """INSERT INTO adaptive_alpha_runs(run_date,status,profile_days,mature_rows,generations,detail,created_at,updated_at)
@@ -1906,10 +2206,20 @@ def run_learning_cycle(trigger="manual"):
                 "status": "failed",
                 "error": f"{type(exc).__name__}: {exc}"[:200],
             }
+        # Option A: hand the alpha lab the very DatasetBuild this cycle already
+        # fingerprinted, so the two stages provably share one dataset.  When the
+        # build failed, the lab falls back to its own deterministic rebuild and
+        # must still match the persisted fingerprint.
+        alpha_dataset_build = dataset_manifest.get("build")
         gc.collect()
         _learning_update_stage(run_id, "alpha_lab")
         with _connect() as conn:
-            alpha_lab = _run_alpha_lab(conn, profile["profile_date"])
+            alpha_lab = _run_alpha_lab(
+                conn,
+                profile["profile_date"],
+                dataset_build=alpha_dataset_build,
+                expected_fingerprint=dataset_manifest.get("dataset_fingerprint"),
+            )
         print(f"[learning-cycle] stage1 profile+alpha done regime={profile.get('regime')} "
               f"samples={alpha_samples} returns={new_alpha_returns} "
               f"dataset={dataset_manifest.get('status')} lab={alpha_lab.get('status')}", flush=True)
@@ -3422,7 +3732,9 @@ def self_test():
             "SELECT id FROM adaptive_market_profiles WHERE profile_date=?", (profile["profile_date"],)
         ).fetchone()["id"])
         assert abs(sum(decision["weights"].values()) - 100) <= 0.2
-        assert alpha_lab["status"] in {"waiting_data", "waiting_validation_window", "completed"}
+        assert alpha_lab["status"] in {
+            "waiting_data", "waiting_dataset", "waiting_validation_window", "completed"
+        }
     return {"profile": profile["regime"], "valid_rows": profile["valid_rows"],
             "alpha_lab": alpha_lab["status"], "status": "ok"}
 
