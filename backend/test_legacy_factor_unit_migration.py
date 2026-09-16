@@ -863,9 +863,13 @@ class StartupPathTests(unittest.TestCase):
 
     def test_startup_path_contains_the_migration(self):
         entries = db_migrate.MIGRATIONS["paper_trading"]
-        self.assertEqual(entries[-1][2], C.migrate_legacy_selection_units,
-                         "v10 必须接在 db_migrate 这条 canonical 启动路径上")
-        self.assertGreater(entries[-1][0], 9)
+        handlers = [entry[2] for entry in entries]
+        self.assertIn(C.migrate_legacy_selection_units, handlers,
+                      "legacy 选股动量单位迁移必须接在 canonical 启动路径上")
+        versions = [entry[0] for entry in entries]
+        self.assertEqual(versions, sorted(versions), "迁移版本号必须递增")
+        self.assertEqual(len(versions), len(set(versions)), "迁移版本号不得重复")
+        self.assertGreaterEqual(max(versions), 10)
 
     def test_startup_path_migrates_then_self_marks(self):
         self._fixture_db(_legacy_params())
@@ -873,7 +877,8 @@ class StartupPathTests(unittest.TestCase):
         params, audits, version = self._read()
         self.assertEqual(params["adaptive_selection"]["conditions"]["individual_mom5_min"], CANONICAL)
         self.assertEqual(len(audits), 1)
-        self.assertEqual(version, 10)
+        # 版本号取自迁移表本身，而不是写死字面量（新增迁移不应打断这条断言）。
+        self.assertEqual(version, max(entry[0] for entry in db_migrate.MIGRATIONS["paper_trading"]))
 
     def test_startup_path_second_boot_is_a_noop(self):
         self._fixture_db(_legacy_params())
@@ -883,7 +888,7 @@ class StartupPathTests(unittest.TestCase):
         params, audits_after_second, version = self._read()
         self.assertEqual(params["adaptive_selection"]["conditions"]["individual_mom5_min"], CANONICAL)
         self.assertEqual(audits_after_second, audits_after_first, "重复启动不得新增 audit")
-        self.assertEqual(version, 10)
+        self.assertEqual(version, max(entry[0] for entry in db_migrate.MIGRATIONS["paper_trading"]))
 
     def test_startup_path_missing_database_is_skipped(self):
         db_migrate.migrate("paper_trading", path=os.path.join(self.dir, "nope.sqlite3"), backup=False)
