@@ -287,11 +287,17 @@ def _resolve_action_state(code, session, *, decision_day, decision_name,
     ``coverage`` 会累计：
 
     * ``required`` —— 需要动作时状态的 (code, session) 次数；
-    * ``resolved`` —— 真的拿到可用 name / risk_flag 的次数。
+    * ``resolved`` —— 状态**真的可用**的次数，判据是契约自己的
+      :func:`selection_tradability.action_state_usable`，**不是**"字段非 ``None``"。
 
     "provider 对象存在"与"动作状态真的解析出来了"是两件事：一个 provider 可能
     对每个 session 都返回 ``None``，此时 executable 覆盖度是 0，报告不得声称
     可执行指标可用。
+
+    这里**绝不**自己判断可用性。曾经用 ``name is not None or flag is not None``：
+    一个 ``{"name": None, "risk_flag": "maybe"}`` 会被记成 resolved，而契约对
+    同一份状态判 ``unproven / unknown_st_status`` —— 覆盖度与契约必须同一口径，
+    否则报告会自称"覆盖 3/3"却一条可执行样本都算不出来。
     """
     name, flag = _action_security_state(
         code, session, decision_day=decision_day, decision_name=decision_name,
@@ -299,7 +305,8 @@ def _resolve_action_state(code, session, *, decision_day, decision_name,
     )
     if session is not None:
         coverage["required"] += 1
-        if name is not None or flag is not None:
+        # 判据来自契约本身：写法无法归一的 risk_flag 不算 resolved。
+        if ST.action_state_usable(name, flag):
             coverage["resolved"] += 1
     return name, flag
 
@@ -403,12 +410,20 @@ def evaluate(picks, horizon, label, sessions, *, asof,
     sample_days = {item[1] for item in verified}
     bench_exec_days = sorted(set(bench_exec or {}) & sample_days)
     benchmark_state_coverage_available = bench_coverage.get("resolved", 0) > 0
+    # **基准侧**可用性：有可信状态源 + 基准侧真的解析出状态 + 至少一个被评估的
+    # 决策日上存在可执行基准样本。它**只**回答"可执行基准在不在"。
     executable_benchmark_available = bool(
         bench_exec is not None
         and benchmark_state_coverage_available
         and bench_exec_days
     )
-    executable_metrics_available = executable_benchmark_available
+    # 选股侧可执行样本计数。**绝不能**用基准侧可用性代替它：随机基准票池与策略
+    # 选中的票是两个 population，基准侧有样本而选股侧一条都不可执行是常态
+    # （例如 provider 覆盖随机票池却答不出策略票）。
+    executable_selected_n = 0
+    # 真正产出 executable_excess 的样本数：可执行选股样本 **且** 该决策日有可执行
+    # 基准基线。这是"可执行超额"这一指标唯一的样本来源。
+    executable_paired_n = 0
 
     for strategy, day, code, name, result, kline in verified:
         outcome = outcomes[f"{strategy}|{day}|{code}"]
@@ -426,6 +441,8 @@ def evaluate(picks, horizon, label, sessions, *, asof,
             continue
         item["r"].append(result.raw_forward_return)
         item["executable"] += 1 if outcome.executable else 0
+        if outcome.executable:
+            executable_selected_n += 1
         # 两个 excess **分开**累积，绝不混为一个数字。
         if day in bench:
             item["market_excess"].append(result.raw_forward_return - bench[day])
@@ -440,6 +457,25 @@ def evaluate(picks, horizon, label, sessions, *, asof,
             item["executable_excess"].append(
                 result.raw_forward_return - bench_exec[day]
             )
+            executable_paired_n += 1
+
+    # ── 三个**分开**的可用性判定，绝不互相代替 ──
+    # 1. 选股侧可执行指标：至少一条真正可执行的选股观测。
+    executable_selection_metrics_available = executable_selected_n > 0
+    # 2. 可执行基准：见上面的 executable_benchmark_available。
+    # 3. 可执行超额：至少一条可执行选股观测落在**同时**有可执行基准的决策日上。
+    #    只有这一条能保证 executable_excess 不是 None。
+    executable_excess_available = executable_paired_n > 0
+    # 兼容字段（legacy）``executable_metrics_available``：含义收紧为"executable
+    # 视图**真的算出了**可执行指标"，即三个条件同时成立。这样 ``n == 0`` 或
+    # "没有任何配对的可执行选股样本"在任何路径下都不可能产生 ``true`` ——
+    # 旧实现把它直接等于 ``executable_benchmark_available``，于是基准侧有样本、
+    # 选股侧一条都不可执行时，报告仍声称可执行指标可用。
+    executable_metrics_available = bool(
+        executable_selection_metrics_available
+        and executable_benchmark_available
+        and executable_excess_available
+    )
 
     bench_available_text = "可得" if executable_benchmark_available else "不可得"
     lines = [
@@ -552,8 +588,16 @@ def evaluate(picks, horizon, label, sessions, *, asof,
         "benchmark_state_coverage_available": benchmark_state_coverage_available,
         # 实际用于 executable_excess 的可执行基准决策日（可能为空 → 基准不可得）。
         "executable_benchmark_days": bench_exec_days,
+        # legacy 汇总字段：三个条件同时成立（见上文的定义）。
         "executable_metrics_available": executable_metrics_available,
+        "executable_selection_metrics_available": (
+            executable_selection_metrics_available
+        ),
         "executable_benchmark_available": executable_benchmark_available,
+        "executable_excess_available": executable_excess_available,
+        # 计数证据：读者可以自己核对"选股侧可执行 N 条、其中 M 条有基准可比"。
+        "executable_selected_n": executable_selected_n,
+        "executable_paired_n": executable_paired_n,
         "label_status_counts": status_counts,
     }
     if state_source_status is not None:
@@ -730,6 +774,18 @@ def main(security_state_fn=None, *, archive_path=None):
     executable_metrics_available = any(
         s.get("executable_metrics_available") for s in exec_summaries
     )
+    executable_selection_metrics_available = any(
+        s.get("executable_selection_metrics_available") for s in exec_summaries
+    )
+    executable_excess_available = any(
+        s.get("executable_excess_available") for s in exec_summaries
+    )
+    executable_selected_n = sum(
+        s.get("executable_selected_n", 0) for s in exec_summaries
+    )
+    executable_paired_n = sum(
+        s.get("executable_paired_n", 0) for s in exec_summaries
+    )
     if executable_metrics_available:
         boundary = (
             f"- executable 指标：**可用**。PIT 历史证券状态源已接入，"
@@ -768,6 +824,15 @@ def main(security_state_fn=None, *, archive_path=None):
         "security_state_source": state_status,
         "provider_present": provider_present,
         "executable_metrics_available": executable_metrics_available,
+        "executable_selection_metrics_available": (
+            executable_selection_metrics_available
+        ),
+        "executable_benchmark_available": any(
+            s.get("executable_benchmark_available") for s in exec_summaries
+        ),
+        "executable_excess_available": executable_excess_available,
+        "executable_selected_n": executable_selected_n,
+        "executable_paired_n": executable_paired_n,
         "action_state_coverage": {"required": required, "resolved": resolved},
         "benchmark_state_coverage": {
             "required": bench_required, "resolved": bench_resolved,

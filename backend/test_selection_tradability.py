@@ -2585,3 +2585,345 @@ def _json_loads(text):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Round 7 — the last two correctness findings
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+class ExecutableAvailabilitySeparationTest(unittest.TestCase):
+    """R7-F1：``executable_metrics_available`` 不得是 ``executable_benchmark_available`` 的别名。
+
+    三个概念必须**各自**判定、绝不互相代替：
+
+    * ``executable_selection_metrics_available`` —— 至少一条真正可执行的选股观测；
+    * ``executable_benchmark_available`` —— 被评估的决策日上存在可执行基准基线；
+    * ``executable_excess_available`` —— 至少一条可执行选股观测落在**同时**有可执行
+      基准的决策日上（``executable_excess`` 唯一的样本来源）。
+
+    旧实现把 legacy 字段直接等于基准侧可用性，于是"基准侧有样本、选股侧一条都不可
+    执行"时报告仍声称可执行指标可用（``n == 0`` 且 ``executable_excess is None``）。
+    """
+
+    KLINES = ProductionEvaluatorWiringTest.KLINES
+
+    def _evaluate(self, picks, *, security_state_fn=None, benchmark=None):
+        with _FakeKlineReport(self.KLINES) as AR:
+            sessions = SL.normalize_sessions(
+                sorted({day for bars in self.KLINES.values() for day in bars})
+            )
+            original = AR.benchmark_map
+            if benchmark is not None:
+                AR.benchmark_map = lambda *a, **k: dict(benchmark)
+            try:
+                return AR.evaluate(
+                    picks, 1, "选股质量", sessions, asof="2024-06-30",
+                    security_state_fn=security_state_fn,
+                )
+            finally:
+                AR.benchmark_map = original
+
+    def test_benchmark_without_any_executable_selection_claims_nothing(self):
+        """**核心回归**：基准侧可用 + 选股侧可执行 n=0 → 三项全部 false。
+
+        provider 答不出任何选股侧状态（``name``/``risk_flag`` 都缺席 → 契约判
+        ``unknown_st_status``），但基准侧照常有可执行基线。旧实现会在这里声称
+        ``executable_metrics_available == true``，而 ``n == 0``、
+        ``executable_excess is None``。
+        """
+        picks = [("s1", "2024-06-14", "600001", "某某股份")]
+
+        def provider(code, session):
+            # 状态存在但**不可用**：两个字段都缺席 → 契约 fail closed。
+            return {"name": None, "risk_flag": None}
+
+        _, summary = self._evaluate(
+            picks, security_state_fn=provider,
+            benchmark={
+                "market": {"2024-06-14": 0.01},
+                "executable": {"2024-06-14": 0.02},
+                "coverage": {"required": 6, "resolved": 6},
+            },
+        )
+        # 基准侧确实成立。
+        self.assertTrue(summary["benchmark_state_coverage_available"])
+        self.assertIn("2024-06-14", summary["executable_benchmark_days"])
+        self.assertTrue(summary["executable_benchmark_available"])
+        # 选股侧一条可执行观测都没有。
+        self.assertEqual(0, summary["n"])
+        self.assertEqual(0, summary["executable_selected_n"])
+        self.assertEqual(0, summary["executable_paired_n"])
+        self.assertFalse(summary["executable_selection_metrics_available"])
+        self.assertFalse(summary["executable_excess_available"])
+        self.assertIsNone(summary["executable_excess"])
+        # legacy 汇总字段绝不因基准侧可用而为 true。
+        self.assertFalse(summary["executable_metrics_available"])
+
+    def test_executable_selection_without_a_paired_benchmark_date(self):
+        """可执行选股样本存在、但没有配对的基准日 → 超额不可用、指标不可用。
+
+        这是三个概念的**中间态**：选股侧成立、基准侧成立，但两者不在同一个决策日上
+        —— ``executable_excess`` 依然一条都减不出来。
+        """
+        picks = [("s1", "2024-06-14", "600001", "某某股份")]
+
+        def provider(code, session):
+            return {"name": "某某股份", "risk_flag": False}
+
+        _, summary = self._evaluate(
+            picks, security_state_fn=provider,
+            benchmark={
+                "market": {"2024-06-14": 0.01},
+                # 基准只在 06-17 有值，而选股样本的决策日是 06-14。
+                "executable": {"2024-06-17": 0.02},
+                "coverage": {"required": 4, "resolved": 4},
+            },
+        )
+        self.assertTrue(summary["benchmark_state_coverage_available"])
+        self.assertGreater(summary["executable_selected_n"], 0)
+        self.assertTrue(summary["executable_selection_metrics_available"])
+        # 但被评估的决策日上没有可执行基准 → 基准不可得、超额不可得。
+        self.assertEqual([], summary["executable_benchmark_days"])
+        self.assertFalse(summary["executable_benchmark_available"])
+        self.assertFalse(summary["executable_excess_available"])
+        self.assertEqual(0, summary["executable_paired_n"])
+        self.assertIsNone(summary["executable_excess"])
+        self.assertFalse(summary["executable_metrics_available"])
+
+    def test_all_three_available_on_a_paired_date(self):
+        """对照：选股侧可执行 + 基准侧同日可用 → 三项全 true（防过度收紧）。"""
+        picks = [("s1", "2024-06-14", "600001", "某某股份")]
+
+        def provider(code, session):
+            return {"name": "某某股份", "risk_flag": False}
+
+        _, summary = self._evaluate(picks, security_state_fn=provider)
+        self.assertTrue(summary["executable_selection_metrics_available"])
+        self.assertTrue(summary["executable_benchmark_available"])
+        self.assertTrue(summary["executable_excess_available"])
+        self.assertTrue(summary["executable_metrics_available"])
+        self.assertGreater(summary["executable_selected_n"], 0)
+        self.assertGreater(summary["executable_paired_n"], 0)
+        self.assertIsNotNone(summary["executable_excess"])
+
+    def test_the_three_fields_are_reported_separately(self):
+        """三个字段必须同时存在，且不是同一个值被复制三遍。"""
+        picks = [("s1", "2024-06-14", "600001", "某某股份")]
+
+        def provider(code, session):
+            return {"name": "某某股份", "risk_flag": False}
+
+        _, summary = self._evaluate(picks, security_state_fn=provider)
+        for key in (
+            "executable_selection_metrics_available",
+            "executable_benchmark_available",
+            "executable_excess_available",
+            "executable_metrics_available",
+        ):
+            self.assertIn(key, summary)
+        # legacy 字段是三者之**合**，不是基准侧字段的别名。
+        self.assertEqual(
+            summary["executable_metrics_available"],
+            summary["executable_selection_metrics_available"]
+            and summary["executable_benchmark_available"]
+            and summary["executable_excess_available"],
+        )
+
+    def test_real_main_reports_the_split(self):
+        """真实 ``main()`` 也必须把三者分开报出（不是只有 evaluate 层有）。"""
+        import os as _os
+        import sqlite3 as sq
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db = _os.path.join(tmp, "selection_tracking.db")
+            conn = sq.connect(db)
+            conn.execute(
+                "CREATE TABLE selection_runs(id INTEGER PRIMARY KEY, strategy TEXT,"
+                " data_asof_date TEXT)"
+            )
+            conn.execute(
+                "CREATE TABLE selection_picks(run_id INTEGER, code TEXT,"
+                " rank_no INTEGER, name TEXT)"
+            )
+            conn.execute("INSERT INTO selection_runs VALUES(1,'s1','2024-06-14')")
+            conn.execute("INSERT INTO selection_picks VALUES(1,'600001',1,'某某股份')")
+            conn.commit()
+            conn.close()
+
+            import selection_alpha_report as AR
+
+            original = dict(
+                DATA_DIR=AR.DATA_DIR, KLINE_DIR=AR.KLINE_DIR,
+                REPORT_PATH=AR.REPORT_PATH, load_kline=AR.load_kline,
+                listdir=AR.os.listdir, WINDOW_DAYS=AR.WINDOW_DAYS,
+            )
+            AR.DATA_DIR = tmp
+            AR.KLINE_DIR = _os.path.join(tmp, "klines")
+            AR.REPORT_PATH = _os.path.join(tmp, "reports", "alpha.md")
+            AR.WINDOW_DAYS = 3650
+            AR.load_kline = lambda code: dict(self.KLINES.get(code) or {})
+            AR.os.listdir = lambda path: (
+                [f"{code}.csv" for code in self.KLINES]
+                if str(path) == str(AR.KLINE_DIR) else original["listdir"](path)
+            )
+            try:
+                from contextlib import redirect_stdout
+                import io
+
+                buf = io.StringIO()
+                with redirect_stdout(buf):
+                    AR.main(security_state_fn=lambda code, session: {
+                        "name": "某某股份", "risk_flag": False})
+                payload = _json_loads(buf.getvalue().strip().splitlines()[-1])
+            finally:
+                AR.DATA_DIR = original["DATA_DIR"]
+                AR.KLINE_DIR = original["KLINE_DIR"]
+                AR.REPORT_PATH = original["REPORT_PATH"]
+                AR.load_kline = original["load_kline"]
+                AR.os.listdir = original["listdir"]
+                AR.WINDOW_DAYS = original["WINDOW_DAYS"]
+
+        for key in (
+            "executable_metrics_available",
+            "executable_selection_metrics_available",
+            "executable_benchmark_available",
+            "executable_excess_available",
+            "executable_selected_n",
+            "executable_paired_n",
+        ):
+            self.assertIn(key, payload)
+        self.assertEqual(
+            payload["executable_metrics_available"],
+            payload["executable_selection_metrics_available"]
+            and payload["executable_benchmark_available"]
+            and payload["executable_excess_available"],
+        )
+
+
+class ActionStateUsabilityPredicateTest(unittest.TestCase):
+    """R7-F2：覆盖度的 ``resolved`` 必须表示状态**真的可用**，而不是字段非 ``None``。
+
+    唯一权威谓词是 :func:`selection_tradability.action_state_usable`，也就是
+    ``tradability_at`` 第 4 步（证据派生权限）所表达的语义。报告层不得自己判断。
+    """
+
+    def test_predicate_truth_table(self):
+        """谓词真值表：与契约第 4 步逐条对应。"""
+        cases = [
+            # (name, risk_flag, usable, why)
+            (None, None, False, "两者都缺席 → ST 未知"),
+            (None, "maybe", False, "显式存在但无法归一 → fail closed"),
+            (None, "garbage", False, "同上"),
+            (None, 2, False, "数值只认精确 0/1"),
+            ("某某股份", "maybe", False, "即使有名称，坏写法也不放行"),
+            ("某某股份", None, True, "名称本身就是资格证据"),
+            (None, False, True, "归一成功 → 是不是 ST 已确定"),
+            (None, True, True, "归一成功（是 ST 也可判）"),
+            (None, "false", True, "字符串假值严格归一"),
+            (None, "0", True, "字符串零严格归一"),
+            ("某某股份", False, True, "两者都有"),
+        ]
+        for name, flag, expected, why in cases:
+            with self.subTest(name=name, risk_flag=flag, why=why):
+                self.assertEqual(
+                    expected, ST.action_state_usable(name, flag), why
+                )
+
+    def test_malformed_risk_flag_is_not_counted_as_resolved_selected_side(self):
+        """选股侧：``{"name": None, "risk_flag": "maybe"}`` **不得**记成 resolved。
+
+        契约对这份状态判 ``unproven / unknown_st_status``；覆盖度若记成 resolved，
+        就与契约自相矛盾。
+        """
+        picks = [("s1", "2024-06-14", "600001", "某某股份")]
+
+        def provider(code, session):
+            return {"name": None, "risk_flag": "maybe"}
+
+        with _FakeKlineReport(ProductionEvaluatorWiringTest.KLINES) as AR:
+            sessions = SL.normalize_sessions(
+                sorted({d for bars in ProductionEvaluatorWiringTest.KLINES.values()
+                        for d in bars})
+            )
+            _, summary = AR.evaluate(
+                picks, 1, "选股质量", sessions, asof="2024-06-30",
+                security_state_fn=provider,
+            )
+        cov = summary["action_state_coverage"]
+        self.assertGreater(cov["required"], 0)
+        self.assertEqual(0, cov["resolved"], "坏写法不得算作可用状态")
+        self.assertFalse(summary["action_state_coverage_available"])
+        # 契约对同一份状态的结论必须是 unproven / unknown_st_status：覆盖度与契约
+        # 同口径，不能一边说"已解析"一边判 unproven。
+        self.assertGreater(
+            summary["tradability_counts"].get(ST.REASON_UNKNOWN_ST_STATUS, 0), 0
+        )
+
+    def test_malformed_risk_flag_is_not_counted_as_resolved_benchmark_side(self):
+        """基准侧：同一个判据也必须生效（两侧覆盖度不得各自为政）。"""
+        picks = [("s1", "2024-06-14", "600001", "某某股份")]
+
+        def provider(code, session):
+            return {"name": None, "risk_flag": "maybe"}
+
+        with _FakeKlineReport(ProductionEvaluatorWiringTest.KLINES) as AR:
+            sessions = SL.normalize_sessions(
+                sorted({d for bars in ProductionEvaluatorWiringTest.KLINES.values()
+                        for d in bars})
+            )
+            _, summary = AR.evaluate(
+                picks, 1, "选股质量", sessions, asof="2024-06-30",
+                security_state_fn=provider,
+            )
+        bench = summary["benchmark_state_coverage"]
+        self.assertGreater(bench["required"], 0)
+        self.assertEqual(0, bench["resolved"], "坏写法不得算作可用状态")
+        self.assertFalse(summary["benchmark_state_coverage_available"])
+
+    def test_absent_name_with_valid_flag_still_counts_as_resolved(self):
+        """对照：名称缺席但 ``risk_flag`` 可归一 → **可用**（防过度收紧）。"""
+        picks = [("s1", "2024-06-14", "600001", "某某股份")]
+
+        def provider(code, session):
+            return {"name": None, "risk_flag": False}
+
+        with _FakeKlineReport(ProductionEvaluatorWiringTest.KLINES) as AR:
+            sessions = SL.normalize_sessions(
+                sorted({d for bars in ProductionEvaluatorWiringTest.KLINES.values()
+                        for d in bars})
+            )
+            _, summary = AR.evaluate(
+                picks, 1, "选股质量", sessions, asof="2024-06-30",
+                security_state_fn=provider,
+            )
+        self.assertGreater(summary["action_state_coverage"]["resolved"], 0)
+        self.assertTrue(summary["action_state_coverage_available"])
+
+    def test_coverage_never_exceeds_the_usable_verdicts(self):
+        """覆盖度与契约必须**同口径**：resolved 不得超过可执行判定成功的样本。
+
+        provider 对每个动作 session 都返回坏写法，则两侧覆盖度都为 0，且没有任何
+        样本被判 executable —— 报告不得一边说"覆盖 3/3"一边说"一条都不可执行"。
+        """
+        picks = [
+            ("s1", "2024-06-14", "600001", "某某股份"),
+            ("s1", "2024-06-14", "600002", "某某股份"),
+        ]
+
+        def provider(code, session):
+            return {"name": None, "risk_flag": "maybe"}
+
+        with _FakeKlineReport(ProductionEvaluatorWiringTest.KLINES) as AR:
+            sessions = SL.normalize_sessions(
+                sorted({d for bars in ProductionEvaluatorWiringTest.KLINES.values()
+                        for d in bars})
+            )
+            _, summary = AR.evaluate(
+                picks, 1, "选股质量", sessions, asof="2024-06-30",
+                security_state_fn=provider,
+            )
+        self.assertEqual(0, summary["action_state_coverage"]["resolved"])
+        self.assertEqual(0, summary["entry_counts"]["executable"])
+        self.assertFalse(summary["executable_selection_metrics_available"])

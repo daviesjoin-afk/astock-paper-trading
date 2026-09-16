@@ -206,6 +206,30 @@ def normalize_risk_flag(value: Any) -> Optional[bool]:
     return PIT.as_strict_bool(value)
 
 
+def action_state_usable(name: Any, risk_flag: Any) -> bool:
+    """一个动作时点的证券状态是否**真的可用**。
+
+    这是 :func:`tradability_at` 第 4 步（证据派生权限）所表达语义的**唯一**权威
+    实现。报告层的覆盖度统计必须复用**同一个**谓词，否则会出现自相矛盾：报告声称
+    "动作状态覆盖 3/3"，可执行指标却一条样本都算不出来。
+
+    规则（与契约逐条对应）：
+
+    * ``risk_flag`` **显式存在但无法归一**（例如 ``"maybe"``）→ **不可用**。
+      契约把它判 ``unproven / unknown_st_status``；覆盖度若按"字段非 ``None``"
+      记成 resolved，就与契约相反。
+    * 有 ``name``、``risk_flag`` 缺席 → **可用**（名称本身就是资格证据）；
+    * ``risk_flag`` 归一成功（``True`` / ``False``）、``name`` 缺席 → **可用**
+      （是不是 ST 已经确定，权限可判）；
+    * 两者**都**缺席 → **不可用**。"不知道当时是不是 ST" 不等于"当时不是 ST"。
+
+    绝不使用内置 ``bool()``：``bool("false") == True``。
+    """
+    if risk_flag is not None and normalize_risk_flag(risk_flag) is None:
+        return False
+    return name is not None or normalize_risk_flag(risk_flag) is not None
+
+
 def is_visible_at(available_at: Any, asof: Any) -> bool:
     """PIT 可见性（``available_at <= asof``）。委托 :func:`point_in_time.is_visible_at`。
 
@@ -511,14 +535,12 @@ def tradability_at(
     # ``bool("false") == True`` 把一只正常股票判成 ST（反向亦然）。归一结果为
     # ``None`` 表示**该字段存在但无法判定**（未知写法），同样 fail closed。
     risk_flag_value = normalize_risk_flag(evidence.risk_flag)
-    if evidence.risk_flag is not None and risk_flag_value is None:
-        return _verdict(
-            status=STATUS_UNPROVEN, reason=REASON_UNKNOWN_ST_STATUS, side=side,
-            code=code_text, action_at=moment, evidence=evidence,
-            board=str(board_scope.get("board") or "") or None,
-        )
-    if evidence.name is None and risk_flag_value is None:
-        # "不知道当时是不是 ST" 不等于"当时不是 ST"：账户权限无法证明 → fail closed。
+    if not action_state_usable(evidence.name, evidence.risk_flag):
+        # 两种子情形共用**同一个**判据（见 :func:`action_state_usable`）：
+        #   * ``risk_flag`` 存在但写法无法归一（例如 ``"maybe"``）；
+        #   * 名称与可归一的 ``risk_flag`` **都**缺席。
+        # "不知道当时是不是 ST" 不等于"当时不是 ST"：账户权限无法证明 →
+        # fail closed。报告层统计覆盖度必须复用这同一个谓词。
         return _verdict(
             status=STATUS_UNPROVEN, reason=REASON_UNKNOWN_ST_STATUS, side=side,
             code=code_text, action_at=moment, evidence=evidence,
