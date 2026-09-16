@@ -103,14 +103,15 @@ class AttributionCacheTests(unittest.TestCase):
                 CREATE TABLE paper_orders(
                     id INTEGER PRIMARY KEY,account_id TEXT,side TEXT,code TEXT,name TEXT,qty INTEGER,
                     planned_price REAL,amount REAL,fees REAL,status TEXT,reason TEXT,risk_payload TEXT,
-                    realized_pnl REAL,created_at TEXT,executed_at TEXT);
+                    realized_pnl REAL,created_at TEXT,executed_at TEXT,
+                    execution_status TEXT,execution_verified INTEGER);
                 CREATE TABLE paper_fills(
                     id INTEGER PRIMARY KEY,order_id INTEGER,price REAL,amount REAL,fees REAL,
                     fill_date TEXT,quote_at TEXT,assumption TEXT);
             """)
             payload = "x" * 500000
             conn.execute(
-                "INSERT INTO paper_orders VALUES(1,'a','buy','000001','x',100,10,1000,1,'filled','r',?,0,?,?)",
+                "INSERT INTO paper_orders VALUES(1,'a','buy','000001','x',100,10,1000,1,'filled','r',?,0,?,?,'verified',1)",
                 (payload, "2026-08-25T10:00:00+08:00", "2026-08-25T10:00:01+08:00"),
             )
             conn.commit(); conn.close()

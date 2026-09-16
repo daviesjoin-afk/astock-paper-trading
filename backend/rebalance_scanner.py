@@ -20,6 +20,8 @@ from __future__ import annotations
 import datetime as dt
 import json
 
+import execution_verification as EV
+
 # ─── 调仓参数 ───
 REBALANCE_VERSION = "daily-rebalance-v2"
 
@@ -238,11 +240,13 @@ def _is_risk_handled(conn, account_id, code, today):
             "order_id": pending_sell[0],
         }
 
-    # 检查当日是否已成功卖出
+    # 检查当日是否已成功卖出。"今日已卖出"是**成交声称**：只有被证据证明卖出的
+    # 委托才能抑制今日的换仓动作，否则一个"没发生过的卖出"会挡住真实换仓。
     filled_sell = conn.execute(
         """SELECT id, status FROM paper_orders
            WHERE account_id=? AND code=? AND side='sell'
              AND status='filled'
+             AND """ + EV.VERIFIED_PREDICATE + """
              AND created_at >= ?
            ORDER BY id DESC LIMIT 1""",
         (account_id, code, today.isoformat())

@@ -4,6 +4,8 @@ from __future__ import annotations
 import sqlite3
 from collections import defaultdict
 
+import execution_verification as EV
+
 EXECUTION_QUALITY_VERSION = "execution-quality-shadow-v1"
 
 def _num(value, default=0.0):
@@ -27,7 +29,8 @@ def audit(paper_db_path, limit=5000):
         conn.row_factory = sqlite3.Row
         rows = [dict(r) for r in conn.execute(
             """SELECT a.source_strategy AS account_id,o.side,o.qty,o.planned_price,
-                      o.filled_price,o.amount,o.fees,o.status,o.reason,o.executed_at
+                      o.filled_price,o.amount,o.fees,o.status,o.reason,o.executed_at,
+                      o.execution_status,o.execution_verified
                FROM paper_orders o LEFT JOIN paper_accounts a ON a.id=o.account_id
                ORDER BY o.id DESC LIMIT ?""", (int(limit),)
         )]
@@ -46,6 +49,10 @@ def audit(paper_db_path, limit=5000):
         if status in {"risk_rejected","rejected","cancelled","expired"}:
             bucket["rejected"] += 1
         if status != "filled":
+            continue
+        # 成交质量是**执行绩效**：只有被证据证明的成交才进入成交率与滑点分布，
+        # 缺少验证列的旧行（自称成交）不得稀释或抬高这些指标。
+        if not EV.is_verified_row(row):
             continue
         bucket["filled"] += 1
         amount = max(_num(row.get("amount")), 0.0)

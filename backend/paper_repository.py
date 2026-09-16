@@ -3,10 +3,20 @@
 
 仓储（repository）是隔离数据库读写的薄接口。本阶段只统一通用行读取和
 审计写入；具体业务 SQL 仍由上层编排，便于后续按账户、订单和成交逐步迁移。
+
+**执行验证闸门**：本模块所有"成交绩效"投影都必须引用
+:data:`execution_verification.VERIFIED_PREDICATE`（唯一一份），不得自己拼
+``execution_verified=1``。谓词是 fail closed 的：缺列、NULL、两列不一致一律排除；
+"探测不到列就把闸门关掉"是 fail open，等于把这份投影悄悄降级成未验证口径。
 """
 from __future__ import annotations
 
 import strategy_registry as SR
+
+try:  # ``backend`` on sys.path（生产与 ``cd backend`` 测试）
+    import execution_verification as EV
+except ImportError:  # pragma: no cover - package-style import
+    from . import execution_verification as EV
 
 
 def rows(conn, sql, params=()):
@@ -63,10 +73,13 @@ def account_metric_inputs(conn, account_ids, today):
         f"id,account_id,code,qty,filled_price,amount,fees,status,{realized_field},"
         f"created_at,{executed_field}"
     )
+    # 卖出行只收**已验证**成交。谓词来自 execution_verification 的唯一实现；
+    # 这里不再按"列在不在"开关闸门 —— 那会把缺列的库静默降级成未验证口径。
     sell_rows = rows(
         conn,
         f"SELECT {sell_fields} FROM paper_orders "
-        f"WHERE account_id IN ({placeholders}) AND side='sell' AND status='filled'",
+        f"WHERE account_id IN ({placeholders}) AND side='sell' AND status='filled' "
+        f"AND {EV.VERIFIED_PREDICATE}",
         tuple(ids),
     )
     sells = {account_id: [] for account_id in ids}

@@ -36,9 +36,18 @@ def aggregate_positions(lots, legacy_rows, cash_flows, day, *, num):
     for key, item in grouped.items():
         item["cost"] = item.pop("cost_amount") / max(item["qty"], 1)
         item["settlement_cost"] = item["cost"]
-        flow = cash_flows.get(key) or {}
-        net_invested = num(flow.get("buy_cash")) - num(flow.get("sell_cash"))
-        item["display_cost"] = net_invested / max(item["qty"], 1)
+        # 现金流投影只覆盖**已验证**的成交行。升级前的持仓验证列为 NULL，因此
+        # 完全没有现金流行；把"缺失"当成 0 会让 net_invested 变成 0，摊薄成本
+        # 就从一个"未知"变成一个"有定义的 0"，前端优先取它，于是每个升级前的
+        # 持仓都显示摊薄成本 0。缺失必须是**未知** → 回落 lot 的结算成本。
+        flow = cash_flows.get(key)
+        if flow is None:
+            item["display_cost"] = item["cost"]
+            item["display_cost_source"] = "lot_settlement_cost"
+        else:
+            net_invested = num(flow.get("buy_cash")) - num(flow.get("sell_cash"))
+            item["display_cost"] = net_invested / max(item["qty"], 1)
+            item["display_cost_source"] = "verified_cash_flow"
         old = legacy.get(key, {})
         item["peak_price"] = num(old.get("peak_price"), item["cost"])
         item["take_stage"] = int(num(old.get("take_stage"), 0))

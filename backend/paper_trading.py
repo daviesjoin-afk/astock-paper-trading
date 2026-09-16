@@ -71,6 +71,7 @@ import portfolio_coordinator as PCO
 import strategy_champion as SCM
 import strategy_clusters as SC
 import execution_profiles as EPF
+import execution_verification as EV
 import paper_sizing as PSZ
 import order_intent as OI
 import strategy_policies as SPOL
@@ -1345,13 +1346,36 @@ def _enforce_order_intent(conn, account, code, payload, *, signal_id=None):
     return intent, None
 
 
+def _execution_verified_predicate() -> str:
+    """执行验证闸门的**唯一** SQL 谓词（委托 :mod:`execution_verification`）。
+
+    读路径一律引用这个函数，不各写一份 ``execution_verified=1``：谓词同时要求
+    ``execution_verified=1`` 与 ``execution_status='verified'``，两列不一致的行
+    fail closed；历史 NULL 行被 ``COALESCE`` 取成 0 而排除。
+    """
+    return EV.VERIFIED_PREDICATE
+
+
+def _row_is_verified(order) -> bool:
+    """Python 侧的同一谓词（行的列已经在手时用，见 :func:`EV.is_verified_row`）。"""
+    return EV.is_verified_row(order)
+
+
 def _rebuild_realized_pnl(conn):
-    """按成交流水 FIFO 重放卖出成本，兼容升级前未含买入费用的历史记录。"""
+    """按成交流水 FIFO 重放卖出成本，兼容升级前未含买入费用的历史记录。
+
+    **执行验证闸门（PR-150）**：只重放 ``execution_verified`` 的行。没有成交流水
+    证据的旧行（``execution_status`` 为 NULL 或非 ``verified``）不参与已实现盈亏
+    重算 —— 那是"账本自称成交"，不是证据证明的成交。它们保留原账面值供审计，
+    绝不因为 ``status='filled'`` 就被当成真实成交收益。
+    """
     lots = {}
     rows = _rows(
         conn,
-        """SELECT id,account_id,code,side,qty,amount,filled_price,fees,status
-           FROM paper_orders WHERE status='filled' ORDER BY id""",
+        "SELECT id,account_id,code,side,qty,amount,filled_price,fees,status"
+        " FROM paper_orders WHERE status='filled' AND "
+        + _execution_verified_predicate()
+        + " ORDER BY id",
     )
     for order in rows:
         key = (order["account_id"], order["code"])
@@ -1754,6 +1778,7 @@ def init_db():
                 RSET.ensure_schema(conn)
                 SR.ensure_schema(conn)
                 PSM.ensure_strategy_reference_columns(conn)
+                PSM.ensure_execution_verification_columns(conn)
                 _ensure_accounts(conn)
                 _ensure_user_strategy_accounts(conn)
                 _ensure_cycle(conn)
@@ -1794,7 +1819,8 @@ def init_db():
                 order_type TEXT NOT NULL DEFAULT 'market',
                 origin TEXT NOT NULL DEFAULT 'strategy', expires_at TEXT, cancelled_at TEXT,
                 strategy_id TEXT, strategy_version INTEGER, strategy_checksum TEXT,
-                retry_of_order_id INTEGER
+                retry_of_order_id INTEGER,
+                execution_status TEXT, execution_verified INTEGER, execution_evidence_source TEXT
             );
             -- 归档表：列集与活跃表严格一致（清理函数用 SELECT * 归档），避免列错位。
             CREATE TABLE IF NOT EXISTS paper_orders_archive (
@@ -1803,7 +1829,8 @@ def init_db():
                 status TEXT, reason TEXT, risk_payload TEXT, realized_pnl REAL,
                 created_at TEXT, executed_at TEXT, order_type TEXT, origin TEXT,
                 expires_at TEXT, cancelled_at TEXT, strategy_id TEXT,
-                strategy_version INTEGER, strategy_checksum TEXT, retry_of_order_id INTEGER
+                strategy_version INTEGER, strategy_checksum TEXT, retry_of_order_id INTEGER,
+                execution_status TEXT, execution_verified INTEGER, execution_evidence_source TEXT
             );
             CREATE TABLE IF NOT EXISTS paper_signals_archive (
                 id INTEGER, account_id TEXT, signal_date TEXT, intended_date TEXT, code TEXT, name TEXT,
@@ -1988,6 +2015,7 @@ def init_db():
         )
         RSET.ensure_schema(conn)
         PSM.ensure_paper_columns(conn)
+        PSM.ensure_execution_verification_columns(conn)
         # 升级前的 lot 只记录成交价。来源订单存在时，将已实际扣除的买入费用
         # 分摊到每股成本；无来源的历史兼容 lot 不臆造费用，保留原始成本。
         conn.execute(
@@ -2993,7 +3021,9 @@ def _position_rows(conn, account_id=None, asof_day=None, readonly=False):
             """SELECT account_id,code,
                       SUM(CASE WHEN side='buy' THEN COALESCE(amount,0)+COALESCE(fees,0) ELSE 0 END) AS buy_cash,
                       SUM(CASE WHEN side='sell' THEN COALESCE(amount,0)-COALESCE(fees,0) ELSE 0 END) AS sell_cash
-                 FROM paper_orders WHERE status='filled' GROUP BY account_id,code""",
+                 FROM paper_orders WHERE status='filled' AND """
+            + _execution_verified_predicate()
+            + " GROUP BY account_id,code",
         )
     }
     return PP.aggregate_positions(
@@ -7555,6 +7585,7 @@ def _strategy_return_series(conn, account_ids, *, days=30):
                       COALESCE(SUM(COALESCE(realized_pnl,0)),0) AS pnl
                  FROM paper_orders
                 WHERE side='sell' AND status='filled' AND executed_at>=?
+                  AND {_execution_verified_predicate()}
                   AND account_id IN ({placeholders})
                 GROUP BY account_id, day ORDER BY day""",
             (since, *account_ids),
@@ -9523,6 +9554,11 @@ def _buy_order(conn, account, signal, quote, market, news, asof_day, *, all_quot
             "UPDATE paper_orders SET status='filled',filled_price=?,amount=?,fees=?,executed_at=? WHERE id=?",
             (fill_price, amount, fees, _now(), order_id),
         )
+        # 执行验证闸门：**必须在成交流水与终态都写入之后**盖章。策略自动买入是
+        # 生产主路径之一，漏掉这一步会让真实成交的验证列恒为 NULL，被
+        # VERIFIED_PREDICATE 当成"没有证据"而从已实现盈亏、持仓现金流与执行绩效
+        # 里整批丢弃（一笔真成交被记成没发生）。
+        EV.stamp_order(conn, order_id)
         conn.execute(f"RELEASE SAVEPOINT {savepoint}")
     except Exception as exc:
         conn.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
@@ -11347,6 +11383,7 @@ def _monitor_risk_impl(asof_date=None):
             hard_stop_touched_today = bool(conn.execute(
                 """SELECT 1 FROM paper_orders
                    WHERE account_id=? AND code=? AND side='sell' AND status='filled'
+                     AND """ + _execution_verified_predicate() + """
                      AND substr(created_at,1,10)=?
                        AND (
                            json_extract(risk_payload,'$.exit_marker')='hard_stop_first_trim'
@@ -11403,12 +11440,16 @@ def _monitor_risk_impl(asof_date=None):
                 quality_action = "risk_exit"
                 detail["position_quality"] = quality_review
             detail["downside_guard"] = downside_guard
+            # 下面三处"当日是否已减仓过"的门禁都是**成交声称**：只有被证据证明
+            # 卖出的委托才算减过仓。没有验证列的旧行不得吃掉今天的第一次减仓，
+            # 否则一个"没发生过的卖出"会把真实需要减仓的持仓永久挡住。
             # P1 审计修复（2026-09-02）：预警/守卫减仓的当日去重同样改用
             # 结构化标记（见下方 guard_actionable 分支写入 detail["exit_marker"]），
             # 中文 LIKE 仅作标记上线前旧订单的同日兜底。
             warning_trimmed = bool(conn.execute(
                 """SELECT 1 FROM paper_orders
                    WHERE account_id=? AND code=? AND side='sell' AND status='filled'
+                     AND """ + _execution_verified_predicate() + """
                      AND substr(created_at,1,10)=?
                        AND (
                            json_extract(risk_payload,'$.exit_marker')='downside_warning_trim'
@@ -11424,6 +11465,7 @@ def _monitor_risk_impl(asof_date=None):
             guard_level_trimmed = bool(conn.execute(
                 """SELECT 1 FROM paper_orders
                    WHERE account_id=? AND code=? AND side='sell' AND status='filled'
+                     AND """ + _execution_verified_predicate() + """
                      AND substr(created_at,1,10)=?
                        AND (
                            json_extract(risk_payload,'$.exit_marker')=?
@@ -11440,6 +11482,7 @@ def _monitor_risk_impl(asof_date=None):
             warning_confirmed_trimmed = bool(conn.execute(
                 """SELECT 1 FROM paper_orders
                    WHERE account_id=? AND code=? AND side='sell' AND status='filled'
+                     AND """ + _execution_verified_predicate() + """
                      AND substr(created_at,1,10)=?
                        AND (
                            json_extract(risk_payload,'$.exit_marker')='downside_warning_confirmed'
@@ -11652,6 +11695,9 @@ def _monitor_risk_impl(asof_date=None):
                 conn.execute("INSERT INTO paper_fills(order_id,account_id,side,code,qty,price,amount,fees,fill_date,quote_at,assumption) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
                              (cursor.lastrowid, position["account_id"], "sell", position["code"], qty, fill_price, amount, fees,
                               day.isoformat(), quote.get("quote_at") or _now(), "实时价 - 0.10% 滑点，含佣金及印花税"))
+                # 风控退出是生产成交路径之一：流水写入后必须盖章，否则这笔真实卖出
+                # 的验证列为 NULL，会被闸门从已实现盈亏 / NAV / 执行绩效里剔除。
+                EV.stamp_order(conn, cursor.lastrowid)
                 _risk_log(conn, position["account_id"], position["code"], "sell", "filled", reason, detail)
                 _audit(conn, position["account_id"], "sell_filled", f"{position['code']} {qty}股 @ {fill_price:.2f}")
                 # 2026-08-28：partial 减仓时仓位仍在，不产生回补观察；
@@ -12081,12 +12127,14 @@ def _bootstrap_signals_for_today(asof_day, live_universe=None, source_slot="intr
                 recovery_codes = set(recovery_watches)
                 reentry_codes = set()
                 if account.get("mode") != "intraday_t":
+                    # "今日已卖出"是成交声称：只有被证据证明卖出的标的才进入回补池。
                     sold_today = {
                         str(row["code"])
                         for row in _rows(
                             conn,
                             """SELECT DISTINCT code FROM paper_orders
                                WHERE account_id=? AND side='sell' AND status='filled'
+                                 AND """ + _execution_verified_predicate() + """
                                  AND substr(executed_at,1,10)=?""",
                             (account["id"], day.isoformat()),
                         )
@@ -12763,6 +12811,8 @@ def _intraday_sell(conn, account, position, quote, asof_day, profile, cycle, ope
     conn.execute("INSERT INTO paper_fills(order_id,account_id,side,code,qty,price,amount,fees,fill_date,quote_at,assumption) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
                  (cursor.lastrowid, account["id"], "sell", position["code"], qty, fill, amount, fees,
                  _date(asof_day).isoformat(), quote.get("quote_at"), "开盘/5分钟实时快照高抛，含滑点、佣金、印花税"))
+    # 日内做T高抛同样是生产成交路径：流水写入后盖章，否则这笔真实卖出被闸门剔除。
+    EV.stamp_order(conn, cursor.lastrowid)
     _risk_log(conn, account["id"], position["code"], "sell", audit_action, "开盘事件高抛通过" if opening_event else "日内高抛通过", payload)
     _audit(conn, account["id"], audit_action, f"{position['code']} {qty}股 @ {fill:.2f}")
     return {
@@ -13752,8 +13802,9 @@ def _record_nav(conn, asof_day, quotes=None):
             for p in account_positions
         )
         realized = _num(conn.execute(
-            """SELECT COALESCE(SUM(realized_pnl),0) FROM paper_orders
-               WHERE account_id=? AND side='sell' AND status='filled'""",
+            "SELECT COALESCE(SUM(realized_pnl),0) FROM paper_orders"
+            " WHERE account_id=? AND side='sell' AND status='filled' AND "
+            + _execution_verified_predicate(),
             (account["id"],),
         ).fetchone()[0])
         # In shared-pool mode account.cash is only an attribution bucket.  A
@@ -13796,7 +13847,14 @@ def _weekly_review(conn, day):
             peak = max(peak, nav)
             max_dd = min(max_dd, nav / peak - 1 if peak else 0)
         fills = _rows(conn, "SELECT * FROM paper_fills WHERE account_id=?", (account["id"],))
-        closed = _rows(conn, "SELECT * FROM paper_orders WHERE account_id=? AND side='sell' AND status='filled'", (account["id"],))
+        # 已平仓笔数是**执行绩效**口径：只有被证据证明的成交才算平仓，
+        # "账本自称成交"的旧行不得抬高样本量去触发参数自动微调。
+        closed = _rows(
+            conn,
+            "SELECT * FROM paper_orders WHERE account_id=? AND side='sell'"
+            " AND status='filled' AND " + _execution_verified_predicate(),
+            (account["id"],),
+        )
         signal_count = conn.execute("SELECT COUNT(*) FROM paper_signals WHERE account_id=?", (account["id"],)).fetchone()[0]
         rejected = conn.execute("SELECT COUNT(*) FROM paper_orders WHERE account_id=? AND status!='filled'", (account["id"],)).fetchone()[0]
         latest_nav = navs[-1] if navs else reference_capital
@@ -14469,13 +14527,13 @@ def _account_metrics(conn, account, quotes=None, positions=None, metric_cache=No
     )
     today = dt.date.today().isoformat()
     if metric_cache is None:
-        sells = _rows(
-            conn,
-            """SELECT id,account_id,code,qty,filled_price,amount,fees,status,
-                      realized_pnl,created_at,executed_at
-                 FROM paper_orders
-                 WHERE account_id=? AND side='sell' AND status='filled'""",
-            (account["id"],),
+        # 直查分支与缓存分支必须产出**同一批**已验证成交：两处各写一份 SQL 会让
+        # trade_count / realized_pnl / 胜率随调用方是否传 cache 而漂移（同一账户
+        # 同一时刻出现两个执行绩效）。统一走仓储的已验证卖出投影。
+        sells = list(
+            (
+                _account_metric_inputs(conn, [account["id"]], today).get("sells") or {}
+            ).get(account["id"], [])
         )
     else:
         sells = list((metric_cache.get("sells") or {}).get(account["id"], []))
@@ -15012,7 +15070,11 @@ def stock_trade_history(code, account_id=None):
             )
             position["account_name"] = account_names.get(position["account_id"], position["account_id"])
             position["hold_days"] = _hold_days(position, dt.date.today())
-        filled = [item for item in orders if item.get("status") == "filled"]
+        # 成交集合是**执行绩效**口径：只有被证据证明成交的行参与已实现盈亏、
+        # 费率与成交笔数汇总。归档快照与旧行没有验证列 → fail closed 排除，
+        # 但把"自称成交却无证据"的条数单独报出来，不让排除变成静默。
+        claimed_fills = [item for item in orders if item.get("status") == "filled"]
+        filled = [item for item in claimed_fills if _row_is_verified(item)]
         sell_orders = [item for item in filled if item.get("side") == "sell"]
         buy_fills = [item for item in fills if item.get("side") == "buy"]
         sell_fills = [item for item in fills if item.get("side") == "sell"]
@@ -15031,6 +15093,7 @@ def stock_trade_history(code, account_id=None):
             "summary": {
                 "order_count": len(orders),
                 "filled_orders": len(filled),
+                "unverified_filled_orders": len(claimed_fills) - len(filled),
                 "rejected_orders": sum(1 for item in orders if item.get("status") == "risk_rejected"),
                 "buy_qty": sum(int(item.get("qty") or 0) for item in buy_fills),
                 "sell_qty": sum(int(item.get("qty") or 0) for item in sell_fills),

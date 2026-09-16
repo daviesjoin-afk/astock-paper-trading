@@ -102,7 +102,8 @@ class PoolExposureInvariantTests(unittest.TestCase):
         conn.executescript(
             """CREATE TABLE paper_orders(id INTEGER PRIMARY KEY, account_id TEXT,
                 side TEXT, code TEXT, amount REAL, status TEXT, realized_pnl REAL,
-                executed_at TEXT, created_at TEXT);
+                executed_at TEXT, created_at TEXT,
+                execution_status TEXT, execution_verified INTEGER);
             CREATE TABLE paper_positions(account_id TEXT, code TEXT, qty INTEGER,
                 cost REAL, entry_date TEXT);"""
         )

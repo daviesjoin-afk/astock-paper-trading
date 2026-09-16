@@ -29,6 +29,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import data_fetcher as dfc  # noqa: E402
 import universe as U  # noqa: E402
 import paper_trading as PT  # noqa: E402
+import execution_verification as EV  # noqa: E402
 
 # 10 virtual tickers. Prefix 600xxx passes paper_trading_rules.security_scope
 # so every ledger path behaves like a real listed board; names are invented
@@ -134,6 +135,9 @@ def _fill(conn, order_id, account_id, code, side, qty, price, created_at):
         order_id, account_id, side, code, qty, price, round(price * qty, 2),
         round(price * qty * 0.0003, 2), created_at[:10], created_at, "snapshot_price_rule",
     ))
+    # 演示数据同样是**生产写路径**：写入流水后盖章，否则 demo 账本里每一笔"成交"
+    # 都没有验证列，会被闸门排除，演示页面的已实现盈亏与成交统计恒为 0。
+    EV.stamp_order(conn, order_id)
 
 
 def _position(conn, cycle_id, account_id, code, name, industry, qty, cost, entry_day, available_day):
