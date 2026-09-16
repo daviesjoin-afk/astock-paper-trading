@@ -596,6 +596,123 @@ class AuditTrailRecordsDatasetIdentity(LearningClosureFixtures):
         )
 
 
+class BlockedRunsRetractStaleCandidates(LearningClosureFixtures):
+    """A blocked run must not leave a previous run's candidates standing.
+
+    ``adaptive_alpha_candidates`` is read without joining the run status (by
+    ``_overview_uncached()`` and ``deepseek_research._overfit_evidence()``), so a
+    same-date rerun that now blocks would keep presenting stale
+    ``shadow_candidate`` rows as valid.  The blocker has to retract them.
+    """
+
+    def _completed_run_with_candidates(self, conn):
+        result = run_lab(conn)
+        self.assertEqual("completed", result["status"])
+        rows = candidates(conn)
+        self.assertTrue(rows, "fixture must produce candidates to retract")
+        return rows
+
+    def test_blocked_rerun_retracts_previous_candidates(self):
+        conn = self.new_db()
+        seed_series(conn)
+        self._completed_run_with_candidates(conn)
+        # Same date now blocks on a fingerprint mismatch.
+        run_lab(conn, expected_fingerprint="f" * 64)
+        self.assertEqual(
+            [], candidates(conn),
+            "a blocked rerun left stale candidates readable",
+        )
+        status, detail = stored_run(conn)
+        self.assertEqual("waiting_dataset", status)
+        self.assertEqual("dataset_fingerprint_mismatch", detail["blocker"])
+
+    def test_empty_partition_rerun_retracts_previous_candidates(self):
+        conn = self.new_db()
+        seed_series(conn)
+        self._completed_run_with_candidates(conn)
+        build = LD.build_dataset(conn, cutoff=CUTOFF, code_build_identity=AE.ENGINE_VERSION)
+        crippled = dataclasses.replace(build, partitions={**build.partitions, "test": []})
+        run_lab(conn, dataset_build=crippled)
+        self.assertEqual([], candidates(conn))
+
+    def test_truncated_rerun_retracts_previous_candidates(self):
+        conn = self.new_db()
+        seed_series(conn)
+        self._completed_run_with_candidates(conn)
+        build = LD.build_dataset(conn, cutoff=CUTOFF, code_build_identity=AE.ENGINE_VERSION)
+        run_lab(conn, dataset_build=dataclasses.replace(build, truncated=True))
+        self.assertEqual([], candidates(conn))
+
+    def test_below_sample_gate_retracts_previous_candidates(self):
+        conn = self.new_db()
+        seed_series(conn)
+        self._completed_run_with_candidates(conn)
+        # The gate is evaluated before any dataset work.
+        result = run_lab(conn, min_days=9999, min_rows=999999)
+        self.assertEqual("waiting_data", result["status"])
+        self.assertEqual([], candidates(conn))
+
+    def test_unprovable_cutoff_rerun_retracts_previous_candidates(self):
+        conn = self.new_db()
+        seed_series(conn)
+        self._completed_run_with_candidates(conn)
+        # Same date, but the cutoff can no longer be proven.  Patched rather than
+        # passed in, so the run_date stays CUTOFF and this really is a rerun of
+        # the same date -- a *different* run_date is a different run and must not
+        # be retracted.
+        with mock.patch.object(
+            LD, "build_dataset", side_effect=ValueError("unparseable cutoff")
+        ), mock.patch.object(AE, "ALPHA_MIN_PROFILE_DAYS", 5), \
+           mock.patch.object(AE, "ALPHA_MIN_MATURE_ROWS", 10):
+            result = AE._run_alpha_lab(conn, CUTOFF)
+        self.assertEqual("waiting_dataset", result["status"])
+        self.assertEqual("unprovable_cutoff", result["detail"]["blocker"])
+        self.assertEqual([], candidates(conn))
+
+    def test_a_different_run_date_does_not_retract_another_dates_candidates(self):
+        """Retraction is scoped to the date being recorded, not global."""
+        conn = self.new_db()
+        seed_series(conn)
+        self._completed_run_with_candidates(conn)
+        kept = conn.execute(
+            "SELECT COUNT(*) FROM adaptive_alpha_candidates WHERE run_date=?", (CUTOFF,)
+        ).fetchone()[0]
+        self.assertGreater(kept, 0)
+        # A run for a different date that blocks must leave CUTOFF's rows alone.
+        with mock.patch.object(AE, "ALPHA_MIN_PROFILE_DAYS", 5), \
+             mock.patch.object(AE, "ALPHA_MIN_MATURE_ROWS", 10):
+            AE._run_alpha_lab(conn, "2026-02-02", expected_fingerprint="b" * 64)
+        self.assertEqual(
+            kept,
+            conn.execute(
+                "SELECT COUNT(*) FROM adaptive_alpha_candidates WHERE run_date=?", (CUTOFF,)
+            ).fetchone()[0],
+        )
+
+    def test_overview_does_not_present_candidates_for_a_blocked_run(self):
+        """The actual reader named in the finding."""
+        conn = self.new_db()
+        seed_series(conn)
+        self._completed_run_with_candidates(conn)
+        run_lab(conn, expected_fingerprint="a" * 64)
+        rows = conn.execute(
+            "SELECT * FROM adaptive_alpha_candidates "
+            "ORDER BY run_date DESC, validation_fitness DESC, id DESC LIMIT 8"
+        ).fetchall()
+        self.assertEqual([], rows)
+
+    def test_a_later_successful_rerun_still_produces_candidates(self):
+        """Retraction must not permanently disable the date."""
+        conn = self.new_db()
+        seed_series(conn)
+        self._completed_run_with_candidates(conn)
+        run_lab(conn, expected_fingerprint="a" * 64)
+        self.assertEqual([], candidates(conn))
+        result = run_lab(conn)
+        self.assertEqual("completed", result["status"])
+        self.assertTrue(candidates(conn))
+
+
 class SingleBuildPerCycle(LearningClosureFixtures):
     def test_cycle_hands_the_lab_the_build_it_already_fingerprinted(self):
         conn = self.new_db()

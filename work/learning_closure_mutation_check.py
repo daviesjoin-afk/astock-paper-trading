@@ -140,6 +140,19 @@ MUTATIONS = (
         "    rng = random.Random(f\"{ENGINE_VERSION}:{run_date}\")\n",
         "RNG identity no longer bound to the dataset fingerprint",
     ),
+    (
+        "L9",
+        ADAPTIVE,
+        "    flag.  Called in the same transaction as the run record, so readers never see\n"
+        "    a blocked run alongside live candidates.\n"
+        "    \"\"\"\n"
+        "    conn.execute(\"DELETE FROM adaptive_alpha_candidates WHERE run_date=?\", (run_date,))\n",
+        "    flag.  Called in the same transaction as the run record, so readers never see\n"
+        "    a blocked run alongside live candidates.\n"
+        "    \"\"\"\n"
+        "    return None  # MUTANT L9: a blocked run keeps the previous candidates\n",
+        "blocked run does not retract the previous candidates",
+    ),
 )
 
 # 自检哨兵：只改注释。它必须 UNDETECTED。

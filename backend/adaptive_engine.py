@@ -1573,9 +1573,27 @@ def _canonical_alpha_frame(build, *, max_rows_per_window=ALPHA_MAX_ROWS_PER_WIND
     return frame
 
 
+def _invalidate_alpha_candidates(conn, run_date):
+    """Drop this date's candidate rows when the run does not select any.
+
+    ``adaptive_alpha_candidates`` is read independently of the run status -- by
+    ``_overview_uncached()`` and ``deepseek_research._overfit_evidence()`` -- so a
+    run that previously completed and is now blocked (or short of samples) would
+    otherwise keep presenting stale rows, including ``shadow_candidate`` entries,
+    as valid.  A hard blocker must retract the claim it is blocking.
+
+    Deleting rather than marking: the rows describe a candidate set that this run
+    no longer stands behind, and no downstream reader honours an invalidation
+    flag.  Called in the same transaction as the run record, so readers never see
+    a blocked run alongside live candidates.
+    """
+    conn.execute("DELETE FROM adaptive_alpha_candidates WHERE run_date=?", (run_date,))
+
+
 def _record_blocked_alpha_run(conn, run_date, status, profile_days, mature_rows, detail):
     """Persist a fail-closed alpha run and return it.  No candidate is written."""
     now = _now()
+    _invalidate_alpha_candidates(conn, run_date)
     conn.execute(
         """INSERT INTO adaptive_alpha_runs(run_date,status,profile_days,mature_rows,generations,detail,created_at,updated_at)
            VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(run_date) DO UPDATE SET status=excluded.status,
@@ -1600,6 +1618,9 @@ def _run_alpha_lab(conn, run_date, *, dataset_build=None, expected_fingerprint=N
             "feature_transformer": list(ALPHA_FEATURES),
             "neural_network": False,
         }
+        # Same retraction rule as a blocked run: falling below the sample gate
+        # must not leave a previous run's candidates standing.
+        _invalidate_alpha_candidates(conn, run_date)
         conn.execute(
             """INSERT INTO adaptive_alpha_runs(run_date,status,profile_days,mature_rows,generations,detail,created_at,updated_at)
                VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(run_date) DO UPDATE SET status=excluded.status,
