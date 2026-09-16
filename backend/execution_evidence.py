@@ -83,6 +83,7 @@ __all__ = [
     "EXECUTION_EVIDENCE_EXTRA_FIELDS",
     "EXECUTION_EVIDENCE_FIELDS",
     "EXECUTION_EVIDENCE_VERSION",
+    "FILL_IDENTITY_FIELDS",
     "FILL_VERDICTS",
     "FILL_VERDICT_NONE_CONFIRMED",
     "FILL_VERDICT_NOT_ATTEMPTED",
@@ -90,6 +91,7 @@ __all__ = [
     "FILL_VERDICT_PENDING",
     "FILL_VERDICT_UNKNOWN",
     "FILL_VERDICT_VERIFIED",
+    "INCONSISTENCY_FILL_IDENTITY_MISMATCH",
     "KNOWN_EVIDENCE_FIELD_NAMES",
     "RETURN_FIELDS",
     "ExecutionEvidence",
@@ -161,9 +163,16 @@ INCONSISTENCY_PLANNED_PRICE_MISSING = "planned_price_missing"
 INCONSISTENCY_REJECTED_WITHOUT_REASON = "rejected_without_reason"
 INCONSISTENCY_CANCELLED_WITHOUT_REASON = "cancelled_without_reason"
 INCONSISTENCY_UNRECOGNIZED_STATUS = "unrecognized_order_status"
+#: 成交流水与委托的身份（账户/方向/标的）不一致。仓库的 ``paper_fills`` 没有外键，
+#: 也没有这三项与委托一致的 CHECK，因此历史或手工导入的错行只能在这里挡住。
+INCONSISTENCY_FILL_IDENTITY_MISMATCH = "fill_identity_mismatch"
 
 SIDE_BUY = "buy"
 SIDE_SELL = "sell"
+
+#: 一条成交流水要归属于某笔委托，必须在这三项上一致。三项都是 ``paper_fills``
+#: 的真实列；只有比较过的项才构成证据，缺失项不构成"不一致"。
+FILL_IDENTITY_FIELDS = ("account_id", "side", "code")
 
 #: 费用模型对账容差（1 分）。仓库写入的是未取整的浮点费用，容差只为兜住
 #: 历史数据里的取整残留；对不上就报 unknown，不强行解释。
@@ -362,6 +371,8 @@ class ExecutionEvidence:
             codes.append(INCONSISTENCY_CANCELLED_WITHOUT_REASON)
         if self.lifecycle_state == EL.STATE_UNKNOWN:
             codes.append(INCONSISTENCY_UNRECOGNIZED_STATUS)
+        if provenance.get("fill_identity_mismatches"):
+            codes.append(INCONSISTENCY_FILL_IDENTITY_MISMATCH)
         return tuple(codes)
 
     def as_dict(self) -> dict:
@@ -527,6 +538,50 @@ def _aggregate_fills(fill_rows: Any) -> dict:
     }
 
 
+def _text_or_none(value: Any) -> Optional[str]:
+    """把值规整成非空文本；空串 / None / 纯空白一律 ``None``（"没有可比对的证据"）。"""
+    text = str(value if value is not None else "").strip()
+    return text or None
+
+
+def _fill_identity_mismatches(
+    order: Any,
+    fill_rows: Any,
+    *,
+    identity_rows: Any = None,
+    identity_known: bool = True,
+) -> tuple:
+    """成交流水与委托在 ``account_id`` / ``side`` / ``code`` 上的不一致明细。
+
+    仓库的 ``paper_fills`` **没有**外键，也没有"这三项必须与委托一致"的约束，
+    而 :func:`load_execution_evidence` 只按 ``order_id`` 关联。于是一条历史错行或
+    手工导入行会被当成权威证据，把一笔委托**错误地**验证成成交（甚至用别人的
+    标的与方向去算一次"往返收益"）。
+
+    判定口径（只报告，不聚合、不改写）：
+
+    * ``identity_known=False``（按 ``order_id`` 关联的调用方没有读取这三列）时
+      返回空元组：**没有检查**不等于**发现了不一致**，这里绝不臆造违规；
+    * 委托侧或流水侧任一为空（列缺失 / NULL / 空串）时跳过该项 —— 没有可比对的
+      证据就不判违规；
+    * 两侧都有值且不相等 → 记一项，含期望值与实际值，供审计定位错行。
+
+    返回 ``((field, expected, actual), ...)``，字段顺序稳定。
+    """
+    if not identity_known or identity_rows is None:
+        return ()
+    mismatches: list = []
+    for row in identity_rows or ():
+        for column in FILL_IDENTITY_FIELDS:
+            expected = _text_or_none(_get(order, column))
+            actual = _text_or_none(_get(row, column))
+            if expected is None or actual is None:
+                continue
+            if expected != actual:
+                mismatches.append((column, expected, actual))
+    return tuple(mismatches)
+
+
 def evidence_from_order(
     order: Any,
     fill_rows: Any = (),
@@ -534,15 +589,36 @@ def evidence_from_order(
     available_qty: Any = None,
     available_source: Optional[str] = None,
     source: str = "paper_orders+paper_fills",
+    fill_identity_rows: Any = None,
+    fill_identity_known: bool = True,
 ) -> ExecutionEvidence:
     """把一行 ``paper_orders``（+ 它的 ``paper_fills``）翻译成执行证据。
 
     ``available_qty`` 必须由调用方**显式**提供（并注明来源）——仓库无法从历史
     委托重建"下单时点的可用数量"，所以不提供时卖单一律 ``unknown``。
+
+    ``fill_identity_rows`` 是同一批流水的身份列（``account_id`` / ``side`` /
+    ``code``），用于核对"这条流水真的属于这笔委托"。**按 order_id 关联**的调用方
+    应当传入（见 :func:`load_execution_evidence`）；按构造期自带身份的调用方可以
+    不传，此时 ``fill_identity_known`` 必须显式给 ``False``：没有检查就不许声称
+    检查过（否则"未核对"会被读成"核对通过"）。
     """
     order = order if order is not None else {}
     aggregated = _aggregate_fills(fill_rows)
+    identity_mismatches = _fill_identity_mismatches(
+        order,
+        fill_rows,
+        identity_rows=fill_identity_rows,
+        identity_known=fill_identity_known,
+    )
     stored_status = str(_get(order, "status", "") or "")
+    #: 身份对不上的流水**不是**这笔委托的证据：一律不聚合、不据以验证成交，
+    #: 只作为不一致上报（见 :data:`INCONSISTENCY_FILL_IDENTITY_MISMATCH`）。
+    #: 宁可判"没有证据"（unknown），也不能用别人的流水把委托验证成成交。
+    excluded_rows = 0
+    if identity_mismatches:
+        excluded_rows = int(aggregated["fill_rows"])
+        aggregated = _aggregate_fills(())
     lifecycle_state = EL.canonical_state(
         stored_status, has_fill=aggregated["fill_rows"] > 0
     )
@@ -612,6 +688,12 @@ def evidence_from_order(
             "source": source,
             "fill_rows": aggregated["fill_rows"],
             "ignored_fill_rows": aggregated["ignored_fill_rows"],
+            "excluded_fill_rows": excluded_rows,
+            "fill_identity_mismatches": [
+                {"field": field, "expected": expected, "actual": actual}
+                for field, expected, actual in identity_mismatches
+            ],
+            "fill_identity_checked": bool(fill_identity_known),
             "planned_price": planned_price,
             "order_type": _text(_get(order, "order_type")),
             "fill_sessions": aggregated["sessions"],
@@ -857,8 +939,11 @@ def load_execution_evidence(
     if not orders:
         return []
     keys = [int(order["id"]) for order in orders]
+    #: 身份列必须与数量/价格一起读出来：``paper_fills`` 没有外键，只按
+    #: ``order_id`` 关联会把历史错行或手工导入行当成权威成交证据。
     fill_rows = conn.execute(
-        "SELECT order_id,qty,price,amount,fees,fill_date,quote_at FROM paper_fills "
+        "SELECT order_id,account_id,side,code,qty,price,amount,fees,fill_date,quote_at "
+        "FROM paper_fills "
         "WHERE order_id IN (%s) ORDER BY id" % ",".join("?" for _ in keys),
         tuple(keys),
     ).fetchall()
@@ -867,6 +952,11 @@ def load_execution_evidence(
         record = dict(row)
         grouped.setdefault(int(record["order_id"]), []).append(record)
     return [
-        evidence_from_order(order, grouped.get(int(order["id"]), ()))
+        evidence_from_order(
+            order,
+            grouped.get(int(order["id"]), ()),
+            fill_identity_rows=grouped.get(int(order["id"]), ()),
+            fill_identity_known=True,
+        )
         for order in orders
     ]

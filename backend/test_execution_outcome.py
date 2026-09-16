@@ -66,6 +66,7 @@ def evidence(
     fills=None,
     session=SESSION,
     reason="",
+    code="600001",
 ):
     if fills is None and status == "filled":
         amount = qty * price
@@ -73,11 +74,14 @@ def evidence(
                   "fill_date": session}]
     return EE.evidence_from_order(
         {
-            "id": 1, "side": side, "code": "600001", "qty": qty,
+            "id": 1, "side": side, "code": code, "qty": qty,
             "planned_price": planned, "status": status, "reason": reason,
             "created_at": CREATED_AT, "order_type": "market",
         },
         fills if fills is not None else [],
+        # 这里按构造期自带身份构造证据，**没有**按 order_id 关联过账本，
+        # 因此显式声明"未核对"，不冒充已核对。
+        fill_identity_known=False,
     )
 
 
@@ -190,6 +194,78 @@ class ReturnLayeringTests(unittest.TestCase):
         )
         with self.assertRaises(EO.MarketLabelSubstitution):
             EO.assert_no_market_label_substitution(forged)
+
+    def test_the_legs_must_be_a_complementary_round_trip_on_one_security(self):
+        """两笔同向成交不是往返；``buy X`` 配 ``sell Y`` 也不是。"""
+        cases = {
+            "two_buys": (evidence(side="buy", price=10.0),
+                         evidence(side="buy", price=11.0, session=EXIT_SESSION)),
+            "two_sells": (evidence(side="sell", price=10.0),
+                          evidence(side="sell", price=11.0, session=EXIT_SESSION)),
+            "different_securities": (
+                evidence(side="buy", code="600001", price=10.0),
+                evidence(side="sell", code="600002", price=11.0, session=EXIT_SESSION),
+            ),
+        }
+        for name, (entry_leg, exit_leg) in cases.items():
+            with self.subTest(name):
+                self.assertTrue(entry_leg.proves_fill())
+                self.assertTrue(exit_leg.proves_fill())
+                outcome = EO.link_execution_outcome(selection_outcome(), entry_leg, exit_leg)
+                self.assertFalse(outcome.execution_verified, name)
+                self.assertFalse(outcome.execution_return.is_known, name)
+                self.assertIsNone(outcome.execution_return.maybe(), name)
+                self.assertNotEqual(
+                    EO.RETURN_SOURCE_REALIZED_FILLS, outcome.execution_return.source, name
+                )
+                # 选股事实与市场反事实不受影响：被否掉的只是"执行已验证"。
+                self.assertTrue(outcome.selection_executable, name)
+                self.assertTrue(outcome.market_return.is_known, name)
+
+    def test_an_unknown_leg_direction_cannot_be_read_as_a_round_trip(self):
+        """方向未知 = 无法证明互补，一律 fail closed。"""
+        entry_leg = evidence(side="", status="pending_limit", fills=[])
+        exit_leg = evidence(side="sell", price=11.0, session=EXIT_SESSION)
+        outcome = EO.link_execution_outcome(selection_outcome(), entry_leg, exit_leg)
+        self.assertFalse(outcome.execution_verified)
+        self.assertFalse(outcome.execution_return.is_known)
+
+    def test_equal_partial_fills_do_not_yield_a_known_execution_return(self):
+        """两腿等量部分成交：数量相等 **不等于** 两腿都完整成交。
+
+        这正是 ``link_execution_outcome`` 曾经自己抛异常的那条路径：收益是
+        ``known`` 而 ``execution_verified`` 为假，被
+        :func:`assert_no_market_label_substitution` 判成"用标签冒充收益"。
+        """
+        partial_fill = lambda session, price: [  # noqa: E731
+            {"qty": 50, "price": price, "amount": 50 * price, "fees": 0.1,
+             "fill_date": session}
+        ]
+        entry_leg = evidence(qty=100, price=10.0, fills=partial_fill(SESSION, 10.0))
+        exit_leg = evidence(
+            side="sell", qty=100, price=11.0, session=EXIT_SESSION,
+            fills=partial_fill(EXIT_SESSION, 11.0),
+        )
+        self.assertEqual(EE.FILL_VERDICT_PARTIAL, entry_leg.fill_verdict_value())
+        self.assertEqual(EE.FILL_VERDICT_PARTIAL, exit_leg.fill_verdict_value())
+        self.assertFalse(entry_leg.proves_fill())
+        self.assertFalse(exit_leg.proves_fill())
+        self.assertEqual(50, entry_leg.filled_qty.require())
+        self.assertEqual(50, exit_leg.filled_qty.require())
+
+        holder = EO.realized_execution_return(entry_leg, exit_leg)
+        self.assertFalse(holder.is_known)
+        self.assertTrue(holder.is_unknown)
+        self.assertIsNone(holder.maybe())
+
+        # 受支持的 ``fill_partial`` 现场必须能被表达与审计，而不是抛异常。
+        outcome = EO.link_execution_outcome(selection_outcome(), entry_leg, exit_leg)
+        self.assertFalse(outcome.execution_verified)
+        self.assertTrue(outcome.execution_return.is_unknown)
+        self.assertEqual(EE.FILL_VERDICT_PARTIAL, outcome.fill_verdict)
+        self.assertEqual(
+            EO.EXECUTION_BUCKET_UNVERIFIED, EO.execution_bucket(outcome)
+        )
 
     def test_entry_only_fill_leaves_the_execution_return_unknown(self):
         outcome = EO.link_execution_outcome(selection_outcome(), evidence())

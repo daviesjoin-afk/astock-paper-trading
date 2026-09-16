@@ -190,13 +190,85 @@ def _selection_field(
     )
 
 
+def _round_trip_leg_identity(entry: Any, exit_evidence: Any) -> dict:
+    """两条腿是否构成**同一标的**上**互补方向**的一次往返。
+
+    往返的合法性必须被**证明**，不能被假设：两笔买入、或 ``buy X`` 配 ``sell Y``
+    都不是往返。方向或标的**未知**时同样判 ``matched=False``（fail closed）——
+    "不知道"不是"是"。
+
+    返回 ``{"matched": bool, "reason": str | None, ...}``；``reason`` 是机器可读
+    的拒绝原因，供字段 ``detail`` 原样携带。
+    """
+    if entry is None or exit_evidence is None:
+        return {"matched": False, "reason": "both legs are required to form a round trip"}
+    entry_code = entry.code.maybe()
+    exit_code = exit_evidence.code.maybe()
+    entry_action = entry.action.maybe()
+    exit_action = exit_evidence.action.maybe()
+    detail = {
+        "entry_code": entry_code,
+        "exit_code": exit_code,
+        "entry_action": entry_action,
+        "exit_action": exit_action,
+    }
+    if not entry_code or not exit_code:
+        return {
+            "matched": False,
+            "reason": (
+                "a leg's security code is not known, so the two fills cannot be tied to "
+                "one round trip"
+            ),
+            **detail,
+        }
+    if str(entry_code) != str(exit_code):
+        return {
+            "matched": False,
+            "reason": (
+                f"the legs reference different securities ({entry_code!r} vs {exit_code!r})"
+            ),
+            **detail,
+        }
+    if entry_action not in (EE.SIDE_BUY, EE.SIDE_SELL) or exit_action not in (
+        EE.SIDE_BUY, EE.SIDE_SELL
+    ):
+        return {
+            "matched": False,
+            "reason": (
+                "a leg's direction is not known, so the legs cannot be shown to be "
+                "complementary"
+            ),
+            **detail,
+        }
+    if entry_action == exit_action:
+        return {
+            "matched": False,
+            "reason": (
+                f"the legs are not complementary: both are {entry_action!r}, so this is "
+                "not an entry/exit round trip"
+            ),
+            **detail,
+        }
+    return {"matched": True, "reason": None, **detail}
+
+
 def realized_execution_return(entry: Any, exit_evidence: Any = None) -> Any:
     """**真实成交往返**收益。这是 ``execution_return`` 唯一合法的来源。
 
     * 入场没有正成交 → ``not_applicable``：没有成交就没有执行收益，
       ``market_label_value`` **不得**用来顶替；
     * 有入场成交但缺离场成交 → ``unknown``：往返还没闭合，不猜；
+    * 两腿不构成同一标的上的互补往返 → ``unknown``：两笔买入、或 ``buy X`` 配
+      ``sell Y`` 都**不是**往返，绝不能据此算出一个收益；
+    * 任一条腿只是**部分**成交（数量少于目标量）→ ``unknown``：数量恰好相等不等于
+      两腿都完整成交，部分成交不得被提升为一次干净往返；
     * 两侧数量不一致（部分平仓/多次建仓）→ ``unknown``：无法定义为一次干净往返。
+
+    这里**必须**自己把完整成交验一遍，而不是只看"数量相等"：``link_execution_outcome``
+    的 ``execution_verified`` 也要求 ``proves_fill()``，若本函数只比数量，等量部分成交
+    会得到一个 ``known`` 收益却配上 ``execution_verified=False``，被
+    :func:`assert_no_market_label_substitution` 判成"用标签冒充收益"而抛异常 ——
+    一个受支持的 ``fill_partial`` 现场反而无法被表达或审计。
     """
     if entry is None or not entry.has_positive_fill():
         return EE.EvidenceField.not_applicable(
@@ -212,6 +284,20 @@ def realized_execution_return(entry: Any, exit_evidence: Any = None) -> Any:
             detail=(
                 "the entry filled but no exit fill evidence exists, so the round trip is not "
                 "closed"
+            ),
+        )
+    identity = _round_trip_leg_identity(entry, exit_evidence)
+    if not identity["matched"]:
+        return EE.EvidenceField.unknown(
+            "execution_return",
+            detail=f"the two legs do not form a single round trip: {identity['reason']}",
+        )
+    if not entry.proves_fill() or not exit_evidence.proves_fill():
+        return EE.EvidenceField.unknown(
+            "execution_return",
+            detail=(
+                "both legs must be proven complete fills; a partial fill cannot define a "
+                "clean round trip even when the two filled quantities happen to be equal"
             ),
         )
     entry_qty = entry.filled_qty.require()
@@ -275,7 +361,11 @@ def link_execution_outcome(
     exit_side = exit_evidence
     entry_verified = bool(entry is not None and entry.proves_fill())
     exit_verified = bool(exit_side is not None and exit_side.proves_fill())
-    execution_verified = bool(entry_verified and exit_verified)
+    #: 两腿必须被证明是**同一标的上的互补往返**。两笔买入、或 ``buy X`` 配
+    #: ``sell Y`` 都不是一次往返：不能因为"两笔各自都完整成交"就盖 verified 章，
+    #: 更不能据此给选股样本记一笔已知的多头收益。
+    identity = _round_trip_leg_identity(entry, exit_side)
+    execution_verified = bool(entry_verified and exit_verified and identity["matched"])
 
     #: ``fill_verdict`` 描述**入场腿**的成交事实。它与 ``execution_verified``
     #: 不是同一个问题：入场全成而离场未平仓时是 ``fill_verified`` +

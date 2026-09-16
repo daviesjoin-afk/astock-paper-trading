@@ -338,12 +338,15 @@
 | 三层收益不得互相替代：来源分别为 `market_label_value` / `executable_selection_market_label` / `realized_fill_round_trip` | `execution_outcome` | `ReturnLayeringTests.test_the_three_return_layers_are_mutually_distinct`、`test_selection_return_is_a_counterfactual_not_a_fill` | ✅ |
 | 没有成交 → `execution_return` 不成立（`not_applicable`，`maybe()` 为 `None`） | `execution_outcome.realized_execution_return` | `ReturnLayeringTests.test_no_fill_means_execution_return_is_not_defined`、`test_entry_only_fill_leaves_the_execution_return_unknown` | ✅ |
 | `market_label_value` **绝不**顶替执行收益；顶替即抛 `MarketLabelSubstitution` | `execution_outcome.assert_no_market_label_substitution` | `ReturnLayeringTests.test_the_market_label_is_never_substituted_for_the_execution_return`、`test_a_known_execution_return_requires_a_verified_execution` | ✅ |
+| 两腿必须是**同一标的上互补方向**的往返：两笔同向、或 `buy X` 配 `sell Y` 一律 `execution_verified=False`（方向/标的未知同样 fail closed） | `execution_outcome._round_trip_leg_identity` | `ReturnLayeringTests.test_the_legs_must_be_a_complementary_round_trip_on_one_security`、`test_an_unknown_leg_direction_cannot_be_read_as_a_round_trip` | ✅ |
+| 等量**部分**成交不得产生已知执行收益：受支持的 `fill_partial` 现场必须能被表达与审计，而不是抛异常 | `execution_outcome.realized_execution_return` | `ReturnLayeringTests.test_equal_partial_fills_do_not_yield_a_known_execution_return` | ✅ |
+| 身份（账户/方向/标的）与委托不符的成交流水**不是**证据：不聚合、不据以验证成交，只作为 `fill_identity_mismatch` 上报 | `execution_evidence._fill_identity_mismatches` / `load_execution_evidence` | `LoadExecutionEvidenceTests.test_a_fill_row_that_does_not_match_the_order_is_not_evidence`、`test_a_matching_fill_row_still_verifies_the_order`、`test_identity_is_not_compared_when_the_caller_did_not_check_it`、`test_a_fill_row_without_identity_columns_is_not_a_mismatch` | ✅ |
 | 执行收益由真实成交往返净额计算；数量不等/费用缺失一律 `unknown` | `execution_outcome.realized_execution_return` | `ReturnLayeringTests.test_execution_return_is_computed_from_real_fills`、`test_execution_return_refuses_a_non_clean_round_trip`、`test_execution_return_is_unknown_when_fee_evidence_is_missing` | ✅ |
 | PR149 selection outcome 契约字段与 `outcome_bucket` 权威分类**不被本层改动** | `selection_tradability` / `execution_outcome` | `Pr149ContractPreservationTests`（4 用例，含 `test_module_does_not_reimplement_the_tradability_bucket_priority`） | ✅ |
 | 只读集成：从真实 `paper_orders` + `paper_fills` 读证据，且所选列必须存在于生产 DDL | `execution_evidence.load_execution_evidence` | `LoadExecutionEvidenceTests`（含 `test_selected_columns_exist_in_the_production_schema` 直接解析 `paper_trading.py` 的 DDL） | ✅ |
 | 新模块纯 stdlib、只读、不导入 `paper_trading`；不触碰 orders/fills 之外的表 | `execution_evidence` / `execution_lifecycle` | `test_execution_evidence.py`（`ArchitectureGuardTests`）、`test_execution_lifecycle.py`（`ArchitectureGuardTests`） | ✅ |
 | 状态机与证据层结论一致：无成交证据的 `filled` 行不能走到 `FILLED` | `execution_lifecycle` + `execution_evidence` | `test_execution_outcome.py`（`LifecycleBridgeTests`） | ✅ |
-| 真实源码变异 M51–M55 全部被测试捕获（5/5 caught，Undetected: 0）；哨兵 S0（仅改注释）必须 UNDETECTED 以证明矩阵非空转 | `execution_evidence` / `execution_lifecycle` / `execution_outcome` | `work/execution_reality_mutation_check.py`（逐项注入、每轮清字节码缓存、逐字节 + sha256 还原核验；含基线 green 前置检查） | ✅ |
+| 真实源码变异 M51–M59 全部被测试捕获（9/9 caught，Undetected: 0）；哨兵 S0（仅改注释）必须 UNDETECTED 以证明矩阵非空转 | `execution_evidence` / `execution_lifecycle` / `execution_outcome` | `work/execution_reality_mutation_check.py`（逐项注入、每轮清字节码缓存、逐字节 + sha256 还原核验；含基线 green 前置检查） | ✅ |
 
 变异明细：
 
@@ -354,5 +357,9 @@
 | M53 | partial fill => full fill（`FILLED` 的数量不变式放宽为 `filled > requested`） | CAUGHT |
 | M54 | execution return fallback market return（无成交时回落到 `market_field`） | CAUGHT |
 | M55 | illegal lifecycle transition accepted（`CREATED` 的合法边集合加入 `FILLED`） | CAUGHT |
+| M56 | round trip leg identity not checked（两腿身份/方向校验被拿掉，两笔买入也会被认成往返） | CAUGHT |
+| M57 | equal partial fills treated as a clean round trip（等量部分成交被当成干净往返并算出已知收益） | CAUGHT |
+| M58 | mismatched fill rows still aggregated（身份不符的流水只上报、仍被聚合为成交证据） | CAUGHT |
+| M59 | fill identity columns not selected（loader 退回只按 `order_id` 关联，不读身份列） | CAUGHT |
 | S0 | 哨兵：只改注释 | UNDETECTED（预期） |
 

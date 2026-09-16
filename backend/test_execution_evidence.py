@@ -363,7 +363,9 @@ class LoadExecutionEvidenceTests(unittest.TestCase):
         "amount", "fees", "status", "reason", "created_at", "executed_at",
         "cancelled_at", "order_type",
     )
-    SIGMA_FILLS = ("order_id", "qty", "price", "amount", "fees", "fill_date", "quote_at")
+    #: 身份列必须在读取列集里：只按 order_id 关联会把错行当成权威成交证据。
+    SIGMA_FILLS = ("order_id", "account_id", "side", "code", "qty", "price", "amount",
+                   "fees", "fill_date", "quote_at")
 
     @classmethod
     def _real_ddl(cls, table):
@@ -463,6 +465,93 @@ class LoadExecutionEvidenceTests(unittest.TestCase):
         before = conn.total_changes
         EE.load_execution_evidence(conn)
         self.assertEqual(before, conn.total_changes)
+
+    def _order_with_mismatched_fill(self):
+        """一笔买 ``600001`` 的委托，配一条身份完全对不上的流水。"""
+        conn = self._conn()
+        conn.execute(
+            "INSERT INTO paper_orders(account_id,side,code,qty,planned_price,status,reason,"
+            "created_at,order_type) VALUES('acc-a','buy','600001',100,10.0,'filled','',"
+            "?,'market')",
+            (CREATED_AT,),
+        )
+        order_id = conn.execute("SELECT id FROM paper_orders").fetchone()[0]
+        amount = 100 * 99.0
+        conn.execute(
+            "INSERT INTO paper_fills(order_id,account_id,side,code,qty,price,amount,fees,"
+            "fill_date,quote_at,assumption) VALUES(?,?,?,?,?,?,?,?,?,?,'imported')",
+            (order_id, "acc-other", "sell", "600002", 100, 99.0, amount,
+             PTR.commission(amount), SESSION, CREATED_AT),
+        )
+        return conn, order_id
+
+    def test_a_fill_row_that_does_not_match_the_order_is_not_evidence(self):
+        """身份对不上的流水不得被当成权威成交证据。"""
+        conn, order_id = self._order_with_mismatched_fill()
+        evidence = EE.load_execution_evidence(conn, order_ids=[order_id])[0]
+        self.assertFalse(evidence.proves_fill())
+        self.assertEqual(EE.FILL_VERDICT_UNKNOWN, evidence.fill_verdict_value())
+        self.assertFalse(evidence.has_positive_fill())
+        self.assertTrue(evidence.filled_qty.is_unknown)
+        self.assertNotEqual(99.0, evidence.fill_price.maybe())
+        self.assertIn(
+            EE.INCONSISTENCY_FILL_IDENTITY_MISMATCH, evidence.inconsistencies()
+        )
+        self.assertEqual(0, evidence.provenance["fill_rows"])
+        self.assertEqual(1, evidence.provenance["excluded_fill_rows"])
+        self.assertTrue(evidence.provenance["fill_identity_checked"])
+        fields = {item["field"] for item in evidence.provenance["fill_identity_mismatches"]}
+        self.assertEqual({"account_id", "side", "code"}, fields)
+
+    def test_a_matching_fill_row_still_verifies_the_order(self):
+        """身份一致的流水照常验证通过：修复不能把正常路径一起否掉。"""
+        conn = self._conn()
+        conn.execute(
+            "INSERT INTO paper_orders(account_id,side,code,qty,planned_price,status,reason,"
+            "created_at,order_type) VALUES('acc-a','buy','600001',100,10.0,'filled','',"
+            "?,'market')",
+            (CREATED_AT,),
+        )
+        order_id = conn.execute("SELECT id FROM paper_orders").fetchone()[0]
+        amount = 100 * 10.01
+        conn.execute(
+            "INSERT INTO paper_fills(order_id,account_id,side,code,qty,price,amount,fees,"
+            "fill_date,quote_at,assumption) VALUES(?,?,?,?,?,?,?,?,?,?,'')",
+            (order_id, "acc-a", "buy", "600001", 100, 10.01, amount,
+             PTR.commission(amount), SESSION, CREATED_AT),
+        )
+        evidence = EE.load_execution_evidence(conn, order_ids=[order_id])[0]
+        self.assertTrue(evidence.proves_fill())
+        self.assertEqual(EE.FILL_VERDICT_VERIFIED, evidence.fill_verdict_value())
+        self.assertNotIn(
+            EE.INCONSISTENCY_FILL_IDENTITY_MISMATCH, evidence.inconsistencies()
+        )
+        self.assertEqual(1, evidence.provenance["fill_rows"])
+        self.assertEqual(0, evidence.provenance["excluded_fill_rows"])
+        self.assertEqual([], evidence.provenance["fill_identity_mismatches"])
+
+    def test_identity_is_not_compared_when_the_caller_did_not_check_it(self):
+        """未核对 ≠ 发现不一致：显式声明未核对时不得凭空报违规。"""
+        fill_row = dict(fill(), account_id="acc-other", side="sell", code="600002")
+        evidence = EE.evidence_from_order(
+            order(), [fill_row], fill_identity_known=False
+        )
+        self.assertNotIn(
+            EE.INCONSISTENCY_FILL_IDENTITY_MISMATCH, evidence.inconsistencies()
+        )
+        self.assertEqual([], evidence.provenance["fill_identity_mismatches"])
+        self.assertFalse(evidence.provenance["fill_identity_checked"])
+        # 流水本身仍然是有效成交证据（未核对只影响"归属"，不影响"这笔流水是什么"）。
+        self.assertTrue(evidence.proves_fill())
+
+    def test_a_fill_row_without_identity_columns_is_not_a_mismatch(self):
+        """没有可比对的证据就不判违规。"""
+        evidence = EE.evidence_from_order(order(), [fill()], fill_identity_known=True)
+        self.assertNotIn(
+            EE.INCONSISTENCY_FILL_IDENTITY_MISMATCH, evidence.inconsistencies()
+        )
+        self.assertTrue(evidence.provenance["fill_identity_checked"])
+        self.assertTrue(evidence.proves_fill())
 
 
 class ArchitectureGuardTests(unittest.TestCase):

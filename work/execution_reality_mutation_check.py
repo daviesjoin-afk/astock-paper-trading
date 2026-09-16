@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""执行真实性层（execution reality layer）本地变异验证工具 M51–M55。
+"""执行真实性层（execution reality layer）本地变异验证工具 M51–M59。
 
 用法::
 
@@ -90,6 +90,34 @@ MUTATIONS = (
         "        STATE_FILLED, STATE_SUBMITTED, STATE_REJECTED, STATE_CANCELLED,\n"
         "        STATE_EXPIRED, STATE_UNKNOWN,\n",
         "illegal lifecycle transition accepted",
+    ),
+    (
+        'M56',
+        'backend/execution_outcome.py',
+        '    identity = _round_trip_leg_identity(entry, exit_side)\n    execution_verified = bool(entry_verified and exit_verified and identity["matched"])\n',
+        '    identity = _round_trip_leg_identity(entry, exit_side)\n    execution_verified = bool(entry_verified and exit_verified)\n',
+        'round trip leg identity not checked',
+    ),
+    (
+        'M57',
+        'backend/execution_outcome.py',
+        '    if not entry.proves_fill() or not exit_evidence.proves_fill():\n        return EE.EvidenceField.unknown(\n            "execution_return",\n            detail=(\n                "both legs must be proven complete fills; a partial fill cannot define a "\n                "clean round trip even when the two filled quantities happen to be equal"\n            ),\n        )\n',
+        '',
+        'equal partial fills treated as a clean round trip',
+    ),
+    (
+        'M58',
+        'backend/execution_evidence.py',
+        '    excluded_rows = 0\n    if identity_mismatches:\n        excluded_rows = int(aggregated["fill_rows"])\n        aggregated = _aggregate_fills(())\n',
+        '    excluded_rows = 0\n    if identity_mismatches:\n        excluded_rows = int(aggregated["fill_rows"])\n',
+        'mismatched fill rows still aggregated',
+    ),
+    (
+        'M59',
+        'backend/execution_evidence.py',
+        '        "SELECT order_id,account_id,side,code,qty,price,amount,fees,fill_date,quote_at "\n',
+        '        "SELECT order_id,qty,price,amount,fees,fill_date,quote_at "\n',
+        'fill identity columns not selected',
     ),
 )
 

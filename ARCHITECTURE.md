@@ -109,6 +109,15 @@ execution_evidence     实际有没有成交、成交价是否可信    （execu
 - **没有成交就没有执行收益**：`execution_return` 在无成交证据时为 `not_applicable`，
   `market_label_value`（反事实标签）**不得**顶替它；`execution_return` 一旦为
   `known`，来源必须是 `realized_fill_round_trip` 且 `execution_verified` 为真。
+- **往返必须被证明**：两腿必须是**同一标的上互补方向**的往返。两笔同向成交、或
+  `buy X` 配 `sell Y` 都不构成往返，一律 `execution_verified=False`；方向或标的
+  未知时同样 fail closed（"不知道"不是"是"）。等量**部分**成交也不构成干净往返：
+  数量恰好相等不等于两腿都完整成交，此时 `execution_return` 为 `unknown`，
+  该现场必须能被表达与审计，而不是触发 `MarketLabelSubstitution`。
+- **成交流水必须归属于该委托**：`paper_fills` 没有外键，也没有"账户/方向/标的与
+  委托一致"的约束，因此 `load_execution_evidence` 必须一并读取身份列并比对。
+  身份不符的流水**不是**证据：不聚合、不据以验证成交，只作为
+  `fill_identity_mismatch` 上报，宁可判 `unknown` 也不能用别人的流水把委托验证成成交。
 - **`selection_executable=True` + `execution_verified=False` 必须允许存在**：
   "选出来但买不进/没成交"正是本层要暴露的现场，不得被静默合并成一种结论。
 
