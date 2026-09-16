@@ -153,16 +153,66 @@ def _row_field(row: Any, name: str) -> Any:
     return getattr(row, name, None)
 
 
+def _verified_flag_value(value: Any) -> bool:
+    """``execution_verified`` 是否**就是**数值 1（与 SQL 的 ``= 1`` 等价）。
+
+    必须与 SQLite 的 ``COALESCE(execution_verified, 0) = 1`` 给出同一个答案，
+    因此这里**不做任何数值转换**：
+
+    * ``bool`` 先判（``bool`` 是 ``int`` 的子类）：``True`` 在 SQLite 里存成整数
+      1，所以 ``True → True``；``False → False``；
+    * ``int`` / ``float``：**精确等于 1** 才算真（``1`` 与 ``1.0`` → ``True``；
+      ``1.1``、``1.9``、``2`` → ``False``）。绝不 ``int(value)`` —— 那会把
+      ``1.1`` 截断成 ``1``，让 Python 判成已验证而 SQL 拒绝它；
+    * ``str`` / ``bytes``：**一律 False**。SQLite 里是 TEXT / BLOB 存储类，
+      与数值 1 比较恒为假。特别地不许把 ``"1"`` 或 ``b"1"`` 当成交：
+      在生产列（INTEGER affinity）上写入 ``"1"`` 时 SQLite 会把它**存成整数 1**，
+      读回来也就是整数 1，所以到这里根本不会出现字符串 —— 一旦出现，说明该值
+      不是走正常写入路径塞进来的，必须 fail closed；
+    * ``None`` 与其它类型 → ``False``。
+    """
+    if isinstance(value, bool):
+        return value is True
+    if isinstance(value, int):
+        return value == 1
+    if isinstance(value, float):
+        return value == 1.0
+    return False
+
+
+def _verified_status_value(value: Any) -> bool:
+    """``execution_status`` 是否**就是**那个字符串 ``'verified'``。
+
+    只接受 ``str`` 且精确相等。SQLite 里 TEXT ``'verified'`` 才与 ``= 'verified'``
+    相等；BLOB、数值、``'VERIFIED'``（SQLite 的 ``=`` 对字符串默认大小写敏感）
+    一律为假。``is_verified_status``（宽松、给 verdict 用）刻意保持独立，
+    因为它处理的是内部 verdict 常量而不是账本列值。
+    """
+    return isinstance(value, str) and value == EXECUTION_STATUS_VERIFIED
+
+
 def is_verified_row(row: Any) -> bool:
     """Python 侧的 :data:`VERIFIED_PREDICATE`：一行账本是否被证明成交。
 
     SQL 读路径必须用 :data:`VERIFIED_PREDICATE`；只有在行的列已经在手
     （归档快照、已读出的 dict / sqlite3.Row）时才用本函数，避免再下发一次查询。
 
-    与 SQL 谓词**逐字对齐**：同时要求 ``execution_verified`` 为真与
-    ``execution_status == 'verified'``。缺列、``NULL``、两列不一致一律
-    ``False``（fail closed）—— 旧行与归档快照里没有这两列，因此**不会**
-    因为 ``status='filled'`` 就被当成成交。
+    **与 SQL 谓词逐值等价**：对同一行，本函数与
+    ``COALESCE(execution_verified, 0) = 1 AND execution_status = 'verified'``
+    必须选中完全相同的行集合。两列不一致、缺列、``NULL``、类型不符一律
+    ``False``（fail closed）—— 旧行与归档快照里没有这两列，因此**不会**因为
+    ``status='filled'`` 就被当成成交。
+
+    为什么不能用 ``int(flag)``：SQLite 允许没有 ``CHECK`` 约束的列存任意
+    存储类的值。``int("1")``、``int(b"1")``、``int(1.1)`` 都会成功并得到 1，
+    于是 Python 判成已验证、SQL 拒绝该行 —— 同一笔成交在 SQL 路径与 Python
+    路径上结论不同。本函数因此只做**精确比较**，不做任何转换。
+
+    支持的输入形状（与 :func:`_row_field` 一致）：``dict`` / 其它 ``Mapping`` /
+    ``sqlite3.Row``（有 ``keys()`` 且支持下标）/ 普通对象（属性）。列值按 SQLite
+    原生存储类处理：``int`` / ``float`` / ``bool`` / ``str`` / ``bytes`` / ``None``。
+    不引入 numpy / pandas 依赖；这类标量（含 ``numpy.bool_`` 等非原生类型）不是
+    本契约接受的存储表示，一律 fail closed 为 ``False``。
     """
     if row is None:
         return False
@@ -170,14 +220,7 @@ def is_verified_row(row: Any) -> bool:
     status = _row_field(row, "execution_status")
     if flag is None or status is None:
         return False
-    try:
-        # 与 SQL 的 ``COALESCE(execution_verified,0) = 1`` 对齐：只有数值 1 通过。
-        # 非数值（例如被塞进 'yes'）在 SQLite 里会被当作 TEXT，比较结果为假，
-        # 这里也必须是假，否则两侧谓词就会给出不同结论。
-        numeric = int(flag)
-    except (TypeError, ValueError):
-        return False
-    return numeric == 1 and str(status) == EXECUTION_STATUS_VERIFIED
+    return _verified_flag_value(flag) and _verified_status_value(status)
 
 
 def verification_from_evidence(evidence: Any, *, fill_rows_present: bool = True) -> dict:

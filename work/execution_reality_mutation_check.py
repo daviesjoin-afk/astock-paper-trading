@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""执行真实性层（execution reality layer）本地变异验证工具 M51–M69。
+"""执行真实性层（execution reality layer）本地变异验证工具 M51–M70。
 
 用法::
 
@@ -191,9 +191,21 @@ MUTATIONS = (
     (
         'M67',
         'backend/execution_verification.py',
-        '    return numeric == 1 and str(status) == EXECUTION_STATUS_VERIFIED\n',
-        '    return bool(status)\n',
+        '    return _verified_flag_value(flag) and _verified_status_value(status)\n',
+        "    return str(status) == EXECUTION_STATUS_VERIFIED\n",
         'row predicate stops requiring the verified flag',
+    ),
+    (
+        'M70',
+        'backend/execution_verification.py',
+        "    if isinstance(value, float):\n"
+        "        return value == 1.0\n"
+        "    return False\n",
+        "    try:\n"
+        "        return int(value) == 1\n"
+        "    except (TypeError, ValueError):\n"
+        "        return False\n",
+        'row predicate coerces/truncates the verification flag',
     ),
     (
         'M68',

@@ -642,12 +642,18 @@ class CommitFillStampsTest(unittest.TestCase):
 
 
 class RowPredicateAgreementTest(unittest.TestCase):
-    """Python 侧谓词必须与 SQL 谓词**逐字对齐**并同样 fail closed。
+    """Python 侧谓词必须与 SQL 谓词**逐值对齐**并同样 fail closed。
 
     两边不一致时，同一行会在"SQL 读路径"与"行列已在手的读路径"之间得到相反
     结论 —— 执行绩效就会出现两个数字。这条测试把两份谓词钉在一起。
+
+    **oracle 是真实 SQLite，不是手写预期**。早期版本用 ``int(flag)`` 判断，
+    于是 ``execution_verified = 1.1`` 被截断成 ``1``：Python 判成交、SQL 拒绝。
+    所以这里的做法是：把矩阵**真实写进** SQLite → 用 ``VERIFIED_PREDICATE`` 查一遍
+    → 把同一批行读回来喂给 ``is_verified_row()`` → 比较两边选中的 **id 集合**。
     """
 
+    #: 两列一致性的基础用例集（旧行、缺列、状态不一致）。
     CASES = (
         ("verified", 1, True),
         ("verified", 0, False),      # 两列不一致 → fail closed
@@ -659,6 +665,46 @@ class RowPredicateAgreementTest(unittest.TestCase):
         ("verified", None, False),
         ("", 1, False),
     )
+
+    @staticmethod
+    def _probe_db(declared):
+        """一个**未声明类型** / 指定 affinity 的探针表。
+
+        ``declared`` 为空时保留 SQLite 原生动态类型（BLOB affinity），这样
+        ``b"1"`` 之类的值真的以 BLOB 存储类落库，才能观察到真实行为。
+        生产列声明的是 ``INTEGER``，所以同时用 INTEGER affinity 覆盖一遍：
+        affinity 会改变**存进去**的值（``"1"`` 存成整数 1），两侧都必须跟着变。
+        """
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        conn.execute(
+            "CREATE TABLE predicate_probe (id INTEGER PRIMARY KEY, label TEXT,"
+            f" execution_verified {declared}, execution_status TEXT)"
+        )
+        return conn
+
+    def _agreement(self, cases, declared=""):
+        """把 cases 写进真实 SQLite，比较 SQL 与 Python 选中的 id 集合。"""
+        conn = self._probe_db(declared)
+        for index, (label, flag, status) in enumerate(cases, start=1):
+            conn.execute(
+                "INSERT INTO predicate_probe"
+                "(id,label,execution_verified,execution_status) VALUES(?,?,?,?)",
+                (index, label, flag, status),
+            )
+        conn.commit()
+        sql_ids = [
+            int(row["id"]) for row in conn.execute(
+                f"SELECT id FROM predicate_probe WHERE {EV.VERIFIED_PREDICATE}"
+                " ORDER BY id")
+        ]
+        rows = [
+            dict(row) for row in
+            conn.execute("SELECT * FROM predicate_probe ORDER BY id")
+        ]
+        py_ids = [int(row["id"]) for row in rows if EV.is_verified_row(row)]
+        labels = {index: label for index, (label, _f, _s) in enumerate(cases, 1)}
+        return sql_ids, py_ids, labels, conn
 
     def test_row_predicate_agrees_with_the_sql_predicate(self):
         conn = _db()
@@ -683,6 +729,96 @@ class RowPredicateAgreementTest(unittest.TestCase):
                          "只有两列一致且为 verified 的行才算已验证")
         self.assertTrue(expected, "用例集本身不能空转")
 
+    #: 完整类型矩阵：SQLite 允许没有 CHECK 约束的列存任意存储类。
+    #:   flag: 1 / 1.0 / 1.1 / 1.9 / 0 / 2 / "1" / "1.0" / b"1" / True / False / None
+    #:   status: verified / unknown / partial / not_executed / None / b"verified" / 1 / "VERIFIED"
+    TYPE_MATRIX = (
+        ("flag_int_1", 1, "verified"),
+        ("flag_float_1_0", 1.0, "verified"),
+        ("flag_float_1_1", 1.1, "verified"),
+        ("flag_float_1_9", 1.9, "verified"),
+        ("flag_int_0", 0, "verified"),
+        ("flag_int_2", 2, "verified"),
+        ("flag_str_1", "1", "verified"),
+        ("flag_str_1_0", "1.0", "verified"),
+        ("flag_blob_1", b"1", "verified"),
+        ("flag_bool_true", True, "verified"),
+        ("flag_bool_false", False, "verified"),
+        ("flag_null", None, "verified"),
+        ("status_unknown", 1, "unknown"),
+        ("status_partial", 1, "partial"),
+        ("status_not_executed", 1, "not_executed"),
+        ("status_null", 1, None),
+        ("status_blob", 1, b"verified"),
+        ("status_int", 1, 1),
+        ("status_upper", 1, "VERIFIED"),
+        ("both_null", None, None),
+    )
+
+    def test_full_type_matrix_agrees_on_an_untyped_column(self):
+        """**核心回归**：未声明类型的列上，SQL 与 Python 必须选中同一批行。
+
+        未声明类型 → BLOB affinity，值以原始存储类落库。旧实现 ``int(flag)`` 会
+        在这里多选 ``1.1`` / ``"1"`` / ``b"1"`` / ``1.9``。
+        """
+        sql_ids, py_ids, labels, _conn = self._agreement(self.TYPE_MATRIX, "")
+        self.assertEqual(
+            sql_ids, py_ids,
+            "SQL 与 Python 选中的行不一致："
+            f"SQL-only={[labels[i] for i in sorted(set(sql_ids) - set(py_ids))]} "
+            f"Python-only={[labels[i] for i in sorted(set(py_ids) - set(sql_ids))]}")
+        # 非空转保护：矩阵里必须有真值行，否则"两边都选空"会假性通过。
+        self.assertTrue(sql_ids, "矩阵必须至少选中一行，否则一致性是假的")
+
+    def test_full_type_matrix_agrees_on_an_integer_affinity_column(self):
+        """生产列声明的是 INTEGER：affinity 会改变存入值，两侧必须同步改变。
+
+        在 INTEGER affinity 下 ``"1"`` / ``"1.0"`` / ``True`` 会被**存成整数 1**，
+        因此 SQL 会选中它们；Python 读到的也是整数 1，同样选中。这条测试锁住
+        "Python 不必自己解释字符串"，因为 SQLite 在写入时已经完成了转换。
+        """
+        sql_ids, py_ids, labels, _conn = self._agreement(self.TYPE_MATRIX, "INTEGER")
+        self.assertEqual(
+            sql_ids, py_ids,
+            "SQL 与 Python 选中的行不一致："
+            f"SQL-only={[labels[i] for i in sorted(set(sql_ids) - set(py_ids))]} "
+            f"Python-only={[labels[i] for i in sorted(set(py_ids) - set(sql_ids))]}")
+        self.assertTrue(sql_ids, "矩阵必须至少选中一行")
+
+    def test_fractional_verified_flag_does_not_pass_python_gate(self):
+        """**独立回归**：``execution_verified = 1.1`` 不得通过 Python 闸门。
+
+        旧实现 ``int(1.1) == 1`` 会放行；SQLite 的 ``COALESCE(v,0) = 1`` 拒绝它。
+        """
+        self.assertFalse(EV.is_verified_row({
+            "execution_verified": 1.1,
+            "execution_status": "verified",
+        }))
+        # 同样必须拒绝的其它"像 1"的值
+        for flag in (1.9, 2, 0.5, "1", "1.0", b"1", "yes"):
+            self.assertFalse(
+                EV.is_verified_row({
+                    "execution_verified": flag,
+                    "execution_status": "verified",
+                }), flag)
+        # 对照：真正等价于 SQL 的值必须通过
+        for flag in (1, 1.0, True):
+            self.assertTrue(
+                EV.is_verified_row({
+                    "execution_verified": flag,
+                    "execution_status": "verified",
+                }), flag)
+
+    def test_blob_and_text_flags_never_verify(self):
+        """BLOB / TEXT 存储类与数值 1 比较恒为假 —— SQL 与 Python 都必须拒绝。"""
+        sql_ids, py_ids, labels, _conn = self._agreement((
+            ("blob_1", b"1", "verified"),
+            ("text_1", "1", "verified"),
+            ("int_1", 1, "verified"),
+        ), "")
+        self.assertEqual(sql_ids, py_ids)
+        self.assertEqual([3], sql_ids, [(labels[i]) for i in sql_ids])
+
     def test_row_predicate_rejects_rows_without_the_columns(self):
         """归档快照 / 旧形状的行没有这两列 → 一律不算成交（fail closed）。"""
         self.assertFalse(EV.is_verified_row({"status": "filled", "side": "sell"}))
@@ -692,6 +828,42 @@ class RowPredicateAgreementTest(unittest.TestCase):
                                              "execution_verified": "yes"}))
         self.assertTrue(EV.is_verified_row({"execution_status": "verified",
                                             "execution_verified": True}))
+
+    def test_row_predicate_reads_every_supported_row_shape(self):
+        """dict / Mapping / sqlite3.Row / 普通对象 都必须能读，且结论一致。"""
+        conn = self._probe_db("INTEGER")
+        conn.execute(
+            "INSERT INTO predicate_probe(label,execution_verified,execution_status)"
+            " VALUES('ok',1,'verified')")
+        conn.execute(
+            "INSERT INTO predicate_probe(label,execution_verified,execution_status)"
+            " VALUES('bad',0,'verified')")
+        conn.commit()
+
+        class VerifiedObjectRow:
+            execution_verified = 1
+            execution_status = "verified"
+
+        class UnverifiedObjectRow:
+            execution_verified = 0
+            execution_status = "verified"
+
+        sql_row = conn.execute(
+            "SELECT * FROM predicate_probe WHERE id=1").fetchone()
+        self.assertTrue(EV.is_verified_row(sql_row), "sqlite3.Row 形状")
+        self.assertTrue(EV.is_verified_row(
+            {"execution_verified": 1, "execution_status": "verified"}), "dict 形状")
+        self.assertTrue(EV.is_verified_row(VerifiedObjectRow()), "属性形状")
+        self.assertFalse(EV.is_verified_row(UnverifiedObjectRow()),
+                         "属性形状也必须 fail closed")
+        # sqlite3.Row 与同一行的 dict 视图必须给出相同结论
+        bad_row = conn.execute(
+            "SELECT * FROM predicate_probe WHERE id=2").fetchone()
+        self.assertEqual(
+            EV.is_verified_row(bad_row),
+            EV.is_verified_row(dict(bad_row)),
+            "同一行的 Row 与 dict 形状结论不一致",
+        )
 
 
 if __name__ == "__main__":
