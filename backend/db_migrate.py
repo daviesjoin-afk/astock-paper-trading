@@ -53,6 +53,19 @@ def _backfill_execution_verification(conn):
     return EV.backfill_legacy_orders(conn)
 
 
+def _ensure_tradability_archive(conn):
+    """v13：历史可交易性事实资产表。
+
+    纯新增（``CREATE TABLE IF NOT EXISTS``），既不新增既有表字段也不回填历史行，
+    因此重复执行是无副作用的；表结构由
+    :func:`tradability_archive.ensure_schema` 持有，迁移只负责把它挂进正式
+    版本链，避免"运行时建表"的第二个真相来源。
+    """
+    import tradability_archive as TA
+
+    return TA.ensure_schema(conn)
+
+
 # 迁移注册表：db_name -> [(version, description, sql_or_callable), ...]
 MIGRATIONS = {
     "paper_trading": [
@@ -87,6 +100,9 @@ MIGRATIONS = {
         # 升级前由生产写路径落库的真实成交会永久停在 NULL，被闸门当成"没有证据"
         # 而从已实现盈亏 / NAV / 执行绩效里消失。
         (12, "按成交流水证据回填执行验证结论（幂等）", _backfill_execution_verification),
+        # 历史可交易性事实资产层：历史日期上"这只票当时是否真的可交易"的证据。
+        # 纯新增表，不改写任何既有行；Provider 不得直接建表，一律走本迁移。
+        (13, "新增历史可交易性事实资产表（幂等）", _ensure_tradability_archive),
     ],
     "adaptive_learning": [
         (1, "创建 schema_version 表", """
