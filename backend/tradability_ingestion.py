@@ -269,6 +269,11 @@ class ListingStatusProvider(TradabilityFactProvider):
             return _result(self, OUTCOME_UNKNOWN, observed_kind=self._observed_kind)
         listing_date = record.get("listing_date")
         delisting_date = record.get("delisting_date")
+        if listing_date is None and delisting_date is None:
+            # 空快照（今天在册、无任何上市/退市日期）不构成任何 listing 事实：
+            # 既推不出 is_listed，也没有可写的历史字段。诚实返回 unknown，而不是
+            # 生成一条全 None 的 evidence、虚报 evidence_present 与覆盖率。
+            return _result(self, OUTCOME_UNKNOWN, observed_kind=self._observed_kind)
         is_listed = TA._resolve_listed(  # noqa: SLF001 - 复用 archive 的唯一推导口径
             str(session), listing_date, delisting_date, None
         )
@@ -903,6 +908,13 @@ class IngestionService:
                     **composed,
                 }
 
+                # source_counts 独立于本次是否新增落库：dry-run 与幂等重放也必须
+                # 报告相同的来源拆分，不能因为唯一键命中就变成空。
+                for source_id in evidence_outcomes:
+                    source_counts[source_id.provider_id] = (
+                        source_counts.get(source_id.provider_id, 0) + 1
+                    )
+
                 if write:
                     try:
                         evidence = TA.normalize_record(record)
@@ -915,14 +927,12 @@ class IngestionService:
                     inserted = self._repo.save(evidence)
                     if inserted:
                         persisted.append(evidence)
-                        for source_id in evidence_outcomes:
-                            source_counts[source_id.provider_id] = (
-                                source_counts.get(source_id.provider_id, 0) + 1
-                            )
                     else:
                         skipped_records += 1  # 幂等重放：唯一键命中，逻辑状态不变。
 
-                self._record_session_stats(session_stats, composed, field_conflicts)
+                self._record_session_stats(
+                    session_stats, composed, field_conflicts, times["unprovable"]
+                )
 
             per_session[session] = self._finalize_session_stats(session_stats)
 
@@ -932,25 +942,27 @@ class IngestionService:
             run_id, codes, sessions, self._cutoff, normalized_evidence
         )
 
-        self._persist_run(
-            run_id=run_id,
-            started_at=started_at,
-            cutoff=self._cutoff,
-            sessions=sessions,
-            status=status,
-            requested_codes=len(codes),
-            raw_records=raw_records,
-            normalized_records=normalized_records,
-            persisted_records=len(persisted),
-            skipped_records=skipped_records,
-            unknown_records=unknown_records,
-            conflict_records=conflict_records,
-            unprovable_records=unprovable_records,
-            error_records=error_records,
-            conflicts=conflicts,
-            unprovable=unprovable,
-            run_fingerprint=run_fingerprint,
-        )
+        # dry-run（write=False）不写任何东西：archive 与 run audit 都不落库。
+        if write:
+            self._persist_run(
+                run_id=run_id,
+                started_at=started_at,
+                cutoff=self._cutoff,
+                sessions=sessions,
+                status=status,
+                requested_codes=len(codes),
+                raw_records=raw_records,
+                normalized_records=normalized_records,
+                persisted_records=len(persisted),
+                skipped_records=skipped_records,
+                unknown_records=unknown_records,
+                conflict_records=conflict_records,
+                unprovable_records=unprovable_records,
+                error_records=error_records,
+                conflicts=conflicts,
+                unprovable=unprovable,
+                run_fingerprint=run_fingerprint,
+            )
 
         return IngestionResult(
             run_id=run_id,
@@ -991,7 +1003,9 @@ class IngestionService:
         stats["unknown_limit_state"] += 1
 
     @staticmethod
-    def _record_session_stats(stats: dict, composed: Mapping[str, Any], conflicts: list) -> None:
+    def _record_session_stats(
+        stats: dict, composed: Mapping[str, Any], conflicts: list, unprovable: bool
+    ) -> None:
         stats["archive_records"] += 1
         stats["evidence_present"] += 1
         if composed.get("is_listed") is None:
@@ -1008,7 +1022,8 @@ class IngestionService:
             stats["unknown_limit_state"] += 1
         if conflicts:
             stats["conflicts"] += 1
-        # fully_proven：核心事实全部可证明（非 None）且无冲突。
+        # fully_proven：核心事实全部可证明（非 None）、无冲突、且观测时点可证明
+        # （unprovable 的证据不能用历史 observed_at 支撑过去决策，不算 fully proven）。
         if (
             composed.get("is_listed") is not None
             and composed.get("is_st") is not None
@@ -1016,6 +1031,7 @@ class IngestionService:
             and composed.get("has_market_quote") is not None
             and composed.get("has_trade_volume") is not None
             and not conflicts
+            and not unprovable
         ):
             stats["fully_proven"] += 1
 

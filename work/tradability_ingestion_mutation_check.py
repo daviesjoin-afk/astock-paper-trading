@@ -101,7 +101,8 @@ MUTATIONS = (
     (
         "TTI7",
         INGESTION,
-        "        # fully_proven：核心事实全部可证明（非 None）且无冲突。\n"
+        "        # fully_proven：核心事实全部可证明（非 None）、无冲突、且观测时点可证明\n"
+        "        # （unprovable 的证据不能用历史 observed_at 支撑过去决策，不算 fully proven）。\n"
         "        if (\n"
         "            composed.get(\"is_listed\") is not None\n"
         "            and composed.get(\"is_st\") is not None\n"
@@ -109,6 +110,7 @@ MUTATIONS = (
         "            and composed.get(\"has_market_quote\") is not None\n"
         "            and composed.get(\"has_trade_volume\") is not None\n"
         "            and not conflicts\n"
+        "            and not unprovable\n"
         "        ):\n",
         "        # MUTANT TTI7: unknown counted as fully_proven\n"
         "        if True:\n",

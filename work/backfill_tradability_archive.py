@@ -61,20 +61,32 @@ def _load_listing_records():
 
 
 def _build_kline_reader():
-    """把共享 K 线缓存包装成 kline_reader(code) -> {date: {close, volume}}。"""
+    """把共享 K 线缓存包装成 kline_reader(code) -> {date: {close, volume}}。
+
+    每个 code 的 K 线在**本次回填运行内只解析一次**：多 session 回填会反复调用
+    ``reader(code)``，若不缓存，每次都要 ``load_shared_kline`` → ``load_cached_kline``
+    → ``pandas.read_csv`` 重读整个 CSV 并重建 date 映射，30 天范围就把同一份历史
+    读 30 遍，市场级范围被重复磁盘 IO 与解析拖垮。
+    """
     import data_fetcher as DF
 
+    cache: dict = {}
+
     def reader(code):
+        if code in cache:
+            return cache[code]
         frame = DF.load_shared_kline(code)
         if frame is None or frame.empty:
-            return {}
-        out = {}
-        for index, row in frame.iterrows():
-            date = str(index.date()) if hasattr(index, "date") else str(index)[:10]
-            out[date] = {
-                "close": float(row.get("close")) if row.get("close") is not None else None,
-                "volume": float(row.get("volume")) if row.get("volume") is not None else None,
-            }
+            out = {}
+        else:
+            out = {}
+            for index, row in frame.iterrows():
+                date = str(index.date()) if hasattr(index, "date") else str(index)[:10]
+                out[date] = {
+                    "close": float(row.get("close")) if row.get("close") is not None else None,
+                    "volume": float(row.get("volume")) if row.get("volume") is not None else None,
+                }
+        cache[code] = out
         return out
 
     return reader
@@ -135,17 +147,15 @@ def _resolve_codes(args) -> list:
 def run_backfill(conn, providers, codes, sessions, *, write=True, run_id=None):
     """核心回填：建 service、ingest、commit/rollback。
 
-    * ``write=True``（生产回填）：显式注入 ``audit_conn``（修复 run audit 永远为空），
-      成功路径 ``commit()``，失败路径 ``rollback()``——否则 CLI 报告 ``persisted>0``
+    * 显式注入 ``audit_conn``（修复 run audit 永远为空）；dry-run 是否写 audit 由
+      ``IngestionService.ingest(write=...)`` 统一门控（``write=False`` 时 archive 与
+      run audit 都不落库）。
+    * 成功路径 ``commit()``，失败路径 ``rollback()``——否则 CLI 报告 ``persisted>0``
       但数据库为空（SQLite 关闭连接时回滚未提交事务，``repository.save`` 只是
       execute，不会自行 commit）。
-    * ``write=False``（dry-run）：不传 ``audit_conn``，只测量不落任何东西——
-      archive 与 ``tradability_ingestion_runs`` 都保持空。
     """
     repo = TA.TradabilityArchiveRepository(conn)
-    # dry-run 不写 audit：IngestionService 的 audit_conn 缺省即"只测量不落 run"。
-    audit_conn = conn if write else None
-    service = TI.IngestionService(providers, repo, audit_conn=audit_conn)
+    service = TI.IngestionService(providers, repo, audit_conn=conn)
     run_id = run_id or uuid.uuid4().hex
     try:
         result = service.ingest(codes, sessions, write=write, run_id=run_id)

@@ -906,5 +906,79 @@ class CompleteSuspensionArchive(IngestionTestCase):
         self.assertEqual(1, result.coverage["sessions"]["2025-06-10"]["unknown_suspension"])
 
 
+# ───────────────────────────── 27. Empty listing snapshot → unknown（fix #6） ────────────
+
+
+class EmptyListingSnapshot(IngestionTestCase):
+    def test_empty_snapshot_is_unknown_not_evidence(self):
+        # 空快照（无 listing_date/delisting_date）不得生成全 None 的 evidence。
+        provider = TI.ListingStatusProvider(
+            {"000001": {}},
+            observed_kind=TI.OBSERVED_RETRIEVED_AT,
+            observed_at="2026-09-16T09:00:00+08:00",
+        )
+        result = self.make_service([provider]).ingest(["000001"], ["2024-01-10"], write=True)
+        # 空快照不构成 listing 事实 → 该 (code, session) 无证据，不虚报 coverage。
+        self.assertEqual(0, result.coverage["evidence_present"])
+        self.assertEqual(0, result.coverage["coverage_ratio"])
+
+
+# ───────────────────────────── 28. Unprovable not fully_proven（fix #8） ────────────────
+
+
+class UnprovableNotFullyProven(IngestionTestCase):
+    def test_unprovable_evidence_not_fully_proven(self):
+        # 所有核心字段都给了，但 observed_kind=retrieved_at（今天才抓到）→ 不可证明，
+        # 即使字段齐全也不得算 fully_proven。
+        listing = TI.ListingStatusProvider(
+            {"000001": {"listing_date": "2010-01-01"}},
+            observed_kind=TI.OBSERVED_RETRIEVED_AT,
+            observed_at="2026-09-16T09:00:00+08:00",
+        )
+        result = self.make_service([listing]).ingest(["000001"], ["2024-01-10"], write=True)
+        self.assertEqual(0, result.coverage["sessions"]["2024-01-10"]["fully_proven"])
+        self.assertGreater(result.coverage["unprovable_observed_at"], 0)
+
+
+# ───────────────────────────── 29. source_counts 独立于新增（fix #10） ────────────────
+
+
+class SourceCountsIndependentOfInsert(IngestionTestCase):
+    def test_replay_reports_same_source_counts(self):
+        provider = TI.ListingStatusProvider(
+            {"000001": {"listing_date": "2010-01-01"}},
+            observed_kind=TI.OBSERVED_SNAPSHOT_TIMESTAMP,
+            observed_at="2025-01-01T09:00:00+08:00",
+        )
+        service = self.make_service([provider])
+        r1 = service.ingest(["000001"], ["2024-01-10"], write=True, run_id="src-count")
+        r2 = service.ingest(["000001"], ["2024-01-10"], write=True, run_id="src-count")
+        # 幂等重放：source_counts 与 coverage 指纹一致，不因唯一键命中而变空。
+        self.assertEqual(r1.coverage["source_counts"], r2.coverage["source_counts"])
+        self.assertEqual(r1.coverage["fingerprint"], r2.coverage["fingerprint"])
+        self.assertEqual(r1.coverage["source_counts"]["listing_status"], 1)
+
+
+# ───────────────────────────── 30. dry-run 不写 audit（fix #9） ────────────────────────
+
+
+class DryRunWritesNoAudit(IngestionTestCase):
+    def test_dry_run_leaves_audit_table_empty(self):
+        provider = TI.ListingStatusProvider(
+            {"000001": {"listing_date": "2010-01-01"}},
+            observed_kind=TI.OBSERVED_SNAPSHOT_TIMESTAMP,
+            observed_at="2025-01-01T09:00:00+08:00",
+        )
+        # audit_conn 已配置（生产同款），但 write=False 不得写 run audit。
+        service = TI.IngestionService([provider], self.repo, audit_conn=self.conn)
+        result = service.ingest(["000001"], ["2024-01-10"], write=False, run_id="dry-audit")
+        del result
+        self.assertEqual(0, self.repo.count("000001"))
+        row = self.conn.execute(
+            "SELECT * FROM tradability_ingestion_runs WHERE run_id=?", ("dry-audit",)
+        ).fetchone()
+        self.assertIsNone(row)
+
+
 if __name__ == "__main__":
     unittest.main()
