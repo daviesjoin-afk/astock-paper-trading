@@ -258,15 +258,57 @@ class QuoteAndVolumeExistence(ArchiveTestCase):
 
 
 class PriceLimitLock(ArchiveTestCase):
-    def test_buy_limit_lock_blocks_buy_only(self):
+    def test_limit_up_blocks_buy_but_leaves_sell_executable(self):
+        """涨停只拦买 —— 卖出仍然可成交（仓库权威口径 test_p5）。"""
         self.add("2025-03-10", is_listed=True, is_st=False, is_suspended=False,
                  has_market_quote=True, has_trade_volume=True,
-                 is_price_limit_locked=True)
+                 is_price_limit_locked=True, price_limit_direction="up")
         decision = self.decide("2025-03-10")
         self.assertFalse(decision.can_buy)
         self.assertEqual(TA.TradabilityReason.BUY_LIMIT_LOCKED, decision.buy_block_reason)
-        self.assertEqual(TA.TradabilityReason.SELL_LIMIT_LOCKED, decision.sell_block_reason)
+        self.assertTrue(decision.can_sell)
+        self.assertEqual(TA.TradabilityReason.OK, decision.sell_block_reason)
+
+    def test_limit_down_blocks_sell_but_leaves_buy_executable(self):
+        """跌停只拦卖 —— 买入仍然可成交。"""
+        self.add("2025-03-10", is_listed=True, is_st=False, is_suspended=False,
+                 has_market_quote=True, has_trade_volume=True,
+                 is_price_limit_locked=True, price_limit_direction="down")
+        decision = self.decide("2025-03-10")
+        self.assertTrue(decision.can_buy)
+        self.assertEqual(TA.TradabilityReason.OK, decision.buy_block_reason)
         self.assertFalse(decision.can_sell)
+        self.assertEqual(TA.TradabilityReason.SELL_LIMIT_LOCKED, decision.sell_block_reason)
+
+    def test_directionality_cannot_be_swapped(self):
+        """golden：涨停与跌停的拦截侧必须相反，绝不一刀切。"""
+        self.add("2025-03-10", is_price_limit_locked=True, price_limit_direction="up")
+        up = self.decide("2025-03-10")
+        self.add("2025-03-11", is_price_limit_locked=True, price_limit_direction="down")
+        down = self.decide("2025-03-11")
+
+        self.assertFalse(up.can_buy)
+        self.assertTrue(up.can_sell)
+        self.assertTrue(down.can_buy)
+        self.assertFalse(down.can_sell)
+        # 两侧被拦的 reason 必须不同——不允许合并成一个 "not tradable"。
+        self.assertNotEqual(up.buy_block_reason, down.sell_block_reason)
+
+    def test_locked_with_unknown_direction_blocks_both_sides(self):
+        """锁定事实已证、方向未知 → fail closed，两侧都拦且原因各自方向性。"""
+        self.add("2025-03-10", is_price_limit_locked=True, price_limit_direction=None)
+        decision = self.decide("2025-03-10")
+        self.assertFalse(decision.can_buy)
+        self.assertFalse(decision.can_sell)
+        self.assertEqual(TA.TradabilityReason.BUY_LIMIT_LOCKED, decision.buy_block_reason)
+        self.assertEqual(TA.TradabilityReason.SELL_LIMIT_LOCKED, decision.sell_block_reason)
+
+    def test_direction_aliases_are_normalized(self):
+        """上游的各种方向写法收敛到两个常量；无法识别的保持未知。"""
+        for raw, expected in (("UP", "up"), ("limit_up", "up"), ("涨停", "up"),
+                              ("Down", "down"), ("limit-down", None),
+                              ("跌停", "down"), ("", None), (None, None)):
+            self.assertEqual(expected, TA._direction(raw), raw)
 
     def test_not_locked_is_normal(self):
         self.add("2025-03-10", is_listed=True, is_st=False, is_suspended=False,
@@ -473,6 +515,37 @@ class RepositorySemantics(ArchiveTestCase):
             TA.TradabilityReason.OK, self.decide("2025-03-10").buy_block_reason
         )
 
+    def test_later_observed_correction_to_the_same_effective_state_is_kept(self):
+        """同一生效时点的上游修正必须保留，并在其后被采用（双时态）。
+
+        若身份不含 observed_at，这条修正会撞唯一键被静默丢弃，修正之后的决策会
+        继续使用过期的第一版事实。
+        """
+        self.add("2025-06-10", is_st=False, observed="2025-06-10T15:05:00",
+                 effective="2025-06-10T09:30:00")
+        # 同一天、同一生效时点，但更晚才观察到的更正：其实是 ST。
+        self.assertTrue(self.add("2025-06-10", is_st=True,
+                                 observed="2025-06-12T15:05:00",
+                                 effective="2025-06-10T09:30:00"))
+        self.assertEqual(2, self.repo.count(), "修正必须落库，而不是被唯一键吞掉")
+
+        # 修正被观察到之前 → 当时只知道第一版。
+        before = self.decide("2025-06-10", at="2025-06-11T09:00:00")
+        self.assertEqual(TA.TradabilityReason.OK, before.buy_block_reason)
+
+        # 修正被观察到之后 → 采用最新已知的版本。
+        after = self.decide("2025-06-10", at="2025-06-13T09:00:00")
+        self.assertEqual(TA.TradabilityReason.ST_RESTRICTED, after.buy_block_reason)
+
+    def test_same_observation_replayed_is_still_a_no_op(self):
+        """同一观测时点的重复写入仍是 no-op —— 身份只放宽到观测维度。"""
+        self.add("2025-06-10", is_st=False, observed="2025-06-10T15:05:00",
+                 effective="2025-06-10T09:30:00")
+        self.assertFalse(self.add("2025-06-10", is_st=False,
+                                  observed="2025-06-10T15:05:00",
+                                  effective="2025-06-10T09:30:00"))
+        self.assertEqual(1, self.repo.count())
+
     def test_distinct_effective_instants_coexist_on_one_session(self):
         self.assertTrue(self.add("2025-05-05", is_suspended=True,
                                  effective="2025-05-05T09:30:00"))
@@ -549,7 +622,8 @@ class MigrationCreatesTheArchive(unittest.TestCase):
         columns = {row[1] for row in conn.execute(f"PRAGMA table_info({TA.ARCHIVE_TABLE})")}
         self.assertEqual(
             {"id", "code", "session_date", "effective_at", "observed_at", "is_listed",
-             "is_st", "is_suspended", "is_price_limit_locked", "has_market_quote",
+             "is_st", "is_suspended", "is_price_limit_locked", "price_limit_direction",
+             "has_market_quote",
              "has_trade_volume", "source", "listing_date", "delisting_date",
              "suspension_reason", "created_at"},
             columns,

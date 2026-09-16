@@ -28,9 +28,11 @@
 （不可见），而不是默认可见。
 
 同一 ``(code, session_date)`` 在某个 ``decision_time`` 下可能有多条可见证据
-（例如当天先后出现"停牌"与"盘中复牌"），取 ``effective_at`` 最大者，即当时
-**最新生效**的那条。唯一约束 ``(code, session_date, effective_at)`` 保证这个
-选择是确定性的。
+（例如当天先后出现"停牌"与"盘中复牌"，或同一生效时点的记录被上游修正），
+取 ``effective_at`` 最大者，即当时**最新生效**的那条；同一 ``effective_at``
+上若存在多条修订，取其中 ``observed_at`` 最大者——即决策当时**最新已知**的版本。
+唯一约束 ``(code, session_date, effective_at, observed_at)`` 保证这个选择是确定性的，
+同时允许"同一生效时点、更晚被观察到"的修订与原始记录并存，而不是被静默丢弃。
 
 无任何可见记录 ≠ 可交易。没有记录时返回 ``UNKNOWN_STATE``，买卖都阻断。
 
@@ -88,11 +90,34 @@ DEFAULT_CACHE_SIZE = 4096
 
 SESSION_RE = re.compile(r"\d{4}-\d{2}-\d{2}")
 
+# 涨跌停方向。沿用 selection_tradability 的方向性语义：涨停只拦买、跌停只拦卖。
+PRICE_LIMIT_UP = "up"
+PRICE_LIMIT_DOWN = "down"
+_PRICE_LIMIT_DIRECTIONS = (PRICE_LIMIT_UP, PRICE_LIMIT_DOWN)
+
+# 上游可能给出的方向写法（中英文 / 大小写 / 简写）统一收敛到两个方向常量。
+_PRICE_LIMIT_ALIASES = {
+    "up": PRICE_LIMIT_UP,
+    "limit_up": PRICE_LIMIT_UP,
+    "limitup": PRICE_LIMIT_UP,
+    "zhangting": PRICE_LIMIT_UP,
+    "涨停": PRICE_LIMIT_UP,
+    "up_lock": PRICE_LIMIT_UP,
+    "down": PRICE_LIMIT_DOWN,
+    "limit_down": PRICE_LIMIT_DOWN,
+    "limitdown": PRICE_LIMIT_DOWN,
+    "dieting": PRICE_LIMIT_DOWN,
+    "跌停": PRICE_LIMIT_DOWN,
+    "down_lock": PRICE_LIMIT_DOWN,
+}
+
 __all__ = [
     "ARCHIVE_TABLE",
     "CONTRACT_VERSION",
     "FINGERPRINT_VERSION",
     "MIGRATION_DESCRIPTION",
+    "PRICE_LIMIT_UP",
+    "PRICE_LIMIT_DOWN",
     "TradabilityArchiveError",
     "TradabilityReason",
     "TradabilityEvidence",
@@ -165,6 +190,18 @@ def _flag(value: Any) -> Optional[bool]:
     return PIT.as_strict_bool(value)
 
 
+def _direction(value: Any) -> Optional[str]:
+    """规范化涨跌停方向；无法识别返回 ``None``（未知，而不是"无方向"）。
+
+    只接受白名单词表。未知方向**保留**为 ``None`` 而不猜测，由判断层决定是否
+    fail closed——这一层只负责如实保留事实。
+    """
+    text = _text(value)
+    if text is None:
+        return None
+    return _PRICE_LIMIT_ALIASES.get(text.lower())
+
+
 def _instant(value: Any) -> Optional["_dt.datetime"]:
     """解析时点。date-only 按仓库既有口径取**当日收盘**（见点内时间模块）。"""
     return PIT.parse_asof(value)
@@ -200,6 +237,12 @@ class TradabilityEvidence:
         三态：``True`` / ``False`` / ``None``（未知）。``None`` 不等于 ``False``，
         也不等于"允许交易"——判断层对核心事实一律 fail closed。
 
+    ``price_limit_direction``
+        涨跌停锁定方向（``"up"`` 涨停 / ``"down"`` 跌停 / ``None`` 未知）。
+        锁定是**有方向**的：涨停只拦买、跌停只拦卖，与仓库权威实现
+        ``selection_tradability`` 的方向性口径一致。无方向布尔会在涨停时错误地
+        禁止卖出——那恰恰是流动性最好的时候。
+
     ``observed_at``
         这条证据**被观察到**的时点。用它挡住"今天的数据解释过去"。
     ``effective_at``
@@ -218,6 +261,7 @@ class TradabilityEvidence:
     has_market_quote: Optional[bool]
     has_trade_volume: Optional[bool]
     is_price_limit_locked: Optional[bool]
+    price_limit_direction: Optional[str]
     source: str
     observed_at: str
     effective_at: str
@@ -237,6 +281,7 @@ class TradabilityEvidence:
             "is_st": _db_flag(self.is_st),
             "is_suspended": _db_flag(self.is_suspended),
             "is_price_limit_locked": _db_flag(self.is_price_limit_locked),
+            "price_limit_direction": self.price_limit_direction,
             "has_market_quote": _db_flag(self.has_market_quote),
             "has_trade_volume": _db_flag(self.has_trade_volume),
             "source": self.source,
@@ -379,6 +424,9 @@ def normalize_record(
         has_market_quote=_flag(record.get("has_market_quote")),
         has_trade_volume=_flag(record.get("has_trade_volume")),
         is_price_limit_locked=_flag(record.get("is_price_limit_locked")),
+        price_limit_direction=_direction(
+            record.get("price_limit_direction") or record.get("limit_direction")
+        ),
         source=src,
         observed_at=observed,
         effective_at=effective,
@@ -403,6 +451,7 @@ def evidence_fingerprint(evidence: TradabilityEvidence) -> str:
         "has_market_quote": evidence.has_market_quote,
         "has_trade_volume": evidence.has_trade_volume,
         "is_price_limit_locked": evidence.is_price_limit_locked,
+        "price_limit_direction": evidence.price_limit_direction,
         "source": evidence.source,
     }
     blob = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
@@ -415,8 +464,9 @@ def evidence_fingerprint(evidence: TradabilityEvidence) -> str:
 def ensure_schema(conn: sqlite3.Connection) -> dict:
     """正式 migration 013 的建表函数（幂等）。
 
-    唯一约束 ``(code, session_date, effective_at)``：同一天可以有多条不同生效
-    时点的状态（盘中停牌 / 盘后复牌），但它们在同一生效时点上只能有一条事实。
+    唯一约束 ``(code, session_date, effective_at, observed_at)``：同一天可以有多条不同生效
+    时点的状态（盘中停牌 / 盘后复牌），且同一生效时点上的记录可以被更晚观察到的
+    版本修订——两者都必须能并存，否则上游修正会被静默丢弃。
 
     ``listing_date`` / ``delisting_date`` / ``suspension_reason`` 是对任务书列出的
     字段的**追加**，不是替换：没有它们就无法回答"判断依据是什么"，审计链会断在
@@ -434,6 +484,7 @@ def ensure_schema(conn: sqlite3.Connection) -> dict:
             is_st INTEGER,
             is_suspended INTEGER,
             is_price_limit_locked INTEGER,
+            price_limit_direction TEXT,
             has_market_quote INTEGER,
             has_trade_volume INTEGER,
             source TEXT NOT NULL,
@@ -441,13 +492,13 @@ def ensure_schema(conn: sqlite3.Connection) -> dict:
             delisting_date TEXT,
             suspension_reason TEXT,
             created_at TEXT NOT NULL,
-            UNIQUE(code, session_date, effective_at)
+            UNIQUE(code, session_date, effective_at, observed_at)
         )
         """
     )
     conn.execute(
         f"CREATE INDEX IF NOT EXISTS idx_hist_tradability_lookup"
-        f" ON {ARCHIVE_TABLE}(code, session_date, effective_at)"
+        f" ON {ARCHIVE_TABLE}(code, session_date, effective_at, observed_at)"
     )
     return {"table": ARCHIVE_TABLE, "migration": MIGRATION_DESCRIPTION}
 
@@ -474,6 +525,7 @@ def _row_to_evidence(row: Any) -> TradabilityEvidence:
         has_market_quote=_flag(_value("has_market_quote")),
         has_trade_volume=_flag(_value("has_trade_volume")),
         is_price_limit_locked=_flag(_value("is_price_limit_locked")),
+        price_limit_direction=_direction(_value("price_limit_direction")),
         source=str(_value("source")),
         observed_at=str(_value("observed_at")),
         effective_at=str(_value("effective_at")),
@@ -519,22 +571,29 @@ class TradabilityArchiveRepository:
         return ensure_schema(self._conn)
 
     def save(self, evidence: TradabilityEvidence) -> bool:
-        """落库一条事实。重复写入是 no-op（历史事实不被第二次运行改写）。
+        """落库一条事实。同一 ``(code, session_date, effective_at, observed_at)``
+        重复写入是 no-op。返回是否**新插入**。
 
-        返回是否**新插入**。选择 ``INSERT OR IGNORE`` 而不是 ``REPLACE``：
-        同一 ``(code, session_date, effective_at)`` 上的既有记录是已经发生过的事实，
-        后到的写入不得覆盖它。
+        身份里含 ``observed_at``（双时态）：同一生效时点的记录可以被上游**修正**，
+        例如最初观察到 ``is_st=False``、后来更正为 ``is_st=True``。若身份不含观测
+        时点，这类修正会与原始记录撞唯一键并被 ``INSERT OR IGNORE`` 静默丢弃，
+        修正之后的决策会继续使用过期的第一版事实——那正好破坏了本层存在的意义。
+
+        选择 ``INSERT OR IGNORE`` 而不是 ``REPLACE``：同一条观测上的既有记录是
+        已经发生过的事实，后到的写入不得覆盖它。
         """
         row = evidence.to_row()
         row["created_at"] = _now()
         cursor = self._conn.execute(
             f"""INSERT OR IGNORE INTO {ARCHIVE_TABLE}(
                     code, session_date, effective_at, observed_at, is_listed, is_st,
-                    is_suspended, is_price_limit_locked, has_market_quote,
+                    is_suspended, is_price_limit_locked, price_limit_direction,
+                    has_market_quote,
                     has_trade_volume, source, listing_date, delisting_date,
                     suspension_reason, created_at)
                 VALUES(:code, :session_date, :effective_at, :observed_at, :is_listed,
-                       :is_st, :is_suspended, :is_price_limit_locked, :has_market_quote,
+                       :is_st, :is_suspended, :is_price_limit_locked,
+                       :price_limit_direction, :has_market_quote,
                        :has_trade_volume, :source, :listing_date, :delisting_date,
                        :suspension_reason, :created_at)""",
             row,
@@ -633,8 +692,9 @@ class TradabilityEvaluator:
         is_listed AND NOT is_suspended AND 行情存在
 
     核心事实为 ``None``（未知）时一律阻断并给 ``UNKNOWN_STATE``——"不知道"不能
-    被当成"允许"。``is_price_limit_locked`` 是**追加**限制：只有显式为 ``True``
-    才阻断（未知不据此阻断，因为它不是 §11 的必备条件之一，而是额外的锁定事实）。
+    被当成"允许"。``is_price_limit_locked`` 是**追加**限制且**有方向**：涨停
+    （``price_limit_direction == "up"``）只拦买、允许卖出；跌停只拦卖、允许买入；
+    锁定为 ``True`` 但方向未知时两侧都拦（锁定事实已证、方向未知 → fail closed）。
     """
 
     @staticmethod
@@ -703,6 +763,9 @@ class TradabilityEvaluator:
                 else TradabilityReason.UNKNOWN_STATE
             )
         if evidence.is_price_limit_locked is True:
+            # 涨停只拦买；方向未知时仍拦买（锁定事实已证，方向未知 → fail closed）
+            if evidence.price_limit_direction == PRICE_LIMIT_DOWN:
+                return TradabilityReason.OK
             return TradabilityReason.BUY_LIMIT_LOCKED
         return TradabilityReason.OK
 
@@ -722,6 +785,9 @@ class TradabilityEvaluator:
                 else TradabilityReason.UNKNOWN_STATE
             )
         if evidence.is_price_limit_locked is True:
+            # 跌停只拦卖；方向未知时仍拦卖（锁定事实已证，方向未知 → fail closed）
+            if evidence.price_limit_direction == PRICE_LIMIT_UP:
+                return TradabilityReason.OK
             return TradabilityReason.SELL_LIMIT_LOCKED
         return TradabilityReason.OK
 

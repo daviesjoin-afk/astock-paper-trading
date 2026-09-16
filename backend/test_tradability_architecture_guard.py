@@ -74,6 +74,18 @@ ALLOWED_FUNCTIONS = {
     "strategies.py": set(),
 }
 
+# ST 名称推断的**已知例外**：这些函数确实按子串扫名称，但同属"当日实时"链路。
+#
+# 记录它们是为了让护栏保持**精确**：一个会连既有实时链路一起报红的护栏不会被人
+# 认真对待，最后会被整条关掉。例外必须逐条登记并写明理由，新增例外只能随实时链路
+# 的独立改造一起做（届时这处 `.str.contains("ST")` 应改为读取事实层结论）。
+#
+# 本 PR 的范围禁止改动交易/选股逻辑，因此这里只登记、不修（见 PR body 的 Scope）。
+KNOWN_ST_NAME_INFERENCE_EXCEPTIONS = {
+    # 当日选股池的身份筛：用当前名称排除 ST / 退市股。
+    ("strategies.py", "_permitted_a_share_mask"),
+}
+
 
 def _load_tree(name):
     return ast.parse((BACKEND / name).read_text(encoding="utf-8"))
@@ -92,24 +104,87 @@ def _function_spans(tree):
 
 
 def _string_substring_test_on(node, keys):
-    """True when ``node`` compares a string containing ``keys`` against something.
+    """True when ``node`` compares or scans a string for ``keys``.
 
-    针对 ``"ST" in str(row.get("name"))`` 这类写法：只看比较表达式里是否出现
-    字符串常量 + ``in``/``not in`` 运算，不匹配注释与文档字符串。
+    要抓两类等价写法，缺一不可：
+
+    * 比较式：``"ST" in str(row.get("name"))`` / ``name in ("ST", ...)``；
+    * 调用式：``name.startswith("ST")`` / ``name.upper().str.contains("ST")`` /
+      ``"ST" in name`` 之外的 pandas 风格 ``.str.contains`` / ``.str.match``。
+
+    只查 ``ast.Compare`` 会漏掉调用式——而 pandas 的 ``.str.contains("ST")``
+    在正式判断模块里真实存在，属于本护栏要禁止的"用当前名称推断 ST"。
+    只看字符串常量，不匹配注释与文档字符串。
     """
     for child in ast.walk(node):
-        if not isinstance(child, ast.Compare):
+        if isinstance(child, ast.Compare):
+            if not any(isinstance(op, (ast.In, ast.NotIn)) for op in child.ops):
+                continue
+            operands = [child.left, *child.comparators]
+            if any(
+                isinstance(item, ast.Constant) and isinstance(item.value, str)
+                for item in operands
+            ):
+                return True
             continue
-        operators = child.ops
-        if not any(isinstance(op, (ast.In, ast.NotIn)) for op in operators):
-            continue
-        left = child.left
-        if isinstance(left, ast.Constant) and isinstance(left.value, str):
-            return True
-        for comparator in child.comparators:
-            if isinstance(comparator, ast.Constant) and isinstance(comparator.value, str):
+        if isinstance(child, ast.Call):
+            if _string_scan_call_on(child, keys):
                 return True
     return False
+
+
+# 会按子串扫描字符串的方法名（str 内建 + pandas Series.str 命名空间）。
+_STRING_SCAN_CALLS = {
+    "startswith", "endswith", "find", "rfind", "index", "rindex",
+    "contains", "match", "fullmatch", "extract", "count", "replace",
+}
+
+
+def _string_scan_call_on(call, keys):
+    """True when ``call`` scans a string literal for one of ``keys``.
+
+    命中条件：被调用名是字符串扫描方法，且实参里出现命中的字符串常量。
+    这样 ``name.startswith("ST")``、``names.str.contains("ST")``、
+    ``names.str.upper().str.contains("ST")`` 都会被抓到。
+    """
+    func = call.func
+    if not isinstance(func, ast.Attribute) or func.attr not in _STRING_SCAN_CALLS:
+        return False
+    for arg in [*call.args, *[kw.value for kw in call.keywords]]:
+        for part in ast.walk(arg):
+            if isinstance(part, ast.Constant) and isinstance(part.value, str):
+                if any(key in part.value for key in keys) or "ST" in part.value:
+                    return True
+    return False
+
+
+def _st_name_inference_in(node):
+    """返回该函数里**第一处**"用名称推断 ST"的表达式；没有则 ``None``。
+
+    判据：表达式里同时出现 ST 字面量与名称/标记来源。覆盖两类写法：
+
+    * 比较式 —— ``"ST" in str(row.get("name"))``；
+    * 调用式 —— ``names.str.upper().str.contains("ST", regex=False)``、
+      ``name.startswith("ST")``。
+
+    只查 ``ast.Compare`` 会漏掉调用式，而 pandas 的 ``.str.contains("ST")``
+    在正式判断模块里真实存在。
+    """
+    for child in ast.walk(node):
+        if isinstance(child, ast.Compare):
+            if not any(isinstance(op, (ast.In, ast.NotIn)) for op in child.ops):
+                continue
+        elif isinstance(child, ast.Call):
+            if not _string_scan_call_on(child, ST_KEYS):
+                continue
+        else:
+            continue
+        rendered = ast.unparse(child)
+        if "ST" not in rendered.upper():
+            continue
+        if any(token in rendered for token in ("name", "risk_flag", "risk_warning")):
+            return rendered
+    return None
 
 
 def _reads_key(node, keys):
@@ -149,7 +224,11 @@ class FormalJudgementMustUseTheArchive(unittest.TestCase):
         )
 
     def test_no_module_infers_st_from_a_name_substring(self):
-        """禁止 ``name.startswith("ST")`` / ``"ST" in name`` 这类推断。"""
+        """禁止 ``name.startswith("ST")`` / ``.str.contains("ST")`` / ``"ST" in name``。
+
+        只查 ``ast.Compare`` 会漏掉调用式，而 pandas 的 ``.str.contains("ST")``
+        正是要禁止的"用当前名称推断 ST"。
+        """
         offenders = []
         for name in FORMAL_JUDGEMENT_MODULES:
             tree = _load_tree(name)
@@ -159,17 +238,11 @@ class FormalJudgementMustUseTheArchive(unittest.TestCase):
                     continue
                 if node.name in allowed:
                     continue
-                if not _string_substring_test_on(node, ST_KEYS):
+                if (name, node.name) in KNOWN_ST_NAME_INFERENCE_EXCEPTIONS:
                     continue
-                for child in ast.walk(node):
-                    if not isinstance(child, ast.Compare):
-                        continue
-                    rendered = ast.unparse(child)
-                    if "ST" in rendered and (
-                        "name" in rendered or "risk_flag" in rendered
-                    ):
-                        offenders.append(f"{name}:{node.lineno} {node.name}: {rendered}")
-                        break
+                expression = _st_name_inference_in(node)
+                if expression is not None:
+                    offenders.append(f"{name}:{node.lineno} {node.name}: {expression}")
         self.assertEqual(
             [], offenders,
             "ST 必须来自带 effective_at 的历史证据，不得由名称/标记字符串推断",
@@ -202,6 +275,66 @@ class GuardIsNotVacuouslyPassing(unittest.TestCase):
         )
         function = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef))
         self.assertTrue(_string_substring_test_on(function, ST_KEYS))
+
+    def test_st_detector_fires_on_call_based_checks(self):
+        """调用式与比较式必须同样被抓到 —— 这是 review 指出的漏检。"""
+        for source in (
+            "def f(name):\n"
+            "    return name.startswith('ST')\n",
+            "def f(names):\n"
+            "    return names.str.contains('ST', regex=False)\n",
+            "def f(names):\n"
+            "    return names.str.upper().str.contains('ST', regex=False)\n",
+            "def f(name):\n"
+            "    return name.endswith('ST')\n",
+        ):
+            tree = ast.parse(source)
+            function = next(
+                node for node in ast.walk(tree)
+                if isinstance(node, ast.FunctionDef)
+            )
+            self.assertIsNotNone(
+                _st_name_inference_in(function), source
+            )
+
+    def test_st_detector_still_ignores_unrelated_calls(self):
+        """不得把无关的字符串调用误报成 ST 推断。"""
+        tree = ast.parse(
+            "def f(names):\n"
+            "    return names.str.startswith('600')\n"
+        )
+        function = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef))
+        self.assertIsNone(_st_name_inference_in(function))
+
+    def test_registered_exceptions_are_real(self):
+        """登记的例外必须指向真实存在的函数，否则例外会变成永久豁免。"""
+        for module_name, function_name in KNOWN_ST_NAME_INFERENCE_EXCEPTIONS:
+            tree = _load_tree(module_name)
+            names = {
+                node.name for node in ast.walk(tree)
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            }
+            self.assertIn(function_name, names, f"{module_name}:{function_name}")
+
+    def test_registered_exception_is_the_only_remaining_inference(self):
+        """例外清单必须与真实命中集合相等：既不多登记，也不遗漏。
+
+        统计口径与主护栏一致：已被 ``ALLOWED_FUNCTIONS`` 按"当日实时链路"整体
+        豁免的函数不计入，它们另有理由。这条是例外机制的自我约束——如果哪天有人
+        在别处新增了名称推断 ST，本断言会失败，而不是被例外清单悄悄吸收。
+        """
+        found = set()
+        for module_name in FORMAL_JUDGEMENT_MODULES:
+            tree = _load_tree(module_name)
+            allowed = ALLOWED_FUNCTIONS.get(module_name, set())
+            for node in ast.walk(tree):
+                if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    continue
+                if node.name in allowed:
+                    continue
+                if _st_name_inference_in(node) is not None:
+                    found.add((module_name, node.name))
+        self.assertEqual(KNOWN_ST_NAME_INFERENCE_EXCEPTIONS, found)
 
     def test_st_substring_detector_ignores_plain_membership(self):
         tree = ast.parse(

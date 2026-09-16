@@ -136,6 +136,53 @@ MUTATIONS = (
         "    if evidence is None:\n",
         "bypass archive（无记录时直接构造可交易事实）",
     ),
+    (
+        "TTA8",
+        ARCHIVE,
+        (
+            "        if evidence.is_price_limit_locked is True:\n"
+            "            # 涨停只拦买；方向未知时仍拦买（锁定事实已证，方向未知 → fail closed）\n"
+            "            if evidence.price_limit_direction == PRICE_LIMIT_DOWN:\n"
+            "                return TradabilityReason.OK\n"
+            "            return TradabilityReason.BUY_LIMIT_LOCKED\n",
+            "        if evidence.is_price_limit_locked is True:\n"
+            "            # 跌停只拦卖；方向未知时仍拦卖（锁定事实已证，方向未知 → fail closed）\n"
+            "            if evidence.price_limit_direction == PRICE_LIMIT_UP:\n"
+            "                return TradabilityReason.OK\n"
+            "            return TradabilityReason.SELL_LIMIT_LOCKED\n",
+        ),
+        (
+            "        if evidence.is_price_limit_locked is True:  # MUTANT TTA8 buy\n"
+            "            return TradabilityReason.BUY_LIMIT_LOCKED\n",
+            "        if evidence.is_price_limit_locked is True:  # MUTANT TTA8 sell\n"
+            "            return TradabilityReason.SELL_LIMIT_LOCKED\n",
+        ),
+        "涨跌停不分方向（涨停也拦卖、跌停也拦买）",
+    ),
+    (
+        "TTA9",
+        ARCHIVE,
+        (
+            "            if evidence.price_limit_direction == PRICE_LIMIT_DOWN:\n"
+            "                return TradabilityReason.OK\n",
+            "            if evidence.price_limit_direction == PRICE_LIMIT_UP:\n"
+            "                return TradabilityReason.OK\n",
+        ),
+        (
+            "            if evidence.price_limit_direction != PRICE_LIMIT_UP:\n"
+            "                return TradabilityReason.OK\n",
+            "            if evidence.price_limit_direction != PRICE_LIMIT_DOWN:\n"
+            "                return TradabilityReason.OK\n",
+        ),
+        "锁定但方向未知时不再 fail closed（两侧放行）",
+    ),
+    (
+        "TTA10",
+        ARCHIVE,
+        "            UNIQUE(code, session_date, effective_at, observed_at)\n",
+        "            UNIQUE(code, session_date, effective_at)\n",
+        "唯一键丢掉观测维度（同一生效时点的上游修正被静默丢弃）",
+    ),
 )
 
 # 自检哨兵：只改注释。它必须 UNDETECTED。
