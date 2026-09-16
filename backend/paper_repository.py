@@ -59,6 +59,10 @@ def account_metric_inputs(conn, account_ids, today):
     order_columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(paper_orders)").fetchall()}
     realized_field = "realized_pnl" if "realized_pnl" in order_columns else "NULL AS realized_pnl"
     executed_field = "executed_at" if "executed_at" in order_columns else "NULL AS executed_at"
+    verified_clause = (
+        "AND (COALESCE(execution_verified,0)=1 AND execution_status='verified')"
+        if "execution_verified" in order_columns else ""
+    )
     sell_fields = (
         f"id,account_id,code,qty,filled_price,amount,fees,status,{realized_field},"
         f"created_at,{executed_field}"
@@ -66,7 +70,8 @@ def account_metric_inputs(conn, account_ids, today):
     sell_rows = rows(
         conn,
         f"SELECT {sell_fields} FROM paper_orders "
-        f"WHERE account_id IN ({placeholders}) AND side='sell' AND status='filled'",
+        f"WHERE account_id IN ({placeholders}) AND side='sell' AND status='filled' "
+        f"{verified_clause}",
         tuple(ids),
     )
     sells = {account_id: [] for account_id in ids}

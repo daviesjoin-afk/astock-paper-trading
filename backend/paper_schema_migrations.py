@@ -232,6 +232,34 @@ def ensure_ignition_shadow_table(conn):
         return False
 
 
+def ensure_execution_verification_columns(conn):
+    """PR-150 wiring：执行验证闸门的三列（活跃表 + 归档表，幂等）。
+
+    只**新增**列，绝不覆盖或改写既有列：``status`` / ``realized_pnl`` 等保持
+    原样，闸门是叠加的消费层结论。
+
+    历史行保持 NULL —— NULL 在 :data:`execution_verification.VERIFIED_PREDICATE`
+    里被 ``COALESCE`` 取成 0，因此旧行**自动**被排除在真实成交统计之外，
+    而不是被默认升级成成交。
+    """
+    definitions = {
+        "execution_status": "TEXT",
+        "execution_verified": "INTEGER",
+        "execution_evidence_source": "TEXT",
+    }
+    changes = {}
+    for table in ("paper_orders", "paper_orders_archive"):
+        changes[table] = ensure_columns(conn, table, definitions)
+    try:
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_paper_orders_execution_verified"
+            " ON paper_orders(execution_verified, execution_status)"
+        )
+    except sqlite3.Error:  # pragma: no cover - 索引失败不应阻断主链路
+        pass
+    return changes
+
+
 def ensure_proposal_lifecycle_columns(conn):
     """PR-33：风险放大提案的生命周期列（resolved_at/resolved_by/note，幂等）。"""
     import asymmetric_risk as AR

@@ -97,6 +97,12 @@ def _pt():
     return PT
 
 
+def _ev():
+    """惰性取用执行验证闸门（PR-150 消费层 wiring）。"""
+    import execution_verification as EV
+    return EV
+
+
 def _default_policies() -> dict[str, ExecutionPolicy]:
     """按 paper_trading 的账户常量构造默认策略表。
 
@@ -543,6 +549,12 @@ def commit_fill(
         (order_id, account_id, side, code, qty, fill_price, amount, fees,
          PT._date(asof_day).isoformat(), plan.get("quote_at"), assumption),
     )
+    # 执行验证闸门（PR-150 wiring）：**必须在 fill 流水写入之后**盖章，否则
+    # evidence_from_order 看不到这条流水，会把一次真实成交记成"没有证据"。
+    # 结论本身委托 execution_verification（它再委托 execution_evidence），
+    # 这里不重新判断任何成交规则。
+    EV = _ev()
+    EV.stamp_order(conn, order_id)
     PT._risk_log(
         conn, account_id, code, side, action,
         risk_log_reason or reason, detail if detail is not None else plan,
