@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""执行真实性层（execution reality layer）本地变异验证工具 M51–M59。
+"""执行真实性层（execution reality layer）本地变异验证工具 M51–M60。
 
 用法::
 
@@ -118,6 +118,13 @@ MUTATIONS = (
         '        "SELECT order_id,account_id,side,code,qty,price,amount,fees,fill_date,quote_at "\n',
         '        "SELECT order_id,qty,price,amount,fees,fill_date,quote_at "\n',
         'fill identity columns not selected',
+    ),
+    (
+        'M60',
+        'backend/execution_evidence.py',
+        '    if fill_identity_known is None:\n        fill_identity_known = fill_identity_rows is not None\n',
+        '    if fill_identity_known is None:\n        fill_identity_known = True\n',
+        'identity check self-attested without identity rows',
     ),
 )
 
