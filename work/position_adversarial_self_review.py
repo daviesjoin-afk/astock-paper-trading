@@ -55,10 +55,23 @@ def check(name, ok, detail=""):
     print("%s  %s  %s" % ("PASS" if ok else "FAIL", name, detail))
 
 
-def fresh():
+def fresh(*, with_cycle=True):
+    """新建一个内存账本。
+
+    ``with_cycle=True``（默认）会写入一条覆盖夹具日期的周期行 —— 真实账本里
+    lot 所属的周期必然存在，且 ``started_at`` 可证明。**没有**周期行时归属
+    正确地为 unprovable（fail closed），因此需要"周期缺失"语义的用例应显式
+    传 ``with_cycle=False``。
+    """
     conn = sqlite3.connect(":memory:")
     conn.row_factory = sqlite3.Row
     conn.executescript(DDL)
+    if with_cycle:
+        conn.execute(
+            "INSERT INTO paper_cycles(id,cycle_key,status,started_at,ended_at,created_at)"
+            " VALUES(?,?,?,?,?,?)",
+            (CYCLE, "cycle-test", "running", "2026-01-01", None, "2026-01-01 00:00:00"),
+        )
     return conn
 
 
@@ -66,7 +79,7 @@ def add_lot(conn, oid, code, session, qty, *, order_created=None, verified=True,
             recorded=None, name=None, remaining=None, asset_type=None,
             account=ACCOUNT, cycle_id=CYCLE, available_date=None,
             order_account=None, order_code=None, fill_account=None,
-            fill_code=None):
+            fill_code=None, executed_at=None):
     name = name or (ETF_NAME if code == ETF else "平安银行")
     asset_type = asset_type or ("etf_t0" if code == ETF else "stock_t1")
     conn.execute(
@@ -74,7 +87,8 @@ def add_lot(conn, oid, code, session, qty, *, order_created=None, verified=True,
         "executed_at,execution_status,execution_verified,execution_evidence_source) "
         "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
         (oid, order_account or account, "buy", order_code or code, name, "filled",
-         "%s 09:30:00" % (order_created or session), "%s 10:00:00" % session,
+         "%s 09:30:00" % (order_created or session),
+         executed_at or ("%s 10:00:00" % session),
          "verified" if verified else "unknown", 1 if verified else 0, "ledger"),
     )
     conn.execute(
@@ -417,10 +431,7 @@ def main():
 
     # 攻击面 D：周期窗之外的卖出不得扣减本周期 lot
     conn = fresh()
-    conn.execute(
-        "INSERT INTO paper_cycles(id,cycle_key,status,started_at,ended_at,created_at)"
-        " VALUES(?,?,?,?,?,?)",
-        (CYCLE, "c-test", "running", "2026-09-17", None, "2026-09-17 00:00:00"))
+    conn.execute("UPDATE paper_cycles SET started_at=? WHERE id=?", ("2026-09-17", CYCLE))
     add_lot(conn, 1, NORMAL, "2026-09-16", 1000, available_date="2026-09-17")
     # 卖在 09-16，早于周期开始日 09-17 → 属于别的资金池。
     add_sell_fill(conn, 9, 9, NORMAL, "2026-09-16", 1000)
@@ -430,10 +441,7 @@ def main():
 
     # 攻击面 D2：窗内的同一笔卖出确实扣减（反向对照，证明差异来自窗）
     conn = fresh()
-    conn.execute(
-        "INSERT INTO paper_cycles(id,cycle_key,status,started_at,ended_at,created_at)"
-        " VALUES(?,?,?,?,?,?)",
-        (CYCLE, "c-test", "running", "2026-09-16", None, "2026-09-16 00:00:00"))
+    conn.execute("UPDATE paper_cycles SET started_at=? WHERE id=?", ("2026-09-16", CYCLE))
     add_lot(conn, 1, NORMAL, "2026-09-16", 1000, available_date="2026-09-17")
     add_sell_fill(conn, 9, 9, NORMAL, "2026-09-17", 1000)
     set_remaining(conn, 1, 0)
@@ -473,6 +481,96 @@ def main():
           _cmp().identity() != _cmp(cycle_id=CYCLE_OLD).identity())
     check("指纹也随账户变化",
           _cmp().fingerprint() != _cmp(account_id=ACCOUNT_B).fingerprint())
+
+    # ── ROUND-3：future-lot 时序 / 周期归属歧义 / 事件排序 ──
+
+    # 攻击面 F：T+0 ETF —— 13:00 才买入的 lot 绝不能满足 10:00 的卖出
+    conn = fresh()
+    add_lot(conn, 1, ETF, "2026-09-17", 100, available_date="2026-09-17",
+            asset_type="etf_t0", executed_at="2026-09-17 09:00:00")
+    add_lot(conn, 2, ETF, "2026-09-17", 100, available_date="2026-09-17",
+            asset_type="etf_t0", executed_at="2026-09-17 13:00:00")
+    add_sell_fill(conn, 9, 9, ETF, "2026-09-17", 100,
+                  executed_at="2026-09-17 10:00:00")
+    set_remaining(conn, 1, 0)
+    c = ctx(adapter(conn), code=ETF, session="2026-09-17", decision_at=AS_OF)
+    check("FUTURE-LOT-1：10:00 卖出只吃 09:00 的 lot，13:00 lot 完整保留",
+          c.held_quantity == 100 and c.quantity_basis == PE.QUANTITY_BASIS_HISTORICAL_REPLAY,
+          "held=%s basis=%s" % (c.held_quantity, c.quantity_basis))
+
+    # 攻击面 G：当时根本不够卖 → 绝不用未来 lot 补齐后宣布 proven
+    conn = fresh()
+    add_lot(conn, 1, ETF, "2026-09-17", 50, available_date="2026-09-17",
+            asset_type="etf_t0", executed_at="2026-09-17 09:00:00")
+    add_lot(conn, 2, ETF, "2026-09-17", 100, available_date="2026-09-17",
+            asset_type="etf_t0", executed_at="2026-09-17 13:00:00")
+    add_sell_fill(conn, 9, 9, ETF, "2026-09-17", 100,
+                  executed_at="2026-09-17 10:00:00")
+    set_remaining(conn, 1, 0)
+    c = ctx(adapter(conn), code=ETF, session="2026-09-17", decision_at=AS_OF)
+    check("FUTURE-LOT-2：缺口只能由未来 lot 补足 → unprovable + 点名根因",
+          c.quantity_basis == PE.QUANTITY_BASIS_UNPROVABLE
+          and "future_lot_consumption_required" in c.diagnostics,
+          "basis=%s diags=%s" % (c.quantity_basis, c.diagnostics))
+
+    # 攻击面 H：重叠开放周期 → 归属歧义必须 fail closed
+    conn = fresh()
+    conn.execute("UPDATE paper_cycles SET started_at=? WHERE id=?", ("2026-09-15", CYCLE))
+    conn.execute(
+        "INSERT INTO paper_cycles(id,cycle_key,status,started_at,ended_at,created_at)"
+        " VALUES(?,?,?,?,?,?)", (CYCLE + 1, "c-b", "running", "2026-09-16", None,
+                                 "2026-09-16 00:00:00"))
+    add_lot(conn, 1, NORMAL, "2026-09-16", 1000, available_date="2026-09-17")
+    add_sell_fill(conn, 9, 9, NORMAL, "2026-09-17", 1000)
+    set_remaining(conn, 1, 0)
+    c = ctx(adapter(conn), session="2026-09-17", decision_at=AS_OF)
+    check("重叠周期 → 归属歧义 fail closed（不得直接采信请求周期）",
+          c.quantity_basis == PE.QUANTITY_BASIS_UNPROVABLE
+          and "sell_fill_cycle_ambiguous" in c.diagnostics,
+          "basis=%s diags=%s" % (c.quantity_basis, c.diagnostics))
+
+    # 攻击面 I：周期起点不可证明 → unprovable（不得默认 proven）
+    conn = fresh()
+    conn.execute(
+        "UPDATE paper_cycles SET started_at=NULL, created_at=NULL WHERE id=?", (CYCLE,))
+    add_lot(conn, 1, NORMAL, "2026-09-16", 1000, available_date="2026-09-17")
+    add_sell_fill(conn, 9, 9, NORMAL, "2026-09-17", 1000)
+    set_remaining(conn, 1, 0)
+    c = ctx(adapter(conn), session="2026-09-17", decision_at=AS_OF)
+    check("周期起点不可证明 → unprovable（不默认 cycle_ok=True）",
+          c.quantity_basis == PE.QUANTITY_BASIS_UNPROVABLE
+          and "sell_fill_cycle_unprovable" in c.diagnostics,
+          "basis=%s diags=%s" % (c.quantity_basis, c.diagnostics))
+
+    # 攻击面 J：同日两笔卖出的顺序必须按真实成交时刻（fill_id 顺序相反）
+    conn = fresh()
+    add_lot(conn, 1, NORMAL, "2026-09-16", 100, available_date="2026-09-17")
+    # fill_id 顺序与真实时间相反：先写入 14:00，再写入 10:00。
+    add_sell_fill(conn, 9, 9, NORMAL, "2026-09-17", 30,
+                  executed_at="2026-09-17 14:00:00")
+    add_sell_fill(conn, 10, 10, NORMAL, "2026-09-17", 30,
+                  executed_at="2026-09-17 10:00:00")
+    set_remaining(conn, 1, 40)
+    c = ctx(adapter(conn), session="2026-09-17", decision_at="2026-09-17T11:00:00+08:00")
+    check("同日两笔卖出按真实时刻切分（11:00 回看 = 70，不是 100）",
+          c.held_quantity == 70, "held=%s" % (c.held_quantity,))
+
+    # 攻击面 K：paused 且起点未知的其它周期不得凭空否决一笔可证明的归属
+    conn = fresh()
+    conn.execute("UPDATE paper_cycles SET started_at=? WHERE id=?", ("2026-09-15", CYCLE))
+    conn.execute(
+        "INSERT INTO paper_cycles(id,cycle_key,status,started_at,ended_at,created_at)"
+        " VALUES(?,?,?,?,?,?)", (CYCLE + 1, "c-paused", "paused", None, None,
+                                 "2026-09-15 00:00:00"))
+    add_lot(conn, 1, NORMAL, "2026-09-16", 1000, available_date="2026-09-17")
+    add_sell_fill(conn, 9, 9, NORMAL, "2026-09-17", 1000)
+    set_remaining(conn, 1, 0)
+    c = ctx(adapter(conn), session="2026-09-17", decision_at=AS_OF)
+    check("起点未知的 paused 周期不否决可证明归属（held=0 且 proven）",
+          c.held_quantity == 0
+          and c.quantity_basis == PE.QUANTITY_BASIS_HISTORICAL_REPLAY,
+          "held=%s basis=%s diags=%s" % (c.held_quantity, c.quantity_basis,
+                                         c.diagnostics))
 
     failed = [name for name, ok in _checks if not ok]
     print("\n%d/%d checks passed" % (len(_checks) - len(failed), len(_checks)))

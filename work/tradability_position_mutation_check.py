@@ -255,12 +255,12 @@ MUTATIONS = (
     (
         "M-T1-12",
         ADAPTER,
-        "        window = self._cycle_window(cycle_id)\n"
-        "        clause = \"\"\n",
-        "        # MUTANT M-T1-12: cycle window dropped from the sell-event query\n"
-        "        window = None\n"
-        "        clause = \"\"\n",
-        "卖出事件查询丢掉周期窗过滤（窗外的卖出可扣减本周期 lot）",
+        "                    elif session < start_at or (end_at is not None and session > end_at):\n"
+        "                        attribution = CYCLE_ATTRIBUTION_MISMATCH\n",
+        "                    # MUTANT M-T1-12: outside-window sell accepted as our cycle\n"
+        "                    elif False:\n"
+        "                        attribution = CYCLE_ATTRIBUTION_MISMATCH\n",
+        "周期窗外的卖出被当成属于本周期（跨周期成交可扣减本周期 lot）",
     ),
     (
         "M-T1-13",
@@ -298,6 +298,49 @@ MUTATIONS = (
         "            # MUTANT M-T1-16: account/cycle dropped from identity\n"
         "            self.code,\n",
         "观察身份丢掉 account_id / cycle_id",
+    ),
+    (
+        "M-T1-17",
+        ADAPTER,
+        "            if existence is None or existence > sell_executed_at:\n"
+        "                # 无法证明它在卖出之前存在，或明确晚于卖出 → 不得消费。\n"
+        "                continue\n",
+        "            # MUTANT M-T1-17: lot existence-time gate removed\n",
+        "删除 lot 存在性闸门（未来 lot 可反向满足更早的 SELL）",
+    ),
+    (
+        "M-T1-18",
+        ADAPTER,
+        "                    if start_at is None:\n"
+        "                        # 周期行存在但起点不可证明 → 无法断言该卖出属于它。\n"
+        "                        attribution = CYCLE_ATTRIBUTION_UNPROVABLE\n",
+        "                    # MUTANT M-T1-18: missing cycle start defaults to proven\n"
+        "                    if False:\n"
+        "                        attribution = CYCLE_ATTRIBUTION_UNPROVABLE\n",
+        "周期起点缺失时重新默认 cycle_ok=True（静默升级归属）",
+    ),
+    (
+        "M-T1-19",
+        ADAPTER,
+        "                        ambiguous, skipped = self._competing_cycles(cycle_id, session)\n",
+        "                        # MUTANT M-T1-19: overlapping cycle ambiguity ignored\n"
+        "                        ambiguous, skipped = False, []\n",
+        "重叠周期歧义被静默接受（直接采信请求周期）",
+    ),
+    (
+        "M-T1-20",
+        ADAPTER,
+        "            key=lambda item: (\n"
+        "                str(item.get(\"session\") or \"\"),\n"
+        "                str(item.get(\"executed_at\") or \"\"),\n"
+        "                _int(item.get(\"fill_id\")),\n"
+        "            ),\n",
+        "            # MUTANT M-T1-20: event ordering ignores executed_at\n"
+        "            key=lambda item: (\n"
+        "                str(item.get(\"session\") or \"\"),\n"
+        "                _int(item.get(\"fill_id\")),\n"
+        "            ),\n",
+        "卖出事件排序忽略 executed_at（按数据库 id 排）",
     ),
 )
 
@@ -749,6 +792,29 @@ DESIGNATED_NON_VACUITY = {
         "test_tradability_position_shadow"
         ".ShadowIdentityMustIncludeAccountAndCycle"
         ".test_identity_separates_two_accounts_on_the_same_code_and_session",
+    ),
+    # FL1 对存在性闸门**不敏感**：FIFO 本来就会先取更早的 lot，因此闸门被删掉
+    # 后它的结论不变（已实测）。真正依赖该闸门的是"更早的 lot 不够、缺口只能由
+    # 未来 lot 补足"这一条，故指名 FL2。
+    "M-T1-17": (
+        "test_tradability_position_shadow"
+        ".FutureLotMustNotSatisfyAnEarlierSell"
+        ".test_FUTURE_LOT_2_insufficient_then_future_lot_is_unprovable",
+    ),
+    "M-T1-18": (
+        "test_tradability_position_shadow"
+        ".CycleAttributionMustFailClosed"
+        ".test_CYCLE_A3_unprovable_start_boundary_fails_closed",
+    ),
+    "M-T1-19": (
+        "test_tradability_position_shadow"
+        ".CycleAttributionMustFailClosed"
+        ".test_CYCLE_A4_overlapping_open_cycles_are_ambiguous",
+    ),
+    "M-T1-20": (
+        "test_tradability_position_shadow"
+        ".SellReplayOrderingUsesRealEventTime"
+        ".test_EVENT_ORDER_3_snapshot_separates_before_and_after",
     ),
 }
 

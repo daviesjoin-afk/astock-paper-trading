@@ -103,7 +103,7 @@ SHADOW_PUBLIC_API = frozenset({
 })
 
 #: ``PositionEvidenceAdapter`` **允许**暴露的公开方法（等值断言）。
-ADAPTER_METHODS = frozenset({"context_for", "load_lots"})
+ADAPTER_METHODS = frozenset({"context_for", "load_lots", "replay_diagnostics"})
 
 #: ``PositionShadowObserver`` **允许**暴露的公开方法（等值断言）。
 OBSERVER_METHODS = frozenset({"observe", "observe_many", "summarize"})
@@ -541,26 +541,48 @@ class SellReplayTimingAndScopeAreEnforced(unittest.TestCase):
 
     def test_oversell_fails_closed_instead_of_continuing(self):
         source = _source(ADAPTER_MODULE)
-        marker = "diagnostics.append(\"sell_fill_exceeds_available_lots\")"
+        marker = 'diagnostics.append("sell_fill_exceeds_available_lots")'
         self.assertIn(marker, source)
-        tail = source[source.index(marker):source.index(marker) + 400]
+        # 从该诊断到 return 之间必须已经判定 unprovable，且**不得**先 continue。
+        tail = source[source.index(marker):source.index(marker) + 900]
+        head = tail.split("historical_quantity_unprovable")[0]
         self.assertIn("historical_quantity_unprovable", tail,
                       "超出可卖 lots 必须立即 unprovable，不能 continue")
-        self.assertNotIn("continue", tail.split("historical_quantity_unprovable")[0],
+        self.assertNotIn("continue", head,
                          "在 unprovable 判定之前不得 continue")
 
     def test_sell_events_are_cycle_scoped(self):
         source = _source(ADAPTER_MODULE)
         self.assertIn("def _sell_fills_for(self, account_id: str, code: str,", source)
         self.assertIn("cycle_id: Any = None", source)
-        # 生产 ``paper_orders`` 没有 ``cycle_id`` 列，因此周期归属靠时间窗；
-        # 若某天真的加上该列，按列过滤是**额外**约束（发现式，不写死）。
+        # 生产 ``paper_orders`` / ``paper_fills`` 都没有 ``cycle_id``，因此周期归属
+        # 由**时间窗四态**判定，而不是一个默认为真的布尔值。
         self.assertIn("def _cycle_window(", source)
-        self.assertIn("f.fill_date >= ?", source)
-        self.assertIn("_orders_have_cycle_column", source)
-        self.assertIn("sell_fill_cycle_mismatch", source)
+        self.assertIn("def _competing_cycles(", source)
+        self.assertIn("CYCLE_ATTRIBUTION_PROVEN", source)
+        self.assertIn("CYCLE_ATTRIBUTION_MISMATCH", source)
+        self.assertIn("CYCLE_ATTRIBUTION_UNPROVABLE", source)
+        self.assertIn("CYCLE_ATTRIBUTION_AMBIGUOUS", source)
+        self.assertIn("sell_fill_cycle_ambiguous", source)
+        self.assertIn("sell_fill_cycle_unprovable", source)
         # 调用点必须真的把 cycle 传下去。
         self.assertIn("self._sell_events(account, code_text, cycle_id=cycle)", source)
+
+    def test_cycle_attribution_is_never_a_default_true(self):
+        """归属不得默认 proven：缺窗口 / 起点不可证明必须落 unprovable。"""
+        source = _source(ADAPTER_MODULE)
+        self.assertNotIn("cycle_ok = True", source)
+        self.assertIn("attribution = CYCLE_ATTRIBUTION_UNPROVABLE", source)
+        # 只有 proven 允许扣减；ambiguous / unprovable 必须 fail closed。
+        self.assertIn("if attribution == CYCLE_ATTRIBUTION_MISMATCH:", source)
+
+    def test_competing_cycle_requires_provable_start(self):
+        """竞争周期必须能证明自己的起点，否则只记诊断、不否决归属。"""
+        source = _source(ADAPTER_MODULE)
+        marker = "def _competing_cycles("
+        body = source[source.index(marker):source.index(marker) + 2600]
+        self.assertIn("if start is None:", body)
+        self.assertIn("skipped.append(other)", body)
 
     def test_cycle_column_is_discovered_not_assumed(self):
         """不得写死 ``o.cycle_id``（生产库没有该列，写死会 no such column）。"""

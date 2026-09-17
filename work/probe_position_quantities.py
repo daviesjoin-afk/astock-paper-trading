@@ -44,6 +44,21 @@ def _rows(conn, sql, args=()):
         return []
 
 
+def _count(rows) -> int:
+    """COUNT 查询的取值；空结果（表缺失等）一律 0，绝不让探针崩在半路。"""
+    if not rows:
+        return 0
+    value = rows[0].get("n")
+    return 0 if value is None else int(value)
+
+
+def _scalar(conn, sql, args=()):
+    rows = _rows(conn, sql, args)
+    if not rows:
+        return None
+    return next(iter(rows[0].values()), None)
+
+
 def main(argv):
     if len(argv) < 2:
         print("用法: python work/probe_position_quantities.py <db_copy_path>")
@@ -64,6 +79,10 @@ def main(argv):
                          "WHERE status IN ('draft','running','paused') ORDER BY id DESC")
     active = cycles[0]["id"] if cycles else None
     print(f"active cycle id: {active}  (candidates={[c['id'] for c in cycles]})")
+    for row in _rows(conn, "SELECT id,status,started_at,ended_at,created_at "
+                           "FROM paper_cycles ORDER BY id"):
+        print(f"  cycle {row['id']}: status={row['status']} "
+              f"start={row['started_at']} end={row['ended_at']} created={row['created_at']}")
 
     # ── 2. lot 总量与消耗分类（全周期 + 当前周期）──
     for label, clause, args in (
@@ -127,25 +146,33 @@ def main(argv):
         conn,
         "SELECT DISTINCT account_id, code FROM paper_position_lots "
         "WHERE cycle_id=? ORDER BY account_id, code", (active,))
+    # 走**公开只读诊断入口**：与真实 PositionEvidenceAdapter 完全同一条
+    # cycle-scoped 重放路径（同一 _sell_events / _eligible_lots / _replay），
+    # 不再由探针自己调私有方法、也不再用 2099 哨兵伪造决策时点。
     reconstructable = unprovable = 0
     reasons: dict = {}
+    attribution: dict = {}
     for scope in scopes:
-        lots = adapter.load_lots(scope["code"], cycle_id=active,
-                                 account_id=scope["account_id"])
-        events = adapter._sell_events(scope["account_id"], scope["code"])
-        replay = adapter._replay(lots, events, decision_session="2099-01-01",
-                                 decision_at=None)
-        if replay["consistent"]:
+        report = adapter.replay_diagnostics(
+            scope["code"], cycle_id=active, account_id=scope["account_id"])
+        if report["consistent"]:
             reconstructable += 1
         else:
             unprovable += 1
-            for item in replay["diagnostics"]:
+            for item in report["diagnostics"]:
                 reasons[item] = reasons.get(item, 0) + 1
+        # 周期归属分布（proven / mismatch / ambiguous / unprovable）——由公开入口
+        # 一并返回，探针不再自己调私有方法。
+        for key, value in (report.get("attribution") or {}).items():
+            attribution[key] = attribution.get(key, 0) + value
     print(f"  (cycle,account,code) groups total: {len(scopes)}")
     print(f"  reconstructable: {reconstructable}")
     print(f"  unprovable: {unprovable}")
     if reasons:
         print(f"  unprovable reasons: {reasons}")
+    print(f"  SELL cycle attribution: {attribution}")
+    print("  ^ 以上数字由本轮 exact head 的 **cycle-scoped replay** 重新计算得出"
+          "（公开入口 replay_diagnostics），非复用上一轮读数。")
 
     # ── 7. 卖出证据与验证覆盖 ──
     sells = _rows(conn, "SELECT COUNT(*) AS n FROM paper_fills WHERE side='sell'")
@@ -160,12 +187,12 @@ def main(argv):
         "SELECT COUNT(*) AS n FROM paper_fills f JOIN paper_orders o ON o.id=f.order_id "
         "WHERE f.side='buy' AND COALESCE(o.execution_verified,0)=1 "
         "AND o.execution_status='verified'")
-    print(f"\nevidence: buy fills={buys[0]['n']} (verified={verified_buys[0]['n']}), "
-          f"sell fills={sells[0]['n']} (verified={verified_sells[0]['n']})")
+    print(f"\nevidence: buy fills={_count(buys)} (verified={_count(verified_buys)}), "
+          f"sell fills={_count(sells)} (verified={_count(verified_sells)})")
 
     # ── 8. ETF lot 覆盖 ──
     etf = _rows(conn, "SELECT COUNT(*) AS n FROM paper_position_lots WHERE asset_type='etf_t0'")
-    print(f"etf_t0 lots: {etf[0]['n']}")
+    print(f"T+0 ETF samples (asset_type='etf_t0'): {_count(etf)}")
 
     print("\n注意：current open lots coverage **不是** historical position coverage；")
     print("      后者只由上面的 reconstructable 一栏给出。")

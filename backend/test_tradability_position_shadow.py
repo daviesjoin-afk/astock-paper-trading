@@ -148,12 +148,16 @@ class PositionTestCase(unittest.TestCase):
                 recorded_at=None, order_created_at=None, remaining=None,
                 cycle_id=CYCLE, lot_id=None, status="filled", side="buy",
                 order_account=None, order_code=None, fill_account=None,
-                fill_code=None, available_date=None, order_verified=None):
+                fill_code=None, available_date=None, order_verified=None,
+                executed_at=None):
         """写入一笔委托 + 一条成交 + 一个 lot（形状与真实账本一致）。
 
         ``session`` 是**真实成交 session**（进 ``paper_fills.fill_date``）；
         ``order_created_at`` 默认为它**前一天**，用来暴露"用订单意图日期冒充
         成交日期"这类缺陷。
+
+        ``executed_at`` 是委托的**真实成交时刻**（生产在成交时写入），默认
+        ``{session} 10:00:00``。日内重放（future-lot 时序）必须能指定它。
 
         ``order_account`` / ``order_code`` / ``fill_account`` / ``fill_code`` 只在
         身份完整性用例里被显式错配（默认与 lot 一致）。
@@ -169,7 +173,8 @@ class PositionTestCase(unittest.TestCase):
             "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (order_id, order_account or account, side, order_code or code, name,
              int(qty), status, "",
-             order_created_at or f"{session} 09:30:00", f"{session} 10:00:00",
+             order_created_at or f"{session} 09:30:00",
+             executed_at or f"{session} 10:00:00",
              exec_status, exec_flag,
              "paper_orders+paper_fills" if verified else "no_evidence_available"),
         )
@@ -203,6 +208,8 @@ class PositionTestCase(unittest.TestCase):
         ``executed_at`` 是委托的**真实成交时刻**（生产在成交时写入）。默认
         ``{session} 10:00:00``，因此"决策时点"在它之前/之后会得到不同结论 ——
         这正是"同 session 卖出必须按真实成交时刻判断"的活体探针。
+        传 ``""`` 表示**显式缺失**（写 NULL），用于验证"拿不到成交时刻必须
+        fail closed"。
 
         ``order_cycle_id`` 只在"跨周期卖出"用例里显式错配（默认与 lot 同周期）。
         """
@@ -215,7 +222,10 @@ class PositionTestCase(unittest.TestCase):
             "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (order_id, order_account or account, order_side or side,
              order_code or code, NORMAL_NAME, int(qty), "filled", "",
-             f"{session} 09:30:00", executed_at or f"{session} 10:00:00",
+             f"{session} 09:30:00",
+             # ``executed_at=""`` 表示**显式缺失**（写 NULL），用于"拿不到真实成交
+             # 时刻"的用例；``None`` 仍取默认时刻。
+             None if executed_at == "" else (executed_at or f"{session} 10:00:00"),
              exec_status, exec_flag,
              "paper_orders+paper_fills" if verified else "no_evidence_available"),
         )
@@ -1345,7 +1355,7 @@ class SameSessionSellMustUseRealExecutionTime(PositionTestCase):
         self.add_lot(qty=1000, session=D0, fill_id=1, order_id=1, lot_id=101,
                      available_date=D1)
         self.add_sell_fill(qty=400, session=D1, fill_id=2, order_id=2,
-                           executed_at=f"{D1} 11:00:00")
+                           executed_at=f"{D1}T11:00:00+08:00")
         self.set_remaining(101, 600)
         ctx = self.context(code=NORMAL, session=D1,
                            decision_at=f"{D1}T10:00:00+08:00")
@@ -1369,6 +1379,9 @@ class SameSessionSellMustUseRealExecutionTime(PositionTestCase):
         self.assertEqual(ctx.quantity_basis, PE.QUANTITY_BASIS_UNPROVABLE)
         self.assertFalse(ctx.comparable)
         self.assertIn("historical_quantity_unprovable", ctx.diagnostics)
+        # 必须命中**这条**守卫（盘中 + 拿不到成交时刻 = 无法证明），而不是靠下游
+        # 的账本自洽性检查"顺带"判负 —— 后者会让这条守卫变成不可观测的摆设。
+        self.assertIn("same_session_sell_time_unknown", ctx.diagnostics)
 
 
 class SellReplayMustStayInsideTheCycle(PositionTestCase):
@@ -1469,6 +1482,262 @@ class ShadowIdentityMustIncludeAccountAndCycle(PositionTestCase):
         )
         self.assertNotEqual(a.fingerprint(),
                             dataclasses.replace(a, account_id="acct_b").fingerprint())
+
+
+# ───────────── ROUND-3：future-lot 时序 / cycle attribution ─────────────
+
+
+class FutureLotMustNotSatisfyAnEarlierSell(PositionTestCase):
+    """承重：**未来 lot 绝不能反向满足过去的 SELL**（PIT 时间穿越）。
+
+    场景按规格 FUTURE-LOT-1..4 构造。关键点是 T+0 ETF：它的 ``available_date``
+    就是当天，因此"按日期比较"根本挡不住 13:00 才买入的 lot 去满足 10:00 的卖出。
+    """
+
+    def _etf_lot(self, *, session, qty, lot_id, order_id, fill_id,
+                 executed_at, available=None):
+        """建一个 T+0 ETF lot：``available_date`` = 当日（生产 ``_record_lot`` 语义）。"""
+        self.add_lot(code=ETF, qty=qty, session=session, fill_id=fill_id,
+                     order_id=order_id, lot_id=lot_id, asset_type="etf_t0",
+                     available_date=available or session, executed_at=executed_at)
+
+    def test_FUTURE_LOT_1_sell_consumes_only_the_earlier_lot(self):
+        # 09:00 已有 100；10:00 卖 100；13:00 又买 100。
+        self._etf_lot(session=D1, qty=100, lot_id=101, order_id=1, fill_id=1,
+                      executed_at=f"{D1} 09:00:00")
+        self._etf_lot(session=D1, qty=100, lot_id=102, order_id=2, fill_id=2,
+                      executed_at=f"{D1} 13:00:00")
+        self.add_sell_fill(code=ETF, qty=100, session=D1, fill_id=3, order_id=3,
+                           executed_at=f"{D1} 10:00:00")
+
+        # 生产当时已经扣减：09:00 lot 卖光，13:00 lot 原封不动。
+        self.set_remaining(101, 0)
+        ctx = self.context(code=ETF, session=D1,
+                           decision_at=f"{D1}T16:00:00+08:00")
+        # 重放必须自洽（否则说明它错误地借用了 13:00 的 lot）。
+        self.assertEqual(ctx.evidence_status, PE.PositionEvidenceStatus.PROVEN)
+        by_lot = {lot.lot_id: lot for lot in ctx.lots}
+        # 09:00 lot 被卖光，13:00 lot 完整保留 —— 绝不是反过来。
+        self.assertNotIn(101, by_lot, "09:00 的 lot 已被卖光，不属于当时的持仓")
+        self.assertEqual(by_lot[102].historical_quantity, 100)
+        self.assertEqual(ctx.held_quantity, 100)
+        self.assertEqual(ctx.consumed_quantity, 100,
+                         "被卖光的份额必须进诊断桶，不得静默消失")
+
+    def test_FUTURE_LOT_2_insufficient_then_future_lot_is_unprovable(self):
+        # 09:00 只有 50；10:00 卖 100；13:00 买 100 → 当时根本不够卖。
+        self._etf_lot(session=D1, qty=50, lot_id=101, order_id=1, fill_id=1,
+                      executed_at=f"{D1} 09:00:00")
+        self._etf_lot(session=D1, qty=100, lot_id=102, order_id=2, fill_id=2,
+                      executed_at=f"{D1} 13:00:00")
+        self.add_sell_fill(code=ETF, qty=100, session=D1, fill_id=3, order_id=3,
+                           executed_at=f"{D1} 10:00:00")
+
+        ctx = self.context(code=ETF, session=D1,
+                           decision_at=f"{D1}T16:00:00+08:00")
+        # 绝不允许用 13:00 的 lot 补足后宣布 proven。
+        self.assertEqual(ctx.evidence_status, PE.PositionEvidenceStatus.UNPROVABLE)
+        self.assertIn("sell_fill_exceeds_available_lots", ctx.diagnostics)
+        self.assertIn("future_lot_consumption_required", ctx.diagnostics)
+        self.assertEqual(ctx.quantity_basis, PE.QUANTITY_BASIS_UNPROVABLE)
+
+    def test_FUTURE_LOT_3_partial_sell_leaves_the_future_lot_intact(self):
+        self._etf_lot(session=D1, qty=100, lot_id=101, order_id=1, fill_id=1,
+                      executed_at=f"{D1} 09:00:00")
+        self._etf_lot(session=D1, qty=100, lot_id=102, order_id=2, fill_id=2,
+                      executed_at=f"{D1} 13:00:00")
+        self.add_sell_fill(code=ETF, qty=50, session=D1, fill_id=3, order_id=3,
+                           executed_at=f"{D1} 10:00:00")
+        self.set_remaining(101, 50)
+
+        ctx = self.context(code=ETF, session=D1,
+                           decision_at=f"{D1}T16:00:00+08:00")
+        self.assertEqual(ctx.evidence_status, PE.PositionEvidenceStatus.PROVEN)
+        by_lot = {lot.lot_id: lot for lot in ctx.lots}
+        self.assertEqual(by_lot[101].historical_quantity, 50)
+        self.assertEqual(by_lot[102].historical_quantity, 100)
+
+    def test_FUTURE_LOT_4_t1_semantics_still_hold(self):
+        """对照：普通 A 股 T+1 语义不得被新增的日内闸门破坏。"""
+        # D0 建仓 → D1 可卖；D1 卖出 100 必须正常扣减。
+        self.add_lot(code=NORMAL, qty=100, session=D0, fill_id=1, order_id=1,
+                     lot_id=101, available_date=D1, executed_at=f"{D0} 10:00:00")
+        self.add_sell_fill(code=NORMAL, qty=100, session=D1, fill_id=2, order_id=2,
+                           executed_at=f"{D1} 10:00:00")
+        self.set_remaining(101, 0)
+        ctx = self.context(code=NORMAL, session=D1,
+                           decision_at=f"{D1}T16:00:00+08:00")
+        # T+1 语义：D1 可卖并已卖出 → 当时持仓为 0，且重放自洽。
+        self.assertEqual(ctx.held_quantity, 0)
+        self.assertEqual(ctx.consumed_quantity, 100)
+        self.assertNotIn("replay_does_not_match_ledger", ctx.diagnostics)
+
+    def test_FUTURE_LOT_5_missing_sell_time_does_not_let_a_same_day_lot_in(self):
+        """拿不到卖出成交时刻时，同日 lot 无法证明日内先后 → fail closed。"""
+        self._etf_lot(session=D1, qty=100, lot_id=101, order_id=1, fill_id=1,
+                      executed_at=f"{D1} 13:00:00")
+        self.add_sell_fill(code=ETF, qty=100, session=D1, fill_id=2, order_id=2,
+                           executed_at=None)
+        ctx = self.context(code=ETF, session=D1,
+                           decision_at=f"{D1}T16:00:00+08:00")
+        self.assertEqual(ctx.evidence_status, PE.PositionEvidenceStatus.UNPROVABLE)
+
+
+class SellReplayOrderingUsesRealEventTime(PositionTestCase):
+    """承重：同日多笔卖出必须按**真实成交时刻**排序，而不是数据库 id。"""
+
+    def test_EVENT_ORDER_1_executed_at_decides_fifo(self):
+        # 两笔同日卖出：10:00 卖 A、11:00 卖 B。若按 id 排反而颠倒，FIFO 会错。
+        self.add_lot(code=NORMAL, qty=100, session=D0, fill_id=1, order_id=1,
+                     lot_id=101, available_date=D1, executed_at=f"{D0} 10:00:00")
+        self.add_lot(code=NORMAL, qty=100, session=D0, fill_id=2, order_id=2,
+                     lot_id=102, available_date=D1, executed_at=f"{D0} 10:00:00")
+        # fill_id 顺序与真实时间**相反**：先写入的是 11:00 那笔。
+        self.add_sell_fill(code=NORMAL, qty=100, session=D1, fill_id=3, order_id=3,
+                           executed_at=f"{D1}T11:00:00+08:00")
+        self.add_sell_fill(code=NORMAL, qty=100, session=D1, fill_id=4, order_id=4,
+                           executed_at=f"{D1} 10:00:00")
+        self.set_remaining(101, 0)
+        self.set_remaining(102, 0)
+
+        ctx = self.context(code=NORMAL, session=D1,
+                           decision_at=f"{D1}T16:00:00+08:00")
+        # 两笔各卖 100，合计把两个 lot 都卖光 —— 顺序不影响总数，但必须自洽。
+        self.assertEqual(ctx.held_quantity, 0)
+        self.assertEqual(ctx.consumed_quantity, 200)
+        self.assertNotIn("replay_does_not_match_ledger", ctx.diagnostics)
+
+    def test_EVENT_ORDER_2_tie_is_broken_deterministically(self):
+        """``executed_at`` 相同时必须有确定性的 tie-breaker（不得随机）。"""
+        self.add_lot(code=NORMAL, qty=100, session=D0, fill_id=1, order_id=1,
+                     lot_id=101, available_date=D1, executed_at=f"{D0} 10:00:00")
+        self.add_sell_fill(code=NORMAL, qty=40, session=D1, fill_id=2, order_id=2,
+                           executed_at=f"{D1} 10:00:00")
+        self.add_sell_fill(code=NORMAL, qty=40, session=D1, fill_id=3, order_id=3,
+                           executed_at=f"{D1} 10:00:00")
+        self.set_remaining(101, 20)
+        first = self.context(code=NORMAL, session=D1,
+                             decision_at=f"{D1}T16:00:00+08:00")
+        second = self.context(code=NORMAL, session=D1,
+                              decision_at=f"{D1}T16:00:00+08:00")
+        # 同一份输入必须给出同一份结论与指纹。
+        self.assertEqual(first.evidence_fingerprint, second.evidence_fingerprint)
+        self.assertEqual(first.held_quantity, second.held_quantity)
+
+    def test_EVENT_ORDER_3_snapshot_separates_before_and_after(self):
+        """决策时点前后的两笔卖出必须被正确切分（顺序由真实时间决定）。"""
+        self.add_lot(code=NORMAL, qty=100, session=D0, fill_id=1, order_id=1,
+                     lot_id=101, available_date=D1, executed_at=f"{D0} 10:00:00")
+        # fill_id 顺序与真实成交时刻**相反**：先写入的是 14:00 那笔。
+        self.add_sell_fill(code=NORMAL, qty=30, session=D1, fill_id=2, order_id=2,
+                           executed_at=f"{D1} 14:00:00")
+        self.add_sell_fill(code=NORMAL, qty=30, session=D1, fill_id=3, order_id=3,
+                           executed_at=f"{D1} 10:00:00")
+        self.set_remaining(101, 40)
+        ctx = self.context(code=NORMAL, session=D1,
+                           decision_at=f"{D1}T11:00:00+08:00")
+        self.assertEqual(ctx.evidence_status, PE.PositionEvidenceStatus.PROVEN)
+        # 11:00 回看：10:00 那笔已扣（100-30=70），14:00 那笔尚未发生。
+        # 若按 fill_id 排序，快照会错成 100。
+        self.assertEqual(ctx.held_quantity, 70)
+
+
+class CycleAttributionMustFailClosed(PositionTestCase):
+    """承重：周期归属无法证明时必须 fail closed，绝不默认 proven（CYCLE-A1..A6）。"""
+
+    def test_CYCLE_A1_unique_window_proves_attribution(self):
+        # 只有请求周期一个窗口包含该卖出 → 可归属。
+        self.add_lot(code=NORMAL, qty=100, session=D0, fill_id=1, order_id=1,
+                     lot_id=101, available_date=D1, executed_at=f"{D0} 10:00:00")
+        self.add_sell_fill(code=NORMAL, qty=100, session=D1, fill_id=2, order_id=2,
+                           executed_at=f"{D1} 10:00:00")
+        self.set_remaining(101, 0)
+        ctx = self.context(code=NORMAL, session=D1,
+                           decision_at=f"{D1}T16:00:00+08:00")
+        self.assertEqual(ctx.held_quantity, 0)
+        self.assertEqual(ctx.consumed_quantity, 100)
+        self.assertNotIn("replay_does_not_match_ledger", ctx.diagnostics,
+                         "重放必须与账本自洽")
+
+    def test_CYCLE_A2_missing_cycle_row_is_unprovable(self):
+        """``cycle_id`` 在 ``paper_cycles`` 里不存在 → 归属不可证明。"""
+        self.add_lot(code=NORMAL, qty=100, session=D0, fill_id=1, order_id=1,
+                     lot_id=101, available_date=D1, executed_at=f"{D0} 10:00:00",
+                     cycle_id=CYCLE)
+        self.add_sell_fill(code=NORMAL, qty=100, session=D1, fill_id=2, order_id=2,
+                           executed_at=f"{D1} 10:00:00", cycle_id=CYCLE)
+        # 请求一个根本没有周期行的 cycle。
+        ctx = self.context(code=NORMAL, session=D1, cycle_id=999,
+                           decision_at=f"{D1}T16:00:00+08:00")
+        # 该 cycle 下没有任何 lot → UNKNOWN（无仓位证据），而不是"可卖"。
+        self.assertIn(ctx.evidence_status,
+                      (PE.PositionEvidenceStatus.UNKNOWN,
+                       PE.PositionEvidenceStatus.UNPROVABLE))
+
+    def test_CYCLE_A3_unprovable_start_boundary_fails_closed(self):
+        """周期行存在但起点无法证明（started_at/created_at 都缺）→ unprovable。"""
+        self.conn.execute(
+            "UPDATE paper_cycles SET started_at=NULL, created_at=NULL WHERE id=?",
+            (CYCLE,))
+        self.add_lot(code=NORMAL, qty=100, session=D0, fill_id=1, order_id=1,
+                     lot_id=101, available_date=D1, executed_at=f"{D0} 10:00:00")
+        self.add_sell_fill(code=NORMAL, qty=100, session=D1, fill_id=2, order_id=2,
+                           executed_at=f"{D1} 10:00:00")
+        self.set_remaining(101, 0)
+        ctx = self.context(code=NORMAL, session=D1,
+                           decision_at=f"{D1}T16:00:00+08:00")
+        self.assertEqual(ctx.evidence_status, PE.PositionEvidenceStatus.UNPROVABLE)
+        self.assertIn("sell_fill_cycle_unprovable", ctx.diagnostics)
+
+    def test_CYCLE_A4_overlapping_open_cycles_are_ambiguous(self):
+        """两个开放周期都能证明包含该卖出 → ambiguous，必须 fail closed。"""
+        # 另一个同样开放、起点更早的周期（复用 setUp 里已有的行，改成竞争形态）。
+        self.conn.execute(
+            "UPDATE paper_cycles SET status='running', started_at=?, ended_at=NULL"
+            " WHERE id=?", (D0, OTHER_CYCLE))
+        self.add_lot(code=NORMAL, qty=100, session=D0, fill_id=1, order_id=1,
+                     lot_id=101, available_date=D1, executed_at=f"{D0} 10:00:00")
+        self.add_sell_fill(code=NORMAL, qty=100, session=D1, fill_id=2, order_id=2,
+                           executed_at=f"{D1} 10:00:00")
+        ctx = self.context(code=NORMAL, session=D1,
+                           decision_at=f"{D1}T16:00:00+08:00")
+        self.assertEqual(ctx.evidence_status, PE.PositionEvidenceStatus.UNPROVABLE)
+        self.assertIn("sell_fill_cycle_ambiguous", ctx.diagnostics)
+
+    def test_CYCLE_A5_sell_outside_the_window_is_not_consumed(self):
+        """明确落在请求周期窗外的卖出不得扣减本周期 lot。"""
+        # 周期窗只覆盖 D1；卖出发生在 D2（窗外）。
+        self.conn.execute(
+            "UPDATE paper_cycles SET started_at=?, ended_at=? WHERE id=?",
+            (D1, D1, CYCLE))
+        self.add_lot(code=NORMAL, qty=100, session=D0, fill_id=1, order_id=1,
+                     lot_id=101, available_date=D1, executed_at=f"{D0} 10:00:00")
+        self.add_sell_fill(code=NORMAL, qty=100, session=D2, fill_id=2, order_id=2,
+                           executed_at=f"{D2} 10:00:00")
+        ctx = self.context(code=NORMAL, session=D1,
+                           decision_at=f"{D1}T16:00:00+08:00")
+        # 窗外那笔不得扣减 → 持仓仍为 100（且账本自洽性由 lot 余额决定）。
+        self.assertEqual(ctx.held_quantity, 100)
+        self.assertIn("sell_fill_cycle_mismatch", ctx.diagnostics)
+
+    def test_CYCLE_A6_paused_cycle_without_start_is_recorded_not_guessed(self):
+        """起点缺失的其它周期只记诊断，不得用来否决一笔可证明的归属。"""
+        # 起点无法证明的 paused 周期：只能记诊断，不能凭它否决一笔可证明的归属。
+        self.conn.execute(
+            "UPDATE paper_cycles SET status='paused', started_at=NULL, ended_at=NULL"
+            " WHERE id=?", (OTHER_CYCLE,))
+        self.add_lot(code=NORMAL, qty=100, session=D0, fill_id=1, order_id=1,
+                     lot_id=101, available_date=D1, executed_at=f"{D0} 10:00:00")
+        self.add_sell_fill(code=NORMAL, qty=100, session=D1, fill_id=2, order_id=2,
+                           executed_at=f"{D1} 10:00:00")
+        self.set_remaining(101, 0)
+        ctx = self.context(code=NORMAL, session=D1,
+                           decision_at=f"{D1}T16:00:00+08:00")
+        # 请求周期本身可证明 → 归属成立（起点未知的周期不能凭空否决它）。
+        self.assertEqual(ctx.held_quantity, 0)
+        self.assertEqual(ctx.consumed_quantity, 100)
+        self.assertNotIn("sell_fill_cycle_ambiguous", ctx.diagnostics)
+        self.assertNotIn("sell_fill_cycle_unprovable", ctx.diagnostics)
 
 
 if __name__ == "__main__":
