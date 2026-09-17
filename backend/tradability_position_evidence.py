@@ -551,6 +551,10 @@ class PositionEvidenceAdapter:
         #: ``(code, session) -> ST.MarketEvidence``。给了才能让 T+1 authority 真的
         #: 判到 T+1 那一步；缺了所有可证明的 lot 一律 ``t1_unknown``（fail closed）。
         self._evidence_provider = evidence_provider
+        #: ``paper_orders.cycle_id`` 是否存在（发现式，不写死假设）。
+        self._orders_cycle_column: Optional[bool] = None
+        #: ``cycle_id -> (started_at, ended_at)`` 日期窗口缓存。
+        self._cycle_windows: dict = {}
 
     # ── 读 ──
 
@@ -627,11 +631,36 @@ class PositionEvidenceAdapter:
                 grouped.setdefault(_int(_row_field(row, "order_id")), []).append(row)
         return grouped
 
-    def _sell_fills_for(self, account_id: str, code: str) -> list:
-        """该 ``(account, code)`` 的**全部**卖出成交流水（含未验证行，供诊断）。
+    def _sell_fills_for(self, account_id: str, code: str,
+                        cycle_id: Any = None) -> list:
+        """该 ``(cycle, account, code)`` 的**全部**卖出成交流水（含未验证行，供诊断）。
 
         每条都带来源委托的验证列，因此调用方可以用**同一份权威谓词**筛选。
+
+        周期作用域：生产 ``paper_orders`` **没有** ``cycle_id`` 列（已核实 DDL），
+        所以周期只能通过**周期时间窗**界定 —— 卖出成交发生在该周期的
+        ``[started_at, ended_at]`` 之内才算属于它。若某天 schema 真的加上了该列，
+        这里会**额外**按列过滤（两重约束取交集，绝不放宽）。
+
+        ``cycle_id`` 为 ``None`` 时不加任何周期约束（由 ``_sell_events`` / ``_replay``
+        决定是否 fail closed）。
         """
+        window = self._cycle_window(cycle_id)
+        clause = ""
+        params: list = [account_id, code]
+        if window is not None:
+            start_at, end_at = window
+            # ``fill_date`` 是日期（``YYYY-MM-DD``）；与周期的日期边界比较。
+            if start_at:
+                clause += " AND f.fill_date >= ?"
+                params.append(start_at)
+            if end_at:
+                clause += " AND f.fill_date <= ?"
+                params.append(end_at)
+        has_column = self._orders_have_cycle_column()
+        if cycle_id is not None and has_column:
+            clause += " AND o.cycle_id=?"
+            params.append(cycle_id)
         return self._rows(
             "SELECT f.id AS fill_id, f.order_id AS order_id, f.account_id AS fill_account_id,"
             " f.code AS fill_code, f.side AS fill_side, f.qty AS fill_qty,"
@@ -642,29 +671,80 @@ class PositionEvidenceAdapter:
             " o.execution_verified AS execution_verified,"
             " o.execution_evidence_source AS execution_evidence_source "
             "FROM paper_fills f JOIN paper_orders o ON o.id = f.order_id "
-            "WHERE f.side='sell' AND f.account_id=? AND f.code=? "
-            "ORDER BY f.fill_date, f.id",
-            (account_id, code),
+            "WHERE f.side='sell' AND f.account_id=? AND f.code=?" + clause +
+            " ORDER BY f.fill_date, f.id",
+            tuple(params),
         )
 
     # ── 历史数量重放（生产 FIFO 语义） ──
 
-    def _sell_events(self, account_id: str, code: str) -> list:
+    def _orders_have_cycle_column(self) -> bool:
+        """``paper_orders`` 是否有 ``cycle_id`` 列（生产**没有**，但允许未来加上）。
+
+        用 ``PRAGMA table_info`` 发现，而不是写死假设 —— 写死会在真实库上报
+        ``no such column``，把整个仓位层打成异常。
+        """
+        if self._orders_cycle_column is None:
+            columns = set()
+            try:
+                for row in self._conn.execute("PRAGMA table_info(paper_orders)"):
+                    columns.add(str(_row_field(row, "name") or row[1]))
+            except sqlite3.Error:  # pragma: no cover - 表不存在
+                columns = set()
+            self._orders_cycle_column = "cycle_id" in columns
+        return self._orders_cycle_column
+
+    def _cycle_window(self, cycle_id: Any) -> Optional[tuple]:
+        """周期的 ``(started_at, ended_at)``（日期粒度），用于界定卖出成交归属。
+
+        生产 ``paper_orders`` 没有 ``cycle_id``，因此周期归属只能靠**时间窗**：
+        该周期启用期间发生的卖出才属于它。``started_at`` 缺失时退回 ``created_at``
+        （该周期开始存在的最早时刻）。两者都拿不到 ⇒ ``None``，即**不做**周期
+        过滤；此时 ``_replay`` 会据 ``cycle_ok`` 判定是否 fail closed。
+        """
+        if cycle_id is None:
+            return None
+        if cycle_id in self._cycle_windows:
+            return self._cycle_windows[cycle_id]
+        rows = self._rows(
+            "SELECT started_at, ended_at, created_at FROM paper_cycles WHERE id=?",
+            (cycle_id,),
+        )
+        window = None
+        if rows:
+            row = rows[0]
+            start = _session_of(_row_field(row, "started_at")) or _session_of(
+                _row_field(row, "created_at"))
+            end = _session_of(_row_field(row, "ended_at"))
+            window = (start, end)
+        self._cycle_windows[cycle_id] = window
+        return window
+
+    def _sell_events(self, account_id: str, code: str,
+                     cycle_id: Any = None) -> list:
         """归一化卖出事件，并做**身份完整性**校验。
 
-        每条事件带：``session`` / ``qty`` / ``verified`` / ``identity_ok`` /
-        ``fill_id``。身份冲突（成交属于另一个账户或另一只股票）不是"跳过"，而是
-        一个必须 fail closed 的事实 —— 绝不允许借另一个账户的已验证卖出改变本账户
-        的历史持仓。
+        每条事件带：``session`` / ``executed_at`` / ``qty`` / ``verified`` /
+        ``identity_ok`` / ``cycle_ok`` / ``fill_id``。
+
+        身份冲突（成交属于另一个账户或另一只股票）不是"跳过"，而是一个必须
+        fail closed 的事实 —— 绝不允许借另一个账户的已验证卖出改变本账户的历史
+        持仓。同理，**周期窗之外的卖出**也不得扣减本周期 lot：那是另一个资金池的
+        成交（``cycle_ok=False``）。
+
+        ``executed_at`` 是委托的**真实成交时刻**：同一 session 内的卖出用它判断
+        "是否发生在决策时点之前"，不再拿 session 收盘时刻去近似。
         """
+        window = self._cycle_window(cycle_id)
         events = []
-        for row in self._sell_fills_for(account_id, code):
+        for row in self._sell_fills_for(account_id, code, cycle_id=cycle_id):
             fill_account = _text(_row_field(row, "fill_account_id"))
             order_account = _text(_row_field(row, "order_account_id"))
             fill_code = _text(_row_field(row, "fill_code"))
             order_code = _text(_row_field(row, "order_code"))
             fill_side = str(_row_field(row, "fill_side") or "").lower()
             order_side = str(_row_field(row, "order_side") or "").lower()
+            session = _session_of(_row_field(row, "fill_date"))
             identity_ok = (
                 fill_account == account_id
                 and order_account == account_id
@@ -673,13 +753,27 @@ class PositionEvidenceAdapter:
                 and fill_side == "sell"
                 and order_side == "sell"
             )
+            # 周期窗判定：只在能确定窗口边界时才断言；窗口未知 ⇒ 视为未知，
+            # 交给 ``_replay`` 对"无法证明归属"fail closed。
+            cycle_ok = True
+            if cycle_id is not None and window is not None:
+                start_at, end_at = window
+                if session is None:
+                    cycle_ok = False
+                else:
+                    if start_at is not None and session < start_at:
+                        cycle_ok = False
+                    if end_at is not None and session > end_at:
+                        cycle_ok = False
             events.append({
                 "fill_id": _int(_row_field(row, "fill_id")),
                 "order_id": _int(_row_field(row, "order_id")),
-                "session": _session_of(_row_field(row, "fill_date")),
+                "session": session,
+                "executed_at": _instant(_row_field(row, "executed_at")),
                 "qty": _int(_row_field(row, "fill_qty")),
                 "verified": bool(EV.is_verified_row(row)),
                 "identity_ok": identity_ok,
+                "cycle_ok": cycle_ok,
             })
         return events
 
@@ -734,22 +828,53 @@ class PositionEvidenceAdapter:
                 diagnostics.append("sell_fill_identity_mismatch")
                 return {"snapshot": {}, "final": {}, "consistent": False,
                         "diagnostics": diagnostics}
+            if not event.get("cycle_ok", True):
+                # 跨周期卖出：不得扣减本周期 lot，也不得"跳过"了事 —— 跳过会让
+                # 重放终态与账本对不上而被误判为"证据不完整"，把一次真实的
+                # 周期作用域错误说成数据缺口。显式 fail closed。
+                diagnostics.append("sell_fill_cycle_mismatch")
+                return {"snapshot": {}, "final": {}, "consistent": False,
+                        "diagnostics": diagnostics}
             if not event["verified"]:
                 # 未验证的卖出：生产在成交时**已经**扣减了 lot，因此忽略它会让
                 # 重放终态与账本对不上。这里显式记诊断并让自洽性检查去判定。
                 diagnostics.append("unverified_sell_fill_excluded")
                 continue
 
-            # 该笔卖出是否发生在 decision_at 之前？同 session 的卖单没有日内时刻，
-            # 只能按"决策时点是否已过该 session 收盘"判断；判断不了就 fail closed。
+            # 该笔卖出是否发生在 decision_at 之前？
+            #
+            # 同 session 的卖出**有真实成交时刻**（``paper_orders.executed_at``，
+            # 生产在成交时写入）——必须用它判断，而不是拿 session 收盘时刻近似：
+            # 10:00 已成交的卖单，在 14:00 回看时应当已经被扣除。只有拿不到
+            # ``executed_at`` 时，才回退到"是否已过收盘"，且**判断不了就 fail
+            # closed**（绝不假设它已发生或未发生）。
             if session < decision_session:
                 consumed_before_decision = True
             elif session == decision_session:
-                if decision_at is None or decision_close is None:
+                executed_at = event.get("executed_at")
+                if executed_at is not None:
+                    if decision_at is None:
+                        diagnostics.append("same_session_sell_not_orderable")
+                        return {"snapshot": {}, "final": {}, "consistent": False,
+                                "diagnostics": diagnostics}
+                    consumed_before_decision = executed_at <= decision_at
+                elif decision_at is None or decision_close is None:
                     diagnostics.append("same_session_sell_not_orderable")
                     return {"snapshot": {}, "final": {}, "consistent": False,
                             "diagnostics": diagnostics}
-                consumed_before_decision = decision_at >= decision_close
+                elif decision_at >= decision_close:
+                    # 决策时点已过该 session 收盘：这一天的成交（盘中何时都好）
+                    # 必定先于决策，因此确定已被扣除。
+                    consumed_before_decision = True
+                else:
+                    # 决策时点在该 session **盘中**，却拿不到真实成交时刻 ——
+                    # 无法判定这笔同日卖出究竟在决策之前还是之后。猜"已发生"会把
+                    # 未发生的卖出算进历史；猜"未发生"会把已卖出的份额当成仍持有
+                    # （即"不知道"变成"可卖"/"可持有"）。两侧都不能猜，必须
+                    # fail closed。
+                    diagnostics.append("same_session_sell_time_unknown")
+                    return {"snapshot": {}, "final": {}, "consistent": False,
+                            "diagnostics": diagnostics}
             else:
                 consumed_before_decision = False
 
@@ -766,8 +891,16 @@ class PositionEvidenceAdapter:
             available_total = sum(remaining[lot["id"]] for lot in eligible)
             if available_total < qty:
                 # 逐字复现生产：聚合可卖量不足时**不动任何 lot**（生产返回 0 消耗）。
+                #
+                # 但在"重建历史持仓"这件事上这不是一个可以继续走的小异常：它意味着
+                # 有一笔卖出没有被任何 lot 解释，账本却被扣减过。此时任何历史数量
+                # 都不可信，必须立刻把整组判为 unprovable —— 不能只记一条诊断然后
+                # continue，那会让后续 lot 看起来"还在"，把不可证明的历史粉饰成
+                # 可卖数量（规格明确禁止 missing ⇒ assume sellable）。
                 diagnostics.append("sell_fill_exceeds_available_lots")
-                continue
+                diagnostics.append("historical_quantity_unprovable")
+                return {"snapshot": {}, "final": {}, "consistent": False,
+                        "diagnostics": diagnostics}
             left = qty
             for lot in eligible:
                 take = min(left, remaining[lot["id"]])
@@ -1120,7 +1253,7 @@ class PositionEvidenceAdapter:
             )
 
         # ── 历史数量：先重放，再判定 ──
-        events = self._sell_events(account, code_text)
+        events = self._sell_events(account, code_text, cycle_id=cycle)
         replay = self._replay(raw_lots, events, decision_session=session,
                               decision_at=resolved_decision_at)
         diagnostics: list = list(replay["diagnostics"])

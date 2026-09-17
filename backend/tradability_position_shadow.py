@@ -139,16 +139,23 @@ class PositionShadowComparison:
     def identity(self) -> tuple:
         """观察身份。仓位证据的指纹**不在**身份里。
 
-        身份必须稳定：同一 ``(code, session, side, decision_at, validation_as_of)``
-        在不同次运行里必须落到同一行。仓位证据变了是**内容**变了，由
-        :meth:`content` / :meth:`fingerprint` 负责暴露（同身份 + 冲突内容 → 由调用方
-        fail closed，绝不 last-write-wins）。
+        身份必须稳定：同一 ``(account, cycle, code, session, side, decision_at,
+        validation_as_of)`` 在不同次运行里必须落到同一行。仓位证据变了是**内容**
+        变了，由 :meth:`content` / :meth:`fingerprint` 负责暴露（同身份 + 冲突内容
+        → 由调用方 fail closed，绝不 last-write-wins）。
+
+        ``account_id`` / ``cycle_id`` **必须进身份**：T+1 是**账户级**约束，lot 又
+        归属**周期**。同一 ``(code, session, side)`` 在两个账户（或两个周期）上是
+        两条**互不相同**的观察 —— 若身份不含这两项，A 账户的可卖结论会覆盖 B 账户
+        的不可卖结论（或反之），这正是"跨账户池化"这类错误最隐蔽的入口。
 
         注意 ``decision_at`` 是**精确时点**：调用方传入 09:31 与 15:00 是两次不同的
         观察（同一 session 内仓位证据可能不同），因此它必须进身份，且**绝不**被
         悄悄改写成 session close。
         """
         return (
+            self.account_id,
+            self.cycle_id,
             self.code,
             self.session,
             self.side,

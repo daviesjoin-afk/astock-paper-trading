@@ -519,5 +519,93 @@ class OperatorCliExposesNoAuthority(unittest.TestCase):
         self.assertIn("--repair-position", FORBIDDEN_CLI_FLAGS)
 
 
+class SellReplayTimingAndScopeAreEnforced(unittest.TestCase):
+    """承重：同 session 卖出按真实成交时刻 + 卖出事件源 cycle-scoped。
+
+    这两条都是"看起来只是诊断、实际会伪造历史"的地方，所以护栏直接盯源码结构。
+    """
+
+    def test_same_session_timing_consumes_the_real_execution_instant(self):
+        source = _source(ADAPTER_MODULE)
+        self.assertIn("executed_at = event.get(\"executed_at\")", source)
+        self.assertIn("consumed_before_decision = executed_at <= decision_at", source)
+        # 拿不到真实成交时刻且决策时点在盘中 → 必须 fail closed，不许猜。
+        self.assertIn("same_session_sell_time_unknown", source)
+
+    def test_mid_session_unknown_time_is_not_guessed_either_way(self):
+        source = _source(ADAPTER_MODULE)
+        # 只允许"已过收盘 → 确定已扣除"这一条回退分支。
+        self.assertIn("elif decision_at >= decision_close:", source)
+        # 不得存在"否则就当成未发生"的猜测分支。
+        self.assertNotIn("consumed_before_decision = decision_at >= decision_close", source)
+
+    def test_oversell_fails_closed_instead_of_continuing(self):
+        source = _source(ADAPTER_MODULE)
+        marker = "diagnostics.append(\"sell_fill_exceeds_available_lots\")"
+        self.assertIn(marker, source)
+        tail = source[source.index(marker):source.index(marker) + 400]
+        self.assertIn("historical_quantity_unprovable", tail,
+                      "超出可卖 lots 必须立即 unprovable，不能 continue")
+        self.assertNotIn("continue", tail.split("historical_quantity_unprovable")[0],
+                         "在 unprovable 判定之前不得 continue")
+
+    def test_sell_events_are_cycle_scoped(self):
+        source = _source(ADAPTER_MODULE)
+        self.assertIn("def _sell_fills_for(self, account_id: str, code: str,", source)
+        self.assertIn("cycle_id: Any = None", source)
+        # 生产 ``paper_orders`` 没有 ``cycle_id`` 列，因此周期归属靠时间窗；
+        # 若某天真的加上该列，按列过滤是**额外**约束（发现式，不写死）。
+        self.assertIn("def _cycle_window(", source)
+        self.assertIn("f.fill_date >= ?", source)
+        self.assertIn("_orders_have_cycle_column", source)
+        self.assertIn("sell_fill_cycle_mismatch", source)
+        # 调用点必须真的把 cycle 传下去。
+        self.assertIn("self._sell_events(account, code_text, cycle_id=cycle)", source)
+
+    def test_cycle_column_is_discovered_not_assumed(self):
+        """不得写死 ``o.cycle_id``（生产库没有该列，写死会 no such column）。"""
+        source = _source(ADAPTER_MODULE)
+        self.assertNotIn("o.cycle_id AS order_cycle_id", source)
+        self.assertIn("PRAGMA table_info(paper_orders)", source)
+
+
+class ShadowIdentityIsAccountAndCycleScoped(unittest.TestCase):
+    """承重：仓位层观察身份必须含 ``account_id`` / ``cycle_id``。"""
+
+    def test_identity_contains_account_and_cycle(self):
+        source = _source(SHADOW_MODULE)
+        marker = "    def identity(self) -> tuple:"
+        self.assertIn(marker, source)
+        body = source[source.index(marker):source.index(marker) + 1400]
+        self.assertIn("self.account_id,", body)
+        self.assertIn("self.cycle_id,", body)
+
+    def test_detector_fires_when_identity_drops_the_scope(self):
+        # 反向断言：把身份改回旧形状（只有 code/session/side/...）时必须能识别。
+        fabricated = """
+        return (
+            self.code,
+            self.session,
+            self.side,
+            self.decision_at,
+            self.validation_as_of,
+        )
+        """
+        self.assertNotIn("self.account_id,", fabricated)
+        self.assertNotIn("self.cycle_id,", fabricated)
+
+
+class OperatorCliReusesTheResolvedKnowledgeInstant(unittest.TestCase):
+    """承重：仓位层 overlay 必须复用市场层面已 resolve 的 ``validation_as_of``。"""
+
+    def test_overlay_uses_the_market_comparisons_resolved_fields(self):
+        source = SHADOW_CLI.read_text(encoding="utf-8")
+        self.assertIn("decision_at=market.decision_at", source)
+        self.assertIn("validation_as_of=market.validation_as_of", source)
+        # 不得直接把原始参数再下发一遍（那会让两条记录的知识时点不一致）。
+        self.assertNotIn("validation_as_of=item.get(\"validation_as_of\")", source)
+        self.assertNotIn("decision_at=item.get(\"decision_at\")", source)
+
+
 if __name__ == "__main__":
     unittest.main()

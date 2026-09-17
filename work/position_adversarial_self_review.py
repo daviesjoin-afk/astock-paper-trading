@@ -26,6 +26,8 @@ DDL = """
 CREATE TABLE paper_orders (id INTEGER PRIMARY KEY, account_id TEXT, side TEXT,
   code TEXT, name TEXT, status TEXT, created_at TEXT, executed_at TEXT,
   execution_status TEXT, execution_verified INTEGER, execution_evidence_source TEXT);
+CREATE TABLE paper_cycles (id INTEGER PRIMARY KEY, cycle_key TEXT, status TEXT,
+  started_at TEXT, ended_at TEXT, created_at TEXT);
 CREATE TABLE paper_fills (id INTEGER PRIMARY KEY, order_id INTEGER, account_id TEXT,
   side TEXT, code TEXT, qty INTEGER, price REAL, amount REAL, fees REAL,
   fill_date TEXT, quote_at TEXT, assumption TEXT);
@@ -94,13 +96,15 @@ def add_lot(conn, oid, code, session, qty, *, order_created=None, verified=True,
 
 def add_sell_fill(conn, fid, oid, code, session, qty, *, account=ACCOUNT,
                   verified=True, order_account=None, order_code=None,
-                  fill_account=None, fill_code=None):
+                  fill_account=None, fill_code=None, cycle_id=CYCLE,
+                  executed_at=None, order_cycle_id=None):
     conn.execute(
         "INSERT INTO paper_orders(id,account_id,side,code,name,status,created_at,"
         "executed_at,execution_status,execution_verified,execution_evidence_source) "
         "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
         (oid, order_account or account, "sell", order_code or code, "平安银行",
-         "filled", "%s 09:30:00" % session, "%s 10:00:00" % session,
+         "filled", "%s 09:30:00" % session,
+         executed_at or ("%s 10:00:00" % session),
          "verified" if verified else "unknown", 1 if verified else 0, "ledger"),
     )
     conn.execute(
@@ -377,6 +381,98 @@ def main():
     check("正数请求量仍正常工作",
           ctx(a, session="2026-09-17", requested=1000).sellability_status
           == PE.SellabilityStatus.T1_SELLABLE)
+
+    # ── ROUND-2：同 session 成交时刻 / 跨周期 / 越卖 / 身份 / 知识时点 ──
+
+    # 攻击面 A：同 session 卖出必须按 executed_at，而不是 session 收盘
+    conn = fresh()
+    add_lot(conn, 1, NORMAL, "2026-09-16", 1000, available_date="2026-09-17")
+    add_sell_fill(conn, 9, 9, NORMAL, "2026-09-17", 400,
+                  executed_at="2026-09-17 10:00:00")
+    set_remaining(conn, 1, 600)
+    c = ctx(adapter(conn), session="2026-09-17", decision_at="2026-09-17T14:00:00+08:00")
+    check("14:00 回看 10:00 已成交的卖出 → 已扣除（600）",
+          c.held_quantity == 600, "held=%s basis=%s" % (c.held_quantity, c.quantity_basis))
+
+    # 攻击面 B：决策时点早于成交时刻 → 尚未扣除
+    conn = fresh()
+    add_lot(conn, 1, NORMAL, "2026-09-16", 1000, available_date="2026-09-17")
+    add_sell_fill(conn, 9, 9, NORMAL, "2026-09-17", 400,
+                  executed_at="2026-09-17 11:00:00")
+    set_remaining(conn, 1, 600)
+    c = ctx(adapter(conn), session="2026-09-17", decision_at="2026-09-17T10:00:00+08:00")
+    check("10:00 回看 11:00 才成交的卖出 → 尚未扣除（1000）",
+          c.held_quantity == 1000, "held=%s basis=%s" % (c.held_quantity, c.quantity_basis))
+
+    # 攻击面 C：拿不到 executed_at 且决策时点在盘中 → 必须 fail closed，不许猜
+    conn = fresh()
+    add_lot(conn, 1, NORMAL, "2026-09-16", 1000, available_date="2026-09-17")
+    add_sell_fill(conn, 9, 9, NORMAL, "2026-09-17", 400)
+    conn.execute("UPDATE paper_orders SET executed_at=NULL WHERE id=9")
+    set_remaining(conn, 1, 600)
+    c = ctx(adapter(conn), session="2026-09-17", decision_at="2026-09-17T10:00:00+08:00")
+    check("盘中无成交时刻 → 不可重建（不猜已发生/未发生）",
+          c.quantity_basis == PE.QUANTITY_BASIS_UNPROVABLE and not c.comparable,
+          "basis=%s comparable=%s" % (c.quantity_basis, c.comparable))
+
+    # 攻击面 D：周期窗之外的卖出不得扣减本周期 lot
+    conn = fresh()
+    conn.execute(
+        "INSERT INTO paper_cycles(id,cycle_key,status,started_at,ended_at,created_at)"
+        " VALUES(?,?,?,?,?,?)",
+        (CYCLE, "c-test", "running", "2026-09-17", None, "2026-09-17 00:00:00"))
+    add_lot(conn, 1, NORMAL, "2026-09-16", 1000, available_date="2026-09-17")
+    # 卖在 09-16，早于周期开始日 09-17 → 属于别的资金池。
+    add_sell_fill(conn, 9, 9, NORMAL, "2026-09-16", 1000)
+    c = ctx(adapter(conn), session="2026-09-17", decision_at=AS_OF)
+    check("周期窗之外的卖出不扣减本周期 lot（held=1000）",
+          c.held_quantity == 1000, "held=%s basis=%s" % (c.held_quantity, c.quantity_basis))
+
+    # 攻击面 D2：窗内的同一笔卖出确实扣减（反向对照，证明差异来自窗）
+    conn = fresh()
+    conn.execute(
+        "INSERT INTO paper_cycles(id,cycle_key,status,started_at,ended_at,created_at)"
+        " VALUES(?,?,?,?,?,?)",
+        (CYCLE, "c-test", "running", "2026-09-16", None, "2026-09-16 00:00:00"))
+    add_lot(conn, 1, NORMAL, "2026-09-16", 1000, available_date="2026-09-17")
+    add_sell_fill(conn, 9, 9, NORMAL, "2026-09-17", 1000)
+    set_remaining(conn, 1, 0)
+    c = ctx(adapter(conn), session="2026-09-17", decision_at=AS_OF)
+    check("周期窗之内的卖出确实扣减（held=0）",
+          c.held_quantity == 0 and c.quantity_basis == PE.QUANTITY_BASIS_HISTORICAL_REPLAY,
+          "held=%s basis=%s" % (c.held_quantity, c.quantity_basis))
+
+    # 攻击面 E：越卖（卖出量 > 当时可卖 lots）→ 立刻 unprovable，绝不 continue
+    conn = fresh()
+    add_lot(conn, 1, NORMAL, "2026-09-16", 1000, available_date="2026-09-17")
+    add_sell_fill(conn, 9, 9, NORMAL, "2026-09-17", 5000)
+    set_remaining(conn, 1, 0)
+    c = ctx(adapter(conn), session="2026-09-17", decision_at=AS_OF)
+    check("越卖 → unprovable（不把不可证明粉饰成可卖）",
+          c.quantity_basis == PE.QUANTITY_BASIS_UNPROVABLE and not c.comparable,
+          "basis=%s comparable=%s" % (c.quantity_basis, c.comparable))
+
+    # 攻击面 F：观察身份必须区分账户与周期
+    def _cmp(**over):
+        base = dict(
+            code=NORMAL, session="2026-09-17", side="sell", decision_at=AS_OF,
+            validation_as_of=AS_OF, market_status="comparable",
+            market_production_allowed=True, position_status="comparable_t1_pass",
+            position_evidence_status="position_proven",
+            position_sellability_status="t1_sellable", position_comparable=True,
+            account_id=ACCOUNT, cycle_id=CYCLE, held_quantity=1000,
+            sellable_quantity=1000, t1_locked_quantity=0, unknown_quantity=0,
+            requested_sell_quantity=1000,
+        )
+        base.update(over)
+        return PS.PositionShadowComparison(**base)
+
+    check("身份区分两个账户",
+          _cmp().identity() != _cmp(account_id=ACCOUNT_B).identity())
+    check("身份区分两个周期",
+          _cmp().identity() != _cmp(cycle_id=CYCLE_OLD).identity())
+    check("指纹也随账户变化",
+          _cmp().fingerprint() != _cmp(account_id=ACCOUNT_B).fingerprint())
 
     failed = [name for name, ok in _checks if not ok]
     print("\n%d/%d checks passed" % (len(_checks) - len(failed), len(_checks)))

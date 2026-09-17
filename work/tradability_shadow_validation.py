@@ -193,8 +193,12 @@ def _position_aware_rows(comparisons, items, adapter, args, cycle_id):
                 session=item.get("session"),
                 side=item.get("side"),
                 production_verdict=item.get("production_verdict"),
-                decision_at=item.get("decision_at"),
-                validation_as_of=item.get("validation_as_of"),
+                decision_at=market.decision_at,
+                # 知识时点必须用**市场层面那条已经 resolve 好的** ``validation_as_of``：
+                # 直接下传 ``item.get(...)`` 会让两条记录的默认快照不一致
+                # （市场层可能已把它规范化为某个精确时点，而 item 里还是原始参数，
+                # 甚至为 None）。同一次验证必须在**同一个知识时点**上成立。
+                validation_as_of=market.validation_as_of,
                 requested_sell_quantity=(
                     requested if str(item.get("side")) == ST.SIDE_SELL else None
                 ),

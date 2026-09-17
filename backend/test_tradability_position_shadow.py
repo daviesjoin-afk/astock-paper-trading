@@ -24,6 +24,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import os
 import sqlite3
 import sys
@@ -40,6 +41,7 @@ import tradability_shadow as TS  # noqa: E402
 ACCOUNT = "acct_a"
 ACCOUNT_B = "acct_b"
 CYCLE = 1
+OTHER_CYCLE = 7
 CYCLE_OLD = 0
 NORMAL = "600001"
 ETF = "510300"
@@ -47,6 +49,7 @@ NORMAL_NAME = "平安银行"
 ETF_NAME = "沪深300ETF"
 
 #: 决策 session 与它们的权威下一交易日（由 backend.universe 的法定交易日历给出）。
+D0 = "2026-09-15"          # 周二（用于"更早建仓、当日已可卖"的用例）
 D1 = "2026-09-16"          # 周三
 D1_NEXT = "2026-09-17"     # 周四
 D2 = "2026-09-17"
@@ -95,6 +98,10 @@ CREATE TABLE paper_position_lots (
     is_t_base INTEGER NOT NULL DEFAULT 1
 );
 CREATE TABLE paper_accounts (id TEXT PRIMARY KEY, cash REAL NOT NULL DEFAULT 0);
+CREATE TABLE paper_cycles (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, cycle_key TEXT NOT NULL UNIQUE,
+    status TEXT NOT NULL, started_at TEXT, ended_at TEXT, created_at TEXT
+);
 """
 
 
@@ -108,6 +115,28 @@ class PositionTestCase(unittest.TestCase):
         TA.ensure_schema(self.conn)
         self.repo = TA.TradabilityArchiveRepository(self.conn)
         self.snapshots = {}
+        # 周期行：生产 ``paper_orders`` 没有 ``cycle_id``，周期归属只能靠时间窗。
+        # 默认周期覆盖夹具用到的全部日期；单个用例可用 ``set_cycle_window`` 收窄。
+        self.conn.execute(
+            "INSERT INTO paper_cycles(id,cycle_key,status,started_at,ended_at,created_at)"
+            " VALUES(?,?,?,?,?,?)",
+            (CYCLE, "cycle-test", "running", None, None, "2026-01-01 00:00:00"),
+        )
+        self.conn.execute(
+            "INSERT INTO paper_cycles(id,cycle_key,status,started_at,ended_at,created_at)"
+            " VALUES(?,?,?,?,?,?)",
+            (OTHER_CYCLE, "cycle-other", "archived", None, "2026-01-02 00:00:00",
+             "2026-01-01 00:00:00"),
+        )
+        self.conn.commit()
+
+    def set_cycle_window(self, cycle_id, start=None, end=None):
+        """收窄某个周期的时间窗（用于"周期之外的卖出"用例）。"""
+        self.conn.execute(
+            "UPDATE paper_cycles SET started_at=?, ended_at=? WHERE id=?",
+            (start, end, cycle_id),
+        )
+        self.conn.commit()
 
     def tearDown(self):
         self.conn.close()
@@ -164,11 +193,18 @@ class PositionTestCase(unittest.TestCase):
     def add_sell_fill(self, *, code=NORMAL, account=ACCOUNT, qty, session,
                       fill_id, order_id, verified=True, side="sell",
                       order_account=None, order_code=None, fill_account=None,
-                      fill_code=None, order_side=None):
+                      fill_code=None, order_side=None, cycle_id=CYCLE,
+                      executed_at=None, order_cycle_id=None):
         """写入一笔**卖出**委托 + 成交（供生产 FIFO 重放使用）。
 
         默认形状与生产一致：``paper_fills.side='sell'`` + 来源委托 ``side='sell'``
         且已盖章（``execution_verified=1`` / ``execution_status='verified'``）。
+
+        ``executed_at`` 是委托的**真实成交时刻**（生产在成交时写入）。默认
+        ``{session} 10:00:00``，因此"决策时点"在它之前/之后会得到不同结论 ——
+        这正是"同 session 卖出必须按真实成交时刻判断"的活体探针。
+
+        ``order_cycle_id`` 只在"跨周期卖出"用例里显式错配（默认与 lot 同周期）。
         """
         exec_status = "verified" if verified else "unknown"
         exec_flag = 1 if verified else 0
@@ -179,7 +215,7 @@ class PositionTestCase(unittest.TestCase):
             "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (order_id, order_account or account, order_side or side,
              order_code or code, NORMAL_NAME, int(qty), "filled", "",
-             f"{session} 09:30:00", f"{session} 10:00:00",
+             f"{session} 09:30:00", executed_at or f"{session} 10:00:00",
              exec_status, exec_flag,
              "paper_orders+paper_fills" if verified else "no_evidence_available"),
         )
@@ -1277,6 +1313,162 @@ class RequestedSellQuantityMustBeStrictlyPositive(PositionTestCase):
     def test_oversized_request_is_blocked_not_accepted(self):
         context = self.context(session=D1_NEXT, requested=1001)
         self.assertEqual(PE.SellabilityStatus.T1_BLOCKED, context.sellability_status)
+
+
+# ───────────────────── ROUND-2：同 session 成交时刻 / 周期 / 身份 ─────────────────────
+
+
+class SameSessionSellMustUseRealExecutionTime(PositionTestCase):
+    """承重：同 session 的卖出必须按 ``paper_orders.executed_at`` 判断先后。
+
+    拿 session 收盘时刻近似会得出错误历史：10:00 已成交的卖单，在 14:00 回看时
+    应当**已经**被扣除；而"是否已过 15:00 收盘"这种判断在 14:00 是 False，于是
+    重放会凭空多出一份持仓 —— 把已卖出份额当成决策当时仍持有。
+    """
+
+    def test_HIST_T1_sell_before_decision_at_is_already_consumed(self):
+        """10:00 成交、14:00 回看 → 已扣除（旧逻辑在 14:00 会误判为未发生）。"""
+        # lot 在 D1 之前建仓且 D1 已可卖（available_date=D1），因此同 session 卖出
+        # 能合法地消耗它 —— 这样测的才是"成交时刻"而不是"可卖性"。
+        self.add_lot(qty=1000, session=D0, fill_id=1, order_id=1, lot_id=101,
+                     available_date=D1)
+        self.add_sell_fill(qty=400, session=D1, fill_id=2, order_id=2,
+                           executed_at=f"{D1} 10:00:00")
+        self.set_remaining(101, 600)
+        ctx = self.context(code=NORMAL, session=D1,
+                           decision_at=f"{D1}T14:00:00+08:00")
+        self.assertEqual(ctx.quantity_basis, PE.QUANTITY_BASIS_HISTORICAL_REPLAY)
+        self.assertEqual(ctx.held_quantity, 600)
+
+    def test_HIST_T2_sell_after_decision_at_is_not_yet_consumed(self):
+        """11:00 成交、10:00 回看 → 尚未扣除（决策时点确实还持有）。"""
+        self.add_lot(qty=1000, session=D0, fill_id=1, order_id=1, lot_id=101,
+                     available_date=D1)
+        self.add_sell_fill(qty=400, session=D1, fill_id=2, order_id=2,
+                           executed_at=f"{D1} 11:00:00")
+        self.set_remaining(101, 600)
+        ctx = self.context(code=NORMAL, session=D1,
+                           decision_at=f"{D1}T10:00:00+08:00")
+        self.assertEqual(ctx.quantity_basis, PE.QUANTITY_BASIS_HISTORICAL_REPLAY)
+        self.assertEqual(ctx.held_quantity, 1000)
+
+    def test_HIST_T3_executed_at_absent_falls_back_to_close_and_fails_closed(self):
+        """拿不到 ``executed_at`` 时回退到收盘判断；与账本冲突 → fail closed。
+
+        把 ``executed_at`` 显式置空、决策时点设为盘中 10:00：收盘判断
+        （10:00 >= 15:00 为 False）会让这笔卖出"未发生"，与账本（已扣减）冲突，
+        自洽性检查必须把整组判为不可重建 —— 而不是悄悄采用那个猜测值。
+        """
+        self.add_lot(qty=1000, session=D0, fill_id=1, order_id=1, lot_id=101,
+                     available_date=D1)
+        self.add_sell_fill(qty=400, session=D1, fill_id=2, order_id=2)
+        self.conn.execute("UPDATE paper_orders SET executed_at=NULL WHERE id=2")
+        self.set_remaining(101, 600)
+        ctx = self.context(code=NORMAL, session=D1,
+                           decision_at=f"{D1}T10:00:00+08:00")
+        self.assertEqual(ctx.quantity_basis, PE.QUANTITY_BASIS_UNPROVABLE)
+        self.assertFalse(ctx.comparable)
+        self.assertIn("historical_quantity_unprovable", ctx.diagnostics)
+
+
+class SellReplayMustStayInsideTheCycle(PositionTestCase):
+    """承重：卖出事件源必须与 lot 一样 **cycle-scoped**。
+
+    生产 ``paper_orders`` **没有** ``cycle_id`` 列（已核实 DDL），因此周期归属只能
+    由**周期时间窗**界定。周期窗之外的卖出属于另一个资金池 —— 拿它扣减本周期 lot
+    就会凭别的周期的成交伪造出"本周期已经卖掉"的历史。
+    """
+
+    def test_HIST_C1_sell_outside_the_cycle_window_does_not_consume(self):
+        """周期窗（起于 D2）之外的 D1 卖出不得扣减本周期 lot。"""
+        self.set_cycle_window(CYCLE, start=D2)
+        self.add_lot(qty=1000, session=D1, fill_id=1, order_id=1, lot_id=101,
+                     available_date=D1)
+        self.add_sell_fill(qty=1000, session=D1, fill_id=2, order_id=2)
+        ctx = self.context(code=NORMAL, session=D2, decision_at=AS_OF)
+        self.assertEqual(ctx.quantity_basis, PE.QUANTITY_BASIS_HISTORICAL_REPLAY)
+        self.assertEqual(ctx.held_quantity, 1000)
+
+    def test_HIST_C2_sell_inside_the_cycle_window_does_consume(self):
+        """反向对照：窗内（D2）的同一笔卖出**确实**扣减 —— 证明上面的差异来自窗。"""
+        self.set_cycle_window(CYCLE, start=D2)
+        self.add_lot(qty=1000, session=D1, fill_id=1, order_id=1, lot_id=101,
+                     available_date=D1)
+        self.add_sell_fill(qty=1000, session=D2, fill_id=2, order_id=2)
+        self.set_remaining(101, 0)
+        ctx = self.context(code=NORMAL, session=D2, decision_at=AS_OF)
+        self.assertEqual(ctx.quantity_basis, PE.QUANTITY_BASIS_HISTORICAL_REPLAY)
+        self.assertEqual(ctx.held_quantity, 0)
+
+    def test_HIST_C3_oversell_is_immediately_unprovable(self):
+        """卖出量超过当时可卖 lots：立刻 unprovable，绝不 continue 后继续展示余额。"""
+        self.add_lot(qty=1000, session=D1, fill_id=1, order_id=1, lot_id=101,
+                     available_date=D1)
+        self.add_sell_fill(qty=5000, session=D2, fill_id=2, order_id=2)
+        self.set_remaining(101, 0)
+        ctx = self.context(code=NORMAL, session=D2, decision_at=AS_OF)
+        self.assertEqual(ctx.quantity_basis, PE.QUANTITY_BASIS_UNPROVABLE)
+        self.assertFalse(ctx.comparable)
+        self.assertIn("sell_fill_exceeds_available_lots", ctx.diagnostics)
+
+    def test_cycle_column_absence_does_not_break_the_query(self):
+        """生产形状（``paper_orders`` 无 ``cycle_id``）必须能正常查询。"""
+        self.assertTrue(self.adapter()._orders_have_cycle_column() is False)
+        self.add_lot(qty=1000, session=D1, fill_id=1, order_id=1, lot_id=101)
+        ctx = self.context(code=NORMAL, session=D2, decision_at=AS_OF)
+        self.assertEqual(ctx.quantity_basis, PE.QUANTITY_BASIS_HISTORICAL_REPLAY)
+
+
+class ShadowIdentityMustIncludeAccountAndCycle(PositionTestCase):
+    """承重：仓位层观察身份必须含 ``account_id`` / ``cycle_id``。
+
+    缺这两项时，同一 ``(code, session, side)`` 在 A 账户与 B 账户上是**同一条**
+    身份 —— 先写入的可卖结论会被后写入的覆盖（或反之），跨账户池化因此不可见。
+    """
+
+    def test_identity_separates_two_accounts_on_the_same_code_and_session(self):
+        a = PS.PositionShadowComparison(
+            code=NORMAL, session=D1, side="sell", decision_at=AS_OF,
+            validation_as_of=AS_OF, market_status="comparable",
+            market_production_allowed=True, position_status="comparable_t1_pass",
+            position_evidence_status="position_proven",
+            position_sellability_status="t1_sellable", position_comparable=True,
+            account_id="acct_a", cycle_id=1, held_quantity=1000,
+            sellable_quantity=1000, t1_locked_quantity=0, unknown_quantity=0,
+            requested_sell_quantity=1000,
+        )
+        b = dataclasses.replace(a, account_id="acct_b")
+        self.assertNotEqual(a.identity(), b.identity(),
+                            "不同账户的同一 (code, session, side) 必须是两条观察")
+
+    def test_identity_separates_two_cycles_on_the_same_account(self):
+        a = PS.PositionShadowComparison(
+            code=NORMAL, session=D1, side="sell", decision_at=AS_OF,
+            validation_as_of=AS_OF, market_status="comparable",
+            market_production_allowed=True, position_status="comparable_t1_pass",
+            position_evidence_status="position_proven",
+            position_sellability_status="t1_sellable", position_comparable=True,
+            account_id=ACCOUNT, cycle_id=1, held_quantity=1000,
+            sellable_quantity=1000, t1_locked_quantity=0, unknown_quantity=0,
+            requested_sell_quantity=1000,
+        )
+        b = dataclasses.replace(a, cycle_id=2)
+        self.assertNotEqual(a.identity(), b.identity(),
+                            "不同周期的同一 (code, session, side) 必须是两条观察")
+
+    def test_fingerprint_reacts_to_account_identity(self):
+        a = PS.PositionShadowComparison(
+            code=NORMAL, session=D1, side="sell", decision_at=AS_OF,
+            validation_as_of=AS_OF, market_status="comparable",
+            market_production_allowed=True, position_status="comparable_t1_pass",
+            position_evidence_status="position_proven",
+            position_sellability_status="t1_sellable", position_comparable=True,
+            account_id="acct_a", cycle_id=1, held_quantity=1000,
+            sellable_quantity=1000, t1_locked_quantity=0, unknown_quantity=0,
+            requested_sell_quantity=1000,
+        )
+        self.assertNotEqual(a.fingerprint(),
+                            dataclasses.replace(a, account_id="acct_b").fingerprint())
 
 
 if __name__ == "__main__":

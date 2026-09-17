@@ -244,6 +244,61 @@ MUTATIONS = (
         "            if False:\n",
         "非正数请求卖出量被接受（随后被判成可卖）",
     ),
+    (
+        "M-T1-11",
+        ADAPTER,
+        "                executed_at = event.get(\"executed_at\")\n",
+        "                # MUTANT M-T1-11: same-session sell timing falls back to session close\n"
+        "                executed_at = None\n",
+        "同 session 卖出改用 session 收盘近似，忽略真实 executed_at",
+    ),
+    (
+        "M-T1-12",
+        ADAPTER,
+        "        window = self._cycle_window(cycle_id)\n"
+        "        clause = \"\"\n",
+        "        # MUTANT M-T1-12: cycle window dropped from the sell-event query\n"
+        "        window = None\n"
+        "        clause = \"\"\n",
+        "卖出事件查询丢掉周期窗过滤（窗外的卖出可扣减本周期 lot）",
+    ),
+    (
+        "M-T1-13",
+        ADAPTER,
+        "            available_total = sum(remaining[lot[\"id\"]] for lot in eligible)\n"
+        "            if available_total < qty:\n",
+        "            available_total = sum(remaining[lot[\"id\"]] for lot in eligible)\n"
+        "            if False:  # MUTANT M-T1-13: oversell只记诊断后继续\n",
+        "卖出量超过当时可卖 lots 时只记诊断并 continue（不再立即 unprovable）",
+    ),
+    (
+        "M-T1-14",
+        ADAPTER,
+        "                \"executed_at\": _instant(_row_field(row, \"executed_at\")),\n",
+        "                # MUTANT M-T1-14: real execution instant dropped\n"
+        "                \"executed_at\": None,\n",
+        "卖出事件丢失真实成交时刻",
+    ),
+    (
+        "M-T1-15",
+        ADAPTER,
+        "                    diagnostics.append(\"same_session_sell_time_unknown\")\n"
+        "                    return {\"snapshot\": {}, \"final\": {}, \"consistent\": False,\n"
+        "                            \"diagnostics\": diagnostics}\n",
+        "                    # MUTANT M-T1-15: 盘中未知时刻被当成\"未发生\"\n"
+        "                    consumed_before_decision = False\n",
+        "盘中拿不到成交时刻时按\"尚未发生\"处理（猜值）",
+    ),
+    (
+        "M-T1-16",
+        SHADOW,
+        "            self.account_id,\n"
+        "            self.cycle_id,\n"
+        "            self.code,\n",
+        "            # MUTANT M-T1-16: account/cycle dropped from identity\n"
+        "            self.code,\n",
+        "观察身份丢掉 account_id / cycle_id",
+    ),
 )
 
 #: 自检哨兵：只改注释。它必须 UNDETECTED —— 否则测试基线本来就是红的，
@@ -318,6 +373,38 @@ def assert_no_leftover_mutants() -> int:
         print("请先 `git checkout -- <file>` 还原，再重跑本矩阵。")
         return 1
     return 0
+
+
+def _lock_path() -> Path:
+    return ROOT / "backend" / ".mutation_matrix.lock"
+
+
+def acquire_run_lock() -> int:
+    """防止**并发**跑测试读到变异中的文件。
+
+    本矩阵会在若干秒内把生产文件改成变异体。若与此同时有人在别处跑
+    ``unittest discover``，那些测试会读到变异体并报出一批莫名其妙的失败 ——
+    看起来像"新改动破坏了既有防线"，实际只是时序冲突。这个锁让矩阵自己
+    声明"我正在改文件"，并且拒绝在锁已被占用时重复进入。
+    """
+    path = _lock_path()
+    if path.exists():
+        try:
+            holder = path.read_text(encoding="utf-8").strip()
+        except OSError:  # pragma: no cover - 竞态
+            holder = "?"
+        print(f"检测到正在运行的变异矩阵（lock={path}，holder={holder}）。")
+        print("请等它跑完再重跑；并发跑测试会读到变异中的文件。")
+        return 1
+    path.write_text(f"pid={os.getpid()}\n", encoding="utf-8")
+    return 0
+
+
+def release_run_lock() -> None:
+    try:
+        _lock_path().unlink()
+    except OSError:  # pragma: no cover - 已被清理
+        pass
 
 
 def _env() -> dict:
@@ -633,6 +720,36 @@ DESIGNATED_NON_VACUITY = {
         ".RequestedSellQuantityMustBeStrictlyPositive"
         ".test_zero_negative_and_invalid_are_all_rejected",
     ),
+    "M-T1-11": (
+        "test_tradability_position_shadow"
+        ".SameSessionSellMustUseRealExecutionTime"
+        ".test_HIST_T1_sell_before_decision_at_is_already_consumed",
+    ),
+    "M-T1-12": (
+        "test_tradability_position_shadow"
+        ".SellReplayMustStayInsideTheCycle"
+        ".test_HIST_C1_sell_outside_the_cycle_window_does_not_consume",
+    ),
+    "M-T1-13": (
+        "test_tradability_position_shadow"
+        ".SellReplayMustStayInsideTheCycle"
+        ".test_HIST_C3_oversell_is_immediately_unprovable",
+    ),
+    "M-T1-14": (
+        "test_tradability_position_shadow"
+        ".SameSessionSellMustUseRealExecutionTime"
+        ".test_HIST_T1_sell_before_decision_at_is_already_consumed",
+    ),
+    "M-T1-15": (
+        "test_tradability_position_shadow"
+        ".SameSessionSellMustUseRealExecutionTime"
+        ".test_HIST_T3_executed_at_absent_falls_back_to_close_and_fails_closed",
+    ),
+    "M-T1-16": (
+        "test_tradability_position_shadow"
+        ".ShadowIdentityMustIncludeAccountAndCycle"
+        ".test_identity_separates_two_accounts_on_the_same_code_and_session",
+    ),
 }
 
 
@@ -711,12 +828,28 @@ def main(argv=None) -> int:
     if "--audit" in argv:
         return audit_anchors()
     if "--non-vacuity" in argv:
-        if not baseline_is_green():
-            print("baseline contract tests are not green; refusing to run non-vacuity")
-            return 1
-        return non_vacuity()
+        locked = acquire_run_lock()
+        if locked:
+            return locked
+        try:
+            if not baseline_is_green():
+                print("baseline contract tests are not green; refusing to run non-vacuity")
+                return 1
+            return non_vacuity()
+        finally:
+            release_run_lock()
     print(f"repo root: {ROOT}")
     print("targets: " + ", ".join(sorted({entry[1] for entry in MUTATIONS})))
+    locked = acquire_run_lock()
+    if locked:
+        return locked
+    try:
+        return _run_matrix()
+    finally:
+        release_run_lock()
+
+
+def _run_matrix() -> int:
     if not baseline_is_green():
         print("baseline contract tests are not green; refusing to run the matrix")
         return 1
