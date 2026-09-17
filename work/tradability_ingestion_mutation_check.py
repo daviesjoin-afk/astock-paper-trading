@@ -34,6 +34,8 @@ TEST_MODULES = (
 INGESTION = "backend/tradability_ingestion.py"
 BACKFILL = "backend/tradability_backfill.py"
 INGESTION_TEST = "backend/test_tradability_ingestion.py"
+SHADOW = "backend/tradability_shadow.py"
+ARCHIVE = "backend/tradability_archive.py"
 
 # 每个变异条目缺省跑的契约测试模块；某些条目（跨文件的 Docker / dry-run /
 # fingerprint / session 契约）需要额外模块，用 TEST_MODULES_BY_ID 覆盖。
@@ -51,6 +53,22 @@ TEST_MODULES_BY_ID = {
     # M-F3 把 run_id 加回 fingerprint payload：P-F5（不同 run_id → 同一指纹）在
     # 回填契约测试里，必须指定该模块，否则默认只跑 test_tradability_ingestion 抓不到。
     "M-F3": ("test_tradability_backfill",),
+    "M-R1": ('test_tradability_backfill',),
+    "M-R2": ('test_tradability_backfill',),
+    "M-R3": ('test_tradability_backfill',),
+    "M-R4": ('test_tradability_backfill',),
+    "M-CODE1": ('test_tradability_backfill',),
+    "M-CODE2": ('test_tradability_backfill',),
+    "M-SESSION1": ('test_tradability_backfill',),
+    "M-SESSION2": ('test_tradability_backfill',),
+    "M-SH1": ('test_tradability_shadow',),
+    "M-SH2": ('test_tradability_shadow',),
+    "M-SH3": ('test_tradability_shadow',),
+    "M-SH4": ('test_tradability_shadow',),
+    "M-SH5": ('test_tradability_shadow',),
+    "M-SH6": ('test_tradability_shadow_architecture_guard',),
+    "M-SH7": ('test_tradability_shadow',),
+    "M-SH8": ('test_tradability_shadow',),
 }
 
 # 每个条目 import-check 的目标模块（排除"生产代码变异后语法错误无法 import"的假杀）。
@@ -59,6 +77,7 @@ IMPORT_MODULE_BY_ID = {
     "M-D1": "tradability_ingestion",   # 改的是 test 文件，生产代码未动
     "M-S1": "tradability_backfill",
     "M-DR1": "tradability_backfill",
+    "M-SH6": 'tradability_shadow',
 }
 
 # (id, 目标文件, 变异前源码片段, 变异后源码片段, 说明)
@@ -217,12 +236,10 @@ MUTATIONS = (
         "M-F1",
         INGESTION,
         "                normalized_records += 1\n"
-        "                normalized_evidence.append(evidence)\n"
-        "                if write:\n",
+        "                normalized_evidence.append(evidence)\n",
         "                normalized_records += 1\n"
         "                if write:\n"
-        "                    normalized_evidence.append(evidence)\n"
-        "                if write:\n",
+        "                    normalized_evidence.append(evidence)\n",
         "normalized evidence 收集被移回 write gate（dry-run fingerprint 漂移）",
     ),
     (
@@ -236,13 +253,13 @@ MUTATIONS = (
         "M-S1",
         BACKFILL,
         "    if calendar is None:\n"
-        "        return sessions_between(first, last)\n"
-        "    return sessions_between(first, last, calendar=calendar)\n",
-        "    if calendar is None:\n"
-        "        return sessions_between(first, last)\n"
+        "        sessions = sessions_between(first, last)\n"
+        "    else:\n"
+        "        sessions = sessions_between(first, last, calendar=calendar)\n",
         "    _f = _dt.date.fromisoformat(str(first)[:10])  # MUTANT M-S1\n"
         "    _l = _dt.date.fromisoformat(str(last)[:10])\n"
-        "    return [(_f + _dt.timedelta(days=i)).isoformat() for i in range((_l - _f).days + 1)]\n",
+        "    sessions = [(_f + _dt.timedelta(days=i)).isoformat() "
+        "for i in range((_l - _f).days + 1)]\n",
         "日期范围恢复自然日枚举（注入 calendar 也被忽略，周末/法定休市进入 denominator）",
     ),
     (
@@ -316,6 +333,118 @@ MUTATIONS = (
         "            \"coverage_ratio\": round(total_known / requested_pairs * 100, 1)\n",
         "            \"coverage_ratio\": round(total_present / requested_pairs * 100, 1)\n",
         "coverage_ratio 被改回 evidence_present / requested_pairs（一点证据 = 100%覆盖）",
+    ),
+    (
+        "M-R1",
+        INGESTION,
+        '            self._assert_replay_identity(run_id, run_fingerprint)\n',
+        '            pass  # MUTANT M-R1: allow same run_id with divergent fingerprint\n',
+        "允许 same run_id + divergent fingerprint（archive 保存新 revision，audit 仍描述旧 run）",
+    ),
+    (
+        "M-R2",
+        INGESTION,
+        '            self._assert_replay_identity(run_id, run_fingerprint)\n            for evidence in normalized_evidence:\n                if self._repo.save(evidence):\n                    persisted.append(evidence)\n                else:\n                    skipped_records += 1  # 幂等重放：唯一键命中，逻辑状态不变。\n',
+        '            for evidence in normalized_evidence:\n                if self._repo.save(evidence):\n                    persisted.append(evidence)\n                else:\n                    skipped_records += 1\n            if self._repo.count() < 0:  # MUTANT M-R2: divergent replay 写 archive\n                self._assert_replay_identity(run_id, run_fingerprint)\n',
+        "divergent replay 写 archive 但不更新 audit（先写事实再检查 run_id 冲突）",
+    ),
+    (
+        "M-R3",
+        INGESTION,
+        '            raise IngestionError(\n                f"run_id {run_id!r} 的 divergent replay 被拒绝："\n                f"stored={stored} incoming={run_fingerprint}"\n            )\n',
+        '            self._persist_run(  # MUTANT M-R3: 先落 audit 再拒绝\n                run_id=run_id, started_at=_now_utc(), cutoff=self._cutoff,\n                sessions=sessions, status=STATUS_COMPLETED,\n                requested_codes=1, raw_records=0, normalized_records=0,\n                persisted_records=0, skipped_records=0, unknown_records=0,\n                conflict_records=0, unprovable_records=0, error_records=0,\n                conflicts=[], unprovable=[], run_fingerprint=run_fingerprint,\n            )\n',
+        "divergent replay 拒绝前先写一行 audit（audit 被污染）",
+    ),
+    (
+        "M-R4",
+        INGESTION,
+        '        if stored is None:\n',
+        '        if stored is None or stored:\n',
+        "既有 run 没有 run_fingerprint 时放行（无法证明是同一次重放却接受）",
+    ),
+    (
+        "M-CODE1",
+        BACKFILL,
+        '        selected = normalize_codes(codes)\n',
+        '        selected = sorted(load_listing_records().keys())  # MUTANT M-CODE1\n',
+        "explicit empty codes fallback whole universe（--write 下放大成全市场写入）",
+    ),
+    (
+        "M-CODE2",
+        BACKFILL,
+        '    if invalid:\n        raise CodeScopeError(\n            "显式 --codes 含非法代码: " + ", ".join(sorted(set(invalid)))\n        )\n',
+        '    if False:  # MUTANT M-CODE2: 静默丢弃非法代码\n        pass\n',
+        "all-invalid codes 被静默丢弃（操作员以为整批都处理了）",
+    ),
+    (
+        "M-SESSION1",
+        BACKFILL,
+        '    if not sessions:\n        raise SessionScopeError(\n            f"日期范围 {first} → {last} 解析出 0 个交易日，无 session 可回填"\n        )\n',
+        '    if False:  # MUTANT M-SESSION1: 接受零交易日范围\n        pass\n',
+        "empty session range accepted（报 completed 但什么都没做）",
+    ),
+    (
+        "M-SESSION2",
+        INGESTION,
+        '        if not sessions:\n            raise IngestionError("ingestion 拒绝空 session scope（0 个交易日）")\n',
+        '        if False:  # MUTANT M-SESSION2: 零 session 也照写 audit\n            pass\n',
+        "zero-session write creates an audit row（把自己记成一次完成的摄取）",
+    ),
+    (
+        "M-SH1",
+        SHADOW,
+        '        elif archive["archive_state"] == ShadowStatus.ARCHIVE_UNKNOWN.value:\n            status = ShadowStatus.ARCHIVE_UNKNOWN\n',
+        '        elif archive["archive_state"] == ShadowStatus.ARCHIVE_UNKNOWN.value:\n            status = ShadowStatus.PRODUCTION_BLOCK_ARCHIVE_ALLOW  # MUTANT M-SH1\n',
+        "archive unknown 被算成 disagreement（证据缺口进分歧分母）",
+    ),
+    (
+        "M-SH2",
+        SHADOW,
+        '        elif archive["archive_state"] == ShadowStatus.ARCHIVE_UNPROVABLE.value:\n            status = ShadowStatus.ARCHIVE_UNPROVABLE\n',
+        '        elif archive["archive_state"] == ShadowStatus.ARCHIVE_UNPROVABLE.value:\n            status = ShadowStatus.AGREE_ALLOW  # MUTANT M-SH2\n',
+        "archive unprovable 被算成 comparable（历史不可证明却进一致率分母）",
+    ),
+    (
+        "M-SH3",
+        SHADOW,
+        '            agreement_rate=_ratio(agree, comparable),\n',
+        '            agreement_rate=_ratio(agree, requested),  # MUTANT M-SH3\n',
+        "agreement_rate 用 requested 当分母（把不可比的也当成一致）",
+    ),
+    (
+        "M-SH4",
+        ARCHIVE,
+        '    verdict = PIT.is_visible_at(evidence.observed_at, decision_time)\n    if verdict.get("mode") != "strict" or not verdict.get("visible"):\n        return False\n',
+        '    pass  # MUTANT M-SH4: 未来证据可参与历史 comparison\n',
+        "future observed evidence 被允许参与历史 comparison（PIT 失效）",
+    ),
+    (
+        "M-SH5",
+        ARCHIVE,
+        '            if evidence.price_limit_direction == PRICE_LIMIT_DOWN:\n                return TradabilityReason.OK\n            return TradabilityReason.BUY_LIMIT_LOCKED\n',
+        '            if evidence.price_limit_direction == PRICE_LIMIT_UP:  # MUTANT M-SH5\n                return TradabilityReason.OK\n            return TradabilityReason.BUY_LIMIT_LOCKED\n',
+        "BUY/SELL 涨跌停方向反转（涨停放行买入）",
+    ),
+    (
+        "M-SH6",
+        SHADOW,
+        'class ShadowError(ValueError):\n',
+        'def allow_order(*args, **kwargs):  # MUTANT M-SH6\n    """Shadow 长出 authority 入口。"""\n    raise NotImplementedError\n\n\nclass ShadowError(ValueError):\n',
+        "shadow result 暴露 authority 入口（可覆盖 production decision）",
+    ),
+    (
+        "M-SH7",
+        SHADOW,
+        '        agree = counts[ShadowStatus.AGREE_ALLOW.value] + counts[ShadowStatus.AGREE_BLOCK.value]\n',
+        '        agree = sum(counts.values())  # MUTANT M-SH7: 把一切算成一致\n',
+        "shadow 汇总把全部结论算成一致（on/off 改变可观测结论）",
+    ),
+    (
+        "M-SH8",
+        SHADOW,
+        '        if stored == row["content_fingerprint"]:\n            return "identical"\n        raise ShadowConflictError(\n            "同一比对身份出现冲突内容："\n            f"{comparison.identity} stored={stored} incoming={row[\'content_fingerprint\']}"\n        )\n',
+        '        return "identical"  # MUTANT M-SH8: last-write-wins\n',
+        "相同 comparison identity 允许 conflicting overwrite（last-write-wins）",
     ),
 )
 

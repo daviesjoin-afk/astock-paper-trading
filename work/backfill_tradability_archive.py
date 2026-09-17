@@ -61,10 +61,16 @@ def main(argv=None) -> int:
         print("需要 --session 或 --from")
         return 2
 
-    sessions = TB.resolve_sessions(start, end, session=args.session)
-    codes = TB.resolve_codes(args.codes, limit=args.limit)
+    # operator scope 在**打开数据库之前**解析：非法 scope 绝不产生任何数据库副作用。
+    # 空 --codes / 零交易日范围是操作员错误（exit 2），不是"跑完但没做事"。
+    try:
+        sessions = TB.resolve_sessions(start, end, session=args.session)
+        codes = TB.resolve_codes(args.codes, limit=args.limit)
+    except TB.ScopeError as exc:
+        print(f"scope 错误: {exc}")
+        return 2
     if not codes:
-        print("没有可回填的代码（universe 为空或 --codes 无效）")
+        print("没有可回填的代码（universe 为空）")
         return 2
 
     write = bool(args.write and not args.dry_run)
@@ -81,14 +87,19 @@ def main(argv=None) -> int:
             TA.ensure_schema(conn)
             TI.ensure_ingestion_schema(conn)
         providers = TB.default_providers()
-        result = TB.run_backfill(
-            conn,
-            providers,
-            codes,
-            sessions,
-            write=write,
-            run_id=args.run_id,
-        )
+        try:
+            result = TB.run_backfill(
+                conn,
+                providers,
+                codes,
+                sessions,
+                write=write,
+                run_id=args.run_id,
+            )
+        except TI.IngestionError as exc:
+            # divergent replay：事务已 rollback，archive / audit 均未改变。
+            print(f"摄取被拒绝: {exc}")
+            return 3
     finally:
         conn.close()
 

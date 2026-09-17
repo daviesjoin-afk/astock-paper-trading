@@ -851,6 +851,13 @@ class IngestionService:
         """
         codes = [str(c) for c in codes if _text(c)]
         sessions = [str(s) for s in sessions if _text(s)]
+        # 零 scope 的 run 不得存在：它没有覆盖任何 (code, session) 对，也不该落一行
+        # 审计把自己记成一次完成的摄取。这是**操作员错误**，不是"数据 unknown"。
+        # 必须在任何持久化之前拒绝（调用方据此 rollback / 非零退出）。
+        if not codes:
+            raise IngestionError("ingestion 拒绝空 code scope（0 个代码）")
+        if not sessions:
+            raise IngestionError("ingestion 拒绝空 session scope（0 个交易日）")
         run_id = run_id or uuid.uuid4().hex
         started_at = _now_utc()
 
@@ -935,12 +942,6 @@ class IngestionService:
                     continue
                 normalized_records += 1
                 normalized_evidence.append(evidence)
-                if write:
-                    inserted = self._repo.save(evidence)
-                    if inserted:
-                        persisted.append(evidence)
-                    else:
-                        skipped_records += 1  # 幂等重放：唯一键命中，逻辑状态不变。
 
                 self._record_session_stats(
                     session_stats, composed, field_conflicts, times["unprovable"]
@@ -953,6 +954,23 @@ class IngestionService:
         run_fingerprint = self._run_fingerprint(
             codes, sessions, self._cutoff, normalized_evidence
         )
+
+        # ── 两阶段：先算完所有结论与内容身份，再决定要不要落库 ──
+        #
+        # replay identity 必须在**任何不可逆持久化之前**校验。``run_id`` 是审计身份，
+        # ``run_fingerprint`` 是内容身份；同一个 run_id 配不同的内容指纹意味着
+        # "拿一个新 run 冒充旧 run 的重放"，必须 fail closed。绝不能先 save() 再发现
+        # 冲突——那时 archive 已经被写入，而 audit 行仍在描述旧 run。
+        #
+        # 因此**所有 archive 写入都在这一步之后**：校验不过就直接抛错，archive 行数
+        # 与 audit 行都不会变（不依赖调用方是否记得 rollback）。
+        if write:
+            self._assert_replay_identity(run_id, run_fingerprint)
+            for evidence in normalized_evidence:
+                if self._repo.save(evidence):
+                    persisted.append(evidence)
+                else:
+                    skipped_records += 1  # 幂等重放：唯一键命中，逻辑状态不变。
 
         # dry-run（write=False）不写任何东西：archive 与 run audit 都不落库。
         if write:
@@ -1198,6 +1216,47 @@ class IngestionService:
             "evidence_fingerprints": sorted(TA.evidence_fingerprint(e) for e in normalized),
         }
         return _sha256(payload)
+
+    def _assert_replay_identity(self, run_id: str, run_fingerprint: str) -> None:
+        """同 run_id 的重放必须内容一致，否则 fail closed（在写 archive 之前）。
+
+        contract::
+
+            same run_id + same run_fingerprint  => 幂等重放，允许
+            same run_id + different fingerprint => IngestionError
+                                                   → 整个事务 rollback
+                                                   → archive 不变、audit 不变
+
+        这一步**必须**发生在任何 archive / audit 写入之前。默认 provider 每次运行都
+        生成新的 ``retrieved_at``，因此"同一个 run_id 再跑一次"往往**不是**重放而是
+        一次内容不同的新 run；那种情况必须被拒绝，而不是让 archive 保存新 revision
+        而 audit 行继续描述旧 run。
+
+        查询与写入共用同一个连接，所以这里读到的是本次事务内的最新状态。
+        """
+        conn = self._audit_conn if self._audit_conn is not None else self._repo.connection
+        try:
+            row = conn.execute(
+                f"SELECT run_fingerprint FROM {INGESTION_RUNS_TABLE} WHERE run_id=?",
+                (run_id,),
+            ).fetchone()
+        except sqlite3.OperationalError:
+            # 审计表还不存在（纯内存测试未建 schema）→ 没有既有 run 可冲突。
+            return
+        if row is None:
+            return
+        stored = row[0] if not isinstance(row, Mapping) else row.get("run_fingerprint")
+        if stored is None:
+            # 既有 run 没有记录内容指纹：无法证明它是同一次重放 → fail closed。
+            raise IngestionError(
+                f"run_id {run_id!r} 已存在但未记录 run_fingerprint，"
+                "无法证明是同一次重放"
+            )
+        if stored != run_fingerprint:
+            raise IngestionError(
+                f"run_id {run_id!r} 的 divergent replay 被拒绝："
+                f"stored={stored} incoming={run_fingerprint}"
+            )
 
     def _persist_run(
         self,

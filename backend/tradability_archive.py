@@ -665,6 +665,15 @@ class TradabilityArchiveRepository:
     def save_many(self, items: Iterable[TradabilityEvidence]) -> int:
         return sum(1 for item in items if self.save(item))
 
+    @property
+    def connection(self) -> sqlite3.Connection:
+        """本仓储持有的连接（只读用途）。
+
+        摄取服务需要用它做**事务内**的 replay identity 查询——审计行与事实行必须在
+        同一个连接/事务里读写，否则"先查后写"之间存在竞态窗口。
+        """
+        return self._conn
+
     # ── 读 ──
     def visible_evidence(
         self, code: Any, session: Any, decision_time: Any
