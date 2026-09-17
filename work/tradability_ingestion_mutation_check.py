@@ -36,8 +36,10 @@ INGESTION = "backend/tradability_ingestion.py"
 BACKFILL = "backend/tradability_backfill.py"
 INGESTION_TEST = "backend/test_tradability_ingestion.py"
 SHADOW = "backend/tradability_shadow.py"
+EXECUTION_MODULE = "backend/execution_dispatch.py"
 SHADOW_CLI = "work/tradability_shadow_validation.py"
 ARCHIVE = "backend/tradability_archive.py"
+LEDGER = "backend/tradability_observation_ledger.py"
 
 # 每个变异条目缺省跑的契约测试模块；某些条目（跨文件的 Docker / dry-run /
 # fingerprint / session 契约）需要额外模块，用 TEST_MODULES_BY_ID 覆盖。
@@ -51,7 +53,7 @@ TEST_MODULES_BY_ID = {
     # M-F1/M-F2 改的是 tradability_ingestion.py：dry-run≠write 与 replay 漂移
     # 由回填契约测试的 fingerprint 断言抓住。
     "M-F1": ("test_tradability_backfill",),
-    "M-F2": ("test_tradability_backfill", "test_tradability_ingestion"),
+    "M-F2": ("test_tradability_observation_ledger",),
     # M-F3 把 run_id 加回 fingerprint payload：P-F5（不同 run_id → 同一指纹）在
     # 回填契约测试里，必须指定该模块，否则默认只跑 test_tradability_ingestion 抓不到。
     "M-F3": ("test_tradability_backfill",),
@@ -81,6 +83,22 @@ TEST_MODULES_BY_ID = {
     "M-R9": ('test_tradability_backfill',),
     "M-R10": ('test_tradability_backfill',),
     "M-R11": ('test_tradability_backfill',),
+    "M-O1": ("test_tradability_observation_ledger",),
+    "M-O2": ("test_tradability_observation_ledger",),
+    "M-O3": ("test_tradability_observation_ledger",),
+    "M-O4": ("test_tradability_observation_ledger",),
+    "M-O5": ("test_tradability_observation_ledger",),
+    "M-O6": ("test_tradability_observation_ledger",),
+    "M-O7": ("test_tradability_observation_ledger",),
+    "M-O8": ("test_tradability_observation_ledger",),
+    "M-O9": ("test_tradability_observation_ledger",),
+    "M-O10": ("test_tradability_observation_architecture_guard",),
+    "M-O11": ("test_tradability_observation_ledger",),
+    "M-O12": ("test_tradability_observation_ledger",),
+    "M-O13": ("test_tradability_shadow",),
+    "M-O14": ("test_tradability_shadow",),
+    "M-O15": ("test_tradability_shadow",),
+    "M-O16": ("test_tradability_shadow",),
 }
 
 # 每个条目 import-check 的目标模块（排除"生产代码变异后语法错误无法 import"的假杀）。
@@ -91,6 +109,35 @@ IMPORT_MODULE_BY_ID = {
     "M-DR1": "tradability_backfill",
     "M-SH6": 'tradability_shadow',
     "M-SH11": 'tradability_shadow',
+    "M-O1": "tradability_observation_ledger",
+    "M-O2": "tradability_observation_ledger",
+    "M-O3": "tradability_observation_ledger",
+    "M-O4": "tradability_observation_ledger",
+    "M-O5": "tradability_observation_ledger",
+    "M-O6": "tradability_observation_ledger",
+    "M-O7": "tradability_shadow",
+    "M-O8": "tradability_observation_ledger",
+    "M-O9": "tradability_shadow",
+    "M-O10": "execution_dispatch",
+    "M-O11": "tradability_observation_ledger",
+    "M-O12": "tradability_observation_ledger",
+    "M-O13": "tradability_shadow",
+    "M-O14": "tradability_shadow",
+    "M-O15": "tradability_shadow",
+    "M-O16": "tradability_shadow",
+}
+
+#: 行为**等价**的变异：注入后不改变任何可达状态，因此**不要求**被测试杀死。
+#:
+#: 规则（spec 要求）：等价变异必须显式登记，并在测试里有断言证明其等价性——"跑绿了
+#: 就算等价"不算证明。每条都要写明为什么等价、以及哪条通路覆盖了同一个契约。
+EQUIVALENT = {
+    # 指纹在**任何 save() 之前**计算，persisted 在那个时点恒为空；而 observations 载荷
+    # 已携带每个 provider 的原始证据指纹，"事实内容变化 → 指纹变化"由它保证。
+    # 等价性由 test_tradability_backfill.FingerprintCoversEvidenceContentAtTheCallSite
+    # （经由 ingest 调用点）与 FingerprintCoversEveryAuditVisibleDifference（直接驱动）
+    # 共同证明。
+    "M-F2EQ",
 }
 
 # (id, 目标文件, 变异前源码片段, 变异后源码片段, 说明)
@@ -258,9 +305,14 @@ MUTATIONS = (
     (
         "M-F2",
         INGESTION,
-        "            normalized_evidence,\n",
-        "            persisted,\n",
-        "fingerprint 使用本次 inserted rows（幂等重放后指纹漂移）",
+        '            "observations": sorted(\n'
+        '                (\n'
+        '                    json.dumps(dict(item), sort_keys=True, ensure_ascii=False, default=str)\n'
+        '                    for item in (observations or ())\n'
+        '                )\n'
+        '            ),\n',
+        '                    "observations": [],  # MUTANT M-F2: 观测载荷不进内容身份\n',
+        "观测载荷不进内容身份（逐 provider 观察时点互换不可见）",
     ),
     (
         "M-S1",
@@ -548,6 +600,249 @@ MUTATIONS = (
         '            if False:  # MUTANT M-R11: 不拒绝 autocommit 连接\n',
         "不拒绝 autocommit 连接（事实与审计无法原子提交）",
     ),
+    (
+        'M-O1',
+        INGESTION,
+        '        events = []\n'
+        '        for result in outcomes:\n'
+        '            events.append(\n'
+        '                OL.event_from_provider_result(\n'
+        '                    result,\n'
+        '                    code=code,\n'
+        '                    session=session,\n'
+        '                    recorded_at=self._recorded_at,\n'
+        '                    ingestion_run_id=run_id,\n'
+        '                )\n'
+        '            )\n'
+        '        return events\n',
+        '        events = []\n'
+        '        for result in outcomes:\n'
+        '            if getattr(result, "status", None) == OL.OBSERVED_UNKNOWN:\n'
+        '                continue  # MUTANT M-O1: provider unknown 不记录\n'
+        '            events.append(\n'
+        '                OL.event_from_provider_result(\n'
+        '                    result,\n'
+        '                    code=code,\n'
+        '                    session=session,\n'
+        '                    recorded_at=self._recorded_at,\n'
+        '                    ingestion_run_id=run_id,\n'
+        '                )\n'
+        '            )\n'
+        '        return events\n',
+        '不记录 provider unknown（unknown 被降级成 never observed）',
+    ),
+    (
+        'M-O2',
+        INGESTION,
+        '        events = []\n'
+        '        for result in outcomes:\n'
+        '            events.append(\n'
+        '                OL.event_from_provider_result(\n'
+        '                    result,\n'
+        '                    code=code,\n'
+        '                    session=session,\n'
+        '                    recorded_at=self._recorded_at,\n'
+        '                    ingestion_run_id=run_id,\n'
+        '                )\n'
+        '            )\n'
+        '        return events\n',
+        '        events = []\n'
+        '        for result in outcomes:\n'
+        '            if getattr(result, "status", None) == OL.OBSERVED_ERROR:\n'
+        '                continue  # MUTANT M-O2: provider error 不记录\n'
+        '            events.append(\n'
+        '                OL.event_from_provider_result(\n'
+        '                    result,\n'
+        '                    code=code,\n'
+        '                    session=session,\n'
+        '                    recorded_at=self._recorded_at,\n'
+        '                    ingestion_run_id=run_id,\n'
+        '                )\n'
+        '            )\n'
+        '        return events\n',
+        '不记录 provider error（error 被降级成 never observed）',
+    ),
+    (
+        'M-O3',
+        INGESTION,
+        '        events = []\n'
+        '        for result in outcomes:\n'
+        '            events.append(\n'
+        '                OL.event_from_provider_result(\n'
+        '                    result,\n'
+        '                    code=code,\n'
+        '                    session=session,\n'
+        '                    recorded_at=self._recorded_at,\n',
+        '        events = []\n'
+        '        for result in outcomes:\n'
+        '            events.append(\n'
+        '                OL.event_from_provider_result(\n'
+        '                    result,\n'
+        '                    code=code,\n'
+        '                    session=session,\n'
+        '                    recorded_at=session,  # MUTANT M-O3: 拿 session_date 冒充摄取时刻\n',
+        'recorded_at 被改成 session_date（时间旅行）',
+    ),
+    (
+        'M-O4',
+        LEDGER,
+        '            clauses.append("recorded_at<=?")\n'
+        '            params.append(moment)\n',
+        '            clauses.append("1=1")  # MUTANT M-O4: as_of 不过滤，未来观察可见\n'
+        '            params.append(moment)\n',
+        'future observation 对早期 validation_as_of 可见',
+    ),
+    (
+        'M-O5',
+        LEDGER,
+        '        cursor = self._conn.execute(\n'
+        '            f"INSERT OR IGNORE INTO {LEDGER_TABLE}({columns}, created_at) "\n'
+        '            f"VALUES({placeholders}, :created_at)",\n'
+        '            row,\n'
+        '        )\n'
+        '        return bool(cursor.rowcount)\n',
+        '        cursor = self._conn.execute(\n'
+        '            f"INSERT INTO {LEDGER_TABLE}({columns}, created_at) "\n'
+        '            f"VALUES({placeholders}, :created_at)",  # MUTANT M-O5: 不去重\n'
+        '            row,\n'
+        '        )\n'
+        '        return True\n',
+        'same-run replay 重复插入 observation 事件',
+    ),
+    (
+        'M-O6',
+        INGESTION,
+        '            if self._ledger is not None:\n'
+        '                self._ledger.append_many(observation_events)\n',
+        '            if False:  # MUTANT M-O6: 观察事件不写，事务原子性无从谈起\n'
+        '                self._ledger.append_many(observation_events)\n',
+        'ledger 写入失败不 rollback archive（根本不写 ledger）',
+    ),
+    (
+        'M-O7',
+        SHADOW,
+        '    if knowledge.evidence_seen:\n'
+        '        return ShadowStatus.ARCHIVE_UNPROVABLE.value, None\n',
+        '    if knowledge.evidence_seen:  # MUTANT M-O7: 晚观察证据永不升级为 unprovable\n'
+        '        return ShadowStatus.ARCHIVE_MISSING.value, None\n',
+        '晚观察证据永不升级为 unprovable（有证据却判 archive_missing）',
+    ),
+    (
+        'M-O8',
+        LEDGER,
+        '        rows = self.events(code_text, session_text, as_of=as_of_text)\n'
+        '        decision_text = _canonical_instant(decision_at) if decision_at is not None else None\n',
+        '        rows = self.events(code_text, session_text)  # MUTANT M-O8: 忽略 as_of\n'
+        '        decision_text = _canonical_instant(decision_at) if decision_at is not None else None\n',
+        '晚于 validation_as_of 的 observation 被用来分类',
+    ),
+    (
+        'M-O9',
+        SHADOW,
+        '    def identity(self) -> tuple:\n'
+        '        """``(code, session, decision_at, side, validation_as_of, contract_version)``。\n'
+        '\n'
+        '        ``validation_as_of`` 必须在身份里：同一条历史决策在 2026-09-17 与 2026-10-01\n'
+        '        做的验证是两个**不同的知识快照**。若它不参与身份，今天新摄取一条观察就会让\n'
+        '        昨天那条已持久化的比对产生 conflict——那正是"历史结论随今天数据库里有什么而\n'
+        '        漂移"。\n'
+        '        """\n'
+        '        return (\n'
+        '            self.code,\n'
+        '            self.session,\n'
+        '            self.decision_at,\n'
+        '            self.side,\n'
+        '            self.validation_as_of,\n'
+        '            self.contract_version,\n'
+        '        )\n',
+        '    def identity(self) -> tuple:\n'
+        '        """``(code, session, decision_at, side, validation_as_of, contract_version)``。\n'
+        '\n'
+        '        ``validation_as_of`` 必须在身份里：同一条历史决策在 2026-09-17 与 2026-10-01\n'
+        '        做的验证是两个**不同的知识快照**。若它不参与身份，今天新摄取一条观察就会让\n'
+        '        昨天那条已持久化的比对产生 conflict——那正是"历史结论随今天数据库里有什么而\n'
+        '        漂移"。\n'
+        '        """\n'
+        '        return (\n'
+        '            self.code,\n'
+        '            self.session,\n'
+        '            self.decision_at,\n'
+        '            self.side,\n'
+        '            self.contract_version,\n'
+        '        )  # MUTANT M-O9: 知识时点不进身份\n',
+        'validation_as_of 从 comparison identity 移除',
+    ),
+    (
+        'M-O10',
+        EXECUTION_MODULE,
+        'import sqlite3\n',
+        'import sqlite3\n'
+        'import tradability_observation_ledger  # MUTANT M-O10: 执行链路 import 台账\n',
+        'Observation Ledger 被 execution module import（authority 泄漏）',
+    ),
+    (
+        'M-O11',
+        LEDGER,
+        '        never = not rows\n'
+        '        legacy = never and bool(archive_has_row)\n',
+        '        never = not rows\n'
+        '        legacy = False  # MUTANT M-O11: 升级前历史数据不标不确定\n',
+        'legacy archive rows 被伪造 first_seen（不标不确定）',
+    ),
+    (
+        'M-O12',
+        LEDGER,
+        '        if key in seen:\n'
+        '            # 同一个 pair 重复出现仍然只是 1 个 pair。\n'
+        '            continue\n'
+        '        seen.add(key)\n',
+        '        if False:  # MUTANT M-O12: 每个事件都算一个 pair\n'
+        '            continue\n'
+        '        seen.add(key)\n',
+        'coverage 用 observation event count 当分母',
+    ),
+    (
+        "M-F2EQ",
+        INGESTION,
+        '            normalized_evidence,\n',
+        '            persisted,\n',
+        "fingerprint 使用本次 inserted rows（等价：指纹在 save() 之前计算，persisted 恒为空）",
+    ),
+    (
+        'M-O13',
+        SHADOW,
+        '    upgraded = _upgrade_v1_shadow_table(conn)\n'
+        '    if not upgraded:\n'
+        '        _create_shadow_table(conn)\n',
+        '    _create_shadow_table(conn)  # MUTANT M-O13: 不升级 v1 表\n',
+        '不升级 v1 影子表（迁移记成功但缺列）',
+    ),
+    (
+        'M-O14',
+        SHADOW,
+        '        if validation_as_of is None:\n'
+        '            as_of_text = _canonical_instant(_dt.datetime.now(_dt.timezone.utc))\n'
+        '            as_of_invalid = as_of_text is None\n',
+        '        if validation_as_of is None:\n'
+        '            as_of_text = None  # MUTANT M-O14: 默认知识时点留空\n'
+        '            as_of_invalid = False\n',
+        '默认 validation_as_of 留空（无快照身份）',
+    ),
+    (
+        'M-O15',
+        SHADOW,
+        '    if knowledge.evidence_seen:\n'
+        '        return ShadowStatus.ARCHIVE_UNPROVABLE.value, None\n',
+        '    # MUTANT M-O15: 证据不优先，先判 provider 诊断\n',
+        '证据不优先于 provider 错误诊断',
+    ),
+    (
+        'M-O16',
+        SHADOW,
+        '        out.sort(key=lambda comparison: _identity_sort_key(comparison.identity))\n',
+        '        out.sort(key=lambda comparison: comparison.identity)  # MUTANT M-O16\n',
+        '身份排序不归一（None 与 str 混用抛 TypeError）',
+    ),
 )
 
 # 自检哨兵：只改注释。它必须 UNDETECTED。
@@ -686,9 +981,24 @@ def apply_and_run(entry) -> str:
               f"sha256_match={sha256(restored) == original_sha}")
 
 
+def _assert_entry_arity() -> int:
+    """每条变异必须是 5 元组。
+
+    缺了这条校验，一次"插错位置"的编辑会让矩阵在 ``apply_and_run`` 里以
+    ``ValueError: too many values to unpack`` 崩掉，而 ``--audit`` 仍然报 PASS——
+    因为 audit 只看 anchor 计数。结构错误必须在 audit 阶段就被抓住。
+    """
+    problems = 0
+    for entry in (SANITY_MUTATION, *MUTATIONS):
+        if len(entry) != 5:
+            print(f"ARITY-BAD {entry[0]}: {len(entry)} elements (expected 5)")
+            problems += 1
+    return problems
+
+
 def audit_anchors() -> int:
     print("=== anchor audit (read-only) ===")
-    bad = 0
+    bad = _assert_entry_arity()
     entries = [SANITY_MUTATION, *MUTATIONS]
     for entry in entries:
         name, relative_path = entry[0], entry[1]
@@ -739,8 +1049,17 @@ def main(argv=None) -> int:
     for name, outcome in results:
         print(f"{name}: {outcome}")
     caught = [name for name, outcome in results if outcome == "CAUGHT"]
-    survived = [name for name, outcome in results if outcome != "CAUGHT"]
+    equivalent = [
+        name for name, outcome in results
+        if outcome != "CAUGHT" and name in EQUIVALENT
+    ]
+    survived = [
+        name for name, outcome in results
+        if outcome != "CAUGHT" and name not in EQUIVALENT
+    ]
     print(f"caught: {len(caught)}/{len(results)}")
+    if equivalent:
+        print(f"equivalent (explicitly registered, not required to be killed): {equivalent}")
     print(f"survived: {survived or 'none'}")
 
     complete = len(results) == len(MUTATIONS) and not survived and sanity == "UNDETECTED"

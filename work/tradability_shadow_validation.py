@@ -9,6 +9,14 @@
     # 日期范围（按 A 股交易日历过滤）
     python work/tradability_shadow_validation.py --from 2025-06-01 --to 2025-06-30 --limit 50
 
+    # 固定知识时点（"我们站在哪一天的知识上做这次验证"）
+    python work/tradability_shadow_validation.py --session 2025-06-10 \
+        --validation-as-of 2026-09-17
+
+``--validation-as-of`` 缺省 = 当前知识时点（看全部已有观察）。显式给出时只使用
+``recorded_at <= validation_as_of`` 的观察事件：晚于该时点才被摄取的事实对这次验证
+不可见，因此同一条历史决策在不同知识时点的验证是两个不同的快照（身份里含它）。
+
 本工具**只**做 argument parsing / 格式化 / exit code，全部比对逻辑在
 :mod:`backend.tradability_shadow`，scope 解析在 :mod:`backend.tradability_backfill`
 （因此与回填 CLI 共享同一套 operator scope 契约：显式空 ``--codes`` 报错、零交易日
@@ -36,6 +44,7 @@ import security_state_point_in_time as SS  # noqa: E402
 import selection_tradability as ST  # noqa: E402
 import tradability_archive as TA  # noqa: E402
 import tradability_backfill as TB  # noqa: E402
+import tradability_observation_ledger as OL  # noqa: E402
 import tradability_shadow as TS  # noqa: E402
 
 
@@ -102,12 +111,13 @@ def _production_verdict(code, session, side, kline_map, state_fn):
     return ST.exit_tradability(evidence, code=code, exit_session=session)
 
 
-def _pair_has_records(conn, code, session):
-    """归档里是否存在该 ``(code, session)`` 的**任何**记录。
+def _pair_has_archive_row(conn, code, session):
+    """归档里是否存在该 ``(code, session)`` 的**任何**行。
 
-    **当前**本 CLI 不消费它——见调用点的说明：从当前归档推导出来的"后来是否摄取过"
-    是一个当前状态，今天插入一条晚观察的记录就会改写昨天的比对分类与指纹。保留这个
-    只读探针是为了让后续引入真正的摄取台账时有一个明确的落点。
+    这**只**用于一个诊断标签：升级前就已存在的历史数据（archive 有行、台账无任何事件）
+    其真实 ``first_seen_at`` 无法反推，只能诚实标 ``legacy_observation_unknown``。
+    它问的是"这条 pair 有没有事实行"，**不是**"它当时可不可见"——后者由 archive 的
+    ``tradability_at`` 在 ``decision_at`` 下回答。
     """
     try:
         row = conn.execute(
@@ -130,6 +140,12 @@ def main(argv=None) -> int:
     parser.add_argument("--codes", help="逗号分隔的代码列表；缺省用当前 universe")
     parser.add_argument("--limit", type=int, default=None, help="只比对前 N 只（调试）")
     parser.add_argument("--side", choices=list(ST.SIDES), default=None, help="只比对某一方向")
+    parser.add_argument(
+        "--validation-as-of",
+        dest="validation_as_of",
+        default=None,
+        help="知识时点（YYYY-MM-DD 或完整时间戳）；缺省=当前知识时点",
+    )
     parser.add_argument("--json", action="store_true", help="以 JSON 输出")
     args = parser.parse_args(argv)
 
@@ -162,7 +178,10 @@ def main(argv=None) -> int:
     conn = sqlite3.connect(db_path, timeout=30)
     try:
         repo = TA.TradabilityArchiveRepository(conn)
-        comparator = TS.ShadowComparator(repo)
+        # 台账提供"我们什么时候第一次看到这条 pair"这一**不可变历史序列**。它只用于
+        # 分类 archive_missing / archive_unprovable 与诊断，绝不参与 archive verdict。
+        ledger = OL.ObservationLedgerRepository(conn)
+        comparator = TS.ShadowComparator(repo, ledger=ledger)
         sides = [args.side] if args.side else list(ST.SIDES)
         items = []
         kline_cache: dict = {}
@@ -182,17 +201,10 @@ def main(argv=None) -> int:
                             "session": session,
                             "side": side,
                             "decision_at": ST.session_close_at(session),
-                            # 默认**不**声明"证据晚于 decision_at 才被观察到"：本 CLI 没有
-                            # 独立的摄取台账，任何从"当前归档里有没有这条 pair"推导出来
-                            # 的结论都是**当前状态**，今天插入一条晚观察的记录就会让昨天
-                            # 的比对从 archive_missing 变成 archive_unprovable，指纹随之
-                            # 改变。那正是用未来事实改写历史结论。
-                            #
-                            # 于是这里取**当时就能得到的结论**：没有可见证据即
-                            # archive_missing。unprovable 需要真正的摄取台账（记录该 pair
-                            # 首次被观察到的时间）才能声明，属于后续工作，见 PR 的 Known
-                            # gaps。
-                            "ingested_later": False,
+                            # 知识时点：显式给出时只使用 ``recorded_at <= as_of`` 的
+                            # 观察事件。它同时进入比对身份，因此 2026-09-17 与 2026-10-01
+                            # 的验证各自成行，今天新摄取一条观察不会让昨天的比对冲突。
+                            "validation_as_of": args.validation_as_of,
                         }
                     )
         comparisons = comparator.compare_many(items)
@@ -227,6 +239,30 @@ def main(argv=None) -> int:
         "comparison_rate", "agreement_rate", "disagreement_rate",
     ):
         print(f"{key}: {data[key]}")
+    print(f"validation_as_of: {args.validation_as_of or '(current)'}")
+    by_diagnostic: dict = {}
+    by_provider_outcome: dict = {}
+    late_observed = 0
+    for comparison in comparisons:
+        if comparison.archive_diagnostic:
+            key = comparison.archive_diagnostic
+            by_diagnostic[key] = by_diagnostic.get(key, 0) + 1
+        for outcome, count in (comparison.provider_outcomes or {}).items():
+            by_provider_outcome[outcome] = by_provider_outcome.get(outcome, 0) + count
+        if comparison.status == TS.ShadowStatus.ARCHIVE_UNPROVABLE.value:
+            late_observed += 1
+    print("archive_diagnostic:", json.dumps(by_diagnostic, ensure_ascii=False))
+    print("provider_outcomes:", json.dumps(by_provider_outcome, ensure_ascii=False))
+    print(f"late_observed (archive_unprovable): {late_observed}")
+    for comparison in comparisons[:5]:
+        print(
+            "  sample: "
+            f"{comparison.code} {comparison.session} {comparison.side} "
+            f"status={comparison.status} "
+            f"first_observed_at={comparison.first_observed_at} "
+            f"market_provable_at_decision={comparison.market_provable_at_decision} "
+            f"system_possessed_at_decision={comparison.system_possessed_at_decision}"
+        )
     print("by_side:", json.dumps(data["by_side"], ensure_ascii=False))
     print("by_production_reason:", json.dumps(data["by_production_reason"], ensure_ascii=False))
     print("by_archive_reason:", json.dumps(data["by_archive_reason"], ensure_ascii=False))

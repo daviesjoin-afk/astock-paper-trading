@@ -77,6 +77,31 @@ def _ensure_tradability_ingestion_runs(conn):
     return TI.ensure_ingestion_schema(conn)
 
 
+def _ensure_tradability_observation_ledger(conn):
+    """v15：可交易性**观察台账**（append-only）。
+
+    记录"我们什么时候看到 / 尝试看到这些事实"，与 v13 的"市场事实是什么"严格分开。
+    纯新增（``CREATE TABLE IF NOT EXISTS``），**不触碰** ``historical_tradability_archive``
+    的任何行，也**不**给历史行伪造 ``first_seen_at``：升级前那些行真实的"系统首次观察到
+    的时间"无法从 archive 反推（``created_at`` 只覆盖 evidence 行，且完全无法表达
+    unknown / error 观察），因此一律诚实标为 ``legacy_observation_unknown``。
+    """
+    import tradability_observation_ledger as OL
+
+    return OL.ensure_ledger_schema(conn)
+
+
+def _ensure_tradability_shadow_table(conn):
+    """v16：Shadow 比对结果表（可选持久化）。
+
+    独立表，与 archive / ingestion audit / orders / fills / positions / 学习表完全隔离。
+    唯一身份含 ``validation_as_of``，所以不同知识时点的验证各自成行。
+    """
+    import tradability_shadow as TS
+
+    return TS.ensure_shadow_schema(conn)
+
+
 # 迁移注册表：db_name -> [(version, description, sql_or_callable), ...]
 MIGRATIONS = {
     "paper_trading": [
@@ -117,6 +142,13 @@ MIGRATIONS = {
         # 历史可交易性证据摄取运行审计：记录每次 backfill 的 provider 集合、
         # 计数、冲突、unprovable 与指纹。纯新增，不触碰 archive 核心表。
         (14, "新增历史可交易性摄取运行审计表（幂等）", _ensure_tradability_ingestion_runs),
+        # 可交易性观察台账：记录"我们什么时候看到/尝试看到这些事实"（含 provider
+        # unknown / error）。纯新增；**绝不**给升级前的 archive 历史行回填 first_seen_at
+        # ——那是时间旅行，真实观察时间无法从 archive 反推。
+        (15, "新增可交易性观察台账（幂等，append-only）",
+         _ensure_tradability_observation_ledger),
+        # Shadow 比对结果（可选持久化，v2 身份含 validation_as_of）。与生产表完全隔离。
+        (16, "新增可交易性 Shadow 比对结果表（幂等）", _ensure_tradability_shadow_table),
     ],
     "adaptive_learning": [
         (1, "创建 schema_version 表", """
