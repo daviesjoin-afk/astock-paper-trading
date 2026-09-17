@@ -377,5 +377,201 @@ class ArchiveIsTheSingleEntryPoint(unittest.TestCase):
             self.assertNotIn("class TradabilityArchiveRepository", source, name)
 
 
+# ───────────────────────── ingestion 边界护栏 ─────────────────────────
+
+#: 摄取层的事实来源 Provider 类必须**永不**写 archive。检查其方法体里不得出现
+#: archive 表名字面量，也不得调用任何 ``.save(...)``（写 authority 只在
+#: IngestionService 编排层）。
+INGESTION_MODULE = "tradability_ingestion.py"
+
+
+def _provider_classes(tree):
+    """摄取模块里，基类名含 ``Provider`` 或以 ``Provider`` 结尾的类（事实源 adapter）。"""
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.ClassDef):
+            continue
+        bases = [ast.unparse(base) for base in node.bases]
+        if any("Provider" in base for base in bases) or node.name.endswith("Provider"):
+            yield node
+
+
+def _writes_archive(node) -> list:
+    """返回 Provider 类方法体里"写 archive"的违规表达式列表。
+
+    判据两条：出现 ``historical_tradability_archive`` 表名字面量，或调用 ``.save(...)``。
+    """
+    offenders = []
+    for child in ast.walk(node):
+        if isinstance(child, ast.Call):
+            func = child.func
+            if isinstance(func, ast.Attribute) and func.attr == "save":
+                offenders.append(ast.unparse(child))
+        if isinstance(child, ast.Constant) and isinstance(child.value, str):
+            if "historical_tradability_archive" in child.value:
+                offenders.append(repr(child.value))
+    return offenders
+
+
+class ProvidersNeverWriteTheArchive(unittest.TestCase):
+    def test_provider_classes_do_not_write_archive(self):
+        tree = _load_tree(INGESTION_MODULE)
+        offenders = []
+        for cls in _provider_classes(tree):
+            hits = _writes_archive(cls)
+            if hits:
+                offenders.append(f"{cls.name}: {hits}")
+        self.assertEqual([], offenders, "Provider 不得写 archive，写 authority 只在 ingestion 编排层")
+
+    def test_guard_detects_a_provider_writing_archive(self):
+        """护栏必须真的能失败：合成一个写 archive 的 Provider，应被抓到。"""
+        source = (
+            "class FooProvider:\n"
+            "    def fetch(self):\n"
+            "        x = 'historical_tradability_archive'\n"
+            "        return x\n"
+        )
+        tree = ast.parse(source)
+        cls = next(n for n in ast.walk(tree) if isinstance(n, ast.ClassDef))
+        self.assertTrue(_writes_archive(cls))
+
+    def test_guard_ignores_ingestion_service_write(self):
+        """编排层 IngestionService 的 save 不在 Provider 边界内，不应误报。"""
+        tree = _load_tree(INGESTION_MODULE)
+        provider_hits = {
+            cls.name: _writes_archive(cls) for cls in _provider_classes(tree)
+        }
+        self.assertTrue(all(not hits for hits in provider_hits.values()), provider_hits)
+
+
+#: 执行/学习链路不得 import/consume ingestion 结果作为正式交易 gate。
+EXECUTION_LEARNING_MODULES = (
+    "paper_trading.py",
+    "adaptive_engine.py",
+    "strategies.py",
+    "execution_dispatch.py",
+    "execution_evidence.py",
+    "execution_lifecycle.py",
+    "execution_outcome.py",
+    "execution_planner.py",
+    "execution_profiles.py",
+    "execution_verification.py",
+    "learning_dataset.py",
+    "learning_evaluation.py",
+)
+
+
+class ExecutionAndLearningDoNotConsumeIngestion(unittest.TestCase):
+    def test_no_execution_or_learning_module_imports_ingestion(self):
+        offenders = []
+        for name in EXECUTION_LEARNING_MODULES:
+            tree = _load_tree(name)
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Import):
+                    for alias in node.names:
+                        if "tradability_ingestion" in alias.name:
+                            offenders.append(f"{name}: import {alias.name}")
+                elif isinstance(node, ast.ImportFrom) and node.module:
+                    if "tradability_ingestion" in node.module:
+                        offenders.append(f"{name}: from {node.module}")
+        self.assertEqual(
+            [], offenders,
+            "执行/学习链路不得 import tradability_ingestion 作为正式交易 gate",
+        )
+
+
+# ───────────────────────── Docker runtime 边界护栏 ─────────────────────────
+#
+# docker-smoke 在镜像内（Dockerfile 只 COPY backend/frontend/deploy）跑
+# `unittest discover -s backend`。任何 backend test 依赖 work/ 下的模块都会让
+# 整个测试文件在镜像内 ImportError，把不依赖 work/ 的契约测试一并带走。
+# 这条护栏禁止 backend test 再次 `sys.path.append("../work")` + import
+# 操作员脚本；回填编排逻辑必须住在 backend/（见 tradability_backfill.py）。
+
+#: work/ 下不可被 backend test import 的模块名。
+WORK_ONLY_MODULES = ("backfill_tradability_archive",)
+
+
+def _test_module_paths() -> list:
+    return sorted((BACKEND).glob("test_*.py"))
+
+
+def _imports_work_module(tree) -> list:
+    offenders = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name.split(".")[0] in WORK_ONLY_MODULES:
+                    offenders.append(f"import {alias.name}")
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            if node.module.split(".")[0] in WORK_ONLY_MODULES:
+                offenders.append(f"from {node.module}")
+    return offenders
+
+
+def _appends_work_to_sys_path(tree) -> list:
+    offenders = []
+    for node in ast.walk(tree):
+        # sys.path.insert(0, "...work...") / sys.path.append("...work...")
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        if not isinstance(func, ast.Attribute) or func.attr not in ("insert", "append"):
+            continue
+        for arg in node.args:
+            for part in ast.walk(arg):
+                if isinstance(part, ast.Constant) and isinstance(part.value, str):
+                    if "work" in part.value.replace("\\", "/").lower():
+                        offenders.append(ast.unparse(node))
+    return offenders
+
+
+class BackendTestsMustNotDependOnWorkModules(unittest.TestCase):
+    def test_no_backend_test_imports_a_work_only_module(self):
+        offenders = []
+        for path in _test_module_paths():
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+            hits = _imports_work_module(tree)
+            for hit in hits:
+                offenders.append(f"{path.name}: {hit}")
+        self.assertEqual(
+            [], offenders,
+            "backend test 不得 import work/ 下的模块；编排逻辑必须在 backend/",
+        )
+
+    def test_no_backend_test_appends_work_to_sys_path(self):
+        offenders = []
+        for path in _test_module_paths():
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+            hits = _appends_work_to_sys_path(tree)
+            for hit in hits:
+                offenders.append(f"{path.name}: {hit}")
+        self.assertEqual(
+            [], offenders,
+            "backend test 不得 sys.path.append(work/)，否则镜像内 discover 会 ImportError",
+        )
+
+    def test_guard_detects_a_work_import(self):
+        source = "import backfill_tradability_archive\n"
+        self.assertTrue(_imports_work_module(ast.parse(source)))
+
+    def test_guard_detects_a_work_sys_path_append(self):
+        source = (
+            "import sys\n"
+            "sys.path.append('/repo/work')\n"
+        )
+        self.assertTrue(_appends_work_to_sys_path(ast.parse(source)))
+
+    def test_guard_ignores_benign_imports(self):
+        source = "import tradability_backfill\nimport tradability_archive\n"
+        self.assertEqual([], _imports_work_module(ast.parse(source)))
+
+    def test_guard_ignores_benign_sys_path(self):
+        source = (
+            "import sys\n"
+            "sys.path.append('/repo/backend')\n"
+        )
+        self.assertEqual([], _appends_work_to_sys_path(ast.parse(source)))
+
+
 if __name__ == "__main__":
     unittest.main()

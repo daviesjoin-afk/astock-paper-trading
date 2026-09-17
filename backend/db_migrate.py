@@ -66,6 +66,17 @@ def _ensure_tradability_archive(conn):
     return TA.ensure_schema(conn)
 
 
+def _ensure_tradability_ingestion_runs(conn):
+    """v14：历史可交易性摄取运行审计表。
+
+    纯新增（``CREATE TABLE IF NOT EXISTS``），不触碰 archive 核心表语义；
+    表结构由 :func:`tradability_ingestion.ensure_ingestion_schema` 持有。
+    """
+    import tradability_ingestion as TI
+
+    return TI.ensure_ingestion_schema(conn)
+
+
 # 迁移注册表：db_name -> [(version, description, sql_or_callable), ...]
 MIGRATIONS = {
     "paper_trading": [
@@ -103,6 +114,9 @@ MIGRATIONS = {
         # 历史可交易性事实资产层：历史日期上"这只票当时是否真的可交易"的证据。
         # 纯新增表，不改写任何既有行；Provider 不得直接建表，一律走本迁移。
         (13, "新增历史可交易性事实资产表（幂等）", _ensure_tradability_archive),
+        # 历史可交易性证据摄取运行审计：记录每次 backfill 的 provider 集合、
+        # 计数、冲突、unprovable 与指纹。纯新增，不触碰 archive 核心表。
+        (14, "新增历史可交易性摄取运行审计表（幂等）", _ensure_tradability_ingestion_runs),
     ],
     "adaptive_learning": [
         (1, "创建 schema_version 表", """
