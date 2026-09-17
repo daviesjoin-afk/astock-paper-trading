@@ -945,7 +945,18 @@ def _entry_freeze_enabled():
 
 
 def _manifest_semantic_match(cached_signature, current_signature) -> bool:
-    """Return True if both signatures are structured dicts with identical content_fingerprint and version."""
+    """Return True if both signatures match semantically across dict and legacy list formats."""
+    # 旧 list 格式的缓存配上新 dict 格式的当前签名，也要能语义匹配：否则
+    # 升级后所有历史缓存都被判成不匹配，触发一次全量重算。
+    if isinstance(cached_signature, (list, tuple)) and isinstance(current_signature, dict):
+        if len(cached_signature) >= 3:
+            cached_size = cached_signature[1]
+            cached_version = cached_signature[2]
+            if (
+                cached_size == current_signature.get("size")
+                and str(cached_version) == str(current_signature.get("version"))
+            ):
+                return True
     return bool(
         isinstance(cached_signature, dict)
         and isinstance(current_signature, dict)

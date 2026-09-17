@@ -28,6 +28,17 @@ LEVEL_LABELS = {
     "tightened": "收紧",
     "blocked": "禁止开仓",
 }
+# 行情来源白名单。只认 == "live" 会把生产里真实在用的 eastmoney-clist /
+# tencent_public_quote 等来源当成"没有实时行情"，风控面板据此误判行情覆盖率。
+LIVE_QUOTE_SOURCES = frozenset({
+    "live",
+    "dashboard_cache",
+    "live_snapshot",
+    "eastmoney-clist",
+    "tencent_public_quote",
+    "eastmoney",
+    "tencent",
+})
 MARKET_SCALES = MARKET_LIGHT_SCALES
 # The execution ledger is a single shared pool.  Strategy profiles still
 # control per-name, industry and stop-risk sizing, but they must not turn the
@@ -310,11 +321,12 @@ def refresh_snapshot(*, market, positions, universe, snapshot_at, news_events, n
     quote_times = [
         _parse_time(position.get("quote_at"))
         for position in positions
-        if position.get("quote_source") == "live" and position.get("quote_at")
+        if position.get("quote_source") in LIVE_QUOTE_SOURCES and position.get("quote_at")
     ]
     latest_quote = max((value for value in quote_times if value), default=None)
     quote_coverage = (
-        sum(position.get("quote_source") == "live" for position in positions) / len(positions) * 100
+        sum(position.get("quote_source") in LIVE_QUOTE_SOURCES for position in positions)
+        / len(positions) * 100
         if positions else 100.0
     )
     flow_coverage = (
@@ -333,7 +345,10 @@ def refresh_snapshot(*, market, positions, universe, snapshot_at, news_events, n
     news_stale = bool(news_observed is None or (received - news_observed).total_seconds() > 15 * 60)
     index_observed = _parse_time((market or {}).get("live_index_time"))
     width_observed = _parse_time(snapshot_at)
-    live_positions = [position for position in positions if position.get("quote_source") == "live"]
+    live_positions = [
+        position for position in positions
+        if position.get("quote_source") in LIVE_QUOTE_SOURCES
+    ]
     quote_valid_count = sum(
         isinstance(position.get("price"), (int, float)) and position.get("price") > 0
         and isinstance(position.get("ret_pct"), (int, float)) and abs(position.get("ret_pct")) <= 30
@@ -672,7 +687,7 @@ def _position_queue(accounts, positions, news_events):
     }
     queue = []
     for row in positions:
-        fresh = row.get("quote_source") == "live" and bool(row.get("quote_at"))
+        fresh = row.get("quote_source") in LIVE_QUOTE_SOURCES and bool(row.get("quote_at"))
         risk_price = _number(row.get("risk_price"))
         price = _number(row.get("price"))
         available = int(_number(row.get("available_qty"), 0))
@@ -798,14 +813,22 @@ def build_dashboard(base_dashboard, snapshot):
         news_stale=bool((snapshot.get("news") or {}).get("stale")),
     )
     worst = _worst_level([card["level"] for card in cards] + [
-        # P3 审计修复（R4）：空仓时"持仓实时行情"源天然 unknown，不应
-        # 判成关键数据源失败把整个风控面板标 blocked。
+        # 只有数据源**严重失败**（failed）或动态风控熔断（halt）才禁止开仓；
+        # 数据源未就绪（unknown）或过期（stale）降级为**收紧额度**（tightened），
+        # 不把"暂时没拿到行情"误封成禁止开仓。
         "blocked" if any(
-            item.get("status") in {"failed", "unknown"}
+            item.get("status") == "failed"
             and item.get("name") in {"沪深300实时行情", "持仓实时行情"}
             and not (item.get("name") == "持仓实时行情" and not positions)
             for item in snapshot.get("data_quality") or []
-        ) else ("blocked" if dynamic.get("mode") == "halt" else ("watch" if dynamic.get("mode") == "caution" else "normal"))
+        ) else (
+            "tightened" if any(
+                item.get("status") in {"unknown", "stale"}
+                and item.get("name") in {"沪深300实时行情", "持仓实时行情"}
+                and not (item.get("name") == "持仓实时行情" and not positions)
+                for item in snapshot.get("data_quality") or []
+            ) else ("blocked" if dynamic.get("mode") == "halt" else ("watch" if dynamic.get("mode") == "caution" else "normal"))
+        )
     ])
     min_scale = min((card["risk_scale_pct"] for card in cards), default=0)
     overall_summary = {

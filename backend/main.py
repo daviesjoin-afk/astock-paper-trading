@@ -303,6 +303,29 @@ def _load_super_flow(topn):
     return cached or []
 
 
+def _selection_signature_matches(cached_signature, current_signature) -> bool:
+    """缓存 manifest 的 signature 是否与当前签名语义一致。
+
+    历史缓存里 ``signature`` 可能是**旧 list 格式**（``[..., size, version, ...]``），
+    也可能是**新 dict 格式**（``{"size": ..., "version": ...}``）。只按 tuple 比较会让
+    旧格式缓存永远不命中，于是每个周期都重算一遍选股因子（而且每次写回时把格式来回
+    翻转）。这里两种格式都接受，判据是 size 与 version 一致。
+    """
+    if isinstance(cached_signature, (list, tuple)):
+        if len(cached_signature) < 3:
+            return False
+        return (
+            cached_signature[1] == current_signature[1]
+            and str(cached_signature[2]) == str(current_signature[2])
+        )
+    if isinstance(cached_signature, dict):
+        return (
+            cached_signature.get("size") == current_signature[1]
+            and str(cached_signature.get("version")) == str(current_signature[2])
+        )
+    return False
+
+
 def _load_selection_base():
     """Load compact persisted factors; rebuild only after the K-line manifest changes."""
     signature = _selection_signature()
@@ -331,7 +354,7 @@ def _load_selection_base():
             if float(meta.get("eligible_factor_coverage_pct") or 0.0) < 90.0:
                 raise ValueError("选股因子缓存覆盖率不足90%")
             if (
-                tuple(meta.get("signature", ())) == signature
+                _selection_signature_matches(meta.get("signature"), signature)
                 and os.path.exists(_SELECTION_FACTORS_PATH)
             ):
                 price_factors = pd.read_csv(
@@ -389,10 +412,17 @@ def _load_selection_base():
         price_factors.to_csv(factors_tmp, encoding="utf-8")
         os.replace(factors_tmp, _SELECTION_FACTORS_PATH)
         meta_tmp = _SELECTION_META_PATH + ".tmp"
+        # 统一写成 paper_trading 认可的权威格式，避免新旧格式反复翻转。
+        try:
+            import paper_trading as PT
+
+            canonical_signature = PT._selection_factor_manifest_signature()
+        except Exception:
+            canonical_signature = None
         with open(meta_tmp, "w", encoding="utf-8") as handle:
             json.dump(
                 {
-                    "signature": list(signature),
+                    "signature": canonical_signature or list(signature),
                     "built_at": time.strftime("%Y-%m-%d %H:%M:%S"),
                     "factor_rows": len(price_factors),
                     "eligible_universe_rows": len(eligible_codes),
