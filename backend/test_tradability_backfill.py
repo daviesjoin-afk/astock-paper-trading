@@ -1071,6 +1071,57 @@ class FingerprintCoversEveryAuditVisibleDifference(IngestionTestCase):
             self._fingerprint(service, conflicts=[other]),
         )
 
+    def test_conflict_session_is_part_of_the_fingerprint(self):
+        """同一组冲突**换到另一个 session** 也是审计可见变化。
+
+        ``detail_json`` 会持久化冲突的 ``session`` / ``effective_at`` /
+        ``observed_at``；指纹只取 field/providers/values 时，"冲突从 01-10 挪到
+        01-11"会被判成幂等重放，而审计行仍在描述旧 session 的冲突。
+        """
+        service = self._service()
+        on_first = TI.Conflict(
+            field="is_st", providers=("a", "b"), values=(True, False),
+            session="2024-01-10", effective_at="2024-01-10T15:05:00",
+            observed_at="2024-01-10T15:05:00",
+        )
+        on_second = TI.Conflict(
+            field="is_st", providers=("a", "b"), values=(True, False),
+            session="2024-01-11", effective_at="2024-01-11T15:05:00",
+            observed_at="2024-01-11T15:05:00",
+        )
+        self.assertNotEqual(
+            self._fingerprint(service, conflicts=[on_first]),
+            self._fingerprint(service, conflicts=[on_second]),
+        )
+        # effective_at / observed_at 单独变化同样要改变指纹。
+        shifted = TI.Conflict(
+            field="is_st", providers=("a", "b"), values=(True, False),
+            session="2024-01-10", effective_at="2024-01-10T15:05:00",
+            observed_at="2024-01-10T15:06:00",
+        )
+        self.assertNotEqual(
+            self._fingerprint(service, conflicts=[on_first]),
+            self._fingerprint(service, conflicts=[shifted]),
+        )
+
+    def test_conflict_ordering_is_canonical(self):
+        """同一个冲突集合换个到达顺序必须得到**相同**指纹（幂等重放不能漂移）。"""
+        service = self._service()
+        first = TI.Conflict(
+            field="is_st", providers=("a", "b"), values=(True, False),
+            session="2024-01-10", effective_at="2024-01-10T15:05:00",
+            observed_at="2024-01-10T15:05:00",
+        )
+        second = TI.Conflict(
+            field="has_trade_volume", providers=("a", "b"), values=(True, False),
+            session="2024-01-10", effective_at="2024-01-10T15:05:00",
+            observed_at="2024-01-10T15:05:00",
+        )
+        self.assertEqual(
+            self._fingerprint(service, conflicts=[first, second]),
+            self._fingerprint(service, conflicts=[second, first]),
+        )
+
     def test_provider_version_is_part_of_the_fingerprint(self):
         first = self.make_service(
             [_VersionedProvider("1")], cutoff="2025-06-01T09:00:00+08:00"
@@ -1079,6 +1130,56 @@ class FingerprintCoversEveryAuditVisibleDifference(IngestionTestCase):
             [_VersionedProvider("2")], cutoff="2025-06-01T09:00:00+08:00"
         )
         self.assertNotEqual(self._fingerprint(first), self._fingerprint(second))
+
+
+class AutocommitConnectionIsRejected(IngestionTestCase):
+    """P2（第三轮 review）：同连接还不够，必须是**显式事务**连接。
+
+    ``isolation_level=None`` 是 SQLite 的 autocommit 模式：每次 ``repository.save()``
+    与审计插入都各自立即提交。若 ``_persist_run`` 随后失败（例如审计表上的 trigger
+    中止插入），事实已经 durable、``rollback()`` 无效、审计行也不存在。
+    """
+
+    def _autocommit_conn(self):
+        conn = sqlite3.connect(":memory:")
+        self.addCleanup(conn.close)
+        conn.isolation_level = None  # autocommit
+        conn.row_factory = sqlite3.Row
+        TA.ensure_schema(conn)
+        TI.ensure_ingestion_schema(conn)
+        return conn
+
+    def test_autocommit_write_is_rejected_with_no_side_effect(self):
+        conn = self._autocommit_conn()
+        repo = TA.TradabilityArchiveRepository(conn)
+        before = _db_snapshot(conn)
+        service = TI.IngestionService(
+            [_OutcomeFlippingProvider()], repo,
+            cutoff="2025-06-01T09:00:00+08:00", audit_conn=conn,
+        )
+        with self.assertRaises(TI.IngestionError):
+            service.ingest(["000001"], ["2024-01-10"], write=True, run_id="autocommit")
+        self.assertEqual(before, _db_snapshot(conn))
+
+    def test_autocommit_dry_run_is_still_allowed(self):
+        """dry-run 不写任何东西，因此不需要事务。"""
+        conn = self._autocommit_conn()
+        repo = TA.TradabilityArchiveRepository(conn)
+        service = TI.IngestionService(
+            [_OutcomeFlippingProvider()], repo,
+            cutoff="2025-06-01T09:00:00+08:00", audit_conn=conn,
+        )
+        result = service.ingest(["000001"], ["2024-01-10"], write=False, run_id="dry")
+        self.assertIsNotNone(result.run_fingerprint)
+
+    def test_explicit_transaction_connection_is_accepted(self):
+        """非空洞性：默认连接（isolation_level=''）必须照常工作。"""
+        service = TI.IngestionService(
+            [_OutcomeFlippingProvider()], self.repo,
+            cutoff="2025-06-01T09:00:00+08:00", audit_conn=self.conn,
+        )
+        result = service.ingest(["000001"], ["2024-01-10"], write=True, run_id="explicit")
+        self.assertEqual(TI.STATUS_COMPLETED_WITH_GAPS, result.status)
 
 
 class AuditConnectionMustMatchArchiveConnection(IngestionTestCase):

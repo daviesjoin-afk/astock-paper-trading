@@ -79,6 +79,8 @@ TEST_MODULES_BY_ID = {
     "M-R7": ('test_tradability_backfill',),
     "M-R8": ('test_tradability_backfill',),
     "M-R9": ('test_tradability_backfill',),
+    "M-R10": ('test_tradability_backfill',),
+    "M-R11": ('test_tradability_backfill',),
 }
 
 # 每个条目 import-check 的目标模块（排除"生产代码变异后语法错误无法 import"的假杀）。
@@ -353,8 +355,24 @@ MUTATIONS = (
     (
         "M-R2",
         INGESTION,
-        '            self._assert_replay_identity(run_id, run_fingerprint)\n            for evidence in normalized_evidence:\n                if self._repo.save(evidence):\n                    persisted.append(evidence)\n                else:\n                    skipped_records += 1  # 幂等重放：唯一键命中，逻辑状态不变。\n',
-        '            for evidence in normalized_evidence:\n                if self._repo.save(evidence):\n                    persisted.append(evidence)\n                else:\n                    skipped_records += 1\n            if self._repo.count() < 0:  # MUTANT M-R2: divergent replay 写 archive\n                self._assert_replay_identity(run_id, run_fingerprint)\n',
+        '            self._assert_replay_identity(run_id, run_fingerprint)\n'
+        '            # autocommit 连接上没有事务可回滚，事实与审计无法原子提交 → 显式拒绝。\n'
+        '            if self._enforce_explicit_transactions:\n'
+        '                raise IngestionError(\n'
+        '                    "write=True 需要显式事务：该连接处于 autocommit（isolation_level=None），"\n'
+        '                    "事实写入与审计插入会各自立即提交，任一后续失败都无法整体回滚"\n'
+        '                )\n'
+        '            for evidence in normalized_evidence:\n'
+        '                if self._repo.save(evidence):\n'
+        '                    persisted.append(evidence)\n'
+        '                else:\n'
+        '                    skipped_records += 1  # 幂等重放：唯一键命中，逻辑状态不变。\n',
+        '            for evidence in normalized_evidence:\n'
+        '                if self._repo.save(evidence):\n'
+        '                    persisted.append(evidence)\n'
+        '                else:\n'
+        '                    skipped_records += 1  # 幂等重放：唯一键命中，逻辑状态不变。\n'
+        '            self._assert_replay_identity(run_id, run_fingerprint)\n',
         "divergent replay 写 archive 但不更新 audit（先写事实再检查 run_id 冲突）",
     ),
     (
@@ -500,7 +518,12 @@ MUTATIONS = (
     (
         "M-R8",
         INGESTION,
-        '            "conflicts": [\n                {"field": c.field, "providers": list(c.providers), "values": list(c.values)}\n                for c in (conflicts or ())\n            ],\n',
+        '            "conflicts": sorted(\n'
+        '                (\n'
+        '                    json.dumps(c.identity_payload(), sort_keys=True, ensure_ascii=False, default=str)\n'
+        '                    for c in (conflicts or ())\n'
+        '                )\n'
+        '            ),\n',
         '            "conflicts": [],  # MUTANT M-R8: conflict 明细不进指纹\n',
         "conflict 明细不进内容身份（冲突集合变化被当成幂等重放）",
     ),
@@ -510,6 +533,20 @@ MUTATIONS = (
         '        if audit_conn is not None and audit_conn is not repository.connection:\n            raise IngestionError(\n                "audit_conn 必须与 repository 使用同一个连接：replay identity 的查询与"\n                "事实写入必须在同一个库、同一个事务内，否则事实与审计无法原子提交"\n            )\n',
         '        if False:  # MUTANT M-R9: 允许跨库审计连接\n            pass\n',
         "允许审计连接与归档连接不同（跨库提交，replay identity 查错库）",
+    ),
+    (
+        "M-R10",
+        INGESTION,
+        '                    json.dumps(c.identity_payload(), sort_keys=True, ensure_ascii=False, default=str)\n',
+        '                    json.dumps({"field": c.field, "providers": list(c.providers), "values": list(c.values)}, sort_keys=True)  # MUTANT M-R10\n',
+        "冲突明细退回部分字段（session/effective_at/observed_at 不进指纹）",
+    ),
+    (
+        "M-R11",
+        INGESTION,
+        '            if self._enforce_explicit_transactions:\n',
+        '            if False:  # MUTANT M-R11: 不拒绝 autocommit 连接\n',
+        "不拒绝 autocommit 连接（事实与审计无法原子提交）",
     ),
 )
 

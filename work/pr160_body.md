@@ -25,7 +25,7 @@ Shadow Tradability Validation      ← 本 PR
 | 项 | 值 |
 | --- | --- |
 | base | `master` @ `1dc4b053f125fe0d38a42c9244737ae9433e9a19` |
-| head | `codex/tradability-shadow-validation` @ `ddff6bab34ef1642e1100d4a0da4823869f82545` |
+| head | `codex/tradability-shadow-validation` @ `c65f40d3583821131e0e130d4900fc656e9d9cc7` |
 
 开始前已 `git fetch` 确认 master 未漂移（`origin/master` == 上述 base SHA，即 #157 的
 merge commit）。
@@ -174,7 +174,7 @@ else:
 | M-SESSION1 empty session range accepted | CAUGHT |
 | M-SESSION2 zero-session write creates audit row | CAUGHT |
 
-**矩阵总结果：44/44 CAUGHT，0 survived**（含既有 TTI1–TTI12 / M-D1 / M-F1..F3 / M-S1 /
+**矩阵总结果：47/47 CAUGHT，0 survived**（含既有 TTI1–TTI12 / M-D1 / M-F1..F3 / M-S1 /
 M-DR1 / M-C1..C5）。`S0` 哨兵（只改注释）按预期 UNDETECTED。
 每条变异都做 byte-for-byte 还原并核对 sha256：40 次 restore 全部 `bytes_match=True
 sha256_match=True`，0 次失败。无 equivalent mutation。
@@ -373,6 +373,26 @@ M-R6 原本 `IMPORT-FAILED`（无法 import 的注入不算 kill），M-SH9 原�
 
 ---
 
+## Review round 2 — 1 P1 + 2 P2 全部修复
+
+| 级别 | 发现 | 修复 |
+| --- | --- | --- |
+| P1 | unprovable / conflict 明细不进内容身份 | 指纹覆盖 unprovable pair 列表与 conflict 明细（field/providers/values）——凡进审计行的差异都是内容身份 |
+| P2 | CLI 仍从当前归档推导 `ingested_later` | CLI 不再声明（`ingested_later=False`）；`archive_unprovable` 需要真正的摄取台账，列为 follow-up |
+| P2 | 审计连接可以与归档连接不同 | 构造时即拒绝不一致的连接；生产本来就传同一个连接 |
+
+顺带两个**由变异矩阵而非 review 发现**的质量修正：
+
+- `M-R8`（conflicts 不进指纹）最初 **SURVIVED**——provider 集合变化会同时改 normalized
+  evidence，间接用例因此"因为错误的原因通过"。新增
+  `FingerprintCoversEveryAuditVisibleDifference`，直接驱动 `_run_fingerprint` 并断言每个
+  审计可见输入都会改变指纹（含两个**不同冲突值集合**必须哈希不同）。
+- 变异矩阵现在运行时持有锁文件，revert 脚本在锁存在时**拒绝启动**。曾经并发运行导致
+  revert 脚本把变异体当成"原始内容"记下并"还原"回去，留下永久损坏的源码；现在这种
+  情况是一次明确拒绝，而不是一次静默损坏。
+
+---
+
 ## Known evidence gaps
 
 归档当前仍**不能**证明（Shadow 把它们如实归入 not_comparable，而不是分歧）：
@@ -386,6 +406,16 @@ M-R6 原本 `IMPORT-FAILED`（无法 import 的注入不算 kill），M-SH9 原�
 
 这些缺口在 summary 里以 `archive_unknown` / `archive_unprovable` / `archive_missing`
 显式计数，**不进** agreement/disagreement 分母。
+
+### Follow-up（本 PR 不做，已记录）
+
+1. **摄取台账**：`archive_unprovable` 现在只能由调用方显式声明。要诚实地自动判定
+   "这条 pair 有证据、只是晚于 decision_at 才被观察到"，需要一个记录该 pair **首次被
+   观察到**时间的摄取台账——那是当前状态无法重建的事实。在它存在之前，CLI 一律报
+   `archive_missing`（两者都是 not_comparable，不影响一致率分母）。
+2. **市场级 vs 持仓级的 T+1**：Shadow CLI 比的是市场层面可交易性，因此不声明
+   `entry_session`。若将来要覆盖持仓层面的 T+1 分歧，需要接入真实持仓入场时点，而不是
+   在 CLI 里编一个。
 
 ---
 
@@ -436,13 +466,13 @@ OK: 12 reverts all caught; all files restored byte-for-byte
 
 ```
 $ python -m unittest discover -s backend -p "test_*.py"
-Ran 2958 tests in 185.453s
+Ran 2969 tests in 192.397s
 
 OK (skipped=5)
 ```
 
 - base（master @ 1dc4b05）计数：**2847**
-- 本 PR head 计数：**2958**（+111）
+- 本 PR head 计数：**2969**（+122）
 - 数字来自与 CI 相同的 runner（`unittest discover`），不是 pytest。
 
 ```

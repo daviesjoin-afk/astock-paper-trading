@@ -90,6 +90,12 @@ REVERTS = [
         "R5 archive writes happen after replay validation",
         INGESTION,
         "            self._assert_replay_identity(run_id, run_fingerprint)\n"
+        "            # autocommit 连接上没有事务可回滚，事实与审计无法原子提交 → 显式拒绝。\n"
+        "            if self._enforce_explicit_transactions:\n"
+        "                raise IngestionError(\n"
+        "                    \"write=True 需要显式事务：该连接处于 autocommit（isolation_level=None），\"\n"
+        "                    \"事实写入与审计插入会各自立即提交，任一后续失败都无法整体回滚\"\n"
+        "                )\n"
         "            for evidence in normalized_evidence:\n"
         "                if self._repo.save(evidence):\n"
         "                    persisted.append(evidence)\n"

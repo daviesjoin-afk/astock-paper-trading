@@ -573,6 +573,16 @@ class Conflict:
             "observed_at": self.observed_at,
         }
 
+    def identity_payload(self) -> dict:
+        """进入**内容身份**的冲突明细。
+
+        与 :meth:`to_dict` 同源——``detail_json`` 会持久化 ``session`` /
+        ``effective_at`` / ``observed_at``，因此这些字段也必须参与 replay identity。
+        只保留 field/providers/values 会让"同一组冲突从一个 session 挪到另一个
+        session"被当成幂等重放，而审计行里描述的仍是旧 session 的冲突。
+        """
+        return self.to_dict()
+
 
 def _compose_fields(results: Sequence[ProviderResult]) -> tuple[dict, list, list]:
     """把多个 Provider 的 partial evidence 确定性合并。
@@ -826,6 +836,17 @@ class IngestionService:
                 "事实写入必须在同一个库、同一个事务内，否则事实与审计无法原子提交"
             )
         self._audit_conn = audit_conn
+        # 同一个连接**还不够**：``isolation_level=None`` 是 SQLite 的 autocommit 模式，
+        # 那里每次 ``repository.save()`` 与审计插入都各自立即提交。若 ``_persist_run``
+        # 随后失败（审计表上的 trigger / 约束中止插入），事实已经durable、``rollback()``
+        # 无效、审计行也不存在——"整个事务 rollback"就成了空话。
+        #
+        # 判据：构造时探测连接是否处于显式事务模式。``in_transaction`` 只反映"此刻有没有
+        # 打开事务"，因此不能只看它；这里直接读 ``isolation_level``（``None`` = autocommit）。
+        self._enforce_explicit_transactions = (
+            audit_conn is not None
+            and getattr(audit_conn, "isolation_level", "") is None
+        )
 
     @property
     def provider_versions(self) -> Mapping[str, str]:
@@ -990,6 +1011,12 @@ class IngestionService:
         # 与 audit 行都不会变（不依赖调用方是否记得 rollback）。
         if write:
             self._assert_replay_identity(run_id, run_fingerprint)
+            # autocommit 连接上没有事务可回滚，事实与审计无法原子提交 → 显式拒绝。
+            if self._enforce_explicit_transactions:
+                raise IngestionError(
+                    "write=True 需要显式事务：该连接处于 autocommit（isolation_level=None），"
+                    "事实写入与审计插入会各自立即提交，任一后续失败都无法整体回滚"
+                )
             for evidence in normalized_evidence:
                 if self._repo.save(evidence):
                     persisted.append(evidence)
@@ -1256,10 +1283,16 @@ class IngestionService:
             "evidence_fingerprints": sorted(TA.evidence_fingerprint(e) for e in normalized),
             "outcomes": dict(sorted((outcomes or {}).items())),
             "unprovable": sorted(str(pair) for pair in (unprovable or ())),
-            "conflicts": [
-                {"field": c.field, "providers": list(c.providers), "values": list(c.values)}
-                for c in (conflicts or ())
-            ],
+            # 完整冲突明细（含 session / effective_at / observed_at），并**规范化排序**：
+            # detail_json 持久化的是 to_dict() 的全字段，指纹只取一部分就会漏掉
+            # "冲突挪到另一个 session" 这类审计可见变化；不排序则依赖列表顺序，
+            # 同一个冲突集合换个到达顺序就会得到不同指纹，破坏幂等重放。
+            "conflicts": sorted(
+                (
+                    json.dumps(c.identity_payload(), sort_keys=True, ensure_ascii=False, default=str)
+                    for c in (conflicts or ())
+                )
+            ),
         }
         return _sha256(payload)
 
