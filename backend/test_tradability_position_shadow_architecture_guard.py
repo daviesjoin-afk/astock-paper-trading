@@ -576,19 +576,45 @@ class SellReplayTimingAndScopeAreEnforced(unittest.TestCase):
         # 只有 proven 允许扣减；ambiguous / unprovable 必须 fail closed。
         self.assertIn("if attribution == CYCLE_ATTRIBUTION_MISMATCH:", source)
 
-    def test_competing_cycle_requires_provable_start(self):
-        """竞争周期必须能证明自己的起点，否则只记诊断、不否决归属。"""
+    def test_unknown_competitor_boundary_is_never_silently_skipped(self):
+        """起点不可证明的竞争周期必须**影响结论**，不能只记诊断就放过。
+
+        ``Absence of competing-cycle evidence is not evidence of absence of a
+        competing cycle.`` 旧实现把它放进 ``skipped`` 后继续采信请求周期 —— 那
+        正是本 PR 修掉的静默升级。
+        """
         source = _source(ADAPTER_MODULE)
         marker = "def _competing_cycles("
-        body = source[source.index(marker):source.index(marker) + 2600]
+        body = source[source.index(marker):source.index(marker) + 4000]
         self.assertIn("if start is None:", body)
-        self.assertIn("skipped.append(other)", body)
+        # 无法证明排除 ⇒ 计入 unprovable，且该结果参与 attribution 判定。
+        self.assertIn("unprovable.append(other)", body)
+        self.assertNotIn("skipped.append(other)", body)
+        self.assertNotIn("cycle_skipped", source)
+        # 归属判定必须消费它：出现 unprovable 竞争者时不得给 proven。
+        self.assertIn("elif unprovable:", source)
+        self.assertIn('diagnostics.append("competing_cycle_unprovable")', source)
 
     def test_cycle_column_is_discovered_not_assumed(self):
-        """不得写死 ``o.cycle_id``（生产库没有该列，写死会 no such column）。"""
+        """``o.cycle_id`` 只能**按 PRAGMA 发现的结果**拼进 SELECT。
+
+        生产库没有该列，无条件查询会 ``no such column``；未来 schema 有该列时又
+        必须真的读到它（那是更强的 durable identity）。因此判据不是"字符串是否
+        出现"，而是"它是否被列存在性闸门保护"。
+        """
         source = _source(ADAPTER_MODULE)
-        self.assertNotIn("o.cycle_id AS order_cycle_id", source)
         self.assertIn("PRAGMA table_info(paper_orders)", source)
+        self.assertIn("if self._orders_have_cycle_column():", source)
+        # 该列只允许在闸门**内部**出现一次（动态 append），不得出现在静态 SQL 里。
+        self.assertEqual(source.count('"o.cycle_id AS order_cycle_id"'), 1)
+        marker = "def _sell_fills_for("
+        body = source[source.index(marker):source.index(marker) + 2600]
+        gate = body.index("if self._orders_have_cycle_column():")
+        column = body.index('"o.cycle_id AS order_cycle_id"')
+        self.assertGreater(column, gate,
+                           "cycle 列必须在存在性闸门之后才被拼接")
+        # 静态 SQL 里不得直接出现该列（那会让无列的生产库查询失败）。
+        self.assertNotIn("o.cycle_id AS order_cycle_id ", body[:gate])
 
 
 class ShadowIdentityIsAccountAndCycleScoped(unittest.TestCase):

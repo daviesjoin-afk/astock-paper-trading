@@ -36,6 +36,52 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "backend"))
 import tradability_position_evidence as PE  # noqa: E402
 
 
+#: 规格 §21 要求的 unprovable 归因分类。**按优先级**匹配：一个组只归一类
+#: （具体原因优先于状态名，状态名优先于通用结论），否则总数会被重复计数。
+#: 每条内部元组是 ``(优先级, 诊断名, 类别)``，数字越小越具体。
+_REASON_PRIORITY = (
+    # 归属本身无法证明：竞争周期边界缺失 / 显式身份冲突
+    (10, "competing_cycle_unprovable", "cycle_attribution_unprovable"),
+    (11, "sell_fill_cycle_identity_conflict", "cycle_attribution_unprovable"),
+    # 多个可证明窗口都能覆盖该卖出
+    (20, "sell_fill_cycle_ambiguous", "cycle_attribution_ambiguous"),
+    # 请求周期自身窗口/起点不可证明（没有更具体的原因时才算它）
+    (30, "sell_fill_cycle_unprovable", "cycle_attribution_unprovable"),
+    # 重放终态与账本对不上 ⇒ 成交证据不完整
+    (40, "replay_does_not_match_ledger", "replay_ledger_mismatch"),
+    (41, "sell_fill_exceeds_available_lots", "replay_ledger_mismatch"),
+    (42, "unverified_sell_fill_excluded", "replay_ledger_mismatch"),
+    # 成交身份冲突（别的账户 / 别的股票）
+    (50, "sell_fill_identity_mismatch", "identity_mismatch"),
+    (51, "source_order_identity_mismatch", "identity_mismatch"),
+    (52, "fill_identity_mismatch", "identity_mismatch"),
+    # 事件时间无法确定先后
+    (60, "sell_fill_session_invalid", "unknown_event_ordering"),
+    (61, "same_session_sell_time_unknown", "unknown_event_ordering"),
+    (62, "same_session_sell_not_orderable", "unknown_event_ordering"),
+    (63, "future_lot_consumption_required", "unknown_event_ordering"),
+)
+
+#: 分类的**固定输出顺序**（缺席也打印 0，便于跨轮对比）。
+_REASON_CATEGORIES = (
+    "cycle_attribution_unprovable",
+    "cycle_attribution_ambiguous",
+    "replay_ledger_mismatch",
+    "identity_mismatch",
+    "unknown_event_ordering",
+    "other",
+)
+
+
+def _categorize_diagnostics(diagnostics) -> str:
+    """把一个 unprovable 组归到**唯一**一类（按最具体的原因）。"""
+    present = set(diagnostics or ())
+    for _, name, category in sorted(_REASON_PRIORITY):
+        if name in present:
+            return category
+    return "other"
+
+
 def _rows(conn, sql, args=()):
     try:
         return [dict(row) for row in conn.execute(sql, args)]
@@ -151,6 +197,7 @@ def main(argv):
     # 不再由探针自己调私有方法、也不再用 2099 哨兵伪造决策时点。
     reconstructable = unprovable = 0
     reasons: dict = {}
+    by_category = {name: 0 for name in _REASON_CATEGORIES}
     attribution: dict = {}
     for scope in scopes:
         report = adapter.replay_diagnostics(
@@ -161,6 +208,8 @@ def main(argv):
             unprovable += 1
             for item in report["diagnostics"]:
                 reasons[item] = reasons.get(item, 0) + 1
+            # 每个**组**只归一类（规格 §21），否则同一组的多个诊断会被重复计数。
+            by_category[_categorize_diagnostics(report["diagnostics"])] += 1
         # 周期归属分布（proven / mismatch / ambiguous / unprovable）——由公开入口
         # 一并返回，探针不再自己调私有方法。
         for key, value in (report.get("attribution") or {}).items():
@@ -169,7 +218,12 @@ def main(argv):
     print(f"  reconstructable: {reconstructable}")
     print(f"  unprovable: {unprovable}")
     if reasons:
-        print(f"  unprovable reasons: {reasons}")
+        print(f"  unprovable reasons (raw): {reasons}")
+    # 按**原因**拆解（规格 §21）：只报一个总数无法说明真正缺的是哪种证据。
+    # 一个组只归一类，因此各类之和 == unprovable 组数。
+    print("  unprovable breakdown by reason (每组归一类):")
+    for name in _REASON_CATEGORIES:
+        print(f"    {name}: {by_category[name]}")
     print(f"  SELL cycle attribution: {attribution}")
     print("  ^ 以上数字由本轮 exact head 的 **cycle-scoped replay** 重新计算得出"
           "（公开入口 replay_diagnostics），非复用上一轮读数。")

@@ -11,6 +11,7 @@ v2 追加的攻击面（规格 §1–§7 的 blocker）：
 import os
 import sqlite3
 import sys
+from pathlib import Path
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -127,6 +128,12 @@ def add_sell_fill(conn, fid, oid, code, session, qty, *, account=ACCOUNT,
         (fid, oid, fill_account or account, "sell", fill_code or code, qty, 10.0,
          qty * 10.0, 0.0, session, None, "close"),
     )
+    # 未来 schema 的 ``paper_orders.cycle_id``：列存在时才写，用来验证适配器真的
+    # 从 SQL 读到这个 durable identity（而不是只靠时间窗推断）。
+    if order_cycle_id is not None:
+        conn.execute("UPDATE paper_orders SET cycle_id=? WHERE id=?",
+                     (int(order_cycle_id), oid))
+    conn.commit()
 
 
 def set_remaining(conn, lot_id, remaining):
@@ -555,7 +562,11 @@ def main():
     check("同日两笔卖出按真实时刻切分（11:00 回看 = 70，不是 100）",
           c.held_quantity == 70, "held=%s" % (c.held_quantity,))
 
-    # 攻击面 K：paused 且起点未知的其它周期不得凭空否决一笔可证明的归属
+    # 攻击面 K（round-4 反转）：paused 且起点未知的其它周期 ⇒ 归属 unprovable。
+    #
+    # 旧断言（"起点未知的周期不得否决可证明归属"）正是本 PR 修掉的静默升级：
+    # ``paused`` 描述当前状态，不是历史归属证据；起点缺失 ⇒ 无法证明它不包含该
+    # 卖出 ⇒ ``Absence of competing evidence is not evidence of absence``。
     conn = fresh()
     conn.execute("UPDATE paper_cycles SET started_at=? WHERE id=?", ("2026-09-15", CYCLE))
     conn.execute(
@@ -566,11 +577,110 @@ def main():
     add_sell_fill(conn, 9, 9, NORMAL, "2026-09-17", 1000)
     set_remaining(conn, 1, 0)
     c = ctx(adapter(conn), session="2026-09-17", decision_at=AS_OF)
-    check("起点未知的 paused 周期不否决可证明归属（held=0 且 proven）",
-          c.held_quantity == 0
-          and c.quantity_basis == PE.QUANTITY_BASIS_HISTORICAL_REPLAY,
-          "held=%s basis=%s diags=%s" % (c.held_quantity, c.quantity_basis,
-                                         c.diagnostics))
+    check("攻击 1/2：paused + 起点未知的竞争周期 ⇒ unprovable（status 不是时间证据）",
+          c.quantity_basis == PE.QUANTITY_BASIS_UNPROVABLE
+          and "competing_cycle_unprovable" in c.diagnostics,
+          "basis=%s diags=%s" % (c.quantity_basis, c.diagnostics))
+
+    # 攻击面 L（规格 §28 的 7 问，逐条对应）
+    def _competitor(conn_, *, status="running", started=None, ended=None,
+                    created="2026-09-15 00:00:00"):
+        """写入一个竞争周期行（``id=CYCLE+1``），用于归属判定攻击。
+
+        ``started`` / ``ended`` 故意可为 ``None`` —— 那正是生产 cycle 4 的形状
+        （paused + ``started_at`` NULL），用来验证边界缺失**降低**可比性。
+        """
+        conn_.execute(
+            "INSERT INTO paper_cycles(id,cycle_key,status,started_at,ended_at,created_at)"
+            " VALUES(?,?,?,?,?,?)",
+            (CYCLE + 1, "c-competitor", status, started, ended, created))
+        conn_.commit()
+
+    def _events(conn_, cycle=CYCLE):
+        """取一次归属判定结果（只读）。账户/代码用本文件的夹具常量。"""
+        ad = adapter(conn_)
+        return ad._sell_events(ACCOUNT, NORMAL, cycle_id=cycle)
+
+    # 问 1：竞争周期起点未知时是否还能被误报 proven？
+    conn = fresh()
+    _competitor(conn, started=None, ended=None)
+    add_lot(conn, 1, NORMAL, "2026-09-16", 1000, available_date="2026-09-17")
+    add_sell_fill(conn, 9, 9, NORMAL, "2026-09-17", 1000)
+    set_remaining(conn, 1, 0)
+    ev = _events(conn)[0]
+    check("问 1：竞争周期起点未知 ⇒ 不得 proven",
+          ev["cycle_attribution"] != PE.CYCLE_ATTRIBUTION_PROVEN
+          and ev["cycle_ok"] is False,
+          "attribution=%s" % (ev["cycle_attribution"],))
+
+    # 问 2：paused 是否被错误当成"不竞争"？
+    conn = fresh()
+    _competitor(conn, status="paused", started=None, ended=None)
+    add_lot(conn, 1, NORMAL, "2026-09-16", 1000, available_date="2026-09-17")
+    add_sell_fill(conn, 9, 9, NORMAL, "2026-09-17", 1000)
+    set_remaining(conn, 1, 0)
+    ev = _events(conn)[0]
+    check("问 2：paused 不得被当作不竞争",
+          ev["cycle_attribution"] != PE.CYCLE_ATTRIBUTION_PROVEN,
+          "attribution=%s" % (ev["cycle_attribution"],))
+
+    # 问 3：created_at 是否被偷偷升级成 economic started_at？
+    conn = fresh()
+    conn.execute("UPDATE paper_cycles SET started_at=NULL, created_at='2026-09-01 00:00:00'"
+                 " WHERE id=?", (CYCLE,))
+    add_lot(conn, 1, NORMAL, "2026-09-16", 1000, available_date="2026-09-17")
+    add_sell_fill(conn, 9, 9, NORMAL, "2026-09-17", 1000)
+    set_remaining(conn, 1, 0)
+    ev = _events(conn)[0]
+    check("问 3：created_at 不得补出 economic start（仍须 unprovable）",
+          ev["cycle_attribution"] == PE.CYCLE_ATTRIBUTION_UNPROVABLE,
+          "attribution=%s" % (ev["cycle_attribution"],))
+
+    # 问 4：cycle_skipped 是否仍可能只是日志、不影响结论？
+    src_text = Path(PE.__file__).read_text(encoding="utf-8")
+    check("问 4：不存在「只记诊断、不影响结论」的 skipped 概念",
+          "cycle_skipped" not in src_text
+          and "unprovable.append(other)" in src_text
+          and "elif unprovable:" in src_text,
+          "adapter source")
+
+    # 问 5：explicit future order_cycle_id 是否真的从 SQL 被读取？
+    conn = fresh()
+    conn.execute("ALTER TABLE paper_orders ADD COLUMN cycle_id INTEGER")
+    add_lot(conn, 1, NORMAL, "2026-09-16", 1000, available_date="2026-09-17")
+    add_sell_fill(conn, 9, 9, NORMAL, "2026-09-17", 1000, order_cycle_id=CYCLE)
+    set_remaining(conn, 1, 0)
+    ev = _events(conn)[0]
+    check("问 5：显式 order_cycle_id 真的从 SQL 读出并采信",
+          ev["cycle_attribution"] == PE.CYCLE_ATTRIBUTION_PROVEN,
+          "attribution=%s" % (ev["cycle_attribution"],))
+
+    # 问 6：order cycle identity 与时间窗冲突是否 fail closed？
+    conn = fresh()
+    conn.execute("ALTER TABLE paper_orders ADD COLUMN cycle_id INTEGER")
+    conn.execute("UPDATE paper_cycles SET started_at='2026-09-16', ended_at='2026-09-16'"
+                 " WHERE id=?", (CYCLE,))
+    add_lot(conn, 1, NORMAL, "2026-09-16", 1000, available_date="2026-09-17")
+    add_sell_fill(conn, 9, 9, NORMAL, "2026-09-17", 1000, order_cycle_id=CYCLE)
+    ev = _events(conn)[0]
+    check("问 6：显式身份与时间窗冲突 ⇒ fail closed",
+          ev["cycle_attribution"] == PE.CYCLE_ATTRIBUTION_UNPROVABLE
+          and "sell_fill_cycle_identity_conflict" in ev["cycle_diagnostics"],
+          "attribution=%s diags=%s" % (ev["cycle_attribution"], ev["cycle_diagnostics"]))
+
+    # 问 7：coverage 下降时是否有人为了保持旧比例放宽规则？
+    #   反向证明：放宽（把 unprovable 竞争者当 proven）会让上面问 1/问 2 立刻变红，
+    #   因此这里断言"收紧方向"确实生效，而不是靠旧比例。
+    conn = fresh()
+    _competitor(conn, started=None, ended=None)
+    add_lot(conn, 1, NORMAL, "2026-09-16", 1000, available_date="2026-09-17")
+    add_sell_fill(conn, 9, 9, NORMAL, "2026-09-17", 1000)
+    set_remaining(conn, 1, 0)
+    report = adapter(conn).replay_diagnostics(NORMAL, cycle_id=CYCLE, account_id=ACCOUNT)
+    check("问 7：收紧后的 fail-closed 真的降低 coverage（不得为旧比例放宽）",
+          report["consistent"] is False
+          and report["attribution"].get(PE.CYCLE_ATTRIBUTION_UNPROVABLE, 0) >= 1,
+          "consistent=%s attribution=%s" % (report["consistent"], report["attribution"]))
 
     failed = [name for name, ok in _checks if not ok]
     print("\n%d/%d checks passed" % (len(_checks) - len(failed), len(_checks)))

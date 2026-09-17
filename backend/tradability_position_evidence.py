@@ -669,15 +669,26 @@ class PositionEvidenceAdapter:
 
         ``cycle_id`` 参数保留仅为签名兼容（列存在时由 ``_sell_events`` 施加额外约束）。
         """
+        columns = [
+            "f.id AS fill_id", "f.order_id AS order_id",
+            "f.account_id AS fill_account_id", "f.code AS fill_code",
+            "f.side AS fill_side", "f.qty AS fill_qty",
+            "f.fill_date AS fill_date", "f.quote_at AS quote_at",
+            "o.account_id AS order_account_id", "o.code AS order_code",
+            "o.side AS order_side", "o.status AS order_status",
+            "o.executed_at AS executed_at",
+            "o.execution_status AS execution_status",
+            "o.execution_verified AS execution_verified",
+            "o.execution_evidence_source AS execution_evidence_source",
+        ]
+        # 未来 schema 的 ``paper_orders.cycle_id`` 是**更强**的历史周期身份，但它
+        # 现在不存在 —— 无条件 SELECT 会在真实生产库上报 ``no such column``，把整个
+        # 仓位层打成异常。因此按 PRAGMA 发现的结果**动态**拼列：存在才读，不存在
+        # 连 SQL 里都不出现，查询照常成功。
+        if self._orders_have_cycle_column():
+            columns.append("o.cycle_id AS order_cycle_id")
         return self._rows(
-            "SELECT f.id AS fill_id, f.order_id AS order_id, f.account_id AS fill_account_id,"
-            " f.code AS fill_code, f.side AS fill_side, f.qty AS fill_qty,"
-            " f.fill_date AS fill_date, f.quote_at AS quote_at,"
-            " o.account_id AS order_account_id, o.code AS order_code, o.side AS order_side,"
-            " o.status AS order_status, o.executed_at AS executed_at,"
-            " o.execution_status AS execution_status,"
-            " o.execution_verified AS execution_verified,"
-            " o.execution_evidence_source AS execution_evidence_source "
+            "SELECT " + ", ".join(columns) + " "
             "FROM paper_fills f JOIN paper_orders o ON o.id = f.order_id "
             "WHERE f.side='sell' AND f.account_id=? AND f.code=? "
             "ORDER BY f.fill_date, f.id",
@@ -713,10 +724,19 @@ class PositionEvidenceAdapter:
     def _cycle_window(self, cycle_id: Any) -> Optional[tuple]:
         """**请求周期**的 ``(start, end)``（日期粒度），用于界定卖出归属。
 
-        生产 ``paper_orders`` 没有 ``cycle_id``，因此周期归属只能靠**时间窗**。
-        ``started_at`` 缺失时退回 ``created_at``（规格允许：该周期开始存在的最早
-        时刻）；``ended_at`` 为 ``NULL`` 表示**开放窗口**（尚未结束）。两者都拿不到
-        ⇒ ``None``：此时请求周期自身不可证明，任何卖出归属都必须 fail closed。
+        生产 ``paper_orders`` / ``paper_fills`` 都没有 ``cycle_id``，因此历史周期
+        归属只能靠**时间窗**。
+
+        **起点的唯一权威是 ``started_at``**：生产只在周期真正开始承担订单/持仓
+        经济所有权时写它。``created_at`` 只是行插入时刻，只能证明「该周期行最迟
+        此刻已存在」，**不能**证明经济所有权已经开始 —— 所以它不再作为起点回退。
+        拿 ``created_at`` 补起点会把「起点未知」静默升级成 proven 归属。
+
+        ``started_at`` 缺失 ⇒ ``start=None``：该周期的历史 ownership window 不可
+        证明，任何基于它的归属都必须 fail closed。
+
+        ``ended_at`` 为 ``NULL`` 表示**开放窗口**（尚未结束），而不是「不可证明」。
+        周期行本身不存在 ⇒ ``None``。
         """
         if cycle_id is None:
             return None
@@ -726,8 +746,7 @@ class PositionEvidenceAdapter:
         for row in self._cycle_rows():
             if _int_or_none(_row_field(row, "id")) != _int_or_none(cycle_id):
                 continue
-            start = _session_of(_row_field(row, "started_at")) or _session_of(
-                _row_field(row, "created_at"))
+            start = _session_of(_row_field(row, "started_at"))
             end = _session_of(_row_field(row, "ended_at"))
             window = (start, end)
             break
@@ -735,45 +754,54 @@ class PositionEvidenceAdapter:
         return window
 
     def _competing_cycles(self, cycle_id: Any, session: Optional[str]) -> tuple:
-        """找出**同时**可能拥有该笔卖出的其它周期 → ``(ambiguous, skipped)``。
+        """把**其它每个周期**显式分类 → ``(ambiguous, unprovable)``。
 
-        生产 ``paper_fills`` / ``paper_orders`` 都没有 ``cycle_id``，所以一笔卖出
-        是否属于请求周期只能靠时间窗。若另一个周期的时间窗**也**能证明包含该
-        session，则这笔卖出的周期归属无法唯一确定 ⇒ ``ambiguous``，必须 fail
-        closed（禁止用 ``latest id`` / ``latest start`` / ``active cycle`` 猜）。
+        ``paper_fills`` / ``paper_orders`` 都没有 ``cycle_id``，所以一笔卖出是否
+        属于请求周期只能靠时间窗。对每一个其它周期，只有两种情况可以安全排除：
 
-        竞争周期的窗口**必须可证明**，因此要求它记录了 ``started_at``：
-        ``created_at`` 只是行插入时刻，不构成「该周期曾运作」的证明。已核实生产
-        数据里 cycles 5/6/7 正是「已运行并归档、但 ``started_at`` 为空」的行，
-        所以「空 start」只说明**起点的证据缺失**，不能用它去否决一笔真实归属。
-        被跳过的周期全部记入 ``skipped`` 诊断，绝不静默忽略。
+        * ``ended_at < session`` —— 它在该卖出之前就结束了；
+        * ``started_at > session`` —— 它在该卖出之后才开始。
 
-        ``ended_at`` 已记录且早于该 session 的周期**可证明不竞争**（无论起点是否
-        已知）—— 这是最常见的排除路径。
+        两者都拿不到时**不能**排除：``started_at IS NULL`` 只说明**起点证据缺失**
+        （生产里 cycles 5/6/7 正是「跑过并归档、但 ``started_at`` 为空」的行，
+        cycle 4 是 paused + ``started_at`` NULL），它既不证明包含，也**不证明不包含**。
+
+        因此本方法返回两个**都影响结论**的结果：
+
+        * ``ambiguous``  —— 有周期的时间窗可证明包含该卖出 ⇒ 归属无法唯一确定；
+        * ``unprovable`` —— 有周期的时间窗无法证明排除该卖出 ⇒ 归属无法证明。
+
+        ``Absence of competing-cycle evidence is not evidence of absence of a
+        competing cycle.`` 缺失的边界证据必须**降低**可比性，绝不放宽归属 ——
+        这里不再有「只记诊断、然后继续采信请求周期」的 ``skipped`` 概念。
+
+        ``status`` 不参与判定：``paused`` 描述的是**当前/记录状态**，不是某个历史
+        卖出当时的周期归属，因此不能当作「不竞争」的证据。
         """
         if cycle_id is None or session is None:
-            return False, []
+            return False, ()
         requested = _int_or_none(cycle_id)
         ambiguous = False
-        skipped: list = []
+        unprovable: list = []
         for row in self._cycle_rows():
             other = _int_or_none(_row_field(row, "id"))
             if other is None or other == requested:
                 continue
             start = _session_of(_row_field(row, "started_at"))
             end = _session_of(_row_field(row, "ended_at"))
-            # 已结束且结束日早于该卖出 → 可证明不属于它（起点未知也无妨）。
+            # 已结束且结束日早于该卖出 → 可证明不包含它。
             if end is not None and session > end:
                 continue
-            # 起点未知 → 无法证明它包含该卖出，也无法用它否决归属：记诊断后跳过。
-            if start is None:
-                skipped.append(other)
+            # 起点晚于该卖出 → 可证明不包含它。
+            if start is not None and session < start:
                 continue
-            if session < start:
+            if start is None:
+                # 边界证据不足：既不能断言包含，也不能断言排除 → 归属不可证明。
+                unprovable.append(other)
                 continue
             # 起点可证明 <= session 且未在 session 前结束 → 窗口包含该卖出。
             ambiguous = True
-        return ambiguous, skipped
+        return ambiguous, tuple(unprovable)
 
     def _sell_events(self, account_id: str, code: str,
                      cycle_id: Any = None) -> list:
@@ -819,42 +847,64 @@ class PositionEvidenceAdapter:
             )
 
             # ── 周期归属：四态判定，绝不默认 proven ──
+            #
+            # ``proven`` 需要**同时**满足：请求周期自身窗口可证明、该卖出落在窗内、
+            # 且**所有其它周期都能被证明不包含它**。「其它周期无法证明包含」不等于
+            # 「可以证明其它周期不包含」—— 前者缺失时必须降级，不能默认升级。
             attribution = CYCLE_ATTRIBUTION_UNPROVABLE
-            skipped: list = []
+            cycle_diagnostics: list = []
             if cycle_id is not None:
                 if window is None or session is None:
                     # 请求周期没有可用窗口 / 卖出 session 不可解析：归属无从证明。
                     attribution = CYCLE_ATTRIBUTION_UNPROVABLE
+                    cycle_diagnostics.append("sell_fill_cycle_unprovable")
                 else:
                     start_at, end_at = window
                     if start_at is None:
                         # 周期行存在但起点不可证明 → 无法断言该卖出属于它。
                         attribution = CYCLE_ATTRIBUTION_UNPROVABLE
+                        cycle_diagnostics.append("sell_fill_cycle_unprovable")
                     elif session < start_at or (end_at is not None and session > end_at):
                         attribution = CYCLE_ATTRIBUTION_MISMATCH
+                        cycle_diagnostics.append("sell_fill_cycle_mismatch")
                     else:
-                        ambiguous, skipped = self._competing_cycles(cycle_id, session)
-                        attribution = (CYCLE_ATTRIBUTION_AMBIGUOUS if ambiguous
-                                       else CYCLE_ATTRIBUTION_PROVEN)
+                        ambiguous, unprovable = self._competing_cycles(cycle_id, session)
+                        if ambiguous:
+                            attribution = CYCLE_ATTRIBUTION_AMBIGUOUS
+                            cycle_diagnostics.append("sell_fill_cycle_ambiguous")
+                        elif unprovable:
+                            # 有周期无法证明不竞争 → 归属不可证明（不是 proven）。
+                            attribution = CYCLE_ATTRIBUTION_UNPROVABLE
+                            cycle_diagnostics.append("competing_cycle_unprovable")
+                        else:
+                            attribution = CYCLE_ATTRIBUTION_PROVEN
 
                 # 若将来 schema 真的有了 ``paper_orders.cycle_id``，它是**更强**的
-                # 显式身份，因此优先采信；但与时间窗**直接冲突**时不得静默选一边。
+                # durable identity，因此优先采信；但与时间窗**直接冲突**时不得静默
+                # 选一边。显式身份一旦可用，它就是权威 —— 时间窗推断（含竞争周期）
+                # 不再参与，因为「这笔成交绑定哪个周期」已经是被持久化的事实。
                 if self._orders_have_cycle_column():
                     order_cycle = _int_or_none(_row_field(row, "order_cycle_id"))
+                    requested_cycle = _int_or_none(cycle_id)
+                    cycle_diagnostics = []
                     if order_cycle is None:
                         # 列存在却读不出值 → 显式身份缺失，无法采信。
                         attribution = CYCLE_ATTRIBUTION_UNPROVABLE
-                    elif order_cycle != _int_or_none(cycle_id):
-                        # 列明确指向**别的**周期；若时间窗又说属于本周期，则是硬冲突。
-                        attribution = (CYCLE_ATTRIBUTION_UNPROVABLE
-                                       if attribution == CYCLE_ATTRIBUTION_PROVEN
-                                       else CYCLE_ATTRIBUTION_MISMATCH)
-                    elif attribution == CYCLE_ATTRIBUTION_MISMATCH:
-                        # 列说属于本周期，时间窗却证明它在窗外 → 硬冲突。
+                        cycle_diagnostics.append("sell_fill_cycle_unprovable")
+                    elif order_cycle != requested_cycle:
+                        # 显式身份明确指向**别的**周期。
+                        attribution = CYCLE_ATTRIBUTION_MISMATCH
+                        cycle_diagnostics.append("sell_fill_cycle_mismatch")
+                    elif (window is not None and window[0] is not None
+                          and session is not None
+                          and (session < window[0]
+                               or (window[1] is not None and session > window[1]))):
+                        # 显式身份说属于本周期，本周期可证明的时间窗却把它排除 →
+                        # 硬冲突：两边证据都在，不能静默相信任意一方。
                         attribution = CYCLE_ATTRIBUTION_UNPROVABLE
+                        cycle_diagnostics.append("sell_fill_cycle_identity_conflict")
                     else:
-                        # 列是更强约束：归属成立（时间窗的 ambiguous/unprovable
-                        # 已被显式身份解决）。
+                        # 显式 durable identity 是更强约束：归属成立。
                         attribution = CYCLE_ATTRIBUTION_PROVEN
 
             events.append({
@@ -867,7 +917,8 @@ class PositionEvidenceAdapter:
                 "identity_ok": identity_ok,
                 "cycle_attribution": attribution,
                 "cycle_ok": attribution == CYCLE_ATTRIBUTION_PROVEN,
-                "cycle_skipped": tuple(skipped),
+                # 归属的**具体**理由（可多条）：probe 按它拆解 unprovable 的原因。
+                "cycle_diagnostics": tuple(cycle_diagnostics),
             })
         return events
 
@@ -975,12 +1026,17 @@ class PositionEvidenceAdapter:
                 diagnostics.append(_CYCLE_ATTRIBUTION_DIAGNOSTIC[attribution])
                 continue
             if attribution is not None and attribution != CYCLE_ATTRIBUTION_PROVEN:
+                # 先记**具体**原因（competing_cycle_unprovable /
+                # sell_fill_cycle_identity_conflict / …），再记通用结论 ——
+                # probe 据此按原因拆解 coverage 缺口，而不是只报一个总数。
+                diagnostics.extend(event.get("cycle_diagnostics") or ())
                 diagnostics.append(_CYCLE_ATTRIBUTION_DIAGNOSTIC.get(
                     attribution, "sell_fill_cycle_unprovable"))
                 diagnostics.append("historical_quantity_unprovable")
                 return {"snapshot": {}, "final": {}, "consistent": False,
                         "diagnostics": diagnostics}
             if not event.get("cycle_ok", True):
+                diagnostics.extend(event.get("cycle_diagnostics") or ())
                 diagnostics.append("sell_fill_cycle_unprovable")
                 diagnostics.append("historical_quantity_unprovable")
                 return {"snapshot": {}, "final": {}, "consistent": False,
