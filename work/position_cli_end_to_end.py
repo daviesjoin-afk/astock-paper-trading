@@ -30,6 +30,12 @@ stamp = conn.execute(
     "WHERE execution_status='verified' LIMIT 1"
 ).fetchone()
 strategy_id, version, checksum = stamp
+# 当前周期 id（与生产只读面板同一条件）；lot 必须落在该周期里才可被观察到。
+cycle_row = conn.execute(
+    "SELECT id FROM paper_cycles WHERE status IN ('draft','running','paused') "
+    "ORDER BY id DESC LIMIT 1"
+).fetchone()
+cycle_id = int(cycle_row[0])
 conn.execute(
     "INSERT OR REPLACE INTO historical_tradability_archive(code,session_date,"
     "effective_at,observed_at,is_listed,is_st,is_suspended,is_price_limit_locked,"
@@ -57,13 +63,13 @@ conn.execute(
 conn.execute(
     "INSERT INTO paper_position_lots(cycle_id,account_id,code,name,industry,qty,"
     "remaining_qty,cost,acquired_at,available_date,asset_type,source_order_id,"
-    "cost_fee_included,is_t_base) VALUES(136,?,'600903','逐日新材',NULL,1200,1200,"
+    "cost_fee_included,is_t_base) VALUES(?,?,'600903','逐日新材',NULL,1200,1200,"
     "10.0,'2026-09-17 10:00:00','2026-09-18','stock_t1',99001,1,1)",
-    (strategy_id,),
+    (cycle_id, strategy_id),
 )
 conn.commit()
 conn.close()
-print("seeded copy:", DB, "account:", strategy_id)
+print("seeded copy:", DB, "account:", strategy_id, "cycle:", cycle_id)
 
 ENV = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1", "ASTOCK_DATA_DIR": SCRATCH}
 
@@ -82,13 +88,38 @@ def run(extra, out):
     return proc.returncode
 
 
+def run_expect_error(extra):
+    """仓位层的 operator 契约：显式非法值必须 exit 2，绝不 fail-open。"""
+    proc = subprocess.run(
+        [sys.executable, "work/tradability_shadow_validation.py",
+         "--session", "2026-09-17", "--codes", "600903", "--side", "sell",
+         "--position-aware", *extra],
+        cwd=ROOT, env=ENV, capture_output=True, text=True,
+    )
+    return proc.returncode, (proc.stdout + proc.stderr).strip()
+
+
+failures = []
+for label, extra in (
+    ("missing --account-id", []),
+    ("invalid --validation-as-of",
+     ["--account-id", strategy_id, "--validation-as-of", "not-a-timestamp"]),
+    ("non-positive --sell-quantity",
+     ["--account-id", strategy_id, "--sell-quantity", "0"]),
+):
+    code, text = run_expect_error(extra)
+    ok = code == 2
+    print(f"operator error [{label}]: exit={code} ({'ok' if ok else 'NOT REJECTED'}) :: {text}")
+    if not ok:
+        failures.append(f"operator error 未生效: {label} (exit={code})")
+
+
 off_path = os.path.join(SCRATCH, "off.json")
 on_path = os.path.join(SCRATCH, "on.json")
 print("off exit:", run(["--json"], off_path))
 print("on  exit:", run(["--position-aware", "--account-id", strategy_id,
                        "--sell-quantity", "1200", "--json"], on_path))
 
-failures = []
 with open(off_path, encoding="utf-8") as fh:
     off_raw = fh.read()
 with open(on_path, encoding="utf-8") as fh:
@@ -111,6 +142,8 @@ if not failures:
         failures.append("仓位层改写了市场层面结果")
     pa = on.get("position_aware") or {}
     print("position_aware error:", pa.get("error"))
+    if pa.get("error"):
+        failures.append(f"position-aware 路径报错: {pa['error']}")
     summary = pa.get("summary")
     if summary:
         for key in ("requested", "sell_comparisons", "position_comparable",
@@ -124,10 +157,38 @@ if not failures:
                   "market=" + str(item["market_status"]),
                   "pos=" + str(item["position_status"]),
                   "ev=" + str(item["position_evidence_status"]),
+                  "cycle=" + str(item.get("cycle_id")),
                   "held=" + str(item["held_quantity"]),
                   "sellable=" + str(item["sellable_quantity"]),
                   "locked=" + str(item["t1_locked_quantity"]),
+                  "basis=" + str(item.get("quantity_basis")),
                   "reason=" + str(item["production_reason"]))
+        # ── v2 承重断言 ──
+        # 该样本：09-17 买入（available_date=09-18），决策 session 也是 09-17
+        # → 同日卖出被 T+1 锁住。**决策时点的持仓数量必须是 1200**（而不是
+        # 今天的可变余额），且这 1200 全部是 t1_locked。
+        if not summary["position_comparable"]:
+            failures.append("预期该样本可比，但 position_comparable=0")
+        if summary["t1_locked_quantity"] != 1200:
+            failures.append(
+                "决策时点历史数量口径错误: t1_locked_quantity="
+                f"{summary['t1_locked_quantity']} != 1200")
+        if summary["proven_sellable_quantity"] != 0:
+            failures.append(
+                "同日买入不得被判成可卖: proven_sellable_quantity="
+                f"{summary['proven_sellable_quantity']} != 0")
+        for item in pa["comparisons"]:
+            if item["side"] != "sell":
+                continue
+            if item["held_quantity"] != 1200:
+                failures.append(
+                    f"决策时点持仓数量错误: held={item['held_quantity']} != 1200")
+            if item.get("quantity_basis") != "historical_replay_fifo_at_decision":
+                failures.append(
+                    f"quantity_basis 不是历史重放口径: {item.get('quantity_basis')}")
+            if item.get("cycle_id") != cycle_id:
+                failures.append(
+                    f"观察未绑定目标 cycle: {item.get('cycle_id')} != {cycle_id}")
 
 print("\n%s" % ("PASS" if not failures else "FAIL: %s" % failures))
 raise SystemExit(1 if failures else 0)

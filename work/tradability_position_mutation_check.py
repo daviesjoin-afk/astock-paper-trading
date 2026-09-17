@@ -55,9 +55,9 @@ MUTATIONS = (
     (
         "M-T1-2",
         ADAPTER,
-        "                        fill_session = sessions.pop()\n",
-        "                        # MUTANT M-T1-2: the intended order date usurps the actual fill\n"
-        "                        fill_session = _session_of(_row_field(order, \"created_at\"))\n",
+        "                            fill_session = sessions.pop()\n",
+        "                            # MUTANT M-T1-2: the intended order date usurps the actual fill\n"
+        "                            fill_session = _session_of(_row_field(order, \"created_at\"))\n",
         "实际成交 session 被订单创建日（意图日）冒充",
     ),
     (
@@ -125,15 +125,15 @@ MUTATIONS = (
     (
         "M-T1-8",
         ADAPTER,
-        "        held = sum(max(0, lot.remaining_quantity) for lot in kept)\n"
-        "        sellable = sum(max(0, lot.remaining_quantity) for lot in kept\n"
+        "        held = sum(max(0, lot.historical_quantity) for lot in kept)\n"
+        "        sellable = sum(max(0, lot.historical_quantity) for lot in kept\n"
         "                       if lot.sellability == LotSellability.SELLABLE)\n",
         "        # MUTANT M-T1-8: mixed lots collapse into the single earliest entry session\n"
         "        _earliest = min((lot.acquisition_session for lot in kept\n"
         "                         if lot.acquisition_session), default=None)\n"
         "        _verdicts = {lot.acquisition_session: lot.sellability for lot in kept}\n"
         "        _unified = _verdicts.get(_earliest)\n"
-        "        held = sum(max(0, lot.remaining_quantity) for lot in kept)\n"
+        "        held = sum(max(0, lot.historical_quantity) for lot in kept)\n"
         "        sellable = (held if _unified == LotSellability.SELLABLE else 0)\n",
         "混合 lot 被压成单一最早 entry date",
     ),
@@ -159,6 +159,91 @@ MUTATIONS = (
         "        market_status = status\n",
         "仓位层改写生产侧结论（把市场层面 status 换成自己的）",
     ),
+    (
+        "M-HQ1",
+        ADAPTER,
+        "            historical = _int(snapshot.get(lot_id, 0))\n",
+        "            # MUTANT M-HQ1: today's mutable balance usurps the decision-time quantity\n"
+        "            historical = _int(_row_field(row, \"remaining_qty\"))\n",
+        "当前可变余额被当作决策时点历史数量",
+    ),
+    (
+        "M-HQ2",
+        ADAPTER,
+        "            if historical <= 0:\n",
+        "            # MUTANT M-HQ2: a fully-consumed lot silently disappears from history\n"
+        "            if _int(_row_field(row, \"remaining_qty\")) <= 0:\n",
+        "完全消耗的历史 lot 被静默丢弃",
+    ),
+    (
+        "M-HQ3",
+        ADAPTER,
+        "        elif unknown == 0:\n"
+        "            status = PositionEvidenceStatus.PROVEN\n",
+        "        # MUTANT M-HQ3: a partially-proven position is declared fully proven\n"
+        "        elif True:\n"
+        "            status = PositionEvidenceStatus.PROVEN\n",
+        "部分可证明的仓位被标成 position_proven",
+    ),
+    (
+        "M-SCOPE1",
+        ADAPTER,
+        "\"FROM paper_position_lots WHERE cycle_id=? AND account_id=? AND code=?\"\n",
+        "\"FROM paper_position_lots WHERE 1=1 AND account_id=? AND code=?\"\n",
+        "cycle 过滤被删除（跨周期 lot 汇入同一 context）",
+    ),
+    (
+        "M-SCOPE2",
+        ADAPTER,
+        "\"FROM paper_position_lots WHERE cycle_id=? AND account_id=? AND code=?\"\n",
+        "\"FROM paper_position_lots WHERE cycle_id=? AND 1=1 AND code=?\"\n",
+        "account 过滤被删除（跨账户份额被池化）",
+    ),
+    (
+        "M-PIT1",
+        ADAPTER,
+        "            resolved_decision_at = _instant(decision_at)\n",
+        "            # MUTANT M-PIT1: the caller's exact decision_at is replaced by session close\n"
+        "            resolved_decision_at = _instant(ST.session_close_at(session))\n",
+        "精确 decision_at 被 session close 覆盖",
+    ),
+    (
+        "M-PIT2",
+        ADAPTER,
+        "            if asof is None:\n",
+        "            if False:  # MUTANT M-PIT2: invalid validation_as_of widens to unlimited future\n",
+        "非法 validation_as_of 被当成无上界（future leak）",
+    ),
+    (
+        "M-ID1",
+        ADAPTER,
+        "                    if (order_account != account_id or lot_account != account_id\n"
+        "                            or order_code != code or lot_code != code):\n",
+        "                    # MUTANT M-ID1: the account half of the identity check is dropped\n"
+        "                    if (order_code != code or lot_code != code):\n",
+        "跨账户来源委托被接受",
+    ),
+    (
+        "M-ID2",
+        ADAPTER,
+        "                            if (str(_row_field(item, \"side\") or \"\").lower() != \"buy\"\n"
+        "                                    or _text(_row_field(item, \"account_id\")) != account_id\n"
+        "                                    or _text(_row_field(item, \"code\")) != code):\n",
+        "                            # MUTANT M-ID2: the code half of the fill identity check is dropped\n"
+        "                            if (str(_row_field(item, \"side\") or \"\").lower() != \"buy\"\n"
+        "                                    or _text(_row_field(item, \"account_id\")) != account_id):\n",
+        "跨股票成交被接受",
+    ),
+    (
+        "M-QTY1",
+        ADAPTER,
+        "            requested = _positive_int_or_none(requested_sell_quantity)\n"
+        "            if requested is None:\n",
+        "            # MUTANT M-QTY1: a non-positive sell quantity is coerced instead of rejected\n"
+        "            requested = _int(requested_sell_quantity)\n"
+        "            if False:\n",
+        "非正数请求卖出量被接受（随后被判成可卖）",
+    ),
 )
 
 #: 自检哨兵：只改注释。它必须 UNDETECTED —— 否则测试基线本来就是红的，
@@ -166,8 +251,8 @@ MUTATIONS = (
 SANITY_MUTATION = (
     "S0",
     ADAPTER,
-    "POSITION_EVIDENCE_VERSION = \"position-evidence-v1\"\n",
-    "POSITION_EVIDENCE_VERSION = \"position-evidence-v1\"  # sanity\n",
+    "POSITION_EVIDENCE_VERSION = \"position-evidence-v2\"\n",
+    "POSITION_EVIDENCE_VERSION = \"position-evidence-v2\"  # sanity\n",
     "harness sanity check (comment only, must survive)",
 )
 
@@ -209,6 +294,30 @@ def clear_bytecode(relative_path: str) -> None:
             candidate.unlink()
         except OSError:  # pragma: no cover
             pass
+
+
+def assert_no_leftover_mutants() -> int:
+    """拒绝在被中断的变异体上继续跑。
+
+    本矩阵用 ``try/finally`` 逐字节还原，但 ``SIGKILL``（超时、Ctrl-C 之后的强杀）
+    会让 ``finally`` 不执行，把 ``# MUTANT`` 留在盘上。此时"基线全绿"的假设不成立，
+    后续所有结论都会失真 —— 因此宁可拒绝运行，也不要在污染源上出报告。
+    """
+    offenders = []
+    for relative_path in sorted({entry[1] for entry in MUTATIONS}):
+        target = ROOT / relative_path
+        if not target.exists():  # pragma: no cover - 清单防御
+            continue
+        text = target.read_text(encoding="utf-8", errors="replace")
+        if "MUTANT " in text:
+            offenders.append(relative_path)
+    if offenders:
+        print("检测到上一次运行遗留的变异体（SIGKILL 会跳过 finally 还原）：")
+        for relative_path in offenders:
+            print(f"  - {relative_path}")
+        print("请先 `git checkout -- <file>` 还原，再重跑本矩阵。")
+        return 1
+    return 0
 
 
 def _env() -> dict:
@@ -364,7 +473,7 @@ def verify_equivalent() -> int:
             name="平安银行", risk_flag=None,
         )
     )
-    context = adapter.context_for("600001", account_id="A",
+    context = adapter.context_for("600001", cycle_id=1, account_id="A",
                                  decision_session="2026-09-17",
                                  requested_sell_quantity=None)
     problems = []
@@ -474,6 +583,56 @@ DESIGNATED_NON_VACUITY = {
         ".MarketBlockRemainsAMarketBlock"
         ".test_position_pass_does_not_overwrite_a_market_block",
     ),
+    "M-HQ1": (
+        "test_tradability_position_shadow"
+        ".HistoricalQuantityMustBeReplayedNotBorrowed"
+        ".test_HIST_Q4_current_remaining_differs_from_decision_time_quantity",
+    ),
+    "M-HQ2": (
+        "test_tradability_position_shadow"
+        ".HistoricalQuantityMustBeReplayedNotBorrowed"
+        ".test_HIST_Q2_fully_consumed_lot_is_not_dropped_from_the_snapshot",
+    ),
+    "M-HQ3": (
+        "test_tradability_position_shadow"
+        ".PositionTaxonomyKeepsNotComparableOutOfDenominators"
+        ".test_partial_evidence_is_not_comparable_and_keeps_the_split_visible",
+    ),
+    "M-SCOPE1": (
+        "test_tradability_position_shadow"
+        ".ScopeIsolationAcrossCyclesAndAccounts"
+        ".test_other_cycle_lots_are_invisible_to_this_comparison",
+    ),
+    "M-SCOPE2": (
+        "test_tradability_position_shadow"
+        ".ScopeIsolationAcrossCyclesAndAccounts"
+        ".test_same_code_across_accounts_is_never_pooled",
+    ),
+    "M-PIT1": (
+        "test_tradability_position_shadow"
+        ".ExactDecisionAtIsConsumedAndInvalidAsOfFailsClosed"
+        ".test_position_identity_keeps_the_exact_decision_at",
+    ),
+    "M-PIT2": (
+        "test_tradability_position_shadow"
+        ".ExactDecisionAtIsConsumedAndInvalidAsOfFailsClosed"
+        ".test_explicit_invalid_validation_as_of_never_widens_to_unlimited",
+    ),
+    "M-ID1": (
+        "test_tradability_position_shadow"
+        ".IdentityIntegrityIsVerified"
+        ".test_cross_account_order_cannot_prove_this_lot",
+    ),
+    "M-ID2": (
+        "test_tradability_position_shadow"
+        ".IdentityIntegrityIsVerified"
+        ".test_cross_code_fill_cannot_prove_this_lot",
+    ),
+    "M-QTY1": (
+        "test_tradability_position_shadow"
+        ".RequestedSellQuantityMustBeStrictlyPositive"
+        ".test_zero_negative_and_invalid_are_all_rejected",
+    ),
 }
 
 
@@ -546,6 +705,9 @@ def non_vacuity() -> int:
 
 def main(argv=None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
+    leftover = assert_no_leftover_mutants()
+    if leftover:
+        return leftover
     if "--audit" in argv:
         return audit_anchors()
     if "--non-vacuity" in argv:

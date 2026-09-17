@@ -363,6 +363,121 @@ class PositionShadowIsNotEmbeddedInHotModules(unittest.TestCase):
                 self.assertNotIn(symbol, source, f"{name} 不得内嵌仓位层")
 
 
+class PositionQuantityMustBeHistoricalNotCurrent(unittest.TestCase):
+    """承重：历史数量必须来自重放，**绝不能**来自当前可变的 ``remaining_qty``。
+
+    这条是 v2 修正的核心缺陷：``paper_position_lots.remaining_qty`` 会被后续 SELL
+    原地递减，因此它描述"现在"，不描述 ``decision_at``。
+    """
+
+    def test_adapter_replays_before_reading_the_snapshot(self):
+        source = _source(ADAPTER_MODULE)
+        self.assertIn("snapshot.get(lot_id", source,
+                      "历史数量必须取自重放快照")
+        self.assertIn("_replay(", source, "必须存在重放步骤")
+
+    def test_adapter_never_derives_historical_quantity_from_remaining_qty(self):
+        """``historical_quantity`` 不得被当前余额赋值。"""
+        source = _source(ADAPTER_MODULE)
+        self.assertNotIn("historical_quantity=_int(_row_field(row, \"remaining_qty\"))",
+                         source)
+        self.assertNotIn("historical = _int(_row_field(row, \"remaining_qty\"))",
+                         source)
+
+    def test_adapter_declares_the_replay_basis(self):
+        source = _source(ADAPTER_MODULE)
+        self.assertIn("QUANTITY_BASIS_HISTORICAL_REPLAY", source)
+        self.assertIn("QUANTITY_BASIS_UNPROVABLE", source)
+
+    def test_unreplayable_history_fails_closed(self):
+        """重放不自洽必须 fail closed，而不是退回当前余额。"""
+        source = _source(ADAPTER_MODULE)
+        self.assertIn("historical_quantity_unprovable", source)
+        self.assertIn("replay_does_not_match_ledger", source)
+
+    def test_detector_fires_on_current_balance_substitution(self):
+        fabricated = 'historical = _int(_row_field(row, "remaining_qty"))'
+        self.assertIn('"remaining_qty"', fabricated)
+        self.assertNotIn("snapshot.get(lot_id", fabricated)
+
+
+class PositionScopeMustBeExplicit(unittest.TestCase):
+    """承重：``cycle_id`` 与 ``account_id`` 必须显式，缺任何一个都 fail closed。"""
+
+    def test_lot_query_is_scoped_by_cycle_and_account(self):
+        source = _source(ADAPTER_MODULE)
+        self.assertIn("FROM paper_position_lots WHERE cycle_id=? AND account_id=?",
+                      source)
+
+    def test_context_for_requires_both_scopes(self):
+        tree = _tree(ADAPTER_MODULE)
+        for node in tree.body:
+            if isinstance(node, ast.ClassDef) and node.name == "PositionEvidenceAdapter":
+                for child in node.body:
+                    if isinstance(child, ast.FunctionDef) and child.name == "context_for":
+                        names = {arg.arg for arg in child.args.kwonlyargs}
+                        self.assertIn("cycle_id", names)
+                        self.assertIn("account_id", names)
+                        return
+        self.fail("未找到 PositionEvidenceAdapter.context_for")
+
+    def test_missing_scope_is_a_diagnostic_not_a_pool(self):
+        source = _source(ADAPTER_MODULE)
+        self.assertIn("missing_cycle_or_account_scope", source)
+
+    def test_detector_fires_on_an_unscoped_query(self):
+        fabricated = "FROM paper_position_lots WHERE code=?"
+        self.assertNotIn("cycle_id=?", fabricated)
+        self.assertNotIn("account_id=?", fabricated)
+
+
+class PositionPitMustConsumeExactDecisionAt(unittest.TestCase):
+    """承重：调用方的精确 ``decision_at`` 必须被消费，显式非法值必须 fail closed。"""
+
+    def test_adapter_consumes_the_caller_decision_at(self):
+        source = _source(ADAPTER_MODULE)
+        self.assertIn("resolved_decision_at = _instant(decision_at)", source)
+
+    def test_session_close_is_only_a_guarded_fallback(self):
+        """``session_close_at`` 只允许出现在"调用方没给 decision_at"的分支里。"""
+        source = _source(ADAPTER_MODULE)
+        guard = "if decision_at is None:"
+        self.assertIn(guard, source)
+        fallback = "resolved_decision_at = _instant(ST.session_close_at(session))"
+        self.assertIn(fallback, source)
+        self.assertLess(source.index(guard), source.index(fallback),
+                        "session close 回退必须排在 None 分支之后（受守卫）")
+        # 精确时点赋值必须独立存在，且不得在 None 分支里。
+        exact = "resolved_decision_at = _instant(decision_at)"
+        self.assertIn(exact, source)
+        self.assertGreater(source.index(exact), source.index(fallback))
+
+    def test_invalid_inputs_are_rejected_explicitly(self):
+        source = _source(ADAPTER_MODULE)
+        for diagnostic in ("invalid_decision_at", "invalid_validation_as_of",
+                           "invalid_requested_sell_quantity"):
+            self.assertIn(diagnostic, source)
+
+    def test_detector_fires_on_a_session_close_override(self):
+        fabricated = "resolved_decision_at = _instant(ST.session_close_at(session))"
+        self.assertIn("session_close_at(session)", fabricated)
+        self.assertNotIn("if decision_at is None:", fabricated)
+
+
+class PositionIdentityIntegrityIsEnforced(unittest.TestCase):
+    """承重：不得借另一账户 / 另一股票的已验证买入证明当前 lot。"""
+
+    def test_adapter_verifies_lot_order_fill_identity(self):
+        source = _source(ADAPTER_MODULE)
+        self.assertIn("IDENTITY_MISMATCH", source)
+        self.assertIn("source_order_identity_mismatch", source)
+        self.assertIn("fill_identity_mismatch", source)
+
+    def test_detector_fires_on_a_dropped_identity_check(self):
+        fabricated = "if (order_code != code or lot_code != code):"
+        self.assertNotIn("order_account != account_id", fabricated)
+
+
 class OperatorCliExposesNoAuthority(unittest.TestCase):
     """CLI 的 position-aware 模式必须与市场层面模式一样**只读、零开关**。"""
 

@@ -40,6 +40,7 @@ if BACKEND not in sys.path:
     sys.path.insert(0, BACKEND)
 
 import data_paths  # noqa: E402
+import point_in_time as PIT  # noqa: E402
 import security_state_point_in_time as SS  # noqa: E402
 import selection_tradability as ST  # noqa: E402
 import tradability_archive as TA  # noqa: E402
@@ -132,7 +133,29 @@ def _pair_has_archive_row(conn, code, session):
     return row is not None
 
 
-def _position_aware_rows(comparisons, items, adapter, args):
+def _resolve_cycle_id(conn):
+    """只读解析当前周期 id（与 ``paper_trading._position_rows(readonly=True)`` 同一条件）。
+
+    生产在只读面板里用的就是这条查询：``status IN ('draft','running','paused')`` 取
+    ``id DESC LIMIT 1``。这里**刻意不调用** ``paper_trading._active_cycle`` —— 那个
+    入口在缺周期时会**创建**一行，而本工具必须只读。
+    """
+    try:
+        row = conn.execute(
+            "SELECT id FROM paper_cycles WHERE status IN ('draft','running','paused') "
+            "ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+    except sqlite3.OperationalError:
+        return None
+    if row is None:
+        return None
+    try:
+        return int(row[0])
+    except (TypeError, ValueError):
+        return None
+
+
+def _position_aware_rows(comparisons, items, adapter, args, cycle_id):
     """把仓位层观察叠加到**已经算好**的市场层面比对结果上（只读）。
 
     关键约束：**既有的市场层面结果一个字段都不重算**。本函数把 ``compare_many``
@@ -140,7 +163,7 @@ def _position_aware_rows(comparisons, items, adapter, args):
 
     返回值是 ``(position_comparisons, position_summary)``。
     """
-    account_id = args.account_id or None
+    account_id = args.account_id
     requested = args.sell_quantity
     market_by_key = {}
     for comparison in comparisons:
@@ -153,7 +176,10 @@ def _position_aware_rows(comparisons, items, adapter, args):
              comparison.validation_as_of)
         ] = comparison
     # ``comparator=None`` + 每条都传 ``market_comparison``：本层绝不重算市场层面。
-    observer = PS.PositionShadowObserver(None, adapter, account_id=account_id)
+    # cycle_id / account_id 是仓位层的**显式作用域**：T+1 是账户级约束，lot 归属周期。
+    observer = PS.PositionShadowObserver(
+        None, adapter, cycle_id=cycle_id, account_id=account_id
+    )
     out = []
     for item, market in zip(items, comparisons):
         key = (
@@ -182,7 +208,8 @@ def _print_position_aware(comparisons, summary, args):
     """仓位层报告。**每条都带自己的分母**，绝不只报一个百分比。"""
     data = summary.to_dict()
     print("--- position-aware T+1 shadow (READ-ONLY / observation only) ---")
-    print(f"account_id: {args.account_id or '(all accounts)'}")
+    print(f"account_id: {args.account_id or '(not specified)'}")
+    print(f"cycle_id: {args.cycle_id if args.cycle_id is not None else '(resolved active cycle)'}")
     print(f"requested_sell_quantity(per comparison): {args.sell_quantity or '(not specified)'}")
     for key in (
         "requested", "sell_comparisons", "buy_comparisons",
@@ -257,7 +284,20 @@ def main(argv=None) -> int:
         "--account-id",
         dest="account_id",
         default=None,
-        help="仓位层观察的账户 id（缺省 = 不带账户过滤，看全部 lot）",
+        help=(
+            "仓位层观察的账户 id。**--position-aware 时必填**：T+1 是账户级约束，"
+            "缺省会让多个账户的同 code 份额被池化，因此拒绝而不是猜一个。"
+        ),
+    )
+    parser.add_argument(
+        "--cycle-id",
+        dest="cycle_id",
+        type=int,
+        default=None,
+        help=(
+            "仓位层观察的周期 id（缺省 = 只读解析当前周期）。lot 归属周期，"
+            "跨周期 lot 绝不能被汇进同一个 sellability context。"
+        ),
     )
     parser.add_argument(
         "--sell-quantity",
@@ -278,6 +318,18 @@ def main(argv=None) -> int:
     if not args.session and not start:
         print("需要 --session 或 --from")
         return 2
+    # ── 仓位层的 operator 契约：显式非法值一律 operator error（绝不 fail-open）──
+    if args.position_aware:
+        if not args.account_id:
+            print("--position-aware 需要 --account-id（T+1 是账户级约束，"
+                  "缺省会把多个账户的同 code 份额池化）")
+            return 2
+        if args.validation_as_of is not None and PIT.parse_asof(args.validation_as_of) is None:
+            print(f"--validation-as-of 不可解析: {args.validation_as_of!r}")
+            return 2
+        if args.sell_quantity is not None and args.sell_quantity <= 0:
+            print(f"--sell-quantity 必须是正整数: {args.sell_quantity!r}")
+            return 2
 
     # 与回填 CLI **共享**同一套 operator scope 契约（显式空 --codes / 零交易日范围
     # 一律 operator error），绝不在这里再犯一遍。
@@ -336,6 +388,9 @@ def main(argv=None) -> int:
         position_error = None
         if args.position_aware:
             try:
+                cycle_id = args.cycle_id
+                if cycle_id is None:
+                    cycle_id = _resolve_cycle_id(conn)
                 adapter = PE.PositionEvidenceAdapter(
                     conn,
                     evidence_provider=lambda c, s: _production_evidence(
@@ -343,8 +398,10 @@ def main(argv=None) -> int:
                     ),
                 )
                 position_comparisons, position_summary = _position_aware_rows(
-                    comparisons, items, adapter, args
+                    comparisons, items, adapter, args, cycle_id
                 )
+                if cycle_id is None:
+                    position_error = "no_active_cycle"
             except Exception as exc:  # 仓位层故障绝不影响市场层面结论
                 position_error = f"{type(exc).__name__}: {exc}"
     finally:

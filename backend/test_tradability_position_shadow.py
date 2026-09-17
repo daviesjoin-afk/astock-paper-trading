@@ -38,6 +38,9 @@ import tradability_position_shadow as PS  # noqa: E402
 import tradability_shadow as TS  # noqa: E402
 
 ACCOUNT = "acct_a"
+ACCOUNT_B = "acct_b"
+CYCLE = 1
+CYCLE_OLD = 0
 NORMAL = "600001"
 ETF = "510300"
 NORMAL_NAME = "平安银行"
@@ -114,12 +117,17 @@ class PositionTestCase(unittest.TestCase):
     def add_lot(self, *, code=NORMAL, account=ACCOUNT, qty, session, fill_id,
                 order_id, name=NORMAL_NAME, asset_type=None, verified=True,
                 recorded_at=None, order_created_at=None, remaining=None,
-                cycle_id=1, lot_id=None, status="filled", side="buy"):
+                cycle_id=CYCLE, lot_id=None, status="filled", side="buy",
+                order_account=None, order_code=None, fill_account=None,
+                fill_code=None, available_date=None, order_verified=None):
         """写入一笔委托 + 一条成交 + 一个 lot（形状与真实账本一致）。
 
         ``session`` 是**真实成交 session**（进 ``paper_fills.fill_date``）；
         ``order_created_at`` 默认为它**前一天**，用来暴露"用订单意图日期冒充
         成交日期"这类缺陷。
+
+        ``order_account`` / ``order_code`` / ``fill_account`` / ``fill_code`` 只在
+        身份完整性用例里被显式错配（默认与 lot 一致）。
         """
         if asset_type is None:
             asset_type = "etf_t0" if code == ETF else "stock_t1"
@@ -130,7 +138,8 @@ class PositionTestCase(unittest.TestCase):
             "risk_payload,created_at,executed_at,execution_status,"
             "execution_verified,execution_evidence_source) "
             "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            (order_id, account, side, code, name, int(qty), status, "",
+            (order_id, order_account or account, side, order_code or code, name,
+             int(qty), status, "",
              order_created_at or f"{session} 09:30:00", f"{session} 10:00:00",
              exec_status, exec_flag,
              "paper_orders+paper_fills" if verified else "no_evidence_available"),
@@ -138,8 +147,8 @@ class PositionTestCase(unittest.TestCase):
         self.conn.execute(
             "INSERT INTO paper_fills(order_id,account_id,side,code,qty,price,amount,"
             "fees,fill_date,quote_at,assumption) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-            (order_id, account, side, code, int(qty), 10.0, int(qty) * 10.0, 0.0,
-             session, None, "close"),
+            (order_id, fill_account or account, side, fill_code or code, int(qty),
+             10.0, int(qty) * 10.0, 0.0, session, None, "close"),
         )
         self.conn.execute(
             "INSERT INTO paper_position_lots(id,cycle_id,account_id,code,name,industry,"
@@ -148,8 +157,44 @@ class PositionTestCase(unittest.TestCase):
             "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (lot_id, cycle_id, account, code, name, None, int(qty),
              int(qty) if remaining is None else int(remaining), 10.0,
-             recorded_at or f"{session} 10:00:00", D2, asset_type,
+             recorded_at or f"{session} 10:00:00", available_date or D2, asset_type,
              order_id, 1, 1),
+        )
+
+    def add_sell_fill(self, *, code=NORMAL, account=ACCOUNT, qty, session,
+                      fill_id, order_id, verified=True, side="sell",
+                      order_account=None, order_code=None, fill_account=None,
+                      fill_code=None, order_side=None):
+        """写入一笔**卖出**委托 + 成交（供生产 FIFO 重放使用）。
+
+        默认形状与生产一致：``paper_fills.side='sell'`` + 来源委托 ``side='sell'``
+        且已盖章（``execution_verified=1`` / ``execution_status='verified'``）。
+        """
+        exec_status = "verified" if verified else "unknown"
+        exec_flag = 1 if verified else 0
+        self.conn.execute(
+            "INSERT INTO paper_orders(id,account_id,side,code,name,qty,status,"
+            "risk_payload,created_at,executed_at,execution_status,"
+            "execution_verified,execution_evidence_source) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (order_id, order_account or account, order_side or side,
+             order_code or code, NORMAL_NAME, int(qty), "filled", "",
+             f"{session} 09:30:00", f"{session} 10:00:00",
+             exec_status, exec_flag,
+             "paper_orders+paper_fills" if verified else "no_evidence_available"),
+        )
+        self.conn.execute(
+            "INSERT INTO paper_fills(id,order_id,account_id,side,code,qty,price,amount,"
+            "fees,fill_date,quote_at,assumption) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+            (fill_id, order_id, fill_account or account, side, fill_code or code,
+             int(qty), 10.0, int(qty) * 10.0, 0.0, session, None, "close"),
+        )
+
+    def set_remaining(self, lot_id, remaining):
+        """把账本现值改成给定的剩余量（模拟生产 FIFO 已经扣减过）。"""
+        self.conn.execute(
+            "UPDATE paper_position_lots SET remaining_qty=? WHERE id=?",
+            (int(remaining), int(lot_id)),
         )
 
     def add_archive_fact(self, code=NORMAL, session=D2, **flags):
@@ -181,9 +226,11 @@ class PositionTestCase(unittest.TestCase):
         )
 
     def context(self, code=NORMAL, *, session=D2, account=ACCOUNT,
-                requested=None, as_of=None, provider=True):
+                requested=None, as_of=None, provider=True,
+                cycle_id=CYCLE, decision_at=None):
         return self.adapter(provider=provider).context_for(
-            code, account_id=account, decision_session=session,
+            code, cycle_id=cycle_id, account_id=account, decision_session=session,
+            decision_at=decision_at,
             validation_as_of=as_of, requested_sell_quantity=requested,
         )
 
@@ -473,7 +520,7 @@ class BuyIsUnaffectedByThePositionLayer(PositionTestCase):
         self.add_archive_fact()
         self.comparator = TS.ShadowComparator(self.repo)
         self.observer = PS.PositionShadowObserver(
-            self.comparator, self.adapter(), account_id=ACCOUNT)
+            self.comparator, self.adapter(), cycle_id=CYCLE, account_id=ACCOUNT)
 
     def _observe(self, side):
         verdict = (
@@ -626,8 +673,7 @@ class MarketBlockRemainsAMarketBlock(PositionTestCase):
         verdict = ST.exit_tradability(evidence, code=NORMAL, exit_session=D1_NEXT)
         self.assertEqual(ST.REASON_LIMIT_DOWN_SELL_BLOCKED, verdict.reason)
 
-        observer = PS.PositionShadowObserver(self.comparator, self.adapter(),
-                                             account_id=ACCOUNT)
+        observer = PS.PositionShadowObserver(self.comparator, self.adapter(), cycle_id=CYCLE, account_id=ACCOUNT)
         observed = observer.observe(
             code=NORMAL, session=D1_NEXT, side=ST.SIDE_SELL,
             production_verdict=verdict, validation_as_of=AS_OF,
@@ -721,8 +767,7 @@ class PositionAwareOnOffHasZeroProductionEffect(PositionTestCase):
         again = self.comparator.compare_many(items)
         market_by_key = {(c.code, c.session, c.decision_at, c.side,
                           c.validation_as_of): c for c in again}
-        observer = PS.PositionShadowObserver(None, self.adapter(),
-                                             account_id=ACCOUNT)
+        observer = PS.PositionShadowObserver(None, self.adapter(), cycle_id=CYCLE, account_id=ACCOUNT)
         for item in items:
             observer.observe(
                 code=item["code"], session=item["session"], side=item["side"],
@@ -740,8 +785,7 @@ class PositionAwareOnOffHasZeroProductionEffect(PositionTestCase):
     def test_no_position_lot_is_consumed_or_rescheduled(self):
         """承重：仓位层绝不能改写 ``remaining_qty`` / ``available_date``。"""
         before = self.position_lot_state()
-        observer = PS.PositionShadowObserver(self.comparator, self.adapter(),
-                                             account_id=ACCOUNT)
+        observer = PS.PositionShadowObserver(self.comparator, self.adapter(), cycle_id=CYCLE, account_id=ACCOUNT)
         observer.observe_many(self._items())
         self.assertEqual(before, self.position_lot_state())
 
@@ -749,8 +793,7 @@ class PositionAwareOnOffHasZeroProductionEffect(PositionTestCase):
         before = self.snapshot_production()
         items = self._items()
         self.comparator.compare_many(items)
-        observer = PS.PositionShadowObserver(self.comparator, self.adapter(),
-                                             account_id=ACCOUNT)
+        observer = PS.PositionShadowObserver(self.comparator, self.adapter(), cycle_id=CYCLE, account_id=ACCOUNT)
         observer.observe_many(items)
         self.assert_production_untouched(before)
 
@@ -758,8 +801,7 @@ class PositionAwareOnOffHasZeroProductionEffect(PositionTestCase):
         before = self.snapshot_production()
         items = self._items()
         comparisons = self.comparator.compare_many(items)
-        observer = PS.PositionShadowObserver(self.comparator, self.adapter(),
-                                             account_id=ACCOUNT)
+        observer = PS.PositionShadowObserver(self.comparator, self.adapter(), cycle_id=CYCLE, account_id=ACCOUNT)
         observed = observer.observe_many(items)
         summary = observer.summarize(observed)
         # 新增的只有观察产物本身。
@@ -784,7 +826,7 @@ class PositionTaxonomyKeepsNotComparableOutOfDenominators(PositionTestCase):
         self.add_archive_fact()
         self.comparator = TS.ShadowComparator(self.repo)
         self.observer = PS.PositionShadowObserver(
-            self.comparator, self.adapter(), account_id=ACCOUNT)
+            self.comparator, self.adapter(), cycle_id=CYCLE, account_id=ACCOUNT)
 
     def _observe(self, code, session, requested):
         verdict = ST.exit_tradability(
@@ -928,21 +970,46 @@ class PositionLayerRefusesToGuess(PositionTestCase):
                          context.lots[0].acquisition_status)
         self.assertEqual(0, context.sellable_quantity)
 
-    def test_consumed_lots_are_reported_not_silently_dropped(self):
-        """已被消耗的 lot 只进诊断桶 —— 本层不重放生产 FIFO。"""
-        self.add_lot(qty=1000, session=D1, fill_id=1, order_id=1, lot_id=101,
-                     remaining=0)
+    def test_a_lot_consumed_after_the_decision_stays_in_that_snapshot(self):
+        """决策**之后**才被完全消耗的 lot 必须仍出现在决策当时的持仓里。
+
+        这条与 v1 的关键差别：v1 把"今天余额为 0"的 lot 直接从历史持仓里剔除，
+        于是"D 日买 1000、D+5 卖 800、今天 200"会被读成"D 日持有 200"。
+        v2 必须先把卖出重放回 D 日，再决定哪些 lot 属于那个快照。
+        """
+        self.add_lot(qty=1000, session=D1, fill_id=1, order_id=1, lot_id=101)
         self.add_lot(qty=500, session=D1, fill_id=2, order_id=2, lot_id=102)
-        context = self.context(session=D1_NEXT, requested=None)
-        self.assertEqual(1000, context.consumed_quantity)
-        self.assertIn("consumed_lots_excluded_fifo_not_replayed",
-                      context.diagnostics)
+        # D2 卖出 1000：FIFO 先吃 101 的 1000（102 一股未动）。
+        self.add_sell_fill(qty=1000, session=D2, fill_id=9, order_id=9)
+        self.set_remaining(101, 0)
+        context = self.context(session=D1, requested=None)
+        # D1 当天：101 尚在（1000），102 也在（500）—— 两笔都属于当时的持仓。
+        self.assertEqual(1500, context.held_quantity,
+                         "决策后被消耗的份额必须仍算进当时的持仓")
+        self.assertEqual(2, len(context.lots))
+        self.assertEqual(0, context.consumed_quantity,
+                         "决策当时没有任何份额被消耗")
+        self.assertEqual(PE.PositionEvidenceStatus.PROVEN, context.evidence_status)
+
+    def test_a_lot_consumed_before_the_decision_is_excluded_but_reported(self):
+        """决策**之前**已被完全消耗的 lot 不在当时持仓里，且必须被报出来。"""
+        self.add_lot(qty=1000, session=D1, fill_id=1, order_id=1, lot_id=101)
+        self.add_lot(qty=500, session=D2, fill_id=2, order_id=2, lot_id=102)
+        # D2 卖出 1000：FIFO 先吃 101（available D2）的 1000。
+        self.add_sell_fill(qty=1000, session=D2, fill_id=9, order_id=9)
+        self.set_remaining(101, 0)
+        # 决策时点在 D2 收盘后 → 101 已被完全消耗，当时只持有 102 的 500。
+        context = self.context(session=D2, requested=None,
+                               decision_at=f"{D2}T16:00:00+08:00")
         self.assertEqual(500, context.held_quantity)
+        self.assertEqual(1, len(context.lots))
+        self.assertEqual(1000, context.consumed_quantity,
+                         "被完全消耗的份额必须进诊断桶，不得静默消失")
 
     def test_quantity_basis_is_declared(self):
         self.add_lot(qty=100, session=D1, fill_id=1, order_id=1)
         context = self.context(session=D1_NEXT, requested=100)
-        self.assertEqual(PE.QUANTITY_BASIS_OPEN_LOTS, context.quantity_basis)
+        self.assertEqual(PE.QUANTITY_BASIS_HISTORICAL_REPLAY, context.quantity_basis)
 
     def test_pre_t1_gate_falls_back_to_the_t1_authority_not_to_allow(self):
         """生产 verdict 停在 T+1 之前时，问权威的 T+1 入口 —— 而不是放行。"""
@@ -951,6 +1018,265 @@ class PositionLayerRefusesToGuess(PositionTestCase):
         source = (PE.__file__ and open(PE.__file__, encoding="utf-8").read()) or ""
         self.assertIn("ST.earliest_sellable_session", source, detail)
         self.assertIn("ST.REASON_T1_NOT_SELLABLE", source, detail)
+
+
+# ───────────────────────── HIST-Q 历史数量重放 ─────────────────────────
+
+
+class HistoricalQuantityMustBeReplayedNotBorrowed(PositionTestCase):
+    """承重：``current remaining_qty`` **绝不能**冒充 ``decision_at`` 的持仓数量。
+
+    规格逐字给出的反例：D 日买 1000、D+5 卖 800、今天 ``remaining_qty=200``；
+    回看 D 日必须得到 1000，而不是 200。
+    """
+
+    def test_HIST_Q4_current_remaining_differs_from_decision_time_quantity(self):
+        self.add_lot(qty=1000, session=D1, fill_id=1, order_id=1, lot_id=101)
+        # D+1 卖出 800（生产已按 FIFO 扣减），账本现值只剩 200。
+        self.add_sell_fill(qty=800, session=D1_NEXT, fill_id=9, order_id=9)
+        self.set_remaining(101, 200)
+        context = self.context(session=D1, requested=None)
+        self.assertEqual(1000, context.held_quantity,
+                         "D 日持有 1000，绝不能拿今天的 200 冒充")
+        self.assertEqual(PE.QUANTITY_BASIS_HISTORICAL_REPLAY, context.quantity_basis)
+
+    def test_HIST_Q2_fully_consumed_lot_is_not_dropped_from_the_snapshot(self):
+        """完全消耗的历史 lot 不得因今天 ``remaining_qty=0`` 就从历史持仓里消失。"""
+        self.add_lot(qty=1000, session=D1, fill_id=1, order_id=1, lot_id=101)
+        self.add_sell_fill(qty=1000, session=D1_NEXT, fill_id=9, order_id=9)
+        self.set_remaining(101, 0)
+        context = self.context(session=D1, requested=None)
+        self.assertEqual(1000, context.held_quantity)
+        self.assertEqual(1, len(context.lots))
+
+    def test_HIST_Q1_partial_consumption_after_decision_is_replayed(self):
+        """决策**之后**的部分消耗不得影响决策当时的数量。"""
+        self.add_lot(qty=1000, session=D1, fill_id=1, order_id=1, lot_id=101)
+        self.add_lot(qty=500, session=D1, fill_id=2, order_id=2, lot_id=102)
+        self.add_sell_fill(qty=300, session=D1_NEXT, fill_id=9, order_id=9)
+        self.set_remaining(101, 700)
+        context = self.context(session=D1, requested=None)
+        self.assertEqual(1500, context.held_quantity)
+
+    def test_HIST_Q3_consumption_before_decision_reduces_the_snapshot(self):
+        """决策**之前**发生的卖出必须已经反映在决策当时的数量里。"""
+        self.add_lot(qty=1000, session=D1, fill_id=1, order_id=1, lot_id=101)
+        # D1 买入 → available_date=D2；D2 卖出 400（生产按 FIFO 扣减）。
+        self.add_sell_fill(qty=400, session=D2, fill_id=9, order_id=9)
+        self.set_remaining(101, 600)
+        # 决策时点在 D2 收盘之后 → 那笔卖出已发生，当时只持有 600。
+        context = self.context(session=D2, requested=None,
+                               decision_at=f"{D2}T16:00:00+08:00")
+        self.assertEqual(600, context.held_quantity)
+        self.assertEqual(PE.PositionEvidenceStatus.PROVEN, context.evidence_status)
+
+    def test_unreplayable_history_fails_closed_and_never_borrows_current_balance(self):
+        """重放与账本对不上 → ``position_unprovable``，绝不退回当前余额。"""
+        self.add_lot(qty=1000, session=D1, fill_id=1, order_id=1, lot_id=101)
+        # 账本说只剩 200，却没有任何卖出成交可解释那 800 —— 证据不完整。
+        self.set_remaining(101, 200)
+        context = self.context(session=D1, requested=None)
+        self.assertEqual(PE.PositionEvidenceStatus.UNPROVABLE, context.evidence_status)
+        self.assertFalse(context.comparable)
+        self.assertIn("historical_quantity_unprovable", context.diagnostics)
+        self.assertNotEqual(200, context.held_quantity,
+                            "不可重放时绝不能拿当前余额充当历史数量")
+        self.assertEqual(0, context.sellable_quantity)
+
+
+# ───────────────────────── SCOPE cycle / account 隔离 ─────────────────────────
+
+
+class ScopeIsolationAcrossCyclesAndAccounts(PositionTestCase):
+    """承重：跨 cycle / 跨 account 的份额**绝不**能汇成一个 sellability context。"""
+
+    def test_other_cycle_lots_are_invisible_to_this_comparison(self):
+        self.add_lot(qty=1000, session=D1, fill_id=1, order_id=1, lot_id=101,
+                     cycle_id=CYCLE)
+        self.add_lot(qty=9000, session=D1, fill_id=2, order_id=2, lot_id=102,
+                     cycle_id=CYCLE_OLD)
+        context = self.context(session=D1_NEXT, requested=None, cycle_id=CYCLE)
+        self.assertEqual(1000, context.held_quantity,
+                         "上一个周期的 lot 绝不能进入本周期比较")
+        self.assertEqual(1, len(context.lots))
+        self.assertEqual(CYCLE, context.cycle_id)
+
+    def test_same_code_across_accounts_is_never_pooled(self):
+        self.add_lot(qty=1000, session=D1, fill_id=1, order_id=1, lot_id=101,
+                     account=ACCOUNT)
+        self.add_lot(qty=500, session=D2, fill_id=2, order_id=2, lot_id=102,
+                     account=ACCOUNT_B)
+        a = self.context(session=D2, requested=None, account=ACCOUNT)
+        b = self.context(session=D2, requested=None, account=ACCOUNT_B)
+        self.assertEqual(1000, a.held_quantity)
+        self.assertEqual(500, b.held_quantity)
+        self.assertNotEqual(1500, a.held_quantity)
+        self.assertNotEqual(1500, b.held_quantity)
+
+    def test_missing_account_scope_is_rejected_not_pooled(self):
+        self.add_lot(qty=1000, session=D1, fill_id=1, order_id=1, lot_id=101,
+                     account=ACCOUNT)
+        self.add_lot(qty=500, session=D1, fill_id=2, order_id=2, lot_id=102,
+                     account=ACCOUNT_B)
+        context = self.context(session=D1, requested=None, account=None)
+        self.assertEqual(PE.PositionEvidenceStatus.INVALID, context.evidence_status)
+        self.assertFalse(context.comparable)
+        self.assertEqual(0, context.held_quantity)
+        self.assertIn("missing_cycle_or_account_scope", context.diagnostics)
+
+    def test_missing_cycle_scope_is_rejected(self):
+        self.add_lot(qty=1000, session=D1, fill_id=1, order_id=1, lot_id=101)
+        context = self.context(session=D1, requested=None, cycle_id=None)
+        self.assertEqual(PE.PositionEvidenceStatus.INVALID, context.evidence_status)
+        self.assertIn("missing_cycle_or_account_scope", context.diagnostics)
+
+    def test_load_lots_without_scope_returns_nothing(self):
+        self.add_lot(qty=1000, session=D1, fill_id=1, order_id=1, lot_id=101)
+        adapter = self.adapter()
+        self.assertEqual([], adapter.load_lots(NORMAL, cycle_id=None,
+                                               account_id=ACCOUNT))
+        self.assertEqual([], adapter.load_lots(NORMAL, cycle_id=CYCLE,
+                                               account_id=None))
+
+
+# ───────────────────────── PIT 精确 decision_at / 非法 as_of ─────────────────────────
+
+
+class ExactDecisionAtIsConsumedAndInvalidAsOfFailsClosed(PositionTestCase):
+    """承重：仓位层必须消费调用方的**精确** ``decision_at``，且显式非法值 fail closed。"""
+
+    def test_same_session_intraday_decision_sees_only_earlier_evidence(self):
+        """同一 session 内 09:31 与 15:00 是两个不同的快照。"""
+        # 成交 09-17，但账本直到当天 13:00 才记录。
+        self.add_lot(qty=1000, session=D2, fill_id=1, order_id=1,
+                     recorded_at=f"{D2} 13:00:00")
+        early = self.context(session=D2, requested=1000,
+                             decision_at=f"{D2}T09:31:00+08:00")
+        late = self.context(session=D2, requested=1000,
+                            decision_at=f"{D2}T15:00:00+08:00")
+        self.assertNotEqual(early.unknown_quantity, 0,
+                            "09:31 时这笔 lot 还没被记录 → 不可见")
+        self.assertEqual(1000, early.unknown_quantity)
+        self.assertEqual(0, early.sellable_quantity)
+        self.assertEqual(1000, late.held_quantity)
+        self.assertEqual(1, len(late.lots))
+
+    def test_position_identity_keeps_the_exact_decision_at(self):
+        """仓位观察身份必须保留传入的精确 ``decision_at``，不得偷偷改成 15:00。"""
+        self.add_lot(qty=1000, session=D1, fill_id=1, order_id=1)
+        early = self.context(session=D2, requested=None,
+                             decision_at=f"{D2}T09:31:00+08:00")
+        late = self.context(session=D2, requested=None,
+                            decision_at=f"{D2}T15:00:00+08:00")
+        self.assertEqual(f"{D2}T09:31:00+08:00", early.decision_at)
+        self.assertEqual(f"{D2}T15:00:00+08:00", late.decision_at)
+        self.assertNotEqual(early.decision_at, late.decision_at)
+
+    def test_explicit_invalid_decision_at_is_invalid_not_silently_closed(self):
+        self.add_lot(qty=1000, session=D1, fill_id=1, order_id=1)
+        context = self.context(session=D2, requested=None, decision_at="not-a-time")
+        self.assertEqual(PE.PositionEvidenceStatus.INVALID, context.evidence_status)
+        self.assertIn("invalid_decision_at", context.diagnostics)
+        self.assertFalse(context.comparable)
+
+    def test_omitted_decision_at_falls_back_to_session_close(self):
+        self.add_lot(qty=1000, session=D1, fill_id=1, order_id=1)
+        context = self.context(session=D1_NEXT, requested=None)
+        self.assertEqual(ST.session_close_at(D1_NEXT), context.decision_at)
+
+    def test_explicit_invalid_validation_as_of_never_widens_to_unlimited(self):
+        """显式非法的 ``validation_as_of`` 绝不能变成"无上界"（future leak）。"""
+        self.add_lot(qty=1000, session=D1, fill_id=1, order_id=1,
+                     recorded_at="2030-01-01 10:00:00")
+        for bad in ("not-a-timestamp", "2026-13-45", "garbage"):
+            context = self.context(session=D2, requested=1000, as_of=bad)
+            self.assertEqual(PE.PositionEvidenceStatus.INVALID,
+                             context.evidence_status,
+                             f"显式非法 as_of={bad!r} 必须 fail closed")
+            self.assertIn("invalid_validation_as_of", context.diagnostics)
+            self.assertEqual(0, context.sellable_quantity)
+
+    def test_omitted_validation_as_of_keeps_the_live_contract(self):
+        self.add_lot(qty=1000, session=D1, fill_id=1, order_id=1)
+        context = self.context(session=D1_NEXT, requested=1000, as_of=None)
+        self.assertIsNone(context.validation_as_of)
+        self.assertEqual(1000, context.sellable_quantity)
+
+
+# ───────────────────────── IDENTITY 身份完整性 ─────────────────────────
+
+
+class IdentityIntegrityIsVerified(PositionTestCase):
+    """承重：``lot → order → fill`` 三方身份必须一致，不得借他人证据证明本 lot。"""
+
+    def test_cross_account_fill_cannot_prove_this_lot(self):
+        self.add_lot(qty=1000, session=D1, fill_id=1, order_id=1,
+                     fill_account=ACCOUNT_B)
+        context = self.context(session=D1_NEXT, requested=1000)
+        self.assertEqual(PE.AcquisitionStatus.IDENTITY_MISMATCH,
+                         context.lots[0].acquisition_status)
+        self.assertEqual(0, context.sellable_quantity)
+        self.assertFalse(context.comparable)
+
+    def test_cross_code_fill_cannot_prove_this_lot(self):
+        self.add_lot(qty=1000, session=D1, fill_id=1, order_id=1,
+                     fill_code="000002")
+        context = self.context(session=D1_NEXT, requested=1000)
+        self.assertEqual(PE.AcquisitionStatus.IDENTITY_MISMATCH,
+                         context.lots[0].acquisition_status)
+        self.assertEqual(0, context.sellable_quantity)
+
+    def test_cross_account_order_cannot_prove_this_lot(self):
+        self.add_lot(qty=1000, session=D1, fill_id=1, order_id=1,
+                     order_account=ACCOUNT_B)
+        context = self.context(session=D1_NEXT, requested=1000)
+        self.assertEqual(PE.AcquisitionStatus.IDENTITY_MISMATCH,
+                         context.lots[0].acquisition_status)
+        self.assertEqual(0, context.sellable_quantity)
+
+    def test_cross_code_order_cannot_prove_this_lot(self):
+        self.add_lot(qty=1000, session=D1, fill_id=1, order_id=1,
+                     order_code="000002")
+        context = self.context(session=D1_NEXT, requested=1000)
+        self.assertEqual(PE.AcquisitionStatus.IDENTITY_MISMATCH,
+                         context.lots[0].acquisition_status)
+
+    def test_an_identified_lot_still_proves_normally(self):
+        self.add_lot(qty=1000, session=D1, fill_id=1, order_id=1)
+        context = self.context(session=D1_NEXT, requested=1000)
+        self.assertEqual(PE.AcquisitionStatus.PROVEN,
+                         context.lots[0].acquisition_status)
+        self.assertEqual(1000, context.sellable_quantity)
+
+
+# ───────────────────────── QTY 请求卖出量必须严格合法 ─────────────────────────
+
+
+class RequestedSellQuantityMustBeStrictlyPositive(PositionTestCase):
+    """承重：非法 ``requested_sell_quantity`` 不得被强制成 0 后被判成可卖。"""
+
+    def setUp(self):
+        super().setUp()
+        self.add_lot(qty=1000, session=D1, fill_id=1, order_id=1)
+
+    def test_zero_negative_and_invalid_are_all_rejected(self):
+        for bad in (0, -1, -1000, "abc", "0", ""):
+            context = self.context(session=D1_NEXT, requested=bad)
+            self.assertEqual(PE.PositionEvidenceStatus.INVALID,
+                             context.evidence_status,
+                             f"requested={bad!r} 必须 fail closed")
+            self.assertIn("invalid_requested_sell_quantity", context.diagnostics)
+            self.assertFalse(context.comparable)
+            self.assertNotEqual(PE.SellabilityStatus.T1_SELLABLE,
+                                context.sellability_status)
+
+    def test_a_positive_quantity_still_works(self):
+        context = self.context(session=D1_NEXT, requested=1000)
+        self.assertEqual(PE.SellabilityStatus.T1_SELLABLE, context.sellability_status)
+
+    def test_oversized_request_is_blocked_not_accepted(self):
+        context = self.context(session=D1_NEXT, requested=1001)
+        self.assertEqual(PE.SellabilityStatus.T1_BLOCKED, context.sellability_status)
 
 
 if __name__ == "__main__":

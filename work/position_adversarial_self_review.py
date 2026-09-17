@@ -3,6 +3,10 @@
 
 用法: python work/position_adversarial_self_review.py
 只读；不触碰任何生产表。
+
+v2 追加的攻击面（规格 §1–§7 的 blocker）：
+历史数量重放、cycle/account 作用域、精确 decision_at、非法 validation_as_of、
+身份完整性、请求卖出量严格合法。
 """
 import os
 import sqlite3
@@ -36,6 +40,10 @@ NORMAL = "600001"
 ETF = "510300"
 ETF_NAME = "沪深300ETF"
 AS_OF = "2026-10-09T16:00:00+08:00"
+CYCLE = 1
+CYCLE_OLD = 0
+ACCOUNT = "A"
+ACCOUNT_B = "B"
 
 _checks = []
 
@@ -53,29 +61,59 @@ def fresh():
 
 
 def add_lot(conn, oid, code, session, qty, *, order_created=None, verified=True,
-            recorded=None, name=None, remaining=None, asset_type=None):
-    name = name or ("沪深300ETF" if code == ETF else "平安银行")
+            recorded=None, name=None, remaining=None, asset_type=None,
+            account=ACCOUNT, cycle_id=CYCLE, available_date=None,
+            order_account=None, order_code=None, fill_account=None,
+            fill_code=None):
+    name = name or (ETF_NAME if code == ETF else "平安银行")
     asset_type = asset_type or ("etf_t0" if code == ETF else "stock_t1")
     conn.execute(
         "INSERT INTO paper_orders(id,account_id,side,code,name,status,created_at,"
         "executed_at,execution_status,execution_verified,execution_evidence_source) "
         "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-        (oid, "A", "buy", code, name, "filled",
+        (oid, order_account or account, "buy", order_code or code, name, "filled",
          "%s 09:30:00" % (order_created or session), "%s 10:00:00" % session,
          "verified" if verified else "unknown", 1 if verified else 0, "ledger"),
     )
     conn.execute(
         "INSERT INTO paper_fills(id,order_id,account_id,side,code,qty,price,amount,"
         "fees,fill_date,quote_at,assumption) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
-        (oid, oid, "A", "buy", code, qty, 10.0, qty * 10.0, 0.0, session, None, "close"),
+        (oid, oid, fill_account or account, "buy", fill_code or code, qty, 10.0,
+         qty * 10.0, 0.0, session, None, "close"),
     )
     conn.execute(
         "INSERT INTO paper_position_lots(id,cycle_id,account_id,code,name,industry,"
         "qty,remaining_qty,cost,acquired_at,available_date,asset_type,source_order_id,"
         "cost_fee_included,is_t_base) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-        (oid, 1, "A", code, name, None, qty, qty if remaining is None else remaining,
-         10.0, "%s 10:00:00" % (recorded or session), "2026-10-01", asset_type, oid, 1, 1),
+        (oid, cycle_id, account, code, name, None, qty,
+         qty if remaining is None else remaining,
+         10.0, "%s 10:00:00" % (recorded or session),
+         available_date or "2026-10-01", asset_type, oid, 1, 1),
     )
+
+
+def add_sell_fill(conn, fid, oid, code, session, qty, *, account=ACCOUNT,
+                  verified=True, order_account=None, order_code=None,
+                  fill_account=None, fill_code=None):
+    conn.execute(
+        "INSERT INTO paper_orders(id,account_id,side,code,name,status,created_at,"
+        "executed_at,execution_status,execution_verified,execution_evidence_source) "
+        "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+        (oid, order_account or account, "sell", order_code or code, "平安银行",
+         "filled", "%s 09:30:00" % session, "%s 10:00:00" % session,
+         "verified" if verified else "unknown", 1 if verified else 0, "ledger"),
+    )
+    conn.execute(
+        "INSERT INTO paper_fills(id,order_id,account_id,side,code,qty,price,amount,"
+        "fees,fill_date,quote_at,assumption) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+        (fid, oid, fill_account or account, "sell", fill_code or code, qty, 10.0,
+         qty * 10.0, 0.0, session, None, "close"),
+    )
+
+
+def set_remaining(conn, lot_id, remaining):
+    conn.execute("UPDATE paper_position_lots SET remaining_qty=? WHERE id=?",
+                 (remaining, lot_id))
 
 
 def adapter(conn):
@@ -90,29 +128,35 @@ def adapter(conn):
     return PE.PositionEvidenceAdapter(conn, evidence_provider=provider)
 
 
+def ctx(a, code=NORMAL, *, session, account=ACCOUNT, cycle_id=CYCLE,
+        requested=None, as_of=None, decision_at=None):
+    return a.context_for(code, cycle_id=cycle_id, account_id=account,
+                         decision_session=session, decision_at=decision_at,
+                         validation_as_of=as_of,
+                         requested_sell_quantity=requested)
+
 def main():
     # 1) 真实成交 session vs 订单意图日期
     conn = fresh()
     add_lot(conn, 1, NORMAL, "2026-09-17", 1000, order_created="2026-09-16")
     a = adapter(conn)
-    ctx = a.context_for(NORMAL, account_id="A", decision_session="2026-09-17")
+    c = ctx(a, session="2026-09-17")
     check("真实 fill 覆盖意图日期",
-          ctx.lots[0].acquisition_session == "2026-09-17" and ctx.t1_locked_quantity == 1000)
+          c.lots[0].acquisition_session == "2026-09-17" and c.t1_locked_quantity == 1000)
 
     # 2) mixed lots 不得塌缩
     conn = fresh()
     add_lot(conn, 1, NORMAL, "2026-09-16", 1000)
     add_lot(conn, 2, NORMAL, "2026-09-17", 500)
     a = adapter(conn)
-    ctx = a.context_for(NORMAL, account_id="A", decision_session="2026-09-17")
+    c = ctx(a, session="2026-09-17")
     check("mixed lots 不塌缩",
-          ctx.t1_locked_quantity == 500 and ctx.sellable_quantity == 1000
-          and len(ctx.acquisition_sessions) == 2)
-    over = a.context_for(NORMAL, account_id="A", decision_session="2026-09-17",
-                         requested_sell_quantity=1200)
-    within = a.context_for(NORMAL, account_id="A", decision_session="2026-09-17",
-                           requested_sell_quantity=900)
-    check("partial sell 超可卖额被拦", over.sellability_status == PE.SellabilityStatus.T1_BLOCKED)
+          c.t1_locked_quantity == 500 and c.sellable_quantity == 1000
+          and len(c.acquisition_sessions) == 2)
+    over = ctx(a, session="2026-09-17", requested=1200)
+    within = ctx(a, session="2026-09-17", requested=900)
+    check("partial sell 超可卖额被拦",
+          over.sellability_status == PE.SellabilityStatus.T1_BLOCKED)
     check("partial sell 在可卖额内通过",
           within.sellability_status == PE.SellabilityStatus.T1_SELLABLE)
 
@@ -120,43 +164,37 @@ def main():
     conn = fresh()
     add_lot(conn, 1, NORMAL, "2026-09-17", 1000, recorded="2026-09-21 13:00:00")
     a = adapter(conn)
-    ctx = a.context_for(NORMAL, account_id="A", decision_session="2026-09-21",
-                        validation_as_of="2026-09-21T12:00:00+08:00")
+    c = ctx(a, session="2026-09-21", as_of="2026-09-21T12:00:00+08:00")
     check("未来证据不入快照",
-          ctx.sellable_quantity == 0 and ctx.unknown_quantity == 1000
-          and not ctx.comparable)
+          c.sellable_quantity == 0 and c.unknown_quantity == 1000
+          and not c.comparable)
 
     # 4) ETF T+0 不得被 T+1 overlay 阻断
     conn = fresh()
     add_lot(conn, 1, ETF, "2026-09-17", 1000)
     a = adapter(conn)
-    ctx = a.context_for(ETF, account_id="A", decision_session="2026-09-17",
-                        requested_sell_quantity=1000)
+    c = ctx(a, code=ETF, session="2026-09-17", requested=1000)
     check("ETF T+0 不被 T+1 阻断",
-          ctx.sellable_quantity == 1000
-          and ctx.sellability_status == PE.SellabilityStatus.T1_SELLABLE
-          and ctx.lots[0].asset_type_authority == "etf_t0")
+          c.sellable_quantity == 1000
+          and c.sellability_status == PE.SellabilityStatus.T1_SELLABLE
+          and c.lots[0].asset_type_authority == "etf_t0")
 
     # 5) 周末与法定假日
     conn = fresh()
     add_lot(conn, 1, NORMAL, "2026-09-18", 100)
     a = adapter(conn)
     check("周五→周一（周六不可卖）",
-          a.context_for(NORMAL, account_id="A",
-                        decision_session="2026-09-19").sellability_status
+          ctx(a, session="2026-09-19").sellability_status
           == PE.SellabilityStatus.T1_BLOCKED
-          and a.context_for(NORMAL, account_id="A",
-                            decision_session="2026-09-21").sellability_status
+          and ctx(a, session="2026-09-21").sellability_status
           == PE.SellabilityStatus.T1_SELLABLE)
     conn = fresh()
     add_lot(conn, 1, NORMAL, "2026-09-30", 100)
     a = adapter(conn)
     check("国庆假期：10-01 不可卖、10-08 可卖",
-          a.context_for(NORMAL, account_id="A",
-                        decision_session="2026-10-01").sellability_status
+          ctx(a, session="2026-10-01").sellability_status
           == PE.SellabilityStatus.T1_BLOCKED
-          and a.context_for(NORMAL, account_id="A",
-                            decision_session="2026-10-08").sellability_status
+          and ctx(a, session="2026-10-08").sellability_status
           == PE.SellabilityStatus.T1_SELLABLE)
 
     # 6) 零 authority：lot 账本不得被任何观察改写
@@ -165,9 +203,8 @@ def main():
     before = [tuple(r) for r in conn.execute(
         "SELECT id,remaining_qty,available_date FROM paper_position_lots")]
     a = adapter(conn)
-    for quantity in (None, 0, 500, 1000, 99999):
-        a.context_for(NORMAL, account_id="A", decision_session="2026-09-17",
-                      requested_sell_quantity=quantity)
+    for quantity in (None, 500, 1000, 99999):
+        ctx(a, session="2026-09-17", requested=quantity)
     after = [tuple(r) for r in conn.execute(
         "SELECT id,remaining_qty,available_date FROM paper_position_lots")]
     check("零 authority：lot 账本逐字节不变", before == after)
@@ -184,7 +221,8 @@ def main():
         "has_market_quote": True, "has_trade_volume": True,
     }))
     a = adapter(conn)
-    observer = PS.PositionShadowObserver(TS.ShadowComparator(repo), a, account_id="A")
+    observer = PS.PositionShadowObserver(TS.ShadowComparator(repo), a,
+                                        cycle_id=CYCLE, account_id=ACCOUNT)
     comparable = observer.observe(
         code=NORMAL, session="2026-09-17", side=ST.SIDE_SELL,
         production_verdict=ST.exit_tradability(a._evidence_provider(NORMAL, "2026-09-17"),
@@ -207,7 +245,7 @@ def main():
     add_lot(conn, 1, NORMAL, "2026-09-16", 1000)
     TA.ensure_schema(conn)
     a = adapter(conn)
-    buy = observer_buy = PS.PositionShadowObserver(None, a, account_id="A")
+    buy = PS.PositionShadowObserver(None, a, cycle_id=CYCLE, account_id=ACCOUNT)
     market = TS.ShadowComparator(TA.TradabilityArchiveRepository(conn)).compare(
         ST.entry_tradability(a._evidence_provider(NORMAL, "2026-09-17"),
                              code=NORMAL, entry_session="2026-09-17"),
@@ -223,6 +261,122 @@ def main():
           and observed.market_status == market.status
           and observed.held_quantity == 0
           and observed.requested_sell_quantity is None)
+
+    # ─────────── v2 新增攻击面（规格 §1–§7） ───────────
+
+    # 9) HIST-Q：今天余额绝不能冒充决策时点数量
+    conn = fresh()
+    add_lot(conn, 1, NORMAL, "2026-09-16", 1000, available_date="2026-09-17")
+    add_sell_fill(conn, 9, 9, NORMAL, "2026-09-17", 800)
+    set_remaining(conn, 1, 200)
+    a = adapter(conn)
+    c = ctx(a, session="2026-09-16")
+    check("历史数量：决策时点 1000 而非今天 200",
+          c.held_quantity == 1000 and c.quantity_basis == PE.QUANTITY_BASIS_HISTORICAL_REPLAY,
+          "held=%s basis=%s" % (c.held_quantity, c.quantity_basis))
+
+    # 10) 完全消耗的历史 lot 不得从快照消失
+    conn = fresh()
+    add_lot(conn, 1, NORMAL, "2026-09-16", 1000, available_date="2026-09-17")
+    add_sell_fill(conn, 9, 9, NORMAL, "2026-09-17", 1000)
+    set_remaining(conn, 1, 0)
+    a = adapter(conn)
+    c = ctx(a, session="2026-09-16")
+    check("完全消耗的 lot 仍在历史快照里",
+          c.held_quantity == 1000 and len(c.lots) == 1)
+
+    # 11) 不可重放 → fail closed，绝不退回当前余额
+    conn = fresh()
+    add_lot(conn, 1, NORMAL, "2026-09-16", 1000)
+    set_remaining(conn, 1, 200)
+    a = adapter(conn)
+    c = ctx(a, session="2026-09-16")
+    check("不可重放 → position_unprovable（不退回 200）",
+          c.evidence_status == PE.PositionEvidenceStatus.UNPROVABLE
+          and c.held_quantity != 200 and c.sellable_quantity == 0,
+          "held=%s" % c.held_quantity)
+
+    # 12) cycle 隔离
+    conn = fresh()
+    add_lot(conn, 1, NORMAL, "2026-09-16", 1000, cycle_id=CYCLE)
+    add_lot(conn, 2, NORMAL, "2026-09-16", 9000, cycle_id=CYCLE_OLD)
+    a = adapter(conn)
+    c = ctx(a, session="2026-09-17", cycle_id=CYCLE)
+    check("跨 cycle lot 不可见",
+          c.held_quantity == 1000 and len(c.lots) == 1 and c.cycle_id == CYCLE)
+
+    # 13) account 隔离（同 code 不同账户绝不池化）
+    conn = fresh()
+    add_lot(conn, 1, NORMAL, "2026-09-16", 1000, account=ACCOUNT)
+    add_lot(conn, 2, NORMAL, "2026-09-17", 500, account=ACCOUNT_B)
+    a = adapter(conn)
+    ca = ctx(a, session="2026-09-17", account=ACCOUNT)
+    cb = ctx(a, session="2026-09-17", account=ACCOUNT_B)
+    check("同 code 跨账户不池化",
+          ca.held_quantity == 1000 and cb.held_quantity == 500
+          and ca.held_quantity != 1500 and cb.held_quantity != 1500)
+
+    # 14) 缺作用域必须被拒绝
+    conn = fresh()
+    add_lot(conn, 1, NORMAL, "2026-09-16", 1000)
+    a = adapter(conn)
+    check("缺 account 作用域被拒绝",
+          ctx(a, session="2026-09-16", account=None).evidence_status
+          == PE.PositionEvidenceStatus.INVALID)
+    check("缺 cycle 作用域被拒绝",
+          ctx(a, session="2026-09-16", cycle_id=None).evidence_status
+          == PE.PositionEvidenceStatus.INVALID)
+
+    # 15) 精确 decision_at 必须被消费
+    conn = fresh()
+    add_lot(conn, 1, NORMAL, "2026-09-17", 1000, recorded="2026-09-17 13:00:00")
+    a = adapter(conn)
+    early = ctx(a, session="2026-09-17", decision_at="2026-09-17T09:31:00+08:00")
+    late = ctx(a, session="2026-09-17", decision_at="2026-09-17T15:00:00+08:00")
+    check("同 session 内精确 decision_at 生效",
+          early.unknown_quantity == 1000 and early.sellable_quantity == 0
+          and late.held_quantity == 1000)
+    check("身份保留精确 decision_at",
+          early.decision_at == "2026-09-17T09:31:00+08:00"
+          and late.decision_at == "2026-09-17T15:00:00+08:00")
+
+    # 16) 显式非法 validation_as_of 绝不放宽成无上界
+    conn = fresh()
+    add_lot(conn, 1, NORMAL, "2026-09-16", 1000, recorded="2030-01-01 10:00:00")
+    a = adapter(conn)
+    bad = ctx(a, session="2026-09-17", as_of="not-a-timestamp", requested=1000)
+    check("非法 validation_as_of → position_invalid",
+          bad.evidence_status == PE.PositionEvidenceStatus.INVALID
+          and bad.sellable_quantity == 0)
+
+    # 17) 身份完整性
+    conn = fresh()
+    add_lot(conn, 1, NORMAL, "2026-09-16", 1000, fill_account=ACCOUNT_B)
+    a = adapter(conn)
+    check("跨账户成交不能证明本 lot",
+          ctx(a, session="2026-09-17").lots[0].acquisition_status
+          == PE.AcquisitionStatus.IDENTITY_MISMATCH)
+    conn = fresh()
+    add_lot(conn, 1, NORMAL, "2026-09-16", 1000, order_code="000002")
+    a = adapter(conn)
+    check("跨股票委托不能证明本 lot",
+          ctx(a, session="2026-09-17").lots[0].acquisition_status
+          == PE.AcquisitionStatus.IDENTITY_MISMATCH)
+
+    # 18) 请求卖出量严格合法
+    conn = fresh()
+    add_lot(conn, 1, NORMAL, "2026-09-16", 1000)
+    a = adapter(conn)
+    bad_qty = [ctx(a, session="2026-09-17", requested=v)
+               for v in (0, -1, -1000, "abc", "0", "")]
+    check("非正/非法请求量全部 fail closed",
+          all(item.evidence_status == PE.PositionEvidenceStatus.INVALID
+              for item in bad_qty)
+          and all(item.sellability_status != PE.SellabilityStatus.T1_SELLABLE
+                  for item in bad_qty))
+    check("正数请求量仍正常工作",
+          ctx(a, session="2026-09-17", requested=1000).sellability_status
+          == PE.SellabilityStatus.T1_SELLABLE)
 
     failed = [name for name, ok in _checks if not ok]
     print("\n%d/%d checks passed" % (len(_checks) - len(failed), len(_checks)))

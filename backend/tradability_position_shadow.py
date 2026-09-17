@@ -117,6 +117,7 @@ class PositionShadowComparison:
     position_comparable: bool
 
     account_id: Optional[str]
+    cycle_id: Optional[int]
     held_quantity: int
     sellable_quantity: int
     t1_locked_quantity: int
@@ -142,6 +143,10 @@ class PositionShadowComparison:
         在不同次运行里必须落到同一行。仓位证据变了是**内容**变了，由
         :meth:`content` / :meth:`fingerprint` 负责暴露（同身份 + 冲突内容 → 由调用方
         fail closed，绝不 last-write-wins）。
+
+        注意 ``decision_at`` 是**精确时点**：调用方传入 09:31 与 15:00 是两次不同的
+        观察（同一 session 内仓位证据可能不同），因此它必须进身份，且**绝不**被
+        悄悄改写成 session close。
         """
         return (
             self.code,
@@ -162,6 +167,7 @@ class PositionShadowComparison:
             "position_sellability_status": self.position_sellability_status,
             "position_comparable": self.position_comparable,
             "account_id": self.account_id,
+            "cycle_id": self.cycle_id,
             "held_quantity": self.held_quantity,
             "sellable_quantity": self.sellable_quantity,
             "t1_locked_quantity": self.t1_locked_quantity,
@@ -201,6 +207,7 @@ class PositionShadowComparison:
             "position_sellability_status": self.position_sellability_status,
             "position_comparable": self.position_comparable,
             "account_id": self.account_id,
+            "cycle_id": self.cycle_id,
             "held_quantity": self.held_quantity,
             "sellable_quantity": self.sellable_quantity,
             "t1_locked_quantity": self.t1_locked_quantity,
@@ -286,15 +293,20 @@ class PositionShadowObserver:
 
     def __init__(self, comparator: Optional[TS.ShadowComparator],
                  adapter: PE.PositionEvidenceAdapter, *,
-                 account_id: Optional[str] = None):
+                 cycle_id: Any = None, account_id: Optional[str] = None):
         """``comparator=None`` = 调用方**每次都会**把算好的市场层面结果传进来。
 
         这条路径是给"市场层面已经在别处算过、本层只做叠加"的调用方用的（操作员 CLI
         就是如此）。此时若有人忘了传 ``market_comparison``，本层**报错**而不是现造
         一个市场层面结论 —— 现造就等于把市场层面的口径在这儿重算了一遍。
+
+        ``cycle_id`` 与 ``account_id`` 是仓位层的作用域：T+1 是**账户级**约束，
+        且 lot 归属**周期**。两者都必须显式给出，否则适配器会以
+        ``position_invalid`` 拒绝观察（**绝不**跨周期 / 跨账户池化）。
         """
         self._comparator = comparator
         self._adapter = adapter
+        self._cycle_id = cycle_id
         self._account_id = account_id
 
     def observe(self, *, code: Any, session: Any, side: Any,
@@ -309,6 +321,9 @@ class PositionShadowObserver:
         ``market_comparison`` 给出时直接复用（调用方已经算过）；否则用
         :meth:`TS.ShadowComparator.compare` 现算一条。**市场层面的东西一律不重算
         成别的口径** —— 本层只是叠加。
+
+        ``decision_at`` 是**精确时点**，原样交给仓位层：同一 session 内 09:31 与
+        15:00 看到的持仓证据可以不同。它**只**在确实没给时才回退到 session close。
         """
         code_text = _text(code) or ""
         session_text = str(session or "")[:10]
@@ -353,6 +368,7 @@ class PositionShadowObserver:
                 position_sellability_status=None,
                 position_comparable=False,
                 account_id=None,
+                cycle_id=None,
                 held_quantity=0, sellable_quantity=0,
                 t1_locked_quantity=0, unknown_quantity=0,
                 requested_sell_quantity=None,
@@ -362,8 +378,10 @@ class PositionShadowObserver:
 
         context = self._adapter.context_for(
             code_text,
+            cycle_id=self._cycle_id,
             account_id=self._account_id,
             decision_session=session_text,
+            decision_at=decision_at,
             validation_as_of=validation_as_of,
             requested_sell_quantity=requested_sell_quantity,
         )
@@ -381,7 +399,10 @@ class PositionShadowObserver:
 
         return PositionShadowComparison(
             code=code_text, session=session_text, side=side_text,
-            decision_at=context.decision_at,
+            # 身份里的 decision_at 是**仓位层实际使用的那个精确时点**：适配器给了
+            # 就用适配器的（它可能与调用方传入的字符串规范化形式不同），没给则是
+            # 市场层面那条的 decision_at。绝不用 session close 覆盖调用方的精确值。
+            decision_at=context.decision_at or decision_at,
             validation_as_of=context.validation_as_of,
             market_status=market_status,
             market_production_allowed=market_allowed,
@@ -390,6 +411,7 @@ class PositionShadowObserver:
             position_sellability_status=context.sellability_status,
             position_comparable=comparable,
             account_id=context.account_id,
+            cycle_id=context.cycle_id,
             held_quantity=context.held_quantity,
             sellable_quantity=context.sellable_quantity,
             t1_locked_quantity=context.t1_locked_quantity,
