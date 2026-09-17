@@ -88,7 +88,13 @@ def _default_observed_kind() -> str:
 CONTRACT_VERSION = "tradability-observation-ledger-v1"
 FINGERPRINT_VERSION = "sha256-canonical-observation-v1"
 MIGRATION_DESCRIPTION = "015_add_tradability_observation_ledger"
+MIGRATION_DESCRIPTION_LINKS = "017_add_tradability_archive_observation_links"
 LEDGER_TABLE = "tradability_observation_ledger"
+
+#: archive 事实行 → observation event 的**行级** provenance 链接（append-only）。
+#: 只由摄取写路径在**新插入** archive 行时写入，因此它证明的是"这条 archive 行与那次
+#: observation event 同处一个 ingestion transaction"，而不是"内容看起来一样"。
+ARCHIVE_LINK_TABLE = "tradability_archive_observation_links"
 
 #: 观察结果三态（与 :mod:`tradability_ingestion` 的 provider outcome 同源）。
 OBSERVED_EVIDENCE = "evidence"
@@ -110,6 +116,7 @@ __all__ = [
     "FINGERPRINT_VERSION",
     "MIGRATION_DESCRIPTION",
     "LEDGER_TABLE",
+    "ARCHIVE_LINK_TABLE",
     "OBSERVED_EVIDENCE",
     "OBSERVED_UNKNOWN",
     "OBSERVED_ERROR",
@@ -120,9 +127,12 @@ __all__ = [
     "ObservationEvent",
     "ObservationKnowledge",
     "ObservationCoverage",
+    "ArchiveObservationCoverage",
+    "reconcile_archive_rows",
     "normalize_error_identity",
     "observation_fingerprint",
     "ensure_ledger_schema",
+    "ensure_archive_link_schema",
     "ObservationLedgerRepository",
     "coverage",
 ]
@@ -442,6 +452,13 @@ class ObservationKnowledge:
     never_observed: bool = False
     legacy_observation_unknown: bool = False
 
+    #: archive 侧的**行级** provenance 对账结果（见 :class:`ArchiveObservationCoverage`）。
+    #: 这三个字段是 ``legacy_observation_unknown`` 的唯一依据：它问的是"有没有哪条
+    #: archive 行缺少写入时固定的 provenance 链接"，而不是"这条 pair 有没有 ledger 事件"。
+    archive_row_count: int = 0
+    archive_rows_with_observation_provenance: int = 0
+    archive_rows_without_observation_provenance: int = 0
+
     market_provable_at_decision: bool = False
     system_possessed_at_decision: bool = False
 
@@ -469,6 +486,13 @@ class ObservationKnowledge:
             "late_observed": self.late_observed,
             "never_observed": self.never_observed,
             "legacy_observation_unknown": self.legacy_observation_unknown,
+            "archive_row_count": self.archive_row_count,
+            "archive_rows_with_observation_provenance": (
+                self.archive_rows_with_observation_provenance
+            ),
+            "archive_rows_without_observation_provenance": (
+                self.archive_rows_without_observation_provenance
+            ),
             "market_provable_at_decision": self.market_provable_at_decision,
             "system_possessed_at_decision": self.system_possessed_at_decision,
             "observation_count": self.observation_count,
@@ -476,6 +500,131 @@ class ObservationKnowledge:
             "fingerprint": self.fingerprint,
             "contract_version": CONTRACT_VERSION,
         }
+
+
+@dataclass(frozen=True, slots=True)
+class ArchiveObservationCoverage:
+    """archive 事实行的**行级** observation provenance 对账结果。
+
+    这是"某条 archive 行当年是不是和某次观察一起落库"的**唯一权威实现**：调用方不得
+    自己写一套 ``covered = ...`` / ``legacy = ...``（多套实现必然漂移，而漂移的正是
+    issue #161 要修的诊断）。
+
+    口径刻意基于 **distinct archive row**，不是事件数、不是 provider 数：
+
+    * 一条 archive 行被 5 个后来的 observation event 重复观察到，它仍然只是 **1 条
+      被覆盖的行**——``archive_rows_with_observation_provenance <= archive_row_count``
+      恒成立，绝不会出现"5 个事件减 1 条事实 = -4"这种反向计数；
+    * 反过来，一条 pre-ledger 行**不会**因为今天又看到同内容证据而被算作有 provenance
+      ——"内容相同"与"写入时就有链接"是两件事（前者连 fingerprint 都可以相同）。
+
+    ``legacy_observation_unknown`` 的依据是"存在**没有** provenance 链接的 archive 行"，
+    而不是"这条 pair 的 ledger 事件数为 0"：mixed pair（既有 legacy 行、又有 ledger-era
+    行）因此必须被如实报出来，而不是被 pair 上任何一条事件掩盖。
+    """
+
+    archive_row_count: int = 0
+    covered_row_count: int = 0
+    uncovered_row_count: int = 0
+
+    @property
+    def has_uncovered_rows(self) -> bool:
+        """是否存在缺少写入时 provenance 的 archive 行（= 真正的 legacy 行）。"""
+        return self.uncovered_row_count > 0
+
+    def to_dict(self) -> dict:
+        return {
+            "archive_row_count": self.archive_row_count,
+            "covered_row_count": self.covered_row_count,
+            "uncovered_row_count": self.uncovered_row_count,
+            "has_uncovered_rows": self.has_uncovered_rows,
+            "contract_version": CONTRACT_VERSION,
+        }
+
+
+def _archive_row_identity(item: Any) -> Optional[tuple]:
+    """archive 事实行的**身份**：``(code, session_date, effective_at, observed_at)``。
+
+    这正是 archive 表的唯一键（见 ``tradability_archive.ensure_schema`` 的
+    ``UNIQUE(code, session_date, effective_at, observed_at)``）。provenance 链接必须
+    锚在这个身份上，而不是锚在 fingerprint 上——两边 fingerprint 属于不同的哈希域
+    （``sha256-canonical-tradability-v1`` vs ``sha256-canonical-observation-v1``），
+    直接比较只会得到"看起来相等"的假象。
+
+    接受映射（``code`` / ``session_date`` / ``effective_at`` / ``observed_at`` 键）或
+    等价四元组；身份不完整时返回 ``None``（调用方据此拒绝登记，而不是写一条残缺链接）。
+    """
+    if item is None:
+        return None
+
+    def _from(get: Any) -> Optional[tuple]:
+        code = _text(get("code"))
+        session = _canonical_session(get("session_date"))
+        effective_at = _canonical_instant(get("effective_at"))
+        observed_at = _canonical_instant(get("observed_at"))
+        if code is None or session is None or effective_at is None or observed_at is None:
+            return None
+        return (code, session, effective_at, observed_at)
+
+    if isinstance(item, Mapping):
+        return _from(item.get)
+    if hasattr(item, "keys") and hasattr(item, "__getitem__"):
+        # ``sqlite3.Row`` 等行对象：既不是 ``Mapping`` 也不支持属性访问，但支持按名索引。
+        # 漏掉这一类会让链接读回来时身份解析成 ``None``，对账恒为"未覆盖"——那正好把
+        # 修复本身变成新的假阴性。
+        return _from(lambda key: item[key] if key in item.keys() else None)
+    if hasattr(item, "code") and hasattr(item, "session_date"):
+        # ``TradabilityEvidence`` 等事实对象：按属性取身份。
+        return _from(lambda key: getattr(item, key, None))
+    try:
+        code, session, effective_at, observed_at = item
+    except (TypeError, ValueError):
+        return None
+    return _from(
+        lambda key: {
+            "code": code,
+            "session_date": session,
+            "effective_at": effective_at,
+            "observed_at": observed_at,
+        }.get(key)
+    )
+
+
+def reconcile_archive_rows(
+    archive_rows: Optional[Sequence[Any]],
+    links: Optional[Sequence[Any]],
+) -> ArchiveObservationCoverage:
+    """按**行级** provenance 对账 archive 事实行与 observation 链接。
+
+    ``archive_rows`` 是 archive 侧的事实行身份；``links`` 是
+    :data:`ARCHIVE_LINK_TABLE` 里的 provenance 链接。两者都接受映射（含
+    ``code`` / ``session_date`` / ``effective_at`` / ``observed_at`` 键）或等价的
+    四元组序列。
+
+    判据是**身份相等**（四元组逐一匹配），不是计数相减、也不是 fingerprint 相等：
+    只有链接表里真的存在指向这条行的记录，才说明它的写入与某次观察同处一个
+    ingestion transaction。
+
+    一条行被多条链接指向（同一次 run 的多个 provider 都观察到它）仍然只算 **1 条
+    被覆盖的行**——用集合去重，而不是把链接条数当覆盖数。
+    """
+    distinct_rows = {
+        identity
+        for identity in (_archive_row_identity(row) for row in (archive_rows or ()))
+        if identity is not None
+    }
+    linked = {
+        identity
+        for identity in (_archive_row_identity(link) for link in (links or ()))
+        if identity is not None
+    }
+    covered = len(distinct_rows & linked)
+    total = len(distinct_rows)
+    return ArchiveObservationCoverage(
+        archive_row_count=total,
+        covered_row_count=covered,
+        uncovered_row_count=total - covered,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -495,6 +644,11 @@ class ObservationCoverage:
     unknown_only_pairs: int = 0
     error_only_pairs: int = 0
     legacy_observation_unknown_pairs: int = 0
+
+    #: 缺 provenance 的 archive **事实行**数（不是 pair 数）。与
+    #: ``legacy_observation_unknown_pairs`` 刻意分开：一个 pair 可以含多行 legacy 事实，
+    #: 混用 pair count 与 row count 会同时高估 pair 数、低估行数。
+    legacy_archive_rows: int = 0
 
     late_evidence_pairs: int = 0
     system_possessed_at_decision: int = 0
@@ -517,6 +671,7 @@ class ObservationCoverage:
             "unknown_only_pairs": self.unknown_only_pairs,
             "error_only_pairs": self.error_only_pairs,
             "legacy_observation_unknown_pairs": self.legacy_observation_unknown_pairs,
+            "legacy_archive_rows": self.legacy_archive_rows,
             "late_evidence_pairs": self.late_evidence_pairs,
             "system_possessed_at_decision": self.system_possessed_at_decision,
             "market_provable_at_decision": self.market_provable_at_decision,
@@ -564,7 +719,68 @@ def ensure_ledger_schema(conn: sqlite3.Connection) -> dict:
         f"CREATE INDEX IF NOT EXISTS idx_{LEDGER_TABLE}_pair "
         f"ON {LEDGER_TABLE}(code, session_date, recorded_at)"
     )
-    return {"table": LEDGER_TABLE, "migration": MIGRATION_DESCRIPTION}
+    # 链接表与台账**同属一个 schema**：没有它，行级 provenance 对账就无法进行，任何
+    # 建了台账却缺链接表的库都会在诊断时直接报 "no such table"。两者必须一起存在，
+    # 因此这里一并确保（migration 017 仍保留，供已停在 v16 的既有库沿版本链升级）。
+    links = ensure_archive_link_schema(conn)
+    return {"table": LEDGER_TABLE, "migration": MIGRATION_DESCRIPTION,
+            "archive_observation_links": links}
+
+
+#: provenance 链接表的列序（显式列清单）。
+ARCHIVE_LINK_COLUMNS = (
+    "id", "code", "session_date", "effective_at", "observed_at",
+    "ingestion_run_id", "provider_id", "observation_fingerprint",
+    "recorded_at", "contract_version", "created_at",
+)
+
+
+def ensure_archive_link_schema(conn: sqlite3.Connection) -> dict:
+    """正式 migration 017 的建表函数（幂等）。**append-only** 行级 provenance 链接。
+
+    这张表回答的问题**只有一个**：
+
+        这条 archive 事实行，是不是由某次 ingestion run 在写入它的同一个
+        transaction 里、连同某个 observation event 一起产生的？
+
+    因此它的身份是 ``(archive 行身份, ingestion_run_id, provider_id,
+    observation_fingerprint)``——四个部分缺一不可：
+
+    * 只记 ``ingestion_run_id`` 不够：一次 run 会产生多行事实与多个事件；
+    * 只记 ``observation_fingerprint`` 不够：那只能证明"内容相同"，而一条 pre-ledger
+      行后来被重新观察到同内容证据时也会得到同一个指纹（见 issue #161 §五/§十三）。
+
+    它**不是**第二套判定层，也不含任何 ``can_*``：链接只说明"这条事实行当年是和哪次
+    观察一起落库的"，绝不决定任何订单能不能执行。
+
+    **绝不回填历史行**：升级前的 archive 行没有这种链接，那就是"原始观察时间不可知"
+    ——诚实答案是 ``legacy_observation_unknown``，而不是编一条假链接。旧数据不得伪造
+    link，本表只为**未来**的 ingestion 建立可靠 provenance。
+    """
+    conn.execute(
+        f"""
+        CREATE TABLE IF NOT EXISTS {ARCHIVE_LINK_TABLE}(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            code TEXT NOT NULL,
+            session_date TEXT NOT NULL,
+            effective_at TEXT NOT NULL,
+            observed_at TEXT NOT NULL,
+            ingestion_run_id TEXT NOT NULL,
+            provider_id TEXT NOT NULL,
+            observation_fingerprint TEXT NOT NULL,
+            recorded_at TEXT NOT NULL,
+            contract_version TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            UNIQUE(code, session_date, effective_at, observed_at,
+                   ingestion_run_id, provider_id, observation_fingerprint)
+        )
+        """
+    )
+    conn.execute(
+        f"CREATE INDEX IF NOT EXISTS idx_{ARCHIVE_LINK_TABLE}_pair "
+        f"ON {ARCHIVE_LINK_TABLE}(code, session_date)"
+    )
+    return {"table": ARCHIVE_LINK_TABLE, "migration": MIGRATION_DESCRIPTION_LINKS}
 
 
 #: 查询列序（显式列清单，不依赖 ``SELECT *`` 的顺序）。
@@ -612,6 +828,10 @@ class ObservationLedgerRepository:
     def ensure_schema(self) -> dict:
         return ensure_ledger_schema(self._conn)
 
+    def ensure_archive_link_schema(self) -> dict:
+        """确保行级 provenance 链接表存在（幂等）。"""
+        return ensure_archive_link_schema(self._conn)
+
     # ── 写（append-only） ──
     def append(self, event: ObservationEvent) -> bool:
         """追加一条观察事件。返回是否**新插入**。
@@ -638,6 +858,111 @@ class ObservationLedgerRepository:
 
     def append_many(self, events: Sequence[ObservationEvent]) -> int:
         return sum(1 for event in events if self.append(event))
+
+    # ── 写：archive 行级 provenance 链接（append-only） ──
+    def link_archive_row(
+        self,
+        evidence: Any,
+        *,
+        ingestion_run_id: Any,
+        provider_id: Any,
+        observation_fingerprint: Any,
+        recorded_at: Any,
+    ) -> bool:
+        """为一条**本次新插入**的 archive 事实行登记 provenance 链接。
+
+        调用方（摄取写路径）必须在**同一个 transaction** 内、且只在这条事实行确实是
+        本次 run 新插入时调用它。返回是否新插入（重复登记是 no-op）。
+
+        ``ingestion_run_id`` + ``observation_fingerprint`` 一起给出"这条事实行当年是
+        和哪次观察一起落库的"证据；单独任一个都不足以证明 provenance。
+        """
+        identity = _archive_row_identity(evidence)
+        if identity is None:
+            raise ObservationError(f"archive 行身份不完整，无法登记 provenance: {evidence!r}")
+        run_text = _text(ingestion_run_id)
+        provider_text = _text(provider_id)
+        fingerprint_text = _text(observation_fingerprint)
+        moment = _canonical_instant(recorded_at)
+        if run_text is None or provider_text is None or fingerprint_text is None:
+            raise ObservationError("provenance 链接缺少 ingestion_run_id / provider / 指纹")
+        if moment is None:
+            raise ObservationError("provenance 链接缺少可解析的 recorded_at")
+        cursor = self._conn.execute(
+            f"""INSERT OR IGNORE INTO {ARCHIVE_LINK_TABLE}(
+                    code, session_date, effective_at, observed_at,
+                    ingestion_run_id, provider_id, observation_fingerprint,
+                    recorded_at, contract_version, created_at)
+                VALUES(?,?,?,?,?,?,?,?,?,?)""",
+            (
+                identity[0], identity[1], identity[2], identity[3],
+                run_text, provider_text, fingerprint_text,
+                moment, CONTRACT_VERSION, now_utc(),
+            ),
+        )
+        return bool(cursor.rowcount)
+
+    def append_links(self, links: Sequence[Mapping[str, Any]]) -> int:
+        """批量登记 provenance 链接（每项须含 ``evidence`` 与链接字段）。"""
+        written = 0
+        for link in links:
+            if self.link_archive_row(
+                link.get("evidence"),
+                ingestion_run_id=link.get("ingestion_run_id"),
+                provider_id=link.get("provider_id"),
+                observation_fingerprint=link.get("observation_fingerprint"),
+                recorded_at=link.get("recorded_at"),
+            ):
+                written += 1
+        return written
+
+    # ── 读：provenance 链接与行级对账 ──
+    def archive_links(self, code: Any = None, session: Any = None) -> list:
+        """该 ``(code, session)`` 的 provenance 链接。
+
+        **刻意不按 ``recorded_at`` 过滤**：链接说明的是 archive 行**写入时**的结构性
+        provenance 类型，不是"截至某时点我们知道什么"。用它做 PIT 过滤会把一条确定是
+        ledger-era 的行错标成 legacy（见 issue #161 §十四）。
+        """
+        clauses: list = []
+        params: list = []
+        code_text = _text(code)
+        if code_text is not None:
+            clauses.append("code=?")
+            params.append(code_text)
+        session_text = _canonical_session(session)
+        if session_text is not None:
+            clauses.append("session_date=?")
+            params.append(session_text)
+        where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+        return self._conn.execute(
+            f"SELECT {', '.join(ARCHIVE_LINK_COLUMNS)} FROM {ARCHIVE_LINK_TABLE}{where}",
+            params,
+        ).fetchall()
+
+    def reconcile_archive_coverage(
+        self, code: Any, session: Any, archive_rows: Optional[Sequence[Any]] = None
+    ) -> ArchiveObservationCoverage:
+        """按行级 provenance 对账该 pair 的 archive 事实行。
+
+        传入 ``archive_rows`` 时按调用方给出的行身份对账；未传入时按本连接可见的
+        archive 链接能覆盖的行来报告（``archive_row_count`` 等于被链接的行数，因此
+        ``uncovered`` 为 0——**没有行身份就无法声称某行缺 provenance**，绝不凭空
+        判 legacy）。
+        """
+        links = self.archive_links(code, session)
+        if archive_rows is None:
+            linked = {
+                _archive_row_identity(link)
+                for link in links
+            }
+            linked.discard(None)
+            return ArchiveObservationCoverage(
+                archive_row_count=len(linked),
+                covered_row_count=len(linked),
+                uncovered_row_count=0,
+            )
+        return reconcile_archive_rows(archive_rows, links)
 
     # ── 读（全部 PIT） ──
     def events(
@@ -731,7 +1056,7 @@ class ObservationLedgerRepository:
         *,
         validation_as_of: Any = None,
         decision_at: Any = None,
-        archive_has_row: bool = False,
+        archive_rows: Optional[Sequence[Any]] = None,
     ) -> ObservationKnowledge:
         """截至 ``validation_as_of`` 的观察知识（PIT）。
 
@@ -739,10 +1064,23 @@ class ObservationLedgerRepository:
         ``source_observed_at`` 与 ``effective_at`` 都不晚于 decision）与
         ``system_possessed_at_decision``（系统口径：``recorded_at <= decision_at``）。
 
-        ``archive_has_row`` 让调用方声明"archive 里确实有这条 pair 的行"。当 ledger
-        里**完全没有**该 pair 的事件、而 archive 有行时，那是升级前的历史数据：真实
-        ``first_seen_at`` 无法反推，因此记 ``legacy_observation_unknown``，
-        **绝不**把 ``archive.created_at`` 或 ``session_date`` 伪装成 first_seen。
+        ``archive_rows`` 是调用方给出的**该 pair 的 archive 事实行身份**，用来做
+        **行级** provenance 对账：哪些行当年是与某次观察一起落库的（有链接），哪些行
+        没有（真正的升级前历史数据）。**必须**传行身份而不是一个 ``bool``——一个
+        "这条 pair 有没有事实行"的布尔无法表达"2 行里 1 行是 legacy"，正是 issue #161
+        的第二个 bug。
+
+        判据是行级对账结果，**不是**"ledger 里有没有事件"：
+
+        * 一条 ledger-era 行即使在某历史知识时点看不到观察事件（``recorded_at`` 晚于
+          ``validation_as_of``），它的 provenance 类型依然是 ledger-era，因此
+          ``legacy_observation_unknown`` 为假——它当时只是"不可见"，不是"从来不知道"；
+        * 一条真正的 pre-ledger 行不会因为今天又观察到同内容证据而被洗白成有 provenance；
+        * mixed pair 里只要有**一行**缺 provenance，``legacy_observation_unknown`` 就是真。
+
+        ``first_seen_at`` 仍只来自真正的 ledger events；历史行没有可证明的首次观察时间，
+        就诚实地说不知道——**绝不**把 ``archive.created_at`` 或 ``session_date`` 伪装成
+        first_seen。
         """
         code_text = _text(code) or ""
         session_text = _canonical_session(session) or ""
@@ -793,7 +1131,24 @@ class ObservationLedgerRepository:
             late = not system_possessed
 
         never = not rows
-        legacy = never and bool(archive_has_row)
+
+        # ── 行级 provenance 对账（issue #161 的核心修复） ──
+        #
+        # 旧逻辑是 ``legacy = never and bool(archive_has_row)``：它问的是"这条 pair 有
+        # 没有 ledger 事件"，于是把两件不同的事混成一件——(1) 一条 ledger-era 行在某历史
+        # 知识时点看不到事件（它只是不可见），(2) 一条真正的升级前历史行。前者被误报成
+        # legacy，就是生产环境里 24 行新摄取事实全被标 legacy 的假诊断；后者在 mixed pair
+        # 里又会被同 pair 的其它事件掩盖。
+        #
+        # 现在按**行**对账：调用方给出该 pair 的 archive 行身份，本仓储用写入时固定的
+        # provenance 链接逐行判断。没有行身份时无法声称任何一行缺 provenance，因此
+        # 不判 legacy（fail closed：宁可不说，也不凭空指控历史数据）。
+        archive_coverage = (
+            self.reconcile_archive_coverage(code_text, session_text, archive_rows)
+            if archive_rows is not None
+            else ArchiveObservationCoverage()
+        )
+        legacy = archive_coverage.has_uncovered_rows
 
         knowledge = ObservationKnowledge(
             code=code_text,
@@ -809,6 +1164,13 @@ class ObservationLedgerRepository:
             late_observed=late,
             never_observed=never,
             legacy_observation_unknown=legacy,
+            archive_row_count=archive_coverage.archive_row_count,
+            archive_rows_with_observation_provenance=(
+                archive_coverage.covered_row_count
+            ),
+            archive_rows_without_observation_provenance=(
+                archive_coverage.uncovered_row_count
+            ),
             market_provable_at_decision=market_provable,
             system_possessed_at_decision=system_possessed,
             observation_count=len(rows),
@@ -824,6 +1186,8 @@ class ObservationLedgerRepository:
                     "last_seen_at", "provider_outcomes", "provider_ids", "evidence_seen",
                     "first_evidence_seen_at", "provable_at_decision", "late_observed",
                     "never_observed", "legacy_observation_unknown",
+                    "archive_row_count", "archive_rows_with_observation_provenance",
+                    "archive_rows_without_observation_provenance",
                     "market_provable_at_decision", "system_possessed_at_decision",
                     "observation_count", "provider_count",
                 )
@@ -859,28 +1223,36 @@ def coverage(
     *,
     validation_as_of: Any = None,
     decision_at: Any = None,
-    archive_pairs: Optional[Sequence[tuple]] = None,
+    archive_rows_by_pair: Optional[Mapping[tuple, Sequence[Any]]] = None,
 ) -> ObservationCoverage:
     """按 **requested code-session pairs** 统计 observation coverage。
 
     ``pairs`` 里的每个 ``(code, session)`` 只计 **1 个 pair**，无论它有多少个观察事件、
     多少个 provider。事件数单独报告为 ``observation_events``。
 
-    ``archive_pairs`` 用于识别"archive 有行、ledger 无事件"的升级前历史数据
-    （``legacy_observation_unknown_pairs``）。
+    ``archive_rows_by_pair`` 把每个 ``(code, session)`` 映射到它的 archive **事实行身份
+    列表**，用来做行级 provenance 对账：
+
+    * ``legacy_observation_unknown_pairs`` 仍然按 **distinct code-session pair** 计数
+      ——一个 pair 里哪怕有 3 条 legacy 行，它也只是 **1 个 pair**；
+    * 行数单独报告为 ``legacy_archive_rows``，绝不与 pair count 混为一谈。
+
+    ``legacy`` 的判据是"这个 pair 存在**缺少写入时 provenance** 的 archive 行"，不是
+    "这个 pair 的 ledger 事件数为 0"。
     """
     as_of_text = _canonical_instant(validation_as_of) if validation_as_of is not None else None
     if validation_as_of is not None and as_of_text is None:
         raise ObservationError(f"非法 validation_as_of: {validation_as_of!r}")
     decision_text = _canonical_instant(decision_at) if decision_at is not None else None
 
-    archive_set = {
-        (_text(code) or "", _canonical_session(session) or "")
-        for code, session in (archive_pairs or ())
+    archive_rows_map = {
+        (_text(code) or "", _canonical_session(session) or ""): rows
+        for (code, session), rows in (archive_rows_by_pair or {}).items()
     }
 
     requested = observed = never = evidence_pairs = unknown_only = error_only = 0
     legacy_pairs = late = possessed = provable = 0
+    legacy_rows = 0
     events_total = 0
     seen: set = set()
 
@@ -894,12 +1266,22 @@ def coverage(
         seen.add(key)
         requested += 1
 
+        # 行级对账与 PIT 可见性**互相独立**：provenance 类型是 archive 行自身的属性，
+        # 不随 validation_as_of 变化（见 issue #161 §十四）。
+        archive_rows = archive_rows_map.get(key)
+        pair_coverage = (
+            repository.reconcile_archive_coverage(code_text, session_text, archive_rows)
+            if archive_rows is not None
+            else None
+        )
+        if pair_coverage is not None and pair_coverage.has_uncovered_rows:
+            legacy_pairs += 1
+            legacy_rows += pair_coverage.uncovered_row_count
+
         rows = repository.events(code_text, session_text, as_of=as_of_text)
         events_total += len(rows)
         if not rows:
             never += 1
-            if key in archive_set:
-                legacy_pairs += 1
             continue
 
         observed += 1
@@ -942,6 +1324,7 @@ def coverage(
         unknown_only_pairs=unknown_only,
         error_only_pairs=error_only,
         legacy_observation_unknown_pairs=legacy_pairs,
+        legacy_archive_rows=legacy_rows,
         late_evidence_pairs=late,
         system_possessed_at_decision=possessed,
         market_provable_at_decision=provable,

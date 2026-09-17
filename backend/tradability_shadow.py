@@ -612,21 +612,34 @@ class ShadowComparator:
                 session,
                 validation_as_of=validation_as_of,
                 decision_at=decision_at,
-                archive_has_row=self._archive_has_row(code, session),
+                archive_rows=self._archive_rows(code, session),
             )
         except OL.ObservationError:
             return None
 
-    def _archive_has_row(self, code: str, session: str) -> bool:
-        """archive 里是否存在该 pair 的**任何**行（用于识别升级前的历史数据）。
+    def _archive_rows(self, code: str, session: str) -> list:
+        """archive 里该 pair 的**全部事实行身份**（用于行级 provenance 对账）。
 
-        这个查询**只**用于诊断标签（"历史数据，真实观察时间不可知"），不参与任何
-        verdict；而且它问的是"这条 pair 有没有事实行"，不是"它当时可不可见"。
+        刻意返回**行身份**而不是一个"有没有行"的布尔：一条 pair 可能同时含 legacy 行与
+        ledger-era 行，布尔无法表达这种 mixed 情形，正是 issue #161 的第二个 bug。
+
+        这个查询**只**用于诊断标签（"这行事实的原始观察时间是否可知"），不参与任何
+        verdict；而且它取的是**行自身**的身份，不做 ``decision_at`` 可见性过滤——行是不是
+        ledger-era 是它自己的属性，不随我们站在哪个知识时点看它而改变。
         """
         try:
-            return bool(self._repo.visible_evidence(code, session, _FAR_FUTURE))
+            evidence_rows = self._repo.visible_evidence(code, session, _FAR_FUTURE)
         except Exception:  # pragma: no cover - 防御 repository 实现差异
-            return False
+            return []
+        return [
+            {
+                "code": getattr(row, "code", None),
+                "session_date": getattr(row, "session_date", None),
+                "effective_at": getattr(row, "effective_at", None),
+                "observed_at": getattr(row, "observed_at", None),
+            }
+            for row in evidence_rows
+        ]
 
     # ── 生产侧 ──
     def _production_side(self, verdict: Any) -> dict:

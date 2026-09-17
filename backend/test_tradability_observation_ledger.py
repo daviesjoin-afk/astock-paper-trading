@@ -341,14 +341,20 @@ class CoverageDenominator(LedgerTestCase):
 
 class LegacyArchiveHandling(LedgerTestCase):
     def test_legacy_rows_do_not_get_a_fabricated_first_seen(self):
-        """archive 有行、ledger 无事件 = 升级前数据：不得伪造 first_seen。"""
+        """archive 有行、无 provenance 链接 = 升级前数据：不得伪造 first_seen。"""
         knowledge = self.ledger.knowledge_at(
-            CODE, SESSION, decision_at=DECISION, archive_has_row=True
+            CODE, SESSION, decision_at=DECISION,
+            archive_rows=[{
+                "code": CODE, "session_date": SESSION,
+                "effective_at": "2024-01-10T15:05:00+08:00",
+                "observed_at": "2024-01-10T15:05:00+08:00",
+            }],
         )
         self.assertTrue(knowledge.never_observed)
         self.assertTrue(knowledge.legacy_observation_unknown)
         self.assertIsNone(knowledge.first_seen_at)
         self.assertIsNone(knowledge.first_evidence_seen_at)
+        self.assertEqual(1, knowledge.archive_rows_without_observation_provenance)
 
 
 # ───────────────────── 摄取集成：replay fingerprint ─────────────────────
@@ -546,6 +552,44 @@ class MissingVersusUnprovable(unittest.TestCase):
         )
         self.assertIsNone(comparison.first_observed_at)
 
+    def test_ledger_era_row_is_not_diagnosed_legacy_at_a_historical_as_of(self):
+        """issue #161 端到端：ledger-era 行在历史知识时点**不得**被判 legacy。
+
+        这是生产环境里的假诊断：事实行是升级后由 ledger-era run 写入的（有行级
+        provenance），但站在 decision 当时的知识时点看不到任何观察事件。旧逻辑只看
+        "pair 有没有 ledger 事件"，于是把它误标成"升级前历史数据"。
+        """
+        self.conn.execute(
+            f"INSERT INTO {TA.ARCHIVE_TABLE}(code, session_date, effective_at, "
+            "observed_at, is_listed, source, created_at) VALUES(?,?,?,?,?,?,?)",
+            (CODE, SESSION, "2024-01-09T00:00:00+08:00",
+             "2026-01-01T00:00:00+08:00", 1, "listing", "2026-01-01T00:00:00+08:00"),
+        )
+        # 该行的写入有行级 provenance（本次 run 与观察一起落库），但观察发生在
+        # decision 之后很久 → 在历史快照里不可见。
+        self.ledger.link_archive_row(
+            {
+                "code": CODE, "session_date": SESSION,
+                "effective_at": "2024-01-09T00:00:00+08:00",
+                "observed_at": "2026-01-01T00:00:00+08:00",
+            },
+            ingestion_run_id=RUN, provider_id="listing",
+            observation_fingerprint="fp-1", recorded_at="2026-01-01T00:00:00+08:00",
+        )
+        comparison = self.compare(validation_as_of="2024-01-12T00:00:00+08:00")
+        # 当时确实没有可用证据 → archive_missing；但它**不是** legacy。
+        self.assertEqual(TS.ShadowStatus.ARCHIVE_MISSING.value, comparison.status)
+        self.assertEqual(
+            TS.ShadowStatus.ARCHIVE_NEVER_OBSERVED.value, comparison.archive_diagnostic
+        )
+        self.assertNotEqual(
+            TS.ShadowStatus.ARCHIVE_LEGACY_OBSERVATION_UNKNOWN.value,
+            comparison.archive_diagnostic,
+        )
+        self.assertIsNone(comparison.first_observed_at)
+        # 顶层分类仍然是 not_comparable：修复诊断不得改变 agreement 分母。
+        self.assertFalse(comparison.comparable)
+
     def test_missing_and_unprovable_never_enter_disagreement(self):
         self.ledger.append(event(recorded_at="2024-01-15T16:00:00+08:00"))
         early = self.compare(validation_as_of="2024-01-12T00:00:00+08:00")
@@ -733,7 +777,11 @@ class MigrationPreservesExistingArchiveRows(unittest.TestCase):
         # 也不得让 Shadow 假称知道 first_seen。
         knowledge = OL.ObservationLedgerRepository(conn).knowledge_at(
             "000001", "2024-01-10", decision_at="2024-01-10T16:00:00+08:00",
-            archive_has_row=True,
+            archive_rows=[{
+                "code": "000001", "session_date": "2024-01-10",
+                "effective_at": "2024-01-10T15:05:00+08:00",
+                "observed_at": "2024-01-10T15:05:00+08:00",
+            }],
         )
         self.assertTrue(knowledge.legacy_observation_unknown)
         self.assertIsNone(knowledge.first_seen_at)
@@ -769,6 +817,291 @@ class MigrationPreservesExistingArchiveRows(unittest.TestCase):
         # 描述里出现的是中文术语（"观察台账" / "Shadow"），断言用它们而不是英文模块名。
         self.assertIn("观察台账", descriptions[15])
         self.assertIn("Shadow", descriptions[16])
+        # v17：行级 provenance 链接表（issue #161）。
+        self.assertIn(17, descriptions)
+        self.assertIn("链接", descriptions[17])
+
+
+# ═════════════════ issue #161 回归矩阵 L161-1 … L161-8 ═════════════════
+#
+# 每个用例都直接对着**行级 provenance 对账**这个修复点，而不是对着实现细节：
+# 断言的是"哪些行被算作有 provenance"，以及由此得出的 legacy 诊断。
+
+
+def _row(effective_at="2024-01-10T15:05:00+08:00", observed_at="2024-01-10T15:05:00+08:00",
+         code=CODE, session=SESSION):
+    return {
+        "code": code, "session_date": session,
+        "effective_at": effective_at, "observed_at": observed_at,
+    }
+
+
+class Issue161RegressionMatrix(LedgerTestCase):
+    """L161-1 … L161-8：issue #161 的完整回归矩阵。"""
+
+    def _knowledge(self, rows, **kwargs):
+        return self.ledger.knowledge_at(CODE, SESSION, decision_at=DECISION,
+                                        archive_rows=rows, **kwargs)
+
+    def _link(self, row, run_id=RUN, provider_id="listing", fingerprint="fp-1",
+              recorded_at="2024-01-10T16:00:00+08:00"):
+        self.ledger.link_archive_row(
+            row, ingestion_run_id=run_id, provider_id=provider_id,
+            observation_fingerprint=fingerprint, recorded_at=recorded_at,
+        )
+
+    def test_l161_1_all_rows_covered_is_not_legacy(self):
+        """L161-1：行由 ledger-era 摄取创建、有链接 → uncovered=0，不是 legacy。
+
+        这正是 issue 的假阳性场景：pair 在历史知识时点看不到事件，但行本身是
+        ledger-era 的。
+        """
+        row = _row()
+        self._link(row)
+        knowledge = self._knowledge(
+            [row], validation_as_of="2024-01-10T00:00:00+08:00"
+        )
+        self.assertEqual(1, knowledge.archive_row_count)
+        self.assertEqual(1, knowledge.archive_rows_with_observation_provenance)
+        self.assertEqual(0, knowledge.archive_rows_without_observation_provenance)
+        self.assertFalse(knowledge.legacy_observation_unknown)
+
+    def test_l161_2_pure_legacy_is_legacy(self):
+        """L161-2：pre-ledger 行、无原始 provenance → uncovered=1，legacy。"""
+        knowledge = self._knowledge([_row()])
+        self.assertEqual(1, knowledge.archive_rows_without_observation_provenance)
+        self.assertTrue(knowledge.legacy_observation_unknown)
+        self.assertIsNone(knowledge.first_seen_at)
+
+    def test_l161_3_mixed_pair_reports_covered_and_uncovered(self):
+        """L161-3：2 行（1 legacy + 1 covered）→ covered=1、uncovered=1、legacy。"""
+        covered = _row(effective_at="2024-01-10T15:05:00+08:00")
+        legacy = _row(effective_at="2024-01-10T14:00:00+08:00",
+                      observed_at="2024-01-10T14:00:00+08:00")
+        self._link(covered)
+        knowledge = self._knowledge([covered, legacy])
+        self.assertEqual(2, knowledge.archive_row_count)
+        self.assertEqual(1, knowledge.archive_rows_with_observation_provenance)
+        self.assertEqual(1, knowledge.archive_rows_without_observation_provenance)
+        self.assertTrue(knowledge.legacy_observation_unknown)
+
+    def test_l161_4_repeated_observations_do_not_over_count(self):
+        """L161-4：1 条行 + 5 次重复观察 → covered 恒为 1，不出现反向计数/over-count。
+
+        两处都必须去重，否则会数出"比事实行还多"的覆盖数：
+
+        * 同一行被**多个 provider** 观察到 → 5 条链接，但仍是 1 条被覆盖的行；
+        * 同一行身份在入参里**重复出现**（调用方按 join 展开时很常见）→ 仍然是 1 条行，
+          否则 ``covered`` 会大于 ``archive_row_count``，正是 issue #161 §十一 禁止的
+          over-count。
+        """
+        row = _row()
+        # 5 个 provider 都观察到同一条事实：链接 5 条，但仍是 1 条被覆盖的行。
+        for index in range(5):
+            self._link(row, provider_id=f"p{index}", fingerprint=f"fp-{index}")
+        # 行身份重复给出三次：去重后仍是 1 条 distinct 行。
+        knowledge = self._knowledge([row, row, row])
+        self.assertEqual(1, knowledge.archive_row_count)
+        self.assertEqual(1, knowledge.archive_rows_with_observation_provenance)
+        self.assertEqual(0, knowledge.archive_rows_without_observation_provenance)
+        # 覆盖数绝不能超过事实行数（issue #161 §十一：不得出现 legacy = -4 这类反向计数）。
+        self.assertLessEqual(
+            knowledge.archive_rows_with_observation_provenance,
+            knowledge.archive_row_count,
+        )
+        self.assertGreaterEqual(knowledge.archive_row_count, 0)
+
+    def test_l161_4b_duplicate_uncovered_rows_count_once(self):
+        """L161-4 补充：重复给出的**未覆盖**行也不得重复计数。"""
+        legacy = _row()
+        knowledge = self._knowledge([legacy, legacy, legacy])
+        self.assertEqual(1, knowledge.archive_row_count)
+        self.assertEqual(1, knowledge.archive_rows_without_observation_provenance)
+
+    def test_l161_5_later_reobservation_does_not_whitewash_legacy_row(self):
+        """L161-5：pre-ledger 行后来被重新观察到同内容证据 → 仍然 legacy。"""
+        legacy = _row()
+        # 后来的 run 观察到**同一内容**（同一条行身份），但那不构成"写入时就有链接"。
+        self.ledger.append(event(run_id="later-run"))
+        knowledge = self._knowledge([legacy])
+        self.assertTrue(knowledge.legacy_observation_unknown)
+        self.assertEqual(1, knowledge.archive_rows_without_observation_provenance)
+
+    def test_l161_6_unknown_and_error_do_not_cover_evidence_row(self):
+        """L161-6：只有 unknown/error 观察 → 不覆盖 archive 事实行。"""
+        self.ledger.append(event(status=OL.OBSERVED_UNKNOWN))
+        self.ledger.append(event(status=OL.OBSERVED_ERROR, error="TimeoutError: x"))
+        knowledge = self._knowledge([_row()])
+        self.assertEqual(0, knowledge.archive_rows_with_observation_provenance)
+        self.assertEqual(1, knowledge.archive_rows_without_observation_provenance)
+        self.assertTrue(knowledge.legacy_observation_unknown)
+
+    def test_l161_7_post_ledger_row_stays_non_legacy_when_as_of_is_earlier(self):
+        """L161-7：post-ledger 行有固定链接，但 recorded_at > validation_as_of。
+
+        该行在历史快照里**不可见**，但它不是 legacy——结构性 provenance 不随知识时点
+        变化。这是 #161 生产环境里出现的假诊断。
+        """
+        row = _row()
+        self._link(row, recorded_at="2024-06-01T16:00:00+08:00")
+        knowledge = self._knowledge(
+            [row], validation_as_of="2024-01-10T00:00:00+08:00"
+        )
+        self.assertTrue(knowledge.never_observed)
+        self.assertFalse(knowledge.legacy_observation_unknown)
+        self.assertFalse(knowledge.evidence_seen)
+
+    def test_l161_8_no_archive_row_is_never_legacy(self):
+        """L161-8：archive_row_count = 0 → 永远 legacy = false。"""
+        empty = self._knowledge([])
+        self.assertEqual(0, empty.archive_row_count)
+        self.assertFalse(empty.legacy_observation_unknown)
+
+        # 连 archive_rows 都不给（调用方无法声称任何行缺 provenance）也不得判 legacy。
+        none_given = self.ledger.knowledge_at(CODE, SESSION, decision_at=DECISION)
+        self.assertFalse(none_given.legacy_observation_unknown)
+
+
+class Issue161CoverageKeepsPairAndRowCountsSeparate(LedgerTestCase):
+    """§二十八：pair count 与 row count 不得混淆。"""
+
+    def test_legacy_pairs_are_distinct_pairs_and_rows_are_counted_separately(self):
+        legacy_a = _row(effective_at="2024-01-10T14:00:00+08:00",
+                        observed_at="2024-01-10T14:00:00+08:00")
+        legacy_b = _row(effective_at="2024-01-10T13:00:00+08:00",
+                        observed_at="2024-01-10T13:00:00+08:00")
+        report = OL.coverage(
+            self.ledger,
+            [(CODE, SESSION)],
+            validation_as_of="2026-01-01T00:00:00+08:00",
+            archive_rows_by_pair={(CODE, SESSION): [legacy_a, legacy_b]},
+        )
+        # 一个 pair 里有 2 条 legacy 行：pair 只算 1 个，行数如实报 2。
+        self.assertEqual(1, report.legacy_observation_unknown_pairs)
+        self.assertEqual(2, report.legacy_archive_rows)
+
+    def test_covered_pair_is_not_counted_as_legacy(self):
+        row = _row()
+        self.ledger.link_archive_row(
+            row, ingestion_run_id=RUN, provider_id="listing",
+            observation_fingerprint="fp-1", recorded_at="2024-01-10T16:00:00+08:00",
+        )
+        report = OL.coverage(
+            self.ledger,
+            [(CODE, SESSION)],
+            validation_as_of="2026-01-01T00:00:00+08:00",
+            archive_rows_by_pair={(CODE, SESSION): [row]},
+        )
+        self.assertEqual(0, report.legacy_observation_unknown_pairs)
+        self.assertEqual(0, report.legacy_archive_rows)
+
+
+class ProvenanceLinkIsAppendOnlyAndIdempotent(LedgerTestCase):
+    """链接表必须 append-only、幂等，且不伪造历史行。"""
+
+    def test_same_link_twice_is_idempotent(self):
+        row = _row()
+        self.assertTrue(self.ledger.link_archive_row(
+            row, ingestion_run_id=RUN, provider_id="listing",
+            observation_fingerprint="fp-1", recorded_at="2024-01-10T16:00:00+08:00",
+        ))
+        self.assertFalse(self.ledger.link_archive_row(
+            row, ingestion_run_id=RUN, provider_id="listing",
+            observation_fingerprint="fp-1", recorded_at="2024-01-10T16:00:00+08:00",
+        ))
+        self.assertEqual(1, len(self.ledger.archive_links(CODE, SESSION)))
+
+    def test_link_without_complete_identity_is_rejected(self):
+        with self.assertRaises(OL.ObservationError):
+            self.ledger.link_archive_row(
+                {"code": CODE}, ingestion_run_id=RUN, provider_id="listing",
+                observation_fingerprint="fp-1", recorded_at="2024-01-10T16:00:00+08:00",
+            )
+
+    def test_links_are_not_pit_filtered(self):
+        """链接是结构性 provenance，不按 recorded_at 过滤。"""
+        row = _row()
+        self.ledger.link_archive_row(
+            row, ingestion_run_id=RUN, provider_id="listing",
+            observation_fingerprint="fp-1", recorded_at="2024-06-01T16:00:00+08:00",
+        )
+        # 即便用一个远早于链接 recorded_at 的时点，链接依然可见。
+        self.assertEqual(1, len(self.ledger.archive_links(CODE, SESSION)))
+
+    def test_no_backfill_for_existing_rows(self):
+        """升级既有库不得给历史行伪造链接。"""
+        conn = self._conn_at_v14()
+        conn.execute(
+            f"INSERT INTO {TA.ARCHIVE_TABLE}(code, session_date, effective_at, "
+            "observed_at, is_listed, source, created_at) VALUES(?,?,?,?,?,?,?)",
+            (CODE, SESSION, "2024-01-10T15:05:00+08:00",
+             "2024-01-10T15:05:00+08:00", 1, "listing", "2026-01-01T00:00:00+08:00"),
+        )
+        OL.ensure_ledger_schema(conn)
+        OL.ensure_ledger_schema(conn)
+        ledger = OL.ObservationLedgerRepository(conn)
+        self.assertEqual(0, len(ledger.archive_links(CODE, SESSION)))
+
+    def _conn_at_v14(self):
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        self.addCleanup(conn.close)
+        TA.ensure_schema(conn)
+        TI.ensure_ingestion_schema(conn)
+        conn.execute(f"DROP TABLE IF EXISTS {OL.LEDGER_TABLE}")
+        conn.execute(f"DROP TABLE IF EXISTS {OL.ARCHIVE_LINK_TABLE}")
+        return conn
+
+
+class IngestionWritesRowLevelProvenance(LedgerTestCase):
+    """真实摄取写路径必须在同事务内登记行级链接（issue #161 §二十五）。"""
+
+    def test_ingest_links_newly_persisted_rows(self):
+        self.repo = TA.TradabilityArchiveRepository(self.conn)
+        service = TI.IngestionService(
+            [_StaticProvider()], self.repo, audit_conn=self.conn,
+            cutoff="2024-01-10T16:00:00+08:00",
+        )
+        result = service.ingest([CODE], [SESSION], write=True, run_id=RUN)
+        self.conn.commit()
+        self.assertEqual(1, len(result.persisted))
+
+        ledger = OL.ObservationLedgerRepository(self.conn)
+        links = ledger.archive_links(CODE, SESSION)
+        self.assertEqual(1, len(links))
+        self.assertEqual(RUN, links[0]["ingestion_run_id"])
+
+        rows = [
+            {
+                "code": row["code"], "session_date": row["session_date"],
+                "effective_at": row["effective_at"], "observed_at": row["observed_at"],
+            }
+            for row in self.conn.execute(
+                f"SELECT * FROM {TA.ARCHIVE_TABLE} WHERE code=? AND session_date=?",
+                (CODE, SESSION),
+            ).fetchall()
+        ]
+        knowledge = ledger.knowledge_at(CODE, SESSION, decision_at=DECISION,
+                                        archive_rows=rows)
+        self.assertFalse(knowledge.legacy_observation_unknown)
+        self.assertEqual(1, knowledge.archive_rows_with_observation_provenance)
+
+    def test_idempotent_replay_does_not_relink_existing_row(self):
+        """幂等重放（未插入新行）不得给旧行补链接。"""
+        self.repo = TA.TradabilityArchiveRepository(self.conn)
+        service = TI.IngestionService(
+            [_StaticProvider()], self.repo, audit_conn=self.conn,
+            cutoff="2024-01-10T16:00:00+08:00",
+        )
+        service.ingest([CODE], [SESSION], write=True, run_id=RUN)
+        self.conn.commit()
+        ledger = OL.ObservationLedgerRepository(self.conn)
+        before = len(ledger.archive_links(CODE, SESSION))
+
+        # 换一个 run_id 重放：archive 唯一键命中 → 未插入 → 不得新增链接。
+        service.ingest([CODE], [SESSION], write=True, run_id="run-0002")
+        self.conn.commit()
+        self.assertEqual(before, len(ledger.archive_links(CODE, SESSION)))
 
 
 if __name__ == "__main__":
