@@ -327,14 +327,44 @@ def verification_for_order(order: Any, fill_rows: Any = None) -> dict:
     )
 
 
+def _row_as_dict(cursor: Any, row: Any) -> dict:
+    """把一行转成 dict，**对行形状自适应**。
+
+    三种行对象都会出现，且都合法：
+
+    - ``dict``（测试替身、手工构造的行）→ 直接用；
+    - ``sqlite3.Row``（生产读路径设了 ``row_factory``）→ 有 ``keys()``，``dict(row)`` 可用；
+    - ``tuple``（``db_migrate`` 的裸连接）→ 只能借 ``cursor.description`` 配列名。
+
+    之前这里写死了第三条路径，于是任何"行已经是 dict"的调用方（例如 planner 的
+    测试替身）都会撞 ``AttributeError: 'X' object has no attribute 'description'``。
+    行形状是调用方的事实，不是本模块可以假定的前提。
+    """
+    if hasattr(row, "keys"):
+        return dict(row)
+    columns = [item[0] for item in (cursor.description or ())]
+    return dict(zip(columns, row, strict=True))
+
+
+def _dict_rows(cursor: Any) -> list:
+    """把游标结果转成 dict 行，**不依赖** ``row_factory``。
+
+    ``db_migrate`` 用的是裸 ``sqlite3.connect()``，行对象是 tuple：对它做
+    ``row["order_id"]`` 会抛 ``TypeError``，``dict(row)`` 同样失败。生产读路径的
+    连接都设了 ``row_factory = sqlite3.Row``，所以这类缺陷只在迁移/运维入口上暴露
+    —— 恰恰是 v12 回填必须跑通的地方。列名取自 ``cursor.description``，因此对
+    ``SELECT *`` 与本模块自己的显式列清单都成立。
+    """
+    return [_row_as_dict(cursor, row) for row in cursor.fetchall()]
+
+
 def _load_fills_with_identity(conn, order_id: Any) -> list:
     """读出某笔委托的成交流水，**含**身份列（供身份核对）。"""
-    rows = conn.execute(
+    return _dict_rows(conn.execute(
         "SELECT order_id,account_id,side,code,qty,price,amount,fees,fill_date,quote_at"
         " FROM paper_fills WHERE order_id=? ORDER BY id",
         (order_id,),
-    ).fetchall()
-    return [dict(row) for row in rows]
+    ))
 
 
 #: 批量读流水时每批的订单数上限（SQLite 变量数量上限是 999）。
@@ -349,16 +379,16 @@ def _fills_for_orders(conn, order_ids: Any) -> dict:
         chunk = ids[start:start + _FILL_FETCH_CHUNK]
         placeholders = ",".join("?" for _ in chunk)
         try:
-            rows = conn.execute(
+            rows = _dict_rows(conn.execute(
                 "SELECT order_id,account_id,side,code,qty,price,amount,fees,fill_date,quote_at"
                 f" FROM paper_fills WHERE order_id IN ({placeholders}) ORDER BY id",
                 tuple(chunk),
-            ).fetchall()
+            ))
         except sqlite3.OperationalError:
             # 流水表还不存在（新库/最小 fixture 上跑迁移）→ 没有任何成交证据。
             return grouped
         for row in rows:
-            grouped.setdefault(int(row["order_id"]), []).append(dict(row))
+            grouped.setdefault(int(row["order_id"]), []).append(row)
     return grouped
 
 
@@ -367,13 +397,12 @@ def stamp_order(conn, order_id: Any) -> dict:
 
     写路径专用。读路径**不得**调用它（读面板写库会与 3 分钟 worker 抢锁）。
     """
-    row = conn.execute(
-        "SELECT * FROM paper_orders WHERE id=?", (order_id,)
-    ).fetchone()
+    cursor = conn.execute("SELECT * FROM paper_orders WHERE id=?", (order_id,))
+    row = cursor.fetchone()
     if row is None:
         return verification_from_evidence(None)
     verdict = verification_for_order(
-        dict(row), _load_fills_with_identity(conn, order_id)
+        _row_as_dict(cursor, row), _load_fills_with_identity(conn, order_id)
     )
     conn.execute(
         "UPDATE paper_orders SET execution_status=?, execution_verified=?,"
@@ -409,11 +438,7 @@ def backfill_legacy_orders(conn, *, limit: Any = None) -> dict:
         sql += " LIMIT ?"
         params = (int(limit),)
     try:
-        cursor = conn.execute(sql, params)
-        columns = [item[0] for item in cursor.description]
-        # 连接可能没有设 ``row_factory``（迁移器用的是裸连接）→ 按列名转字典，
-        # 不依赖行对象支持字符串下标。
-        orders = [dict(zip(columns, row, strict=True)) for row in cursor.fetchall()]
+        orders = _dict_rows(conn.execute(sql, params))
     except sqlite3.OperationalError:
         # 迁移会在"表还不存在"的库上运行（新建库 / 最小 fixture）：
         # 没有订单可回填，按"零行"返回，绝不因此让迁移失败。
