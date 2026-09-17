@@ -88,13 +88,37 @@ def _production_verdict(code, session, side, kline_map, state_fn):
     """**真实生产判定**：直接调用生产路径在用的 ``entry_/exit_tradability``。
 
     本工具不复制任何生产规则——它把生产函数拿来跑，拿回它的 verdict。
+
+    **卖出方向不传 ``entry_session``**：这个 CLI 手上没有真实的持仓入场 session，
+    而生产契约里 ``entry_session`` 一旦给出就会做 T+1 校验。伪造 ``entry_session =
+    session``（"当天买入当天卖"）会让普通 T+1 证券被判 ``t1_not_sellable``，于是默认
+    运行的卖出半边会报出一批**假的** ``production_block_archive_allow`` 分歧。
+    本 CLI 比较的是**市场层面的可交易性**，T+1 属于持仓层面，因此这里诚实地不声明
+    入场时点（不传 = 不做 T+1 判定），而不是编一个出来。
     """
     evidence = _production_evidence(code, session, kline_map, state_fn)
     if side == ST.SIDE_BUY:
         return ST.entry_tradability(evidence, code=code, entry_session=session)
-    return ST.exit_tradability(
-        evidence, code=code, exit_session=session, entry_session=session
-    )
+    return ST.exit_tradability(evidence, code=code, exit_session=session)
+
+
+def _pair_has_records(conn, code, session):
+    """归档里是否存在该 ``(code, session)`` 的**任何**记录（含未来 observed_at 的修订）。
+
+    这是**调用方**的声明输入，不是比对器的判据：比对器不能自己问"后来有没有"（那会
+    让历史结论随后来的摄取改变）。本 CLI 在这里声明的是"这条 pair 有证据，只是可能
+    晚于 decision_at 才被观察到"，于是比对器会把"当时不可见"记成 ``archive_unprovable``
+    而不是 ``archive_missing``——两者都是 not_comparable，不进分歧分母。
+    """
+    try:
+        row = conn.execute(
+            "SELECT 1 FROM historical_tradability_archive "
+            "WHERE code=? AND session_date=? LIMIT 1",
+            (str(code), str(session)[:10]),
+        ).fetchone()
+    except sqlite3.OperationalError:
+        return False
+    return row is not None
 
 
 def main(argv=None) -> int:
@@ -159,6 +183,13 @@ def main(argv=None) -> int:
                             "session": session,
                             "side": side,
                             "decision_at": ST.session_close_at(session),
+                            # "这条 pair 有证据、只是晚于 decision_at 才被观察到"是调用方
+                            # 显式声明的输入。归档表里确实存在该 pair 的记录（含未来
+                            # observed_at 的修订）时才声明，绝不让比对器自己去查"后来
+                            # 有没有"——那是未来事实，会改写历史结论。
+                            "ingested_later": _pair_has_records(
+                                conn, code, session
+                            ),
                         }
                     )
         comparisons = comparator.compare_many(items)

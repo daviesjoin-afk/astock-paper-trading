@@ -35,6 +35,7 @@ INGESTION = "backend/tradability_ingestion.py"
 BACKFILL = "backend/tradability_backfill.py"
 INGESTION_TEST = "backend/test_tradability_ingestion.py"
 SHADOW = "backend/tradability_shadow.py"
+SHADOW_CLI = "work/tradability_shadow_validation.py"
 ARCHIVE = "backend/tradability_archive.py"
 
 # 每个变异条目缺省跑的契约测试模块；某些条目（跨文件的 Docker / dry-run /
@@ -69,6 +70,11 @@ TEST_MODULES_BY_ID = {
     "M-SH6": ('test_tradability_shadow_architecture_guard',),
     "M-SH7": ('test_tradability_shadow',),
     "M-SH8": ('test_tradability_shadow',),
+    "M-R5": ('test_tradability_backfill',),
+    "M-R6": ('test_tradability_backfill',),
+    "M-SH9": ('test_tradability_shadow',),
+    "M-SH10": ('test_tradability_shadow',),
+    "M-SH11": ('test_tradability_shadow_architecture_guard',),
 }
 
 # 每个条目 import-check 的目标模块（排除"生产代码变异后语法错误无法 import"的假杀）。
@@ -78,6 +84,7 @@ IMPORT_MODULE_BY_ID = {
     "M-S1": "tradability_backfill",
     "M-DR1": "tradability_backfill",
     "M-SH6": 'tradability_shadow',
+    "M-SH11": 'tradability_shadow',
 }
 
 # (id, 目标文件, 变异前源码片段, 变异后源码片段, 说明)
@@ -245,8 +252,8 @@ MUTATIONS = (
     (
         "M-F2",
         INGESTION,
-        "            codes, sessions, self._cutoff, normalized_evidence\n",
-        "            codes, sessions, self._cutoff, persisted\n",
+        "            normalized_evidence,\n",
+        "            persisted,\n",
         "fingerprint 使用本次 inserted rows（幂等重放后指纹漂移）",
     ),
     (
@@ -279,13 +286,11 @@ MUTATIONS = (
         [
             "        codes: Sequence[str], sessions: Sequence[str], cutoff: str,\n",
             "            \"version\": FINGERPRINT_VERSION,\n",
-            "            codes, sessions, self._cutoff, normalized_evidence\n",
         ],
         [
             "        run_id: str, codes: Sequence[str], sessions: Sequence[str], cutoff: str,\n",
             "            \"version\": FINGERPRINT_VERSION,\n"
             "            \"run_id\": run_id,\n",
-            "            run_id, codes, sessions, self._cutoff, normalized_evidence\n",
         ],
         "run_id 重新参与 fingerprint payload（audit identity 泄漏进内容指纹）",
     ),
@@ -445,6 +450,41 @@ MUTATIONS = (
         '        if stored == row["content_fingerprint"]:\n            return "identical"\n        raise ShadowConflictError(\n            "同一比对身份出现冲突内容："\n            f"{comparison.identity} stored={stored} incoming={row[\'content_fingerprint\']}"\n        )\n',
         '        return "identical"  # MUTANT M-SH8: last-write-wins\n',
         "相同 comparison identity 允许 conflicting overwrite（last-write-wins）",
+    ),
+    (
+        "M-R5",
+        INGESTION,
+        '        if self._audit_conn is None:\n            raise IngestionError(\n                "write=True 需要持久审计存储（audit_conn）才能校验 run_id 的 replay "\n                "identity；缺少它时既读不到既有指纹也无法记录本次指纹，"\n                "同 run_id 的 divergent replay 将无法被拒绝"\n            )\n',
+        '        if self._audit_conn is None:  # MUTANT M-R5: 无持久审计也放行\n            return\n',
+        "无持久审计存储时仍接受 replay-capable 写入（divergent replay 不再可挡）",
+    ),
+    (
+        "M-R6",
+        INGESTION,
+        '            "outcomes": dict(sorted((outcomes or {}).items())),\n',
+        '            "outcomes": {},  # MUTANT M-R6: 结果分布不进指纹\n',
+        "provider 结果分布不进指纹（error→unknown 被当成幂等重放）",
+    ),
+    (
+        "M-SH9",
+        SHADOW,
+        '            or side_mismatch\n',
+        '            or False  # MUTANT M-SH9: 不检查生产 verdict 的 side\n',
+        "生产 verdict 的 side 与比对 side 不一致时仍接受（标签错误的一致/分歧）",
+    ),
+    (
+        "M-SH10",
+        SHADOW,
+        '        elif archive["archive_state"] == ShadowStatus.ARCHIVE_UNPROVABLE.value:\n            status = ShadowStatus.ARCHIVE_UNPROVABLE\n',
+        '        elif archive["archive_state"] == ShadowStatus.ARCHIVE_UNPROVABLE.value:\n            status = ShadowStatus.ARCHIVE_MISSING  # MUTANT M-SH10\n',
+        "归档不可证明被降级成 missing（缺证据与不可证明混淆）",
+    ),
+    (
+        "M-SH11",
+        SHADOW_CLI,
+        '    return ST.exit_tradability(evidence, code=code, exit_session=session)\n',
+        '    return ST.exit_tradability(  # MUTANT M-SH11: 伪造同日 entry_session\n        evidence, code=code, exit_session=session, entry_session=session\n    )\n',
+        "卖出方向伪造同日 entry_session（造出假的 T+1 分歧）",
     ),
 )
 

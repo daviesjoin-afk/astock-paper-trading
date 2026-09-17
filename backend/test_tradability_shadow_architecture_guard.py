@@ -280,42 +280,56 @@ class OperatorCliExposesNoAuthority(unittest.TestCase):
     """操作员 CLI 的 flag / 只读契约。
 
     ``work/`` **不在运行时镜像里**（Dockerfile 只 ``COPY backend/frontend/deploy``），
-    而 ``docker-smoke`` 会在镜像内跑整套 backend suite。因此这几条断言在镜像内必须
-    **显式跳过并说明原因**，而不是让整个测试文件 ImportError/FileNotFoundError——
+    而 ``docker-smoke`` 会在镜像内跑整套 backend suite。读 ``work/`` 文件的那几条
+    断言因此必须**显式跳过并说明原因**，而不是让整个测试文件 FileNotFoundError——
     那会把同文件里不依赖 ``work/`` 的护栏（公开 API 面等值断言、import 边界）一起带走。
 
+    注意跳过的**范围**：只有真正读 ``SHADOW_CLI`` 的用例跳过；检测器自身的非空洞性
+    用例（构造一个假 AST 喂给检测器）必须在**任何**环境里都跑，否则"护栏的护栏"就
+    在运行时镜像里消失了。
+
     跳过的代价是可控的：CI 的 ``tests (3.11)`` / ``tests (3.12)`` job 用的是**完整
-    仓库 checkout**，这几条在那里一定会真的跑（本 PR 的 head 上它们通过了）。
+    仓库 checkout**，读文件的用例在那里一定会真的执行。
     """
 
-    def setUp(self):
+    SKIP_WITHOUT_WORK = "work/ 不在运行时镜像内（docker-smoke 只挂载 backend/frontend/deploy）"
+
+    def _cli_source(self) -> str:
         if not SHADOW_CLI.exists():
-            self.skipTest(
-                "work/ 不在运行时镜像内（docker-smoke 只挂载 backend/frontend/deploy）；"
-                "CLI 的 flag 契约由完整 checkout 的 tests job 覆盖"
-            )
+            self.skipTest(f"{self.SKIP_WITHOUT_WORK}；CLI 契约由完整 checkout 的 tests job 覆盖")
+        return SHADOW_CLI.read_text(encoding="utf-8")
 
     def test_no_forbidden_flag_is_accepted(self):
-        source = SHADOW_CLI.read_text(encoding="utf-8")
+        source = self._cli_source()
         accepted = {value for value in _string_constants(ast.parse(source))}
         found = sorted(flag for flag in FORBIDDEN_CLI_FLAGS if flag in accepted)
         self.assertEqual([], found, f"shadow CLI 不得接受 {found}")
 
     def test_cli_defaults_to_read_only(self):
-        source = SHADOW_CLI.read_text(encoding="utf-8")
+        source = self._cli_source()
         # 只读工具：不得出现任何写库语句。
         for statement in ("INSERT INTO", "UPDATE ", "DELETE FROM", "DROP TABLE"):
             self.assertNotIn(statement, source, f"shadow CLI 不得包含 {statement}")
 
     def test_cli_reuses_the_shared_operator_scope_contract(self):
         """CLI 必须复用 backend 的 scope 解析，不得自带第二套。"""
-        source = SHADOW_CLI.read_text(encoding="utf-8")
+        source = self._cli_source()
         self.assertIn("TB.resolve_codes", source)
         self.assertIn("TB.resolve_sessions", source)
         self.assertIn("TB.ScopeError", source)
 
+    def test_cli_does_not_fabricate_an_entry_session_for_sell(self):
+        """卖出方向不得伪造 ``entry_session``（会造出假的 T+1 分歧）。"""
+        source = self._cli_source()
+        self.assertIn(
+            "ST.exit_tradability(evidence, code=code, exit_session=session)", source
+        )
+        self.assertNotIn("ST.exit_tradability(evidence, code=code, exit_session=session,", source)
+
+    # ── 以下检测器用例**不读文件**，因此在运行时镜像内也必须真的跑 ──
+
     def test_detector_fires_on_a_forbidden_flag(self):
-        """非空洞性：检测器本身必须能抓到禁用的 flag（镜像内也跑）。"""
+        """非空洞性：检测器本身必须能抓到禁用的 flag。"""
         tree = ast.parse("parser.add_argument('--apply', action='store_true')\n")
         accepted = _string_constants(tree)
         self.assertIn("--apply", accepted)
@@ -324,6 +338,21 @@ class OperatorCliExposesNoAuthority(unittest.TestCase):
     def test_detector_fires_on_a_write_statement(self):
         source = "conn.execute('INSERT INTO paper_orders VALUES (1)')\n"
         self.assertIn("INSERT INTO", source)
+
+    def test_detector_ignores_a_read_only_statement(self):
+        source = "conn.execute('SELECT COUNT(*) FROM historical_tradability_archive')\n"
+        for statement in ("INSERT INTO", "UPDATE ", "DELETE FROM", "DROP TABLE"):
+            self.assertNotIn(statement, source)
+
+    def test_detector_fires_on_a_fabricated_entry_session(self):
+        """非空洞性：卖出分支里出现 ``entry_session`` 必须能被这段检查抓住。"""
+        fabricated = (
+            "return ST.exit_tradability(evidence, code=code, exit_session=session, "
+            "entry_session=session)\n"
+        )
+        self.assertIn("entry_session=", fabricated)
+        honest = "return ST.exit_tradability(evidence, code=code, exit_session=session)\n"
+        self.assertNotIn("entry_session=", honest)
 
 
 class ShadowModuleIsNotEmbeddedInHotModules(unittest.TestCase):

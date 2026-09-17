@@ -751,5 +751,153 @@ class DivergentReplayIsRejected(IngestionTestCase):
         ).fetchone()[0])
 
 
+class ReplayIdentityNeedsDurableAudit(IngestionTestCase):
+    """P1（review）：replay identity 的判据只存在于审计表里。
+
+    ``IngestionService`` 的默认构造是 ``audit_conn=None``。那种情况下 ``_persist_run``
+    不写任何东西，本次运行的指纹**不会**被记录，于是第二次同 run_id 的写入必然读到
+    "无既有行"而放行——正好是 P2-1 要挡的事故。因此没有持久审计时必须 fail closed。
+    """
+
+    def _service_without_audit(self, observed_at):
+        provider = TI.ListingStatusProvider(
+            {"000001": {"listing_date": "2010-01-01"}},
+            observed_kind=TI.OBSERVED_SNAPSHOT_TIMESTAMP,
+            observed_at=observed_at,
+        )
+        repo = TA.TradabilityArchiveRepository(self.conn)
+        return TI.IngestionService(
+            [provider], repo, cutoff="2025-06-01T09:00:00+08:00"
+        )
+
+    def test_write_without_audit_conn_is_rejected(self):
+        conn = sqlite3.connect(":memory:")
+        try:
+            TA.ensure_schema(conn)
+            TI.ensure_ingestion_schema(conn)
+            before = _db_snapshot(conn)
+            service = TI.IngestionService(
+                [TI.ListingStatusProvider({"000001": {}},
+                                          observed_kind=TI.OBSERVED_SNAPSHOT_TIMESTAMP,
+                                          observed_at="2025-01-01T09:00:00+08:00")],
+                TA.TradabilityArchiveRepository(conn),
+                cutoff="2025-06-01T09:00:00+08:00",
+            )
+            with self.assertRaises(TI.IngestionError):
+                service.ingest(["000001"], ["2024-01-10"], write=True, run_id="no-audit")
+            # 拒绝发生在持久化之前：DB 逻辑状态逐项不变。
+            self.assertEqual(before, _db_snapshot(conn))
+        finally:
+            conn.close()
+
+    def test_divergent_replay_is_impossible_without_durable_audit(self):
+        """没有审计表可读 → fail closed，而不是"读不到就当没冲突"。"""
+        conn = sqlite3.connect(":memory:")
+        try:
+            TA.ensure_schema(conn)  # 故意不建 ingestion_runs 表
+            provider = TI.ListingStatusProvider(
+                {"000001": {}},
+                observed_kind=TI.OBSERVED_SNAPSHOT_TIMESTAMP,
+                observed_at="2025-01-01T09:00:00+08:00",
+            )
+            service = TI.IngestionService(
+                [provider],
+                TA.TradabilityArchiveRepository(conn),
+                cutoff="2025-06-01T09:00:00+08:00",
+                audit_conn=conn,
+            )
+            with self.assertRaises(TI.IngestionError):
+                service.ingest(["000001"], ["2024-01-10"], write=True, run_id="no-table")
+        finally:
+            conn.close()
+
+    def test_dry_run_without_audit_conn_is_still_allowed(self):
+        """dry-run 不写任何东西，因此不需要审计存储。"""
+        conn = sqlite3.connect(":memory:")
+        try:
+            TA.ensure_schema(conn)
+            provider = TI.ListingStatusProvider(
+                {"000001": {}},
+                observed_kind=TI.OBSERVED_SNAPSHOT_TIMESTAMP,
+                observed_at="2025-01-01T09:00:00+08:00",
+            )
+            service = TI.IngestionService(
+                [provider],
+                TA.TradabilityArchiveRepository(conn),
+                cutoff="2025-06-01T09:00:00+08:00",
+            )
+            result = service.ingest(["000001"], ["2024-01-10"], write=False, run_id="dry")
+            self.assertIsNotNone(result.run_fingerprint)
+            self.assertEqual(0, len(result.persisted))
+        finally:
+            conn.close()
+
+
+class _OutcomeFlippingProvider(TI.TradabilityFactProvider):
+    """先返回 error、后返回 unknown —— 两次运行都不产生任何 normalized evidence。"""
+
+    provider_id = "flaky"
+
+    def __init__(self):
+        self.provider_version = "1"
+        self.mode = "error"
+
+    def fetch(self, code, session):
+        if self.mode == "error":
+            return TI.ProviderResult(
+                provider_id=self.provider_id,
+                provider_version=self.provider_version,
+                status=TI.OUTCOME_ERROR,
+                error="boom",
+                observed_kind=TI.OBSERVED_SNAPSHOT_TIMESTAMP,
+                observed_at="2025-01-01T09:00:00+08:00",
+            )
+        return TI.ProviderResult(
+            provider_id=self.provider_id,
+            provider_version=self.provider_version,
+            status=TI.OUTCOME_UNKNOWN,
+            observed_kind=TI.OBSERVED_SNAPSHOT_TIMESTAMP,
+            observed_at="2025-01-01T09:00:00+08:00",
+        )
+
+
+class ReplayIdentityCoversProviderOutcomes(IngestionTestCase):
+    """P1（review）：error→unknown 的翻转必须改变 replay 身份。
+
+    两种结果都**不产生 normalized evidence**，若指纹只看 evidence，两次运行指纹相同
+    会被判成幂等重放，``INSERT OR IGNORE`` 保留第一行 audit —— 本次报告 ``completed``
+    而审计仍是 ``completed_with_gaps``。凡是会写进审计的状态/计数差异都属于内容身份。
+    """
+
+    def test_error_then_unknown_is_not_an_idempotent_replay(self):
+        provider = _OutcomeFlippingProvider()
+        service = self.make_service([provider], cutoff="2025-06-01T09:00:00+08:00")
+        first = service.ingest(["000001"], ["2024-01-10"], write=True, run_id="flip")
+        self.assertEqual(TI.STATUS_COMPLETED_WITH_GAPS, first.status)
+        audit_before = self.conn.execute(
+            "SELECT status, run_fingerprint, error_records, unknown_records "
+            "FROM tradability_ingestion_runs WHERE run_id='flip'"
+        ).fetchone()
+        self.assertEqual(TI.STATUS_COMPLETED_WITH_GAPS, audit_before[0])
+
+        provider.mode = "unknown"
+        with self.assertRaises(TI.IngestionError):
+            service.ingest(["000001"], ["2024-01-10"], write=True, run_id="flip")
+
+        after = self.conn.execute(
+            "SELECT status, run_fingerprint, error_records, unknown_records "
+            "FROM tradability_ingestion_runs WHERE run_id='flip'"
+        ).fetchone()
+        self.assertEqual(tuple(audit_before), tuple(after))
+
+    def test_outcome_distribution_is_part_of_the_fingerprint(self):
+        provider = _OutcomeFlippingProvider()
+        service = self.make_service([provider], cutoff="2025-06-01T09:00:00+08:00")
+        error_run = service.ingest(["000001"], ["2024-01-10"], write=False, run_id="a")
+        provider.mode = "unknown"
+        unknown_run = service.ingest(["000001"], ["2024-01-10"], write=False, run_id="b")
+        self.assertNotEqual(error_run.run_fingerprint, unknown_run.run_fingerprint)
+
+
 if __name__ == "__main__":
     unittest.main()

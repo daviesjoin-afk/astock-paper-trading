@@ -187,6 +187,21 @@ def _run(created: list) -> int:
         ), summary
         for gap in ("archive_unknown", "archive_unprovable", "archive_missing"):
             assert gap in statuses, (gap, statuses)
+        # 卖出方向不得出现 T+1 造成的假分歧：CLI 不声明 entry_session，因此
+        # 任何 ``t1_not_sellable`` 都说明它又伪造了同日入场。
+        sell_reasons = {
+            item["production_reason"]
+            for item in payload["comparisons"]
+            if item["side"] == "sell"
+        }
+        assert "t1_not_sellable" not in sell_reasons, sell_reasons
+        # 归档侧停牌在买卖两侧都是 block（停牌与方向无关）。
+        suspended = [
+            item for item in payload["comparisons"]
+            if item["archive_reason"] == "suspended"
+        ]
+        assert len(suspended) == 2, suspended
+        assert all(item["archive_allowed"] is False for item in suspended), suspended
 
         print()
         print("=== 非法 operator scope（必须在打开 DB 之前拒绝） ===")

@@ -952,7 +952,19 @@ class IngestionService:
         status = self._run_status(error_records, unknown_records, conflicts, unprovable)
         coverage = self._build_coverage(per_session, sessions, codes, source_counts)
         run_fingerprint = self._run_fingerprint(
-            codes, sessions, self._cutoff, normalized_evidence
+            codes,
+            sessions,
+            self._cutoff,
+            normalized_evidence,
+            # provider 结果分布进指纹：error→unknown 的翻转在 evidence 上不可见，
+            # 但会改变 status 与 audit 计数，因此属于内容身份（见 _run_fingerprint）。
+            {
+                "evidence": raw_records,
+                "unknown": unknown_records,
+                "error": error_records,
+                "skipped": skipped_records,
+                "status": status,
+            },
         )
 
         # ── 两阶段：先算完所有结论与内容身份，再决定要不要落库 ──
@@ -1194,11 +1206,12 @@ class IngestionService:
         self,
         codes: Sequence[str], sessions: Sequence[str], cutoff: str,
         normalized: Sequence[TA.TradabilityEvidence],
+        outcomes: Optional[Mapping[str, Any]] = None,
     ) -> str:
-        """内容身份指纹：只由 normalized facts + requested scope + cutoff +
-        provider/provenance identity 决定。run_id 是 audit identity，**绝不**参与
-        内容指纹；同一份事实用不同 run_id 重放必须得到同一 fingerprint。
-        数据变化时指纹必须变化。
+        """内容身份指纹：由 normalized facts + requested scope + cutoff +
+        provider/provenance identity + **provider 结果分布**决定。run_id 是 audit
+        identity，**绝不**参与内容指纹；同一份事实用不同 run_id 重放必须得到同一
+        fingerprint。数据变化时指纹必须变化。
 
         输入是**规范化后的证据**而非本次新插入的 persisted 行：幂等重放时第二次
         ``ingest`` 不会产生任何新插入（唯一键命中），若用 persisted 作输入，同一份
@@ -1206,6 +1219,13 @@ class IngestionService:
 
         同时把 **provider/provenance identity**（provider_id → provider_version）
         纳入指纹：version 属于 provenance 身份，改变它必须改变指纹。
+
+        ``outcomes`` 是本次运行的 provider 结果分布（evidence / unknown / error 计数）。
+        它必须进入指纹：一个 provider 返回 ``error`` 与后来返回 ``unknown``，在 scope /
+        cutoff / provider 版本完全相同的情况下**不产生任何 normalized evidence**，
+        若指纹只看 evidence，两次运行会得到同一个指纹而被判成"幂等重放"，于是
+        ``INSERT OR IGNORE`` 保留第一行 audit —— 本次运行报告 ``completed``，审计里
+        却仍是 ``completed_with_gaps``。凡是会写进审计的状态/计数差异，都属于内容身份。
         """
         payload = {
             "version": FINGERPRINT_VERSION,
@@ -1214,6 +1234,7 @@ class IngestionService:
             "cutoff": cutoff,
             "provider_versions": dict(sorted(self.provider_versions.items())),
             "evidence_fingerprints": sorted(TA.evidence_fingerprint(e) for e in normalized),
+            "outcomes": dict(sorted((outcomes or {}).items())),
         }
         return _sha256(payload)
 
@@ -1232,17 +1253,29 @@ class IngestionService:
         一次内容不同的新 run；那种情况必须被拒绝，而不是让 archive 保存新 revision
         而 audit 行继续描述旧 run。
 
-        查询与写入共用同一个连接，所以这里读到的是本次事务内的最新状态。
+        **没有持久审计存储就必须拒绝**：replay identity 的判据是"上次那个 run_id 记了
+        什么指纹"，而那个事实**只**存在于审计表里。没有审计连接时，这次调用既读不到
+        既有指纹、``_persist_run`` 也不会记下自己的指纹，于是第二次同 run_id 写入必然
+        读到"无既有行"而放行——正好是这条契约要挡的事故。因此这里把"无持久审计"直接
+        判为不可重放，而不是静默退化成一个永远通过的门。
         """
-        conn = self._audit_conn if self._audit_conn is not None else self._repo.connection
+        if self._audit_conn is None:
+            raise IngestionError(
+                "write=True 需要持久审计存储（audit_conn）才能校验 run_id 的 replay "
+                "identity；缺少它时既读不到既有指纹也无法记录本次指纹，"
+                "同 run_id 的 divergent replay 将无法被拒绝"
+            )
         try:
-            row = conn.execute(
+            row = self._audit_conn.execute(
                 f"SELECT run_fingerprint FROM {INGESTION_RUNS_TABLE} WHERE run_id=?",
                 (run_id,),
             ).fetchone()
-        except sqlite3.OperationalError:
-            # 审计表还不存在（纯内存测试未建 schema）→ 没有既有 run 可冲突。
-            return
+        except sqlite3.OperationalError as exc:
+            # 审计表不存在 = 无法证明"这是同一次重放" → fail closed，绝不当作"没有冲突"。
+            raise IngestionError(
+                f"审计表 {INGESTION_RUNS_TABLE} 不可读（{exc}），无法校验 run_id "
+                f"{run_id!r} 的 replay identity"
+            ) from exc
         if row is None:
             return
         stored = row[0] if not isinstance(row, Mapping) else row.get("run_fingerprint")

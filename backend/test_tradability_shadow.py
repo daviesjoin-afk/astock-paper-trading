@@ -167,9 +167,14 @@ class ArchiveGapsAreNotDisagreement(ShadowTestCase):
         self.assertIsNone(comparison.archive_allowed)
 
     def test_unprovable_archive_evidence_is_not_comparable(self):
-        # 事实存在，但决策当时还不可知（observed_at 在 decision_at 之后）。
+        # 事实存在，但决策当时还不可知（observed_at 在 decision_at 之后）；
+        # 由调用方显式声明 ingested_later → archive_unprovable。
         self.add_fact("2024-01-10", observed="2024-02-01T15:05:00")
-        comparison = self.compare(production_verdict(ST.STATUS_EXECUTABLE))
+        comparison = self.comparator.compare(
+            production_verdict(ST.STATUS_EXECUTABLE),
+            code="000001", session="2024-01-10", side=ST.SIDE_BUY,
+            decision_at="2024-01-10T16:00:00", ingested_later=True,
+        )
         self.assertEqual(TS.ShadowStatus.ARCHIVE_UNPROVABLE.value, comparison.status)
         self.assertFalse(comparison.comparable)
 
@@ -217,6 +222,40 @@ class ArchiveGapsAreNotDisagreement(ShadowTestCase):
             production_verdict(ST.STATUS_INVALID, reason=ST.REASON_MISSING_CODE)
         )
         self.assertEqual(TS.ShadowStatus.COMPARISON_INVALID.value, comparison.status)
+
+    def test_production_verdict_side_must_match_the_comparison_side(self):
+        """一个 sell verdict 配 ``side="buy"`` 必须判 invalid。
+
+        否则会把 sell 的结论当成 buy 的生产结果，再去比归档的 buy 结论，
+        产出一条**标签错误**的一致/分歧。
+        """
+        self.add_fact("2024-01-10")
+        mismatched = self.comparator.compare(
+            production_verdict(ST.STATUS_EXECUTABLE, side=ST.SIDE_SELL),
+            code="000001", session="2024-01-10", side=ST.SIDE_BUY,
+            decision_at="2024-01-10T16:00:00",
+        )
+        self.assertEqual(TS.ShadowStatus.COMPARISON_INVALID.value, mismatched.status)
+        self.assertFalse(mismatched.comparable)
+        # 反向同样成立。
+        reverse = self.comparator.compare(
+            production_verdict(ST.STATUS_EXECUTABLE, side=ST.SIDE_BUY),
+            code="000001", session="2024-01-10", side=ST.SIDE_SELL,
+            decision_at="2024-01-10T16:00:00",
+        )
+        self.assertEqual(TS.ShadowStatus.COMPARISON_INVALID.value, reverse.status)
+
+    def test_matching_side_is_not_rejected(self):
+        """非空洞性：side 一致时不得被误判 invalid。"""
+        self.add_fact("2024-01-10")
+        for side in (ST.SIDE_BUY, ST.SIDE_SELL):
+            with self.subTest(side=side):
+                comparison = self.compare(
+                    production_verdict(ST.STATUS_EXECUTABLE, side=side), side=side
+                )
+                self.assertNotEqual(
+                    TS.ShadowStatus.COMPARISON_INVALID.value, comparison.status
+                )
 
 
 # ───────────────────────── 3. Summary 分母契约 ─────────────────────────
@@ -273,7 +312,12 @@ class SummaryDenominators(ShadowTestCase):
             ),
             self.compare(production_verdict(ST.STATUS_EXECUTABLE), session="2024-01-12"),
             self.compare(production_verdict(ST.STATUS_EXECUTABLE), session="2024-01-13"),
-            self.compare(production_verdict(ST.STATUS_EXECUTABLE), session="2024-01-14"),
+            # 2024-01-14：证据晚于 decision_at 才被观察到，由调用方显式声明 → unprovable。
+            self.comparator.compare(
+                production_verdict(ST.STATUS_EXECUTABLE),
+                code="000001", session="2024-01-14", side=ST.SIDE_BUY,
+                decision_at="2024-01-14T16:00:00", ingested_later=True,
+            ),
             self.compare(production_verdict(ST.STATUS_EXECUTABLE), session="2024-01-15"),
             self.compare(None, session="2024-01-16"),
             self.compare(production_verdict(ST.STATUS_INVALID), session="2024-01-17"),
@@ -335,12 +379,37 @@ class PointInTimeGolden(ShadowTestCase):
     def test_future_observed_at_is_invisible(self):
         self.add_fact("2024-01-10", observed="2024-12-31T15:05:00")
         comparison = self.compare(production_verdict(ST.STATUS_EXECUTABLE))
+        # 当时无可见证据 → 默认 archive_missing（"当时没有任何可用证据"是当时就能
+        # 得到的结论）。调用方显式声明"证据晚于 decision_at 才被观察到"时才记
+        # unprovable —— 见 test_ingested_later_declaration_is_the_only_unprovable_path。
+        self.assertEqual(TS.ShadowStatus.ARCHIVE_MISSING.value, comparison.status)
+        self.assertFalse(comparison.comparable)
+
+    def test_ingested_later_declaration_is_the_only_unprovable_path(self):
+        self.add_fact("2024-01-10", observed="2024-12-31T15:05:00")
+        comparison = self.comparator.compare(
+            production_verdict(ST.STATUS_EXECUTABLE),
+            code="000001", session="2024-01-10", side=ST.SIDE_BUY,
+            decision_at="2024-01-10T16:00:00", ingested_later=True,
+        )
         self.assertEqual(TS.ShadowStatus.ARCHIVE_UNPROVABLE.value, comparison.status)
+        self.assertFalse(comparison.comparable)
+
+    def test_future_ingestion_cannot_change_an_earlier_comparison(self):
+        """后来的摄取不得改写历史比对（分类与指纹都必须稳定）。"""
+        before = self.compare(production_verdict(ST.STATUS_EXECUTABLE))
+        self.assertEqual(TS.ShadowStatus.ARCHIVE_MISSING.value, before.status)
+        # 今天补一条 observed_at 晚于历史 decision_at 的记录。
+        self.add_fact("2024-01-10", observed="2025-06-01T15:05:00",
+                      effective="2025-06-01T15:05:00")
+        after = self.compare(production_verdict(ST.STATUS_EXECUTABLE))
+        self.assertEqual(before.status, after.status)
+        self.assertEqual(before.fingerprint, after.fingerprint)
 
     def test_future_effective_at_is_invisible(self):
         self.add_fact("2024-01-10", effective="2024-12-31T15:05:00")
         comparison = self.compare(production_verdict(ST.STATUS_EXECUTABLE))
-        self.assertEqual(TS.ShadowStatus.ARCHIVE_UNPROVABLE.value, comparison.status)
+        self.assertEqual(TS.ShadowStatus.ARCHIVE_MISSING.value, comparison.status)
 
     def test_later_revision_visible_only_after_new_decision(self):
         self.add_fact("2024-01-10")
