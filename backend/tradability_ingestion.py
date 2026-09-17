@@ -57,12 +57,14 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any, Iterable, Mapping, Optional, Sequence
 
-try:  # ``backend`` on sys.path（生产与 ``cd backend`` 测试）
+try:  # ``backend`` 在 sys.path（生产与 ``cd backend`` 测试）
     import point_in_time as PIT
     import tradability_archive as TA
+    import tradability_observation_ledger as OL
 except ImportError:  # pragma: no cover - package-style import
     from . import point_in_time as PIT  # type: ignore
     from . import tradability_archive as TA  # type: ignore
+    from . import tradability_observation_ledger as OL  # type: ignore
 
 
 # ───────────────────────────── 常量与词表 ─────────────────────────────
@@ -753,7 +755,15 @@ def _coverage_fingerprint(report: Mapping[str, Any]) -> str:
 
 
 def ensure_ingestion_schema(conn: sqlite3.Connection) -> dict:
-    """正式 migration 014 的建表函数（幂等）。摄取运行审计表。"""
+    """正式 migration 014 的建表函数（幂等）。摄取运行审计表。
+
+    同时确保 **observation ledger** 存在：摄取服务在**同一个事务**里写事实、run audit 与
+    观察事件，三者必须同时可用。把它们拆成"调用方记得分别 ensure"会让 ledger 在缺失时
+    才暴露成写入失败——那正好破坏了本层"要么一起成功、要么一起回滚"的语义。
+
+    ledger 的表结构仍由 :func:`tradability_observation_ledger.ensure_ledger_schema`
+    单一持有（migration 015 也调用它），这里只是把它纳入"摄取所需的 schema"。
+    """
     conn.execute(
         f"""
         CREATE TABLE IF NOT EXISTS {INGESTION_RUNS_TABLE}(
@@ -782,7 +792,12 @@ def ensure_ingestion_schema(conn: sqlite3.Connection) -> dict:
         )
         """
     )
-    return {"table": INGESTION_RUNS_TABLE, "migration": MIGRATION_DESCRIPTION}
+    ledger = OL.ensure_ledger_schema(conn)
+    return {
+        "table": INGESTION_RUNS_TABLE,
+        "migration": MIGRATION_DESCRIPTION,
+        "observation_ledger": ledger,
+    }
 
 
 # ───────────────────────────── Ingestion Service ─────────────────────────────
@@ -800,6 +815,9 @@ class IngestionResult:
     unprovable: Sequence[str]
     run_fingerprint: str
     provider_versions: Mapping[str, str]
+    #: 本次运行产生的观察事件。dry-run 下它们**只存在内存里**（preview），不落库；
+    #: write=True 下它们与事实、审计同事务写入 ledger。
+    observations: Sequence[Any] = ()
 
 
 class IngestionService:
@@ -836,6 +854,9 @@ class IngestionService:
                 "事实写入必须在同一个库、同一个事务内，否则事实与审计无法原子提交"
             )
         self._audit_conn = audit_conn
+        # 观察台账的写入口。它必须与 archive 事实、run audit 共用同一个连接/事务，
+        # 因此**只**在 audit_conn 存在时构造（没有事务的连接上不允许写 ledger）。
+        self._ledger: Optional[Any] = None
         # 同一个连接**还不够**：``isolation_level=None`` 是 SQLite 的 autocommit 模式，
         # 那里每次 ``repository.save()`` 与审计插入都各自立即提交。若 ``_persist_run``
         # 随后失败（审计表上的 trigger / 约束中止插入），事实已经durable、``rollback()``
@@ -851,6 +872,33 @@ class IngestionService:
     @property
     def provider_versions(self) -> Mapping[str, str]:
         return {p.provider_id: p.provider_version for p in self._providers}
+
+    def _observation_events(
+        self, outcomes: Sequence[ProviderResult], code: str, session: str, run_id: str
+    ) -> list:
+        """把本次取数的**全部** provider 结果转成观察事件。
+
+        三态都记录（``evidence`` / ``unknown`` / ``error``）："从未调用 provider" 与
+        "调用了、provider 明确返回 unknown" 不是同一件事；``error`` 也不能被降级成
+        "never observed"。
+
+        ``recorded_at`` 是**我们自己的系统**摄取到这条观察的时刻，由调用方在 run 开始时
+        统一取一次（同一 run 内所有事件共享同一个 recorded_at，保证同一 run 的观察是
+        一个知识快照，而不是"按处理顺序散布在时间轴上"）。**绝不**用 effective_at /
+        session_date 顶替。
+        """
+        events = []
+        for result in outcomes:
+            events.append(
+                OL.event_from_provider_result(
+                    result,
+                    code=code,
+                    session=session,
+                    recorded_at=self._recorded_at,
+                    ingestion_run_id=run_id,
+                )
+            )
+        return events
 
     def _fetch(self, code: str, session: str) -> Sequence[ProviderResult]:
         """逐个 provider 取数。单个 provider 失败**不**影响其它股票/provider。"""
@@ -891,6 +939,15 @@ class IngestionService:
             raise IngestionError("ingestion 拒绝空 session scope（0 个交易日）")
         run_id = run_id or uuid.uuid4().hex
         started_at = _now_utc()
+        # 同一 run 的**所有**观察共享同一个 recorded_at：一次摄取是一个知识快照，
+        # 不能因为处理顺序让同一批观察散布在时间轴上。dry-run 也取（供 preview），
+        # 但不落库。
+        self._recorded_at = _now_utc()
+        self._ledger = (
+            OL.ObservationLedgerRepository(self._audit_conn)
+            if self._audit_conn is not None
+            else None
+        )
 
         persisted: list = []
         normalized_evidence: list = []
@@ -905,11 +962,17 @@ class IngestionService:
         skipped_records = 0
         source_counts: dict = {}
         per_session: dict = {}
+        observation_events: list = []
 
         for session in sessions:
             session_stats = self._init_session_stats(len(codes))
             for code in codes:
                 outcomes = self._fetch(code, session)
+                # 观察台账：**全部** provider 结果都要记（含 unknown / error）。
+                # 它只是 audit fact sink，不参与"archive 是否可写"的任何决定。
+                observation_events.extend(
+                    self._observation_events(outcomes, code, session, run_id)
+                )
                 raw_records += len([r for r in outcomes if r.status == OUTCOME_EVIDENCE])
                 unknown_records += len([r for r in outcomes if r.status == OUTCOME_UNKNOWN])
                 error_records += len([r for r in outcomes if r.status == OUTCOME_ERROR])
@@ -998,6 +1061,23 @@ class IngestionService:
             },
             unprovable,
             conflicts,
+            # observation 语义必须进内容身份：archive/audit 完全相同时，provider 结果从
+            # unknown 翻到 error（或 evidence）、provider 版本变化、source observed kind
+            # 变化，都会让 ledger 内容不同。若指纹不含它，就会出现"archive/audit 指纹
+            # 相同、ledger 却不同"的 divergent replay 被当成幂等重放。
+            [
+                {
+                    "provider_id": event.provider_id,
+                    "provider_version": event.provider_version,
+                    "provider_status": event.provider_status,
+                    "source_observed_kind": event.source_observed_kind,
+                    "source_observed_at": event.source_observed_at,
+                    "effective_at": event.effective_at,
+                    "evidence_fingerprint": event.evidence_fingerprint,
+                    "error_fingerprint": event.error_fingerprint,
+                }
+                for event in observation_events
+            ],
         )
 
         # ── 两阶段：先算完所有结论与内容身份，再决定要不要落库 ──
@@ -1022,6 +1102,13 @@ class IngestionService:
                     persisted.append(evidence)
                 else:
                     skipped_records += 1  # 幂等重放：唯一键命中，逻辑状态不变。
+
+            # 观察事件与 archive 事实、run audit 必须处于**同一个事务**：任一失败则三者
+            # 一起 rollback。绝不能出现"archive 成功、ledger 失败"或"ledger 成功、audit
+            # 失败"——那样 ledger 与事实就会互相矛盾，而它存在的意义正是给出可审计的
+            # 观察序列。
+            if self._ledger is not None:
+                self._ledger.append_many(observation_events)
 
         # dry-run（write=False）不写任何东西：archive 与 run audit 都不落库。
         if write:
@@ -1054,6 +1141,7 @@ class IngestionService:
             unprovable=unprovable,
             run_fingerprint=run_fingerprint,
             provider_versions=self.provider_versions,
+            observations=tuple(observation_events),
         )
 
     # ── coverage 内部 ──
@@ -1248,6 +1336,7 @@ class IngestionService:
         outcomes: Optional[Mapping[str, Any]] = None,
         unprovable: Optional[Sequence[Any]] = None,
         conflicts: Optional[Sequence[Any]] = None,
+        observations: Optional[Sequence[Mapping[str, Any]]] = None,
     ) -> str:
         """内容身份指纹：由 normalized facts + requested scope + cutoff +
         provider/provenance identity + **provider 结果分布**决定。run_id 是 audit
@@ -1291,6 +1380,15 @@ class IngestionService:
                 (
                     json.dumps(c.identity_payload(), sort_keys=True, ensure_ascii=False, default=str)
                     for c in (conflicts or ())
+                )
+            ),
+            # observation 语义（含三态与 provenance），规范化排序。它必须进指纹：
+            # 否则会出现 archive/audit 完全相同、ledger 却不同的 divergent replay
+            # 被判成幂等重放。排序保证同一集合换个到达顺序指纹不变。
+            "observations": sorted(
+                (
+                    json.dumps(dict(item), sort_keys=True, ensure_ascii=False, default=str)
+                    for item in (observations or ())
                 )
             ),
         }

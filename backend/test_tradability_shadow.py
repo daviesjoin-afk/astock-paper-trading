@@ -587,9 +587,23 @@ class ComparisonIdentity(unittest.TestCase):
             archive_observed_at="2024-01-10T15:05:00", archive_evidence_present=True,
         )
         self.assertEqual(
-            ("000001", "2024-01-10", "2024-01-10T16:00:00", "buy", TS.CONTRACT_VERSION),
+            (
+                "000001", "2024-01-10", "2024-01-10T16:00:00", "buy", None,
+                TS.CONTRACT_VERSION,
+            ),
             comparison.identity,
         )
+        # validation_as_of 是 v2 身份的一部分：不同知识时点是不同快照。
+        later = TS.ShadowComparison(
+            code="000001", session="2024-01-10", decision_at="2024-01-10T16:00:00",
+            side=ST.SIDE_BUY, status=TS.ShadowStatus.AGREE_ALLOW.value, comparable=True,
+            production_allowed=True, production_reason="ok", production_status="executable",
+            archive_allowed=True, archive_reason="ok", archive_source=SOURCE,
+            archive_fingerprint="fp", archive_effective_at="2024-01-10T15:05:00",
+            archive_observed_at="2024-01-10T15:05:00", archive_evidence_present=True,
+            validation_as_of="2026-09-17T00:00:00+08:00",
+        )
+        self.assertNotEqual(comparison.identity, later.identity)
 
     def test_same_identity_and_content_share_fingerprint(self):
         first = self._comparison()

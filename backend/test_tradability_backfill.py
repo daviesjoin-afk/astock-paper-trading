@@ -158,6 +158,31 @@ class FingerprintChangesWithEvidence(unittest.TestCase):
             conn.close()
 
 
+class EvidenceContentIsBoundThroughObservations(unittest.TestCase):
+    """等价变异的**证明**：为什么"把 normalized 换成 persisted"不再可观测。
+
+    指纹在**任何 ``save()`` 之前**计算，``persisted`` 在那个时点恒为空列表；同一份契约
+    （"事实内容变化必须改变指纹"）由 observations 载荷携带的原始证据指纹保证。这里断言
+    该通路确实生效：provider 身份 / scope / 结果计数全同，只有证据内容不同 → 指纹不同。
+    """
+
+    def setUp(self):
+        self.conn = sqlite3.connect(":memory:")
+        self.addCleanup(self.conn.close)
+        TA.ensure_schema(self.conn)
+        TI.ensure_ingestion_schema(self.conn)
+
+    def test_evidence_content_is_bound_through_the_observations_payload(self):
+        service = _make_service(
+            self.conn, [_EvidenceContentProvider({"is_listed": True})],
+            cutoff="2025-06-01T09:00:00+08:00",
+        )
+        result = service.ingest(["000001"], ["2024-01-10"], write=False, run_id="r")
+        # observations 载荷必须真的存在并携带证据指纹——否则"等价"就成了空话。
+        self.assertTrue(result.observations)
+        self.assertTrue(all(event.evidence_fingerprint for event in result.observations))
+
+
 class _VersionedProvider(TI.TradabilityFactProvider):
     """P-F4 用：provider/provenance version 可注入，其余事实完全一致。"""
 
@@ -174,6 +199,62 @@ class _VersionedProvider(TI.TradabilityFactProvider):
             evidence={"is_listed": True},
             observed_kind=TI.OBSERVED_SNAPSHOT_TIMESTAMP,
             observed_at="2025-01-01T09:00:00+08:00",
+        )
+
+
+class _EvidenceContentProvider(TI.TradabilityFactProvider):
+    """provider 身份完全一致，只有**证据内容**不同（M-F2 用）。"""
+
+    provider_id = "content"
+    provider_version = "1"
+
+    def __init__(self, evidence):
+        self._evidence = evidence
+
+    def fetch(self, code, session):
+        return TI.ProviderResult(
+            provider_id=self.provider_id,
+            provider_version=self.provider_version,
+            status=TI.OUTCOME_EVIDENCE,
+            evidence=dict(self._evidence),
+            observed_kind=TI.OBSERVED_SNAPSHOT_TIMESTAMP,
+            observed_at="2025-01-01T09:00:00+08:00",
+        )
+
+
+class FingerprintCoversEvidenceContentAtTheCallSite(unittest.TestCase):
+    """指纹必须覆盖**证据内容本身**，而且要经由 ``ingest`` 的调用点验证。
+
+    ``_run_fingerprint`` 的 direct 用例测的是函数本体；如果 ``ingest`` 在调用它时传错了
+    实参（例如传成本次 inserted 的 ``persisted`` 行——在那一刻恒为空列表），direct 用例
+    照样全绿，而幂等重放的语义已经破了。因此这里只改证据内容（code / session / scope /
+    provider 身份 / 结果计数**全同**），断言 ``ingest`` 得到的指纹必须不同。
+    """
+
+    def setUp(self):
+        self.conn = sqlite3.connect(":memory:")
+        self.addCleanup(self.conn.close)
+        TA.ensure_schema(self.conn)
+        TI.ensure_ingestion_schema(self.conn)
+
+    def _fingerprint(self, evidence):
+        service = _make_service(
+            self.conn, [_EvidenceContentProvider(evidence)],
+            cutoff="2025-06-01T09:00:00+08:00",
+        )
+        result = service.ingest(["000001"], ["2024-01-10"], write=False, run_id="r")
+        return result.run_fingerprint
+
+    def test_evidence_content_changes_the_ingest_fingerprint(self):
+        first = self._fingerprint({"is_listed": True})
+        second = self._fingerprint({"is_listed": False})
+        self.assertNotEqual(first, second)
+
+    def test_identical_evidence_keeps_the_same_fingerprint(self):
+        # 非空洞性：内容相同就必须同指纹，否则上一条会因为"每次都不同"而假通过。
+        self.assertEqual(
+            self._fingerprint({"is_listed": True}),
+            self._fingerprint({"is_listed": True}),
         )
 
 
@@ -990,6 +1071,27 @@ class ReplayIdentityCoversConflicts(IngestionTestCase):
         self.assertNotEqual(first.run_fingerprint, second.run_fingerprint)
 
 
+def _evidence(*, is_listed=True):
+    """一条完整的事实对象（其余字段留空 = unknown）。"""
+    return TA.TradabilityEvidence(
+        code="000001",
+        session_date="2024-01-10",
+        effective_at="2024-01-10T15:05:00+08:00",
+        observed_at="2024-01-10T15:05:00+08:00",
+        is_listed=is_listed,
+        listing_date=None,
+        delisting_date=None,
+        is_st=None,
+        is_suspended=None,
+        suspension_reason=None,
+        has_market_quote=None,
+        has_trade_volume=None,
+        is_price_limit_locked=None,
+        price_limit_direction=None,
+        source="listing",
+    )
+
+
 class FingerprintCoversEveryAuditVisibleDifference(IngestionTestCase):
     """直接验证内容身份本身：审计行里会出现的每一项差异都必须改变指纹。
 
@@ -1069,6 +1171,24 @@ class FingerprintCoversEveryAuditVisibleDifference(IngestionTestCase):
         self.assertNotEqual(
             self._fingerprint(service, conflicts=[conflict]),
             self._fingerprint(service, conflicts=[other]),
+        )
+
+    def test_normalized_evidence_is_part_of_the_fingerprint(self):
+        """``normalized`` 本身必须进指纹——其余输入全同，只改事实。
+
+        既有"不同 evidence → 不同指纹"的用例同时换了 code，于是它靠 code 差异通过：
+        把 ``normalized`` 换成 ``persisted``（恒为空）也照样绿。这里只改 evidence。
+        """
+        service = self._service()
+        base = self._fingerprint(service)
+        fact = _evidence(is_listed=True)
+        changed = self._fingerprint(service, normalized=[fact])
+        self.assertNotEqual(base, changed)
+        # 另一个事实（内容不同）也必须得到不同的指纹。
+        other = _evidence(is_listed=False)
+        self.assertNotEqual(
+            self._fingerprint(service, normalized=[fact]),
+            self._fingerprint(service, normalized=[other]),
         )
 
     def test_conflict_session_is_part_of_the_fingerprint(self):
