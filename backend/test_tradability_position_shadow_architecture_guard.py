@@ -596,10 +596,22 @@ class ShadowIdentityIsAccountAndCycleScoped(unittest.TestCase):
 
 
 class OperatorCliReusesTheResolvedKnowledgeInstant(unittest.TestCase):
-    """承重：仓位层 overlay 必须复用市场层面已 resolve 的 ``validation_as_of``。"""
+    """承重：仓位层 overlay 必须复用市场层面已 resolve 的 ``validation_as_of``。
+
+    注意：``work/`` 不在运行时镜像内（docker-smoke 只挂载 backend/frontend/deploy），
+    因此这里与 :class:`OperatorCliExposesNoAuthority` 一样，缺文件时 skip 而不是
+    直接读 —— 否则离线 smoke 会以 ``FileNotFoundError`` 失败。
+    """
+
+    SKIP_WITHOUT_WORK = "work/ 不在运行时镜像内（docker-smoke 只挂载 backend/frontend/deploy）"
+
+    def _cli_source(self) -> str:
+        if not SHADOW_CLI.exists():
+            self.skipTest(f"{self.SKIP_WITHOUT_WORK}；CLI 契约由完整 checkout 的 tests job 覆盖")
+        return SHADOW_CLI.read_text(encoding="utf-8")
 
     def test_overlay_uses_the_market_comparisons_resolved_fields(self):
-        source = SHADOW_CLI.read_text(encoding="utf-8")
+        source = self._cli_source()
         self.assertIn("decision_at=market.decision_at", source)
         self.assertIn("validation_as_of=market.validation_as_of", source)
         # 不得直接把原始参数再下发一遍（那会让两条记录的知识时点不一致）。
