@@ -102,6 +102,23 @@ def _ensure_tradability_shadow_table(conn):
     return TS.ensure_shadow_schema(conn)
 
 
+def _ensure_tradability_archive_observation_links(conn):
+    """v17：archive 事实行的观察来源链接表（append-only，纯新增）。
+
+    记录"这条 archive 事实行是由哪次 ingestion run、连同哪个 observation event 一起
+    写入的"。这是区分「真正 pre-ledger 历史行」与「ledger-era 行」的唯一可靠依据：
+    fingerprint 相等只能证明内容相同（一条旧行后来被重新观察到同内容证据时指纹也会
+    相同），而本表证明的是**同一个 transaction 里一起产生**。
+
+    **绝不回填历史行**：升级前的 archive 行没有链接，那就是"原始观察时间不可知"，
+    诚实答案是 ``legacy_observation_unknown``。表结构由
+    :func:`tradability_observation_ledger.ensure_archive_link_schema` 持有。
+    """
+    import tradability_observation_ledger as OL
+
+    return OL.ensure_archive_link_schema(conn)
+
+
 # 迁移注册表：db_name -> [(version, description, sql_or_callable), ...]
 MIGRATIONS = {
     "paper_trading": [
@@ -149,6 +166,12 @@ MIGRATIONS = {
          _ensure_tradability_observation_ledger),
         # Shadow 比对结果（可选持久化，v2 身份含 validation_as_of）。与生产表完全隔离。
         (16, "新增可交易性 Shadow 比对结果表（幂等）", _ensure_tradability_shadow_table),
+        # 行级 provenance 链接：archive 事实行 ↔ 产生它的 observation event。
+        # 纯新增、append-only；**绝不**回填历史行——升级前的 archive 行没有这种链接，
+        # 那就是"原始观察时间不可知"，编一条假链接才是真正的错误。只为未来 ingestion
+        # 建立可靠 provenance（见 issue #161 §六/§七/§二十四）。
+        (17, "新增 archive 事实行观察来源链接表（幂等，append-only）",
+         _ensure_tradability_archive_observation_links),
     ],
     "adaptive_learning": [
         (1, "创建 schema_version 表", """

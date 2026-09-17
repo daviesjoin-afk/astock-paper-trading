@@ -97,19 +97,30 @@ LEDGER_WRITER_ALLOWLIST = (
 LEDGER_PUBLIC_API = frozenset({
     "ObservationError",
     "ObservationEvent", "ObservationKnowledge", "ObservationCoverage",
+    "ArchiveObservationCoverage", "reconcile_archive_rows",
     "normalize_error_identity", "observation_fingerprint", "now_utc",
-    "ensure_ledger_schema", "ObservationLedgerRepository", "coverage",
+    "ensure_ledger_schema", "ensure_archive_link_schema",
+    "ObservationLedgerRepository", "coverage",
     "event_from_provider_result",
 })
 
 #: ``ObservationLedgerRepository`` **允许**暴露的公开方法（等值断言）。
+#: ``link_archive_row`` / ``append_links`` / ``archive_links`` /
+#: ``reconcile_archive_coverage`` 是 issue #161 的行级 provenance 面：前两者是
+#: append-only 写入口，后两者是行级对账读入口。它们不含任何 ``can_*``，也不参与
+#: verdict——只回答"这条 archive 行当年是不是和某次观察一起落库"。
 REPOSITORY_PUBLIC_API = frozenset({
     "append", "append_many", "connection", "count", "ensure_schema",
     "events", "first_observation", "knowledge_at",
+    "ensure_archive_link_schema", "link_archive_row", "append_links",
+    "archive_links", "reconcile_archive_coverage",
 })
 
 #: ``ObservationKnowledge`` **允许**暴露的公开方法——**不含**任何 ``can_*``。
 KNOWLEDGE_PUBLIC_API = frozenset({"has_any_observation", "to_dict"})
+
+#: 行级 provenance 链接表名：只有台账模块与迁移可以写它（唯一写入口）。
+ARCHIVE_LINK_TABLE = "tradability_archive_observation_links"
 
 #: 会改数据的 SQL 关键字（append-only 台账不得出现）。
 MUTATING_SQL_KEYWORDS = ("UPDATE ", "DELETE FROM", "DROP TABLE", "REPLACE INTO")

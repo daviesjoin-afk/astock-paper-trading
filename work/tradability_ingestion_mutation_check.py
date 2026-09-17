@@ -99,6 +99,14 @@ TEST_MODULES_BY_ID = {
     "M-O14": ("test_tradability_shadow",),
     "M-O15": ("test_tradability_shadow",),
     "M-O16": ("test_tradability_shadow",),
+    "M-L161-1": ("test_tradability_observation_ledger",),
+    "M-L161-2": ("test_tradability_observation_ledger",),
+    "M-L161-3": ("test_tradability_observation_ledger",),
+    "M-L161-4": ("test_tradability_observation_ledger",),
+    "M-L161-5": ("test_tradability_observation_ledger",),
+    "M-L161-6": ("test_tradability_observation_ledger",),
+    "M-L161-7": ("test_tradability_observation_ledger",),
+    "M-L161-8": ("test_tradability_observation_ledger",),
 }
 
 # 每个条目 import-check 的目标模块（排除"生产代码变异后语法错误无法 import"的假杀）。
@@ -125,6 +133,14 @@ IMPORT_MODULE_BY_ID = {
     "M-O14": "tradability_shadow",
     "M-O15": "tradability_shadow",
     "M-O16": "tradability_shadow",
+    "M-L161-1": "tradability_observation_ledger",
+    "M-L161-2": "tradability_observation_ledger",
+    "M-L161-3": "tradability_observation_ledger",
+    "M-L161-4": "tradability_observation_ledger",
+    "M-L161-5": "tradability_observation_ledger",
+    "M-L161-6": "tradability_observation_ledger",
+    "M-L161-7": "tradability_observation_ledger",
+    "M-L161-8": "tradability_observation_ledger",
 }
 
 #: 行为**等价**的变异：注入后不改变任何可达状态，因此**不要求**被测试杀死。
@@ -783,11 +799,9 @@ MUTATIONS = (
     (
         'M-O11',
         LEDGER,
-        '        never = not rows\n'
-        '        legacy = never and bool(archive_has_row)\n',
-        '        never = not rows\n'
-        '        legacy = False  # MUTANT M-O11: 升级前历史数据不标不确定\n',
-        'legacy archive rows 被伪造 first_seen（不标不确定）',
+        '        legacy = archive_coverage.has_uncovered_rows\n',
+        '        legacy = never  # MUTANT M-O11: 只有 never_observed 才判 legacy\n',
+        'legacy 只看 ledger 事件数（行级 provenance 被忽略）',
     ),
     (
         'M-O12',
@@ -842,6 +856,77 @@ MUTATIONS = (
         '        out.sort(key=lambda comparison: _identity_sort_key(comparison.identity))\n',
         '        out.sort(key=lambda comparison: comparison.identity)  # MUTANT M-O16\n',
         '身份排序不归一（None 与 str 混用抛 TypeError）',
+    ),
+    # ═════════════ issue #161 变异矩阵 M-L161-1 … M-L161-8 ═════════════
+    # 每条都注入"修复前那类错误"，用来证明 L161-1..8 真的在守护这个修复点。
+    (
+        'M-L161-1',
+        LEDGER,
+        '        legacy = archive_coverage.has_uncovered_rows\n',
+        '        legacy = bool(archive_rows)  # MUTANT M-L161-1: 任何行都标 legacy\n',
+        '任何 archive 行 + 历史 as_of 都被标 legacy（#161 原始假阳性）',
+    ),
+    (
+        'M-L161-2',
+        LEDGER,
+        '        legacy = archive_coverage.has_uncovered_rows\n',
+        '        legacy = (not never) and bool(archive_rows)  # MUTANT M-L161-2\n',
+        '只要 pair 有任意 ledger event 就判 non-legacy（mixed pair 掩盖真 legacy）',
+    ),
+    (
+        'M-L161-3',
+        LEDGER,
+        '        legacy = archive_coverage.has_uncovered_rows\n',
+        '        legacy = (len(rows) < archive_coverage.archive_row_count)  # MUTANT M-L161-3\n',
+        'raw 事件数直接与 archive 行数相减（计数下溢 / 反向计数）',
+    ),
+    (
+        'M-L161-4',
+        LEDGER,
+        '    covered = len(distinct_rows & linked)\n',
+        '    covered = len([r for r in (archive_rows or ()) if _archive_row_identity(r) in linked])\n'
+        '    # MUTANT M-L161-4: 不去重，重复链接重复覆盖\n',
+        '重复 ledger events 重复覆盖同一 archive row（over-count）',
+    ),
+    (
+        'M-L161-5',
+        LEDGER,
+        '        legacy = archive_coverage.has_uncovered_rows\n',
+        '        legacy = False  # MUTANT M-L161-5: later re-observation 洗白 legacy\n',
+        'later re-observation 洗白真正 legacy row',
+    ),
+    (
+        'M-L161-6',
+        LEDGER,
+        '        links = self.archive_links(code, session)\n',
+        '        links = self.archive_links(code, session)\n'
+        '        if not links and self.events(code, session):  # MUTANT M-L161-6\n'
+        '            links = list(archive_rows or ())  # unknown/error 也算覆盖\n',
+        'unknown/error event 被算作 archive evidence provenance',
+    ),
+    (
+        'M-L161-7',
+        LEDGER,
+        '        session_text = _canonical_session(session)\n'
+        '        if session_text is not None:\n'
+        '            clauses.append("session_date=?")\n'
+        '            params.append(session_text)\n'
+        '        where = f" WHERE {\' AND \'.join(clauses)}" if clauses else ""\n',
+        '        session_text = _canonical_session(session)\n'
+        '        if session_text is not None:\n'
+        '            clauses.append("session_date=?")\n'
+        '            params.append(session_text)\n'
+        '        clauses.append("recorded_at<=\'2024-01-10T00:00:00+08:00\'")\n'
+        '        # MUTANT M-L161-7: 对 provenance 链接做 PIT 过滤\n'
+        '        where = f" WHERE {\' AND \'.join(clauses)}" if clauses else ""\n',
+        'post-ledger linked row 因 validation_as_of 太早被误标 legacy（链接被 PIT 过滤）',
+    ),
+    (
+        'M-L161-8',
+        LEDGER,
+        '        legacy = archive_coverage.has_uncovered_rows\n',
+        '        legacy = archive_coverage.uncovered_row_count >= 0  # MUTANT M-L161-8\n',
+        'future observation 被算 evidence_seen（无行时也判 legacy）',
     ),
 )
 

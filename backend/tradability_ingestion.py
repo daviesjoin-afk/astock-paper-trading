@@ -793,10 +793,15 @@ def ensure_ingestion_schema(conn: sqlite3.Connection) -> dict:
         """
     )
     ledger = OL.ensure_ledger_schema(conn)
+    # 行级 provenance 链接表也必须在这里确保存在：摄取写路径要在**同一个事务**里把
+    # "这条 archive 行是本次 run 新插入的"记下来，缺表会让链接写入失败并连带回滚
+    # 整次摄取。
+    archive_links = OL.ensure_archive_link_schema(conn)
     return {
         "table": INGESTION_RUNS_TABLE,
         "migration": MIGRATION_DESCRIPTION,
         "observation_ledger": ledger,
+        "archive_observation_links": archive_links,
     }
 
 
@@ -899,6 +904,45 @@ class IngestionService:
                 )
             )
         return events
+
+    def _archive_links(
+        self,
+        persisted: Sequence[Any],
+        observation_events: Sequence[Any],
+    ) -> list:
+        """为**本次新插入**的 archive 行构造行级 provenance 链接。
+
+        链接的身份是 ``(archive 行身份, ingestion_run_id, provider_id,
+        observation_fingerprint)``：它证明"这条事实行与这次观察同处一个 ingestion
+        transaction"，而不是"内容看起来一样"。
+
+        只链接 ``persisted``（本次真的新插入的行）——幂等重放命中的行**不**链接，
+        否则一条旧行会被误标成本次 run 创建的。观察事件按 ``(code, session)`` 归组：
+        同一次 run 里多个 provider 都观察到同一条事实，链接会各写一条，但行级对账用
+        集合去重，因此仍然是 **1 条被覆盖的行**。
+        """
+        by_pair: dict = {}
+        for event in observation_events:
+            key = (event.code, event.session_date)
+            by_pair.setdefault(key, []).append(event)
+
+        links: list = []
+        for evidence in persisted:
+            key = (evidence.code, evidence.session_date)
+            for event in by_pair.get(key, ()):
+                # 只有 evidence 观察才携带证据指纹；unknown/error 不构成"看到了事实"。
+                if not event.evidence_fingerprint:
+                    continue
+                links.append(
+                    {
+                        "evidence": evidence,
+                        "ingestion_run_id": event.ingestion_run_id,
+                        "provider_id": event.provider_id,
+                        "observation_fingerprint": event.observation_fingerprint,
+                        "recorded_at": event.recorded_at,
+                    }
+                )
+        return links
 
     def _fetch(self, code: str, session: str) -> Sequence[ProviderResult]:
         """逐个 provider 取数。单个 provider 失败**不**影响其它股票/provider。"""
@@ -1109,6 +1153,14 @@ class IngestionService:
             # 观察序列。
             if self._ledger is not None:
                 self._ledger.append_many(observation_events)
+                # 行级 provenance：只为**本次 run 新插入**的 archive 行登记链接。这是
+                # "这条事实行当年与哪次观察同处一个 transaction"的唯一持久证据；幂等
+                # 重放（未插入）不登记——那会让一条旧行看起来像是本次 run 创建的。
+                # 与 archive / ledger / audit 同事务：链接写入失败必须整体回滚，否则
+                # 会留下"有事实行却没有 provenance"或反之的半成品状态。
+                self._ledger.append_links(
+                    self._archive_links(persisted, observation_events)
+                )
 
         # dry-run（write=False）不写任何东西：archive 与 run audit 都不落库。
         if write:
