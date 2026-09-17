@@ -83,6 +83,17 @@ _ARCHIVE_UNKNOWN_REASON = TA.TradabilityReason.UNKNOWN_STATE.value
 _FAR_FUTURE = "9999-12-31T23:59:59+08:00"
 
 
+def _identity_sort_key(identity: tuple) -> tuple:
+    """身份的可比较排序键。
+
+    ``identity`` 里 ``validation_as_of`` 是**可选**的：缺省快照为 ``None``，显式快照为
+    ``str``。直接对身份排序会在两者混用时抛 ``TypeError: '<' not supported between
+    instances of 'str' and 'NoneType'``——那会让 ``compare_many`` 整体失败，而不是把
+    两条快照都返回。这里统一归一成字符串再排序。
+    """
+    return tuple("" if part is None else str(part) for part in identity)
+
+
 def _diagnose_missing(knowledge: Any, decision_at: str) -> tuple:
     """``archive_missing`` 的**诊断细分**（不改变顶层 status）。
 
@@ -99,6 +110,11 @@ def _diagnose_missing(knowledge: Any, decision_at: str) -> tuple:
             ShadowStatus.ARCHIVE_MISSING.value,
             ShadowStatus.ARCHIVE_NEVER_OBSERVED.value,
         )
+    # **证据优先**：一个 pair 可能同时有 evidence 与 error/unknown 观察（不同 provider）。
+    # 只要观察到了证据，就属于"晚观察到/当时不可证明"，必须判 archive_unprovable；
+    # 先看 error 诊断会把这类 pair 错标成 provider_error，并让晚观察证据被系统性少计。
+    if knowledge.evidence_seen:
+        return ShadowStatus.ARCHIVE_UNPROVABLE.value, None
     outcomes = knowledge.provider_outcomes or {}
     if outcomes.get(OL.OBSERVED_ERROR):
         return (
@@ -110,8 +126,11 @@ def _diagnose_missing(knowledge: Any, decision_at: str) -> tuple:
             ShadowStatus.ARCHIVE_MISSING.value,
             ShadowStatus.ARCHIVE_PROVIDER_UNKNOWN.value,
         )
-    # 观察到了证据，但截至 validation_as_of 它仍不足以证明 decision_at 当时可知
-    # （例如 source_observed_at 晚于 decision）——这是"晚观察到"，不是"从未观察"。
+    # 防御性默认：走到这里说明「观察到了记录、却没有 evidence、也没有 error/unknown
+    # 诊断」。按当前三态词表（evidence / unknown / error）这是不可达的——有 evidence
+    # 已在上方返回，其余记录必然落入上面两个诊断分支。保留它是因为「晚观察到
+    # （有证据但当时不可证明）」的正确出口在上方那个 evidence 分支；这里的语义仍是
+    # unprovable，而不是 missing。
     return ShadowStatus.ARCHIVE_UNPROVABLE.value, None
 
 
@@ -655,12 +674,17 @@ class ShadowComparator:
         session_text = _canonical_session(session)
         side_text = _text(side)
         moment = _canonical_instant(decision_at)
-        # validation_as_of 缺失 = "用当前知识时点"（不设上界）；显式给出但不可解析
-        # 则整条比对判 invalid，**绝不**退化成"看全部未来数据"。
-        as_of_text = (
-            None if validation_as_of is None else _canonical_instant(validation_as_of)
-        )
-        as_of_invalid = validation_as_of is not None and as_of_text is None
+        # ``validation_as_of`` 缺省 = **当前知识时点**，并解析成一个**具体时刻**：
+        # 它同时作为台账查询上界与比对身份。若缺省时留 ``None``，身份里就没有任何时间
+        # 信息——新观察到来后再存同一条比对，内容变了而身份没变，会抛
+        # ``ShadowConflictError``，与"更晚的知识形成独立快照"的设计直接矛盾。
+        # 显式给出但不可解析则整条比对判 invalid，**绝不**退化成"看全部未来数据"。
+        if validation_as_of is None:
+            as_of_text = _canonical_instant(_dt.datetime.now(_dt.timezone.utc))
+            as_of_invalid = as_of_text is None
+        else:
+            as_of_text = _canonical_instant(validation_as_of)
+            as_of_invalid = as_of_text is None
         production = self._production_side(production_verdict)
 
         # 生产 verdict 的 side 必须与本次比对的 side **一致**：一个 sell verdict 配
@@ -765,7 +789,7 @@ class ShadowComparator:
                     validation_as_of=item.get("validation_as_of"),
                 )
             )
-        out.sort(key=lambda comparison: comparison.identity)
+        out.sort(key=lambda comparison: _identity_sort_key(comparison.identity))
         return out
 
     @staticmethod
@@ -918,13 +942,44 @@ _SHADOW_COLUMNS = (
 )
 
 
-def ensure_shadow_schema(conn: sqlite3.Connection) -> dict:
-    """建比对结果表（幂等）。
+def _shadow_table_columns(conn: sqlite3.Connection) -> list:
+    """现有影子表的列名（表不存在 → 空列表）。"""
+    try:
+        cursor = conn.execute(f"PRAGMA table_info({SHADOW_TABLE})")
+    except sqlite3.OperationalError:  # pragma: no cover - 防御
+        return []
+    return [row[1] for row in cursor.fetchall()]
 
-    唯一身份 = ``(code, session, decision_at, side, validation_as_of, contract_version)``
-    —— ``validation_as_of`` 在身份里，因此 2026-09-17 与 2026-10-01 两次知识时点的验证
-    各自成行，今天新摄取一条观察**不会**让昨天那条已持久化的比对变成 conflict。
+
+def _upgrade_v1_shadow_table(conn: sqlite3.Connection) -> bool:
+    """把 v1 影子表升级成 v2 结构；返回是否做了升级。
+
+    v1 表（由上一版的公开 ``ensure_shadow_schema`` 建出）缺少 ``validation_as_of`` 及
+    台账诊断列。``CREATE TABLE IF NOT EXISTS`` 会**保留**旧结构却让迁移记为成功，于是
+    之后的 ``save_comparison`` 因缺列失败，``load_comparisons`` 又吞掉 ``OperationalError``
+    静默返回空列表——数据看起来"没了"，而迁移状态显示正常。
+
+    v1 行里没有知识时点信息，无法事后补出；重建时按 v1 语义把 ``validation_as_of`` 置
+    空串（"未声明知识时点"），并保留原有全部行与列值。
     """
+    columns = _shadow_table_columns(conn)
+    if not columns or "validation_as_of" in columns:
+        return False
+    legacy = [
+        column for column in _SHADOW_COLUMNS if column in columns
+    ]
+    backup = f"{SHADOW_TABLE}__v1"
+    conn.execute(f"ALTER TABLE {SHADOW_TABLE} RENAME TO {backup}")
+    _create_shadow_table(conn)
+    columns_sql = ", ".join(legacy)
+    conn.execute(
+        f"INSERT INTO {SHADOW_TABLE}({columns_sql}) SELECT {columns_sql} FROM {backup}"
+    )
+    conn.execute(f"DROP TABLE {backup}")
+    return True
+
+
+def _create_shadow_table(conn: sqlite3.Connection) -> None:
     conn.execute(
         f"""
         CREATE TABLE IF NOT EXISTS {SHADOW_TABLE}(
@@ -959,7 +1014,23 @@ def ensure_shadow_schema(conn: sqlite3.Connection) -> dict:
         )
         """
     )
-    return {"table": SHADOW_TABLE, "migration": MIGRATION_DESCRIPTION}
+
+
+def ensure_shadow_schema(conn: sqlite3.Connection) -> dict:
+    """建比对结果表（幂等），并把 v1 表升级到 v2。
+
+    唯一身份 = ``(code, session, decision_at, side, validation_as_of, contract_version)``
+    —— ``validation_as_of`` 在身份里，因此 2026-09-17 与 2026-10-01 两次知识时点的验证
+    各自成行，今天新摄取一条观察**不会**让昨天那条已持久化的比对变成 conflict。
+    """
+    upgraded = _upgrade_v1_shadow_table(conn)
+    if not upgraded:
+        _create_shadow_table(conn)
+    return {
+        "table": SHADOW_TABLE,
+        "migration": MIGRATION_DESCRIPTION,
+        "upgraded_from_v1": upgraded,
+    }
 
 
 def _db_flag(value: Optional[bool]) -> Optional[int]:

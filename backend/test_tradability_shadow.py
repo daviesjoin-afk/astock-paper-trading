@@ -74,11 +74,16 @@ class ShadowTestCase(unittest.TestCase):
         payload.update(flags)
         return self.repo.save(TA.normalize_record(payload))
 
+    #: 固定的知识时点。PIT 测试必须显式固定它——默认 as-of 是**当前时刻**，
+    #: 两次调用会落在不同身份上，那样断言的就不是"同一知识时点下结论稳定"。
+    AS_OF = "2024-01-11T00:00:00+08:00"
+
     def compare(self, verdict, *, code="000001", session="2024-01-10",
-                side=ST.SIDE_BUY, at=None):
+                side=ST.SIDE_BUY, at=None, as_of=AS_OF):
         return self.comparator.compare(
             verdict, code=code, session=session, side=side,
             decision_at=at or f"{session}T16:00:00",
+            validation_as_of=as_of,
         )
 
 
@@ -772,10 +777,10 @@ class CompareManyIsDeterministic(ShadowTestCase):
         items = [
             {"production_verdict": production_verdict(ST.STATUS_EXECUTABLE),
              "code": "600000", "session": "2024-01-10", "side": ST.SIDE_BUY,
-             "decision_at": "2024-01-10T16:00:00"},
+             "decision_at": "2024-01-10T16:00:00", "validation_as_of": self.AS_OF},
             {"production_verdict": production_verdict(ST.STATUS_EXECUTABLE),
              "code": "000001", "session": "2024-01-10", "side": ST.SIDE_BUY,
-             "decision_at": "2024-01-10T16:00:00"},
+             "decision_at": "2024-01-10T16:00:00", "validation_as_of": self.AS_OF},
         ]
         first = self.comparator.compare_many(items)
         second = self.comparator.compare_many(list(reversed(items)))
@@ -796,6 +801,228 @@ class CompareManyIsDeterministic(ShadowTestCase):
             self.comparator.compare_many(list(reversed(items)))
         )
         self.assertEqual(forward.to_dict(), backward.to_dict())
+
+
+# ───────────────── 4b. review 修复的回归 ─────────────────
+
+
+class DefaultValidationAsOfIsAConcreteSnapshot(ShadowTestCase):
+    """默认 ``validation_as_of`` 必须解析成**具体时刻**，而不是留空。
+
+    留空时身份里没有时间信息：新观察到来后再存同一条比对，内容变了而身份没变，会抛
+    ``ShadowConflictError``——与"更晚的知识形成独立快照"的设计直接矛盾。
+    """
+
+    def test_default_resolves_to_a_concrete_instant(self):
+        comparison = self.comparator.compare(
+            production_verdict(ST.STATUS_EXECUTABLE),
+            code="000001", session="2024-01-10", side=ST.SIDE_BUY,
+            decision_at="2024-01-10T16:00:00",
+        )
+        self.assertIsNotNone(comparison.validation_as_of)
+        self.assertNotEqual("", comparison.validation_as_of)
+        # 必须可解析成真实时刻。
+        import datetime as _dt
+
+        _dt.datetime.fromisoformat(comparison.validation_as_of)
+
+    def test_later_knowledge_does_not_conflict_with_an_earlier_snapshot(self):
+        """新观察到来后重跑默认比对：身份不同 → 不冲突（而不是 raise）。"""
+        TS.ensure_shadow_schema(self.conn)
+        first = self.comparator.compare(
+            production_verdict(ST.STATUS_EXECUTABLE),
+            code="000001", session="2024-01-10", side=ST.SIDE_BUY,
+            decision_at="2024-01-10T16:00:00",
+        )
+        self.assertEqual("inserted", TS.save_comparison(self.conn, first))
+        # 之后才被观察到的证据（改变 archive 侧结论）。
+        self.add_fact("2024-01-10", observed="2024-06-01T15:05:00",
+                      effective="2024-06-01T15:05:00", is_suspended=True)
+        second = self.comparator.compare(
+            production_verdict(ST.STATUS_EXECUTABLE),
+            code="000001", session="2024-01-10", side=ST.SIDE_BUY,
+            decision_at="2024-01-10T16:00:00",
+        )
+        self.assertNotEqual(first.identity, second.identity)
+        self.assertEqual("inserted", TS.save_comparison(self.conn, second))
+
+
+class CompareManyHandlesMixedOptionalSnapshots(ShadowTestCase):
+    """同一条 pair 的一条省略 as-of、一条给出 as-of：不得抛 ``TypeError``。"""
+
+    def test_mixed_none_and_str_identity_sorts(self):
+        # 省略 as-of **不会**产生 None（会解析成具体当前时刻）；只有**不可解析**的
+        # as-of 才把 None 写进身份（该条判 comparison_invalid，但仍要参与排序）。
+        items = [
+            {"production_verdict": production_verdict(ST.STATUS_EXECUTABLE),
+             "code": "000001", "session": "2024-01-10", "side": ST.SIDE_BUY,
+             "decision_at": "2024-01-10T16:00:00",
+             "validation_as_of": "not-a-date"},
+            {"production_verdict": production_verdict(ST.STATUS_EXECUTABLE),
+             "code": "000001", "session": "2024-01-10", "side": ST.SIDE_BUY,
+             "decision_at": "2024-01-10T16:00:00",
+             "validation_as_of": "2024-01-11T00:00:00+08:00"},
+        ]
+        comparisons = self.comparator.compare_many(items)
+        self.assertEqual(2, len(comparisons))
+        # 非空洞性：确认这条路径真的产生了 None 身份，否则排序断言没有意义。
+        self.assertIn(None, [c.validation_as_of for c in comparisons])
+
+    def test_detector_fires_when_none_and_str_are_mixed(self):
+        """非空洞性：确认这个组合真的会让"直接对身份排序"炸掉。"""
+        with self.assertRaises(TypeError):
+            sorted([("a", None), ("a", "b")])
+
+
+class EvidenceTakesPriorityOverProviderErrors(ShadowTestCase):
+    """一个 pair 同时有 evidence 与 error 观察时，必须判 unprovable 而非 provider_error。"""
+
+    def test_mixed_evidence_and_error_is_unprovable_not_provider_error(self):
+        import tradability_observation_ledger as OL
+        import tradability_ingestion as TI
+
+        comparator = TS.ShadowComparator(
+            self.repo, ledger=OL.ObservationLedgerRepository(self.conn)
+        )
+
+        def event(provider_id, status, error=None):
+            return OL.event_from_provider_result(
+                TI.ProviderResult(
+                    provider_id=provider_id, provider_version="1", status=status,
+                    evidence={"listing_date": "2010-01-01"} if status == "evidence" else {},
+                    observed_kind=TI.OBSERVED_SNAPSHOT_TIMESTAMP,
+                    observed_at="2024-06-01T15:05:00+08:00",
+                    effective_at="2024-06-01T15:05:00+08:00",
+                    error=error,
+                ),
+                code="000001", session="2024-01-10",
+                recorded_at="2024-06-01T15:05:00+08:00", ingestion_run_id="run-mix",
+            )
+
+        ledger = OL.ObservationLedgerRepository(self.conn)
+        ledger.ensure_schema()
+        ledger.append(event("a", "evidence"))
+        ledger.append(event("b", "error", error="TimeoutError: x"))
+
+        comparison = comparator.compare(
+            production_verdict(ST.STATUS_EXECUTABLE),
+            code="000001", session="2024-01-10", side=ST.SIDE_BUY,
+            decision_at="2024-01-10T16:00:00",
+            validation_as_of="2026-01-01T00:00:00+08:00",
+        )
+        self.assertEqual(TS.ShadowStatus.ARCHIVE_UNPROVABLE.value, comparison.status)
+        self.assertIsNone(comparison.archive_diagnostic)
+        self.assertFalse(comparison.comparable)
+
+
+class V1ShadowTableIsUpgradedInPlace(ShadowTestCase):
+    """v1 影子表必须被**升级**，而不是被 ``CREATE TABLE IF NOT EXISTS`` 放过。
+
+    放过时的故障形态很隐蔽：迁移记成功、写入抛缺列、读取吞掉 ``OperationalError``
+    返回空列表——数据看起来"没了"，而状态显示一切正常。
+    """
+
+    V1_DDL = """
+        CREATE TABLE tradability_shadow_comparisons(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            comparison_id TEXT NOT NULL,
+            code TEXT NOT NULL,
+            session TEXT NOT NULL,
+            decision_at TEXT NOT NULL,
+            side TEXT NOT NULL,
+            production_allowed INTEGER,
+            production_reason TEXT,
+            production_status TEXT,
+            archive_allowed INTEGER,
+            archive_reason TEXT,
+            archive_source TEXT,
+            archive_fingerprint TEXT,
+            archive_effective_at TEXT,
+            archive_observed_at TEXT,
+            archive_evidence_present INTEGER NOT NULL DEFAULT 0,
+            comparison_status TEXT NOT NULL,
+            comparable INTEGER NOT NULL DEFAULT 0,
+            content_fingerprint TEXT NOT NULL,
+            contract_version TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            UNIQUE(code, session, decision_at, side, contract_version)
+        )
+    """
+
+    def _make_v1_table_with_a_row(self):
+        self.conn.execute(self.V1_DDL)
+        self.conn.execute(
+            "INSERT INTO tradability_shadow_comparisons("
+            "comparison_id, code, session, decision_at, side, production_allowed, "
+            "production_reason, production_status, archive_allowed, archive_reason, "
+            "archive_source, archive_fingerprint, archive_effective_at, "
+            "archive_observed_at, archive_evidence_present, comparison_status, "
+            "comparable, content_fingerprint, contract_version, created_at) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            ("legacy-id", "000001", "2024-01-10", "2024-01-10T16:00:00", "buy", 1,
+             "ok", "executable", 1, "ok", SOURCE, "fp",
+             "2024-01-10T15:05:00", "2024-01-10T15:05:00", 1,
+             "agree_allow", 1, "legacy-content", "tradability-shadow-v1",
+             "2026-01-01T00:00:00+08:00"),
+        )
+
+    def test_v1_table_gains_the_v2_columns(self):
+        self._make_v1_table_with_a_row()
+        result = TS.ensure_shadow_schema(self.conn)
+        self.assertTrue(result.get("upgraded_from_v1"))
+        columns = {
+            row[1]
+            for row in self.conn.execute(
+                "PRAGMA table_info(tradability_shadow_comparisons)"
+            ).fetchall()
+        }
+        for required in (
+            "validation_as_of", "archive_diagnostic", "first_observed_at",
+            "first_evidence_observed_at", "market_provable_at_decision",
+            "system_possessed_at_decision",
+        ):
+            self.assertIn(required, columns)
+
+    def test_existing_rows_are_preserved(self):
+        self._make_v1_table_with_a_row()
+        TS.ensure_shadow_schema(self.conn)
+        rows = self.conn.execute(
+            "SELECT code, comparison_status, content_fingerprint, contract_version "
+            "FROM tradability_shadow_comparisons"
+        ).fetchall()
+        self.assertEqual(1, len(rows))
+        self.assertEqual(
+            ("000001", "agree_allow", "legacy-content", "tradability-shadow-v1"),
+            tuple(rows[0]),
+        )
+
+    def test_saving_works_after_the_upgrade(self):
+        """升级后写入必须成功——这正是"只 CREATE IF NOT EXISTS"会失败的路径。"""
+        self._make_v1_table_with_a_row()
+        TS.ensure_shadow_schema(self.conn)
+        comparison = TS.ShadowComparison(
+            code="000002", session="2024-01-10", decision_at="2024-01-10T16:00:00",
+            side=ST.SIDE_BUY, status=TS.ShadowStatus.AGREE_ALLOW.value, comparable=True,
+            production_allowed=True, production_reason="ok", production_status="executable",
+            archive_allowed=True, archive_reason="ok", archive_source=SOURCE,
+            archive_fingerprint="fp2", archive_effective_at="2024-01-10T15:05:00",
+            archive_observed_at="2024-01-10T15:05:00", archive_evidence_present=True,
+            validation_as_of="2026-09-17T00:00:00+08:00",
+        )
+        self.assertEqual("inserted", TS.save_comparison(self.conn, comparison))
+        self.assertEqual(2, len(TS.load_comparisons(self.conn)))
+
+    def test_upgrade_is_idempotent(self):
+        self._make_v1_table_with_a_row()
+        TS.ensure_shadow_schema(self.conn)
+        second = TS.ensure_shadow_schema(self.conn)
+        self.assertFalse(second.get("upgraded_from_v1"))
+        self.assertEqual(1, len(TS.load_comparisons(self.conn)))
+
+    def test_fresh_database_is_not_flagged_as_upgraded(self):
+        # 非空洞性：全新库不应报告"从 v1 升级"，否则上面几条断言可能只是恒真。
+        result = TS.ensure_shadow_schema(self.conn)
+        self.assertFalse(result.get("upgraded_from_v1"))
 
 
 if __name__ == "__main__":

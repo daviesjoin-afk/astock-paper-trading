@@ -95,6 +95,10 @@ TEST_MODULES_BY_ID = {
     "M-O10": ("test_tradability_observation_architecture_guard",),
     "M-O11": ("test_tradability_observation_ledger",),
     "M-O12": ("test_tradability_observation_ledger",),
+    "M-O13": ("test_tradability_shadow",),
+    "M-O14": ("test_tradability_shadow",),
+    "M-O15": ("test_tradability_shadow",),
+    "M-O16": ("test_tradability_shadow",),
 }
 
 # 每个条目 import-check 的目标模块（排除"生产代码变异后语法错误无法 import"的假杀）。
@@ -117,6 +121,10 @@ IMPORT_MODULE_BY_ID = {
     "M-O10": "execution_dispatch",
     "M-O11": "tradability_observation_ledger",
     "M-O12": "tradability_observation_ledger",
+    "M-O13": "tradability_shadow",
+    "M-O14": "tradability_shadow",
+    "M-O15": "tradability_shadow",
+    "M-O16": "tradability_shadow",
 }
 
 #: 行为**等价**的变异：注入后不改变任何可达状态，因此**不要求**被测试杀死。
@@ -713,12 +721,11 @@ MUTATIONS = (
     (
         'M-O7',
         SHADOW,
-        '    # 观察到了证据，但截至 validation_as_of 它仍不足以证明 decision_at 当时可知\n'
-        '    # （例如 source_observed_at 晚于 decision）——这是"晚观察到"，不是"从未观察"。\n'
-        '    return ShadowStatus.ARCHIVE_UNPROVABLE.value, None\n',
-        '    # MUTANT M-O7: 永远不升级为 unprovable\n'
-        '    return ShadowStatus.ARCHIVE_MISSING.value, None\n',
-        'archive_missing 永不升级为 unprovable',
+        '    if knowledge.evidence_seen:\n'
+        '        return ShadowStatus.ARCHIVE_UNPROVABLE.value, None\n',
+        '    if knowledge.evidence_seen:  # MUTANT M-O7: 晚观察证据永不升级为 unprovable\n'
+        '        return ShadowStatus.ARCHIVE_MISSING.value, None\n',
+        '晚观察证据永不升级为 unprovable（有证据却判 archive_missing）',
     ),
     (
         'M-O8',
@@ -800,6 +807,41 @@ MUTATIONS = (
         '            normalized_evidence,\n',
         '            persisted,\n',
         "fingerprint 使用本次 inserted rows（等价：指纹在 save() 之前计算，persisted 恒为空）",
+    ),
+    (
+        'M-O13',
+        SHADOW,
+        '    upgraded = _upgrade_v1_shadow_table(conn)\n'
+        '    if not upgraded:\n'
+        '        _create_shadow_table(conn)\n',
+        '    _create_shadow_table(conn)  # MUTANT M-O13: 不升级 v1 表\n',
+        '不升级 v1 影子表（迁移记成功但缺列）',
+    ),
+    (
+        'M-O14',
+        SHADOW,
+        '        if validation_as_of is None:\n'
+        '            as_of_text = _canonical_instant(_dt.datetime.now(_dt.timezone.utc))\n'
+        '            as_of_invalid = as_of_text is None\n',
+        '        if validation_as_of is None:\n'
+        '            as_of_text = None  # MUTANT M-O14: 默认知识时点留空\n'
+        '            as_of_invalid = False\n',
+        '默认 validation_as_of 留空（无快照身份）',
+    ),
+    (
+        'M-O15',
+        SHADOW,
+        '    if knowledge.evidence_seen:\n'
+        '        return ShadowStatus.ARCHIVE_UNPROVABLE.value, None\n',
+        '    # MUTANT M-O15: 证据不优先，先判 provider 诊断\n',
+        '证据不优先于 provider 错误诊断',
+    ),
+    (
+        'M-O16',
+        SHADOW,
+        '        out.sort(key=lambda comparison: _identity_sort_key(comparison.identity))\n',
+        '        out.sort(key=lambda comparison: comparison.identity)  # MUTANT M-O16\n',
+        '身份排序不归一（None 与 str 混用抛 TypeError）',
     ),
 )
 
