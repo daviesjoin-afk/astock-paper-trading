@@ -362,6 +362,105 @@ class MigrationTest(unittest.TestCase):
         self.assertIn(PSM.ensure_execution_verification_columns, handlers)
 
 
+class BareConnectionReadbackTest(unittest.TestCase):
+    """回填与盖章必须在**裸连接**上跑通（迁移器用的就是它）。
+
+    ``db_migrate`` 用 ``sqlite3.connect(path)``，行对象是 tuple：任何
+    ``row["column"]`` 都会抛 ``TypeError``，而 ``dict(row)`` 同样失败。生产读路径
+    的连接都设了 ``row_factory = sqlite3.Row``，所以这类缺陷**只在迁移/运维入口
+    暴露** —— 也就是 v12 回填真正要跑的地方。只测 ``sqlite3.Row`` 连接的回归套件
+    会整体漏掉它。
+    """
+
+    def _bare_db(self):
+        """与 ``_db()`` 同结构，但**不设** ``row_factory``。"""
+        conn = sqlite3.connect(":memory:")
+        conn.executescript(
+            """
+            CREATE TABLE paper_orders (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, account_id TEXT NOT NULL,
+                signal_id INTEGER, side TEXT NOT NULL, code TEXT NOT NULL, name TEXT,
+                qty INTEGER NOT NULL, planned_price REAL, filled_price REAL,
+                amount REAL, fees REAL, status TEXT NOT NULL, reason TEXT,
+                risk_payload TEXT NOT NULL, realized_pnl REAL, created_at TEXT NOT NULL,
+                executed_at TEXT, order_type TEXT NOT NULL DEFAULT 'market',
+                origin TEXT NOT NULL DEFAULT 'strategy', expires_at TEXT,
+                cancelled_at TEXT, strategy_id TEXT, strategy_version INTEGER,
+                strategy_checksum TEXT, retry_of_order_id INTEGER
+            );
+            CREATE TABLE paper_fills (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, order_id INTEGER NOT NULL,
+                account_id TEXT NOT NULL, side TEXT NOT NULL, code TEXT NOT NULL,
+                qty INTEGER NOT NULL, price REAL NOT NULL, amount REAL NOT NULL,
+                fees REAL NOT NULL, fill_date TEXT NOT NULL, quote_at TEXT,
+                assumption TEXT NOT NULL
+            );
+            """
+        )
+        PSM.ensure_execution_verification_columns(conn)
+        return conn
+
+    def test_backfill_verifies_a_filled_row_on_a_bare_connection(self):
+        """**核心回归**：裸连接 + 完整流水 → 必须回填成 ``verified``，而不是崩。
+
+        这是生产库 v12 迁移的真实形状：8000+ 订单、有 paper_fills 表、连接是
+        裸的。修复前这里抛 ``TypeError: tuple indices must be integers``。
+        """
+        conn = self._bare_db()
+        order_id = _insert_order(conn, status="filled")
+        _insert_fill(conn, order_id)
+        conn.execute(
+            "UPDATE paper_orders SET execution_status=NULL,execution_verified=NULL"
+            " WHERE id=?", (order_id,))
+        result = EV.backfill_legacy_orders(conn)
+        self.assertEqual(1, result["stamped"])
+        self.assertEqual(1, result["verified"], "裸连接上也要认出完整成交证据")
+        row = conn.execute(
+            "SELECT execution_status,execution_verified FROM paper_orders WHERE id=?",
+            (order_id,)).fetchone()
+        self.assertEqual(EV.EXECUTION_STATUS_VERIFIED, row[0])
+
+    def test_backfill_stamps_unknown_on_a_bare_connection(self):
+        """对照：裸连接 + 没有流水 → ``unknown``，绝不升级。"""
+        conn = self._bare_db()
+        order_id = _insert_order(conn, status="filled")
+        conn.execute(
+            "UPDATE paper_orders SET execution_status=NULL,execution_verified=NULL"
+            " WHERE id=?", (order_id,))
+        result = EV.backfill_legacy_orders(conn)
+        self.assertEqual(1, result["stamped"])
+        self.assertEqual(0, result["verified"])
+        row = conn.execute(
+            "SELECT execution_status FROM paper_orders WHERE id=?", (order_id,)).fetchone()
+        self.assertEqual(EV.EXECUTION_STATUS_UNKNOWN, row[0])
+
+    def test_stamp_order_works_on_a_bare_connection(self):
+        """``stamp_order`` 同样不得假设行支持字符串下标。"""
+        conn = self._bare_db()
+        order_id = _insert_order(conn, status="filled")
+        _insert_fill(conn, order_id)
+        verdict = EV.stamp_order(conn, order_id)
+        self.assertEqual(EV.EXECUTION_STATUS_VERIFIED, verdict["execution_status"])
+        row = conn.execute(
+            "SELECT execution_verified FROM paper_orders WHERE id=?", (order_id,)).fetchone()
+        self.assertEqual(1, row[0])
+
+    def test_dict_rows_is_row_factory_agnostic(self):
+        """助手本身：tuple 行与 ``sqlite3.Row`` 行必须给出同样的 dict。"""
+        bare = self._bare_db()
+        order_id = _insert_order(bare, status="filled")
+        bare_orders = EV._dict_rows(bare.execute(
+            "SELECT id,status,account_id FROM paper_orders WHERE id=?", (order_id,)))
+        named = _db()
+        named_id = _insert_order(named, status="filled")
+        named_orders = EV._dict_rows(named.execute(
+            "SELECT id,status,account_id FROM paper_orders WHERE id=?", (named_id,)))
+        self.assertEqual(["id", "status", "account_id"], list(bare_orders[0]))
+        self.assertEqual(
+            sorted(bare_orders[0].keys()), sorted(named_orders[0].keys()))
+        self.assertEqual("filled", bare_orders[0]["status"])
+
+
 class GateReportTest(unittest.TestCase):
     def test_every_row_lands_in_exactly_one_state(self):
         report = EV.gate_report([
