@@ -48,6 +48,9 @@ TEST_MODULES_BY_ID = {
     # 由回填契约测试的 fingerprint 断言抓住。
     "M-F1": ("test_tradability_backfill",),
     "M-F2": ("test_tradability_backfill", "test_tradability_ingestion"),
+    # M-F3 把 run_id 加回 fingerprint payload：P-F5（不同 run_id → 同一指纹）在
+    # 回填契约测试里，必须指定该模块，否则默认只跑 test_tradability_ingestion 抓不到。
+    "M-F3": ("test_tradability_backfill",),
 }
 
 # 每个条目 import-check 的目标模块（排除"生产代码变异后语法错误无法 import"的假杀）。
@@ -126,19 +129,24 @@ MUTATIONS = (
     (
         "TTI7",
         INGESTION,
-        "        # fully_proven：核心事实全部可证明（非 None）、无冲突、且观测时点可证明\n"
-        "        # （unprovable 的证据不能用历史 observed_at 支撑过去决策，不算 fully proven）。\n"
-        "        if (\n"
+        "        core_fields_complete = (\n"
         "            composed.get(\"is_listed\") is not None\n"
         "            and composed.get(\"is_st\") is not None\n"
         "            and composed.get(\"is_suspended\") is not None\n"
         "            and composed.get(\"has_market_quote\") is not None\n"
         "            and composed.get(\"has_trade_volume\") is not None\n"
-        "            and not conflicts\n"
-        "            and not unprovable\n"
-        "        ):\n",
-        "        # MUTANT TTI7: unknown counted as fully_proven\n"
-        "        if True:\n",
+        "        )\n"
+        "        if core_fields_complete and not conflicts and not unprovable:\n"
+        "            stats[\"fully_proven\"] += 1\n",
+        "        core_fields_complete = (\n"
+        "            composed.get(\"is_listed\") is not None\n"
+        "            and composed.get(\"is_st\") is not None\n"
+        "            and composed.get(\"is_suspended\") is not None\n"
+        "            and composed.get(\"has_market_quote\") is not None\n"
+        "            and composed.get(\"has_trade_volume\") is not None\n"
+        "        )\n"
+        "        if True:  # MUTANT TTI7: unknown counted as fully_proven\n"
+        "            stats[\"fully_proven\"] += 1\n",
         "coverage 把 UNKNOWN 算作 fully_proven（覆盖率虚高）",
     ),
     (
@@ -220,8 +228,8 @@ MUTATIONS = (
     (
         "M-F2",
         INGESTION,
-        "            run_id, codes, sessions, self._cutoff, normalized_evidence\n",
-        "            run_id, codes, sessions, self._cutoff, persisted\n",
+        "            codes, sessions, self._cutoff, normalized_evidence\n",
+        "            codes, sessions, self._cutoff, persisted\n",
         "fingerprint 使用本次 inserted rows（幂等重放后指纹漂移）",
     ),
     (
@@ -248,6 +256,67 @@ MUTATIONS = (
         "        return service.ingest(codes, sessions, write=False, run_id=run_id)\n",
         "dry-run 恢复 schema mutation（悄悄建表，违反无副作用契约）",
     ),
+    (
+        "M-F3",
+        INGESTION,
+        [
+            "        codes: Sequence[str], sessions: Sequence[str], cutoff: str,\n",
+            "            \"version\": FINGERPRINT_VERSION,\n",
+            "            codes, sessions, self._cutoff, normalized_evidence\n",
+        ],
+        [
+            "        run_id: str, codes: Sequence[str], sessions: Sequence[str], cutoff: str,\n",
+            "            \"version\": FINGERPRINT_VERSION,\n"
+            "            \"run_id\": run_id,\n",
+            "            run_id, codes, sessions, self._cutoff, normalized_evidence\n",
+        ],
+        "run_id 重新参与 fingerprint payload（audit identity 泄漏进内容指纹）",
+    ),
+    (
+        "M-C1",
+        INGESTION,
+        "            \"unknown\": total_unknown_pairs,\n",
+        "            \"unknown\": total_unknown_fields,\n",
+        "pair-level unknown 被改回 field counter 之和（维度混淆）",
+    ),
+    (
+        "M-C2",
+        INGESTION,
+        "            \"known\": total_known,\n",
+        "            \"known\": total_present,\n",
+        "pair-level known 被改回 evidence_present（部分证据也算 known）",
+    ),
+    (
+        "M-C3",
+        INGESTION,
+        "        if conflicts:\n"
+        "            stats[\"conflict\"] += 1\n"
+        "        elif unprovable:\n",
+        "        if conflicts:\n"
+        "            stats[\"conflict\"] += 1\n"
+        "            stats[\"unknown\"] += 1\n"
+        "        elif unprovable:\n",
+        "conflict pair 同时计入 unknown（破坏排他分类）",
+    ),
+    (
+        "M-C4",
+        INGESTION,
+        "        elif unprovable:\n"
+        "            stats[\"unprovable\"] += 1\n"
+        "        elif not core_fields_complete:\n",
+        "        elif unprovable:\n"
+        "            stats[\"unprovable\"] += 1\n"
+        "            stats[\"known\"] += 1\n"
+        "        elif not core_fields_complete:\n",
+        "unprovable pair 同时计入 known（不可证明却算已知）",
+    ),
+    (
+        "M-C5",
+        INGESTION,
+        "            \"coverage_ratio\": round(total_known / requested_pairs * 100, 1)\n",
+        "            \"coverage_ratio\": round(total_present / requested_pairs * 100, 1)\n",
+        "coverage_ratio 被改回 evidence_present / requested_pairs（一点证据 = 100%覆盖）",
+    ),
 )
 
 # 自检哨兵：只改注释。它必须 UNDETECTED。
@@ -271,6 +340,11 @@ def replace_once(source: bytes, before: str, after: str) -> bytes:
     if count != 1:
         raise AssertionError(f"mutation anchor count != 1 (got {count}): {before!r}")
     return source.replace(old, new, 1)
+
+
+def _as_fragments(x):
+    """单片段字符串或片段列表统一为列表（M-F3 等多处替换的 mutation 用）。"""
+    return [x] if isinstance(x, str) else list(x)
 
 
 def clear_bytecode(relative_path: str) -> None:
@@ -322,7 +396,15 @@ def apply_and_run(entry) -> str:
     original = target.read_bytes()
     original_sha = sha256(original)
 
-    mutated = replace_once(original, before, after)
+    befores = _as_fragments(before)
+    afters = _as_fragments(after)
+    if len(befores) != len(afters):
+        raise AssertionError(
+            f"{name}: fragment count mismatch {len(befores)} != {len(afters)}"
+        )
+    mutated = original
+    for b, a in zip(befores, afters):
+        mutated = replace_once(mutated, b, a)
     if mutated == original:
         raise AssertionError(f"{name} mutation is inert at the byte level")
     try:
@@ -355,18 +437,24 @@ def audit_anchors() -> int:
     for entry in entries:
         name, relative_path = entry[0], entry[1]
         before, after = entry[2], entry[3]
+        befores = _as_fragments(before)
+        afters = _as_fragments(after)
         data = (ROOT / relative_path).read_bytes()
-        old = before.encode("utf-8")
-        count = data.count(old)
-        if count != 1:
+        if len(befores) != len(afters):
             bad += 1
-            print(f"{name}: BAD (count={count})")
-            print(f"    anchor: {before[:120]!r}")
-        else:
-            print(f"{name}: ok")
-        if after == before:
-            print(f"{name}: INERT (before == after)")
-            bad += 1
+            print(f"{name}: fragment count mismatch {len(befores)} != {len(afters)}")
+            continue
+        for b, a in zip(befores, afters):
+            count = data.count(b.encode("utf-8"))
+            if count != 1:
+                bad += 1
+                print(f"{name}: BAD (count={count})")
+                print(f"    anchor: {b[:120]!r}")
+            elif a == b:
+                print(f"{name}: INERT (before == after)")
+                bad += 1
+            else:
+                print(f"{name}: ok")
     print(f"=== audit result: {'PASS' if bad == 0 else f'{bad} problem(s)'} ===")
     return 1 if bad else 0
 

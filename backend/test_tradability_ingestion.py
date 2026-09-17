@@ -564,6 +564,175 @@ class Coverage(IngestionTestCase):
 # ───────────────────────────── 19. Coverage denominator ─────────────────────────────
 
 
+class _StaticPairProvider(TI.TradabilityFactProvider):
+    """按 (code, session) 注入固定 evidence 与 observed_kind 的 fake provider。
+
+    * 只传 ``fields``：对每个 pair 返回同一份 evidence；
+    * 传 ``evidence_by_pair``：只对 map 里的 pair 返回 evidence，其余 pair 返回
+      ``OUTCOME_UNKNOWN``（不是空 evidence，避免污染 evidence_present 计数）。
+    """
+
+    def __init__(self, pid, fields=None, *, observed_kind, observed_at, evidence_by_pair=None):
+        self.provider_id = pid
+        self.provider_version = "1"
+        self._fields = dict(fields or {})
+        self._observed_kind = observed_kind
+        self._observed_at = observed_at
+        self._by_pair = dict(evidence_by_pair or {})
+
+    def fetch(self, code, session):
+        key = (str(code), str(session))
+        if self._by_pair:
+            fields = self._by_pair.get(key)
+            if fields is None:
+                return TI.ProviderResult(
+                    provider_id=self.provider_id,
+                    provider_version=self.provider_version,
+                    status=TI.OUTCOME_UNKNOWN,
+                )
+        else:
+            fields = self._fields
+        return TI.ProviderResult(
+            provider_id=self.provider_id,
+            provider_version=self.provider_version,
+            status=TI.OUTCOME_EVIDENCE,
+            evidence=dict(fields),
+            observed_kind=self._observed_kind,
+            observed_at=self._observed_at,
+        )
+
+
+class PairLevelCoverageClassification(IngestionTestCase):
+    """P-C1..P-C4：coverage 必须区分 pair-level 排他分类与 field-level diagnostics。"""
+
+    CORE = {
+        "is_listed": True,
+        "is_st": False,
+        "is_suspended": False,
+        "has_market_quote": True,
+        "has_trade_volume": True,
+    }
+
+    def _snapshot(self, fields):
+        return _StaticPairProvider(
+            "p", fields, observed_kind=TI.OBSERVED_SNAPSHOT_TIMESTAMP,
+            observed_at="2024-06-14T09:00:00+08:00",
+        )
+
+    def test_pc1_fully_proven_pair_is_known(self):
+        result = self.make_service([self._snapshot(self.CORE)]).ingest(
+            ["000001"], ["2024-06-14"], write=True
+        )
+        cov = result.coverage
+        self.assertEqual(1, cov["known"])
+        self.assertEqual(0, cov["unknown"])
+        self.assertEqual(0, cov["conflict"])
+        self.assertEqual(0, cov["unprovable_observed_at"])
+        self.assertEqual(100.0, cov["coverage_ratio"])
+
+    def test_pc2_partial_evidence_is_unknown_not_known(self):
+        result = self.make_service(
+            [self._snapshot({"is_listed": True})]
+        ).ingest(["000001"], ["2024-06-14"], write=True)
+        cov = result.coverage
+        self.assertEqual(0, cov["known"])
+        self.assertEqual(1, cov["unknown"])
+        self.assertEqual(0, cov["conflict"])
+        self.assertEqual(0, cov["unprovable_observed_at"])
+        self.assertEqual(0.0, cov["coverage_ratio"])
+        # listing 已知但其余 4 个核心字段未知 → field-level 计数 > 1。
+        self.assertGreater(cov["unknown_field_count"], 1)
+        self.assertEqual(1, cov["evidence_present_pairs"])
+        self.assertEqual(100.0, cov["evidence_presence_ratio"])
+
+    def test_pc3_conflict_pair_counts_once_as_conflict(self):
+        a = self._snapshot({"is_listed": True, "is_st": False})
+        b = self._snapshot({"is_listed": True, "is_st": True})  # 与 a 冲突
+        result = self.make_service([a, b]).ingest(["000001"], ["2024-06-14"], write=True)
+        cov = result.coverage
+        self.assertEqual(0, cov["known"])
+        self.assertEqual(0, cov["unknown"])
+        self.assertEqual(1, cov["conflict"])
+        self.assertEqual(0, cov["unprovable_observed_at"])
+
+    def test_pc4_unprovable_pair_is_not_known(self):
+        prov = _StaticPairProvider(
+            "p", self.CORE, observed_kind=TI.OBSERVED_RETRIEVED_AT,
+            observed_at="2026-09-16T09:00:00+08:00",
+        )
+        result = self.make_service([prov]).ingest(["000001"], ["2024-06-14"], write=True)
+        cov = result.coverage
+        self.assertEqual(0, cov["known"])
+        self.assertEqual(0, cov["unknown"])
+        self.assertEqual(0, cov["conflict"])
+        self.assertEqual(1, cov["unprovable_observed_at"])
+
+
+class PairPartitionInvariant(IngestionTestCase):
+    """多 pair 下四类 pair 计数恒等于 requested_pairs（混合 known/unknown/conflict/unprovable）。"""
+
+    def test_partition_sum_equals_requested_pairs(self):
+        codes = ["000001", "000002"]
+        sessions = ["2024-06-12", "2024-06-13", "2024-06-14"]
+        core = PairLevelCoverageClassification.CORE
+        snap = _StaticPairProvider(
+            "snap",
+            observed_kind=TI.OBSERVED_SNAPSHOT_TIMESTAMP,
+            observed_at="2024-06-14T09:00:00+08:00",
+            evidence_by_pair={
+                ("000001", "2024-06-12"): dict(core),          # known
+                ("000001", "2024-06-13"): {"is_listed": True},  # unknown（部分）
+            },
+        )
+        unprov = _StaticPairProvider(
+            "unprov",
+            observed_kind=TI.OBSERVED_RETRIEVED_AT,
+            observed_at="2026-09-16T09:00:00+08:00",
+            evidence_by_pair={
+                ("000002", "2024-06-13"): dict(core),  # unprovable
+            },
+        )
+        conf_a = _StaticPairProvider(
+            "conf-a",
+            observed_kind=TI.OBSERVED_SNAPSHOT_TIMESTAMP,
+            observed_at="2024-06-14T09:00:00+08:00",
+            evidence_by_pair={
+                ("000002", "2024-06-12"): {"is_listed": True, "is_st": False},
+            },
+        )
+        conf_b = _StaticPairProvider(
+            "conf-b",
+            observed_kind=TI.OBSERVED_SNAPSHOT_TIMESTAMP,
+            observed_at="2024-06-14T09:00:00+08:00",
+            evidence_by_pair={
+                ("000002", "2024-06-12"): {"is_listed": True, "is_st": True},
+            },
+        )
+        # 预期分类：
+        #   known      = 000001×06-12
+        #   unknown    = 000001×06-13（部分）+ 000001×06-14 + 000002×06-14（无证据）
+        #   conflict   = 000002×06-12（is_st 冲突）
+        #   unprovable = 000002×06-13
+        result = self.make_service(
+            [snap, unprov, conf_a, conf_b]
+        ).ingest(codes, sessions, write=True)
+        cov = result.coverage
+        self.assertEqual(6, cov["requested_pairs"])
+        self.assertEqual(1, cov["known"])
+        self.assertEqual(3, cov["unknown"])
+        self.assertEqual(1, cov["conflict"])
+        self.assertEqual(1, cov["unprovable_observed_at"])
+        self.assertEqual(
+            cov["requested_pairs"],
+            cov["known"]
+            + cov["unknown"]
+            + cov["conflict"]
+            + cov["unprovable_observed_at"],
+        )
+        self.assertTrue(0.0 <= cov["coverage_ratio"] <= 100.0)
+        self.assertTrue(0.0 <= cov["evidence_presence_ratio"] <= 100.0)
+
+
 class CoverageDenominator(IngestionTestCase):
     def test_requested_code_scope_not_whole_market(self):
         provider = TI.ListingStatusProvider(
@@ -877,8 +1046,10 @@ class CoverageDenominatorPairs(IngestionTestCase):
         self.assertEqual(1, result.coverage["requested_symbols"])
         self.assertEqual(2, result.coverage["requested_sessions"])
         self.assertEqual(2, result.coverage["requested_pairs"])
-        # 两个 session 均有 evidence：2/2 = 100，绝不超过 100。
-        self.assertEqual(100.0, result.coverage["coverage_ratio"])
+        # 两个 session 均有 evidence：evidence_presence_ratio = 100。
+        # 但只有 listing 已知（其余核心字段未知）→ pair-level known coverage = 0。
+        self.assertEqual(100.0, result.coverage["evidence_presence_ratio"])
+        self.assertEqual(0.0, result.coverage["coverage_ratio"])
 
 
 # ───────────────────────────── 26. Complete suspension archive 语义（fix #4） ───────────

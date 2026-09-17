@@ -718,7 +718,13 @@ def _coverage_fingerprint(report: Mapping[str, Any]) -> str:
         "requested_symbols": report.get("requested_symbols"),
         "archive_records": report.get("archive_records"),
         "evidence_present": report.get("evidence_present"),
+        "evidence_present_pairs": report.get("evidence_present_pairs"),
         "fully_proven": report.get("fully_proven"),
+        "known": report.get("known"),
+        "unknown": report.get("unknown"),
+        "conflict": report.get("conflict"),
+        "unprovable_observed_at": report.get("unprovable_observed_at"),
+        "unknown_fields": report.get("unknown_fields"),
         "unknown_listing": report.get("unknown_listing"),
         "unknown_st": report.get("unknown_st"),
         "unknown_suspension": report.get("unknown_suspension"),
@@ -726,9 +732,9 @@ def _coverage_fingerprint(report: Mapping[str, Any]) -> str:
         "unknown_volume": report.get("unknown_volume"),
         "unknown_limit_state": report.get("unknown_limit_state"),
         "conflicts": report.get("conflicts"),
-        "unprovable_observed_at": report.get("unprovable_observed_at"),
         "source_counts": dict(report.get("source_counts") or {}),
         "coverage_ratio": report.get("coverage_ratio"),
+        "evidence_presence_ratio": report.get("evidence_presence_ratio"),
     }
     return _sha256(payload)
 
@@ -872,8 +878,10 @@ class IngestionService:
 
                 evidence_outcomes = [r for r in outcomes if r.status == OUTCOME_EVIDENCE]
                 if not evidence_outcomes:
-                    # 没有任何 provider 给出事实 → 这条 (code, session) 无证据。
+                    # 没有任何 provider 给出事实 → 这条 (code, session) 无证据，
+                    # pair-level 判 unknown（只 +1 一次）。
                     self._record_unknown_fields(session_stats)
+                    session_stats["unknown"] += 1
                     continue
 
                 composed, field_conflicts, _ = _compose_fields(evidence_outcomes)
@@ -897,7 +905,6 @@ class IngestionService:
                 if times["unprovable"]:
                     unprovable.append(f"{code}:{session}")
                     unprovable_records += 1
-                    session_stats["unprovable"] += 1
 
                 record = {
                     "code": code,
@@ -944,7 +951,7 @@ class IngestionService:
         status = self._run_status(error_records, unknown_records, conflicts, unprovable)
         coverage = self._build_coverage(per_session, sessions, codes, source_counts)
         run_fingerprint = self._run_fingerprint(
-            run_id, codes, sessions, self._cutoff, normalized_evidence
+            codes, sessions, self._cutoff, normalized_evidence
         )
 
         # dry-run（write=False）不写任何东西：archive 与 run audit 都不落库。
@@ -987,7 +994,11 @@ class IngestionService:
             "requested": requested,
             "archive_records": 0,
             "evidence_present": 0,
+            "evidence_present_pairs": 0,
             "fully_proven": 0,
+            "known": 0,
+            "unknown": 0,
+            "conflict": 0,
             "unknown_listing": 0,
             "unknown_st": 0,
             "unknown_suspension": 0,
@@ -1013,6 +1024,7 @@ class IngestionService:
     ) -> None:
         stats["archive_records"] += 1
         stats["evidence_present"] += 1
+        stats["evidence_present_pairs"] += 1
         if composed.get("is_listed") is None:
             stats["unknown_listing"] += 1
         if composed.get("is_st") is None:
@@ -1027,23 +1039,38 @@ class IngestionService:
             stats["unknown_limit_state"] += 1
         if conflicts:
             stats["conflicts"] += 1
-        # fully_proven：核心事实全部可证明（非 None）、无冲突、且观测时点可证明
-        # （unprovable 的证据不能用历史 observed_at 支撑过去决策，不算 fully proven）。
-        if (
+        # 核心事实全部非 None 且无冲突、且观测时点可证明 → 与 #156 evaluator 的
+        # fully_proven 口径一致。price_limit_locked 是追加方向性限制，不参与
+        # 核心 fully_proven 判定（保持 #156 语义不动）。
+        core_fields_complete = (
             composed.get("is_listed") is not None
             and composed.get("is_st") is not None
             and composed.get("is_suspended") is not None
             and composed.get("has_market_quote") is not None
             and composed.get("has_trade_volume") is not None
-            and not conflicts
-            and not unprovable
-        ):
+        )
+        if core_fields_complete and not conflicts and not unprovable:
             stats["fully_proven"] += 1
+        # pair-level exclusive classification，优先级 conflict > unprovable >
+        # unknown > known。一个 pair 最终只 +1 一次，保证四类总和恒等于 requested_pairs。
+        if conflicts:
+            stats["conflict"] += 1
+        elif unprovable:
+            stats["unprovable"] += 1
+        elif not core_fields_complete:
+            stats["unknown"] += 1
+        else:
+            stats["known"] += 1
 
     @staticmethod
     def _finalize_session_stats(stats: dict) -> dict:
         stats["coverage_ratio"] = (
-            round(stats["evidence_present"] / stats["requested"] * 100, 1)
+            round(stats["known"] / stats["requested"] * 100, 1)
+            if stats["requested"]
+            else 0.0
+        )
+        stats["evidence_presence_ratio"] = (
+            round(stats["evidence_present_pairs"] / stats["requested"] * 100, 1)
             if stats["requested"]
             else 0.0
         )
@@ -1068,7 +1095,12 @@ class IngestionService:
                     "requested",
                     "archive_records",
                     "evidence_present",
+                    "evidence_present_pairs",
                     "fully_proven",
+                    "known",
+                    "unknown",
+                    "conflict",
+                    "unprovable",
                     "unknown_listing",
                     "unknown_st",
                     "unknown_suspension",
@@ -1078,6 +1110,7 @@ class IngestionService:
                     "conflicts",
                     "unprovable",
                     "coverage_ratio",
+                    "evidence_presence_ratio",
                 )
             }
         # 分母口径：requested code-session pairs（调用方传入的 code × session 全笛卡尔积）。
@@ -1085,14 +1118,18 @@ class IngestionService:
         total_requested = len(codes)
         requested_pairs = total_requested * len(sessions)
         total_present = sum(s["evidence_present"] for s in summary.values())
+        total_present_pairs = sum(s["evidence_present_pairs"] for s in summary.values())
         total_fully = sum(s["fully_proven"] for s in summary.values())
         total_conflicts = sum(s["conflicts"] for s in summary.values())
-        total_unknown = sum(
+        total_unknown_fields = sum(
             s["unknown_listing"] + s["unknown_st"] + s["unknown_suspension"]
             + s["unknown_quote"] + s["unknown_volume"] + s["unknown_limit_state"]
             for s in summary.values()
         )
-        total_unprovable = sum(s["unprovable"] for s in summary.values())
+        total_known = sum(s["known"] for s in summary.values())
+        total_unknown_pairs = sum(s["unknown"] for s in summary.values())
+        total_conflict_pairs = sum(s["conflict"] for s in summary.values())
+        total_unprovable_pairs = sum(s["unprovable"] for s in summary.values())
         aggregate = {
             "version": CONTRACT_VERSION,
             "scope": "requested_code_coverage",
@@ -1101,15 +1138,26 @@ class IngestionService:
             "requested_sessions": len(sessions),
             "requested_pairs": requested_pairs,
             "evidence_present": total_present,
-            "known": total_present,
+            "evidence_present_pairs": total_present_pairs,
+            "known": total_known,
+            "unknown": total_unknown_pairs,
+            "conflict": total_conflict_pairs,
+            "unprovable_observed_at": total_unprovable_pairs,
             "fully_proven": total_fully,
-            "unknown_fields": total_unknown,
-            "unknown": total_unknown,
+            "unknown_fields": total_unknown_fields,
+            "unknown_field_count": total_unknown_fields,
+            "unknown_listing": sum(s["unknown_listing"] for s in summary.values()),
+            "unknown_st": sum(s["unknown_st"] for s in summary.values()),
+            "unknown_suspension": sum(s["unknown_suspension"] for s in summary.values()),
+            "unknown_quote": sum(s["unknown_quote"] for s in summary.values()),
+            "unknown_volume": sum(s["unknown_volume"] for s in summary.values()),
+            "unknown_limit_state": sum(s["unknown_limit_state"] for s in summary.values()),
             "conflicts": total_conflicts,
-            "conflict": total_conflicts,
-            "unprovable_observed_at": total_unprovable,
             "source_counts": dict(source_counts),
-            "coverage_ratio": round(total_present / requested_pairs * 100, 1)
+            "coverage_ratio": round(total_known / requested_pairs * 100, 1)
+            if requested_pairs
+            else 0.0,
+            "evidence_presence_ratio": round(total_present_pairs / requested_pairs * 100, 1)
             if requested_pairs
             else 0.0,
             "sessions": summary,
@@ -1126,11 +1174,13 @@ class IngestionService:
 
     def _run_fingerprint(
         self,
-        run_id: str, codes: Sequence[str], sessions: Sequence[str], cutoff: str,
+        codes: Sequence[str], sessions: Sequence[str], cutoff: str,
         normalized: Sequence[TA.TradabilityEvidence],
     ) -> str:
-        """同一 source payload + provider versions + requested scope + PIT timestamps
-        应产生稳定指纹；数据变化时指纹必须变化。
+        """内容身份指纹：只由 normalized facts + requested scope + cutoff +
+        provider/provenance identity 决定。run_id 是 audit identity，**绝不**参与
+        内容指纹；同一份事实用不同 run_id 重放必须得到同一 fingerprint。
+        数据变化时指纹必须变化。
 
         输入是**规范化后的证据**而非本次新插入的 persisted 行：幂等重放时第二次
         ``ingest`` 不会产生任何新插入（唯一键命中），若用 persisted 作输入，同一份
@@ -1141,7 +1191,6 @@ class IngestionService:
         """
         payload = {
             "version": FINGERPRINT_VERSION,
-            "run_id": run_id,
             "codes": sorted(codes),
             "sessions": sorted(sessions),
             "cutoff": cutoff,

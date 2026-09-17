@@ -163,6 +163,69 @@ class FingerprintChangesWithProviderVersion(unittest.TestCase):
             conn.close()
 
 
+class FingerprintIndependentOfRunIdentity(unittest.TestCase):
+    """P-F5：run_id 是 audit identity，**绝不**参与内容指纹。
+
+    同一份 facts/scope/cutoff/provider 用不同 run_id 重放，指纹必须相同。
+    """
+
+    def test_different_run_id_shares_the_same_fingerprint(self):
+        cutoff = "2025-06-01T09:00:00+08:00"
+        conn = sqlite3.connect(":memory:")
+        try:
+            TA.ensure_schema(conn)
+            TI.ensure_ingestion_schema(conn)
+            a = _make_service(conn, [_listing_provider()], cutoff=cutoff).ingest(
+                ["000001"], ["2024-01-10"], write=False, run_id="run-a"
+            )
+            b = _make_service(conn, [_listing_provider()], cutoff=cutoff).ingest(
+                ["000001"], ["2024-01-10"], write=False, run_id="run-b"
+            )
+            self.assertNotEqual(a.run_id, b.run_id)
+            self.assertEqual(a.run_fingerprint, b.run_fingerprint)
+        finally:
+            conn.close()
+
+
+class FingerprintChangesWithScope(unittest.TestCase):
+    """P-F6：requested session scope 改变 → fingerprint 改变。"""
+
+    def test_scope_change_changes_fingerprint(self):
+        cutoff = "2025-06-01T09:00:00+08:00"
+        conn = sqlite3.connect(":memory:")
+        try:
+            TA.ensure_schema(conn)
+            TI.ensure_ingestion_schema(conn)
+            a = _make_service(conn, [_listing_provider()], cutoff=cutoff).ingest(
+                ["000001"], ["2024-01-10"], write=False, run_id="r"
+            )
+            b = _make_service(conn, [_listing_provider()], cutoff=cutoff).ingest(
+                ["000001"], ["2024-01-10", "2024-01-11"], write=False, run_id="r"
+            )
+            self.assertNotEqual(a.run_fingerprint, b.run_fingerprint)
+        finally:
+            conn.close()
+
+
+class FingerprintChangesWithCutoff(unittest.TestCase):
+    """P-F7：cutoff 改变 → fingerprint 改变。"""
+
+    def test_cutoff_change_changes_fingerprint(self):
+        conn = sqlite3.connect(":memory:")
+        try:
+            TA.ensure_schema(conn)
+            TI.ensure_ingestion_schema(conn)
+            a = _make_service(
+                conn, [_listing_provider()], cutoff="2025-06-01T09:00:00+08:00"
+            ).ingest(["000001"], ["2024-01-10"], write=False, run_id="r")
+            b = _make_service(
+                conn, [_listing_provider()], cutoff="2025-07-01T09:00:00+08:00"
+            ).ingest(["000001"], ["2024-01-10"], write=False, run_id="r")
+            self.assertNotEqual(a.run_fingerprint, b.run_fingerprint)
+        finally:
+            conn.close()
+
+
 class SessionResolutionHonorsCalendar(unittest.TestCase):
     """P-S1/P-S2：日期范围按交易日历过滤，周末与法定休市日不进入 sessions。"""
 
@@ -206,7 +269,8 @@ class CoverageBoundedBySessionPairs(unittest.TestCase):
             self.assertEqual(3, cov["requested_sessions"])
             self.assertEqual(3, cov["requested_pairs"])
             self.assertLessEqual(cov["coverage_ratio"], 100.0)
-            self.assertEqual(100.0, cov["coverage_ratio"])
+            self.assertEqual(0.0, cov["coverage_ratio"])  # listing-only：非 fully proven
+            self.assertEqual(100.0, cov["evidence_presence_ratio"])
             # P-S4：code_count × session_count == requested_pairs == denominator。
             self.assertEqual(
                 cov["requested_codes"] * cov["requested_sessions"],
