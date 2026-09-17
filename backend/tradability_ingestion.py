@@ -815,6 +815,16 @@ class IngestionService:
         self._cutoff = _canonical_instant(cutoff) or _now_utc()
         # 可选：写 ``tradability_ingestion_runs`` 审计表的连接。不传则只做
         # archive 写入与 coverage，不落 run 记录（纯内存测试可省略）。
+        #
+        # **审计连接必须就是归档连接**。replay identity 是"归档里这条 run 记了什么
+        # 指纹"，它必须与事实写入在同一个库、同一个事务里：分属两条连接时，既可能读到
+        # 一个空的 runs 表（而归档库里其实已经有该 run_id），也可能让事实与审计跨库提交
+        # ——"整个事务 rollback"就无从谈起。与其在写入时才发现，不如在构造时就拒绝。
+        if audit_conn is not None and audit_conn is not repository.connection:
+            raise IngestionError(
+                "audit_conn 必须与 repository 使用同一个连接：replay identity 的查询与"
+                "事实写入必须在同一个库、同一个事务内，否则事实与审计无法原子提交"
+            )
         self._audit_conn = audit_conn
 
     @property
@@ -965,6 +975,8 @@ class IngestionService:
                 "skipped": skipped_records,
                 "status": status,
             },
+            unprovable,
+            conflicts,
         )
 
         # ── 两阶段：先算完所有结论与内容身份，再决定要不要落库 ──
@@ -1207,6 +1219,8 @@ class IngestionService:
         codes: Sequence[str], sessions: Sequence[str], cutoff: str,
         normalized: Sequence[TA.TradabilityEvidence],
         outcomes: Optional[Mapping[str, Any]] = None,
+        unprovable: Optional[Sequence[Any]] = None,
+        conflicts: Optional[Sequence[Any]] = None,
     ) -> str:
         """内容身份指纹：由 normalized facts + requested scope + cutoff +
         provider/provenance identity + **provider 结果分布**决定。run_id 是 audit
@@ -1225,7 +1239,13 @@ class IngestionService:
         cutoff / provider 版本完全相同的情况下**不产生任何 normalized evidence**，
         若指纹只看 evidence，两次运行会得到同一个指纹而被判成"幂等重放"，于是
         ``INSERT OR IGNORE`` 保留第一行 audit —— 本次运行报告 ``completed``，审计里
-        却仍是 ``completed_with_gaps``。凡是会写进审计的状态/计数差异，都属于内容身份。
+        却仍是 ``completed_with_gaps``。
+
+        ``unprovable`` / ``conflicts`` 同理：provider 给出的**事实与时间戳完全相同**、
+        只把 ``observed_kind`` 从可证明类型换成 ``unprovable`` 时，normalized evidence
+        与 outcomes 计数都不变，但审计行的 ``unprovable_records`` 与
+        ``detail_json.unprovable`` 变了。规则是：**凡是会写进审计行的差异都属于内容
+        身份**，不能只覆盖其中一部分。
         """
         payload = {
             "version": FINGERPRINT_VERSION,
@@ -1235,6 +1255,11 @@ class IngestionService:
             "provider_versions": dict(sorted(self.provider_versions.items())),
             "evidence_fingerprints": sorted(TA.evidence_fingerprint(e) for e in normalized),
             "outcomes": dict(sorted((outcomes or {}).items())),
+            "unprovable": sorted(str(pair) for pair in (unprovable or ())),
+            "conflicts": [
+                {"field": c.field, "providers": list(c.providers), "values": list(c.values)}
+                for c in (conflicts or ())
+            ],
         }
         return _sha256(payload)
 

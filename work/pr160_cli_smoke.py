@@ -175,8 +175,10 @@ def _run(created: list) -> int:
         assert summary["comparable"] > 0, "整批都不可比 → 这个冒烟证明不了任何比对"
         # 每一类归档缺口都被真实走到，并且**都不进**分歧分母。
         assert summary["archive_unknown"] == 1, summary["archive_unknown"]
-        assert summary["archive_unprovable"] == 2, summary["archive_unprovable"]
-        assert summary["archive_missing"] == 2, summary["archive_missing"]
+        # 归档_unprovable 现在是调用方声明（CLI 不声明，见文件内说明），因此这里
+        # 期望 0：没有可见证据一律 archive_missing。
+        assert summary["archive_unprovable"] == 0, summary["archive_unprovable"]
+        assert summary["archive_missing"] == 4, summary["archive_missing"]
         assert summary["production_unknown"] == 0
         assert summary["agreement_rate"] is not None
         assert summary["disagreement_rate"] is not None
@@ -185,7 +187,7 @@ def _run(created: list) -> int:
             == summary["production_allow_archive_block"]
             + summary["production_block_archive_allow"]
         ), summary
-        for gap in ("archive_unknown", "archive_unprovable", "archive_missing"):
+        for gap in ("archive_unknown", "archive_missing"):
             assert gap in statuses, (gap, statuses)
         # 卖出方向不得出现 T+1 造成的假分歧：CLI 不声明 entry_session，因此
         # 任何 ``t1_not_sellable`` 都说明它又伪造了同日入场。

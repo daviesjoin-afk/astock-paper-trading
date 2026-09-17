@@ -176,7 +176,21 @@ REVERTS = [
 ]
 
 
+def _refuse_if_mutation_running() -> None:
+    """变异矩阵运行期间生产源码可能是变异体——此时"就地回退"会把它当成原始内容。
+
+    一个真实事故：并行跑本脚本时，它把变异体读成"原始内容"记下来，随后又"还原"成
+    那个变异体，留下了一段永久损坏的源码。这里改成明确拒绝，而不是静默损坏。
+    """
+    lock = BACKEND.parent / "work" / ".mutation_running"
+    if lock.exists():
+        raise SystemExit(
+            f"变异矩阵正在运行（{lock} 存在）；源码此刻可能是变异体，拒绝并发运行"
+        )
+
+
 def main() -> int:
+    _refuse_if_mutation_running()
     originals = {}
     for path in (INGESTION, BACKFILL, ARCHIVE, SHADOW):
         originals[path] = path.read_bytes()

@@ -103,12 +103,11 @@ def _production_verdict(code, session, side, kline_map, state_fn):
 
 
 def _pair_has_records(conn, code, session):
-    """归档里是否存在该 ``(code, session)`` 的**任何**记录（含未来 observed_at 的修订）。
+    """归档里是否存在该 ``(code, session)`` 的**任何**记录。
 
-    这是**调用方**的声明输入，不是比对器的判据：比对器不能自己问"后来有没有"（那会
-    让历史结论随后来的摄取改变）。本 CLI 在这里声明的是"这条 pair 有证据，只是可能
-    晚于 decision_at 才被观察到"，于是比对器会把"当时不可见"记成 ``archive_unprovable``
-    而不是 ``archive_missing``——两者都是 not_comparable，不进分歧分母。
+    **当前**本 CLI 不消费它——见调用点的说明：从当前归档推导出来的"后来是否摄取过"
+    是一个当前状态，今天插入一条晚观察的记录就会改写昨天的比对分类与指纹。保留这个
+    只读探针是为了让后续引入真正的摄取台账时有一个明确的落点。
     """
     try:
         row = conn.execute(
@@ -183,13 +182,17 @@ def main(argv=None) -> int:
                             "session": session,
                             "side": side,
                             "decision_at": ST.session_close_at(session),
-                            # "这条 pair 有证据、只是晚于 decision_at 才被观察到"是调用方
-                            # 显式声明的输入。归档表里确实存在该 pair 的记录（含未来
-                            # observed_at 的修订）时才声明，绝不让比对器自己去查"后来
-                            # 有没有"——那是未来事实，会改写历史结论。
-                            "ingested_later": _pair_has_records(
-                                conn, code, session
-                            ),
+                            # 默认**不**声明"证据晚于 decision_at 才被观察到"：本 CLI 没有
+                            # 独立的摄取台账，任何从"当前归档里有没有这条 pair"推导出来
+                            # 的结论都是**当前状态**，今天插入一条晚观察的记录就会让昨天
+                            # 的比对从 archive_missing 变成 archive_unprovable，指纹随之
+                            # 改变。那正是用未来事实改写历史结论。
+                            #
+                            # 于是这里取**当时就能得到的结论**：没有可见证据即
+                            # archive_missing。unprovable 需要真正的摄取台账（记录该 pair
+                            # 首次被观察到的时间）才能声明，属于后续工作，见 PR 的 Known
+                            # gaps。
+                            "ingested_later": False,
                         }
                     )
         comparisons = comparator.compare_many(items)

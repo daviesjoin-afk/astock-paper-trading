@@ -899,5 +899,212 @@ class ReplayIdentityCoversProviderOutcomes(IngestionTestCase):
         self.assertNotEqual(error_run.run_fingerprint, unknown_run.run_fingerprint)
 
 
+class _KindFlippingProvider(TI.TradabilityFactProvider):
+    """事实与时间戳完全相同，只把 observed_kind 从可证明类型换成 unprovable。"""
+
+    provider_id = "kind_flip"
+
+    def __init__(self):
+        self.provider_version = "1"
+        self.kind = TI.OBSERVED_SNAPSHOT_TIMESTAMP
+
+    def fetch(self, code, session):
+        return TI.ProviderResult(
+            provider_id=self.provider_id,
+            provider_version=self.provider_version,
+            status=TI.OUTCOME_EVIDENCE,
+            evidence={"is_listed": True},
+            observed_kind=self.kind,
+            observed_at="2025-01-01T09:00:00+08:00",
+        )
+
+
+class ReplayIdentityCoversUnprovableOutcomes(IngestionTestCase):
+    """P1（第二轮 review）：unprovable / conflict 也必须进内容身份。
+
+    provider 给出的事实与时间戳完全不变、只把 ``observed_kind`` 从可证明类型换成
+    ``unprovable`` 时，normalized evidence 与 outcomes 计数都不变，但审计行的
+    ``unprovable_records`` 与 ``detail_json.unprovable`` 变了。若指纹不含它，同 run_id
+    的重试会被当成"完全相同"而放行，``INSERT OR IGNORE`` 保留那行过期的审计。
+    """
+
+    def test_unprovable_flip_is_not_an_idempotent_replay(self):
+        provider = _KindFlippingProvider()
+        service = self.make_service([provider], cutoff="2025-06-01T09:00:00+08:00")
+        service.ingest(["000001"], ["2024-01-10"], write=True, run_id="kind")
+        before = self.conn.execute(
+            "SELECT status, run_fingerprint, unprovable_records, detail_json "
+            "FROM tradability_ingestion_runs WHERE run_id='kind'"
+        ).fetchone()
+        self.assertEqual(0, before[2])
+
+        provider.kind = TI.OBSERVED_UNPROVABLE
+        with self.assertRaises(TI.IngestionError):
+            service.ingest(["000001"], ["2024-01-10"], write=True, run_id="kind")
+
+        after = self.conn.execute(
+            "SELECT status, run_fingerprint, unprovable_records, detail_json "
+            "FROM tradability_ingestion_runs WHERE run_id='kind'"
+        ).fetchone()
+        self.assertEqual(tuple(before), tuple(after))
+
+    def test_unprovable_flag_changes_the_fingerprint(self):
+        provider = _KindFlippingProvider()
+        service = self.make_service([provider], cutoff="2025-06-01T09:00:00+08:00")
+        provable = service.ingest(["000001"], ["2024-01-10"], write=False, run_id="a")
+        provider.kind = TI.OBSERVED_UNPROVABLE
+        unprovable = service.ingest(["000001"], ["2024-01-10"], write=False, run_id="b")
+        # normalized evidence 的指纹可能相同（事实一致），但内容身份必须不同。
+        self.assertNotEqual(provable.run_fingerprint, unprovable.run_fingerprint)
+
+
+class _ConflictingProvider(TI.TradabilityFactProvider):
+    """两个 provider 对同一字段给出不同值 → conflict。"""
+
+    def __init__(self, value):
+        self.provider_id = f"conflict_{value}"
+        self.provider_version = "1"
+        self._value = value
+
+    def fetch(self, code, session):
+        return TI.ProviderResult(
+            provider_id=self.provider_id,
+            provider_version=self.provider_version,
+            status=TI.OUTCOME_EVIDENCE,
+            evidence={"is_st": self._value},
+            observed_kind=TI.OBSERVED_SNAPSHOT_TIMESTAMP,
+            observed_at="2025-01-01T09:00:00+08:00",
+        )
+
+
+class ReplayIdentityCoversConflicts(IngestionTestCase):
+    def test_conflict_details_are_part_of_the_fingerprint(self):
+        first = self.make_service(
+            [_ConflictingProvider(True), _ConflictingProvider(False)],
+            cutoff="2025-06-01T09:00:00+08:00",
+        ).ingest(["000001"], ["2024-01-10"], write=False, run_id="a")
+        second = self.make_service(
+            [_ConflictingProvider(True)],
+            cutoff="2025-06-01T09:00:00+08:00",
+        ).ingest(["000001"], ["2024-01-10"], write=False, run_id="b")
+        self.assertNotEqual(first.run_fingerprint, second.run_fingerprint)
+
+
+class FingerprintCoversEveryAuditVisibleDifference(IngestionTestCase):
+    """直接验证内容身份本身：审计行里会出现的每一项差异都必须改变指纹。
+
+    间接经由 ``ingest`` 的用例有一个盲区：某些差异会**同时**改变 normalized evidence
+    的指纹（例如 provider 集合变化会改 ``source``），于是"去掉 conflicts 字段"的变异
+    仍然被抓住，看不出该字段是否真的被消费。这里直接调用 ``_run_fingerprint``，把每个
+    参数逐一改变，断言指纹随之改变——这是"凡进审计的差异都是内容身份"这条规则最精确
+    的验证方式。
+    """
+
+    def _service(self):
+        return self.make_service(
+            [_ConflictingProvider(True)], cutoff="2025-06-01T09:00:00+08:00"
+        )
+
+    def _fingerprint(self, service, **overrides):
+        base = {
+            "codes": ["000001"],
+            "sessions": ["2024-01-10"],
+            "cutoff": "2025-06-01T09:00:00+08:00",
+            "normalized": [],
+            "outcomes": {"evidence": 1, "unknown": 0, "error": 0, "skipped": 0,
+                         "status": TI.STATUS_COMPLETED},
+            "unprovable": [],
+            "conflicts": [],
+        }
+        base.update(overrides)
+        return service._run_fingerprint(
+            base["codes"], base["sessions"], base["cutoff"], base["normalized"],
+            base["outcomes"], base["unprovable"], base["conflicts"],
+        )
+
+    def test_baseline_is_stable(self):
+        service = self._service()
+        self.assertEqual(self._fingerprint(service), self._fingerprint(service))
+
+    def test_outcome_distribution_is_part_of_the_fingerprint(self):
+        service = self._service()
+        base = self._fingerprint(service)
+        changed = self._fingerprint(
+            service, outcomes={"evidence": 0, "unknown": 1, "error": 0, "skipped": 0,
+                               "status": TI.STATUS_COMPLETED}
+        )
+        self.assertNotEqual(base, changed)
+
+    def test_run_status_is_part_of_the_fingerprint(self):
+        service = self._service()
+        base = self._fingerprint(service)
+        changed = self._fingerprint(
+            service, outcomes={"evidence": 0, "unknown": 0, "error": 1, "skipped": 0,
+                               "status": TI.STATUS_COMPLETED_WITH_GAPS}
+        )
+        self.assertNotEqual(base, changed)
+
+    def test_unprovable_details_are_part_of_the_fingerprint(self):
+        service = self._service()
+        base = self._fingerprint(service)
+        changed = self._fingerprint(service, unprovable=["000001:2024-01-10"])
+        self.assertNotEqual(base, changed)
+
+    def test_conflict_details_are_part_of_the_fingerprint(self):
+        service = self._service()
+        base = self._fingerprint(service)
+        conflict = TI.Conflict(
+            field="is_st", providers=("a", "b"), values=(True, False),
+            session="2024-01-10", effective_at="2024-01-10T15:05:00",
+            observed_at="2024-01-10T15:05:00",
+        )
+        changed = self._fingerprint(service, conflicts=[conflict])
+        self.assertNotEqual(base, changed)
+        # 冲突**内容**（值集合）变化也必须改变指纹，不只是"有没有冲突"。
+        other = TI.Conflict(
+            field="is_st", providers=("a", "b"), values=(True, True),
+            session="2024-01-10", effective_at="2024-01-10T15:05:00",
+            observed_at="2024-01-10T15:05:00",
+        )
+        self.assertNotEqual(
+            self._fingerprint(service, conflicts=[conflict]),
+            self._fingerprint(service, conflicts=[other]),
+        )
+
+    def test_provider_version_is_part_of_the_fingerprint(self):
+        first = self.make_service(
+            [_VersionedProvider("1")], cutoff="2025-06-01T09:00:00+08:00"
+        )
+        second = self.make_service(
+            [_VersionedProvider("2")], cutoff="2025-06-01T09:00:00+08:00"
+        )
+        self.assertNotEqual(self._fingerprint(first), self._fingerprint(second))
+
+
+class AuditConnectionMustMatchArchiveConnection(IngestionTestCase):
+    """P2（第二轮 review）：审计连接必须与归档同库同连接。"""
+
+    def test_audit_conn_on_a_different_connection_is_rejected(self):
+        other = sqlite3.connect(":memory:")
+        self.addCleanup(other.close)
+        TI.ensure_ingestion_schema(other)
+        with self.assertRaises(TI.IngestionError):
+            TI.IngestionService(
+                [_OutcomeFlippingProvider()],
+                self.repo,
+                cutoff="2025-06-01T09:00:00+08:00",
+                audit_conn=other,
+            )
+
+    def test_same_connection_is_accepted(self):
+        service = TI.IngestionService(
+            [_OutcomeFlippingProvider()],
+            self.repo,
+            cutoff="2025-06-01T09:00:00+08:00",
+            audit_conn=self.conn,
+        )
+        self.assertIsNotNone(service)
+
+
 if __name__ == "__main__":
     unittest.main()

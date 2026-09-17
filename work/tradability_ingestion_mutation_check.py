@@ -19,6 +19,7 @@
 
 from __future__ import annotations
 
+import atexit
 import hashlib
 import os
 import subprocess
@@ -75,6 +76,9 @@ TEST_MODULES_BY_ID = {
     "M-SH9": ('test_tradability_shadow',),
     "M-SH10": ('test_tradability_shadow',),
     "M-SH11": ('test_tradability_shadow_architecture_guard',),
+    "M-R7": ('test_tradability_backfill',),
+    "M-R8": ('test_tradability_backfill',),
+    "M-R9": ('test_tradability_backfill',),
 }
 
 # 每个条目 import-check 的目标模块（排除"生产代码变异后语法错误无法 import"的假杀）。
@@ -486,6 +490,27 @@ MUTATIONS = (
         '    return ST.exit_tradability(  # MUTANT M-SH11: 伪造同日 entry_session\n        evidence, code=code, exit_session=session, entry_session=session\n    )\n',
         "卖出方向伪造同日 entry_session（造出假的 T+1 分歧）",
     ),
+    (
+        "M-R7",
+        INGESTION,
+        '            "unprovable": sorted(str(pair) for pair in (unprovable or ())),\n',
+        '            "unprovable": [],  # MUTANT M-R7: unprovable 明细不进指纹\n',
+        "unprovable 明细不进内容身份（observed_kind 翻转被当成幂等重放）",
+    ),
+    (
+        "M-R8",
+        INGESTION,
+        '            "conflicts": [\n                {"field": c.field, "providers": list(c.providers), "values": list(c.values)}\n                for c in (conflicts or ())\n            ],\n',
+        '            "conflicts": [],  # MUTANT M-R8: conflict 明细不进指纹\n',
+        "conflict 明细不进内容身份（冲突集合变化被当成幂等重放）",
+    ),
+    (
+        "M-R9",
+        INGESTION,
+        '        if audit_conn is not None and audit_conn is not repository.connection:\n            raise IngestionError(\n                "audit_conn 必须与 repository 使用同一个连接：replay identity 的查询与"\n                "事实写入必须在同一个库、同一个事务内，否则事实与审计无法原子提交"\n            )\n',
+        '        if False:  # MUTANT M-R9: 允许跨库审计连接\n            pass\n',
+        "允许审计连接与归档连接不同（跨库提交，replay identity 查错库）",
+    ),
 )
 
 # 自检哨兵：只改注释。它必须 UNDETECTED。
@@ -496,6 +521,31 @@ SANITY_MUTATION = (
     "CONTRACT_VERSION = \"tradability-ingestion-v1\"  # sanity\n",
     "harness sanity check (comment only, must survive)",
 )
+
+
+#: 变异矩阵运行期间存在的锁文件。矩阵会把**生产源码**临时改成变异体，
+#: 因此任何其它脚本（测试、lint、另一个矩阵）在此期间读到的都是**被改过的字节**。
+#: 一个真实事故：并行跑 revert 脚本时，它把变异体当成"原始内容"记了下来，随后
+#: "还原"成变异体，留下了一段永久损坏的源码。锁的作用就是让这种情况变成一次
+#: 明确拒绝，而不是一次静默损坏。
+LOCK_PATH = ROOT / "work" / ".mutation_running"
+
+
+def acquire_lock() -> None:
+    if LOCK_PATH.exists():
+        raise SystemExit(
+            f"另一个变异矩阵正在运行（{LOCK_PATH} 存在）；"
+            "生产源码此刻可能是变异体，拒绝并发运行"
+        )
+    LOCK_PATH.write_text(str(os.getpid()), encoding="utf-8")
+    atexit.register(release_lock)
+
+
+def release_lock() -> None:
+    try:
+        LOCK_PATH.unlink()
+    except OSError:
+        pass
 
 
 def sha256(data: bytes) -> str:
@@ -572,7 +622,7 @@ def apply_and_run(entry) -> str:
             f"{name}: fragment count mismatch {len(befores)} != {len(afters)}"
         )
     mutated = original
-    for b, a in zip(befores, afters):
+    for b, a in zip(befores, afters, strict=True):
         mutated = replace_once(mutated, b, a)
     if mutated == original:
         raise AssertionError(f"{name} mutation is inert at the byte level")
@@ -613,7 +663,7 @@ def audit_anchors() -> int:
             bad += 1
             print(f"{name}: fragment count mismatch {len(befores)} != {len(afters)}")
             continue
-        for b, a in zip(befores, afters):
+        for b, a in zip(befores, afters, strict=True):
             count = data.count(b.encode("utf-8"))
             if count != 1:
                 bad += 1
@@ -632,6 +682,7 @@ def main(argv=None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     if "--audit" in argv:
         return audit_anchors()
+    acquire_lock()
     print(f"repo root: {ROOT}")
     print("targets: " + ", ".join(sorted({entry[1] for entry in MUTATIONS})))
     if not baseline_is_green():

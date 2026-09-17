@@ -25,7 +25,7 @@ Shadow Tradability Validation      ← 本 PR
 | 项 | 值 |
 | --- | --- |
 | base | `master` @ `1dc4b053f125fe0d38a42c9244737ae9433e9a19` |
-| head | `codex/tradability-shadow-validation` @ `64f12b3ad2dc4ed6bd33372e9d2d5d605c57691d` |
+| head | `codex/tradability-shadow-validation` @ `ddff6bab34ef1642e1100d4a0da4823869f82545` |
 
 开始前已 `git fetch` 确认 master 未漂移（`origin/master` == 上述 base SHA，即 #157 的
 merge commit）。
@@ -174,7 +174,7 @@ else:
 | M-SESSION1 empty session range accepted | CAUGHT |
 | M-SESSION2 zero-session write creates audit row | CAUGHT |
 
-**矩阵总结果：39/39 CAUGHT，0 survived**（含既有 TTI1–TTI12 / M-D1 / M-F1..F3 / M-S1 /
+**矩阵总结果：44/44 CAUGHT，0 survived**（含既有 TTI1–TTI12 / M-D1 / M-F1..F3 / M-S1 /
 M-DR1 / M-C1..C5）。`S0` 哨兵（只改注释）按预期 UNDETECTED。
 每条变异都做 byte-for-byte 还原并核对 sha256：40 次 restore 全部 `bytes_match=True
 sha256_match=True`，0 次失败。无 equivalent mutation。
@@ -354,6 +354,25 @@ CLI 运行前后数据库文件字节完全一致（只读证明）。
 
 ---
 
+## Review round 1 — 3 P1 + 3 P2 全部修复
+
+第一轮 review 提出 6 条发现，逐条**先复现再修**，全部已修复并 resolve：
+
+| 级别 | 发现 | 修复 |
+| --- | --- | --- |
+| P1 | `audit_conn=None` 时 replay identity 无处可查 | `write=True` 要求持久审计存储；缺审计表同样 fail closed（dry-run 不受影响） |
+| P1 | error→unknown 翻转不改变指纹 | 指纹覆盖 provider 结果分布（evidence/unknown/error/skipped/status）——凡进审计的差异都是内容身份 |
+| P1 | Shadow CLI 为卖出伪造同日 `entry_session` | 不声明 `entry_session`（本工具比的是市场层面可交易性，T+1 属于持仓层面），消除假分歧 |
+| P2 | 用"后来是否摄取过"决定归档分类 | 分类只用 `decision_at` 当时可见证据；missing/unprovable 由调用方显式声明，未来探测已删除 |
+| P2 | 生产 verdict 的 side 与比对 side 不一致仍接受 | `side` 不匹配 → `comparison_invalid` |
+| P2 | `work/` 缺失时整个类被 skip | skip 只作用于真正读 CLI 文件的用例，护栏自身的非空洞性检测在任何环境都跑 |
+
+变异矩阵随之扩到 **44** 条（新增 M-R5/R6、M-SH9/10/11）。其中两条**修正而非保留**：
+M-R6 原本 `IMPORT-FAILED`（无法 import 的注入不算 kill），M-SH9 原本是 inert 变异
+（注入后行为不变）；改成真正注入缺陷后 44/44 CAUGHT、0 survived。
+
+---
+
 ## Known evidence gaps
 
 归档当前仍**不能**证明（Shadow 把它们如实归入 not_comparable，而不是分歧）：
@@ -375,8 +394,8 @@ CLI 运行前后数据库文件字节完全一致（只读证明）。
 ### Focused suites
 
 ```
-backend/test_tradability_shadow.py                        46 tests
-backend/test_tradability_shadow_architecture_guard.py      18 tests
+backend/test_tradability_shadow.py                        51 tests
+backend/test_tradability_shadow_architecture_guard.py      22 tests
 backend/test_tradability_backfill.py      （+36：R1–R7 / CODE1–6 / SESSION1–6 等）
 ```
 
@@ -384,7 +403,7 @@ backend/test_tradability_backfill.py      （+36：R1–R7 / CODE1–6 / SESSION
 $ python -m unittest test_tradability_backfill test_tradability_ingestion \
       test_tradability_archive test_tradability_shadow \
       test_tradability_shadow_architecture_guard
-Ran 218 tests in 1.811s
+Ran 399 tests in 1.951s
 
 OK
 ```
@@ -417,13 +436,13 @@ OK: 12 reverts all caught; all files restored byte-for-byte
 
 ```
 $ python -m unittest discover -s backend -p "test_*.py"
-Ran 2944 tests in 207.831s
+Ran 2958 tests in 185.453s
 
 OK (skipped=5)
 ```
 
 - base（master @ 1dc4b05）计数：**2847**
-- 本 PR head 计数：**2944**（+97）
+- 本 PR head 计数：**2958**（+111）
 - 数字来自与 CI 相同的 runner（`unittest discover`），不是 pytest。
 
 ```
