@@ -277,6 +277,24 @@ class ExecutionAndLearningDoNotConsumeShadow(unittest.TestCase):
 
 
 class OperatorCliExposesNoAuthority(unittest.TestCase):
+    """操作员 CLI 的 flag / 只读契约。
+
+    ``work/`` **不在运行时镜像里**（Dockerfile 只 ``COPY backend/frontend/deploy``），
+    而 ``docker-smoke`` 会在镜像内跑整套 backend suite。因此这几条断言在镜像内必须
+    **显式跳过并说明原因**，而不是让整个测试文件 ImportError/FileNotFoundError——
+    那会把同文件里不依赖 ``work/`` 的护栏（公开 API 面等值断言、import 边界）一起带走。
+
+    跳过的代价是可控的：CI 的 ``tests (3.11)`` / ``tests (3.12)`` job 用的是**完整
+    仓库 checkout**，这几条在那里一定会真的跑（本 PR 的 head 上它们通过了）。
+    """
+
+    def setUp(self):
+        if not SHADOW_CLI.exists():
+            self.skipTest(
+                "work/ 不在运行时镜像内（docker-smoke 只挂载 backend/frontend/deploy）；"
+                "CLI 的 flag 契约由完整 checkout 的 tests job 覆盖"
+            )
+
     def test_no_forbidden_flag_is_accepted(self):
         source = SHADOW_CLI.read_text(encoding="utf-8")
         accepted = {value for value in _string_constants(ast.parse(source))}
@@ -289,10 +307,23 @@ class OperatorCliExposesNoAuthority(unittest.TestCase):
         for statement in ("INSERT INTO", "UPDATE ", "DELETE FROM", "DROP TABLE"):
             self.assertNotIn(statement, source, f"shadow CLI 不得包含 {statement}")
 
+    def test_cli_reuses_the_shared_operator_scope_contract(self):
+        """CLI 必须复用 backend 的 scope 解析，不得自带第二套。"""
+        source = SHADOW_CLI.read_text(encoding="utf-8")
+        self.assertIn("TB.resolve_codes", source)
+        self.assertIn("TB.resolve_sessions", source)
+        self.assertIn("TB.ScopeError", source)
+
     def test_detector_fires_on_a_forbidden_flag(self):
+        """非空洞性：检测器本身必须能抓到禁用的 flag（镜像内也跑）。"""
         tree = ast.parse("parser.add_argument('--apply', action='store_true')\n")
         accepted = _string_constants(tree)
         self.assertIn("--apply", accepted)
+        self.assertIn("--apply", FORBIDDEN_CLI_FLAGS)
+
+    def test_detector_fires_on_a_write_statement(self):
+        source = "conn.execute('INSERT INTO paper_orders VALUES (1)')\n"
+        self.assertIn("INSERT INTO", source)
 
 
 class ShadowModuleIsNotEmbeddedInHotModules(unittest.TestCase):
