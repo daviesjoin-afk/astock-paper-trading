@@ -36,6 +36,11 @@ cycle_row = conn.execute(
     "ORDER BY id DESC LIMIT 1"
 ).fetchone()
 cycle_id = int(cycle_row[0])
+# ``started_at`` 是历史周期归属起点的**唯一权威**（``created_at`` 只证明行已存在）。
+# 生产里 running 周期会写它；夹具必须照做，否则归属正确地 fail closed。
+conn.execute(
+    "UPDATE paper_cycles SET started_at='2026-09-01 00:00:00', ended_at=NULL WHERE id=?",
+    (cycle_id,))
 conn.execute(
     "INSERT OR REPLACE INTO historical_tradability_archive(code,session_date,"
     "effective_at,observed_at,is_listed,is_st,is_suspended,is_price_limit_locked,"
@@ -189,6 +194,82 @@ if not failures:
             if item.get("cycle_id") != cycle_id:
                 failures.append(
                     f"观察未绑定目标 cycle: {item.get('cycle_id')} != {cycle_id}")
+
+# ── round-4：加入一个边界不可证明的竞争周期，归属必须 fail closed ──
+# 这是本 PR 的核心：``paused`` + 起点/结束全缺（生产 cycle 4 的形状）时，
+# "没有其它可证明窗口" **不等于** "可以证明没有其它周期拥有它"。
+tight_path = os.path.join(SCRATCH, "tight.json")
+conn = sqlite3.connect(DB, timeout=30)
+# 竞争周期必须**低于**目标 id：CLI 取"活跃周期"用的是
+# ``status IN ('draft','running','paused') ORDER BY id DESC LIMIT 1``，
+# 更高的 id 会把目标周期挤掉（那样观察的是竞争周期本身，测不到归属判定）。
+# 生产真实形状也正是如此：paused cycle 4 的 id 低于 running cycle 8。
+competitor_id = conn.execute(
+    "SELECT COALESCE(MIN(id), 1) - 1 FROM paper_cycles").fetchone()[0]
+conn.execute(
+    "INSERT OR REPLACE INTO paper_cycles(id,cycle_key,status,capital,"
+    "risk_profile,started_at,ended_at,created_at,updated_at)"
+    " VALUES(?,?,?,?,?,?,?,?,?)",
+    (competitor_id, "c-cli-unknown", "paused", 100000.0, "shared_pool",
+     None, None, "2026-09-01 00:00:00", "2026-09-01 00:00:00"))
+# 没有卖出成交，归属闸门根本不会被走到（基线观察只是"T+1 锁住"）。因此这里补一笔
+# **已验证**的窗内卖出，并把 lot 的余额改成生产 FIFO 扣减后的值 —— 这样重放会真的
+# 去判定"这笔成交属于哪个周期"。
+conn.execute(
+    "INSERT OR REPLACE INTO paper_orders(id,account_id,side,code,name,qty,"
+    "planned_price,filled_price,amount,fees,status,risk_payload,created_at,"
+    "executed_at,order_type,origin,strategy_id,strategy_version,strategy_checksum,"
+    "execution_status,execution_verified,execution_evidence_source) "
+    "VALUES(99002,?,'sell','600903','逐日新材',600,10.0,10.0,6000.0,0.0,'filled','',"
+    "'2026-09-17 09:30:00','2026-09-17 10:30:00','market','strategy',?,?,?,"
+    "'verified',1,'paper_orders+paper_fills')",
+    (strategy_id, strategy_id, version, checksum))
+conn.execute(
+    "INSERT OR REPLACE INTO paper_fills(order_id,account_id,side,code,qty,price,"
+    "amount,fees,fill_date,quote_at,assumption) "
+    "VALUES(99002,?,'sell','600903',600,10.0,6000.0,0.0,'2026-09-17',NULL,'close')",
+    (strategy_id,))
+conn.execute("UPDATE paper_position_lots SET remaining_qty=600 WHERE source_order_id=99001")
+conn.commit()
+conn.close()
+print("tight exit:", run(["--position-aware", "--account-id", strategy_id,
+                          "--sell-quantity", "600", "--json"], tight_path))
+with open(tight_path, encoding="utf-8") as fh:
+    tight = json.loads(fh.read())
+tight_pa = tight.get("position_aware") or {}
+tight_summary = tight_pa.get("summary") or {}
+print("tight position_evidence_status:",
+      [item["position_evidence_status"] for item in tight_pa.get("comparisons", [])])
+print("tight position_comparable:", tight_summary.get("position_comparable"))
+print("tight t1_locked_quantity:", tight_summary.get("t1_locked_quantity"))
+if tight_summary.get("position_comparable") != 0:
+    failures.append(
+        "竞争周期边界不可证明时 position_comparable 必须为 0，实际="
+        f"{tight_summary.get('position_comparable')}")
+if tight_summary.get("t1_locked_quantity") != 0:
+    failures.append(
+        "不可比样本不得贡献 T+1 份额，实际 t1_locked_quantity="
+        f"{tight_summary.get('t1_locked_quantity')}")
+for item in tight_pa.get("comparisons", []):
+    if item["side"] != "sell":
+        continue
+    if item["position_evidence_status"] != "position_unprovable":
+        failures.append(
+            "竞争周期边界不可证明时必须 position_unprovable，实际="
+            f"{item['position_evidence_status']}")
+    diags = set(item.get("lot_diagnostics") or [])
+    # 该副本里真实存在其它周期，因此具体原因可能是"竞争周期无法证明"
+    # （competing_cycle_unprovable）或"多个窗口都能覆盖"（ambiguous）——
+    # 两者都是 fail-closed 的归属结论，必须点名其中至少一个。
+    fail_closed_reasons = {
+        "competing_cycle_unprovable",
+        "sell_fill_cycle_ambiguous",
+        "sell_fill_cycle_unprovable",
+        "sell_fill_cycle_identity_conflict",
+    }
+    if not (diags & fail_closed_reasons):
+        failures.append(
+            f"必须点名 fail-closed 归属根因，实际诊断={sorted(diags)}")
 
 print("\n%s" % ("PASS" if not failures else "FAIL: %s" % failures))
 raise SystemExit(1 if failures else 0)

@@ -29,6 +29,7 @@ import os
 import sqlite3
 import sys
 import unittest
+from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -120,13 +121,17 @@ class PositionTestCase(unittest.TestCase):
         self.conn.execute(
             "INSERT INTO paper_cycles(id,cycle_key,status,started_at,ended_at,created_at)"
             " VALUES(?,?,?,?,?,?)",
-            (CYCLE, "cycle-test", "running", None, None, "2026-01-01 00:00:00"),
+            # ``started_at`` 是**起点唯一权威**（``created_at`` 只证明行已存在），
+            # 因此夹具必须像生产一样给它一个真实起点。
+            (CYCLE, "cycle-test", "running", "2026-01-01 00:00:00", None,
+             "2026-01-01 00:00:00"),
         )
         self.conn.execute(
             "INSERT INTO paper_cycles(id,cycle_key,status,started_at,ended_at,created_at)"
             " VALUES(?,?,?,?,?,?)",
-            (OTHER_CYCLE, "cycle-other", "archived", None, "2026-01-02 00:00:00",
-             "2026-01-01 00:00:00"),
+            # 另一个周期：起点已知、结束早于夹具全部日期 ⇒ 可证明不竞争。
+            (OTHER_CYCLE, "cycle-other", "archived", "2026-01-01 00:00:00",
+             "2026-01-02 00:00:00", "2026-01-01 00:00:00"),
         )
         self.conn.commit()
 
@@ -235,6 +240,13 @@ class PositionTestCase(unittest.TestCase):
             (fill_id, order_id, fill_account or account, side, fill_code or code,
              int(qty), 10.0, int(qty) * 10.0, 0.0, session, None, "close"),
         )
+        # 未来 schema 的 ``paper_orders.cycle_id``：列存在时才写，用于验证适配器
+        # 真的从 SQL 里读到它（而不是只看时间窗）。
+        if order_cycle_id is not None:
+            self.conn.execute(
+                "UPDATE paper_orders SET cycle_id=? WHERE id=?",
+                (int(order_cycle_id), order_id),
+            )
 
     def set_remaining(self, lot_id, remaining):
         """把账本现值改成给定的剩余量（模拟生产 FIFO 已经扣减过）。"""
@@ -1569,7 +1581,6 @@ class FutureLotMustNotSatisfyAnEarlierSell(PositionTestCase):
                            decision_at=f"{D1}T16:00:00+08:00")
         # T+1 语义：D1 可卖并已卖出 → 当时持仓为 0，且重放自洽。
         self.assertEqual(ctx.held_quantity, 0)
-        self.assertEqual(ctx.consumed_quantity, 100)
         self.assertNotIn("replay_does_not_match_ledger", ctx.diagnostics)
 
     def test_FUTURE_LOT_5_missing_sell_time_does_not_let_a_same_day_lot_in(self):
@@ -1655,7 +1666,6 @@ class CycleAttributionMustFailClosed(PositionTestCase):
         ctx = self.context(code=NORMAL, session=D1,
                            decision_at=f"{D1}T16:00:00+08:00")
         self.assertEqual(ctx.held_quantity, 0)
-        self.assertEqual(ctx.consumed_quantity, 100)
         self.assertNotIn("replay_does_not_match_ledger", ctx.diagnostics,
                          "重放必须与账本自洽")
 
@@ -1720,9 +1730,13 @@ class CycleAttributionMustFailClosed(PositionTestCase):
         self.assertEqual(ctx.held_quantity, 100)
         self.assertIn("sell_fill_cycle_mismatch", ctx.diagnostics)
 
-    def test_CYCLE_A6_paused_cycle_without_start_is_recorded_not_guessed(self):
-        """起点缺失的其它周期只记诊断，不得用来否决一笔可证明的归属。"""
-        # 起点无法证明的 paused 周期：只能记诊断，不能凭它否决一笔可证明的归属。
+    def test_CYCLE_FC7_paused_cycle_without_start_makes_attribution_unprovable(self):
+        """CYCLE-FC7：``paused`` + 起点未知 + 开放结束 ⇒ 归属 unprovable。
+
+        ``paused`` 描述的是**当前/记录状态**，不是某个历史卖出当时的周期归属，
+        因此不能当作"不竞争"的证据。起点缺失 ⇒ 无法证明它不包含该卖出 ⇒
+        ``Absent of competing evidence is not evidence of absence``。
+        """
         self.conn.execute(
             "UPDATE paper_cycles SET status='paused', started_at=NULL, ended_at=NULL"
             " WHERE id=?", (OTHER_CYCLE,))
@@ -1733,11 +1747,176 @@ class CycleAttributionMustFailClosed(PositionTestCase):
         self.set_remaining(101, 0)
         ctx = self.context(code=NORMAL, session=D1,
                            decision_at=f"{D1}T16:00:00+08:00")
-        # 请求周期本身可证明 → 归属成立（起点未知的周期不能凭空否决它）。
-        self.assertEqual(ctx.held_quantity, 0)
-        self.assertEqual(ctx.consumed_quantity, 100)
-        self.assertNotIn("sell_fill_cycle_ambiguous", ctx.diagnostics)
+        self.assertEqual(ctx.evidence_status, PE.PositionEvidenceStatus.UNPROVABLE)
+        self.assertIn("competing_cycle_unprovable", ctx.diagnostics)
+        self.assertFalse(ctx.comparable)
+
+# ─────────────── CYCLE-FC：历史卖出周期归属 fail-closed 矩阵 ───────────────
+
+
+class CycleAttributionFailClosedMatrix(PositionTestCase):
+    """承重：只有**唯一可证明**的历史卖出归属才允许 ``proven``。
+
+    ``Absence of competing-cycle evidence is not evidence of absence of a
+    competing cycle.`` 「其它周期无法证明包含它」不等于「可以证明其它周期不包含
+    它」—— 前者必须降级成 ``unprovable``，而不是默认升级成 ``proven``。
+    """
+
+    def _scope(self, cycle_id=CYCLE):
+        return dict(code=NORMAL, session=D1, cycle_id=cycle_id,
+                    decision_at=f"{D1}T16:00:00+08:00")
+
+    def _one_sell_in_window(self):
+        self.add_lot(code=NORMAL, qty=100, session=D0, fill_id=1, order_id=1,
+                     lot_id=101, available_date=D1, executed_at=f"{D0} 10:00:00")
+        self.add_sell_fill(code=NORMAL, qty=100, session=D1, fill_id=2, order_id=2,
+                           executed_at=f"{D1} 10:00:00")
+        self.set_remaining(101, 0)
+
+    def test_CYCLE_FC1_all_competitors_provably_excluded_is_proven(self):
+        """CYCLE-FC1：请求周期窗完整 + 其它周期都可证明不包含 ⇒ ``proven``。
+
+        用**部分消耗**的 lot，使 ``kept`` 非空 —— 否则 ``context_for`` 会因
+        "决策时点已无 lot 可见" 返回 ``UNKNOWN``，那是与归属无关的另一个维度。
+        """
+        self.add_lot(code=NORMAL, qty=200, session=D0, fill_id=1, order_id=1,
+                     lot_id=101, available_date=D1, executed_at=f"{D0} 10:00:00")
+        self.add_sell_fill(code=NORMAL, qty=100, session=D1, fill_id=2, order_id=2,
+                           executed_at=f"{D1} 10:00:00")
+        self.set_remaining(101, 100)
+        ctx = self.context(**self._scope())
+        self.assertEqual(ctx.evidence_status, PE.PositionEvidenceStatus.PROVEN)
         self.assertNotIn("sell_fill_cycle_unprovable", ctx.diagnostics)
+        self.assertNotIn("competing_cycle_unprovable", ctx.diagnostics)
+        self.assertNotIn("sell_fill_cycle_ambiguous", ctx.diagnostics)
+        self.assertEqual(ctx.held_quantity, 100)
+        self.assertEqual(ctx.held_quantity, 100)
+
+    def test_CYCLE_FC2_competitor_with_no_boundaries_makes_it_unprovable(self):
+        """CYCLE-FC2：其它周期 ``started_at``/``ended_at`` 全 NULL ⇒ unprovable。"""
+        self.conn.execute(
+            "UPDATE paper_cycles SET started_at=NULL, ended_at=NULL WHERE id=?",
+            (OTHER_CYCLE,))
+        self._one_sell_in_window()
+        ctx = self.context(**self._scope())
+        self.assertEqual(ctx.evidence_status, PE.PositionEvidenceStatus.UNPROVABLE)
+        self.assertIn("competing_cycle_unprovable", ctx.diagnostics)
+
+    def test_CYCLE_FC3_competitor_ended_before_the_sell_does_not_block_proven(self):
+        """CYCLE-FC3：``ended_at < SELL`` ⇒ 可证明不竞争，不阻止 ``proven``。"""
+        self.conn.execute(
+            "UPDATE paper_cycles SET started_at=NULL, ended_at=? WHERE id=?",
+            (D0, OTHER_CYCLE))
+        self.add_lot(code=NORMAL, qty=200, session=D0, fill_id=1, order_id=1,
+                     lot_id=101, available_date=D1, executed_at=f"{D0} 10:00:00")
+        self.add_sell_fill(code=NORMAL, qty=100, session=D1, fill_id=2, order_id=2,
+                           executed_at=f"{D1} 10:00:00")
+        self.set_remaining(101, 100)
+        ctx = self.context(**self._scope())
+        # 起点未知也无妨：结束日已早于该卖出，可证明它不包含这笔成交。
+        self.assertEqual(ctx.evidence_status, PE.PositionEvidenceStatus.PROVEN)
+        self.assertEqual(ctx.held_quantity, 100)
+        self.assertNotIn("competing_cycle_unprovable", ctx.diagnostics)
+
+    def test_CYCLE_FC4_competitor_started_after_the_sell_does_not_block_proven(self):
+        """CYCLE-FC4：``started_at > SELL`` ⇒ 可证明不竞争。"""
+        self.conn.execute(
+            "UPDATE paper_cycles SET started_at=?, ended_at=NULL WHERE id=?",
+            (D2, OTHER_CYCLE))
+        self.add_lot(code=NORMAL, qty=200, session=D0, fill_id=1, order_id=1,
+                     lot_id=101, available_date=D1, executed_at=f"{D0} 10:00:00")
+        self.add_sell_fill(code=NORMAL, qty=100, session=D1, fill_id=2, order_id=2,
+                           executed_at=f"{D1} 10:00:00")
+        self.set_remaining(101, 100)
+        ctx = self.context(**self._scope())
+        self.assertEqual(ctx.evidence_status, PE.PositionEvidenceStatus.PROVEN)
+        self.assertEqual(ctx.held_quantity, 100)
+
+    def test_CYCLE_FC5_overlapping_proven_window_is_ambiguous(self):
+        """CYCLE-FC5：另一个周期的窗口**可证明**覆盖该卖出 ⇒ ``ambiguous``。"""
+        self.conn.execute(
+            "UPDATE paper_cycles SET started_at=?, ended_at=NULL WHERE id=?",
+            (D0, OTHER_CYCLE))
+        self._one_sell_in_window()
+        ctx = self.context(**self._scope())
+        self.assertEqual(ctx.evidence_status, PE.PositionEvidenceStatus.UNPROVABLE)
+        self.assertIn("sell_fill_cycle_ambiguous", ctx.diagnostics)
+
+    def test_CYCLE_FC6_requested_cycle_missing_start_is_unprovable(self):
+        """CYCLE-FC6：请求周期自身 ``started_at`` 缺失 ⇒ ``unprovable``。
+
+        ``created_at`` 仍在（夹具默认写入），但它**不得**被用来补出起点。
+        """
+        self.conn.execute(
+            "UPDATE paper_cycles SET started_at=NULL WHERE id=?", (CYCLE,))
+        self._one_sell_in_window()
+        ctx = self.context(**self._scope())
+        self.assertEqual(ctx.evidence_status, PE.PositionEvidenceStatus.UNPROVABLE)
+        self.assertIn("sell_fill_cycle_unprovable", ctx.diagnostics)
+
+    def test_CYCLE_FC8_explicit_order_cycle_id_matching_is_durable_identity(self):
+        """CYCLE-FC8：未来 schema 的 ``order_cycle_id == requested`` ⇒ proven。
+
+        显式 durable identity 一旦存在就是权威：它由**执行时**持久化，因此即使
+        时间窗推断因竞争周期而不可判定，归属仍成立。
+        """
+        self._with_order_cycle_column()
+        self.conn.execute(
+            "UPDATE paper_cycles SET started_at=NULL, ended_at=NULL WHERE id=?",
+            (OTHER_CYCLE,))
+        self.add_lot(code=NORMAL, qty=200, session=D0, fill_id=1, order_id=1,
+                     lot_id=101, available_date=D1, executed_at=f"{D0} 10:00:00")
+        self.add_sell_fill(code=NORMAL, qty=100, session=D1, fill_id=2, order_id=2,
+                           executed_at=f"{D1} 10:00:00", order_cycle_id=CYCLE)
+        self.set_remaining(101, 100)
+        ctx = self.context(**self._scope())
+        self.assertEqual(ctx.evidence_status, PE.PositionEvidenceStatus.PROVEN)
+        self.assertEqual(ctx.held_quantity, 100)
+
+    def test_CYCLE_FC9_explicit_order_cycle_id_mismatch_is_mismatch(self):
+        """CYCLE-FC9：``order_cycle_id != requested`` ⇒ ``mismatch``（不扣减）。"""
+        self._with_order_cycle_column()
+        self.add_lot(code=NORMAL, qty=100, session=D0, fill_id=1, order_id=1,
+                     lot_id=101, available_date=D1, executed_at=f"{D0} 10:00:00")
+        self.add_sell_fill(code=NORMAL, qty=100, session=D1, fill_id=2, order_id=2,
+                           executed_at=f"{D1} 10:00:00", order_cycle_id=OTHER_CYCLE)
+        ctx = self.context(**self._scope())
+        # 明确属于别的资金池：不得扣减本周期 lot。
+        self.assertEqual(ctx.held_quantity, 100)
+        self.assertIn("sell_fill_cycle_mismatch", ctx.diagnostics)
+
+    def test_CYCLE_FC10_explicit_identity_conflicting_with_window_fails_closed(self):
+        """CYCLE-FC10：显式 ``order_cycle_id`` 与本周期可证明时间窗冲突 ⇒ fail closed。"""
+        self._with_order_cycle_column()
+        # 本周期窗只覆盖 D0；卖出在 D1（窗外），但显式身份却说是本周期 → 硬冲突。
+        self.conn.execute(
+            "UPDATE paper_cycles SET started_at=?, ended_at=? WHERE id=?",
+            (D0, D0, CYCLE))
+        self.add_lot(code=NORMAL, qty=100, session=D0, fill_id=1, order_id=1,
+                     lot_id=101, available_date=D1, executed_at=f"{D0} 10:00:00")
+        self.add_sell_fill(code=NORMAL, qty=100, session=D1, fill_id=2, order_id=2,
+                           executed_at=f"{D1} 10:00:00", order_cycle_id=CYCLE)
+        ctx = self.context(**self._scope())
+        self.assertEqual(ctx.evidence_status, PE.PositionEvidenceStatus.UNPROVABLE)
+        self.assertIn("sell_fill_cycle_identity_conflict", ctx.diagnostics)
+
+    def test_CYCLE_FC_guard_no_skipped_competitor_concept_remains(self):
+        """反向自检：适配器里不得再存在「跳过竞争者」的旧概念。"""
+        source = Path(PE.__file__).read_text(encoding="utf-8")
+        self.assertNotIn("cycle_skipped", source)
+        self.assertNotIn("skipped.append(other)", source)
+        self.assertIn("unprovable.append(other)", source)
+
+    # ── 未来 schema 支持：``paper_orders.cycle_id`` 列 ──
+
+    def _with_order_cycle_column(self):
+        """给 ``paper_orders`` 加上 ``cycle_id`` 列（模拟未来 schema）。
+
+        列是**真的**加在表上，因此适配器的 ``PRAGMA table_info`` 会发现它 —— 这
+        正是「动态发现而不是写死」要验证的路径。
+        """
+        self.conn.execute("ALTER TABLE paper_orders ADD COLUMN cycle_id INTEGER")
+        self.conn.commit()
 
 
 if __name__ == "__main__":

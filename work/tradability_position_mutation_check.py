@@ -322,10 +322,90 @@ MUTATIONS = (
     (
         "M-T1-19",
         ADAPTER,
-        "                        ambiguous, skipped = self._competing_cycles(cycle_id, session)\n",
+        "                        ambiguous, unprovable = self._competing_cycles(cycle_id, session)\n",
         "                        # MUTANT M-T1-19: overlapping cycle ambiguity ignored\n"
-        "                        ambiguous, skipped = False, []\n",
+        "                        ambiguous, unprovable = False, ()\n",
         "重叠周期歧义被静默接受（直接采信请求周期）",
+    ),
+    (
+        "M-CYCLE-FC1",
+        ADAPTER,
+        "            if start is None:\n"
+        "                # 边界证据不足：既不能断言包含，也不能断言排除 → 归属不可证明。\n"
+        "                unprovable.append(other)\n"
+        "                continue\n",
+        "            # MUTANT M-CYCLE-FC1: unknown competitor silently skipped\n"
+        "            if start is None:\n"
+        "                continue\n",
+        "未知竞争周期被忽略（缺失边界证据 ⇒ 仍报 proven）",
+    ),
+    (
+        "M-CYCLE-FC2",
+        ADAPTER,
+        "            if start is None:\n"
+        "                # 边界证据不足：既不能断言包含，也不能断言排除 → 归属不可证明。\n"
+        "                unprovable.append(other)\n"
+        "                continue\n",
+        "            # MUTANT M-CYCLE-FC2: paused competitor treated as non-competing\n"
+        "            if start is None and str(_row_field(row, \"status\") or \"\") == \"paused\":\n"
+        "                continue\n"
+        "            if start is None:\n"
+        "                unprovable.append(other)\n"
+        "                continue\n",
+        "paused 被当作「不竞争」的证据（status 冒充时间证据）",
+    ),
+    (
+        "M-CYCLE-FC3",
+        ADAPTER,
+        "            start = _session_of(_row_field(row, \"started_at\"))\n"
+        "            end = _session_of(_row_field(row, \"ended_at\"))\n"
+        "            # 已结束且结束日早于该卖出 → 可证明不包含它。\n",
+        "            # MUTANT M-CYCLE-FC3: created_at silently promoted to economic start\n"
+        "            start = _session_of(_row_field(row, \"started_at\")) or _session_of(\n"
+        "                _row_field(row, \"created_at\"))\n"
+        "            end = _session_of(_row_field(row, \"ended_at\"))\n"
+        "            # 已结束且结束日早于该卖出 → 可证明不包含它。\n",
+        "created_at 被偷偷升级成 economic started_at（起点未知被补成 proven）",
+    ),
+    (
+        "M-CYCLE-FC4",
+        ADAPTER,
+        "                        elif unprovable:\n"
+        "                            # 有周期无法证明不竞争 → 归属不可证明（不是 proven）。\n"
+        "                            attribution = CYCLE_ATTRIBUTION_UNPROVABLE\n"
+        "                            cycle_diagnostics.append(\"competing_cycle_unprovable\")\n",
+        "                        # MUTANT M-CYCLE-FC4: unprovable competitor only logged\n"
+        "                        elif False:\n"
+        "                            attribution = CYCLE_ATTRIBUTION_UNPROVABLE\n"
+        "                            cycle_diagnostics.append(\"competing_cycle_unprovable\")\n",
+        "unprovable 竞争者只记录不影响结论（仍报 proven）",
+    ),
+    (
+        "M-CYCLE-FC5",
+        ADAPTER,
+        "        if self._orders_have_cycle_column():\n"
+        "            columns.append(\"o.cycle_id AS order_cycle_id\")\n",
+        "        # MUTANT M-CYCLE-FC5: existing cycle column never read from SQL\n"
+        "        if False:\n"
+        "            columns.append(\"o.cycle_id AS order_cycle_id\")\n",
+        "未来 schema 有 order_cycle_id 却不从 SQL 读取（durable identity 失效）",
+    ),
+    (
+        "M-CYCLE-FC6",
+        ADAPTER,
+        "                    elif (window is not None and window[0] is not None\n"
+        "                          and session is not None\n"
+        "                          and (session < window[0]\n"
+        "                               or (window[1] is not None and session > window[1]))):\n"
+        "                        # 显式身份说属于本周期，本周期可证明的时间窗却把它排除 →\n"
+        "                        # 硬冲突：两边证据都在，不能静默相信任意一方。\n"
+        "                        attribution = CYCLE_ATTRIBUTION_UNPROVABLE\n"
+        "                        cycle_diagnostics.append(\"sell_fill_cycle_identity_conflict\")\n",
+        "                    # MUTANT M-CYCLE-FC6: identity/time-window conflict silently accepted\n"
+        "                    elif False:\n"
+        "                        attribution = CYCLE_ATTRIBUTION_UNPROVABLE\n"
+        "                        cycle_diagnostics.append(\"sell_fill_cycle_identity_conflict\")\n",
+        "显式 order_cycle_id 与时间窗冲突仍被接受（不 fail closed）",
     ),
     (
         "M-T1-20",
@@ -808,8 +888,46 @@ DESIGNATED_NON_VACUITY = {
     ),
     "M-T1-19": (
         "test_tradability_position_shadow"
+        ".CycleAttributionFailClosedMatrix"
+        ".test_CYCLE_FC5_overlapping_proven_window_is_ambiguous",
+    ),
+    "M-CYCLE-FC1": (
+        "test_tradability_position_shadow"
+        ".CycleAttributionFailClosedMatrix"
+        ".test_CYCLE_FC2_competitor_with_no_boundaries_makes_it_unprovable",
+        "test_tradability_position_shadow"
         ".CycleAttributionMustFailClosed"
-        ".test_CYCLE_A4_overlapping_open_cycles_are_ambiguous",
+        ".test_CYCLE_FC7_paused_cycle_without_start_makes_attribution_unprovable",
+    ),
+    "M-CYCLE-FC2": (
+        "test_tradability_position_shadow"
+        ".CycleAttributionMustFailClosed"
+        ".test_CYCLE_FC7_paused_cycle_without_start_makes_attribution_unprovable",
+    ),
+    "M-CYCLE-FC3": (
+        # created_at 被升级成**竞争周期**的起点 ⇒ 归属退化成 ambiguous，
+        # 因此真正抓住它的是 FC2（而不是只覆盖请求周期起点的 FC6）。
+        "test_tradability_position_shadow"
+        ".CycleAttributionFailClosedMatrix"
+        ".test_CYCLE_FC2_competitor_with_no_boundaries_makes_it_unprovable",
+        "test_tradability_position_shadow"
+        ".CycleAttributionMustFailClosed"
+        ".test_CYCLE_FC7_paused_cycle_without_start_makes_attribution_unprovable",
+    ),
+    "M-CYCLE-FC4": (
+        "test_tradability_position_shadow"
+        ".CycleAttributionFailClosedMatrix"
+        ".test_CYCLE_FC2_competitor_with_no_boundaries_makes_it_unprovable",
+    ),
+    "M-CYCLE-FC5": (
+        "test_tradability_position_shadow"
+        ".CycleAttributionFailClosedMatrix"
+        ".test_CYCLE_FC8_explicit_order_cycle_id_matching_is_durable_identity",
+    ),
+    "M-CYCLE-FC6": (
+        "test_tradability_position_shadow"
+        ".CycleAttributionFailClosedMatrix"
+        ".test_CYCLE_FC10_explicit_identity_conflicting_with_window_fails_closed",
     ),
     "M-T1-20": (
         "test_tradability_position_shadow"
