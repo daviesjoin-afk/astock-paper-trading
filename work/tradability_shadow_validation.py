@@ -45,6 +45,8 @@ import selection_tradability as ST  # noqa: E402
 import tradability_archive as TA  # noqa: E402
 import tradability_backfill as TB  # noqa: E402
 import tradability_observation_ledger as OL  # noqa: E402
+import tradability_position_evidence as PE  # noqa: E402
+import tradability_position_shadow as PS  # noqa: E402
 import tradability_shadow as TS  # noqa: E402
 
 
@@ -130,6 +132,101 @@ def _pair_has_archive_row(conn, code, session):
     return row is not None
 
 
+def _position_aware_rows(comparisons, items, adapter, args):
+    """把仓位层观察叠加到**已经算好**的市场层面比对结果上（只读）。
+
+    关键约束：**既有的市场层面结果一个字段都不重算**。本函数把 ``compare_many``
+    的产物按身份索引进字典复用，仓位层只在卖出方向附加字段。
+
+    返回值是 ``(position_comparisons, position_summary)``。
+    """
+    account_id = args.account_id or None
+    requested = args.sell_quantity
+    market_by_key = {}
+    for comparison in comparisons:
+        # 身份必须与 ``ShadowComparison.identity`` 对齐（含 ``decision_at`` 与
+        # ``validation_as_of``）—— 只按 ``(code, session, side)`` 索引会在同一对
+        # 代码/日期出现两条比对时把结果配错。
+        market_by_key[
+            (str(comparison.code), str(comparison.session)[:10],
+             str(comparison.decision_at), str(comparison.side),
+             comparison.validation_as_of)
+        ] = comparison
+    # ``comparator=None`` + 每条都传 ``market_comparison``：本层绝不重算市场层面。
+    observer = PS.PositionShadowObserver(None, adapter, account_id=account_id)
+    out = []
+    for item, market in zip(items, comparisons):
+        key = (
+            str(item.get("code")), str(item.get("session"))[:10],
+            str(market.decision_at), str(item.get("side")),
+            market.validation_as_of,
+        )
+        out.append(
+            observer.observe(
+                code=item.get("code"),
+                session=item.get("session"),
+                side=item.get("side"),
+                production_verdict=item.get("production_verdict"),
+                decision_at=item.get("decision_at"),
+                validation_as_of=item.get("validation_as_of"),
+                requested_sell_quantity=(
+                    requested if str(item.get("side")) == ST.SIDE_SELL else None
+                ),
+                market_comparison=market_by_key.get(key, market),
+            )
+        )
+    return out, observer.summarize(out)
+
+
+def _print_position_aware(comparisons, summary, args):
+    """仓位层报告。**每条都带自己的分母**，绝不只报一个百分比。"""
+    data = summary.to_dict()
+    print("--- position-aware T+1 shadow (READ-ONLY / observation only) ---")
+    print(f"account_id: {args.account_id or '(all accounts)'}")
+    print(f"requested_sell_quantity(per comparison): {args.sell_quantity or '(not specified)'}")
+    for key in (
+        "requested", "sell_comparisons", "buy_comparisons",
+        "position_comparable", "position_not_comparable",
+        "t1_pass", "t1_blocked",
+        "position_evidence_proven", "position_evidence_partial",
+        "position_evidence_unknown", "position_evidence_unprovable",
+        "position_evidence_invalid",
+        "requested_sell_quantity", "proven_sellable_quantity",
+        "t1_locked_quantity", "unknown_quantity",
+    ):
+        print(f"{key}: {data[key]}")
+    rate = data["position_comparison_rate"]
+    print(
+        "position_comparison_rate: "
+        f"{'not_available' if rate is None else rate}"
+        f" (numerator={data['position_comparable']}"
+        f", denominator={data['sell_comparisons']})"
+    )
+    print("by_position_status:", json.dumps(data["by_position_status"], ensure_ascii=False))
+    print("by_evidence_status:", json.dumps(data["by_evidence_status"], ensure_ascii=False))
+    print("by_market_status:", json.dumps(data["by_market_status"], ensure_ascii=False))
+    print("仓位证据不可比的观察**不进**任何 agreement / disagreement 分母。")
+    for item in comparisons:
+        if item.side != ST.SIDE_SELL:
+            continue
+        acquisitions = ",".join(item.acquisition_sessions) or "(none)"
+        print(
+            "  sample: "
+            f"{item.code} {item.session} {item.side} "
+            f"market={item.market_status} position={item.position_status} "
+            f"evidence={item.position_evidence_status} "
+            f"held={item.held_quantity} sellable={item.sellable_quantity} "
+            f"t1_locked={item.t1_locked_quantity} unknown={item.unknown_quantity} "
+            f"requested={item.requested_sell_quantity} "
+            f"acquisition_session(s)={acquisitions} "
+            f"fill_fingerprint={(item.evidence_fingerprint or '')[:12]} "
+            f"production_reason={item.production_reason}"
+        )
+        if item.lot_diagnostics:
+            print(f"    position_diagnostic: {','.join(item.lot_diagnostics)}")
+    print("Position-aware Shadow 只是观察，零 execution authority。")
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(
         description="Shadow Tradability Validation（只读；不改变任何交易行为）"
@@ -147,6 +244,31 @@ def main(argv=None) -> int:
         help="知识时点（YYYY-MM-DD 或完整时间戳）；缺省=当前知识时点",
     )
     parser.add_argument("--json", action="store_true", help="以 JSON 输出")
+    parser.add_argument(
+        "--position-aware",
+        dest="position_aware",
+        action="store_true",
+        help=(
+            "附加**只读**的仓位层 T+1 观察（真实持仓 lot 证据 + selection_tradability "
+            "T+1 authority）。缺省关闭；它不改变市场层面结果，也不改变任何交易行为。"
+        ),
+    )
+    parser.add_argument(
+        "--account-id",
+        dest="account_id",
+        default=None,
+        help="仓位层观察的账户 id（缺省 = 不带账户过滤，看全部 lot）",
+    )
+    parser.add_argument(
+        "--sell-quantity",
+        dest="sell_quantity",
+        type=int,
+        default=None,
+        help=(
+            "仓位层的请求卖出股数（用于可卖份额对比）。缺省时只报份额分解，"
+            "不给出'该笔卖出能否成交'的判断。"
+        ),
+    )
     args = parser.parse_args(argv)
 
     start, end = args.from_date, args.to_date
@@ -209,20 +331,40 @@ def main(argv=None) -> int:
                     )
         comparisons = comparator.compare_many(items)
         summary = comparator.summarize(comparisons)
+        # 仓位层是**附加观察维度**：它上面这段市场层面的结果一个字段都不动。
+        position_comparisons = position_summary = None
+        position_error = None
+        if args.position_aware:
+            try:
+                adapter = PE.PositionEvidenceAdapter(
+                    conn,
+                    evidence_provider=lambda c, s: _production_evidence(
+                        c, s, kline_cache.get(c) or {}, state_fn
+                    ),
+                )
+                position_comparisons, position_summary = _position_aware_rows(
+                    comparisons, items, adapter, args
+                )
+            except Exception as exc:  # 仓位层故障绝不影响市场层面结论
+                position_error = f"{type(exc).__name__}: {exc}"
     finally:
         conn.close()
 
     if args.json:
-        print(
-            json.dumps(
-                {
-                    "summary": summary.to_dict(),
-                    "comparisons": [c.to_dict() for c in comparisons],
-                },
-                ensure_ascii=False,
-                indent=2,
-            )
-        )
+        payload = {
+            "summary": summary.to_dict(),
+            "comparisons": [c.to_dict() for c in comparisons],
+        }
+        if args.position_aware:
+            payload["position_aware"] = {
+                "summary": position_summary.to_dict() if position_summary else None,
+                "comparisons": (
+                    [c.to_dict() for c in position_comparisons]
+                    if position_comparisons else []
+                ),
+                "error": position_error,
+            }
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
         return 0
 
     print("=== shadow tradability validation (READ-ONLY / observation only) ===")
@@ -268,6 +410,11 @@ def main(argv=None) -> int:
     print("by_archive_reason:", json.dumps(data["by_archive_reason"], ensure_ascii=False))
     print("archive 缺口不计入 disagreement：见 archive_unknown / archive_unprovable / archive_missing。")
     print("Shadow 只是观察，零 execution authority。")
+    if args.position_aware:
+        if position_error:
+            print(f"position-aware 观察失败（不影响上面的市场层面结果）: {position_error}")
+        elif position_comparisons is not None:
+            _print_position_aware(position_comparisons, position_summary, args)
     return 0
 
 
