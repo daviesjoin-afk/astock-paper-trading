@@ -18,10 +18,12 @@
 
 from __future__ import annotations
 
+import datetime as _dt
 import os
 import sqlite3
 import sys
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -55,6 +57,38 @@ def _index_names(conn):
         "SELECT name FROM sqlite_master WHERE type='index' ORDER BY name"
     ).fetchall()
     return [row[0] for row in rows]
+
+
+def _db_snapshot(conn):
+    """逻辑快照：表 / 索引 / user_version / 事实行 / 审计行 / 事实内容指纹。
+
+    "失败的 run 不改变数据库"必须逐项验证，而不是只看行数——行数相同但内容被
+    改写同样是副作用。
+    """
+
+    def _count(table):
+        try:
+            return conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+        except sqlite3.OperationalError:
+            return None
+
+    def _rows(table):
+        try:
+            cursor = conn.execute(f"SELECT * FROM {table} ORDER BY rowid")
+        except sqlite3.OperationalError:
+            return None
+        names = [column[0] for column in cursor.description]
+        return [tuple(zip(names, row, strict=False)) for row in cursor.fetchall()]
+
+    return {
+        "tables": _table_names(conn),
+        "indexes": _index_names(conn),
+        "user_version": conn.execute("PRAGMA user_version").fetchone()[0],
+        "archive_rows": _count(TA.ARCHIVE_TABLE),
+        "audit_rows": _count(TI.INGESTION_RUNS_TABLE),
+        "archive_content": _rows(TA.ARCHIVE_TABLE),
+        "audit_content": _rows(TI.INGESTION_RUNS_TABLE),
+    }
 
 
 class FingerprintDryRunEqualsWrite(unittest.TestCase):
@@ -348,6 +382,829 @@ class DryRunHasNoDatabaseSideEffect(unittest.TestCase):
             self.assertIsNotNone(result.run_fingerprint)
         finally:
             conn.close()
+
+
+class ExplicitCodeScopeIsHonored(unittest.TestCase):
+    """P2-2（deferred）：``codes is None`` 与"显式给出但解析为空"必须严格区分。
+
+    绝不允许"显式 targeted input 解析失败 → 自动 fallback 全市场"：在 ``--write``
+    下，一次 ``--codes ,`` 会从小范围命令放大成全市场写入。
+    """
+
+    UNIVERSE = {"000001": {}, "000002": {}, "600000": {}}
+
+    def setUp(self):
+        patcher = mock.patch.object(TB, "load_listing_records", lambda: dict(self.UNIVERSE))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_code1_missing_codes_uses_default_universe(self):
+        self.assertEqual(["000001", "000002", "600000"], TB.resolve_codes(None))
+
+    def test_code1b_limit_applies_to_default_universe(self):
+        self.assertEqual(["000001"], TB.resolve_codes(None, limit=1))
+
+    def test_code2_comma_only_is_rejected(self):
+        with self.assertRaises(TB.CodeScopeError):
+            TB.resolve_codes(",")
+
+    def test_code3_whitespace_only_is_rejected(self):
+        with self.assertRaises(TB.CodeScopeError):
+            TB.resolve_codes("   ")
+
+    def test_code3b_separators_only_is_rejected(self):
+        with self.assertRaises(TB.CodeScopeError):
+            TB.resolve_codes(", , ,")
+
+    def test_code4_all_invalid_is_rejected(self):
+        for value in ("abc", "12345", "1234567", "600000abc", "00000X"):
+            with self.subTest(value=value):
+                with self.assertRaises(TB.CodeScopeError):
+                    TB.resolve_codes(value)
+
+    def test_code4b_one_invalid_among_valid_is_rejected(self):
+        # 静默丢弃非法 token 会让操作员以为"这批全处理了"。
+        with self.assertRaises(TB.CodeScopeError):
+            TB.resolve_codes("000001,abc")
+
+    def test_code5_explicit_subset_returns_exactly_that_subset(self):
+        self.assertEqual(["000001", "600000"], TB.resolve_codes("000001,600000"))
+        self.assertEqual(["600000"], TB.resolve_codes("600000"))
+
+    def test_code5b_exchange_prefixes_are_normalized(self):
+        self.assertEqual(["000001", "600000"], TB.resolve_codes("SZ000001,SH600000"))
+
+    def test_code5c_duplicates_are_collapsed_in_order(self):
+        self.assertEqual(["000001", "600000"], TB.resolve_codes("000001,600000,000001"))
+
+    def test_code6_invalid_explicit_codes_plus_write_leaves_db_untouched(self):
+        conn = sqlite3.connect(":memory:")
+        try:
+            TA.ensure_schema(conn)
+            TI.ensure_ingestion_schema(conn)
+            before = _db_snapshot(conn)
+            with self.assertRaises(TB.CodeScopeError):
+                codes = TB.resolve_codes("000001,abc")
+                TB.run_backfill(
+                    conn, [_listing_provider()], codes, ["2024-01-10"],
+                    write=True, run_id="code6",
+                )
+            self.assertEqual(before, _db_snapshot(conn))
+        finally:
+            conn.close()
+
+    def test_code6b_empty_explicit_codes_plus_write_leaves_db_untouched(self):
+        conn = sqlite3.connect(":memory:")
+        try:
+            TA.ensure_schema(conn)
+            TI.ensure_ingestion_schema(conn)
+            before = _db_snapshot(conn)
+            with self.assertRaises(TB.CodeScopeError):
+                codes = TB.resolve_codes("  ")
+                TB.run_backfill(
+                    conn, [_listing_provider()], codes, ["2024-01-10"],
+                    write=True, run_id="code6b",
+                )
+            self.assertEqual(before, _db_snapshot(conn))
+        finally:
+            conn.close()
+
+
+class SessionScopeMustResolveToTradingSessions(unittest.TestCase):
+    """P2-3（deferred）：零交易日范围必须失败，不得报告 completed。"""
+
+    def test_session1_reversed_range_is_rejected(self):
+        with self.assertRaises(TB.SessionScopeError):
+            TB.resolve_sessions("2026-09-18", "2026-09-14")
+
+    def test_session2_weekend_only_is_rejected(self):
+        # 2026-09-12/13 是周六 / 周日。
+        with self.assertRaises(TB.SessionScopeError):
+            TB.resolve_sessions("2026-09-12", "2026-09-13")
+
+    def test_session3_holiday_only_is_rejected(self):
+        # 注入一个把整段都判为休市的日历（模拟全部落在法定休市日）。
+        with self.assertRaises(TB.SessionScopeError):
+            TB.resolve_sessions("2026-09-14", "2026-09-16", calendar=lambda day: False)
+
+    def test_session4_malformed_date_is_rejected(self):
+        for value in ("2026-13-99", "not-a-date", "20260914", "", "2026-09"):
+            with self.subTest(value=value):
+                with self.assertRaises(TB.SessionScopeError):
+                    TB.resolve_sessions(value, "2026-09-18")
+
+    def test_session4b_malformed_explicit_session_is_rejected(self):
+        with self.assertRaises(TB.SessionScopeError):
+            TB.resolve_sessions(session="2026-13-99")
+
+    def test_session4c_closed_explicit_session_is_rejected(self):
+        with self.assertRaises(TB.SessionScopeError):
+            TB.resolve_sessions(session="2026-09-13", calendar=lambda day: day.weekday() < 5)
+
+    def test_session5_normal_range_returns_only_trading_sessions(self):
+        sessions = TB.resolve_sessions(
+            "2026-09-11", "2026-09-15", calendar=lambda day: day.weekday() < 5
+        )
+        self.assertEqual(["2026-09-11", "2026-09-14", "2026-09-15"], sessions)
+        for session in sessions:
+            # 每个 session 都是 ``YYYY-MM-DD``（不是自然日枚举出来的别的东西）。
+            self.assertRegex(session, r"^\d{4}-\d{2}-\d{2}$")
+            self.assertEqual(session, _dt.date.fromisoformat(session).isoformat())
+
+    def test_session5b_explicit_session_is_returned_as_single(self):
+        self.assertEqual(
+            ["2026-09-14"],
+            TB.resolve_sessions(session="2026-09-14", calendar=lambda day: day.weekday() < 5),
+        )
+
+    def test_session6_zero_session_write_leaves_db_untouched(self):
+        conn = sqlite3.connect(":memory:")
+        try:
+            TA.ensure_schema(conn)
+            TI.ensure_ingestion_schema(conn)
+            before = _db_snapshot(conn)
+            with self.assertRaises(TB.SessionScopeError):
+                sessions = TB.resolve_sessions("2026-09-12", "2026-09-13")
+                TB.run_backfill(
+                    conn, [_listing_provider()], ["000001"], sessions,
+                    write=True, run_id="session6",
+                )
+            self.assertEqual(before, _db_snapshot(conn))
+        finally:
+            conn.close()
+
+    def test_session6b_ingestion_rejects_an_empty_session_scope_directly(self):
+        # 即使绕过 scope 解析层直接调用编排层，零 session 也必须被拒绝。
+        conn = sqlite3.connect(":memory:")
+        try:
+            TA.ensure_schema(conn)
+            TI.ensure_ingestion_schema(conn)
+            before = _db_snapshot(conn)
+            with self.assertRaises(TI.IngestionError):
+                TB.run_backfill(
+                    conn, [_listing_provider()], ["000001"], [],
+                    write=True, run_id="session6b",
+                )
+            self.assertEqual(before, _db_snapshot(conn))
+        finally:
+            conn.close()
+
+    def test_session6c_ingestion_rejects_an_empty_code_scope_directly(self):
+        conn = sqlite3.connect(":memory:")
+        try:
+            TA.ensure_schema(conn)
+            TI.ensure_ingestion_schema(conn)
+            before = _db_snapshot(conn)
+            with self.assertRaises(TI.IngestionError):
+                TB.run_backfill(
+                    conn, [_listing_provider()], [], ["2024-01-10"],
+                    write=True, run_id="session6c",
+                )
+            self.assertEqual(before, _db_snapshot(conn))
+        finally:
+            conn.close()
+
+
+class _VersionedProvider(TI.TradabilityFactProvider):
+    """provider/provenance version 可注入，其余事实完全一致。"""
+
+    provider_id = "versioned"
+
+    def __init__(self, version):
+        self.provider_version = version
+
+    def fetch(self, code, session):
+        return TI.ProviderResult(
+            provider_id=self.provider_id,
+            provider_version=self.provider_version,
+            status=TI.OUTCOME_EVIDENCE,
+            evidence={"is_listed": True},
+            observed_kind=TI.OBSERVED_SNAPSHOT_TIMESTAMP,
+            observed_at="2025-01-01T09:00:00+08:00",
+        )
+
+
+class IngestionTestCase(unittest.TestCase):
+    """带 archive + audit schema 的内存库夹具。"""
+
+    def setUp(self):
+        self.conn = sqlite3.connect(":memory:")
+        self.conn.row_factory = sqlite3.Row
+        self.addCleanup(self.conn.close)
+        TA.ensure_schema(self.conn)
+        TI.ensure_ingestion_schema(self.conn)
+        self.repo = TA.TradabilityArchiveRepository(self.conn)
+
+    def make_service(self, providers, *, cutoff=None):
+        return TI.IngestionService(
+            providers, self.repo, cutoff=cutoff, audit_conn=self.conn
+        )
+
+
+class DivergentReplayIsRejected(IngestionTestCase):
+    """P2-1（deferred）：``run_id`` 是审计身份，``run_fingerprint`` 是内容身份。
+
+    contract::
+
+        same run_id + same run_fingerprint  => 幂等重放，允许
+        same run_id + different fingerprint => IngestionError，整个事务 rollback
+                                               archive 不变、audit 不变
+    """
+
+    def _service(self, observed_at):
+        provider = TI.ListingStatusProvider(
+            {"000001": {"listing_date": "2010-01-01"}},
+            observed_kind=TI.OBSERVED_SNAPSHOT_TIMESTAMP,
+            observed_at=observed_at,
+        )
+        return self.make_service([provider], cutoff="2025-06-01T09:00:00+08:00")
+
+    def _audit(self, run_id):
+        cursor = self.conn.execute(
+            "SELECT * FROM tradability_ingestion_runs WHERE run_id=?", (run_id,)
+        )
+        row = cursor.fetchone()
+        if row is None:
+            return None
+        names = [column[0] for column in cursor.description]
+        return dict(zip(names, row, strict=False))
+
+    # R1 —— 同 run_id + 同指纹：允许，且不产生重复事实。
+    def test_r1_same_run_id_same_fingerprint_is_idempotent(self):
+        service = self._service("2025-01-01T09:00:00+08:00")
+        first = service.ingest(["000001"], ["2024-01-10"], write=True, run_id="R1")
+        count_after_first = self.repo.count("000001")
+        audit_after_first = self._audit("R1")
+        replay = service.ingest(["000001"], ["2024-01-10"], write=True, run_id="R1")
+
+        self.assertEqual(first.run_fingerprint, replay.run_fingerprint)
+        self.assertEqual(1, count_after_first)
+        self.assertEqual(count_after_first, self.repo.count("000001"))
+        self.assertEqual(0, len(replay.persisted))
+        # audit 行也不得被重写。
+        self.assertEqual(audit_after_first, self._audit("R1"))
+
+    # R2 —— 同 run_id + 改变的 code scope：拒绝。
+    def test_r2_changed_code_scope_is_rejected(self):
+        service = self._service("2025-01-01T09:00:00+08:00")
+        service.ingest(["000001"], ["2024-01-10"], write=True, run_id="R2")
+        before = _db_snapshot(self.conn)
+        with self.assertRaises(TI.IngestionError):
+            service.ingest(["000002"], ["2024-01-10"], write=True, run_id="R2")
+        self.assertEqual(before, _db_snapshot(self.conn))
+
+    # R3 —— 同 run_id + 改变的 sessions：拒绝。
+    def test_r3_changed_sessions_is_rejected(self):
+        service = self._service("2025-01-01T09:00:00+08:00")
+        service.ingest(["000001"], ["2024-01-10"], write=True, run_id="R3")
+        before = _db_snapshot(self.conn)
+        with self.assertRaises(TI.IngestionError):
+            service.ingest(["000001"], ["2024-01-10", "2024-01-11"], write=True, run_id="R3")
+        self.assertEqual(before, _db_snapshot(self.conn))
+
+    # R4 —— 同 run_id + 改变的 evidence：拒绝。
+    def test_r4_changed_evidence_is_rejected(self):
+        service = self._service("2025-01-01T09:00:00+08:00")
+        service.ingest(["000001"], ["2024-01-10"], write=True, run_id="R4")
+        before = _db_snapshot(self.conn)
+        # 默认 provider 每次运行都会生成新的 retrieved_at —— 这正是"再跑一次不是重放"
+        # 的真实来源，必须被拒绝，而不是让 archive 保存新 revision。
+        changed = self._service("2025-02-02T09:00:00+08:00")
+        with self.assertRaises(TI.IngestionError):
+            changed.ingest(["000001"], ["2024-01-10"], write=True, run_id="R4")
+        self.assertEqual(before, _db_snapshot(self.conn))
+
+    # R5 —— 同 run_id + 改变的 provider_version：拒绝。
+    def test_r5_changed_provider_version_is_rejected(self):
+        service = self.make_service([_VersionedProvider("1")], cutoff="2025-06-01T09:00:00+08:00")
+        service.ingest(["000001"], ["2024-01-10"], write=True, run_id="R5")
+        before = _db_snapshot(self.conn)
+        bumped = self.make_service([_VersionedProvider("2")], cutoff="2025-06-01T09:00:00+08:00")
+        with self.assertRaises(TI.IngestionError):
+            bumped.ingest(["000001"], ["2024-01-10"], write=True, run_id="R5")
+        self.assertEqual(before, _db_snapshot(self.conn))
+
+    # R6 —— divergent replay 之后 archive 行数不变。
+    def test_r6_divergent_replay_leaves_archive_row_count_unchanged(self):
+        service = self._service("2025-01-01T09:00:00+08:00")
+        service.ingest(["000001"], ["2024-01-10"], write=True, run_id="R6")
+        rows_before = self.repo.count()
+        with self.assertRaises(TI.IngestionError):
+            self._service("2025-02-02T09:00:00+08:00").ingest(
+                ["000001"], ["2024-01-10"], write=True, run_id="R6"
+            )
+        self.assertEqual(rows_before, self.repo.count())
+
+    # R7 —— divergent replay 之后 audit 行不变。
+    def test_r7_divergent_replay_leaves_audit_row_unchanged(self):
+        service = self._service("2025-01-01T09:00:00+08:00")
+        first = service.ingest(["000001"], ["2024-01-10"], write=True, run_id="R7")
+        audit_before = self._audit("R7")
+        self.assertIsNotNone(audit_before)
+        self.assertEqual(first.run_fingerprint, audit_before["run_fingerprint"])
+        with self.assertRaises(TI.IngestionError):
+            self._service("2025-02-02T09:00:00+08:00").ingest(
+                ["000001"], ["2024-01-10"], write=True, run_id="R7"
+            )
+        self.assertEqual(audit_before, self._audit("R7"))
+        self.assertEqual(
+            1,
+            self.conn.execute(
+                "SELECT COUNT(*) FROM tradability_ingestion_runs WHERE run_id='R7'"
+            ).fetchone()[0],
+        )
+
+    # 特别审计：新的 retrieved_at 不得冒充旧 run_id 的 replay。
+    def test_new_retrieved_at_cannot_impersonate_an_old_run(self):
+        first = self._service("2025-01-01T09:00:00+08:00").ingest(
+            ["000001"], ["2024-01-10"], write=True, run_id="R-impersonate"
+        )
+        second = self._service("2025-03-03T09:00:00+08:00")
+        with self.assertRaises(TI.IngestionError):
+            second.ingest(["000001"], ["2024-01-10"], write=True, run_id="R-impersonate")
+        # 第一次的指纹仍然描述 audit 行里那一次运行。
+        self.assertEqual(first.run_fingerprint, self._audit("R-impersonate")["run_fingerprint"])
+
+    # 校验必须发生在持久化**之前**：连 dry-run 语义都不受影响。
+    def test_rejection_happens_before_any_persistence(self):
+        service = self._service("2025-01-01T09:00:00+08:00")
+        service.ingest(["000001"], ["2024-01-10"], write=True, run_id="R-order")
+        archive_before = _db_snapshot(self.conn)["archive_content"]
+        with self.assertRaises(TI.IngestionError):
+            self._service("2025-02-02T09:00:00+08:00").ingest(
+                ["000001"], ["2024-01-10"], write=True, run_id="R-order"
+            )
+        # 事实内容逐行相同（不是"行数相同但内容被改写"）。
+        self.assertEqual(archive_before, _db_snapshot(self.conn)["archive_content"])
+
+    # 不同 run_id + 相同内容：不是冲突，指纹相同。
+    def test_different_run_id_same_content_is_not_a_conflict(self):
+        first = self._service("2025-01-01T09:00:00+08:00").ingest(
+            ["000001"], ["2024-01-10"], write=True, run_id="R-a"
+        )
+        second = self._service("2025-01-01T09:00:00+08:00").ingest(
+            ["000001"], ["2024-01-10"], write=True, run_id="R-b"
+        )
+        self.assertEqual(first.run_fingerprint, second.run_fingerprint)
+        self.assertEqual(2, self.conn.execute(
+            "SELECT COUNT(*) FROM tradability_ingestion_runs"
+        ).fetchone()[0])
+
+
+class ReplayIdentityNeedsDurableAudit(IngestionTestCase):
+    """P1（review）：replay identity 的判据只存在于审计表里。
+
+    ``IngestionService`` 的默认构造是 ``audit_conn=None``。那种情况下 ``_persist_run``
+    不写任何东西，本次运行的指纹**不会**被记录，于是第二次同 run_id 的写入必然读到
+    "无既有行"而放行——正好是 P2-1 要挡的事故。因此没有持久审计时必须 fail closed。
+    """
+
+    def _service_without_audit(self, observed_at):
+        provider = TI.ListingStatusProvider(
+            {"000001": {"listing_date": "2010-01-01"}},
+            observed_kind=TI.OBSERVED_SNAPSHOT_TIMESTAMP,
+            observed_at=observed_at,
+        )
+        repo = TA.TradabilityArchiveRepository(self.conn)
+        return TI.IngestionService(
+            [provider], repo, cutoff="2025-06-01T09:00:00+08:00"
+        )
+
+    def test_write_without_audit_conn_is_rejected(self):
+        conn = sqlite3.connect(":memory:")
+        try:
+            TA.ensure_schema(conn)
+            TI.ensure_ingestion_schema(conn)
+            before = _db_snapshot(conn)
+            service = TI.IngestionService(
+                [TI.ListingStatusProvider({"000001": {}},
+                                          observed_kind=TI.OBSERVED_SNAPSHOT_TIMESTAMP,
+                                          observed_at="2025-01-01T09:00:00+08:00")],
+                TA.TradabilityArchiveRepository(conn),
+                cutoff="2025-06-01T09:00:00+08:00",
+            )
+            with self.assertRaises(TI.IngestionError):
+                service.ingest(["000001"], ["2024-01-10"], write=True, run_id="no-audit")
+            # 拒绝发生在持久化之前：DB 逻辑状态逐项不变。
+            self.assertEqual(before, _db_snapshot(conn))
+        finally:
+            conn.close()
+
+    def test_divergent_replay_is_impossible_without_durable_audit(self):
+        """没有审计表可读 → fail closed，而不是"读不到就当没冲突"。"""
+        conn = sqlite3.connect(":memory:")
+        try:
+            TA.ensure_schema(conn)  # 故意不建 ingestion_runs 表
+            provider = TI.ListingStatusProvider(
+                {"000001": {}},
+                observed_kind=TI.OBSERVED_SNAPSHOT_TIMESTAMP,
+                observed_at="2025-01-01T09:00:00+08:00",
+            )
+            service = TI.IngestionService(
+                [provider],
+                TA.TradabilityArchiveRepository(conn),
+                cutoff="2025-06-01T09:00:00+08:00",
+                audit_conn=conn,
+            )
+            with self.assertRaises(TI.IngestionError):
+                service.ingest(["000001"], ["2024-01-10"], write=True, run_id="no-table")
+        finally:
+            conn.close()
+
+    def test_dry_run_without_audit_conn_is_still_allowed(self):
+        """dry-run 不写任何东西，因此不需要审计存储。"""
+        conn = sqlite3.connect(":memory:")
+        try:
+            TA.ensure_schema(conn)
+            provider = TI.ListingStatusProvider(
+                {"000001": {}},
+                observed_kind=TI.OBSERVED_SNAPSHOT_TIMESTAMP,
+                observed_at="2025-01-01T09:00:00+08:00",
+            )
+            service = TI.IngestionService(
+                [provider],
+                TA.TradabilityArchiveRepository(conn),
+                cutoff="2025-06-01T09:00:00+08:00",
+            )
+            result = service.ingest(["000001"], ["2024-01-10"], write=False, run_id="dry")
+            self.assertIsNotNone(result.run_fingerprint)
+            self.assertEqual(0, len(result.persisted))
+        finally:
+            conn.close()
+
+
+class _OutcomeFlippingProvider(TI.TradabilityFactProvider):
+    """先返回 error、后返回 unknown —— 两次运行都不产生任何 normalized evidence。"""
+
+    provider_id = "flaky"
+
+    def __init__(self):
+        self.provider_version = "1"
+        self.mode = "error"
+
+    def fetch(self, code, session):
+        if self.mode == "error":
+            return TI.ProviderResult(
+                provider_id=self.provider_id,
+                provider_version=self.provider_version,
+                status=TI.OUTCOME_ERROR,
+                error="boom",
+                observed_kind=TI.OBSERVED_SNAPSHOT_TIMESTAMP,
+                observed_at="2025-01-01T09:00:00+08:00",
+            )
+        return TI.ProviderResult(
+            provider_id=self.provider_id,
+            provider_version=self.provider_version,
+            status=TI.OUTCOME_UNKNOWN,
+            observed_kind=TI.OBSERVED_SNAPSHOT_TIMESTAMP,
+            observed_at="2025-01-01T09:00:00+08:00",
+        )
+
+
+class ReplayIdentityCoversProviderOutcomes(IngestionTestCase):
+    """P1（review）：error→unknown 的翻转必须改变 replay 身份。
+
+    两种结果都**不产生 normalized evidence**，若指纹只看 evidence，两次运行指纹相同
+    会被判成幂等重放，``INSERT OR IGNORE`` 保留第一行 audit —— 本次报告 ``completed``
+    而审计仍是 ``completed_with_gaps``。凡是会写进审计的状态/计数差异都属于内容身份。
+    """
+
+    def test_error_then_unknown_is_not_an_idempotent_replay(self):
+        provider = _OutcomeFlippingProvider()
+        service = self.make_service([provider], cutoff="2025-06-01T09:00:00+08:00")
+        first = service.ingest(["000001"], ["2024-01-10"], write=True, run_id="flip")
+        self.assertEqual(TI.STATUS_COMPLETED_WITH_GAPS, first.status)
+        audit_before = self.conn.execute(
+            "SELECT status, run_fingerprint, error_records, unknown_records "
+            "FROM tradability_ingestion_runs WHERE run_id='flip'"
+        ).fetchone()
+        self.assertEqual(TI.STATUS_COMPLETED_WITH_GAPS, audit_before[0])
+
+        provider.mode = "unknown"
+        with self.assertRaises(TI.IngestionError):
+            service.ingest(["000001"], ["2024-01-10"], write=True, run_id="flip")
+
+        after = self.conn.execute(
+            "SELECT status, run_fingerprint, error_records, unknown_records "
+            "FROM tradability_ingestion_runs WHERE run_id='flip'"
+        ).fetchone()
+        self.assertEqual(tuple(audit_before), tuple(after))
+
+    def test_outcome_distribution_is_part_of_the_fingerprint(self):
+        provider = _OutcomeFlippingProvider()
+        service = self.make_service([provider], cutoff="2025-06-01T09:00:00+08:00")
+        error_run = service.ingest(["000001"], ["2024-01-10"], write=False, run_id="a")
+        provider.mode = "unknown"
+        unknown_run = service.ingest(["000001"], ["2024-01-10"], write=False, run_id="b")
+        self.assertNotEqual(error_run.run_fingerprint, unknown_run.run_fingerprint)
+
+
+class _KindFlippingProvider(TI.TradabilityFactProvider):
+    """事实与时间戳完全相同，只把 observed_kind 从可证明类型换成 unprovable。"""
+
+    provider_id = "kind_flip"
+
+    def __init__(self):
+        self.provider_version = "1"
+        self.kind = TI.OBSERVED_SNAPSHOT_TIMESTAMP
+
+    def fetch(self, code, session):
+        return TI.ProviderResult(
+            provider_id=self.provider_id,
+            provider_version=self.provider_version,
+            status=TI.OUTCOME_EVIDENCE,
+            evidence={"is_listed": True},
+            observed_kind=self.kind,
+            observed_at="2025-01-01T09:00:00+08:00",
+        )
+
+
+class ReplayIdentityCoversUnprovableOutcomes(IngestionTestCase):
+    """P1（第二轮 review）：unprovable / conflict 也必须进内容身份。
+
+    provider 给出的事实与时间戳完全不变、只把 ``observed_kind`` 从可证明类型换成
+    ``unprovable`` 时，normalized evidence 与 outcomes 计数都不变，但审计行的
+    ``unprovable_records`` 与 ``detail_json.unprovable`` 变了。若指纹不含它，同 run_id
+    的重试会被当成"完全相同"而放行，``INSERT OR IGNORE`` 保留那行过期的审计。
+    """
+
+    def test_unprovable_flip_is_not_an_idempotent_replay(self):
+        provider = _KindFlippingProvider()
+        service = self.make_service([provider], cutoff="2025-06-01T09:00:00+08:00")
+        service.ingest(["000001"], ["2024-01-10"], write=True, run_id="kind")
+        before = self.conn.execute(
+            "SELECT status, run_fingerprint, unprovable_records, detail_json "
+            "FROM tradability_ingestion_runs WHERE run_id='kind'"
+        ).fetchone()
+        self.assertEqual(0, before[2])
+
+        provider.kind = TI.OBSERVED_UNPROVABLE
+        with self.assertRaises(TI.IngestionError):
+            service.ingest(["000001"], ["2024-01-10"], write=True, run_id="kind")
+
+        after = self.conn.execute(
+            "SELECT status, run_fingerprint, unprovable_records, detail_json "
+            "FROM tradability_ingestion_runs WHERE run_id='kind'"
+        ).fetchone()
+        self.assertEqual(tuple(before), tuple(after))
+
+    def test_unprovable_flag_changes_the_fingerprint(self):
+        provider = _KindFlippingProvider()
+        service = self.make_service([provider], cutoff="2025-06-01T09:00:00+08:00")
+        provable = service.ingest(["000001"], ["2024-01-10"], write=False, run_id="a")
+        provider.kind = TI.OBSERVED_UNPROVABLE
+        unprovable = service.ingest(["000001"], ["2024-01-10"], write=False, run_id="b")
+        # normalized evidence 的指纹可能相同（事实一致），但内容身份必须不同。
+        self.assertNotEqual(provable.run_fingerprint, unprovable.run_fingerprint)
+
+
+class _ConflictingProvider(TI.TradabilityFactProvider):
+    """两个 provider 对同一字段给出不同值 → conflict。"""
+
+    def __init__(self, value):
+        self.provider_id = f"conflict_{value}"
+        self.provider_version = "1"
+        self._value = value
+
+    def fetch(self, code, session):
+        return TI.ProviderResult(
+            provider_id=self.provider_id,
+            provider_version=self.provider_version,
+            status=TI.OUTCOME_EVIDENCE,
+            evidence={"is_st": self._value},
+            observed_kind=TI.OBSERVED_SNAPSHOT_TIMESTAMP,
+            observed_at="2025-01-01T09:00:00+08:00",
+        )
+
+
+class ReplayIdentityCoversConflicts(IngestionTestCase):
+    def test_conflict_details_are_part_of_the_fingerprint(self):
+        first = self.make_service(
+            [_ConflictingProvider(True), _ConflictingProvider(False)],
+            cutoff="2025-06-01T09:00:00+08:00",
+        ).ingest(["000001"], ["2024-01-10"], write=False, run_id="a")
+        second = self.make_service(
+            [_ConflictingProvider(True)],
+            cutoff="2025-06-01T09:00:00+08:00",
+        ).ingest(["000001"], ["2024-01-10"], write=False, run_id="b")
+        self.assertNotEqual(first.run_fingerprint, second.run_fingerprint)
+
+
+class FingerprintCoversEveryAuditVisibleDifference(IngestionTestCase):
+    """直接验证内容身份本身：审计行里会出现的每一项差异都必须改变指纹。
+
+    间接经由 ``ingest`` 的用例有一个盲区：某些差异会**同时**改变 normalized evidence
+    的指纹（例如 provider 集合变化会改 ``source``），于是"去掉 conflicts 字段"的变异
+    仍然被抓住，看不出该字段是否真的被消费。这里直接调用 ``_run_fingerprint``，把每个
+    参数逐一改变，断言指纹随之改变——这是"凡进审计的差异都是内容身份"这条规则最精确
+    的验证方式。
+    """
+
+    def _service(self):
+        return self.make_service(
+            [_ConflictingProvider(True)], cutoff="2025-06-01T09:00:00+08:00"
+        )
+
+    def _fingerprint(self, service, **overrides):
+        base = {
+            "codes": ["000001"],
+            "sessions": ["2024-01-10"],
+            "cutoff": "2025-06-01T09:00:00+08:00",
+            "normalized": [],
+            "outcomes": {"evidence": 1, "unknown": 0, "error": 0, "skipped": 0,
+                         "status": TI.STATUS_COMPLETED},
+            "unprovable": [],
+            "conflicts": [],
+        }
+        base.update(overrides)
+        return service._run_fingerprint(
+            base["codes"], base["sessions"], base["cutoff"], base["normalized"],
+            base["outcomes"], base["unprovable"], base["conflicts"],
+        )
+
+    def test_baseline_is_stable(self):
+        service = self._service()
+        self.assertEqual(self._fingerprint(service), self._fingerprint(service))
+
+    def test_outcome_distribution_is_part_of_the_fingerprint(self):
+        service = self._service()
+        base = self._fingerprint(service)
+        changed = self._fingerprint(
+            service, outcomes={"evidence": 0, "unknown": 1, "error": 0, "skipped": 0,
+                               "status": TI.STATUS_COMPLETED}
+        )
+        self.assertNotEqual(base, changed)
+
+    def test_run_status_is_part_of_the_fingerprint(self):
+        service = self._service()
+        base = self._fingerprint(service)
+        changed = self._fingerprint(
+            service, outcomes={"evidence": 0, "unknown": 0, "error": 1, "skipped": 0,
+                               "status": TI.STATUS_COMPLETED_WITH_GAPS}
+        )
+        self.assertNotEqual(base, changed)
+
+    def test_unprovable_details_are_part_of_the_fingerprint(self):
+        service = self._service()
+        base = self._fingerprint(service)
+        changed = self._fingerprint(service, unprovable=["000001:2024-01-10"])
+        self.assertNotEqual(base, changed)
+
+    def test_conflict_details_are_part_of_the_fingerprint(self):
+        service = self._service()
+        base = self._fingerprint(service)
+        conflict = TI.Conflict(
+            field="is_st", providers=("a", "b"), values=(True, False),
+            session="2024-01-10", effective_at="2024-01-10T15:05:00",
+            observed_at="2024-01-10T15:05:00",
+        )
+        changed = self._fingerprint(service, conflicts=[conflict])
+        self.assertNotEqual(base, changed)
+        # 冲突**内容**（值集合）变化也必须改变指纹，不只是"有没有冲突"。
+        other = TI.Conflict(
+            field="is_st", providers=("a", "b"), values=(True, True),
+            session="2024-01-10", effective_at="2024-01-10T15:05:00",
+            observed_at="2024-01-10T15:05:00",
+        )
+        self.assertNotEqual(
+            self._fingerprint(service, conflicts=[conflict]),
+            self._fingerprint(service, conflicts=[other]),
+        )
+
+    def test_conflict_session_is_part_of_the_fingerprint(self):
+        """同一组冲突**换到另一个 session** 也是审计可见变化。
+
+        ``detail_json`` 会持久化冲突的 ``session`` / ``effective_at`` /
+        ``observed_at``；指纹只取 field/providers/values 时，"冲突从 01-10 挪到
+        01-11"会被判成幂等重放，而审计行仍在描述旧 session 的冲突。
+        """
+        service = self._service()
+        on_first = TI.Conflict(
+            field="is_st", providers=("a", "b"), values=(True, False),
+            session="2024-01-10", effective_at="2024-01-10T15:05:00",
+            observed_at="2024-01-10T15:05:00",
+        )
+        on_second = TI.Conflict(
+            field="is_st", providers=("a", "b"), values=(True, False),
+            session="2024-01-11", effective_at="2024-01-11T15:05:00",
+            observed_at="2024-01-11T15:05:00",
+        )
+        self.assertNotEqual(
+            self._fingerprint(service, conflicts=[on_first]),
+            self._fingerprint(service, conflicts=[on_second]),
+        )
+        # effective_at / observed_at 单独变化同样要改变指纹。
+        shifted = TI.Conflict(
+            field="is_st", providers=("a", "b"), values=(True, False),
+            session="2024-01-10", effective_at="2024-01-10T15:05:00",
+            observed_at="2024-01-10T15:06:00",
+        )
+        self.assertNotEqual(
+            self._fingerprint(service, conflicts=[on_first]),
+            self._fingerprint(service, conflicts=[shifted]),
+        )
+
+    def test_conflict_ordering_is_canonical(self):
+        """同一个冲突集合换个到达顺序必须得到**相同**指纹（幂等重放不能漂移）。"""
+        service = self._service()
+        first = TI.Conflict(
+            field="is_st", providers=("a", "b"), values=(True, False),
+            session="2024-01-10", effective_at="2024-01-10T15:05:00",
+            observed_at="2024-01-10T15:05:00",
+        )
+        second = TI.Conflict(
+            field="has_trade_volume", providers=("a", "b"), values=(True, False),
+            session="2024-01-10", effective_at="2024-01-10T15:05:00",
+            observed_at="2024-01-10T15:05:00",
+        )
+        self.assertEqual(
+            self._fingerprint(service, conflicts=[first, second]),
+            self._fingerprint(service, conflicts=[second, first]),
+        )
+
+    def test_provider_version_is_part_of_the_fingerprint(self):
+        first = self.make_service(
+            [_VersionedProvider("1")], cutoff="2025-06-01T09:00:00+08:00"
+        )
+        second = self.make_service(
+            [_VersionedProvider("2")], cutoff="2025-06-01T09:00:00+08:00"
+        )
+        self.assertNotEqual(self._fingerprint(first), self._fingerprint(second))
+
+
+class AutocommitConnectionIsRejected(IngestionTestCase):
+    """P2（第三轮 review）：同连接还不够，必须是**显式事务**连接。
+
+    ``isolation_level=None`` 是 SQLite 的 autocommit 模式：每次 ``repository.save()``
+    与审计插入都各自立即提交。若 ``_persist_run`` 随后失败（例如审计表上的 trigger
+    中止插入），事实已经 durable、``rollback()`` 无效、审计行也不存在。
+    """
+
+    def _autocommit_conn(self):
+        conn = sqlite3.connect(":memory:")
+        self.addCleanup(conn.close)
+        conn.isolation_level = None  # autocommit
+        conn.row_factory = sqlite3.Row
+        TA.ensure_schema(conn)
+        TI.ensure_ingestion_schema(conn)
+        return conn
+
+    def test_autocommit_write_is_rejected_with_no_side_effect(self):
+        conn = self._autocommit_conn()
+        repo = TA.TradabilityArchiveRepository(conn)
+        before = _db_snapshot(conn)
+        service = TI.IngestionService(
+            [_OutcomeFlippingProvider()], repo,
+            cutoff="2025-06-01T09:00:00+08:00", audit_conn=conn,
+        )
+        with self.assertRaises(TI.IngestionError):
+            service.ingest(["000001"], ["2024-01-10"], write=True, run_id="autocommit")
+        self.assertEqual(before, _db_snapshot(conn))
+
+    def test_autocommit_dry_run_is_still_allowed(self):
+        """dry-run 不写任何东西，因此不需要事务。"""
+        conn = self._autocommit_conn()
+        repo = TA.TradabilityArchiveRepository(conn)
+        service = TI.IngestionService(
+            [_OutcomeFlippingProvider()], repo,
+            cutoff="2025-06-01T09:00:00+08:00", audit_conn=conn,
+        )
+        result = service.ingest(["000001"], ["2024-01-10"], write=False, run_id="dry")
+        self.assertIsNotNone(result.run_fingerprint)
+
+    def test_explicit_transaction_connection_is_accepted(self):
+        """非空洞性：默认连接（isolation_level=''）必须照常工作。"""
+        service = TI.IngestionService(
+            [_OutcomeFlippingProvider()], self.repo,
+            cutoff="2025-06-01T09:00:00+08:00", audit_conn=self.conn,
+        )
+        result = service.ingest(["000001"], ["2024-01-10"], write=True, run_id="explicit")
+        self.assertEqual(TI.STATUS_COMPLETED_WITH_GAPS, result.status)
+
+
+class AuditConnectionMustMatchArchiveConnection(IngestionTestCase):
+    """P2（第二轮 review）：审计连接必须与归档同库同连接。"""
+
+    def test_audit_conn_on_a_different_connection_is_rejected(self):
+        other = sqlite3.connect(":memory:")
+        self.addCleanup(other.close)
+        TI.ensure_ingestion_schema(other)
+        with self.assertRaises(TI.IngestionError):
+            TI.IngestionService(
+                [_OutcomeFlippingProvider()],
+                self.repo,
+                cutoff="2025-06-01T09:00:00+08:00",
+                audit_conn=other,
+            )
+
+    def test_same_connection_is_accepted(self):
+        service = TI.IngestionService(
+            [_OutcomeFlippingProvider()],
+            self.repo,
+            cutoff="2025-06-01T09:00:00+08:00",
+            audit_conn=self.conn,
+        )
+        self.assertIsNotNone(service)
 
 
 if __name__ == "__main__":

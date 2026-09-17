@@ -573,6 +573,16 @@ class Conflict:
             "observed_at": self.observed_at,
         }
 
+    def identity_payload(self) -> dict:
+        """进入**内容身份**的冲突明细。
+
+        与 :meth:`to_dict` 同源——``detail_json`` 会持久化 ``session`` /
+        ``effective_at`` / ``observed_at``，因此这些字段也必须参与 replay identity。
+        只保留 field/providers/values 会让"同一组冲突从一个 session 挪到另一个
+        session"被当成幂等重放，而审计行里描述的仍是旧 session 的冲突。
+        """
+        return self.to_dict()
+
 
 def _compose_fields(results: Sequence[ProviderResult]) -> tuple[dict, list, list]:
     """把多个 Provider 的 partial evidence 确定性合并。
@@ -815,7 +825,28 @@ class IngestionService:
         self._cutoff = _canonical_instant(cutoff) or _now_utc()
         # 可选：写 ``tradability_ingestion_runs`` 审计表的连接。不传则只做
         # archive 写入与 coverage，不落 run 记录（纯内存测试可省略）。
+        #
+        # **审计连接必须就是归档连接**。replay identity 是"归档里这条 run 记了什么
+        # 指纹"，它必须与事实写入在同一个库、同一个事务里：分属两条连接时，既可能读到
+        # 一个空的 runs 表（而归档库里其实已经有该 run_id），也可能让事实与审计跨库提交
+        # ——"整个事务 rollback"就无从谈起。与其在写入时才发现，不如在构造时就拒绝。
+        if audit_conn is not None and audit_conn is not repository.connection:
+            raise IngestionError(
+                "audit_conn 必须与 repository 使用同一个连接：replay identity 的查询与"
+                "事实写入必须在同一个库、同一个事务内，否则事实与审计无法原子提交"
+            )
         self._audit_conn = audit_conn
+        # 同一个连接**还不够**：``isolation_level=None`` 是 SQLite 的 autocommit 模式，
+        # 那里每次 ``repository.save()`` 与审计插入都各自立即提交。若 ``_persist_run``
+        # 随后失败（审计表上的 trigger / 约束中止插入），事实已经durable、``rollback()``
+        # 无效、审计行也不存在——"整个事务 rollback"就成了空话。
+        #
+        # 判据：构造时探测连接是否处于显式事务模式。``in_transaction`` 只反映"此刻有没有
+        # 打开事务"，因此不能只看它；这里直接读 ``isolation_level``（``None`` = autocommit）。
+        self._enforce_explicit_transactions = (
+            audit_conn is not None
+            and getattr(audit_conn, "isolation_level", "") is None
+        )
 
     @property
     def provider_versions(self) -> Mapping[str, str]:
@@ -851,6 +882,13 @@ class IngestionService:
         """
         codes = [str(c) for c in codes if _text(c)]
         sessions = [str(s) for s in sessions if _text(s)]
+        # 零 scope 的 run 不得存在：它没有覆盖任何 (code, session) 对，也不该落一行
+        # 审计把自己记成一次完成的摄取。这是**操作员错误**，不是"数据 unknown"。
+        # 必须在任何持久化之前拒绝（调用方据此 rollback / 非零退出）。
+        if not codes:
+            raise IngestionError("ingestion 拒绝空 code scope（0 个代码）")
+        if not sessions:
+            raise IngestionError("ingestion 拒绝空 session scope（0 个交易日）")
         run_id = run_id or uuid.uuid4().hex
         started_at = _now_utc()
 
@@ -935,12 +973,6 @@ class IngestionService:
                     continue
                 normalized_records += 1
                 normalized_evidence.append(evidence)
-                if write:
-                    inserted = self._repo.save(evidence)
-                    if inserted:
-                        persisted.append(evidence)
-                    else:
-                        skipped_records += 1  # 幂等重放：唯一键命中，逻辑状态不变。
 
                 self._record_session_stats(
                     session_stats, composed, field_conflicts, times["unprovable"]
@@ -951,8 +983,45 @@ class IngestionService:
         status = self._run_status(error_records, unknown_records, conflicts, unprovable)
         coverage = self._build_coverage(per_session, sessions, codes, source_counts)
         run_fingerprint = self._run_fingerprint(
-            codes, sessions, self._cutoff, normalized_evidence
+            codes,
+            sessions,
+            self._cutoff,
+            normalized_evidence,
+            # provider 结果分布进指纹：error→unknown 的翻转在 evidence 上不可见，
+            # 但会改变 status 与 audit 计数，因此属于内容身份（见 _run_fingerprint）。
+            {
+                "evidence": raw_records,
+                "unknown": unknown_records,
+                "error": error_records,
+                "skipped": skipped_records,
+                "status": status,
+            },
+            unprovable,
+            conflicts,
         )
+
+        # ── 两阶段：先算完所有结论与内容身份，再决定要不要落库 ──
+        #
+        # replay identity 必须在**任何不可逆持久化之前**校验。``run_id`` 是审计身份，
+        # ``run_fingerprint`` 是内容身份；同一个 run_id 配不同的内容指纹意味着
+        # "拿一个新 run 冒充旧 run 的重放"，必须 fail closed。绝不能先 save() 再发现
+        # 冲突——那时 archive 已经被写入，而 audit 行仍在描述旧 run。
+        #
+        # 因此**所有 archive 写入都在这一步之后**：校验不过就直接抛错，archive 行数
+        # 与 audit 行都不会变（不依赖调用方是否记得 rollback）。
+        if write:
+            self._assert_replay_identity(run_id, run_fingerprint)
+            # autocommit 连接上没有事务可回滚，事实与审计无法原子提交 → 显式拒绝。
+            if self._enforce_explicit_transactions:
+                raise IngestionError(
+                    "write=True 需要显式事务：该连接处于 autocommit（isolation_level=None），"
+                    "事实写入与审计插入会各自立即提交，任一后续失败都无法整体回滚"
+                )
+            for evidence in normalized_evidence:
+                if self._repo.save(evidence):
+                    persisted.append(evidence)
+                else:
+                    skipped_records += 1  # 幂等重放：唯一键命中，逻辑状态不变。
 
         # dry-run（write=False）不写任何东西：archive 与 run audit 都不落库。
         if write:
@@ -1176,11 +1245,14 @@ class IngestionService:
         self,
         codes: Sequence[str], sessions: Sequence[str], cutoff: str,
         normalized: Sequence[TA.TradabilityEvidence],
+        outcomes: Optional[Mapping[str, Any]] = None,
+        unprovable: Optional[Sequence[Any]] = None,
+        conflicts: Optional[Sequence[Any]] = None,
     ) -> str:
-        """内容身份指纹：只由 normalized facts + requested scope + cutoff +
-        provider/provenance identity 决定。run_id 是 audit identity，**绝不**参与
-        内容指纹；同一份事实用不同 run_id 重放必须得到同一 fingerprint。
-        数据变化时指纹必须变化。
+        """内容身份指纹：由 normalized facts + requested scope + cutoff +
+        provider/provenance identity + **provider 结果分布**决定。run_id 是 audit
+        identity，**绝不**参与内容指纹；同一份事实用不同 run_id 重放必须得到同一
+        fingerprint。数据变化时指纹必须变化。
 
         输入是**规范化后的证据**而非本次新插入的 persisted 行：幂等重放时第二次
         ``ingest`` 不会产生任何新插入（唯一键命中），若用 persisted 作输入，同一份
@@ -1188,6 +1260,19 @@ class IngestionService:
 
         同时把 **provider/provenance identity**（provider_id → provider_version）
         纳入指纹：version 属于 provenance 身份，改变它必须改变指纹。
+
+        ``outcomes`` 是本次运行的 provider 结果分布（evidence / unknown / error 计数）。
+        它必须进入指纹：一个 provider 返回 ``error`` 与后来返回 ``unknown``，在 scope /
+        cutoff / provider 版本完全相同的情况下**不产生任何 normalized evidence**，
+        若指纹只看 evidence，两次运行会得到同一个指纹而被判成"幂等重放"，于是
+        ``INSERT OR IGNORE`` 保留第一行 audit —— 本次运行报告 ``completed``，审计里
+        却仍是 ``completed_with_gaps``。
+
+        ``unprovable`` / ``conflicts`` 同理：provider 给出的**事实与时间戳完全相同**、
+        只把 ``observed_kind`` 从可证明类型换成 ``unprovable`` 时，normalized evidence
+        与 outcomes 计数都不变，但审计行的 ``unprovable_records`` 与
+        ``detail_json.unprovable`` 变了。规则是：**凡是会写进审计行的差异都属于内容
+        身份**，不能只覆盖其中一部分。
         """
         payload = {
             "version": FINGERPRINT_VERSION,
@@ -1196,8 +1281,73 @@ class IngestionService:
             "cutoff": cutoff,
             "provider_versions": dict(sorted(self.provider_versions.items())),
             "evidence_fingerprints": sorted(TA.evidence_fingerprint(e) for e in normalized),
+            "outcomes": dict(sorted((outcomes or {}).items())),
+            "unprovable": sorted(str(pair) for pair in (unprovable or ())),
+            # 完整冲突明细（含 session / effective_at / observed_at），并**规范化排序**：
+            # detail_json 持久化的是 to_dict() 的全字段，指纹只取一部分就会漏掉
+            # "冲突挪到另一个 session" 这类审计可见变化；不排序则依赖列表顺序，
+            # 同一个冲突集合换个到达顺序就会得到不同指纹，破坏幂等重放。
+            "conflicts": sorted(
+                (
+                    json.dumps(c.identity_payload(), sort_keys=True, ensure_ascii=False, default=str)
+                    for c in (conflicts or ())
+                )
+            ),
         }
         return _sha256(payload)
+
+    def _assert_replay_identity(self, run_id: str, run_fingerprint: str) -> None:
+        """同 run_id 的重放必须内容一致，否则 fail closed（在写 archive 之前）。
+
+        contract::
+
+            same run_id + same run_fingerprint  => 幂等重放，允许
+            same run_id + different fingerprint => IngestionError
+                                                   → 整个事务 rollback
+                                                   → archive 不变、audit 不变
+
+        这一步**必须**发生在任何 archive / audit 写入之前。默认 provider 每次运行都
+        生成新的 ``retrieved_at``，因此"同一个 run_id 再跑一次"往往**不是**重放而是
+        一次内容不同的新 run；那种情况必须被拒绝，而不是让 archive 保存新 revision
+        而 audit 行继续描述旧 run。
+
+        **没有持久审计存储就必须拒绝**：replay identity 的判据是"上次那个 run_id 记了
+        什么指纹"，而那个事实**只**存在于审计表里。没有审计连接时，这次调用既读不到
+        既有指纹、``_persist_run`` 也不会记下自己的指纹，于是第二次同 run_id 写入必然
+        读到"无既有行"而放行——正好是这条契约要挡的事故。因此这里把"无持久审计"直接
+        判为不可重放，而不是静默退化成一个永远通过的门。
+        """
+        if self._audit_conn is None:
+            raise IngestionError(
+                "write=True 需要持久审计存储（audit_conn）才能校验 run_id 的 replay "
+                "identity；缺少它时既读不到既有指纹也无法记录本次指纹，"
+                "同 run_id 的 divergent replay 将无法被拒绝"
+            )
+        try:
+            row = self._audit_conn.execute(
+                f"SELECT run_fingerprint FROM {INGESTION_RUNS_TABLE} WHERE run_id=?",
+                (run_id,),
+            ).fetchone()
+        except sqlite3.OperationalError as exc:
+            # 审计表不存在 = 无法证明"这是同一次重放" → fail closed，绝不当作"没有冲突"。
+            raise IngestionError(
+                f"审计表 {INGESTION_RUNS_TABLE} 不可读（{exc}），无法校验 run_id "
+                f"{run_id!r} 的 replay identity"
+            ) from exc
+        if row is None:
+            return
+        stored = row[0] if not isinstance(row, Mapping) else row.get("run_fingerprint")
+        if stored is None:
+            # 既有 run 没有记录内容指纹：无法证明它是同一次重放 → fail closed。
+            raise IngestionError(
+                f"run_id {run_id!r} 已存在但未记录 run_fingerprint，"
+                "无法证明是同一次重放"
+            )
+        if stored != run_fingerprint:
+            raise IngestionError(
+                f"run_id {run_id!r} 的 divergent replay 被拒绝："
+                f"stored={stored} incoming={run_fingerprint}"
+            )
 
     def _persist_run(
         self,
