@@ -3356,40 +3356,35 @@ def _bootstrap_risk_rejection_cooldown(conn, account_id, code, asof_day):
     }
 
 
-def _migrate_legacy_positions(conn):
-    """首次升级时把旧聚合持仓拆成一笔可结算 lot；之后只以 lots 为准。"""
-    cycle = _active_cycle(conn)
-    legacy = _rows(conn, "SELECT * FROM paper_positions")
-    for row in legacy:
-        exists = conn.execute(
-            "SELECT 1 FROM paper_position_lots WHERE cycle_id=? AND account_id=? AND code=? LIMIT 1",
-            (cycle["id"], row["account_id"], row["code"]),
-        ).fetchone()
-        if exists or _num(row.get("qty")) <= 0:
-            continue
-        conn.execute(
-            """INSERT INTO paper_position_lots(cycle_id,account_id,code,name,industry,qty,remaining_qty,cost,acquired_at,available_date,asset_type,is_t_base)
-               VALUES(?,?,?,?,?,?,?,?,?,?,?,1)""",
-            (cycle["id"], row["account_id"], row["code"], row.get("name"), row.get("industry"),
-             int(row["qty"]), int(row["qty"]), _num(row["cost"]), row.get("entry_date") or _date().isoformat(),
-             row.get("available_date") or _date().isoformat(), row.get("asset_type") or "stock_t1"),
-        )
-
-
 def _position_rows(conn, account_id=None, asof_day=None, readonly=False):
-    """从 lot 聚合持仓，并显式区分可卖底仓和当日锁定份额。"""
+    """从 lot 聚合持仓，并显式区分可卖底仓和当日锁定份额。
+
+    **读模型：绝不创建 executable position facts。**
+
+    ``readonly`` 只控制调用方是否已经持有写锁（读面板走只读快照），两条分支的
+    **语义完全一致**：都只读 ``paper_position_lots`` 与 ``paper_positions``，
+    不写任何表。
+
+    这里曾经无条件调用 ``_migrate_legacy_positions``，把 ``paper_positions``
+    里**没有 durable 归属证据**的历史镜像行重新展开成一条盖当前 active cycle
+    的 ``source_order_id IS NULL`` lot。那是一个**每次调用都会重跑**的"一次性
+    迁移"：任何一次普通持仓读取（含 ``_shared_account_exposure`` 这条风控/
+    资金链可达路径）都可能给新周期凭空造出一笔可成交底仓。
+
+    ``paper_positions`` 只是 ``paper_position_lots`` 的兼容投影，没有
+    ``cycle_id`` / ``source_order_id`` / 已验证取得证据，因此**无法证明**某行
+    属于哪个周期。"不知道"不能升级成"当前周期"——未知归属必须保持未知。
+    """
     if readonly:
-        # Read panels must not call _ensure_cycle/_migrate_legacy_positions:
-        # both may write while the 3-minute worker is settling orders.
-        cycle_row = conn.execute(
-            "SELECT * FROM paper_cycles WHERE status IN ('draft','running','paused') ORDER BY id DESC LIMIT 1"
-        ).fetchone()
-        if cycle_row is None:
-            return []
-        cycle = dict(cycle_row)
-    else:
-        _migrate_legacy_positions(conn)
-        cycle = _active_cycle(conn)
+        # Read panels must not call _ensure_cycle: it may INSERT a cycle while
+        # the 3-minute worker is settling orders.  The read itself is identical
+        # on both paths - `readonly` only documents that the caller holds a
+        # read-only snapshot.
+        pass
+    cycle_id = _active_cycle_id_readonly(conn)
+    if cycle_id is None:
+        return []
+    cycle = {"id": cycle_id}
     day = _date(asof_day).isoformat()
     sql = "SELECT * FROM paper_position_lots WHERE cycle_id=? AND remaining_qty>0"
     params = [cycle["id"]]
