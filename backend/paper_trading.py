@@ -2956,6 +2956,9 @@ def _reserve_shared_capital(conn, order_key, account_id, code, amount, fees=0.0,
     设为 keyword-only 而不是普通默认参数，是为了让既有的位置调用（``_reserve_
     shared_capital(conn, key, acct, code, amt, fees)``）语义完全不变 —— 新参数只能
     被显式指名传入，避免以后有人在位置上调错顺序时静默改变周期校验的对象。
+
+    归属冲突时 ``PCR.reserve_shared_capital`` 会抛 :class:`ReservationCycleMismatch`
+    （不吞、不转成 (False, reason)），调用方按类型捕获。
     """
     return PCR.reserve_shared_capital(
         conn, order_key, account_id, code, amount, fees,
@@ -2963,6 +2966,24 @@ def _reserve_shared_capital(conn, order_key, account_id, code, amount, fees=0.0,
         active_cycle_fn=_active_cycle,
         expected_cycle_id=expected_cycle_id,
     )
+
+
+#: 预占归属冲突的异常类型（由预占模块定义，这里转出，让上层不必依赖模块层次
+#: 即可按类型捕获）。
+ReservationCycleMismatch = PCR.ReservationCycleMismatch
+
+
+def _is_reservation_cycle_mismatch(exc):
+    """该异常是否为「预占周期与订单周期不一致」。
+
+    §4 备用的统一 helper：优先按**类型**判定（``isinstance`` 对真实的
+    :class:`ReservationCycleMismatch`）；仅当异常被跨进程/跨层包装过、类型信息
+    丢失时，才回退到 ``marker`` 字符串比对。刻意不做宽泛的文本 contains —— 那样
+    一旦改写文案就会静默失效。
+    """
+    if isinstance(exc, ReservationCycleMismatch):
+        return True
+    return getattr(exc, "marker", None) == ReservationCycleMismatch.marker
 
 
 def _finish_capital_reservation(conn, order_key, status):

@@ -660,6 +660,120 @@ MUTATIONS = (
         "                continue\n",
         "stale 订单不终态化（每轮 pending → 失败 → pending，永久污染扫描器）",
     ),
+    (
+        "M-CF16",
+        "backend/manual_orders.py",
+        "                    reserved, reserve_reason = _reserve_shared_capital(\n"
+        "                        conn, order[\"id\"], order[\"account_id\"], order[\"code\"],\n"
+        "                        reserve_amount, reserve_fees,\n"
+        "                        expected_cycle_id=guarded_cycle_id,\n"
+        "                    )\n"
+        "                except Exception as exc:\n"
+        "                    # §3：归属冲突是**永久性**冲突，不是临时资金不足 ⇒ 终态化，\n"
+        "                    # 不能打回 pending_limit 让下一轮再试（永远不会成功）。\n"
+        "                    if not _is_reservation_cycle_mismatch(exc, _ReservationCycleMismatch):\n"
+        "                        raise\n"
+        "                    output.append(_terminalize_cycle_stale_order(conn, order, exc))\n"
+        "                    continue\n",
+        "                reserved, reserve_reason = _reserve_shared_capital(\n"
+        "                    conn, order[\"id\"], order[\"account_id\"], order[\"code\"],\n"
+        "                    reserve_amount, reserve_fees,\n"
+        "                )\n",        "未触发分支漏传 expected_cycle_id（预占周期失去校验）",
+    ),
+    (
+        "M-CF17",
+        "backend/manual_orders.py",
+        "            try:\n"
+        "                reserved, reserve_reason = _reserve_shared_capital(\n"
+        "                    conn, order[\"id\"], order[\"account_id\"], order[\"code\"],\n"
+        "                    reserve_amount, reserve_fees, expected_cycle_id=guarded_cycle_id,\n"
+        "                )\n"
+        "            except Exception as exc:\n"
+        "                # §3：预占归属冲突是永久性事实冲突，**不是**临时资金不足。\n"
+        "                # 旧行为把它和 funding shortage 混在一起 ⇒ 打回 pending_limit\n"
+        "                # 让下一轮再试 —— 而 order.cycle_id 与 reservation.cycle_id 都\n"
+        "                # 不可变，所以这个重试永远不会成功，只会永久污染扫描器。\n"
+        "                if not _is_reservation_cycle_mismatch(exc, _ReservationCycleMismatch):\n"
+        "                    raise\n"
+        "                output.append(_terminalize_cycle_stale_order(conn, order, exc))\n"
+        "                continue\n",
+        "            reserved, reserve_reason = _reserve_shared_capital(\n"
+        "                conn, order[\"id\"], order[\"account_id\"], order[\"code\"],\n"
+        "                reserve_amount, reserve_fees, expected_cycle_id=guarded_cycle_id,\n"
+        "            )\n",        "归属冲突被当成普通资金不足（无终态化分支）",
+    ),
+    (
+        "M-CF18",
+        "backend/manual_orders.py",
+        "            try:\n"
+        "                reserved, reserve_reason = _reserve_shared_capital(\n"
+        "                    conn, order[\"id\"], order[\"account_id\"], order[\"code\"],\n"
+        "                    reserve_amount, reserve_fees, expected_cycle_id=guarded_cycle_id,\n"
+        "                )\n"
+        "            except Exception as exc:\n"
+        "                # §3：预占归属冲突是永久性事实冲突，**不是**临时资金不足。\n"
+        "                # 旧行为把它和 funding shortage 混在一起 ⇒ 打回 pending_limit\n"
+        "                # 让下一轮再试 —— 而 order.cycle_id 与 reservation.cycle_id 都\n"
+        "                # 不可变，所以这个重试永远不会成功，只会永久污染扫描器。\n"
+        "                if not _is_reservation_cycle_mismatch(exc, _ReservationCycleMismatch):\n"
+        "                    raise\n"
+        "                output.append(_terminalize_cycle_stale_order(conn, order, exc))\n"
+        "                continue\n",
+        "            try:\n"
+        "                reserved, reserve_reason = _reserve_shared_capital(\n"
+        "                    conn, order[\"id\"], order[\"account_id\"], order[\"code\"],\n"
+        "                    reserve_amount, reserve_fees, expected_cycle_id=guarded_cycle_id,\n"
+        "                )\n"
+        "            except Exception as exc:\n"
+        "                if not _is_reservation_cycle_mismatch(exc, _ReservationCycleMismatch):\n"
+        "                    raise\n"
+        "                conn.execute(\n"
+        "                    'UPDATE paper_orders SET status=\\'pending_limit\\',reason=? WHERE id=?',\n"
+        "                    (str(exc), order[\"id\"]),\n"
+        "                )\n"
+        "                continue\n",        "归属冲突后仍保持 pending_limit（永久重试）",
+    ),
+    (
+        "M-CF19",
+        "backend/manual_orders.py",
+        "    # §6/§7：释放既有预占（若无预占，UPDATE 命中 0 行，天然 no-op，无需 catch-all）。\n"
+        "    # 释放失败即让本事务失败 —— 绝不留下「订单终态 + 资金仍被占用」的组合。\n"
+        "    _finish_capital_reservation(conn, order_id, \"released\")\n",
+        "    # §6/§7：释放既有预占（若无预占，UPDATE 命中 0 行，天然 no-op，无需 catch-all）。\n"
+        "    # 释放失败即让本事务失败 —— 绝不留下「订单终态 + 资金仍被占用」的组合。\n"
+        "    conn.execute(\n"
+        "        'UPDATE paper_capital_reservations SET cycle_id=? WHERE order_key=?',\n"
+        "        (detail.get('order_cycle_id'), str(order_id)),\n"
+        "    )\n"
+        "    _finish_capital_reservation(conn, order_id, \"released\")\n",        "终态化改写 reservation.cycle_id（伪造归属）",
+    ),
+    (
+        "M-CF20",
+        "backend/manual_orders.py",
+        "    # §6/§7：释放既有预占（若无预占，UPDATE 命中 0 行，天然 no-op，无需 catch-all）。\n"
+        "    # 释放失败即让本事务失败 —— 绝不留下「订单终态 + 资金仍被占用」的组合。\n"
+        "    _finish_capital_reservation(conn, order_id, \"released\")\n",
+        "    # §6/§7：释放既有预占（若无预占，UPDATE 命中 0 行，天然 no-op，无需 catch-all）。\n"
+        "    # 释放失败即让本事务失败 —— 绝不留下「订单终态 + 资金仍被占用」的组合。\n"
+        "    conn.execute(\n"
+        "        'UPDATE paper_capital_reservations SET amount=0.0,fees=0.0 WHERE order_key=?',\n"
+        "        (str(order_id),),\n"
+        "    )\n"
+        "    _finish_capital_reservation(conn, order_id, \"released\")\n",        "终态化 resize 预占金额/费用",
+    ),
+    (
+        "M-CF21",
+        "backend/manual_orders.py",
+        "    # §6/§7：释放既有预占（若无预占，UPDATE 命中 0 行，天然 no-op，无需 catch-all）。\n"
+        "    # 释放失败即让本事务失败 —— 绝不留下「订单终态 + 资金仍被占用」的组合。\n"
+        "    _finish_capital_reservation(conn, order_id, \"released\")\n",
+        "    # §6/§7：释放既有预占（若无预占，UPDATE 命中 0 行，天然 no-op，无需 catch-all）。\n"
+        "    # 释放失败即让本事务失败 —— 绝不留下「订单终态 + 资金仍被占用」的组合。\n"
+        "    try:\n"
+        "        _finish_capital_reservation(conn, order_id, \"released\")\n"
+        "    except Exception:\n"
+        "        pass\n",        "预占释放失败被静默忽略（订单终态但资金仍被占用）",
+    ),
 )
 
 #: 自检哨兵：只改注释。它必须 UNDETECTED —— 否则测试基线本来就是红的，
@@ -1293,6 +1407,38 @@ DESIGNATED_NON_VACUITY = {
         "test_deferred_fill_cycle_binding"
         ".RealPendingSellPathEndToEnd"
         ".test_scan_refuses_pending_order_after_execution_cycle_changed",
+    ),
+    "M-CF16": (
+        "test_deferred_fill_cycle_binding"
+        ".ReservationCycleMismatchEndToEnd"
+        ".test_not_triggered_mismatched_reservation_terminalizes",
+    ),
+    "M-CF17": (
+        "test_deferred_fill_cycle_binding"
+        ".ReservationCycleMismatchEndToEnd"
+        ".test_triggered_mismatched_reservation_terminalizes",
+    ),
+    "M-CF18": (
+        "test_deferred_fill_cycle_binding"
+        ".ReservationCycleMismatchEndToEnd"
+        ".test_triggered_mismatched_reservation_terminalizes",
+    ),
+    "M-CF19": (
+        "test_deferred_fill_cycle_binding"
+        ".ReservationCycleMismatchEndToEnd"
+        ".test_not_triggered_mismatched_reservation_terminalizes",
+    ),
+    "M-CF20": (
+        "test_deferred_fill_cycle_binding"
+        ".ReservationCycleMismatchEndToEnd"
+        ".test_not_triggered_mismatched_reservation_terminalizes",
+    ),
+    "M-CF21": (
+        # 实测：M-CF21 把释放失败改回静默吞掉。原来指定的终态化用例观测不到它
+        # —— 那些用例不会让释放失败。真正能杀掉它的是专门注入释放失败的用例。
+        "test_deferred_fill_cycle_binding"
+        ".ReservationCycleMismatchEndToEnd"
+        ".test_release_failure_is_not_swallowed",
     ),
 }
 

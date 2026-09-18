@@ -34,6 +34,35 @@ def _as_int(value):
         return None
 
 
+class ReservationCycleMismatch(RuntimeError):
+    """预占行的 ``cycle_id`` 与订单的 ``cycle_id`` 不一致 —— 永久性的归属冲突。
+
+    这是 ``durable provenance conflict``，**不是**临时资金不足：
+
+    * ``order.cycle_id`` 不可变；
+    * ``reservation.cycle_id`` 不可变（本模块绝不改写它）。
+
+    二者不一致时，「下一轮再试」永远不会自行恢复，所以上层必须把它终态化，
+    而不是打回 ``pending_limit`` 重试。
+
+    作为**异常类型**而不是返回值里的自由文本，是为了让判定可结构化：调用方按
+    ``except ReservationCycleMismatch`` 捕获，而不是 ``if "reservation_cycle_mismatch"
+    in reason`` 这种一改文案就失效的脆弱匹配。``marker`` 同时用于写入 ``reason``。
+    """
+
+    marker = "reservation_cycle_mismatch"
+
+    def __init__(self, order_key, reserved_cycle_id, order_cycle_id, message=""):
+        self.order_key = str(order_key)
+        self.reserved_cycle_id = reserved_cycle_id
+        self.order_cycle_id = order_cycle_id
+        super().__init__(
+            f"{self.marker}: order_key={self.order_key} "
+            f"reserved_cycle_id={reserved_cycle_id} order_cycle_id={order_cycle_id}"
+            f"{' ' + message if message else ''}"
+        )
+
+
 def _query_all(conn, sql, params=()):
     cursor = conn.execute(sql, params)
     return [_as_dict(cursor, row) for row in cursor.fetchall()]
@@ -104,10 +133,12 @@ def reserve_shared_capital(
     if existing and expected_cycle_id is not None:
         reserved_cycle = _as_int(existing.get("cycle_id"))
         if reserved_cycle != int(expected_cycle_id):
-            return False, (
-                "reservation_cycle_mismatch: 预占周期 "
-                f"{reserved_cycle!r} 与订单周期 {int(expected_cycle_id)} 不一致，"
-                "拒绝改写预占（周期归属不可变）"
+            # §4：抛**类型化**异常，而不是返回一段自由文本让上层做 contains 匹配。
+            # 上层（scanner）必须据此终态化订单；把它混进 (False, reason) 会让
+            # 「永久归属冲突」和「临时资金不足」在下游无法区分。
+            raise ReservationCycleMismatch(
+                order_key, reserved_cycle, int(expected_cycle_id),
+                "拒绝改写既有预占（预占周期归属不可变）",
             )
 
     _, pending_total = pending_buy_reservations(

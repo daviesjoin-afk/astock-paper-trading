@@ -613,10 +613,14 @@ class RealPendingSellPathEndToEnd(_ProvenRiskHarness):
                          (self.account_id,))
 
     def _snapshot(self):
-        """成交相关账本的只读快照（fill / lot / 现金 / 预占）。
+        """成交相关账本的只读快照（fill / lot / 现金 / 预占明细）。
 
-        预占单独计数，因为「guard 必须在 reservation 之前」这条要求的唯一可观测
-        证据就是：漂移订单不能让预占表发生任何变化。
+        §11：只比行数与 ``SUM(amount+fees)`` 是**不够**的 —— 那看不出预占的
+        ``status`` / ``cycle_id`` / ``released_at`` 有没有变。而「终态清理允许把
+        stale 预占从 ``reserved`` 释放为 ``released``、但绝不允许改写 ``cycle_id`` /
+        ``amount`` / ``fees``」这条契约，恰恰只能通过逐行明细来断言。因此这里记录
+        每一条预占行的完整身份：``cycle_id`` / ``status`` / ``amount`` / ``fees`` /
+        ``released_at``。
 
         ``lots_from_orders`` 只数**由订单产生**的 lot（``source_order_id`` 非空）。
         不能直接用全表 lot 计数：本仓库存在一条**与被测订单无关**的既有路径 ——
@@ -632,6 +636,16 @@ class RealPendingSellPathEndToEnd(_ProvenRiskHarness):
             row = self.conn.execute(sql, params).fetchone()
             return None if row is None else row[0]
 
+        reservations = {
+            str(row["order_key"]): (
+                None if row["cycle_id"] is None else int(row["cycle_id"]),
+                row["status"], float(row["amount"]), float(row["fees"]),
+                row["released_at"],
+            )
+            for row in self.conn.execute(
+                "SELECT order_key,cycle_id,status,amount,fees,released_at"
+                " FROM paper_capital_reservations")
+        }
         return {
             "fills": one("SELECT COUNT(*) FROM paper_fills"),
             "lots": one("SELECT COUNT(*) FROM paper_position_lots"),
@@ -639,6 +653,7 @@ class RealPendingSellPathEndToEnd(_ProvenRiskHarness):
                 "SELECT COUNT(*) FROM paper_position_lots"
                 " WHERE source_order_id IS NOT NULL"),
             "reservations": one("SELECT COUNT(*) FROM paper_capital_reservations"),
+            "reservation_rows": reservations,
             "cash": maybe("SELECT cash FROM paper_accounts WHERE id=?",
                           (self.account_id,)),
         }
@@ -971,7 +986,11 @@ class ReservationCycleProvenance(_LedgerCase):
         return None if row is None else int(row["cycle_id"])
 
     def test_mismatched_reservation_is_not_resized(self):
-        """预占记在 cycle 9、订单属于 cycle 8 ⇒ 拒绝调整，且**不改写** cycle_id。"""
+        """预占记在 cycle 9、订单属于 cycle 8 ⇒ 拒绝调整，且**不改写** cycle_id。
+
+        §4：冲突以**类型化异常**表达（``ReservationCycleMismatch``），不是返回一段
+        自由文本 —— 上层据类型判定，而不是对 reason 做 contains 匹配。
+        """
         later = self.add_cycle(started_at="2026-09-20 09:30:00")
         with PT._db(immediate=True) as conn:
             conn.execute(
@@ -980,9 +999,15 @@ class ReservationCycleProvenance(_LedgerCase):
                 (later, "order-1", ACCOUNT, CODE, "buy", 1000.0, 5.0, "reserved",
                  "2026-09-20 09:30:00"),
             )
-        ok, reason = self._reserve(self.cycle)
-        self.assertFalse(ok, "预占周期与订单周期不一致时必须 fail closed")
-        self.assertIn("reservation_cycle_mismatch", reason)
+        with PT._db(immediate=True) as conn:
+            with self.assertRaises(PT.ReservationCycleMismatch) as ctx:
+                PT._reserve_shared_capital(
+                    conn, "order-1", ACCOUNT, CODE, 2000.0, 5.0,
+                    expected_cycle_id=self.cycle,
+                )
+        self.assertEqual(ctx.exception.marker, "reservation_cycle_mismatch")
+        self.assertEqual(ctx.exception.reserved_cycle_id, later)
+        self.assertEqual(ctx.exception.order_cycle_id, self.cycle)
         self.assertEqual(self._reservation_cycle(), later,
                          "§22：绝不改写预占的 cycle_id 来\"修复\"")
         amount = self.conn.execute(
@@ -1002,17 +1027,301 @@ class ReservationCycleProvenance(_LedgerCase):
         self.assertEqual(self._reservation_cycle(), self.cycle)
 
 
+class ReservationCycleMismatchEndToEnd(_ProvenRiskHarness):
+    """§8/§9/§10：**真实** ``process_pending_manual_orders`` 下的预占周期冲突。
+
+    规格明确要求这些场景必须走真实 scanner，而不是只测预占原语 —— 因为缺陷恰恰
+    出在 scanner 把「永久归属冲突」当成「临时资金不足」的那两处分支里：
+    not-triggered 分支甚至**没有**把订单周期传下去，triggered 分支则把它打回
+    ``pending_limit`` 无限重试。
+    """
+
+    def _current_cycle(self):
+        return int(self.conn.execute(
+            "SELECT cycle_id FROM paper_accounts WHERE id=?",
+            (self.account_id,),
+        ).fetchone()["cycle_id"])
+
+    def _seed_pending_buy_with_mismatched_reservation(self, *, triggered):
+        """构造 order(cycle 8) + reservation(cycle 9) 的 pending 限价 BUY 订单。
+
+        触发判定是 ``plan["triggered"] = quote_price <= limit_price``（买入方向）——
+        即限价**高于**现价时才会成交。因此：
+
+        * ``triggered=True``  ⇒ 限价 15.0 > 现价 12.0，落到"已触发"分支；
+        * ``triggered=False`` ⇒ 限价 5.0  < 现价 12.0，落到"未触发"分支。
+
+        （实测教训：早先误以为"限价 10 现价 12"会触发，结果两条场景都进了
+        not-triggered 分支，于是"已触发"的测试其实是空壳 —— 见 revert 非空性。）
+        """
+        cycle = self._current_cycle()
+        stamp = PT._strategy_stamp(self.conn, self.account_id)
+        # 人工构造一个不属于本订单的周期 id，用来模拟历史错误归属。
+        bogus_cycle = int(self.conn.execute(
+            "SELECT COALESCE(MAX(id),0)+1 FROM paper_cycles").fetchone()[0])
+        price = 15.0 if triggered else 5.0
+        cur = self.conn.execute(
+            "INSERT INTO paper_orders(account_id,side,code,name,qty,planned_price,"
+            "status,reason,risk_payload,created_at,origin,order_type,"
+            "strategy_id,strategy_version,strategy_checksum,cycle_id)"
+            " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (self.account_id, "buy", self.code, f"测试股_{self.code}", 100, price,
+             "pending_limit", "seed", "{}", f"{self.day} 10:00:00",
+             "manual", "limit", *stamp, cycle),
+        )
+        order_id = int(cur.lastrowid)
+        self.conn.execute(
+            "INSERT INTO paper_capital_reservations(cycle_id,order_key,account_id,"
+            "code,side,amount,fees,status,created_at) VALUES(?,?,?,?,?,?,?,?,?)",
+            (bogus_cycle, str(order_id), self.account_id, self.code, "buy",
+             price * 100, 5.0, "reserved", f"{self.day} 10:00:00"),
+        )
+        self.conn.commit()
+        return order_id, cycle, bogus_cycle
+
+    def _reservation_row(self, order_id):
+        return self.conn.execute(
+            "SELECT cycle_id,status,amount,fees,released_at"
+            " FROM paper_capital_reservations WHERE order_key=?",
+            (str(order_id),)).fetchone()
+
+    def _run_scan(self, *, market_light="green", tier="T1"):
+        """跑真实 scanner。
+
+        两个前置门禁必须显式喂成「通过」，否则扫描走不到预占分支，测到的是门禁
+        而不是被测行为：
+
+        * ``market_context`` —— plan 构造里有 ``EP.market_gate(...)["blocked"]``，
+          而基类 harness 的 ``_cached_close_market`` 只返回
+          ``{"breadth": 0.5, "sentiment": "neutral"}``，缺 ``light`` 时按「未知」
+          处理并禁止新开仓；
+        * ``DE.buy_decision`` —— plan 构造要求 ``tier in ("T1","T2")``，否则以
+          「买入模型为 T5，未通过开仓门禁」拒绝。这里替成确定性的 T1。
+        """
+        import manual_orders as MO
+        market = {"light": market_light, "breadth": 0.5, "sentiment": "neutral"}
+        decision = {"tier": tier, "action": "买入", "reason": "fixture"}
+        # 捕获 scanner 实际构建的 plan，记录它走了哪个分支 —— 这样「已触发」与
+        # 「未触发」两条测试就不会因为夹具参数写错而双双落进同一分支（那正是本
+        # 轮 revert 非空性抓出的空壳：限价 10 现价 12 其实**不**触发）。
+        self.branch_probe = {}
+        real_plan = MO._manual_order_plan
+
+        def spy(*args, **kwargs):
+            built = real_plan(*args, **kwargs)
+            self.branch_probe["triggered"] = built.get("triggered")
+            self.branch_probe["allowed"] = built.get("allowed")
+            self.branch_probe["limit_price"] = kwargs.get("limit_price")
+            return built
+
+        with mock.patch.object(PT, "_quotes", return_value=self.quotes_map), \
+                mock.patch.object(PT, "init_db", lambda *a, **k: None), \
+                mock.patch.object(PT, "_entry_freeze_enabled", lambda: False), \
+                mock.patch.object(PT, "_market_state", return_value=market), \
+                mock.patch.object(PT, "_cached_close_market",
+                                  lambda conn, day, allow_network=False: market), \
+                mock.patch.object(PT.DE, "buy_decision", return_value=decision), \
+                mock.patch.object(MO, "_manual_order_plan", spy):
+            return MO.process_pending_manual_orders(asof_date=self.day)
+
+    def _set_account_running(self):
+        with PT._db(immediate=True) as conn:
+            conn.execute("UPDATE paper_accounts SET status='running' WHERE id=?",
+                         (self.account_id,))
+
+    def _snapshot(self):
+        one = lambda sql: int(self.conn.execute(sql).fetchone()[0])
+        cash = self.conn.execute(
+            "SELECT cash FROM paper_accounts WHERE id=?",
+            (self.account_id,)).fetchone()["cash"]
+        return {
+            "fills": one("SELECT COUNT(*) FROM paper_fills"),
+            "lots_from_orders": one(
+                "SELECT COUNT(*) FROM paper_position_lots"
+                " WHERE source_order_id IS NOT NULL"),
+            "reservations": one("SELECT COUNT(*) FROM paper_capital_reservations"),
+            "cash": cash,
+        }
+
+    def _assert_mismatch_terminalized(self, order_id, cycle, bogus_cycle, output,
+                                      original_amount):
+        """§8/§9 共同断言：终态化 + 预占 released + 身份不变 + 零业务写入。"""
+        row = self.conn.execute(
+            "SELECT status,reason,cycle_id FROM paper_orders WHERE id=?",
+            (order_id,)).fetchone()
+        # 1. 订单必须终态化，**不是** pending_limit / pending_execution_retry。
+        self.assertEqual("superseded", row["status"],
+                         f"归属冲突必须终态化，不能重试：{output}")
+        self.assertIn("reservation_cycle_mismatch", str(row["reason"]))
+        self.assertNotIn("pending_limit", str(row["status"]))
+        # 2. 订单周期归属不可变。
+        self.assertEqual(int(row["cycle_id"]), cycle, "订单周期不可变")
+        # 3. 预占：cycle/amount/fees 原样保留，只允许 status -> released。
+        res = self._reservation_row(order_id)
+        self.assertEqual(int(res["cycle_id"]), bogus_cycle,
+                         "§22：预占 cycle_id 绝不被改写")
+        self.assertEqual(float(res["fees"]), 5.0, "费用不被 resize")
+        self.assertEqual("released", res["status"],
+                         "§6：终态清理允许把 stale 预占释放，且应当释放")
+        # 金额必须等于**扫描前捕获的原值**，证明 scanner 没有按本轮市价或其它规模
+        # resize 它（原值随场景不同：未触发用限价，已触发用成交价）。
+        self.assertEqual(float(res["amount"]), float(original_amount),
+                         "§8：预占金额必须保持扫描前原值，绝不得 resize")
+        return res
+
+    def test_not_triggered_mismatched_reservation_terminalizes(self):
+        """§8：**未触发**限价分支的归属冲突必须终态化（Blocker A 的承重测试）。
+
+        旧缺陷：该分支调用 ``_reserve_shared_capital`` 时**没有**传
+        ``expected_cycle_id``，于是周期冲突根本不会被发现，预占会被静默按本订单
+        规模 resize，订单继续留在队列里。
+        """
+        order_id, cycle, bogus = self._seed_pending_buy_with_mismatched_reservation(
+            triggered=False)
+        self._set_account_running()
+        self._set_fresh_exit_quote(self.code, price=12.0, pct=1.0, high=12.2, low=11.8)
+        before = self._snapshot()
+        amount_before = float(self._reservation_row(order_id)["amount"])
+        output = self._run_scan()
+        # 前置：夹具必须真的落进 not-triggered 分支，否则本测试是空壳。
+        self.assertFalse(self.branch_probe.get("triggered"),
+                         f"夹具必须走未触发分支：{self.branch_probe}")
+        self._assert_mismatch_terminalized(order_id, cycle, bogus, output,
+                                           amount_before)
+        after = self._snapshot()
+        self.assertEqual(after["fills"], before["fills"], "不得写 fill")
+        self.assertEqual(after["lots_from_orders"], before["lots_from_orders"],
+                         "不得创建 lot")
+        self.assertEqual(after["cash"], before["cash"], "不得扣款")
+        self.assertEqual(after["reservations"], before["reservations"],
+                         "不得创建新预占")
+
+    def test_triggered_mismatched_reservation_terminalizes(self):
+        """§9：**已触发**分支的归属冲突同样必须终态化（Blocker B 的承重测试）。
+
+        旧缺陷：该分支把 ``reservation_cycle_mismatch`` 与「临时资金不足」一起
+        处理 ⇒ 打回 ``pending_limit`` 让下一轮再试；而两个 cycle 都不可变，重试
+        永远不会成功。
+        """
+        order_id, cycle, bogus = self._seed_pending_buy_with_mismatched_reservation(
+            triggered=True)
+        self._set_account_running()
+        self._set_fresh_exit_quote(self.code, price=12.0, pct=1.0, high=12.2, low=11.8)
+        before = self._snapshot()
+        amount_before = float(self._reservation_row(order_id)["amount"])
+        output = self._run_scan()
+        # 前置：夹具必须真的落进**已触发**分支。买入限价单的触发条件是
+        # `quote_price <= limit_price`，所以限价必须高于现价（15 > 12）。
+        # 缺了这条断言，两条测试可能双双走未触发分支，而"已触发"那条就成了空壳。
+        self.assertTrue(self.branch_probe.get("triggered"),
+                        f"夹具必须走已触发分支：{self.branch_probe}")
+        self._assert_mismatch_terminalized(order_id, cycle, bogus, output,
+                                           amount_before)
+        after = self._snapshot()
+        self.assertEqual(after["fills"], before["fills"], "不得写 fill")
+        self.assertEqual(after["lots_from_orders"], before["lots_from_orders"],
+                         "不得创建 lot")
+        self.assertEqual(after["cash"], before["cash"], "不得扣款")
+
+    def test_release_failure_is_not_swallowed(self):
+        """§7：预占释放失败必须让本次尝试失败，**不得**静默把订单终态化。
+
+        若释放失败被吞掉，就会出现「订单已 superseded、预占仍 reserved」的组合 ——
+        那笔资金被永久占用且没有任何订单再引用它，比直接失败更糟。
+
+        判据：注入一个释放失败后，订单**不得**变成 superseded，预占也不得变成
+        released（因为根本没有释放成功），且异常必须浮现给调用方。
+        """
+        order_id, cycle, bogus = self._seed_pending_buy_with_mismatched_reservation(
+            triggered=False)
+        self._set_account_running()
+        self._set_fresh_exit_quote(self.code, price=12.0, pct=1.0, high=12.2, low=11.8)
+
+        real = PT._finish_capital_reservation
+
+        def boom(conn, order_key, status):
+            if status == "released":
+                raise RuntimeError("RELEASE_BOOM: simulated ledger failure")
+            return real(conn, order_key, status)
+
+        import manual_orders as MO
+        market = {"light": "green", "breadth": 0.5, "sentiment": "neutral"}
+        with mock.patch.object(PT, "_quotes", return_value=self.quotes_map), \
+                mock.patch.object(PT, "init_db", lambda *a, **k: None), \
+                mock.patch.object(PT, "_entry_freeze_enabled", lambda: False), \
+                mock.patch.object(PT, "_market_state", return_value=market), \
+                mock.patch.object(PT, "_cached_close_market",
+                                  lambda conn, day, allow_network=False: market), \
+                mock.patch.object(PT.DE, "buy_decision",
+                                  return_value={"tier": "T1", "action": "买入"}), \
+                mock.patch.object(PT, "_finish_capital_reservation", boom):
+            with self.assertRaises(RuntimeError) as ctx:
+                MO.process_pending_manual_orders(asof_date=self.day)
+        self.assertIn("RELEASE_BOOM", str(ctx.exception))
+        # 订单**不得**被静默终态化（否则就是「订单终态 + 资金被占用」的坏组合）。
+        self.assertNotEqual(
+            "superseded",
+            self.conn.execute("SELECT status FROM paper_orders WHERE id=?",
+                              (order_id,)).fetchone()["status"],
+            "释放失败时不得把订单标成 superseded",
+        )
+        self.assertNotEqual(
+            "released", self._reservation_row(order_id)["status"],
+            "释放并未真正成功，状态不得显示 released",
+        )
+
+    def test_matching_reservation_still_resizes_and_fills(self):
+        """§10 正对照：周期一致时，未触发可正常 resize、已触发可正常成交。"""
+        # (a) 未触发 ⇒ resize 后保持 pending_limit
+        cycle = self._current_cycle()
+        stamp = PT._strategy_stamp(self.conn, self.account_id)
+        price = 5.0
+        cur = self.conn.execute(
+            "INSERT INTO paper_orders(account_id,side,code,name,qty,planned_price,"
+            "status,reason,risk_payload,created_at,origin,order_type,"
+            "strategy_id,strategy_version,strategy_checksum,cycle_id)"
+            " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (self.account_id, "buy", self.code, f"测试股_{self.code}", 100, price,
+             "pending_limit", "seed", "{}", f"{self.day} 10:00:00",
+             "manual", "limit", *stamp, cycle),
+        )
+        pending_id = int(cur.lastrowid)
+        self.conn.execute(
+            "INSERT INTO paper_capital_reservations(cycle_id,order_key,account_id,"
+            "code,side,amount,fees,status,created_at) VALUES(?,?,?,?,?,?,?,?,?)",
+            (cycle, str(pending_id), self.account_id, self.code, "buy", 100.0, 5.0,
+             "reserved", f"{self.day} 10:00:00"),
+        )
+        self.conn.commit()
+        self._set_account_running()
+        self._set_fresh_exit_quote(self.code, price=12.0, pct=1.0, high=12.2, low=11.8)
+        self._run_scan()
+        row = self.conn.execute(
+            "SELECT status FROM paper_orders WHERE id=?", (pending_id,)).fetchone()
+        self.assertEqual("pending_limit", row["status"],
+                         "同周期未触发订单必须保持 pending_limit（不得误杀）")
+        res = self._reservation_row(pending_id)
+        self.assertEqual(int(res["cycle_id"]), cycle)
+        self.assertEqual("reserved", res["status"], "同周期预占不得被释放")
+
+
 class FinalReviewGateAllSixAbsences(_ProvenRiskHarness):
     """§43 最终人工审核 Gate：cycle mismatch 时六项必须全部缺席。
 
     规格要求的六个「no」逐一断言（不只是「订单没成交」这一个笼统观察）：
 
-    * no reservation mutation
+    * no reservation creation / resize / cycle rewrite（**终态释放是允许且期望的**：
+      stale 订单的预占必须从 ``reserved`` 转为 ``released``，否则资金被永久占用）
     * no cash mutation
     * no lot mutation
     * no fill
     * no execution verification stamp
     * no position sync caused by the stale order
+
+    §6/§11：把这一条写成笼统的 "no reservation mutation" 是**不准确**的 —— 释放
+    本身就是一次 mutation，而且是正确行为。真正的契约是：``cycle_id`` / ``amount``
+    / ``fees`` 一律不变，``status`` 只允许 ``reserved -> released``。因此快照必须
+    逐行记录预占的完整身份，而不是只比行数与 ``SUM(amount+fees)``。
 
     走**真实** ``process_pending_manual_orders``，而不是原语，因为 §43 要审的是
     「生产路径在漂移时会不会留下痕迹」。
@@ -1073,6 +1382,16 @@ class FinalReviewGateAllSixAbsences(_ProvenRiskHarness):
             "reservation_amount": self.conn.execute(
                 "SELECT COALESCE(SUM(amount+fees),0) FROM paper_capital_reservations"
             ).fetchone()[0],
+            # §11：逐行记录预占身份，才能断言 cycle_id/status 的契约。
+            "reservation_rows": {
+                str(row["order_key"]): (
+                    None if row["cycle_id"] is None else int(row["cycle_id"]),
+                    row["status"], float(row["amount"]), float(row["fees"]),
+                )
+                for row in self.conn.execute(
+                    "SELECT order_key,cycle_id,status,amount,fees"
+                    " FROM paper_capital_reservations")
+            },
             "cash": self.conn.execute(
                 "SELECT cash FROM paper_accounts WHERE id=?", (self.account_id,)
             ).fetchone()["cash"],
@@ -1089,7 +1408,8 @@ class FinalReviewGateAllSixAbsences(_ProvenRiskHarness):
 
         output = self._run_scan()
 
-        # 1. no reservation mutation —— 包括"没有新建"和"没有改金额"。
+        # 1. §6：预占契约 —— 不得新建、不得 resize、不得改写 cycle_id；
+        #    stale 订单的预占**允许且期望**从 reserved 释放为 released。
         self.assertEqual(
             count("SELECT COUNT(*) FROM paper_capital_reservations"),
             before["reservations"], f"不得新建预占：{output}",
@@ -1098,8 +1418,26 @@ class FinalReviewGateAllSixAbsences(_ProvenRiskHarness):
             self.conn.execute(
                 "SELECT COALESCE(SUM(amount+fees),0) FROM paper_capital_reservations"
             ).fetchone()[0],
-            before["reservation_amount"], "不得改写任何预占金额",
+            before["reservation_amount"], "不得改写任何预占金额/费用",
         )
+        # 逐行核对身份：cycle_id 不可变；status 只允许 reserved -> released。
+        for row in self.conn.execute(
+                "SELECT order_key,cycle_id,status FROM paper_capital_reservations"):
+            key = str(row["order_key"])
+            if key not in before["reservation_rows"]:
+                continue
+            prior_cycle, prior_status = before["reservation_rows"][key][:2]
+            self.assertEqual(
+                None if row["cycle_id"] is None else int(row["cycle_id"]),
+                prior_cycle, f"§22：预占 {key} 的 cycle_id 绝不可改写",
+            )
+            self.assertIn(
+                row["status"], ("reserved", "released"),
+                f"预占 {key} 的状态必须仍是 reserved 或已 released",
+            )
+            if row["status"] == "released":
+                self.assertEqual(prior_status, "reserved",
+                                 "释放只允许从 reserved 转到 released")
         # 2. no cash mutation
         self.assertEqual(
             self.conn.execute("SELECT cash FROM paper_accounts WHERE id=?",
