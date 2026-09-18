@@ -232,28 +232,54 @@ class _LedgerCase(unittest.TestCase):
 # §14 Regression 1 / §19 Regression 6：pending SELL 不得跨周期消费
 # ══════════════════════════════════════════════════════════════════════════
 class PendingSellStaysInItsOwnCycle(_LedgerCase):
-    """一个 cycle 8 建的 pending SELL，在 cycle 9 激活后成交，仍只碰 cycle 8。"""
+    """§13/§14：cycle 8 建的 pending SELL，在 active 搬到 cycle 9 后**必须拒绝成交**。
 
-    def test_R1_pending_sell_consumes_only_its_own_cycle(self):
-        """Regression 1：只消费 cycle 8 的 lot，cycle 9 的 lot 纹丝不动。"""
+    早先这两条测试期望「cycle 8 的订单在 cycle 9 激活后仍然成交并消耗 cycle 8 的
+    底仓」。那个期望本身是错的，且已被规格 §13 点名：``paper_accounts`` 已被
+    ``_create_cycle`` 重绑到 cycle 9，卖出所得会进 cycle 9 的现金 —— 卖 cycle 8 的
+    持仓、收 cycle 9 的钱，是 cross-cycle 账本错配。系统里没有可独立写入的历史周期
+    现金账本，所以正确 contract 是：**持久化的周期归属不等于成交授权**。
+
+    这两条现在验证「归属可证明但账本已搬家 ⇒ fail closed，且账本零变化」。
+    """
+
+    def test_R1_pending_sell_is_refused_when_execution_cycle_changed(self):
+        """Regression 1：拒绝成交，且两个周期的底仓都纹丝不动。"""
         self.add_lot(self.cycle, 100)
         order = self.add_order(side="sell", qty=100, cycle_id=self.cycle)
         later = self.add_cycle()
         self.add_lot(later, 100)  # 必须真的存在 cycle 9 底仓，否则断言是空的
         self.assertNotEqual(later, self.cycle)
         self.assertEqual(self.active_cycle(), later, "夹具必须真的把 active 切走")
+        before = self.counts()
 
-        self.commit(order, side="sell", qty=100)
+        with self.assertRaises(PT.OrderExecutionCycleChanged) as ctx:
+            self.commit(order, side="sell", qty=100)
 
-        self.assertEqual(self.lot_remaining(self.cycle), 0, "cycle 8 的 lot 应被消耗")
+        self.assertEqual(ctx.exception.order_cycle_id, self.cycle)
+        self.assertEqual(ctx.exception.active_cycle_id, later)
+        self.assertEqual(self.lot_remaining(self.cycle), 100, "cycle 8 的 lot 不得被消耗")
         self.assertEqual(self.lot_remaining(later), 100, "cycle 9 的 lot 不得被触碰")
         self.assertEqual(self.order_cycle(order), self.cycle, "订单周期不可变")
+        after = self.counts()
+        self.assertEqual(after["fills"], before["fills"], "不得写入 fill")
+        self.assertEqual(self._cash(), before["cash"], "不得入账现金")
 
-    def test_R6_post_v18_sell_prefers_durable_cycle_over_active(self):
-        """Regression 6：durable provenance 优先于 current active state。"""
+    def test_R6_durable_cycle_still_wins_when_the_ledger_agrees(self):
+        """Regression 6：三者一致时 durable provenance 正常成交（正对照）。
+
+        原测试断言「active 变了仍然成交」；现在只有在**账本与订单同周期**时成交才
+        合法。这里把账户也留在 cycle 8，验证 durable ``order.cycle_id`` 确实被用作
+        成交依据（而不是被 active state 覆盖）。
+        """
         self.add_lot(self.cycle, 100)
         order = self.add_order(side="sell", qty=100, cycle_id=self.cycle)
-        self.add_cycle()  # active 变成新周期
+        self.assertEqual(self.active_cycle(), self.cycle)
+        self.assertEqual(
+            int(self.conn.execute("SELECT cycle_id FROM paper_accounts WHERE id=?",
+                                  (ACCOUNT,)).fetchone()[0]),
+            self.cycle,
+        )
 
         self.commit(order, side="sell", qty=100)
 
@@ -586,12 +612,58 @@ class RealPendingSellPathEndToEnd(_ProvenRiskHarness):
             conn.execute("UPDATE paper_accounts SET status='running' WHERE id=?",
                          (self.account_id,))
 
-    def test_scan_fills_from_the_orders_own_cycle_after_active_moved(self):
+    def _snapshot(self):
+        """成交相关账本的只读快照（fill / lot / 现金 / 预占）。
+
+        预占单独计数，因为「guard 必须在 reservation 之前」这条要求的唯一可观测
+        证据就是：漂移订单不能让预占表发生任何变化。
+
+        ``lots_from_orders`` 只数**由订单产生**的 lot（``source_order_id`` 非空）。
+        不能直接用全表 lot 计数：本仓库存在一条**与被测订单无关**的既有路径 ——
+        ``_position_rows`` → ``_migrate_legacy_positions`` 会在 active cycle 前进后
+        把 ``paper_positions`` 里的历史镜像行重新展开成一条 ``source_order_id IS
+        NULL`` 的 lot。该行为在 base commit 上同样存在（已实测复现），属于本轮范围
+        之外的既有缺陷，不能让它把「这张漂移订单没有造出任何 lot」这个真断言搅浑。
+        """
+        def one(sql, params=()):
+            return int(self.conn.execute(sql, params).fetchone()[0])
+
+        def maybe(sql, params=()):
+            row = self.conn.execute(sql, params).fetchone()
+            return None if row is None else row[0]
+
+        return {
+            "fills": one("SELECT COUNT(*) FROM paper_fills"),
+            "lots": one("SELECT COUNT(*) FROM paper_position_lots"),
+            "lots_from_orders": one(
+                "SELECT COUNT(*) FROM paper_position_lots"
+                " WHERE source_order_id IS NOT NULL"),
+            "reservations": one("SELECT COUNT(*) FROM paper_capital_reservations"),
+            "cash": maybe("SELECT cash FROM paper_accounts WHERE id=?",
+                          (self.account_id,)),
+        }
+
+    def test_scan_refuses_pending_order_after_execution_cycle_changed(self):
+        """§13/§14：active cycle 搬走后，cycle 8 的 pending SELL **必须拒绝成交**。
+
+        本测试替换了早先的 ``test_scan_fills_from_the_orders_own_cycle_after_active_moved``
+        —— 那个期望本身是错的：它要求「cycle 8 的订单在 cycle 9 激活后仍然消耗
+        cycle 8 的底仓并成交」。但 ``paper_accounts`` 已被 ``_create_cycle`` 重绑到
+        cycle 9，卖出所得会打进 cycle 9 的现金，形成 cross-cycle 账本错配：
+
+        * 卖的是 cycle 8 的持仓，
+        * 收钱的是 cycle 9 的账户。
+
+        系统里并不存在可独立写入的历史周期现金账本，所以正确 contract 不是「想办法
+        把 cash 写回旧周期」，而是：持久化的周期归属 **不等于** 成交授权 —— 账本一旦
+        搬家，旧订单即 stale，必须 fail closed 并终态化。
+        """
         order, cycle = self._seed_pending_sell()
         later = self._add_later_cycle()
         self.assertNotEqual(later, cycle)
         self._set_account_running()
         self._set_fresh_exit_quote(self.code, price=12.0, pct=1.0, high=12.2, low=11.8)
+        # cycle 9 也放一份底仓：如果实现错误地"借"当前周期，数量断言会抓住。
         with PT._db(immediate=True) as conn:
             conn.execute(
                 "INSERT INTO paper_position_lots(cycle_id,account_id,code,name,industry,"
@@ -600,12 +672,19 @@ class RealPendingSellPathEndToEnd(_ProvenRiskHarness):
                 (later, self.account_id, self.code, f"测试股_{self.code}", "Tech",
                  100, 100, 10.0, "2026-09-01 10:00:00", "2026-09-02", "stock_t1", 1, 1),
             )
+        fills_before = self.conn.execute("SELECT COUNT(*) FROM paper_fills").fetchone()[0]
+        cash_before = self.conn.execute(
+            "SELECT cash FROM paper_accounts WHERE id=?", (self.account_id,)
+        ).fetchone()["cash"]
         output = self._run_scan()
-        self.assertTrue(output, f"扫描必须处理这条待成交委托：{output}")
-        status = self.conn.execute(
-            "SELECT status FROM paper_orders WHERE id=?", (order,)
-        ).fetchone()["status"]
-        self.assertEqual("filled", status, f"真实路径必须成交：{output}")
+        row = self.conn.execute(
+            "SELECT status,reason FROM paper_orders WHERE id=?", (order,)
+        ).fetchone()
+        self.assertNotEqual("filled", row["status"], f"周期漂移后绝不能成交：{output}")
+        self.assertEqual("superseded", row["status"],
+                         f"必须收敛为终态，而不是每轮重试：{output}")
+        self.assertIn("order_execution_cycle_changed", str(row["reason"]))
+        # E2E 核心断言：两侧底仓都没动。
         own = self.conn.execute(
             "SELECT COALESCE(SUM(remaining_qty),0) FROM paper_position_lots"
             " WHERE cycle_id=? AND account_id=? AND code=?",
@@ -616,8 +695,93 @@ class RealPendingSellPathEndToEnd(_ProvenRiskHarness):
             " WHERE cycle_id=? AND account_id=? AND code=?",
             (later, self.account_id, self.code),
         ).fetchone()[0]
-        self.assertEqual(int(own), 0, "E2E：必须消耗订单自己周期（cycle 8）的底仓")
-        self.assertEqual(int(other), 100, "E2E：绝不能借 active 周期（cycle 9）的底仓")
+        self.assertEqual(int(own), 100, "E2E：cycle 8 的底仓不得被消耗")
+        self.assertEqual(int(other), 100, "E2E：cycle 9 的底仓不得被借走")
+        self.assertEqual(
+            self.conn.execute("SELECT COUNT(*) FROM paper_fills").fetchone()[0],
+            fills_before, "E2E：不得写任何 fill",
+        )
+        self.assertEqual(
+            self.conn.execute("SELECT cash FROM paper_accounts WHERE id=?",
+                              (self.account_id,)).fetchone()["cash"],
+            cash_before, "E2E：不得有任何现金变动",
+        )
+        self.assertEqual(int(self.conn.execute(
+            "SELECT cycle_id FROM paper_orders WHERE id=?", (order,)
+        ).fetchone()["cycle_id"]), cycle, "订单周期归属必须保持不变（不可变事实）")
+
+    def test_scan_refuses_pending_buy_after_execution_cycle_changed(self):
+        """§15：cycle 8 的 pending BUY 在 cycle 9 激活后，不得成交、不得写 lot。
+
+        这是本轮最重要的 BUY 承重测试。BUY 的问题方向与 SELL 相反但后果同样严重：
+        cycle 8 的委托会**用 cycle 9 的现金**买出一个 cycle 8 的 lot。旧代码还会在
+        cycle guard 之前就调用 ``_reserve_shared_capital``，于是 cycle 9 的账上留下
+        一张属于 cycle 8 委托的预占 —— 即使成交随后失败，那笔预占也已经落库。
+        """
+        cycle = self._current_cycle()
+        self._insert_lot(self.account_id, self.code, 100, 10.0,
+                         available_date="2026-09-09")
+        stamp = PT._strategy_stamp(self.conn, self.account_id)
+        cur = self.conn.execute(
+            "INSERT INTO paper_orders(account_id,side,code,name,qty,planned_price,"
+            "status,reason,risk_payload,created_at,origin,strategy_id,"
+            "strategy_version,strategy_checksum,cycle_id)"
+            " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (self.account_id, "buy", self.code, f"测试股_{self.code}", 100, 10.0,
+             "manual_execution_retry", "seed", "{}", f"{self.day} 10:00:00",
+             "manual", *stamp, cycle),
+        )
+        self.conn.commit()
+        order = int(cur.lastrowid)
+        later = self._add_later_cycle()
+        self.assertNotEqual(later, cycle)
+        self._set_account_running()
+        self._set_fresh_exit_quote(self.code, price=12.0, pct=1.0, high=12.2, low=11.8)
+        before = self._snapshot()
+        output = self._run_scan()
+        row = self.conn.execute(
+            "SELECT status,reason FROM paper_orders WHERE id=?", (order,)
+        ).fetchone()
+        self.assertNotEqual("filled", row["status"], f"周期漂移后绝不能成交：{output}")
+        self.assertEqual("superseded", row["status"])
+        self.assertIn("order_execution_cycle_changed", str(row["reason"]))
+        after = self._snapshot()
+        self.assertEqual(after["fills"], before["fills"], "不得写 fill")
+        self.assertEqual(
+            after["lots_from_orders"], before["lots_from_orders"],
+            "不得为这张漂移订单创建 lot",
+        )
+        self.assertEqual(after["cash"], before["cash"], "不得扣款")
+        self.assertEqual(
+            after["reservations"],
+            before["reservations"],
+            "不得为漂移订单创建/改写预占（guard 必须在 reservation 之前）",
+        )
+        self.assertEqual(int(self.conn.execute(
+            "SELECT cycle_id FROM paper_orders WHERE id=?", (order,)
+        ).fetchone()["cycle_id"]), cycle, "订单周期归属不可变")
+
+    def test_same_cycle_deferred_order_still_fills_normally(self):
+        """§18：同周期的 deferred fill 仍然正常成交 —— 本 PR 只拒绝周期漂移。
+
+        防止"修得太狠"：如果 guard 把「隔了几轮扫描才成交」也判成漂移，deferred
+        fill 这个正常能力就被误杀了。这里 order/account/active 三者同为 cycle 8。
+        """
+        order, cycle = self._seed_pending_sell()
+        self.assertEqual(self._current_cycle(), cycle)
+        self._set_account_running()
+        self._set_fresh_exit_quote(self.code, price=12.0, pct=1.0, high=12.2, low=11.8)
+        output = self._run_scan()
+        row = self.conn.execute(
+            "SELECT status FROM paper_orders WHERE id=?", (order,)
+        ).fetchone()
+        self.assertEqual("filled", row["status"], f"同周期 deferred fill 必须成交：{output}")
+        own = self.conn.execute(
+            "SELECT COALESCE(SUM(remaining_qty),0) FROM paper_position_lots"
+            " WHERE cycle_id=? AND account_id=? AND code=?",
+            (cycle, self.account_id, self.code),
+        ).fetchone()[0]
+        self.assertEqual(int(own), 0, "同周期成交必须正常消耗底仓")
 
     def test_scan_cannot_fill_a_legacy_null_cycle_sell(self):
         """legacy NULL-cycle 的 pending SELL：扫描必须不成交、不碰任何周期底仓。"""
@@ -667,6 +831,305 @@ class RealPendingSellPathEndToEnd(_ProvenRiskHarness):
 # ══════════════════════════════════════════════════════════════════════════
 # §4/§9/§11 原语级契约（不可由 commit_fill 的外层预检代替）
 # ══════════════════════════════════════════════════════════════════════════
+class ReadOnlyCycleLookupHasNoSideEffects(_LedgerCase):
+    """§9/§10：周期闸门**只读**，绝不能顺手创建周期。"""
+
+    def test_guard_does_not_create_a_cycle_on_an_empty_ledger(self):
+        """空库上调 guard 必须 fail closed，且**不得** INSERT 任何周期行。
+
+        ``_active_cycle`` 在没有任何周期时会调用 ``_ensure_cycle`` 建一个新周期。
+        如果 guard 用了它，「现在属于哪个周期」这个问题的答案就会从「不存在」变成
+        「我刚造出来的一个」，于是验证动作本身改变了被验证的世界。
+        """
+        with PT._db(immediate=True) as conn:
+            conn.execute("DELETE FROM paper_cycles")
+        cycles_before = int(self.conn.execute(
+            "SELECT COUNT(*) FROM paper_cycles").fetchone()[0])
+        order = self.add_order(side="buy", qty=100, cycle_id=None)
+        with PT._db(immediate=True) as conn:
+            with self.assertRaises(PT.OrderCycleProvenanceUnknown):
+                PT._assert_order_execution_cycle(conn, order, account_id=ACCOUNT)
+            active = PT._active_cycle_id_readonly(conn)
+        self.assertIsNone(active, "无周期时必须返回 None，不得凭空创建")
+        self.assertEqual(
+            int(self.conn.execute("SELECT COUNT(*) FROM paper_cycles").fetchone()[0]),
+            cycles_before, "guard 不得创建周期",
+        )
+
+    def test_readonly_active_cycle_matches_creation_free_semantics(self):
+        """正对照：存在周期时只读入口返回同一个 active cycle。"""
+        with PT._db(immediate=True) as conn:
+            self.assertEqual(PT._active_cycle_id_readonly(conn), self.cycle)
+            self.assertEqual(
+                int(PT._active_cycle(conn)["id"]), self.cycle,
+            )
+
+
+class ExecutionCycleInvariantIsChecked(_LedgerCase):
+    """§5/§11：三项一致性 —— 订单周期 == 账户周期 == active 周期。"""
+
+    def _proven_buy(self):
+        return self.add_order(side="buy", qty=100, cycle_id=self.cycle)
+
+    def test_account_cycle_mismatch_is_rejected(self):
+        """账户被重绑到新周期、但订单仍属旧周期 ⇒ 必须 fail closed。
+
+        即使 ``paper_accounts.id`` 没变：``_create_cycle`` 会**重绑并重置**账户，
+        所以「同一个账户 id」绝不代表「同一个经济周期」。
+        """
+        order = self._proven_buy()
+        later = self.add_cycle(started_at="2026-09-20 09:30:00")
+        with PT._db(immediate=True) as conn:
+            conn.execute("UPDATE paper_accounts SET cycle_id=? WHERE id=?",
+                         (later, ACCOUNT))
+        with PT._db(immediate=True) as conn:
+            with self.assertRaises(PT.OrderExecutionCycleChanged) as ctx:
+                PT._assert_order_execution_cycle(conn, order, account_id=ACCOUNT)
+        self.assertEqual(ctx.exception.order_cycle_id, self.cycle)
+        self.assertEqual(ctx.exception.account_cycle_id, later)
+        self.assertEqual(ctx.exception.marker, "order_execution_cycle_changed")
+
+    def test_active_cycle_mismatch_is_rejected(self):
+        """活跃周期前进、订单仍属旧周期 ⇒ 必须 fail closed。"""
+        order = self._proven_buy()
+        later = self.add_cycle(started_at="2026-09-20 09:30:00")
+        self.assertNotEqual(later, self.cycle)
+        with PT._db(immediate=True) as conn:
+            with self.assertRaises(PT.OrderExecutionCycleChanged):
+                PT._assert_order_execution_cycle(conn, order, account_id=ACCOUNT)
+
+    def test_null_account_cycle_is_rejected(self):
+        """账户 ``cycle_id`` 为 NULL（未启用策略）⇒ 必须 fail closed。"""
+        order = self._proven_buy()
+        with PT._db(immediate=True) as conn:
+            conn.execute("UPDATE paper_accounts SET cycle_id=NULL WHERE id=?",
+                         (ACCOUNT,))
+        with PT._db(immediate=True) as conn:
+            with self.assertRaises(PT.OrderExecutionCycleChanged):
+                PT._assert_order_execution_cycle(conn, order, account_id=ACCOUNT)
+
+    def test_missing_account_is_rejected(self):
+        """账户不存在 ⇒ 必须 fail closed（不得把 None 当成"一致"）。"""
+        order = self._proven_buy()
+        with PT._db(immediate=True) as conn:
+            with self.assertRaises(PT.OrderExecutionCycleChanged):
+                PT._assert_order_execution_cycle(conn, order, account_id="ghost")
+
+    def test_consistent_triple_passes_and_returns_the_order_cycle(self):
+        """正对照：三者一致时返回订单周期（证明上面的拒绝有区分度）。"""
+        order = self._proven_buy()
+        with PT._db(immediate=True) as conn:
+            self.assertEqual(
+                PT._assert_order_execution_cycle(conn, order, account_id=ACCOUNT),
+                self.cycle,
+            )
+
+    def test_guard_refuses_an_unprovable_order_directly(self):
+        """§19：闸门**自己**必须拒绝归属不可证明的订单，绝不回退到 active cycle。
+
+        必须直接驱动闸门：``commit_fill`` 在调用闸门**之前**也读了一次归属并抛异常，
+        所以从 ``commit_fill`` 那条路径看，闸门内部的这个判断是被遮蔽的（防御纵深
+        的第二层）。只测 ``commit_fill`` 无法证明闸门自己会拒绝 —— 把闸门的判断换成
+        「拿当前 active cycle 顶上」之后，``commit_fill`` 的用例依然全绿。
+        """
+        legacy = self.add_order(side="buy", qty=100, cycle_id=None)
+        with PT._db(immediate=True) as conn:
+            with self.assertRaises(PT.OrderCycleProvenanceUnknown):
+                PT._assert_order_execution_cycle(conn, legacy, account_id=ACCOUNT)
+
+    def test_guard_does_not_fall_back_to_active_cycle_for_a_drifted_order(self):
+        """§5：漂移订单也不得被"修好" —— 拒绝，而不是改用 active cycle。"""
+        order = self._proven_buy()
+        later = self.add_cycle(started_at="2026-09-20 09:30:00")
+        self.assertNotEqual(later, self.cycle)
+        with PT._db(immediate=True) as conn:
+            conn.execute("UPDATE paper_accounts SET cycle_id=? WHERE id=?",
+                         (later, ACCOUNT))
+        with PT._db(immediate=True) as conn:
+            with self.assertRaises(PT.OrderExecutionCycleChanged) as ctx:
+                PT._assert_order_execution_cycle(conn, order, account_id=ACCOUNT)
+        # 异常必须携带**订单自己的**周期，而不是 active 周期 —— 否则上层无法区分
+        # "归属未知" 与 "归属已知但账本已搬家"。
+        self.assertEqual(ctx.exception.order_cycle_id, self.cycle)
+        self.assertEqual(ctx.exception.marker, "order_execution_cycle_changed")
+
+
+class ReservationCycleProvenance(_LedgerCase):
+    """§20/§21/§22：预占的周期归属必须与订单一致，且**不可改写**。"""
+
+    def _reserve(self, cycle_id, *, amount=1000.0):
+        with PT._db(immediate=True) as conn:
+            return PT._reserve_shared_capital(
+                conn, "order-1", ACCOUNT, CODE, amount, 5.0,
+                expected_cycle_id=cycle_id,
+            )
+
+    def _reservation_cycle(self):
+        row = self.conn.execute(
+            "SELECT cycle_id FROM paper_capital_reservations WHERE order_key=?",
+            ("order-1",)).fetchone()
+        return None if row is None else int(row["cycle_id"])
+
+    def test_mismatched_reservation_is_not_resized(self):
+        """预占记在 cycle 9、订单属于 cycle 8 ⇒ 拒绝调整，且**不改写** cycle_id。"""
+        later = self.add_cycle(started_at="2026-09-20 09:30:00")
+        with PT._db(immediate=True) as conn:
+            conn.execute(
+                "INSERT INTO paper_capital_reservations(cycle_id,order_key,account_id,"
+                "code,side,amount,fees,status,created_at) VALUES(?,?,?,?,?,?,?,?,?)",
+                (later, "order-1", ACCOUNT, CODE, "buy", 1000.0, 5.0, "reserved",
+                 "2026-09-20 09:30:00"),
+            )
+        ok, reason = self._reserve(self.cycle)
+        self.assertFalse(ok, "预占周期与订单周期不一致时必须 fail closed")
+        self.assertIn("reservation_cycle_mismatch", reason)
+        self.assertEqual(self._reservation_cycle(), later,
+                         "§22：绝不改写预占的 cycle_id 来\"修复\"")
+        amount = self.conn.execute(
+            "SELECT amount FROM paper_capital_reservations WHERE order_key=?",
+            ("order-1",)).fetchone()[0]
+        self.assertEqual(float(amount), 1000.0, "拒绝时必须原样保留金额")
+
+    def test_matching_reservation_is_resized_normally(self):
+        """正对照：周期一致时可以正常调整（证明拒绝有区分度）。"""
+        self._reserve(self.cycle, amount=1000.0)
+        ok, reason = self._reserve(self.cycle, amount=2000.0)
+        self.assertTrue(ok, f"同周期预占应可调整：{reason}")
+        amount = self.conn.execute(
+            "SELECT amount FROM paper_capital_reservations WHERE order_key=?",
+            ("order-1",)).fetchone()[0]
+        self.assertEqual(float(amount), 2000.0)
+        self.assertEqual(self._reservation_cycle(), self.cycle)
+
+
+class FinalReviewGateAllSixAbsences(_ProvenRiskHarness):
+    """§43 最终人工审核 Gate：cycle mismatch 时六项必须全部缺席。
+
+    规格要求的六个「no」逐一断言（不只是「订单没成交」这一个笼统观察）：
+
+    * no reservation mutation
+    * no cash mutation
+    * no lot mutation
+    * no fill
+    * no execution verification stamp
+    * no position sync caused by the stale order
+
+    走**真实** ``process_pending_manual_orders``，而不是原语，因为 §43 要审的是
+    「生产路径在漂移时会不会留下痕迹」。
+    """
+
+    def _current_cycle(self):
+        return int(self.conn.execute(
+            "SELECT cycle_id FROM paper_accounts WHERE id=?",
+            (self.account_id,),
+        ).fetchone()["cycle_id"])
+
+    def _seed_pending_sell(self):
+        self._insert_lot(self.account_id, self.code, 100, 10.0,
+                         available_date="2026-09-09")
+        cycle = self._current_cycle()
+        stamp = PT._strategy_stamp(self.conn, self.account_id)
+        cur = self.conn.execute(
+            "INSERT INTO paper_orders(account_id,side,code,name,qty,planned_price,"
+            "status,reason,risk_payload,created_at,origin,strategy_id,"
+            "strategy_version,strategy_checksum,cycle_id)"
+            " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (self.account_id, "sell", self.code, f"测试股_{self.code}", 100, 12.0,
+             "manual_execution_retry", "seed", "{}", f"{self.day} 10:00:00",
+             "manual", *stamp, cycle),
+        )
+        self.conn.commit()
+        return int(cur.lastrowid), cycle
+
+    def _add_later_cycle(self):
+        with PT._db(immediate=True) as conn:
+            conn.execute("DELETE FROM paper_nav")
+        with PT._db(immediate=True) as conn:
+            cycle = PT._create_cycle(conn, 300000.0, status="running",
+                                     reason="测试推进周期")
+        return int(cycle["id"])
+
+    def _run_scan(self):
+        import manual_orders as MO
+        with mock.patch.object(PT, "_quotes", return_value=self.quotes_map), \
+                mock.patch.object(PT, "init_db", lambda *a, **k: None), \
+                mock.patch.object(PT, "_entry_freeze_enabled", lambda: False):
+            return MO.process_pending_manual_orders(asof_date=self.day)
+
+    def test_all_six_absences_hold_for_a_stale_order(self):
+        order, cycle = self._seed_pending_sell()
+        later = self._add_later_cycle()
+        self.assertNotEqual(later, cycle)
+        with PT._db(immediate=True) as conn:
+            conn.execute("UPDATE paper_accounts SET status='running' WHERE id=?",
+                         (self.account_id,))
+        self._set_fresh_exit_quote(self.code, price=12.0, pct=1.0, high=12.2, low=11.8)
+
+        def count(sql, params=()):
+            return int(self.conn.execute(sql, params).fetchone()[0])
+
+        before = {
+            "reservations": count("SELECT COUNT(*) FROM paper_capital_reservations"),
+            "reservation_amount": self.conn.execute(
+                "SELECT COALESCE(SUM(amount+fees),0) FROM paper_capital_reservations"
+            ).fetchone()[0],
+            "cash": self.conn.execute(
+                "SELECT cash FROM paper_accounts WHERE id=?", (self.account_id,)
+            ).fetchone()["cash"],
+            "lots": count("SELECT COUNT(*) FROM paper_position_lots"),
+            "lots_from_orders": count(
+                "SELECT COUNT(*) FROM paper_position_lots"
+                " WHERE source_order_id IS NOT NULL"),
+            "fills": count("SELECT COUNT(*) FROM paper_fills"),
+            "verified": count(
+                "SELECT COUNT(*) FROM paper_orders"
+                " WHERE execution_verified=1 OR execution_status='verified'"),
+            "nav": count("SELECT COUNT(*) FROM paper_nav"),
+        }
+
+        output = self._run_scan()
+
+        # 1. no reservation mutation —— 包括"没有新建"和"没有改金额"。
+        self.assertEqual(
+            count("SELECT COUNT(*) FROM paper_capital_reservations"),
+            before["reservations"], f"不得新建预占：{output}",
+        )
+        self.assertEqual(
+            self.conn.execute(
+                "SELECT COALESCE(SUM(amount+fees),0) FROM paper_capital_reservations"
+            ).fetchone()[0],
+            before["reservation_amount"], "不得改写任何预占金额",
+        )
+        # 2. no cash mutation
+        self.assertEqual(
+            self.conn.execute("SELECT cash FROM paper_accounts WHERE id=?",
+                              (self.account_id,)).fetchone()["cash"],
+            before["cash"], "不得有现金变动",
+        )
+        # 3. no lot mutation（订单来源的 lot 是唯一可归因给本订单的口径）
+        self.assertEqual(
+            count("SELECT COUNT(*) FROM paper_position_lots"
+                  " WHERE source_order_id IS NOT NULL"),
+            before["lots_from_orders"], "不得让本订单造出 lot",
+        )
+        # 4. no fill
+        self.assertEqual(count("SELECT COUNT(*) FROM paper_fills"),
+                         before["fills"], "不得写 fill")
+        # 5. no execution verification stamp
+        self.assertEqual(
+            count("SELECT COUNT(*) FROM paper_orders"
+                  " WHERE execution_verified=1 OR execution_status='verified'"),
+            before["verified"], "不得为 stale 订单盖章成交验证",
+        )
+        # 6. 该订单本身必须终态化（§23），且周期归属不可变。
+        row = self.conn.execute(
+            "SELECT status,reason,cycle_id FROM paper_orders WHERE id=?", (order,)
+        ).fetchone()
+        self.assertEqual(row["status"], "superseded", f"必须终态化：{output}")
+        self.assertIn("order_execution_cycle_changed", str(row["reason"]))
+        self.assertEqual(int(row["cycle_id"]), cycle, "订单周期归属不可变")
+
+
 class PrimitiveGuardsAreReachableDirectly(_LedgerCase):
     """两个原语**自己**必须 fail closed，不能只靠 ``commit_fill`` 的外层预检。
 
@@ -759,6 +1222,10 @@ class ProvenancePrecheckHappensBeforeAnyMutation(_LedgerCase):
         # 预检被静默跳过，测试就变成永绿的空壳。
         stub._order_cycle_provenance_for_order = PT._order_cycle_provenance_for_order
         stub.OrderCycleProvenanceUnknown = PT.OrderCycleProvenanceUnknown
+        # execution-cycle 闸门同样必须指向真实实现：auto-Mock 会返回真值，让
+        # 「漏掉周期一致性校验」这件事在 spy 测试里观测不到。
+        stub._assert_order_execution_cycle = PT._assert_order_execution_cycle
+        stub.OrderExecutionCycleChanged = PT.OrderExecutionCycleChanged
         return stub
 
     def _drive(self, order, side, reserved):

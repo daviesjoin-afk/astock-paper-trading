@@ -68,6 +68,16 @@ def _cycle_stub_kwargs(order_cycle=ORDER_CYCLE, *, proven=True, status=None,
         "OrderCycleProvenanceUnknown": PT.OrderCycleProvenanceUnknown,
         "ORDER_CYCLE_PROVEN": PT.ORDER_CYCLE_PROVEN,
         "ORDER_CYCLE_LEGACY_UNKNOWN": PT.ORDER_CYCLE_LEGACY_UNKNOWN,
+        # execution-cycle invariant：``commit_fill`` 现在还会校验
+        # order cycle == account cycle == active cycle。这里指向**真实**实现，
+        # 让替身的 ``conn`` 通过它真正需要的三条读（provenance 已注入、
+        # ``paper_accounts.cycle_id``、active cycle id）来决定放行与否 ——
+        # 如果换成恒真的 lambda，本文件里所有成交用例都会在「周期校验被删掉」
+        # 的变异下依然全绿。
+        "_assert_order_execution_cycle": PT._assert_order_execution_cycle,
+        "_active_cycle_id_readonly": PT._active_cycle_id_readonly,
+        "_account_cycle_id_readonly": PT._account_cycle_id_readonly,
+        "OrderExecutionCycleChanged": PT.OrderExecutionCycleChanged,
     }
 
 
@@ -103,13 +113,14 @@ class _FakeConn:
 
     ``commit_fill`` 现在还会：读订单的 durable 周期归属（读取被注入的
     ``_order_cycle_provenance_for_order``，不经此替身）、校验订单身份
-    （``SELECT account_id, code, side FROM paper_orders WHERE id=?``），并在写入
-    成交后盖章（读回订单与其 fill 行）。替身因此要回答 ``paper_orders`` 行、
-    ``paper_fills`` 行、身份三元组、以及信号关注度计数。
+    （``SELECT account_id, code, side FROM paper_orders WHERE id=?``）、校验
+    execution-cycle invariant（``paper_accounts.cycle_id`` + active cycle id），
+    并在写入成交后盖章（读回订单与其 fill 行）。替身因此要回答 ``paper_orders``
+    行、``paper_fills`` 行、身份三元组、账户周期、active 周期、以及信号关注度计数。
     """
 
     def __init__(self, interest=0, raises=False, order_row=None, fill_rows=(),
-                 identity=None):
+                 identity=None, account_cycle=None, active_cycle=None):
         self.interest = interest
         self.raises = raises
         self.queries = []
@@ -117,6 +128,10 @@ class _FakeConn:
         self.fill_rows = list(fill_rows)
         #: ``(account_id, code, side)``；缺省从 ``order_row`` 推导，保持身份自洽。
         self.identity = identity
+        #: 缺省与 ``ORDER_CYCLE`` 一致 —— 即「账本仍在订单所属周期」，让原本
+        #: 合法的成交用例继续走通；需要构造漂移的用例显式传别的值。
+        self.account_cycle = ORDER_CYCLE if account_cycle is None else account_cycle
+        self.active_cycle = ORDER_CYCLE if active_cycle is None else active_cycle
 
     def _identity_row(self):
         if self.identity is not None:
@@ -138,6 +153,11 @@ class _FakeConn:
             return _FakeResult(row=self._identity_row())
         if text.startswith("select * from paper_orders where id"):
             return _FakeResult(row=self.order_row)
+        # ── execution-cycle invariant 的两次只读查询（顺序无关，各自可辨认）──
+        if text.startswith("select cycle_id from paper_accounts"):
+            return _FakeResult(row=(self.account_cycle,))
+        if text.startswith("select id from paper_cycles"):
+            return _FakeResult(row=(self.active_cycle,))
         return _FakeResult(self.interest)
 
 
@@ -326,8 +346,9 @@ class CommitFillTests(_StubbedPlannerTest):
         calls = []
         stub = types.SimpleNamespace(
             _assert_active_lease=lambda conn, label: calls.append(("lease", label)),
-            _reserve_shared_capital=lambda conn, order_id, account_id, code, amount, fees: (
-                calls.append(("reserve", code, amount)), (True, None))[1],
+            _reserve_shared_capital=lambda conn, order_id, account_id, code, amount, fees,
+            expected_cycle_id=None: (
+                calls.append(("reserve", code, amount, expected_cycle_id)), (True, None))[1],
             _debit_shared_cash=lambda conn, value, preferred_account_id=None: calls.append(
                 ("debit", round(value, 2))),
             _finish_capital_reservation=lambda conn, order_id, status: calls.append(
@@ -367,6 +388,11 @@ class CommitFillTests(_StubbedPlannerTest):
         # 预留必须先于扣款，成交后才消费预占。
         self.assertLess(kinds.index("reserve"), kinds.index("debit"))
         self.assertLess(kinds.index("debit"), kinds.index("lot"))
+        # §20–§22：预占必须显式带上订单的周期，否则「预占周期 == 订单周期」
+        # 只能靠预占层自己解析 active cycle（那正是要消灭的隐式来源）。
+        reserve_call = [item for item in calls if item[0] == "reserve"][0]
+        self.assertEqual(reserve_call[3], ORDER_CYCLE,
+                         "预占必须携带订单的 durable 周期")
         self.assertIn(("reservation", "consumed"), calls)
         self.assertEqual(2152.15, [item for item in calls if item[0] == "debit"][0][1])
         self.assertIn(("audit", "strategy_buy"), [(c[0], c[1]) for c in calls if c[0] == "audit"])

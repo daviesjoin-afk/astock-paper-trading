@@ -59,9 +59,36 @@ def _db():
             fees REAL NOT NULL, fill_date TEXT NOT NULL, quote_at TEXT,
             assumption TEXT NOT NULL
         );
+        -- Round-7：成交路径现在还要证明 order cycle == account cycle == active
+        -- cycle。夹具必须真的提供这两张表和一致的行，否则「周期事实」在夹具里
+        -- 根本不存在，用例会因为无法证明而失败 —— 那是夹具缺陷，不是被测行为。
+        CREATE TABLE paper_cycles (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, cycle_key TEXT NOT NULL,
+            status TEXT NOT NULL, capital REAL, risk_profile TEXT,
+            started_at TEXT, ended_at TEXT, created_at TEXT, updated_at TEXT,
+            duration_days INTEGER, enabled_strategies TEXT
+        );
+        CREATE TABLE paper_accounts (
+            id TEXT PRIMARY KEY, cycle_id INTEGER, status TEXT, initial_cash REAL,
+            cash REAL, params TEXT
+        );
         """
     )
     PSM.ensure_execution_verification_columns(conn)
+    # 账户绑定在 ORDER_CYCLE 上，active cycle 也是它 —— 即「账本与订单同周期」，
+    # 这正是本文件其余用例想测的前提。
+    conn.execute(
+        "INSERT INTO paper_cycles(id,cycle_key,status,capital,created_at,updated_at,"
+        "started_at) VALUES(?,?,?,?,?,?,?)",
+        (ORDER_CYCLE, f"c-{ORDER_CYCLE}", "running", 100000.0,
+         SESSION + " 09:00:00", SESSION + " 09:00:00", SESSION + " 09:30:00"),
+    )
+    conn.execute(
+        "INSERT INTO paper_accounts(id,cycle_id,status,initial_cash,cash)"
+        " VALUES(?,?,?,?,?)",
+        (ACCOUNT, ORDER_CYCLE, "running", 100000.0, 100000.0),
+    )
+    conn.commit()
     return conn
 
 
@@ -731,6 +758,14 @@ class CommitFillStampsTest(unittest.TestCase):
             _sync_positions=lambda *a, **k: None,
             _order_cycle_provenance_for_order=PT._order_cycle_provenance_for_order,
             OrderCycleProvenanceUnknown=PT.OrderCycleProvenanceUnknown,
+            # Round-7：commit_fill 现在还会校验 order cycle == account cycle ==
+            # active cycle。这里指向**真实**实现（连同它需要的两个只读查询入口），
+            # 让本用例的周期一致性能被真实判定 —— 替身若恒真，本文件就无法在
+            # 「周期一致性校验被删掉」时转红。
+            _assert_order_execution_cycle=PT._assert_order_execution_cycle,
+            _active_cycle_id_readonly=PT._active_cycle_id_readonly,
+            _account_cycle_id_readonly=PT._account_cycle_id_readonly,
+            OrderExecutionCycleChanged=PT.OrderExecutionCycleChanged,
         )
         plan = {
             "side": "buy", "code": CODE, "qty": 100, "amount": 1000.0,

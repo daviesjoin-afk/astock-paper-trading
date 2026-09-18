@@ -543,15 +543,18 @@ MUTATIONS = (
     ),
     (
         "M-CF3",
-        "backend/execution_planner.py",
+        "backend/paper_trading.py",
         "    if not provenance.is_proven:\n"
-        "        raise PT.OrderCycleProvenanceUnknown(\n"
+        "        raise OrderCycleProvenanceUnknown(\n"
         "            order_id, provenance.status,\n"
-        "            f\"{side} 成交被拒绝：订单周期归属不可证明\",\n"
-        "        )\n",
-        "    if False:\n"
-        "        raise PT.OrderCycleProvenanceUnknown(order_id, provenance.status)\n",
-        "post-v18 订单缺 cycle 仍允许成交",
+        "            \"订单周期归属不可证明；拒绝进入成交语义\",\n"
+        "        )\n"
+        "    order_cycle_id = provenance.cycle_id\n",
+        "    if not provenance.is_proven:\n"
+        "        order_cycle_id = _active_cycle_id_readonly(conn)\n"
+        "    else:\n"
+        "        order_cycle_id = provenance.cycle_id\n",
+        "归属不可证明时回退到当前 active cycle（NULL/未知被当成可成交）",
     ),
     (
         "M-CF4",
@@ -570,9 +573,10 @@ MUTATIONS = (
     (
         "M-CF5",
         "backend/execution_planner.py",
-        "    order_cycle_id = provenance.cycle_id\n",
+        "    order_cycle_id = PT._assert_order_execution_cycle(\n"
+        "        conn, order_id, account_id=account_id, provenance=provenance,\n",
         "    order_cycle_id = PT._order_cycle_id(conn)\n",
-        "SELL 用当前 active cycle 而非订单周期",
+        "成交闸门被替换成当前 active cycle（execution-cycle 一致性校验消失）",
     ),
     (
         "M-CF6",
@@ -604,6 +608,57 @@ MUTATIONS = (
         "    if False:\n"
         "        raise RuntimeError('order identity mismatch')\n",
         "订单身份冲突被静默接受",
+    ),
+    (
+        "M-CF9",
+        "backend/paper_trading.py",
+        "    if account_cycle_id != order_cycle_id or active_cycle_id != order_cycle_id:\n",
+        "    if False:\n",
+        "删除 order_cycle == account_cycle / active_cycle 一致性检查",
+    ),
+    (
+        "M-CF10",
+        "backend/paper_trading.py",
+        "    account_cycle_id = _account_cycle_id_readonly(conn, account_id)\n",
+        "    account_cycle_id = order_cycle_id\n",
+        "账户周期证据被替换成订单周期（account 检查恒成立而失去意义）",
+    ),
+    (
+        "M-CF11",
+        "backend/manual_orders.py",
+        "                PT_assert_execution_cycle = _order_execution_cycle_guard()\n"
+        "                guarded_cycle_id = PT_assert_execution_cycle(\n"
+        "                    conn, order[\"id\"], account_id=order[\"account_id\"],\n"
+        "                )\n",
+        "                guarded_cycle_id = None\n",
+        "pending 扫描跳过 cycle guard，直接进入预占",
+    ),
+    (
+        "M-CF12",
+        "backend/execution_planner.py",
+        "    order_cycle_id = PT._assert_order_execution_cycle(\n"
+        "        conn, order_id, account_id=account_id, provenance=provenance,\n",
+        "    order_cycle_id = provenance.cycle_id\n",
+        "commit_fill 的 defense-in-depth 周期校验被删除（仅剩上层预检）",
+    ),
+    (
+        "M-CF14",
+        "backend/paper_capital_reservations.py",
+        "        reserved_cycle = _as_int(existing.get(\"cycle_id\"))\n"
+        "        if reserved_cycle != int(expected_cycle_id):\n",
+        "        reserved_cycle = int(expected_cycle_id)\n"
+        "        if reserved_cycle != int(expected_cycle_id):",
+        "预占周期与订单周期不一致时仍允许 resize",
+    ),
+    (
+        "M-CF15",
+        "backend/manual_orders.py",
+        "                terminal = _terminalize_cycle_stale_order(conn, order, guard_exc)\n"
+        "                output.append(terminal)\n"
+        "                continue\n",
+        "                output.append({\"order_id\": order[\"id\"], \"status\": \"pending_limit\"})\n"
+        "                continue\n",
+        "stale 订单不终态化（每轮 pending → 失败 → pending，永久污染扫描器）",
     ),
 )
 
@@ -1169,24 +1224,30 @@ DESIGNATED_NON_VACUITY = {
         ".test_record_lot_refuses_a_legacy_source_order",
     ),
     "M-CF2": (
+        # 实测：该变异把成交闸门换成当前 active cycle。被测的"拒绝"用例在
+        # 变异下依然会拒绝（它读到的是同一个漂移事实），真正转红的是
+        # "同周期必须正常成交"这条正对照。
         "test_deferred_fill_cycle_binding"
-        ".PendingSellStaysInItsOwnCycle"
-        ".test_R1_pending_sell_consumes_only_its_own_cycle",
+        ".RealPendingSellPathEndToEnd"
+        ".test_same_cycle_deferred_order_still_fills_normally",
     ),
     "M-CF3": (
+        # 实测：变异让"归属不可证明"回退到当前 active cycle。commit_fill 在调用
+        # 闸门之前自己也读了一次归属并抛异常，把闸门内部这个判断遮蔽了；
+        # 直接驱动闸门的用例才是唯一能观测它的测试。
         "test_deferred_fill_cycle_binding"
-        ".ProvenancePrecheckHappensBeforeAnyMutation"
-        ".test_legacy_buy_is_rejected_before_any_side_effect",
+        ".ExecutionCycleInvariantIsChecked"
+        ".test_guard_refuses_an_unprovable_order_directly",
     ),
     "M-CF4": (
         "test_deferred_fill_cycle_binding"
         ".PendingSellStaysInItsOwnCycle"
-        ".test_R1_pending_sell_consumes_only_its_own_cycle",
+        ".test_R1_pending_sell_is_refused_when_execution_cycle_changed",
     ),
     "M-CF5": (
         "test_deferred_fill_cycle_binding"
         ".PendingSellStaysInItsOwnCycle"
-        ".test_R1_pending_sell_consumes_only_its_own_cycle",
+        ".test_R1_pending_sell_is_refused_when_execution_cycle_changed",
     ),
     "M-CF6": (
         "test_deferred_fill_cycle_binding"
@@ -1202,6 +1263,36 @@ DESIGNATED_NON_VACUITY = {
         "test_deferred_fill_cycle_binding"
         ".OrderIdentityMismatchFailsClosed"
         ".test_code_mismatch_is_rejected",
+    ),
+    "M-CF9": (
+        "test_deferred_fill_cycle_binding"
+        ".ExecutionCycleInvariantIsChecked"
+        ".test_account_cycle_mismatch_is_rejected",
+    ),
+    "M-CF10": (
+        "test_deferred_fill_cycle_binding"
+        ".ExecutionCycleInvariantIsChecked"
+        ".test_null_account_cycle_is_rejected",
+    ),
+    "M-CF11": (
+        "test_deferred_fill_cycle_binding"
+        ".RealPendingSellPathEndToEnd"
+        ".test_scan_refuses_pending_buy_after_execution_cycle_changed",
+    ),
+    "M-CF12": (
+        "test_deferred_fill_cycle_binding"
+        ".PendingSellStaysInItsOwnCycle"
+        ".test_R1_pending_sell_is_refused_when_execution_cycle_changed",
+    ),
+    "M-CF14": (
+        "test_deferred_fill_cycle_binding"
+        ".ReservationCycleProvenance"
+        ".test_mismatched_reservation_is_not_resized",
+    ),
+    "M-CF15": (
+        "test_deferred_fill_cycle_binding"
+        ".RealPendingSellPathEndToEnd"
+        ".test_scan_refuses_pending_order_after_execution_cycle_changed",
     ),
 }
 

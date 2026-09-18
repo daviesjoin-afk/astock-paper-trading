@@ -559,7 +559,8 @@ def commit_fill(
 
     PT._assert_active_lease(conn, "execution planner commit")
 
-    # ── 周期归属预检（§7/§8/§11）：必须在任何不可逆写之前 ──────────────────
+    # ── §12 顺序（不可调换）：lease → provenance → identity → execution-cycle
+    #    invariant → 才允许任何 reservation / cash / lot / fill 写 ────────────
     # 成交阶段**绝不**解析「当前 active cycle」。订单的周期是它创建时写下的事实，
     # 一个 cycle 8 建的 pending SELL 在 cycle 9 激活后成交时，必须仍然只碰 cycle 8
     # 的 lot；legacy NULL-cycle 订单的归属**不可证明**，只能 fail closed（既不建
@@ -570,14 +571,22 @@ def commit_fill(
             order_id, provenance.status,
             f"{side} 成交被拒绝：订单周期归属不可证明",
         )
-    order_cycle_id = provenance.cycle_id
     _assert_order_identity(conn, order_id=order_id, account_id=account_id,
                            code=code, side=side)
+    # §5 execution-cycle invariant：订单周期 == 账户当前周期 == active 周期。
+    # 上层 scanner 已检查过一遍，这里仍然校验（§12 defense in depth）：调用方可能
+    # 持有上一轮缓存的 account 快照，账本在两次读之间搬了家。
+    order_cycle_id = PT._assert_order_execution_cycle(
+        conn, order_id, account_id=account_id, provenance=provenance,
+    )
 
     if side == "buy":
         if not reserved:
+            # §20–§22：这张订单的周期归属已经在上面证明过，把它传给预占层，
+            # 让「预占周期 == 订单周期」也在同一次写入里成立。
             ok, reserve_reason = PT._reserve_shared_capital(
                 conn, order_id, account_id, code, amount, fees,
+                expected_cycle_id=order_cycle_id,
             )
             if not ok:
                 raise RuntimeError(reserve_reason or "共享资金池预占失败")
