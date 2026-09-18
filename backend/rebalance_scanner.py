@@ -259,21 +259,41 @@ def _is_risk_handled(conn, account_id, code, today):
             "order_id": filled_sell[0],
         }
 
-    # 检查最近一次风险审计是否已触发该股票的卖出
+    # 检查最近一次风险审计是否已触发该股票的卖出。
+    #
+    # 这里原本查询 ``risk_log`` 表 —— 但**该表在生产 schema 中不存在**
+    # （``paper_trading.init_db()`` 建出的 40 张表里没有它，全仓库也没有任何
+    # 写入点；``risk_log`` 是 ``_risk_log()`` 这个**函数名**，不是表名）。
+    # 结果是这一句必然抛 ``no such table: risk_log``，让整个调仓扫描 100% 失败。
+    #
+    # 权威替代来源是 ``paper_orders.risk_payload``：风控退出在落库时由
+    # ``_sell_plan`` 写入 ``exit_class`` / ``exit_reason_code``，而生产代码自己判定
+    # 「当日是否已发生某类退出」用的就是同一个来源（见 ``paper_trading`` 里的
+    # ``hard_stop_touched_today``）。这里沿用同一口径，不再引入第二套读法。
+    #
+    # 与上面的 ``filled_sell`` 一致，只有**被证据证明成交**的卖出才抑制换仓：
+    # 一个"没发生过的卖出"不该挡住真实换仓。窗口比 ``filled_sell`` 宽一天，
+    # 以覆盖昨日盘尾触发的风控退出。
     recent_risk = conn.execute(
-        """SELECT decision, reason FROM risk_log
+        """SELECT id, reason FROM paper_orders
            WHERE account_id=? AND code=? AND side='sell'
-             AND decision IN ('hard_stop', 'trailing_stop', 'take_profit',
-                              'max_hold', 'tactical_take_profit')
+             AND status='filled'
+             AND """ + EV.VERIFIED_PREDICATE + """
              AND created_at >= ?
+             AND (
+                 json_extract(risk_payload,'$.exit_class') IN (
+                     'hard_stop', 'trailing_stop', 'max_hold', 'tactical_take_profit')
+                 OR json_extract(risk_payload,'$.exit_reason_code') IN (
+                     'hard_stop', 'trailing_stop', 'max_hold', 'take_profit')
+             )
            ORDER BY id DESC LIMIT 1""",
         (account_id, code, (today - dt.timedelta(days=1)).isoformat())
     ).fetchone()
     if recent_risk:
         return {
             "handled": True,
-            "reason": f"实时风控已触发 {recent_risk[0]}：{recent_risk[1][:50] if recent_risk[1] else ''}",
-            "order_id": None,
+            "reason": f"实时风控已触发卖出（委托 #{recent_risk[0]}）：{recent_risk[1][:50] if recent_risk[1] else ''}",
+            "order_id": recent_risk[0],
         }
 
     return {"handled": False, "reason": "", "order_id": None}

@@ -444,37 +444,98 @@ class NewsLearningSourceGuard(unittest.TestCase):
 
 
 class ProjectionContractGuard(unittest.TestCase):
-    """§11 —— paper_positions 不得作为 current-position authority。"""
+    """§11 / Round-11 §19–§20 —— ``paper_positions`` 不得作为 current-position authority。
 
-    #: 允许直接读取 paper_positions 的场景（显式白名单）。
+    Round-10 的白名单是**模块级**的：``"backend/api_adaptive.py": "display read model"``
+    把整个模块豁免成"展示用途"。但同一个模块里 ``/rebalance/scan`` 是
+    **decision-adjacent 写路径** —— 它会据持仓生成真实调仓计划。同文件里存在一个
+    展示函数，不能成为整个文件获豁免的理由。
+
+    因此本守卫改成 **函数/查询粒度**：每一条豁免必须指明「哪个文件的哪个函数」，
+    并给出「为什么这个读取不是 current-position authority」。
+
+    ``api_adaptive.py`` 已**从白名单整体移除**：Round-11 修完后它不再有任何直接
+    ``FROM paper_positions``，所以不需要豁免（行为证据见
+    ``test_rebalance_db_ownership.py``）。
+
+    文档字符串里的 ``SELECT ... FROM paper_positions`` 是**散文**不是查询，由
+    ``_projection_reads`` 显式跳过 —— 这样就不必为注释/文档字符串留任何豁免。
+    """
+
+    #: 允许直接读取 ``paper_positions`` 的**函数**（显式白名单，函数粒度）。
+    #: 键 = ``backend/<file>.py::<function>``；``<module>`` 表示模块级语句。
     #: 每个条目都是「为什么这个读取不是 current-position authority」。
-    ALLOWED = {
-        # 兼容投影的唯一写者/读点：由 lot 聚合后重建镜像。
-        "backend/paper_trading.py": "projection writer + legacy metadata enrichment",
-        # 兼容元数据（peak_price / take_stage）与镜像重建。
-        "backend/paper_position_read_model.py": "read model enriches metadata from mirror",
-        # 归档 / 清表清单。
-        "backend/paper_cycle_service.py": "archive/purge table list",
-        # schema 迁移。
-        "backend/paper_schema_migrations.py": "schema migration column list",
-        # 一致性自检（把投影与 lot 对账）。
-        "backend/paper_replay_regression.py": "projection-vs-lot consistency check",
+    ALLOWED_FUNCTIONS = {
+        # 投影的唯一写者：由 lot 聚合后重建镜像（DELETE 旧行再写）。
+        "backend/paper_trading.py::_sync_positions": "projection writer",
+        # 展示兜底：只取 name 用于风险审计展示，不参与任何持仓判定。
+        "backend/paper_trading.py::risk_audit": "display-only name fallback",
+        # 唯一权威 reader 本身：仅用投影补 peak_price / take_stage 展示元数据。
+        "backend/paper_position_read_model.py::current_positions":
+            "enrich display metadata for an already-proven lot position",
+        # 一致性自检：把投影与 lot 对账（发现不一致，不产生持仓）。
+        "backend/paper_replay_regression.py::validate": "projection-vs-lot consistency check",
         # 开发/测试种子数据。
-        "backend/demo_seed.py": "dev/test seed",
-        # 展示 / 只读面板 / AI 上下文。
-        "backend/api_adaptive.py": "display read model",
-        "backend/ai_analysis.py": "display/AI context",
-        "backend/deepseek_advisor.py": "display/diagnostics count",
-        "backend/deepseek_research.py": "display/research aggregate",
+        "backend/demo_seed.py::_drop_position": "dev/test seed teardown",
+        # 展示 / 只读面板 / AI 上下文（均非决策路径）。
+        "backend/deepseek_advisor.py::collect_evidence": "display/diagnostics count",
+        "backend/deepseek_research.py::_pnl_evidence": "display/research aggregate",
+        "backend/deepseek_research.py::_event_evidence": "display/research aggregate",
         # 历史符号发现（明确非 holding）。
-        "backend/news_learning.py": "recent symbol discovery only (documented non-holding)",
-        # legacy helper（已登记 dead，且已改为 lot 证据）。
-        "backend/strategy_champion.py": "legacy helper, lot-evidence based",
+        "backend/news_learning.py::_paper_codes":
+            "recent symbol discovery only (documented non-holding)",
     }
 
-    def test_no_unaudited_direct_projection_consumer(self):
+    #: 曾经存在、现已不需要豁免的模块 —— 再被加回白名单即失败。
+    #: 这是 §19 的承重断言：decision-adjacent 模块不得整体获豁免。
+    MODULES_THAT_MUST_NOT_BE_WHITELISTED = ("backend/api_adaptive.py",)
+
+    @staticmethod
+    def _projection_reads(path):
+        """返回 ``[(function_name, lineno), ...]``：真实的投影查询所在函数。
+
+        刻意用 ``ast`` 解析而不是字符串匹配：
+        * **跳过文档字符串** —— ``_position_rows`` 的 docstring 里写着
+          ``SELECT ... FROM paper_positions``，那是解释文字，不是查询；
+        * 注释天然不进 AST，因此也不会被误报。
+        """
         import ast
 
+        with open(path, encoding="utf-8") as fh:
+            src = fh.read()
+        if "paper_positions" not in src:
+            return []
+        tree = ast.parse(src)
+
+        # 收集所有文档字符串节点，稍后跳过。
+        docstring_nodes = set()
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef,
+                                 ast.ClassDef)):
+                body = getattr(node, "body", None)
+                if body and isinstance(body[0], ast.Expr) \
+                        and isinstance(body[0].value, ast.Constant) \
+                        and isinstance(body[0].value.value, str):
+                    docstring_nodes.add(id(body[0].value))
+
+        found = []
+
+        def walk(node, function):
+            for child in ast.iter_child_nodes(node):
+                child_function = function
+                if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    child_function = child.name
+                if isinstance(child, ast.Constant) and isinstance(child.value, str) \
+                        and id(child) not in docstring_nodes:
+                    text = child.value.upper()
+                    if "PAPER_POSITIONS" in text and ("FROM " in text or "JOIN " in text):
+                        found.append((child_function or "<module>", child.lineno))
+                walk(child, child_function)
+
+        walk(tree, None)
+        return found
+
+    def _scan_backend(self):
         root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         backend = os.path.join(root, "backend")
         offenders = []
@@ -482,22 +543,144 @@ class ProjectionContractGuard(unittest.TestCase):
             if not name.endswith(".py") or name.startswith("test_"):
                 continue
             rel = f"backend/{name}"
-            if rel in self.ALLOWED:
-                continue
-            with open(os.path.join(backend, name), encoding="utf-8") as fh:
-                src = fh.read()
-            if "paper_positions" not in src:
-                continue
-            tree = ast.parse(src)
-            for node in ast.walk(tree):
-                if isinstance(node, ast.Constant) and isinstance(node.value, str):
-                    text = node.value.upper()
-                    if "PAPER_POSITIONS" in text and ("FROM " in text or "JOIN " in text):
-                        offenders.append(f"{rel}:{node.lineno}")
+            for function, lineno in self._projection_reads(os.path.join(backend, name)):
+                key = f"{rel}::{function}"
+                if key not in self.ALLOWED_FUNCTIONS:
+                    offenders.append(f"{key}:{lineno}")
+        return offenders
+
+    def test_no_unaudited_direct_projection_consumer(self):
+        offenders = self._scan_backend()
         self.assertEqual(
             offenders, [],
-            f"这些位置未列入白名单却直接读 paper_positions 投影：{offenders}",
+            f"这些位置未列入函数级白名单却直接读 paper_positions 投影：{offenders}",
         )
+
+    def test_allowlist_has_no_module_level_exemption(self):
+        """白名单键必须精确到函数 —— 不接受整模块豁免。"""
+        module_level = sorted(
+            key for key in self.ALLOWED_FUNCTIONS if key.endswith("::<module>")
+        )
+        self.assertEqual(
+            module_level, [],
+            f"白名单存在模块级豁免（应按函数收窄）：{module_level}",
+        )
+
+    def test_api_adaptive_is_not_whitelisted(self):
+        """§19 承重：``api_adaptive`` 不得再整体获豁免。
+
+        它同时含 ``/rebalance/scan`` 这条 decision-adjacent 写路径，用
+        "display read model" 把整个模块豁免掉，会让这条写路径的投影读取
+        永久免检。
+        """
+        for module in self.MODULES_THAT_MUST_NOT_BE_WHITELISTED:
+            self.assertNotIn(
+                module, self.ALLOWED_FUNCTIONS,
+                f"{module} 被整体加入投影白名单",
+            )
+            for key in self.ALLOWED_FUNCTIONS:
+                self.assertFalse(
+                    key.startswith(module + "::"),
+                    f"{module} 仍以函数级形式获豁免：{key}",
+                )
+
+    def test_allowlist_entries_are_not_stale(self):
+        """白名单不得留下"已经不需要"的条目 —— 过宽的白名单就是下一个漏洞。"""
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        live = set()
+        for name in sorted(os.listdir(os.path.join(root, "backend"))):
+            if not name.endswith(".py") or name.startswith("test_"):
+                continue
+            rel = f"backend/{name}"
+            for function, _lineno in self._projection_reads(
+                    os.path.join(root, "backend", name)):
+                live.add(f"{rel}::{function}")
+        stale = sorted(set(self.ALLOWED_FUNCTIONS) - live)
+        self.assertEqual(stale, [], f"白名单含不再需要的条目：{stale}")
+
+    def test_docstrings_are_not_treated_as_queries(self):
+        """文档字符串里的 SQL 是散文，不该逼出一条豁免。"""
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        reads = self._projection_reads(os.path.join(root, "backend", "paper_trading.py"))
+        functions = {fn for fn, _ln in reads}
+        self.assertNotIn(
+            "_position_rows", functions,
+            "_position_rows 的 docstring 被误判成了真实投影查询",
+        )
+
+
+class RebalanceDatabaseOwnership(unittest.TestCase):
+    """Round-11 §4/§5/§26 —— 调仓 endpoint 的数据库归属（源码级守卫）。
+
+    行为证据在 ``test_rebalance_db_ownership.py``（两个物理分离的 SQLite）。
+    这里锁住"调用点形状"，防止有人把连接改回去而测试夹具恰好没覆盖到。
+    """
+
+    def _src(self, rel):
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(os.path.join(root, rel), encoding="utf-8") as fh:
+            return fh.read()
+
+    def test_api_adaptive_rebalance_routes_never_use_adaptive_connect(self):
+        """四个 rebalance endpoint 都不得再用 ``adaptive._connect()``。
+
+        ``adaptive._connect()`` = ``adaptive_learning.sqlite3``，而调仓扫描要读
+        ``paper_accounts`` / 当前持仓 lot / ``paper_orders`` / ``paper_signals``，
+        并写 ``rebalance_*`` —— 全部属于 paper ledger。
+        """
+        import ast
+
+        src = self._src("backend/api_adaptive.py")
+        tree = ast.parse(src)
+
+        def decorator_path(node):
+            for dec in node.decorator_list:
+                if isinstance(dec, ast.Call) and isinstance(dec.func, ast.Attribute):
+                    args = dec.args
+                    if args and isinstance(args[0], ast.Constant):
+                        return str(args[0].value)
+            return None
+
+        offenders = []
+        for node in ast.walk(tree):
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            path = decorator_path(node)
+            if not path or not path.startswith("/rebalance/"):
+                continue
+            for inner in ast.walk(node):
+                if not isinstance(inner, ast.Call):
+                    continue
+                fn = inner.func
+                if isinstance(fn, ast.Attribute) and fn.attr == "_connect" \
+                        and isinstance(fn.value, ast.Name) and fn.value.id == "adaptive":
+                    offenders.append(f"{path}:{inner.lineno}")
+        self.assertEqual(
+            offenders, [],
+            f"这些 rebalance endpoint 仍在 adaptive DB 上执行：{offenders}",
+        )
+
+    def test_paper_rebalance_db_helper_targets_paper_db_path(self):
+        """唯一连接入口必须指向 ``PAPER_DB_PATH``，且用项目既有的写 helper。"""
+        import ast
+
+        src = self._src("backend/api_adaptive.py")
+        tree = ast.parse(src)
+        helper = next(
+            (n for n in ast.walk(tree)
+             if isinstance(n, ast.FunctionDef) and n.name == "_paper_rebalance_db"),
+            None,
+        )
+        self.assertIsNotNone(helper, "缺少 _paper_rebalance_db 连接入口")
+        body = ast.get_source_segment(src, helper) or ""
+        self.assertIn("PST.db(", body, "未使用项目既有的 paper 写 helper")
+        self.assertIn("PAPER_DB_PATH", body, "未指向 paper ledger")
+
+    def test_rebalance_scanner_does_not_query_missing_risk_log_table(self):
+        """§8：``risk_log`` 表不存在，任何查询都会让扫描 100% 失败。"""
+        src = self._src("backend/rebalance_scanner.py")
+        self.assertNotIn("FROM risk_log", src,
+                         "rebalance_scanner 仍查询不存在的 risk_log 表")
 
 
 if __name__ == "__main__":

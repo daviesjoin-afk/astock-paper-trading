@@ -5,16 +5,42 @@ import os
 import tempfile
 import threading
 import time
+from contextlib import contextmanager
 
 from fastapi import APIRouter, HTTPException, Query
 
 import adaptive_engine as adaptive
 import adaptive_learning_dispatch as learning_dispatch
 import paper_position_read_model as PPRM
+import paper_storage as PST
 import self_evolution as SE
 
 
 router = APIRouter(prefix="/api/adaptive", tags=["adaptive-learning"])
+
+
+@contextmanager
+def _paper_rebalance_db():
+    """调仓引擎的读写连接：**必须是 paper ledger**，不是 adaptive DB。
+
+    调仓扫描在同一连接上既读 paper 账本事实（``paper_accounts`` / 当前持仓 lot /
+    ``paper_orders`` / ``paper_signals``），又写自己的状态表
+    （``rebalance_scans`` / ``rebalance_plans`` / ``rebalance_cooldown``）。
+    因此它的事务模型天然是 **paper-ledger coupled**：这些状态一旦与账本事实分开，
+    「扫到的持仓」与「据此写下的计划」就不再来自同一个快照。
+
+    旧实现用 ``adaptive._connect()``（= ``adaptive_learning.sqlite3``）。那张库既没有
+    ``paper_accounts`` 也没有 ``paper_position_lots``，于是 endpoint 在错误的数据库上
+    找 paper 事实 —— 读不到就报 ``no such table``；更糟的是它会在错误库里建出
+    rebalance 状态，让 status/plans 与 scan 各说各话（split-brain）。
+
+    刻意**不用** ``PPRM.connect_readonly`` / ``paper_ledger_reader``：它们带
+    ``mode=ro`` + ``PRAGMA query_only=ON``，而调仓扫描必须写上述三张状态表。
+    也刻意**不** ``ATTACH`` 两个库：跨库事务会引入锁与部分提交语义，而 scanner
+    本来就依赖 paper ledger，最小正确模型是「调仓状态与 paper 账本同库」。
+    """
+    with PST.db(adaptive.PAPER_DB_PATH) as conn:
+        yield conn
 
 # ─── 轻量内存缓存 ───
 # One cache implementation is enough for the read-only status endpoints.
@@ -553,7 +579,7 @@ def rebalance_status():
         return cached
     try:
         import rebalance_scanner
-        with adaptive._connect() as conn:
+        with _paper_rebalance_db() as conn:
             rebalance_scanner.ensure_schema(conn)
             result = rebalance_scanner.get_rebalance_status(conn)
             _cache_set("rebalance_status", result)
@@ -577,7 +603,11 @@ def run_rebalance_scan(confirmed: bool = Query(False)):
             "status": "quote_unavailable", "error": type(exc).__name__,
         }) from exc
     try:
-        with adaptive._connect() as conn:
+        # 一次扫描 = **一个** paper ledger 连接 = 一个事务。账本事实
+        # （running 账户 / 当前持仓 lot / 委托 / 信号）与扫描写下的
+        # rebalance 状态必须来自同一快照，否则持仓、风控状态与计划之间
+        # 会在两个连接之间漂移。行情已在事务外取好，不会长事务阻塞网络。
+        with _paper_rebalance_db() as conn:
             rebalance_scanner.ensure_schema(conn)
             accounts = []
             for acc in conn.execute("SELECT * FROM paper_accounts WHERE status='running'").fetchall():
@@ -600,7 +630,7 @@ def verify_rebalance_plans(confirmed: bool = Query(False)):
     _require_confirmation(confirmed, "验证调仓计划")
     try:
         import rebalance_scanner
-        with adaptive._connect() as conn:
+        with _paper_rebalance_db() as conn:
             rebalance_scanner.ensure_schema(conn)
             plans = rebalance_scanner.get_pending_plans(conn)
         if not plans:
@@ -608,7 +638,9 @@ def verify_rebalance_plans(confirmed: bool = Query(False)):
         # Fetch outside the connection scope; verification only writes after a
         # complete, auditable quote snapshot is available.
         quotes, quote_meta = _fetch_rebalance_quotes()
-        with adaptive._connect() as conn:
+        # 验证写回的仍是**同一个** paper ledger：待验证计划是 scan 写在那里的，
+        # 验证结果必须落在同一处，否则 status/plans 永远看不到验证状态。
+        with _paper_rebalance_db() as conn:
             rebalance_scanner.ensure_schema(conn)
             results = rebalance_scanner.verify_all_plans(conn, plans, quotes)
             return {"plans": results, "quote_meta": quote_meta}
@@ -622,7 +654,7 @@ def verify_rebalance_plans(confirmed: bool = Query(False)):
 def get_rebalance_plans(status: str = Query("all")):
     try:
         import rebalance_scanner
-        with adaptive._connect() as conn:
+        with _paper_rebalance_db() as conn:
             rebalance_scanner.ensure_schema(conn)
             if status == "all":
                 rows = conn.execute("SELECT * FROM rebalance_plans ORDER BY id DESC LIMIT 50").fetchall()

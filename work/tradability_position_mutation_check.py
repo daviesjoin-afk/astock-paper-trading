@@ -44,6 +44,8 @@ TEST_MODULES = (
     "test_legacy_position_rematerialization",
     # Round-10：当前持仓消费者必须走权威 lot（cycle-scoped）。
     "test_authoritative_position_consumers",
+    # Round-11：调仓引擎必须读写 paper ledger（两个物理分离的 SQLite）。
+    "test_rebalance_db_ownership",
 )
 
 ADAPTER = "backend/tradability_position_evidence.py"
@@ -53,6 +55,12 @@ MIGRATIONS = "backend/paper_schema_migrations.py"
 WRITER = "backend/paper_trading.py"
 #: Round-10 当前持仓权威读取器（唯一实现）。
 READ_MODEL = "backend/paper_position_read_model.py"
+#: Round-11 调仓 endpoint 的连接归属（四个 rebalance 路由）。
+API_ADAPTIVE = "backend/api_adaptive.py"
+#: Round-11 数据库归属的 E2E 夹具（两个物理分离的 SQLite）。
+TEST_DB_OWNERSHIP = "backend/test_rebalance_db_ownership.py"
+#: Round-10/11 消费者契约 + projection 白名单守卫。
+TEST_CONSUMERS = "backend/test_authoritative_position_consumers.py"
 
 # (id, 目标文件, 变异前, 变异后, 说明)
 MUTATIONS = (
@@ -1027,6 +1035,80 @@ MUTATIONS = (
         "        pass\n",
         "current-position read 调用会创建周期",
     ),
+    # ── Round-11：调仓引擎的数据库归属（§24） ──────────────────────────────
+    (
+        "M-PC8",
+        API_ADAPTIVE,
+        "    with PST.db(adaptive.PAPER_DB_PATH) as conn:\n"
+        "        yield conn\n",
+        "    # MUTANT M-PC8: rebalance back to the adaptive-learning DB\n"
+        "    with adaptive._connect() as conn:\n"
+        "        yield conn\n",
+        "调仓连接入口改回 adaptive._connect()（错误数据库）",
+    ),
+    (
+        "M-PC9",
+        API_ADAPTIVE,
+        "                acc_dict[\"positions\"] = PPRM.current_positions(conn, account_id=acc[\"id\"])\n",
+        "                # MUTANT M-PC9: current positions read on the adaptive connection\n"
+        "                with adaptive._connect() as _ac:\n"
+        "                    acc_dict[\"positions\"] = PPRM.current_positions(_ac, account_id=acc[\"id\"])\n",
+        "当前持仓在 adaptive 连接上读取",
+    ),
+    (
+        "M-PC10",
+        API_ADAPTIVE,
+        "        import rebalance_scanner\n"
+        "        with _paper_rebalance_db() as conn:\n"
+        "            rebalance_scanner.ensure_schema(conn)\n"
+        "            result = rebalance_scanner.get_rebalance_status(conn)\n"
+        "            _cache_set(\"rebalance_status\", result)\n"
+        "            return result\n",
+        "        import rebalance_scanner\n"
+        "        # MUTANT M-PC10: scan writes paper DB, status reads adaptive DB\n"
+        "        with adaptive._connect() as conn:\n"
+        "            rebalance_scanner.ensure_schema(conn)\n"
+        "            result = rebalance_scanner.get_rebalance_status(conn)\n"
+        "            _cache_set(\"rebalance_status\", result)\n"
+        "            return result\n",
+        "scan 写 paper DB 而 status 读 adaptive DB（split-brain）",
+    ),
+    (
+        "M-PC11",
+        API_ADAPTIVE,
+        "        with _paper_rebalance_db() as conn:\n"
+        "            rebalance_scanner.ensure_schema(conn)\n"
+        "            results = rebalance_scanner.verify_all_plans(conn, plans, quotes)\n",
+        "        # MUTANT M-PC11: verify reads/writes the adaptive DB\n"
+        "        with adaptive._connect() as conn:\n"
+        "            rebalance_scanner.ensure_schema(conn)\n"
+        "            results = rebalance_scanner.verify_all_plans(conn, plans, quotes)\n",
+        "verify 继续读写 adaptive DB",
+    ),
+    (
+        "M-PC12",
+        TEST_DB_OWNERSHIP,
+        "        self.assertNotEqual(\n"
+        "            os.path.realpath(self.paper_path), os.path.realpath(self.adaptive_path),\n"
+        "            \"paper/adaptive DB 指向同一文件 ⇒ 数据库归属缺陷不可能被测出\",\n"
+        "        )\n",
+        "        # MUTANT M-PC12: fixture collapses both DBs onto one file\n"
+        "        self.adaptive_path = self.paper_path\n",
+        "API 夹具把 adaptive.DB_PATH 与 PAPER_DB_PATH 指向同一文件",
+    ),
+    (
+        "M-PC13",
+        TEST_CONSUMERS,
+        "        \"backend/news_learning.py::_paper_codes\":\n"
+        "            \"recent symbol discovery only (documented non-holding)\",\n"
+        "    }\n",
+        "        \"backend/news_learning.py::_paper_codes\":\n"
+        "            \"recent symbol discovery only (documented non-holding)\",\n"
+        "        # MUTANT M-PC13: whole-module exemption is back\n"
+        "        \"backend/api_adaptive.py\": \"display read model\",\n"
+        "    }\n",
+        "api_adaptive 重新被整体加入 projection 白名单",
+    ),
 )
 
 #: 自检哨兵：只改注释。它必须 UNDETECTED —— 否则测试基线本来就是红的，
@@ -1139,10 +1221,21 @@ def _env() -> dict:
     return {**os.environ, "PYTHONPATH": "backend", "PYTHONDONTWRITEBYTECODE": "1"}
 
 
+#: 子进程输出必须**显式**按 UTF-8 解码。
+#: ``text=True`` 不带 ``encoding`` 会用 ``locale.getpreferredencoding()`` —— 在中文
+#: Windows 上是 ``gbk``，而测试子进程打印的是 UTF-8（用例名与文档字符串都是中文）。
+#: 一旦某条测试失败，unittest 会回显中文用例名，解码线程随即抛
+#: ``UnicodeDecodeError``，矩阵会以"harness 崩溃"而非"变异存活"的形式失败 ——
+#: 看起来像环境问题，实际会掩盖真实结论。显式指定 + ``errors="replace"`` 后，
+#: 任何输出都能被读回并判定。
+_SUBPROCESS_TEXT = {"encoding": "utf-8", "errors": "replace"}
+
+
 def run_contract_tests() -> subprocess.CompletedProcess:
     return subprocess.run(
         [sys.executable, "-m", "unittest", "-q", *TEST_MODULES],
         cwd=str(ROOT), env=_env(), capture_output=True, text=True,
+        **_SUBPROCESS_TEXT,
     )
 
 
@@ -1152,6 +1245,7 @@ def _import_check() -> bool:
         [sys.executable, "-c",
          "import tradability_position_evidence, tradability_position_shadow"],
         cwd=str(ROOT), env=_env(), capture_output=True, text=True,
+        **_SUBPROCESS_TEXT,
     )
     if run.returncode != 0:
         print(run.stdout)
@@ -1760,6 +1854,40 @@ DESIGNATED_NON_VACUITY = {
         ".NoActiveCycleFailsClosed"
         ".test_no_active_cycle_returns_empty_and_creates_nothing",
     ),
+    # ── Round-11：调仓引擎的数据库归属（§25） ────────────────────────────────
+    # NV-RB1：adaptive DB 与 paper DB 分离时，scan 只有在用 paper DB 时才成功。
+    "M-PC8": (
+        "test_rebalance_db_ownership"
+        ".E2E_RB1_ScanUsesPaperDB"
+        ".test_RB1_scan_reads_paper_ledger_not_adaptive",
+    ),
+    # NV-RB1 第二条：同一缺陷的"不得污染 adaptive DB"侧面。
+    "M-PC9": (
+        "test_rebalance_db_ownership"
+        ".E2E_RB3_AuthoritativeLotIncluded"
+        ".test_RB3_current_lot_reaches_scanner_and_writes_scan_row",
+    ),
+    # NV-RB2：scan → status 必须跨两个 HTTP handler 看到同一 paper 状态。
+    "M-PC10": (
+        "test_rebalance_db_ownership"
+        ".E2E_RB5_StatusAndPlansSameDB"
+        ".test_RB5_status_sees_scan_written_in_paper_db",
+    ),
+    "M-PC11": (
+        "test_rebalance_db_ownership"
+        ".E2E_RB6_VerifySameDB"
+        ".test_RB6_verify_reads_and_updates_paper_db",
+    ),
+    "M-PC12": (
+        "test_rebalance_db_ownership"
+        ".E2E_RB1_ScanUsesPaperDB"
+        ".test_RB1_scan_reads_paper_ledger_not_adaptive",
+    ),
+    "M-PC13": (
+        "test_authoritative_position_consumers"
+        ".ProjectionContractGuard"
+        ".test_api_adaptive_is_not_whitelisted",
+    ),
 }
 
 
@@ -1767,6 +1895,7 @@ def _run_specific(test_ids) -> subprocess.CompletedProcess:
     return subprocess.run(
         [sys.executable, "-m", "unittest", "-v", *test_ids],
         cwd=str(ROOT), env=_env(), capture_output=True, text=True,
+        **_SUBPROCESS_TEXT,
     )
 
 
