@@ -42,7 +42,6 @@ def _get_se():
 
 
 import paper_storage as PST
-import paper_portfolio as PP
 import paper_position_read_model as PPRM
 import paper_repository as PRP
 import paper_performance as PPerf

@@ -130,7 +130,7 @@ class UnifiedReader(_LedgerCase):
     """§3/§4/§12 —— 唯一权威只读 reader。"""
 
     def test_reader_is_cycle_scoped_and_lot_backed(self):
-        c2 = self.stale_mirror_scenario()
+        self.stale_mirror_scenario()
         self.assertEqual(PPRM.current_positions(self.conn), [], "陈旧镜像被当成当前持仓")
         self.assertEqual(PPRM.current_held_codes(self.conn), set())
         self.assertEqual(PPRM.current_holding_keys(self.conn), set())
