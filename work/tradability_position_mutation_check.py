@@ -40,6 +40,8 @@ TEST_MODULES = (
     "test_order_cycle_identity",
     # Round-6：延迟成交的周期绑定（Blockers 1/2）。
     "test_deferred_fill_cycle_binding",
+    # Round-9：legacy paper_positions 镜像不得被重物化成 executable position。
+    "test_legacy_position_rematerialization",
 )
 
 ADAPTER = "backend/tradability_position_evidence.py"
@@ -774,6 +776,138 @@ MUTATIONS = (
         "    except Exception:\n"
         "        pass\n",        "预占释放失败被静默忽略（订单终态但资金仍被占用）",
     ),
+    # ── Round-9：legacy paper_positions 不得成为 lot creator（§23） ──────────
+    (
+        "M-LP1",
+        WRITER,
+        "    cycle_id = _active_cycle_id_readonly(conn)\n"
+        "    if cycle_id is None:\n"
+        "        return []\n"
+        "    cycle = {\"id\": cycle_id}\n",
+        "    # MUTANT M-LP1: runtime legacy-position auto-migration restored\n"
+        "    _active_cycle(conn)\n"
+        "    for _legacy in _rows(conn, \"SELECT * FROM paper_positions\"):\n"
+        "        if _num(_legacy.get(\"qty\")) > 0:\n"
+        "            conn.execute(\n"
+        "                \"INSERT INTO paper_position_lots(cycle_id,account_id,code,name,industry,qty,remaining_qty,cost,acquired_at,available_date,asset_type,is_t_base) VALUES(?,?,?,?,?,?,?,?,?,?,?,1)\",\n"
+        "                (_active_cycle_id_readonly(conn), _legacy[\"account_id\"], _legacy[\"code\"], _legacy.get(\"name\"),\n"
+        "                 _legacy.get(\"industry\"), int(_legacy[\"qty\"]), int(_legacy[\"qty\"]), _num(_legacy[\"cost\"]),\n"
+        "                 _legacy.get(\"entry_date\") or _date().isoformat(),\n"
+        "                 _legacy.get(\"available_date\") or _date().isoformat(),\n"
+        "                 _legacy.get(\"asset_type\") or \"stock_t1\"),\n"
+        "            )\n"
+        "    cycle_id = _active_cycle_id_readonly(conn)\n"
+        "    if cycle_id is None:\n"
+        "        return []\n"
+        "    cycle = {\"id\": cycle_id}\n",
+        "在 _position_rows 中恢复 runtime legacy-position 迁移",
+    ),
+    (
+        "M-LP2",
+        WRITER,
+        "    legacy_rows = _rows(conn, \"SELECT * FROM paper_positions\")\n",
+        "    # MUTANT M-LP2: mirror rows stamped into the current cycle as lots\n"
+        "    legacy_rows = _rows(conn, \"SELECT * FROM paper_positions\")\n"
+        "    for _mirror in legacy_rows:\n"
+        "        if _num(_mirror.get(\"qty\")) > 0 and not conn.execute(\n"
+        "            \"SELECT 1 FROM paper_position_lots WHERE cycle_id=? AND account_id=? AND code=? LIMIT 1\",\n"
+        "            (cycle[\"id\"], _mirror[\"account_id\"], _mirror[\"code\"]),\n"
+        "        ).fetchone():\n"
+        "            conn.execute(\n"
+        "                \"INSERT INTO paper_position_lots(cycle_id,account_id,code,name,industry,qty,remaining_qty,cost,acquired_at,available_date,asset_type,is_t_base) VALUES(?,?,?,?,?,?,?,?,?,?,?,1)\",\n"
+        "                (cycle[\"id\"], _mirror[\"account_id\"], _mirror[\"code\"], _mirror.get(\"name\"),\n"
+        "                 _mirror.get(\"industry\"), int(_mirror[\"qty\"]), int(_mirror[\"qty\"]), _num(_mirror[\"cost\"]),\n"
+        "                 _mirror.get(\"entry_date\") or _date().isoformat(),\n"
+        "                 _mirror.get(\"available_date\") or _date().isoformat(),\n"
+        "                 _mirror.get(\"asset_type\") or \"stock_t1\"),\n"
+        "            )\n",
+        "legacy 镜像行按 current active cycle 插入 lot",
+    ),
+    (
+        "M-LP3",
+        "backend/paper_portfolio.py",
+        "    legacy = {(p[\"account_id\"], p[\"code\"]): p for p in legacy_rows}\n"
+        "    out = []\n"
+        "    for key, item in grouped.items():\n",
+        "    legacy = {(p[\"account_id\"], p[\"code\"]): p for p in legacy_rows}\n"
+        "    out = []\n"
+        "    # MUTANT M-LP3: legacy-only mirror rows emitted as executable positions\n"
+        "    for _key, _row in legacy.items():\n"
+        "        if _key not in grouped and num(_row.get(\"qty\")) > 0:\n"
+        "            grouped[_key] = {\n"
+        "                \"account_id\": _row[\"account_id\"], \"code\": _row[\"code\"],\n"
+        "                \"name\": _row.get(\"name\"), \"industry\": _row.get(\"industry\") or \"未知\",\n"
+        "                \"qty\": int(num(_row.get(\"qty\"))), \"cost_amount\": num(_row.get(\"qty\")) * num(_row.get(\"cost\")),\n"
+        "                \"entry_date\": str(_row.get(\"entry_date\") or day)[:10], \"available_qty\": 0,\n"
+        "                \"locked_qty\": 0, \"asset_type\": _row.get(\"asset_type\") or \"stock_t1\",\n"
+        "                \"available_date\": _row.get(\"available_date\") or day,\n"
+        "            }\n"
+        "    for key, item in grouped.items():\n",
+        "aggregate_positions 把无 lot 的 legacy 行输出为持仓",
+    ),
+    (
+        "M-LP4",
+        WRITER,
+        "def _sync_positions(conn, account_id=None, asof_day=None):\n"
+        "    \"\"\"保留聚合表供旧接口兼容；交易结算逻辑只读取 lots。\"\"\"\n"
+        "    positions = _position_rows(conn, account_id, asof_day)\n",
+        "def _sync_positions(conn, account_id=None, asof_day=None):\n"
+        "    \"\"\"保留聚合表供旧接口兼容；交易结算逻辑只读取 lots。\"\"\"\n"
+        "    # MUTANT M-LP4: mirror rematerialized into lots before syncing\n"
+        "    _cycle = _active_cycle_id_readonly(conn)\n"
+        "    for _mirror in _rows(conn, \"SELECT * FROM paper_positions\"):\n"
+        "        if _cycle is not None and _num(_mirror.get(\"qty\")) > 0 and not conn.execute(\n"
+        "            \"SELECT 1 FROM paper_position_lots WHERE cycle_id=? AND account_id=? AND code=? LIMIT 1\",\n"
+        "            (_cycle, _mirror[\"account_id\"], _mirror[\"code\"]),\n"
+        "        ).fetchone():\n"
+        "            conn.execute(\n"
+        "                \"INSERT INTO paper_position_lots(cycle_id,account_id,code,name,industry,qty,remaining_qty,cost,acquired_at,available_date,asset_type,is_t_base) VALUES(?,?,?,?,?,?,?,?,?,?,?,1)\",\n"
+        "                (_cycle, _mirror[\"account_id\"], _mirror[\"code\"], _mirror.get(\"name\"),\n"
+        "                 _mirror.get(\"industry\"), int(_mirror[\"qty\"]), int(_mirror[\"qty\"]), _num(_mirror[\"cost\"]),\n"
+        "                 _mirror.get(\"entry_date\") or _date().isoformat(),\n"
+        "                 _mirror.get(\"available_date\") or _date().isoformat(),\n"
+        "                 _mirror.get(\"asset_type\") or \"stock_t1\"),\n"
+        "            )\n"
+        "    positions = _position_rows(conn, account_id, asof_day)\n",
+        "_sync_positions 前先 rematerialize 镜像",
+    ),
+    (
+        "M-LP5",
+        WRITER,
+        "def _shared_account_exposure(conn, quotes, asof_day=None):\n"
+        "    positions = _position_rows(conn, asof_day=asof_day)\n",
+        "def _shared_account_exposure(conn, quotes, asof_day=None):\n"
+        "    # MUTANT M-LP5: exposure read materializes lots from the mirror\n"
+        "    _cycle = _active_cycle_id_readonly(conn)\n"
+        "    for _mirror in _rows(conn, \"SELECT * FROM paper_positions\"):\n"
+        "        if _cycle is not None and _num(_mirror.get(\"qty\")) > 0 and not conn.execute(\n"
+        "            \"SELECT 1 FROM paper_position_lots WHERE cycle_id=? AND account_id=? AND code=? LIMIT 1\",\n"
+        "            (_cycle, _mirror[\"account_id\"], _mirror[\"code\"]),\n"
+        "        ).fetchone():\n"
+        "            conn.execute(\n"
+        "                \"INSERT INTO paper_position_lots(cycle_id,account_id,code,name,industry,qty,remaining_qty,cost,acquired_at,available_date,asset_type,is_t_base) VALUES(?,?,?,?,?,?,?,?,?,?,?,1)\",\n"
+        "                (_cycle, _mirror[\"account_id\"], _mirror[\"code\"], _mirror.get(\"name\"),\n"
+        "                 _mirror.get(\"industry\"), int(_mirror[\"qty\"]), int(_mirror[\"qty\"]), _num(_mirror[\"cost\"]),\n"
+        "                 _mirror.get(\"entry_date\") or _date().isoformat(),\n"
+        "                 _mirror.get(\"available_date\") or _date().isoformat(),\n"
+        "                 _mirror.get(\"asset_type\") or \"stock_t1\"),\n"
+        "            )\n"
+        "    positions = _position_rows(conn, asof_day=asof_day)\n",
+        "敞口计算触发 lot 创建",
+    ),
+    (
+        "M-LP6",
+        "backend/paper_portfolio.py",
+        "        qty = int(lot[\"remaining_qty\"])\n",
+        "        # MUTANT M-LP6: stale mirror quantity overrides the authoritative lot\n"
+        "        _mirror_qty = None\n"
+        "        for _p in legacy_rows:\n"
+        "            if (_p[\"account_id\"], _p[\"code\"]) == (lot[\"account_id\"], lot[\"code\"]):\n"
+        "                _mirror_qty = _p.get(\"qty\")\n"
+        "                break\n"
+        "        qty = int(num(_mirror_qty)) if _mirror_qty is not None else int(lot[\"remaining_qty\"])\n",
+        "陈旧镜像数量覆盖权威 lot 数量",
+    ),
 )
 
 #: 自检哨兵：只改注释。它必须 UNDETECTED —— 否则测试基线本来就是红的，
@@ -1440,6 +1574,37 @@ DESIGNATED_NON_VACUITY = {
         ".ReservationCycleMismatchEndToEnd"
         ".test_release_failure_is_not_swallowed",
     ),
+    # ── Round-9：legacy mirror 不得成为 lot / executable position（§24） ──────
+    "M-LP1": (
+        "test_legacy_position_rematerialization"
+        ".NewCycleMustNotInheritStaleMirror"
+        ".test_LP1_new_cycle_gets_no_inferred_lot",
+    ),
+    "M-LP2": (
+        "test_legacy_position_rematerialization"
+        ".NewCycleMustNotInheritStaleMirror"
+        ".test_LP1_new_cycle_gets_no_inferred_lot",
+    ),
+    "M-LP3": (
+        "test_legacy_position_rematerialization"
+        ".LegacyOnlyMirrorIsNotExecutable"
+        ".test_LP5_legacy_only_mirror_creates_nothing",
+    ),
+    "M-LP4": (
+        "test_legacy_position_rematerialization"
+        ".SyncPositionsFlowsOneWay"
+        ".test_LP4b_sync_never_builds_lots_from_mirror",
+    ),
+    "M-LP5": (
+        "test_legacy_position_rematerialization"
+        ".ExposureReadCreatesNoLot"
+        ".test_LP3_shared_account_exposure_does_not_write_lots",
+    ),
+    "M-LP6": (
+        "test_legacy_position_rematerialization"
+        ".LegacyMetadataCompatibility"
+        ".test_LP7_authoritative_lot_qty_beats_stale_mirror_qty",
+    ),
 }
 
 
@@ -1512,6 +1677,18 @@ def non_vacuity() -> int:
 
 def main(argv=None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
+    only = None
+    if "--only" in argv:
+        idx = argv.index("--only")
+        raw = argv[idx + 1] if idx + 1 < len(argv) else ""
+        only = {token.strip() for token in raw.split(",") if token.strip()}
+        if not only:
+            print("--only requires a comma-separated list of mutation ids")
+            return 2
+        unknown = only - {entry[0] for entry in MUTATIONS}
+        if unknown:
+            print(f"--only names unknown mutations: {sorted(unknown)}")
+            return 2
     leftover = assert_no_leftover_mutants()
     if leftover:
         return leftover
@@ -1534,25 +1711,36 @@ def main(argv=None) -> int:
     if locked:
         return locked
     try:
-        return _run_matrix()
+        return _run_matrix(only=only)
     finally:
         release_run_lock()
 
 
-def _run_matrix() -> int:
-    if not baseline_is_green():
-        print("baseline contract tests are not green; refusing to run the matrix")
-        return 1
+def _run_matrix(only=None) -> int:
+    """运行变异矩阵。
 
+    ``only`` 给出变异 id 集合时只跑这些条目，供**隔离 worktree 里的并发 worker**
+    使用：每个 worker 拿到一个不相交的子集，各自在自己的 worktree 里改写源码，
+    因此「矩阵运行期间不得并行跑测试」这条铁律仍然成立（没有两个进程共享同一份
+    源码）。子集模式跳过 sanity 与 baseline 自检 —— 那两项由主进程跑一次即可，
+    20 个 worker 各跑一遍纯属浪费。
+    """
+    entries = [e for e in MUTATIONS if only is None or e[0] in only]
+    if only is None:
+        if not baseline_is_green():
+            print("baseline contract tests are not green; refusing to run the matrix")
+            return 1
     results = []
-    sanity = apply_and_run(SANITY_MUTATION)
-    print(f"S0 sanity: {sanity} (expected UNDETECTED)")
-    for entry in MUTATIONS:
+    sanity = "UNDETECTED"
+    if only is None:
+        sanity = apply_and_run(SANITY_MUTATION)
+        print(f"S0 sanity: {sanity} (expected UNDETECTED)")
+    for entry in entries:
         outcome = apply_and_run(entry)
         print(f"{entry[0]}: {outcome}  ({entry[4]})")
         results.append((entry[0], outcome))
 
-    equivalent = verify_equivalent()
+    equivalent = verify_equivalent() if only is None else 0
 
     print("\n=== mutation matrix summary ===")
     for name, outcome in results:
@@ -1566,9 +1754,9 @@ def _run_matrix() -> int:
             print(f"  {name} 登记为等价变异（见 verify_equivalent 的证明）")
 
     complete = (
-        len(results) == len(MUTATIONS)
+        len(results) == len(entries)
         and not survived
-        and sanity == "UNDETECTED"
+        and (only is not None or sanity == "UNDETECTED")
         and equivalent == 0
     )
     print("mutation matrix: " + ("PASS" if complete else "FAIL"))
