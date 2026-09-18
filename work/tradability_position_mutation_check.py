@@ -38,6 +38,8 @@ TEST_MODULES = (
     # v18 订单周期归属：迁移/guard/order-writer 与跨周期身份契约。
     "test_order_cycle_provenance",
     "test_order_cycle_identity",
+    # Round-6：延迟成交的周期绑定（Blockers 1/2）。
+    "test_deferred_fill_cycle_binding",
 )
 
 ADAPTER = "backend/tradability_position_evidence.py"
@@ -476,10 +478,11 @@ MUTATIONS = (
     (
         "M-OC5",
         WRITER,
-        "    order_cycle = _order_cycle_id_for_order(conn, order_id) if order_id is not None else None\n"
-        "    cycle_id = order_cycle if order_cycle is not None else _order_cycle_id(conn, cycle_id)\n",
-        "    # MUTANT M-OC5: lot ignores its source buy order's cycle\n"
-        "    cycle_id = _order_cycle_id(conn, cycle_id)\n",
+        "    if order_id is not None:\n"
+        "        prov = _order_cycle_provenance_for_order(conn, order_id)\n"
+        "        if not prov.is_proven:\n",
+        "    # MUTANT M-OC5: lot falls back to the active cycle for a legacy order\n"
+        "    if False:\n",
         "BUY lot 不继承来源订单 cycle（订单与 lot 可跨周期）",
     ),
     (
@@ -511,6 +514,96 @@ MUTATIONS = (
         "        if False:\n"
         "            return \"excluded\"\n",
         "同日 cycle 边界退回 date-only 比较（时刻精度丢失）",
+    ),
+    (
+        "M-CF1",
+        "backend/paper_trading.py",
+        "    if order_id is not None:\n"
+        "        prov = _order_cycle_provenance_for_order(conn, order_id)\n"
+        "        if not prov.is_proven:\n"
+        "            raise OrderCycleProvenanceUnknown(\n"
+        "                order_id, prov.status,\n"
+        "                \"来源买单的周期归属不可证明；拒绝创建带确定周期的新 lot\",\n"
+        "            )\n"
+        "        cycle_id = prov.cycle_id\n"
+        "    else:\n"
+        "        cycle_id = _order_cycle_id(conn, cycle_id)\n",
+        "    order_cycle = _order_cycle_id_for_order(conn, order_id) if order_id is not None else None\n"
+        "    cycle_id = order_cycle if order_cycle is not None else _order_cycle_id(conn, cycle_id)\n",
+        "legacy order 的 lot 回退到当前 active cycle",
+    ),
+    (
+        "M-CF2",
+        "backend/execution_planner.py",
+        "        consumed, cost_amount = PT._consume_available_lots(\n"
+        "            conn, account_id, code, qty, asof_day, cycle_id=order_cycle_id,\n"
+        "        )\n",
+        "        consumed, cost_amount = PT._consume_available_lots(conn, account_id, code, qty, asof_day)\n",
+        "SELL 成交不把订单周期传给 FIFO 消耗",
+    ),
+    (
+        "M-CF3",
+        "backend/execution_planner.py",
+        "    if not provenance.is_proven:\n"
+        "        raise PT.OrderCycleProvenanceUnknown(\n"
+        "            order_id, provenance.status,\n"
+        "            f\"{side} 成交被拒绝：订单周期归属不可证明\",\n"
+        "        )\n",
+        "    if False:\n"
+        "        raise PT.OrderCycleProvenanceUnknown(order_id, provenance.status)\n",
+        "post-v18 订单缺 cycle 仍允许成交",
+    ),
+    (
+        "M-CF4",
+        "backend/paper_trading.py",
+        "    if order_id is not None:\n"
+        "        prov = _order_cycle_provenance_for_order(conn, order_id)\n"
+        "        if not prov.is_proven:\n"
+        "            raise OrderCycleProvenanceUnknown(\n"
+        "                order_id, prov.status,\n"
+        "                \"来源买单的周期归属不可证明；拒绝创建带确定周期的新 lot\",\n"
+        "            )\n"
+        "        cycle_id = prov.cycle_id\n",
+        "    cycle_id = _order_cycle_id(conn, cycle_id)\n",
+        "BUY lot 不继承订单周期，改用当前 active cycle",
+    ),
+    (
+        "M-CF5",
+        "backend/execution_planner.py",
+        "    order_cycle_id = provenance.cycle_id\n",
+        "    order_cycle_id = PT._order_cycle_id(conn)\n",
+        "SELL 用当前 active cycle 而非订单周期",
+    ),
+    (
+        "M-CF6",
+        "backend/paper_trading.py",
+        "        if not same:\n"
+        "            # 跨周期 ⇒ 终止血缘，新订单作为独立尝试写入（不带 retry_of_order_id）。\n"
+        "            return None\n",
+        "",
+        "跨周期 retry lineage 被静默接受",
+    ),
+    (
+        "M-CF7",
+        "backend/paper_trading.py",
+        "    if cycle_id is None:\n"
+        "        raise OrderCycleProvenanceUnknown(\n"
+        "            None, ORDER_CYCLE_ORDER_MISSING,\n"
+        "            \"lot 消耗必须由来源订单显式提供周期；拒绝回退到当前 active cycle\",\n"
+        "        )\n",
+        "    cycle_id = _order_cycle_id(conn, cycle_id)\n",
+        "匿名 lot 消耗回退到当前 active cycle",
+    ),
+    (
+        "M-CF8",
+        "backend/execution_planner.py",
+        "    if mismatches:\n"
+        "        raise RuntimeError(\n"
+        "            f\"order identity mismatch for order_id={order_id}: \" + \"; \".join(mismatches)\n"
+        "        )\n",
+        "    if False:\n"
+        "        raise RuntimeError('order identity mismatch')\n",
+        "订单身份冲突被静默接受",
     ),
 )
 
@@ -1069,6 +1162,46 @@ DESIGNATED_NON_VACUITY = {
         "test_order_cycle_identity"
         ".ExactTimeFallbackTests"
         ".test_TIME_CYCLE_2_competitor_ended_before_the_sell_is_excluded",
+    ),
+    "M-CF1": (
+        "test_deferred_fill_cycle_binding"
+        ".PrimitiveGuardsAreReachableDirectly"
+        ".test_record_lot_refuses_a_legacy_source_order",
+    ),
+    "M-CF2": (
+        "test_deferred_fill_cycle_binding"
+        ".PendingSellStaysInItsOwnCycle"
+        ".test_R1_pending_sell_consumes_only_its_own_cycle",
+    ),
+    "M-CF3": (
+        "test_deferred_fill_cycle_binding"
+        ".ProvenancePrecheckHappensBeforeAnyMutation"
+        ".test_legacy_buy_is_rejected_before_any_side_effect",
+    ),
+    "M-CF4": (
+        "test_deferred_fill_cycle_binding"
+        ".PendingSellStaysInItsOwnCycle"
+        ".test_R1_pending_sell_consumes_only_its_own_cycle",
+    ),
+    "M-CF5": (
+        "test_deferred_fill_cycle_binding"
+        ".PendingSellStaysInItsOwnCycle"
+        ".test_R1_pending_sell_consumes_only_its_own_cycle",
+    ),
+    "M-CF6": (
+        "test_deferred_fill_cycle_binding"
+        ".RetryLineageHardConstraint"
+        ".test_cross_cycle_retry_does_not_inherit_lineage",
+    ),
+    "M-CF7": (
+        "test_deferred_fill_cycle_binding"
+        ".PrimitiveGuardsAreReachableDirectly"
+        ".test_consume_lots_refuses_a_missing_cycle",
+    ),
+    "M-CF8": (
+        "test_deferred_fill_cycle_binding"
+        ".OrderIdentityMismatchFailsClosed"
+        ".test_code_mismatch_is_rejected",
     ),
 }
 

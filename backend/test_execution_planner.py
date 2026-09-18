@@ -19,6 +19,8 @@ import execution_planner as EP
 BACKEND_DIR = os.path.dirname(os.path.abspath(__file__))
 NOW = "2026-09-08 10:00:00"
 LATE = "2026-09-08 15:00:00"
+#: 替身订单与 lot 共用的 durable 周期（v18 write-time fact）。
+ORDER_CYCLE = 8
 
 
 def _order_row(**overrides):
@@ -31,10 +33,42 @@ def _order_row(**overrides):
         "created_at": NOW, "executed_at": NOW, "order_type": "limit",
         "origin": "strategy", "expires_at": None, "cancelled_at": None,
         "strategy_id": None, "strategy_version": None, "strategy_checksum": None,
-        "retry_of_order_id": None,
+        "retry_of_order_id": None, "cycle_id": ORDER_CYCLE,
     }
     row.update(overrides)
     return row
+
+
+def _provenance(order_cycle=ORDER_CYCLE, *, proven=True, status=None, exists=True):
+    """``paper_trading._order_cycle_provenance_for_order`` 的替身结论。
+
+    成交路径现在必须先证明订单的周期归属；替身必须能给出**四态**中的任意一种，
+    否则「legacy NULL 必须 fail closed」这类契约在替身下无法被测试。
+    """
+    import paper_trading as PT
+
+    if proven:
+        return PT.OrderCycleProvenance(True, True, order_cycle, PT.ORDER_CYCLE_PROVEN)
+    return PT.OrderCycleProvenance(
+        exists, True, None, status or PT.ORDER_CYCLE_LEGACY_UNKNOWN,
+    )
+
+
+def _cycle_stub_kwargs(order_cycle=ORDER_CYCLE, *, proven=True, status=None,
+                       exists=True):
+    """注入到 paper_trading 替身里的周期归属成员。"""
+    import paper_trading as PT
+
+    return {
+        "_order_cycle_provenance_for_order": (
+            lambda conn, order_id: _provenance(
+                order_cycle, proven=proven, status=status, exists=exists,
+            )
+        ),
+        "OrderCycleProvenanceUnknown": PT.OrderCycleProvenanceUnknown,
+        "ORDER_CYCLE_PROVEN": PT.ORDER_CYCLE_PROVEN,
+        "ORDER_CYCLE_LEGACY_UNKNOWN": PT.ORDER_CYCLE_LEGACY_UNKNOWN,
+    }
 
 
 def _fill_row(**overrides):
@@ -67,18 +101,31 @@ class _FakeResult:
 class _FakeConn:
     """Records the queries this planner makes, including the verification read-back.
 
-    ``commit_fill`` stamps the execution-verification verdict after writing the
-    fill row, which means it reads the order back and lists its fill rows. The
-    double therefore answers three shapes: the signal-interest count, the
-    ``paper_orders`` row, and the ``paper_fills`` rows.
+    ``commit_fill`` 现在还会：读订单的 durable 周期归属（读取被注入的
+    ``_order_cycle_provenance_for_order``，不经此替身）、校验订单身份
+    （``SELECT account_id, code, side FROM paper_orders WHERE id=?``），并在写入
+    成交后盖章（读回订单与其 fill 行）。替身因此要回答 ``paper_orders`` 行、
+    ``paper_fills`` 行、身份三元组、以及信号关注度计数。
     """
 
-    def __init__(self, interest=0, raises=False, order_row=None, fill_rows=()):
+    def __init__(self, interest=0, raises=False, order_row=None, fill_rows=(),
+                 identity=None):
         self.interest = interest
         self.raises = raises
         self.queries = []
         self.order_row = order_row
         self.fill_rows = list(fill_rows)
+        #: ``(account_id, code, side)``；缺省从 ``order_row`` 推导，保持身份自洽。
+        self.identity = identity
+
+    def _identity_row(self):
+        if self.identity is not None:
+            return self.identity
+        row = self.order_row
+        if not row:
+            return ("tq_breakout", "002241", "buy")
+        get = row.get if isinstance(row, dict) else (lambda k, d=None: d)
+        return (get("account_id"), get("code"), get("side"))
 
     def execute(self, sql, params=()):
         self.queries.append((sql, tuple(params)))
@@ -87,6 +134,8 @@ class _FakeConn:
         text = " ".join(str(sql).split()).lower()
         if text.startswith("select * from paper_fills"):
             return _FakeResult(rows=self.fill_rows)
+        if text.startswith("select account_id, code, side from paper_orders"):
+            return _FakeResult(row=self._identity_row())
         if text.startswith("select * from paper_orders where id"):
             return _FakeResult(row=self.order_row)
         return _FakeResult(self.interest)
@@ -100,6 +149,7 @@ def _pt_stub(now=NOW, statuses=("pending", "waitlist", "retry")):
         MAIN_FORCE_STRATEGY_ID="main_force_top10",
         NEW_STRATEGY_ID="reported_profit_breakout",
         _num=lambda value, default=0.0: default if value in (None, "") else float(value),
+        **_cycle_stub_kwargs(),
     )
 
 
@@ -282,9 +332,10 @@ class CommitFillTests(_StubbedPlannerTest):
                 ("debit", round(value, 2))),
             _finish_capital_reservation=lambda conn, order_id, status: calls.append(
                 ("reservation", status)),
-            _record_lot=lambda conn, account, plan, qty, price, day, order_id, is_t_base=True, fees=0.0: calls.append(
-                ("lot", qty)),
-            _consume_available_lots=lambda conn, account_id, code, qty, day: (qty, 0.0),
+            _record_lot=lambda conn, account, plan, qty, price, day, order_id, is_t_base=True, fees=0.0,
+            cycle_id=None: calls.append(("lot", qty, cycle_id)),
+            _consume_available_lots=lambda conn, account_id, code, qty, day, cycle_id=None: (
+                calls.append(("consume_cycle", cycle_id)), (qty, 0.0))[1],
             _credit_shared_cash=lambda conn, value, account_id=None: calls.append(("credit", value)),
             _json=lambda value: value,
             _now=lambda: NOW,
@@ -293,6 +344,7 @@ class CommitFillTests(_StubbedPlannerTest):
             _risk_log=lambda *args, **kwargs: calls.append(("risk_log", args[5])),
             _audit=lambda *args, **kwargs: calls.append(("audit", args[2], args[3])),
             _sync_positions=lambda conn, account_id, day: calls.append(("sync",)),
+            **_cycle_stub_kwargs(),
         )
         conn = _FakeConn(
             order_row=_order_row(),
@@ -327,7 +379,9 @@ class CommitFillTests(_StubbedPlannerTest):
             _debit_shared_cash=lambda conn, value, preferred_account_id=None: calls.append(("debit",)),
             _finish_capital_reservation=lambda conn, order_id, status: calls.append(("reservation", status)),
             _record_lot=lambda *args, **kwargs: calls.append(("lot",)),
-            _consume_available_lots=lambda conn, account_id, code, qty, day: (qty, 0.0),
+            _consume_available_lots=lambda conn, account_id, code, qty, day, cycle_id=None: (
+                None or (qty, 0.0)),
+            **_cycle_stub_kwargs(),
             _credit_shared_cash=lambda *args, **kwargs: calls.append(("credit",)),
             _json=lambda value: value,
             _now=lambda: NOW,
@@ -361,7 +415,7 @@ class CommitFillTests(_StubbedPlannerTest):
             _debit_shared_cash=lambda conn, value, preferred_account_id=None: None,
             _finish_capital_reservation=lambda conn, order_id, status: None,
             _record_lot=lambda *args, **kwargs: None,
-            _consume_available_lots=lambda conn, account_id, code, qty, day: (qty, 0.0),
+            _consume_available_lots=lambda conn, account_id, code, qty, day, cycle_id=None: (qty, 0.0),
             _credit_shared_cash=lambda *args, **kwargs: None,
             _json=lambda value: value,
             _now=lambda: NOW,
@@ -370,6 +424,7 @@ class CommitFillTests(_StubbedPlannerTest):
             _risk_log=lambda *args, **kwargs: calls.append(("risk_log",)),
             _audit=lambda *args, **kwargs: calls.append(("audit",)),
             _sync_positions=lambda conn, account_id, day: None,
+            **_cycle_stub_kwargs(),
         )
         plan = {
             "side": "buy", "code": "002241", "qty": 100, "amount": 1000.0,
@@ -404,7 +459,7 @@ class CommitFillTests(_StubbedPlannerTest):
             _debit_shared_cash=lambda *args, **kwargs: None,
             _finish_capital_reservation=lambda *args, **kwargs: None,
             _record_lot=lambda *args, **kwargs: None,
-            _consume_available_lots=lambda conn, account_id, code, qty, day: (qty - 100, 0.0),
+            _consume_available_lots=lambda conn, account_id, code, qty, day, cycle_id=None: (qty - 100, 0.0),
             _credit_shared_cash=lambda *args, **kwargs: None,
             _json=lambda value: value,
             _now=lambda: NOW,
@@ -413,6 +468,7 @@ class CommitFillTests(_StubbedPlannerTest):
             _risk_log=lambda *args, **kwargs: None,
             _audit=lambda *args, **kwargs: None,
             _sync_positions=lambda *args, **kwargs: None,
+            **_cycle_stub_kwargs(),
         )
         plan = {"side": "sell", "code": "002241", "qty": 200, "amount": 4000.0,
                 "fees": 4.0, "fill_price": 20.0, "quote_at": None, "risk": {}}
