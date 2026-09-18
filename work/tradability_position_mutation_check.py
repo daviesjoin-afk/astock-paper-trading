@@ -42,6 +42,8 @@ TEST_MODULES = (
     "test_deferred_fill_cycle_binding",
     # Round-9：legacy paper_positions 镜像不得被重物化成 executable position。
     "test_legacy_position_rematerialization",
+    # Round-10：当前持仓消费者必须走权威 lot（cycle-scoped）。
+    "test_authoritative_position_consumers",
 )
 
 ADAPTER = "backend/tradability_position_evidence.py"
@@ -49,6 +51,8 @@ SHADOW = "backend/tradability_position_shadow.py"
 #: v18 订单周期归属：迁移/guard 与生产订单写入口（供 M-OC* 变异使用）。
 MIGRATIONS = "backend/paper_schema_migrations.py"
 WRITER = "backend/paper_trading.py"
+#: Round-10 当前持仓权威读取器（唯一实现）。
+READ_MODEL = "backend/paper_position_read_model.py"
 
 # (id, 目标文件, 变异前, 变异后, 说明)
 MUTATIONS = (
@@ -779,43 +783,58 @@ MUTATIONS = (
     # ── Round-9：legacy paper_positions 不得成为 lot creator（§23） ──────────
     (
         "M-LP1",
-        WRITER,
-        "    cycle_id = _active_cycle_id_readonly(conn)\n"
+        READ_MODEL,
+        "    cycle_id = active_cycle_id(conn)\n"
         "    if cycle_id is None:\n"
         "        return []\n"
-        "    cycle = {\"id\": cycle_id}\n",
+        "    day = _date(asof_day).isoformat()\n"
+        "    sql = \"SELECT * FROM paper_position_lots WHERE cycle_id=? AND remaining_qty>0\"\n"
+        "    params = [cycle_id]\n"
+        "    if account_id:\n"
+        "        sql += \" AND account_id=?\"\n"
+        "        params.append(account_id)\n",
         "    # MUTANT M-LP1: runtime legacy-position auto-migration restored\n"
-        "    _active_cycle(conn)\n"
-        "    for _legacy in _rows(conn, \"SELECT * FROM paper_positions\"):\n"
-        "        if _num(_legacy.get(\"qty\")) > 0:\n"
+        "    for _legacy in _dicts(conn.execute(\"SELECT * FROM paper_positions\").fetchall()):\n"
+        "        if _num(_legacy.get(\"qty\")) > 0 and not conn.execute(\n"
+        "            \"SELECT 1 FROM paper_position_lots WHERE cycle_id=? AND account_id=? AND code=? LIMIT 1\",\n"
+        "            (cycle_id, _legacy[\"account_id\"], _legacy[\"code\"]),\n"
+        "        ).fetchone():\n"
         "            conn.execute(\n"
         "                \"INSERT INTO paper_position_lots(cycle_id,account_id,code,name,industry,qty,remaining_qty,cost,acquired_at,available_date,asset_type,is_t_base) VALUES(?,?,?,?,?,?,?,?,?,?,?,1)\",\n"
-        "                (_active_cycle_id_readonly(conn), _legacy[\"account_id\"], _legacy[\"code\"], _legacy.get(\"name\"),\n"
+        "                (cycle_id, _legacy[\"account_id\"], _legacy[\"code\"], _legacy.get(\"name\"),\n"
         "                 _legacy.get(\"industry\"), int(_legacy[\"qty\"]), int(_legacy[\"qty\"]), _num(_legacy[\"cost\"]),\n"
         "                 _legacy.get(\"entry_date\") or _date().isoformat(),\n"
         "                 _legacy.get(\"available_date\") or _date().isoformat(),\n"
         "                 _legacy.get(\"asset_type\") or \"stock_t1\"),\n"
         "            )\n"
-        "    cycle_id = _active_cycle_id_readonly(conn)\n"
-        "    if cycle_id is None:\n"
-        "        return []\n"
-        "    cycle = {\"id\": cycle_id}\n",
-        "在 _position_rows 中恢复 runtime legacy-position 迁移",
+        "    day = _date(asof_day).isoformat()\n"
+        "    sql = \"SELECT * FROM paper_position_lots WHERE cycle_id=? AND remaining_qty>0\"\n"
+        "    params = [cycle_id]\n"
+        "    if account_id:\n"
+        "        sql += \" AND account_id=?\"\n"
+        "        params.append(account_id)\n",
+        "在 current_positions 中恢复 runtime legacy-position 迁移",
     ),
     (
         "M-LP2",
-        WRITER,
-        "    legacy_rows = _rows(conn, \"SELECT * FROM paper_positions\")\n",
+        READ_MODEL,
+        "    try:\n"
+        "        legacy_rows = _dicts(conn.execute(\"SELECT * FROM paper_positions\").fetchall())\n"
+        "    except sqlite3.Error:\n"
+        "        legacy_rows = []\n",
         "    # MUTANT M-LP2: mirror rows stamped into the current cycle as lots\n"
-        "    legacy_rows = _rows(conn, \"SELECT * FROM paper_positions\")\n"
+        "    try:\n"
+        "        legacy_rows = _dicts(conn.execute(\"SELECT * FROM paper_positions\").fetchall())\n"
+        "    except sqlite3.Error:\n"
+        "        legacy_rows = []\n"
         "    for _mirror in legacy_rows:\n"
         "        if _num(_mirror.get(\"qty\")) > 0 and not conn.execute(\n"
         "            \"SELECT 1 FROM paper_position_lots WHERE cycle_id=? AND account_id=? AND code=? LIMIT 1\",\n"
-        "            (cycle[\"id\"], _mirror[\"account_id\"], _mirror[\"code\"]),\n"
+        "            (cycle_id, _mirror[\"account_id\"], _mirror[\"code\"]),\n"
         "        ).fetchone():\n"
         "            conn.execute(\n"
         "                \"INSERT INTO paper_position_lots(cycle_id,account_id,code,name,industry,qty,remaining_qty,cost,acquired_at,available_date,asset_type,is_t_base) VALUES(?,?,?,?,?,?,?,?,?,?,?,1)\",\n"
-        "                (cycle[\"id\"], _mirror[\"account_id\"], _mirror[\"code\"], _mirror.get(\"name\"),\n"
+        "                (cycle_id, _mirror[\"account_id\"], _mirror[\"code\"], _mirror.get(\"name\"),\n"
         "                 _mirror.get(\"industry\"), int(_mirror[\"qty\"]), int(_mirror[\"qty\"]), _num(_mirror[\"cost\"]),\n"
         "                 _mirror.get(\"entry_date\") or _date().isoformat(),\n"
         "                 _mirror.get(\"available_date\") or _date().isoformat(),\n"
@@ -907,6 +926,106 @@ MUTATIONS = (
         "                break\n"
         "        qty = int(num(_mirror_qty)) if _mirror_qty is not None else int(lot[\"remaining_qty\"])\n",
         "陈旧镜像数量覆盖权威 lot 数量",
+    ),
+    # ── Round-10：当前持仓消费者必须走权威 lot（§23） ────────────────────────
+    (
+        "M-PC1",
+        "backend/news_learning.py",
+        "            for row in PPRM.current_holding_rows(paper):\n"
+        "                items.append({**row, \"pool_tier\": \"holding\",\n"
+        "                              \"rank_no\": 0, \"source\": \"paper_position_lots\"})\n",
+        "            # MUTANT M-PC1: news_learning back to the raw projection\n"
+        "            for row in paper.execute(\n"
+        "                \"SELECT code,name,industry,account_id FROM paper_positions WHERE qty>0\"\n"
+        "            ):\n"
+        "                items.append({**dict(row), \"pool_tier\": \"holding\",\n"
+        "                              \"rank_no\": 0, \"source\": \"paper_positions\"})\n",
+        "news_learning 恢复直接 SELECT paper_positions 当 holding",
+    ),
+    (
+        "M-PC2",
+        READ_MODEL,
+        "    cycle_id = active_cycle_id(conn)\n"
+        "    if cycle_id is None:\n"
+        "        return []\n"
+        "    day = _date(asof_day).isoformat()\n",
+        "    # MUTANT M-PC2: cycle filter dropped (every cycle pooled)\n"
+        "    cycle_id = active_cycle_id(conn)\n"
+        "    if cycle_id is None:\n"
+        "        return []\n"
+        "    cycle_id = None\n"
+        "    day = _date(asof_day).isoformat()\n",
+        "current position reader 忽略 cycle filter",
+    ),
+    (
+        "M-PC3",
+        READ_MODEL,
+        "    cycle_id = active_cycle_id(conn)\n"
+        "    if cycle_id is None:\n"
+        "        return []\n"
+        "    day = _date(asof_day).isoformat()\n"
+        "    sql = \"SELECT * FROM paper_position_lots WHERE cycle_id=? AND remaining_qty>0\"\n",
+        "    # MUTANT M-PC3: no active cycle falls back to the projection\n"
+        "    cycle_id = active_cycle_id(conn)\n"
+        "    if cycle_id is None:\n"
+        "        _fb = _dicts(conn.execute(\"SELECT * FROM paper_positions\").fetchall())\n"
+        "        return [dict(r) for r in _fb]\n"
+        "    day = _date(asof_day).isoformat()\n"
+        "    sql = \"SELECT * FROM paper_position_lots WHERE cycle_id=? AND remaining_qty>0\"\n",
+        "无 active cycle 时 fallback paper_positions",
+    ),
+    (
+        "M-PC4",
+        "backend/rebalance_scanner.py",
+        "            held_codes = PPRM.current_held_codes(conn, account_id=account_id)\n",
+        "            # MUTANT M-PC4: held_codes back to the raw projection\n"
+        "            _hr = conn.execute(\"SELECT code FROM paper_positions WHERE account_id=?\", (account_id,)).fetchall()\n"
+        "            held_codes = {str(r[0]) for r in _hr}\n",
+        "rebalance held_codes 恢复读 mirror",
+    ),
+    (
+        "M-PC5",
+        "backend/adaptive_engine.py",
+        "        positions = PPRM.current_positions(paper)\n",
+        "        # MUTANT M-PC5: shadow portfolio back to the raw projection\n"
+        "        positions = [dict(row) for row in paper.execute(\n"
+        "            \"SELECT account_id,code,name,industry,qty,cost FROM paper_positions WHERE qty>0\"\n"
+        "        )]\n",
+        "adaptive shadow 恢复 mirror 当前组合",
+    ),
+    (
+        "M-PC6",
+        "backend/paper_portfolio.py",
+        "        qty = int(lot[\"remaining_qty\"])\n",
+        "        # MUTANT M-PC6: stale mirror quantity overrides the authoritative lot\n"
+        "        _mq = None\n"
+        "        for _p in legacy_rows:\n"
+        "            if (_p[\"account_id\"], _p[\"code\"]) == (lot[\"account_id\"], lot[\"code\"]):\n"
+        "                _mq = _p.get(\"qty\")\n"
+        "                break\n"
+        "        qty = int(num(_mq)) if _mq is not None else int(lot[\"remaining_qty\"])\n",
+        "mirror qty 覆盖 lot remaining_qty",
+    ),
+    (
+        "M-PC7",
+        READ_MODEL,
+        "def active_cycle_id(conn) -> int | None:\n",
+        "def active_cycle_id(conn) -> int | None:\n"
+        "    # MUTANT M-PC7: read path may create a cycle (write during a read)\n"
+        "    try:\n"
+        "        _r = conn.execute(\n"
+        "            \"SELECT id FROM paper_cycles WHERE status IN ('draft','running','paused')\"\n"
+        "            \" ORDER BY id DESC LIMIT 1\"\n"
+        "        ).fetchone()\n"
+        "        if _r is None:\n"
+        "            conn.execute(\n"
+        "                \"INSERT INTO paper_cycles(cycle_key,status,capital,risk_profile,created_at,updated_at)\"\n"
+        "                \" VALUES('mutant','paused',100000.0,'shared_pool','2026-01-01','2026-01-01')\"\n"
+        "            )\n"
+        "            conn.commit()\n"
+        "    except sqlite3.Error:\n"
+        "        pass\n",
+        "current-position read 调用会创建周期",
     ),
 )
 
@@ -1604,6 +1723,42 @@ DESIGNATED_NON_VACUITY = {
         "test_legacy_position_rematerialization"
         ".LegacyMetadataCompatibility"
         ".test_LP7_authoritative_lot_qty_beats_stale_mirror_qty",
+    ),
+    # ── Round-10：当前持仓消费者必须走权威 lot（§23） ────────────────────────
+    "M-PC1": (
+        "test_authoritative_position_consumers"
+        ".NewsLearningHoldingTier"
+        ".test_PC1_stale_mirror_is_not_holding",
+    ),
+    "M-PC2": (
+        "test_authoritative_position_consumers"
+        ".CycleIsolation"
+        ".test_only_current_cycle_positions",
+    ),
+    "M-PC3": (
+        "test_authoritative_position_consumers"
+        ".NoActiveCycleFailsClosed"
+        ".test_no_active_cycle_returns_empty_and_creates_nothing",
+    ),
+    "M-PC4": (
+        "test_authoritative_position_consumers"
+        ".RebalanceHeldCodes"
+        ".test_PC4_stale_mirror_does_not_exclude",
+    ),
+    "M-PC5": (
+        "test_authoritative_position_consumers"
+        ".AdaptiveShadowPortfolio"
+        ".test_PC6_stale_mirror_excluded_from_shadow_portfolio",
+    ),
+    "M-PC6": (
+        "test_authoritative_position_consumers"
+        ".LegacyMetadataCompatibility"
+        ".test_mirror_qty_cost_entry_date_cannot_override_lot",
+    ),
+    "M-PC7": (
+        "test_authoritative_position_consumers"
+        ".NoActiveCycleFailsClosed"
+        ".test_no_active_cycle_returns_empty_and_creates_nothing",
     ),
 }
 

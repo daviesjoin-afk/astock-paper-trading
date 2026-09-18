@@ -21,6 +21,7 @@ import datetime as dt
 import json
 
 import execution_verification as EV
+import paper_position_read_model as PPRM
 
 # ─── 调仓参数 ───
 REBALANCE_VERSION = "daily-rebalance-v2"
@@ -836,13 +837,10 @@ def find_replacement_candidates(conn, account_id, sold_code, quotes, factor_tabl
     # 2. 如果等待池没有候选，从因子表中找
     if not candidates and factor_table is not None:
         try:
-            # 获取已持仓和已拒绝的代码
-            held_codes = set()
-            held_rows = conn.execute(
-                "SELECT code FROM paper_positions WHERE account_id=?",
-                (account_id,)
-            ).fetchall()
-            held_codes = {str(r[0]) for r in held_rows}
+            # 获取已持仓和已拒绝的代码。「已持仓」必须是**当前 active cycle**
+            # 的权威 lot：paper_positions 是投影，旧周期残留镜像行会让一个本已
+            # 不持有的代码被错误排除在替补候选之外。
+            held_codes = PPRM.current_held_codes(conn, account_id=account_id)
 
             rejected_rows = conn.execute(
                 """SELECT code FROM paper_signals

@@ -43,6 +43,7 @@ def _get_se():
 
 import paper_storage as PST
 import paper_portfolio as PP
+import paper_position_read_model as PPRM
 import paper_repository as PRP
 import paper_performance as PPerf
 import paper_schema_migrations as PSM
@@ -3361,6 +3362,10 @@ def _position_rows(conn, account_id=None, asof_day=None, readonly=False):
 
     **读模型：绝不创建 executable position facts。**
 
+    实现已抽到 :mod:`paper_position_read_model` —— 当前持仓只有一个实现，
+    ``news_learning`` / ``rebalance_scanner`` / ``adaptive_engine`` 共用它，
+    不再各自写一份 ``SELECT ... FROM paper_positions``。
+
     ``readonly`` 只控制调用方是否已经持有写锁（读面板走只读快照），两条分支的
     **语义完全一致**：都只读 ``paper_position_lots`` 与 ``paper_positions``，
     不写任何表。
@@ -3381,39 +3386,7 @@ def _position_rows(conn, account_id=None, asof_day=None, readonly=False):
         # on both paths - `readonly` only documents that the caller holds a
         # read-only snapshot.
         pass
-    cycle_id = _active_cycle_id_readonly(conn)
-    if cycle_id is None:
-        return []
-    cycle = {"id": cycle_id}
-    day = _date(asof_day).isoformat()
-    sql = "SELECT * FROM paper_position_lots WHERE cycle_id=? AND remaining_qty>0"
-    params = [cycle["id"]]
-    if account_id:
-        sql += " AND account_id=?"
-        params.append(account_id)
-    lots = _rows(conn, sql, tuple(params))
-    legacy_rows = _rows(conn, "SELECT * FROM paper_positions")
-    # 终端展示常用“摊薄成本”：已卖出部分的净回款抵减尚未卖出仓位成本。
-    # 风控、卖出结转仍使用下面的 FIFO settlement_cost，不能用摊薄成本替代。
-    cash_flows = {
-        (row["account_id"], row["code"]): row
-        for row in _rows(
-            conn,
-            """SELECT account_id,code,
-                      SUM(CASE WHEN side='buy' THEN COALESCE(amount,0)+COALESCE(fees,0) ELSE 0 END) AS buy_cash,
-                      SUM(CASE WHEN side='sell' THEN COALESCE(amount,0)-COALESCE(fees,0) ELSE 0 END) AS sell_cash
-                 FROM paper_orders WHERE status='filled' AND """
-            + _execution_verified_predicate()
-            + " GROUP BY account_id,code",
-        )
-    }
-    return PP.aggregate_positions(
-        lots,
-        legacy_rows,
-        cash_flows,
-        day,
-        num=_num,
-    )
+    return PPRM.current_positions(conn, account_id=account_id, asof_day=asof_day)
 
 
 # 今日盈亏可接受的报价来源白名单。dashboard_cache 是 overview 读模型从

@@ -10,6 +10,7 @@ from fastapi import APIRouter, HTTPException, Query
 
 import adaptive_engine as adaptive
 import adaptive_learning_dispatch as learning_dispatch
+import paper_position_read_model as PPRM
 import self_evolution as SE
 
 
@@ -581,7 +582,10 @@ def run_rebalance_scan(confirmed: bool = Query(False)):
             accounts = []
             for acc in conn.execute("SELECT * FROM paper_accounts WHERE status='running'").fetchall():
                 acc_dict = dict(acc)
-                acc_dict["positions"] = [dict(p) for p in conn.execute("SELECT * FROM paper_positions WHERE account_id=? AND qty>0", (acc["id"],)).fetchall()]
+                # 「当前持仓」必须来自权威 lot（cycle-scoped）。这里原本直接读
+                # paper_positions 投影，而 daily_close_scan 会把这些行当作持仓
+                # 评估质量并生成调仓计划 —— 旧周期残留镜像行会变成真实的调仓依据。
+                acc_dict["positions"] = PPRM.current_positions(conn, account_id=acc["id"])
                 accounts.append(acc_dict)
             result = rebalance_scanner.daily_close_scan(conn, accounts, quotes)
             if isinstance(result, dict):

@@ -31,6 +31,7 @@ import adaptive_selection as selection_evolution
 import deepseek_advisor
 import deepseek_research
 import news_learning
+import paper_position_read_model as PPRM
 import risk_center as paper_risk_center
 import trade_attribution
 import ai_analysis
@@ -2924,9 +2925,11 @@ def _portfolio_shadow_arbitration():
         }
     paper = paper_reader.connect(PAPER_DB_PATH, timeout=30)
     try:
-        positions = [dict(row) for row in paper.execute(
-            "SELECT account_id,code,name,industry,qty,cost FROM paper_positions WHERE qty>0"
-        )]
+        # 「当前组合」= 当前 active cycle 的权威 lot。这里原本直接读
+        # paper_positions，会把旧周期的残留镜像行算进影子组合。切换数据源
+        # **不给 Shadow 任何新 authority**：模式仍是 shadow、不下单、不改信号，
+        # 只是让它看到正确的当前事实。
+        positions = PPRM.current_positions(paper)
         quote_map = {}
         for snapshot_path in SNAPSHOT_PATHS:
             snapshot = _load_json(snapshot_path, {}) or {}
@@ -3036,22 +3039,20 @@ def _disclosure_scope_codes(day: dt.date) -> list[str]:
     seen: set[str] = set()
     paper = paper_reader.connect(PAPER_DB_PATH, timeout=8)
     try:
-        queries = (
-            "SELECT code FROM paper_positions WHERE qty>0 ORDER BY account_id,code LIMIT ?",
-            """SELECT code FROM paper_signals
-               WHERE signal_date=? OR intended_date=?
-               ORDER BY id DESC LIMIT ?""",
-        )
-        rows = paper.execute(queries[0], (DISCLOSURE_MAX_CODES,)).fetchall()
-        for row in rows:
-            code = str(row["code"] or "").strip()
+        # 当前持仓代码来自权威 lot（cycle-scoped）；投影里的残留镜像行不应
+        # 扩大公告证据扫描范围，否则旧周期代码会被反复拉进 PIT 证据刷新。
+        for code in sorted(PPRM.current_held_codes(paper)):
             if code and code not in seen:
                 seen.add(code)
                 codes.append(code)
+        codes = codes[:DISCLOSURE_MAX_CODES]
         remaining = max(0, DISCLOSURE_MAX_CODES - len(codes))
         if remaining:
             rows = paper.execute(
-                queries[1], (day.isoformat(), day.isoformat(), remaining),
+                """SELECT code FROM paper_signals
+                   WHERE signal_date=? OR intended_date=?
+                   ORDER BY id DESC LIMIT ?""",
+                (day.isoformat(), day.isoformat(), remaining),
             ).fetchall()
             for row in rows:
                 code = str(row["code"] or "").strip()
