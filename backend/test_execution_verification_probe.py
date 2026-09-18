@@ -77,13 +77,13 @@ class ExecutionGateProbeTestCase(unittest.TestCase):
                    account_id,side,code,name,qty,planned_price,filled_price,amount,fees,
                    status,reason,risk_payload,realized_pnl,created_at,executed_at,
                    execution_status,execution_verified,
-                   strategy_id,strategy_version,strategy_checksum)
-               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                   strategy_id,strategy_version,strategy_checksum,cycle_id)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (ACCOUNT_ID, side, CODE, "探针标的", qty, price, price, qty * price,
              round(qty * price * 0.0006, 2), status, "probe", "{}", realized,
              f"{self.today.isoformat()} 10:00:00", executed_at,
              execution_status, None if verified is None else int(bool(verified)),
-             *stamp),
+             *stamp, self.cycle["id"]),
         )
         return cursor.lastrowid
 

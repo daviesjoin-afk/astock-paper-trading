@@ -73,9 +73,9 @@ class StrategyVersioningTests(unittest.TestCase):
         self.conn.execute(
             """INSERT INTO paper_orders(
                    account_id,side,code,qty,status,risk_payload,created_at,
-                   strategy_id,strategy_version,strategy_checksum)
-               VALUES('tq_breakout','buy','000001',100,'filled','{}','2026-09-08',?,?,?)""",
-            pinned,
+                   strategy_id,strategy_version,strategy_checksum,cycle_id)
+               VALUES('tq_breakout','buy','000001',100,'filled','{}','2026-09-08',?,?,?,?)""",
+            pinned + (cycle_id,),
         )
         registry.save_definition(
             self.conn, "tq_breakout", {"description": "new head"}, expected_version=1,
@@ -142,12 +142,15 @@ class StrategyVersioningTests(unittest.TestCase):
         self.assertEqual(columns("paper_signals"), columns("paper_signals_archive"))
 
         stamp = registry.stamp_for_account(self.conn, "tq_breakout")
+        cycle_id = self.conn.execute(
+            "SELECT cycle_id FROM paper_accounts WHERE id='tq_breakout'"
+        ).fetchone()[0]
         self.conn.execute(
             """INSERT INTO paper_orders(
                    account_id,side,code,qty,status,risk_payload,created_at,
-                   strategy_id,strategy_version,strategy_checksum)
-               VALUES('tq_breakout','buy','000001',100,'filled','{}','2026-09-08',?,?,?)""",
-            stamp,
+                   strategy_id,strategy_version,strategy_checksum,cycle_id)
+               VALUES('tq_breakout','buy','000001',100,'filled','{}','2026-09-08',?,?,?,?)""",
+            stamp + (cycle_id,),
         )
         self.conn.execute("INSERT INTO paper_orders_archive SELECT * FROM paper_orders")
         archived = self.conn.execute(

@@ -524,6 +524,9 @@ def commit_fill(
         PT._assert_active_lease(conn, "execution planner cash debit")
         PT._debit_shared_cash(conn, amount + fees, preferred_account_id=account_id)
         PT._finish_capital_reservation(conn, order_id, "consumed")
+        # §15：lot 的周期由 ``_record_lot`` 直接从**来源买单**读回（见那里的
+        # ``_order_cycle_id_for_order``），因此这里不需要、也不应该再解析一次 ——
+        # 多一个解析点就多一个 split-brain 机会。
         PT._record_lot(
             conn, account, plan, qty, fill_price, asof_day, order_id,
             is_t_base=is_t_base, fees=fees,

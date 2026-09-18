@@ -556,9 +556,13 @@ class SellReplayTimingAndScopeAreEnforced(unittest.TestCase):
         self.assertIn("def _sell_fills_for(self, account_id: str, code: str,", source)
         self.assertIn("cycle_id: Any = None", source)
         # 生产 ``paper_orders`` / ``paper_fills`` 都没有 ``cycle_id``，因此周期归属
-        # 由**时间窗四态**判定，而不是一个默认为真的布尔值。
-        self.assertIn("def _cycle_window(", source)
+        # 由**时间窗四态**判定，而不是一个默认为真的布尔值。判定收敛在
+        # ``_cycle_facts``（周期事实的唯一读法）+ ``_cycle_relation``（三态关系），
+        # 二者是权威；不得再引入第二套窗口读取。
+        self.assertIn("def _cycle_facts(", source)
+        self.assertIn("def _cycle_relation(", source)
         self.assertIn("def _competing_cycles(", source)
+        self.assertNotIn("def _cycle_window(", source)
         self.assertIn("CYCLE_ATTRIBUTION_PROVEN", source)
         self.assertIn("CYCLE_ATTRIBUTION_MISMATCH", source)
         self.assertIn("CYCLE_ATTRIBUTION_UNPROVABLE", source)
@@ -582,14 +586,29 @@ class SellReplayTimingAndScopeAreEnforced(unittest.TestCase):
         ``Absence of competing-cycle evidence is not evidence of absence of a
         competing cycle.`` 旧实现把它放进 ``skipped`` 后继续采信请求周期 —— 那
         正是本 PR 修掉的静默升级。
+
+        §20/§21 之后判定收敛到 ``_cycle_relation`` 的**三态**：起点不可证明返回
+        ``undecidable``，由 ``_competing_cycles`` 计入 ``unprovable`` 并参与归属
+        结论。这里断言的是这条结构，而不是某个中间变量名。
         """
         source = _source(ADAPTER_MODULE)
-        marker = "def _competing_cycles("
-        body = source[source.index(marker):source.index(marker) + 4000]
-        self.assertIn("if start is None:", body)
-        # 无法证明排除 ⇒ 计入 unprovable，且该结果参与 attribution 判定。
-        self.assertIn("unprovable.append(other)", body)
-        self.assertNotIn("skipped.append(other)", body)
+        marker = "def _cycle_relation("
+        relation_body = source[source.index(marker):source.index(marker) + 4000]
+        # 起点不可证明 ⇒ 两个方向都不能断言（既不包含也不排除）。
+        self.assertIn("if start_session is None:", relation_body)
+        self.assertIn('return "undecidable"', relation_body)
+        self.assertIn("def _competing_cycles(", source)
+        competitor = source[source.index("def _competing_cycles("):]
+        competitor = competitor[:competitor.index("def _sell_events(")]
+        # 不可判定 ⇒ 计入 unprovable，且该结果参与 attribution 判定。
+        self.assertIn("unprovable.append(other)", competitor)
+        # 三态只显式排除 "excluded"/"contains"；其余（含 "undecidable"）一律
+        # 落到 unprovable —— 也就是「不可判定必须降低可比性」。
+        self.assertIn('relation == "excluded"', competitor)
+        self.assertIn('relation == "contains"', competitor)
+        self.assertIn("self._cycle_relation(self._cycle_facts(other), session, instant)",
+                      competitor)
+        self.assertNotIn("skipped.append(other)", competitor)
         self.assertNotIn("cycle_skipped", source)
         # 归属判定必须消费它：出现 unprovable 竞争者时不得给 proven。
         self.assertIn("elif unprovable:", source)

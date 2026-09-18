@@ -85,6 +85,70 @@ def ensure_order_lineage_column(conn):
     return changes
 
 
+def ensure_order_cycle_provenance(conn):
+    """v18：订单的**不可变周期归属**（write-time fact，绝不回填历史）。
+
+    给 ``paper_orders`` 与 ``paper_orders_archive`` 同时、同位置加上 ``cycle_id``：
+    retention 仍用 ``INSERT OR IGNORE INTO paper_orders_archive SELECT * FROM
+    paper_orders`` 整行拷贝，所以两张表的列数与顺序必须严格一致，否则整行拷贝会错位。
+
+    本函数只做两件事：``ALTER TABLE ... ADD COLUMN`` 与 guard 安装。**绝不**给历史行
+    回填 ``cycle_id`` —— 升级前的订单属于哪个周期无法从任何**当前**状态反推
+    （``paper_accounts.cycle_id`` 是可变重绑定，``paper_cycles.started_at`` 对 paused
+    周期为 NULL），``cycle_id IS NULL`` 正是诚实的 legacy provenance 状态。
+
+    Guard 语义：
+
+    * ``paper_orders`` BEFORE INSERT —— 新的 account-scoped 订单必须带 ``cycle_id``，
+      且必须指向真实存在的 ``paper_cycles.id``；trigger 不回扫旧行，因此历史 NULL
+      行不受影响。**不**拿"当前 active cycle"再比较一次，否则会把 write-time fact
+      和后来的 current state 混在一起。
+    * ``paper_orders`` / ``paper_orders_archive`` BEFORE UPDATE OF cycle_id —— 一经
+      写入不得更改，``NULL -> 8`` 同样被阻止；否则以后任何 repair 脚本都能把
+      "不知道"洗白成"知道"。
+    * ``paper_orders_archive`` **不装** INSERT guard —— 升级前的 deferred / waitlist /
+      retry 行之后仍可能经 ``SELECT *`` 进入归档表，legacy NULL 必须允许归档。
+    """
+    definitions = {"cycle_id": "INTEGER"}
+    changes = {}
+    for table in ("paper_orders", "paper_orders_archive"):
+        changes[table] = ensure_columns(conn, table, definitions)
+    _ensure_order_cycle_provenance_guards(conn)
+    return changes
+
+
+def _ensure_order_cycle_provenance_guards(conn):
+    """Reject new orders without a durable cycle, and freeze it once written.
+
+    Historical NULL rows are intentionally left untouched: a trigger never
+    re-scans existing rows, so upgrading a multi-gigabyte ledger rewrites
+    nothing. The archive table only receives the immutability guard, because
+    retention still copies legacy NULL-cycle rows into it.
+    """
+    has_cycles = bool(table_columns(conn, "paper_cycles"))
+    if has_cycles and "cycle_id" in table_columns(conn, "paper_orders"):
+        conn.execute(
+            """CREATE TRIGGER IF NOT EXISTS trg_paper_orders_cycle_provenance_insert
+                BEFORE INSERT ON paper_orders
+                WHEN NEW.account_id IS NOT NULL AND (
+                    NEW.cycle_id IS NULL
+                    OR NOT EXISTS (
+                        SELECT 1 FROM paper_cycles c WHERE c.id=NEW.cycle_id
+                    )
+                )
+                BEGIN SELECT RAISE(ABORT, 'invalid order cycle provenance'); END"""
+        )
+    for table in ("paper_orders", "paper_orders_archive"):
+        if "cycle_id" not in table_columns(conn, table):
+            continue
+        conn.execute(
+            f"""CREATE TRIGGER IF NOT EXISTS trg_{table}_cycle_provenance_immutable
+                BEFORE UPDATE OF cycle_id ON {table}
+                WHEN NEW.cycle_id IS NOT OLD.cycle_id
+                BEGIN SELECT RAISE(ABORT, 'order cycle provenance is immutable'); END"""
+        )
+
+
 def ensure_strategy_reference_columns(conn):
     """Append immutable strategy-version stamps to execution evidence tables.
 

@@ -1127,7 +1127,7 @@ def _entry_frozen_reason(source=None):
 
 def _record_entry_frozen_waitlist(
     conn, account_id, code, *, name=None, qty=0, planned_price=None,
-    risk_payload=None, signal_id=None, asof_day=None, source="entry",
+    risk_payload=None, signal_id=None, asof_day=None, source="entry", cycle_id=None,
 ):
     """Persist one auditable, idempotent frozen-entry waitlist record.
 
@@ -1175,14 +1175,15 @@ def _record_entry_frozen_waitlist(
         """INSERT INTO paper_orders(
                account_id,signal_id,side,code,name,qty,planned_price,status,reason,
                risk_payload,origin,created_at,strategy_id,strategy_version,strategy_checksum,
-               retry_of_order_id)
-           VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+               retry_of_order_id,cycle_id)
+           VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (
             account_id, signal_id, "buy", code, name, max(0, int(_num(qty))),
             _num(planned_price, None), ENTRY_FROZEN_WAITLIST_STATUS, reason,
             _json(payload), "strategy", _now(),
             strategy_id, strategy_version, strategy_checksum,
             _previous_attempt_order_id(conn, signal_id),
+            _order_cycle_id(conn, cycle_id),
         ),
     )
     order_id = int(cursor.lastrowid)
@@ -1790,6 +1791,7 @@ def init_db():
                 SR.ensure_schema(conn)
                 PSM.ensure_strategy_reference_columns(conn)
                 PSM.ensure_execution_verification_columns(conn)
+                PSM.ensure_order_cycle_provenance(conn)
                 _ensure_accounts(conn)
                 _ensure_user_strategy_accounts(conn)
                 _ensure_cycle(conn)
@@ -1831,7 +1833,8 @@ def init_db():
                 origin TEXT NOT NULL DEFAULT 'strategy', expires_at TEXT, cancelled_at TEXT,
                 strategy_id TEXT, strategy_version INTEGER, strategy_checksum TEXT,
                 retry_of_order_id INTEGER,
-                execution_status TEXT, execution_verified INTEGER, execution_evidence_source TEXT
+                execution_status TEXT, execution_verified INTEGER, execution_evidence_source TEXT,
+                cycle_id INTEGER
             );
             -- 归档表：列集与活跃表严格一致（清理函数用 SELECT * 归档），避免列错位。
             CREATE TABLE IF NOT EXISTS paper_orders_archive (
@@ -1841,7 +1844,8 @@ def init_db():
                 created_at TEXT, executed_at TEXT, order_type TEXT, origin TEXT,
                 expires_at TEXT, cancelled_at TEXT, strategy_id TEXT,
                 strategy_version INTEGER, strategy_checksum TEXT, retry_of_order_id INTEGER,
-                execution_status TEXT, execution_verified INTEGER, execution_evidence_source TEXT
+                execution_status TEXT, execution_verified INTEGER, execution_evidence_source TEXT,
+                cycle_id INTEGER
             );
             CREATE TABLE IF NOT EXISTS paper_signals_archive (
                 id INTEGER, account_id TEXT, signal_date TEXT, intended_date TEXT, code TEXT, name TEXT,
@@ -2081,6 +2085,7 @@ def init_db():
         _rebuild_realized_pnl(conn)
         SR.ensure_schema(conn)
         PSM.ensure_strategy_reference_columns(conn)
+        PSM.ensure_order_cycle_provenance(conn)
         _ensure_accounts(conn)
         _ensure_user_strategy_accounts(conn)
         _ensure_cycle(conn)
@@ -2488,6 +2493,75 @@ def _active_cycle(conn):
         _ensure_cycle(conn)
         cycle = conn.execute("SELECT * FROM paper_cycles WHERE status IN ('draft','running','paused') ORDER BY id DESC LIMIT 1").fetchone()
     return dict(cycle)
+
+
+def _order_cycle_id(conn, cycle_id=None):
+    """订单/lot 写入时刻所属周期的**唯一解析入口**（v18 write-time fact）。
+
+    优先级：
+
+    1. 调用链里**已经确定**的周期身份（``cycle_id`` 显式向下传）—— 这是权威，
+       也是避免 split-brain 的唯一方式：同一次决策用 cycle A 消耗 lot、却把订单
+       写成 cycle B，会让「谁拥有这笔委托」变成两个互相矛盾的持久事实；
+    2. 本事务内解析的 active cycle —— 只作为**没有**显式身份时的兜底。同一
+       immediate 事务内 ``paper_cycles.status`` 不会被本层改写，因此它与调用方
+       在同一事务里解析到的是同一个周期。
+
+    绝不从 ``paper_accounts.cycle_id``（可变重绑定）或任何时间窗推断。
+    """
+    if cycle_id is not None:
+        try:
+            explicit = int(cycle_id)
+        except (TypeError, ValueError):
+            explicit = None
+        if explicit is not None:
+            return explicit
+    return int(_active_cycle(conn)["id"])
+
+
+def _order_cycle_id_for_order(conn, order_id):
+    """**已存在**订单的 durable 周期身份：从行里读，绝不重新解析。
+
+    这是 §15/§16 的结构性保证来源 —— lot 与卖出成交都引用**订单自己**的
+    ``cycle_id``，因此「订单属于周期 A、lot 属于周期 B」在构造上不可能发生。
+
+    列不存在（pre-v18 schema）或订单行不存在 → ``None``，由调用方决定兜底；
+    ``None`` **不是**「没有周期」，而是「无法从订单证明周期」，调用方必须按
+    fail-closed 语义处理。
+    """
+    if order_id is None or not _orders_have_cycle_column(conn):
+        return None
+    try:
+        row = conn.execute(
+            "SELECT cycle_id FROM paper_orders WHERE id=?", (int(order_id),)
+        ).fetchone()
+    except sqlite3.Error:  # pragma: no cover - 表不存在
+        return None
+    if row is None:
+        return None
+    value = row["cycle_id"] if hasattr(row, "keys") else row[0]
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+_ORDERS_CYCLE_COLUMN_CACHE = {"value": None}
+
+
+def _orders_have_cycle_column(conn):
+    """``paper_orders`` 是否有 ``cycle_id``（v18 之后恒为真；旧库可能尚未迁移）。
+
+    用 ``PRAGMA`` 发现而不是写死：写死会在 pre-v18 库上报 ``no such column``，
+    把整条交易链路打成异常。结果按连接无关地缓存一次（schema 在进程内不变）。
+    """
+    if _ORDERS_CYCLE_COLUMN_CACHE["value"] is None:
+        try:
+            columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(paper_orders)")}
+        except sqlite3.Error:  # pragma: no cover - 表不存在
+            columns = set()
+        _ORDERS_CYCLE_COLUMN_CACHE["value"] = "cycle_id" in columns
+    return bool(_ORDERS_CYCLE_COLUMN_CACHE["value"])
 
 
 def _shared_account_rows(conn, cycle_id=None):
@@ -3122,16 +3196,21 @@ def _sync_positions(conn, account_id=None, asof_day=None):
     return positions
 
 
-def _consume_available_lots(conn, account_id, code, qty, asof_day):
-    """FIFO 消耗已结算股票底仓，返回真实成本；T+1 锁定份额永不被扣减。"""
-    cycle = _active_cycle(conn)
+def _consume_available_lots(conn, account_id, code, qty, asof_day, cycle_id=None):
+    """FIFO 消耗已结算股票底仓，返回真实成本；T+1 锁定份额永不被扣减。
+
+    ``cycle_id`` 是**调用链里已经确定**的周期身份（v18 write-time fact）。传入时
+    它就是唯一权威，从而保证「消耗哪个周期的 lot」与「卖出委托写在哪个周期」是
+    同一个事实；不传时才回退到本事务解析的 active cycle。
+    """
+    cycle_id = _order_cycle_id(conn, cycle_id)
     remaining = int(qty)
     cost_amount = 0.0
     lots = _rows(
         conn,
         """SELECT * FROM paper_position_lots WHERE cycle_id=? AND account_id=? AND code=?
            AND remaining_qty>0 AND available_date<=? ORDER BY acquired_at,id""",
-        (cycle["id"], account_id, code, _date(asof_day).isoformat()),
+        (cycle_id, account_id, code, _date(asof_day).isoformat()),
     )
     # Validate the aggregate available quantity before mutating any lot.  A
     # malformed/partially-consumed lot must not leave a half-reduced ledger
@@ -3151,14 +3230,22 @@ def _consume_available_lots(conn, account_id, code, qty, asof_day):
     return int(qty) - remaining, cost_amount
 
 
-def _record_lot(conn, account, signal, qty, fill_price, asof_day, order_id=None, is_t_base=True, fees=0.0):
-    cycle = _active_cycle(conn)
+def _record_lot(conn, account, signal, qty, fill_price, asof_day, order_id=None, is_t_base=True, fees=0.0, cycle_id=None):
+    """写入买入 lot。周期归属必须与**来源买单**一致（§15 硬 invariant）。
+
+    来源订单存在且带 durable ``cycle_id`` 时，lot 一律继承它 —— 这让「订单属于
+    周期 A、lot 属于周期 B」在构造上不可能发生。来源订单是 legacy（``cycle_id``
+    为 NULL）或没有来源订单时，才回退到显式传入 / 本事务解析的周期：legacy 订单
+    的 NULL 是**未知**而不是「另一个周期」，且绝不反向回填订单。
+    """
+    order_cycle = _order_cycle_id_for_order(conn, order_id) if order_id is not None else None
+    cycle_id = order_cycle if order_cycle is not None else _order_cycle_id(conn, cycle_id)
     asset_type = _asset_type(signal.get("code"), signal.get("name"))
     available = _date(asof_day) if asset_type == "etf_t0" else _next_weekday(asof_day)
     conn.execute(
         """INSERT INTO paper_position_lots(cycle_id,account_id,code,name,industry,qty,remaining_qty,cost,acquired_at,available_date,asset_type,source_order_id,cost_fee_included,is_t_base)
            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-        (cycle["id"], account["id"], signal["code"], signal.get("name"), signal.get("industry"), int(qty), int(qty),
+        (cycle_id, account["id"], signal["code"], signal.get("name"), signal.get("industry"), int(qty), int(qty),
          fill_price + _num(fees) / max(int(qty), 1), _now(), available.isoformat(), asset_type, order_id, 1, int(bool(is_t_base))),
     )
 
@@ -8573,6 +8660,7 @@ def _buy_order(conn, account, signal, quote, market, news, asof_day, *, all_quot
             signal_id=signal.get("id"),
             asof_day=asof_day,
             source="自动候选",
+            cycle_id=current_cycle["id"],
         )
         if str(signal.get("status") or "") in ENTRY_RETRY_SIGNAL_STATUSES:
             conn.execute(
@@ -9412,15 +9500,16 @@ def _buy_order(conn, account, signal, quote, market, news, asof_day, *, all_quot
         """INSERT INTO paper_orders(
            account_id,signal_id,side,code,name,qty,planned_price,order_type,filled_price,amount,
            fees,status,reason,risk_payload,created_at,executed_at,expires_at,
-           strategy_id,strategy_version,strategy_checksum,retry_of_order_id)
-        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+           strategy_id,strategy_version,strategy_checksum,retry_of_order_id,cycle_id)
+        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (account["id"], signal["id"], "buy", code, signal.get("name"), qty,
          entry_limit["limit_price"] if entry_limit["limit_price"] is not None else price,
          entry_limit["order_type"],
          fill_price if allowed else None,
          amount if allowed else None, fees if allowed else None, order_status, reason,
          _json(risk), _now(), _now() if allowed else None, dispatch_plan["expires_at"],
-         strategy_id, strategy_version, strategy_checksum, retry_of_order_id),
+         strategy_id, strategy_version, strategy_checksum, retry_of_order_id,
+         _order_cycle_id(conn, current_cycle["id"])),
     )
     # A frozen order is a waitlist marker, not a second live order.  Once the
     # data gate reopens and this candidate receives a fresh decision, retire
@@ -9536,7 +9625,7 @@ def _buy_order(conn, account, signal, quote, market, news, asof_day, *, all_quot
         _debit_shared_cash(conn, amount + fees, preferred_account_id=account["id"])
         _finish_capital_reservation(conn, order_id, "consumed")
         _assert_active_lease(conn, "strategy fill lot")
-        _record_lot(conn, account, signal, qty, fill_price, asof_day, order_id, is_t_base=True, fees=fees)
+        _record_lot(conn, account, signal, qty, fill_price, asof_day, order_id, is_t_base=True, fees=fees, cycle_id=_order_cycle_id(conn, current_cycle["id"]))
         if ET is not None:
             ET.mark_entered(account["id"], code, fill_price)
         conn.execute("INSERT INTO paper_fills(order_id,account_id,side,code,qty,price,amount,fees,fill_date,quote_at,assumption) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
@@ -11651,11 +11740,11 @@ def _monitor_risk_impl(asof_date=None):
                 cursor = conn.execute(
                     """INSERT INTO paper_orders(
                            account_id,side,code,name,qty,planned_price,status,reason,
-                           risk_payload,created_at,strategy_id,strategy_version,strategy_checksum)
-                       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                           risk_payload,created_at,strategy_id,strategy_version,strategy_checksum,cycle_id)
+                       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                     (position["account_id"], "sell", position["code"], position.get("name"),
                      planned_qty, price or None, status, order_reason, _json(detail), _now(),
-                     *strategy_stamp),
+                     *strategy_stamp, _order_cycle_id(conn, cycle["id"])),
                 )
                 _risk_log(conn, position["account_id"], position["code"], "sell", "unfilled", order_reason, detail)
                 orders.append({"code": position["code"], "status": status, "reason": order_reason})
@@ -11668,7 +11757,13 @@ def _monitor_risk_impl(asof_date=None):
             conn.execute(f"SAVEPOINT {savepoint}")
             try:
                 _assert_active_lease(conn, "risk sell lot")
-                consumed, cost_amount = _consume_available_lots(conn, position["account_id"], position["code"], qty, day)
+                # §8：lot 消耗与卖出委托必须是**同一个** cycle fact。这里解析一次，
+                # 同时传给 FIFO 消耗与 order INSERT，杜绝 split-brain。
+                sell_cycle_id = _order_cycle_id(conn, cycle["id"])
+                consumed, cost_amount = _consume_available_lots(
+                    conn, position["account_id"], position["code"], qty, day,
+                    cycle_id=sell_cycle_id,
+                )
                 if consumed < LOT_SIZE:
                     _risk_log(conn, position["account_id"], position["code"], "sell", "held_t1", "可卖底仓不足", detail)
                     conn.execute(f"RELEASE SAVEPOINT {savepoint}")
@@ -11694,11 +11789,11 @@ def _monitor_risk_impl(asof_date=None):
                 _assert_active_lease(conn, "risk sell finalization")
                 strategy_stamp = _strategy_stamp(conn, position["account_id"])
                 cursor = conn.execute(
-                    """INSERT INTO paper_orders(account_id,side,code,name,qty,planned_price,filled_price,amount,fees,status,reason,risk_payload,realized_pnl,created_at,executed_at,strategy_id,strategy_version,strategy_checksum)
-                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    """INSERT INTO paper_orders(account_id,side,code,name,qty,planned_price,filled_price,amount,fees,status,reason,risk_payload,realized_pnl,created_at,executed_at,strategy_id,strategy_version,strategy_checksum,cycle_id)
+                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                     (position["account_id"], "sell", position["code"], position.get("name"), qty, price, fill_price,
                      amount, fees, "filled", reason, _json(detail), realized_pnl, _now(), _now(),
-                     *strategy_stamp),
+                     *strategy_stamp, sell_cycle_id),
                 )
                 _credit_shared_cash(conn, amount - fees, position["account_id"])
                 conn.execute("UPDATE paper_positions SET take_stage=? WHERE account_id=? AND code=?",
@@ -12789,7 +12884,11 @@ def _intraday_sell(conn, account, position, quote, asof_day, profile, cycle, ope
     fill = price * (1 - SLIPPAGE)
     amount = qty * fill
     fees = _commission(amount) + amount * STAMP_SELL
-    consumed, cost_amount = _consume_available_lots(conn, account["id"], position["code"], qty, asof_day)
+    # §8：lot 消耗与卖出委托共享同一个 cycle fact（`cycle` 由调用方按当前周期解析）。
+    sell_cycle_id = _order_cycle_id(conn, cycle["id"])
+    consumed, cost_amount = _consume_available_lots(
+        conn, account["id"], position["code"], qty, asof_day, cycle_id=sell_cycle_id,
+    )
     if consumed < LOT_SIZE:
         return None, "可卖底仓不足"
     qty, amount = consumed, consumed * fill
@@ -12813,10 +12912,10 @@ def _intraday_sell(conn, account, position, quote, asof_day, profile, cycle, ope
     audit_action = "opening_event_t_sell" if opening_event else "intraday_t_sell"
     strategy_stamp = _strategy_stamp(conn, account["id"])
     cursor = conn.execute(
-        """INSERT INTO paper_orders(account_id,side,code,name,qty,planned_price,filled_price,amount,fees,status,reason,risk_payload,realized_pnl,created_at,executed_at,strategy_id,strategy_version,strategy_checksum)
-           VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+        """INSERT INTO paper_orders(account_id,side,code,name,qty,planned_price,filled_price,amount,fees,status,reason,risk_payload,realized_pnl,created_at,executed_at,strategy_id,strategy_version,strategy_checksum,cycle_id)
+           VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (account["id"], "sell", position["code"], position.get("name"), qty, price, fill, amount, fees,
-         "filled", order_reason, _json(payload), pnl, _now(), _now(), *strategy_stamp),
+         "filled", order_reason, _json(payload), pnl, _now(), _now(), *strategy_stamp, sell_cycle_id),
     )
     _credit_shared_cash(conn, amount - fees, account["id"])
     conn.execute("INSERT INTO paper_fills(order_id,account_id,side,code,qty,price,amount,fees,fill_date,quote_at,assumption) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
@@ -12921,6 +13020,7 @@ def _intraday_buyback(conn, account, position, quote, market, asof_day, profile,
             },
             asof_day=asof_day,
             source="日内回补",
+            cycle_id=cycle["id"],
         )
         if not created:
             _risk_log(
@@ -13100,6 +13200,7 @@ def _swing_scale_in(conn, account, position, quote, market, asof_day, profile, c
             },
             asof_day=asof_day,
             source="策略确认加仓",
+            cycle_id=cycle["id"],
         )
         if not created:
             _risk_log(

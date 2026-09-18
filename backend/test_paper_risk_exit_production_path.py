@@ -132,11 +132,12 @@ class PaperRiskExitProductionPathTestCase(unittest.TestCase):
                 """INSERT INTO paper_orders(
                        account_id, side, code, name, qty, planned_price, filled_price,
                        amount, fees, status, reason, risk_payload, created_at, executed_at,
-                       order_type, origin, strategy_id, strategy_version, strategy_checksum
+                       order_type, origin, strategy_id, strategy_version, strategy_checksum,
+                       cycle_id
                    ) VALUES (?, 'buy', ?, ?, ?, ?, ?, ?, 5.0, 'filled', 'seed_buy',
-                             '{}', ?, ?, 'market', 'seed', ?, ?, ?)""",
+                             '{}', ?, ?, 'market', 'seed', ?, ?, ?, ?)""",
                 (account_id, code, f"测试股_{code}", qty, cost, cost, qty * cost,
-                 f"{available_date} 09:30:00", f"{available_date} 09:30:00", *stamp),
+                 f"{available_date} 09:30:00", f"{available_date} 09:30:00", *stamp, cycle_id),
             )
             seed_order_id = int(cur_order.lastrowid)
 
@@ -312,9 +313,9 @@ class TestPaperRiskExitProductionPath(PaperRiskExitProductionPathTestCase):
                 """INSERT INTO paper_orders(
                        account_id, side, code, name, qty, planned_price, filled_price,
                        amount, fees, status, reason, risk_payload, created_at, executed_at,
-                       order_type, origin, strategy_id, strategy_version, strategy_checksum
+                       order_type, origin, strategy_id, strategy_version, strategy_checksum, cycle_id
                    ) VALUES (?, 'buy', ?, '测试', 100, 10.0, 10.0, 1000.0, 5.0, 'filled', 'old',
-                             '{}', '2026-08-01 09:30:00', '2026-08-01 09:30:00', 'market', 'seed', ?, ?, ?)""",
+                             '{}', '2026-08-01 09:30:00', '2026-08-01 09:30:00', 'market', 'seed', ?, ?, ?, 1)""",
                 (paused_account, self.code, *stamp_p),
             )
             conn.execute(
@@ -327,9 +328,9 @@ class TestPaperRiskExitProductionPath(PaperRiskExitProductionPathTestCase):
                 """INSERT INTO paper_orders(
                        account_id, side, code, name, qty, planned_price, filled_price,
                        amount, fees, status, reason, risk_payload, created_at, executed_at,
-                       order_type, origin, strategy_id, strategy_version, strategy_checksum
+                       order_type, origin, strategy_id, strategy_version, strategy_checksum, cycle_id
                    ) VALUES (?, 'buy', ?, '测试', 100, 10.0, 10.0, 1000.0, 5.0, 'filled', 'old',
-                             '{}', '2026-08-01 09:30:00', '2026-08-01 09:30:00', 'market', 'seed', ?, ?, ?)""",
+                             '{}', '2026-08-01 09:30:00', '2026-08-01 09:30:00', 'market', 'seed', ?, ?, ?, 1)""",
                 (archived_account, self.code, *stamp_a),
             )
             conn.execute(
@@ -542,10 +543,10 @@ class TestPaperRiskExitProductionPath(PaperRiskExitProductionPathTestCase):
             conn.execute(
                 """INSERT INTO paper_orders(
                        account_id, origin, side, code, name, qty, planned_price, status, reason, created_at,
-                       risk_payload, strategy_id, strategy_version, strategy_checksum
+                       risk_payload, strategy_id, strategy_version, strategy_checksum, cycle_id
                    ) VALUES (?, 'strategy', 'sell', ?, '测试', 500, 9.0, 'execution_retry', '重试', '2026-09-10 14:50:00',
-                             '{}', ?, ?, ?)""",
-                (account_id, self.code_b, *stamp),
+                             '{}', ?, ?, ?, ?)""",
+                (account_id, self.code_b, *stamp, 1),
             )
 
             # Slot occupancy after sell order: must NOT include (account_id, code_b)

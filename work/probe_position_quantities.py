@@ -244,7 +244,36 @@ def main(argv):
     print(f"\nevidence: buy fills={_count(buys)} (verified={_count(verified_buys)}), "
           f"sell fills={_count(sells)} (verified={_count(verified_sells)})")
 
-    # ── 8. ETF lot 覆盖 ──
+    # ── 8. 订单周期归属（v18）采用率 ──
+    # 规格 §29：只知道"总 comparison rate"无法判断新 provenance 有没有真的被写下来。
+    # 这里分别给出订单总量、已带 durable cycle 的量、以及 SELL 一侧的 legacy 缺口。
+    has_cycle_column = bool(_rows(
+        conn, "SELECT 1 FROM pragma_table_info('paper_orders') WHERE name='cycle_id'"))
+    print(f"\norder cycle provenance (v18): column present={has_cycle_column}")
+    if has_cycle_column:
+        orders_total = _count(_rows(conn, "SELECT COUNT(*) AS n FROM paper_orders"))
+        orders_present = _count(_rows(
+            conn, "SELECT COUNT(*) AS n FROM paper_orders WHERE cycle_id IS NOT NULL"))
+        orders_missing = _count(_rows(
+            conn, "SELECT COUNT(*) AS n FROM paper_orders WHERE cycle_id IS NULL"))
+        sells_total = _count(_rows(
+            conn, "SELECT COUNT(*) AS n FROM paper_orders WHERE side='sell'"))
+        sells_present = _count(_rows(
+            conn, "SELECT COUNT(*) AS n FROM paper_orders "
+                  "WHERE side='sell' AND cycle_id IS NOT NULL"))
+        print(f"  orders_total: {orders_total}")
+        print(f"  orders_cycle_provenance_present: {orders_present}")
+        print(f"  orders_cycle_provenance_missing: {orders_missing}")
+        print(f"  sell_orders_total: {sells_total}")
+        print(f"  sell_orders_explicit_cycle: {sells_present}")
+        print(f"  sell_orders_legacy_cycle_missing: {sells_total - sells_present}")
+        if orders_total:
+            print(f"  adoption rate: {orders_present / orders_total:.4f}")
+    else:
+        # pre-v18 副本：诚实报告"列不存在"，而不是把 0 当成"采用率为 0"。
+        print("  ^ 该副本尚未迁移到 v18（paper_orders 无 cycle_id）")
+
+    # ── 9. ETF lot 覆盖 ──
     etf = _rows(conn, "SELECT COUNT(*) AS n FROM paper_position_lots WHERE asset_type='etf_t0'")
     print(f"T+0 ETF samples (asset_type='etf_t0'): {_count(etf)}")
 

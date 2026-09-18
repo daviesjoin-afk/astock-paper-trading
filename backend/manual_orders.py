@@ -482,6 +482,7 @@ def _commit_strategy_buy(
         _lease_lost,
         _now,
         _num,
+        _order_cycle_id,
         _risk_log,
         _strategy_stamp,
     )
@@ -495,11 +496,11 @@ def _commit_strategy_buy(
     cursor = conn.execute(
         """INSERT INTO paper_orders(
            account_id,side,code,name,qty,planned_price,status,reason,
-           risk_payload,created_at,strategy_id,strategy_version,strategy_checksum)
-           VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+           risk_payload,created_at,strategy_id,strategy_version,strategy_checksum,cycle_id)
+           VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (account_id, "buy", code, plan.get("name"), qty,
          _num(plan.get("planned_price"), fill_price), "pending_execution",
-         reason, _json(detail), _now(), *strategy_stamp),
+         reason, _json(detail), _now(), *strategy_stamp, _order_cycle_id(conn)),
     )
     order_id = int(cursor.lastrowid)
     savepoint = f"strategy_buy_{order_id}"
@@ -557,6 +558,7 @@ def submit_manual_order(
         _market_state,
         _now,
         _num,
+        _order_cycle_id,
         _quotes,
         _record_nav,
         _reserve_shared_capital,
@@ -602,15 +604,15 @@ def submit_manual_order(
             """INSERT INTO paper_orders(
                account_id,side,code,name,qty,planned_price,status,reason,risk_payload,
                order_type,origin,expires_at,created_at,
-               strategy_id,strategy_version,strategy_checksum)
-               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+               strategy_id,strategy_version,strategy_checksum,cycle_id)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 account_id, side, code, plan.get("name"), int(plan.get("qty") or 0),
                 _num(limit_price) if order_type == "limit" else _num(plan.get("quote_price")),
                 status, reason, _json(plan.get("risk") or {}), order_type, "manual",
                 day.isoformat() if status in {"pending_limit", ENTRY_FROZEN_WAITLIST_STATUS}
                 and order_type == "limit" else None, _now(),
-                *strategy_stamp,
+                *strategy_stamp, _order_cycle_id(conn),
             ),
         )
         order_id = cursor.lastrowid
