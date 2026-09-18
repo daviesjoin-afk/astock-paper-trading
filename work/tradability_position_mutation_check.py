@@ -35,10 +35,16 @@ ROOT = Path(__file__).resolve().parents[1]
 TEST_MODULES = (
     "test_tradability_position_shadow",
     "test_tradability_position_shadow_architecture_guard",
+    # v18 订单周期归属：迁移/guard/order-writer 与跨周期身份契约。
+    "test_order_cycle_provenance",
+    "test_order_cycle_identity",
 )
 
 ADAPTER = "backend/tradability_position_evidence.py"
 SHADOW = "backend/tradability_position_shadow.py"
+#: v18 订单周期归属：迁移/guard 与生产订单写入口（供 M-OC* 变异使用）。
+MIGRATIONS = "backend/paper_schema_migrations.py"
+WRITER = "backend/paper_trading.py"
 
 # (id, 目标文件, 变异前, 变异后, 说明)
 MUTATIONS = (
@@ -255,7 +261,7 @@ MUTATIONS = (
     (
         "M-T1-12",
         ADAPTER,
-        "                    elif session < start_at or (end_at is not None and session > end_at):\n"
+        "                    elif relation == \"excluded\":\n"
         "                        attribution = CYCLE_ATTRIBUTION_MISMATCH\n",
         "                    # MUTANT M-T1-12: outside-window sell accepted as our cycle\n"
         "                    elif False:\n"
@@ -311,8 +317,8 @@ MUTATIONS = (
     (
         "M-T1-18",
         ADAPTER,
-        "                    if start_at is None:\n"
-        "                        # 周期行存在但起点不可证明 → 无法断言该卖出属于它。\n"
+        "                    if relation == \"undecidable\":\n"
+        "                        # 周期行存在但起点不可证明 / 边界同一天且日内顺序未知。\n"
         "                        attribution = CYCLE_ATTRIBUTION_UNPROVABLE\n",
         "                    # MUTANT M-T1-18: missing cycle start defaults to proven\n"
         "                    if False:\n"
@@ -322,7 +328,9 @@ MUTATIONS = (
     (
         "M-T1-19",
         ADAPTER,
-        "                        ambiguous, unprovable = self._competing_cycles(cycle_id, session)\n",
+        "                        ambiguous, unprovable = self._competing_cycles(\n"
+        "                            cycle_id, session, executed_instant,\n"
+        "                        )\n",
         "                        # MUTANT M-T1-19: overlapping cycle ambiguity ignored\n"
         "                        ambiguous, unprovable = False, ()\n",
         "重叠周期歧义被静默接受（直接采信请求周期）",
@@ -330,26 +338,26 @@ MUTATIONS = (
     (
         "M-CYCLE-FC1",
         ADAPTER,
-        "            if start is None:\n"
-        "                # 边界证据不足：既不能断言包含，也不能断言排除 → 归属不可证明。\n"
-        "                unprovable.append(other)\n"
+        "            relation = self._cycle_relation(self._cycle_facts(other), session, instant)\n"
+        "            if relation == \"excluded\":\n"
+        "                # 已证明不拥有该卖出 → 可以排除。\n"
         "                continue\n",
-        "            # MUTANT M-CYCLE-FC1: unknown competitor silently skipped\n"
-        "            if start is None:\n"
+        "            # MUTANT M-CYCLE-FC1: undecidable competitor silently skipped\n"
+        "            if relation == \"undecidable\":\n"
         "                continue\n",
         "未知竞争周期被忽略（缺失边界证据 ⇒ 仍报 proven）",
     ),
     (
         "M-CYCLE-FC2",
         ADAPTER,
-        "            if start is None:\n"
-        "                # 边界证据不足：既不能断言包含，也不能断言排除 → 归属不可证明。\n"
-        "                unprovable.append(other)\n"
+        "            relation = self._cycle_relation(self._cycle_facts(other), session, instant)\n"
+        "            if relation == \"excluded\":\n"
+        "                # 已证明不拥有该卖出 → 可以排除。\n"
         "                continue\n",
         "            # MUTANT M-CYCLE-FC2: paused competitor treated as non-competing\n"
-        "            if start is None and str(_row_field(row, \"status\") or \"\") == \"paused\":\n"
+        "            if relation == \"undecidable\" and str(_row_field(row, \"status\") or \"\") == \"paused\":\n"
         "                continue\n"
-        "            if start is None:\n"
+        "            if relation == \"undecidable\":\n"
         "                unprovable.append(other)\n"
         "                continue\n",
         "paused 被当作「不竞争」的证据（status 冒充时间证据）",
@@ -357,14 +365,12 @@ MUTATIONS = (
     (
         "M-CYCLE-FC3",
         ADAPTER,
-        "            start = _session_of(_row_field(row, \"started_at\"))\n"
-        "            end = _session_of(_row_field(row, \"ended_at\"))\n"
-        "            # 已结束且结束日早于该卖出 → 可证明不包含它。\n",
+        "            raw_start = _text(_row_field(row, \"started_at\"))\n"
+        "            raw_end = _text(_row_field(row, \"ended_at\"))\n",
         "            # MUTANT M-CYCLE-FC3: created_at silently promoted to economic start\n"
-        "            start = _session_of(_row_field(row, \"started_at\")) or _session_of(\n"
+        "            raw_start = _text(_row_field(row, \"started_at\")) or _text(\n"
         "                _row_field(row, \"created_at\"))\n"
-        "            end = _session_of(_row_field(row, \"ended_at\"))\n"
-        "            # 已结束且结束日早于该卖出 → 可证明不包含它。\n",
+        "            raw_end = _text(_row_field(row, \"ended_at\"))\n",
         "created_at 被偷偷升级成 economic started_at（起点未知被补成 proven）",
     ),
     (
@@ -393,12 +399,11 @@ MUTATIONS = (
     (
         "M-CYCLE-FC6",
         ADAPTER,
-        "                    elif (window is not None and window[0] is not None\n"
-        "                          and session is not None\n"
-        "                          and (session < window[0]\n"
-        "                               or (window[1] is not None and session > window[1]))):\n"
+        "                    elif requested_facts is not None and self._cycle_relation(\n"
+        "                            requested_facts, session, executed_instant) == \"excluded\":\n"
         "                        # 显式身份说属于本周期，本周期可证明的时间窗却把它排除 →\n"
-        "                        # 硬冲突：两边证据都在，不能静默相信任意一方。\n"
+        "                        # 硬冲突：两边证据都在，不能静默相信任意一方。§20：这里也按\n"
+        "                        # **时刻**比较，否则「同日 16:00 才开始的周期」会被误当成已覆盖。\n"
         "                        attribution = CYCLE_ATTRIBUTION_UNPROVABLE\n"
         "                        cycle_diagnostics.append(\"sell_fill_cycle_identity_conflict\")\n",
         "                    # MUTANT M-CYCLE-FC6: identity/time-window conflict silently accepted\n"
@@ -422,6 +427,91 @@ MUTATIONS = (
         "            ),\n",
         "卖出事件排序忽略 executed_at（按数据库 id 排）",
     ),
+    (
+        "M-OC1",
+        MIGRATIONS,
+        "    definitions = {\"cycle_id\": \"INTEGER\"}\n",
+        "    # MUTANT M-OC1: legacy rows backfilled from the active cycle\n"
+        "    definitions = {\"cycle_id\": \"INTEGER\"}\n"
+        "    if table_columns(conn, \"paper_cycles\"):\n"
+        "        conn.execute(\n"
+        "            \"UPDATE paper_orders SET cycle_id=(SELECT MAX(id) FROM paper_cycles) \"\n"
+        "            \"WHERE cycle_id IS NULL\"\n"
+        "        )\n",
+        "migration 用当前 active cycle 回填 legacy 行（伪造历史 provenance）",
+    ),
+    (
+        "M-OC2",
+        MIGRATIONS,
+        "    for table in (\"paper_orders\", \"paper_orders_archive\"):\n"
+        "        if \"cycle_id\" not in table_columns(conn, table):\n"
+        "            continue\n",
+        "    for table in ():\n"
+        "        if \"cycle_id\" not in table_columns(conn, table):\n"
+        "            continue\n",
+        "cycle_id 可被 UPDATE（immutable guard 未安装）",
+    ),
+    (
+        "M-OC3",
+        MIGRATIONS,
+        "    definitions = {\"cycle_id\": \"INTEGER\"}\n"
+        "    changes = {}\n"
+        "    for table in (\"paper_orders\", \"paper_orders_archive\"):\n"
+        "        changes[table] = ensure_columns(conn, table, definitions)\n",
+        "    definitions = {\"cycle_id\": \"INTEGER\"}\n"
+        "    changes = {}\n"
+        "    for table in (\"paper_orders\",):\n"
+        "        changes[table] = ensure_columns(conn, table, definitions)\n",
+        "archive 表漏 cycle_id（SELECT * 整行拷贝错位）",
+    ),
+    (
+        "M-OC4",
+        MIGRATIONS,
+        "                    OR NOT EXISTS (\n"
+        "                        SELECT 1 FROM paper_cycles c WHERE c.id=NEW.cycle_id\n"
+        "                    )\n",
+        "                    OR 0\n",
+        "不存在的 cycle_id 被接受（guard 不再校验引用完整性）",
+    ),
+    (
+        "M-OC5",
+        WRITER,
+        "    order_cycle = _order_cycle_id_for_order(conn, order_id) if order_id is not None else None\n"
+        "    cycle_id = order_cycle if order_cycle is not None else _order_cycle_id(conn, cycle_id)\n",
+        "    # MUTANT M-OC5: lot ignores its source buy order's cycle\n"
+        "    cycle_id = _order_cycle_id(conn, cycle_id)\n",
+        "BUY lot 不继承来源订单 cycle（订单与 lot 可跨周期）",
+    ),
+    (
+        "M-OC6",
+        WRITER,
+        "    cycle_id = _order_cycle_id(conn, cycle_id)\n"
+        "    remaining = int(qty)\n",
+        "    # MUTANT M-OC6: lot consumption re-resolves the active cycle\n"
+        "    cycle_id = _active_cycle(conn)[\"id\"]\n"
+        "    remaining = int(qty)\n",
+        "SELL 消耗 lot 时重新解析周期（split-brain）",
+    ),
+    (
+        "M-OC7",
+        ADAPTER,
+        "        if self._orders_have_cycle_column():\n"
+        "            columns.append(\"o.cycle_id AS order_cycle_id\")\n",
+        "        # MUTANT M-OC7: adapter ignores the explicit order cycle\n"
+        "        if False:\n"
+        "            columns.append(\"o.cycle_id AS order_cycle_id\")\n",
+        "adapter 忽略显式 order cycle（durable provenance 失效）",
+    ),
+    (
+        "M-OC8",
+        ADAPTER,
+        "        if instant is not None and end_precise and end_instant is not None \\\n"
+        "                and instant > end_instant:\n"
+        "            return \"excluded\"\n",
+        "        if False:\n"
+        "            return \"excluded\"\n",
+        "同日 cycle 边界退回 date-only 比较（时刻精度丢失）",
+    ),
 )
 
 #: 自检哨兵：只改注释。它必须 UNDETECTED —— 否则测试基线本来就是红的，
@@ -429,8 +519,8 @@ MUTATIONS = (
 SANITY_MUTATION = (
     "S0",
     ADAPTER,
-    "POSITION_EVIDENCE_VERSION = \"position-evidence-v2\"\n",
-    "POSITION_EVIDENCE_VERSION = \"position-evidence-v2\"  # sanity\n",
+    "POSITION_EVIDENCE_VERSION = \"position-evidence-v3\"\n",
+    "POSITION_EVIDENCE_VERSION = \"position-evidence-v3\"  # sanity\n",
     "harness sanity check (comment only, must survive)",
 )
 
@@ -624,7 +714,6 @@ def verify_equivalent() -> int:
     不存在"归约成单一 entry_session"的代码路径。
     """
     import sqlite3
-    import tempfile
 
     sys.path.insert(0, str(ROOT / "backend"))
     import selection_tradability as ST
@@ -933,6 +1022,53 @@ DESIGNATED_NON_VACUITY = {
         "test_tradability_position_shadow"
         ".SellReplayOrderingUsesRealEventTime"
         ".test_EVENT_ORDER_3_snapshot_separates_before_and_after",
+    ),
+    # ── v18 订单周期归属（M-OC*）──
+    "M-OC1": (
+        "test_order_cycle_provenance"
+        ".MigrationNoBackfillTests"
+        ".test_MIG_CYCLE_3_and_7_legacy_rows_stay_null_and_unchanged",
+    ),
+    "M-OC2": (
+        "test_order_cycle_provenance"
+        ".ImmutabilityGuardTests"
+        ".test_MIG_CYCLE_8_null_to_cycle_update_is_rejected",
+    ),
+    "M-OC3": (
+        # 实测：archive 少一列时"列顺序相等"断言仍可能全绿（两边都少），
+        # 真正抓住它的是 ``ensure_columns`` 的返回契约。
+        "test_order_cycle_provenance"
+        ".SchemaContractTests"
+        ".test_ensure_is_idempotent",
+    ),
+    "M-OC4": (
+        # 实测：去掉引用完整性校验后，NULL 仍会被 `c.id = NULL` 拦下，
+        # 因此指名真正观察该分支的用例。
+        "test_order_cycle_provenance"
+        ".InsertGuardTests"
+        ".test_nonexistent_cycle_id_is_rejected",
+    ),
+    "M-OC5": (
+        "test_order_cycle_provenance"
+        ".ProductionPrimitiveCycleTests"
+        ".test_buy_lot_inherits_its_source_order_cycle_not_the_active_cycle",
+    ),
+    "M-OC6": (
+        "test_order_cycle_provenance"
+        ".ProductionPrimitiveCycleTests"
+        ".test_lot_consumption_uses_the_explicit_cycle_not_the_active_one",
+    ),
+    "M-OC7": (
+        # 实测：忽略显式 cycle 后 OC6 仍 proven（窗口恰好也能证明），
+        # 真正暴露该缺陷的是"跨周期卖出必须被拒绝"的 OC3。
+        "test_order_cycle_identity"
+        ".CrossCycleIdentityTests"
+        ".test_OC3_sell_order_cycle_must_match_the_consumed_lot_cycle",
+    ),
+    "M-OC8": (
+        "test_order_cycle_identity"
+        ".ExactTimeFallbackTests"
+        ".test_TIME_CYCLE_2_competitor_ended_before_the_sell_is_excluded",
     ),
 }
 

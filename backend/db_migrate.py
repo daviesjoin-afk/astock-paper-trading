@@ -119,6 +119,18 @@ def _ensure_tradability_archive_observation_links(conn):
     return OL.ensure_archive_link_schema(conn)
 
 
+def _ensure_order_cycle_provenance(conn):
+    """v18：订单不可变周期归属（write-time fact，纯新增列 + guard，绝不回填）。
+
+    只给 ``paper_orders`` / ``paper_orders_archive`` 加 ``cycle_id`` 并安装 guard；
+    **不** UPDATE 任何既有行。升级前的订单属于哪个周期无法从当前状态反推，
+    ``cycle_id IS NULL`` 就是诚实的 legacy provenance 状态 —— 任何 backfill 都是
+    把"不知道"洗白成"知道"。表结构与 guard 由
+    :func:`paper_schema_migrations.ensure_order_cycle_provenance` 持有。
+    """
+    return paper_schema.ensure_order_cycle_provenance(conn)
+
+
 # 迁移注册表：db_name -> [(version, description, sql_or_callable), ...]
 MIGRATIONS = {
     "paper_trading": [
@@ -172,6 +184,13 @@ MIGRATIONS = {
         # 建立可靠 provenance（见 issue #161 §六/§七/§二十四）。
         (17, "新增 archive 事实行观察来源链接表（幂等，append-only）",
          _ensure_tradability_archive_observation_links),
+        # 订单不可变周期归属：给 paper_orders / paper_orders_archive 同时加 cycle_id
+        # 并安装 guard（新订单必须带真实 cycle、写入后不可更改）。**绝不回填历史行**：
+        # 升级前的订单属于哪个周期无法从当前状态反推（paper_accounts.cycle_id 是可变
+        # 重绑定，paused 周期 started_at 为 NULL），cycle_id IS NULL 就是诚实的
+        # legacy provenance 状态。Migration 本身绝不允许"提高历史 coverage"。
+        (18, "新增订单不可变周期归属字段 cycle_id（幂等，不回填）",
+         _ensure_order_cycle_provenance),
     ],
     "adaptive_learning": [
         (1, "创建 schema_version 表", """

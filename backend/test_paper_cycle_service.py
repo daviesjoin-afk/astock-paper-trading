@@ -110,8 +110,8 @@ class CycleSnapshotTests(_DbCase):
         stamp = SR.stamp_for_account(self.conn, "tq_breakout")
         self.conn.execute(
             "INSERT INTO paper_orders(id,account_id,side,code,qty,status,risk_payload,created_at,"
-            "strategy_id,strategy_version,strategy_checksum) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-            (1, "tq_breakout", "buy", "600901", 100, "pending", "{}", PCS.now()) + stamp,
+            "strategy_id,strategy_version,strategy_checksum,cycle_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+            (1, "tq_breakout", "buy", "600901", 100, "pending", "{}", PCS.now()) + stamp + (self.cycle["id"],),
         )
         self.conn.commit()
         _cycle, snapshot = PCS.cycle_snapshot(self.conn, self.cycle)

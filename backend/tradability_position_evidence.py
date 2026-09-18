@@ -96,8 +96,12 @@ except ImportError:  # pragma: no cover - package-style import
     from . import selection_tradability as ST
 
 
-POSITION_EVIDENCE_VERSION = "position-evidence-v2"
-POSITION_EVIDENCE_FINGERPRINT_VERSION = "sha256-canonical-position-evidence-v2"
+POSITION_EVIDENCE_VERSION = "position-evidence-v3"
+# v2 -> v3：同一份历史事实的**证据解释**变了，因此必须正式 bump，不能沿用旧号。
+# 变化点：(a) 周期归属统一走 ``_cycle_relation`` 三态（含 §20 时刻级比较、
+# §21 边界同日不猜日内顺序）；(b) ``paper_orders.cycle_id`` 成为显式 durable
+# provenance 路径。旧 fingerprint 与新 fingerprint 不可比。
+POSITION_EVIDENCE_FINGERPRINT_VERSION = "sha256-canonical-position-evidence-v3"
 
 #: ``held_quantity`` 的口径。**只有这一种**是决策时点口径。
 QUANTITY_BASIS_HISTORICAL_REPLAY = "historical_replay_fifo_at_decision"
@@ -240,6 +244,19 @@ def _session_of(value: Any) -> Optional[str]:
     except ValueError:
         return None
     return head
+
+
+def _is_precise_instant(value: Optional[str]) -> bool:
+    """该时间值是否**带时刻**（``YYYY-MM-DD HH:MM:SS`` / ISO ``T``），而不是只有日期。
+
+    只有日期的边界是**不精确**的：它不表示「当天结束」，而表示「当天某时刻」。
+    把不精确边界当成精确时刻去比较，会把同日发生的卖出误判成「发生在周期开始
+    之前」—— 那是把精度不足伪装成精确证据。
+    """
+    text = _text(value)
+    if text is None:
+        return False
+    return len(text) > 10
 
 
 def _int(value: Any) -> int:
@@ -575,8 +592,9 @@ class PositionEvidenceAdapter:
         self._evidence_provider = evidence_provider
         #: ``paper_orders.cycle_id`` 是否存在（发现式，不写死假设）。
         self._orders_cycle_column: Optional[bool] = None
-        #: ``cycle_id -> (started_at, ended_at)`` 日期窗口缓存。
-        self._cycle_windows: dict = {}
+        #: ``cycle_id -> (start_session, end_session, start_instant, end_instant)``
+        #: 统一事实缓存（日期 + 时刻两种粒度，供三态关系判定使用）。
+        self._cycle_facts_cache: dict = {}
         #: 全部周期行的缓存（``None`` = 尚未读取）。
         self._cycle_cache: Optional[list] = None
 
@@ -721,46 +739,101 @@ class PositionEvidenceAdapter:
                 "FROM paper_cycles ORDER BY id", ())
         return self._cycle_cache
 
-    def _cycle_window(self, cycle_id: Any) -> Optional[tuple]:
-        """**请求周期**的 ``(start, end)``（日期粒度），用于界定卖出归属。
+    def _cycle_facts(self, cycle_id: Any) -> Optional[tuple]:
+        """周期事实 → ``(start_session, end_session, start_instant, end_instant,
+        start_precise, end_precise)``。
 
-        生产 ``paper_orders`` / ``paper_fills`` 都没有 ``cycle_id``，因此历史周期
-        归属只能靠**时间窗**。
+        同时给出**日期**与**完整时刻**两种粒度，以及该边界**是否带时刻**：
 
-        **起点的唯一权威是 ``started_at``**：生产只在周期真正开始承担订单/持仓
-        经济所有权时写它。``created_at`` 只是行插入时刻，只能证明「该周期行最迟
-        此刻已存在」，**不能**证明经济所有权已经开始 —— 所以它不再作为起点回退。
-        拿 ``created_at`` 补起点会把「起点未知」静默升级成 proven 归属。
+        * 生产用 ``_now()``（``YYYY-MM-DD HH:MM:SS``）写 ``started_at``，因此真实
+          周期边界都是精确的，可以按时刻比较（§20）；
+        * 只有日期（长度 10）的边界是**不精确**的 legacy/夹具形状，不能当成
+          「当天结束」——那会把同日卖出误判成发生在周期开始之前。不精确边界一律
+          退回日期粒度判定，与旧语义保持一致。
 
-        ``started_at`` 缺失 ⇒ ``start=None``：该周期的历史 ownership window 不可
-        证明，任何基于它的归属都必须 fail closed。
-
-        ``ended_at`` 为 ``NULL`` 表示**开放窗口**（尚未结束），而不是「不可证明」。
-        周期行本身不存在 ⇒ ``None``。
+        周期行不存在 ⇒ ``None``。
         """
         if cycle_id is None:
             return None
-        if cycle_id in self._cycle_windows:
-            return self._cycle_windows[cycle_id]
-        window = None
+        if cycle_id in self._cycle_facts_cache:
+            return self._cycle_facts_cache[cycle_id]
+        facts = None
         for row in self._cycle_rows():
             if _int_or_none(_row_field(row, "id")) != _int_or_none(cycle_id):
                 continue
-            start = _session_of(_row_field(row, "started_at"))
-            end = _session_of(_row_field(row, "ended_at"))
-            window = (start, end)
+            raw_start = _text(_row_field(row, "started_at"))
+            raw_end = _text(_row_field(row, "ended_at"))
+            facts = (
+                _session_of(raw_start), _session_of(raw_end),
+                _instant(raw_start), _instant(raw_end),
+                _is_precise_instant(raw_start), _is_precise_instant(raw_end),
+            )
             break
-        self._cycle_windows[cycle_id] = window
-        return window
+        self._cycle_facts_cache[cycle_id] = facts
+        return facts
 
-    def _competing_cycles(self, cycle_id: Any, session: Optional[str]) -> tuple:
+    @staticmethod
+    def _cycle_relation(facts: Optional[tuple], session: Optional[str],
+                        instant: Optional[str]) -> str:
+        """该周期相对一笔卖出的关系（三态，**绝不**默认包含或排除）。
+
+        返回 ``excluded`` / ``contains`` / ``undecidable``：
+
+        * ``excluded``   —— 可**证明**该周期不拥有这笔卖出；
+        * ``contains``   —— 可**证明**该周期拥有这笔卖出；
+        * ``undecidable``—— 边界证据不足，两个方向都不能断言。
+
+        ``started_at`` 缺失 ⇒ 起点不可证明 ⇒ ``undecidable``（``created_at`` 不参与，
+        它只证明「行已存在」）。``ended_at`` 缺失是**开放窗口**，不是不可证明。
+
+        §20 收紧：卖出有 ``executed_at``、且边界**带时刻**时按**时刻**比较 ——
+        同一交易日里「10:00 卖出 / 16:00 周期才开始」只比日期无法表达先后。
+
+        §21 保持 fail closed：卖出**没有**完整成交时刻、而边界带时刻又与卖出同一天
+        时，**不能**猜日内顺序 ⇒ ``undecidable``。只有严格跨日才允许用日期证明排除。
+        """
+        if facts is None or session is None:
+            return "undecidable"
+        (start_session, end_session, start_instant, end_instant,
+         start_precise, end_precise) = facts
+        # ── 1) 结束边界优先：结束已证明早于该卖出 ⇒ 不竞争，**不需要**起点 ──
+        #    （顺序很关键：起点未知时若先判 ``undecidable``，就永远用不上
+        #      "它早就结束了" 这个可证明的排除事实。）
+        if end_session is not None and end_session < session:
+            return "excluded"
+        if instant is not None and end_precise and end_instant is not None \
+                and instant > end_instant:
+            return "excluded"
+        # ── 2) 起点不可证明 ⇒ 两个方向都不能断言 ──
+        if start_session is None:
+            return "undecidable"
+        # ── 3) 起点证明晚于该卖出 ⇒ 不竞争 ──
+        if start_session > session:
+            return "excluded"
+        if instant is not None and start_precise and start_instant is not None \
+                and instant < start_instant:
+            return "excluded"
+        # ── 4) 可证明包含（窗覆盖该卖出） ──
+        if instant is not None and start_precise and end_precise:
+            # 两个边界都带时刻 ⇒ 精确判定已由上面完成。
+            return "contains"
+        if instant is None and (
+            (start_precise and start_session == session)
+            or (end_precise and end_session == session)
+        ):
+            # §21：卖出没有精确时刻，边界带时刻又与它同一天 ⇒ 日内顺序不可知。
+            return "undecidable"
+        return "contains"
+
+    def _competing_cycles(self, cycle_id: Any, session: Optional[str],
+                          instant: Optional[str] = None) -> tuple:
         """把**其它每个周期**显式分类 → ``(ambiguous, unprovable)``。
 
         ``paper_fills`` / ``paper_orders`` 都没有 ``cycle_id``，所以一笔卖出是否
         属于请求周期只能靠时间窗。对每一个其它周期，只有两种情况可以安全排除：
 
-        * ``ended_at < session`` —— 它在该卖出之前就结束了；
-        * ``started_at > session`` —— 它在该卖出之后才开始。
+        * ``ended_at`` 早于该卖出 —— 它在该卖出之前就结束了；
+        * ``started_at`` 晚于该卖出 —— 它在该卖出之后才开始。
 
         两者都拿不到时**不能**排除：``started_at IS NULL`` 只说明**起点证据缺失**
         （生产里 cycles 5/6/7 正是「跑过并归档、但 ``started_at`` 为空」的行，
@@ -777,6 +850,10 @@ class PositionEvidenceAdapter:
 
         ``status`` 不参与判定：``paused`` 描述的是**当前/记录状态**，不是某个历史
         卖出当时的周期归属，因此不能当作「不竞争」的证据。
+
+        §20/§21：判定统一委托 :meth:`_cycle_relation` —— 卖出有完整 ``executed_at``
+        时按**时刻**比较（同一天也能分先后），没有时只在**严格跨日**才允许用日期
+        证明排除，边界同一天一律 ``undecidable``。
         """
         if cycle_id is None or session is None:
             return False, ()
@@ -787,20 +864,16 @@ class PositionEvidenceAdapter:
             other = _int_or_none(_row_field(row, "id"))
             if other is None or other == requested:
                 continue
-            start = _session_of(_row_field(row, "started_at"))
-            end = _session_of(_row_field(row, "ended_at"))
-            # 已结束且结束日早于该卖出 → 可证明不包含它。
-            if end is not None and session > end:
+            relation = self._cycle_relation(self._cycle_facts(other), session, instant)
+            if relation == "excluded":
+                # 已证明不拥有该卖出 → 可以排除。
                 continue
-            # 起点晚于该卖出 → 可证明不包含它。
-            if start is not None and session < start:
+            if relation == "contains":
+                # 窗口可证明包含该卖出 → 归属无法唯一确定。
+                ambiguous = True
                 continue
-            if start is None:
-                # 边界证据不足：既不能断言包含，也不能断言排除 → 归属不可证明。
-                unprovable.append(other)
-                continue
-            # 起点可证明 <= session 且未在 session 前结束 → 窗口包含该卖出。
-            ambiguous = True
+            # 边界证据不足：既不能断言包含，也不能断言排除 → 归属不可证明。
+            unprovable.append(other)
         return ambiguous, tuple(unprovable)
 
     def _sell_events(self, account_id: str, code: str,
@@ -827,7 +900,7 @@ class PositionEvidenceAdapter:
         ``executed_at`` 是委托的**真实成交时刻**：同一 session 内的卖出用它判断
         「是否发生在决策时点之前」，不再拿 session 收盘时刻去近似。
         """
-        window = self._cycle_window(cycle_id)
+        requested_facts = self._cycle_facts(cycle_id)
         events = []
         for row in self._sell_fills_for(account_id, code, cycle_id=cycle_id):
             fill_account = _text(_row_field(row, "fill_account_id"))
@@ -837,6 +910,7 @@ class PositionEvidenceAdapter:
             fill_side = str(_row_field(row, "fill_side") or "").lower()
             order_side = str(_row_field(row, "order_side") or "").lower()
             session = _session_of(_row_field(row, "fill_date"))
+            executed_instant = _instant(_row_field(row, "executed_at"))
             identity_ok = (
                 fill_account == account_id
                 and order_account == account_id
@@ -851,24 +925,32 @@ class PositionEvidenceAdapter:
             # ``proven`` 需要**同时**满足：请求周期自身窗口可证明、该卖出落在窗内、
             # 且**所有其它周期都能被证明不包含它**。「其它周期无法证明包含」不等于
             # 「可以证明其它周期不包含」—— 前者缺失时必须降级，不能默认升级。
+            #
+            # §20/§21：窗内/窗外一律经 :meth:`_cycle_relation` 判定 —— 有真实成交
+            # 时刻时按**时刻**比较（同一天也能分先后），没有时边界同一天一律
+            # ``undecidable``，绝不猜日内顺序。
             attribution = CYCLE_ATTRIBUTION_UNPROVABLE
             cycle_diagnostics: list = []
             if cycle_id is not None:
-                if window is None or session is None:
+                if requested_facts is None or session is None:
                     # 请求周期没有可用窗口 / 卖出 session 不可解析：归属无从证明。
                     attribution = CYCLE_ATTRIBUTION_UNPROVABLE
                     cycle_diagnostics.append("sell_fill_cycle_unprovable")
                 else:
-                    start_at, end_at = window
-                    if start_at is None:
-                        # 周期行存在但起点不可证明 → 无法断言该卖出属于它。
+                    relation = self._cycle_relation(
+                        requested_facts, session, executed_instant,
+                    )
+                    if relation == "undecidable":
+                        # 周期行存在但起点不可证明 / 边界同一天且日内顺序未知。
                         attribution = CYCLE_ATTRIBUTION_UNPROVABLE
                         cycle_diagnostics.append("sell_fill_cycle_unprovable")
-                    elif session < start_at or (end_at is not None and session > end_at):
+                    elif relation == "excluded":
                         attribution = CYCLE_ATTRIBUTION_MISMATCH
                         cycle_diagnostics.append("sell_fill_cycle_mismatch")
                     else:
-                        ambiguous, unprovable = self._competing_cycles(cycle_id, session)
+                        ambiguous, unprovable = self._competing_cycles(
+                            cycle_id, session, executed_instant,
+                        )
                         if ambiguous:
                             attribution = CYCLE_ATTRIBUTION_AMBIGUOUS
                             cycle_diagnostics.append("sell_fill_cycle_ambiguous")
@@ -895,12 +977,11 @@ class PositionEvidenceAdapter:
                         # 显式身份明确指向**别的**周期。
                         attribution = CYCLE_ATTRIBUTION_MISMATCH
                         cycle_diagnostics.append("sell_fill_cycle_mismatch")
-                    elif (window is not None and window[0] is not None
-                          and session is not None
-                          and (session < window[0]
-                               or (window[1] is not None and session > window[1]))):
+                    elif requested_facts is not None and self._cycle_relation(
+                            requested_facts, session, executed_instant) == "excluded":
                         # 显式身份说属于本周期，本周期可证明的时间窗却把它排除 →
-                        # 硬冲突：两边证据都在，不能静默相信任意一方。
+                        # 硬冲突：两边证据都在，不能静默相信任意一方。§20：这里也按
+                        # **时刻**比较，否则「同日 16:00 才开始的周期」会被误当成已覆盖。
                         attribution = CYCLE_ATTRIBUTION_UNPROVABLE
                         cycle_diagnostics.append("sell_fill_cycle_identity_conflict")
                     else:

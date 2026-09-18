@@ -114,16 +114,17 @@ def _decision(conn, account_id, code, side, decision, reason, name):
     ))
 
 
-def _order(conn, account_id, code, name, side, qty, status, reason, created_at, planned=None, filled=None):
+def _order(conn, account_id, code, name, side, qty, status, reason, created_at, planned=None, filled=None, cycle_id=None):
     price = filled if filled is not None else (planned if planned is not None else 0.0)
     strategy_stamp = PT._strategy_stamp(conn, account_id)
     cur = conn.execute(
-        "INSERT INTO paper_orders(account_id,side,code,name,qty,planned_price,filled_price,amount,fees,status,reason,risk_payload,created_at,executed_at,strategy_id,strategy_version,strategy_checksum) "
-        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        "INSERT INTO paper_orders(account_id,side,code,name,qty,planned_price,filled_price,amount,fees,status,reason,risk_payload,created_at,executed_at,strategy_id,strategy_version,strategy_checksum,cycle_id) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         (account_id, side, code, name, qty,
          planned if planned is not None else price, filled, round(price * qty, 2),
          round(price * qty * 0.0003, 2), status, reason, "{}", created_at,
-         created_at if status == "filled" else None, *strategy_stamp),
+         created_at if status == "filled" else None, *strategy_stamp,
+         cycle_id if cycle_id is not None else PT._order_cycle_id(conn)),
     )
     return cur.lastrowid
 
