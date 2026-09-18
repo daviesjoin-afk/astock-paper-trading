@@ -18,6 +18,7 @@
 """
 from __future__ import annotations
 
+import datetime as dt
 import os
 import sqlite3
 import sys
@@ -304,17 +305,39 @@ class NewsLearningHoldingTier(_LedgerCase):
 
 
 class RebalanceHeldCodes(_LedgerCase):
-    """§14 PC4–PC5 —— 替补候选排除必须用权威 holdings。"""
+    """§14 PC4–PC5 —— 替补候选排除必须用权威 holdings。
+
+    承重测试驱动**真实路径** ``find_replacement_candidates``，而不是只调 reader
+    原语：只调原语时，把 rebalance_scanner 改回读 mirror 的变异不会被抓到
+    （非空性实测暴露过这一点）。
+    """
+
+    def _factor_table(self):
+        import pandas as pd
+        return pd.DataFrame(
+            [{"name": "候选A", "score": 99.0}, {"name": "候选B", "score": 98.0}],
+            index=[CODE, "601398"],
+        )
+
+    def _candidate_codes(self, sold_code="000002"):
+        import rebalance_scanner as RS
+        rows = RS.find_replacement_candidates(
+            self.conn, ACCOUNT, sold_code, {}, factor_table=self._factor_table()
+        )
+        return {str(r.get("code")) for r in rows}
 
     def test_PC4_stale_mirror_does_not_exclude(self):
+        """陈旧镜像里的代码不得被排除在替补候选之外（它并不被持有）。"""
         self.stale_mirror_scenario()
-        self.assertEqual(PPRM.current_held_codes(self.conn), set(),
-                         "陈旧镜像把代码错误排除在替补候选外")
+        self.assertIn(CODE, self._candidate_codes(),
+                      "陈旧镜像把代码错误排除在替补候选外")
 
     def test_PC5_current_lot_is_excluded(self):
+        """当前周期确实持有 ⇒ 必须被排除。"""
         self.add_lot(self.cycle1, 100)
         self.conn.commit()
-        self.assertEqual(PPRM.current_held_codes(self.conn), {CODE})
+        self.assertNotIn(CODE, self._candidate_codes(),
+                         "当前周期持仓未被排除出替补候选")
 
     def test_rebalance_scanner_uses_authoritative_reader(self):
         """源码级：rebalance_scanner 不再直接读 paper_positions。"""
@@ -326,18 +349,80 @@ class RebalanceHeldCodes(_LedgerCase):
 
 
 class AdaptiveShadowPortfolio(_LedgerCase):
-    """§15 PC6–PC7 —— 影子组合必须看到正确的当前事实。"""
+    """§15 PC6–PC7 —— 影子组合必须看到正确的当前事实。
+
+    承重测试驱动**真实路径** ``_portfolio_shadow_arbitration``（影子/advisory，
+    无执行 authority），而不是只调 reader 原语。
+
+    影子路径里持仓的作用有两处：① ``_portfolio_shadow_risk(positions)`` 的组合
+    风险指标；② 对候选信号的 ``held_codes`` 去重惩罚。因此「权威持仓是否被看到」
+    要用这两者断言 —— 而不是断言持仓出现在 ``candidates`` 里（那来自
+    ``paper_signals``，持仓从不作为 candidate 输出）。
+    """
+
+    def _shadow(self):
+        import adaptive_engine as AE
+        with mock.patch.object(AE, "PAPER_DB_PATH", self.path):
+            return AE._portfolio_shadow_arbitration()
 
     def test_PC6_stale_mirror_excluded_from_shadow_portfolio(self):
         self.stale_mirror_scenario()
-        self.assertEqual(PPRM.current_positions(self.conn), [],
-                         "影子组合会包含陈旧镜像持仓")
+        result = self._shadow()
+        # 持仓在影子输出里的可观测面：held_slots 计数 + risk_metrics 的持仓聚合。
+        self.assertEqual(int(result.get("held_slots") or 0), 0,
+                         "陈旧镜像被算进了影子组合持仓")
+        self.assertEqual(int((result.get("risk_metrics") or {}).get("positions", {}).get("total") or 0), 0,
+                         "陈旧镜像进入了影子风险持仓聚合")
+        self.assertEqual(str(result.get("mode")), "shadow",
+                         "影子模式不得因本改动获得执行 authority")
 
-    def test_PC7_authoritative_lot_included(self):
+    def test_PC7_authoritative_lot_is_seen_by_shadow(self):
+        """权威持仓必须被影子路径看到（作为组合风险输入）。"""
         self.add_lot(self.cycle1, 100)
         self.conn.commit()
-        rows = PPRM.current_positions(self.conn)
-        self.assertEqual([r["code"] for r in rows], [CODE])
+        result = self._shadow()
+        self.assertEqual(int(result.get("held_slots") or 0), 1,
+                         "权威持仓未被影子组合看到")
+        self.assertEqual(int((result.get("risk_metrics") or {}).get("positions", {}).get("total") or 0), 1,
+                         "权威持仓未进入影子风险持仓聚合")
+        self.assertEqual(str(result.get("mode")), "shadow")
+
+    def test_PC7b_shadow_duplicate_penalty_follows_authoritative_holdings(self):
+        """候选信号的去重惩罚必须基于权威持仓，而不是陈旧镜像。"""
+        import adaptive_engine as AE
+        import strategy_registry as registry
+        today = dt.datetime.now(AE.TZ).date().isoformat()
+        # 用仓库既有的策略版本戳机制写信号：paper_signals 有不可绕过的
+        # strategy stamp 触发器，手写 INSERT 会被 fail closed 拒绝。
+        strategy_id, version, checksum = registry.stamp_for_account(self.conn, ACCOUNT)
+        self.conn.execute(
+            "INSERT INTO paper_signals(account_id,code,name,status,intended_date,"
+            "signal_date,t_score,rank_score,payload,created_at,"
+            "strategy_id,strategy_version,strategy_checksum) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (ACCOUNT, CODE, NAME, "pending", today, today, 60.0, 60.0, "{}", today,
+             strategy_id, version, checksum),
+        )
+        self.conn.commit()
+
+        # 只有陈旧镜像（不在当前周期）⇒ 不应触发同股惩罚
+        self.stale_mirror_scenario()
+        stale = self._shadow()
+        stale_row = next((r for r in stale.get("candidates") or [] if r["code"] == CODE), None)
+        self.assertIsNotNone(stale_row, "夹具未产出候选")
+        self.assertEqual(stale_row["penalties"]["duplicate"], 0.0,
+                         "陈旧镜像触发了同股惩罚")
+
+        # 当前周期放入权威 lot ⇒ 应触发同股惩罚
+        active = int(self.conn.execute(
+            "SELECT id FROM paper_cycles WHERE status IN ('draft','running','paused')"
+            " ORDER BY id DESC LIMIT 1").fetchone()[0])
+        self.add_lot(active, 100)
+        held = self._shadow()
+        held_row = next((r for r in held.get("candidates") or [] if r["code"] == CODE), None)
+        self.assertIsNotNone(held_row, "夹具未产出候选")
+        self.assertGreater(held_row["penalties"]["duplicate"], 0.0,
+                           "权威持仓未触发同股惩罚")
 
     def test_adaptive_engine_uses_authoritative_reader(self):
         root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
