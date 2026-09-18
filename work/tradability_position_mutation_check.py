@@ -1615,16 +1615,21 @@ def _run_specific(test_ids) -> subprocess.CompletedProcess:
     )
 
 
-def non_vacuity() -> int:
+def non_vacuity(only=None) -> int:
     """§30：revert-then-run —— 指名的测试必须**先绿后红**。
 
     对每条变异：先在**未变异**源码上跑它指名的测试（必须全绿），再变异后跑
     同样的测试（必须全红）。两步都成立才说明该测试真的在守护这个缺陷，
     而不是碰巧跟着别的失败一起变红。
+
+    ``only`` 给出变异 id 集合时只校验这些条目，供**隔离 worktree 里的并发
+    worker** 使用（与 ``_run_matrix`` 同一套分片机制）。子集模式不打印总判定，
+    由主进程汇总各片结果。
     """
     print("=== non-vacuity (revert-then-run) ===")
+    items = [(n, d) for n, d in DESIGNATED_NON_VACUITY.items() if only is None or n in only]
     failures = []
-    for name, designated in DESIGNATED_NON_VACUITY.items():
+    for name, designated in items:
         entry = next((item for item in MUTATIONS if item[0] == name), None)
         if entry is None:
             failures.append(f"{name}: 变异未登记")
@@ -1671,7 +1676,12 @@ def non_vacuity() -> int:
         print("\nnon-vacuity failures:")
         for item in failures:
             print(f"  {item}")
-    print(f"non-vacuity: {'PASS' if not failures else 'FAIL'}")
+    if only is None:
+        print(f"non-vacuity: {'PASS' if not failures else 'FAIL'}")
+    else:
+        # 子集模式：逐条打印结论，总判定由主进程汇总（避免把「部分片通过」
+        # 误读成整体 PASS）。
+        print(f"non-vacuity shard: {len(items) - len(failures)}/{len(items)} ok")
     return 1 if failures else 0
 
 
@@ -1699,10 +1709,10 @@ def main(argv=None) -> int:
         if locked:
             return locked
         try:
-            if not baseline_is_green():
+            if only is None and not baseline_is_green():
                 print("baseline contract tests are not green; refusing to run non-vacuity")
                 return 1
-            return non_vacuity()
+            return non_vacuity(only=only)
         finally:
             release_run_lock()
     print(f"repo root: {ROOT}")
