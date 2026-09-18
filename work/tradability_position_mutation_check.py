@@ -38,6 +38,8 @@ TEST_MODULES = (
     # v18 订单周期归属：迁移/guard/order-writer 与跨周期身份契约。
     "test_order_cycle_provenance",
     "test_order_cycle_identity",
+    # Round-6：延迟成交的周期绑定（Blockers 1/2）。
+    "test_deferred_fill_cycle_binding",
 )
 
 ADAPTER = "backend/tradability_position_evidence.py"
@@ -476,10 +478,11 @@ MUTATIONS = (
     (
         "M-OC5",
         WRITER,
-        "    order_cycle = _order_cycle_id_for_order(conn, order_id) if order_id is not None else None\n"
-        "    cycle_id = order_cycle if order_cycle is not None else _order_cycle_id(conn, cycle_id)\n",
-        "    # MUTANT M-OC5: lot ignores its source buy order's cycle\n"
-        "    cycle_id = _order_cycle_id(conn, cycle_id)\n",
+        "    if order_id is not None:\n"
+        "        prov = _order_cycle_provenance_for_order(conn, order_id)\n"
+        "        if not prov.is_proven:\n",
+        "    # MUTANT M-OC5: lot falls back to the active cycle for a legacy order\n"
+        "    if False:\n",
         "BUY lot 不继承来源订单 cycle（订单与 lot 可跨周期）",
     ),
     (
@@ -511,6 +514,265 @@ MUTATIONS = (
         "        if False:\n"
         "            return \"excluded\"\n",
         "同日 cycle 边界退回 date-only 比较（时刻精度丢失）",
+    ),
+    (
+        "M-CF1",
+        "backend/paper_trading.py",
+        "    if order_id is not None:\n"
+        "        prov = _order_cycle_provenance_for_order(conn, order_id)\n"
+        "        if not prov.is_proven:\n"
+        "            raise OrderCycleProvenanceUnknown(\n"
+        "                order_id, prov.status,\n"
+        "                \"来源买单的周期归属不可证明；拒绝创建带确定周期的新 lot\",\n"
+        "            )\n"
+        "        cycle_id = prov.cycle_id\n"
+        "    else:\n"
+        "        cycle_id = _order_cycle_id(conn, cycle_id)\n",
+        "    order_cycle = _order_cycle_id_for_order(conn, order_id) if order_id is not None else None\n"
+        "    cycle_id = order_cycle if order_cycle is not None else _order_cycle_id(conn, cycle_id)\n",
+        "legacy order 的 lot 回退到当前 active cycle",
+    ),
+    (
+        "M-CF2",
+        "backend/execution_planner.py",
+        "        consumed, cost_amount = PT._consume_available_lots(\n"
+        "            conn, account_id, code, qty, asof_day, cycle_id=order_cycle_id,\n"
+        "        )\n",
+        "        consumed, cost_amount = PT._consume_available_lots(conn, account_id, code, qty, asof_day)\n",
+        "SELL 成交不把订单周期传给 FIFO 消耗",
+    ),
+    (
+        "M-CF3",
+        "backend/paper_trading.py",
+        "    if not provenance.is_proven:\n"
+        "        raise OrderCycleProvenanceUnknown(\n"
+        "            order_id, provenance.status,\n"
+        "            \"订单周期归属不可证明；拒绝进入成交语义\",\n"
+        "        )\n"
+        "    order_cycle_id = provenance.cycle_id\n",
+        "    if not provenance.is_proven:\n"
+        "        order_cycle_id = _active_cycle_id_readonly(conn)\n"
+        "    else:\n"
+        "        order_cycle_id = provenance.cycle_id\n",
+        "归属不可证明时回退到当前 active cycle（NULL/未知被当成可成交）",
+    ),
+    (
+        "M-CF4",
+        "backend/paper_trading.py",
+        "    if order_id is not None:\n"
+        "        prov = _order_cycle_provenance_for_order(conn, order_id)\n"
+        "        if not prov.is_proven:\n"
+        "            raise OrderCycleProvenanceUnknown(\n"
+        "                order_id, prov.status,\n"
+        "                \"来源买单的周期归属不可证明；拒绝创建带确定周期的新 lot\",\n"
+        "            )\n"
+        "        cycle_id = prov.cycle_id\n",
+        "    cycle_id = _order_cycle_id(conn, cycle_id)\n",
+        "BUY lot 不继承订单周期，改用当前 active cycle",
+    ),
+    (
+        "M-CF5",
+        "backend/execution_planner.py",
+        "    order_cycle_id = PT._assert_order_execution_cycle(\n"
+        "        conn, order_id, account_id=account_id, provenance=provenance,\n",
+        "    order_cycle_id = PT._order_cycle_id(conn)\n",
+        "成交闸门被替换成当前 active cycle（execution-cycle 一致性校验消失）",
+    ),
+    (
+        "M-CF6",
+        "backend/paper_trading.py",
+        "        if not same:\n"
+        "            # 跨周期 ⇒ 终止血缘，新订单作为独立尝试写入（不带 retry_of_order_id）。\n"
+        "            return None\n",
+        "",
+        "跨周期 retry lineage 被静默接受",
+    ),
+    (
+        "M-CF7",
+        "backend/paper_trading.py",
+        "    if cycle_id is None:\n"
+        "        raise OrderCycleProvenanceUnknown(\n"
+        "            None, ORDER_CYCLE_ORDER_MISSING,\n"
+        "            \"lot 消耗必须由来源订单显式提供周期；拒绝回退到当前 active cycle\",\n"
+        "        )\n",
+        "    cycle_id = _order_cycle_id(conn, cycle_id)\n",
+        "匿名 lot 消耗回退到当前 active cycle",
+    ),
+    (
+        "M-CF8",
+        "backend/execution_planner.py",
+        "    if mismatches:\n"
+        "        raise RuntimeError(\n"
+        "            f\"order identity mismatch for order_id={order_id}: \" + \"; \".join(mismatches)\n"
+        "        )\n",
+        "    if False:\n"
+        "        raise RuntimeError('order identity mismatch')\n",
+        "订单身份冲突被静默接受",
+    ),
+    (
+        "M-CF9",
+        "backend/paper_trading.py",
+        "    if account_cycle_id != order_cycle_id or active_cycle_id != order_cycle_id:\n",
+        "    if False:\n",
+        "删除 order_cycle == account_cycle / active_cycle 一致性检查",
+    ),
+    (
+        "M-CF10",
+        "backend/paper_trading.py",
+        "    account_cycle_id = _account_cycle_id_readonly(conn, account_id)\n",
+        "    account_cycle_id = order_cycle_id\n",
+        "账户周期证据被替换成订单周期（account 检查恒成立而失去意义）",
+    ),
+    (
+        "M-CF11",
+        "backend/manual_orders.py",
+        "                PT_assert_execution_cycle = _order_execution_cycle_guard()\n"
+        "                guarded_cycle_id = PT_assert_execution_cycle(\n"
+        "                    conn, order[\"id\"], account_id=order[\"account_id\"],\n"
+        "                )\n",
+        "                guarded_cycle_id = None\n",
+        "pending 扫描跳过 cycle guard，直接进入预占",
+    ),
+    (
+        "M-CF12",
+        "backend/execution_planner.py",
+        "    order_cycle_id = PT._assert_order_execution_cycle(\n"
+        "        conn, order_id, account_id=account_id, provenance=provenance,\n",
+        "    order_cycle_id = provenance.cycle_id\n",
+        "commit_fill 的 defense-in-depth 周期校验被删除（仅剩上层预检）",
+    ),
+    (
+        "M-CF14",
+        "backend/paper_capital_reservations.py",
+        "        reserved_cycle = _as_int(existing.get(\"cycle_id\"))\n"
+        "        if reserved_cycle != int(expected_cycle_id):\n",
+        "        reserved_cycle = int(expected_cycle_id)\n"
+        "        if reserved_cycle != int(expected_cycle_id):",
+        "预占周期与订单周期不一致时仍允许 resize",
+    ),
+    (
+        "M-CF15",
+        "backend/manual_orders.py",
+        "                terminal = _terminalize_cycle_stale_order(conn, order, guard_exc)\n"
+        "                output.append(terminal)\n"
+        "                continue\n",
+        "                output.append({\"order_id\": order[\"id\"], \"status\": \"pending_limit\"})\n"
+        "                continue\n",
+        "stale 订单不终态化（每轮 pending → 失败 → pending，永久污染扫描器）",
+    ),
+    (
+        "M-CF16",
+        "backend/manual_orders.py",
+        "                    reserved, reserve_reason = _reserve_shared_capital(\n"
+        "                        conn, order[\"id\"], order[\"account_id\"], order[\"code\"],\n"
+        "                        reserve_amount, reserve_fees,\n"
+        "                        expected_cycle_id=guarded_cycle_id,\n"
+        "                    )\n"
+        "                except Exception as exc:\n"
+        "                    # §3：归属冲突是**永久性**冲突，不是临时资金不足 ⇒ 终态化，\n"
+        "                    # 不能打回 pending_limit 让下一轮再试（永远不会成功）。\n"
+        "                    if not _is_reservation_cycle_mismatch(exc, _ReservationCycleMismatch):\n"
+        "                        raise\n"
+        "                    output.append(_terminalize_cycle_stale_order(conn, order, exc))\n"
+        "                    continue\n",
+        "                reserved, reserve_reason = _reserve_shared_capital(\n"
+        "                    conn, order[\"id\"], order[\"account_id\"], order[\"code\"],\n"
+        "                    reserve_amount, reserve_fees,\n"
+        "                )\n",        "未触发分支漏传 expected_cycle_id（预占周期失去校验）",
+    ),
+    (
+        "M-CF17",
+        "backend/manual_orders.py",
+        "            try:\n"
+        "                reserved, reserve_reason = _reserve_shared_capital(\n"
+        "                    conn, order[\"id\"], order[\"account_id\"], order[\"code\"],\n"
+        "                    reserve_amount, reserve_fees, expected_cycle_id=guarded_cycle_id,\n"
+        "                )\n"
+        "            except Exception as exc:\n"
+        "                # §3：预占归属冲突是永久性事实冲突，**不是**临时资金不足。\n"
+        "                # 旧行为把它和 funding shortage 混在一起 ⇒ 打回 pending_limit\n"
+        "                # 让下一轮再试 —— 而 order.cycle_id 与 reservation.cycle_id 都\n"
+        "                # 不可变，所以这个重试永远不会成功，只会永久污染扫描器。\n"
+        "                if not _is_reservation_cycle_mismatch(exc, _ReservationCycleMismatch):\n"
+        "                    raise\n"
+        "                output.append(_terminalize_cycle_stale_order(conn, order, exc))\n"
+        "                continue\n",
+        "            reserved, reserve_reason = _reserve_shared_capital(\n"
+        "                conn, order[\"id\"], order[\"account_id\"], order[\"code\"],\n"
+        "                reserve_amount, reserve_fees, expected_cycle_id=guarded_cycle_id,\n"
+        "            )\n",        "归属冲突被当成普通资金不足（无终态化分支）",
+    ),
+    (
+        "M-CF18",
+        "backend/manual_orders.py",
+        "            try:\n"
+        "                reserved, reserve_reason = _reserve_shared_capital(\n"
+        "                    conn, order[\"id\"], order[\"account_id\"], order[\"code\"],\n"
+        "                    reserve_amount, reserve_fees, expected_cycle_id=guarded_cycle_id,\n"
+        "                )\n"
+        "            except Exception as exc:\n"
+        "                # §3：预占归属冲突是永久性事实冲突，**不是**临时资金不足。\n"
+        "                # 旧行为把它和 funding shortage 混在一起 ⇒ 打回 pending_limit\n"
+        "                # 让下一轮再试 —— 而 order.cycle_id 与 reservation.cycle_id 都\n"
+        "                # 不可变，所以这个重试永远不会成功，只会永久污染扫描器。\n"
+        "                if not _is_reservation_cycle_mismatch(exc, _ReservationCycleMismatch):\n"
+        "                    raise\n"
+        "                output.append(_terminalize_cycle_stale_order(conn, order, exc))\n"
+        "                continue\n",
+        "            try:\n"
+        "                reserved, reserve_reason = _reserve_shared_capital(\n"
+        "                    conn, order[\"id\"], order[\"account_id\"], order[\"code\"],\n"
+        "                    reserve_amount, reserve_fees, expected_cycle_id=guarded_cycle_id,\n"
+        "                )\n"
+        "            except Exception as exc:\n"
+        "                if not _is_reservation_cycle_mismatch(exc, _ReservationCycleMismatch):\n"
+        "                    raise\n"
+        "                conn.execute(\n"
+        "                    'UPDATE paper_orders SET status=\\'pending_limit\\',reason=? WHERE id=?',\n"
+        "                    (str(exc), order[\"id\"]),\n"
+        "                )\n"
+        "                continue\n",        "归属冲突后仍保持 pending_limit（永久重试）",
+    ),
+    (
+        "M-CF19",
+        "backend/manual_orders.py",
+        "    # §6/§7：释放既有预占（若无预占，UPDATE 命中 0 行，天然 no-op，无需 catch-all）。\n"
+        "    # 释放失败即让本事务失败 —— 绝不留下「订单终态 + 资金仍被占用」的组合。\n"
+        "    _finish_capital_reservation(conn, order_id, \"released\")\n",
+        "    # §6/§7：释放既有预占（若无预占，UPDATE 命中 0 行，天然 no-op，无需 catch-all）。\n"
+        "    # 释放失败即让本事务失败 —— 绝不留下「订单终态 + 资金仍被占用」的组合。\n"
+        "    conn.execute(\n"
+        "        'UPDATE paper_capital_reservations SET cycle_id=? WHERE order_key=?',\n"
+        "        (detail.get('order_cycle_id'), str(order_id)),\n"
+        "    )\n"
+        "    _finish_capital_reservation(conn, order_id, \"released\")\n",        "终态化改写 reservation.cycle_id（伪造归属）",
+    ),
+    (
+        "M-CF20",
+        "backend/manual_orders.py",
+        "    # §6/§7：释放既有预占（若无预占，UPDATE 命中 0 行，天然 no-op，无需 catch-all）。\n"
+        "    # 释放失败即让本事务失败 —— 绝不留下「订单终态 + 资金仍被占用」的组合。\n"
+        "    _finish_capital_reservation(conn, order_id, \"released\")\n",
+        "    # §6/§7：释放既有预占（若无预占，UPDATE 命中 0 行，天然 no-op，无需 catch-all）。\n"
+        "    # 释放失败即让本事务失败 —— 绝不留下「订单终态 + 资金仍被占用」的组合。\n"
+        "    conn.execute(\n"
+        "        'UPDATE paper_capital_reservations SET amount=0.0,fees=0.0 WHERE order_key=?',\n"
+        "        (str(order_id),),\n"
+        "    )\n"
+        "    _finish_capital_reservation(conn, order_id, \"released\")\n",        "终态化 resize 预占金额/费用",
+    ),
+    (
+        "M-CF21",
+        "backend/manual_orders.py",
+        "    # §6/§7：释放既有预占（若无预占，UPDATE 命中 0 行，天然 no-op，无需 catch-all）。\n"
+        "    # 释放失败即让本事务失败 —— 绝不留下「订单终态 + 资金仍被占用」的组合。\n"
+        "    _finish_capital_reservation(conn, order_id, \"released\")\n",
+        "    # §6/§7：释放既有预占（若无预占，UPDATE 命中 0 行，天然 no-op，无需 catch-all）。\n"
+        "    # 释放失败即让本事务失败 —— 绝不留下「订单终态 + 资金仍被占用」的组合。\n"
+        "    try:\n"
+        "        _finish_capital_reservation(conn, order_id, \"released\")\n"
+        "    except Exception:\n"
+        "        pass\n",        "预占释放失败被静默忽略（订单终态但资金仍被占用）",
     ),
 )
 
@@ -1069,6 +1331,114 @@ DESIGNATED_NON_VACUITY = {
         "test_order_cycle_identity"
         ".ExactTimeFallbackTests"
         ".test_TIME_CYCLE_2_competitor_ended_before_the_sell_is_excluded",
+    ),
+    "M-CF1": (
+        "test_deferred_fill_cycle_binding"
+        ".PrimitiveGuardsAreReachableDirectly"
+        ".test_record_lot_refuses_a_legacy_source_order",
+    ),
+    "M-CF2": (
+        # 实测：该变异把成交闸门换成当前 active cycle。被测的"拒绝"用例在
+        # 变异下依然会拒绝（它读到的是同一个漂移事实），真正转红的是
+        # "同周期必须正常成交"这条正对照。
+        "test_deferred_fill_cycle_binding"
+        ".RealPendingSellPathEndToEnd"
+        ".test_same_cycle_deferred_order_still_fills_normally",
+    ),
+    "M-CF3": (
+        # 实测：变异让"归属不可证明"回退到当前 active cycle。commit_fill 在调用
+        # 闸门之前自己也读了一次归属并抛异常，把闸门内部这个判断遮蔽了；
+        # 直接驱动闸门的用例才是唯一能观测它的测试。
+        "test_deferred_fill_cycle_binding"
+        ".ExecutionCycleInvariantIsChecked"
+        ".test_guard_refuses_an_unprovable_order_directly",
+    ),
+    "M-CF4": (
+        "test_deferred_fill_cycle_binding"
+        ".PendingSellStaysInItsOwnCycle"
+        ".test_R1_pending_sell_is_refused_when_execution_cycle_changed",
+    ),
+    "M-CF5": (
+        "test_deferred_fill_cycle_binding"
+        ".PendingSellStaysInItsOwnCycle"
+        ".test_R1_pending_sell_is_refused_when_execution_cycle_changed",
+    ),
+    "M-CF6": (
+        "test_deferred_fill_cycle_binding"
+        ".RetryLineageHardConstraint"
+        ".test_cross_cycle_retry_does_not_inherit_lineage",
+    ),
+    "M-CF7": (
+        "test_deferred_fill_cycle_binding"
+        ".PrimitiveGuardsAreReachableDirectly"
+        ".test_consume_lots_refuses_a_missing_cycle",
+    ),
+    "M-CF8": (
+        "test_deferred_fill_cycle_binding"
+        ".OrderIdentityMismatchFailsClosed"
+        ".test_code_mismatch_is_rejected",
+    ),
+    "M-CF9": (
+        "test_deferred_fill_cycle_binding"
+        ".ExecutionCycleInvariantIsChecked"
+        ".test_account_cycle_mismatch_is_rejected",
+    ),
+    "M-CF10": (
+        "test_deferred_fill_cycle_binding"
+        ".ExecutionCycleInvariantIsChecked"
+        ".test_null_account_cycle_is_rejected",
+    ),
+    "M-CF11": (
+        "test_deferred_fill_cycle_binding"
+        ".RealPendingSellPathEndToEnd"
+        ".test_scan_refuses_pending_buy_after_execution_cycle_changed",
+    ),
+    "M-CF12": (
+        "test_deferred_fill_cycle_binding"
+        ".PendingSellStaysInItsOwnCycle"
+        ".test_R1_pending_sell_is_refused_when_execution_cycle_changed",
+    ),
+    "M-CF14": (
+        "test_deferred_fill_cycle_binding"
+        ".ReservationCycleProvenance"
+        ".test_mismatched_reservation_is_not_resized",
+    ),
+    "M-CF15": (
+        "test_deferred_fill_cycle_binding"
+        ".RealPendingSellPathEndToEnd"
+        ".test_scan_refuses_pending_order_after_execution_cycle_changed",
+    ),
+    "M-CF16": (
+        "test_deferred_fill_cycle_binding"
+        ".ReservationCycleMismatchEndToEnd"
+        ".test_not_triggered_mismatched_reservation_terminalizes",
+    ),
+    "M-CF17": (
+        "test_deferred_fill_cycle_binding"
+        ".ReservationCycleMismatchEndToEnd"
+        ".test_triggered_mismatched_reservation_terminalizes",
+    ),
+    "M-CF18": (
+        "test_deferred_fill_cycle_binding"
+        ".ReservationCycleMismatchEndToEnd"
+        ".test_triggered_mismatched_reservation_terminalizes",
+    ),
+    "M-CF19": (
+        "test_deferred_fill_cycle_binding"
+        ".ReservationCycleMismatchEndToEnd"
+        ".test_not_triggered_mismatched_reservation_terminalizes",
+    ),
+    "M-CF20": (
+        "test_deferred_fill_cycle_binding"
+        ".ReservationCycleMismatchEndToEnd"
+        ".test_not_triggered_mismatched_reservation_terminalizes",
+    ),
+    "M-CF21": (
+        # 实测：M-CF21 把释放失败改回静默吞掉。原来指定的终态化用例观测不到它
+        # —— 那些用例不会让释放失败。真正能杀掉它的是专门注入释放失败的用例。
+        "test_deferred_fill_cycle_binding"
+        ".ReservationCycleMismatchEndToEnd"
+        ".test_release_failure_is_not_swallowed",
     ),
 }
 

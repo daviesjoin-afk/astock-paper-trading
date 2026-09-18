@@ -181,12 +181,21 @@ class RetryLineageTests(unittest.TestCase):
         self.assertIsNone(PT._previous_attempt_order_id(conn, None))
 
     def test_buy_order_insert_writes_lineage_column(self):
-        """源码级护栏：_buy_order 的 INSERT 必须携带 retry_of_order_id。"""
+        """源码级护栏：``_buy_order`` 的 INSERT 必须携带 retry_of_order_id。
+
+        断言**意图**（该 INSERT 列出血缘列，并由解析器取值），而不是某个调用点的
+        字面写法：解析器现在还要接收子尝试的 cycle 以拒绝跨周期血缘（§20），
+        把签名钉死会让护栏在正确的语义变更上误报。
+        """
         path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "paper_trading.py")
         with open(path, encoding="utf-8") as fh:
             source = fh.read()
         self.assertIn("retry_of_order_id", source)
-        self.assertIn("_previous_attempt_order_id(conn, signal.get(\"id\"))", source)
+        insert = source[source.index("def _buy_order("):]
+        insert = insert[:insert.index("_record_lot(")] if "_record_lot(" in insert else insert
+        self.assertIn("retry_of_order_id", insert, "_buy_order 的 INSERT 必须列出血缘列")
+        self.assertIn("_previous_attempt_order_id(", insert,
+                      "_buy_order 必须由统一解析器取血缘，而不是自己算")
 
     def test_schema_ensure_is_idempotent(self):
         conn = _db()

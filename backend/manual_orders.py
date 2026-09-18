@@ -699,6 +699,117 @@ def cancel_manual_order(order_id):
     return {"order_id": int(order_id), "status": "cancelled"}
 
 
+def _order_execution_cycle_guard():
+    """解析 ``paper_trading._assert_order_execution_cycle``（Phase 2 惰性导入）。"""
+    from paper_trading import _assert_order_execution_cycle
+    return _assert_order_execution_cycle
+
+
+#: 两类「订单不得进入成交语义」的拒绝标记。二者的区别是**证据状态**，不是严重性：
+#: 一个说「这张订单的周期归属无法证明」，另一个说「归属可证明，但账本已经搬家」。
+CYCLE_GUARD_REJECTION_MARKERS = (
+    "order_execution_cycle_changed",
+    "legacy_order_cycle_unproven",
+    "order_cycle_provenance_unknown",
+)
+
+
+def _is_cycle_guard_rejection(exc):
+    """该异常是否是「订单不得进入成交语义」的拒绝（而不是别的故障）。
+
+    只认标记字符串，不认异常类型：``paper_trading`` 与 ``manual_orders`` 之间存在
+    惰性导入屏障，直接 import 那些异常类会在模块加载期形成环。标记同时也是写入
+    ``reason`` 的文本，所以只有一个事实来源。
+    """
+    if getattr(exc, "marker", None) in CYCLE_GUARD_REJECTION_MARKERS:
+        return True
+    text = str(exc)
+    return any(marker in text for marker in CYCLE_GUARD_REJECTION_MARKERS)
+
+
+def _is_reservation_cycle_mismatch(exc, mismatch_type):
+    """预占周期冲突的**结构化**判定（§4）。
+
+    优先 ``isinstance``；仅在类型信息丢失（异常被上层包装）时才回退到 ``marker``
+    等值比对。刻意不做宽泛文本 contains —— 改写文案就会静默失效。
+    """
+    if mismatch_type is not None and isinstance(exc, mismatch_type):
+        return True
+    return getattr(exc, "marker", None) == "reservation_cycle_mismatch"
+
+
+def _terminalize_cycle_stale_order(conn, order, exc):
+    """把因周期漂移/归属未知而永远无法成交的订单收敛为终态 ``superseded``。
+
+    §23/§24：只失败一次的订单不应该永久污染 pending 扫描器。旧行为是每轮
+    ``pending → 归属失败 → pending``，同一张订单在每个扫描周期都重跑一遍预占与
+    行情抓取，却永远不可能成交，还把「有 N 张待成交」这个运维信号永久污染。
+
+    终态选 ``superseded``（而不是新造一个状态），与仓库既有约定一致：
+    ``execution_dispatch._retire_for_retry`` 与 ``entry_lifecycle`` 的回收路径都把
+    "这张委托不再有效，由信号另起一张" 收敛到 ``superseded``。
+
+    **绝不**修改 ``cycle_id``（§19/§22）：legacy 行保持 ``cycle_id=NULL``，漂移行
+    保持其原周期 —— 周期归属是不可变事实，这里只改生命周期状态。
+
+    §6：终态清理**允许**把既有预占从 ``reserved`` 释放为 ``released``（订单已终态，
+    不能继续占共享资金），但绝不改 ``cycle_id`` / ``amount`` / ``fees``。
+
+    §7：释放失败**不得**静默吞掉。若这里把订单标成 ``superseded`` 而预占仍停在
+    ``reserved``，那笔资金会被永久占用且没有任何订单再引用它 —— 比直接失败更糟。
+    因此释放异常向上抛，让调用方的事务回滚（订单保持原状，下轮可诊断）。
+    """
+    # Phase 2 extraction: resolved at call time to avoid a circular import.
+    from paper_trading import (
+        _audit,
+        _finish_capital_reservation,
+        _json,
+        _loads,
+        _now,
+        _risk_log,
+    )
+    order_id = int(order["id"])
+    marker = getattr(exc, "marker", None) or "order_execution_cycle_changed"
+    detail = {
+        "order_id": order_id,
+        "marker": marker,
+        "status": "superseded",
+        "error": str(exc),
+        "cycle_guard": True,
+    }
+    for field in ("order_cycle_id", "account_cycle_id", "active_cycle_id",
+                  "reserved_cycle_id"):
+        value = getattr(exc, field, None)
+        if value is not None:
+            detail[field] = value
+    # §6/§7：释放既有预占（若无预占，UPDATE 命中 0 行，天然 no-op，无需 catch-all）。
+    # 释放失败即让本事务失败 —— 绝不留下「订单终态 + 资金仍被占用」的组合。
+    _finish_capital_reservation(conn, order_id, "released")
+    reason = f"{marker}：{str(exc)[:200]}"
+    payload = _loads(order.get("risk_payload"), {})
+    if not isinstance(payload, dict):
+        payload = {}
+    payload["cycle_guard"] = detail
+    conn.execute(
+        """UPDATE paper_orders
+              SET status='superseded',reason=?,risk_payload=?,cancelled_at=?
+            WHERE id=? AND status NOT IN ('filled')""",
+        (reason, _json(payload), _now(), order_id),
+    )
+    _risk_log(
+        conn, order["account_id"], order["code"], order.get("side") or "buy",
+        "superseded", reason, detail,
+    )
+    _audit(
+        conn, order["account_id"], "superseded",
+        f"cycle guard: {order['code']} order={order_id} {marker}",
+    )
+    return {
+        "order_id": order_id, "status": "superseded",
+        "superseded": True, "reason": reason, "marker": marker,
+    }
+
+
 def process_pending_manual_orders(asof_date=None):
     # Phase 2 extraction: resolved at call time to avoid a circular import.
     from paper_trading import (
@@ -727,6 +838,7 @@ def process_pending_manual_orders(asof_date=None):
         dfc,
         init_db,
     )
+    from paper_trading import ReservationCycleMismatch as _ReservationCycleMismatch
     import execution_planner as EP
     init_db()
     day = _date(asof_date)
@@ -772,6 +884,26 @@ def process_pending_manual_orders(asof_date=None):
         )
         for order in pending:
             _assert_active_lease(conn, "pending manual order")
+            # ── execution-cycle 预检（§7/§16/§23）：必须在**任何** reservation /
+            # cash / lot / fill mutation 之前。旧代码在触发后才调用
+            # ``_reserve_shared_capital``，而预占会读当前共享现金并写入**当前**
+            # active cycle 的 reservation —— 等到 commit_fill 才发现周期漂移就
+            # 太晚了：cycle 9 的 reservation 已经落库，形成另一种账本错配。
+            #
+            # 归属未知（legacy NULL / pre-v18 schema）与账本已搬家是两类不同的
+            # 拒绝，都必须终态化：否则这张订单会每轮 pending → 失败 → pending，
+            # 永久污染扫描器（§24）。
+            try:
+                PT_assert_execution_cycle = _order_execution_cycle_guard()
+                guarded_cycle_id = PT_assert_execution_cycle(
+                    conn, order["id"], account_id=order["account_id"],
+                )
+            except Exception as guard_exc:
+                if not _is_cycle_guard_rejection(guard_exc):
+                    raise
+                terminal = _terminalize_cycle_stale_order(conn, order, guard_exc)
+                output.append(terminal)
+                continue
             if order.get("side") == "buy" and _entry_freeze_enabled():
                 reason = _entry_frozen_reason("待触发限价委托")
                 payload = _loads(order.get("risk_payload"), {})
@@ -851,10 +983,22 @@ def process_pending_manual_orders(asof_date=None):
                 reserve_price = _num(order.get("planned_price"), _num(plan.get("limit_price")))
                 reserve_amount = max(0, int(plan.get("qty") or 0)) * max(reserve_price, 0.0)
                 reserve_fees = _commission(reserve_amount)
-                reserved, reserve_reason = _reserve_shared_capital(
-                    conn, order["id"], order["account_id"], order["code"],
-                    reserve_amount, reserve_fees,
-                )
+                # §2：本分支同样处理**已存在**订单的预占，必须带上订单周期 ——
+                # 否则「预占周期 == 订单周期」在这条路径上失去校验（旧预占可能记在
+                # 别的周期上，而 resize 会把它按本订单的规模改写）。
+                try:
+                    reserved, reserve_reason = _reserve_shared_capital(
+                        conn, order["id"], order["account_id"], order["code"],
+                        reserve_amount, reserve_fees,
+                        expected_cycle_id=guarded_cycle_id,
+                    )
+                except Exception as exc:
+                    # §3：归属冲突是**永久性**冲突，不是临时资金不足 ⇒ 终态化，
+                    # 不能打回 pending_limit 让下一轮再试（永远不会成功）。
+                    if not _is_reservation_cycle_mismatch(exc, _ReservationCycleMismatch):
+                        raise
+                    output.append(_terminalize_cycle_stale_order(conn, order, exc))
+                    continue
                 if not reserved:
                     reason = reserve_reason or "共享资金池预占失败"
                     conn.execute(
@@ -876,10 +1020,20 @@ def process_pending_manual_orders(asof_date=None):
             reserve_price = _num(plan.get("fill_price"), _num(order.get("planned_price")))
             reserve_amount = max(0, int(plan.get("qty") or 0)) * max(reserve_price, 0.0)
             reserve_fees = _commission(reserve_amount)
-            reserved, reserve_reason = _reserve_shared_capital(
-                conn, order["id"], order["account_id"], order["code"],
-                reserve_amount, reserve_fees,
-            )
+            try:
+                reserved, reserve_reason = _reserve_shared_capital(
+                    conn, order["id"], order["account_id"], order["code"],
+                    reserve_amount, reserve_fees, expected_cycle_id=guarded_cycle_id,
+                )
+            except Exception as exc:
+                # §3：预占归属冲突是永久性事实冲突，**不是**临时资金不足。
+                # 旧行为把它和 funding shortage 混在一起 ⇒ 打回 pending_limit
+                # 让下一轮再试 —— 而 order.cycle_id 与 reservation.cycle_id 都
+                # 不可变，所以这个重试永远不会成功，只会永久污染扫描器。
+                if not _is_reservation_cycle_mismatch(exc, _ReservationCycleMismatch):
+                    raise
+                output.append(_terminalize_cycle_stale_order(conn, order, exc))
+                continue
             if not reserved:
                 reason = reserve_reason or "共享资金池预占失败"
                 # A triggered order can become temporarily unfunded because
@@ -909,6 +1063,13 @@ def process_pending_manual_orders(asof_date=None):
                 conn.execute(f"RELEASE SAVEPOINT {savepoint}")
                 if _lease_lost(exc):
                     raise
+                if _is_cycle_guard_rejection(exc):
+                    # §23：周期漂移/归属未知不是「暂时性故障」，重试永远不会成功。
+                    # 每轮 pending → 失败 → pending 会让这张订单永久占用扫描器，
+                    # 所以这里直接终态化，而不是再标成可重试。
+                    terminal = _terminalize_cycle_stale_order(conn, order, exc)
+                    output.append(terminal)
+                    continue
                 reason = f"待成交执行异常，下一轮重试：{type(exc).__name__}: {exc}"
                 # Release the old reservation before retrying.  The next
                 # cycle will resize it against the then-current cash pool.

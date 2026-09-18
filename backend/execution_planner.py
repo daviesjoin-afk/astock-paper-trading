@@ -26,6 +26,8 @@
 """
 from __future__ import annotations
 
+import sqlite3
+
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
@@ -480,6 +482,48 @@ def revalidate_order_plan(conn, order, *, plan_builder, asof_day, quote=None, **
     )
 
 
+def _assert_order_identity(conn, *, order_id, account_id, code, side):
+    """下单方传入的 plan/account 必须与**落库的那张订单**讲同一件事（§12）。
+
+    ``commit_fill`` 的三个参数来自不同来源：``order_id`` 由调用方给出，
+    ``account`` 与 ``plan`` 可能是另一轮扫描里缓存的快照。只要其中任何一个与订单
+    行不符，成交就会把 A 的事实记到 B 的账上 —— 扣错账户的现金、消耗错标的的底仓，
+    而订单行本身看起来很正常。这类错误不会被下游任何一致性检查发现，因为账本是
+    自洽的，只是属于另一笔委托。
+
+    因此身份冲突一律 fail closed，绝不「以调用方为准」继续写。复用订单行作为
+    权威：``plan`` 是请求，订单行是已持久化的请求。
+    """
+    if side not in ("buy", "sell"):
+        raise RuntimeError(f"order identity mismatch: unsupported side {side!r}")
+    try:
+        row = conn.execute(
+            "SELECT account_id, code, side FROM paper_orders WHERE id=?",
+            (int(order_id),),
+        ).fetchone()
+    except (sqlite3.Error, TypeError, ValueError) as exc:  # pragma: no cover
+        raise RuntimeError(f"order identity unreadable for order_id={order_id}") from exc
+    if row is None:
+        raise RuntimeError(f"order identity mismatch: order_id={order_id} not found")
+    if hasattr(row, "keys"):
+        stored_account, stored_code, stored_side = (
+            row["account_id"], row["code"], row["side"],
+        )
+    else:
+        stored_account, stored_code, stored_side = row[0], row[1], row[2]
+    mismatches = []
+    if str(stored_account) != str(account_id):
+        mismatches.append(f"account_id stored={stored_account!r} caller={account_id!r}")
+    if str(stored_code) != str(code):
+        mismatches.append(f"code stored={stored_code!r} caller={code!r}")
+    if str(stored_side) != str(side):
+        mismatches.append(f"side stored={stored_side!r} caller={side!r}")
+    if mismatches:
+        raise RuntimeError(
+            f"order identity mismatch for order_id={order_id}: " + "; ".join(mismatches)
+        )
+
+
 def commit_fill(
     conn,
     *,
@@ -514,26 +558,53 @@ def commit_fill(
     realized_pnl = None
 
     PT._assert_active_lease(conn, "execution planner commit")
+
+    # ── §12 顺序（不可调换）：lease → provenance → identity → execution-cycle
+    #    invariant → 才允许任何 reservation / cash / lot / fill 写 ────────────
+    # 成交阶段**绝不**解析「当前 active cycle」。订单的周期是它创建时写下的事实，
+    # 一个 cycle 8 建的 pending SELL 在 cycle 9 激活后成交时，必须仍然只碰 cycle 8
+    # 的 lot；legacy NULL-cycle 订单的归属**不可证明**，只能 fail closed（既不建
+    # 带确定周期的 lot，也不去消费某个周期的底仓）。
+    provenance = PT._order_cycle_provenance_for_order(conn, order_id)
+    if not provenance.is_proven:
+        raise PT.OrderCycleProvenanceUnknown(
+            order_id, provenance.status,
+            f"{side} 成交被拒绝：订单周期归属不可证明",
+        )
+    _assert_order_identity(conn, order_id=order_id, account_id=account_id,
+                           code=code, side=side)
+    # §5 execution-cycle invariant：订单周期 == 账户当前周期 == active 周期。
+    # 上层 scanner 已检查过一遍，这里仍然校验（§12 defense in depth）：调用方可能
+    # 持有上一轮缓存的 account 快照，账本在两次读之间搬了家。
+    order_cycle_id = PT._assert_order_execution_cycle(
+        conn, order_id, account_id=account_id, provenance=provenance,
+    )
+
     if side == "buy":
         if not reserved:
+            # §20–§22：这张订单的周期归属已经在上面证明过，把它传给预占层，
+            # 让「预占周期 == 订单周期」也在同一次写入里成立。
             ok, reserve_reason = PT._reserve_shared_capital(
                 conn, order_id, account_id, code, amount, fees,
+                expected_cycle_id=order_cycle_id,
             )
             if not ok:
                 raise RuntimeError(reserve_reason or "共享资金池预占失败")
         PT._assert_active_lease(conn, "execution planner cash debit")
         PT._debit_shared_cash(conn, amount + fees, preferred_account_id=account_id)
         PT._finish_capital_reservation(conn, order_id, "consumed")
-        # §15：lot 的周期由 ``_record_lot`` 直接从**来源买单**读回（见那里的
-        # ``_order_cycle_id_for_order``），因此这里不需要、也不应该再解析一次 ——
-        # 多一个解析点就多一个 split-brain 机会。
+        # §10：lot 的周期**显式**来自来源订单（`_record_lot` 内部同样强制这一点，
+        # 这里显式传入，让「订单 cycle == lot cycle」在调用点也读得出来）。
         PT._record_lot(
             conn, account, plan, qty, fill_price, asof_day, order_id,
-            is_t_base=is_t_base, fees=fees,
+            is_t_base=is_t_base, fees=fees, cycle_id=order_cycle_id,
         )
     else:
         PT._assert_active_lease(conn, "execution planner lot consumption")
-        consumed, cost_amount = PT._consume_available_lots(conn, account_id, code, qty, asof_day)
+        # §9：FIFO 消耗必须绑定**订单自己**的周期，绝不重新解析 active cycle。
+        consumed, cost_amount = PT._consume_available_lots(
+            conn, account_id, code, qty, asof_day, cycle_id=order_cycle_id,
+        )
         if consumed != qty:
             raise RuntimeError("可卖份额在成交前发生变化，委托已停止")
         realized_pnl = amount - cost_amount - fees

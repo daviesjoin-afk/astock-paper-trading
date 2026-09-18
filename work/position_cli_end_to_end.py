@@ -53,11 +53,11 @@ conn.execute(
     "INSERT INTO paper_orders(id,account_id,side,code,name,qty,planned_price,"
     "filled_price,amount,fees,status,risk_payload,created_at,executed_at,order_type,"
     "origin,strategy_id,strategy_version,strategy_checksum,execution_status,"
-    "execution_verified,execution_evidence_source) "
+    "execution_verified,execution_evidence_source,cycle_id) "
     "VALUES(99001,?, 'buy','600903','逐日新材',1200,10.0,10.0,12000.0,0.0,'filled','',"
     "'2026-09-17 09:30:00','2026-09-17 10:00:00','market','strategy',?,?,?,"
-    "'verified',1,'paper_orders+paper_fills')",
-    (strategy_id, strategy_id, version, checksum),
+    "'verified',1,'paper_orders+paper_fills',?)",
+    (strategy_id, strategy_id, version, checksum, cycle_id),
 )
 conn.execute(
     "INSERT INTO paper_fills(order_id,account_id,side,code,qty,price,amount,fees,"
@@ -215,15 +215,24 @@ conn.execute(
 # 没有卖出成交，归属闸门根本不会被走到（基线观察只是"T+1 锁住"）。因此这里补一笔
 # **已验证**的窗内卖出，并把 lot 的余额改成生产 FIFO 扣减后的值 —— 这样重放会真的
 # 去判定"这笔成交属于哪个周期"。
+#
+# 这笔卖出刻意是 **legacy 形状**（``cycle_id IS NULL``）：它要验证的正是「历史行没有
+# durable 归属时，adapter 只能按时间窗判定，且竞争者边界不可证明 ⇒ fail closed」。
+# v18 的 INSERT guard 不允许新行缺少周期（那是对的），所以这里按既有做法临时卸下
+# guard 写入历史形状，再原样装回 —— 被测的是 adapter 的读取语义，不是 guard 本身。
+conn.execute("DROP TRIGGER IF EXISTS trg_paper_orders_cycle_provenance_insert")
 conn.execute(
     "INSERT OR REPLACE INTO paper_orders(id,account_id,side,code,name,qty,"
     "planned_price,filled_price,amount,fees,status,risk_payload,created_at,"
     "executed_at,order_type,origin,strategy_id,strategy_version,strategy_checksum,"
-    "execution_status,execution_verified,execution_evidence_source) "
+    "execution_status,execution_verified,execution_evidence_source,cycle_id) "
     "VALUES(99002,?,'sell','600903','逐日新材',600,10.0,10.0,6000.0,0.0,'filled','',"
     "'2026-09-17 09:30:00','2026-09-17 10:30:00','market','strategy',?,?,?,"
-    "'verified',1,'paper_orders+paper_fills')",
+    "'verified',1,'paper_orders+paper_fills',NULL)",
     (strategy_id, strategy_id, version, checksum))
+import paper_schema_migrations as _PSM  # noqa: E402
+
+_PSM._ensure_order_cycle_provenance_guards(conn)
 conn.execute(
     "INSERT OR REPLACE INTO paper_fills(order_id,account_id,side,code,qty,price,"
     "amount,fees,fill_date,quote_at,assumption) "

@@ -236,8 +236,12 @@ class FacadeContractTests(unittest.TestCase):
             "_pending_buy_reservations", "_reserve_shared_capital", "_finish_capital_reservation")))
         self.assertEqual("(conn, cycle_id=None, exclude_order_key=None)",
                          str(inspect.signature(PT._pending_buy_reservations)))
-        self.assertEqual("(conn, order_key, account_id, code, amount, fees=0.0)",
-                         str(inspect.signature(PT._reserve_shared_capital)))
+        self.assertEqual(
+            "(conn, order_key, account_id, code, amount, fees=0.0, *, expected_cycle_id=None)",
+            str(inspect.signature(PT._reserve_shared_capital)),
+            "Round-7 起新增 keyword-only 的 expected_cycle_id：位置调用语义不变，"
+            "但预占层必须能收到订单的周期（§20–§22）",
+        )
         self.assertEqual("(conn, order_key, status)", str(inspect.signature(PT._finish_capital_reservation)))
 
     def test_facades_delegate_once(self):

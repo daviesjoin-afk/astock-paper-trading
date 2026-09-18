@@ -29,6 +29,10 @@ SESSION = "2024-06-18"
 NEXT_SESSION = "2024-06-19"
 ACCOUNT = "tq_breakout"
 CODE = "600001"
+#: 该替身账本里订单/lot 的 durable 周期。v18 之后成交路径必须能证明它，
+#: 因此夹具订单必须带一个真实 cycle（legacy NULL 的 fail-closed 由
+#: test_order_cycle_identity / test_order_cycle_provenance 覆盖）。
+ORDER_CYCLE = 8
 
 
 def _db():
@@ -46,7 +50,7 @@ def _db():
             executed_at TEXT, order_type TEXT NOT NULL DEFAULT 'market',
             origin TEXT NOT NULL DEFAULT 'strategy', expires_at TEXT,
             cancelled_at TEXT, strategy_id TEXT, strategy_version INTEGER,
-            strategy_checksum TEXT, retry_of_order_id INTEGER
+            strategy_checksum TEXT, retry_of_order_id INTEGER, cycle_id INTEGER
         );
         CREATE TABLE paper_fills (
             id INTEGER PRIMARY KEY AUTOINCREMENT, order_id INTEGER NOT NULL,
@@ -55,24 +59,52 @@ def _db():
             fees REAL NOT NULL, fill_date TEXT NOT NULL, quote_at TEXT,
             assumption TEXT NOT NULL
         );
+        -- Round-7：成交路径现在还要证明 order cycle == account cycle == active
+        -- cycle。夹具必须真的提供这两张表和一致的行，否则「周期事实」在夹具里
+        -- 根本不存在，用例会因为无法证明而失败 —— 那是夹具缺陷，不是被测行为。
+        CREATE TABLE paper_cycles (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, cycle_key TEXT NOT NULL,
+            status TEXT NOT NULL, capital REAL, risk_profile TEXT,
+            started_at TEXT, ended_at TEXT, created_at TEXT, updated_at TEXT,
+            duration_days INTEGER, enabled_strategies TEXT
+        );
+        CREATE TABLE paper_accounts (
+            id TEXT PRIMARY KEY, cycle_id INTEGER, status TEXT, initial_cash REAL,
+            cash REAL, params TEXT
+        );
         """
     )
     PSM.ensure_execution_verification_columns(conn)
+    # 账户绑定在 ORDER_CYCLE 上，active cycle 也是它 —— 即「账本与订单同周期」，
+    # 这正是本文件其余用例想测的前提。
+    conn.execute(
+        "INSERT INTO paper_cycles(id,cycle_key,status,capital,created_at,updated_at,"
+        "started_at) VALUES(?,?,?,?,?,?,?)",
+        (ORDER_CYCLE, f"c-{ORDER_CYCLE}", "running", 100000.0,
+         SESSION + " 09:00:00", SESSION + " 09:00:00", SESSION + " 09:30:00"),
+    )
+    conn.execute(
+        "INSERT INTO paper_accounts(id,cycle_id,status,initial_cash,cash)"
+        " VALUES(?,?,?,?,?)",
+        (ACCOUNT, ORDER_CYCLE, "running", 100000.0, 100000.0),
+    )
+    conn.commit()
     return conn
 
 
 def _insert_order(conn, *, status="filled", side="buy", qty=100, price=10.0,
                   amount=None, fees=None, executed_at=SESSION + " 15:00:00",
-                  account_id=ACCOUNT, code=CODE):
+                  account_id=ACCOUNT, code=CODE, cycle_id=ORDER_CYCLE):
     gross = qty * price if amount is None else amount
     charge = 5.0 if fees is None else fees
     cur = conn.execute(
         """INSERT INTO paper_orders(account_id,side,code,qty,planned_price,
                filled_price,amount,fees,status,reason,risk_payload,realized_pnl,
-               created_at,executed_at,order_type,origin)
-           VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+               created_at,executed_at,order_type,origin,cycle_id)
+           VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (account_id, side, code, qty, price, price, gross, charge, status, "test",
-         "{}", None, SESSION + " 10:00:00", executed_at, "limit", "strategy"),
+         "{}", None, SESSION + " 10:00:00", executed_at, "limit", "strategy",
+         cycle_id),
     )
     return int(cur.lastrowid)
 
@@ -386,7 +418,7 @@ class BareConnectionReadbackTest(unittest.TestCase):
                 executed_at TEXT, order_type TEXT NOT NULL DEFAULT 'market',
                 origin TEXT NOT NULL DEFAULT 'strategy', expires_at TEXT,
                 cancelled_at TEXT, strategy_id TEXT, strategy_version INTEGER,
-                strategy_checksum TEXT, retry_of_order_id INTEGER
+                strategy_checksum TEXT, retry_of_order_id INTEGER, cycle_id INTEGER
             );
             CREATE TABLE paper_fills (
                 id INTEGER PRIMARY KEY AUTOINCREMENT, order_id INTEGER NOT NULL,
@@ -506,7 +538,7 @@ class ExecutionVerificationSqlGateTest(unittest.TestCase):
                 status TEXT NOT NULL, reason TEXT, risk_payload TEXT NOT NULL,
                 realized_pnl REAL, created_at TEXT NOT NULL, executed_at TEXT,
                 order_type TEXT NOT NULL DEFAULT 'market',
-                origin TEXT NOT NULL DEFAULT 'strategy'
+                origin TEXT NOT NULL DEFAULT 'strategy', cycle_id INTEGER
             );
             CREATE TABLE paper_fills (
                 id INTEGER PRIMARY KEY AUTOINCREMENT, order_id INTEGER NOT NULL,
@@ -623,7 +655,7 @@ class PositionPathGateTest(unittest.TestCase):
                 status TEXT NOT NULL, reason TEXT, risk_payload TEXT NOT NULL,
                 realized_pnl REAL, created_at TEXT NOT NULL, executed_at TEXT,
                 order_type TEXT NOT NULL DEFAULT 'market',
-                origin TEXT NOT NULL DEFAULT 'strategy'
+                origin TEXT NOT NULL DEFAULT 'strategy', cycle_id INTEGER
             );
             CREATE TABLE paper_fills (
                 id INTEGER PRIMARY KEY AUTOINCREMENT, order_id INTEGER NOT NULL,
@@ -705,13 +737,17 @@ class CommitFillStampsTest(unittest.TestCase):
         conn = _db()
         order_id = _insert_order(conn, status="pending", qty=100, price=10.0,
                                  amount=1000.0, fees=5.0)
+        # 周期归属成员从真实 paper_trading 取（不是抄一份）：本用例的要点是
+        # 成交路径真的盖章，替身只隔离现金/lot 副作用，不隔离被断言的契约。
+        import paper_trading as PT
+
         stub = types.SimpleNamespace(
             _assert_active_lease=lambda conn, label: None,
             _reserve_shared_capital=lambda *a, **k: (True, None),
             _debit_shared_cash=lambda *a, **k: None,
             _finish_capital_reservation=lambda *a, **k: None,
             _record_lot=lambda *a, **k: None,
-            _consume_available_lots=lambda conn, account_id, code, qty, day: (qty, 0.0),
+            _consume_available_lots=lambda conn, account_id, code, qty, day, cycle_id=None: (qty, 0.0),
             _credit_shared_cash=lambda *a, **k: None,
             _json=lambda value: "{}",
             _now=lambda: SESSION + " 15:00:00",
@@ -720,6 +756,16 @@ class CommitFillStampsTest(unittest.TestCase):
             _risk_log=lambda *a, **k: None,
             _audit=lambda *a, **k: None,
             _sync_positions=lambda *a, **k: None,
+            _order_cycle_provenance_for_order=PT._order_cycle_provenance_for_order,
+            OrderCycleProvenanceUnknown=PT.OrderCycleProvenanceUnknown,
+            # Round-7：commit_fill 现在还会校验 order cycle == account cycle ==
+            # active cycle。这里指向**真实**实现（连同它需要的两个只读查询入口），
+            # 让本用例的周期一致性能被真实判定 —— 替身若恒真，本文件就无法在
+            # 「周期一致性校验被删掉」时转红。
+            _assert_order_execution_cycle=PT._assert_order_execution_cycle,
+            _active_cycle_id_readonly=PT._active_cycle_id_readonly,
+            _account_cycle_id_readonly=PT._account_cycle_id_readonly,
+            OrderExecutionCycleChanged=PT.OrderExecutionCycleChanged,
         )
         plan = {
             "side": "buy", "code": CODE, "qty": 100, "amount": 1000.0,

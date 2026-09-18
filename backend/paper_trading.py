@@ -1182,7 +1182,7 @@ def _record_entry_frozen_waitlist(
             _num(planned_price, None), ENTRY_FROZEN_WAITLIST_STATUS, reason,
             _json(payload), "strategy", _now(),
             strategy_id, strategy_version, strategy_checksum,
-            _previous_attempt_order_id(conn, signal_id),
+            _previous_attempt_order_id(conn, signal_id, _order_cycle_id(conn, cycle_id)),
             _order_cycle_id(conn, cycle_id),
         ),
     )
@@ -1684,26 +1684,67 @@ def _reconcile_signal_order_states(conn):
     }
 
 
-def _previous_attempt_order_id(conn, signal_id):
+def _previous_attempt_order_id(conn, signal_id, child_cycle_id=None):
     """PR-29：返回该信号最近一条已终态的买单尝试 id（审计血缘）。
 
     过期/回收的旧委托（superseded / expired / cancelled）保留完整行；
     同一信号重建的新委托以 ``retry_of_order_id`` 指向它，形成
     Signal → 尝试1（终态）→ 尝试2（…）的链路。
+
+    §20/§21 硬约束：``retry_of_order_id`` 表达的是「**同一次**经济尝试的重试」。
+    因此只有当父尝试的周期与子尝试的周期**相同**（或父尝试是 legacy、周期未知）
+    时才建立链接：
+
+    * ``parent.cycle_id IS NULL``（legacy）⇒ 允许链接；这是**新的可证明尝试**，
+      绝不因此把父订单解释成也属于子订单的周期，父行永远保持 NULL；
+    * ``parent.cycle_id == child_cycle_id`` ⇒ 同周期重试，允许链接；
+    * ``parent.cycle_id != child_cycle_id`` ⇒ **跨周期**，经济活动已经不同
+      （另一个周期的资金/持仓），此时建立链接会把「新独立尝试」谎报成「旧尝试的
+      重试」。正确处置是**终止旧血缘、创建新的独立尝试** —— 即不写
+      ``retry_of_order_id``。旧行本就是终态且保留完整，审计信息不丢失。
+
+    旧实现只看「不同值能看出来，所以没事」，那是把可检测性当成了约束力。
     """
     if signal_id is None:
         return None
+    row = None
     try:
         row = conn.execute(
-            """SELECT id FROM paper_orders
+            """SELECT id, cycle_id FROM paper_orders
                 WHERE signal_id=? AND side='buy'
                   AND status IN ('superseded','expired','cancelled')
                 ORDER BY id DESC LIMIT 1""",
             (int(signal_id),),
         ).fetchone()
     except sqlite3.Error:
+        # pre-v18 schema（没有 cycle_id 列）：退回只取 id，并把父周期视为未知。
+        # 这是**必须**保留的路径 —— 旧库上「父尝试归属未知」等价于 legacy 父行，
+        # 按 §21 允许建立血缘，而不能因为列缺失就让血缘解析整体失效。
+        try:
+            row = conn.execute(
+                """SELECT id FROM paper_orders
+                    WHERE signal_id=? AND side='buy'
+                      AND status IN ('superseded','expired','cancelled')
+                    ORDER BY id DESC LIMIT 1""",
+                (int(signal_id),),
+            ).fetchone()
+        except sqlite3.Error:
+            return None
+    if row is None:
         return None
-    return int(row["id"]) if row is not None else None
+    try:
+        parent_cycle = row["cycle_id"]
+    except (TypeError, IndexError, KeyError):
+        parent_cycle = None
+    if child_cycle_id is not None and parent_cycle is not None:
+        try:
+            same = int(parent_cycle) == int(child_cycle_id)
+        except (TypeError, ValueError):
+            same = False
+        if not same:
+            # 跨周期 ⇒ 终止血缘，新订单作为独立尝试写入（不带 retry_of_order_id）。
+            return None
+    return int(row["id"])
 
 
 def _supersede_signal_execution_retries(conn, signal_id):
@@ -2495,6 +2536,51 @@ def _active_cycle(conn):
     return dict(cycle)
 
 
+def _active_cycle_id_readonly(conn):
+    """**只读**读取当前 active cycle id；不存在则返回 ``None``，绝不创建周期。
+
+    与 :func:`_active_cycle` 的关键区别：后者在没有任何周期时会调用
+    ``_ensure_cycle`` **INSERT 一个新周期**。验证「一张已存在的历史订单是否还
+    有权成交」是一个纯查询问题 —— 如果因为库是空的就顺手建一个周期，那等于用
+    一次写操作回答了「现在属于哪个周期」，而这个答案本来是「不存在」。
+
+    ``paper_cycles`` 表不存在（极简 schema / 部分测试库）同样返回 ``None``：
+    读取不到周期事实就是「无法证明」，而不是让底层 ``OperationalError`` 冒出去。
+    """
+    try:
+        row = conn.execute(
+            "SELECT id FROM paper_cycles WHERE status IN ('draft','running','paused')"
+            " ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+    except sqlite3.Error:
+        return None
+    if row is None:
+        return None
+    try:
+        return int(row["id"] if hasattr(row, "keys") else row[0])
+    except (TypeError, ValueError):
+        return None
+
+
+def _account_cycle_id_readonly(conn, account_id):
+    """**只读**读取账户当前绑定的经济周期；账户缺失或为 NULL 时返回 ``None``。"""
+    if account_id is None:
+        return None
+    try:
+        row = conn.execute(
+            "SELECT cycle_id FROM paper_accounts WHERE id=?", (str(account_id),)
+        ).fetchone()
+    except sqlite3.Error:  # pragma: no cover - 表不存在
+        return None
+    if row is None:
+        return None
+    value = row["cycle_id"] if hasattr(row, "keys") else row[0]
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def _order_cycle_id(conn, cycle_id=None):
     """订单/lot 写入时刻所属周期的**唯一解析入口**（v18 write-time fact）。
 
@@ -2508,6 +2594,11 @@ def _order_cycle_id(conn, cycle_id=None):
        在同一事务里解析到的是同一个周期。
 
     绝不从 ``paper_accounts.cycle_id``（可变重绑定）或任何时间窗推断。
+
+    **不适用于已存在订单的成交路径**：那里必须用
+    :func:`_order_cycle_provenance_for_order`，因为「订单存在但没有 cycle」是
+    「未知」，不是「可以拿当前 active cycle 顶上」。这个兜底只服务于
+    **创建**订单/lot 的那一刻。
     """
     if cycle_id is not None:
         try:
@@ -2519,49 +2610,230 @@ def _order_cycle_id(conn, cycle_id=None):
     return int(_active_cycle(conn)["id"])
 
 
-def _order_cycle_id_for_order(conn, order_id):
-    """**已存在**订单的 durable 周期身份：从行里读，绝不重新解析。
+#: ``provenance.status`` 的四个取值（§3）。``None`` 与它们的区别是**语义区别**，
+#: 不能被折叠成一个 ``Optional[int]``：``None`` 同时混了「订单不存在」「schema
+#: 还没有该列」「订单存在但 cycle 为 NULL」三种完全不同的情形，而三者的正确处置
+#: 完全不同（前者是调用错误，中者是环境事实，后者必须 fail closed）。
+ORDER_CYCLE_PROVEN = "proven"
+ORDER_CYCLE_LEGACY_UNKNOWN = "legacy_unknown"
+ORDER_CYCLE_ORDER_MISSING = "order_missing"
+ORDER_CYCLE_PRE_V18_SCHEMA = "pre_v18_schema"
 
-    这是 §15/§16 的结构性保证来源 —— lot 与卖出成交都引用**订单自己**的
-    ``cycle_id``，因此「订单属于周期 A、lot 属于周期 B」在构造上不可能发生。
 
-    列不存在（pre-v18 schema）或订单行不存在 → ``None``，由调用方决定兜底；
-    ``None`` **不是**「没有周期」，而是「无法从订单证明周期」，调用方必须按
-    fail-closed 语义处理。
+class OrderCycleProvenanceUnknown(RuntimeError):
+    """成交阶段遇到**不可证明**的订单周期归属 ⇒ fail closed。
+
+    规格 §4/§8 明确要求：legacy NULL-cycle 订单与 post-v18 缺 cycle 的订单都不得
+    靠「当前 active cycle」顶上。异常文本里带 ``legacy_order_cycle_unproven`` /
+    ``order_cycle_provenance_unknown`` 标记，便于上层（手动待成交扫描、策略重试、
+    延迟成交）把它转换成明确的 not-filled / retry-blocked / supersede-required，
+    而不是留下半成交状态。
+
+    继承 ``RuntimeError`` 是有意的：现有调用方已经用 ``except Exception`` 隔离单个
+    订单（``process_pending_manual_orders`` 回滚 savepoint 并标记可重试），因此
+    fail closed 会自然落到「本轮不成交、下轮重试」，不会静默成交。
     """
-    if order_id is None or not _orders_have_cycle_column(conn):
-        return None
+
+    def __init__(self, order_id, status, message=""):
+        self.order_id = order_id
+        self.status = status
+        marker = (
+            "legacy_order_cycle_unproven"
+            if status == ORDER_CYCLE_LEGACY_UNKNOWN
+            else "order_cycle_provenance_unknown"
+        )
+        self.marker = marker
+        super().__init__(f"{marker}: order_id={order_id} status={status} {message}".strip())
+
+
+class OrderExecutionCycleChanged(RuntimeError):
+    """订单的周期归属**可证明**，但经济账本已经搬到别的周期 ⇒ fail closed。
+
+    这是「归属未知」之外的另一类拒绝：``order.cycle_id`` 是可信的（例如 8），
+    但 ``paper_accounts`` 已被重绑到 cycle 9、active cycle 也是 9。此时该订单
+    若继续成交，会形成 cross-cycle 账本错配：
+
+    * SELL：卖掉 cycle 8 的持仓，把钱打进 cycle 9 的现金；
+    * BUY：用 cycle 9 的现金买出一个 cycle 8 的 lot。
+
+    ``paper_accounts`` 是**当前**经济账户，新周期创建时会被重绑并重置，系统里
+    并不存在可独立写入的历史周期现金账本。因此正确的 contract 不是「想办法把
+    cash 写回旧周期」，而是：**持久化的周期归属不等于成交授权** —— 账本一旦
+    搬家，旧订单即 stale，必须 fail closed。
+
+    标记 ``order_execution_cycle_changed`` 携带四个 id，便于上层做终态化与诊断。
+    """
+
+    def __init__(self, order_id, order_cycle_id, account_cycle_id, active_cycle_id,
+                 message=""):
+        self.order_id = order_id
+        self.order_cycle_id = order_cycle_id
+        self.account_cycle_id = account_cycle_id
+        self.active_cycle_id = active_cycle_id
+        self.marker = "order_execution_cycle_changed"
+        super().__init__(
+            f"order_execution_cycle_changed: order_id={order_id} "
+            f"order_cycle_id={order_cycle_id} account_cycle_id={account_cycle_id} "
+            f"active_cycle_id={active_cycle_id} {message}".strip()
+        )
+
+
+class OrderCycleProvenance:
+    """订单的 durable 周期归属**四态**结论（不变量：``proven`` ⟺ ``cycle_id`` 非 None）。
+
+    调用方必须按 ``status`` 分支，而不是按 ``cycle_id is None`` 分支 —— 后者把
+    「未知」与「schema 太旧」混为一谈，正是本轮要消灭的漏洞。
+    """
+
+    __slots__ = ("order_exists", "schema_has_cycle_column", "cycle_id", "status")
+
+    def __init__(self, order_exists, schema_has_cycle_column, cycle_id, status):
+        self.order_exists = bool(order_exists)
+        self.schema_has_cycle_column = bool(schema_has_cycle_column)
+        self.cycle_id = cycle_id
+        self.status = status
+
+    @property
+    def is_proven(self):
+        """只有这一种状态允许把周期写进 lot / 用于 lot 消耗。"""
+        return self.status == ORDER_CYCLE_PROVEN
+
+    def as_dict(self):
+        return {
+            "order_exists": self.order_exists,
+            "schema_has_cycle_column": self.schema_has_cycle_column,
+            "cycle_id": self.cycle_id,
+            "status": self.status,
+        }
+
+    def __repr__(self):  # pragma: no cover - 诊断用
+        return (
+            f"OrderCycleProvenance(status={self.status!r}, "
+            f"cycle_id={self.cycle_id!r}, order_exists={self.order_exists}, "
+            f"schema_has_cycle_column={self.schema_has_cycle_column})"
+        )
+
+
+def _order_cycle_provenance_for_order(conn, order_id) -> OrderCycleProvenance:
+    """**已存在订单**的 durable 周期归属：四态，绝不回退到当前 active cycle。
+
+    这是成交阶段的唯一权威读法。``order_id`` 缺失、行缺失、schema 无列、列为
+    NULL —— 四种情形必须可区分，且**没有一种**允许调用方去问「现在是哪个周期」。
+
+    先看 schema 再看行：schema 无 ``cycle_id`` 列时，``SELECT cycle_id`` 必然报错，
+    而「报错」与「行不存在」在同一个 ``except`` 里无法区分 —— 那样 pre-v18 库上的
+    每一行都会被报成 ``order_missing``，于是「schema 太旧」这个**环境事实**被
+    伪装成「订单不存在」这个**调用错误**，运维会去查订单号而不会去跑迁移。
+    """
+    has_column = _orders_have_cycle_column(conn)
+    if order_id is None:
+        return OrderCycleProvenance(False, has_column, None, ORDER_CYCLE_ORDER_MISSING)
+    if not has_column:
+        # 列不存在 ⇒ 该订单创建于 v18 之前，回归属**不可能**被证明；但仍然要把
+        # 「行到底在不在」查清楚，否则两种完全不同的故障会被混成一个结论。
+        exists = False
+        try:
+            exists = conn.execute(
+                "SELECT 1 FROM paper_orders WHERE id=?", (int(order_id),)
+            ).fetchone() is not None
+        except (sqlite3.Error, TypeError, ValueError):
+            exists = False
+        status = ORDER_CYCLE_PRE_V18_SCHEMA if exists else ORDER_CYCLE_ORDER_MISSING
+        return OrderCycleProvenance(exists, False, None, status)
     try:
         row = conn.execute(
             "SELECT cycle_id FROM paper_orders WHERE id=?", (int(order_id),)
         ).fetchone()
-    except sqlite3.Error:  # pragma: no cover - 表不存在
-        return None
+    except (sqlite3.Error, TypeError, ValueError):  # pragma: no cover - 表不存在
+        return OrderCycleProvenance(False, True, None, ORDER_CYCLE_ORDER_MISSING)
     if row is None:
-        return None
+        return OrderCycleProvenance(False, True, None, ORDER_CYCLE_ORDER_MISSING)
     value = row["cycle_id"] if hasattr(row, "keys") else row[0]
     try:
-        return int(value)
+        cycle = int(value)
     except (TypeError, ValueError):
-        return None
+        cycle = None
+    if cycle is None:
+        return OrderCycleProvenance(True, True, None, ORDER_CYCLE_LEGACY_UNKNOWN)
+    return OrderCycleProvenance(True, True, cycle, ORDER_CYCLE_PROVEN)
 
 
-_ORDERS_CYCLE_COLUMN_CACHE = {"value": None}
+def _order_cycle_id_for_order(conn, order_id):
+    """**只读**入口：仅当归属可证明时返回 ``int``，否则 ``None``。
+
+    保留旧签名供 ``_record_lot`` 使用；成交路径必须用
+    :func:`_order_cycle_provenance_for_order` 拿到四态并据此 fail closed。
+    """
+    provenance = _order_cycle_provenance_for_order(conn, order_id)
+    return provenance.cycle_id if provenance.is_proven else None
+
+
+def _assert_order_execution_cycle(conn, order_id, *, account_id=None, provenance=None):
+    """**已存在订单**的成交授权闸门：返回可证明的 ``order_cycle_id``，否则抛异常。
+
+    这是 execution-cycle invariant 的**唯一**实现（§8：不要把判断抄成三四份）。
+    任何让一张已存在的 ``paper_order`` 进入成交语义的路径都必须先过这里。
+
+    三项必须同时成立（§5）：
+
+    1. ``order.cycle_id`` 可证明（否则 :class:`OrderCycleProvenanceUnknown`）；
+    2. ``paper_accounts.cycle_id == order.cycle_id``；
+    3. active execution cycle id == ``order.cycle_id``。
+
+    为什么 account 一致还不够：``paper_accounts`` 会在新周期创建时被**重绑并重置**
+    （``_create_cycle`` 对未启用策略还会把 ``cycle_id`` 置 NULL），所以「账户 id 相同」
+    绝不代表「仍是同一经济周期」。订单归属可信 + 账本已搬家，就是
+    :class:`OrderExecutionCycleChanged`。
+
+    ``provenance`` 允许调用方把已经读到的归属结论传进来（§12 要求先读归属、再校验
+    身份、最后校验周期一致性）。传入时不再重复查询；结论本身仍只由
+    :func:`_order_cycle_provenance_for_order` 产生，所以「同一个事实的两套读法」不会
+    出现。
+
+    **纯只读**（§9）：只做 SELECT / PRAGMA。刻意不使用 :func:`_active_cycle` —— 后者
+    在没有周期时会 ``_ensure_cycle`` **INSERT 一个周期**，那等于用一次写操作回答
+    「现在属于哪个周期」，把「不存在」变成一个凭空造出的答案。这里拿不到就是
+    fail closed。
+    """
+    if provenance is None:
+        provenance = _order_cycle_provenance_for_order(conn, order_id)
+    if not provenance.is_proven:
+        raise OrderCycleProvenanceUnknown(
+            order_id, provenance.status,
+            "订单周期归属不可证明；拒绝进入成交语义",
+        )
+    order_cycle_id = provenance.cycle_id
+
+    account_cycle_id = _account_cycle_id_readonly(conn, account_id)
+    active_cycle_id = _active_cycle_id_readonly(conn)
+    if account_cycle_id != order_cycle_id or active_cycle_id != order_cycle_id:
+        raise OrderExecutionCycleChanged(
+            order_id, order_cycle_id, account_cycle_id, active_cycle_id,
+            "订单周期与经济账本/active 周期不一致；旧周期订单已 stale",
+        )
+    return order_cycle_id
 
 
 def _orders_have_cycle_column(conn):
     """``paper_orders`` 是否有 ``cycle_id``（v18 之后恒为真；旧库可能尚未迁移）。
 
     用 ``PRAGMA`` 发现而不是写死：写死会在 pre-v18 库上报 ``no such column``，
-    把整条交易链路打成异常。结果按连接无关地缓存一次（schema 在进程内不变）。
+    把整条交易链路打成异常。
+
+    **刻意不缓存。** 这里曾经把一个裸布尔值缓存进模块级全局，于是同一进程里任何
+    一个 pre-v18 形状的连接（例如手写 schema 的测试库、或诊断用的旧快照）先被
+    查询，就会把整个进程的答案永久钉成 ``False`` —— 真实 v18 库随后被误判为
+    pre-v18。而「schema 太旧」与「legacy NULL」恰恰是必须分开的两种情形，所以
+    这个「优化」会直接制造错误结论。``PRAGMA table_info`` 只读 schema、不碰数据
+    页，调用点都在成交/写单路径而非热循环里，每次询问一次是正确性的合理代价。
+
+    拿不到列定义（表不存在）⇒ ``False``，并且**不**把它记成结论。
     """
-    if _ORDERS_CYCLE_COLUMN_CACHE["value"] is None:
-        try:
-            columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(paper_orders)")}
-        except sqlite3.Error:  # pragma: no cover - 表不存在
-            columns = set()
-        _ORDERS_CYCLE_COLUMN_CACHE["value"] = "cycle_id" in columns
-    return bool(_ORDERS_CYCLE_COLUMN_CACHE["value"])
+    try:
+        columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(paper_orders)")}
+    except sqlite3.Error:  # pragma: no cover - 表不存在
+        return False
+    return "cycle_id" in columns
 
 
 def _shared_account_rows(conn, cycle_id=None):
@@ -2677,12 +2949,41 @@ def _pending_position_slots(conn, positions=None, exclude_order_key=None):
     )
 
 
-def _reserve_shared_capital(conn, order_key, account_id, code, amount, fees=0.0):
+def _reserve_shared_capital(conn, order_key, account_id, code, amount, fees=0.0, *,
+                            expected_cycle_id=None):
+    """兼容 facade：``expected_cycle_id`` 是**新增的关键字参数**。
+
+    设为 keyword-only 而不是普通默认参数，是为了让既有的位置调用（``_reserve_
+    shared_capital(conn, key, acct, code, amt, fees)``）语义完全不变 —— 新参数只能
+    被显式指名传入，避免以后有人在位置上调错顺序时静默改变周期校验的对象。
+
+    归属冲突时 ``PCR.reserve_shared_capital`` 会抛 :class:`ReservationCycleMismatch`
+    （不吞、不转成 (False, reason)），调用方按类型捕获。
+    """
     return PCR.reserve_shared_capital(
         conn, order_key, account_id, code, amount, fees,
         num_fn=_num, now_fn=_now, shared_cash_fn=_shared_cash,
         active_cycle_fn=_active_cycle,
+        expected_cycle_id=expected_cycle_id,
     )
+
+
+#: 预占归属冲突的异常类型（由预占模块定义，这里转出，让上层不必依赖模块层次
+#: 即可按类型捕获）。
+ReservationCycleMismatch = PCR.ReservationCycleMismatch
+
+
+def _is_reservation_cycle_mismatch(exc):
+    """该异常是否为「预占周期与订单周期不一致」。
+
+    §4 备用的统一 helper：优先按**类型**判定（``isinstance`` 对真实的
+    :class:`ReservationCycleMismatch`）；仅当异常被跨进程/跨层包装过、类型信息
+    丢失时，才回退到 ``marker`` 字符串比对。刻意不做宽泛的文本 contains —— 那样
+    一旦改写文案就会静默失效。
+    """
+    if isinstance(exc, ReservationCycleMismatch):
+        return True
+    return getattr(exc, "marker", None) == ReservationCycleMismatch.marker
 
 
 def _finish_capital_reservation(conn, order_key, status):
@@ -3199,10 +3500,21 @@ def _sync_positions(conn, account_id=None, asof_day=None):
 def _consume_available_lots(conn, account_id, code, qty, asof_day, cycle_id=None):
     """FIFO 消耗已结算股票底仓，返回真实成本；T+1 锁定份额永不被扣减。
 
-    ``cycle_id`` 是**调用链里已经确定**的周期身份（v18 write-time fact）。传入时
-    它就是唯一权威，从而保证「消耗哪个周期的 lot」与「卖出委托写在哪个周期」是
-    同一个事实；不传时才回退到本事务解析的 active cycle。
+    ``cycle_id`` 是**调用链里已经确定**的周期身份（v18 write-time fact），且现在是
+    **必填语义**：成交路径必须把来源订单的 durable ``cycle_id`` 传进来（见
+    ``execution_planner.commit_fill``）。传 ``None`` 一律 fail closed，**不再**回退到
+    当前 active cycle —— 那正是本轮要修的 split-brain：cycle 8 创建的 pending SELL 在
+    cycle 9 激活后成交，会去消费 cycle 9 的 lot，而成交单仍挂在 cycle 8 订单上。
+
+    不做任何「库里没有周期就当匿名调用」的例外：那会重新打开同一条漏口，而且
+    ``_order_cycle_id`` 在无周期库里会**顺手创建一个新周期**（``_ensure_cycle``），
+    等于用一次写操作把「不知道」变成「知道」。
     """
+    if cycle_id is None:
+        raise OrderCycleProvenanceUnknown(
+            None, ORDER_CYCLE_ORDER_MISSING,
+            "lot 消耗必须由来源订单显式提供周期；拒绝回退到当前 active cycle",
+        )
     cycle_id = _order_cycle_id(conn, cycle_id)
     remaining = int(qty)
     cost_amount = 0.0
@@ -3233,13 +3545,28 @@ def _consume_available_lots(conn, account_id, code, qty, asof_day, cycle_id=None
 def _record_lot(conn, account, signal, qty, fill_price, asof_day, order_id=None, is_t_base=True, fees=0.0, cycle_id=None):
     """写入买入 lot。周期归属必须与**来源买单**一致（§15 硬 invariant）。
 
-    来源订单存在且带 durable ``cycle_id`` 时，lot 一律继承它 —— 这让「订单属于
-    周期 A、lot 属于周期 B」在构造上不可能发生。来源订单是 legacy（``cycle_id``
-    为 NULL）或没有来源订单时，才回退到显式传入 / 本事务解析的周期：legacy 订单
-    的 NULL 是**未知**而不是「另一个周期」，且绝不反向回填订单。
+    归属**只**接受两种来源，且都不允许回退到当前 active cycle：
+
+    * 来源订单的 durable ``cycle_id`` 可证明（``proven``）⇒ lot 继承它；
+    * **没有**来源订单（``order_id is None``）⇒ 这是订单创建前的直接建仓路径，
+      才允许用显式传入 / 本事务解析的周期。此时不存在「订单与 lot 不一致」的问题。
+
+    来源订单**存在但归属不可证明**（legacy NULL / pre-v18 schema / 行缺失）时必须
+    fail closed：抛 :class:`OrderCycleProvenanceUnknown`，**不写任何 lot**。旧行为是
+    ``order_cycle is None`` 就回退到 active cycle，那会让 legacy 订单的未知归属在
+    lot 层被洗成一个「已知周期」的派生事实 —— lot 写着 cycle 8，而它引用的订单
+    永远是 NULL，帐实两歧且无法回溯。规矩是：``"不知道"`` 不能变成 ``"可卖"``。
     """
-    order_cycle = _order_cycle_id_for_order(conn, order_id) if order_id is not None else None
-    cycle_id = order_cycle if order_cycle is not None else _order_cycle_id(conn, cycle_id)
+    if order_id is not None:
+        prov = _order_cycle_provenance_for_order(conn, order_id)
+        if not prov.is_proven:
+            raise OrderCycleProvenanceUnknown(
+                order_id, prov.status,
+                "来源买单的周期归属不可证明；拒绝创建带确定周期的新 lot",
+            )
+        cycle_id = prov.cycle_id
+    else:
+        cycle_id = _order_cycle_id(conn, cycle_id)
     asset_type = _asset_type(signal.get("code"), signal.get("name"))
     available = _date(asof_day) if asset_type == "etf_t0" else _next_weekday(asof_day)
     conn.execute(
@@ -9495,7 +9822,9 @@ def _buy_order(conn, account, signal, quote, market, news, asof_day, *, all_quot
         conn, account["id"], signal.get("id"),
     )
     # PR-29：同一信号重建的新委托记录审计血缘——上一条终态尝试的 order id。
-    retry_of_order_id = _previous_attempt_order_id(conn, signal.get("id"))
+    retry_of_order_id = _previous_attempt_order_id(
+        conn, signal.get("id"), _order_cycle_id(conn, current_cycle["id"]),
+    )
     cursor = conn.execute(
         """INSERT INTO paper_orders(
            account_id,signal_id,side,code,name,qty,planned_price,order_type,filled_price,amount,
