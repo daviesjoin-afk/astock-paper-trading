@@ -13,6 +13,12 @@
        （non-vacuity —— 失败必须来自对应契约，而不是 import/收集错误）；
     6. finally 逐字节还原，sha256 必须与原文件一致。
 
+**每次注入都必须用独立冷字节码缓存**（``PYTHONPYCACHEPREFIX``）：CPython 判定
+``.pyc`` 是否有效只看源文件 mtime（秒级）+ 字节长度。两条**字节长度相同**的变异
+若发生在同一秒内，第二条会被误判"缓存仍然有效"而直接复用上一条的旧字节码 ——
+注入没有真正执行，测试却是绿的，于是产生**假阴性**。这不是理论风险：M-RD8 与
+M-RD9 的偏移量同为 -34，实测就是这样互相污染的。
+
 变异矩阵::
 
     M-RD1   bought_today 忽略 entry_date          -> RD-01 同日新仓识别
@@ -27,6 +33,7 @@
     M-RD10  无报价被当成可决策                    -> RD-08 no_quote 短路
     M-RD11  paper_trading 重新长出 _position_peak -> 架构 Guard 2b（纯 helper 回流）
     M-RD12  _sell_plan 不再把 asof 传给引擎       -> 架构 Guard 6e（R15 缺陷重现口）
+    M-RD13  _intraday_downside_guard 把 asof 传错  -> RD-16（第二条生产链漏 as-of）
 
 用法（仓库根目录）::
 
@@ -36,8 +43,10 @@ from __future__ import annotations
 
 import hashlib
 import os
+import shutil
 import subprocess
 import sys
+import tempfile
 from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -50,6 +59,22 @@ PAPER_TRADING_FILE = "backend/paper_trading.py"
 
 def b(text: str) -> bytes:
     return text.encode("utf-8")
+
+
+#: 每次测试用一份全新的字节码缓存目录，杜绝"同长度变异复用旧 .pyc"的假阴性。
+#: 放在系统临时目录（而非仓库内），避免生成物污染工作区。
+PYCACHE_ROOT = tempfile.mkdtemp(prefix="r15_mutation_pycache_")
+_PYCACHE_SEQ = [0]
+
+
+def run_test(target: str) -> subprocess.CompletedProcess:
+    _PYCACHE_SEQ[0] += 1
+    env = dict(os.environ)
+    env["PYTHONPYCACHEPREFIX"] = os.path.join(PYCACHE_ROOT, f"run{_PYCACHE_SEQ[0]:03d}")
+    return subprocess.run(
+        [sys.executable, "-m", "unittest", target],
+        cwd=BACKEND, capture_output=True, text=True, timeout=300, env=env,
+    )
 
 
 MUTATIONS = [
@@ -177,14 +202,21 @@ MUTATIONS = [
                 "test_guard6e_sell_plan_delegates_to_the_pure_engine",
         "desc": "架构：_sell_plan 不再把显式 as-of 传给决策引擎",
     },
+    {
+        "id": "M-RD13",
+        "file": PAPER_TRADING_FILE,
+        "old": '    peak = PRD.position_peak(position, quote, price, asof_day=asof_day)\n',
+        # 故意传一个**形状合法但语义错误**的日期，而不是删参数：删参数会被
+        # ``PRD.position_peak`` 的 keyword-only 必填直接 TypeError 掉，那样证明的
+        # 只是"签名还在"，不是"业务语义还在"。传错日期时 bought_today 判 False，
+        # 同日新仓于是重新吸收买入前的 quote.high —— 这正是 R15 的真实缺陷路径。
+        "new": '    peak = PRD.position_peak(position, quote, price, asof_day="1900-01-01")\n'
+               '    # mutation: 第二条生产链把 as-of 传成别的日期\n',
+        "test": f"{TEST_MODULE}.ProductionDownsideGuardTests."
+                "test_rd16_same_day_new_position_does_not_reabsorb_pre_entry_high",
+        "desc": "日内守护把 as-of 传错（同日新仓重新吸收买入前 high）",
+    },
 ]
-
-
-def run_test(target: str) -> subprocess.CompletedProcess:
-    return subprocess.run(
-        [sys.executable, "-m", "unittest", target],
-        cwd=BACKEND, capture_output=True, text=True, timeout=300,
-    )
 
 
 def sha256(data: bytes) -> str:
@@ -254,4 +286,8 @@ def main() -> int:
 
 if __name__ == "__main__":
     del mock  # 本脚本不做进程内桩；保留 import 供将来的 dry-run 扩展
-    raise SystemExit(main())
+    try:
+        _code = main()
+    finally:
+        shutil.rmtree(PYCACHE_ROOT, ignore_errors=True)
+    raise SystemExit(_code)

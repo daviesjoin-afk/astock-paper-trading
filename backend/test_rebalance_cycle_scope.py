@@ -767,12 +767,21 @@ class SameDayRolloverKeepsBothRows(_CycleScopeCase):
         self.activate(c9)
         self.add_lot(c9, 100)
 
-        self.scan({CODE: QUOTE_FLAT})
+        # 本用例的不变量是"**同一个交易日**内的周期翻转"。夹具里的 ``2026-09-19``
+        # 是交易日身份，不是"跑测试的机器今天恰好是 09-19"：生产 scanner 用
+        # ``_date()``（→ ``_now()``，Asia/Shanghai 当前日期）给新行打 scan_date，
+        # 所以必须把 scanner 时钟钉在夹具当天。否则机器日期一旦跨过 09-19，cycle 9
+        # 的新行会写到第二天，下面按 ``scan_date='2026-09-19'`` 的查询就只剩 cycle 8
+        # 一行 —— 那是 date-brittle 夹具，与本用例要证明的周期归属无关。
+        frozen = dt.datetime(2026, 9, 19, 22, 0, 0,
+                              tzinfo=dt.timezone(dt.timedelta(hours=8)))  # Asia/Shanghai
+        with mock.patch.object(RS, "_now", return_value=frozen):
+            self.scan({CODE: QUOTE_FLAT})
 
-        rows = self._rows(
-            "SELECT cycle_id,scan_date,quality_score FROM rebalance_scans"
-            " WHERE account_id=? AND code=? AND scan_date='2026-09-19'"
-            " ORDER BY cycle_id", (ACCOUNT, CODE))
+            rows = self._rows(
+                "SELECT cycle_id,scan_date,quality_score FROM rebalance_scans"
+                " WHERE account_id=? AND code=? AND scan_date='2026-09-19'"
+                " ORDER BY cycle_id", (ACCOUNT, CODE))
         self.assertEqual([int(r["cycle_id"]) for r in rows], [c8, c9],
                          "同一天两个周期未各自保留一行（发生了 replace/冲突）")
         self.assertEqual(float(rows[0]["quality_score"]), CYCLE8_QUALITY,

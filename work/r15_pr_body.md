@@ -2,6 +2,45 @@
 
 `MERGE: NOT MERGED` · `DEPLOY: NOT DEPLOYED`
 
+## Review follow-up (round 2)
+
+An independent exact-head review of `0cd7d4b` confirmed the production
+correctness fix and the architecture extraction, but flagged two closing items.
+Both are addressed in the current head.
+
+1. **Exact-head CI was red.** Three jobs (`tests (3.11)`, `tests (3.12)`,
+   `docker-smoke`) failed on the *same single* date-brittle fixture,
+   `test_rebalance_cycle_scope.SameDayRolloverKeepsBothRows.test_two_cycles_same_day_coexist`.
+   It was pre-existing (reproduced on the unmodified base SHA), but this project's
+   merge rule is **exact-head CI all green**, so "pre-existing" is not a basis for
+   merging over red. Fixed **test-only**, in this PR rather than a separate one,
+   because it was blocking the whole repository's CI.
+   `rebalance_scanner.py` / production code was **not** touched. See
+   "Fixture fix" below.
+2. **The second production path had no regression coverage.** The original defect
+   lived on **two** entries (`_sell_plan` *and* `_intraday_downside_guard`). Both
+   were fixed, but only the first was pinned by a test. Added **RD-16** (real
+   `PT._intraday_downside_guard`) plus the matching non-vacuous mutation
+   **M-RD13**. See "Tests" and "Non-vacuity" below.
+
+## Fixture fix (`backend/test_rebalance_cycle_scope.py`, test-only)
+
+The fixture asserted a **trading day** (`2026-09-19`) while the production scanner
+stamps new rows with `_date()` → `_now()` → the machine's Asia/Shanghai date. So
+the case only passed while the machine happened to still be on 09-19. The fix
+pins the *scanner clock* inside the case, leaving the fixture's dates alone:
+
+```python
+frozen = dt.datetime(2026, 9, 19, 22, 0, 0,
+                     tzinfo=dt.timezone(dt.timedelta(hours=8)))  # Asia/Shanghai
+with mock.patch.object(RS, "_now", return_value=frozen):
+    self.scan({CODE: QUOTE_FLAT})
+```
+
+The case now asserts what it was always meant to assert — *a cycle rollover
+within one trading day keeps one scan row per cycle* — instead of *the test
+machine's today happens to be 2026-09-19*. No production code changed.
+
 ## Summary
 
 Sell-risk decisions silently depended on **the machine's current date**, not on
@@ -104,7 +143,7 @@ deliberately not "simplified"):
 
 ## Tests
 
-- **`backend/test_paper_risk_decision.py` (NEW)** — RD-01 … RD-15 golden
+- **`backend/test_paper_risk_decision.py` (NEW)** — RD-01 … RD-16 golden
   matrix: `bought_today` semantics, explicit-asof fail-fast, same-day vs
   overnight peak basis, as-of normalisation (date/datetime/ISO/blank), caller
   must supply `limit_pct`, missing quote is a no-op, hard-stop first-trim vs
@@ -112,6 +151,16 @@ deliberately not "simplified"):
   (hard_stop outranks max_hold), unknown stage skips, and
   **RD-15: `_sell_plan` is machine-date independent** (two `dt` stubs, same
   result).
+  **RD-16** covers the **second** production path — the real
+  `PT._intraday_downside_guard`:
+  - *RD-16*: historical same-day new position does **not** re-absorb the
+    pre-entry `quote.high` (`peak_retrace_pct == 0.0`, `level == "none"`);
+  - *RD-16b*: overnight position still absorbs the intraday high
+    (`peak_retrace_pct == 12.5`, `level == "warning"`, `sell_ratio == 0.25`) —
+    positive control, semantics not weakened;
+  - *RD-16c*: guard output is identical under two different machine dates given
+    the same explicit `asof_day` — so a future re-introduction of
+    `date.today()` inside the guard diverges and fails.
 - **`backend/test_paper_trading_architecture_guard.py`** — new
   `RiskDecisionModuleIsDeterministic` class: 6a zero project imports, 6b no I/O
   calls, 6c no wall-clock attribute reads, 6d `asof_day` keyword-only and
@@ -123,14 +172,14 @@ deliberately not "simplified"):
 
 ## Non-vacuity (mutation check)
 
-`work/r15_mutation_check.py` injects **12 byte-level mutations** into the real
+`work/r15_mutation_check.py` injects **13 byte-level mutations** into the real
 production sources and runs the *specific* contract test for each, requiring
 exit code ≠ 0 **and** `FAIL:`/`ERROR:` on that exact test method (so an
 import/collection error cannot masquerade as a catch). Every file is restored
 byte-identically and verified by sha256 in a `finally` block.
 
 ```text
-RESULT: 12/12 mutations RED, all files restored byte-identical
+RESULT: 13/13 mutations RED, all files restored byte-identical
 ```
 
 | ID | Mutation | Caught by |
@@ -147,56 +196,64 @@ RESULT: 12/12 mutations RED, all files restored byte-identical
 | M-RD10 | no-quote treated as decidable | RD-08 |
 | M-RD11 | `_position_peak` re-inlined into `paper_trading` | Guard 2b |
 | M-RD12 | `_sell_plan` stops forwarding `asof_day` | Guard 6e |
+| M-RD13 | **`_intraday_downside_guard` forwards the wrong `asof_day`** | **RD-16** |
+
+M-RD13 deliberately mutates the *value* rather than deleting the argument:
+dropping `asof_day=asof_day` would raise `TypeError` on the keyword-only
+required parameter, which would only prove the signature still exists. Passing a
+wrong-but-valid date makes `bought_today` return `False`, so the same-day
+position re-absorbs the pre-entry high — the real R15 business defect — and fails
+on the assertion, not on an exception.
+
+### Harness correctness: cold bytecode cache
+
+The runner passes a fresh `PYTHONPYCACHEPREFIX` per invocation. CPython validates
+a `.pyc` using the source's mtime (**second** granularity) plus its byte length,
+so two same-length mutations within the same second can make the second one reuse
+the first's stale bytecode — the injection never executes and the test stays
+green. This was not hypothetical: M-RD8 and M-RD9 both shift the file by −34
+bytes and did collide, turning a genuinely-caught mutation into a false
+`SUSPECT`. With the isolated cache the matrix is 13/13 RED.
 
 ## Verification (local)
 
-> **exact-head CI note**: `tests (3.11)`, `tests (3.12)` and `docker-smoke` are
-> RED on head `190da07` — all three fail on the *same single* test,
-> `test_rebalance_cycle_scope.SameDayRolloverKeepsBothRows.test_two_cycles_same_day_coexist`
-> (`[1] != [1, 2]`), an unmodified fixture from before this PR. `syntax`,
-> `quality`, `frontend`, `browser-e2e` and `Security Leak Scan` are all green.
-> Evidence and root cause below.
-
 | Check | Result |
 |---|---|
-| `unittest backend.test_paper_risk_decision` | 15 tests OK |
+| `unittest backend.test_paper_risk_decision` | 18 tests OK |
 | `unittest backend.test_paper_trading_architecture_guard` | 15 tests OK |
-| `unittest backend.test_paper_risk_decision backend.test_paper_trading_architecture_guard` | 30 tests OK |
+| `unittest backend.test_rebalance_cycle_scope` | 29 tests OK |
+| `unittest` (three modules above, together) | 62 tests OK |
 | `work/r15_before_fix_repro.py` | C1/C2 NOT REPRODUCED, C3/C4 PASS |
-| `work/r15_mutation_check.py` | 12/12 RED, restore byte-identical |
+| `work/r15_mutation_check.py` | 13/13 RED, restore byte-identical |
 | `ruff check backend` | All checks passed |
 | `python -m compileall -q backend` | exit 0 |
 | `node --check` over `frontend/src/**/*.js` | exit 0 |
 | `scripts/security/scan-sensitive-data.py --scope all` | `kinds: none / values: 0` |
-| `unittest discover -s backend` | 3509 tests, **1 pre-existing failure** (see below) |
+| `unittest discover -s backend` | **3512 tests OK** (skipped=5) — no failures |
 
-### Pre-existing failure, not caused by this PR
-
-`test_rebalance_cycle_scope.SameDayRolloverKeepsBothRows.test_two_cycles_same_day_coexist`
-fails on the **unmodified base SHA `06197d76`** as well (reproduced in a clean
-`git worktree` of the base commit):
+### The previously-red fixture now passes
 
 ```
-$ git worktree add --detach <tmp> 06197d76a218485c377ffb10eac77671b51f3b0d
-$ python -m unittest backend.test_rebalance_cycle_scope.SameDayRolloverKeepsBothRows.test_two_cycles_same_day_coexist
-AssertionError: Lists differ: [1] != [1, 2]
-FAILED (failures=1)
+$ python -m unittest backend.test_rebalance_cycle_scope -v
+Ran 29 tests in 6.937s
+OK
 ```
 
-Root cause (date-brittle fixture, unrelated to sell-risk decisions):
+Root cause, retained here for the record (it was a wall-clock leak in a *test
+fixture*, never in the code under this PR):
 
-- the fixture seeds `scan_date="2026-09-19"` while `rebalance_scanner._date()`
-  (→ `_now().date()`) returns the **machine's local date**, and the scanner
-  writes rows with `today.isoformat()`;
-- once the machine date rolls past `2026-09-19`, the seeded row and today's row
-  land on different `scan_date` values, so the query only returns one row;
+- the fixture seeded `scan_date="2026-09-19"` while `rebalance_scanner._date()`
+  (→ `_now().date()`) returns the **machine's local date**, and the scanner writes
+  rows with `today.isoformat()`;
+- once the machine date rolled past `2026-09-19`, the seeded row and today's row
+  landed on different `scan_date` values, so the query returned only one row;
 - why no earlier CI run caught it: master's last green run was at
   `2026-09-19T15:55Z` (Shanghai 23:55, 09-19) — still inside the fixture's day.
-  This PR's run at `2026-09-19T16:52Z` (Shanghai 00:52, **09-20**) crossed the
-  boundary, so the same suite now fails. It is a wall-clock leak in a *test
-  fixture*, not in the code under this PR.
+  The `190da07` run at `2026-09-19T16:52Z` (Shanghai 00:52, **09-20**) crossed the
+  boundary, so the same suite turned red.
 
-Reported honestly rather than papered over; it is **out of scope** for this PR.
+Fixed test-only by freezing the scanner clock inside the case; production
+`rebalance_scanner.py` is untouched.
 
 ## Documentation
 

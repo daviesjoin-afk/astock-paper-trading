@@ -25,6 +25,7 @@ R15 correctness defect
     RD-13  严重度仲裁：硬止损压过最长持有，不被后者覆盖
     RD-14  档位未知跳过阶梯止盈；档位已知时跳空越档单轮连续消费
     RD-15  真实 ``_sell_plan`` 委托纯 engine，且不随机器当前日期漂移
+    RD-16  真实 ``_intraday_downside_guard`` 同样只认显式 as-of（第二条生产链）
 
 全部纯 fixture：不打开数据库、不访问网络 / K 线（``_completed_kline`` 打桩）、
 不 sleep、不动真实系统时钟（机器"今天"用假 ``PT.dt`` 显式模拟）。
@@ -335,6 +336,69 @@ class ProductionSellPlanTests(unittest.TestCase):
             PRD.position_peak(position, quote, quote["price"], asof_day=ASOF),
             quote["price"],
         )
+
+
+class ProductionDownsideGuardTests(unittest.TestCase):
+    """RD-16 —— 第二条生产链 ``_intraday_downside_guard`` 同样不得漏 as-of。
+
+    原始 defect 存在于**两个**生产入口：``_sell_plan`` 与 ``_intraday_downside_guard``。
+    后者内部也算 ``peak = PRD.position_peak(...)``，漏 as-of 时同样回退到机器当前
+    日期，于是 historical replay 里同日新仓会重新吸收**买入前**的 ``quote.high``，
+    ``peak_retrace`` 被凭空放大并触发一次 warning 减仓。
+
+    本用例直接驱动真实 ``PT._intraday_downside_guard``（不是纯 engine）：
+    既钉住 as-of 语义，也证明这条路径不读机器时钟。
+    """
+
+    #: 整仓当日买入、``quote.high`` 是买入前的日内最高价。
+    def _same_day_position(self):
+        return {"account_id": ACCOUNT, "code": CODE, "qty": 100,
+                "today_acquired_qty": 100, "entry_date": ASOF_ISO,
+                "cost": COST, "peak_price": COST, "take_stage": None}
+
+    def _overnight_position(self):
+        return {"account_id": ACCOUNT, "code": CODE, "qty": 100,
+                "today_acquired_qty": 0, "entry_date": "2026-01-04",
+                "cost": COST, "peak_price": COST, "take_stage": None}
+
+    #: 现价 10.50：买入前的 high 12.00 一旦被吸收，回撤就是 12.5%（≥ 3.5% 阈值）。
+    #: 当日跌幅只有 -1.0%（未达 -2.0%），日内低点反弹 0.96%（未达 washout 1.5%），
+    #: 因此**唯一**可能触发 warning 的条件就是被污染的 peak_retrace。
+    QUOTE = {"price": 10.50, "high": PRE_ENTRY_HIGH, "pct": -1.0, "low": 10.40}
+
+    def test_rd16_same_day_new_position_does_not_reabsorb_pre_entry_high(self):
+        guard = PT._intraday_downside_guard(
+            self._same_day_position(), self.QUOTE, asof_day=ASOF)
+
+        # 峰值 = max(权威 peak, 当前价) = 10.50 ⇒ 无回撤 ⇒ 不产生假预警
+        self.assertEqual(guard["peak_retrace_pct"], 0.0,
+                         "同日新仓在日内守护里吸收了买入前的 quote.high")
+        self.assertEqual(guard["level"], "none")
+        self.assertEqual(guard["sell_ratio"], 0.0)
+
+    def test_rd16b_overnight_position_still_absorbs_intraday_high(self):
+        """正对照：隔夜仓的 peak 口径没有被本 PR 改弱。"""
+        guard = PT._intraday_downside_guard(
+            self._overnight_position(), self.QUOTE, asof_day=ASOF)
+
+        self.assertEqual(guard["peak_retrace_pct"], 12.5)
+        self.assertEqual(guard["level"], "warning")
+        self.assertEqual(guard["sell_ratio"], 0.25)
+
+    def test_rd16c_guard_result_does_not_depend_on_the_machine_date(self):
+        """守护的输入只有显式 asof —— 换一个"机器今天"不得改变任何字段。
+
+        这条断言是回归护栏：若有人日后在 guard 内部重新引入 ``_date()`` /
+        ``dt.date.today()`` 这类隐式机器日期，两个世界的输出就会分叉。
+        """
+        position, quote = self._same_day_position(), self.QUOTE
+        outputs = []
+        for machine_day in (ASOF, MACHINE_OTHER):
+            with mock.patch.object(PT, "dt", _fake_dt(machine_day)):
+                outputs.append(PT._intraday_downside_guard(
+                    dict(position), dict(quote), asof_day=ASOF))
+        self.assertEqual(outputs[0], outputs[1],
+                         "日内守护的输出随机器当前日期漂移（wall-clock 泄漏）")
 
 
 if __name__ == "__main__":
