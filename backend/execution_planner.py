@@ -32,6 +32,8 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
+import paper_position_risk_state as PPRS
+
 __all__ = [
     "EXECUTION_PLANNER_VERSION",
     "ExecutionPolicy",
@@ -609,6 +611,15 @@ def commit_fill(
             raise RuntimeError("可卖份额在成交前发生变化，委托已停止")
         realized_pnl = amount - cost_amount - fees
         PT._credit_shared_cash(conn, amount - fees, account_id)
+        # R14 §17：SELL 的 episode 收尾与 lot 消耗同处一个事务，并直接依赖
+        # paper_position_risk_state（不经 paper_trading 转发）。manual / deferred
+        # SELL 同样能卖光最后一股，必须关闭 episode，否则权威表残留"看着还活着"
+        # 的 peak/take_stage。finalizer 用订单自己的 durable cycle 去权威 lots 查
+        # 同周期剩余量，不重解 active cycle；本路径无档位推进事实 ⇒
+        # next_take_stage 缺省 None（部分卖出原样保留 stage，绝不重置）。
+        PPRS.finalize_sell(
+            conn, cycle_id=order_cycle_id, account_id=account_id, code=code,
+        )
 
     PT._assert_active_lease(conn, "execution planner finalization")
     conn.execute(

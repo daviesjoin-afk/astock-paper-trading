@@ -1,0 +1,266 @@
+# -*- coding: utf-8 -*-
+"""``paper_trading`` 架构边界护栏（AST / 源码静态扫描）—— Round-2 第一版。
+
+存在理由只有一个：**position runtime risk state 的 authority 不能再搬回 god
+module**，domain implementation 也不能再长回 ``paper_trading.py``。Round-1
+把 ``paper_position_risk_state`` 的四个 runtime CRUD helper 直接加进了 1.6 万行
+的大文件，于是"唯一 runtime 状态所有者"在源码层并不存在，任何一次顺手修改都能
+把 risk-state 读写散回去。护栏把边界钉成可执行断言：
+
+    Guard 1  新 domain 模块禁止反向 import ``paper_trading``；
+    Guard 2  ``paper_trading.py`` 不得再出现 risk-state CRUD SQL / 转发 wrapper；
+    Guard 3  ``paper_trading.py`` 的 LOC / 模块级函数数不得反弹；
+    Guard 4  新 domain 模块不得成为 service locator（零项目级 import）；
+    Guard 5  三条生产 SELL 路径必须都经过同一个 episode finalizer。
+
+刻意不做全仓架构分析：只扫本边界涉及的文件 + 一条 LOC 基线。确定性、无网络、
+无副作用；规模控制在 200 行左右，坏了能一眼看懂。
+"""
+import ast
+import re
+import unittest
+from pathlib import Path
+
+BACKEND = Path(__file__).resolve().parent
+PAPER_TRADING = BACKEND / "paper_trading.py"
+EXECUTION_PLANNER = BACKEND / "execution_planner.py"
+RISK_STATE_MODULE = "paper_position_risk_state.py"
+
+RISK_STATE_TABLE = "paper_position_risk_state"
+
+#: Guard 1 —— 这些 domain 模块只允许依赖 stdlib / 各自的低层契约。反向 import
+#: ``paper_trading`` 会把它们变成 god module 的延伸，authority 随之泄漏。
+DOMAIN_MODULES = (
+    "paper_position_risk_state.py",
+    "paper_position_read_model.py",
+    "paper_portfolio.py",
+    "paper_cycle_service.py",
+    "paper_capital_reservations.py",
+    "paper_cycle_capital.py",
+    "paper_slot_occupancy.py",
+    "paper_risk_exit_eligibility.py",
+)
+
+#: 历史上已有的例外。当前为空。新模块 ``paper_position_risk_state.py`` 永远不得
+#: 进入本表 —— 它的价值恰恰在于"不依赖 paper_trading"。
+REVERSE_IMPORT_ALLOWLIST: dict = {}
+
+#: Guard 2 —— risk-state runtime CRUD 只能存在于 authority 模块里。
+_RISK_STATE_WRITE = re.compile(
+    r"(?:INSERT(?:\s+OR\s+\w+)?\s+INTO|REPLACE\s+INTO|UPDATE|DELETE\s+FROM)"
+    r"\s+" + RISK_STATE_TABLE + r"\b",
+    re.IGNORECASE,
+)
+
+#: Round-1 加进 ``paper_trading.py`` 的四个转发 wrapper；迁出后不得回流。
+FORBIDDEN_PAPER_TRADING_DEFS = frozenset({
+    "init_position_risk_state",
+    "update_position_peak",
+    "update_position_take_stage",
+    "delete_position_risk_state",
+})
+
+#: Guard 3 —— Round-2 exact head 的基线（master 为 16314 行 / 287 函数）。以后只
+#: 允许 same or lower：确有 facade wiring 要加，必须同时抽出别的函数保持不增长。
+#: 不要设计环境变量绕过 / ``skip if CI`` 之类的后门。
+PAPER_TRADING_LOC_BASELINE = 16365
+PAPER_TRADING_DEF_BASELINE = 287
+
+#: Guard 4 —— 新模块允许出现的 import 根（stdlib）。
+ALLOWED_STDLIB_IMPORTS = frozenset({"__future__", "datetime", "typing", "sqlite3"})
+
+#: Guard 5 —— 生产 SELL 路径 → (文件, 函数名)。
+PRODUCTION_SELL_PATHS = (
+    ("paper_trading.py", "_monitor_risk_impl"),
+    ("paper_trading.py", "_intraday_sell"),
+    ("execution_planner.py", "commit_fill"),
+)
+
+FINALIZER_CALL = "finalize_sell("
+FINALIZER_OWNER = "PPRS"
+
+
+def _source(name):
+    return (BACKEND / name).read_text(encoding="utf-8")
+
+
+def _tree(name):
+    return ast.parse(_source(name))
+
+
+def _imported_roots(tree):
+    """所有 import 的**根模块名**（``a.b`` → ``a``；``from a import b`` → ``a``）。"""
+    roots = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            roots.update(alias.name.split(".")[0] for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+            roots.add(node.module.split(".")[0])
+    return roots
+
+
+def _top_level_defs(tree):
+    return {
+        node.name for node in tree.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+
+
+def _code_string_constants(tree):
+    """模块 / 类 / 函数的 docstring 之外的字符串常量（即真正的 SQL 文本）。"""
+    docstrings = set()
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+            body = getattr(node, "body", None) or []
+            if body and isinstance(body[0], ast.Expr) and \
+                    isinstance(body[0].value, ast.Constant) and \
+                    isinstance(body[0].value.value, str):
+                docstrings.add(id(body[0].value))
+    return [
+        node.value for node in ast.walk(tree)
+        if isinstance(node, ast.Constant) and isinstance(node.value, str)
+        and id(node) not in docstrings
+    ]
+
+
+def _function_source(tree, name, raw):
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == name:
+            return "\n".join(raw.splitlines()[node.lineno - 1:node.end_lineno])
+    raise AssertionError(f"未找到函数 {name}")
+
+
+class DomainModulesNeverDependOnPaperTrading(unittest.TestCase):
+    """Guard 1 —— authority 边界必须是单向的。"""
+
+    def test_guard1_domain_modules_do_not_import_paper_trading(self):
+        for name in DOMAIN_MODULES:
+            with self.subTest(module=name):
+                self.assertTrue((BACKEND / name).exists(), f"{name} 不存在")
+                if name in REVERSE_IMPORT_ALLOWLIST:
+                    self.skipTest(f"{name} 是已登记的例外")
+                self.assertNotIn(
+                    "paper_trading", _imported_roots(_tree(name)),
+                    f"{name} 反向 import 了 paper_trading：依赖方向被反转，"
+                    "risk-state / 持仓读模型会重新变成大文件的延伸",
+                )
+
+    def test_guard1b_risk_state_module_is_never_allowlisted(self):
+        self.assertNotIn(
+            RISK_STATE_MODULE, REVERSE_IMPORT_ALLOWLIST,
+            "新模块的价值就在「不依赖 paper_trading」；不允许把它登记成例外",
+        )
+
+
+class RiskStateCrudStaysInItsOwner(unittest.TestCase):
+    """Guard 2 —— runtime CRUD 不得重回 ``paper_trading.py``。"""
+
+    def test_guard2_no_direct_risk_state_crud_in_paper_trading(self):
+        hits = [
+            (number, line.strip())
+            for number, line in enumerate(_source("paper_trading.py").splitlines(), 1)
+            if _RISK_STATE_WRITE.search(line)
+        ]
+        self.assertEqual(
+            hits, [],
+            "paper_trading.py 又出现了 paper_position_risk_state 的 CRUD SQL；"
+            "全部读写必须经 paper_position_risk_state 模块（DDL 仍归 "
+            "paper_schema_migrations）",
+        )
+
+    def test_guard2b_forbidden_forwarding_wrappers_do_not_come_back(self):
+        defined = _top_level_defs(_tree("paper_trading.py"))
+        self.assertEqual(
+            sorted(defined & FORBIDDEN_PAPER_TRADING_DEFS), [],
+            "四个 risk-state CRUD wrapper 被搬回了 paper_trading.py",
+        )
+
+
+class PaperTradingDoesNotRegrow(unittest.TestCase):
+    """Guard 3 —— god module 只允许变瘦。"""
+
+    def _size(self):
+        raw = _source("paper_trading.py")
+        return len(raw.splitlines()), len(_top_level_defs(ast.parse(raw)))
+
+    def test_guard3_line_count_does_not_exceed_the_round2_baseline(self):
+        loc, _defs = self._size()
+        self.assertLessEqual(
+            loc, PAPER_TRADING_LOC_BASELINE,
+            f"paper_trading.py 长到 {loc} 行（基线 {PAPER_TRADING_LOC_BASELINE}）："
+            "domain implementation 必须迁到独立模块，不要在这里继续堆",
+        )
+
+    def test_guard3b_top_level_function_count_does_not_exceed_the_baseline(self):
+        _loc, defs = self._size()
+        self.assertLessEqual(
+            defs, PAPER_TRADING_DEF_BASELINE,
+            f"paper_trading.py 模块级函数增加到 {defs}（基线 "
+            f"{PAPER_TRADING_DEF_BASELINE}）：确有 facade wiring 要加，"
+            "必须同时抽出等价函数保持不增长",
+        )
+
+
+class RiskStateModuleIsAPureDomainBoundary(unittest.TestCase):
+    """Guard 4 —— 新模块必须是纯 domain/infrastructure 边界。"""
+
+    def test_guard4_risk_state_module_has_zero_project_imports(self):
+        project_modules = {path.stem for path in BACKEND.glob("*.py")}
+        roots = _imported_roots(_tree(RISK_STATE_MODULE))
+        leaked = sorted(roots & (project_modules - {Path(RISK_STATE_MODULE).stem}))
+        self.assertEqual(
+            leaked, [],
+            f"{RISK_STATE_MODULE} import 了项目模块 {leaked}；"
+            "它只应依赖 stdlib 与调用方交进来的 sqlite connection",
+        )
+        self.assertEqual(sorted(roots - ALLOWED_STDLIB_IMPORTS), [],
+                         "出现了未登记的 import，请审慎评估后再放行")
+
+    def test_guard4b_risk_state_module_does_not_own_transactions_or_resolve_cycles(self):
+        """只扫**代码与 SQL 常量**，不扫文档字符串（那里的 ``BEGIN`` 是说明文字）。"""
+        tree = _tree(RISK_STATE_MODULE)
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+                self.assertNotIn(
+                    node.func.attr, {"commit", "rollback", "executescript", "executemany"},
+                    f"状态模块调用了 .{node.func.attr}()：transaction 归调用方所有",
+                )
+        sql = "\n".join(_code_string_constants(tree)).upper()
+        for forbidden in ("BEGIN", "SAVEPOINT", "ROLLBACK", "COMMIT"):
+            self.assertNotIn(
+                forbidden, sql,
+                "状态模块的 SQL 里出现了事务语句：状态收尾必须与成交同处调用方事务",
+            )
+        for forbidden in ("PAPER_ACCOUNTS", "MAX(CYCLE_ID)"):
+            self.assertNotIn(
+                forbidden, sql,
+                "状态模块不得解析 active cycle：cycle_id 必须由调用方显式传入",
+            )
+
+
+class EveryProductionSellPathFinalizesTheEpisode(unittest.TestCase):
+    """Guard 5 —— episode 收尾只有一条判据、一个 finalizer。"""
+
+    def test_guard5_sell_paths_call_the_shared_finalizer(self):
+        for filename, function in PRODUCTION_SELL_PATHS:
+            with self.subTest(path=f"{filename}:{function}"):
+                raw = _source(filename)
+                body = _function_source(ast.parse(raw), function, raw)
+                self.assertIn(
+                    f"{FINALIZER_OWNER}.{FINALIZER_CALL}", body,
+                    f"{filename}:{function} 不再调用共享的 episode finalizer —— "
+                    "该路径卖光最后一股权威 lot 后会留下已结束 episode 的运行时状态",
+                )
+
+    def test_guard5b_finalizer_is_not_reached_through_paper_trading(self):
+        """execution_planner 必须直接依赖 authority 模块，而不是让 PT 转发。"""
+        source = _source("execution_planner.py")
+        self.assertIn(f"import {RISK_STATE_MODULE[:-3]} as {FINALIZER_OWNER}", source,
+                      "execution_planner 未直接 import paper_position_risk_state")
+        self.assertNotIn("PT.finalize_sell(", source,
+                         "execution_planner 经 paper_trading 转发调用 finalizer："
+                         "依赖方向又被打回 god module")
+
+
+if __name__ == "__main__":
+    unittest.main()

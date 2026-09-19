@@ -150,10 +150,19 @@ def _position(conn, cycle_id, account_id, code, name, industry, qty, cost, entry
         INSERT INTO paper_position_lots(cycle_id,account_id,code,name,industry,qty,remaining_qty,cost,acquired_at,available_date,asset_type,source_order_id,cost_fee_included,is_t_base)
         VALUES (?,?,?,?,?,?,?,?,?,?,'stock_t1',NULL,0,1)""",
         (cycle_id, account_id, code, name, industry, qty, qty, cost, f"{entry_day} 10:00:00", available_day))
+    # R14：runtime 风险状态（peak/take_stage）的权威在 cycle-owned 表；
+    # 种子数据同样必须写那里，否则演示持仓会走"状态缺失"的 fail-safe 语义。
+    # 投影里的 peak/take_stage 只是展示镜像。
+    PT._rows(conn, """
+        INSERT OR REPLACE INTO paper_position_risk_state(cycle_id,account_id,code,peak_price,take_stage,opened_order_id,initialized_at,updated_at)
+        VALUES (?,?,?,?,0,NULL,?,?)""",
+        (cycle_id, account_id, code, round(cost * 1.03, 2), f"{entry_day} 10:00:00", f"{entry_day} 10:00:00"))
 
 
 def _drop_position(conn, account_id, code):
     PT._rows(conn, "DELETE FROM paper_positions WHERE account_id=? AND code=?", (account_id, code))
+    PT._rows(conn, "DELETE FROM paper_position_risk_state WHERE account_id=? AND code=?",
+             (account_id, code))
     PT._rows(conn, "UPDATE paper_position_lots SET remaining_qty=0 WHERE account_id=? AND code=?",
              (account_id, code))
 

@@ -53,7 +53,7 @@ ARCHIVE_FORMAT = "compact-ledger-v2"
 # 归档时**整体搬运**的账本表（durable trading ledger）。
 LEDGER_TABLES = (
     "paper_accounts", "paper_orders", "paper_positions",
-    "paper_position_lots", "paper_fills", "paper_nav",
+    "paper_position_lots", "paper_position_risk_state", "paper_fills", "paper_nav",
     "paper_parameter_versions", "paper_position_limit_versions",
 )
 
@@ -66,7 +66,8 @@ COUNTED_TABLES = (
 
 # 归档后清空的活动账本表（历史保留在 paper_archives.snapshot 里）。
 PURGED_TABLES = (
-    "paper_signals", "paper_orders", "paper_positions", "paper_position_lots", "paper_fills",
+    "paper_signals", "paper_orders", "paper_positions", "paper_position_lots",
+    "paper_position_risk_state", "paper_fills",
     "paper_risk_decisions", "paper_nav", "paper_jobs", "paper_job_runs", "paper_reviews",
     "paper_intraday_observations", "paper_parameter_versions", "paper_position_reviews",
     "paper_capital_reservations", "paper_position_limit_versions",

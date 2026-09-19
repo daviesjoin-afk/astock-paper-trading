@@ -7,8 +7,26 @@
 from __future__ import annotations
 
 
-def aggregate_positions(lots, legacy_rows, cash_flows, day, *, num):
-    """将可用持仓 lot 聚合成兼容旧接口的持仓字典列表。"""
+def aggregate_positions(lots, risk_state_rows, cash_flows, day, *, num):
+    """将可用持仓 lot 聚合成兼容旧接口的持仓字典列表。
+
+    Authority（R14）::
+
+        lots            -> qty / cost / entry_date（quantity authority）
+        risk_state_rows -> peak_price / take_stage（runtime risk authority）
+        paper_positions -> 不再参与聚合（zero execution authority）
+
+    ``risk_state_rows`` 是**同周期** ``paper_position_risk_state`` 行。某持仓
+    没有状态行时（升级前遗留持仓 / 无 episode 事实），语义是显式 fail-safe：
+
+    * ``peak_price`` 锚定成本 —— 与全新 episode 的默认一致；``_position_peak``
+    仍会吸收当日 high，因此移动止损按"今日观测峰值"照常工作，但绝不会因为一条
+    不可证明的历史峰值而比基线卖得更多；
+    * ``take_stage=None`` —— "已消费到哪一档"不可证明，``_sell_plan`` 对
+    ``None`` 跳过阶梯止盈（绝不猜一个档位多卖）。
+
+    hard stop / max hold 不依赖这两项，照常工作 —— 基础保护不被关闭。
+    """
     grouped = {}
     for lot in lots:
         key = (lot["account_id"], lot["code"])
@@ -31,7 +49,7 @@ def aggregate_positions(lots, legacy_rows, cash_flows, day, *, num):
         else:
             item["locked_qty"] += qty
 
-    legacy = {(p["account_id"], p["code"]): p for p in legacy_rows}
+    risk_state = {(p["account_id"], p["code"]): p for p in risk_state_rows}
     out = []
     for key, item in grouped.items():
         item["cost"] = item.pop("cost_amount") / max(item["qty"], 1)
@@ -48,8 +66,15 @@ def aggregate_positions(lots, legacy_rows, cash_flows, day, *, num):
             net_invested = num(flow.get("buy_cash")) - num(flow.get("sell_cash"))
             item["display_cost"] = net_invested / max(item["qty"], 1)
             item["display_cost_source"] = "verified_cash_flow"
-        old = legacy.get(key, {})
-        item["peak_price"] = num(old.get("peak_price"), item["cost"])
-        item["take_stage"] = int(num(old.get("take_stage"), 0))
+        row = risk_state.get(key)
+        if row is None:
+            # 缺失 = 未知（unknown must not be upgraded into known）。
+            item["peak_price"] = item["cost"]
+            item["take_stage"] = None
+            item["risk_state_source"] = "missing"
+        else:
+            item["peak_price"] = num(row.get("peak_price"), item["cost"])
+            item["take_stage"] = int(num(row.get("take_stage"), 0))
+            item["risk_state_source"] = "cycle_state"
         out.append(item)
     return out

@@ -463,6 +463,102 @@ def ensure_rebalance_state_cycle_ownership(conn):
     return changes
 
 
+# ─── 周期归属的持仓运行时风险状态（v20） ─────────────────────────────────────
+#
+# 不变量::
+#
+#     paper_position_lots        = position quantity / ownership authority
+#     paper_position_risk_state  = runtime peak / staged-take-profit authority
+#     paper_positions            = compatibility projection only
+#
+# 背景：``peak_price``（移动止损的峰值）与 ``take_stage``（阶梯止盈已消费档位）
+# 不是展示元数据 —— ``paper_trading._sell_plan`` 用前者算 drawdown 并触发
+# ``trailing_stop``、用后者驱动阶梯止盈的状态机，它们是 execution-adjacent 的
+# 运行时风险状态。但它们一直寄居在 ``paper_positions`` 投影里，而该表
+# **没有 cycle_id、没有 position episode 身份**（``PRIMARY KEY(account_id, code)``），
+# 于是旧周期 / 旧 episode 的 peak 与 stage 会直接泄漏进新周期，真实改变卖出决策。
+#
+# **绝不回填**：升级前的 ``paper_positions.peak_price`` / ``take_stage`` 属于哪个
+# 周期、哪个 position episode 无法从任何当前状态反推 —— 和 #169 禁止
+# "stale mirror -> current lot" 是同一种错误。没有风险状态行时，语义是
+# fail-safe（读模型给成本锚 peak 与"未知"stage），绝不用投影元数据冒充权威。
+#
+#: 规范列序（与 DDL 共用一份事实）。
+POSITION_RISK_STATE_COLUMNS = (
+    "cycle_id", "account_id", "code", "peak_price", "take_stage",
+    "opened_order_id", "initialized_at", "updated_at",
+)
+
+
+def position_risk_state_ddl(table="paper_position_risk_state"):
+    """``paper_position_risk_state`` 的规范 DDL（主键含 ``cycle_id``）。
+
+    ``cycle_id`` 直接 ``NOT NULL``：本表由 v20 全新创建、**禁止回填**，所以
+    不存在"历史行需要保持 NULL"的问题 —— 不需要 v18/v19 的"可空列 + trigger"
+    折衷，可以直接用列约束表达"每行都必须属于一个周期"。cycle 是否真实存在的
+    校验仍由 trigger 承担（``paper_cycles`` 不存在的极简库里退化为仅 NOT NULL）。
+    """
+    return f"""
+        CREATE TABLE {table}(
+            cycle_id INTEGER NOT NULL,
+            account_id TEXT NOT NULL,
+            code TEXT NOT NULL,
+            peak_price REAL NOT NULL,
+            take_stage INTEGER NOT NULL DEFAULT 0,
+            opened_order_id INTEGER,
+            initialized_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY(cycle_id, account_id, code)
+        )
+    """
+
+
+def _ensure_position_risk_state_guards(conn):
+    """新行必须指向真实周期，且周期归属一经写入不可更改。
+
+    周期身份是 **creation-time ownership fact**：风险状态行由哪次建仓产生，
+    就永远属于哪个周期。``BEFORE UPDATE OF cycle_id`` 让任何 repair 脚本都
+    无法把行"改挂"到另一个周期 —— 那等于事后重写归属历史。
+    """
+    if not table_columns(conn, "paper_position_risk_state"):
+        return
+    has_cycles = bool(table_columns(conn, "paper_cycles"))
+    when = "NEW.cycle_id IS NULL"
+    if has_cycles:
+        when += (" OR NOT EXISTS (SELECT 1 FROM paper_cycles c"
+                 " WHERE c.id=NEW.cycle_id)")
+    conn.execute(
+        f"""CREATE TRIGGER IF NOT EXISTS trg_paper_position_risk_state_cycle_required_insert
+            BEFORE INSERT ON paper_position_risk_state
+            WHEN {when}
+            BEGIN SELECT RAISE(ABORT, 'position risk state requires a cycle'); END"""
+    )
+    conn.execute(
+        """CREATE TRIGGER IF NOT EXISTS trg_paper_position_risk_state_cycle_immutable
+            BEFORE UPDATE OF cycle_id ON paper_position_risk_state
+            WHEN NEW.cycle_id IS NOT OLD.cycle_id
+            BEGIN SELECT RAISE(ABORT, 'position risk state cycle ownership is immutable'); END"""
+    )
+
+
+def ensure_position_risk_state(conn):
+    """v20：cycle-owned 的持仓运行时风险状态表（幂等，**绝不回填**）。
+
+    只建表 + 安装 guard。**不执行任何** ``INSERT ... SELECT ... FROM
+    paper_positions``：升级前投影里的 peak/take_stage 没有 cycle / episode
+    归属，把它们搬进本表就是把"不知道"洗白成"当前周期的已知状态"。
+    首个状态行只能由 verified BUY 的 episode 生命周期创建。
+    """
+    changes = {}
+    if not table_columns(conn, "paper_position_risk_state"):
+        conn.execute(position_risk_state_ddl("paper_position_risk_state"))
+        changes["paper_position_risk_state"] = "created"
+    else:
+        changes["paper_position_risk_state"] = "ok"
+    _ensure_position_risk_state_guards(conn)
+    return changes
+
+
 def ensure_strategy_reference_columns(conn):
     """Append immutable strategy-version stamps to execution evidence tables.
 
