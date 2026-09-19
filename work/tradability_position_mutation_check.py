@@ -2063,10 +2063,17 @@ DESIGNATED_NON_VACUITY = {
         ".test_cycle_change_during_verify_fails_closed",
     ),
     # NV-RC9：没有 active cycle 时不得写下无归属状态。
+    #
+    # 必须指名**scanner 层**的守卫测试，不能指名 API 层的
+    # ``test_scan_without_active_cycle_creates_no_state``：M-RC9 变异的是
+    # ``rebalance_scanner._require_cycle_id``，而 endpoint 在调用 scanner **之前**
+    # 就有自己独立的一次 ``cycle_id is None`` 检查（两层的 fail-closed 是
+    # defense in depth）。API 层测试因此会因为另一层的守卫而继续变红/变绿，
+    # 与本次变异无关 —— 那正是非空性要抓的"变异打在了不是被守护的那个决策点"。
     "M-RC9": (
         "test_rebalance_cycle_scope"
         ".NoActiveCycleFailsClosed"
-        ".test_scan_without_active_cycle_creates_no_state",
+        ".test_daily_close_scan_requires_cycle_id",
     ),
 }
 
