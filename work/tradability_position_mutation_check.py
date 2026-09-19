@@ -46,6 +46,8 @@ TEST_MODULES = (
     "test_authoritative_position_consumers",
     # Round-11：调仓引擎必须读写 paper ledger（两个物理分离的 SQLite）。
     "test_rebalance_db_ownership",
+    # Round-12：调仓状态（scan / plan / cooldown）的周期归属。
+    "test_rebalance_cycle_scope",
 )
 
 ADAPTER = "backend/tradability_position_evidence.py"
@@ -59,6 +61,12 @@ READ_MODEL = "backend/paper_position_read_model.py"
 API_ADAPTIVE = "backend/api_adaptive.py"
 #: Round-11 数据库归属的 E2E 夹具（两个物理分离的 SQLite）。
 TEST_DB_OWNERSHIP = "backend/test_rebalance_db_ownership.py"
+#: Round-12 调仓状态的周期归属 E2E 夹具。
+TEST_CYCLE_SCOPE = "backend/test_rebalance_cycle_scope.py"
+#: Round-12 调仓状态 schema（唯一契约含 cycle_id）的持有者。
+SCHEMA_MIGRATIONS = "backend/paper_schema_migrations.py"
+#: Round-12 调仓扫描器（周期归属的读取与写入落点）。
+SCANNER = "backend/rebalance_scanner.py"
 #: Round-10/11 消费者契约 + projection 白名单守卫。
 TEST_CONSUMERS = "backend/test_authoritative_position_consumers.py"
 
@@ -1058,19 +1066,13 @@ MUTATIONS = (
     (
         "M-PC10",
         API_ADAPTIVE,
-        "        import rebalance_scanner\n"
         "        with _paper_rebalance_db() as conn:\n"
         "            rebalance_scanner.ensure_schema(conn)\n"
-        "            result = rebalance_scanner.get_rebalance_status(conn)\n"
-        "            _cache_set(\"rebalance_status\", result)\n"
-        "            return result\n",
-        "        import rebalance_scanner\n"
+        "            # operational status 只回答\"**当前周期**待执行什么\"。历史跨周期的\n",
         "        # MUTANT M-PC10: scan writes paper DB, status reads adaptive DB\n"
         "        with adaptive._connect() as conn:\n"
         "            rebalance_scanner.ensure_schema(conn)\n"
-        "            result = rebalance_scanner.get_rebalance_status(conn)\n"
-        "            _cache_set(\"rebalance_status\", result)\n"
-        "            return result\n",
+        "            # operational status 只回答\"**当前周期**待执行什么\"。历史跨周期的\n",
         "scan 写 paper DB 而 status 读 adaptive DB（split-brain）",
     ),
     (
@@ -1078,11 +1080,11 @@ MUTATIONS = (
         API_ADAPTIVE,
         "        with _paper_rebalance_db() as conn:\n"
         "            rebalance_scanner.ensure_schema(conn)\n"
-        "            results = rebalance_scanner.verify_all_plans(conn, plans, quotes)\n",
+        "            # **周期竞态**：取计划与取行情之间隔着一次网络调用，期间周期可能\n",
         "        # MUTANT M-PC11: verify reads/writes the adaptive DB\n"
         "        with adaptive._connect() as conn:\n"
         "            rebalance_scanner.ensure_schema(conn)\n"
-        "            results = rebalance_scanner.verify_all_plans(conn, plans, quotes)\n",
+        "            # **周期竞态**：取计划与取行情之间隔着一次网络调用，期间周期可能\n",
         "verify 继续读写 adaptive DB",
     ),
     (
@@ -1105,6 +1107,132 @@ MUTATIONS = (
         "        \"backend/api_adaptive.py\": \"display read model\",\n"
         "    }\n",
         "api_adaptive 重新被整体加入 projection 白名单",
+    ),
+    # ── Round-12：调仓状态的周期归属（§28 M-RC1 … M-RC9） ────────────────────
+    # M-RC1：rebalance_scans 的 operational 查询丢掉 cycle_id。
+    # 落点选 ``get_rebalance_status`` 的 recent_scans —— status 是 operational
+    # 视图，去掉周期过滤后 cycle 8 的扫描行会混进 cycle 9 的状态。
+    (
+        "M-RC1",
+        SCANNER,
+        "           FROM rebalance_scans WHERE cycle_id=?\n"
+        "           ORDER BY id DESC LIMIT ?\"\"\",\n"
+        "        (cycle_id, limit)\n",
+        "           # MUTANT M-RC1: rebalance_scans query drops cycle_id\n"
+        "           FROM rebalance_scans WHERE (? IS NOT NULL OR 1=1)\n"
+        "           ORDER BY id DESC LIMIT ?\"\"\",\n"
+        "        (cycle_id, limit)\n",
+        "rebalance_scans 查询丢掉 cycle_id（跨周期扫描行混入 operational 视图）",
+    ),
+    # M-RC2：prev_quality_score 跨周期读取。
+    (
+        "M-RC2",
+        SCANNER,
+        "            \"\"\"SELECT quality_score FROM rebalance_scans\n"
+        "               WHERE cycle_id=? AND account_id=? AND code=?\n"
+        "               ORDER BY id DESC LIMIT 1\"\"\",\n"
+        "            (cycle_id, account_id, code)\n",
+        "            # MUTANT M-RC2: prev_quality_score reads across cycles\n"
+        "            \"\"\"SELECT quality_score FROM rebalance_scans\n"
+        "               WHERE account_id=? AND code=?\n"
+        "               ORDER BY id DESC LIMIT 1\"\"\",\n"
+        "            (account_id, code)\n",
+        "prev_quality_score 跨周期读取（借用旧周期基线）",
+    ),
+    # M-RC3：consecutive_outflow 跨周期累计。
+    (
+        "M-RC3",
+        SCANNER,
+        "        \"\"\"SELECT fund_flow_trend FROM rebalance_scans\n"
+        "           WHERE cycle_id=? AND account_id=? AND code=?\n"
+        "           ORDER BY scan_date DESC LIMIT 5\"\"\",\n"
+        "        (cycle_id, account_id, code)\n",
+        "        # MUTANT M-RC3: consecutive outflow crosses cycles\n"
+        "        \"\"\"SELECT fund_flow_trend FROM rebalance_scans\n"
+        "           WHERE account_id=? AND code=?\n"
+        "           ORDER BY scan_date DESC LIMIT 5\"\"\",\n"
+        "        (account_id, code)\n",
+        "consecutive_outflow 跨周期累计",
+    ),
+    # M-RC4：get_pending_plans 不过滤周期（返回全部历史周期计划）。
+    (
+        "M-RC4",
+        SCANNER,
+        "        \"\"\"SELECT * FROM rebalance_plans\n"
+        "           WHERE cycle_id=? AND status IN ('planned', 'verified')\n"
+        "           ORDER BY plan_date DESC\"\"\",\n"
+        "        (cycle_id,)\n",
+        "        # MUTANT M-RC4: pending plans are not cycle-scoped\n"
+        "        \"\"\"SELECT * FROM rebalance_plans\n"
+        "           WHERE status IN ('planned', 'verified')\n"
+        "           ORDER BY plan_date DESC\"\"\",\n"
+        "        ()\n",
+        "get_pending_plans 不过滤 cycle（返回全部历史周期计划）",
+    ),
+    # M-RC5：verify 的 UPDATE 只按 id（丢掉 cycle_id 过滤）。
+    # 承重面是**伪造归属**的 plan dict：身份检查被谎报的 cycle_id 骗过，唯一还能
+    # 挡住它的是 UPDATE 自身的 cycle 过滤。
+    (
+        "M-RC5",
+        SCANNER,
+        "               WHERE id=? AND cycle_id=?\"\"\",\n",
+        "               # MUTANT M-RC5: verify UPDATE keys on id only\n"
+        "               WHERE id=? AND ? IS NOT NULL\"\"\",\n",
+        "verify UPDATE 只按 id（stale plan 可被 caller 注入改写）",
+    ),
+    # M-RC6：risk-handled 的委托查询不过滤周期。
+    # 三条分支各有一处 `AND cycle_id=?`；这里改最承重的 recent_risk 分支
+    # （同日翻周期时把 cycle 8 的风控退出算到 cycle 9 头上）。
+    (
+        "M-RC6",
+        SCANNER,
+        "           WHERE account_id=? AND code=? AND side='sell' AND cycle_id=?\n"
+        "             AND status='filled'\n"
+        "             AND \"\"\" + EV.VERIFIED_PREDICATE + \"\"\"\n"
+        "             AND created_at >= ?\n"
+        "             AND (\n",
+        "           # MUTANT M-RC6: risk-handled order query ignores the cycle\n"
+        "           WHERE account_id=? AND code=? AND side='sell'\n"
+        "             AND status='filled'\n"
+        "             AND \"\"\" + EV.VERIFIED_PREDICATE + \"\"\"\n"
+        "             AND created_at >= ?\n"
+        "             AND (\n",
+        "risk handled 的委托查询不过滤 cycle（旧周期退出压制新周期持仓）",
+    ),
+    # M-RC7：rebalance_scans 的 UNIQUE 恢复成 scan_date/account/code。
+    # 这是 §5 的核心：只 ADD COLUMN 而保留旧 UNIQUE 会让同日跨周期互相 replace。
+    (
+        "M-RC7",
+        SCHEMA_MIGRATIONS,
+        "            UNIQUE(cycle_id, scan_date, account_id, code)\n",
+        "            -- MUTANT M-RC7: cross-cycle UNIQUE is back\n"
+        "            UNIQUE(scan_date, account_id, code)\n",
+        "rebalance_scans 的 UNIQUE 恢复成 scan_date/account_id/code",
+    ),
+    # M-RC8：verify 期间周期变化仍继续（竞态守卫被移除）。
+    (
+        "M-RC8",
+        API_ADAPTIVE,
+        "            if current_cycle_id != requested_cycle_id:\n",
+        "            # MUTANT M-RC8: cycle change during verify is ignored\n"
+        "            if False and current_cycle_id != requested_cycle_id:\n",
+        "verify 期间 cycle change 仍继续（stale plan 被验证）",
+    ),
+    # M-RC9：新 scan/plan 的 cycle_id 写成 NULL（无归属事实）。
+    # 落点是 ``_require_cycle_id`` 的返回 —— 它把"必须有周期"折叠成"写 NULL"。
+    (
+        "M-RC9",
+        SCANNER,
+        "    if cycle_id is None:\n"
+        "        raise NoActiveCycle(\n"
+        "            f\"{operation}: 没有 active paper cycle，拒绝写入无归属的调仓状态\"\n"
+        "        )\n"
+        "    return int(cycle_id)\n",
+        "    # MUTANT M-RC9: unowned state is written with cycle_id=NULL\n"
+        "    if cycle_id is None:\n"
+        "        return None\n"
+        "    return int(cycle_id)\n",
+        "新 scan/plan 的 cycle_id 写成 NULL（无归属事实）",
     ),
 )
 
@@ -1884,6 +2012,61 @@ DESIGNATED_NON_VACUITY = {
         "test_authoritative_position_consumers"
         ".ProjectionContractGuard"
         ".test_api_adaptive_is_not_whitelisted",
+    ),
+    # ── Round-12：调仓状态的周期归属（§28） ──────────────────────────────────
+    # NV-RC1：status 的 recent_scans 必须 cycle-scoped。
+    "M-RC1": (
+        "test_rebalance_cycle_scope"
+        ".RB_C_StatusIsCurrentCycleOnly"
+        ".test_status_shows_only_current_cycle",
+    ),
+    # NV-RC2：prev_quality_score 必须同周期（不得借 90.0 基线）。
+    "M-RC2": (
+        "test_rebalance_cycle_scope"
+        ".RB_C5_PrevQualityIsSameCycle"
+        ".test_RB_C5_prev_quality_does_not_borrow_cycle8_baseline",
+    ),
+    # NV-RC3：consecutive_outflow 必须同周期（1 而不是 5）。
+    "M-RC3": (
+        "test_rebalance_cycle_scope"
+        ".RB_C6_ConsecutiveOutflowIsSameCycle"
+        ".test_RB_C6_outflow_streak_does_not_cross_cycles",
+    ),
+    # NV-RC4：get_pending_plans 必须只返回本周期。
+    "M-RC4": (
+        "test_rebalance_cycle_scope"
+        ".RB_C2_PendingPlansAreCycleScoped"
+        ".test_RB_C2_cycle8_plan_is_invisible_to_cycle9",
+    ),
+    # NV-RC5：verify 的 UPDATE 必须按 cycle_id 过滤（伪造归属被挡住）。
+    "M-RC5": (
+        "test_rebalance_cycle_scope"
+        ".RB_C3_VerifyRejectsForeignCyclePlan"
+        ".test_RB_C3_forged_plan_identity_is_rejected_by_update_guard",
+    ),
+    # NV-RC6：risk-handled 的委托查询必须按周期过滤。
+    "M-RC6": (
+        "test_rebalance_cycle_scope"
+        ".RB_C7_RiskHandledIsSameCycle"
+        ".test_RB_C7_cycle8_order_does_not_handle_cycle9_position",
+    ),
+    # NV-RC7：UNIQUE 必须含 cycle_id（同日两周期各自成行）。
+    "M-RC7": (
+        "test_rebalance_cycle_scope"
+        ".SameDayRolloverKeepsBothRows"
+        ".test_two_cycles_same_day_coexist",
+    ),
+    # NV-RC8：verify 期间周期变化必须 fail closed。
+    "M-RC8": (
+        "test_rebalance_cycle_scope"
+        ".RB_C_VerifyCycleChangeRace"
+        ".test_cycle_change_during_verify_fails_closed",
+    ),
+    # NV-RC9：没有 active cycle 时不得写下无归属状态。
+    "M-RC9": (
+        "test_rebalance_cycle_scope"
+        ".NoActiveCycleFailsClosed"
+        ".test_scan_without_active_cycle_creates_no_state",
     ),
 }
 

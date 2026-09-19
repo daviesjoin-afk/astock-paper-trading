@@ -149,6 +149,320 @@ def _ensure_order_cycle_provenance_guards(conn):
         )
 
 
+# ─── 调仓状态表的周期归属（v19） ─────────────────────────────────────────────
+#
+# 不变量::
+#
+#     Every rebalance fact belongs to exactly one paper cycle.
+#
+# 背景：``rebalance_scanner`` 的三张状态表（scan / plan / cooldown）是在
+# Round-11 才被搬进 paper ledger 的。数据库归属修对了，但**周期归属**没有：
+# 三张表都没有 ``cycle_id``，于是
+#
+#   * ``rebalance_scans`` 的唯一键是 ``(scan_date, account_id, code)`` ——
+#     这是一个**跨周期错误约束**：同一天从 cycle 8 翻到 cycle 9 时，
+#     cycle 9 的扫描会 ``INSERT OR REPLACE`` 掉 cycle 8 的同一行；
+#   * ``rebalance_cooldown`` 的主键是 ``(code, account_id)`` ——
+#     旧周期的冷却会天然压住新周期；
+#   * ``rebalance_plans`` 没有周期身份，只能靠"当前 active cycle"在验证时
+#     重新猜归属。
+#
+# 本函数只做两件事：把三张表的 schema 变成周期可分区，并安装 guard。
+# **绝不**给历史行回填 ``cycle_id``：升级前的调仓行属于哪个周期无法从任何
+# **当前**状态反推（``paper_accounts.cycle_id`` 是可变重绑定，``MAX(paper_cycles.id)``
+# 与"当时 active"是两回事，日期更是与周期无函数关系），
+# ``cycle_id IS NULL`` 正是诚实的 legacy 状态 —— 所有 operational 查询都按
+# ``cycle_id=?`` 过滤，NULL 行因此天然不可见、不可验证、不可执行。
+
+#: 调仓状态表（三张都必须带 ``cycle_id``）。
+REBALANCE_STATE_TABLES = ("rebalance_scans", "rebalance_plans", "rebalance_cooldown")
+
+#: 规范列序（新建与重建共用同一份，避免"历史库与新库形状不同"）。
+_REBALANCE_SCANS_COLUMNS = (
+    "id", "cycle_id", "scan_date", "account_id", "code", "name",
+    "current_qty", "cost", "current_price", "unrealized_pnl_pct", "hold_days",
+    "quality_score", "prev_quality_score", "quality_change",
+    "fund_flow_trend", "consecutive_outflow_days",
+    "action", "action_reason", "planned_sell_ratio",
+    "scan_version", "created_at",
+)
+
+_REBALANCE_PLANS_COLUMNS = (
+    "id", "cycle_id", "plan_date", "execute_date", "account_id", "code", "name",
+    "action", "sell_qty", "sell_ratio", "sell_reason",
+    "replacement_code", "replacement_name", "replacement_score",
+    "status", "open_price", "open_pct", "open_volume_ratio", "open_fund_flow",
+    "open_verified", "open_verify_reason",
+    "executed_at", "executed_price", "executed_qty", "realized_pnl",
+    "plan_version", "created_at", "updated_at",
+)
+
+_REBALANCE_COOLDOWN_COLUMNS = (
+    "cycle_id", "code", "account_id", "sold_date", "cooldown_until",
+)
+
+#: ``rebalance_scans`` 的最终唯一契约 —— 必须含 ``cycle_id``。
+REBALANCE_SCANS_UNIQUE = ("cycle_id", "scan_date", "account_id", "code")
+
+#: ``rebalance_cooldown`` 的最终主键 —— 必须含 ``cycle_id``。
+REBALANCE_COOLDOWN_PK = ("cycle_id", "code", "account_id")
+
+
+def rebalance_scans_ddl(table="rebalance_scans"):
+    """``rebalance_scans`` 的规范 DDL（唯一键含 ``cycle_id``）。"""
+    return f"""
+        CREATE TABLE {table}(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            cycle_id INTEGER,
+            scan_date TEXT NOT NULL,
+            account_id TEXT NOT NULL,
+            code TEXT NOT NULL,
+            name TEXT,
+            -- 持仓状态
+            current_qty INTEGER,
+            cost REAL,
+            current_price REAL,
+            unrealized_pnl_pct REAL,
+            hold_days INTEGER,
+            -- 质量评估
+            quality_score REAL,
+            prev_quality_score REAL,
+            quality_change REAL,
+            fund_flow_trend TEXT,
+            consecutive_outflow_days INTEGER,
+            -- 决策
+            action TEXT NOT NULL,
+            action_reason TEXT,
+            planned_sell_ratio REAL DEFAULT 0,
+            -- 元数据
+            scan_version TEXT,
+            created_at TEXT NOT NULL,
+            UNIQUE(cycle_id, scan_date, account_id, code)
+        )
+    """
+
+
+def rebalance_plans_ddl(table="rebalance_plans"):
+    """``rebalance_plans`` 的规范 DDL（``cycle_id`` 是 creation-time fact）。"""
+    return f"""
+        CREATE TABLE {table}(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            cycle_id INTEGER,
+            plan_date TEXT NOT NULL,
+            execute_date TEXT,
+            account_id TEXT NOT NULL,
+            code TEXT NOT NULL,
+            name TEXT,
+            action TEXT NOT NULL,
+            -- 卖出计划
+            sell_qty INTEGER,
+            sell_ratio REAL,
+            sell_reason TEXT,
+            -- 替补计划
+            replacement_code TEXT,
+            replacement_name TEXT,
+            replacement_score REAL,
+            -- 状态
+            status TEXT NOT NULL DEFAULT 'planned',
+            -- 开盘验证
+            open_price REAL,
+            open_pct REAL,
+            open_volume_ratio REAL,
+            open_fund_flow REAL,
+            open_verified BOOLEAN DEFAULT 0,
+            open_verify_reason TEXT,
+            -- 执行结果
+            executed_at TEXT,
+            executed_price REAL,
+            executed_qty INTEGER,
+            realized_pnl REAL,
+            -- 元数据
+            plan_version TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+    """
+
+
+def rebalance_cooldown_ddl(table="rebalance_cooldown"):
+    """``rebalance_cooldown`` 的规范 DDL（主键含 ``cycle_id``）。
+
+    该表当前**没有任何读写调用点**（见 PR body 的 dead-table 审计），但 schema
+    必须避免它将来被接回时把旧周期冷却套在新周期上 —— 不能留下 latent
+    cross-cycle state。
+    """
+    return f"""
+        CREATE TABLE {table}(
+            cycle_id INTEGER,
+            code TEXT NOT NULL,
+            account_id TEXT NOT NULL,
+            sold_date TEXT NOT NULL,
+            cooldown_until TEXT NOT NULL,
+            PRIMARY KEY(cycle_id, code, account_id)
+        )
+    """
+
+
+def _unique_index_columns(conn, table):
+    """返回该表上第一个 UNIQUE **约束**的列序列（无则 ``None``）。
+
+    只看 ``origin='u'``（``UNIQUE(...)`` 表约束产生的隐式索引），不看
+    ``CREATE INDEX``（``origin='c'``）—— 后者可以随便增删，不是契约。
+    """
+    try:
+        rows = conn.execute(f"PRAGMA index_list({table})").fetchall()
+    except sqlite3.Error:
+        return None
+    for row in rows:
+        if len(row) < 4 or int(row[2]) != 1 or str(row[3]) != "u":
+            continue
+        try:
+            columns = [r[2] for r in conn.execute(f"PRAGMA index_info({row[1]})").fetchall()]
+        except sqlite3.Error:  # pragma: no cover - 竞态
+            continue
+        return tuple(columns)
+    return None
+
+
+def _primary_key_columns(conn, table):
+    """返回该表的主键列序列（按 ``pk`` 序号；无主键则 ``()``）。"""
+    try:
+        rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
+    except sqlite3.Error:
+        return ()
+    keyed = sorted((int(r[5]), r[1]) for r in rows if int(r[5]) > 0)
+    return tuple(name for _index, name in keyed)
+
+
+def _rebuild_table(conn, table, ddl_factory, canonical_columns):
+    """安全、幂等的 table rebuild。
+
+    规则：**只有当约束本身要变时才重建**（``rebalance_scans`` 的 UNIQUE、
+    ``rebalance_cooldown`` 的 PK）；纯加列走 ``ALTER TABLE ADD COLUMN``。
+
+    重建在调用方的事务内完成：建新表 → 显式列名整行搬运 → DROP 旧表 → RENAME。
+    搬运**逐列点名**（绝不 ``SELECT *``），旧表缺的列写 ``NULL`` —— 对
+    ``cycle_id`` 而言这正是"legacy 归属不可证明"的诚实取值。
+    """
+    old_columns = table_columns(conn, table)
+    if not old_columns:
+        conn.execute(ddl_factory(table))
+        return "created"
+    staged = f"{table}__r12_rebuild"
+    conn.execute(f"DROP TABLE IF EXISTS {staged}")
+    conn.execute(ddl_factory(staged))
+    target = ", ".join(f'"{column}"' for column in canonical_columns)
+    source = ", ".join(
+        f'"{column}"' if column in old_columns else "NULL"
+        for column in canonical_columns
+    )
+    conn.execute(
+        f'INSERT INTO "{staged}" ({target}) SELECT {source} FROM "{table}"'
+    )
+    conn.execute(f'DROP TABLE "{table}"')
+    conn.execute(f'ALTER TABLE "{staged}" RENAME TO "{table}"')
+    return "rebuilt"
+
+
+def _ensure_rebalance_cycle_guards(conn):
+    """新行必须带真实周期，且周期归属一经写入不可更改。
+
+    为什么用 trigger 而不是 ``NOT NULL`` 列约束：``NOT NULL`` 是**逐行**约束，
+    它无法同时表达"新行必须非 NULL"与"历史行保持 NULL"—— 声明了 ``NOT NULL``
+    就再也插不进 legacy 行，升级必须回填，而回填就是猜归属。v18 的订单周期归属
+    已经确立了同一模式（列可空 + BEFORE INSERT guard + 不可变 guard），这里沿用。
+
+    历史 NULL 行不受影响：trigger 不回扫既有行，因此升级一个多 GB 账本不会重写
+    任何数据。``paper_cycles`` 不存在（极简 schema / 测试库）时只校验非 NULL ——
+    读不到周期事实就不假装能校验它。
+    """
+    has_cycles = bool(table_columns(conn, "paper_cycles"))
+    for table in REBALANCE_STATE_TABLES:
+        if "cycle_id" not in table_columns(conn, table):
+            continue
+        when = "NEW.cycle_id IS NULL"
+        if has_cycles:
+            when += (" OR NOT EXISTS (SELECT 1 FROM paper_cycles c"
+                     " WHERE c.id=NEW.cycle_id)")
+        conn.execute(
+            f"""CREATE TRIGGER IF NOT EXISTS trg_{table}_cycle_required_insert
+                BEFORE INSERT ON {table}
+                WHEN {when}
+                BEGIN SELECT RAISE(ABORT, 'rebalance state requires a cycle'); END"""
+        )
+        conn.execute(
+            f"""CREATE TRIGGER IF NOT EXISTS trg_{table}_cycle_immutable
+                BEFORE UPDATE OF cycle_id ON {table}
+                WHEN NEW.cycle_id IS NOT OLD.cycle_id
+                BEGIN SELECT RAISE(ABORT, 'rebalance cycle ownership is immutable'); END"""
+        )
+
+
+def ensure_rebalance_state_cycle_ownership(conn):
+    """v19：调仓状态（scan / plan / cooldown）的**周期归属**（幂等，不回填）。
+
+    三张表都必须带 ``cycle_id``，且唯一契约必须把周期算进去：
+
+    * ``rebalance_scans``：``UNIQUE(scan_date, account_id, code)``
+      → ``UNIQUE(cycle_id, scan_date, account_id, code)``（**必须重建**，不能只
+      ``ADD COLUMN`` 再把旧 UNIQUE 留着 —— 那样同日跨周期仍会互相 replace）；
+    * ``rebalance_plans``：纯新增列（无约束变更，最省）；
+    * ``rebalance_cooldown``：``PRIMARY KEY(code, account_id)``
+      → ``PRIMARY KEY(cycle_id, code, account_id)``（**必须重建**）。
+
+    旧行保留、其它字段逐字保留、``cycle_id`` 一律 ``NULL``（不猜归属）。
+    """
+    changes = {}
+
+    if _unique_index_columns(conn, "rebalance_scans") != REBALANCE_SCANS_UNIQUE:
+        changes["rebalance_scans"] = _rebuild_table(
+            conn, "rebalance_scans", rebalance_scans_ddl, _REBALANCE_SCANS_COLUMNS,
+        )
+    else:
+        changes["rebalance_scans"] = "ok"
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_rebalance_scans_date"
+        " ON rebalance_scans(scan_date DESC)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_rebalance_scans_cycle_date"
+        " ON rebalance_scans(cycle_id, scan_date DESC)"
+    )
+
+    if "cycle_id" not in table_columns(conn, "rebalance_plans"):
+        if not table_columns(conn, "rebalance_plans"):
+            conn.execute(rebalance_plans_ddl("rebalance_plans"))
+            changes["rebalance_plans"] = "created"
+        else:
+            conn.execute('ALTER TABLE "rebalance_plans" ADD COLUMN cycle_id INTEGER')
+            changes["rebalance_plans"] = "altered"
+    else:
+        changes["rebalance_plans"] = "ok"
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_rebalance_plans_date"
+        " ON rebalance_plans(plan_date DESC)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_rebalance_plans_status"
+        " ON rebalance_plans(status, plan_date DESC)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_rebalance_plans_cycle_status"
+        " ON rebalance_plans(cycle_id, status, plan_date DESC)"
+    )
+
+    if _primary_key_columns(conn, "rebalance_cooldown") != REBALANCE_COOLDOWN_PK:
+        changes["rebalance_cooldown"] = _rebuild_table(
+            conn, "rebalance_cooldown", rebalance_cooldown_ddl,
+            _REBALANCE_COOLDOWN_COLUMNS,
+        )
+    else:
+        changes["rebalance_cooldown"] = "ok"
+
+    _ensure_rebalance_cycle_guards(conn)
+    return changes
+
+
 def ensure_strategy_reference_columns(conn):
     """Append immutable strategy-version stamps to execution evidence tables.
 

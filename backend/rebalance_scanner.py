@@ -22,6 +22,7 @@ import json
 
 import execution_verification as EV
 import paper_position_read_model as PPRM
+import paper_schema_migrations as PSM
 
 # ─── 调仓参数 ───
 REBALANCE_VERSION = "daily-rebalance-v2"
@@ -122,94 +123,52 @@ def _load_json(value, default=None):
 # ─── 数据库 Schema ───
 
 def ensure_schema(conn):
-    """创建调仓相关的数据库表。"""
-    conn.executescript("""
-        -- 每日调仓扫描结果
-        CREATE TABLE IF NOT EXISTS rebalance_scans(
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            scan_date TEXT NOT NULL,
-            account_id TEXT NOT NULL,
-            code TEXT NOT NULL,
-            name TEXT,
-            -- 持仓状态
-            current_qty INTEGER,
-            cost REAL,
-            current_price REAL,
-            unrealized_pnl_pct REAL,
-            hold_days INTEGER,
-            -- 质量评估
-            quality_score REAL,
-            prev_quality_score REAL,
-            quality_change REAL,
-            fund_flow_trend TEXT,
-            consecutive_outflow_days INTEGER,
-            -- 决策
-            action TEXT NOT NULL,
-            action_reason TEXT,
-            planned_sell_ratio REAL DEFAULT 0,
-            -- 元数据
-            scan_version TEXT,
-            created_at TEXT NOT NULL,
-            UNIQUE(scan_date, account_id, code)
-        );
-        CREATE INDEX IF NOT EXISTS idx_rebalance_scans_date
-            ON rebalance_scans(scan_date DESC);
+    """创建调仓相关的数据库表（周期归属由迁移模块持有，幂等）。
 
-        -- 调仓计划（收盘生成，次日开盘验证）
-        CREATE TABLE IF NOT EXISTS rebalance_plans(
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            plan_date TEXT NOT NULL,
-            execute_date TEXT,
-            account_id TEXT NOT NULL,
-            code TEXT NOT NULL,
-            name TEXT,
-            action TEXT NOT NULL,
-            -- 卖出计划
-            sell_qty INTEGER,
-            sell_ratio REAL,
-            sell_reason TEXT,
-            -- 替补计划
-            replacement_code TEXT,
-            replacement_name TEXT,
-            replacement_score REAL,
-            -- 状态
-            status TEXT NOT NULL DEFAULT 'planned',
-            -- 开盘验证
-            open_price REAL,
-            open_pct REAL,
-            open_volume_ratio REAL,
-            open_fund_flow REAL,
-            open_verified BOOLEAN DEFAULT 0,
-            open_verify_reason TEXT,
-            -- 执行结果
-            executed_at TEXT,
-            executed_price REAL,
-            executed_qty INTEGER,
-            realized_pnl REAL,
-            -- 元数据
-            plan_version TEXT,
-            created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL
-        );
-        CREATE INDEX IF NOT EXISTS idx_rebalance_plans_date
-            ON rebalance_plans(plan_date DESC);
-        CREATE INDEX IF NOT EXISTS idx_rebalance_plans_status
-            ON rebalance_plans(status, plan_date DESC);
-
-        -- 调仓冷却记录
-        CREATE TABLE IF NOT EXISTS rebalance_cooldown(
-            code TEXT NOT NULL,
-            account_id TEXT NOT NULL,
-            sold_date TEXT NOT NULL,
-            cooldown_until TEXT NOT NULL,
-            PRIMARY KEY(code, account_id)
-        );
-    """)
+    本函数**不再**自己写 DDL：三张状态表的规范形状（含 ``cycle_id`` 与把周期
+    算进唯一契约的 UNIQUE / PRIMARY KEY）由
+    :func:`paper_schema_migrations.ensure_rebalance_state_cycle_ownership` 单一持有。
+    在 scanner 里再写一份 ``CREATE TABLE`` 会造出第二个真相来源 —— 而且这里
+    写的 DDL 只在表**不存在**时生效，一个已经存在的旧表会**静默保留**
+    ``UNIQUE(scan_date, account_id, code)`` 这个跨周期错误约束。
+    """
+    PSM.ensure_rebalance_state_cycle_ownership(conn)
 
 
-# ─── 收盘扫描 ───
+# ─── 周期归属 ───
 
-def _is_risk_handled(conn, account_id, code, today):
+class NoActiveCycle(RuntimeError):
+    """没有可归属的 paper cycle。
+
+    ``daily_close_scan`` / ``verify_all_plans`` 是**写**路径：它们落下的每一条
+    scan / plan 都必须是"某个周期的事实"。没有 active cycle 时既不能猜一个
+    （``MAX(paper_cycles.id)`` / 账户绑定 / 日期都与"当时 active"不是一回事），
+    也不能落一条 ``cycle_id=NULL`` 的新行 —— 那会把一条**今天的决策**伪装成
+    "legacy 归属不可证明"，而 legacy 语义是给升级前的历史行保留的。
+    因此 fail closed：不扫描、不写状态。
+    """
+
+
+def resolve_cycle_id(conn):
+    """**只读**解析当前 active cycle id；不存在返回 ``None``（绝不创建周期）。
+
+    复用 :func:`paper_position_read_model.active_cycle_id` —— 它已经是全仓库
+    「现在属于哪个周期」的唯一只读实现，且**不会**像 ``_active_cycle`` 那样在
+    没有周期时顺手 ``_ensure_cycle`` 插一个（那等于用一次写操作回答查询）。
+    """
+    return PPRM.active_cycle_id(conn)
+
+
+def _require_cycle_id(cycle_id, *, operation):
+    """把 ``cycle_id=None`` 挡在写路径之外（fail closed，不是 permissive fallback）。"""
+    if cycle_id is None:
+        raise NoActiveCycle(
+            f"{operation}: 没有 active paper cycle，拒绝写入无归属的调仓状态"
+        )
+    return int(cycle_id)
+
+
+def _is_risk_handled(conn, account_id, code, today, cycle_id):
     """检查该持仓是否已被实时风控系统处理（或待处理）。
 
     实时风控覆盖的场景（调仓系统不应重复）：
@@ -218,6 +177,15 @@ def _is_risk_handled(conn, account_id, code, today):
     - 跌停卖出
     - 已有待执行的卖出委托
 
+    ``cycle_id`` 是**必须**的：``paper_orders.cycle_id`` 自 v18 起就是不可变的
+    写入期事实，因此"这条卖出委托属于哪个周期"是可判定的。只按
+    ``created_at >= today`` 判断则不然 —— 同一天从 cycle 8 翻到 cycle 9 时，
+    cycle 8 在当天早些时候落下的卖出委托仍然满足"今天"，会把 cycle 9 里一个
+    **全新的**持仓判成 ``risk_handled=True``，从而让调仓系统整轮跳过它。
+
+    这里刻意**不**用"日期窗口"代替周期身份：日期窗口只是周期的近似，
+    近似会在同日翻周期这个真实场景上失效。
+
     Returns:
         dict: {
             handled: bool,
@@ -225,14 +193,15 @@ def _is_risk_handled(conn, account_id, code, today):
             order_id: int or None,
         }
     """
+    cycle_id = _require_cycle_id(cycle_id, operation="_is_risk_handled")
     # 检查是否有当日待执行的卖出委托
     pending_sell = conn.execute(
         """SELECT id, status, reason FROM paper_orders
-           WHERE account_id=? AND code=? AND side='sell'
+           WHERE account_id=? AND code=? AND side='sell' AND cycle_id=?
              AND status IN ('pending_limit', 'unfilled_limit_down', 'entry_frozen_waitlist')
              AND created_at >= ?
            ORDER BY id DESC LIMIT 1""",
-        (account_id, code, today.isoformat())
+        (account_id, code, cycle_id, today.isoformat())
     ).fetchone()
     if pending_sell:
         return {
@@ -245,12 +214,12 @@ def _is_risk_handled(conn, account_id, code, today):
     # 委托才能抑制今日的换仓动作，否则一个"没发生过的卖出"会挡住真实换仓。
     filled_sell = conn.execute(
         """SELECT id, status FROM paper_orders
-           WHERE account_id=? AND code=? AND side='sell'
+           WHERE account_id=? AND code=? AND side='sell' AND cycle_id=?
              AND status='filled'
              AND """ + EV.VERIFIED_PREDICATE + """
              AND created_at >= ?
            ORDER BY id DESC LIMIT 1""",
-        (account_id, code, today.isoformat())
+        (account_id, code, cycle_id, today.isoformat())
     ).fetchone()
     if filled_sell:
         return {
@@ -276,7 +245,7 @@ def _is_risk_handled(conn, account_id, code, today):
     # 以覆盖昨日盘尾触发的风控退出。
     recent_risk = conn.execute(
         """SELECT id, reason FROM paper_orders
-           WHERE account_id=? AND code=? AND side='sell'
+           WHERE account_id=? AND code=? AND side='sell' AND cycle_id=?
              AND status='filled'
              AND """ + EV.VERIFIED_PREDICATE + """
              AND created_at >= ?
@@ -287,7 +256,7 @@ def _is_risk_handled(conn, account_id, code, today):
                      'hard_stop', 'trailing_stop', 'max_hold', 'take_profit')
              )
            ORDER BY id DESC LIMIT 1""",
-        (account_id, code, (today - dt.timedelta(days=1)).isoformat())
+        (account_id, code, cycle_id, (today - dt.timedelta(days=1)).isoformat())
     ).fetchone()
     if recent_risk:
         return {
@@ -299,13 +268,17 @@ def _is_risk_handled(conn, account_id, code, today):
     return {"handled": False, "reason": "", "order_id": None}
 
 
-def scan_positions_quality(conn, account_id, positions, quotes, factor_table=None, news=None):
+def scan_positions_quality(conn, account_id, positions, quotes, factor_table=None,
+                           news=None, cycle_id=None):
     """扫描单个账户的所有持仓，评估质量变化。
 
     与实时风控协调：
     - 已有卖出委托/已卖出/已触发止损的持仓 → 跳过
     - 只对"实时风控未覆盖"的持仓生成调仓计划
     - 调仓关注的是：质量衰退、资金趋势、公告风险、持仓过久
+
+    ``cycle_id`` 必须由调用方**一次**解析后显式传入，scanner 内部绝不各自重新
+    解析 active cycle —— 否则同一个 scan 事务里的不同 helper 可能看到不同的周期。
 
     Args:
         conn: 数据库连接
@@ -314,10 +287,12 @@ def scan_positions_quality(conn, account_id, positions, quotes, factor_table=Non
         quotes: 实时报价 {code: quote}
         factor_table: 因子表（可选）
         news: 新闻/公告列表 [{code, title, content, type, ...}]
+        cycle_id: 本次扫描的 paper cycle（必须；无周期时 fail closed）
 
     Returns:
         list: 每个持仓的评估结果
     """
+    cycle_id = _require_cycle_id(cycle_id, operation="scan_positions_quality")
     results = []
     today = _date()
     thresholds = REBALANCE_THRESHOLDS
@@ -346,10 +321,19 @@ def scan_positions_quality(conn, account_id, positions, quotes, factor_table=Non
             _num(pos.get("quality_score"), 50.0)
         )
 
-        # 获取历史质量分（从上次扫描）
+        # 获取历史质量分（**同一个 cycle** 的上次扫描）
+        #
+        # 原实现是 ``WHERE account_id=? AND code=? ORDER BY id DESC LIMIT 1``，
+        # 即"这只票上一次扫描"——**跨周期**。cycle 9 的第一次扫描会读到 cycle 8
+        # 的分数当基线，于是 quality_change 是"相对上一个周期"的差值：一个在
+        # cycle 9 完全没变过的持仓会被判成质量大幅衰退并生成卖出计划。
+        # 新周期的第一次扫描没有同周期历史 ⇒ 沿用"无上次扫描"语义
+        # （``prev_quality_score = quality_score``，即 change=0），绝不借旧周期基线。
         prev_scan = conn.execute(
-            "SELECT quality_score FROM rebalance_scans WHERE account_id=? AND code=? ORDER BY id DESC LIMIT 1",
-            (account_id, code)
+            """SELECT quality_score FROM rebalance_scans
+               WHERE cycle_id=? AND account_id=? AND code=?
+               ORDER BY id DESC LIMIT 1""",
+            (cycle_id, account_id, code)
         ).fetchone()
         prev_quality_score = _num(prev_scan[0], quality_score) if prev_scan else quality_score
         quality_change = quality_score - prev_quality_score
@@ -358,11 +342,11 @@ def scan_positions_quality(conn, account_id, positions, quotes, factor_table=Non
         super_net = _num(quote.get("super_net"))
         fund_flow_trend = "inflow" if super_net > 0 else ("outflow" if super_net < 0 else "neutral")
 
-        # 检查连续流出天数
-        consecutive_outflow = _check_consecutive_outflow(conn, account_id, code, today)
+        # 检查连续流出天数（同周期）
+        consecutive_outflow = _check_consecutive_outflow(conn, account_id, code, today, cycle_id)
 
-        # ── 检查实时风控是否已处理 ──
-        risk_status = _is_risk_handled(conn, account_id, code, today)
+        # ── 检查实时风控是否已处理（同周期） ──
+        risk_status = _is_risk_handled(conn, account_id, code, today, cycle_id)
 
         # ── 分析当日公告/新闻 ──
         news_risk = _analyze_news_for_code(code, news, negative_keywords)
@@ -427,14 +411,19 @@ def scan_positions_quality(conn, account_id, positions, quotes, factor_table=Non
         results.append(result)
 
         # 保存扫描结果（包括 risk_handled 的，用于追踪）
+        #
+        # ``INSERT OR REPLACE`` 的冲突目标现在含 ``cycle_id``：同一天在两个
+        # 周期里扫描同一 account/code 会留下**两行**，而不是把旧周期那一行
+        # 覆盖掉。这正是 §18 的 same-day rollover 承重场景。
         conn.execute(
             """INSERT OR REPLACE INTO rebalance_scans(
-                scan_date, account_id, code, name, current_qty, cost, current_price,
-                unrealized_pnl_pct, hold_days, quality_score, prev_quality_score,
-                quality_change, fund_flow_trend, consecutive_outflow_days,
-                action, action_reason, planned_sell_ratio, scan_version, created_at
-            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-            (today.isoformat(), account_id, code, pos.get("name"), qty, cost, price,
+                cycle_id, scan_date, account_id, code, name, current_qty, cost,
+                current_price, unrealized_pnl_pct, hold_days, quality_score,
+                prev_quality_score, quality_change, fund_flow_trend,
+                consecutive_outflow_days, action, action_reason, planned_sell_ratio,
+                scan_version, created_at
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (cycle_id, today.isoformat(), account_id, code, pos.get("name"), qty, cost, price,
              round(unrealized_pnl * 100, 2), hold_days, quality_score, prev_quality_score,
              quality_change, fund_flow_trend, consecutive_outflow,
              action, reason, sell_ratio, REBALANCE_VERSION, _now().isoformat())
@@ -499,13 +488,20 @@ def _analyze_news_for_code(code, news, negative_keywords):
     }
 
 
-def _check_consecutive_outflow(conn, account_id, code, today):
-    """检查连续资金流出天数。"""
+def _check_consecutive_outflow(conn, account_id, code, today, cycle_id):
+    """检查**同一周期内**的连续资金流出天数。
+
+    原实现只按 ``account_id`` / ``code`` 取最近 5 行，于是 cycle 8 攒下的
+    outflow 连续天数会直接算进 cycle 9 的第一天：cycle 9 一个全新的持仓可能
+    在"连续 5 日净流出"的名义下被判成卖出，而这 5 天一天都不属于 cycle 9。
+    连续流出是一个**周期内的**观测序列，必须与周期一起分区。
+    """
+    cycle_id = _require_cycle_id(cycle_id, operation="_check_consecutive_outflow")
     rows = conn.execute(
         """SELECT fund_flow_trend FROM rebalance_scans
-           WHERE account_id=? AND code=?
+           WHERE cycle_id=? AND account_id=? AND code=?
            ORDER BY scan_date DESC LIMIT 5""",
-        (account_id, code)
+        (cycle_id, account_id, code)
     ).fetchall()
     count = 0
     for row in rows:
@@ -591,7 +587,7 @@ def _decide_rebalance_action(quality_score, quality_change, unrealized_pnl,
     return "hold", "持仓质量稳定", 0.0
 
 
-def daily_close_scan(conn, accounts, quotes, factor_table=None, news=None):
+def daily_close_scan(conn, accounts, quotes, factor_table=None, news=None, cycle_id=None):
     """每日晚间调仓扫描。
 
     与实时风控协调：
@@ -599,16 +595,27 @@ def daily_close_scan(conn, accounts, quotes, factor_table=None, news=None):
     - 只为"实时风控未覆盖"的持仓生成调仓计划
     - 调仓计划在次日开盘验证后才执行
 
+    不变量::
+
+        One scan = one transaction = one paper snapshot = one cycle identity.
+
+    ``cycle_id`` 由**调用方**在打开连接后只读解析一次并显式传入；scanner 内部
+    的任何 helper 都不再各自重新解析 active cycle。缺省 ``None`` **不是**
+    permissive fallback —— 没有 active cycle 时本函数 fail closed（抛
+    :class:`NoActiveCycle`），绝不落下无归属的 scan / plan。
+
     Args:
         conn: 数据库连接
         accounts: 账户列表 [{id, positions: [...]}]
         quotes: 全市场报价
         factor_table: 因子表
         news: 新闻列表
+        cycle_id: 本次扫描的 paper cycle（必须；无周期则 fail closed）
 
     Returns:
         dict: 扫描结果
     """
+    cycle_id = _require_cycle_id(cycle_id, operation="daily_close_scan")
     ensure_schema(conn)
     today = _date()
     all_results = []
@@ -624,7 +631,7 @@ def daily_close_scan(conn, accounts, quotes, factor_table=None, news=None):
         # 扫描持仓质量
         results = scan_positions_quality(
             conn, account_id, positions, quotes,
-            factor_table=factor_table, news=news
+            factor_table=factor_table, news=news, cycle_id=cycle_id,
         )
         all_results.extend(results)
 
@@ -643,6 +650,7 @@ def daily_close_scan(conn, accounts, quotes, factor_table=None, news=None):
                 sell_qty = min(sell_qty, result["current_qty"])
 
                 plan = {
+                    "cycle_id": cycle_id,
                     "plan_date": today.isoformat(),
                     "account_id": account_id,
                     "code": result["code"],
@@ -655,14 +663,16 @@ def daily_close_scan(conn, accounts, quotes, factor_table=None, news=None):
                 }
                 plans.append(plan)
 
-                # 保存计划
+                # 保存计划。``cycle_id`` 是 **creation-time fact** —— 写入即定，
+                # 之后 verify 绝不再猜归属（见 verify_all_plans 的 defense in depth）。
+                # 计划周期与扫描周期必然相同：它们来自同一次调用、同一个 cycle_id。
                 conn.execute(
                     """INSERT INTO rebalance_plans(
-                        plan_date, account_id, code, name, action,
+                        cycle_id, plan_date, account_id, code, name, action,
                         sell_qty, sell_ratio, sell_reason, status,
                         plan_version, created_at, updated_at
-                    ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
-                    (today.isoformat(), account_id, result["code"], result["name"],
+                    ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (cycle_id, today.isoformat(), account_id, result["code"], result["name"],
                      result["action"], sell_qty, result["planned_sell_ratio"],
                      result["action_reason"], "planned", REBALANCE_VERSION,
                      _now().isoformat(), _now().isoformat())
@@ -670,6 +680,7 @@ def daily_close_scan(conn, accounts, quotes, factor_table=None, news=None):
 
     # 统计
     summary = {
+        "cycle_id": cycle_id,
         "scan_date": today.isoformat(),
         "version": REBALANCE_VERSION,
         "total_positions": len(all_results),
@@ -765,19 +776,52 @@ def verify_opening_data(conn, plan, open_quote, market_data=None):
     }
 
 
-def verify_all_plans(conn, plans, quotes):
-    """批量验证所有调仓计划。
+class StalePlanCycle(RuntimeError):
+    """调用方试图在周期 X 验证一个属于周期 Y 的计划。
+
+    这不是"计划过期"，而是**归属冲突**：一个 cycle 8 的计划在 cycle 9 被验证
+    就等于让旧周期的决策在新周期生效。fail closed —— 一条都不改。
+    """
+
+    def __init__(self, plan_id, plan_cycle_id, cycle_id):
+        self.plan_id = plan_id
+        self.plan_cycle_id = plan_cycle_id
+        self.cycle_id = cycle_id
+        super().__init__(
+            f"plan #{plan_id} 属于 cycle {plan_cycle_id}，"
+            f"不得在 cycle {cycle_id} 验证"
+        )
+
+
+def verify_all_plans(conn, plans, quotes, cycle_id=None):
+    """批量验证所有调仓计划（**必须**指定周期，defense in depth）。
+
+    即使调用方已经用 :func:`get_pending_plans` 筛过 current-cycle 计划，本函数
+    自身也必须要求 ``cycle_id`` 并逐条校验 ``plan.cycle_id == cycle_id``：
+    否则任何 stale plan 都能被 caller 直接注入，绕过筛选。
+
+    UPDATE 的 WHERE 至少是 ``id=? AND cycle_id=?``，且 ``rowcount`` 必须恰为 1
+    —— 0 行说明这条计划不属于本周期（或已被并发改动），此时 fail closed，
+    而不是"什么都没更新但报成功"。
 
     Args:
         conn: 数据库连接
         plans: 计划列表
         quotes: 开盘报价 {code: quote}
+        cycle_id: 请求验证的 paper cycle（必须）
 
     Returns:
         list: 验证结果
     """
+    cycle_id = _require_cycle_id(cycle_id, operation="verify_all_plans")
     results = []
     for plan in plans:
+        plan_id = plan.get("id")
+        plan_cycle_id = plan.get("cycle_id")
+        # 归属冲突：不接受"计划自己说自己属于谁"以外的任何推断。
+        if plan_cycle_id is None or int(plan_cycle_id) != cycle_id:
+            raise StalePlanCycle(plan_id, plan_cycle_id, cycle_id)
+
         code = plan.get("code", "")
         quote = quotes.get(code, {})
 
@@ -785,17 +829,19 @@ def verify_all_plans(conn, plans, quotes):
 
         # 更新计划状态
         new_status = "verified" if verification["verified"] else "cancelled"
-        conn.execute(
+        cursor = conn.execute(
             """UPDATE rebalance_plans SET
                 status=?, open_price=?, open_pct=?, open_volume_ratio=?,
                 open_fund_flow=?, open_verified=?, open_verify_reason=?,
                 updated_at=?
-               WHERE id=?""",
+               WHERE id=? AND cycle_id=?""",
             (new_status, verification["open_price"], verification["open_pct"],
              verification["open_volume_ratio"], verification["open_fund_flow"],
              int(verification["verified"]), verification["reason"],
-             _now().isoformat(), plan.get("id"))
+             _now().isoformat(), plan_id, cycle_id)
         )
+        if cursor.rowcount != 1:
+            raise StalePlanCycle(plan_id, plan_cycle_id, cycle_id)
 
         results.append({**plan, **verification, "new_status": new_status})
 
@@ -892,36 +938,50 @@ def find_replacement_candidates(conn, account_id, sold_code, quotes, factor_tabl
 
 # ─── 状态查询 ───
 
-def get_rebalance_status(conn, limit=10):
-    """获取调仓状态。"""
+def get_rebalance_status(conn, limit=10, cycle_id=None):
+    """获取调仓状态（**current-cycle operational state**）。
+
+    ``cycle_id`` 是必须的：默认接口只应展示当前 active cycle 的运营状态。
+    历史跨周期的 recent history 若将来需要，应由**独立接口**提供 —— 让历史行
+    混进 operational status 会让"现在待执行什么"这个问题的答案包含旧周期计划。
+
+    ``cycle_id IS NULL`` 的 legacy 行天然被 ``cycle_id=?`` 排除（SQL 里
+    ``NULL = 8`` 不为真），因此 legacy 状态在运营视图里不可见 —— 这正是
+    "归属不可证明 ⇒ 不可操作"的落地方式。
+    """
+    cycle_id = _require_cycle_id(cycle_id, operation="get_rebalance_status")
     ensure_schema(conn)
 
-    # 最近的扫描
+    # 最近的扫描（本周期）
     scans = conn.execute(
         """SELECT scan_date, account_id, code, name, action, action_reason,
                   quality_score, quality_change, unrealized_pnl_pct, hold_days
-           FROM rebalance_scans ORDER BY id DESC LIMIT ?""",
-        (limit,)
+           FROM rebalance_scans WHERE cycle_id=?
+           ORDER BY id DESC LIMIT ?""",
+        (cycle_id, limit)
     ).fetchall()
 
-    # 最近的计划
+    # 最近的计划（本周期）
     plans = conn.execute(
         """SELECT id, plan_date, account_id, code, name, action, status,
                   sell_qty, sell_reason, open_verified, open_verify_reason,
                   executed_at, realized_pnl
-           FROM rebalance_plans ORDER BY id DESC LIMIT ?""",
-        (limit,)
+           FROM rebalance_plans WHERE cycle_id=?
+           ORDER BY id DESC LIMIT ?""",
+        (cycle_id, limit)
     ).fetchall()
 
-    # 待执行的计划
+    # 待执行的计划（本周期）
     pending_plans = conn.execute(
         """SELECT id, plan_date, account_id, code, name, action, sell_qty, sell_reason
-           FROM rebalance_plans WHERE status IN ('planned', 'verified')
-           ORDER BY plan_date DESC"""
+           FROM rebalance_plans WHERE cycle_id=? AND status IN ('planned', 'verified')
+           ORDER BY plan_date DESC""",
+        (cycle_id,)
     ).fetchall()
 
     return {
         "version": REBALANCE_VERSION,
+        "cycle_id": cycle_id,
         "recent_scans": [
             {
                 "date": r[0], "account": r[1], "code": r[2], "name": r[3],
@@ -953,12 +1013,26 @@ def get_rebalance_status(conn, limit=10):
     }
 
 
-def get_pending_plans(conn):
-    """获取待执行的调仓计划。"""
+def get_pending_plans(conn, cycle_id=None):
+    """获取**指定周期**待执行的调仓计划（``cycle_id`` 必须）。
+
+    原实现是 ``WHERE status IN ('planned','verified')``，即**全部历史周期**的
+    待执行计划。在 cycle 9 调用它会拿到 cycle 8 的计划，而 verify 会就地把它
+    更新成 verified —— 一个旧周期的决策就这样在新周期"通过验证"了。
+
+    legacy（``cycle_id IS NULL``）计划不可验证、不可执行：它们不满足
+    ``cycle_id=?``，因此这里天然不返回。
+
+    Args:
+        conn: 数据库连接
+        cycle_id: 请求的 paper cycle（必须）
+    """
+    cycle_id = _require_cycle_id(cycle_id, operation="get_pending_plans")
     ensure_schema(conn)
     rows = conn.execute(
         """SELECT * FROM rebalance_plans
-           WHERE status IN ('planned', 'verified')
-           ORDER BY plan_date DESC"""
+           WHERE cycle_id=? AND status IN ('planned', 'verified')
+           ORDER BY plan_date DESC""",
+        (cycle_id,)
     ).fetchall()
     return [dict(r) for r in rows]

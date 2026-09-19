@@ -1833,6 +1833,11 @@ def init_db():
                 PSM.ensure_strategy_reference_columns(conn)
                 PSM.ensure_execution_verification_columns(conn)
                 PSM.ensure_order_cycle_provenance(conn)
+                # Round-12：调仓状态（scan / plan / cooldown）的周期归属。
+                # 与上面几行同理 —— 既有账本走快路径直接 return，永远不会执行
+                # 新建库的 executescript 建表块，新增列/约束必须在这里显式迁移，
+                # 否则线上库永远缺 cycle_id 与含周期的唯一契约。
+                PSM.ensure_rebalance_state_cycle_ownership(conn)
                 _ensure_accounts(conn)
                 _ensure_user_strategy_accounts(conn)
                 _ensure_cycle(conn)

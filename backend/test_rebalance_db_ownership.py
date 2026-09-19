@@ -455,7 +455,7 @@ class RiskLogTableDoesNotExist(_TwoDatabaseCase):
         )
         self.conn.commit()
 
-        status = RS._is_risk_handled(self.conn, ACCOUNT, CODE, today)
+        status = RS._is_risk_handled(self.conn, ACCOUNT, CODE, today, cycle)
 
         self.assertTrue(status["handled"], "已验证的风控退出未被识别为 risk_handled")
         self.assertEqual(status["reason"][:9], "实时风控已触发卖出")
@@ -482,7 +482,7 @@ class RiskLogTableDoesNotExist(_TwoDatabaseCase):
         )
         self.conn.commit()
 
-        status = RS._is_risk_handled(self.conn, ACCOUNT, CODE, today)
+        status = RS._is_risk_handled(self.conn, ACCOUNT, CODE, today, cycle)
 
         self.assertFalse(status["handled"],
                          "未验证的卖出被当成了已发生的风控退出")
@@ -509,7 +509,7 @@ class RiskLogTableDoesNotExist(_TwoDatabaseCase):
         )
         self.conn.commit()
 
-        status = RS._is_risk_handled(self.conn, ACCOUNT, CODE, today)
+        status = RS._is_risk_handled(self.conn, ACCOUNT, CODE, today, cycle)
 
         self.assertFalse(status["handled"],
                          "非风控退出类别被误判为 risk_handled")
