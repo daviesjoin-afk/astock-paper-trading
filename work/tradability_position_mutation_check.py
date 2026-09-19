@@ -42,6 +42,12 @@ TEST_MODULES = (
     "test_deferred_fill_cycle_binding",
     # Round-9：legacy paper_positions 镜像不得被重物化成 executable position。
     "test_legacy_position_rematerialization",
+    # Round-10：当前持仓消费者必须走权威 lot（cycle-scoped）。
+    "test_authoritative_position_consumers",
+    # Round-11：调仓引擎必须读写 paper ledger（两个物理分离的 SQLite）。
+    "test_rebalance_db_ownership",
+    # Round-12：调仓状态（scan / plan / cooldown）的周期归属。
+    "test_rebalance_cycle_scope",
 )
 
 ADAPTER = "backend/tradability_position_evidence.py"
@@ -49,6 +55,20 @@ SHADOW = "backend/tradability_position_shadow.py"
 #: v18 订单周期归属：迁移/guard 与生产订单写入口（供 M-OC* 变异使用）。
 MIGRATIONS = "backend/paper_schema_migrations.py"
 WRITER = "backend/paper_trading.py"
+#: Round-10 当前持仓权威读取器（唯一实现）。
+READ_MODEL = "backend/paper_position_read_model.py"
+#: Round-11 调仓 endpoint 的连接归属（四个 rebalance 路由）。
+API_ADAPTIVE = "backend/api_adaptive.py"
+#: Round-11 数据库归属的 E2E 夹具（两个物理分离的 SQLite）。
+TEST_DB_OWNERSHIP = "backend/test_rebalance_db_ownership.py"
+#: Round-12 调仓状态的周期归属 E2E 夹具。
+TEST_CYCLE_SCOPE = "backend/test_rebalance_cycle_scope.py"
+#: Round-12 调仓状态 schema（唯一契约含 cycle_id）的持有者。
+SCHEMA_MIGRATIONS = "backend/paper_schema_migrations.py"
+#: Round-12 调仓扫描器（周期归属的读取与写入落点）。
+SCANNER = "backend/rebalance_scanner.py"
+#: Round-10/11 消费者契约 + projection 白名单守卫。
+TEST_CONSUMERS = "backend/test_authoritative_position_consumers.py"
 
 # (id, 目标文件, 变异前, 变异后, 说明)
 MUTATIONS = (
@@ -779,43 +799,58 @@ MUTATIONS = (
     # ── Round-9：legacy paper_positions 不得成为 lot creator（§23） ──────────
     (
         "M-LP1",
-        WRITER,
-        "    cycle_id = _active_cycle_id_readonly(conn)\n"
+        READ_MODEL,
+        "    cycle_id = active_cycle_id(conn)\n"
         "    if cycle_id is None:\n"
         "        return []\n"
-        "    cycle = {\"id\": cycle_id}\n",
+        "    day = _date(asof_day).isoformat()\n"
+        "    sql = \"SELECT * FROM paper_position_lots WHERE cycle_id=? AND remaining_qty>0\"\n"
+        "    params = [cycle_id]\n"
+        "    if account_id:\n"
+        "        sql += \" AND account_id=?\"\n"
+        "        params.append(account_id)\n",
         "    # MUTANT M-LP1: runtime legacy-position auto-migration restored\n"
-        "    _active_cycle(conn)\n"
-        "    for _legacy in _rows(conn, \"SELECT * FROM paper_positions\"):\n"
-        "        if _num(_legacy.get(\"qty\")) > 0:\n"
+        "    for _legacy in _dicts(conn.execute(\"SELECT * FROM paper_positions\").fetchall()):\n"
+        "        if _num(_legacy.get(\"qty\")) > 0 and not conn.execute(\n"
+        "            \"SELECT 1 FROM paper_position_lots WHERE cycle_id=? AND account_id=? AND code=? LIMIT 1\",\n"
+        "            (cycle_id, _legacy[\"account_id\"], _legacy[\"code\"]),\n"
+        "        ).fetchone():\n"
         "            conn.execute(\n"
         "                \"INSERT INTO paper_position_lots(cycle_id,account_id,code,name,industry,qty,remaining_qty,cost,acquired_at,available_date,asset_type,is_t_base) VALUES(?,?,?,?,?,?,?,?,?,?,?,1)\",\n"
-        "                (_active_cycle_id_readonly(conn), _legacy[\"account_id\"], _legacy[\"code\"], _legacy.get(\"name\"),\n"
+        "                (cycle_id, _legacy[\"account_id\"], _legacy[\"code\"], _legacy.get(\"name\"),\n"
         "                 _legacy.get(\"industry\"), int(_legacy[\"qty\"]), int(_legacy[\"qty\"]), _num(_legacy[\"cost\"]),\n"
         "                 _legacy.get(\"entry_date\") or _date().isoformat(),\n"
         "                 _legacy.get(\"available_date\") or _date().isoformat(),\n"
         "                 _legacy.get(\"asset_type\") or \"stock_t1\"),\n"
         "            )\n"
-        "    cycle_id = _active_cycle_id_readonly(conn)\n"
-        "    if cycle_id is None:\n"
-        "        return []\n"
-        "    cycle = {\"id\": cycle_id}\n",
-        "在 _position_rows 中恢复 runtime legacy-position 迁移",
+        "    day = _date(asof_day).isoformat()\n"
+        "    sql = \"SELECT * FROM paper_position_lots WHERE cycle_id=? AND remaining_qty>0\"\n"
+        "    params = [cycle_id]\n"
+        "    if account_id:\n"
+        "        sql += \" AND account_id=?\"\n"
+        "        params.append(account_id)\n",
+        "在 current_positions 中恢复 runtime legacy-position 迁移",
     ),
     (
         "M-LP2",
-        WRITER,
-        "    legacy_rows = _rows(conn, \"SELECT * FROM paper_positions\")\n",
+        READ_MODEL,
+        "    try:\n"
+        "        legacy_rows = _dicts(conn.execute(\"SELECT * FROM paper_positions\").fetchall())\n"
+        "    except sqlite3.Error:\n"
+        "        legacy_rows = []\n",
         "    # MUTANT M-LP2: mirror rows stamped into the current cycle as lots\n"
-        "    legacy_rows = _rows(conn, \"SELECT * FROM paper_positions\")\n"
+        "    try:\n"
+        "        legacy_rows = _dicts(conn.execute(\"SELECT * FROM paper_positions\").fetchall())\n"
+        "    except sqlite3.Error:\n"
+        "        legacy_rows = []\n"
         "    for _mirror in legacy_rows:\n"
         "        if _num(_mirror.get(\"qty\")) > 0 and not conn.execute(\n"
         "            \"SELECT 1 FROM paper_position_lots WHERE cycle_id=? AND account_id=? AND code=? LIMIT 1\",\n"
-        "            (cycle[\"id\"], _mirror[\"account_id\"], _mirror[\"code\"]),\n"
+        "            (cycle_id, _mirror[\"account_id\"], _mirror[\"code\"]),\n"
         "        ).fetchone():\n"
         "            conn.execute(\n"
         "                \"INSERT INTO paper_position_lots(cycle_id,account_id,code,name,industry,qty,remaining_qty,cost,acquired_at,available_date,asset_type,is_t_base) VALUES(?,?,?,?,?,?,?,?,?,?,?,1)\",\n"
-        "                (cycle[\"id\"], _mirror[\"account_id\"], _mirror[\"code\"], _mirror.get(\"name\"),\n"
+        "                (cycle_id, _mirror[\"account_id\"], _mirror[\"code\"], _mirror.get(\"name\"),\n"
         "                 _mirror.get(\"industry\"), int(_mirror[\"qty\"]), int(_mirror[\"qty\"]), _num(_mirror[\"cost\"]),\n"
         "                 _mirror.get(\"entry_date\") or _date().isoformat(),\n"
         "                 _mirror.get(\"available_date\") or _date().isoformat(),\n"
@@ -907,6 +942,319 @@ MUTATIONS = (
         "                break\n"
         "        qty = int(num(_mirror_qty)) if _mirror_qty is not None else int(lot[\"remaining_qty\"])\n",
         "陈旧镜像数量覆盖权威 lot 数量",
+    ),
+    # ── Round-10：当前持仓消费者必须走权威 lot（§23） ────────────────────────
+    (
+        "M-PC1",
+        "backend/news_learning.py",
+        "            for row in PPRM.current_holding_rows(paper):\n"
+        "                items.append({**row, \"pool_tier\": \"holding\",\n"
+        "                              \"rank_no\": 0, \"source\": \"paper_position_lots\"})\n",
+        "            # MUTANT M-PC1: news_learning back to the raw projection\n"
+        "            for row in paper.execute(\n"
+        "                \"SELECT code,name,industry,account_id FROM paper_positions WHERE qty>0\"\n"
+        "            ):\n"
+        "                items.append({**dict(row), \"pool_tier\": \"holding\",\n"
+        "                              \"rank_no\": 0, \"source\": \"paper_positions\"})\n",
+        "news_learning 恢复直接 SELECT paper_positions 当 holding",
+    ),
+    (
+        "M-PC2",
+        READ_MODEL,
+        "    cycle_id = active_cycle_id(conn)\n"
+        "    if cycle_id is None:\n"
+        "        return []\n"
+        "    day = _date(asof_day).isoformat()\n",
+        "    # MUTANT M-PC2: cycle filter dropped (every cycle pooled)\n"
+        "    cycle_id = active_cycle_id(conn)\n"
+        "    if cycle_id is None:\n"
+        "        return []\n"
+        "    cycle_id = None\n"
+        "    day = _date(asof_day).isoformat()\n",
+        "current position reader 忽略 cycle filter",
+    ),
+    (
+        "M-PC3",
+        READ_MODEL,
+        "    cycle_id = active_cycle_id(conn)\n"
+        "    if cycle_id is None:\n"
+        "        return []\n"
+        "    day = _date(asof_day).isoformat()\n"
+        "    sql = \"SELECT * FROM paper_position_lots WHERE cycle_id=? AND remaining_qty>0\"\n",
+        "    # MUTANT M-PC3: no active cycle falls back to the projection\n"
+        "    cycle_id = active_cycle_id(conn)\n"
+        "    if cycle_id is None:\n"
+        "        _fb = _dicts(conn.execute(\"SELECT * FROM paper_positions\").fetchall())\n"
+        "        return [dict(r) for r in _fb]\n"
+        "    day = _date(asof_day).isoformat()\n"
+        "    sql = \"SELECT * FROM paper_position_lots WHERE cycle_id=? AND remaining_qty>0\"\n",
+        "无 active cycle 时 fallback paper_positions",
+    ),
+    (
+        "M-PC4",
+        "backend/rebalance_scanner.py",
+        "            held_codes = PPRM.current_held_codes(conn, account_id=account_id)\n",
+        "            # MUTANT M-PC4: held_codes back to the raw projection\n"
+        "            _hr = conn.execute(\"SELECT code FROM paper_positions WHERE account_id=?\", (account_id,)).fetchall()\n"
+        "            held_codes = {str(r[0]) for r in _hr}\n",
+        "rebalance held_codes 恢复读 mirror",
+    ),
+    (
+        "M-PC5",
+        "backend/adaptive_engine.py",
+        "        positions = PPRM.current_positions(paper)\n",
+        "        # MUTANT M-PC5: shadow portfolio back to the raw projection\n"
+        "        positions = [dict(row) for row in paper.execute(\n"
+        "            \"SELECT account_id,code,name,industry,qty,cost FROM paper_positions WHERE qty>0\"\n"
+        "        )]\n",
+        "adaptive shadow 恢复 mirror 当前组合",
+    ),
+    (
+        "M-PC6",
+        "backend/paper_portfolio.py",
+        "        qty = int(lot[\"remaining_qty\"])\n",
+        "        # MUTANT M-PC6: stale mirror quantity overrides the authoritative lot\n"
+        "        _mq = None\n"
+        "        for _p in legacy_rows:\n"
+        "            if (_p[\"account_id\"], _p[\"code\"]) == (lot[\"account_id\"], lot[\"code\"]):\n"
+        "                _mq = _p.get(\"qty\")\n"
+        "                break\n"
+        "        qty = int(num(_mq)) if _mq is not None else int(lot[\"remaining_qty\"])\n",
+        "mirror qty 覆盖 lot remaining_qty",
+    ),
+    (
+        "M-PC7",
+        READ_MODEL,
+        "def active_cycle_id(conn) -> int | None:\n",
+        "def active_cycle_id(conn) -> int | None:\n"
+        "    # MUTANT M-PC7: read path may create a cycle (write during a read)\n"
+        "    try:\n"
+        "        _r = conn.execute(\n"
+        "            \"SELECT id FROM paper_cycles WHERE status IN ('draft','running','paused')\"\n"
+        "            \" ORDER BY id DESC LIMIT 1\"\n"
+        "        ).fetchone()\n"
+        "        if _r is None:\n"
+        "            conn.execute(\n"
+        "                \"INSERT INTO paper_cycles(cycle_key,status,capital,risk_profile,created_at,updated_at)\"\n"
+        "                \" VALUES('mutant','paused',100000.0,'shared_pool','2026-01-01','2026-01-01')\"\n"
+        "            )\n"
+        "            conn.commit()\n"
+        "    except sqlite3.Error:\n"
+        "        pass\n",
+        "current-position read 调用会创建周期",
+    ),
+    # ── Round-11：调仓引擎的数据库归属（§24） ──────────────────────────────
+    (
+        "M-PC8",
+        API_ADAPTIVE,
+        "    with PST.db(adaptive.PAPER_DB_PATH) as conn:\n"
+        "        yield conn\n",
+        "    # MUTANT M-PC8: rebalance back to the adaptive-learning DB\n"
+        "    with adaptive._connect() as conn:\n"
+        "        yield conn\n",
+        "调仓连接入口改回 adaptive._connect()（错误数据库）",
+    ),
+    (
+        "M-PC9",
+        API_ADAPTIVE,
+        "                acc_dict[\"positions\"] = PPRM.current_positions(conn, account_id=acc[\"id\"])\n",
+        "                # MUTANT M-PC9: current positions read on the adaptive connection\n"
+        "                with adaptive._connect() as _ac:\n"
+        "                    acc_dict[\"positions\"] = PPRM.current_positions(_ac, account_id=acc[\"id\"])\n",
+        "当前持仓在 adaptive 连接上读取",
+    ),
+    (
+        "M-PC10",
+        API_ADAPTIVE,
+        "        with _paper_rebalance_db() as conn:\n"
+        "            rebalance_scanner.ensure_schema(conn)\n"
+        "            # operational status 只回答\"**当前周期**待执行什么\"。历史跨周期的\n",
+        "        # MUTANT M-PC10: scan writes paper DB, status reads adaptive DB\n"
+        "        with adaptive._connect() as conn:\n"
+        "            rebalance_scanner.ensure_schema(conn)\n"
+        "            # operational status 只回答\"**当前周期**待执行什么\"。历史跨周期的\n",
+        "scan 写 paper DB 而 status 读 adaptive DB（split-brain）",
+    ),
+    (
+        "M-PC11",
+        API_ADAPTIVE,
+        "        with _paper_rebalance_db() as conn:\n"
+        "            rebalance_scanner.ensure_schema(conn)\n"
+        "            # **周期竞态**：取计划与取行情之间隔着一次网络调用，期间周期可能\n",
+        "        # MUTANT M-PC11: verify reads/writes the adaptive DB\n"
+        "        with adaptive._connect() as conn:\n"
+        "            rebalance_scanner.ensure_schema(conn)\n"
+        "            # **周期竞态**：取计划与取行情之间隔着一次网络调用，期间周期可能\n",
+        "verify 继续读写 adaptive DB",
+    ),
+    (
+        "M-PC12",
+        TEST_DB_OWNERSHIP,
+        "        self.adaptive_path = os.path.join(self.tmp.name, \"adaptive.sqlite3\")\n",
+        "        # MUTANT M-PC12: fixture collapses both DBs onto one file\n"
+        "        self.adaptive_path = self.paper_path\n",
+        "API 夹具把 adaptive.DB_PATH 与 PAPER_DB_PATH 指向同一文件",
+    ),
+    (
+        "M-PC13",
+        TEST_CONSUMERS,
+        "        \"backend/news_learning.py::_paper_codes\":\n"
+        "            \"recent symbol discovery only (documented non-holding)\",\n"
+        "    }\n",
+        "        \"backend/news_learning.py::_paper_codes\":\n"
+        "            \"recent symbol discovery only (documented non-holding)\",\n"
+        "        # MUTANT M-PC13: whole-module exemption is back\n"
+        "        \"backend/api_adaptive.py\": \"display read model\",\n"
+        "    }\n",
+        "api_adaptive 重新被整体加入 projection 白名单",
+    ),
+    # ── Round-12：调仓状态的周期归属（§28 M-RC1 … M-RC9） ────────────────────
+    # M-RC1：rebalance_scans 的 operational 查询丢掉 cycle_id。
+    # 落点选 ``get_rebalance_status`` 的 recent_scans —— status 是 operational
+    # 视图，去掉周期过滤后 cycle 8 的扫描行会混进 cycle 9 的状态。
+    (
+        "M-RC1",
+        SCANNER,
+        "           FROM rebalance_scans WHERE cycle_id=?\n"
+        "           ORDER BY id DESC LIMIT ?\"\"\",\n"
+        "        (cycle_id, limit)\n",
+        "           # MUTANT M-RC1: rebalance_scans query drops cycle_id\n"
+        "           FROM rebalance_scans WHERE (? IS NOT NULL OR 1=1)\n"
+        "           ORDER BY id DESC LIMIT ?\"\"\",\n"
+        "        (cycle_id, limit)\n",
+        "rebalance_scans 查询丢掉 cycle_id（跨周期扫描行混入 operational 视图）",
+    ),
+    # M-RC2：prev_quality_score 跨周期读取。
+    (
+        "M-RC2",
+        SCANNER,
+        "            \"\"\"SELECT quality_score FROM rebalance_scans\n"
+        "               WHERE cycle_id=? AND account_id=? AND code=?\n"
+        "               ORDER BY id DESC LIMIT 1\"\"\",\n"
+        "            (cycle_id, account_id, code)\n",
+        "            # MUTANT M-RC2: prev_quality_score reads across cycles\n"
+        "            \"\"\"SELECT quality_score FROM rebalance_scans\n"
+        "               WHERE account_id=? AND code=?\n"
+        "               ORDER BY id DESC LIMIT 1\"\"\",\n"
+        "            (account_id, code)\n",
+        "prev_quality_score 跨周期读取（借用旧周期基线）",
+    ),
+    # M-RC3：consecutive_outflow 跨周期累计。
+    (
+        "M-RC3",
+        SCANNER,
+        "        \"\"\"SELECT fund_flow_trend FROM rebalance_scans\n"
+        "           WHERE cycle_id=? AND account_id=? AND code=?\n"
+        "           ORDER BY scan_date DESC LIMIT 5\"\"\",\n"
+        "        (cycle_id, account_id, code)\n",
+        "        # MUTANT M-RC3: consecutive outflow crosses cycles\n"
+        "        \"\"\"SELECT fund_flow_trend FROM rebalance_scans\n"
+        "           WHERE account_id=? AND code=?\n"
+        "           ORDER BY scan_date DESC LIMIT 5\"\"\",\n"
+        "        (account_id, code)\n",
+        "consecutive_outflow 跨周期累计",
+    ),
+    # M-RC4：get_pending_plans 不过滤周期（返回全部历史周期计划）。
+    (
+        "M-RC4",
+        SCANNER,
+        "        \"\"\"SELECT * FROM rebalance_plans\n"
+        "           WHERE cycle_id=? AND status IN ('planned', 'verified')\n"
+        "           ORDER BY plan_date DESC\"\"\",\n"
+        "        (cycle_id,)\n",
+        "        # MUTANT M-RC4: pending plans are not cycle-scoped\n"
+        "        \"\"\"SELECT * FROM rebalance_plans\n"
+        "           WHERE status IN ('planned', 'verified')\n"
+        "           ORDER BY plan_date DESC\"\"\",\n"
+        "        ()\n",
+        "get_pending_plans 不过滤 cycle（返回全部历史周期计划）",
+    ),
+    # M-RC5：verify 的 UPDATE 只按 id（丢掉 cycle_id 过滤）。
+    # 承重面是**伪造归属**的 plan dict：身份检查被谎报的 cycle_id 骗过，唯一还能
+    # 挡住它的是 UPDATE 自身的 cycle 过滤。
+    (
+        "M-RC5",
+        SCANNER,
+        "               WHERE id=? AND cycle_id=?\"\"\",\n",
+        "               # MUTANT M-RC5: verify UPDATE keys on id only\n"
+        "               WHERE id=? AND ? IS NOT NULL\"\"\",\n",
+        "verify UPDATE 只按 id（stale plan 可被 caller 注入改写）",
+    ),
+    # M-RC6：risk-handled 的委托查询不过滤周期。
+    # 三条分支各有一处 `AND cycle_id=?`；这里改最承重的 recent_risk 分支
+    # （同日翻周期时把 cycle 8 的风控退出算到 cycle 9 头上）。
+    (
+        "M-RC6",
+        SCANNER,
+        "           WHERE account_id=? AND code=? AND side='sell' AND cycle_id=?\n"
+        "             AND status='filled'\n"
+        "             AND \"\"\" + EV.VERIFIED_PREDICATE + \"\"\"\n"
+        "             AND created_at >= ?\n"
+        "             AND (\n",
+        "           # MUTANT M-RC6: risk-handled order query ignores the cycle\n"
+        "           WHERE account_id=? AND code=? AND side='sell'\n"
+        "             AND status='filled'\n"
+        "             AND \"\"\" + EV.VERIFIED_PREDICATE + \"\"\"\n"
+        "             AND created_at >= ?\n"
+        "             AND (\n",
+        "risk handled 的委托查询不过滤 cycle（旧周期退出压制新周期持仓）",
+    ),
+    # M-RC7：rebalance_scans 的 UNIQUE 恢复成 scan_date/account/code。
+    # 这是 §5 的核心：只 ADD COLUMN 而保留旧 UNIQUE 会让同日跨周期互相 replace。
+    (
+        "M-RC7",
+        SCHEMA_MIGRATIONS,
+        "            UNIQUE(cycle_id, scan_date, account_id, code)\n",
+        "            -- MUTANT M-RC7: cross-cycle UNIQUE is back\n"
+        "            UNIQUE(scan_date, account_id, code)\n",
+        "rebalance_scans 的 UNIQUE 恢复成 scan_date/account_id/code",
+    ),
+    # M-RC8：verify 期间周期变化仍继续（竞态守卫被移除）。
+    (
+        "M-RC8",
+        API_ADAPTIVE,
+        "            if current_cycle_id != requested_cycle_id:\n",
+        "            # MUTANT M-RC8: cycle change during verify is ignored\n"
+        "            if False and current_cycle_id != requested_cycle_id:\n",
+        "verify 期间 cycle change 仍继续（stale plan 被验证）",
+    ),
+    # M-RC9：新 scan/plan 的 cycle_id 写成 NULL（无归属事实）。
+    # 落点是 ``_require_cycle_id`` 的返回 —— 它把"必须有周期"折叠成"写 NULL"。
+    (
+        "M-RC9",
+        SCANNER,
+        "    if cycle_id is None:\n"
+        "        raise NoActiveCycle(\n"
+        "            f\"{operation}: 没有 active paper cycle，拒绝写入无归属的调仓状态\"\n"
+        "        )\n"
+        "    return int(cycle_id)\n",
+        "    # MUTANT M-RC9: unowned state is written with cycle_id=NULL\n"
+        "    if cycle_id is None:\n"
+        "        return None\n"
+        "    return int(cycle_id)\n",
+        "新 scan/plan 的 cycle_id 写成 NULL（无归属事实）",
+    ),
+    # ── Round-13：``/rebalance/status`` 的运营视图新鲜度（§11 M-RC10 / M-RC11）──
+    # 本轮缺陷的完整形态是"固定 key 的 30 秒 cache"（**读 + 写**）。只加读或只加写
+    # 都是**惰性变异**：只加读读到的是永远为空的 cache，只加写则无人消费。
+    # 第一代矩阵实测两条均 UNDETECTED，因此 M-RC10 把整个 body 作为一个
+    # 连续锚点，同时恢复读与写。
+    (
+        "M-RC10",
+        API_ADAPTIVE,
+            '    try:\n        import rebalance_scanner\n        with _paper_rebalance_db() as conn:\n            rebalance_scanner.ensure_schema(conn)\n            # operational status 只回答"**当前周期**待执行什么"。历史跨周期的\n            # recent history 若将来需要，应由独立接口提供，而不是混进这里。\n            cycle_id = rebalance_scanner.resolve_cycle_id(conn)\n            if cycle_id is None:\n                raise HTTPException(status_code=409, detail={\n                    "status": "no_active_cycle",\n                    "message": "没有 active paper cycle，调仓状态不可判定",\n                })\n            return rebalance_scanner.get_rebalance_status(conn, cycle_id=cycle_id)\n',
+            '    # MUTANT M-RC10: process-local 30s cache is back (stale operational view)\n    cached = _cache_get("rebalance_status", ttl=30)\n    if cached is not None:\n        return cached\n    try:\n        import rebalance_scanner\n        with _paper_rebalance_db() as conn:\n            rebalance_scanner.ensure_schema(conn)\n            # operational status 只回答"**当前周期**待执行什么"。历史跨周期的\n            # recent history 若将来需要，应由独立接口提供，而不是混进这里。\n            cycle_id = rebalance_scanner.resolve_cycle_id(conn)\n            if cycle_id is None:\n                raise HTTPException(status_code=409, detail={\n                    "status": "no_active_cycle",\n                    "message": "没有 active paper cycle，调仓状态不可判定",\n                })\n            result = rebalance_scanner.get_rebalance_status(conn, cycle_id=cycle_id)\n            # MUTANT M-RC10: cache the resolved view under one fixed key\n            _cache_set("rebalance_status", result)\n            return result\n',
+        "status 重新引入固定 key 的 30 秒 cache（读+写；旧周期快照泄漏）",
+    ),
+    # M-RC11：只把缓存**按 cycle 分键**（规格§4 明确禁止的替代方案）。
+    # cycle 翻转因 key 不同而看不出来，但**同周期内** scan 写下的状态仍在
+    # TTL 内不可见 —— §9 的 same-cycle freshness 用例必须把它抓住。
+    (
+        "M-RC11",
+        API_ADAPTIVE,
+            '            return rebalance_scanner.get_rebalance_status(conn, cycle_id=cycle_id)\n',
+            '            # MUTANT M-RC11: per-cycle cache key still hides same-cycle writes\n            cache_key = f"rebalance_status:{cycle_id}"\n            cached = _cache_get(cache_key, ttl=30)\n            if cached is not None:\n                return cached\n            result = rebalance_scanner.get_rebalance_status(conn, cycle_id=cycle_id)\n            _cache_set(cache_key, result)\n            return result\n',
+        "status 改成按 cycle 分键的 30 秒 cache（同周期写入在 TTL 内不可见）",
     ),
 )
 
@@ -1020,10 +1368,21 @@ def _env() -> dict:
     return {**os.environ, "PYTHONPATH": "backend", "PYTHONDONTWRITEBYTECODE": "1"}
 
 
+#: 子进程输出必须**显式**按 UTF-8 解码。
+#: ``text=True`` 不带 ``encoding`` 会用 ``locale.getpreferredencoding()`` —— 在中文
+#: Windows 上是 ``gbk``，而测试子进程打印的是 UTF-8（用例名与文档字符串都是中文）。
+#: 一旦某条测试失败，unittest 会回显中文用例名，解码线程随即抛
+#: ``UnicodeDecodeError``，矩阵会以"harness 崩溃"而非"变异存活"的形式失败 ——
+#: 看起来像环境问题，实际会掩盖真实结论。显式指定 + ``errors="replace"`` 后，
+#: 任何输出都能被读回并判定。
+_SUBPROCESS_TEXT = {"encoding": "utf-8", "errors": "replace"}
+
+
 def run_contract_tests() -> subprocess.CompletedProcess:
     return subprocess.run(
         [sys.executable, "-m", "unittest", "-q", *TEST_MODULES],
         cwd=str(ROOT), env=_env(), capture_output=True, text=True,
+        **_SUBPROCESS_TEXT,
     )
 
 
@@ -1033,6 +1392,7 @@ def _import_check() -> bool:
         [sys.executable, "-c",
          "import tradability_position_evidence, tradability_position_shadow"],
         cwd=str(ROOT), env=_env(), capture_output=True, text=True,
+        **_SUBPROCESS_TEXT,
     )
     if run.returncode != 0:
         print(run.stdout)
@@ -1605,6 +1965,153 @@ DESIGNATED_NON_VACUITY = {
         ".LegacyMetadataCompatibility"
         ".test_LP7_authoritative_lot_qty_beats_stale_mirror_qty",
     ),
+    # ── Round-10：当前持仓消费者必须走权威 lot（§23） ────────────────────────
+    "M-PC1": (
+        "test_authoritative_position_consumers"
+        ".NewsLearningHoldingTier"
+        ".test_PC1_stale_mirror_is_not_holding",
+    ),
+    "M-PC2": (
+        "test_authoritative_position_consumers"
+        ".CycleIsolation"
+        ".test_only_current_cycle_positions",
+    ),
+    "M-PC3": (
+        "test_authoritative_position_consumers"
+        ".NoActiveCycleFailsClosed"
+        ".test_no_active_cycle_returns_empty_and_creates_nothing",
+    ),
+    "M-PC4": (
+        "test_authoritative_position_consumers"
+        ".RebalanceHeldCodes"
+        ".test_PC4_stale_mirror_does_not_exclude",
+    ),
+    "M-PC5": (
+        "test_authoritative_position_consumers"
+        ".AdaptiveShadowPortfolio"
+        ".test_PC6_stale_mirror_excluded_from_shadow_portfolio",
+    ),
+    "M-PC6": (
+        "test_authoritative_position_consumers"
+        ".LegacyMetadataCompatibility"
+        ".test_mirror_qty_cost_entry_date_cannot_override_lot",
+    ),
+    "M-PC7": (
+        "test_authoritative_position_consumers"
+        ".NoActiveCycleFailsClosed"
+        ".test_no_active_cycle_returns_empty_and_creates_nothing",
+    ),
+    # ── Round-11：调仓引擎的数据库归属（§25） ────────────────────────────────
+    # NV-RB1：adaptive DB 与 paper DB 分离时，scan 只有在用 paper DB 时才成功。
+    "M-PC8": (
+        "test_rebalance_db_ownership"
+        ".E2E_RB1_ScanUsesPaperDB"
+        ".test_RB1_scan_reads_paper_ledger_not_adaptive",
+    ),
+    # NV-RB1 第二条：同一缺陷的"不得污染 adaptive DB"侧面。
+    "M-PC9": (
+        "test_rebalance_db_ownership"
+        ".E2E_RB3_AuthoritativeLotIncluded"
+        ".test_RB3_current_lot_reaches_scanner_and_writes_scan_row",
+    ),
+    # NV-RB2：scan → status 必须跨两个 HTTP handler 看到同一 paper 状态。
+    "M-PC10": (
+        "test_rebalance_db_ownership"
+        ".E2E_RB5_StatusAndPlansSameDB"
+        ".test_RB5_status_sees_scan_written_in_paper_db",
+    ),
+    "M-PC11": (
+        "test_rebalance_db_ownership"
+        ".E2E_RB6_VerifySameDB"
+        ".test_RB6_verify_reads_and_updates_paper_db",
+    ),
+    "M-PC12": (
+        "test_rebalance_db_ownership"
+        ".E2E_RB1_ScanUsesPaperDB"
+        ".test_RB1_scan_reads_paper_ledger_not_adaptive",
+    ),
+    "M-PC13": (
+        "test_authoritative_position_consumers"
+        ".ProjectionContractGuard"
+        ".test_api_adaptive_is_not_whitelisted",
+    ),
+    # ── Round-12：调仓状态的周期归属（§28） ──────────────────────────────────
+    # NV-RC1：status 的 recent_scans 必须 cycle-scoped。
+    "M-RC1": (
+        "test_rebalance_cycle_scope"
+        ".RB_C_StatusIsCurrentCycleOnly"
+        ".test_status_shows_only_current_cycle",
+    ),
+    # NV-RC2：prev_quality_score 必须同周期（不得借 90.0 基线）。
+    "M-RC2": (
+        "test_rebalance_cycle_scope"
+        ".RB_C5_PrevQualityIsSameCycle"
+        ".test_RB_C5_prev_quality_does_not_borrow_cycle8_baseline",
+    ),
+    # NV-RC3：consecutive_outflow 必须同周期（1 而不是 5）。
+    "M-RC3": (
+        "test_rebalance_cycle_scope"
+        ".RB_C6_ConsecutiveOutflowIsSameCycle"
+        ".test_RB_C6_outflow_streak_does_not_cross_cycles",
+    ),
+    # NV-RC4：get_pending_plans 必须只返回本周期。
+    "M-RC4": (
+        "test_rebalance_cycle_scope"
+        ".RB_C2_PendingPlansAreCycleScoped"
+        ".test_RB_C2_cycle8_plan_is_invisible_to_cycle9",
+    ),
+    # NV-RC5：verify 的 UPDATE 必须按 cycle_id 过滤（伪造归属被挡住）。
+    "M-RC5": (
+        "test_rebalance_cycle_scope"
+        ".RB_C3_VerifyRejectsForeignCyclePlan"
+        ".test_RB_C3_forged_plan_identity_is_rejected_by_update_guard",
+    ),
+    # NV-RC6：risk-handled 的委托查询必须按周期过滤。
+    "M-RC6": (
+        "test_rebalance_cycle_scope"
+        ".RB_C7_RiskHandledIsSameCycle"
+        ".test_RB_C7_cycle8_order_does_not_handle_cycle9_position",
+    ),
+    # NV-RC7：UNIQUE 必须含 cycle_id（同日两周期各自成行）。
+    "M-RC7": (
+        "test_rebalance_cycle_scope"
+        ".SameDayRolloverKeepsBothRows"
+        ".test_two_cycles_same_day_coexist",
+    ),
+    # NV-RC8：verify 期间周期变化必须 fail closed。
+    "M-RC8": (
+        "test_rebalance_cycle_scope"
+        ".RB_C_VerifyCycleChangeRace"
+        ".test_cycle_change_during_verify_fails_closed",
+    ),
+    # NV-RC9：没有 active cycle 时不得写下无归属状态。
+    #
+    # 必须指名**scanner 层**的守卫测试，不能指名 API 层的
+    # ``test_scan_without_active_cycle_creates_no_state``：M-RC9 变异的是
+    # ``rebalance_scanner._require_cycle_id``，而 endpoint 在调用 scanner **之前**
+    # 就有自己独立的一次 ``cycle_id is None`` 检查（两层的 fail-closed 是
+    # defense in depth）。API 层测试因此会因为另一层的守卫而继续变红/变绿，
+    # 与本次变异无关 —— 那正是非空性要抓的"变异打在了不是被守护的那个决策点"。
+    "M-RC9": (
+        "test_rebalance_cycle_scope"
+        ".NoActiveCycleFailsClosed"
+        ".test_daily_close_scan_requires_cycle_id",
+    ),
+    # ── Round-13：运营视图新鲜度（§11/§12） ──────────────────────────────────
+    # NV-RC10：M-RC10 恢复固定 TTL cache ⇒ cycle 翻转后必须立刻返回新周期。
+    # 指名 §8 的 rollover 用例 —— 它**不 sleep、不手工清 cache**，因此只有
+    # "每次都重新解析当前周期"才能变绿。
+    "M-RC10": (
+        "test_rebalance_cycle_scope"
+        ".RB_C_StatusFreshness"
+        ".test_rebalance_status_does_not_leak_previous_cycle_after_rollover",
+    ),
+    # NV-RC11：M-RC11 只污染写侧 ⇒ 同周期 scan 后必须立即可见。
+    "M-RC11": (
+        "test_rebalance_cycle_scope"
+        ".RB_C_StatusFreshness"
+        ".test_rebalance_status_reflects_same_cycle_scan_immediately",
+    ),
 }
 
 
@@ -1612,6 +2119,7 @@ def _run_specific(test_ids) -> subprocess.CompletedProcess:
     return subprocess.run(
         [sys.executable, "-m", "unittest", "-v", *test_ids],
         cwd=str(ROOT), env=_env(), capture_output=True, text=True,
+        **_SUBPROCESS_TEXT,
     )
 
 

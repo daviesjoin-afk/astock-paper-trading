@@ -24,6 +24,7 @@ import data_fetcher as dfc
 
 BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 import data_paths
+import paper_position_read_model as PPRM
 DB_PATH = data_paths.data_path("adaptive_learning.sqlite3")
 PAPER_DB_PATH = data_paths.data_path("paper_trading.sqlite3")
 BENCHMARK_CACHE_KEY = "BENCH_000300"
@@ -351,10 +352,13 @@ def candidate_pool(conn=None, asof=None, limit=POOL_LIMIT):
         paper = sqlite3.connect(PAPER_DB_PATH, timeout=20)
         paper.row_factory = sqlite3.Row
         try:
-            for row in paper.execute(
-                "SELECT code,name,industry,account_id FROM paper_positions WHERE qty>0"
-            ):
-                items.append({**dict(row), "pool_tier": "holding", "rank_no": 0, "source": "paper_positions"})
+            # 「现在持有什么」必须来自当前 active cycle 的权威 lot，而不是
+            # paper_positions 投影。投影没有 cycle_id / source_order_id，一个
+            # 旧周期的残留镜像行会被当成当前 holding 并进入候选池、事件捕获与
+            # 学习输入。此处按 cycle 过滤，且无 active cycle 时不给出任何 holding。
+            for row in PPRM.current_holding_rows(paper):
+                items.append({**row, "pool_tier": "holding",
+                              "rank_no": 0, "source": "paper_position_lots"})
             for row in paper.execute(
                 """SELECT code,name,industry,account_id,rank_score FROM paper_signals
                    WHERE status IN ('pending','deferred_capacity') AND intended_date>=?""", (day,)
@@ -407,6 +411,21 @@ def candidate_pool(conn=None, asof=None, limit=POOL_LIMIT):
 
 
 def _paper_codes(limit=POOL_LIMIT):
+    """最近出现过的代码（用于事件扫描范围），**不是**当前持仓声明。
+
+    语义区分（Round-10 §6）：本函数只做 **historical/recent symbol discovery** ——
+    给公告扫描一个有界的、可复现的代码集合。因此它允许使用 ``paper_positions``
+    投影的 ``entry_date`` 作为"曾经出现过"的时间戳。
+
+    但这**绝不**意味着那些代码是当前持仓：
+
+    - 不能标成 ``pool_tier = "holding"``（holding 只在 :func:`candidate_pool`
+      里由当前 active cycle 的权威 lot 产生）；
+    - 不能提高 holding 优先级；
+    - 不能用于候选排除或持仓存在性判断。
+
+    真正「现在持有什么」请走 ``paper_position_read_model.current_holding_*``。
+    """
     pool = candidate_pool(limit=limit)
     if pool:
         return [str(row["code"]) for row in pool]

@@ -131,6 +131,28 @@ def _ensure_order_cycle_provenance(conn):
     return paper_schema.ensure_order_cycle_provenance(conn)
 
 
+def _ensure_rebalance_state_cycle_ownership(conn):
+    """v19：调仓状态表的周期归属（scan / plan / cooldown，幂等，绝不回填）。
+
+    三张表都必须带 ``cycle_id``，且唯一契约必须把周期算进去：
+
+    * ``rebalance_scans`` 的 ``UNIQUE(scan_date, account_id, code)`` 本身是
+      **跨周期错误约束** —— 同一天翻周期时新扫描会 replace 掉旧周期那一行，
+      因此必须整表重建为 ``UNIQUE(cycle_id, scan_date, account_id, code)``；
+    * ``rebalance_plans`` 只加列（无约束变更）；
+    * ``rebalance_cooldown`` 的 ``PRIMARY KEY(code, account_id)`` 会让旧周期冷却
+      天然压住新周期，必须重建为 ``PRIMARY KEY(cycle_id, code, account_id)``。
+
+    **绝不回填历史行**：升级前的调仓行属于哪个周期无法从任何当前状态反推
+    （``paper_accounts.cycle_id`` 是可变重绑定、``MAX(paper_cycles.id)`` 不是
+    "当时 active"、日期与周期无函数关系），``cycle_id IS NULL`` 就是诚实的
+    legacy 归属状态 —— 所有 operational 查询按 ``cycle_id=?`` 过滤，NULL 行
+    因此天然不可见、不可验证、不可执行。表结构与 guard 由
+    :func:`paper_schema_migrations.ensure_rebalance_state_cycle_ownership` 持有。
+    """
+    return paper_schema.ensure_rebalance_state_cycle_ownership(conn)
+
+
 # 迁移注册表：db_name -> [(version, description, sql_or_callable), ...]
 MIGRATIONS = {
     "paper_trading": [
@@ -191,6 +213,14 @@ MIGRATIONS = {
         # legacy provenance 状态。Migration 本身绝不允许"提高历史 coverage"。
         (18, "新增订单不可变周期归属字段 cycle_id（幂等，不回填）",
          _ensure_order_cycle_provenance),
+        # 调仓状态的周期归属：三张 rebalance 状态表加 cycle_id，并把唯一契约
+        # （scans 的 UNIQUE、cooldown 的 PK）改成含周期的版本。**必须重建表**，
+        # 因为约束本身是错的 —— 只 ADD COLUMN 会把跨周期 replace / 跨周期冷却
+        # 留在原地。**绝不回填历史行**：升级前的调仓行属于哪个周期无法从当前
+        # 状态反推，cycle_id IS NULL 就是诚实的 legacy 归属状态，且被所有
+        # operational 查询（cycle_id=?）天然排除。
+        (19, "新增调仓状态的周期归属 cycle_id（幂等，不回填，重建唯一契约）",
+         _ensure_rebalance_state_cycle_ownership),
     ],
     "adaptive_learning": [
         (1, "创建 schema_version 表", """

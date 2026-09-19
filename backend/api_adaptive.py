@@ -5,15 +5,45 @@ import os
 import tempfile
 import threading
 import time
+from contextlib import contextmanager
 
 from fastapi import APIRouter, HTTPException, Query
 
 import adaptive_engine as adaptive
 import adaptive_learning_dispatch as learning_dispatch
+import paper_position_read_model as PPRM
+import paper_storage as PST
 import self_evolution as SE
 
 
 router = APIRouter(prefix="/api/adaptive", tags=["adaptive-learning"])
+
+
+@contextmanager
+def _paper_rebalance_db():
+    """调仓引擎的读写连接：**必须是 paper ledger**，不是 adaptive DB。
+
+    调仓扫描在同一连接上既读 paper 账本事实（``paper_accounts`` / 当前持仓 lot /
+    ``paper_orders`` / ``paper_signals``），又写自己的状态表
+    （``rebalance_scans`` / ``rebalance_plans`` / ``rebalance_cooldown``）。
+    因此它的事务模型天然是 **paper-ledger coupled**：这些状态一旦与账本事实分开，
+    「扫到的持仓」与「据此写下的计划」就不再来自同一个快照。
+
+    旧实现用 ``adaptive._connect()``（= ``adaptive_learning.sqlite3``）。那张库既没有
+    ``paper_accounts`` 也没有 ``paper_position_lots``，于是 endpoint 在错误的数据库上
+    找 paper 事实 —— 读不到就报 ``no such table``；更糟的是它会在错误库里建出
+    rebalance 状态，让 status/plans 与 scan 各说各话（split-brain）。
+
+    刻意**不用** ``PPRM.connect_readonly`` / ``paper_ledger_reader``：它们带
+    ``mode=ro`` + ``PRAGMA query_only=ON``，而调仓扫描必须写上述三张状态表。
+    也刻意**不** ``ATTACH`` 两个库：跨库事务会引入锁与部分提交语义，而 scanner
+    本来就依赖 paper ledger，最小正确模型是「调仓状态与 paper 账本同库」。
+
+    连接归属（Round-11）与周期归属（Round-12）是两件事，必须同时成立：
+    调仓状态既属于 paper ledger，也属于**某一个** paper cycle。
+    """
+    with PST.db(adaptive.PAPER_DB_PATH) as conn:
+        yield conn
 
 # ─── 轻量内存缓存 ───
 # One cache implementation is enough for the read-only status endpoints.
@@ -547,16 +577,37 @@ def rollback_rebalance(
 
 @router.get("/rebalance/status")
 def rebalance_status():
-    cached = _cache_get("rebalance_status", ttl=30)
-    if cached is not None:
-        return cached
+    """当前 active cycle 的**实时**运营状态。
+
+    **刻意不缓存**。这里曾经有一个 ``_cache_get("rebalance_status", ttl=30)``：
+    它在解析当前周期**之前**就返回，于是 ``HTTP operational view`` 与
+    ``authoritative current cycle`` 可以不一致 —— 同日 cycle 翻转后 30 秒内
+    GET 仍返回旧周期的 payload；同周期内的 scan/plan 写入也要等 TTL 过期才
+    可见；"没有 active cycle"时还会返回旧的 200 而不是 fail closed。
+
+    Round-12 已经把 rebalance state 做成 cycle-owned，本端点必须每次都重新问
+    账本"现在属于哪个周期"，而不是相信进程内的旧快照。缓存失效协议（按
+    cycle 分键、scan/verify 后手工 clear、rollover 时 clear）都是**第二份
+    authority**，会再次引入同一个缺陷类。
+
+    读的是本地 SQLite 的少量 operational state（``rebalance_scans`` /
+    ``rebalance_plans`` 各 LIMIT 10 + pending），不需要缓存。
+    """
     try:
         import rebalance_scanner
-        with adaptive._connect() as conn:
+        with _paper_rebalance_db() as conn:
             rebalance_scanner.ensure_schema(conn)
-            result = rebalance_scanner.get_rebalance_status(conn)
-            _cache_set("rebalance_status", result)
-            return result
+            # operational status 只回答"**当前周期**待执行什么"。历史跨周期的
+            # recent history 若将来需要，应由独立接口提供，而不是混进这里。
+            cycle_id = rebalance_scanner.resolve_cycle_id(conn)
+            if cycle_id is None:
+                raise HTTPException(status_code=409, detail={
+                    "status": "no_active_cycle",
+                    "message": "没有 active paper cycle，调仓状态不可判定",
+                })
+            return rebalance_scanner.get_rebalance_status(conn, cycle_id=cycle_id)
+    except HTTPException:
+        raise
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"调仓状态失败：{type(exc).__name__}") from exc
 
@@ -576,17 +627,39 @@ def run_rebalance_scan(confirmed: bool = Query(False)):
             "status": "quote_unavailable", "error": type(exc).__name__,
         }) from exc
     try:
-        with adaptive._connect() as conn:
+        # 一次扫描 = **一个** paper ledger 连接 = 一个事务。账本事实
+        # （running 账户 / 当前持仓 lot / 委托 / 信号）与扫描写下的
+        # rebalance 状态必须来自同一快照，否则持仓、风控状态与计划之间
+        # 会在两个连接之间漂移。行情已在事务外取好，不会长事务阻塞网络。
+        with _paper_rebalance_db() as conn:
             rebalance_scanner.ensure_schema(conn)
+            # 周期在**打开连接后只读解析一次**，然后显式传下去。scanner 内部的
+            # 每个 helper 都不得各自重新解析 active cycle —— 否则同一次扫描里
+            # 的持仓、风控状态与计划可能来自不同的周期身份。
+            cycle_id = rebalance_scanner.resolve_cycle_id(conn)
+            if cycle_id is None:
+                # fail closed：没有 active cycle 就不扫描、不写任何 rebalance
+                # 状态。绝不用 MAX(paper_cycles.id) / 账户绑定 / 日期猜一个。
+                raise HTTPException(status_code=409, detail={
+                    "status": "no_active_cycle",
+                    "message": "没有 active paper cycle，拒绝扫描并写入无归属的调仓状态",
+                })
             accounts = []
             for acc in conn.execute("SELECT * FROM paper_accounts WHERE status='running'").fetchall():
                 acc_dict = dict(acc)
-                acc_dict["positions"] = [dict(p) for p in conn.execute("SELECT * FROM paper_positions WHERE account_id=? AND qty>0", (acc["id"],)).fetchall()]
+                # 「当前持仓」必须来自权威 lot（cycle-scoped）。这里原本直接读
+                # paper_positions 投影，而 daily_close_scan 会把这些行当作持仓
+                # 评估质量并生成调仓计划 —— 旧周期残留镜像行会变成真实的调仓依据。
+                acc_dict["positions"] = PPRM.current_positions(conn, account_id=acc["id"])
                 accounts.append(acc_dict)
-            result = rebalance_scanner.daily_close_scan(conn, accounts, quotes)
+            result = rebalance_scanner.daily_close_scan(
+                conn, accounts, quotes, cycle_id=cycle_id,
+            )
             if isinstance(result, dict):
                 result["quote_meta"] = quote_meta
             return result
+    except HTTPException:
+        raise
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"调仓扫描失败：{type(exc).__name__}: {str(exc)[:200]}") from exc
 
@@ -596,18 +669,42 @@ def verify_rebalance_plans(confirmed: bool = Query(False)):
     _require_confirmation(confirmed, "验证调仓计划")
     try:
         import rebalance_scanner
-        with adaptive._connect() as conn:
+        with _paper_rebalance_db() as conn:
             rebalance_scanner.ensure_schema(conn)
-            plans = rebalance_scanner.get_pending_plans(conn)
+            requested_cycle_id = rebalance_scanner.resolve_cycle_id(conn)
+            if requested_cycle_id is None:
+                raise HTTPException(status_code=409, detail={
+                    "status": "no_active_cycle",
+                    "message": "没有 active paper cycle，拒绝验证调仓计划",
+                })
+            plans = rebalance_scanner.get_pending_plans(conn, cycle_id=requested_cycle_id)
         if not plans:
-            return {"message": "没有待验证的调仓计划", "plans": []}
+            return {"message": "没有待验证的调仓计划", "plans": [],
+                    "cycle_id": requested_cycle_id}
         # Fetch outside the connection scope; verification only writes after a
         # complete, auditable quote snapshot is available.
         quotes, quote_meta = _fetch_rebalance_quotes()
-        with adaptive._connect() as conn:
+        # 验证写回的仍是**同一个** paper ledger：待验证计划是 scan 写在那里的，
+        # 验证结果必须落在同一处，否则 status/plans 永远看不到验证状态。
+        with _paper_rebalance_db() as conn:
             rebalance_scanner.ensure_schema(conn)
-            results = rebalance_scanner.verify_all_plans(conn, plans, quotes)
-            return {"plans": results, "quote_meta": quote_meta}
+            # **周期竞态**：取计划与取行情之间隔着一次网络调用，期间周期可能
+            # 从 8 翻到 9。此时手上的计划属于 cycle 8，而"当前周期"已是 9 ——
+            # 绝不能在 cycle 9 里把 cycle 8 的计划验证掉。重新解析当前周期并要求
+            # 它与请求时**逐字相同**，否则 fail closed（不写任何一行）。
+            current_cycle_id = rebalance_scanner.resolve_cycle_id(conn)
+            if current_cycle_id != requested_cycle_id:
+                raise HTTPException(status_code=409, detail={
+                    "status": "cycle_changed_during_verify",
+                    "requested_cycle_id": requested_cycle_id,
+                    "current_cycle_id": current_cycle_id,
+                    "message": "取行情期间 paper cycle 已变化，拒绝验证 stale plan",
+                })
+            results = rebalance_scanner.verify_all_plans(
+                conn, plans, quotes, cycle_id=current_cycle_id,
+            )
+            return {"plans": results, "quote_meta": quote_meta,
+                    "cycle_id": current_cycle_id}
     except HTTPException:
         raise
     except Exception as exc:
@@ -618,13 +715,26 @@ def verify_rebalance_plans(confirmed: bool = Query(False)):
 def get_rebalance_plans(status: str = Query("all")):
     try:
         import rebalance_scanner
-        with adaptive._connect() as conn:
+        with _paper_rebalance_db() as conn:
             rebalance_scanner.ensure_schema(conn)
+            # operational 视图只展示当前周期；历史跨周期计划不属于本接口。
+            cycle_id = rebalance_scanner.resolve_cycle_id(conn)
+            if cycle_id is None:
+                raise HTTPException(status_code=409, detail={
+                    "status": "no_active_cycle",
+                    "message": "没有 active paper cycle，调仓计划不可判定",
+                })
             if status == "all":
-                rows = conn.execute("SELECT * FROM rebalance_plans ORDER BY id DESC LIMIT 50").fetchall()
+                rows = conn.execute(
+                    "SELECT * FROM rebalance_plans WHERE cycle_id=? ORDER BY id DESC LIMIT 50",
+                    (cycle_id,)).fetchall()
             else:
-                rows = conn.execute("SELECT * FROM rebalance_plans WHERE status=? ORDER BY id DESC LIMIT 50", (status,)).fetchall()
-            return {"plans": [dict(r) for r in rows]}
+                rows = conn.execute(
+                    "SELECT * FROM rebalance_plans WHERE cycle_id=? AND status=?"
+                    " ORDER BY id DESC LIMIT 50", (cycle_id, status)).fetchall()
+            return {"plans": [dict(r) for r in rows], "cycle_id": cycle_id}
+    except HTTPException:
+        raise
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"获取计划失败：{type(exc).__name__}") from exc
 
