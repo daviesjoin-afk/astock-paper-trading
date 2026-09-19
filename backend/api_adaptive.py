@@ -577,9 +577,22 @@ def rollback_rebalance(
 
 @router.get("/rebalance/status")
 def rebalance_status():
-    cached = _cache_get("rebalance_status", ttl=30)
-    if cached is not None:
-        return cached
+    """当前 active cycle 的**实时**运营状态。
+
+    **刻意不缓存**。这里曾经有一个 ``_cache_get("rebalance_status", ttl=30)``：
+    它在解析当前周期**之前**就返回，于是 ``HTTP operational view`` 与
+    ``authoritative current cycle`` 可以不一致 —— 同日 cycle 翻转后 30 秒内
+    GET 仍返回旧周期的 payload；同周期内的 scan/plan 写入也要等 TTL 过期才
+    可见；"没有 active cycle"时还会返回旧的 200 而不是 fail closed。
+
+    Round-12 已经把 rebalance state 做成 cycle-owned，本端点必须每次都重新问
+    账本"现在属于哪个周期"，而不是相信进程内的旧快照。缓存失效协议（按
+    cycle 分键、scan/verify 后手工 clear、rollover 时 clear）都是**第二份
+    authority**，会再次引入同一个缺陷类。
+
+    读的是本地 SQLite 的少量 operational state（``rebalance_scans`` /
+    ``rebalance_plans`` 各 LIMIT 10 + pending），不需要缓存。
+    """
     try:
         import rebalance_scanner
         with _paper_rebalance_db() as conn:
@@ -592,9 +605,7 @@ def rebalance_status():
                     "status": "no_active_cycle",
                     "message": "没有 active paper cycle，调仓状态不可判定",
                 })
-            result = rebalance_scanner.get_rebalance_status(conn, cycle_id=cycle_id)
-            _cache_set("rebalance_status", result)
-            return result
+            return rebalance_scanner.get_rebalance_status(conn, cycle_id=cycle_id)
     except HTTPException:
         raise
     except Exception as exc:

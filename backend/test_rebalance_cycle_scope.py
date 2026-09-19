@@ -567,8 +567,111 @@ class RB_C_StatusIsCurrentCycleOnly(_CycleScopeCase):
                         "plans 接口返回了非当前周期的计划")
 
 
-# ─── §26 Verify race E2E ────────────────────────────────────────────────────
+class RB_C_StatusFreshness(_CycleScopeCase):
+    """Round-13 §8/§9/§10：``/rebalance/status`` 必须是**请求时刻**的实时视图。
 
+    Round-12 让 rebalance state 变成 cycle-owned，但 ``rebalance_status()``
+    在解析当前周期**之前**返回了一个进程内 30 秒 cache。于是
+    ``HTTP operational view != authoritative current cycle``。本组用例全部
+    **走真实 handler**，不 sleep、不手工清 cache、不直接改 ``API._cache``
+    —— 要证明的是 production implementation 自身正确，而不是 cache helper
+    的行为。
+    """
+
+    def test_rebalance_status_does_not_leak_previous_cycle_after_rollover(self):
+        """§8：同日 cycle 翻转后，**不等 TTL** 立即返回新周期状态。"""
+        c8 = self.current_cycle()
+        self.activate(c8)
+        self.add_lot(c8, 100, code="OLD8")
+        self.seed_scan(c8, scan_date="2026-09-19", quality=CYCLE8_QUALITY,
+                       trend="outflow", code="OLD8")
+        self.seed_plan(c8, plan_date="2026-09-19", code="OLD8")
+
+        first = API.rebalance_status()
+        self.assertEqual(int(first["cycle_id"]), c8)
+        self.assertEqual([r["code"] for r in first["recent_scans"]], ["OLD8"])
+
+        # 同日翻转到 cycle 9，建立**明显不同**的 cycle 9 状态。
+        c9 = self.add_cycle(stamp="2026-09-19 12:00:00")
+        self.activate(c9)
+        self.add_lot(c9, 100, code="NEW9")
+        self.seed_scan(c9, scan_date="2026-09-19", quality=CYCLE9_QUALITY,
+                       trend="inflow", code="NEW9")
+        self.seed_plan(c9, plan_date="2026-09-19", code="NEW9")
+
+        # 不 sleep、不 clear cache —— 立刻再问一次。
+        second = API.rebalance_status()
+
+        self.assertEqual(int(second["cycle_id"]), c9,
+                         "cycle 翻转后 status 仍报告旧周期（stale cached payload）")
+        codes = [r["code"] for r in second["recent_scans"]]
+        self.assertNotIn("OLD8", codes, "cycle 8 的 scan 泄漏进 cycle 9 的 status")
+        self.assertEqual(codes, ["NEW9"])
+        # pending 也只能是 cycle 9 的。
+        pending_ids = {int(p["id"]) for p in second["pending_plans"]}
+        c9_ids = {int(r["id"]) for r in
+                  self._rows("SELECT id FROM rebalance_plans WHERE cycle_id=?", (c9,))}
+        self.assertEqual(pending_ids, c9_ids,
+                         "status 的 pending_plans 混入了旧周期计划")
+        self.assertTrue(pending_ids, "夹具未产出 cycle 9 的 pending 计划")
+
+    def test_rebalance_status_reflects_same_cycle_scan_immediately(self):
+        """§9：同周期内 scan 写下的状态，**不等 TTL** 立即可见。"""
+        c8 = self.current_cycle()
+        self.activate(c8)
+        self.add_lot(c8, 100)
+
+        before = API.rebalance_status()
+        self.assertEqual(int(before["cycle_id"]), c8)
+        self.assertEqual(before["recent_scans"], [], "夹具在 scan 之前已有扫描行")
+        self.assertEqual(before["pending_plans"], [])
+
+        # 真实 scan handler（行情已 patch，禁止网络）。
+        result = self.scan({CODE: QUOTE_FLAT})
+        self.assertGreaterEqual(int(result.get("plans_created") or 0), 1,
+                                "夹具未达到计划阈值")
+
+        # 不 sleep、不 clear cache —— 立刻再问一次。
+        after = API.rebalance_status()
+
+        self.assertEqual(int(after["cycle_id"]), c8, "同周期内 cycle_id 发生了变化")
+        self.assertEqual([r["code"] for r in after["recent_scans"]], [CODE],
+                         "同周期 scan 写下的扫描行在 TTL 内不可见")
+        self.assertTrue(after["pending_plans"],
+                        "同周期 scan 写下的计划在 TTL 内不可见")
+
+    def test_rebalance_status_no_active_cycle_cannot_return_cached_old_cycle(self):
+        """§10：没有 active cycle 必须**立即** fail closed，不被 cache 绕过。"""
+        from fastapi import HTTPException
+
+        c8 = self.current_cycle()
+        self.activate(c8)
+        self.add_lot(c8, 100, code="OLD8")
+        self.seed_scan(c8, scan_date="2026-09-19", quality=CYCLE8_QUALITY,
+                       trend="outflow", code="OLD8")
+
+        first = API.rebalance_status()
+        self.assertEqual(int(first["cycle_id"]), c8)
+
+        # 让"没有 active cycle"成立：所有周期移出 (draft,running,paused)。
+        self.conn.execute("UPDATE paper_cycles SET status='archived'")
+        self.conn.execute("UPDATE paper_accounts SET status='running', cycle_id=NULL")
+        self.conn.commit()
+        self.assertIsNone(RS.resolve_cycle_id(self.conn),
+                          "夹具仍有 active cycle ⇒ 测不到 fail closed")
+
+        # 不 sleep、不 clear cache —— 立刻再问一次。
+        with self.assertRaises(HTTPException) as ctx:
+            API.rebalance_status()
+
+        self.assertEqual(ctx.exception.status_code, 409,
+                         "无 active cycle 时 status 未 fail closed")
+        self.assertEqual(ctx.exception.detail["status"], "no_active_cycle")
+        # 承重：绝不能再把旧周期的 payload 当成 200 返回。
+        self.assertNotEqual(getattr(ctx.exception, "status_code", None), 200)
+
+
+# ─── §26 Verify race E2E ────────────────────────────────────────────────────
 class RB_C_VerifyCycleChangeRace(_CycleScopeCase):
     """§26：取计划（cycle 8）→ 取行情 → 周期切到 9 → verify 必须 fail closed。"""
 

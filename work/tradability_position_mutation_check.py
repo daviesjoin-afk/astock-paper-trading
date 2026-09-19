@@ -1234,6 +1234,42 @@ MUTATIONS = (
         "    return int(cycle_id)\n",
         "新 scan/plan 的 cycle_id 写成 NULL（无归属事实）",
     ),
+    # ── Round-13：``/rebalance/status`` 的运营视图新鲜度（§11 M-RC10 / M-RC11）──
+    # M-RC10：把"每次重新解析当前周期"换回**固定 key 的 30 秒 cache**。
+    # 这正是 Round-13 修掉的缺陷本身：cache 命中时**根本不会**打开账本、不会
+    # 解析当前周期，于是 cycle 翻转 / 同周期写入 / 无周期 fail-closed 三者全部
+    # 被旧快照绕过。落点是 endpoint 的**第一行**与返回前的一行。
+    (
+        "M-RC10",
+        API_ADAPTIVE,
+        "    try:\n"
+        "        import rebalance_scanner\n"
+        "        with _paper_rebalance_db() as conn:\n"
+        "            rebalance_scanner.ensure_schema(conn)\n"
+        "            # operational status 只回答",
+        "    # MUTANT M-RC10: process-local 30s cache is back (stale operational view)\n"
+        "    cached = _cache_get(\"rebalance_status\", ttl=30)\n"
+        "    if cached is not None:\n"
+        "        return cached\n"
+        "    try:\n"
+        "        import rebalance_scanner\n"
+        "        with _paper_rebalance_db() as conn:\n"
+        "            rebalance_scanner.ensure_schema(conn)\n"
+        "            # operational status 只回答",
+        "status 重新引入固定 key 的 30 秒 cache（旧周期快照泄漏）",
+    ),
+    # M-RC11：只补回写侧 —— 每次请求都重新解析周期，但**结果被缓存**，
+    # 于是"同周期 scan 之后立即可见"与"无周期 fail closed"仍然被绕过。
+    (
+        "M-RC11",
+        API_ADAPTIVE,
+        "            return rebalance_scanner.get_rebalance_status(conn, cycle_id=cycle_id)\n",
+        "            # MUTANT M-RC11: the freshly resolved view is cached anyway\n"
+        "            result = rebalance_scanner.get_rebalance_status(conn, cycle_id=cycle_id)\n"
+        "            _cache_set(\"rebalance_status\", result)\n"
+        "            return result\n",
+        "status 的实时结果被写回固定 key cache（后续请求读到旧快照）",
+    ),
 )
 
 #: 自检哨兵：只改注释。它必须 UNDETECTED —— 否则测试基线本来就是红的，
@@ -2074,6 +2110,21 @@ DESIGNATED_NON_VACUITY = {
         "test_rebalance_cycle_scope"
         ".NoActiveCycleFailsClosed"
         ".test_daily_close_scan_requires_cycle_id",
+    ),
+    # ── Round-13：运营视图新鲜度（§11/§12） ──────────────────────────────────
+    # NV-RC10：M-RC10 恢复固定 TTL cache ⇒ cycle 翻转后必须立刻返回新周期。
+    # 指名 §8 的 rollover 用例 —— 它**不 sleep、不手工清 cache**，因此只有
+    # "每次都重新解析当前周期"才能变绿。
+    "M-RC10": (
+        "test_rebalance_cycle_scope"
+        ".RB_C_StatusFreshness"
+        ".test_rebalance_status_does_not_leak_previous_cycle_after_rollover",
+    ),
+    # NV-RC11：M-RC11 只污染写侧 ⇒ 同周期 scan 后必须立即可见。
+    "M-RC11": (
+        "test_rebalance_cycle_scope"
+        ".RB_C_StatusFreshness"
+        ".test_rebalance_status_reflects_same_cycle_scan_immediately",
     ),
 }
 
