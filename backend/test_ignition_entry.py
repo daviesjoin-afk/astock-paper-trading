@@ -12,6 +12,7 @@ from unittest import mock
 sys.path.insert(0, os.path.dirname(__file__))
 sys.modules.setdefault("requests", mock.MagicMock())
 import paper_trading as P  # noqa: E402
+import paper_risk_decision as PRD  # noqa: E402
 import entry_timing as ET  # noqa: E402
 import ignition_entry as IGN  # noqa: E402
 
@@ -193,9 +194,9 @@ class SameDayPeakTests(unittest.TestCase):
         pos_new = {"qty": 100, "today_acquired_qty": 100, "entry_date": "2026-08-31"}
         pos_old = {"qty": 100, "today_acquired_qty": 100, "entry_date": "2026-08-28"}
         pos_add = {"qty": 200, "today_acquired_qty": 100, "entry_date": "2026-08-28"}
-        self.assertTrue(P._bought_today(pos_new, day))
-        self.assertFalse(P._bought_today(pos_old, day))
-        self.assertFalse(P._bought_today(pos_add, day))
+        self.assertTrue(PRD.bought_today(pos_new, asof_day=day))
+        self.assertFalse(PRD.bought_today(pos_old, asof_day=day))
+        self.assertFalse(PRD.bought_today(pos_add, asof_day=day))
 
     def test_same_day_position_ignores_pre_buy_high(self):
         # 买入前日内最高 3.62，买入价 3.40：同日新仓不得把 3.62 计入峰值
@@ -203,21 +204,21 @@ class SameDayPeakTests(unittest.TestCase):
         pos = {"qty": 100, "today_acquired_qty": 100, "entry_date": "2026-08-31",
                "peak_price": 3.40}
         quote = {"high": 3.62}
-        self.assertEqual(P._position_peak(pos, quote, 3.40, day), 3.40)
+        self.assertEqual(PRD.position_peak(pos, quote, 3.40, asof_day=day), 3.40)
 
     def test_next_day_restores_full_intraday_high(self):
         day = dt.date(2026, 8, 28)
         pos = {"qty": 100, "today_acquired_qty": 0, "entry_date": "2026-08-28",
                "peak_price": 3.40}
         quote = {"high": 3.62}
-        self.assertEqual(P._position_peak(pos, quote, 3.40, day), 3.62)
+        self.assertEqual(PRD.position_peak(pos, quote, 3.40, asof_day=day), 3.62)
 
     def test_partial_add_keeps_full_high_scope(self):
         day = dt.date(2026, 8, 31)
         pos = {"qty": 200, "today_acquired_qty": 100, "entry_date": "2026-08-28",
                "peak_price": 3.40}
         quote = {"high": 3.62}
-        self.assertEqual(P._position_peak(pos, quote, 3.40, day), 3.62)
+        self.assertEqual(PRD.position_peak(pos, quote, 3.40, asof_day=day), 3.62)
 
 
 class IgnitionShadowMigrationTests(unittest.TestCase):
