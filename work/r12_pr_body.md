@@ -207,6 +207,17 @@ paper DB:     paper_accounts present: True    paper_position_lots present: True
               rebalance_scans: absent   rebalance_plans: absent   rebalance_cooldown: absent
 ```
 
+That audit was taken **before** Round-12. Afterwards the local pair reads:
+
+```
+paper DB:     rebalance_scans rows=0   rebalance_plans rows=0   rebalance_cooldown rows=0
+adaptive DB:  rebalance_scans ABSENT   rebalance_plans ABSENT   rebalance_cooldown ABSENT
+```
+
+The three tables now exist in the paper DB with **zero rows**, created by the v19
+migration through `init_db()`. Empty state is zero-authority, and the adaptive DB
+still holds none — which is the invariant that matters.
+
 `adaptive_learning.sqlite3` holds **no** rebalance rows, so **no data migration is
 needed** by this PR (spec §10). Nothing was deleted, copied or overwritten.
 
