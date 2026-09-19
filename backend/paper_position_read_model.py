@@ -4,7 +4,8 @@
 不变量::
 
     paper_position_lots is the current executable position authority.
-    paper_positions is never evidence that a position is currently held.
+    paper_position_risk_state is the runtime peak / take-stage authority.
+    paper_positions is a compatibility projection with zero execution authority.
 
 本模块存在的理由：在 PR #168 之前，多个模块各自写一份
 ``SELECT ... FROM paper_positions WHERE qty>0`` 并把它解释成「现在持有什么」。
@@ -37,9 +38,10 @@ import paper_portfolio as PP
 
 POSITION_READ_MODEL_VERSION = "position-read-model-v1"
 
-#: 允许从 ``paper_positions`` 读取的列 —— **仅限展示元数据**。
-#: 数量 / 成本 / 取得日期 / 归属一律不得来自投影。
-LEGACY_METADATA_COLUMNS = ("peak_price", "take_stage")
+#: 允许从同周期 ``paper_position_risk_state`` 读取的风险状态列 —— 这是
+#: peak_price（移动止损）与 take_stage（阶梯止盈）的**唯一**权威来源。
+#: ``paper_positions`` 投影不再向任何执行判定供给这两个字段（R14）。
+RISK_STATE_METADATA_COLUMNS = ("peak_price", "take_stage")
 
 
 def _num(value, default=0.0):
@@ -124,10 +126,17 @@ def current_positions(conn, *, account_id=None, asof_day=None):
 
     返回与旧 ``_position_rows`` 相同形状的字典列表，因此调用方可以就地替换，
     不需要改自己的下游逻辑。``qty`` / ``cost`` / ``entry_date`` / ``available_qty``
-    / ``locked_qty`` 全部由 lot 派生；``paper_positions`` 只能补 ``peak_price``
-    与 ``take_stage``，且**仅对已有权威 lot 的 account/code**。
+    / ``locked_qty`` 全部由 lot 派生；``peak_price`` / ``take_stage`` **只**来自
+    同周期的 ``paper_position_risk_state``（R14 起执行权威），并且**仅对已有
+    权威 lot 的 account/code**。
+
+    没有风险状态行的持仓（升级前遗留 / 无 episode 事实）得到显式 fail-safe
+    默认：peak 锚定成本、``take_stage=None``（未知）—— 绝不回落
+    ``paper_positions`` 投影，"未知"不能升级成"已知"。
 
     没有 active cycle 时返回 ``[]`` —— 不建周期、不回落投影。
+    本函数是**纯读**：不 INSERT/UPDATE 风险状态、不创建周期、不修投影。
+    初始化只发生在 verified execution lifecycle（``paper_trading._record_lot``）。
     """
     cycle_id = active_cycle_id(conn)
     if cycle_id is None:
@@ -141,11 +150,16 @@ def current_positions(conn, *, account_id=None, asof_day=None):
     lots = _dicts(conn.execute(sql, tuple(params)).fetchall())
 
     try:
-        legacy_rows = _dicts(conn.execute("SELECT * FROM paper_positions").fetchall())
+        state_rows = _dicts(conn.execute(
+            "SELECT * FROM paper_position_risk_state WHERE cycle_id=?",
+            (cycle_id,)).fetchall())
     except sqlite3.Error:
-        legacy_rows = []
+        # 表不存在（极简 schema / 未迁移的库）⇒ 没有可证明的风险状态。
+        # 绝不回落 paper_positions 投影 —— 那正是本 PR 要消灭的执行权威泄漏。
+        state_rows = []
 
-    return PP.aggregate_positions(lots, legacy_rows, _verified_cash_flows(conn), day, num=_num)
+    return PP.aggregate_positions(
+        lots, state_rows, _verified_cash_flows(conn), day, num=_num)
 
 
 def current_holding_keys(conn, *, account_id=None) -> set:

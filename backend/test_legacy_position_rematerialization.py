@@ -354,7 +354,12 @@ class LegacyMetadataCompatibility(_LedgerCase):
     """§8 / §20 LP6 / LP7 —— 兼容投影契约。"""
 
     def test_LP6_authoritative_lot_gets_legacy_metadata(self):
-        """LP6: 有权威 lot 时，镜像的 peak_price / take_stage 仍被采用。"""
+        """LP6（R14 修订）: 有权威 lot 时，镜像的 peak_price / take_stage
+        **不再被采用** —— 它们的权威在 cycle-owned 风险状态表。
+
+        缺失状态走显式 fail-safe（peak 锚定成本、take_stage=None 未知），
+        执行判定绝不读投影："未知"不能被镜像冒充成"已知"。
+        """
         self.add_lot(self.cycle1, 100)
         self.conn.execute(
             "INSERT INTO paper_positions(account_id,code,name,industry,qty,cost,entry_date,"
@@ -366,8 +371,9 @@ class LegacyMetadataCompatibility(_LedgerCase):
 
         positions = PT._position_rows(self.conn, readonly=False)
         self.assertEqual(len(positions), 1)
-        self.assertAlmostEqual(float(positions[0]["peak_price"]), 13.75)
-        self.assertEqual(int(positions[0]["take_stage"]), 3)
+        self.assertAlmostEqual(float(positions[0]["peak_price"]), 10.0)
+        self.assertIsNone(positions[0]["take_stage"])
+        self.assertEqual(positions[0]["risk_state_source"], "missing")
 
     def test_LP7_authoritative_lot_qty_beats_stale_mirror_qty(self):
         """LP7: 数量必须来自 lot，而不是陈旧的镜像。"""

@@ -247,16 +247,40 @@ class ReadOnlyInvariant(_LedgerCase):
 
 
 class LegacyMetadataCompatibility(_LedgerCase):
-    """§20 —— 镜像只能补展示元数据，不能覆盖权威数量/成本/日期。"""
+    """§20 / R14 —— 镜像不能覆盖权威数量/成本/日期，也**不再供给**风险状态。"""
 
-    def test_peak_and_take_stage_come_from_mirror(self):
+    def test_stale_mirror_peak_and_take_stage_have_zero_execution_authority(self):
+        """R14：peak_price / take_stage 的权威在 cycle-owned 风险状态表。
+
+        镜像里的 13.75 / 3 不得进入持仓读数：缺失状态走显式 fail-safe
+        （peak 锚定成本、take_stage=None 未知），执行判定绝不读投影。
+        """
         self.add_lot(self.cycle1, 100)
         self.add_mirror(qty=100, peak_price=13.75, take_stage=3)
         self.conn.commit()
         rows = PPRM.current_positions(self.conn)
         self.assertEqual(len(rows), 1)
-        self.assertAlmostEqual(float(rows[0]["peak_price"]), 13.75)
-        self.assertEqual(int(rows[0]["take_stage"]), 3)
+        self.assertNotAlmostEqual(float(rows[0]["peak_price"]), 13.75)
+        self.assertAlmostEqual(float(rows[0]["peak_price"]), float(rows[0]["cost"]))
+        self.assertIsNone(rows[0]["take_stage"], "未知档位不得被镜像冒充成已知")
+        self.assertEqual(rows[0]["risk_state_source"], "missing")
+
+    def test_cycle_state_row_is_the_only_peak_stage_authority(self):
+        """R14：同周期风险状态行存在时，读数来自它而不是镜像。"""
+        self.add_lot(self.cycle1, 100)
+        self.add_mirror(qty=100, peak_price=13.75, take_stage=3)
+        self.conn.execute(
+            "INSERT INTO paper_position_risk_state(cycle_id,account_id,code,peak_price,"
+            "take_stage,opened_order_id,initialized_at,updated_at) VALUES(?,?,?,?,?,?,?,?)",
+            (self.cycle1, ACCOUNT, CODE, 11.25, 1, None,
+             "2026-09-01 10:00:00", "2026-09-01 10:00:00"),
+        )
+        self.conn.commit()
+        rows = PPRM.current_positions(self.conn)
+        self.assertEqual(len(rows), 1)
+        self.assertAlmostEqual(float(rows[0]["peak_price"]), 11.25)
+        self.assertEqual(int(rows[0]["take_stage"]), 1)
+        self.assertEqual(rows[0]["risk_state_source"], "cycle_state")
 
     def test_mirror_qty_cost_entry_date_cannot_override_lot(self):
         self.add_lot(self.cycle1, 200, cost=7.0, acquired_at="2026-07-01 10:00:00")
@@ -470,9 +494,6 @@ class ProjectionContractGuard(unittest.TestCase):
         "backend/paper_trading.py::_sync_positions": "projection writer",
         # 展示兜底：只取 name 用于风险审计展示，不参与任何持仓判定。
         "backend/paper_trading.py::risk_audit": "display-only name fallback",
-        # 唯一权威 reader 本身：仅用投影补 peak_price / take_stage 展示元数据。
-        "backend/paper_position_read_model.py::current_positions":
-            "enrich display metadata for an already-proven lot position",
         # 一致性自检：把投影与 lot 对账（发现不一致，不产生持仓）。
         "backend/paper_replay_regression.py::validate": "projection-vs-lot consistency check",
         # 开发/测试种子数据。

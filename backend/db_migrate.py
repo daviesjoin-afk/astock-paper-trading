@@ -131,6 +131,25 @@ def _ensure_order_cycle_provenance(conn):
     return paper_schema.ensure_order_cycle_provenance(conn)
 
 
+def _ensure_position_risk_state(conn):
+    """v20：cycle-owned 的持仓运行时风险状态（peak / take_stage，幂等，绝不回填）。
+
+    ``peak_price``（移动止损峰值）与 ``take_stage``（阶梯止盈已消费档位）是
+    execution-adjacent 的运行时风险状态，此前寄居在无 cycle / episode 身份的
+    ``paper_positions`` 投影里，旧周期 / 旧 episode 的值会真实改变新周期的
+    卖出决策。新表以 ``(cycle_id, account_id, code)`` 为主键，首行只能由
+    verified BUY 的 episode 生命周期创建。
+
+    **绝不回填**：升级前投影里的 peak/take_stage 属于哪个周期、哪个 episode
+    无法从任何当前状态反推 —— 把它们搬进本表就是把"不知道"洗白成"当前周期的
+    已知状态"（与 #169 禁止 stale mirror -> current lot 同一种错误）。缺失
+    状态的语义是 fail-safe（成本锚 peak + 未知 stage），绝不冒充权威。
+    表结构与 guard 由
+    :func:`paper_schema_migrations.ensure_position_risk_state` 持有。
+    """
+    return paper_schema.ensure_position_risk_state(conn)
+
+
 def _ensure_rebalance_state_cycle_ownership(conn):
     """v19：调仓状态表的周期归属（scan / plan / cooldown，幂等，绝不回填）。
 
@@ -221,6 +240,14 @@ MIGRATIONS = {
         # operational 查询（cycle_id=?）天然排除。
         (19, "新增调仓状态的周期归属 cycle_id（幂等，不回填，重建唯一契约）",
          _ensure_rebalance_state_cycle_ownership),
+        # 持仓运行时风险状态（peak_price / take_stage）的周期归属：新表主键为
+        # (cycle_id, account_id, code)，首行只能由 verified BUY 的 episode
+        # 生命周期创建。**绝不回填** paper_positions 的投影元数据 —— 升级前的
+        # peak/take_stage 没有周期 / episode 归属，搬进本表就是把"不知道"洗白
+        # 成"当前周期的已知状态"。缺失状态走 fail-safe（成本锚 peak + 未知
+        # stage），绝不冒充权威。
+        (20, "新增周期归属的持仓运行时风险状态表（幂等，不回填）",
+         _ensure_position_risk_state),
     ],
     "adaptive_learning": [
         (1, "创建 schema_version 表", """
