@@ -61,6 +61,7 @@ import paper_cycle_capital as PCC
 import paper_decision_audit as PDA
 import paper_slot_occupancy as PSO
 import paper_risk_exit_eligibility as PRE
+import paper_risk_decision as PRD
 import adaptive_selection_compat as ASC
 # ELC / EPD 仍被非 cleanup 路径使用（signal freshness、entry slice plan、
 # dispatch 规划与核验、gated order 查询）。清理动作已移交 paper_slot_service，
@@ -10672,148 +10673,17 @@ def _rollback_slot_borrow(conn, borrow):
     return {"allowed": True, "limits": before, "reason": "订单未成交，借用席位已回滚"}
 
 
-def _main_force_intent(position, quote, market=None, news=None):
-    """Estimate whether a sharp move is more consistent with washout or distribution.
-
-    This is an explainable *risk signal*, not an observable fact.  It requires
-    price/flow/volume evidence to agree before assigning either label; missing
-    fields deliberately fall back to ``uncertain``.  The result is written to
-    risk reviews and sell-plan payloads, but is not a standalone order trigger.
-    """
-    quote = quote or {}
-    price = _num(quote.get("price"), None)
-    pct = _num(quote.get("pct"), None)
-    main_pct = _num(quote.get("main_pct"), _num(quote.get("main_net_pct"), None))
-    super_net = _num(quote.get("super_net"), None)
-    vol_ratio = _num(quote.get("vol_ratio"), None)
-    high = _num(quote.get("high"), None)
-    low = _num(quote.get("low"), None)
-    open_price = _num(quote.get("open_price"), None)
-    market_pct = _num((market or {}).get("live_index_pct"), None)
-    relative = pct - market_pct if pct is not None and market_pct is not None else None
-    range_pos = None
-    if price is not None and high and low is not None and high > low:
-        range_pos = max(0.0, min(1.0, (price - low) / (high - low)))
-    negative_news = bool(_negative_hits(news or [], str(position.get("code") or "")))
-
-    distribution = 0.0
-    washout = 0.0
-    evidence = []
-    missing = []
-    if pct is None:
-        missing.append("当日涨跌幅")
-    elif pct <= -4:
-        distribution += 28; washout += 14; evidence.append(f"当日跌幅 {pct:+.2f}%")
-    elif pct <= -2:
-        distribution += 20; washout += 12; evidence.append(f"当日跌幅 {pct:+.2f}%")
-    elif pct < 0:
-        distribution += 8; washout += 8; evidence.append(f"当日小幅回落 {pct:+.2f}%")
-    if main_pct is None:
-        missing.append("主力净流入占比")
-    elif main_pct <= -4:
-        distribution += 32; evidence.append(f"主力净流入占比 {main_pct:+.2f}%")
-    elif main_pct <= -2:
-        distribution += 22; evidence.append(f"主力净流入占比 {main_pct:+.2f}%")
-    elif main_pct >= 1:
-        washout += 28; evidence.append(f"主力仍为净流入 {main_pct:+.2f}%")
-    elif main_pct >= -1:
-        washout += 18; evidence.append(f"主力流出有限 {main_pct:+.2f}%")
-    else:
-        washout += 8
-    if super_net is not None:
-        if super_net < 0:
-            distribution += 6
-        else:
-            washout += 5
-    else:
-        missing.append("超大单资金")
-    if vol_ratio is None:
-        missing.append("量比")
-    elif vol_ratio >= 1.5:
-        distribution += 12; washout += 10; evidence.append(f"量比 {vol_ratio:.2f}")
-    elif vol_ratio >= 1.1:
-        distribution += 5; washout += 6
-    if range_pos is not None:
-        if range_pos <= 0.35:
-            distribution += 14; evidence.append("收盘靠近日内低位")
-        elif range_pos >= 0.60:
-            washout += 18; evidence.append("下探后收复日内低位")
-    else:
-        missing.append("日内高低价")
-    if open_price is not None and price is not None and price < open_price:
-        distribution += 4
-    if relative is not None:
-        if relative <= -3:
-            distribution += 12; evidence.append(f"相对沪深300弱 {relative:+.2f}%")
-        elif relative >= -1:
-            washout += 9
-    if negative_news:
-        distribution += 16; evidence.append("发现负面公告/舆情")
-    elif news is not None:
-        washout += 5
-
-    distribution = round(min(100.0, distribution), 1)
-    washout = round(min(100.0, washout), 1)
-    usable = 1.0 - min(len(set(missing)) / 5.0, 0.8)
-    gap = abs(distribution - washout)
-    confidence = round(min(0.98, (0.50 + gap / 100.0) * usable), 2)
-    if distribution >= 60 and distribution - washout >= 12 and confidence >= 0.58:
-        classification, label, hint = "distribution", "疑似出货", "冻结加仓，优先复核可卖仓位"
-    elif washout >= 58 and washout - distribution >= 10 and confidence >= 0.58:
-        classification, label, hint = "washout", "疑似洗盘", "不因单日下跌单独清仓，等待承接确认"
-    else:
-        classification, label, hint = "uncertain", "意图不确定", "不得据此单独下单"
-    return {
-        "classification": classification,
-        "label": label,
-        "confidence": confidence,
-        "distribution_score": distribution,
-        "washout_score": washout,
-        "action_hint": hint,
-        "evidence": evidence[:8],
-        "missing": sorted(set(missing)),
-        "relative_to_market_pct": round(relative, 2) if relative is not None else None,
-        "range_position": round(range_pos, 3) if range_pos is not None else None,
-        "asof": quote.get("quote_at"),
-        "model": "main_force_intent_v1_shadow",
-    }
-
-
-def _bought_today(position, asof_day=None):
-    """整仓都是当日买入（同日新仓）才适用"买入后峰值"口径。
-
-    2026-08-31 复核 P1：同日新仓在买入后不到一分钟就被按买入前的日内
-    最高价算回撤（如开盘 3.62 冲高、3.40 才买入，立刻得到 6%+ 假回撤
-    预警）。同日新仓的 peak 只从买入后的采样价起记录；次日恢复完整
-    日内最高价口径。部分加仓的老仓仍用完整口径（老仓峰值合法）。
-    """
-    today = _date(asof_day or dt.date.today()).isoformat()
-    qty = int(_num(position.get("qty")))
-    today_qty = int(_num(position.get("today_acquired_qty")))
-    return (
-        qty > 0 and today_qty >= qty
-        and str(position.get("entry_date") or "") == today
-    )
-
-
-def _position_peak(position, quote, price, asof_day=None):
-    """统一峰值口径：同日新仓不吸收买入前的日内 high。"""
-    if _bought_today(position, asof_day):
-        return max(_num(position.get("peak_price"), 0.0), price or 0.0)
-    return max(
-        _num(position.get("peak_price"), 0.0),
-        _num(quote.get("high"), 0.0), price or 0.0,
-    )
-
-
 def _intraday_downside_guard(position, quote, market=None, news=None, policy_override=None,
-                             flow_trajectory=None):
+                             flow_trajectory=None, *, asof_day):
     """Combine intraday weakness and main-force intent into a staged guard.
 
     ``warning`` is informational/freeze-add territory.  ``partial`` and
     ``full`` are candidates for a sell only after the caller confirms the
     signal on a subsequent scan.  Washout evidence suppresses a sell unless
     a severe loss/negative-event condition is also present.
+
+    ``asof_day`` 必填：峰值口径与主力意图都不得回退到机器当前日期，
+    R15 的缺陷正是在这里把 as-of 漏给了峰值 helper。
     """
     account_id = str(position.get("account_id") or "")
     policy = dict(SPOL.intraday_downside_policy(account_id))
@@ -10831,11 +10701,11 @@ def _intraday_downside_guard(position, quote, market=None, news=None, policy_ove
     ret_pct = (price / cost - 1) * 100 if price and cost else None
     market_pct = _num((market or {}).get("live_index_pct"), None)
     relative = pct - market_pct if pct is not None and market_pct is not None else None
-    peak = _position_peak(position, quote, price)
+    peak = PRD.position_peak(position, quote, price, asof_day=asof_day)
     peak_retrace = (1 - price / peak) * 100 if price and peak else None
     peak_return = (peak / cost - 1) * 100 if peak and cost else None
     giveback = peak_return - ret_pct if peak_return is not None and ret_pct is not None else None
-    intent = _main_force_intent(position, quote, market=market, news=news)
+    intent = PRD.main_force_intent(position, quote, market=market, news=news)
     distribution = intent.get("classification") == "distribution" and intent.get("confidence", 0) >= 0.58
     washout = intent.get("classification") == "washout" and intent.get("confidence", 0) >= 0.58
     negative_news = bool(_negative_hits(news or [], str(position.get("code") or "")))
@@ -11100,7 +10970,7 @@ def _position_quality_score(conn, position, quote, asof_day, news=None, replacem
             _score100(signal["rank_score"], 0.0),
         )
     negative = _negative_hits(news or [], code)
-    main_force_intent = _main_force_intent(position, quote, market=market, news=news)
+    main_force_intent = PRD.main_force_intent(position, quote, market=market, news=news)
     news_penalty = min(24.0, len(negative) * 12.0)
     # 限售解禁预警（P0）：未来30天大额解禁（≥3%流通）重扣，60天≥5%中扣。
     # 解禁是确定性的供给冲击，等价格反应再退出就晚了；数据源失败时扣0。
@@ -11461,97 +11331,41 @@ def _rotation_buy_candidate(conn, account, replacement, quote, market, news, aso
 
 
 def _sell_plan(position, quote, asof_day, news, hard_stop_touched_today=False, spec_override=None):
+    """卖出决策的 orchestration adapter：解析输入 → 交给纯 engine → 组装旧 schema。
+
+    真正的硬止损/移动止损/最长持有/阶梯止盈/严重度仲裁都在
+    ``paper_risk_decision.evaluate_sell``（零 DB / 零 wall clock / 零策略依赖）。
+    这里只做本模块才有能力做的事：解析策略 spec、算 hold_days、解析涨跌停与
+    首段减仓比例、补 volatility shadow 诊断，并保持对调用方稳定的 4 元组返回。
+    """
     # PR-30：spec_override 允许调用方传入"ACCOUNT_SPECS × 编译画像"的生效参数
     # （hard_stop/trail/hold_max 取更紧）；未传时保持原有行为。
     spec = dict(_spec_for(position["account_id"]))
     if spec_override:
         spec.update(spec_override)
-    price = _num(quote.get("price"), 0)
-    cost = _num(position["cost"], 0)
-    # 与盘中守护同口径：峰值吸收当日 high，回撤不被 3 分钟采样间隙低估；
-    # 同日新仓例外——只用买入后的采样价，不吸收买入前的日内高点。
-    peak = _position_peak(position, quote, price)
-    ret = price / cost - 1 if cost and price else None
-    drawdown = 1 - price / peak if peak and price else None
     days = _hold_days(position, asof_day)
-    # R14：take_stage 的权威在 cycle-owned 风险状态。本周期无状态行（遗留持仓）
-    # 时读模型给 ``None`` —— "未知"保持未知：跳过阶梯止盈（绝不猜档位多卖），
-    # hard stop / max hold / trailing（peak 缺失锚定成本）照常工作。
-    raw_stage = position.get("take_stage")
-    stage_known = raw_stage is not None
-    next_stage = int(raw_stage) if stage_known else 0
-    reasons, sell_ratio = [], 0.0
-    exit_class, exit_reason_code = "none", None
-    # P1 审计修复（2026-09-02）：卖出状态机的"当日已发生某类退出"判定
-    # 改为读取订单 payload 里的稳定 ASCII 标记，不再对中文 reason 做
-    # LIKE 匹配——文案措辞调整曾经会静默破坏跌破确认与级别去重。
-    exit_marker = None
-    if ret is None:
-        return 0.0, "缺少有效报价", next_stage, {
+    price = _num(quote.get("price"), 0)
+    decision = PRD.evaluate_sell(
+        position, quote, asof_day=asof_day, spec=spec, hold_days=days, news=news,
+        hard_stop_touched_today=hard_stop_touched_today,
+        limit_pct=_limit_pct(position["code"]),
+        # 首段减仓比例同样来自策略 policy：engine 不解析账户归属。
+        hard_stop_first_trim_ratio=SPOL.intraday_downside_policy(
+            position["account_id"]
+        ).get("partial_ratio", 0.35),
+        risk_version=RISK_VERSION,
+    )
+    if decision["status"] == "no_quote":
+        return 0.0, "缺少有效报价", decision["next_stage"], {
             "strategy_id": position["account_id"],
             "risk_profile": spec.get("risk_profile"),
-            "strategy_version": spec.get("strategy_version") or RISK_VERSION,
+            "strategy_version": decision["strategy_version"],
             "hold_days": days,
         }
-    # P3 审计修复（S4）：退出类别按严重度固定优先级——旧实现顺序执行
-    # 且后者覆盖前者，同时满足"硬止损+达到最长持有"的持仓被记为较弱的
-    # max_hold，污染恢复观察与自进化样本的退出归因。
-    _exit_severity = {"none": 0, "tactical_take_profit": 1, "max_hold": 2,
-                      "trailing_stop": 3, "hard_stop": 4}
-    def _set_exit(new_class, new_code):
-        nonlocal exit_class, exit_reason_code
-        if _exit_severity[new_class] > _exit_severity.get(exit_class, 0):
-            exit_class, exit_reason_code = new_class, new_code
-    if ret <= spec["hard_stop"]:
-        # 2026-08-28 修复：盘中首次触碰硬止损且非崩盘形态时，不再立即
-        # 全仓清掉——先按守卫 partial 比例减仓；后续扫描仍在线下、或当日
-        # 已做过首段减仓、或已逼近跌停（崩盘形态）时才全清。避免把单针
-        # 探底卖在最低点（2026-08-28 601212 案例：7.013 清仓后反弹 +7.6%）。
-        limit_pct_now = _limit_pct(position["code"])
-        pct_now = _num(quote.get("pct"), 0.0)
-        crash_tape = pct_now <= -(limit_pct_now * 0.8)
-        if crash_tape or hard_stop_touched_today:
-            suffix = "崩盘形态" if crash_tape else "跌破确认"
-            reasons.append(f"硬止损 {ret*100:.1f}%（{suffix}，全清）")
-            sell_ratio = 1.0
-            _set_exit("hard_stop", "hard_stop")
-        else:
-            guard_ratio = _num(
-                SPOL.intraday_downside_policy(position["account_id"]).get("partial_ratio"), 0.35,
-            )
-            reasons.append(
-                f"硬止损首段减仓：现距成本 {ret*100:.1f}% 触及止损线且非崩盘形态，"
-                f"先减 {guard_ratio*100:.0f}%；后续扫描仍在线下将清仓"
-            )
-            sell_ratio = max(sell_ratio, guard_ratio)
-            _set_exit("hard_stop", "hard_stop")
-            exit_marker = "hard_stop_first_trim"
-    if ret >= spec["trail_after"] and drawdown is not None and drawdown >= spec["trail_stop"]:
-        reasons.append(f"移动止损，峰值回撤 {drawdown*100:.1f}%")
-        sell_ratio = 1.0
-        _set_exit("trailing_stop", "trailing_stop")
-    if days >= spec["hold_max"]:
-        reasons.append(f"达到最长持有 {days} 日")
-        sell_ratio = 1.0
-        _set_exit("max_hold", "max_hold")
-    stages = spec["take_profit"]
-    # P2 审计修复（2026-09-02）：跳空越档时单轮内连续消费所有已满足的
-    # 止盈档位（累计比例，封顶 1.0）。旧实现每轮只消费一档，价格从 +5%
-    # 直接跳到 +11% 时第二档要等下一个 3 分钟轮次，期间暴露于回撤。
-    # 仍只在无更强退出（硬止损/移动止损/最长持有）时执行；stage 未知
-    # （无同周期风险状态行）时整段跳过 —— 档位历史不可证明就不得据此卖出。
-    if sell_ratio == 0 and stage_known:
-        while next_stage < len(stages) and ret >= stages[next_stage][0]:
-            sell_ratio = min(1.0, sell_ratio + stages[next_stage][1])
-            next_stage += 1
-            reasons.append(f"阶梯止盈 {ret*100:.1f}%")
-            _set_exit("tactical_take_profit", "take_profit")
-    shadow_news = _negative_hits(news, position["code"])
-    main_force_intent = _main_force_intent(position, quote, news=news)
     exit_profile = {
         "strategy_id": position["account_id"],
         "risk_profile": spec.get("risk_profile"),
-        "strategy_version": spec.get("strategy_version") or RISK_VERSION,
+        "strategy_version": decision["strategy_version"],
         "hold_min": spec.get("hold_min"),
         "hold_max": spec.get("hold_max"),
         "hard_stop": spec.get("hard_stop"),
@@ -11560,23 +11374,24 @@ def _sell_plan(position, quote, asof_day, news, hard_stop_touched_today=False, s
         "take_profit": spec.get("take_profit"),
         "hard_stop_unchanged": True,
     }
-    return sell_ratio, "；".join(reasons), next_stage, {
+    exit_class = decision["exit_class"]
+    return decision["sell_ratio"], decision["reason"], decision["next_stage"], {
         "strategy_id": position["account_id"],
         "risk_profile": spec.get("risk_profile"),
-        "strategy_version": spec.get("strategy_version") or RISK_VERSION,
+        "strategy_version": decision["strategy_version"],
         "exit_profile": exit_profile,
-        "ret_pct": round(ret*100, 2),
-        "drawdown_pct": round((drawdown or 0)*100, 2),
+        "ret_pct": round(decision["ret"]*100, 2),
+        "drawdown_pct": round((decision["drawdown"] or 0)*100, 2),
         "hold_days": days,
-        "main_force_intent": main_force_intent,
-        "shadow_news_warning_count": len(shadow_news),
+        "main_force_intent": decision["main_force_intent"],
+        "shadow_news_warning_count": decision["shadow_news_warning_count"],
         "shadow_news_notice": (
             "快讯关键词仅作影子提示，不自动卖出"
-            if shadow_news else None
+            if decision["shadow_news_warning_count"] else None
         ),
         "exit_class": exit_class,
-        "exit_reason_code": exit_reason_code,
-        "exit_marker": exit_marker,
+        "exit_reason_code": decision["exit_reason_code"],
+        "exit_marker": decision["exit_marker"],
         "protective_exit": exit_class in PROTECTIVE_EXIT_CLASSES,
         "volatility_shadow": _volatility_shadow(position["code"], asof_day, price),
     }
@@ -11744,6 +11559,7 @@ def _monitor_risk_impl(asof_date=None):
                     account_map.get(position["account_id"]) or {"id": position["account_id"]}
                 ),
                 flow_trajectory=flow_trajectory_map.get(position["code"]),
+                asof_day=day,
             )
             permission_reason = permission_exit_reasons.get((position["account_id"], position["code"]))
             capacity_reason = capacity_exit_reasons.get((position["account_id"], position["code"]))
@@ -11799,7 +11615,7 @@ def _monitor_risk_impl(asof_date=None):
             # 同日新仓例外：只用买入后的采样价（2026-08-31 P1），
             # 避免买入前的高点立即制造虚假回撤预警。
             scan_peak = (
-                price if _bought_today(position, day)
+                price if PRD.bought_today(position, asof_day=day)
                 else max(price, _num(quote.get("high"), 0.0))
             )
             if scan_peak > _num(position.get("peak_price"), 0):

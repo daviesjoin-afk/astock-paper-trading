@@ -11,10 +11,11 @@ module**，domain implementation 也不能再长回 ``paper_trading.py``。Round
     Guard 2  ``paper_trading.py`` 不得再出现 risk-state CRUD SQL / 转发 wrapper；
     Guard 3  ``paper_trading.py`` 的 LOC / 模块级函数数不得反弹；
     Guard 4  新 domain 模块不得成为 service locator（零项目级 import）；
-    Guard 5  三条生产 SELL 路径必须都经过同一个 episode finalizer。
+    Guard 5  三条生产 SELL 路径必须都经过同一个 episode finalizer；
+    Guard 6  ``paper_risk_decision`` 必须是零 I/O / 零 wall-clock 的纯决策边界。
 
 刻意不做全仓架构分析：只扫本边界涉及的文件 + 一条 LOC 基线。确定性、无网络、
-无副作用；规模控制在 200 行左右，坏了能一眼看懂。
+无副作用；规模控制在 300 行左右，坏了能一眼看懂。
 """
 import ast
 import re
@@ -25,6 +26,7 @@ BACKEND = Path(__file__).resolve().parent
 PAPER_TRADING = BACKEND / "paper_trading.py"
 EXECUTION_PLANNER = BACKEND / "execution_planner.py"
 RISK_STATE_MODULE = "paper_position_risk_state.py"
+RISK_DECISION_MODULE = "paper_risk_decision.py"
 
 RISK_STATE_TABLE = "paper_position_risk_state"
 
@@ -39,6 +41,7 @@ DOMAIN_MODULES = (
     "paper_cycle_capital.py",
     "paper_slot_occupancy.py",
     "paper_risk_exit_eligibility.py",
+    "paper_risk_decision.py",
 )
 
 #: 历史上已有的例外。当前为空。新模块 ``paper_position_risk_state.py`` 永远不得
@@ -58,16 +61,29 @@ FORBIDDEN_PAPER_TRADING_DEFS = frozenset({
     "update_position_peak",
     "update_position_take_stage",
     "delete_position_risk_state",
+    # R15：纯风险卖出状态机搬进 paper_risk_decision 后不得再长回来。
+    "_bought_today",
+    "_position_peak",
+    "_main_force_intent",
 })
 
-#: Guard 3 —— Round-2 exact head 的基线（master 为 16314 行 / 287 函数）。以后只
-#: 允许 same or lower：确有 facade wiring 要加，必须同时抽出别的函数保持不增长。
+#: Guard 3 —— Round-3 exact head 的基线（上一轮 16365 行 / 287 函数）。R15 把纯风险
+#: 卖出状态机抽到 ``paper_risk_decision.py`` 后基线向下 ratchet。以后只允许 same or
+#: lower：确有 facade wiring 要加，必须同时抽出别的函数保持不增长。
 #: 不要设计环境变量绕过 / ``skip if CI`` 之类的后门。
-PAPER_TRADING_LOC_BASELINE = 16365
-PAPER_TRADING_DEF_BASELINE = 287
+PAPER_TRADING_LOC_BASELINE = 16181
+PAPER_TRADING_DEF_BASELINE = 284
 
 #: Guard 4 —— 新模块允许出现的 import 根（stdlib）。
 ALLOWED_STDLIB_IMPORTS = frozenset({"__future__", "datetime", "typing", "sqlite3"})
+
+#: Guard 6 —— 纯决策边界不得触碰的任何 I/O / 时钟 API 名（属性名或调用名）。
+FORBIDDEN_IO_CALLS = frozenset({
+    "open", "exec", "eval", "compile", "__import__",
+    "connect", "cursor", "execute", "executemany", "executescript", "commit",
+    "urlopen", "urlretrieve", "socket", "request", "getenv", "environ",
+})
+FORBIDDEN_CLOCK_ATTRS = frozenset({"today", "now", "utcnow", "time", "time_ns", "monotonic"})
 
 #: Guard 5 —— 生产 SELL 路径 → (文件, 函数名)。
 PRODUCTION_SELL_PATHS = (
@@ -236,6 +252,84 @@ class RiskStateModuleIsAPureDomainBoundary(unittest.TestCase):
                 forbidden, sql,
                 "状态模块不得解析 active cycle：cycle_id 必须由调用方显式传入",
             )
+
+
+class RiskDecisionModuleIsDeterministic(unittest.TestCase):
+    """Guard 6 —— 退出决策只能由显式输入决定，不得自带 I/O 或 wall-clock。"""
+
+    def _call_names(self, tree):
+        """所有被调用的名字：``f()`` 取 ``f``，``a.b()`` 取 ``b``。"""
+        names = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call):
+                func = node.func
+                if isinstance(func, ast.Name):
+                    names.add(func.id)
+                elif isinstance(func, ast.Attribute):
+                    names.add(func.attr)
+        return names
+
+    def test_guard6a_risk_decision_module_has_zero_project_imports(self):
+        roots = _imported_roots(_tree(RISK_DECISION_MODULE))
+        self.assertEqual(sorted(roots - ALLOWED_STDLIB_IMPORTS), [],
+                         "出现了未登记的 import：决策引擎不得依赖项目模块或第三方栈")
+
+    def test_guard6b_risk_decision_module_performs_no_io(self):
+        tree = _tree(RISK_DECISION_MODULE)
+        leaked = sorted(self._call_names(tree) & FORBIDDEN_IO_CALLS)
+        self.assertEqual(
+            leaked, [],
+            f"{RISK_DECISION_MODULE} 出现了 I/O 调用 {leaked}：决策必须是纯函数，"
+            "DB / 网络 / 文件 / 进程一律由调用方在边界之外完成",
+        )
+
+    def test_guard6c_risk_decision_module_reads_no_wall_clock(self):
+        tree = _tree(RISK_DECISION_MODULE)
+        leaked = sorted(self._call_names(tree) & FORBIDDEN_CLOCK_ATTRS)
+        self.assertEqual(
+            leaked, [],
+            f"{RISK_DECISION_MODULE} 读取了系统时钟 {leaked}：决策日期只能由 "
+            "asof_day 显式传入，禁止任何形式的 wall-clock 回退",
+        )
+
+    def test_guard6d_asof_day_is_keyword_only_and_required(self):
+        """``asof_day`` 一旦可省，就一定会有人省掉——于是又回到机器当前日期。
+
+        只查公开 API（``__all__`` 里的入口）；模块内私有规整函数由它们间接覆盖。
+        """
+        tree = _tree(RISK_DECISION_MODULE)
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.FunctionDef) or node.name.startswith("_"):
+                continue
+            if "asof_day" not in {arg.arg for arg in node.args.args + node.args.kwonlyargs}:
+                continue
+            with self.subTest(function=node.name):
+                kwonly = {arg.arg for arg in node.args.kwonlyargs}
+                self.assertIn(
+                    "asof_day", kwonly,
+                    f"{node.name} 的 asof_day 不是 keyword-only：位置参数可以漏传，"
+                    "等于把 wall-clock 泄漏重新引入",
+                )
+                defaults = node.args.kw_defaults
+                index = [arg.arg for arg in node.args.kwonlyargs].index("asof_day")
+                self.assertTrue(
+                    defaults[index] is None,
+                    f"{node.name} 的 asof_day 带默认值：缺失时必须 fail fast，"
+                    "不得静默回退到机器当前日期",
+                )
+
+    def test_guard6e_sell_plan_delegates_to_the_pure_engine(self):
+        raw = _source("paper_trading.py")
+        body = _function_source(ast.parse(raw), "_sell_plan", raw)
+        self.assertIn(
+            "PRD.evaluate_sell(", body,
+            "_sell_plan 不再委托 paper_risk_decision.evaluate_sell —— "
+            "退出状态机正在回流到 god module",
+        )
+        self.assertIn(
+            "asof_day=asof_day", body,
+            "_sell_plan 没有把显式 as-of 传给决策引擎：R15 的 wall-clock 泄漏会复发",
+        )
 
 
 class EveryProductionSellPathFinalizesTheEpisode(unittest.TestCase):
