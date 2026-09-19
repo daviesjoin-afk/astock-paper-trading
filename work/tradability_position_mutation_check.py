@@ -1088,10 +1088,7 @@ MUTATIONS = (
     (
         "M-PC12",
         TEST_DB_OWNERSHIP,
-        "        self.assertNotEqual(\n"
-        "            os.path.realpath(self.paper_path), os.path.realpath(self.adaptive_path),\n"
-        "            \"paper/adaptive DB 指向同一文件 ⇒ 数据库归属缺陷不可能被测出\",\n"
-        "        )\n",
+        "        self.adaptive_path = os.path.join(self.tmp.name, \"adaptive.sqlite3\")\n",
         "        # MUTANT M-PC12: fixture collapses both DBs onto one file\n"
         "        self.adaptive_path = self.paper_path\n",
         "API 夹具把 adaptive.DB_PATH 与 PAPER_DB_PATH 指向同一文件",
