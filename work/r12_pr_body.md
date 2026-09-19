@@ -494,22 +494,80 @@ operational query is cycle-scoped, which is what makes this safe.
 
 ## Mutation (spec §28)
 
+Run as 8 disjoint shards, each in its own `git worktree`:
+
 ```
 new mutations M-RC1..M-RC9   → 9/9 CAUGHT, survived: none
 re-run M-PC8..M-PC13         → 6/6 CAUGHT (Round-11 kills preserved)
 matrix                       → 15/15 CAUGHT
 non-vacuity                  → 15/15 ok
 restore                      → 15 × bytes_match=True sha256_match=True
+anchor audit                 → PASS (93 anchors, each exactly once)
 ```
 
-M-RC10/M-RC11 anchors were re-aimed (M-PC10/M-PC11) after the endpoints were
-rewritten; the anchor audit is what caught that they had stopped matching, and
-both still kill.
+**Non-vacuity caught one vacuous mutation, and it was mine.** M-RC9 rewrites the
+scanner's `_require_cycle_id` fail-closed guard, but I had designated the
+*API-level* test `test_scan_without_active_cycle_creates_no_state`. The endpoint
+has its own independent `cycle_id is None` check that fires *before* the scanner
+is ever called — the two fail-closed layers are deliberate defense in depth — so
+that test kept its verdict for a reason unrelated to the mutation:
+
+```
+M-RC9: 指名测试在变异后仍然全绿（空洞）
+```
+
+Re-aimed at `test_daily_close_scan_requires_cycle_id`, which calls the scanner
+directly:
+
+```
+M-RC9: baseline GREEN -> mutated RED  (ok)
+M-RC9: CAUGHT  (新 scan/plan 的 cycle_id 写成 NULL（无归属事实）)
+```
+
+This is the "mutation aimed at a decision point that is not the one being
+guarded" failure mode. It is worth noting *why* it happened here: the defense in
+depth that makes the production code correct is exactly what made a shallow
+non-vacuity check pass. The anchor audit separately caught that M-PC10/M-PC11 had
+stopped matching after the endpoints were rewritten; both were re-aimed and both
+still kill.
+
+## Migration on a real legacy schema (spec §21)
+
+`work/r12_migration_legacy_check.py` builds a ledger with the **pre-Round-12**
+schema (three tables, `UNIQUE(scan_date, account_id, code)`,
+`PRIMARY KEY(code, account_id)`) plus one legacy row in each table, then runs the
+migration:
+
+```
+旧 scans 唯一契约         = ('scan_date', 'account_id', 'code')
+旧 cooldown 主键          = ('code', 'account_id')
+
+第一次迁移 changes         = {'rebalance_scans': 'rebuilt', 'rebalance_plans': 'altered',
+                            'rebalance_cooldown': 'rebuilt'}
+新 scans 唯一契约         = ('cycle_id', 'scan_date', 'account_id', 'code')
+新 cooldown 主键          = ('cycle_id', 'code', 'account_id')
+legacy cycle_id 值        = {'scans': [(None,)], 'plans': [(None,)], 'cool': [(None,)]}
+legacy scans 其它字段逐字保留 = True
+
+第二次迁移 changes         = {'rebalance_scans': 'ok', 'rebalance_plans': 'ok',
+                            'rebalance_cooldown': 'ok'}
+```
+
+| check | result |
+| --- | --- |
+| row count preserved (1/1/1 before and after both runs) | PASS |
+| scans UNIQUE includes `cycle_id` | PASS |
+| cooldown PK includes `cycle_id` | PASS |
+| legacy other fields preserved verbatim | PASS |
+| legacy `cycle_id` stays NULL | PASS |
+| second run is a no-op | PASS |
 
 ## Backend / tooling
 
 ```
 python -m unittest discover -s backend -p "test_*.py"
+  Ran 3437 tests in 448.276s / OK (skipped=5) / exit=0
+  (3411 + 26 new cycle-scope tests)
 python -m ruff check backend     All checks passed!
 python -m compileall -q backend  exit=0
 ```
