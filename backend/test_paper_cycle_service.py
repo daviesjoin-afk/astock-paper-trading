@@ -157,6 +157,41 @@ class ArchiveCycleTests(_DbCase):
         returned = self._archive()
         self.assertEqual(self.cycle["id"], returned["id"])
 
+    def test_R16_risk_scan_runs_are_cycle_owned_on_archive(self):
+        """R16：风险扫描运行状态必须随周期一起归档清理。
+
+        ``archive_cycle`` 归档的是**当前 active cycle**，随后清空全部
+        cycle-owned operational 表（历史保留在 ``paper_archives.snapshot``）。
+        若 ``paper_risk_scan_runs`` 不在清单里，被归档周期的 scan run 会留在
+        活动表中成为孤儿 —— 它的唯一身份含 cycle_id，既不会被新周期命中，
+        也永远不会被任何清理路径回收。
+        """
+        self.assertIn("paper_risk_scan_runs", PCS.PURGED_TABLES,
+                      "周期清理清单缺少 paper_risk_scan_runs（会留下孤儿 run）")
+        self.assertIn("paper_risk_scan_runs", PCS.COUNTED_TABLES,
+                      "快照计数缺少 paper_risk_scan_runs")
+
+        self.conn.execute(
+            "INSERT INTO paper_risk_scan_runs(cycle_id,asof_date,scan_minute,status,"
+            "attempt,started_at,finished_at,error,detail) "
+            "VALUES(?,?,?,'completed',1,?,?,NULL,'{}')",
+            (int(self.cycle["id"]), "2026-09-10", "2026-09-10 14:50", PCS.now(), PCS.now()),
+        )
+        self.conn.commit()
+        self.assertEqual(
+            self.conn.execute("SELECT COUNT(*) FROM paper_risk_scan_runs").fetchone()[0], 1)
+
+        _cycle, snapshot = PCS.cycle_snapshot(self.conn, self.cycle)
+        self.assertIn("paper_risk_scan_runs", snapshot["_table_counts"],
+                      "归档快照缺少 scan run 行数")
+
+        self._archive()
+
+        self.assertEqual(
+            self.conn.execute("SELECT COUNT(*) FROM paper_risk_scan_runs").fetchone()[0], 0,
+            "归档后 scan run 残留成了孤儿",
+        )
+
 
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()

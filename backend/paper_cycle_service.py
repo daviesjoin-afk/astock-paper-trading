@@ -62,6 +62,7 @@ COUNTED_TABLES = (
     "paper_signals", "paper_risk_decisions", "paper_jobs",
     "paper_job_runs", "paper_reviews", "paper_intraday_observations",
     "paper_position_reviews", "paper_capital_reservations",
+    "paper_risk_scan_runs",
 )
 
 # 归档后清空的活动账本表（历史保留在 paper_archives.snapshot 里）。
@@ -71,6 +72,10 @@ PURGED_TABLES = (
     "paper_risk_decisions", "paper_nav", "paper_jobs", "paper_job_runs", "paper_reviews",
     "paper_intraday_observations", "paper_parameter_versions", "paper_position_reviews",
     "paper_capital_reservations", "paper_position_limit_versions",
+    # R16：风险扫描运行状态是 cycle-owned operational state。不随周期一起清掉的话，
+    # 归档周期 8 之后它的 scan run 行会留在活动表里成为孤儿，而唯一身份含
+    # cycle_id ⇒ 既不会被周期 9 命中，也永远不会被清理。
+    "paper_risk_scan_runs",
 )
 
 CAPITAL_MIN = 1000.0
