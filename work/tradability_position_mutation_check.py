@@ -1235,40 +1235,26 @@ MUTATIONS = (
         "新 scan/plan 的 cycle_id 写成 NULL（无归属事实）",
     ),
     # ── Round-13：``/rebalance/status`` 的运营视图新鲜度（§11 M-RC10 / M-RC11）──
-    # M-RC10：把"每次重新解析当前周期"换回**固定 key 的 30 秒 cache**。
-    # 这正是 Round-13 修掉的缺陷本身：cache 命中时**根本不会**打开账本、不会
-    # 解析当前周期，于是 cycle 翻转 / 同周期写入 / 无周期 fail-closed 三者全部
-    # 被旧快照绕过。落点是 endpoint 的**第一行**与返回前的一行。
+    # 本轮缺陷的完整形态是"固定 key 的 30 秒 cache"（**读 + 写**）。只加读或只加写
+    # 都是**惰性变异**：只加读读到的是永远为空的 cache，只加写则无人消费。
+    # 第一代矩阵实测两条均 UNDETECTED，因此 M-RC10 把整个 body 作为一个
+    # 连续锚点，同时恢复读与写。
     (
         "M-RC10",
         API_ADAPTIVE,
-        "    try:\n"
-        "        import rebalance_scanner\n"
-        "        with _paper_rebalance_db() as conn:\n"
-        "            rebalance_scanner.ensure_schema(conn)\n"
-        "            # operational status 只回答",
-        "    # MUTANT M-RC10: process-local 30s cache is back (stale operational view)\n"
-        "    cached = _cache_get(\"rebalance_status\", ttl=30)\n"
-        "    if cached is not None:\n"
-        "        return cached\n"
-        "    try:\n"
-        "        import rebalance_scanner\n"
-        "        with _paper_rebalance_db() as conn:\n"
-        "            rebalance_scanner.ensure_schema(conn)\n"
-        "            # operational status 只回答",
-        "status 重新引入固定 key 的 30 秒 cache（旧周期快照泄漏）",
+            '    try:\n        import rebalance_scanner\n        with _paper_rebalance_db() as conn:\n            rebalance_scanner.ensure_schema(conn)\n            # operational status 只回答"**当前周期**待执行什么"。历史跨周期的\n            # recent history 若将来需要，应由独立接口提供，而不是混进这里。\n            cycle_id = rebalance_scanner.resolve_cycle_id(conn)\n            if cycle_id is None:\n                raise HTTPException(status_code=409, detail={\n                    "status": "no_active_cycle",\n                    "message": "没有 active paper cycle，调仓状态不可判定",\n                })\n            return rebalance_scanner.get_rebalance_status(conn, cycle_id=cycle_id)\n',
+            '    # MUTANT M-RC10: process-local 30s cache is back (stale operational view)\n    cached = _cache_get("rebalance_status", ttl=30)\n    if cached is not None:\n        return cached\n    try:\n        import rebalance_scanner\n        with _paper_rebalance_db() as conn:\n            rebalance_scanner.ensure_schema(conn)\n            # operational status 只回答"**当前周期**待执行什么"。历史跨周期的\n            # recent history 若将来需要，应由独立接口提供，而不是混进这里。\n            cycle_id = rebalance_scanner.resolve_cycle_id(conn)\n            if cycle_id is None:\n                raise HTTPException(status_code=409, detail={\n                    "status": "no_active_cycle",\n                    "message": "没有 active paper cycle，调仓状态不可判定",\n                })\n            result = rebalance_scanner.get_rebalance_status(conn, cycle_id=cycle_id)\n            # MUTANT M-RC10: cache the resolved view under one fixed key\n            _cache_set("rebalance_status", result)\n            return result\n',
+        "status 重新引入固定 key 的 30 秒 cache（读+写；旧周期快照泄漏）",
     ),
-    # M-RC11：只补回写侧 —— 每次请求都重新解析周期，但**结果被缓存**，
-    # 于是"同周期 scan 之后立即可见"与"无周期 fail closed"仍然被绕过。
+    # M-RC11：只把缓存**按 cycle 分键**（规格§4 明确禁止的替代方案）。
+    # cycle 翻转因 key 不同而看不出来，但**同周期内** scan 写下的状态仍在
+    # TTL 内不可见 —— §9 的 same-cycle freshness 用例必须把它抓住。
     (
         "M-RC11",
         API_ADAPTIVE,
-        "            return rebalance_scanner.get_rebalance_status(conn, cycle_id=cycle_id)\n",
-        "            # MUTANT M-RC11: the freshly resolved view is cached anyway\n"
-        "            result = rebalance_scanner.get_rebalance_status(conn, cycle_id=cycle_id)\n"
-        "            _cache_set(\"rebalance_status\", result)\n"
-        "            return result\n",
-        "status 的实时结果被写回固定 key cache（后续请求读到旧快照）",
+            '            return rebalance_scanner.get_rebalance_status(conn, cycle_id=cycle_id)\n',
+            '            # MUTANT M-RC11: per-cycle cache key still hides same-cycle writes\n            cache_key = f"rebalance_status:{cycle_id}"\n            cached = _cache_get(cache_key, ttl=30)\n            if cached is not None:\n                return cached\n            result = rebalance_scanner.get_rebalance_status(conn, cycle_id=cycle_id)\n            _cache_set(cache_key, result)\n            return result\n',
+        "status 改成按 cycle 分键的 30 秒 cache（同周期写入在 TTL 内不可见）",
     ),
 )
 

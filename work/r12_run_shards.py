@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Round-12 变异矩阵分片启动器。
+"""Round-12/13 变异矩阵分片启动器。
 
 每个分片在**独立 git worktree** 里运行：``work/tradability_position_mutation_check.py``
 从自身位置推导 ``ROOT``，因此每个 worker 有自己的源码树和自己的 lock 文件 ——
@@ -21,8 +21,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 SHARDS = 8
 
-#: Round-12 新增/受影响的变异 id（全部要跑）。
-IDS = [f"M-RC{i}" for i in range(1, 10)]
+#: Round-12/13 新增/受影响的变异 id（全部要跑）。
+IDS = [f"M-RC{i}" for i in range(1, 12)]
 
 #: 同时重跑 Round-11 的 DB 归属变异，确认它们仍然 CAUGHT。
 IDS += [f"M-PC{i}" for i in range(8, 14)]
@@ -58,7 +58,7 @@ def setup_worktrees(gen: str) -> None:
 
 def launch(gen: str) -> list:
     """把每个分片作为**独立受管后台进程**启动（绝不前台跑）。"""
-    out_dir = ROOT / "work" / f"r12_matrix_{gen}"
+    out_dir = ROOT / "work" / f"r13_matrix_{gen}"
     out_dir.mkdir(parents=True, exist_ok=True)
     procs = []
     for index in range(SHARDS):
@@ -81,7 +81,7 @@ def launch(gen: str) -> list:
 
 def launch_non_vacuity(gen: str) -> list:
     """非空性同样分片跑（每条要先绿后红，成本与矩阵同量级）。"""
-    out_dir = ROOT / "work" / f"r12_nonvac_{gen}"
+    out_dir = ROOT / "work" / f"r13_nonvac_{gen}"
     out_dir.mkdir(parents=True, exist_ok=True)
     procs = []
     for index in range(SHARDS):
