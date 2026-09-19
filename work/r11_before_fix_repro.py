@@ -5,8 +5,18 @@
 
     python work/r11_before_fix_repro.py
 
-本脚本**只读地**回答一个问题：在 exact head ``c48a80ca`` 上，
-``api_adaptive.run_rebalance_scan`` 到底在哪个 SQLite 文件上跑？
+本脚本回答一个问题：``api_adaptive.run_rebalance_scan`` 到底在哪个 SQLite
+文件上跑？它是一个**差分探针**，用来分别回答「修复前是否复现」与「修复后是否
+已消除」，因此**修复前后各跑一次、两次判定含义相反**：
+
+* 在 **未修复** 源码（exact head ``c48a80ca``）上跑 ⇒ 期望 ``PASS``
+  （观察到 ``no such table: paper_accounts``，且 ``rebalance_*`` 建在 adaptive 库）；
+* 在 **已修复** 源码上跑 ⇒ 期望 ``FAIL (defect not reproduced)``。
+
+**修复后报 FAIL 是正确结果，不是回归** —— 它正是"缺陷已消失"的读数。
+之所以仍然保留这个反向判定，是为了让同一条命令能在两种源码上给出可比的
+差分结论，而不是各写一套只会自证的脚本。修复后的正向验证见
+``work/r11_after_fix_check.py`` 与 ``backend/test_rebalance_db_ownership.py``。
 
 做法（刻意不使用任何 mock 掉数据库的东西）：
 
@@ -176,11 +186,15 @@ def main():
         print("  BEFORE-FIX REPRODUCTION: PASS")
         print("  → rebalance endpoint 确实在 adaptive_learning.sqlite3 上执行，")
         print("    而它读取的是 paper ledger 事实。")
+        print("  （这是在**未修复**源码上期望的读数。）")
         return 0
     if kind == "OK" and paper_got_rebalance and not adaptive_got_rebalance:
         print()
         print("  BEFORE-FIX REPRODUCTION: FAIL (defect not reproduced)")
         print("  → endpoint 已经在 paper DB 上运行。")
+        print("  （若当前源码**已含修复**，这正是期望读数：缺陷已消除，不是回归。")
+        print("    修复后的正向验证见 work/r11_after_fix_check.py 与")
+        print("    backend/test_rebalance_db_ownership.py。）")
         return 1
     print()
     print("  BEFORE-FIX REPRODUCTION: INCONCLUSIVE")
