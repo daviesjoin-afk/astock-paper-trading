@@ -563,10 +563,17 @@ class V20Migration(_LedgerCase):
             "PRAGMA table_info(paper_position_risk_state)") if r["pk"]]
         self.assertEqual(pk, ["cycle_id", "account_id", "code"])
 
-    def test_migration_v20_is_registered_as_latest(self):
+    def test_migration_v20_is_registered(self):
+        """v20 必须是**已注册**的迁移（R16 之后最新版是 v21，见下）。"""
+        paper = {version: desc for version, desc, _op in db_migrate.MIGRATIONS["paper_trading"]}
+        self.assertIn(20, paper)
+        self.assertIn("风险状态", paper[20])
+
+    def test_migration_v21_is_registered_as_latest(self):
+        """R16 把风险扫描运行状态表登记为 v21（paper_risk_scan_runs）。"""
         paper = db_migrate.MIGRATIONS["paper_trading"]
-        self.assertEqual(paper[-1][0], 20)
-        self.assertIn("风险状态", paper[-1][1])
+        self.assertEqual(paper[-1][0], 21)
+        self.assertIn("风险扫描", paper[-1][1])
 
     def test_migration_upgrade_recreates_table_with_guards(self):
         self.conn.executescript(
