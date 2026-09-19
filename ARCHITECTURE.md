@@ -160,6 +160,38 @@ slot occupancy
 - 已有完整持仓（`int(qty) >= lot_size`）的 `(account_id, code)` 若有待成交买单，属于对既有持仓加仓，不占用新席位（suppressed）。
 - `paper_trading.py` 保留 `_pending_position_slots(conn, positions=None, exclude_order_key=None)` 兼容 facade，负责解析可选持仓并向新模块注入 `ENTRY_SLOT_OCCUPYING_ORDER_STATUSES`、`LOT_SIZE`、`_num` 与 `_rows`。新模块纯 stdlib，无事务控制，不执行写 SQL，不导入 `paper_trading`。
 
+### 持仓运行时风险状态边界
+
+`backend/paper_position_risk_state.py` 是 `paper_position_risk_state` 表的唯一 runtime 状态所有权边界。三张表的权威划分是固定的：
+
+```text
+paper_position_lots          数量 / 归属 / 成本权威（唯一）
+paper_position_risk_state    cycle-owned 运行时权威：peak_price / take_stage / episode 起点 / 来源买单
+paper_positions              仅兼容展示投影，零执行权威
+```
+
+缺失风险状态是 fail-safe 而不是"补一个默认值"：peak 锚定成本（与全新 episode 默认一致）、`take_stage=None`（阶梯止盈整体跳过，未知绝不升格为已知），hard stop / max hold 照常工作。投影里被篡改的 peak / take_stage 永不进入执行判定。
+
+**episode 终止只有一个判据**：同 cycle 权威 `paper_position_lots` 剩余量之和为 0。该判据由 `finalize_sell(conn, *, cycle_id, account_id, code, next_take_stage=None)` 自己从权威 lots 读取——不让三个调用方各写一份 `position_closed`。三条生产 SELL 路径必须全部经过它：
+
+| Sell path | 能否整仓退出 | episode finalizer |
+| --- | ---: | --- |
+| 风控扫描 `paper_trading._monitor_risk_impl` | 是 | `PPRS.finalize_sell` |
+| 手动/延迟委托 `execution_planner.commit_fill`（SELL 分支） | 是 | `PPRS.finalize_sell` |
+| 日内高抛 `paper_trading._intraday_sell` | 是（`available == LOT_SIZE` 时高抛即整仓） | `PPRS.finalize_sell` |
+
+模块边界（刻意窄，且必须保持窄）：零项目级 import（只依赖 stdlib 与调用方交进来的 `sqlite connection`）；不拥有事务（绝不 `commit`/`rollback`/`BEGIN`，状态收尾必须与 lot 消耗、订单/成交写入同处调用方事务）；不解析 active cycle（`cycle_id` 一律由调用方显式传入，禁止 `MAX(cycle_id)` / `paper_accounts.cycle_id` / 日期推断）；不拥有 schema（DDL 仍在 `paper_schema_migrations`，注册仍在 `db_migrate`）；不决定成交（只在权威 lot 消耗成功**之后**收尾，状态行的存在与否绝不反过来决定 SELL 是否成立，missing state 的 fail-safe 语义不变）。
+
+依赖方向单向且不可反转：
+
+```text
+paper_trading      ──▶ paper_position_risk_state
+execution_planner  ──▶ paper_position_risk_state
+paper_position_risk_state ──▶ (stdlib only)
+```
+
+`paper_trading.py` 不再保留这四个 CRUD helper 的任何转发 wrapper（它们是新 API，没有 legacy compatibility 价值）。回归门禁见 `backend/test_paper_trading_architecture_guard.py`（反向 import、CRUD SQL 回流、`paper_trading.py` 规模基线、service locator、SELL 路径 finalizer 覆盖率）。
+
 | 领域 | 代码范围 | 拥有什么 | 不拥有什么 |
 | --- | --- | --- | --- |
 | Strategy Domain | `strategy_registry`、`strategy_service`、`strategy_dsl_*`、`strategy_runtime`、`strategy_risk_*`、`strategy_policies`、`strategy_clusters`、`strategy_champion` | 策略身份、不可变版本、DSL 编译、运行时就绪、生命周期、风险/执行画像 | 订单、成交、资金池、周期账本 |
@@ -257,6 +289,7 @@ PR-49 把这条口径的实现收敛到只读解析器 `backend/paper_cycle_owne
 | 执行真实性证据 | `backend/execution_evidence.py`, `backend/execution_lifecycle.py`, `backend/execution_outcome.py` | 执行证据三态契约（`known`/`unknown`/`not_applicable`）、成交六分类、委托成交状态机与非法跳转拒绝、`selection_executable` × `execution_verified` 连接、`market`/`selection`/`execution` 三层收益 | 不撮合、不写订单/成交/资金、不重建仓库没有的历史数据、不改写 PR149 selection outcome、不用市场标签顶替执行收益；不 import `paper_trading` |
 | 行情基础设施 | `data_fetcher.py`, `marketdata_transport.py`, `marketdata_providers.py`, `marketdata_normalizers.py`, `marketdata_cache.py` | 多源请求、重试/熔断、解析标准化、缓存、覆盖率和新鲜度元数据 | 不在缓存陈旧时伪造实时价 |
 | 交易门禁 | `paper_trading_rules.py`, `paper_quote_policy.py`, `entry_timing.py` | 交易日、费用、证券权限、T+1、整手、涨跌停、行情新鲜度和入场时机 | 不负责持久化订单 |
+| 持仓运行时风险状态 | `backend/paper_position_risk_state.py` | `paper_position_risk_state` 的唯一 runtime 状态所有权：episode 初始化（verified BUY `0 -> >0`）、peak 只升不降吸收、take_stage 推进、full-exit 收尾、以及所有生产 SELL 路径共用的 `finalize_sell`（自行按 cycle 读权威 `paper_position_lots` 判定 episode 是否结束） | 不拥有 schema/DDL（归 `paper_schema_migrations`），不拥有事务（不 commit/rollback/BEGIN），不解析 active cycle（cycle_id 由调用方显式传入），不决定成交；不 import `paper_trading`，零项目级依赖 |
 | 资金与仓位 | `paper_allocation.py`, `paper_sizing.py`, `paper_portfolio.py`, `paper_performance.py` | 共享池预算、席位、下单股数、持仓 lot 聚合、今日盈亏纯计算 | 不调用外部行情源 |
 | 账本与迁移 | `paper_storage.py`, `paper_repository.py`, `paper_schema_migrations.py`, `paper_ledger_reader.py`, `paper_archive_projection.py` | SQLite 连接/WAL/重试、通用行读写、幂等迁移、只读读取端口、历史快照投影 | 不改变交易策略结论 |
 | 风控与审计 | `risk_center.py`, `adaptive_risk.py`, `adaptive_shadow_risk.py` | 风险状态机、下行保护、风险仪表盘、影子风控和结构化审计原因 | 影子层不能越权提交订单 |

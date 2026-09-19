@@ -12,6 +12,12 @@
     never "upgraded" from the projection.
     Reads never create state; writes always carry explicit cycle provenance.
 
+Round-2（本文件后半部分）额外钉住一条：**episode 结束只有一个判据** ——
+同周期权威 lots 剩余量为 0，由 ``paper_position_risk_state.finalize_sell``
+自己判定。因此 full-exit 用例必须驱动**真实生产 SELL 路径**（risk scan /
+``execution_planner.commit_fill`` / ``_intraday_sell``），不能自己调用
+``delete_episode`` 来"假装"生产链路被覆盖 —— 那只证明 delete 原语可用。
+
 全部用例驱动**真实生产 schema**（``PT.init_db``）与**真实生产原语**
 （``paper_position_read_model`` / ``paper_portfolio`` / ``paper_trading``
 的 episode 生命周期）。手写最小 DDL 证明不了本缺陷：被测行为是
@@ -21,6 +27,7 @@
 """
 from __future__ import annotations
 
+import datetime as dt
 import os
 import sqlite3
 import sys
@@ -31,8 +38,10 @@ from unittest import mock
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import db_migrate  # noqa: E402
+import execution_planner as EP  # noqa: E402
 import paper_cycle_service as PCS  # noqa: E402
 import paper_position_read_model as PPRM  # noqa: E402
+import paper_position_risk_state as PPRS  # noqa: E402
 import paper_schema_migrations as PSM  # noqa: E402
 import paper_trading as PT  # noqa: E402
 
@@ -288,9 +297,9 @@ class WritesAreCycleScoped(_LedgerCase):
         c2 = self.add_cycle()
         self.add_state(c2, peak_price=12.0, take_stage=0)
 
-        PT.update_position_peak(
+        PPRS.update_peak(
             self.conn, cycle_id=c2, account_id=ACCOUNT, code=CODE, peak_price=15.0)
-        PT.update_position_take_stage(
+        PPRS.update_take_stage(
             self.conn, cycle_id=c2, account_id=ACCOUNT, code=CODE, take_stage=2)
         self.conn.commit()
 
@@ -303,13 +312,13 @@ class WritesAreCycleScoped(_LedgerCase):
 
     def test_PRS5b_peak_write_never_lowers_and_missing_row_is_noop(self):
         self.add_state(self.cycle1, peak_price=14.0, take_stage=0)
-        PT.update_position_peak(
+        PPRS.update_peak(
             self.conn, cycle_id=self.cycle1, account_id=ACCOUNT, code=CODE,
             peak_price=11.0)
         self.assertAlmostEqual(float(self.state_row(self.cycle1)["peak_price"]), 14.0,
                                "peak 被写低了（只升不降被破坏）")
         # 不存在的行 ⇒ no-op（读/扫描路径绝不创造权威状态）。
-        PT.update_position_peak(
+        PPRS.update_peak(
             self.conn, cycle_id=self.cycle1, account_id=ACCOUNT, code="000001",
             peak_price=99.0)
         self.conn.commit()
@@ -320,15 +329,39 @@ class WritesAreCycleScoped(_LedgerCase):
         c2 = self.add_cycle()
         self.add_state(c2, peak_price=12.0, take_stage=0)
 
-        PT.delete_position_risk_state(
+        PPRS.delete_episode(
             self.conn, cycle_id=c2, account_id=ACCOUNT, code=CODE)
         self.conn.commit()
         self.assertIsNone(self.state_row(c2))
         self.assertIsNotNone(self.state_row(self.cycle1), "旧周期状态被跨周期删除")
 
+    def test_PRS5d_every_write_requires_an_explicit_cycle(self):
+        """写原语绝不"自己找周期"：缺 cycle 一律拒绝，而不是回落 active cycle。"""
+        for call in (
+            lambda: PPRS.initialize_episode(
+                self.conn, cycle_id=None, account_id=ACCOUNT, code=CODE, peak_price=10.0),
+            lambda: PPRS.update_peak(
+                self.conn, cycle_id=None, account_id=ACCOUNT, code=CODE, peak_price=10.0),
+            lambda: PPRS.update_take_stage(
+                self.conn, cycle_id=None, account_id=ACCOUNT, code=CODE, take_stage=1),
+            lambda: PPRS.delete_episode(
+                self.conn, cycle_id=None, account_id=ACCOUNT, code=CODE),
+            lambda: PPRS.finalize_sell(
+                self.conn, cycle_id=None, account_id=ACCOUNT, code=CODE),
+        ):
+            with self.assertRaises(ValueError):
+                call()
+        self.assertEqual(self.state_count(), 0, "被拒的写入仍然改了状态行")
+
 
 class EpisodeLifecycle(_LedgerCase):
-    """PRS-6~9 —— episode 生命周期走真实 ``_record_lot`` / lot 消耗。"""
+    """PRS-6~9 —— episode 生命周期走真实 ``_record_lot`` / lot 消耗。
+
+    本类只覆盖**原语级契约**（BUY 初始化/吸收、finalizer 三态语义）。
+    "生产 SELL 路径真的调用了 finalizer" 由
+    :class:`ProductionSellPathClosesEpisode` 驱动真实路径证明 —— 那才是
+    Round-2 要修的东西，不能靠这里手工调一次 delete 来冒充。
+    """
 
     def test_PRS6_partial_sell_preserves_state(self):
         self.record_buy(200, 10.0)
@@ -337,37 +370,89 @@ class EpisodeLifecycle(_LedgerCase):
             self.conn, ACCOUNT, CODE, 100, "2026-09-10", cycle_id=self.cycle1)
         self.conn.commit()
         self.assertEqual(int(consumed), 100)
+        # 没有档位推进事实（manual / deferred SELL）⇒ 必须原样保留。
+        result = PPRS.finalize_sell(
+            self.conn, cycle_id=self.cycle1, account_id=ACCOUNT, code=CODE)
+        self.conn.commit()
+        self.assertEqual(result["state_action"], PPRS.STATE_PRESERVED)
+        self.assertEqual(int(result["remaining_qty"]), 100)
+        self.assertFalse(result["position_closed"])
 
         row = self.state_row(self.cycle1)
         self.assertIsNotNone(row, "部分减仓清掉了运行时风险状态")
         self.assertAlmostEqual(float(row["peak_price"]), 13.75)
-        self.assertEqual(int(row["take_stage"]), 1)
+        self.assertEqual(int(row["take_stage"]), 1, "无档位事实的部分卖出重置了档位")
         rows = PPRM.current_positions(self.conn)
         self.assertEqual(int(rows[0]["qty"]), 100)
-        self.assertAlmostEqual(float(rows[0]["peak_price"]), 13.75)
 
-    def test_PRS7_full_exit_clears_state_via_sell_finalization(self):
-        """full exit（episode 结束）必须清除状态；same-cycle 再进场拿全新状态。"""
-        self.record_buy(100, 10.0)
-        self.bump_state(self.cycle1, peak_price=13.75, take_stage=2)
+    def test_PRS6b_partial_sell_with_a_stage_fact_advances_the_stage(self):
+        """有档位事实的部分卖出推进 take_stage，且 finalizer 不改写 peak。"""
+        self.record_buy(200, 10.0)
+        self.bump_state(self.cycle1, peak_price=13.75, take_stage=1)
         PT._consume_available_lots(
             self.conn, ACCOUNT, CODE, 100, "2026-09-10", cycle_id=self.cycle1)
-        # 卖出成交收尾路径（risk scan finalization）在 position_closed 时删除状态。
-        PT.delete_position_risk_state(
-            self.conn, cycle_id=self.cycle1, account_id=ACCOUNT, code=CODE)
+        result = PPRS.finalize_sell(
+            self.conn, cycle_id=self.cycle1, account_id=ACCOUNT, code=CODE,
+            next_take_stage=2)
         self.conn.commit()
+        self.assertEqual(result["state_action"], PPRS.STATE_STAGE_UPDATED)
+        row = self.state_row(self.cycle1)
+        self.assertEqual(int(row["take_stage"]), 2)
+        self.assertAlmostEqual(float(row["peak_price"]), 13.75, "finalizer 改了 peak")
+
+    def test_PRS7_finalizer_terminates_only_on_zero_authoritative_qty(self):
+        """终止判据来自权威 lots，而不是调用方的局部变量。
+
+        剩余量不是 0 时给 ``next_take_stage`` 只推进档位、绝不删除；卖掉最后一股
+        （权威剩余量 0）才删除。判据错位的直接后果是"部分卖出把 episode 关掉"。
+        """
+        self.record_buy(200, 10.0)
+        self.bump_state(self.cycle1, peak_price=13.75, take_stage=1)
+        PT._consume_available_lots(
+            self.conn, ACCOUNT, CODE, 100, "2026-09-10", cycle_id=self.cycle1)
+        self.conn.commit()
+        partial = PPRS.finalize_sell(
+            self.conn, cycle_id=self.cycle1, account_id=ACCOUNT, code=CODE,
+            next_take_stage=2)
+        self.conn.commit()
+        self.assertNotEqual(partial["state_action"], PPRS.STATE_DELETED)
+        self.assertIsNotNone(self.state_row(self.cycle1),
+                             "剩余 100 股时被当成 full exit")
+
+        PT._consume_available_lots(
+            self.conn, ACCOUNT, CODE, 100, "2026-09-10", cycle_id=self.cycle1)
+        result = PPRS.finalize_sell(
+            self.conn, cycle_id=self.cycle1, account_id=ACCOUNT, code=CODE,
+            next_take_stage=3)
+        self.conn.commit()
+        self.assertEqual(result["state_action"], PPRS.STATE_DELETED)
+        self.assertEqual(int(result["remaining_qty"]), 0)
+        self.assertTrue(result["position_closed"])
         self.assertIsNone(self.state_row(self.cycle1), "full exit 未清除风险状态")
 
-        # 源码级守卫：删除只发生在 ``if position_closed:`` 分支内，部分减仓
-        # 走 else 的 take_stage 推进 —— 结构回归由该守卫钉住。
-        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        with open(os.path.join(root, "backend/paper_trading.py"), encoding="utf-8") as fh:
-            src = fh.read()
-        closed_at = src.index("if position_closed:")
-        delete_at = src.index("delete_position_risk_state(", closed_at)
-        else_at = src.index("else:", closed_at)
-        self.assertLess(delete_at, else_at,
-                        "delete_position_risk_state 不再位于 position_closed 分支内")
+    def test_PRS7b_finalizer_never_mixes_another_cycles_lots(self):
+        """判据必须按 cycle 隔离：别的周期还有货，不得让本周期的已结束状态留下来。
+
+        这条用例是**判据隔离**的判别性设计 —— 两个周期必须一空一有：本周期卖光
+        （0）、另一个周期还有 300 股。少写 ``cycle_id`` 过滤时聚合值变成 300，
+        本周期会被误判成"还没结束"。
+        """
+        self.record_buy(100, 10.0)                      # cycle1
+        c2 = self.add_cycle()
+        self.add_lot(c2, 300)                           # 另一个周期仍有持仓
+        PT._consume_available_lots(
+            self.conn, ACCOUNT, CODE, 100, "2026-09-10", cycle_id=self.cycle1)
+        self.conn.commit()
+
+        result = PPRS.finalize_sell(
+            self.conn, cycle_id=self.cycle1, account_id=ACCOUNT, code=CODE)
+        self.conn.commit()
+
+        self.assertEqual(int(result["remaining_qty"]), 0,
+                         "finalize_sell 把别的周期的剩余量算进了本周期判据")
+        self.assertEqual(result["state_action"], PPRS.STATE_DELETED)
+        self.assertIsNone(self.state_row(self.cycle1),
+                          "本周期已卖光，episode 却因别的周期还有货而未被关闭")
 
     def test_PRS8_add_on_preserves_stage_and_raises_peak(self):
         """加仓：不重置 episode 状态；peak 只升不降；initialized_at 不变。"""
@@ -376,7 +461,7 @@ class EpisodeLifecycle(_LedgerCase):
         self.assertAlmostEqual(float(row["peak_price"]), 10.0)
         self.assertEqual(int(row["take_stage"]), 0)
         self.assertIsNone(row["opened_order_id"], "直接建仓路径不得伪造订单出处")
-        PT.update_position_take_stage(
+        PPRS.update_take_stage(
             self.conn, cycle_id=self.cycle1, account_id=ACCOUNT, code=CODE,
             take_stage=1)
         self.conn.commit()
@@ -652,6 +737,312 @@ class DualDatabaseOwnership(unittest.TestCase):
             tables = getattr(PCS, attr, None) or ()
             self.assertIn("paper_position_risk_state", tables,
                           f"paper_cycle_service.{attr} 缺少 paper_position_risk_state")
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# Round-2 Blocker A：full exit 必须由**每一条**生产 SELL 路径收尾
+#
+# Round-1 只把状态清理写进了风控扫描分支，于是 ``execution_planner.commit_fill``
+# 与 ``_intraday_sell`` 在卖光最后一股权威 lot 之后仍然留着 risk-state 行。
+# 下面的用例**驱动真实生产路径**（``PT.monitor_risk`` / ``EP.commit_fill`` /
+# ``PT._intraday_sell``），而不是自己调用 delete 原语 —— 「测试手工 delete 一次」
+# 只能证明 delete helper 可用，证明不了生产链路会调用它。
+# ══════════════════════════════════════════════════════════════════════════
+class ProductionSellPathClosesEpisode(_LedgerCase):
+    """B / C / F —— ``execution_planner.commit_fill`` 的 SELL 分支。
+
+    这是 manual / deferred 委托的真实成交入口（``reserved=True`` 跳过预占，
+    只聚焦成交阶段），也是 Round-1 漏掉的第一条 full-exit 路径。
+    """
+
+    # ── 夹具 ─────────────────────────────────────────────────────────────
+    def buy(self, qty, price, *, day="2026-09-01"):
+        """真实生产 BUY 生命周期：``_record_lot`` 建 lot 并初始化 episode。"""
+        account = dict(self.conn.execute(
+            "SELECT * FROM paper_accounts WHERE id=?", (ACCOUNT,)).fetchone())
+        when = dt.date.fromisoformat(day)
+        PT._record_lot(self.conn, account, {"code": CODE, "name": NAME}, qty, price,
+                       when, order_id=None, cycle_id=self.cycle1)
+        PT._sync_positions(self.conn, ACCOUNT, when)
+        self.conn.commit()
+
+    def sell_order(self, qty, *, cycle_id=None):
+        stamp = PT._strategy_stamp(self.conn, ACCOUNT)
+        cur = self.conn.execute(
+            "INSERT INTO paper_orders(account_id,side,code,name,qty,planned_price,status,"
+            "reason,risk_payload,created_at,origin,strategy_id,strategy_version,"
+            "strategy_checksum,cycle_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (ACCOUNT, "sell", CODE, NAME, qty, 13.0, "pending_limit", "manual_sell",
+             "{}", "2026-09-05 10:00:00", "manual", *stamp, cycle_id or self.cycle1),
+        )
+        self.conn.commit()
+        return int(cur.lastrowid)
+
+    def commit_sell(self, order_id, qty, *, price=13.0, day="2026-09-05"):
+        with mock.patch.object(PT, "_completed_kline", return_value=None):
+            return EP.commit_fill(
+                self.conn, account={"id": ACCOUNT},
+                plan={"side": "sell", "code": CODE, "qty": qty, "fill_price": price,
+                      "amount": qty * price, "fees": 5.0, "quote_at": None, "risk": {}},
+                order_id=order_id, asof_day=dt.date.fromisoformat(day),
+                reserved=True, action="manual_filled", reason="测试手动卖出",
+            )
+
+    def remaining_lots(self):
+        return PPRS.remaining_qty(
+            self.conn, cycle_id=self.cycle1, account_id=ACCOUNT, code=CODE)
+
+    # ── 用例 ─────────────────────────────────────────────────────────────
+    def test_execution_planner_full_sell_deletes_position_risk_state(self):
+        self.buy(100, 10.0)
+        self.assertIsNotNone(self.state_row(self.cycle1), "夹具未建立 episode 状态")
+        order = self.sell_order(100)
+
+        self.commit_sell(order, 100)
+        self.conn.commit()
+
+        self.assertEqual(self.remaining_lots(), 0, "权威 lots 未清零")
+        self.assertIsNone(self.state_row(self.cycle1),
+                          "execution_planner 全仓卖出后 episode 风险状态残留")
+        row = self.conn.execute(
+            "SELECT status,qty,execution_verified FROM paper_orders WHERE id=?",
+            (order,)).fetchone()
+        self.assertEqual(row["status"], "filled")
+        self.assertEqual(int(row["qty"]), 100)
+        self.assertEqual(int(row["execution_verified"] or 0), 1, "成交未盖章")
+
+    def test_execution_planner_partial_sell_preserves_position_risk_state(self):
+        """反向 guard：不是"任何卖出都 delete"。"""
+        self.buy(200, 10.0)
+        PPRS.update_peak(
+            self.conn, cycle_id=self.cycle1, account_id=ACCOUNT, code=CODE,
+            peak_price=13.0)
+        PPRS.update_take_stage(
+            self.conn, cycle_id=self.cycle1, account_id=ACCOUNT, code=CODE,
+            take_stage=1)
+        self.conn.commit()
+        order = self.sell_order(100)
+
+        self.commit_sell(order, 100)
+        self.conn.commit()
+
+        self.assertEqual(self.remaining_lots(), 100)
+        row = self.state_row(self.cycle1)
+        self.assertIsNotNone(row, "部分卖出的手动委托把 episode 关掉了")
+        self.assertAlmostEqual(float(row["peak_price"]), 13.0)
+        self.assertEqual(int(row["take_stage"]), 1, "手动部分卖出重置了止盈档位")
+
+    def test_full_exit_then_same_cycle_reentry_starts_fresh_episode(self):
+        with mock.patch.object(PPRS, "_now", return_value="2026-09-01 10:00:00"):
+            self.buy(100, 10.0)
+        PPRS.update_take_stage(
+            self.conn, cycle_id=self.cycle1, account_id=ACCOUNT, code=CODE,
+            take_stage=2)
+        self.conn.commit()
+        self.assertEqual(str(self.state_row(self.cycle1)["initialized_at"]),
+                         "2026-09-01 10:00:00")
+
+        order = self.sell_order(100)
+        self.commit_sell(order, 100, price=12.0)
+        self.conn.commit()
+        self.assertEqual(self.remaining_lots(), 0)
+        self.assertIsNone(self.state_row(self.cycle1), "full exit 未删除状态")
+
+        # same-cycle re-entry：走真实 BUY 生产路径，必须拿到全新 episode。
+        with mock.patch.object(PPRS, "_now", return_value="2026-09-12 10:00:00"):
+            self.buy(100, 15.0, day="2026-09-11")
+        row = self.state_row(self.cycle1)
+        self.assertIsNotNone(row, "re-entry 未建立新 episode")
+        self.assertAlmostEqual(float(row["peak_price"]), 15.0, "re-entry 继承了旧 peak")
+        self.assertEqual(int(row["take_stage"]), 0, "re-entry 继承了旧档位")
+        self.assertEqual(str(row["initialized_at"]), "2026-09-12 10:00:00",
+                         "re-entry 复用了旧 episode 的起点时间（旧行没被清掉）")
+        self.assertEqual(int(self.state_count()), 1)
+
+    def test_buy_through_commit_fill_records_the_source_order(self):
+        """BUY 侧生命周期同样只有一条入口：``_record_lot``（§21）。"""
+        stamp = PT._strategy_stamp(self.conn, ACCOUNT)
+        cur = self.conn.execute(
+            "INSERT INTO paper_orders(account_id,side,code,name,qty,planned_price,status,"
+            "reason,risk_payload,created_at,origin,strategy_id,strategy_version,"
+            "strategy_checksum,cycle_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (ACCOUNT, "buy", CODE, NAME, 100, 10.0, "pending_limit", "manual_buy",
+             "{}", "2026-09-05 10:00:00", "manual", *stamp, self.cycle1),
+        )
+        order = int(cur.lastrowid)
+        self.conn.commit()
+
+        with mock.patch.object(PT, "_completed_kline", return_value=None):
+            EP.commit_fill(
+                self.conn, account={"id": ACCOUNT},
+                plan={"side": "buy", "code": CODE, "qty": 100, "fill_price": 10.0,
+                      "amount": 1000.0, "fees": 5.0, "quote_at": None, "risk": {}},
+                order_id=order, asof_day=dt.date.fromisoformat("2026-09-01"),
+                reserved=True, action="manual_filled", reason="测试手动买入",
+            )
+        self.conn.commit()
+
+        row = self.state_row(self.cycle1)
+        self.assertIsNotNone(row, "verified BUY 未建立 episode 状态")
+        self.assertAlmostEqual(float(row["peak_price"]), 10.0)
+        self.assertEqual(int(row["take_stage"]), 0)
+        self.assertEqual(int(row["opened_order_id"]), order,
+                         "episode 出处不是本笔 verified 买单")
+
+
+class _ProductionRiskScanCase(unittest.TestCase):
+    """复用 ``test_paper_risk_exit_production_path`` 的**已验证**生产夹具。
+
+    真实风控扫描需要：新鲜且通过双源校验的行情、running 账户、真实 seed 买单
+    + fill + lot。这些闸门那个文件已经证明可用；这里借用而不是复制，以免两边
+    的夹具漂移。
+    """
+
+    ACCOUNT = "tq_breakout"
+
+    def setUp(self):
+        import test_paper_risk_exit_production_path as RISK
+
+        self._inner = RISK.TestPaperRiskExitProductionPath(
+            "test_A_normal_running_account_full_risk_exit_pipeline")
+        self._inner.setUp()
+        self.addCleanup(self._inner.doCleanups)
+        self.addCleanup(self._inner.tearDown)
+        self.day = self._inner.day
+        self.code = self._inner.code
+        self.cycle = 1
+        self.conn = sqlite3.connect(PT.DB_PATH)
+        self.conn.row_factory = sqlite3.Row
+        self.addCleanup(self.conn.close)
+
+    # ── 夹具 ─────────────────────────────────────────────────────────────
+    def add_lot(self, qty, cost):
+        """真实 lot + **真实权威 API** 建立同周期 episode 风险状态行。"""
+        self._inner._insert_lot(self.ACCOUNT, self.code, qty, cost)
+        PPRS.initialize_episode(
+            self.conn, cycle_id=self.cycle, account_id=self.ACCOUNT,
+            code=self.code, peak_price=cost)
+        self.conn.commit()
+
+    def state_row(self):
+        return self.conn.execute(
+            "SELECT * FROM paper_position_risk_state"
+            " WHERE cycle_id=? AND account_id=? AND code=?",
+            (self.cycle, self.ACCOUNT, self.code)).fetchone()
+
+    def remaining_lots(self):
+        return PPRS.remaining_qty(
+            self.conn, cycle_id=self.cycle, account_id=self.ACCOUNT, code=self.code)
+
+    def sell_orders(self):
+        return self.conn.execute(
+            "SELECT id,qty,status,execution_verified FROM paper_orders"
+            " WHERE account_id=? AND side='sell' ORDER BY id", (self.ACCOUNT,)).fetchall()
+
+    def sell_fills(self):
+        return self.conn.execute(
+            "SELECT order_id,qty,price FROM paper_fills"
+            " WHERE account_id=? AND side='sell' ORDER BY id", (self.ACCOUNT,)).fetchall()
+
+
+class RiskScanFullExitClosesEpisode(_ProductionRiskScanCase):
+    """A —— 风控扫描（``PT.monitor_risk``）的真实全仓退出。"""
+
+    def test_risk_full_exit_deletes_position_risk_state(self):
+        self.add_lot(100, 10.0)
+        self.assertIsNotNone(self.state_row(), "夹具未建立 episode 风险状态")
+        # 现价 9.0 / 成本 10 ⇒ -10% 击穿硬止损，ratio=100% ⇒ 整仓退出。
+        self._inner._set_fresh_exit_quote(self.code, price=9.0, pct=-8.0)
+
+        res = PT.monitor_risk(self.day)
+
+        self.assertEqual(res.get("slot"), "risk")
+        filled = [o for o in res.get("orders", []) if o.get("status") == "filled"]
+        self.assertEqual(len(filled), 1, f"风控扫描未产生全仓成交：{res.get('orders')}")
+        self.assertEqual(int(filled[0]["qty"]), 100)
+
+        orders = self.sell_orders()
+        self.assertEqual(len(orders), 1, "风控退出的卖出委托数量异常")
+        self.assertEqual(int(orders[0]["execution_verified"] or 0), 1,
+                         "风控退出成交未盖章（会被执行闸门剔除）")
+        self.assertEqual(len(self.sell_fills()), 1)
+        self.assertEqual(self.remaining_lots(), 0, "权威 lots 未清零")
+        self.assertIsNone(self.state_row(), "full exit 后 episode 风险状态残留")
+
+
+class IntradaySellClosesEpisode(_ProductionRiskScanCase):
+    """D / E —— 日内高抛（``PT._intraday_sell``）的真实生产路径。
+
+    ``available == LOT_SIZE`` 时 ``qty = max(LOT_SIZE, …) = LOT_SIZE``，即
+    "一手仓的高抛就是整仓清空" —— 这条路径同样必须以 full exit 收尾。
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.conn.execute("UPDATE paper_accounts SET mode='intraday_t' WHERE id=?",
+                          (self.ACCOUNT,))
+        self.conn.commit()
+
+    def _set_t_sell_quote(self, *, price=11.0, high=11.5, prev_close=11.0):
+        """构造通过做T卖点门槛的行情：峰值 4.5%↑ + 回撤 4.3% + 收益 10%。"""
+        self._inner.quotes_map[self.code] = {
+            "code": self.code, "name": f"测试股_{self.code}", "price": price,
+            "high": high, "low": round(price - 0.2, 4), "pct": 0.0,
+            "prev_close": prev_close, "amount": 100000.0, "volume": 10000.0,
+            "turnover": 1.0, "quote_source": "live",
+            "quote_at": f"{self.day.isoformat()} 10:30:00",
+            "quote_validation": "cross_source_checked",
+        }
+
+    def _drive(self):
+        """驱动真实生产入口 ``_intraday_sell``（非 opening_event 分支）。"""
+        account = dict(self.conn.execute(
+            "SELECT * FROM paper_accounts WHERE id=?", (self.ACCOUNT,)).fetchone())
+        cycle = PT._active_cycle(self.conn)
+        positions = PT._position_rows(self.conn, self.ACCOUNT, self.day)
+        self.assertEqual(len(positions), 1, "夹具应恰好产出一条持仓")
+        with mock.patch.object(PT, "_completed_kline", return_value=None):
+            action, reason = PT._intraday_sell(
+                self.conn, account, dict(positions[0]),
+                dict(self._inner.quotes_map[self.code]), self.day,
+                PT._risk_profile(account, conn=self.conn), cycle,
+            )
+        self.conn.commit()
+        return action, reason
+
+    def test_intraday_full_sell_deletes_position_risk_state(self):
+        self.add_lot(100, 10.0)
+        self._set_t_sell_quote()
+        self.assertIsNotNone(self.state_row())
+
+        action, reason = self._drive()
+
+        self.assertIsNotNone(action, f"日内高抛未成交：{reason}")
+        self.assertEqual(int(action["qty"]), 100)
+        self.assertEqual(len(self.sell_fills()), 1, "高抛成交流水缺失")
+        self.assertEqual(self.remaining_lots(), 0, "100 股全卖后权威 lots 未清零")
+        self.assertIsNone(self.state_row(), "100 股全卖后 episode 风险状态残留")
+
+    def test_intraday_partial_sell_preserves_position_risk_state(self):
+        self.add_lot(500, 10.0)
+        PPRS.update_peak(
+            self.conn, cycle_id=self.cycle, account_id=self.ACCOUNT,
+            code=self.code, peak_price=13.0)
+        PPRS.update_take_stage(
+            self.conn, cycle_id=self.cycle, account_id=self.ACCOUNT,
+            code=self.code, take_stage=1)
+        self.conn.commit()
+        self._set_t_sell_quote()
+
+        action, reason = self._drive()
+
+        self.assertIsNotNone(action, f"日内高抛未成交：{reason}")
+        self.assertEqual(int(action["qty"]), 100)          # int(500*30%/100)*100
+        self.assertEqual(self.remaining_lots(), 400)
+        row = self.state_row()
+        self.assertIsNotNone(row, "部分高抛把 episode 关掉了")
+        self.assertAlmostEqual(float(row["peak_price"]), 13.0)
+        self.assertEqual(int(row["take_stage"]), 1, "无档位事实的部分高抛改了档位")
 
 
 if __name__ == "__main__":

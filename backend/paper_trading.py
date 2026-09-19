@@ -43,6 +43,7 @@ def _get_se():
 
 import paper_storage as PST
 import paper_position_read_model as PPRM
+import paper_position_risk_state as PPRS
 import paper_repository as PRP
 import paper_performance as PPerf
 import paper_schema_migrations as PSM
@@ -1838,8 +1839,7 @@ def init_db():
                 # 新建库的 executescript 建表块，新增列/约束必须在这里显式迁移，
                 # 否则线上库永远缺 cycle_id 与含周期的唯一契约。
                 PSM.ensure_rebalance_state_cycle_ownership(conn)
-                # R14（v20）：cycle-owned 持仓运行时风险状态表。既有账本同样
-                # 走这条快路径，新表必须在这里显式补建（幂等、绝不回填）。
+                # R14（v20）：既有账本走这条快路径，新表必须显式补建（幂等、不回填）。
                 PSM.ensure_position_risk_state(conn)
                 _ensure_accounts(conn)
                 _ensure_user_strategy_accounts(conn)
@@ -2135,8 +2135,7 @@ def init_db():
         SR.ensure_schema(conn)
         PSM.ensure_strategy_reference_columns(conn)
         PSM.ensure_order_cycle_provenance(conn)
-        # R14（v20）：cycle-owned 持仓运行时风险状态表（DDL 单一事实来源在
-        # paper_schema_migrations，这里显式调用以保证新库也具备该表）。
+        # R14（v20）：DDL 单一事实来源在 paper_schema_migrations，这里显式调用。
         PSM.ensure_position_risk_state(conn)
         _ensure_accounts(conn)
         _ensure_user_strategy_accounts(conn)
@@ -3461,17 +3460,8 @@ def _today_sell_performance(sells, quotes, asof_day=None):
 def _sync_positions(conn, account_id=None, asof_day=None):
     """保留聚合表供旧接口兼容；交易结算逻辑只读取 lots。
 
-    R14 数据方向（唯一合法方向）::
-
-        authoritative lots + authoritative risk state
-                ↓
-        paper_positions compatibility projection
-
-    投影可以**接收**权威，但永远不能**创造**权威：本函数写入的 peak/take_stage
-    只是展示镜像，任何执行判定都不得再从 ``paper_positions`` 读回它们。
-    风险状态缺失的持仓（升级前遗留）在投影里物化为 ``take_stage=0``（该列
-    NOT NULL），这只是展示约定 —— 真实语义"未知"由读模型的 ``None`` +
-    ``risk_state_source`` 表达。
+    R14 数据方向（唯一合法方向）：权威 lots + 权威 risk state → 本投影。投影可以
+    **接收**权威，永远不能**创造**权威；这里写的 peak/take_stage 只是展示镜像。
     """
     positions = _position_rows(conn, account_id, asof_day)
     if account_id:
@@ -3561,97 +3551,26 @@ def _record_lot(conn, account, signal, qty, fill_price, asof_day, order_id=None,
         cycle_id = _order_cycle_id(conn, cycle_id)
     asset_type = _asset_type(signal.get("code"), signal.get("name"))
     available = _date(asof_day) if asset_type == "etf_t0" else _next_weekday(asof_day)
-    # R14：position episode 边界。同一 (cycle, account, code) 在本笔 verified
-    # BUY 成交前 remaining_qty 之和为 0（无 lot 或已全部卖光）⇒ 全新 episode：
-    # runtime 风险状态必须以本笔成交价初始化（peak=成交价、stage=0、
-    # opened_order_id=来源订单），绝不能继承旧周期 / 旧 episode 的 peak/take_stage。
-    # remaining_qty>0 ⇒ 同一 episode 的追加 lot：take_stage 保持、peak 只允许
-    # 吸收（max）；行缺失（升级前遗留持仓第一次被加仓）时不创建 —— "未知"
-    # 保持未知，由读模型 fail-safe，绝不用投影元数据冒充权威。
-    prior_qty = int(conn.execute(
-        "SELECT COALESCE(SUM(remaining_qty),0) FROM paper_position_lots"
-        " WHERE cycle_id=? AND account_id=? AND code=?",
-        (cycle_id, account["id"], signal["code"]),
-    ).fetchone()[0] or 0)
+    # R14：episode 边界。本笔成交前同 cycle 权威 remaining_qty 之和为 0 ⇒ 全新
+    # episode（peak=本笔成交价 / stage=0）；>0 ⇒ 同 episode 加仓，stage 保持、
+    # peak 只升不降。判定统一走 risk-state 模块的权威聚合，不在这里另写一份 SQL。
+    prior_qty = PPRS.remaining_qty(
+        conn, cycle_id=cycle_id, account_id=account["id"], code=signal["code"])
     conn.execute(
         """INSERT INTO paper_position_lots(cycle_id,account_id,code,name,industry,qty,remaining_qty,cost,acquired_at,available_date,asset_type,source_order_id,cost_fee_included,is_t_base)
            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (cycle_id, account["id"], signal["code"], signal.get("name"), signal.get("industry"), int(qty), int(qty),
          fill_price + _num(fees) / max(int(qty), 1), _now(), available.isoformat(), asset_type, order_id, 1, int(bool(is_t_base))),
     )
+    # 生命周期初始化/吸收由 paper_position_risk_state 持有；只传已证明的 cycle。
     if prior_qty <= 0:
-        init_position_risk_state(
+        PPRS.initialize_episode(
             conn, cycle_id=cycle_id, account_id=account["id"], code=signal["code"],
             peak_price=fill_price, opened_order_id=order_id)
     else:
-        update_position_peak(
+        PPRS.update_peak(
             conn, cycle_id=cycle_id, account_id=account["id"], code=signal["code"],
             peak_price=fill_price)
-
-
-def init_position_risk_state(conn, *, cycle_id, account_id, code, peak_price,
-                             opened_order_id=None):
-    """verified BUY ``0 -> >0`` 的 position episode 初始化（R14 §17）。
-
-    ``peak_price`` = 本笔 verified 成交价、``take_stage`` = 0、
-    ``opened_order_id`` = 来源 verified 买单（直接建仓路径无订单时诚实留 NULL，
-    绝不从 active cycle / 日期 / ``MAX(order_id)`` 猜）。
-
-    ``INSERT OR REPLACE``：同一 ``(cycle_id, account_id, code)`` 上任何残留行
-    （上一 episode 未被显式清理的防御性兜底）都不得继承给新 episode ——
-    full exit 后的 same-cycle re-entry 必须拿到全新状态（R14 §20 / PRS-10）。
-    必须与成交结算处于同一事务（调用方负责，本函数只写）。
-    """
-    now = _now()
-    conn.execute(
-        """INSERT OR REPLACE INTO paper_position_risk_state(
-               cycle_id,account_id,code,peak_price,take_stage,opened_order_id,
-               initialized_at,updated_at)
-           VALUES(?,?,?,?,?,?,?,?)""",
-        (cycle_id, account_id, code, float(peak_price), 0, opened_order_id, now, now),
-    )
-
-
-def update_position_peak(conn, *, cycle_id, account_id, code, peak_price):
-    """峰值吸收：cycle-scoped、只升不降（R14 §15/§18）。
-
-    调用方必须显式传 ``cycle_id``（write-time provenance），helper 内**绝不**
-    重新 resolve current active cycle。行不存在 ⇒ no-op：初始化只发生在
-    verified BUY 的 episode 生命周期里（§22），扫描/读取路径绝不创造权威状态；
-    缺行持仓的 peak 维持读模型的成本锚（与全新 episode 默认一致）。
-    """
-    conn.execute(
-        "UPDATE paper_position_risk_state SET peak_price=MAX(peak_price,?),updated_at=?"
-        " WHERE cycle_id=? AND account_id=? AND code=?",
-        (float(peak_price), _now(), cycle_id, account_id, code),
-    )
-
-
-def update_position_take_stage(conn, *, cycle_id, account_id, code, take_stage):
-    """阶梯止盈推进：cycle-scoped（R14 §16）。
-
-    调用方必须显式传 ``cycle_id`` —— 卖出订单本身已拥有 durable cycle
-    provenance（``sell_cycle_id``），写状态必须用同一个 cycle fact，绝不写时
-    再查 active cycle。行不存在（unknown stage）⇒ no-op：未知档位既不能被
-    推进，也不能被写成一个"有定义的 0"。
-    """
-    conn.execute(
-        "UPDATE paper_position_risk_state SET take_stage=?,updated_at=?"
-        " WHERE cycle_id=? AND account_id=? AND code=?",
-        (int(take_stage), _now(), cycle_id, account_id, code),
-    )
-
-
-def delete_position_risk_state(conn, *, cycle_id, account_id, code):
-    """full exit 结束本 position episode：runtime 风险状态一并关闭（R14 §19）。
-
-    首选最小实现是 DELETE（订单 / 成交 / 审计表已经保留历史事实）；same-cycle
-    re-entry 由 :func:`init_position_risk_state` 创建全新状态（PRS-10）。
-    """
-    conn.execute(
-        "DELETE FROM paper_position_risk_state WHERE cycle_id=? AND account_id=? AND code=?",
-        (cycle_id, account_id, code),
-    )
 
 
 def _latest_price_map(codes=None):
@@ -11555,11 +11474,9 @@ def _sell_plan(position, quote, asof_day, news, hard_stop_touched_today=False, s
     ret = price / cost - 1 if cost and price else None
     drawdown = 1 - price / peak if peak and price else None
     days = _hold_days(position, asof_day)
-    # R14：take_stage 现在是 cycle-owned 风险状态的权威值。本周期没有风险
-    # 状态行（升级前遗留持仓 / 无 episode 事实）时读模型给 ``None`` ——
-    # "未知"必须保持未知：跳过阶梯止盈（绝不猜一个档位而多卖），而
-    # hard stop / max hold / trailing（peak 缺失时锚定成本，与全新 episode
-    # 的默认一致）照常工作。``risk_state_source`` 由读模型显式标注。
+    # R14：take_stage 的权威在 cycle-owned 风险状态。本周期无状态行（遗留持仓）
+    # 时读模型给 ``None`` —— "未知"保持未知：跳过阶梯止盈（绝不猜档位多卖），
+    # hard stop / max hold / trailing（peak 缺失锚定成本）照常工作。
     raw_stage = position.get("take_stage")
     stage_known = raw_stage is not None
     next_stage = int(raw_stage) if stage_known else 0
@@ -11886,10 +11803,10 @@ def _monitor_risk_impl(asof_date=None):
                 else max(price, _num(quote.get("high"), 0.0))
             )
             if scan_peak > _num(position.get("peak_price"), 0):
-                # R14：峰值写入 cycle-owned 风险状态（write-time provenance 与
-                # 卖出路径同一个 cycle fact），绝不按 (account_id, code) 裸写
-                # paper_positions 投影 —— 那会把本周期峰值写进无身份的镜像。
-                update_position_peak(
+                # R14：峰值写入 cycle-owned 风险状态，cycle 取与卖出路径同一个
+                # write-time provenance；绝不按 (account_id, code) 裸写无身份的
+                # paper_positions 投影。
+                PPRS.update_peak(
                     conn, cycle_id=_order_cycle_id(conn, cycle["id"]),
                     account_id=position["account_id"], code=position["code"],
                     peak_price=scan_peak,
@@ -12218,20 +12135,14 @@ def _monitor_risk_impl(asof_date=None):
                      *strategy_stamp, sell_cycle_id),
                 )
                 _credit_shared_cash(conn, amount - fees, position["account_id"])
-                # R14：风险状态写入 cycle-owned 表，cycle 用卖出订单自己的
-                # durable provenance（sell_cycle_id），绝不按 (account_id, code)
-                # 裸写 paper_positions 投影。full exit（本 position episode
-                # 结束）时关闭状态 —— 订单/成交/审计表已保留历史事实，
-                # same-cycle re-entry 将由 verified BUY 创建全新状态。
-                if position_closed:
-                    delete_position_risk_state(
-                        conn, cycle_id=sell_cycle_id,
-                        account_id=position["account_id"], code=position["code"])
-                else:
-                    update_position_take_stage(
-                        conn, cycle_id=sell_cycle_id,
-                        account_id=position["account_id"], code=position["code"],
-                        take_stage=next_stage)
+                # R14：**所有**生产 SELL 路径共用同一个 episode 收尾原语 ——
+                # finalizer 自己从权威 lots 判定同周期剩余量是否为 0，不从调用方
+                # 局部变量推断。full exit ⇒ 关闭状态；partial ⇒ 推进止盈档位。
+                PPRS.finalize_sell(
+                    conn, cycle_id=sell_cycle_id,
+                    account_id=position["account_id"], code=position["code"],
+                    next_take_stage=next_stage,
+                )
                 conn.execute("INSERT INTO paper_fills(order_id,account_id,side,code,qty,price,amount,fees,fill_date,quote_at,assumption) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
                              (cursor.lastrowid, position["account_id"], "sell", position["code"], qty, fill_price, amount, fees,
                               day.isoformat(), quote.get("quote_at") or _now(), "实时价 - 0.10% 滑点，含佣金及印花税"))
@@ -13352,6 +13263,13 @@ def _intraday_sell(conn, account, position, quote, asof_day, profile, cycle, ope
          "filled", order_reason, _json(payload), pnl, _now(), _now(), *strategy_stamp, sell_cycle_id),
     )
     _credit_shared_cash(conn, amount - fees, account["id"])
+    # R14：高抛同样是生产 SELL 路径。日内高抛没有档位推进事实 ⇒
+    # next_take_stage=None：部分卖保留状态，卖光最后一股权威 lot 时关闭 episode
+    # （available==100 时高抛即整仓清空的真实生产路径）。cycle 用 sell_cycle_id。
+    PPRS.finalize_sell(
+        conn, cycle_id=sell_cycle_id, account_id=account["id"],
+        code=position["code"],
+    )
     conn.execute("INSERT INTO paper_fills(order_id,account_id,side,code,qty,price,amount,fees,fill_date,quote_at,assumption) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
                  (cursor.lastrowid, account["id"], "sell", position["code"], qty, fill, amount, fees,
                  _date(asof_day).isoformat(), quote.get("quote_at"), "开盘/5分钟实时快照高抛，含滑点、佣金、印花税"))
