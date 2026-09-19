@@ -946,6 +946,35 @@ class TestRiskScanLifecycleProductionPath(PaperRiskExitProductionPathTestCase):
             "存在没有对应 failed 转换的 running 身份",
         )
 
+    # ── P7 ─────────────────────────────────────────────────────────────────
+    def test_RISK_SCAN_P7_completion_failure_does_not_orphan_running(self):
+        """completion 事务自身失败时，同一身份必须被推进到 failed。
+
+        若 completion 落在 try 之外，异常会绕过 fail 路径，durable 行就永远
+        停在 ``running`` —— 一个再也不会被推进的孤儿身份。
+        """
+        self._insert_lot("tq_breakout", self.code, 500, 10.0)
+        self._set_fresh_exit_quote(self.code, price=9.0, pct=-8.0)
+
+        boom = RuntimeError("injected completion failure")
+        real_complete = PT.PRSS.complete_scan
+
+        def failing_complete(*args, **kwargs):
+            raise boom
+
+        with mock.patch.object(PT.PRSS, "complete_scan", side_effect=failing_complete):
+            with self.assertRaises(RuntimeError):
+                PT.monitor_risk(self.day)
+        self.assertIs(PT.PRSS.complete_scan, real_complete)
+
+        runs = self._scan_runs()
+        self.assertEqual(len(runs), 1, "completion 失败产生了第二个 scan 身份")
+        self.assertEqual(
+            runs[0]["status"], "failed",
+            "completion 事务失败后 durable 行停在 running —— orphan 身份永远不会被推进",
+        )
+        self.assertFalse(any(r["status"] == "running" for r in runs))
+
 
 if __name__ == "__main__":
     unittest.main()

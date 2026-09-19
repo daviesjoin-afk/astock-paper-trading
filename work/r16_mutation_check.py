@@ -266,6 +266,32 @@ MUTATIONS = [
                 "test_rs12_migration_leaves_new_table_empty",
         "desc": "migration 从旧 paper_audit 回填 scan runs（伪造历史归属）",
     },
+    {
+        "id": "M-RS15",
+        "file": PAPER_TRADING_FILE,
+        "old": '        result = _monitor_risk_impl(asof_date, cycle_id=ident["cycle_id"])\n'
+               '        with _db(immediate=True, hot_path=True) as conn:\n'
+               '            _assert_active_lease(conn, "risk scan completion")\n'
+               '            PRSS.complete_scan(conn, **ident, finished_at=_now())\n'
+               '            _audit(conn, None, "risk_scan_completed", _json(dict(ident)))\n'
+               '        return result\n'
+               '    except Exception as exc:\n'
+               '        if _lease_lost(exc):\n'
+               '            raise\n'
+               '        try:\n'
+               '            with _db(immediate=True, hot_path=True) as conn:\n',
+        # 把 completion 移回 try 之外（评审指出的原始结构）：收尾事务自身失败时
+        # 异常绕过 fail 路径，durable 行永远停在 running。
+        "new": '        result = _monitor_risk_impl(asof_date, cycle_id=ident["cycle_id"])\n'
+               '    except Exception as exc:\n'
+               '        if _lease_lost(exc):\n'
+               '            raise\n'
+               '        try:\n'
+               '            with _db(immediate=True, hot_path=True) as conn:\n',
+        "test": f"{PRODUCTION_MODULE}.TestRiskScanLifecycleProductionPath."
+                "test_RISK_SCAN_P7_completion_failure_does_not_orphan_running",
+        "desc": "completion 移出受保护区域（收尾失败不再回落 fail，留下 orphan）",
+    },
 ]
 
 

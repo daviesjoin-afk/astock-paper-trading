@@ -12067,10 +12067,9 @@ def _monitor_risk_impl(asof_date=None, *, cycle_id):
 def monitor_risk(asof_date=None):
     """Run risk monitoring with a durable, cycle-owned scan identity.
 
-    R16：身份 ``(cycle_id, asof_date, scan_minute)`` 只解析一次并 durable 认领
-    （claim → 外部 I/O → assert_cycle_active → 执行 → complete）。``paper_audit``
-    只剩 observability，不再参与"是否执行风险订单"的判断；异常时先把**同一身份**
-    推进到 ``failed``，因此同分钟重试不会被 ``already_scanned`` 吞掉。
+    R16：身份 ``(cycle_id, asof_date, scan_minute)`` 只解析一次并 durable 认领；
+    ``paper_audit`` 只剩 observability，不再参与"是否执行风险订单"的判断；异常时
+    先把同一身份推进到 ``failed``，同分钟重试因此不会被 ``already_scanned`` 吞掉。
     """
     init_db()
     day = _date(asof_date)
@@ -12096,12 +12095,18 @@ def monitor_risk(asof_date=None):
         _audit(conn, None, "risk_scan_claimed", _json(dict(scan_context)))  # 仅可观测
     try:
         result = _monitor_risk_impl(asof_date, cycle_id=ident["cycle_id"])
+        with _db(immediate=True, hot_path=True) as conn:
+            _assert_active_lease(conn, "risk scan completion")
+            PRSS.complete_scan(conn, **ident, finished_at=_now())
+            _audit(conn, None, "risk_scan_completed", _json(dict(ident)))
+        return result
     except Exception as exc:
         if _lease_lost(exc):
             raise
         try:
             with _db(immediate=True, hot_path=True) as conn:
-                # 必须用**原来那个** identity：绝不重新取时钟。
+                # 必须用**原来那个** identity：绝不重新取时钟。completion 事务自身
+                # 异常也会走到这里，把仍 running 的同一身份推进到 failed（无 orphan）。
                 PRSS.fail_scan(conn, **ident, finished_at=_now(),
                                error=f"{type(exc).__name__}: {exc}")
                 _audit(conn, None, "risk_scan_failed", _json({
@@ -12112,11 +12117,6 @@ def monitor_risk(asof_date=None):
         except Exception:
             pass
         raise
-    with _db(immediate=True, hot_path=True) as conn:
-        _assert_active_lease(conn, "risk scan completion")
-        PRSS.complete_scan(conn, **ident, finished_at=_now())
-        _audit(conn, None, "risk_scan_completed", _json(dict(ident)))
-    return result
 
 
 def _cached_close_market(conn, day, *, allow_network=True):

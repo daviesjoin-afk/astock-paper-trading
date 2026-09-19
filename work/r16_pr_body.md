@@ -2,6 +2,39 @@
 
 `MERGE: NOT MERGED` · `DEPLOY: NOT DEPLOYED`
 
+## Review follow-up (round 2)
+
+An automated review of head `042fe1d` raised one actionable point, now fixed:
+
+> **Keep scan completion inside the failure handler** — if the completion
+> transaction raises a non-lease exception (`complete_scan`, the completion
+> audit, or the commit), the exception occurred *after* the surrounding `try`, so
+> `fail_scan` was never called and the durable row stayed `running` forever.
+
+Correct: the completion block sat **outside** the `try`, so a failure while
+finalising left exactly the orphan `running` identity this PR exists to
+eliminate. Completion now lives **inside** the guarded region, so any failure
+there — including `complete_scan`'s own CAS or the commit — falls through to
+`fail_scan` on the **same** identity:
+
+```python
+try:
+    result = _monitor_risk_impl(asof_date, cycle_id=ident["cycle_id"])
+    with _db(immediate=True, hot_path=True) as conn:
+        _assert_active_lease(conn, "risk scan completion")
+        PRSS.complete_scan(conn, **ident, finished_at=_now())
+        _audit(conn, None, "risk_scan_completed", _json(dict(ident)))
+    return result
+except Exception as exc:
+    ...
+    PRSS.fail_scan(conn, **ident, finished_at=_now(), error=...)
+    raise
+```
+
+New regression **RISK-SCAN-P7** pins it: inject a failure into `complete_scan`
+and assert the row ends `failed` (not `running`) with exactly one identity. New
+mutation **M-RS15** reverts completion to outside the `try` and P7 goes RED.
+
 ## Summary
 
 A risk scan's identity was **the machine minute and nothing else**. The dedupe
@@ -211,6 +244,8 @@ none — **not** "latest cycle").
     cycle, old identity `failed`
   - **RISK-SCAN-P5** failure → retry: `failed(attempt=1)` → `completed(attempt=2)`
   - **RISK-SCAN-P6** minute boundary leaves exactly one row, `failed`, no orphan
+  - **RISK-SCAN-P7** a failure while *finalising* (injected into `complete_scan`)
+    still lands on `failed` on the same identity — no orphan `running`
   - The old `_clear_audit_scan_marker` helper became `_clear_scan_run_state`:
     clearing the audit marker alone **no longer** opens the gate, which is the
     observable proof of the authority downgrade.
@@ -228,14 +263,14 @@ none — **not** "latest cycle").
 
 ## Non-vacuity (mutation check)
 
-`work/r16_mutation_check.py` injects **14 byte-level mutations** into real
+`work/r16_mutation_check.py` injects **15 byte-level mutations** into real
 production sources and requires the *specific* contract test to fail with
 `FAIL:`/`ERROR:` on that exact method (so an import/collection error cannot
 masquerade as a catch). Every file is restored byte-identically and verified by
 sha256 in a `finally` block.
 
 ```text
-RESULT: 14/14 mutations RED, all files restored byte-identical
+RESULT: 15/15 mutations RED, all files restored byte-identical
 ```
 
 | ID | Mutation | Caught by |
@@ -254,6 +289,7 @@ RESULT: 14/14 mutations RED, all files restored byte-identical
 | M-RS12 | `paper_audit` back as scan control authority | Guard 7f |
 | M-RS13 | `paper_risk_scan_state` imports `paper_trading` | Guard 7a |
 | M-RS14 | migration backfills from legacy `paper_audit` | RS-12 |
+| M-RS15 | completion moved outside the guarded region | RISK-SCAN-P7 |
 
 **M-RS9 / M-RS11 are real business mutations, not signature checks.** M-RS9
 deletes the fence and RISK-SCAN-P4 goes RED because the old snapshot reaches the
@@ -274,13 +310,13 @@ green.
 | Check | Result |
 |---|---|
 | `unittest backend.test_paper_risk_scan_state` | 35 tests OK |
-| `unittest backend.test_paper_risk_exit_production_path` | 21 tests OK |
+| `unittest backend.test_paper_risk_exit_production_path` | 22 tests OK |
 | `unittest backend.test_paper_trading_architecture_guard` | 23 tests OK |
 | targeted set (scan state + production + guard + risk state + risk decision) | 136 tests OK |
 | cycle/runtime regression set (12 modules) | 188 tests OK |
-| `unittest discover -s backend` | **3568 tests OK** (skipped=5) |
+| `unittest discover -s backend` | **3569 tests OK** (skipped=5) |
 | `work/r16_before_fix_repro.py` | base 4/4 REPRODUCED → fixed 0/4 |
-| `work/r16_mutation_check.py` | 14/14 RED, restore byte-identical |
+| `work/r16_mutation_check.py` | 15/15 RED, restore byte-identical |
 | `ruff check backend` | All checks passed |
 | `python -m compileall -q backend` | exit 0 |
 | `node --check` over `frontend/src/**/*.js` | 17 files, exit 0 |
