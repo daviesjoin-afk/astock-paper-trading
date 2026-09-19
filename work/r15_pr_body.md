@@ -150,6 +150,13 @@ RESULT: 12/12 mutations RED, all files restored byte-identical
 
 ## Verification (local)
 
+> **exact-head CI note**: `tests (3.11)`, `tests (3.12)` and `docker-smoke` are
+> RED on head `190da07` — all three fail on the *same single* test,
+> `test_rebalance_cycle_scope.SameDayRolloverKeepsBothRows.test_two_cycles_same_day_coexist`
+> (`[1] != [1, 2]`), an unmodified fixture from before this PR. `syntax`,
+> `quality`, `frontend`, `browser-e2e` and `Security Leak Scan` are all green.
+> Evidence and root cause below.
+
 | Check | Result |
 |---|---|
 | `unittest backend.test_paper_risk_decision` | 15 tests OK |
@@ -167,10 +174,29 @@ RESULT: 12/12 mutations RED, all files restored byte-identical
 
 `test_rebalance_cycle_scope.SameDayRolloverKeepsBothRows.test_two_cycles_same_day_coexist`
 fails on the **unmodified base SHA `06197d76`** as well (reproduced in a clean
-`git worktree` of the base commit). It is a date-brittle fixture in the rebalance
-scanner suite — unrelated to sell-risk decisions — and no CI run on master has
-observed it yet because it depends on the local machine date. Reported honestly
-rather than papered over; it is **out of scope** for this PR.
+`git worktree` of the base commit):
+
+```
+$ git worktree add --detach <tmp> 06197d76a218485c377ffb10eac77671b51f3b0d
+$ python -m unittest backend.test_rebalance_cycle_scope.SameDayRolloverKeepsBothRows.test_two_cycles_same_day_coexist
+AssertionError: Lists differ: [1] != [1, 2]
+FAILED (failures=1)
+```
+
+Root cause (date-brittle fixture, unrelated to sell-risk decisions):
+
+- the fixture seeds `scan_date="2026-09-19"` while `rebalance_scanner._date()`
+  (→ `_now().date()`) returns the **machine's local date**, and the scanner
+  writes rows with `today.isoformat()`;
+- once the machine date rolls past `2026-09-19`, the seeded row and today's row
+  land on different `scan_date` values, so the query only returns one row;
+- why no earlier CI run caught it: master's last green run was at
+  `2026-09-19T15:55Z` (Shanghai 23:55, 09-19) — still inside the fixture's day.
+  This PR's run at `2026-09-19T16:52Z` (Shanghai 00:52, **09-20**) crossed the
+  boundary, so the same suite now fails. It is a wall-clock leak in a *test
+  fixture*, not in the code under this PR.
+
+Reported honestly rather than papered over; it is **out of scope** for this PR.
 
 ## Documentation
 
