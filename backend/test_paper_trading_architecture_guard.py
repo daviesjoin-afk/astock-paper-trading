@@ -17,7 +17,11 @@ module**，domain implementation 也不能再长回 ``paper_trading.py``。Round
              扫描生命周期边界，且 ``paper_audit`` 不得再充当执行权威；
     Guard 8  position review 的评分/动作决策必须是零 I/O 纯域模块，入场模型分
              只能来自 episode provenance（``opened_order_id`` → verified BUY
-             order → 精确 ``signal_id``），且禁止 latest-signal 搜索回流。
+             order → 精确 ``signal_id``），且禁止 latest-signal 搜索回流；
+    Guard 9  replacement candidate 与 slot-upgrade 必须是 as-of / cycle 有界的：
+             候选 ``intended_date == asof_day`` 且 ``signal_date <= asof_day``，
+             历史 review 受 ``(cycle_id, review_date <= asof_day)`` 约束，
+             slot context / borrow / rollback 一律使用显式 ``cycle_id``。
 """
 import ast
 import re
@@ -32,6 +36,8 @@ RISK_DECISION_MODULE = "paper_risk_decision.py"
 RISK_SCAN_STATE_MODULE = "paper_risk_scan_state.py"
 POSITION_REVIEW_MODULE = "paper_position_review.py"
 REVIEW_EVIDENCE_MODULE = "paper_position_review_evidence.py"
+REPLACEMENT_MODULE = "paper_replacement_decision.py"
+REPLACEMENT_EVIDENCE_MODULE = "paper_replacement_evidence.py"
 
 RISK_STATE_TABLE = "paper_position_risk_state"
 RISK_SCAN_RUN_TABLE = "paper_risk_scan_runs"
@@ -51,6 +57,8 @@ DOMAIN_MODULES = (
     "paper_risk_scan_state.py",
     "paper_position_review.py",
     "paper_position_review_evidence.py",
+    "paper_replacement_decision.py",
+    "paper_replacement_evidence.py",
 )
 
 #: 历史上已有的例外。当前为空。新模块 ``paper_position_risk_state.py`` 永远不得
@@ -88,8 +96,8 @@ FORBIDDEN_PAPER_TRADING_DEFS = frozenset({
 #: ``paper_risk_scan_state.py`` 后基线持续向下 ratchet。以后只允许 same or
 #: lower：确有 facade wiring 要加，必须同时抽出别的函数保持不增长。
 #: 不要设计环境变量绕过 / ``skip if CI`` 之类的后门。
-PAPER_TRADING_LOC_BASELINE = 16134
-PAPER_TRADING_DEF_BASELINE = 283
+PAPER_TRADING_LOC_BASELINE = 16049
+PAPER_TRADING_DEF_BASELINE = 282
 
 #: Guard 4 —— 新模块允许出现的 import 根（stdlib）。
 ALLOWED_STDLIB_IMPORTS = frozenset({"__future__", "datetime", "typing", "sqlite3"})
@@ -102,6 +110,29 @@ POSITION_REVIEW_ALLOWED_IMPORTS = frozenset({"__future__", "dataclasses", "typin
 
 #: Guard 8 —— evidence resolver 允许的 import 根（含仓库唯一的 verified 判据）。
 REVIEW_EVIDENCE_ALLOWED_IMPORTS = frozenset({"__future__", "sqlite3", "execution_verification"})
+
+#: Guard 9 —— 纯 replacement 决策域允许的 import 根（仅 stdlib）。
+REPLACEMENT_ALLOWED_IMPORTS = frozenset({"__future__", "dataclasses", "json", "typing"})
+
+#: Guard 9 —— replacement evidence 只允许 sqlite conn + stdlib（零反向依赖、零时钟）。
+REPLACEMENT_EVIDENCE_ALLOWED_IMPORTS = frozenset({"__future__", "sqlite3"})
+
+#: Guard 9 —— ``paper_trading`` 里不得再出现的 latest-signal / next-day-range 形状。
+FORBIDDEN_REPLACEMENT_SHAPES = (
+    "ORDER BY signal_date DESC",
+    "intended_date>=",
+    "intended_date<=",
+)
+
+#: Guard 9 —— 旧候选评分 helper 必须迁出后不得回流。
+FORBIDDEN_REPLACEMENT_DEFS = frozenset({"_replacement_score_from_signal"})
+
+#: Guard 9 —— 这些函数必须显式接收 cycle_id，函数体内不得再解析 active cycle。
+EXPLICIT_CYCLE_FUNCTIONS = (
+    "_slot_upgrade_context",
+    "_apply_slot_borrow",
+    "_rollback_slot_borrow",
+)
 
 #: Guard 6 —— 纯决策边界不得触碰的任何 I/O / 时钟 API 名（属性名或调用名）。
 FORBIDDEN_IO_CALLS = frozenset({
@@ -643,6 +674,256 @@ class PositionReviewIsProvenanceBound(unittest.TestCase):
         self.assertIn("review_date", code)
         self.assertIn("ValueError", code,
                       "review_date 缺失必须 fail fast，不得静默猜日期")
+
+
+class ReplacementIsAsOfAndCycleBound(unittest.TestCase):
+    """Guard 9 —— replacement / slot-upgrade 必须是 as-of 与 cycle 有界的。
+
+    为什么需要它：R18 之前，一个 risk pass 可以选中 **intended_date = 明天** 的
+    signal 作为今天的替补，用它的分数优势触发**今天的** consolidation_exit；随后
+    真实 ``_buy_order`` 又因 ``signal_freshness`` 要求 ``intended_date == asof_day``
+    把同一个 signal 打成 expired —— 今天纯粹为明天的候选卖了仓。同一批 helper 还
+    会自己 ``_active_cycle()`` 并读**没有 as-of 上界**的最新 review。把这三种形状
+    写回去，缺陷立刻复发。
+    """
+
+    def test_guard9a_pure_replacement_module_has_zero_project_imports(self):
+        project = {path.stem for path in BACKEND.glob("*.py")}
+        roots = _imported_roots(_tree(REPLACEMENT_MODULE))
+        leaked = sorted(roots & (project - {Path(REPLACEMENT_MODULE).stem}))
+        self.assertEqual(leaked, [], f"{REPLACEMENT_MODULE} 依赖了项目模块 {leaked}")
+        self.assertEqual(sorted(roots - REPLACEMENT_ALLOWED_IMPORTS), [],
+                         "出现了未登记的 import 根")
+
+    def test_guard9b_pure_replacement_module_performs_no_io_or_clock(self):
+        tree = _tree(REPLACEMENT_MODULE)
+        leaked_io = sorted(_call_names(tree) & FORBIDDEN_IO_CALLS)
+        leaked_clock = sorted(_call_names(tree) & FORBIDDEN_CLOCK_ATTRS)
+        self.assertEqual(leaked_io, [], f"{REPLACEMENT_MODULE} 出现 I/O {leaked_io}")
+        self.assertEqual(leaked_clock, [],
+                         f"{REPLACEMENT_MODULE} 读取系统时钟 {leaked_clock}")
+
+    def test_guard9c_replacement_evidence_has_no_reverse_dependency(self):
+        roots = _imported_roots(_tree(REPLACEMENT_EVIDENCE_MODULE))
+        self.assertNotIn("paper_trading", roots,
+                         "replacement evidence 不得反向 import paper_trading")
+        self.assertEqual(sorted(roots - REPLACEMENT_EVIDENCE_ALLOWED_IMPORTS), [],
+                         "出现了未登记的 import 根")
+        leaked_clock = sorted(_call_names(_tree(REPLACEMENT_EVIDENCE_MODULE))
+                              & FORBIDDEN_CLOCK_ATTRS)
+        self.assertEqual(leaked_clock, [],
+                         f"{REPLACEMENT_EVIDENCE_MODULE} 读取系统时钟 {leaked_clock}")
+
+    def test_guard9d_candidate_query_is_not_a_next_day_range(self):
+        body = _module_body(REPLACEMENT_EVIDENCE_MODULE)
+        self.assertNotIn("_next_weekday", body,
+                         "candidate 读取又出现了 next-day 推算")
+        self.assertNotIn("intended_date>=", body)
+        self.assertNotIn("intended_date<=", body)
+        self.assertIn("intended_date=?", body,
+                      "candidate 的 intended_date 必须是等式，不是 range")
+
+    def test_guard9e_candidate_has_an_asof_upper_bound(self):
+        body = _module_body(REPLACEMENT_EVIDENCE_MODULE)
+        self.assertIn("signal_date<=?", body,
+                      "candidate 读取缺少 signal_date <= asof 上界（future leakage）")
+
+    def test_guard9f_slot_context_cycle_id_is_required(self):
+        self._assert_kwonly_required("_slot_upgrade_context", "cycle_id")
+
+    def test_guard9g_slot_context_never_resolves_the_active_cycle(self):
+        self._assert_no_active_cycle("_slot_upgrade_context")
+
+    def test_guard9h_borrow_and_rollback_require_explicit_cycle(self):
+        for name in ("_apply_slot_borrow", "_rollback_slot_borrow"):
+            with self.subTest(function=name):
+                self._assert_kwonly_required(name, "cycle_id")
+                self._assert_no_active_cycle(name)
+
+    def test_guard9i_historical_review_read_is_bounded(self):
+        """evidence 的历史 review 读取必须同时有 cycle_id 与 review_date 上界。"""
+        body = _module_body(REPLACEMENT_EVIDENCE_MODULE)
+        self.assertIn("cycle_id=?", body)
+        self.assertIn("review_date<=?", body,
+                      "历史 review 缺少 review_date <= asof 上界（future leakage）")
+
+    def test_guard9j_legacy_replacement_score_helper_is_gone(self):
+        defined = _top_level_defs(_tree("paper_trading.py"))
+        self.assertEqual(sorted(defined & FORBIDDEN_REPLACEMENT_DEFS), [],
+                         "旧候选评分 helper 被搬回了 paper_trading.py；"
+                         "生产调用必须直接用 PRep.score_candidate")
+        raw = _source("paper_trading.py")
+        self.assertNotIn("_replacement_score_from_signal(", raw,
+                         "paper_trading.py 仍在调用已迁出的候选评分 helper")
+
+    def test_guard9k_replacement_candidate_never_uses_a_next_day_range(self):
+        """候选读取只允许 ``intended_date=?``；不得回到 today..next_day 的 range。
+
+        注意：``intended_date>=`` / ``intended_date<=`` 在仓库别处有**无关**的正当
+        用途（例如结算/归档窗口），因此这里只钉 replacement 候选这条读取路径。
+        """
+        raw = _source("paper_trading.py")
+        body = _function_source(ast.parse(raw), "_best_replacement_candidate", raw)
+        for shape in FORBIDDEN_REPLACEMENT_SHAPES:
+            self.assertNotIn(shape, body,
+                             f"_best_replacement_candidate 又出现 {shape!r}："
+                             "今天的替补必须属于今天，不能是 next-day range")
+        self.assertNotIn("_next_weekday", body,
+                         "_best_replacement_candidate 又在推算 next weekday")
+
+    def test_guard9k2_paper_trading_never_latest_signal_searches(self):
+        raw = _source("paper_trading.py")
+        hits = [
+            (number, line.strip())
+            for number, line in enumerate(raw.splitlines(), 1)
+            if "ORDER BY signal_date DESC" in line
+        ]
+        self.assertEqual(hits, [], f"latest-signal 排序回流到 paper_trading：{hits}")
+
+    def test_guard9l_candidate_selection_uses_the_evidence_layer_and_pure_module(self):
+        raw = _source("paper_trading.py")
+        body = _function_source(ast.parse(raw), "_best_replacement_candidate", raw)
+        self.assertIn("PREPL.load_replacement_candidates(", body,
+                      "候选读取没有经过 as-of 有界的 evidence 层")
+        self.assertIn("PRep.choose_best_candidate(", body,
+                      "候选排序没有交给纯域模块")
+
+    def test_guard9m_slot_chain_budget_uses_the_explicit_cycle(self):
+        """席位预算查询必须显式传 cycle_id（否则一次借位跨越两个周期）。
+
+        `_dynamic_position_limits()` 自身允许 `cycle_id=None`（= active cycle，冷启动
+        / 容量退出 / 面板读取的既有语义），但 ``_slot_upgrade_context`` /
+        ``_apply_slot_borrow`` 这条在途下单链**必须**把已认领周期传进去，否则
+        reviews / 持仓数看显式周期，而 target_limit / donors / allocation_version
+        看 active cycle —— 同周期借位会被错误拒绝。
+        """
+        raw = _source("paper_trading.py")
+        for name in ("_slot_upgrade_context", "_apply_slot_borrow"):
+            with self.subTest(function=name):
+                # 调用可能跨行，所以按空白归一化后再匹配调用形状。
+                flat = " ".join(_function_source(ast.parse(raw), name, raw).split())
+                self.assertIn(
+                    "_dynamic_position_limits( conn, cycle_id=resolved_cycle_id",
+                    flat,
+                    f"{name} 没有把显式 cycle 交给席位预算查询")
+        # pending 席位读取只发生在 _slot_upgrade_context：它一旦跨周期，active
+        # cycle 的在途买单就会占掉被请求周期的席位。
+        flat = " ".join(
+            _function_source(ast.parse(raw), "_slot_upgrade_context", raw).split())
+        self.assertIn(
+            "_pending_position_slots(conn, positions, cycle_id=resolved_cycle_id",
+            flat,
+            "_slot_upgrade_context 的 pending 席位仍然跨周期（active cycle 的在途"
+            "买单会占掉被请求周期的席位）")
+
+    def test_guard9n_cluster_evidence_follows_the_claimed_cycle(self):
+        """进入 fingerprint / allocation version 的簇证据也必须周期与 as-of 有界。
+
+        ``_dynamic_position_limits`` 允许 ``cycle_id=None``（= active cycle），但
+        ``_slot_upgrade_context`` / ``_apply_slot_borrow`` 传来的显式周期必须一路走到
+        **簇画像**：持仓走 ``positions_for_cycle``、signal 查询有 as-of 上界、成交序列
+        固定同一周期。否则 cycle 8 的预算行由 cycle 9 的持仓（甚至未来 signal）决定。
+        """
+        raw = _source("paper_trading.py")
+        profiles = _function_source(ast.parse(raw), "_strategy_cluster_profiles", raw)
+        self.assertIn("cycle_id=None", profiles,
+                      "_strategy_cluster_profiles 不再接受显式周期")
+        self.assertIn("PPRM.positions_for_cycle(", profiles,
+                      "簇画像的持仓读取没有固定到显式周期（会重新解析 active cycle）")
+        self.assertIn("intended_date<=?", profiles,
+                      "簇画像的 signal 查询缺少 as-of 上界（future leakage）")
+        self.assertIn("cycle_id=cycle_id", profiles,
+                      "簇画像的成交序列没有继承显式周期")
+        # 预算侧必须继续把已认领周期 / as-of 交给簇画像。
+        limits = " ".join(
+            _function_source(ast.parse(raw), "_dynamic_position_limits", raw).split())
+        self.assertIn("_strategy_cluster_factors( conn, asof_day, account_ids=account_ids,"
+                      " cycle_id=cycle_id,",
+                      limits,
+                      "_dynamic_position_limits 没有把显式周期/as-of 交给簇画像")
+
+    def test_guard9o_buy_order_capacity_reads_use_the_proven_cycle(self):
+        """开仓主路径 ``_buy_order`` 的容量读取也必须钉在已认领周期与 as-of 上。
+
+        这条路径与 ``_slot_upgrade_context`` 是两处独立的 wiring：``_buy_order``
+        已经解析过 ``current_cycle``（并据此拒绝了非本周期账户），因此它的
+        pending 席位读取与 allocation 预算都不能再回到"现在 active 的是谁"或
+        "机器今天"。漏了 pending 的 cycle ⇒ 上一个周期的在途单占掉本周期席位；
+        漏了预算的 as-of ⇒ 历史 as-of 下借位前后的版本号不一致。
+        """
+        raw = _source("paper_trading.py")
+        body = " ".join(
+            _function_source(ast.parse(raw), "_buy_order", raw).split())
+        self.assertIn(
+            "_pending_position_slots(conn, positions, cycle_id=current_cycle[\"id\"])",
+            body,
+            "_buy_order 的 pending 席位读取没有固定到已认领周期")
+        # 初次预算与借位后的 re-read 都必须是同一组 facts（cycle + as-of）。
+        # 归一化空白后按出现次数断言，避免依赖换行位置。
+        self.assertEqual(
+            2, body.count("cycle_id=current_cycle[\"id\"], asof_day=asof_day"),
+            "_buy_order 里带 (cycle, as-of) 的预算读取不是两次"
+            "（初次预算或借位后 re-read 漏传了 provenance）")
+
+    # ── 共用断言 ──────────────────────────────────────────────────────────
+    def _assert_kwonly_required(self, name, param):
+        tree = ast.parse(_source("paper_trading.py"))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.FunctionDef) or node.name != name:
+                continue
+            kwonly = [arg.arg for arg in node.args.kwonlyargs]
+            self.assertIn(param, kwonly,
+                          f"{name} 的 {param} 不是 keyword-only：归属必须显式传入")
+            self.assertIsNone(
+                node.args.kw_defaults[kwonly.index(param)],
+                f"{name} 的 {param} 带默认值：缺失必须 fail fast")
+            return
+        self.fail(f"paper_trading.py 里找不到 {name}")
+
+    def _assert_no_active_cycle(self, name):
+        raw = _source("paper_trading.py")
+        tree = ast.parse(raw)
+        node = _function_node(tree, name)
+        body = "\n".join(raw.splitlines()[node.lineno - 1:node.end_lineno])
+        # 只查**代码**：docstring 会引用旧实现（``_active_cycle()``）作为历史说明。
+        body = _strip_function_docstring(node, body)
+        code = "\n".join(
+            line for line in body.splitlines() if not line.strip().startswith("#")
+        )
+        self.assertNotIn("_active_cycle(", code,
+                         f"{name} 又自己解析 active cycle：一次在途下单的归属"
+                         "会被周期翻转掉包")
+
+
+def _function_node(tree, name):
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == name:
+            return node
+    raise AssertionError(f"未找到函数 {name}")
+
+
+def _strip_function_docstring(node, body):
+    """从函数源码里去掉它自己的 docstring（按 AST 行号切）。"""
+    statements = getattr(node, "body", None) or []
+    if not statements:
+        return body
+    first = statements[0]
+    if not (isinstance(first, ast.Expr) and isinstance(first.value, ast.Constant)
+            and isinstance(first.value.value, str)):
+        return body
+    lines = body.splitlines()
+    offset = first.end_lineno - node.lineno
+    return "\n".join(lines[:1] + lines[offset + 1:])
+
+
+def _module_body(name):
+    """模块 docstring 之外的**代码**（docstring 会引用旧 SQL 作为历史说明）。"""
+    raw = _source(name)
+    tree = ast.parse(raw)
+    first = tree.body[0]
+    if isinstance(first, ast.Expr):
+        return "\n".join(raw.splitlines()[first.end_lineno:])
+    return raw
 
 
 if __name__ == "__main__":
