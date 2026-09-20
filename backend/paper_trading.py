@@ -8194,7 +8194,7 @@ def _dynamic_position_limits(conn, *, cycle_id=None, asof_day=None):
     all_rows = _shared_account_rows(conn, cycle_id)
     running_rows = [row for row in all_rows if row.get("status") == "running"]
     rows = running_rows or all_rows
-    account_ids = [key for key in ACCOUNT_SPECS if any(row.get("id") == key for row in rows)]
+    account_ids = [str(row.get("id")) for row in rows if row.get("id")]
     if not account_ids and not explicit_empty_cycle:
         account_ids = list(ACCOUNT_SPECS)
     row_map = {row.get("id"): row for row in rows}

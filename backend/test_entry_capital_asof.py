@@ -15,6 +15,7 @@
     EC-9  intraday buyback 的预算带 (cycle, as-of)
     EC-10 swing scale-in 的预算带 (cycle, as-of)
     EC-20 dynamic position limits 的 (cycle, as-of, pinned version)
+    EC-20c user-only cycle 的 seat participants 必须来自 cycle ledger rows
 
 **概念区分**（规格 §29/§101）：participants / adaptive overlays / cluster 是
 **有界证据**；仍在 ``reserved`` 的共享现金是**全局经济义务**，故意不受周期
@@ -541,6 +542,50 @@ class DynamicPositionLimitsAreCycleAsOfBound(_CapitalCase):
         self.assertEqual({}, result["limits"], "idle cycle 注入了 builtin 席位")
         self.assertEqual({}, result["weights"], "idle cycle 注入了 builtin 权重")
         self.assertEqual(0, result["pool_limit"], "idle cycle 产生了非零 pool_limit")
+
+
+    def test_ec20c_user_only_cycle_participates_in_seat_budget(self):
+        """EC-20c —— explicit cycle 的参与者 authority 是 cycle ledger rows。"""
+        import strategy_registry as SR
+        user = "r19_user_only"
+        cycle = self.new_cycle(f"r19-ec20c-{self.cycle_id()}")
+        rule = {
+            "op": "gt", "left": {"op": "field", "name": "close"},
+            "right": {"op": "const", "value": 1},
+        }
+        metadata = {"style": "trend", "daily": True, "hold": 8, "positions": 3}
+        with PT._db(immediate=True) as conn:
+            SR.ensure_schema(conn)
+            SR.create_user_definition(
+                conn, user, "R19 user only", dsl_ast=rule,
+                metadata=metadata, actor="r19-test")
+            conn.execute(
+                "INSERT INTO paper_accounts(id,name,source_strategy,status,"
+                "initial_cash,cash,cycle_days,max_positions,max_weight,max_exposure,"
+                "version,created_at,updated_at,cycle_id,risk_profile) "
+                "VALUES(?,?,'strategy_dsl','running',0,0,8,3,0.32,0.9,'v0',?,?,?, 'trend')",
+                (user, user, f"{DAY.isoformat()} 00:00:00",
+                 f"{DAY.isoformat()} 00:00:00", int(cycle)),
+            )
+            conn.execute(
+                "UPDATE paper_cycles SET enabled_strategies=? WHERE id=?",
+                (PT._json([user]), int(cycle)))
+            SR.bind_cycle_versions(conn, int(cycle), [user])
+        with PT._db() as conn:
+            rows = PT._shared_account_rows(conn, cycle)
+            result = PT._dynamic_position_limits(
+                conn, cycle_id=cycle, asof_day=DAY)
+        self.assertEqual(
+            [user], [str(row.get("id")) for row in rows if row.get("id")],
+            "fixture 的 cycle ledger 没有只返回用户策略")
+        self.assertIn(user, result["weights"], "seat budget 丢掉了用户策略权重")
+        self.assertIn(user, result["limits"], "seat budget 丢掉了用户策略席位")
+        self.assertGreater(result["pool_limit"], 0, "用户策略没有获得可用 pool_limit")
+        for builtin in PT.ACCOUNT_SPECS:
+            self.assertNotIn(builtin, result["weights"],
+                             f"用户专属 cycle 错误注入了 builtin 权重：{builtin}")
+            self.assertNotIn(builtin, result["limits"],
+                             f"用户专属 cycle 错误注入了 builtin 席位：{builtin}")
 
 
 class CyclePinnedStrategyVersionIsUsed(_CapitalCase):

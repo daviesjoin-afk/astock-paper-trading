@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""R19 负向变异矩阵（M-ENT1 ~ M-ENT27）。
+"""R19 负向变异矩阵（M-ENT1 ~ M-ENT28）。
 
 每条变异都对应一条 R19 契约，必须让**对应**契约测试变红 —— 否则门禁是空的。
 
@@ -46,6 +46,7 @@
     M-ENT25 dynamic position limits runtime drops pinned inputs  -> EC-20
     M-ENT26 final BUY sizing profile 改回 current                -> EC-21
     M-ENT27 effective spec 改回 current effective_spec           -> EC-21
+    M-ENT28 seat participants 改回 ACCOUNT_SPECS 过滤            -> EC-20c
 
 用法（仓库根目录）::
 
@@ -463,6 +464,15 @@ MUTATIONS = [
         "test": f"{BUY_MODULE}.FinalSizingUsesCyclePinnedVersion."
                 "test_ec21_final_buy_sizing_uses_cycle_pinned_profile_and_spec",
         "desc": "final effective spec 退回 current compiled profile",
+    },
+    {
+        "id": "M-ENT28",
+        "file": PAPER_TRADING_FILE,
+        "old": "    account_ids = [str(row.get(\"id\")) for row in rows if row.get(\"id\")]\n",
+        "new": "    account_ids = [key for key in ACCOUNT_SPECS if any(row.get(\"id\") == key for row in rows)]\n",
+        "test": f"{CAPITAL_MODULE}.DynamicPositionLimitsAreCycleAsOfBound."
+                "test_ec20c_user_only_cycle_participates_in_seat_budget",
+        "desc": "seat participants 退回 ACCOUNT_SPECS 过滤（用户策略被丢掉）",
     },
 ]
 

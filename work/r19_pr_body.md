@@ -78,6 +78,7 @@ strategy_pool_budget explicit cycle/asof:   PASS
 allocation_plan explicit cycle/asof:        PASS
 dynamic position limits cycle/asof:         PASS
 dynamic position limits pinned runtime:     PASS
+user-only seat participants:                PASS
 final BUY sizing profile cycle/asof:        PASS
 final effective spec cycle-pinned:          PASS
 intraday buyback explicit cycle/asof:       PASS
@@ -201,7 +202,7 @@ PASS (test_replacement_asof_provenance, test_paper_replacement_decision,
 ## Mutation
 
 ```text
-M-ENT1..M-ENT27:      27/27 CAUGHT
+M-ENT1..M-ENT28:      28/28 CAUGHT
 survived:             0
 non-vacuity:          PASS
 restore bytes:        PASS
@@ -236,6 +237,7 @@ M-ENT24  RED  dynamic position limits risk profile drops cycle/as-of
 M-ENT25  RED  dynamic position limits runtime drops pinned inputs
 M-ENT26  RED  final BUY sizing profile falls back to current head
 M-ENT27  RED  final effective spec falls back to current compiled profile
+M-ENT28  RED  seat participants fall back to ACCOUNT_SPECS filtering
 ```
 
 ## paper_trading.py
@@ -252,9 +254,9 @@ wiring; the LOC ratchet (Guard 3) passes.
 ## Verification
 
 ```text
-architecture baseline:  PASS (Guard 1..Guard 10u)
+architecture baseline:  PASS (Guard 1..Guard 10v)
 Targeted:               PASS
-  test_entry_capital_asof (EC-1..EC-20)
+  test_entry_capital_asof (EC-1..EC-20c)
   test_strategy_buy_commit_convergence (SB-1..SB-16 + EC-21)
   test_paper_capital_reservations
   test_paper_trading_architecture_guard
@@ -291,6 +293,7 @@ Deploy:                 NOT DEPLOYED
 | 8 | Dynamic position/seat budget ignored `asof_day` / `cycle_id` and re-read current runtime context | `_dynamic_position_limits` passes `asof_day` / `conn` / `cycle_id` into `_risk_profile` and `profiles` / `cycle_id` into `_strategy_runtimes`; explicit idle cycle no longer injects builtins | EC-20, EC-20b, Guard 10t, M-ENT24, M-ENT25 |
 | 9 | Final BUY sizing profile still read current adaptive/current strategy state | `_buy_order` uses `_risk_profile(..., asof_day=asof_day, cycle_id=current_cycle["id"])` | EC-21, Guard 10u, M-ENT26 |
 | 10 | Final effective spec still read current compiled profile | `SRE.effective_spec_for_cycle` uses `compiled_profile_for_cycle`; `_buy_order` uses that helper | EC-21, Guard 10u, M-ENT27 |
+| 11 | User-only explicit cycle was filtered out of seat-budget participants by `ACCOUNT_SPECS` membership | `_dynamic_position_limits` derives participant ids directly from cycle ledger `rows`, so builtin and user strategies share the same seat-budget authority | EC-20c, Guard 10v, M-ENT28 |
 
 ## Authority matrix
 

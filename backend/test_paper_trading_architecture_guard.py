@@ -1220,6 +1220,16 @@ class EntryCapitalPlanningIsBounded(unittest.TestCase):
         self.assertNotIn("compiled_profile_for(conn,account_id)", helper,
                          "effective_spec_for_cycle 回退 current/latest profile")
 
+    def test_guard10v_seat_participants_come_from_cycle_ledger_rows(self):
+        """seat budget 的参与者必须是 cycle ledger rows，不能反向筛 ACCOUNT_SPECS。"""
+        body = self._flat("_dynamic_position_limits")
+        self.assertIn(
+            'account_ids=[str(row.get("id"))forrowinrowsifrow.get("id")]', body,
+            "seat budget 没有直接消费 cycle ledger rows")
+        self.assertNotIn(
+            "account_ids=[keyforkeyinACCOUNT_SPECS", body,
+            "seat budget 仍用 ACCOUNT_SPECS 过滤参与者：用户策略会被丢掉")
+
     # ── 普通 BUY 的 commit 收敛 ────────────────────────────────────────────
     def test_guard10i_normal_buy_order_has_no_direct_ledger_writes(self):
         """``_buy_order`` 不再直接写成交账本（§45、§76、§80）。
