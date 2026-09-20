@@ -1,4 +1,4 @@
-# A 股量化模拟盘引擎
+# A 股确定性量化策略研究与模拟交易平台
 
 [English](README_EN.md) · 中文
 
@@ -6,7 +6,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Python 3.11+](https://img.shields.io/badge/Python-3.11%2B-blue.svg)](https://www.python.org/)
 
-> **Local-first A-share paper-trading and strategy platform with declarative custom strategies, dynamic risk/allocation, T+1-aware execution, deterministic replay and auditable evolution.**
+> **Local-first A-share strategy research & paper-trading platform with declarative strategies, point-in-time evidence, verified execution, cycle-owned ledgers, deterministic risk/replay and auditable evolution.**
 
 一个面向中国 A 股微观交易规则的、本地优先的**量化模拟盘与策略平台**。项目把 T+1、整手、涨跌停、停牌、行情时效、费用/滑点、风险决策与审计回放直接放进撮合路径，而不是在回测结束后再做近似修正。
 
@@ -24,6 +24,26 @@
 
 细节见 [策略平台文档](docs/STRATEGY_PLATFORM.md)、[自进化架构](docs/EVOLUTION_ARCHITECTURE.md) 与 [架构说明](ARCHITECTURE.md)。
 
+## v2.0.0：确定性、可审计、Point-in-Time 正确的平台基线
+
+**v2.0.0** 是自 v1.3.0 以来的 major release：126 个 merged PR 把项目从“策略模拟盘 + 自进化”推进到强调**证据来源、历史可知性、执行真实性、周期归属和确定性决策**的研究平台。
+
+核心变化：
+
+- **动态策略平台**：Strategy Registry、不可变版本、声明式 DSL、统一 RuntimeContext、Strategy Workbench 与策略插件契约；
+- **中央执行契约**：OrderIntent / Execution Planner、N-strategy allocation、risk-based sizing、TTL/staged-entry 与跨策略敞口协调；
+- **Point-in-Time 研究**：可复现 dataset/evaluation、exact cutoff、purged walk-forward、candidate trace，历史决策不再消费未来事实；
+- **Historical Tradability**：事实 archive + ingestion audit + append-only observation ledger，区分事实生效时间、上游观察时间与本系统记录时间；
+- **Verified Execution**：`filled` 不再自动等于真实成交，收益/NAV/执行绩效以 verified fill evidence 为门槛；
+- **权威账本**：`paper_position_lots` 是当前持仓执行权威，legacy projection 不再决定“现在持有什么”；
+- **Cycle / as-of deterministic risk**：position episode、sell decision、risk scan、position review、replacement/slot upgrade 全部绑定明确 cycle 与 as-of；
+- **安全与可维护性**：统一 Operator Security Boundary、前端 feature modules、Playwright E2E、DataFeed/StrategyPlugin、强制 security leak scan。
+
+当前 paper schema 为 **v21**；无法可靠重建的历史 provenance 会保持 `unknown` / `NULL`，不会被“最新状态”猜测性补齐。
+
+完整升级说明、breaking behavior、验证结果以及 v1.3.0 之后全部 126 个 merged PR 索引见 **[v2.0.0 发布说明](docs/RELEASE-v2.0.0.md)**。
+
+
 ## 必须知道的六条平台语义
 
 1. **自定义策略不运行 Python**：用户策略只是声明式 DSL，由平台的白名单编译器与离线求值器执行。
@@ -37,7 +57,7 @@
 
 ## Dashboard 预览
 
-当前发布版本：**v1.3.0**（见 [GitHub Releases](https://github.com/daviesjoin-afk/astock-paper-trading/releases)；[CHANGELOG](CHANGELOG.md) 的详细条目截至 v1.2.0）。查看 [架构说明](ARCHITECTURE.md)、[策略平台](docs/STRATEGY_PLATFORM.md)、[仓库结构地图](docs/REPOSITORY_LAYOUT.md) 和 [安全边界](SECURITY.md)。CI 验证 Python 3.11/3.12；API 返回的历史内部版本 2.0.0 不代表 Release 标签。
+当前发布版本：**v2.0.0**（[完整发布说明](docs/RELEASE-v2.0.0.md) · [GitHub Releases](https://github.com/daviesjoin-afk/astock-paper-trading/releases) · [CHANGELOG](CHANGELOG.md)）。查看 [架构说明](ARCHITECTURE.md)、[策略平台](docs/STRATEGY_PLATFORM.md)、[仓库结构地图](docs/REPOSITORY_LAYOUT.md) 和 [安全边界](SECURITY.md)。CI 验证 Python 3.11/3.12、离线 Docker 全量回归、前端构建与 Chromium E2E。
 
 ![模拟盘 Dashboard 预览](docs/assets/dashboard.png)
 
@@ -137,7 +157,7 @@
 
 ```text
 backend/
-  paper_trading.py      撮合 / 风控 / 审计 / 资金 / slot 调度主引擎
+  paper_trading.py      兼容 facade + 交易/slot 应用编排（领域实现持续外移）
   strategy_registry.py  策略身份 · 不可变版本 · 生命周期状态机
   strategy_service.py   策略应用服务（HTTP 与领域之间唯一边界）
   strategy_dsl_*.py     声明式 DSL 的规范/校验与离线求值
