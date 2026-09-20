@@ -520,7 +520,7 @@ round-3 blockers are actually fenced rather than merely untested.
 | targeted set (7 modules incl. slot occupancy / position review) | 240 tests OK |
 | entry / slot / cycle regression set (11 modules) | 244 tests OK |
 | strategy + golden replay set (6 modules) | 99 tests OK |
-| `unittest discover -s backend` | **3721 tests OK** (skipped=5) |
+| `unittest discover -s backend` | **3723 tests OK** (skipped=5) |
 | `work/r18_before_fix_repro.py` | base 6/6 REPRODUCED → fixed 0/6 |
 | `work/r18_mutation_check.py` | 17/17 RED, restore byte-identical |
 | `ruff check backend` | All checks passed |
