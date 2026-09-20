@@ -174,8 +174,79 @@ class NoActiveCycleFailsClosed(_LedgerCase):
         conn = sqlite3.connect(":memory:")
         conn.row_factory = sqlite3.Row
         self.assertIsNone(PPRM.active_cycle_id(conn))
-        self.assertEqual(PPRM.current_positions(conn), [])
-        conn.close()
+
+
+class ExplicitCyclePositionReadTests(_LedgerCase):
+    """R16：``positions_for_cycle`` 是只读指定周期、绝不 fallback 的持仓读取。
+
+    这是风险扫描在外部 I/O 之后仍需精确回到**认领过的那个周期**的承重接口：
+    一条从 cycle A 开始的扫描必须能读到 A 的持仓，哪怕 A 已经 paused /
+    归档、B 已经是 active —— 它绝不能偷偷 fallback 成"现在 active 的周期"。
+
+    注意 active_cycle_id 的判据是 ``status IN ('draft','running','paused')``
+    （**不含** archived）取最大 id；paused 且 id 更大的周期仍算 active。
+    """
+
+    def _active_cycle_id(self):
+        return int(self.conn.execute(
+            "SELECT id FROM paper_cycles WHERE status IN ('draft','running','paused')"
+            " ORDER BY id DESC LIMIT 1").fetchone()[0])
+
+    def test_explicit_cycle_read_returns_only_requested_cycle(self):
+        running = int(self.cycle1)          # 初始 running 周期（id 最小）
+        old = self.add_cycle(status="paused")  # 更高 id 的 paused 周期 → active
+        self.add_lot(running, 100)
+        self.add_lot(old, 200)
+
+        exp = PPRM.positions_for_cycle(self.conn, running)
+        self.assertEqual(len(exp), 1)
+        self.assertEqual(int(exp[0]["qty"]), 100, "显式读取串进了别的周期")
+
+        # 显式读 paused 旧周期：即便它已不是 active，也要精确读到它的持仓
+        old_rows = PPRM.positions_for_cycle(self.conn, old)
+        self.assertEqual(len(old_rows), 1)
+        self.assertEqual(int(old_rows[0]["qty"]), 200)
+
+        # current_positions 只读 active（= paused 旧周期，因其 id 更大）
+        cur = PPRM.current_positions(self.conn)
+        self.assertEqual(len(cur), 1)
+        self.assertEqual(int(cur[0]["qty"]), 200)
+
+    def test_explicit_cycle_does_not_fallback_to_current(self):
+        old = self.add_cycle(status="paused", started_at="2026-09-18 09:30:00")
+        self.add_lot(old, 300)
+        # 把 old 归档，再另起一个 running 周期成为当前 active
+        self.conn.execute("UPDATE paper_cycles SET status='archived' WHERE id=?", (int(old),))
+        active = self.add_cycle(status="running", started_at="2026-09-20 09:30:00")
+        self.assertNotEqual(int(active), int(old))
+        self.conn.commit()
+
+        # active 已经是新周期，但显式读 old（已归档）仍应精确返回它的持仓
+        rows = PPRM.positions_for_cycle(self.conn, old)
+        self.assertEqual(
+            len(rows), 1,
+            "explicit cycle 读取 fallback 成了当前 active cycle（应该精确读旧周期）",
+        )
+        self.assertEqual(int(rows[0]["qty"]), 300)
+
+    def test_positions_for_cycle_rejects_none(self):
+        self.assertEqual(PPRM.positions_for_cycle(self.conn, None), [])
+
+    def test_positions_for_cycle_missing_cycle_is_empty(self):
+        self.assertEqual(PPRM.positions_for_cycle(self.conn, 99999), [])
+
+    def test_current_positions_delegates_to_same_aggregation(self):
+        """current_positions 与 positions_for_cycle 共用同一套聚合（只有周期来源不同）。"""
+        cid = self._active_cycle_id()
+        self.add_lot(cid, 150, code=CODE_B)
+        cur = PPRM.current_positions(self.conn)
+        exp = PPRM.positions_for_cycle(self.conn, cid)
+        self.assertEqual(len(cur), len(exp))
+        # 同一周期下两者逐行同构
+        by_code_c = {p["code"]: p for p in cur}
+        by_code_e = {p["code"]: p for p in exp}
+        for code in by_code_e:
+            self.assertEqual(int(by_code_c[code]["qty"]), int(by_code_e[code]["qty"]))
 
 
 class AccountIsolation(_LedgerCase):

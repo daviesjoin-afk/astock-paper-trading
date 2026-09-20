@@ -62,6 +62,7 @@ import paper_decision_audit as PDA
 import paper_slot_occupancy as PSO
 import paper_risk_exit_eligibility as PRE
 import paper_risk_decision as PRD
+import paper_risk_scan_state as PRSS
 import adaptive_selection_compat as ASC
 # ELC / EPD 仍被非 cleanup 路径使用（signal freshness、entry slice plan、
 # dispatch 规划与核验、gated order 查询）。清理动作已移交 paper_slot_service，
@@ -1842,6 +1843,7 @@ def init_db():
                 PSM.ensure_rebalance_state_cycle_ownership(conn)
                 # R14（v20）：既有账本走这条快路径，新表必须显式补建（幂等、不回填）。
                 PSM.ensure_position_risk_state(conn)
+                PSM.ensure_risk_scan_run_state(conn)  # R16 v21 风险扫描运行状态
                 _ensure_accounts(conn)
                 _ensure_user_strategy_accounts(conn)
                 _ensure_cycle(conn)
@@ -2138,6 +2140,7 @@ def init_db():
         PSM.ensure_order_cycle_provenance(conn)
         # R14（v20）：DDL 单一事实来源在 paper_schema_migrations，这里显式调用。
         PSM.ensure_position_risk_state(conn)
+        PSM.ensure_risk_scan_run_state(conn)  # R16 v21（DDL 只在 migration）
         _ensure_accounts(conn)
         _ensure_user_strategy_accounts(conn)
         _ensure_cycle(conn)
@@ -11397,51 +11400,22 @@ def _sell_plan(position, quote, asof_day, news, hard_stop_touched_today=False, s
     }
 
 
-def _monitor_risk_impl(asof_date=None):
-    """14:50 风控任务：仅监控当前持仓，卖出不受市场新开仓门禁影响。"""
+def _monitor_risk_impl(asof_date=None, *, cycle_id):
+    """14:50 风控任务：仅监控当前持仓，卖出不受市场新开仓门禁影响。
+
+    ``cycle_id`` 是 **keyword-only 且必填**（R16）：扫描身份已在
+    :func:`monitor_risk` 里解析并 durable 认领，实现层不得再问一次"现在 active
+    的是谁" —— 那正是 R16 之前让一次从旧周期开始的扫描在行情/快讯 I/O 之后去
+    操作新周期 lots / orders / reviews 的路径。scan 生命周期也已整体移出。
+    """
     init_db()
     day = _date(asof_date)
-    # Claim the minute before touching positions.  Pending manual buys are
-    # deliberately processed only after this risk-exit pass has committed.
-    # This covers overlap between the periodic intraday run and the dedicated
-    # 14:50 risk slot without holding a database transaction across network
-    # quote requests.
-    scan_minute = dt.datetime.now().strftime("%Y-%m-%d %H:%M")
-    with _db(immediate=True, hot_path=True) as conn:
-        _assert_active_lease(conn, "risk scan marker")
-        scan_marker = conn.execute(
-            "SELECT event,detail FROM paper_audit WHERE event='risk_scan_state' "
-            "AND detail LIKE ? ORDER BY id DESC LIMIT 1",
-            (f'%"scan_minute": "{scan_minute}"%',),
-        ).fetchone()
-        marker_detail = _loads(scan_marker["detail"], {}) if scan_marker else {}
-        marker_started = marker_detail.get("started_at") if marker_detail else None
-        marker_stale = False
-        if marker_started:
-            try:
-                marker_stale = (
-                    dt.datetime.now() - dt.datetime.fromisoformat(str(marker_started)[:19])
-                ).total_seconds() > 15 * 60
-            except (TypeError, ValueError):
-                marker_stale = False
-        marker_running = scan_marker and marker_detail.get("status") == "running"
-        if scan_marker and (
-            marker_detail.get("status") == "completed"
-            or (marker_running and not marker_stale)
-        ):
-            return {
-                "slot": "risk", "date": day.isoformat(), "orders": [],
-                "manual_orders": [], "status": "already_scanned",
-                "reason": f"{scan_minute} 风控扫描已由同一调度周期完成",
-            }
-        _audit(conn, None, "risk_scan_state", _json({
-            "scan_minute": scan_minute, "status": "running", "attempt": 1,
-            "started_at": _now(),
-        }))
     manual_orders = []
     with _db() as snapshot_conn:
         risk_ids = _risk_exit_account_ids(snapshot_conn)
-        positions = [p for p in _position_rows(snapshot_conn, asof_day=day) if p["account_id"] in risk_ids]
+        # 快照阶段就固定到**已认领**的周期，而不是"此刻 active 的那个周期"。
+        positions = [p for p in PPRM.positions_for_cycle(snapshot_conn, cycle_id, asof_day=day)
+                     if p["account_id"] in risk_ids]
         market_context = _cached_close_market(snapshot_conn, day, allow_network=False)
         retry_placeholders = ",".join("?" for _ in ENTRY_RETRY_SIGNAL_STATUSES)
         candidate_rows = snapshot_conn.execute(
@@ -11464,20 +11438,21 @@ def _monitor_risk_impl(asof_date=None):
         quote_map, news, flow_trajectory_map = {}, [], {}
     if not positions:
         with _db(immediate=True, hot_path=True) as conn:
+            PRSS.assert_cycle_active(conn, cycle_id=cycle_id)  # 空仓分支同样要 fence
             _sync_positions(conn, asof_day=day)
             _record_nav(conn, day, quotes=quote_map)
         try:
             manual_orders = process_pending_manual_orders(day)
         except Exception as exc:
             manual_orders = [{"status": "pending_batch_retry", "reason": str(exc)}]
-        result = {"slot": "risk", "date": day.isoformat(), "orders": [], "manual_orders": manual_orders}
-        with _db(immediate=True, hot_path=True) as conn:
-            _audit(conn, None, "risk_scan_state", _json({"scan_minute": scan_minute, "status": "completed", "finished_at": _now()}))
-        return result
+        return {"slot": "risk", "date": day.isoformat(), "orders": [], "manual_orders": manual_orders}
     with _db(immediate=True, hot_path=True) as conn:
+        # R16 cycle fence：外部 I/O 之后、正式写 transaction 打开的第一件事就是
+        # 证明"已认领的周期仍是当前 active cycle"。周期变了 ⇒ fail closed。
+        PRSS.assert_cycle_active(conn, cycle_id=cycle_id)
         risk_ids = _risk_exit_account_ids(conn)
-        positions = [p for p in _position_rows(conn, asof_day=day) if p["account_id"] in risk_ids]
-        cycle = _active_cycle(conn)
+        positions = [p for p in PPRM.positions_for_cycle(conn, cycle_id, asof_day=day)
+                     if p["account_id"] in risk_ids]
         account_map = {
             row["id"]: row for row in _accounts_by_id(conn, risk_ids)
         }
@@ -11546,7 +11521,7 @@ def _monitor_risk_impl(asof_date=None):
                     """SELECT action FROM paper_position_reviews
                        WHERE cycle_id=? AND account_id=? AND code=? AND review_date < ?
                        ORDER BY review_date DESC LIMIT 1""",
-                    (cycle["id"], position["account_id"], position["code"], day.isoformat()),
+                    (cycle_id, position["account_id"], position["code"], day.isoformat()),
                 ).fetchone()
                 quality_review["quality_exit_confirmed"] = bool(
                     previous_review and previous_review["action"] in {
@@ -11582,7 +11557,7 @@ def _monitor_risk_impl(asof_date=None):
                 if downside_guard.get("level") != "none" and not permission_reason and not capacity_reason:
                     quality_action = "downside_pending_quote"
                     quality_reason = f"下跌{downside_guard['level']}：{downside_guard['reason']}；{quote_status['reason']}"
-                _save_position_review(conn, cycle["id"], quality_review, quality_action, quality_reason)
+                _save_position_review(conn, cycle_id, quality_review, quality_action, quality_reason)
                 if pending_ratio > 0 or capacity_reason or permission_reason or downside_guard.get("level") != "none":
                     detail = {
                         **pending_detail,
@@ -11623,7 +11598,7 @@ def _monitor_risk_impl(asof_date=None):
                 # write-time provenance；绝不按 (account_id, code) 裸写无身份的
                 # paper_positions 投影。
                 PPRS.update_peak(
-                    conn, cycle_id=_order_cycle_id(conn, cycle["id"]),
+                    conn, cycle_id=_order_cycle_id(conn, cycle_id),
                     account_id=position["account_id"], code=position["code"],
                     peak_price=scan_peak,
                 )
@@ -11826,7 +11801,7 @@ def _monitor_risk_impl(asof_date=None):
                         quality_reason,
                         {"downside_guard": downside_guard, "quote_status": quote_status},
                     )
-            _save_position_review(conn, cycle["id"], quality_review, quality_action, quality_reason)
+            _save_position_review(conn, cycle_id, quality_review, quality_action, quality_reason)
             if ratio <= 0:
                 continue
             detail["quote_status"] = quote_status
@@ -11899,7 +11874,7 @@ def _monitor_risk_impl(asof_date=None):
                        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                     (position["account_id"], "sell", position["code"], position.get("name"),
                      planned_qty, price or None, status, order_reason, _json(detail), _now(),
-                     *strategy_stamp, _order_cycle_id(conn, cycle["id"])),
+                     *strategy_stamp, _order_cycle_id(conn, cycle_id)),
                 )
                 _risk_log(conn, position["account_id"], position["code"], "sell", "unfilled", order_reason, detail)
                 orders.append({"code": position["code"], "status": status, "reason": order_reason})
@@ -11914,7 +11889,7 @@ def _monitor_risk_impl(asof_date=None):
                 _assert_active_lease(conn, "risk sell lot")
                 # §8：lot 消耗与卖出委托必须是**同一个** cycle fact。这里解析一次，
                 # 同时传给 FIFO 消耗与 order INSERT，杜绝 split-brain。
-                sell_cycle_id = _order_cycle_id(conn, cycle["id"])
+                sell_cycle_id = _order_cycle_id(conn, cycle_id)
                 consumed, cost_amount = _consume_available_lots(
                     conn, position["account_id"], position["code"], qty, day,
                     cycle_id=sell_cycle_id,
@@ -12086,35 +12061,58 @@ def _monitor_risk_impl(asof_date=None):
         with _db(immediate=True, hot_path=True) as audit_conn:
             _audit(audit_conn, None, "pending_manual_batch_retry", str(exc))
     risk_result["manual_orders"] = manual_orders
-    with _db(immediate=True, hot_path=True) as conn:
-        _assert_active_lease(conn, "risk scan completion")
-        _audit(conn, None, "risk_scan_state", _json({
-            "scan_minute": scan_minute, "status": "completed", "finished_at": _now(),
-        }))
     return risk_result
 
 
 def monitor_risk(asof_date=None):
-    """Run risk monitoring with a retryable scan ledger.
+    """Run risk monitoring with a durable, cycle-owned scan identity.
 
-    The implementation deliberately remains exception-transparent to the
-    scheduler, but converts the minute marker to ``failed`` first.  A direct
-    retry in the same minute therefore is not swallowed as ``already_scanned``
-    after a provider/ledger exception.
+    R16：身份 ``(cycle_id, asof_date, scan_minute)`` 只解析一次并 durable 认领；
+    ``paper_audit`` 只剩 observability，不再参与"是否执行风险订单"的判断；异常时
+    先把同一身份推进到 ``failed``，同分钟重试因此不会被 ``already_scanned`` 吞掉。
     """
-    scan_minute = dt.datetime.now().strftime("%Y-%m-%d %H:%M")
+    init_db()
+    day = _date(asof_date)
+    run_at = dt.datetime.now()  # 只取一次：身份不能由两个时钟读数拼出来
+    with _db(immediate=True, hot_path=True) as conn:
+        _assert_active_lease(conn, "risk scan claim")
+        scan_context = {
+            "cycle_id": int(_active_cycle(conn)["id"]),
+            "asof_date": day.isoformat(),
+            "scan_minute": run_at.strftime("%Y-%m-%d %H:%M"),
+            "started_at": run_at.strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        ident = {k: scan_context[k] for k in ("cycle_id", "asof_date", "scan_minute")}
+        claimed = PRSS.claim_scan(
+            conn, **ident, started_at=scan_context["started_at"])
+        if not claimed["claimed"]:
+            # 兼容既有 facade 契约：重复入口（含 running）一律回 already_scanned。
+            return {
+                "slot": "risk", "date": day.isoformat(), "orders": [], "manual_orders": [],
+                "status": "already_scanned",
+                "reason": f"{scan_context['scan_minute']} 风控扫描已由同一调度周期完成",
+            }
+        _audit(conn, None, "risk_scan_claimed", _json(dict(scan_context)))  # 仅可观测
     try:
-        return _monitor_risk_impl(asof_date)
+        result = _monitor_risk_impl(asof_date, cycle_id=ident["cycle_id"])
+        with _db(immediate=True, hot_path=True) as conn:
+            _assert_active_lease(conn, "risk scan completion")
+            PRSS.complete_scan(conn, **ident, finished_at=_now())
+            _audit(conn, None, "risk_scan_completed", _json(dict(ident)))
+        return result
     except Exception as exc:
         if _lease_lost(exc):
             raise
         try:
             with _db(immediate=True, hot_path=True) as conn:
-                _audit(conn, None, "risk_scan_state", _json({
-                    "scan_minute": scan_minute,
-                    "status": "failed",
-                    "finished_at": _now(),
-                    "error": f"{type(exc).__name__}: {exc}",
+                # 必须用**原来那个** identity：绝不重新取时钟。completion 事务自身
+                # 异常也会走到这里，把仍 running 的同一身份推进到 failed（无 orphan）。
+                PRSS.fail_scan(conn, **ident, finished_at=_now(),
+                               error=f"{type(exc).__name__}: {exc}")
+                _audit(conn, None, "risk_scan_failed", _json({
+                    **ident,
+                    "failure_code": ("cycle_changed"
+                                     if isinstance(exc, PRSS.RiskScanCycleChanged) else "error"),
                 }))
         except Exception:
             pass

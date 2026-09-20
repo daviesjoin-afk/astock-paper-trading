@@ -559,6 +559,120 @@ def ensure_position_risk_state(conn):
     return changes
 
 
+# ─── 周期归属的风险扫描运行状态（v21） ──────────────────────────────────────
+#
+# 不变量::
+#
+#     paper_risk_scan_runs = risk scan run lifecycle authority
+#     paper_audit          = human-readable audit trail only
+#
+# 背景：分钟级风险扫描的幂等性此前由 ``paper_audit`` 里一条
+# ``event='risk_scan_state'`` 的 JSON 标记决定，而那条标记的 key **只有机器分钟**，
+# 没有 cycle 身份、也没有 asof 日期。于是：
+#
+#   * 同一分钟内翻周期时，新周期会读到旧周期的 completed 标记而被
+#     ``already_scanned`` 吞掉 —— 新周期持仓一次风控都没跑；
+#   * 同一分钟跑不同 asof 的 replay 会互相抑制；
+#   * wrapper 与 impl 各自取一次分钟，跨分钟边界会留下永远没有 failed 转换的
+#     orphan running 标记。
+#
+# **绝不回填**：升级前的 audit 标记没有 durable cycle 归属，无法从当前状态
+# 反推（``paper_accounts.cycle_id`` 是可变重绑定、``MAX(paper_cycles.id)``
+# 不是"当时 active"、日期与周期无函数关系）。历史归属未知就保持未知，留在
+# 旧 audit 里；本表只从空表开始承载**未来**的运行事实。
+
+#: 规范列序（与 DDL 共用一份事实）。
+RISK_SCAN_RUN_COLUMNS = (
+    "id", "cycle_id", "asof_date", "scan_minute", "status", "attempt",
+    "started_at", "finished_at", "error", "detail",
+)
+
+#: 合法状态（与 ``paper_risk_scan_state.SCAN_STATUSES`` 共用一份事实）。
+RISK_SCAN_RUN_STATUSES = ("running", "completed", "failed")
+
+
+def risk_scan_run_ddl(table="paper_risk_scan_runs"):
+    """``paper_risk_scan_runs`` 的规范 DDL。
+
+    身份 ``UNIQUE(cycle_id, asof_date, scan_minute)`` 三者缺一不可：
+
+    * 只做 ``UNIQUE(cycle_id, scan_minute)`` 会让同一分钟的不同 asof replay
+      互相抑制；
+    * 只做 ``UNIQUE(asof_date, scan_minute)`` 会让同分钟翻周期互相抑制。
+
+    ``cycle_id`` 直接 ``NOT NULL``：本表由 v21 全新创建、**禁止回填**，
+    因此可以直接用列约束表达"每行都必须属于一个周期"，不需要 v18/v19 的
+    "可空列 + trigger"折衷。cycle 是否真实存在由 trigger 校验。
+    """
+    return f"""
+        CREATE TABLE {table}(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            cycle_id INTEGER NOT NULL,
+            asof_date TEXT NOT NULL,
+            scan_minute TEXT NOT NULL,
+            status TEXT NOT NULL,
+            attempt INTEGER NOT NULL DEFAULT 1,
+            started_at TEXT NOT NULL,
+            finished_at TEXT,
+            error TEXT,
+            detail TEXT NOT NULL DEFAULT '{{}}',
+            UNIQUE(cycle_id, asof_date, scan_minute),
+            CHECK(status IN ('running','completed','failed'))
+        )
+    """
+
+
+def _ensure_risk_scan_run_guards(conn):
+    """新行必须指向真实周期，且身份一经写入不可更改。
+
+    身份是 **claim-time fact**：这次扫描认领的是哪个周期的哪一天哪一分钟，
+    就永远是那个身份。``BEFORE UPDATE OF cycle_id, asof_date, scan_minute``
+    让任何 repair 脚本都无法把一次已经跑过的扫描"改挂"到另一个周期/另一天/
+    另一分钟 —— 那等于事后重写执行归属历史，正是 R16 要消灭的 provenance
+    fabrication。
+    """
+    if not table_columns(conn, "paper_risk_scan_runs"):
+        return
+    has_cycles = bool(table_columns(conn, "paper_cycles"))
+    when = "NEW.cycle_id IS NULL"
+    if has_cycles:
+        when += (" OR NOT EXISTS (SELECT 1 FROM paper_cycles c"
+                 " WHERE c.id=NEW.cycle_id)")
+    conn.execute(
+        f"""CREATE TRIGGER IF NOT EXISTS trg_paper_risk_scan_runs_cycle_required_insert
+            BEFORE INSERT ON paper_risk_scan_runs
+            WHEN {when}
+            BEGIN SELECT RAISE(ABORT, 'invalid risk scan cycle provenance'); END"""
+    )
+    conn.execute(
+        """CREATE TRIGGER IF NOT EXISTS trg_paper_risk_scan_runs_identity_immutable
+            BEFORE UPDATE OF cycle_id, asof_date, scan_minute ON paper_risk_scan_runs
+            WHEN NEW.cycle_id IS NOT OLD.cycle_id
+              OR NEW.asof_date IS NOT OLD.asof_date
+              OR NEW.scan_minute IS NOT OLD.scan_minute
+            BEGIN SELECT RAISE(ABORT, 'risk scan identity is immutable'); END"""
+    )
+
+
+def ensure_risk_scan_run_state(conn):
+    """v21：cycle-owned 的风险扫描运行状态表（幂等，**绝不回填**）。
+
+    只建表 + 安装 guard。**不执行任何** ``INSERT ... SELECT ... FROM
+    paper_audit``：升级前那条 ``event='risk_scan_state'`` 的标记没有 cycle
+    归属，把它的 created_at / 当前 active cycle / MAX(cycle_id) 拿来推算
+    "当时属于哪个周期"就是把"不知道"洗白成"知道"。历史扫描归属未知就保持
+    未知；首个运行行只能由 ``paper_risk_scan_state.claim_scan`` 创建。
+    """
+    changes = {}
+    if not table_columns(conn, "paper_risk_scan_runs"):
+        conn.execute(risk_scan_run_ddl("paper_risk_scan_runs"))
+        changes["paper_risk_scan_runs"] = "created"
+    else:
+        changes["paper_risk_scan_runs"] = "ok"
+    _ensure_risk_scan_run_guards(conn)
+    return changes
+
+
 def ensure_strategy_reference_columns(conn):
     """Append immutable strategy-version stamps to execution evidence tables.
 

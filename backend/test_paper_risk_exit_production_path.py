@@ -163,9 +163,18 @@ class PaperRiskExitProductionPathTestCase(unittest.TestCase):
             PT._sync_positions(conn, asof_day=self.day)
             return cur.lastrowid
 
-    def _clear_audit_scan_marker(self):
+    def _clear_scan_run_state(self):
+        """清掉本次扫描的 durable 运行身份，模拟"下一次调度周期"。
+
+        R16 之前这一步删的是 ``paper_audit`` 的 ``risk_scan_state`` 标记 —— 那是
+        当时唯一的执行权威。R16 起执行权威搬到 ``paper_risk_scan_runs``（身份为
+        ``cycle_id + asof_date + scan_minute``），``paper_audit`` 只剩 observability。
+        因此"让同一分钟的下一次扫描能真正执行"必须清 durable 运行行；只删 audit
+        已经**不再**能打开闸门（这正是本 PR 要证明的降级）。
+        """
         with PT._db(immediate=True) as conn:
-            conn.execute("DELETE FROM paper_audit WHERE event='risk_scan_state'")
+            conn.execute("DELETE FROM paper_risk_scan_runs")
+            conn.execute("DELETE FROM paper_audit WHERE event LIKE 'risk_scan%'")
 
 
 class TestPaperRiskExitProductionPath(PaperRiskExitProductionPathTestCase):
@@ -427,7 +436,7 @@ class TestPaperRiskExitProductionPath(PaperRiskExitProductionPathTestCase):
         self.assertEqual(res1["orders"][0]["status"], "filled")
 
         # Clear audit marker for pass 2 to simulate next review pass
-        self._clear_audit_scan_marker()
+        self._clear_scan_run_state()
 
         res2 = PT.monitor_risk(self.day)
         self.assertEqual(len(res2.get("orders", [])), 0)
@@ -474,7 +483,7 @@ class TestPaperRiskExitProductionPath(PaperRiskExitProductionPathTestCase):
         self.assertEqual(res1["orders"][0]["status"], "unfilled_limit_down")
 
         # Clear scan marker to simulate subsequent scan pass in cooldown
-        self._clear_audit_scan_marker()
+        self._clear_scan_run_state()
 
         res2 = PT.monitor_risk(self.day)
         self.assertEqual(len(res2.get("orders", [])), 1)
@@ -720,6 +729,251 @@ class TestPaperRiskExitProductionPath(PaperRiskExitProductionPathTestCase):
 
                 lots = conn.execute("SELECT remaining_qty FROM paper_position_lots WHERE account_id=?", (account_id,)).fetchall()
                 self.assertEqual(lots[0]["remaining_qty"], 0)
+
+
+class TestRiskScanLifecycleProductionPath(PaperRiskExitProductionPathTestCase):
+    """R16 生产回归：风险扫描身份必须是 cycle-owned 的 durable 事实。
+
+    RISK-SCAN-P1  同 cycle + 同 asof + 同分钟：第二次 already_scanned，订单/成交不重复
+    RISK-SCAN-P2  跨周期同分钟：cycle 9 不得被 cycle 8 的完成态抑制
+    RISK-SCAN-P3  同 cycle + 同分钟 + 不同 asof：两者都能被 claim
+    RISK-SCAN-P4  quote I/O 期间周期 rollover：fail closed，且不产生任何新周期副作用
+    RISK-SCAN-P5  失败 → 重试：failed(attempt=1) → running(attempt=2) → completed
+    RISK-SCAN-P6  跨分钟边界：最终只有**一个**身份行，且 status=failed（无 orphan running）
+    """
+
+    def _scan_runs(self):
+        with PT._db() as conn:
+            return [dict(r) for r in conn.execute(
+                "SELECT cycle_id,asof_date,scan_minute,status,attempt"
+                " FROM paper_risk_scan_runs ORDER BY id").fetchall()]
+
+    def _active_cycle_id(self):
+        with PT._db() as conn:
+            return int(conn.execute(
+                "SELECT id FROM paper_cycles WHERE status IN ('draft','running','paused')"
+                " ORDER BY id DESC LIMIT 1").fetchone()[0])
+
+    def _add_cycle_and_activate(self, stamp="2026-09-10 14:50:30"):
+        with PT._db(immediate=True) as conn:
+            cur = conn.execute(
+                "INSERT INTO paper_cycles(cycle_key,status,capital,risk_profile,created_at,"
+                "updated_at,started_at) VALUES(?,?,?,?,?,?,?)",
+                (f"c-{stamp}", "running", 100000.0, "shared_pool", stamp, stamp, stamp),
+            )
+            cycle_id = int(cur.lastrowid)
+            conn.execute("UPDATE paper_cycles SET status='running' WHERE id=?", (cycle_id,))
+            conn.execute(
+                "UPDATE paper_accounts SET cycle_id=?, status='running' WHERE id=?",
+                (cycle_id, "tq_breakout"),
+            )
+            return cycle_id
+
+    def _sell_fills(self):
+        with PT._db() as conn:
+            return conn.execute(
+                "SELECT COUNT(*) FROM paper_fills WHERE side='sell'").fetchone()[0]
+
+    def _sell_orders(self, cycle_id=None):
+        with PT._db() as conn:
+            sql = "SELECT id,cycle_id FROM paper_orders WHERE side='sell'"
+            params = ()
+            if cycle_id is not None:
+                sql += " AND cycle_id=?"
+                params = (cycle_id,)
+            return [dict(r) for r in conn.execute(sql, params).fetchall()]
+
+    # ── P1 ─────────────────────────────────────────────────────────────────
+    def test_RISK_SCAN_P1_same_identity_dedupes_without_duplicate_side_effects(self):
+        self._insert_lot("tq_breakout", self.code, 500, 10.0)
+        self._set_fresh_exit_quote(self.code, price=9.0, pct=-8.0)
+
+        first = PT.monitor_risk(self.day)
+        second = PT.monitor_risk(self.day)
+
+        self.assertEqual(len(first.get("orders", [])), 1)
+        self.assertEqual(second.get("status"), "already_scanned")
+        self.assertEqual(second.get("orders"), [])
+        self.assertEqual(self._sell_fills(), 1, "同一身份产生了重复成交")
+
+        runs = self._scan_runs()
+        self.assertEqual(len(runs), 1, "同一身份产生了多行 scan run")
+        self.assertEqual(runs[0]["status"], "completed")
+        self.assertEqual(int(runs[0]["attempt"]), 1)
+
+    # ── P2 ─────────────────────────────────────────────────────────────────
+    def test_RISK_SCAN_P2_cross_cycle_same_minute_is_not_suppressed(self):
+        c8 = self._active_cycle_id()
+        self._insert_lot("tq_breakout", self.code, 500, 10.0)
+        self._set_fresh_exit_quote(self.code, price=9.0, pct=-8.0)
+        first = PT.monitor_risk(self.day)
+        self.assertEqual(len(first.get("orders", [])), 1)
+
+        # 同一分钟内翻周期，cycle 9 同样持有该票并同样触发风控
+        c9 = self._add_cycle_and_activate()
+        self._insert_lot("tq_breakout", self.code, 500, 10.0, cycle_id=c9)
+        self._set_fresh_exit_quote(self.code, price=9.0, pct=-8.0)
+
+        second = PT.monitor_risk(self.day)
+        self.assertNotEqual(
+            second.get("status"), "already_scanned",
+            "cycle 9 被 cycle 8 的同分钟完成态抑制 —— 新周期持仓一次风控都没跑",
+        )
+        runs = self._scan_runs()
+        cycles = sorted(int(r["cycle_id"]) for r in runs)
+        self.assertEqual(cycles, [c8, c9], "两个周期未各自留下 scan run")
+        self.assertTrue(all(r["status"] == "completed" for r in runs))
+
+    # ── P3 ─────────────────────────────────────────────────────────────────
+    def test_RISK_SCAN_P3_different_asof_same_minute_is_claimable(self):
+        self._insert_lot("tq_breakout", self.code, 500, 10.0)
+        self._set_fresh_exit_quote(self.code, price=9.0, pct=-8.0)
+        PT.monitor_risk(self.day)
+
+        other_day = dt.date(2026, 9, 11)
+        self._set_fresh_exit_quote(self.code, price=9.0, pct=-8.0)
+        PT.monitor_risk(other_day)
+
+        runs = self._scan_runs()
+        self.assertEqual(len(runs), 2, "同分钟不同 asof 被错误抑制")
+        self.assertEqual(
+            sorted(r["asof_date"] for r in runs),
+            sorted([self.day.isoformat(), other_day.isoformat()]),
+        )
+
+    # ── P4 ─────────────────────────────────────────────────────────────────
+    def test_RISK_SCAN_P4_cycle_rollover_during_quote_fetch_fails_closed(self):
+        c8 = self._active_cycle_id()
+        self._insert_lot("tq_breakout", self.code, 500, 10.0)
+        self._set_fresh_exit_quote(self.code, price=9.0, pct=-8.0)
+
+        state = {"c9": None}
+        base_quotes = PT._quotes
+
+        def rollover(codes, asof_date=None):
+            if state["c9"] is None:
+                c9 = self._add_cycle_and_activate()
+                self._insert_lot("tq_breakout", self.code, 500, 10.0, cycle_id=c9)
+                state["c9"] = c9
+            return base_quotes(codes, asof_date=asof_date)
+
+        with mock.patch.object(PT, "_quotes", side_effect=rollover):
+            with self.assertRaises(PT.PRSS.RiskScanCycleChanged):
+                PT.monitor_risk(self.day)
+
+        c9 = state["c9"]
+        self.assertIsNotNone(c9, "夹具未触发周期 rollover")
+        self.assertEqual(self._sell_orders(c9), [], "旧快照操作了新周期的订单")
+        self.assertEqual(self._sell_fills(), 0, "周期 rollover 后仍然成交")
+        with PT._db() as conn:
+            c9_lots = conn.execute(
+                "SELECT COALESCE(SUM(remaining_qty),0) FROM paper_position_lots WHERE cycle_id=?",
+                (c9,)).fetchone()[0]
+            c9_reviews = conn.execute(
+                "SELECT COUNT(*) FROM paper_position_reviews WHERE cycle_id=?", (c9,)).fetchone()[0]
+        self.assertEqual(int(c9_lots), 500, "新周期 lot 被旧周期的扫描消耗")
+        self.assertEqual(c9_reviews, 0, "旧周期的扫描写了新周期的 position review")
+
+        runs = self._scan_runs()
+        self.assertEqual(len(runs), 1)
+        self.assertEqual(runs[0]["status"], "failed", "cycle changed 未 fail closed")
+        self.assertEqual(int(runs[0]["cycle_id"]), c8)
+
+    # ── P5 ─────────────────────────────────────────────────────────────────
+    def test_RISK_SCAN_P5_failure_is_retryable_with_attempt_increment(self):
+        self._insert_lot("tq_breakout", self.code, 500, 10.0)
+        self._set_fresh_exit_quote(self.code, price=9.0, pct=-8.0)
+
+        boom = RuntimeError("injected provider failure")
+        with mock.patch.object(PT, "_quotes", side_effect=boom):
+            with self.assertRaises(RuntimeError):
+                PT.monitor_risk(self.day)
+
+        runs = self._scan_runs()
+        self.assertEqual(len(runs), 1)
+        self.assertEqual(runs[0]["status"], "failed")
+        self.assertEqual(int(runs[0]["attempt"]), 1)
+
+        # 同一身份直接重试：failed → running(attempt=2) → completed
+        self._set_fresh_exit_quote(self.code, price=9.0, pct=-8.0)
+        result = PT.monitor_risk(self.day)
+        self.assertEqual(len(result.get("orders", [])), 1, "重试未能真正执行")
+        runs = self._scan_runs()
+        self.assertEqual(len(runs), 1, "重试产生了第二个身份")
+        self.assertEqual(runs[0]["status"], "completed")
+        self.assertEqual(int(runs[0]["attempt"]), 2, "重试未递增 attempt")
+
+    # ── P6 ─────────────────────────────────────────────────────────────────
+    def test_RISK_SCAN_P6_minute_boundary_leaves_no_orphan_running(self):
+        self._insert_lot("tq_breakout", self.code, 500, 10.0)
+        self._set_fresh_exit_quote(self.code, price=9.0, pct=-8.0)
+
+        # 模拟 wrapper 与执行阶段跨分钟：时钟每次调用都前进一分钟。
+        ticks = [dt.datetime(2026, 9, 10, 14, 50, 59)]
+
+        def ticking():
+            current = ticks[-1]
+            ticks.append(current + dt.timedelta(minutes=1))
+            return current
+
+        class _Date(dt.date):
+            @classmethod
+            def today(cls):
+                return dt.date(2026, 9, 10)
+
+        class _Datetime(dt.datetime):
+            @classmethod
+            def now(cls, tz=None):
+                value = ticking()
+                return value if tz is None else value.replace(tzinfo=tz)
+
+        class _DT:
+            date = _Date
+            datetime = _Datetime
+            timedelta = dt.timedelta
+
+        boom = RuntimeError("injected failure at minute boundary")
+        with mock.patch.object(PT, "dt", _DT), \
+                mock.patch.object(PT, "_quotes", side_effect=boom):
+            with self.assertRaises(RuntimeError):
+                PT.monitor_risk(self.day)
+
+        runs = self._scan_runs()
+        self.assertEqual(len(runs), 1, "跨分钟边界产生了第二个 scan 身份")
+        self.assertEqual(runs[0]["status"], "failed", "留下了 orphan running")
+        self.assertFalse(
+            any(r["status"] == "running" for r in runs),
+            "存在没有对应 failed 转换的 running 身份",
+        )
+
+    # ── P7 ─────────────────────────────────────────────────────────────────
+    def test_RISK_SCAN_P7_completion_failure_does_not_orphan_running(self):
+        """completion 事务自身失败时，同一身份必须被推进到 failed。
+
+        若 completion 落在 try 之外，异常会绕过 fail 路径，durable 行就永远
+        停在 ``running`` —— 一个再也不会被推进的孤儿身份。
+        """
+        self._insert_lot("tq_breakout", self.code, 500, 10.0)
+        self._set_fresh_exit_quote(self.code, price=9.0, pct=-8.0)
+
+        boom = RuntimeError("injected completion failure")
+        real_complete = PT.PRSS.complete_scan
+
+        def failing_complete(*args, **kwargs):
+            raise boom
+
+        with mock.patch.object(PT.PRSS, "complete_scan", side_effect=failing_complete):
+            with self.assertRaises(RuntimeError):
+                PT.monitor_risk(self.day)
+        self.assertIs(PT.PRSS.complete_scan, real_complete)
+
+        runs = self._scan_runs()
+        self.assertEqual(len(runs), 1, "completion 失败产生了第二个 scan 身份")
+        self.assertEqual(
+            runs[0]["status"], "failed",
+            "completion 事务失败后 durable 行停在 running —— orphan 身份永远不会被推进",
+        )
+        self.assertFalse(any(r["status"] == "running" for r in runs))
 
 
 if __name__ == "__main__":

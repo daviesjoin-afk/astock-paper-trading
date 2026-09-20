@@ -12,10 +12,9 @@ module**，domain implementation 也不能再长回 ``paper_trading.py``。Round
     Guard 3  ``paper_trading.py`` 的 LOC / 模块级函数数不得反弹；
     Guard 4  新 domain 模块不得成为 service locator（零项目级 import）；
     Guard 5  三条生产 SELL 路径必须都经过同一个 episode finalizer；
-    Guard 6  ``paper_risk_decision`` 必须是零 I/O / 零 wall-clock 的纯决策边界。
-
-刻意不做全仓架构分析：只扫本边界涉及的文件 + 一条 LOC 基线。确定性、无网络、
-无副作用；规模控制在 300 行左右，坏了能一眼看懂。
+    Guard 6  ``paper_risk_decision`` 必须是零 I/O / 零 wall-clock 的纯决策边界；
+    Guard 7  ``paper_risk_scan_state`` 必须是零 I/O / 零 wall-clock / 零事务的
+             扫描生命周期边界，且 ``paper_audit`` 不得再充当执行权威。
 """
 import ast
 import re
@@ -27,8 +26,10 @@ PAPER_TRADING = BACKEND / "paper_trading.py"
 EXECUTION_PLANNER = BACKEND / "execution_planner.py"
 RISK_STATE_MODULE = "paper_position_risk_state.py"
 RISK_DECISION_MODULE = "paper_risk_decision.py"
+RISK_SCAN_STATE_MODULE = "paper_risk_scan_state.py"
 
 RISK_STATE_TABLE = "paper_position_risk_state"
+RISK_SCAN_RUN_TABLE = "paper_risk_scan_runs"
 
 #: Guard 1 —— 这些 domain 模块只允许依赖 stdlib / 各自的低层契约。反向 import
 #: ``paper_trading`` 会把它们变成 god module 的延伸，authority 随之泄漏。
@@ -42,6 +43,7 @@ DOMAIN_MODULES = (
     "paper_slot_occupancy.py",
     "paper_risk_exit_eligibility.py",
     "paper_risk_decision.py",
+    "paper_risk_scan_state.py",
 )
 
 #: 历史上已有的例外。当前为空。新模块 ``paper_position_risk_state.py`` 永远不得
@@ -52,6 +54,13 @@ REVERSE_IMPORT_ALLOWLIST: dict = {}
 _RISK_STATE_WRITE = re.compile(
     r"(?:INSERT(?:\s+OR\s+\w+)?\s+INTO|REPLACE\s+INTO|UPDATE|DELETE\s+FROM)"
     r"\s+" + RISK_STATE_TABLE + r"\b",
+    re.IGNORECASE,
+)
+
+#: Guard 7 —— risk scan run 的 runtime CRUD 只能存在于状态模块里。
+_RISK_SCAN_WRITE = re.compile(
+    r"(?:INSERT(?:\s+OR\s+\w+)?\s+INTO|REPLACE\s+INTO|UPDATE|DELETE\s+FROM)"
+    r"\s+" + RISK_SCAN_RUN_TABLE + r"\b",
     re.IGNORECASE,
 )
 
@@ -68,14 +77,18 @@ FORBIDDEN_PAPER_TRADING_DEFS = frozenset({
 })
 
 #: Guard 3 —— Round-3 exact head 的基线（上一轮 16365 行 / 287 函数）。R15 把纯风险
-#: 卖出状态机抽到 ``paper_risk_decision.py`` 后基线向下 ratchet。以后只允许 same or
+#: 卖出状态机抽到 ``paper_risk_decision.py``、R16 把风险扫描生命周期抽到
+#: ``paper_risk_scan_state.py`` 后基线持续向下 ratchet。以后只允许 same or
 #: lower：确有 facade wiring 要加，必须同时抽出别的函数保持不增长。
 #: 不要设计环境变量绕过 / ``skip if CI`` 之类的后门。
-PAPER_TRADING_LOC_BASELINE = 16181
+PAPER_TRADING_LOC_BASELINE = 16179
 PAPER_TRADING_DEF_BASELINE = 284
 
 #: Guard 4 —— 新模块允许出现的 import 根（stdlib）。
 ALLOWED_STDLIB_IMPORTS = frozenset({"__future__", "datetime", "typing", "sqlite3"})
+
+#: Guard 7 —— 扫描生命周期模块允许的 import 根（纯 stdlib，含 json 做 detail 编码）。
+RISK_SCAN_ALLOWED_IMPORTS = frozenset({"__future__", "json", "sqlite3"})
 
 #: Guard 6 —— 纯决策边界不得触碰的任何 I/O / 时钟 API 名（属性名或调用名）。
 FORBIDDEN_IO_CALLS = frozenset({
@@ -113,6 +126,19 @@ def _imported_roots(tree):
         elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
             roots.add(node.module.split(".")[0])
     return roots
+
+
+def _call_names(tree):
+    """树里出现的所有被调用名（``f(...)`` 的 ``f`` / ``obj.m(...)`` 的 ``m``）。"""
+    names = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            func = node.func
+            if isinstance(func, ast.Name):
+                names.add(func.id)
+            elif isinstance(func, ast.Attribute):
+                names.add(func.attr)
+    return names
 
 
 def _top_level_defs(tree):
@@ -354,6 +380,153 @@ class EveryProductionSellPathFinalizesTheEpisode(unittest.TestCase):
         self.assertNotIn("PT.finalize_sell(", source,
                          "execution_planner 经 paper_trading 转发调用 finalizer："
                          "依赖方向又被打回 god module")
+
+
+class RiskScanStateIsACycleOwnedBoundary(unittest.TestCase):
+    """Guard 7 —— 风险扫描生命周期必须是零 I/O / 零时钟 / 零事务的独立边界。
+
+    为什么需要它：R16 之前"这次分钟级扫描是否已经跑过"由 ``paper_audit`` 里一条
+    JSON 标记决定，标记的 key 只有机器分钟、没有 cycle 身份，而且 wrapper 与 impl
+    各自取一次时钟。把这些重新写回 ``paper_trading.py``（或让本模块变成 god
+    module 的延伸）就会让同一类缺陷立刻复发，所以边界必须是可执行断言。
+    """
+
+    def test_guard7a_scan_state_module_has_zero_project_imports(self):
+        project_modules = {path.stem for path in BACKEND.glob("*.py")}
+        roots = _imported_roots(_tree(RISK_SCAN_STATE_MODULE))
+        leaked = sorted(roots & (project_modules - {Path(RISK_SCAN_STATE_MODULE).stem}))
+        self.assertEqual(
+            leaked, [],
+            f"{RISK_SCAN_STATE_MODULE} 依赖了项目模块 {leaked}：扫描生命周期状态"
+            "必须只依赖 stdlib，绝不 import paper_trading（依赖方向单向）",
+        )
+        self.assertEqual(sorted(roots - RISK_SCAN_ALLOWED_IMPORTS), [],
+                         "出现了未登记的 import 根")
+
+    def test_guard7b_scan_state_module_performs_no_io(self):
+        tree = _tree(RISK_SCAN_STATE_MODULE)
+        # ``execute`` 是合法的：本模块唯一职责就是对调用方传入的连接做
+        # 自己的运行表读写。真正要禁的是网络 / 文件 / 进程 / 自建连接。
+        forbidden = FORBIDDEN_IO_CALLS - {"execute", "executemany", "cursor",
+                                          "connect", "commit"}
+        leaked = sorted(_call_names(tree) & forbidden)
+        self.assertEqual(
+            leaked, [],
+            f"{RISK_SCAN_STATE_MODULE} 出现了 I/O 调用 {leaked}：它只能通过调用方"
+            "传入的连接读写自己的运行表，网络 / 文件 / 进程 / 自建连接一律禁用",
+        )
+
+    def test_guard7c_scan_state_module_reads_no_wall_clock(self):
+        tree = _tree(RISK_SCAN_STATE_MODULE)
+        leaked = sorted(_call_names(tree) & FORBIDDEN_CLOCK_ATTRS)
+        self.assertEqual(
+            leaked, [],
+            f"{RISK_SCAN_STATE_MODULE} 读取了系统时钟 {leaked}：身份与时间戳只能由"
+            "调用方显式传入，否则 scan identity 会自己漂移",
+        )
+
+    def test_guard7d_scan_state_module_owns_no_transaction(self):
+        raw = _source(RISK_SCAN_STATE_MODULE)
+        body = raw[raw.find('"""', raw.find('"""') + 3) + 3:]
+        leaked = sorted(_call_names(ast.parse(raw)) & {"commit", "rollback"})
+        self.assertEqual(
+            leaked, [],
+            f"{RISK_SCAN_STATE_MODULE} 出现了事务调用 {leaked}：事务由调用方"
+            "（paper_trading.monitor_risk）拥有",
+        )
+        for token in ("BEGIN", "SAVEPOINT", "COMMIT", "ROLLBACK"):
+            with self.subTest(token=token):
+                self.assertNotIn(token, body,
+                                 f"{RISK_SCAN_STATE_MODULE} 出现了事务语句 {token}")
+
+    def test_guard7e_paper_trading_does_not_crud_the_scan_table(self):
+        hits = [
+            (number, line.strip())
+            for number, line in enumerate(_source("paper_trading.py").splitlines(), 1)
+            if _RISK_SCAN_WRITE.search(line)
+        ]
+        self.assertEqual(
+            hits, [],
+            "paper_trading.py 直接 CRUD paper_risk_scan_runs；运行时读写必须全部经"
+            " paper_risk_scan_state（DDL 仍归 paper_schema_migrations）",
+        )
+
+    def test_guard7f_paper_audit_is_not_risk_scan_control_state(self):
+        """``paper_audit`` 只允许做 observability，不得再决定"要不要执行"。"""
+        raw = _source("paper_trading.py")
+        hits = [
+            (number, line.strip())
+            for number, line in enumerate(raw.splitlines(), 1)
+            if "paper_audit" in line and "risk_scan_state" in line
+        ]
+        self.assertEqual(
+            hits, [],
+            "paper_trading.py 又用 paper_audit 的 risk_scan_state 标记做控制判断；"
+            "执行权威只能是 paper_risk_scan_runs",
+        )
+        body = _function_source(ast.parse(raw), "monitor_risk", raw)
+        self.assertIn(
+            "PRSS.claim_scan(", body,
+            "monitor_risk 不再通过 paper_risk_scan_state 认领扫描身份",
+        )
+        impl = _function_source(ast.parse(raw), "_monitor_risk_impl", raw)
+        self.assertNotIn(
+            "risk_scan_state", impl,
+            "_monitor_risk_impl 又碰了 paper_audit 的 risk_scan_state 标记：scan "
+            "生命周期必须整体由 monitor_risk + paper_risk_scan_state 负责",
+        )
+        self.assertNotIn(
+            "scan_minute", impl,
+            "_monitor_risk_impl 又自己算 scan_minute：身份必须只由 monitor_risk "
+            "解析一次，否则跨分钟边界会留下 orphan running",
+        )
+
+    def test_guard7g_impl_cycle_id_is_keyword_only_and_required(self):
+        tree = ast.parse(_source("paper_trading.py"))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.FunctionDef) or node.name != "_monitor_risk_impl":
+                continue
+            kwonly = {arg.arg for arg in node.args.kwonlyargs}
+            self.assertIn("cycle_id", kwonly,
+                          "_monitor_risk_impl 的 cycle_id 不是 keyword-only："
+                          "位置参数可以漏传，等于把跨周期执行重新引入")
+            index = [arg.arg for arg in node.args.kwonlyargs].index("cycle_id")
+            self.assertIsNone(
+                node.args.kw_defaults[index],
+                "_monitor_risk_impl 的 cycle_id 带默认值：缺失时必须 fail fast，"
+                "不得静默回退到'现在 active 的周期'",
+            )
+            return
+        self.fail("paper_trading.py 里找不到 _monitor_risk_impl")
+
+    def test_guard7h_scan_snapshot_is_pinned_to_the_claimed_cycle(self):
+        """风险扫描的持仓读取必须走显式周期，不能重新猜 active cycle。"""
+        raw = _source("paper_trading.py")
+        impl = _function_source(ast.parse(raw), "_monitor_risk_impl", raw)
+        self.assertIn(
+            "PPRM.positions_for_cycle(", impl,
+            "_monitor_risk_impl 不再用显式周期读持仓：一次从旧周期开始的扫描会"
+            "重新问'现在 active 的是谁'，从而操作新周期",
+        )
+        self.assertNotIn(
+            "_position_rows(", impl,
+            "_monitor_risk_impl 又回落到 current-cycle 持仓读取",
+        )
+        self.assertIn(
+            "PRSS.assert_cycle_active(", impl,
+            "_monitor_risk_impl 在外部 I/O 之后不再做 cycle fence："
+            "周期 rollover 会带着旧快照继续执行",
+        )
+        # fence 必须出现在执行侧写入之前（源码顺序只是弱证据，权威是生产回归
+        # RISK-SCAN-P4；这里挡住"把 fence 挪到写完订单之后"这种明显回归）。
+        fence_at = impl.index("PRSS.assert_cycle_active(")
+        for execution_write in ("_consume_available_lots(", "finalize_sell("):
+            with self.subTest(write=execution_write):
+                if execution_write in impl:
+                    self.assertLess(
+                        fence_at, impl.index(execution_write),
+                        f"cycle fence 出现在 {execution_write} 之后",
+                    )
 
 
 if __name__ == "__main__":

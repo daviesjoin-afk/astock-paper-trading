@@ -150,6 +150,24 @@ def _ensure_position_risk_state(conn):
     return paper_schema.ensure_position_risk_state(conn)
 
 
+def _ensure_risk_scan_run_state(conn):
+    """v21：cycle-owned 的风险扫描运行状态（幂等，绝不回填）。
+
+    分钟级风险扫描的幂等性此前由 ``paper_audit`` 里一条
+    ``event='risk_scan_state'`` 的 JSON 标记决定，key **只有机器分钟** ——
+    没有 cycle 身份、没有 asof 日期。于是同分钟翻周期会互相抑制（新周期持仓
+    一次风控都不跑）、同分钟不同 asof 的 replay 也会互相抑制。新表以
+    ``(cycle_id, asof_date, scan_minute)`` 为唯一身份，身份一经写入不可更改。
+
+    **绝不回填**：升级前 audit 标记的 cycle 归属无法从任何当前状态反推
+    （``paper_accounts.cycle_id`` 是可变重绑定、``MAX(paper_cycles.id)`` 不是
+    "当时 active"、日期与周期无函数关系）。历史归属未知就保持未知，留在旧
+    audit 里；本表只承载未来的运行事实。表结构与 guard 由
+    :func:`paper_schema_migrations.ensure_risk_scan_run_state` 持有。
+    """
+    return paper_schema.ensure_risk_scan_run_state(conn)
+
+
 def _ensure_rebalance_state_cycle_ownership(conn):
     """v19：调仓状态表的周期归属（scan / plan / cooldown，幂等，绝不回填）。
 
@@ -248,6 +266,13 @@ MIGRATIONS = {
         # stage），绝不冒充权威。
         (20, "新增周期归属的持仓运行时风险状态表（幂等，不回填）",
          _ensure_position_risk_state),
+        # 风险扫描运行状态（claim / running / completed / failed）的周期归属：
+        # 新表唯一身份为 (cycle_id, asof_date, scan_minute)，三者缺一不可。
+        # **绝不回填**：升级前 paper_audit 的 risk_scan_state 标记没有 durable
+        # cycle 归属，无法从当前状态反推 —— 用它推"当时属于哪个周期"就是把
+        # "不知道"洗白成"知道"。历史归属未知就留在旧 audit 里。
+        (21, "新增周期归属的风险扫描运行状态表（幂等，不回填）",
+         _ensure_risk_scan_run_state),
     ],
     "adaptive_learning": [
         (1, "创建 schema_version 表", """

@@ -36,6 +36,18 @@ import sqlite3
 import execution_verification as EV
 import paper_portfolio as PP
 
+__all__ = [
+    "POSITION_READ_MODEL_VERSION",
+    "RISK_STATE_METADATA_COLUMNS",
+    "active_cycle_id",
+    "positions_for_cycle",
+    "current_positions",
+    "current_holding_keys",
+    "current_held_codes",
+    "current_holding_rows",
+    "connect_readonly",
+]
+
 POSITION_READ_MODEL_VERSION = "position-read-model-v1"
 
 #: 允许从同周期 ``paper_position_risk_state`` 读取的风险状态列 —— 这是
@@ -121,25 +133,25 @@ def _dicts(rows):
     return [dict(row) for row in rows]
 
 
-def current_positions(conn, *, account_id=None, asof_day=None):
-    """当前 active cycle 的权威持仓（只读）。
+def positions_for_cycle(conn, cycle_id, *, account_id=None, asof_day=None):
+    """**指定周期**的权威持仓（只读，exact cycle，绝不 fallback）。
 
-    返回与旧 ``_position_rows`` 相同形状的字典列表，因此调用方可以就地替换，
-    不需要改自己的下游逻辑。``qty`` / ``cost`` / ``entry_date`` / ``available_qty``
-    / ``locked_qty`` 全部由 lot 派生；``peak_price`` / ``take_stage`` **只**来自
-    同周期的 ``paper_position_risk_state``（R14 起执行权威），并且**仅对已有
-    权威 lot 的 account/code**。
+    与 :func:`current_positions` 的唯一区别是周期从参数来，而不是"现在 active
+    的是谁"。这个区别是 R16 的承重契约：一次已经开始的风险扫描必须问
+    "我认领的周期 X 持有什么"，而**不能**在外部 I/O（行情 / 快讯 / 资金流）
+    之后重新问"现在 active 的是谁" —— 那期间周期可能已经 rollover，于是从
+    cycle 8 开始的扫描会去操作 cycle 9 的 lots / orders / reviews。
 
-    没有风险状态行的持仓（升级前遗留 / 无 episode 事实）得到显式 fail-safe
-    默认：peak 锚定成本、``take_stage=None``（未知）—— 绝不回落
-    ``paper_positions`` 投影，"未知"不能升级成"已知"。
-
-    没有 active cycle 时返回 ``[]`` —— 不建周期、不回落投影。
-    本函数是**纯读**：不 INSERT/UPDATE 风险状态、不创建周期、不修投影。
-    初始化只发生在 verified execution lifecycle（``paper_trading._record_lot``）。
+    ``cycle_id`` 为 ``None`` ⇒ 返回 ``[]``（没有可证明的周期就是"无法证明"，
+    不建周期、不回落 ``paper_positions`` 投影）。``cycle_id`` 指向一个**已
+    paused / 已归档**的周期时**照常读取**：本函数的职责是"exact requested
+    cycle"，不是"current executable cycle"。
     """
-    cycle_id = active_cycle_id(conn)
     if cycle_id is None:
+        return []
+    try:
+        cycle_id = int(cycle_id)
+    except (TypeError, ValueError):
         return []
     day = _date(asof_day).isoformat()
     sql = "SELECT * FROM paper_position_lots WHERE cycle_id=? AND remaining_qty>0"
@@ -160,6 +172,33 @@ def current_positions(conn, *, account_id=None, asof_day=None):
 
     return PP.aggregate_positions(
         lots, state_rows, _verified_cash_flows(conn), day, num=_num)
+
+
+def current_positions(conn, *, account_id=None, asof_day=None):
+    """当前 active cycle 的权威持仓（只读）。
+
+    返回与旧 ``_position_rows`` 相同形状的字典列表，因此调用方可以就地替换，
+    不需要改自己的下游逻辑。``qty`` / ``cost`` / ``entry_date`` / ``available_qty``
+    / ``locked_qty`` 全部由 lot 派生；``peak_price`` / ``take_stage`` **只**来自
+    同周期的 ``paper_position_risk_state``（R14 起执行权威），并且**仅对已有
+    权威 lot 的 account/code**。
+
+    没有风险状态行的持仓（升级前遗留 / 无 episode 事实）得到显式 fail-safe
+    默认：peak 锚定成本、``take_stage=None``（未知）—— 绝不回落
+    ``paper_positions`` 投影，"未知"不能升级成"已知"。
+
+    没有 active cycle 时返回 ``[]`` —— 不建周期、不回落投影。
+    本函数是**纯读**：不 INSERT/UPDATE 风险状态、不创建周期、不修投影。
+    初始化只发生在 verified execution lifecycle（``paper_trading._record_lot``）。
+
+    实现只有一份：本函数只负责解析"当前 active cycle"，聚合逻辑全部委托
+    :func:`positions_for_cycle`。语义与 R16 之前**逐字相同** —— 仍然只读
+    current active cycle，没有 active cycle 就是 ``[]``，绝不改成 latest cycle。
+    """
+    cycle_id = active_cycle_id(conn)
+    if cycle_id is None:
+        return []
+    return positions_for_cycle(conn, cycle_id, account_id=account_id, asof_day=asof_day)
 
 
 def current_holding_keys(conn, *, account_id=None) -> set:
