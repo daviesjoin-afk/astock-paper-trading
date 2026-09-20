@@ -14,7 +14,10 @@ module**，domain implementation 也不能再长回 ``paper_trading.py``。Round
     Guard 5  三条生产 SELL 路径必须都经过同一个 episode finalizer；
     Guard 6  ``paper_risk_decision`` 必须是零 I/O / 零 wall-clock 的纯决策边界；
     Guard 7  ``paper_risk_scan_state`` 必须是零 I/O / 零 wall-clock / 零事务的
-             扫描生命周期边界，且 ``paper_audit`` 不得再充当执行权威。
+             扫描生命周期边界，且 ``paper_audit`` 不得再充当执行权威；
+    Guard 8  position review 的评分/动作决策必须是零 I/O 纯域模块，入场模型分
+             只能来自 episode provenance（``opened_order_id`` → verified BUY
+             order → 精确 ``signal_id``），且禁止 latest-signal 搜索回流。
 """
 import ast
 import re
@@ -27,6 +30,8 @@ EXECUTION_PLANNER = BACKEND / "execution_planner.py"
 RISK_STATE_MODULE = "paper_position_risk_state.py"
 RISK_DECISION_MODULE = "paper_risk_decision.py"
 RISK_SCAN_STATE_MODULE = "paper_risk_scan_state.py"
+POSITION_REVIEW_MODULE = "paper_position_review.py"
+REVIEW_EVIDENCE_MODULE = "paper_position_review_evidence.py"
 
 RISK_STATE_TABLE = "paper_position_risk_state"
 RISK_SCAN_RUN_TABLE = "paper_risk_scan_runs"
@@ -44,6 +49,8 @@ DOMAIN_MODULES = (
     "paper_risk_exit_eligibility.py",
     "paper_risk_decision.py",
     "paper_risk_scan_state.py",
+    "paper_position_review.py",
+    "paper_position_review_evidence.py",
 )
 
 #: 历史上已有的例外。当前为空。新模块 ``paper_position_risk_state.py`` 永远不得
@@ -81,14 +88,20 @@ FORBIDDEN_PAPER_TRADING_DEFS = frozenset({
 #: ``paper_risk_scan_state.py`` 后基线持续向下 ratchet。以后只允许 same or
 #: lower：确有 facade wiring 要加，必须同时抽出别的函数保持不增长。
 #: 不要设计环境变量绕过 / ``skip if CI`` 之类的后门。
-PAPER_TRADING_LOC_BASELINE = 16179
-PAPER_TRADING_DEF_BASELINE = 284
+PAPER_TRADING_LOC_BASELINE = 16134
+PAPER_TRADING_DEF_BASELINE = 283
 
 #: Guard 4 —— 新模块允许出现的 import 根（stdlib）。
 ALLOWED_STDLIB_IMPORTS = frozenset({"__future__", "datetime", "typing", "sqlite3"})
 
 #: Guard 7 —— 扫描生命周期模块允许的 import 根（纯 stdlib，含 json 做 detail 编码）。
 RISK_SCAN_ALLOWED_IMPORTS = frozenset({"__future__", "json", "sqlite3"})
+
+#: Guard 8 —— 纯 position-review 域模块允许的 import 根（仅 stdlib）。
+POSITION_REVIEW_ALLOWED_IMPORTS = frozenset({"__future__", "dataclasses", "typing"})
+
+#: Guard 8 —— evidence resolver 允许的 import 根（含仓库唯一的 verified 判据）。
+REVIEW_EVIDENCE_ALLOWED_IMPORTS = frozenset({"__future__", "sqlite3", "execution_verification"})
 
 #: Guard 6 —— 纯决策边界不得触碰的任何 I/O / 时钟 API 名（属性名或调用名）。
 FORBIDDEN_IO_CALLS = frozenset({
@@ -527,6 +540,109 @@ class RiskScanStateIsACycleOwnedBoundary(unittest.TestCase):
                         fence_at, impl.index(execution_write),
                         f"cycle fence 出现在 {execution_write} 之后",
                     )
+
+
+class PositionReviewIsProvenanceBound(unittest.TestCase):
+    """Guard 8 —— position review 必须是纯域模块 + episode provenance 绑定。
+
+    为什么需要它：R17 之前持仓的"原始模型分"来自
+    ``SELECT ... FROM paper_signals WHERE account_id=? AND code=?
+    ORDER BY signal_date DESC,id DESC LIMIT 1`` —— 一个既没有 episode 归属、
+    也没有 asof 上界的 latest 搜索。它会被后来无关的 signal 甚至未来 signal
+    顶掉，并真实改变自动集中换仓判定。把这套 SQL 或"最近一条 signal"的习惯
+    写回去，缺陷立刻复发。
+    """
+
+    def test_guard8a_pure_review_module_has_zero_project_imports(self):
+        project = {path.stem for path in BACKEND.glob("*.py")}
+        roots = _imported_roots(_tree(POSITION_REVIEW_MODULE))
+        leaked = sorted(roots & (project - {Path(POSITION_REVIEW_MODULE).stem}))
+        self.assertEqual(leaked, [], f"{POSITION_REVIEW_MODULE} 依赖了项目模块 {leaked}")
+        self.assertEqual(sorted(roots - POSITION_REVIEW_ALLOWED_IMPORTS), [],
+                         "出现了未登记的 import 根")
+
+    def test_guard8b_pure_review_module_performs_no_io_or_clock(self):
+        tree = _tree(POSITION_REVIEW_MODULE)
+        leaked_io = sorted(_call_names(tree) & FORBIDDEN_IO_CALLS)
+        leaked_clock = sorted(_call_names(tree) & FORBIDDEN_CLOCK_ATTRS)
+        self.assertEqual(leaked_io, [], f"{POSITION_REVIEW_MODULE} 出现 I/O {leaked_io}")
+        self.assertEqual(leaked_clock, [],
+                         f"{POSITION_REVIEW_MODULE} 读取系统时钟 {leaked_clock}")
+
+    def test_guard8c_evidence_module_has_no_reverse_dependency(self):
+        roots = _imported_roots(_tree(REVIEW_EVIDENCE_MODULE))
+        self.assertNotIn("paper_trading", roots,
+                         "证据解析器不得反向 import paper_trading")
+        self.assertEqual(sorted(roots - REVIEW_EVIDENCE_ALLOWED_IMPORTS), [],
+                         "出现了未登记的 import 根")
+
+    def test_guard8d_evidence_module_never_latest_searches(self):
+        raw = _source(REVIEW_EVIDENCE_MODULE)
+        tree = ast.parse(raw)
+        first = tree.body[0]
+        body = "\n".join(raw.splitlines()[first.end_lineno:]) if isinstance(
+            first, ast.Expr) else raw
+        self.assertNotIn("ORDER BY signal_date", body,
+                         "证据解析器出现了 latest-signal 排序：episode provenance 只能"
+                         "经 opened_order_id → 精确 signal_id 解析")
+        self.assertNotIn("LIMIT 1", body,
+                         "证据解析器出现了 LIMIT 1：这是 latest 搜索的形状")
+        # 归档表是 episode signal 被 _cleanup_stale_data 搬走后的同一行（id 不变），
+        # 允许读取，但只允许**精确 id** —— 不得变成"活跃表没有就去归档表搜一条最新的"。
+        for number, line in enumerate(body.splitlines(), 1):
+            text = line.strip()
+            if "paper_signals_archive" not in text or text.startswith("SIGNAL_SOURCES"):
+                continue
+            self.assertIn("WHERE id=?", text,
+                          f"{REVIEW_EVIDENCE_MODULE} 第 {number} 行把归档表用在了"
+                          f"精确 id 之外的形状：{text}")
+
+    def test_guard8e_position_quality_requires_explicit_cycle(self):
+        tree = ast.parse(_source("paper_trading.py"))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.FunctionDef) or node.name != "_position_quality_score":
+                continue
+            kwonly = [arg.arg for arg in node.args.kwonlyargs]
+            self.assertIn("cycle_id", kwonly,
+                          "_position_quality_score 的 cycle_id 不是 keyword-only："
+                          "episode provenance 必须钉在已认领的周期上")
+            self.assertIsNone(node.args.kw_defaults[kwonly.index("cycle_id")],
+                              "_position_quality_score 的 cycle_id 带默认值：缺失必须 fail fast")
+            return
+        self.fail("paper_trading.py 里找不到 _position_quality_score")
+
+    def test_guard8f_position_quality_uses_the_resolver(self):
+        raw = _source("paper_trading.py")
+        body = _function_source(ast.parse(raw), "_position_quality_score", raw)
+        self.assertIn("PREV.resolve_entry_signal(", body,
+                      "_position_quality_score 不再经 episode provenance 解析入场模型分")
+        self.assertNotIn("ORDER BY signal_date DESC", body,
+                         "_position_quality_score 又出现了 latest-signal 搜索")
+
+    def test_guard8g_legacy_latest_signal_sql_is_gone(self):
+        """整份 paper_trading.py 不得再把 latest signal 当 position quality 证据。"""
+        raw = _source("paper_trading.py")
+        hits = [
+            (number, line.strip())
+            for number, line in enumerate(raw.splitlines(), 1)
+            if "ORDER BY signal_date DESC" in line
+        ]
+        self.assertEqual(hits, [], f"latest-signal 排序回流到 paper_trading：{hits}")
+
+    def test_guard8h_save_position_review_has_no_wall_clock_fallback(self):
+        raw = _source("paper_trading.py")
+        body = _function_source(ast.parse(raw), "_save_position_review", raw)
+        # 只查**代码**：注释里会引用旧实现作为历史说明，不应误报。
+        code = "\n".join(
+            line for line in body.splitlines() if not line.strip().startswith("#")
+        )
+        self.assertNotIn("dt.date.today()", code,
+                         "_save_position_review 又用机器今天兜底 review_date")
+        self.assertNotIn("date.today()", code,
+                         "_save_position_review 又用机器今天兜底 review_date")
+        self.assertIn("review_date", code)
+        self.assertIn("ValueError", code,
+                      "review_date 缺失必须 fail fast，不得静默猜日期")
 
 
 if __name__ == "__main__":

@@ -63,6 +63,8 @@ import paper_slot_occupancy as PSO
 import paper_risk_exit_eligibility as PRE
 import paper_risk_decision as PRD
 import paper_risk_scan_state as PRSS
+import paper_position_review as PReview
+import paper_position_review_evidence as PREV
 import adaptive_selection_compat as ASC
 # ELC / EPD 仍被非 cleanup 路径使用（signal freshness、entry slice plan、
 # dispatch 规划与核验、gated order 查询）。清理动作已移交 paper_slot_service，
@@ -7874,6 +7876,23 @@ STRATEGY_MAX_POSITIONS = 6
 STRATEGY_PROTECTED_SLOT_FLOOR = 2
 SLOT_UPGRADE_MIN_CANDIDATE_SCORE = 75.0
 SLOT_UPGRADE_MIN_EDGE = 25.0
+# R17：集中换仓决策已抽到 paper_position_review（纯域模块）。它不 import 本模块，
+# 因此阈值必须由这里注入；打包成模块级常量，既让"常量表 ↔ policy 字段"的对应
+# 关系一眼可查，也避免每次调用重建 dataclass。
+REVIEW_POLICY = PReview.ReviewPolicy(
+    lot_size=LOT_SIZE,
+    max_sells_per_run=POSITION_REVIEW_MAX_SELLS_PER_RUN,
+    exit_score=POSITION_REVIEW_EXIT_SCORE,
+    replace_score=POSITION_REVIEW_REPLACE_SCORE,
+    any_replace_score=POSITION_REVIEW_ANY_REPLACE_SCORE,
+    replacement_edge=POSITION_REVIEW_REPLACEMENT_EDGE,
+    replacement_execution_buffer=POSITION_REPLACEMENT_EXECUTION_BUFFER,
+    full_cap_edge=POSITION_FULL_CAP_REPLACEMENT_EDGE,
+    full_cap_max_score=POSITION_FULL_CAP_MAX_SCORE,
+    slot_upgrade_min_candidate_score=SLOT_UPGRADE_MIN_CANDIDATE_SCORE,
+    slot_upgrade_min_edge=SLOT_UPGRADE_MIN_EDGE,
+    rotation_max_per_day=POSITION_ROTATION_MAX_PER_STRATEGY_DAY,
+)
 # A seat transfer is less aggressive than a forced quality rotation: it is
 # allowed only for a genuinely strong candidate, but does not require the
 # candidate to beat an existing holding by the full urgent-replacement margin.
@@ -10915,7 +10934,7 @@ def _downside_confirmed(conn, account_id, code, asof_day, guard):
     return prior_level in {"warning", "partial", "full"} and confirmed_intent
 
 
-def _position_quality_score(conn, position, quote, asof_day, news=None, replacement=None, nav=None, market=None,
+def _position_quality_score(conn, position, quote, asof_day, *, cycle_id, news=None, replacement=None, nav=None, market=None,
                             flow_trajectory=None):
     """Score an existing holding for concentration decisions (0..100).
 
@@ -10924,6 +10943,12 @@ def _position_quality_score(conn, position, quote, asof_day, news=None, replacem
     the original model score and verified negative-event pressure.  A high
     score may remain as a one-lot core/observation holding; a low score is
     eligible for rotation only after T+1 and quote gates pass.
+
+    ``cycle_id`` 是 **keyword-only 且必填**（R17）：入场 signal 的 provenance
+    必须钉在**已认领的**周期上，实现层不得再问一次"现在 active 的是谁"。
+
+    评分算术本身已抽到 :mod:`paper_position_review`；本函数只做证据收集与
+    orchestration（行情 / K 线 / provenance / 新闻 / 替代数据 / 权重 / 替补）。
     """
     code = str(position.get("code") or "")
     account_id = position.get("account_id")
@@ -10958,20 +10983,30 @@ def _position_quality_score(conn, position, quote, asof_day, news=None, replacem
             trend = max(0.0, min(100.0, trend))
             trend_detail = f"收盘/MA20/MA60结构 {sum(checks)}/{len(checks)}"
 
+    # R17：入场模型分只能来自**当前 episode 的 provenance** ——
+    # risk_state.opened_order_id → verified cycle-owned BUY order → 精确 signal_id。
+    # 绝不回落到「account+code 的最近一条 signal」（那既没有 episode 归属，
+    # 也没有 asof 上界，会让后来的无关 signal 或未来 signal 改变自动换仓判定）。
+    provenance = PREV.resolve_entry_signal(
+        conn,
+        cycle_id=cycle_id,
+        account_id=account_id,
+        code=code,
+        opened_order_id=position.get("episode_opened_order_id"),
+        asof_day=asof_day,
+    )
     model_score = 50.0
-    signal = conn.execute(
-        """SELECT rank_score,t_score,payload FROM paper_signals
-           WHERE account_id=? AND code=? ORDER BY signal_date DESC,id DESC LIMIT 1""",
-        (account_id, code),
-    ).fetchone()
-    if signal:
-        payload = _loads(signal["payload"], {})
+    model_score_source = "unknown"
+    if provenance["status"] == "verified":
+        signal = provenance["signal"]
+        payload = _loads(signal.get("payload"), {})
         entry = (payload.get("decision") or {}).get("entry_model") or {}
         model_score = max(
             _score100(signal["t_score"], 0.0),
             _score100(entry.get("score"), 0.0),
             _score100(signal["rank_score"], 0.0),
         )
+        model_score_source = "episode_provenance"
     negative = _negative_hits(news or [], code)
     main_force_intent = PRD.main_force_intent(position, quote, market=market, news=news)
     news_penalty = min(24.0, len(negative) * 12.0)
@@ -11011,22 +11046,16 @@ def _position_quality_score(conn, position, quote, asof_day, news=None, replacem
     alt_shadow_delta = alt_bonus - lockup_penalty
     weights = HOLDING_QUALITY_WEIGHTS.get(account_id, HOLDING_QUALITY_WEIGHTS["trend_pullback"])
     hold_days = _hold_days(position, asof_day)
-    # A just-opened position has no completed holding-period evidence.  Keep
-    # its entry model visible, but neutralise the slow daily-K component for
-    # the first calendar trading day.  Hard stops, verified announcements and
-    # T+1/limit gates remain fully active elsewhere in monitor_risk.
-    review_phase = "建仓复核" if hold_days < 1 else "持仓复核"
-    trend_for_score = 50.0 if hold_days < 1 else trend
-    # Public-web alternative data remains shadow evidence until its
-    # point-in-time coverage and out-of-sample attribution are validated.
-    # It must not move automatic concentration/rotation thresholds yet.
-    score = (
-        model_score * weights["model"] + trend_for_score * weights["trend"]
-        + flow * weights["flow"] + momentum * weights["momentum"]
-        + return_score * weights["return"] - news_penalty
+    # 评分算术与 grade 边界在 paper_position_review（纯域模块），公式逐字等价。
+    scored = PReview.score_quality(
+        model_score=model_score, trend_score=trend, flow_score=flow,
+        momentum_score=momentum, return_score=return_score,
+        news_penalty=news_penalty, weights=weights, hold_days=hold_days,
     )
-    score = round(max(0.0, min(100.0, score)), 2)
-    grade = "建仓复核" if hold_days < 1 else ("核心" if score >= 65 else "观察" if score >= 50 else "减仓" if score >= 40 else "淘汰")
+    score = scored["score"]
+    grade = scored["grade"]
+    trend_for_score = scored["trend_for_score"]
+    review_phase = scored["review_phase"]
     market_value = max(0.0, _num(position.get("qty")) * max(price, 0.0))
     nav = max(_num(nav), 0.0)
     position_pct = market_value / nav * 100 if nav else 0.0
@@ -11083,6 +11112,15 @@ def _position_quality_score(conn, position, quote, asof_day, news=None, replacem
         "review_phase": review_phase, "weights": weights,
         "model_score": round(model_score, 2), "trend_score": round(trend_for_score, 2),
         "trend_raw_score": round(trend, 2),
+        # R17 provenance：解释"这个 model_score 是怎么来的"，让 50 分不是黑箱。
+        "model_score_source": model_score_source,
+        "episode_opened_order_id": position.get("episode_opened_order_id"),
+        "entry_signal_id": provenance.get("signal_id"),
+        "entry_signal_date": provenance.get("signal_date"),
+        "entry_signal_provenance_status": provenance["status"],
+        "entry_signal_provenance_reason": provenance.get("reason"),
+        # decide_action 是纯函数，最短观察期由 adapter 注入（账户配置不进口域层）。
+        "min_hold_days": _replacement_min_hold_days(account_id),
         "flow_score": round(flow, 2), "momentum_score": round(momentum, 2),
         "return_score": round(return_score, 2), "turnover": round(turnover, 2),
         "news_penalty": round(news_penalty, 2),
@@ -11186,101 +11224,15 @@ def _permission_scope_exit_candidates(conn, positions, reviews, quote_map, asof_
     return selected
 
 
-def _concentration_action(review, position, quote_status, sells_used):
-    """Decide whether a quality review should trigger a full rotation sell."""
-    if not quote_status.get("fresh"):
-        return "quote_pending", "行情未通过核验，暂不做集中换仓"
-    if not review or review.get("score") is None:
-        return "review_pending", "持仓评分尚未完成，暂不做集中换仓"
-    if int(position.get("available_qty") or 0) < LOT_SIZE:
-        return "t1_locked", "T+1 可卖份额不足，等待可卖后再评估"
-    if sells_used >= POSITION_REVIEW_MAX_SELLS_PER_RUN:
-        return "queued", "本轮集中换仓已达到最多三笔，顺延下一轮"
-    score = _num(review.get("score"))
-    raw_edge = _num(review.get("replacement_edge"), None)
-    edge = (
-        raw_edge - POSITION_REPLACEMENT_EXECUTION_BUFFER
-        if raw_edge is not None else None
-    )
-    review["replacement_execution_buffer"] = POSITION_REPLACEMENT_EXECUTION_BUFFER
-    review["replacement_net_edge"] = round(edge, 2) if edge is not None else None
-    replacement_score = _num(review.get("replacement_score"), None)
-    at_dynamic_limit = bool(review.get("at_dynamic_limit"))
-    rotations_today = int(_num(review.get("rotations_today")))
-    # The normal two-day observation window prevents churn.  It must not trap
-    # a very weak holding when a materially stronger, freshly revalidated
-    # replacement is waiting for its only slot.  This is still constrained by
-    # T+1, fresh exit quote, total pool hard cap and the replacement buy gate.
-    urgent_slot_upgrade = bool(
-        replacement_score is not None
-        and replacement_score >= SLOT_UPGRADE_MIN_CANDIDATE_SCORE
-        and edge is not None and edge >= SLOT_UPGRADE_MIN_EDGE
-        and score <= POSITION_REVIEW_EXIT_SCORE
-    )
-    if urgent_slot_upgrade:
-        return "consolidation_exit", (
-            f"紧急择强换仓：现仓 {score:.1f} 分，替补 {replacement_score:.1f} 分，"
-            f"原始分差 {raw_edge:.1f}、扣除执行缓冲后 {edge:.1f}；"
-            "豁免最短观察期但不豁免 T+1/行情/总池门禁"
-        )
-    min_hold_days = _replacement_min_hold_days(
-        review.get("account_id") or position.get("account_id")
-    )
-    if review.get("hold_days", 0) < min_hold_days:
-        return "new_position", (
-            f"持仓观察期 {review.get('hold_days', 0)}/{min_hold_days} 日，"
-            "暂不因评分换仓"
-        )
-    # Small residual lots can be consolidated at a moderate score.  A larger
-    # holding is only rotated when its absolute quality is clearly weak; this
-    # prevents broad churn while still removing a genuinely poor position.
-    can_replace = (
-        edge is not None and edge >= POSITION_REVIEW_REPLACEMENT_EDGE
-        and (
-            (review.get("small_position") and score < POSITION_REVIEW_REPLACE_SCORE)
-            or score <= POSITION_REVIEW_ANY_REPLACE_SCORE
-        )
-    )
-    full_slot_upgrade = (
-        at_dynamic_limit
-        and edge is not None and edge >= POSITION_FULL_CAP_REPLACEMENT_EDGE
-        and score < POSITION_FULL_CAP_MAX_SCORE
-    )
-    # Swing positions need an independent observation before a quality-score
-    # exit.  A single intraday/market-wide score can be noisy and was observed
-    # to liquidate trend holdings one session before their rebound.  Hard
-    # stops, downside guards and urgent slot upgrades are evaluated elsewhere
-    # and still take precedence; this gate only affects concentration exits.
-    if position.get("account_id") == "trend_pullback" and score <= POSITION_REVIEW_EXIT_SCORE:
-        if not bool(review.get("quality_exit_confirmed")):
-            return "watch", (
-                f"趋势持仓评分 {score:.1f} 低于淘汰线，但尚无连续观察确认；"
-                "保留观察，等待下一完整窗口或结构破坏"
-            )
-    if score <= POSITION_REVIEW_EXIT_SCORE:
-        return "consolidation_exit", f"持仓质量评分 {score:.1f} 低于淘汰线 {POSITION_REVIEW_EXIT_SCORE:.0f}"
-    if (can_replace or full_slot_upgrade) and rotations_today >= POSITION_ROTATION_MAX_PER_STRATEGY_DAY:
-        return "queued", (
-            f"本策略今日主动换仓已达 {rotations_today}/{POSITION_ROTATION_MAX_PER_STRATEGY_DAY} 上限，"
-            "候选保留至下一轮/下一交易日"
-        )
-    if can_replace or full_slot_upgrade:
-        if full_slot_upgrade:
-            return "consolidation_exit", (
-                f"动态席位已满，择强换股：现仓 {score:.1f} 分，"
-                f"替补原始高 {raw_edge:.1f} 分，扣执行缓冲后仍高 {edge:.1f} 分"
-            )
-        if can_replace:
-            return "consolidation_exit", (
-                f"低质量小仓换仓：评分 {score:.1f}，后备候选原始高 {raw_edge:.1f} 分，"
-                f"扣执行缓冲后高 {edge:.1f} 分"
-            )
-    if score < POSITION_REVIEW_REPLACE_SCORE:
-        return "watch", f"评分 {score:.1f} 偏弱，尚无足够优势候选替换"
-    return "hold", f"评分 {score:.1f}，保留并等待策略加仓确认"
-
-
 def _save_position_review(conn, cycle_id, review, action, reason):
+    # R17：review_date 必须**显式**来自调用方。此前是
+    # ``_date(review.get("review_date") or dt.date.today())`` —— 一个 wall-clock
+    # 回退：任何遗漏 review_date 的路径都会把历史 as-of 复核日期偷偷写成"机器今天"，
+    # 而 monitor_risk 一直显式设置 review["review_date"] = day。缺失即 fail fast，
+    # 绝不猜日期（determinism 修复，属 R17 范围）。
+    review_date = review.get("review_date")
+    if review_date is None or str(review_date).strip() == "":
+        raise ValueError("_save_position_review 需要显式 review_date（不允许 wall-clock 回退）")
     replacement = review.get("replacement") or {}
     conn.execute(
         """INSERT INTO paper_position_reviews(
@@ -11293,7 +11245,7 @@ def _save_position_review(conn, cycle_id, review, action, reason):
              replacement_code=excluded.replacement_code,replacement_score=excluded.replacement_score,
              reasons=excluded.reasons,detail=excluded.detail,created_at=excluded.created_at""",
         (
-            cycle_id, review["account_id"], review["code"], _date(review.get("review_date") or dt.date.today()).isoformat(),
+            cycle_id, review["account_id"], review["code"], _date(review_date).isoformat(),
             review["score"], review["grade"], action, review["market_value"], review["position_pct"],
             replacement.get("code"), review.get("replacement_score"),
             "；".join(review.get("reasons") or []),
@@ -11478,6 +11430,7 @@ def _monitor_risk_impl(asof_date=None, *, cycle_id):
             )
             review = _position_quality_score(
                 conn, position, quote_map.get(position["code"], {}), day,
+                cycle_id=cycle_id,
                 news=news, replacement=replacement, nav=pool_nav,
                 market=market_context,
                 flow_trajectory=flow_trajectory_map.get(position["code"]),
@@ -11545,8 +11498,9 @@ def _monitor_risk_impl(asof_date=None, *, cycle_id):
                 pending_ratio, pending_reason, _, pending_detail = _sell_plan(
                     position, quote, day, news
                 )
-                quality_action, quality_reason = _concentration_action(
+                quality_action, quality_reason = PReview.decide_action(
                     quality_review, position, quote_status, concentration_sells_used,
+                    policy=REVIEW_POLICY,
                 )
                 if permission_reason:
                     quality_action = "permission_scope_exit_pending_quote"
@@ -11630,8 +11584,9 @@ def _monitor_risk_impl(asof_date=None, *, cycle_id):
                     ACCOUNT_SPECS.get(position["account_id"]) or {},
                 ),
             )
-            quality_action, quality_reason = _concentration_action(
+            quality_action, quality_reason = PReview.decide_action(
                 quality_review, position, quote_status, concentration_sells_used,
+                policy=REVIEW_POLICY,
             )
             if permission_reason:
                 # Permissions exits have their own per-strategy daily quota.
