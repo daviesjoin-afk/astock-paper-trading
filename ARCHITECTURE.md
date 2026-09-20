@@ -172,13 +172,16 @@ paper_positions              仅兼容展示投影，零执行权威
 
 缺失风险状态是 fail-safe 而不是"补一个默认值"：peak 锚定成本（与全新 episode 默认一致）、`take_stage=None`（阶梯止盈整体跳过，未知绝不升格为已知），hard stop / max hold 照常工作。投影里被篡改的 peak / take_stage 永不进入执行判定。
 
-**episode 终止只有一个判据**：同 cycle 权威 `paper_position_lots` 剩余量之和为 0。该判据由 `finalize_sell(conn, *, cycle_id, account_id, code, next_take_stage=None)` 自己从权威 lots 读取——不让三个调用方各写一份 `position_closed`。三条生产 SELL 路径必须全部经过它：
+**episode 终止只有一个判据**：同 cycle 权威 `paper_position_lots` 剩余量之和为 0。该判据由 `finalize_sell(conn, *, cycle_id, account_id, code, next_take_stage=None)` 自己从权威 lots 读取——不让调用方各写一份 `position_closed`。R20 后，应用层 SELL 路径只能经过唯一 commit primitive；`PPRS.finalize_sell` 只由 `execution_planner.commit_fill` 调用：
 
-| Sell path | 能否整仓退出 | episode finalizer |
-| --- | ---: | --- |
-| 风控扫描 `paper_trading._monitor_risk_impl` | 是 | `PPRS.finalize_sell` |
-| 手动/延迟委托 `execution_planner.commit_fill`（SELL 分支） | 是 | `PPRS.finalize_sell` |
-| 日内高抛 `paper_trading._intraday_sell` | 是（`available == LOT_SIZE` 时高抛即整仓） | `PPRS.finalize_sell` |
+| Sell path | 能否整仓退出 | 成交提交 owner | episode finalizer |
+| --- | ---: | --- | --- |
+| 风控扫描 `paper_trading._monitor_risk_impl` | 是 | `execution_planner.commit_fill` | `PPRS.finalize_sell`（仅 commit_fill 内） |
+| 手动/延迟委托 `execution_planner.commit_fill`（SELL 分支） | 是 | `execution_planner.commit_fill` | `PPRS.finalize_sell`（仅 commit_fill 内） |
+| 日内高抛 `paper_trading._intraday_sell` | 是（`available == LOT_SIZE` 时高抛即整仓） | `execution_planner.commit_fill` | `PPRS.finalize_sell`（仅 commit_fill 内） |
+
+A trading decision may have many application paths, but a fill has exactly one commit owner.
+Decision path != fill commit authority.
 
 模块边界（刻意窄，且必须保持窄）：零项目级 import（只依赖 stdlib 与调用方交进来的 `sqlite connection`）；不拥有事务（绝不 `commit`/`rollback`/`BEGIN`，状态收尾必须与 lot 消耗、订单/成交写入同处调用方事务）；不解析 active cycle（`cycle_id` 一律由调用方显式传入，禁止 `MAX(cycle_id)` / `paper_accounts.cycle_id` / 日期推断）；不拥有 schema（DDL 仍在 `paper_schema_migrations`，注册仍在 `db_migrate`）；不决定成交（只在权威 lot 消耗成功**之后**收尾，状态行的存在与否绝不反过来决定 SELL 是否成立，missing state 的 fail-safe 语义不变）。
 
@@ -191,6 +194,8 @@ paper_position_risk_state ──▶ (stdlib only)
 ```
 
 `paper_trading.py` 不再保留这四个 CRUD helper 的任何转发 wrapper（它们是新 API，没有 legacy compatibility 价值）。回归门禁见 `backend/test_paper_trading_architecture_guard.py`（反向 import、CRUD SQL 回流、`paper_trading.py` 规模基线、service locator、SELL 路径 finalizer 覆盖率）。
+
+R20 进一步把 SELL 成交提交收敛到 `execution_planner.commit_fill`：`paper_trading` 不再 runtime `INSERT INTO paper_fills`、不再 `EV.stamp_order`、不再直接 `PPRS.finalize_sell`，也不得自行 `_consume_available_lots` / `_credit_shared_cash`。回归门禁见 Guard 11a~11f 与 `backend/test_sell_fill_commit_convergence.py`（SF-1 ~ SF-14）。
 
 | 领域 | 代码范围 | 拥有什么 | 不拥有什么 |
 | --- | --- | --- | --- |
@@ -424,6 +429,13 @@ PR-49 把这条口径的实现收敛到只读解析器 `backend/paper_cycle_owne
     - **不宣称历史 reservation 可重建**：`paper_capital_reservations` 不是 event-sourced（只保留最终状态），本层只关闭**可由现有 cycle/as-of 字段明确约束的** future evidence leakage，不伪造"完整 historical replay determinism"。
     - **无迁移**：现有 schema 已有 `reservation.cycle_id` / `order.cycle_id` / `created_at` / `status`，本层不新增 migration。
     - 依赖方向单向：`paper_trading` → {`manual_orders`, `execution_planner`, `paper_capital_reservations`, `strategy_risk_enforcement`} → stdlib，反向禁止。回归门禁见 `backend/test_entry_capital_asof.py`（EC-1 ~ EC-20c）、`backend/test_strategy_buy_commit_convergence.py`（SB-1 ~ SB-16 + EC-21）、`backend/test_paper_trading_architecture_guard.py`（Guard 10a ~ Guard 10v）、`backend/test_deferred_fill_cycle_binding.py`（预占归属冲突终态化 + 漂移释放失败浮现）、`work/r19_mutation_check.py`（M-ENT1 ~ M-ENT28）。
+
+21. SELL Fill Commit Convergence 必须把**决策路径**与**成交提交 authority**分开（R20）：
+    - **成交提交只有一个原语**：`execution_planner.commit_fill` 是 order-backed fill commit authority；`_monitor_risk_impl` 与 `_intraday_sell` 只负责卖出决策、数量、价格、pending order 与失败/重试处理。R20 之前两条路径各自维护 `lot consumption → cash credit → order filled → paper_fills → execution stamp → episode finalize → risk/audit` 的第二套写路径；现在统一为 `decision → create pending order → EP.commit_fill`。
+    - **SELL invariants**：`commit_fill` SELL 分支必须保持 `lease → order-cycle provenance → order identity → execution-cycle invariant → ledger mutation` 的顺序；lot 消耗必须显式绑定订单的 durable `cycle_id`，未知 / legacy NULL / 跨周期一律 fail closed。`PPRS.finalize_sell` 只由 `commit_fill` 调用，partial take-profit 通过显式 `sell_next_take_stage` 推进档位，full exit 由 finalizer 从权威 lots 判定。
+    - **事务不变量**：一次成交只能是“全部提交成功”或“全部没有发生”；应用层必须在 SAVEPOINT 内创建 pending order 并调用 `commit_fill`，失败时 `ROLLBACK TO` + `RELEASE`，不得留下 lot/cash/fill/order/verification/episode 的部分状态。
+    - **回归门禁**：`backend/test_sell_fill_commit_convergence.py`（SF-1 ~ SF-14）、`backend/test_paper_trading_architecture_guard.py`（Guard 11a ~ 11f）、`work/r20_mutation_check.py`（M-EXE1 ~ M-EXE18，要求 18/18 RED、survived=0、字节与 SHA256 还原）。
+    - **锁句**：A trading decision may have many application paths, but a fill has exactly one commit owner. Decision path != fill commit authority.
 
 ## 学习/研究数据契约（PR-8）
 

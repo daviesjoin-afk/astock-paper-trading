@@ -98,16 +98,16 @@ class PaperFillWritePathGuardTests(unittest.TestCase):
                     )
         self.assertEqual(offenders, [], "存在未接闸门的成交流水写路径：\n" + "\n".join(offenders))
         # 门禁自身不能空转：今天已知的写路径必须全部被扫到。
-        for expected in ("paper_trading.py", "execution_planner.py", "demo_seed.py"):
+        for expected in ("execution_planner.py", "demo_seed.py"):
             self.assertTrue(
                 any(entry.startswith(expected) for entry in seen),
                 f"{expected} 的成交流水写路径未被门禁扫到（门禁失效？）：{seen}",
             )
-        # R19：普通策略 BUY 收敛到 ``execution_planner.commit_fill`` 之后，
-        # ``_buy_order`` 不再自己 INSERT INTO paper_fills，活跃写路径由 5 条
-        # 收敛为 4 条（demo_seed / commit_fill / 风控卖出 / 日内卖出）。
+        # R20：所有生产 SELL/BUY 收敛到 ``execution_planner.commit_fill`` 之后，
+        # paper_trading 不再直接 INSERT INTO paper_fills；活跃写路径只剩
+        # commit_fill 与 demo_seed 夹具写入器。
         self.assertEqual(
-            len(seen), 4,
+            len(seen), 2,
             f"成交流水写路径数量异常（应统一走 execution_planner.commit_fill）：{seen}",
         )
 

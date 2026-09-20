@@ -543,6 +543,7 @@ def commit_fill(
     detail: Mapping[str, Any] | None = None,
     assumption: str = "本地行情快照按 0.10% 滑点模拟；不代表真实可成交价格",
     is_t_base: bool = True,
+    sell_next_take_stage: int | None = None,
 ):
     """统一成交落库原语：自动与手动共用“扣款 → 记 lot → 写 fill → 风险日志”。
 
@@ -558,6 +559,7 @@ def commit_fill(
     code = str(plan.get("code"))
     account_id = account["id"]
     realized_pnl = None
+    cost_amount = None
 
     PT._assert_active_lease(conn, "execution planner commit")
 
@@ -619,13 +621,20 @@ def commit_fill(
         # next_take_stage 缺省 None（部分卖出原样保留 stage，绝不重置）。
         PPRS.finalize_sell(
             conn, cycle_id=order_cycle_id, account_id=account_id, code=code,
+            next_take_stage=sell_next_take_stage,
         )
+
+    fill_detail = detail if detail is not None else plan
+    if side == "sell" and cost_amount is not None:
+        fill_detail = dict(fill_detail)
+        fill_detail.setdefault("cost_amount", round(cost_amount, 2))
+        fill_detail.setdefault("realized_pnl", round(realized_pnl, 2))
 
     PT._assert_active_lease(conn, "execution planner finalization")
     conn.execute(
         """UPDATE paper_orders SET filled_price=?,amount=?,fees=?,status='filled',
            reason=?,risk_payload=?,realized_pnl=?,executed_at=? WHERE id=?""",
-        (fill_price, amount, fees, reason, PT._json(detail if detail is not None else plan),
+        (fill_price, amount, fees, reason, PT._json(fill_detail),
          realized_pnl, PT._now(), order_id),
     )
     conn.execute(
@@ -642,7 +651,7 @@ def commit_fill(
     EV.stamp_order(conn, order_id)
     PT._risk_log(
         conn, account_id, code, side, action,
-        risk_log_reason or reason, detail if detail is not None else plan,
+        risk_log_reason or reason, fill_detail,
     )
     PT._audit(
         conn, account_id, audit_action or action,

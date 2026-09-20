@@ -96,7 +96,7 @@ FORBIDDEN_PAPER_TRADING_DEFS = frozenset({
 #: ``paper_risk_scan_state.py`` 后基线持续向下 ratchet。以后只允许 same or
 #: lower：确有 facade wiring 要加，必须同时抽出别的函数保持不增长。
 #: 不要设计环境变量绕过 / ``skip if CI`` 之类的后门。
-PAPER_TRADING_LOC_BASELINE = 16049
+PAPER_TRADING_LOC_BASELINE = 16045
 PAPER_TRADING_DEF_BASELINE = 282
 
 #: Guard 4 —— 新模块允许出现的 import 根（stdlib）。
@@ -406,15 +406,26 @@ class EveryProductionSellPathFinalizesTheEpisode(unittest.TestCase):
     """Guard 5 —— episode 收尾只有一条判据、一个 finalizer。"""
 
     def test_guard5_sell_paths_call_the_shared_finalizer(self):
+        """R20：应用层只能调 commit primitive，finalizer 只归 execution_planner。"""
         for filename, function in PRODUCTION_SELL_PATHS:
             with self.subTest(path=f"{filename}:{function}"):
                 raw = _source(filename)
                 body = _function_source(ast.parse(raw), function, raw)
-                self.assertIn(
-                    f"{FINALIZER_OWNER}.{FINALIZER_CALL}", body,
-                    f"{filename}:{function} 不再调用共享的 episode finalizer —— "
-                    "该路径卖光最后一股权威 lot 后会留下已结束 episode 的运行时状态",
-                )
+                if filename == "execution_planner.py":
+                    self.assertIn(
+                        f"{FINALIZER_OWNER}.{FINALIZER_CALL}", body,
+                        "execution_planner.commit_fill 不再调用共享的 episode finalizer",
+                    )
+                else:
+                    self.assertIn(
+                        "EP.commit_fill(", body,
+                        f"{filename}:{function} 不再经过唯一成交提交原语",
+                    )
+                    self.assertNotIn(
+                        f"{FINALIZER_OWNER}.{FINALIZER_CALL}", body,
+                        f"{filename}:{function} 重新直接调用 episode finalizer；"
+                        "成交提交 authority 又出现第二套",
+                    )
 
     def test_guard5b_finalizer_is_not_reached_through_paper_trading(self):
         """execution_planner 必须直接依赖 authority 模块，而不是让 PT 转发。"""
@@ -1330,6 +1341,104 @@ class EntryCapitalPlanningIsBounded(unittest.TestCase):
         self.assertIn("expected_cycle_id=order_cycle_id",
                       planner[index:index + 300],
                       "execution_planner.commit_fill 没有把订单周期交给预占层")
+
+
+
+class SellFillCommitConvergenceIsBounded(unittest.TestCase):
+    """Guard 11 —— SELL 决策可以有多条路径，成交提交只能有一个 owner。"""
+
+    def _flat(self, name, filename="paper_trading.py"):
+        raw = _source(filename)
+        body = _function_source(ast.parse(raw), name, raw)
+        return "".join(body.split())
+
+    def _assert_app_sell_delegates(self, function):
+        body = self._flat(function)
+        for shape, label in (
+            ("INSERTINTOpaper_fills", "成交流水写入"),
+            ("EV.stamp_order(", "执行验证盖章"),
+            ("_credit_shared_cash(", "现金入账"),
+            ("_consume_available_lots(", "lot 消耗"),
+            ("PPRS.finalize_sell(", "episode 收尾"),
+        ):
+            with self.subTest(function=function, shape=label):
+                self.assertNotIn(
+                    shape, body,
+                    f"{function} 又直接执行{label}（{shape}）：应用层只能创建订单并调用 "
+                    "execution_planner.commit_fill",
+                )
+        self.assertIn(
+            "EP.commit_fill(", body,
+            f"{function} 不再经过唯一成交提交原语 execution_planner.commit_fill",
+        )
+
+    def test_guard11a_risk_sell_delegates_to_commit_fill(self):
+        self._assert_app_sell_delegates("_monitor_risk_impl")
+
+    def test_guard11b_intraday_sell_delegates_to_commit_fill(self):
+        self._assert_app_sell_delegates("_intraday_sell")
+
+    def test_guard11c_paper_trading_has_no_runtime_fill_insert(self):
+        tree = ast.parse(_source("paper_trading.py"))
+        offenders = []
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            if not isinstance(func, ast.Attribute) or func.attr not in {"execute", "executemany"}:
+                continue
+            if not node.args or not isinstance(node.args[0], ast.Constant):
+                continue
+            sql = str(node.args[0].value or "").upper()
+            if "INSERT INTO PAPER_FILLS" in sql:
+                offenders.append(node.lineno)
+        self.assertEqual(
+            offenders, [],
+            f"paper_trading.py 第 {offenders} 行又出现 runtime paper_fills INSERT："
+            "成交流水必须只由 execution_planner.commit_fill 写入",
+        )
+
+    def test_guard11d_stamp_order_is_owned_by_commit_fill(self):
+        source = _source("paper_trading.py")
+        self.assertNotIn(
+            "EV.stamp_order(", source,
+            "paper_trading.py 又直接给成交盖章：execution verification 必须归 commit_fill",
+        )
+        self.assertIn(
+            "EV.stamp_order(", _source("execution_planner.py"),
+            "execution_planner.commit_fill 不再盖执行验证章",
+        )
+
+    def test_guard11e_finalize_sell_is_owned_by_commit_fill(self):
+        self.assertNotIn(
+            "PPRS.finalize_sell(", _source("paper_trading.py"),
+            "paper_trading.py 又直接收尾 position episode：SELL episode authority 必须归 commit_fill",
+        )
+        self.assertIn(
+            "PPRS.finalize_sell(", _source("execution_planner.py"),
+            "execution_planner.commit_fill 不再收尾 position episode",
+        )
+
+    def test_guard11f_sell_commit_keeps_defense_in_depth_order(self):
+        body = self._flat("commit_fill", "execution_planner.py")
+        ordered = (
+            "_order_cycle_provenance_for_order(",
+            "_assert_order_identity(",
+            "_assert_order_execution_cycle(",
+            "_consume_available_lots(",
+        )
+        positions = []
+        for shape in ordered:
+            self.assertIn(shape, body, f"commit_fill 缺少 SELL 防守链：{shape}")
+            positions.append(body.index(shape))
+        self.assertEqual(
+            positions, sorted(positions),
+            "commit_fill 的 SELL 防守链顺序被打乱：provenance → identity → execution-cycle → lot mutation",
+        )
+        self.assertNotIn(
+            "_active_cycle(", body,
+            "commit_fill 重新解析 active cycle 决定成交归属",
+        )
 
 
 def _function_node(tree, name):
