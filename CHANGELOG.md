@@ -2,6 +2,30 @@
 
 本文记录版本变化；GitHub Release 同步提供详细更新、升级步骤和已知限制。
 
+## v2.0.0 — 确定性策略平台、Point-in-Time 研究、权威账本与风险闭环
+
+发布日期：2026-09-20。详见 [完整发布说明](docs/RELEASE-v2.0.0.md)。
+
+- 自 v1.3.0 后合入 126 个 PR：动态 Strategy Registry、不可变版本、声明式 DSL、Strategy Workbench、统一 RuntimeContext / OrderIntent / Execution Planner 与 N-strategy allocation。
+- 建立 point-in-time learning/evaluation、purged walk-forward、historical tradability archive/observation ledger 与 replayable candidate provenance，系统性关闭 future leakage。
+- 引入 execution reality / verification：订单自称 filled 不再等于真实成交；verified fills、immutable order cycle provenance 成为收益与执行统计的证据门槛。
+- `paper_position_lots` 成为当前持仓数量/成本权威，`paper_positions` 降级为兼容投影；rebalance、risk state、risk scan 和 replacement/slot decisions 全面 cycle/as-of 化。
+- 风险域完成 position episode → deterministic sell → durable risk scan → episode-bound review → as-of-bound replacement 的连续闭环。
+- DataFeed/StrategyPlugin、operator security boundary、前端模块化与 Playwright E2E、security leak scan 等工程基础同步强化。
+- paper schema 演进至 v21；无法证明的 legacy provenance 保持 unknown/NULL，不做猜测性回填。
+- #174 合并后的 master：Python 3.11/3.12 与 Docker 均运行 3727 项后端测试，syntax / quality / frontend / Chromium / security 全绿。
+
+## v1.3.0 — 自进化闭环、策略选股页与前端性能修复
+
+发布日期：2026-09-08。GitHub Release：`v1.3.0`。
+
+- 自进化 apply + A/B validation 闭环完成；
+- 上线按五套模拟盘策略分组的“策略选股”页；
+- 前端切页改用 SWR 缓存并削减 Observer/图表重排开销；
+- 修复部署 cron 根目录、paper model id whitelist 与 optional-factor NaN 清空候选等生产问题；
+- 发布时后端回归约 285 项。
+
+
 ## v1.2.0 — 确定性演示、离线 CI 与引擎模块化
 
 发布日期：2026-09-07。详见 [完整发布说明](docs/RELEASE-v1.2.0.md)。
