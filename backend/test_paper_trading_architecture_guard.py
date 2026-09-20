@@ -788,6 +788,22 @@ class ReplacementIsAsOfAndCycleBound(unittest.TestCase):
         self.assertIn("PRep.choose_best_candidate(", body,
                       "候选排序没有交给纯域模块")
 
+    def test_guard9m_slot_chain_budget_uses_the_explicit_cycle(self):
+        """席位预算查询必须显式传 cycle_id（否则一次借位跨越两个周期）。
+
+        `_dynamic_position_limits()` 自身允许 `cycle_id=None`（= active cycle，冷启动
+        / 容量退出 / 面板读取的既有语义），但 ``_slot_upgrade_context`` /
+        ``_apply_slot_borrow`` 这条在途下单链**必须**把已认领周期传进去，否则
+        reviews / 持仓数看显式周期，而 target_limit / donors / allocation_version
+        看 active cycle —— 同周期借位会被错误拒绝。
+        """
+        for name in ("_slot_upgrade_context", "_apply_slot_borrow"):
+            with self.subTest(function=name):
+                raw = _source("paper_trading.py")
+                body = _function_source(ast.parse(raw), name, raw)
+                self.assertIn("_dynamic_position_limits(conn, cycle_id=", body,
+                              f"{name} 没有把显式 cycle 交给席位预算查询")
+
     # ── 共用断言 ──────────────────────────────────────────────────────────
     def _assert_kwonly_required(self, name, param):
         tree = ast.parse(_source("paper_trading.py"))

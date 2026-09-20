@@ -2,6 +2,45 @@
 
 `MERGE: NOT MERGED` · `DEPLOY: NOT DEPLOYED`
 
+## Review follow-up (round 2)
+
+An automated review of head `5f03a185` raised one actionable point, now fixed:
+
+> **Bind the allocation budget to the supplied cycle** — when the caller supplies
+> a non-active cycle (the rollover case this change is intended to handle),
+> `resolved_cycle_id` only bounded the review lookup: `_dynamic_position_limits()`
+> still calls `_active_cycle()` and therefore derives `target_limit` and donors
+> from the newer active cycle. `_apply_slot_borrow` repeated this split, pairing
+> the active cycle's `allocation_version` with the explicit cycle in its row
+> query, so a valid same-cycle borrow is incorrectly rejected as missing.
+
+Correct, and verified in the source before fixing: `_dynamic_position_limits`
+opened with `cycle = _active_cycle(conn)` and used it for both the version-row
+lookup and the insert, so the budget was always the **active** cycle's while the
+reviews and position counts had already moved to the explicit one. In the
+rollover case this made a legitimate same-cycle borrow fail closed with
+"未找到当前席位版本，暂不借位" — a silent loss of the borrow, not a safety win.
+
+`_dynamic_position_limits(conn, *, cycle_id=None)` now takes an optional explicit
+cycle (`None` keeps the pre-existing "whatever is active now" semantics for the
+cold-start allocation, capacity exit and dashboard readers), and the whole
+in-flight order chain passes its claimed cycle through:
+
+```text
+_dynamic_position_limits(conn, cycle_id=current_cycle.id)   # in _buy_order
+  → _slot_upgrade_context(..., cycle_id=current_cycle.id)
+  → _apply_slot_borrow(..., cycle_id=current_cycle.id)
+  → position_limit_version read/write on that same cycle
+  → _rollback_slot_borrow(..., cycle_id=current_cycle.id)
+```
+
+New production regression **RPL-P5d** pins it without mocking the budget: with
+cycle 9 active and the allocation only existing for cycle 8, a cycle-8 borrow
+must succeed and must write cycle 8's version row. New mutation **M-RPL15**
+reverts the budget call to the active cycle and P5d goes RED. New **Guard 9m**
+statically requires `_slot_upgrade_context` / `_apply_slot_borrow` to pass
+`cycle_id` into the budget lookup.
+
 ## Before / After
 
 **Before** — A risk pass could select a replacement signal intended for the next
@@ -253,7 +292,7 @@ Compatibility position projection: paper_positions
   drift cannot slip through. Also asserts the policy defaults equal the
   production constants, that the adapter and the pure module agree on the score,
   and the module's zero-project-import / zero-I/O / zero-clock boundary.
-- **`backend/test_replacement_asof_provenance.py` (NEW, 27 tests)** — evidence
+- **`backend/test_replacement_asof_provenance.py` (NEW, 28 tests)** — evidence
   contract **RP2-01 … RP2-11** (same-day candidate loaded; tomorrow candidate
   excluded; **legal overnight plan still allowed**; future `signal_date` excluded
   even when `intended_date == D`; past intended_date excluded; status filter;
@@ -268,7 +307,9 @@ Compatibility position projection: paper_positions
   (plus **P5b** positive control that the same-cycle borrow does write, and
   **P5c** that the donor position count is read from the explicit cycle),
   **P7** the review's `replacement_score` only ever comes from a same-day
-  candidate.
+  candidate, **P5d** the seat budget (`allocation_version` / `target_limit` /
+  donors) is derived from the explicit cycle so a legitimate same-cycle borrow
+  is not rejected as "version missing".
 - **`backend/test_paper_trading_architecture_guard.py`** — new **Guard 9**
   (`ReplacementIsAsOfAndCycleBound`): 9a pure module zero project imports, 9b
   zero I/O and zero clock, 9c evidence module no reverse dependency and no clock,
@@ -282,7 +323,7 @@ Compatibility position projection: paper_positions
 
 ## Non-vacuity (mutation check)
 
-`work/r18_mutation_check.py` injects **14 byte-level mutations** into real
+`work/r18_mutation_check.py` injects **15 byte-level mutations** into real
 production sources and requires the *specific* contract test to fail with
 `FAIL:`/`ERROR:` on that exact method, so an import/collection error cannot
 masquerade as a catch. Every file is restored byte-identically and verified by
@@ -290,7 +331,7 @@ sha256 in a `finally` block, with a fresh `PYTHONPYCACHEPREFIX` per run so a
 same-length mutation in the same second cannot reuse stale bytecode.
 
 ```text
-RESULT: 14/14 mutations RED, all files restored byte-identical
+RESULT: 15/15 mutations RED, all files restored byte-identical
 ```
 
 | ID | Mutation | Caught by |
@@ -309,6 +350,7 @@ RESULT: 14/14 mutations RED, all files restored byte-identical
 | M-RPL12 | net edge ignores the execution buffer | threshold boundary |
 | M-RPL13 | pure module reverse-imports `paper_trading` | Guard 9a |
 | M-RPL14 | adapter swaps `asof` for the next weekday | RPL-P1 |
+| M-RPL15 | seat budget reverted to the active cycle | RPL-P5d |
 
 **M-RPL1 and M-RPL14 are the core business mutations**, not signature checks:
 restoring the next-day window — either inside the evidence layer or by shifting
@@ -321,13 +363,13 @@ makes the future-review regression go RED.
 | Check | Result |
 |---|---|
 | new modules (replacement decision + provenance) | 69 tests OK |
-| `unittest backend.test_paper_trading_architecture_guard` | 44 tests OK |
-| targeted set (7 modules) | 226 tests OK |
+| `unittest backend.test_paper_trading_architecture_guard` | 45 tests OK |
+| targeted set (7 modules) | 227 tests OK |
 | entry / slot / cycle regression set (11 modules) | 151 tests OK |
 | strategy + golden replay set (9 modules) | 116 tests OK |
-| `unittest discover -s backend` | **3715 tests OK** (skipped=5) |
+| `unittest discover -s backend` | **3717 tests OK** (skipped=5) |
 | `work/r18_before_fix_repro.py` | base 4/4 REPRODUCED → fixed 0/4 |
-| `work/r18_mutation_check.py` | 14/14 RED, restore byte-identical |
+| `work/r18_mutation_check.py` | 15/15 RED, restore byte-identical |
 | `ruff check backend` | All checks passed |
 | `python -m compileall -q backend` | exit 0 |
 

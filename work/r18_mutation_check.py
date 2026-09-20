@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""R18 负向变异矩阵（M-RPL1 ~ M-RPL14）。
+"""R18 负向变异矩阵（M-RPL1 ~ M-RPL15）。
 
 每条变异都对应一条 R18 / 架构契约，必须让**对应**契约测试变红 —— 否则门禁是空的。
 
@@ -126,9 +126,10 @@ MUTATIONS = [
     {
         "id": "M-RPL4",
         "file": PAPER_TRADING_FILE,
-        "old": '    resolved_cycle_id = int(cycle_id)\n    count_budget = _dynamic_position_limits(conn)\n',
+        "old": '    resolved_cycle_id = int(cycle_id)\n'
+               '    # 席位预算同样取自显式周期',
         "new": '    resolved_cycle_id = int(_active_cycle(conn)["id"])  # mutation\n'
-               '    count_budget = _dynamic_position_limits(conn)\n',
+               '    # 席位预算同样取自显式周期',
         "test": f"{GUARD_MODULE}.ReplacementIsAsOfAndCycleBound."
                 "test_guard9g_slot_context_never_resolves_the_active_cycle",
         "desc": "slot context 改回 _active_cycle() 自行解析周期",
@@ -136,7 +137,8 @@ MUTATIONS = [
     {
         "id": "M-RPL5",
         "file": PAPER_TRADING_FILE,
-        "old": '    resolved_cycle_id = int(cycle_id)\n    budget = _dynamic_position_limits(conn)\n',
+        "old": '    resolved_cycle_id = int(cycle_id)\n'
+               '    budget = _dynamic_position_limits(conn, cycle_id=resolved_cycle_id)\n',
         "new": '    resolved_cycle_id = int(_active_cycle(conn)["id"])  # mutation\n'
                '    budget = _dynamic_position_limits(conn)\n',
         "test": f"{PROV_MODULE}.ProductionSlotLifecycleProvenance."
@@ -240,6 +242,17 @@ MUTATIONS = [
         "test": f"{PROV_MODULE}.ProductionAsOfRegression."
                 "test_rpl_p1_tomorrow_candidate_cannot_sell_today_holding",
         "desc": "adapter 把 asof 换成 next weekday（明天候选重新可卖今天持仓）",
+    },
+    {
+        "id": "M-RPL15",
+        "file": PAPER_TRADING_FILE,
+        # 席位预算改回 active cycle：借位请求的是显式周期，预算却来自 active cycle，
+        # 于是拿 active 的 allocation_version 去查显式周期的版本行 ⇒ 同周期借位被拒。
+        "old": '    budget = _dynamic_position_limits(conn, cycle_id=resolved_cycle_id)\n',
+        "new": '    budget = _dynamic_position_limits(conn)  # mutation\n',
+        "test": f"{PROV_MODULE}.ProductionSlotLifecycleProvenance."
+                "test_rpl_p5d_borrow_budget_is_derived_from_the_explicit_cycle",
+        "desc": "席位预算改回 active cycle（同周期借位被错误拒绝）",
     },
 ]
 

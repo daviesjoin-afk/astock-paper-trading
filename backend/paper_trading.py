@@ -8161,7 +8161,7 @@ def _strategy_runtimes(account_ids, weights=None, diversification=None, *, conn=
     return runtimes
 
 
-def _dynamic_position_limits(conn):
+def _dynamic_position_limits(conn, *, cycle_id=None):
     """Return a versioned allocation inside the 15-slot hard cap.
 
     ``pool_limit`` is an effective deployable limit, not a target that must
@@ -8169,10 +8169,16 @@ def _dynamic_position_limits(conn):
     can leave seats empty.  Any active risk-profile change is immediately
     reflected in a new allocation version; contraction is still executed only
     through the staged, T+1/quote/limit-aware capacity-exit path.
+
+    ``cycle_id``（R18，keyword-only）：``None`` = "现在 active 的那个周期"（冷启动
+    分配 / 容量退出 / 面板读取保持原语义）。但**席位比较 → 借位 → 回滚**这条在途
+    下单链必须把调用方已证明过的周期显式传进来，否则 reviews / 持仓数看显式周期、
+    而 target_limit / donors / 席位版本行看 active cycle，一次借位跨越两个周期
+    （§14 要求整条链同周期）。
     """
-    cycle = _active_cycle(conn)
+    cycle_id = int(cycle_id) if cycle_id is not None else int(_active_cycle(conn)["id"])
     hard_pool_cap = int(RSET.get(conn, "shared_pool_position_limit", SHARED_POOL_MAX_POSITIONS))
-    all_rows = _shared_account_rows(conn, cycle["id"])
+    all_rows = _shared_account_rows(conn, cycle_id)
     running_rows = [row for row in all_rows if row.get("status") == "running"]
     rows = running_rows or all_rows
     account_ids = [key for key in ACCOUNT_SPECS if any(row.get("id") == key for row in rows)]
@@ -8218,7 +8224,7 @@ def _dynamic_position_limits(conn):
     existing = conn.execute(
         """SELECT * FROM paper_position_limit_versions
            WHERE cycle_id=? AND allocation_key=?""",
-        (cycle["id"], allocation_key),
+        (cycle_id, allocation_key),
     ).fetchone()
     if existing:
         limits = _loads(existing["limits"], {})
@@ -8256,7 +8262,7 @@ def _dynamic_position_limits(conn):
                cycle_id,allocation_key,pool_limit,limits,weights,inputs,source,effective_at,created_at)
            VALUES(?,?,?,?,?,?,?,?,?)""",
         (
-            cycle["id"], allocation_key, total_cap, _json(limits), _json(weights),
+            cycle_id, allocation_key, total_cap, _json(limits), _json(weights),
             _json({"baseline_exposure": baseline, "current_exposure": current,
                    "risk_scale": risk_scale, "runtime_inputs": runtime_inputs,
                    "protected_slot_floor": protected_floor,
@@ -9360,9 +9366,9 @@ def _buy_order(conn, account, signal, quote, market, news, asof_day, *, all_quot
             )
             risk["slot_borrow"] = borrowed
             if borrowed.get("allowed"):
-                # Re-read the same allocation version after the atomic transfer
-                # so sizing and the audit gate use the borrowed slot immediately.
-                count_budget = _dynamic_position_limits(conn)
+                # Re-read the same allocation version (same explicit cycle) after the
+                # atomic transfer so sizing / audit use the borrowed slot immediately.
+                count_budget = _dynamic_position_limits(conn, cycle_id=current_cycle["id"])
                 position_limit = max(1, int(count_budget["limits"].get(account["id"], position_limit)))
                 strategy_count_blocked = len(committed_open_codes) >= position_limit
                 risk["position_count_gate"]["limit"] = position_limit
@@ -10364,14 +10370,11 @@ def _waitlist_realtime_assessment(signal, account, quote, asof_day):
 def _best_replacement_candidate(conn, account_id, day, held_codes):
     """Find the strongest **same-day** pending candidate that is not already held.
 
-    R18（as-of hard contract）：今天可以用来卖掉今天持仓的替补，必须**属于今天**。
-    候选读取经 :mod:`paper_replacement_evidence` 固定在 ``intended_date == day`` 且
-    ``signal_date <= day``：
-
-    * ``intended_date == day``（**等式**，不是 ``today..next_weekday`` 的 range）——
-      否则明天的候选会先制造今天的卖出，而真实 BUY 又因 ``signal_freshness`` 要求
-      ``intended_date == asof_day`` 被拒（§4-§7）。
-    * ``signal_date <= day`` —— 历史 as-of 回放不得读到未来的证据。
+    R18（as-of hard contract）：今天能触发今天卖出的替补必须**属于今天**。候选读取
+    经 :mod:`paper_replacement_evidence` 固定在 ``intended_date == day``（**等式**，
+    不是 ``today..next_weekday`` 的 range）与 ``signal_date <= day``（历史 as-of 不得
+    读到未来证据）；否则明天的候选会先制造今天的卖出，而真实 BUY 又因
+    ``signal_freshness`` 要求 ``intended_date == asof_day`` 被拒（§4-§7）。
 
     合法 overnight 计划（``signal_date = D-1``、``intended_date = D``）仍然可用。
     归档 signal 不参与：它是历史 opening 证据，不是 executable candidate。
@@ -10380,19 +10383,15 @@ def _best_replacement_candidate(conn, account_id, day, held_codes):
     rows = PREPL.load_replacement_candidates(
         conn, account_id=account_id, asof_day=_date(day).isoformat(), statuses=statuses,
     )
-    # security scope 仍由 adapter 处理（纯域模块不 import 项目 API）。name / risk_flag
-    # 取自 signal 自身的 payload.pick，与旧实现逐字一致。
+    # security scope 仍由 adapter 处理（纯域模块不 import 项目 API）。
     allowed = []
     for row in rows:
-        code = str(row.get("code") or "")
-        if not code:
-            continue
         pick = (_loads(row.get("payload"), {}) or {}).get("pick") or {}
-        if not _security_scope(code, row.get("name") or pick.get("name"),
-                               pick.get("risk_flag"))["allowed"]:
-            continue
-        allowed.append(row)
-    # 候选质量必须是稳定复合分；选择与排序在纯域模块里（held 排除也在那里再兜一次）。
+        code = str(row.get("code") or "")
+        if code and _security_scope(code, row.get("name") or pick.get("name"),
+                                    pick.get("risk_flag"))["allowed"]:
+            allowed.append(row)
+    # 候选质量是稳定复合分；排序在纯域模块里（held 排除也在那里再兜一次）。
     return PRep.choose_best_candidate(allowed, held_codes=held_codes)
 
 
@@ -10410,11 +10409,13 @@ def _slot_upgrade_context(conn, account_id, signal, positions, asof_day, *, cycl
       "当前周期是谁、账户挂在哪"，本 helper 不得再问一次 ``_active_cycle()``
       （那正是 §10/§14 的 defect B：一次在途下单的席位比较去读了另一个周期）。
     * 历史 review 经 :func:`paper_replacement_evidence.latest_position_review` 读取，
-      带 ``review_date <= asof_day`` 上界（defect C：``asof=D`` 不得读到 ``D+1``）。
-    * 比较与状态机在 :mod:`paper_replacement_decision`（纯域模块）。
+      带 ``review_date <= asof_day`` 上界（defect C：``asof=D`` 不得读到 ``D+1``）；
+      比较与状态机在 :mod:`paper_replacement_decision`（纯域模块）。
     """
     resolved_cycle_id = int(cycle_id)
-    count_budget = _dynamic_position_limits(conn)
+    # 席位预算同样取自显式周期（否则 reviews/持仓数看 cycle 8，target_limit/donors
+    # 看 active cycle 9），且避免拿 active 的 allocation_version 查别的周期的版本行。
+    count_budget = _dynamic_position_limits(conn, cycle_id=resolved_cycle_id)
     counts = {
         key: sum(
             1 for item in positions
@@ -10472,14 +10473,13 @@ def _apply_slot_borrow(conn, account_id, upgrade, asof_day, *, cycle_id):
     """Atomically transfer one unused strategy slot to a strong candidate.
 
     R18：``cycle_id`` 是 **keyword-only 且必填**。借位必须与产生该 ``upgrade`` 的
-    那一次下单尝试处在**同一个周期**上；席位版本行（``paper_position_limit_versions``）
-    也只用这个显式周期定位。旧实现的 ``_active_cycle(conn)`` 会在周期翻转后把一次
-    cycle 8 的在途借位写进 cycle 9 的版本行（§13/§39）。
+    那一次下单尝试处在**同一个周期**上；席位版本行
+    （``paper_position_limit_versions``）也只用这个显式周期定位与写入。
     """
     if not upgrade or not upgrade.get("borrow_ready") or not upgrade.get("donors"):
         return {"allowed": False, "reason": "未达到动态借位条件"}
     resolved_cycle_id = int(cycle_id)
-    budget = _dynamic_position_limits(conn)
+    budget = _dynamic_position_limits(conn, cycle_id=resolved_cycle_id)
     limits = {key: int(_num(value)) for key, value in (budget.get("limits") or {}).items()}
     donor = next(
         (item for item in upgrade["donors"]

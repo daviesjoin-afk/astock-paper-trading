@@ -473,7 +473,8 @@ class ProductionSlotLifecycleProvenance(ProductionCandidateCase):
             "donors": [{"account_id": "shared_pool", "limit": 15, "count": 3,
                         "remaining_after": 3, "unused_pool_slots": 12}],
         }
-        with mock.patch.object(PT, "_dynamic_position_limits", lambda conn: dict(budget)):
+        with mock.patch.object(PT, "_dynamic_position_limits",
+                                   lambda conn, *, cycle_id=None: dict(budget)):
             with PT._db(immediate=True) as conn:
                 result = PT._apply_slot_borrow(
                     conn, ACCOUNT, upgrade, DAY, cycle_id=cycle8)
@@ -536,7 +537,8 @@ class ProductionSlotLifecycleProvenance(ProductionCandidateCase):
             "donors": [{"account_id": donor, "limit": 6, "count": 0,
                         "remaining_after": 5}],
         }
-        with mock.patch.object(PT, "_dynamic_position_limits", lambda conn: dict(budget)):
+        with mock.patch.object(PT, "_dynamic_position_limits",
+                                   lambda conn, *, cycle_id=None: dict(budget)):
             with PT._db(immediate=True) as conn:
                 result = PT._apply_slot_borrow(
                     conn, ACCOUNT, upgrade, DAY, cycle_id=cycle8)
@@ -545,6 +547,43 @@ class ProductionSlotLifecycleProvenance(ProductionCandidateCase):
         after = self._version_row(v8)
         self.assertEqual(PT._loads(after["limits"], {})[donor], 5)
         self.assertEqual(PT._loads(after["limits"], {})[ACCOUNT], 3)
+
+    def test_rpl_p5d_borrow_budget_is_derived_from_the_explicit_cycle(self):
+        """席位预算（allocation_version / target_limit / donors）也必须来自显式周期。
+
+        审查发现的真实缺陷：``resolved_cycle_id`` 曾只约束 review 查询，而
+        ``_dynamic_position_limits()`` 仍自行 ``_active_cycle()``，于是预算取自更新的
+        active cycle，``_apply_slot_borrow`` 又拿 active cycle 的
+        ``allocation_version`` 去查显式周期的版本行 —— 一次**合法的同周期借位**会被
+        误判成"未找到当前席位版本"而拒绝。
+
+        这里不 mock 预算，走真实调用链，只断言"显式周期请求必须能借到席位"。
+        """
+        cycle8 = self.cycle_id()
+        cycle9 = self._seed_cycle(f"r18-p5d-{cycle8}")
+        with PT._db(immediate=True) as conn:
+            conn.execute("UPDATE paper_cycles SET status='closed' WHERE id=?", (cycle8,))
+        self.assertEqual(self.cycle_id(), cycle9, "fixture 没把 active cycle 翻到 9")
+
+        upgrade = {
+            "borrow_ready": True, "borrow_candidate_score": 80.0,
+            "donors": [{"account_id": "shared_pool", "limit": 15, "count": 3,
+                        "remaining_after": 3, "unused_pool_slots": 12}],
+        }
+        with PT._db(immediate=True) as conn:
+            result = PT._apply_slot_borrow(
+                conn, ACCOUNT, upgrade, DAY, cycle_id=cycle8)
+        self.assertTrue(
+            result.get("allowed"),
+            "显式 cycle 8 的同周期借位被拒绝（预算/版本行取自 active cycle 9）："
+            f"{result.get('reason')}")
+        version_id = int(str(result["allocation_version"]).rsplit("v", 1)[-1])
+        with PT._db() as probe:
+            row = probe.execute(
+                "SELECT cycle_id FROM paper_position_limit_versions WHERE id=?",
+                (version_id,)).fetchone()
+        self.assertEqual(int(row["cycle_id"]), cycle8,
+                         "借位写进了别的周期的席位版本行")
 
     def _cycle_positions(self, cycle_id, account_id):
         with PT._db() as conn:
@@ -565,7 +604,8 @@ class ProductionSlotLifecycleProvenance(ProductionCandidateCase):
             "donors": [{"account_id": "shared_pool", "limit": 15, "count": 3,
                         "remaining_after": 3, "unused_pool_slots": 12}],
         }
-        with mock.patch.object(PT, "_dynamic_position_limits", lambda conn: dict(budget)):
+        with mock.patch.object(PT, "_dynamic_position_limits",
+                                   lambda conn, *, cycle_id=None: dict(budget)):
             with PT._db(immediate=True) as conn:
                 result = PT._apply_slot_borrow(
                     conn, ACCOUNT, upgrade, DAY, cycle_id=cycle8)
