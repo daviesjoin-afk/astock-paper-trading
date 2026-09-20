@@ -7858,7 +7858,9 @@ def _risk_profile(account, asof_day=None, conn=None):
         profile["adaptive_candidate_id"] = meta.get("candidate_id")
     # PR-30：编译策略风险画像接生产。帽类/纪律类参数按"画像只能收紧"融合；
     # 解析失败 fail-closed 回落 Composite 最保守模板，绝不因解析失败而放宽。
-    if conn is not None:
+    # R19 §25：历史 as-of 只融合可证明当时已生效的版本画像（当前版本可能是在
+    # 回放日之后创建的，其编译帽不属于那个时点）。
+    if conn is not None and SRE.compiled_profile_is_asof_provable(conn, account_id, asof_day):
         compiled = SRE.compiled_profile_for(conn, account_id)
         profile, compiled_audit = SRE.tighten_caps(profile, compiled)
         profile["compiled_risk_profile"] = compiled_audit
@@ -8309,8 +8311,7 @@ def _strategy_pool_weights(conn, rows, profiles, *, asof_day=None):
     预算计算与分配解释必须使用**同一个**优先级来源，否则解释与实际分配背离。
 
     R19：``asof_day`` 一旦可省，历史回放的 strategy weight 就会被"生效日更晚"
-    的自进化覆盖改写。它与 ``_risk_profile`` 走同一判定（``effective_date <=
-    asof`` 才生效），因此这里是资金预算里唯一允许的 overlay 入口。
+    的自进化覆盖改写；它与 ``_risk_profile`` 走同一判定。
     """
     weights = {}
     for row in rows or []:
@@ -8353,7 +8354,10 @@ def _pool_allocation_inputs(conn, account, nav, positions, quotes, market=None,
     真实 reserved cash 仍占用同一个经济共享资金池，按周期过滤会造成 double-spend。
     """
     rows = rows if rows is not None else _shared_account_rows(conn, cycle_id)
-    if not rows:
+    if not rows and cycle_id is None:
+        # §24：单账户兜底只服务于 legacy / live 调用。显式周期的权威参与者集合
+        # 就是周期账本本身 —— idle 周期（enabled_strategies == []）解析出空列表，
+        # 注入调用方账户会凭空造出零策略周期本不该有的资金表达。
         rows = [account] if account is not None else []
     profiles = {
         row.get("id"): _risk_profile(row, asof_day=asof_day, conn=conn)
@@ -8361,7 +8365,8 @@ def _pool_allocation_inputs(conn, account, nav, positions, quotes, market=None,
     }
     weights = _strategy_pool_weights(conn, rows, profiles, asof_day=asof_day)
     values = {row.get("id"): 0.0 for row in rows if row.get("id")}
-    if account is not None and account.get("id") not in values:
+    if account is not None and account.get("id") not in values and cycle_id is None:
+        # 同上：显式周期下参与者集合就是周期账本，不得再把调用方账户补进来。
         account_id = account.get("id")
         profiles[account_id] = _risk_profile(account, asof_day=asof_day, conn=conn)
         weights[account_id] = max(_num(profiles[account_id].get("max_exposure"), 0.0), 0.01)
@@ -8383,8 +8388,8 @@ def _pool_allocation_inputs(conn, account, nav, positions, quotes, market=None,
     scales = market_light_scales(market_light) if market_light else None
     # 相关.cluster：资金预算与席位分配使用同一套分散化系数，并施加**绝对**
     # 簇预算——归一化的有效权重会抵消公共系数，绝对约束才能兜住克隆簇。
-    # R19：簇证据必须与本次 (cycle, as-of) 同源，否则"机器今天"的持仓与未来
-    # signal 会改变历史 as-of 的簇结构与簇预算。
+    # R19：簇证据与本次 (cycle, as-of) 同源，否则机器今天的持仓与未来 signal
+    # 会改变历史 as-of 的簇结构与簇预算。
     clusters, cluster_factors = _strategy_cluster_factors(
         conn, asof_day, account_ids=list(weights), cycle_id=cycle_id,
     )
@@ -8462,10 +8467,10 @@ def _strategy_pool_budget(conn, account, nav, positions, quotes, market=None,
     allowance and a shadow/quarantined one gets no new capital at all.
 
     R19: ``cycle_id`` / ``asof_day`` bound the participant ledgers, the adaptive
-    risk/allocation overlays and the cluster evidence to one point in time; the
-    seat budget already carried them (R18), and the capital budget must use the
-    *same* facts or a historical entry gets a different quantity because evidence
-    that did not exist at the requested as-of date was visible.
+    overlays and the cluster evidence to one point in time; the seat budget
+    already carried them (R18) and the capital budget must use the same facts,
+    or a historical entry gets a different quantity because evidence that did
+    not exist at the requested as-of date was visible.
     """
     inputs = _pool_allocation_inputs(
         conn, account, nav, positions, quotes, market,

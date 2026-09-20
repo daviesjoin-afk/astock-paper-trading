@@ -114,6 +114,34 @@ def compiled_profile_for(conn: sqlite3.Connection, account_id: Any) -> dict[str,
         return composite_compiled_profile()
 
 
+def compiled_profile_is_asof_provable(conn: sqlite3.Connection, account_id: Any,
+                                      asof_day: Any) -> bool:
+    """编译风险画像是否可证明在 ``asof_day`` 当日就已生效（R19 §25）。
+
+    :func:`compiled_profile_for` 解析的是策略**当前**不可变版本，它没有 as-of
+    参数。历史回放时若该版本是在回放日**之后**才创建的，它的编译帽就不属于
+    那个时点 —— 直接融合会让未来版本的风险帽改写历史 weights 与 allocation。
+
+    ``asof_day is None``（current/live）⇒ 恒 True，既有语义完全不变。
+    历史 as-of ⇒ 要求当前版本的 ``created_at`` 不晚于 asof（版本不可变，
+    创建时间即它开始存在的时刻）。无法证明（无版本行 / 无时间戳 / 读取异常）
+    一律 fail closed，绝不猜。
+    """
+    if asof_day is None:
+        return True
+    try:
+        import strategy_registry as SR
+
+        version = SR.get_version(str(account_id), conn=conn)
+        created = str(getattr(version, "created_at", "") or "")[:10]
+        target = str(asof_day)[:10]
+        if not created or not target:
+            return False
+        return created <= target
+    except Exception:
+        return False
+
+
 def _tighter_stop(base: Any, compiled: Any) -> float | None:
     """止损深度：负值域内取 max（亏损上限更小 = 更紧）。"""
     base_v, compiled_v = _num(base), _num(compiled)

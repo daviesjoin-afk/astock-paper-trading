@@ -920,12 +920,18 @@ def _terminalize_cycle_stale_order(conn, order, exc):
     §6：终态清理**允许**把既有预占从 ``reserved`` 释放为 ``released``（订单已终态，
     不能继续占共享资金），但绝不改 ``cycle_id`` / ``amount`` / ``fees``。
 
+    §50 例外：**预占周期归属冲突**时那张预占行不属于本订单（它记在另一个周期上，
+    是另一笔经济事实的凭证）。此时释放它等于把别人的资金挪为可用 —— 因此冲突
+    分支**跳过释放**，只把当前订单终态化；这与 ``strategy_fill_failure`` 的处置
+    一致。
+
     §7：释放失败**不得**静默吞掉。若这里把订单标成 ``superseded`` 而预占仍停在
     ``reserved``，那笔资金会被永久占用且没有任何订单再引用它 —— 比直接失败更糟。
     因此释放异常向上抛，让调用方的事务回滚（订单保持原状，下轮可诊断）。
     """
     # Phase 2 extraction: resolved at call time to avoid a circular import.
     from paper_trading import (
+        ReservationCycleMismatch,
         _audit,
         _finish_capital_reservation,
         _json,
@@ -947,9 +953,13 @@ def _terminalize_cycle_stale_order(conn, order, exc):
         value = getattr(exc, field, None)
         if value is not None:
             detail[field] = value
-    # §6/§7：释放既有预占（若无预占，UPDATE 命中 0 行，天然 no-op，无需 catch-all）。
-    # 释放失败即让本事务失败 —— 绝不留下「订单终态 + 资金仍被占用」的组合。
-    _finish_capital_reservation(conn, order_id, "released")
+    # §50：冲突的预占属于**别的**订单，绝不 release（那是在处置别人的资产）。
+    foreign_reservation = _is_reservation_cycle_mismatch(exc, ReservationCycleMismatch)
+    detail["reservation_released"] = not foreign_reservation
+    if not foreign_reservation:
+        # §6/§7：释放既有预占（若无预占，UPDATE 命中 0 行，天然 no-op）。
+        # 释放失败即让本事务失败 —— 绝不留下「订单终态 + 资金仍被占用」的组合。
+        _finish_capital_reservation(conn, order_id, "released")
     reason = f"{marker}：{str(exc)[:200]}"
     payload = _loads(order.get("risk_payload"), {})
     if not isinstance(payload, dict):

@@ -413,5 +413,82 @@ class ReservedCashIsAGlobalObligation(_CapitalCase):
         self.assertEqual(by_account, by_account_new)
 
 
+class CompiledProfileIsAsOfBound(_CapitalCase):
+    """EC-12 —— 编译风险画像不得由回放日之后创建的策略版本改写。"""
+
+    def test_ec12_future_strategy_version_does_not_change_history(self):
+        import strategy_registry as SR
+        self.quotes[CODE] = _quote(CODE)
+        # 非空门禁：当前（live）口径下编译画像**确实**被融合（否则断言无意义）。
+        with PT._db() as conn:
+            account = dict(conn.execute(
+                "SELECT * FROM paper_accounts WHERE id=?", (ACCOUNT,)).fetchone())
+            live = PT._risk_profile(account, conn=conn)
+        self.assertIn("compiled_risk_profile", live,
+                      "live 口径下没有融合编译画像（门禁会是空转）")
+        # 历史 as-of 早于策略版本创建日 ⇒ 该版本的帽不可证明当时已生效。
+        with PT._db() as conn:
+            version = SR.get_version(ACCOUNT, conn=conn)
+        if version is None:
+            self.skipTest("该账户没有注册表版本行")
+        created = str(version.created_at)[:10]
+        earlier = (dt.date.fromisoformat(created) - dt.timedelta(days=30)).isoformat()
+        with PT._db() as conn:
+            historical = PT._risk_profile(account, asof_day=earlier, conn=conn)
+        self.assertNotIn(
+            "compiled_risk_profile", historical,
+            f"回放日 {earlier} 早于策略版本创建日 {created}，未来版本的编译帽被融进历史")
+
+
+class ExplicitEmptyCycleHasNoCapital(_CapitalCase):
+    """EC-13 —— 显式 idle 周期（enabled_strategies == []）不得凭空产生预算。"""
+
+    def test_ec13_idle_cycle_does_not_fall_back_to_the_caller_account(self):
+        idle = self.new_cycle(f"r19-ec13-{self.cycle_id()}")
+        with PT._db(immediate=True) as conn:
+            conn.execute("UPDATE paper_cycles SET enabled_strategies=? WHERE id=?",
+                         ("[]", idle))
+        with PT._db() as conn:
+            rows = PT._shared_account_rows(conn, idle)
+        self.assertEqual([], list(rows), "fixture 的 idle 周期本应没有参与者（空门禁）")
+        self.quotes[CODE] = _quote(CODE)
+        with PT._db() as conn:
+            inputs = PT._pool_allocation_inputs(
+                conn, {"id": ACCOUNT}, 100_000.0, [], dict(self.quotes),
+                dict(MARKET), cycle_id=idle, asof_day=DAY,
+            )
+        self.assertEqual(
+            [], list(inputs["rows"]),
+            "显式 idle 周期把调用方账户注入成参与者：零策略周期凭空有了资金表达")
+        self.assertEqual({}, inputs["weights"], "idle 周期产生了策略权重")
+
+
+class ForeignReservationIsNeverReleased(unittest.TestCase):
+    """EC-14 —— 周期冲突的预占绝不被 release（含手动终态化路径）。"""
+
+    def test_ec14_terminalizer_skips_release_for_a_foreign_reservation(self):
+        path = os.path.join(BACKEND, "manual_orders.py")
+        with open(path, encoding="utf-8") as handle:
+            raw = handle.read()
+        tree = ast.parse(raw)
+        node = next(
+            item for item in ast.walk(tree)
+            if isinstance(item, ast.FunctionDef)
+            and item.name == "_terminalize_cycle_stale_order"
+        )
+        body = "".join(
+            "\n".join(raw.splitlines()[node.lineno - 1:node.end_lineno]).split())
+        self.assertIn(
+            "_is_reservation_cycle_mismatch(exc,ReservationCycleMismatch)", body,
+            "终态化路径没有识别预占周期冲突")
+        self.assertIn(
+            "ifnotforeign_reservation:", body,
+            "终态化路径无条件释放预占：冲突的预占属于别的订单（§50）")
+        guard_at = body.index("ifnotforeign_reservation:")
+        release_at = body.index("_finish_capital_reservation(conn,order_id,")
+        self.assertLess(guard_at, release_at,
+                        "释放预占出现在冲突守卫之外（会释放别人的资产）")
+
+
 if __name__ == "__main__":
     unittest.main()

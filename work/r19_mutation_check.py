@@ -298,6 +298,40 @@ MUTATIONS = [
                 "test_sb14_intermediate_slice_stays_deferred",
         "desc": "第 1 片成交后错误把 signal 标 filled（剩余片丢失）",
     },
+    # ── 审查反馈：三条 P2 的回归钉 ────────────────────────────────────────
+    {
+        "id": "M-ENT17",
+        "file": PAPER_TRADING_FILE,
+        "old": "    if not rows and cycle_id is None:\n",
+        "new": "    if not rows:  # mutation: 显式周期也注入调用方账户\n",
+        "test": f"{CAPITAL_MODULE}.ExplicitEmptyCycleHasNoCapital."
+                "test_ec13_idle_cycle_does_not_fall_back_to_the_caller_account",
+        "desc": "显式 idle 周期重新注入调用方账户（零策略周期凭空有预算）",
+    },
+    {
+        "id": "M-ENT18",
+        "file": PAPER_TRADING_FILE,
+        "old": "    if conn is not None and SRE.compiled_profile_is_asof_provable("
+               "conn, account_id, asof_day):\n",
+        "new": "    if conn is not None:  # mutation: 无条件融合当前版本编译画像\n",
+        "test": f"{CAPITAL_MODULE}.CompiledProfileIsAsOfBound."
+                "test_ec12_future_strategy_version_does_not_change_history",
+        "desc": "编译风险画像无条件融合（回放日之后创建的版本改写历史）",
+    },
+    {
+        "id": "M-ENT19",
+        "file": MANUAL_FILE,
+        "old": "    foreign_reservation = _is_reservation_cycle_mismatch("
+               "exc, ReservationCycleMismatch)\n"
+               "    detail[\"reservation_released\"] = not foreign_reservation\n"
+               "    if not foreign_reservation:\n",
+        "new": "    foreign_reservation = False  # mutation: 无条件释放冲突预占\n"
+               "    detail[\"reservation_released\"] = True\n"
+               "    if True:\n",
+        "test": f"{CAPITAL_MODULE}.ForeignReservationIsNeverReleased."
+                "test_ec14_terminalizer_skips_release_for_a_foreign_reservation",
+        "desc": "手动终态化路径无条件 release 周期冲突的预占",
+    },
 ]
 
 

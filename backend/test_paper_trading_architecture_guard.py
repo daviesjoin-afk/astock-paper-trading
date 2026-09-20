@@ -1017,6 +1017,47 @@ class EntryCapitalPlanningIsBounded(unittest.TestCase):
         self.assertIn("compatibility parameter intentionally ignored", raw,
                       "pending_buy_reservations 的 cycle_id 不再是刻意忽略的兼容参数")
 
+    def test_guard10n_explicit_cycle_has_no_single_account_fallback(self):
+        """显式周期的参与者集合就是周期账本；不得再注入调用方账户（§24）。
+
+        否则 `enabled_strategies == []` 的 idle 周期会凭空拿到一份非零预算或
+        部署计划 —— 零策略周期本不该有资金表达。
+        """
+        body = self._flat("_pool_allocation_inputs")
+        self.assertIn(
+            "ifnotrowsandcycle_idisNone:", body,
+            "参与者空列表兜底没有按显式周期设限")
+        self.assertIn(
+            "ifaccountisnotNoneandaccount.get(\"id\")notinvalues"
+            "andcycle_idisNone:", body,
+            "账户补入分支没有按显式周期设限：idle 周期会凭空产生参与者")
+
+    def test_guard10o_compiled_profile_is_asof_provable(self):
+        """历史 as-of 只融合**可证明当时已生效**的编译风险画像（§25）。"""
+        body = self._flat("_risk_profile")
+        self.assertIn(
+            "andSRE.compiled_profile_is_asof_provable(conn,account_id,asof_day):", body,
+            "_risk_profile 无条件融合当前版本编译画像：回放日之后创建的策略版本"
+            "会改写历史 weights / allocation")
+        helper = self._flat("compiled_profile_is_asof_provable",
+                            "strategy_risk_enforcement.py")
+        self.assertIn("SR.get_version(", helper,
+                      "as-of 可证明性没有查策略版本行")
+        self.assertIn("returncreated<=target", helper,
+                      "as-of 可证明性没有比较版本创建日与 asof")
+
+    def test_guard10p_terminalizer_never_releases_a_foreign_reservation(self):
+        """手动终态化路径同样不得 release 周期冲突的预占（§50）。"""
+        body = self._flat("_terminalize_cycle_stale_order", "manual_orders.py")
+        self.assertIn(
+            "_is_reservation_cycle_mismatch(exc,ReservationCycleMismatch)", body,
+            "终态化路径没有识别预占周期冲突")
+        guard_at = body.index("ifnotforeign_reservation:")
+        release_at = body.index("_finish_capital_reservation(conn,order_id,")
+        self.assertLess(
+            guard_at, release_at,
+            "终态化路径无条件释放预占：冲突的预占属于别的订单")
+
     # ── 普通 BUY 的 commit 收敛 ────────────────────────────────────────────
     def test_guard10i_normal_buy_order_has_no_direct_ledger_writes(self):
         """``_buy_order`` 不再直接写成交账本（§45、§76、§80）。
