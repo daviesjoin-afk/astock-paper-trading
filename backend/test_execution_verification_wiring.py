@@ -103,7 +103,13 @@ class PaperFillWritePathGuardTests(unittest.TestCase):
                 any(entry.startswith(expected) for entry in seen),
                 f"{expected} 的成交流水写路径未被门禁扫到（门禁失效？）：{seen}",
             )
-        self.assertGreaterEqual(len(seen), 5, f"成交流水写路径数量异常：{seen}")
+        # R19：普通策略 BUY 收敛到 ``execution_planner.commit_fill`` 之后，
+        # ``_buy_order`` 不再自己 INSERT INTO paper_fills，活跃写路径由 5 条
+        # 收敛为 4 条（demo_seed / commit_fill / 风控卖出 / 日内卖出）。
+        self.assertEqual(
+            len(seen), 4,
+            f"成交流水写路径数量异常（应统一走 execution_planner.commit_fill）：{seen}",
+        )
 
     def test_no_module_reimplements_the_verified_predicate(self):
         forbidden = (

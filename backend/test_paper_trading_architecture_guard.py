@@ -850,6 +850,10 @@ class ReplacementIsAsOfAndCycleBound(unittest.TestCase):
         pending 席位读取与 allocation 预算都不能再回到"现在 active 的是谁"或
         "机器今天"。漏了 pending 的 cycle ⇒ 上一个周期的在途单占掉本周期席位；
         漏了预算的 as-of ⇒ 历史 as-of 下借位前后的版本号不一致。
+
+        R19 之后同一条链上又多出两处资金预算读取（strategy budget 与
+        allocation plan），所以这里只钉**下界**：席位预算的两次 (cycle, as-of)
+        必须仍在，资金口径的完整性由 Guard 10 单独负责。
         """
         raw = _source("paper_trading.py")
         body = " ".join(
@@ -860,9 +864,9 @@ class ReplacementIsAsOfAndCycleBound(unittest.TestCase):
             "_buy_order 的 pending 席位读取没有固定到已认领周期")
         # 初次预算与借位后的 re-read 都必须是同一组 facts（cycle + as-of）。
         # 归一化空白后按出现次数断言，避免依赖换行位置。
-        self.assertEqual(
-            2, body.count("cycle_id=current_cycle[\"id\"], asof_day=asof_day"),
-            "_buy_order 里带 (cycle, as-of) 的预算读取不是两次"
+        self.assertGreaterEqual(
+            body.count("cycle_id=current_cycle[\"id\"], asof_day=asof_day"), 2,
+            "_buy_order 里带 (cycle, as-of) 的预算读取少于两次"
             "（初次预算或借位后 re-read 漏传了 provenance）")
 
     # ── 共用断言 ──────────────────────────────────────────────────────────
@@ -893,6 +897,226 @@ class ReplacementIsAsOfAndCycleBound(unittest.TestCase):
         self.assertNotIn("_active_cycle(", code,
                          f"{name} 又自己解析 active cycle：一次在途下单的归属"
                          "会被周期翻转掉包")
+
+
+class EntryCapitalPlanningIsBounded(unittest.TestCase):
+    """Guard 10 —— 资金预算/部署证据必须 (cycle, as-of) 有界，成交只能有一个 commit。
+
+    为什么需要它：R19 之前 strategy BUY 的**席位**预算已被 R18 钉在显式
+    ``cycle_id`` + ``asof_day`` 上，但同一决策点下游的**资金**预算与部署计划
+    仍会重新解析 active cycle、读取"机器今天"的簇证据，并让生效日更晚的
+    adaptive risk / adaptive allocation overlay 改写历史 as-of 的预算与数量。
+    同时普通 ``_buy_order`` 还维护着第二套 reserve/debit/lot/fill/verification
+    写路径。把这四种形状写回去，缺陷都会立刻复发。
+
+    注意两组概念**不可混淆**（§29、§101）：
+    - 有界证据：participants / adaptive risk / adaptive allocation / cluster；
+    - 全局经济义务：仍然 ``reserved`` 的共享现金（**故意**不做 cycle 过滤，
+      否则会造成真实 double-spend）。
+    """
+
+    def _flat(self, name, filename="paper_trading.py"):
+        """函数源码的**空白无关**形式（换行/缩进不影响断言）。"""
+        raw = _source(filename)
+        body = _function_source(ast.parse(raw), name, raw)
+        return "".join(body.split())
+
+    # ── capital planning provenance ───────────────────────────────────────
+    def test_guard10a_pool_inputs_accept_explicit_cycle_and_asof(self):
+        tree = ast.parse(_source("paper_trading.py"))
+        node = _function_node(tree, "_pool_allocation_inputs")
+        kwonly = {arg.arg for arg in node.args.kwonlyargs}
+        for param in ("cycle_id", "asof_day"):
+            with self.subTest(param=param):
+                self.assertIn(
+                    param, kwonly,
+                    f"_pool_allocation_inputs 的 {param} 不是 keyword-only："
+                    "证据边界必须显式传入，位置参数可以漏传")
+
+    def test_guard10b_participant_rows_follow_the_explicit_cycle(self):
+        body = self._flat("_pool_allocation_inputs")
+        self.assertIn(
+            "_shared_account_rows(conn,cycle_id)", body,
+            "_pool_allocation_inputs 的参与者账户没有固定到显式周期："
+            "历史 as-of 回放会读到 active cycle 的账本")
+
+    def test_guard10c_risk_profile_is_asof_bound_on_both_paths(self):
+        """rows path 与 account fallback **都**必须带 as-of（§25/§26）。"""
+        body = self._flat("_pool_allocation_inputs")
+        self.assertIn(
+            "_risk_profile(row,asof_day=asof_day,conn=conn)", body,
+            "rows path 的 risk profile 漏传 asof_day")
+        self.assertIn(
+            "_risk_profile(account,asof_day=asof_day,conn=conn)", body,
+            "account fallback 漏传 asof_day：未来 adaptive risk 会污染历史")
+
+    def test_guard10d_adaptive_allocation_weight_is_asof_bound(self):
+        tree = ast.parse(_source("paper_trading.py"))
+        node = _function_node(tree, "_strategy_pool_weights")
+        kwonly = {arg.arg for arg in node.args.kwonlyargs}
+        self.assertIn("asof_day", kwonly,
+                      "_strategy_pool_weights 的 asof_day 不是 keyword-only")
+        body = self._flat("_strategy_pool_weights")
+        self.assertIn(
+            "_runtime_parameter_active(alloc.get(\"effective_date\"),"
+            "asof_day=asof_day,status=alloc.get(\"status\"))",
+            body,
+            "_strategy_pool_weights 没有把 as-of 交给 overlay 激活判定："
+            "生效日更晚的 adaptive allocation 会改写历史 strategy weight")
+
+    def test_guard10e_cluster_evidence_follows_cycle_and_asof(self):
+        body = self._flat("_pool_allocation_inputs")
+        self.assertIn(
+            "_strategy_cluster_factors(conn,asof_day,"
+            "account_ids=list(weights),cycle_id=cycle_id,",
+            body,
+            "簇证据没有继承显式 (cycle, as-of)：机器今天的持仓/未来 signal 会"
+            "改变历史 as-of 的簇结构与簇预算")
+
+    def test_guard10f_strategy_budget_and_allocation_plan_carry_provenance(self):
+        for name in ("_strategy_pool_budget", "_allocation_plan"):
+            with self.subTest(function=name):
+                tree = ast.parse(_source("paper_trading.py"))
+                node = _function_node(tree, name)
+                kwonly = {arg.arg for arg in node.args.kwonlyargs}
+                for param in ("cycle_id", "asof_day"):
+                    self.assertIn(param, kwonly,
+                                  f"{name} 的 {param} 不是 keyword-only")
+                body = self._flat(name)
+                self.assertIn(
+                    "cycle_id=cycle_id,asof_day=asof_day,", body,
+                    f"{name} 没有把 (cycle, as-of) 原样传给 _pool_allocation_inputs")
+
+    def test_guard10g_production_buy_callers_pass_cycle_and_asof(self):
+        """三条生产买入路径必须显式传 (cycle, as-of)（§33-§36、§75）。"""
+        expectations = {
+            "_buy_order": ("_strategy_pool_budget(", "_allocation_plan("),
+            "_intraday_buyback": ("_strategy_pool_budget(",),
+            "_swing_scale_in": ("_strategy_pool_budget(",),
+        }
+        for name, calls in expectations.items():
+            body = self._flat(name)
+            for call in calls:
+                with self.subTest(function=name, call=call):
+                    index = body.index(call)
+                    window = body[index:index + 400]
+                    self.assertIn("cycle_id=", window,
+                                  f"{name} 的 {call} 调用没有显式传 cycle_id")
+                    self.assertIn("asof_day=asof_day", window,
+                                  f"{name} 的 {call} 调用没有显式传 asof_day")
+
+    def test_guard10h_reserved_cash_stays_a_global_obligation(self):
+        """在途预占是全局经济义务：参与者有界，但**资金占用**不得按周期过滤。"""
+        body = self._flat("_pool_allocation_inputs")
+        index = body.index("_pending_buy_reservations(")
+        window = body[index:index + 200]
+        self.assertNotIn("cycle_id", window,
+                         "在途预占被按周期过滤：旧周期尚未释放的真实 reserved "
+                         "cash 仍占用同一个资金池，过滤会造成 double-spend")
+        raw = _source("paper_capital_reservations.py")
+        self.assertIn("compatibility parameter intentionally ignored", raw,
+                      "pending_buy_reservations 的 cycle_id 不再是刻意忽略的兼容参数")
+
+    # ── 普通 BUY 的 commit 收敛 ────────────────────────────────────────────
+    def test_guard10i_normal_buy_order_has_no_direct_ledger_writes(self):
+        """``_buy_order`` 不再直接写成交账本（§45、§76、§80）。
+
+        注意断言用的是**空白移除后**的形状：``_flat`` 会把函数源码里所有空白
+        （包括 SQL 字符串内部的空格）去掉，所以多词 SQL 必须写成
+        ``INSERTINTOpaper_fills`` —— 否则断言在扁平化文本上永远匹配不到，
+        门禁会静默变成空转（变异矩阵 M-ENT14 专门钉这一点）。
+        """
+        body = self._flat("_buy_order")
+        for shape, label in (
+            ("_debit_shared_cash(", "现金扣款"),
+            ("_record_lot(", "lot 写入"),
+            ("INSERTINTOpaper_fills", "成交流水写入"),
+            ("EV.stamp_order(", "执行验证盖章"),
+            ("_reserve_shared_capital(", "资金预占"),
+        ):
+            with self.subTest(shape=label):
+                self.assertNotIn(
+                    shape, body,
+                    f"_buy_order 又直接写成交账本（{label}）：reserve/cash/lot/fill/"
+                    "verification 必须整体由 execution_planner.commit_fill 负责")
+        self.assertIn("commit_strategy_entry_fill(", body,
+                      "_buy_order 不再委托统一的成交提交编排")
+        self.assertNotIn(
+            "UPDATEpaper_ordersSETstatus='filled'", body,
+            "_buy_order 又自己把订单改成 filled —— 那是 commit_fill 的职责")
+
+    def test_guard10j_commit_orchestration_owns_the_planner_primitive(self):
+        body = self._flat("commit_strategy_entry_fill", "manual_orders.py")
+        self.assertIn("EP.commit_fill(", body,
+                      "普通策略 BUY 的提交编排不再调用 execution_planner.commit_fill")
+        for shape, label in (
+            ("_debit_shared_cash(", "现金扣款"),
+            ("_record_lot(", "lot 写入"),
+            ("INSERTINTOpaper_fills", "成交流水写入"),
+            ("EV.stamp_order(", "执行验证盖章"),
+        ):
+            with self.subTest(shape=label):
+                self.assertNotIn(
+                    shape, body,
+                    f"提交编排自己重写了{label}（{shape}）：唯一 commit primitive 是 "
+                    "execution_planner.commit_fill（§65），不得复制第二套账本")
+
+    def test_guard10k_mismatch_never_releases_a_foreign_reservation(self):
+        """周期归属冲突绝不 release 不属于本订单的预占（§50、§51）。"""
+        body = self._flat("strategy_fill_failure", "manual_orders.py")
+        mismatch_at = body.index("isinstance(exc,ReservationCycleMismatch)")
+        release_at = body.index("_finish_capital_reservation(conn,order_id,")
+        self.assertLess(
+            mismatch_at, release_at,
+            "释放预占出现在周期冲突判定之前：冲突的 reservation 会被误释放")
+        branch = body[mismatch_at:release_at]
+        self.assertNotIn(
+            "_finish_capital_reservation(", branch,
+            "周期冲突分支释放了冲突的 reservation —— 那不属于本订单（§50）")
+        self.assertIn("risk_rejected", branch,
+                      "周期冲突没有把当前订单终态化（§51）")
+        self.assertIn("deferred_capacity", branch,
+                      "周期冲突后候选意图没有留在复试管道等待新 order identity")
+
+    def test_guard10l_new_reservation_uses_the_expected_order_cycle(self):
+        """新预占行的 cycle 必须来自 expected_cycle_id（§19、§78）。"""
+        body = self._flat("reserve_shared_capital", "paper_capital_reservations.py")
+        self.assertIn(
+            "ifexpected_cycle_idisnotNone:reservation_cycle_id="
+            "int(expected_cycle_id)", body,
+            "新建预占行重新解析 active cycle：订单周期与预占周期会被拆成两个事实")
+        self.assertNotIn(
+            "cycle=active_cycle_fn(conn)", body,
+            "新建预占行回落到 active cycle 作为唯一来源")
+
+    def test_guard10m_production_reservations_carry_the_order_cycle(self):
+        """所有 order-backed 生产预占都必须传 expected_cycle_id（§40、§67、§79）。"""
+        order_backed = (
+            ("manual_orders.py", "submit_manual_order"),
+            ("manual_orders.py", "process_pending_manual_orders"),
+        )
+        for filename, function in order_backed:
+            with self.subTest(path=f"{filename}:{function}"):
+                body = self._flat(function, filename)
+                index = -1
+                found = 0
+                while True:
+                    index = body.find("_reserve_shared_capital(", index + 1)
+                    if index < 0:
+                        break
+                    found += 1
+                    window = body[index:index + 320]
+                    self.assertIn(
+                        "expected_cycle_id=", window,
+                        f"{filename}:{function} 的预占调用没有带订单周期")
+                self.assertGreater(found, 0,
+                                   f"{filename}:{function} 里找不到预占调用（空门禁）")
+        # planner 是唯一 commit primitive，它必须自己传订单周期。
+        planner = " ".join(_source("execution_planner.py").split()).replace(" ", "")
+        index = planner.index("PT._reserve_shared_capital(")
+        self.assertIn("expected_cycle_id=order_cycle_id",
+                      planner[index:index + 300],
+                      "execution_planner.commit_fill 没有把订单周期交给预占层")
 
 
 def _function_node(tree, name):
