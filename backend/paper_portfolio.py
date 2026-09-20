@@ -72,9 +72,18 @@ def aggregate_positions(lots, risk_state_rows, cash_flows, day, *, num):
             item["peak_price"] = item["cost"]
             item["take_stage"] = None
             item["risk_state_source"] = "missing"
+            item["episode_opened_order_id"] = None
         else:
             item["peak_price"] = num(row.get("peak_price"), item["cost"])
             item["take_stage"] = int(num(row.get("take_stage"), 0))
             item["risk_state_source"] = "cycle_state"
+            # R17：当前 position episode 的来源 opening BUY order 也由同周期的
+            # risk state 拥有（0 -> >0 建仓时写入，add-on 保持不变，full exit 删行，
+            # 同周期重入写新的 opened_order_id）。这里把它作为 episode metadata
+            # 暴露给调用方 —— 名字刻意不叫 ``order_id``，避免与卖单/当前委托混淆。
+            # 缺状态行时是 ``None``（未知），绝不从 ``paper_position_lots.
+            # source_order_id`` 反推：每个 add-on lot 的该字段都不同，MIN/MAX/latest
+            # 都不是 episode origin。
+            item["episode_opened_order_id"] = row.get("opened_order_id")
         out.append(item)
     return out
