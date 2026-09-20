@@ -100,11 +100,13 @@ MUTATIONS = [
         "id": "M-ENT2",
         "file": PAPER_TRADING_FILE,
         "old": "    profiles = {\n"
-               "        row.get(\"id\"): _risk_profile(row, asof_day=asof_day, conn=conn)\n"
+               "        row.get(\"id\"): _risk_profile(row, asof_day=asof_day, "
+               "conn=conn, cycle_id=cycle_id)\n"
                "        for row in rows if row.get(\"id\")\n"
                "    }\n",
         "new": "    profiles = {\n"
-               "        row.get(\"id\"): _risk_profile(row, conn=conn)  # mutation\n"
+               "        row.get(\"id\"): _risk_profile(row, conn=conn, cycle_id=cycle_id)"
+               "  # mutation\n"
                "        for row in rows if row.get(\"id\")\n"
                "    }\n",
         "test": f"{CAPITAL_MODULE}.AdaptiveRiskIsAsOfBound."
@@ -311,9 +313,9 @@ MUTATIONS = [
     {
         "id": "M-ENT18",
         "file": PAPER_TRADING_FILE,
-        "old": "    if conn is not None and SRE.compiled_profile_is_asof_provable("
+        "old": "    elif conn is not None and SRE.compiled_profile_is_asof_provable("
                "conn, account_id, asof_day):\n",
-        "new": "    if conn is not None:  # mutation: 无条件融合当前版本编译画像\n",
+        "new": "    elif conn is not None:  # mutation: 无条件融合当前版本编译画像\n",
         "test": f"{CAPITAL_MODULE}.CompiledProfileIsAsOfBound."
                 "test_ec12_future_strategy_version_does_not_change_history",
         "desc": "编译风险画像无条件融合（回放日之后创建的版本改写历史）",
@@ -331,6 +333,23 @@ MUTATIONS = [
         "test": f"{CAPITAL_MODULE}.ForeignReservationIsNeverReleased."
                 "test_ec14_terminalizer_skips_release_for_a_foreign_reservation",
         "desc": "手动终态化路径无条件 release 周期冲突的预占",
+    },
+    {
+        "id": "M-ENT20",
+        "file": PAPER_TRADING_FILE,
+        "old": "    if conn is not None and cycle_id is not None:\n"
+               "        compiled = SRE.compiled_profile_for_cycle("
+               "conn, account_id, cycle_id=cycle_id)\n"
+               "    elif conn is not None and SRE.compiled_profile_is_asof_provable("
+               "conn, account_id, asof_day):\n"
+               "        compiled = SRE.compiled_profile_for(conn, account_id)\n",
+        "new": "    if conn is not None and SRE.compiled_profile_is_asof_provable("
+               "conn, account_id, asof_day):\n"
+               "        compiled = SRE.compiled_profile_for(conn, account_id)"
+               "  # mutation: current/latest head\n",
+        "test": f"{CAPITAL_MODULE}.CyclePinnedStrategyVersionIsUsed."
+                "test_ec15_cycle_pinned_version_beats_a_later_current_head",
+        "desc": "cycle-pinned 版本查询退回 current/latest head",
     },
 ]
 

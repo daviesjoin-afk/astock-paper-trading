@@ -944,11 +944,11 @@ class EntryCapitalPlanningIsBounded(unittest.TestCase):
         """rows path 与 account fallback **都**必须带 as-of（§25/§26）。"""
         body = self._flat("_pool_allocation_inputs")
         self.assertIn(
-            "_risk_profile(row,asof_day=asof_day,conn=conn)", body,
-            "rows path 的 risk profile 漏传 asof_day")
+            "_risk_profile(row,asof_day=asof_day,conn=conn,cycle_id=cycle_id)", body,
+            "rows path 的 risk profile 漏传 as-of / cycle")
         self.assertIn(
-            "_risk_profile(account,asof_day=asof_day,conn=conn)", body,
-            "account fallback 漏传 asof_day：未来 adaptive risk 会污染历史")
+            "_risk_profile(account,asof_day=asof_day,conn=conn,cycle_id=cycle_id)", body,
+            "account fallback 漏传 as-of / cycle：未来 adaptive risk 会污染历史")
 
     def test_guard10d_adaptive_allocation_weight_is_asof_bound(self):
         tree = ast.parse(_source("paper_trading.py"))
@@ -1057,6 +1057,46 @@ class EntryCapitalPlanningIsBounded(unittest.TestCase):
         self.assertLess(
             guard_at, release_at,
             "终态化路径无条件释放预占：冲突的预占属于别的订单")
+
+    def test_guard10q_cycle_capital_resolves_the_pinned_strategy_version(self):
+        """explicit cycle 的资金路径必须用 ``paper_cycle_strategy_versions`` 的 pin（§25）。
+
+        ``_risk_profile`` 的 cycle 分支**只能**走 cycle-pinned 版本解析：
+        current/latest head（``paper_strategy_version_heads`` / ``get_context``）不是
+        exact-cycle 口径的 authority —— 它既可能让历史 cycle 吃到后来版本，也可能在
+        head 晚于 asof 时整体丢掉收紧。
+        """
+        body = self._flat("_risk_profile")
+        self.assertIn(
+            "ifconnisnotNoneandcycle_idisnotNone:", body,
+            "_risk_profile 没有按 explicit cycle 分流策略版本 provenance")
+        cycle_branch = body.split("elif", 1)[0]
+        self.assertIn(
+            "SRE.compiled_profile_for_cycle(conn,account_id,cycle_id=cycle_id)",
+            cycle_branch,
+            "explicit cycle 分支没有走 cycle-pinned 版本解析")
+        self.assertNotIn(
+            "SRE.compiled_profile_for(conn,account_id)", cycle_branch,
+            "explicit cycle 分支回落到 current head 编译画像：历史 cycle 的资本预算"
+            "会被后来的版本改写")
+        helper = self._flat("compiled_profile_for_cycle",
+                            "strategy_risk_enforcement.py")
+        self.assertIn(
+            "SR.stamp_for_account(conn,str(account_id),cycle_id=int(cycle_id))", helper,
+            "cycle 口径的画像解析没有从周期 pin 表（paper_cycle_strategy_versions）取版本")
+        self.assertIn("checksum=str(checksum)", helper,
+                      "cycle pin 解析没有按 immutable checksum 校验版本")
+        for shape, label in (
+            ("paper_strategy_version_heads", "strategy version heads（current head）"),
+            ("get_context(", "strategy_runtime 当前上下文（current head）"),
+        ):
+            with self.subTest(shape=label):
+                self.assertNotIn(
+                    shape, helper,
+                    f"cycle 口径的画像解析把 {label} 当成了 authority")
+        self.assertIn(
+            "composite_compiled_profile()", helper,
+            "binding 缺失时没有 fail closed 到 Composite（会因 provenance 不可证明而放宽风险）")
 
     # ── 普通 BUY 的 commit 收敛 ────────────────────────────────────────────
     def test_guard10i_normal_buy_order_has_no_direct_ledger_writes(self):

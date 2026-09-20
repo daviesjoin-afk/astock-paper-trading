@@ -1,8 +1,9 @@
 # R19 — fix(entry): bind buy planning and commit to order provenance
 
 - Branch: `codex/entry-capital-commit-convergence`
-- Base SHA: `d754fd4e8ac966a8f0e50f079906aa029c1cb4c0` (master containing #174)
-- Final exact head: `a9c4878`（见 CI 记录）
+- Base SHA: `d754fd4e8ac966a8f0e50f079906aa029c1cb4c0` (master containing #174), rebased onto `cbb1863`
+- Review-fix commit: `275ee60`（精确 head 与 CI 结论以 PR 的 exact-head 检查为准）
+- Final review-fix commit: cycle-pinned strategy version provenance（精确 head 见 PR）
 
 ## Before
 
@@ -78,6 +79,30 @@ allocation_plan explicit cycle/asof:        PASS
 intraday buyback explicit cycle/asof:       PASS
 swing scale-in explicit cycle/asof:         PASS
 ```
+
+## Strategy version provenance (explicit cycle)
+
+The capital budget already carries an explicit `cycle_id`. The compiled
+strategy risk profile must consume **the same immutable version that cycle
+pinned at start-up**, not the current/latest head.
+
+```text
+authority:                    paper_cycle_strategy_versions
+resolver:                     SRE.compiled_profile_for_cycle(conn, account_id, cycle_id=)
+  → SR.stamp_for_account(conn, account_id, cycle_id=)
+  → SR.get_version(strategy_id, version, checksum=checksum)
+current head / version heads: NOT the authority on the exact-cycle branch
+missing / invalid binding:     Composite (fail closed), never current head
+as-of earlier than head:       pinned version still applied (no silent un-tightening)
+```
+
+"current head + `created_at <= asof`" is a *different* contract and does not
+replace this one: cycle 8 may pin v1 and only later create v2, so a
+timestamp-only check lets cycle 8's historical budget adopt v2's caps. The
+reverse direction must hold too — when the head is newer than the as-of date
+the pinned profile must **not** be dropped entirely, because the compiled
+profile only ever tightens; dropping it silently loosens historical risk
+limits beyond the genuinely pinned version.
 
 ## Global reservation semantics
 
@@ -166,7 +191,7 @@ PASS (test_replacement_asof_provenance, test_paper_replacement_decision,
 ## Mutation
 
 ```text
-M-ENT1..M-ENT16:      16/16 CAUGHT
+M-ENT1..M-ENT20:      20/20 CAUGHT
 survived:             0
 non-vacuity:          PASS
 restore bytes:        PASS
@@ -190,14 +215,18 @@ M-ENT13  RED  mismatch branch releases the conflicting reservation
 M-ENT14  RED  normal _buy_order re-adds direct INSERT INTO paper_fills
 M-ENT15  RED  normal _buy_order re-adds direct _record_lot
 M-ENT16  RED  first slice marks the signal filled
+M-ENT17  RED  explicit idle cycle re-injects the caller account
+M-ENT18  RED  compiled profile merged unconditionally (future version rewrites history)
+M-ENT19  RED  terminalizer unconditionally releases a foreign reservation
+M-ENT20  RED  cycle-pinned version lookup falls back to current/latest head
 ```
 
 ## paper_trading.py
 
 ```text
 before:  16049 / 282
-after:   16043 / 282
-delta:   -6 LOC / 0 defs
+after:   16048 / 282
+delta:   -1 LOC / 0 defs
 ```
 
 The decrease comes from deleting the duplicate reserve/cash/lot/fill/verification
@@ -206,17 +235,18 @@ wiring; the LOC ratchet (Guard 3) passes.
 ## Verification
 
 ```text
-architecture baseline:  PASS (Guard 1..Guard 10m)
+architecture baseline:  PASS (Guard 1..Guard 10q)
 Targeted:               PASS
-  test_entry_capital_asof (EC-1..EC-11)
+  test_entry_capital_asof (EC-1..EC-16)
   test_strategy_buy_commit_convergence (SB-1..SB-16)
   test_paper_capital_reservations
   test_paper_trading_architecture_guard
+  test_deferred_fill_cycle_binding
   test_replacement_asof_provenance
   test_paper_replacement_decision
   test_position_review_provenance
   test_paper_risk_scan_state
-Backend full:           Ran 3759, OK (skipped=5)
+Backend full:           exact-head CI
 ruff:                   PASS
 compileall:             PASS
 Frontend:               PASS (build; no dist drift — this PR does not touch frontend)
@@ -229,6 +259,15 @@ Exact-head CI:          ALL PASS
 Merge:                  NOT MERGED
 Deploy:                 NOT DEPLOYED
 ```
+
+## Review findings addressed
+
+| # | Finding | Fix | Regression |
+|---|---------|-----|------------|
+| 1 | Foreign (wrong-cycle) reservation was released by the terminalizer | `_terminalize_cycle_stale_order` skips release when the mismatch is a foreign reservation | EC-14, Guard 10p, M-ENT19 |
+| 2 | Explicit idle cycle silently injected the caller account | both fallback branches are gated on `cycle_id is None` | EC-13, Guard 10n, M-ENT17 |
+| 3 | Compiled risk profile was merged for as-of dates older than the strategy version | `compiled_profile_is_asof_provable` gates the merge | EC-12, Guard 10o, M-ENT18 |
+| 4 | Historical compiled risk profile was resolved from the current head instead of the version the cycle pinned | `SRE.compiled_profile_for_cycle` reads `paper_cycle_strategy_versions` via `SR.stamp_for_account` → `SR.get_version(checksum=…)`; exact-cycle branch never consults current/latest head; missing binding fails closed to Composite; the pinned profile still applies when the head is newer than the as-of date | EC-15, EC-16, Guard 10q, M-ENT20 |
 
 ## Authority matrix
 

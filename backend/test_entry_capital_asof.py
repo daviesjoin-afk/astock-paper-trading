@@ -463,6 +463,142 @@ class ExplicitEmptyCycleHasNoCapital(_CapitalCase):
         self.assertEqual({}, inputs["weights"], "idle 周期产生了策略权重")
 
 
+class CyclePinnedStrategyVersionIsUsed(_CapitalCase):
+    """EC-15 / EC-16 —— capital budget 必须消费 cycle **冻结**的不可变版本。
+
+    这是 R19 §25 的真正 contract：``paper_cycle_strategy_versions`` 在周期启动时
+    就 pin 住了 ``strategy_id / strategy_version / strategy_checksum``，后来的编辑
+    无法再给该周期的证据换标签。仅凭 ``current head.created_at <= asof`` 判断是
+    **另一个** contract —— 它既可能让历史 cycle 吃到后来版本，也可能在 head 晚于
+    asof 时整体丢掉收紧（那会让历史风险限制反而比真正 pinned 版本更宽松）。
+    """
+
+    USER = "r19_alpha"
+    #: 两个**合法 DSL** 且产出不同 archetype / max_exposure 的版本定义。
+    #: v1 → Trend / 0.85；v2 → Composite / 0.65。
+    PINNED_RULE = {"op": "gt", "left": {"op": "field", "name": "close"},
+                   "right": {"op": "indicator", "name": "ma", "window": 20}}
+    PINNED_CONFIG = {"style": "trend", "hold": 8, "positions": 3,
+                     "daily": True, "close": True}
+    HEAD_RULE = {"op": "gt", "left": {"op": "field", "name": "close"},
+                 "right": {"op": "const", "value": 1}}
+    HEAD_CONFIG = {"style": "quality", "daily": True, "close": True, "hold": 20,
+                   "positions": 8, "stop": True, "atr": True}
+
+    def _seed_pinned_cycle(self, *, cycle_id):
+        """建 v1（Trend, max_exposure=0.85）并把该账户 pin 到 cycle_id。"""
+        import strategy_registry as SR
+        with PT._db(immediate=True) as conn:
+            SR.ensure_schema(conn)
+            SR.create_user_definition(
+                conn, self.USER, "R19 trend", dsl_ast=dict(self.PINNED_RULE),
+                metadata=dict(self.PINNED_CONFIG), actor="r19-test")
+        with PT._db(immediate=True) as conn:
+            # 账户需要存在才能被 pin；创建用户名下的账户行。
+            conn.execute(
+                "INSERT OR IGNORE INTO paper_accounts(id,name,source_strategy,status,"
+                "initial_cash,cash,cycle_days,max_positions,max_weight,max_exposure,"
+                "version,created_at,updated_at,cycle_id,risk_profile) "
+                "VALUES(?,?,'strategy_dsl','running',0,0,8,3,0.32,0.9,'v0',?,?,?, 'trend')",
+                (self.USER, self.USER, f"{DAY.isoformat()} 00:00:00",
+                 f"{DAY.isoformat()} 00:00:00", int(cycle_id)),
+            )
+            SR.bind_cycle_versions(conn, int(cycle_id), [self.USER])
+        with PT._db() as conn:
+            stamp = SR.stamp_for_account(conn, self.USER, cycle_id=int(cycle_id))
+        self.assertIsNotNone(stamp[1], "fixture 的 pin 没有建立")
+        return int(stamp[1])
+
+    def _advance_head(self, *, expected_version):
+        """把 current head 推到 v2（Composite, max_exposure=0.65）。"""
+        import strategy_registry as SR
+        with PT._db(immediate=True) as conn:
+            SR.save_definition(
+                conn, self.USER,
+                {"dsl_ast": dict(self.HEAD_RULE), "metadata": dict(self.HEAD_CONFIG)},
+                expected_version=expected_version, actor="r19-test",
+                change_note="r19 advance head",
+            )
+
+    def test_ec15_cycle_pinned_version_beats_a_later_current_head(self):
+        """cycle pin v1；之后 head 前进到 v2（created_at <= asof）仍不得改写该 cycle。"""
+        import strategy_registry as SR
+        cycle = self.cycle_id()
+        pinned_version = self._seed_pinned_cycle(cycle_id=cycle)
+        with PT._db() as conn:
+            pinned_profile = PT.SRE.compiled_profile_for_cycle(
+                conn, self.USER, cycle_id=cycle)
+        self._advance_head(expected_version=pinned_version)
+        with PT._db() as conn:
+            head = SR.get_version(self.USER, conn=conn)
+            head_profile = PT.SRE.compiled_profile_for(conn, self.USER)
+            resolved = PT.SRE.compiled_profile_for_cycle(conn, self.USER, cycle_id=cycle)
+            pinned_after = int(SR.stamp_for_account(conn, self.USER, cycle_id=cycle)[1])
+            head_created = str(head.created_at)[:10]
+            account = dict(conn.execute(
+                "SELECT * FROM paper_accounts WHERE id=?", (self.USER,)).fetchone())
+            # asof **不早于** head 创建日 —— 旧逻辑（current head + created_at <= asof）
+            # 会认为 v2 可证明，从而让 cycle 的资本预算吃到 v2 的帽。
+            production = PT._risk_profile(
+                account, asof_day=head_created, conn=conn, cycle_id=cycle)
+        self.assertNotEqual(
+            int(head.version), pinned_version,
+            "fixture 的 current head 没有前进（空门禁）")
+        # 非空门禁：两版本画像**确实**不同，否则本测试无法区分。
+        self.assertNotEqual(
+            pinned_profile.get("max_exposure"), head_profile.get("max_exposure"),
+            f"两版本 max_exposure 相同，无法区分：{pinned_profile} vs {head_profile}")
+        # 核心断言：cycle 口径必须停在 pinned v1，而不是 current head v2。
+        self.assertEqual(
+            pinned_version, pinned_after, "cycle pin 被 head 前进改写了")
+        self.assertEqual(
+            pinned_profile.get("max_exposure"), resolved.get("max_exposure"),
+            "cycle capital planning 使用了 current head 而不是 cycle-pinned 版本")
+        self.assertNotEqual(
+            head_profile.get("max_exposure"), resolved.get("max_exposure"),
+            "cycle 口径吃到了 current head 的帽")
+        # 生产路径（``_risk_profile`` 的 explicit cycle 分支）同样必须消费 pinned 版本。
+        audit = production.get("compiled_risk_profile") or {}
+        self.assertEqual(
+            pinned_profile.get("template"), audit.get("template"),
+            f"生产资金路径用了 current head 的编译画像：{audit}")
+        self.assertNotEqual(
+            head_profile.get("template"), audit.get("template"),
+            "生产资金路径吃到了 current head 的模板")
+        self.assertEqual(
+            round(float(pinned_profile.get("max_exposure") or 0), 4),
+            round(float(production.get("max_exposure") or 0), 4),
+            "生产资金路径的 max_exposure 不是 cycle-pinned 版本的帽")
+
+    def test_ec16_late_head_does_not_drop_the_pinned_profile(self):
+        """head 晚于 asof 也必须继续用 pinned 版本，不得整体跳过收紧。"""
+        cycle = self.cycle_id()
+        self._seed_pinned_cycle(cycle_id=cycle)
+        with PT._db() as conn:
+            pinned = PT.SRE.compiled_profile_for_cycle(conn, self.USER, cycle_id=cycle)
+        # 非空门禁：pin 住的版本不是 Composite 兜底（否则无法区分"用了 pinned"
+        # 与"fail closed 到 Composite"）。
+        self.assertNotEqual(
+            pinned.get("template"), PT.SRE.composite_compiled_profile().get("template"),
+            "pin 住的版本解析成了 Composite：fixture 无法区分 pinned 与兜底")
+        # asof 远早于版本创建日 —— 旧逻辑（created_at <= asof）会整体跳过收紧。
+        with PT._db() as conn:
+            account = dict(conn.execute(
+                "SELECT * FROM paper_accounts WHERE id=?", (self.USER,)).fetchone())
+            profile = PT._risk_profile(
+                account, asof_day="2020-01-01", conn=conn, cycle_id=cycle)
+        self.assertIn(
+            "compiled_risk_profile", profile,
+            "asof 早于版本创建时整体跳过了 compiled profile：历史风险限制被放宽")
+        self.assertEqual(
+            profile["compiled_risk_profile"].get("template"), pinned.get("template"),
+            "asof 早于版本创建时没有继续使用 cycle-pinned 版本")
+        self.assertEqual(
+            round(float(profile.get("max_exposure") or 0), 4),
+            round(float(pinned.get("max_exposure") or 0), 4),
+            "cycle-pinned 的 max_exposure 没有生效")
+
+
 class ForeignReservationIsNeverReleased(unittest.TestCase):
     """EC-14 —— 周期冲突的预占绝不被 release（含手动终态化路径）。"""
 
