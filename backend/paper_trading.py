@@ -2787,7 +2787,7 @@ def _order_cycle_id_for_order(conn, order_id):
     return provenance.cycle_id if provenance.is_proven else None
 
 
-def _assert_order_execution_cycle(conn, order_id, *, account_id=None, provenance=None):
+def _assert_order_execution_cycle(conn, order_id, *, account_id=None, provenance=None, allow_out_of_cycle_account=False):
     """**已存在订单**的成交授权闸门：返回可证明的 ``order_cycle_id``，否则抛异常。
 
     这是 execution-cycle invariant 的**唯一**实现（§8：不要把判断抄成三四份）。
@@ -2825,9 +2825,9 @@ def _assert_order_execution_cycle(conn, order_id, *, account_id=None, provenance
 
     account_cycle_id = _account_cycle_id_readonly(conn, account_id)
     active_cycle_id = _active_cycle_id_readonly(conn)
-    # 归档/退出当前周期的账户仍可清掉旧 lot；仅当订单周期 == active cycle 时放行。
-    archived_out_of_cycle = account_cycle_id is None and active_cycle_id == order_cycle_id and (conn.execute("SELECT status FROM paper_accounts WHERE id=?", (account_id,)).fetchone() or [None])[0] == "archived"
-    if (account_cycle_id != order_cycle_id and not archived_out_of_cycle) or active_cycle_id != order_cycle_id:
+    # 暂停/归档/退出当前周期的账户仍可清掉旧 lot；仅 SELL 且订单周期 == active cycle 时放行。
+    archived_out_of_cycle = account_cycle_id is None and active_cycle_id == order_cycle_id and (conn.execute("SELECT status FROM paper_accounts WHERE id=?", (account_id,)).fetchone() or [None])[0] in ("paused", "archived")
+    if (account_cycle_id != order_cycle_id and not (allow_out_of_cycle_account and archived_out_of_cycle)) or active_cycle_id != order_cycle_id:
         raise OrderExecutionCycleChanged(
             order_id, order_cycle_id, account_cycle_id, active_cycle_id,
             "订单周期与经济账本/active 周期不一致；旧周期订单已 stale",

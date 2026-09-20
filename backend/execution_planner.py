@@ -582,6 +582,7 @@ def commit_fill(
     # 持有上一轮缓存的 account 快照，账本在两次读之间搬了家。
     order_cycle_id = PT._assert_order_execution_cycle(
         conn, order_id, account_id=account_id, provenance=provenance,
+        allow_out_of_cycle_account=(side == "sell"),
     )
 
     if side == "buy":

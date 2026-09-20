@@ -67,17 +67,17 @@ Additional behavior-preserving details:
 - `PPRS.finalize_sell` is called only by `execution_planner.commit_fill`.
 - Risk partial take-profit passes `sell_next_take_stage`; intraday/manual SELL passes `None`, so partial sells preserve the existing stage.
 - Full exits are decided by the finalizer from authoritative `paper_position_lots`, not by caller-local `position.qty`.
-- Archived/out-of-cycle accounts retain their existing risk-exit capability when the order cycle equals the active cycle; unknown / legacy NULL / identity mismatch / cross-cycle orders still fail closed.
+- Paused/archived out-of-cycle accounts retain their existing risk-exit capability when the order cycle equals the active cycle and the order is a SELL; unknown / legacy NULL / identity mismatch / cross-cycle orders still fail closed.
 - The legacy execution-verification wiring guard now expects only `execution_planner.commit_fill` and the `demo_seed` fixture writer as `paper_fills` write owners.
 
 ## Tests
 
 ```text
 Targeted suite:
-397 tests OK
+398 tests OK
 
 Full backend:
-3804 tests OK (skipped=5)
+3805 tests OK (skipped=5)
 
 Frontend:
 npm --prefix frontend run build: PASS

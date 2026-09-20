@@ -74,6 +74,24 @@ class RiskSellCommitConvergence(_R20RiskBase):
         self.assertEqual(row["status"], "filled")
         self.assertEqual(int(row["execution_verified"] or 0), 1)
 
+    def test_sf1b_paused_out_of_cycle_account_still_commits(self):
+        """被禁用策略会留下 paused + cycle_id=NULL；它仍必须能风控清仓。"""
+        self.add_lot(100, 10.0)
+        self.conn.execute(
+            "UPDATE paper_accounts SET status='paused', cycle_id=NULL WHERE id=?",
+            (self.ACCOUNT,),
+        )
+        self.conn.commit()
+        self._inner._set_fresh_exit_quote(self.code, price=9.0, pct=-8.0)
+
+        result = PT.monitor_risk(self.day)
+
+        filled = [item for item in result.get("orders", [])
+                  if item.get("status") == "filled"]
+        self.assertEqual(len(filled), 1, result.get("orders"))
+        self.assertEqual(self.remaining_lots(), 0)
+        self.assertIsNone(self.state_row())
+
     def test_sf4_risk_partial_sell_advances_take_stage(self):
         self.add_lot(200, 10.0)
         self._inner._set_fresh_exit_quote(
