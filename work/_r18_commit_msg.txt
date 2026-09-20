@@ -1,0 +1,28 @@
+fix(risk): bind replacement decisions to cycle and as-of
+
+A risk pass could select a replacement signal intended for the next trading
+day: `_best_replacement_candidate` used `intended_date >= today AND
+intended_date <= next_weekday`. That future candidate could supply enough score
+edge to trigger a same-day consolidation_exit — a real sell of the current
+holding — while the subsequent `_rotation_buy_candidate -> _buy_order` rejected
+the very same signal because `entry_lifecycle.signal_freshness` requires
+`intended_date == asof_day`. Today sold purely for tomorrow's candidate, which
+was then additionally marked expired today. The same helpers also re-resolved
+the active cycle themselves and read the newest position review with no as-of
+upper bound (asof=D could read a D+1 review).
+
+Replacement candidate reads are now restricted to active signals whose
+`intended_date` equals the explicit asof_day and whose `signal_date` is not in
+the future (a legal overnight plan D-1 -> D still works), and slot review
+evidence is bounded by `(cycle_id, review_date <= asof_day)`. Slot context,
+borrow and rollback all take one explicit keyword-only cycle_id and never call
+`_active_cycle()` — a borrow lifecycle is same cycle in, same cycle out.
+
+The pure candidate scoring and slot comparison move out of paper_trading.py into
+backend/paper_replacement_decision.py (zero DB, zero I/O, zero wall clock, zero
+project imports, frozen ReplacementPolicy), with the bounded reads in
+backend/paper_replacement_evidence.py. No thresholds, no protective exits, no
+schema changes — no migration. Final replacement BUY still goes through the
+single `_buy_order` gate; this does not duplicate or weaken execution checks.
+
+paper_trading.py: 16134 -> 16049 LOC, 283 -> 282 top-level defs.

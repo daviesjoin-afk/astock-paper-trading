@@ -65,6 +65,8 @@ import paper_risk_decision as PRD
 import paper_risk_scan_state as PRSS
 import paper_position_review as PReview
 import paper_position_review_evidence as PREV
+import paper_replacement_decision as PRep
+import paper_replacement_evidence as PREPL
 import adaptive_selection_compat as ASC
 # ELC / EPD 仍被非 cleanup 路径使用（signal freshness、entry slice plan、
 # dispatch 规划与核验、gated order 查询）。清理动作已移交 paper_slot_service，
@@ -7898,6 +7900,26 @@ REVIEW_POLICY = PReview.ReviewPolicy(
 # candidate to beat an existing holding by the full urgent-replacement margin.
 SLOT_BORROW_MIN_CANDIDATE_SCORE = 65.0
 SLOT_BORROW_MIN_EDGE = 12.0
+# R18：候选评分与席位比较已抽到 paper_replacement_decision（纯域模块）。它不 import
+# 本模块，因此阈值必须由这里注入；模块级常量让"常量表 ↔ policy 字段"一眼可查，
+# 也避免每次调用重建 dataclass。**所有数值保持原样，不得调整**。
+REPLACEMENT_POLICY = PRep.ReplacementPolicy(
+    strategy_min_positions=STRATEGY_MIN_POSITIONS,
+    strategy_max_positions=STRATEGY_MAX_POSITIONS,
+    shared_pool_max_positions=SHARED_POOL_MAX_POSITIONS,
+    borrow_min_candidate_score=SLOT_BORROW_MIN_CANDIDATE_SCORE,
+    borrow_min_edge=SLOT_BORROW_MIN_EDGE,
+    upgrade_min_candidate_score=SLOT_UPGRADE_MIN_CANDIDATE_SCORE,
+    upgrade_min_edge=SLOT_UPGRADE_MIN_EDGE,
+    execution_buffer=POSITION_REPLACEMENT_EXECUTION_BUFFER,
+    full_cap_edge=POSITION_FULL_CAP_REPLACEMENT_EDGE,
+    full_cap_max_score=POSITION_FULL_CAP_MAX_SCORE,
+    replace_edge=POSITION_REVIEW_REPLACEMENT_EDGE,
+    any_replace_score=POSITION_REVIEW_ANY_REPLACE_SCORE,
+    replace_score=POSITION_REVIEW_REPLACE_SCORE,
+    exit_score=POSITION_REVIEW_EXIT_SCORE,
+    lot_size=LOT_SIZE,
+)
 # 总席位是全天风险容量，不是 09:30 后可一次性买满的目标。候选仍由
 # 全市场实时重排，但新开仓按确认窗口逐步释放；做T回补、既有持仓加仓和
 # 风险卖出不占用这条新票释位规则。
@@ -9325,10 +9347,17 @@ def _buy_order(conn, account, signal, quote, market, news, asof_day, *, all_quot
     # A borrowed seat is a late-session quality allocation tool.  It must not
     # let a strong opening candidate bypass the staged deployment budget.
     if strategy_count_blocked and not pacing_blocked:
-        upgrade = _slot_upgrade_context(conn, account["id"], signal, positions, asof_day)
+        # R18：席位比较/借位必须与上面已经证明过的 current_cycle 同周期 ——
+        # 不再让 helper 自己重新解析 active cycle。
+        upgrade = _slot_upgrade_context(
+            conn, account["id"], signal, positions, asof_day,
+            cycle_id=current_cycle["id"],
+        )
         risk["slot_upgrade"] = upgrade
         if upgrade.get("eligible"):
-            borrowed = _apply_slot_borrow(conn, account["id"], upgrade, asof_day)
+            borrowed = _apply_slot_borrow(
+                conn, account["id"], upgrade, asof_day, cycle_id=current_cycle["id"],
+            )
             risk["slot_borrow"] = borrowed
             if borrowed.get("allowed"):
                 # Re-read the same allocation version after the atomic transfer
@@ -9819,7 +9848,7 @@ def _buy_order(conn, account, signal, quote, market, news, asof_day, *, all_quot
         # 该信号已在执行队列中等待，本轮不再重复入队（否则每轮扫描都会新建
         # 一条挂起单，TTL 与队列视图都会被不断刷新）。
         if (risk.get("slot_borrow") or {}).get("allowed"):
-            risk["slot_borrow_rollback"] = _rollback_slot_borrow(conn, risk["slot_borrow"])
+            risk["slot_borrow_rollback"] = _rollback_slot_borrow(conn, risk["slot_borrow"], cycle_id=current_cycle["id"])
         hold_reason = dispatch_plan["reason"] or "委托已在执行队列中等待放行"
         _risk_log(conn, account["id"], code, "buy", f"execution_gate_{dispatch_gate}",
                   hold_reason, risk)
@@ -9896,7 +9925,7 @@ def _buy_order(conn, account, signal, quote, market, news, asof_day, *, all_quot
     _risk_log(conn, account["id"], code, "buy", decision_name, reason, risk)
     if not allowed:
         if (risk.get("slot_borrow") or {}).get("allowed"):
-            risk["slot_borrow_rollback"] = _rollback_slot_borrow(conn, risk["slot_borrow"])
+            risk["slot_borrow_rollback"] = _rollback_slot_borrow(conn, risk["slot_borrow"], cycle_id=current_cycle["id"])
         if order_status in EPD.GATED_ORDER_STATUSES:
             # 挂起单已落库（不预占资金、不占席位）；信号留在复试管道里，
             # 批量窗口开启或人工核验放行后由下一轮扫描继续过闸成交。
@@ -10015,7 +10044,7 @@ def _buy_order(conn, account, signal, quote, market, news, asof_day, *, all_quot
             raise
         _finish_capital_reservation(conn, order_id, "released")
         if (risk.get("slot_borrow") or {}).get("allowed"):
-            risk["slot_borrow_rollback"] = _rollback_slot_borrow(conn, risk["slot_borrow"])
+            risk["slot_borrow_rollback"] = _rollback_slot_borrow(conn, risk["slot_borrow"], cycle_id=current_cycle["id"])
         failure = f"策略买入执行失败，可重试：{type(exc).__name__}: {exc}"
         conn.execute(
             "UPDATE paper_orders SET status=?,reason=?,filled_price=NULL,amount=NULL,fees=NULL,executed_at=NULL WHERE id=?",
@@ -10296,24 +10325,6 @@ def _score100(value, default=50.0):
     return max(0.0, min(100.0, value))
 
 
-def _replacement_score_from_signal(signal):
-    """Return the comparable 0..100 score used for a slot replacement.
-
-    The entry assessment, intraday score and selection rank have different
-    scales.  Keeping this composition in one helper prevents the order gate,
-    holding review and UI audit from comparing different numbers.
-    """
-    signal = signal or {}
-    payload = _loads(signal.get("payload"), {}) if isinstance(signal, dict) else {}
-    entry = (payload.get("decision") or {}).get("entry_model") or {}
-    return round(
-        _score100(entry.get("score"), 0.0) * 0.45
-        + _score100(signal.get("t_score"), 0.0) * 0.35
-        + _score100(signal.get("rank_score"), 0.0) * 0.20,
-        2,
-    )
-
-
 def _waitlist_realtime_assessment(signal, account, quote, asof_day):
     """Re-score a waiting candidate with the quote used for this execution.
 
@@ -10326,7 +10337,7 @@ def _waitlist_realtime_assessment(signal, account, quote, asof_day):
     payload = _loads(signal.get("payload"), {})
     pick = dict(payload.get("pick") or {})
     pick.update({key: value for key, value in (quote or {}).items() if value is not None})
-    base = _replacement_score_from_signal(signal)
+    base = PRep.score_candidate(signal)
     source_price = _num((payload.get("pick") or {}).get("price"), None)
     live_price = _num((quote or {}).get("price"), None)
     drift_pct = ((live_price / source_price - 1.0) * 100.0) if source_price and live_price else None
@@ -10351,52 +10362,58 @@ def _waitlist_realtime_assessment(signal, account, quote, asof_day):
 
 
 def _best_replacement_candidate(conn, account_id, day, held_codes):
-    """Find the strongest pending candidate that is not already held."""
-    next_day = _next_weekday(day).isoformat()
-    rows = _rows(
-        conn,
-        """SELECT id,code,name,rank_score,t_score,payload,intended_date,status
-           FROM paper_signals
-           WHERE account_id=? AND status IN ('pending','deferred_capacity',?)
-             AND intended_date>=? AND intended_date<=?
-           ORDER BY COALESCE(t_score,0) DESC,COALESCE(rank_score,0) DESC,id DESC""",
-        (account_id, ENTRY_FROZEN_WAITLIST_STATUS, _date(day).isoformat(), next_day),
+    """Find the strongest **same-day** pending candidate that is not already held.
+
+    R18（as-of hard contract）：今天可以用来卖掉今天持仓的替补，必须**属于今天**。
+    候选读取经 :mod:`paper_replacement_evidence` 固定在 ``intended_date == day`` 且
+    ``signal_date <= day``：
+
+    * ``intended_date == day``（**等式**，不是 ``today..next_weekday`` 的 range）——
+      否则明天的候选会先制造今天的卖出，而真实 BUY 又因 ``signal_freshness`` 要求
+      ``intended_date == asof_day`` 被拒（§4-§7）。
+    * ``signal_date <= day`` —— 历史 as-of 回放不得读到未来的证据。
+
+    合法 overnight 计划（``signal_date = D-1``、``intended_date = D``）仍然可用。
+    归档 signal 不参与：它是历史 opening 证据，不是 executable candidate。
+    """
+    statuses = ("pending", "deferred_capacity", ENTRY_FROZEN_WAITLIST_STATUS)
+    rows = PREPL.load_replacement_candidates(
+        conn, account_id=account_id, asof_day=_date(day).isoformat(), statuses=statuses,
     )
-    held_codes = {str(code) for code in (held_codes or set())}
-    best = None
+    # security scope 仍由 adapter 处理（纯域模块不 import 项目 API）。name / risk_flag
+    # 取自 signal 自身的 payload.pick，与旧实现逐字一致。
+    allowed = []
     for row in rows:
         code = str(row.get("code") or "")
-        if not code or code in held_codes:
+        if not code:
             continue
-        payload = _loads(row.get("payload"), {})
-        pick = payload.get("pick") or {}
-        if not _security_scope(
-            code, row.get("name") or pick.get("name"), pick.get("risk_flag"),
-        )["allowed"]:
+        pick = (_loads(row.get("payload"), {}) or {}).get("pick") or {}
+        if not _security_scope(code, row.get("name") or pick.get("name"),
+                               pick.get("risk_flag"))["allowed"]:
             continue
-        # Replacement quality must be a stable composite.  Taking the maximum
-        # of three differently-scaled fields let one noisy value hijack the
-        # last slot in a concentrated portfolio.
-        score = _replacement_score_from_signal(row)
-        item = {
-            "signal_id": int(row["id"]), "status": row.get("status"),
-            "code": code, "name": row.get("name") or code,
-            "score": round(score, 2), "intended_date": row.get("intended_date"),
-        }
-        if best is None or item["score"] > best["score"]:
-            best = item
-    return best
+        allowed.append(row)
+    # 候选质量必须是稳定复合分；选择与排序在纯域模块里（held 排除也在那里再兜一次）。
+    return PRep.choose_best_candidate(allowed, held_codes=held_codes)
 
 
-def _slot_upgrade_context(conn, account_id, signal, positions, asof_day):
+def _slot_upgrade_context(conn, account_id, signal, positions, asof_day, *, cycle_id):
     """Explain whether a full strategy slot can be upgraded by a candidate.
 
     This is deliberately an explanation/queue helper, not a way around T+1
     or the shared hard cap.  The actual sell still happens only in
     ``monitor_risk`` after a fresh exit quote, lot availability and the same
     score comparison have been checked.
+
+    R18：
+
+    * ``cycle_id`` 是 **keyword-only 且必填** —— 调用方（``_buy_order``）已经证明过
+      "当前周期是谁、账户挂在哪"，本 helper 不得再问一次 ``_active_cycle()``
+      （那正是 §10/§14 的 defect B：一次在途下单的席位比较去读了另一个周期）。
+    * 历史 review 经 :func:`paper_replacement_evidence.latest_position_review` 读取，
+      带 ``review_date <= asof_day`` 上界（defect C：``asof=D`` 不得读到 ``D+1``）。
+    * 比较与状态机在 :mod:`paper_replacement_decision`（纯域模块）。
     """
-    cycle = _active_cycle(conn)
+    resolved_cycle_id = int(cycle_id)
     count_budget = _dynamic_position_limits(conn)
     counts = {
         key: sum(
@@ -10406,59 +10423,32 @@ def _slot_upgrade_context(conn, account_id, signal, positions, asof_day):
         for key in count_budget.get("limits", {})
     }
     target_limit = int(_num(count_budget.get("limits", {}).get(account_id), 0))
-    donors = []
-    for donor_id, donor_limit_raw in count_budget.get("limits", {}).items():
-        if donor_id == account_id:
-            continue
-        donor_limit = int(_num(donor_limit_raw))
-        donor_count = int(counts.get(donor_id, 0))
-        # A donor may give only an unused slot and must retain the normal
-        # three-position minimum.  This is an actual allocation transfer,
-        # not an exception that raises the shared 15-slot hard cap.
-        donor_floor = max(STRATEGY_MIN_POSITIONS, donor_count)
-        if donor_limit > donor_floor and donor_count < donor_limit:
-            donors.append({
-                "account_id": donor_id,
-                "limit": donor_limit,
-                "count": donor_count,
-                "remaining_after": donor_limit - 1,
-            })
     pool_limit = int(_num(count_budget.get("pool_limit"), SHARED_POOL_MAX_POSITIONS))
     pending_slots = _pending_position_slots(conn, positions)
     occupied_pool = {
         (str(item.get("account_id")), str(item.get("code")))
         for item in positions if int(_num(item.get("qty"))) >= LOT_SIZE
     } | pending_slots
-    # When every strategy has reached its local allocation but the effective
-    # pool still has free seats (for example 8 occupied out of a 12-seat
-    # risk-reduced pool), lend one of those unallocated seats directly.
-    if len(occupied_pool) < pool_limit:
-        donors.append({
-            "account_id": "shared_pool",
-            "limit": pool_limit,
-            "count": len(occupied_pool),
-            "remaining_after": len(occupied_pool),
-            "unused_pool_slots": pool_limit - len(occupied_pool),
-        })
-    borrow_candidate = _replacement_score_from_signal(signal)
-    borrow_ready = bool(
-        target_limit < STRATEGY_MAX_POSITIONS
-        and donors
-        and borrow_candidate >= SLOT_BORROW_MIN_CANDIDATE_SCORE
+    # donor 判定（含"共享池还有未分配席位就直接出借"）在纯域模块里。
+    donors = PRep.derive_donors(
+        limits=count_budget.get("limits", {}), counts=counts, account_id=account_id,
+        pool_limit=pool_limit, occupied_pool_count=len(occupied_pool),
+        policy=REPLACEMENT_POLICY,
     )
-    candidate_score = _replacement_score_from_signal(signal)
+    candidate_score = PRep.score_candidate(signal)
     held = [
         item for item in positions
         if item.get("account_id") == account_id and int(_num(item.get("qty"))) >= LOT_SIZE
     ]
     weakest = None
     for position in held:
-        review = conn.execute(
-            """SELECT score,action FROM paper_position_reviews
-               WHERE cycle_id=? AND account_id=? AND code=?
-               ORDER BY id DESC LIMIT 1""",
-            (cycle["id"], account_id, str(position.get("code") or "")),
-        ).fetchone()
+        # R18：历史 review 必须**同时**受显式 cycle_id 与 review_date<=asof_day 约束。
+        # 旧查询只按 ORDER BY id DESC LIMIT 1，于是 asof=D 会读到 D+1 的 review
+        # （future leakage），并且用 active cycle 而非已认领周期。
+        review = PREPL.latest_position_review(
+            conn, cycle_id=resolved_cycle_id, account_id=account_id,
+            code=str(position.get("code") or ""), asof_day=_date(asof_day).isoformat(),
+        )
         score = _num(review["score"], 100.0) if review else 100.0
         item = {
             "code": str(position.get("code") or ""),
@@ -10470,106 +10460,25 @@ def _slot_upgrade_context(conn, account_id, signal, positions, asof_day):
         }
         if weakest is None or item["score"] < weakest["score"]:
             weakest = item
-    if weakest is None:
-        return {
-            "candidate_score": candidate_score,
-            "borrow_candidate_score": borrow_candidate,
-            "borrow_ready": borrow_ready,
-            "donors": donors,
-            "eligible": borrow_ready,
-            "reason": (
-                f"候选 {borrow_candidate:.1f} 分可从 {donors[0]['account_id']} 借用一个未使用席位"
-                if borrow_ready else "暂无可比较的存量持仓"
-            ),
-        }
-    edge = candidate_score - weakest["score"]
-    pool_donor_available = any(item.get("account_id") == "shared_pool" for item in donors)
-    borrow_ready = bool(
-        target_limit < STRATEGY_MAX_POSITIONS
-        and donors
-        and borrow_candidate >= SLOT_BORROW_MIN_CANDIDATE_SCORE
-        and (pool_donor_available or edge >= SLOT_BORROW_MIN_EDGE)
+    return PRep.decide_slot_upgrade(
+        candidate_score=candidate_score, weakest=weakest, target_limit=target_limit,
+        donors=donors, at_dynamic_limit=len(held) >= target_limit,
+        min_hold_days=_replacement_min_hold_days(account_id),
+        policy=REPLACEMENT_POLICY,
     )
-    urgent = bool(
-        candidate_score >= SLOT_UPGRADE_MIN_CANDIDATE_SCORE
-        and edge >= SLOT_UPGRADE_MIN_EDGE
-        and weakest["score"] <= POSITION_REVIEW_EXIT_SCORE
-    )
-    net_edge = edge - POSITION_REPLACEMENT_EXECUTION_BUFFER
-    at_dynamic_limit = len(held) >= target_limit
-    full_slot_ready = bool(
-        at_dynamic_limit
-        and net_edge >= POSITION_FULL_CAP_REPLACEMENT_EDGE
-        and weakest["score"] < POSITION_FULL_CAP_MAX_SCORE
-    )
-    regular_upgrade_ready = bool(
-        net_edge >= POSITION_REVIEW_REPLACEMENT_EDGE
-        and (
-            weakest["score"] <= POSITION_REVIEW_ANY_REPLACE_SCORE
-            or (
-                weakest.get("review_action") in {"watch", "reduce", "exit"}
-                and weakest["score"] < POSITION_REVIEW_REPLACE_SCORE
-            )
-        )
-    )
-    upgrade_ready = bool(urgent or full_slot_ready or regular_upgrade_ready)
-    min_hold_days = _replacement_min_hold_days(account_id)
-    if weakest["available_qty"] < LOT_SIZE:
-        state = "t1_locked"
-        reason = (
-            f"高分替补 {candidate_score:.1f} 分，现有最弱仓 {weakest['name']} "
-            f"{weakest['score']:.1f} 分，分差 {edge:.1f}；最弱仓受 T+1 锁定，"
-            "保留为优先替补，最早可卖后自动复核"
-        )
-    elif upgrade_ready and weakest["hold_days"] < min_hold_days and not urgent:
-        state = "observe"
-        reason = (
-            f"候选 {candidate_score:.1f} 分高于最弱仓 {weakest['score']:.1f} 分（+{edge:.1f}），"
-            f"但最弱仓观察期仅 {weakest['hold_days']}/{min_hold_days} 日，"
-            "继续观察以避免高频换手"
-        )
-    elif urgent:
-        state = "urgent_upgrade"
-        reason = (
-            f"候选 {candidate_score:.1f} 分显著高于最弱仓 {weakest['name']} "
-            f"{weakest['score']:.1f} 分（+{edge:.1f}），达到紧急择强换仓条件；"
-            "等待下一次风控扫描按 T+1 和行情核验执行"
-        )
-    elif full_slot_ready or regular_upgrade_ready:
-        state = "upgrade_ready"
-        reason = (
-            f"候选 {candidate_score:.1f} 分高于最弱仓 {weakest['name']} "
-            f"{weakest['score']:.1f} 分（原始 +{edge:.1f}、成本缓冲后 +{net_edge:.1f}），"
-            "进入择强换仓队列"
-        )
-    else:
-        state = "edge_insufficient"
-        reason = (
-            f"候选 {candidate_score:.1f} 分较最弱仓 {weakest['score']:.1f} 分高 {edge:.1f}，"
-            f"扣除执行缓冲后 {net_edge:.1f}，未达到满席净优势 "
-            f"{POSITION_FULL_CAP_REPLACEMENT_EDGE:.1f} 分；继续候选重排，不占换仓队列"
-        )
-    return {
-        "candidate_score": candidate_score, "weakest": weakest,
-        "edge": round(edge, 2), "urgent": urgent,
-        "borrow_candidate_score": borrow_candidate,
-        "borrow_ready": borrow_ready,
-        "donors": donors,
-        "state": "slot_borrow_ready" if borrow_ready else state,
-        "eligible": bool(borrow_ready or state in {"urgent_upgrade", "upgrade_ready"}),
-        "reason": (
-            f"候选 {borrow_candidate:.1f} 分达到借位条件，可从 {donors[0]['account_id']} "
-            f"转入一个未使用席位；不突破总上限{SHARED_POOL_MAX_POSITIONS}"
-            if borrow_ready else reason
-        ),
-    }
 
 
-def _apply_slot_borrow(conn, account_id, upgrade, asof_day):
-    """Atomically transfer one unused strategy slot to a strong candidate."""
+def _apply_slot_borrow(conn, account_id, upgrade, asof_day, *, cycle_id):
+    """Atomically transfer one unused strategy slot to a strong candidate.
+
+    R18：``cycle_id`` 是 **keyword-only 且必填**。借位必须与产生该 ``upgrade`` 的
+    那一次下单尝试处在**同一个周期**上；席位版本行（``paper_position_limit_versions``）
+    也只用这个显式周期定位。旧实现的 ``_active_cycle(conn)`` 会在周期翻转后把一次
+    cycle 8 的在途借位写进 cycle 9 的版本行（§13/§39）。
+    """
     if not upgrade or not upgrade.get("borrow_ready") or not upgrade.get("donors"):
         return {"allowed": False, "reason": "未达到动态借位条件"}
-    cycle = _active_cycle(conn)
+    resolved_cycle_id = int(cycle_id)
     budget = _dynamic_position_limits(conn)
     limits = {key: int(_num(value)) for key, value in (budget.get("limits") or {}).items()}
     donor = next(
@@ -10592,7 +10501,7 @@ def _apply_slot_borrow(conn, account_id, upgrade, asof_day):
             version_id = 0
         row = conn.execute(
             "SELECT id,inputs FROM paper_position_limit_versions WHERE id=? AND cycle_id=?",
-            (version_id, cycle["id"]),
+            (version_id, resolved_cycle_id),
         ).fetchone()
         if row is None:
             return {"allowed": False, "reason": "未找到当前席位版本，暂不借位"}
@@ -10618,7 +10527,7 @@ def _apply_slot_borrow(conn, account_id, upgrade, asof_day):
             "reason": "从共享池未使用动态席位借用1个席位",
         }
     donor_count = sum(
-        1 for item in _position_rows(conn)
+        1 for item in PPRM.positions_for_cycle(conn, resolved_cycle_id)
         if item.get("account_id") == donor_id and int(_num(item.get("qty"))) >= LOT_SIZE
     )
     if limits[donor_id] - 1 < max(STRATEGY_MIN_POSITIONS, donor_count):
@@ -10635,7 +10544,7 @@ def _apply_slot_borrow(conn, account_id, upgrade, asof_day):
         version_id = 0
     row = conn.execute(
         "SELECT id,inputs FROM paper_position_limit_versions WHERE id=? AND cycle_id=?",
-        (version_id, cycle["id"]),
+        (version_id, resolved_cycle_id),
     ).fetchone()
     if row is None:
         return {"allowed": False, "reason": "未找到当前席位版本，暂不借位"}
@@ -10661,11 +10570,17 @@ def _apply_slot_borrow(conn, account_id, upgrade, asof_day):
     }
 
 
-def _rollback_slot_borrow(conn, borrow):
-    """Undo a provisional seat transfer when the order does not fill."""
+def _rollback_slot_borrow(conn, borrow, *, cycle_id):
+    """Undo a provisional seat transfer when the order does not fill.
+
+    R18：``cycle_id`` 是 **keyword-only 且必填**，并且必须是**当初借位时那个周期**。
+    一次 borrow 生命周期必须 ``same cycle in → same cycle out``：若回滚去问
+    ``_active_cycle()``，周期翻转后会把 cycle 8 的借位从 cycle 9 的版本行里回滚
+    （或在 cycle 9 找不到行而静默留下泄漏的席位），§13/§40。
+    """
     if not borrow or not borrow.get("allowed") or borrow.get("rolled_back"):
         return {"allowed": False, "reason": "没有可回滚的借位"}
-    cycle = _active_cycle(conn)
+    resolved_cycle_id = int(cycle_id)
     version_text = str(borrow.get("allocation_version") or "slots-v0")
     try:
         version_id = int(version_text.rsplit("v", 1)[-1])
@@ -10673,7 +10588,7 @@ def _rollback_slot_borrow(conn, borrow):
         version_id = 0
     row = conn.execute(
         "SELECT id,limits,inputs FROM paper_position_limit_versions WHERE id=? AND cycle_id=?",
-        (version_id, cycle["id"]),
+        (version_id, resolved_cycle_id),
     ).fetchone()
     if row is None:
         return {"allowed": False, "reason": "当前借位版本不存在，无法自动回滚"}
