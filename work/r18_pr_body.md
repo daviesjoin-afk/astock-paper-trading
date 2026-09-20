@@ -224,11 +224,15 @@ and candidate.signal_date <= asof_day.
 
 Slot-upgrade review evidence must be bounded by
 (cycle_id, review_date <= asof_day).
+
+Once a helper accepts an explicit cycle_id, every position / order / budget
+evidence read inside it that affects the decision must be bounded by that
+same cycle (and as-of) — it must not fall back to the current active cycle.
 ```
 
-Both are **equality / upper bound**, not a range and not "take the newest row".
-A legal overnight plan (`signal_date = D-1`, `intended_date = D`) therefore stays
-**usable** — the fix does not ban overnight planning.
+The first two are **equality / upper bound**, not a range and not "take the
+newest row". A legal overnight plan (`signal_date = D-1`, `intended_date = D`)
+therefore stays **usable** — the fix does not ban overnight planning.
 
 ## Before-fix reproduction (unmodified base `f979a16`)
 
@@ -248,10 +252,10 @@ R18-C3 historical slot context reads future review: REPRODUCED
     actual : asof=2026-09-10 weakest_score=20.0 (D review=70, D+1 review=20; expected 70) state=upgrade_ready
 
 R18-C4 slot context re-resolves active cycle: REPRODUCED
-    actual : requested cycle=1 active_cycle=2 weakest_score=20.0 (cycle8=70, cycle9=20; expected 70)
+    actual : requested cycle=1 active_cycle=2 weakest_score=20.0 (cycle8=70, cycle9=20; expected 70) has_cycle_kwarg=False
 
 R18-C5 pending BUY slots cross the cycle boundary: REPRODUCED
-    actual : requested cycle=1 active_cycle=2 cycle9_pending_buys=3 cycle8 occupied_pool donor=['sector_rotation'] (cycle 8 无在途买单 ⇒ shared_pool donor 必须存在)
+    actual : requested cycle=1 active_cycle=2 cycle9_pending_buys=3 cycle8 occupied_pool donor=['sector_rotation'] has_cycle_kwarg=False (cycle 8 无在途买单 ⇒ shared_pool donor 必须存在)
 
 R18-C6 cluster signal evidence has no as-of bound: REPRODUCED
     actual : asof=2026-09-10 signals=['600301', '600302'] leaked_future=['600302'] (600302 属于 2026-09-11，必须排除)
@@ -315,6 +319,7 @@ replacement.
 ## New module: `backend/paper_replacement_decision.py`
 
 ```python
+allocation_version_id(text, default=0)                      # `slots-vN` token
 score_candidate(signal)                                     # 0..100 composite
 choose_best_candidate(candidates, *, held_codes)            # strongest, held excluded
 derive_donors(*, limits, counts, account_id, pool_limit,
@@ -409,6 +414,8 @@ Position review: paper_position_review
 Replacement candidate evidence: paper_signals active rows, same intended trading day only
 Replacement/slot decision: paper_replacement_decision
 Slot review evidence: paper_position_reviews, explicit cycle + asof bound
+Slot seat occupancy: paper_orders, explicit cycle
+Allocation budget evidence: positions + signals + fills of the explicit cycle
 Risk scan lifecycle: paper_risk_scan_runs
 Compatibility position projection: paper_positions
 ```
@@ -447,6 +454,9 @@ Compatibility position projection: paper_positions
   (with a non-vacuity sub-assertion that cycle 9 *does* see them), and
   **P5f** cycle 8's cluster profile contains neither cycle 9's positions nor an
   as-of-after signal, while `cycle_id=None` still reads the active cycle.
+- **`backend/test_paper_slot_occupancy.py`** — facade signature now pins the
+  keyword-only `cycle_id`, plus a test that an explicit cycle is forwarded into
+  `paper_slot_occupancy.pending_position_slots` while `None` stays `None`.
 - **`backend/test_paper_trading_architecture_guard.py`** — new **Guard 9**
   (`ReplacementIsAsOfAndCycleBound`): 9a pure module zero project imports, 9b
   zero I/O and zero clock, 9c evidence module no reverse dependency and no clock,
