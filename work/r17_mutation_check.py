@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""R17 负向变异矩阵（M-PR1 ~ M-PR13）。
+"""R17 负向变异矩阵（M-PR1 ~ M-PR15）。
 
 每条变异都对应一条 R17 / 架构契约，必须让**对应**契约测试变红 —— 否则门禁是空的。
 
@@ -32,6 +32,8 @@
     M-PR11  score == 淘汰线 的 <= 改成 <                -> 阈值边界
     M-PR12  paper_position_review 反向 import           -> Guard 8a
     M-PR13  _save_position_review 缺 review_date 时兜底 -> Guard 8h
+    M-PR14  归档后的 episode signal 不再解析            -> RP-15
+    M-PR15  signal 身份校验（含归档行）被移除           -> RP-16
 
 用法（仓库根目录）::
 
@@ -80,29 +82,18 @@ MUTATIONS = [
         "id": "M-PR1",
         "file": EVIDENCE_FILE,
         # 核心业务变异：把 opened_order_id → 精确 signal 变回"最近一条 signal"。
-        "old": '    signal_id = _row_value(order, "signal_id")\n'
-               '    if signal_id is None or str(signal_id).strip() == "":\n'
-               '        return _unknown("missing_signal_id", opened_order_id=order_id)\n'
-               '    try:\n'
-               '        signal_id = int(signal_id)\n'
-               '    except (TypeError, ValueError):\n'
-               '        return _unknown("missing_signal_id", opened_order_id=order_id)\n'
-               '\n'
-               '    try:\n'
-               '        signal = conn.execute(\n'
-               '            "SELECT id,account_id,code,signal_date,rank_score,t_score,payload"\n'
-               '            "  FROM paper_signals WHERE id=?",\n'
-               '            (signal_id,),\n'
-               '        ).fetchone()\n',
-        "new": '    signal_id = _row_value(order, "signal_id")\n'
-               '    try:\n'
-               '        signal = conn.execute(\n'
-               '            "SELECT id,account_id,code,signal_date,rank_score,t_score,payload"\n'
-               '            "  FROM paper_signals WHERE account_id=? AND code=?"\n'
-               '            " ORDER BY signal_date DESC,id DESC LIMIT 1",\n'
-               '            (expected_account, expected_code),\n'
-               '        ).fetchone()\n'
-               '        signal_id = _row_value(signal, "id") if signal else None\n',
+        "old": '    signal, signal_source = _load_signal(conn, signal_id)\n'
+               '    if signal is None:\n'
+               '        return _unknown("signal_not_found", opened_order_id=order_id, signal_id=signal_id)\n',
+        "new": '    signal = conn.execute(\n'
+               '        "SELECT id,account_id,code,signal_date,rank_score,t_score,payload"\n'
+               '        "  FROM paper_signals WHERE account_id=? AND code=?"\n'
+               '        " ORDER BY signal_date DESC,id DESC LIMIT 1",\n'
+               '        (expected_account, expected_code),\n'
+               '    ).fetchone()  # mutation: 最近一条 signal\n'
+               '    signal_source = "paper_signals"\n'
+               '    if signal is None:\n'
+               '        return _unknown("signal_not_found", opened_order_id=order_id, signal_id=signal_id)\n',
         "test": f"{PROV_MODULE}.ProductionProvenanceRegression."
                 "test_risk_review_p1_later_signal_does_not_change_model_score",
         "desc": "resolver 改回 latest account+code signal（episode provenance 丢失）",
@@ -241,6 +232,27 @@ MUTATIONS = [
         "test": f"{GUARD_MODULE}.PositionReviewIsProvenanceBound."
                 "test_guard8h_save_position_review_has_no_wall_clock_fallback",
         "desc": "_save_position_review 缺 review_date 时回落机器今天",
+    },
+    {
+        "id": "M-PR14",
+        "file": EVIDENCE_FILE,
+        "old": 'SIGNAL_SOURCES = ("paper_signals", "paper_signals_archive")\n',
+        "new": 'SIGNAL_SOURCES = ("paper_signals",)  # mutation: 归档后的 episode signal 失去 provenance\n',
+        "test": f"{PROV_MODULE}.ResolverContractTests."
+                "test_rp15_archived_entry_signal_still_resolves_by_exact_id",
+        "desc": "分批建仓归档后的 entry signal 不再被解析（真实分数退化成中性 50）",
+    },
+    {
+        "id": "M-PR15",
+        "file": EVIDENCE_FILE,
+        "old": '    if (str(_row_value(signal, "account_id") or "") != expected_account\n'
+               '            or str(_row_value(signal, "code") or "") != expected_code):\n'
+               '        return _unknown("signal_identity_mismatch", opened_order_id=order_id,\n'
+               '                        signal_id=signal_id)\n',
+        "new": '    # mutation: 归档/活跃 signal 的身份不再校验\n',
+        "test": f"{PROV_MODULE}.ResolverContractTests."
+                "test_rp16_archived_signal_keeps_identity_and_asof_checks",
+        "desc": "signal 身份不匹配（含归档行）仍被接受为 provenance",
     },
 ]
 

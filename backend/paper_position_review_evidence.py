@@ -33,6 +33,17 @@
 任何一环不成立 ⇒ ``status="unknown"``。**绝不** fallback 到
 「account+code 的最近一条 signal」：unknown 不等于 latest guess。
 
+``paper_signals_archive`` 也算同一环
+-----------------------------------
+分批建仓（sliced entry）在**首片成交之后**会把 signal 留在
+``deferred_capacity``（``_buy_order`` 的后半段），而这条 signal 已经建出了真实
+持仓。``_cleanup_stale_data`` 24 小时后会把 ``deferred_capacity`` 的 signal
+整体搬进 ``paper_signals_archive`` 并从 ``paper_signals`` 删除 —— 行身份
+（``id``）被原样保留，订单链完好无损。因此精确 id 查找必须覆盖这两张表，
+否则一条**可证明**的 episode 会因为归档被误判成 unknown、真实模型分退化成
+中性 50。归档查找同样只按 ``id`` 精确命中，并保留全部身份与 asof 校验 ——
+这不是 latest 搜索，而是同一行的持久化副本。
+
 硬边界（由 ``test_paper_trading_architecture_guard.py`` 静态强制）
 ------------------------------------------------------------------
 * 只允许依赖 ``execution_verification`` 与 stdlib；
@@ -70,6 +81,14 @@ UNKNOWN_REASONS = (
 )
 
 
+#: 精确 id 命中 signal 的**行来源**。活跃表优先；归档表是同一行被
+#: ``_cleanup_stale_data`` 搬走后的持久化副本（``id`` 原样保留）。
+SIGNAL_SOURCES = ("paper_signals", "paper_signals_archive")
+
+#: 两张表列一致（``INSERT ... SELECT *`` 搬运），因此列清单只写一次。
+_SIGNAL_COLUMNS = "id,account_id,code,signal_date,rank_score,t_score,payload"
+
+
 def _unknown(reason, **extra):
     payload = {
         "status": "unknown",
@@ -99,13 +118,35 @@ def _normalize_day(value):
     return text[:10] if text else None
 
 
+def _load_signal(conn, signal_id):
+    """按**精确 id**读 signal 行：活跃表 → 归档表。
+
+    返回 ``(row, table_name)``，都没命中时 ``(None, None)``。归档表是
+    ``_cleanup_stale_data`` 对同一行的搬运（``id`` 不变），所以这里仍然是精确
+    provenance，而不是"找不到就去搜一条最新的"。表缺失（极简夹具 / 老库）与
+    查不到一律视为"没有这一行"。
+    """
+    for table in SIGNAL_SOURCES:
+        try:
+            row = conn.execute(
+                f"SELECT {_SIGNAL_COLUMNS} FROM {table} WHERE id=?",
+                (signal_id,),
+            ).fetchone()
+        except sqlite3.Error:
+            continue
+        if row is not None:
+            return row, table
+    return None, None
+
+
 def resolve_entry_signal(conn, *, cycle_id, account_id, code, opened_order_id, asof_day):
     """解析当前 episode 的入场 signal（只读、精确、绝不 fallback）。
 
     返回::
 
         {"status": "verified", "opened_order_id": 101, "signal_id": 55,
-         "signal_date": "2026-09-10", "signal": {...}, "provenance_version": ...}
+         "signal_date": "2026-09-10", "signal_source": "paper_signals",
+         "signal": {...}, "provenance_version": ...}
 
     或::
 
@@ -170,14 +211,7 @@ def resolve_entry_signal(conn, *, cycle_id, account_id, code, opened_order_id, a
     except (TypeError, ValueError):
         return _unknown("missing_signal_id", opened_order_id=order_id)
 
-    try:
-        signal = conn.execute(
-            "SELECT id,account_id,code,signal_date,rank_score,t_score,payload"
-            "  FROM paper_signals WHERE id=?",
-            (signal_id,),
-        ).fetchone()
-    except sqlite3.Error:
-        return _unknown("signal_not_found", opened_order_id=order_id, signal_id=signal_id)
+    signal, signal_source = _load_signal(conn, signal_id)
     if signal is None:
         return _unknown("signal_not_found", opened_order_id=order_id, signal_id=signal_id)
 
@@ -197,6 +231,7 @@ def resolve_entry_signal(conn, *, cycle_id, account_id, code, opened_order_id, a
         "opened_order_id": order_id,
         "signal_id": signal_id,
         "signal_date": signal_date,
+        "signal_source": signal_source,
         "signal": {
             "id": signal_id,
             "account_id": _row_value(signal, "account_id"),

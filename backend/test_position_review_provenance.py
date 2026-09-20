@@ -15,13 +15,16 @@
     RP-12  opened_order_id 缺失 → unknown
     RP-13  add-on 不替换 episode origin
     RP-14  full exit + re-entry 使用新 origin
+    RP-15  归档（paper_signals_archive）后的 episode signal 仍按精确 id 解析
+    RP-16  归档行同样受身份与 asof 校验约束，且绝不当作 latest 回退
 
 生产回归（直接驱动 ``PT._position_quality_score`` / ``PT.monitor_risk``）：
 
-    RISK-REVIEW-P1  后来无关 signal 不改变 production model score
-    RISK-REVIEW-P2  未来 signal 不进入 historical as-of
-    RISK-REVIEW-P3  缺失 provenance 保持中性 50 且不猜 latest
-    RISK-REVIEW-P4  错误 provenance 不再制造 false consolidation_exit
+    RISK-REVIEW-P1   后来无关 signal 不改变 production model score
+    RISK-REVIEW-P2   未来 signal 不进入 historical as-of
+    RISK-REVIEW-P3   缺失 provenance 保持中性 50 且不猜 latest
+    RISK-REVIEW-P4   错误 provenance 不再制造 false consolidation_exit
+    RISK-REVIEW-P10  分批建仓 signal 归档后真实模型分不退化
 """
 from __future__ import annotations
 
@@ -91,6 +94,18 @@ class _ResolverCase(unittest.TestCase):
             "payload) VALUES(?,?,?,?,?,?,'{}')",
             (signal_id, account_id, code, signal_date, rank_score, t_score),
         )
+        self.conn.commit()
+
+    def archive_signal(self, signal_id):
+        """把 signal 搬进归档表（与 ``_cleanup_stale_data`` 同一形状：id 不变）。"""
+        self.conn.execute(
+            "CREATE TABLE IF NOT EXISTS paper_signals_archive("
+            "id INTEGER, account_id TEXT, code TEXT, signal_date TEXT,"
+            "rank_score REAL, t_score REAL, payload TEXT)")
+        self.conn.execute(
+            "INSERT INTO paper_signals_archive"
+            " SELECT * FROM paper_signals WHERE id=?", (signal_id,))
+        self.conn.execute("DELETE FROM paper_signals WHERE id=?", (signal_id,))
         self.conn.commit()
 
     def resolve(self, *, cycle_id=1, opened_order_id=101, asof_day="2026-09-10",
@@ -201,6 +216,42 @@ class ResolverContractTests(_ResolverCase):
         self.assertNotIn("ORDER BY signal_date", body)
         self.assertNotIn("ORDER BY signal_date DESC", body)
         self.assertNotIn("LIMIT 1", body)
+
+    def test_rp15_archived_entry_signal_still_resolves_by_exact_id(self):
+        """分批建仓首片成交后 signal 被 _cleanup_stale_data 归档，链仍然可证。"""
+        self.add_signal(55, rank_score=90.0, t_score=90.0)
+        self.add_order(101, signal_id=55)
+        self.archive_signal(55)
+        result = self.resolve()
+        self.assertEqual(result["status"], "verified")
+        self.assertEqual(result["reason"], None)
+        self.assertEqual(result["signal_id"], 55)
+        self.assertEqual(result["signal"]["rank_score"], 90.0)
+        self.assertEqual(result["signal_source"], "paper_signals_archive")
+
+    def test_rp16_archived_signal_keeps_identity_and_asof_checks(self):
+        """归档不是"放行"：身份与 asof 校验在归档行上一样成立。"""
+        self.add_signal(55, account_id="sector_rotation")
+        self.add_order(101, signal_id=55)
+        self.archive_signal(55)
+        self.assertEqual(self.resolve()["reason"], "signal_identity_mismatch")
+
+        self.add_signal(56, signal_date="2026-09-11")
+        self.add_order(102, signal_id=56)
+        self.archive_signal(56)
+        result = self.resolve(opened_order_id=102, asof_day="2026-09-10")
+        self.assertEqual(result["reason"], "signal_after_asof")
+
+    def test_rp16b_archive_never_used_as_latest_fallback(self):
+        """归档表里另有一行同账户同代码的 signal：仍只按 id 精确命中。"""
+        self.add_signal(55, signal_date="2026-09-10", rank_score=90.0)
+        self.add_order(101, signal_id=55)
+        self.archive_signal(55)
+        self.add_signal(77, signal_date="2026-09-11", rank_score=10.0)
+        self.archive_signal(77)
+        result = self.resolve(asof_day="2026-09-11")
+        self.assertEqual(result["status"], "verified")
+        self.assertEqual(result["signal_id"], 55, "归档表被当成 latest 搜索用了")
 
 
 class ProductionEpisodeCase(unittest.TestCase):
@@ -450,6 +501,35 @@ class ProductionProvenanceRegression(ProductionEpisodeCase):
         result = PT.monitor_risk(DAY)
         sells = [o for o in result.get("orders", []) if o.get("status") == "filled"]
         self.assertTrue(sells, "保护性硬止损被 provenance 改动影响")
+
+    def test_risk_review_p10_archived_entry_signal_keeps_real_model_score(self):
+        """分批建仓：首片成交后 signal 被真实 cleanup 归档，分数不得退化成 50。
+
+        ``_buy_order`` 在 sliced entry 首片成交后把 signal 留在
+        ``deferred_capacity``，而 ``_cleanup_stale_data`` 会把它搬进
+        ``paper_signals_archive`` 并从 ``paper_signals`` 删除。订单链完好，
+        所以 episode 的真实模型分必须仍然可证 —— 否则一条**可证明**的持仓会
+        被误判成 unknown 并拿到中性 50。
+        """
+        signal_a, order_a = self.build_episode(episode_score=90.0)
+        with PT._db(immediate=True) as conn:
+            conn.execute(
+                "UPDATE paper_signals SET status='deferred_capacity',"
+                " created_at='2020-01-01 09:00:00' WHERE id=?", (signal_a,))
+        cleaned = PT._cleanup_stale_data()
+        self.assertGreaterEqual(int(cleaned.get("deferred_capacity_signals") or 0), 1)
+        with PT._db() as conn:
+            self.assertIsNone(conn.execute(
+                "SELECT id FROM paper_signals WHERE id=?", (signal_a,)).fetchone())
+            self.assertIsNotNone(conn.execute(
+                "SELECT id FROM paper_signals_archive WHERE id=?", (signal_a,)).fetchone())
+        review = self.review(asof_day=DAY_NEXT)
+        self.assertEqual(review["model_score"], 90.0,
+                         "归档后的 episode signal 失去了 provenance，退化成中性 50")
+        self.assertEqual(review["model_score_source"], "episode_provenance")
+        self.assertEqual(review["entry_signal_provenance_status"], "verified")
+        self.assertEqual(int(review["entry_signal_id"]), signal_a)
+        self.assertEqual(int(review.get("episode_opened_order_id") or 0), order_a)
 
 
 if __name__ == "__main__":

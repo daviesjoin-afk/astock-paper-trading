@@ -2,6 +2,46 @@
 
 `MERGE: NOT MERGED` · `DEPLOY: NOT DEPLOYED`
 
+## Review follow-up (round 2)
+
+An automated review of head `8071253b` raised one actionable point, now fixed:
+
+> **Resolve archived entry signals by their exact ID** — when a sliced entry
+> fills its first slice but leaves later slices pending, `_buy_order` changes the
+> originating signal to `deferred_capacity`; after 24 hours `_cleanup_stale_data`
+> moves every such signal to `paper_signals_archive` and deletes it from
+> `paper_signals`. This lookup then reports `signal_not_found` for an otherwise
+> intact, verified opening-order chain, replacing the episode's real model score
+> with 50 and potentially changing automatic rotation decisions.
+
+Correct, and verified in the source before fixing: `_buy_order` leaves the signal
+at `deferred_capacity` after the first slice fills (`paper_trading.py`, the
+`if not slice_done:` branch) while the order is already `filled` and
+execution-verified, and `_cleanup_stale_data` archives `deferred_capacity` rows
+older than a day into `paper_signals_archive` (same columns, **same `id`**) and
+deletes them from `paper_signals`. The chain is intact, so the episode's score is
+still provable — reporting `unknown` there loses real provenance.
+
+The exact-ID lookup now covers both tables, with **identical** identity and
+as-of checks, and reports which row source answered:
+
+```python
+def _load_signal(conn, signal_id):
+    for table in SIGNAL_SOURCES:              # paper_signals → paper_signals_archive
+        row = conn.execute(f"SELECT {_SIGNAL_COLUMNS} FROM {table} WHERE id=?", ...)
+```
+
+This is still exact provenance, not a fallback: the archive row *is* the same
+row (`id` preserved by `INSERT ... SELECT *`), and the shape is pinned statically
+— the guard now rejects any use of `paper_signals_archive` outside `WHERE id=?`.
+New regression **RP-15** (archived entry signal still resolves), **RP-16** (the
+archive keeps every identity/as-of check), **RP-16b** (the archive is never a
+latest fallback) and production regression **RISK-REVIEW-P10**, which drives the
+**real** `_cleanup_stale_data` and asserts the real model score survives
+(`90.0` / `episode_provenance`, not `50.0`). New mutations **M-PR14** (archive
+lookup removed → RP-15 RED) and **M-PR15** (signal identity check removed →
+RP-16 RED).
+
 ## Before / After
 
 **Before** — Position quality resolved its original model score by querying the
@@ -179,8 +219,17 @@ Result on success:
 
 ```python
 {"status": "verified", "opened_order_id": 101, "signal_id": 55,
- "signal_date": "2026-09-10", "signal": {...}, "provenance_version": ...}
+ "signal_date": "2026-09-10", "signal_source": "paper_signals",
+ "signal": {...}, "provenance_version": ...}
 ```
+
+The exact-ID lookup covers `paper_signals` **and** `paper_signals_archive`: a
+sliced entry leaves its (already filled) signal at `deferred_capacity`, and
+`_cleanup_stale_data` later moves that same row — same `id` — into the archive.
+Reading the archive is still exact provenance, so the episode keeps its real
+model score instead of degrading to the neutral `50`. Identity and as-of checks
+are applied identically to archival rows, and the archive is never searched by
+account/code.
 
 Result on any break in the chain (`status="unknown"` + explicit reason):
 
@@ -331,28 +380,32 @@ Delta:  -45 / -1
   hold, same-input-same-output determinism, explicit threshold boundaries
   (`38 / 38.01 / 40 / 50 / 65`, so a `<=` → `<` drift cannot slip through), plus
   module-boundary self-checks.
-- **`backend/test_position_review_provenance.py` (NEW, 26 tests)** —
-  resolver contract **RP-01 … RP-14** (verified opening order resolves the exact
+- **`backend/test_position_review_provenance.py` (NEW, 30 tests)** —
+  resolver contract **RP-01 … RP-16** (verified opening order resolves the exact
   signal; later same-account/code signal ignored; future signal ignored;
   wrong-cycle order rejected; wrong-account order rejected; wrong-code order
   rejected; unverified order rejected; non-filled order rejected; missing
   `signal_id`; missing signal row; signal identity mismatch; missing
   `opened_order_id`; add-on does not replace origin; full-exit + re-entry uses
-  the new origin) and a static "never latest-search" assertion.
-  Production regressions **RISK-REVIEW-P1 … P9** drive the real
+  the new origin; archived entry signal still resolves by exact id; archived rows
+  keep identity/as-of checks and are never a latest fallback) and a static
+  "never latest-search" assertion.
+  Production regressions **RISK-REVIEW-P1 … P10** drive the real
   `PT._position_quality_score` / real action decision: a later unrelated signal
   must not change the model score (**P1**), a future episode signal must stay
   unknown under an historical as-of (**P2b**), missing provenance must not guess
   (**P3/P3b**), the wrong provenance must not manufacture a false
   `consolidation_exit` (**P4**), add-on keeps the origin (**P5**), re-entry takes
   a new origin (**P6**), `episode_opened_order_id` is exposed (**P7**),
-  `review_date` must be explicit (**P8**), and protective exits are unaffected
-  (**P9**).
+  `review_date` must be explicit (**P8**), protective exits are unaffected
+  (**P9**), and an episode signal archived by the **real** `_cleanup_stale_data`
+  keeps its real model score (**P10**).
 - **`backend/test_paper_trading_architecture_guard.py`** — new **Guard 8**
   (`PositionReviewIsProvenanceBound`): 8a pure review module has zero project
   imports, 8b zero I/O and zero wall clock, 8c evidence module has no reverse
   dependency on `paper_trading`, 8d the resolver contains no latest-search
-  fallback, 8e `_position_quality_score.cycle_id` is keyword-only + required,
+  fallback (and touches `paper_signals_archive` only as `WHERE id=?`), 8e
+  `_position_quality_score.cycle_id` is keyword-only + required,
   8f the adapter must use `PREV.resolve_entry_signal` and the old SQL must not
   reappear, 8g no `ORDER BY signal_date DESC` in `paper_trading`, 8h
   `_save_position_review` has no `date.today()` fallback. Baseline ratcheted
@@ -360,7 +413,7 @@ Delta:  -45 / -1
 
 ## Non-vacuity (mutation check)
 
-`work/r17_mutation_check.py` injects **13 byte-level mutations** into real
+`work/r17_mutation_check.py` injects **15 byte-level mutations** into real
 production sources and requires the *specific* contract test to fail with
 `FAIL:`/`ERROR:` on that exact method, so an import/collection error cannot
 masquerade as a catch. Every file is restored byte-identically and verified by
@@ -368,7 +421,7 @@ sha256 in a `finally` block, with a fresh `PYTHONPYCACHEPREFIX` per run so a
 same-length mutation in the same second cannot reuse stale bytecode.
 
 ```text
-RESULT: 13/13 mutations RED, all files restored byte-identical
+RESULT: 15/15 mutations RED, all files restored byte-identical
 ```
 
 | ID | Mutation | Caught by |
@@ -386,6 +439,8 @@ RESULT: 13/13 mutations RED, all files restored byte-identical
 | M-PR11 | `score <= exit_threshold` changed to `<` | threshold boundary |
 | M-PR12 | `paper_position_review` reverse-imports `paper_trading` | Guard 8a |
 | M-PR13 | `_save_position_review` falls back to wall clock | Guard 8h |
+| M-PR14 | archived entry signal no longer resolved by exact id | RP-15 |
+| M-PR15 | signal identity check removed (archive rows included) | RP-16 |
 
 **M-PR1 is the core business mutation**, not a signature check: reverting the
 chain to "latest account+code signal" makes the R17-C1 production regression go
@@ -396,11 +451,12 @@ makes the historical-as-of regression go RED on a wrong `model_score`.
 
 | Check | Result |
 |---|---|
-| `unittest backend.test_paper_position_review` + provenance + guard | 84 tests OK |
-| targeted set (8 modules) | 235 tests OK |
-| `unittest discover -s backend` | **3630 tests OK** (skipped=5) |
+| `unittest backend.test_paper_position_review` + provenance + guard | 88 tests OK |
+| targeted set (8 modules) | 239 tests OK |
+| strategy + golden replay set (9 modules) | 116 tests OK |
+| `unittest discover -s backend` | **3634 tests OK** (skipped=5) |
 | `work/r17_before_fix_repro.py` | base 5/6 REPRODUCED → fixed 0/6 |
-| `work/r17_mutation_check.py` | 13/13 RED, restore byte-identical |
+| `work/r17_mutation_check.py` | 15/15 RED, restore byte-identical |
 | `ruff check backend` | All checks passed |
 | `python -m compileall -q backend` | exit 0 |
 | `npm run build` + `git diff --exit-code -- frontend/dist` | exit 0 (no drift) |

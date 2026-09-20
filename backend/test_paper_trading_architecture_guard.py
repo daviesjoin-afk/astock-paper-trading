@@ -587,6 +587,15 @@ class PositionReviewIsProvenanceBound(unittest.TestCase):
                          "经 opened_order_id → 精确 signal_id 解析")
         self.assertNotIn("LIMIT 1", body,
                          "证据解析器出现了 LIMIT 1：这是 latest 搜索的形状")
+        # 归档表是 episode signal 被 _cleanup_stale_data 搬走后的同一行（id 不变），
+        # 允许读取，但只允许**精确 id** —— 不得变成"活跃表没有就去归档表搜一条最新的"。
+        for number, line in enumerate(body.splitlines(), 1):
+            text = line.strip()
+            if "paper_signals_archive" not in text or text.startswith("SIGNAL_SOURCES"):
+                continue
+            self.assertIn("WHERE id=?", text,
+                          f"{REVIEW_EVIDENCE_MODULE} 第 {number} 行把归档表用在了"
+                          f"精确 id 之外的形状：{text}")
 
     def test_guard8e_position_quality_requires_explicit_cycle(self):
         tree = ast.parse(_source("paper_trading.py"))
