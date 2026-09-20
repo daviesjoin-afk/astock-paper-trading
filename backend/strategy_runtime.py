@@ -148,6 +148,84 @@ def get_context(conn: sqlite3.Connection, strategy_id: str, *, settings_rev: str
     return context
 
 
+def _number(value, default=None):
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return default
+    if number != number:
+        return default
+    return number
+
+
+def allocation_runtimes(
+    account_ids,
+    weights=None,
+    diversification=None,
+    *,
+    conn: sqlite3.Connection | None = None,
+    profiles=None,
+    cycle_id=None,
+    slot_caps=None,
+    priority_floors=None,
+    own_exposure_caps=None,
+    strategy_max_positions: int = 6,
+):
+    """Build allocation runtimes with explicit cycle provenance when requested.
+
+    ``cycle_id=None`` keeps the live/current behavior.  With an explicit cycle,
+    version-derived fields come from the already bounded ``profiles`` (which
+    include the cycle-pinned compiled profile), while lifecycle permission is
+    read from the current strategy status only.  The current strategy head is
+    never consulted for historical version-derived caps.
+    """
+    diversification = diversification or {}
+    slot_caps = slot_caps or {}
+    priority_floors = priority_floors or {}
+    own_exposure_caps = own_exposure_caps or {}
+    pinned = cycle_id is not None
+    runtimes = []
+    for account_id in account_ids:
+        weight = _number((weights or {}).get(account_id), 1.0)
+        context_runtime = None
+        if conn is not None and not pinned:
+            try:
+                context_runtime = get_context(conn, account_id).allocation_runtime
+            except (ValueError, sqlite3.Error):
+                context_runtime = None
+        if pinned:
+            profile = (profiles or {}).get(account_id) or {}
+            compiled_audit = profile.get("compiled_risk_profile") or {}
+            max_positions = _number(
+                compiled_audit.get("max_positions"),
+                _number(profile.get("max_positions"), strategy_max_positions),
+            )
+            own_exposure_cap = _number(profile.get("max_exposure"))
+            try:
+                spec = SR.get(account_id, conn=conn) if conn is not None else None
+            except sqlite3.Error:
+                spec = None
+            lifecycle_stage = lifecycle_stage_for(spec) if spec is not None else "quarantined"
+            capital_scale = PA.stage_capital_scale(PA.StrategyRuntime(
+                strategy_id=account_id, lifecycle_stage=lifecycle_stage))[0]
+        else:
+            max_positions = context_runtime.max_positions if context_runtime else strategy_max_positions
+            own_exposure_cap = context_runtime.own_exposure_cap_pct if context_runtime else None
+            lifecycle_stage = context_runtime.lifecycle_stage if context_runtime else "standard"
+            capital_scale = context_runtime.capital_scale if context_runtime else None
+        runtimes.append(PA.StrategyRuntime(
+            strategy_id=account_id,
+            base_priority=max(weight, 0.01),
+            max_positions=slot_caps.get(account_id, max_positions),
+            priority_floor_pct=priority_floors.get(account_id),
+            own_exposure_cap_pct=own_exposure_caps.get(account_id, own_exposure_cap),
+            diversification=_number(diversification.get(account_id), 1.0),
+            lifecycle_stage=lifecycle_stage,
+            capital_scale=capital_scale,
+        ))
+    return runtimes
+
+
 def active_contexts(conn: sqlite3.Connection, *, settings_rev: str | None = None) -> tuple[StrategyRuntimeContext, ...]:
     revision = settings_rev if settings_rev is not None else settings_revision(conn)
     return tuple(get_context(conn, strategy_id, settings_rev=revision) for strategy_id in SR.active_ids(conn=conn))

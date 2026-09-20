@@ -34,7 +34,11 @@ __all__ = [
     "DISCIPLINE_MERGE_KEYS",
     "composite_compiled_profile",
     "compiled_profile_for",
+    "compiled_profile_for_cycle",
+    "compiled_profile_is_asof_provable",
+    "compiled_dsl_for_cycle",
     "effective_spec",
+    "effective_spec_for_cycle",
     "tighten_caps",
     "tighten_spec",
 ]
@@ -114,6 +118,107 @@ def compiled_profile_for(conn: sqlite3.Connection, account_id: Any) -> dict[str,
         return composite_compiled_profile()
 
 
+def compiled_profile_is_asof_provable(conn: sqlite3.Connection, account_id: Any,
+                                      asof_day: Any) -> bool:
+    """编译风险画像是否可证明在 ``asof_day`` 当日就已生效（R19 §25）。
+
+    :func:`compiled_profile_for` 解析的是策略**当前**不可变版本，它没有 as-of
+    参数。历史回放时若该版本是在回放日**之后**才创建的，它的编译帽就不属于
+    那个时点 —— 直接融合会让未来版本的风险帽改写历史 weights 与 allocation。
+
+    ``asof_day is None``（current/live）⇒ 恒 True，既有语义完全不变。
+    历史 as-of ⇒ 要求当前版本的 ``created_at`` 不晚于 asof（版本不可变，
+    创建时间即它开始存在的时刻）。无法证明（无版本行 / 无时间戳 / 读取异常）
+    一律 fail closed，绝不猜。
+    """
+    if asof_day is None:
+        return True
+    try:
+        import strategy_registry as SR
+
+        version = SR.get_version(str(account_id), conn=conn)
+        created = str(getattr(version, "created_at", "") or "")[:10]
+        target = str(asof_day)[:10]
+        if not created or not target:
+            return False
+        return created <= target
+    except Exception:
+        return False
+
+
+def compiled_profile_for_cycle(conn: sqlite3.Connection, account_id: Any, *,
+                               cycle_id: Any) -> dict[str, Any]:
+    """解析某账户在 **explicit cycle** 下被冻结的策略版本的编译风险画像（R19 §25）。
+
+    authority 是 ``paper_cycle_strategy_versions`` —— 周期在启动时就把当时的
+    ``strategy_id / strategy_version / strategy_checksum`` pin 住了，后来的编辑
+    无法再给这个周期的 signal / order / audit 证据换标签。既然资金预算已经显式
+    绑定 ``cycle_id``，风险画像就必须消费**同一个**不可变版本，而不是 current head。
+
+    为什么不能用 "current head + created_at <= asof"：那是另一个 contract。
+    cycle 8 可以 pin v1，之后创建 v2；若 ``v2.created_at <= asof``，仅凭时间戳
+    判断就会让 cycle 8 的历史预算吃到 v2 的帽 —— 而 cycle 8 的正确事实始终是 v1。
+
+    反方向同样必须正确：head 晚于 asof 时**不是**整体跳过画像。compiled profile
+    的语义是"画像只能收紧"，跳过会让历史风险限制比真正的 cycle-pinned 版本更宽松。
+    因此这里用 pin 住的版本继续编译。
+
+    fail closed：binding 缺失 / 版本行缺失 / checksum 不符 / 任何异常 ⇒
+    Composite 最保守模板（本模块既有约定），绝不 fallback 到 current head，
+    也绝不因为 provenance 不可证明而放宽风险。
+    """
+    try:
+        import strategy_registry as SR
+
+        record = SR.cycle_version_for_account(
+            conn, str(account_id), cycle_id=int(cycle_id))
+        if record is None:
+            return composite_compiled_profile()
+        return _compiled_from_version(record)
+    except Exception:
+        return composite_compiled_profile()
+
+
+def compiled_dsl_for_cycle(conn: sqlite3.Connection, account_id: Any, *,
+                           cycle_id: Any) -> dict[str, Any] | None:
+    """Return the exact cycle-pinned DSL, or ``None`` when the pin is missing.
+
+    This mirrors :func:`compiled_profile_for_cycle` but is used by cluster
+    evidence, where a missing pin must mean "unknown evidence" rather than
+    falling back to the current strategy head.
+    """
+    try:
+        import strategy_registry as SR
+        from strategy_dsl_schema import normalize
+
+        record = SR.cycle_version_for_account(
+            conn, str(account_id), cycle_id=int(cycle_id))
+        if record is None:
+            return None
+        definition = dict(getattr(record, "definition", None) or {})
+        ast = definition.get("dsl_ast")
+        return normalize(ast) if ast is not None else None
+    except Exception:
+        return None
+
+
+def _compiled_from_version(record: Any) -> dict[str, Any]:
+    """把一个**不可变**策略版本编译成执行域画像（不做 active-cycle 解析）。"""
+    from strategy_risk_fingerprint import compile_strategy_risk_fingerprint
+    from strategy_risk_profiles import compile_strategy_risk_profile
+    from strategy_dsl_schema import normalize
+
+    definition = dict(getattr(record, "definition", None) or {})
+    ast = definition.get("dsl_ast")
+    compiled = normalize(ast) if ast is not None else None
+    fingerprint = compile_strategy_risk_fingerprint(compiled, definition.get("metadata"))
+    profile = compile_strategy_risk_profile(fingerprint)
+    flattened = _flatten(
+        profile, template=profile.template, archetype=fingerprint.archetype,
+    )
+    return flattened
+
+
 def _tighter_stop(base: Any, compiled: Any) -> float | None:
     """止损深度：负值域内取 max（亏损上限更小 = 更紧）。"""
     base_v, compiled_v = _num(base), _num(compiled)
@@ -131,6 +236,7 @@ def tighten_caps(profile: Mapping[str, Any], compiled: Mapping[str, Any]) -> tup
         "template": compiled.get("template"),
         "archetype": compiled.get("archetype"),
         "version": STRATEGY_RISK_ENFORCEMENT_VERSION,
+        "max_positions": _num(compiled.get("max_positions")),
         "tightened": {},
     }
     for key in CAP_MERGE_KEYS:
@@ -193,3 +299,17 @@ def tighten_spec(spec: Mapping[str, Any], compiled: Mapping[str, Any]) -> dict[s
 def effective_spec(conn: sqlite3.Connection, account_id: Any, base_spec: Mapping[str, Any]) -> dict[str, Any]:
     """ACCOUNT_SPECS × 编译画像 → 生效执行参数（生产站点直接调用）。"""
     return tighten_spec(base_spec, compiled_profile_for(conn, account_id))
+
+
+def effective_spec_for_cycle(
+    conn: sqlite3.Connection,
+    account_id: Any,
+    base_spec: Mapping[str, Any],
+    *,
+    cycle_id: Any,
+) -> dict[str, Any]:
+    """ACCOUNT_SPECS × **cycle-pinned** 编译画像 → 历史生效执行参数。"""
+    return tighten_spec(
+        base_spec,
+        compiled_profile_for_cycle(conn, account_id, cycle_id=cycle_id),
+    )

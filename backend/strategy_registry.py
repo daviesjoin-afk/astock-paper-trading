@@ -1051,6 +1051,34 @@ def bind_cycle_versions(conn, cycle_id, account_ids):
         )
 
 
+def cycle_stamp_for_account(conn, account_id, *, cycle_id):
+    """Resolve **only** the immutable version pinned to one explicit cycle.
+
+    This is the strict-cycle authority: no legacy binding fallback and no
+    current-head fallback.  Callers that need a live/legacy stamp should use
+    :func:`stamp_for_account`; callers replaying one cycle must use this helper
+    so a missing pin fails closed instead of silently adopting another version.
+    """
+    account_id = str(account_id or "").strip()
+    if not account_id or cycle_id is None:
+        return None
+    row = conn.execute(
+        """SELECT strategy_id,strategy_version,strategy_checksum
+           FROM paper_cycle_strategy_versions WHERE cycle_id=? AND account_id=?""",
+        (int(cycle_id), account_id),
+    ).fetchone()
+    return tuple(row) if row is not None else None
+
+
+def cycle_version_for_account(conn, account_id, *, cycle_id):
+    """Resolve the exact immutable strategy version pinned to an explicit cycle."""
+    stamp = cycle_stamp_for_account(conn, account_id, cycle_id=cycle_id)
+    if stamp is None:
+        return None
+    strategy_id, version, checksum = stamp
+    return get_version(strategy_id, version, checksum=checksum, conn=conn)
+
+
 def stamp_for_account(conn, account_id, *, cycle_id=None):
     """Resolve the immutable version pinned to an account's current cycle."""
     account_id = str(account_id or "").strip()
@@ -1061,11 +1089,7 @@ def stamp_for_account(conn, account_id, *, cycle_id=None):
         cycle_id = row[0] if row else None
     row = None
     if cycle_id is not None:
-        row = conn.execute(
-            """SELECT strategy_id,strategy_version,strategy_checksum
-               FROM paper_cycle_strategy_versions WHERE cycle_id=? AND account_id=?""",
-            (int(cycle_id), account_id),
-        ).fetchone()
+        row = cycle_stamp_for_account(conn, account_id, cycle_id=cycle_id)
     if row is None:
         row = conn.execute(
             """SELECT strategy_id,strategy_version,strategy_checksum

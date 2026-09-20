@@ -1145,7 +1145,12 @@ class ReservationCycleMismatchEndToEnd(_ProvenRiskHarness):
 
     def _assert_mismatch_terminalized(self, order_id, cycle, bogus_cycle, output,
                                       original_amount):
-        """§8/§9 共同断言：终态化 + 预占 released + 身份不变 + 零业务写入。"""
+        """§8/§9 共同断言：终态化 + **冲突预占原样保留** + 身份不变 + 零业务写入。
+
+        R19 §50 修正：这张预占行记在 ``bogus_cycle`` 上，属于**别的**经济事实，
+        不是本订单可以处置的资产。旧行为（把它 release 掉）会把别人的资金挪为
+        可用；正确处置是只终态化当前订单，冲突预占保持原样。
+        """
         row = self.conn.execute(
             "SELECT status,reason,cycle_id FROM paper_orders WHERE id=?",
             (order_id,)).fetchone()
@@ -1156,13 +1161,15 @@ class ReservationCycleMismatchEndToEnd(_ProvenRiskHarness):
         self.assertNotIn("pending_limit", str(row["status"]))
         # 2. 订单周期归属不可变。
         self.assertEqual(int(row["cycle_id"]), cycle, "订单周期不可变")
-        # 3. 预占：cycle/amount/fees 原样保留，只允许 status -> released。
+        # 3. 冲突预占：cycle/amount/fees/status 全部原样 —— 它不属于本订单。
         res = self._reservation_row(order_id)
         self.assertEqual(int(res["cycle_id"]), bogus_cycle,
                          "§22：预占 cycle_id 绝不被改写")
         self.assertEqual(float(res["fees"]), 5.0, "费用不被 resize")
-        self.assertEqual("released", res["status"],
-                         "§6：终态清理允许把 stale 预占释放，且应当释放")
+        self.assertEqual("reserved", res["status"],
+                         "§50：冲突的预占属于别的订单，绝不被 release")
+        self.assertIsNone(res["released_at"],
+                          "§50：冲突预占不得留下 released_at")
         # 金额必须等于**扫描前捕获的原值**，证明 scanner 没有按本轮市价或其它规模
         # resize 它（原值随场景不同：未触发用限价，已触发用成交价）。
         self.assertEqual(float(res["amount"]), float(original_amount),
@@ -1229,11 +1236,36 @@ class ReservationCycleMismatchEndToEnd(_ProvenRiskHarness):
         若释放失败被吞掉，就会出现「订单已 superseded、预占仍 reserved」的组合 ——
         那笔资金被永久占用且没有任何订单再引用它，比直接失败更糟。
 
-        判据：注入一个释放失败后，订单**不得**变成 superseded，预占也不得变成
-        released（因为根本没有释放成功），且异常必须浮现给调用方。
+        R19 起这条契约只对**会释放预占**的路径成立：预占周期归属冲突属于
+        **别的**订单，R19 §50 明确不再释放它（见
+        ``test_not_triggered_mismatched_reservation_terminalizes``）。因此这里
+        改走**订单周期漂移**路径 —— 那张预占属于本订单，必须释放，而释放失败
+        不得被吞。
         """
-        order_id, cycle, bogus = self._seed_pending_buy_with_mismatched_reservation(
-            triggered=False)
+        cycle = self._current_cycle()
+        stamp = PT._strategy_stamp(self.conn, self.account_id)
+        cur = self.conn.execute(
+            "INSERT INTO paper_orders(account_id,side,code,name,qty,planned_price,"
+            "status,reason,risk_payload,created_at,origin,strategy_id,"
+            "strategy_version,strategy_checksum,cycle_id)"
+            " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (self.account_id, "buy", self.code, f"测试股_{self.code}", 100, 10.0,
+             "manual_execution_retry", "seed", "{}", f"{self.day} 10:00:00",
+             "manual", *stamp, cycle),
+        )
+        order_id = int(cur.lastrowid)
+        # 本订单**自己的**预占（同周期）⇒ 终态化时应当释放。
+        self.conn.execute(
+            "INSERT INTO paper_capital_reservations(cycle_id,order_key,account_id,"
+            "code,side,amount,fees,status,created_at) VALUES(?,?,?,?,?,?,?,?,?)",
+            (cycle, str(order_id), self.account_id, self.code, "buy", 1000.0, 5.0,
+             "reserved", f"{self.day} 10:00:00"),
+        )
+        self.conn.commit()
+        with PT._db(immediate=True) as conn:
+            conn.execute("DELETE FROM paper_nav")
+        with PT._db(immediate=True) as conn:
+            PT._create_cycle(conn, 300000.0, status="running", reason="测试推进周期")
         self._set_account_running()
         self._set_fresh_exit_quote(self.code, price=12.0, pct=1.0, high=12.2, low=11.8)
 

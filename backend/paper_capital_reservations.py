@@ -157,12 +157,20 @@ def reserve_shared_capital(
         )
         return True, None
 
-    cycle = active_cycle_fn(conn)
+    # §19：新建行的 ``cycle_id`` 优先取**调用方已证明的订单周期**。当调用方
+    # 已经知道这张订单属于哪个周期时，重新解析 active cycle 会把「订单周期」
+    # 与「预占周期」再次拆成两个可能不同的持久事实 —— 而这正是本函数存在的
+    # 意义（二者是同一笔经济事实的两半）。只有调用方未声明周期时（例如没有
+    # 订单身份的辅助路径）才回落到 active cycle。
+    if expected_cycle_id is not None:
+        reservation_cycle_id = int(expected_cycle_id)
+    else:
+        reservation_cycle_id = int(active_cycle_fn(conn)["id"])
     conn.execute(
         """INSERT INTO paper_capital_reservations
            (cycle_id,order_key,account_id,code,side,amount,fees,status,created_at)
            VALUES(?,?,?,?,?,?,?,?,?)""",
-        (cycle["id"], order_key, account_id, code, "buy", amount, fees,
+        (reservation_cycle_id, order_key, account_id, code, "buy", amount, fees,
          "reserved", now_fn()),
     )
     return True, None

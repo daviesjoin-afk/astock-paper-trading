@@ -541,6 +541,152 @@ def _commit_strategy_buy(
     return {"order_id": order_id, "side": "buy", "code": code, "qty": qty}, None
 
 
+def strategy_fill_failure(conn, exc, *, signal, order_id, account, code, risk, cycle_id):
+    """普通策略 BUY 成交失败的**唯一处置入口**（R19 §45-§53）。
+
+    订单创建与成交提交仍归 ``paper_trading._buy_order``；这里只负责失败语义，
+    让该函数不必同时承载两套账本逻辑：
+
+    * **预占周期冲突**（``ReservationCycleMismatch``）是持久化归属冲突，不是临时
+      资金不足。冲突的 reservation 属于**别的**订单（可能是别的周期），因此
+      §50 明确禁止 release 它 —— 那是在处置别人的资产。本订单本身终态化：
+      同一个 ``order.id`` 永远与该 reservation 周期冲突，打回重试只会永久污染
+      扫描器（§51）。候选意图可由**新的 order identity** 重试（§52）。
+    * 其余异常是可重试的执行失败：释放本订单预占、回滚 slot borrow、订单与
+      信号退回重试态（§53：borrow 属于本次 attempt，必须回滚）。
+    """
+    # Phase 2 extraction: resolved at call time to avoid a circular import.
+    from paper_trading import (
+        ReservationCycleMismatch,
+        STRATEGY_EXECUTION_RETRY_STATUS,
+        _finish_capital_reservation,
+        _risk_log,
+        _rollback_slot_borrow,
+    )
+    borrow = risk.get("slot_borrow") or {}
+    if borrow.get("allowed"):
+        risk["slot_borrow_rollback"] = _rollback_slot_borrow(
+            conn, borrow, cycle_id=cycle_id)
+    if isinstance(exc, ReservationCycleMismatch):
+        conflict = (
+            f"资金预占周期归属冲突（{ReservationCycleMismatch.marker}）："
+            f"reserved_cycle={exc.reserved_cycle_id} order_cycle={exc.order_cycle_id}；"
+            "该委托已终态化，候选可由新委托重试"
+        )
+        conn.execute(
+            "UPDATE paper_orders SET status='risk_rejected',reason=?,filled_price=NULL,"
+            "amount=NULL,fees=NULL,executed_at=NULL WHERE id=?",
+            (conflict, order_id),
+        )
+        conn.execute(
+            "UPDATE paper_signals SET status='deferred_capacity',reason=? WHERE id=?",
+            (conflict, signal["id"]),
+        )
+        _risk_log(conn, account["id"], code, "buy", "risk_rejected", conflict, risk)
+        return {
+            "filled": False, "deferred": True, "status": "risk_rejected",
+            "reservation_cycle_mismatch": True, "reason": conflict,
+        }
+    _finish_capital_reservation(conn, order_id, "released")
+    failure = f"策略买入执行失败，可重试：{type(exc).__name__}: {exc}"
+    conn.execute(
+        "UPDATE paper_orders SET status=?,reason=?,filled_price=NULL,amount=NULL,"
+        "fees=NULL,executed_at=NULL WHERE id=?",
+        (STRATEGY_EXECUTION_RETRY_STATUS, failure, order_id),
+    )
+    conn.execute(
+        "UPDATE paper_signals SET status='pending',reason=? WHERE id=?",
+        (failure, signal["id"]),
+    )
+    _risk_log(conn, account["id"], code, "buy", STRATEGY_EXECUTION_RETRY_STATUS,
+              failure, risk)
+    return {
+        "filled": False, "retryable": True,
+        "status": STRATEGY_EXECUTION_RETRY_STATUS, "reason": failure,
+    }
+
+
+def commit_strategy_entry_fill(
+    conn, *, account, signal, quote, payload, slice_state, asof_day,
+    order_id, plan, decision_name, reason, risk, cycle_id,
+):
+    """普通策略 BUY 的**成交编排**边界（R19 §41-§56）。
+
+    订单创建仍归 ``paper_trading._buy_order``（§42：本 PR 不搬 Entry Service）。
+    本函数承接「SAVEPOINT → 提交成交 → 切片账面推进 → 失败处置」这段编排，
+    与 ``_commit_strategy_buy`` 同处一个模块。**成交落库本身仍唯一由
+    ``execution_planner.commit_fill`` 拥有** —— reserve / cash / lot / fill /
+    执行验证 / risk log / audit 一律不在此重写（§65）。
+    """
+    # Phase 2 extraction: resolved at call time to avoid a circular import.
+    from paper_trading import _assert_active_lease, _json, _lease_lost
+    import execution_planner as EP
+    savepoint = f"strategy_fill_{order_id}"
+    conn.execute(f"SAVEPOINT {savepoint}")
+    try:
+        _assert_active_lease(conn, "strategy fill commit")
+        # §43：plan 必须携带完整 lot 身份（code/name/industry），否则
+        # `_record_lot` 会丢失持仓元数据。
+        EP.commit_fill(
+            conn,
+            account=account,
+            plan={
+                "side": "buy", "code": plan["code"], "name": plan.get("name"),
+                "industry": plan.get("industry"), "qty": plan["qty"],
+                "fill_price": plan["fill_price"], "amount": plan["amount"],
+                "fees": plan["fees"], "quote_at": quote.get("quote_at"),
+            },
+            order_id=order_id,
+            asof_day=asof_day,
+            side="buy",
+            reserved=False,
+            action=decision_name,
+            risk_log_reason=reason,
+            audit_action="buy_filled",
+            audit_message=f"{plan['code']} {plan['qty']}股 @ {plan['fill_price']:.2f}",
+            reason=reason,
+            detail=risk,
+            assumption="实时价 + 0.10% 滑点",
+            is_t_base=True,
+        )
+        _assert_active_lease(conn, "strategy fill finalization")
+        slice_done = slice_state is None
+        if slice_state is not None:
+            slice_plan = [int(item) for item in (slice_state.get("plan") or [])]
+            slices_filled = max(0, int(slice_state.get("filled") or 0)) + 1
+            slice_done = slices_filled >= len(slice_plan)
+            conn.execute(
+                "UPDATE paper_signals SET payload=? WHERE id=?",
+                (_json({**payload, "entry_slices": {**slice_state, "filled": slices_filled}}),
+                 signal["id"]),
+            )
+            # §47：分批建仓的切片语义绝不能变。中间片成交后信号必须留在
+            # 复试管道（deferred_capacity），只有最后一片才标 filled ——
+            # 否则剩余片会被永久丢失。
+            if not slice_done:
+                conn.execute(
+                    "UPDATE paper_signals SET status='deferred_capacity',reason=? WHERE id=?",
+                    (f"分批建仓第 {slices_filled}/{len(slice_plan)} 片已成交；"
+                     "剩余片由后续扫描重新取价并重跑全部风控", signal["id"]),
+                )
+        if slice_done:
+            conn.execute(
+                "UPDATE paper_signals SET status='filled', reason=? WHERE id=?",
+                (reason, signal["id"]),
+            )
+        conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+        return None
+    except Exception as exc:
+        conn.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+        conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+        if _lease_lost(exc):
+            raise
+        return strategy_fill_failure(
+            conn, exc, signal=signal, order_id=order_id, account=account,
+            code=plan["code"], risk=risk, cycle_id=cycle_id,
+        )
+
+
 def submit_manual_order(
     account_id, code, side, qty=0, order_type="market", limit_price=None, asof_date=None,
 ):
@@ -568,6 +714,7 @@ def submit_manual_order(
         dfc,
         init_db,
     )
+    from paper_trading import ReservationCycleMismatch as _ReservationCycleMismatch
     init_db()
     day = _date(asof_date)
     with _db() as snapshot_conn:
@@ -600,6 +747,7 @@ def submit_manual_order(
         elif status == ENTRY_FROZEN_WAITLIST_STATUS:
             reason = reason or _entry_frozen_reason("手动委托")
         strategy_stamp = _strategy_stamp(conn, account_id)
+        order_cycle_id = _order_cycle_id(conn)
         cursor = conn.execute(
             """INSERT INTO paper_orders(
                account_id,side,code,name,qty,planned_price,status,reason,risk_payload,
@@ -612,7 +760,7 @@ def submit_manual_order(
                 status, reason, _json(plan.get("risk") or {}), order_type, "manual",
                 day.isoformat() if status in {"pending_limit", ENTRY_FROZEN_WAITLIST_STATUS}
                 and order_type == "limit" else None, _now(),
-                *strategy_stamp, _order_cycle_id(conn),
+                *strategy_stamp, order_cycle_id,
             ),
         )
         order_id = cursor.lastrowid
@@ -627,9 +775,26 @@ def submit_manual_order(
             )
             reserve_amount = max(0, int(plan.get("qty") or 0)) * max(reserve_price, 0.0)
             reserve_fees = _commission(reserve_amount)
-            reserved, reserve_reason = _reserve_shared_capital(
-                conn, order_id, account_id, code, reserve_amount, reserve_fees,
-            )
+            # §40：已经有 durable order id 的预占必须带上订单周期 ——
+            # 预先存在的同 key 预占若记在别的周期上，resize 会把它按本订单的
+            # 规模改写，形成 durable provenance mismatch。
+            try:
+                reserved, reserve_reason = _reserve_shared_capital(
+                    conn, order_id, account_id, code, reserve_amount, reserve_fees,
+                    expected_cycle_id=order_cycle_id,
+                )
+            except Exception as exc:
+                # §49/§51：归属冲突是持久化事实冲突，不是临时资金不足。
+                # 冲突的预占不属于本订单（绝不 release 别人的资产），本订单
+                # 直接终态化 —— 同一个 order.id 永远与该预占周期冲突。
+                if not _is_reservation_cycle_mismatch(exc, _ReservationCycleMismatch):
+                    raise
+                order_row = _rows(
+                    conn, "SELECT * FROM paper_orders WHERE id=?", (order_id,),
+                )[0]
+                terminal = _terminalize_cycle_stale_order(conn, order_row, exc)
+                _record_nav(conn, day, quotes=quote_map)
+                return {"order_id": order_id, "plan": plan, **terminal}
             if not reserved:
                 status = "risk_rejected"
                 reason = reserve_reason or "共享资金池预占失败"
@@ -755,12 +920,18 @@ def _terminalize_cycle_stale_order(conn, order, exc):
     §6：终态清理**允许**把既有预占从 ``reserved`` 释放为 ``released``（订单已终态，
     不能继续占共享资金），但绝不改 ``cycle_id`` / ``amount`` / ``fees``。
 
+    §50 例外：**预占周期归属冲突**时那张预占行不属于本订单（它记在另一个周期上，
+    是另一笔经济事实的凭证）。此时释放它等于把别人的资金挪为可用 —— 因此冲突
+    分支**跳过释放**，只把当前订单终态化；这与 ``strategy_fill_failure`` 的处置
+    一致。
+
     §7：释放失败**不得**静默吞掉。若这里把订单标成 ``superseded`` 而预占仍停在
     ``reserved``，那笔资金会被永久占用且没有任何订单再引用它 —— 比直接失败更糟。
     因此释放异常向上抛，让调用方的事务回滚（订单保持原状，下轮可诊断）。
     """
     # Phase 2 extraction: resolved at call time to avoid a circular import.
     from paper_trading import (
+        ReservationCycleMismatch,
         _audit,
         _finish_capital_reservation,
         _json,
@@ -782,9 +953,13 @@ def _terminalize_cycle_stale_order(conn, order, exc):
         value = getattr(exc, field, None)
         if value is not None:
             detail[field] = value
-    # §6/§7：释放既有预占（若无预占，UPDATE 命中 0 行，天然 no-op，无需 catch-all）。
-    # 释放失败即让本事务失败 —— 绝不留下「订单终态 + 资金仍被占用」的组合。
-    _finish_capital_reservation(conn, order_id, "released")
+    # §50：冲突的预占属于**别的**订单，绝不 release（那是在处置别人的资产）。
+    foreign_reservation = _is_reservation_cycle_mismatch(exc, ReservationCycleMismatch)
+    detail["reservation_released"] = not foreign_reservation
+    if not foreign_reservation:
+        # §6/§7：释放既有预占（若无预占，UPDATE 命中 0 行，天然 no-op）。
+        # 释放失败即让本事务失败 —— 绝不留下「订单终态 + 资金仍被占用」的组合。
+        _finish_capital_reservation(conn, order_id, "released")
     reason = f"{marker}：{str(exc)[:200]}"
     payload = _loads(order.get("risk_payload"), {})
     if not isinstance(payload, dict):

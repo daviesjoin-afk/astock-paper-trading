@@ -97,6 +97,24 @@ def _loads(value, default=None):
         return default if default is not None else {}
 
 
+def explicit_empty_cycle(conn, cycle_id) -> bool:
+    """Whether a cycle explicitly declares ``enabled_strategies == []``.
+
+    Missing / NULL / unparsable values are **not** idle; they retain the
+    legacy fallback semantics.  Only the explicit empty list means "this
+    cycle owns no strategies".
+    """
+    try:
+        row = _row(
+            conn,
+            "SELECT enabled_strategies FROM paper_cycles WHERE id=?",
+            (int(cycle_id),),
+        )
+        return bool(row) and _loads(row.get("enabled_strategies"), None) == []
+    except Exception:
+        return False
+
+
 def lifecycle_paused_ids(conn) -> frozenset:
     """注册表中被生命周期暂停的策略 id；执行层据此临时禁用新信号。
 
