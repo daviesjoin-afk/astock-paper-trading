@@ -242,7 +242,7 @@ MIT. See [`LICENSE`](LICENSE).
 
 ## Release and deployment status
 
-Current release: **v1.3.0** (see [GitHub Releases](https://github.com/daviesjoin-afk/astock-paper-trading/releases); the detailed [`CHANGELOG.md`](CHANGELOG.md) entries currently stop at v1.2.0). See [security boundaries](SECURITY.md), the [strategy platform](docs/STRATEGY_PLATFORM.md) and the [repository layout](docs/REPOSITORY_LAYOUT.md). CI covers Python 3.11/3.12. The historical API version 2.0.0 is not the release tag.
+Current release: **v2.0.0** — see the [full release notes](docs/RELEASE-v2.0.0.md), [GitHub Releases](https://github.com/daviesjoin-afk/astock-paper-trading/releases) and [`CHANGELOG.md`](CHANGELOG.md). See [security boundaries](SECURITY.md), the [strategy platform](docs/STRATEGY_PLATFORM.md) and the [repository layout](docs/REPOSITORY_LAYOUT.md). CI covers Python 3.11/3.12, the offline Docker regression suite, frontend build checks and Chromium E2E.
 
 The local Compose mapping binds the host port to loopback only (`127.0.0.1:8600:8600`); inside the container Uvicorn still listens on `0.0.0.0` for port publishing, health checks and reverse proxying.
 
