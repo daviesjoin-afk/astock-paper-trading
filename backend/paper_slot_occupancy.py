@@ -18,6 +18,7 @@ def pending_position_slots(
     positions: Iterable[dict[str, Any]],
     exclude_order_key: Any = None,
     *,
+    cycle_id: Any = None,
     occupying_statuses: Collection[str],
     lot_size: int,
     num_fn: Callable[[Any], float | int],
@@ -29,6 +30,11 @@ def pending_position_slots(
     occupying_statuses occupy new position seats.  Any pending order for an
     account/code pair that already holds a full-lot position (>= lot_size) is suppressed
     because it adds to an existing position rather than claiming a new position slot.
+
+    ``cycle_id`` 为 ``None`` 时保持历史语义（不过滤周期，供只读面板与兼容调用）；
+    传显式周期时只统计**该周期**的委托。一旦席位比较固定到某个周期，它读到的
+    pending 席位也必须是同一周期的 —— 否则更新的 active cycle 的在途买单会占掉
+    被请求周期的席位（legacy ``cycle_id IS NULL`` 行在显式周期下自然不可见）。
     """
     existing = {
         (str(item.get("account_id")), str(item.get("code")))
@@ -47,6 +53,9 @@ def pending_position_slots(
     placeholders = ",".join("?" for _ in status_list)
     where = f"origin IN ('manual','strategy') AND side='buy' AND status IN ({placeholders})"
     params: list[Any] = list(status_list)
+    if cycle_id is not None:
+        where += " AND cycle_id=?"
+        params.append(int(cycle_id))
     if excluded_id is not None:
         where += " AND id<>?"
         params.append(excluded_id)

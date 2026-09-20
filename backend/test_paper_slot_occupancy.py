@@ -202,9 +202,27 @@ class SlotOccupancyIdentityAndSuppressionTests(OrderDatabaseMixin, unittest.Test
 class SlotOccupancyFacadeContractTests(unittest.TestCase):
     def test_facade_signature_exact_match(self):
         sig = inspect.signature(PT._pending_position_slots)
-        self.assertEqual(["conn", "positions", "exclude_order_key"], list(sig.parameters.keys()))
+        self.assertEqual(
+            ["conn", "positions", "exclude_order_key", "cycle_id"],
+            list(sig.parameters.keys()))
         self.assertIs(None, sig.parameters["positions"].default)
         self.assertIs(None, sig.parameters["exclude_order_key"].default)
+        # cycle_id 是 keyword-only：显式周期只能被指名传入，位置参数调用
+        # 必须保持历史语义（面板 / 手动委托读"现在"的席位）。
+        self.assertIs(
+            inspect.Parameter.KEYWORD_ONLY,
+            sig.parameters["cycle_id"].kind,
+        )
+        self.assertIs(None, sig.parameters["cycle_id"].default)
+
+    def test_explicit_cycle_scopes_the_pending_order_query(self):
+        """显式 cycle_id 必须进入 SQL；None 时保持历史（不过滤周期）语义。"""
+        with mock.patch.object(PT.PSO, "pending_position_slots",
+                               return_value=set()) as mock_pso:
+            PT._pending_position_slots(mock.MagicMock(), positions=[], cycle_id=8)
+            self.assertEqual(8, mock_pso.call_args.kwargs["cycle_id"])
+            PT._pending_position_slots(mock.MagicMock(), positions=[])
+            self.assertIsNone(mock_pso.call_args.kwargs["cycle_id"])
 
     def test_explicit_empty_positions_skips_position_rows_sentinel(self):
         with mock.patch.object(PT, "_position_rows") as mock_pos_rows, \

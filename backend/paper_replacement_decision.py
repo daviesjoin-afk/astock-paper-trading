@@ -36,6 +36,7 @@ from dataclasses import dataclass
 __all__ = [
     "ReplacementPolicy",
     "REPLACEMENT_DECISION_VERSION",
+    "allocation_version_id",
     "score_candidate",
     "choose_best_candidate",
     "derive_donors",
@@ -43,6 +44,20 @@ __all__ = [
 ]
 
 REPLACEMENT_DECISION_VERSION = "replacement-decision-v1"
+
+
+def allocation_version_id(text, default: int = 0) -> int:
+    """把 ``slots-vN`` 形式的席位版本 token 解析成 ``N``。
+
+    借位 / 回滚都要用同一个版本行身份去定位**显式周期**的
+    ``paper_position_limit_versions`` 行；解析逻辑只此一份，避免各自
+    ``try/except`` 出不同的默认值。无法解析（缺字段 / 非法 token）时返回
+    ``default``，调用方据此 fail closed。
+    """
+    try:
+        return int(str(text).rsplit("v", 1)[-1])
+    except (TypeError, ValueError):
+        return default
 
 
 @dataclass(frozen=True)

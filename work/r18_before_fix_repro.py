@@ -7,6 +7,8 @@
     R18-C2  tomorrow candidate 真实制造 today SELL（production path）
     R18-C3  historical slot upgrade 读到未来 review
     R18-C4  slot context 重新解析 active cycle（读到别的周期）
+    R18-C5  在途 pending BUY 席位跨周期（cycle 9 的买单占掉 cycle 8 的席位）
+    R18-C6  簇画像 signal 证据没有 as-of 上界（future leakage）
 
 用法（仓库根目录）::
 
@@ -138,6 +140,29 @@ class Repro:
         with PT._db() as conn:
             return [p for p in PT._position_rows(conn, asof_day=DAY)
                     if p["account_id"] == account_id]
+
+    def add_pending_buy(self, *, account_id, code, cycle_id,
+                        status="pending_limit"):
+        """一条可执行的在途 BUY 委托（占席位）。"""
+        with PT._db(immediate=True) as conn:
+            stamp = PT._strategy_stamp(conn, account_id)
+            conn.execute(
+                "INSERT INTO paper_orders(account_id,side,code,name,qty,planned_price,"
+                "status,reason,risk_payload,origin,created_at,strategy_id,"
+                "strategy_version,strategy_checksum,cycle_id) VALUES(?,'buy',?,?,100,"
+                "10.0,?,'fixture','{}','strategy',?,?,?,?,?)",
+                (account_id, code, f"测试股_{code}", status,
+                 f"{DAY.isoformat()} 10:00:00", *stamp, cycle_id),
+            )
+
+    def new_cycle(self, key):
+        with PT._db(immediate=True) as conn:
+            cur = conn.execute(
+                "INSERT INTO paper_cycles(cycle_key,status,capital,risk_profile,started_at,"
+                "created_at,updated_at) VALUES(?,'running',1000000.0,'balanced',?,?,?)",
+                (key, f"{DAY_NEXT.isoformat()} 00:00:00",
+                 f"{DAY_NEXT.isoformat()} 00:00:00", f"{DAY_NEXT.isoformat()} 00:00:00"))
+            return int(cur.lastrowid)
 
     def positions_for_cycle(self, cycle_id, account_id):
         """显式周期的持仓（C4 需要与 active cycle 不同的周期）。"""
@@ -315,6 +340,65 @@ def case_c4():
         r.teardown()
 
 
+# ─── R18-C5：在途 pending BUY 席位跨周期 ─────────────────────────────────
+def case_c5():
+    r = Repro()
+    r.setup()
+    try:
+        account = "tq_breakout"
+        cycle8 = r.cycle_id()
+        with PT._db(immediate=True) as conn:
+            conn.execute("UPDATE paper_cycles SET status='closed' WHERE id=?", (cycle8,))
+        cycle9 = r.new_cycle(f"r18-c5-{cycle8}")
+        for index in range(3):
+            r.add_pending_buy(account_id=account, code=f"6001{index:02d}",
+                              cycle_id=cycle9)
+        budget = {"pool_limit": 3, "limits": {account: 2, "sector_rotation": 3},
+                  "allocation_version": "slots-v1"}
+        signal = {"code": "600009", "payload": "{}"}
+        # base 的 _slot_upgrade_context 没有 cycle_id 参数（缺陷本身的一部分）；
+        # 有则显式传，没有就按旧签名调用。
+        has_kwarg = "cycle_id" in inspect.signature(
+            PT._slot_upgrade_context).parameters
+        kwargs = {"cycle_id": cycle8} if has_kwarg else {}
+        with mock.patch.object(
+                PT, "_dynamic_position_limits",
+                lambda conn, *, cycle_id=None, asof_day=None: dict(budget)):
+            with PT._db() as conn:
+                ctx8 = PT._slot_upgrade_context(
+                    conn, account, signal, [], DAY, **kwargs)
+        donors = [item["account_id"] for item in ctx8["donors"]]
+        leaked = "shared_pool" not in donors
+        return (not leaked), (
+            f"requested cycle={cycle8} active_cycle={cycle9} "
+            f"cycle9_pending_buys=3 cycle8 occupied_pool donor={donors} "
+            f"has_cycle_kwarg={has_kwarg} "
+            f"(cycle 8 无在途买单 ⇒ shared_pool donor 必须存在)"
+        )
+    finally:
+        r.teardown()
+
+
+# ─── R18-C6：簇画像 signal 证据没有 as-of 上界 ────────────────────────────
+def case_c6():
+    r = Repro()
+    r.setup()
+    try:
+        account = "tq_breakout"
+        r.add_signal(account_id=account, code="600301", intended_date=DAY.isoformat())
+        r.add_signal(account_id=account, code="600302", intended_date=DAY_NEXT.isoformat())
+        with PT._db() as conn:
+            profile = PT._strategy_cluster_profiles(conn, DAY, [account])[account]
+        leaked = sorted(
+            code for code in profile["signals"] if code == "600302")
+        return (not leaked), (
+            f"asof={DAY.isoformat()} signals={sorted(profile['signals'])} "
+            f"leaked_future={leaked} (600302 属于 {DAY_NEXT.isoformat()}，必须排除)"
+        )
+    finally:
+        r.teardown()
+
+
 def main() -> int:
     print(f"repo root: {ROOT}")
     print(f"HEAD      : {os.popen('git rev-parse --short=12 HEAD').read().strip()}")
@@ -324,6 +408,8 @@ def main() -> int:
         ("R18-C2 tomorrow candidate triggers today rotation/sell", case_c2),
         ("R18-C3 historical slot context reads future review", case_c3),
         ("R18-C4 slot context re-resolves active cycle", case_c4),
+        ("R18-C5 pending BUY slots cross the cycle boundary", case_c5),
+        ("R18-C6 cluster signal evidence has no as-of bound", case_c6),
     ]
     results = []
     for name, fn in cases:

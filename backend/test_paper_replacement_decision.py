@@ -442,6 +442,21 @@ class ThresholdBoundaryTests(unittest.TestCase):
         self.assertEqual(PT.PRep.score_candidate(sample), PRep.score_candidate(sample))
 
 
+class AllocationVersionTokenTests(unittest.TestCase):
+    """RD-16 —— 席位版本 token 解析只此一份（借位 / 回滚共用）。"""
+
+    def test_parses_slots_vN(self):
+        self.assertEqual(PRep.allocation_version_id("slots-v7"), 7)
+        self.assertEqual(PRep.allocation_version_id("slots-v0"), 0)
+
+    def test_unparsable_token_falls_back_to_default(self):
+        """缺字段 / 非法 token 必须 fail closed（调用方据此拒绝借位）。"""
+        for bad in (None, "", "slots-", "abc", {}):
+            with self.subTest(value=bad):
+                self.assertEqual(PRep.allocation_version_id(bad), 0)
+        self.assertEqual(PRep.allocation_version_id(None, default=-1), -1)
+
+
 class ModuleBoundaryTests(unittest.TestCase):
     """规格 §61-§62 —— 纯模块的硬边界（零项目 import / 零 I/O / 零时钟）。"""
 

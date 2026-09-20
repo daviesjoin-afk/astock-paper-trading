@@ -2,6 +2,111 @@
 
 `MERGE: NOT MERGED` · `DEPLOY: NOT DEPLOYED`
 
+## Review follow-up (round 3)
+
+A second human review of head `f7fb858` found **two remaining cycle-fencing
+blockers**: R18 claimed "the whole slot lifecycle belongs to one explicit cycle",
+but two evidence channels still fell back to the current active cycle.
+
+### Blocker 1 — pending BUY slot occupancy crossed the cycle
+
+`_slot_upgrade_context(..., cycle_id=8)` fixed reviews, budget and positions to
+cycle 8, but then called:
+
+```python
+pending_slots = _pending_position_slots(conn, positions)
+```
+
+which reached `paper_slot_occupancy.pending_position_slots()` and ran:
+
+```sql
+SELECT account_id,code FROM paper_orders
+ WHERE origin IN ('manual','strategy') AND side='buy' AND status IN (...)
+```
+
+with **no `cycle_id=?`**. So with cycle 8 requested and cycle 9 active:
+
+```text
+positions          → cycle 8
+reviews            → cycle 8
+allocation version → cycle 8
+pending BUY seats  → ALL cycles        ← split-brain
+```
+
+Three in-flight BUYs belonging to cycle 9 changed cycle 8's `occupied_pool`, and
+therefore the existence of a `shared_pool` donor, `borrow_ready` and the whole
+slot-upgrade state. No P5/P5c/P5d test covered pending-order occupancy, which is
+why CI was green.
+
+Fixed: `pending_position_slots(conn, positions, exclude_order_key=None, *,
+cycle_id=None, ...)` appends `AND cycle_id=?` when a cycle is supplied (`None`
+keeps the pre-existing unfiltered semantics for dashboard / manual-order
+readers, where legacy `cycle_id IS NULL` rows must stay visible).
+`_pending_position_slots(conn, positions=None, exclude_order_key=None, *,
+cycle_id=None)` forwards it, and the in-flight chain passes its claimed cycle:
+
+```python
+pending_slots = _pending_position_slots(conn, positions, cycle_id=resolved_cycle_id)
+```
+
+New production regression **RPL-P5e** (cycle 8 requested / cycle 9 active, only
+cycle 9 has executable pending BUYs ⇒ cycle 8's `occupied_pool` must ignore them)
+plus mutation **M-RPL16** (drop the cycle filter ⇒ P5e RED) and Guard 9m now also
+pins the pending-slot call shape.
+
+### Blocker 2 — explicit-cycle allocation budget still read active-cycle positions
+
+`_dynamic_position_limits(conn, cycle_id=8)` fixed the account rows and the
+version row, but internally called `_strategy_cluster_factors(conn,
+account_ids=...)` without the cycle, which reached
+`_strategy_cluster_profiles(...)` and read:
+
+```python
+positions = _position_rows(conn, asof_day=day)   # current-position facade
+```
+
+That facade re-resolves the **active** cycle, so:
+
+```text
+_dynamic_position_limits(cycle_id=8)
+  account rows            → cycle 8
+  allocation version      → cycle 8
+  cluster position evidence → active cycle 9   ← split-brain
+```
+
+`cluster_diversification` then feeds `runtime_inputs` → `fingerprint` →
+`allocation_key` → `PA.position_limits`, so an allocation version was created
+under cycle 8 whose fingerprint / cluster evidence came from cycle 9 — and in
+some combinations the limits themselves changed.
+
+Fixed:
+
+```python
+_dynamic_position_limits(conn, *, cycle_id=None, asof_day=None)
+  → _strategy_cluster_factors(conn, asof_day, account_ids=..., cycle_id=cycle_id)
+  → _strategy_cluster_profiles(conn, asof_day, account_ids, *, cycle_id=None)
+  → PPRM.positions_for_cycle(conn, int(cycle_id), asof_day=day)
+```
+
+`_slot_upgrade_context` / `_apply_slot_borrow` pass both `cycle_id` and `asof_day`.
+
+Two more future-leakage channels in the same helper were closed while in there:
+the cluster signal query had only `intended_date >= day-14` and now also carries
+`intended_date <= day`; and `_strategy_return_series` used the wall clock
+(`_date()`) with no cycle filter, and now takes `cycle_id` / `asof_day` and bounds
+the fill window with `executed_at < asof+1d`.
+
+New production regression **RPL-P5f** (cycle 9 positions and an as-of-after
+signal must not appear in cycle 8's cluster profile, while `cycle_id=None` keeps
+reading the active cycle) plus mutation **M-RPL17** (cluster positions back to
+`_position_rows()` ⇒ P5f RED).
+
+Both blockers share one principle, now written into invariant 19 and Guard 9n:
+
+> Once a helper accepts an explicit `cycle_id`, every position / order / budget
+> evidence read inside it that affects the decision must no longer fall back to
+> the current active cycle.
+
 ## Review follow-up (round 2)
 
 An automated review of head `5f03a185` raised one actionable point, now fixed:
@@ -56,8 +161,11 @@ position review without an as-of upper bound.
 active signals whose `intended_date` equals the explicit `asof_day` and whose
 `signal_date` is not in the future.
 
-Slot-upgrade/borrow/rollback use one explicit `cycle_id`, and holding review
-evidence is read only from that cycle at `review_date <= asof_day`.
+Slot-upgrade/borrow/rollback use one explicit `cycle_id`, and **every** evidence
+read behind that decision — holding reviews, position counts, pending BUY seat
+occupancy, and the allocation budget's cluster profiles / return series — is
+fenced to the same explicit cycle and as-of. Holding review evidence is read only
+from that cycle at `review_date <= asof_day`.
 
 Final replacement BUY execution still goes through the existing `_buy_order`
 gate; this PR does not duplicate or weaken execution checks.
@@ -142,7 +250,13 @@ R18-C3 historical slot context reads future review: REPRODUCED
 R18-C4 slot context re-resolves active cycle: REPRODUCED
     actual : requested cycle=1 active_cycle=2 weakest_score=20.0 (cycle8=70, cycle9=20; expected 70)
 
-SUMMARY: 4/4 reproduced on this tree
+R18-C5 pending BUY slots cross the cycle boundary: REPRODUCED
+    actual : requested cycle=1 active_cycle=2 cycle9_pending_buys=3 cycle8 occupied_pool donor=['sector_rotation'] (cycle 8 无在途买单 ⇒ shared_pool donor 必须存在)
+
+R18-C6 cluster signal evidence has no as-of bound: REPRODUCED
+    actual : asof=2026-09-10 signals=['600301', '600302'] leaked_future=['600302'] (600302 属于 2026-09-11，必须排除)
+
+SUMMARY: 6/6 reproduced on this tree
 ```
 
 **C2 is the full production chain, not a partial one**: the future candidate
@@ -158,8 +272,14 @@ R18-C1 ...: NOT REPRODUCED   selector returned signal_id=None (future signal=1 .
 R18-C2 ...: NOT REPRODUCED   selected_future=False action=watch replacement_score=None
 R18-C3 ...: NOT REPRODUCED   asof=2026-09-10 weakest_score=70.0 ... state=edge_insufficient
 R18-C4 ...: NOT REPRODUCED   requested cycle=1 active_cycle=2 weakest_score=70.0 ...
-SUMMARY: 0/4 reproduced on this tree
+R18-C5 ...: NOT REPRODUCED   requested cycle=1 active_cycle=2 ... donor=['sector_rotation', 'shared_pool']
+R18-C6 ...: NOT REPRODUCED   asof=2026-09-10 signals=['600301'] leaked_future=[]
+SUMMARY: 0/6 reproduced on this tree
 ```
+
+C5/C6 (added in round 3) reproduce on the unmodified base `f979a166` (6/6 there)
+and were also confirmed on the previously reviewed head `f7fb858`; both are
+**NOT REPRODUCED** after this round's fix. C1–C4 remain 0/4 as before.
 
 ## New module: `backend/paper_replacement_evidence.py`
 
@@ -252,8 +372,20 @@ Merging them into one "unified score" would silently change both semantics.
   is **keyword-only and required**, and the function bodies no longer call
   `_active_cycle()`. `_buy_order` passes the `current_cycle` it already proved.
 - A borrow lifecycle is now `same cycle in → same cycle out`: borrow and rollback
-  locate the seat-version row by the **explicit** cycle, and the donor position
-  count is read via `PPRM.positions_for_cycle(conn, resolved_cycle_id)`.
+  locate the seat-version row by the **explicit** cycle (via
+  `PRep.allocation_version_id`), and the donor position count is read via
+  `PPRM.positions_for_cycle(conn, resolved_cycle_id)`.
+- **Blocker 1 (round 3)** — `_pending_position_slots(..., *, cycle_id=None)`
+  forwards `cycle_id=?` into `paper_slot_occupancy.pending_position_slots()`, and
+  the in-flight chain passes its claimed cycle, so another cycle's pending BUYs
+  cannot occupy the requested cycle's seats.
+- **Blocker 2 (round 3)** — `_dynamic_position_limits(conn, *, cycle_id=None,
+  asof_day=None)` forwards both into `_strategy_cluster_factors` /
+  `_strategy_cluster_profiles`, which read `PPRM.positions_for_cycle(...)`
+  instead of the current-position facade, bound the signal query with
+  `intended_date <= day`, and pass the same cycle / as-of to
+  `_strategy_return_series` (which itself now bounds `executed_at` and filters
+  `cycle_id`).
 - **Removed** `_replacement_score_from_signal` with **no** compatibility wrapper;
   production calls `PRep.score_candidate` directly.
 - Deliberately **not** changed: `_rotation_buy_candidate` still delegates to the
@@ -264,8 +396,8 @@ Size ratchet per §104:
 
 ```text
 Before: 16134 / 283
-After:  16049 / 282
-Delta:  -85 / -1
+After:  16046 / 282
+Delta:  -88 / -1
 ```
 
 ## Authority matrix
@@ -283,7 +415,7 @@ Compatibility position projection: paper_positions
 
 ## Tests
 
-- **`backend/test_paper_replacement_decision.py` (NEW, 42 tests)** — RD-1 … RD-15,
+- **`backend/test_paper_replacement_decision.py` (NEW, 43 tests)** — RD-1 … RD-16,
   plus explicit threshold boundaries (`candidate == borrow_min_candidate`,
   `edge == borrow_min_edge`, `candidate == upgrade_min_candidate`,
   `edge == upgrade_min_edge`, `net_edge == full_cap_edge`,
@@ -292,7 +424,7 @@ Compatibility position projection: paper_positions
   drift cannot slip through. Also asserts the policy defaults equal the
   production constants, that the adapter and the pure module agree on the score,
   and the module's zero-project-import / zero-I/O / zero-clock boundary.
-- **`backend/test_replacement_asof_provenance.py` (NEW, 28 tests)** — evidence
+- **`backend/test_replacement_asof_provenance.py` (NEW, 30 tests)** — evidence
   contract **RP2-01 … RP2-11** (same-day candidate loaded; tomorrow candidate
   excluded; **legal overnight plan still allowed**; future `signal_date` excluded
   even when `intended_date == D`; past intended_date excluded; status filter;
@@ -304,12 +436,17 @@ Compatibility position projection: paper_positions
   is always None"), **P3** a legal overnight candidate still influences today's
   decision, **P4** a future review cannot create `slot_upgrade_ready`,
   **P5/P6** borrow and rollback never touch another cycle's seat-version row
-  (plus **P5b** positive control that the same-cycle borrow does write, and
-  **P5c** that the donor position count is read from the explicit cycle),
+  (plus **P5b** positive control that the same-cycle borrow does write,
+  **P5c** that the donor position count is read from the explicit cycle, and
+  **P5d** that the seat budget (`allocation_version` / `target_limit` / donors)
+  is derived from the explicit cycle so a legitimate same-cycle borrow is not
+  rejected as "version missing"),
   **P7** the review's `replacement_score` only ever comes from a same-day
-  candidate, **P5d** the seat budget (`allocation_version` / `target_limit` /
-  donors) is derived from the explicit cycle so a legitimate same-cycle borrow
-  is not rejected as "version missing".
+  candidate,
+  **P5e** cycle 8's `occupied_pool` ignores cycle 9's executable pending BUYs
+  (with a non-vacuity sub-assertion that cycle 9 *does* see them), and
+  **P5f** cycle 8's cluster profile contains neither cycle 9's positions nor an
+  as-of-after signal, while `cycle_id=None` still reads the active cycle.
 - **`backend/test_paper_trading_architecture_guard.py`** — new **Guard 9**
   (`ReplacementIsAsOfAndCycleBound`): 9a pure module zero project imports, 9b
   zero I/O and zero clock, 9c evidence module no reverse dependency and no clock,
@@ -319,11 +456,14 @@ Compatibility position projection: paper_positions
   historical review read is bounded by `(cycle_id, review_date <= asof)`, 9j the
   legacy `_replacement_score_from_signal` is gone, 9k the candidate path never
   regains the next-day range, 9l the adapter uses the evidence layer and the pure
-  module. Baseline ratcheted **down** to 16049 / 282.
+  module, 9m the slot chain passes the explicit cycle into the budget lookup and
+  into the pending-slot read, 9n the cluster evidence follows the claimed cycle /
+  as-of. Baseline ratcheted **down** to 16049 / 282 and the file now sits at
+  16046.
 
 ## Non-vacuity (mutation check)
 
-`work/r18_mutation_check.py` injects **15 byte-level mutations** into real
+`work/r18_mutation_check.py` injects **17 byte-level mutations** into real
 production sources and requires the *specific* contract test to fail with
 `FAIL:`/`ERROR:` on that exact method, so an import/collection error cannot
 masquerade as a catch. Every file is restored byte-identically and verified by
@@ -331,7 +471,7 @@ sha256 in a `finally` block, with a fresh `PYTHONPYCACHEPREFIX` per run so a
 same-length mutation in the same second cannot reuse stale bytecode.
 
 ```text
-RESULT: 15/15 mutations RED, all files restored byte-identical
+RESULT: 17/17 mutations RED, all files restored byte-identical
 ```
 
 | ID | Mutation | Caught by |
@@ -351,27 +491,31 @@ RESULT: 15/15 mutations RED, all files restored byte-identical
 | M-RPL13 | pure module reverse-imports `paper_trading` | Guard 9a |
 | M-RPL14 | adapter swaps `asof` for the next weekday | RPL-P1 |
 | M-RPL15 | seat budget reverted to the active cycle | RPL-P5d |
+| M-RPL16 | pending-slot read loses the `cycle_id` filter | RPL-P5e |
+| M-RPL17 | cluster positions back to `_position_rows()` | RPL-P5f |
 
 **M-RPL1 and M-RPL14 are the core business mutations**, not signature checks:
 restoring the next-day window — either inside the evidence layer or by shifting
 the adapter's `asof` — makes the tomorrow-candidate production regression go RED.
 **M-RPL3** proves the historical leakage bound: removing `review_date <= asof`
-makes the future-review regression go RED.
+makes the future-review regression go RED. **M-RPL16 / M-RPL17** prove the two
+round-3 blockers are actually fenced rather than merely untested.
 
 ## Verification (local)
 
 | Check | Result |
 |---|---|
-| new modules (replacement decision + provenance) | 69 tests OK |
-| `unittest backend.test_paper_trading_architecture_guard` | 45 tests OK |
-| targeted set (7 modules) | 227 tests OK |
-| entry / slot / cycle regression set (11 modules) | 151 tests OK |
-| strategy + golden replay set (9 modules) | 116 tests OK |
-| `unittest discover -s backend` | **3717 tests OK** (skipped=5) |
-| `work/r18_before_fix_repro.py` | base 4/4 REPRODUCED → fixed 0/4 |
-| `work/r18_mutation_check.py` | 15/15 RED, restore byte-identical |
+| `test_paper_replacement_decision` + `test_replacement_asof_provenance` (new modules) | 73 tests OK |
+| `unittest backend.test_paper_trading_architecture_guard` | 46 tests OK |
+| targeted set (7 modules incl. slot occupancy / position review) | 240 tests OK |
+| entry / slot / cycle regression set (11 modules) | 244 tests OK |
+| strategy + golden replay set (6 modules) | 99 tests OK |
+| `unittest discover -s backend` | **3721 tests OK** (skipped=5) |
+| `work/r18_before_fix_repro.py` | base 6/6 REPRODUCED → fixed 0/6 |
+| `work/r18_mutation_check.py` | 17/17 RED, restore byte-identical |
 | `ruff check backend` | All checks passed |
 | `python -m compileall -q backend` | exit 0 |
+| `scripts/security/scan-sensitive-data.py --scope worktree` | kinds: none / values: 0 |
 
 Golden replay (`test_production_path_golden_replay`, `test_demo_replay_golden`)
 shows **no snapshot drift**: normal fixtures do not rely on a future replacement

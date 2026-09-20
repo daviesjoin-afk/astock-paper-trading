@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""R18 负向变异矩阵（M-RPL1 ~ M-RPL15）。
+"""R18 负向变异矩阵（M-RPL1 ~ M-RPL17）。
 
 每条变异都对应一条 R18 / 架构契约，必须让**对应**契约测试变红 —— 否则门禁是空的。
 
@@ -33,6 +33,9 @@
     M-RPL12 net edge 忽略 execution buffer               -> 阈值边界
     M-RPL13 pure module reverse-import paper_trading     -> Guard 9a
     M-RPL14 tomorrow candidate 重新触发 today sell       -> RPL-P1
+    M-RPL15 borrow budget 改回 active cycle              -> RPL-P5d
+    M-RPL16 pending 席位去掉 cycle 过滤                  -> RPL-P5e
+    M-RPL17 簇画像持仓改回 _position_rows()              -> RPL-P5f
 
 用法（仓库根目录）::
 
@@ -138,7 +141,9 @@ MUTATIONS = [
         "id": "M-RPL5",
         "file": PAPER_TRADING_FILE,
         "old": '    resolved_cycle_id = int(cycle_id)\n'
-               '    budget = _dynamic_position_limits(conn, cycle_id=resolved_cycle_id)\n',
+               '    budget = _dynamic_position_limits(\n'
+               '        conn, cycle_id=resolved_cycle_id, asof_day=asof_day,\n'
+               '    )\n',
         "new": '    resolved_cycle_id = int(_active_cycle(conn)["id"])  # mutation\n'
                '    budget = _dynamic_position_limits(conn)\n',
         "test": f"{PROV_MODULE}.ProductionSlotLifecycleProvenance."
@@ -159,8 +164,8 @@ MUTATIONS = [
     {
         "id": "M-RPL7",
         "file": PAPER_TRADING_FILE,
-        "old": '        1 for item in PPRM.positions_for_cycle(conn, resolved_cycle_id)\n',
-        "new": '        1 for item in PPRM.current_positions(conn)  # mutation\n',
+        "old": '            1 for item in PPRM.positions_for_cycle(conn, resolved_cycle_id)\n',
+        "new": '            1 for item in PPRM.current_positions(conn)  # mutation\n',
         "test": f"{PROV_MODULE}.ProductionSlotLifecycleProvenance."
                 "test_rpl_p5c_donor_count_is_read_from_the_explicit_cycle",
         "desc": "donor 持仓读改回 current_positions（不再固定显式周期）",
@@ -248,11 +253,38 @@ MUTATIONS = [
         "file": PAPER_TRADING_FILE,
         # 席位预算改回 active cycle：借位请求的是显式周期，预算却来自 active cycle，
         # 于是拿 active 的 allocation_version 去查显式周期的版本行 ⇒ 同周期借位被拒。
-        "old": '    budget = _dynamic_position_limits(conn, cycle_id=resolved_cycle_id)\n',
+        "old": '    budget = _dynamic_position_limits(\n'
+               '        conn, cycle_id=resolved_cycle_id, asof_day=asof_day,\n'
+               '    )\n',
         "new": '    budget = _dynamic_position_limits(conn)  # mutation\n',
         "test": f"{PROV_MODULE}.ProductionSlotLifecycleProvenance."
                 "test_rpl_p5d_borrow_budget_is_derived_from_the_explicit_cycle",
         "desc": "席位预算改回 active cycle（同周期借位被错误拒绝）",
+    },
+    {
+        "id": "M-RPL16",
+        "file": PAPER_TRADING_FILE,
+        # Blocker 1：in-flight pending 席位读取去掉显式周期 ⇒ 更新的 active cycle 的
+        # 在途买单会占掉被请求周期的席位（改变 donor / borrow / upgrade 状态）。
+        "old": '    pending_slots = _pending_position_slots(conn, positions, cycle_id=resolved_cycle_id)\n',
+        "new": '    pending_slots = _pending_position_slots(conn, positions)  # mutation\n',
+        "test": f"{PROV_MODULE}.ProductionSlotLifecycleProvenance."
+                "test_rpl_p5e_pending_slots_are_read_from_the_explicit_cycle",
+        "desc": "pending 席位改回跨周期读取（cycle9 在途买单占掉 cycle8 席位）",
+    },
+    {
+        "id": "M-RPL17",
+        "file": PAPER_TRADING_FILE,
+        # Blocker 2：簇画像持仓改回 current-position facade ⇒ 显式周期的预算
+        # fingerprint 由 active cycle 的持仓决定。
+        "old": '    if cycle_id is None:\n'
+               '        positions = _position_rows(conn, asof_day=day)\n'
+               '    else:\n'
+               '        positions = PPRM.positions_for_cycle(conn, int(cycle_id), asof_day=day)\n',
+        "new": '    positions = _position_rows(conn, asof_day=day)  # mutation\n',
+        "test": f"{PROV_MODULE}.ProductionSlotLifecycleProvenance."
+                "test_rpl_p5f_cluster_evidence_is_cycle_and_asof_bound",
+        "desc": "簇画像持仓改回 _position_rows()（预算证据来自 active cycle）",
     },
 ]
 

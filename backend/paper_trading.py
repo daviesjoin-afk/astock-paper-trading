@@ -2942,7 +2942,7 @@ def _pending_buy_reservations(conn, cycle_id=None, exclude_order_key=None):
     )
 
 
-def _pending_position_slots(conn, positions=None, exclude_order_key=None):
+def _pending_position_slots(conn, positions=None, exclude_order_key=None, *, cycle_id=None):
     """Return distinct slots held by executable pending buy orders.
 
     ``deferred_capacity`` and ``entry_frozen_waitlist`` are research queue
@@ -2950,6 +2950,10 @@ def _pending_position_slots(conn, positions=None, exclude_order_key=None):
     a strategy seat.  Counting them here turns every waitlist candidate into
     a phantom position and can permanently report impossible values such as
     62/15 occupied seats.
+
+    ``cycle_id``（R18）：``None`` = 当前语义（面板 / 手动委托读现在的席位）；在途
+    slot-upgrade 链必须传已认领周期，否则更新的 active cycle 的在途买单会凭空占掉
+    被请求周期的席位，改变 donor / borrow / upgrade 状态。
     """
     resolved_positions = (
         _position_rows(conn)
@@ -2960,6 +2964,7 @@ def _pending_position_slots(conn, positions=None, exclude_order_key=None):
         conn,
         resolved_positions,
         exclude_order_key,
+        cycle_id=cycle_id,
         occupying_statuses=ENTRY_SLOT_OCCUPYING_ORDER_STATUSES,
         lot_size=LOT_SIZE,
         num_fn=_num,
@@ -8033,28 +8038,36 @@ def _entry_deployment_gate(conn, account_id, code, positions, pending_slots, cou
     }
 
 
-def _strategy_return_series(conn, account_ids, *, days=30):
+def _strategy_return_series(conn, account_ids, *, days=30, cycle_id=None, asof_day=None):
     """按策略聚合近 N 天的日盈亏序列（已实现盈亏，Pearson 对线性缩放不变）。
 
     每个策略一条按日求和的 realized-pnl 序列；无成交日补 0，保证各序列
     长度一致。查询失败返回空映射（证据缺失时权重自动让渡）。
+
+    R18：显式 ``cycle_id`` / ``asof_day`` 时只读**该周期、截至 asof** 的成交。
     """
     if conn is None or not account_ids:
         return {}
-    day = _date()
+    day = _date(asof_day)
     since = (day - dt.timedelta(days=days)).isoformat()
+    until = (day + dt.timedelta(days=1)).isoformat()
     series = {account_id: [] for account_id in account_ids}
     placeholders = ",".join("?" for _ in account_ids)
+    where = "side='sell' AND status='filled' AND executed_at>=? AND executed_at<?"
+    params: list = [since, until]
+    if cycle_id is not None:
+        where += " AND cycle_id=?"
+        params.append(int(cycle_id))
     try:
         rows = conn.execute(
             f"""SELECT account_id, substr(executed_at,1,10) AS day,
                       COALESCE(SUM(COALESCE(realized_pnl,0)),0) AS pnl
                  FROM paper_orders
-                WHERE side='sell' AND status='filled' AND executed_at>=?
+                WHERE {where}
                   AND {_execution_verified_predicate()}
                   AND account_id IN ({placeholders})
                 GROUP BY account_id, day ORDER BY day""",
-            (since, *account_ids),
+            (*params, *account_ids),
         ).fetchall()
     except sqlite3.Error:
         return series
@@ -8071,17 +8084,25 @@ def _strategy_return_series(conn, account_ids, *, days=30):
     return series
 
 
-def _strategy_cluster_profiles(conn, asof_day=None, account_ids=None):
+def _strategy_cluster_profiles(conn, asof_day=None, account_ids=None, *, cycle_id=None):
     """收集各策略的相关性画像：持仓/近期信号代码与行业集合（约 14 天窗口）。
 
     只为**参与当前周期的策略**建画像（未启用策略不占预算也不该抬簇规模），
     任何查询失败都只损失证据，不阻塞主扫描。
     PR-27：画像额外携带策略 DSL AST——新复制的策略没有任何行为历史，
     只有结构证据能第一时间把它抓进簇。
+
+    R18：三条证据通道都必须与调用方声明的周期/as-of 一致 —— 持仓走
+    :func:`paper_position_read_model.positions_for_cycle`（显式周期）、signal 查询
+    补 ``intended_date <= day`` 上界、成交序列固定同一周期与 as-of。``None`` 保持
+    current/live 语义（冷启动分配、面板解释）。
     """
     day = _date(asof_day)
     wanted = [str(item) for item in (account_ids or list(ACCOUNT_SPECS))]
-    positions = _position_rows(conn, asof_day=day)
+    if cycle_id is None:
+        positions = _position_rows(conn, asof_day=day)
+    else:
+        positions = PPRM.positions_for_cycle(conn, int(cycle_id), asof_day=day)
     profiles = {}
     for account_id in wanted:
         own = [item for item in positions if item.get("account_id") == account_id]
@@ -8099,8 +8120,8 @@ def _strategy_cluster_profiles(conn, asof_day=None, account_ids=None):
     try:
         rows = conn.execute(
             """SELECT account_id,code FROM paper_signals
-                WHERE intended_date>=? AND code IS NOT NULL AND code<>''""",
-            ((day - dt.timedelta(days=14)).isoformat(),),
+                WHERE intended_date>=? AND intended_date<=? AND code IS NOT NULL AND code<>''""",
+            ((day - dt.timedelta(days=14)).isoformat(), day.isoformat()),
         ).fetchall()
     except sqlite3.Error:
         rows = []
@@ -8110,16 +8131,17 @@ def _strategy_cluster_profiles(conn, asof_day=None, account_ids=None):
         account_id = str(record.get("account_id") or "")
         if account_id in profiles and record.get("code"):
             profiles[account_id]["signals"].add(str(record["code"]))
-    returns_map = _strategy_return_series(conn, wanted)
+    returns_map = _strategy_return_series(
+        conn, wanted, cycle_id=cycle_id, asof_day=day)
     for account_id, returns in returns_map.items():
         if account_id in profiles and returns:
             profiles[account_id]["returns"] = returns
     return profiles
 
 
-def _strategy_cluster_factors(conn, asof_day=None, account_ids=None):
+def _strategy_cluster_factors(conn, asof_day=None, account_ids=None, *, cycle_id=None):
     """返回 (clusters, {strategy_id: 分散化系数})；单策略簇系数 = 1.0。"""
-    profiles = _strategy_cluster_profiles(conn, asof_day, account_ids)
+    profiles = _strategy_cluster_profiles(conn, asof_day, account_ids, cycle_id=cycle_id)
     clusters = SC.strategy_clusters(profiles)
     factors = {
         account_id: SC.cluster_diversification_factor(account_id, clusters)
@@ -8161,7 +8183,7 @@ def _strategy_runtimes(account_ids, weights=None, diversification=None, *, conn=
     return runtimes
 
 
-def _dynamic_position_limits(conn, *, cycle_id=None):
+def _dynamic_position_limits(conn, *, cycle_id=None, asof_day=None):
     """Return a versioned allocation inside the 15-slot hard cap.
 
     ``pool_limit`` is an effective deployable limit, not a target that must
@@ -8170,11 +8192,10 @@ def _dynamic_position_limits(conn, *, cycle_id=None):
     reflected in a new allocation version; contraction is still executed only
     through the staged, T+1/quote/limit-aware capacity-exit path.
 
-    ``cycle_id``（R18，keyword-only）：``None`` = "现在 active 的那个周期"（冷启动
-    分配 / 容量退出 / 面板读取保持原语义）。但**席位比较 → 借位 → 回滚**这条在途
-    下单链必须把调用方已证明过的周期显式传进来，否则 reviews / 持仓数看显式周期、
-    而 target_limit / donors / 席位版本行看 active cycle，一次借位跨越两个周期
-    （§14 要求整条链同周期）。
+    ``cycle_id`` / ``asof_day``（R18，keyword-only）：``None`` = "现在 active 的
+    那个周期 / 机器今天"（冷启动分配 / 容量退出 / 面板读取原语义）。但**席位比较
+    → 借位 → 回滚**这条在途下单链必须传已认领周期与 as-of：否则账号行 / 版本行看
+    显式周期，而簇画像的持仓与成交证据仍来自 active cycle（甚至 as-of 之后）。
     """
     cycle_id = int(cycle_id) if cycle_id is not None else int(_active_cycle(conn)["id"])
     hard_pool_cap = int(RSET.get(conn, "shared_pool_position_limit", SHARED_POOL_MAX_POSITIONS))
@@ -8193,7 +8214,7 @@ def _dynamic_position_limits(conn, *, cycle_id=None):
     # 1/sqrt(簇规模) 的分散化系数——复制近似策略拿不到线性叠加的风险额度。
     # 只对参与当前周期的策略建画像。
     clusters, cluster_factors = _strategy_cluster_factors(
-        conn, account_ids=account_ids,
+        conn, asof_day, account_ids=account_ids, cycle_id=cycle_id,
     )
     diversification = {key: cluster_factors.get(key, 1.0) for key in account_ids}
     weights = {
@@ -10415,7 +10436,9 @@ def _slot_upgrade_context(conn, account_id, signal, positions, asof_day, *, cycl
     resolved_cycle_id = int(cycle_id)
     # 席位预算同样取自显式周期（否则 reviews/持仓数看 cycle 8，target_limit/donors
     # 看 active cycle 9），且避免拿 active 的 allocation_version 查别的周期的版本行。
-    count_budget = _dynamic_position_limits(conn, cycle_id=resolved_cycle_id)
+    count_budget = _dynamic_position_limits(
+        conn, cycle_id=resolved_cycle_id, asof_day=asof_day,
+    )
     counts = {
         key: sum(
             1 for item in positions
@@ -10425,7 +10448,9 @@ def _slot_upgrade_context(conn, account_id, signal, positions, asof_day, *, cycl
     }
     target_limit = int(_num(count_budget.get("limits", {}).get(account_id), 0))
     pool_limit = int(_num(count_budget.get("pool_limit"), SHARED_POOL_MAX_POSITIONS))
-    pending_slots = _pending_position_slots(conn, positions)
+    # R18：in-flight pending 席位同样固定到显式周期，否则更新的 active cycle 的在途
+    # 买单会占掉被请求周期的席位，直接改变 donor / borrow / upgrade 状态。
+    pending_slots = _pending_position_slots(conn, positions, cycle_id=resolved_cycle_id)
     occupied_pool = {
         (str(item.get("account_id")), str(item.get("code")))
         for item in positions if int(_num(item.get("qty"))) >= LOT_SIZE
@@ -10479,7 +10504,9 @@ def _apply_slot_borrow(conn, account_id, upgrade, asof_day, *, cycle_id):
     if not upgrade or not upgrade.get("borrow_ready") or not upgrade.get("donors"):
         return {"allowed": False, "reason": "未达到动态借位条件"}
     resolved_cycle_id = int(cycle_id)
-    budget = _dynamic_position_limits(conn, cycle_id=resolved_cycle_id)
+    budget = _dynamic_position_limits(
+        conn, cycle_id=resolved_cycle_id, asof_day=asof_day,
+    )
     limits = {key: int(_num(value)) for key, value in (budget.get("limits") or {}).items()}
     donor = next(
         (item for item in upgrade["donors"]
@@ -10491,60 +10518,26 @@ def _apply_slot_borrow(conn, account_id, upgrade, asof_day, *, cycle_id):
     if donor is None or limits.get(account_id, 0) >= account_slot_cap:
         return {"allowed": False, "reason": "借位名额已被其他并发下单占用"}
     donor_id = donor["account_id"]
-    if donor_id == "shared_pool":
-        before = dict(limits)
-        limits[account_id] += 1
-        version_text = str(budget.get("allocation_version", "slots-v0"))
-        try:
-            version_id = int(version_text.rsplit("v", 1)[-1])
-        except (TypeError, ValueError):
-            version_id = 0
-        row = conn.execute(
-            "SELECT id,inputs FROM paper_position_limit_versions WHERE id=? AND cycle_id=?",
-            (version_id, resolved_cycle_id),
-        ).fetchone()
-        if row is None:
-            return {"allowed": False, "reason": "未找到当前席位版本，暂不借位"}
-        inputs = _loads(row["inputs"], {})
-        event = {
-            "at": _now(), "account_id": account_id, "from": donor_id,
-            "candidate_score": round(_num(upgrade.get("borrow_candidate_score")), 2),
-            "limits_before": before, "limits_after": limits,
-            "pool_free_before": int(_num(donor.get("unused_pool_slots"))),
-        }
-        history = list(inputs.get("slot_borrow_events") or [])[-9:]
-        history.append(event)
-        inputs["slot_borrow_events"] = history
-        inputs["last_slot_borrow"] = event
-        conn.execute(
-            "UPDATE paper_position_limit_versions SET limits=?,inputs=?,source=?,effective_at=? WHERE id=?",
-            (_json(limits), _json(inputs), "versioned_runtime_active_risk_budget+pool_slot_borrow", _now(), row["id"]),
-        )
-        return {
-            "allowed": True, "from_account": donor_id, "to_account": account_id,
-            "limits_before": before, "limits_after": limits,
-            "allocation_version": budget.get("allocation_version"),
-            "reason": "从共享池未使用动态席位借用1个席位",
-        }
-    donor_count = sum(
-        1 for item in PPRM.positions_for_cycle(conn, resolved_cycle_id)
-        if item.get("account_id") == donor_id and int(_num(item.get("qty"))) >= LOT_SIZE
-    )
-    if limits[donor_id] - 1 < max(STRATEGY_MIN_POSITIONS, donor_count):
-        return {"allowed": False, "reason": "出让策略已达到最小保留席位"}
+    shared_pool_donor = donor_id == "shared_pool"
     before = dict(limits)
-    limits[donor_id] -= 1
-    limits[account_id] += 1
-    # The schema stores the numeric row id as the allocation version; locate
-    # the active row by the version returned from _dynamic_position_limits.
-    version_text = str(budget.get("allocation_version", "slots-v0"))
-    try:
-        version_id = int(version_text.rsplit("v", 1)[-1])
-    except (TypeError, ValueError):
-        version_id = 0
+    if shared_pool_donor:
+        limits[account_id] += 1
+    else:
+        donor_count = sum(
+            1 for item in PPRM.positions_for_cycle(conn, resolved_cycle_id)
+            if item.get("account_id") == donor_id and int(_num(item.get("qty"))) >= LOT_SIZE
+        )
+        if limits[donor_id] - 1 < max(STRATEGY_MIN_POSITIONS, donor_count):
+            return {"allowed": False, "reason": "出让策略已达到最小保留席位"}
+        limits[donor_id] -= 1
+        limits[account_id] += 1
+    # The schema stores the numeric row id as the allocation version; locate that
+    # row by the token returned from _dynamic_position_limits, scoped to the
+    # explicit cycle so a rollover cannot resolve the same token elsewhere.
     row = conn.execute(
         "SELECT id,inputs FROM paper_position_limit_versions WHERE id=? AND cycle_id=?",
-        (version_id, resolved_cycle_id),
+        (PRep.allocation_version_id(budget.get("allocation_version", "slots-v0")),
+         resolved_cycle_id),
     ).fetchone()
     if row is None:
         return {"allowed": False, "reason": "未找到当前席位版本，暂不借位"}
@@ -10554,19 +10547,27 @@ def _apply_slot_borrow(conn, account_id, upgrade, asof_day, *, cycle_id):
         "candidate_score": round(_num(upgrade.get("borrow_candidate_score")), 2),
         "limits_before": before, "limits_after": limits,
     }
+    if shared_pool_donor:
+        event["pool_free_before"] = int(_num(donor.get("unused_pool_slots")))
     history = list(inputs.get("slot_borrow_events") or [])[-9:]
     history.append(event)
     inputs["slot_borrow_events"] = history
     inputs["last_slot_borrow"] = event
     conn.execute(
         "UPDATE paper_position_limit_versions SET limits=?,inputs=?,source=?,effective_at=? WHERE id=?",
-        (_json(limits), _json(inputs), "versioned_runtime_active_risk_budget+slot_borrow", _now(), row["id"]),
+        (_json(limits), _json(inputs),
+         "versioned_runtime_active_risk_budget"
+         + ("+pool_slot_borrow" if shared_pool_donor else "+slot_borrow"),
+         _now(), row["id"]),
     )
     return {
         "allowed": True, "from_account": donor_id, "to_account": account_id,
         "limits_before": before, "limits_after": limits,
         "allocation_version": budget.get("allocation_version"),
-        "reason": f"高分候选从 {donor_id} 借用1个未使用席位",
+        "reason": (
+            "从共享池未使用动态席位借用1个席位" if shared_pool_donor
+            else f"高分候选从 {donor_id} 借用1个未使用席位"
+        ),
     }
 
 
@@ -10582,13 +10583,9 @@ def _rollback_slot_borrow(conn, borrow, *, cycle_id):
         return {"allowed": False, "reason": "没有可回滚的借位"}
     resolved_cycle_id = int(cycle_id)
     version_text = str(borrow.get("allocation_version") or "slots-v0")
-    try:
-        version_id = int(version_text.rsplit("v", 1)[-1])
-    except (TypeError, ValueError):
-        version_id = 0
     row = conn.execute(
         "SELECT id,limits,inputs FROM paper_position_limit_versions WHERE id=? AND cycle_id=?",
-        (version_id, resolved_cycle_id),
+        (PRep.allocation_version_id(version_text), resolved_cycle_id),
     ).fetchone()
     if row is None:
         return {"allowed": False, "reason": "当前借位版本不存在，无法自动回滚"}

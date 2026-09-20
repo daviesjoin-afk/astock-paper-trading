@@ -797,12 +797,50 @@ class ReplacementIsAsOfAndCycleBound(unittest.TestCase):
         reviews / 持仓数看显式周期，而 target_limit / donors / allocation_version
         看 active cycle —— 同周期借位会被错误拒绝。
         """
+        raw = _source("paper_trading.py")
         for name in ("_slot_upgrade_context", "_apply_slot_borrow"):
             with self.subTest(function=name):
-                raw = _source("paper_trading.py")
-                body = _function_source(ast.parse(raw), name, raw)
-                self.assertIn("_dynamic_position_limits(conn, cycle_id=", body,
-                              f"{name} 没有把显式 cycle 交给席位预算查询")
+                # 调用可能跨行，所以按空白归一化后再匹配调用形状。
+                flat = " ".join(_function_source(ast.parse(raw), name, raw).split())
+                self.assertIn(
+                    "_dynamic_position_limits( conn, cycle_id=resolved_cycle_id",
+                    flat,
+                    f"{name} 没有把显式 cycle 交给席位预算查询")
+        # pending 席位读取只发生在 _slot_upgrade_context：它一旦跨周期，active
+        # cycle 的在途买单就会占掉被请求周期的席位。
+        flat = " ".join(
+            _function_source(ast.parse(raw), "_slot_upgrade_context", raw).split())
+        self.assertIn(
+            "_pending_position_slots(conn, positions, cycle_id=resolved_cycle_id",
+            flat,
+            "_slot_upgrade_context 的 pending 席位仍然跨周期（active cycle 的在途"
+            "买单会占掉被请求周期的席位）")
+
+    def test_guard9n_cluster_evidence_follows_the_claimed_cycle(self):
+        """进入 fingerprint / allocation version 的簇证据也必须周期与 as-of 有界。
+
+        ``_dynamic_position_limits`` 允许 ``cycle_id=None``（= active cycle），但
+        ``_slot_upgrade_context`` / ``_apply_slot_borrow`` 传来的显式周期必须一路走到
+        **簇画像**：持仓走 ``positions_for_cycle``、signal 查询有 as-of 上界、成交序列
+        固定同一周期。否则 cycle 8 的预算行由 cycle 9 的持仓（甚至未来 signal）决定。
+        """
+        raw = _source("paper_trading.py")
+        profiles = _function_source(ast.parse(raw), "_strategy_cluster_profiles", raw)
+        self.assertIn("cycle_id=None", profiles,
+                      "_strategy_cluster_profiles 不再接受显式周期")
+        self.assertIn("PPRM.positions_for_cycle(", profiles,
+                      "簇画像的持仓读取没有固定到显式周期（会重新解析 active cycle）")
+        self.assertIn("intended_date<=?", profiles,
+                      "簇画像的 signal 查询缺少 as-of 上界（future leakage）")
+        self.assertIn("cycle_id=cycle_id", profiles,
+                      "簇画像的成交序列没有继承显式周期")
+        # 预算侧必须继续把已认领周期 / as-of 交给簇画像。
+        limits = " ".join(
+            _function_source(ast.parse(raw), "_dynamic_position_limits", raw).split())
+        self.assertIn("_strategy_cluster_factors( conn, asof_day, account_ids=account_ids,"
+                      " cycle_id=cycle_id,",
+                      limits,
+                      "_dynamic_position_limits 没有把显式周期/as-of 交给簇画像")
 
     # ── 共用断言 ──────────────────────────────────────────────────────────
     def _assert_kwonly_required(self, name, param):

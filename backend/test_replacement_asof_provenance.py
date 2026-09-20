@@ -474,7 +474,7 @@ class ProductionSlotLifecycleProvenance(ProductionCandidateCase):
                         "remaining_after": 3, "unused_pool_slots": 12}],
         }
         with mock.patch.object(PT, "_dynamic_position_limits",
-                                   lambda conn, *, cycle_id=None: dict(budget)):
+                                   lambda conn, *, cycle_id=None, asof_day=None: dict(budget)):
             with PT._db(immediate=True) as conn:
                 result = PT._apply_slot_borrow(
                     conn, ACCOUNT, upgrade, DAY, cycle_id=cycle8)
@@ -538,7 +538,7 @@ class ProductionSlotLifecycleProvenance(ProductionCandidateCase):
                         "remaining_after": 5}],
         }
         with mock.patch.object(PT, "_dynamic_position_limits",
-                                   lambda conn, *, cycle_id=None: dict(budget)):
+                                   lambda conn, *, cycle_id=None, asof_day=None: dict(budget)):
             with PT._db(immediate=True) as conn:
                 result = PT._apply_slot_borrow(
                     conn, ACCOUNT, upgrade, DAY, cycle_id=cycle8)
@@ -590,6 +590,99 @@ class ProductionSlotLifecycleProvenance(ProductionCandidateCase):
             return [dict(row) for row in PT.PPRM.positions_for_cycle(
                 conn, cycle_id, account_id=account_id, asof_day=DAY)]
 
+    def _add_pending_buy(self, *, code, cycle_id, account_id=ACCOUNT,
+                         status="pending_limit"):
+        """一条**可执行**的在途 BUY 委托（占席位），归属显式周期。"""
+        with PT._db(immediate=True) as conn:
+            stamp = PT._strategy_stamp(conn, account_id)
+            conn.execute(
+                "INSERT INTO paper_orders(account_id,side,code,name,qty,planned_price,"
+                "status,reason,risk_payload,origin,created_at,strategy_id,"
+                "strategy_version,strategy_checksum,cycle_id) VALUES(?,'buy',?,?,100,"
+                "10.0,?,'fixture','{}','strategy',?,?,?,?,?)",
+                (account_id, code, f"测试股_{code}", status,
+                 f"{DAY.isoformat()} 10:00:00", *stamp, cycle_id),
+            )
+
+    def test_rpl_p5e_pending_slots_are_read_from_the_explicit_cycle(self):
+        """cycle8 请求 / cycle9 active：cycle8 的 occupied_pool 必须忽略 cycle9 的
+        pending BUY。
+
+        修复前 ``_pending_position_slots()`` 完全没有 ``cycle_id``：请求 cycle 8 的
+        席位比较会把 cycle 9 那 3 个在途买单算进 occupied_pool，于是 shared_pool
+        donor 消失、borrow/upgrade 状态被**另一个周期**的在途委托改写。
+        """
+        cycle8 = self.cycle_id()
+        cycle9 = self._seed_cycle(f"r18-p5e-{cycle8}")
+        for index in range(3):
+            self._add_pending_buy(code=f"6001{index:02d}", cycle_id=cycle9)
+        with PT._db(immediate=True) as conn:
+            conn.execute("UPDATE paper_cycles SET status='closed' WHERE id=?", (cycle8,))
+        self.assertEqual(self.cycle_id(), cycle9, "fixture 没把 active cycle 翻到 9")
+
+        budget = {"pool_limit": 3, "limits": {ACCOUNT: 2, OTHER: 3},
+                  "allocation_version": "slots-v1"}
+        signal = {"code": "600009", "payload": "{}"}
+        with mock.patch.object(
+                PT, "_dynamic_position_limits",
+                lambda conn, *, cycle_id=None, asof_day=None: dict(budget)):
+            with PT._db() as conn:
+                ctx8 = PT._slot_upgrade_context(
+                    conn, ACCOUNT, signal, [], DAY, cycle_id=cycle8)
+                ctx9 = PT._slot_upgrade_context(
+                    conn, ACCOUNT, signal, [], DAY, cycle_id=cycle9)
+
+        donor8 = [item["account_id"] for item in ctx8["donors"]]
+        donor9 = [item["account_id"] for item in ctx9["donors"]]
+        # 非空门禁：这些在途委托确实占席位 —— 请求 cycle 9 时共享池席位被占满。
+        self.assertNotIn("shared_pool", donor9,
+                         f"fixture 的 cycle 9 在途买单没有占席位：{donor9}")
+        self.assertIn("shared_pool", donor8,
+                      f"cycle 8 的 occupied_pool 混进了 cycle 9 的 pending BUY：{donor8}")
+
+    def test_rpl_p5f_cluster_evidence_is_cycle_and_asof_bound(self):
+        """cycle8 请求 / cycle9 active：簇画像证据必须只来自 cycle 8 且截至 asof。
+
+        这是 Blocker 2 的根因链：``_dynamic_position_limits(cycle_id=8)`` 内部经
+        ``_strategy_cluster_factors`` → ``_strategy_cluster_profiles`` 读
+        ``_position_rows()``（重新解析 active cycle 9）并且 signal 查询没有
+        ``intended_date <= day`` 上界 —— 于是 cycle 8 的
+        ``cluster_diversification`` / fingerprint / allocation version 由 cycle 9 的
+        持仓（甚至 asof 之后的 signal）决定。
+        """
+        cycle8 = self.cycle_id()
+        cycle9 = self._seed_cycle(f"r18-p5f-{cycle8}")
+        with PT._db(immediate=True) as conn:
+            conn.execute("UPDATE paper_cycles SET status='closed' WHERE id=?", (cycle8,))
+        self.assertEqual(self.cycle_id(), cycle9, "fixture 没把 active cycle 翻到 9")
+
+        # cycle 9（active）持有 3 只仓位；cycle 8 为空。
+        for index in range(3):
+            self.add_lot(code=f"6002{index:02d}", cycle_id=cycle9)
+        # signal 证据：asof 当天一条（合法），asof 之后一条（未来，必须排除）。
+        self.add_signal(code="600301", intended_date=DAY.isoformat())
+        self.add_signal(code="600302", intended_date=DAY_NEXT.isoformat())
+
+        def profile(cycle_id):
+            with PT._db() as conn:
+                return PT._strategy_cluster_profiles(
+                    conn, DAY, [ACCOUNT], cycle_id=cycle_id)[ACCOUNT]
+
+        live = profile(None)
+        self.assertEqual(
+            {f"6002{index:02d}" for index in range(3)},
+            set(live["positions"]),
+            "current/live 语义仍必须读 active cycle 的持仓（否则 fixture 是空的）")
+
+        requested = profile(cycle8)
+        self.assertEqual(
+            set(), set(requested["positions"]),
+            f"cycle 8 的簇画像混进了 cycle 9 的持仓：{sorted(requested['positions'])}")
+        self.assertIn("600301", requested["signals"],
+                      "asof 当天的 signal 证据被误杀")
+        self.assertNotIn("600302", requested["signals"],
+                         "asof 之后的 signal 被当成簇画像证据（future leakage）")
+
     def test_rpl_p5b_borrow_does_write_its_own_cycle(self):
         """正向对照：显式周期**匹配**时借位必须真的写入（证明上两条不是空门禁）。"""
         cycle8 = self.cycle_id()
@@ -605,7 +698,7 @@ class ProductionSlotLifecycleProvenance(ProductionCandidateCase):
                         "remaining_after": 3, "unused_pool_slots": 12}],
         }
         with mock.patch.object(PT, "_dynamic_position_limits",
-                                   lambda conn, *, cycle_id=None: dict(budget)):
+                                   lambda conn, *, cycle_id=None, asof_day=None: dict(budget)):
             with PT._db(immediate=True) as conn:
                 result = PT._apply_slot_borrow(
                     conn, ACCOUNT, upgrade, DAY, cycle_id=cycle8)
