@@ -78,6 +78,7 @@ import portfolio_coordinator as PCO
 import strategy_champion as SCM
 import strategy_clusters as SC
 import execution_profiles as EPF
+import execution_planner as EP
 import execution_verification as EV
 import paper_sizing as PSZ
 import order_intent as OI
@@ -2786,7 +2787,7 @@ def _order_cycle_id_for_order(conn, order_id):
     return provenance.cycle_id if provenance.is_proven else None
 
 
-def _assert_order_execution_cycle(conn, order_id, *, account_id=None, provenance=None):
+def _assert_order_execution_cycle(conn, order_id, *, account_id=None, provenance=None, allow_out_of_cycle_account=False):
     """**已存在订单**的成交授权闸门：返回可证明的 ``order_cycle_id``，否则抛异常。
 
     这是 execution-cycle invariant 的**唯一**实现（§8：不要把判断抄成三四份）。
@@ -2824,7 +2825,9 @@ def _assert_order_execution_cycle(conn, order_id, *, account_id=None, provenance
 
     account_cycle_id = _account_cycle_id_readonly(conn, account_id)
     active_cycle_id = _active_cycle_id_readonly(conn)
-    if account_cycle_id != order_cycle_id or active_cycle_id != order_cycle_id:
+    # 暂停/归档/退出当前周期的账户仍可清掉旧 lot；仅 SELL 且订单周期 == active cycle 时放行。
+    archived_out_of_cycle = account_cycle_id is None and active_cycle_id == order_cycle_id and (conn.execute("SELECT status FROM paper_accounts WHERE id=?", (account_id,)).fetchone() or [None])[0] in ("paused", "archived")
+    if (account_cycle_id != order_cycle_id and not (allow_out_of_cycle_account and archived_out_of_cycle)) or active_cycle_id != order_cycle_id:
         raise OrderExecutionCycleChanged(
             order_id, order_cycle_id, account_cycle_id, active_cycle_id,
             "订单周期与经济账本/active 周期不一致；旧周期订单已 stale",
@@ -6657,7 +6660,6 @@ def _chase_entry_gate(account, pick, quote, market, entry_model, q, execution_qu
     result = {"allowed": False, "risk_scale": 1.0, "reason": None, "mode": "normal"}
     # 追高通道由执行策略声明（chase_lane），不再按账户 ID 分支：
     # momentum=短线接力，sector_hot=板块热点加速，其余一律不追高。
-    import execution_planner as EP
     policy = EP.policy_for(account_id)
     if policy.chase_lane not in ("momentum", "sector_hot"):
         result["reason"] = policy.chase_rejection
@@ -6755,7 +6757,6 @@ def _chase_entry_gate(account, pick, quote, market, entry_model, q, execution_qu
 
 def _strategy_market_policy(account, pick, quote, market):
     """不同策略使用不同的黄灯缩放；红灯统一停止新开仓。"""
-    import execution_planner as EP
     light = market.get("light") or "unknown"
     account_id = account["id"]
     policy = EP.policy_for(account_id)
@@ -9044,7 +9045,6 @@ def _exceptional_opportunity(account, pick, quote, market, entry_model, q, risk_
 def _buy_order(conn, account, signal, quote, market, news, asof_day, *, all_quotes=None):
     # PR-06：席位预留、追高/加速门限、首仓纪律等差异统一由中央执行计划器的
     # 声明式策略表提供，本函数不再按账户 ID 分支。
-    import execution_planner as EP
     import manual_orders as MO
     _assert_active_lease(conn, "strategy buy")
     # Pause/reset may happen while a scheduled scan is already in progress.
@@ -11744,67 +11744,53 @@ def _monitor_risk_impl(asof_date=None, *, cycle_id):
             fill_price = price * (1 - SLIPPAGE)
             amount = qty * fill_price
             fees = _commission(amount) + amount * STAMP_SELL
+            detail["remaining_qty"] = max(0, int(_num(position.get("qty"))) - qty)
+            detail["position_closed"] = detail["remaining_qty"] < LOT_SIZE
+            if concentration_triggered and not detail["position_closed"]:
+                detail["capacity_state"] = "partial_due_t1"
+                reason += f"；仅卖出可卖底仓，仍有 {detail['remaining_qty']} 股受 T+1 约束，后续继续处理"
+            detail = _with_decision_snapshot(
+                detail, account_id=position["account_id"], code=position["code"], side="sell",
+                decision="filled", reason=reason, asof_date=day, quote=quote, news=news,
+                kline=_completed_kline(position["code"], day, inclusive=False),
+                final_score=quality_review.get("score"),
+            )
             savepoint = f"risk_pos_{position['account_id']}_{position['code']}"
             conn.execute(f"SAVEPOINT {savepoint}")
             try:
-                _assert_active_lease(conn, "risk sell lot")
-                # §8：lot 消耗与卖出委托必须是**同一个** cycle fact。这里解析一次，
-                # 同时传给 FIFO 消耗与 order INSERT，杜绝 split-brain。
+                _assert_active_lease(conn, "risk sell order")
                 sell_cycle_id = _order_cycle_id(conn, cycle_id)
-                consumed, cost_amount = _consume_available_lots(
-                    conn, position["account_id"], position["code"], qty, day,
-                    cycle_id=sell_cycle_id,
-                )
-                if consumed < LOT_SIZE:
-                    _risk_log(conn, position["account_id"], position["code"], "sell", "held_t1", "可卖底仓不足", detail)
-                    conn.execute(f"RELEASE SAVEPOINT {savepoint}")
-                    continue
-                qty = consumed
-                remaining_qty = max(0, int(_num(position.get("qty"))) - qty)
-                position_closed = remaining_qty < LOT_SIZE
-                detail["remaining_qty"] = remaining_qty
-                detail["position_closed"] = position_closed
-                if concentration_triggered and not position_closed:
-                    detail["capacity_state"] = "partial_due_t1"
-                    reason += f"；仅卖出可卖底仓，仍有 {remaining_qty} 股受 T+1 约束，后续继续处理"
-                amount = qty * fill_price
-                fees = _commission(amount) + amount * STAMP_SELL
-                realized_pnl = amount - cost_amount - fees
-                detail = _with_decision_snapshot(
-                    detail, account_id=position["account_id"], code=position["code"],
-                    side="sell", decision="filled", reason=reason, asof_date=day,
-                    quote=quote, news=news,
-                    kline=_completed_kline(position["code"], day, inclusive=False),
-                    final_score=quality_review.get("score"),
-                )
-                _assert_active_lease(conn, "risk sell finalization")
                 strategy_stamp = _strategy_stamp(conn, position["account_id"])
                 cursor = conn.execute(
-                    """INSERT INTO paper_orders(account_id,side,code,name,qty,planned_price,filled_price,amount,fees,status,reason,risk_payload,realized_pnl,created_at,executed_at,strategy_id,strategy_version,strategy_checksum,cycle_id)
-                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                    (position["account_id"], "sell", position["code"], position.get("name"), qty, price, fill_price,
-                     amount, fees, "filled", reason, _json(detail), realized_pnl, _now(), _now(),
+                    """INSERT INTO paper_orders(
+                           account_id,side,code,name,qty,planned_price,status,reason,
+                           risk_payload,created_at,strategy_id,strategy_version,strategy_checksum,cycle_id)
+                       VALUES(?,?,?,?,?,?,'pending_execution',?,?,?,?,?,?,?)""",
+                    (position["account_id"], "sell", position["code"], position.get("name"),
+                     qty, price, reason, _json(detail), _now(),
                      *strategy_stamp, sell_cycle_id),
                 )
-                _credit_shared_cash(conn, amount - fees, position["account_id"])
-                # R14：**所有**生产 SELL 路径共用同一个 episode 收尾原语 ——
-                # finalizer 自己从权威 lots 判定同周期剩余量是否为 0，不从调用方
-                # 局部变量推断。full exit ⇒ 关闭状态；partial ⇒ 推进止盈档位。
-                PPRS.finalize_sell(
-                    conn, cycle_id=sell_cycle_id,
-                    account_id=position["account_id"], code=position["code"],
-                    next_take_stage=next_stage,
+                order_id = int(cursor.lastrowid)
+                EP.commit_fill(
+                    conn,
+                    account=account_map.get(position["account_id"], {"id": position["account_id"]}),
+                    plan={
+                        "side": "sell", "code": position["code"],
+                        "name": position.get("name"), "qty": qty,
+                        "fill_price": fill_price, "amount": amount, "fees": fees,
+                        "quote_at": quote.get("quote_at") or _now(),
+                    },
+                    order_id=order_id,
+                    asof_day=day,
+                    side="sell",
+                    action="filled",
+                    audit_action="sell_filled",
+                    audit_message=f"{position['code']} {qty}股 @ {fill_price:.2f}",
+                    reason=reason,
+                    detail=detail,
+                    assumption="实时价 - 0.10% 滑点，含佣金及印花税",
+                    sell_next_take_stage=next_stage,
                 )
-                conn.execute("INSERT INTO paper_fills(order_id,account_id,side,code,qty,price,amount,fees,fill_date,quote_at,assumption) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-                             (cursor.lastrowid, position["account_id"], "sell", position["code"], qty, fill_price, amount, fees,
-                              day.isoformat(), quote.get("quote_at") or _now(), "实时价 - 0.10% 滑点，含佣金及印花税"))
-                # 风控退出是生产成交路径之一：流水写入后必须盖章，否则这笔真实卖出
-                # 的验证列为 NULL，会被闸门从已实现盈亏 / NAV / 执行绩效里剔除。
-                EV.stamp_order(conn, cursor.lastrowid)
-                _risk_log(conn, position["account_id"], position["code"], "sell", "filled", reason, detail)
-                _audit(conn, position["account_id"], "sell_filled", f"{position['code']} {qty}股 @ {fill_price:.2f}")
-                # 2026-08-28：partial 减仓时仓位仍在，不产生回补观察；
-                # 只有完全退出才记录 recovery watch。
                 if detail.get("protective_exit") and ratio >= 0.999:
                     policy = _recovery_policy(position["account_id"])
                     _audit(conn, position["account_id"], "protective_exit_recovery_watch", _json({
@@ -11856,13 +11842,13 @@ def _monitor_risk_impl(asof_date=None, *, cycle_id):
                 if quality_action == "permission_scope_exit":
                     _audit(
                         conn, position["account_id"], "permission_scope_exit",
-                        f"{position['code']} {permission_reason}；本次卖出 {qty} 股，剩余 {remaining_qty} 股",
+                        f"{position['code']} {permission_reason}；本次卖出 {qty} 股，剩余 {detail['remaining_qty']} 股",
                     )
                 # Reducing an over-cap strategy must lower its stock count.
                 # A score-based rotation may enter a stronger replacement;
                 # capacity compression deliberately releases cash instead.
                 replacement = (
-                    {} if quality_action in {"capacity_exit", "permission_scope_exit"} or not position_closed
+                    {} if quality_action in {"capacity_exit", "permission_scope_exit"} or not detail["position_closed"]
                     else (quality_review.get("replacement") or {})
                 )
                 replacement_code = replacement.get("code")
@@ -11892,8 +11878,8 @@ def _monitor_risk_impl(asof_date=None, *, cycle_id):
                 "code": position["code"], "status": "filled", "qty": qty,
                 "reason": reason, "concentration_rotation": concentration_triggered,
                 "quality_score": quality_review.get("score"),
-                "position_closed": position_closed,
-                "remaining_qty": remaining_qty,
+                "position_closed": detail["position_closed"],
+                "remaining_qty": detail["remaining_qty"],
                 "replacement_buy": detail.get("replacement_buy"),
             })
         _sync_positions(conn, asof_day=day)
@@ -12904,54 +12890,67 @@ def _intraday_sell(conn, account, position, quote, asof_day, profile, cycle, ope
     fill = price * (1 - SLIPPAGE)
     amount = qty * fill
     fees = _commission(amount) + amount * STAMP_SELL
-    # §8：lot 消耗与卖出委托共享同一个 cycle fact（`cycle` 由调用方按当前周期解析）。
-    sell_cycle_id = _order_cycle_id(conn, cycle["id"])
-    consumed, cost_amount = _consume_available_lots(
-        conn, account["id"], position["code"], qty, asof_day, cycle_id=sell_cycle_id,
-    )
-    if consumed < LOT_SIZE:
-        return None, "可卖底仓不足"
-    qty, amount = consumed, consumed * fill
-    fees = _commission(amount) + amount * STAMP_SELL
-    pnl = amount - cost_amount - fees
-    payload = {"kind": "stock_inventory_t", "sell_price": round(fill, 4), "qty": qty,
-               "cost_amount": round(cost_amount, 2), "quote_at": quote.get("quote_at"),
-               "edge_pct": round(edge * 100, 2), "trigger": trigger,
-               "opening_event": bool(opening_event), "opening_assessment": event,
-               "quote_high": _num(quote.get("high")), "quote_low": _num(quote.get("low")),
-               "take_profit_peak_pct": round(peak_pct, 3) if not opening_event else None,
-               "take_profit_retrace_pct": round(retrace_pct, 3) if not opening_event else None,
-               "quote_status": quote_status}
+    payload = {
+        "kind": "stock_inventory_t", "sell_price": round(fill, 4), "qty": qty,
+        "quote_at": quote.get("quote_at"),
+        "edge_pct": round(edge * 100, 2), "trigger": trigger,
+        "opening_event": bool(opening_event), "opening_assessment": event,
+        "quote_high": _num(quote.get("high")), "quote_low": _num(quote.get("low")),
+        "take_profit_peak_pct": round(peak_pct, 3) if not opening_event else None,
+        "take_profit_retrace_pct": round(retrace_pct, 3) if not opening_event else None,
+        "quote_status": quote_status,
+    }
     payload = _with_decision_snapshot(
         payload, account_id=account["id"], code=position["code"], side="sell",
         decision=("opening_event_t_sell" if opening_event else "intraday_t_sell"),
         reason=trigger, asof_date=asof_day, quote=quote,
         kline=_completed_kline(position["code"], asof_day, inclusive=False),
     )
+    # §8：lot 消耗与卖出委托共享同一个 cycle fact（`cycle` 由调用方按当前周期解析）。
     order_reason = "开盘冲高回落减仓：共享事件引擎" if opening_event else "日内做T高抛：仅卖出已结算底仓"
     audit_action = "opening_event_t_sell" if opening_event else "intraday_t_sell"
-    strategy_stamp = _strategy_stamp(conn, account["id"])
-    cursor = conn.execute(
-        """INSERT INTO paper_orders(account_id,side,code,name,qty,planned_price,filled_price,amount,fees,status,reason,risk_payload,realized_pnl,created_at,executed_at,strategy_id,strategy_version,strategy_checksum,cycle_id)
-           VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-        (account["id"], "sell", position["code"], position.get("name"), qty, price, fill, amount, fees,
-         "filled", order_reason, _json(payload), pnl, _now(), _now(), *strategy_stamp, sell_cycle_id),
-    )
-    _credit_shared_cash(conn, amount - fees, account["id"])
-    # R14：高抛同样是生产 SELL 路径。日内高抛没有档位推进事实 ⇒
-    # next_take_stage=None：部分卖保留状态，卖光最后一股权威 lot 时关闭 episode
-    # （available==100 时高抛即整仓清空的真实生产路径）。cycle 用 sell_cycle_id。
-    PPRS.finalize_sell(
-        conn, cycle_id=sell_cycle_id, account_id=account["id"],
-        code=position["code"],
-    )
-    conn.execute("INSERT INTO paper_fills(order_id,account_id,side,code,qty,price,amount,fees,fill_date,quote_at,assumption) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-                 (cursor.lastrowid, account["id"], "sell", position["code"], qty, fill, amount, fees,
-                 _date(asof_day).isoformat(), quote.get("quote_at"), "开盘/5分钟实时快照高抛，含滑点、佣金、印花税"))
-    # 日内做T高抛同样是生产成交路径：流水写入后盖章，否则这笔真实卖出被闸门剔除。
-    EV.stamp_order(conn, cursor.lastrowid)
-    _risk_log(conn, account["id"], position["code"], "sell", audit_action, "开盘事件高抛通过" if opening_event else "日内高抛通过", payload)
-    _audit(conn, account["id"], audit_action, f"{position['code']} {qty}股 @ {fill:.2f}")
+    savepoint = f"intraday_sell_{account['id']}_{position['code']}"
+    conn.execute(f"SAVEPOINT {savepoint}")
+    try:
+        sell_cycle_id = _order_cycle_id(conn, cycle["id"])
+        strategy_stamp = _strategy_stamp(conn, account["id"])
+        cursor = conn.execute(
+            """INSERT INTO paper_orders(
+                   account_id,side,code,name,qty,planned_price,status,reason,
+                   risk_payload,created_at,strategy_id,strategy_version,strategy_checksum,cycle_id)
+               VALUES(?,?,?,?,?,?,'pending_execution',?,?,?,?,?,?,?)""",
+            (account["id"], "sell", position["code"], position.get("name"), qty, price,
+             order_reason, _json(payload), _now(), *strategy_stamp, sell_cycle_id),
+        )
+        order_id = int(cursor.lastrowid)
+        pnl = EP.commit_fill(
+            conn,
+            account=account,
+            plan={
+                "side": "sell", "code": position["code"],
+                "name": position.get("name"), "qty": qty,
+                "fill_price": fill, "amount": amount, "fees": fees,
+                "quote_at": quote.get("quote_at"),
+            },
+            order_id=order_id,
+            asof_day=asof_day,
+            side="sell",
+            action=audit_action,
+            audit_action=audit_action,
+            audit_message=f"{position['code']} {qty}股 @ {fill:.2f}",
+            risk_log_reason="开盘事件高抛通过" if opening_event else "日内高抛通过",
+            reason=order_reason,
+            detail=payload,
+            assumption="开盘/5分钟实时快照高抛，含滑点、佣金、印花税",
+            sell_next_take_stage=None,
+        )
+        conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+    except Exception as exc:
+        conn.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+        conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+        if _lease_lost(exc):
+            raise
+        return None, f"高抛执行失败，可重试：{type(exc).__name__}: {exc}"
     return {
         "order_id": cursor.lastrowid, "side": "sell", "code": position["code"],
         "qty": qty, "pnl": round(pnl, 2), "sell_price": round(fill, 4),
