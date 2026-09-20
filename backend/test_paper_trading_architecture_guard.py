@@ -96,8 +96,8 @@ FORBIDDEN_PAPER_TRADING_DEFS = frozenset({
 #: ``paper_risk_scan_state.py`` 后基线持续向下 ratchet。以后只允许 same or
 #: lower：确有 facade wiring 要加，必须同时抽出别的函数保持不增长。
 #: 不要设计环境变量绕过 / ``skip if CI`` 之类的后门。
-PAPER_TRADING_LOC_BASELINE = 15549
-PAPER_TRADING_DEF_BASELINE = 282
+PAPER_TRADING_LOC_BASELINE = 14840
+PAPER_TRADING_DEF_BASELINE = 280
 
 #: Guard 4 —— 新模块允许出现的 import 根（stdlib）。
 ALLOWED_STDLIB_IMPORTS = frozenset({"__future__", "datetime", "typing", "sqlite3"})
