@@ -1,4 +1,4 @@
-# A-Share Paper Trading & Quantitative Research Engine
+# A-Share Deterministic Paper Trading & Strategy Research Platform
 
 [中文 README](README.md)
 
@@ -21,6 +21,26 @@ The repository is no longer "five fixed strategies". It is a strategy platform:
 Platform capabilities: immutable **strategy versions**, a **lifecycle** state machine, a pinned **RuntimeContext**, **risk compilation** (strategies can only tighten), **dynamic allocation** over a shared capital pool, a central **OrderIntent / Execution Planner**, **T+1-aware execution**, **deterministic replay**, **strategy evolution / Champion-Challenger**, and the browser-based **Strategy Workbench**.
 
 See [strategy platform](docs/STRATEGY_PLATFORM.md), [evolution architecture](docs/EVOLUTION_ARCHITECTURE.md) and [architecture notes](ARCHITECTURE.md).
+
+## v2.0.0: deterministic, auditable, point-in-time-correct platform baseline
+
+**v2.0.0** is a major release covering 126 merged PRs since v1.3.0. The project now treats provenance, historical knowability, execution verification, cycle ownership and deterministic decisions as first-class contracts instead of best-effort metadata.
+
+Highlights:
+
+- **Dynamic strategy platform** — Strategy Registry, immutable versions, declarative DSL, pinned RuntimeContext, Strategy Workbench and StrategyPlugin contracts.
+- **Central execution contracts** — OrderIntent / Execution Planner, N-strategy allocation, risk-based sizing, TTL/staged entry and cross-strategy exposure coordination.
+- **Point-in-time research** — reproducible datasets/evaluation, exact timestamp cutoffs, purged walk-forward validation and replayable candidate traces.
+- **Historical tradability** — fact archive, ingestion audit and append-only observation ledger separating effective time, upstream observation time and local recorded time.
+- **Verified execution** — a stored `filled` status no longer proves a real fill; PnL/NAV/execution metrics consume verified fill evidence.
+- **Authoritative ledger** — `paper_position_lots` is the executable current-position authority; legacy position projections no longer answer “what do we hold now?”.
+- **Cycle/as-of deterministic risk** — position episodes, sell decisions, risk-scan lifecycle, position reviews and replacement/slot-upgrade decisions are bound to explicit cycle/as-of facts.
+- **Security and maintainability** — unified operator write boundary, frontend feature modules, Playwright E2E, DataFeed/StrategyPlugin boundaries and mandatory secret scanning.
+
+The paper schema is now **v21**. Historical provenance that cannot be proven stays `unknown` / `NULL`; v2.0.0 does not fabricate certainty from current state.
+
+See the **[full v2.0.0 release notes](docs/RELEASE-v2.0.0.md)**, [CHANGELOG](CHANGELOG.md) and [GitHub Releases](https://github.com/daviesjoin-afk/astock-paper-trading/releases).
+
 
 ## Six platform semantics you must know
 
