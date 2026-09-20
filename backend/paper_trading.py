@@ -8114,7 +8114,11 @@ def _strategy_cluster_profiles(conn, asof_day=None, account_ids=None, *, cycle_i
         dsl_ast = None
         if conn is not None:
             try:
-                dsl_ast = SRT.get_context(conn, account_id).compiled_dsl
+                if cycle_id is None:
+                    dsl_ast = SRT.get_context(conn, account_id).compiled_dsl
+                else:
+                    dsl_ast = SRE.compiled_dsl_for_cycle(
+                        conn, account_id, cycle_id=cycle_id)
             except (ValueError, sqlite3.Error):
                 dsl_ast = None
         profiles[account_id] = SC.similarity_profile(
@@ -8155,37 +8159,16 @@ def _strategy_cluster_factors(conn, asof_day=None, account_ids=None, *, cycle_id
     return clusters, factors
 
 
-def _strategy_runtimes(account_ids, weights=None, diversification=None, *, conn=None):
-    """把账户权重与声明式配置编译成分配引擎的 StrategyRuntime 列表（PR-07）。
-
-    任意 N 个策略：席位上限、优先级地板与自身敞口约束全部来自数据表
-    （ALLOCATION_*），不在分配代码里比较策略 ID。``diversification`` 是
-    相关.cluster 的分散化系数（PR：1/sqrt(簇规模)），近似策略聚合后拿不到
-    线性叠加的风险额度。
-    """
-    diversification = diversification or {}
-    runtimes = []
-    for account_id in account_ids:
-        weight = _num((weights or {}).get(account_id), 1.0)
-        context_runtime = None
-        if conn is not None:
-            try:
-                context_runtime = SRT.get_context(conn, account_id).allocation_runtime
-            except (ValueError, sqlite3.Error):
-                context_runtime = None
-        runtimes.append(
-            PA.StrategyRuntime(
-                strategy_id=account_id,
-                base_priority=max(weight, 0.01),
-                max_positions=ALLOCATION_SLOT_CAPS.get(account_id, context_runtime.max_positions if context_runtime else STRATEGY_MAX_POSITIONS),
-                priority_floor_pct=ALLOCATION_PRIORITY_FLOOR_PCT.get(account_id),
-                own_exposure_cap_pct=ALLOCATION_OWN_EXPOSURE_CAP_PCT.get(account_id, context_runtime.own_exposure_cap_pct if context_runtime else None),
-                diversification=_num(diversification.get(account_id), 1.0),
-                lifecycle_stage=context_runtime.lifecycle_stage if context_runtime else "standard",
-                capital_scale=context_runtime.capital_scale if context_runtime else None,
-            )
-        )
-    return runtimes
+def _strategy_runtimes(account_ids, weights=None, diversification=None, *, conn=None,
+                      profiles=None, cycle_id=None):
+    """Build allocation runtimes; explicit cycles use pinned version fields."""
+    return SRT.allocation_runtimes(
+        account_ids, weights, diversification, conn=conn, profiles=profiles,
+        cycle_id=cycle_id, slot_caps=ALLOCATION_SLOT_CAPS,
+        priority_floors=ALLOCATION_PRIORITY_FLOOR_PCT,
+        own_exposure_caps=ALLOCATION_OWN_EXPOSURE_CAP_PCT,
+        strategy_max_positions=STRATEGY_MAX_POSITIONS,
+    )
 
 
 def _dynamic_position_limits(conn, *, cycle_id=None, asof_day=None):
@@ -8396,7 +8379,8 @@ def _pool_allocation_inputs(conn, account, nav, positions, quotes, market=None,
     )
     runtimes = _strategy_runtimes(
         list(weights), weights,
-        diversification={key: cluster_factors.get(key, 1.0) for key in weights}, conn=conn,
+        diversification={key: cluster_factors.get(key, 1.0) for key in weights},
+        conn=conn, profiles=profiles, cycle_id=cycle_id,
     )
     return {
         "rows": rows,

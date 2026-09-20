@@ -1082,12 +1082,15 @@ class EntryCapitalPlanningIsBounded(unittest.TestCase):
         helper = self._flat("compiled_profile_for_cycle",
                             "strategy_risk_enforcement.py")
         self.assertIn(
-            "SR.stamp_for_account(conn,str(account_id),cycle_id=int(cycle_id))", helper,
-            "cycle 口径的画像解析没有从周期 pin 表（paper_cycle_strategy_versions）取版本")
-        self.assertIn("checksum=str(checksum)", helper,
-                      "cycle pin 解析没有按 immutable checksum 校验版本")
+            "SR.cycle_version_for_account(conn,str(account_id),cycle_id=int(cycle_id))",
+            helper,
+            "cycle 口径的画像解析没有走 strict cycle version resolver")
+        self.assertNotIn(
+            "SR.stamp_for_account(", helper,
+            "cycle 口径的画像解析又复用了带 legacy/current-head fallback 的 stamp")
         for shape, label in (
             ("paper_strategy_version_heads", "strategy version heads（current head）"),
+            ("paper_strategy_legacy_bindings", "legacy binding"),
             ("get_context(", "strategy_runtime 当前上下文（current head）"),
         ):
             with self.subTest(shape=label):
@@ -1097,6 +1100,62 @@ class EntryCapitalPlanningIsBounded(unittest.TestCase):
         self.assertIn(
             "composite_compiled_profile()", helper,
             "binding 缺失时没有 fail closed 到 Composite（会因 provenance 不可证明而放宽风险）")
+        strict = self._flat("cycle_stamp_for_account", "strategy_registry.py")
+        self.assertIn(
+            "FROMpaper_cycle_strategy_versionsWHEREcycle_id=?ANDaccount_id=?",
+            strict,
+            "strict cycle resolver 没有只读周期 pin 表")
+        for shape in (
+            "paper_strategy_legacy_bindings",
+            "paper_strategy_version_heads",
+            "strategy_definitions",
+        ):
+            with self.subTest(strict_fallback=shape):
+                self.assertNotIn(
+                    shape, strict,
+                    "strict cycle resolver 混入了非周期 pin 的 fallback")
+
+    def test_guard10r_cluster_dsl_uses_cycle_pinned_version(self):
+        """cluster 的结构证据必须与 explicit cycle 的版本 pin 同源（§25）。"""
+        body = self._flat("_strategy_cluster_profiles")
+        self.assertIn(
+            "SRE.compiled_dsl_for_cycle(conn,account_id,cycle_id=cycle_id)", body,
+            "explicit cycle 的 cluster DSL 没有走 cycle-pinned resolver")
+        cycle_branch = body.split(
+            "ifconnisnotNone:try:ifcycle_idisNone:", 1)[1].split("else:", 1)[1].split("except", 1)[0]
+        self.assertNotIn(
+            "SRT.get_context(", cycle_branch,
+            "explicit cycle 的 cluster DSL 又读了 current head")
+        helper = self._flat("compiled_dsl_for_cycle", "strategy_risk_enforcement.py")
+        self.assertIn(
+            "SR.cycle_version_for_account(conn,str(account_id),cycle_id=int(cycle_id))",
+            helper,
+            "cluster DSL 没有复用 strict cycle version resolver")
+        self.assertNotIn("get_context(", helper,
+                         "cluster DSL helper 回退到了 current runtime context")
+
+    def test_guard10s_allocation_runtime_uses_cycle_pinned_fields(self):
+        """allocation runtime 的版本派生字段必须与 explicit cycle 同源（§25）。"""
+        wrapper = self._flat("_strategy_runtimes")
+        self.assertIn("SRT.allocation_runtimes(", wrapper,
+                      "runtime 组装没有下沉到 strategy_runtime")
+        self.assertIn("profiles=profiles", wrapper,
+                      "runtime facade 没有传递 cycle-pinned profiles")
+        self.assertIn("cycle_id=cycle_id", wrapper,
+                      "runtime facade 没有传递 explicit cycle")
+        builder = self._flat("allocation_runtimes", "strategy_runtime.py")
+        self.assertIn("ifpinned:", builder,
+                      "runtime builder 没有区分 explicit cycle provenance")
+        self.assertIn(
+            'compiled_audit.get("max_positions")', builder,
+            "runtime max_positions 没有取 cycle-pinned compiled profile")
+        self.assertIn(
+            '_number(profile.get("max_exposure"))', builder,
+            "runtime own_exposure_cap_pct 没有取 cycle-pinned risk profile")
+        cycle_branch = builder.split("ifpinned:", 1)[1].split("else:", 1)[0]
+        self.assertNotIn(
+            "get_context(", cycle_branch,
+            "explicit cycle runtime 又读了 current strategy context")
 
     # ── 普通 BUY 的 commit 收敛 ────────────────────────────────────────────
     def test_guard10i_normal_buy_order_has_no_direct_ledger_writes(self):

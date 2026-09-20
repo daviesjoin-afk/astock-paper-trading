@@ -598,6 +598,114 @@ class CyclePinnedStrategyVersionIsUsed(_CapitalCase):
             round(float(pinned.get("max_exposure") or 0), 4),
             "cycle-pinned 的 max_exposure 没有生效")
 
+    def test_ec17_missing_cycle_pin_never_falls_back_to_current_head(self):
+        """EC-17 —— explicit cycle 没有 pin 时必须 Composite，不得回退 current head。"""
+        import strategy_registry as SR
+        cycle = self.cycle_id()
+        with PT._db(immediate=True) as conn:
+            SR.ensure_schema(conn)
+            SR.create_user_definition(
+                conn, self.USER, "R19 unpinned", dsl_ast=dict(self.PINNED_RULE),
+                metadata=dict(self.PINNED_CONFIG), actor="r19-test")
+        with PT._db(immediate=True) as conn:
+            conn.execute(
+                "INSERT OR IGNORE INTO paper_accounts(id,name,source_strategy,status,"
+                "initial_cash,cash,cycle_days,max_positions,max_weight,max_exposure,"
+                "version,created_at,updated_at,cycle_id,risk_profile) "
+                "VALUES(?,?,'strategy_dsl','running',0,0,8,3,0.32,0.9,'v0',?,?,?, 'trend')",
+                (self.USER, self.USER, f"{DAY.isoformat()} 00:00:00",
+                 f"{DAY.isoformat()} 00:00:00", int(cycle)),
+            )
+        with PT._db() as conn:
+            pin = conn.execute(
+                "SELECT 1 FROM paper_cycle_strategy_versions WHERE cycle_id=? AND account_id=?",
+                (int(cycle), self.USER)).fetchone()
+            head = PT.SRE.compiled_profile_for(conn, self.USER)
+            resolved = PT.SRE.compiled_profile_for_cycle(conn, self.USER, cycle_id=cycle)
+            account = dict(conn.execute(
+                "SELECT * FROM paper_accounts WHERE id=?", (self.USER,)).fetchone())
+            production = PT._risk_profile(
+                account, asof_day=DAY.isoformat(), conn=conn, cycle_id=cycle)
+        composite = PT.SRE.composite_compiled_profile()
+        self.assertIsNone(pin, "fixture 不应存在 cycle pin")
+        self.assertNotEqual(
+            head.get("template"), composite.get("template"),
+            "fixture 的 current head 与 Composite 无法区分")
+        self.assertEqual(
+            composite.get("template"), resolved.get("template"),
+            "缺 cycle pin 时没有 fail closed 到 Composite，而是回退到了 current head")
+        self.assertEqual(
+            composite.get("max_exposure"), resolved.get("max_exposure"),
+            "缺 cycle pin 时读到了 current head 的帽")
+        audit = production.get("compiled_risk_profile") or {}
+        self.assertEqual(
+            composite.get("template"), audit.get("template"),
+            "生产资金路径缺 pin 时没有 fail closed 到 Composite")
+
+    def test_ec18_cluster_dsl_uses_cycle_pinned_version(self):
+        """EC-18 —— cluster 的结构证据必须取 cycle pin 的 DSL，而不是 current head。"""
+        import strategy_registry as SR
+        cycle = self.cycle_id()
+        pinned_version = self._seed_pinned_cycle(cycle_id=cycle)
+        other = "r19_clone"
+        with PT._db(immediate=True) as conn:
+            SR.ensure_schema(conn)
+            SR.create_user_definition(
+                conn, other, "R19 clone", dsl_ast=dict(self.HEAD_RULE),
+                metadata=dict(self.HEAD_CONFIG), actor="r19-test")
+            SR.bind_cycle_versions(conn, int(cycle), [other])
+        with PT._db() as conn:
+            before = PT._strategy_cluster_profiles(
+                conn, DAY, [self.USER, other], cycle_id=cycle)
+        before_similarity = PT.SC.dsl_ast_similarity(
+            before[self.USER].get("dsl_ast"), before[other].get("dsl_ast"))
+        self.assertLess(
+            before_similarity, PT.SC.DSL_CLONE_THRESHOLD,
+            "fixture 的 v1 与对照策略不应是结构克隆")
+        self._advance_head(expected_version=pinned_version)
+        with PT._db() as conn:
+            after = PT._strategy_cluster_profiles(
+                conn, DAY, [self.USER, other], cycle_id=cycle)
+            clusters, _factors = PT._strategy_cluster_factors(
+                conn, DAY, [self.USER, other], cycle_id=cycle)
+        after_similarity = PT.SC.dsl_ast_similarity(
+            after[self.USER].get("dsl_ast"), after[other].get("dsl_ast"))
+        self.assertLess(
+            after_similarity, PT.SC.DSL_CLONE_THRESHOLD,
+            "cycle 回放的 cluster DSL 吃到了后来 current head 的结构")
+        self.assertNotEqual(
+            PT.SC.cluster_of(self.USER, clusters), PT.SC.cluster_of(other, clusters),
+            "cycle 回放因后来 current head 的 DSL 改变了簇预算")
+
+    def test_ec19_runtime_cap_uses_cycle_pinned_version(self):
+        """EC-19 —— allocation runtime 的版本派生字段必须取 cycle pin。"""
+        cycle = self.cycle_id()
+        pinned_version = self._seed_pinned_cycle(cycle_id=cycle)
+        with PT._db() as conn:
+            account = dict(conn.execute(
+                "SELECT * FROM paper_accounts WHERE id=?", (self.USER,)).fetchone())
+            before = PT._pool_allocation_inputs(
+                conn, account, CAPITAL, [], {}, dict(MARKET), rows=[account],
+                cycle_id=cycle, asof_day=DAY)
+            pinned_runtime = next(
+                item for item in before["runtimes"] if item.strategy_id == self.USER)
+        self._advance_head(expected_version=pinned_version)
+        with PT._db() as conn:
+            account = dict(conn.execute(
+                "SELECT * FROM paper_accounts WHERE id=?", (self.USER,)).fetchone())
+            after = PT._pool_allocation_inputs(
+                conn, account, CAPITAL, [], {}, dict(MARKET), rows=[account],
+                cycle_id=cycle, asof_day=DAY)
+            after_runtime = next(
+                item for item in after["runtimes"] if item.strategy_id == self.USER)
+            head_runtime = PT.SRT.get_context(conn, self.USER).allocation_runtime
+        self.assertNotEqual(
+            pinned_runtime.own_exposure_cap_pct, head_runtime.own_exposure_cap_pct,
+            "fixture 的两个版本敞口帽相同，无法区分 provenance")
+        self.assertEqual(
+            pinned_runtime.own_exposure_cap_pct, after_runtime.own_exposure_cap_pct,
+            "cycle 回放的 allocation runtime 敞口帽被后来 current head 改写")
+
 
 class ForeignReservationIsNeverReleased(unittest.TestCase):
     """EC-14 —— 周期冲突的预占绝不被 release（含手动终态化路径）。"""

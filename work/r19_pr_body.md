@@ -89,11 +89,15 @@ pinned at start-up**, not the current/latest head.
 ```text
 authority:                    paper_cycle_strategy_versions
 resolver:                     SRE.compiled_profile_for_cycle(conn, account_id, cycle_id=)
-  → SR.stamp_for_account(conn, account_id, cycle_id=)
+  → SR.cycle_version_for_account(conn, account_id, cycle_id=)
   → SR.get_version(strategy_id, version, checksum=checksum)
-current head / version heads: NOT the authority on the exact-cycle branch
-missing / invalid binding:     Composite (fail closed), never current head
-as-of earlier than head:       pinned version still applied (no silent un-tightening)
+strict pin lookup:            only paper_cycle_strategy_versions
+legacy / current-head fallback: forbidden on the exact-cycle branch
+cluster DSL:                  exact pinned version → normalized AST; missing pin = unknown
+allocation runtime fields:    pinned max_positions / own_exposure_cap_pct;
+                              current lifecycle permission may stay current
+missing / invalid binding:    risk/runtime fail closed; cluster DSL = None
+as-of earlier than head:      pinned version still applied (no silent un-tightening)
 ```
 
 "current head + `created_at <= asof`" is a *different* contract and does not
@@ -191,7 +195,7 @@ PASS (test_replacement_asof_provenance, test_paper_replacement_decision,
 ## Mutation
 
 ```text
-M-ENT1..M-ENT20:      20/20 CAUGHT
+M-ENT1..M-ENT23:      23/23 CAUGHT
 survived:             0
 non-vacuity:          PASS
 restore bytes:        PASS
@@ -219,14 +223,17 @@ M-ENT17  RED  explicit idle cycle re-injects the caller account
 M-ENT18  RED  compiled profile merged unconditionally (future version rewrites history)
 M-ENT19  RED  terminalizer unconditionally releases a foreign reservation
 M-ENT20  RED  cycle-pinned version lookup falls back to current/latest head
+M-ENT21  RED  strict cycle resolver falls back to stamp_for_account
+M-ENT22  RED  cluster DSL falls back to current runtime context
+M-ENT23  RED  runtime version fields fall back to current strategy context
 ```
 
 ## paper_trading.py
 
 ```text
 before:  16049 / 282
-after:   16048 / 282
-delta:   -1 LOC / 0 defs
+after:   16032 / 282
+delta:   -17 LOC / 0 defs
 ```
 
 The decrease comes from deleting the duplicate reserve/cash/lot/fill/verification
@@ -235,9 +242,9 @@ wiring; the LOC ratchet (Guard 3) passes.
 ## Verification
 
 ```text
-architecture baseline:  PASS (Guard 1..Guard 10q)
+architecture baseline:  PASS (Guard 1..Guard 10s)
 Targeted:               PASS
-  test_entry_capital_asof (EC-1..EC-16)
+  test_entry_capital_asof (EC-1..EC-19)
   test_strategy_buy_commit_convergence (SB-1..SB-16)
   test_paper_capital_reservations
   test_paper_trading_architecture_guard
@@ -267,7 +274,10 @@ Deploy:                 NOT DEPLOYED
 | 1 | Foreign (wrong-cycle) reservation was released by the terminalizer | `_terminalize_cycle_stale_order` skips release when the mismatch is a foreign reservation | EC-14, Guard 10p, M-ENT19 |
 | 2 | Explicit idle cycle silently injected the caller account | both fallback branches are gated on `cycle_id is None` | EC-13, Guard 10n, M-ENT17 |
 | 3 | Compiled risk profile was merged for as-of dates older than the strategy version | `compiled_profile_is_asof_provable` gates the merge | EC-12, Guard 10o, M-ENT18 |
-| 4 | Historical compiled risk profile was resolved from the current head instead of the version the cycle pinned | `SRE.compiled_profile_for_cycle` reads `paper_cycle_strategy_versions` via `SR.stamp_for_account` → `SR.get_version(checksum=…)`; exact-cycle branch never consults current/latest head; missing binding fails closed to Composite; the pinned profile still applies when the head is newer than the as-of date | EC-15, EC-16, Guard 10q, M-ENT20 |
+| 4 | Historical compiled risk profile was resolved from the current head instead of the version the cycle pinned | `SRE.compiled_profile_for_cycle` reads `paper_cycle_strategy_versions` via strict `SR.cycle_version_for_account` → `SR.get_version(checksum=…)`; exact-cycle branch never consults current/latest head; missing binding fails closed to Composite; the pinned profile still applies when the head is newer than the as-of date | EC-15, EC-16, Guard 10q, M-ENT20 |
+| 5 | Strict cycle authority still reused a resolver with legacy/current-head fallback | `SR.cycle_stamp_for_account` / `cycle_version_for_account` only read `paper_cycle_strategy_versions`; no legacy binding or current head fallback | EC-17, Guard 10q, M-ENT21 |
+| 6 | Cluster DSL structural evidence still read the current strategy head | cluster DSL is compiled from the exact cycle-pinned version; missing pin means unknown (`None`), never current DSL | EC-18, Guard 10r, M-ENT22 |
+| 7 | Allocation runtime cap could still read the current strategy head | runtime `max_positions` / `own_exposure_cap_pct` come from cycle-pinned profile/version fields; only current lifecycle permission stays current | EC-19, Guard 10s, M-ENT23 |
 
 ## Authority matrix
 

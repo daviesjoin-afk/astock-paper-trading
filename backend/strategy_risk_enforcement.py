@@ -36,6 +36,7 @@ __all__ = [
     "compiled_profile_for",
     "compiled_profile_for_cycle",
     "compiled_profile_is_asof_provable",
+    "compiled_dsl_for_cycle",
     "effective_spec",
     "tighten_caps",
     "tighten_spec",
@@ -168,17 +169,36 @@ def compiled_profile_for_cycle(conn: sqlite3.Connection, account_id: Any, *,
     try:
         import strategy_registry as SR
 
-        strategy_id, version, checksum = SR.stamp_for_account(
+        record = SR.cycle_version_for_account(
             conn, str(account_id), cycle_id=int(cycle_id))
-        if not strategy_id or version is None or not checksum:
-            return composite_compiled_profile()
-        record = SR.get_version(str(strategy_id), int(version), checksum=str(checksum),
-                                conn=conn)
         if record is None:
             return composite_compiled_profile()
         return _compiled_from_version(record)
     except Exception:
         return composite_compiled_profile()
+
+
+def compiled_dsl_for_cycle(conn: sqlite3.Connection, account_id: Any, *,
+                           cycle_id: Any) -> dict[str, Any] | None:
+    """Return the exact cycle-pinned DSL, or ``None`` when the pin is missing.
+
+    This mirrors :func:`compiled_profile_for_cycle` but is used by cluster
+    evidence, where a missing pin must mean "unknown evidence" rather than
+    falling back to the current strategy head.
+    """
+    try:
+        import strategy_registry as SR
+        from strategy_dsl_schema import normalize
+
+        record = SR.cycle_version_for_account(
+            conn, str(account_id), cycle_id=int(cycle_id))
+        if record is None:
+            return None
+        definition = dict(getattr(record, "definition", None) or {})
+        ast = definition.get("dsl_ast")
+        return normalize(ast) if ast is not None else None
+    except Exception:
+        return None
 
 
 def _compiled_from_version(record: Any) -> dict[str, Any]:
@@ -215,6 +235,7 @@ def tighten_caps(profile: Mapping[str, Any], compiled: Mapping[str, Any]) -> tup
         "template": compiled.get("template"),
         "archetype": compiled.get("archetype"),
         "version": STRATEGY_RISK_ENFORCEMENT_VERSION,
+        "max_positions": _num(compiled.get("max_positions")),
         "tightened": {},
     }
     for key in CAP_MERGE_KEYS:

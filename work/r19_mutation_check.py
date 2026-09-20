@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""R19 负向变异矩阵（M-ENT1 ~ M-ENT16）。
+"""R19 负向变异矩阵（M-ENT1 ~ M-ENT23）。
 
 每条变异都对应一条 R19 契约，必须让**对应**契约测试变红 —— 否则门禁是空的。
 
@@ -35,6 +35,13 @@
     M-ENT14 normal BUY 重新 direct INSERT paper_fills     -> Guard 10i
     M-ENT15 normal BUY 重新 direct _record_lot            -> Guard 10i
     M-ENT16 slice 1 错误把 signal 标 filled               -> SB-14
+    M-ENT17 participants 改回 active cycle                 -> EC-7
+    M-ENT18 adaptive allocation 删除 asof                  -> EC-3
+    M-ENT19 risk profile 删除 cycle_id                     -> Guard 10c
+    M-ENT20 cycle-pinned risk profile 改回 current head    -> EC-15
+    M-ENT21 strict cycle resolver 改回 stamp fallback      -> EC-17
+    M-ENT22 cluster DSL 改回 current runtime context       -> EC-18
+    M-ENT23 runtime version fields 改回 current context    -> EC-19
 
 用法（仓库根目录）::
 
@@ -55,6 +62,8 @@ CAPITAL_MODULE = "test_entry_capital_asof"
 BUY_MODULE = "test_strategy_buy_commit_convergence"
 GUARD_MODULE = "test_paper_trading_architecture_guard"
 PAPER_TRADING_FILE = "backend/paper_trading.py"
+STRATEGY_RUNTIME_FILE = "backend/strategy_runtime.py"
+RISK_ENFORCEMENT_FILE = "backend/strategy_risk_enforcement.py"
 MANUAL_FILE = "backend/manual_orders.py"
 RESERVATION_FILE = "backend/paper_capital_reservations.py"
 PLANNER_FILE = "backend/execution_planner.py"
@@ -350,6 +359,51 @@ MUTATIONS = [
         "test": f"{CAPITAL_MODULE}.CyclePinnedStrategyVersionIsUsed."
                 "test_ec15_cycle_pinned_version_beats_a_later_current_head",
         "desc": "cycle-pinned 版本查询退回 current/latest head",
+    },
+    {
+        "id": "M-ENT21",
+        "file": RISK_ENFORCEMENT_FILE,
+        "old": "        record = SR.cycle_version_for_account(\n"
+               "            conn, str(account_id), cycle_id=int(cycle_id))\n"
+               "        if record is None:\n"
+               "            return composite_compiled_profile()\n"
+               "        return _compiled_from_version(record)\n",
+        "new": "        strategy_id, version, checksum = SR.stamp_for_account(\n"
+               "            conn, str(account_id), cycle_id=int(cycle_id))\n"
+               "        record = SR.get_version(\n"
+               "            str(strategy_id), int(version), checksum=str(checksum), conn=conn)\n"
+               "        if record is None:\n"
+               "            return composite_compiled_profile()\n"
+               "        return _compiled_from_version(record)\n",
+        "test": f"{CAPITAL_MODULE}.CyclePinnedStrategyVersionIsUsed."
+                "test_ec17_missing_cycle_pin_never_falls_back_to_current_head",
+        "desc": "strict cycle resolver 退回 legacy/current-head stamp fallback",
+    },
+    {
+        "id": "M-ENT22",
+        "file": PAPER_TRADING_FILE,
+        "old": "                if cycle_id is None:\n"
+               "                    dsl_ast = SRT.get_context(conn, account_id).compiled_dsl\n"
+               "                else:\n"
+               "                    dsl_ast = SRE.compiled_dsl_for_cycle(\n"
+               "                        conn, account_id, cycle_id=cycle_id)\n",
+        "new": "                dsl_ast = SRT.get_context(conn, account_id).compiled_dsl\n"
+               "                # mutation: current head DSL\n",
+        "test": f"{CAPITAL_MODULE}.CyclePinnedStrategyVersionIsUsed."
+                "test_ec18_cluster_dsl_uses_cycle_pinned_version",
+        "desc": "cluster DSL 退回 current runtime context",
+    },
+    {
+        "id": "M-ENT23",
+        "file": STRATEGY_RUNTIME_FILE,
+        "old": "            profile = (profiles or {}).get(account_id) or {}\n"
+               "            compiled_audit = profile.get(\"compiled_risk_profile\") or {}\n",
+        "new": "            context_runtime = get_context(conn, account_id).allocation_runtime\n"
+               "            profile = {\"max_exposure\": context_runtime.own_exposure_cap_pct}\n"
+               "            compiled_audit = {\"max_positions\": context_runtime.max_positions}\n",
+        "test": f"{CAPITAL_MODULE}.CyclePinnedStrategyVersionIsUsed."
+                "test_ec19_runtime_cap_uses_cycle_pinned_version",
+        "desc": "runtime 版本派生字段退回 current strategy context",
     },
 ]
 
