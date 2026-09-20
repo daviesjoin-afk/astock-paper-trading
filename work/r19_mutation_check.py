@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""R19 负向变异矩阵（M-ENT1 ~ M-ENT23）。
+"""R19 负向变异矩阵（M-ENT1 ~ M-ENT27）。
 
 每条变异都对应一条 R19 契约，必须让**对应**契约测试变红 —— 否则门禁是空的。
 
@@ -42,6 +42,10 @@
     M-ENT21 strict cycle resolver 改回 stamp fallback      -> EC-17
     M-ENT22 cluster DSL 改回 current runtime context       -> EC-18
     M-ENT23 runtime version fields 改回 current context    -> EC-19
+    M-ENT24 dynamic position limits risk profile drops cycle/asof -> EC-20
+    M-ENT25 dynamic position limits runtime drops pinned inputs  -> EC-20
+    M-ENT26 final BUY sizing profile 改回 current                -> EC-21
+    M-ENT27 effective spec 改回 current effective_spec           -> EC-21
 
 用法（仓库根目录）::
 
@@ -404,6 +408,61 @@ MUTATIONS = [
         "test": f"{CAPITAL_MODULE}.CyclePinnedStrategyVersionIsUsed."
                 "test_ec19_runtime_cap_uses_cycle_pinned_version",
         "desc": "runtime 版本派生字段退回 current strategy context",
+    },
+    {
+        "id": "M-ENT24",
+        "file": PAPER_TRADING_FILE,
+        "old": "    profiles = {\n"
+               "        account_id: _risk_profile(\n"
+               "            row_map.get(account_id) or {\"id\": account_id},\n"
+               "            asof_day=asof_day, conn=conn, cycle_id=cycle_id,\n"
+               "        )\n"
+               "        for account_id in account_ids\n"
+               "    }\n",
+        "new": "    profiles = {\n"
+               "        account_id: _risk_profile(row_map.get(account_id) or {\"id\": account_id})\n"
+               "        for account_id in account_ids\n"
+               "    }\n",
+        "test": f"{CAPITAL_MODULE}.DynamicPositionLimitsAreCycleAsOfBound."
+                "test_ec20_dynamic_position_limits_are_cycle_asof_deterministic",
+        "desc": "dynamic position limits 的 risk profile 丢掉 cycle/as-of",
+    },
+    {
+        "id": "M-ENT25",
+        "file": PAPER_TRADING_FILE,
+        "old": "        _strategy_runtimes(\n"
+               "            account_ids, weights, diversification=diversification,\n"
+               "            conn=conn, profiles=profiles, cycle_id=cycle_id,\n"
+               "        ),\n",
+        "new": "        _strategy_runtimes(\n"
+               "            account_ids, weights, diversification=diversification, conn=conn),\n",
+        "test": f"{CAPITAL_MODULE}.DynamicPositionLimitsAreCycleAsOfBound."
+                "test_ec20_dynamic_position_limits_are_cycle_asof_deterministic",
+        "desc": "dynamic position limits 的 runtime 丢掉 pinned profiles/cycle",
+    },
+    {
+        "id": "M-ENT26",
+        "file": PAPER_TRADING_FILE,
+        "old": "    profile = _risk_profile(\n"
+               "        account, asof_day=asof_day, conn=conn, cycle_id=current_cycle[\"id\"])\n"
+               "    code_value = code_values.get(code, 0.0)\n",
+        "new": "    profile = _risk_profile(account, conn=conn)\n"
+               "    code_value = code_values.get(code, 0.0)\n",
+        "test": f"{BUY_MODULE}.FinalSizingUsesCyclePinnedVersion."
+                "test_ec21_final_buy_sizing_uses_cycle_pinned_profile_and_spec",
+        "desc": "final BUY sizing profile 退回 current/latest head",
+    },
+    {
+        "id": "M-ENT27",
+        "file": PAPER_TRADING_FILE,
+        "old": "    eff_spec = SRE.effective_spec_for_cycle(\n"
+               "        conn, account[\"id\"], ACCOUNT_SPECS.get(account[\"id\"]) or {},\n"
+               "        cycle_id=current_cycle[\"id\"],\n"
+               "    )\n",
+        "new": "    eff_spec = SRE.effective_spec(conn, account[\"id\"], ACCOUNT_SPECS.get(account[\"id\"]) or {})\n",
+        "test": f"{BUY_MODULE}.FinalSizingUsesCyclePinnedVersion."
+                "test_ec21_final_buy_sizing_uses_cycle_pinned_profile_and_spec",
+        "desc": "final effective spec 退回 current compiled profile",
     },
 ]
 

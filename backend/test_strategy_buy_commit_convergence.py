@@ -19,6 +19,7 @@
     SB-14 中间片保持 deferred
     SB-15 最后一片标记 filled
     SB-16 执行验证仍然盖章
+    EC-21 final BUY sizing 必须消费 cycle-pinned profile / effective spec
 """
 from __future__ import annotations
 
@@ -160,6 +161,60 @@ class _BuyCase(unittest.TestCase):
                 ).fetchone()[0],
                 "cash": PT._shared_cash(conn),
             }
+
+
+class FinalSizingUsesCyclePinnedVersion(_BuyCase):
+    """EC-21 —— final BUY sizing 不得被后来的 risk/profile version 改写。"""
+
+    def test_ec21_final_buy_sizing_uses_cycle_pinned_profile_and_spec(self):
+        import strategy_registry as SR
+        cycle = self.cycle_id()
+        self.quotes[CODE] = _quote(CODE)
+        signal_id = self.add_signal(signal_date=DAY_PREV.isoformat())
+        with PT._db() as conn:
+            account = dict(conn.execute(
+                "SELECT * FROM paper_accounts WHERE id=?", (ACCOUNT,)).fetchone())
+            pinned_profile = PT._risk_profile(
+                account, asof_day=DAY, conn=conn, cycle_id=cycle)
+            pinned_spec = PT.SRE.effective_spec_for_cycle(
+                conn, ACCOUNT, PT.ACCOUNT_SPECS.get(ACCOUNT) or {}, cycle_id=cycle)
+            current = SR.get_version(ACCOUNT, conn=conn)
+        with PT._db(immediate=True) as conn:
+            SR.save_definition(
+                conn, ACCOUNT,
+                {"metadata": {"style": "momentum", "daily": True, "positions": 3}},
+                expected_version=current.version, actor="r19-test",
+                change_note="ec21 advance current head",
+            )
+        with PT._db() as conn:
+            head_profile = PT.SRE.compiled_profile_for(conn, ACCOUNT)
+            head_spec = PT.SRE.effective_spec(
+                conn, ACCOUNT, PT.ACCOUNT_SPECS.get(ACCOUNT) or {})
+        self.assertNotEqual(
+            pinned_profile.get("max_exposure"), head_profile.get("max_exposure"),
+            "fixture 的 v1/v2 max_exposure 相同，无法区分 provenance")
+        self.assertNotEqual(
+            pinned_spec.get("hard_stop"), head_spec.get("hard_stop"),
+            "fixture 的 v1/v2 hard_stop 相同，无法区分 provenance")
+        captured = {}
+
+        def spy(*args, **kwargs):
+            captured["hard_stop"] = args[6]
+            captured["profile"] = args[7]
+            return 0, {"qty": 0, "reason": "ec21_capture"}
+
+        with mock.patch.object(PT, "_price_aware_qty", side_effect=spy):
+            result, _order = self.run_buy(signal_id=signal_id)
+        self.assertIn(
+            "profile", captured,
+            f"_buy_order 没有到达 final sizing（fixture 未覆盖目标路径）：{result}")
+        self.assertEqual(
+            pinned_profile.get("max_exposure"),
+            captured["profile"].get("max_exposure"),
+            "final sizing profile 吃到了后来 current head 的风险画像")
+        self.assertEqual(
+            pinned_spec.get("hard_stop"), captured["hard_stop"],
+            "final sizing hard_stop 吃到了后来 current head 的 effective spec")
 
 
 class NormalBuyConvergence(_BuyCase):

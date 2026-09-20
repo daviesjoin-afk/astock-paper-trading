@@ -76,6 +76,10 @@ cluster cycle:                              PASS
 cluster as-of:                              PASS
 strategy_pool_budget explicit cycle/asof:   PASS
 allocation_plan explicit cycle/asof:        PASS
+dynamic position limits cycle/asof:         PASS
+dynamic position limits pinned runtime:     PASS
+final BUY sizing profile cycle/asof:        PASS
+final effective spec cycle-pinned:          PASS
 intraday buyback explicit cycle/asof:       PASS
 swing scale-in explicit cycle/asof:         PASS
 ```
@@ -96,6 +100,8 @@ legacy / current-head fallback: forbidden on the exact-cycle branch
 cluster DSL:                  exact pinned version → normalized AST; missing pin = unknown
 allocation runtime fields:    pinned max_positions / own_exposure_cap_pct;
                               current lifecycle permission may stay current
+final sizing profile:         _risk_profile(..., asof_day=, cycle_id=)
+final effective spec:         SRE.effective_spec_for_cycle(..., cycle_id=)
 missing / invalid binding:    risk/runtime fail closed; cluster DSL = None
 as-of earlier than head:      pinned version still applied (no silent un-tightening)
 ```
@@ -195,7 +201,7 @@ PASS (test_replacement_asof_provenance, test_paper_replacement_decision,
 ## Mutation
 
 ```text
-M-ENT1..M-ENT23:      23/23 CAUGHT
+M-ENT1..M-ENT27:      27/27 CAUGHT
 survived:             0
 non-vacuity:          PASS
 restore bytes:        PASS
@@ -226,14 +232,18 @@ M-ENT20  RED  cycle-pinned version lookup falls back to current/latest head
 M-ENT21  RED  strict cycle resolver falls back to stamp_for_account
 M-ENT22  RED  cluster DSL falls back to current runtime context
 M-ENT23  RED  runtime version fields fall back to current strategy context
+M-ENT24  RED  dynamic position limits risk profile drops cycle/as-of
+M-ENT25  RED  dynamic position limits runtime drops pinned inputs
+M-ENT26  RED  final BUY sizing profile falls back to current head
+M-ENT27  RED  final effective spec falls back to current compiled profile
 ```
 
 ## paper_trading.py
 
 ```text
 before:  16049 / 282
-after:   16032 / 282
-delta:   -17 LOC / 0 defs
+after:   16046 / 282
+delta:   -3 LOC / 0 defs
 ```
 
 The decrease comes from deleting the duplicate reserve/cash/lot/fill/verification
@@ -242,10 +252,10 @@ wiring; the LOC ratchet (Guard 3) passes.
 ## Verification
 
 ```text
-architecture baseline:  PASS (Guard 1..Guard 10s)
+architecture baseline:  PASS (Guard 1..Guard 10u)
 Targeted:               PASS
-  test_entry_capital_asof (EC-1..EC-19)
-  test_strategy_buy_commit_convergence (SB-1..SB-16)
+  test_entry_capital_asof (EC-1..EC-20)
+  test_strategy_buy_commit_convergence (SB-1..SB-16 + EC-21)
   test_paper_capital_reservations
   test_paper_trading_architecture_guard
   test_deferred_fill_cycle_binding
@@ -278,6 +288,9 @@ Deploy:                 NOT DEPLOYED
 | 5 | Strict cycle authority still reused a resolver with legacy/current-head fallback | `SR.cycle_stamp_for_account` / `cycle_version_for_account` only read `paper_cycle_strategy_versions`; no legacy binding or current head fallback | EC-17, Guard 10q, M-ENT21 |
 | 6 | Cluster DSL structural evidence still read the current strategy head | cluster DSL is compiled from the exact cycle-pinned version; missing pin means unknown (`None`), never current DSL | EC-18, Guard 10r, M-ENT22 |
 | 7 | Allocation runtime cap could still read the current strategy head | runtime `max_positions` / `own_exposure_cap_pct` come from cycle-pinned profile/version fields; only current lifecycle permission stays current | EC-19, Guard 10s, M-ENT23 |
+| 8 | Dynamic position/seat budget ignored `asof_day` / `cycle_id` and re-read current runtime context | `_dynamic_position_limits` passes `asof_day` / `conn` / `cycle_id` into `_risk_profile` and `profiles` / `cycle_id` into `_strategy_runtimes`; explicit idle cycle no longer injects builtins | EC-20, EC-20b, Guard 10t, M-ENT24, M-ENT25 |
+| 9 | Final BUY sizing profile still read current adaptive/current strategy state | `_buy_order` uses `_risk_profile(..., asof_day=asof_day, cycle_id=current_cycle["id"])` | EC-21, Guard 10u, M-ENT26 |
+| 10 | Final effective spec still read current compiled profile | `SRE.effective_spec_for_cycle` uses `compiled_profile_for_cycle`; `_buy_order` uses that helper | EC-21, Guard 10u, M-ENT27 |
 
 ## Authority matrix
 

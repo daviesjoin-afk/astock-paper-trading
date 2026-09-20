@@ -14,6 +14,7 @@
     EC-8  allocation_plan 与 strategy_pool_budget 消费同一份有界事实
     EC-9  intraday buyback 的预算带 (cycle, as-of)
     EC-10 swing scale-in 的预算带 (cycle, as-of)
+    EC-20 dynamic position limits 的 (cycle, as-of, pinned version)
 
 **概念区分**（规格 §29/§101）：participants / adaptive overlays / cluster 是
 **有界证据**；仍在 ``reserved`` 的共享现金是**全局经济义务**，故意不受周期
@@ -461,6 +462,85 @@ class ExplicitEmptyCycleHasNoCapital(_CapitalCase):
             [], list(inputs["rows"]),
             "显式 idle 周期把调用方账户注入成参与者：零策略周期凭空有了资金表达")
         self.assertEqual({}, inputs["weights"], "idle 周期产生了策略权重")
+
+
+class DynamicPositionLimitsAreCycleAsOfBound(_CapitalCase):
+    """EC-20 —— seat budget 也必须消费同一个 (cycle, as-of, pinned version)。"""
+
+    def test_ec20_dynamic_position_limits_are_cycle_asof_deterministic(self):
+        import strategy_registry as SR
+        cycle = self.cycle_id()
+        with PT._db() as conn:
+            before = PT._dynamic_position_limits(conn, cycle_id=cycle, asof_day=DAY)
+            current = SR.get_version(ACCOUNT, conn=conn)
+        self.assertIn(ACCOUNT, before["weights"], "fixture 没有生成 seat-budget 权重")
+        # 清掉 baseline 缓存行，确保 after 调用真正走 runtime 组装路径。
+        with PT._db(immediate=True) as conn:
+            conn.execute(
+                "DELETE FROM paper_position_limit_versions WHERE cycle_id=?",
+                (cycle,))
+        # 未来 adaptive risk：历史 as-of 回放不得看见它。
+        self.set_account_params(
+            ACCOUNT, adaptive_risk={"max_exposure": 0.30},
+            adaptive_risk_meta={
+                "status": "active", "effective_date": DAY_NEXT.isoformat(),
+            })
+        # current head 前进到不同风险模板；cycle pin 仍应停在 v1。
+        with PT._db(immediate=True) as conn:
+            SR.save_definition(
+                conn, ACCOUNT,
+                {"metadata": {"style": "trend", "hold": 8, "daily": True, "positions": 3}},
+                expected_version=current.version, actor="r19-test",
+                change_note="ec20 advance current head",
+            )
+        captured = {}
+        original_runtimes = PT._strategy_runtimes
+
+        def spy(*args, **kwargs):
+            captured["profiles"] = kwargs.get("profiles")
+            captured["cycle_id"] = kwargs.get("cycle_id")
+            return original_runtimes(*args, **kwargs)
+
+        with PT._db() as conn:
+            with mock.patch.object(PT, "_strategy_runtimes", side_effect=spy):
+                after = PT._dynamic_position_limits(conn, cycle_id=cycle, asof_day=DAY)
+            head_runtime = PT.SRT.get_context(conn, ACCOUNT).allocation_runtime
+        self.assertNotEqual(
+            before["weights"].get(ACCOUNT), 0.30,
+            "fixture 的未来 adaptive risk 没有形成可区分状态")
+        self.assertNotEqual(
+            before["weights"].get(ACCOUNT), head_runtime.own_exposure_cap_pct,
+            "fixture 的 current head 与 pinned runtime 帽相同，无法区分 provenance")
+        self.assertEqual(
+            cycle, captured.get("cycle_id"),
+            "seat-budget runtime 没有收到 explicit cycle")
+        self.assertIn(
+            ACCOUNT, captured.get("profiles") or {},
+            "seat-budget runtime 没有收到 pinned profiles")
+        self.assertEqual(
+            before["pool_limit"], after["pool_limit"],
+            "seat-budget pool_limit 被未来 adaptive risk / current head 改写")
+        self.assertEqual(
+            before["limits"], after["limits"],
+            "seat-budget limits 被未来 adaptive risk / current head 改写")
+        self.assertEqual(
+            before["weights"], after["weights"],
+            "seat-budget weights 被未来 adaptive risk / current head 改写")
+
+
+    def test_ec20b_explicit_idle_cycle_does_not_reinject_builtins(self):
+        """EC-20b —— explicit idle cycle 的 seat budget 也必须保持空。"""
+        idle = self.new_cycle(f"r19-ec20b-{self.cycle_id()}")
+        with PT._db(immediate=True) as conn:
+            conn.execute(
+                "UPDATE paper_cycles SET enabled_strategies=? WHERE id=?",
+                ("[]", idle))
+        with PT._db() as conn:
+            result = PT._dynamic_position_limits(
+                conn, cycle_id=idle, asof_day=DAY)
+        self.assertEqual({}, result["limits"], "idle cycle 注入了 builtin 席位")
+        self.assertEqual({}, result["weights"], "idle cycle 注入了 builtin 权重")
+        self.assertEqual(0, result["pool_limit"], "idle cycle 产生了非零 pool_limit")
 
 
 class CyclePinnedStrategyVersionIsUsed(_CapitalCase):

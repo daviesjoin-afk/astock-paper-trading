@@ -8103,7 +8103,8 @@ def _strategy_cluster_profiles(conn, asof_day=None, account_ids=None, *, cycle_i
     current/live 语义（冷启动分配、面板解释）。
     """
     day = _date(asof_day)
-    wanted = [str(item) for item in (account_ids or list(ACCOUNT_SPECS))]
+    wanted = [str(item) for item in (
+        list(ACCOUNT_SPECS) if account_ids is None else account_ids)]
     if cycle_id is None:
         positions = _position_rows(conn, asof_day=day)
     else:
@@ -8185,17 +8186,23 @@ def _dynamic_position_limits(conn, *, cycle_id=None, asof_day=None):
     → 借位 → 回滚**这条在途下单链必须传已认领周期与 as-of：否则账号行 / 版本行看
     显式周期，而簇画像的持仓与成交证据仍来自 active cycle（甚至 as-of 之后）。
     """
-    cycle_id = int(cycle_id) if cycle_id is not None else int(_active_cycle(conn)["id"])
+    explicit_cycle = cycle_id is not None
+    cycle_id = int(cycle_id) if explicit_cycle else int(_active_cycle(conn)["id"])
+    explicit_empty_cycle = (
+        explicit_cycle and PCY.explicit_empty_cycle(conn, cycle_id))
     hard_pool_cap = int(RSET.get(conn, "shared_pool_position_limit", SHARED_POOL_MAX_POSITIONS))
     all_rows = _shared_account_rows(conn, cycle_id)
     running_rows = [row for row in all_rows if row.get("status") == "running"]
     rows = running_rows or all_rows
     account_ids = [key for key in ACCOUNT_SPECS if any(row.get("id") == key for row in rows)]
-    if not account_ids:
+    if not account_ids and not explicit_empty_cycle:
         account_ids = list(ACCOUNT_SPECS)
     row_map = {row.get("id"): row for row in rows}
     profiles = {
-        account_id: _risk_profile(row_map.get(account_id) or {"id": account_id})
+        account_id: _risk_profile(
+            row_map.get(account_id) or {"id": account_id},
+            asof_day=asof_day, conn=conn, cycle_id=cycle_id,
+        )
         for account_id in account_ids
     }
     # 相关.cluster（PR）：按信号/持仓/行业重合归簇，簇内策略乘以
@@ -8252,7 +8259,10 @@ def _dynamic_position_limits(conn, *, cycle_id=None, asof_day=None):
     count = len(account_ids)
     baseline = sum(weights.values()) / max(count, 1)
     allocation = PA.position_limits(
-        _strategy_runtimes(account_ids, weights, diversification=diversification, conn=conn),
+        _strategy_runtimes(
+            account_ids, weights, diversification=diversification,
+            conn=conn, profiles=profiles, cycle_id=cycle_id,
+        ),
         hard_pool_cap=hard_pool_cap,
         strategy_max_positions=STRATEGY_MAX_POSITIONS,
         strategy_min_positions=STRATEGY_MIN_POSITIONS,
@@ -9450,7 +9460,8 @@ def _buy_order(conn, account, signal, quote, market, news, asof_day, *, all_quot
     risk["account_risk"] = risk_state
     if risk_state["blocked"]:
         reasons.extend(risk_state["reasons"])
-    profile = _risk_profile(account, conn=conn)
+    profile = _risk_profile(
+        account, asof_day=asof_day, conn=conn, cycle_id=current_cycle["id"])
     code_value = code_values.get(code, 0.0)
     # 组合口径（PR：cross-strategy exposure）：单票占用必须包含**所有策略**
     # 的在途买单，否则两个策略同时买入同一标的会各自只看到已成交部分，
@@ -9501,7 +9512,10 @@ def _buy_order(conn, account, signal, quote, market, news, asof_day, *, all_quot
     exposure_cap = RSET.get(conn, "shared_pool_exposure_cap", SHARED_POOL_MAX_EXPOSURE)
     single_position_max_amount = RSET.get(conn, "single_position_max_amount", 0.0)
     # PR-30：生效执行参数 = ACCOUNT_SPECS × 编译画像（止损/移动止损/持仓/加仓取更紧）。
-    eff_spec = SRE.effective_spec(conn, account["id"], ACCOUNT_SPECS.get(account["id"]) or {})
+    eff_spec = SRE.effective_spec_for_cycle(
+        conn, account["id"], ACCOUNT_SPECS.get(account["id"]) or {},
+        cycle_id=current_cycle["id"],
+    )
     risk["effective_spec"] = {
         key: eff_spec.get(key)
         for key in ("hard_stop", "trail_after", "trail_stop", "hold_max", "max_positions", "max_pyramiding")

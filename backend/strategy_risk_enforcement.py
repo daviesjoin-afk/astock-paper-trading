@@ -38,6 +38,7 @@ __all__ = [
     "compiled_profile_is_asof_provable",
     "compiled_dsl_for_cycle",
     "effective_spec",
+    "effective_spec_for_cycle",
     "tighten_caps",
     "tighten_spec",
 ]
@@ -298,3 +299,17 @@ def tighten_spec(spec: Mapping[str, Any], compiled: Mapping[str, Any]) -> dict[s
 def effective_spec(conn: sqlite3.Connection, account_id: Any, base_spec: Mapping[str, Any]) -> dict[str, Any]:
     """ACCOUNT_SPECS × 编译画像 → 生效执行参数（生产站点直接调用）。"""
     return tighten_spec(base_spec, compiled_profile_for(conn, account_id))
+
+
+def effective_spec_for_cycle(
+    conn: sqlite3.Connection,
+    account_id: Any,
+    base_spec: Mapping[str, Any],
+    *,
+    cycle_id: Any,
+) -> dict[str, Any]:
+    """ACCOUNT_SPECS × **cycle-pinned** 编译画像 → 历史生效执行参数。"""
+    return tighten_spec(
+        base_spec,
+        compiled_profile_for_cycle(conn, account_id, cycle_id=cycle_id),
+    )

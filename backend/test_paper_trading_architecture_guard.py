@@ -999,7 +999,20 @@ class EntryCapitalPlanningIsBounded(unittest.TestCase):
             for call in calls:
                 with self.subTest(function=name, call=call):
                     index = body.index(call)
-                    window = body[index:index + 400]
+                    open_at = body.index("(", index)
+                    depth = 0
+                    end = None
+                    for offset in range(open_at, len(body)):
+                        if body[offset] == "(":
+                            depth += 1
+                        elif body[offset] == ")":
+                            depth -= 1
+                            if depth == 0:
+                                end = offset + 1
+                                break
+                    self.assertIsNotNone(
+                        end, f"{name} 的 {call} 调用括号不完整，门禁无法验证")
+                    window = body[index:end]
                     self.assertIn("cycle_id=", window,
                                   f"{name} 的 {call} 调用没有显式传 cycle_id")
                     self.assertIn("asof_day=asof_day", window,
@@ -1156,6 +1169,56 @@ class EntryCapitalPlanningIsBounded(unittest.TestCase):
         self.assertNotIn(
             "get_context(", cycle_branch,
             "explicit cycle runtime 又读了 current strategy context")
+
+    def test_guard10t_dynamic_position_limits_are_cycle_asof_bound(self):
+        """seat budget 也必须消费 explicit cycle + as-of + pinned runtime。"""
+        body = self._flat("_dynamic_position_limits")
+        self.assertIn("explicit_cycle=cycle_idisnotNone", body,
+                      "seat budget 没有保存 explicit cycle 语义")
+        self.assertIn(
+            '_risk_profile(row_map.get(account_id)or{"id":account_id}', body,
+            "seat-budget risk profile 没有按账户行解析")
+        self.assertIn(
+            "asof_day=asof_day,conn=conn,cycle_id=cycle_id", body,
+            "seat-budget risk profile 漏传 as-of / cycle / conn")
+        self.assertIn(
+            "_strategy_runtimes(account_ids,weights,diversification=diversification", body,
+            "seat-budget runtime 没有走统一组装")
+        self.assertIn(
+            "conn=conn,profiles=profiles,cycle_id=cycle_id", body,
+            "seat-budget runtime 没有启用 pinned profiles/cycle")
+        self.assertIn(
+            "explicit_empty_cycle=(explicit_cycleand"
+            "PCY.explicit_empty_cycle(conn,cycle_id))", body,
+            "seat budget 没有区分 explicit empty cycle 与 legacy 缺字段")
+        self.assertIn("ifnotaccount_idsandnotexplicit_empty_cycle:", body,
+                      "explicit idle cycle 会重新注入全部 builtin")
+        clusters = self._flat("_strategy_cluster_profiles")
+        self.assertIn(
+            "wanted=[str(item)foritemin(list(ACCOUNT_SPECS)ifaccount_idsisNoneelseaccount_ids)]",
+            clusters,
+            "显式空 account_ids 被 cluster helper 当成默认全量策略")
+
+    def test_guard10u_final_buy_sizing_uses_cycle_pinned_version(self):
+        """final sizing profile / effective spec 必须与 cycle pin 同源。"""
+        body = self._flat("_buy_order")
+        self.assertIn(
+            '_risk_profile(account,asof_day=asof_day,conn=conn', body,
+            "final sizing profile 漏传 as-of / cycle")
+        self.assertIn(
+            'cycle_id=current_cycle["id"]', body,
+            "final sizing 没有绑定 current cycle")
+        self.assertIn(
+            'SRE.effective_spec_for_cycle(conn,account["id"]', body,
+            "final effective spec 仍走 current/latest 编译画像")
+        self.assertIn(
+            'ACCOUNT_SPECS.get(account["id"])or{}', body,
+            "final effective spec 没有传 base spec")
+        helper = self._flat("effective_spec_for_cycle", "strategy_risk_enforcement.py")
+        self.assertIn("compiled_profile_for_cycle(conn,account_id,cycle_id=cycle_id)", helper,
+                      "effective_spec_for_cycle 没有消费 strict cycle profile")
+        self.assertNotIn("compiled_profile_for(conn,account_id)", helper,
+                         "effective_spec_for_cycle 回退 current/latest profile")
 
     # ── 普通 BUY 的 commit 收敛 ────────────────────────────────────────────
     def test_guard10i_normal_buy_order_has_no_direct_ledger_writes(self):
