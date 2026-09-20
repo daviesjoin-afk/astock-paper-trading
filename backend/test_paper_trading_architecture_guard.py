@@ -842,6 +842,29 @@ class ReplacementIsAsOfAndCycleBound(unittest.TestCase):
                       limits,
                       "_dynamic_position_limits 没有把显式周期/as-of 交给簇画像")
 
+    def test_guard9o_buy_order_capacity_reads_use_the_proven_cycle(self):
+        """开仓主路径 ``_buy_order`` 的容量读取也必须钉在已认领周期与 as-of 上。
+
+        这条路径与 ``_slot_upgrade_context`` 是两处独立的 wiring：``_buy_order``
+        已经解析过 ``current_cycle``（并据此拒绝了非本周期账户），因此它的
+        pending 席位读取与 allocation 预算都不能再回到"现在 active 的是谁"或
+        "机器今天"。漏了 pending 的 cycle ⇒ 上一个周期的在途单占掉本周期席位；
+        漏了预算的 as-of ⇒ 历史 as-of 下借位前后的版本号不一致。
+        """
+        raw = _source("paper_trading.py")
+        body = " ".join(
+            _function_source(ast.parse(raw), "_buy_order", raw).split())
+        self.assertIn(
+            "_pending_position_slots(conn, positions, cycle_id=current_cycle[\"id\"])",
+            body,
+            "_buy_order 的 pending 席位读取没有固定到已认领周期")
+        # 初次预算与借位后的 re-read 都必须是同一组 facts（cycle + as-of）。
+        # 归一化空白后按出现次数断言，避免依赖换行位置。
+        self.assertEqual(
+            2, body.count("cycle_id=current_cycle[\"id\"], asof_day=asof_day"),
+            "_buy_order 里带 (cycle, as-of) 的预算读取不是两次"
+            "（初次预算或借位后 re-read 漏传了 provenance）")
+
     # ── 共用断言 ──────────────────────────────────────────────────────────
     def _assert_kwonly_required(self, name, param):
         tree = ast.parse(_source("paper_trading.py"))

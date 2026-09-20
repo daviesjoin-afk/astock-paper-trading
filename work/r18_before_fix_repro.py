@@ -9,6 +9,8 @@
     R18-C4  slot context 重新解析 active cycle（读到别的周期）
     R18-C5  在途 pending BUY 席位跨周期（cycle 9 的买单占掉 cycle 8 的席位）
     R18-C6  簇画像 signal 证据没有 as-of 上界（future leakage）
+    R18-C7  _buy_order 的 pending 席位跨周期（真实开仓主路径）
+    R18-C8  _buy_order 的预算漏传 as-of（借位前后版本不一致）
 
 用法（仓库根目录）::
 
@@ -399,6 +401,135 @@ def case_c6():
         r.teardown()
 
 
+# ─── R18-C7 / C8：真实 _buy_order 主路径的周期与 as-of 连续性 ───────────────
+_ALL_ACCOUNTS = ("tq_breakout", "trend_pullback", "sector_rotation",
+                 "reported_profit_breakout", "main_force_top10")
+_MARKET = {"light": "green", "overseas": {"light": "green", "advice": "x"},
+           "breadth": 0.5, "sentiment": "neutral"}
+
+
+class BuyOrderRepro(Repro):
+    """在 Repro 之上加：真实 _buy_order 驱动 + 周期翻转。
+
+    ``add_signal`` / ``add_lot`` / ``add_review`` / ``add_pending_buy`` 全部复用
+    基类；这里只补"翻转 active cycle"和"驱动真实 _buy_order"。
+    """
+
+    def activate(self, key):
+        requested = self.cycle_id()
+        with PT._db() as conn:
+            enabled = conn.execute(
+                "SELECT enabled_strategies FROM paper_cycles WHERE id=?",
+                (requested,)).fetchone()["enabled_strategies"]
+        with PT._db(immediate=True) as conn:
+            conn.execute("UPDATE paper_cycles SET status='closed' WHERE id=?", (requested,))
+        with PT._db(immediate=True) as conn:
+            cur = conn.execute(
+                "INSERT INTO paper_cycles(cycle_key,status,capital,risk_profile,started_at,"
+                "created_at,updated_at,enabled_strategies) VALUES(?,'running',1000000.0,"
+                "'balanced',?,?,?,?)",
+                (key, f"{DAY.isoformat()} 00:00:00", f"{DAY.isoformat()} 00:00:00",
+                 f"{DAY.isoformat()} 00:00:00", enabled))
+            active = int(cur.lastrowid)
+        with PT._db(immediate=True) as conn:
+            conn.executemany(
+                "UPDATE paper_accounts SET cycle_id=?, status='running' WHERE id=?",
+                [(active, account_id) for account_id in _ALL_ACCOUNTS])
+        return requested, active
+
+    def run_buy_order(self, signal_id, code, account_id="tq_breakout"):
+        with PT._db() as conn:
+            signal = dict(conn.execute("SELECT * FROM paper_signals WHERE id=?",
+                                       (signal_id,)).fetchone())
+        self.quotes[code] = {
+            "code": code, "name": f"测试股_{code}", "price": 10.0, "high": 10.1,
+            "low": 9.9, "pct": 0.0, "amount": 100000.0, "volume": 10000.0,
+            "turnover": 1.0, "quote_source": "live",
+            "quote_at": f"{DAY.isoformat()} 14:50:00",
+            "quote_validation": "cross_source_checked",
+        }
+        with PT._db(immediate=True) as conn:
+            result = PT._buy_order(
+                conn, {"id": account_id}, signal, self.quotes[code],
+                dict(_MARKET), [], DAY, all_quotes=dict(self.quotes))
+        with PT._db() as conn:
+            order = conn.execute(
+                "SELECT risk_payload FROM paper_orders WHERE signal_id=? ORDER BY id DESC LIMIT 1",
+                (signal_id,)).fetchone()
+        payload = PT._loads(order["risk_payload"], {}) if order is not None else {}
+        return result, payload
+
+    def sync(self):
+        with PT._db(immediate=True) as conn:
+            PT._sync_positions(conn, asof_day=DAY)
+
+
+def case_c7():
+    """真实 _buy_order 把上一个周期的在途买单算进本周期承诺席位。"""
+    r = BuyOrderRepro()
+    r.setup()
+    try:
+        requested, active = r.activate("r18-c7-requested")
+        for index in range(3):
+            r.add_pending_buy(account_id="tq_breakout", code=f"6001{index:02d}",
+                              cycle_id=requested)
+        sig = r.add_signal(account_id="tq_breakout", code="600900",
+                           intended_date=DAY.isoformat(), signal_date=DAY_PREV.isoformat())
+        _result, payload = r.run_buy_order(sig, "600900")
+        gate = payload.get("position_count_gate") or {}
+        leaked = bool(gate.get("committed")) or bool(gate.get("pool_current"))
+        return (not leaked), (
+            f"requested cycle={requested} active={active} cycle{requested}_pending_buys=3 "
+            f"gate.committed={gate.get('committed')} gate.pool_current={gate.get('pool_current')} "
+            f"(expected 0/0: 上一个周期的在途单不属于本周期)"
+        )
+    finally:
+        r.teardown()
+
+
+def case_c8():
+    """真实 _buy_order 的预算漏传 as-of：借位写进另一个版本行。"""
+    r = BuyOrderRepro()
+    r.setup()
+    try:
+        _requested, active = r.activate("r18-c8-requested")
+        codes = ["600001", "600002", "600003"]
+        for code in codes:
+            r.add_lot(account_id="tq_breakout", code=code, cycle_id=active)
+            r.add_lot(account_id="sector_rotation", code=code, cycle_id=active)
+            r.add_review(account_id="tq_breakout", code=code, review_date=DAY.isoformat(),
+                         score=20.0, cycle_id=active)
+        r.sync()
+        only_today = (dt.date.today() - dt.timedelta(days=5)).isoformat()
+        r.add_signal(account_id="tq_breakout", code="600888", intended_date=only_today)
+        r.add_signal(account_id="sector_rotation", code="600888", intended_date=only_today)
+
+        with PT._db() as conn:
+            bounded = PT._dynamic_position_limits(conn, cycle_id=active, asof_day=DAY)
+        with PT._db() as conn:
+            unbounded = PT._dynamic_position_limits(conn, cycle_id=active)
+        sig = r.add_signal(account_id="tq_breakout", code="600901",
+                           intended_date=DAY.isoformat(), signal_date=DAY_PREV.isoformat(),
+                           entry_score=90.0, t_score=90.0, rank_score=90.0)
+        _result, payload = r.run_buy_order(sig, "600901")
+        gate = payload.get("position_count_gate") or {}
+        borrow = payload.get("slot_borrow") or {}
+        mismatched = bool(borrow.get("allowed")) and (
+            borrow.get("allocation_version") != gate.get("allocation_version")
+            or borrow.get("limits_after", {}).get("tq_breakout") != gate.get("limit")
+        )
+        return (not mismatched), (
+            f"active={active} bounded(asof=D)={bounded['allocation_version']} "
+            f"unbounded={unbounded['allocation_version']} "
+            f"borrow.version={borrow.get('allocation_version')} "
+            f"gate.version={gate.get('allocation_version')} gate.limit={gate.get('limit')} "
+            f"borrow.limits_after.tq={borrow.get('limits_after', {}).get('tq_breakout')} "
+            f"(expected 借位前后同一版本行)"
+        )
+    finally:
+        r.teardown()
+
+
 def main() -> int:
     print(f"repo root: {ROOT}")
     print(f"HEAD      : {os.popen('git rev-parse --short=12 HEAD').read().strip()}")
@@ -410,6 +541,8 @@ def main() -> int:
         ("R18-C4 slot context re-resolves active cycle", case_c4),
         ("R18-C5 pending BUY slots cross the cycle boundary", case_c5),
         ("R18-C6 cluster signal evidence has no as-of bound", case_c6),
+        ("R18-C7 _buy_order pending slots cross the cycle boundary", case_c7),
+        ("R18-C8 _buy_order budget loses the as-of (borrow version drift)", case_c8),
     ]
     results = []
     for name, fn in cases:

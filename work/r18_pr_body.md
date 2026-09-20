@@ -2,6 +2,107 @@
 
 `MERGE: NOT MERGED` · `DEPLOY: NOT DEPLOYED`
 
+## Review follow-up (round 4)
+
+A third human review of head `7056c9f` confirmed both round-3 blockers as fixed, then
+traced further back along the **real `_buy_order` main path** and found **two more
+wiring leaks of the same kind** — same helper, same principle, but the open-path
+copies had not been fenced.
+
+### Blocker 1 — `_buy_order` still read pending BUYs across the cycle
+
+Round 3 fixed `_slot_upgrade_context`, but the real entry path still had:
+
+```python
+pending_slots = _pending_position_slots(conn, positions)
+```
+
+even though `_buy_order` had already resolved and validated `current_cycle`
+(`current_account["cycle_id"] != current_cycle["id"]` rejects there). `_buy_order`
+is the single gate shared by **both** production entries:
+
+```text
+opening scan      → _buy_order
+risk rotation     → _rotation_buy_candidate → _buy_order
+```
+
+So with cycle 8 holding executable pending BUYs and cycle 9 active, cycle 9's own
+opening would count cycle 8's orders into:
+
+```text
+committed_open_codes
+pool_open_positions
+entry_deployment
+strategy_count_blocked
+pool_count_blocked
+```
+
+and could wrongly defer/reject a legitimate new BUY. Fixed:
+
+```python
+pending_slots = _pending_position_slots(conn, positions, cycle_id=current_cycle["id"])
+```
+
+New production regression **RPL-P5g** drives the **real `_buy_order`** (cycle 8 closed
+with 3 executable pending BUYs, cycle 9 active and clean) and asserts
+`position_count_gate.committed == 0` and `pool_current == 0`, with a non-vacuity
+assertion that the cycle-8 orders *do* occupy seats when read with `cycle_id=8`.
+Mutation **M-RPL18** removes the filter and P5g goes RED.
+
+### Blocker 2 — borrow-time budget was not one set of (cycle, as-of) facts
+
+`_slot_upgrade_context` and `_apply_slot_borrow` were correct after round 3, but
+`_buy_order`'s own two budget reads were not:
+
+```python
+count_budget = _dynamic_position_limits(conn)                                # initial
+count_budget = _dynamic_position_limits(conn, cycle_id=current_cycle["id"])  # post-borrow
+```
+
+Neither passed `asof_day`. Because the cluster fingerprint now depends on the as-of
+(round 3), the same cycle resolves to **different** allocation versions under
+"as-of D" and "machine today". Two real failures follow:
+
+* initial budget loses the as-of ⇒ it uses today's tighter limit, decides the seats
+  are full, and needlessly triggers a borrow that shaves a donor's seat;
+* post-borrow re-read loses the as-of ⇒ the just-borrowed seat disappears and
+  `strategy_count_blocked` flips back to true.
+
+The in-code comment already claimed "Re-read the same allocation version" — that was
+not guaranteed. Both sites now carry the full provenance:
+
+```python
+count_budget = _dynamic_position_limits(conn, cycle_id=current_cycle["id"], asof_day=asof_day)
+```
+
+so the whole chain is one set of facts:
+
+```text
+current_cycle.id + asof_day
+        ↓
+initial count budget
+        ↓
+slot upgrade
+        ↓
+slot borrow
+        ↓
+post-borrow budget re-read
+```
+
+New production regressions, both driving the real `_buy_order` on a fixture where the
+two as-ofs provably resolve different versions (asserted as a non-vacuity precondition):
+
+* **RPL-P5h** — borrow succeeds on version A and the post-borrow re-read must return
+  that same version **and** observe the borrowed seat;
+* **RPL-P5i** — with the same fixture, the initial budget must use the as-of-bounded
+  limit, so a cycle that still has room must **not** enter `_slot_upgrade_context` /
+  `_apply_slot_borrow` at all.
+
+Mutations **M-RPL19** (initial budget) and **M-RPL20** (post-borrow re-read) each drop
+`asof_day` and turn the matching regression RED.
+
+Guard **9o** statically pins all three call shapes in `_buy_order`.
+
 ## Review follow-up (round 3)
 
 A second human review of head `f7fb858` found **two remaining cycle-fencing
@@ -164,8 +265,10 @@ active signals whose `intended_date` equals the explicit `asof_day` and whose
 Slot-upgrade/borrow/rollback use one explicit `cycle_id`, and **every** evidence
 read behind that decision — holding reviews, position counts, pending BUY seat
 occupancy, and the allocation budget's cluster profiles / return series — is
-fenced to the same explicit cycle and as-of. Holding review evidence is read only
-from that cycle at `review_date <= asof_day`.
+fenced to the same explicit cycle and as-of. The **real open path `_buy_order`
+applies the same rule to its own capacity reads**, so neither another cycle's
+pending orders nor another as-of's fingerprint can influence a new BUY. Holding
+review evidence is read only from that cycle at `review_date <= asof_day`.
 
 Final replacement BUY execution still goes through the existing `_buy_order`
 gate; this PR does not duplicate or weaken execution checks.
@@ -228,6 +331,10 @@ Slot-upgrade review evidence must be bounded by
 Once a helper accepts an explicit cycle_id, every position / order / budget
 evidence read inside it that affects the decision must be bounded by that
 same cycle (and as-of) — it must not fall back to the current active cycle.
+
+The real open path _buy_order obeys the same rule for its own capacity reads:
+pending BUY occupancy and the allocation budget (initial and post-borrow) are
+resolved from the cycle and as-of it already proved.
 ```
 
 The first two are **equality / upper bound**, not a range and not "take the
@@ -281,9 +388,31 @@ R18-C6 ...: NOT REPRODUCED   asof=2026-09-10 signals=['600301'] leaked_future=[]
 SUMMARY: 0/6 reproduced on this tree
 ```
 
-C5/C6 (added in round 3) reproduce on the unmodified base `f979a166` (6/6 there)
-and were also confirmed on the previously reviewed head `f7fb858`; both are
-**NOT REPRODUCED** after this round's fix. C1–C4 remain 0/4 as before.
+```text
+R18-C7 _buy_order pending slots cross the cycle boundary: REPRODUCED
+    actual : requested cycle=1 active=2 cycle1_pending_buys=3 gate.committed=3 gate.pool_current=3 (expected 0/0: 上一个周期的在途单不属于本周期)
+
+R18-C8 _buy_order budget loses the as-of (borrow version drift): REPRODUCED
+    actual : active=2 bounded(asof=D)=slots-v1 unbounded=slots-v2 borrow.version=slots-v1 gate.version=slots-v2 gate.limit=2 borrow.limits_after.tq=4 (expected 借位前后同一版本行)
+
+SUMMARY: 2/8 reproduced on this tree
+```
+
+C1–C4 were verified on the unmodified base `f979a166` (4/4 there), C5/C6 on the
+reviewed head `f7fb858`, and C7/C8 on the reviewed head `7056c9f`. All eight are
+**NOT REPRODUCED** on this head. Each case was added in the round that found its
+defect, so none of them could be written to fit an already-fixed tree.
+
+C8's original evidence on `7056c9f` is the clearest form of the round-4 budget bug:
+
+```text
+bounded(asof=D)=slots-v1  unbounded=slots-v2
+borrow.version=slots-v1   gate.version=slots-v2   gate.limit=2   borrow.limits_after.tq=4
+```
+
+The borrow wrote version `slots-v1` and granted `tq_breakout` a 4th seat, but the
+post-borrow re-read resolved `slots-v2` and reported `limit=2` — the borrowed seat
+vanished before the gate could use it.
 
 ## New module: `backend/paper_replacement_evidence.py`
 
@@ -391,6 +520,11 @@ Merging them into one "unified score" would silently change both semantics.
   `intended_date <= day`, and pass the same cycle / as-of to
   `_strategy_return_series` (which itself now bounds `executed_at` and filters
   `cycle_id`).
+- **Round 4** — `_buy_order`'s own capacity reads now carry the cycle and as-of it
+  already proved: `_pending_position_slots(conn, positions,
+  cycle_id=current_cycle["id"])`, and `_dynamic_position_limits(conn,
+  cycle_id=current_cycle["id"], asof_day=asof_day)` at **both** the initial budget
+  and the post-borrow re-read.
 - **Removed** `_replacement_score_from_signal` with **no** compatibility wrapper;
   production calls `PRep.score_candidate` directly.
 - Deliberately **not** changed: `_rotation_buy_candidate` still delegates to the
@@ -401,8 +535,8 @@ Size ratchet per §104:
 
 ```text
 Before: 16134 / 283
-After:  16046 / 282
-Delta:  -88 / -1
+After:  16049 / 282
+Delta:  -85 / -1
 ```
 
 ## Authority matrix
@@ -431,7 +565,7 @@ Compatibility position projection: paper_positions
   drift cannot slip through. Also asserts the policy defaults equal the
   production constants, that the adapter and the pure module agree on the score,
   and the module's zero-project-import / zero-I/O / zero-clock boundary.
-- **`backend/test_replacement_asof_provenance.py` (NEW, 30 tests)** — evidence
+- **`backend/test_replacement_asof_provenance.py` (NEW, 33 tests)** — evidence
   contract **RP2-01 … RP2-11** (same-day candidate loaded; tomorrow candidate
   excluded; **legal overnight plan still allowed**; future `signal_date` excluded
   even when `intended_date == D`; past intended_date excluded; status filter;
@@ -454,6 +588,16 @@ Compatibility position projection: paper_positions
   (with a non-vacuity sub-assertion that cycle 9 *does* see them), and
   **P5f** cycle 8's cluster profile contains neither cycle 9's positions nor an
   as-of-after signal, while `cycle_id=None` still reads the active cycle.
+- **`backend/test_replacement_asof_provenance.py` — `ProductionBuyOrderCycleFence`**
+  drives the **real `_buy_order`** (not a helper) for the round-4 blockers:
+  **P5g** cycle 8's three executable pending BUYs must not populate cycle 9's
+  `position_count_gate.committed` / `pool_current` (with a non-vacuity assertion
+  that they *are* counted under `cycle_id=cycle8`); **P5h** the post-borrow re-read
+  must return the borrow's own allocation version and observe the borrowed seat;
+  **P5i** the initial budget must honour the as-of, so a cycle that still has room
+  must not enter the borrow path at all. P5h/P5i share a fixture that first
+  **asserts** the two as-ofs resolve different allocation versions, so neither can
+  pass vacuously.
 - **`backend/test_paper_slot_occupancy.py`** — facade signature now pins the
   keyword-only `cycle_id`, plus a test that an explicit cycle is forwarded into
   `paper_slot_occupancy.pending_position_slots` while `None` stays `None`.
@@ -468,12 +612,13 @@ Compatibility position projection: paper_positions
   regains the next-day range, 9l the adapter uses the evidence layer and the pure
   module, 9m the slot chain passes the explicit cycle into the budget lookup and
   into the pending-slot read, 9n the cluster evidence follows the claimed cycle /
-  as-of. Baseline ratcheted **down** to 16049 / 282 and the file now sits at
-  16046.
+  as-of, 9o `_buy_order`'s real capacity reads (pending slots + both budget reads)
+  carry the proven cycle and as-of. Baseline ratcheted **down** to 16049 / 282 and
+  the file stays at 16049.
 
 ## Non-vacuity (mutation check)
 
-`work/r18_mutation_check.py` injects **17 byte-level mutations** into real
+`work/r18_mutation_check.py` injects **20 byte-level mutations** into real
 production sources and requires the *specific* contract test to fail with
 `FAIL:`/`ERROR:` on that exact method, so an import/collection error cannot
 masquerade as a catch. Every file is restored byte-identically and verified by
@@ -481,7 +626,7 @@ sha256 in a `finally` block, with a fresh `PYTHONPYCACHEPREFIX` per run so a
 same-length mutation in the same second cannot reuse stale bytecode.
 
 ```text
-RESULT: 17/17 mutations RED, all files restored byte-identical
+RESULT: 20/20 mutations RED, all files restored byte-identical
 ```
 
 | ID | Mutation | Caught by |
@@ -503,26 +648,30 @@ RESULT: 17/17 mutations RED, all files restored byte-identical
 | M-RPL15 | seat budget reverted to the active cycle | RPL-P5d |
 | M-RPL16 | pending-slot read loses the `cycle_id` filter | RPL-P5e |
 | M-RPL17 | cluster positions back to `_position_rows()` | RPL-P5f |
+| M-RPL18 | `_buy_order` pending-slot read loses the filter | RPL-P5g |
+| M-RPL19 | `_buy_order` initial budget loses the as-of | RPL-P5i |
+| M-RPL20 | post-borrow re-read loses the as-of | RPL-P5h |
 
 **M-RPL1 and M-RPL14 are the core business mutations**, not signature checks:
 restoring the next-day window — either inside the evidence layer or by shifting
 the adapter's `asof` — makes the tomorrow-candidate production regression go RED.
 **M-RPL3** proves the historical leakage bound: removing `review_date <= asof`
-makes the future-review regression go RED. **M-RPL16 / M-RPL17** prove the two
-round-3 blockers are actually fenced rather than merely untested.
+makes the future-review regression go RED. **M-RPL16 … M-RPL20** prove the
+round-3 and round-4 blockers are actually fenced rather than merely untested,
+and each was confirmed non-vacuous by first observing it as `SUSPECT` and then
+strengthening the fixture until the mutation was genuinely caught.
 
 ## Verification (local)
 
 | Check | Result |
 |---|---|
-| `test_paper_replacement_decision` + `test_replacement_asof_provenance` (new modules) | 73 tests OK |
-| `unittest backend.test_paper_trading_architecture_guard` | 46 tests OK |
-| targeted set (7 modules incl. slot occupancy / position review) | 240 tests OK |
-| entry / slot / cycle regression set (11 modules) | 244 tests OK |
-| strategy + golden replay set (6 modules) | 99 tests OK |
-| `unittest discover -s backend` | **3723 tests OK** (skipped=5) |
-| `work/r18_before_fix_repro.py` | base 6/6 REPRODUCED → fixed 0/6 |
-| `work/r18_mutation_check.py` | 17/17 RED, restore byte-identical |
+| `test_paper_replacement_decision` + `test_replacement_asof_provenance` (new modules) | 76 tests OK |
+| `unittest backend.test_paper_trading_architecture_guard` | 47 tests OK |
+| targeted set (9 modules incl. golden replay) | 263 tests OK |
+| `unittest discover -s backend` | **3727 tests OK** (skipped=5) |
+| `work/r18_before_fix_repro.py` | 0/8 on this head (C1–C4 4/4 on base, C5/C6 2/2 on `f7fb858`, C7/C8 2/2 on `7056c9f`) |
+| `work/r18_mutation_check.py` | 20/20 RED, restore byte-identical |
+| `paper_trading.py` size | 16049 LOC / 282 defs (ratchet same-or-lower) |
 | `ruff check backend` | All checks passed |
 | `python -m compileall -q backend` | exit 0 |
 | `scripts/security/scan-sensitive-data.py --scope worktree` | kinds: none / values: 0 |

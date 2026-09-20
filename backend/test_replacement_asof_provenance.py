@@ -52,6 +52,13 @@ DAY = dt.date(2026, 9, 10)
 DAY_NEXT = dt.date(2026, 9, 11)
 DAY_PREV = dt.date(2026, 9, 9)
 STATUSES = ("pending", "deferred_capacity")
+#: 真实 ``_buy_order`` 需要 ``light``（市场灯）与 ``overseas``（跳空/竞价闸门）。
+MARKET = {
+    "light": "green",
+    "overseas": {"light": "green", "advice": "fixture"},
+    "breadth": 0.5,
+    "sentiment": "neutral",
+}
 
 
 class _EvidenceCase(unittest.TestCase):
@@ -707,6 +714,231 @@ class ProductionSlotLifecycleProvenance(ProductionCandidateCase):
         self.assertEqual(PT._loads(after["limits"], {})["tq_breakout"], 3)
         inputs = PT._loads(after["inputs"], {})
         self.assertTrue(inputs.get("slot_borrow_events"))
+
+
+class ProductionBuyOrderCycleFence(ProductionCandidateCase):
+    """RPL-P5g / RPL-P5h —— 真实 ``_buy_order`` 主路径的周期与 as-of 连续性。
+
+    前面几条 P5* 都只驱动 ``_slot_upgrade_context`` / ``_apply_slot_borrow``
+    这些 helper。开仓主路径 ``_buy_order`` 自己也有两处容量读取：
+    pending 席位与 allocation 预算。它们同样必须钉在
+    ``current_cycle["id"]`` + 本次 ``asof_day`` 上。
+    """
+
+    ALL_ACCOUNTS = (
+        ACCOUNT, "trend_pullback", OTHER, "reported_profit_breakout",
+        "main_force_top10",
+    )
+
+    def _seed_cycle(self, key, enabled_strategies):
+        with PT._db(immediate=True) as conn:
+            cur = conn.execute(
+                "INSERT INTO paper_cycles(cycle_key,status,capital,risk_profile,started_at,"
+                "created_at,updated_at,enabled_strategies) VALUES(?,'running',1000000.0,"
+                "'balanced',?,?,?,?)",
+                (key, f"{DAY.isoformat()} 00:00:00", f"{DAY.isoformat()} 00:00:00",
+                 f"{DAY.isoformat()} 00:00:00", enabled_strategies))
+            return int(cur.lastrowid)
+
+    def _activate(self, key):
+        """把 active cycle 翻到新建的周期，并把五个账户全部挂上去。"""
+        requested = self.cycle_id()
+        with PT._db() as conn:
+            enabled = conn.execute(
+                "SELECT enabled_strategies FROM paper_cycles WHERE id=?",
+                (requested,)).fetchone()["enabled_strategies"]
+        with PT._db(immediate=True) as conn:
+            conn.execute("UPDATE paper_cycles SET status='closed' WHERE id=?", (requested,))
+        active = self._seed_cycle(key, enabled)
+        with PT._db(immediate=True) as conn:
+            conn.executemany(
+                "UPDATE paper_accounts SET cycle_id=?, status='running' WHERE id=?",
+                [(active, account_id) for account_id in self.ALL_ACCOUNTS])
+        self.assertEqual(self.cycle_id(), active, "fixture 没把 active cycle 翻过去")
+        return requested, active
+
+    def _add_pending_buy(self, *, code, cycle_id, account_id=ACCOUNT,
+                         status="pending_limit"):
+        with PT._db(immediate=True) as conn:
+            stamp = PT._strategy_stamp(conn, account_id)
+            conn.execute(
+                "INSERT INTO paper_orders(account_id,side,code,name,qty,planned_price,"
+                "status,reason,risk_payload,origin,created_at,strategy_id,"
+                "strategy_version,strategy_checksum,cycle_id) VALUES(?,'buy',?,?,100,"
+                "10.0,?,'fixture','{}','strategy',?,?,?,?,?)",
+                (account_id, code, f"测试股_{code}", status,
+                 f"{DAY.isoformat()} 10:00:00", *stamp, cycle_id),
+            )
+
+    def _add_lot(self, *, code, cycle_id, account_id=ACCOUNT):
+        with PT._db(immediate=True) as conn:
+            stamp = PT._strategy_stamp(conn, account_id)
+            order_id = conn.execute(
+                "INSERT INTO paper_orders(account_id,side,code,name,qty,planned_price,"
+                "filled_price,amount,fees,status,reason,risk_payload,created_at,executed_at,"
+                "order_type,origin,strategy_id,strategy_version,strategy_checksum,cycle_id,"
+                "execution_verified,execution_status) VALUES(?,'buy',?,?,100,10.0,10.0,1000.0,"
+                "5.0,'filled','seed_buy','{}',?,?,'market','seed',?,?,?,?,1,'verified')",
+                (account_id, code, f"测试股_{code}", "2026-08-20 09:30:00",
+                 "2026-08-20 09:30:00", *stamp, cycle_id)).lastrowid
+            conn.execute(
+                "INSERT INTO paper_position_lots(cycle_id,account_id,code,name,industry,qty,"
+                "remaining_qty,cost,acquired_at,available_date,asset_type,cost_fee_included,"
+                "is_t_base,source_order_id) VALUES(?,?,?,?,?,100,100,10.0,?,?,'stock_t1',1,1,?)",
+                (cycle_id, account_id, code, f"测试股_{code}", "Tech",
+                 "2026-08-20 10:00:00", "2026-08-21", order_id),
+            )
+
+    def _add_review(self, *, code, cycle_id, score=20.0, account_id=ACCOUNT):
+        with PT._db(immediate=True) as conn:
+            conn.execute(
+                "INSERT INTO paper_position_reviews(cycle_id,account_id,code,review_date,"
+                "score,grade,action,market_value,position_pct,reasons,detail,created_at) "
+                "VALUES(?,?,?,?,?,'观察','hold',1000.0,1.0,'fixture','{}',?)",
+                (cycle_id, account_id, code, DAY.isoformat(), score,
+                 f"{DAY.isoformat()} 14:50:00"),
+            )
+
+    def _run_buy_order(self, *, signal_id, code):
+        """驱动**真实** ``_buy_order``，返回 (结果, 落库的 risk_payload)。"""
+        self.set_quote(code)
+        with PT._db() as conn:
+            signal = dict(conn.execute(
+                "SELECT * FROM paper_signals WHERE id=?", (signal_id,)).fetchone())
+        with PT._db(immediate=True) as conn:
+            result = PT._buy_order(
+                conn, {"id": ACCOUNT}, signal, self.quotes[code], dict(MARKET), [], DAY,
+                all_quotes=dict(self.quotes),
+            )
+        with PT._db() as conn:
+            order = conn.execute(
+                "SELECT risk_payload FROM paper_orders WHERE signal_id=? ORDER BY id DESC LIMIT 1",
+                (signal_id,)).fetchone()
+        payload = PT._loads(order["risk_payload"], {}) if order is not None else {}
+        return result, payload
+
+    def test_rpl_p5g_buy_order_pending_slots_are_cycle_bound(self):
+        """cycle8 的 3 个在途 BUY 不得占掉 cycle9 的席位（真实 ``_buy_order``）。
+
+        修复前 ``_buy_order`` 虽然已经拿到 ``current_cycle``，却仍调用
+        ``_pending_position_slots(conn, positions)``：更新的 active cycle 在正常开仓
+        时会把**上一个周期**的在途买单算进 ``committed_open_codes`` /
+        ``pool_open_positions``，把一次合法开仓错误 defer/reject。
+        """
+        requested, active = self._activate("r18-p5g-requested")
+        for index in range(3):
+            self._add_pending_buy(code=f"6001{index:02d}", cycle_id=requested)
+        signal_id = self.add_signal(code="600900", intended_date=DAY.isoformat(),
+                                    signal_date=DAY_PREV.isoformat())
+        _result, payload = self._run_buy_order(signal_id=signal_id, code="600900")
+        gate = payload["position_count_gate"]
+        self.assertEqual(active, self.cycle_id())
+        # 非空门禁：这 3 张单**确实**占席位 —— 请求 cycle8 时必须看得到。
+        with PT._db() as conn:
+            occupied = PT._pending_position_slots(conn, [], cycle_id=requested)
+        self.assertEqual(3, len(occupied), "fixture 的 cycle 8 在途买单没有占席位")
+        self.assertEqual(
+            0, gate["committed"],
+            f"cycle 9 的开仓把 cycle 8 的在途买单算进了承诺席位：{gate}")
+        self.assertEqual(
+            0, gate["pool_current"],
+            f"cycle 9 的开仓把 cycle 8 的在途买单算进了共享池席位：{gate}")
+
+    def _seed_asof_split_fixture(self, *, lots):
+        """建一个让 (cycle, as-of) 解析出**不同**席位版本的 fixture。
+
+        A/B 两策略持有完全相同的 ``lots`` 支股票（position/industry jaccard = 1.0），
+        并共享一条 ``intended_date`` 只落在"机器今天"窗口内的 signal ⇒ 有界与无界
+        as-of 的簇证据不同，fingerprint / allocation version 必然分叉。返回
+        ``(active, bounded, unbounded)``。
+        """
+        _requested, active = self._activate(f"r18-asof-split-{len(lots)}")
+        for code in lots:
+            self._add_lot(code=code, cycle_id=active)
+            self._add_lot(code=code, cycle_id=active, account_id=OTHER)
+            self._add_review(code=code, cycle_id=active)
+        with PT._db(immediate=True) as conn:
+            PT._sync_positions(conn, asof_day=DAY)
+        only_today = (dt.date.today() - dt.timedelta(days=5)).isoformat()
+        self.add_signal(code="600888", intended_date=only_today)
+        self.add_signal(code="600888", intended_date=only_today, account_id=OTHER)
+        with PT._db() as conn:
+            bounded = PT._dynamic_position_limits(conn, cycle_id=active, asof_day=DAY)
+        with PT._db() as conn:
+            unbounded = PT._dynamic_position_limits(conn, cycle_id=active)
+        self.assertNotEqual(
+            bounded["allocation_version"], unbounded["allocation_version"],
+            "fixture 没能让 as-of 有界/无界解析出不同的席位版本（断言会是空门禁）")
+        self.assertNotEqual(
+            bounded["allocation_key"], unbounded["allocation_key"],
+            "fixture 的两个 as-of 解析出了同一个 allocation key")
+        return active, bounded, unbounded
+
+    def test_rpl_p5h_buy_order_post_borrow_reread_keeps_the_same_asof(self):
+        """借位后的 re-read 必须回到**同一个** as-of 有界的席位版本。
+
+        修复前 re-read 只带 cycle、漏传 ``asof_day`` ⇒ 解析到"机器今天"的版本，
+        刚刚借到的席位在 ``position_count_gate`` 里消失，``strategy_count_blocked``
+        又变回 true。
+        """
+        active, bounded, unbounded = self._seed_asof_split_fixture(
+            lots=["600001", "600002", "600003"])
+        # 非空门禁：无界 as-of 的上限确实低于持仓数（否则不会触发借位），
+        # 且有界 as-of 的上限更高 —— 两个 as-of 的判定口径真的不同。
+        crowded = 3
+        self.assertLess(
+            unbounded["limits"][ACCOUNT], crowded,
+            "fixture 在无界 as-of 下没有达到席位上限（不会触发借位）")
+        self.assertGreater(
+            bounded["limits"][ACCOUNT], unbounded["limits"][ACCOUNT],
+            "fixture 的 as-of 有界上限没有高于无界上限")
+
+        signal_id = self.add_signal(code="600901", intended_date=DAY.isoformat(),
+                                    signal_date=DAY_PREV.isoformat())
+        _result, payload = self._run_buy_order(signal_id=signal_id, code="600901")
+        borrow = payload.get("slot_borrow") or {}
+        self.assertTrue(borrow.get("allowed"), f"fixture 没能真的借到席位：{borrow}")
+        self.assertEqual(
+            bounded["allocation_version"], borrow["allocation_version"],
+            "借位写进了另一个 as-of 的席位版本")
+        gate = payload["position_count_gate"]
+        self.assertEqual(
+            borrow["allocation_version"], gate["allocation_version"],
+            "借位后的 re-read 解析到了另一个 as-of 的席位版本（借到的席位消失了）")
+        self.assertEqual(
+            borrow["limits_after"][ACCOUNT], gate["limit"],
+            f"借位后的 limit 没有反映刚借到的席位：{gate} vs {borrow}")
+        self.assertEqual(active, self.cycle_id())
+
+    def test_rpl_p5i_buy_order_initial_budget_uses_the_asof(self):
+        """初次预算也必须用本次 as-of：本周期还有余量时不得无谓借位。
+
+        修复前初次预算只带 cycle ⇒ 用"机器今天"的收紧上限判定席位已满，于是触发
+        ``_slot_upgrade_context`` / ``_apply_slot_borrow``，把 donor 的席位白削一刀。
+        """
+        _active, bounded, unbounded = self._seed_asof_split_fixture(
+            lots=["600001", "600002"])
+        crowded = 2
+        self.assertLessEqual(
+            unbounded["limits"][ACCOUNT], crowded,
+            "fixture 在无界 as-of 下没有达到席位上限")
+        self.assertGreater(
+            bounded["limits"][ACCOUNT], crowded,
+            "fixture 的 as-of 有界上限没有留出余量（无法证明'不该借位'）")
+
+        signal_id = self.add_signal(code="600902", intended_date=DAY.isoformat(),
+                                    signal_date=DAY_PREV.isoformat())
+        _result, payload = self._run_buy_order(signal_id=signal_id, code="600902")
+        gate = payload["position_count_gate"]
+        self.assertEqual(
+            bounded["limits"][ACCOUNT], gate["limit"],
+            "初次预算没有使用本次 as-of 的席位上限")
+        self.assertNotIn(
+            "slot_upgrade", payload,
+            "本周期还有余量，却进入了席位比较（初次预算漏传 as-of）")
+        self.assertNotIn(
+            "slot_borrow", payload,
+            "本周期还有余量，却无谓触发了借位（初次预算漏传 as-of）")
 
 
 class SlotUpgradeContractTests(unittest.TestCase):

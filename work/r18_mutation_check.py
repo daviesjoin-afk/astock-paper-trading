@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""R18 负向变异矩阵（M-RPL1 ~ M-RPL17）。
+"""R18 负向变异矩阵（M-RPL1 ~ M-RPL20）。
 
 每条变异都对应一条 R18 / 架构契约，必须让**对应**契约测试变红 —— 否则门禁是空的。
 
@@ -36,6 +36,9 @@
     M-RPL15 borrow budget 改回 active cycle              -> RPL-P5d
     M-RPL16 pending 席位去掉 cycle 过滤                  -> RPL-P5e
     M-RPL17 簇画像持仓改回 _position_rows()              -> RPL-P5f
+    M-RPL18 _buy_order pending 席位去掉 cycle 过滤       -> RPL-P5g
+    M-RPL19 _buy_order 初次预算漏传 as-of                -> RPL-P5i
+    M-RPL20 借位后 re-read 漏传 as-of                    -> RPL-P5h
 
 用法（仓库根目录）::
 
@@ -285,6 +288,40 @@ MUTATIONS = [
         "test": f"{PROV_MODULE}.ProductionSlotLifecycleProvenance."
                 "test_rpl_p5f_cluster_evidence_is_cycle_and_asof_bound",
         "desc": "簇画像持仓改回 _position_rows()（预算证据来自 active cycle）",
+    },
+    {
+        "id": "M-RPL18",
+        "file": PAPER_TRADING_FILE,
+        # round-4 blocker：_buy_order 的 pending 席位读取回退到"所有周期"，
+        # 于是更新的 active cycle 会把上一个周期的在途买单算进自己的承诺席位。
+        "old": '    pending_slots = _pending_position_slots(conn, positions, cycle_id=current_cycle["id"])\n',
+        "new": '    pending_slots = _pending_position_slots(conn, positions)  # mutation\n',
+        "test": f"{PROV_MODULE}.ProductionBuyOrderCycleFence."
+                "test_rpl_p5g_buy_order_pending_slots_are_cycle_bound",
+        "desc": "_buy_order 的 pending 席位改回跨周期读取",
+    },
+    {
+        "id": "M-RPL19",
+        "file": PAPER_TRADING_FILE,
+        # round-4 blocker：借位前的初次预算漏传 as-of ⇒ 历史 as-of 下解析出
+        # 另一个指纹/版本行，借到的席位在后续 re-read 里消失。
+        "old": '    count_budget = _dynamic_position_limits(conn, cycle_id=current_cycle["id"], asof_day=asof_day)\n',
+        "new": '    count_budget = _dynamic_position_limits(conn, cycle_id=current_cycle["id"])  # mutation\n',
+        "test": f"{PROV_MODULE}.ProductionBuyOrderCycleFence."
+                "test_rpl_p5i_buy_order_initial_budget_uses_the_asof",
+        "desc": "_buy_order 初次预算漏传 as-of（有余量却无谓借位）",
+    },
+    {
+        "id": "M-RPL20",
+        "file": PAPER_TRADING_FILE,
+        # round-4 blocker 的另一半：借位后的 re-read 漏传 as-of。
+        "old": '                count_budget = _dynamic_position_limits(\n'
+               '                    conn, cycle_id=current_cycle["id"], asof_day=asof_day)\n',
+        "new": '                count_budget = _dynamic_position_limits(\n'
+               '                    conn, cycle_id=current_cycle["id"])  # mutation\n',
+        "test": f"{PROV_MODULE}.ProductionBuyOrderCycleFence."
+                "test_rpl_p5h_buy_order_post_borrow_reread_keeps_the_same_asof",
+        "desc": "借位后的 re-read 漏传 as-of（借到的席位在重算里消失）",
     },
 ]
 

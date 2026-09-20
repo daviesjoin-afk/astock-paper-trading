@@ -9288,7 +9288,7 @@ def _buy_order(conn, account, signal, quote, market, news, asof_day, *, all_quot
         item["code"] for item in positions
         if item.get("account_id") == account["id"] and int(_num(item.get("qty"))) >= LOT_SIZE
     }
-    pending_slots = _pending_position_slots(conn, positions)
+    pending_slots = _pending_position_slots(conn, positions, cycle_id=current_cycle["id"])
     committed_open_codes = open_codes | {
         pending_code for pending_account, pending_code in pending_slots
         if pending_account == account["id"]
@@ -9323,7 +9323,8 @@ def _buy_order(conn, account, signal, quote, market, news, asof_day, *, all_quot
             timing_block_reasons.append(
                 f"入场时机：{timing_info.get('reason') or timing_info.get('state')}")
             reasons.extend(timing_block_reasons)
-    count_budget = _dynamic_position_limits(conn)
+    # R18：预算与 current_cycle + as-of 同源，否则历史 as-of 下算出另一个版本行。
+    count_budget = _dynamic_position_limits(conn, cycle_id=current_cycle["id"], asof_day=asof_day)
     minimum_order_amount, minimum_order_detail = _dynamic_minimum_order_amount(
         current_cycle, nav=nav, position_limit=count_budget.get("pool_limit"), conn=conn,
     )
@@ -9387,9 +9388,11 @@ def _buy_order(conn, account, signal, quote, market, news, asof_day, *, all_quot
             )
             risk["slot_borrow"] = borrowed
             if borrowed.get("allowed"):
-                # Re-read the same allocation version (same explicit cycle) after the
-                # atomic transfer so sizing / audit use the borrowed slot immediately.
-                count_budget = _dynamic_position_limits(conn, cycle_id=current_cycle["id"])
+                # Re-read the *same* allocation version after the atomic transfer so
+                # sizing / audit use the borrowed seat at once. "Same" needs the borrow's
+                # provenance too (cycle + as-of), else a re-resolved row drops the seat.
+                count_budget = _dynamic_position_limits(
+                    conn, cycle_id=current_cycle["id"], asof_day=asof_day)
                 position_limit = max(1, int(count_budget["limits"].get(account["id"], position_limit)))
                 strategy_count_blocked = len(committed_open_codes) >= position_limit
                 risk["position_count_gate"]["limit"] = position_limit
