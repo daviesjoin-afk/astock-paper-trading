@@ -422,6 +422,58 @@ def _lot_economic_dates(conn, order_ids) -> tuple[dict[int, str], bool]:
     return dates, True
 
 
+def _verified_source_buy_fill(conn, lot: Mapping) -> dict | None:
+    """Return a fully matching verified BUY fill for one durable lot."""
+    source_order_id = lot.get("source_order_id")
+    if source_order_id is None:
+        return None
+    if not (
+        _has_columns(conn, "paper_fills", _FILL_COLUMNS)
+        and _has_columns(conn, "paper_orders", _ORDER_COLUMNS)
+    ):
+        return None
+    try:
+        order_id = int(source_order_id)
+    except (TypeError, ValueError):
+        return None
+    row = conn.execute(
+        "SELECT f.id AS fill_id, f.order_id,"
+        "       f.account_id AS fill_account_id, f.side AS fill_side,"
+        "       f.code AS fill_code, f.fill_date,"
+        "       o.account_id AS order_account_id, o.side AS order_side,"
+        "       o.code AS order_code, o.status AS order_status, o.cycle_id,"
+        "       o.execution_status, o.execution_verified, o.executed_at"
+        "  FROM paper_fills f JOIN paper_orders o ON o.id=f.order_id"
+        " WHERE f.order_id=? ORDER BY f.id LIMIT 1",
+        (order_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    row = dict(row)
+    if int(row.get("cycle_id") or -1) != int(lot.get("cycle_id") or -1):
+        return None
+    if str(row.get("order_account_id") or "") != str(lot.get("account_id") or ""):
+        return None
+    if str(row.get("fill_account_id") or "") != str(lot.get("account_id") or ""):
+        return None
+    if str(row.get("order_code") or "") != str(lot.get("code") or ""):
+        return None
+    if str(row.get("fill_code") or "") != str(lot.get("code") or ""):
+        return None
+    if str(row.get("order_side") or "").lower() != "buy":
+        return None
+    if str(row.get("fill_side") or "").lower() != "buy":
+        return None
+    if str(row.get("order_status") or "").lower() != "filled":
+        return None
+    if not EV.is_verified_row(row):
+        return None
+    fill_day = _day_text(row.get("fill_date"))
+    if not fill_day:
+        return None
+    row["economic_date"] = fill_day
+    return row
+
 def bounded_lots(conn, context: PortfolioReadContext, *, account_id: str | None = None) -> list[dict]:
     """Reconstruct open lots at ``context.asof_day`` from durable facts.
 
@@ -452,9 +504,6 @@ def bounded_lots_with_status(conn, context: PortfolioReadContext, *,
         " ORDER BY acquired_at,id",
         tuple(params),
     ))
-    economic_dates, fill_proof = _lot_economic_dates(
-        conn, (row.get("source_order_id") for row in rows)
-    )
     unknown_date = False
     uncertain_lot_ids: set[int] = set()
     bounded = []
@@ -462,18 +511,12 @@ def bounded_lots_with_status(conn, context: PortfolioReadContext, *,
         lot = dict(row)
         lot_id = int(lot.get("id") or 0)
         original = str(lot.get("acquired_at") or "")
-        source_order_id = lot.get("source_order_id")
-        if source_order_id is None:
+        evidence = _verified_source_buy_fill(conn, lot)
+        if evidence is None:
             uncertain_lot_ids.add(lot_id)
-        economic = None
-        if source_order_id is not None and fill_proof:
-            economic = economic_dates.get(int(source_order_id))
-            if economic is None:
-                uncertain_lot_ids.add(lot_id)
-        if economic is None:
             economic = original[:10] or None
-            if source_order_id is not None and not fill_proof:
-                uncertain_lot_ids.add(lot_id)
+        else:
+            economic = evidence.get("economic_date")
         if not economic:
             unknown_date = True
             continue
@@ -764,33 +807,13 @@ def initial_capital(conn, context: PortfolioReadContext):
 
 
 def _uncovered_lot_facts(conn, lots: list[dict]) -> tuple[float, int]:
-    """Cash cost and count of open lots without linked BUY fill evidence."""
+    """Cash cost and count of durable lots without verified matching BUY fills."""
     if not lots:
         return 0.0, 0
-    if not _has_columns(conn, "paper_fills", {"order_id", "side"}):
-        return 0.0, 0
-    source_order_ids = []
-    for lot in lots:
-        try:
-            source_order_ids.append(int(lot.get("source_order_id")))
-        except (TypeError, ValueError):
-            source_order_ids.append(None)
-    order_ids = sorted({value for value in source_order_ids if value is not None})
-    covered_order_ids: set[int] = set()
-    for start in range(0, len(order_ids), 400):
-        chunk = order_ids[start:start + 400]
-        placeholders = ",".join("?" for _ in chunk)
-        covered_order_ids.update(
-            int(row[0]) for row in conn.execute(
-                f"SELECT DISTINCT order_id FROM paper_fills"
-                f" WHERE side='buy' AND order_id IN ({placeholders})",
-                tuple(chunk),
-            )
-        )
     uncovered_cost = 0.0
     uncovered_count = 0
-    for lot, source_order_id in zip(lots, source_order_ids, strict=True):
-        if source_order_id is not None and source_order_id in covered_order_ids:
+    for lot in lots:
+        if _verified_source_buy_fill(conn, lot) is not None:
             continue
         qty = _num(lot.get("qty"), 0.0) or 0.0
         cost = _num(lot.get("cost"), 0.0) or 0.0

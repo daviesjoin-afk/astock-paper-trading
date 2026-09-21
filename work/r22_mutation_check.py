@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""R22 mutation matrix M-PORT1 ~ M-PORT31.
+"""R22 mutation matrix M-PORT1 ~ M-PORT32.
 
 Each mutation must turn its corresponding permanent contract RED.  The script
 restores every mutated file byte-identically and verifies sha256.
@@ -107,7 +107,7 @@ MUTATIONS = [
         "id": "M-PORT13", "file": READ_MODEL,
         "old": '            cash = PPort.cash(conn, context)[0]; cash = PPort.compatibility_cash(conn, context) if cash is None else cash',
         "new": '            cash = PPort.cash(conn, context)[0]; cash = PPort.initial_capital(conn, context) if cash is None else cash',
-        "test": f"{TEST}.test_port11b_legacy_cash_fallback_accounts_for_recorded_fills",
+        "test": f"{TEST}.test_port11k_missing_order_fill_uses_compatibility_cash",
         "desc": "substitute untouched capital when legacy cash is unproven",
         "file_override": "backend/paper_trading.py",
     },
@@ -148,8 +148,8 @@ MUTATIONS = [
     },
     {
         "id": "M-PORT19", "file": READ_MODEL,
-        "old": "            economic = economic_dates.get(int(source_order_id))\n",
-        "new": "            economic = None\n",
+        "old": '''    fill_day = _day_text(row.get("fill_date"))\n    if not fill_day:\n        return None\n    row["economic_date"] = fill_day\n''',
+        "new": '''    fill_day = _day_text(lot.get("acquired_at"))\n    if not fill_day:\n        return None\n    row["economic_date"] = fill_day\n''',
         "test": f"{TEST}.test_port4d_lot_economic_date_comes_from_fill_date",
         "desc": "use wall-clock acquired_at instead of fill economic date",
     },
@@ -212,11 +212,12 @@ MUTATIONS = [
     },
     {
         "id": "M-PORT27", "file": READ_MODEL,
-        "old": '''        if source_order_id is None:
+        "old": '''        if evidence is None:
             uncertain_lot_ids.add(lot_id)
+            economic = original[:10] or None
 ''',
-        "new": '''        if source_order_id is None:
-            pass
+        "new": '''        if evidence is None:
+            economic = original[:10] or None
 ''',
         "test": f"{TEST}.test_port11g_source_less_lot_keeps_cash_unknown",
         "desc": "promote wall-clock acquired_at for source-less lots",
@@ -266,6 +267,17 @@ MUTATIONS = [
 ''',
         "test": f"{TEST}.test_port11j_read_before_cycle_creation_is_unknown",
         "desc": "publish pre-cycle capital as verified",
+    },
+    {
+        "id": "M-PORT32", "file": READ_MODEL,
+        "old": '''    if int(row.get("cycle_id") or -1) != int(lot.get("cycle_id") or -1):
+        return None
+''',
+        "new": '''    if False:
+        return None
+''',
+        "test": f"{TEST}.test_port4k_source_order_identity_must_match_lot",
+        "desc": "accept a source BUY order from another cycle",
     },
 ]
 

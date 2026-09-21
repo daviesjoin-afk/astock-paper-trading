@@ -252,6 +252,22 @@ class PortfolioReadModelContractTests(unittest.TestCase):
             self.conn, P.PortfolioReadContext(self.cycle100, DAY)
         )
         self.assertEqual(positions, [])
+    def test_port4k_source_order_identity_must_match_lot(self):
+        other_cycle_order = self._order_and_fill(
+            cycle_id=self.cycle101, side="buy", qty=100, price=10.0,
+            fill_date=DAY.isoformat(),
+        )
+        self._lot(self.cycle100, 100, 10.0, source_order_id=other_cycle_order)
+        self.conn.commit()
+        context = P.PortfolioReadContext(self.cycle100, DAY)
+        lots, status = P.bounded_lots_with_status(self.conn, context)
+        self.assertEqual([row["code"] for row in lots], [CODE])
+        self.assertEqual(status, "unknown")
+        self.assertEqual(P.cash(self.conn, context), (None, "unknown"))
+        with self.assertRaises(P.PortfolioReadUnavailable):
+            PT._shared_account_exposure(
+                self.conn, {CODE: {"price": 10.0}}, DAY, cycle_id=self.cycle100,
+            )
     def test_port4b_explicit_exposure_uses_bounded_positions(self):
         future = self._order_and_fill(
             cycle_id=self.cycle100, side="buy", qty=100, price=10.0,
@@ -388,11 +404,11 @@ class PortfolioReadModelContractTests(unittest.TestCase):
         self.conn.commit()
         context = P.PortfolioReadContext(self.cycle100, DAY)
         self.assertEqual(P.cash(self.conn, context), (None, "unknown"))
-        self.assertEqual(P.compatibility_cash(self.conn, context), 98995.0)
-        _positions, _value, nav, _industries, _codes = PT._shared_account_exposure(
-            self.conn, {CODE: {"price": 10.0}}, DAY, cycle_id=self.cycle100,
-        )
-        self.assertEqual(nav, 99995.0)
+        self.assertEqual(P.compatibility_cash(self.conn, context), 97990.0)
+        with self.assertRaises(P.PortfolioReadUnavailable):
+            PT._shared_account_exposure(
+                self.conn, {CODE: {"price": 10.0}}, DAY, cycle_id=self.cycle100,
+            )
 
     def test_port11d_mixed_fill_less_lot_is_reconciled(self):
         stamp = PT._strategy_stamp(self.conn, ACCOUNT)
@@ -413,10 +429,10 @@ class PortfolioReadModelContractTests(unittest.TestCase):
         context = P.PortfolioReadContext(self.cycle100, DAY)
         self.assertEqual(P.cash(self.conn, context), (None, "unknown"))
         self.assertEqual(P.compatibility_cash(self.conn, context), 96995.0)
-        _positions, _value, nav, _industries, _codes = PT._shared_account_exposure(
-            self.conn, {CODE: {"price": 10.0}}, DAY, cycle_id=self.cycle100,
-        )
-        self.assertEqual(nav, 99995.0)
+        with self.assertRaises(P.PortfolioReadUnavailable):
+            PT._shared_account_exposure(
+                self.conn, {CODE: {"price": 10.0}}, DAY, cycle_id=self.cycle100,
+            )
 
     def test_port11g_source_less_lot_keeps_cash_unknown(self):
         self._lot(self.cycle100, 100, 10.0)
@@ -457,6 +473,30 @@ class PortfolioReadModelContractTests(unittest.TestCase):
         result = self._portfolio(self.cycle100, before, valuations={CODE: 10.0})
         self.assertIsNone(result["nav"])
         self.assertEqual(result["cash_status"], "unknown")
+    def test_port11k_missing_order_fill_uses_compatibility_cash(self):
+        verified = self._order_and_fill(
+            cycle_id=self.cycle100, side="buy", qty=100, price=10.0,
+            fill_date=DAY.isoformat(), fees=5.0,
+        )
+        self._lot(self.cycle100, 100, 10.05, source_order_id=verified)
+        stamp = PT._strategy_stamp(self.conn, ACCOUNT)
+        self.conn.execute(
+            "INSERT INTO paper_orders(account_id,side,code,qty,status,risk_payload,created_at,"
+            "executed_at,order_type,origin,strategy_id,strategy_version,strategy_checksum,cycle_id,"
+            "execution_status,execution_verified) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (ACCOUNT, "buy", "000001", 100, "filled", "{}", f"{DAY.isoformat()} 09:30:00",
+             f"{DAY.isoformat()} 09:30:01", "market", "seed", *stamp, self.cycle100,
+             "unknown", 0),
+        )
+        self.conn.commit()
+        context = P.PortfolioReadContext(self.cycle100, DAY)
+        self.assertEqual(P.cash(self.conn, context), (None, "unknown"))
+        self.assertEqual(P.compatibility_cash(self.conn, context), 98995.0)
+        _positions, _value, nav, _industries, _codes = PT._shared_account_exposure(
+            self.conn, {CODE: {"price": 10.0}}, DAY, cycle_id=self.cycle100,
+        )
+        self.assertEqual(nav, 99995.0)
     def test_port11c_account_initial_capital_is_cycle_scoped(self):
         self.conn.execute(
             "UPDATE paper_accounts SET cycle_id=? WHERE id=?", (self.cycle101, ACCOUNT)
