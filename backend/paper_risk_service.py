@@ -134,18 +134,20 @@ def _accounts_by_id(conn, account_ids):
     return [dict(row) for row in rows]
 
 
-def _spec_for(account_id, conn=None):
+def _spec_for(account_id, conn, *, cycle_id):
+    """Resolve a SELL base spec with strict cycle provenance for user strategies."""
     spec = ACS.builtin_spec(account_id)
     if spec is not None:
         return spec
     try:
-        context = SRT.get_context(conn, account_id)
+        context = SRT.get_context_for_cycle(conn, account_id, cycle_id=cycle_id)
     except (ValueError, sqlite3.Error):
         return ACS.fallback_spec()
     return USP.user_spec_for(context, risk_profiles=ACS.RISK_PROFILES)
 
 
-def _strategy_stamp(conn, account_id, signal_id=None):
+def _strategy_stamp(conn, account_id, *, cycle_id, signal_id=None):
+    """Return the exact cycle-pinned strategy stamp, or an explicit unknown."""
     if signal_id is not None:
         row = conn.execute(
             """SELECT strategy_id,strategy_version,strategy_checksum
@@ -154,7 +156,8 @@ def _strategy_stamp(conn, account_id, signal_id=None):
         ).fetchone()
         if row and all(value is not None and value != "" for value in row):
             return tuple(row)
-    return SR.stamp_for_account(conn, account_id)
+    stamp = SR.cycle_stamp_for_account(conn, account_id, cycle_id=cycle_id)
+    return tuple(stamp) if stamp is not None else (None, None, None)
 
 
 def _audit(conn, account_id, event, detail):
@@ -235,7 +238,7 @@ def run(context: RiskRunContext, *, ports: RiskServicePorts):
             payload or {}, account_id=account_id, code=code, side=side,
             decision=decision, reason=reason,
         )
-        strategy_id, strategy_version, strategy_checksum = _strategy_stamp(conn, account_id)
+        strategy_id, strategy_version, strategy_checksum = _strategy_stamp(conn, account_id, cycle_id=cycle_id)
         conn.execute(
             """INSERT INTO paper_risk_decisions(
                    account_id,code,side,decision,reason,payload,created_at,
@@ -362,7 +365,7 @@ def run(context: RiskRunContext, *, ports: RiskServicePorts):
             if not quote_status["fresh"]:
                 pending_ratio, pending_reason, _, pending_detail = PREv.sell_plan(
                     position, quote, day, news,
-                    base_spec=_spec_for(position["account_id"], conn),
+                    base_spec=_spec_for(position["account_id"], conn, cycle_id=cycle_id),
                     deps=ports.evidence,
                 )
                 quality_action, quality_reason = PReview.decide_action(
@@ -444,7 +447,7 @@ def run(context: RiskRunContext, *, ports: RiskServicePorts):
                    LIMIT 1""",
                 (position["account_id"], position["code"], day.isoformat()),
             ).fetchone())
-            base_spec = _spec_for(position["account_id"], conn)
+            base_spec = _spec_for(position["account_id"], conn, cycle_id=cycle_id)
             ratio, reason, next_stage, detail = PREv.sell_plan(
                 position, quote, day, news, hard_stop_touched_today=hard_stop_touched_today,
                 # PR-30：卖出状态机的止损/移动止损/时间止损用 cycle-pinned 编译画像。
@@ -691,7 +694,7 @@ def run(context: RiskRunContext, *, ports: RiskServicePorts):
                     asof_date=day, quote=quote, news=news,
                     kline=ports.evidence.load_kline(position["code"], day, inclusive=False),
                 )
-                strategy_stamp = _strategy_stamp(conn, position["account_id"])
+                strategy_stamp = _strategy_stamp(conn, position["account_id"], cycle_id=cycle_id)
                 cursor = conn.execute(
                     """INSERT INTO paper_orders(
                            account_id,side,code,name,qty,planned_price,status,reason,
@@ -724,7 +727,7 @@ def run(context: RiskRunContext, *, ports: RiskServicePorts):
             try:
                 ports.assert_active_lease(conn, "risk sell order")
                 sell_cycle_id = cycle_id
-                strategy_stamp = _strategy_stamp(conn, position["account_id"])
+                strategy_stamp = _strategy_stamp(conn, position["account_id"], cycle_id=cycle_id)
                 cursor = conn.execute(
                     """INSERT INTO paper_orders(
                            account_id,side,code,name,qty,planned_price,status,reason,

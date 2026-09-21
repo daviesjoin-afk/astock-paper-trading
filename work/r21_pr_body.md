@@ -17,13 +17,21 @@ R21-C1 risk scan capacity budget leaks current facts: REPRODUCED
 R21-C2 downside policy leaks future/current risk profile: REPRODUCED
     scan_override_warning=-4.0 bounded_warning=-2.0
 R21-C3 sell policy leaks current strategy head: REPRODUCED
-    scan_uses_unbounded_effective_spec=True head_vs_pin_distinct=True head_hard_stop=-0.04 pin_hard_stop=-0.04
+    structural_current_head_resolver=True head_vs_pin_object_distinct=True head_hard_stop=-0.04 pin_hard_stop=-0.04
+    C3 proves the structural current-head resolver path; the behavioral user-policy difference is covered by C5 / RSVC-15.
 R21-C4 risk application orchestration remains in paper_trading: REPRODUCED
     _monitor_risk_impl LOC=651 responsibilities={snapshot, external evidence, quality review, capacity review, sell decision, sell execution orchestration, rotation, projection/nav, pending manual retry}
 R21 before-fix reproduced: 4/4
+
+R21-C5 user SELL base policy leaks current strategy head: REPRODUCED
+    pinned=v1/hard_stop=-0.04/hold_max=10 current=v2/hard_stop=-0.04/hold_max=5
+    v1 does not hit max_hold; v2 does.
+R21-C6 risk facts stamp current strategy version instead of cycle pin: REPRODUCED
+    pinned_stamp=('r19_alpha', 1, ...) current_head=v2; missing cycle/legacy binding adopts v2/current
+R21 follow-up before-fix reproduced: 2/2
 ```
 
-After the fix, the same probe reports `0/4`; the real production contracts are now covered by `backend/test_risk_application_service.py` (RSVC-1..14).
+After the fix, the original probe reports `0/4` and the follow-up probe reports `0/2`; the real production contracts are covered by `backend/test_risk_application_service.py` (RSVC-1..16).
 
 ## Correctness
 
@@ -32,11 +40,14 @@ After the fix, the same probe reports `0/4`; the real production contracts are n
 - SELL spec: the risk run uses `strategy_risk_enforcement.effective_spec_for_cycle` and never falls back to the current strategy head.
 - cycle fence: external quote/news/fund-flow I/O ends before the write transaction; the first write-phase action is `paper_risk_scan_state.assert_cycle_active(cycle_id)`; rollover aborts without orders/reviews/risk writes.
 - explicit context: `RiskRunContext(cycle_id, asof_day)` is immutable and rejects `None`; `run()` requires that context and does not resolve `active_cycle` or wall-clock dates for decision identity.
+- USER base spec: `strategy_runtime.get_context_for_cycle(...)` resolves only `paper_cycle_strategy_versions`; missing pin raises instead of falling back to current head. `paper_risk_service._spec_for(...)` requires `cycle_id` and is used on both stale and fresh SELL paths.
+- risk provenance: `paper_risk_service._strategy_stamp(...)` requires `cycle_id`, uses `SR.cycle_stamp_for_account(...)` only, and returns `(None, None, None)` when the pin is absent. Unfilled/pending SELL orders and risk decision logs carry the cycle-pinned v1 stamp; missing provenance stays NULL.
+- audit guard: the existing strategy-stamp insert guard was narrowed to allow an all-NULL explicit unknown state while still rejecting partial, forged, or current-head substitutions. This is required so a missing cycle pin cannot block a protective SELL.
 
 ## Architecture
 
 - `paper_trading.py`: before `16045 LOC / 282 top-level defs`; after `14840 LOC / 280 top-level defs`.
-- `paper_risk_service.py`: `877 LOC`, one risk-run application workflow.
+- `paper_risk_service.py`: `880 LOC`, one risk-run application workflow.
 - `paper_risk_evidence.py`: risk-only evidence/read-model adapters moved out of `paper_trading.py`.
 - `paper_trading._monitor_risk_impl`: thin compatibility adapter, 4 LOC; calls `paper_risk_service.run(...)`.
 - reverse imports: `paper_risk_service.py = 0`, `paper_risk_evidence.py = 0`.
@@ -54,10 +65,12 @@ After the fix, the same probe reports `0/4`; the real production contracts are n
 
 ```text
 Targeted suite:
-297 tests OK
+100 tests OK (risk application + Guard 12)
+201 tests OK (sell / decision / asof / provenance regression)
+9 tests OK (strategy runtime contract)
 
 Full backend:
-3826 tests OK (skipped=5)
+3831 tests OK (skipped=5)
 
 Frontend:
 npm --prefix frontend run build: PASS (2 existing duplicate-key warnings)
@@ -74,8 +87,8 @@ ruff check backend: All checks passed
 `work/r21_mutation_check.py`:
 
 ```text
-M-RSK1..M-RSK16
-16/16 RED
+M-RSK1..M-RSK18
+18/18 RED
 survived=0
 restore bytes byte-identical
 restore sha256 PASS

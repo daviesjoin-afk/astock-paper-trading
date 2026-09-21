@@ -16,13 +16,17 @@ if BACKEND not in sys.path:
     sys.path.insert(0, BACKEND)
 
 import execution_planner as EP  # noqa: E402
+import paper_account_specs as ACS  # noqa: E402
 import paper_position_risk_state as PPRS  # noqa: E402
 import paper_risk_evidence as PREv  # noqa: E402
 import paper_risk_scan_state as PRSS  # noqa: E402
 import paper_risk_service as PRSVC  # noqa: E402
 import paper_trading as PT  # noqa: E402
+import strategy_registry as SR  # noqa: E402
 import strategy_risk_enforcement as SRE  # noqa: E402
+import strategy_runtime as SRT  # noqa: E402
 import test_position_risk_state as PRS  # noqa: E402
+import user_strategy_participation as USP  # noqa: E402
 
 
 ACCOUNT = "tq_breakout"
@@ -101,6 +105,75 @@ class _RiskServiceCase(PRS._ProductionRiskScanCase):
                 expected_version=current.version, actor="rsvc",
                 change_note="rsvc head advance", risk_evidence=20,
             )
+
+
+    USER = "r21_alpha"
+    USER_PINNED_RULE = {
+        "op": "gt", "left": {"op": "field", "name": "close"},
+        "right": {"op": "indicator", "name": "ma", "window": 20},
+    }
+    USER_PINNED_CONFIG = {
+        "style": "trend", "hold": 8, "positions": 3, "daily": True, "close": True,
+    }
+    USER_HEAD_RULE = {
+        "op": "gt", "left": {"op": "field", "name": "close"},
+        "right": {"op": "const", "value": 1},
+    }
+    USER_HEAD_CONFIG = {
+        "style": "quality", "daily": True, "close": True, "hold": 20,
+        "positions": 8, "stop": True, "atr": True,
+    }
+
+    def seed_user_strategy_v1(self):
+        with PT._db(immediate=True) as conn:
+            SR.ensure_schema(conn)
+            SR.create_user_definition(
+                conn, self.USER, "R21 alpha", dsl_ast=dict(self.USER_PINNED_RULE),
+                metadata=dict(self.USER_PINNED_CONFIG), actor="rsvc",
+            )
+            conn.execute(
+                "INSERT OR IGNORE INTO paper_accounts(id,name,source_strategy,status,"
+                "initial_cash,cash,cycle_days,max_positions,max_weight,max_exposure,"
+                "version,created_at,updated_at,cycle_id,risk_profile) "
+                "VALUES(?,?,'strategy_dsl','running',0,0,8,3,0.32,0.9,'v0',?,?,?, 'trend')",
+                (self.USER, self.USER, f"{self.day.isoformat()} 00:00:00",
+                 f"{self.day.isoformat()} 00:00:00", int(self.cycle)),
+            )
+            SR.bind_cycle_versions(conn, self.cycle, [self.USER])
+        with PT._db() as conn:
+            return SR.cycle_version_for_account(conn, self.USER, cycle_id=self.cycle)
+
+    def advance_user_head(self, pinned_version):
+        with PT._db(immediate=True) as conn:
+            SR.save_definition(
+                conn, self.USER,
+                {"dsl_ast": dict(self.USER_HEAD_RULE),
+                 "metadata": dict(self.USER_HEAD_CONFIG)},
+                expected_version=pinned_version.version, actor="rsvc",
+                change_note="rsvc user head advance",
+            )
+
+    def add_lot_for_account(self, account_id, code, qty, cost):
+        self._inner._insert_lot(account_id, code, qty, cost)
+        PPRS.initialize_episode(
+            self.conn, cycle_id=self.cycle, account_id=account_id,
+            code=code, peak_price=cost,
+        )
+        self.conn.commit()
+
+    def delete_user_cycle_binding(self):
+        with PT._db(immediate=True) as conn:
+            conn.execute(
+                "DELETE FROM paper_cycle_strategy_versions WHERE cycle_id=? AND account_id=?",
+                (self.cycle, self.USER),
+            )
+            try:
+                conn.execute(
+                    "DELETE FROM paper_strategy_legacy_bindings WHERE account_id=?",
+                    (self.USER,),
+                )
+            except Exception:
+                pass
 
     def review_detail(self, code=None):
         row = self.conn.execute(
@@ -396,6 +469,95 @@ class RiskServiceContractTests(_RiskServiceCase):
             nonempty = PT.monitor_risk(self.day)
         self.assertEqual(nonempty["manual_orders"], [{"status": "nonempty"}])
         pending.assert_called_once()
+
+    def test_rsvc15_user_sell_base_policy_uses_cycle_pinned_version(self):
+        pinned = self.seed_user_strategy_v1()
+        with PT._db() as conn:
+            pinned_spec = PRSVC._spec_for(self.USER, conn, cycle_id=self.cycle)
+        self.advance_user_head(pinned)
+        with PT._db() as conn:
+            head_context = SRT.get_context(conn, self.USER)
+            head_spec = USP.user_spec_for(head_context, risk_profiles=ACS.RISK_PROFILES)
+            service_spec = PRSVC._spec_for(self.USER, conn, cycle_id=self.cycle)
+        self.assertNotEqual(pinned_spec, head_spec)
+        self.assertNotEqual(pinned_spec["hold_max"], head_spec["hold_max"])
+        self.assertEqual(service_spec, pinned_spec)
+        self.assertEqual(service_spec["strategy_version"], f"v{pinned.version}")
+
+        position = {
+            "account_id": self.USER, "code": self.code, "qty": 100,
+            "available_qty": 100, "cost": 10.0, "peak_price": 10.0,
+            "entry_date": (self.day - dt.timedelta(days=6)).isoformat(),
+            "take_stage": 0,
+        }
+        quote = {
+            "price": 10.0, "pct": 0.0, "high": 10.0, "low": 10.0,
+            "quote_at": f"{self.day.isoformat()} 10:00:00",
+        }
+        with mock.patch.object(PT, "_completed_kline", return_value=None):
+            deps = PT._risk_service_ports().evidence
+        pinned_ratio, _, _, _ = PREv.sell_plan(
+            position, quote, self.day, [], base_spec=pinned_spec, deps=deps,
+        )
+        head_ratio, _, _, _ = PREv.sell_plan(
+            position, quote, self.day, [], base_spec=head_spec, deps=deps,
+        )
+        self.assertEqual(pinned_ratio, 0.0)
+        self.assertGreater(head_ratio, 0.0)
+
+    def test_rsvc16_risk_facts_use_cycle_pinned_strategy_provenance(self):
+        pinned = self.seed_user_strategy_v1()
+        self.advance_user_head(pinned)
+        self.add_lot_for_account(self.USER, self.code, 100, 10.0)
+        self.set_quote(self.code, price=9.0, pct=-10.0, high=9.2, low=8.9)
+        self.run_risk()
+        order = self.conn.execute(
+            "SELECT strategy_id,strategy_version,strategy_checksum,status"
+            " FROM paper_orders WHERE account_id=? AND code=? AND side='sell'"
+            " ORDER BY id DESC LIMIT 1",
+            (self.USER, self.code),
+        ).fetchone()
+        decision = self.conn.execute(
+            "SELECT strategy_id,strategy_version,strategy_checksum"
+            " FROM paper_risk_decisions WHERE account_id=? AND code=? AND side='sell'"
+            " ORDER BY id DESC LIMIT 1",
+            (self.USER, self.code),
+        ).fetchone()
+        self.assertIsNotNone(order)
+        self.assertIsNotNone(decision)
+        self.assertEqual(order["status"], "unfilled_limit_down")
+        for row in (order, decision):
+            self.assertEqual(row["strategy_id"], pinned.strategy_id)
+            self.assertEqual(int(row["strategy_version"]), pinned.version)
+            self.assertEqual(row["strategy_checksum"], pinned.checksum)
+
+        # Missing pin: explicit cycle exists, but no cycle/legacy binding.
+        # The audit metadata stays unknown; it must not adopt current head.
+        self.delete_user_cycle_binding()
+        self.add_lot_for_account(self.USER, self.code_b, 100, 10.0)
+        self.set_quote(self.code_b, price=9.0, pct=-10.0, high=9.2, low=8.9)
+        self.clear_scan_state()
+        self.run_risk()
+        missing_order = self.conn.execute(
+            "SELECT strategy_id,strategy_version,strategy_checksum,status"
+            " FROM paper_orders WHERE account_id=? AND code=? AND side='sell'"
+            " ORDER BY id DESC LIMIT 1",
+            (self.USER, self.code_b),
+        ).fetchone()
+        missing_decision = self.conn.execute(
+            "SELECT strategy_id,strategy_version,strategy_checksum"
+            " FROM paper_risk_decisions WHERE account_id=? AND code=? AND side='sell'"
+            " ORDER BY id DESC LIMIT 1",
+            (self.USER, self.code_b),
+        ).fetchone()
+        self.assertIsNotNone(missing_order)
+        self.assertIsNotNone(missing_decision)
+        self.assertEqual(missing_order["status"], "unfilled_limit_down")
+        for row in (missing_order, missing_decision):
+            self.assertIsNone(row["strategy_id"])
+            self.assertIsNone(row["strategy_version"])
+            self.assertIsNone(row["strategy_checksum"])
+
 
 
 if __name__ == "__main__":

@@ -215,10 +215,11 @@ def c3_sell_spec_current_head_leak():
             f"{'REPRODUCED' if reproduced else 'NOT REPRODUCED'}"
         )
         print(
-            f"    scan_uses_unbounded_effective_spec={scan_used_current} "
-            f"head_vs_pin_distinct={distinct} "
+            f"    structural_current_head_resolver={scan_used_current} "
+            f"head_vs_pin_object_distinct={distinct} "
             f"head_hard_stop={current_spec.get('hard_stop')} "
-            f"pin_hard_stop={pinned_after.get('hard_stop')}"
+            f"pin_hard_stop={pinned_after.get('hard_stop')} "
+            "(behavioral user-policy difference is covered by R21-C5)"
         )
         return reproduced
     finally:

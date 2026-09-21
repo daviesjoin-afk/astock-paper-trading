@@ -137,6 +137,20 @@ MUTATIONS = [
         "test": f"{SERVICE_TEST}.test_rsvc10_quality_capacity_permission_order_is_stable",
         "desc": "quality exit sorting reverts to insertion order",
     },
+    {
+        "id": "M-RSK17", "file": SERVICE,
+        "old": "        context = SRT.get_context_for_cycle(conn, account_id, cycle_id=cycle_id)\n",
+        "new": "        context = SRT.get_context(conn, account_id)\n",
+        "test": f"{SERVICE_TEST}.test_rsvc15_user_sell_base_policy_uses_cycle_pinned_version",
+        "desc": "user SELL base spec follows current strategy head",
+    },
+    {
+        "id": "M-RSK18", "file": SERVICE,
+        "old": "    stamp = SR.cycle_stamp_for_account(conn, account_id, cycle_id=cycle_id)\n",
+        "new": "    stamp = SR.stamp_for_account(conn, account_id)\n",
+        "test": f"{SERVICE_TEST}.test_rsvc16_risk_facts_use_cycle_pinned_strategy_provenance",
+        "desc": "risk facts fall back to legacy/current strategy stamp",
+    },
 ]
 
 
@@ -171,6 +185,8 @@ def main() -> int:
     for module in (
         f"{SERVICE_TEST}.test_rsvc1_risk_run_context_requires_explicit_identity",
         f"{GUARD_TEST}.test_guard12a_no_reverse_dependency",
+        f"{SERVICE_TEST}.test_rsvc15_user_sell_base_policy_uses_cycle_pinned_version",
+        f"{SERVICE_TEST}.test_rsvc16_risk_facts_use_cycle_pinned_strategy_provenance",
     ):
         base = run_test(module)
         if base.returncode != 0:

@@ -698,11 +698,14 @@ def ensure_strategy_reference_columns(conn):
 
 
 def _ensure_strategy_reference_guards(conn):
-    """Reject incomplete, forged, or later-mutated evidence stamps.
+    """Reject partial, forged, or later-mutated evidence stamps.
 
-    Historical NULL rows are intentionally left untouched. The INSERT guards
-    apply only to new account-scoped live evidence; archives accept legacy NULL
-    rows copied by retention while preserving any complete stamps verbatim.
+    Historical NULL rows are intentionally left untouched. A complete stamp
+    must reference an exact immutable strategy version. An all-NULL stamp is
+    the explicit "unknown provenance" state and remains allowed (for example
+    a protective SELL whose cycle pin metadata is missing); partial stamps and
+    forged stamps are still rejected. Insert triggers are refreshed so an
+    already-initialized database receives the current guard definition.
     """
     for table in (
         "paper_signals", "paper_orders", "paper_risk_decisions", "paper_audit",
@@ -711,10 +714,18 @@ def _ensure_strategy_reference_guards(conn):
             table_columns(conn, table)
         ):
             continue
+        trigger = f"trg_{table}_strategy_stamp_insert"
+        conn.execute(f"DROP TRIGGER IF EXISTS {trigger}")
         conn.execute(
-            f"""CREATE TRIGGER IF NOT EXISTS trg_{table}_strategy_stamp_insert
+            f"""CREATE TRIGGER {trigger}
                 BEFORE INSERT ON {table}
-                WHEN NEW.account_id IS NOT NULL AND (
+                WHEN NEW.account_id IS NOT NULL
+                 AND NOT (
+                    NEW.strategy_id IS NULL
+                    AND NEW.strategy_version IS NULL
+                    AND NEW.strategy_checksum IS NULL
+                 )
+                 AND (
                     NEW.strategy_id IS NULL OR NEW.strategy_version IS NULL
                     OR NEW.strategy_checksum IS NULL
                     OR NEW.strategy_id <> NEW.account_id

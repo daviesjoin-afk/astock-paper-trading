@@ -1541,6 +1541,41 @@ class RiskApplicationServiceBoundary(unittest.TestCase):
                 f"{module} reverse-imports {leaked}; pure decision modules stay pure",
             )
 
+    def test_guard12h_user_spec_is_cycle_pinned(self):
+        raw = _source(self.SERVICE)
+        body = _function_source(ast.parse(raw), "_spec_for", raw)
+        self.assertIn(
+            "SRT.get_context_for_cycle(", body,
+            "paper_risk_service._spec_for 仍读取 current strategy head",
+        )
+        self.assertNotIn(
+            "SRT.get_context(", body,
+            "paper_risk_service._spec_for 回退到 current head context",
+        )
+        service = "".join(raw.split())
+        self.assertEqual(
+            service.count("_spec_for(position[\"account_id\"],conn,cycle_id=cycle_id)"),
+            2,
+            "risk service 的 stale/fresh SELL 路径没有全部把 explicit cycle 传给 _spec_for",
+        )
+        context = _function_source(ast.parse(_source("strategy_runtime.py")), "get_context_for_cycle", _source("strategy_runtime.py"))
+        self.assertIn("SR.cycle_version_for_account(", context)
+        self.assertNotIn("SR.get_version(", context)
+        self.assertNotIn("stamp_for_account(", context)
+
+    def test_guard12i_risk_stamps_use_strict_cycle_resolver(self):
+        raw = _source(self.SERVICE)
+        body = _function_source(ast.parse(raw), "_strategy_stamp", raw)
+        self.assertIn("SR.cycle_stamp_for_account(", body)
+        self.assertNotIn("SR.stamp_for_account(", body)
+        service = "".join(raw.split())
+        self.assertIn("_strategy_stamp(conn,account_id,cycle_id=cycle_id)", service)
+        self.assertEqual(
+            service.count("_strategy_stamp(conn,position[\"account_id\"],cycle_id=cycle_id)"),
+            2,
+            "unfilled / pending_execution SELL 没有全部把 explicit cycle 传给 stamp resolver",
+        )
+
     def test_guard12g_service_is_not_a_monolith(self):
         loc = len(_source(self.SERVICE).splitlines())
         self.assertLess(loc, 900, f"paper_risk_service.py grew to {loc} LOC")
