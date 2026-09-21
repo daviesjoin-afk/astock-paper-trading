@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -164,9 +165,9 @@ MUTATIONS = [
     },
     {
         "id": "M-PORT21", "file": READ_MODEL,
-        "old": "    for orders, all_rows in (\n",
-        "new": "    for orders, all_rows in ():\n",
-        "test": f"{TEST}.test_port3c_buy_order_without_fill_blocks_display_cash_flow",
+        "old": '            if not EV.is_verified_row(order) or not rows or any(\n                not _identity_ok(row) or not EV.is_verified_row(row) for row in rows\n            ):\n                incomplete.add(key)\n',
+        "new": '            if False:\n                incomplete.add(key)\n',
+"test": f"{TEST}.test_port3c_buy_order_without_fill_blocks_display_cash_flow",
         "desc": "ignore filled orders with no fill evidence in display flow",
     },
     {
@@ -602,6 +603,29 @@ def _cycle_initial(conn, context: PortfolioReadContext, account_id: str | None =
         "test": f"{TEST}.test_port11o_account_attached_after_asof_stays_unknown",
         "desc": "publish account capital before the account joined the cycle",
     },
+    {
+        "id": "M-PORT59", "file": READ_MODEL,
+        "old": '''    order_columns = _columns(conn, "paper_orders")
+    if account_id and "account_id" not in order_columns:
+        # An account-scoped read cannot prove "this account had no fills"
+        # without the order identity column; failing open to zero net flow
+        # would publish the account's initial balance as verified.
+        return None
+    params: list[Any] = [context.cycle_id, context.asof_day.isoformat()]
+    account_sql = ""
+    if account_id:
+        account_sql = " AND o.account_id=?"
+        params.append(str(account_id))
+''',
+        "new": '''    params: list[Any] = [context.cycle_id, context.asof_day.isoformat()]
+    account_sql = ""
+    if account_id and "account_id" in _columns(conn, "paper_orders"):
+        account_sql = " AND o.account_id=?"
+        params.append(str(account_id))
+''',
+        "test": f"{TEST}.test_port5h_account_specific_fill_check_requires_order_identity",
+        "desc": "fail open to zero net flow when order identity is unavailable",
+    },
 ]
 
 
@@ -618,11 +642,16 @@ def _adapt_eol(text: str, original: bytes) -> bytes:
 PYCACHE_ROOT = tempfile.mkdtemp(prefix="r22_mutation_pycache_")
 _SEQ = [0]
 
+#: 变异体必须因**契约断言**失败。语法/导入错误是假杀，不能计为 CAUGHT。
+BROKEN_RE = re.compile(
+    r"(SyntaxError|IndentationError|ImportError|ModuleNotFoundError"
+    r"|_FailedTest|AttributeError: module)", re.MULTILINE,
+)
 
-def run_test(target: str) -> subprocess.CompletedProcess:
-    _SEQ[0] += 1
+
+def run_test(target: str, seq: int) -> subprocess.CompletedProcess:
     env = dict(os.environ)
-    env["PYTHONPYCACHEPREFIX"] = os.path.join(PYCACHE_ROOT, f"run{_SEQ[0]:03d}")
+    env["PYTHONPYCACHEPREFIX"] = os.path.join(PYCACHE_ROOT, f"run{seq:03d}")
     env["PYTHONIOENCODING"] = "utf-8"
     return subprocess.run(
         [sys.executable, "-m", "unittest", target],
@@ -631,46 +660,97 @@ def run_test(target: str) -> subprocess.CompletedProcess:
     )
 
 
+def assert_no_leftover(mutation: dict) -> None:
+    """Refuse to leave a mutant behind in a production file.
+
+    The runner restores every target byte-for-byte and verifies sha256, but a
+    SIGKILL skips the ``finally``.  Writers that add a ``# MUTANT`` marker are
+    caught here; for marker-less injections the sha256 restore check is the
+    guard, and ``_LOCK`` keeps other gates from racing a half-mutated tree.
+    """
+    path = os.path.join(ROOT, mutation.get("file_override", mutation["file"]))
+    if "MUTANT" in open(path, "r", encoding="utf-8").read():
+        raise RuntimeError(f'{mutation["id"]}: leftover mutant in {mutation["file"]}')
+
+
+def _apply(text: str, mutation: dict) -> str:
+    old = mutation["old"]
+    new = mutation["new"]
+    if mutation.get("last"):
+        index = text.rfind(old)
+        assert index >= 0, f'{mutation["id"]}: anchor not found'
+        return text[:index] + new + text[index + len(old):]
+    assert text.count(old) >= 1, f'{mutation["id"]}: anchor not found'
+    return text.replace(old, new, 1)
+
+
+def _is_fake_kill(result: subprocess.CompletedProcess) -> bool:
+    """A kill won by Syntax/Import failure is not a kill."""
+    blob = (result.stdout or "") + (result.stderr or "")
+    return bool(BROKEN_RE.search(blob))
+
+
+def run_mutation(mutation: dict, *, non_vacuity: bool) -> str:
+    """Return ``CAUGHT`` / ``SURVIVED`` / ``FAKE`` / ``VACUOUS``."""
+    path = os.path.join(ROOT, mutation.get("file_override", mutation["file"]))
+    with open(path, "rb") as handle:
+        original = handle.read()
+    before = sha256(original)
+    text = original.decode("utf-8").replace("\r\n", "\n")
+
+    baseline_rc = None
+    if non_vacuity:
+        baseline = run_test(mutation["test"], _SEQ[0] + 1)
+        baseline_rc = baseline.returncode
+        if baseline_rc != 0:
+            return f"BASELINE-RED({baseline_rc})"
+
+    mutated = _apply(text, mutation)
+    try:
+        with open(path, "wb") as handle:
+            handle.write(_adapt_eol(mutated, original))
+        result = run_test(mutation["test"], _SEQ[0] + 1)
+        red = result.returncode != 0
+        if not red:
+            return "SURVIVED"
+        if _is_fake_kill(result):
+            return "FAKE"
+        return "CAUGHT"
+    finally:
+        with open(path, "wb") as handle:
+            handle.write(original)
+        with open(path, "rb") as handle:
+            after = sha256(handle.read())
+        if after != before:
+            raise RuntimeError(f'{mutation["id"]}: restore sha256 mismatch')
+        assert_no_leftover(mutation)
+
+
 def main() -> int:
     print(f"repo root: {ROOT}")
-    results = []
+    argv = sys.argv[1:]
+    only: set[str] | None = None
+    if "--only" in argv:
+        only = {item for item in argv[argv.index("--only") + 1].split(",") if item}
+    non_vacuity = "--non-vacuity" in argv
+
+    results: list[tuple[str, str]] = []
     for mutation in MUTATIONS:
-        path = os.path.join(ROOT, mutation.get("file_override", mutation["file"]))
-        with open(path, "rb") as handle:
-            original = handle.read()
-        before = sha256(original)
-        text = original.decode("utf-8").replace("\r\n", "\n")
-        old = mutation["old"]
-        new = mutation["new"]
-        if mutation.get("last"):
-            index = text.rfind(old)
-            assert index >= 0, f'{mutation["id"]}: anchor not found'
-            mutated = text[:index] + new + text[index + len(old):]
-        else:
-            assert text.count(old) >= 1, f'{mutation["id"]}: anchor not found'
-            mutated = text.replace(old, new, 1)
-        try:
-            with open(path, "wb") as handle:
-                handle.write(_adapt_eol(mutated, original))
-            result = run_test(mutation["test"])
-            red = result.returncode != 0
-            results.append(red)
-            print(f'{mutation["id"]} {mutation["desc"]}: '
-                  f'{"RED" if red else "SURVIVED"}')
-            if not red:
-                print(result.stdout[-2000:])
-                print(result.stderr[-2000:])
-        finally:
-            with open(path, "wb") as handle:
-                handle.write(original)
-            with open(path, "rb") as handle:
-                after = sha256(handle.read())
-            if after != before:
-                raise RuntimeError(f'{mutation["id"]}: restore sha256 mismatch')
-    red_count = sum(results)
-    print(f"R22 mutations: {red_count}/{len(results)} RED; survived={len(results)-red_count}")
+        if only is not None and mutation["id"] not in only:
+            continue
+        verdict = run_mutation(mutation, non_vacuity=non_vacuity)
+        results.append((mutation["id"], verdict))
+        print(f'{mutation["id"]} {mutation["desc"]}: {verdict}')
+
+    bad = [(mid, v) for mid, v in results if v != "CAUGHT"]
+    for mid, verdict in bad:
+        print(f"NOT-CAUGHT {mid}: {verdict}")
+    print(f"R22 mutations: {len(results) - len(bad)}/{len(results)} CAUGHT; "
+          f"survived={sum(1 for _, v in bad if v.startswith('SURVIVED'))}; "
+          f"fake={sum(1 for _, v in bad if v == 'FAKE')}; "
+          f"other={sum(1 for _, v in bad if not v.startswith('SURVIVED') and v != 'FAKE')}")
     print("restore sha256: PASS")
-    return 0 if red_count == len(results) else 1
+    return 0 if not bad else 1
 
 
 if __name__ == "__main__":

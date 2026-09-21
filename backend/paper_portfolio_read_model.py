@@ -342,9 +342,15 @@ def _has_any_fill_rows(conn, context: PortfolioReadContext,
         and _has_columns(conn, "paper_orders", {"id", "cycle_id"})
     ):
         return None
+    order_columns = _columns(conn, "paper_orders")
+    if account_id and "account_id" not in order_columns:
+        # An account-scoped read cannot prove "this account had no fills"
+        # without the order identity column; failing open to zero net flow
+        # would publish the account's initial balance as verified.
+        return None
     params: list[Any] = [context.cycle_id, context.asof_day.isoformat()]
     account_sql = ""
-    if account_id and "account_id" in _columns(conn, "paper_orders"):
+    if account_id:
         account_sql = " AND o.account_id=?"
         params.append(str(account_id))
     try:

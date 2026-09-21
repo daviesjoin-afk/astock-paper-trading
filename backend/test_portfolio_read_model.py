@@ -345,6 +345,40 @@ class PortfolioReadModelContractTests(unittest.TestCase):
         finally:
             conn.close()
 
+    def test_port5h_account_specific_fill_check_requires_order_identity(self):
+        # paper_orders 缺 account_id 时，账户级读无法证明“该账户无成交”；
+        # _has_any_fill_rows 必须返回 None，cash 不得把初始余额发布成 verified。
+        conn = sqlite3.connect(":memory:")
+        try:
+            conn.execute(
+                "CREATE TABLE paper_accounts("
+                "id TEXT PRIMARY KEY, initial_cash REAL, cycle_id INTEGER)"
+            )
+            conn.execute(
+                "INSERT INTO paper_accounts VALUES(?,?,?)",
+                (ACCOUNT, 100000.0, self.cycle100),
+            )
+            conn.execute(
+                "CREATE TABLE paper_cycles(id INTEGER PRIMARY KEY, created_at TEXT)"
+            )
+            conn.execute(
+                "INSERT INTO paper_cycles VALUES(?,?)",
+                (self.cycle100, f"{DAY.isoformat()} 09:00:00"),
+            )
+            conn.execute("CREATE TABLE paper_fills(order_id INTEGER, fill_date TEXT)")
+            conn.execute(
+                "CREATE TABLE paper_orders(id INTEGER PRIMARY KEY, cycle_id INTEGER)"
+            )
+            context = P.PortfolioReadContext(self.cycle100, DAY)
+            # 非空门禁：账户确实挂在本周期，否则本测试区分不了两条路径。
+            self.assertIsNotNone(P._cycle_initial(conn, context, account_id=ACCOUNT))
+            self.assertIsNone(P._has_any_fill_rows(conn, context, account_id=ACCOUNT))
+            self.assertEqual(
+                P.cash(conn, context, account_id=ACCOUNT), (None, "unknown")
+            )
+        finally:
+            conn.close()
+
     def test_port6_projection_corruption_cannot_override_authority(self):
         buy = self._order_and_fill(cycle_id=self.cycle100, side="buy", qty=100,
                                    price=10.0, fill_date=DAY.isoformat())

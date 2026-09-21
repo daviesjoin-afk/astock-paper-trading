@@ -44,7 +44,7 @@ After-fix probe summary: `0/8 reproduced`; C1/C2/C3/C6 now use the explicit boun
 
 ## Architecture
 
-- new module: `backend/paper_portfolio_read_model.py` (1015 LOC, 37 top-level defs)
+- new module: `backend/paper_portfolio_read_model.py` (1227 LOC, 42 top-level defs)
 - `paper_trading.py` LOC: `14847 -> 14847`
 - `paper_trading.py` top-level defs: `280 -> 280`
 - reverse imports: `0` (new read model does not import `paper_trading`)
@@ -62,20 +62,22 @@ After-fix probe summary: `0/8 reproduced`; C1/C2/C3/C6 now use the explicit boun
 
 ## Tests
 
-- targeted portfolio read model: `65/65 PASS`
+- targeted portfolio read model: `66/66 PASS`
 - architecture guard: `94/94 PASS`
-- risk / authoritative-position / sell-convergence suites: `114/114 PASS`
-- full backend: `3912 tests OK (skipped=5)`
+- risk / authoritative-position / portfolio read-model suites: `122/122 PASS`
+- full backend: `3913 tests OK (skipped=5)`
 - frontend build: `PASS` (2 pre-existing duplicate-key warnings in `frontend/src/core/format.js`, not introduced by R22)
 - frontend unit: `111/111 PASS`
+- frontend e2e (chromium, `--workers=1`): `32 passed`
 - dist drift: `PASS`
 - compileall: `PASS`
 - ruff: `PASS`
 
 ## Mutation
 
-- `M-PORT1`..`M-PORT58`: `58/58 RED`
-- survived: `0`
+- `M-PORT1`..`M-PORT59`: `59/59 CAUGHT`
+- survived: `0`; fake kills (Syntax/Import won): `0`
+- non-vacuity (`--non-vacuity`, baseline GREEN then mutated RED on the designated test): `59/59`
 - restore sha256: `PASS`
 
 ## Review fixes
@@ -126,15 +128,16 @@ After-fix probe summary: `0/8 reproduced`; C1/C2/C3/C6 now use the explicit boun
 - P2 partial order coverage: an order now counts as covered only when **every** selected fill is identity-consistent and verified. Previously one valid fill alongside a mismatched one let `verified_cash_flows()` publish a partial projection (e.g. half the cost) for the order's real account/code.
 - P2 side-contradicting fills: the bounded fill readers no longer filter by the fill's declared side. A verified BUY order carrying an additional same-day SELL fill is contradictory execution evidence and now fails closed, instead of publishing only the BUY amount as verified cash/NAV when no lot exists.
 - P2 account attachment date: a cycle's `created_at` says nothing about when a given account joined it. Account-level initial capital now also requires bounded attachment evidence (`paper_parameter_versions.effective_date <= asof_day`), so an account attached mid-cycle cannot lend its current `initial_cash` to a snapshot that predates its participation.
-- each review fix has a permanent regression and a dedicated mutation (`M-PORT13`..`M-PORT58`).
+- P2 missing order identity in scoped fill checks: `_has_any_fill_rows` now returns `None` (unreadable) when an account-scoped read is requested on a `paper_orders` table lacking `account_id`, instead of omitting the account predicate and letting `cash()` publish the account's initial balance as verified zero net flow. Added PORT-5h and M-PORT59.
+- each review fix has a permanent regression and a dedicated mutation (`M-PORT13`..`M-PORT59`).
 
 ## Security
 
-- local sensitive-data scan: `kinds: none`, `values: 0`
-- manual review: `2` existing screenshot/binary entries (same `docs/assets/dashboard.png`), no new sensitive findings
-- GitHub Security Leak Scan: `SUCCESS` on exact head (both workflow runs)
-- exact-head CI: `9/9 PASS` on `39495b6`
-- unresolved actionable review threads: `0`
+- local sensitive-data scan (`--scope worktree`): `kinds: none`, `values: 0`
+- manual review: `1` existing screenshot/binary entry (`docs/assets/dashboard.png`, pre-existing in master), no new sensitive findings
+- GitHub Security Leak Scan: to be re-verified on the new head after push
+- exact-head CI: to be re-verified on the new head after push (previously `9/9 PASS` on `5bebd30`)
+- unresolved actionable review threads: `0` after this fix is pushed and the thread is resolved
 
 ## Merge status
 
