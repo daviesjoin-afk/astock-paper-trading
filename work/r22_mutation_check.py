@@ -103,6 +103,28 @@ MUTATIONS = [
         "test": f"{TEST}.test_port9_unknown_valuation_stays_unknown",
         "desc": "remove unknown valuation preservation",
     },
+    {
+        "id": "M-PORT13", "file": READ_MODEL,
+        "old": '            cash = PPort.compatibility_cash(conn, context) if cash is None else cash',
+        "new": '            cash = PPort.initial_capital(conn, context) if cash is None else cash',
+        "test": f"{TEST}.test_port11b_legacy_cash_fallback_accounts_for_recorded_fills",
+        "desc": "substitute untouched capital when legacy cash is unproven",
+        "file_override": "backend/paper_trading.py",
+    },
+    {
+        "id": "M-PORT14", "file": READ_MODEL,
+        "old": '    for rows in (all_buys, all_sells):\n',
+        "new": '    for rows in (all_sells,):\n',
+        "test": f"{TEST}.test_port3b_unverified_buy_blocks_display_cash_flow",
+        "desc": "ignore unverified BUY rows in display cash flow",
+    },
+    {
+        "id": "M-PORT15", "file": READ_MODEL,
+        "old": "        if row is None or int(row[1] or -1) != context.cycle_id:\n            return None\n",
+        "new": "        if row is None:\n            return None\n",
+        "test": f"{TEST}.test_port11c_account_initial_capital_is_cycle_scoped",
+        "desc": "scope account initial capital to the wrong cycle",
+    },
 ]
 
 
@@ -136,7 +158,7 @@ def main() -> int:
     print(f"repo root: {ROOT}")
     results = []
     for mutation in MUTATIONS:
-        path = os.path.join(ROOT, mutation["file"])
+        path = os.path.join(ROOT, mutation.get("file_override", mutation["file"]))
         with open(path, "rb") as handle:
             original = handle.read()
         before = sha256(original)

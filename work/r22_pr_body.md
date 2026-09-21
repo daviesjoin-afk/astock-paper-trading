@@ -44,7 +44,7 @@ After-fix probe summary: `0/8 reproduced`; C1/C2/C3/C6 now use the explicit boun
 
 ## Architecture
 
-- new module: `backend/paper_portfolio_read_model.py` (639 LOC, 25 top-level defs)
+- new module: `backend/paper_portfolio_read_model.py` (669 LOC, 27 top-level defs)
 - `paper_trading.py` LOC: `14847 -> 14847`
 - `paper_trading.py` top-level defs: `280 -> 280`
 - reverse imports: `0` (new read model does not import `paper_trading`)
@@ -62,9 +62,10 @@ After-fix probe summary: `0/8 reproduced`; C1/C2/C3/C6 now use the explicit boun
 
 ## Tests
 
-- targeted portfolio read model: `16/16 PASS`
+- targeted portfolio read model: `19/19 PASS`
 - architecture guard: `94/94 PASS`
-- full backend: `3862 tests OK (skipped=5)`
+- affected R19/R20/R21 + portfolio contract suites: `170/170 PASS`
+- full backend: `3865 tests OK (skipped=5)`
 - frontend build: `PASS` (2 pre-existing duplicate-key warnings in `frontend/src/core/format.js`, not introduced by R22)
 - frontend unit: `111/111 PASS`
 - dist drift: `PASS`
@@ -73,9 +74,16 @@ After-fix probe summary: `0/8 reproduced`; C1/C2/C3/C6 now use the explicit boun
 
 ## Mutation
 
-- `M-PORT1`..`M-PORT12`: `12/12 RED`
+- `M-PORT1`..`M-PORT15`: `15/15 RED`
 - survived: `0`
 - restore sha256: `PASS`
+
+## Review fixes
+
+- P1 unknown cash: strict `PortfolioReadContext.cash()` stays `unknown`; the R21 compatibility port now uses a bounded compatibility estimate that subtracts recorded fills or held lot cost instead of substituting untouched full capital.
+- P2 mixed unverified BUY display flow: every relevant BUY/SELL fill must be identity-consistent and verified before a per-symbol `verified_cash_flow` projection is published; otherwise display cost falls back to durable lot settlement cost.
+- P2 account cycle scope: account-specific initial capital now requires `paper_accounts.cycle_id == requested cycle_id`; a rebounded account cannot lend its new cycle's capital to an old cycle read.
+- each review fix has a permanent regression and a dedicated mutation (`M-PORT13`..`M-PORT15`).
 
 ## Security
 

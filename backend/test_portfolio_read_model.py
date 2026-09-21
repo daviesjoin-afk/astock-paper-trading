@@ -195,6 +195,45 @@ class PortfolioReadModelContractTests(unittest.TestCase):
         rows = P.positions_for_context(self.conn, P.PortfolioReadContext(self.cycle100, DAY))
         self.assertEqual(rows[0]["qty"], 100)
 
+    def test_port3b_unverified_buy_blocks_display_cash_flow(self):
+        first = self._order_and_fill(cycle_id=self.cycle100, side="buy", qty=100,
+                                     price=10.0, fill_date=DAY.isoformat(), fees=0.0)
+        self._lot(self.cycle100, 100, 10.0, source_order_id=first)
+        second = self._order_and_fill(cycle_id=self.cycle100, side="buy", qty=100,
+                                      price=20.0, fill_date=DAY.isoformat(), fees=0.0)
+        self.conn.execute("UPDATE paper_orders SET execution_verified=0 WHERE id=?", (second,))
+        self._lot(self.cycle100, 100, 20.0, source_order_id=second)
+        self.conn.commit()
+        context = P.PortfolioReadContext(self.cycle100, DAY)
+        self.assertEqual(P.verified_cash_flows(self.conn, context), {})
+        rows = P.positions_for_context(self.conn, context)
+        self.assertEqual(rows[0]["display_cost"], 15.0)
+
+    def test_port11b_legacy_cash_fallback_accounts_for_recorded_fills(self):
+        buy = self._order_and_fill(cycle_id=self.cycle100, side="buy", qty=100,
+                                   price=10.0, fill_date=DAY.isoformat(), fees=5.0,
+                                   verified=False)
+        self._lot(self.cycle100, 100, 10.05, source_order_id=buy)
+        self.conn.commit()
+        context = P.PortfolioReadContext(self.cycle100, DAY)
+        self.assertEqual(P.cash(self.conn, context), (None, "unknown"))
+        self.assertEqual(P.compatibility_cash(self.conn, context), 98995.0)
+        _positions, _value, nav, _industries, _codes = PT._shared_account_exposure(
+            self.conn, {CODE: {"price": 10.0}}, DAY, cycle_id=self.cycle100,
+        )
+        self.assertEqual(nav, 99995.0)
+
+    def test_port11c_account_initial_capital_is_cycle_scoped(self):
+        self.conn.execute(
+            "UPDATE paper_accounts SET cycle_id=? WHERE id=?", (self.cycle101, ACCOUNT)
+        )
+        self.conn.commit()
+        context = P.PortfolioReadContext(self.cycle100, DAY)
+        self.assertEqual(
+            P.cash(self.conn, context, account_id=ACCOUNT),
+            (None, "unknown"),
+        )
+
     def test_port7_historical_read_never_resolves_active_cycle(self):
         buy = self._order_and_fill(cycle_id=self.cycle100, side="buy", qty=100,
                                    price=10.0, fill_date=DAY.isoformat())

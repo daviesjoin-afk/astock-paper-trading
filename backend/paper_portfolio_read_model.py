@@ -44,6 +44,7 @@ __all__ = [
     "portfolio_for_context",
     "exposure",
     "initial_capital",
+    "compatibility_cash",
     "portfolio_for_cycle",
 ]
 
@@ -100,6 +101,15 @@ def _day_text(value: Any) -> str | None:
 
 def _row_dicts(rows) -> list[dict]:
     return [dict(row) for row in rows]
+
+
+def _identity_ok(row: Mapping) -> bool:
+    """A fill row must match its source order identity before it counts."""
+    return (
+        str(row.get("fill_account_id") or "") == str(row.get("order_account_id") or "")
+        and str(row.get("fill_code") or "") == str(row.get("order_code") or "")
+        and str(row.get("fill_side") or "") == str(row.get("order_side") or "")
+    )
 
 
 def _columns(conn, table: str) -> set[str]:
@@ -167,12 +177,7 @@ def _sell_fills(conn, context: PortfolioReadContext, account_id: str | None = No
     ))
     verified = []
     for row in rows:
-        identity_ok = (
-            str(row.get("fill_account_id") or "") == str(row.get("order_account_id") or "")
-            and str(row.get("fill_code") or "") == str(row.get("order_code") or "")
-            and str(row.get("fill_side") or "") == str(row.get("order_side") or "")
-        )
-        if identity_ok and EV.is_verified_row(row):
+        if _identity_ok(row) and EV.is_verified_row(row):
             verified.append(row)
     return verified, rows, True
 
@@ -229,12 +234,7 @@ def _buy_fills(conn, context: PortfolioReadContext, account_id: str | None = Non
     ))
     verified = []
     for row in rows:
-        identity_ok = (
-            str(row.get("fill_account_id") or "") == str(row.get("order_account_id") or "")
-            and str(row.get("fill_code") or "") == str(row.get("order_code") or "")
-            and str(row.get("fill_side") or "") == str(row.get("order_side") or "")
-        )
-        if identity_ok and EV.is_verified_row(row):
+        if _identity_ok(row) and EV.is_verified_row(row):
             verified.append(row)
     return verified, rows, True
 
@@ -281,10 +281,7 @@ def _unproven_sell_exists(conn, context: PortfolioReadContext,
             return bool(conn.execute(sql, tuple(params)).fetchone()[0])
         return False
     unproven_fill = any(
-        str(row.get("fill_account_id") or "") != str(row.get("order_account_id") or "")
-        or str(row.get("fill_code") or "") != str(row.get("order_code") or "")
-        or str(row.get("fill_side") or "") != str(row.get("order_side") or "")
-        or not EV.is_verified_row(row)
+        not _identity_ok(row) or not EV.is_verified_row(row)
         for row in rows
     )
     if unproven_fill:
@@ -379,18 +376,22 @@ def verified_cash_flows(conn, context: PortfolioReadContext, *,
     proven.  Otherwise the caller gets no flow for that key and the display
     layer falls back to durable lot settlement cost.
     """
-    buys, _buy_rows, proof = _buy_fills(conn, context, account_id)
-    sells, _sell_rows, sell_proof = _sell_fills(conn, context, account_id)
+    buys, all_buys, proof = _buy_fills(conn, context, account_id)
+    sells, all_sells, sell_proof = _sell_fills(conn, context, account_id)
     if not proof or not sell_proof:
         return {}
     flows: dict[tuple[str, str], dict] = {}
     incomplete: set[tuple[str, str]] = set()
+    # Every relevant fill must be identity-consistent and verified before a
+    # per-symbol display cost may use a partial cash-flow projection.
+    for rows in (all_buys, all_sells):
+        for row in rows:
+            key = (str(row.get("fill_account_id") or ""), str(row.get("fill_code") or ""))
+            if not _identity_ok(row) or not EV.is_verified_row(row):
+                incomplete.add(key)
     for side, rows in (("buy", buys), ("sell", sells)):
         for row in rows:
             key = (str(row.get("fill_account_id") or ""), str(row.get("fill_code") or ""))
-            if not EV.is_verified_row(row):
-                incomplete.add(key)
-                continue
             flow = flows.setdefault(key, {"buy_cash": 0.0, "sell_cash": 0.0})
             amount = _num(row.get("fill_amount"))
             fees = _num(row.get("fill_fees"), 0.0)
@@ -401,13 +402,6 @@ def verified_cash_flows(conn, context: PortfolioReadContext, *,
                 flow["buy_cash"] += amount + fees
             else:
                 flow["sell_cash"] += amount - fees
-    # If there is any unproven sell for a key, do not publish a partial flow.
-    _verified, all_sells, sell_proof = _sell_fills(conn, context, account_id)
-    if sell_proof:
-        for row in all_sells:
-            key = (str(row.get("fill_account_id") or ""), str(row.get("fill_code") or ""))
-            if not EV.is_verified_row(row):
-                incomplete.add(key)
     return {key: value for key, value in flows.items() if key not in incomplete}
 
 
@@ -454,12 +448,14 @@ def realized_pnl(conn, context: PortfolioReadContext, *,
 def _cycle_initial(conn, context: PortfolioReadContext, account_id: str | None = None):
     """Resolve cycle/account initial capital without reading current cash."""
     if account_id:
-        if not _has_columns(conn, "paper_accounts", {"id", "initial_cash"}):
+        if not _has_columns(conn, "paper_accounts", {"id", "initial_cash", "cycle_id"}):
             return None
         row = conn.execute(
-            "SELECT initial_cash FROM paper_accounts WHERE id=?", (str(account_id),)
+            "SELECT initial_cash,cycle_id FROM paper_accounts WHERE id=?", (str(account_id),)
         ).fetchone()
-        return _num(row[0], None) if row is not None else None
+        if row is None or int(row[1] or -1) != context.cycle_id:
+            return None
+        return _num(row[0], None)
     if _has_columns(conn, "paper_cycles", {"id", "capital"}):
         cycle = conn.execute(
             "SELECT capital FROM paper_cycles WHERE id=?", (context.cycle_id,)
@@ -489,7 +485,7 @@ def _cash_flow_total(conn, context: PortfolioReadContext, account_id: str | None
         return 0.0, STATUS_VERIFIED
     if _unproven_sell_exists(conn, context, account_id):
         return None, STATUS_UNKNOWN
-    if any(not EV.is_verified_row(row) for row in buy_rows):
+    if any(not _identity_ok(row) or not EV.is_verified_row(row) for row in buy_rows):
         return None, STATUS_UNKNOWN
     total = 0.0
     for row in buys:
@@ -523,6 +519,40 @@ def cash(conn, context: PortfolioReadContext, *,
 def initial_capital(conn, context: PortfolioReadContext):
     """Return the durable cycle/account initial capital without current cash."""
     return _cycle_initial(conn, context)
+
+
+def compatibility_cash(conn, context: PortfolioReadContext, *,
+                      account_id: str | None = None):
+    """Bounded legacy/risk compatibility cash estimate.
+
+    The strict :func:`cash` stays unknown when fill verification is absent.
+    This narrower fallback is for the R21 risk port only: it keeps the value
+    bounded to the requested cycle/as-of and accounts for recorded fills or
+    held lot cost, without reading current account cash.
+    """
+    initial = _cycle_initial(conn, context, account_id)
+    if initial is None:
+        return None
+    buys, buy_rows, buy_proof = _buy_fills(conn, context, account_id)
+    sells, sell_rows, sell_proof = _sell_fills(conn, context, account_id)
+    rows = list(buy_rows or ()) + list(sell_rows or ())
+    if rows and (buy_proof or sell_proof):
+        total = initial
+        for row in rows:
+            amount = _num(row.get("fill_amount"))
+            fees = _num(row.get("fill_fees"), 0.0)
+            if amount is None or fees is None:
+                return None
+            if str(row.get("fill_side") or "") == "buy":
+                total -= amount + fees
+            else:
+                total += amount - fees
+        return total
+    invested = sum(
+        int(row.get("remaining_qty") or 0) * (_num(row.get("cost"), 0.0) or 0.0)
+        for row in bounded_lots(conn, context, account_id=account_id)
+    )
+    return max(0.0, initial - invested)
 
 
 def exposure(positions, quotes, *, num):
