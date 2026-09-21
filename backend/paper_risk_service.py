@@ -18,7 +18,7 @@ import execution_planner as EP
 import execution_verification as EV
 import paper_account_specs as ACS
 import paper_decision_audit as PDA
-import paper_position_read_model as PPRM
+import paper_portfolio_read_model as PPort
 import paper_position_review as PReview
 import paper_position_risk_state as PPRS
 import paper_quote_policy as PQP
@@ -207,8 +207,9 @@ def run(context: RiskRunContext, *, ports: RiskServicePorts):
     with ports.open_db() as snapshot_conn:
         risk_ids = ports.risk_exit_account_ids(snapshot_conn)
         # 快照阶段就固定到**已认领**的周期，而不是"此刻 active 的那个周期"。
-        positions = [p for p in PPRM.positions_for_cycle(snapshot_conn, cycle_id, asof_day=day)
-                     if p["account_id"] in risk_ids]
+        positions = [p for p in PPort.risk_positions_for_context(
+            snapshot_conn, PPort.PortfolioReadContext(cycle_id, day),
+        ) if p["account_id"] in risk_ids]
         retry_placeholders = ",".join("?" for _ in ports.evidence.entry_retry_signal_statuses)
         candidate_rows = snapshot_conn.execute(
             f"SELECT DISTINCT code FROM paper_signals WHERE status IN ({retry_placeholders})",
@@ -266,8 +267,9 @@ def run(context: RiskRunContext, *, ports: RiskServicePorts):
         # 证明"已认领的周期仍是当前 active cycle"。周期变了 ⇒ fail closed。
         PRSS.assert_cycle_active(conn, cycle_id=cycle_id)
         risk_ids = ports.risk_exit_account_ids(conn)
-        positions = [p for p in PPRM.positions_for_cycle(conn, cycle_id, asof_day=day)
-                     if p["account_id"] in risk_ids]
+        positions = [p for p in PPort.risk_positions_for_context(
+            conn, PPort.PortfolioReadContext(cycle_id, day),
+        ) if p["account_id"] in risk_ids]
         account_map = {
             row["id"]: row for row in _accounts_by_id(conn, risk_ids)
         }

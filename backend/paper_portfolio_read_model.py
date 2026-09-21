@@ -40,6 +40,8 @@ __all__ = [
     "bounded_lots",
     "verified_cash_flows",
     "positions_for_context",
+    "positions_for_context_with_status",
+    "risk_positions_for_context",
     "realized_pnl",
     "cash",
     "portfolio_for_context",
@@ -190,7 +192,7 @@ def _sell_fills(conn, context: PortfolioReadContext, account_id: str | None = No
 def _all_filled_sell_orders(conn, context: PortfolioReadContext, account_id: str | None = None):
     if not _has_columns(conn, "paper_orders", _ORDER_COLUMNS):
         return [], False
-    params: list[Any] = [context.cycle_id, context.asof_day.isoformat()]
+    params: list[Any] = [context.cycle_id]
     account_sql = ""
     if account_id:
         account_sql = " AND account_id=?"
@@ -200,37 +202,44 @@ def _all_filled_sell_orders(conn, context: PortfolioReadContext, account_id: str
         "       execution_verified,realized_pnl,executed_at"
         "  FROM paper_orders"
         " WHERE cycle_id=? AND side='sell' AND status='filled'"
-        "   AND executed_at IS NOT NULL AND length(executed_at)>=10"
-        "   AND substr(executed_at,1,10)<=?"
         + account_sql +
         " ORDER BY id",
         tuple(params),
     ))
-    return rows, True
+    economic_dates, proof = _lot_economic_dates(conn, (row.get("id") for row in rows))
+    bounded = []
+    for row in rows:
+        economic = economic_dates.get(int(row["id"]))
+        if economic is None or economic <= context.asof_day.isoformat():
+            bounded.append(row)
+    return bounded, proof
 
 
 def _all_filled_buy_orders(conn, context: PortfolioReadContext,
                            account_id: str | None = None):
     if not _has_columns(conn, "paper_orders", _ORDER_COLUMNS):
         return [], False
-    params: list[Any] = [context.cycle_id, context.asof_day.isoformat()]
+    params: list[Any] = [context.cycle_id]
     account_sql = ""
     if account_id:
         account_sql = " AND account_id=?"
         params.append(str(account_id))
     rows = _row_dicts(conn.execute(
         "SELECT id,account_id,code,status,cycle_id,execution_status,"
-        "       execution_verified,realized_pnl,executed_at,created_at"
+        "       execution_verified,realized_pnl,executed_at"
         "  FROM paper_orders"
         " WHERE cycle_id=? AND side='buy' AND status='filled'"
-        "   AND COALESCE(executed_at,created_at) IS NOT NULL"
-        "   AND length(COALESCE(executed_at,created_at))>=10"
-        "   AND substr(COALESCE(executed_at,created_at),1,10)<=?"
         + account_sql +
         " ORDER BY id",
         tuple(params),
     ))
-    return rows, True
+    economic_dates, proof = _lot_economic_dates(conn, (row.get("id") for row in rows))
+    bounded = []
+    for row in rows:
+        economic = economic_dates.get(int(row["id"]))
+        if economic is None or economic <= context.asof_day.isoformat():
+            bounded.append(row)
+    return bounded, proof
 
 
 def _buy_fills(conn, context: PortfolioReadContext, account_id: str | None = None):
@@ -508,7 +517,8 @@ def verified_cash_flows(conn, context: PortfolioReadContext, *,
 
 
 def positions_for_context_with_status(
-    conn, context: PortfolioReadContext, *, account_id: str | None = None
+    conn, context: PortfolioReadContext, *, account_id: str | None = None,
+    risk_state_rows: list[dict] | None = None,
 ) -> tuple[list[dict], str]:
     """Aggregate bounded lots and retain the quantity-proof status."""
     lots, quantity_status = bounded_lots_with_status(
@@ -517,7 +527,7 @@ def positions_for_context_with_status(
     open_lots = [row for row in lots if int(row.get("remaining_qty") or 0) > 0]
     flows = verified_cash_flows(conn, context, account_id=account_id)
     positions = PP.aggregate_positions(
-        open_lots, (), flows, context.asof_day.isoformat(), num=_num
+        open_lots, risk_state_rows or (), flows, context.asof_day.isoformat(), num=_num
     )
     return positions, quantity_status
 
@@ -698,6 +708,24 @@ def _valuation_price(valuations: Mapping | None, code: str) -> float | None:
     if isinstance(value, Mapping):
         value = value.get("price")
     return _num(value, None)
+
+
+def risk_positions_for_context(conn, context: PortfolioReadContext, *,
+                              account_id: str | None = None) -> list[dict]:
+    """Bounded position read with cycle-owned runtime risk state for risk scans."""
+    risk_state_rows = []
+    if _has_columns(conn, "paper_position_risk_state", {"cycle_id"}):
+        risk_state_rows = _row_dicts(conn.execute(
+            "SELECT * FROM paper_position_risk_state WHERE cycle_id=?",
+            (context.cycle_id,),
+        ))
+    positions, status = positions_for_context_with_status(
+        conn, context, account_id=account_id,
+        risk_state_rows=risk_state_rows,
+    )
+    if status != STATUS_VERIFIED:
+        raise PortfolioReadUnavailable("portfolio quantity proof is unknown")
+    return positions
 
 
 def portfolio_for_context(

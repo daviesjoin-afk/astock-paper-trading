@@ -560,13 +560,13 @@ class RiskScanStateIsACycleOwnedBoundary(unittest.TestCase):
         raw = _source("paper_risk_service.py")
         impl = _function_source(ast.parse(raw), "run", raw)
         self.assertIn(
-            "PPRM.positions_for_cycle(", impl,
-            "_monitor_risk_impl 不再用显式周期读持仓：一次从旧周期开始的扫描会"
-            "重新问'现在 active 的是谁'，从而操作新周期",
+            "PPort.risk_positions_for_context(", impl,
+            "risk service 不再用显式 cycle/as-of bounded reader：一次从旧周期开始的"
+            "扫描会重新问'现在 active 的是谁'，从而操作新周期",
         )
         self.assertNotIn(
-            "_position_rows(", impl,
-            "_monitor_risk_impl 又回落到 current-cycle 持仓读取",
+            "PPRM.positions_for_cycle(", impl,
+            "risk service 又回落到 current remaining_qty 读取",
         )
         self.assertIn(
             "PRSS.assert_cycle_active(", impl,

@@ -186,6 +186,33 @@ class PortfolioReadModelContractTests(unittest.TestCase):
                 self.conn, {CODE: {"price": 10.0}}, DAY, cycle_id=self.cycle100,
             )
 
+    def test_port4g_risk_positions_follow_economic_asof(self):
+        historical = self._order_and_fill(cycle_id=self.cycle100, side="buy", qty=100,
+                                          price=10.0, fill_date=DAY.isoformat())
+        self._lot(self.cycle100, 100, 10.0,
+                  acquired_at=f"{NEXT.isoformat()} 10:00:00", source_order_id=historical)
+        future = self._order_and_fill(cycle_id=self.cycle100, side="buy", qty=50,
+                                      price=11.0, fill_date=NEXT.isoformat())
+        self._lot(self.cycle100, 50, 11.0,
+                  acquired_at=f"{DAY.isoformat()} 10:00:00", source_order_id=future)
+        self.conn.commit()
+        positions = P.risk_positions_for_context(
+            self.conn, P.PortfolioReadContext(self.cycle100, DAY)
+        )
+        self.assertEqual([row["qty"] for row in positions], [100])
+
+    def test_port4h_risk_positions_fail_closed_on_unknown_quantity(self):
+        buy = self._order_and_fill(cycle_id=self.cycle100, side="buy", qty=100,
+                                   price=10.0, fill_date=DAY.isoformat())
+        self._lot(self.cycle100, 100, 10.0, source_order_id=buy)
+        self._order_and_fill(cycle_id=self.cycle100, side="sell", qty=50,
+                             price=12.0, fill_date=DAY.isoformat(), verified=False)
+        self.conn.commit()
+        with self.assertRaises(P.PortfolioReadUnavailable):
+            P.risk_positions_for_context(
+                self.conn, P.PortfolioReadContext(self.cycle100, DAY)
+            )
+
     def test_port4b_explicit_exposure_uses_bounded_positions(self):
         self._lot(self.cycle100, 100, 10.0, acquired_at=f"{NEXT.isoformat()} 10:00:00")
         self.conn.commit()
@@ -294,6 +321,19 @@ class PortfolioReadModelContractTests(unittest.TestCase):
         self.assertEqual(
             P.cash(self.conn, P.PortfolioReadContext(self.cycle100, DAY)),
             (None, "unknown"),
+        )
+
+    def test_port11e_future_dated_fill_order_does_not_change_earlier_cash(self):
+        order = self._order_and_fill(cycle_id=self.cycle100, side="buy", qty=100,
+                                     price=10.0, fill_date=NEXT.isoformat())
+        self.conn.execute(
+            "UPDATE paper_orders SET executed_at=? WHERE id=?",
+            (f"{DAY.isoformat()} 09:30:01", order),
+        )
+        self.conn.commit()
+        self.assertEqual(
+            P.cash(self.conn, P.PortfolioReadContext(self.cycle100, DAY)),
+            (100000.0, "verified"),
         )
 
     def test_port11b_legacy_cash_fallback_accounts_for_recorded_fills(self):

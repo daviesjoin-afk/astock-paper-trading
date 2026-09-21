@@ -41,7 +41,7 @@ MUTATIONS = [
     },
     {
         "id": "M-PORT4", "file": READ_MODEL,
-        "old": '''    positions = PP.aggregate_positions(\n        open_lots, (), flows, context.asof_day.isoformat(), num=_num\n    )\n    return positions, quantity_status\n''',
+        "old": '''    positions = PP.aggregate_positions(\n        open_lots, risk_state_rows or (), flows, context.asof_day.isoformat(), num=_num\n    )\n    return positions, quantity_status\n''',
         "new": '''    _pending = [{\n        "account_id": "pending", "code": "PENDING", "name": None,\n        "industry": None, "remaining_qty": 100, "qty": 100, "cost": 1.0,\n        "acquired_at": context.asof_day.isoformat() + " 00:00:00",\n        "available_date": context.asof_day.isoformat(), "asset_type": "stock_t1",\n    }]\n    positions = PP.aggregate_positions(\n        open_lots + _pending, (), flows, context.asof_day.isoformat(), num=_num\n    )\n    return positions, quantity_status\n''',
         "test": f"{TEST}.test_port5_pending_and_unverified_orders_are_excluded",
         "desc": "include a pending order as a position",
