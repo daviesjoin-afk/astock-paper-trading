@@ -86,6 +86,20 @@ def _num(value: Any, default: float | None = 0.0) -> float | None:
         return default
 
 
+def _ledger_num(value: Any, default: float | None = None) -> float | None:
+    """Numeric ledger evidence where non-finite values are unknown, not data.
+
+    SQLite REAL columns can hold ``inf`` / ``-inf`` / ``nan``.  Publishing such
+    a value would make cash / realized PnL / NAV / exposure "verified infinite",
+    so it is treated exactly like an unreadable value — the same policy
+    :func:`_valuation_price` already applies to prices.
+    """
+    number = _num(value, None)
+    if number is None or not math.isfinite(number):
+        return default
+    return number
+
+
 def _asof(value: Any) -> dt.date:
     """Parse an explicit as-of date; never fall back to today."""
     if isinstance(value, dt.datetime):
@@ -395,7 +409,13 @@ def _consume_fifo(lots: list[dict], sells: list[dict]) -> tuple[list[dict], bool
 
 
 def _lot_economic_dates(conn, order_ids) -> tuple[dict[int, str], bool]:
-    """Return source-order acquisition dates, preferring the actual fill date."""
+    """Return source-order acquisition dates, preferring the actual fill date.
+
+    Only an identity-consistent fill may date its order.  An unrelated fill
+    (another account / code / side) must not push a filled order's economic
+    date past the requested as-of: that would hide both the fill and the order
+    from the bounded sell checks and publish a pre-sale portfolio as verified.
+    """
     ids = sorted({int(value) for value in order_ids if value is not None})
     if not ids:
         return {}, True
@@ -403,19 +423,43 @@ def _lot_economic_dates(conn, order_ids) -> tuple[dict[int, str], bool]:
     orders_available = _has_columns(conn, "paper_orders", {"id", "executed_at", "status"})
     if not fills_available and not orders_available:
         return {}, False
+    identity_available = (
+        _has_columns(conn, "paper_fills",
+                     {"order_id", "fill_date", "account_id", "side", "code"})
+        and _has_columns(conn, "paper_orders", {"id", "account_id", "side", "code"})
+    )
     dates: dict[int, str] = {}
     for start in range(0, len(ids), 400):
         chunk = ids[start:start + 400]
         placeholders = ",".join("?" for _ in chunk)
         if fills_available:
-            rows = conn.execute(
-                f"SELECT order_id,MIN(fill_date) FROM paper_fills"
-                f" WHERE order_id IN ({placeholders}) AND fill_date IS NOT NULL"
-                f"   AND length(fill_date)>=10 GROUP BY order_id",
-                tuple(chunk),
-            ).fetchall()
-            for order_id, fill_date in rows:
-                dates[int(order_id)] = str(fill_date)[:10]
+            if identity_available:
+                rows = _row_dicts(conn.execute(
+                    f"SELECT f.order_id, f.fill_date AS fill_date,"
+                    f"       f.account_id AS fill_account_id, f.side AS fill_side,"
+                    f"       f.code AS fill_code, o.account_id AS order_account_id,"
+                    f"       o.side AS order_side, o.code AS order_code"
+                    f"  FROM paper_fills f JOIN paper_orders o ON o.id=f.order_id"
+                    f" WHERE f.order_id IN ({placeholders})"
+                    f"   AND f.fill_date IS NOT NULL AND length(f.fill_date)>=10",
+                    tuple(chunk),
+                ))
+                for row in rows:
+                    if not _identity_ok(row):
+                        continue
+                    order_id = int(row["order_id"])
+                    day = str(row["fill_date"])[:10]
+                    if order_id not in dates or day < dates[order_id]:
+                        dates[order_id] = day
+            else:
+                rows = conn.execute(
+                    f"SELECT order_id,MIN(fill_date) FROM paper_fills"
+                    f" WHERE order_id IN ({placeholders}) AND fill_date IS NOT NULL"
+                    f"   AND length(fill_date)>=10 GROUP BY order_id",
+                    tuple(chunk),
+                ).fetchall()
+                for order_id, fill_date in rows:
+                    dates[int(order_id)] = str(fill_date)[:10]
         missing = [value for value in chunk if value not in dates]
         if missing and orders_available:
             placeholders = ",".join("?" for _ in missing)
@@ -549,6 +593,12 @@ def bounded_lots_with_status(conn, context: PortfolioReadContext, *,
         lot = dict(row)
         lot_id = int(lot.get("id") or 0)
         original = str(lot.get("acquired_at") or "")
+        # Non-finite stored quantities are not ledger evidence.  They would
+        # otherwise raise out of the FIFO integer arithmetic below.
+        if _ledger_num(lot.get("qty")) is None:
+            unknown_date = True
+            uncertain_lot_ids.add(lot_id)
+            continue
         evidence = _verified_source_buy_fill(conn, lot, reused_sources=reused_sources)
         if evidence is None:
             uncertain_lot_ids.add(lot_id)
@@ -626,8 +676,8 @@ def verified_cash_flows(conn, context: PortfolioReadContext, *,
         for row in rows:
             key = (str(row.get("fill_account_id") or ""), str(row.get("fill_code") or ""))
             flow = flows.setdefault(key, {"buy_cash": 0.0, "sell_cash": 0.0})
-            amount = _num(row.get("fill_amount"))
-            fees = _num(row.get("fill_fees"), 0.0)
+            amount = _ledger_num(row.get("fill_amount"))
+            fees = _ledger_num(row.get("fill_fees"), 0.0)
             if amount is None or fees is None:
                 incomplete.add(key)
                 continue
@@ -704,7 +754,7 @@ def realized_pnl(conn, context: PortfolioReadContext, *,
         sorted_order_ids,
     ))
     for order in orders:
-        value = _num(order.get("realized_pnl"), None)
+        value = _ledger_num(order.get("realized_pnl"))
         if value is None:
             return None, STATUS_UNKNOWN
         total += value
@@ -787,7 +837,7 @@ def _cycle_initial(conn, context: PortfolioReadContext, account_id: str | None =
             return None
         if not _cycle_created_by(conn, context, account_id=account_id):
             return None
-        return _num(row[0], None)
+        return _ledger_num(row[0])
     if _has_columns(conn, "paper_cycles", {"id", "capital"}):
         cycle = conn.execute(
             "SELECT capital FROM paper_cycles WHERE id=?", (context.cycle_id,)
@@ -795,7 +845,7 @@ def _cycle_initial(conn, context: PortfolioReadContext, account_id: str | None =
         if cycle is not None:
             if not _cycle_created_by(conn, context):
                 return None
-            declared = _num(cycle[0], 0.0)
+            declared = _ledger_num(cycle[0], 0.0)
             if declared is not None and declared > 0:
                 return declared
     if not _has_columns(conn, "paper_accounts", {"cycle_id", "initial_cash"}):
@@ -807,7 +857,7 @@ def _cycle_initial(conn, context: PortfolioReadContext, account_id: str | None =
     ).fetchone()
     if row is None or int(row[0] or 0) <= 0:
         return None
-    return _num(row[1], None)
+    return _ledger_num(row[1])
 
 
 def _cash_flow_total(conn, context: PortfolioReadContext, account_id: str | None = None):
@@ -844,14 +894,14 @@ def _cash_flow_total(conn, context: PortfolioReadContext, account_id: str | None
         return None, STATUS_UNKNOWN
     total = 0.0
     for row in buys:
-        amount = _num(row.get("fill_amount"))
-        fees = _num(row.get("fill_fees"), 0.0)
+        amount = _ledger_num(row.get("fill_amount"))
+        fees = _ledger_num(row.get("fill_fees"), 0.0)
         if amount is None or fees is None:
             return None, STATUS_UNKNOWN
         total -= amount + fees
     for row in sells:
-        amount = _num(row.get("fill_amount"))
-        fees = _num(row.get("fill_fees"), 0.0)
+        amount = _ledger_num(row.get("fill_amount"))
+        fees = _ledger_num(row.get("fill_fees"), 0.0)
         if amount is None or fees is None:
             return None, STATUS_UNKNOWN
         total += amount - fees
@@ -884,8 +934,12 @@ def initial_capital(conn, context: PortfolioReadContext):
     return _cycle_initial(conn, context)
 
 
-def _uncovered_lot_facts(conn, lots: list[dict]) -> tuple[float, int]:
-    """Cash cost and count of durable lots without verified matching BUY fills."""
+def _uncovered_lot_facts(conn, lots: list[dict]):
+    """Cash cost and count of durable lots without verified matching BUY fills.
+
+    Returns ``(cost, count)``; ``cost`` is ``None`` when an uncovered lot
+    carries non-finite ledger evidence, which is unknown rather than a number.
+    """
     if not lots:
         return 0.0, 0
     reused_sources = _reused_source_orders(lots)
@@ -894,10 +948,14 @@ def _uncovered_lot_facts(conn, lots: list[dict]) -> tuple[float, int]:
     for lot in lots:
         if _verified_source_buy_fill(conn, lot, reused_sources=reused_sources) is not None:
             continue
-        qty = _num(lot.get("qty"), 0.0) or 0.0
-        cost = _num(lot.get("cost"), 0.0) or 0.0
+        qty = _ledger_num(lot.get("qty"), 0.0)
+        cost = _ledger_num(lot.get("cost"), 0.0)
         uncovered_count += 1
-        uncovered_cost += qty * cost
+        if qty is None or cost is None:
+            uncovered_cost = None
+            continue
+        if uncovered_cost is not None:
+            uncovered_cost += qty * cost
     return uncovered_cost, uncovered_count
 
 
@@ -927,8 +985,8 @@ def compatibility_cash(conn, context: PortfolioReadContext, *,
     if rows and (buy_proof or sell_proof):
         total = initial
         for row in rows:
-            amount = _num(row.get("fill_amount"))
-            fees = _num(row.get("fill_fees"), 0.0)
+            amount = _ledger_num(row.get("fill_amount"))
+            fees = _ledger_num(row.get("fill_fees"), 0.0)
             if amount is None or fees is None:
                 return None
             if str(row.get("fill_side") or "") == "buy":
@@ -936,9 +994,11 @@ def compatibility_cash(conn, context: PortfolioReadContext, *,
             else:
                 total += amount - fees
         uncovered_cost, _uncovered_count = _uncovered_lot_facts(conn, all_lots)
+        if uncovered_cost is None:
+            return None
         return total - uncovered_cost
     invested = sum(
-        int(row.get("remaining_qty") or 0) * (_num(row.get("cost"), 0.0) or 0.0)
+        int(row.get("remaining_qty") or 0) * (_ledger_num(row.get("cost"), 0.0) or 0.0)
         for row in open_lots
     )
     return max(0.0, initial - invested)
@@ -971,10 +1031,15 @@ def _valuation_price(valuations: Mapping | None, code: str) -> float | None:
 
 
 def _risk_state_rows_for_context(conn, context: PortfolioReadContext) -> list[dict]:
-    """Return only runtime risk rows provably no newer than ``asof_day``."""
+    """Return only runtime risk rows provably no newer than ``asof_day``.
+
+    ``account_id`` / ``code`` are part of the prerequisite check: the caller
+    indexes every returned row by both, so a partially migrated table without
+    them must be treated as unavailable rather than raising ``KeyError``.
+    """
     if not _has_columns(
         conn, "paper_position_risk_state",
-        {"cycle_id", "initialized_at", "updated_at"},
+        {"cycle_id", "account_id", "code", "initialized_at", "updated_at"},
     ):
         return []
     day = context.asof_day.isoformat()

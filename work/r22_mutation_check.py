@@ -185,7 +185,7 @@ MUTATIONS = [
     },
     {
         "id": "M-PORT24", "file": READ_MODEL,
-        "old": "        uncovered_cost, _uncovered_count = _uncovered_lot_facts(conn, all_lots)\n        return total - uncovered_cost\n",
+        "old": "        uncovered_cost, _uncovered_count = _uncovered_lot_facts(conn, all_lots)\n        if uncovered_cost is None:\n            return None\n        return total - uncovered_cost\n",
         "new": "        return total\n",
         "test": f"{TEST}.test_port11d_mixed_fill_less_lot_is_reconciled",
         "desc": "ignore uncovered durable lot cost in compatibility cash",
@@ -323,11 +323,11 @@ MUTATIONS = [
         "id": "M-PORT36", "file": READ_MODEL,
         "old": '''        if not _cycle_created_by(conn, context, account_id=account_id):
             return None
-        return _num(row[0], None)
+        return _ledger_num(row[0])
 ''',
         "new": '''        if not _cycle_created_by(conn, context):
             return None
-        return _num(row[0], None)
+        return _ledger_num(row[0])
 ''',
         "test": f"{TEST}.test_port11m_pre_cycle_activity_is_account_scoped",
         "desc": "let another account authorize pre-cycle capital",
@@ -438,6 +438,62 @@ MUTATIONS = [
 ''',
         "test": f"{TEST}.test_port11n_missing_cycle_creation_evidence_stays_unknown",
         "desc": "treat missing cycle creation evidence as proof of existence",
+    },
+    {
+        "id": "M-PORT46", "file": READ_MODEL,
+        "old": '''    number = _num(value, None)
+    if number is None or not math.isfinite(number):
+        return default
+    return number
+''',
+        "new": '''    return _num(value, default)
+''',
+        "test": f"{TEST}.test_port9c_non_finite_ledger_values_stay_unknown",
+        "desc": "publish non-finite fill amounts as verified cash",
+    },
+    {
+        "id": "M-PORT47", "file": READ_MODEL,
+        "old": '''        value = _ledger_num(order.get("realized_pnl"))
+''',
+        "new": '''        value = _num(order.get("realized_pnl"), None)
+''',
+        "test": f"{TEST}.test_port10d_non_finite_realized_pnl_stays_unknown",
+        "desc": "publish non-finite realized PnL as verified",
+    },
+    {
+        "id": "M-PORT48", "file": READ_MODEL,
+        "old": '''        {"cycle_id", "account_id", "code", "initialized_at", "updated_at"},
+''',
+        "new": '''        {"cycle_id", "initialized_at", "updated_at"},
+''',
+        "test": f"{TEST}.test_port4p_partial_risk_state_schema_fails_closed",
+        "desc": "index risk state rows without their identity columns",
+    },
+    {
+        "id": "M-PORT49", "file": READ_MODEL,
+        "old": '''                for row in rows:
+                    if not _identity_ok(row):
+                        continue
+                    order_id = int(row["order_id"])
+''',
+        "new": '''                for row in rows:
+                    order_id = int(row["order_id"])
+''',
+        "test": f"{TEST}.test_port5f_mismatched_fill_does_not_date_its_order",
+        "desc": "let a mismatched fill date its order",
+    },
+    {
+        "id": "M-PORT50", "file": READ_MODEL,
+        "old": '''        if _ledger_num(lot.get("qty")) is None:
+            unknown_date = True
+            uncertain_lot_ids.add(lot_id)
+            continue
+''',
+        "new": '''        if False:
+            continue
+''',
+        "test": f"{TEST}.test_port9d_non_finite_lot_quantity_stays_unknown",
+        "desc": "let a non-finite stored lot quantity through the FIFO read",
     },
 ]
 

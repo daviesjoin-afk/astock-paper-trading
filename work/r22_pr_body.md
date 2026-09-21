@@ -62,10 +62,10 @@ After-fix probe summary: `0/8 reproduced`; C1/C2/C3/C6 now use the explicit boun
 
 ## Tests
 
-- targeted portfolio read model: `52/52 PASS`
+- targeted portfolio read model: `57/57 PASS`
 - architecture guard: `94/94 PASS`
 - risk / authoritative-position / sell-convergence suites: `114/114 PASS`
-- full backend: `3899 tests OK (skipped=5)`
+- full backend: `3904 tests OK (skipped=5)`
 - frontend build: `PASS` (2 pre-existing duplicate-key warnings in `frontend/src/core/format.js`, not introduced by R22)
 - frontend unit: `111/111 PASS`
 - dist drift: `PASS`
@@ -74,7 +74,7 @@ After-fix probe summary: `0/8 reproduced`; C1/C2/C3/C6 now use the explicit boun
 
 ## Mutation
 
-- `M-PORT1`..`M-PORT45`: `45/45 RED`
+- `M-PORT1`..`M-PORT50`: `50/50 RED`
 - survived: `0`
 - restore sha256: `PASS`
 
@@ -115,7 +115,10 @@ After-fix probe summary: `0/8 reproduced`; C1/C2/C3/C6 now use the explicit boun
 - P1 reused source fill: a `source_order_id` claimed by more than one durable lot no longer provides acquisition evidence for any of them (the schema has no uniqueness constraint on it), so a duplicated lot cannot inflate verified quantity, halve display cost, or double risk exposure.
 - P2 partial fill schema: the fill readers' capability check now requires every column they actually `SELECT` (`price` / `amount` / `fees`), so a partially migrated `paper_fills` table falls back to unknown instead of raising `sqlite3.OperationalError` through realized-PnL, portfolio, and risk reads.
 - P2 missing cycle creation evidence: a `paper_cycles` row without `created_at` is no longer treated as proof that the cycle already existed; pre-cycle initial capital still requires bounded activity evidence and otherwise stays unknown.
-- each review fix has a permanent regression and a dedicated mutation (`M-PORT13`..`M-PORT45`).
+- P2 non-finite ledger values: numeric ledger evidence (fill `amount`/`fees`, order `realized_pnl`, cycle/account capital, lot `qty`/`cost`) must be finite — SQLite REAL columns can hold `inf` / `-inf` / `nan`, and publishing one made cash / realized PnL / NAV / exposure "verified infinite". `_ledger_num` now treats non-finite values as unknown, matching the policy `_valuation_price` already applies to prices.
+- P2 risk-state identity columns: the `paper_position_risk_state` prerequisite check now also requires `account_id` / `code`, so a partially migrated table is treated as unavailable instead of raising `KeyError` out of the aggregator.
+- P2 mismatched fill dating: only an identity-consistent fill may supply an order's economic date. An unrelated (another account / code / side) fill can no longer push a filled order past the as-of and hide both the fill and the order from the bounded sell checks, which would have published a pre-sale portfolio as verified.
+- each review fix has a permanent regression and a dedicated mutation (`M-PORT13`..`M-PORT50`).
 
 ## Security
 

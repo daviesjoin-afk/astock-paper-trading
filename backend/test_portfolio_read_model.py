@@ -577,6 +577,95 @@ class PortfolioReadModelContractTests(unittest.TestCase):
         self.assertEqual(lots, [])
         self.assertEqual(status, "unknown")
 
+    def test_port9c_non_finite_ledger_values_stay_unknown(self):
+        buy = self._order_and_fill(cycle_id=self.cycle100, side="buy", qty=100,
+                                   price=10.0, fill_date=DAY.isoformat(), fees=0.0)
+        self._lot(self.cycle100, 100, 10.0, source_order_id=buy)
+        self.conn.execute(
+            "UPDATE paper_fills SET amount=? WHERE order_id=?", (float("inf"), buy)
+        )
+        self.conn.commit()
+        context = P.PortfolioReadContext(self.cycle100, DAY)
+        self.assertEqual(P.cash(self.conn, context), (None, "unknown"))
+        self.assertIsNone(P.compatibility_cash(self.conn, context))
+        self.assertEqual(P.verified_cash_flows(self.conn, context), {})
+
+    def test_port9d_non_finite_lot_quantity_stays_unknown(self):
+        self._lot(self.cycle100, 100, 10.0)
+        self.conn.execute(
+            "UPDATE paper_position_lots SET qty=? WHERE cycle_id=?",
+            (float("inf"), self.cycle100),
+        )
+        self.conn.commit()
+        context = P.PortfolioReadContext(self.cycle100, DAY)
+        lots, status = P.bounded_lots_with_status(self.conn, context)
+        self.assertEqual(lots, [])
+        self.assertEqual(status, "unknown")
+
+    def test_port10d_non_finite_realized_pnl_stays_unknown(self):
+        sell = self._order_and_fill(
+            cycle_id=self.cycle100, side="sell", qty=100, price=11.0,
+            fill_date=DAY.isoformat(), fees=0.0,
+        )
+        self.conn.execute(
+            "UPDATE paper_orders SET realized_pnl=? WHERE id=?",
+            (float("-inf"), sell),
+        )
+        self.conn.commit()
+        value, status = P.realized_pnl(
+            self.conn, P.PortfolioReadContext(self.cycle100, DAY)
+        )
+        self.assertIsNone(value)
+        self.assertEqual(status, "unknown")
+
+    def test_port4p_partial_risk_state_schema_fails_closed(self):
+        conn = sqlite3.connect(":memory:")
+        try:
+            conn.execute(
+                "CREATE TABLE paper_position_risk_state("
+                "cycle_id INTEGER, initialized_at TEXT, updated_at TEXT)"
+            )
+            conn.execute(
+                "INSERT INTO paper_position_risk_state VALUES(?,?,?)",
+                (self.cycle100, f"{DAY.isoformat()} 09:00:00",
+                 f"{DAY.isoformat()} 09:00:00"),
+            )
+            context = P.PortfolioReadContext(self.cycle100, DAY)
+            self.assertEqual(P._risk_state_rows_for_context(conn, context), [])
+            # 缺 identity 列的 runtime state 视为不可用（不是 KeyError）。
+            with self.assertRaises(P.PortfolioReadUnavailable):
+                P.risk_positions_for_context(conn, context)
+        finally:
+            conn.close()
+
+    def test_port5f_mismatched_fill_does_not_date_its_order(self):
+        # 一条 **fill-less** 已成交 SELL（executed_at 落在 asof 内）+ 一条错配的
+        # 未来 fill 挂在同一 order 上。错配 fill 不得为该 order 提供经济日。
+        stamp = PT._strategy_stamp(self.conn, ACCOUNT)
+        sell = int(self.conn.execute(
+            "INSERT INTO paper_orders(account_id,side,code,name,qty,planned_price,"
+            "filled_price,amount,fees,status,reason,risk_payload,created_at,executed_at,"
+            "order_type,origin,strategy_id,strategy_version,strategy_checksum,cycle_id,"
+            "execution_status,execution_verified,realized_pnl) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (ACCOUNT, "sell", CODE, "测试股", 100, 11.0, 11.0, 1100.0, 0.0, "filled",
+             "r22-test", "{}", f"{DAY.isoformat()} 09:30:00",
+             f"{DAY.isoformat()} 09:30:01", "market", "seed", *stamp, self.cycle100,
+             "verified", 1, 99.0),
+        ).lastrowid)
+        self.conn.execute(
+            "INSERT INTO paper_fills(order_id,account_id,side,code,qty,price,amount,fees,"
+            "fill_date,quote_at,assumption) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+            (sell, "r22-other", "buy", "000001", 100, 10.0, 1000.0, 0.0,
+             NEXT.isoformat(), f"{NEXT.isoformat()} 09:30:00", "r22-test"),
+        )
+        self.conn.commit()
+        context = P.PortfolioReadContext(self.cycle100, DAY)
+        # 错配 fill 不得把该 SELL 推到 asof 之后：否则 order 与 fill 同时从
+        # bounded 卖出检查里消失，卖前组合被发布成 verified。
+        self.assertEqual(P.realized_pnl(self.conn, context), (None, "unknown"))
+        self.assertEqual(P.cash(self.conn, context), (None, "unknown"))
+
     def test_port4o_one_source_fill_cannot_fund_two_lots(self):
         buy = self._order_and_fill(cycle_id=self.cycle100, side="buy", qty=100,
                                    price=10.0, fill_date=DAY.isoformat())
