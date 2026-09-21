@@ -697,14 +697,28 @@ def ensure_strategy_reference_columns(conn):
     return changes
 
 
+#: Table-aware explicit-unknown exceptions for strategy provenance.  A missing
+#: entry means all-NULL provenance is rejected for that table.
+STRATEGY_STAMP_UNKNOWN_ALLOWANCE = {
+    "paper_orders": (
+        "NEW.side='sell' AND NEW.cycle_id IS NOT NULL "
+        "AND NEW.status IN ('pending_execution','unfilled_limit_down')"
+    ),
+    "paper_risk_decisions": "NEW.side='sell'",
+    "paper_audit": (
+        "NEW.event IN ('sell_filled','protective_exit_recovery_watch')"
+    ),
+}
+
+
 def _ensure_strategy_reference_guards(conn):
     """Reject partial, forged, or later-mutated evidence stamps.
 
     Historical NULL rows are intentionally left untouched. A complete stamp
     must reference an exact immutable strategy version. An all-NULL stamp is
-    the explicit "unknown provenance" state and remains allowed (for example
-    a protective SELL whose cycle pin metadata is missing); partial stamps and
-    forged stamps are still rejected. Insert triggers are refreshed so an
+    the explicit "unknown provenance" state only where the table-aware
+    allowance below says a causal protective-SELL path needs it; partial and
+    forged stamps are rejected everywhere. Insert triggers are refreshed so an
     already-initialized database receives the current guard definition.
     """
     for table in (
@@ -715,6 +729,7 @@ def _ensure_strategy_reference_guards(conn):
         ):
             continue
         trigger = f"trg_{table}_strategy_stamp_insert"
+        allow_unknown = STRATEGY_STAMP_UNKNOWN_ALLOWANCE.get(table, "0")
         conn.execute(f"DROP TRIGGER IF EXISTS {trigger}")
         conn.execute(
             f"""CREATE TRIGGER {trigger}
@@ -724,6 +739,7 @@ def _ensure_strategy_reference_guards(conn):
                     NEW.strategy_id IS NULL
                     AND NEW.strategy_version IS NULL
                     AND NEW.strategy_checksum IS NULL
+                    AND ({allow_unknown})
                  )
                  AND (
                     NEW.strategy_id IS NULL OR NEW.strategy_version IS NULL

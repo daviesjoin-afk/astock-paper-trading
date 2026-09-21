@@ -62,6 +62,86 @@ class StrategyVersioningTests(unittest.TestCase):
                 "WHERE id='tq_breakout'"
             )
 
+
+    def _try_insert(self, sql, params=()):
+        try:
+            self.conn.execute(sql, params)
+            self.conn.commit()
+            return True
+        except sqlite3.IntegrityError:
+            self.conn.rollback()
+            return False
+
+    def test_db_strat_1_signal_all_null_rejected(self):
+        self.assertFalse(self._try_insert(
+            "INSERT INTO paper_signals(account_id,signal_date,intended_date,code,"
+            "payload,status,created_at) VALUES(?,?,?,?,?,?,?)",
+            ("tq_breakout", "2026-09-10", "2026-09-10", "600001",
+             "{}", "pending", "2026-09-10 09:00:00"),
+        ))
+
+    def test_db_strat_guard_scope_matrix(self):
+        cycle_id = self.conn.execute(
+            "SELECT cycle_id FROM paper_accounts WHERE id='tq_breakout'"
+        ).fetchone()[0]
+        account = "tq_breakout"
+        order_sql = (
+            "INSERT INTO paper_orders(account_id,side,code,qty,status,risk_payload,"
+            "created_at,order_type,origin,cycle_id,strategy_id,strategy_version,"
+            "strategy_checksum) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)"
+        )
+        decision_sql = (
+            "INSERT INTO paper_risk_decisions(account_id,side,decision,payload,created_at,"
+            "strategy_id,strategy_version,strategy_checksum) VALUES(?,?,?,?,?,?,?,?)"
+        )
+        audit_sql = (
+            "INSERT INTO paper_audit(account_id,event,created_at,strategy_id,"
+            "strategy_version,strategy_checksum) VALUES(?,?,?,?,?,?)"
+        )
+        # DB-STRAT-2: BUY all-NULL rejected.
+        self.assertFalse(self._try_insert(
+            order_sql, (account, "buy", "600001", 100, "pending_execution", "{}",
+                        "2026-09-10 09:00:00", "market", "strategy", cycle_id,
+                        None, None, None)))
+        # DB-STRAT-3: SELL pending_execution with explicit cycle allows unknown.
+        self.assertTrue(self._try_insert(
+            order_sql, (account, "sell", "600001", 100, "pending_execution", "{}",
+                        "2026-09-10 09:00:00", "market", "strategy", cycle_id,
+                        None, None, None)))
+        # DB-STRAT-4: SELL without cycle cannot use unknown.
+        self.assertFalse(self._try_insert(
+            order_sql, (account, "sell", "600002", 100, "pending_execution", "{}",
+                        "2026-09-10 09:00:00", "market", "strategy", None,
+                        None, None, None)))
+        # DB-STRAT-5 / 6: SELL risk decision allows unknown; BUY does not.
+        self.assertTrue(self._try_insert(
+            decision_sql, (account, "sell", "filled", "{}", "2026-09-10 10:00:00",
+                           None, None, None)))
+        self.assertFalse(self._try_insert(
+            decision_sql, (account, "buy", "blocked", "{}", "2026-09-10 10:00:00",
+                           None, None, None)))
+        # DB-STRAT-7 / 8: only causal SELL audit events allow unknown.
+        self.assertTrue(self._try_insert(
+            audit_sql, (account, "sell_filled", "2026-09-10 10:00:00", None, None, None)))
+        self.assertTrue(self._try_insert(
+            audit_sql, (account, "protective_exit_recovery_watch",
+                        "2026-09-10 10:00:00", None, None, None)))
+        self.assertFalse(self._try_insert(
+            audit_sql, (account, "some_unrelated_event", "2026-09-10 10:00:00",
+                        None, None, None)))
+        # DB-STRAT-9: partial stamps remain rejected even on allowed shapes.
+        self.assertFalse(self._try_insert(
+            order_sql, (account, "sell", "600003", 100, "pending_execution", "{}",
+                        "2026-09-10 09:00:00", "market", "strategy", cycle_id,
+                        account, None, None)))
+        self.assertFalse(self._try_insert(
+            decision_sql, (account, "sell", "filled", "{}", "2026-09-10 10:00:00",
+                           account, None, None)))
+        # DB-STRAT-10: complete but forged stamps remain rejected.
+        self.assertFalse(self._try_insert(
+            audit_sql, (account, "sell_filled", "2026-09-10 10:00:00",
+                        account, 1, "forged-checksum")))
+
     def test_existing_cycle_and_legacy_order_stay_resolvable_as_v1_after_v2(self):
         cycle_id = self.conn.execute(
             "SELECT cycle_id FROM paper_accounts WHERE id='tq_breakout'"

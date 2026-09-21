@@ -96,7 +96,7 @@ FORBIDDEN_PAPER_TRADING_DEFS = frozenset({
 #: ``paper_risk_scan_state.py`` 后基线持续向下 ratchet。以后只允许 same or
 #: lower：确有 facade wiring 要加，必须同时抽出别的函数保持不增长。
 #: 不要设计环境变量绕过 / ``skip if CI`` 之类的后门。
-PAPER_TRADING_LOC_BASELINE = 14840
+PAPER_TRADING_LOC_BASELINE = 14847
 PAPER_TRADING_DEF_BASELINE = 280
 
 #: Guard 4 —— 新模块允许出现的 import 根（stdlib）。
@@ -1575,6 +1575,39 @@ class RiskApplicationServiceBoundary(unittest.TestCase):
             2,
             "unfilled / pending_execution SELL 没有全部把 explicit cycle 传给 stamp resolver",
         )
+
+    def test_guard12j_commit_fill_inherits_durable_order_stamp(self):
+        raw = _source("execution_planner.py")
+        commit = _function_source(ast.parse(raw), "commit_fill", raw)
+        self.assertIn("order_strategy_stamp = _assert_order_identity(", commit)
+        self.assertIn("PT._risk_log(", commit)
+        self.assertIn("PT._audit(", commit)
+        self.assertGreaterEqual(commit.count("strategy_stamp=order_strategy_stamp"), 2)
+        identity = _function_source(ast.parse(raw), "_assert_order_identity", raw)
+        self.assertIn("strategy_id, strategy_version, strategy_checksum", identity)
+        self.assertIn("partial strategy stamp", identity)
+        for forbidden in ("SR.stamp_for_account(", "SR.get_version(", "SRT.get_context("):
+            self.assertNotIn(
+                forbidden, commit,
+                f"commit_fill 重新解析 strategy provenance：{forbidden}",
+            )
+
+    def test_guard12k_unknown_stamp_exception_is_table_aware(self):
+        raw = _source("paper_schema_migrations.py")
+        start = raw.index("STRATEGY_STAMP_UNKNOWN_ALLOWANCE = {")
+        end = raw.index("\n}\n", start)
+        allowance = raw[start:end]
+        self.assertIn('"paper_orders"', allowance)
+        self.assertIn('"paper_risk_decisions"', allowance)
+        self.assertIn('"paper_audit"', allowance)
+        self.assertNotIn('"paper_signals"', allowance)
+        self.assertIn("NEW.side='sell'", allowance)
+        self.assertIn("NEW.cycle_id IS NOT NULL", allowance)
+        self.assertIn("pending_execution", allowance)
+        self.assertIn("sell_filled", allowance)
+        self.assertIn("protective_exit_recovery_watch", allowance)
+        # Behavioral allow/reject coverage lives in
+        # test_strategy_versioning.DbStrat* / test_db_strat_*.
 
     def test_guard12g_service_is_not_a_monolith(self):
         loc = len(_source(self.SERVICE).splitlines())

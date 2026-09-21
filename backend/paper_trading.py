@@ -3108,8 +3108,11 @@ def _rows(conn, sql, params=()):
     return PRP.rows(conn, sql, params)
 
 
-def _audit(conn, account_id, event, detail):
-    return PRP.audit(conn, account_id, event, detail, _now())
+def _audit(conn, account_id, event, detail, *, strategy_stamp=None):
+    return PRP.audit(
+        conn, account_id, event, detail, _now(),
+        strategy_stamp=strategy_stamp,
+    )
 
 
 def _strategy_stamp(conn, account_id, signal_id=None):
@@ -3222,12 +3225,16 @@ def _recovery_observation(conn, account_id, code, watch, quote, day):
     return True, "止损后恢复观察通过，仍须重新通过完整入场门禁", observation
 
 
-def _risk_log(conn, account_id, code, side, decision, reason, payload):
+def _risk_log(conn, account_id, code, side, decision, reason, payload, *,
+              strategy_stamp=None):
     payload = _with_decision_snapshot(
         payload or {}, account_id=account_id, code=code, side=side,
         decision=decision, reason=reason,
     )
-    strategy_id, strategy_version, strategy_checksum = _strategy_stamp(conn, account_id)
+    if strategy_stamp is None:
+        strategy_id, strategy_version, strategy_checksum = _strategy_stamp(conn, account_id)
+    else:
+        strategy_id, strategy_version, strategy_checksum = strategy_stamp
     conn.execute(
         """INSERT INTO paper_risk_decisions(
                account_id,code,side,decision,reason,payload,created_at,

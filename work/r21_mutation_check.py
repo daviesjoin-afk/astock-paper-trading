@@ -22,6 +22,7 @@ PLANNER = "backend/execution_planner.py"
 REPLACEMENT_EVIDENCE = "backend/paper_replacement_evidence.py"
 
 SERVICE_TEST = "test_risk_application_service.RiskServiceContractTests"
+STRATEGY_VERSIONING_TEST = "test_strategy_versioning.StrategyVersioningTests"
 GUARD_TEST = "test_paper_trading_architecture_guard.RiskApplicationServiceBoundary"
 
 MUTATIONS = [
@@ -151,6 +152,20 @@ MUTATIONS = [
         "test": f"{SERVICE_TEST}.test_rsvc16_risk_facts_use_cycle_pinned_strategy_provenance",
         "desc": "risk facts fall back to legacy/current strategy stamp",
     },
+    {
+        "id": "M-RSK19", "file": PLANNER,
+        "old": "        risk_log_reason or reason, fill_detail,\n        strategy_stamp=order_strategy_stamp,\n    )\n",
+        "new": "        risk_log_reason or reason, fill_detail,\n    )\n",
+        "test": f"{SERVICE_TEST}.test_rsvc17_filled_sell_inherits_durable_order_provenance",
+        "desc": "filled risk log ignores durable order strategy stamp",
+    },
+    {
+        "id": "M-RSK20", "file": "backend/paper_schema_migrations.py",
+        "old": 'STRATEGY_STAMP_UNKNOWN_ALLOWANCE = {\n    "paper_orders": (\n',
+        "new": 'STRATEGY_STAMP_UNKNOWN_ALLOWANCE = {\n    "paper_signals": "1=1",\n    "paper_orders": (\n',
+        "test": f"{STRATEGY_VERSIONING_TEST}.test_db_strat_1_signal_all_null_rejected",
+        "desc": "all-NULL unknown exception is widened to paper_signals",
+    },
 ]
 
 
@@ -187,6 +202,8 @@ def main() -> int:
         f"{GUARD_TEST}.test_guard12a_no_reverse_dependency",
         f"{SERVICE_TEST}.test_rsvc15_user_sell_base_policy_uses_cycle_pinned_version",
         f"{SERVICE_TEST}.test_rsvc16_risk_facts_use_cycle_pinned_strategy_provenance",
+        f"{SERVICE_TEST}.test_rsvc17_filled_sell_inherits_durable_order_provenance",
+        f"{STRATEGY_VERSIONING_TEST}.test_db_strat_1_signal_all_null_rejected",
     ):
         base = run_test(module)
         if base.returncode != 0:

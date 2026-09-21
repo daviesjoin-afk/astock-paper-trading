@@ -61,6 +61,110 @@ class DbMigrateTests(unittest.TestCase):
             finally:
                 conn.close()
 
+
+    def test_v21_to_v22_refreshes_narrow_strategy_stamp_guard(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "paper.sqlite3")
+            bootstrap = sqlite3.connect(path)
+            bootstrap.executescript(
+                """
+                CREATE TABLE paper_orders(id INTEGER PRIMARY KEY, status TEXT);
+                CREATE TABLE paper_position_lots(id INTEGER PRIMARY KEY, cost REAL, qty INTEGER);
+                CREATE TABLE paper_positions(account_id TEXT, code TEXT, qty INTEGER);
+                CREATE TABLE paper_accounts(id TEXT PRIMARY KEY, initial_cash REAL, cash REAL);
+                CREATE TABLE paper_jobs(slot TEXT, market_date TEXT, started_at TEXT);
+                CREATE TABLE paper_job_runs(run_key TEXT PRIMARY KEY, started_at TEXT);
+                CREATE TABLE paper_runtime_locks(lock_key TEXT PRIMARY KEY, acquired_at TEXT, expires_at TEXT);
+                CREATE TABLE paper_nav(account_id TEXT, nav_date TEXT);
+                CREATE TABLE paper_signals(
+                    id INTEGER PRIMARY KEY,
+                    account_id TEXT NOT NULL,
+                    signal_date TEXT NOT NULL,
+                    intended_date TEXT NOT NULL,
+                    code TEXT NOT NULL,
+                    payload TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    created_at TEXT NOT NULL);
+                """
+            )
+            bootstrap.commit()
+            bootstrap.close()
+            with redirect_stdout(StringIO()):
+                db_migrate.migrate("paper_trading", path=path)
+            conn = sqlite3.connect(path)
+            try:
+                conn.execute(
+                    """CREATE TABLE IF NOT EXISTS paper_signals(
+                           id INTEGER PRIMARY KEY,
+                           account_id TEXT NOT NULL,
+                           signal_date TEXT NOT NULL,
+                           intended_date TEXT NOT NULL,
+                           code TEXT NOT NULL,
+                           payload TEXT NOT NULL,
+                           status TEXT NOT NULL,
+                           created_at TEXT NOT NULL)"""
+                )
+                # Simulate the pre-v22 broad guard on an existing ledger.
+                conn.execute("DROP TRIGGER IF EXISTS trg_paper_signals_strategy_stamp_insert")
+                conn.execute(
+                    """CREATE TRIGGER trg_paper_signals_strategy_stamp_insert
+                       BEFORE INSERT ON paper_signals
+                       WHEN NEW.account_id IS NOT NULL
+                        AND NOT (
+                            NEW.strategy_id IS NULL
+                            AND NEW.strategy_version IS NULL
+                            AND NEW.strategy_checksum IS NULL
+                        )
+                        AND (
+                            NEW.strategy_id IS NULL OR NEW.strategy_version IS NULL
+                            OR NEW.strategy_checksum IS NULL
+                            OR NEW.strategy_id <> NEW.account_id
+                            OR NOT EXISTS (
+                                SELECT 1 FROM paper_strategy_versions v
+                                WHERE v.strategy_id=NEW.strategy_id
+                                  AND v.version=NEW.strategy_version
+                                  AND v.checksum=NEW.strategy_checksum
+                            )
+                        )
+                       BEGIN SELECT RAISE(ABORT, 'invalid strategy version stamp'); END"""
+                )
+                conn.execute(
+                    "UPDATE schema_version SET version=21 WHERE db_name='paper_trading'"
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+            with redirect_stdout(StringIO()):
+                db_migrate.migrate("paper_trading", path=path)
+
+            conn = sqlite3.connect(path)
+            try:
+                self.assertEqual(
+                    conn.execute(
+                        "SELECT version FROM schema_version WHERE db_name='paper_trading'"
+                    ).fetchone()[0],
+                    22,
+                )
+
+                def try_insert(sql, params=()):
+                    try:
+                        conn.execute(sql, params)
+                        conn.commit()
+                        return True
+                    except sqlite3.IntegrityError:
+                        conn.rollback()
+                        return False
+
+                self.assertFalse(try_insert(
+                    "INSERT INTO paper_signals(account_id,signal_date,intended_date,code,"
+                    "payload,status,created_at) VALUES(?,?,?,?,?,?,?)",
+                    ("tq_breakout", "2026-09-10", "2026-09-10", "600001",
+                     "{}", "pending", "2026-09-10 09:00:00"),
+                ))
+            finally:
+                conn.close()
+
     def test_migration_creates_consistent_pre_upgrade_backup(self):
         with tempfile.TemporaryDirectory() as directory:
             path = os.path.join(directory, "paper.sqlite3")

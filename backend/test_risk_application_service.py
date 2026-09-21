@@ -559,6 +559,84 @@ class RiskServiceContractTests(_RiskServiceCase):
             self.assertIsNone(row["strategy_checksum"])
 
 
+    def test_rsvc17_filled_sell_inherits_durable_order_provenance(self):
+        pinned = self.seed_user_strategy_v1()
+        self.advance_user_head(pinned)
+        self.add_lot_for_account(self.USER, self.code, 100, 10.0)
+        self.set_quote(self.code, price=9.0, pct=-8.0, high=9.2, low=8.9)
+        self.run_risk()
+        order = self.conn.execute(
+            "SELECT strategy_id,strategy_version,strategy_checksum,status"
+            " FROM paper_orders WHERE account_id=? AND code=? AND side='sell'"
+            " ORDER BY id DESC LIMIT 1",
+            (self.USER, self.code),
+        ).fetchone()
+        decision = self.conn.execute(
+            "SELECT strategy_id,strategy_version,strategy_checksum"
+            " FROM paper_risk_decisions WHERE account_id=? AND code=? AND side='sell'"
+            " AND decision='filled' ORDER BY id DESC LIMIT 1",
+            (self.USER, self.code),
+        ).fetchone()
+        audit = self.conn.execute(
+            "SELECT strategy_id,strategy_version,strategy_checksum"
+            " FROM paper_audit WHERE account_id=? AND event='sell_filled'"
+            " ORDER BY id DESC LIMIT 1",
+            (self.USER,),
+        ).fetchone()
+        self.assertIsNotNone(order)
+        self.assertIsNotNone(decision)
+        self.assertIsNotNone(audit)
+        self.assertEqual(order["status"], "filled")
+        for row in (order, decision, audit):
+            self.assertEqual(row["strategy_id"], pinned.strategy_id)
+            self.assertEqual(int(row["strategy_version"]), pinned.version)
+            self.assertEqual(row["strategy_checksum"], pinned.checksum)
+        recovery = self.conn.execute(
+            "SELECT strategy_id,strategy_version,strategy_checksum"
+            " FROM paper_audit WHERE account_id=? AND event='protective_exit_recovery_watch'"
+            " ORDER BY id DESC LIMIT 1",
+            (self.USER,),
+        ).fetchone()
+        if recovery is not None:
+            self.assertEqual(recovery["strategy_id"], pinned.strategy_id)
+            self.assertEqual(int(recovery["strategy_version"]), pinned.version)
+            self.assertEqual(recovery["strategy_checksum"], pinned.checksum)
+
+        # Missing cycle pin: the protective SELL still executes, but all
+        # downstream provenance remains explicitly unknown.
+        self.delete_user_cycle_binding()
+        self.add_lot_for_account(self.USER, self.code_b, 100, 10.0)
+        self.set_quote(self.code_b, price=9.0, pct=-8.0, high=9.2, low=8.9)
+        self.clear_scan_state()
+        self.run_risk()
+        missing_order = self.conn.execute(
+            "SELECT strategy_id,strategy_version,strategy_checksum,status"
+            " FROM paper_orders WHERE account_id=? AND code=? AND side='sell'"
+            " ORDER BY id DESC LIMIT 1",
+            (self.USER, self.code_b),
+        ).fetchone()
+        missing_decision = self.conn.execute(
+            "SELECT strategy_id,strategy_version,strategy_checksum"
+            " FROM paper_risk_decisions WHERE account_id=? AND code=? AND side='sell'"
+            " AND decision='filled' ORDER BY id DESC LIMIT 1",
+            (self.USER, self.code_b),
+        ).fetchone()
+        missing_audit = self.conn.execute(
+            "SELECT strategy_id,strategy_version,strategy_checksum"
+            " FROM paper_audit WHERE account_id=? AND event='sell_filled'"
+            " ORDER BY id DESC LIMIT 1",
+            (self.USER,),
+        ).fetchone()
+        self.assertIsNotNone(missing_order)
+        self.assertIsNotNone(missing_decision)
+        self.assertIsNotNone(missing_audit)
+        self.assertEqual(missing_order["status"], "filled")
+        for row in (missing_order, missing_decision, missing_audit):
+            self.assertIsNone(row["strategy_id"])
+            self.assertIsNone(row["strategy_version"])
+            self.assertIsNone(row["strategy_checksum"])
+
+
 
 if __name__ == "__main__":
     unittest.main()

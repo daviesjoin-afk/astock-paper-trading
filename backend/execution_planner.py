@@ -500,7 +500,8 @@ def _assert_order_identity(conn, *, order_id, account_id, code, side):
         raise RuntimeError(f"order identity mismatch: unsupported side {side!r}")
     try:
         row = conn.execute(
-            "SELECT account_id, code, side FROM paper_orders WHERE id=?",
+            "SELECT account_id, code, side, strategy_id, strategy_version, strategy_checksum"
+            " FROM paper_orders WHERE id=?",
             (int(order_id),),
         ).fetchone()
     except (sqlite3.Error, TypeError, ValueError) as exc:  # pragma: no cover
@@ -511,8 +512,12 @@ def _assert_order_identity(conn, *, order_id, account_id, code, side):
         stored_account, stored_code, stored_side = (
             row["account_id"], row["code"], row["side"],
         )
+        order_strategy_stamp = (
+            row["strategy_id"], row["strategy_version"], row["strategy_checksum"],
+        )
     else:
         stored_account, stored_code, stored_side = row[0], row[1], row[2]
+        order_strategy_stamp = (row[3], row[4], row[5]) if len(row) >= 6 else (None, None, None)
     mismatches = []
     if str(stored_account) != str(account_id):
         mismatches.append(f"account_id stored={stored_account!r} caller={account_id!r}")
@@ -524,6 +529,13 @@ def _assert_order_identity(conn, *, order_id, account_id, code, side):
         raise RuntimeError(
             f"order identity mismatch for order_id={order_id}: " + "; ".join(mismatches)
         )
+    if any(value is not None for value in order_strategy_stamp) and any(
+        value is None for value in order_strategy_stamp
+    ):
+        raise RuntimeError(
+            f"partial strategy stamp on order_id={order_id}: {order_strategy_stamp!r}"
+        )
+    return order_strategy_stamp
 
 
 def commit_fill(
@@ -575,8 +587,9 @@ def commit_fill(
             order_id, provenance.status,
             f"{side} 成交被拒绝：订单周期归属不可证明",
         )
-    _assert_order_identity(conn, order_id=order_id, account_id=account_id,
-                           code=code, side=side)
+    order_strategy_stamp = _assert_order_identity(
+        conn, order_id=order_id, account_id=account_id, code=code, side=side,
+    )
     # §5 execution-cycle invariant：订单周期 == 账户当前周期 == active 周期。
     # 上层 scanner 已检查过一遍，这里仍然校验（§12 defense in depth）：调用方可能
     # 持有上一轮缓存的 account 快照，账本在两次读之间搬了家。
@@ -653,10 +666,12 @@ def commit_fill(
     PT._risk_log(
         conn, account_id, code, side, action,
         risk_log_reason or reason, fill_detail,
+        strategy_stamp=order_strategy_stamp,
     )
     PT._audit(
         conn, account_id, audit_action or action,
         audit_message or f"{side} {code} {qty}股 @ {fill_price:.2f}",
+        strategy_stamp=order_strategy_stamp,
     )
     PT._sync_positions(conn, account_id, asof_day)
     return realized_pnl

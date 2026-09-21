@@ -160,8 +160,11 @@ def _strategy_stamp(conn, account_id, *, cycle_id, signal_id=None):
     return tuple(stamp) if stamp is not None else (None, None, None)
 
 
-def _audit(conn, account_id, event, detail):
-    return PRP.audit(conn, account_id, event, detail, _now())
+def _audit(conn, account_id, event, detail, *, strategy_stamp=None):
+    return PRP.audit(
+        conn, account_id, event, detail, _now(),
+        strategy_stamp=strategy_stamp,
+    )
 
 
 def _rotation_buy_candidate(conn, account, replacement, quote, market, news, asof_day,
@@ -771,7 +774,7 @@ def run(context: RiskRunContext, *, ports: RiskServicePorts):
                         "expires_on": (_date(day) + dt.timedelta(days=policy["max_days"])).isoformat(),
                         "probe_ratio": 0.25,
                         "volatility_shadow": detail.get("volatility_shadow"),
-                    }))
+                    }), strategy_stamp=strategy_stamp)
                 conn.execute(f"RELEASE SAVEPOINT {savepoint}")
             except Exception as exc:
                 conn.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
