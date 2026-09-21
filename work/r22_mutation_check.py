@@ -87,8 +87,14 @@ MUTATIONS = [
     },
     {
         "id": "M-PORT10", "file": READ_MODEL,
-        "old": '"   AND length(f.fill_date)>=10 AND substr(f.fill_date,1,10)<=?"',
-        "new": '"   AND length(f.fill_date)>=10 AND 1=1"',
+        "old": '''        " WHERE o.cycle_id=? AND o.side='sell' AND o.status='filled'"
+        "   AND f.fill_date IS NOT NULL"
+        "   AND length(f.fill_date)>=10 AND substr(f.fill_date,1,10)<=?"
+''',
+        "new": '''        " WHERE o.cycle_id=? AND o.side='sell' AND o.status='filled'"
+        "   AND f.fill_date IS NOT NULL"
+        "   AND length(f.fill_date)>=10 AND 1=1"
+''',
         "test": f"{TEST}.test_port4_future_fill_is_excluded_by_asof",
         "desc": "include future SELL in historical read",
     },
@@ -321,15 +327,13 @@ MUTATIONS = [
     },
     {
         "id": "M-PORT36", "file": READ_MODEL,
-        "old": '''    return _cycle_created_by(conn, context, account_id=account_id)
-
-
-def _cycle_initial(conn, context: PortfolioReadContext, account_id: str | None = None):
+        "old": '''    # No attachment provenance row: fall back only to account-scoped bounded
+    # activity, never to the cycle's own creation evidence.
+    return _cycle_has_bounded_activity(conn, context, account_id=account_id)
 ''',
-        "new": '''    return _cycle_created_by(conn, context)
-
-
-def _cycle_initial(conn, context: PortfolioReadContext, account_id: str | None = None):
+        "new": '''    # No attachment provenance row: fall back only to account-scoped bounded
+    # activity, never to the cycle's own creation evidence.
+    return _cycle_has_bounded_activity(conn, context)
 ''',
         "test": f"{TEST}.test_port11m_pre_cycle_activity_is_account_scoped",
         "desc": "let another account authorize pre-cycle capital",
@@ -425,8 +429,26 @@ def _cycle_initial(conn, context: PortfolioReadContext, account_id: str | None =
     },
     {
         "id": "M-PORT44", "file": READ_MODEL,
-        "old": '''        _has_columns(conn, "paper_fills", _FILL_SELECT_COLUMNS)''',
-        "new": '''        _has_columns(conn, "paper_fills", _FILL_COLUMNS)''',
+        "old": '''    """Return (verified rows, all rows, proof_available).
+
+    Every fill attached to a bounded SELL order is selected, **not** just the
+    rows whose declared side agrees with the order: a contradictory fill is
+    execution evidence that must fail closed, so it has to reach the
+    completeness checks instead of being filtered out by ``f.side``.
+    """
+    if not (
+        _has_columns(conn, "paper_fills", _FILL_SELECT_COLUMNS)
+''',
+        "new": '''    """Return (verified rows, all rows, proof_available).
+
+    Every fill attached to a bounded SELL order is selected, **not** just the
+    rows whose declared side agrees with the order: a contradictory fill is
+    execution evidence that must fail closed, so it has to reach the
+    completeness checks instead of being filtered out by ``f.side``.
+    """
+    if not (
+        _has_columns(conn, "paper_fills", _FILL_COLUMNS)
+''',
         "test": f"{TEST}.test_port5e_partial_fill_schema_fails_closed",
         "desc": "query missing price/amount/fees columns on a partial fill schema",
     },
@@ -626,6 +648,19 @@ def _cycle_initial(conn, context: PortfolioReadContext, account_id: str | None =
         "test": f"{TEST}.test_port5h_account_specific_fill_check_requires_order_identity",
         "desc": "fail open to zero net flow when order identity is unavailable",
     },
+    {
+        "id": "M-PORT60", "file": READ_MODEL,
+        "old": '''            return bool(day and day <= context.asof_day.isoformat())
+    # No attachment provenance row: fall back only to account-scoped bounded
+    # activity, never to the cycle's own creation evidence.
+    return _cycle_has_bounded_activity(conn, context, account_id=account_id)
+''',
+        "new": '''            return bool(day and day <= context.asof_day.isoformat())
+    return True
+''',
+        "test": f"{TEST}.test_port11p_attachment_provenance_missing_stays_unknown",
+        "desc": "fall back to cycle creation as account attachment proof",
+    },
 ]
 
 
@@ -649,7 +684,23 @@ BROKEN_RE = re.compile(
 )
 
 
-def run_test(target: str, seq: int) -> subprocess.CompletedProcess:
+def _next_seq() -> int:
+    """Return a strictly increasing run id.
+
+    Every subprocess invocation must get its own ``PYTHONPYCACHEPREFIX``:
+    sharing one cache directory lets a baseline run's ``.pyc`` be reused by the
+    mutant run (and vice versa), which silently invalidates the whole matrix.
+    ``_SEQ`` used to be a constant ``[0]`` with callers passing
+    ``_SEQ[0] + 1``, i.e. the same ``run001`` for every invocation; the
+    monotonic increment here is the fix, and ``self_test_sequence`` pins it.
+    """
+    _SEQ[0] += 1
+    return _SEQ[0]
+
+
+def run_test(target: str, seq: int | None = None) -> subprocess.CompletedProcess:
+    if seq is None:
+        seq = _next_seq()
     env = dict(os.environ)
     env["PYTHONPYCACHEPREFIX"] = os.path.join(PYCACHE_ROOT, f"run{seq:03d}")
     env["PYTHONIOENCODING"] = "utf-8"
@@ -658,6 +709,38 @@ def run_test(target: str, seq: int) -> subprocess.CompletedProcess:
         cwd=BACKEND, capture_output=True, text=True, encoding="utf-8",
         errors="replace", timeout=600, env=env,
     )
+
+
+def self_test_sequence() -> None:
+    """Static + behavioural assertion that run caches never collapse to one dir.
+
+    Guards against the exact regression found in review: a fixed sequence means
+    baseline and mutant share a bytecode cache directory.
+    """
+    seen = [_next_seq() for _ in range(5)]
+    assert len(set(seen)) == len(seen), f"sequence not unique: {seen}"
+    assert seen == sorted(seen), f"sequence not increasing: {seen}"
+
+    dirs: list[str] = []
+    original = subprocess.run
+    try:
+        def _capture(args, **kwargs):  # noqa: ANN001
+            dirs.append(kwargs["env"]["PYTHONPYCACHEPREFIX"])
+            raise _ShortCircuit
+        subprocess.run = _capture  # type: ignore[assignment]
+        for _ in range(3):
+            try:
+                run_test("unittest")
+            except _ShortCircuit:
+                pass
+    finally:
+        subprocess.run = original  # type: ignore[assignment]
+    assert len(dirs) == 3, f"expected 3 invocations, got {dirs}"
+    assert len(set(dirs)) == 3, f"invocations share a cache dir: {dirs}"
+
+
+class _ShortCircuit(RuntimeError):
+    """Raised by the self-test's subprocess stub."""
 
 
 def assert_no_leftover(mutation: dict) -> None:
@@ -700,7 +783,7 @@ def run_mutation(mutation: dict, *, non_vacuity: bool) -> str:
 
     baseline_rc = None
     if non_vacuity:
-        baseline = run_test(mutation["test"], _SEQ[0] + 1)
+        baseline = run_test(mutation["test"])
         baseline_rc = baseline.returncode
         if baseline_rc != 0:
             return f"BASELINE-RED({baseline_rc})"
@@ -709,7 +792,7 @@ def run_mutation(mutation: dict, *, non_vacuity: bool) -> str:
     try:
         with open(path, "wb") as handle:
             handle.write(_adapt_eol(mutated, original))
-        result = run_test(mutation["test"], _SEQ[0] + 1)
+        result = run_test(mutation["test"])
         red = result.returncode != 0
         if not red:
             return "SURVIVED"
@@ -733,6 +816,11 @@ def main() -> int:
     if "--only" in argv:
         only = {item for item in argv[argv.index("--only") + 1].split(",") if item}
     non_vacuity = "--non-vacuity" in argv
+
+    # Refuse to run if the run-id sequence can collapse to one cache dir: a
+    # shared pycache between baseline and mutant silently invalidates the run.
+    self_test_sequence()
+    print("runner self-test: PASS (unique, increasing pycache sequence)")
 
     results: list[tuple[str, str]] = []
     for mutation in MUTATIONS:

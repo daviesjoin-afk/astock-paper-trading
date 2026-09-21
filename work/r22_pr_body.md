@@ -44,7 +44,7 @@ After-fix probe summary: `0/8 reproduced`; C1/C2/C3/C6 now use the explicit boun
 
 ## Architecture
 
-- new module: `backend/paper_portfolio_read_model.py` (1227 LOC, 42 top-level defs)
+- new module: `backend/paper_portfolio_read_model.py` (1234 LOC, 42 top-level defs)
 - `paper_trading.py` LOC: `14847 -> 14847`
 - `paper_trading.py` top-level defs: `280 -> 280`
 - reverse imports: `0` (new read model does not import `paper_trading`)
@@ -62,10 +62,10 @@ After-fix probe summary: `0/8 reproduced`; C1/C2/C3/C6 now use the explicit boun
 
 ## Tests
 
-- targeted portfolio read model: `66/66 PASS`
+- targeted portfolio read model: `71/71 PASS`
 - architecture guard: `94/94 PASS`
-- risk / authoritative-position / portfolio read-model suites: `122/122 PASS`
-- full backend: `3913 tests OK (skipped=5)`
+- risk / authoritative-position / portfolio consumer suites: `150/150 PASS`
+- full backend: `3918 tests OK (skipped=5)`
 - frontend build: `PASS` (2 pre-existing duplicate-key warnings in `frontend/src/core/format.js`, not introduced by R22)
 - frontend unit: `111/111 PASS`
 - frontend e2e (chromium, `--workers=1`): `32 passed`
@@ -75,10 +75,12 @@ After-fix probe summary: `0/8 reproduced`; C1/C2/C3/C6 now use the explicit boun
 
 ## Mutation
 
-- `M-PORT1`..`M-PORT59`: `59/59 CAUGHT`
-- survived: `0`; fake kills (Syntax/Import won): `0`
-- non-vacuity (`--non-vacuity`, baseline GREEN then mutated RED on the designated test): `59/59`
+- `M-PORT1`..`M-PORT60`: `60/60 CAUGHT`
+- survived: `0`; fake kills (Syntax/Import won): `0`; baseline-red: `0`
+- non-vacuity (`--non-vacuity`, baseline GREEN then mutated RED on the designated test): `60/60`
 - restore sha256: `PASS`
+- anchor audit (`work/r22_audit_anchors.py`, read-only): `60/60 OK` (every anchor occurs exactly once)
+- runner self-test: `PASS` (unique, increasing `PYTHONPYCACHEPREFIX` per invocation)
 
 ## Review fixes
 
@@ -129,7 +131,9 @@ After-fix probe summary: `0/8 reproduced`; C1/C2/C3/C6 now use the explicit boun
 - P2 side-contradicting fills: the bounded fill readers no longer filter by the fill's declared side. A verified BUY order carrying an additional same-day SELL fill is contradictory execution evidence and now fails closed, instead of publishing only the BUY amount as verified cash/NAV when no lot exists.
 - P2 account attachment date: a cycle's `created_at` says nothing about when a given account joined it. Account-level initial capital now also requires bounded attachment evidence (`paper_parameter_versions.effective_date <= asof_day`), so an account attached mid-cycle cannot lend its current `initial_cash` to a snapshot that predates its participation.
 - P2 missing order identity in scoped fill checks: `_has_any_fill_rows` now returns `None` (unreadable) when an account-scoped read is requested on a `paper_orders` table lacking `account_id`, instead of omitting the account predicate and letting `cash()` publish the account's initial balance as verified zero net flow. Added PORT-5h and M-PORT59.
-- each review fix has a permanent regression and a dedicated mutation (`M-PORT13`..`M-PORT59`).
+- P1 account attachment provenance: `_account_attached_by` no longer falls back to `_cycle_created_by`. `cycle existed by D` is not `account belonged to that cycle by D`, so account-scoped initial capital now requires either a matching `paper_parameter_versions.effective_date <= asof_day` row or account-scoped bounded ledger activity. Without either, account initial capital and cash stay `unknown`; cycle-level initial capital is unaffected. Added PORT-11p..11t (missing provenance / ≤asof verifies / >asof unknown / partial schema without exception / cycle creation is not attachment) and M-PORT60.
+- P2 mutation runner pycache sequence: `_SEQ` was a constant and callers passed `_SEQ[0] + 1`, so baseline and every mutant shared `run001`. `run_test()` now allocates a strictly increasing id via `_next_seq()`, and `self_test_sequence()` (run at matrix start) fails the run if ids are not unique/increasing or if invocations share a cache dir. Fake-kill detection is unchanged.
+- each review fix has a permanent regression and a dedicated mutation (`M-PORT13`..`M-PORT60`).
 
 ## Security
 

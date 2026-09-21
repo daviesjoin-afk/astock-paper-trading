@@ -879,6 +879,11 @@ def _account_attached_by(conn, context: PortfolioReadContext, account_id) -> boo
     ``paper_parameter_versions.effective_date``.  Without bounded
     attachment evidence the account must not lend its current ``initial_cash``
     to a snapshot that predates its participation.
+
+    ``cycle existed by D`` is **not** ``account belonged to that cycle by D``, so
+    this resolver never falls back to cycle creation.  The only alternative
+    bounded evidence is account-scoped ledger activity, which proves the account
+    was participating on a date that is already <= ``asof_day``.
     """
     if _has_columns(conn, "paper_parameter_versions",
                     {"cycle_id", "account_id", "effective_date"}):
@@ -890,7 +895,9 @@ def _account_attached_by(conn, context: PortfolioReadContext, account_id) -> boo
         if row is not None and row[0] is not None:
             day = _day_text(row[0])
             return bool(day and day <= context.asof_day.isoformat())
-    return _cycle_created_by(conn, context, account_id=account_id)
+    # No attachment provenance row: fall back only to account-scoped bounded
+    # activity, never to the cycle's own creation evidence.
+    return _cycle_has_bounded_activity(conn, context, account_id=account_id)
 
 
 def _cycle_initial(conn, context: PortfolioReadContext, account_id: str | None = None):

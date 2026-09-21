@@ -365,12 +365,24 @@ class PortfolioReadModelContractTests(unittest.TestCase):
                 "INSERT INTO paper_cycles VALUES(?,?)",
                 (self.cycle100, f"{DAY.isoformat()} 09:00:00"),
             )
+            # R23：账户级 initial capital 现在必须有真实的 bounded attachment
+            # 证据，不能再靠 cycle creation 推断。这里给出匹配且 <= asof 的
+            # attachment 行，让非空前提仍然成立。
+            conn.execute(
+                "CREATE TABLE paper_parameter_versions("
+                "cycle_id INTEGER, account_id TEXT, effective_date TEXT)"
+            )
+            conn.execute(
+                "INSERT INTO paper_parameter_versions VALUES(?,?,?)",
+                (self.cycle100, ACCOUNT, DAY.isoformat()),
+            )
             conn.execute("CREATE TABLE paper_fills(order_id INTEGER, fill_date TEXT)")
             conn.execute(
                 "CREATE TABLE paper_orders(id INTEGER PRIMARY KEY, cycle_id INTEGER)"
             )
             context = P.PortfolioReadContext(self.cycle100, DAY)
-            # 非空门禁：账户确实挂在本周期，否则本测试区分不了两条路径。
+            # 非空门禁：账户确实挂在本周期且 attachment 可证明，
+            # 否则本测试区分不了两条路径。
             self.assertIsNotNone(P._cycle_initial(conn, context, account_id=ACCOUNT))
             self.assertIsNone(P._has_any_fill_rows(conn, context, account_id=ACCOUNT))
             self.assertEqual(
@@ -840,6 +852,96 @@ class PortfolioReadModelContractTests(unittest.TestCase):
         finally:
             conn.close()
 
+    def test_port11p_attachment_provenance_missing_stays_unknown(self):
+        # 规格 A：cycle 早于 asof 创建、paper_accounts 当前指向该 cycle、
+        # paper_parameter_versions 表存在但**没有**匹配的 attachment 行，
+        # 且无 account-specific bounded activity
+        # => 账户级 initial capital / cash 都必须 UNKNOWN。
+        self.assertTrue(self.conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table'"
+            " AND name='paper_parameter_versions'"
+        ).fetchone(), "attachment-provenance table must exist")
+        self.assertEqual(self.conn.execute(
+            "SELECT COUNT(*) FROM paper_parameter_versions WHERE cycle_id=? AND account_id=?",
+            (self.cycle100, ACCOUNT),
+        ).fetchone()[0], 0)
+        context = P.PortfolioReadContext(self.cycle100, DAY)
+        # 非空门禁 1：cycle 本身在 asof 前已存在 —— 否则本测试无法区分
+        # “cycle 不存在”与“account attachment 不可证明”。
+        self.assertTrue(P._cycle_created_by(self.conn, context))
+        # 非空门禁 2：账户确实挂在这个 cycle 上 —— 否则走的是 cycle_id 不匹配分支。
+        self.assertEqual(self.conn.execute(
+            "SELECT cycle_id FROM paper_accounts WHERE id=?", (ACCOUNT,)
+        ).fetchone()[0], self.cycle100)
+        self.assertFalse(P._account_attached_by(self.conn, context, ACCOUNT))
+        self.assertIsNone(P._cycle_initial(self.conn, context, account_id=ACCOUNT))
+        self.assertEqual(P.cash(self.conn, context, account_id=ACCOUNT), (None, "unknown"))
+
+    def test_port11q_attachment_provenance_before_or_on_asof_may_verify(self):
+        # 规格 B：匹配的 attachment 证据 effective_date <= asof => 可 verified。
+        self.conn.execute(
+            "INSERT INTO paper_parameter_versions(cycle_id,account_id,version,style,"
+            "params,reason,effective_date,created_at) VALUES(?,?,?,?,?,?,?,?)",
+            (self.cycle100, ACCOUNT, "v1.0", "trend", "{}", "r23-test",
+             DAY.isoformat(), f"{DAY.isoformat()} 08:00:00"),
+        )
+        self.conn.commit()
+        context = P.PortfolioReadContext(self.cycle100, DAY)
+        self.assertTrue(P._account_attached_by(self.conn, context, ACCOUNT))
+        self.assertIsNotNone(P._cycle_initial(self.conn, context, account_id=ACCOUNT))
+
+    def test_port11r_attachment_provenance_after_asof_stays_unknown(self):
+        # 规格 C：匹配的 attachment 证据 effective_date > asof => UNKNOWN。
+        self.conn.execute(
+            "INSERT INTO paper_parameter_versions(cycle_id,account_id,version,style,"
+            "params,reason,effective_date,created_at) VALUES(?,?,?,?,?,?,?,?)",
+            (self.cycle100, ACCOUNT, "v2.0", "trend", "{}", "r23-test",
+             NEXT.isoformat(), f"{NEXT.isoformat()} 09:00:00"),
+        )
+        self.conn.commit()
+        context = P.PortfolioReadContext(self.cycle100, DAY)
+        self.assertTrue(P._cycle_created_by(self.conn, context))
+        self.assertFalse(P._account_attached_by(self.conn, context, ACCOUNT))
+        self.assertIsNone(P._cycle_initial(self.conn, context, account_id=ACCOUNT))
+        self.assertEqual(P.cash(self.conn, context, account_id=ACCOUNT), (None, "unknown"))
+
+    def test_port11s_partial_attachment_schema_stays_unknown_without_exception(self):
+        # 规格 D：attachment-provenance schema 缺失/不完整，
+        # 且没有其他 bounded account-specific 证据 => UNKNOWN，不抛异常。
+        conn = sqlite3.connect(":memory:")
+        try:
+            conn.executescript(
+                "CREATE TABLE paper_cycles(id INTEGER PRIMARY KEY, capital REAL,"
+                " created_at TEXT);"
+                "CREATE TABLE paper_accounts(id TEXT PRIMARY KEY, initial_cash REAL,"
+                " cycle_id INTEGER);"
+                # 只有部分列：缺 effective_date，必须读作“不可用”而非抛 SQL 错误。
+                "CREATE TABLE paper_parameter_versions(cycle_id INTEGER,"
+                " account_id TEXT);"
+            )
+            conn.execute("INSERT INTO paper_cycles VALUES(?,?,?)",
+                         (7, 100000.0, f"{DAY.isoformat()} 09:00:00"))
+            conn.execute("INSERT INTO paper_accounts VALUES(?,?,?)",
+                         (ACCOUNT, 100000.0, 7))
+            conn.execute("INSERT INTO paper_parameter_versions VALUES(?,?)", (7, ACCOUNT))
+            conn.commit()
+            context = P.PortfolioReadContext(7, DAY)
+            self.assertFalse(P._account_attached_by(conn, context, ACCOUNT))
+            self.assertIsNone(P._cycle_initial(conn, context, account_id=ACCOUNT))
+            self.assertEqual(P.cash(conn, context, account_id=ACCOUNT), (None, "unknown"))
+        finally:
+            conn.close()
+
+    def test_port11t_cycle_creation_is_not_account_attachment(self):
+        # 核心判据：cycle existed by D != account belonged to cycle by D。
+        # 同一条 cycle 级证据在**cycle 级**读取时足以证明资本，
+        # 在**账户级**读取时不足以证明 attachment。
+        context = P.PortfolioReadContext(self.cycle100, DAY)
+        self.assertTrue(P._cycle_created_by(self.conn, context))
+        self.assertIsNotNone(P._cycle_initial(self.conn, context))  # cycle 级：仍可证明
+        self.assertIsNone(P._cycle_initial(self.conn, context, account_id=ACCOUNT))
+        # 不得因为这个修改而让 cycle-level initial capital 无条件 unknown。
+
     def test_port11n_missing_cycle_creation_evidence_stays_unknown(self):
         conn = sqlite3.connect(":memory:")
         try:
@@ -925,11 +1027,29 @@ class PortfolioReadModelContractTests(unittest.TestCase):
         self.assertIsNone(value)
         self.assertEqual(status, "unknown")
     def test_port11c_account_initial_capital_is_cycle_scoped(self):
+        # 必须给出**可证明的 attachment 证据**，否则账户级读取会先被
+        # attachment gate 拦下（R23 起），本测试就观测不到 cycle_id 作用域检查。
+        self.conn.execute(
+            "INSERT INTO paper_parameter_versions(cycle_id,account_id,version,style,"
+            "params,reason,effective_date,created_at) VALUES(?,?,?,?,?,?,?,?)",
+            (self.cycle100, ACCOUNT, "v1.0", "trend", "{}", "r23-test",
+             DAY.isoformat(), f"{DAY.isoformat()} 08:00:00"),
+        )
+        self.conn.commit()
         self.conn.execute(
             "UPDATE paper_accounts SET cycle_id=? WHERE id=?", (self.cycle101, ACCOUNT)
         )
         self.conn.commit()
         context = P.PortfolioReadContext(self.cycle100, DAY)
+        # 非空门禁：attachment 对本周期可证明，因此下面读到的 None
+        # 只可能来自 cycle_id 作用域检查，而非 attachment gate。
+        self.assertEqual(
+            self.conn.execute(
+                "SELECT COUNT(*) FROM paper_parameter_versions"
+                " WHERE cycle_id=? AND account_id=?", (self.cycle100, ACCOUNT)
+            ).fetchone()[0],
+            1,
+        )
         self.assertEqual(
             P.cash(self.conn, context, account_id=ACCOUNT),
             (None, "unknown"),
