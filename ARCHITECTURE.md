@@ -562,7 +562,8 @@ portfolio metrics / risk / dashboard / research consumers
 - `paper_position_risk_state` 的前置列检查必须包含调用方索引所需的 `account_id` / `code`：部分迁移表若缺 identity 列，历史 runtime 风险状态按不可用处理，不得抛 `KeyError`。
 - `paper_position_lots` 的前置列检查必须包含 bounded lot read 实际使用的列（含 `id`，它既是 `ORDER BY` 键也是 FIFO 排序键）：部分迁移表缺列一律保持 quantity unknown，不得抛 `OperationalError`。
 - **不确定性只有在该 account/code 仓位完全清空时才算解除**：同一 key 下可能同时存在 source-less lot 与已验证 lot，部分卖出会按**不可信**的 `acquired_at` 排序先吃掉 source-less 行，FIFO 无法证明实际卖出的是哪一条。因此只要该 key 仍有任何未平仓数量，缺失的 acquisition 证据就仍使余量（及其 cost / entry date）不可证明，quantity 必须保持 unknown；完全闭仓才允许消解。
-- 一条 filled order 只有在它**被选中的全部 fill** 都 identity 一致且 execution-verified 时才可视为已覆盖：只要其中任何一条错配或未验证，就按该 order 自己的 account/code 计入 incomplete，不得因为"存在一条合法 fill"而发布半份 `verified_cash_flow`。
+- 一条 filled order 只有在它**被选中的全部 fill** 都 identity 一致且 execution-verified 时才可视为已覆盖：只要其中任何一条错配或未验证，就按该 order 自己的 account/code 计入 incomplete，不得因为"存在一条合法 fill"而发布半份 `verified_cash_flow`。bounded fill reader 因此**不得按 fill 自己声明的 side 过滤**：挂在已成交 order 上的 side 矛盾 fill 属于 execution evidence，必须进入完整性检查并 fail closed。
+- 账户级 initial capital 除了"周期已存在"之外，还必须有**账户接入**证据：`paper_cycles.created_at` 只说明周期何时建立，说不出某个账户何时加入（mid-cycle 接入会重绑 `paper_accounts.cycle_id` 并写下更晚的 `paper_parameter_versions.effective_date`）。接入日不晚于 asof 才可发布该账户的资本，否则保持 unknown。
 - `paper_positions` 仍是 compatibility projection；projection 不拥有 execution authority。
 
 Invariants：

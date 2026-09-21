@@ -844,6 +844,42 @@ class PortfolioReadModelContractTests(unittest.TestCase):
         self.assertEqual(lots, [])
         self.assertEqual(status, "unknown")
 
+    def test_port5g_side_contradicting_fill_blocks_coverage(self):
+        # 已成交 BUY order 上挂一条同日 SELL fill：contradictory execution
+        # evidence 必须让该 order 的现金流不再是 verified。
+        buy = self._order_and_fill(cycle_id=self.cycle100, side="buy", qty=100,
+                                   price=10.0, fill_date=DAY.isoformat(), fees=0.0)
+        self.conn.execute(
+            "INSERT INTO paper_fills(order_id,account_id,side,code,qty,price,amount,fees,"
+            "fill_date,quote_at,assumption) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+            (buy, ACCOUNT, "sell", CODE, 100, 10.0, 1000.0, 0.0,
+             DAY.isoformat(), f"{DAY.isoformat()} 09:31:00", "r22-test"),
+        )
+        self._lot(self.cycle100, 100, 10.0, source_order_id=buy)
+        self.conn.commit()
+        context = P.PortfolioReadContext(self.cycle100, DAY)
+        self.assertEqual(P.verified_cash_flows(self.conn, context), {})
+        self.assertEqual(P.cash(self.conn, context), (None, "unknown"))
+
+    def test_port11o_account_attached_after_asof_stays_unknown(self):
+        # cycle 在 asof 之前就存在（created_at <= asof），但该账户是**之后**
+        # 才接入这个周期的：账户级 initial capital 仍必须保持 unknown。
+        self.conn.execute(
+            "INSERT INTO paper_parameter_versions(cycle_id,account_id,version,style,"
+            "params,reason,effective_date,created_at) VALUES(?,?,?,?,?,?,?,?)",
+            (self.cycle100, ACCOUNT, "v2.0", "trend", "{}", "r22-test",
+             NEXT.isoformat(), f"{NEXT.isoformat()} 09:00:00"),
+        )
+        self.conn.commit()
+        context = P.PortfolioReadContext(self.cycle100, DAY)
+        # 非空门禁：cycle 本身在 asof 之前已存在，否则本测试无法区分两条路径。
+        self.assertTrue(P._cycle_created_by(self.conn, context))
+        # cycle 级资本仍可证明（周期确实已存在）；账户级资本不可证明。
+        self.assertIsNone(P._cycle_initial(self.conn, context, account_id=ACCOUNT))
+        self.assertEqual(
+            P.cash(self.conn, context, account_id=ACCOUNT), (None, "unknown")
+        )
+
     def test_port10b_realized_pnl_without_execution_schema_stays_unknown(self):
         conn = sqlite3.connect(":memory:")
         try:

@@ -320,13 +320,15 @@ MUTATIONS = [
     },
     {
         "id": "M-PORT36", "file": READ_MODEL,
-        "old": '''        if not _cycle_created_by(conn, context, account_id=account_id):
-            return None
-        return _ledger_num(row[0])
+        "old": '''    return _cycle_created_by(conn, context, account_id=account_id)
+
+
+def _cycle_initial(conn, context: PortfolioReadContext, account_id: str | None = None):
 ''',
-        "new": '''        if not _cycle_created_by(conn, context):
-            return None
-        return _ledger_num(row[0])
+        "new": '''    return _cycle_created_by(conn, context)
+
+
+def _cycle_initial(conn, context: PortfolioReadContext, account_id: str | None = None):
 ''',
         "test": f"{TEST}.test_port11m_pre_cycle_activity_is_account_scoped",
         "desc": "let another account authorize pre-cycle capital",
@@ -577,6 +579,28 @@ MUTATIONS = [
 ''',
         "test": f"{TEST}.test_port13b_one_order_with_a_mismatched_fill_blocks_its_key",
         "desc": "cover an order as soon as any one of its fills is valid",
+    },
+    {
+        "id": "M-PORT57", "file": READ_MODEL,
+        "old": '''        " WHERE o.cycle_id=? AND o.side='buy' AND o.status='filled'"
+        "   AND f.fill_date IS NOT NULL"
+''',
+        "new": '''        " WHERE o.cycle_id=? AND o.side='buy' AND o.status='filled'"
+        "   AND f.side='buy' AND f.fill_date IS NOT NULL"
+''',
+        "test": f"{TEST}.test_port5g_side_contradicting_fill_blocks_coverage",
+        "desc": "filter out a side-contradicting fill before completeness checks",
+    },
+    {
+        "id": "M-PORT58", "file": READ_MODEL,
+        "old": '''        if not _account_attached_by(conn, context, account_id):
+            return None
+''',
+        "new": '''        if not _cycle_created_by(conn, context, account_id=account_id):
+            return None
+''',
+        "test": f"{TEST}.test_port11o_account_attached_after_asof_stays_unknown",
+        "desc": "publish account capital before the account joined the cycle",
     },
 ]
 

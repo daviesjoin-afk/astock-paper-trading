@@ -199,7 +199,13 @@ class PortfolioReadContext:
 
 
 def _sell_fills(conn, context: PortfolioReadContext, account_id: str | None = None):
-    """Return (verified rows, all rows, proof_available)."""
+    """Return (verified rows, all rows, proof_available).
+
+    Every fill attached to a bounded SELL order is selected, **not** just the
+    rows whose declared side agrees with the order: a contradictory fill is
+    execution evidence that must fail closed, so it has to reach the
+    completeness checks instead of being filtered out by ``f.side``.
+    """
     if not (
         _has_columns(conn, "paper_fills", _FILL_SELECT_COLUMNS)
         and _has_columns(conn, "paper_orders", _ORDER_COLUMNS)
@@ -221,7 +227,7 @@ def _sell_fills(conn, context: PortfolioReadContext, account_id: str | None = No
         "       o.amount AS order_amount, o.fees AS order_fees, o.executed_at"
         "  FROM paper_fills f JOIN paper_orders o ON o.id=f.order_id"
         " WHERE o.cycle_id=? AND o.side='sell' AND o.status='filled'"
-        "   AND f.side='sell' AND f.fill_date IS NOT NULL"
+        "   AND f.fill_date IS NOT NULL"
         "   AND length(f.fill_date)>=10 AND substr(f.fill_date,1,10)<=?"
         + account_sql +
         " ORDER BY f.fill_date,f.id",
@@ -288,6 +294,12 @@ def _all_filled_buy_orders(conn, context: PortfolioReadContext,
 
 
 def _buy_fills(conn, context: PortfolioReadContext, account_id: str | None = None):
+    """Return (verified rows, all rows, proof_available).
+
+    As with :func:`_sell_fills`, every fill attached to a bounded BUY order is
+    selected so a side-contradicting fill reaches the completeness checks
+    instead of being filtered out by ``f.side``.
+    """
     if not (
         _has_columns(conn, "paper_fills", _FILL_SELECT_COLUMNS)
         and _has_columns(conn, "paper_orders", _ORDER_COLUMNS)
@@ -309,7 +321,7 @@ def _buy_fills(conn, context: PortfolioReadContext, account_id: str | None = Non
         "       o.amount AS order_amount, o.fees AS order_fees, o.executed_at"
         "  FROM paper_fills f JOIN paper_orders o ON o.id=f.order_id"
         " WHERE o.cycle_id=? AND o.side='buy' AND o.status='filled'"
-        "   AND f.side='buy' AND f.fill_date IS NOT NULL"
+        "   AND f.fill_date IS NOT NULL"
         "   AND length(f.fill_date)>=10 AND substr(f.fill_date,1,10)<=?"
         + account_sql +
         " ORDER BY f.fill_date,f.id",
@@ -852,6 +864,29 @@ def _cycle_created_by(conn, context: PortfolioReadContext,
         return True
     return _cycle_has_bounded_activity(conn, context, account_id=account_id)
 
+def _account_attached_by(conn, context: PortfolioReadContext, account_id) -> bool:
+    """Return whether ``account_id`` provably belonged to the cycle by ``asof_day``.
+
+    A cycle's ``created_at`` says nothing about when a **given account** joined
+    it: the supported mid-cycle attachment paths rebind
+    ``paper_accounts.cycle_id`` and record a later
+    ``paper_parameter_versions.effective_date``.  Without bounded
+    attachment evidence the account must not lend its current ``initial_cash``
+    to a snapshot that predates its participation.
+    """
+    if _has_columns(conn, "paper_parameter_versions",
+                    {"cycle_id", "account_id", "effective_date"}):
+        row = conn.execute(
+            "SELECT MIN(effective_date) FROM paper_parameter_versions"
+            " WHERE cycle_id=? AND account_id=?",
+            (context.cycle_id, str(account_id)),
+        ).fetchone()
+        if row is not None and row[0] is not None:
+            day = _day_text(row[0])
+            return bool(day and day <= context.asof_day.isoformat())
+    return _cycle_created_by(conn, context, account_id=account_id)
+
+
 def _cycle_initial(conn, context: PortfolioReadContext, account_id: str | None = None):
     """Resolve cycle/account initial capital without reading current cash."""
     if account_id:
@@ -862,7 +897,7 @@ def _cycle_initial(conn, context: PortfolioReadContext, account_id: str | None =
         ).fetchone()
         if row is None or int(row[1] or -1) != context.cycle_id:
             return None
-        if not _cycle_created_by(conn, context, account_id=account_id):
+        if not _account_attached_by(conn, context, account_id):
             return None
         return _ledger_num(row[0])
     if _has_columns(conn, "paper_cycles", {"id", "capital"}):
