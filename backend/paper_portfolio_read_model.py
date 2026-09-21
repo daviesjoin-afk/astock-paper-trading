@@ -461,6 +461,8 @@ def bounded_lots_with_status(conn, context: PortfolioReadContext, *,
         lot = dict(row)
         original = str(lot.get("acquired_at") or "")
         source_order_id = lot.get("source_order_id")
+        if source_order_id is None:
+            unknown_date = True
         economic = None
         if source_order_id is not None and fill_proof:
             economic = economic_dates.get(int(source_order_id))
@@ -641,6 +643,10 @@ def _cash_flow_total(conn, context: PortfolioReadContext, account_id: str | None
             return None, STATUS_UNKNOWN
         if any_fill is None:
             return None, STATUS_UNKNOWN
+        lots = bounded_lots(conn, context, account_id=account_id)
+        _uncovered_cost, uncovered_count = _uncovered_lot_facts(conn, lots)
+        if uncovered_count:
+            return None, STATUS_UNKNOWN
         return 0.0, STATUS_VERIFIED
     if _unproven_sell_exists(conn, context, account_id):
         return None, STATUS_UNKNOWN
@@ -659,6 +665,10 @@ def _cash_flow_total(conn, context: PortfolioReadContext, account_id: str | None
         if amount is None or fees is None:
             return None, STATUS_UNKNOWN
         total += amount - fees
+    lots = bounded_lots(conn, context, account_id=account_id)
+    _uncovered_cost, uncovered_count = _uncovered_lot_facts(conn, lots)
+    if uncovered_count:
+        return None, STATUS_UNKNOWN
     return total, STATUS_VERIFIED
 
 
@@ -682,12 +692,12 @@ def initial_capital(conn, context: PortfolioReadContext):
     return _cycle_initial(conn, context)
 
 
-def _uncovered_lot_cost(conn, lots: list[dict]) -> float:
-    """Cash cost of open lots not already represented by BUY fills."""
+def _uncovered_lot_facts(conn, lots: list[dict]) -> tuple[float, int]:
+    """Cash cost and count of open lots without linked BUY fill evidence."""
     if not lots:
-        return 0.0
+        return 0.0, 0
     if not _has_columns(conn, "paper_fills", {"order_id", "side"}):
-        return 0.0
+        return 0.0, 0
     source_order_ids = []
     for lot in lots:
         try:
@@ -706,14 +716,16 @@ def _uncovered_lot_cost(conn, lots: list[dict]) -> float:
                 tuple(chunk),
             )
         )
-    uncovered = 0.0
+    uncovered_cost = 0.0
+    uncovered_count = 0
     for lot, source_order_id in zip(lots, source_order_ids, strict=True):
         if source_order_id is not None and source_order_id in covered_order_ids:
             continue
         qty = _num(lot.get("qty"), 0.0) or 0.0
         cost = _num(lot.get("cost"), 0.0) or 0.0
-        uncovered += qty * cost
-    return uncovered
+        uncovered_count += 1
+        uncovered_cost += qty * cost
+    return uncovered_cost, uncovered_count
 
 
 def compatibility_cash(conn, context: PortfolioReadContext, *,
@@ -745,7 +757,8 @@ def compatibility_cash(conn, context: PortfolioReadContext, *,
                 total -= amount + fees
             else:
                 total += amount - fees
-        return total - _uncovered_lot_cost(conn, open_lots)
+        uncovered_cost, _uncovered_count = _uncovered_lot_facts(conn, open_lots)
+        return total - uncovered_cost
     invested = sum(
         int(row.get("remaining_qty") or 0) * (_num(row.get("cost"), 0.0) or 0.0)
         for row in open_lots

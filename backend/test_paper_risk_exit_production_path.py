@@ -155,10 +155,11 @@ class PaperRiskExitProductionPathTestCase(unittest.TestCase):
             cur = conn.execute(
                 """INSERT INTO paper_position_lots(
                        cycle_id, account_id, code, name, industry, qty, remaining_qty,
-                       cost, acquired_at, available_date, asset_type, cost_fee_included, is_t_base
-                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'stock_t1', 1, 1)""",
+                       cost, acquired_at, available_date, asset_type, cost_fee_included,
+                       is_t_base, source_order_id
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'stock_t1', 1, 1, ?)""",
                 (cycle_id, account_id, code, f"测试股_{code}", "Tech", qty, remaining_qty,
-                 cost, acquired_at, available_date),
+                 cost, acquired_at, available_date, seed_order_id),
             )
             PT._sync_positions(conn, asof_day=self.day)
             return cur.lastrowid

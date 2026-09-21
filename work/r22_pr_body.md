@@ -44,7 +44,7 @@ After-fix probe summary: `0/8 reproduced`; C1/C2/C3/C6 now use the explicit boun
 
 ## Architecture
 
-- new module: `backend/paper_portfolio_read_model.py` (901 LOC, 34 top-level defs)
+- new module: `backend/paper_portfolio_read_model.py` (916 LOC, 34 top-level defs)
 - `paper_trading.py` LOC: `14847 -> 14847`
 - `paper_trading.py` top-level defs: `280 -> 280`
 - reverse imports: `0` (new read model does not import `paper_trading`)
@@ -62,10 +62,10 @@ After-fix probe summary: `0/8 reproduced`; C1/C2/C3/C6 now use the explicit boun
 
 ## Tests
 
-- targeted portfolio read model: `33/33 PASS`
+- targeted portfolio read model: `34/34 PASS`
 - architecture guard: `94/94 PASS`
 - risk / authoritative-position / sell-convergence suites: `113/113 PASS`
-- full backend: `3879 tests OK (skipped=5)`
+- full backend: `3880 tests OK (skipped=5)`
 - frontend build: `PASS` (2 pre-existing duplicate-key warnings in `frontend/src/core/format.js`, not introduced by R22)
 - frontend unit: `111/111 PASS`
 - dist drift: `PASS`
@@ -74,7 +74,7 @@ After-fix probe summary: `0/8 reproduced`; C1/C2/C3/C6 now use the explicit boun
 
 ## Mutation
 
-- `M-PORT1`..`M-PORT25`: `25/25 RED`
+- `M-PORT1`..`M-PORT27`: `27/27 RED`
 - survived: `0`
 - restore sha256: `PASS`
 
@@ -95,7 +95,9 @@ After-fix probe summary: `0/8 reproduced`; C1/C2/C3/C6 now use the explicit boun
 - P2 valuation sanity: non-finite and non-positive valuation evidence is treated as unavailable, so NaN/inf cannot produce verified NAV.
 - P1 mixed fill-less lots: when recorded fill flows exist, compatibility cash now also subtracts the original cost of durable lots that have no linked BUY fill, preventing fill-less legacy lots from inflating NAV.
 - P2 future runtime risk state: risk positions only accept `paper_position_risk_state` rows whose `initialized_at` and `updated_at` dates are not later than `asof_day`; future peak / take-stage / re-entry state is treated as missing rather than injected into historical replay.
-- each review fix has a permanent regression and a dedicated mutation (`M-PORT13`..`M-PORT25`).
+- P1 source-less durable lots: strict cash now returns unknown when any open durable lot lacks linked BUY fill evidence; compatibility cash reconciles its original cost instead of treating cash flow as zero.
+- P1 source-less historical lots: `bounded_lots_with_status` marks `source_order_id IS NULL` lots as quantity unknown; explicit exposure/risk reads fail closed instead of promoting `acquired_at` to authority.
+- each review fix has a permanent regression and a dedicated mutation (`M-PORT13`..`M-PORT27`).
 
 ## Security
 

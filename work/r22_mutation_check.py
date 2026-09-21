@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""R22 mutation matrix M-PORT1 ~ M-PORT25.
+"""R22 mutation matrix M-PORT1 ~ M-PORT27.
 
 Each mutation must turn its corresponding permanent contract RED.  The script
 restores every mutated file byte-identically and verifies sha256.
@@ -183,7 +183,7 @@ MUTATIONS = [
     },
     {
         "id": "M-PORT24", "file": READ_MODEL,
-        "old": "        return total - _uncovered_lot_cost(conn, open_lots)\n",
+        "old": "        uncovered_cost, _uncovered_count = _uncovered_lot_facts(conn, open_lots)\n        return total - uncovered_cost\n",
         "new": "        return total\n",
         "test": f"{TEST}.test_port11d_mixed_fill_less_lot_is_reconciled",
         "desc": "ignore uncovered durable lot cost in compatibility cash",
@@ -194,6 +194,20 @@ MUTATIONS = [
         "new": '    day = "9999-12-31"\n',
         "test": f"{TEST}.test_port4i_risk_positions_exclude_future_runtime_state",
         "desc": "inject future runtime risk state into historical read",
+    },
+    {
+        "id": "M-PORT26", "file": READ_MODEL,
+        "old": '''    lots = bounded_lots(conn, context, account_id=account_id)\n    _uncovered_cost, uncovered_count = _uncovered_lot_facts(conn, lots)\n    if uncovered_count:\n        return None, STATUS_UNKNOWN\n    return total, STATUS_VERIFIED\n''',
+        "new": '''    return total, STATUS_VERIFIED\n''',
+        "test": f"{TEST}.test_port11g_source_less_lot_keeps_cash_unknown",
+        "desc": "treat source-less durable lots as verified zero cash flow",
+    },
+    {
+        "id": "M-PORT27", "file": READ_MODEL,
+        "old": '''        if source_order_id is None:\n            unknown_date = True\n        economic = None\n''',
+        "new": '''        economic = None\n''',
+        "test": f"{TEST}.test_port11g_source_less_lot_keeps_cash_unknown",
+        "desc": "promote wall-clock acquired_at for source-less lots",
     },
 ]
 
