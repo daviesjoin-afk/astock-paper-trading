@@ -443,7 +443,7 @@ MUTATIONS = [
         "id": "M-PORT46", "file": READ_MODEL,
         "old": '''    number = _num(value, None)
     if number is None or not math.isfinite(number):
-        return default
+        return None
     return number
 ''',
         "new": '''    return _num(value, default)
@@ -484,7 +484,7 @@ MUTATIONS = [
     },
     {
         "id": "M-PORT50", "file": READ_MODEL,
-        "old": '''        if _ledger_num(lot.get("qty")) is None:
+        "old": '''        if _ledger_num(lot.get("qty")) is None or _ledger_num(lot.get("cost")) is None:
             unknown_date = True
             uncertain_lot_ids.add(lot_id)
             continue
@@ -494,6 +494,50 @@ MUTATIONS = [
 ''',
         "test": f"{TEST}.test_port9d_non_finite_lot_quantity_stays_unknown",
         "desc": "let a non-finite stored lot quantity through the FIFO read",
+    },
+    {
+        "id": "M-PORT51", "file": READ_MODEL,
+        "old": '''    "id", "cycle_id", "account_id", "code", "qty", "remaining_qty", "cost",
+''',
+        "new": '''    "cycle_id", "account_id", "code", "qty", "remaining_qty", "cost",
+''',
+        "test": f"{TEST}.test_port4q_partial_lot_schema_without_id_fails_closed",
+        "desc": "order bounded lots by a missing id column",
+    },
+    {
+        "id": "M-PORT52", "file": READ_MODEL,
+        "old": '''    if value is None:
+        return default
+    number = _num(value, None)
+    if number is None or not math.isfinite(number):
+        return None
+''',
+        "new": '''    number = _num(value, None)
+    if number is None or not math.isfinite(number):
+        return default
+''',
+        "test": f"{TEST}.test_port9e_non_finite_fill_fees_stay_unknown",
+        "desc": "coerce a non-finite fill fee to zero",
+    },
+    {
+        "id": "M-PORT53", "file": READ_MODEL,
+        "old": '''        if _ledger_num(sell.get("fill_qty")) is None:
+            return [row for bucket in grouped.values() for row in bucket], False
+''',
+        "new": '''        if False:
+            return [row for bucket in grouped.values() for row in bucket], False
+''',
+        "test": f"{TEST}.test_port9f_non_finite_sell_quantity_fails_closed",
+        "desc": "convert a non-finite sell fill quantity to an integer",
+    },
+    {
+        "id": "M-PORT54", "file": READ_MODEL,
+        "old": '''        if _ledger_num(lot.get("qty")) is None or _ledger_num(lot.get("cost")) is None:
+''',
+        "new": '''        if _ledger_num(lot.get("qty")) is None:
+''',
+        "test": f"{TEST}.test_port9g_non_finite_lot_cost_with_source_stays_unknown",
+        "desc": "let a non-finite source-backed lot cost reach aggregation",
     },
 ]
 

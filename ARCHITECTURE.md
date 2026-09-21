@@ -557,9 +557,10 @@ portfolio metrics / risk / dashboard / research consumers
 - 缺失 authoritative lot/execution schema 时，quantity 与 realized PnL 保持 unknown；account-specific 读取遇到缺 `account_id` 的 order schema 也必须 fail closed，不能触发 SQL 异常。fill reader 的前置校验还要覆盖它真正 `SELECT` 的 `price` / `amount` / `fees`：部分迁移的 `paper_fills` 若缺这些列，portfolio / realized PnL / risk 读取一律回落 unknown，不得抛出 `OperationalError`。
 - `source_order_id` 在 schema 上没有唯一约束，因此同一个已验证单 fill 来源订单**不得**为多条 durable lot 背书：一旦某个 `source_order_id` 被多条 lot 引用，它对全部相关 lot 都不再构成 acquisition evidence，quantity 与 cash 保持 unknown（否则复制一条 100 股 lot 就会得到 200 股已验证持仓并摊薄 display cost）。
 - `paper_cycles` 缺少 `created_at`（部分迁移 schema）**不是**该周期当时已存在的证据：初始资本仍需 bounded activity 背书，否则保持 unknown；"无法证明"绝不升级成"当时已存在"。
-- 任何数值类 ledger 证据（fill amount/fees、order realized_pnl、cycle/account 资本、lot qty/cost）都必须是**有限**数：SQLite REAL 列可以存 `inf` / `-inf` / `nan`，把它当数据发布就会得到 `verified` 的无穷 cash / PnL / NAV / 敞口。`_ledger_num` 与 `_valuation_price` 同口径 —— 非有限值按不可读处理（unknown），绝不作为数字参与决策。
+- 任何数值类 ledger 证据（fill amount/fees、order realized_pnl、cycle/account 资本、lot qty/cost）都必须是**有限**数：SQLite REAL 列可以存 `inf` / `-inf` / `nan`，把它当数据发布就会得到 `verified` 的无穷 cash / PnL / NAV / 敞口。`_ledger_num` 与 `_valuation_price` 同口径 —— 非有限值按不可读处理（unknown），绝不作为数字参与决策。**缺失**才可等价于 0（absent fee），"存在但非有限"必须保持 unknown，不能被 default 悄悄吞成 0；同理 lot / sell fill 的 `qty`、lot 的 `cost` 都在进入 FIFO 整数运算与聚合前校验，非有限值 fail closed，不得抛 `OverflowError`。
 - 只有 identity 一致的 fill 才能为其 order 提供经济日：错配（另一 account / code / side）的 fill 不得把已成交订单的经济日推到 asof 之后，否则该 fill 与 order 会同时从 bounded 卖出检查里消失，卖前组合被发布成 verified。错配时回落 fill-less 的 `executed_at`，而非采用该 fill 的日期。
 - `paper_position_risk_state` 的前置列检查必须包含调用方索引所需的 `account_id` / `code`：部分迁移表若缺 identity 列，历史 runtime 风险状态按不可用处理，不得抛 `KeyError`。
+- `paper_position_lots` 的前置列检查必须包含 bounded lot read 实际使用的列（含 `id`，它既是 `ORDER BY` 键也是 FIFO 排序键）：部分迁移表缺列一律保持 quantity unknown，不得抛 `OperationalError`。
 - `paper_positions` 仍是 compatibility projection；projection 不拥有 execution authority。
 
 Invariants：

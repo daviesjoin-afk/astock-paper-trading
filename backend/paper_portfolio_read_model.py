@@ -57,7 +57,7 @@ STATUS_VERIFIED = "verified"
 STATUS_UNKNOWN = "unknown"
 
 _POSITION_LOT_COLUMNS = {
-    "cycle_id", "account_id", "code", "qty", "remaining_qty", "cost",
+    "id", "cycle_id", "account_id", "code", "qty", "remaining_qty", "cost",
     "acquired_at", "available_date", "asset_type", "source_order_id",
 }
 _FILL_COLUMNS = {"id", "order_id", "account_id", "side", "code", "qty", "fill_date"}
@@ -93,10 +93,16 @@ def _ledger_num(value: Any, default: float | None = None) -> float | None:
     a value would make cash / realized PnL / NAV / exposure "verified infinite",
     so it is treated exactly like an unreadable value — the same policy
     :func:`_valuation_price` already applies to prices.
+
+    A **missing** value may take ``default`` (an absent fee really is zero), but
+    a value that is present and non-finite stays ``None`` so callers fail closed
+    instead of silently turning corrupt evidence into a number.
     """
+    if value is None:
+        return default
     number = _num(value, None)
     if number is None or not math.isfinite(number):
-        return default
+        return None
     return number
 
 
@@ -393,6 +399,10 @@ def _consume_fifo(lots: list[dict], sells: list[dict]) -> tuple[list[dict], bool
         grouped[key].sort(key=lambda row: (str(row.get("acquired_at") or ""), int(row.get("id") or 0)))
     for sell in sells:
         key = (str(sell.get("fill_account_id") or ""), str(sell.get("fill_code") or ""))
+        # A non-finite fill quantity is not evidence; `int(inf)` would raise
+        # ``OverflowError`` out of the whole portfolio / risk read.
+        if _ledger_num(sell.get("fill_qty")) is None:
+            return [row for bucket in grouped.values() for row in bucket], False
         remaining = int(_num(sell.get("fill_qty"), 0) or 0)
         if remaining <= 0:
             continue
@@ -595,7 +605,7 @@ def bounded_lots_with_status(conn, context: PortfolioReadContext, *,
         original = str(lot.get("acquired_at") or "")
         # Non-finite stored quantities are not ledger evidence.  They would
         # otherwise raise out of the FIFO integer arithmetic below.
-        if _ledger_num(lot.get("qty")) is None:
+        if _ledger_num(lot.get("qty")) is None or _ledger_num(lot.get("cost")) is None:
             unknown_date = True
             uncertain_lot_ids.add(lot_id)
             continue

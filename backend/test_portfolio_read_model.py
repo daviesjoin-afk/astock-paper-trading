@@ -602,6 +602,65 @@ class PortfolioReadModelContractTests(unittest.TestCase):
         self.assertEqual(lots, [])
         self.assertEqual(status, "unknown")
 
+    def test_port4q_partial_lot_schema_without_id_fails_closed(self):
+        conn = sqlite3.connect(":memory:")
+        try:
+            conn.execute(
+                "CREATE TABLE paper_position_lots("
+                "cycle_id INTEGER, account_id TEXT, code TEXT, qty INTEGER,"
+                "remaining_qty INTEGER, cost REAL, acquired_at TEXT,"
+                "available_date TEXT, asset_type TEXT, source_order_id INTEGER)"
+            )
+            lots, status = P.bounded_lots_with_status(
+                conn, P.PortfolioReadContext(self.cycle100, DAY)
+            )
+        finally:
+            conn.close()
+        self.assertEqual(lots, [])
+        self.assertEqual(status, "unknown")
+
+    def test_port9e_non_finite_fill_fees_stay_unknown(self):
+        buy = self._order_and_fill(cycle_id=self.cycle100, side="buy", qty=100,
+                                   price=10.0, fill_date=DAY.isoformat())
+        self._lot(self.cycle100, 100, 10.0, source_order_id=buy)
+        self.conn.execute(
+            "UPDATE paper_fills SET fees=? WHERE order_id=?", (float("inf"), buy)
+        )
+        self.conn.commit()
+        context = P.PortfolioReadContext(self.cycle100, DAY)
+        # 存在的非有限 fees 必须保持 unknown；只有缺失的 fee 才等价于 0。
+        self.assertEqual(P.cash(self.conn, context), (None, "unknown"))
+        self.assertEqual(P.verified_cash_flows(self.conn, context), {})
+
+    def test_port9f_non_finite_sell_quantity_fails_closed(self):
+        self._lot(self.cycle100, 100, 10.0)
+        sell = self._order_and_fill(
+            cycle_id=self.cycle100, side="sell", qty=100, price=11.0,
+            fill_date=DAY.isoformat(), fees=0.0,
+        )
+        self.conn.execute(
+            "UPDATE paper_fills SET qty=? WHERE order_id=?", (float("inf"), sell)
+        )
+        self.conn.commit()
+        context = P.PortfolioReadContext(self.cycle100, DAY)
+        lots, status = P.bounded_lots_with_status(self.conn, context)
+        self.assertEqual(status, "unknown")
+        self.assertEqual([row["remaining_qty"] for row in lots], [100])
+
+    def test_port9g_non_finite_lot_cost_with_source_stays_unknown(self):
+        buy = self._order_and_fill(cycle_id=self.cycle100, side="buy", qty=100,
+                                   price=10.0, fill_date=DAY.isoformat())
+        self._lot(self.cycle100, 100, 10.0, source_order_id=buy)
+        self.conn.execute(
+            "UPDATE paper_position_lots SET cost=? WHERE cycle_id=?",
+            (float("inf"), self.cycle100),
+        )
+        self.conn.commit()
+        result = self._portfolio(self.cycle100, valuations={CODE: 10.0})
+        self.assertEqual(result["quantity_status"], "unknown")
+        self.assertIsNone(result["unrealized_pnl"])
+        self.assertIsNone(result["nav"])
+
     def test_port10d_non_finite_realized_pnl_stays_unknown(self):
         sell = self._order_and_fill(
             cycle_id=self.cycle100, side="sell", qty=100, price=11.0,
