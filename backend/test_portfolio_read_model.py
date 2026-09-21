@@ -361,6 +361,34 @@ class PortfolioReadModelContractTests(unittest.TestCase):
             (None, "unknown"),
         )
 
+    def test_port9b_non_finite_or_non_positive_valuation_stays_unknown(self):
+        buy = self._order_and_fill(cycle_id=self.cycle100, side="buy", qty=100,
+                                   price=10.0, fill_date=DAY.isoformat())
+        self._lot(self.cycle100, 100, 10.0, source_order_id=buy)
+        self.conn.commit()
+        for bad_price in (float("nan"), float("inf"), float("-inf"), 0.0, -1.0):
+            with self.subTest(price=bad_price):
+                result = self._portfolio(self.cycle100, valuations={CODE: bad_price})
+                self.assertIsNone(result["market_value"])
+                self.assertIsNone(result["unrealized_pnl"])
+                self.assertIsNone(result["nav"])
+                self.assertEqual(result["market_value_status"], "unknown")
+
+    def test_port11f_archived_cycle_remains_unknown(self):
+        self.conn.execute(
+            "INSERT INTO paper_archives(cycle_id,cycle_key,reason,snapshot,created_at) "
+            "VALUES(?,?,?,?,?)",
+            (self.cycle100, "r22-c100", "test_archive", "{}", f"{DAY.isoformat()} 15:00:00"),
+        )
+        self.conn.commit()
+        result = self._portfolio(self.cycle100, valuations={CODE: 10.0})
+        self.assertTrue(result["archived"])
+        self.assertEqual(result["quantity_status"], "unknown")
+        self.assertIsNone(result["market_value"])
+        self.assertIsNone(result["cash"])
+        self.assertIsNone(result["realized_pnl"])
+        self.assertIsNone(result["nav"])
+
     def test_port7_historical_read_never_resolves_active_cycle(self):
         buy = self._order_and_fill(cycle_id=self.cycle100, side="buy", qty=100,
                                    price=10.0, fill_date=DAY.isoformat())

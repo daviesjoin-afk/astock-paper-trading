@@ -44,7 +44,7 @@ After-fix probe summary: `0/8 reproduced`; C1/C2/C3/C6 now use the explicit boun
 
 ## Architecture
 
-- new module: `backend/paper_portfolio_read_model.py` (822 LOC, 31 top-level defs)
+- new module: `backend/paper_portfolio_read_model.py` (857 LOC, 32 top-level defs)
 - `paper_trading.py` LOC: `14847 -> 14847`
 - `paper_trading.py` top-level defs: `280 -> 280`
 - reverse imports: `0` (new read model does not import `paper_trading`)
@@ -62,10 +62,10 @@ After-fix probe summary: `0/8 reproduced`; C1/C2/C3/C6 now use the explicit boun
 
 ## Tests
 
-- targeted portfolio read model: `29/29 PASS`
+- targeted portfolio read model: `31/31 PASS`
 - architecture guard: `94/94 PASS`
 - affected R19/R20/R21 + portfolio contract suites: `170/170 PASS`
-- full backend: `3875 tests OK (skipped=5)`
+- full backend: `3877 tests OK (skipped=5)`
 - frontend build: `PASS` (2 pre-existing duplicate-key warnings in `frontend/src/core/format.js`, not introduced by R22)
 - frontend unit: `111/111 PASS`
 - dist drift: `PASS`
@@ -74,7 +74,7 @@ After-fix probe summary: `0/8 reproduced`; C1/C2/C3/C6 now use the explicit boun
 
 ## Mutation
 
-- `M-PORT1`..`M-PORT21`: `21/21 RED`
+- `M-PORT1`..`M-PORT23`: `23/23 RED`
 - survived: `0`
 - restore sha256: `PASS`
 
@@ -91,7 +91,9 @@ After-fix probe summary: `0/8 reproduced`; C1/C2/C3/C6 now use the explicit boun
 - P2 missing-order fill evidence: display cash flow now also inspects bounded filled BUY/SELL orders for verified fill evidence, blocking partial per-symbol projections.
 - P1 risk snapshot positions: paper_risk_service now reads the bounded status-returning position API for both snapshot and write-time loops, with cycle-owned risk state still injected separately.
 - P2 filled-order bounding: BUY/SELL filled-order checks now use the economic fill date when present and fall back to executed_at only for genuinely fill-less legacy orders.
-- each review fix has a permanent regression and a dedicated mutation (`M-PORT13`..`M-PORT21`).
+- P2 archived cycles: archived cycles now return unknown portfolio/cash/realized facts instead of a fabricated verified empty portfolio.
+- P2 valuation sanity: non-finite and non-positive valuation evidence is treated as unavailable, so NaN/inf cannot produce verified NAV.
+- each review fix has a permanent regression and a dedicated mutation (`M-PORT13`..`M-PORT23`).
 
 ## Security
 

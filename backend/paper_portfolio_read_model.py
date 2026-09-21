@@ -20,6 +20,7 @@ quote.
 from __future__ import annotations
 
 import datetime as dt
+import math
 import sqlite3
 from dataclasses import dataclass
 from typing import Any, Mapping
@@ -129,6 +130,26 @@ def _has_columns(conn, table: str, required: set[str]) -> bool:
 
 class PortfolioReadUnavailable(RuntimeError):
     """Raised when a bounded portfolio read cannot prove a required fact."""
+
+
+def _cycle_is_archived(conn, context: PortfolioReadContext) -> bool:
+    """Return whether the requested cycle's live ledger has been archived."""
+    if _has_columns(conn, "paper_archives", {"cycle_id"}):
+        try:
+            row = conn.execute(
+                "SELECT 1 FROM paper_archives WHERE cycle_id=? LIMIT 1",
+                (context.cycle_id,),
+            ).fetchone()
+            if row is not None:
+                return True
+        except sqlite3.Error:
+            pass
+    if _has_columns(conn, "paper_cycles", {"id", "status"}):
+        row = conn.execute(
+            "SELECT status FROM paper_cycles WHERE id=?", (context.cycle_id,)
+        ).fetchone()
+        return bool(row is not None and str(row[0] or "") == "archived")
+    return False
 
 
 @dataclass(frozen=True)
@@ -415,6 +436,8 @@ def bounded_lots(conn, context: PortfolioReadContext, *, account_id: str | None 
 def bounded_lots_with_status(conn, context: PortfolioReadContext, *,
                              account_id: str | None = None) -> tuple[list[dict], str]:
     """Return ``(lots, quantity_status)`` for an explicit context."""
+    if _cycle_is_archived(conn, context):
+        return [], STATUS_UNKNOWN
     if not _has_columns(conn, "paper_position_lots", _POSITION_LOT_COLUMNS):
         return [], STATUS_VERIFIED
     params: list[Any] = [context.cycle_id]
@@ -543,6 +566,8 @@ def positions_for_context(conn, context: PortfolioReadContext, *,
 def realized_pnl(conn, context: PortfolioReadContext, *,
                  account_id: str | None = None) -> tuple[float | None, str]:
     """Sum verified committed SELL realized PnL up to ``context.asof_day``."""
+    if _cycle_is_archived(conn, context):
+        return None, STATUS_UNKNOWN
     if _unproven_sell_exists(conn, context, account_id):
         return None, STATUS_UNKNOWN
     verified, _rows, proof_available = _sell_fills(conn, context, account_id)
@@ -596,6 +621,8 @@ def _cycle_initial(conn, context: PortfolioReadContext, account_id: str | None =
 
 
 def _cash_flow_total(conn, context: PortfolioReadContext, account_id: str | None = None):
+    if _cycle_is_archived(conn, context):
+        return None, STATUS_UNKNOWN
     buys, buy_rows, buy_proof = _buy_fills(conn, context, account_id)
     sells, _sell_rows, sell_proof = _sell_fills(conn, context, account_id)
     buy_orders, buy_orders_proof = _all_filled_buy_orders(conn, context, account_id)
@@ -638,6 +665,8 @@ def _cash_flow_total(conn, context: PortfolioReadContext, account_id: str | None
 def cash(conn, context: PortfolioReadContext, *,
          account_id: str | None = None) -> tuple[float | None, str]:
     """Reconstruct bounded cash from the cycle declaration and verified fills."""
+    if _cycle_is_archived(conn, context):
+        return None, STATUS_UNKNOWN
     initial = _cycle_initial(conn, context, account_id)
     if initial is None:
         return None, STATUS_UNKNOWN
@@ -662,6 +691,8 @@ def compatibility_cash(conn, context: PortfolioReadContext, *,
     bounded to the requested cycle/as-of and accounts for recorded fills or
     held lot cost, without reading current account cash.
     """
+    if _cycle_is_archived(conn, context):
+        return None
     initial = _cycle_initial(conn, context, account_id)
     if initial is None:
         return None
@@ -707,7 +738,10 @@ def _valuation_price(valuations: Mapping | None, code: str) -> float | None:
     value = valuations.get(code)
     if isinstance(value, Mapping):
         value = value.get("price")
-    return _num(value, None)
+    price = _num(value, None)
+    if price is None or not math.isfinite(price) or price <= 0:
+        return None
+    return price
 
 
 def risk_positions_for_context(conn, context: PortfolioReadContext, *,
@@ -783,6 +817,7 @@ def portfolio_for_context(
         },
         "positions": positions,
         "quantity_status": quantity_status,
+        "archived": _cycle_is_archived(conn, context),
         "realized_pnl": realized,
         "realized_pnl_status": realized_status,
         "cash": cash_value,

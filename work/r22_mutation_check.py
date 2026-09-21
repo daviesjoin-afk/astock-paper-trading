@@ -69,8 +69,8 @@ MUTATIONS = [
     },
     {
         "id": "M-PORT8", "file": READ_MODEL,
-        "old": '    return _num(value, None)\n',
-        "new": '    return _num(value, 10.0)\n',
+        "old": '    price = _num(value, None)\n',
+        "new": '    price = _num(value, None) or 10.0\n',
         "test": f"{TEST}.test_port9_unknown_valuation_stays_unknown",
         "desc": "fallback missing price to a latest price",
         "last": True,
@@ -166,6 +166,20 @@ MUTATIONS = [
         "new": "    for orders, verified_rows in ():\n",
         "test": f"{TEST}.test_port3c_buy_order_without_fill_blocks_display_cash_flow",
         "desc": "ignore filled orders with no fill evidence in display flow",
+    },
+    {
+        "id": "M-PORT22", "file": READ_MODEL,
+        "old": "    if _cycle_is_archived(conn, context):\n        return [], STATUS_UNKNOWN\n",
+        "new": "    if False:\n        return [], STATUS_UNKNOWN\n",
+        "test": f"{TEST}.test_port11f_archived_cycle_remains_unknown",
+        "desc": "publish an archived cycle as a verified empty portfolio",
+    },
+    {
+        "id": "M-PORT23", "file": READ_MODEL,
+        "old": "    if price is None or not math.isfinite(price) or price <= 0:\n        return None\n",
+        "new": "    if price is None:\n        return None\n",
+        "test": f"{TEST}.test_port9b_non_finite_or_non_positive_valuation_stays_unknown",
+        "desc": "accept non-finite valuation evidence as verified",
     },
 ]
 
