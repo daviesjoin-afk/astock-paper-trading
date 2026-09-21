@@ -804,15 +804,18 @@ def run(context: RiskRunContext, *, ports: RiskServicePorts):
                     _audit(
                         conn, position["account_id"], "quality_rotation",
                         f"{position['code']} 择强换仓，质量评分 {quality_review.get('score', 0):.1f}",
+                        strategy_stamp=strategy_stamp,
                     )
                 _audit(
                     conn, position["account_id"], "concentration_rotation",
                     f"{position['code']} 质量评分 {quality_review.get('score', 0):.1f}，释放额度等待高分候选 {((quality_review.get('replacement') or {}).get('code') or '下一轮选股')}",
+                    strategy_stamp=strategy_stamp,
                 )
                 if quality_action == "permission_scope_exit":
                     _audit(
                         conn, position["account_id"], "permission_scope_exit",
                         f"{position['code']} {permission_reason}；本次卖出 {qty} 股，剩余 {detail['remaining_qty']} 股",
+                        strategy_stamp=strategy_stamp,
                     )
                 # Reducing an over-cap strategy must lower its stock count.
                 # A score-based rotation may enter a stronger replacement;

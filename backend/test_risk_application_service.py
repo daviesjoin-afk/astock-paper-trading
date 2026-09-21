@@ -175,6 +175,13 @@ class _RiskServiceCase(PRS._ProductionRiskScanCase):
             except Exception:
                 pass
 
+    def delete_user_legacy_binding(self):
+        with PT._db(immediate=True) as conn:
+            conn.execute(
+                "DELETE FROM paper_strategy_legacy_bindings WHERE account_id=?",
+                (self.USER,),
+            )
+
     def review_detail(self, code=None):
         row = self.conn.execute(
             "SELECT detail FROM paper_position_reviews"
@@ -186,6 +193,11 @@ class _RiskServiceCase(PRS._ProductionRiskScanCase):
 
 
 class RiskServiceContractTests(_RiskServiceCase):
+    def _fresh_case(self):
+        case = type(self)("test_rsvc1_risk_run_context_requires_explicit_identity")
+        case.setUp()
+        return case
+
     def test_rsvc1_risk_run_context_requires_explicit_identity(self):
         with self.assertRaises(ValueError):
             PRSVC.RiskRunContext(cycle_id=None, asof_day=self.day)
@@ -635,6 +647,156 @@ class RiskServiceContractTests(_RiskServiceCase):
             self.assertIsNone(row["strategy_id"])
             self.assertIsNone(row["strategy_version"])
             self.assertIsNone(row["strategy_checksum"])
+
+
+
+    def test_rsvc18_post_fill_rotation_audits_inherit_sell_provenance(self):
+        def stamp(row):
+            if row is None:
+                return (None, None, None)
+            return (
+                row["strategy_id"], row["strategy_version"], row["strategy_checksum"],
+            )
+
+        def pin_v1_then_v2(case):
+            pinned = case.seed_user_strategy_v1()
+            case.advance_user_head(pinned)
+            head = SR.get_version(case.USER, conn=case.conn)
+            self.assertNotEqual(pinned.version, head.version)
+            self.assertNotEqual(pinned.checksum, head.checksum)
+            # Keep the cycle pin but remove the legacy resolver fallback, so
+            # current head is the only value an unpassed audit can adopt.
+            case.delete_user_legacy_binding()
+            return pinned, head
+
+        def sell_order(case):
+            return case.conn.execute(
+                "SELECT strategy_id,strategy_version,strategy_checksum,status"
+                " FROM paper_orders WHERE account_id=? AND side='sell'"
+                " ORDER BY id DESC LIMIT 1",
+                (case.USER,),
+            ).fetchone()
+
+        def filled_decision(case):
+            return case.conn.execute(
+                "SELECT strategy_id,strategy_version,strategy_checksum"
+                " FROM paper_risk_decisions WHERE account_id=? AND side='sell'"
+                " AND decision='filled' ORDER BY id DESC LIMIT 1",
+                (case.USER,),
+            ).fetchone()
+
+        def audit(case, event):
+            return case.conn.execute(
+                "SELECT strategy_id,strategy_version,strategy_checksum"
+                " FROM paper_audit WHERE account_id=? AND event=?"
+                " ORDER BY id DESC LIMIT 1",
+                (case.USER, event),
+            ).fetchone()
+
+        def add_capacity_positions(case):
+            for code in ("600001", "600002", "600003", "600004", "600005", "600006"):
+                case.add_lot_for_account(case.USER, code, 100, 10.0)
+                case.set_quote(code, price=10.0, pct=0.5, high=10.2, low=9.8)
+
+        def assert_filled_concentration(case, result):
+            self.assertTrue(
+                any(
+                    item.get("status") == "filled" and item.get("concentration_rotation")
+                    for item in result.get("orders", [])
+                ),
+                f"no filled concentration SELL: {result.get('orders')}",
+            )
+
+        with self.subTest("capacity exit pinned v1 / current v2"):
+            case = self._fresh_case()
+            try:
+                pinned, _head = pin_v1_then_v2(case)
+                add_capacity_positions(case)
+                result = case.run_risk()
+                assert_filled_concentration(case, result)
+                expected = (pinned.strategy_id, pinned.version, pinned.checksum)
+                for row in (
+                    sell_order(case),
+                    filled_decision(case),
+                    audit(case, "sell_filled"),
+                    audit(case, "concentration_rotation"),
+                ):
+                    self.assertEqual(stamp(row), expected)
+            finally:
+                case.doCleanups()
+
+        with self.subTest("capacity exit missing cycle pin"):
+            case = self._fresh_case()
+            try:
+                _pinned, _head = pin_v1_then_v2(case)
+                case.delete_user_cycle_binding()
+                add_capacity_positions(case)
+                result = case.run_risk()
+                assert_filled_concentration(case, result)
+                for row in (
+                    sell_order(case),
+                    filled_decision(case),
+                    audit(case, "sell_filled"),
+                    audit(case, "concentration_rotation"),
+                ):
+                    self.assertEqual(stamp(row), (None, None, None))
+            finally:
+                case.doCleanups()
+
+        with self.subTest("quality rotation consolidation_exit"):
+            case = self._fresh_case()
+            try:
+                pinned, _head = pin_v1_then_v2(case)
+                case.add_lot_for_account(case.USER, case.code, 100, 10.0)
+                case.set_quote(case.code, price=10.0, pct=0.5, high=10.2, low=9.8)
+                original = PREv.position_quality_score
+
+                def low_quality(*args, **kwargs):
+                    review = original(*args, **kwargs)
+                    review["score"] = 0.0
+                    review["grade"] = "淘汰"
+                    review["hold_days"] = 2
+                    review["min_hold_days"] = 2
+                    return review
+
+                with mock.patch.object(
+                    PREv, "position_quality_score", side_effect=low_quality,
+                ):
+                    result = case.run_risk()
+                assert_filled_concentration(case, result)
+                expected = (pinned.strategy_id, pinned.version, pinned.checksum)
+                for row in (
+                    sell_order(case),
+                    filled_decision(case),
+                    audit(case, "sell_filled"),
+                    audit(case, "quality_rotation"),
+                    audit(case, "concentration_rotation"),
+                ):
+                    self.assertEqual(stamp(row), expected)
+            finally:
+                case.doCleanups()
+
+        with self.subTest("permission scope exit"):
+            case = self._fresh_case()
+            try:
+                pinned, _head = pin_v1_then_v2(case)
+                code = "688001"
+                case.add_lot_for_account(case.USER, code, 300, 10.0)
+                case.set_quote(code, price=10.0, pct=0.5, high=10.2, low=9.8)
+                result = case.run_risk()
+                assert_filled_concentration(case, result)
+                expected = (pinned.strategy_id, pinned.version, pinned.checksum)
+                for row in (
+                    sell_order(case),
+                    filled_decision(case),
+                    audit(case, "sell_filled"),
+                    audit(case, "permission_scope_exit"),
+                    audit(case, "concentration_rotation"),
+                ):
+                    self.assertEqual(stamp(row), expected)
+                self.assertIsNotNone(audit(case, "permission_scope_exit"))
+            finally:
+                case.doCleanups()
 
 
 

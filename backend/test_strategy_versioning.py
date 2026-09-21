@@ -120,11 +120,20 @@ class StrategyVersioningTests(unittest.TestCase):
         self.assertFalse(self._try_insert(
             decision_sql, (account, "buy", "blocked", "{}", "2026-09-10 10:00:00",
                            None, None, None)))
-        # DB-STRAT-7 / 8: only causal SELL audit events allow unknown.
+        # DB-STRAT-7 / 8: only explicit causal SELL audit events allow unknown.
         self.assertTrue(self._try_insert(
             audit_sql, (account, "sell_filled", "2026-09-10 10:00:00", None, None, None)))
         self.assertTrue(self._try_insert(
             audit_sql, (account, "protective_exit_recovery_watch",
+                        "2026-09-10 10:00:00", None, None, None)))
+        self.assertTrue(self._try_insert(
+            audit_sql, (account, "quality_rotation",
+                        "2026-09-10 10:00:00", None, None, None)))
+        self.assertTrue(self._try_insert(
+            audit_sql, (account, "concentration_rotation",
+                        "2026-09-10 10:00:00", None, None, None)))
+        self.assertTrue(self._try_insert(
+            audit_sql, (account, "permission_scope_exit",
                         "2026-09-10 10:00:00", None, None, None)))
         self.assertFalse(self._try_insert(
             audit_sql, (account, "some_unrelated_event", "2026-09-10 10:00:00",

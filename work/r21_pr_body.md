@@ -36,10 +36,13 @@ R21-C7 filled SELL downstream provenance re-resolves current head: REPRODUCED
     sell_filled audit=('r21_alpha', 2, ...)
 R21-C8 all-NULL strategy provenance is accepted outside protective SELL: REPRODUCED
     paper_signals_insert_ok=True paper_orders_buy_insert_ok=True
-R21 final before-fix reproduced: 2/2
+R21-C9 post-fill rotation audit re-resolves current strategy head: REPRODUCED
+    pinned_case order=v1 decision=v1 sell_filled=v1 rotation=v2
+    missing_pin order=NULL decision=NULL sell_filled=NULL rotation=v2
+R21 C9 follow-up before-fix reproduced: 1/1
 ```
 
-After the fix, the original probe reports `0/4`, the follow-up probe reports `0/2`, and the final probe reports `0/2`; the real production contracts are covered by `backend/test_risk_application_service.py` (RSVC-1..17).
+After the fix, the original probe reports `0/4`, the follow-up probe reports `0/2`, and the final C7/C8/C9 probe reports `0/3`; the real production contracts are covered by `backend/test_risk_application_service.py` (RSVC-1..18).
 
 ## Correctness
 
@@ -53,12 +56,15 @@ After the fix, the original probe reports `0/4`, the follow-up probe reports `0/
 - audit guard: the strategy-stamp insert guard is table-aware. Signals, BUY orders, BUY decisions, unrelated audits, partial stamps, and forged stamps remain rejected; only SELL pending orders with an explicit cycle, SELL risk decisions, and causal SELL audit events may carry an all-NULL explicit unknown state.
 - fill provenance: `execution_planner.commit_fill` reads the durable order row’s `(strategy_id, strategy_version, strategy_checksum)` before mutation and passes it unchanged to both `PT._risk_log` and `PT._audit`. Missing pin therefore stays NULL/NULL/NULL through fill; it is never replaced by current head.
 - recovery watch: `protective_exit_recovery_watch` inherits the same causal SELL stamp held by the risk service.
-- migration: v22 refreshes the narrow guard contract without backfilling any historical evidence; a v21 DB upgrade test proves the existing ledger receives the new semantics.
+- post-fill causal audits: `quality_rotation`, `concentration_rotation`, and `permission_scope_exit` all inherit the same strategy stamp as the successful SELL order.
+- missing pin: all post-fill causal audits stay explicit NULL provenance and never fall back to current head.
+- DB guard: only explicit SELL causal audit events may use unknown strategy stamp; unrelated audits remain rejected.
+- migration: v22 refreshes the narrow guard contract without backfilling any historical evidence; a v21 DB upgrade test proves the existing ledger receives the final audit whitelist.
 
 ## Architecture
 
 - `paper_trading.py`: before `16045 LOC / 282 top-level defs`; after `14847 LOC / 280 top-level defs` (provenance plumbing only).
-- `paper_risk_service.py`: `883 LOC`, one risk-run application workflow.
+- `paper_risk_service.py`: `886 LOC`, one risk-run application workflow.
 - `paper_risk_evidence.py`: risk-only evidence/read-model adapters moved out of `paper_trading.py`.
 - `paper_trading._monitor_risk_impl`: thin compatibility adapter, 4 LOC; calls `paper_risk_service.run(...)`.
 - reverse imports: `paper_risk_service.py = 0`, `paper_risk_evidence.py = 0`.
@@ -76,11 +82,11 @@ After the fix, the original probe reports `0/4`, the follow-up probe reports `0/
 
 ```text
 Targeted suite:
-119 tests OK (risk application + strategy runtime + Guard 12 + schema/migration)
-201 tests OK (sell / decision / asof / provenance regression)
+117 tests OK (risk application + strategy runtime + Guard 12 + schema/migration)
+228 tests OK (sell / decision / asof / provenance regression)
 
 Full backend:
-3837 tests OK (skipped=5)
+3839 tests OK (skipped=5)
 
 Frontend:
 npm --prefix frontend run build: PASS (2 existing duplicate-key warnings)
@@ -97,8 +103,8 @@ ruff check backend: All checks passed
 `work/r21_mutation_check.py`:
 
 ```text
-M-RSK1..M-RSK20
-20/20 RED
+M-RSK1..M-RSK21
+21/21 RED
 survived=0
 restore bytes byte-identical
 restore sha256 PASS
@@ -109,10 +115,10 @@ This is a local mutation artifact, not a GitHub CI job claim.
 ## Security
 
 ```text
-scope  : all
+scope  : worktree
 kinds  : none
 values : 0
-manual review: 2 existing image/binary assets
+manual review: 1 existing image asset
 ```
 
 `security-leak-scan` is the CI hard gate; this local result is reported separately.

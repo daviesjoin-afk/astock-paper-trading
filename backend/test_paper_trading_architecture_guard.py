@@ -1606,8 +1606,39 @@ class RiskApplicationServiceBoundary(unittest.TestCase):
         self.assertIn("pending_execution", allowance)
         self.assertIn("sell_filled", allowance)
         self.assertIn("protective_exit_recovery_watch", allowance)
+        self.assertIn("quality_rotation", allowance)
+        self.assertIn("concentration_rotation", allowance)
+        self.assertIn("permission_scope_exit", allowance)
         # Behavioral allow/reject coverage lives in
         # test_strategy_versioning.DbStrat* / test_db_strat_*.
+
+    def test_guard12l_post_fill_sell_audits_inherit_existing_stamp(self):
+        raw = _source(self.SERVICE)
+        start = raw.rindex("            if concentration_triggered:")
+        end = raw.index("            orders.append({", start)
+        post_fill = raw[start:end]
+        self.assertEqual(
+            post_fill.count("_audit("), 3,
+            "post-fill rotation/capacity audit calls changed unexpectedly",
+        )
+        for event in (
+            "quality_rotation",
+            "concentration_rotation",
+            "permission_scope_exit",
+        ):
+            self.assertIn(f'"{event}"', post_fill)
+        self.assertEqual(
+            post_fill.count("strategy_stamp=strategy_stamp"), 3,
+            "post-fill audit does not inherit the durable SELL strategy stamp",
+        )
+        for forbidden in (
+            "SR.stamp_for_account(", "SR.cycle_stamp_for_account(",
+            "SRT.get_context(", "SRT.get_context_for_cycle(",
+        ):
+            self.assertNotIn(
+                forbidden, post_fill,
+                f"post-fill SELL audit re-resolves strategy provenance: {forbidden}",
+            )
 
     def test_guard12g_service_is_not_a_monolith(self):
         loc = len(_source(self.SERVICE).splitlines())

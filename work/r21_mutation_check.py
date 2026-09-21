@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""R21 mutation matrix M-RSK1 ~ M-RSK16.
+"""R21 mutation matrix M-RSK1 ~ M-RSK21.
 
 Each mutation must turn its corresponding contract test RED.  The script
 restores every mutated file byte-identically and verifies sha256.
@@ -166,6 +166,22 @@ MUTATIONS = [
         "test": f"{STRATEGY_VERSIONING_TEST}.test_db_strat_1_signal_all_null_rejected",
         "desc": "all-NULL unknown exception is widened to paper_signals",
     },
+    {
+        "id": "M-RSK21", "file": SERVICE,
+        "old": '''                _audit(
+                    conn, position["account_id"], "concentration_rotation",
+                    f"{position['code']} 质量评分 {quality_review.get('score', 0):.1f}，释放额度等待高分候选 {((quality_review.get('replacement') or {}).get('code') or '下一轮选股')}",
+                    strategy_stamp=strategy_stamp,
+                )
+''',
+        "new": '''                _audit(
+                    conn, position["account_id"], "concentration_rotation",
+                    f"{position['code']} 质量评分 {quality_review.get('score', 0):.1f}，释放额度等待高分候选 {((quality_review.get('replacement') or {}).get('code') or '下一轮选股')}",
+                )
+''',
+        "test": f"{SERVICE_TEST}.test_rsvc18_post_fill_rotation_audits_inherit_sell_provenance",
+        "desc": "post-fill concentration rotation ignores causal SELL strategy stamp",
+    },
 ]
 
 
@@ -203,6 +219,7 @@ def main() -> int:
         f"{SERVICE_TEST}.test_rsvc15_user_sell_base_policy_uses_cycle_pinned_version",
         f"{SERVICE_TEST}.test_rsvc16_risk_facts_use_cycle_pinned_strategy_provenance",
         f"{SERVICE_TEST}.test_rsvc17_filled_sell_inherits_durable_order_provenance",
+        f"{SERVICE_TEST}.test_rsvc18_post_fill_rotation_audits_inherit_sell_provenance",
         f"{STRATEGY_VERSIONING_TEST}.test_db_strat_1_signal_all_null_rejected",
     ):
         base = run_test(module)

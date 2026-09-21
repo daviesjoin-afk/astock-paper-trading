@@ -85,6 +85,12 @@ class DbMigrateTests(unittest.TestCase):
                     payload TEXT NOT NULL,
                     status TEXT NOT NULL,
                     created_at TEXT NOT NULL);
+                CREATE TABLE paper_audit(
+                    id INTEGER PRIMARY KEY,
+                    account_id TEXT NOT NULL,
+                    event TEXT NOT NULL,
+                    detail TEXT,
+                    created_at TEXT NOT NULL);
                 """
             )
             bootstrap.commit()
@@ -114,6 +120,32 @@ class DbMigrateTests(unittest.TestCase):
                             NEW.strategy_id IS NULL
                             AND NEW.strategy_version IS NULL
                             AND NEW.strategy_checksum IS NULL
+                        )
+                        AND (
+                            NEW.strategy_id IS NULL OR NEW.strategy_version IS NULL
+                            OR NEW.strategy_checksum IS NULL
+                            OR NEW.strategy_id <> NEW.account_id
+                            OR NOT EXISTS (
+                                SELECT 1 FROM paper_strategy_versions v
+                                WHERE v.strategy_id=NEW.strategy_id
+                                  AND v.version=NEW.strategy_version
+                                  AND v.checksum=NEW.strategy_checksum
+                            )
+                        )
+                       BEGIN SELECT RAISE(ABORT, 'invalid strategy version stamp'); END"""
+                )
+                # Simulate the pre-v22 audit allowance: only the two original
+                # causal SELL events were permitted with unknown provenance.
+                conn.execute("DROP TRIGGER IF EXISTS trg_paper_audit_strategy_stamp_insert")
+                conn.execute(
+                    """CREATE TRIGGER trg_paper_audit_strategy_stamp_insert
+                       BEFORE INSERT ON paper_audit
+                       WHEN NEW.account_id IS NOT NULL
+                        AND NOT (
+                            NEW.strategy_id IS NULL
+                            AND NEW.strategy_version IS NULL
+                            AND NEW.strategy_checksum IS NULL
+                            AND NEW.event IN ('sell_filled','protective_exit_recovery_watch')
                         )
                         AND (
                             NEW.strategy_id IS NULL OR NEW.strategy_version IS NULL
@@ -161,6 +193,21 @@ class DbMigrateTests(unittest.TestCase):
                     "payload,status,created_at) VALUES(?,?,?,?,?,?,?)",
                     ("tq_breakout", "2026-09-10", "2026-09-10", "600001",
                      "{}", "pending", "2026-09-10 09:00:00"),
+                ))
+                audit_sql = (
+                    "INSERT INTO paper_audit(account_id,event,created_at) VALUES(?,?,?)"
+                )
+                for event in (
+                    "quality_rotation",
+                    "concentration_rotation",
+                    "permission_scope_exit",
+                ):
+                    self.assertTrue(try_insert(
+                        audit_sql, ("tq_breakout", event, "2026-09-10 10:00:00")
+                    ))
+                self.assertFalse(try_insert(
+                    audit_sql,
+                    ("tq_breakout", "some_unrelated_event", "2026-09-10 10:00:00"),
                 ))
             finally:
                 conn.close()

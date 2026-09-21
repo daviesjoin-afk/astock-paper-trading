@@ -706,7 +706,13 @@ STRATEGY_STAMP_UNKNOWN_ALLOWANCE = {
     ),
     "paper_risk_decisions": "NEW.side='sell'",
     "paper_audit": (
-        "NEW.event IN ('sell_filled','protective_exit_recovery_watch')"
+        "NEW.event IN ("
+        "'sell_filled',"
+        "'protective_exit_recovery_watch',"
+        "'quality_rotation',"
+        "'concentration_rotation',"
+        "'permission_scope_exit'"
+        ")"
     ),
 }
 
