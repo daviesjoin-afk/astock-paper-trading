@@ -577,6 +577,53 @@ class PortfolioReadModelContractTests(unittest.TestCase):
         self.assertEqual(lots, [])
         self.assertEqual(status, "unknown")
 
+    def test_port4o_one_source_fill_cannot_fund_two_lots(self):
+        buy = self._order_and_fill(cycle_id=self.cycle100, side="buy", qty=100,
+                                   price=10.0, fill_date=DAY.isoformat())
+        self._lot(self.cycle100, 100, 10.0, source_order_id=buy)
+        self._lot(self.cycle100, 100, 10.0, source_order_id=buy)
+        self.conn.commit()
+        context = P.PortfolioReadContext(self.cycle100, DAY)
+        _lots, status = P.bounded_lots_with_status(self.conn, context)
+        self.assertEqual(status, "unknown")
+        result = self._portfolio(self.cycle100, valuations={CODE: 10.0})
+        self.assertEqual(result["quantity_status"], "unknown")
+        self.assertIsNone(result["nav"])
+        self.assertEqual(P.cash(self.conn, context), (None, "unknown"))
+
+    def test_port5e_partial_fill_schema_fails_closed(self):
+        conn = sqlite3.connect(":memory:")
+        try:
+            conn.execute(
+                "CREATE TABLE paper_fills("
+                "id INTEGER PRIMARY KEY, order_id INTEGER, account_id TEXT,"
+                "side TEXT, code TEXT, qty INTEGER, fill_date TEXT)"
+            )
+            conn.execute(
+                "CREATE TABLE paper_orders("
+                "id INTEGER PRIMARY KEY, account_id TEXT, side TEXT, code TEXT,"
+                "status TEXT, cycle_id INTEGER, execution_status TEXT,"
+                "execution_verified INTEGER, realized_pnl REAL, executed_at TEXT,"
+                "amount REAL, fees REAL)"
+            )
+            context = P.PortfolioReadContext(self.cycle100, DAY)
+            self.assertEqual(P.realized_pnl(conn, context), (None, "unknown"))
+            self.assertEqual(P.cash(conn, context), (None, "unknown"))
+            self.assertEqual(P.positions_for_context(conn, context), [])
+        finally:
+            conn.close()
+
+    def test_port11n_missing_cycle_creation_evidence_stays_unknown(self):
+        conn = sqlite3.connect(":memory:")
+        try:
+            conn.execute("CREATE TABLE paper_cycles(id INTEGER PRIMARY KEY, capital REAL)")
+            conn.execute("INSERT INTO paper_cycles VALUES(?,?)", (self.cycle100, 100000.0))
+            context = P.PortfolioReadContext(self.cycle100, DAY)
+            self.assertIsNone(P.initial_capital(conn, context))
+            self.assertEqual(P.cash(conn, context), (None, "unknown"))
+        finally:
+            conn.close()
+
     def test_port4n_multi_fill_source_lot_keeps_quantity_unknown(self):
         buy = self._order_and_fill(cycle_id=self.cycle100, side="buy", qty=100,
                                    price=10.0, fill_date=DAY.isoformat())

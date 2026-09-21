@@ -410,6 +410,35 @@ MUTATIONS = [
         "test": f"{TEST}.test_port5d_account_specific_partial_activity_schema_fails_closed",
         "desc": "query a missing lot account column during pre-cycle activity lookup",
     },
+    {
+        "id": "M-PORT43", "file": READ_MODEL,
+        "old": '''    if reused_sources and order_id in reused_sources:
+        return None
+''',
+        "new": '''    if False:
+        return None
+''',
+        "test": f"{TEST}.test_port4o_one_source_fill_cannot_fund_two_lots",
+        "desc": "let one source fill fund multiple durable lots",
+    },
+    {
+        "id": "M-PORT44", "file": READ_MODEL,
+        "old": '''        _has_columns(conn, "paper_fills", _FILL_SELECT_COLUMNS)''',
+        "new": '''        _has_columns(conn, "paper_fills", _FILL_COLUMNS)''',
+        "test": f"{TEST}.test_port5e_partial_fill_schema_fails_closed",
+        "desc": "query missing price/amount/fees columns on a partial fill schema",
+    },
+    {
+        "id": "M-PORT45", "file": READ_MODEL,
+        "old": '''    if not _has_columns(conn, "paper_cycles", {"id", "created_at"}):
+        return _cycle_has_bounded_activity(conn, context, account_id=account_id)
+''',
+        "new": '''    if not _has_columns(conn, "paper_cycles", {"id", "created_at"}):
+        return True
+''',
+        "test": f"{TEST}.test_port11n_missing_cycle_creation_evidence_stays_unknown",
+        "desc": "treat missing cycle creation evidence as proof of existence",
+    },
 ]
 
 

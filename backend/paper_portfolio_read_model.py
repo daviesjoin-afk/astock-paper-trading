@@ -61,6 +61,10 @@ _POSITION_LOT_COLUMNS = {
     "acquired_at", "available_date", "asset_type", "source_order_id",
 }
 _FILL_COLUMNS = {"id", "order_id", "account_id", "side", "code", "qty", "fill_date"}
+#: Columns the fill readers actually ``SELECT``.  A partially migrated
+#: ``paper_fills`` table missing one of these must fail closed as unknown
+#: instead of raising ``sqlite3.OperationalError`` out of a portfolio read.
+_FILL_SELECT_COLUMNS = _FILL_COLUMNS | {"price", "amount", "fees"}
 _ORDER_COLUMNS = {
     "id", "account_id", "side", "code", "status", "cycle_id",
     "execution_status", "execution_verified", "realized_pnl", "executed_at",
@@ -177,7 +181,7 @@ class PortfolioReadContext:
 def _sell_fills(conn, context: PortfolioReadContext, account_id: str | None = None):
     """Return (verified rows, all rows, proof_available)."""
     if not (
-        _has_columns(conn, "paper_fills", _FILL_COLUMNS)
+        _has_columns(conn, "paper_fills", _FILL_SELECT_COLUMNS)
         and _has_columns(conn, "paper_orders", _ORDER_COLUMNS)
     ):
         return [], [], False
@@ -265,7 +269,7 @@ def _all_filled_buy_orders(conn, context: PortfolioReadContext,
 
 def _buy_fills(conn, context: PortfolioReadContext, account_id: str | None = None):
     if not (
-        _has_columns(conn, "paper_fills", _FILL_COLUMNS)
+        _has_columns(conn, "paper_fills", _FILL_SELECT_COLUMNS)
         and _has_columns(conn, "paper_orders", _ORDER_COLUMNS)
     ):
         return [], [], False
@@ -426,19 +430,41 @@ def _lot_economic_dates(conn, order_ids) -> tuple[dict[int, str], bool]:
     return dates, True
 
 
-def _verified_source_buy_fill(conn, lot: Mapping) -> dict | None:
+def _reused_source_orders(lots) -> set[int]:
+    """Return source order ids claimed by more than one durable lot.
+
+    ``paper_position_lots.source_order_id`` carries no uniqueness constraint, so
+    two lot rows can point at the same verified single-fill BUY order.  Each
+    per-lot check would then pass independently while cash only ever subtracts
+    that one fill: a duplicated 100-share lot becomes 200 verified shares and
+    halves the display cost.  Reused sources are therefore not evidence.
+    """
+    counts: dict[int, int] = {}
+    for lot in lots:
+        try:
+            order_id = int(lot.get("source_order_id"))
+        except (TypeError, ValueError):
+            continue
+        counts[order_id] = counts.get(order_id, 0) + 1
+    return {order_id for order_id, count in counts.items() if count > 1}
+
+
+def _verified_source_buy_fill(conn, lot: Mapping, *,
+                              reused_sources: set[int] | None = None) -> dict | None:
     """Return a fully matching verified BUY fill for one durable lot."""
     source_order_id = lot.get("source_order_id")
     if source_order_id is None:
         return None
     if not (
-        _has_columns(conn, "paper_fills", _FILL_COLUMNS)
+        _has_columns(conn, "paper_fills", _FILL_SELECT_COLUMNS)
         and _has_columns(conn, "paper_orders", _ORDER_COLUMNS)
     ):
         return None
     try:
         order_id = int(source_order_id)
     except (TypeError, ValueError):
+        return None
+    if reused_sources and order_id in reused_sources:
         return None
     row = conn.execute(
         "SELECT f.id AS fill_id, f.order_id, f.qty AS fill_qty,"
@@ -517,12 +543,13 @@ def bounded_lots_with_status(conn, context: PortfolioReadContext, *,
     unknown_date = False
     unresolved_uncertain = False
     uncertain_lot_ids: set[int] = set()
+    reused_sources = _reused_source_orders(rows)
     bounded = []
     for row in rows:
         lot = dict(row)
         lot_id = int(lot.get("id") or 0)
         original = str(lot.get("acquired_at") or "")
-        evidence = _verified_source_buy_fill(conn, lot)
+        evidence = _verified_source_buy_fill(conn, lot, reused_sources=reused_sources)
         if evidence is None:
             uncertain_lot_ids.add(lot_id)
             economic = original[:10] or None
@@ -728,14 +755,21 @@ def _cycle_has_bounded_activity(conn, context: PortfolioReadContext,
 
 def _cycle_created_by(conn, context: PortfolioReadContext,
                       account_id: str | None = None) -> bool:
-    """Return whether an existing cycle row predates ``context.asof_day``."""
+    """Return whether an existing cycle row provably predates ``context.asof_day``.
+
+    Missing creation evidence is **not** proof that the cycle already existed: a
+    partially migrated ``paper_cycles`` table with ``id`` and ``capital`` but no
+    ``created_at`` must not let an arbitrarily early as-of read publish the
+    declared capital as verified.  Such a read falls back to bounded activity
+    evidence, and stays unknown when that is absent too.
+    """
     if not _has_columns(conn, "paper_cycles", {"id", "created_at"}):
-        return True
+        return _cycle_has_bounded_activity(conn, context, account_id=account_id)
     row = conn.execute(
         "SELECT created_at FROM paper_cycles WHERE id=?", (context.cycle_id,)
     ).fetchone()
     if row is None:
-        return True
+        return _cycle_has_bounded_activity(conn, context, account_id=account_id)
     created = _day_text(row[0])
     if created and created <= context.asof_day.isoformat():
         return True
@@ -854,10 +888,11 @@ def _uncovered_lot_facts(conn, lots: list[dict]) -> tuple[float, int]:
     """Cash cost and count of durable lots without verified matching BUY fills."""
     if not lots:
         return 0.0, 0
+    reused_sources = _reused_source_orders(lots)
     uncovered_cost = 0.0
     uncovered_count = 0
     for lot in lots:
-        if _verified_source_buy_fill(conn, lot) is not None:
+        if _verified_source_buy_fill(conn, lot, reused_sources=reused_sources) is not None:
             continue
         qty = _num(lot.get("qty"), 0.0) or 0.0
         cost = _num(lot.get("cost"), 0.0) or 0.0
