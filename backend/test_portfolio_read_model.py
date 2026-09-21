@@ -312,6 +312,23 @@ class PortfolioReadModelContractTests(unittest.TestCase):
         self.assertEqual(realized, 0.0)
         self.assertEqual(status, "verified")
 
+    def test_port5c_account_specific_partial_order_schema_fails_closed(self):
+        conn = sqlite3.connect(":memory:")
+        try:
+            conn.execute(
+                "CREATE TABLE paper_orders("
+                "id INTEGER PRIMARY KEY, cycle_id INTEGER, side TEXT,"
+                "status TEXT, executed_at TEXT)"
+            )
+            value, status = P.realized_pnl(
+                conn, P.PortfolioReadContext(self.cycle100, DAY),
+                account_id=ACCOUNT,
+            )
+        finally:
+            conn.close()
+        self.assertIsNone(value)
+        self.assertEqual(status, "unknown")
+
     def test_port6_projection_corruption_cannot_override_authority(self):
         buy = self._order_and_fill(cycle_id=self.cycle100, side="buy", qty=100,
                                    price=10.0, fill_date=DAY.isoformat())
@@ -532,6 +549,18 @@ class PortfolioReadModelContractTests(unittest.TestCase):
             self.conn, {CODE: {"price": 10.0}}, DAY, cycle_id=self.cycle100,
         )
         self.assertEqual(nav, 99995.0)
+    def test_port4m_future_source_less_lot_keeps_quantity_unknown(self):
+        self._lot(
+            self.cycle100, 100, 10.0,
+            acquired_at=f"{NEXT.isoformat()} 10:00:00",
+        )
+        self.conn.commit()
+        lots, status = P.bounded_lots_with_status(
+            self.conn, P.PortfolioReadContext(self.cycle100, DAY)
+        )
+        self.assertEqual(lots, [])
+        self.assertEqual(status, "unknown")
+
     def test_port4l_missing_lot_schema_keeps_quantity_unknown(self):
         conn = sqlite3.connect(":memory:")
         try:
@@ -576,6 +605,26 @@ class PortfolioReadModelContractTests(unittest.TestCase):
                 self.assertIsNone(result["unrealized_pnl"])
                 self.assertIsNone(result["nav"])
                 self.assertEqual(result["market_value_status"], "unknown")
+
+    def test_port10c_partial_future_sell_fill_keeps_realized_pnl_unknown(self):
+        order = self._order_and_fill(
+            cycle_id=self.cycle100, side="sell", qty=50, price=11.0,
+            fill_date=DAY.isoformat(), realized_pnl=123.0, fees=0.0,
+        )
+        self.conn.execute(
+            "INSERT INTO paper_fills(order_id,account_id,side,code,qty,price,amount,"
+            "fees,fill_date,quote_at,assumption) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                order, ACCOUNT, "sell", CODE, 50, 12.0, 600.0, 0.0,
+                NEXT.isoformat(), f"{NEXT.isoformat()} 09:30:00", "r22-test",
+            ),
+        )
+        self.conn.commit()
+        value, status = P.realized_pnl(
+            self.conn, P.PortfolioReadContext(self.cycle100, DAY)
+        )
+        self.assertIsNone(value)
+        self.assertEqual(status, "unknown")
 
     def test_port11f_archived_cycle_remains_unknown(self):
         self.conn.execute(

@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""R22 mutation matrix M-PORT1 ~ M-PORT37.
+"""R22 mutation matrix M-PORT1 ~ M-PORT40.
 
 Each mutation must turn its corresponding permanent contract RED.  The script
 restores every mutated file byte-identically and verifies sha256.
@@ -29,8 +29,8 @@ MUTATIONS = [
     },
     {
         "id": "M-PORT2", "file": READ_MODEL,
-        "old": "        if economic > context.asof_day.isoformat():\n            continue\n",
-        "new": "        if False:\n            continue\n",
+        "old": "        if economic > context.asof_day.isoformat():\n            if lot_id in uncertain_lot_ids:\n                unresolved_uncertain = True\n            continue\n",
+        "new": "        if False:\n            if lot_id in uncertain_lot_ids:\n                unresolved_uncertain = True\n            continue\n",
         "test": f"{TEST}.test_port4_future_fill_is_excluded_by_asof",
         "desc": "remove as-of filter from lot read",
     },
@@ -237,7 +237,7 @@ MUTATIONS = [
     },
     {
         "id": "M-PORT29", "file": READ_MODEL,
-        "old": '''    unresolved_uncertain = any(
+        "old": '''    unresolved_uncertain = unresolved_uncertain or any(
         int(row.get("id") or 0) in uncertain_lot_ids
         and int(row.get("remaining_qty") or 0) > 0
         for row in rebuilt
@@ -353,6 +353,40 @@ MUTATIONS = [
 ''',
         "test": f"{RISK_TEST}.test_rsvc19_historical_positions_are_not_filtered_by_current_eligibility",
         "desc": "filter bounded historical positions by current risk eligibility",
+    },
+    {
+        "id": "M-PORT38", "file": READ_MODEL,
+        "old": '''    unresolved_uncertain = unresolved_uncertain or any(
+''',
+        "new": '''    unresolved_uncertain = any(
+''',
+        "test": f"{TEST}.test_port4m_future_source_less_lot_keeps_quantity_unknown",
+        "desc": "drop future-dated source-less uncertainty",
+    },
+    {
+        "id": "M-PORT39", "file": READ_MODEL,
+        "old": '''        if account_id and "account_id" not in order_columns:
+            return True
+''',
+        "new": '''        if False:
+            return True
+''',
+        "test": f"{TEST}.test_port5c_account_specific_partial_order_schema_fails_closed",
+        "desc": "query a missing account column on a partial order schema",
+    },
+    {
+        "id": "M-PORT40", "file": READ_MODEL,
+        "old": '''    if (
+        len(completeness) != len(order_ids)
+        or any(total != bounded for total, bounded in completeness.values())
+    ):
+        return None, STATUS_UNKNOWN
+''',
+        "new": '''    if False:
+        return None, STATUS_UNKNOWN
+''',
+        "test": f"{TEST}.test_port10c_partial_future_sell_fill_keeps_realized_pnl_unknown",
+        "desc": "publish order-level PnL before every fill is bounded",
     },
 ]
 

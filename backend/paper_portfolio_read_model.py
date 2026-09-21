@@ -329,7 +329,11 @@ def _unproven_sell_exists(conn, context: PortfolioReadContext,
     _verified, rows, proof_available = _sell_fills(conn, context, account_id)
     if not proof_available:
         # No verification columns at all: any historical sell row is unproven.
-        if _has_columns(conn, "paper_orders", {"cycle_id", "side", "status", "executed_at"}):
+        required_columns = {"cycle_id", "side", "status", "executed_at"}
+        order_columns = _columns(conn, "paper_orders")
+        if account_id and "account_id" not in order_columns:
+            return True
+        if required_columns.issubset(order_columns):
             params = [context.cycle_id, context.asof_day.isoformat()]
             sql = ("SELECT COUNT(*) FROM paper_orders WHERE cycle_id=? AND side='sell'"
                    " AND status='filled' AND executed_at IS NOT NULL"
@@ -505,6 +509,7 @@ def bounded_lots_with_status(conn, context: PortfolioReadContext, *,
         tuple(params),
     ))
     unknown_date = False
+    unresolved_uncertain = False
     uncertain_lot_ids: set[int] = set()
     bounded = []
     for row in rows:
@@ -519,8 +524,12 @@ def bounded_lots_with_status(conn, context: PortfolioReadContext, *,
             economic = evidence.get("economic_date")
         if not economic:
             unknown_date = True
+            if lot_id in uncertain_lot_ids:
+                unresolved_uncertain = True
             continue
         if economic > context.asof_day.isoformat():
+            if lot_id in uncertain_lot_ids:
+                unresolved_uncertain = True
             continue
         # Keep the original intraday time for FIFO ordering, but replace the
         # economic date with the source fill's trading date.
@@ -530,7 +539,7 @@ def bounded_lots_with_status(conn, context: PortfolioReadContext, *,
     sells, _rows, proof_available = _sell_fills(conn, context, account_id)
     unproven = _unproven_sell_exists(conn, context, account_id)
     rebuilt, fully_consumed = _consume_fifo(bounded, sells)
-    unresolved_uncertain = any(
+    unresolved_uncertain = unresolved_uncertain or any(
         int(row.get("id") or 0) in uncertain_lot_ids
         and int(row.get("remaining_qty") or 0) > 0
         for row in rebuilt
@@ -637,9 +646,29 @@ def realized_pnl(conn, context: PortfolioReadContext, *,
     if not order_ids:
         return 0.0, STATUS_VERIFIED
     placeholders = ",".join("?" for _ in order_ids)
+    sorted_order_ids = tuple(sorted(order_ids))
+    fill_counts = conn.execute(
+        f"SELECT order_id, COUNT(*),"
+        f"       SUM(CASE WHEN fill_date IS NOT NULL"
+        f"                AND length(fill_date)>=10"
+        f"                AND substr(fill_date,1,10)<=?"
+        f"           THEN 1 ELSE 0 END)"
+        f"  FROM paper_fills WHERE order_id IN ({placeholders})"
+        f" GROUP BY order_id",
+        (context.asof_day.isoformat(), *sorted_order_ids),
+    ).fetchall()
+    completeness = {
+        int(row[0]): (int(row[1]), int(row[2] or 0))
+        for row in fill_counts
+    }
+    if (
+        len(completeness) != len(order_ids)
+        or any(total != bounded for total, bounded in completeness.values())
+    ):
+        return None, STATUS_UNKNOWN
     orders = _row_dicts(conn.execute(
         f"SELECT id,realized_pnl FROM paper_orders WHERE id IN ({placeholders})",
-        tuple(sorted(order_ids)),
+        sorted_order_ids,
     ))
     for order in orders:
         value = _num(order.get("realized_pnl"), None)

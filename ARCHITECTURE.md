@@ -550,7 +550,9 @@ portfolio metrics / risk / dashboard / research consumers
 - per-symbol `verified_cash_flow` 要求该订单的全部 fill 行同时通过 identity 与 execution verification；错配 fill 不能因同订单另有合法 fill 而留下部分现金流投影。
 - account-specific pre-cycle 的 bounded lot/fill/order 证据必须限定到同一账户；其他账户的历史活动不能为该账户的 initial capital 背书。
 - 历史风险扫描先读取 bounded positions，再以这些账户扩充当前风控范围；current eligibility 只能增加扫描对象，不能反向剔除历史回放中仍有仓位的账户。
-- 缺失 authoritative lot/execution schema 时，quantity 与 realized PnL 保持 unknown；schema 读不到不能证明“零持仓 / 零已实现收益”。
+- source-less durable lot 的不可信 `acquired_at` 晚于 asof 时只能省略该 lot 的交割事实，不能把其不确定性一起省略；quantity 与风险扫描仍保持 unknown。
+- 多 fill SELL order 的 order-level `realized_pnl` 只有在全部 fill 都不晚于 `asof_day` 时才能进入历史汇总；部分成交后的快照不得泄露未来 fill 的收益。
+- 缺失 authoritative lot/execution schema 时，quantity 与 realized PnL 保持 unknown；account-specific 读取遇到缺 `account_id` 的 order schema 也必须 fail closed，不能触发 SQL 异常。
 - `paper_positions` 仍是 compatibility projection；projection 不拥有 execution authority。
 
 Invariants：

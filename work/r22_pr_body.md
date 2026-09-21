@@ -62,10 +62,10 @@ After-fix probe summary: `0/8 reproduced`; C1/C2/C3/C6 now use the explicit boun
 
 ## Tests
 
-- targeted portfolio read model: `44/44 PASS`
+- targeted portfolio read model: `47/47 PASS`
 - architecture guard: `94/94 PASS`
 - risk / authoritative-position / sell-convergence suites: `114/114 PASS`
-- full backend: `3891 tests OK (skipped=5)`
+- full backend: `3894 tests OK (skipped=5)`
 - frontend build: `PASS` (2 pre-existing duplicate-key warnings in `frontend/src/core/format.js`, not introduced by R22)
 - frontend unit: `111/111 PASS`
 - dist drift: `PASS`
@@ -74,7 +74,7 @@ After-fix probe summary: `0/8 reproduced`; C1/C2/C3/C6 now use the explicit boun
 
 ## Mutation
 
-- `M-PORT1`..`M-PORT37`: `37/37 RED`
+- `M-PORT1`..`M-PORT40`: `40/40 RED`
 - survived: `0`
 - restore sha256: `PASS`
 
@@ -107,7 +107,10 @@ After-fix probe summary: `0/8 reproduced`; C1/C2/C3/C6 now use the explicit boun
 - P2 mismatched fill identity: a BUY/SELL fill that disagrees with its order cannot leave a partial cash-flow projection for the order's real account/code; the affected key falls back to settlement cost.
 - P2 account-scoped pre-cycle proof: bounded activity from another account can no longer authorize an account-specific initial capital before the cycle's `created_at`.
 - P1 historical risk eligibility: bounded positions are always included in the risk scan scope for the requested as-of; current eligibility may add accounts but must not filter out reconstructed historical holdings.
-- each review fix has a permanent regression and a dedicated mutation (`M-PORT13`..`M-PORT37`).
+- P2 partial order schema: an account-specific read on a database without `paper_orders.account_id` fails closed as unknown instead of raising `OperationalError`.
+- P2 future source-less lot: a source-less lot whose untrusted `acquired_at` is later than the requested as-of still keeps quantity/risk proof unknown; it is not silently treated as absent.
+- P2 partially bounded SELL order: order-level `realized_pnl` is published only after every fill for that order is bounded by the requested as-of; a first fill cannot leak later fill PnL.
+- each review fix has a permanent regression and a dedicated mutation (`M-PORT13`..`M-PORT40`).
 
 ## Security
 
