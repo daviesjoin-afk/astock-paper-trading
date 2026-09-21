@@ -491,7 +491,7 @@ def bounded_lots_with_status(conn, context: PortfolioReadContext, *,
     if _cycle_is_archived(conn, context):
         return [], STATUS_UNKNOWN
     if not _has_columns(conn, "paper_position_lots", _POSITION_LOT_COLUMNS):
-        return [], STATUS_VERIFIED
+        return [], STATUS_UNKNOWN
     params: list[Any] = [context.cycle_id]
     account_sql = ""
     if account_id:
@@ -626,7 +626,7 @@ def realized_pnl(conn, context: PortfolioReadContext, *,
         return None, STATUS_UNKNOWN
     verified, _rows, proof_available = _sell_fills(conn, context, account_id)
     if not proof_available:
-        return 0.0, STATUS_VERIFIED
+        return None, STATUS_UNKNOWN
     total = 0.0
     order_ids: set[int] = set()
     for row in verified:

@@ -62,10 +62,10 @@ After-fix probe summary: `0/8 reproduced`; C1/C2/C3/C6 now use the explicit boun
 
 ## Tests
 
-- targeted portfolio read model: `40/40 PASS`
+- targeted portfolio read model: `42/42 PASS`
 - architecture guard: `94/94 PASS`
 - risk / authoritative-position / sell-convergence suites: `113/113 PASS`
-- full backend: `3886 tests OK (skipped=5)`
+- full backend: `3888 tests OK (skipped=5)`
 - frontend build: `PASS` (2 pre-existing duplicate-key warnings in `frontend/src/core/format.js`, not introduced by R22)
 - frontend unit: `111/111 PASS`
 - dist drift: `PASS`
@@ -74,7 +74,7 @@ After-fix probe summary: `0/8 reproduced`; C1/C2/C3/C6 now use the explicit boun
 
 ## Mutation
 
-- `M-PORT1`..`M-PORT32`: `32/32 RED`
+- `M-PORT1`..`M-PORT34`: `34/34 RED`
 - survived: `0`
 - restore sha256: `PASS`
 
@@ -102,7 +102,9 @@ After-fix probe summary: `0/8 reproduced`; C1/C2/C3/C6 now use the explicit boun
 - P2 nonexistent cycles: initial capital requires a declared cycle row or at least one matching account ledger row; a missing cycle stays unknown instead of becoming a verified zero-capital portfolio.
 - P2 pre-cycle reads: initial capital also requires a declared cycle row whose `created_at` date is not later than `asof_day`; a pre-cycle date stays unknown unless bounded lot/fill/order evidence already exists before that date.
 - P1 source-order identity: a durable lot is trusted only when its source order and fill match the lot cycle/account/code and BUY side and the order is execution-verified; otherwise quantity and cash stay unknown.
-- each review fix has a permanent regression and a dedicated mutation (`M-PORT13`..`M-PORT32`).
+- P2 incomplete lot schema: when `paper_position_lots` is absent or lacks required columns, quantity stays unknown instead of publishing a verified empty portfolio.
+- P2 incomplete execution schema: when SELL/order evidence cannot be read, realized PnL stays unknown instead of publishing a verified zero.
+- each review fix has a permanent regression and a dedicated mutation (`M-PORT13`..`M-PORT34`).
 
 ## Security
 

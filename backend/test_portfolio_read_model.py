@@ -497,6 +497,27 @@ class PortfolioReadModelContractTests(unittest.TestCase):
             self.conn, {CODE: {"price": 10.0}}, DAY, cycle_id=self.cycle100,
         )
         self.assertEqual(nav, 99995.0)
+    def test_port4l_missing_lot_schema_keeps_quantity_unknown(self):
+        conn = sqlite3.connect(":memory:")
+        try:
+            lots, status = P.bounded_lots_with_status(
+                conn, P.PortfolioReadContext(self.cycle100, DAY)
+            )
+        finally:
+            conn.close()
+        self.assertEqual(lots, [])
+        self.assertEqual(status, "unknown")
+
+    def test_port10b_realized_pnl_without_execution_schema_stays_unknown(self):
+        conn = sqlite3.connect(":memory:")
+        try:
+            value, status = P.realized_pnl(
+                conn, P.PortfolioReadContext(self.cycle100, DAY)
+            )
+        finally:
+            conn.close()
+        self.assertIsNone(value)
+        self.assertEqual(status, "unknown")
     def test_port11c_account_initial_capital_is_cycle_scoped(self):
         self.conn.execute(
             "UPDATE paper_accounts SET cycle_id=? WHERE id=?", (self.cycle101, ACCOUNT)

@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""R22 mutation matrix M-PORT1 ~ M-PORT32.
+"""R22 mutation matrix M-PORT1 ~ M-PORT34.
 
 Each mutation must turn its corresponding permanent contract RED.  The script
 restores every mutated file byte-identically and verifies sha256.
@@ -278,6 +278,28 @@ MUTATIONS = [
 ''',
         "test": f"{TEST}.test_port4k_source_order_identity_must_match_lot",
         "desc": "accept a source BUY order from another cycle",
+    },
+    {
+        "id": "M-PORT33", "file": READ_MODEL,
+        "old": '''    if not _has_columns(conn, "paper_position_lots", _POSITION_LOT_COLUMNS):
+        return [], STATUS_UNKNOWN
+''',
+        "new": '''    if not _has_columns(conn, "paper_position_lots", _POSITION_LOT_COLUMNS):
+        return [], STATUS_VERIFIED
+''',
+        "test": f"{TEST}.test_port4l_missing_lot_schema_keeps_quantity_unknown",
+        "desc": "invent an empty verified portfolio without lot schema",
+    },
+    {
+        "id": "M-PORT34", "file": READ_MODEL,
+        "old": '''    if not proof_available:
+        return None, STATUS_UNKNOWN
+''',
+        "new": '''    if not proof_available:
+        return 0.0, STATUS_VERIFIED
+''',
+        "test": f"{TEST}.test_port10b_realized_pnl_without_execution_schema_stays_unknown",
+        "desc": "invent verified zero realized PnL without execution evidence",
     },
 ]
 
