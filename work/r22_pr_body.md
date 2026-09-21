@@ -62,10 +62,10 @@ After-fix probe summary: `0/8 reproduced`; C1/C2/C3/C6 now use the explicit boun
 
 ## Tests
 
-- targeted portfolio read model: `47/47 PASS`
+- targeted portfolio read model: `49/49 PASS`
 - architecture guard: `94/94 PASS`
 - risk / authoritative-position / sell-convergence suites: `114/114 PASS`
-- full backend: `3894 tests OK (skipped=5)`
+- full backend: `3896 tests OK (skipped=5)`
 - frontend build: `PASS` (2 pre-existing duplicate-key warnings in `frontend/src/core/format.js`, not introduced by R22)
 - frontend unit: `111/111 PASS`
 - dist drift: `PASS`
@@ -74,7 +74,7 @@ After-fix probe summary: `0/8 reproduced`; C1/C2/C3/C6 now use the explicit boun
 
 ## Mutation
 
-- `M-PORT1`..`M-PORT40`: `40/40 RED`
+- `M-PORT1`..`M-PORT42`: `42/42 RED`
 - survived: `0`
 - restore sha256: `PASS`
 
@@ -110,7 +110,9 @@ After-fix probe summary: `0/8 reproduced`; C1/C2/C3/C6 now use the explicit boun
 - P2 partial order schema: an account-specific read on a database without `paper_orders.account_id` fails closed as unknown instead of raising `OperationalError`.
 - P2 future source-less lot: a source-less lot whose untrusted `acquired_at` is later than the requested as-of still keeps quantity/risk proof unknown; it is not silently treated as absent.
 - P2 partially bounded SELL order: order-level `realized_pnl` is published only after every fill for that order is bounded by the requested as-of; a first fill cannot leak later fill PnL.
-- each review fix has a permanent regression and a dedicated mutation (`M-PORT13`..`M-PORT40`).
+- P1 multi-fill source order: a durable lot without fill-level allocation accepts a source order only when it has exactly one quantity-matching BUY fill; multi-fill and oversized/duplicate evidence remains unknown.
+- P2 partial lot schema: account-specific pre-cycle activity checks require `paper_position_lots.account_id` before adding its predicate, so incomplete migrations remain unknown rather than raising SQL errors.
+- each review fix has a permanent regression and a dedicated mutation (`M-PORT13`..`M-PORT42`).
 
 ## Security
 

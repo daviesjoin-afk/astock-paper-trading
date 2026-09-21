@@ -441,19 +441,23 @@ def _verified_source_buy_fill(conn, lot: Mapping) -> dict | None:
     except (TypeError, ValueError):
         return None
     row = conn.execute(
-        "SELECT f.id AS fill_id, f.order_id,"
+        "SELECT f.id AS fill_id, f.order_id, f.qty AS fill_qty,"
         "       f.account_id AS fill_account_id, f.side AS fill_side,"
         "       f.code AS fill_code, f.fill_date,"
         "       o.account_id AS order_account_id, o.side AS order_side,"
         "       o.code AS order_code, o.status AS order_status, o.cycle_id,"
         "       o.execution_status, o.execution_verified, o.executed_at"
         "  FROM paper_fills f JOIN paper_orders o ON o.id=f.order_id"
-        " WHERE f.order_id=? ORDER BY f.id LIMIT 1",
+        " WHERE f.order_id=? ORDER BY f.id",
         (order_id,),
-    ).fetchone()
-    if row is None:
+    ).fetchall()
+    # A durable lot has no fill-level allocation key.  A source order with
+    # multiple fills therefore cannot prove which fill funded this lot (nor
+    # prevent two lots from reusing the same fill).  Keep it fail-closed until
+    # the ledger carries that allocation explicitly.
+    if len(row) != 1:
         return None
-    row = dict(row)
+    row = dict(row[0])
     if int(row.get("cycle_id") or -1) != int(lot.get("cycle_id") or -1):
         return None
     if str(row.get("order_account_id") or "") != str(lot.get("account_id") or ""):
@@ -471,6 +475,8 @@ def _verified_source_buy_fill(conn, lot: Mapping) -> dict | None:
     if str(row.get("order_status") or "").lower() != "filled":
         return None
     if not EV.is_verified_row(row):
+        return None
+    if _num(row.get("fill_qty"), None) != _num(lot.get("qty"), None):
         return None
     fill_day = _day_text(row.get("fill_date"))
     if not fill_day:
@@ -684,7 +690,10 @@ def _cycle_has_bounded_activity(conn, context: PortfolioReadContext,
     day = context.asof_day.isoformat()
     account_sql = " AND account_id=?" if account_id else ""
     account_params: tuple = (str(account_id),) if account_id else ()
-    if _has_columns(conn, "paper_position_lots", {"cycle_id", "acquired_at"}):
+    lot_columns = {"cycle_id", "acquired_at"}
+    if account_id:
+        lot_columns.add("account_id")
+    if _has_columns(conn, "paper_position_lots", lot_columns):
         row = conn.execute(
             "SELECT 1 FROM paper_position_lots WHERE cycle_id=?"
             " AND substr(acquired_at,1,10)<=?" + account_sql + " LIMIT 1",
@@ -703,7 +712,10 @@ def _cycle_has_bounded_activity(conn, context: PortfolioReadContext,
         ).fetchone()
         if row is not None:
             return True
-    if _has_columns(conn, "paper_orders", {"cycle_id", "executed_at"}):
+    order_columns = {"cycle_id", "executed_at"}
+    if account_id:
+        order_columns.add("account_id")
+    if _has_columns(conn, "paper_orders", order_columns):
         row = conn.execute(
             "SELECT 1 FROM paper_orders WHERE cycle_id=?"
             " AND substr(executed_at,1,10)<=?" + account_sql + " LIMIT 1",

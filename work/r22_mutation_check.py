@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""R22 mutation matrix M-PORT1 ~ M-PORT40.
+"""R22 mutation matrix M-PORT1 ~ M-PORT42.
 
 Each mutation must turn its corresponding permanent contract RED.  The script
 restores every mutated file byte-identically and verifies sha256.
@@ -387,6 +387,28 @@ MUTATIONS = [
 ''',
         "test": f"{TEST}.test_port10c_partial_future_sell_fill_keeps_realized_pnl_unknown",
         "desc": "publish order-level PnL before every fill is bounded",
+    },
+    {
+        "id": "M-PORT41", "file": READ_MODEL,
+        "old": '''    if len(row) != 1:
+        return None
+''',
+        "new": '''    if False:
+        return None
+''',
+        "test": f"{TEST}.test_port4n_multi_fill_source_lot_keeps_quantity_unknown",
+        "desc": "reuse one source fill for a multi-fill order",
+    },
+    {
+        "id": "M-PORT42", "file": READ_MODEL,
+        "old": '''    if account_id:
+        lot_columns.add("account_id")
+''',
+        "new": '''    if False:
+        lot_columns.add("account_id")
+''',
+        "test": f"{TEST}.test_port5d_account_specific_partial_activity_schema_fails_closed",
+        "desc": "query a missing lot account column during pre-cycle activity lookup",
     },
 ]
 

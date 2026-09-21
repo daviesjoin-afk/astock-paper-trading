@@ -329,6 +329,22 @@ class PortfolioReadModelContractTests(unittest.TestCase):
         self.assertIsNone(value)
         self.assertEqual(status, "unknown")
 
+    def test_port5d_account_specific_partial_activity_schema_fails_closed(self):
+        conn = sqlite3.connect(":memory:")
+        try:
+            conn.execute(
+                "CREATE TABLE paper_position_lots(cycle_id INTEGER, acquired_at TEXT)"
+            )
+            conn.execute(
+                "INSERT INTO paper_position_lots VALUES(?,?)",
+                (self.cycle100, f"{DAY.isoformat()} 09:00:00"),
+            )
+            self.assertFalse(P._cycle_has_bounded_activity(
+                conn, P.PortfolioReadContext(self.cycle100, DAY), account_id=ACCOUNT,
+            ))
+        finally:
+            conn.close()
+
     def test_port6_projection_corruption_cannot_override_authority(self):
         buy = self._order_and_fill(cycle_id=self.cycle100, side="buy", qty=100,
                                    price=10.0, fill_date=DAY.isoformat())
@@ -559,6 +575,22 @@ class PortfolioReadModelContractTests(unittest.TestCase):
             self.conn, P.PortfolioReadContext(self.cycle100, DAY)
         )
         self.assertEqual(lots, [])
+        self.assertEqual(status, "unknown")
+
+    def test_port4n_multi_fill_source_lot_keeps_quantity_unknown(self):
+        buy = self._order_and_fill(cycle_id=self.cycle100, side="buy", qty=100,
+                                   price=10.0, fill_date=DAY.isoformat())
+        self.conn.execute(
+            "INSERT INTO paper_fills(order_id,account_id,side,code,qty,price,amount,fees,"
+            "fill_date,quote_at,assumption) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+            (buy, ACCOUNT, "buy", CODE, 100, 10.0, 1000.0, 5.0,
+             NEXT.isoformat(), f"{NEXT.isoformat()} 09:30:00", "r22-test"),
+        )
+        self._lot(self.cycle100, 100, 10.0, source_order_id=buy)
+        self.conn.commit()
+        _lots, status = P.bounded_lots_with_status(
+            self.conn, P.PortfolioReadContext(self.cycle100, DAY)
+        )
         self.assertEqual(status, "unknown")
 
     def test_port4l_missing_lot_schema_keeps_quantity_unknown(self):
