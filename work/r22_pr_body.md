@@ -65,13 +65,13 @@ After-fix probe summary: `0/8 reproduced`; C1/C2/C3/C6 now use the explicit boun
 - targeted portfolio read model: `71/71 PASS`
 - architecture guard: `94/94 PASS`
 - risk / authoritative-position / portfolio consumer suites: `150/150 PASS`
-- full backend: `3918 tests OK (skipped=5)`
+- full backend: `3918 tests OK (skipped=5)` — re-run on the cleanup head, count unchanged
 - frontend build: `PASS` (2 pre-existing duplicate-key warnings in `frontend/src/core/format.js`, not introduced by R22)
 - frontend unit: `111/111 PASS`
 - frontend e2e (chromium, `--workers=1`): `32 passed`
 - dist drift: `PASS`
-- compileall: `PASS`
-- ruff: `PASS`
+- compileall (`backend work`): `PASS`
+- ruff (`check backend`, the CI command): `PASS`; `check backend work` leaves `7` pre-existing findings in untouched earlier-round scripts (`r12_*`, `r17_*`, `r19_*`, `tradability_*`), none in files this PR adds or renames
 
 ## Mutation
 
@@ -139,9 +139,35 @@ After-fix probe summary: `0/8 reproduced`; C1/C2/C3/C6 now use the explicit boun
 
 - local sensitive-data scan (`--scope worktree`): `kinds: none`, `values: 0`
 - manual review: `1` existing screenshot/binary entry (`docs/assets/dashboard.png`, pre-existing in master), no new sensitive findings
-- GitHub Security Leak Scan: to be re-verified on the new head after push
-- exact-head CI: to be re-verified on the new head after push (previously `9/9 PASS` on `5bebd30`)
-- unresolved actionable review threads: `0` after this fix is pushed and the thread is resolved
+- GitHub Security Leak Scan: `PASS` on the final head
+- unresolved actionable review threads: `0`
+
+## Final verification
+
+- exact final head SHA: the head of this PR at final verification — see the PR body on GitHub (this file is committed *inside* that head, so it cannot contain its own commit hash)
+- base SHA (master, no drift): `a628b194cdf984b11a8cbd3eaba0266f28342abc`
+- head based directly on current master: `merge-base == origin/master == a628b194...`
+- exact-head CI: `9/9 PASS` (`syntax`, `docker-smoke`, `tests (3.11)`, `tests (3.12)`, `quality`, `frontend`, `browser-e2e (chromium)`, `security-leak-scan` x2)
+- security-leak-scan: `PASS`
+- unresolved actionable review threads: `0`
+- mutation `M-PORT1`..`M-PORT60`: `60/60 CAUGHT`
+- fake = `0`; survived = `0`; baseline-red = `0`
+- restore sha256: `PASS`
+- runner self-test: `PASS`
+- no schema change, no reverse import, no new current/today fallback
+- MERGE: NOT MERGED
+- DEPLOY: NOT DEPLOYED
+
+## Namespace / maintainability
+
+- R22 = Portfolio / Read Model Closure; R23 = Strategy / Selection Provenance
+- PR #180 contains no `r23_*` artifact, label, or comment for portfolio work
+  (`gh api .../pulls/180/files` → no `r23` filename; `git grep -n -E 'r23|R23'` → no hits)
+- `work/r23_before_fix_repro.py` → `work/r22_attachment_provenance_repro.py` (git mv)
+- `work/r23_diagnose_survivor.py` → `work/r22_diagnose_survivor.py` (git mv)
+- the two `r22_*` repro scripts keep distinct responsibilities: `work/r22_before_fix_repro.py` covers the R22 C1..C4 contamination probes on the R21 merge base, `work/r22_attachment_provenance_repro.py` covers the P1 attachment-provenance probe
+- the provenance repro's `--head` flag had silently become a no-op once the fix was committed (HEAD *is* the fixed revision, so it compared fixed against fixed while its docstring still claimed to fetch the unfixed version). It now takes `--rev` and self-checks: it inspects the source for the fail-open fallback and exits `1` with an explicit message when pointed at a revision that already contains the fix, instead of printing a meaningless matching verdict. `--rev HEAD^` → `REPRODUCED`, worktree → `NOT REPRODUCED`, `--rev HEAD` → refused
+- no production semantic change: `paper_portfolio_read_model.py`, `paper_risk_service.py`, `paper_trading.py` are byte-identical to `4afb819`
 
 ## Merge status
 
