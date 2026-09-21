@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""R22 mutation matrix M-PORT1 ~ M-PORT30.
+"""R22 mutation matrix M-PORT1 ~ M-PORT31.
 
 Each mutation must turn its corresponding permanent contract RED.  The script
 restores every mutated file byte-identically and verifies sha256.
@@ -190,8 +190,8 @@ MUTATIONS = [
     },
     {
         "id": "M-PORT25", "file": READ_MODEL,
-        "old": '    day = context.asof_day.isoformat()\n',
-        "new": '    day = "9999-12-31"\n',
+        "old": '    day = context.asof_day.isoformat()\n    return _row_dicts(conn.execute(\n        "SELECT * FROM paper_position_risk_state"',
+        "new": '    day = "9999-12-31"\n    return _row_dicts(conn.execute(\n        "SELECT * FROM paper_position_risk_state"',
         "test": f"{TEST}.test_port4i_risk_positions_exclude_future_runtime_state",
         "desc": "inject future runtime risk state into historical read",
     },
@@ -255,6 +255,17 @@ MUTATIONS = [
 ''',
         "test": f"{TEST}.test_port11i_missing_cycle_does_not_invent_zero_capital",
         "desc": "invent zero capital for a nonexistent cycle",
+    },
+    {
+        "id": "M-PORT31", "file": READ_MODEL,
+        "old": '''        if cycle is not None:
+            if not _cycle_created_by(conn, context):
+                return None
+''',
+        "new": '''        if cycle is not None:
+''',
+        "test": f"{TEST}.test_port11j_read_before_cycle_creation_is_unknown",
+        "desc": "publish pre-cycle capital as verified",
     },
 ]
 

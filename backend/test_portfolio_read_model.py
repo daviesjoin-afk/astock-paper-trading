@@ -449,6 +449,14 @@ class PortfolioReadModelContractTests(unittest.TestCase):
         self.assertIsNone(result["cash"])
         self.assertIsNone(result["nav"])
         self.assertEqual(result["cash_status"], "unknown")
+    def test_port11j_read_before_cycle_creation_is_unknown(self):
+        before = DAY - dt.timedelta(days=1)
+        context = P.PortfolioReadContext(self.cycle100, before)
+        self.assertIsNone(P.initial_capital(self.conn, context))
+        self.assertEqual(P.cash(self.conn, context), (None, "unknown"))
+        result = self._portfolio(self.cycle100, before, valuations={CODE: 10.0})
+        self.assertIsNone(result["nav"])
+        self.assertEqual(result["cash_status"], "unknown")
     def test_port11c_account_initial_capital_is_cycle_scoped(self):
         self.conn.execute(
             "UPDATE paper_accounts SET cycle_id=? WHERE id=?", (self.cycle101, ACCOUNT)

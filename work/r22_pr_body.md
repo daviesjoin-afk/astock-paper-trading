@@ -44,7 +44,7 @@ After-fix probe summary: `0/8 reproduced`; C1/C2/C3/C6 now use the explicit boun
 
 ## Architecture
 
-- new module: `backend/paper_portfolio_read_model.py` (937 LOC, 34 top-level defs)
+- new module: `backend/paper_portfolio_read_model.py` (992 LOC, 36 top-level defs)
 - `paper_trading.py` LOC: `14847 -> 14847`
 - `paper_trading.py` top-level defs: `280 -> 280`
 - reverse imports: `0` (new read model does not import `paper_trading`)
@@ -62,10 +62,10 @@ After-fix probe summary: `0/8 reproduced`; C1/C2/C3/C6 now use the explicit boun
 
 ## Tests
 
-- targeted portfolio read model: `37/37 PASS`
+- targeted portfolio read model: `38/38 PASS`
 - architecture guard: `94/94 PASS`
 - risk / authoritative-position / sell-convergence suites: `113/113 PASS`
-- full backend: `3883 tests OK (skipped=5)`
+- full backend: `3884 tests OK (skipped=5)`
 - frontend build: `PASS` (2 pre-existing duplicate-key warnings in `frontend/src/core/format.js`, not introduced by R22)
 - frontend unit: `111/111 PASS`
 - dist drift: `PASS`
@@ -74,7 +74,7 @@ After-fix probe summary: `0/8 reproduced`; C1/C2/C3/C6 now use the explicit boun
 
 ## Mutation
 
-- `M-PORT1`..`M-PORT30`: `30/30 RED`
+- `M-PORT1`..`M-PORT31`: `31/31 RED`
 - survived: `0`
 - restore sha256: `PASS`
 
@@ -100,7 +100,8 @@ After-fix probe summary: `0/8 reproduced`; C1/C2/C3/C6 now use the explicit boun
 - P1 closed legacy lots: source-less uncertainty is tracked per lot and only unresolved open quantity makes quantity proof unknown; fully consumed legacy lots no longer abort unrelated risk scans.
 - P2 consumed legacy cash: strict cash and compatibility reconciliation inspect the full bounded lot set, including lots fully consumed by verified SELLs, so missing acquisition cash cannot be published as verified.
 - P2 nonexistent cycles: initial capital requires a declared cycle row or at least one matching account ledger row; a missing cycle stays unknown instead of becoming a verified zero-capital portfolio.
-- each review fix has a permanent regression and a dedicated mutation (`M-PORT13`..`M-PORT30`).
+- P2 pre-cycle reads: initial capital also requires a declared cycle row whose `created_at` date is not later than `asof_day`; a pre-cycle date stays unknown unless bounded lot/fill/order evidence already exists before that date.
+- each review fix has a permanent regression and a dedicated mutation (`M-PORT13`..`M-PORT31`).
 
 ## Security
 

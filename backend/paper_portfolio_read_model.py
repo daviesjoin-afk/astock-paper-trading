@@ -603,6 +603,57 @@ def realized_pnl(conn, context: PortfolioReadContext, *,
     return total, STATUS_VERIFIED
 
 
+def _cycle_has_bounded_activity(conn, context: PortfolioReadContext,
+                                account_id: str | None = None) -> bool:
+    """Return whether bounded ledger evidence predates ``context.asof_day``."""
+    day = context.asof_day.isoformat()
+    account_sql = " AND account_id=?" if account_id else ""
+    account_params: tuple = (str(account_id),) if account_id else ()
+    if _has_columns(conn, "paper_position_lots", {"cycle_id", "acquired_at"}):
+        row = conn.execute(
+            "SELECT 1 FROM paper_position_lots WHERE cycle_id=?"
+            " AND substr(acquired_at,1,10)<=?" + account_sql + " LIMIT 1",
+            (context.cycle_id, day, *account_params),
+        ).fetchone()
+        if row is not None:
+            return True
+    if _has_columns(conn, "paper_fills", {"order_id", "account_id", "fill_date"}) and \
+       _has_columns(conn, "paper_orders", {"id", "cycle_id"}):
+        fill_account_sql = " AND f.account_id=?" if account_id else ""
+        row = conn.execute(
+            "SELECT 1 FROM paper_fills f JOIN paper_orders o ON o.id=f.order_id"
+            " WHERE o.cycle_id=? AND substr(f.fill_date,1,10)<=?"
+            + fill_account_sql + " LIMIT 1",
+            (context.cycle_id, day, *account_params),
+        ).fetchone()
+        if row is not None:
+            return True
+    if _has_columns(conn, "paper_orders", {"cycle_id", "executed_at"}):
+        row = conn.execute(
+            "SELECT 1 FROM paper_orders WHERE cycle_id=?"
+            " AND substr(executed_at,1,10)<=?" + account_sql + " LIMIT 1",
+            (context.cycle_id, day, *account_params),
+        ).fetchone()
+        if row is not None:
+            return True
+    return False
+
+
+def _cycle_created_by(conn, context: PortfolioReadContext,
+                      account_id: str | None = None) -> bool:
+    """Return whether an existing cycle row predates ``context.asof_day``."""
+    if not _has_columns(conn, "paper_cycles", {"id", "created_at"}):
+        return True
+    row = conn.execute(
+        "SELECT created_at FROM paper_cycles WHERE id=?", (context.cycle_id,)
+    ).fetchone()
+    if row is None:
+        return True
+    created = _day_text(row[0])
+    if created and created <= context.asof_day.isoformat():
+        return True
+    return _cycle_has_bounded_activity(conn, context, account_id=account_id)
+
 def _cycle_initial(conn, context: PortfolioReadContext, account_id: str | None = None):
     """Resolve cycle/account initial capital without reading current cash."""
     if account_id:
@@ -613,12 +664,16 @@ def _cycle_initial(conn, context: PortfolioReadContext, account_id: str | None =
         ).fetchone()
         if row is None or int(row[1] or -1) != context.cycle_id:
             return None
+        if not _cycle_created_by(conn, context):
+            return None
         return _num(row[0], None)
     if _has_columns(conn, "paper_cycles", {"id", "capital"}):
         cycle = conn.execute(
             "SELECT capital FROM paper_cycles WHERE id=?", (context.cycle_id,)
         ).fetchone()
         if cycle is not None:
+            if not _cycle_created_by(conn, context):
+                return None
             declared = _num(cycle[0], 0.0)
             if declared is not None and declared > 0:
                 return declared
