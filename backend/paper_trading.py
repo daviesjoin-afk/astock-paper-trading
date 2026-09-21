@@ -61,10 +61,8 @@ import paper_cycle_capital as PCC
 import paper_decision_audit as PDA
 import paper_slot_occupancy as PSO
 import paper_risk_exit_eligibility as PRE
-import paper_risk_decision as PRD
 import paper_risk_scan_state as PRSS
 import paper_position_review as PReview
-import paper_position_review_evidence as PREV
 import paper_replacement_decision as PRep
 import paper_replacement_evidence as PREPL
 import adaptive_selection_compat as ASC
@@ -87,6 +85,8 @@ import strategy_registry as SR
 import strategy_runtime as SRT
 import user_strategy_participation as USP
 import strategy_risk_enforcement as SRE
+import paper_risk_evidence as PREv
+import paper_risk_service as PRSVC
 import runtime_settings as RSET
 from market_policy import market_light_scale, market_light_scales
 from paper_trading_rules import (
@@ -3108,8 +3108,11 @@ def _rows(conn, sql, params=()):
     return PRP.rows(conn, sql, params)
 
 
-def _audit(conn, account_id, event, detail):
-    return PRP.audit(conn, account_id, event, detail, _now())
+def _audit(conn, account_id, event, detail, *, strategy_stamp=None):
+    return PRP.audit(
+        conn, account_id, event, detail, _now(),
+        strategy_stamp=strategy_stamp,
+    )
 
 
 def _strategy_stamp(conn, account_id, signal_id=None):
@@ -3222,12 +3225,16 @@ def _recovery_observation(conn, account_id, code, watch, quote, day):
     return True, "止损后恢复观察通过，仍须重新通过完整入场门禁", observation
 
 
-def _risk_log(conn, account_id, code, side, decision, reason, payload):
+def _risk_log(conn, account_id, code, side, decision, reason, payload, *,
+              strategy_stamp=None):
     payload = _with_decision_snapshot(
         payload or {}, account_id=account_id, code=code, side=side,
         decision=decision, reason=reason,
     )
-    strategy_id, strategy_version, strategy_checksum = _strategy_stamp(conn, account_id)
+    if strategy_stamp is None:
+        strategy_id, strategy_version, strategy_checksum = _strategy_stamp(conn, account_id)
+    else:
+        strategy_id, strategy_version, strategy_checksum = strategy_stamp
     conn.execute(
         """INSERT INTO paper_risk_decisions(
                account_id,code,side,decision,reason,payload,created_at,
@@ -10383,31 +10390,9 @@ def _waitlist_realtime_assessment(signal, account, quote, asof_day):
 
 
 def _best_replacement_candidate(conn, account_id, day, held_codes):
-    """Find the strongest **same-day** pending candidate that is not already held.
-
-    R18（as-of hard contract）：今天能触发今天卖出的替补必须**属于今天**。候选读取
-    经 :mod:`paper_replacement_evidence` 固定在 ``intended_date == day``（**等式**，
-    不是 ``today..next_weekday`` 的 range）与 ``signal_date <= day``（历史 as-of 不得
-    读到未来证据）；否则明天的候选会先制造今天的卖出，而真实 BUY 又因
-    ``signal_freshness`` 要求 ``intended_date == asof_day`` 被拒（§4-§7）。
-
-    合法 overnight 计划（``signal_date = D-1``、``intended_date = D``）仍然可用。
-    归档 signal 不参与：它是历史 opening 证据，不是 executable candidate。
-    """
-    statuses = ("pending", "deferred_capacity", ENTRY_FROZEN_WAITLIST_STATUS)
-    rows = PREPL.load_replacement_candidates(
-        conn, account_id=account_id, asof_day=_date(day).isoformat(), statuses=statuses,
+    return PREv.best_replacement_candidate(
+        conn, account_id, day, held_codes, deps=_risk_service_ports().evidence,
     )
-    # security scope 仍由 adapter 处理（纯域模块不 import 项目 API）。
-    allowed = []
-    for row in rows:
-        pick = (_loads(row.get("payload"), {}) or {}).get("pick") or {}
-        code = str(row.get("code") or "")
-        if code and _security_scope(code, row.get("name") or pick.get("name"),
-                                    pick.get("risk_flag"))["allowed"]:
-            allowed.append(row)
-    # 候选质量是稳定复合分；排序在纯域模块里（held 排除也在那里再兜一次）。
-    return PRep.choose_best_candidate(allowed, held_codes=held_codes)
 
 
 def _slot_upgrade_context(conn, account_id, signal, positions, asof_day, *, cycle_id):
@@ -10603,1312 +10588,129 @@ def _rollback_slot_borrow(conn, borrow, *, cycle_id):
 
 def _intraday_downside_guard(position, quote, market=None, news=None, policy_override=None,
                              flow_trajectory=None, *, asof_day):
-    """Combine intraday weakness and main-force intent into a staged guard.
-
-    ``warning`` is informational/freeze-add territory.  ``partial`` and
-    ``full`` are candidates for a sell only after the caller confirms the
-    signal on a subsequent scan.  Washout evidence suppresses a sell unless
-    a severe loss/negative-event condition is also present.
-
-    ``asof_day`` 必填：峰值口径与主力意图都不得回退到机器当前日期，
-    R15 的缺陷正是在这里把 as-of 漏给了峰值 helper。
-    """
-    account_id = str(position.get("account_id") or "")
-    policy = dict(SPOL.intraday_downside_policy(account_id))
-    if policy_override:
-        for key in policy:
-            candidate_key = f"downside_{key}"
-            if candidate_key in policy_override and policy_override[candidate_key] is not None:
-                policy[key] = policy_override[candidate_key]
-    if not policy:
-        return {"level": "none", "sell_ratio": 0.0, "reason": "无对应策略下跌防线"}
-    quote = quote or {}
-    pct = _num(quote.get("pct"), None)
-    price = _num(quote.get("price"), None)
-    cost = _num(position.get("cost"), None)
-    ret_pct = (price / cost - 1) * 100 if price and cost else None
-    market_pct = _num((market or {}).get("live_index_pct"), None)
-    relative = pct - market_pct if pct is not None and market_pct is not None else None
-    peak = PRD.position_peak(position, quote, price, asof_day=asof_day)
-    peak_retrace = (1 - price / peak) * 100 if price and peak else None
-    peak_return = (peak / cost - 1) * 100 if peak and cost else None
-    giveback = peak_return - ret_pct if peak_return is not None and ret_pct is not None else None
-    intent = PRD.main_force_intent(position, quote, market=market, news=news)
-    distribution = intent.get("classification") == "distribution" and intent.get("confidence", 0) >= 0.58
-    washout = intent.get("classification") == "washout" and intent.get("confidence", 0) >= 0.58
-    negative_news = bool(_negative_hits(news or [], str(position.get("code") or "")))
-    warning = bool(
-        (pct is not None and pct <= policy["warning_pct"])
-        or (relative is not None and relative <= policy["relative_pct"])
-        or (peak_retrace is not None and peak_retrace >= policy["peak_retrace_pct"])
+    return PREv.intraday_downside_guard(
+        position, quote, market=market, news=news, policy_override=policy_override,
+        flow_trajectory=flow_trajectory, asof_day=asof_day,
+        deps=_risk_service_ports().evidence,
     )
-    # Intraday-T must not dump inventory during a low-open/high-go recovery.
-    # A quote that has reclaimed the morning low by >=1.5% with a non-negative
-    # tape is treated as a washout/recovery unless independent distribution
-    # evidence is present.  Hard stops remain handled by _sell_plan.
-    day_low = _num(quote.get("low"), None)
-    low_rebound = ((price / day_low - 1.0) * 100) if price and day_low and day_low > 0 else None
-    recovery_hold = bool(
-        account_id == "tq_breakout"
-        and low_rebound is not None and low_rebound >= 1.5
-        and pct is not None and pct >= -1.0
-        and not distribution and not negative_news
+
+
+
+
+def _position_quality_score(conn, position, quote, asof_day, *, cycle_id, news=None,
+                            replacement=None, nav=None, market=None, flow_trajectory=None):
+    return PREv.position_quality_score(
+        conn, position, quote, asof_day, cycle_id=cycle_id, news=news,
+        replacement=replacement, nav=nav, market=market,
+        flow_trajectory=flow_trajectory, deps=_risk_service_ports().evidence,
     )
-    if recovery_hold:
-        warning = False
-    flow_trajectory = dict(flow_trajectory or {})
-    main_force_distribution = bool(
-        position.get("account_id") == MAIN_FORCE_STRATEGY_ID
-        and distribution and flow_trajectory.get("status") == "ok"
-        and _num(flow_trajectory.get("main_delta_5m"), 0.0) < 0
-        and _num(flow_trajectory.get("positive_persistence_10m"), 1.0) < 0.50
-    )
-    # Distribution needs both price weakness and an independent confirmation;
-    # a large fall with positive/neutral flow is treated as possible washout.
-    partial = bool(
-        distribution
-        and pct is not None and pct <= policy["partial_pct"]
-        and (ret_pct is None or ret_pct <= 0 or (relative is not None and relative <= policy["relative_pct"]))
-    )
-    if main_force_distribution:
-        partial = True
-    severe = bool(
-        distribution
-        and pct is not None and pct <= policy["full_pct"]
-        and (ret_pct is None or ret_pct <= 0)
-        and peak_retrace is not None
-        and peak_retrace >= policy["peak_retrace_pct"]
-    )
-    if main_force_distribution:
-        severe = True
-    # A position can lose its entire accumulated edge before the daily loss
-    # threshold is reached.  Treat that as a separate, auditable risk path:
-    # washout evidence may suppress the ordinary intent-based sell, but it
-    # must not suppress protection of a meaningful peak-to-current giveback.
-    giveback_partial = bool(
-        giveback is not None
-        and peak_return is not None
-        and peak_return >= policy.get("giveback_min_peak_return_pct", 4.0)
-        and giveback >= policy.get("giveback_partial_pct", 6.0)
-        and (ret_pct is None or ret_pct <= 1.0)
-        and (pct is None or pct <= 0.0)
-    )
-    giveback_severe = bool(
-        giveback_partial
-        and giveback >= policy.get("giveback_full_pct", 10.0)
-        and (ret_pct is None or ret_pct <= -3.0)
-    )
-    if washout and not negative_news:
-        # 洗盘只是在风险尚可承受时延迟减仓，不能覆盖各策略自己的
-        # 亏损保护线。短线T容忍区最窄，趋势波段最宽，板块轮动居中。
-        washout_override = _num(
-            (STRATEGY_RISK_BEHAVIORS.get(account_id) or {}).get(
-                "washout_loss_override_pct"
-            ),
-            -4.0,
-        )
-        loss_beyond_override = (
-            ret_pct is not None and ret_pct <= washout_override
-        ) or (
-            relative is not None and relative <= policy["relative_pct"] - 1.0
-        )
-        if not loss_beyond_override:
-            partial = False
-            severe = False
-    warning_trim_ratio = _num(policy.get("warning_trim_ratio"), 0.0)
-    if giveback_severe or severe:
-        level, sell_ratio = "full", 1.0
-    elif giveback_partial or partial:
-        level, sell_ratio = "partial", policy["partial_ratio"]
-    elif warning:
-        level, sell_ratio = "warning", warning_trim_ratio
-    else:
-        level, sell_ratio = "none", 0.0
-    reasons = []
-    if main_force_distribution:
-        reasons.append("超强主力出货共振：意图分类为疑似出货，5分钟资金转负且10分钟持续率低于50%")
-    if pct is not None and pct <= policy["warning_pct"]:
-        reasons.append(f"当日跌幅 {pct:+.2f}%")
-    if relative is not None and relative <= policy["relative_pct"]:
-        reasons.append(f"相对沪深300弱 {relative:+.2f}%")
-    if peak_retrace is not None and peak_retrace >= policy["peak_retrace_pct"]:
-        reasons.append(f"盘中高点回撤 {peak_retrace:.2f}%")
-    if giveback_partial:
-        reasons.append(
-            f"收益回吐保护：峰值收益 {peak_return:.2f}%、已回吐 {giveback:.2f}%"
-        )
-    reasons.append(intent.get("label") or "主力意图不确定")
-    return {
-        "level": level,
-        "sell_ratio": sell_ratio,
-        "reason": "；".join(reasons) if reasons else "未达到下跌预警条件",
-        "policy": policy,
-        "main_force_intent": intent,
-        "intraday_pct": round(pct, 2) if pct is not None else None,
-        "cost_return_pct": round(ret_pct, 2) if ret_pct is not None else None,
-        "relative_to_market_pct": round(relative, 2) if relative is not None else None,
-        "peak_retrace_pct": round(peak_retrace, 2) if peak_retrace is not None else None,
-        "peak_return_pct": round(peak_return, 2) if peak_return is not None else None,
-        "giveback_pct": round(giveback, 2) if giveback is not None else None,
-        "giveback_protection": bool(giveback_partial or giveback_severe),
-        "strategy_risk_behavior": STRATEGY_RISK_BEHAVIORS.get(account_id, {}),
-        "negative_news": negative_news,
-        "flow_trajectory": flow_trajectory,
-        "main_force_distribution": main_force_distribution,
-        "recovery_hold": recovery_hold,
-        "recovery_hold_reason": (
-            f"低开高走：较日内低点反弹 {low_rebound:.2f}%，暂缓日内预警减仓"
-            if recovery_hold else None
-        ),
-        # 日内T的预警首段减仓是一次性的轻仓保护；趋势/板块仍维持
-        # 两次确认后才执行的 partial/full 机制。
-        "requires_confirmation": level in {"partial", "full"},
-        "model": "intraday_downside_guard_v1",
-        "asof": quote.get("quote_at"),
-    }
 
 
-def _downside_confirmed(conn, account_id, code, asof_day, guard):
-    """Require a distinct prior five-minute scan with the same adverse intent."""
-    # 2026-09-03 二次确认减仓：warning 级也允许走两次确认。首段减仓
-    # 一天只有一次，之后价格长期停在 warning 区间（跌不深但持续阴跌、
-    # 主力意图反复读出疑似出货）时，两次确认是仅存的保护通道，
-    # 不能再被级别门槛直接挡掉。
-    if not guard or guard.get("level") not in {"partial", "full", "warning"}:
-        return False
-    rows = conn.execute(
-        """SELECT decision,payload,created_at FROM paper_risk_decisions
-           WHERE account_id=? AND code=? AND side='sell'
-             AND substr(created_at,1,10)=?
-             AND decision IN ('downside_warning','downside_partial_pending','downside_full_pending')
-           ORDER BY id DESC LIMIT 2""",
-        (account_id, code, _date(asof_day).isoformat()),
-    ).fetchall()
-    if not rows:
-        return False
-    latest_row = rows[0]
-    latest = _loads(latest_row["payload"], {})
-    prior_guard = latest.get("downside_guard") or {}
-    prior_class = ((prior_guard.get("main_force_intent") or {}).get("classification"))
-    current_class = ((guard.get("main_force_intent") or {}).get("classification"))
-    prior_level = prior_guard.get("level")
-    current_time = str(guard.get("asof") or "")
-    prior_time = str(prior_guard.get("asof") or latest_row["created_at"] or "")
-    try:
-        current_at = dt.datetime.fromisoformat(current_time.replace("Z", "+00:00"))
-        prior_at = dt.datetime.fromisoformat(prior_time.replace("Z", "+00:00"))
-        if bool(current_at.tzinfo) != bool(prior_at.tzinfo):
-            return False
-        if (current_at - prior_at).total_seconds() < max(60, INTRADAY_INTERVAL_MINUTES * 60 - 30):
-            return False
-    except (TypeError, ValueError, OverflowError):
-        # A missing timestamp must fail closed; two concurrent scheduler calls
-        # must never be mistaken for two independent confirmations.
-        return False
-    # Giveback protection is intent-independent by design (see the audit note
-    # above): a position that gave back a large accumulated edge while the
-    # main-force classifier returned "uncertain" (e.g. missing flow fields)
-    # used to make this confirmation unreachable, so the protective exit could
-    # never fire until the hard stop.  Two consecutive scans both carrying the
-    # giveback flag are still required — the spacing check above already
-    # guarantees they are distinct observations.
-    giveback_today = bool(
-        conn.execute(
-            ("SELECT 1 FROM paper_risk_decisions "
-             "WHERE account_id=? AND code=? AND side='sell' "
-             "AND substr(created_at,1,10)=? "
-             "AND decision IN ('downside_warning','downside_partial_pending','downside_full_pending') "
-             "AND json_extract(payload,'$.downside_guard.giveback_protection') "
-             "    IN (1,'1','true','True') "
-             "LIMIT 1"),
-            (account_id, code, _date(asof_day).isoformat()),
-        ).fetchone()
-    )
-    # 2026-09-03 sticky fix: giveback protection is a persistent intraday
-    # condition.  Once it has fired in ANY earlier scan today it stays valid
-    # for the rest of the day, so a minor bounce flipping the live flag back
-    # to 0 can no longer make the protective confirmation unreachable (the
-    # position used to drift all the way to the hard stop instead).
-    giveback_confirmed = (
-        bool(guard.get("giveback_protection")) or giveback_today
-    ) and (
-        bool(prior_guard.get("giveback_protection")) or giveback_today
-    )
-    confirmed_intent = (
-        prior_class == current_class == "distribution" or giveback_confirmed
-    )
-    return prior_level in {"warning", "partial", "full"} and confirmed_intent
 
 
-def _position_quality_score(conn, position, quote, asof_day, *, cycle_id, news=None, replacement=None, nav=None, market=None,
-                            flow_trajectory=None):
-    """Score an existing holding for concentration decisions (0..100).
-
-    The score is intentionally independent from the entry gate: it combines
-    the position's actual return, live momentum/flow, completed-kline trend,
-    the original model score and verified negative-event pressure.  A high
-    score may remain as a one-lot core/observation holding; a low score is
-    eligible for rotation only after T+1 and quote gates pass.
-
-    ``cycle_id`` 是 **keyword-only 且必填**（R17）：入场 signal 的 provenance
-    必须钉在**已认领的**周期上，实现层不得再问一次"现在 active 的是谁"。
-
-    评分算术本身已抽到 :mod:`paper_position_review`；本函数只做证据收集与
-    orchestration（行情 / K 线 / provenance / 新闻 / 替代数据 / 权重 / 替补）。
-    """
-    code = str(position.get("code") or "")
-    account_id = position.get("account_id")
-    price = _num(quote.get("price"), _num(position.get("cost")))
-    cost = _num(position.get("cost"))
-    ret_pct = (price / cost - 1) * 100 if price > 0 and cost > 0 else 0.0
-    pct = _num(quote.get("pct"))
-    main_pct = _num(quote.get("main_pct"), _num(quote.get("main_net_pct")))
-    vol_ratio = _num(quote.get("vol_ratio"), 1.0)
-    turnover = _num(quote.get("turnover"), 0.0)
-    momentum = max(0.0, min(100.0, 50.0 + pct * 4.0 + (vol_ratio - 1.0) * 12.0))
-    flow = max(0.0, min(100.0, 50.0 + main_pct * 4.0))
-    return_score = max(0.0, min(100.0, 50.0 + ret_pct * 3.0))
-
-    trend = 50.0
-    trend_detail = "趋势数据不足"
-    frame = _completed_kline(code, asof_day, inclusive=False)
-    if frame is not None and not frame.empty and "close" in frame.columns:
-        close_series = pd.to_numeric(frame["close"], errors="coerce").dropna()
-        if not close_series.empty:
-            last_close = float(close_series.iloc[-1])
-            ma20 = float(close_series.tail(20).mean()) if len(close_series) >= 20 else None
-            ma60 = float(close_series.tail(60).mean()) if len(close_series) >= 60 else None
-            checks = []
-            if ma20:
-                checks.append(last_close >= ma20)
-            if ma60:
-                checks.append(last_close >= ma60)
-            if ma20 and ma60:
-                checks.append(ma20 >= ma60)
-            trend = 50.0 + sum(20.0 if item else -20.0 for item in checks)
-            trend = max(0.0, min(100.0, trend))
-            trend_detail = f"收盘/MA20/MA60结构 {sum(checks)}/{len(checks)}"
-
-    # R17：入场模型分只能来自**当前 episode 的 provenance** ——
-    # risk_state.opened_order_id → verified cycle-owned BUY order → 精确 signal_id。
-    # 绝不回落到「account+code 的最近一条 signal」（那既没有 episode 归属，
-    # 也没有 asof 上界，会让后来的无关 signal 或未来 signal 改变自动换仓判定）。
-    provenance = PREV.resolve_entry_signal(
-        conn,
-        cycle_id=cycle_id,
-        account_id=account_id,
-        code=code,
-        opened_order_id=position.get("episode_opened_order_id"),
-        asof_day=asof_day,
-    )
-    model_score = 50.0
-    model_score_source = "unknown"
-    if provenance["status"] == "verified":
-        signal = provenance["signal"]
-        payload = _loads(signal.get("payload"), {})
-        entry = (payload.get("decision") or {}).get("entry_model") or {}
-        model_score = max(
-            _score100(signal["t_score"], 0.0),
-            _score100(entry.get("score"), 0.0),
-            _score100(signal["rank_score"], 0.0),
-        )
-        model_score_source = "episode_provenance"
-    negative = _negative_hits(news or [], code)
-    main_force_intent = PRD.main_force_intent(position, quote, market=market, news=news)
-    news_penalty = min(24.0, len(negative) * 12.0)
-    # 限售解禁预警（P0）：未来30天大额解禁（≥3%流通）重扣，60天≥5%中扣。
-    # 解禁是确定性的供给冲击，等价格反应再退出就晚了；数据源失败时扣0。
-    lockup_penalty, lockup_desc = 0.0, None
-    if AD is not None:
-        try:
-            lockup_penalty, lockup_desc = AD.lockup_penalty(code, asof_day=asof_day)
-        except Exception:
-            lockup_penalty, lockup_desc = 0.0, None
-    # 龙虎榜信号（P1）：近7天上榜净买 +6（抢筹确认），净卖 -6（出货警示）。
-    lhb_bonus, lhb_desc = 0.0, None
-    if AD is not None:
-        try:
-            lhb_bonus, lhb_desc = AD.lhb_position_signal(code, asof_day=asof_day)
-        except Exception:
-            lhb_bonus, lhb_desc = 0.0, None
-    # 筹码/杠杆信号（P2）：两融 ±4、大宗 -5/+3、股东户数 ±5。
-    # 各自独立小幅度，合计最坏 -14，与 lockup/lhb 共同构成替代数据
-    # 评分层；任一数据源失败该项为 0，不影响其余。
-    margin_bonus, margin_desc, block_bonus, block_desc, holder_bonus, holder_desc = 0.0, None, 0.0, None, 0.0, None
-    if AD is not None:
-        try:
-            margin_bonus, margin_desc = AD.margin_signal(code, asof_day=asof_day)
-        except Exception:
-            margin_bonus, margin_desc = 0.0, None
-        try:
-            block_bonus, block_desc = AD.block_trade_signal(code, asof_day=asof_day)
-        except Exception:
-            block_bonus, block_desc = 0.0, None
-        try:
-            holder_bonus, holder_desc = AD.holder_signal(code, asof_day=asof_day)
-        except Exception:
-            holder_bonus, holder_desc = 0.0, None
-    alt_bonus = lhb_bonus + margin_bonus + block_bonus + holder_bonus
-    alt_shadow_delta = alt_bonus - lockup_penalty
-    weights = HOLDING_QUALITY_WEIGHTS.get(account_id, HOLDING_QUALITY_WEIGHTS["trend_pullback"])
-    hold_days = _hold_days(position, asof_day)
-    # 评分算术与 grade 边界在 paper_position_review（纯域模块），公式逐字等价。
-    scored = PReview.score_quality(
-        model_score=model_score, trend_score=trend, flow_score=flow,
-        momentum_score=momentum, return_score=return_score,
-        news_penalty=news_penalty, weights=weights, hold_days=hold_days,
-    )
-    score = scored["score"]
-    grade = scored["grade"]
-    trend_for_score = scored["trend_for_score"]
-    review_phase = scored["review_phase"]
-    market_value = max(0.0, _num(position.get("qty")) * max(price, 0.0))
-    nav = max(_num(nav), 0.0)
-    position_pct = market_value / nav * 100 if nav else 0.0
-    small = position_pct < POSITION_REVIEW_SMALL_PCT * 100
-    one_lot = int(_num(position.get("qty"))) <= LOT_SIZE
-    replacement_score = _num((replacement or {}).get("score"), None)
-    replacement_edge = replacement_score - score if replacement_score is not None else None
-    reasons = [
-        f"模型 {model_score:.1f}", f"趋势 {trend_for_score:.1f}" + ("（新仓中性）" if hold_days < 1 else ""),
-        f"资金 {flow:.1f}", f"动量 {momentum:.1f}",
-        f"收益 {return_score:.1f}",
-    ]
-    if negative:
-        reasons.append(f"负面事件 {len(negative)} 条")
-    if lockup_penalty:
-        reasons.append(f"影子·限售解禁 -{lockup_penalty:.0f}（{lockup_desc}）")
-    if lhb_desc:
-        reasons.append(f"影子·龙虎榜 {'+' if lhb_bonus >= 0 else ''}{lhb_bonus:.0f}（{lhb_desc}）")
-    for _bonus, _desc, _label in (
-        (margin_bonus, margin_desc, "两融"),
-        (block_bonus, block_desc, "大宗"),
-        (holder_bonus, holder_desc, "股东户数"),
-    ):
-        if _desc:
-            reasons.append(f"影子·{_label} {'+' if _bonus >= 0 else ''}{_bonus:.0f}（{_desc}）")
-    if one_lot:
-        reasons.append("当前仅一手")
-    if small:
-        reasons.append(f"仓位仅 {position_pct:.2f}%")
-    reasons.append(
-        f"主力意图 {main_force_intent['label']}"
-        f"（置信度 {main_force_intent['confidence']*100:.0f}%）"
-    )
-    flow_trajectory = dict(flow_trajectory or {})
-    if flow_trajectory.get("status") == "ok":
-        flow_direction = flow_trajectory.get("direction")
-        divergence = "none"
-        if pct > 0 and flow_direction == "outflow":
-            divergence = "price_up_flow_out"
-        elif pct < 0 and flow_direction == "inflow":
-            divergence = "price_down_flow_in"
-        flow_trajectory["price_flow_divergence"] = divergence
-        labels = {"inflow": "流入", "outflow": "流出", "flat": "平稳"}
-        reasons.append(
-            f"影子·分钟资金 {labels.get(flow_direction, '未知')}，"
-            f"5分钟主力变化 {float(flow_trajectory.get('main_delta_5m') or 0)/10000:.1f}万，"
-            f"持续性 {float(flow_trajectory.get('positive_persistence_10m') or 0)*100:.0f}%"
-        )
-    return {
-        "code": code, "account_id": account_id, "score": score, "grade": grade,
-        "market_value": round(market_value, 2), "position_pct": round(position_pct, 2),
-        "ret_pct": round(ret_pct, 2), "hold_days": hold_days,
-        "small_position": bool(small), "one_lot": bool(one_lot),
-        "review_phase": review_phase, "weights": weights,
-        "model_score": round(model_score, 2), "trend_score": round(trend_for_score, 2),
-        "trend_raw_score": round(trend, 2),
-        # R17 provenance：解释"这个 model_score 是怎么来的"，让 50 分不是黑箱。
-        "model_score_source": model_score_source,
-        "episode_opened_order_id": position.get("episode_opened_order_id"),
-        "entry_signal_id": provenance.get("signal_id"),
-        "entry_signal_date": provenance.get("signal_date"),
-        "entry_signal_provenance_status": provenance["status"],
-        "entry_signal_provenance_reason": provenance.get("reason"),
-        # decide_action 是纯函数，最短观察期由 adapter 注入（账户配置不进口域层）。
-        "min_hold_days": _replacement_min_hold_days(account_id),
-        "flow_score": round(flow, 2), "momentum_score": round(momentum, 2),
-        "return_score": round(return_score, 2), "turnover": round(turnover, 2),
-        "news_penalty": round(news_penalty, 2),
-        "lockup_penalty": round(lockup_penalty, 2),
-        "lockup_detail": lockup_desc,
-        "lhb_bonus": round(lhb_bonus, 2),
-        "lhb_detail": lhb_desc,
-        "margin_bonus": round(margin_bonus, 2), "margin_detail": margin_desc,
-        "block_bonus": round(block_bonus, 2), "block_detail": block_desc,
-        "holder_bonus": round(holder_bonus, 2), "holder_detail": holder_desc,
-        "alt_shadow_delta": round(alt_shadow_delta, 2),
-        "alt_score_applied": False,
-        "fund_flow_trajectory": flow_trajectory,
-        "fund_flow_trajectory_applied": False,
-        "trend_detail": trend_detail,
-        "replacement": replacement, "replacement_score": replacement_score,
-        "replacement_edge": round(replacement_edge, 2) if replacement_edge is not None else None,
-        "main_force_intent": main_force_intent,
-        "reasons": reasons,
-    }
-
-
-def _over_capacity_exit_candidates(conn, positions, reviews, account_map, asof_day):
-    """Pick the weakest *sellable* positions when a strategy exceeds its cap.
-
-    The cap controls the number of distinct stocks, not the number of lots.
-    New purchases are blocked immediately; existing excess holdings are then
-    reduced over ordinary risk passes, preserving T+1 and live-quote gates.
-    """
-    selected = {}
-    count_budget = _dynamic_position_limits(conn)
-    by_account = {}
-    for position in positions:
-        if int(_num(position.get("qty"))) >= LOT_SIZE:
-            by_account.setdefault(position["account_id"], []).append(position)
-    for account_id, items in by_account.items():
-        fallback = (ACCOUNT_SPECS.get(account_id) or {}).get("max_positions", 5)
-        limit = max(1, int(count_budget["limits"].get(account_id, fallback)))
-        excess = max(0, len(items) - limit)
-        if not excess:
-            continue
-        eligible = [
-            item for item in items
-            if int(_num(item.get("available_qty"))) >= LOT_SIZE
-        ]
-        eligible.sort(key=lambda item: (
-            _num((reviews.get((account_id, item["code"])) or {}).get("score"), 100.0),
-            _num((reviews.get((account_id, item["code"])) or {}).get("market_value"), 0.0),
-        ))
-        for rank, item in enumerate(eligible[:excess], start=1):
-            review = reviews.get((account_id, item["code"])) or {}
-            selected[(account_id, item["code"])] = (
-                f"策略持仓数 {len(items)}/{limit}（总上限 {count_budget['pool_limit']}），压缩超额持仓；"
-                f"按质量评分排序第 {rank} 个（{_num(review.get('score')):.1f} 分）"
-            )
-    return selected
-
-
-def _permission_scope_exit_candidates(conn, positions, reviews, quote_map, asof_day):
-    """Choose at most one restricted holding per strategy and trading day.
-
-    These are legacy positions which the user cannot trade on the configured
-    account (STAR/BSE/ST).  They must never be reinforced.  Exits are gradual,
-    auditable and still obey T+1, fresh-quote and limit-down execution gates.
-    """
-    selected = {}
-    by_account = {}
-    for position in positions:
-        quote = (quote_map or {}).get(position.get("code"), {})
-        scope = _security_scope(
-            position.get("code"), quote.get("name") or position.get("name"),
-            quote.get("risk_flag"),
-        )
-        if scope["allowed"] or int(_num(position.get("qty"))) < LOT_SIZE:
-            continue
-        item = dict(position)
-        item["security_scope"] = scope
-        by_account.setdefault(position["account_id"], []).append(item)
-    priority = {"风险警示": 0, "北交所": 1, "科创板": 2}
-    for account_id, items in by_account.items():
-        completed_today = conn.execute(
-            """SELECT COUNT(*) FROM paper_audit
-               WHERE account_id=? AND event='permission_scope_exit'
-                 AND substr(created_at,1,10)=?""",
-            (account_id, _date(asof_day).isoformat()),
-        ).fetchone()[0]
-        remaining = max(0, PERMISSION_SCOPE_EXIT_MAX_PER_STRATEGY_DAY - int(completed_today or 0))
-        if not remaining:
-            continue
-        items.sort(key=lambda item: (
-            0 if int(_num(item.get("available_qty"))) >= LOT_SIZE else 1,
-            priority.get(item["security_scope"].get("board"), 9),
-            _num((reviews.get((account_id, item["code"])) or {}).get("score"), 100.0),
-        ))
-        for item in items[:remaining]:
-            scope = item["security_scope"]
-            selected[(account_id, item["code"])] = (
-                f"{scope['reason']}；不在可交易权限范围，按每策略每日最多 "
-                f"{PERMISSION_SCOPE_EXIT_MAX_PER_STRATEGY_DAY} 只逐步退出并释放席位"
-            )
-    return selected
 
 
 def _save_position_review(conn, cycle_id, review, action, reason):
-    # R17：review_date 必须**显式**来自调用方。此前是
-    # ``_date(review.get("review_date") or dt.date.today())`` —— 一个 wall-clock
-    # 回退：任何遗漏 review_date 的路径都会把历史 as-of 复核日期偷偷写成"机器今天"，
-    # 而 monitor_risk 一直显式设置 review["review_date"] = day。缺失即 fail fast，
-    # 绝不猜日期（determinism 修复，属 R17 范围）。
-    review_date = review.get("review_date")
-    if review_date is None or str(review_date).strip() == "":
-        raise ValueError("_save_position_review 需要显式 review_date（不允许 wall-clock 回退）")
-    replacement = review.get("replacement") or {}
-    conn.execute(
-        """INSERT INTO paper_position_reviews(
-           cycle_id,account_id,code,review_date,score,grade,action,market_value,
-           position_pct,replacement_code,replacement_score,reasons,detail,created_at)
-           VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-           ON CONFLICT(cycle_id,account_id,code,review_date) DO UPDATE SET
-             score=excluded.score,grade=excluded.grade,action=excluded.action,
-             market_value=excluded.market_value,position_pct=excluded.position_pct,
-             replacement_code=excluded.replacement_code,replacement_score=excluded.replacement_score,
-             reasons=excluded.reasons,detail=excluded.detail,created_at=excluded.created_at""",
-        (
-            cycle_id, review["account_id"], review["code"], _date(review_date).isoformat(),
-            review["score"], review["grade"], action, review["market_value"], review["position_pct"],
-            replacement.get("code"), review.get("replacement_score"),
-            "；".join(review.get("reasons") or []),
-            _json({**review, "action": action, "action_reason": reason}), _now(),
-        ),
-    )
+    return PREv.save_position_review(conn, cycle_id, review, action, reason)
 
 
-def _rotation_buy_candidate(conn, account, replacement, quote, market, news, asof_day, *, all_quotes=None):
-    """Re-enter one released slot with a previously deferred high-score signal.
-
-    The normal buy path is deliberately reused so the replacement still goes
-    through live quote validation, T+1/limit checks, the shared 82% cap and the
-    strategy's own risk budget.  A failed replacement is recorded as an audit
-    result; it never bypasses a gate merely because a sell just freed cash.
-    """
-    signal_id = replacement.get("signal_id") if replacement else None
-    if not signal_id:
-        return {"status": "no_candidate", "reason": "没有可复用的候选信号"}
-    row = conn.execute(
-        "SELECT * FROM paper_signals WHERE id=? AND status IN ('pending','deferred_capacity',?)",
-        (signal_id, ENTRY_FROZEN_WAITLIST_STATUS),
-    ).fetchone()
-    if not row:
-        return {"status": "candidate_expired", "reason": "候选已被其他流程处理"}
-    result = _buy_order(
-        conn, account, dict(row), quote or {}, market or {}, news or {}, _date(asof_day),
-        all_quotes=dict(all_quotes or {}),
-    )
-    result = dict(result or {})
-    result.update({
-        "signal_id": int(signal_id),
-        "rotation": True,
-        "replacement_code": replacement.get("code"),
-        "replacement_score": replacement.get("score"),
-    })
-    return result
 
 
-def _sell_plan(position, quote, asof_day, news, hard_stop_touched_today=False, spec_override=None):
-    """卖出决策的 orchestration adapter：解析输入 → 交给纯 engine → 组装旧 schema。
-
-    真正的硬止损/移动止损/最长持有/阶梯止盈/严重度仲裁都在
-    ``paper_risk_decision.evaluate_sell``（零 DB / 零 wall clock / 零策略依赖）。
-    这里只做本模块才有能力做的事：解析策略 spec、算 hold_days、解析涨跌停与
-    首段减仓比例、补 volatility shadow 诊断，并保持对调用方稳定的 4 元组返回。
-    """
-    # PR-30：spec_override 允许调用方传入"ACCOUNT_SPECS × 编译画像"的生效参数
-    # （hard_stop/trail/hold_max 取更紧）；未传时保持原有行为。
-    spec = dict(_spec_for(position["account_id"]))
-    if spec_override:
-        spec.update(spec_override)
-    days = _hold_days(position, asof_day)
-    price = _num(quote.get("price"), 0)
-    decision = PRD.evaluate_sell(
-        position, quote, asof_day=asof_day, spec=spec, hold_days=days, news=news,
+def _sell_plan(position, quote, asof_day, news, hard_stop_touched_today=False,
+              spec_override=None):
+    return PREv.sell_plan(
+        position, quote, asof_day, news,
         hard_stop_touched_today=hard_stop_touched_today,
-        limit_pct=_limit_pct(position["code"]),
-        # 首段减仓比例同样来自策略 policy：engine 不解析账户归属。
-        hard_stop_first_trim_ratio=SPOL.intraday_downside_policy(
-            position["account_id"]
-        ).get("partial_ratio", 0.35),
-        risk_version=RISK_VERSION,
+        spec_override=spec_override,
+        base_spec=_spec_for(position["account_id"]),
+        deps=_risk_service_ports().evidence,
     )
-    if decision["status"] == "no_quote":
-        return 0.0, "缺少有效报价", decision["next_stage"], {
-            "strategy_id": position["account_id"],
-            "risk_profile": spec.get("risk_profile"),
-            "strategy_version": decision["strategy_version"],
-            "hold_days": days,
+
+
+class _RiskProjectionAdapter:
+    """Projection/NAV adapter retained in the compatibility facade."""
+
+    def sync_positions(self, conn, day):
+        return _sync_positions(conn, asof_day=day)
+
+    def record_nav(self, conn, day, quotes):
+        return _record_nav(conn, day, quotes=quotes)
+
+
+_RISK_PROJECTION = _RiskProjectionAdapter()
+
+
+def _risk_load_market_inputs(*, day, positions, candidate_codes):
+    """Load cached market context and external risk evidence outside writes."""
+    with _db() as conn:
+        market_context = _cached_close_market(conn, day, allow_network=False)
+    if not positions:
+        return {
+            "market_context": market_context,
+            "quote_map": {},
+            "news": [],
+            "news_meta": dict(_NEWS_SCAN_META),
+            "flow_trajectory_map": {},
         }
-    exit_profile = {
-        "strategy_id": position["account_id"],
-        "risk_profile": spec.get("risk_profile"),
-        "strategy_version": decision["strategy_version"],
-        "hold_min": spec.get("hold_min"),
-        "hold_max": spec.get("hold_max"),
-        "hard_stop": spec.get("hard_stop"),
-        "trail_after": spec.get("trail_after"),
-        "trail_stop": spec.get("trail_stop"),
-        "take_profit": spec.get("take_profit"),
-        "hard_stop_unchanged": True,
+    codes = sorted({str(item["code"]) for item in positions} | set(candidate_codes or ()))
+    quote_map = _quotes(codes, asof_date=day)
+    news = _news_for({item["code"]: item.get("name") or item["code"] for item in positions})
+    news_meta = dict(_NEWS_SCAN_META)
+    try:
+        flow_trajectory_map = (
+            AD.fund_flow_trajectories(codes, asof_day=day) if AD is not None else {}
+        )
+    except Exception:
+        flow_trajectory_map = {}
+    return {
+        "market_context": market_context,
+        "quote_map": quote_map,
+        "news": news,
+        "news_meta": news_meta,
+        "flow_trajectory_map": flow_trajectory_map,
     }
-    exit_class = decision["exit_class"]
-    return decision["sell_ratio"], decision["reason"], decision["next_stage"], {
-        "strategy_id": position["account_id"],
-        "risk_profile": spec.get("risk_profile"),
-        "strategy_version": decision["strategy_version"],
-        "exit_profile": exit_profile,
-        "ret_pct": round(decision["ret"]*100, 2),
-        "drawdown_pct": round((decision["drawdown"] or 0)*100, 2),
-        "hold_days": days,
-        "main_force_intent": decision["main_force_intent"],
-        "shadow_news_warning_count": decision["shadow_news_warning_count"],
-        "shadow_news_notice": (
-            "快讯关键词仅作影子提示，不自动卖出"
-            if decision["shadow_news_warning_count"] else None
-        ),
-        "exit_class": exit_class,
-        "exit_reason_code": decision["exit_reason_code"],
-        "exit_marker": decision["exit_marker"],
-        "protective_exit": exit_class in PROTECTIVE_EXIT_CLASSES,
-        "volatility_shadow": _volatility_shadow(position["code"], asof_day, price),
-    }
+
+
+def _risk_service_ports():
+    evidence = PREv.RiskEvidenceDeps(
+        lot_size=LOT_SIZE,
+        max_sells_per_run=POSITION_REVIEW_MAX_SELLS_PER_RUN,
+        blocked_retry_minutes=POSITION_REVIEW_BLOCKED_RETRY_MINUTES,
+        small_pct=POSITION_REVIEW_SMALL_PCT,
+        permission_scope_exit_max_per_strategy_day=PERMISSION_SCOPE_EXIT_MAX_PER_STRATEGY_DAY,
+        permission_scope_exit_ratio=PERMISSION_SCOPE_EXIT_RATIO,
+        protective_exit_classes=frozenset(PROTECTIVE_EXIT_CLASSES),
+        entry_retry_signal_statuses=tuple(ENTRY_RETRY_SIGNAL_STATUSES),
+        entry_frozen_waitlist_status=ENTRY_FROZEN_WAITLIST_STATUS,
+        intraday_interval_minutes=INTRADAY_INTERVAL_MINUTES,
+        holding_quality_weights=HOLDING_QUALITY_WEIGHTS,
+        strategy_risk_behaviors=STRATEGY_RISK_BEHAVIORS,
+        main_force_strategy_id=MAIN_FORCE_STRATEGY_ID,
+        review_policy=REVIEW_POLICY,
+        risk_version=RISK_VERSION,
+        alt_data=AD,
+        load_kline=_completed_kline,
+    )
+    return PRSVC.RiskServicePorts(
+        evidence=evidence,
+        open_db=_db,
+        load_market_inputs=_risk_load_market_inputs,
+        shared_exposure=lambda conn, day, quotes: _shared_account_exposure(conn, quotes, day)[1:3],
+        dynamic_position_limits=_dynamic_position_limits,
+        risk_profile=_risk_profile,
+        risk_exit_account_ids=_risk_exit_account_ids,
+        rotation_buy=_buy_order,
+        projection=_RISK_PROJECTION,
+        process_pending_manual_orders=process_pending_manual_orders,
+        assert_active_lease=_assert_active_lease,
+    )
 
 
 def _monitor_risk_impl(asof_date=None, *, cycle_id):
-    """14:50 风控任务：仅监控当前持仓，卖出不受市场新开仓门禁影响。
+    """Thin compatibility adapter for the cycle-owned risk service."""
+    context = PRSVC.RiskRunContext(cycle_id=cycle_id, asof_day=_date(asof_date))
+    return PRSVC.run(context, ports=_risk_service_ports())
 
-    ``cycle_id`` 是 **keyword-only 且必填**（R16）：扫描身份已在
-    :func:`monitor_risk` 里解析并 durable 认领，实现层不得再问一次"现在 active
-    的是谁" —— 那正是 R16 之前让一次从旧周期开始的扫描在行情/快讯 I/O 之后去
-    操作新周期 lots / orders / reviews 的路径。scan 生命周期也已整体移出。
-    """
-    init_db()
-    day = _date(asof_date)
-    manual_orders = []
-    with _db() as snapshot_conn:
-        risk_ids = _risk_exit_account_ids(snapshot_conn)
-        # 快照阶段就固定到**已认领**的周期，而不是"此刻 active 的那个周期"。
-        positions = [p for p in PPRM.positions_for_cycle(snapshot_conn, cycle_id, asof_day=day)
-                     if p["account_id"] in risk_ids]
-        market_context = _cached_close_market(snapshot_conn, day, allow_network=False)
-        retry_placeholders = ",".join("?" for _ in ENTRY_RETRY_SIGNAL_STATUSES)
-        candidate_rows = snapshot_conn.execute(
-            f"SELECT DISTINCT code FROM paper_signals WHERE status IN ({retry_placeholders})",
-            tuple(ENTRY_RETRY_SIGNAL_STATUSES),
-        ).fetchall()
-        candidate_codes = {str(row[0]) for row in candidate_rows if row[0]}
-    if positions:
-        codes = sorted({str(p["code"]) for p in positions} | candidate_codes)
-        quote_map = _quotes(codes, asof_date=day)
-        news = _news_for({p["code"]: p.get("name") or p["code"] for p in positions})
-        # Current-only minute flow is fetched concurrently before opening the
-        # SQLite write transaction.  It is shadow evidence and can never block
-        # deterministic risk exits when the source is unavailable.
-        try:
-            flow_trajectory_map = AD.fund_flow_trajectories(codes, asof_day=day) if AD is not None else {}
-        except Exception:
-            flow_trajectory_map = {}
-    else:
-        quote_map, news, flow_trajectory_map = {}, [], {}
-    if not positions:
-        with _db(immediate=True, hot_path=True) as conn:
-            PRSS.assert_cycle_active(conn, cycle_id=cycle_id)  # 空仓分支同样要 fence
-            _sync_positions(conn, asof_day=day)
-            _record_nav(conn, day, quotes=quote_map)
-        try:
-            manual_orders = process_pending_manual_orders(day)
-        except Exception as exc:
-            manual_orders = [{"status": "pending_batch_retry", "reason": str(exc)}]
-        return {"slot": "risk", "date": day.isoformat(), "orders": [], "manual_orders": manual_orders}
-    with _db(immediate=True, hot_path=True) as conn:
-        # R16 cycle fence：外部 I/O 之后、正式写 transaction 打开的第一件事就是
-        # 证明"已认领的周期仍是当前 active cycle"。周期变了 ⇒ fail closed。
-        PRSS.assert_cycle_active(conn, cycle_id=cycle_id)
-        risk_ids = _risk_exit_account_ids(conn)
-        positions = [p for p in PPRM.positions_for_cycle(conn, cycle_id, asof_day=day)
-                     if p["account_id"] in risk_ids]
-        account_map = {
-            row["id"]: row for row in _accounts_by_id(conn, risk_ids)
-        }
-        _, pool_market_value, pool_nav, _, _ = _shared_account_exposure(conn, quote_map, day)
-        held_by_account = {}
-        for item in positions:
-            held_by_account.setdefault(item["account_id"], set()).add(item["code"])
-        count_budget = _dynamic_position_limits(conn)
-        rotations_today = {
-            account_id: conn.execute(
-                """SELECT COUNT(*) FROM paper_audit
-                   WHERE account_id=? AND event='quality_rotation'
-                     AND substr(created_at,1,10)=?""",
-                (account_id, day.isoformat()),
-            ).fetchone()[0]
-            for account_id in account_map
-        }
-        quality_reviews = {}
-        for position in positions:
-            replacement = _best_replacement_candidate(
-                conn, position["account_id"], day,
-                held_by_account.get(position["account_id"], set()),
-            )
-            review = _position_quality_score(
-                conn, position, quote_map.get(position["code"], {}), day,
-                cycle_id=cycle_id,
-                news=news, replacement=replacement, nav=pool_nav,
-                market=market_context,
-                flow_trajectory=flow_trajectory_map.get(position["code"]),
-            )
-            review["review_date"] = day
-            review["dynamic_position_limit"] = count_budget["limits"].get(position["account_id"], 5)
-            review["strategy_position_count"] = len(held_by_account.get(position["account_id"], set()))
-            review["at_dynamic_limit"] = (
-                review["strategy_position_count"] >= review["dynamic_position_limit"]
-            )
-            review["pool_position_limit"] = count_budget["pool_limit"]
-            review["rotations_today"] = int(rotations_today.get(position["account_id"], 0))
-            quality_reviews[(position["account_id"], position["code"])] = review
-        capacity_exit_reasons = _over_capacity_exit_candidates(
-            conn, positions, quality_reviews, account_map, day,
-        )
-        permission_exit_reasons = _permission_scope_exit_candidates(
-            conn, positions, quality_reviews, quote_map, day,
-        )
-        # Capacity compression and full-slot rotation must evaluate the weakest
-        # holdings first; database/lot insertion order must never decide which
-        # stock is sacrificed for a stronger candidate.
-        positions.sort(key=lambda item: (
-            0 if (item["account_id"], item["code"]) in permission_exit_reasons else 1,
-            0 if (item["account_id"], item["code"]) in capacity_exit_reasons else 1,
-            _num((quality_reviews.get((item["account_id"], item["code"])) or {}).get("score"), 100.0),
-        ))
-        concentration_sells_used = 0
-        permission_sells_used = 0
-        rotation_swaps_used_by_account = dict(rotations_today)
-        rotation_bought_codes = set()
-        rotation_results = []
-        orders = []
-        for position in positions:
-            _assert_active_lease(conn, "risk position")
-            quote = quote_map.get(position["code"], {})
-            quote_status = _execution_quote_status(quote, day, purpose="exit")
-            quality_review = quality_reviews.get((position["account_id"], position["code"])) or {}
-            if position["account_id"] == "trend_pullback":
-                previous_review = conn.execute(
-                    """SELECT action FROM paper_position_reviews
-                       WHERE cycle_id=? AND account_id=? AND code=? AND review_date < ?
-                       ORDER BY review_date DESC LIMIT 1""",
-                    (cycle_id, position["account_id"], position["code"], day.isoformat()),
-                ).fetchone()
-                quality_review["quality_exit_confirmed"] = bool(
-                    previous_review and previous_review["action"] in {
-                        "watch", "consolidation_exit", "capacity_exit"
-                    }
-                )
-            downside_guard = _intraday_downside_guard(
-                position, quote, market=market_context, news=news,
-                policy_override=_risk_profile(
-                    account_map.get(position["account_id"]) or {"id": position["account_id"]}
-                ),
-                flow_trajectory=flow_trajectory_map.get(position["code"]),
-                asof_day=day,
-            )
-            permission_reason = permission_exit_reasons.get((position["account_id"], position["code"]))
-            capacity_reason = capacity_exit_reasons.get((position["account_id"], position["code"]))
-            quality_review["rotations_today"] = int(
-                rotation_swaps_used_by_account.get(position["account_id"], 0)
-            )
-            if not quote_status["fresh"]:
-                pending_ratio, pending_reason, _, pending_detail = _sell_plan(
-                    position, quote, day, news
-                )
-                quality_action, quality_reason = PReview.decide_action(
-                    quality_review, position, quote_status, concentration_sells_used,
-                    policy=REVIEW_POLICY,
-                )
-                if permission_reason:
-                    quality_action = "permission_scope_exit_pending_quote"
-                    quality_reason = f"{permission_reason}；{quote_status['reason']}，等待可执行行情"
-                elif capacity_reason:
-                    quality_action = "capacity_exit_pending_quote"
-                    quality_reason = f"{capacity_reason}；{quote_status['reason']}，等待可执行行情"
-                if downside_guard.get("level") != "none" and not permission_reason and not capacity_reason:
-                    quality_action = "downside_pending_quote"
-                    quality_reason = f"下跌{downside_guard['level']}：{downside_guard['reason']}；{quote_status['reason']}"
-                _save_position_review(conn, cycle_id, quality_review, quality_action, quality_reason)
-                if pending_ratio > 0 or capacity_reason or permission_reason or downside_guard.get("level") != "none":
-                    detail = {
-                        **pending_detail,
-                        "quote_status": quote_status,
-                        "position_quality": quality_review,
-                        "downside_guard": downside_guard,
-                        "intended_sell_ratio": pending_ratio,
-                    }
-                    reason = quality_reason if (capacity_reason or permission_reason or downside_guard.get("level") != "none") else (
-                        f"{pending_reason}；{quote_status['reason']}，风险未解除"
-                    )
-                    _risk_log(
-                        conn,
-                        position["account_id"],
-                        position["code"],
-                        "sell",
-                        "exit_pending_data",
-                        reason,
-                        detail,
-                    )
-                    orders.append({
-                        "code": position["code"],
-                        "status": "exit_pending_data",
-                        "reason": reason,
-                    })
-                continue
-            price = _num(quote.get("price"), 0)
-            # 峰值同时吸收当日 high：两轮 3 分钟扫描之间的冲高若不记入
-            # peak，移动止损会系统性延迟触发（与日内下行守卫的口径一致）。
-            # 同日新仓例外：只用买入后的采样价（2026-08-31 P1），
-            # 避免买入前的高点立即制造虚假回撤预警。
-            scan_peak = (
-                price if PRD.bought_today(position, asof_day=day)
-                else max(price, _num(quote.get("high"), 0.0))
-            )
-            if scan_peak > _num(position.get("peak_price"), 0):
-                # R14：峰值写入 cycle-owned 风险状态，cycle 取与卖出路径同一个
-                # write-time provenance；绝不按 (account_id, code) 裸写无身份的
-                # paper_positions 投影。
-                PPRS.update_peak(
-                    conn, cycle_id=_order_cycle_id(conn, cycle_id),
-                    account_id=position["account_id"], code=position["code"],
-                    peak_price=scan_peak,
-                )
-                position["peak_price"] = scan_peak
-            downside_confirmed = _downside_confirmed(
-                conn, position["account_id"], position["code"], day, downside_guard,
-            )
-            downside_guard["confirmed"] = downside_confirmed
-            # P1 审计修复（2026-09-02）：主判定改用订单 payload 的稳定标记
-            # exit_marker='hard_stop_first_trim'（由 _sell_plan 写入）；中文
-            # reason LIKE 仅保留为当日旧订单（标记上线前写入）的同日兜底。
-            hard_stop_touched_today = bool(conn.execute(
-                """SELECT 1 FROM paper_orders
-                   WHERE account_id=? AND code=? AND side='sell' AND status='filled'
-                     AND """ + _execution_verified_predicate() + """
-                     AND substr(created_at,1,10)=?
-                       AND (
-                           json_extract(risk_payload,'$.exit_marker')='hard_stop_first_trim'
-                           OR reason LIKE '%硬止损首段减仓%'
-                       )
-                   LIMIT 1""",
-                (position["account_id"], position["code"], day.isoformat()),
-            ).fetchone())
-            ratio, reason, next_stage, detail = _sell_plan(
-                position, quote, day, news, hard_stop_touched_today=hard_stop_touched_today,
-                # PR-30：卖出状态机的止损/移动止损/时间止损用编译画像收紧后的生效参数。
-                spec_override=SRE.effective_spec(
-                    conn, position["account_id"],
-                    ACCOUNT_SPECS.get(position["account_id"]) or {},
-                ),
-            )
-            quality_action, quality_reason = PReview.decide_action(
-                quality_review, position, quote_status, concentration_sells_used,
-                policy=REVIEW_POLICY,
-            )
-            if permission_reason:
-                # Permissions exits have their own per-strategy daily quota.
-                # Do not let three ordinary capacity/quality rotations defer a
-                # position the account is no longer allowed to reinforce.
-                quality_action, quality_reason = "permission_scope_exit", permission_reason
-            elif capacity_reason and concentration_sells_used < POSITION_REVIEW_MAX_SELLS_PER_RUN:
-                quality_action, quality_reason = "capacity_exit", capacity_reason
-            concentration_triggered = quality_action in {
-                "consolidation_exit", "capacity_exit", "permission_scope_exit",
-            }
-            if concentration_triggered:
-                # A quality rotation is a full exit, even when the ordinary
-                # ladder would only take a partial profit.  Otherwise a
-                # low-quality one-lot can remain indefinitely after the first
-                # partial sell and defeat the purpose of concentration.
-                if quality_action == "permission_scope_exit":
-                    ratio = max(ratio, PERMISSION_SCOPE_EXIT_RATIO)
-                    detail["permission_scope_exit"] = {
-                        "tranche_ratio": PERMISSION_SCOPE_EXIT_RATIO,
-                        "daily_limit": PERMISSION_SCOPE_EXIT_MAX_PER_STRATEGY_DAY,
-                    }
-                    reason = (
-                        quality_reason if not reason else
-                        f"{quality_reason}；与常规风险卖出取较高比例"
-                    )
-                else:
-                    ratio = 1.0
-                    reason = quality_reason if ratio <= 0 or not reason else f"{quality_reason}；覆盖常规卖出比例"
-                    # 集中轮换是全退，覆盖 _sell_plan 可能带出的首段减仓标记，
-                    # 避免"硬止损首段减仓已发生"的状态被全退订单误报。
-                    detail["exit_marker"] = "concentration_exit"
-                detail["position_quality"] = quality_review
-                detail["concentration_review"] = True
-            elif ratio > 0:
-                quality_action = "risk_exit"
-                detail["position_quality"] = quality_review
-            detail["downside_guard"] = downside_guard
-            # 下面三处"当日是否已减仓过"的门禁都是**成交声称**：只有被证据证明
-            # 卖出的委托才算减过仓。没有验证列的旧行不得吃掉今天的第一次减仓，
-            # 否则一个"没发生过的卖出"会把真实需要减仓的持仓永久挡住。
-            # P1 审计修复（2026-09-02）：预警/守卫减仓的当日去重同样改用
-            # 结构化标记（见下方 guard_actionable 分支写入 detail["exit_marker"]），
-            # 中文 LIKE 仅作标记上线前旧订单的同日兜底。
-            warning_trimmed = bool(conn.execute(
-                """SELECT 1 FROM paper_orders
-                   WHERE account_id=? AND code=? AND side='sell' AND status='filled'
-                     AND """ + _execution_verified_predicate() + """
-                     AND substr(created_at,1,10)=?
-                       AND (
-                           json_extract(risk_payload,'$.exit_marker')='downside_warning_trim'
-                           OR reason LIKE '%下跌预警首段减仓%'
-                       )
-                   LIMIT 1""",
-                (position["account_id"], position["code"], day.isoformat()),
-            ).fetchone())
-            # P3 审计修复（P1）：partial/full 缺少一次性消费标记——确认后
-            # 每个扫描周期都重复减仓，弱势日 ~10 分钟内复利式清仓。按级别
-            # 去重：partial 已卖不重复 partial，但条件恶化仍可升级到 full。
-            guard_level = downside_guard.get("level")
-            guard_level_trimmed = bool(conn.execute(
-                """SELECT 1 FROM paper_orders
-                   WHERE account_id=? AND code=? AND side='sell' AND status='filled'
-                     AND """ + _execution_verified_predicate() + """
-                     AND substr(created_at,1,10)=?
-                       AND (
-                           json_extract(risk_payload,'$.exit_marker')=?
-                           OR reason LIKE ?
-                       )
-                   LIMIT 1""",
-                (position["account_id"], position["code"], day.isoformat(),
-                 f"downside_{guard_level}", f"%下跌{guard_level}已连续两次确认%"),
-            ).fetchone())
-            # 2026-09-03 二次确认减仓：warning 级首段减仓（一天一次）用完
-            # 之后，若连续两轮扫描（满足最小扫描间隔）均确认"疑似出货"，
-            # 允许追加一次 partial 比例的减仓——兑现"连续两次扫描确认后
-            # 才允许部分减仓"的审计口径；当日一次，条件恶化仍可升级 full。
-            warning_confirmed_trimmed = bool(conn.execute(
-                """SELECT 1 FROM paper_orders
-                   WHERE account_id=? AND code=? AND side='sell' AND status='filled'
-                     AND """ + _execution_verified_predicate() + """
-                     AND substr(created_at,1,10)=?
-                       AND (
-                           json_extract(risk_payload,'$.exit_marker')='downside_warning_confirmed'
-                           OR reason LIKE '%下跌预警连续两次确认减仓%'
-                       )
-                   LIMIT 1""",
-                (position["account_id"], position["code"], day.isoformat()),
-            ).fetchone())
-            warning_actionable = bool(
-                position["account_id"] in {"tq_breakout", NEW_STRATEGY_ID}
-                and downside_guard.get("level") == "warning"
-                and _num(downside_guard.get("sell_ratio")) > 0
-                and not warning_trimmed
-            )
-            warning_confirmed_trim = bool(
-                position["account_id"] in {"tq_breakout", NEW_STRATEGY_ID}
-                and downside_guard.get("level") == "warning"
-                and downside_confirmed
-                and ((downside_guard.get("main_force_intent") or {}).get("classification")
-                     == "distribution")
-                and warning_trimmed
-                and not warning_confirmed_trimmed
-            )
-            guard_actionable = (
-                (downside_guard.get("level") in {"partial", "full"} and downside_confirmed
-                 and not guard_level_trimmed)
-                or warning_actionable
-                or warning_confirmed_trim
-            )
-            guard_pending = downside_guard.get("level") in {"partial", "full"} and not downside_confirmed
-            if guard_actionable and not concentration_triggered:
-                if warning_confirmed_trim:
-                    # 追加减仓按 partial 比例执行（sell_ratio 在 warning 级
-                    # 只带首段比例，不能代表确认后的处置力度）。
-                    ratio = max(
-                        ratio,
-                        _num((downside_guard.get("policy") or {}).get("partial_ratio"),
-                             _num(downside_guard.get("sell_ratio"), 0.0)),
-                    )
-                else:
-                    ratio = max(ratio, _num(downside_guard.get("sell_ratio"), 0.0))
-                guard_level = downside_guard.get("level")
-                if warning_confirmed_trim:
-                    quality_action = "downside_warning_confirmed"
-                elif warning_actionable:
-                    quality_action = "downside_warning_trim"
-                else:
-                    quality_action = f"downside_{guard_level}"
-                # 当日去重的结构化消费标记（P1 审计修复 2026-09-02）：
-                # 卖出订单 payload 携带 exit_marker，次日/下一级别仍可升级。
-                detail["exit_marker"] = quality_action
-                mfi_label = ((downside_guard.get('main_force_intent') or {}).get('label') or '不确定')
-                if warning_confirmed_trim:
-                    quality_reason = (
-                        f"下跌预警连续两次确认减仓：本次处理可卖仓位的 {ratio*100:.0f}%；"
-                        f"{downside_guard.get('reason')}；主力意图 {mfi_label}"
-                    )
-                elif warning_actionable:
-                    quality_reason = (
-                        f"下跌预警首段减仓：本次处理可卖仓位的 {ratio*100:.0f}%；"
-                        f"{downside_guard.get('reason')}；主力意图 {mfi_label}"
-                    )
-                else:
-                    quality_reason = (
-                        f"下跌{guard_level}已连续两次确认：{downside_guard.get('reason')}；"
-                        f"主力意图 {mfi_label}"
-                    )
-                reason = f"{quality_reason}；覆盖常规卖出比例" if reason else quality_reason
-            elif guard_pending or downside_guard.get("level") == "warning":
-                if not concentration_triggered:
-                    quality_action = "downside_warning"
-                    quality_reason = (
-                        f"下跌预警待确认：{downside_guard.get('reason')}；"
-                        "连续两次扫描确认后才允许部分/全部减仓"
-                    )
-                if not concentration_triggered:
-                    _risk_log(
-                        conn,
-                        position["account_id"],
-                        position["code"],
-                        "sell",
-                        (
-                            f"downside_{downside_guard.get('level')}_pending"
-                            if guard_pending else "downside_warning"
-                        ),
-                        quality_reason,
-                        {"downside_guard": downside_guard, "quote_status": quote_status},
-                    )
-            _save_position_review(conn, cycle_id, quality_review, quality_action, quality_reason)
-            if ratio <= 0:
-                continue
-            detail["quote_status"] = quote_status
-            if quote_status.get("degraded"):
-                reason += "；主行情新鲜有效，备用行情未核验，按风控退出降级执行"
-            if int(position.get("available_qty") or 0) < LOT_SIZE:
-                pending_action = (
-                    "permission_scope_exit_t1_locked"
-                    if quality_action == "permission_scope_exit" else "held_t1"
-                )
-                _risk_log(conn, position["account_id"], position["code"], "sell", pending_action, "A股 T+1，暂不可卖", detail)
-                continue
-            sellable = int(position.get("available_qty") or 0)
-            if ratio >= 0.999:
-                planned_qty = sellable
-            else:
-                partial_qty = int(sellable * ratio / LOT_SIZE) * LOT_SIZE
-                # P3 审计修复（P2）：一手仓的部分比例取整后为 0，旧逻辑
-                # max(LOT_SIZE,…) 会把"预警轻减 25%"放大成整仓清仓。部分
-                # 退出一手仓时跳过本次分批（保留观察），不违背分级语义。
-                if partial_qty < LOT_SIZE:
-                    _risk_log(
-                        conn, position["account_id"], position["code"], "sell",
-                        "partial_skipped_min_lot",
-                        f"可卖 {sellable} 股不足按 {ratio*100:.0f}% 部分减仓的最低一手，"
-                        "保留观察不做整仓清仓",
-                        detail,
-                    )
-                    continue
-                planned_qty = partial_qty
-            planned_qty = min(planned_qty, sellable)
-            pct = _num(quote.get("pct"))
-            if price <= 0 or pct <= -_limit_pct(
-                position["code"], position.get("name"), position.get("risk_flag")
-            ) + 0.05:
-                # A quote that remains locked at the same limit price cannot
-                # produce a new paper fill every five-minute pass.  Keep one
-                # auditable attempt, then retry after a short cooldown or as
-                # soon as the quoted price changes (the lock may have opened).
-                retry_after = (dt.datetime.now() - dt.timedelta(
-                    minutes=POSITION_REVIEW_BLOCKED_RETRY_MINUTES
-                )).strftime("%Y-%m-%d %H:%M:%S")
-                recent_block = conn.execute(
-                    """SELECT id,planned_price FROM paper_orders
-                       WHERE account_id=? AND side='sell' AND code=?
-                         AND status='unfilled_limit_down' AND created_at>=?
-                       ORDER BY id DESC LIMIT 1""",
-                    (position["account_id"], position["code"], retry_after),
-                ).fetchone()
-                if recent_block and abs(_num(recent_block["planned_price"]) - price) < 0.001:
-                    orders.append({
-                        "code": position["code"],
-                        "status": "unfilled_limit_down_wait",
-                        "reason": f"同价跌停委托 {POSITION_REVIEW_BLOCKED_RETRY_MINUTES} 分钟冷却中，行情解锁或冷却结束后重试",
-                    })
-                    continue
-                status, order_reason = "unfilled_limit_down", (reason + "；跌停/无报价，不能虚构成交")
-                _assert_active_lease(conn, "risk unfilled-order write")
-                detail = _with_decision_snapshot(
-                    detail, account_id=position["account_id"], code=position["code"],
-                    side="sell", decision="unfilled", reason=order_reason,
-                    asof_date=day, quote=quote, news=news,
-                    kline=_completed_kline(position["code"], day, inclusive=False),
-                )
-                strategy_stamp = _strategy_stamp(conn, position["account_id"])
-                cursor = conn.execute(
-                    """INSERT INTO paper_orders(
-                           account_id,side,code,name,qty,planned_price,status,reason,
-                           risk_payload,created_at,strategy_id,strategy_version,strategy_checksum,cycle_id)
-                       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                    (position["account_id"], "sell", position["code"], position.get("name"),
-                     planned_qty, price or None, status, order_reason, _json(detail), _now(),
-                     *strategy_stamp, _order_cycle_id(conn, cycle_id)),
-                )
-                _risk_log(conn, position["account_id"], position["code"], "sell", "unfilled", order_reason, detail)
-                orders.append({"code": position["code"], "status": status, "reason": order_reason})
-                continue
-            qty = planned_qty
-            fill_price = price * (1 - SLIPPAGE)
-            amount = qty * fill_price
-            fees = _commission(amount) + amount * STAMP_SELL
-            detail["remaining_qty"] = max(0, int(_num(position.get("qty"))) - qty)
-            detail["position_closed"] = detail["remaining_qty"] < LOT_SIZE
-            if concentration_triggered and not detail["position_closed"]:
-                detail["capacity_state"] = "partial_due_t1"
-                reason += f"；仅卖出可卖底仓，仍有 {detail['remaining_qty']} 股受 T+1 约束，后续继续处理"
-            detail = _with_decision_snapshot(
-                detail, account_id=position["account_id"], code=position["code"], side="sell",
-                decision="filled", reason=reason, asof_date=day, quote=quote, news=news,
-                kline=_completed_kline(position["code"], day, inclusive=False),
-                final_score=quality_review.get("score"),
-            )
-            savepoint = f"risk_pos_{position['account_id']}_{position['code']}"
-            conn.execute(f"SAVEPOINT {savepoint}")
-            try:
-                _assert_active_lease(conn, "risk sell order")
-                sell_cycle_id = _order_cycle_id(conn, cycle_id)
-                strategy_stamp = _strategy_stamp(conn, position["account_id"])
-                cursor = conn.execute(
-                    """INSERT INTO paper_orders(
-                           account_id,side,code,name,qty,planned_price,status,reason,
-                           risk_payload,created_at,strategy_id,strategy_version,strategy_checksum,cycle_id)
-                       VALUES(?,?,?,?,?,?,'pending_execution',?,?,?,?,?,?,?)""",
-                    (position["account_id"], "sell", position["code"], position.get("name"),
-                     qty, price, reason, _json(detail), _now(),
-                     *strategy_stamp, sell_cycle_id),
-                )
-                order_id = int(cursor.lastrowid)
-                EP.commit_fill(
-                    conn,
-                    account=account_map.get(position["account_id"], {"id": position["account_id"]}),
-                    plan={
-                        "side": "sell", "code": position["code"],
-                        "name": position.get("name"), "qty": qty,
-                        "fill_price": fill_price, "amount": amount, "fees": fees,
-                        "quote_at": quote.get("quote_at") or _now(),
-                    },
-                    order_id=order_id,
-                    asof_day=day,
-                    side="sell",
-                    action="filled",
-                    audit_action="sell_filled",
-                    audit_message=f"{position['code']} {qty}股 @ {fill_price:.2f}",
-                    reason=reason,
-                    detail=detail,
-                    assumption="实时价 - 0.10% 滑点，含佣金及印花税",
-                    sell_next_take_stage=next_stage,
-                )
-                if detail.get("protective_exit") and ratio >= 0.999:
-                    policy = _recovery_policy(position["account_id"])
-                    _audit(conn, position["account_id"], "protective_exit_recovery_watch", _json({
-                        "status": "watching", "code": position["code"],
-                        "account_id": position["account_id"], "exit_class": detail.get("exit_class"),
-                        "exit_reason_code": detail.get("exit_reason_code"),
-                        "exit_price": fill_price, "exit_at": _now(),
-                        "min_reclaim_pct": policy["reclaim_pct"],
-                        "required_scans": policy["min_scans"],
-                        "cooldown_minutes": policy["cooldown_minutes"],
-                        "expires_on": (_date(day) + dt.timedelta(days=policy["max_days"])).isoformat(),
-                        "probe_ratio": 0.25,
-                        "volatility_shadow": detail.get("volatility_shadow"),
-                    }))
-                conn.execute(f"RELEASE SAVEPOINT {savepoint}")
-            except Exception as exc:
-                conn.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
-                conn.execute(f"RELEASE SAVEPOINT {savepoint}")
-                if _lease_lost(exc):
-                    raise
-                retry_reason = f"持仓卖出执行失败，可重试：{type(exc).__name__}: {exc}"
-                _risk_log(conn, position["account_id"], position["code"], "sell", "execution_retry", retry_reason, {"error": str(exc), "retryable": True})
-                orders.append({"code": position["code"], "status": "execution_retry", "reason": retry_reason})
-                continue
-            if concentration_triggered:
-                # Rebuild the position snapshot before sizing the replacement
-                # so the released value is visible to the shared-pool budget
-                # in this same risk pass.
-                _sync_positions(conn, asof_day=day)
-                if quality_action == "permission_scope_exit":
-                    permission_sells_used += 1
-                else:
-                    concentration_sells_used += 1
-                if quality_action == "consolidation_exit":
-                    rotation_swaps_used_by_account[position["account_id"]] = (
-                        int(rotation_swaps_used_by_account.get(position["account_id"], 0)) + 1
-                    )
-                # P3 审计修复（S2）：质量轮换独立事件——旧计数把 capacity/
-                # permission 退出也算进每日轮换额度，挤占真正的择强换仓。
-                if quality_action == "consolidation_exit":
-                    _audit(
-                        conn, position["account_id"], "quality_rotation",
-                        f"{position['code']} 择强换仓，质量评分 {quality_review.get('score', 0):.1f}",
-                    )
-                _audit(
-                    conn, position["account_id"], "concentration_rotation",
-                    f"{position['code']} 质量评分 {quality_review.get('score', 0):.1f}，释放额度等待高分候选 {((quality_review.get('replacement') or {}).get('code') or '下一轮选股')}",
-                )
-                if quality_action == "permission_scope_exit":
-                    _audit(
-                        conn, position["account_id"], "permission_scope_exit",
-                        f"{position['code']} {permission_reason}；本次卖出 {qty} 股，剩余 {detail['remaining_qty']} 股",
-                    )
-                # Reducing an over-cap strategy must lower its stock count.
-                # A score-based rotation may enter a stronger replacement;
-                # capacity compression deliberately releases cash instead.
-                replacement = (
-                    {} if quality_action in {"capacity_exit", "permission_scope_exit"} or not detail["position_closed"]
-                    else (quality_review.get("replacement") or {})
-                )
-                replacement_code = replacement.get("code")
-                if replacement_code and replacement_code not in rotation_bought_codes:
-                    # Replacement quotes were prefetched with the candidate
-                    # snapshot before this write transaction.  Never start
-                    # network or disk I/O after the risk ledger is locked.
-                    replacement_quote = quote_map.get(replacement_code) or {}
-                    replacement_news = [
-                        row for row in news if str(row.get("code") or "") == str(replacement_code)
-                    ]
-                    replacement_result = _rotation_buy_candidate(
-                        conn,
-                        account_map.get(position["account_id"], {"id": position["account_id"]}),
-                        replacement,
-                        replacement_quote,
-                        market_context,
-                        replacement_news,
-                        day,
-                        all_quotes=quote_map,
-                    )
-                    rotation_results.append(replacement_result)
-                    if replacement_result.get("filled"):
-                        rotation_bought_codes.add(replacement_code)
-                    detail["replacement_buy"] = replacement_result
-            orders.append({
-                "code": position["code"], "status": "filled", "qty": qty,
-                "reason": reason, "concentration_rotation": concentration_triggered,
-                "quality_score": quality_review.get("score"),
-                "position_closed": detail["position_closed"],
-                "remaining_qty": detail["remaining_qty"],
-                "replacement_buy": detail.get("replacement_buy"),
-            })
-        _sync_positions(conn, asof_day=day)
-        _record_nav(conn, day, quotes=quote_map)
-        risk_result = {
-            "slot": "risk", "date": day.isoformat(),
-            "orders": orders, "manual_orders": manual_orders,
-            "concentration": {
-                "reviewed": len(quality_reviews),
-                "rotated": concentration_sells_used,
-                "permission_scope_exits": permission_sells_used,
-                "replacements": rotation_results,
-                "max_per_run": POSITION_REVIEW_MAX_SELLS_PER_RUN,
-                "pool_market_value": round(pool_market_value, 2),
-                "pool_nav": round(pool_nav, 2),
-            },
-        }
-    # Pending/manual buys run only after all risk exits have committed.  A
-    # failed pending batch remains retryable and never hides a completed sell.
-    try:
-        manual_orders = process_pending_manual_orders(day)
-    except Exception as exc:
-        if _lease_lost(exc):
-            raise
-        manual_orders = [{"status": "pending_batch_retry", "reason": str(exc)}]
-        with _db(immediate=True, hot_path=True) as audit_conn:
-            _audit(audit_conn, None, "pending_manual_batch_retry", str(exc))
-    risk_result["manual_orders"] = manual_orders
-    return risk_result
 
 
 def monitor_risk(asof_date=None):

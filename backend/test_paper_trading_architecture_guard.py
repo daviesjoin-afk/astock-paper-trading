@@ -96,8 +96,8 @@ FORBIDDEN_PAPER_TRADING_DEFS = frozenset({
 #: ``paper_risk_scan_state.py`` 后基线持续向下 ratchet。以后只允许 same or
 #: lower：确有 facade wiring 要加，必须同时抽出别的函数保持不增长。
 #: 不要设计环境变量绕过 / ``skip if CI`` 之类的后门。
-PAPER_TRADING_LOC_BASELINE = 16045
-PAPER_TRADING_DEF_BASELINE = 282
+PAPER_TRADING_LOC_BASELINE = 14847
+PAPER_TRADING_DEF_BASELINE = 280
 
 #: Guard 4 —— 新模块允许出现的 import 根（stdlib）。
 ALLOWED_STDLIB_IMPORTS = frozenset({"__future__", "datetime", "typing", "sqlite3"})
@@ -144,7 +144,7 @@ FORBIDDEN_CLOCK_ATTRS = frozenset({"today", "now", "utcnow", "time", "time_ns", 
 
 #: Guard 5 —— 生产 SELL 路径 → (文件, 函数名)。
 PRODUCTION_SELL_PATHS = (
-    ("paper_trading.py", "_monitor_risk_impl"),
+    ("paper_risk_service.py", "run"),
     ("paper_trading.py", "_intraday_sell"),
     ("execution_planner.py", "commit_fill"),
 )
@@ -389,8 +389,8 @@ class RiskDecisionModuleIsDeterministic(unittest.TestCase):
                 )
 
     def test_guard6e_sell_plan_delegates_to_the_pure_engine(self):
-        raw = _source("paper_trading.py")
-        body = _function_source(ast.parse(raw), "_sell_plan", raw)
+        raw = _source("paper_risk_evidence.py")
+        body = _function_source(ast.parse(raw), "sell_plan", raw)
         self.assertIn(
             "PRD.evaluate_sell(", body,
             "_sell_plan 不再委托 paper_risk_decision.evaluate_sell —— "
@@ -556,8 +556,8 @@ class RiskScanStateIsACycleOwnedBoundary(unittest.TestCase):
 
     def test_guard7h_scan_snapshot_is_pinned_to_the_claimed_cycle(self):
         """风险扫描的持仓读取必须走显式周期，不能重新猜 active cycle。"""
-        raw = _source("paper_trading.py")
-        impl = _function_source(ast.parse(raw), "_monitor_risk_impl", raw)
+        raw = _source("paper_risk_service.py")
+        impl = _function_source(ast.parse(raw), "run", raw)
         self.assertIn(
             "PPRM.positions_for_cycle(", impl,
             "_monitor_risk_impl 不再用显式周期读持仓：一次从旧周期开始的扫描会"
@@ -640,9 +640,9 @@ class PositionReviewIsProvenanceBound(unittest.TestCase):
                           f"精确 id 之外的形状：{text}")
 
     def test_guard8e_position_quality_requires_explicit_cycle(self):
-        tree = ast.parse(_source("paper_trading.py"))
+        tree = ast.parse(_source("paper_risk_evidence.py"))
         for node in ast.walk(tree):
-            if not isinstance(node, ast.FunctionDef) or node.name != "_position_quality_score":
+            if not isinstance(node, ast.FunctionDef) or node.name != "position_quality_score":
                 continue
             kwonly = [arg.arg for arg in node.args.kwonlyargs]
             self.assertIn("cycle_id", kwonly,
@@ -654,8 +654,8 @@ class PositionReviewIsProvenanceBound(unittest.TestCase):
         self.fail("paper_trading.py 里找不到 _position_quality_score")
 
     def test_guard8f_position_quality_uses_the_resolver(self):
-        raw = _source("paper_trading.py")
-        body = _function_source(ast.parse(raw), "_position_quality_score", raw)
+        raw = _source("paper_risk_evidence.py")
+        body = _function_source(ast.parse(raw), "position_quality_score", raw)
         self.assertIn("PREV.resolve_entry_signal(", body,
                       "_position_quality_score 不再经 episode provenance 解析入场模型分")
         self.assertNotIn("ORDER BY signal_date DESC", body,
@@ -672,8 +672,8 @@ class PositionReviewIsProvenanceBound(unittest.TestCase):
         self.assertEqual(hits, [], f"latest-signal 排序回流到 paper_trading：{hits}")
 
     def test_guard8h_save_position_review_has_no_wall_clock_fallback(self):
-        raw = _source("paper_trading.py")
-        body = _function_source(ast.parse(raw), "_save_position_review", raw)
+        raw = _source("paper_risk_evidence.py")
+        body = _function_source(ast.parse(raw), "save_position_review", raw)
         # 只查**代码**：注释里会引用旧实现作为历史说明，不应误报。
         code = "\n".join(
             line for line in body.splitlines() if not line.strip().startswith("#")
@@ -773,8 +773,8 @@ class ReplacementIsAsOfAndCycleBound(unittest.TestCase):
         注意：``intended_date>=`` / ``intended_date<=`` 在仓库别处有**无关**的正当
         用途（例如结算/归档窗口），因此这里只钉 replacement 候选这条读取路径。
         """
-        raw = _source("paper_trading.py")
-        body = _function_source(ast.parse(raw), "_best_replacement_candidate", raw)
+        raw = _source("paper_risk_evidence.py")
+        body = _function_source(ast.parse(raw), "best_replacement_candidate", raw)
         for shape in FORBIDDEN_REPLACEMENT_SHAPES:
             self.assertNotIn(shape, body,
                              f"_best_replacement_candidate 又出现 {shape!r}："
@@ -792,8 +792,8 @@ class ReplacementIsAsOfAndCycleBound(unittest.TestCase):
         self.assertEqual(hits, [], f"latest-signal 排序回流到 paper_trading：{hits}")
 
     def test_guard9l_candidate_selection_uses_the_evidence_layer_and_pure_module(self):
-        raw = _source("paper_trading.py")
-        body = _function_source(ast.parse(raw), "_best_replacement_candidate", raw)
+        raw = _source("paper_risk_evidence.py")
+        body = _function_source(ast.parse(raw), "best_replacement_candidate", raw)
         self.assertIn("PREPL.load_replacement_candidates(", body,
                       "候选读取没有经过 as-of 有界的 evidence 层")
         self.assertIn("PRep.choose_best_candidate(", body,
@@ -1352,8 +1352,8 @@ class SellFillCommitConvergenceIsBounded(unittest.TestCase):
         body = _function_source(ast.parse(raw), name, raw)
         return "".join(body.split())
 
-    def _assert_app_sell_delegates(self, function):
-        body = self._flat(function)
+    def _assert_app_sell_delegates(self, function, filename="paper_trading.py"):
+        body = self._flat(function, filename)
         for shape, label in (
             ("INSERTINTOpaper_fills", "成交流水写入"),
             ("EV.stamp_order(", "执行验证盖章"),
@@ -1373,7 +1373,7 @@ class SellFillCommitConvergenceIsBounded(unittest.TestCase):
         )
 
     def test_guard11a_risk_sell_delegates_to_commit_fill(self):
-        self._assert_app_sell_delegates("_monitor_risk_impl")
+        self._assert_app_sell_delegates("run", "paper_risk_service.py")
 
     def test_guard11b_intraday_sell_delegates_to_commit_fill(self):
         self._assert_app_sell_delegates("_intraday_sell")
@@ -1439,6 +1439,211 @@ class SellFillCommitConvergenceIsBounded(unittest.TestCase):
             "_active_cycle(", body,
             "commit_fill 重新解析 active cycle 决定成交归属",
         )
+
+
+
+class RiskApplicationServiceBoundary(unittest.TestCase):
+    """Guard 12 —— one claimed risk run is owned by the application service."""
+
+    SERVICE = "paper_risk_service.py"
+    EVIDENCE = "paper_risk_evidence.py"
+
+    def test_guard12a_no_reverse_dependency(self):
+        for filename in (self.SERVICE, self.EVIDENCE):
+            roots = _imported_roots(_tree(filename))
+            self.assertNotIn("paper_trading", roots,
+                             f"{filename} reverse-imports paper_trading")
+
+    def test_guard12b_paper_trading_facade_is_thin(self):
+        raw = _source("paper_trading.py")
+        body = _function_source(ast.parse(raw), "_monitor_risk_impl", raw)
+        self.assertLessEqual(
+            len(body.splitlines()), 40,
+            "_monitor_risk_impl 不再是 thin compatibility adapter",
+        )
+        self.assertIn("PRSVC.run(", body,
+                      "_monitor_risk_impl 不再委托 paper_risk_service.run")
+        self.assertNotIn("for position in positions", body,
+                         "_monitor_risk_impl 又长出 risk loop")
+
+    def test_guard12c_explicit_context_and_no_active_cycle_resolution(self):
+        raw = _source(self.SERVICE)
+        run_body = _function_source(ast.parse(raw), "run", raw)
+        flat = "".join(run_body.split())
+        self.assertIn("run(context:RiskRunContext,*,ports:RiskServicePorts)", flat,
+                      "paper_risk_service.run 没有显式接收 RiskRunContext")
+        self.assertNotIn("_active_cycle(", flat,
+                         "risk run 重新解析 active cycle")
+        self.assertNotIn("date.today", flat,
+                         "risk run 重新读取机器日期作为决策身份")
+        self.assertNotIn("datetime.now().date", flat,
+                         "risk run 从机器时钟推导决策日期")
+        self.assertIn("class RiskRunContext", raw)
+        self.assertIn("cycle_id: int", raw)
+        self.assertIn("asof_day: dt.date", raw)
+        self.assertIn("requires explicit cycle_id", raw)
+        self.assertIn("requires explicit asof_day", raw)
+
+    def test_guard12d_bounded_capital_context(self):
+        service = "".join(_source(self.SERVICE).split())
+        self.assertIn(
+            "ports.dynamic_position_limits(conn,cycle_id=cycle_id,asof_day=day,)",
+            service,
+            "risk service dynamic limits 没有绑定 cycle/as-of",
+        )
+        self.assertIn("policy_override=ports.risk_profile(", service)
+        self.assertIn("asof_day=day,conn=conn,cycle_id=cycle_id,", service,
+                      "risk service downside profile 没有绑定 cycle/as-of/conn")
+        self.assertIn(
+            "SRE.effective_spec_for_cycle(conn,position[\"account_id\"],base_spec,cycle_id=cycle_id,)",
+            service,
+            "risk service SELL spec 没有使用 cycle-pinned effective spec",
+        )
+        self.assertNotIn("SRE.effective_spec(conn", service,
+                         "risk service 仍直接使用 current-head effective spec")
+        self.assertNotIn("ports.dynamic_position_limits(conn)", service,
+                         "risk service dynamic limits 又省略 cycle/as-of")
+        self.assertNotIn(
+            "ports.risk_profile(account_map.get(position[\"account_id\"])or{\"id\":position[\"account_id\"]},)",
+            service,
+        )
+
+    def test_guard12e_sell_authority_stays_in_execution_planner(self):
+        service = "".join(_source(self.SERVICE).split())
+        for shape, label in (
+            ("INSERTINTOpaper_fills", "成交流水写入"),
+            ("EV.stamp_order(", "执行验证盖章"),
+            ("_credit_shared_cash(", "现金入账"),
+            ("_consume_available_lots(", "lot 消耗"),
+            ("PPRS.finalize_sell(", "episode 收尾"),
+        ):
+            with self.subTest(shape=label):
+                self.assertNotIn(shape, service,
+                                 f"risk service 直接执行{label}")
+        self.assertIn("EP.commit_fill(", service,
+                      "risk service 不再经过 execution_planner.commit_fill")
+
+    def test_guard12f_pure_domain_direction(self):
+        forbidden = {
+            "paper_trading", "paper_risk_service", "sqlite3",
+            "requests", "urllib", "httpx", "aiohttp", "socket",
+            "data_fetcher", "alt_data",
+        }
+        for module in (
+            "paper_risk_decision.py",
+            "paper_position_review.py",
+            "paper_replacement_decision.py",
+        ):
+            roots = _imported_roots(_tree(module))
+            leaked = sorted(roots & forbidden)
+            self.assertEqual(
+                leaked, [],
+                f"{module} reverse-imports {leaked}; pure decision modules stay pure",
+            )
+
+    def test_guard12h_user_spec_is_cycle_pinned(self):
+        raw = _source(self.SERVICE)
+        body = _function_source(ast.parse(raw), "_spec_for", raw)
+        self.assertIn(
+            "SRT.get_context_for_cycle(", body,
+            "paper_risk_service._spec_for 仍读取 current strategy head",
+        )
+        self.assertNotIn(
+            "SRT.get_context(", body,
+            "paper_risk_service._spec_for 回退到 current head context",
+        )
+        service = "".join(raw.split())
+        self.assertEqual(
+            service.count("_spec_for(position[\"account_id\"],conn,cycle_id=cycle_id)"),
+            2,
+            "risk service 的 stale/fresh SELL 路径没有全部把 explicit cycle 传给 _spec_for",
+        )
+        context = _function_source(ast.parse(_source("strategy_runtime.py")), "get_context_for_cycle", _source("strategy_runtime.py"))
+        self.assertIn("SR.cycle_version_for_account(", context)
+        self.assertNotIn("SR.get_version(", context)
+        self.assertNotIn("stamp_for_account(", context)
+
+    def test_guard12i_risk_stamps_use_strict_cycle_resolver(self):
+        raw = _source(self.SERVICE)
+        body = _function_source(ast.parse(raw), "_strategy_stamp", raw)
+        self.assertIn("SR.cycle_stamp_for_account(", body)
+        self.assertNotIn("SR.stamp_for_account(", body)
+        service = "".join(raw.split())
+        self.assertIn("_strategy_stamp(conn,account_id,cycle_id=cycle_id)", service)
+        self.assertEqual(
+            service.count("_strategy_stamp(conn,position[\"account_id\"],cycle_id=cycle_id)"),
+            2,
+            "unfilled / pending_execution SELL 没有全部把 explicit cycle 传给 stamp resolver",
+        )
+
+    def test_guard12j_commit_fill_inherits_durable_order_stamp(self):
+        raw = _source("execution_planner.py")
+        commit = _function_source(ast.parse(raw), "commit_fill", raw)
+        self.assertIn("order_strategy_stamp = _assert_order_identity(", commit)
+        self.assertIn("PT._risk_log(", commit)
+        self.assertIn("PT._audit(", commit)
+        self.assertGreaterEqual(commit.count("strategy_stamp=order_strategy_stamp"), 2)
+        identity = _function_source(ast.parse(raw), "_assert_order_identity", raw)
+        self.assertIn("strategy_id, strategy_version, strategy_checksum", identity)
+        self.assertIn("partial strategy stamp", identity)
+        for forbidden in ("SR.stamp_for_account(", "SR.get_version(", "SRT.get_context("):
+            self.assertNotIn(
+                forbidden, commit,
+                f"commit_fill 重新解析 strategy provenance：{forbidden}",
+            )
+
+    def test_guard12k_unknown_stamp_exception_is_table_aware(self):
+        raw = _source("paper_schema_migrations.py")
+        start = raw.index("STRATEGY_STAMP_UNKNOWN_ALLOWANCE = {")
+        end = raw.index("\n}\n", start)
+        allowance = raw[start:end]
+        self.assertIn('"paper_orders"', allowance)
+        self.assertIn('"paper_risk_decisions"', allowance)
+        self.assertIn('"paper_audit"', allowance)
+        self.assertNotIn('"paper_signals"', allowance)
+        self.assertIn("NEW.side='sell'", allowance)
+        self.assertIn("NEW.cycle_id IS NOT NULL", allowance)
+        self.assertIn("pending_execution", allowance)
+        self.assertIn("sell_filled", allowance)
+        self.assertIn("protective_exit_recovery_watch", allowance)
+        self.assertIn("quality_rotation", allowance)
+        self.assertIn("concentration_rotation", allowance)
+        self.assertIn("permission_scope_exit", allowance)
+        # Behavioral allow/reject coverage lives in
+        # test_strategy_versioning.DbStrat* / test_db_strat_*.
+
+    def test_guard12l_post_fill_sell_audits_inherit_existing_stamp(self):
+        raw = _source(self.SERVICE)
+        start = raw.rindex("            if concentration_triggered:")
+        end = raw.index("            orders.append({", start)
+        post_fill = raw[start:end]
+        self.assertEqual(
+            post_fill.count("_audit("), 3,
+            "post-fill rotation/capacity audit calls changed unexpectedly",
+        )
+        for event in (
+            "quality_rotation",
+            "concentration_rotation",
+            "permission_scope_exit",
+        ):
+            self.assertIn(f'"{event}"', post_fill)
+        self.assertEqual(
+            post_fill.count("strategy_stamp=strategy_stamp"), 3,
+            "post-fill audit does not inherit the durable SELL strategy stamp",
+        )
+        for forbidden in (
+            "SR.stamp_for_account(", "SR.cycle_stamp_for_account(",
+            "SRT.get_context(", "SRT.get_context_for_cycle(",
+        ):
+            self.assertNotIn(
+                forbidden, post_fill,
+                f"post-fill SELL audit re-resolves strategy provenance: {forbidden}",
+            )
+
+    def test_guard12g_service_is_not_a_monolith(self):
+        loc = len(_source(self.SERVICE).splitlines())
+        self.assertLess(loc, 900, f"paper_risk_service.py grew to {loc} LOC")
+
 
 
 def _function_node(tree, name):

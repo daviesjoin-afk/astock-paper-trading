@@ -100,13 +100,19 @@ def clear_cache() -> None:
     _CACHE.clear()
 
 
-def get_context(conn: sqlite3.Connection, strategy_id: str, *, settings_rev: str | None = None) -> StrategyRuntimeContext:
-    spec = SR.get(strategy_id, conn=conn)
-    if spec is None:
-        raise ValueError("unknown strategy id")
-    version = SR.get_version(strategy_id, conn=conn)
-    if version is None:
-        raise ValueError("strategy has no immutable version")
+def _build_context(
+    conn: sqlite3.Connection,
+    spec,
+    version,
+    *,
+    settings_rev: str | None = None,
+) -> StrategyRuntimeContext:
+    """Build one context from an explicitly supplied immutable version.
+
+    Version-derived facts always come from ``version``.  Lifecycle permission
+    is intentionally read from the current ``spec`` status, matching the
+    existing live/runtime contract.
+    """
     revision = settings_rev if settings_rev is not None else settings_revision(conn)
     status = str(getattr(spec, "status", "") or "").strip().lower()
     # PR-26 评审 P1：生命周期阶段参与缓存键，状态迁移（active→paused 等）立即生效。
@@ -146,6 +152,46 @@ def get_context(conn: sqlite3.Connection, strategy_id: str, *, settings_rev: str
     )
     _CACHE[key] = context
     return context
+
+
+def get_context(conn: sqlite3.Connection, strategy_id: str, *, settings_rev: str | None = None) -> StrategyRuntimeContext:
+    spec = SR.get(strategy_id, conn=conn)
+    if spec is None:
+        raise ValueError("unknown strategy id")
+    version = SR.get_version(strategy_id, conn=conn)
+    if version is None:
+        raise ValueError("strategy has no immutable version")
+    return _build_context(conn, spec, version, settings_rev=settings_rev)
+
+
+def get_context_for_cycle(
+    conn: sqlite3.Connection,
+    strategy_id: str,
+    *,
+    cycle_id: int,
+    settings_rev: str | None = None,
+) -> StrategyRuntimeContext:
+    """Build a context from the exact immutable version pinned to one cycle.
+
+    Explicit-cycle callers must not fall back to the current head, legacy
+    bindings, or ``paper_accounts.cycle_id``.  A missing pin is an explicit
+    ValueError; lifecycle permission still comes from the current spec.
+    """
+    if cycle_id is None:
+        raise ValueError("get_context_for_cycle requires explicit cycle_id")
+    spec = SR.get(strategy_id, conn=conn)
+    if spec is None:
+        raise ValueError("unknown strategy id")
+    try:
+        cycle = int(cycle_id)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"get_context_for_cycle cycle_id is invalid: {cycle_id!r}") from exc
+    version = SR.cycle_version_for_account(conn, strategy_id, cycle_id=cycle)
+    if version is None:
+        raise ValueError(
+            f"strategy version not pinned for cycle {cycle}: {strategy_id}"
+        )
+    return _build_context(conn, spec, version, settings_rev=settings_rev)
 
 
 def _number(value, default=None):

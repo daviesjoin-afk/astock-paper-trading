@@ -101,6 +101,35 @@ class StrategyRuntimeTests(unittest.TestCase):
         self.assertEqual(context.lifecycle_stage, "shadow")
         self.assertEqual(context.capital_scale, 0.0)
 
+
+    def test_get_context_for_cycle_is_strictly_pinned_and_does_not_follow_head(self):
+        """EC-15 follow-up: explicit cycle context never follows current head."""
+        registry.bind_cycle_versions(self.conn, 77, ["runtime_breakout"])
+        pinned = runtime.get_context_for_cycle(
+            self.conn, "runtime_breakout", cycle_id=77, settings_rev="1",
+        )
+        registry.save_definition(self.conn, "runtime_breakout", {"dsl_ast": {
+            "op": "gt", "left": {"op": "field", "name": "volume"},
+            "right": {"op": "const", "value": 100},
+        }})
+        runtime.clear_cache()
+        current = runtime.get_context(self.conn, "runtime_breakout", settings_rev="1")
+        replay = runtime.get_context_for_cycle(
+            self.conn, "runtime_breakout", cycle_id=77, settings_rev="1",
+        )
+        self.assertEqual(pinned.version, 1)
+        self.assertEqual(current.version, 2)
+        self.assertEqual(replay.version, 1)
+        self.assertNotEqual(pinned.checksum, current.checksum)
+        self.assertEqual(replay.checksum, pinned.checksum)
+        self.assertEqual(replay.definition, pinned.definition)
+        self.assertEqual(replay.compiled_dsl, pinned.compiled_dsl)
+        self.assertEqual(replay.risk_fingerprint, pinned.risk_fingerprint)
+        with self.assertRaises(ValueError):
+            runtime.get_context_for_cycle(
+                self.conn, "runtime_breakout", cycle_id=999, settings_rev="1",
+            )
+
     def test_dsl_version_change_produces_new_context_contract(self):
         before = runtime.get_context(self.conn, "runtime_breakout", settings_rev="1")
         registry.save_definition(self.conn, "runtime_breakout", {"dsl_ast": {

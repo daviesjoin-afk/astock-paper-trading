@@ -35,6 +35,16 @@ def _ensure_strategy_versioning(conn):
     return paper_schema.ensure_strategy_reference_columns(conn)
 
 
+def _tighten_strategy_reference_unknown_guards(conn):
+    """v22: refresh the strategy-stamp insert trigger to its narrow scope.
+
+    This is a guard-contract refresh only: columns are ensured, the trigger is
+    dropped/recreated with table-aware unknown exceptions, and no historical
+    evidence row is updated or backfilled.
+    """
+    return paper_schema.ensure_strategy_reference_columns(conn)
+
+
 def _backfill_execution_verification(conn):
     """按**证据**回填执行验证结论（v11 建列之后的第二步，幂等）。
 
@@ -273,6 +283,11 @@ MIGRATIONS = {
         # "不知道"洗白成"知道"。历史归属未知就留在旧 audit 里。
         (21, "新增周期归属的风险扫描运行状态表（幂等，不回填）",
          _ensure_risk_scan_run_state),
+        # 策略版本戳 unknown 例外收紧：只允许保护性 SELL 因果链上的
+        # all-NULL provenance；signals / BUY / 普通 audit 继续被拒绝。
+        # 仅刷新 guard，不回填任何历史 evidence。
+        (22, "收紧策略版本戳 unknown 例外，仅允许保护性 SELL（幂等、不回填）",
+         _tighten_strategy_reference_unknown_guards),
     ],
     "adaptive_learning": [
         (1, "创建 schema_version 表", """

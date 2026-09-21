@@ -24,8 +24,13 @@ def rows(conn, sql, params=()):
     return [dict(row) for row in conn.execute(sql, params).fetchall()]
 
 
-def audit(conn, account_id, event, detail, created_at):
-    """写入一条结构化审计事件。"""
+def audit(conn, account_id, event, detail, created_at, *, strategy_stamp=None):
+    """写入一条结构化审计事件。
+
+    ``strategy_stamp=None`` keeps legacy/live resolution.  An explicit tuple -
+    including ``(None, None, None)`` - is passed through unchanged so a
+    committed order's durable provenance can be inherited by its audit row.
+    """
     columns = {
         str(row[1]) for row in conn.execute("PRAGMA table_info(paper_audit)").fetchall()
     }
@@ -39,9 +44,12 @@ def audit(conn, account_id, event, detail, created_at):
             (account_id, event, detail, created_at),
         )
         return
-    strategy_id, strategy_version, strategy_checksum = SR.stamp_for_account(
-        conn, account_id,
-    )
+    if strategy_stamp is None:
+        strategy_id, strategy_version, strategy_checksum = SR.stamp_for_account(
+            conn, account_id,
+        )
+    else:
+        strategy_id, strategy_version, strategy_checksum = strategy_stamp
     conn.execute(
         """INSERT INTO paper_audit(
                account_id,event,detail,created_at,

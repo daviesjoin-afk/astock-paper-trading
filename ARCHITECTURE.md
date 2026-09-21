@@ -493,6 +493,36 @@ v2 的证据表：`learning_prediction_evidence`（预测证据，含 `model_ver
 - **Evaluation manifests are content-addressed and reproducible.** 同一数据集 + 同一预测证据 + 同一评分参数 + 同一模型溯源 ⇒ 同一个 SHA-256；`created_at` 不属于内容指纹，重复评估走 `INSERT OR IGNORE`。指纹显式包含 `prediction_digest`（所判证据的内容摘要）、`model_provenance`（产物与训练边界）、`coverage` 与 `holdout`（尾部稳健性 + **canonical test / tail 审计身份**）五组材料：rank IC 对分数做单调变换不变，若不含证据摘要，两个不同的预测集会共用一个审计记录；若不含溯源，两个不同的产物会共用一个结论；若不含尾部审计身份，"某个最近日期由 valid 变 undefined"这种科学事实变化就无法体现在指纹里。manifest 同时落库这些字段（含 `provenance_fingerprint`、`coverage_ratio`、`holdout_date_count`、`canonical_test_date_count`、`undefined_ic_dates` 等），其中 `undefined_ic_dates` / `holdout_undefined_dates` 以**具体日期数组**落库，便于人工审计直接点名。
 - **Scientific readiness grants zero execution authority.** `neural_shadow` 落到 `approved_bounded_shadow` 必须**同时**满足 `dataset_contract_ok AND evaluation_contract_ok AND human_approved`；数据集就绪但样本外证据未达标时停在新增状态 `approval_waiting_evaluation`（缺数据则仍是 `approval_waiting_data`）。任何状态下 `mode` 始终 `shadow_only`、`trading_impact` 与 `execution_authority` 始终 `none`，硬门禁不变。
 
+## 风险应用服务边界（R21）
+
+```text
+API / Scheduler
+      ↓
+paper_trading facade
+      ↓
+paper_risk_service
+      ↓
+evidence/read models
+      ↓
+pure decisions
+      ↓
+execution_planner
+```
+
+职责边界：
+
+- `paper_trading` owns public compatibility entrypoints.
+- `paper_risk_service` owns one risk-run application workflow.
+- `pure domain modules` own decisions.
+- `execution_planner` owns fill commits.
+- `A claimed risk cycle never re-resolves "current cycle".`
+
+`paper_trading._monitor_risk_impl` 只保留 thin compatibility adapter：解析显式
+`cycle_id` / `asof_day` 后调用 `paper_risk_service.run(context, ports=...)`。
+durable scan claim、running/completed/failed 生命周期仍由 `paper_trading.monitor_risk`
+公共 facade 持有；`paper_risk_service` 不 import `paper_trading`，只依赖只读
+evidence / read model、纯决策模块、`execution_planner` 和明确注入的基础设施 ports。
+
 ## 目标依赖方向
 
 ```text

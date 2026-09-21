@@ -126,7 +126,8 @@ class _FakeConn:
         self.queries = []
         self.order_row = order_row
         self.fill_rows = list(fill_rows)
-        #: ``(account_id, code, side)``；缺省从 ``order_row`` 推导，保持身份自洽。
+        #: ``(account_id, code, side[, strategy_id, strategy_version, strategy_checksum])``；
+        #: 缺省从 ``order_row`` 推导，保持身份与 durable provenance 自洽。
         self.identity = identity
         #: 缺省与 ``ORDER_CYCLE`` 一致 —— 即「账本仍在订单所属周期」，让原本
         #: 合法的成交用例继续走通；需要构造漂移的用例显式传别的值。
@@ -135,12 +136,18 @@ class _FakeConn:
 
     def _identity_row(self):
         if self.identity is not None:
-            return self.identity
+            identity = tuple(self.identity)
+            if len(identity) == 3:
+                return identity + (None, None, None)
+            return identity
         row = self.order_row
         if not row:
-            return ("tq_breakout", "002241", "buy")
+            return ("tq_breakout", "002241", "buy", None, None, None)
         get = row.get if isinstance(row, dict) else (lambda k, d=None: d)
-        return (get("account_id"), get("code"), get("side"))
+        return (
+            get("account_id"), get("code"), get("side"),
+            get("strategy_id"), get("strategy_version"), get("strategy_checksum"),
+        )
 
     def execute(self, sql, params=()):
         self.queries.append((sql, tuple(params)))
@@ -149,7 +156,7 @@ class _FakeConn:
         text = " ".join(str(sql).split()).lower()
         if text.startswith("select * from paper_fills"):
             return _FakeResult(rows=self.fill_rows)
-        if text.startswith("select account_id, code, side from paper_orders"):
+        if text.startswith("select account_id, code, side"):
             return _FakeResult(row=self._identity_row())
         if text.startswith("select * from paper_orders where id"):
             return _FakeResult(row=self.order_row)
