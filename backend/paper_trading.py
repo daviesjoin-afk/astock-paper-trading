@@ -3044,11 +3044,11 @@ def _shared_account_exposure(conn, quotes, asof_day=None, *, cycle_id=None):
         positions = _position_rows(conn, asof_day=asof_day)
         cash = _shared_cash(conn)
     else:
-        positions = PPRM.positions_for_cycle(conn, cycle_id, asof_day=asof_day)
         if asof_day is None:
-            cash = _shared_cash(conn, cycle_id)
+            positions = PPRM.positions_for_cycle(conn, cycle_id, asof_day=asof_day); cash = _shared_cash(conn, cycle_id)
         else:
-            context = PPort.PortfolioReadContext(cycle_id, asof_day); cash = PPort.cash(conn, context)[0]
+            context = PPort.PortfolioReadContext(cycle_id, asof_day); positions = PPort.positions_for_context(conn, context)
+            cash = PPort.cash(conn, context)[0]
             cash = PPort.compatibility_cash(conn, context) if cash is None else cash
     value, industries, codes = PPort.exposure(positions, quotes, num=_num)
     return positions, value, (cash + value) if cash is not None else None, industries, codes

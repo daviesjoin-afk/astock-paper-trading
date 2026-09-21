@@ -204,6 +204,30 @@ def _all_filled_sell_orders(conn, context: PortfolioReadContext, account_id: str
     return rows, True
 
 
+def _all_filled_buy_orders(conn, context: PortfolioReadContext,
+                           account_id: str | None = None):
+    if not _has_columns(conn, "paper_orders", _ORDER_COLUMNS):
+        return [], False
+    params: list[Any] = [context.cycle_id, context.asof_day.isoformat()]
+    account_sql = ""
+    if account_id:
+        account_sql = " AND account_id=?"
+        params.append(str(account_id))
+    rows = _row_dicts(conn.execute(
+        "SELECT id,account_id,code,status,cycle_id,execution_status,"
+        "       execution_verified,realized_pnl,executed_at,created_at"
+        "  FROM paper_orders"
+        " WHERE cycle_id=? AND side='buy' AND status='filled'"
+        "   AND COALESCE(executed_at,created_at) IS NOT NULL"
+        "   AND length(COALESCE(executed_at,created_at))>=10"
+        "   AND substr(COALESCE(executed_at,created_at),1,10)<=?"
+        + account_sql +
+        " ORDER BY id",
+        tuple(params),
+    ))
+    return rows, True
+
+
 def _buy_fills(conn, context: PortfolioReadContext, account_id: str | None = None):
     if not (
         _has_columns(conn, "paper_fills", _FILL_COLUMNS)
@@ -405,17 +429,27 @@ def verified_cash_flows(conn, context: PortfolioReadContext, *,
     return {key: value for key, value in flows.items() if key not in incomplete}
 
 
-def positions_for_context(conn, context: PortfolioReadContext, *,
-                           account_id: str | None = None) -> list[dict]:
-    """Aggregate bounded durable lots into the compatibility position shape."""
-    lots, _quantity_status = bounded_lots_with_status(
+def positions_for_context_with_status(
+    conn, context: PortfolioReadContext, *, account_id: str | None = None
+) -> tuple[list[dict], str]:
+    """Aggregate bounded lots and retain the quantity-proof status."""
+    lots, quantity_status = bounded_lots_with_status(
         conn, context, account_id=account_id
     )
     open_lots = [row for row in lots if int(row.get("remaining_qty") or 0) > 0]
     flows = verified_cash_flows(conn, context, account_id=account_id)
-    return PP.aggregate_positions(
+    positions = PP.aggregate_positions(
         open_lots, (), flows, context.asof_day.isoformat(), num=_num
     )
+    return positions, quantity_status
+
+
+def positions_for_context(conn, context: PortfolioReadContext, *,
+                           account_id: str | None = None) -> list[dict]:
+    """Aggregate bounded durable lots into the compatibility position shape."""
+    return positions_for_context_with_status(
+        conn, context, account_id=account_id,
+    )[0]
 
 
 def realized_pnl(conn, context: PortfolioReadContext, *,
@@ -476,6 +510,16 @@ def _cycle_initial(conn, context: PortfolioReadContext, account_id: str | None =
 def _cash_flow_total(conn, context: PortfolioReadContext, account_id: str | None = None):
     buys, buy_rows, buy_proof = _buy_fills(conn, context, account_id)
     sells, _sell_rows, sell_proof = _sell_fills(conn, context, account_id)
+    buy_orders, buy_orders_proof = _all_filled_buy_orders(conn, context, account_id)
+    if buy_orders_proof:
+        verified_buy_order_ids = {
+            int(row["order_id"]) for row in buys if row.get("order_id") is not None
+        }
+        for order in buy_orders:
+            if not EV.is_verified_row(order):
+                return None, STATUS_UNKNOWN
+            if int(order["id"]) not in verified_buy_order_ids:
+                return None, STATUS_UNKNOWN
     if not buy_proof or not sell_proof:
         any_fill = _has_any_fill_rows(conn, context, account_id)
         if any_fill is True:
@@ -590,7 +634,9 @@ def portfolio_for_context(
     ``market_value`` / ``unrealized_pnl`` / ``nav`` are ``None`` when explicit
     valuation evidence is missing.  They are never filled from a current quote.
     """
-    positions = positions_for_context(conn, context, account_id=account_id)
+    positions, quantity_status = positions_for_context_with_status(
+        conn, context, account_id=account_id,
+    )
     realized, realized_status = realized_pnl(conn, context, account_id=account_id)
     cash_value, cash_status = cash(conn, context, account_id=account_id)
     missing_codes = []
@@ -606,7 +652,7 @@ def portfolio_for_context(
         cost = _num(position.get("cost"), 0.0) or 0.0
         market_value += qty * price
         unrealized += qty * (price - cost)
-    if missing_codes:
+    if missing_codes or quantity_status != STATUS_VERIFIED:
         market_value = None
         unrealized = None
         market_status = STATUS_UNKNOWN
@@ -630,6 +676,7 @@ def portfolio_for_context(
             "account_id": str(account_id) if account_id else None,
         },
         "positions": positions,
+        "quantity_status": quantity_status,
         "realized_pnl": realized,
         "realized_pnl_status": realized_status,
         "cash": cash_value,

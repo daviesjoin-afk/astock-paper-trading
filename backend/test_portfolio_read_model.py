@@ -154,6 +154,27 @@ class PortfolioReadModelContractTests(unittest.TestCase):
         self.assertEqual(before["qty"], 100)
         self.assertEqual(after["qty"], before["qty"])
 
+    def test_port4b_explicit_exposure_uses_bounded_positions(self):
+        self._lot(self.cycle100, 100, 10.0, acquired_at=f"{NEXT.isoformat()} 10:00:00")
+        self.conn.commit()
+        positions, _value, _nav, _industries, _codes = PT._shared_account_exposure(
+            self.conn, {CODE: {"price": 10.0}}, DAY, cycle_id=self.cycle100,
+        )
+        self.assertEqual(positions, [])
+
+    def test_port4c_unknown_quantity_keeps_valuation_unknown(self):
+        buy = self._order_and_fill(cycle_id=self.cycle100, side="buy", qty=100,
+                                   price=10.0, fill_date=DAY.isoformat())
+        self._lot(self.cycle100, 100, 10.0, source_order_id=buy)
+        self._order_and_fill(cycle_id=self.cycle100, side="sell", qty=50,
+                             price=12.0, fill_date=DAY.isoformat(), verified=False)
+        self.conn.commit()
+        result = self._portfolio(self.cycle100, valuations={CODE: 10.0})
+        self.assertEqual(result["quantity_status"], "unknown")
+        self.assertIsNone(result["market_value"])
+        self.assertIsNone(result["unrealized_pnl"])
+        self.assertIsNone(result["nav"])
+
     def test_port5_pending_and_unverified_orders_are_excluded(self):
         stamp = PT._strategy_stamp(self.conn, ACCOUNT)
         self.conn.execute(
@@ -208,6 +229,21 @@ class PortfolioReadModelContractTests(unittest.TestCase):
         self.assertEqual(P.verified_cash_flows(self.conn, context), {})
         rows = P.positions_for_context(self.conn, context)
         self.assertEqual(rows[0]["display_cost"], 15.0)
+
+    def test_port11a_filled_buy_without_fill_evidence_keeps_cash_unknown(self):
+        stamp = PT._strategy_stamp(self.conn, ACCOUNT)
+        self.conn.execute(
+            "INSERT INTO paper_orders(account_id,side,code,qty,status,risk_payload,created_at,"
+            "executed_at,order_type,origin,strategy_id,strategy_version,strategy_checksum,cycle_id) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (ACCOUNT, "buy", CODE, 100, "filled", "{}", f"{DAY.isoformat()} 09:30:00",
+             f"{DAY.isoformat()} 09:30:01", "market", "seed", *stamp, self.cycle100),
+        )
+        self.conn.commit()
+        self.assertEqual(
+            P.cash(self.conn, P.PortfolioReadContext(self.cycle100, DAY)),
+            (None, "unknown"),
+        )
 
     def test_port11b_legacy_cash_fallback_accounts_for_recorded_fills(self):
         buy = self._order_and_fill(cycle_id=self.cycle100, side="buy", qty=100,
