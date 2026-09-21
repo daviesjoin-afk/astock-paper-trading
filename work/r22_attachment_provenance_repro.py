@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""R23 before-fix 复现：account attachment provenance 必须 fail closed。
+"""R22 attachment-provenance before-fix 复现：account attachment 必须 fail closed。
 
 规格（PR #180 最后一轮人工审核 P1）：
 
@@ -12,16 +12,22 @@
 
 用法::
 
-    python work/r23_before_fix_repro.py [--source <module path>]
+    python work/r22_attachment_provenance_repro.py [--rev <rev>]
 
-不传 ``--source`` 时用仓库中的当前版本；传 ``HEAD:...`` 形式不可用时
-用 ``--head`` 从 git HEAD 取未修复版本。
+- 不带 ``--rev``：检查**工作区**当前版本（应当已修复）。
+  预期 NOT REPRODUCED；若变成 REPRODUCED 说明修复被回退，退出码 1。
+- 带 ``--rev``：从该 revision 取出 ``backend/paper_portfolio_read_model.py``
+  作为 **before-fix 基线**（应指向修复提交的父提交，默认 ``HEAD^``）。
+  预期 REPRODUCED；若该 rev 其实已含修复，退出码 1 并给出明确提示。
+
+本脚本是自校验的：它不假设你给的 revision 一定未修复，而是直接检查源码里
+是否还存在那条 fail-open 的 fallback，指错版本会明确报错，而不是静默给出
+一个「两边一致」的无意义结论。
 """
 from __future__ import annotations
 
 import datetime as dt
 import importlib.util
-import os
 import sqlite3
 import subprocess
 import sys
@@ -32,8 +38,12 @@ ROOT = Path(__file__).resolve().parents[1]
 BACKEND = ROOT / "backend"
 sys.path.insert(0, str(BACKEND))
 
-ACCOUNT = "r23-acct"          # 独立于既有夹具，避免依赖生产常量
+ACCOUNT = "r22-acct"          # 独立于既有夹具，避免依赖生产常量
 DAY = dt.date(2026, 9, 20)
+MODULE_REL = "backend/paper_portfolio_read_model.py"
+
+#: 修复前的 fail-open fallback：把 cycle creation 当作 account attachment 证据。
+PREFIX_MARKER = "return _cycle_created_by(conn, context, account_id=account_id)"
 
 
 def _load_module(path: Path, name: str):
@@ -72,7 +82,7 @@ def build_fixture(conn: sqlite3.Connection) -> tuple[int, str]:
     cycle_id = int(conn.execute(
         "INSERT INTO paper_cycles(id,cycle_key,status,capital,created_at,updated_at)"
         " VALUES(?,?,?,?,?,?)",
-        (7, "r23-cycle", "running", 100000.0,
+        (7, "r22-cycle", "running", 100000.0,
          f"{DAY.isoformat()} 09:00:00", f"{DAY.isoformat()} 09:00:00"),
     ).lastrowid)
     conn.execute("INSERT INTO paper_accounts VALUES(?,?,?)",
@@ -89,22 +99,42 @@ def probe(module, conn: sqlite3.Connection) -> dict:
     return {"attached": attached, "initial": initial, "cash": cash}
 
 
+def _resolve_rev(rev: str) -> Path:
+    raw = subprocess.run(
+        ["git", "show", f"{rev}:{MODULE_REL}"],
+        cwd=str(ROOT), capture_output=True, check=True,
+    ).stdout
+    tmp = Path(tempfile.mkdtemp(prefix="r22_rev_")) / "paper_portfolio_read_model.py"
+    tmp.write_bytes(raw.replace(b"\r\n", b"\n"))
+    return tmp
+
+
 def main() -> int:
     argv = sys.argv[1:]
-    use_head = "--head" in argv
-    if use_head:
-        raw = subprocess.run(
-            ["git", "show", "HEAD:backend/paper_portfolio_read_model.py"],
-            cwd=str(ROOT), capture_output=True, check=True,
-        ).stdout
-        tmp = Path(tempfile.mkdtemp(prefix="r23_head_")) / "paper_portfolio_read_model.py"
-        tmp.write_bytes(raw.replace(b"\r\n", b"\n"))
-        module = _load_module(tmp, "r23_head_module")
-        label = "HEAD (unfixed)"
+    rev = argv[argv.index("--rev") + 1] if "--rev" in argv else None
+
+    if rev is None:
+        source = BACKEND / "paper_portfolio_read_model.py"
+        module = _load_module(source, "r22_current_module")
+        label = "worktree (expected: fixed)"
+        expect_reproduced = False
     else:
-        module = _load_module(
-            BACKEND / "paper_portfolio_read_model.py", "r23_current_module")
-        label = "worktree (fixed)"
+        source = _resolve_rev(rev)
+        module = _load_module(source, "r22_rev_module")
+        label = f"{rev} (expected: pre-fix)"
+        expect_reproduced = True
+
+    # 自校验：先确认这个来源确实是/不是 before-fix 代码，再下结论。
+    text = source.read_text(encoding="utf-8")
+    if PREFIX_MARKER in text and not expect_reproduced:
+        print(f"source: {label}")
+        print("  !! 工作区仍存在 fail-open fallback，修复被回退", file=sys.stderr)
+        return 1
+    if PREFIX_MARKER not in text and expect_reproduced:
+        print(f"source: {label}")
+        print(f"  !! {rev} 已包含修复，不能作为 before-fix 基线；"
+              "请指向修复提交的父提交（如 HEAD^）", file=sys.stderr)
+        return 1
 
     conn = sqlite3.connect(":memory:")
     conn.row_factory = sqlite3.Row
@@ -117,12 +147,18 @@ def main() -> int:
     print(f"  _cycle_initial(account)   = {result['initial']}")
     print(f"  cash(account)             = {result['cash']}")
 
-    verified = result["cash"] != (None, "unknown") or result["initial"] is not None
-    if verified:
+    published = result["cash"] != (None, "unknown") or result["initial"] is not None
+    if published:
         print("  verdict: REPRODUCED (account capital published without attachment proof)")
-        return 0
-    print("  verdict: NOT REPRODUCED (account capital stays unknown)")
-    return 1 if not use_head else 0
+    else:
+        print("  verdict: NOT REPRODUCED (account capital stays unknown)")
+
+    if published != expect_reproduced:
+        want = "REPRODUCED" if expect_reproduced else "NOT REPRODUCED"
+        print(f"  !! 预期 {want}，实得相反 → 退出码 1", file=sys.stderr)
+        return 1
+    print("  assertion: as expected")
+    return 0
 
 
 if __name__ == "__main__":

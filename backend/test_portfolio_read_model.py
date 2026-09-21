@@ -365,7 +365,7 @@ class PortfolioReadModelContractTests(unittest.TestCase):
                 "INSERT INTO paper_cycles VALUES(?,?)",
                 (self.cycle100, f"{DAY.isoformat()} 09:00:00"),
             )
-            # R23：账户级 initial capital 现在必须有真实的 bounded attachment
+            # R22：账户级 initial capital 现在必须有真实的 bounded attachment
             # 证据，不能再靠 cycle creation 推断。这里给出匹配且 <= asof 的
             # attachment 行，让非空前提仍然成立。
             conn.execute(
@@ -882,7 +882,7 @@ class PortfolioReadModelContractTests(unittest.TestCase):
         self.conn.execute(
             "INSERT INTO paper_parameter_versions(cycle_id,account_id,version,style,"
             "params,reason,effective_date,created_at) VALUES(?,?,?,?,?,?,?,?)",
-            (self.cycle100, ACCOUNT, "v1.0", "trend", "{}", "r23-test",
+            (self.cycle100, ACCOUNT, "v1.0", "trend", "{}", "r22-test",
              DAY.isoformat(), f"{DAY.isoformat()} 08:00:00"),
         )
         self.conn.commit()
@@ -895,7 +895,7 @@ class PortfolioReadModelContractTests(unittest.TestCase):
         self.conn.execute(
             "INSERT INTO paper_parameter_versions(cycle_id,account_id,version,style,"
             "params,reason,effective_date,created_at) VALUES(?,?,?,?,?,?,?,?)",
-            (self.cycle100, ACCOUNT, "v2.0", "trend", "{}", "r23-test",
+            (self.cycle100, ACCOUNT, "v2.0", "trend", "{}", "r22-test",
              NEXT.isoformat(), f"{NEXT.isoformat()} 09:00:00"),
         )
         self.conn.commit()
@@ -1028,11 +1028,11 @@ class PortfolioReadModelContractTests(unittest.TestCase):
         self.assertEqual(status, "unknown")
     def test_port11c_account_initial_capital_is_cycle_scoped(self):
         # 必须给出**可证明的 attachment 证据**，否则账户级读取会先被
-        # attachment gate 拦下（R23 起），本测试就观测不到 cycle_id 作用域检查。
+        # attachment gate 拦下（R22 起），本测试就观测不到 cycle_id 作用域检查。
         self.conn.execute(
             "INSERT INTO paper_parameter_versions(cycle_id,account_id,version,style,"
             "params,reason,effective_date,created_at) VALUES(?,?,?,?,?,?,?,?)",
-            (self.cycle100, ACCOUNT, "v1.0", "trend", "{}", "r23-test",
+            (self.cycle100, ACCOUNT, "v1.0", "trend", "{}", "r22-test",
              DAY.isoformat(), f"{DAY.isoformat()} 08:00:00"),
         )
         self.conn.commit()
