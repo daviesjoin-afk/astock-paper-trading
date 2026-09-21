@@ -387,6 +387,51 @@ class PortfolioReadModelContractTests(unittest.TestCase):
         rows = P.positions_for_context(self.conn, context)
         self.assertEqual(rows[0]["display_cost"], 15.0)
 
+    def test_port13b_one_order_with_a_mismatched_fill_blocks_its_key(self):
+        # 同一订单上一条合法 fill + 一条错配 fill：order 不得因为"存在合法行"
+        # 而被认为已覆盖，否则真实 account/code 会留下半份现金流投影。
+        order = self._order_and_fill(
+            cycle_id=self.cycle100, side="buy", qty=100, price=10.0,
+            fill_date=DAY.isoformat(), fees=0.0,
+        )
+        self.conn.execute(
+            "UPDATE paper_orders SET qty=100 WHERE id=?", (order,)
+        )
+        self.conn.execute(
+            "INSERT INTO paper_fills(order_id,account_id,side,code,qty,price,amount,fees,"
+            "fill_date,quote_at,assumption) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+            (order, ACCOUNT, "buy", "000001", 50, 10.0, 500.0, 0.0,
+             DAY.isoformat(), f"{DAY.isoformat()} 09:31:00", "r22-test"),
+        )
+        self._lot(self.cycle100, 100, 10.0, source_order_id=order)
+        self.conn.commit()
+        context = P.PortfolioReadContext(self.cycle100, DAY)
+        self.assertEqual(P.verified_cash_flows(self.conn, context), {})
+        self.assertEqual(
+            P.positions_for_context(self.conn, context)[0]["display_cost"], 10.0
+        )
+
+    def test_port4r_partial_sell_keeps_mixed_uncertain_key_unknown(self):
+        # 同一 account/code 下：source-less lot（acquired_at 更早）+ 已证 lot。
+        # 部分卖出会先吃掉 source-less 行，但 FIFO 无法证明究竟卖的是哪一条；
+        # 只要该 key 仍有持仓，quantity 必须保持 unknown。
+        self._lot(self.cycle100, 100, 10.0,
+                  acquired_at=f"{DAY.isoformat()} 09:00:00")
+        buy = self._order_and_fill(
+            cycle_id=self.cycle100, side="buy", qty=100, price=10.0,
+            fill_date=DAY.isoformat(), fees=0.0,
+        )
+        self._lot(self.cycle100, 100, 10.0,
+                  acquired_at=f"{DAY.isoformat()} 11:00:00", source_order_id=buy)
+        self._order_and_fill(
+            cycle_id=self.cycle100, side="sell", qty=100, price=11.0,
+            fill_date=DAY.isoformat(), fees=0.0,
+        )
+        self.conn.commit()
+        context = P.PortfolioReadContext(self.cycle100, DAY)
+        _lots, status = P.bounded_lots_with_status(self.conn, context)
+        self.assertEqual(status, "unknown")
+
     def test_port13a_identity_mismatch_blocks_real_order_cash_flow(self):
         first = self._order_and_fill(
             cycle_id=self.cycle100, side="buy", qty=100, price=10.0,

@@ -62,10 +62,10 @@ After-fix probe summary: `0/8 reproduced`; C1/C2/C3/C6 now use the explicit boun
 
 ## Tests
 
-- targeted portfolio read model: `61/61 PASS`
+- targeted portfolio read model: `63/63 PASS`
 - architecture guard: `94/94 PASS`
 - risk / authoritative-position / sell-convergence suites: `114/114 PASS`
-- full backend: `3908 tests OK (skipped=5)`
+- full backend: `3910 tests OK (skipped=5)`
 - frontend build: `PASS` (2 pre-existing duplicate-key warnings in `frontend/src/core/format.js`, not introduced by R22)
 - frontend unit: `111/111 PASS`
 - dist drift: `PASS`
@@ -74,7 +74,7 @@ After-fix probe summary: `0/8 reproduced`; C1/C2/C3/C6 now use the explicit boun
 
 ## Mutation
 
-- `M-PORT1`..`M-PORT54`: `54/54 RED`
+- `M-PORT1`..`M-PORT56`: `56/56 RED`
 - survived: `0`
 - restore sha256: `PASS`
 
@@ -122,7 +122,9 @@ After-fix probe summary: `0/8 reproduced`; C1/C2/C3/C6 now use the explicit boun
 - P2 non-finite fees coerced to zero: `_ledger_num` now distinguishes "absent" (may take the default — an absent fee really is zero) from "present but non-finite" (stays unknown). Previously `fees=inf` was silently converted to `0.0` and published as verified cash.
 - P2 non-finite sell quantity: a non-finite SELL fill quantity is rejected before FIFO conversion, so it can no longer raise `OverflowError: cannot convert float infinity to integer` out of portfolio reads and the risk scan.
 - P2 non-finite source-backed lot cost: a lot whose cost is non-finite is rejected alongside its quantity, so a verified source order can no longer let `cost=inf` reach aggregation and publish infinite unrealized PnL / exposure.
-- each review fix has a permanent regression and a dedicated mutation (`M-PORT13`..`M-PORT54`).
+- P1 mixed uncertain lots after a partial sell: uncertainty is only resolved when the whole account/code position is closed. A source-less lot and a verified lot can share the key, and a partial SELL may consume the source-less row first purely because its untrusted `acquired_at` sorts earlier — FIFO cannot prove which lot was actually sold, so the remainder's quantity, cost and entry date stay unknown.
+- P2 partial order coverage: an order now counts as covered only when **every** selected fill is identity-consistent and verified. Previously one valid fill alongside a mismatched one let `verified_cash_flows()` publish a partial projection (e.g. half the cost) for the order's real account/code.
+- each review fix has a permanent regression and a dedicated mutation (`M-PORT13`..`M-PORT56`).
 
 ## Security
 

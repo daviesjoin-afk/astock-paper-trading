@@ -632,9 +632,22 @@ def bounded_lots_with_status(conn, context: PortfolioReadContext, *,
     sells, _rows, proof_available = _sell_fills(conn, context, account_id)
     unproven = _unproven_sell_exists(conn, context, account_id)
     rebuilt, fully_consumed = _consume_fifo(bounded, sells)
+    # Uncertainty is only resolved by a **fully closed** account/code position.
+    # A source-less lot and a verified lot can share the key; a partial SELL may
+    # consume the source-less row first purely because its untrusted
+    # ``acquired_at`` sorts earlier, so FIFO cannot prove which lot was actually
+    # sold.  As long as anything remains open under that key, the missing
+    # acquisition evidence still makes the remainder — and its cost and entry
+    # date — unprovable.
+    open_by_key: dict[tuple[str, str], int] = {}
+    for row in rebuilt:
+        key = (str(row.get("account_id") or ""), str(row.get("code") or ""))
+        open_by_key[key] = open_by_key.get(key, 0) + int(row.get("remaining_qty") or 0)
     unresolved_uncertain = unresolved_uncertain or any(
         int(row.get("id") or 0) in uncertain_lot_ids
-        and int(row.get("remaining_qty") or 0) > 0
+        and open_by_key.get(
+            (str(row.get("account_id") or ""), str(row.get("code") or "")), 0
+        ) > 0
         for row in rebuilt
     )
     status = STATUS_UNKNOWN if (
@@ -667,20 +680,24 @@ def verified_cash_flows(conn, context: PortfolioReadContext, *,
             if not _identity_ok(row) or not EV.is_verified_row(row):
                 incomplete.add(key)
     # A filled order with no verified fill row is not evidence of zero cash;
-    # it blocks the per-symbol projection for that key.
-    for orders, verified_rows in (
+    # it blocks the per-symbol projection for that key.  An order only counts as
+    # covered when **every** fill selected for it is identity-consistent and
+    # verified: one valid fill alongside a mismatched one would otherwise leave
+    # a partial projection on the order's real account/code.
+    for orders, all_rows in (
         (_all_filled_buy_orders(conn, context, account_id)[0], all_buys),
         (_all_filled_sell_orders(conn, context, account_id)[0], all_sells),
     ):
-        verified_ids = {
-            int(row["order_id"]) for row in verified_rows
-            if row.get("order_id") is not None
-            and _identity_ok(row)
-            and EV.is_verified_row(row)
-        }
+        rows_by_order: dict[int, list[dict]] = {}
+        for row in all_rows:
+            if row.get("order_id") is not None:
+                rows_by_order.setdefault(int(row["order_id"]), []).append(row)
         for order in orders:
             key = (str(order.get("account_id") or ""), str(order.get("code") or ""))
-            if not EV.is_verified_row(order) or int(order["id"]) not in verified_ids:
+            rows = rows_by_order.get(int(order["id"]), [])
+            if not EV.is_verified_row(order) or not rows or any(
+                not _identity_ok(row) or not EV.is_verified_row(row) for row in rows
+            ):
                 incomplete.add(key)
     for side, rows in (("buy", buys), ("sell", sells)):
         for row in rows:

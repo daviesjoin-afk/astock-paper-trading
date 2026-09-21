@@ -115,8 +115,8 @@ MUTATIONS = [
     },
     {
         "id": "M-PORT14", "file": READ_MODEL,
-        "old": '''    for rows in (all_buys, all_sells):\n        for row in rows:\n            key = (str(row.get("fill_account_id") or ""), str(row.get("fill_code") or ""))\n            if not _identity_ok(row) or not EV.is_verified_row(row):\n                incomplete.add(key)\n    # A filled order with no verified fill row is not evidence of zero cash;\n    # it blocks the per-symbol projection for that key.\n    for orders, verified_rows in (\n        (_all_filled_buy_orders(conn, context, account_id)[0], all_buys),\n        (_all_filled_sell_orders(conn, context, account_id)[0], all_sells),\n    ):\n''',
-        "new": '''    for rows in (all_sells,):\n        for row in rows:\n            key = (str(row.get("fill_account_id") or ""), str(row.get("fill_code") or ""))\n            if not _identity_ok(row) or not EV.is_verified_row(row):\n                incomplete.add(key)\n    for orders, verified_rows in (\n        (_all_filled_sell_orders(conn, context, account_id)[0], all_sells),\n    ):\n''',
+        "old": '''    for rows in (all_buys, all_sells):\n        for row in rows:\n            key = (str(row.get("fill_account_id") or ""), str(row.get("fill_code") or ""))\n            if not _identity_ok(row) or not EV.is_verified_row(row):\n                incomplete.add(key)\n    # A filled order with no verified fill row is not evidence of zero cash;\n    # it blocks the per-symbol projection for that key.  An order only counts as\n    # covered when **every** fill selected for it is identity-consistent and\n    # verified: one valid fill alongside a mismatched one would otherwise leave\n    # a partial projection on the order's real account/code.\n    for orders, all_rows in (\n        (_all_filled_buy_orders(conn, context, account_id)[0], all_buys),\n        (_all_filled_sell_orders(conn, context, account_id)[0], all_sells),\n    ):\n''',
+        "new": '''    for rows in (all_sells,):\n        for row in rows:\n            key = (str(row.get("fill_account_id") or ""), str(row.get("fill_code") or ""))\n            if not _identity_ok(row) or not EV.is_verified_row(row):\n                incomplete.add(key)\n    for orders, all_rows in (\n        (_all_filled_sell_orders(conn, context, account_id)[0], all_sells),\n    ):\n''',
         "test": f"{TEST}.test_port3b_unverified_buy_blocks_display_cash_flow",
         "desc": "ignore unverified BUY rows in display cash flow",
     },
@@ -164,8 +164,8 @@ MUTATIONS = [
     },
     {
         "id": "M-PORT21", "file": READ_MODEL,
-        "old": "    for orders, verified_rows in (\n",
-        "new": "    for orders, verified_rows in ():\n",
+        "old": "    for orders, all_rows in (\n",
+        "new": "    for orders, all_rows in ():\n",
         "test": f"{TEST}.test_port3c_buy_order_without_fill_blocks_display_cash_flow",
         "desc": "ignore filled orders with no fill evidence in display flow",
     },
@@ -239,7 +239,9 @@ MUTATIONS = [
         "id": "M-PORT29", "file": READ_MODEL,
         "old": '''    unresolved_uncertain = unresolved_uncertain or any(
         int(row.get("id") or 0) in uncertain_lot_ids
-        and int(row.get("remaining_qty") or 0) > 0
+        and open_by_key.get(
+            (str(row.get("account_id") or ""), str(row.get("code") or "")), 0
+        ) > 0
         for row in rebuilt
     )
 ''',
@@ -305,16 +307,13 @@ MUTATIONS = [
     },
     {
         "id": "M-PORT35", "file": READ_MODEL,
-        "old": '''        verified_ids = {
-            int(row["order_id"]) for row in verified_rows
-            if row.get("order_id") is not None
-            and _identity_ok(row)
-            and EV.is_verified_row(row)
-        }
+        "old": '''            if not EV.is_verified_row(order) or not rows or any(
+                not _identity_ok(row) or not EV.is_verified_row(row) for row in rows
+            ):
 ''',
-        "new": '''        verified_ids = {
-            int(row["order_id"]) for row in verified_rows if row.get("order_id") is not None
-        }
+        "new": '''            if not EV.is_verified_row(order) or not rows or any(
+                not EV.is_verified_row(row) for row in rows
+            ):
 ''',
         "test": f"{TEST}.test_port13a_identity_mismatch_blocks_real_order_cash_flow",
         "desc": "cover a mismatched fill order with an unrelated verified fill",
@@ -538,6 +537,46 @@ MUTATIONS = [
 ''',
         "test": f"{TEST}.test_port9g_non_finite_lot_cost_with_source_stays_unknown",
         "desc": "let a non-finite source-backed lot cost reach aggregation",
+    },
+    {
+        "id": "M-PORT55", "file": READ_MODEL,
+        "old": '''    open_by_key: dict[tuple[str, str], int] = {}
+    for row in rebuilt:
+        key = (str(row.get("account_id") or ""), str(row.get("code") or ""))
+        open_by_key[key] = open_by_key.get(key, 0) + int(row.get("remaining_qty") or 0)
+    unresolved_uncertain = unresolved_uncertain or any(
+        int(row.get("id") or 0) in uncertain_lot_ids
+        and open_by_key.get(
+            (str(row.get("account_id") or ""), str(row.get("code") or "")), 0
+        ) > 0
+        for row in rebuilt
+    )
+''',
+        "new": '''    unresolved_uncertain = unresolved_uncertain or any(
+        int(row.get("id") or 0) in uncertain_lot_ids
+        and int(row.get("remaining_qty") or 0) > 0
+        for row in rebuilt
+    )
+''',
+        "test": f"{TEST}.test_port4r_partial_sell_keeps_mixed_uncertain_key_unknown",
+        "desc": "clear mixed-key uncertainty after a partial sell",
+    },
+    {
+        "id": "M-PORT56", "file": READ_MODEL,
+        "old": '''            rows = rows_by_order.get(int(order["id"]), [])
+            if not EV.is_verified_row(order) or not rows or any(
+                not _identity_ok(row) or not EV.is_verified_row(row) for row in rows
+            ):
+                incomplete.add(key)
+''',
+        "new": '''            rows = rows_by_order.get(int(order["id"]), [])
+            if not EV.is_verified_row(order) or not any(
+                _identity_ok(row) and EV.is_verified_row(row) for row in rows
+            ):
+                incomplete.add(key)
+''',
+        "test": f"{TEST}.test_port13b_one_order_with_a_mismatched_fill_blocks_its_key",
+        "desc": "cover an order as soon as any one of its fills is valid",
     },
 ]
 
