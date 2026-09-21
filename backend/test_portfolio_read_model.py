@@ -82,14 +82,14 @@ class PortfolioReadModelContractTests(unittest.TestCase):
         return order_id
 
     def _lot(self, cycle_id, qty, cost, *, acquired_at=None, remaining_qty=None,
-             source_order_id=None):
+             source_order_id=None, account_id=ACCOUNT):
         acquired_at = acquired_at or f"{DAY.isoformat()} 10:00:00"
         remaining_qty = qty if remaining_qty is None else remaining_qty
         return int(self.conn.execute(
             "INSERT INTO paper_position_lots(cycle_id,account_id,code,name,industry,qty,"
             "remaining_qty,cost,acquired_at,available_date,asset_type,source_order_id,"
             "cost_fee_included,is_t_base) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            (cycle_id, ACCOUNT, CODE, "测试股", "测试", qty, remaining_qty, cost,
+            (cycle_id, account_id, CODE, "测试股", "测试", qty, remaining_qty, cost,
              acquired_at, NEXT.isoformat(), "stock_t1", source_order_id, 1, 1),
         ).lastrowid)
 
@@ -354,6 +354,27 @@ class PortfolioReadModelContractTests(unittest.TestCase):
         rows = P.positions_for_context(self.conn, context)
         self.assertEqual(rows[0]["display_cost"], 15.0)
 
+    def test_port13a_identity_mismatch_blocks_real_order_cash_flow(self):
+        first = self._order_and_fill(
+            cycle_id=self.cycle100, side="buy", qty=100, price=10.0,
+            fill_date=DAY.isoformat(), fees=0.0,
+        )
+        second = self._order_and_fill(
+            cycle_id=self.cycle100, side="buy", qty=100, price=10.0,
+            fill_date=DAY.isoformat(), fees=0.0,
+        )
+        self._lot(self.cycle100, 100, 10.0, source_order_id=first)
+        self._lot(self.cycle100, 100, 10.0, source_order_id=second)
+        self.conn.execute(
+            "UPDATE paper_fills SET code='000001' WHERE order_id=?", (second,)
+        )
+        self.conn.commit()
+        context = P.PortfolioReadContext(self.cycle100, DAY)
+        self.assertEqual(P.verified_cash_flows(self.conn, context), {})
+        self.assertEqual(
+            P.positions_for_context(self.conn, context)[0]["display_cost"], 10.0
+        )
+
     def test_port3b_unverified_buy_blocks_display_cash_flow(self):
         first = self._order_and_fill(cycle_id=self.cycle100, side="buy", qty=100,
                                      price=10.0, fill_date=DAY.isoformat(), fees=0.0)
@@ -473,6 +494,20 @@ class PortfolioReadModelContractTests(unittest.TestCase):
         result = self._portfolio(self.cycle100, before, valuations={CODE: 10.0})
         self.assertIsNone(result["nav"])
         self.assertEqual(result["cash_status"], "unknown")
+    def test_port11m_pre_cycle_activity_is_account_scoped(self):
+        before = DAY - dt.timedelta(days=1)
+        self._lot(
+            self.cycle100, 100, 10.0,
+            acquired_at=f"{before.isoformat()} 10:00:00",
+            account_id="r22-other",
+        )
+        self.conn.commit()
+        context = P.PortfolioReadContext(self.cycle100, before)
+        self.assertEqual(
+            P.cash(self.conn, context, account_id=ACCOUNT),
+            (None, "unknown"),
+        )
+
     def test_port11k_missing_order_fill_uses_compatibility_cash(self):
         verified = self._order_and_fill(
             cycle_id=self.cycle100, side="buy", qty=100, price=10.0,

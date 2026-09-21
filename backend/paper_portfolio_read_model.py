@@ -571,7 +571,10 @@ def verified_cash_flows(conn, context: PortfolioReadContext, *,
         (_all_filled_sell_orders(conn, context, account_id)[0], all_sells),
     ):
         verified_ids = {
-            int(row["order_id"]) for row in verified_rows if row.get("order_id") is not None
+            int(row["order_id"]) for row in verified_rows
+            if row.get("order_id") is not None
+            and _identity_ok(row)
+            and EV.is_verified_row(row)
         }
         for order in orders:
             key = (str(order.get("account_id") or ""), str(order.get("code") or ""))
@@ -707,7 +710,7 @@ def _cycle_initial(conn, context: PortfolioReadContext, account_id: str | None =
         ).fetchone()
         if row is None or int(row[1] or -1) != context.cycle_id:
             return None
-        if not _cycle_created_by(conn, context):
+        if not _cycle_created_by(conn, context, account_id=account_id):
             return None
         return _num(row[0], None)
     if _has_columns(conn, "paper_cycles", {"id", "capital"}):

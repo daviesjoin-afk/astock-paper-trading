@@ -199,17 +199,27 @@ def _rotation_buy_candidate(conn, account, replacement, quote, market, news, aso
     return result
 
 
+def _bounded_risk_scope(conn, context: PPort.PortfolioReadContext, *,
+                        ports: RiskServicePorts):
+    """Return bounded positions plus current-or-historical risk account IDs."""
+    positions = PPort.risk_positions_for_context(conn, context)
+    risk_ids = set(ports.risk_exit_account_ids(conn))
+    risk_ids.update(
+        str(row["account_id"]) for row in positions if row.get("account_id")
+    )
+    return positions, risk_ids
+
+
 def run(context: RiskRunContext, *, ports: RiskServicePorts):
     """Run one risk workflow for the exact context already claimed by the facade."""
     day = context.asof_day
     cycle_id = context.cycle_id
     manual_orders = []
     with ports.open_db() as snapshot_conn:
-        risk_ids = ports.risk_exit_account_ids(snapshot_conn)
         # 快照阶段就固定到**已认领**的周期，而不是"此刻 active 的那个周期"。
-        positions = [p for p in PPort.risk_positions_for_context(
-            snapshot_conn, PPort.PortfolioReadContext(cycle_id, day),
-        ) if p["account_id"] in risk_ids]
+        positions, risk_ids = _bounded_risk_scope(
+            snapshot_conn, PPort.PortfolioReadContext(cycle_id, day), ports=ports,
+        )
         retry_placeholders = ",".join("?" for _ in ports.evidence.entry_retry_signal_statuses)
         candidate_rows = snapshot_conn.execute(
             f"SELECT DISTINCT code FROM paper_signals WHERE status IN ({retry_placeholders})",
@@ -266,10 +276,9 @@ def run(context: RiskRunContext, *, ports: RiskServicePorts):
         # R16 cycle fence：外部 I/O 之后、正式写 transaction 打开的第一件事就是
         # 证明"已认领的周期仍是当前 active cycle"。周期变了 ⇒ fail closed。
         PRSS.assert_cycle_active(conn, cycle_id=cycle_id)
-        risk_ids = ports.risk_exit_account_ids(conn)
-        positions = [p for p in PPort.risk_positions_for_context(
-            conn, PPort.PortfolioReadContext(cycle_id, day),
-        ) if p["account_id"] in risk_ids]
+        positions, risk_ids = _bounded_risk_scope(
+            conn, PPort.PortfolioReadContext(cycle_id, day), ports=ports,
+        )
         account_map = {
             row["id"]: row for row in _accounts_by_id(conn, risk_ids)
         }

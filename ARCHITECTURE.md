@@ -547,6 +547,9 @@ portfolio metrics / risk / dashboard / research consumers
 - `source_order_id IS NULL` 的 durable lot 不把 `acquired_at` 当历史权威：未平仓数量为 unknown，严格 cash flow 也保持 unknown；已由 verified SELL 卖光的 lot 不再污染后续风险扫描，但仍参与缺失 acquisition cash 的完整性检查。
 - `paper_cycles` 或至少一条匹配 `paper_accounts` 记录才可作为 initial capital 证据；若 cycle 行存在，还要求 `created_at` 日期不晚于 `asof_day`，或 asof 前已有 bounded lot/fill/order 证据。不存在的 cycle/account 或空 pre-cycle 读取保持 unknown，不发明零资本。
 - durable lot 的 `source_order_id` 只有在完整匹配同 cycle / account / code / BUY side 的已验证 fill 时才可作为 acquisition evidence；identity/verification 不匹配时 quantity 与 cash 都保持 unknown。
+- per-symbol `verified_cash_flow` 要求该订单的全部 fill 行同时通过 identity 与 execution verification；错配 fill 不能因同订单另有合法 fill 而留下部分现金流投影。
+- account-specific pre-cycle 的 bounded lot/fill/order 证据必须限定到同一账户；其他账户的历史活动不能为该账户的 initial capital 背书。
+- 历史风险扫描先读取 bounded positions，再以这些账户扩充当前风控范围；current eligibility 只能增加扫描对象，不能反向剔除历史回放中仍有仓位的账户。
 - 缺失 authoritative lot/execution schema 时，quantity 与 realized PnL 保持 unknown；schema 读不到不能证明“零持仓 / 零已实现收益”。
 - `paper_positions` 仍是 compatibility projection；projection 不拥有 execution authority。
 

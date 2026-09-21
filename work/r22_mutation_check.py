@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""R22 mutation matrix M-PORT1 ~ M-PORT34.
+"""R22 mutation matrix M-PORT1 ~ M-PORT37.
 
 Each mutation must turn its corresponding permanent contract RED.  The script
 restores every mutated file byte-identically and verifies sha256.
@@ -16,6 +16,8 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BACKEND = os.path.join(ROOT, "backend")
 READ_MODEL = "backend/paper_portfolio_read_model.py"
 TEST = "test_portfolio_read_model.PortfolioReadModelContractTests"
+RISK_SERVICE = "backend/paper_risk_service.py"
+RISK_TEST = "test_risk_application_service.RiskServiceContractTests"
 
 MUTATIONS = [
     {
@@ -300,6 +302,57 @@ MUTATIONS = [
 ''',
         "test": f"{TEST}.test_port10b_realized_pnl_without_execution_schema_stays_unknown",
         "desc": "invent verified zero realized PnL without execution evidence",
+    },
+    {
+        "id": "M-PORT35", "file": READ_MODEL,
+        "old": '''        verified_ids = {
+            int(row["order_id"]) for row in verified_rows
+            if row.get("order_id") is not None
+            and _identity_ok(row)
+            and EV.is_verified_row(row)
+        }
+''',
+        "new": '''        verified_ids = {
+            int(row["order_id"]) for row in verified_rows if row.get("order_id") is not None
+        }
+''',
+        "test": f"{TEST}.test_port13a_identity_mismatch_blocks_real_order_cash_flow",
+        "desc": "cover a mismatched fill order with an unrelated verified fill",
+    },
+    {
+        "id": "M-PORT36", "file": READ_MODEL,
+        "old": '''        if not _cycle_created_by(conn, context, account_id=account_id):
+            return None
+        return _num(row[0], None)
+''',
+        "new": '''        if not _cycle_created_by(conn, context):
+            return None
+        return _num(row[0], None)
+''',
+        "test": f"{TEST}.test_port11m_pre_cycle_activity_is_account_scoped",
+        "desc": "let another account authorize pre-cycle capital",
+    },
+    {
+        "id": "M-PORT37", "file": RISK_SERVICE,
+        "old": '''def _bounded_risk_scope(conn, context: PPort.PortfolioReadContext, *,
+                        ports: RiskServicePorts):
+    """Return bounded positions plus current-or-historical risk account IDs."""
+    positions = PPort.risk_positions_for_context(conn, context)
+    risk_ids = set(ports.risk_exit_account_ids(conn))
+    risk_ids.update(
+        str(row["account_id"]) for row in positions if row.get("account_id")
+    )
+    return positions, risk_ids
+''',
+        "new": '''def _bounded_risk_scope(conn, context: PPort.PortfolioReadContext, *,
+                        ports: RiskServicePorts):
+    """Return bounded positions plus current-or-historical risk account IDs."""
+    positions = PPort.risk_positions_for_context(conn, context)
+    risk_ids = set(ports.risk_exit_account_ids(conn))
+    return [row for row in positions if row["account_id"] in risk_ids], risk_ids
+''',
+        "test": f"{RISK_TEST}.test_rsvc19_historical_positions_are_not_filtered_by_current_eligibility",
+        "desc": "filter bounded historical positions by current risk eligibility",
     },
 ]
 

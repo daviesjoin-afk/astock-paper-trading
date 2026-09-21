@@ -558,14 +558,20 @@ class RiskScanStateIsACycleOwnedBoundary(unittest.TestCase):
     def test_guard7h_scan_snapshot_is_pinned_to_the_claimed_cycle(self):
         """风险扫描的持仓读取必须走显式周期，不能重新猜 active cycle。"""
         raw = _source("paper_risk_service.py")
-        impl = _function_source(ast.parse(raw), "run", raw)
+        tree = ast.parse(raw)
+        impl = _function_source(tree, "run", raw)
+        scope = _function_source(tree, "_bounded_risk_scope", raw)
         self.assertIn(
-            "PPort.risk_positions_for_context(", impl,
+            "_bounded_risk_scope(", impl,
+            "risk service 不再通过显式 cycle/as-of bounded scope 读取持仓",
+        )
+        self.assertIn(
+            "PPort.risk_positions_for_context(", scope,
             "risk service 不再用显式 cycle/as-of bounded reader：一次从旧周期开始的"
             "扫描会重新问'现在 active 的是谁'，从而操作新周期",
         )
         self.assertNotIn(
-            "PPRM.positions_for_cycle(", impl,
+            "PPRM.positions_for_cycle(", scope,
             "risk service 又回落到 current remaining_qty 读取",
         )
         self.assertIn(

@@ -62,10 +62,10 @@ After-fix probe summary: `0/8 reproduced`; C1/C2/C3/C6 now use the explicit boun
 
 ## Tests
 
-- targeted portfolio read model: `42/42 PASS`
+- targeted portfolio read model: `44/44 PASS`
 - architecture guard: `94/94 PASS`
-- risk / authoritative-position / sell-convergence suites: `113/113 PASS`
-- full backend: `3888 tests OK (skipped=5)`
+- risk / authoritative-position / sell-convergence suites: `114/114 PASS`
+- full backend: `3891 tests OK (skipped=5)`
 - frontend build: `PASS` (2 pre-existing duplicate-key warnings in `frontend/src/core/format.js`, not introduced by R22)
 - frontend unit: `111/111 PASS`
 - dist drift: `PASS`
@@ -74,7 +74,7 @@ After-fix probe summary: `0/8 reproduced`; C1/C2/C3/C6 now use the explicit boun
 
 ## Mutation
 
-- `M-PORT1`..`M-PORT34`: `34/34 RED`
+- `M-PORT1`..`M-PORT37`: `37/37 RED`
 - survived: `0`
 - restore sha256: `PASS`
 
@@ -104,12 +104,15 @@ After-fix probe summary: `0/8 reproduced`; C1/C2/C3/C6 now use the explicit boun
 - P1 source-order identity: a durable lot is trusted only when its source order and fill match the lot cycle/account/code and BUY side and the order is execution-verified; otherwise quantity and cash stay unknown.
 - P2 incomplete lot schema: when `paper_position_lots` is absent or lacks required columns, quantity stays unknown instead of publishing a verified empty portfolio.
 - P2 incomplete execution schema: when SELL/order evidence cannot be read, realized PnL stays unknown instead of publishing a verified zero.
-- each review fix has a permanent regression and a dedicated mutation (`M-PORT13`..`M-PORT34`).
+- P2 mismatched fill identity: a BUY/SELL fill that disagrees with its order cannot leave a partial cash-flow projection for the order's real account/code; the affected key falls back to settlement cost.
+- P2 account-scoped pre-cycle proof: bounded activity from another account can no longer authorize an account-specific initial capital before the cycle's `created_at`.
+- P1 historical risk eligibility: bounded positions are always included in the risk scan scope for the requested as-of; current eligibility may add accounts but must not filter out reconstructed historical holdings.
+- each review fix has a permanent regression and a dedicated mutation (`M-PORT13`..`M-PORT37`).
 
 ## Security
 
 - local sensitive-data scan: `kinds: none`, `values: 0`
-- manual review: `1` existing screenshot/binary item (`docs/assets/dashboard.png`), no new sensitive findings
+- manual review: `2` existing screenshot/binary entries (same `docs/assets/dashboard.png`), no new sensitive findings
 - GitHub Security Leak Scan: pending exact-head verification
 
 ## Merge status
