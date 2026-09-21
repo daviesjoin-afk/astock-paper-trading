@@ -154,6 +154,38 @@ class PortfolioReadModelContractTests(unittest.TestCase):
         self.assertEqual(before["qty"], 100)
         self.assertEqual(after["qty"], before["qty"])
 
+    def test_port4d_lot_economic_date_comes_from_fill_date(self):
+        buy = self._order_and_fill(cycle_id=self.cycle100, side="buy", qty=100,
+                                   price=10.0, fill_date=DAY.isoformat())
+        # Production _record_lot uses wall-clock _now(); the fill_date is the
+        # economic date that must bound a historical read.
+        self._lot(self.cycle100, 100, 10.0,
+                  acquired_at=f"{NEXT.isoformat()} 10:00:00", source_order_id=buy)
+        self.conn.commit()
+        rows = P.positions_for_context(self.conn, P.PortfolioReadContext(self.cycle100, DAY))
+        self.assertEqual([row["qty"] for row in rows], [100])
+
+    def test_port4e_future_fill_date_is_excluded_even_when_acquired_at_is_early(self):
+        buy = self._order_and_fill(cycle_id=self.cycle100, side="buy", qty=100,
+                                   price=10.0, fill_date=NEXT.isoformat())
+        self._lot(self.cycle100, 100, 10.0,
+                  acquired_at=f"{DAY.isoformat()} 10:00:00", source_order_id=buy)
+        self.conn.commit()
+        rows = P.positions_for_context(self.conn, P.PortfolioReadContext(self.cycle100, DAY))
+        self.assertEqual(rows, [])
+
+    def test_port4f_explicit_exposure_fails_closed_on_unknown_quantity(self):
+        buy = self._order_and_fill(cycle_id=self.cycle100, side="buy", qty=100,
+                                   price=10.0, fill_date=DAY.isoformat())
+        self._lot(self.cycle100, 100, 10.0, source_order_id=buy)
+        self._order_and_fill(cycle_id=self.cycle100, side="sell", qty=50,
+                             price=12.0, fill_date=DAY.isoformat(), verified=False)
+        self.conn.commit()
+        with self.assertRaises(P.PortfolioReadUnavailable):
+            PT._shared_account_exposure(
+                self.conn, {CODE: {"price": 10.0}}, DAY, cycle_id=self.cycle100,
+            )
+
     def test_port4b_explicit_exposure_uses_bounded_positions(self):
         self._lot(self.cycle100, 100, 10.0, acquired_at=f"{NEXT.isoformat()} 10:00:00")
         self.conn.commit()
@@ -215,6 +247,25 @@ class PortfolioReadModelContractTests(unittest.TestCase):
         self.conn.commit()
         rows = P.positions_for_context(self.conn, P.PortfolioReadContext(self.cycle100, DAY))
         self.assertEqual(rows[0]["qty"], 100)
+
+    def test_port3c_buy_order_without_fill_blocks_display_cash_flow(self):
+        first = self._order_and_fill(cycle_id=self.cycle100, side="buy", qty=100,
+                                     price=20.0, fill_date=DAY.isoformat(), fees=0.0)
+        self._lot(self.cycle100, 100, 20.0, source_order_id=first)
+        stamp = PT._strategy_stamp(self.conn, ACCOUNT)
+        ghost = int(self.conn.execute(
+            "INSERT INTO paper_orders(account_id,side,code,qty,status,risk_payload,created_at,"
+            "executed_at,order_type,origin,strategy_id,strategy_version,strategy_checksum,cycle_id) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (ACCOUNT, "buy", CODE, 100, "filled", "{}", f"{DAY.isoformat()} 09:30:00",
+             f"{DAY.isoformat()} 09:30:01", "market", "seed", *stamp, self.cycle100),
+        ).lastrowid)
+        self._lot(self.cycle100, 100, 10.0, source_order_id=ghost)
+        self.conn.commit()
+        context = P.PortfolioReadContext(self.cycle100, DAY)
+        self.assertEqual(P.verified_cash_flows(self.conn, context), {})
+        rows = P.positions_for_context(self.conn, context)
+        self.assertEqual(rows[0]["display_cost"], 15.0)
 
     def test_port3b_unverified_buy_blocks_display_cash_flow(self):
         first = self._order_and_fill(cycle_id=self.cycle100, side="buy", qty=100,

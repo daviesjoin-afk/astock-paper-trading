@@ -35,6 +35,7 @@ __all__ = [
     "PORTFOLIO_READ_MODEL_VERSION",
     "STATUS_VERIFIED",
     "STATUS_UNKNOWN",
+    "PortfolioReadUnavailable",
     "PortfolioReadContext",
     "bounded_lots",
     "verified_cash_flows",
@@ -122,6 +123,10 @@ def _columns(conn, table: str) -> set[str]:
 def _has_columns(conn, table: str, required: set[str]) -> bool:
     columns = _columns(conn, table)
     return bool(columns) and required.issubset(columns)
+
+
+class PortfolioReadUnavailable(RuntimeError):
+    """Raised when a bounded portfolio read cannot prove a required fact."""
 
 
 @dataclass(frozen=True)
@@ -351,6 +356,42 @@ def _consume_fifo(lots: list[dict], sells: list[dict]) -> tuple[list[dict], bool
     return [row for bucket in grouped.values() for row in bucket], True
 
 
+def _lot_economic_dates(conn, order_ids) -> tuple[dict[int, str], bool]:
+    """Return source-order acquisition dates, preferring the actual fill date."""
+    ids = sorted({int(value) for value in order_ids if value is not None})
+    if not ids:
+        return {}, True
+    fills_available = _has_columns(conn, "paper_fills", {"order_id", "fill_date"})
+    orders_available = _has_columns(conn, "paper_orders", {"id", "executed_at", "status"})
+    if not fills_available and not orders_available:
+        return {}, False
+    dates: dict[int, str] = {}
+    for start in range(0, len(ids), 400):
+        chunk = ids[start:start + 400]
+        placeholders = ",".join("?" for _ in chunk)
+        if fills_available:
+            rows = conn.execute(
+                f"SELECT order_id,MIN(fill_date) FROM paper_fills"
+                f" WHERE order_id IN ({placeholders}) AND fill_date IS NOT NULL"
+                f"   AND length(fill_date)>=10 GROUP BY order_id",
+                tuple(chunk),
+            ).fetchall()
+            for order_id, fill_date in rows:
+                dates[int(order_id)] = str(fill_date)[:10]
+        missing = [value for value in chunk if value not in dates]
+        if missing and orders_available:
+            placeholders = ",".join("?" for _ in missing)
+            rows = conn.execute(
+                f"SELECT id,executed_at FROM paper_orders WHERE id IN ({placeholders})"
+                f"   AND status='filled' AND executed_at IS NOT NULL"
+                f"   AND length(executed_at)>=10",
+                tuple(missing),
+            ).fetchall()
+            for order_id, executed_at in rows:
+                dates[int(order_id)] = str(executed_at)[:10]
+    return dates, True
+
+
 def bounded_lots(conn, context: PortfolioReadContext, *, account_id: str | None = None) -> list[dict]:
     """Reconstruct open lots at ``context.asof_day`` from durable facts.
 
@@ -367,26 +408,50 @@ def bounded_lots_with_status(conn, context: PortfolioReadContext, *,
     """Return ``(lots, quantity_status)`` for an explicit context."""
     if not _has_columns(conn, "paper_position_lots", _POSITION_LOT_COLUMNS):
         return [], STATUS_VERIFIED
-    params: list[Any] = [context.cycle_id, context.asof_day.isoformat()]
+    params: list[Any] = [context.cycle_id]
     account_sql = ""
     if account_id:
         account_sql = " AND account_id=?"
         params.append(str(account_id))
     rows = _row_dicts(conn.execute(
         "SELECT * FROM paper_position_lots"
-        " WHERE cycle_id=? AND qty>0 AND acquired_at IS NOT NULL"
-        "   AND length(acquired_at)>=10 AND substr(acquired_at,1,10)<=?"
+        " WHERE cycle_id=? AND qty>0"
         + account_sql +
-        " ORDER BY account_id,code,acquired_at,id",
+        " ORDER BY acquired_at,id",
         tuple(params),
     ))
+    economic_dates, fill_proof = _lot_economic_dates(
+        conn, (row.get("source_order_id") for row in rows)
+    )
+    unknown_date = False
+    bounded = []
+    for row in rows:
+        lot = dict(row)
+        original = str(lot.get("acquired_at") or "")
+        source_order_id = lot.get("source_order_id")
+        economic = None
+        if source_order_id is not None and fill_proof:
+            economic = economic_dates.get(int(source_order_id))
+            if economic is None:
+                unknown_date = True
+        if economic is None:
+            economic = original[:10] or None
+            if source_order_id is not None and not fill_proof:
+                unknown_date = True
+        if not economic:
+            unknown_date = True
+            continue
+        if economic > context.asof_day.isoformat():
+            continue
+        # Keep the original intraday time for FIFO ordering, but replace the
+        # economic date with the source fill's trading date.
+        suffix = original[10:] if len(original) >= 10 else " 00:00:00"
+        lot["acquired_at"] = economic + (suffix or " 00:00:00")
+        bounded.append(lot)
     sells, _rows, proof_available = _sell_fills(conn, context, account_id)
     unproven = _unproven_sell_exists(conn, context, account_id)
-    if not proof_available and unproven:
-        status = STATUS_UNKNOWN
-    else:
-        status = STATUS_UNKNOWN if unproven else STATUS_VERIFIED
-    rebuilt, fully_consumed = _consume_fifo(rows, sells)
+    status = STATUS_UNKNOWN if (unknown_date or unproven or not proof_available) else STATUS_VERIFIED
+    rebuilt, fully_consumed = _consume_fifo(bounded, sells)
     if not fully_consumed:
         status = STATUS_UNKNOWN
     return rebuilt, status
@@ -412,6 +477,19 @@ def verified_cash_flows(conn, context: PortfolioReadContext, *,
         for row in rows:
             key = (str(row.get("fill_account_id") or ""), str(row.get("fill_code") or ""))
             if not _identity_ok(row) or not EV.is_verified_row(row):
+                incomplete.add(key)
+    # A filled order with no verified fill row is not evidence of zero cash;
+    # it blocks the per-symbol projection for that key.
+    for orders, verified_rows in (
+        (_all_filled_buy_orders(conn, context, account_id)[0], all_buys),
+        (_all_filled_sell_orders(conn, context, account_id)[0], all_sells),
+    ):
+        verified_ids = {
+            int(row["order_id"]) for row in verified_rows if row.get("order_id") is not None
+        }
+        for order in orders:
+            key = (str(order.get("account_id") or ""), str(order.get("code") or ""))
+            if not EV.is_verified_row(order) or int(order["id"]) not in verified_ids:
                 incomplete.add(key)
     for side, rows in (("buy", buys), ("sell", sells)):
         for row in rows:

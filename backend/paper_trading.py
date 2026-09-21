@@ -3047,9 +3047,9 @@ def _shared_account_exposure(conn, quotes, asof_day=None, *, cycle_id=None):
         if asof_day is None:
             positions = PPRM.positions_for_cycle(conn, cycle_id, asof_day=asof_day); cash = _shared_cash(conn, cycle_id)
         else:
-            context = PPort.PortfolioReadContext(cycle_id, asof_day); positions = PPort.positions_for_context(conn, context)
-            cash = PPort.cash(conn, context)[0]
-            cash = PPort.compatibility_cash(conn, context) if cash is None else cash
+            context = PPort.PortfolioReadContext(cycle_id, asof_day); positions, quantity_status = PPort.positions_for_context_with_status(conn, context)
+            if quantity_status != PPort.STATUS_VERIFIED: raise PPort.PortfolioReadUnavailable("explicit-cycle exposure quantity proof is unknown")
+            cash = PPort.cash(conn, context)[0]; cash = PPort.compatibility_cash(conn, context) if cash is None else cash
     value, industries, codes = PPort.exposure(positions, quotes, num=_num)
     return positions, value, (cash + value) if cash is not None else None, industries, codes
 
