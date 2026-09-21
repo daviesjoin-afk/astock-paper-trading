@@ -682,6 +682,40 @@ def initial_capital(conn, context: PortfolioReadContext):
     return _cycle_initial(conn, context)
 
 
+def _uncovered_lot_cost(conn, lots: list[dict]) -> float:
+    """Cash cost of open lots not already represented by BUY fills."""
+    if not lots:
+        return 0.0
+    if not _has_columns(conn, "paper_fills", {"order_id", "side"}):
+        return 0.0
+    source_order_ids = []
+    for lot in lots:
+        try:
+            source_order_ids.append(int(lot.get("source_order_id")))
+        except (TypeError, ValueError):
+            source_order_ids.append(None)
+    order_ids = sorted({value for value in source_order_ids if value is not None})
+    covered_order_ids: set[int] = set()
+    for start in range(0, len(order_ids), 400):
+        chunk = order_ids[start:start + 400]
+        placeholders = ",".join("?" for _ in chunk)
+        covered_order_ids.update(
+            int(row[0]) for row in conn.execute(
+                f"SELECT DISTINCT order_id FROM paper_fills"
+                f" WHERE side='buy' AND order_id IN ({placeholders})",
+                tuple(chunk),
+            )
+        )
+    uncovered = 0.0
+    for lot, source_order_id in zip(lots, source_order_ids, strict=True):
+        if source_order_id is not None and source_order_id in covered_order_ids:
+            continue
+        qty = _num(lot.get("qty"), 0.0) or 0.0
+        cost = _num(lot.get("cost"), 0.0) or 0.0
+        uncovered += qty * cost
+    return uncovered
+
+
 def compatibility_cash(conn, context: PortfolioReadContext, *,
                       account_id: str | None = None):
     """Bounded legacy/risk compatibility cash estimate.
@@ -696,6 +730,7 @@ def compatibility_cash(conn, context: PortfolioReadContext, *,
     initial = _cycle_initial(conn, context, account_id)
     if initial is None:
         return None
+    open_lots = bounded_lots(conn, context, account_id=account_id)
     buys, buy_rows, buy_proof = _buy_fills(conn, context, account_id)
     sells, sell_rows, sell_proof = _sell_fills(conn, context, account_id)
     rows = list(buy_rows or ()) + list(sell_rows or ())
@@ -710,10 +745,10 @@ def compatibility_cash(conn, context: PortfolioReadContext, *,
                 total -= amount + fees
             else:
                 total += amount - fees
-        return total
+        return total - _uncovered_lot_cost(conn, open_lots)
     invested = sum(
         int(row.get("remaining_qty") or 0) * (_num(row.get("cost"), 0.0) or 0.0)
-        for row in bounded_lots(conn, context, account_id=account_id)
+        for row in open_lots
     )
     return max(0.0, initial - invested)
 
@@ -744,15 +779,26 @@ def _valuation_price(valuations: Mapping | None, code: str) -> float | None:
     return price
 
 
+def _risk_state_rows_for_context(conn, context: PortfolioReadContext) -> list[dict]:
+    """Return only runtime risk rows provably no newer than ``asof_day``."""
+    if not _has_columns(
+        conn, "paper_position_risk_state",
+        {"cycle_id", "initialized_at", "updated_at"},
+    ):
+        return []
+    day = context.asof_day.isoformat()
+    return _row_dicts(conn.execute(
+        "SELECT * FROM paper_position_risk_state"
+        " WHERE cycle_id=? AND substr(initialized_at,1,10)<=?"
+        "   AND substr(updated_at,1,10)<=?",
+        (context.cycle_id, day, day),
+    ))
+
+
 def risk_positions_for_context(conn, context: PortfolioReadContext, *,
                               account_id: str | None = None) -> list[dict]:
     """Bounded position read with cycle-owned runtime risk state for risk scans."""
-    risk_state_rows = []
-    if _has_columns(conn, "paper_position_risk_state", {"cycle_id"}):
-        risk_state_rows = _row_dicts(conn.execute(
-            "SELECT * FROM paper_position_risk_state WHERE cycle_id=?",
-            (context.cycle_id,),
-        ))
+    risk_state_rows = _risk_state_rows_for_context(conn, context)
     positions, status = positions_for_context_with_status(
         conn, context, account_id=account_id,
         risk_state_rows=risk_state_rows,

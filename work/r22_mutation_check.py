@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""R22 mutation matrix M-PORT1 ~ M-PORT12.
+"""R22 mutation matrix M-PORT1 ~ M-PORT25.
 
 Each mutation must turn its corresponding permanent contract RED.  The script
 restores every mutated file byte-identically and verifies sha256.
@@ -180,6 +180,20 @@ MUTATIONS = [
         "new": "    if price is None:\n        return None\n",
         "test": f"{TEST}.test_port9b_non_finite_or_non_positive_valuation_stays_unknown",
         "desc": "accept non-finite valuation evidence as verified",
+    },
+    {
+        "id": "M-PORT24", "file": READ_MODEL,
+        "old": "        return total - _uncovered_lot_cost(conn, open_lots)\n",
+        "new": "        return total\n",
+        "test": f"{TEST}.test_port11d_mixed_fill_less_lot_is_reconciled",
+        "desc": "ignore uncovered durable lot cost in compatibility cash",
+    },
+    {
+        "id": "M-PORT25", "file": READ_MODEL,
+        "old": '    day = context.asof_day.isoformat()\n',
+        "new": '    day = "9999-12-31"\n',
+        "test": f"{TEST}.test_port4i_risk_positions_exclude_future_runtime_state",
+        "desc": "inject future runtime risk state into historical read",
     },
 ]
 

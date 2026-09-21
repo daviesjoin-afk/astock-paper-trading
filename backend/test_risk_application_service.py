@@ -63,6 +63,7 @@ class _RiskServiceCase(PRS._ProductionRiskScanCase):
         PPRS.initialize_episode(
             self.conn, cycle_id=self.cycle, account_id=self.ACCOUNT,
             code=code, peak_price=cost,
+            now=f"{self.day.isoformat()} 10:00:00",
         )
         self.conn.commit()
 
@@ -158,6 +159,7 @@ class _RiskServiceCase(PRS._ProductionRiskScanCase):
         PPRS.initialize_episode(
             self.conn, cycle_id=self.cycle, account_id=account_id,
             code=code, peak_price=cost,
+            now=f"{self.day.isoformat()} 10:00:00",
         )
         self.conn.commit()
 

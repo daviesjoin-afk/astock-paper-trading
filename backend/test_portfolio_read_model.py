@@ -213,6 +213,34 @@ class PortfolioReadModelContractTests(unittest.TestCase):
                 self.conn, P.PortfolioReadContext(self.cycle100, DAY)
             )
 
+    def test_port4i_risk_positions_exclude_future_runtime_state(self):
+        buy = self._order_and_fill(cycle_id=self.cycle100, side="buy", qty=100,
+                                   price=10.0, fill_date=DAY.isoformat())
+        self._lot(self.cycle100, 100, 10.0, source_order_id=buy)
+        self.conn.execute(
+            "INSERT INTO paper_position_risk_state(cycle_id,account_id,code,peak_price,"
+            "take_stage,opened_order_id,initialized_at,updated_at) VALUES(?,?,?,?,?,?,?,?)",
+            (self.cycle100, ACCOUNT, CODE, 12.5, 2, buy,
+             f"{DAY.isoformat()} 10:00:00", f"{DAY.isoformat()} 10:00:00"),
+        )
+        self.conn.commit()
+        positions = P.risk_positions_for_context(
+            self.conn, P.PortfolioReadContext(self.cycle100, DAY)
+        )
+        self.assertAlmostEqual(positions[0]["peak_price"], 12.5)
+        self.assertEqual(positions[0]["take_stage"], 2)
+        self.conn.execute(
+            "UPDATE paper_position_risk_state SET peak_price=?,take_stage=?,updated_at=?"
+            " WHERE cycle_id=? AND account_id=? AND code=?",
+            (99.0, 3, f"{NEXT.isoformat()} 10:00:00", self.cycle100, ACCOUNT, CODE),
+        )
+        self.conn.commit()
+        positions = P.risk_positions_for_context(
+            self.conn, P.PortfolioReadContext(self.cycle100, DAY)
+        )
+        self.assertAlmostEqual(positions[0]["peak_price"], 10.0)
+        self.assertIsNone(positions[0]["take_stage"])
+        self.assertIsNone(positions[0]["episode_opened_order_id"])
     def test_port4b_explicit_exposure_uses_bounded_positions(self):
         self._lot(self.cycle100, 100, 10.0, acquired_at=f"{NEXT.isoformat()} 10:00:00")
         self.conn.commit()
@@ -350,6 +378,29 @@ class PortfolioReadModelContractTests(unittest.TestCase):
         )
         self.assertEqual(nav, 99995.0)
 
+    def test_port11d_mixed_fill_less_lot_is_reconciled(self):
+        stamp = PT._strategy_stamp(self.conn, ACCOUNT)
+        self.conn.execute(
+            "INSERT INTO paper_orders(account_id,side,code,qty,status,risk_payload,created_at,"
+            "executed_at,order_type,origin,strategy_id,strategy_version,strategy_checksum,cycle_id,"
+            "execution_status,execution_verified) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (ACCOUNT, "buy", "000001", 100, "filled", "{}", f"{DAY.isoformat()} 09:30:00",
+             f"{DAY.isoformat()} 09:30:01", "market", "seed", *stamp, self.cycle100,
+             "unknown", 0),
+        )
+        self._lot(self.cycle100, 100, 10.0)
+        verified = self._order_and_fill(cycle_id=self.cycle100, side="buy", qty=200,
+                                        price=10.0, fill_date=DAY.isoformat())
+        self._lot(self.cycle100, 200, 10.0, source_order_id=verified)
+        self.conn.commit()
+        context = P.PortfolioReadContext(self.cycle100, DAY)
+        self.assertEqual(P.cash(self.conn, context), (None, "unknown"))
+        self.assertEqual(P.compatibility_cash(self.conn, context), 96995.0)
+        _positions, _value, nav, _industries, _codes = PT._shared_account_exposure(
+            self.conn, {CODE: {"price": 10.0}}, DAY, cycle_id=self.cycle100,
+        )
+        self.assertEqual(nav, 99995.0)
     def test_port11c_account_initial_capital_is_cycle_scoped(self):
         self.conn.execute(
             "UPDATE paper_accounts SET cycle_id=? WHERE id=?", (self.cycle101, ACCOUNT)

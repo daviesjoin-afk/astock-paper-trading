@@ -44,7 +44,7 @@ After-fix probe summary: `0/8 reproduced`; C1/C2/C3/C6 now use the explicit boun
 
 ## Architecture
 
-- new module: `backend/paper_portfolio_read_model.py` (857 LOC, 32 top-level defs)
+- new module: `backend/paper_portfolio_read_model.py` (901 LOC, 34 top-level defs)
 - `paper_trading.py` LOC: `14847 -> 14847`
 - `paper_trading.py` top-level defs: `280 -> 280`
 - reverse imports: `0` (new read model does not import `paper_trading`)
@@ -62,10 +62,10 @@ After-fix probe summary: `0/8 reproduced`; C1/C2/C3/C6 now use the explicit boun
 
 ## Tests
 
-- targeted portfolio read model: `31/31 PASS`
+- targeted portfolio read model: `33/33 PASS`
 - architecture guard: `94/94 PASS`
-- affected R19/R20/R21 + portfolio contract suites: `170/170 PASS`
-- full backend: `3877 tests OK (skipped=5)`
+- risk / authoritative-position / sell-convergence suites: `113/113 PASS`
+- full backend: `3879 tests OK (skipped=5)`
 - frontend build: `PASS` (2 pre-existing duplicate-key warnings in `frontend/src/core/format.js`, not introduced by R22)
 - frontend unit: `111/111 PASS`
 - dist drift: `PASS`
@@ -74,7 +74,7 @@ After-fix probe summary: `0/8 reproduced`; C1/C2/C3/C6 now use the explicit boun
 
 ## Mutation
 
-- `M-PORT1`..`M-PORT23`: `23/23 RED`
+- `M-PORT1`..`M-PORT25`: `25/25 RED`
 - survived: `0`
 - restore sha256: `PASS`
 
@@ -93,12 +93,14 @@ After-fix probe summary: `0/8 reproduced`; C1/C2/C3/C6 now use the explicit boun
 - P2 filled-order bounding: BUY/SELL filled-order checks now use the economic fill date when present and fall back to executed_at only for genuinely fill-less legacy orders.
 - P2 archived cycles: archived cycles now return unknown portfolio/cash/realized facts instead of a fabricated verified empty portfolio.
 - P2 valuation sanity: non-finite and non-positive valuation evidence is treated as unavailable, so NaN/inf cannot produce verified NAV.
-- each review fix has a permanent regression and a dedicated mutation (`M-PORT13`..`M-PORT23`).
+- P1 mixed fill-less lots: when recorded fill flows exist, compatibility cash now also subtracts the original cost of durable lots that have no linked BUY fill, preventing fill-less legacy lots from inflating NAV.
+- P2 future runtime risk state: risk positions only accept `paper_position_risk_state` rows whose `initialized_at` and `updated_at` dates are not later than `asof_day`; future peak / take-stage / re-entry state is treated as missing rather than injected into historical replay.
+- each review fix has a permanent regression and a dedicated mutation (`M-PORT13`..`M-PORT25`).
 
 ## Security
 
 - local sensitive-data scan: `kinds: none`, `values: 0`
-- manual review: `2` existing screenshot/binary items (`docs/assets/dashboard.png`), no new sensitive findings
+- manual review: `1` existing screenshot/binary item (`docs/assets/dashboard.png`), no new sensitive findings
 - GitHub Security Leak Scan: pending exact-head verification
 
 ## Merge status
