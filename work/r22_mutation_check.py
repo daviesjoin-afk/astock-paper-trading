@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""R22 mutation matrix M-PORT1 ~ M-PORT27.
+"""R22 mutation matrix M-PORT1 ~ M-PORT30.
 
 Each mutation must turn its corresponding permanent contract RED.  The script
 restores every mutated file byte-identically and verifies sha256.
@@ -183,7 +183,7 @@ MUTATIONS = [
     },
     {
         "id": "M-PORT24", "file": READ_MODEL,
-        "old": "        uncovered_cost, _uncovered_count = _uncovered_lot_facts(conn, open_lots)\n        return total - uncovered_cost\n",
+        "old": "        uncovered_cost, _uncovered_count = _uncovered_lot_facts(conn, all_lots)\n        return total - uncovered_cost\n",
         "new": "        return total\n",
         "test": f"{TEST}.test_port11d_mixed_fill_less_lot_is_reconciled",
         "desc": "ignore uncovered durable lot cost in compatibility cash",
@@ -197,17 +197,64 @@ MUTATIONS = [
     },
     {
         "id": "M-PORT26", "file": READ_MODEL,
-        "old": '''    lots = bounded_lots(conn, context, account_id=account_id)\n    _uncovered_cost, uncovered_count = _uncovered_lot_facts(conn, lots)\n    if uncovered_count:\n        return None, STATUS_UNKNOWN\n    return total, STATUS_VERIFIED\n''',
-        "new": '''    return total, STATUS_VERIFIED\n''',
+        "old": '''    lots, _quantity_status = bounded_lots_with_status(
+        conn, context, account_id=account_id,
+    )
+    _uncovered_cost, uncovered_count = _uncovered_lot_facts(conn, lots)
+    if uncovered_count:
+        return None, STATUS_UNKNOWN
+    return total, STATUS_VERIFIED
+''',
+        "new": '''    return total, STATUS_VERIFIED
+''',
         "test": f"{TEST}.test_port11g_source_less_lot_keeps_cash_unknown",
         "desc": "treat source-less durable lots as verified zero cash flow",
     },
     {
         "id": "M-PORT27", "file": READ_MODEL,
-        "old": '''        if source_order_id is None:\n            unknown_date = True\n        economic = None\n''',
-        "new": '''        economic = None\n''',
+        "old": '''        if source_order_id is None:
+            uncertain_lot_ids.add(lot_id)
+''',
+        "new": '''        if source_order_id is None:
+            pass
+''',
         "test": f"{TEST}.test_port11g_source_less_lot_keeps_cash_unknown",
         "desc": "promote wall-clock acquired_at for source-less lots",
+    },
+    {
+        "id": "M-PORT28", "file": READ_MODEL,
+        "old": '''    lots, _quantity_status = bounded_lots_with_status(
+        conn, context, account_id=account_id,
+    )
+''',
+        "new": '''    lots = bounded_lots(conn, context, account_id=account_id)
+''',
+        "test": f"{TEST}.test_port11h_consumed_source_less_lot_cash_completeness",
+        "desc": "ignore consumed legacy lots in cash completeness",
+    },
+    {
+        "id": "M-PORT29", "file": READ_MODEL,
+        "old": '''    unresolved_uncertain = any(
+        int(row.get("id") or 0) in uncertain_lot_ids
+        and int(row.get("remaining_qty") or 0) > 0
+        for row in rebuilt
+    )
+''',
+        "new": '''    unresolved_uncertain = bool(uncertain_lot_ids)
+''',
+        "test": f"{TEST}.test_port4j_closed_source_less_lot_does_not_poison_risk_reads",
+        "desc": "poison risk scans with fully consumed source-less lots",
+    },
+    {
+        "id": "M-PORT30", "file": READ_MODEL,
+        "old": '''    if row is None or int(row[0] or 0) <= 0:
+        return None
+''',
+        "new": '''    if row is None:
+        return None
+''',
+        "test": f"{TEST}.test_port11i_missing_cycle_does_not_invent_zero_capital",
+        "desc": "invent zero capital for a nonexistent cycle",
     },
 ]
 

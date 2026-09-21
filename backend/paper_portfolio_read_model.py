@@ -456,22 +456,24 @@ def bounded_lots_with_status(conn, context: PortfolioReadContext, *,
         conn, (row.get("source_order_id") for row in rows)
     )
     unknown_date = False
+    uncertain_lot_ids: set[int] = set()
     bounded = []
     for row in rows:
         lot = dict(row)
+        lot_id = int(lot.get("id") or 0)
         original = str(lot.get("acquired_at") or "")
         source_order_id = lot.get("source_order_id")
         if source_order_id is None:
-            unknown_date = True
+            uncertain_lot_ids.add(lot_id)
         economic = None
         if source_order_id is not None and fill_proof:
             economic = economic_dates.get(int(source_order_id))
             if economic is None:
-                unknown_date = True
+                uncertain_lot_ids.add(lot_id)
         if economic is None:
             economic = original[:10] or None
             if source_order_id is not None and not fill_proof:
-                unknown_date = True
+                uncertain_lot_ids.add(lot_id)
         if not economic:
             unknown_date = True
             continue
@@ -484,8 +486,15 @@ def bounded_lots_with_status(conn, context: PortfolioReadContext, *,
         bounded.append(lot)
     sells, _rows, proof_available = _sell_fills(conn, context, account_id)
     unproven = _unproven_sell_exists(conn, context, account_id)
-    status = STATUS_UNKNOWN if (unknown_date or unproven or not proof_available) else STATUS_VERIFIED
     rebuilt, fully_consumed = _consume_fifo(bounded, sells)
+    unresolved_uncertain = any(
+        int(row.get("id") or 0) in uncertain_lot_ids
+        and int(row.get("remaining_qty") or 0) > 0
+        for row in rebuilt
+    )
+    status = STATUS_UNKNOWN if (
+        unknown_date or unresolved_uncertain or unproven or not proof_available
+    ) else STATUS_VERIFIED
     if not fully_consumed:
         status = STATUS_UNKNOWN
     return rebuilt, status
@@ -616,10 +625,13 @@ def _cycle_initial(conn, context: PortfolioReadContext, account_id: str | None =
     if not _has_columns(conn, "paper_accounts", {"cycle_id", "initial_cash"}):
         return None
     row = conn.execute(
-        "SELECT COALESCE(SUM(initial_cash),0) FROM paper_accounts WHERE cycle_id=?",
+        "SELECT COUNT(*),COALESCE(SUM(initial_cash),0)"
+        " FROM paper_accounts WHERE cycle_id=?",
         (context.cycle_id,),
     ).fetchone()
-    return _num(row[0], None) if row is not None else None
+    if row is None or int(row[0] or 0) <= 0:
+        return None
+    return _num(row[1], None)
 
 
 def _cash_flow_total(conn, context: PortfolioReadContext, account_id: str | None = None):
@@ -643,7 +655,9 @@ def _cash_flow_total(conn, context: PortfolioReadContext, account_id: str | None
             return None, STATUS_UNKNOWN
         if any_fill is None:
             return None, STATUS_UNKNOWN
-        lots = bounded_lots(conn, context, account_id=account_id)
+        lots, _quantity_status = bounded_lots_with_status(
+            conn, context, account_id=account_id,
+        )
         _uncovered_cost, uncovered_count = _uncovered_lot_facts(conn, lots)
         if uncovered_count:
             return None, STATUS_UNKNOWN
@@ -665,7 +679,9 @@ def _cash_flow_total(conn, context: PortfolioReadContext, account_id: str | None
         if amount is None or fees is None:
             return None, STATUS_UNKNOWN
         total += amount - fees
-    lots = bounded_lots(conn, context, account_id=account_id)
+    lots, _quantity_status = bounded_lots_with_status(
+        conn, context, account_id=account_id,
+    )
     _uncovered_cost, uncovered_count = _uncovered_lot_facts(conn, lots)
     if uncovered_count:
         return None, STATUS_UNKNOWN
@@ -742,7 +758,12 @@ def compatibility_cash(conn, context: PortfolioReadContext, *,
     initial = _cycle_initial(conn, context, account_id)
     if initial is None:
         return None
-    open_lots = bounded_lots(conn, context, account_id=account_id)
+    all_lots, _quantity_status = bounded_lots_with_status(
+        conn, context, account_id=account_id,
+    )
+    open_lots = [
+        row for row in all_lots if int(row.get("remaining_qty") or 0) > 0
+    ]
     buys, buy_rows, buy_proof = _buy_fills(conn, context, account_id)
     sells, sell_rows, sell_proof = _sell_fills(conn, context, account_id)
     rows = list(buy_rows or ()) + list(sell_rows or ())
@@ -757,7 +778,7 @@ def compatibility_cash(conn, context: PortfolioReadContext, *,
                 total -= amount + fees
             else:
                 total += amount - fees
-        uncovered_cost, _uncovered_count = _uncovered_lot_facts(conn, open_lots)
+        uncovered_cost, _uncovered_count = _uncovered_lot_facts(conn, all_lots)
         return total - uncovered_cost
     invested = sum(
         int(row.get("remaining_qty") or 0) * (_num(row.get("cost"), 0.0) or 0.0)

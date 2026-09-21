@@ -241,6 +241,17 @@ class PortfolioReadModelContractTests(unittest.TestCase):
         self.assertAlmostEqual(positions[0]["peak_price"], 10.0)
         self.assertIsNone(positions[0]["take_stage"])
         self.assertIsNone(positions[0]["episode_opened_order_id"])
+    def test_port4j_closed_source_less_lot_does_not_poison_risk_reads(self):
+        self._lot(self.cycle100, 100, 10.0)
+        self._order_and_fill(
+            cycle_id=self.cycle100, side="sell", qty=100, price=11.0,
+            fill_date=DAY.isoformat(), fees=0.0,
+        )
+        self.conn.commit()
+        positions = P.risk_positions_for_context(
+            self.conn, P.PortfolioReadContext(self.cycle100, DAY)
+        )
+        self.assertEqual(positions, [])
     def test_port4b_explicit_exposure_uses_bounded_positions(self):
         future = self._order_and_fill(
             cycle_id=self.cycle100, side="buy", qty=100, price=10.0,
@@ -419,6 +430,25 @@ class PortfolioReadModelContractTests(unittest.TestCase):
             PT._shared_account_exposure(
                 self.conn, {CODE: {"price": 10.0}}, DAY, cycle_id=self.cycle100,
             )
+    def test_port11h_consumed_source_less_lot_cash_completeness(self):
+        self._lot(self.cycle100, 100, 10.0)
+        self._order_and_fill(
+            cycle_id=self.cycle100, side="sell", qty=100, price=11.0,
+            fill_date=DAY.isoformat(), fees=0.0,
+        )
+        self.conn.commit()
+        context = P.PortfolioReadContext(self.cycle100, DAY)
+        self.assertEqual(P.cash(self.conn, context), (None, "unknown"))
+        self.assertEqual(P.compatibility_cash(self.conn, context), 100100.0)
+
+    def test_port11i_missing_cycle_does_not_invent_zero_capital(self):
+        context = P.PortfolioReadContext(999999, DAY)
+        self.assertIsNone(P.initial_capital(self.conn, context))
+        self.assertEqual(P.cash(self.conn, context), (None, "unknown"))
+        result = self._portfolio(999999, valuations={CODE: 10.0})
+        self.assertIsNone(result["cash"])
+        self.assertIsNone(result["nav"])
+        self.assertEqual(result["cash_status"], "unknown")
     def test_port11c_account_initial_capital_is_cycle_scoped(self):
         self.conn.execute(
             "UPDATE paper_accounts SET cycle_id=? WHERE id=?", (self.cycle101, ACCOUNT)
