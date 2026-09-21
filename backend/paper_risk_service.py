@@ -271,7 +271,9 @@ def run(context: RiskRunContext, *, ports: RiskServicePorts):
         account_map = {
             row["id"]: row for row in _accounts_by_id(conn, risk_ids)
         }
-        pool_market_value, pool_nav = ports.shared_exposure(conn, day, quote_map)
+        pool_market_value, pool_nav = ports.shared_exposure(
+            conn, day, quote_map, cycle_id=cycle_id,
+        )
         held_by_account = {}
         for item in positions:
             held_by_account.setdefault(item["account_id"], set()).add(item["code"])

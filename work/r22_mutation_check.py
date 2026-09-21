@@ -1,0 +1,178 @@
+# -*- coding: utf-8 -*-
+"""R22 mutation matrix M-PORT1 ~ M-PORT12.
+
+Each mutation must turn its corresponding permanent contract RED.  The script
+restores every mutated file byte-identically and verifies sha256.
+"""
+from __future__ import annotations
+
+import hashlib
+import os
+import subprocess
+import sys
+import tempfile
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+BACKEND = os.path.join(ROOT, "backend")
+READ_MODEL = "backend/paper_portfolio_read_model.py"
+TEST = "test_portfolio_read_model.PortfolioReadModelContractTests"
+
+MUTATIONS = [
+    {
+        "id": "M-PORT1", "file": READ_MODEL,
+        "old": '" WHERE cycle_id=? AND qty>0 AND acquired_at IS NOT NULL"',
+        "new": '" WHERE qty>0 AND acquired_at IS NOT NULL"',
+        "test": f"{TEST}.test_port2_later_cycle_cannot_mutate_historical_quantity",
+        "desc": "remove cycle filter from lot read",
+    },
+    {
+        "id": "M-PORT2", "file": READ_MODEL,
+        "old": '"   AND length(acquired_at)>=10 AND substr(acquired_at,1,10)<=?"',
+        "new": '"   AND length(acquired_at)>=10"',
+        "test": f"{TEST}.test_port4_future_fill_is_excluded_by_asof",
+        "desc": "remove as-of filter from lot read",
+    },
+    {
+        "id": "M-PORT3", "file": READ_MODEL,
+        "old": 'original_qty = int(_num(item.get("qty"), 0) or 0)',
+        "new": 'original_qty = int(_num(item.get("remaining_qty"), 0) or 0)',
+        "test": f"{TEST}.test_port6b_remaining_qty_is_not_historical_authority",
+        "desc": "use current remaining_qty as historical quantity",
+    },
+    {
+        "id": "M-PORT4", "file": READ_MODEL,
+        "old": '''    return PP.aggregate_positions(\n        open_lots, (), flows, context.asof_day.isoformat(), num=_num\n    )\n''',
+        "new": '''    _pending = [{\n        "account_id": "pending", "code": "PENDING", "name": None,\n        "industry": None, "remaining_qty": 100, "qty": 100, "cost": 1.0,\n        "acquired_at": context.asof_day.isoformat() + " 00:00:00",\n        "available_date": context.asof_day.isoformat(), "asset_type": "stock_t1",\n    }]\n    return PP.aggregate_positions(\n        open_lots + _pending, (), flows, context.asof_day.isoformat(), num=_num\n    )\n''',
+        "test": f"{TEST}.test_port5_pending_and_unverified_orders_are_excluded",
+        "desc": "include a pending order as a position",
+    },
+    {
+        "id": "M-PORT5", "file": READ_MODEL,
+        "old": '''    if _unproven_sell_exists(conn, context, account_id):\n        return None, STATUS_UNKNOWN\n    verified, _rows, proof_available = _sell_fills(conn, context, account_id)\n''',
+        "new": '''    verified, _rows, proof_available = _sell_fills(conn, context, account_id)\n''',
+        "test": f"{TEST}.test_port10_realized_pnl_uses_verified_execution_only",
+        "desc": "include unverified SELL in realized pnl",
+    },
+    {
+        "id": "M-PORT6", "file": READ_MODEL,
+        "old": '''    positions = positions_for_context(conn, context, account_id=account_id)\n    realized, realized_status = realized_pnl(conn, context, account_id=account_id)\n''',
+        "new": '''    context = PortfolioReadContext(cycle_id=1, asof_day=context.asof_day)\n    positions = positions_for_context(conn, context, account_id=account_id)\n    realized, realized_status = realized_pnl(conn, context, account_id=account_id)\n''',
+        "test": f"{TEST}.test_port7_historical_read_never_resolves_active_cycle",
+        "desc": "replace requested cycle with another cycle",
+    },
+    {
+        "id": "M-PORT7", "file": READ_MODEL,
+        "old": '    if isinstance(value, dt.date):\n        return value',
+        "new": '    if isinstance(value, dt.date):\n        return dt.date.today()',
+        "test": f"{TEST}.test_port4_future_fill_is_excluded_by_asof",
+        "desc": "replace explicit as-of with wall clock",
+    },
+    {
+        "id": "M-PORT8", "file": READ_MODEL,
+        "old": '    return _num(value, None)\n',
+        "new": '    return _num(value, 10.0)\n',
+        "test": f"{TEST}.test_port9_unknown_valuation_stays_unknown",
+        "desc": "fallback missing price to a latest price",
+        "last": True,
+    },
+    {
+        "id": "M-PORT9", "file": READ_MODEL,
+        "old": '    return initial + net, STATUS_VERIFIED',
+        "new": '    return initial + net + 1000.0, STATUS_VERIFIED',
+        "test": f"{TEST}.test_port11_cash_and_nav_are_cycle_asof_bounded",
+        "desc": "mix unproven current cash into historical NAV",
+    },
+    {
+        "id": "M-PORT10", "file": READ_MODEL,
+        "old": '"   AND length(f.fill_date)>=10 AND substr(f.fill_date,1,10)<=?"',
+        "new": '"   AND length(f.fill_date)>=10 AND 1=1"',
+        "test": f"{TEST}.test_port4_future_fill_is_excluded_by_asof",
+        "desc": "include future SELL in historical read",
+    },
+    {
+        "id": "M-PORT11", "file": READ_MODEL,
+        "old": '''    return PP.aggregate_positions(\n        open_lots, (), flows, context.asof_day.isoformat(), num=_num\n    )\n''',
+        "new": '''    positions = PP.aggregate_positions(\n        open_lots, (), flows, context.asof_day.isoformat(), num=_num\n    )\n    for _position in positions:\n        _position["cost"] = 999.0\n    return positions\n''',
+        "test": f"{TEST}.test_port1_explicit_cycle_owns_quantity",
+        "desc": "use current projection cost for historical cycle",
+    },
+    {
+        "id": "M-PORT12", "file": READ_MODEL,
+        "old": '''    if missing_codes:\n        market_value = None\n        unrealized = None\n        market_status = STATUS_UNKNOWN\n    else:\n        market_status = STATUS_VERIFIED\n''',
+        "new": '''    market_status = STATUS_VERIFIED\n''',
+        "test": f"{TEST}.test_port9_unknown_valuation_stays_unknown",
+        "desc": "remove unknown valuation preservation",
+    },
+]
+
+
+def sha256(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def _adapt_eol(text: str, original: bytes) -> bytes:
+    if original.count(b"\r\n") > 0:
+        text = text.replace("\r\n", "\n").replace("\n", "\r\n")
+    return text.encode("utf-8")
+
+
+PYCACHE_ROOT = tempfile.mkdtemp(prefix="r22_mutation_pycache_")
+_SEQ = [0]
+
+
+def run_test(target: str) -> subprocess.CompletedProcess:
+    _SEQ[0] += 1
+    env = dict(os.environ)
+    env["PYTHONPYCACHEPREFIX"] = os.path.join(PYCACHE_ROOT, f"run{_SEQ[0]:03d}")
+    env["PYTHONIOENCODING"] = "utf-8"
+    return subprocess.run(
+        [sys.executable, "-m", "unittest", target],
+        cwd=BACKEND, capture_output=True, text=True, encoding="utf-8",
+        errors="replace", timeout=600, env=env,
+    )
+
+
+def main() -> int:
+    print(f"repo root: {ROOT}")
+    results = []
+    for mutation in MUTATIONS:
+        path = os.path.join(ROOT, mutation["file"])
+        with open(path, "rb") as handle:
+            original = handle.read()
+        before = sha256(original)
+        text = original.decode("utf-8").replace("\r\n", "\n")
+        old = mutation["old"]
+        new = mutation["new"]
+        if mutation.get("last"):
+            index = text.rfind(old)
+            assert index >= 0, f'{mutation["id"]}: anchor not found'
+            mutated = text[:index] + new + text[index + len(old):]
+        else:
+            assert text.count(old) >= 1, f'{mutation["id"]}: anchor not found'
+            mutated = text.replace(old, new, 1)
+        try:
+            with open(path, "wb") as handle:
+                handle.write(_adapt_eol(mutated, original))
+            result = run_test(mutation["test"])
+            red = result.returncode != 0
+            results.append(red)
+            print(f'{mutation["id"]} {mutation["desc"]}: '
+                  f'{"RED" if red else "SURVIVED"}')
+            if not red:
+                print(result.stdout[-2000:])
+                print(result.stderr[-2000:])
+        finally:
+            with open(path, "wb") as handle:
+                handle.write(original)
+            with open(path, "rb") as handle:
+                after = sha256(handle.read())
+            if after != before:
+                raise RuntimeError(f'{mutation["id"]}: restore sha256 mismatch')
+    red_count = sum(results)
+    print(f"R22 mutations: {red_count}/{len(results)} RED; survived={len(results)-red_count}")
+    print("restore sha256: PASS")
+    return 0 if red_count == len(results) else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

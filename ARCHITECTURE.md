@@ -523,6 +523,36 @@ durable scan claim、running/completed/failed 生命周期仍由 `paper_trading.
 公共 facade 持有；`paper_risk_service` 不 import `paper_trading`，只依赖只读
 evidence / read model、纯决策模块、`execution_planner` 和明确注入的基础设施 ports。
 
+## Portfolio / Read Model 边界（R22）
+
+```text
+verified execution / durable lot facts
+              ↓
+paper_position_lots / verified fill facts
+              ↓
+cycle + as-of bounded PortfolioReadContext
+              ↓
+portfolio metrics / risk / dashboard / research consumers
+```
+
+职责边界：
+
+- `backend/paper_portfolio_read_model.py` 是显式 `(cycle_id, asof_day)` 的只读组合读模型；它不 import `paper_trading`，不创建周期，不读取 wall clock。
+- 数量由 `paper_position_lots.qty` 减去 as-of 前已验证 SELL fill 重建；当前 `remaining_qty` 只属于 current read，不是历史权威。
+- acquisition cost 来自 durable lot `cost`；`display_cost` 只有完整同周期、as-of 前现金流证据时才使用 `verified_cash_flow`。
+- realized PnL 只汇总已验证 committed SELL execution facts；pending / rejected / unverified / future fill 不进入历史组合。
+- cash 由周期固定资本加 as-of 前已验证 fill 净现金流重建；current `paper_accounts.cash` 不回填历史 cash。
+- market value / unrealized PnL / NAV 只使用 caller 显式传入的 bounded valuation evidence；缺失时保持 `None` / `unknown`，绝不回落 current quote。
+- `paper_positions` 仍是 compatibility projection；projection 不拥有 execution authority。
+
+Invariants：
+
+1. A bounded portfolio read never re-resolves the current cycle.
+2. Future executions cannot change a historical as-of portfolio view.
+3. Projection state is never promoted to execution authority.
+4. Missing historical valuation remains unknown; it is not replaced by a current quote.
+5. Portfolio reads do not create or mutate execution facts.
+
 ## 目标依赖方向
 
 ```text

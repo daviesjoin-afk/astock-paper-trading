@@ -43,6 +43,7 @@ def _get_se():
 
 import paper_storage as PST
 import paper_position_read_model as PPRM
+import paper_portfolio_read_model as PPort
 import paper_position_risk_state as PPRS
 import paper_repository as PRP
 import paper_performance as PPerf
@@ -3038,20 +3039,19 @@ def _credit_shared_cash(conn, amount, account_id):
     )
 
 
-def _shared_account_exposure(conn, quotes, asof_day=None):
-    positions = _position_rows(conn, asof_day=asof_day)
-    value = 0.0
-    industries = {}
-    codes = {}
-    for pos in positions:
-        price = _num((quotes.get(pos["code"]) or {}).get("price"), _num(pos["cost"]))
-        item_value = _num(pos["qty"]) * price
-        value += item_value
-        codes[pos["code"]] = codes.get(pos["code"], 0.0) + item_value
-        industry = pos.get("industry") or "未知"
-        industries[industry] = industries.get(industry, 0.0) + item_value
-    cash = _shared_cash(conn)
-    return positions, value, cash + value, industries, codes
+def _shared_account_exposure(conn, quotes, asof_day=None, *, cycle_id=None):
+    if cycle_id is None:
+        positions = _position_rows(conn, asof_day=asof_day)
+        cash = _shared_cash(conn)
+    else:
+        positions = PPRM.positions_for_cycle(conn, cycle_id, asof_day=asof_day)
+        if asof_day is None:
+            cash = _shared_cash(conn, cycle_id)
+        else:
+            context = PPort.PortfolioReadContext(cycle_id, asof_day); cash = PPort.cash(conn, context)[0]
+            cash = PPort.initial_capital(conn, context) if cash is None else cash
+    value, industries, codes = PPort.exposure(positions, quotes, num=_num)
+    return positions, value, (cash + value) if cash is not None else None, industries, codes
 
 
 def _shared_risk_state(conn, account, nav, asof_day):
@@ -10695,7 +10695,7 @@ def _risk_service_ports():
         evidence=evidence,
         open_db=_db,
         load_market_inputs=_risk_load_market_inputs,
-        shared_exposure=lambda conn, day, quotes: _shared_account_exposure(conn, quotes, day)[1:3],
+        shared_exposure=lambda conn, day, quotes, cycle_id=None: _shared_account_exposure(conn, quotes, day, cycle_id=cycle_id)[1:3],
         dynamic_position_limits=_dynamic_position_limits,
         risk_profile=_risk_profile,
         risk_exit_account_ids=_risk_exit_account_ids,
