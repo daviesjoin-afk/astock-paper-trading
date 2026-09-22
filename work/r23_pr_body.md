@@ -410,9 +410,10 @@ This round changed **no production logic**. It answered the E2E flakiness questi
 with measurements, and removed two pieces of verification complexity that had become
 self-contradictory.
 
-### 16.1 The GitHub exact-head run did have a flaky test — stated plainly
+### 16.1 The browser job on `6fbf475` did have a flaky test — stated plainly
 
-The CI *check* was green, but the browser job log is not:
+On `6fbf475685216cd71d85e455e023835181e20d1d` the CI *check* was green, but the
+browser job log is not:
 
 ```
 Running 32 tests using 1 worker
@@ -456,14 +457,29 @@ navigation. It is a fixed environment-sensitive cost, not a lock or a regression
 **(a) Frontend is byte-identical.** `git diff c872ae1..6fbf475 -- frontend/` is
 empty, so the page requests exactly the same things in both versions.
 
-**(b) Controlled interleaved A/B on the slow path**, both versions measured under the
-same CI-like no-network condition:
+**(b) Genuinely interleaved A/B on the slow path** (`work/r23_round4_ab_timing.py
+--rounds 6`). Each round measures **both** versions back to back and the order swaps
+every round (AB, BA, AB…), so drift in machine load is shared by both sides.
+Independent process and independent temp data dir per measurement, same CI-like
+no-network condition throughout. The runner asserts the schedule really is
+interleaved (every round contains both versions, the leading version alternates,
+longest same-version run ≤ 2) and prints the real order:
 
-| | master `c872ae1` | R23 head `6fbf475` |
+```
+master → R23 → R23 → master → master → R23 → R23 → master → master → R23 → R23 → master
+```
+
+Two independent interleaved runs, `strategy_allocation_explain` median delta
+(R23 − master):
+
+| run | Δ explain | verdict |
 |---|---|---|
-| `fetch_market_snapshot_full` (median of 5) | 13.739s | 13.693s |
-| `strategy_allocation_explain` (median of 5) | 13.744s | 13.799s |
-| Δ explain | — | **+0.055s** |
+| 1 | **+0.035s** | NO REGRESSION |
+| 2 | **+0.088s** | NO REGRESSION |
+
+Both are tens of milliseconds against a ~13.8s single-pass cost — noise, not a
+difference. Raw per-sample seconds are in `work/r23_handoff.md`; they drift with
+runner load and are not merge evidence.
 
 `BEGIN IMMEDIATE` is not implicated: the lock audit (§16.6) shows no provider call
 inside the write lock, and the DB costs 3-4 ms either way.
@@ -486,20 +502,20 @@ Under the CI-equivalent configuration (`--workers=1 --retries=0`):
 The exact-head CI run from §16.1 is reported as it happened (1 flaky / 31 passed);
 the numbers above are a separate, later measurement under the same settings.
 
-### 16.5 The new exact-head CI run is clean
+### 16.5 The exact-head browser job is clean
 
-After this round's commit, the same browser job on the new head reports:
+Browser job on the head this PR was reviewed at
+(`b34b6334534359254b501303d9f7e9130de815a9`): **32 passed, `workers=1`, no retry, no
+flaky**.
 
-```
-Running 32 tests using 1 worker
-  ✓ 11 ... paper-runtime.spec.js:23:3 ... 面板只读：无定义编辑控件，且可跳回策略工坊详情 (10.9s)
-  32 passed (1.8m)
-```
-
-No `flaky`, no `retry #` anywhere in the log (grep count 0), and the previously
-failing test went from >60s + 49.4s retry to **10.9s**. The other exact-head checks
-are green as well: `tests (3.11)`, `tests (3.12)` (**Ran 4006 tests, OK**),
+`flaky` and `retry #` do not appear anywhere in that log (grep count 0). The other
+exact-head checks are green as well: `tests (3.11)`, `tests (3.12)` (**Ran 4006
+tests, OK**),
 `syntax`, `quality`, `docker-smoke`, `frontend`, `security-leak-scan` ×2.
+
+Per-case wall-clock seconds from this investigation are recorded in
+`work/r23_handoff.md` rather than here: they drift with runner load and are not merge
+evidence.
 
 Note that this clean run does not prove the underlying slowness is gone — it is the
 same offline snapshot-refresh cost from §16.2, which happens to fit inside the budget
