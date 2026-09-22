@@ -23,7 +23,9 @@ import sqlite3
 import sys
 import tempfile
 import unittest
-import unittest.mock as mock  # noqa: F401 - 供子类 mock.patch 使用
+import unittest.mock as mock  # noqa: F401  # noqa: F401 - 供子类 mock.patch 使用
+
+from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -930,6 +932,284 @@ class AsOfIsolationTests(_IsolatedStudy):
             {row["id"] for row in self.runs(strategy_id=None, day=DAY)},
             {run["run_id"] for group in PS.latest()["strategies"] for run in group["runs"]})
         self.assertEqual(PS.latest(trade_date=DAY)["trade_date"], DAY)
+
+
+# ---------------------------------------------------------------------------
+# R23 review round —— 迁移重建顺序 / 中断恢复 / 冲突刷新（3 条 review findings）
+# ---------------------------------------------------------------------------
+
+#: 升级前的 family B 结构。子表**必须**带 ``REFERENCES``：finding 1 的全部内容
+#: 就是 SQLite 会跟着 ``RENAME`` 改写子表的 FK 目标。用一份不带 FK 的 DDL 来测，
+#: 会把这条 finding 测成永远绿色的假测试。
+LEGACY_TRACKING_RUNS = """
+CREATE TABLE selection_runs (
+    id INTEGER PRIMARY KEY,
+    run_date TEXT NOT NULL,
+    generated_at TEXT NOT NULL,
+    strategy TEXT NOT NULL,
+    strategy_name TEXT NOT NULL,
+    data_asof_date TEXT,
+    benchmark_entry_price REAL,
+    universe_size INTEGER,
+    candidate_count INTEGER,
+    selected_count INTEGER,
+    executable_count INTEGER,
+    source TEXT NOT NULL,
+    result_json TEXT NOT NULL,
+    UNIQUE(run_date, strategy)
+)
+"""
+
+LEGACY_TRACKING_PICKS = """
+CREATE TABLE selection_picks (
+    id INTEGER PRIMARY KEY,
+    run_id INTEGER NOT NULL REFERENCES selection_runs(id) ON DELETE CASCADE,
+    rank_no INTEGER NOT NULL,
+    code TEXT NOT NULL,
+    snapshot_json TEXT NOT NULL
+)
+"""
+
+
+class _LegacyTracking(unittest.TestCase):
+    """把 family B 库造成升级前的形状（含真实 FK 与一行历史 run）。"""
+
+    RUN_ID = 7
+    PICK_ID = 1
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.addCleanup(self.tmp.cleanup)
+        self.path = os.path.join(self.tmp.name, "selection_tracking.db")
+        self.conn = sqlite3.connect(self.path, timeout=20)
+        self.addCleanup(self.conn.close)
+        self.conn.executescript(LEGACY_TRACKING_RUNS + ";" + LEGACY_TRACKING_PICKS + ";")
+        self.conn.execute(
+            "INSERT INTO selection_runs(id, run_date, generated_at, strategy,"
+            " strategy_name, source, result_json)"
+            " VALUES(?,?,?,?,?,?,?)",
+            (self.RUN_ID, "2026-09-01", "2026-09-01T15:05:00", "trend_pullback",
+             "趋势波段", "scheduled", "{}"),
+        )
+        self.conn.execute(
+            "INSERT INTO selection_picks(id, run_id, rank_no, code, snapshot_json)"
+            " VALUES(?,?,?,?,?)",
+            (self.PICK_ID, self.RUN_ID, 1, "600000", "{}"),
+        )
+        self.conn.commit()
+
+    def fk_target(self, table="selection_picks"):
+        sql = self.conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name=?", (table,)
+        ).fetchone()[0]
+        return sql.split("REFERENCES")[1].split("(")[0].strip() if "REFERENCES" in sql else None
+
+    def migrate(self):
+        """调用真实 ``ensure_schema``，而不是单独调 ``_migrate_runs``。
+
+        迁移顺序（外键开关、guard 安装）本身就是 finding 1 的一部分，绕过
+        ``ensure_schema`` 就等于把被测对象换成了另一个较短的路径。
+        """
+        old = ST.DB_PATH
+        ST.DB_PATH = self.path
+        try:
+            ST.ensure_schema()
+        finally:
+            ST.DB_PATH = old
+
+
+class RunTableRebuildTests(_LegacyTracking):
+    def test_RF01_rebuild_keeps_child_fk_pointing_at_selection_runs(self):
+        """finding 1：重建后子表 FK 必须仍指向 ``selection_runs``。
+
+        回归的是真实故障：``RENAME selection_runs TO selection_runs_legacy`` 会被
+        SQLite 传播到子表，``DROP TABLE selection_runs_legacy`` 之后子表 schema
+        指向不存在的表 —— 插入 pick 报
+        ``no such table: main.selection_runs_legacy``。
+        """
+        self.migrate()
+        self.conn.close()
+        self.conn = sqlite3.connect(self.path, timeout=20)
+        self.addCleanup(self.conn.close)
+        # 正对照：DDL 里确实有 REFERENCES，否则本测试什么也没测。
+        self.assertEqual(self.fk_target(), "selection_runs",
+                         "重建后子表 FK 指向了别的表（finding 1 复发）")
+        self.assertTrue(
+            self.conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='selection_runs'"
+            ).fetchone(), "重建后 selection_runs 不存在")
+        # 历史数据未被 CASCADE 带走。
+        self.assertEqual(
+            self.conn.execute("SELECT COUNT(*) FROM selection_picks").fetchone()[0],
+            1, "重建把 picks 丢了（ON DELETE CASCADE 被触发）")
+        # 真正的验收：picks 仍可写入，且必须通过 FK 校验。
+        self.conn.execute("PRAGMA foreign_keys = ON")
+        run_id = self.conn.execute("SELECT id FROM selection_runs").fetchone()[0]
+        self.conn.execute(
+            "INSERT INTO selection_picks(run_id, rank_no, code, snapshot_json)"
+            " VALUES(?,?,?,?)", (run_id, 2, "600001", "{}"))
+        self.conn.commit()
+
+    def test_RF02_interrupted_rebuild_does_not_discard_the_only_copy(self):
+        """finding 2：中断在「改名之后、拷贝之前」时，legacy 表是唯一副本。
+
+        旧实现下次启动无条件 ``DROP TABLE selection_runs_legacy``，历史直接消失。
+        现在必须先回收再删。
+        """
+        # 模拟中断：只执行旧实现的第一条语句。
+        self.conn.execute("ALTER TABLE selection_runs RENAME TO selection_runs_legacy")
+        self.conn.commit()
+        rows_before = self.conn.execute(
+            "SELECT COUNT(*) FROM selection_runs_legacy").fetchone()[0]
+        self.assertEqual(rows_before, 1)
+        self.conn.close()
+
+        self.migrate()
+
+        self.conn.close()
+        self.conn = sqlite3.connect(self.path, timeout=20)
+        self.addCleanup(self.conn.close)
+        rows_after = self.conn.execute(
+            "SELECT COUNT(*) FROM selection_runs").fetchone()[0]
+        self.assertEqual(rows_after, rows_before,
+                         "中断恢复把历史 runs 丢了（finding 2 复发）")
+        self.assertFalse(
+            self.conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table'"
+                " AND name='selection_runs_legacy'").fetchone(),
+            "legacy 副本应已回收并删除")
+        # 历史行必须保留可读身份，而不是被 NULL 掉。
+        row = self.conn.execute(
+            "SELECT run_date, strategy, provenance_status FROM selection_runs").fetchone()
+        self.assertEqual(row[0], "2026-09-01")
+        self.assertEqual(row[1], "trend_pullback")
+        self.assertEqual(row[2], SP.STATUS_LEGACY_UNPROVEN,
+                         "回收来的历史行必须显式声明为 legacy_unproven")
+
+    def test_RF03_rebuild_is_idempotent_and_leaves_no_legacy_tables(self):
+        """正对照：正常路径跑两次不产生 legacy 残留，也不重复插入。"""
+        self.migrate()
+        self.migrate()
+        self.conn.close()
+        self.conn = sqlite3.connect(self.path, timeout=20)
+        self.addCleanup(self.conn.close)
+        leftovers = [
+            row[0] for row in self.conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+                " AND name LIKE 'selection_runs%'")
+        ]
+        self.assertEqual(sorted(leftovers), ["selection_runs"],
+                         f"重建留下了临时表：{leftovers}")
+        self.assertEqual(
+            self.conn.execute("SELECT COUNT(*) FROM selection_runs").fetchone()[0], 1)
+        self.assertEqual(
+            self.conn.execute("SELECT COUNT(*) FROM selection_picks").fetchone()[0], 1)
+
+
+class SignalRefreshTests(LedgerProvenanceTests):
+    """finding 3：升级后的首次盘中刷新必须能刷新**升级前就存在**的 signal。
+
+    这类 signal 的 provenance 列诚实地是 NULL，而 v23 与既有的 stamp trigger 都
+    禁止把 NULL 改成值 —— 所以刷新语句不能把不可变列放进 ``DO UPDATE SET``。
+    """
+
+    def _legacy_signal(self, code="600901"):
+        """写入一行「升级前」形状的 signal：**stamp 真实、cycle_id 未知**。
+
+        finding 3 描述的正是这个形状 —— 升级前写入的 signal 早于 v23 加列，所以
+        ``cycle_id`` 诚实地是 NULL；而 stamp 列当时就已存在并有值。行是在 guard
+        安装**之前**写进去的，所以按仓库既有写法临时卸下 guard 再装回
+        （见 ``test_deferred_fill_cycle_binding``），而不是放宽 guard。
+        """
+        import paper_schema_migrations as PSM
+        stamp = self.PT._strategy_stamp(self.conn, self.ACCOUNT)
+        self.conn.execute(
+            "DROP TRIGGER IF EXISTS trg_paper_signals_cycle_provenance_insert")
+        try:
+            self.conn.execute(
+                "INSERT INTO paper_signals(account_id, signal_date, intended_date, code,"
+                " name, close_price, rank_score, payload, status, reason, created_at,"
+                " strategy_id, strategy_version, strategy_checksum, cycle_id)"
+                " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,NULL)",
+                (self.ACCOUNT, DAY, DAY, code, "旧信号", 10.0, 1.0, "{}", "pending",
+                 "升级前写入", "2026-09-07T09:35:00", *stamp),
+            )
+        finally:
+            PSM._ensure_signal_cycle_provenance_guards(self.conn)
+        self.conn.commit()
+
+    def _upsert(self):
+        """抽取**生产**的 ``INSERT ... ON CONFLICT`` 语句。
+
+        手抄一份 SQL 会在生产语句改动后继续通过 —— 那正是探针失明的成因。
+        """
+        src = (Path(__file__).resolve().parent / "paper_trading.py").read_text(
+            encoding="utf-8")
+        start = src.index('"""INSERT INTO paper_signals(\n')
+        end = src.index('"""', start + 3)
+        stmt = src[start + 3:end]
+        self.assertIn("ON CONFLICT(account_id,signal_date,code)", stmt)
+        head = stmt.split(")", 1)[0].split("(", 1)[1]
+        return stmt, [part.strip() for part in head.split(",")]
+
+    def test_RF04_bootstrap_refresh_updates_a_pre_upgrade_signal(self):
+        """finding 3：升级后的首次刷新**不得**抛异常，且必须保留原 provenance。"""
+        self._legacy_signal()
+        before = self.conn.execute(
+            "SELECT strategy_id, strategy_version, strategy_checksum, cycle_id"
+            " FROM paper_signals WHERE account_id=? AND code=?",
+            (self.ACCOUNT, "600901")).fetchone()
+        self.assertTrue(before["strategy_id"], "夹具的 stamp 必须真实")
+        self.assertIsNone(before["cycle_id"], "夹具的 cycle_id 必须未知（finding 3 的形状）")
+        stmt, order = self._upsert()
+        # 生产环境的账号 stamp 来自 cycle pin，所以「升级后的刷新」带来的 stamp 与
+        # 既有行**相同** —— 这条 finding 只可能是 cycle_id 一列被改写（review 描述
+        # 的形状）。stamp 列本身也在 SET 里，但值相同，所以只有 cycle 那条 trigger
+        # 会 abort。
+        stamp = self.stamp()
+        values = {
+            "account_id": self.ACCOUNT, "signal_date": DAY, "intended_date": DAY,
+            "code": "600901", "name": "新信号", "industry": "银行",
+            "close_price": 11.0, "rank_score": 2.0, "t_tier": "A", "t_score": 1.5,
+            "payload": "{}", "status": "ready", "reason": "刷新", "created_at": "t2",
+            "strategy_id": stamp[0], "strategy_version": stamp[1],
+            "strategy_checksum": stamp[2], "cycle_id": self.cycle_id,
+        }
+        self.assertEqual(set(order), set(values),
+                         f"探针列集合与生产语句不一致：{set(order) ^ set(values)}")
+        # 不能抛 IntegrityError —— 那正是 finding 3 的真实故障。
+        self.conn.execute(stmt, tuple(values[column] for column in order))
+        self.conn.commit()
+        row = self.conn.execute(
+            "SELECT status, name, strategy_id, cycle_id FROM paper_signals"
+            " WHERE account_id=? AND code=?", (self.ACCOUNT, "600901"),
+        ).fetchone()
+        # 决策字段被刷新（证明确实走了 UPDATE 分支，不是插了一行新的）
+        self.assertEqual(row["name"], "新信号")
+        self.assertEqual(row["status"], "ready")
+        # 不可变 provenance 保持原样：NULL 就是 NULL，绝不回填。
+        self.assertEqual(row["strategy_id"], before["strategy_id"],
+                         "刷新语句回填/改写了不可变的 strategy stamp")
+        self.assertIsNone(row["cycle_id"],
+                          "刷新语句回填了不可变的 cycle 归属（finding 3 复发）")
+        self.assertEqual(
+            self.conn.execute(
+                "SELECT COUNT(*) FROM paper_signals WHERE account_id=? AND code=?",
+                (self.ACCOUNT, "600901")).fetchone()[0],
+            1, "刷新兴建了第二行，而不是更新既有行")
+
+    def test_RF05_provenance_columns_are_absent_from_the_conflict_update(self):
+        """静态：``DO UPDATE SET`` 不得包含任何不可变 provenance 列。
+
+        快照断言在「第一次刷新恰好成功」时会漏掉这条，静态断言则无论 fixtures
+        如何都能挡住 —— 两条互补，缺一不可。
+        """
+        stmt, _order = self._upsert()
+        set_clause = stmt.split("DO UPDATE SET", 1)[1]
+        for column in ("cycle_id", "strategy_id", "strategy_version",
+                       "strategy_checksum"):
+            self.assertNotIn(f"{column}=excluded.{column}", set_clause,
+                             f"刷新语句仍会改写不可变列 {column}")
 
 
 if __name__ == "__main__":

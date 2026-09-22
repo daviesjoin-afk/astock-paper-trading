@@ -245,6 +245,31 @@ MUTATIONS = [
         "test": f"{SP}.SelectionProvenanceTests.test_SP06_archived_strategy_history_still_resolves",
         "desc": "archived strategy 无法 replay 历史 version（lifecycle 当历史权威）",
     },
+    # ---- M-RF1..M-RF3：review findings（迁移重建顺序 / 中断恢复 / 冲突刷新）----
+    {
+        'id': 'M-RF1',
+        'file': 'backend/selection_tracking.py',
+        'old': '    conn.executescript(_runs_ddl(staged))\n    conn.execute(\n        f"""INSERT OR IGNORE INTO {staged}({select_legacy},\n                provenance_status, provenance_key, asof_day, scope, cycle_id,\n                strategy_id, strategy_version, strategy_checksum)\n            SELECT {select_legacy}, \'{SP.STATUS_LEGACY_UNPROVEN}\',\n                   \'{LEGACY_KEY_PREFIX}|\' || run_date || \'|\' || strategy,\n                   data_asof_date, \'{SP.SCOPE_RESEARCH}\', NULL, NULL, NULL, NULL\n            FROM selection_runs"""\n    )\n    conn.execute("DROP TABLE selection_runs")\n    conn.execute(f"ALTER TABLE {staged} RENAME TO selection_runs")',
+        'new': '    conn.execute(f"ALTER TABLE selection_runs RENAME TO {legacy}")\n    conn.executescript(_runs_ddl(staged))\n    conn.execute(\n        f"""INSERT OR IGNORE INTO {staged}({select_legacy},\n                provenance_status, provenance_key, asof_day, scope, cycle_id,\n                strategy_id, strategy_version, strategy_checksum)\n            SELECT {select_legacy}, \'{SP.STATUS_LEGACY_UNPROVEN}\',\n                   \'{LEGACY_KEY_PREFIX}|\' || run_date || \'|\' || strategy,\n                   data_asof_date, \'{SP.SCOPE_RESEARCH}\', NULL, NULL, NULL, NULL\n            FROM {legacy}"""\n    )\n    conn.execute(f"DROP TABLE {legacy}")\n    conn.execute(f"ALTER TABLE {staged} RENAME TO selection_runs")',
+        'test': 'test_strategy_selection_provenance.RunTableRebuildTests.test_RF01_rebuild_keeps_child_fk_pointing_at_selection_runs',
+        'desc': 'run 表重建改回「先重命名父表」（子表 FK 跟着走，DROP 后悬空）',
+    },
+    {
+        'id': 'M-RF2',
+        'file': 'backend/selection_tracking.py',
+        'old': '    _absorb_leftover_runs(conn, legacy, staged)',
+        'new': '    conn.execute(f"DROP TABLE IF EXISTS {legacy}")',
+        'test': 'test_strategy_selection_provenance.RunTableRebuildTests.test_RF02_interrupted_rebuild_does_not_discard_the_only_copy',
+        'desc': '中断恢复无条件 DROP legacy 表（丢掉唯一副本）',
+    },
+    {
+        'id': 'M-RF3',
+        'file': 'backend/paper_trading.py',
+        'old': '                               created_at=excluded.created_at"""',
+        'new': '                               created_at=excluded.created_at,\n                               strategy_id=excluded.strategy_id,\n                               strategy_version=excluded.strategy_version,\n                               strategy_checksum=excluded.strategy_checksum,\n                               cycle_id=excluded.cycle_id"""',
+        'test': 'test_strategy_selection_provenance.SignalRefreshTests.test_RF04_bootstrap_refresh_updates_a_pre_upgrade_signal',
+        'desc': '刷新语句重新写入不可变 provenance 列（升级后首次刷新 abort）',
+    },
 ]
 
 

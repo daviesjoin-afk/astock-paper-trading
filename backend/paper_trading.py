@@ -11351,11 +11351,7 @@ def _bootstrap_signals_for_today(asof_day, live_universe=None, source_slot="intr
                                payload=excluded.payload,
                                status=excluded.status,
                                reason=excluded.reason,
-                               created_at=excluded.created_at,
-                               strategy_id=excluded.strategy_id,
-                               strategy_version=excluded.strategy_version,
-                               strategy_checksum=excluded.strategy_checksum,
-                               cycle_id=excluded.cycle_id""",
+                               created_at=excluded.created_at""",
                         (
                             account["id"], factor_day.isoformat(), day.isoformat(), code,
                             pick.get("name"), pick.get("industry"),

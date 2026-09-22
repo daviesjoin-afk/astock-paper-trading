@@ -55,34 +55,7 @@ def ensure_schema():
         # （前向验证样本不可再生）。PRAGMA 必须在任何 DML 之前生效。
         conn.execute("PRAGMA foreign_keys = OFF")
         conn.executescript(
-            """
-            CREATE TABLE IF NOT EXISTS selection_runs (
-                id INTEGER PRIMARY KEY,
-                run_date TEXT NOT NULL,
-                generated_at TEXT NOT NULL,
-                strategy TEXT NOT NULL,
-                strategy_name TEXT NOT NULL,
-                data_asof_date TEXT,
-                benchmark_entry_price REAL,
-                universe_size INTEGER,
-                candidate_count INTEGER,
-                selected_count INTEGER,
-                executable_count INTEGER,
-                source TEXT NOT NULL,
-                result_json TEXT NOT NULL,
-                -- R23 run 级 provenance：strategy_* 在本系列诚实地保持 NULL
-                -- （``strategy`` 是模型族 id，注册表里不存在），状态为
-                -- ``not_applicable``；asof/scope 则必须固定下来。
-                provenance_status TEXT,
-                provenance_key TEXT,
-                asof_day TEXT,
-                scope TEXT,
-                cycle_id INTEGER,
-                strategy_id TEXT,
-                strategy_version INTEGER,
-                strategy_checksum TEXT,
-                UNIQUE(run_date, strategy, provenance_key)
-            );
+            _runs_ddl() + """;
             CREATE TABLE IF NOT EXISTS selection_picks (
                 id INTEGER PRIMARY KEY,
                 run_id INTEGER NOT NULL REFERENCES selection_runs(id) ON DELETE CASCADE,
@@ -160,35 +133,14 @@ def _unique_index_columns(conn, table) -> set[tuple[str, ...]]:
     return found
 
 
-def _migrate_runs(conn) -> None:
-    """Rebuild a pre-R23 run table into the provenance-keyed shape (idempotent).
+def _runs_ddl(table: str = "selection_runs") -> str:
+    """Canonical run-table DDL: the fresh and rebuilt tables share one definition.
 
-    迁移策略（规格 §9 / §8）：只**新增** NULL provenance 列并标
-    ``provenance_status='legacy_unproven'``；唯一契约从 ``(run_date, strategy)``
-    改为 ``(run_date, strategy, provenance_key)`` —— 约束本身是错的，只 ADD
-    COLUMN 会让「同日同策略、不同 as-of」继续互相覆盖，所以必须重建。
-    **绝不**用今天的 Registry / generation 时间回填历史 provenance。
-
-    崩溃安全：沿用 SQLite 官方重建顺序（新表 → 拷贝 → 删旧 → 改名），并且在
-    外键关闭时进行，绝不让 ``ON DELETE CASCADE`` 把 picks/observations 带走。
+    Keeping a single definition is what makes the rebuild order safe - see
+    ``_migrate_runs``.
     """
-    legacy = "selection_runs_legacy"
-    if _table_exists(conn, legacy):
-        conn.execute("DROP TABLE " + legacy)
-    columns = _columns(conn, "selection_runs")
-    unique = _unique_index_columns(conn, "selection_runs")
-    if "provenance_key" in columns and ("run_date", "strategy", "provenance_key") in unique:
-        return
-    present = [name for name in LEGACY_RUN_COLUMNS if name in columns]
-    select_legacy = ", ".join(present)
-    columns_sql = ", ".join(present + [
-        "provenance_status", "provenance_key", "asof_day", "scope", "cycle_id",
-        "strategy_id", "strategy_version", "strategy_checksum",
-    ])
-    conn.executescript(
-        f"""
-        ALTER TABLE selection_runs RENAME TO {legacy};
-        CREATE TABLE selection_runs (
+    return f"""
+        CREATE TABLE IF NOT EXISTS {table} (
             id INTEGER PRIMARY KEY,
             run_date TEXT NOT NULL,
             generated_at TEXT NOT NULL,
@@ -202,6 +154,9 @@ def _migrate_runs(conn) -> None:
             executable_count INTEGER,
             source TEXT NOT NULL,
             result_json TEXT NOT NULL,
+            -- R23 run 级 provenance：strategy_* 在本系列诚实地保持 NULL
+            -- （``strategy`` 是模型族 id，注册表里不存在），状态为
+            -- ``not_applicable``；asof/scope 则必须固定下来。
             provenance_status TEXT,
             provenance_key TEXT,
             asof_day TEXT,
@@ -211,15 +166,105 @@ def _migrate_runs(conn) -> None:
             strategy_version INTEGER,
             strategy_checksum TEXT,
             UNIQUE(run_date, strategy, provenance_key)
-        );
-        INSERT INTO selection_runs({columns_sql})
-        SELECT {select_legacy}, '{SP.STATUS_LEGACY_UNPROVEN}',
-               '{LEGACY_KEY_PREFIX}|' || run_date || '|' || strategy,
-               data_asof_date, '{SP.SCOPE_RESEARCH}', NULL, NULL, NULL, NULL
-        FROM {legacy};
-        DROP TABLE {legacy};
-        """
+        )
+    """
+
+
+def _absorb_leftover_runs(conn, legacy: str, staged: str) -> None:
+    """Recover from an interrupted rebuild instead of deleting its only copy.
+
+    Two leftovers exist in the wild, and both used to be destroyed on sight:
+
+    * ``selection_runs_legacy`` - an *interrupted pre-fix* migration renamed the
+      parent and then died. If the parent is gone the rename is simply undone;
+      if the parent survived, the leftover rows are folded back in (by ``id``)
+      *before* the leftover is dropped, so recovery can never discard the only
+      surviving copy of the research history.
+    * ``selection_runs_new`` - the staged table of this implementation. When the
+      parent is gone, the staged table **is** the history and is promoted back.
+
+    Fold/promote are idempotent, so a crash in the middle of recovery is itself
+    recoverable.
+    """
+    if _table_exists(conn, staged) and not _table_exists(conn, "selection_runs"):
+        conn.execute(f"ALTER TABLE {staged} RENAME TO selection_runs")
+    if not _table_exists(conn, legacy):
+        return
+    if not _table_exists(conn, "selection_runs"):
+        conn.execute(f"ALTER TABLE {legacy} RENAME TO selection_runs")
+        return
+    parent_columns = _columns(conn, "selection_runs")
+    present = [name for name in LEGACY_RUN_COLUMNS
+               if name in _columns(conn, legacy) and name in parent_columns]
+    if present:
+        columns_sql = ", ".join(present)
+        # A rebuilt parent already carries provenance columns: stamp the folded
+        # rows as legacy-unproven so no row is ever left without a declared
+        # state. A pre-R23 parent has no such columns, and the normal migration
+        # stamps them a moment later - so only select what exists.
+        if "provenance_key" in parent_columns:
+            conn.execute(
+                f"""INSERT OR IGNORE INTO selection_runs({columns_sql},
+                        provenance_status, provenance_key, asof_day, scope, cycle_id,
+                        strategy_id, strategy_version, strategy_checksum)
+                    SELECT {columns_sql}, '{SP.STATUS_LEGACY_UNPROVEN}',
+                           '{LEGACY_KEY_PREFIX}|' || run_date || '|' || strategy,
+                           data_asof_date, '{SP.SCOPE_RESEARCH}', NULL, NULL, NULL, NULL
+                    FROM {legacy}"""
+            )
+        else:
+            conn.execute(
+                f"INSERT OR IGNORE INTO selection_runs({columns_sql})"
+                f" SELECT {columns_sql} FROM {legacy}"
+            )
+    conn.execute(f"DROP TABLE {legacy}")
+
+
+def _migrate_runs(conn) -> None:
+    """Rebuild a pre-R23 run table into the provenance-keyed shape (idempotent).
+
+    迁移策略（规格 §9 / §8）：只**新增** NULL provenance 列并标
+    ``provenance_status='legacy_unproven'``；唯一契约从 ``(run_date, strategy)``
+    改为 ``(run_date, strategy, provenance_key)`` —— 约束本身是错的，只 ADD
+    COLUMN 会让「同日同策略、不同 as-of」继续互相覆盖，所以必须重建。
+    **绝不**用今天的 Registry / generation 时间回填历史 provenance。
+
+    崩溃安全 = 两步合一：
+
+    1. **绝不重命名被引用的父表**。``selection_picks.run_id`` 有
+       ``REFERENCES selection_runs(id) ON DELETE CASCADE``，而 SQLite 在
+       ``ALTER TABLE ... RENAME TO`` 时会把子表的 FK 目标一起改写：曾经
+       ``RENAME selection_runs TO selection_runs_legacy`` → 删掉 legacy → 子表
+       schema 就指向了一张不存在的表，此后任何 pick 插入都是
+       ``no such table: main.selection_runs_legacy``。现在按 SQLite 官方顺序
+       「建新表 → 拷贝 → 删旧表 → 改名」，父表名字在重建期间**始终可用**。
+    2. **任何遗留副本都先回收再删**（``_absorb_leftover_runs``）：中断在
+       「改名之后、拷贝之前」时，legacy 表是历史的唯一副本，绝不能无条件删。
+    """
+    legacy = "selection_runs_legacy"
+    staged = "selection_runs_new"
+    _absorb_leftover_runs(conn, legacy, staged)
+    columns = _columns(conn, "selection_runs")
+    unique = _unique_index_columns(conn, "selection_runs")
+    if "provenance_key" in columns and ("run_date", "strategy", "provenance_key") in unique:
+        return
+    if not _table_exists(conn, "selection_runs"):
+        conn.executescript(_runs_ddl())
+        return
+    present = [name for name in LEGACY_RUN_COLUMNS if name in columns]
+    select_legacy = ", ".join(present)
+    conn.executescript(_runs_ddl(staged))
+    conn.execute(
+        f"""INSERT OR IGNORE INTO {staged}({select_legacy},
+                provenance_status, provenance_key, asof_day, scope, cycle_id,
+                strategy_id, strategy_version, strategy_checksum)
+            SELECT {select_legacy}, '{SP.STATUS_LEGACY_UNPROVEN}',
+                   '{LEGACY_KEY_PREFIX}|' || run_date || '|' || strategy,
+                   data_asof_date, '{SP.SCOPE_RESEARCH}', NULL, NULL, NULL, NULL
+            FROM selection_runs"""
     )
+    conn.execute("DROP TABLE selection_runs")
+    conn.execute(f"ALTER TABLE {staged} RENAME TO selection_runs")
 
 
 def _ensure_provenance_guards(conn) -> None:
