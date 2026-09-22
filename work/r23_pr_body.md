@@ -454,8 +454,10 @@ navigation. It is a fixed environment-sensitive cost, not a lock or a regression
 
 ### 16.3 Is it a R23 regression? No — verified two ways
 
-**(a) Frontend is byte-identical.** `git diff c872ae1..1e49a4d -- frontend/` is
-empty, so the page requests exactly the same things in both versions.
+**(a) Frontend is byte-identical.** `git diff origin/master..HEAD -- frontend/` is
+empty, so the page requests exactly the same things in both versions. (Reproduce by
+fetching the branch; the range is expressed with refs rather than hashes so it cannot
+go stale as documentation commits land.)
 
 **(b) Genuinely interleaved A/B on the slow path** (`work/r23_round4_ab_timing.py
 --rounds 6`). Each round measures **both** versions back to back and the order swaps
@@ -504,13 +506,19 @@ the numbers above are a separate, later measurement under the same settings.
 
 ### 16.5 The exact-head browser job is clean
 
-Browser job on the head this PR is at (`1e49a4de137ac3d3fcc0396dbc6d7ac97c8165f3`):
-**32 passed, `workers=1`, no retry, no flaky**.
+Browser job: **32 passed, `workers=1`, no retry, no flaky** — on every head of this PR
+since the investigation in §16.1, current head included. `flaky` and `retry #` do not
+appear anywhere in those logs (grep count 0).
 
-`flaky` and `retry #` do not appear anywhere in that log (grep count 0). The other
-exact-head checks are green as well: `tests (3.11)`, `tests (3.12)` (**Ran 4006
-tests, OK**),
-`syntax`, `quality`, `docker-smoke`, `frontend`, `security-leak-scan` ×2.
+GitHub's checks on the head actually being merged are the authority for the exact
+revision. This section deliberately does not name one, because this PR's later
+commits are documentation-only and would make any SHA written here stale — the same
+drift that §16.5 previously suffered. What matters for merge is that the property
+holds on the head under review, not that a particular hash was typed here.
+
+The other exact-head checks are green as well: `tests (3.11)`, `tests (3.12)`
+(**Ran 4006 tests, OK**), `syntax`, `quality`, `docker-smoke`, `frontend`,
+`security-leak-scan` ×2.
 
 Note that this clean run does not prove the underlying slowness is gone — it is the
 same offline snapshot-refresh cost from §16.2, which happens to fit inside the budget
