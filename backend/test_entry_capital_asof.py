@@ -131,11 +131,11 @@ class _CapitalCase(unittest.TestCase):
             conn.execute(
                 "INSERT INTO paper_signals(account_id,signal_date,intended_date,code,name,"
                 "close_price,rank_score,t_tier,t_score,payload,status,created_at,"
-                "strategy_id,strategy_version,strategy_checksum) "
-                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "strategy_id,strategy_version,strategy_checksum,cycle_id) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (account_id, intended_date, intended_date, code, f"测试股_{code}", 10.0,
                  0.8, "A", 0.9, "{}", status, f"{intended_date} 15:00:00",
-                 *PT._strategy_stamp(conn, account_id)),
+                 *PT._strategy_stamp(conn, account_id), self.cycle_id()),
             )
 
     def add_lot(self, *, account_id, code, cycle_id, qty=100, cost=10.0):

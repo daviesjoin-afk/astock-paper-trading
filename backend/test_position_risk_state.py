@@ -569,12 +569,12 @@ class V20Migration(_LedgerCase):
         self.assertIn(20, paper)
         self.assertIn("风险状态", paper[20])
 
-    def test_migration_v22_is_registered_as_latest(self):
-        """R21 收窄 strategy-stamp unknown 例外并登记为 v22。"""
-        paper = db_migrate.MIGRATIONS["paper_trading"]
-        self.assertEqual(paper[-1][0], 22)
-        self.assertIn("策略版本戳", paper[-1][1])
-        self.assertIn("保护性 SELL", paper[-1][1])
+    def test_migration_v22_is_registered(self):
+        """R21 收窄 strategy-stamp unknown 例外并登记为 v22（后续版本继续追加）。"""
+        paper = {version: desc for version, desc, _op in db_migrate.MIGRATIONS["paper_trading"]}
+        self.assertIn(22, paper)
+        self.assertIn("策略版本戳", paper[22])
+        self.assertIn("保护性 SELL", paper[22])
 
     def test_migration_upgrade_recreates_table_with_guards(self):
         self.conn.executescript(

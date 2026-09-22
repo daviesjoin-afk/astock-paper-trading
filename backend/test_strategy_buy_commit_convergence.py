@@ -125,11 +125,14 @@ class _BuyCase(unittest.TestCase):
             cursor = conn.execute(
                 "INSERT INTO paper_signals(account_id,signal_date,intended_date,code,name,"
                 "close_price,rank_score,t_tier,t_score,payload,status,created_at,"
-                "strategy_id,strategy_version,strategy_checksum) "
-                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "strategy_id,strategy_version,strategy_checksum,cycle_id) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (account_id, signal_date, intended_date, code, f"测试股_{code}", 10.0,
                  0.9, "A", 0.9, PT._json(body), "pending", f"{signal_date} 15:00:00",
-                 *PT._strategy_stamp(conn, account_id)),
+                 *PT._strategy_stamp(conn, account_id),
+                 int(conn.execute(
+                     "SELECT cycle_id FROM paper_accounts WHERE id=?", (account_id,)
+                 ).fetchone()[0])),
             )
             return int(cursor.lastrowid)
 

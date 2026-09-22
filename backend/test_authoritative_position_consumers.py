@@ -493,10 +493,10 @@ class AdaptiveShadowPortfolio(_LedgerCase):
         self.conn.execute(
             "INSERT INTO paper_signals(account_id,code,name,status,intended_date,"
             "signal_date,t_score,rank_score,payload,created_at,"
-            "strategy_id,strategy_version,strategy_checksum) "
-            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "strategy_id,strategy_version,strategy_checksum,cycle_id) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (ACCOUNT, CODE, NAME, "pending", today, today, 60.0, 60.0, "{}", today,
-             strategy_id, version, checksum),
+             strategy_id, version, checksum, self.cycle1),
         )
         self.conn.commit()
 

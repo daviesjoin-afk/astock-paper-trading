@@ -21,7 +21,12 @@ module**，domain implementation 也不能再长回 ``paper_trading.py``。Round
     Guard 9  replacement candidate 与 slot-upgrade 必须是 as-of / cycle 有界的：
              候选 ``intended_date == asof_day`` 且 ``signal_date <= asof_day``，
              历史 review 受 ``(cycle_id, review_date <= asof_day)`` 约束，
-             slot context / borrow / rollback 一律使用显式 ``cycle_id``。
+             slot context / borrow / rollback 一律使用显式 ``cycle_id``；
+    Guard 14 strategy / selection provenance 必须 **version-pinned**：纯契约模块
+             零项目依赖、零时钟；版本解析只在 (a) cycle pin、(b) run 创建那一刻的
+             current head 两处发生；历史一律读 persisted stamp，永不 ``MAX(version)``
+             / ``ORDER BY version DESC``；signal / order 写入器不得重新 stamp
+             current version；immutable provenance 列不得被 UPDATE 修正。
 """
 import ast
 import re
@@ -97,7 +102,15 @@ FORBIDDEN_PAPER_TRADING_DEFS = frozenset({
 #: ``paper_risk_scan_state.py`` 后基线持续向下 ratchet。以后只允许 same or
 #: lower：确有 facade wiring 要加，必须同时抽出别的函数保持不增长。
 #: 不要设计环境变量绕过 / ``skip if CI`` 之类的后门。
-PAPER_TRADING_LOC_BASELINE = 14847
+#:
+#: R23（14847 → 14896，+49）：signal 的周期归属是**写入时刻**的事实，必须由
+#: signal 写入点自己产生，因此 facade 侧不得不加接线：``init_db`` 的 v23 迁移
+#: 调用、``paper_signals`` / ``paper_signals_archive`` 的 ``cycle_id`` 列、
+#: 以及两处 signal 写入点「先解析账号级 provenance，缺失即 fail closed 跳过」
+#: 的守卫。解析与契约本身已抽到 ``strategy_selection_resolver`` /
+#: ``strategy_selection_provenance``（该区域净减 43 行），模块级函数数 280 保持
+#: 不变。**不再**为了凑这个数字去拆一个与 R23 无关的子系统（§16.6/§16.9）。
+PAPER_TRADING_LOC_BASELINE = 14896
 PAPER_TRADING_DEF_BASELINE = 280
 
 #: Guard 4 —— 新模块允许出现的 import 根（stdlib）。
@@ -134,6 +147,44 @@ EXPLICIT_CYCLE_FUNCTIONS = (
     "_apply_slot_borrow",
     "_rollback_slot_borrow",
 )
+
+#: Guard 14 —— provenance 纯契约 + 薄 adapter（R23）。
+SELECTION_PROVENANCE_MODULE = "strategy_selection_provenance.py"
+SELECTION_RESOLVER_MODULE = "strategy_selection_resolver.py"
+
+#: Guard 14 —— resolver 允许的 import 根：只允许**向下**依赖（契约 + Registry）。
+#: 出现 ``paper_trading`` / ``paper_selection`` / ``selection_tracking`` 意味着
+#: adapter 反过来依赖调用方，版本权威就重新变成循环的。
+SELECTION_RESOLVER_ALLOWED_IMPORTS = frozenset({
+    "__future__", "dataclasses", "typing", "strategy_registry",
+    "strategy_selection_provenance",
+})
+
+#: Guard 14 —— 纯契约模块允许的 import 根（仅 stdlib，且不含 os/sqlite3）。
+SELECTION_PROVENANCE_ALLOWED_IMPORTS = frozenset({
+    "__future__", "dataclasses", "datetime", "re", "typing",
+})
+
+#: Guard 14 —— 版本解析的反模式：只按 version 拿「最新那一版」。
+#: ``MAX(version)`` 与 ``ORDER BY version DESC LIMIT 1`` 都会把历史 run 重新解释成
+#: current head —— 这正是 R23 要消灭的行为。
+FORBIDDEN_VERSION_SEARCH_PATTERNS = (
+    r"MAX\s*\(\s*version\s*\)",
+    r"ORDER\s+BY\s+version\s+DESC",
+    r"ORDER\s+BY\s+current_version\s+DESC",
+)
+
+#: Guard 14 —— 历史 provenance 只能**读**：这两张表的 immutable 列不得 UPDATE。
+IMMUTABLE_PROVENANCE_TABLES = ("paper_selection_runs", "selection_runs", "paper_signals")
+
+#: Guard 14 —— 「现在能跑什么」的 current resolver 名；cycle 路径不得调用它们。
+#: Guard 14 —— 「现在是哪一版」的解析函数名。**只读 current head** 的意思是不带显式
+#: version/checksum 去问 Registry；带 version+checksum 的读法是**校验**一个已经
+#: 持久化的事实，不构成回退，所以两条路径必须分开断言。
+CURRENT_HEAD_RESOLVERS = frozenset({"get_version", "current_version_for_account"})
+
+#: Guard 14 —— signal / order 写入器必须沿用 cycle pin，不得重新取 current head。
+STRICT_STAMP_FUNCTIONS = ("_strategy_stamp",)
 
 #: Guard 6 —— 纯决策边界不得触碰的任何 I/O / 时钟 API 名（属性名或调用名）。
 FORBIDDEN_IO_CALLS = frozenset({
@@ -1695,6 +1746,498 @@ class PortfolioReadModelIsCycleAsOfBounded(unittest.TestCase):
         self.assertNotIn("CREATE TABLE", body)
         self.assertNotIn("ALTER TABLE", body)
         self.assertNotIn("DROP TABLE", body)
+
+
+class SelectionProvenanceIsVersionPinned(unittest.TestCase):
+    """Guard 14 —— strategy / selection provenance 必须 version-pinned（R23）。
+
+    这一组护栏存在的理由：R22 之前「这个 run 是哪个策略版本跑的」没有持久事实，
+    历史 run 会被**今天的** current head 重新解释（改个名字、升一版，昨天的选股就
+    换了个解释），而 checksum / as-of / cycle 全都可以在没有门禁的情况下被顺手
+    「修好」。所以这里把边界钉成静态断言，能 AST 的不用 grep，能用 AST 位置信息
+    的不用子串。
+    """
+
+    # ---------- pure contract ----------
+
+    def test_guard14a_contract_module_has_no_project_imports(self):
+        roots = _imported_roots(_tree(SELECTION_PROVENANCE_MODULE))
+        self.assertEqual(sorted(roots - SELECTION_PROVENANCE_ALLOWED_IMPORTS), [],
+                         "纯契约模块 import 了项目模块 / 非白名单 stdlib")
+
+    def test_guard14b_contract_module_never_reads_clock_or_db(self):
+        tree = _tree(SELECTION_PROVENANCE_MODULE)
+        offenders = []
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Attribute) and node.attr in {
+                    "today", "now", "utcnow", "time", "time_ns", "monotonic"}:
+                offenders.append(node.attr)
+            elif isinstance(node, ast.Call):
+                func = node.func
+                name = func.id if isinstance(func, ast.Name) else getattr(func, "attr", "")
+                if name in {"connect", "cursor", "execute", "executescript", "commit",
+                            "getenv"}:
+                    offenders.append(name)
+        self.assertEqual(offenders, [],
+                         f"纯契约模块触碰了时钟 / DB / 环境：{offenders}")
+
+    def test_guard14c_contract_module_declares_the_scope_invariants(self):
+        """scope 语义必须是契约的一部分，而不是调用方各自记得的约定。"""
+        raw = _source(SELECTION_PROVENANCE_MODULE)
+        self.assertIn("SCOPE_CYCLE", raw)
+        self.assertIn("SCOPE_RESEARCH", raw)
+        body = _function_source(_tree(SELECTION_PROVENANCE_MODULE),
+                                "__post_init__", raw)
+        self.assertIn("cycle scope requires an explicit cycle id", body)
+        self.assertIn("research scope must not carry a cycle id", body)
+
+    # ---------- thin resolver ----------
+
+    def test_guard14d_resolver_only_depends_downwards(self):
+        roots = _imported_roots(_tree(SELECTION_RESOLVER_MODULE))
+        self.assertEqual(sorted(roots - SELECTION_RESOLVER_ALLOWED_IMPORTS), [],
+                         "resolver 依赖了调用方（版本权威会变回循环）")
+
+    def test_guard14e_resolver_has_no_version_search_or_clock(self):
+        body = _module_body(SELECTION_RESOLVER_MODULE)
+        for pattern in FORBIDDEN_VERSION_SEARCH_PATTERNS:
+            self.assertIsNone(re.search(pattern, body, re.IGNORECASE),
+                              f"resolver 用「最新那一版」解释历史：{pattern}")
+        for forbidden in ("date.today", "datetime.now", "utcnow"):
+            self.assertNotIn(forbidden, body, f"resolver 读了 wall-clock：{forbidden}")
+
+    def test_guard14f_cycle_resolution_goes_through_the_pin(self):
+        body = _function_source(_tree(SELECTION_RESOLVER_MODULE),
+                                "cycle_provenance", _source(SELECTION_RESOLVER_MODULE))
+        self.assertIn("cycle_version_for_account", body,
+                      "cycle scope 必须走 cycle pin，不能自己找版本")
+        self.assertNotIn("get_version(", body,
+                         "cycle scope 不得读 current head")
+        self.assertNotIn("paper_accounts", body,
+                         "requested cycle 不得从 paper_accounts.cycle_id 推导")
+
+    def test_guard14g_current_head_is_read_only_at_run_creation(self):
+        """current head（**不带** version 的读取）只能出现在 run 创建入口。
+
+        ``get_version(id, version, checksum=…)`` 校验的是一个**已经持久化**的事实，
+        不是「现在是哪一版」，因此只把没有显式 version 的调用判为回退。
+        """
+        tree = _tree(SELECTION_RESOLVER_MODULE)
+        head_readers = []
+        for node in ast.walk(tree):
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            for call in ast.walk(node):
+                if not (isinstance(call, ast.Call)
+                        and isinstance(call.func, ast.Attribute)
+                        and call.func.attr in CURRENT_HEAD_RESOLVERS):
+                    continue
+                if len(call.args) >= 2:
+                    continue  # 带显式 version → 校验，不是回退
+                head_readers.append(node.name)
+        self.assertEqual(sorted(set(head_readers)), ["research_version_pin"],
+                         f"current head 被这些入口读取了：{sorted(set(head_readers))}")
+
+    def test_guard14h_paper_trading_never_version_searches_provenance(self):
+        """god module 里不得出现「找最新那一版」，也不得自己推导周期归属。
+
+        ``current_cycle`` 是本文件既有的**局部变量名**（执行路径解析出的周期），
+        不是回退；这里禁的是把「当前周期」当解析入口用的写法。
+        """
+        raw = _source("paper_trading.py")
+        tree = _tree("paper_trading.py")
+        body = _module_body("paper_trading.py")
+        for pattern in FORBIDDEN_VERSION_SEARCH_PATTERNS:
+            self.assertIsNone(re.search(pattern, body, re.IGNORECASE),
+                              f"paper_trading 出现「最新版本」搜索：{pattern}")
+        for forbidden in ("_current_cycle()", "latest_cycle(", "active_cycle_id("):
+            self.assertNotIn(forbidden, body,
+                             f"paper_trading 回退 current/latest：{forbidden}")
+        self.assertNotIn(
+            "FROM paper_accounts WHERE id=?",
+            _function_source(tree, "_strategy_stamp", raw),
+            "_strategy_stamp 自己推导周期归属（应经 SRES.signal_cycle_provenance）")
+
+    def test_guard14i_signal_writer_uses_the_strict_pin_resolver(self):
+        """signal / order 写入戳的权威来源必须唯一，且不得读 current head。
+
+        血缘查询本身已归 resolver（``signal_order_provenance``），所以这里断言
+        god module 是**委托**而不是自带一份 SELECT；它同时不得自己推导周期归属。
+        """
+        raw = _source("paper_trading.py")
+        tree = _tree("paper_trading.py")
+        for name in STRICT_STAMP_FUNCTIONS:
+            body = _function_source(tree, name, raw)
+            self.assertIn("signal_order_provenance", body,
+                          f"{name} 不再经 resolver 继承 signal 的因果戳")
+            self.assertIn("paper_signals", _source(SELECTION_RESOLVER_MODULE),
+                          "signal 血缘的唯一查询点消失了")
+            self.assertNotIn("get_version(", body,
+                             f"{name} 重新取了 current head")
+            self.assertNotIn("FROM paper_signals", body,
+                             f"{name} 自己复制了一套 signal 查询（双重 authority）")
+        # 严格解析器只存在于 resolver，``paper_trading`` 只做别名转发。
+        self.assertIn("SRES.signal_cycle_provenance", raw)
+        self.assertNotIn("class SignalCycleUnprovable", raw,
+                         "SignalCycleUnprovable 被复制回 god module（双重 authority）")
+        # 两个 signal 写入点都必须冻结写入上下文，且把**候选构建前捕获的**周期与
+        # 提交时观测到的周期都交给 resolver（详见 guard 14n / 14o）。
+        for function in ("generate_signals", "_bootstrap_signals_for_today"):
+            body = _function_source(tree, function, raw)
+            self.assertIn("signal_write_context_or_error(", body,
+                          f"{function} 没有冻结 signal 的写入上下文")
+            self.assertIn("cycle_id=", body,
+                          f"{function} 没有把已解析的周期显式传给 resolver")
+            self.assertNotIn("get_version(", body,
+                             f"{function} 在写入路径里读了 current head")
+
+    def test_guard14j_immutable_provenance_columns_are_never_updated(self):
+        """immutable stamp 只能被 INSERT：任何 ``UPDATE … SET strategy_version`` 都是回填。"""
+        for module in ("paper_trading.py", "paper_selection.py",
+                       "selection_tracking.py"):
+            tree = _tree(module)
+            for node in ast.walk(tree):
+                if not (isinstance(node, ast.Call)
+                        and isinstance(node.func, ast.Attribute)
+                        and node.func.attr == "execute"):
+                    continue
+                sql = node.args[0] if node.args else None
+                if not (isinstance(sql, ast.Constant) and isinstance(sql.value, str)):
+                    continue
+                upper = sql.value.upper()
+                if "UPDATE " not in upper:
+                    continue
+                target = upper.split("UPDATE ", 1)[1].split()[0].strip("\"'")
+                if target not in IMMUTABLE_PROVENANCE_TABLES:
+                    continue
+                # provenance 列出现 SET 里（或出现在 BEFORE UPDATE 触发器名里）即违规
+                bad = [column for column in
+                       ("STRATEGY_VERSION", "STRATEGY_CHECKSUM", "ASOF_DAY",
+                        "PROVENANCE_KEY")
+                       if "SET " in upper and column in upper]
+                self.assertEqual(bad, [],
+                                 f"{module} 用 UPDATE 改写 {target} 的 provenance：{bad}")
+
+    def test_guard14k_provenance_readers_exist_in_one_place(self):
+        """历史读取只有一个实现：``reading_from_row``（+ resolver 的薄转发）。"""
+        raw = _source(SELECTION_PROVENANCE_MODULE)
+        tree = _tree(SELECTION_PROVENANCE_MODULE)
+        body = _function_source(tree, "reading_from_row", raw)
+        self.assertIn("provenance_status", body)
+        # 反向：任何其他模块都不得自己实现一套 status 推断
+        for module in ("paper_selection.py", "selection_tracking.py", "paper_trading.py"):
+            module_body = _module_body(module)
+            for invented in ("STATUS_LEGACY_UNPROVEN", "STATUS_NOT_APPLICABLE"):
+                if invented in module_body:
+                    self.assertIn(
+                        "SP.", module_body,
+                        f"{module} 自己发明了 provenance 状态 {invented}")
+            # 只禁**字面量**：``f"...provenance_status = '{SP.STATUS_VERIFIED}'"``
+            # 是引用契约常量生成 SQL，恰恰是「不手写状态」的做法。
+            tree = _tree(module)
+            templated = {
+                id(part) for node in ast.walk(tree)
+                if isinstance(node, ast.JoinedStr) for part in node.values
+            }
+            docstrings = {
+                id(node.body[0].value) for node in ast.walk(tree)
+                if isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef,
+                                     ast.AsyncFunctionDef))
+                and node.body and isinstance(node.body[0], ast.Expr)
+                and isinstance(node.body[0].value, ast.Constant)
+                and isinstance(node.body[0].value.value, str)
+            }
+            literal = [
+                node.value for node in ast.walk(tree)
+                if isinstance(node, ast.Constant) and isinstance(node.value, str)
+                and id(node) not in templated and id(node) not in docstrings
+                and re.search(r"provenance_status\s*=\s*['\"]", node.value)
+            ]
+            self.assertEqual(literal, [],
+                             f"{module} 手写 provenance_status 字面量：{literal[:1]}")
+
+    def test_guard14l_signal_cycle_requires_a_keyword_only_explicit_cycle(self):
+        """Guard 14l：``signal_cycle_provenance`` 的 ``cycle_id`` 必须是 keyword-only 必填。
+
+        签名本身就是 authority 边界：只要 ``cycle_id`` 有默认值（或能按位置省略），
+        调用方就能不带周期调用它，解析器于是又得自己去猜一个 —— 那正是
+        「重新解析 mutable ``paper_accounts.cycle_id``」的入口。
+        """
+        tree = _tree(SELECTION_RESOLVER_MODULE)
+        node = _function_node(tree, "signal_cycle_provenance")
+        args = node.args
+        required = [a.arg for a in args.args] + [a.arg for a in args.kwonlyargs]
+        self.assertIn("cycle_id", required,
+                      "signal_cycle_provenance 不再接受显式 cycle_id")
+        self.assertIn("cycle_id", [a.arg for a in args.kwonlyargs],
+                      "cycle_id 必须是 keyword-only（否则调用方可以按位置/省略传入）")
+        defaults = list(args.defaults) + [d for d in args.kw_defaults if d is not None]
+        self.assertEqual(len(defaults), 0,
+                         f"signal_cycle_provenance 的参数 {sorted(required)} 里出现了默认值："
+                         "cycle_id 一旦有默认值，调用方就能省略它")
+        # 位置参数也不得能承载周期：cycle_id 必须**只**能在 kwonly 段出现。
+        self.assertNotIn("cycle_id", [a.arg for a in args.args],
+                         "cycle_id 仍可作为位置参数传入（keyword-only 契约被绕过）")
+
+    def test_guard14m_signal_cycle_body_never_reads_paper_accounts(self):
+        """Guard 14m：``signal_cycle_provenance`` 函数体不得读 ``paper_accounts``。
+
+        周期归属是**调用方**在写事务里已经确定的事实。函数体自己去查账户当前
+        周期，就是把一个可变的 current-state 当成 write-time authority ——
+        I/O 期间发生的 rollover 会被静默采纳，旧候选被盖成新周期的策略版本。
+        """
+        raw = _source(SELECTION_RESOLVER_MODULE)
+        tree = _tree(SELECTION_RESOLVER_MODULE)
+        node = _function_node(tree, "signal_cycle_provenance")
+        body = _strip_function_docstring(
+            node, _function_source(tree, "signal_cycle_provenance", raw))
+        self.assertNotIn("paper_accounts", body,
+                         "signal_cycle_provenance 又去 paper_accounts 取周期了")
+        for forbidden in ("active_cycle", "latest_cycle", "current_cycle",
+                          "ORDER BY id DESC", "MAX(id)"):
+            self.assertNotIn(forbidden, body,
+                             f"signal_cycle_provenance 出现周期搜索：{forbidden}")
+        # ``SR.stamp_for_account`` 有 legacy/current-head 回退，必须禁；但
+        # ``cycle_stamp_for_account`` 是唯一合法权威，所以按调用属性名精确判，
+        # 不能用子串（前者是后者的子串，子串判断会把正确实现判成违规）。
+        for node_call in ast.walk(node):
+            if isinstance(node_call, ast.Call) and isinstance(node_call.func, ast.Attribute):
+                self.assertNotEqual(
+                    node_call.func.attr, "stamp_for_account",
+                    "signal_cycle_provenance 回退到了 SR.stamp_for_account"
+                    "（legacy binding / current-head）")
+        self.assertIn("cycle_stamp_for_account", body,
+                      "signal 的版本权威必须仍是 cycle pin")
+        self.assertIn("cycle_id=requested", body,
+                      "cycle pin 查询没有把显式 cycle 传下去")
+
+    def test_guard14n_generate_signals_passes_a_frozen_explicit_cycle(self):
+        """Guard 14n：``generate_signals`` 必须把**候选构建前捕获的**周期传下去。
+
+        候选/provenance/写入三者的周期必须是同一个：捕获归属来自 provider I/O
+        之前的账户行，提交时再观测一次，两者不一致即整批 stale —— 绝不重新取
+        新周期，然后把旧候选 stamp 到新周期。
+        """
+        raw = _source("paper_trading.py")
+        tree = _tree("paper_trading.py")
+        body = _function_source(tree, "generate_signals", raw)
+        self.assertIn("signal_write_context_or_error", body,
+                      "generate_signals 不再经 resolver 冻结写入上下文")
+        self.assertIn("cycle_id=account[\"cycle_id\"]", body,
+                      "generate_signals 没有把候选构建前捕获的周期显式传下去")
+        self.assertIn("account_cycle_id=current[\"cycle_id\"]", body,
+                      "generate_signals 没有把提交时观测到的账户周期交给校验")
+        self.assertNotIn("_cycle_signal_provenance(", body,
+                         "generate_signals 仍直接调用旧的 cycle 解析入口")
+        self.assertNotIn("get_version(", body,
+                         "generate_signals 在写入路径里读了 current head")
+
+    def test_guard14o_bootstrap_signals_passes_an_explicit_cycle(self):
+        """Guard 14o：``_bootstrap_signals_for_today`` 必须传显式 cycle + 捕获归属。
+
+        该函数已经持有解析好的 cycle 上下文；它不得在写入前**再次**推导账户当前
+        周期，否则 rollover 会被当成「账户换了周期」而静默迁移 provenance。
+        """
+        raw = _source("paper_trading.py")
+        tree = _tree("paper_trading.py")
+        body = _function_source(tree, "_bootstrap_signals_for_today", raw)
+        self.assertIn("signal_write_context_or_error", body,
+                      "_bootstrap_signals_for_today 不再经 resolver 冻结写入上下文")
+        self.assertIn("cycle_id=cycle[\"id\"]", body,
+                      "_bootstrap_signals_for_today 没有传它已解析的显式周期")
+        self.assertIn("account_cycle_id=account[\"cycle_id\"]", body,
+                      "_bootstrap_signals_for_today 没有用候选构建前的捕获归属校验")
+        self.assertNotIn("_cycle_signal_provenance(", body,
+                         "_bootstrap_signals_for_today 仍直接调用旧的 cycle 解析入口")
+        self.assertNotIn("get_version(", body,
+                         "_bootstrap_signals_for_today 在写入路径里读了 current head")
+
+    def test_guard14p_research_head_is_pinned_before_the_run_computes(self):
+        """Guard 14p：research selection 的 current head pin 必须发生在 ``_run_one`` **之前**。
+
+        动态时序不能只靠字符串顺序，所以这里同时做两件事：
+
+        * 静态：``run_daily`` 里 ``_pin_research_version`` 的调用位置出现在
+          ``_run_one`` 之前，且 ``_run_provenance`` **不再**自己读 head；
+        * 动态：``test_provenance_inflight_change`` 的 in-flight regression
+          在 ``_run_one`` 内部发布新版本 —— 落库的戳必须仍是计算开始时的版本。
+        """
+        raw = _source("paper_selection.py")
+        tree = _tree("paper_selection.py")
+        body = _function_source(tree, "run_daily", raw)
+        pin_at = body.find("_pin_research_version(")
+        run_at = body.find("_run_one(")
+        self.assertNotEqual(pin_at, -1, "run_daily 不再 pin immutable version")
+        self.assertNotEqual(run_at, -1, "run_daily 不再调用 _run_one")
+        self.assertLess(pin_at, run_at,
+                        "immutable version 的 pin 发生在 _run_one **之后**"
+                        "（计算期间发布的版本会被错误归因给本次结果）")
+        # pin 恰好一次：重复 pin 会重新引入「算完再问一次 head」的窗口。
+        self.assertEqual(body.count("_pin_research_version("), 1,
+                         "run_daily 里 pin 了多次（TOCTOU 窗口重新出现）")
+        # provenance 组装侧不得再读 current head。
+        assembly = _strip_function_docstring(
+            _function_node(tree, "_run_provenance"),
+            _function_source(tree, "_run_provenance", raw))
+        self.assertNotIn("get_version(", assembly,
+                         "_run_provenance 重新读了 current head")
+        self.assertIn("pin", assembly,
+                      "_run_provenance 没有消费计算前冻结的 pin")
+        # 唯一允许读 current head 的入口仍是 resolver 里的 research_version_pin。
+        resolver_raw = _source(SELECTION_RESOLVER_MODULE)
+        self.assertIn("research_version_pin", resolver_raw)
+
+    def test_guard14q_signal_order_lineage_has_one_owner(self):
+        """signal → order 的血缘解析只有一套实现，且不得 current-fill。
+
+        多个 order writer 各自复制「查 signal / 校验账号 / 校验周期 / 校验戳」是
+        双重 authority 的温床：只要有一个漏了某步校验，那条路径就能把 legacy
+        signal 补成今天的版本。因此要求：
+
+        * 唯一实现是 resolver 的 ``signal_order_provenance``；
+        * 它自己不做 current-head / current-cycle / ``stamp_for_account`` 回退；
+        * god module 的两处 ``_strategy_stamp`` 都**只**经它继承 signal 血缘，
+          不再自己写 SELECT ``paper_signals``。
+        """
+        raw = _source(SELECTION_RESOLVER_MODULE)
+        tree = _tree(SELECTION_RESOLVER_MODULE)
+        node = _function_node(tree, "signal_order_provenance")
+        body = _strip_function_docstring(
+            node, _function_source(tree, "signal_order_provenance", raw))
+        self.assertIn("paper_signals", body,
+                      "signal_order_provenance 不再按 exact signal 查血缘")
+        for forbidden in ("get_version", "stamp_for_account", "active_cycle",
+                          "latest_cycle", "current_cycle", "paper_accounts"):
+            self.assertNotIn(forbidden, body,
+                             f"signal_order_provenance 回退到了 {forbidden}")
+        self.assertIn("SignalOrderUnprovable", body,
+                      "血缘不完整时必须 fail closed")
+
+    def test_guard14r_signal_risk_log_consumes_the_frozen_stamp(self):
+        """Guard 14r：signal 的 risk decision 必须复用**同一个 frozen stamp**。
+
+        ``_risk_log`` 的 ``strategy_stamp=None`` 默认会把 ``_strategy_stamp`` 拉进来，
+        于是每个 candidate 各解析一次 Registry。更重要的是 provenance 会分叉：
+        ``paper_signals`` 盖的是批次级 frozen 戳，而 ``paper_risk_decisions`` 拿到的是
+        逐 candidate 重解析的结果 —— rollover 窗口里两者可能不是同一版策略。
+
+        因此两条 signal 写入路径都必须显式传批次级 frozen stamp。
+        """
+        raw = _source("paper_trading.py")
+        tree = _tree("paper_trading.py")
+        expectations = {
+            "generate_signals": "strategy_stamp=account_stamp",
+            "_bootstrap_signals_for_today": "strategy_stamp=bootstrap_stamp",
+        }
+        for function, expected in expectations.items():
+            body = _function_source(tree, function, raw)
+            self.assertIn(expected, body,
+                          f"{function} 的 _risk_log 没有复用冻结戳（会逐 candidate 重解析）")
+            # 该路径的 signal INSERT 也必须用同一个 frozen 变量（解包或整体传入）。
+            frozen = expected.split("=", 1)[1]
+            self.assertTrue(
+                f"*{frozen}" in body or f"= {frozen}" in body,
+                f"{function} 的 signal INSERT 没有用冻结戳 {frozen}")
+        # 冻结戳必须在 **candidate** 循环之外解析一次（N candidates ≠ N Registry
+        # queries）。账户级循环允许每次都解析（每个账户各有自己的周期与 pin），
+        # 所以这里只禁「候选内层循环里的解析」。
+        for function, frozen in (("generate_signals", "account_context"),
+                                 ("_bootstrap_signals_for_today", "bootstrap_context")):
+            node = _function_node(tree, function)
+            for loop in ast.walk(node):
+                if not isinstance(loop, ast.For):
+                    continue
+                if "candidates" not in ast.dump(loop.iter):
+                    continue  # 只看 candidate 维度的那一层
+                for call in ast.walk(loop):
+                    if (isinstance(call, ast.Call)
+                            and isinstance(call.func, ast.Attribute)
+                            and call.func.attr == "signal_write_context_or_error"):
+                        self.fail(f"{function} 在 candidate 循环内解析写入上下文"
+                                  "（应为每账户一次，而不是每个候选一次）")
+            self.assertIn(frozen, _function_source(tree, function, raw),
+                          f"{function} 不再持有批次级冻结上下文 {frozen}")
+        # 解析器本身仍然只存在于 resolver。
+        self.assertIn("def signal_write_context", _source(SELECTION_RESOLVER_MODULE))
+
+    def test_guard14s_signal_commit_phase_is_fenced(self):
+        """Guard 14s：signal 的最终 commit phase 必须在 ``BEGIN IMMEDIATE`` 内。
+
+        校验（账户仍属 captured cycle）与随后的 signal INSERT 必须处于同一个
+        write boundary。deferred 事务下两者之间会被一个 rollover 事务穿透 ——
+        ``RV08`` 用真实竞争者证明了这一点（deferred → 竞争者提交成功 → RED）。
+        """
+        raw = _source("paper_trading.py")
+        tree = _tree("paper_trading.py")
+        node = _function_node(tree, "generate_signals")
+        commit_block = None
+        for with_node in ast.walk(node):
+            if not isinstance(with_node, ast.With):
+                continue
+            call = with_node.items[0].context_expr
+            if not (isinstance(call, ast.Call) and getattr(call.func, "id", "") == "_db"):
+                continue
+            block = "\n".join(raw.splitlines()[with_node.lineno - 1:with_node.end_lineno])
+            if "INSERT OR IGNORE INTO paper_signals" in block:
+                commit_block = (call, block)
+                break
+        self.assertIsNotNone(commit_block, "generate_signals 里找不到 signal commit phase")
+        call, block = commit_block
+        keywords = {kw.arg: kw.value for kw in call.keywords}
+        self.assertIn("immediate", keywords,
+                      "signal commit phase 用的是 deferred 事务（rollover 可穿透）")
+        self.assertIs(keywords["immediate"].value, True,
+                      "signal commit phase 的 immediate 不是字面量 True")
+        # provider/network I/O 不得被搬进写锁。
+        for io in ("fetch_market_snapshot_full", "fetch_sector_flow",
+                   "fetch_hot_sector_snapshot", "_news_for(", "_quotes("):
+            self.assertNotIn(io, block, f"provider 调用 {io} 被搬进了 signal 写锁")
+
+    def test_guard14t_signal_cycle_must_match_the_account_binding(self):
+        """Guard 14t：新 signal 的 cycle 必须与 account 当前绑定一致（DB 层）。
+
+        这是防 rollover 穿透的**第二层**防线：即使某个调用方漏了应用层校验，
+        DB 也必须拒绝一条 cycle 归属已经过期的行。同时必须保持既有语义 ——
+        只约束新行、不回填 legacy、archive 继续允许 legacy NULL。
+        """
+        raw = _source("paper_schema_migrations.py")
+        node = _function_node(_tree("paper_schema_migrations.py"),
+                              "_ensure_signal_cycle_provenance_guards")
+        body = _strip_function_docstring(
+            node, _function_source(_tree("paper_schema_migrations.py"),
+                                   "_ensure_signal_cycle_provenance_guards", raw))
+        self.assertIn("paper_accounts", body,
+                      "signal INSERT guard 不再校验 account/cycle 一致性")
+        self.assertIn("a.cycle_id = NEW.cycle_id", body,
+                      "account/cycle 一致性谓词消失了")
+        self.assertIn("paper_cycles", body, "cycle 存在性检查消失了")
+        self.assertIn("BEFORE INSERT ON paper_signals", body,
+                      "INSERT guard 不再装在 paper_signals 上")
+        # 只约束**新写**：不得出现任何回填/UPDATE 历史行的语句。
+        for forbidden in ("UPDATE paper_signals", "SET cycle_id"):
+            self.assertNotIn(forbidden, body,
+                             f"guard 试图改写历史行 provenance：{forbidden}")
+        # archive 不装 INSERT guard（legacy NULL 行必须能归档）。
+        self.assertNotIn("BEFORE INSERT ON paper_signals_archive", body,
+                         "archive 装了 INSERT guard（legacy NULL 行会无法归档）")
+        # 两张表的 cycle 不可变 guard 都要在（archive 侧的表名由 f-string 生成）。
+        self.assertIn("paper_signals\"", body, "paper_signals 的不可变 guard 消失了")
+        self.assertIn("paper_signals_archive\"", body,
+                      "paper_signals_archive 的不可变 guard 消失了")
+        self.assertIn("BEFORE UPDATE OF cycle_id", body,
+                      "cycle 归属的不可变 guard 消失了")
+        # 唯一 owner：调用方只调用它，不复制一套。
+        for module in ("paper_trading.py", "paper_risk_service.py"):
+            module_body = _module_body(module)
+            self.assertIn("signal_order_provenance", module_body,
+                          f"{module} 没有经 resolver 解析 signal 血缘")
+            tree_m = _tree(module)
+            for name in ("_strategy_stamp",):
+                fn = _function_source(tree_m, name, _source(module))
+                self.assertIn("signal_order_provenance", fn,
+                              f"{module}.{name} 的 signal 分支不再走唯一 owner")
+                self.assertNotIn("paper_signals", fn,
+                                 f"{module}.{name} 又自己写了一套 signal 查询")
 
 
 def _function_node(tree, name):

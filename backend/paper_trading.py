@@ -83,6 +83,7 @@ import paper_sizing as PSZ
 import order_intent as OI
 import strategy_policies as SPOL
 import strategy_registry as SR
+import strategy_selection_resolver as SRES
 import strategy_runtime as SRT
 import user_strategy_participation as USP
 import strategy_risk_enforcement as SRE
@@ -1178,7 +1179,7 @@ def _record_entry_frozen_waitlist(
     if existing:
         return int(existing["id"]), False, reason, payload
     strategy_id, strategy_version, strategy_checksum = _strategy_stamp(
-        conn, account_id, signal_id,
+        conn, account_id, signal_id, cycle_id=_order_cycle_id(conn, cycle_id),
     )
     cursor = conn.execute(
         """INSERT INTO paper_orders(
@@ -1842,6 +1843,9 @@ def init_db():
                 PSM.ensure_strategy_reference_columns(conn)
                 PSM.ensure_execution_verification_columns(conn)
                 PSM.ensure_order_cycle_provenance(conn)
+                # R23（v23）：signal 的不可变周期归属。既有账本的新列必须走
+                # 这里显式迁移，否则线上库永远缺 cycle_id（幂等、不回填）。
+                PSM.ensure_signal_cycle_provenance(conn)
                 # Round-12：调仓状态（scan / plan / cooldown）的周期归属。
                 # 与上面几行同理 —— 既有账本走快路径直接 return，永远不会执行
                 # 新建库的 executescript 建表块，新增列/约束必须在这里显式迁移，
@@ -1879,6 +1883,7 @@ def init_db():
                 t_score REAL, payload TEXT NOT NULL, status TEXT NOT NULL, reason TEXT,
                 created_at TEXT NOT NULL, strategy_id TEXT,
                 strategy_version INTEGER, strategy_checksum TEXT,
+                cycle_id INTEGER,
                 UNIQUE(account_id, signal_date, code)
             );
             CREATE TABLE IF NOT EXISTS paper_orders (
@@ -1909,7 +1914,8 @@ def init_db():
                 id INTEGER, account_id TEXT, signal_date TEXT, intended_date TEXT, code TEXT, name TEXT,
                 industry TEXT, close_price REAL, rank_score REAL, t_tier TEXT, t_score REAL,
                 payload TEXT, status TEXT, reason TEXT, created_at TEXT,
-                strategy_id TEXT, strategy_version INTEGER, strategy_checksum TEXT
+                strategy_id TEXT, strategy_version INTEGER, strategy_checksum TEXT,
+                cycle_id INTEGER
             );
             CREATE TABLE IF NOT EXISTS paper_positions (
                 account_id TEXT NOT NULL, code TEXT NOT NULL, name TEXT, industry TEXT,
@@ -2144,6 +2150,8 @@ def init_db():
         SR.ensure_schema(conn)
         PSM.ensure_strategy_reference_columns(conn)
         PSM.ensure_order_cycle_provenance(conn)
+        # R23（v23）：signal 的不可变周期归属（幂等、不回填）。
+        PSM.ensure_signal_cycle_provenance(conn)
         # R14（v20）：DDL 单一事实来源在 paper_schema_migrations，这里显式调用。
         PSM.ensure_position_risk_state(conn)
         PSM.ensure_risk_scan_run_state(conn)  # R16 v21（DDL 只在 migration）
@@ -3115,18 +3123,33 @@ def _audit(conn, account_id, event, detail, *, strategy_stamp=None):
     )
 
 
-def _strategy_stamp(conn, account_id, signal_id=None):
-    """Return one complete causal Strategy Definition version stamp."""
-    if signal_id is not None:
-        row = conn.execute(
-            """SELECT strategy_id,strategy_version,strategy_checksum
-               FROM paper_signals WHERE id=?""",
-            (int(signal_id),),
-        ).fetchone()
-        if row and all(value is not None and value != "" for value in row):
-            return tuple(row)
-    return SR.stamp_for_account(conn, account_id)
+def _strategy_stamp(conn, account_id, signal_id=None, *, cycle_id=None):
+    """Return one complete causal Strategy Definition version stamp.
 
+    With a ``signal_id`` the stamp is **inherited** from that signal — the decision
+    that produced it — so a later order can never be re-stamped with a version the
+    decision did not use. A signal that cannot prove its own lineage yields no
+    order: the resolver's ``SignalOrderUnprovable`` propagates rather than filling
+    in from current state. Without one the cycle pin is the authority;
+    ``cycle_id`` is the cycle the caller already resolved, else the durable one.
+    Neither path reads a strategy head.
+    """
+    if signal_id is not None:
+        return SRES.signal_order_provenance(
+            conn, signal_id=signal_id, account_id=account_id,
+            expected_cycle_id=cycle_id,
+        ).stamp
+    stamp = SR.stamp_for_account(conn, account_id, cycle_id=cycle_id)
+    return tuple(stamp) if stamp is not None else (None, None, None)
+
+
+# R23：signal 的周期归属 / signal-linked order 血缘解析都归
+# ``strategy_selection_resolver``（薄 adapter），这里只做别名，保证既有
+# import 路径与运维脚本不被打断。
+SignalCycleUnprovable = SRES.SignalCycleUnprovable
+SignalOrderUnprovable = SRES.SignalOrderUnprovable
+SignalStaleContext = SRES.SignalStaleContext
+_cycle_signal_provenance = SRES.signal_cycle_provenance
 
 def _volatility_shadow(code, asof_day, price=None):
     """Return volatility diagnostics only; never changes a risk threshold."""
@@ -7632,7 +7655,9 @@ def generate_signals(asof_date=None):
             except Exception as exc:
                 research["shadow_error"] = f"{type(exc).__name__}: {exc}"
         research_results[account_id] = research
-    with _db() as conn:
+    # R23：commit phase 用 BEGIN IMMEDIATE，保证校验与 signal INSERT 同处一个
+    # write boundary。
+    with _db(immediate=True) as conn:
         for account, candidates, meta in candidate_batches:
             # A pause/reset may occur while provider calls are in flight.  Do
             # not write signals for an account that is no longer active.
@@ -7657,6 +7682,18 @@ def generate_signals(asof_date=None):
                 meta["research_shadow"] = {"status": "failed", "error": research["shadow_error"]}
                 _audit(conn, account["id"], "research_shadow_failed", research["shadow_error"])
             created = 0
+            # R23：signal provenance 在账户粒度循环外解析一次（规格 §24），周期与
+            # 写锁内重读的账户周期比对，不一致即整批 stale。
+            account_context, context_error = SRES.signal_write_context_or_error(
+                conn, account["id"], cycle_id=account["cycle_id"],
+                account_cycle_id=current["cycle_id"], asof_day=day.isoformat())
+            if context_error is not None:
+                _audit(conn, account["id"], context_error.event, context_error.detail)
+                summary["accounts"].append({
+                    "id": account["id"], "created": 0, "candidates": len(candidates),
+                    "provenance_unprovable": True, "reason": context_error.detail, **meta})
+                continue
+            account_cycle_id, account_stamp = account_context.cycle_id, account_context.stamp
             for pick in candidates:
                 code = pick["code"]
                 quote = evidence_quotes.get(code, {})
@@ -7684,22 +7721,22 @@ def generate_signals(asof_date=None):
                     final_score=(decision.get("entry_model") or {}).get("score"),
                 )
                 status = "pending" if passed else "blocked"
-                strategy_id, strategy_version, strategy_checksum = _strategy_stamp(
-                    conn, account["id"],
-                )
+                strategy_id, strategy_version, strategy_checksum = account_stamp
                 conn.execute(
                     """INSERT OR IGNORE INTO paper_signals(
                        account_id,signal_date,intended_date,code,name,industry,close_price,
                        rank_score,t_tier,t_score,payload,status,reason,created_at,
-                       strategy_id,strategy_version,strategy_checksum)
-                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                       strategy_id,strategy_version,strategy_checksum,cycle_id)
+                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                     (account["id"], day.isoformat(), _next_weekday(day).isoformat(), code, pick.get("name"),
                      pick.get("industry"), _num(quote.get("price"), _num(pick.get("price"))), _num(pick.get("score")),
                      decision.get("tier"), _num((decision.get("entry_model") or {}).get("score")),
                      _json(payload), status, reason, _now(),
-                     strategy_id, strategy_version, strategy_checksum),
+                     strategy_id, strategy_version, strategy_checksum, account_cycle_id),
                 )
-                _risk_log(conn, account["id"], code, "buy", "approved_signal" if passed else "rejected_signal", reason, payload)
+                # R23：候选批 / signal 行 / risk decision 共享同一个 frozen stamp。
+                _risk_log(conn, account["id"], code, "buy", "approved_signal" if passed
+                          else "rejected_signal", reason, payload, strategy_stamp=account_stamp)
                 created += int(passed)
             _audit(conn, account["id"], "close_signal_scan", f"候选 {len(candidates)}，通过 {created}")
             summary["accounts"].append({"id": account["id"], "created": created, "candidates": len(candidates), **meta})
@@ -9942,7 +9979,7 @@ def _buy_order(conn, account, signal, quote, market, news, asof_day, *, all_quot
     _supersede_signal_execution_retries(conn, signal.get("id"))
     _assert_active_lease(conn, "strategy buy order write")
     strategy_id, strategy_version, strategy_checksum = _strategy_stamp(
-        conn, account["id"], signal.get("id"),
+        conn, account["id"], signal.get("id"), cycle_id=current_cycle["id"],
     )
     # PR-29：同一信号重建的新委托记录审计血缘——上一条终态尝试的 order id。
     retry_of_order_id = _previous_attempt_order_id(
@@ -11190,6 +11227,17 @@ def _bootstrap_signals_for_today(asof_day, live_universe=None, source_slot="intr
                 approved = 0
                 waitlisted = 0
                 skipped_existing = 0
+                # R23：候选批 / signal 行 / risk decision 共享同一个 frozen stamp。
+                # 周期取本函数已解析的 `cycle` 与候选构建前的捕获归属。
+                bootstrap_context, bootstrap_error = SRES.signal_write_context_or_error(
+                    conn, account["id"], cycle_id=cycle["id"],
+                    account_cycle_id=account["cycle_id"], asof_day=day.isoformat())
+                if bootstrap_error is not None:
+                    _audit(conn, account["id"], bootstrap_error.event, bootstrap_error.detail)
+                    _observe_intraday(conn, cycle["id"], account["id"], None, None, "scan",
+                                      bootstrap_error.detail, {"provenance_unprovable": True})
+                    continue
+                bootstrap_cycle_id, bootstrap_stamp = bootstrap_context.cycle_id, bootstrap_context.stamp
                 for pick in candidates:
                     code = pick["code"]
                     is_reentry = code in reentry_codes
@@ -11289,13 +11337,12 @@ def _bootstrap_signals_for_today(asof_day, live_universe=None, source_slot="intr
                         "reason": "早期强势、资金和流动性共振；仅用于同批等待池排序",
                         "execution_override": False,
                     }
-                    strategy_stamp = _strategy_stamp(conn, account["id"])
                     conn.execute(
                         """INSERT INTO paper_signals(
                                account_id,signal_date,intended_date,code,name,industry,close_price,
                                rank_score,t_tier,t_score,payload,status,reason,created_at,
-                               strategy_id,strategy_version,strategy_checksum
-                           ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                               strategy_id,strategy_version,strategy_checksum,cycle_id
+                           ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                            ON CONFLICT(account_id,signal_date,code) DO UPDATE SET
                                intended_date=excluded.intended_date,
                                name=excluded.name,
@@ -11314,7 +11361,8 @@ def _bootstrap_signals_for_today(asof_day, live_universe=None, source_slot="intr
                             _num(quote.get("price"), _num(pick.get("price"))),
                             _num(pick.get("score")), decision.get("tier"),
                             _num((decision.get("entry_model") or {}).get("score"), 0.0) + waitlist_priority,
-                            _json(payload), status, reason, _now(), *strategy_stamp,
+                            _json(payload), status, reason, _now(), *bootstrap_stamp,
+                            bootstrap_cycle_id,
                         ),
                     )
                     _risk_log(
@@ -11323,6 +11371,7 @@ def _bootstrap_signals_for_today(asof_day, live_universe=None, source_slot="intr
                         if status == ENTRY_FROZEN_WAITLIST_STATUS
                         else "approved_bootstrap" if passed else "rejected_bootstrap",
                         reason or "盘中候选通过", payload,
+                        strategy_stamp=bootstrap_stamp,
                     )
                     if is_reentry and passed:
                         _observe_intraday(
