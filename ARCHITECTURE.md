@@ -723,10 +723,16 @@ Risk → Order → Fill（各自既有 authority）
    `strategy_version` / `strategy_checksum` / `cycle_id` 永不出现在其中。
    两种语句由 `signal_service.conflict_statement` **唯一构造** —— 回归测试与
    生产执行读的是同一个函数，因此"测试断言的 SQL"不可能与"生产跑的 SQL"分叉。
-2. **Candidate 与 committed Signal 的边界是显式的**。候选 dict 不再"加字段加到
-   变成 DB 行"：落库必须经过一个 `SignalDecision`（`outcome` ∈ {approved,
-   blocked} + `reason` + `status` + `evidence`）。裁决是落库前的业务对象，
-   而非裸布尔或裸字典。
+2. **Candidate 与 committed Signal 的边界是显式的，且由 writer 强制。**
+   候选 dict 不再"加字段加到变成 DB 行"：`commit_signal` **要求**传入
+   `SignalDecision`，并从它**独占派生** `status` / `reason` /
+   `payload.signal_decision` / `payload.signal_evidence`。调用方在 `row` 里
+   提供 `status` / `reason`，或在 payload 里预设这两个裁决键，一律**被拒绝**
+   （不是静默忽略——静默忽略会让旁路继续以"能跑"的形式存在）。
+   因此"拿到唯一 writer 就能伪造一条正式 signal"这条路径不存在：没有 decision
+   就不能 commit（签名层强制），有了 decision 也不能在别处改写它的结论。
+   `commit_signal` 返回实际落库的 canonical payload，调用方用它写 risk log，
+   避免出现第二处裁决注入点。
 3. **evidence 是紧凑投影，不是第二份行情 payload**。`SignalEvidence` 只携带
    `verification` / `verification_method` / `asof_day` / `observed_at` / `policy`
    与少量解释字段，随 `payload.signal_evidence` 落库。逐票双源结论由
@@ -759,8 +765,10 @@ Risk → Order → Fill（各自既有 authority）
    Signal Persistence Owner / Risk Authority / Promotion Authority。
    `R25 does NOT allow AI to write signals.`
 9. 回归门禁见 `backend/test_signal_pipeline.py`（SIG01 ~ SIG15 契约 / writer /
-   ledger 集成；SIGG01 ~ SIGG04 架构 guard），语义 mutation 见
-   `work/r25_mutation_check.py`（M-SIG1 ~ M-SIG8，8/8 CAUGHT、0 survived、0 fake）。
+   ledger 集成，SIG-WRITER-01 ~ 05 的 Decision→Commit 契约；SIGG01 ~ SIGG05 架构
+   guard，含"两条 production 路径必须交入明确 SignalDecision"），语义 mutation 见
+   `work/r25_mutation_check.py`（M-SIG1 ~ M-SIG8 + M-SIG-D1，9/9 CAUGHT、
+   0 survived、0 fake）。
 
 ## 目标依赖方向
 
@@ -796,6 +804,8 @@ network I/O 进入 DB writer transaction
 零 I/O / 零 wall-clock / 零事务所有权边界被破坏
 第二套 signal persistence owner（R25：`paper_signals` 写入只允许 signal_service）
 signal 侧自带"什么算双源"的判据（R25：必须委托 is_cross_source_verified）
+绕过 Decision→Commit 边界写 signal（R25：commit_signal 必须消费 SignalDecision，
+调用方不得自述 status/reason/裁决 payload）
 ```
 
 ### 仅作 review signal（不进入 CI gate）

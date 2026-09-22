@@ -113,18 +113,20 @@ MUTATIONS = [
         "file": PAPER,
         # bootstrap 绕过统一 writer，自己内联一段 INSERT —— 出现第二个 persistence owner。
         # 这正是 §26 明令禁止的"正常 signal 一套、bootstrap 另一套 writer"。
-        "old": """                    SIG.commit_signal(
+        "old": """                    committed_payload = SIG.commit_signal(
                         conn,
-                        context=bootstrap_context,""",
+                        context=bootstrap_context,
+                        decision=bootstrap_decision,""",
         "new": """                    conn.execute(
                         "INSERT INTO paper_signals(account_id,signal_date,intended_date,code,"
                         "name,payload,status,reason,created_at) VALUES(?,?,?,?,?,?,?,?,?)",
                         (bootstrap_context.account_id, factor_day.isoformat(), day.isoformat(),
                          code, pick.get("name"), _json(payload), status, reason, _now()),
                     )
-                    SIG.commit_signal(
+                    committed_payload = SIG.commit_signal(
                         conn,
-                        context=bootstrap_context,""",
+                        context=bootstrap_context,
+                        decision=bootstrap_decision,""",
         "test": _sig("SignalArchitectureGuardTests.test_SIGG01_signal_insert_has_exactly_one_production_owner"),
         "desc": "bootstrap 自行 INSERT（出现第二个 signal persistence owner）",
     },
@@ -154,6 +156,35 @@ MUTATIONS = [
         context = row""",
         "test": _sig("SignalWriterContractTests.test_SIG09_commit_requires_a_frozen_context"),
         "desc": "writer 接受非 frozen context（provenance 不再由批次独占）",
+    },
+    {
+        "id": "M-SIG-D1",
+        "file": SERVICE,
+        # writer 忽略 decision，重新信任调用方 row：裁决字段不再由 SignalDecision
+        # 独占，row 里自述的 status/reason 被直接采用。这正是 R25 复核指出的
+        # mandatory Decision→Commit contract 被绕过的形状 —— 任何模块（含未来
+        # R27 的 AI candidate producer）都能自己拼一行 status="pending" 落库，
+        # 完全不经过 Candidate / Evidence / Decision。
+        "old": """    leaked = [col for col in _DECISION_OWNED_ROW_COLUMNS if col in row]
+    if leaked:
+        raise ValueError(
+            "commit_signal row must not carry decision-owned columns "
+            f"{leaked}: 这些字段由 SignalDecision 独占，调用方提供会让"
+            "Candidate→Decision→Commit 边界失效"
+        )
+
+    missing = [col for col in _ROW_COLUMNS if col not in row]""",
+        "new": """    missing = [col for col in _ROW_COLUMNS if col not in row]""",
+        "extra": [(
+            """        # 裁决字段由 decision 独占供给。
+        "status": decision.status,
+        "reason": decision.reason,""",
+            """        # 裁决字段改为信任 caller row。
+        "status": row.get("status", decision.status),
+        "reason": row.get("reason", decision.reason),""",
+        )],
+        "test": _sig("SignalWriterContractTests.test_SIGW02_commit_rejects_a_row_that_forges_the_decision_status"),
+        "desc": "writer 忽略 decision 重新信任 caller row（绕过 Candidate→Decision 边界）",
     },
 ]
 
@@ -236,18 +267,26 @@ def assert_no_leftover(mutation: dict) -> None:
 
 
 def _apply(text: str, mutation: dict) -> str:
-    """Apply one mutation, requiring its anchor to be **unique**.
+    """Apply one mutation, requiring **every** anchor to be unique.
 
     ``replace(..., 1)`` rewrites the first hit; a duplicated anchor would let the
-    mutation land elsewhere while still reporting CAUGHT.
+    mutation land elsewhere while still reporting CAUGHT. A mutation may carry
+    ``extra`` — a list of additional ``(old, new)`` pairs — for cases where
+    re-opening a bypass genuinely needs two edits (removing the guard *and*
+    re-wiring the value it guarded). Each pair is checked for uniqueness too, so
+    a multi-anchor mutation is no weaker than a single-anchor one.
     """
-    old, new = mutation["old"], mutation["new"]
-    count = text.count(old)
-    assert count == 1, (
-        f'{mutation["id"]}: mutation anchor must be unique; count={count}; '
-        f'file={mutation["file"]}'
-    )
-    return text.replace(old, new, 1)
+    pairs = [(mutation["old"], mutation["new"])]
+    for extra in mutation.get("extra", ()):
+        pairs.append((extra[0], extra[1]))
+    for old, new in pairs:
+        count = text.count(old)
+        assert count == 1, (
+            f'{mutation["id"]}: mutation anchor must be unique; count={count}; '
+            f'file={mutation["file"]}; anchor={old[:60]!r}'
+        )
+        text = text.replace(old, new, 1)
+    return text
 
 
 def _is_fake_kill(result: subprocess.CompletedProcess) -> bool:

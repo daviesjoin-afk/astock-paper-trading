@@ -164,7 +164,49 @@ class SignalContractTests(unittest.TestCase):
 
 
 class SignalWriterContractTests(unittest.TestCase):
-    """唯一 writer 的语句契约（不依赖任何 DB）。"""
+    """唯一 writer 的语句与 **Decision→Commit 契约**（不依赖任何 DB）。
+
+    R25 的核心不变量是 Candidate→Evidence→Decision→FrozenContext→Commit。
+    writer 只认 frozen context 是不够的：如果它同时信任 caller 传进来的
+    ``status`` / ``reason`` / 裁决 payload，那么任何模块都能自己拼一行
+    ``status="pending"`` 直接落库，绕过整个决策链 —— "唯一 writer" 就只是把
+    内联 SQL 换了个位置。本类把这条边界钉死。
+    """
+
+    @staticmethod
+    def _conn():
+        conn = sqlite3.connect(":memory:")
+        conn.execute(
+            "CREATE TABLE paper_signals(id INTEGER PRIMARY KEY, account_id TEXT,"
+            " signal_date TEXT, intended_date TEXT, code TEXT, name TEXT, industry TEXT,"
+            " close_price REAL, rank_score REAL, t_tier TEXT, t_score REAL, payload TEXT,"
+            " status TEXT, reason TEXT, created_at TEXT, strategy_id TEXT,"
+            " strategy_version INTEGER, strategy_checksum TEXT, cycle_id INTEGER)"
+        )
+        return conn
+
+    @staticmethod
+    def _context():
+        return SIG.SignalWriteContext(
+            account_id="acc", cycle_id=1, strategy_id="s", strategy_version=1,
+            strategy_checksum="c", asof_day="2026-09-08",
+        )
+
+    @staticmethod
+    def _row(**overrides):
+        row = {
+            "signal_date": "2026-09-08", "intended_date": "2026-09-09", "code": "600901",
+            "name": "测试", "industry": None, "close_price": 10.0, "rank_score": 1.0,
+            "t_tier": "A", "t_score": 1.0, "payload": {"pick": {"code": "600901"}},
+            "created_at": "2026-09-08T15:00:00",
+        }
+        row.update(overrides)
+        return row
+
+    def _stored(self, conn):
+        return conn.execute(
+            "SELECT status, reason, payload FROM paper_signals"
+        ).fetchone()
 
     def test_SIG06_conflict_statement_is_the_single_sql_constructor(self):
         ignore = SIG.conflict_statement(SIG.CONFLICT_IGNORE)
@@ -188,12 +230,12 @@ class SignalWriterContractTests(unittest.TestCase):
 
     def test_SIG08_commit_rejects_a_row_missing_business_columns(self):
         """缺列必须在写之前炸，而不是把半行静默落库。"""
-        context = SIG.SignalWriteContext(
-            account_id="acc", cycle_id=1, strategy_id="s", strategy_version=1,
-            strategy_checksum="c", asof_day="2026-09-08",
-        )
+        context = self._context()
+        decision = SIG.decide_signal(passed=True, reason="通过")
         with self.assertRaises(ValueError) as caught:
-            SIG.commit_signal(sqlite3.connect(":memory:"), context=context, row={"code": "600901"})
+            SIG.commit_signal(
+                self._conn(), context=context, decision=decision, row={"code": "600901"},
+            )
         self.assertIn("missing columns", str(caught.exception))
 
     def test_SIG09_commit_requires_a_frozen_context(self):
@@ -205,22 +247,11 @@ class SignalWriterContractTests(unittest.TestCase):
         所以这里同时断言：非 frozen context（无论是 None 还是一个装有 provenance
         的 dict）都被明确拒绝，且拒绝理由指向"需要 frozen context"。
         """
-        conn = sqlite3.connect(":memory:")
-        conn.execute(
-            "CREATE TABLE paper_signals(id INTEGER PRIMARY KEY, account_id TEXT,"
-            " signal_date TEXT, intended_date TEXT, code TEXT, name TEXT, industry TEXT,"
-            " close_price REAL, rank_score REAL, t_tier TEXT, t_score REAL, payload TEXT,"
-            " status TEXT, reason TEXT, created_at TEXT, strategy_id TEXT,"
-            " strategy_version INTEGER, strategy_checksum TEXT, cycle_id INTEGER)"
-        )
-        row = {
-            "signal_date": "2026-09-08", "intended_date": "2026-09-09", "code": "600901",
-            "name": "测试", "industry": None, "close_price": 10.0, "rank_score": 1.0,
-            "t_tier": "A", "t_score": 1.0, "payload": "{}", "status": "pending",
-            "reason": "", "created_at": "2026-09-08T15:00:00",
-        }
+        conn = self._conn()
+        decision = SIG.decide_signal(passed=True, reason="通过")
+        row = self._row()
         with self.assertRaises(ValueError) as caught:
-            SIG.commit_signal(conn, context=None, row=row)
+            SIG.commit_signal(conn, context=None, decision=decision, row=row)
         self.assertIn("frozen", str(caught.exception).lower())
 
         # 一个"看起来像 context"的 dict 也不能被接受：它没有 frozen 语义，
@@ -230,9 +261,158 @@ class SignalWriterContractTests(unittest.TestCase):
             "strategy_version": 1, "strategy_checksum": "c", "asof_day": "2026-09-08",
         }
         with self.assertRaises((ValueError, AttributeError, TypeError)):
-            SIG.commit_signal(conn, context=impostor, row=row)
+            SIG.commit_signal(conn, context=impostor, decision=decision, row=row)
         rows = conn.execute("SELECT COUNT(*) FROM paper_signals").fetchone()[0]
         self.assertEqual(rows, 0, "非 frozen context 仍然写入了 signal")
+        conn.close()
+
+    # ---------------------------------------------------------------
+    # SIG-WRITER-01..03 —— Decision→Commit 契约（复核要求的 permanent regression）
+    # ---------------------------------------------------------------
+
+    def test_SIGW01_commit_rejects_a_missing_decision(self):
+        """SIG-WRITER-01：没有 SignalDecision 就不能 commit。
+
+        这条是一个"缺失参数"型漏洞：如果 ``decision`` 是可选的，caller 只要
+        自己拼 row 就能伪造一条正式 signal，完全不经过 Candidate / Evidence /
+        Decision。未来 R27 的 AI candidate producer 一旦拿到 writer 就能这样做 ——
+        因此这里必须拒绝，而不是"默认放行"。
+
+        拒绝由**签名**保证（keyword-only 且无默认值），因此缺参是 ``TypeError``；
+        传了非 decision 的值则由 writer 自己 raise ``ValueError``。两种都要覆盖：
+        只测后者会漏掉"签名允许省略"的实现。
+        """
+        conn = self._conn()
+        row = self._row(status="pending", reason="我自己说通过")
+        with self.assertRaises(TypeError) as caught:
+            # 完全不传 decision：模拟"只想写一行"的 caller。
+            SIG.commit_signal(conn, context=self._context(), row=row)
+        self.assertIn("decision", str(caught.exception))
+
+        # 传一个"看起来像 decision"的 dict / None 同样不行。
+        for not_a_decision in (None, {"outcome": "approved", "status": "pending", "reason": ""}):
+            with self.assertRaises(ValueError) as caught_value:
+                SIG.commit_signal(
+                    conn, context=self._context(), decision=not_a_decision, row=row,
+                )
+            self.assertIn("SignalDecision", str(caught_value.exception))
+        self.assertEqual(
+            conn.execute("SELECT COUNT(*) FROM paper_signals").fetchone()[0], 0,
+            "缺失/伪造 decision 仍然写入了 signal",
+        )
+        conn.close()
+
+    def test_SIGW02_commit_rejects_a_row_that_forges_the_decision_status(self):
+        """SIG-WRITER-02：decision=blocked，但 caller 伪造 ``status=pending`` → 拒绝。
+
+        这正是"靠调用者自觉遵守"与"真正的 authority contract"的分界：
+        writer 必须**拒绝** caller 提供的裁决字段，而不是静默忽略它
+        （静默忽略会让旁路继续以"能跑"的形式存在，掩盖 caller 的误解）。
+        """
+        conn = self._conn()
+        blocked = SIG.decide_signal(passed=False, reason="缺少有效报价")
+        # 伪造一个可执行 status。
+        with self.assertRaises(ValueError) as caught:
+            SIG.commit_signal(
+                conn, context=self._context(), decision=blocked,
+                row=self._row(status="pending", reason="缺少有效报价"),
+            )
+        self.assertIn("status", str(caught.exception))
+        # 即使"伪造的值与 decision 恰好一致"也必须拒绝：一致性不是调用方的职责，
+        # 允许它就等于允许 caller 决定裁决来源。
+        with self.assertRaises(ValueError):
+            SIG.commit_signal(
+                conn, context=self._context(), decision=blocked,
+                row=self._row(status="blocked", reason="缺少有效报价"),
+            )
+        # 只伪造 reason 也不行。
+        with self.assertRaises(ValueError) as caught_reason:
+            SIG.commit_signal(
+                conn, context=self._context(), decision=blocked,
+                row=self._row(reason="缺少有效报价"),
+            )
+        self.assertIn("reason", str(caught_reason.exception))
+        self.assertEqual(
+            conn.execute("SELECT COUNT(*) FROM paper_signals").fetchone()[0], 0,
+            "伪造裁决字段仍然写入了 signal",
+        )
+        conn.close()
+
+    def test_SIGW03_commit_rejects_a_payload_that_forges_the_evidence(self):
+        """SIG-WRITER-03：decision 的 evidence=A，caller 在 payload 伪造成 B → 拒绝。
+
+        证据与裁决同属 writer 独占：如果允许 caller 预置 ``signal_evidence``，
+        落库的"为什么这条 signal 成立"就不再来自决策对象，而是来自最后一个动手
+        写 payload 的人。
+        """
+        conn = self._conn()
+        real = SIG.signal_evidence(
+            {"quote_validation": "range_timestamp_checked"}, asof_day="2026-09-08",
+        )
+        decision = SIG.decide_signal(passed=True, reason="通过", evidence=real)
+        forged = SIG.signal_evidence(
+            {"quote_validation": "cross_source_checked"}, asof_day="2026-09-08",
+        ).projection()
+        self.assertFalse(real.cross_source_verified)
+        self.assertTrue(forged["cross_source_verified"])
+
+        for key, value in (("signal_evidence", forged), ("signal_decision", {"outcome": "approved"})):
+            with self.assertRaises(ValueError) as caught:
+                SIG.commit_signal(
+                    conn, context=self._context(), decision=decision,
+                    row=self._row(payload={"pick": {}, key: value}),
+                )
+            self.assertIn(key, str(caught.exception))
+        self.assertEqual(
+            conn.execute("SELECT COUNT(*) FROM paper_signals").fetchone()[0], 0,
+            "伪造 payload 裁决键仍然写入了 signal",
+        )
+        conn.close()
+
+    def test_SIGW04_writer_injects_canonical_decision_and_evidence(self):
+        """正对照：writer 自己注入裁决与证据，并返回落库的 canonical payload。
+
+        没有这条，前面三条"拒绝"可能是"反正什么都不写"造成的假绿。
+        """
+        conn = self._conn()
+        evidence = SIG.signal_evidence(
+            {"quote_validation": "cross_source_checked", "quote_at": "2026-09-08T09:35:00"},
+            asof_day="2026-09-08",
+        )
+        decision = SIG.decide_signal(passed=True, reason="", evidence=evidence)
+        payload = {"pick": {"code": "600901"}}
+        returned = SIG.commit_signal(
+            conn, context=self._context(), decision=decision,
+            row=self._row(payload=payload),
+        )
+        status, reason, stored_payload = self._stored(conn)
+        self.assertEqual(status, decision.status)
+        self.assertEqual(reason, decision.reason)
+        stored = json.loads(stored_payload)
+        # writer 注入的裁决与证据必须落在账本里，且与 decision 一致。
+        self.assertEqual(stored["signal_decision"]["outcome"], "approved")
+        self.assertEqual(stored["signal_decision"]["status"], decision.status)
+        self.assertEqual(
+            stored["signal_evidence"]["cross_source_verified"],
+            evidence.cross_source_verified,
+        )
+        # 调用方拿到的返回值就是落库内容，可直接用于 risk log（避免二次注入点）。
+        self.assertEqual(returned["signal_decision"], stored["signal_decision"])
+        # writer 不得把 payload 写回调用方传进来的 mapping（那是共享可变状态）。
+        self.assertNotIn("signal_decision", payload)
+        self.assertNotIn("signal_evidence", payload)
+        conn.close()
+
+    def test_SIGW05_payload_must_be_a_mapping_not_a_preserialized_string(self):
+        """调用方不能预序列化 payload：writer 必须在写入前注入裁决与证据。"""
+        conn = self._conn()
+        decision = SIG.decide_signal(passed=True, reason="")
+        with self.assertRaises(ValueError) as caught:
+            SIG.commit_signal(
+                conn, context=self._context(), decision=decision,
+                row=self._row(payload='{"pick": {}}'),
+            )
+        self.assertIn("mapping", str(caught.exception))
         conn.close()
 
 
@@ -472,6 +652,58 @@ class SignalArchitectureGuardTests(unittest.TestCase):
                         f"{function} 的写锁内出现网络/取数调用 {io_name}",
                     )
         self.assertGreaterEqual(checked, 1, "找不到任何 signal 写事务（门禁空转）")
+
+    def test_SIGG05_production_callsites_must_pass_an_explicit_decision(self):
+        """两条 production signal 路径都必须交入明确的 ``SignalDecision``。
+
+        这是 R25 最核心不变的守卫：Candidate→Evidence→Decision→Commit。
+        writer 的签名已经强制要求 ``decision``（见 SIG-WRITER-01），本门禁额外
+        钉住**调用点**——防止将来有人把两条路径改成"先 commit、decision 算了但
+        没传"，或者新增第三条只写 row 的路径。
+
+        判定基于 AST：要求每个 ``SIG.commit_signal(...)`` 调用点都带
+        ``decision=`` 关键字，且该值不是字面量 None。
+        """
+        raw = _backend_source("paper_trading.py")
+        tree = ast.parse(raw)
+        callsites = []
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            if not (isinstance(func, ast.Attribute) and func.attr == "commit_signal"):
+                continue
+            keywords = {kw.arg: kw.value for kw in node.keywords}
+            callsites.append((node.lineno, keywords))
+
+        self.assertGreaterEqual(
+            len(callsites), 2,
+            f"production 里有 {len(callsites)} 个 commit_signal 调用点（期望 ≥2：close + bootstrap）",
+        )
+        for lineno, keywords in callsites:
+            self.assertIn(
+                "decision", keywords,
+                f"paper_trading.py:{lineno} 的 commit_signal 没有传 decision "
+                "（绕过了 Candidate→Evidence→Decision 边界）",
+            )
+            decision = keywords["decision"]
+            self.assertFalse(
+                isinstance(decision, ast.Constant) and decision.value is None,
+                f"paper_trading.py:{lineno} 的 decision 是字面量 None",
+            )
+            # 裁决字段不得由调用点提供 —— 它们由 decision 独占。
+            row = keywords.get("row")
+            if isinstance(row, ast.Dict):
+                keys = {
+                    key.value for key in row.keys
+                    if isinstance(key, ast.Constant) and isinstance(key.value, str)
+                }
+                leaked = keys & {"status", "reason"}
+                self.assertEqual(
+                    leaked, set(),
+                    f"paper_trading.py:{lineno} 在 row 里自述裁决字段 {leaked}"
+                    "（这些由 SignalDecision 独占）",
+                )
 
 
 # ---------------------------------------------------------------------------
@@ -779,7 +1011,11 @@ class SignalCrashSafetyTests(OfflinePaperEnv, unittest.TestCase):
     """写路径失败必须 fail closed：不写错误 signal，并给出可诊断原因（§50）。"""
 
     def test_SIG15_commit_failure_does_not_leave_a_partial_signal(self):
-        """writer 抛错时整批回滚：既不留半行，也不吞掉异常。"""
+        """writer 抛错时整批回滚：既不留半行，也不吞掉异常。
+
+        用 ghost account 触发 DB 层的 cycle provenance trigger（R23 第二道门），
+        因此异常必须来自 SQL 层而不是参数校验 —— 后者根本走不到 INSERT。
+        """
         with self._conn() as conn:
             SR.ensure_schema(conn)
         PT.init_db()
@@ -787,17 +1023,18 @@ class SignalCrashSafetyTests(OfflinePaperEnv, unittest.TestCase):
             account_id="ghost_account", cycle_id=1, strategy_id="s",
             strategy_version=1, strategy_checksum="c", asof_day="2026-09-08",
         )
+        decision = SIG.decide_signal(passed=True, reason="通过")
         conn = sqlite3.connect(PT.DB_PATH, timeout=5)
         try:
             with self.assertRaises(sqlite3.Error):
                 SIG.commit_signal(
-                    conn, context=context, conflict=SIG.CONFLICT_IGNORE,
+                    conn, context=context, decision=decision,
+                    conflict=SIG.CONFLICT_IGNORE,
                     row={
                         "signal_date": "2026-09-08", "intended_date": "2026-09-09",
                         "code": "600901", "name": "幻影", "industry": None,
                         "close_price": 10.0, "rank_score": 1.0, "t_tier": "A",
-                        "t_score": 1.0, "payload": "{}", "status": "pending",
-                        "reason": "", "created_at": "2026-09-08T15:00:00",
+                        "t_score": 1.0, "payload": {}, "created_at": "2026-09-08T15:00:00",
                     },
                 )
             conn.rollback()

@@ -74,17 +74,39 @@ implicit current-state lookup in signal:  before = 0（R23 已消除）
 
 ## 3. Candidate / Evidence / Decision 如何分离
 
-**Candidate ≠ Signal。** 候选 dict 此前"加字段加到自动变成 DB signal"——中间没有
-lifecycle boundary。现在落库必须经过一个显式决策对象：
+**Candidate ≠ Signal，且这个边界由 writer 强制。** 候选 dict 此前"加字段加到
+自动变成 DB signal"——中间没有 lifecycle boundary。现在：
 
 ```python
-decision = SIG.decide_signal(passed=..., reason=..., evidence=...)
-# outcome ∈ {approved, blocked}; status 是 paper_signals.status; evidence 是证据投影
+decision = SIG.decide_signal(passed=..., reason=..., evidence=...)   # 必需
+committed = SIG.commit_signal(conn, context=..., decision=decision, row={...})
 ```
+
+`commit_signal` 从 `decision` **独占派生** `status` / `reason` /
+`payload.signal_decision` / `payload.signal_evidence`，并**拒绝**调用方自己提供
+这些字段：
+
+| 尝试 | 结果 |
+| --- | --- |
+| 不传 `decision` | 签名层 `TypeError`（keyword-only、无默认值） |
+| `decision=None` 或 dict | `ValueError`（必须是真的 `SignalDecision`） |
+| `row` 里带 `status` / `reason` | `ValueError`（decision 独占；**即使值与 decision 一致也拒绝**） |
+| payload 预设 `signal_decision` / `signal_evidence` | `ValueError` |
+| payload 传预序列化字符串 | `ValueError`（writer 必须在写入前注入） |
+
+为什么是"拒绝"而不是"静默忽略"：静默忽略会让旁路继续以"能跑"的形式存在，
+掩盖 caller 的误解。为什么这条重要：如果 writer 信任 caller 传进来的 `status`，
+那么"唯一 writer"只是把内联 SQL 换了个位置 —— 任何模块（未来包括 R27 的 AI
+candidate producer）只要拿到 `commit_signal` 就能写一条 `status="pending"` 的
+正式 signal，完全不经过 Candidate / Evidence / Decision。
+
+`commit_signal` 返回**实际落库的 canonical payload**，两个调用点用它写 risk log /
+intraday 观察，因此不存在第二处裁决注入点。
 
 `evidence` 是**紧凑投影**，不是第二份行情 payload：只携带
 `verification` / `verification_method` / `asof_day` / `observed_at` / `policy`
-与少量解释字段。不复制全市场 snapshot。
+与少量解释字段。不复制全市场 snapshot，且 `signal_decision` 刻意不再嵌一份
+evidence —— 同一行里放两份事实，漂移时无法判断哪份是权威。
 
 ---
 
@@ -92,8 +114,8 @@ decision = SIG.decide_signal(passed=..., reason=..., evidence=...)
 
 `backend/signal_service.py`（唯一，且是**纯边界**）：
 
-- `commit_signal(conn, *, context, row, conflict)` 是 `paper_signals` 的**唯一**
-  生产写入点；
+- `commit_signal(conn, *, context, decision, row, conflict)` 是 `paper_signals`
+  的**唯一**生产写入点，且**强制消费 `SignalDecision`**（见 §3）；
 - `conflict_statement(conflict)` 是两种语句的唯一构造入口；
 - 依赖方向单向：`paper_trading → signal_service → market_data_contract /
   strategy_selection_resolver`。它**不** import `paper_trading`、不 import FastAPI、
@@ -218,8 +240,8 @@ paper_trading.py  BASE LOC=14895 defs=302  →  HEAD LOC=14993 defs=304
 L0  ruff backend（全树）           All checks passed
     compileall                     OK
 
-L1/L2  R25 targeted                254/254 OK
-       test_signal_pipeline         20
+L1/L2  R25 targeted                260/260 OK
+       test_signal_pipeline         26（含 SIG-WRITER-01..05、SIGG05）
        test_provenance_inflight_change 11
        test_strategy_selection_provenance 44（含修复的 RF04/RF05）
        test_paper_trading_architecture_guard 112（含修复的 guard14r/14s）
@@ -227,14 +249,16 @@ L1/L2  R25 targeted                254/254 OK
        signal-consumer regression    213/213 OK
        read-model / frontend-contract 101/101 OK
 
-L3  backend full                   Ran 4078 tests, OK, skipped=5
+L3  backend full                  Ran 4084 tests, OK, skipped=5
     frontend unit                  125/125（118 既有 + 7 新增）
     frontend build + check:dist    PASS
-    browser E2E (paper-runtime)    2 passed（workers=1, retries=0）
+    browser E2E (full suite)      32 passed（workers=1, retries=0；
+                                   paper-runtime 单 spec 亦 2 passed）
     security (worktree / all)      clean
-    mutation --non-vacuity         8/8 CAUGHT, survived=0, fake=0, other=0
+    mutation --non-vacuity         9/9 CAUGHT, survived=0, fake=0, other=0
                                    restore sha256 PASS
 ```
+
 
 ### 继承的半成品与本轮修复
 
@@ -253,6 +277,36 @@ L3  backend full                   Ran 4078 tests, OK, skipped=5
    完成，并把行情 / 新闻 / 板块流预取移到写事务之前。新增 AST guard `SIGG04` 与行为
    探针 `SIG14`（包住 `_db` 与 provider，写事务内调用即失败）两层守住。
 4. 修掉 bootstrap 的 status 双套条件死代码。
+
+### 复核修正：Decision→Commit 契约（mandatory）
+
+人工复核发现的最核心 blocker：**唯一 writer 并不要求传入 `SignalDecision`。**
+正常路径确实走了 `decide_signal()`，但 `commit_signal()` 只校验 frozen context、
+provenance 与 row 列完整性，然后**信任**调用方传进来的 `status` / `reason` /
+payload。任何 production caller（含未来 R27 的 AI candidate producer）只要拿到
+writer 就能自己拼一行 `status="pending"` 落库，绕过 Candidate→Evidence→Decision。
+当时测试本身也直接 `row + context` 调 writer，等于把这条旁路当作合法 API。
+
+本轮按"只做一个很窄的修复"处理，未拆模块、未引入 repository/facade：
+
+- `commit_signal(conn, *, context, decision, row, conflict)`：`decision` 成为
+  **必需**（keyword-only、无默认值），writer 从它独占派生
+  `status` / `reason` / `payload.signal_decision` / `payload.signal_evidence`；
+- 调用方在 `row` 里带 `status` / `reason`，或在 payload 里预设两个裁决键，
+  一律 **fail closed**（明确拒绝，不是静默忽略——静默忽略会让旁路继续以
+  "能跑"的形式存在）；
+- payload 必须传 mapping；writer 负责序列化（与既有 `_json` 同口径，字节一致）；
+- writer 返回实际落库的 canonical payload，两个 callsite 用它写 risk log 与
+  intraday 观察，消除了第二处裁决注入点；
+- `signal_decision` 不再嵌一份 evidence（evidence 已单独持久化，复制两份会在
+  漂移时无法判断权威）；
+- 新增 permanent regression：`SIG-WRITER-01`（无 decision → 拒绝）、
+  `SIG-WRITER-02`（decision=blocked 但 caller 伪造 status=pending → 拒绝，
+  含"值与 decision 恰好一致也拒绝"）、`SIG-WRITER-03`（payload 伪造 evidence →
+  拒绝）、`SIGW04`（正对照：writer 注入 canonical 裁决/证据）、`SIGW05`
+  （payload 不得预序列化）、`SIGG05`（两条 production callsite 必须交入明确
+  `SignalDecision`，且 row 不含 status/reason）；
+- 新增 mutation `M-SIG-D1`（writer 忽略 decision、重新信任 caller row）→ RED。
 
 ### mutation 矩阵发现的测试鉴别力问题
 

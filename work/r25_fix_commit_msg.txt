@@ -1,0 +1,34 @@
+fix(signal): require SignalDecision at the writer (mandatory Decision→Commit)
+
+复核 blocker：唯一 Signal writer 并不要求传入 SignalDecision。正常路径确实走了
+decide_signal()，但 commit_signal() 只校验 frozen context / provenance / row 列
+完整性，然后信任调用方传进来的 status / reason / payload。任何 production
+caller（含未来 R27 的 AI candidate producer）只要拿到 writer 就能自己拼一行
+status="pending" 落库，绕过 Candidate→Evidence→Decision。测试本身也直接
+row+context 调 writer，等于把旁路当合法 API。
+
+本轮只做这一项窄修复，未拆模块、未引入 repository/facade：
+
+- commit_signal(conn, *, context, decision, row, conflict)：decision 成为必需
+  （keyword-only 无默认值）；writer 从它独占派生 status / reason /
+  payload.signal_decision / payload.signal_evidence。
+- 调用方在 row 里带 status/reason、或在 payload 预设两个裁决键，一律 fail
+  closed（明确拒绝而非静默忽略——静默忽略会让旁路以"能跑"的形式继续存在）。
+- payload 必须传 mapping，writer 负责序列化（与既有 _json 同口径，字节一致）。
+- writer 返回实际落库的 canonical payload；两个 callsite 用它写 risk log 与
+  intraday 观察，消除第二处裁决注入点。
+- signal_decision 不再嵌一份 evidence（已单独持久化，复制两份漂移时无法判断权威）。
+
+新增 permanent regression：
+- SIG-WRITER-01 无 decision → 拒绝（签名层 TypeError + 非 decision 值 ValueError）
+- SIG-WRITER-02 decision=blocked 但 caller 伪造 status=pending → 拒绝
+  （含"值与 decision 恰好一致也拒绝"）
+- SIG-WRITER-03 payload 伪造 evidence → 拒绝
+- SIGW04 正对照：writer 注入 canonical 裁决/证据并返回落库内容
+- SIGW05 payload 不得预序列化
+- SIGG05 两条 production callsite 必须交入明确 SignalDecision，row 不含裁决字段
+- mutation M-SIG-D1（writer 忽略 decision、重新信任 caller row）→ RED
+
+验证：R25 targeted 260/260；backend full 4084 OK / skipped=5；frontend 125/125；
+E2E 32 passed（0 retry / 0 flaky）；security clean；mutation 9/9 CAUGHT
+（survived=0, fake=0, restore sha256 PASS）。

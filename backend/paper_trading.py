@@ -7749,11 +7749,13 @@ def generate_signals(asof_date=None):
                 decision_result = SIG.decide_signal(
                     passed=passed, reason=reason, evidence=approval_evidence,
                 )
-                payload["signal_evidence"] = approval_evidence.projection()
-                payload["signal_decision"] = decision_result.business_projection()
-                SIG.commit_signal(
+                # R25：writer 独占 status / reason / 两个裁决 payload 键，并返回
+                # 实际落库的 canonical payload。risk log 复用这个返回值，
+                # 而不是自己再注入一次裁决（那会出现第二处注入点）。
+                committed_payload = SIG.commit_signal(
                     conn,
                     context=account_context,
+                    decision=decision_result,
                     row={
                         "signal_date": day.isoformat(),
                         "intended_date": _next_weekday(day).isoformat(),
@@ -7764,16 +7766,15 @@ def generate_signals(asof_date=None):
                         "rank_score": _num(pick.get("score")),
                         "t_tier": decision.get("tier"),
                         "t_score": _num((decision.get("entry_model") or {}).get("score")),
-                        "payload": _json(payload),
-                        "status": decision_result.status,
-                        "reason": reason,
+                        "payload": payload,
                         "created_at": _now(),
                     },
                     conflict=SIG.CONFLICT_IGNORE,
                 )
                 # R23：候选批 / signal 行 / risk decision 共享同一个 frozen stamp。
                 _risk_log(conn, account["id"], code, "buy", "approved_signal" if passed
-                          else "rejected_signal", reason, payload, strategy_stamp=account_stamp)
+                          else "rejected_signal", reason, committed_payload,
+                          strategy_stamp=account_stamp)
                 created += int(passed)
             _audit(conn, account["id"], "close_signal_scan", f"候选 {len(candidates)}，通过 {created}")
             summary["accounts"].append({"id": account["id"], "created": created, "candidates": len(candidates), **meta})
@@ -11436,8 +11437,9 @@ def _bootstrap_signals_for_today(asof_day, live_universe=None, source_slot="intr
                         "reason": "早期强势、资金和流动性共振；仅用于同批等待池排序",
                         "execution_override": False,
                     }
-                    payload["signal_evidence"] = approval_evidence.projection()
-                    # R25：status / reason 由决策唯一产出，落库直接取它的字段。
+                    # R25：status / reason / 两个裁决 payload 键由 writer 从决策
+                    # 独占派生；它返回实际落库的 canonical payload，risk log 与
+                    # intraday 观察复用同一份，不产生第二处裁决注入点。
                     bootstrap_decision = SIG.decide_signal(
                         passed=passed, reason=reason, evidence=approval_evidence,
                         status_if_passed=(
@@ -11448,10 +11450,10 @@ def _bootstrap_signals_for_today(asof_day, live_universe=None, source_slot="intr
                         ),
                     )
                     status = bootstrap_decision.status
-                    payload["signal_decision"] = bootstrap_decision.business_projection()
-                    SIG.commit_signal(
+                    committed_payload = SIG.commit_signal(
                         conn,
                         context=bootstrap_context,
+                        decision=bootstrap_decision,
                         row={
                             "signal_date": factor_day.isoformat(),
                             "intended_date": day.isoformat(),
@@ -11462,9 +11464,7 @@ def _bootstrap_signals_for_today(asof_day, live_universe=None, source_slot="intr
                             "rank_score": _num(pick.get("score")),
                             "t_tier": decision.get("tier"),
                             "t_score": _num((decision.get("entry_model") or {}).get("score"), 0.0) + waitlist_priority,
-                            "payload": _json(payload),
-                            "status": status,
-                            "reason": bootstrap_decision.reason,
+                            "payload": payload,
                             "created_at": _now(),
                         },
                         conflict=SIG.CONFLICT_REFRESH,
@@ -11474,18 +11474,19 @@ def _bootstrap_signals_for_today(asof_day, live_universe=None, source_slot="intr
                         ENTRY_FROZEN_WAITLIST_STATUS
                         if status == ENTRY_FROZEN_WAITLIST_STATUS
                         else "approved_bootstrap" if passed else "rejected_bootstrap",
-                        reason or "盘中候选通过", payload,
+                        reason or "盘中候选通过", committed_payload,
                         strategy_stamp=bootstrap_stamp,
                     )
                     if is_reentry and passed:
                         _observe_intraday(
                             conn, cycle["id"], account["id"], code, _num(quote.get("price")),
-                            "swing_reentry_armed", "波段卖出后重新满足入场条件，允许单次再入场", payload,
+                            "swing_reentry_armed", "波段卖出后重新满足入场条件，允许单次再入场",
+                            committed_payload,
                         )
                     if is_recovery:
                         _observe_intraday(
                             conn, cycle["id"], account["id"], code, _num(quote.get("price")),
-                            "protective_recovery", reason, payload,
+                            "protective_recovery", reason, committed_payload,
                         )
                     approved += int(passed)
                 item = {
