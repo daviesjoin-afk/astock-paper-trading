@@ -9,6 +9,8 @@ import sys
 sys.path.insert(0, "/app/backend")
 
 import data_fetcher as dfc  # noqa: E402
+import market_data_contract as MDC  # noqa: E402
+import market_data_service as MDSvc  # noqa: E402
 
 
 def main():
@@ -26,7 +28,8 @@ def main():
             }
             print(json.dumps(payload, ensure_ascii=False))
             return 0
-        rows = dfc.fetch_market_snapshot_full(max_age=0, force=True)
+        # R24：显式强制刷新（freshness 窗口归 CLOSE_SNAPSHOT_POLICY）。
+        rows = MDSvc.refresh_rows(force=True, policy=MDC.CLOSE_SNAPSHOT_POLICY)
         unique_rows = {
             str(row.get("code")): row for row in rows
             if isinstance(row, dict) and str(row.get("code") or "")

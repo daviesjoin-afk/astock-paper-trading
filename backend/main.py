@@ -16,6 +16,8 @@ except ImportError:  # pragma: no cover - Windows development only.
 
 import build_info as BI
 import data_fetcher as dfc
+import market_data_contract as MDC
+import market_data_service as MDSvc
 import universe as U
 import factors as F
 import strategies as S
@@ -847,17 +849,45 @@ def health():
     )
     warnings = []
     advisories = []
+    # R24：行情事实经唯一 authority 判定，health 只投影、不自己重算 freshness。
+    # 数据事实（data_fact）与 provider 健康（provider_health）并列但互不推导：
+    # provider 红灯不自动作废最后已验证的 snapshot，snapshot 存在也不代表源健康。
+    try:
+        market_data = MDSvc.market_health_projection(
+            now=datetime.datetime.now(datetime.timezone.utc)
+        )
+    except Exception as exc:
+        market_data = {
+            "data_fact": {
+                "status": "unavailable", "availability": "unavailable",
+                "freshness": "unknown", "verification": "not_attempted",
+                "verification_method": "none",
+                "as_of": None, "observed_at": None, "age_seconds": None,
+                "reason": "provider_unavailable", "policy": "market_health_display",
+                "row_count": 0,
+            },
+            "snapshot_meta": {"saved_at": None, "expected_rows": 0, "rows": 0,
+                              "complete": False},
+            "provider_health": {"healthy": False, "checked_at": None,
+                                "action": f"行情事实判定异常：{type(exc).__name__}"},
+        }
     live_snapshot = {
         "rows": 0, "saved_at": None, "quote_at_min": None,
         "quote_at_max": None, "age_seconds": None, "status": "unknown",
     }
     try:
-        with open(dfc.MARKET_SNAPSHOT_FULL_CACHE_PATH, encoding="utf-8") as handle:
-            payload = json.load(handle)
-        rows = payload.get("rows") if isinstance(payload, dict) else None
-        rows = rows if isinstance(rows, list) else []
+        # R24：经 Market Data Authority 读取 —— 它复用既有的 complete-marker 与
+        # 行覆盖校验（``_full_snapshot_payload_is_complete``）。此前这里直接
+        # ``open(MARKET_SNAPSHOT_FULL_CACHE_PATH)``，一份残缺/伪造 payload 会被
+        # 当成正常快照计数。
+        cached_reading, cached_payload = MDSvc.read_snapshot_with_meta(
+            now=datetime.datetime.now(datetime.timezone.utc)
+        )
+        rows = [dict(row) for row in cached_reading.rows()]
         stamps = sorted(str(row.get("quote_at")) for row in rows if row.get("quote_at"))
-        saved_at = payload.get("saved_at") if isinstance(payload, dict) else None
+        # ``saved_at`` 由 authority 保留（不再被丢成 None），因此这里的
+        # data-validity 年龄口径与迁移前一致。
+        saved_at = cached_payload.get("saved_at") if cached_payload else None
         live_snapshot.update({
             "rows": len(rows), "saved_at": saved_at,
             "quote_at_min": stamps[0] if stamps else None,
@@ -902,10 +932,12 @@ def health():
         live_snapshot["quote_day_rows"] = len(quote_day_rows)
         live_snapshot["expected_quote_day"] = expected_quote_day
         complete_snapshot = len(rows) >= 4000 and len(quote_day_rows) >= 4000
-        live_snapshot["status"] = (
-            "fresh" if in_live_session and len(rows) >= 4000 and len(fresh_rows) >= 4000
-            else "closed_snapshot" if not in_live_session and complete_snapshot
-            else "stale"
+        # R24：freshness 的**判决**只有 Market Data Authority 一个来源。这里保留
+        # live_snapshot 是因为 data-validity 页消费其行数/覆盖明细，但 status 不再
+        # 在这里重新判一遍（否则同一响应里会出现两个权威口径）。
+        live_snapshot["status"] = market_data["data_fact"]["status"]
+        live_snapshot["closed_snapshot"] = bool(
+            not in_live_session and complete_snapshot
         )
         if len(rows) < 4000:
             warnings.append(f"全市场实时快照仅 {len(rows)} 行，未达到完整性门槛 4000")
@@ -913,9 +945,10 @@ def health():
             warnings.append(f"全市场实时快照新鲜有效仅 {len(fresh_rows)} 行，已超过30分钟或不是当日行情")
         if not in_live_session and len(quote_day_rows) < 4000:
             warnings.append(f"最近完整交易日快照仅 {len(quote_day_rows)} 行，未达到完整性门槛 4000")
-    except (OSError, ValueError, TypeError) as exc:
-        live_snapshot["status"] = "missing"
-        warnings.append(f"全市场实时快照读取失败：{type(exc).__name__}")
+    except (OSError, ValueError, TypeError, KeyError) as exc:
+        # 明细行读取失败只影响展示；freshness 结论仍只由 authority 给出
+        # （它已独立读过同一份校验过的 payload）。
+        warnings.append(f"全市场实时快照明细读取失败：{type(exc).__name__}")
     source_health = dfc.load_source_health()
     if source_health and not source_health.get("healthy", False):
         warnings.append(source_health.get("action") or "最近一轮行情源探活未通过，等待自动重连")
@@ -947,6 +980,8 @@ def health():
         "warnings": warnings,
         "advisories": advisories,
         "live_snapshot": live_snapshot,
+        # R24：行情事实的唯一投影（前端只渲染，不重算 freshness/provider 规则）。
+        "market_data": market_data,
         "selection_usable_pct": coverage["usable_selection_pct"],
         "backtest_usable": coverage["usable_backtest"],
         "backtest_usable_pct": coverage["usable_backtest_pct"],
@@ -1383,12 +1418,11 @@ def _select_uncached(
 
         Selection must fail closed on insufficient coverage, not fail open (or
         turn a transient provider exception into a 500 response).
+
+        R24：selection 是决策路径（显式允许联网），取数与 freshness 都归
+        Market Data Authority；它已经把 provider 异常收敛成"返回空"。
         """
-        try:
-            rows = dfc.fetch_market_snapshot_full(max_age=240, force=force)
-        except Exception:
-            return []
-        return rows if isinstance(rows, list) else []
+        return MDSvc.refresh_rows(force=force)
 
     live_rows = _safe_live_snapshot()
     # A disk fallback can be complete in row count but several days old.  Do
@@ -1696,10 +1730,15 @@ def news():
 @app.get("/api/hot")
 def hot():
     ranks = dfc.fetch_hot_rank(50)
-    snap = {s["code"]: s for s in dfc.fetch_market_snapshot_full(max_age=240)}
+    # R24：只读页面不为了"补价格"而同步刷新全市场快照 —— 经 authority 读
+    # 当前已知事实；快照缺失/过期时相关字段留空而不是阻塞这个只读请求。
+    snap = MDSvc.read_snapshot(
+        MDC.LIVE_MARKET_POLICY, now=datetime.datetime.now(datetime.timezone.utc),
+    ).snapshot
+    snap_by_code = snap.by_code() if snap is not None else {}
     out = []
     for r in ranks:
-        s = snap.get(r["code"], {})
+        s = snap_by_code.get(r["code"], {})
         out.append({**r, "name": s.get("name"), "price": s.get("price"),
                     "pct": s.get("pct"), "industry": s.get("industry")})
     return {"hot": out}

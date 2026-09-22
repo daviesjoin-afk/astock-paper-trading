@@ -292,7 +292,8 @@ PR-49 把这条口径的实现收敛到只读解析器 `backend/paper_cycle_owne
 | 策略与决策 | `strategies.py`, `strategy_registry.py`, `strategy_service.py`, `strategy_api_models.py`, `strategy_dsl_schema.py`, `strategy_dsl_evaluator.py`, `strategy_runtime.py`, `strategy_risk_fingerprint.py`, `strategy_risk_profiles.py`, `strategy_risk_enforcement.py`, `strategy_parameter_schema.py`, `strategy_policies.py`, `strategy_clusters.py`, `strategy_champion.py`, `user_strategy_participation.py`, `decision_engine.py`, `decision_context.py`, `decision_rules.py` | 策略身份与不可变版本、DSL 编译、运行时就绪与 RuntimeContext、风险/执行画像、生命周期与治理、候选车道与纯规则评分 | 不读取真实券商账户，不写订单/成交 |
 | 订单意图与执行计划 | `order_intent.py`, `execution_planner.py`, `execution_dispatch.py`, `entry_lifecycle.py` | 策略→执行器的意图契约（拒绝数量越权）、计划/复核/落库统一口径、分批与 TTL | 不决定买什么，不计算资金池分配 |
 | 执行真实性证据 | `backend/execution_evidence.py`, `backend/execution_lifecycle.py`, `backend/execution_outcome.py` | 执行证据三态契约（`known`/`unknown`/`not_applicable`）、成交六分类、委托成交状态机与非法跳转拒绝、`selection_executable` × `execution_verified` 连接、`market`/`selection`/`execution` 三层收益 | 不撮合、不写订单/成交/资金、不重建仓库没有的历史数据、不改写 PR149 selection outcome、不用市场标签顶替执行收益；不 import `paper_trading` |
-| 行情基础设施 | `data_fetcher.py`, `marketdata_transport.py`, `marketdata_providers.py`, `marketdata_normalizers.py`, `marketdata_cache.py` | 多源请求、重试/熔断、解析标准化、缓存、覆盖率和新鲜度元数据 | 不在缓存陈旧时伪造实时价 |
+| 行情基础设施 | `data_fetcher.py`, `marketdata_transport.py`, `marketdata_providers.py`, `marketdata_normalizers.py`, `marketdata_cache.py` | 多源请求、重试/熔断、解析标准化、缓存、覆盖率和新鲜度元数据 | 不在缓存陈旧时伪造实时价；不判断业务 freshness policy（归 `market_data_contract`） |
+| 行情业务权威 | `backend/market_data_contract.py`（纯契约：状态语义 + freshness policy）、`backend/market_data_service.py`（唯一 authority：只读 / 显式刷新两个入口） | 回答"在指定 as-of / freshness policy 下，系统目前拥有什么经过验证的市场事实"；区分 fresh / stale / degraded / unverified / unavailable；显式 network policy；点时可证明性 | contract 零 I/O / 零时钟 / 零项目依赖；service 不拥有事务、不 import `paper_trading`、不在只读模式联网；不重写 provider 实现、不负责 provider 健康（归 `data_fetcher.load_source_health`） |
 | 交易门禁 | `paper_trading_rules.py`, `paper_quote_policy.py`, `entry_timing.py` | 交易日、费用、证券权限、T+1、整手、涨跌停、行情新鲜度和入场时机 | 不负责持久化订单 |
 | 持仓运行时风险状态 | `backend/paper_position_risk_state.py` | `paper_position_risk_state` 的唯一 runtime 状态所有权：episode 初始化（verified BUY `0 -> >0`）、peak 只升不降吸收、take_stage 推进、full-exit 收尾、以及所有生产 SELL 路径共用的 `finalize_sell`（自行按 cycle 读权威 `paper_position_lots` 判定 episode 是否结束） | 不拥有 schema/DDL（归 `paper_schema_migrations`），不拥有事务（不 commit/rollback/BEGIN），不解析 active cycle（cycle_id 由调用方显式传入），不决定成交；不 import `paper_trading`，零项目级依赖 |
 | 卖出风险决策引擎 | `backend/paper_risk_decision.py` | 纯确定性卖出风险状态机：同日新仓识别与峰值口径、硬止损（首段减仓 vs 全清）、移动止损、最长持有、阶梯止盈，并由固定严重度序仲裁；`paper_trading._sell_plan` 仅保留薄 adapter | 不读数据库/网络/文件系统、不读机器时钟（`asof_day` 必须由调用方显式传入，缺失即 fail fast）、无全局缓存、不 import `paper_trading` / `strategy_policies` / `paper_account_specs`（policy 由调用方解析后注入）；不决定成交、不写账本 |
@@ -574,6 +575,104 @@ Invariants：
 4. Missing historical valuation remains unknown; it is not replaced by a current quote.
 5. Portfolio reads do not create or mutate execution facts.
 
+## Market Data Boundary（R24）
+
+### 调用方向
+
+行情相关能力此前分散在 provider 调用、cache、TTL/freshness、双源核验、
+fallback、as-of 与页面 read path 之中，上层各自回答"Eastmoney 怎么拿 / cache
+有没有 / 要不要 refresh / A 和 B 谁可信 / 多久算 stale"。R24 建立**唯一
+business authority**，调用方向单向：
+
+```text
+        marketdata_transport / providers / normalizers / cache
+                              ↑   （provider mechanics，不知道上面存在）
+                       data_fetcher
+                              ↑   （provider + cache 存储/投放机制）
+        ┌─────────────────────────────────────────────┐
+        │  market_data_contract.py   纯契约（零 I/O）  │
+        │    status / freshness / verification / as_of │
+        │    MarketDataPolicy  唯一的 freshness 来源   │
+        ├─────────────────────────────────────────────┤
+        │  market_data_service.py    唯一 authority    │
+        │    read_snapshot()    只读，绝不联网          │
+        │    refresh_snapshot() 显式允许联网            │
+        └─────────────────────────────────────────────┘
+                              ↓  MarketDataSnapshot / MarketDataReading
+        Selection / Signal / Risk / Execution / Read Models / Frontend
+```
+
+### 谁负责什么
+
+| 问题 | 唯一 owner |
+| --- | --- |
+| 谁允许 network | `read_snapshot()`（`ACCESS_READ`，**绝不**联网）与 `refresh_snapshot()`（`ACCESS_REFRESH`，显式允许）。判据只有 `access_mode_allows_network()`；未知模式 fail closed |
+| 谁只能 read cache/snapshot | 只读业务路径：`allocation-explain`、runtime view（dashboard）、`/api/hot`、`/api/health`、归因报告。它们只读持久化事实，绝不为此同步刷新 |
+| 谁负责 freshness | `market_data_contract.MarketDataPolicy`（`LIVE_MARKET_POLICY` 240s / 竞价 90s / 开盘事件 120s / 名单 300s / 归因 900s / 收盘 0s）。调用层不再各写 `max_age=` |
+| 谁负责 provider disagreement | `MarketDataSnapshot.verification` 维度（`verified` / `single_source` / `disagreement` / `unavailable` / `not_attempted`），由 `classify()` 判定。冲突一律报 `unverified`，**绝不**静默挑一个源 |
+| `verified` 到底是什么 | 含义固定为"**该 kind 的 verification policy 已通过**"，而"通过的是哪一套"由 `verification_method` 显式表达：`cross_source`（逐票第二源核验）或 `coverage_integrity`（完整性与覆盖）。**只读 `verified` 不得假设多源核验过**；需要双源保证必须调用 `is_cross_source_verified()` |
+| 谁负责 stale 与 unavailable 的区分 | 同上的 `classify()`：STALE 保留最后一份可信 rows；UNAVAILABLE 不带 payload。两者**绝不**合并 |
+| historical as-of 由谁负责 | `classify(..., asof_day=)`：只能使用该日或更早可证明的观测，`observed_day > requested` 或无法证明一律 fail closed（`asof_mismatch` / `asof_unprovable`），**绝不**用 current snapshot 回填 |
+| 谁负责 provider 健康 | `data_fetcher.load_source_health()`（**不**迁移）。与 data fact 并列但互不推导：源红灯不作废最后已验证 snapshot，snapshot 存在也不代表源健康 |
+| network 与 DB writer transaction 的隔离 | authority **不拥有也不接受事务**（不 BEGIN/commit/rollback、不 import `paper_trading`）。provider I/O 与账本写入之间是结构性隔离，不是调用方自觉 |
+
+### 不变量
+
+1. Market Data 的**业务权威**只有一份（`backend/market_data_service.py`），状态语义与
+   freshness policy 只有一份（`backend/market_data_contract.py`，纯 stdlib、零 I/O、
+   零时钟、零项目级 import）。**full-market snapshot 这一类事实**全部经 authority：
+   上层调用点从 18 处收敛到 **0** 处（provider 实现本身仍留在 `data_fetcher.py`，
+   R24 不重写 provider），且**任何模块都不得按路径裸读** `market_snapshot_full.json`，
+   也不得回退到 20 页风险样本 `market_snapshot.json`（约 1/25 个市场，把它当全市场会
+   系统性歪曲板块/个股统计）。依赖方向单向：
+   `调用方 → market_data_service → data_fetcher → providers/cache`，反向禁止。
+   回归门禁：`test_MDG08`（属性名裸读）+ `test_MDG10`（**字面路径**裸读，覆盖
+   `adaptive_engine` / `deepseek_advisor` / `ai_analysis` / `trade_attribution` 这类改写）。
+2. **只读业务路径绝不为了回答"当前已知事实是什么"而同步发起 provider 网络刷新。**
+   这是本边界存在的主要理由：`GET /api/paper/allocation-explain` 曾每次只读请求穿透到
+   provider，在网络不可用时每次支付 ~13.8s 连接超时/重试（实机复现：
+   `work/r23_round4_nonet_probe.py`）。迁移后同一条件下 ≈0.10s，且 provider 调用数为 0。
+   read path 有缓存但过期 → 返回 `stale` **加**最后一份可信 rows；完全没有 → 返回
+   `unavailable`。绝不为了"让页面看起来正常"而偷偷联网，也绝不把 stale 标成 fresh，
+   也绝不构造 0 / `{}` / 默认指数 / 昨值冒充今值。只读路径必须**保留源元数据**
+   （`saved_at` / `expected_rows`）——把它们丢成 `None` / `0` 会让 `/api/health` 的
+   `live_snapshot.saved_at` 与年龄口径静默回退（`test_MDPR01`）。
+   **声明边界**：`GET /api/hot` 仍会同步取**东财人气榜**（`fetch_hot_rank`，独立
+   artifact，非 full-market snapshot）；`POST /api/selection-evaluation/refresh` 与盘后
+   归因的 fallback refresh 也允许联网。它们不是 GET 只读路径 —— 本不变量只覆盖
+   full-market snapshot 的只读消费（`test_MDG06` 钉住这个事实，避免被表述成
+   "整个 read API 都不联网"）。
+3. `verified` 的含义固定为"**该 kind 的 verification policy 已通过**"，而"通过的是
+   哪一套"由 `verification_method` 显式表达：`cross_source`（逐票第二源核验）或
+   `coverage_integrity`（完整性与覆盖）。**只读 `verified` 不得假设多源核验过** ——
+   需要双源保证的消费者必须调用 `is_cross_source_verified()`。构造期即拒绝
+   `verified` 配 `none`、拒绝 `not_attempted` 配任何真实 method。
+4. `MarketDataReading` 保留**正交维度**（`availability` / `freshness` / `verification` /
+   `verification_method` / `as_of` / `reason`），**禁止**压成一个 `quality_score`。
+   `reason` 复用既有业务术语，同一个失败原因不得在不同 caller 出现 `no_data` /
+   `empty` / `provider_error` 等多个名字。API/前端只消费
+   `MarketDataReading.projection()`，只渲染、不重算 freshness，也不理解 provider 机制
+   （重试/熔断/缓存键不进普通 UI）。
+5. **横截面的新鲜度是"多少行够新"，不是"最新那一行够新"。** `MarketDataPolicy` 对全市场
+   快照带 `min_fresh_ratio`（默认 90%）。只看最新一条 `quote_at` 会让"3999 条隔夜旧数据 +
+   1 条刚更新"因为是完整 payload 且最新一行够新而被判 `fresh`，那不是一个可信的实时
+   横截面（`test_MD18`，mutation `M-MD7`）。单点事实（名单构建等）不设比例要求，退化为
+   "最新一条在窗口内"。不同消费者用不同 policy：health 的 data-validity 展示用
+   `MARKET_HEALTH_POLICY`（1800s），**不**并入实时决策的 `LIVE_MARKET_POLICY`（240s）——
+   两者的业务问题不同（"还能不能做实时决策" vs "这份切片还值不值得展示"）。
+6. 决策路径（scheduled scan、收盘、竞价、开盘事件、手动下单、selection、归因）显式使用
+   `refresh_snapshot` / `refresh_rows`。刷新失败时保留最后一次可信事实并标记 stale；
+   对**横截面扫描**则返回空以停止本轮候选扫描（既有语义：不用旧快照冒充实时行情，
+   不回落 20 页风险样本）。cache 只是存储/投放机制，**不是** fact authority：
+   `cache 有值` 不等于 `一定可信`，仍要过 as_of / freshness / verification。
+7. 回归门禁见 `backend/test_market_data_boundary.py`（MD-01 ~ MD-19 契约、
+   MDR-01 ~ MDR-07 只读不联网 + stale/unavailable positive control、MDP-01 ~ MDP-10
+   refresh/失败/多源 parity、MDPIT-01 ~ MDPIT-04 点时可证明性、
+   MDPR-01 ~ MDPR-03 源元数据 parity、MDG-01 ~ MDG-10 架构 guard），
+   语义 mutation 见 `work/r24_mutation_check.py`（M-MD1 ~ M-MD9，9/9 CAUGHT、
+   0 survived、0 fake），只读路径零网络证明见 `work/r24_readpath_no_network_check.py`
+   （9 条只读入口，provider 全部替换为断言失败）。
+
 ## 目标依赖方向
 
 ```text
@@ -583,6 +682,84 @@ API → Service → Domain
 ```
 
 Domain 不直接依赖 FastAPI、SQLite、Eastmoney、Tencent、Sina 或具体 LLM SDK。这个目标会通过渐进拆分实现，不做一次性重写。
+
+## 验证与架构护栏（guard policy）
+
+护栏只 hard fail **语义不变量**，不 hard fail **规模指标**。这条分界本身是架构决定：
+规模指标（单文件 LOC / 模块级 def 数 / 函数行数 / 模块数量）不是架构性质，
+把它们设成 CI 门槛会逼出错误优化 —— 一个"确实需要新增一个有业务意义的
+orchestration wiring"的改动会先撞上 def 上限，然后被迫把另一个无关函数机械搬到
+新文件，结果多出一个 wrapper / helper / import，调用链更长，可维护性反而下降。
+
+### CI hard fail（语义所有权与依赖不变量）
+
+```text
+重复 authority（同一 capability 出现第二份实现）
+旧 authority 回流（已迁出的实现被搬回 god module）
+新增直接 DB write owner
+provider bypass（绕过 Market Data authority 直连/裸读缓存）
+跨 capability dependency violation（pure domain 反向 import 编排层）
+historical current-fill（历史请求用当前快照回填）
+implicit current-state re-resolution（调用方自己重解 active cycle / current head）
+frontend 业务规则重复（前端重算后端 policy）
+network I/O 进入 DB writer transaction
+新模块成为 service locator（零项目级 import 才能是纯边界）
+零 I/O / 零 wall-clock / 零事务所有权边界被破坏
+```
+
+### 仅作 review signal（不进入 CI gate）
+
+```text
+单文件 LOC
+单文件模块级 def 数
+单个函数行数上限
+模块数量
+```
+
+**R24 收尾已移除** `paper_trading.py` 的 LOC / top-level-def hard gate
+（`test_paper_trading_architecture_guard.py` 的 Guard 3 及其两个断言与
+`PAPER_TRADING_LOC_BASELINE` / `PAPER_TRADING_DEF_BASELINE` 常量）。
+未用新阈值替代，也未引入 soft/warning 阈值或 growth budget —— size-based gate
+整体取消。需要趋势数字时临时统计即可（`wc -l` / 一次性 AST `sum(isinstance(...))`），
+不新增永久工具。
+
+### 拆分与抽象的纪律
+
+新增模块必须说明四件事，否则不构成架构改进：
+
+```text
+business responsibility
+authority（它拥有什么唯一真相）
+dependency direction（依赖谁、谁依赖它）
+为什么认知复杂度真的下降
+```
+
+禁止为了降低单文件 LOC 而机械拆分。也禁止为了减少 `if` 数量而机械抽象：
+简单 guard / 少量直接分支允许保留；只有**重复规则、长 if/elif 链、深层嵌套、
+状态硬编码分派**才考虑 pure business predicate / policy table / handler dispatch /
+transition table / rule pipeline。
+
+### 分层验证模型（L0 → L3）
+
+证据是否需要重跑由**修改内容**决定，而不是每次都重跑全量：
+
+```text
+L0  快速静态      ruff check + compileall 修改涉及的文件
+L1  定向验证      受影响模块的 test module / architecture guard
+L2  子系统验证    相关 targeted tests + 相关 mutations + consumer regression
+L3  最终全量      backend full + frontend + E2E + security + full mutation
+```
+
+- **docs-only**（`*.md` / 注释 / PR 描述）：本地不重跑任何 production 验证，
+  等 exact-head CI 即可。
+- **test-only**（`test_*.py` / guard / work 验证脚本）：L0 + 相关 test module。
+- **production subsystem**：L0 → 相关 targeted → 相关 mutations → consumer regression，
+  **不要立刻 full backend**。
+- **最终 production head**：production 修改真正结束后才做一次 L3，然后 push。
+
+merge authority 永远是**当前 PR HEAD 的 exact-head CI**，不是文档里写下的某个旧 SHA。
+因此 PR body 不再记录 `HEAD = <sha>` 快照（那会导致"为更新 SHA 再 commit → SHA 又变"的
+循环）；改为写 "GitHub Actions checks on current PR HEAD"，人工审核时从 GitHub API 读取。
 
 ## 架构演进记录（历史批次：模块化与边界固化）
 

@@ -154,29 +154,41 @@ def _parse_datetime(value):
 
 
 def _market_snapshot():
-    """Read the full-market snapshot already fetched by the 5-minute loop."""
-    paths = (
-        os.path.join(CACHE_DIR, "market_snapshot_full.json"),
-        os.path.join(CACHE_DIR, "market_snapshot.json"),
-    )
-    for path in paths:
-        try:
-            with open(path, "r", encoding="utf-8") as handle:
-                payload = json.load(handle)
-            rows = payload.get("rows") if isinstance(payload, dict) else None
-            if isinstance(rows, list) and rows:
-                return rows, payload.get("saved_at"), os.path.basename(path)
-        except (OSError, ValueError, TypeError):
-            continue
-    return [], None, None
+    """读取**经校验的**全市场快照（R24：只经 Market Data Authority）。
+
+    迁移前的实现直接 ``open(market_snapshot_full.json)``，并在失败时**回退**
+    ``market_snapshot.json`` —— 那是 20 页风险样本（约 1/25 个市场），
+    把它当全市场快照算板块/个股涨跌会系统性歪曲归因结论。同时裸读文件也
+    绕过了 ``_full_snapshot_payload_is_complete`` 的完整性校验。
+
+    现在：只读 authority 校验过的事实；不完整/缺失就返回空，让调用方走
+    「无快照」分支（离线归因率下降是**如实**结论，好过一个被歪曲的归因）。
+    """
+    try:
+        import market_data_service as MDSvc
+        reading, payload = MDSvc.read_snapshot_with_meta(
+            now=dt.datetime.now(dt.timezone.utc),
+        )
+        rows = [dict(row) for row in reading.rows()]
+        if not rows:
+            return [], None, None
+        return rows, (payload.get("saved_at") if payload else None), "market_snapshot_full"
+    except Exception:
+        return [], None, None
 
 
 def _quote_maps(kline_cache=None):
     rows, saved_at, source_file = _market_snapshot()
     if not rows:
+        # R24：归因是盘后离线任务，允许联网，但 fresh 窗口由共享 policy 决定，
+        # 不再在这里内联一个 900 秒 magic number。
         try:
-            import data_fetcher as dfc
-            rows = dfc.fetch_market_snapshot_full(max_age=900) or []
+            import market_data_contract as MDC
+            import market_data_service as MDSvc
+            reading = MDSvc.refresh_snapshot(
+                MDC.ATTRIBUTION_POLICY, now=dt.datetime.now(dt.timezone.utc),
+            )
+            rows = [dict(row) for row in reading.rows()]
             source_file = "live_market_snapshot"
         except Exception:
             rows = []

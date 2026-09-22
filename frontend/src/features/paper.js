@@ -319,6 +319,38 @@ export function filterPaperTerminal(){
    生命周期编辑——需要改定义就跳转到策略工坊。 */
 export var PAPER_STAGE_LABELS={shadow:'影子（不部署）',pilot:'试点',standard:'标准',mature:'成熟',quarantined:'隔离（不部署）'};
 
+/* R24：行情事实状态只有一个渲染入口。
+ *
+ * 后端 Market Data Authority 给出 status / freshness / as_of / reason；
+ * 前端**只渲染**，绝不重算新鲜度（不得用「当前时间减去时间戳再比一个毫秒阈值」
+ * 这类判断——那个阈值是后端 policy，前端复制一份必然漂移），也不理解 provider
+ * 机制（重试次数/熔断/缓存键都不出现在这里的输入里）。 */
+export var PAPER_MARKET_STATUS_LABELS={
+  fresh:'可信',stale:'已过期',degraded:'降级',unverified:'未通过核验',unavailable:'不可用'
+};
+export var PAPER_MARKET_REASON_LABELS={
+  missing:'还没有可信行情',stale:'行情已超过新鲜度窗口',incomplete:'行情覆盖不完整',
+  provider_unavailable:'行情源不可用',refresh_failed:'行情刷新失败',
+  cross_source_failed:'多源核验未通过',asof_unprovable:'无法证明该时点行情',
+  asof_mismatch:'行情时点与请求不一致'
+};
+
+export function paperMarketDataHtml(md){
+  md=md||{};
+  var status=String(md.status||'unavailable');
+  var label=PAPER_MARKET_STATUS_LABELS[status]||status;
+  var tone=(status==='fresh')?'tag-ok':(status==='unavailable'?'tag-warn':'tag-warn');
+  var parts=[];
+  if(md.as_of||md.observed_at) parts.push('最后可信时间 '+riskText(md.observed_at||md.as_of));
+  var reason=md.reason?(PAPER_MARKET_REASON_LABELS[md.reason]||md.reason):'';
+  if(reason) parts.push('原因：'+reason);
+  if(md.verification&&md.verification!=='verified') parts.push('核验 '+riskText(md.verification));
+  return '<div data-testid="paper-market-data-status" data-market-status="'+adaptiveEsc(status)+'">'
+    +'行情：<span class="tag '+tone+'">'+riskText(label)+'</span>'
+    +(parts.length?(' · '+parts.join(' · ')):'')
+    +'</div>';
+}
+
 export async function loadPaperStrategyCenter(){
   var target=$('paperStrategyView');
   if(!target) return;
@@ -417,6 +449,7 @@ export function renderPaperStrategyCenter(d){
   var guards=(((d.boundaries||{}).shared_guards)||[]).map(function(item){return '<li>'+riskText(item)+'</li>';}).join('');
   target.innerHTML='<section class="paper-strategy-intro"><div><h3>运行策略</h3>'
     +'<p>本页只读展示当前周期里各策略的运行状态：参与情况、资金额度、生命周期阶段、席位占用与等待原因。策略定义、DSL、版本与生命周期统一在主导航「策略工坊」维护，本页不提供任何修改入口。</p>'
+    +paperMarketDataHtml(allocation.market_data)
     +'<div class="strategy-builder-toolbar"><button type="button" onclick="openInStrategyWorkbench()">打开策略工坊</button>'
     +'<span class="strategy-builder-hint">'+(headline.join(' · ')||'—')+'</span></div></div></section>'
     +'<section class="paper-strategy-grid">'+cards+'</section>'
@@ -686,7 +719,7 @@ export async function renderPaperDashboard(d,auditRequest){
     var sharedDayText=shared.today_pnl===null||shared.today_pnl===undefined
       ? '今日 '+(shared.today_pnl_status||'暂无完整收益')
       : '今日 '+cny(shared.today_pnl,true)+'（'+pctTxt(shared.today_return_pct)+'）';
-    var sharedCard='<article class="paper-account-card shared-pool-card"><div class="paper-account-title"><span>总资金池</span><span class="tag tag-ok">'+(shared.strategy_count||accounts.length)+' 策略共用</span></div><div class="paper-account-nav '+pctCls(shared.return_pct)+'">'+cny(shared.nav)+'</div><div style="margin-top:5px;font-size:13px;font-weight:700" class="'+pctCls(shared.today_return_pct)+'">'+sharedDayText+'</div><div style="margin-top:3px;font-size:12px" class="'+pctCls(shared.return_pct)+'">累计 '+pctTxt(shared.return_pct)+' · 盈亏 '+cny(shared.nav-shared.initial_cash,true)+'</div><div class="paper-account-meta"><span>总持仓市值<b>'+cny(shared.market_value)+'</b></span><span>资金利用率<b>'+fmt(shared.fund_utilization_pct,1)+'%</b></span><span>持仓/总上限<b>'+shared.position_count+' / '+(shared.position_limit||18)+'</b></span></div><div style="margin-top:6px;font-size:11px;color:var(--text-secondary)">'+slotText+'<br>'+borrowText+'</div><div style="margin-top:4px;font-size:11px;color:var(--text-secondary)">'+entryFreezeText+'</div><div style="margin-top:4px;font-size:11px;color:var(--text-secondary)">买入决策按策略分别运行；满仓后高分候选进入替补池，先卖弱仓再买强仓，不扩大总席位</div></article>';
+    var sharedCard='<article class="paper-account-card shared-pool-card"><div class="paper-account-title"><span>总资金池</span><span class="tag tag-ok">'+(shared.strategy_count||accounts.length)+' 策略共用</span></div><div style="margin-top:5px;font-size:11px;color:var(--text-secondary)">'+paperMarketDataHtml(d.market_data)+'</div><div class="paper-account-nav '+pctCls(shared.return_pct)+'">'+cny(shared.nav)+'</div><div style="margin-top:5px;font-size:13px;font-weight:700" class="'+pctCls(shared.today_return_pct)+'">'+sharedDayText+'</div><div style="margin-top:3px;font-size:12px" class="'+pctCls(shared.return_pct)+'">累计 '+pctTxt(shared.return_pct)+' · 盈亏 '+cny(shared.nav-shared.initial_cash,true)+'</div><div class="paper-account-meta"><span>总持仓市值<b>'+cny(shared.market_value)+'</b></span><span>资金利用率<b>'+fmt(shared.fund_utilization_pct,1)+'%</b></span><span>持仓/总上限<b>'+shared.position_count+' / '+(shared.position_limit||18)+'</b></span></div><div style="margin-top:6px;font-size:11px;color:var(--text-secondary)">'+slotText+'<br>'+borrowText+'</div><div style="margin-top:4px;font-size:11px;color:var(--text-secondary)">'+entryFreezeText+'</div><div style="margin-top:4px;font-size:11px;color:var(--text-secondary)">买入决策按策略分别运行；满仓后高分候选进入替补池，先卖弱仓再买强仓，不扩大总席位</div></article>';
     $('paperAccountStrip').innerHTML=sharedCard+accounts.map(function(a){
       var tone=a.id==='trend_pullback'?'swing':(a.id==='sector_rotation'?'rotation':'');
       var poolPositionPct=Number(a.strategy_position_pct_pool);

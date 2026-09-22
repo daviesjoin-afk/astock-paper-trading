@@ -9,7 +9,6 @@ module**，domain implementation 也不能再长回 ``paper_trading.py``。Round
 
     Guard 1  新 domain 模块禁止反向 import ``paper_trading``；
     Guard 2  ``paper_trading.py`` 不得再出现 risk-state CRUD SQL / 转发 wrapper；
-    Guard 3  ``paper_trading.py`` 的 LOC / 模块级函数数不得反弹；
     Guard 4  新 domain 模块不得成为 service locator（零项目级 import）；
     Guard 5  三条生产 SELL 路径必须都经过同一个 episode finalizer；
     Guard 6  ``paper_risk_decision`` 必须是零 I/O / 零 wall-clock 的纯决策边界；
@@ -97,21 +96,18 @@ FORBIDDEN_PAPER_TRADING_DEFS = frozenset({
     "_main_force_intent",
 })
 
-#: Guard 3 —— Round-3 exact head 的基线（上一轮 16365 行 / 287 函数）。R15 把纯风险
-#: 卖出状态机抽到 ``paper_risk_decision.py``、R16 把风险扫描生命周期抽到
-#: ``paper_risk_scan_state.py`` 后基线持续向下 ratchet。以后只允许 same or
-#: lower：确有 facade wiring 要加，必须同时抽出别的函数保持不增长。
-#: 不要设计环境变量绕过 / ``skip if CI`` 之类的后门。
+#: Guard 3（已移除）—— ``paper_trading.py`` 的 LOC / 模块级函数数曾经是 CI hard gate
+#: （R15 → R24 一路向下 ratchet：16365 行 / 287 函数 → 14895 行 / 280 函数）。
 #:
-#: R23（14847 → 14896，+49）：signal 的周期归属是**写入时刻**的事实，必须由
-#: signal 写入点自己产生，因此 facade 侧不得不加接线：``init_db`` 的 v23 迁移
-#: 调用、``paper_signals`` / ``paper_signals_archive`` 的 ``cycle_id`` 列、
-#: 以及两处 signal 写入点「先解析账号级 provenance，缺失即 fail closed 跳过」
-#: 的守卫。解析与契约本身已抽到 ``strategy_selection_resolver`` /
-#: ``strategy_selection_provenance``（该区域净减 43 行），模块级函数数 280 保持
-#: 不变。**不再**为了凑这个数字去拆一个与 R23 无关的子系统（§16.6/§16.9）。
-PAPER_TRADING_LOC_BASELINE = 14896
-PAPER_TRADING_DEF_BASELINE = 280
+#: 它被**删除**而不是继续调阈值，因为 size 不是架构性质：一个"确实需要新增一个有
+#: 业务意义的 orchestration wiring"的改动会先撞上 defs 上限，然后被迫把另一个无关
+#: 函数机械搬到新文件 —— 结果多出一个 wrapper / helper / import，调用链更长，
+#: 代码反而更难维护。这正是本文件要防的方向的反面。
+#:
+#: 现在由**语义 guard** hard fail（authority 不得回流、provider 不得被绕开、
+#: dependency direction 不得违反、historical 不得 current-fill、io/clock/事务边界
+#: 不得破坏），``paper_trading.py`` 的 LOC / defs 只作为 review signal 人工观察。
+#: 具体规则见 ``ARCHITECTURE.md`` 的 "验证与架构护栏" 一节。
 
 #: Guard 4 —— 新模块允许出现的 import 根（stdlib）。
 ALLOWED_STDLIB_IMPORTS = frozenset({"__future__", "datetime", "typing", "sqlite3"})
@@ -314,29 +310,25 @@ class RiskStateCrudStaysInItsOwner(unittest.TestCase):
         )
 
 
-class PaperTradingDoesNotRegrow(unittest.TestCase):
-    """Guard 3 —— god module 只允许变瘦。"""
-
-    def _size(self):
-        raw = _source("paper_trading.py")
-        return len(raw.splitlines()), len(_top_level_defs(ast.parse(raw)))
-
-    def test_guard3_line_count_does_not_exceed_the_round2_baseline(self):
-        loc, _defs = self._size()
-        self.assertLessEqual(
-            loc, PAPER_TRADING_LOC_BASELINE,
-            f"paper_trading.py 长到 {loc} 行（基线 {PAPER_TRADING_LOC_BASELINE}）："
-            "domain implementation 必须迁到独立模块，不要在这里继续堆",
-        )
-
-    def test_guard3b_top_level_function_count_does_not_exceed_the_baseline(self):
-        _loc, defs = self._size()
-        self.assertLessEqual(
-            defs, PAPER_TRADING_DEF_BASELINE,
-            f"paper_trading.py 模块级函数增加到 {defs}（基线 "
-            f"{PAPER_TRADING_DEF_BASELINE}）：确有 facade wiring 要加，"
-            "必须同时抽出等价函数保持不增长",
-        )
+# Guard 3（``PaperTradingDoesNotRegrow`` / ``test_guard3_line_count_*`` /
+# ``test_guard3b_top_level_function_count_*``）已**整体删除**。
+#
+# 它曾经断言 ``paper_trading.py`` 的 LOC 与模块级 def 数不得超过固定基线。
+# 删除理由：那是 mechanical metric，不是架构不变量。它会把"新增一个有业务意义的
+# orchestration 函数"变成 CI 失败，从而逼出"为凑数字而机械搬函数"这种
+# 降低可维护性的改动 —— 与护栏存在的目的相反。
+#
+# 明确不做的事：不换成新的更大阈值、不做 soft/warning 阈值、不做 growth budget。
+# size-based gate 整体取消，只保留人工趋势观察（``wc -l`` / 一次性 AST 统计）。
+#
+# 仍然 hard fail 的是语义 guard（本文件其余全部理由，以及
+# ``test_market_data_boundary.py`` 的 MDG-* 环境）：
+#   * authority 不得回流 / 不得出现第二份实现
+#   * provider 不得被绕过、full-market cache 不得裸读
+#   * dependency direction 不得反转、pure domain 不得引入项目级 import
+#   * historical 不得 current-fill、implicit current-state 不得重新解析
+#   * 零 I/O / 零 wall-clock / 零事务所有权边界不得破坏
+#   * 前端不得重复后端业务规则
 
 
 class RiskStateModuleIsAPureDomainBoundary(unittest.TestCase):

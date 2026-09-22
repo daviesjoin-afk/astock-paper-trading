@@ -54,7 +54,13 @@ def sector_linkage(window=60, min_corr=0.70, min_members=3, top_pairs=30):
     # （板块资金流接口只返回前100个细分板块，与个股行业字段口径不一致，故不采用）
     flow_map = {}
     try:
-        snap = dfc.fetch_market_snapshot()
+        # R24：``/api/sector_linkage`` 是只读 GET，必须经 Market Data Authority
+        # 读已知事实，不得在此同步穿透 provider（此前 fetch_market_snapshot
+        # 在缓存过期时会联网）。
+        import market_data_service as MDSvc
+        import datetime as _dt
+        reading = MDSvc.read_snapshot(now=_dt.datetime.now(_dt.timezone.utc))
+        snap = [dict(row) for row in reading.rows()]
         agg = {}
         for s in snap:
             ind = s.get("industry")

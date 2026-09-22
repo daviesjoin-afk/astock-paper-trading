@@ -148,15 +148,28 @@ def _close_cutoff(profile_date):
 
 
 def _read_snapshot(snapshot_paths):
-    for path in snapshot_paths:
-        try:
-            with open(path, "r", encoding="utf-8") as handle:
-                payload = json.load(handle)
-        except (OSError, ValueError, TypeError):
-            continue
-        if isinstance(payload, dict) and isinstance(payload.get("rows"), list):
-            return payload, os.path.basename(path)
-    return {}, None
+    """只读全市场事实（R24：只经 Market Data Authority）。
+
+    迁移前遍历 ``snapshot_paths`` 裸读 JSON，第二个路径是 20 页风险样本 ——
+    把它当全市场快照会让 coverage / 有效性统计系统性偏差，且绕过完整性校验。
+    现在只认 authority 校验过的事实。
+
+    返回 shape 保持不变（``payload`` dict + ``source_file``），因为调用方
+    ``collect_evidence`` 还要读 ``saved_at``。
+    """
+    try:
+        import market_data_service as MDSvc
+        reading, payload = MDSvc.read_snapshot_with_meta(
+            now=dt.datetime.now(dt.timezone.utc)
+        )
+        rows = [dict(row) for row in reading.rows()]
+        if not rows:
+            return {}, None
+        merged = dict(payload) if isinstance(payload, dict) else {}
+        merged["rows"] = rows
+        return merged, "market_snapshot_full"
+    except Exception:
+        return {}, None
 
 
 def _finding(code, severity, title, evidence, action):

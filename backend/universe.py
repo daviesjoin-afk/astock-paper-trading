@@ -8,6 +8,8 @@ import datetime as dt
 import os, json, time, threading, uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import data_fetcher as dfc
+import market_data_contract as MDC
+import market_data_service as MDSvc
 
 try:
     import point_in_time as PIT
@@ -86,7 +88,8 @@ def build_universe(size=0):
     # persisted formal universe used by the paper trader and selector.
     debug_limit = int(size or 0)
     try:
-        snap = dfc.fetch_market_snapshot_full(max_age=300)
+        # R24：freshness 窗口来自共享 policy，不再在此内联一个 300 秒。
+        snap = MDSvc.refresh_rows(policy=MDC.UNIVERSE_BUILD_POLICY)
     except Exception:
         snap = []
     existing = load_universe()
@@ -1085,60 +1088,3 @@ def coverage_report(cache_ttl=0):
         with _coverage_cache_lock:
             _coverage_cache.update({"key": cache_key, "at": time.monotonic(), "data": dict(result)})
     return result
-
-# ---------- 科创板强势信号 → 映射所属板块的主板/创业板龙头 ----------
-def star_leader_mapping(min_pct=5.0, top_star=10, leaders_per_sector=3):
-    """旧客户端兼容的科创板行业联动观察。
-
-    科创板和北交所已经直接进入全市场基础库；本函数只观察科创强势股的同行联动，
-    不再把主板/创业板股票当成它们的替代品。
-    龙头判定 = 同行业内 涨幅 + 主力净流入占比 + 流通市值 综合排序。"""
-    snap = dfc.fetch_market_snapshot()
-    star = [s for s in snap
-            if str(s.get("code", "")).startswith(("688", "689"))
-            and isinstance(s.get("pct"), (int, float)) and s["pct"] >= min_pct
-            and s.get("name") and "ST" not in s["name"]]
-    star.sort(key=lambda x: x["pct"], reverse=True)
-    star = star[:top_star]
-    if not star:
-        return {"star_signals": [], "note": f"当前无涨幅≥{min_pct}%的科创板强势股"}
-    # 主板/创业板候选（已剔ST）
-    main_cx = [s for s in snap
-               if str(s.get("code", "")).startswith(("60", "00", "30"))
-               and s.get("name") and "ST" not in s["name"] and "退" not in s["name"]
-               and isinstance(s.get("pct"), (int, float))]
-    by_industry = {}
-    for s in main_cx:
-        ind = s.get("industry")
-        if ind:
-            by_industry.setdefault(ind, []).append(s)
-
-    def _leader_score(s):
-        pct = s.get("pct") or 0
-        mp = s.get("main_pct") if isinstance(s.get("main_pct"), (int, float)) else 0
-        cap = s.get("float_cap") or 0
-        cap_score = min(cap / 5e10, 1.0)  # 500亿流通市值封顶
-        return pct * 0.5 + mp * 0.3 + cap_score * 2.0
-
-    out = []
-    for st in star:
-        ind = st.get("industry")
-        cands = by_industry.get(ind, [])
-        cands.sort(key=_leader_score, reverse=True)
-        leaders = [{
-            "code": c["code"], "name": c["name"],
-            "pct": round(c["pct"], 2) if isinstance(c.get("pct"), (int, float)) else None,
-            "main_pct": c.get("main_pct"),
-            "float_cap_yi": round((c.get("float_cap") or 0) / 1e8, 1),
-            "board": "创业板" if str(c["code"]).startswith("30") else "主板",
-        } for c in cands[:leaders_per_sector]]
-        out.append({
-            "star_code": st["code"], "star_name": st["name"],
-            "star_pct": round(st["pct"], 2), "industry": ind,
-            "leaders": leaders,
-            "hint": f"科创股 {st['name']} 大涨 {st['pct']:.1f}%，可关注同板块「{ind}」主板/创业板龙头替代",
-        })
-    return {
-        "star_signals": out,
-        "note": "科创板和北交所均已直接进入全市场基础库；同行联动仅供研究参考，不构成投资建议。",
-    }

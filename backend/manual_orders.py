@@ -12,6 +12,7 @@ api_paper.py call sites are unchanged.
 """
 from __future__ import annotations
 
+import market_data_service as MDSvc
 
 
 def _manual_risk_state(conn, account, nav, asof_day):
@@ -88,7 +89,6 @@ def _manual_order_plan(
         _strategy_pool_budget,
         _universe_snapshot_time,
         _with_decision_snapshot,
-        dfc,
     )
     import execution_planner as EP
     day = _date(asof_day)
@@ -243,10 +243,8 @@ def _manual_order_plan(
             if conn.in_transaction:
                 live_universe = []
             else:
-                try:
-                    live_universe = dfc.fetch_market_snapshot_full(max_age=240) or []
-                except Exception:
-                    live_universe = []
+                # R24：显式决策路径（允许联网），经 Market Data Authority 取数。
+                live_universe = MDSvc.refresh_rows()
         market = dict(market_context or _market_state(
             day, live_universe=live_universe,
             allow_network=not conn.in_transaction,
@@ -711,7 +709,6 @@ def submit_manual_order(
         _risk_log,
         _rows,
         _strategy_stamp,
-        dfc,
         init_db,
     )
     from paper_trading import ReservationCycleMismatch as _ReservationCycleMismatch
@@ -727,10 +724,8 @@ def submit_manual_order(
     quote_map = _quotes(sorted(set(existing_codes) | {str(code)}), asof_date=day)
     live_universe = None
     if str(side).lower() == "buy":
-        try:
-            live_universe = dfc.fetch_market_snapshot_full(max_age=240) or []
-        except Exception:
-            live_universe = []
+        # R24：显式决策路径（允许联网），经 Market Data Authority 取数。
+        live_universe = MDSvc.refresh_rows()
     market_context = _market_state(day, live_universe=live_universe, allow_network=True) if str(side).lower() == "buy" else None
     with _db(immediate=True) as conn:
         plan = _manual_order_plan(
@@ -1010,7 +1005,6 @@ def process_pending_manual_orders(asof_date=None):
         _reserve_shared_capital,
         _risk_log,
         _rows,
-        dfc,
         init_db,
     )
     from paper_trading import ReservationCycleMismatch as _ReservationCycleMismatch
@@ -1041,10 +1035,8 @@ def process_pending_manual_orders(asof_date=None):
     quote_map = _quotes(sorted({row["code"] for row in pending} | set(position_codes)), asof_date=day)
     live_universe = None
     if any(row.get("side") == "buy" for row in pending):
-        try:
-            live_universe = dfc.fetch_market_snapshot_full(max_age=240) or []
-        except Exception:
-            live_universe = []
+        # R24：显式决策路径（允许联网），经 Market Data Authority 取数。
+        live_universe = MDSvc.refresh_rows()
     market_context = (
         _market_state(day, live_universe=live_universe, allow_network=True)
         if any(row.get("side") == "buy" for row in pending) else None
