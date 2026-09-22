@@ -465,7 +465,7 @@ same CI-like no-network condition:
 | `strategy_allocation_explain` (median of 5) | 13.744s | 13.799s |
 | Δ explain | — | **+0.055s** |
 
-`BEGIN IMMEDIATE` is not implicated: the lock audit (§16.5) shows no provider call
+`BEGIN IMMEDIATE` is not implicated: the lock audit (§16.6) shows no provider call
 inside the write lock, and the DB costs 3-4 ms either way.
 
 **Conclusion: pre-existing environment-sensitive E2E flake.** It lives in the
@@ -483,8 +483,28 @@ Under the CI-equivalent configuration (`--workers=1 --retries=0`):
 - `paper-runtime.spec.js` × 5 serial rounds: **5/5 PASS, 0 flaky, 0 retry**
 - full browser suite: **32 passed, exit 0, 0 flaky, 0 retry**
 
-The frozen exact-head CI facts from §16.1 are reported as they happened; this is a
-separate, later measurement under the same settings.
+The exact-head CI run from §16.1 is reported as it happened (1 flaky / 31 passed);
+the numbers above are a separate, later measurement under the same settings.
+
+### 16.5 The new exact-head CI run is clean
+
+After this round's commit, the same browser job on the new head reports:
+
+```
+Running 32 tests using 1 worker
+  ✓ 11 ... paper-runtime.spec.js:23:3 ... 面板只读：无定义编辑控件，且可跳回策略工坊详情 (10.9s)
+  32 passed (1.8m)
+```
+
+No `flaky`, no `retry #` anywhere in the log (grep count 0), and the previously
+failing test went from >60s + 49.4s retry to **10.9s**. The other exact-head checks
+are green as well: `tests (3.11)`, `tests (3.12)` (**Ran 4006 tests, OK**),
+`syntax`, `quality`, `docker-smoke`, `frontend`, `security-leak-scan` ×2.
+
+Note that this clean run does not prove the underlying slowness is gone — it is the
+same offline snapshot-refresh cost from §16.2, which happens to fit inside the budget
+when the runner is not additionally loaded. That is exactly why it stays follow-up
+debt rather than being declared fixed here.
 
 Targeted module list and exact counts behind §15.5's **374**:
 
@@ -504,7 +524,7 @@ Skipped counts are environment-specific: the local isolated clone reports
 `skipped=5`; GitHub Actions Python 3.12 on the previous head reported `skipped=1`.
 They are not one number and are not presented as one.
 
-### 16.5 Lock scope re-check
+### 16.6 Lock scope re-check
 
 `generate_signals`'s commit phase (`paper_trading.py:7660-7742`) is audited by
 `work/r23_round4_lock_scope_audit.py`: the 13 functions and 6 methods called inside
@@ -516,7 +536,7 @@ provider work still completes before the lock is taken. The stale-validation ste
 deliberately kept inside the transaction — moving it out would reopen the
 validation→INSERT window that `RV08` locks down.
 
-### 16.6 Harness simplification
+### 16.7 Harness simplification
 
 **Sharding removed.** The runner documented "must run serially" while still shipping
 `--shard/--shards`; concurrent shards rewrite the same production files and pollute
