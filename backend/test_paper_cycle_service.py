@@ -121,8 +121,14 @@ class CycleSnapshotTests(_DbCase):
 
 class ArchiveCycleTests(_DbCase):
     def _archive(self):
+        # v23：新的 signal 必须带真实 cycle 归属（与 v18 的订单 guard 同源），
+        # 且账户当时确实属于该 cycle —— 生产中两者由 ``_create_cycle`` 同时建立，
+        # 所以这里也把账户挂上去，而不是造一个 signal 绑到不属于的周期。
+        self.conn.execute(
+            "UPDATE paper_accounts SET cycle_id=?, status='running' WHERE id=?",
+            (self.cycle["id"], "tq_breakout"),
+        )
         stamp = SR.stamp_for_account(self.conn, "tq_breakout")
-        # v23：新的 signal 必须带真实 cycle 归属（与 v18 的订单 guard 同源）。
         self.conn.execute(
             "INSERT INTO paper_signals(account_id,signal_date,intended_date,code,payload,status,created_at,"
             "strategy_id,strategy_version,strategy_checksum,cycle_id) VALUES(?,?,?,?,?,?,?,?,?,?,?)",

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -81,13 +82,15 @@ CASES = [
     {
         "guard": f"{GUARD}.test_guard14p_research_head_is_pinned_before_the_run_computes",
         "file": SELECTION,
+        # 语法完全合法的错误顺序：pin 挪进 try 体内、_run_one 之后。Python 能正常
+        # parse/import，Guard 14p 的**顺序**断言必须 FAIL（不是靠 SyntaxError）。
         "old": """            pin = _pin_research_version(item["strategy_id"])
             try:
                 result = _run_one(item["model_id"], topn)""",
         "new": """            try:
                 result = _run_one(item["model_id"], topn)
-            pin = _pin_research_version(item["strategy_id"])""",
-        "desc": "pin 移到 _run_one 之后（静态顺序检查必须抓到）",
+                pin = _pin_research_version(item["strategy_id"])""",
+        "desc": "pin 移到 _run_one 之后（合法语法；静态顺序检查必须抓到）",
     },
 ]
 
@@ -98,6 +101,17 @@ FIXED_GUARDS = [
     f"{GUARD}.test_guard14o_bootstrap_signals_passes_an_explicit_cycle",
     f"{GUARD}.test_guard14p_research_head_is_pinned_before_the_run_computes",
 ]
+
+#: 接线错误不是「业务断言失败」。mutant 让测试因这些原因变红时，被改的实现根本
+#: 没跑到被测契约，所以计 FAKE（不算非空性证据）。
+BROKEN_RE = re.compile(
+    r"(SyntaxError|IndentationError|TabError"
+    r"|ImportError|ModuleNotFoundError"
+    r"|NameError|UnboundLocalError"
+    r"|_FailedTest|AttributeError: module"
+    r"|is not defined|local variable .* referenced before assignment)",
+    re.MULTILINE,
+)
 
 
 def run(target: str) -> subprocess.CompletedProcess:
@@ -110,9 +124,13 @@ def run(target: str) -> subprocess.CompletedProcess:
                           encoding="utf-8", errors="replace", timeout=900, env=env)
 
 
+def _is_fake(result: subprocess.CompletedProcess) -> bool:
+    blob = (result.stdout or "") + (result.stderr or "")
+    return bool(BROKEN_RE.search(blob))
+
+
 def main() -> int:
     print("=== baseline ===")
-    base = run(f"{GUARD}.test_guard14l_signal_cycle_requires_a_keyword_only_explicit_cycle")
     ok_all = True
     for name in FIXED_GUARDS:
         r = run(name)
@@ -126,6 +144,7 @@ def main() -> int:
 
     print("\n=== non-vacuity ===")
     bad = []
+    fake = []
     for case in CASES:
         with open(case["file"], "rb") as handle:
             original = handle.read()
@@ -139,7 +158,13 @@ def main() -> int:
             with open(case["file"], "wb") as handle:
                 handle.write(text.replace(case["old"], case["new"], 1).encode("utf-8"))
             result = run(case["guard"])
-            verdict = "CAUGHT" if result.returncode != 0 else "SURVIVED"
+            if result.returncode == 0:
+                verdict = "SURVIVED"
+            elif _is_fake(result):
+                verdict = "FAKE"
+                fake.append(case["guard"].split(".")[-1])
+            else:
+                verdict = "CAUGHT"
         finally:
             with open(case["file"], "wb") as handle:
                 handle.write(original)
@@ -149,8 +174,12 @@ def main() -> int:
         if verdict != "CAUGHT":
             bad.append(case["guard"].split(".")[-1])
 
-    print(f"\nGuard 14 non-vacuity: {len(CASES) - len(bad)}/{len(CASES)} CAUGHT")
+    caught = len(CASES) - len(bad)
+    print(f"\nGuard 14 non-vacuity: caught={caught}/{len(CASES)} "
+          f"survived={len(bad) - len(fake)} fake={len(fake)}")
     print("restore sha256: PASS")
+    if fake:
+        print(f"FAKE（接线错误，不算非空性证据）: {fake}")
     return 0 if not bad else 1
 
 

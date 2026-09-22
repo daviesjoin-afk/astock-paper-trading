@@ -282,6 +282,130 @@ each other (tally 0-1/3). Sharding is only safe when shards touch disjoint files
 matrix also restores byte-identically from a snapshot taken at launch, so production
 files must not be edited while it runs.
 
-## 15. Merge status
+## 15. Review round 2 — two provenance correctness blockers, plus a TOCTOU close
+
+Review round 1's fixes stand (F1/F2/F3, commit `2344e70`), and its numbers above are
+superseded by this round's: the matrix grew 18 → **21** and the backend suite
+**3973 → 3999**. Only the blockers were touched — no R24, no market-data changes, no
+strategy / risk threshold changes, no candidate scoring or execution-rule changes.
+
+### 15.1 Signal cycle: mutable re-resolution + a validation→INSERT window
+
+`strategy_selection_resolver.signal_cycle_provenance` re-read
+`paper_accounts.cycle_id`, so candidates built under cycle A were stamped with cycle
+B's strategy version when a rollover landed during the provider-I/O window. The cycle
+is now **keyword-only and required**: the resolver performs no `paper_accounts` read
+and never searches for a cycle. Both writers freeze a `SignalWriteContext` from the
+cycle the candidates were built under and compare it against the cycle observed at
+commit time; a mismatch drops the whole batch as `SignalStaleContext` with an
+explicit `signal_stale_cycle_context` audit.
+
+The final review blocker then closed the remaining window between that check and the
+first `INSERT`:
+
+- `generate_signals` commits inside **`BEGIN IMMEDIATE`**, so validation and the
+  signal INSERT share one write boundary. All provider/network calls still finish
+  before the lock is taken — the commit block contains local decisions and writes
+  only, and Guard 14s asserts that.
+- A **second layer** in the DB: `BEFORE INSERT ON paper_signals` now also requires
+  `EXISTS (SELECT 1 FROM paper_accounts a WHERE a.id = NEW.account_id AND
+  a.cycle_id = NEW.cycle_id)`. It constrains new rows only — no legacy backfill,
+  `paper_signals_archive` still accepts legacy NULL, and rollover never rewrites an
+  existing signal's cycle.
+
+| test | BEFORE | AFTER |
+|---|---|---|
+| `RV01` close-signal rollover | cycle A candidates written as `cycle_id=B, version=2` | batch dropped as stale, explicit audit, nothing written to B |
+| `RV03` bootstrap rollover | same shape | batch aborted |
+| `RV08` rollover between validation and first INSERT | competitor rollover **commits** between the check and the INSERT (`committed=True, cycle_b=3`) | competitor is blocked by the write boundary; batch commits atomically under cycle A |
+| `RV10` DB second layer | — | a signal for a cycle the account has left is rejected: `invalid signal cycle provenance` |
+| `RV11` history | — | rollover leaves existing signal rows on their original cycle |
+| `RV02`/`RV04`/`RV09` | — | positive controls: with no rollover, cycle A signals are written normally |
+
+`RV08` was **vacuous on its first version** (it stayed green with a deferred
+transaction) because an earlier optional-research audit write had already upgraded
+the transaction to a write. The fixture now makes that ledger succeed, so the
+test's first write is the signal INSERT — and it discriminates: `immediate` GREEN,
+`deferred` RED with the competitor committing.
+
+### 15.2 Research selection: post-hoc version attribution
+
+`run_daily` resolved provenance after `_run_one`, so a strategy published
+mid-computation was credited with a result it did not produce. The order is now
+**pin → compute → as-of → combine → write**: the immutable version is pinned once
+before `_run_one` and the as-of resolved afterwards. `RV07` publishes v2 *inside*
+`_run_one`; the stored stamp must remain v1 (SP-01/SP-02 cannot see this, since their
+version change happens after the read).
+
+Scope is stated honestly rather than implied: for family A the selection semantics
+come from `model_id` (`STRATEGY_MODEL` → `strategies.PAPER_WEIGHTS` /
+`_paper_conditions`), i.e. from code — an edit to the immutable definition row does
+not by itself change which stocks get picked. The pin therefore records the
+**attributed published identity**, not a scored input. That distinction is written
+into `ResearchVersionPin` and `_pin_research_version` so the DB never claims a
+binding the execution path does not have.
+
+### 15.3 Frozen stamp now spans the signal decision log
+
+Both writers pass their batch-level frozen stamp to `_risk_log`, so candidate batch,
+`paper_signals` row and `paper_risk_decisions` row carry the same provenance, and N
+candidates no longer trigger N Registry stamp resolutions. Guard 14r asserts both
+passing sites and forbids re-resolving inside the candidate loop.
+
+### 15.4 Guards and evidence quality
+
+New permanent guards (Guard 14 was 14l-14q from round 1):
+
+| guard | assertion |
+|---|---|
+| `14r` | signal risk decisions consume the frozen batch stamp (no per-candidate re-resolution) |
+| `14s` | the signal commit phase is `BEGIN IMMEDIATE`, with no provider call inside the lock |
+| `14t` | the DB insert guard requires the account/cycle binding, keeps legacy NULL and archive semantics |
+
+Evidence-quality fixes to the harness itself:
+
+- **M-SP20 was not a valid mutant** — it deleted the `pin` assignment and killed the
+  test with `NameError`, which proves nothing. It is now a runnable wrong
+  implementation (pin taken after a successful `_run_one`). `RV07` fails on
+  `AssertionError: 2 != 1` (stored v2, expected v1), with syntax valid and no wiring
+  error — verified by `work/r23_round3_mutation_business_check.py`.
+- The fake detector now rejects `NameError`, `UnboundLocalError`, `TabError` and
+  similar runtime wiring errors, so none of them can count as a business CAUGHT.
+- The Guard 14p non-vacuity mutant is now legal Python (pin moved inside the `try`
+  after `_run_one`), and its runner classifies wiring errors as FAKE.
+- The anchor audit now enforces **`count == 1`** for ordinary anchors (they previously
+  passed with duplicates, while `_apply` replaces the first hit — an anchor could
+  drift onto a different call site and still report CAUGHT). `last=True` anchors are
+  validated by their own rule.
+
+### 15.5 Verification for this round
+
+| gate | result |
+|---|---|
+| `RV01`-`RV11` production regressions | all green; `RV08` discriminating (immediate GREEN / deferred RED) |
+| targeted provenance + guard modules | **182 tests OK** |
+| full backend suite | **3999 tests OK (skipped=5)** |
+| serial mutation matrix (21, non-vacuity) | **21/21 CAUGHT; survived=0; fake=0; baseline-red=0; restore sha256 PASS** |
+| M-SP19/20/21 business-failure proof | syntax valid, no wiring error, fails on the contract assertion |
+| Guard 14l-14p non-vacuity | **caught=5/5; survived=0; fake=0; restore sha256 PASS** |
+| anchor audit | **21 anchors, count == 1 each; 0 missing; 0 duplicate** |
+| ruff / compileall | `All checks passed!` / clean |
+| frontend build / unit / browser e2e | build clean (no `dist` diff) / **111 pass, 0 fail** / **32 passed** |
+| leak scan `--scope worktree` and `--scope all` | `kinds: none; values: 0` |
+
+### 15.6 Fixture corrections forced by the DB guard
+
+Adding the account/cycle insert guard surfaced **seven** existing fixtures that
+constructed a state production cannot reach — a signal bound to a cycle its account
+does not belong to (production binds both together in `_create_cycle`). The fixtures
+were corrected to the real shape (`test_order_intent_contract`,
+`test_paper_cycle_service`, `test_replacement_asof_provenance`); the guard was not
+relaxed. The guard also degrades safely on a minimal schema: without
+`paper_accounts` it installs only the cycle-existence half, so it never references a
+missing table.
+
+## 16. Merge status
 
 Not merged, not deployed. Awaiting human review.
+
+

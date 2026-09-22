@@ -102,11 +102,18 @@ class OrderIntentContractTests(unittest.TestCase):
             " FROM paper_strategy_legacy_bindings WHERE account_id=?", (strategy_id,),
         ).fetchone()
         signal = self._signal(qty=500)
-        # v23：signal 的周期归属是写入时刻的事实，必须显式给出真实 cycle。
+        # v23：signal 的周期归属是写入时刻的事实，必须显式给出真实 cycle，且该
+        # 账户当时确实属于它（DB guard 会拒绝 account/cycle 不一致的新行 —— 生产
+        # 里这个形状不可能出现，因为新建周期会同时重绑账户）。
         self.conn.execute(
             "INSERT OR IGNORE INTO paper_cycles(id,cycle_key,status,capital,risk_profile,"
             "created_at,updated_at) VALUES(1,'intent-cycle','running',300000.0,"
             "'shared_pool',datetime('now'),datetime('now'))")
+        # 用户策略账户由生产开户路径补齐（幂等），再把它挂到刚建的周期上 ——
+        # 这正是 ``_create_cycle`` 的真实形状：账户与周期同时存在且互相绑定。
+        PT._ensure_user_strategy_accounts(self.conn)
+        self.conn.execute(
+            "UPDATE paper_accounts SET cycle_id=1 WHERE id=?", (strategy_id,))
         signal["id"] = self.conn.execute(
             "INSERT INTO paper_signals(account_id,code,signal_date,intended_date,status,payload,reason,"
             "strategy_id,strategy_version,strategy_checksum,created_at,cycle_id)"

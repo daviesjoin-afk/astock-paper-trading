@@ -7655,7 +7655,9 @@ def generate_signals(asof_date=None):
             except Exception as exc:
                 research["shadow_error"] = f"{type(exc).__name__}: {exc}"
         research_results[account_id] = research
-    with _db() as conn:
+    # R23：commit phase 用 BEGIN IMMEDIATE，保证校验与 signal INSERT 同处一个
+    # write boundary。
+    with _db(immediate=True) as conn:
         for account, candidates, meta in candidate_batches:
             # A pause/reset may occur while provider calls are in flight.  Do
             # not write signals for an account that is no longer active.
@@ -7680,8 +7682,8 @@ def generate_signals(asof_date=None):
                 meta["research_shadow"] = {"status": "failed", "error": research["shadow_error"]}
                 _audit(conn, account["id"], "research_shadow_failed", research["shadow_error"])
             created = 0
-            # R23：signal 的不可变 provenance 在账户粒度的循环**外**解析一次
-            # （规格 §24），周期取候选构建前的捕获归属；期间 rollover 即 stale。
+            # R23：signal provenance 在账户粒度循环外解析一次（规格 §24），周期与
+            # 写锁内重读的账户周期比对，不一致即整批 stale。
             account_context, context_error = SRES.signal_write_context_or_error(
                 conn, account["id"], cycle_id=account["cycle_id"],
                 account_cycle_id=current["cycle_id"], asof_day=day.isoformat())
@@ -7691,8 +7693,7 @@ def generate_signals(asof_date=None):
                     "id": account["id"], "created": 0, "candidates": len(candidates),
                     "provenance_unprovable": True, "reason": context_error.detail, **meta})
                 continue
-            account_cycle_id, account_stamp = (
-                account_context.cycle_id, account_context.stamp)
+            account_cycle_id, account_stamp = account_context.cycle_id, account_context.stamp
             for pick in candidates:
                 code = pick["code"]
                 quote = evidence_quotes.get(code, {})
@@ -7733,7 +7734,9 @@ def generate_signals(asof_date=None):
                      _json(payload), status, reason, _now(),
                      strategy_id, strategy_version, strategy_checksum, account_cycle_id),
                 )
-                _risk_log(conn, account["id"], code, "buy", "approved_signal" if passed else "rejected_signal", reason, payload)
+                # R23：候选批 / signal 行 / risk decision 共享同一个 frozen stamp。
+                _risk_log(conn, account["id"], code, "buy", "approved_signal" if passed
+                          else "rejected_signal", reason, payload, strategy_stamp=account_stamp)
                 created += int(passed)
             _audit(conn, account["id"], "close_signal_scan", f"候选 {len(candidates)}，通过 {created}")
             summary["accounts"].append({"id": account["id"], "created": created, "candidates": len(candidates), **meta})
@@ -11224,20 +11227,17 @@ def _bootstrap_signals_for_today(asof_day, live_universe=None, source_slot="intr
                 approved = 0
                 waitlisted = 0
                 skipped_existing = 0
-                # R23：signal 的不可变 provenance 在候选循环**外**解析一次
-                # （规格 §24），周期取本函数已解析的 `cycle` 与候选构建前的捕获
-                # 归属；期间 rollover 即整批丢弃（stale_context）。
+                # R23：候选批 / signal 行 / risk decision 共享同一个 frozen stamp。
+                # 周期取本函数已解析的 `cycle` 与候选构建前的捕获归属。
                 bootstrap_context, bootstrap_error = SRES.signal_write_context_or_error(
                     conn, account["id"], cycle_id=cycle["id"],
                     account_cycle_id=account["cycle_id"], asof_day=day.isoformat())
                 if bootstrap_error is not None:
                     _audit(conn, account["id"], bootstrap_error.event, bootstrap_error.detail)
-                    _observe_intraday(
-                        conn, cycle["id"], account["id"], None, None, "scan",
-                        bootstrap_error.detail, {"provenance_unprovable": True})
+                    _observe_intraday(conn, cycle["id"], account["id"], None, None, "scan",
+                                      bootstrap_error.detail, {"provenance_unprovable": True})
                     continue
-                bootstrap_cycle_id, bootstrap_stamp = (
-                    bootstrap_context.cycle_id, bootstrap_context.stamp)
+                bootstrap_cycle_id, bootstrap_stamp = bootstrap_context.cycle_id, bootstrap_context.stamp
                 for pick in candidates:
                     code = pick["code"]
                     is_reentry = code in reentry_codes
@@ -11337,7 +11337,6 @@ def _bootstrap_signals_for_today(asof_day, live_universe=None, source_slot="intr
                         "reason": "早期强势、资金和流动性共振；仅用于同批等待池排序",
                         "execution_override": False,
                     }
-                    strategy_stamp = bootstrap_stamp
                     conn.execute(
                         """INSERT INTO paper_signals(
                                account_id,signal_date,intended_date,code,name,industry,close_price,
@@ -11362,7 +11361,7 @@ def _bootstrap_signals_for_today(asof_day, live_universe=None, source_slot="intr
                             _num(quote.get("price"), _num(pick.get("price"))),
                             _num(pick.get("score")), decision.get("tier"),
                             _num((decision.get("entry_model") or {}).get("score"), 0.0) + waitlist_priority,
-                            _json(payload), status, reason, _now(), *strategy_stamp,
+                            _json(payload), status, reason, _now(), *bootstrap_stamp,
                             bootstrap_cycle_id,
                         ),
                     )
@@ -11372,6 +11371,7 @@ def _bootstrap_signals_for_today(asof_day, live_universe=None, source_slot="intr
                         if status == ENTRY_FROZEN_WAITLIST_STATUS
                         else "approved_bootstrap" if passed else "rejected_bootstrap",
                         reason or "盘中候选通过", payload,
+                        strategy_stamp=bootstrap_stamp,
                     )
                     if is_reentry and passed:
                         _observe_intraday(

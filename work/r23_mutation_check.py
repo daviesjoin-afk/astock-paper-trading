@@ -288,14 +288,20 @@ MUTATIONS = [
     },
     {
         'id': 'M-SP20', 'file': SELECTION,
+        # 合法的**错误实现**：pin 挪到 ``_run_one`` 返回之后（仍在同一 try 体内，
+        # 因此语法/名称都是有效的）。这正是修复前的因果顺序 —— 计算期间发布的
+        # 版本会被记成产出该结果的那一版。
+        # 必须是「可运行的业务错误」，绝不能退化成 NameError/语法错误：
+        # 那种 RED 什么也证明不了（fake detector 也会把它计为 FAKE）。
         'old': """            pin = _pin_research_version(item["strategy_id"])
             try:
                 result = _run_one(item["model_id"], topn)""",
         'new': """            try:
-                result = _run_one(item["model_id"], topn)""",
+                result = _run_one(item["model_id"], topn)
+                pin = _pin_research_version(item["strategy_id"])""",
         'test': "test_provenance_inflight_change.ResearchVersionInflightTests"
                 ".test_RV07_inflight_version_publication_does_not_change_the_run_stamp",
-        'desc': 'research strategy pin 移回 _run_one 之后（in-flight 发布被错误归因）',
+        'desc': 'research strategy pin 移到 _run_one 之后（in-flight 发布被错误归因）',
     },
     {
         'id': 'M-SP21', 'file': RESOLVER,
@@ -326,10 +332,17 @@ def _adapt_eol(text: str, original: bytes) -> bytes:
 PYCACHE_ROOT = tempfile.mkdtemp(prefix="r23_mutation_pycache_")
 _SEQ = [0]
 
-#: 变异体必须因**契约断言**失败。语法 / 导入错误是假杀，不能计为 CAUGHT。
+#: 变异体必须因**契约断言**失败。语法 / 导入 / 运行时接线错误都是假杀，
+#: 不能计为 CAUGHT —— 一个 ``NameError`` 也能让测试变红，但它证明不了任何
+#: 业务性质（测试根本没跑到被测的契约断言）。
 BROKEN_RE = re.compile(
-    r"(SyntaxError|IndentationError|ImportError|ModuleNotFoundError"
-    r"|_FailedTest|AttributeError: module)", re.MULTILINE,
+    r"(SyntaxError|IndentationError|TabError"
+    r"|ImportError|ModuleNotFoundError"
+    r"|NameError|UnboundLocalError"
+    r"|_FailedTest|AttributeError: module"
+    r"|TypeError: .*takes .* positional argument"
+    r"|is not defined|local variable .* referenced before assignment)",
+    re.MULTILINE,
 )
 
 

@@ -22,6 +22,7 @@ import os
 import sqlite3
 import sys
 import unittest
+from unittest import mock
 
 BACKEND = os.path.dirname(os.path.abspath(__file__))
 if BACKEND not in sys.path:
@@ -125,6 +126,66 @@ class _RolloverFixture(OfflinePaperEnv, unittest.TestCase):
             return [row["event"] for row in conn.execute(
                 "SELECT event FROM paper_audit ORDER BY id")]
 
+    def try_competing_rollover(self, *, timeout=0.2, tag="competing"):
+        """从**独立连接**尝试把账户 A→B；写入器持锁时必须失败。
+
+        返回 ``{"committed": bool, ...}``。这里刻意用短 ``timeout``：我们要观测的是
+        「写边界是否真的互斥」，而不是让竞争者排队等到写入器提交后再悄悄成功 ——
+        后者会让「校验通过 → INSERT」之间出现一个**已提交**的 rollover。
+        """
+        conn = sqlite3.connect(PT.DB_PATH, timeout=timeout)
+        try:
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA busy_timeout=200")
+            version = SR.save_definition(
+                conn, STRATEGY_ID, {"name": f"{tag} 的 v2"},
+                actor="rollover-test", change_note=tag)
+            conn.execute(
+                "INSERT INTO paper_cycles(cycle_key,status,capital,risk_profile,"
+                "created_at,updated_at) VALUES(?,'running',?,?,datetime('now'),"
+                "datetime('now'))",
+                (f"{tag}-{self._db_index}", CAPITAL, "shared_pool"))
+            cycle_b = int(conn.execute("SELECT last_insert_rowid()").fetchone()[0])
+            SR.bind_cycle_versions(conn, cycle_b, [STRATEGY_ID])
+            conn.execute("UPDATE paper_accounts SET cycle_id=? WHERE id=?",
+                         (cycle_b, STRATEGY_ID))
+            conn.commit()
+            return {"committed": True, "cycle_b": cycle_b, "version": version.version}
+        except sqlite3.Error as exc:
+            try:
+                conn.rollback()
+            except sqlite3.Error:
+                pass
+            return {"committed": False, "error": f"{type(exc).__name__}: {exc}"}
+        finally:
+            conn.close()
+
+    def account_cycle(self):
+        with self._conn() as conn:
+            return int(conn.execute(
+                "SELECT cycle_id FROM paper_accounts WHERE id=?", (STRATEGY_ID,)
+            ).fetchone()[0])
+
+    def insert_signal_raw(self, *, cycle_id, code="600950"):
+        """直接写一行 signal（绕过写入器），用于验证 DB 层的第二道门。"""
+        with self._conn() as conn:
+            stamp = SR.cycle_stamp_for_account(conn, STRATEGY_ID, cycle_id=cycle_id)
+        conn = sqlite3.connect(PT.DB_PATH, timeout=5)
+        try:
+            conn.execute(
+                "INSERT INTO paper_signals(account_id,signal_date,intended_date,code,name,"
+                "payload,status,reason,created_at,strategy_id,strategy_version,"
+                "strategy_checksum,cycle_id) "
+                "VALUES(?,?,?,?,?,'{}','pending','','2026-09-08T15:00:00',?,?,?,?)",
+                (STRATEGY_ID, D_DAY.isoformat(), D_DAY.isoformat(), code, "测试")
+                + tuple(stamp) + (cycle_id,))
+            conn.commit()
+            return None
+        except sqlite3.Error as exc:
+            return exc
+        finally:
+            conn.close()
+
 
 class SignalCycleRolloverTests(_RolloverFixture):
     """Blocker A —— close signal generation 期间的 rollover。"""
@@ -209,6 +270,137 @@ class SignalCycleRolloverTests(_RolloverFixture):
             self.assertEqual(int(row["strategy_version"]), pinned_a[1])
         self.assertNotIn("signal_stale_cycle_context", self.audit_events())
         self.assertTrue(any(row.get("created") for row in summary.get("accounts", [])))
+
+
+class SignalCommitFencingTests(_RolloverFixture):
+    """Final review blocker —— stale-check → first INSERT 的 TOCTOU。
+
+    RV01 只覆盖「provider I/O 期间 rollover」（写事务之前）。它无法区分：
+
+    * 正确的实现：校验与 INSERT 处于同一个 write boundary；
+    * 错误的实现：两者之间存在窗口，一个 rollover 事务可以在校验**通过之后**、
+      INSERT **之前**提交 —— 于是一批按 cycle A 校验过的候选被写成 A 的 cycle，
+      而账户在那一刻已经属于 B。
+
+    这里把竞争者**精确插在校验与 INSERT 之间**：patch ``signal_write_context``（校验
+    本身），让它在返回成功之后立刻从独立连接尝试 rollover。此时本批的 INSERT 还
+    一行都没发生；两者之间是否真的不可穿透，就看这个竞争者能不能提交。
+
+    夹具前提：可选 research ledger 必须**成功**。否则``research_shadow_failed`` 的
+    审计写会落在校验之前，把事务提前升级为写事务，从而掩盖被测窗口 —— 那样的
+    测试即使实现是错的也会绿（本测试第一版正是如此）。
+    """
+
+    def setUp(self):
+        super().setUp()
+        # 可选 research ledger 在离线夹具里成功（它只接受已注册的 paper 策略名）。
+        # 目的：让最终 commit phase 的第一处写就是 signal INSERT。
+        research = mock.Mock()
+        research.update_observations.return_value = {}
+        research.record_shadow_run.return_value = {"status": "ok"}
+        patcher = mock.patch.object(PT, "_get_pr", lambda: research)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_RV08_rollover_cannot_land_between_validation_and_first_insert(self):
+        cycle_a = self.cycle_a
+        pinned_a = self._pinned(cycle_a)
+        self.assertIsNotNone(pinned_a, "前提：cycle A 上有 pin")
+
+        competitor = {}
+        original_write_context = SRES.signal_write_context
+
+        def _write_context_then_compete(*args, **kwargs):
+            context = original_write_context(*args, **kwargs)
+            # 此刻校验已经**成功返回**（账户被判定属于 cycle A），而本批的第一行
+            # signal INSERT 还没写。竞争者在这里从独立连接尝试 rollover。
+            if not competitor:
+                competitor.update(self.try_competing_rollover())
+            return context
+
+        SRES.signal_write_context = _write_context_then_compete
+        PT.SRES.signal_write_context = _write_context_then_compete
+        self.addCleanup(setattr, SRES, "signal_write_context", original_write_context)
+        self.addCleanup(setattr, PT.SRES, "signal_write_context", original_write_context)
+
+        # 正确实现下竞争者必须被写边界挡住：校验通过之后、本批 commit 之前，
+        # 任何 rollover 都不允许提交。若它提交了，说明「校验 → INSERT」之间存在
+        # 可穿透的窗口（把 commit phase 改回 deferred 就会走到这里）。
+        leaked = None
+        try:
+            PT.generate_signals(D_DAY)
+        except sqlite3.IntegrityError as exc:
+            leaked = exc
+
+        self.assertTrue(competitor, "前提：竞争者钩子被触发过（否则本测试没有测到窗口）")
+        self.assertFalse(
+            competitor.get("committed"),
+            "rollover 在「校验通过 → 首次 INSERT」之间提交了：写边界没有互斥"
+            f"（competitor={competitor}）")
+
+        rows = self.signal_rows()
+        a_rows = [row for row in rows if int(row["cycle_id"] or 0) == cycle_a]
+        final_cycle = self.account_cycle()
+
+        # 写锁互斥：竞争者在写边界内失败，本批在 A 的周期归属下原子完成。
+        self.assertIsNone(leaked, f"竞争者未提交，写入却失败了：{leaked}")
+        self.assertEqual(final_cycle, cycle_a,
+                         "竞争者未提交，账户却已经不属于 cycle A")
+        self.assertTrue(a_rows, "竞争者未提交时本批必须真的写入 cycle A 的 signal")
+        for row in a_rows:
+            self.assertEqual(int(row["strategy_version"]), pinned_a[1],
+                             "cycle A 的 signal 带了别的版本戳")
+
+    def test_RV09_no_rollover_writes_cycle_a_normally(self):
+        """正对照：没有竞争者时本批必须正常写入 A/v1（否则 RV08 可能假绿）。"""
+        cycle_a = self.cycle_a
+        pinned_a = self._pinned(cycle_a)
+        summary = PT.generate_signals(D_DAY)
+        rows = self.signal_rows()
+        self.assertTrue(rows, "正对照：必须产生 signal")
+        for row in rows:
+            self.assertEqual(int(row["cycle_id"]), cycle_a)
+            self.assertEqual(int(row["strategy_version"]), pinned_a[1])
+        self.assertEqual(self.account_cycle(), cycle_a)
+        self.assertTrue(any(row.get("created") for row in summary.get("accounts", [])))
+
+    def test_RV10_db_guard_rejects_a_signal_for_a_cycle_the_account_left(self):
+        """第二层防线：即使调用方漏了校验，DB 也拒绝 cycle 已过期的 signal。
+
+        这条直接绕过写入器写一行 —— 模拟「将来新增的写入点忘了校验」或
+        「调用方被改回旧实现」。DB guard 必须 fail closed。
+        """
+        cycle_a = self.cycle_a
+        # 先证明合法形状可写（否则「被拒绝」可能只是因为 guard 太严而恒拒）。
+        self.assertIsNone(self.insert_signal_raw(cycle_id=cycle_a, code="600951"),
+                          "同一 cycle 的 signal 竟然写不进去（guard 过严）")
+        # 把账户搬到 B，然后仍尝试写 A 的 signal。
+        cycle_b, _version_b, _pin_b = self.rollover_to_new_cycle()
+        self.assertEqual(self.account_cycle(), cycle_b)
+        error = self.insert_signal_raw(cycle_id=cycle_a, code="600952")
+        self.assertIsNotNone(error,
+                             "账户已离开 cycle A，DB 仍接受了 cycle A 的新 signal")
+        self.assertIn("invalid signal cycle provenance", str(error))
+        codes = {row["code"] for row in self.signal_rows()}
+        self.assertNotIn("600952", codes, "被拒的行竟然落库了")
+        # 正对照：搬到 B 之后写 B 的 signal 是合法的。
+        self.assertIsNone(self.insert_signal_raw(cycle_id=cycle_b, code="600953"),
+                          "账户当前 cycle 的 signal 竟然写不进去")
+
+    def test_RV11_rollover_does_not_rewrite_existing_signal_history(self):
+        """rollover 后旧 signal 的历史行保持原 cycle（绝不做 UPDATE 迁移）。"""
+        cycle_a = self.cycle_a
+        self.assertIsNone(self.insert_signal_raw(cycle_id=cycle_a, code="600954"))
+        before = [row for row in self.signal_rows() if row["code"] == "600954"]
+        self.assertEqual(len(before), 1)
+
+        self.rollover_to_new_cycle()
+
+        after = [row for row in self.signal_rows() if row["code"] == "600954"]
+        self.assertEqual(after[0]["cycle_id"], cycle_a,
+                         "rollover 改写了既有 signal 的周期归属")
+        self.assertEqual(after[0]["id"], before[0]["id"])
+        self.assertEqual(after[0]["strategy_version"], before[0]["strategy_version"])
 
 
 class BootstrapCycleRolloverTests(_RolloverFixture):

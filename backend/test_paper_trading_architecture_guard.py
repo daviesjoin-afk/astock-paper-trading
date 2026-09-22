@@ -2112,6 +2112,120 @@ class SelectionProvenanceIsVersionPinned(unittest.TestCase):
                              f"signal_order_provenance 回退到了 {forbidden}")
         self.assertIn("SignalOrderUnprovable", body,
                       "血缘不完整时必须 fail closed")
+
+    def test_guard14r_signal_risk_log_consumes_the_frozen_stamp(self):
+        """Guard 14r：signal 的 risk decision 必须复用**同一个 frozen stamp**。
+
+        ``_risk_log`` 的 ``strategy_stamp=None`` 默认会把 ``_strategy_stamp`` 拉进来，
+        于是每个 candidate 各解析一次 Registry。更重要的是 provenance 会分叉：
+        ``paper_signals`` 盖的是批次级 frozen 戳，而 ``paper_risk_decisions`` 拿到的是
+        逐 candidate 重解析的结果 —— rollover 窗口里两者可能不是同一版策略。
+
+        因此两条 signal 写入路径都必须显式传批次级 frozen stamp。
+        """
+        raw = _source("paper_trading.py")
+        tree = _tree("paper_trading.py")
+        expectations = {
+            "generate_signals": "strategy_stamp=account_stamp",
+            "_bootstrap_signals_for_today": "strategy_stamp=bootstrap_stamp",
+        }
+        for function, expected in expectations.items():
+            body = _function_source(tree, function, raw)
+            self.assertIn(expected, body,
+                          f"{function} 的 _risk_log 没有复用冻结戳（会逐 candidate 重解析）")
+            # 该路径的 signal INSERT 也必须用同一个 frozen 变量（解包或整体传入）。
+            frozen = expected.split("=", 1)[1]
+            self.assertTrue(
+                f"*{frozen}" in body or f"= {frozen}" in body,
+                f"{function} 的 signal INSERT 没有用冻结戳 {frozen}")
+        # 冻结戳必须在 **candidate** 循环之外解析一次（N candidates ≠ N Registry
+        # queries）。账户级循环允许每次都解析（每个账户各有自己的周期与 pin），
+        # 所以这里只禁「候选内层循环里的解析」。
+        for function, frozen in (("generate_signals", "account_context"),
+                                 ("_bootstrap_signals_for_today", "bootstrap_context")):
+            node = _function_node(tree, function)
+            for loop in ast.walk(node):
+                if not isinstance(loop, ast.For):
+                    continue
+                if "candidates" not in ast.dump(loop.iter):
+                    continue  # 只看 candidate 维度的那一层
+                for call in ast.walk(loop):
+                    if (isinstance(call, ast.Call)
+                            and isinstance(call.func, ast.Attribute)
+                            and call.func.attr == "signal_write_context_or_error"):
+                        self.fail(f"{function} 在 candidate 循环内解析写入上下文"
+                                  "（应为每账户一次，而不是每个候选一次）")
+            self.assertIn(frozen, _function_source(tree, function, raw),
+                          f"{function} 不再持有批次级冻结上下文 {frozen}")
+        # 解析器本身仍然只存在于 resolver。
+        self.assertIn("def signal_write_context", _source(SELECTION_RESOLVER_MODULE))
+
+    def test_guard14s_signal_commit_phase_is_fenced(self):
+        """Guard 14s：signal 的最终 commit phase 必须在 ``BEGIN IMMEDIATE`` 内。
+
+        校验（账户仍属 captured cycle）与随后的 signal INSERT 必须处于同一个
+        write boundary。deferred 事务下两者之间会被一个 rollover 事务穿透 ——
+        ``RV08`` 用真实竞争者证明了这一点（deferred → 竞争者提交成功 → RED）。
+        """
+        raw = _source("paper_trading.py")
+        tree = _tree("paper_trading.py")
+        node = _function_node(tree, "generate_signals")
+        commit_block = None
+        for with_node in ast.walk(node):
+            if not isinstance(with_node, ast.With):
+                continue
+            call = with_node.items[0].context_expr
+            if not (isinstance(call, ast.Call) and getattr(call.func, "id", "") == "_db"):
+                continue
+            block = "\n".join(raw.splitlines()[with_node.lineno - 1:with_node.end_lineno])
+            if "INSERT OR IGNORE INTO paper_signals" in block:
+                commit_block = (call, block)
+                break
+        self.assertIsNotNone(commit_block, "generate_signals 里找不到 signal commit phase")
+        call, block = commit_block
+        keywords = {kw.arg: kw.value for kw in call.keywords}
+        self.assertIn("immediate", keywords,
+                      "signal commit phase 用的是 deferred 事务（rollover 可穿透）")
+        self.assertIs(keywords["immediate"].value, True,
+                      "signal commit phase 的 immediate 不是字面量 True")
+        # provider/network I/O 不得被搬进写锁。
+        for io in ("fetch_market_snapshot_full", "fetch_sector_flow",
+                   "fetch_hot_sector_snapshot", "_news_for(", "_quotes("):
+            self.assertNotIn(io, block, f"provider 调用 {io} 被搬进了 signal 写锁")
+
+    def test_guard14t_signal_cycle_must_match_the_account_binding(self):
+        """Guard 14t：新 signal 的 cycle 必须与 account 当前绑定一致（DB 层）。
+
+        这是防 rollover 穿透的**第二层**防线：即使某个调用方漏了应用层校验，
+        DB 也必须拒绝一条 cycle 归属已经过期的行。同时必须保持既有语义 ——
+        只约束新行、不回填 legacy、archive 继续允许 legacy NULL。
+        """
+        raw = _source("paper_schema_migrations.py")
+        node = _function_node(_tree("paper_schema_migrations.py"),
+                              "_ensure_signal_cycle_provenance_guards")
+        body = _strip_function_docstring(
+            node, _function_source(_tree("paper_schema_migrations.py"),
+                                   "_ensure_signal_cycle_provenance_guards", raw))
+        self.assertIn("paper_accounts", body,
+                      "signal INSERT guard 不再校验 account/cycle 一致性")
+        self.assertIn("a.cycle_id = NEW.cycle_id", body,
+                      "account/cycle 一致性谓词消失了")
+        self.assertIn("paper_cycles", body, "cycle 存在性检查消失了")
+        self.assertIn("BEFORE INSERT ON paper_signals", body,
+                      "INSERT guard 不再装在 paper_signals 上")
+        # 只约束**新写**：不得出现任何回填/UPDATE 历史行的语句。
+        for forbidden in ("UPDATE paper_signals", "SET cycle_id"):
+            self.assertNotIn(forbidden, body,
+                             f"guard 试图改写历史行 provenance：{forbidden}")
+        # archive 不装 INSERT guard（legacy NULL 行必须能归档）。
+        self.assertNotIn("BEFORE INSERT ON paper_signals_archive", body,
+                         "archive 装了 INSERT guard（legacy NULL 行会无法归档）")
+        # 两张表的 cycle 不可变 guard 都要在（archive 侧的表名由 f-string 生成）。
+        self.assertIn("paper_signals\"", body, "paper_signals 的不可变 guard 消失了")
+        self.assertIn("paper_signals_archive\"", body,
+                      "paper_signals_archive 的不可变 guard 消失了")
+        self.assertIn("BEFORE UPDATE OF cycle_id", body,
+                      "cycle 归属的不可变 guard 消失了")
         # 唯一 owner：调用方只调用它，不复制一套。
         for module in ("paper_trading.py", "paper_risk_service.py"):
             module_body = _module_body(module)

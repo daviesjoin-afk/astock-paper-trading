@@ -249,6 +249,18 @@ class ProductionCandidateCase(unittest.TestCase):
                 "SELECT id FROM paper_cycles WHERE status IN ('draft','running','paused')"
                 " ORDER BY id DESC LIMIT 1").fetchone()[0])
 
+    def account_cycle_id(self, account_id=ACCOUNT):
+        """账户当前所属周期 —— signal 的 cycle 归属就是这个 write-time fact。
+
+        不用 ``self.cycle_id()``（= active cycle）：两者在「在途借位时 active 已
+        翻到下个周期、账户仍留在原周期」的 fixture 里**故意不同**，而生产
+        ``generate_signals`` 盖的是账户自己的周期（DB guard 也强制这一点）。
+        """
+        with PT._db() as conn:
+            return int(conn.execute(
+                "SELECT cycle_id FROM paper_accounts WHERE id=?", (account_id,)
+            ).fetchone()[0])
+
     def add_signal(self, *, code, intended_date, signal_date=None, entry_score=90.0,
                    t_score=90.0, rank_score=90.0, status="pending", account_id=ACCOUNT):
         signal_date = signal_date or intended_date
@@ -262,7 +274,8 @@ class ProductionCandidateCase(unittest.TestCase):
                 (account_id, signal_date, intended_date, code, f"测试股_{code}", 10.0,
                  rank_score, "A", t_score,
                  PT._json({"decision": {"entry_model": {"score": entry_score}}}),
-                 status, f"{signal_date} 15:00:00", *stamp, self.cycle_id()),
+                 status, f"{signal_date} 15:00:00", *stamp,
+                 self.account_cycle_id(account_id)),
             )
             return int(cur.lastrowid)
 

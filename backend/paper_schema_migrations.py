@@ -797,8 +797,14 @@ def ensure_signal_cycle_provenance(conn):
     Guard 语义：
 
     * ``paper_signals`` BEFORE INSERT —— account-scoped signal 必须带真实存在的
-      ``cycle_id``；trigger 不回扫旧行，因此历史 NULL 行不受影响。
+      ``cycle_id``，**且**该 account 当前确实属于这个 cycle。两条都是 write-time
+      fact：第一条保证周期不是幽灵，第二条保证「A 的候选」不会被写成「B 的
+      signal」。这是防 rollover 穿透的**第二层**防线 —— 写入器已经在
+      ``BEGIN IMMEDIATE`` 里做过同样的校验并会整批 stale，DB 这一层保证即使
+      调用方漏了、或将来新增了写入点，也无法落库一条 cycle 归属已经过期的行。
+      注意：只约束**新写**的行；既有历史行（含 NULL）不受影响，不做回填。
     * 两张表 BEFORE UPDATE OF cycle_id —— 一经写入不得更改，``NULL -> 8`` 同样被阻止。
+      **rollover 后旧 signal 的历史行保持原 cycle**，绝不会被 UPDATE 迁移。
     * ``paper_signals_archive`` **不装** INSERT guard —— 历史 NULL 行仍会经
       ``SELECT *`` 进入归档表，legacy NULL 必须允许归档。
     """
@@ -813,7 +819,19 @@ def ensure_signal_cycle_provenance(conn):
 def _ensure_signal_cycle_provenance_guards(conn):
     """Reject new signals without a durable cycle, and freeze it once written."""
     has_cycles = bool(table_columns(conn, "paper_cycles"))
+    # account-cycle 一致性检查需要 ``paper_accounts`` 存在。极简 schema 下只装
+    # 前半段（cycle 必须存在），不会引用一张不存在的表。
+    has_accounts = bool(table_columns(conn, "paper_accounts"))
     if has_cycles and "cycle_id" in table_columns(conn, "paper_signals"):
+        account_clause = (
+            """                    OR NOT EXISTS (
+                        SELECT 1 FROM paper_accounts a
+                        WHERE a.id = NEW.account_id
+                          AND a.cycle_id = NEW.cycle_id
+                    )
+"""
+            if has_accounts else ""
+        )
         conn.execute("DROP TRIGGER IF EXISTS trg_paper_signals_cycle_provenance_insert")
         conn.execute(
             """CREATE TRIGGER trg_paper_signals_cycle_provenance_insert
@@ -823,7 +841,7 @@ def _ensure_signal_cycle_provenance_guards(conn):
                     OR NOT EXISTS (
                         SELECT 1 FROM paper_cycles c WHERE c.id=NEW.cycle_id
                     )
-                )
+""" + account_clause + """                )
                 BEGIN SELECT RAISE(ABORT, 'invalid signal cycle provenance'); END"""
         )
     for table in ("paper_signals", "paper_signals_archive"):
