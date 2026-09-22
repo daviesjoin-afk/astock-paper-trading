@@ -31,6 +31,7 @@ def dashboard(include_activity=False, include_history_symbols=False):
         _today_position_performance, dfc, schedule_status,
         _execution_verified_predicate,
     )
+    import market_data_service as MDSvc
 
     # Cache schedule_status to avoid repeated init_db() calls
     now_ts = time.time()
@@ -555,6 +556,10 @@ def dashboard(include_activity=False, include_history_symbols=False):
         return {
             "accounts": accounts, "shared": shared, "capital_model": "shared_pool",
             "positions": positions,
+            # R24：行情事实的唯一投影。前端只渲染，不重算 freshness/provider
+            # 规则；读取路径经 Market Data Authority（只读缓存，绝不为此处
+            # 同步访问 provider）。
+            "market_data": MDSvc.read_projection(),
             # 守仓评分明细（约 275KB）只服务于持仓卡片的 quality_* 投影，
             # 浏览器从不消费整表；activity 工作区不再重复下发。
             "position_reviews": [] if include_activity else review_rows,

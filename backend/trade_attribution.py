@@ -174,9 +174,15 @@ def _market_snapshot():
 def _quote_maps(kline_cache=None):
     rows, saved_at, source_file = _market_snapshot()
     if not rows:
+        # R24：归因是盘后离线任务，允许联网，但 fresh 窗口由共享 policy 决定，
+        # 不再在这里内联一个 900 秒 magic number。
         try:
-            import data_fetcher as dfc
-            rows = dfc.fetch_market_snapshot_full(max_age=900) or []
+            import market_data_contract as MDC
+            import market_data_service as MDSvc
+            reading = MDSvc.refresh_snapshot(
+                MDC.ATTRIBUTION_POLICY, now=dt.datetime.now(dt.timezone.utc),
+            )
+            rows = [dict(row) for row in reading.rows()]
             source_file = "live_market_snapshot"
         except Exception:
             rows = []

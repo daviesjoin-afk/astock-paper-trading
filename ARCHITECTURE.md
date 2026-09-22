@@ -292,7 +292,8 @@ PR-49 把这条口径的实现收敛到只读解析器 `backend/paper_cycle_owne
 | 策略与决策 | `strategies.py`, `strategy_registry.py`, `strategy_service.py`, `strategy_api_models.py`, `strategy_dsl_schema.py`, `strategy_dsl_evaluator.py`, `strategy_runtime.py`, `strategy_risk_fingerprint.py`, `strategy_risk_profiles.py`, `strategy_risk_enforcement.py`, `strategy_parameter_schema.py`, `strategy_policies.py`, `strategy_clusters.py`, `strategy_champion.py`, `user_strategy_participation.py`, `decision_engine.py`, `decision_context.py`, `decision_rules.py` | 策略身份与不可变版本、DSL 编译、运行时就绪与 RuntimeContext、风险/执行画像、生命周期与治理、候选车道与纯规则评分 | 不读取真实券商账户，不写订单/成交 |
 | 订单意图与执行计划 | `order_intent.py`, `execution_planner.py`, `execution_dispatch.py`, `entry_lifecycle.py` | 策略→执行器的意图契约（拒绝数量越权）、计划/复核/落库统一口径、分批与 TTL | 不决定买什么，不计算资金池分配 |
 | 执行真实性证据 | `backend/execution_evidence.py`, `backend/execution_lifecycle.py`, `backend/execution_outcome.py` | 执行证据三态契约（`known`/`unknown`/`not_applicable`）、成交六分类、委托成交状态机与非法跳转拒绝、`selection_executable` × `execution_verified` 连接、`market`/`selection`/`execution` 三层收益 | 不撮合、不写订单/成交/资金、不重建仓库没有的历史数据、不改写 PR149 selection outcome、不用市场标签顶替执行收益；不 import `paper_trading` |
-| 行情基础设施 | `data_fetcher.py`, `marketdata_transport.py`, `marketdata_providers.py`, `marketdata_normalizers.py`, `marketdata_cache.py` | 多源请求、重试/熔断、解析标准化、缓存、覆盖率和新鲜度元数据 | 不在缓存陈旧时伪造实时价 |
+| 行情基础设施 | `data_fetcher.py`, `marketdata_transport.py`, `marketdata_providers.py`, `marketdata_normalizers.py`, `marketdata_cache.py` | 多源请求、重试/熔断、解析标准化、缓存、覆盖率和新鲜度元数据 | 不在缓存陈旧时伪造实时价；不判断业务 freshness policy（归 `market_data_contract`） |
+| 行情业务权威 | `backend/market_data_contract.py`（纯契约：状态语义 + freshness policy）、`backend/market_data_service.py`（唯一 authority：只读 / 显式刷新两个入口） | 回答"在指定 as-of / freshness policy 下，系统目前拥有什么经过验证的市场事实"；区分 fresh / stale / degraded / unverified / unavailable；显式 network policy；点时可证明性 | contract 零 I/O / 零时钟 / 零项目依赖；service 不拥有事务、不 import `paper_trading`、不在只读模式联网；不重写 provider 实现、不负责 provider 健康（归 `data_fetcher.load_source_health`） |
 | 交易门禁 | `paper_trading_rules.py`, `paper_quote_policy.py`, `entry_timing.py` | 交易日、费用、证券权限、T+1、整手、涨跌停、行情新鲜度和入场时机 | 不负责持久化订单 |
 | 持仓运行时风险状态 | `backend/paper_position_risk_state.py` | `paper_position_risk_state` 的唯一 runtime 状态所有权：episode 初始化（verified BUY `0 -> >0`）、peak 只升不降吸收、take_stage 推进、full-exit 收尾、以及所有生产 SELL 路径共用的 `finalize_sell`（自行按 cycle 读权威 `paper_position_lots` 判定 episode 是否结束） | 不拥有 schema/DDL（归 `paper_schema_migrations`），不拥有事务（不 commit/rollback/BEGIN），不解析 active cycle（cycle_id 由调用方显式传入），不决定成交；不 import `paper_trading`，零项目级依赖 |
 | 卖出风险决策引擎 | `backend/paper_risk_decision.py` | 纯确定性卖出风险状态机：同日新仓识别与峰值口径、硬止损（首段减仓 vs 全清）、移动止损、最长持有、阶梯止盈，并由固定严重度序仲裁；`paper_trading._sell_plan` 仅保留薄 adapter | 不读数据库/网络/文件系统、不读机器时钟（`asof_day` 必须由调用方显式传入，缺失即 fail fast）、无全局缓存、不 import `paper_trading` / `strategy_policies` / `paper_account_specs`（policy 由调用方解析后注入）；不决定成交、不写账本 |
@@ -573,6 +574,80 @@ Invariants：
 3. Projection state is never promoted to execution authority.
 4. Missing historical valuation remains unknown; it is not replaced by a current quote.
 5. Portfolio reads do not create or mutate execution facts.
+
+## Market Data Boundary（R24）
+
+### 调用方向
+
+行情相关能力此前分散在 provider 调用、cache、TTL/freshness、双源核验、
+fallback、as-of 与页面 read path 之中，上层各自回答"Eastmoney 怎么拿 / cache
+有没有 / 要不要 refresh / A 和 B 谁可信 / 多久算 stale"。R24 建立**唯一
+business authority**，调用方向单向：
+
+```text
+        marketdata_transport / providers / normalizers / cache
+                              ↑   （provider mechanics，不知道上面存在）
+                       data_fetcher
+                              ↑   （provider + cache 存储/投放机制）
+        ┌─────────────────────────────────────────────┐
+        │  market_data_contract.py   纯契约（零 I/O）  │
+        │    status / freshness / verification / as_of │
+        │    MarketDataPolicy  唯一的 freshness 来源   │
+        ├─────────────────────────────────────────────┤
+        │  market_data_service.py    唯一 authority    │
+        │    read_snapshot()    只读，绝不联网          │
+        │    refresh_snapshot() 显式允许联网            │
+        └─────────────────────────────────────────────┘
+                              ↓  MarketDataSnapshot / MarketDataReading
+        Selection / Signal / Risk / Execution / Read Models / Frontend
+```
+
+### 谁负责什么
+
+| 问题 | 唯一 owner |
+| --- | --- |
+| 谁允许 network | `read_snapshot()`（`ACCESS_READ`，**绝不**联网）与 `refresh_snapshot()`（`ACCESS_REFRESH`，显式允许）。判据只有 `access_mode_allows_network()`；未知模式 fail closed |
+| 谁只能 read cache/snapshot | 只读业务路径：`allocation-explain`、runtime view（dashboard）、`/api/hot`、`/api/health`、归因报告。它们只读持久化事实，绝不为此同步刷新 |
+| 谁负责 freshness | `market_data_contract.MarketDataPolicy`（`LIVE_MARKET_POLICY` 240s / 竞价 90s / 开盘事件 120s / 名单 300s / 归因 900s / 收盘 0s）。调用层不再各写 `max_age=` |
+| 谁负责 provider disagreement | `MarketDataSnapshot.verification` 维度（`verified` / `single_source` / `disagreement` / `unavailable` / `not_attempted`），由 `classify()` 判定。冲突一律报 `unverified`，**绝不**静默挑一个源 |
+| 谁负责 stale 与 unavailable 的区分 | 同上的 `classify()`：STALE 保留最后一份可信 rows；UNAVAILABLE 不带 payload。两者**绝不**合并 |
+| historical as-of 由谁负责 | `classify(..., asof_day=)`：只能使用该日或更早可证明的观测，`observed_day > requested` 或无法证明一律 fail closed（`asof_mismatch` / `asof_unprovable`），**绝不**用 current snapshot 回填 |
+| 谁负责 provider 健康 | `data_fetcher.load_source_health()`（**不**迁移）。与 data fact 并列但互不推导：源红灯不作废最后已验证 snapshot，snapshot 存在也不代表源健康 |
+| network 与 DB writer transaction 的隔离 | authority **不拥有也不接受事务**（不 BEGIN/commit/rollback、不 import `paper_trading`）。provider I/O 与账本写入之间是结构性隔离，不是调用方自觉 |
+
+### 不变量
+
+1. Market Data 的**业务权威**只有一份（`backend/market_data_service.py`），状态语义与
+   freshness policy 只有一份（`backend/market_data_contract.py`，纯 stdlib、零 I/O、
+   零时钟、零项目级 import）。上层不再直接调用 provider 取全市场快照：生产
+   `fetch_market_snapshot_full` 调用点从 18 处收敛到 **0** 处（provider 实现本身仍留在
+   `data_fetcher.py`，R24 不重写 provider）。依赖方向单向：
+   `调用方 → market_data_service → data_fetcher → providers/cache`，反向禁止。
+2. **只读业务路径绝不为了回答"当前已知事实是什么"而同步发起 provider 网络刷新。**
+   这是本边界存在的主要理由：`GET /api/paper/allocation-explain` 曾每次只读请求穿透到
+   provider，在网络不可用时每次支付 ~13.8s 连接超时/重试（实机复现：
+   `work/r23_round4_nonet_probe.py`）。迁移后同一条件下 ≈0.10s，且 provider 调用数为 0。
+   read path 有缓存但过期 → 返回 `stale` **加**最后一份可信 rows；完全没有 → 返回
+   `unavailable`。绝不为了"让页面看起来正常"而偷偷联网，也绝不把 stale 标成 fresh，
+   也绝不构造 0 / `{}` / 默认指数 / 昨值冒充今值。
+3. `MarketDataReading` 保留**正交维度**（`availability` / `freshness` / `verification` /
+   `as_of` / `reason`），**禁止**压成一个 `quality_score`。`reason` 复用既有业务术语，
+   同一个失败原因不得在不同 caller 出现 `no_data` / `empty` / `provider_error` 等多个名字。
+   API/前端只消费 `MarketDataReading.projection()`，只渲染、不重算 freshness，也不理解
+   provider 机制（重试/熔断/缓存键不进普通 UI）。
+4. 决策路径（scheduled scan、收盘、竞价、开盘事件、手动下单、selection、归因）显式使用
+   `refresh_snapshot` / `refresh_rows`。刷新失败时保留最后一次可信事实并标记 stale；
+   对**横截面扫描**则返回空以停止本轮候选扫描（既有语义：不用旧快照冒充实时行情，
+   不回落 20 页风险样本）。cache 只是存储/投放机制，**不是** fact authority：
+   `cache 有值` 不等于 `一定可信`，仍要过 as_of / freshness / verification。
+   直接 `open(MARKET_SNAPSHOT_FULL_CACHE_PATH)` 的旁路读取会绕过
+   `_full_snapshot_payload_is_complete` 的完整性校验，一律禁止（R24 已把
+   `main.health` 从裸 `open()` 迁到 authority）。
+5. 回归门禁见 `backend/test_market_data_boundary.py`（MD-01 ~ MD-14 契约、
+   MDR-01 ~ MDR-07 只读不联网 + stale/unavailable positive control、MDP-01 ~ MDP-10
+   refresh/失败/多源 parity、MDPIT-01 ~ MDPIT-04 点时可证明性、MDG-01 ~ MDG-08 架构
+   guard），语义 mutation 见 `work/r24_mutation_check.py`（M-MD1 ~ M-MD5，5/5 CAUGHT、
+   0 survived、0 fake）。
 
 ## 目标依赖方向
 

@@ -110,7 +110,13 @@ FORBIDDEN_PAPER_TRADING_DEFS = frozenset({
 #: 的守卫。解析与契约本身已抽到 ``strategy_selection_resolver`` /
 #: ``strategy_selection_provenance``（该区域净减 43 行），模块级函数数 280 保持
 #: 不变。**不再**为了凑这个数字去拆一个与 R23 无关的子系统（§16.6/§16.9）。
-PAPER_TRADING_LOC_BASELINE = 14896
+#: R24（14896 → 14895，-1）：Market Data 的取数、freshness 与 provider 失败语义
+#: 抽到 ``market_data_service`` / ``market_data_contract`` 后，``paper_trading``
+#: 的行情调用点只留下**更少**的接线（3 处 ``MDSvc`` 调用取代了各自的
+#: ``try/except + max_age`` 内联块），模块级函数数 280 保持不变。
+#: 本轮不是为了调这个数字而拆模块：authority 存在的理由是修 read-path 同步
+#: provider 刷新（§11），LOC 只是没有恶化。
+PAPER_TRADING_LOC_BASELINE = 14895
 PAPER_TRADING_DEF_BASELINE = 280
 
 #: Guard 4 —— 新模块允许出现的 import 根（stdlib）。

@@ -23,6 +23,8 @@ from contextlib import contextmanager
 import pandas as pd
 
 import data_fetcher as dfc
+import market_data_contract as MDC
+import market_data_service as MDSvc
 import decision_engine as DE
 import factors as F
 import strategies as S
@@ -3736,10 +3738,10 @@ def _market_state(asof_date, live_universe=None, *, allow_network=True):
     # 盘中市场宽度必须使用同一轮全市场实时快照，不能读取可能滞后数日的
     # universe.json。外部源暂时不可用时保守地返回未知，而不伪装成实时数据。
     if live_universe is None and allow_network:
-        try:
-            live_universe = dfc.fetch_market_snapshot_full(max_age=240)
-        except Exception:
-            live_universe = []
+        # R24：refresh 与 freshness 归 Market Data Authority；刷新失败返回空。
+        live_universe = MDSvc.refresh_rows()
+    elif live_universe is None:
+        live_universe = []
     elif live_universe is None:
         live_universe = []
     latest = {str(row.get("code")): row for row in (live_universe or []) if row.get("code")}
@@ -7521,7 +7523,7 @@ def generate_signals(asof_date=None):
         }
     # 收盘任务必须绕过 240 秒缓存强制刷新一次全市场快照，确保收盘口径不滞留在 14:55 的盘中缓存。
     try:
-        close_raw = dfc.fetch_market_snapshot_full(max_age=0, force=True)
+        close_raw = MDSvc.refresh_rows(force=True, policy=MDC.CLOSE_SNAPSHOT_POLICY)
         # A historical/research invocation must not compare an old as-of day
         # with today's live timestamp.  Scheduled today's close is the only
         # path that needs the real-time cross-sectional gate.
@@ -7757,7 +7759,7 @@ def backfill_research_shadow(asof_date=None):
     if not _is_trade_weekday(day):
         return {"status": "skipped", "reason": "非交易工作日", "date": day.isoformat()}
     try:
-        close_universe = dfc.fetch_market_snapshot_full(max_age=0, force=True)
+        close_universe = MDSvc.refresh_rows(force=True, policy=MDC.CLOSE_SNAPSHOT_POLICY)
         close_snapshot_at = max(
             (str(row.get("quote_at")) for row in close_universe if row.get("quote_at")),
             default=None,
@@ -8892,17 +8894,15 @@ def strategy_allocation_explain():
     data_quality/diversification 六因子、capital_scale、目标预算、可用预算、
     席位上限、以及当前未部署的等待原因。纯只读，不影响任何交易。
     """
+    # R24：只读路径**绝不**为此同步刷新 provider（此前每次 read 最坏 ~13.8s 超时）。
+    market_data = MDSvc.read_snapshot(now=MDSvc.now_utc(), asof_day=None)
     init_db()
     with _db() as conn:
         day = _date()
         cycle = _active_cycle(conn)
         # 行情估值走缓存快照（离线回落成本价），尽量与执行路径同口径。
-        try:
-            quotes_map = {str(row.get("code")): row
-                          for row in (dfc.fetch_market_snapshot_full(max_age=240) or [])
-                          if row.get("code")}
-        except Exception:
-            quotes_map = {}
+        quotes_map = {str(row.get("code")): row
+                      for row in market_data.rows() if row.get("code")}
         try:
             market = _market_state(day, allow_network=False) or {}
         except Exception:
@@ -9019,6 +9019,8 @@ def strategy_allocation_explain():
             "nav": round(_num(nav), 2),
             "pool_limit": int(_num(count_budget["pool_limit"])),
             "market_light": market_light or "unknown",
+            # R24：只读投影。前端只渲染，不重算 freshness/provider 规则。
+            "market_data": market_data.projection(),
             "cluster_version": SC.STRATEGY_CLUSTER_VERSION,
             # PR-26：部署计划摘要（与执行路径同一份结果）
             "allocation_plan": {
@@ -10210,7 +10212,7 @@ def execute_open(asof_date=None):
     # standalone 09:31 scheduler cannot bypass a blocked 3-minute scan.
     try:
         open_rows = _validated_live_universe(
-            dfc.fetch_market_snapshot_full(max_age=120), day, max_quote_age_minutes=20,
+            MDSvc.refresh_rows(policy=MDC.OPENING_EVENT_POLICY), day, max_quote_age_minutes=20,
         )
     except Exception:
         open_rows = []
@@ -11461,7 +11463,7 @@ def run_auction_preselection(asof_date=None, force=False):
     if not force and (now.weekday() >= 5 or now.time() < dt.time(9, 24) or now.time() > dt.time(9, 27)):
         return {"slot": "auction", "status": "skipped", "date": day.isoformat(), "reason": "仅在 09:25 采集集合竞价快照"}
     try:
-        live_universe = dfc.fetch_market_snapshot_full(max_age=90, force=True)
+        live_universe = MDSvc.refresh_rows(force=True, policy=MDC.AUCTION_PRESELECTION_POLICY)
     except Exception as exc:
         return {"slot": "auction", "status": "blocked", "date": day.isoformat(), "reason": f"竞价行情读取失败：{exc}"}
     current_rows = []
@@ -12464,12 +12466,10 @@ def monitor_intraday(asof_datetime=None, force=False):
             "healthy": False, "reconnected": False, "attempts": 0,
             "action": f"健康检查异常：{type(exc).__name__}: {exc}",
         }
-    try:
-        live_universe = _validated_live_universe(
-            dfc.fetch_market_snapshot_full(max_age=240), day, max_quote_age_minutes=20,
-        )
-    except Exception:
-        live_universe = []
+    # R24：signal/扫描是**决策路径**，显式允许联网，由 authority 取数并判 freshness。
+    live_universe = _validated_live_universe(
+        MDSvc.refresh_rows(), day, max_quote_age_minutes=20,
+    )
     # A non-empty but partial response is a dangerous failure mode: it looks
     # normal in a UI but silently narrows the market scan.  Force one source
     # recovery/refresh before refusing only the candidate scan for this round.
@@ -12483,7 +12483,7 @@ def monitor_intraday(asof_datetime=None, force=False):
             }
         try:
             live_universe = _validated_live_universe(
-                dfc.fetch_market_snapshot_full(max_age=0, force=True), day, max_quote_age_minutes=20,
+                MDSvc.refresh_rows(force=True), day, max_quote_age_minutes=20,
             )
         except Exception:
             live_universe = []
@@ -14323,10 +14323,9 @@ def risk_dashboard(refresh=False, allow_stale=False, allow_network=True):
     if snapshot is None:
         # 复用 5 分钟任务已经建立的全市场缓存。旧实现单独抓取市值前 2,000
         # 只股票，既慢又把 36% 覆盖误标成“全市场”。
-        try:
-            live_universe = dfc.fetch_market_snapshot_full(max_age=240)
-        except Exception:
-            live_universe = []
+        # R24：走到这里必然 allow_network=True（上面已把 False 分支改成占位
+        # snapshot），因此经 authority 的 refresh 入口取数。
+        live_universe = MDSvc.refresh_rows()
         market = _market_state(dt.date.today(), live_universe=live_universe)
         universe = U.load_universe() or []
         # The persisted universe is a historical fallback and can lag the

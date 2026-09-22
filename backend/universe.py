@@ -8,6 +8,8 @@ import datetime as dt
 import os, json, time, threading, uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import data_fetcher as dfc
+import market_data_contract as MDC
+import market_data_service as MDSvc
 
 try:
     import point_in_time as PIT
@@ -86,7 +88,8 @@ def build_universe(size=0):
     # persisted formal universe used by the paper trader and selector.
     debug_limit = int(size or 0)
     try:
-        snap = dfc.fetch_market_snapshot_full(max_age=300)
+        # R24：freshness 窗口来自共享 policy，不再在此内联一个 300 秒。
+        snap = MDSvc.refresh_rows(policy=MDC.UNIVERSE_BUILD_POLICY)
     except Exception:
         snap = []
     existing = load_universe()
