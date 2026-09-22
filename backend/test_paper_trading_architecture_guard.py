@@ -2125,11 +2125,25 @@ class SelectionProvenanceIsVersionPinned(unittest.TestCase):
             body = _function_source(tree, function, raw)
             self.assertIn(expected, body,
                           f"{function} 的 _risk_log 没有复用冻结戳（会逐 candidate 重解析）")
-            # 该路径的 signal INSERT 也必须用同一个 frozen 变量（解包或整体传入）。
-            frozen = expected.split("=", 1)[1]
-            self.assertTrue(
-                f"*{frozen}" in body or f"= {frozen}" in body,
-                f"{function} 的 signal INSERT 没有用冻结戳 {frozen}")
+            # R25：signal 行的 provenance 不再解包成局部变量再手抄进 INSERT，而是
+            # 整体交给唯一 writer（SIG.commit_signal 只从 frozen context 取四列）。
+            # 所以这里断言「该路径确实把 frozen context 交给了 writer」，而不是断言
+            # 某个局部变量名出现在 SQL 里 —— 后者会奖励"再抄一份 provenance"的写法。
+            self.assertIn("SIG.commit_signal(", body,
+                          f"{function} 的 signal 落库没有经唯一 writer")
+            self.assertIn("context=account_context" if function == "generate_signals"
+                          else "context=bootstrap_context", body,
+                          f"{function} 的 signal 落库没有传批次级 frozen context")
+            # 禁止把 provenance 四列写进 row：writer 的契约是"provenance 只来自
+            # context"，一旦有人把 strategy_version/cycle_id 塞回 row，就等于重新
+            # 引入"候选批一套戳、落库另一套戳"的可表达性。只看 commit 的 row 字典，
+            # 不看函数里其它合法的 cycle_id 读取（例如重读 paper_accounts）。
+            for keys in _commit_signal_row_keys(tree, function):
+                for leaked in ("strategy_id", "strategy_version",
+                               "strategy_checksum", "cycle_id"):
+                    self.assertNotIn(
+                        leaked, keys,
+                        f"{function} 把 provenance 列 {leaked!r} 塞进了 commit row")
         # 冻结戳必须在 **candidate** 循环之外解析一次（N candidates ≠ N Registry
         # queries）。账户级循环允许每次都解析（每个账户各有自己的周期与 pin），
         # 所以这里只禁「候选内层循环里的解析」。
@@ -2158,6 +2172,13 @@ class SelectionProvenanceIsVersionPinned(unittest.TestCase):
         校验（账户仍属 captured cycle）与随后的 signal INSERT 必须处于同一个
         write boundary。deferred 事务下两者之间会被一个 rollover 事务穿透 ——
         ``RV08`` 用真实竞争者证明了这一点（deferred → 竞争者提交成功 → RED）。
+
+        R25 把 INSERT 搬进 ``signal_service.commit_signal`` 之后，"写锁内"不再
+        能靠 grep 一段 SQL 字面量来判定。改为断言两件事：
+
+        * 该批次确实经唯一 writer 落库（``SIG.commit_signal(``），且
+        * 这一调用位于 ``generate_signals`` 的 ``_db(immediate=True)`` 块内，
+          并且该块里没有 provider/network I/O。
         """
         raw = _source("paper_trading.py")
         tree = _tree("paper_trading.py")
@@ -2170,11 +2191,11 @@ class SelectionProvenanceIsVersionPinned(unittest.TestCase):
             if not (isinstance(call, ast.Call) and getattr(call.func, "id", "") == "_db"):
                 continue
             block = "\n".join(raw.splitlines()[with_node.lineno - 1:with_node.end_lineno])
-            if "INSERT OR IGNORE INTO paper_signals" in block:
-                commit_block = (call, block)
+            if "SIG.commit_signal(" in block:
+                commit_block = (call, block, with_node)
                 break
         self.assertIsNotNone(commit_block, "generate_signals 里找不到 signal commit phase")
-        call, block = commit_block
+        call, block, with_node = commit_block
         keywords = {kw.arg: kw.value for kw in call.keywords}
         self.assertIn("immediate", keywords,
                       "signal commit phase 用的是 deferred 事务（rollover 可穿透）")
@@ -2184,6 +2205,15 @@ class SelectionProvenanceIsVersionPinned(unittest.TestCase):
         for io in ("fetch_market_snapshot_full", "fetch_sector_flow",
                    "fetch_hot_sector_snapshot", "_news_for(", "_quotes("):
             self.assertNotIn(io, block, f"provider 调用 {io} 被搬进了 signal 写锁")
+        # commit 必须是这个 immediate 块内的**直接**调用：若把 commit 挪出块外
+        # （先收集再提交），fencing 就重新变成 deferred 语义。
+        self.assertTrue(
+            any(isinstance(child, ast.Call)
+                and isinstance(child.func, ast.Attribute)
+                and child.func.attr == "commit_signal"
+                for child in ast.walk(with_node)),
+            "signal commit 不在 BEGIN IMMEDIATE 块内",
+        )
 
     def test_guard14t_signal_cycle_must_match_the_account_binding(self):
         """Guard 14t：新 signal 的 cycle 必须与 account 当前绑定一致（DB 层）。
@@ -2237,6 +2267,29 @@ def _function_node(tree, name):
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == name:
             return node
     raise AssertionError(f"未找到函数 {name}")
+
+
+def _commit_signal_row_keys(tree, function):
+    """Yield the string keys of every ``SIG.commit_signal(... row={...})`` call.
+
+    Yields one ``set`` of keys per call site, so a guard can assert that the
+    ``row`` mapping never carries provenance columns — provenance must come from
+    the frozen context, never from hand-written row data.
+    """
+    for node in ast.walk(_function_node(tree, function)):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        if not (isinstance(func, ast.Attribute) and func.attr == "commit_signal"):
+            continue
+        for keyword in node.keywords:
+            if keyword.arg != "row" or not isinstance(keyword.value, ast.Dict):
+                continue
+            yield {
+                key.value
+                for key in keyword.value.keys
+                if isinstance(key, ast.Constant) and isinstance(key.value, str)
+            }
 
 
 def _strip_function_docstring(node, body):

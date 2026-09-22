@@ -673,6 +673,95 @@ business authority**，调用方向单向：
    0 survived、0 fake），只读路径零网络证明见 `work/r24_readpath_no_network_check.py`
    （9 条只读入口，provider 全部替换为断言失败）。
 
+## Signal Pipeline Boundary（R25）
+
+### 调用方向
+
+"为什么系统在这个 cycle、这个策略版本、这个时间点，对这只股票产生了这一条
+signal？"此前需要 reviewer 在 provider / helper / DB 代码里重新推导：
+候选获取、行情与 evidence 收集、策略条件、approval / block reason、risk log、
+signal INSERT、bootstrap、runtime read 分散在多个路径中。R25 把这条链路收敛成
+**单一 authority**，调用方向单向：
+
+```text
+Selection Candidate（谁是候选）
+        ↓
+Signal Evidence（用了什么市场事实）
+        ↓
+Signal Decision（裁决：approved / blocked + reason）
+        ↓
+Frozen Signal Context（不可变 cycle / strategy version）
+        ↓
+Signal Commit —— signal_service.commit_signal（唯一 INSERT 入口）
+        ↓
+Immutable Signal Ledger（paper_signals）
+        ↓
+Risk → Order → Fill（各自既有 authority）
+```
+
+### 谁负责什么
+
+| 问题 | 唯一 owner |
+| --- | --- |
+| 哪些股票进入候选集合 | Selection Authority（`_candidate_rows` / selection runner）。**不**决定 signal 是否成立 |
+| 市场事实是什么、freshness / verification / as-of | Market Data Authority（R24，见上节）。**不**决定 BUY / SELL / HOLD |
+| 基于 frozen candidate + evidence 做 signal-level 裁决 | `paper_trading._signal_approval`（evidence → decision），产出 `SignalDecision` |
+| 候选 → evidence → decision → commit 的生命周期与落库 | **`backend/signal_service.py`**：`commit_signal` 独占 `INSERT INTO paper_signals` |
+| frozen provenance（cycle / strategy version / checksum） | `strategy_selection_resolver.signal_write_context`（R23）；`commit_signal` 只从 context 取四列 |
+| 策略本身的业务逻辑 | strategy registry / DSL（Signal Pipeline **不**复制策略定义，见下"不得成为第二个 Strategy Engine"） |
+| signal 是否允许进入受控后续流程 | Risk Authority（R21）。Signal 只能**记录** risk 结果，不能拥有风险规则 |
+| 订单是否成交、如何成交 | Execution Authority。R25 不碰 |
+| `verified` 是否等价于双源 | **否**。需要双源必须调用 `market_data_contract.is_cross_source_verified`；`SignalEvidence.cross_source_verified` 是它在 signal 侧的显式投影 |
+
+### 不变量
+
+1. `paper_signals` 的**生产写入只有一份**：`signal_service.commit_signal`。
+   close 路径（`generate_signals`）与 bootstrap（`_bootstrap_signals_for_today`）
+   都经它落库，且都不再内联 SQL。两条路径的冲突语义显式二选一：
+   close 用 `INSERT OR IGNORE`（同键重跑幂等、绝不覆盖既有行）；bootstrap 用
+   `ON CONFLICT ... DO UPDATE`，SET 子句**只含业务列**，`strategy_id` /
+   `strategy_version` / `strategy_checksum` / `cycle_id` 永不出现在其中。
+   两种语句由 `signal_service.conflict_statement` **唯一构造** —— 回归测试与
+   生产执行读的是同一个函数，因此"测试断言的 SQL"不可能与"生产跑的 SQL"分叉。
+2. **Candidate 与 committed Signal 的边界是显式的**。候选 dict 不再"加字段加到
+   变成 DB 行"：落库必须经过一个 `SignalDecision`（`outcome` ∈ {approved,
+   blocked} + `reason` + `status` + `evidence`）。裁决是落库前的业务对象，
+   而非裸布尔或裸字典。
+3. **evidence 是紧凑投影，不是第二份行情 payload**。`SignalEvidence` 只携带
+   `verification` / `verification_method` / `asof_day` / `observed_at` / `policy`
+   与少量解释字段，随 `payload.signal_evidence` 落库。逐票双源结论由
+   `cross_source_verified` 显式回答，其判据**委托**给 R24 的
+   `is_cross_source_verified`（构造一个 `MarketDataSnapshot` 再问它），因此
+   `coverage_integrity` 那种"verified 但不是双源"不会被 signal 侧误读。
+4. **provider I/O 绝不进入 signal 的 writer transaction**。两条路径都是
+   `_db(immediate=True)` ＋ 写锁内零网络：close 路径在开户前预取
+   `evidence_quotes` / `evidence_news` / `evidence_sector_flow`；bootstrap 在
+   写事务之前按账户预取（并在此之前用只读连接完成候选冷却与 recheck 注入，
+   使"为哪些候选取证"与"实际审批哪些候选"是同一集合）。这条不变量同时由 AST
+   guard（`SIGG04`）与行为探针（`SIG14`：包住 `_db` 与 provider，写事务内调用
+   即失败）两层守住。
+5. **一次 signal 一批冻结上下文**。cycle 与 strategy version 在 commit phase
+   解析一次，rollover 使整批 stale（审计 `signal_stale_cycle_context`、`created=0`），
+   **绝不**把旧周期候选迁移到新周期或贴上 current head。DB 层另有 R23 的
+   `trg_paper_signals_cycle_provenance_insert` / `..._strategy_stamp_immutable`
+   作第二道门。
+6. **历史 signal 是 authority**。读路径只读持久化 stamp，不再调
+   `SR.get_version`、不重解 current cycle、不用 current market data 回填。
+   signal → order 血缘仍由唯一 owner `strategy_selection_resolver.signal_order_provenance`
+   解析（R25 未新建第二套 lineage）。
+7. **Signal Pipeline 不是第二个 Strategy Engine，也不是 service locator**。
+   `signal_service` 只 import `market_data_contract`（纯契约）与
+   `strategy_selection_resolver`（frozen context 契约）；不 import `paper_trading`、
+   不 import FastAPI、不取数据、不读时钟、不开事务（guard `SIGG03` 钉住）。
+   frontend / API 不得重算 signal 规则：后端投影 `signal_decision`
+   （outcome / reason / evidence 状态），前端只渲染。
+8. **为 R27 AI 预留的插槽**：AI 以后可以是 **Candidate Producer**，但**不是**
+   Signal Persistence Owner / Risk Authority / Promotion Authority。
+   `R25 does NOT allow AI to write signals.`
+9. 回归门禁见 `backend/test_signal_pipeline.py`（SIG01 ~ SIG15 契约 / writer /
+   ledger 集成；SIGG01 ~ SIGG04 架构 guard），语义 mutation 见
+   `work/r25_mutation_check.py`（M-SIG1 ~ M-SIG8，8/8 CAUGHT、0 survived、0 fake）。
+
 ## 目标依赖方向
 
 ```text
@@ -705,6 +794,8 @@ frontend 业务规则重复（前端重算后端 policy）
 network I/O 进入 DB writer transaction
 新模块成为 service locator（零项目级 import 才能是纯边界）
 零 I/O / 零 wall-clock / 零事务所有权边界被破坏
+第二套 signal persistence owner（R25：`paper_signals` 写入只允许 signal_service）
+signal 侧自带"什么算双源"的判据（R25：必须委托 is_cross_source_verified）
 ```
 
 ### 仅作 review signal（不进入 CI gate）

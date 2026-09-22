@@ -85,6 +85,7 @@ import paper_sizing as PSZ
 import order_intent as OI
 import strategy_policies as SPOL
 import strategy_registry as SR
+import signal_service as SIG
 import strategy_selection_resolver as SRES
 import strategy_runtime as SRT
 import user_strategy_participation as USP
@@ -3723,6 +3724,17 @@ def _strategy_reference_is_usable(account_id, reference_date, asof_date):
 
 def _quote_is_fresh(quote, asof_date):
     return PQP.quote_is_fresh(quote, asof_date, date_fn=_date)
+
+
+def signal_evidence_for(quote, *, asof_day=None, policy=None):
+    """把逐票行情投影成 Signal Pipeline 的 evidence（薄适配，零判定）。
+
+    逐票双源判定归 R24 authority（``is_cross_source_verified``），本函数只
+    负责把 ``asof_date`` 归一成字符串并转发 —— 不做任何 verification 比较，
+    以免 signal 侧出现第二套"什么算双源"的判据。
+    """
+    day = "" if asof_day is None else _date(asof_day).isoformat()
+    return SIG.signal_evidence(quote, asof_day=day, policy=policy)
 
 
 def _is_trading_active(quote):
@@ -7402,6 +7414,15 @@ def _signal_approval(
 ):
     code = pick["code"]
     flags = []
+    # R25：evidence 在决策**之前**收集一次，并随 decision 一起返回 —— 决策函数
+    # 不自行发网络、不重解 current，只消费这个已冻结的投影。
+    #
+    # 注意这里**不**声称任何 Market Data policy 名称：逐票实时行情的 freshness /
+    # 区间校验仍由既有 owner ``paper_quote_policy`` 判定（20 分钟窗口），它与 R24
+    # 的全市场快照 policy（``LIVE_MARKET_POLICY`` 240s）是两类事实、两套判据。
+    # R25 只借用 R24 的**核验语义谓词**（什么算双源），不借用它的 freshness policy，
+    # 因此不写 policy 名，避免把一个没有实际应用的 policy 记成证据。
+    evidence = signal_evidence_for(quote, asof_day=asof_date)
     security_scope = _security_scope(code, quote.get("name") or pick.get("name"), quote.get("risk_flag"))
     if not security_scope["allowed"]:
         flags.append(security_scope["reason"])
@@ -7417,7 +7438,7 @@ def _signal_approval(
         flags.append("缺少有效报价")
     if not _quote_is_fresh(quote, asof_date or dt.date.today()):
         flags.append("未取得带当日源时间戳的实时行情")
-    elif quote.get("quote_validation") != "cross_source_checked":
+    elif not evidence.cross_source_verified:
         flags.append("\u5b9e\u65f6\u884c\u60c5\u672a\u901a\u8fc7\u72ec\u7acb\u4ea4\u53c9\u6838\u9a8c")
     listing = _new_listing_profile(account["id"], code, kline, history_meta, asof_date or dt.date.today())
     is_new_listing = bool(listing.get("eligible"))
@@ -7492,7 +7513,10 @@ def _signal_approval(
     }
     flags.extend(entry_model["reasons"])
     decision["entry_model"] = entry_model
-    return (not flags), "；".join(flags), decision, market_policy
+    # R25：evidence 作为**第五个返回值**显式交给调用方，而不是塞进 decision dict
+    # —— decision 会被序列化进 payload 落库，把证据对象混进去等于在账本里塞第二份
+    # 事实副本。调用方拿到它后只做一件事：包进 SignalDecision 一起写入。
+    return (not flags), "；".join(flags), decision, market_policy, evidence
 
 
 def generate_signals(asof_date=None):
@@ -7693,12 +7717,14 @@ def generate_signals(asof_date=None):
                     "id": account["id"], "created": 0, "candidates": len(candidates),
                     "provenance_unprovable": True, "reason": context_error.detail, **meta})
                 continue
-            account_cycle_id, account_stamp = account_context.cycle_id, account_context.stamp
+            # R23：signal 行的 provenance 四列只由 frozen context 供给（见
+            # SIG.commit_signal），这里不再解包成局部变量 —— 少一处可被误用的副本。
+            account_stamp = account_context.stamp
             for pick in candidates:
                 code = pick["code"]
                 quote = evidence_quotes.get(code, {})
                 kline = _completed_kline(code, day)
-                passed, reason, decision, market_policy = _signal_approval(
+                passed, reason, decision, market_policy, approval_evidence = _signal_approval(
                     account, pick, quote, kline, evidence_sector_flow, market,
                     evidence_news, evidence_history.get(code), day, conn=conn,
                 )
@@ -7720,19 +7746,30 @@ def generate_signals(asof_date=None):
                     news=payload.get("news"),
                     final_score=(decision.get("entry_model") or {}).get("score"),
                 )
-                status = "pending" if passed else "blocked"
-                strategy_id, strategy_version, strategy_checksum = account_stamp
-                conn.execute(
-                    """INSERT OR IGNORE INTO paper_signals(
-                       account_id,signal_date,intended_date,code,name,industry,close_price,
-                       rank_score,t_tier,t_score,payload,status,reason,created_at,
-                       strategy_id,strategy_version,strategy_checksum,cycle_id)
-                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                    (account["id"], day.isoformat(), _next_weekday(day).isoformat(), code, pick.get("name"),
-                     pick.get("industry"), _num(quote.get("price"), _num(pick.get("price"))), _num(pick.get("score")),
-                     decision.get("tier"), _num((decision.get("entry_model") or {}).get("score")),
-                     _json(payload), status, reason, _now(),
-                     strategy_id, strategy_version, strategy_checksum, account_cycle_id),
+                decision_result = SIG.decide_signal(
+                    passed=passed, reason=reason, evidence=approval_evidence,
+                )
+                payload["signal_evidence"] = approval_evidence.projection()
+                payload["signal_decision"] = decision_result.business_projection()
+                SIG.commit_signal(
+                    conn,
+                    context=account_context,
+                    row={
+                        "signal_date": day.isoformat(),
+                        "intended_date": _next_weekday(day).isoformat(),
+                        "code": code,
+                        "name": pick.get("name"),
+                        "industry": pick.get("industry"),
+                        "close_price": _num(quote.get("price"), _num(pick.get("price"))),
+                        "rank_score": _num(pick.get("score")),
+                        "t_tier": decision.get("tier"),
+                        "t_score": _num((decision.get("entry_model") or {}).get("score")),
+                        "payload": _json(payload),
+                        "status": decision_result.status,
+                        "reason": reason,
+                        "created_at": _now(),
+                    },
+                    conflict=SIG.CONFLICT_IGNORE,
                 )
                 # R23：候选批 / signal 行 / risk decision 共享同一个 frozen stamp。
                 _risk_log(conn, account["id"], code, "buy", "approved_signal" if passed
@@ -10928,6 +10965,100 @@ def _staged_slice_pending(payload_text) -> bool:
     return bool(plan) and int(state.get("filled") or 0) < len(plan)
 
 
+def _bootstrap_cooled_candidates(conn, account_id, candidates, day):
+    """bootstrap 的「重审注入 + 冷却过滤 + 优先级排序」——只读、不联网。
+
+    刻意可与写事务分离：证据（行情 / 新闻 / 板块流）必须按**最终**候选集合预取，
+    而最终集合依赖这一步的冷却查询。把两者一起放在写锁之前，写锁内就只剩校验、
+    决策与落库（R25 §20：provider I/O 不得进入 writer transaction）。
+
+    ``conn`` 只需可读（只读连接即可）；本函数**不**写任何表，返回的
+    ``deferred_discards`` 由调用方在写事务内应用到 ``deferred_codes``。
+    """
+    candidates = [dict(item) for item in (candidates or [])]
+    candidate_codes = {str(item.get("code") or "") for item in candidates}
+    deferred_discards = set()
+    recheck_rows = _rows(
+        conn,
+        """SELECT code,payload FROM paper_signals
+           WHERE account_id=? AND intended_date=?
+                 AND status IN ('recheck_capacity','deferred_capacity',?,?)""",
+        (account_id, day.isoformat(), ENTRY_FROZEN_WAITLIST_STATUS, RECOVERY_WATCH_STATUS),
+    )
+    recheck_codes = {str(row.get("code") or "") for row in recheck_rows}
+    for recheck_row in recheck_rows:
+        recheck_payload = _loads(recheck_row.get("payload"), {})
+        recheck_pick = recheck_payload.get("pick") or {}
+        if recheck_payload.get("fast_entry_priority"):
+            recheck_pick["fast_entry_priority"] = recheck_payload["fast_entry_priority"]
+        recheck_code = str(recheck_pick.get("code") or recheck_row.get("code") or "")
+        recheck_scope = _security_scope(
+            recheck_code, recheck_pick.get("name"), recheck_pick.get("risk_flag"),
+        )
+        if recheck_code and recheck_scope["allowed"]:
+            # It may already be in the live top candidates.  Either way, this pass
+            # must be allowed to refresh its deferred status after cash or a slot
+            # has been released.
+            deferred_discards.add(recheck_code)
+        if recheck_code and recheck_scope["allowed"] and recheck_code not in candidate_codes:
+            recheck_pick["code"] = recheck_code
+            candidates.append(recheck_pick)
+            candidate_codes.add(recheck_code)
+            # The following approval pass will either restore this candidate to
+            # pending or keep it deferred.  Do not let a stale snapshot of
+            # deferred_codes suppress that recheck.
+        elif (recheck_code and recheck_scope["allowed"]
+              and recheck_pick.get("fast_entry_priority")):
+            # The live strategy scan may already contain the same code.  Preserve
+            # the 30-second confirmation on that fresher candidate instead of
+            # losing its priority during code deduplication.
+            for live_pick in candidates:
+                if str(live_pick.get("code") or "") == recheck_code:
+                    live_pick["fast_entry_priority"] = recheck_pick["fast_entry_priority"]
+                    break
+    # Do not repeatedly send the same structurally invalid trend names through the
+    # 12-slot live approval budget every three minutes.  Capacity/freeze rechecks
+    # remain exempt: they were valid entries and must be allowed to wake as soon as
+    # a slot/cash is released.
+    structural_cooldowns = []
+    risk_cooldowns = []
+    cooled_candidates = []
+    for candidate in candidates:
+        candidate_code = str(candidate.get("code") or "")
+        risk_cooldown = _bootstrap_risk_rejection_cooldown(
+            conn, account_id, candidate_code, day,
+        )
+        if risk_cooldown:
+            risk_cooldowns.append({"code": candidate_code, **risk_cooldown})
+            continue
+        cooldown = (
+            None if candidate_code in recheck_codes
+            else _bootstrap_structural_recheck_cooldown(
+                conn, account_id, candidate_code, day,
+            )
+        )
+        if cooldown:
+            structural_cooldowns.append({"code": candidate_code, **cooldown})
+            continue
+        cooled_candidates.append(candidate)
+    # Waiting-pool priority is recalculated from the newest score on every scan.
+    # Database insertion order must not pin an old name.
+    deduped = {}
+    for item in cooled_candidates:
+        code = str(item.get("code") or "")
+        if code:
+            deduped[code] = item
+    return {
+        "candidates": _prioritize_live_candidate_budget(
+            list(deduped.values()), account_id, recheck_codes, limit=12,
+        ),
+        "recheck_codes": recheck_codes,
+        "structural_cooldowns": structural_cooldowns,
+        "risk_cooldowns": risk_cooldowns,
+        "deferred_discards": deferred_discards,
+    }
+
+
 def _bootstrap_signals_for_today(asof_day, live_universe=None, source_slot="intraday"):
     """用上一交易日的完整因子扫描当日候选；仓位数量不作为扫描门槛。
 
@@ -11008,7 +11139,42 @@ def _bootstrap_signals_for_today(asof_day, live_universe=None, source_slot="intr
         )
     except Exception:
         global_microstructure_map = {}
-    with _db() as conn:
+    # R25：bootstrap 与 close 路径必须同形 —— provider/网络证据在**写事务之外**
+    # 收集完成，写锁内只做校验、决策与落库。此前 ``_quotes`` / ``_news_for`` /
+    # ``fetch_sector_flow`` 在 ``_db()`` 内被逐账户调用：那不仅让每个账户各付一次
+    # 网络延迟（写锁被持有），而且一次慢源就能阻塞成交、风控退出与页面读取数分钟。
+    # 证据按账户预取一次，写事务内只读这份快照。
+    bootstrap_evidence = {}
+    for account in accounts:
+        precomputed = precomputed_candidates.get(account["id"], ([], {}))
+        if precomputed[1].get("blocked"):
+            continue
+        # 冷却过滤会决定最终候选集合，而冷却查询需要账本 —— 但它只读，因此用
+        # 只读连接在写事务之前完成，使「为哪些候选取证」与后面「实际审批哪些
+        # 候选」使用同一个集合。
+        with _db_readonly() as evidence_conn:
+            cooled = _bootstrap_cooled_candidates(
+                evidence_conn, account["id"], precomputed[0], day,
+            )
+        names = {pick["code"]: pick.get("name") or pick["code"]
+                 for pick in cooled["candidates"]}
+        try:
+            quotes = _quotes(list(names)) if names else {}
+        except Exception:
+            quotes = {}
+        try:
+            news = _news_for(names) if names else []
+        except Exception:
+            news = []
+        try:
+            sector_flow = dfc.fetch_sector_flow("industry")
+        except Exception:
+            sector_flow = []
+        bootstrap_evidence[account["id"]] = {
+            "cooled": cooled, "names": names, "quotes": quotes,
+            "news": news, "sector_flow": sector_flow,
+        }
+    with _db(immediate=True) as conn:
         cycle = _active_cycle(conn)
         for account in accounts:
             try:
@@ -11112,91 +11278,11 @@ def _bootstrap_signals_for_today(asof_day, live_universe=None, source_slot="intr
                 )
 
                 candidates, meta = precomputed_candidates.get(account["id"], ([], {}))
-                candidates = [dict(item) for item in candidates]
-                # 仓位单位逻辑修复后，旧的容量误判信号必须重新进入本轮候选，
-                # 不能因为它们不在当前前 12 名就继续沉淀为“次日重筛”。
-                candidate_codes = {str(item.get("code") or "") for item in candidates}
-                recheck_rows = _rows(
-                    conn,
-                    """SELECT code,payload FROM paper_signals
-                       WHERE account_id=? AND intended_date=?
-                             AND status IN ('recheck_capacity','deferred_capacity',?,?)""",
-                    (account["id"], day.isoformat(), ENTRY_FROZEN_WAITLIST_STATUS, RECOVERY_WATCH_STATUS),
-                )
-                recheck_codes = {str(row.get("code") or "") for row in recheck_rows}
-                for recheck_row in recheck_rows:
-                    recheck_payload = _loads(recheck_row.get("payload"), {})
-                    recheck_pick = recheck_payload.get("pick") or {}
-                    if recheck_payload.get("fast_entry_priority"):
-                        recheck_pick["fast_entry_priority"] = recheck_payload["fast_entry_priority"]
-                    recheck_code = str(recheck_pick.get("code") or recheck_row.get("code") or "")
-                    recheck_scope = _security_scope(
-                        recheck_code, recheck_pick.get("name"), recheck_pick.get("risk_flag"),
-                    )
-                    if recheck_code and recheck_scope["allowed"]:
-                        # It may already be in the live top candidates.  Either
-                        # way, this pass must be allowed to refresh its deferred
-                        # status after cash or a slot has been released.
-                        deferred_codes.discard(recheck_code)
-                    if recheck_code and recheck_scope["allowed"] and recheck_code not in candidate_codes:
-                        recheck_pick["code"] = recheck_code
-                        candidates.append(recheck_pick)
-                        candidate_codes.add(recheck_code)
-                        # The following approval pass will either restore this
-                        # candidate to pending or keep it deferred.  Do not let a
-                        # stale snapshot of deferred_codes suppress that recheck.
-                    elif (
-                        recheck_code and recheck_scope["allowed"]
-                        and recheck_pick.get("fast_entry_priority")
-                    ):
-                        # The live strategy scan may already contain the same
-                        # code.  Preserve the 30-second confirmation on that
-                        # fresher candidate instead of losing its priority
-                        # during code deduplication.
-                        for live_pick in candidates:
-                            if str(live_pick.get("code") or "") == recheck_code:
-                                live_pick["fast_entry_priority"] = recheck_pick["fast_entry_priority"]
-                                break
-                # Do not repeatedly send the same structurally invalid trend names
-                # through the 12-slot live approval budget every three minutes.
-                # Capacity/freeze rechecks remain exempt: they were valid entries
-                # and must be allowed to wake as soon as a slot/cash is released.
-                structural_cooldowns = []
-                risk_cooldowns = []
-                cooled_candidates = []
-                for candidate in candidates:
-                    candidate_code = str(candidate.get("code") or "")
-                    risk_cooldown = _bootstrap_risk_rejection_cooldown(
-                        conn, account["id"], candidate_code, day,
-                    )
-                    if risk_cooldown:
-                        risk_cooldowns.append({"code": candidate_code, **risk_cooldown})
-                        continue
-                    cooldown = (
-                        None if candidate_code in recheck_codes
-                        else _bootstrap_structural_recheck_cooldown(
-                            conn, account["id"], candidate_code, day,
-                        )
-                    )
-                    if cooldown:
-                        structural_cooldowns.append({"code": candidate_code, **cooldown})
-                        continue
-                    cooled_candidates.append(candidate)
-                candidates = cooled_candidates
-                try:
-                    NL.capture_candidate_snapshot(account["id"], candidates, factor_day, slot=source_slot)
-                except Exception as exc:
-                    _audit(conn, account["id"], "candidate_snapshot_failed", f"{type(exc).__name__}: {exc}")
-                # Waiting-pool priority is recalculated from the newest score on
-                # every scan.  Database insertion order must not pin an old name.
-                deduped = {}
-                for item in candidates:
-                    code = str(item.get("code") or "")
-                    if code:
-                        deduped[code] = item
-                candidates = _prioritize_live_candidate_budget(
-                    list(deduped.values()), account["id"], recheck_codes, limit=12,
-                )
+                # R25：候选集合与逐账户证据都在**写事务之外**算好（见上方
+                # bootstrap_evidence 预取区段）。写锁内只消费这份快照，不再：
+                # 查冷却 / 取行情 / 取新闻 / 取板块流。recheck 注入与冷却过滤的
+                # 结果必须与取证时的候选集合一致，故一并从预取结果取用。
+                evidence = bootstrap_evidence.get(account["id"]) or {}
                 if meta.get("blocked"):
                     item = {
                         "id": account["id"], "status": "blocked",
@@ -11210,20 +11296,30 @@ def _bootstrap_signals_for_today(asof_day, live_universe=None, source_slot="intr
                                          "full_market_scan": meta.get("full_market_scan")},
                     )
                     continue
-
-                names = {pick["code"]: pick.get("name") or pick["code"] for pick in candidates}
-                quotes = _quotes(list(names))
-                news = _news_for(names)
+                cooled = evidence.get("cooled") or {
+                    "candidates": [], "recheck_codes": set(),
+                    "structural_cooldowns": [], "risk_cooldowns": [],
+                    "deferred_discards": set(),
+                }
+                for recheck_code in cooled["deferred_discards"]:
+                    deferred_codes.discard(recheck_code)
+                structural_cooldowns = cooled["structural_cooldowns"]
+                risk_cooldowns = cooled["risk_cooldowns"]
+                candidates = cooled["candidates"]
+                names = evidence.get("names") or {}
+                quotes = evidence.get("quotes") or {}
+                news = evidence.get("news") or []
+                sector_flow = evidence.get("sector_flow") or []
+                try:
+                    NL.capture_candidate_snapshot(account["id"], candidates, factor_day, slot=source_slot)
+                except Exception as exc:
+                    _audit(conn, account["id"], "candidate_snapshot_failed", f"{type(exc).__name__}: {exc}")
                 for candidate in candidates:
                     candidate["microstructure"] = global_microstructure_map.get(
                         str(candidate.get("code") or ""),
                         {"status": "source_unavailable", "score_applied": False,
                          "grade": "public_quote_shadow"},
                     )
-                try:
-                    sector_flow = dfc.fetch_sector_flow("industry")
-                except Exception:
-                    sector_flow = []
                 approved = 0
                 waitlisted = 0
                 skipped_existing = 0
@@ -11237,7 +11333,10 @@ def _bootstrap_signals_for_today(asof_day, live_universe=None, source_slot="intr
                     _observe_intraday(conn, cycle["id"], account["id"], None, None, "scan",
                                       bootstrap_error.detail, {"provenance_unprovable": True})
                     continue
-                bootstrap_cycle_id, bootstrap_stamp = bootstrap_context.cycle_id, bootstrap_context.stamp
+                bootstrap_stamp = bootstrap_context.stamp
+                # R25: bootstrap 的写边界必须与 close 路径同形 —— BEGIN IMMEDIATE
+                # fencing + 写锁内零网络（quotes/news/sector_flow 仅在 commit 前
+                # 以预取证据注入，见上方 evidence 区段）。
                 for pick in candidates:
                     code = pick["code"]
                     is_reentry = code in reentry_codes
@@ -11258,7 +11357,7 @@ def _bootstrap_signals_for_today(asof_day, live_universe=None, source_slot="intr
                     # 同一只候选在同一轮循环里会被 _signal_approval 和
                     # _with_decision_snapshot 各用一次 K 线；只读一次文件。
                     kline = _completed_kline(code, factor_day)
-                    passed, reason, decision, market_policy = _signal_approval(
+                    passed, reason, decision, market_policy, approval_evidence = _signal_approval(
                         account, pick, quote, kline,
                         sector_flow, market, news, history.get(code), day,
                         factor_asof_date=factor_day, conn=conn,
@@ -11303,12 +11402,12 @@ def _bootstrap_signals_for_today(asof_day, live_universe=None, source_slot="intr
                         news=payload.get("news"),
                         final_score=(decision.get("entry_model") or {}).get("score"),
                     )
-                    status = (
-                        ENTRY_FROZEN_WAITLIST_STATUS
-                        if passed and _entry_freeze_enabled()
-                        else "pending" if passed else RECOVERY_WATCH_STATUS if is_recovery else "blocked"
-                    )
-                    if status == ENTRY_FROZEN_WAITLIST_STATUS:
+                    # R25：入场冻结是**候选级**事实，先判定一次；随后 SignalDecision
+                    # 用同一个事实同时产出 status 与 reason。此前这里和下方各算了一套
+                    # 条件（落库用前一套、decision 用后一套），两套一旦漂移，写进账本
+                    # 的状态就不再是决策的结果。
+                    entry_frozen = bool(passed and _entry_freeze_enabled())
+                    if entry_frozen:
                         waitlisted += 1
                         reason = _entry_frozen_reason("盘中候选")
                         payload["entry_freeze"] = {
@@ -11337,33 +11436,38 @@ def _bootstrap_signals_for_today(asof_day, live_universe=None, source_slot="intr
                         "reason": "早期强势、资金和流动性共振；仅用于同批等待池排序",
                         "execution_override": False,
                     }
-                    conn.execute(
-                        """INSERT INTO paper_signals(
-                               account_id,signal_date,intended_date,code,name,industry,close_price,
-                               rank_score,t_tier,t_score,payload,status,reason,created_at,
-                               strategy_id,strategy_version,strategy_checksum,cycle_id
-                           ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-                           ON CONFLICT(account_id,signal_date,code) DO UPDATE SET
-                               intended_date=excluded.intended_date,
-                               name=excluded.name,
-                               industry=excluded.industry,
-                               close_price=excluded.close_price,
-                               rank_score=excluded.rank_score,
-                               t_tier=excluded.t_tier,
-                               t_score=excluded.t_score,
-                               payload=excluded.payload,
-                               status=excluded.status,
-                               reason=excluded.reason,
-                               created_at=excluded.created_at""",
-                        (
-                            account["id"], factor_day.isoformat(), day.isoformat(), code,
-                            pick.get("name"), pick.get("industry"),
-                            _num(quote.get("price"), _num(pick.get("price"))),
-                            _num(pick.get("score")), decision.get("tier"),
-                            _num((decision.get("entry_model") or {}).get("score"), 0.0) + waitlist_priority,
-                            _json(payload), status, reason, _now(), *bootstrap_stamp,
-                            bootstrap_cycle_id,
+                    payload["signal_evidence"] = approval_evidence.projection()
+                    # R25：status / reason 由决策唯一产出，落库直接取它的字段。
+                    bootstrap_decision = SIG.decide_signal(
+                        passed=passed, reason=reason, evidence=approval_evidence,
+                        status_if_passed=(
+                            ENTRY_FROZEN_WAITLIST_STATUS if entry_frozen else "pending"
                         ),
+                        status_if_blocked=(
+                            RECOVERY_WATCH_STATUS if is_recovery else "blocked"
+                        ),
+                    )
+                    status = bootstrap_decision.status
+                    payload["signal_decision"] = bootstrap_decision.business_projection()
+                    SIG.commit_signal(
+                        conn,
+                        context=bootstrap_context,
+                        row={
+                            "signal_date": factor_day.isoformat(),
+                            "intended_date": day.isoformat(),
+                            "code": code,
+                            "name": pick.get("name"),
+                            "industry": pick.get("industry"),
+                            "close_price": _num(quote.get("price"), _num(pick.get("price"))),
+                            "rank_score": _num(pick.get("score")),
+                            "t_tier": decision.get("tier"),
+                            "t_score": _num((decision.get("entry_model") or {}).get("score"), 0.0) + waitlist_priority,
+                            "payload": _json(payload),
+                            "status": status,
+                            "reason": bootstrap_decision.reason,
+                            "created_at": _now(),
+                        },
+                        conflict=SIG.CONFLICT_REFRESH,
                     )
                     _risk_log(
                         conn, account["id"], code, "buy",

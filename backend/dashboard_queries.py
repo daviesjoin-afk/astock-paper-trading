@@ -387,7 +387,9 @@ def dashboard(include_activity=False, include_history_symbols=False):
                     conn,
                     f"""SELECT {signal_fields},
                                json_extract(payload,'$.pick.sector_heat') AS sector_heat_json,
-                               json_extract(payload,'$.decision.entry_model') AS entry_model_json
+                               json_extract(payload,'$.decision.entry_model') AS entry_model_json,
+                               json_extract(payload,'$.signal_evidence') AS evidence_json,
+                               json_extract(payload,'$.signal_decision') AS decision_json
                         FROM paper_signals WHERE intended_date=?
                         ORDER BY account_id,rank_score DESC,id DESC LIMIT 120""",
                     (dt.date.today().isoformat(),),
@@ -420,6 +422,7 @@ def dashboard(include_activity=False, include_history_symbols=False):
             for signal in signals:
                 sector_heat = _loads(signal.pop("sector_heat_json", None), {}) or {}
                 entry_model = _loads(signal.pop("entry_model_json", None), {}) or {}
+                evidence = _loads(signal.pop("evidence_json", None), {}) or {}
                 execution = execution_by_signal.get(int(signal["id"])) or {}
                 signal["audit"] = {
                     "factor_date": signal.get("signal_date"),
@@ -433,6 +436,24 @@ def dashboard(include_activity=False, include_history_symbols=False):
                     "executed_at": execution.get("executed_at"),
                     "execution_quote_at": execution.get("execution_quote_at"),
                     "execution_price": execution.get("filled_price"),
+                }
+                # R25 §43：signal 的裁决与证据由后端投影成稳定字段，前端只渲染。
+                # 前端**不得**从 status 反推"是否双源"——``cross_source_verified``
+                # 是后端算好的业务谓词，``verification_method`` 让该结论可追溯。
+                # ``outcome`` 来自落库时持久化的裁决（历史事实 = authority），
+                # 而不是在这里按 status 重新推断。
+                persisted_decision = _loads(signal.pop("decision_json", None), {}) or {}
+                signal["signal_decision"] = {
+                    "outcome": persisted_decision.get("outcome"),
+                    "status": signal.get("status"),
+                    "reason": signal.get("reason"),
+                    "evidence": {
+                        "verification": evidence.get("verification"),
+                        "verification_method": evidence.get("verification_method"),
+                        "cross_source_verified": evidence.get("cross_source_verified"),
+                        "asof_day": evidence.get("asof_day"),
+                        "policy": evidence.get("policy"),
+                    } if evidence else None,
                 }
                 signal["payload"] = {
                     "pick": {"sector_heat": sector_heat},

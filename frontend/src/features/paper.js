@@ -2,7 +2,7 @@
 // 跨模块依赖（由原单文件作用域推导）
 import { api, apiPost } from "../core/api.js";
 import { $, chart, tableScroll } from "../core/dom.js";
-import { adaptiveEsc, cny, fmt, paperStatusTag, pctCls, pctTxt, riskText, zhRiskText } from "../core/format.js";
+import { adaptiveEsc, cny, fmt, paperStatusTag, pctCls, pctTxt, riskText, signalDecisionView, zhRiskText } from "../core/format.js";
 import { showPaperWorkspace } from "../core/navigation.js";
 import { PAPER_NAV_TTL_MS } from "../core/state.js";
 import { renderPaperAudit } from "./risk.js";
@@ -858,7 +858,12 @@ export async function renderPaperDashboard(d,auditRequest){
       var actual=audit.execution_status==='filled'
         ? ((audit.executed_at||'\u2014')+'<br><small>\u884c\u60c5 '+(audit.execution_quote_at||'\u2014')+'</small>')
         : '\u672a\u6210\u4ea4<br><small>'+(s.status==='blocked'||s.status==='rejected'?'\u4fe1\u53f7\u65f6\u70b9\u98ce\u63a7\u62e6\u622a':'\u5c1a\u672a\u6267\u884c')+'</small>';
-      return '<tr><td>'+(accountName[s.account_id]||s.account_id)+'</td><td><b>'+s.name+'</b><br/><span style="font-size:11px;color:var(--text-muted)">'+s.code+'</span></td><td>'+(audit.factor_date||s.signal_date||'\u2014')+'</td><td>'+marketText+'</td><td>'+(audit.planned_review_date||s.intended_date||'\u2014')+'</td><td>'+actual+'</td><td>'+(model.name||'\u72ec\u7acb\u5165\u573a\u6a21\u578b')+'<br><small>'+fmt(s.t_score,2)+'</small></td><td>'+paperStatusTag(s.status)+'</td><td style="font-size:12px">'+(s.reason||'\u5f85\u5b9e\u65f6\u884c\u60c5\u4e0e\u8d26\u6237\u98ce\u63a7\u590d\u6838')+'</td></tr>';
+      // R25：裁决与证据直接渲染后端投影，不在前端重算 signal 规则。
+      var decision=signalDecisionView(s.signal_decision);
+      var decisionText='<b>'+riskText(decision.outcomeText)+'</b>'
+        +'<br><small>'+riskText(decision.evidenceText)+'</small>';
+      var reasonText=riskText(zhRiskText(decision.reason||s.reason||'\u5f85\u5b9e\u65f6\u884c\u60c5\u4e0e\u8d26\u6237\u98ce\u63a7\u590d\u6838'));
+      return '<tr><td>'+(accountName[s.account_id]||s.account_id)+'</td><td><b>'+s.name+'</b><br/><span style="font-size:11px;color:var(--text-muted)">'+s.code+'</span></td><td>'+(audit.factor_date||s.signal_date||'\u2014')+'</td><td>'+marketText+'</td><td>'+(audit.planned_review_date||s.intended_date||'\u2014')+'</td><td>'+actual+'</td><td>'+(model.name||'\u72ec\u7acb\u5165\u573a\u6a21\u578b')+'<br><small>'+fmt(s.t_score,2)+'</small></td><td>'+paperStatusTag(s.status)+'</td><td>'+decisionText+'</td><td style="font-size:12px">'+reasonText+'</td></tr>';
     }).join('');
     var orders = (d.orders||[]).map(function(o){
       var view=paperOrderStatusView(o.status), cancel=(!o.archived_cycle&&o.status==='pending_limit')?'<button class="paper-mini-btn cancel" onclick="cancelPaperOrder('+o.id+')">撤单</button>':'';
@@ -882,7 +887,7 @@ export async function renderPaperDashboard(d,auditRequest){
       ? '曲线按各策略绩效参考本金归一化；策略启用前保持空值，并与沪深300收盘快照对比。'
       : (running?'本周期已启动；净值点不足两个，后续有效快照会自动补齐曲线。':'挑战将在确认资金并启动新周期后开始。');
     var signalsAudit = signals
-      ? tableScroll('<table><tr><th>策略</th><th>标的</th><th>信号日</th><th>执行日</th><th>独立模型评分</th><th>状态</th><th>说明</th></tr>'+signals+'</table>',980)
+      ? tableScroll('<table><tr><th>策略</th><th>标的</th><th>信号日</th><th>执行日</th><th>独立模型评分</th><th>状态</th><th>裁决/证据</th><th>说明</th></tr>'+signals+'</table>',1080)
       : '<div class="paper-empty">暂无信号。已启用策略会按各自模型、行情时间戳和仓位上限分别审批。</div>';
     var positionsAudit = positions
       ? tableScroll('<table><tr><th>策略决策</th><th>标的</th><th>持仓股数</th><th>持仓市值 / 总池占比</th><th>成本</th><th>现价</th><th>浮盈亏</th><th>质量评分 / 处置</th><th>持有</th><th>份额状态</th><th>交易制度</th><th>最早可卖 / 报价</th></tr>'+positions+'</table>',1260)
