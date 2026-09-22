@@ -238,6 +238,11 @@ Removed duplicate authority:
 0 个模块整体删除；1 处重复读取实现被收敛（main.health 的裸 open 绕过校验）
 + 调用层 6 个散落 TTL 收敛为具名 policy
 
+Guard policy (R24 final cleanup):
+R24 final cleanup removed the legacy LOC/top-level-def hard gates.
+Architecture CI now protects semantic ownership and dependency invariants
+instead of mechanical file-size ceilings.
+
 New facade/wrapper count:
 0（刻意不做 compatibility facade；调用方直接调 authority，无 v1/v2/legacy 层）
 
@@ -264,9 +269,10 @@ after  = 2 production modules（market_data_contract.py 判状态语义 +
          不再有第二个业务判决（MDG08 / MDG09 锁住）
 
 paper_trading.py:
-LOC = 14895（baseline 14896，净 -1）
-defs = 280（不变）
-仅趋势，不作为 blocker
+LOC = 14895
+defs = 280
+仅作为 **architecture trend observation**，不参与 pass/fail
+（R24 收尾已删除旧的 LOC / top-level-def hard gate，见下方「收尾修复」）
 ```
 
 ## Frontend sync
@@ -342,12 +348,16 @@ timeout 主导**——本轮从 13.8s 降到 0.10s，且 read path 在无缓存�
 PR:    #182（https://github.com/daviesjoin-afk/astock-paper-trading/pull/182）
 
 BASE:  2afcbecad0ee7966130d41b30711bbc5ebc38660
-HEAD:  cf8226196d5572e2540cc366d3c0a3a8c08104be（含复审修正；exact-head CI 已在该
-       SHA 上全绿 —— 9/9 checks。其后如出现**仅改 work/*.md** 的 docs 提交，
-       不改变被验证的代码内容）
 MASTER: 2afcbecad0ee7966130d41b30711bbc5ebc38660
 MERGE-BASE: 2afcbecad0ee7966130d41b30711bbc5ebc38660
 BASE DRIFT: NO
+
+EXACT-HEAD VERIFICATION:
+  GitHub Actions checks on current PR HEAD（不在此记录 SHA 快照 ——
+  merge authority 是当前 HEAD 的 exact-head CI；人工审核时从 GitHub API 读取）
+  要求：tests 3.11 / tests 3.12 / syntax / quality / docker-smoke /
+        frontend / browser-e2e / security-leak-scan 全绿，
+        且 browser log 无 flaky / 无 retry / 无 timeout。
 
 R24 MARKET DATA AUTHORITY
 
@@ -409,7 +419,7 @@ implicit current-state lookup added: 0
 large if/elif chain added: NO
 compatibility path removed: 6 处调用层 max_age 字面量 + 8 处 try/except 内联块
 business-rule lookup: before = 4 modules   after = 2 modules（同属一个 authority）
-paper_trading.py: LOC=14895  defs=280
+paper_trading.py: LOC=14895  defs=280（trend only，non-blocking）
 
 MERGE: NOT MERGED
 DEPLOY: NOT DEPLOYED
@@ -555,5 +565,114 @@ backend full: 4060 tests, OK, skipped=5
 frontend:     118/118
 E2E:          32/32, 0 flaky, 0 retry；paper-runtime 连续 5 轮
 security:     kinds=none, values=0, exit 0（worktree + all）
-paper_trading.py: LOC=14895（baseline 14895，净 0）  defs=280（不变）
+paper_trading.py: LOC=14895  defs=280（trend only，non-blocking）
 ```
+
+---
+
+## 收尾修复：移除机械 LOC/defs Hard Gate
+
+R24 功能正确性、full-market authority 收口、read/refresh 边界、PIT 语义、
+health metadata parity、横截面新鲜度、verification_method 语义、前端投影均已 PASS。
+本轮**只**做一件架构清理，**未改任何 production code**。
+
+### 移除内容
+
+`backend/test_paper_trading_architecture_guard.py`：
+
+- 删除 `PAPER_TRADING_LOC_BASELINE = 14895` / `PAPER_TRADING_DEF_BASELINE = 280`
+- 删除 `test_guard3_line_count_does_not_exceed_the_round2_baseline`
+- 删除 `test_guard3b_top_level_function_count_does_not_exceed_the_baseline`
+- 删除只为它们存在的 `PaperTradingDoesNotRegrow._size()`
+- 删除 header docstring 里的 `Guard 3` 声明，并在原位置留下**为何删除**的说明
+
+未替换成 15000 / 15500 / 16000 新阈值，也未引入 warning / soft threshold /
+growth budget —— **size-based CI gate 整体取消**。
+
+### 为什么删除
+
+size 不是架构性质。把它设成 hard gate 会逼出这种错误优化：
+
+```text
+确实需要新增一个有业务意义的 orchestration function
+        ↓
+defs 281 会失败
+        ↓
+机械把另一个无关函数搬到新文件
+        ↓
+新增 wrapper / helper / import，调用链更长
+        ↓
+可维护性反而下降
+```
+
+### 保留的语义 guard（仍然 hard fail）
+
+删除的是 size guard，**不是** architecture guard。本文件 13 个语义 guard class
+全部保留（Guard 1/2/4/5/6/7/8/9/14，含 dependency direction、零项目级 import、
+零 I/O / 零 wall-clock / 零事务所有权、episode finalizer、provenance 不得取 current
+head 等），`test_market_data_boundary.py` 的 10 条 MDG-* 环境 guard 亦全部保留
+（含 full-market cache 不得裸读、provider bypass、health 不得二次判 freshness）。
+
+现在文档化的分界见 `ARCHITECTURE.md` 的「验证与架构护栏（guard policy）」：
+
+```text
+CI hard fail  重复 authority / authority 回流 / provider bypass /
+              dependency violation / historical current-fill /
+              implicit current-state re-resolution / frontend 业务规则重复 /
+              network-in-writer-transaction / service locator / 边界被破坏
+
+review signal 单文件 LOC / 单文件 defs / 函数行数上限 / 模块数量
+```
+
+### 拆分类纪律（写入 ARCHITECTURE.md）
+
+新增模块必须说明 `business responsibility` / `authority` / `dependency direction` /
+`为什么认知复杂度真的下降`，否则不构成架构改进。禁止为降低单文件 LOC 而机械拆分；
+禁止为减少 `if` 数量而机械抽象（简单 guard 允许保留，只有重复规则 / 长 if/elif /
+深层嵌套 / 状态硬编码分派才考虑 predicate / policy table / dispatch / transition table）。
+
+### 分层验证模型（本轮起正式采用）
+
+```text
+L0 快速静态   ruff check + compileall 修改涉及的文件
+L1 定向验证   受影响模块 test module / architecture guard
+L2 子系统     相关 targeted tests + 相关 mutations + consumer regression
+L3 最终全量   backend full + frontend + E2E + security + full mutation
+```
+
+证据是否需要重跑由**修改内容**决定：docs-only 本地不跑 production 验证；
+test-only 只跑 L0 + 相关 test module；production subsystem 先 L0 → targeted →
+mutations → consumer regression；只有 production 修改真正结束才做一次 L3。
+
+merge authority 是**当前 PR HEAD 的 exact-head CI**，不是文档里写的某个旧 SHA。
+因此本 PR body 不再记录 `HEAD = <sha>` 快照（那会造成"为更新 SHA 再 commit →
+SHA 又变"的循环），改由 GitHub API 读取当前 HEAD。
+
+### 本轮验证（按分层模型）
+
+```text
+production changed: NO（diff 只有 test_paper_trading_architecture_guard.py）
+L0 ruff:     PASS
+L0 compile:  PASS（exit 0）
+L1 guard:    112/112 PASS（原 114 —— 精确减少被删的两个 size test）
+```
+
+继承的 production 证据未失效（production bytes 未变）：见上一节 54 / 9：9 / 4060 /
+118 / 32：32。本轮本地**不**重跑全量，由 exact-head CI 负责最终确认。
+
+### R25 pre-flight 债务（本轮只记录，不实现）
+
+`verification == "verified"` 只表示"该 kind 的 verification policy 通过"，
+**不等于**通过双源核验。只有 `MDC.is_cross_source_verified(snapshot)` 才能回答后者。
+
+```text
+R25 Signal Pipeline 开工前必须：
+  搜索全部新增/修改 production code，禁止用
+      snapshot.verification == "verified"
+  推断 cross-source verified；需要双源保证必须用
+      MDC.is_cross_source_verified(snapshot)
+  （可考虑增加小型 AST guard，但本 R24 收尾不实现）
+```
+
+该规则已在 `ARCHITECTURE.md` 不变量 3、`market_data_contract` 的
+`is_cross_source_verified` docstring 与本 PR body 三处写明。

@@ -683,6 +683,84 @@ API → Service → Domain
 
 Domain 不直接依赖 FastAPI、SQLite、Eastmoney、Tencent、Sina 或具体 LLM SDK。这个目标会通过渐进拆分实现，不做一次性重写。
 
+## 验证与架构护栏（guard policy）
+
+护栏只 hard fail **语义不变量**，不 hard fail **规模指标**。这条分界本身是架构决定：
+规模指标（单文件 LOC / 模块级 def 数 / 函数行数 / 模块数量）不是架构性质，
+把它们设成 CI 门槛会逼出错误优化 —— 一个"确实需要新增一个有业务意义的
+orchestration wiring"的改动会先撞上 def 上限，然后被迫把另一个无关函数机械搬到
+新文件，结果多出一个 wrapper / helper / import，调用链更长，可维护性反而下降。
+
+### CI hard fail（语义所有权与依赖不变量）
+
+```text
+重复 authority（同一 capability 出现第二份实现）
+旧 authority 回流（已迁出的实现被搬回 god module）
+新增直接 DB write owner
+provider bypass（绕过 Market Data authority 直连/裸读缓存）
+跨 capability dependency violation（pure domain 反向 import 编排层）
+historical current-fill（历史请求用当前快照回填）
+implicit current-state re-resolution（调用方自己重解 active cycle / current head）
+frontend 业务规则重复（前端重算后端 policy）
+network I/O 进入 DB writer transaction
+新模块成为 service locator（零项目级 import 才能是纯边界）
+零 I/O / 零 wall-clock / 零事务所有权边界被破坏
+```
+
+### 仅作 review signal（不进入 CI gate）
+
+```text
+单文件 LOC
+单文件模块级 def 数
+单个函数行数上限
+模块数量
+```
+
+**R24 收尾已移除** `paper_trading.py` 的 LOC / top-level-def hard gate
+（`test_paper_trading_architecture_guard.py` 的 Guard 3 及其两个断言与
+`PAPER_TRADING_LOC_BASELINE` / `PAPER_TRADING_DEF_BASELINE` 常量）。
+未用新阈值替代，也未引入 soft/warning 阈值或 growth budget —— size-based gate
+整体取消。需要趋势数字时临时统计即可（`wc -l` / 一次性 AST `sum(isinstance(...))`），
+不新增永久工具。
+
+### 拆分与抽象的纪律
+
+新增模块必须说明四件事，否则不构成架构改进：
+
+```text
+business responsibility
+authority（它拥有什么唯一真相）
+dependency direction（依赖谁、谁依赖它）
+为什么认知复杂度真的下降
+```
+
+禁止为了降低单文件 LOC 而机械拆分。也禁止为了减少 `if` 数量而机械抽象：
+简单 guard / 少量直接分支允许保留；只有**重复规则、长 if/elif 链、深层嵌套、
+状态硬编码分派**才考虑 pure business predicate / policy table / handler dispatch /
+transition table / rule pipeline。
+
+### 分层验证模型（L0 → L3）
+
+证据是否需要重跑由**修改内容**决定，而不是每次都重跑全量：
+
+```text
+L0  快速静态      ruff check + compileall 修改涉及的文件
+L1  定向验证      受影响模块的 test module / architecture guard
+L2  子系统验证    相关 targeted tests + 相关 mutations + consumer regression
+L3  最终全量      backend full + frontend + E2E + security + full mutation
+```
+
+- **docs-only**（`*.md` / 注释 / PR 描述）：本地不重跑任何 production 验证，
+  等 exact-head CI 即可。
+- **test-only**（`test_*.py` / guard / work 验证脚本）：L0 + 相关 test module。
+- **production subsystem**：L0 → 相关 targeted → 相关 mutations → consumer regression，
+  **不要立刻 full backend**。
+- **最终 production head**：production 修改真正结束后才做一次 L3，然后 push。
+
+merge authority 永远是**当前 PR HEAD 的 exact-head CI**，不是文档里写下的某个旧 SHA。
+因此 PR body 不再记录 `HEAD = <sha>` 快照（那会导致"为更新 SHA 再 commit → SHA 又变"的
+循环）；改为写 "GitHub Actions checks on current PR HEAD"，人工审核时从 GitHub API 读取。
+
 ## 架构演进记录（历史批次：模块化与边界固化）
 
 > 下面这段是**当时**的变更记录，保留原样以追溯判断依据；当前领域边界与策略平台视图见本文上半部分与 [`docs/STRATEGY_PLATFORM.md`](docs/STRATEGY_PLATFORM.md)。
