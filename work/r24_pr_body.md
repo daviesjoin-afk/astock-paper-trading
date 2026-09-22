@@ -11,8 +11,11 @@ read_snapshot()     ACCESS_READ    只读缓存/持久化事实，绝不联网
 refresh_snapshot()  ACCESS_REFRESH 显式允许联网，必须由调用方主动选择
 ```
 
-**取消了**上层对 provider 的直接 ownership：生产 `fetch_market_snapshot_full`
-调用点从 **18 处收敛到 0 处**。`paper_trading.py` 现在**没有任何**直接 provider 调用。
+**取消了**上层对 provider 的直接 ownership：上层（`paper_trading` / `main` /
+`manual_orders` / `universe` / `trade_attribution` / `close_snapshot_runner` /
+`dashboard_queries`）的 `fetch_market_snapshot_full` 调用点从 **18 处收敛到 0 处**。
+现在全仓只剩 **1 处**调用，且在 authority 自己内部
+（`market_data_service.refresh_snapshot`）——这正是"唯一权威"应有的形状。
 provider 实现本身仍留在 `data_fetcher.py`——R24 不重写 provider。
 
 ## 哪些 read path 不再同步访问网络
@@ -137,9 +140,11 @@ before: 无（散落在 data_fetcher / main.health / risk_dashboard /
         paper_trading._market_state / dashboard_queries，各写一套 freshness）
 after:  market_data_contract.py（状态语义 + policy）+ market_data_service.py（唯一取数入口）
 
-Direct provider production call sites (fetch_market_snapshot_full):
-before: 18
-after:  0
+Direct provider call sites (fetch_market_snapshot_full):
+before: 18（散在 paper_trading / main / manual_orders / universe /
+        trade_attribution / close_snapshot_runner）
+after:  1（且只在 authority 内部：market_data_service.refresh_snapshot）
+        上层调用点 = 0
 
 Read paths that can synchronously hit provider:
 before: 4（allocation-explain / hot / health / trade_attribution）
@@ -192,9 +197,11 @@ Compatibility paths removed:
 main.health 的裸文件读取；6 处调用层 max_age 字面量；8 处 try/except+provider 内联块
 
 理解"当前行情是否可信"需要查看：
-before = 4 production modules（data_fetcher / main / paper_trading / dashboard_queries）
-after  = 1 production module（market_data_contract.py 的状态语义；
-         + market_data_service.py 只回答"能不能联网"）
+before = 4 production modules（data_fetcher 的 cache TTL / main.health 的二次判决 /
+         paper_trading 各调用点的 max_age 字面量 / dashboard_queries 的读取路径）
+after  = 2 production modules（market_data_contract.py 判状态语义 +
+         market_data_service.py 判能不能联网），且二者构成**同一个 authority**，
+         不再有第二个业务判决（MDG08 / MDG09 锁住）
 
 paper_trading.py:
 LOC = 14895（baseline 14896，净 -1）
@@ -287,7 +294,8 @@ R24 MARKET DATA AUTHORITY
 authority before: 无
 authority after:  market_data_contract + market_data_service
 
-direct provider call sites:      before = 18   after = 0
+direct provider call sites:      before = 18   after = 1（仅在 authority 内部；
+                                              上层调用点 = 0）
 read paths w/ sync provider net: before = 4    after = 0
 freshness owners:                before = 3    after = 1
 provider disagreement owners:    before = 2    after = 2（未合并，消费者不同）
@@ -338,7 +346,7 @@ removed facade/wrapper: 0
 implicit current-state lookup added: 0
 large if/elif chain added: NO
 compatibility path removed: 6 处调用层 max_age 字面量 + 8 处 try/except 内联块
-business-rule lookup: before = 4 modules   after = 1 module
+business-rule lookup: before = 4 modules   after = 2 modules（同属一个 authority）
 paper_trading.py: LOC=14895  defs=280
 
 MERGE: NOT MERGED
