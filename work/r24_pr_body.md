@@ -244,6 +244,9 @@ full browser: 32/32, flaky=0, retry=0
 
 security worktree: PASS（kinds: none, values: 0, exit 0）
 security all:      PASS（kinds: none, values: 0, exit 0）
+exact-head CI:     PASS（9/9 —— tests 3.11 / tests 3.12 / syntax / quality /
+                   docker-smoke / frontend / browser-e2e / security-leak-scan ×2；
+                   browser 日志人工核对：32 passed, 0 retry, 0 flaky, 无 timeout）
 ```
 
 前端新增测试做的是**行为断言**，不是源码存在性断言：直接 import 真实的
@@ -269,10 +272,12 @@ timeout 主导**——本轮从 13.8s 降到 0.10s，且 read path 在无缓存�
 ## 交付格式
 
 ```text
-PR:    （待创建）
+PR:    #182（https://github.com/daviesjoin-afk/astock-paper-trading/pull/182）
 
 BASE:  2afcbecad0ee7966130d41b30711bbc5ebc38660
-HEAD:  （见 PR head）
+HEAD:  45e6763f83b91618940b6302ad17e6fa3068afb0（R24 代码提交；exact-head CI 已在该
+       SHA 上全绿 —— 9/9 checks。其后如出现**仅改 work/*.md** 的 docs 提交，
+       不改变被验证的代码内容）
 MASTER: 2afcbecad0ee7966130d41b30711bbc5ebc38660
 MERGE-BASE: 2afcbecad0ee7966130d41b30711bbc5ebc38660
 BASE DRIFT: NO
@@ -322,6 +327,7 @@ paper-runtime repeated: 5/5 clean
 full browser: 32/32, flaky=0, retry=0
 security worktree: PASS
 security all: PASS
+exact-head CI: PASS（9/9 checks，head 45e6763f83b91618940b6302ad17e6fa3068afb0）
 
 ARCHITECTURE / MAINTAINABILITY
 
