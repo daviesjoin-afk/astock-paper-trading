@@ -308,9 +308,12 @@ mutation: caught=9 survived=0 fake=0（work/r24_mutation_check.py --non-vacuity�
   M-MD4 historical 请求 fallback current
   M-MD5 unavailable 被默认值填充
 
-backend full:  4060 tests, OK, skipped=5
+inherited production validation:
+  backend full: 4060 tests, OK, skipped=5（上一 production head）
+current exact-head:
+  backend full: 4058 tests, OK, skipped=1（GitHub CI Python 3.12）
 frontend unit: 118/118（含 7 条 R24 新增：frontend/tests/market-data-status.test.mjs）
-architecture guard: 114/114
+architecture guard: 112/112 PASS
 
 paper-runtime repeated: 5/5 clean（每轮 2 passed, 0 retry, 0 flaky）
 full browser: 32/32, flaky=0, retry=0
@@ -399,14 +402,14 @@ TESTS
 
 R24 targeted: 54
 mutation: caught=9 survived=0 fake=0
-backend full: 4060 tests, skipped=5
+inherited production validation: backend full 4060 tests, skipped=5（上一 production head）
 frontend unit: 118/118
 paper-runtime repeated: 5/5 clean
 full browser: 32/32, flaky=0, retry=0
 security worktree: PASS
 security all: PASS
-exact-head CI: PASS（9/9 checks，head cf8226196d5572e2540cc366d3c0a3a8c08104be；
-               CI Python 3.12 实际 4060 tests OK skipped=1，
+exact-head CI: PASS（9/9 checks；
+               current exact-head: backend full 4058 tests OK skipped=1，
                browser-e2e 32/32、1 worker、0 retry / 0 flaky）
 
 ARCHITECTURE / MAINTAINABILITY
@@ -561,7 +564,7 @@ read path"不成立；`MDG06` 只禁 `fetch_market_snapshot_full`，旧探针也
 ```text
 R24 targeted: 54 tests（原 45，新增 9：MD15-19 契约语义 / MDPR-01-03 元数据 parity）
 mutation:     9/9 CAUGHT, survived=0, fake=0（原 5 条，新增 M-MD6..M-MD9 锁复审修正）
-backend full: 4060 tests, OK, skipped=5
+inherited production validation: backend full 4060 tests, OK, skipped=5（上一 production head）
 frontend:     118/118
 E2E:          32/32, 0 flaky, 0 retry；paper-runtime 连续 5 轮
 security:     kinds=none, values=0, exit 0（worktree + all）
@@ -651,7 +654,8 @@ SHA 又变"的循环），改由 GitHub API 读取当前 HEAD。
 ### 本轮验证（按分层模型）
 
 ```text
-production changed: NO（diff 只有 test_paper_trading_architecture_guard.py）
+production changed: NO
+本轮仅修改 architecture guard test + architecture/PR documentation
 L0 ruff:     PASS
 L0 compile:  PASS（exit 0）
 L1 guard:    112/112 PASS（原 114 —— 精确减少被删的两个 size test）
