@@ -257,11 +257,12 @@ class ProductionCandidateCase(unittest.TestCase):
             cur = conn.execute(
                 "INSERT INTO paper_signals(account_id,signal_date,intended_date,code,name,"
                 "close_price,rank_score,t_tier,t_score,payload,status,created_at,"
-                "strategy_id,strategy_version,strategy_checksum) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "strategy_id,strategy_version,strategy_checksum,cycle_id) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (account_id, signal_date, intended_date, code, f"测试股_{code}", 10.0,
                  rank_score, "A", t_score,
                  PT._json({"decision": {"entry_model": {"score": entry_score}}}),
-                 status, f"{signal_date} 15:00:00", *stamp),
+                 status, f"{signal_date} 15:00:00", *stamp, self.cycle_id()),
             )
             return int(cur.lastrowid)
 

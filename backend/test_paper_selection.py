@@ -48,6 +48,19 @@ class PaperSelectionTests(unittest.TestCase):
         self.old_db = PS.DB_PATH
         PS.DB_PATH = os.path.join(self.tmp.name, "selection_tracking.db")
         self.addCleanup(setattr, PS, "DB_PATH", self.old_db)
+        # provenance 需要 immutable strategy versions：建一个隔离的账本库，
+        # 显式指定给 paper_selection（绝不猜路径）。
+        self.registry_db = os.path.join(self.tmp.name, "paper_trading.sqlite3")
+        self.old_registry = PS.REGISTRY_DB_PATH
+        PS.REGISTRY_DB_PATH = self.registry_db
+        self.addCleanup(setattr, PS, "REGISTRY_DB_PATH", self.old_registry)
+        import strategy_registry as SR
+        conn = sqlite3.connect(self.registry_db)
+        try:
+            SR.ensure_schema(conn)
+            conn.commit()
+        finally:
+            conn.close()
         self.calls = []
 
         def fake_run(model_id, topn):

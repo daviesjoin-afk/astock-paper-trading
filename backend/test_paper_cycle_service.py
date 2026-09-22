@@ -122,10 +122,12 @@ class CycleSnapshotTests(_DbCase):
 class ArchiveCycleTests(_DbCase):
     def _archive(self):
         stamp = SR.stamp_for_account(self.conn, "tq_breakout")
+        # v23：新的 signal 必须带真实 cycle 归属（与 v18 的订单 guard 同源）。
         self.conn.execute(
             "INSERT INTO paper_signals(account_id,signal_date,intended_date,code,payload,status,created_at,"
-            "strategy_id,strategy_version,strategy_checksum) VALUES(?,?,?,?,?,?,?,?,?,?)",
-            ("tq_breakout", "2026-09-11", "2026-09-12", "600901", "{}", "pending", PCS.now()) + stamp,
+            "strategy_id,strategy_version,strategy_checksum,cycle_id) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+            ("tq_breakout", "2026-09-11", "2026-09-12", "600901", "{}", "pending", PCS.now())
+            + stamp + (self.cycle["id"],),
         )
         self.conn.commit()
         return PCS.archive_cycle(self.conn, self.cycle, "单元测试归档")

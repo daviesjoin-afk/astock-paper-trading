@@ -102,13 +102,18 @@ class OrderIntentContractTests(unittest.TestCase):
             " FROM paper_strategy_legacy_bindings WHERE account_id=?", (strategy_id,),
         ).fetchone()
         signal = self._signal(qty=500)
+        # v23：signal 的周期归属是写入时刻的事实，必须显式给出真实 cycle。
+        self.conn.execute(
+            "INSERT OR IGNORE INTO paper_cycles(id,cycle_key,status,capital,risk_profile,"
+            "created_at,updated_at) VALUES(1,'intent-cycle','running',300000.0,"
+            "'shared_pool',datetime('now'),datetime('now'))")
         signal["id"] = self.conn.execute(
             "INSERT INTO paper_signals(account_id,code,signal_date,intended_date,status,payload,reason,"
-            "strategy_id,strategy_version,strategy_checksum,created_at)"
-            " VALUES(?,?,?,?,?,?,?,?,?,?,datetime('now'))",
+            "strategy_id,strategy_version,strategy_checksum,created_at,cycle_id)"
+            " VALUES(?,?,?,?,?,?,?,?,?,?,datetime('now'),?)",
             (strategy_id, "600000", PT._date().isoformat(), PT._date().isoformat(),
              "pending", signal["payload"], "", stamp["strategy_id"],
-             stamp["strategy_version"], stamp["strategy_checksum"]),
+             stamp["strategy_version"], stamp["strategy_checksum"], 1),
         ).lastrowid
         intent, reject = PT._enforce_order_intent(
             self.conn, {"id": strategy_id}, "600000",

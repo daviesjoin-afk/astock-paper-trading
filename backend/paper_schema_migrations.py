@@ -778,6 +778,66 @@ def _ensure_strategy_reference_guards(conn):
         )
 
 
+def ensure_signal_cycle_provenance(conn):
+    """v23：信号的**不可变周期归属**（write-time fact，绝不回填历史）。
+
+    给 ``paper_signals`` 与 ``paper_signals_archive`` 同时、同位置加上 ``cycle_id``：
+    retention 仍用 ``INSERT OR IGNORE INTO paper_signals_archive SELECT * FROM
+    paper_signals`` 整行拷贝，所以两张表的列数与顺序必须严格一致，否则整行拷贝会错位。
+
+    为什么 signal 需要自己的周期归属：``paper_orders.cycle_id`` 只覆盖「已经下单」
+    的 signal。被 blocked / pending / 从未成交的 signal 根本没有 order，于是
+    「这条 signal 属于哪个 cycle」无处可查 —— 只能靠 ``paper_accounts.cycle_id``
+    这一**可变**重绑定去猜，而它在新建周期时会被改写。
+
+    本函数只做两件事：``ALTER TABLE ... ADD COLUMN`` 与 guard 安装。**绝不**给历史行
+    回填 ``cycle_id`` —— 升级前的 signal 属于哪个周期无法从任何**当前**状态反推，
+    ``cycle_id IS NULL`` 正是诚实的 legacy provenance 状态。
+
+    Guard 语义：
+
+    * ``paper_signals`` BEFORE INSERT —— account-scoped signal 必须带真实存在的
+      ``cycle_id``；trigger 不回扫旧行，因此历史 NULL 行不受影响。
+    * 两张表 BEFORE UPDATE OF cycle_id —— 一经写入不得更改，``NULL -> 8`` 同样被阻止。
+    * ``paper_signals_archive`` **不装** INSERT guard —— 历史 NULL 行仍会经
+      ``SELECT *`` 进入归档表，legacy NULL 必须允许归档。
+    """
+    definitions = {"cycle_id": "INTEGER"}
+    changes = {}
+    for table in ("paper_signals", "paper_signals_archive"):
+        changes[table] = ensure_columns(conn, table, definitions)
+    _ensure_signal_cycle_provenance_guards(conn)
+    return changes
+
+
+def _ensure_signal_cycle_provenance_guards(conn):
+    """Reject new signals without a durable cycle, and freeze it once written."""
+    has_cycles = bool(table_columns(conn, "paper_cycles"))
+    if has_cycles and "cycle_id" in table_columns(conn, "paper_signals"):
+        conn.execute("DROP TRIGGER IF EXISTS trg_paper_signals_cycle_provenance_insert")
+        conn.execute(
+            """CREATE TRIGGER trg_paper_signals_cycle_provenance_insert
+                BEFORE INSERT ON paper_signals
+                WHEN NEW.account_id IS NOT NULL AND (
+                    NEW.cycle_id IS NULL
+                    OR NOT EXISTS (
+                        SELECT 1 FROM paper_cycles c WHERE c.id=NEW.cycle_id
+                    )
+                )
+                BEGIN SELECT RAISE(ABORT, 'invalid signal cycle provenance'); END"""
+        )
+    for table in ("paper_signals", "paper_signals_archive"):
+        if "cycle_id" not in table_columns(conn, table):
+            continue
+        conn.execute(f"DROP TRIGGER IF EXISTS trg_{table}_cycle_provenance_immutable")
+        conn.execute(
+            f"""CREATE TRIGGER trg_{table}_cycle_provenance_immutable
+                BEFORE UPDATE OF cycle_id ON {table}
+                WHEN NEW.cycle_id IS NOT OLD.cycle_id
+                BEGIN SELECT RAISE(ABORT, 'signal cycle provenance is immutable'); END"""
+        )
+
+
 def ensure_runtime_lease_columns(conn):
     """补齐调度租约/fencing 字段，并规范旧时间分隔符。"""
     migrations = {

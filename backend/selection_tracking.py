@@ -4,13 +4,20 @@
 ????????????????????????????????????
 ??????????????????????????????300?????
 """
+from __future__ import annotations
+
 import datetime as dt
 import json
 import os
 import sqlite3
+import sys
 from collections import defaultdict
+from contextlib import closing
 
 import data_fetcher as dfc
+import strategy_registry as SR
+import strategy_selection_provenance as SP
+import strategy_selection_resolver as SRES
 
 DB_PATH = os.path.join(dfc.CACHE_DIR, "selection_tracking.db")
 BENCHMARK_CODE = "BENCH_000300"
@@ -18,6 +25,10 @@ BENCHMARK_NAME = "CSI 300"
 HORIZONS = (1, 3, 5, 10, 20)
 MAX_TRACKING_DAYS = 20
 CHINA_TZ = dt.timezone(dt.timedelta(hours=8))
+#: Immutable strategy versions live in the ledger registry, not in this research
+#: DB. Explicit override first (tests / offline replay must set it — never guess a
+#: path from "the newest .sqlite3").
+REGISTRY_DB_PATH: str | None = None
 # PR-8：``holding_days`` 记录的是"已成功记录的收盘观测次数"，不是经交易所日历
 # 认证的交易日数。字段名保留（兼容旧 API / 旧库），但语义必须显式声明。
 HOLDING_DAY_SEMANTICS = "recorded_close_observation_count"
@@ -37,7 +48,12 @@ def _connect():
 
 def ensure_schema():
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
-    with _connect() as conn:
+    conn = _connect()
+    try:
+        # 重建父表前必须先关外键：``selection_picks.run_id`` 有 ON DELETE
+        # CASCADE，重建途中删除父表会连带销毁全部 picks / observations
+        # （前向验证样本不可再生）。PRAGMA 必须在任何 DML 之前生效。
+        conn.execute("PRAGMA foreign_keys = OFF")
         conn.executescript(
             """
             CREATE TABLE IF NOT EXISTS selection_runs (
@@ -54,7 +70,18 @@ def ensure_schema():
                 executable_count INTEGER,
                 source TEXT NOT NULL,
                 result_json TEXT NOT NULL,
-                UNIQUE(run_date, strategy)
+                -- R23 run 级 provenance：strategy_* 在本系列诚实地保持 NULL
+                -- （``strategy`` 是模型族 id，注册表里不存在），状态为
+                -- ``not_applicable``；asof/scope 则必须固定下来。
+                provenance_status TEXT,
+                provenance_key TEXT,
+                asof_day TEXT,
+                scope TEXT,
+                cycle_id INTEGER,
+                strategy_id TEXT,
+                strategy_version INTEGER,
+                strategy_checksum TEXT,
+                UNIQUE(run_date, strategy, provenance_key)
             );
             CREATE TABLE IF NOT EXISTS selection_picks (
                 id INTEGER PRIMARY KEY,
@@ -89,6 +116,155 @@ def ensure_schema():
                 ON selection_observations(pick_id, observed_date DESC);
             """
         )
+        _migrate_runs(conn)
+        conn.execute("PRAGMA foreign_keys = ON")
+        _ensure_provenance_guards(conn)
+        conn.executescript(
+            """
+            CREATE INDEX IF NOT EXISTS idx_selection_runs_key
+                ON selection_runs(run_date, strategy, provenance_key);
+            """
+        )
+    finally:
+        conn.close()
+
+
+#: 升级前的 run 表结构，按**列名**拷贝（绝不按位置），列错位在整行拷贝里是灾难。
+LEGACY_RUN_COLUMNS = (
+    "id", "run_date", "generated_at", "strategy", "strategy_name", "data_asof_date",
+    "benchmark_entry_price", "universe_size", "candidate_count", "selected_count",
+    "executable_count", "source", "result_json",
+)
+
+#: 历史行（升级前只留下模型族 id）的身份前缀。
+LEGACY_KEY_PREFIX = "legacy"
+
+
+def _table_exists(conn, table) -> bool:
+    return conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)
+    ).fetchone() is not None
+
+
+def _columns(conn, table) -> list[str]:
+    return [str(row[1]) for row in conn.execute(f"PRAGMA table_info({table})")]
+
+
+def _unique_index_columns(conn, table) -> set[tuple[str, ...]]:
+    found: set[tuple[str, ...]] = set()
+    for row in conn.execute(f"PRAGMA index_list({table})"):
+        if not row[2]:
+            continue
+        found.add(tuple(str(info[2]) for info in
+                        conn.execute(f"PRAGMA index_info({row[1]})")))
+    return found
+
+
+def _migrate_runs(conn) -> None:
+    """Rebuild a pre-R23 run table into the provenance-keyed shape (idempotent).
+
+    迁移策略（规格 §9 / §8）：只**新增** NULL provenance 列并标
+    ``provenance_status='legacy_unproven'``；唯一契约从 ``(run_date, strategy)``
+    改为 ``(run_date, strategy, provenance_key)`` —— 约束本身是错的，只 ADD
+    COLUMN 会让「同日同策略、不同 as-of」继续互相覆盖，所以必须重建。
+    **绝不**用今天的 Registry / generation 时间回填历史 provenance。
+
+    崩溃安全：沿用 SQLite 官方重建顺序（新表 → 拷贝 → 删旧 → 改名），并且在
+    外键关闭时进行，绝不让 ``ON DELETE CASCADE`` 把 picks/observations 带走。
+    """
+    legacy = "selection_runs_legacy"
+    if _table_exists(conn, legacy):
+        conn.execute("DROP TABLE " + legacy)
+    columns = _columns(conn, "selection_runs")
+    unique = _unique_index_columns(conn, "selection_runs")
+    if "provenance_key" in columns and ("run_date", "strategy", "provenance_key") in unique:
+        return
+    present = [name for name in LEGACY_RUN_COLUMNS if name in columns]
+    select_legacy = ", ".join(present)
+    columns_sql = ", ".join(present + [
+        "provenance_status", "provenance_key", "asof_day", "scope", "cycle_id",
+        "strategy_id", "strategy_version", "strategy_checksum",
+    ])
+    conn.executescript(
+        f"""
+        ALTER TABLE selection_runs RENAME TO {legacy};
+        CREATE TABLE selection_runs (
+            id INTEGER PRIMARY KEY,
+            run_date TEXT NOT NULL,
+            generated_at TEXT NOT NULL,
+            strategy TEXT NOT NULL,
+            strategy_name TEXT NOT NULL,
+            data_asof_date TEXT,
+            benchmark_entry_price REAL,
+            universe_size INTEGER,
+            candidate_count INTEGER,
+            selected_count INTEGER,
+            executable_count INTEGER,
+            source TEXT NOT NULL,
+            result_json TEXT NOT NULL,
+            provenance_status TEXT,
+            provenance_key TEXT,
+            asof_day TEXT,
+            scope TEXT,
+            cycle_id INTEGER,
+            strategy_id TEXT,
+            strategy_version INTEGER,
+            strategy_checksum TEXT,
+            UNIQUE(run_date, strategy, provenance_key)
+        );
+        INSERT INTO selection_runs({columns_sql})
+        SELECT {select_legacy}, '{SP.STATUS_LEGACY_UNPROVEN}',
+               '{LEGACY_KEY_PREFIX}|' || run_date || '|' || strategy,
+               data_asof_date, '{SP.SCOPE_RESEARCH}', NULL, NULL, NULL, NULL
+        FROM {legacy};
+        DROP TABLE {legacy};
+        """
+    )
+
+
+def _ensure_provenance_guards(conn) -> None:
+    """Provenance 是 write-time、immutable 的事实（DDL 层兜底，规格 §9/§16）。
+
+    * INSERT —— 拒绝未声明状态、拒绝「声称 verified 却没有 version/checksum」、
+      拒绝 cycle scope 缺 cycle_id、拒绝 research scope 携带 cycle_id；
+    * UPDATE —— 一经写入不得更改（``NULL -> 值`` 同样被阻止），否则任何 repair
+      脚本都能把 legacy ``unknown`` 洗白成 ``verified``。
+    """
+    guards = {
+        "trg_selection_runs_provenance_insert": f"""
+            CREATE TRIGGER trg_selection_runs_provenance_insert
+            BEFORE INSERT ON selection_runs
+            WHEN (NEW.provenance_status IS NOT NULL
+                  AND NEW.provenance_status NOT IN
+                      ('{SP.STATUS_VERIFIED}','{SP.STATUS_UNKNOWN}',
+                       '{SP.STATUS_LEGACY_UNPROVEN}','{SP.STATUS_NOT_APPLICABLE}'))
+              OR (NEW.provenance_status = '{SP.STATUS_VERIFIED}' AND (
+                     NEW.strategy_id IS NULL OR NEW.strategy_version IS NULL
+                  OR NEW.strategy_checksum IS NULL OR NEW.asof_day IS NULL
+                  OR NEW.scope IS NULL))
+              OR (NEW.scope = '{SP.SCOPE_CYCLE}' AND NEW.cycle_id IS NULL)
+              OR (NEW.scope = '{SP.SCOPE_RESEARCH}' AND NEW.cycle_id IS NOT NULL)
+            BEGIN SELECT RAISE(ABORT, 'invalid selection run provenance'); END
+        """,
+        "trg_selection_runs_provenance_immutable": """
+            CREATE TRIGGER trg_selection_runs_provenance_immutable
+            BEFORE UPDATE OF provenance_status,provenance_key,asof_day,scope,cycle_id,
+                             strategy_id,strategy_version,strategy_checksum
+            ON selection_runs
+            WHEN NEW.provenance_status IS NOT OLD.provenance_status
+              OR NEW.provenance_key IS NOT OLD.provenance_key
+              OR NEW.asof_day IS NOT OLD.asof_day
+              OR NEW.scope IS NOT OLD.scope
+              OR NEW.cycle_id IS NOT OLD.cycle_id
+              OR NEW.strategy_id IS NOT OLD.strategy_id
+              OR NEW.strategy_version IS NOT OLD.strategy_version
+              OR NEW.strategy_checksum IS NOT OLD.strategy_checksum
+            BEGIN SELECT RAISE(ABORT, 'selection run provenance is immutable'); END
+        """,
+    }
+    for name, ddl in guards.items():
+        conn.execute(f"DROP TRIGGER IF EXISTS {name}")
+        conn.execute(ddl)
 
 
 def _number(value):
@@ -150,11 +326,26 @@ def refresh_benchmark():
     return True
 
 
-def record_run(result, run_date=None, source="scheduled"):
+def record_run(result, run_date=None, source="scheduled", *, asof_day=None):
     """Persist one immutable candidate snapshot per strategy and trading date.
 
-    A same-day retry replaces only that strategy's unfinished snapshot, keeping
-    the schedule idempotent while preserving all older research evidence.
+    Provenance（R23）：
+
+    * run 的**身份**是 ``(run_date, strategy, provenance_key)``。同一个
+      provenance key 的重试是幂等覆盖；不同的 as-of / 不同 scope 是**另一份
+      证据**，绝不互相覆盖；
+    * 本系列的 ``strategy`` 是**模型族 id**（``three_day`` / ``five_day`` /
+      ``ten_day`` …），注册表里不存在这些 id，所以策略版本轴诚实地记为
+      ``provenance_status='not_applicable'``、``strategy_*`` 保持 NULL ——
+      **绝不**为了字段齐整而编造一个 strategy_id；
+    * ``asof_day`` 由 caller 显式传入，或从结果里唯一可证明的因子日解析；无法唯一
+      确定时 ``provenance_status='unknown'``，**不**退回 today / 最新行情日；
+    * ``scope`` 永远是 ``research``、``cycle_id`` 永远是 NULL —— 研究 run 不属于
+      任何 paper cycle，本模块从不解析 active cycle。
+
+    历史 ``run_date`` 的不可变性在**写入之前**判定：过去的快照不接受任何改写
+    （对它的 upsert 会删除既有 picks，FK ``ON DELETE CASCADE`` 进而销毁全部
+    observations，``holding_days`` 等前向验证指标将被永久破坏）。
     """
     ensure_schema()
     strategy = str(result.get("strategy") or "")
@@ -166,15 +357,33 @@ def record_run(result, run_date=None, source="scheduled"):
     bench_entry = _benchmark_price_on_or_before(dt.date.fromisoformat(day))
     generated_at = dt.datetime.now(CHINA_TZ).isoformat(timespec="seconds")
     safe_result = _json_safe(result)
+    provenance = _run_provenance(result, strategy, asof_day=asof_day,
+                                 data_asof=data_asof)
     with _connect() as conn:
+        existing = conn.execute(
+            "SELECT id FROM selection_runs WHERE run_date=? AND strategy=?",
+            (day, strategy),
+        ).fetchone()
+        if existing is not None and str(day) < _today().isoformat():
+            # 历史日期的快照不可变 —— 必须在任何写之前收敛，否则就是
+            # "先覆盖、再声明跳过"（R23 之前正是这个顺序：upsert 已经改了行，
+            # 才发现日期是过去，于是返回 skipped，而证据已经变了）。
+            return {
+                "status": "skipped", "reason": "historical run_date is immutable",
+                "run_date": day, "strategy": strategy, "run_id": existing["id"],
+                "provenance_status": provenance["provenance_status"],
+                "provenance_key": provenance["provenance_key"],
+            }
         conn.execute(
             """
             INSERT INTO selection_runs(
                 run_date, generated_at, strategy, strategy_name, data_asof_date,
                 benchmark_entry_price, universe_size, candidate_count, selected_count,
-                executable_count, source, result_json
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(run_date, strategy) DO UPDATE SET
+                executable_count, source, result_json,
+                provenance_status, provenance_key, asof_day, scope, cycle_id,
+                strategy_id, strategy_version, strategy_checksum
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(run_date, strategy, provenance_key) DO UPDATE SET
                 generated_at=excluded.generated_at,
                 strategy_name=excluded.strategy_name,
                 data_asof_date=excluded.data_asof_date,
@@ -191,19 +400,16 @@ def record_run(result, run_date=None, source="scheduled"):
                 data_asof, bench_entry, result.get("universe_size"),
                 result.get("candidate_count"), len(picks), result.get("executable_count"),
                 source, json.dumps(safe_result, ensure_ascii=False, separators=(",", ":")),
+                provenance["provenance_status"], provenance["provenance_key"],
+                provenance["asof_day"], SP.SCOPE_RESEARCH, None,
+                provenance["strategy_id"], provenance["strategy_version"],
+                provenance["strategy_checksum"],
             ),
         )
         run = conn.execute(
-            "SELECT id FROM selection_runs WHERE run_date=? AND strategy=?", (day, strategy)
+            "SELECT id FROM selection_runs WHERE run_date=? AND strategy=? AND "
+            "provenance_key IS ?", (day, strategy, provenance["provenance_key"]),
         ).fetchone()
-        if run is not None and str(day) < _today().isoformat():
-            # 历史日期的快照视为不可变：对过去 run_date 的 upsert 会删除
-            # 既有 picks，FK ON DELETE CASCADE 进而销毁全部 observations，
-            # holding_days 等前向验证指标将被永久破坏。同日重试不受影响。
-            return {
-                "status": "skipped", "reason": "historical run_date is immutable",
-                "run_date": day, "strategy": strategy, "run_id": run["id"],
-            }
         conn.execute("DELETE FROM selection_picks WHERE run_id=?", (run["id"],))
         for rank, pick in enumerate(picks, 1):
             decision = pick.get("buy_decision") or {}
@@ -222,6 +428,98 @@ def record_run(result, run_date=None, source="scheduled"):
                 ),
             )
     return {"date": day, "strategy": strategy, "saved": len(picks), "data_asof_date": data_asof}
+
+
+def _run_provenance(result, strategy, *, asof_day=None, data_asof=None) -> dict:
+    """Pin one research run's as-of and record the honest strategy-axis verdict.
+
+    ``strategy`` here is a **model family**, not a registered strategy id, so the
+    version axis is ``not_applicable`` and ``strategy_*`` stays NULL. The
+    question "which immutable version produced this?" therefore has a truthful
+    answer: "this run is not strategy-versioned" — rather than a fabricated id.
+
+    If a *registered* strategy id is ever passed (a future caller wiring family B
+    to the registry), the version is resolved once through the shared resolver as
+    a research pin — never by re-implementing version lookup here.
+    """
+    declared = SP.declared_asof_candidates(result)
+    if not any(label == "data_quality.complete_cutoff" for label, _ in declared) and data_asof:
+        # ``data_asof_date`` 是本模块自己推导的因子截止日：它同样是「决策所基于
+        # 的因子快照」的候选，且与 pick 上的逐条日期互相印证。
+        declared = list(declared) + [("data_asof", data_asof)]
+    try:
+        asof = SP.resolve_asof_day(asof_day, declared)
+    except SP.AsOfUnprovable as exc:
+        return {
+            "provenance_status": SP.STATUS_UNKNOWN,
+            "provenance_key": SP.run_provenance_key(
+                scope=SP.SCOPE_RESEARCH, subject=str(strategy), asof_day=None,
+            ),
+            "asof_day": None,
+            "strategy_id": None,
+            "strategy_version": None,
+            "strategy_checksum": None,
+            "provenance_detail": str(exc),
+        }
+    registered = _registered_strategy_ids()
+    if str(strategy) in registered:
+        with closing(_registry_conn()) as registry:
+            reading = SRES.research_provenance(registry, str(strategy), asof_day=asof)
+        provenance = reading.provenance
+        return {
+            "provenance_status": reading.status,
+            "provenance_key": SP.run_provenance_key(
+                scope=SP.SCOPE_RESEARCH, subject=str(strategy), asof_day=asof,
+                strategy_version=(provenance.strategy_version if provenance else None),
+                strategy_checksum=(provenance.strategy_checksum if provenance else None),
+            ),
+            "asof_day": asof,
+            "strategy_id": str(strategy),
+            "strategy_version": provenance.strategy_version if provenance else None,
+            "strategy_checksum": provenance.strategy_checksum if provenance else None,
+            "provenance_detail": reading.detail,
+        }
+    return {
+        "provenance_status": SP.STATUS_NOT_APPLICABLE,
+        "provenance_key": SP.run_provenance_key(
+            scope=SP.SCOPE_RESEARCH, subject=str(strategy), asof_day=asof,
+            strategy_version=None, strategy_checksum=None,
+        ),
+        "asof_day": asof,
+        "strategy_id": None,
+        "strategy_version": None,
+        "strategy_checksum": None,
+        "provenance_detail": (
+            f"{strategy!r} is a model family, not a registered strategy id"
+        ),
+    }
+
+
+def _registered_strategy_ids() -> frozenset[str]:
+    """Current registry ids — used *only* to decide applicability, never to fill."""
+    try:
+        return frozenset(SR.active_ids(db_path=_registry_db_path())) | frozenset(
+            spec.id for spec in SR.list_definitions(db_path=_registry_db_path()))
+    except Exception:
+        return frozenset()
+
+
+def _registry_db_path() -> str:
+    """Immutable versions live in the ledger registry, not the research DB."""
+    if REGISTRY_DB_PATH:
+        return str(REGISTRY_DB_PATH)
+    module = sys.modules.get("paper_trading")
+    path = getattr(module, "DB_PATH", None) if module is not None else None
+    if path:
+        return str(path)
+    import data_paths
+    return data_paths.data_path("paper_trading.sqlite3")
+
+
+def _registry_conn() -> sqlite3.Connection:
+    conn = sqlite3.connect(f"file:{_registry_db_path()}?mode=ro", uri=True, timeout=20)
+    conn.row_factory = sqlite3.Row
+    return conn
 
 
 def _latest_snapshot_prices():

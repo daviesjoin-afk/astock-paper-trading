@@ -62,7 +62,13 @@ class DbMigrateTests(unittest.TestCase):
                 conn.close()
 
 
-    def test_v21_to_v22_refreshes_narrow_strategy_stamp_guard(self):
+    def test_v21_to_latest_refreshes_narrow_strategy_stamp_guard(self):
+        """v21 → 最新：R21 的收窄 guard 必须被重新安装（存量库也要拿到新定义）。
+
+        断言的是「迁移链跑到**当前** head」而不是某个写死的版本号 —— 但 v22 的
+        收窄行为与 v23 之后的 head 都不是本用例的被测对象，所以只用 ``>= 22``
+        锁住「v22 已应用」，避免每次新增迁移都要改这里。
+        """
         with tempfile.TemporaryDirectory() as directory:
             path = os.path.join(directory, "paper.sqlite3")
             bootstrap = sqlite3.connect(path)
@@ -172,11 +178,15 @@ class DbMigrateTests(unittest.TestCase):
 
             conn = sqlite3.connect(path)
             try:
+                applied = conn.execute(
+                    "SELECT version FROM schema_version WHERE db_name='paper_trading'"
+                ).fetchone()[0]
+                self.assertGreaterEqual(applied, 22, "v22 的收窄 guard 未被应用")
                 self.assertEqual(
-                    conn.execute(
-                        "SELECT version FROM schema_version WHERE db_name='paper_trading'"
-                    ).fetchone()[0],
-                    22,
+                    applied,
+                    max(version for version, _desc, _op
+                        in db_migrate.MIGRATIONS["paper_trading"]),
+                    "迁移链没有跑到当前 head",
                 )
 
                 def try_insert(sql, params=()):

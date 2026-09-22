@@ -288,6 +288,14 @@ MIGRATIONS = {
         # 仅刷新 guard，不回填任何历史 evidence。
         (22, "收紧策略版本戳 unknown 例外，仅允许保护性 SELL（幂等、不回填）",
          _tighten_strategy_reference_unknown_guards),
+        # 信号的不可变周期归属：给 paper_signals / paper_signals_archive 同位置加
+        # cycle_id 并安装 guard（新 signal 必须带真实 cycle、写入后不可更改）。
+        # **绝不回填历史行**：升级前的 signal 属于哪个周期无法从当前状态反推
+        # （paper_accounts.cycle_id 是可变重绑定），cycle_id IS NULL 就是诚实的
+        # legacy provenance 状态。这补上了 signal→order 之外那部分归属空白：
+        # blocked / pending / 从未成交的 signal 没有任何 order 可借。
+        (23, "新增信号的不可变周期归属字段 cycle_id（幂等，不回填）",
+         paper_schema.ensure_signal_cycle_provenance),
     ],
     "adaptive_learning": [
         (1, "创建 schema_version 表", """

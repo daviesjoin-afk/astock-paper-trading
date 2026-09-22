@@ -487,14 +487,36 @@ class RetryLineageHardConstraint(_LedgerCase):
     """
 
     def _terminal_parent(self, *, cycle_id, signal_id=9001):
+        """写一条种子 signal + 一条终态父委托。
+
+        ``cycle_id=None`` 表示 **legacy**（升级前创建的行）。与 :meth:`add_order`
+        同理：legacy shape **无法**经 v18/v23 的 INSERT guard 写入 —— 那正是 guard
+        的职责。要构造历史形状，必须暂时卸下 guard 再装回去。这不是绕过被测行为：
+        被测的是成交/血缘阶段**读取** legacy 行时的语义，而不是 guard 本身。
+        """
+        import paper_schema_migrations as PSM
         stamp = PT._strategy_stamp(self.conn, ACCOUNT)
-        self.conn.execute(
-            "INSERT INTO paper_signals(id,account_id,code,intended_date,signal_date,"
-            "status,reason,payload,created_at,strategy_id,strategy_version,"
-            "strategy_checksum) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
-            (signal_id, ACCOUNT, CODE, "2026-09-05", "2026-09-05", "deferred_capacity",
-             "种子信号", "{}", "2026-09-05 09:30:00", *stamp),
-        )
+        if cycle_id is None:
+            self.conn.execute(
+                "DROP TRIGGER IF EXISTS trg_paper_signals_cycle_provenance_insert")
+            try:
+                self.conn.execute(
+                    "INSERT INTO paper_signals(id,account_id,code,intended_date,signal_date,"
+                    "status,reason,payload,created_at,strategy_id,strategy_version,"
+                    "strategy_checksum,cycle_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,NULL)",
+                    (signal_id, ACCOUNT, CODE, "2026-09-05", "2026-09-05", "deferred_capacity",
+                     "种子信号", "{}", "2026-09-05 09:30:00", *stamp),
+                )
+            finally:
+                PSM._ensure_signal_cycle_provenance_guards(self.conn)
+        else:
+            self.conn.execute(
+                "INSERT INTO paper_signals(id,account_id,code,intended_date,signal_date,"
+                "status,reason,payload,created_at,strategy_id,strategy_version,"
+                "strategy_checksum,cycle_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (signal_id, ACCOUNT, CODE, "2026-09-05", "2026-09-05", "deferred_capacity",
+                 "种子信号", "{}", "2026-09-05 09:30:00", *stamp, cycle_id),
+            )
         cur = self.conn.execute(
             "INSERT INTO paper_orders(account_id,signal_id,side,code,name,qty,status,"
             "reason,risk_payload,created_at,strategy_id,strategy_version,"
