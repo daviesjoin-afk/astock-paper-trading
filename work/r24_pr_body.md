@@ -342,7 +342,7 @@ timeout 主导**——本轮从 13.8s 降到 0.10s，且 read path 在无缓存�
 PR:    #182（https://github.com/daviesjoin-afk/astock-paper-trading/pull/182）
 
 BASE:  2afcbecad0ee7966130d41b30711bbc5ebc38660
-HEAD:  45e6763f83b91618940b6302ad17e6fa3068afb0（R24 代码提交；exact-head CI 已在该
+HEAD:  cf8226196d5572e2540cc366d3c0a3a8c08104be（含复审修正；exact-head CI 已在该
        SHA 上全绿 —— 9/9 checks。其后如出现**仅改 work/*.md** 的 docs 提交，
        不改变被验证的代码内容）
 MASTER: 2afcbecad0ee7966130d41b30711bbc5ebc38660
@@ -395,7 +395,9 @@ paper-runtime repeated: 5/5 clean
 full browser: 32/32, flaky=0, retry=0
 security worktree: PASS
 security all: PASS
-exact-head CI: PASS（9/9 checks，head 45e6763f83b91618940b6302ad17e6fa3068afb0）
+exact-head CI: PASS（9/9 checks，head cf8226196d5572e2540cc366d3c0a3a8c08104be；
+               CI Python 3.12 实际 4060 tests OK skipped=1，
+               browser-e2e 32/32、1 worker、0 retry / 0 flaky）
 
 ARCHITECTURE / MAINTAINABILITY
 
