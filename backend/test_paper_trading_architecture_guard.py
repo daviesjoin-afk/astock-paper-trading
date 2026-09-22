@@ -48,6 +48,7 @@ DOMAIN_MODULES = (
     "paper_position_risk_state.py",
     "paper_position_read_model.py",
     "paper_portfolio.py",
+    "paper_portfolio_read_model.py",
     "paper_cycle_service.py",
     "paper_capital_reservations.py",
     "paper_cycle_capital.py",
@@ -557,15 +558,21 @@ class RiskScanStateIsACycleOwnedBoundary(unittest.TestCase):
     def test_guard7h_scan_snapshot_is_pinned_to_the_claimed_cycle(self):
         """风险扫描的持仓读取必须走显式周期，不能重新猜 active cycle。"""
         raw = _source("paper_risk_service.py")
-        impl = _function_source(ast.parse(raw), "run", raw)
+        tree = ast.parse(raw)
+        impl = _function_source(tree, "run", raw)
+        scope = _function_source(tree, "_bounded_risk_scope", raw)
         self.assertIn(
-            "PPRM.positions_for_cycle(", impl,
-            "_monitor_risk_impl 不再用显式周期读持仓：一次从旧周期开始的扫描会"
-            "重新问'现在 active 的是谁'，从而操作新周期",
+            "_bounded_risk_scope(", impl,
+            "risk service 不再通过显式 cycle/as-of bounded scope 读取持仓",
+        )
+        self.assertIn(
+            "PPort.risk_positions_for_context(", scope,
+            "risk service 不再用显式 cycle/as-of bounded reader：一次从旧周期开始的"
+            "扫描会重新问'现在 active 的是谁'，从而操作新周期",
         )
         self.assertNotIn(
-            "_position_rows(", impl,
-            "_monitor_risk_impl 又回落到 current-cycle 持仓读取",
+            "PPRM.positions_for_cycle(", scope,
+            "risk service 又回落到 current remaining_qty 读取",
         )
         self.assertIn(
             "PRSS.assert_cycle_active(", impl,
@@ -1644,6 +1651,50 @@ class RiskApplicationServiceBoundary(unittest.TestCase):
         loc = len(_source(self.SERVICE).splitlines())
         self.assertLess(loc, 900, f"paper_risk_service.py grew to {loc} LOC")
 
+
+class PortfolioReadModelIsCycleAsOfBounded(unittest.TestCase):
+    """Guard 13 —— portfolio read model 必须只读、显式上下文、无 current 回退。"""
+
+    MODULE = "paper_portfolio_read_model.py"
+
+    def test_guard13a_no_reverse_dependency(self):
+        self.assertNotIn("paper_trading", _imported_roots(_tree(self.MODULE)))
+
+    def test_guard13b_read_model_has_no_execution_mutation(self):
+        tree = _tree(self.MODULE)
+        sql = "\n".join(_code_string_constants(tree)).upper()
+        for forbidden in ("INSERT INTO", "UPDATE ", "DELETE FROM", "CREATE TABLE", "ALTER TABLE", "DROP TABLE"):
+            self.assertNotIn(forbidden, sql, f"read model 出现写语句：{forbidden}")
+        calls = _call_names(tree)
+        self.assertFalse(calls & {"commit", "rollback", "executescript", "executemany"})
+
+    def test_guard13c_no_active_cycle_or_wall_clock(self):
+        body = _module_body(self.MODULE)
+        for forbidden in ("active_cycle", "current_cycle", "latest_cycle",
+                          "date.today", "datetime.now", "datetime.utcnow"):
+            self.assertNotIn(forbidden, body, f"read model 回退 current/wall-clock：{forbidden}")
+
+    def test_guard13d_historical_entrypoint_requires_explicit_context(self):
+        raw = _source(self.MODULE)
+        body = _function_source(_tree(self.MODULE), "portfolio_for_cycle", raw)
+        self.assertIn("PortfolioReadContext(cycle_id=cycle_id, asof_day=asof_day)", body)
+
+    def test_guard13e_shared_exposure_accepts_explicit_cycle(self):
+        body = _function_source(_tree("paper_trading.py"),
+                                "_shared_account_exposure", _source("paper_trading.py"))
+        self.assertIn("cycle_id=None", body)
+        self.assertIn("PPRM.positions_for_cycle", body)
+
+    def test_guard13f_risk_service_passes_cycle_to_shared_exposure(self):
+        service = _source("paper_risk_service.py")
+        self.assertIn("ports.shared_exposure(", service)
+        self.assertIn("cycle_id=cycle_id", service)
+
+    def test_guard13g_no_schema_change(self):
+        body = _module_body(self.MODULE).upper()
+        self.assertNotIn("CREATE TABLE", body)
+        self.assertNotIn("ALTER TABLE", body)
+        self.assertNotIn("DROP TABLE", body)
 
 
 def _function_node(tree, name):

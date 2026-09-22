@@ -63,6 +63,7 @@ class _RiskServiceCase(PRS._ProductionRiskScanCase):
         PPRS.initialize_episode(
             self.conn, cycle_id=self.cycle, account_id=self.ACCOUNT,
             code=code, peak_price=cost,
+            now=f"{self.day.isoformat()} 10:00:00",
         )
         self.conn.commit()
 
@@ -158,6 +159,7 @@ class _RiskServiceCase(PRS._ProductionRiskScanCase):
         PPRS.initialize_episode(
             self.conn, cycle_id=self.cycle, account_id=account_id,
             code=code, peak_price=cost,
+            now=f"{self.day.isoformat()} 10:00:00",
         )
         self.conn.commit()
 
@@ -648,6 +650,37 @@ class RiskServiceContractTests(_RiskServiceCase):
             self.assertIsNone(row["strategy_version"])
             self.assertIsNone(row["strategy_checksum"])
 
+
+
+    def test_rsvc19_historical_positions_are_not_filtered_by_current_eligibility(self):
+        class _Captured(RuntimeError):
+            pass
+
+        historical_day = self.day - dt.timedelta(days=1)
+        self.add_lot(100, 10.0)
+        with PT._db(immediate=True) as conn:
+            conn.execute(
+                "UPDATE paper_position_lots SET remaining_qty=0"
+                " WHERE cycle_id=? AND account_id=?",
+                (self.cycle, self.ACCOUNT),
+            )
+            conn.execute(
+                "UPDATE paper_accounts SET status='paused' WHERE id=?",
+                (self.ACCOUNT,),
+            )
+        captured = {}
+
+        def capture(**kwargs):
+            captured.update(kwargs)
+            raise _Captured()
+
+        with mock.patch.object(PT, "_risk_load_market_inputs", side_effect=capture):
+            with self.assertRaises(_Captured):
+                PT._monitor_risk_impl(historical_day, cycle_id=self.cycle)
+        self.assertEqual(
+            [row["account_id"] for row in captured["positions"]],
+            [self.ACCOUNT],
+        )
 
 
     def test_rsvc18_post_fill_rotation_audits_inherit_sell_provenance(self):

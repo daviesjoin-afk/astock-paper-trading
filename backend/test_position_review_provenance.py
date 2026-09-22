@@ -319,7 +319,15 @@ class ProductionEpisodeCase(unittest.TestCase):
                 (ACCOUNT, "buy", CODE, "测试股", qty, price, price, qty * price,
                  "2026-09-09 09:30:00", "2026-09-09 09:30:00", *stamp, cycle_id, signal_id),
             )
-            return int(cur.lastrowid)
+            order_id = int(cur.lastrowid)
+            conn.execute(
+                "INSERT INTO paper_fills(order_id,account_id,side,code,qty,price,amount,"
+                "fees,fill_date,quote_at,assumption) "
+                "VALUES(?,?,'buy',?,?,?,?,5.0,?,?,'seed')",
+                (order_id, ACCOUNT, CODE, qty, price, qty * price,
+                 "2026-09-09", "2026-09-09 09:30:00"),
+            )
+            return order_id
 
     def add_lot(self, *, order_id, qty=100, cost=10.0):
         with PT._db(immediate=True) as conn:

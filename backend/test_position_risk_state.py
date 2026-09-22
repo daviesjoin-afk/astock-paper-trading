@@ -929,7 +929,8 @@ class _ProductionRiskScanCase(unittest.TestCase):
         self._inner._insert_lot(self.ACCOUNT, self.code, qty, cost)
         PPRS.initialize_episode(
             self.conn, cycle_id=self.cycle, account_id=self.ACCOUNT,
-            code=self.code, peak_price=cost)
+            code=self.code, peak_price=cost,
+            now=f"{self.day.isoformat()} 10:00:00")
         self.conn.commit()
 
     def state_row(self):

@@ -133,9 +133,9 @@ class PaperRiskExitProductionPathTestCase(unittest.TestCase):
                        account_id, side, code, name, qty, planned_price, filled_price,
                        amount, fees, status, reason, risk_payload, created_at, executed_at,
                        order_type, origin, strategy_id, strategy_version, strategy_checksum,
-                       cycle_id
+                       cycle_id, execution_status, execution_verified
                    ) VALUES (?, 'buy', ?, ?, ?, ?, ?, ?, 5.0, 'filled', 'seed_buy',
-                             '{}', ?, ?, 'market', 'seed', ?, ?, ?, ?)""",
+                             '{}', ?, ?, 'market', 'seed', ?, ?, ?, ?, 'verified', 1)""",
                 (account_id, code, f"测试股_{code}", qty, cost, cost, qty * cost,
                  f"{available_date} 09:30:00", f"{available_date} 09:30:00", *stamp, cycle_id),
             )
@@ -155,10 +155,11 @@ class PaperRiskExitProductionPathTestCase(unittest.TestCase):
             cur = conn.execute(
                 """INSERT INTO paper_position_lots(
                        cycle_id, account_id, code, name, industry, qty, remaining_qty,
-                       cost, acquired_at, available_date, asset_type, cost_fee_included, is_t_base
-                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'stock_t1', 1, 1)""",
+                       cost, acquired_at, available_date, asset_type, cost_fee_included,
+                       is_t_base, source_order_id
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'stock_t1', 1, 1, ?)""",
                 (cycle_id, account_id, code, f"测试股_{code}", "Tech", qty, remaining_qty,
-                 cost, acquired_at, available_date),
+                 cost, acquired_at, available_date, seed_order_id),
             )
             PT._sync_positions(conn, asof_day=self.day)
             return cur.lastrowid
