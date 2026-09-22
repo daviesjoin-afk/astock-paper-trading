@@ -285,8 +285,8 @@ files must not be edited while it runs.
 ## 15. Review round 2 — two provenance correctness blockers, plus a TOCTOU close
 
 Review round 1's fixes stand (F1/F2/F3, commit `2344e70`), and its numbers above are
-superseded by this round's: the matrix grew 18 → **21** and the backend suite
-**3973 → 3999**. Only the blockers were touched — no R24, no market-data changes, no
+superseded by the rounds below: the matrix grew 18 → **21** and the backend suite
+**3973 → 4006**. Only the blockers were touched — no R24, no market-data changes, no
 strategy / risk threshold changes, no candidate scoring or execution-rule changes.
 
 ### 15.1 Signal cycle: mutable re-resolution + a validation→INSERT window
@@ -383,14 +383,14 @@ Evidence-quality fixes to the harness itself:
 | gate | result |
 |---|---|
 | `RV01`-`RV11` production regressions | all green; `RV08` discriminating (immediate GREEN / deferred RED) |
-| targeted provenance + guard modules | **182 tests OK** |
-| full backend suite | **3999 tests OK (skipped=5)** |
+| targeted provenance + guard modules | **374 tests OK** (see §16.4 for the exact module list) |
+| full backend suite | **4006 tests OK** (local isolated clone: `skipped=5`) |
 | serial mutation matrix (21, non-vacuity) | **21/21 CAUGHT; survived=0; fake=0; baseline-red=0; restore sha256 PASS** |
 | M-SP19/20/21 business-failure proof | syntax valid, no wiring error, fails on the contract assertion |
 | Guard 14l-14p non-vacuity | **caught=5/5; survived=0; fake=0; restore sha256 PASS** |
 | anchor audit | **21 anchors, count == 1 each; 0 missing; 0 duplicate** |
-| ruff / compileall | `All checks passed!` / clean |
-| frontend build / unit / browser e2e | build clean (no `dist` diff) / **111 pass, 0 fail** / **32 passed** |
+| ruff / compileall | `All checks passed!` (backend) / clean |
+| frontend build / unit | build clean (no `dist` diff) / **111 pass, 0 fail** |
 | leak scan `--scope worktree` and `--scope all` | `kinds: none; values: 0` |
 
 ### 15.6 Fixture corrections forced by the DB guard
@@ -404,8 +404,143 @@ relaxed. The guard also degrades safely on a minimal schema: without
 `paper_accounts` it installs only the cycle-existence half, so it never references a
 missing table.
 
-## 16. Merge status
+## 16. Browser E2E stability investigation, and harness simplification
+
+This round changed **no production logic**. It answered the E2E flakiness question
+with measurements, and removed two pieces of verification complexity that had become
+self-contradictory.
+
+### 16.1 The GitHub exact-head run did have a flaky test — stated plainly
+
+The CI *check* was green, but the browser job log is not:
+
+```
+Running 32 tests using 1 worker
+  ✘ 11 ... paper-runtime.spec.js:23:3 ... 面板只读：无定义编辑控件，且可跳回策略工坊详情 (1.0m)
+  ✓ 12 ... paper-runtime.spec.js:23:3 ... (retry #1) (49.4s)
+  1 flaky
+  31 passed (3.7m)
+```
+
+The first attempt hit `Test timeout of 60000ms exceeded` while waiting for
+`paper-runtime-strategies [data-testid^="paper-runtime-card-"]` to become visible.
+So "CI is green" is **not** evidence that E2E is stable, and this PR does not claim
+32/32 for that run.
+
+### 16.2 Reproduction, then root cause
+
+Round-robin reproduction (`--workers=1 --retries=0`, paper-runtime only, 5 serial
+rounds): **5/5 PASS**, but round 1 cost 48.1s vs ~6.7s afterwards.
+
+Timing the three read sources the page actually requests (cold and warm):
+
+| endpoint | cold | warm |
+|---|---|---|
+| `/api/health` | 0.003s | 0.024s |
+| **`/api/paper/allocation-explain`** | **4.637s** | **4.672s** |
+| `/api/strategies?include_archived=true` | 0.046s | 0.042s |
+| `/api/paper/strategy-center` | 0.018s | 0.017s |
+
+Segment-timing the slow one shows the cost is entirely
+`dfc.fetch_market_snapshot_full(max_age=240)`: **4.4s with network, 13.8s without**
+(and it is paid on *every* call, because a failed refresh never populates the TTL
+cache). The DB layer is not involved: `_db()` open+query 0.003s,
+`_db(immediate=True)` open+query 0.004s.
+
+That explains the CI behaviour: CI runs offline, so the read path pays ~13.8s —
+against a 60s per-test budget that also covers `page.goto` and the workbench
+navigation. It is a fixed environment-sensitive cost, not a lock or a regression.
+
+### 16.3 Is it a R23 regression? No — verified two ways
+
+**(a) Frontend is byte-identical.** `git diff c872ae1..6fbf475 -- frontend/` is
+empty, so the page requests exactly the same things in both versions.
+
+**(b) Controlled interleaved A/B on the slow path**, both versions measured under the
+same CI-like no-network condition:
+
+| | master `c872ae1` | R23 head `6fbf475` |
+|---|---|---|
+| `fetch_market_snapshot_full` (median of 5) | 13.739s | 13.693s |
+| `strategy_allocation_explain` (median of 5) | 13.744s | 13.799s |
+| Δ explain | — | **+0.055s** |
+
+`BEGIN IMMEDIATE` is not implicated: the lock audit (§16.5) shows no provider call
+inside the write lock, and the DB costs 3-4 ms either way.
+
+**Conclusion: pre-existing environment-sensitive E2E flake.** It lives in the
+read-path snapshot refresh reaching the network, and it predates this PR. This PR
+does **not** widen scope to fix it, and does not weaken any timeout or add retries to
+hide it. Recorded as follow-up debt: `allocation-explain` is a read-only view and
+should not synchronously refresh a network snapshot; the fix belongs with the
+market-data boundary work (R24), where the read path can consume a cached snapshot
+that the scan/job path keeps warm.
+
+### 16.4 Independent stability verification (this round)
+
+Under the CI-equivalent configuration (`--workers=1 --retries=0`):
+
+- `paper-runtime.spec.js` × 5 serial rounds: **5/5 PASS, 0 flaky, 0 retry**
+- full browser suite: **32 passed, exit 0, 0 flaky, 0 retry**
+
+The frozen exact-head CI facts from §16.1 are reported as they happened; this is a
+separate, later measurement under the same settings.
+
+Targeted module list and exact counts behind §15.5's **374**:
+
+| module | tests |
+|---|---|
+| `test_provenance_inflight_change` | 11 |
+| `test_strategy_selection_provenance` | 57 |
+| `test_paper_trading_architecture_guard` | 114 |
+| `test_paper_selection` | 15 |
+| `test_selection_tradability` | 124 |
+| `test_order_intent_contract` | 8 |
+| `test_paper_cycle_service` | 12 |
+| `test_replacement_asof_provenance` | 33 |
+| **total** | **374** |
+
+Skipped counts are environment-specific: the local isolated clone reports
+`skipped=5`; GitHub Actions Python 3.12 on the previous head reported `skipped=1`.
+They are not one number and are not presented as one.
+
+### 16.5 Lock scope re-check
+
+`generate_signals`'s commit phase (`paper_trading.py:7660-7742`) is audited by
+`work/r23_round4_lock_scope_audit.py`: the 13 functions and 6 methods called inside
+it are all local decisions (`_signal_approval`, `_order_intent_payload`,
+`_with_decision_snapshot`, `_completed_kline` reading cached bars), DB writes
+(`execute`, `fetchone`) and the context check
+(`signal_write_context_or_error`). No provider/network entry point appears, so all
+provider work still completes before the lock is taken. The stale-validation step was
+deliberately kept inside the transaction — moving it out would reopen the
+validation→INSERT window that `RV08` locks down.
+
+### 16.6 Harness simplification
+
+**Sharding removed.** The runner documented "must run serially" while still shipping
+`--shard/--shards`; concurrent shards rewrite the same production files and pollute
+each other (an earlier 5-way sharded run was invalid, tally 0-1/3). The flags, the
+`index % shards` selection and the usage example are gone — serial is the only mode,
+and the dangerous mode no longer exists.
+
+**Anchor uniqueness enforced where the mutation happens.** `_apply()` used
+`assert count >= 1` + `replace(..., 1)`: the function that actually rewrites source
+accepted a duplicate anchor, letting the mutation land on a different call site while
+still reporting CAUGHT. It now asserts `count == 1` with the id/count/file in the
+message, so the safety condition does not depend on a reviewer remembering to run a
+second script.
+
+**`last=True` removed.** No mutation used it (0 of 21). The `rfind` branch in
+`_apply()`, the special case and the `last_mode` tally in the anchor audit are
+deleted rather than kept "in case". `work/r23_round2_anchor_check.py` is now a plain
+audit report: 21 mutations, all anchors must be exactly 1.
+
+One mutation = one unique anchor = one named regression.
+
+## 17. Merge status
 
 Not merged, not deployed. Awaiting human review.
+
 
 

@@ -1,9 +1,17 @@
 # -*- coding: utf-8 -*-
-"""R23 mutation matrix M-SP1 ~ M-SP15（规格 §19）。
+"""R23 mutation matrix —— 21 条 mutation（M-SP1..M-SP21 + M-RF1..M-RF3）。
 
-每条 mutation 必须让**唯一指定的永久回归**变 RED；baseline 必须 GREEN。脚本对每个
-变异文件做 byte-identical 还原并校验 sha256。``--non-vacuity`` 会先跑 baseline，
-``SyntaxError`` / ``ImportError`` / ``_FailedTest`` 一律计为 FAKE（不算 KILL）。
+**必须串行运行。** 每条 mutation 会就地改写 production source，跑完再按启动时的
+快照做 byte-identical 还原并校验 sha256；并发分片会同时改写同一批文件而互相污染，
+结果无效（R23 期间实测分片 tally 只有 0-1/3）。矩阵运行期间不要编辑 production
+文件，也不要同时跑别的测试套件。
+
+每条 mutation 必须让**唯一指定的永久回归**变 RED，且 anchor 必须**恰好命中一次**
+（``_apply`` 内强制）——否则「改哪一处」会由字符串顺序决定，anchor 漂移后可能悄悄
+改到别的调用点却仍打印 CAUGHT。
+
+``--non-vacuity`` 会先跑 baseline；``SyntaxError`` / ``ImportError`` / ``NameError``
+等接线错误一律计为 FAKE（不算 KILL）——它们让测试变红却证明不了任何业务性质。
 
 机制沿用 R22 已修好的 ``PYTHONPYCACHEPREFIX`` 逐次唯一目录：baseline 与 mutant
 绝不能共享字节码缓存，否则整张矩阵静默失效。
@@ -11,7 +19,6 @@
 用法：
     python work/r23_mutation_check.py                  # 全部
     python work/r23_mutation_check.py --only M-SP1,M-SP2
-    python work/r23_mutation_check.py --shard 0 --shards 4   # 分片并发
 """
 from __future__ import annotations
 
@@ -404,12 +411,19 @@ def assert_no_leftover(mutation: dict) -> None:
 
 
 def _apply(text: str, mutation: dict) -> str:
+    """Apply one mutation, requiring its anchor to be **unique**.
+
+    ``replace(..., 1)`` rewrites the first hit, so a duplicated anchor would let the
+    mutation land on a different call site than intended while still reporting
+    CAUGHT. The invariant is enforced here, in the function that actually performs
+    the rewrite, rather than only in a separate audit script.
+    """
     old, new = mutation["old"], mutation["new"]
-    if mutation.get("last"):
-        index = text.rfind(old)
-        assert index >= 0, f'{mutation["id"]}: anchor not found'
-        return text[:index] + new + text[index + len(old):]
-    assert text.count(old) >= 1, f'{mutation["id"]}: anchor not found'
+    count = text.count(old)
+    assert count == 1, (
+        f'{mutation["id"]}: mutation anchor must be unique; count={count}; '
+        f'file={mutation["file"]}'
+    )
     return text.replace(old, new, 1)
 
 
@@ -458,18 +472,11 @@ def main() -> int:
     if "--only" in argv:
         only = {item for item in argv[argv.index("--only") + 1].split(",") if item}
     non_vacuity = "--non-vacuity" in argv
-    shard, shards = 0, 1
-    if "--shard" in argv:
-        shard = int(argv[argv.index("--shard") + 1])
-    if "--shards" in argv:
-        shards = int(argv[argv.index("--shards") + 1])
 
     self_test_sequence()
     print("runner self-test: PASS (unique, increasing pycache sequence)")
 
     selected = [m for m in MUTATIONS if only is None or m["id"] in only]
-    if shards > 1:
-        selected = [m for index, m in enumerate(selected) if index % shards == shard]
     results: list[tuple[str, str]] = []
     for mutation in selected:
         verdict = run_mutation(mutation, non_vacuity=non_vacuity)
