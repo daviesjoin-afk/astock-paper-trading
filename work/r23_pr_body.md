@@ -454,7 +454,7 @@ navigation. It is a fixed environment-sensitive cost, not a lock or a regression
 
 ### 16.3 Is it a R23 regression? No — verified two ways
 
-**(a) Frontend is byte-identical.** `git diff c872ae1..6fbf475 -- frontend/` is
+**(a) Frontend is byte-identical.** `git diff c872ae1..1e49a4d -- frontend/` is
 empty, so the page requests exactly the same things in both versions.
 
 **(b) Genuinely interleaved A/B on the slow path** (`work/r23_round4_ab_timing.py
@@ -478,8 +478,8 @@ Two independent interleaved runs, `strategy_allocation_explain` median delta
 | 2 | **+0.088s** | NO REGRESSION |
 
 Both are tens of milliseconds against a ~13.8s single-pass cost — noise, not a
-difference. Raw per-sample seconds are in `work/r23_handoff.md`; they drift with
-runner load and are not merge evidence.
+difference. Per-sample seconds drift with runner load and are not reproduced here,
+because they are not merge evidence.
 
 `BEGIN IMMEDIATE` is not implicated: the lock audit (§16.6) shows no provider call
 inside the write lock, and the DB costs 3-4 ms either way.
@@ -504,18 +504,13 @@ the numbers above are a separate, later measurement under the same settings.
 
 ### 16.5 The exact-head browser job is clean
 
-Browser job on the head this PR was reviewed at
-(`b34b6334534359254b501303d9f7e9130de815a9`): **32 passed, `workers=1`, no retry, no
-flaky**.
+Browser job on the head this PR is at (`1e49a4de137ac3d3fcc0396dbc6d7ac97c8165f3`):
+**32 passed, `workers=1`, no retry, no flaky**.
 
 `flaky` and `retry #` do not appear anywhere in that log (grep count 0). The other
 exact-head checks are green as well: `tests (3.11)`, `tests (3.12)` (**Ran 4006
 tests, OK**),
 `syntax`, `quality`, `docker-smoke`, `frontend`, `security-leak-scan` ×2.
-
-Per-case wall-clock seconds from this investigation are recorded in
-`work/r23_handoff.md` rather than here: they drift with runner load and are not merge
-evidence.
 
 Note that this clean run does not prove the underlying slowness is gone — it is the
 same offline snapshot-refresh cost from §16.2, which happens to fit inside the budget
