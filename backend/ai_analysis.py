@@ -78,15 +78,25 @@ def ensure_schema(conn):
 
 
 def _read_snapshot(snapshot_paths):
-    for path in snapshot_paths or ():
-        try:
-            with open(path, "r", encoding="utf-8") as handle:
-                payload = json.load(handle)
-            if isinstance(payload, dict) and isinstance(payload.get("rows"), list):
-                return payload, os.path.basename(path)
-        except (OSError, ValueError, TypeError):
-            continue
-    return {}, None
+    """只读全市场事实（R24：只经 Market Data Authority）。
+
+    迁移前裸读 ``snapshot_paths``（第二个是 20 页风险样本），会绕过完整性校验
+    并把样本当成全市场。现在只认 authority 校验过的事实。
+    """
+    try:
+        import datetime as _dt
+        import market_data_service as MDSvc
+        reading, payload = MDSvc.read_snapshot_with_meta(
+            now=_dt.datetime.now(_dt.timezone.utc)
+        )
+        rows = [dict(row) for row in reading.rows()]
+        if not rows:
+            return {}, None
+        merged = dict(payload) if isinstance(payload, dict) else {}
+        merged["rows"] = rows
+        return merged, "market_snapshot_full"
+    except Exception:
+        return {}, None
 
 
 def _paper_context(paper_db_path, scope):

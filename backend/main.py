@@ -861,10 +861,13 @@ def health():
             "data_fact": {
                 "status": "unavailable", "availability": "unavailable",
                 "freshness": "unknown", "verification": "not_attempted",
+                "verification_method": "none",
                 "as_of": None, "observed_at": None, "age_seconds": None,
-                "reason": "provider_unavailable", "policy": "live_market",
+                "reason": "provider_unavailable", "policy": "market_health_display",
                 "row_count": 0,
             },
+            "snapshot_meta": {"saved_at": None, "expected_rows": 0, "rows": 0,
+                              "complete": False},
             "provider_health": {"healthy": False, "checked_at": None,
                                 "action": f"行情事实判定异常：{type(exc).__name__}"},
         }
@@ -877,10 +880,14 @@ def health():
         # 行覆盖校验（``_full_snapshot_payload_is_complete``）。此前这里直接
         # ``open(MARKET_SNAPSHOT_FULL_CACHE_PATH)``，一份残缺/伪造 payload 会被
         # 当成正常快照计数。
-        cached = MDSvc.read_snapshot(now=datetime.datetime.now(datetime.timezone.utc))
-        rows = [dict(row) for row in cached.rows()]
+        cached_reading, cached_payload = MDSvc.read_snapshot_with_meta(
+            now=datetime.datetime.now(datetime.timezone.utc)
+        )
+        rows = [dict(row) for row in cached_reading.rows()]
         stamps = sorted(str(row.get("quote_at")) for row in rows if row.get("quote_at"))
-        saved_at = cached.snapshot.saved_at if cached.snapshot is not None else None
+        # ``saved_at`` 由 authority 保留（不再被丢成 None），因此这里的
+        # data-validity 年龄口径与迁移前一致。
+        saved_at = cached_payload.get("saved_at") if cached_payload else None
         live_snapshot.update({
             "rows": len(rows), "saved_at": saved_at,
             "quote_at_min": stamps[0] if stamps else None,

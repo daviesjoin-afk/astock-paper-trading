@@ -52,6 +52,30 @@ def _full_rows(*, quote_at=None):
     return _rows(dfc.FULL_MARKET_MIN_ROWS, quote_at=quote_at)
 
 
+def _payload(rows, *, saved_at=None, expected_rows=None):
+    """构造一份**经完整性校验**的持久化 payload（authority 的唯一输入）。"""
+    row_list = list(rows)
+    codes = {str(row.get("code")) for row in row_list if row.get("code")}
+    return {
+        "complete": True,
+        "rows": row_list,
+        "saved_at": saved_at or NOW.isoformat(),
+        "expected_rows": expected_rows if expected_rows is not None else len(codes),
+    }
+
+
+def _patch_cached(rows, *, saved_at=None, expected_rows=None):
+    """把 authority 的持久化读取固定成给定 payload。
+
+    对应 ``data_fetcher.load_market_snapshot_full_payload`` —— authority 读的是
+    这个**保留元数据**的入口，而不是只返回 rows 的旧入口。
+    """
+    return mock.patch.object(
+        dfc, "load_market_snapshot_full_payload",
+        return_value=_payload(rows, saved_at=saved_at, expected_rows=expected_rows),
+    )
+
+
 def _freeze_now(testcase):
     """把 authority 取的墙钟固定成 ``NOW``，让 freshness 判定可确定复现。
 
@@ -70,13 +94,24 @@ def _snapshot(
     rows=None,
     complete=True,
     verification=MDC.VERIFICATION_VERIFIED,
+    verification_method=None,
     **kwargs,
 ):
     stamp = NOW.isoformat() if observed_at is None else observed_at
     payload = rows if rows is not None else ({"code": "600000", "quote_at": stamp},)
+    if verification_method is None:
+        # 每个 verification 状态只能配它允许的 method（构建期校验会拒绝别的）。
+        verification_method = {
+            MDC.VERIFICATION_VERIFIED: MDC.VERIFICATION_METHOD_CROSS_SOURCE,
+            MDC.VERIFICATION_SINGLE_SOURCE: MDC.VERIFICATION_METHOD_CROSS_SOURCE,
+            MDC.VERIFICATION_DISAGREEMENT: MDC.VERIFICATION_METHOD_CROSS_SOURCE,
+            MDC.VERIFICATION_UNAVAILABLE: MDC.VERIFICATION_METHOD_CROSS_SOURCE,
+            MDC.VERIFICATION_NOT_ATTEMPTED: MDC.VERIFICATION_METHOD_NONE,
+        }[verification]
     return MDC.MarketDataSnapshot(
         kind="full_market_snapshot",
         rows=tuple(payload), complete=complete, verification=verification,
+        verification_method=verification_method,
         observed_at=stamp, **kwargs,
     )
 
@@ -290,6 +325,91 @@ class MarketDataContractTests(unittest.TestCase):
                        "circuit_open", "retry_after_seconds"):
             self.assertNotIn(leaked, projection)
 
+    def test_MD15_verified_never_implies_cross_source(self):
+        """``verified`` 只表示"该 kind 的 policy 通过"，必须带 method。
+
+        复核修正的核心：单源完整快照若只标 ``verified`` 而无 method，R25/R27
+        会把它误读成"双源核验过"。构造期即拒绝这种组合。
+        """
+        with self.assertRaises(ValueError):
+            MDC.MarketDataSnapshot(
+                kind="full_market_snapshot", rows=(), complete=True,
+                verification=MDC.VERIFICATION_VERIFIED,
+                verification_method=MDC.VERIFICATION_METHOD_NONE,
+            )
+        # coverage_integrity 的 verified **不是**多源核验。
+        coverage = MDC.MarketDataSnapshot(
+            kind="full_market_snapshot", rows=(), complete=True,
+            verification=MDC.VERIFICATION_VERIFIED,
+            verification_method=MDC.VERIFICATION_METHOD_COVERAGE_INTEGRITY,
+        )
+        self.assertFalse(MDC.is_cross_source_verified(coverage))
+        cross = MDC.MarketDataSnapshot(
+            kind="full_market_snapshot", rows=(), complete=True,
+            verification=MDC.VERIFICATION_VERIFIED,
+            verification_method=MDC.VERIFICATION_METHOD_CROSS_SOURCE,
+        )
+        self.assertTrue(MDC.is_cross_source_verified(cross))
+        self.assertFalse(MDC.is_cross_source_verified(None))
+
+    def test_MD16_not_attempted_cannot_claim_a_method(self):
+        """没有核验就不能带 cross_source / coverage_integrity。"""
+        for method in (MDC.VERIFICATION_METHOD_CROSS_SOURCE,
+                       MDC.VERIFICATION_METHOD_COVERAGE_INTEGRITY):
+            with self.assertRaises(ValueError):
+                MDC.MarketDataSnapshot(
+                    kind="full_market_snapshot", rows=(),
+                    verification=MDC.VERIFICATION_NOT_ATTEMPTED,
+                    verification_method=method,
+                )
+
+    def test_MD17_verification_method_is_projected(self):
+        """投影必须同时给出 verification 与 verification_method。"""
+        reading = MDC.classify(
+            _snapshot(verification_method=MDC.VERIFICATION_METHOD_COVERAGE_INTEGRITY),
+            MDC.LIVE_MARKET_POLICY, now=NOW,
+        )
+        projection = reading.projection()
+        self.assertEqual(MDC.VERIFICATION_VERIFIED, projection["verification"])
+        self.assertEqual(MDC.VERIFICATION_METHOD_COVERAGE_INTEGRITY,
+                         projection["verification_method"])
+
+    def test_MD18_cross_section_needs_coverage_not_just_newest_row(self):
+        """横截面新鲜度是"多少行够新"，不是"最新那行够新"。
+
+        复核修正的真实缺陷：一个完整 payload 里 3999 行是隔夜旧数据、只有 1 行
+        刚更新时，只看"最新一条 quote_at"会判 fresh —— 那不是一个可信的实时
+        横截面，必须 fail closed。
+        """
+        stale_row = {"code": "600000", "quote_at": _ago(86400)}
+        fresh_row = {"code": "699999", "quote_at": _ago(5)}
+        mostly_stale = [dict(stale_row, code=str(600000 + i))
+                        for i in range(3999)] + [fresh_row]
+        reading = MDC.classify(
+            _snapshot(rows=mostly_stale), MDC.LIVE_MARKET_POLICY, now=NOW,
+        )
+        self.assertEqual(MDC.STATUS_STALE, reading.status)
+        self.assertEqual(MDC.REASON_STALE, reading.reason)
+        self.assertEqual(MDC.FRESHNESS_STALE, reading.freshness)
+        ratio = reading.snapshot.verification_detail.get("fresh_ratio")
+        self.assertIsNotNone(ratio)
+        self.assertLess(ratio, MDC.CROSS_SECTION_MIN_FRESH_RATIO)
+
+        # 全部新鲜 → fresh（证明上一条不是因为"横截面一律拒绝"而通过）。
+        all_fresh = [dict(fresh_row, code=str(600000 + i)) for i in range(4000)]
+        ok = MDC.classify(
+            _snapshot(rows=all_fresh), MDC.LIVE_MARKET_POLICY, now=NOW,
+        )
+        self.assertEqual(MDC.STATUS_FRESH, ok.status)
+
+    def test_MD19_point_kind_without_ratio_requirement_still_works(self):
+        """没有比例要求的 policy（单点事实）仍按最新一条判定。"""
+        reading = MDC.classify(
+            _snapshot(rows=[{"code": "600000", "quote_at": _ago(5)}]),
+            MDC.UNIVERSE_BUILD_POLICY, now=NOW,
+        )
+        self.assertEqual(MDC.STATUS_FRESH, reading.status)
+
 
 # ---------------------------------------------------------------------------
 # MDR：只读路径绝不联网
@@ -301,22 +421,22 @@ class MarketDataReadPathTests(unittest.TestCase):
 
     def test_MDR01_read_snapshot_with_cache_never_touches_provider(self):
         """有缓存 → 返回 facts + status，且**零** provider 调用。"""
-        rows = _rows(3, quote_at=_ago(30))
+        rows = _full_rows(quote_at=_ago(30))
         with _NetworkForbidden(self) as guard:
-            with mock.patch.object(
-                dfc, "load_market_snapshot_full_cached", return_value=rows,
-            ):
+            with _patch_cached(rows):
                 reading = MDSvc.read_snapshot(MDC.LIVE_MARKET_POLICY, now=NOW)
         self.assertEqual([], guard.attempts, "只读路径访问了 provider")
         self.assertTrue(reading.available)
-        self.assertEqual(3, len(reading.rows()))
+        self.assertEqual(len(rows), len(reading.rows()))
+        # 复核修正：单源完整快照**不得**自称多源核验过。
+        self.assertEqual(MDC.VERIFICATION_METHOD_COVERAGE_INTEGRITY,
+                         reading.snapshot.verification_method)
+        self.assertFalse(MDC.is_cross_source_verified(reading.snapshot))
 
     def test_MDR02_read_snapshot_without_cache_is_unavailable_not_crash(self):
         """无缓存 → 明确 unavailable，既不崩也不联网。"""
         with _NetworkForbidden(self) as guard:
-            with mock.patch.object(
-                dfc, "load_market_snapshot_full_cached", return_value=[],
-            ):
+            with _patch_cached([]):
                 reading = MDSvc.read_snapshot(MDC.LIVE_MARKET_POLICY, now=NOW)
         self.assertEqual([], guard.attempts, "只读路径访问了 provider")
         self.assertEqual(MDC.STATUS_UNAVAILABLE, reading.status)
@@ -325,24 +445,20 @@ class MarketDataReadPathTests(unittest.TestCase):
 
     def test_MDR03_stale_read_positive_control(self):
         """stale positive control：report stale + 最后可信数据，不偷偷 refresh。"""
-        rows = [{"code": "600000", "quote_at": _ago(7200), "price": 10.0}]
+        rows = _full_rows(quote_at=_ago(7200))
         with _NetworkForbidden(self) as guard:
-            with mock.patch.object(
-                dfc, "load_market_snapshot_full_cached", return_value=rows,
-            ):
+            with _patch_cached(rows):
                 reading = MDSvc.read_snapshot(MDC.LIVE_MARKET_POLICY, now=NOW)
         self.assertEqual([], guard.attempts, "stale 读取偷偷刷新了行情")
         self.assertEqual(MDC.STATUS_STALE, reading.status)
         self.assertEqual(MDC.REASON_STALE, reading.reason)
-        self.assertEqual(1, len(reading.rows()), "stale 必须保留最后可信事实")
+        self.assertEqual(len(rows), len(reading.rows()), "stale 必须保留最后可信事实")
         self.assertNotEqual(MDC.STATUS_FRESH, reading.status, "stale 被标成了 fresh")
 
     def test_MDR04_unavailable_read_positive_control(self):
         """unavailable positive control：绝不填充默认值。"""
         with _NetworkForbidden(self) as guard:
-            with mock.patch.object(
-                dfc, "load_market_snapshot_full_cached", return_value=[],
-            ):
+            with _patch_cached([]):
                 reading = MDSvc.read_snapshot(MDC.LIVE_MARKET_POLICY, now=NOW)
         self.assertEqual([], guard.attempts, "只读路径访问了 provider")
         self.assertEqual(MDC.REASON_MISSING, reading.reason)
@@ -355,7 +471,7 @@ class MarketDataReadPathTests(unittest.TestCase):
         """持久化读取本身抛异常时也要降级成 unavailable，而不是 500。"""
         with _NetworkForbidden(self) as guard:
             with mock.patch.object(
-                dfc, "load_market_snapshot_full_cached",
+                dfc, "load_market_snapshot_full_payload",
                 side_effect=RuntimeError("corrupt cache"),
             ):
                 reading = MDSvc.read_snapshot(MDC.LIVE_MARKET_POLICY, now=NOW)
@@ -377,10 +493,7 @@ class MarketDataReadPathTests(unittest.TestCase):
         patcher.start()
         self.addCleanup(patcher.stop)
         with _NetworkForbidden(self) as guard:
-            with mock.patch.object(
-                dfc, "load_market_snapshot_full_cached",
-                return_value=_rows(3, quote_at=_ago(7200)),
-            ):
+            with _patch_cached(_full_rows(quote_at=_ago(7200))):
                 payload = PT.strategy_allocation_explain()
         self.assertEqual([], guard.attempts,
                          "allocation-explain 的行情读取访问了 provider")
@@ -392,10 +505,7 @@ class MarketDataReadPathTests(unittest.TestCase):
         """运行时只读投影同样不得联网。"""
         _freeze_now(self)
         with _NetworkForbidden(self) as guard:
-            with mock.patch.object(
-                dfc, "load_market_snapshot_full_cached",
-                return_value=_rows(3, quote_at=_ago(30)),
-            ):
+            with _patch_cached(_full_rows(quote_at=_ago(30))):
                 projection = MDSvc.read_projection()
         self.assertEqual([], guard.attempts, "运行时读投影访问了 provider")
         self.assertEqual(MDC.STATUS_FRESH, projection["status"])
@@ -413,9 +523,7 @@ class MarketDataRefreshTests(unittest.TestCase):
         rows = _full_rows(quote_at=_ago(10))
         with mock.patch.object(
             dfc, "fetch_market_snapshot_full", return_value=rows,
-        ), mock.patch.object(
-            dfc, "load_market_snapshot_full_cached", return_value=[],
-        ):
+        ), _patch_cached([]):
             reading = MDSvc.refresh_snapshot(MDC.LIVE_MARKET_POLICY, now=NOW)
         self.assertEqual(MDC.STATUS_FRESH, reading.status)
         self.assertEqual(MDC.ACCESS_REFRESH, reading.access_mode)
@@ -425,9 +533,7 @@ class MarketDataRefreshTests(unittest.TestCase):
         """一行"全市场快照"不是完整事实：必须 fail closed，不许标 fresh。"""
         with mock.patch.object(
             dfc, "fetch_market_snapshot_full", return_value=_rows(5, quote_at=_ago(5)),
-        ), mock.patch.object(
-            dfc, "load_market_snapshot_full_cached", return_value=[],
-        ):
+        ), _patch_cached([]):
             reading = MDSvc.refresh_snapshot(MDC.LIVE_MARKET_POLICY, now=NOW)
         self.assertEqual(MDC.STATUS_STALE, reading.status)
         self.assertEqual(MDC.REASON_INCOMPLETE, reading.reason)
@@ -435,23 +541,19 @@ class MarketDataRefreshTests(unittest.TestCase):
 
     def test_MDP02_refresh_failure_keeps_last_known_and_marks_stale(self):
         """既有语义：failed refresh 回落 full-market cache，而不是假装成功。"""
-        cached = [{"code": "600000", "quote_at": _ago(7200), "price": 9.0}]
+        cached = _full_rows(quote_at=_ago(7200))
         with mock.patch.object(
             dfc, "fetch_market_snapshot_full", return_value=[],
-        ), mock.patch.object(
-            dfc, "load_market_snapshot_full_cached", return_value=cached,
-        ):
+        ), _patch_cached(cached):
             reading = MDSvc.refresh_snapshot(MDC.LIVE_MARKET_POLICY, now=NOW)
         self.assertEqual(MDC.STATUS_STALE, reading.status)
         self.assertEqual(MDC.REASON_REFRESH_FAILED, reading.reason)
-        self.assertEqual(1, len(reading.rows()), "旧事实必须保留")
+        self.assertEqual(len(cached), len(reading.rows()), "旧事实必须保留")
 
     def test_MDP03_refresh_failure_without_cache_is_unavailable(self):
         with mock.patch.object(
             dfc, "fetch_market_snapshot_full", return_value=[],
-        ), mock.patch.object(
-            dfc, "load_market_snapshot_full_cached", return_value=[],
-        ):
+        ), _patch_cached([]):
             reading = MDSvc.refresh_snapshot(MDC.LIVE_MARKET_POLICY, now=NOW)
         self.assertEqual(MDC.STATUS_UNAVAILABLE, reading.status)
         self.assertEqual(MDC.REASON_REFRESH_FAILED, reading.reason)
@@ -462,9 +564,7 @@ class MarketDataRefreshTests(unittest.TestCase):
         with mock.patch.object(
             dfc, "fetch_market_snapshot_full",
             side_effect=RuntimeError("provider exploded"),
-        ), mock.patch.object(
-            dfc, "load_market_snapshot_full_cached", return_value=[],
-        ):
+        ), _patch_cached([]):
             reading = MDSvc.refresh_snapshot(MDC.LIVE_MARKET_POLICY, now=NOW)
         self.assertEqual(MDC.STATUS_UNAVAILABLE, reading.status)
         self.assertEqual(MDC.REASON_REFRESH_FAILED, reading.reason)
@@ -581,6 +681,59 @@ class MarketDataPointInTimeTests(unittest.TestCase):
         )
         self.assertEqual(MDC.AVAILABILITY_AVAILABLE, reading.availability)
         self.assertEqual(1, len(reading.rows()))
+
+
+# ---------------------------------------------------------------------------
+# MDPR：source metadata parity（复审修正）
+# ---------------------------------------------------------------------------
+
+
+class MarketDataMetadataParityTests(unittest.TestCase):
+    """MDPR-01 ~ MDPR-03：只读路径必须保留源元数据。
+
+    复审指出的回退：``_load_cached_snapshot`` 只取 ``rows``，于是
+    ``saved_at=None`` / ``expected_rows=0``，``/api/health`` 的
+    ``live_snapshot.saved_at`` 与 ``age_seconds`` 随之丢失。
+    """
+
+    def test_MDPR01_read_snapshot_keeps_payload_metadata(self):
+        rows = _full_rows(quote_at=_ago(60))
+        with _patch_cached(rows, saved_at="2026-08-28T02:20:00+00:00",
+                           expected_rows=len(rows)):
+            reading, payload = MDSvc.read_snapshot_with_meta(now=NOW)
+        self.assertEqual("2026-08-28T02:20:00+00:00",
+                         reading.snapshot.saved_at,
+                         "saved_at 在只读路径上被丢弃（health 元数据回退）")
+        self.assertEqual(len(rows), reading.snapshot.expected_rows)
+        self.assertEqual("2026-08-28T02:20:00+00:00", payload.get("saved_at"))
+
+    def test_MDPR02_health_projection_exposes_snapshot_meta(self):
+        rows = _full_rows(quote_at=_ago(60))
+        with _patch_cached(rows, saved_at="2026-08-28T02:20:00+00:00",
+                           expected_rows=len(rows)):
+            projection = MDSvc.market_health_projection(now=NOW)
+        meta = projection["snapshot_meta"]
+        self.assertEqual("2026-08-28T02:20:00+00:00", meta["saved_at"])
+        self.assertEqual(len(rows), meta["rows"])
+        self.assertTrue(meta["complete"])
+        # 数据事实与 provider 健康是两个独立结论，互不推导。
+        self.assertIn("data_fact", projection)
+        self.assertIn("provider_health", projection)
+
+    def test_MDPR03_health_uses_its_own_policy_not_live_240s(self):
+        """health 的展示口径是 1800s，不是 live 的 240s。"""
+        rows = _full_rows(quote_at=_ago(900))
+        with _patch_cached(rows):
+            reading, _ = MDSvc.read_snapshot_with_meta(
+                MDC.MARKET_HEALTH_POLICY, now=NOW,
+            )
+        self.assertEqual(MDC.MARKET_HEALTH_POLICY.name, reading.policy_name)
+        self.assertEqual(MDC.FRESHNESS_FRESH, reading.freshness,
+                         "1800s 窗口内的快照在 health 口径下应为 fresh")
+        with _patch_cached(rows):
+            live, _ = MDSvc.read_snapshot_with_meta(MDC.LIVE_MARKET_POLICY, now=NOW)
+        self.assertEqual(MDC.FRESHNESS_STALE, live.freshness,
+                         "同一份快照在 live 240s 口径下应为 stale")
 
 
 # ---------------------------------------------------------------------------
@@ -710,7 +863,20 @@ class MarketDataArchitectureGuardTests(unittest.TestCase):
                       "前端不再展示后端给出的 reason")
 
     def test_MDG06_read_paths_have_no_synchronous_provider_refresh(self):
-        """只读 API 入口不得直接出现 provider 刷新调用。"""
+        """只读 API 入口不得直接出现 provider 刷新调用。
+
+        R24 复审修正：此前只禁 ``fetch_market_snapshot_full``，但``/api/hot``
+        开头的 ``fetch_hot_rank`` 内部就会 ``http_post_json``，因此
+        "``/api/hot`` 已是 network-free read path" 的说法不成立。守卫现在覆盖
+        所有**会发起网络**的 provider 入口，并显式承认 ``hot`` 仍会取热度榜。
+        """
+        #: 这些入口内部都会发起 HTTP 请求。
+        NETWORK_ENTRIES = (
+            "fetch_market_snapshot_full", "fetch_market_snapshot",
+            "fetch_hot_rank", "fetch_indices", "fetch_fast_news",
+            "fetch_realtime_for_codes", "fetch_sector_flow",
+            "http_get", "http_post_json",
+        )
         tree = self._tree("main.py")
         for name in ("hot", "health"):
             node = next(
@@ -722,10 +888,71 @@ class MarketDataArchitectureGuardTests(unittest.TestCase):
                 else getattr(child.func, "id", "")
                 for child in ast.walk(node) if isinstance(child, ast.Call)
             }
-            self.assertNotIn(
-                "fetch_market_snapshot_full", names,
-                f"只读入口 {name}() 又同步刷新了全市场快照",
-            )
+            if name == "health":
+                # health 是**完全** network-free 的只读入口。
+                for entry in NETWORK_ENTRIES:
+                    self.assertNotIn(
+                        entry, names,
+                        f"只读入口 health() 出现了会联网的 provider 调用：{entry}",
+                    )
+            else:
+                # hot 仍会同步取热度榜（独立 artifact，非 full-market snapshot）。
+                # 这不是 R24 的迁移目标，但必须有测试钉住事实，避免再次被
+                # 描述成"整个 read API 都不联网"。
+                self.assertIn(
+                    "fetch_hot_rank", names,
+                    "hot() 不再取热度榜 —— 若改为缓存读取，请同步更新本测试与文档",
+                )
+                self.assertNotIn(
+                    "fetch_market_snapshot_full", names,
+                    "hot() 又同步刷新了全市场快照",
+                )
+
+    def test_MDG10_no_module_raw_reads_the_snapshot_cache_by_path(self):
+        """任何模块都不得按**路径**裸读 full-market 快照缓存。
+
+        R24 复审修正：``MDG08`` 只匹配属性名 ``MARKET_SNAPSHOT_FULL_CACHE_PATH``，
+        而 ``adaptive_engine`` / ``deepseek_advisor`` / ``trade_attribution``
+        用的是**字面文件名** ``"market_snapshot_full.json"``，因此会假绿。
+        这条守卫直接按字面路径匹配，并额外禁止回退到 20 页风险样本
+        （``market_snapshot.json`` —— 约 1/25 个市场，把它当全市场会歪曲统计）。
+        """
+        allowed = {
+            "market_data_service.py",   # authority 本身
+            "data_fetcher.py",          # provider/cache 机制（写方）
+            "marketdata_cache.py",      # 缓存原语
+            "demo_seed.py",             # 演示夹具：构造快照，不是消费者
+        }
+        offenders = []
+        for name in sorted(os.listdir(
+            os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                         "backend")
+        )):
+            if not name.endswith(".py") or name.startswith("test_") or name in allowed:
+                continue
+            path = self._path(name)
+            with open(path, encoding="utf-8") as handle:
+                raw = handle.read()
+            if "market_snapshot_full.json" not in raw and \
+                    "market_snapshot.json" not in raw:
+                continue
+            for node in ast.walk(ast.parse(raw)):
+                if not isinstance(node, ast.Call):
+                    continue
+                callee = (node.func.attr if isinstance(node.func, ast.Attribute)
+                          else getattr(node.func, "id", ""))
+                if callee not in ("open", "load", "loads", "read_text"):
+                    continue
+                for arg in ast.walk(node):
+                    if isinstance(arg, ast.Constant) and isinstance(arg.value, str) \
+                            and arg.value in ("market_snapshot_full.json",
+                                              "market_snapshot.json"):
+                        offenders.append(f"{name}:{callee}@line{node.lineno}")
+                        break
+        self.assertEqual(
+            [], sorted(set(offenders)),
+            f"这些模块按路径裸读了快照缓存（绕过完整性校验）：{sorted(set(offenders))}",
+        )
 
     def test_MDG07_read_only_consumers_use_the_authority_not_the_provider(self):
         """已迁移的只读消费者必须走 authority，而不是回退到 provider。"""

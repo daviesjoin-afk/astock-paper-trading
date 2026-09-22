@@ -638,13 +638,27 @@ def _full_snapshot_payload_is_complete(payload):
 
 def load_market_snapshot_full_cached():
     """Return the last persisted full-market snapshot rows.  Read-only, no network."""
+    payload = load_market_snapshot_full_payload()
+    rows = payload.get("rows")
+    return rows if isinstance(rows, list) and rows else []
+
+
+def load_market_snapshot_full_payload():
+    """Return the last persisted full-market payload, validated.  No network.
+
+    Callers that need the source metadata (``saved_at`` / ``expected_rows``)
+    must use this instead of ``open()``-ing the cache file directly: the raw
+    file read skips ``_full_snapshot_payload_is_complete`` and would let a
+    truncated or legacy payload be counted as a normal snapshot.
+    """
     try:
         with open(MARKET_SNAPSHOT_FULL_CACHE_PATH, encoding="utf-8") as handle:
             payload = json.load(handle)
-        rows = payload.get("rows") if isinstance(payload, dict) else None
-        return rows if _full_snapshot_payload_is_complete(payload) and rows else []
     except (OSError, ValueError, TypeError):
-        return []
+        return {}
+    if not _full_snapshot_payload_is_complete(payload):
+        return {}
+    return payload
 
 
 def _fresh_full_snapshot_from_disk(max_age):

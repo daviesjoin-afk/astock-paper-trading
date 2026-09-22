@@ -1,5 +1,10 @@
 # refactor(market-data): establish verified market-data boundary
 
+> **复审修正（第二轮）**：首轮提交后有 4 项被判定为合并前必须收掉的问题，均已在
+> 本 head 修复并加了永久回归。逐条见文末「复审修正」一节。核心结论未变：
+> R24 主方向正确、`allocation-explain` 债务已修；修正的是**收口完整性**、
+> **verification 语义真实性**、**health 元数据/新鲜度 parity** 与**证据精确性**。
+
 ## 这一轮实际建立/取消了什么
 
 **建立**了 Market Data 的**唯一业务权威**：`market_data_contract.py`（纯契约，零 I/O /
@@ -32,27 +37,47 @@ strategy_allocation_explain  13.82s / 13.83s   →  0.104s / 0.091s
 provider 调用数              ≥1                →  0
 ```
 
-`work/r24_readpath_no_network_check.py` 把 6 个 provider 入口全部 monkeypatch 成
-`raise AssertionError`，production read entry 仍正常返回：
+`work/r24_readpath_no_network_check.py` 把**所有会发起 HTTP 的 provider 入口**
+（含 `fetch_hot_rank`）全部 monkeypatch 成 `raise AssertionError`，逐个驱动 9 条只读
+入口：
 
 ```text
-elapsed=0.108s  network attempts: 0
-market_data: {'status': 'unavailable', 'availability': 'unavailable', ...'reason': 'missing'}
-strategies: 5
+    0.000s  market_data_service.read_snapshot
+    0.000s  market_data_service.read_projection
+    0.000s  market_data_service.read_snapshot_legacy_shape
+    0.071s  strategy_allocation_explain() market_data=unavailable
+    0.174s  dashboard() market_data=unavailable
+    0.001s  linkage.sector_linkage()
+    0.049s  adaptive_engine._snapshot_rows
+    0.000s  deepseek_advisor._read_snapshot
+    0.000s  ai_analysis._read_snapshot
+
+total provider calls attempted from read paths: 0
+PASS: 只读路径零 provider 网络调用
 ```
 
-同时迁走的只读路径：runtime view（`dashboard` 的 `market_data` 投影）、`/api/hot`、
-`/api/health`、`trade_attribution`。**8 个只读 API 的同步 provider 刷新从 4 处降到 0 处。**
+**声明边界（本轮精确化，不夸大）**：本 PR 收敛的是 **full-market snapshot 这一类事实**
+的只读消费。以下**不是** GET 只读路径，仍允许联网，脚本与 `test_MDG06` 都显式钉住这个事实：
+
+- `GET /api/hot` → `fetch_hot_rank`（东财**人气榜**，独立 artifact，非 full-market 快照）。
+  它**仍会**同步取榜；首轮把 `/api/hot` 描述成"network-free read path"是不准确的。
+- `POST /api/selection-evaluation/refresh` → `selection_tracking.update_observations`
+  （显式刷新动作）。
+- 盘后归因在无已知事实时的 fallback refresh（`trade_attribution._quote_maps`）。
+
+因此正确的指标口径是：**full-market snapshot 的同步 provider 刷新从 4 处降到 0 处**，
+而不是"整个 read API 都不联网"。
 
 ## fresh / stale / degraded / unavailable 如何解释
 
-保留**四个正交维度**，明确**不**压成 `quality_score`：
+保留**五个正交维度**，明确**不**压成 `quality_score`：
 
 | 维度 | 取值 |
 | --- | --- |
 | `availability` | `available` / `unavailable` |
 | `freshness` | `fresh` / `stale` / `unknown` |
 | `verification` | `verified` / `single_source` / `disagreement` / `unavailable` / `not_attempted` |
+| `verification_method` | `cross_source` / `coverage_integrity` / `none` |
 | `as_of` | 这条事实对应的业务日 |
 
 派生 `status` 只有 5 个值：`fresh` / `stale` / `degraded` / `unverified` / `unavailable`，
@@ -62,9 +87,15 @@ strategies: 5
 关键语义分离（此前靠 `None` / `{}` / 空 list / magic string 让调用方猜）：
 
 - **STALE ≠ UNAVAILABLE**：有最后一份可信 snapshot 但过期 → 返回 `stale` **加**完整 rows
-  （`test_MDR03` 断言 rows 仍为 1 条）；完全没有 → `unavailable`，不携带 payload。
+  （`test_MDR03` 断言 rows 全部保留）；完全没有 → `unavailable`，不携带 payload。
 - **DISAGREEMENT ≠ UNAVAILABLE，也 ≠ VERIFIED**：多源冲突报 `unverified`，绝不静默挑一个
   源；核验源本身不可用报 `degraded`——两者是不同结论（`test_MD07`）。
+- **`verified` ≠ 多源核验过**（复审修正）：`verified` 只表示"该 kind 的 policy 通过了"，
+  具体是哪一套由 `verification_method` 表达；构造期即拒绝 `verified` 配 `none`
+  （`test_MD15` / `test_MD16`），双源保证必须用 `is_cross_source_verified()`。
+- **横截面新鲜度看覆盖比例，不看最新一行**（复审修正）：`MIN_FRESH_RATIO = 90%`。
+  "3999 条隔夜旧数据 + 1 条刚更新"因为完整 payload 且最新一行够新而被判 `fresh` 是错的，
+  现在正确判 `stale`（`test_MD18`）。
 - **未来漂移的源时间戳不可采信**：`abs()` 语义与既有
   `data_fetcher._fresh_full_snapshot_from_disk` 一致，不因"看起来更新"判 fresh（`test_MD10`）。
 
@@ -140,15 +171,41 @@ before: 无（散落在 data_fetcher / main.health / risk_dashboard /
         paper_trading._market_state / dashboard_queries，各写一套 freshness）
 after:  market_data_contract.py（状态语义 + policy）+ market_data_service.py（唯一取数入口）
 
-Direct provider call sites (fetch_market_snapshot_full):
-before: 18（散在 paper_trading / main / manual_orders / universe /
-        trade_attribution / close_snapshot_runner）
-after:  1（且只在 authority 内部：market_data_service.refresh_snapshot）
-        上层调用点 = 0
+Direct access to the full-market snapshot artifact（按**通道**拆分，因为有三条通道）:
 
-Read paths that can synchronously hit provider:
-before: 4（allocation-explain / hot / health / trade_attribution）
+channel A `fetch_market_snapshot_full(...)`:
+  before: 17（paper_trading 9 / main 2 / manual_orders 3 / universe 1 /
+           trade_attribution 1 / close_snapshot_runner 1）
+  after:  1（且只在 authority 内部：market_data_service.refresh_snapshot）
+          上层调用点 = 0
+
+channel B `fetch_market_snapshot(pages=None...)`（同一 artifact 的第二个入口）:
+  before: 4（paper_trading 1 / universe 1 / linkage 1 / selection_tracking 1）
+  after:  0
+  （`api_adaptive.fetch_market_snapshot(pages=20)` 不在此列：pages=20 写的是
+    `market_snapshot_sample_20.json`，是**不同** artifact，属风险样本用途）
+
+channel C 按路径裸读 `market_snapshot_full.json` / `market_snapshot.json`:
+  before: 5 个裸读读取器，分布在 4 个模块
+            （trade_attribution._market_snapshot、adaptive_engine._snapshot_rows、
+              adaptive_engine._data_input_state、deepseek_advisor._read_snapshot、
+              ai_analysis._read_snapshot）
+          其中**全部**都会回退到 20 页风险样本 `market_snapshot.json`，
+          且都绕过 `_full_snapshot_payload_is_complete` 的完整性校验。
+  after:  0（写方 data_fetcher 与演示夹具 demo_seed 除外）
+          —— `MDG10` 按**字面路径**检查，能抓出这类改写（已验证）。
+
+三条通道合计：before **26** 处 → after **1** 处（仅在 authority 内部）。
+首轮只报了 channel A 的 17 处，且把 channel C 误判为"已迁移"（实际只迁移了它的
+fallback 分支），这正是复审第 1 条指出的收口不完整。
+
+Read paths that can synchronously hit provider（**full-market snapshot 这一类**）:
+before: 4（allocation-explain / health / trade_attribution / adaptive 系）
 after:  0
+注（复审修正后的精确口径）：这不是"整个 read API 都不联网"。仍允许联网且**不是**
+GET 只读路径的有：`GET /api/hot` 的 `fetch_hot_rank`（东财人气榜，独立 artifact）、
+`POST /api/selection-evaluation/refresh`、盘后归因的 fallback refresh。
+`test_MDG06` 显式断言 `hot()` 仍会取榜，防止这类声明再次被写宽。
 
 Freshness decision owners（**全市场行情事实的业务判决**）:
 before: 3
@@ -166,6 +223,9 @@ after:  1（market_data_contract.MarketDataPolicy + classify）
   本轮不合并这两个口径（消费者不同）。
 - `paper_quote_policy.quote_is_fresh`（个股 20 分钟）同样不在计数里：它是逐票
   成交门禁，与横截面快照是不同生命周期。
+- health 的 1800s 展示口径现已由 `MARKET_HEALTH_POLICY` 在 authority 内执行
+  （此前硬编码在 `main.health`）——它是**同一 owner 的第二个 policy**，
+  不是第二个 owner。
 
 Provider disagreement decision owners:
 before: 2（paper_trading._quotes 逐票核验；deepseek_advisor._secondary_quote_check 独立采样）
@@ -226,7 +286,7 @@ New standalone page added:         NO
 ## 测试
 
 ```text
-R24 targeted: 45 tests（backend/test_market_data_boundary.py）
+R24 targeted: 54 tests（backend/test_market_data_boundary.py）
 
 modules:
   MD-01..MD-14      契约：状态维度 / policy 单一来源 / 边界 / 投影 / 纯函数无时钟
@@ -235,14 +295,14 @@ modules:
   MDPIT-01..04      点时可证明性（严禁 current 回填）
   MDG-01..MDG-09    架构守卫（AST / import-level）
 
-mutation: caught=5 survived=0 fake=0（work/r24_mutation_check.py --non-vacuity）
+mutation: caught=9 survived=0 fake=0（work/r24_mutation_check.py --non-vacuity）
   M-MD1 read_snapshot 偷偷允许联网
   M-MD2 stale 被标成 fresh
   M-MD3 provider 冲突被静默当成可用
   M-MD4 historical 请求 fallback current
   M-MD5 unavailable 被默认值填充
 
-backend full:  4051 tests, OK, skipped=5
+backend full:  4060 tests, OK, skipped=5
 frontend unit: 118/118（含 7 条 R24 新增：frontend/tests/market-data-status.test.mjs）
 architecture guard: 114/114
 
@@ -294,7 +354,7 @@ R24 MARKET DATA AUTHORITY
 authority before: 无
 authority after:  market_data_contract + market_data_service
 
-direct provider call sites:      before = 18   after = 1（仅在 authority 内部；
+direct provider call sites:      before = 26   after = 1（仅在 authority 内部；
                                               上层调用点 = 0）
 read paths w/ sync provider net: before = 4    after = 0
 freshness owners:                before = 3    after = 1
@@ -327,9 +387,9 @@ frontend provider mechanics:         0
 
 TESTS
 
-R24 targeted: 45
-mutation: caught=5 survived=0 fake=0
-backend full: 4051 tests, skipped=5
+R24 targeted: 54
+mutation: caught=9 survived=0 fake=0
+backend full: 4060 tests, skipped=5
 frontend unit: 118/118
 paper-runtime repeated: 5/5 clean
 full browser: 32/32, flaky=0, retry=0
@@ -357,8 +417,141 @@ STATUS: AWAITING HUMAN REVIEW
 ## 证据脚本
 
 - `work/r24_authority_audit.md` —— 逐调用链审计（18 个 provider 调用点分类、
-  freshness 4 owner、§18 network/transaction 审计、逐项判定真缺口）
-- `work/r24_readpath_no_network_check.py` —— 只读路径零网络证明（provider 入口全部
-  monkeypatch 成断言失败）
-- `work/r24_mutation_check.py` —— 5 条语义 mutation，带 `--non-vacuity`
+  freshness owner、§18 network/transaction 审计、逐项判定真缺口）
+- `work/r24_readpath_no_network_check.py` —— 只读路径零网络证明（**所有**会发起 HTTP 的
+  provider 入口 monkeypatch 成断言失败；9 条只读入口）
+- `work/r24_mutation_check.py` —— 9 条语义 mutation，带 `--non-vacuity`
 - `work/r23_round4_nonet_probe.py` —— 本轮 before/after 延迟对照所用探针（沿用 R23）
+
+---
+
+## 复审修正（第二轮）
+
+首轮提交后有 4 项被判定为合并前必须收掉。以下逐条说明**问题、根因、修法与回归**。
+
+### 1. full-market authority 没有真正唯一（P1/P2）
+
+**问题**：同一批 full-market artifact 仍有多条绕过 authority 的路径：
+
+- `paper_trading.monitor_intraday()` 的诊断分支直接 `dfc.fetch_market_snapshot(pages=None, allow_disk_fallback=True)`
+- `universe.star_leader_mapping()` 直接 `dfc.fetch_market_snapshot()`
+- `trade_attribution._market_snapshot()` 直接 `open(market_snapshot_full.json)`，
+  **并在失败时回退 `market_snapshot.json`**
+- 复查中另外发现：`adaptive_engine`（`_snapshot_rows` / `_data_input_state`）、
+  `deepseek_advisor._read_snapshot`、`ai_analysis._read_snapshot` 也都裸读同一 artifact，
+  且同样回退 20 页风险样本
+
+**根因**：迁移只覆盖了 `fetch_market_snapshot_full`，漏掉了 **`fetch_market_snapshot`
+与按路径裸读**两条同 artifact 通道；首轮的 `MDG08` 守卫只匹配属性名
+`MARKET_SNAPSHOT_FULL_CACHE_PATH`，而上述模块用的是**字面文件名**，所以守卫假绿。
+回退到 `market_snapshot.json` 是实质正确性问题：那是 20 页风险样本（约 1/25 个市场），
+把它当全市场快照算板块/个股涨跌会系统性歪曲归因结论。
+
+**修法**：
+
+- 全部改经 authority（`read_snapshot` / `read_snapshot_with_meta` /
+  `read_snapshot_legacy_shape` / `refresh_rows`）。归因与 adaptive 的 raw cache read 已删除。
+- 新增 `data_fetcher.load_market_snapshot_full_payload()`：**保留元数据**的校验读取器，
+  替代裸 `open()`。
+- `universe.star_leader_mapping()` 全仓**零调用方**（含前端/E2E/测试），按 §35
+  「零消费者的 compat 路径删除」直接删除，而不是把死代码迁移。
+
+**回归**：`test_MDG10`（按**字面路径**检查裸读，排除写方与演示夹具），
+已用变异验证能精确抓出（在 `linkage.py` 插入 `open('market_snapshot_full.json')`
+→ `MDG10` RED，报告 `linkage.py:open@line56`）。另新增 `MDG08` 的属性名通道。
+
+### 2. `verification="verified"` 的语义是假的（P1/P2）
+
+**问题**：契约把 `VERIFICATION_VERIFIED` 定义为"多源核验通过"，但
+`_load_cached_snapshot()` / `refresh_snapshot()` 对**单一 Eastmoney** 全市场快照，
+只要 completeness/coverage 通过就直接标 `verified`。这会让单源快照在契约层看起来像
+双源验证过——而 R25/R27 会直接消费这个 contract。
+
+**根因**：把"哪个 kind 的 policy 通过了"和"通过的是哪一套 policy"压成了一个枚举值。
+
+**修法**：新增正交维度 `verification_method`：
+
+- `cross_source` —— 逐票第二独立源核验（这才是"多源核验"的字面含义）
+- `coverage_integrity` —— 完整性与覆盖（complete marker + 4000 行门槛 + 90% 期望覆盖）
+- `none` —— 未做任何核验
+
+`verified` 的含义固定为"**该 kind 的 verification policy 已通过**"；
+full-market 标 `verified` + `coverage_integrity`。构造期校验强制状态与 method 相容
+（`verified` 不许配 `none`；`not_attempted` 不许配任何真实 method），因此这类错误
+**不可能**被写出来。新增 `is_cross_source_verified()` 作为显式判据，需要双源保证的
+消费者（AI 调参门禁、R25/R27）必须调用它，而不是比较 `verification == "verified"`。
+`verification_detail` 同时带上 `policy` / `rows` / `unique_codes` / `expected_rows`，
+让"凭什么说它完整"可审计，而不是一个裸布尔。
+
+**回归**：`test_MD15`（verified 必须带 method + `is_cross_source_verified` 语义）、
+`test_MD16`（状态/method 相容性）、`test_MD17`（投影必须给出 method）、
+`test_MDR01`（单源完整快照不得自称双源）；mutation `M-MD6` / `M-MD8`。
+
+### 3. `/api/health` 的 metadata 与 freshness 行为未声明变化（P2）
+
+**问题**（三个独立缺陷）：
+
+1. `_load_cached_snapshot()` 只取 `rows`，把 `saved_at=None` / `expected_rows=0`，
+   于是 `live_snapshot.saved_at` 与基于它算的 `age_seconds` 实际丢失。
+2. 旧 health 判 `fresh` 要求盘中至少 4000 条当日且 30 分钟内的 fresh rows；
+   authority 只看**最新一条 quote_at** 是否在 240s 内 → "3999 条旧 + 1 条新"
+   理论上可能被投影成 fresh。
+3. health 的 1800s 展示口径被 240s 实时口径顶替。
+
+**根因**：authority 只保留 rows、丢掉了 payload metadata；契约缺少**横截面**新鲜度概念
+（只有单点"最新观测时点"）；且把两个不同业务问题的 policy 合并成了一个。
+
+**修法**：
+
+1. authority 保留完整 payload：新增 `read_snapshot_with_meta()` 返回
+   `(reading, payload)`，`market_health_projection()` 增加 `snapshot_meta`
+   段（`saved_at` / `expected_rows` / `rows` / `complete`）。
+2. 契约新增 `min_fresh_ratio`：横截面 policy 要求窗口内行数占**可解析总行数**达 90%
+   （`CROSS_SECTION_MIN_FRESH_RATIO`），并把 `fresh_ratio` 写进 `verification_detail`
+   以便审计。单点 kind（名单构建）不设比例要求，退化为"最新一条在窗口内"。
+3. 新增 `MARKET_HEALTH_POLICY`（1800s）由 authority 执行，health 消费它，
+   **不**并入 `LIVE_MARKET_POLICY`（240s）——两者的业务问题不同
+   （"还能不能做实时决策" vs "这份切片还值不值得展示"）。
+
+`main.health` 同时被简化为**一次** authority 读取（此前是"authority 读一次 + 自己拼
+metadata"），并移除了它在 authority 之外的第二份 `live_snapshot.status` 判决。
+
+**回归**：`MDPR-01 ~ MDPR-03`（元数据保留、health 投影、1800s vs 240s 口径分离）、
+`test_MD18`（3999 旧 + 1 新 → stale）、`test_MD19`（单点 kind 不受影响）、
+`test_MDG09`（health 不得再有第二份 freshness 判决）；
+mutation `M-MD7`（横截面只看最新行）、`M-MD9`（丢弃 saved_at）。
+
+### 4. 证据口径仍然过宽：`/api/hot` 不是零网络（P2）
+
+**问题**：`main.hot()` 虽不再为补价格调用 `fetch_market_snapshot_full`，但开头的
+`dfc.fetch_hot_rank(50)` 内部就 `http_post_json`。因此"`/api/hot` 已成为 network-free
+read path"不成立；`MDG06` 只禁 `fetch_market_snapshot_full`，旧探针也只验证
+`strategy_allocation_explain()`，这部分会假绿。
+
+**根因**：把"迁移了 full-market snapshot 的取数"表述成了"整个 read API 都不联网"。
+
+**修法**：选择**精确化声明**而不是为无消费者的端点新建缓存设施：
+
+- `MDG06` 现在检查**所有会联网的 provider 入口**（含 `fetch_hot_rank`），
+  并显式断言 `hot()` **仍会**取榜——这样"它不联网"的说法一旦被写回来就会变红。
+- 探针覆盖扩展到 9 条只读入口、12 个 provider 入口，并在输出里显式列出
+  **不属于**只读路径因而允许联网的三项（`/api/hot`、`POST /selection-evaluation/refresh`、
+  盘后归因 fallback）。
+- 指标口径统一改为"**full-market snapshot 的同步 provider 刷新** 4 → 0"。
+
+### 小的维护性问题
+
+`_market_state()` 里连续两次完全相同的 `elif live_universe is None: live_universe = []`
+已删除（首轮编辑的残留）。
+
+### 复审修正后的验证
+
+```text
+R24 targeted: 54 tests（原 45，新增 9：MD15-19 契约语义 / MDPR-01-03 元数据 parity）
+mutation:     9/9 CAUGHT, survived=0, fake=0（原 5 条，新增 M-MD6..M-MD9 锁复审修正）
+backend full: 4060 tests, OK, skipped=5
+frontend:     118/118
+E2E:          32/32, 0 flaky, 0 retry；paper-runtime 连续 5 轮
+security:     kinds=none, values=0, exit 0（worktree + all）
+paper_trading.py: LOC=14895（baseline 14895，净 0）  defs=280（不变）
+```

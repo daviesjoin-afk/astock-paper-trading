@@ -940,14 +940,17 @@ def _compensate_evolution(kind, candidate_snapshot, paper_snapshot, account_id,
 
 
 def _snapshot_rows():
-    for path in SNAPSHOT_PATHS:
-        payload = _load_json(path)
-        if not isinstance(payload, dict) or not isinstance(payload.get("rows"), list):
-            continue
-        rows = payload["rows"]
-        if rows:
-            return rows, payload.get("saved_at"), os.path.basename(path)
-    return [], None, None
+    """只读全市场事实（R24：只经 Market Data Authority）。
+
+    迁移前遍历 ``SNAPSHOT_PATHS``（full → 20 页样本）裸读 JSON，因此会
+    把 20 页风险样本当全市场快照，并绕过完整性校验。现在只认 authority
+    校验过的事实；拿不到就返回空，由调用方如实降级。
+    """
+    try:
+        import market_data_service as MDSvc
+        return MDSvc.read_snapshot_legacy_shape()
+    except Exception:
+        return [], None, None
 
 
 def _profile_date(rows):
@@ -3292,12 +3295,21 @@ def _execution_evidence_state(conn, day: dt.date | None = None, *, persist: bool
 def _data_input_state(conn):
     """Profile the five input families and state their safe authority."""
     now = dt.datetime.now(TZ)
-    full_path = os.path.join(CACHE_DIR, "market_snapshot_full.json")
     manifest_path = os.path.join(CACHE_DIR, "kline_manifest.json")
     factor_path = os.path.join(CACHE_DIR, "selection_factors.csv")
     health_path = os.path.join(CACHE_DIR, "data_source_health.json")
-    snapshot = _load_json(full_path, {}) or {}
-    market_rows = snapshot.get("rows") if isinstance(snapshot, dict) else []
+    # R24：全市场事实只经 authority 读取（此前裸读 full_path，绕过完整性校验，
+    # 且与 authority 的新鲜度判定口径不一致）。saved_at 由 authority 保留。
+    try:
+        import market_data_service as MDSvc
+        _reading, _payload = MDSvc.read_snapshot_with_meta(
+            now=dt.datetime.now(dt.timezone.utc)
+        )
+        market_rows = [dict(row) for row in _reading.rows()]
+        saved_at = _payload.get("saved_at") if _payload else None
+    except Exception:
+        market_rows = []
+        saved_at = None
     market_rows = market_rows if isinstance(market_rows, list) else []
     valid_price = sum(1 for row in market_rows if (_num(row.get("price"), 0) or 0) > 0 and row.get("quote_at"))
     ohlc_valid = 0
@@ -3306,7 +3318,6 @@ def _data_input_state(conn):
         values = [_num(row.get(key), None) for key in ("open_price", "high", "low", "prev_close")]
         if price > 0 and all(value is not None and value > 0 and 0.2 <= value / price <= 5 for value in values):
             ohlc_valid += 1
-    saved_at = snapshot.get("saved_at") if isinstance(snapshot, dict) else None
     freshness_minutes = None
     try:
         stamp = dt.datetime.fromisoformat(str(saved_at).replace("Z", "+00:00"))

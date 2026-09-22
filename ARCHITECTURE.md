@@ -610,6 +610,7 @@ business authority**，调用方向单向：
 | 谁只能 read cache/snapshot | 只读业务路径：`allocation-explain`、runtime view（dashboard）、`/api/hot`、`/api/health`、归因报告。它们只读持久化事实，绝不为此同步刷新 |
 | 谁负责 freshness | `market_data_contract.MarketDataPolicy`（`LIVE_MARKET_POLICY` 240s / 竞价 90s / 开盘事件 120s / 名单 300s / 归因 900s / 收盘 0s）。调用层不再各写 `max_age=` |
 | 谁负责 provider disagreement | `MarketDataSnapshot.verification` 维度（`verified` / `single_source` / `disagreement` / `unavailable` / `not_attempted`），由 `classify()` 判定。冲突一律报 `unverified`，**绝不**静默挑一个源 |
+| `verified` 到底是什么 | 含义固定为"**该 kind 的 verification policy 已通过**"，而"通过的是哪一套"由 `verification_method` 显式表达：`cross_source`（逐票第二源核验）或 `coverage_integrity`（完整性与覆盖）。**只读 `verified` 不得假设多源核验过**；需要双源保证必须调用 `is_cross_source_verified()` |
 | 谁负责 stale 与 unavailable 的区分 | 同上的 `classify()`：STALE 保留最后一份可信 rows；UNAVAILABLE 不带 payload。两者**绝不**合并 |
 | historical as-of 由谁负责 | `classify(..., asof_day=)`：只能使用该日或更早可证明的观测，`observed_day > requested` 或无法证明一律 fail closed（`asof_mismatch` / `asof_unprovable`），**绝不**用 current snapshot 回填 |
 | 谁负责 provider 健康 | `data_fetcher.load_source_health()`（**不**迁移）。与 data fact 并列但互不推导：源红灯不作废最后已验证 snapshot，snapshot 存在也不代表源健康 |
@@ -619,35 +620,58 @@ business authority**，调用方向单向：
 
 1. Market Data 的**业务权威**只有一份（`backend/market_data_service.py`），状态语义与
    freshness policy 只有一份（`backend/market_data_contract.py`，纯 stdlib、零 I/O、
-   零时钟、零项目级 import）。上层不再直接调用 provider 取全市场快照：生产
-   `fetch_market_snapshot_full` 调用点从 18 处收敛到 **0** 处（provider 实现本身仍留在
-   `data_fetcher.py`，R24 不重写 provider）。依赖方向单向：
+   零时钟、零项目级 import）。**full-market snapshot 这一类事实**全部经 authority：
+   上层调用点从 18 处收敛到 **0** 处（provider 实现本身仍留在 `data_fetcher.py`，
+   R24 不重写 provider），且**任何模块都不得按路径裸读** `market_snapshot_full.json`，
+   也不得回退到 20 页风险样本 `market_snapshot.json`（约 1/25 个市场，把它当全市场会
+   系统性歪曲板块/个股统计）。依赖方向单向：
    `调用方 → market_data_service → data_fetcher → providers/cache`，反向禁止。
+   回归门禁：`test_MDG08`（属性名裸读）+ `test_MDG10`（**字面路径**裸读，覆盖
+   `adaptive_engine` / `deepseek_advisor` / `ai_analysis` / `trade_attribution` 这类改写）。
 2. **只读业务路径绝不为了回答"当前已知事实是什么"而同步发起 provider 网络刷新。**
    这是本边界存在的主要理由：`GET /api/paper/allocation-explain` 曾每次只读请求穿透到
    provider，在网络不可用时每次支付 ~13.8s 连接超时/重试（实机复现：
    `work/r23_round4_nonet_probe.py`）。迁移后同一条件下 ≈0.10s，且 provider 调用数为 0。
    read path 有缓存但过期 → 返回 `stale` **加**最后一份可信 rows；完全没有 → 返回
    `unavailable`。绝不为了"让页面看起来正常"而偷偷联网，也绝不把 stale 标成 fresh，
-   也绝不构造 0 / `{}` / 默认指数 / 昨值冒充今值。
-3. `MarketDataReading` 保留**正交维度**（`availability` / `freshness` / `verification` /
-   `as_of` / `reason`），**禁止**压成一个 `quality_score`。`reason` 复用既有业务术语，
-   同一个失败原因不得在不同 caller 出现 `no_data` / `empty` / `provider_error` 等多个名字。
-   API/前端只消费 `MarketDataReading.projection()`，只渲染、不重算 freshness，也不理解
-   provider 机制（重试/熔断/缓存键不进普通 UI）。
-4. 决策路径（scheduled scan、收盘、竞价、开盘事件、手动下单、selection、归因）显式使用
+   也绝不构造 0 / `{}` / 默认指数 / 昨值冒充今值。只读路径必须**保留源元数据**
+   （`saved_at` / `expected_rows`）——把它们丢成 `None` / `0` 会让 `/api/health` 的
+   `live_snapshot.saved_at` 与年龄口径静默回退（`test_MDPR01`）。
+   **声明边界**：`GET /api/hot` 仍会同步取**东财人气榜**（`fetch_hot_rank`，独立
+   artifact，非 full-market snapshot）；`POST /api/selection-evaluation/refresh` 与盘后
+   归因的 fallback refresh 也允许联网。它们不是 GET 只读路径 —— 本不变量只覆盖
+   full-market snapshot 的只读消费（`test_MDG06` 钉住这个事实，避免被表述成
+   "整个 read API 都不联网"）。
+3. `verified` 的含义固定为"**该 kind 的 verification policy 已通过**"，而"通过的是
+   哪一套"由 `verification_method` 显式表达：`cross_source`（逐票第二源核验）或
+   `coverage_integrity`（完整性与覆盖）。**只读 `verified` 不得假设多源核验过** ——
+   需要双源保证的消费者必须调用 `is_cross_source_verified()`。构造期即拒绝
+   `verified` 配 `none`、拒绝 `not_attempted` 配任何真实 method。
+4. `MarketDataReading` 保留**正交维度**（`availability` / `freshness` / `verification` /
+   `verification_method` / `as_of` / `reason`），**禁止**压成一个 `quality_score`。
+   `reason` 复用既有业务术语，同一个失败原因不得在不同 caller 出现 `no_data` /
+   `empty` / `provider_error` 等多个名字。API/前端只消费
+   `MarketDataReading.projection()`，只渲染、不重算 freshness，也不理解 provider 机制
+   （重试/熔断/缓存键不进普通 UI）。
+5. **横截面的新鲜度是"多少行够新"，不是"最新那一行够新"。** `MarketDataPolicy` 对全市场
+   快照带 `min_fresh_ratio`（默认 90%）。只看最新一条 `quote_at` 会让"3999 条隔夜旧数据 +
+   1 条刚更新"因为是完整 payload 且最新一行够新而被判 `fresh`，那不是一个可信的实时
+   横截面（`test_MD18`，mutation `M-MD7`）。单点事实（名单构建等）不设比例要求，退化为
+   "最新一条在窗口内"。不同消费者用不同 policy：health 的 data-validity 展示用
+   `MARKET_HEALTH_POLICY`（1800s），**不**并入实时决策的 `LIVE_MARKET_POLICY`（240s）——
+   两者的业务问题不同（"还能不能做实时决策" vs "这份切片还值不值得展示"）。
+6. 决策路径（scheduled scan、收盘、竞价、开盘事件、手动下单、selection、归因）显式使用
    `refresh_snapshot` / `refresh_rows`。刷新失败时保留最后一次可信事实并标记 stale；
    对**横截面扫描**则返回空以停止本轮候选扫描（既有语义：不用旧快照冒充实时行情，
    不回落 20 页风险样本）。cache 只是存储/投放机制，**不是** fact authority：
    `cache 有值` 不等于 `一定可信`，仍要过 as_of / freshness / verification。
-   直接 `open(MARKET_SNAPSHOT_FULL_CACHE_PATH)` 的旁路读取会绕过
-   `_full_snapshot_payload_is_complete` 的完整性校验，一律禁止（R24 已把
-   `main.health` 从裸 `open()` 迁到 authority）。
-5. 回归门禁见 `backend/test_market_data_boundary.py`（MD-01 ~ MD-14 契约、
+7. 回归门禁见 `backend/test_market_data_boundary.py`（MD-01 ~ MD-19 契约、
    MDR-01 ~ MDR-07 只读不联网 + stale/unavailable positive control、MDP-01 ~ MDP-10
-   refresh/失败/多源 parity、MDPIT-01 ~ MDPIT-04 点时可证明性、MDG-01 ~ MDG-08 架构
-   guard），语义 mutation 见 `work/r24_mutation_check.py`（M-MD1 ~ M-MD5，5/5 CAUGHT、
-   0 survived、0 fake）。
+   refresh/失败/多源 parity、MDPIT-01 ~ MDPIT-04 点时可证明性、
+   MDPR-01 ~ MDPR-03 源元数据 parity、MDG-01 ~ MDG-10 架构 guard），
+   语义 mutation 见 `work/r24_mutation_check.py`（M-MD1 ~ M-MD9，9/9 CAUGHT、
+   0 survived、0 fake），只读路径零网络证明见 `work/r24_readpath_no_network_check.py`
+   （9 条只读入口，provider 全部替换为断言失败）。
 
 ## 目标依赖方向
 

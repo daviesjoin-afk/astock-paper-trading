@@ -61,35 +61,39 @@ MUTATIONS = [
     },
     {
         "id": "M-MD2", "file": CONTRACT,
-        # stale 被标成 fresh：超窗分支改成放行。这会让页面/决策把陈旧事实
+        # stale 被标成 fresh：覆盖不足分支改成放行。这会让页面/决策把陈旧事实
         # 当成可信实时行情。
-        "old": """    if age > policy.max_age_seconds:
-        return MarketDataReading(
+        "old": """    if not satisfied:
+        # 源观测时点不可解析、或横截面新鲜覆盖不足 —— 都不能算 fresh。
+        return _reading(
             availability=AVAILABILITY_AVAILABLE,
-            freshness=FRESHNESS_STALE,
-            status=STATUS_STALE,""",
-        "new": """    if age > policy.max_age_seconds and False:
-        return MarketDataReading(
+            freshness=FRESHNESS_UNKNOWN if age is None else FRESHNESS_STALE,
+            status=STATUS_STALE, reason=REASON_STALE,
+        )""",
+        "new": """    if not satisfied and False:
+        # 源观测时点不可解析、或横截面新鲜覆盖不足 —— 都不能算 fresh。
+        return _reading(
             availability=AVAILABILITY_AVAILABLE,
-            freshness=FRESHNESS_STALE,
-            status=STATUS_STALE,""",
+            freshness=FRESHNESS_UNKNOWN if age is None else FRESHNESS_STALE,
+            status=STATUS_STALE, reason=REASON_STALE,
+        )""",
         "test": f"{MD}.MarketDataReadPathTests.test_MDR03_stale_read_positive_control",
-        "desc": "stale 被标成 fresh（超窗仍判新鲜）",
+        "desc": "stale 被标成 fresh（超窗/覆盖不足仍判新鲜）",
     },
     {
         "id": "M-MD3", "file": CONTRACT,
         # disagreement 被静默挑一个源：冲突降级成"可用且已验证"。
         # 正是 §13 禁止的 ``return source_a or source_b`` 式静默 fallback。
         "old": """    if snapshot.verification == VERIFICATION_DISAGREEMENT:
-        return MarketDataReading(
-            availability=AVAILABILITY_AVAILABLE,
-            freshness=FRESHNESS_UNKNOWN,
-            status=STATUS_UNVERIFIED,""",
+        return _reading(
+            availability=AVAILABILITY_AVAILABLE, freshness=FRESHNESS_UNKNOWN,
+            status=STATUS_UNVERIFIED, reason=REASON_CROSS_SOURCE_FAILED,
+        )""",
         "new": """    if snapshot.verification == VERIFICATION_DISAGREEMENT and False:
-        return MarketDataReading(
-            availability=AVAILABILITY_AVAILABLE,
-            freshness=FRESHNESS_UNKNOWN,
-            status=STATUS_UNVERIFIED,""",
+        return _reading(
+            availability=AVAILABILITY_AVAILABLE, freshness=FRESHNESS_UNKNOWN,
+            status=STATUS_UNVERIFIED, reason=REASON_CROSS_SOURCE_FAILED,
+        )""",
         "test": f"{MD}.MarketDataContractTests.test_MD06_disagreement_is_reported_not_resolved",
         "desc": "provider 冲突被静默当成可用（不报 unverified）",
     },
@@ -98,15 +102,9 @@ MUTATIONS = [
         # historical missing 时 fallback current：as-of 校验被绕过，
         # 历史请求可以直接拿 current snapshot 回填（§15 绝对禁止）。
         "old": """        if observed_day > requested:
-            return MarketDataReading(
-                availability=AVAILABILITY_UNAVAILABLE,
-                freshness=FRESHNESS_UNKNOWN,
-                status=STATUS_UNAVAILABLE,""",
+            return MarketDataReading(""",
         "new": """        if observed_day > requested and False:
-            return MarketDataReading(
-                availability=AVAILABILITY_UNAVAILABLE,
-                freshness=FRESHNESS_UNKNOWN,
-                status=STATUS_UNAVAILABLE,""",
+            return MarketDataReading(""",
         "test": f"{MD}.MarketDataPointInTimeTests.test_MDPIT01_current_snapshot_never_fills_an_earlier_asof",
         "desc": "historical 请求 fallback 到 current snapshot（PIT 被绕过）",
     },
@@ -126,6 +124,66 @@ MUTATIONS = [
         )""",
         "test": f"{MD}.MarketDataReadPathTests.test_MDR02_read_snapshot_without_cache_is_unavailable_not_crash",
         "desc": "unavailable 被默认值填充（没有事实却报可用）",
+    },
+    # ---- M-MD6..M-MD8：复审修正后新增的不变量 ----
+    {
+        "id": "M-MD6", "file": CONTRACT,
+        # 单源快照冒充多源核验：``verified`` 允许配 ``none`` method。
+        # 这正是复审指出的"verification 语义是假的"。
+        "old": """    VERIFICATION_VERIFIED: (
+        VERIFICATION_METHOD_CROSS_SOURCE, VERIFICATION_METHOD_COVERAGE_INTEGRITY,
+    ),""",
+        "new": """    VERIFICATION_VERIFIED: (
+        VERIFICATION_METHOD_CROSS_SOURCE, VERIFICATION_METHOD_COVERAGE_INTEGRITY,
+        VERIFICATION_METHOD_NONE,
+    ),""",
+        "test": f"{MD}.MarketDataContractTests.test_MD15_verified_never_implies_cross_source",
+        "desc": "verified 可以不带核验方法（单源冒充双源）",
+    },
+    {
+        "id": "M-MD7", "file": CONTRACT,
+        # 横截面新鲜度只看"最新一行"：3999 条隔夜旧数据 + 1 条新数据被判 fresh。
+        # 恢复复审前那个只看 observed_at 的行为。
+        "old": """    ratio = fresh_ratio(rows, now, policy.max_age_seconds)
+    if ratio is None:
+        return False, None
+    return ratio >= policy.min_fresh_ratio, ratio""",
+        "new": """    return (
+        newest_age is not None and newest_age <= policy.max_age_seconds
+    ), None""",
+        "test": f"{MD}.MarketDataContractTests.test_MD18_cross_section_needs_coverage_not_just_newest_row",
+        "desc": "横截面只按最新一行判新鲜（覆盖不足仍报 fresh）",
+    },
+    {
+        "id": "M-MD8", "file": SVC,
+        # 全市场快照冒充双源核验：把 coverage_integrity 改成 cross_source。
+        "old": """        verification_method=(
+            MDC.VERIFICATION_METHOD_COVERAGE_INTEGRITY if complete
+            else MDC.VERIFICATION_METHOD_NONE
+        ),""",
+        "new": """        verification_method=(
+            MDC.VERIFICATION_METHOD_CROSS_SOURCE if complete
+            else MDC.VERIFICATION_METHOD_NONE
+        ),""",
+        "test": f"{MD}.MarketDataReadPathTests.test_MDR01_read_snapshot_with_cache_never_touches_provider",
+        "desc": "单源全市场快照自称 cross_source 核验过",
+    },
+    {
+        "id": "M-MD9", "file": SVC,
+        # 丢弃 payload metadata（复审指出的 health 元数据回退）：
+        # saved_at / expected_rows 又被压成 None / 0。
+        "old": """    rows = payload.get("rows")
+    if not isinstance(rows, list) or not rows:
+        return None
+    complete = bool(dfc_module._full_snapshot_payload_is_complete(payload))
+    saved_at = payload.get("saved_at")""",
+        "new": """    rows = payload.get("rows")
+    if not isinstance(rows, list) or not rows:
+        return None
+    complete = bool(dfc_module._full_snapshot_payload_is_complete(payload))
+    saved_at = None""",
+        "test": f"{MD}.MarketDataMetadataParityTests.test_MDPR01_read_snapshot_keeps_payload_metadata",
+        "desc": "只读路径丢弃 saved_at（health 元数据回退）",
     },
 ]
 

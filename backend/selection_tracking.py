@@ -567,8 +567,25 @@ def _registry_conn() -> sqlite3.Connection:
     return conn
 
 
+def _authority_snapshot_rows():
+    """经 Market Data Authority 取全市场事实。
+
+    这是一个**收盘后的 tracking job**（非浏览器只读路径），原有实现就是
+    ``fetch_market_snapshot()``（缓存未命中时联网），因此这里保留显式刷新
+    语义以维持行为 parity；只是把取数、完整性校验与新鲜度判定统一交给
+    authority，而不是自己直连 provider。
+    """
+    try:
+        import market_data_service as MDSvc
+        return MDSvc.refresh_rows()
+    except Exception:
+        return []
+
+
 def _latest_snapshot_prices():
-    rows = dfc.fetch_market_snapshot()
+    # R24：只读路径经 Market Data Authority（此前直接调 fetch_market_snapshot，
+    # 在缓存过期时会同步穿透 provider，并绕过 authority 的新鲜度判定）。
+    rows = _authority_snapshot_rows()
     by_code = {}
     dates = []
     for row in rows:

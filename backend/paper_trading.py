@@ -3742,8 +3742,6 @@ def _market_state(asof_date, live_universe=None, *, allow_network=True):
         live_universe = MDSvc.refresh_rows()
     elif live_universe is None:
         live_universe = []
-    elif live_universe is None:
-        live_universe = []
     latest = {str(row.get("code")): row for row in (live_universe or []) if row.get("code")}
     breadth_snapshot_at = max(
         (str(row.get("quote_at")) for row in latest.values() if row.get("quote_at")),
@@ -8894,7 +8892,7 @@ def strategy_allocation_explain():
     data_quality/diversification 六因子、capital_scale、目标预算、可用预算、
     席位上限、以及当前未部署的等待原因。纯只读，不影响任何交易。
     """
-    # R24：只读路径**绝不**为此同步刷新 provider（此前每次 read 最坏 ~13.8s 超时）。
+    # R24：只读路径绝不为此同步刷新 provider（此前每次 read 最坏 ~13.8s 超时）。
     market_data = MDSvc.read_snapshot(now=MDSvc.now_utc(), asof_day=None)
     init_db()
     with _db() as conn:
@@ -12517,8 +12515,10 @@ def monitor_intraday(asof_datetime=None, force=False):
     # 本轮只保留等待池，直到同日新鲜全市场快照恢复。
     if not scan_ready:
         try:
-            fb_rows = dfc.fetch_market_snapshot(pages=None, allow_disk_fallback=True)
-            fb_universe = _validated_live_universe(fb_rows, day, max_quote_age_minutes=180)
+            # R24：诊断读也经 authority，且只读已知事实不联网。
+            fb_reading = MDSvc.read_snapshot(now=MDSvc.now_utc())
+            fb_universe = _validated_live_universe(
+                [dict(row) for row in fb_reading.rows()], day, max_quote_age_minutes=180)
             fb_gate = _live_scan_gate(fb_universe, day)
             if fb_gate["ready"]:
                 with _db() as fb_conn:

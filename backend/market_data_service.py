@@ -63,8 +63,8 @@ __all__ = [
     "KIND_FULL_MARKET_SNAPSHOT", "KINDS",
     "MarketDataAccessError",
     "full_market_snapshot_projection", "market_health_projection",
-    "now_utc", "read_projection", "read_snapshot", "refresh_rows",
-    "refresh_snapshot", "snapshot_from_cached_payload",
+    "now_utc", "read_projection", "read_snapshot", "read_snapshot_with_meta",
+    "refresh_rows", "refresh_snapshot", "snapshot_from_cached_payload",
 ]
 
 #: 全市场横截面快照 —— 目前唯一的 Market Data fact kind。
@@ -137,57 +137,124 @@ def snapshot_from_cached_payload(
         expected = int(payload.get("expected_rows") or 0)
     except (TypeError, ValueError):
         expected = 0
-    return MDC.MarketDataSnapshot(
-        kind=kind,
-        rows=tuple(row for row in rows if isinstance(row, Mapping)),
-        as_of=MDC.canonical_day(observed_at),
+    return _full_market_snapshot(
+        rows=rows,
         observed_at=observed_at,
         saved_at=str(saved_at) if saved_at else None,
-        source="eastmoney_clist_full_snapshot",
         complete=complete,
         expected_rows=expected,
-        # 横截面快照的核验机制是**完整性与覆盖**（既有的 completeness
-        # marker + 行覆盖门槛），不是逐票双源核验 —— 后者属于
-        # ``_quotes`` 的个股路径，本 kind 不冒充。
+        kind=kind,
+    )
+
+
+def _full_market_snapshot(
+    *,
+    rows,
+    observed_at: str | None,
+    saved_at: str | None,
+    complete: bool,
+    expected_rows: int,
+    kind: str,
+) -> MDC.MarketDataSnapshot:
+    """全市场横截面快照的唯一构造点（R24 复审修正后的核验语义）。
+
+    关键：这个 kind 的核验机制是**完整性与覆盖**（持久化 reader 的 complete
+    marker + 行数/唯一代码/期望覆盖率门槛），**不是**逐票双源交叉核验。
+    因此：
+
+    * 完整性通过 → ``verification="verified"`` + ``verification_method=
+      "coverage_integrity"`` —— 表示"本 kind 的 policy 通过了"，
+      **不**表示每一行都有第二个源确认过；
+    * 完整性不通过 → ``not_attempted`` + ``degraded_reason=incomplete``。
+
+    修正前这里是直接标 ``verification="verified"`` 且不带 method，等于让一个
+    单源快照在契约层看起来像双源验证过；R25/R27 消费时会据此高估可信度。
+    需要双源保证的消费者必须用 :func:`market_data_contract.is_cross_source_verified`。
+    """
+    row_list = [row for row in rows if isinstance(row, Mapping)]
+    return MDC.MarketDataSnapshot(
+        kind=kind,
+        rows=tuple(row_list),
+        as_of=MDC.canonical_day(observed_at),
+        observed_at=observed_at,
+        saved_at=saved_at,
+        source="eastmoney_clist_full_snapshot",
+        complete=complete,
+        expected_rows=expected_rows,
         verification=(
             MDC.VERIFICATION_VERIFIED if complete else MDC.VERIFICATION_NOT_ATTEMPTED
+        ),
+        verification_method=(
+            MDC.VERIFICATION_METHOD_COVERAGE_INTEGRITY if complete
+            else MDC.VERIFICATION_METHOD_NONE
+        ),
+        # 逐源证据：让"凭什么说它完整"可审计，而不是一个裸布尔。
+        verification_detail=(
+            {
+                "policy": "coverage_integrity",
+                "rows": len(row_list),
+                "unique_codes": len({
+                    str(row.get("code")) for row in row_list if row.get("code")
+                }),
+                "expected_rows": expected_rows,
+            }
+            if complete else {"policy": "coverage_integrity", "passed": False}
         ),
         degraded_reason=None if complete else MDC.REASON_INCOMPLETE,
     )
 
 
-def _load_cached_snapshot(
+def _load_cached_snapshot_with_meta(
     kind: str,
-) -> MDC.MarketDataSnapshot | None:
-    """读持久化事实。**只做本地读取，绝不触网。**
+) -> tuple[MDC.MarketDataSnapshot | None, Mapping[str, Any]]:
+    """读持久化事实，并**保留完整 payload metadata**。
 
-    刻意走 ``data_fetcher.load_market_snapshot_full_cached``（其 docstring 即
-    "Read-only, no network"），而不是 raw ``open(MARKET_SNAPSHOT_FULL_CACHE_PATH)`` ——
-    后者会绕过完整性校验（当前 ``main.health`` / ``adaptive_engine`` /
-    ``trade_attribution`` / ``demo_seed`` 就是这么绕过校验的）。
+    R24 复审修正：旧实现只取 ``rows``，于是 ``saved_at`` / ``expected_rows``
+    被丢成 ``None`` / ``0`` —— ``/api/health`` 的 ``live_snapshot.saved_at``
+    与基于它算出的 ``age_seconds`` 也随之丢失，属未声明的行为回退。
+
+    这里返回 ``(snapshot, payload)``，让需要源元数据的消费者（health 的
+    data-validity 明细）拿得到原始字段，而不是被迫重新 ``open()`` 那个文件
+    （那条旁路会绕过完整性校验）。
     """
     if kind != KIND_FULL_MARKET_SNAPSHOT:
         raise ValueError(f"unknown market data kind: {kind!r}")
     try:
-        rows = dfc_module.load_market_snapshot_full_cached()
+        payload = dfc_module.load_market_snapshot_full_payload()
     except Exception:
-        return None
-    if not rows:
-        return None
-    # ``load_market_snapshot_full_cached`` 已确认 payload 完整，因此这里
-    # 直接构造 snapshot，不再重读文件。
-    newest = _newest_quote_at(rows)
-    return MDC.MarketDataSnapshot(
-        kind=kind,
-        rows=tuple(rows),
-        as_of=MDC.canonical_day(newest),
-        observed_at=newest,
-        saved_at=None,
-        source="eastmoney_clist_full_snapshot",
-        complete=True,
-        expected_rows=0,
-        verification=MDC.VERIFICATION_VERIFIED,
+        return None, {}
+    if not isinstance(payload, Mapping):
+        return None, {}
+    return snapshot_from_cached_payload(payload, kind=kind), payload
+
+
+def _load_cached_snapshot(
+    kind: str,
+) -> MDC.MarketDataSnapshot | None:
+    """读持久化事实。**只做本地读取，绝不触网。**"""
+    return _load_cached_snapshot_with_meta(kind)[0]
+
+
+def read_snapshot_with_meta(
+    policy: MDC.MarketDataPolicy = MDC.LIVE_MARKET_POLICY,
+    *,
+    now: Any,
+    asof_day: Any = None,
+    kind: str = KIND_FULL_MARKET_SNAPSHOT,
+) -> tuple[MDC.MarketDataReading, Mapping[str, Any]]:
+    """:func:`read_snapshot` + 原始 payload metadata。
+
+    给需要源元数据的消费者（``/api/health`` 的 data-validity 明细：
+    ``saved_at`` / ``expected_rows`` / 行覆盖）使用，让它们不必绕过
+    authority 去 ``open()`` 那个文件。
+    """
+    deadline = _resolve_now(policy, now)
+    snapshot, payload = _load_cached_snapshot_with_meta(kind)
+    reading = MDC.classify(
+        snapshot, policy, now=deadline, access_mode=MDC.ACCESS_READ,
+        asof_day=asof_day,
     )
+    return reading, payload
 
 
 # ---------------------------------------------------------------------------
@@ -254,17 +321,21 @@ def refresh_snapshot(
             reason=MDC.REASON_REFRESH_FAILED,
         )
     newest = _newest_quote_at(rows)
-    refreshed = MDC.MarketDataSnapshot(
-        kind=kind,
-        rows=tuple(row for row in rows if isinstance(row, Mapping)),
-        as_of=MDC.canonical_day(newest),
-        observed_at=newest,
-        saved_at=None,
-        source="eastmoney_clist_full_snapshot",
-        complete=len(rows) >= dfc_module.FULL_MARKET_MIN_ROWS,
-        expected_rows=0,
-        verification=MDC.VERIFICATION_VERIFIED,
-    )
+    # 刷新已把结果写入持久化层；优先用那份**经同一完整性判据**的 payload 作
+    # metadata 来源（能拿到 saved_at / expected_rows / 真实覆盖），与只读路径
+    # 完全同口径。拿不到时才退回"只凭本次 rows"的保守判定。
+    persisted, _payload = _load_cached_snapshot_with_meta(kind)
+    if persisted is not None and persisted.observed_at is not None:
+        refreshed = persisted
+    else:
+        refreshed = _full_market_snapshot(
+            rows=rows,
+            observed_at=newest,
+            saved_at=None,
+            complete=len(rows) >= dfc_module.FULL_MARKET_MIN_ROWS,
+            expected_rows=0,
+            kind=kind,
+        )
     return MDC.classify(
         refreshed, policy, now=deadline, access_mode=MDC.ACCESS_REFRESH,
         asof_day=asof_day,
@@ -338,6 +409,29 @@ def refresh_rows(
     return [dict(row) for row in reading.rows() if isinstance(row, Mapping)]
 
 
+def read_snapshot_legacy_shape() -> tuple[list[dict[str, Any]], str | None, str | None]:
+    """只读全市场事实，返回既有消费者期望的 ``(rows, saved_at, source_label)``。
+
+    存在的理由：``adaptive_engine`` / ``deepseek_advisor`` / ``trade_attribution``
+    历史上各自 ``open()`` 那两个 JSON 文件，并在第一个文件失败时**回退**
+    ``market_snapshot.json`` —— 那是 20 页风险样本（约 1/25 个市场），
+    把它当全市场快照会系统性歪曲板块/个股统计。裸读也绕过了
+    ``_full_snapshot_payload_is_complete``。
+
+    这里只返回**经完整性校验**的 full-market 事实；拿不到就返回空元组，
+    让调用方走"无快照"分支（如实降级，好过用错误 artifact 冒充）。
+    """
+    try:
+        reading, payload = read_snapshot_with_meta(now=now_utc())
+    except Exception:
+        return [], None, None
+    rows = [dict(row) for row in reading.rows()]
+    if not rows:
+        return [], None, None
+    saved_at = payload.get("saved_at") if isinstance(payload, Mapping) else None
+    return rows, (str(saved_at) if saved_at else None), "market_snapshot_full"
+
+
 # ---------------------------------------------------------------------------
 # 给 API / 前端的唯一投影（§22 / §46）
 # ---------------------------------------------------------------------------
@@ -359,11 +453,31 @@ def market_health_projection(*, now: Any) -> dict[str, Any]:
 
     §45：provider health 红色**不**自动作废最后已验证的 snapshot；
     snapshot 存在也**不**代表 provider 当前健康。两者并列展示、互不推导。
+
+    ``data_fact`` 用 ``MARKET_HEALTH_POLICY``（1800s）判定 —— 这是 health 页
+    既有的展示口径，**不是** ``LIVE_MARKET_POLICY`` 的 240s（R24 复审前
+    1800s 硬编码在 ``main.health`` 里，属调用层的第二份 freshness 判决）。
+    同时保留完整 payload metadata，让 consumer 不必绕过 authority 读文件。
     """
-    reading = read_snapshot(MDC.LIVE_MARKET_POLICY, now=now)
+    reading, payload = read_snapshot_with_meta(MDC.MARKET_HEALTH_POLICY, now=now)
     provider_health = dfc_module.load_source_health() or {}
+    rows = payload.get("rows") if isinstance(payload, Mapping) else None
+    rows = rows if isinstance(rows, list) else []
+    try:
+        expected_rows = int(payload.get("expected_rows") or 0) if payload else 0
+    except (TypeError, ValueError):
+        expected_rows = 0
     return {
         "data_fact": reading.projection(),
+        # 源元数据：health 的 data-validity 明细直接消费这些字段。
+        "snapshot_meta": {
+            "saved_at": payload.get("saved_at") if payload else None,
+            "expected_rows": expected_rows,
+            "rows": len(rows),
+            "complete": bool(
+                reading.snapshot.complete if reading.snapshot is not None else False
+            ),
+        },
         # provider/系统健康：诊断语义，普通运行页面默认不展示细节。
         "provider_health": {
             "healthy": bool(provider_health.get("healthy")),

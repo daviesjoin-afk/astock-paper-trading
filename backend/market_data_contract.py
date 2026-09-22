@@ -47,7 +47,7 @@
 from __future__ import annotations
 
 import datetime as dt
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from types import MappingProxyType
 from typing import Any, Iterable, Mapping
 
@@ -60,6 +60,10 @@ __all__ = [
     "VERIFICATION_VERIFIED", "VERIFICATION_SINGLE_SOURCE",
     "VERIFICATION_DISAGREEMENT", "VERIFICATION_UNAVAILABLE",
     "VERIFICATION_NOT_ATTEMPTED", "VERIFICATIONS",
+    # verification method
+    "VERIFICATION_METHOD_CROSS_SOURCE", "VERIFICATION_METHOD_COVERAGE_INTEGRITY",
+    "VERIFICATION_METHOD_NONE", "VERIFICATION_METHODS",
+    "is_cross_source_verified",
     # access mode
     "ACCESS_READ", "ACCESS_REFRESH", "ACCESS_MODES",
     # reasons
@@ -73,7 +77,8 @@ __all__ = [
     # policy
     "MarketDataPolicy", "LIVE_MARKET_POLICY", "AUCTION_PRESELECTION_POLICY",
     "OPENING_EVENT_POLICY", "UNIVERSE_BUILD_POLICY", "ATTRIBUTION_POLICY",
-    "CLOSE_SNAPSHOT_POLICY", "POLICIES", "policy_named",
+    "CLOSE_SNAPSHOT_POLICY", "MARKET_HEALTH_POLICY", "POLICIES", "policy_named",
+    "CROSS_SECTION_MIN_FRESH_RATIO", "fresh_ratio",
     # snapshot / reading
     "MarketDataSnapshot", "MarketDataReading",
     # helpers
@@ -122,6 +127,44 @@ VERIFICATIONS = (
     VERIFICATION_DISAGREEMENT, VERIFICATION_UNAVAILABLE,
     VERIFICATION_NOT_ATTEMPTED,
 )
+
+# ---------------------------------------------------------------------------
+# verification_method —— ``verified`` 到底"被什么验证过"（R24 复审修正）
+# ---------------------------------------------------------------------------
+
+#: 逐行/逐票的**第二独立来源**核验（例如主源 + 腾讯/新浪行情）。
+#: 这才是"多源核验"的字面含义。
+VERIFICATION_METHOD_CROSS_SOURCE = "cross_source"
+#: **完整性与覆盖**核验：持久化 reader 记录了完整分页标记，且行数 / 唯一代码数 /
+#: 期望覆盖率同时达标。它证明的是"这份横截面是完整的市场切片"，
+#: **不**证明"每一行都有第二个源交叉确认过"。
+VERIFICATION_METHOD_COVERAGE_INTEGRITY = "coverage_integrity"
+#: 没有做任何核验（``not_attempted`` / 缓存只读直出）。
+VERIFICATION_METHOD_NONE = "none"
+VERIFICATION_METHODS = (
+    VERIFICATION_METHOD_CROSS_SOURCE, VERIFICATION_METHOD_COVERAGE_INTEGRITY,
+    VERIFICATION_METHOD_NONE,
+)
+
+#: 每个 verification 状态**允许**的 method —— 这是本轮复审的核心修正。
+#:
+#: 修正前：单源 Eastmoney 全市场快照只要完整性通过就直接标成
+#: ``verification="verified"``，而 ``verified`` 的定义是"多源核验通过"。
+#: 那会让一个**单源**快照在契约层看起来像双源验证过；R25/R27 直接消费这个
+#: contract 时就会据此高估可信度。
+#:
+#: 修正后：``verified`` 的含义固定为"**该 kind 的 verification policy 已通过**"，
+#: 而"通过了哪一套 policy"由 ``verification_method`` 显式表达，消费者必须同时
+#: 读这两个字段，不得只看 ``verified`` 就假设是双源。
+_VERIFICATION_METHODS_BY_STATE = {
+    VERIFICATION_VERIFIED: (
+        VERIFICATION_METHOD_CROSS_SOURCE, VERIFICATION_METHOD_COVERAGE_INTEGRITY,
+    ),
+    VERIFICATION_SINGLE_SOURCE: (VERIFICATION_METHOD_CROSS_SOURCE,),
+    VERIFICATION_DISAGREEMENT: (VERIFICATION_METHOD_CROSS_SOURCE,),
+    VERIFICATION_UNAVAILABLE: (VERIFICATION_METHOD_CROSS_SOURCE,),
+    VERIFICATION_NOT_ATTEMPTED: (VERIFICATION_METHOD_NONE,),
+}
 
 # ---------------------------------------------------------------------------
 # access mode —— 本轮最重要的 contract（§10 Network Policy）
@@ -196,12 +239,18 @@ class MarketDataPolicy:
     ``max_age_seconds`` 是**观测时点**到 ``now`` 的容忍窗口。``name`` 用于
     审计与 reason 归因，让"为什么这条被判 stale"可追溯。
 
-    刻意不是配置框架：只有名字和一个窗口。不同业务消费者用不同 policy，
-    相同业务消费者**必须**共用同一个常量。
+    ``min_fresh_ratio`` 是**横截面**要求：窗口内的行数占可解析总行数的比例
+    必须达标。默认 0 表示"只看最新一条观测时点"，适用于单点事实（一条报价、
+    一个指数）。**全市场横截面必须设正值** —— 否则"3999 条隔夜旧数据 + 1 条
+    刚更新的数据"会因为是完整 payload、且最新一条够新而被判 fresh，
+    而这显然不是一个可信的实时横截面。
+
+    刻意不是配置框架：只有名字、一个窗口、一个比例。
     """
 
     name: str
     max_age_seconds: float
+    min_fresh_ratio: float = 0.0
 
     def __post_init__(self) -> None:
         if not str(self.name or "").strip():
@@ -210,19 +259,38 @@ class MarketDataPolicy:
             raise ValueError(
                 f"policy {self.name}: max_age_seconds must be a non-negative number"
             )
+        if not isinstance(self.min_fresh_ratio, (int, float)) or not (
+            0.0 <= self.min_fresh_ratio <= 1.0
+        ):
+            raise ValueError(
+                f"policy {self.name}: min_fresh_ratio must be within [0, 1]"
+            )
+
+
+#: 横截面快照的默认覆盖要求（与既有 `_validated_live_universe` /
+#: `main.health` 的"当日有效行达门槛"口径同源）。
+CROSS_SECTION_MIN_FRESH_RATIO = 0.90
 
 
 #: 全市场实时快照：周期扫描、市场门控、运行时读取、allocation-explain。
 #: 这是唯一持有 240s 的地方；调用方不再各自写 ``max_age=240``。
-LIVE_MARKET_POLICY = MarketDataPolicy("live_market", 240.0)
+#: 带 90% 覆盖要求：横截面的新鲜度是"多少行够新"，不是"最新那一行够新"。
+LIVE_MARKET_POLICY = MarketDataPolicy(
+    "live_market", 240.0, min_fresh_ratio=CROSS_SECTION_MIN_FRESH_RATIO,
+)
 
 #: 09:25 集合竞价预选：只认竞价窗口内的快照。
-AUCTION_PRESELECTION_POLICY = MarketDataPolicy("auction_preselection", 90.0)
+AUCTION_PRESELECTION_POLICY = MarketDataPolicy(
+    "auction_preselection", 90.0, min_fresh_ratio=CROSS_SECTION_MIN_FRESH_RATIO,
+)
 
 #: 开盘事件监测：容忍窗口更短。
-OPENING_EVENT_POLICY = MarketDataPolicy("opening_event", 120.0)
+OPENING_EVENT_POLICY = MarketDataPolicy(
+    "opening_event", 120.0, min_fresh_ratio=CROSS_SECTION_MIN_FRESH_RATIO,
+)
 
-#: 全市场名单构建：允许较宽松的重建窗口。
+#: 全市场名单构建：允许较宽松的重建窗口（名单是低频静态资产，覆盖比新鲜更
+#: 重要，因此这里只要求新鲜度窗口、不额外要求比例）。
 UNIVERSE_BUILD_POLICY = MarketDataPolicy("universe_build", 300.0)
 
 #: 成交归因报告：盘后离线使用，窗口最宽。
@@ -232,9 +300,17 @@ ATTRIBUTION_POLICY = MarketDataPolicy("trade_attribution", 900.0)
 #: 既有的 ``max_age=0, force=True`` 语义由它统一表达，调用方不再各写一遍 0。
 CLOSE_SNAPSHOT_POLICY = MarketDataPolicy("close_snapshot", 0.0)
 
+#: ``/api/health`` 的 data-validity 展示：既有口径是盘中 1800s / 非盘中更宽。
+#: 它**不**并入 ``LIVE_MARKET_POLICY`` 的 240s —— 两者业务问题不同：
+#: 240s 回答"能不能拿它做实时决策"，1800s 回答"这份切片还值不值得展示"。
+#: R24 复审前这个 1800s 硬编码在 ``main.health`` 里，属调用层第二份判决；
+#: 现在由 authority 执行同一 policy。
+MARKET_HEALTH_POLICY = MarketDataPolicy("market_health_display", 1800.0)
+
 POLICIES = (
     LIVE_MARKET_POLICY, AUCTION_PRESELECTION_POLICY, OPENING_EVENT_POLICY,
     UNIVERSE_BUILD_POLICY, ATTRIBUTION_POLICY, CLOSE_SNAPSHOT_POLICY,
+    MARKET_HEALTH_POLICY,
 )
 
 _POLICY_BY_NAME = {policy.name: policy for policy in POLICIES}
@@ -349,6 +425,9 @@ class MarketDataSnapshot:
     complete: bool = False
     expected_rows: int = 0
     verification: str = VERIFICATION_NOT_ATTEMPTED
+    #: **这次** ``verified`` 是通过哪套 policy 得到的。消费者必须同时读它，
+    #: 不得只看 ``verification == "verified"`` 就假设是双源核验。
+    verification_method: str = VERIFICATION_METHOD_NONE
     verification_detail: Mapping[str, Any] = field(default_factory=dict)
     degraded_reason: str | None = None
 
@@ -358,6 +437,13 @@ class MarketDataSnapshot:
         if self.verification not in VERIFICATIONS:
             raise ValueError(
                 f"snapshot {self.kind}: unknown verification {self.verification!r}"
+            )
+        allowed = _VERIFICATION_METHODS_BY_STATE.get(self.verification)
+        if allowed is not None and self.verification_method not in allowed:
+            raise ValueError(
+                f"snapshot {self.kind}: verification={self.verification!r} cannot "
+                f"carry verification_method={self.verification_method!r} "
+                f"(allowed: {allowed})"
             )
         if self.degraded_reason is not None and self.degraded_reason not in REASONS:
             raise ValueError(
@@ -445,6 +531,12 @@ class MarketDataReading:
                 self.snapshot.verification if self.snapshot is not None
                 else VERIFICATION_NOT_ATTEMPTED
             ),
+            # ``verified`` 是"哪套 policy 通过了"。消费者必须同时读这一项：
+            # coverage_integrity 不是多源交叉核验。
+            "verification_method": (
+                self.snapshot.verification_method if self.snapshot is not None
+                else VERIFICATION_METHOD_NONE
+            ),
             "as_of": self.snapshot.as_of if self.snapshot is not None else None,
             "observed_at": (
                 self.snapshot.observed_at if self.snapshot is not None else None
@@ -510,6 +602,49 @@ def reading_for_refresh_failure(
                     refresh_failed=True)
 
 
+def fresh_ratio(rows: Any, now: Any, max_age: float) -> float | None:
+    """窗口内的行数占**可解析总行数**的比例；无可解析行时 ``None``。
+
+    横截面新鲜度必须看比例，而不是"最新那一行够不够新"。
+    """
+    current = _parse_instant(now)
+    if current is None:
+        return None
+    parsed = 0
+    fresh = 0
+    for row in rows or ():
+        if not isinstance(row, Mapping):
+            continue
+        age = _age_seconds(row.get("quote_at") or row.get("observed_at"), current)
+        if age is None:
+            continue
+        parsed += 1
+        if age <= max_age:
+            fresh += 1
+    if not parsed:
+        return None
+    return fresh / parsed
+
+
+def _cross_section_freshness(
+    rows: Any, now: dt.datetime | None, policy: MarketDataPolicy,
+    newest_age: float | None,
+) -> tuple[bool, float | None]:
+    """横截面是否满足 policy 的要求；无比例要求时退化为"最新一条在窗口内"。
+
+    ``newest_age`` 是调用方已经从 ``snapshot.observed_at`` 算好的最新观测间隔，
+    因此单点 kind 不需要第二次遍历。返回 ``(satisfied, ratio)``。
+    """
+    if policy.min_fresh_ratio <= 0:
+        return (
+            newest_age is not None and newest_age <= policy.max_age_seconds
+        ), None
+    ratio = fresh_ratio(rows, now, policy.max_age_seconds)
+    if ratio is None:
+        return False, None
+    return ratio >= policy.min_fresh_ratio, ratio
+
+
 def classify(
     snapshot: MarketDataSnapshot | None,
     policy: MarketDataPolicy,
@@ -531,9 +666,9 @@ def classify(
         多源不一致                            → UNVERIFIED/ cross_source_failed
         核验源不可用                          → DEGRADED  / cross_source_failed
         观测时点不可解析                       → STALE     / stale  (freshness=unknown)
-        观测时点超出 policy 窗口               → STALE     / stale
+        横截面新鲜覆盖不足 / 超窗              → STALE     / stale
         只有单源证据                          → DEGRADED
-        多源通过 + 窗口内                     → FRESH
+        通过该 kind 的 verification policy     → FRESH
         刷新失败但有旧事实                     → STALE     / refresh_failed
     """
     if snapshot is None:
@@ -568,93 +703,75 @@ def classify(
             )
 
     age = _age_seconds(snapshot.observed_at, now)
+    deadline = _parse_instant(now)
+    satisfied, ratio = _cross_section_freshness(
+        snapshot.rows, deadline, policy, age,
+    )
+    detail = dict(snapshot.verification_detail)
+    if ratio is not None:
+        detail["fresh_ratio"] = round(ratio, 4)
+        detail["min_fresh_ratio"] = policy.min_fresh_ratio
+
+    def _reading(**overrides) -> MarketDataReading:
+        base = {
+            "policy_name": policy.name,
+            "snapshot": _with_detail(snapshot, detail),
+            "age_seconds": age,
+            "access_mode": access_mode,
+        }
+        base.update(overrides)
+        return MarketDataReading(**base)
 
     if not snapshot.complete:
-        return MarketDataReading(
-            availability=AVAILABILITY_AVAILABLE,
-            freshness=FRESHNESS_STALE,
+        return _reading(
+            availability=AVAILABILITY_AVAILABLE, freshness=FRESHNESS_STALE,
             status=STATUS_STALE,
-            policy_name=policy.name,
-            snapshot=snapshot,
             reason=snapshot.degraded_reason or REASON_INCOMPLETE,
-            age_seconds=age,
-            access_mode=access_mode,
         )
 
     if snapshot.verification == VERIFICATION_DISAGREEMENT:
-        return MarketDataReading(
-            availability=AVAILABILITY_AVAILABLE,
-            freshness=FRESHNESS_UNKNOWN,
-            status=STATUS_UNVERIFIED,
-            policy_name=policy.name,
-            snapshot=snapshot,
-            reason=REASON_CROSS_SOURCE_FAILED,
-            age_seconds=age,
-            access_mode=access_mode,
+        return _reading(
+            availability=AVAILABILITY_AVAILABLE, freshness=FRESHNESS_UNKNOWN,
+            status=STATUS_UNVERIFIED, reason=REASON_CROSS_SOURCE_FAILED,
         )
 
     if snapshot.verification == VERIFICATION_UNAVAILABLE:
-        return MarketDataReading(
-            availability=AVAILABILITY_AVAILABLE,
-            freshness=FRESHNESS_UNKNOWN,
-            status=STATUS_DEGRADED,
-            policy_name=policy.name,
-            snapshot=snapshot,
-            reason=REASON_CROSS_SOURCE_FAILED,
-            age_seconds=age,
-            access_mode=access_mode,
+        return _reading(
+            availability=AVAILABILITY_AVAILABLE, freshness=FRESHNESS_UNKNOWN,
+            status=STATUS_DEGRADED, reason=REASON_CROSS_SOURCE_FAILED,
         )
 
     if refresh_failed:
-        return MarketDataReading(
-            availability=AVAILABILITY_AVAILABLE,
-            freshness=FRESHNESS_STALE,
-            status=STATUS_STALE,
-            policy_name=policy.name,
-            snapshot=snapshot,
-            reason=REASON_REFRESH_FAILED,
-            age_seconds=age,
-            access_mode=access_mode,
+        return _reading(
+            availability=AVAILABILITY_AVAILABLE, freshness=FRESHNESS_STALE,
+            status=STATUS_STALE, reason=REASON_REFRESH_FAILED,
         )
 
-    if age is None:
-        # 源观测时点不可解析：既不能算 fresh 也不该算 unavailable。
-        return MarketDataReading(
+    if not satisfied:
+        # 源观测时点不可解析、或横截面新鲜覆盖不足 —— 都不能算 fresh。
+        return _reading(
             availability=AVAILABILITY_AVAILABLE,
-            freshness=FRESHNESS_UNKNOWN,
-            status=STATUS_STALE,
-            policy_name=policy.name,
-            snapshot=snapshot,
-            reason=REASON_STALE,
-            age_seconds=None,
-            access_mode=access_mode,
-        )
-
-    if age > policy.max_age_seconds:
-        return MarketDataReading(
-            availability=AVAILABILITY_AVAILABLE,
-            freshness=FRESHNESS_STALE,
-            status=STATUS_STALE,
-            policy_name=policy.name,
-            snapshot=snapshot,
-            reason=REASON_STALE,
-            age_seconds=age,
-            access_mode=access_mode,
+            freshness=FRESHNESS_UNKNOWN if age is None else FRESHNESS_STALE,
+            status=STATUS_STALE, reason=REASON_STALE,
         )
 
     single_source = snapshot.verification in (
         VERIFICATION_SINGLE_SOURCE, VERIFICATION_NOT_ATTEMPTED,
     )
-    return MarketDataReading(
-        availability=AVAILABILITY_AVAILABLE,
-        freshness=FRESHNESS_FRESH,
+    return _reading(
+        availability=AVAILABILITY_AVAILABLE, freshness=FRESHNESS_FRESH,
         status=STATUS_DEGRADED if single_source else STATUS_FRESH,
-        policy_name=policy.name,
-        snapshot=snapshot,
         reason=None if not single_source else REASON_CROSS_SOURCE_FAILED,
-        age_seconds=age,
-        access_mode=access_mode,
     )
+
+
+def _with_detail(
+    snapshot: MarketDataSnapshot, detail: Mapping[str, Any],
+) -> MarketDataSnapshot:
+    """带（补充后的）核验证据复制一份 snapshot；证据未变则原样返回。"""
+    if detail == dict(snapshot.verification_detail):
+        return snapshot
+    return replace(snapshot, verification_detail=detail)
 
 
 def worst_verification(verifications: Iterable[str]) -> str:
@@ -685,3 +802,19 @@ def verification_from_cross_status(status: Any) -> str:
         "range_timestamp_checked": VERIFICATION_SINGLE_SOURCE,
         "unverified": VERIFICATION_NOT_ATTEMPTED,
     }.get(text, VERIFICATION_NOT_ATTEMPTED)
+
+
+def is_cross_source_verified(snapshot: MarketDataSnapshot | None) -> bool:
+    """该快照是否**真的**通过了多源交叉核验。
+
+    这是"``verified`` 不等于双源"的显式判据：``verified`` + method=coverage_integrity
+    **不是**多源核验，只有 method=cross_source 才是。需要双源保证的消费者
+    （例如 AI 调参门禁、R25/R27 的可信事实判定）必须调用它，而不是比较
+    ``snapshot.verification == "verified"``。
+    """
+    if snapshot is None:
+        return False
+    return (
+        snapshot.verification == VERIFICATION_VERIFIED
+        and snapshot.verification_method == VERIFICATION_METHOD_CROSS_SOURCE
+    )
