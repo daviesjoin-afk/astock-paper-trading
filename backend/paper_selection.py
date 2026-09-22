@@ -22,11 +22,12 @@ active cycle、也从不从 ``paper_accounts.cycle_id`` 推断周期。
 
 Provenance（R23）
 -----------------
-每个 run 在**创建的那一刻**通过 :mod:`strategy_selection_resolver` pin 一次
+每个 run 在**计算开始之前**通过 :mod:`strategy_selection_resolver` pin 一次
 immutable ``(strategy_id, version, checksum)``，并经
 :func:`strategy_selection_provenance.resolve_asof_day` 解析一次 ``asof_day``，
-然后持久化。同一 run 的 picks 通过 ``run_id`` 引用 run，**不**各自重复解析版本
-（规格 §24：避免 N picks → N Registry queries）。
+然后持久化。pin 必须在计算前取：否则「读到 v1 → 中途升级 v2 → 计算后解析」
+会把 v1 时代的计算记成 v2。同一 run 的 picks 通过 ``run_id`` 引用 run，**不**各自
+重复解析版本（规格 §24：避免 N picks → N Registry queries）。
 
 历史读取只读 persisted stamp：:func:`latest` 不再用**当前** Registry 决定历史
 可见性，也不再用当前名称解释历史行（规格 §15）。
@@ -455,8 +456,11 @@ def run_daily(strategies=None, topn: int = DEFAULT_TOPN, run_date: str | None = 
 
     Provenance 语义：
 
-    * 每个策略在 run 创建时 pin **一次** immutable head，并解析一次 ``asof_day``；
-      同一 run 的 picks 共享该 provenance（``run_id`` 引用）；
+    * 顺序是 **pin → compute → as-of → combine → write**：每个策略在 ``_run_one``
+      **之前** pin 一次 immutable head，计算结束后只再解析 ``asof_day``，然后
+      组装并持久化。绝不「先算完再问一次 current head」——那会把计算期间发布的
+      新版本记成产出该结果的那一版（TOCTOU 归因）；
+    * 同一 run 的 picks 共享该 provenance（``run_id`` 引用）；
     * 重跑只覆盖**同一个 provenance key**；immutable version 变了就是另一份证据，
       旧证据保留；
     * as-of 无法唯一确定（缺候选日期 / 多日期冲突）时 run 记为
@@ -477,6 +481,11 @@ def run_daily(strategies=None, topn: int = DEFAULT_TOPN, run_date: str | None = 
             now = dt.datetime.now(CHINA_TZ).isoformat(timespec="seconds")
             status, message, picks, factor_date = "error", "", [], ""
             result = None
+            # R23：immutable version 必须在**计算开始之前** pin 一次。若等到
+            # selection 跑完再读 current head，那么 T0 读到 v1、T2 策略升级到
+            # v2、T4 才解析 provenance 就会把一份 v1 时代的计算记成 v2 —— 这是
+            # 错误的 provenance，而且无法从结果里看出来。
+            pin = _pin_research_version(item["strategy_id"])
             try:
                 result = _run_one(item["model_id"], topn)
                 if not isinstance(result, dict):
@@ -514,7 +523,7 @@ def run_daily(strategies=None, topn: int = DEFAULT_TOPN, run_date: str | None = 
                 message = f"{type(exc).__name__}: {exc}"[:300]
 
             provenance = _run_provenance(conn, item["strategy_id"], result,
-                                        explicit_asof=asof_day)
+                                        explicit_asof=asof_day, pin=pin)
 
             # 覆盖语义：只覆盖**同一份证据**（同 provenance key），重跑不留副本；
             # 不同 immutable version / 不同 as-of 是另一份证据，绝不 DELETE。
@@ -561,14 +570,38 @@ def run_daily(strategies=None, topn: int = DEFAULT_TOPN, run_date: str | None = 
         conn.close()
 
 
-def _run_provenance(conn, strategy_id: str, result, *, explicit_asof=None) -> dict:
-    """Pin one run's provenance: resolve the immutable head once, the as-of once.
+def _pin_research_version(strategy_id: str):
+    """Read the strategy's immutable head **once, before the run computes**.
 
-    The immutable version comes from
-    :func:`strategy_selection_resolver.research_provenance` —— 研究 run **唯一**
-    允许读"现在"的地方；as-of 来自
-    :func:`strategy_selection_provenance.resolve_asof_day`，它拒绝缺失或冲突的
-    输入而不是猜一个。
+    Returns ``None`` when the strategy has no immutable version; the run then
+    records an honest ``unknown`` instead of being stamped with whatever the head
+    happens to be later.
+
+    Scope, stated honestly: the pinned version is the **attributed published
+    identity** of this run, not an input the scoring consumed. Family A's
+    selection semantics come from ``model_id`` (``STRATEGY_MODEL`` →
+    ``strategies.PAPER_WEIGHTS`` / ``_paper_conditions``) — i.e. from code, not
+    from the immutable definition row. An edit to that row does not by itself
+    change which stocks get picked. The pin is still required to be taken here
+    (before ``_run_one``) so a publication landing mid-run can never be credited
+    with a result it did not produce.
+    """
+    with closing(_registry_conn()) as registry:
+        return SRES.research_version_pin(registry, strategy_id)
+
+
+def _run_provenance(conn, strategy_id: str, result, *, explicit_asof=None,
+                    pin=None) -> dict:
+    """Assemble one run's provenance from the pre-computation pin + the as-of.
+
+    The immutable version is the ``pin`` taken **before** ``_run_one`` ran (see
+    :func:`_pin_research_version`), so a strategy edit landing mid-computation
+    cannot change what this run is recorded as having used. The as-of comes from
+    :func:`strategy_selection_provenance.resolve_asof_day`, which refuses missing
+    or conflicting input rather than guessing.
+
+    There is deliberately **no** current-head read here: the only head read for a
+    run happens once, earlier, in the caller.
     """
     declared = SP.declared_asof_candidates(result)
     try:
@@ -581,9 +614,10 @@ def _run_provenance(conn, strategy_id: str, result, *, explicit_asof=None) -> di
         reading = SP.ProvenanceReading(None, SP.STATUS_UNKNOWN,
                                        asof_detail or "as-of unprovable", str(strategy_id))
     else:
-        # provenance 只 pin 一次：用只读的 registry 连接，读完即关闭并持久化。
+        # 用只读的 registry 连接组装 reading；版本来自计算前的 pin，不重读 head。
         with closing(_registry_conn()) as registry:
-            reading = SRES.research_provenance(registry, strategy_id, asof_day=asof)
+            reading = SRES.research_provenance(registry, strategy_id, asof_day=asof,
+                                               pin=pin)
     if reading.is_authoritative:
         payload = reading.require().to_dict()
         payload["provenance_status"] = SP.STATUS_VERIFIED

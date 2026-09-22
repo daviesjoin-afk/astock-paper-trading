@@ -1179,7 +1179,7 @@ def _record_entry_frozen_waitlist(
     if existing:
         return int(existing["id"]), False, reason, payload
     strategy_id, strategy_version, strategy_checksum = _strategy_stamp(
-        conn, account_id, signal_id,
+        conn, account_id, signal_id, cycle_id=_order_cycle_id(conn, cycle_id),
     )
     cursor = conn.execute(
         """INSERT INTO paper_orders(
@@ -3123,30 +3123,33 @@ def _audit(conn, account_id, event, detail, *, strategy_stamp=None):
     )
 
 
-def _strategy_stamp(conn, account_id, signal_id=None):
+def _strategy_stamp(conn, account_id, signal_id=None, *, cycle_id=None):
     """Return one complete causal Strategy Definition version stamp.
 
-    With a ``signal_id`` the stamp is **inherited** from that signal — the
-    decision that produced it — so a later order can never be re-stamped with a
-    version the decision did not use. Without one, the cycle pin is the authority.
+    With a ``signal_id`` the stamp is **inherited** from that signal — the decision
+    that produced it — so a later order can never be re-stamped with a version the
+    decision did not use. A signal that cannot prove its own lineage yields no
+    order: the resolver's ``SignalOrderUnprovable`` propagates rather than filling
+    in from current state. Without one the cycle pin is the authority;
+    ``cycle_id`` is the cycle the caller already resolved, else the durable one.
+    Neither path reads a strategy head.
     """
     if signal_id is not None:
-        row = conn.execute(
-            """SELECT strategy_id,strategy_version,strategy_checksum
-               FROM paper_signals WHERE id=?""",
-            (int(signal_id),),
-        ).fetchone()
-        if row and all(value is not None and value != "" for value in row):
-            return tuple(row)
-    return SR.stamp_for_account(conn, account_id)
+        return SRES.signal_order_provenance(
+            conn, signal_id=signal_id, account_id=account_id,
+            expected_cycle_id=cycle_id,
+        ).stamp
+    stamp = SR.stamp_for_account(conn, account_id, cycle_id=cycle_id)
+    return tuple(stamp) if stamp is not None else (None, None, None)
 
 
-# R23：signal 的周期归属解析归 ``strategy_selection_resolver``（薄 adapter），
-# 它同时给 cycle 与 immutable version，缺 pin 即 fail closed。这里只做别名，
-# 保证既有 import 路径与运维脚本不被打断。
+# R23：signal 的周期归属 / signal-linked order 血缘解析都归
+# ``strategy_selection_resolver``（薄 adapter），这里只做别名，保证既有
+# import 路径与运维脚本不被打断。
 SignalCycleUnprovable = SRES.SignalCycleUnprovable
+SignalOrderUnprovable = SRES.SignalOrderUnprovable
+SignalStaleContext = SRES.SignalStaleContext
 _cycle_signal_provenance = SRES.signal_cycle_provenance
-
 
 def _volatility_shadow(code, asof_day, price=None):
     """Return volatility diagnostics only; never changes a risk threshold."""
@@ -7678,17 +7681,18 @@ def generate_signals(asof_date=None):
                 _audit(conn, account["id"], "research_shadow_failed", research["shadow_error"])
             created = 0
             # R23：signal 的不可变 provenance 在账户粒度的循环**外**解析一次
-            # （规格 §24：避免 N picks → N Registry queries），并且必须同时给出
-            # cycle 与 immutable version —— 缺 pin 时 fail closed（不写错戳）。
-            try:
-                account_cycle_id, account_stamp = _cycle_signal_provenance(conn, account["id"])
-            except SignalCycleUnprovable as exc:
-                _audit(conn, account["id"], "signal_provenance_unprovable", exc.detail)
+            # （规格 §24），周期取候选构建前的捕获归属；期间 rollover 即 stale。
+            account_context, context_error = SRES.signal_write_context_or_error(
+                conn, account["id"], cycle_id=account["cycle_id"],
+                account_cycle_id=current["cycle_id"], asof_day=day.isoformat())
+            if context_error is not None:
+                _audit(conn, account["id"], context_error.event, context_error.detail)
                 summary["accounts"].append({
                     "id": account["id"], "created": 0, "candidates": len(candidates),
-                    "provenance_unprovable": True, "reason": exc.detail, **meta,
-                })
+                    "provenance_unprovable": True, "reason": context_error.detail, **meta})
                 continue
+            account_cycle_id, account_stamp = (
+                account_context.cycle_id, account_context.stamp)
             for pick in candidates:
                 code = pick["code"]
                 quote = evidence_quotes.get(code, {})
@@ -9972,7 +9976,7 @@ def _buy_order(conn, account, signal, quote, market, news, asof_day, *, all_quot
     _supersede_signal_execution_retries(conn, signal.get("id"))
     _assert_active_lease(conn, "strategy buy order write")
     strategy_id, strategy_version, strategy_checksum = _strategy_stamp(
-        conn, account["id"], signal.get("id"),
+        conn, account["id"], signal.get("id"), cycle_id=current_cycle["id"],
     )
     # PR-29：同一信号重建的新委托记录审计血缘——上一条终态尝试的 order id。
     retry_of_order_id = _previous_attempt_order_id(
@@ -11221,19 +11225,19 @@ def _bootstrap_signals_for_today(asof_day, live_universe=None, source_slot="intr
                 waitlisted = 0
                 skipped_existing = 0
                 # R23：signal 的不可变 provenance 在候选循环**外**解析一次
-                # （规格 §24），并且必须同时给出 cycle 与 immutable version ——
-                # 缺 cycle pin 时 fail closed，绝不写一个来自 current head 的戳。
-                try:
-                    bootstrap_cycle_id, bootstrap_stamp = _cycle_signal_provenance(
-                        conn, account["id"],
-                    )
-                except SignalCycleUnprovable as exc:
-                    _audit(conn, account["id"], "signal_provenance_unprovable", exc.detail)
+                # （规格 §24），周期取本函数已解析的 `cycle` 与候选构建前的捕获
+                # 归属；期间 rollover 即整批丢弃（stale_context）。
+                bootstrap_context, bootstrap_error = SRES.signal_write_context_or_error(
+                    conn, account["id"], cycle_id=cycle["id"],
+                    account_cycle_id=account["cycle_id"], asof_day=day.isoformat())
+                if bootstrap_error is not None:
+                    _audit(conn, account["id"], bootstrap_error.event, bootstrap_error.detail)
                     _observe_intraday(
                         conn, cycle["id"], account["id"], None, None, "scan",
-                        exc.detail, {"provenance_unprovable": True},
-                    )
+                        bootstrap_error.detail, {"provenance_unprovable": True})
                     continue
+                bootstrap_cycle_id, bootstrap_stamp = (
+                    bootstrap_context.cycle_id, bootstrap_context.stamp)
                 for pick in candidates:
                     code = pick["code"]
                     is_reentry = code in reentry_codes

@@ -28,6 +28,7 @@ import paper_risk_evidence as PREv
 import paper_risk_scan_state as PRSS
 import strategy_policies as SPOL
 import strategy_registry as SR
+import strategy_selection_resolver as SRES
 import strategy_risk_enforcement as SRE
 import strategy_runtime as SRT
 import user_strategy_participation as USP
@@ -147,15 +148,13 @@ def _spec_for(account_id, conn, *, cycle_id):
 
 
 def _strategy_stamp(conn, account_id, *, cycle_id, signal_id=None):
-    """Return the exact cycle-pinned strategy stamp, or an explicit unknown."""
+    """Exact cycle-pinned stamp, or an explicit unknown. A ``signal_id`` must
+    prove its own lineage, so the resolver raises instead of current-filling."""
     if signal_id is not None:
-        row = conn.execute(
-            """SELECT strategy_id,strategy_version,strategy_checksum
-               FROM paper_signals WHERE id=?""",
-            (int(signal_id),),
-        ).fetchone()
-        if row and all(value is not None and value != "" for value in row):
-            return tuple(row)
+        order = SRES.signal_order_provenance(
+            conn, signal_id=signal_id, account_id=account_id,
+            expected_cycle_id=cycle_id)
+        return order.stamp
     stamp = SR.cycle_stamp_for_account(conn, account_id, cycle_id=cycle_id)
     return tuple(stamp) if stamp is not None else (None, None, None)
 

@@ -155,31 +155,28 @@ MUTATIONS = [
     # ---- M-SP8 / M-SP9 / M-SP13 / M-SP15：signal / order 链 ----
     {
         "id": "M-SP8", "file": RESOLVER,
-        "old": """    stamp = SR.cycle_stamp_for_account(conn, account_id, cycle_id=cycle_id)
+        "old": """    stamp = SR.cycle_stamp_for_account(conn, account_id, cycle_id=requested)
     if stamp is None:
         raise SignalCycleUnprovable(
-            account_id, cycle_id, "cycle has no pinned immutable strategy version"
+            account_id, requested, "cycle has no pinned immutable strategy version"
         )
-    return cycle_id, tuple(stamp)""",
-        "new": """    stamp = SR.cycle_stamp_for_account(conn, account_id, cycle_id=cycle_id)
+    return requested, tuple(stamp)""",
+        "new": """    stamp = SR.cycle_stamp_for_account(conn, account_id, cycle_id=requested)
     if stamp is None:
         stamp = SR.stamp_for_account(conn, account_id)
-    return cycle_id, tuple(stamp)""",
+    return requested, tuple(stamp)""",
         "test": f"{SP}.LedgerProvenanceTests.test_SP11b_signal_writer_fails_closed_without_a_cycle_pin",
         "desc": "signal writer 缺 pin 时改用任何可解析的戳（不再 fail closed）",
     },
     {
         "id": "M-SP9", "file": PAPER,
         "old": """    if signal_id is not None:
-        row = conn.execute(
-            \"\"\"SELECT strategy_id,strategy_version,strategy_checksum
-               FROM paper_signals WHERE id=?\"\"\",
-            (int(signal_id),),
-        ).fetchone()
-        if row and all(value is not None and value != "" for value in row):
-            return tuple(row)
-    return SR.stamp_for_account(conn, account_id)""",
-        "new": """    return SR.stamp_for_account(conn, account_id)""",
+        return SRES.signal_order_provenance(
+            conn, signal_id=signal_id, account_id=account_id,
+            expected_cycle_id=cycle_id,
+        ).stamp
+    stamp = SR.stamp_for_account(conn, account_id, cycle_id=cycle_id)""",
+        "new": """    stamp = SR.stamp_for_account(conn, account_id, cycle_id=cycle_id)""",
         "test": f"{SP}.LedgerProvenanceTests.test_SP12_order_stamp_is_inherited_from_its_signal",
         "desc": "order writer 不再继承 signal 的因果戳，改查 current head",
     },
@@ -198,31 +195,23 @@ MUTATIONS = [
     },
     {
         "id": "M-SP13", "file": RESOLVER,
-        "old": """    row = conn.execute(
-        "SELECT cycle_id FROM paper_accounts WHERE id=?", (str(account_id),)
-    ).fetchone()
-    cycle_id = None
-    if row is not None:
-        try:
-            cycle_id = int(row[0]) if row[0] is not None else None
-        except (TypeError, ValueError, IndexError):
-            cycle_id = None""",
+        "old": """    requested = SP.canonical_cycle_id(cycle_id)
+    if requested is None:
+        raise SignalCycleUnprovable(
+            account_id, None, "signal requires an explicit canonical cycle id"
+        )
+    stamp = SR.cycle_stamp_for_account(conn, account_id, cycle_id=requested)""",
         "new": """    row = conn.execute(
         "SELECT cycle_id FROM paper_accounts WHERE id=?", (str(account_id),)
     ).fetchone()
-    cycle_id = None
-    if row is not None:
-        try:
-            cycle_id = int(row[0]) if row[0] is not None else None
-        except (TypeError, ValueError, IndexError):
-            cycle_id = None
-    if cycle_id is None:
-        active = conn.execute(
-            "SELECT id FROM paper_cycles WHERE status='running' ORDER BY id DESC LIMIT 1"
-        ).fetchone()
-        cycle_id = int(active[0]) if active is not None else None""",
-        "test": f"{SP}.LedgerProvenanceTests.test_SP11b_signal_writer_fails_closed_without_a_cycle_pin",
-        "desc": "cycle_id 从 active cycle 推导（而非账户的 durable 归属）",
+    requested = SP.canonical_cycle_id(row[0] if row is not None else None)
+    if requested is None:
+        raise SignalCycleUnprovable(
+            account_id, None, "signal requires an explicit canonical cycle id"
+        )
+    stamp = SR.cycle_stamp_for_account(conn, account_id, cycle_id=requested)""",
+        "test": f"{SP}.LedgerProvenanceTests.test_SP11c_explicit_cycle_beats_rebound_account_cycle",
+        "desc": "忽略显式 cycle_id，改从 paper_accounts 重新解析（旧错误 authority）",
     },
     {
         "id": "M-SP15", "file": RESOLVER,
@@ -269,6 +258,57 @@ MUTATIONS = [
         'new': '                               created_at=excluded.created_at,\n                               strategy_id=excluded.strategy_id,\n                               strategy_version=excluded.strategy_version,\n                               strategy_checksum=excluded.strategy_checksum,\n                               cycle_id=excluded.cycle_id"""',
         'test': 'test_strategy_selection_provenance.SignalRefreshTests.test_RF04_bootstrap_refresh_updates_a_pre_upgrade_signal',
         'desc': '刷新语句重新写入不可变 provenance 列（升级后首次刷新 abort）',
+    },
+    # ---- M-SP19..M-SP21：本轮两个 provenance correctness blocker ----
+    {
+        'id': 'M-SP19', 'file': RESOLVER,
+        'old': """    requested = SP.canonical_cycle_id(cycle_id)
+    if requested is None:
+        raise SignalCycleUnprovable(
+            account_id, None, "signal requires an explicit canonical cycle id"
+        )
+    observed = SP.canonical_cycle_id(account_cycle_id)
+    if observed != requested:
+        raise SignalStaleContext(account_id, requested,
+                                 observed if observed is not None else "none")
+    stamp = SR.cycle_stamp_for_account(conn, account_id, cycle_id=requested)""",
+        'new': """    row = conn.execute(
+        "SELECT cycle_id FROM paper_accounts WHERE id=?", (str(account_id),)
+    ).fetchone()
+    requested = SP.canonical_cycle_id(row[0] if row is not None else None)
+    if requested is None:
+        raise SignalCycleUnprovable(
+            account_id, None, "signal requires an explicit canonical cycle id"
+        )
+    stamp = SR.cycle_stamp_for_account(conn, account_id, cycle_id=requested)""",
+        'test': "test_provenance_inflight_change.SignalCycleRolloverTests"
+                ".test_RV01_close_signal_rollover_does_not_restamp_old_candidates",
+        'desc': 'signal resolver 改回读取 mutable paper_accounts.cycle_id'
+                '（rollover 后把旧候选写成新周期）',
+    },
+    {
+        'id': 'M-SP20', 'file': SELECTION,
+        'old': """            pin = _pin_research_version(item["strategy_id"])
+            try:
+                result = _run_one(item["model_id"], topn)""",
+        'new': """            try:
+                result = _run_one(item["model_id"], topn)""",
+        'test': "test_provenance_inflight_change.ResearchVersionInflightTests"
+                ".test_RV07_inflight_version_publication_does_not_change_the_run_stamp",
+        'desc': 'research strategy pin 移回 _run_one 之后（in-flight 发布被错误归因）',
+    },
+    {
+        'id': 'M-SP21', 'file': RESOLVER,
+        'old': """    observed = SP.canonical_cycle_id(account_cycle_id)
+    if observed != requested:
+        raise SignalStaleContext(account_id, requested,
+                                 observed if observed is not None else "none")""",
+        'new': """    observed = SP.canonical_cycle_id(account_cycle_id)
+    if observed != requested:
+        requested = observed""",
+        'test': "test_provenance_inflight_change.SignalCycleRolloverTests"
+                ".test_RV01_close_signal_rollover_does_not_restamp_old_candidates",
+        'desc': 'rollover 时把旧批次迁移到新周期（而不是整批 stale abort）',
     },
 ]
 

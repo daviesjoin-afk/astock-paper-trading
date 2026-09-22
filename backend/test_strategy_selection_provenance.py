@@ -168,6 +168,60 @@ class SelectionProvenanceTests(_IsolatedStudy):
         self.assertTrue(reading.is_authoritative)
         self.assertEqual(reading.require().strategy_version, v1.version)
 
+    def test_SP01b_strategy_head_change_during_selection_does_not_change_run_stamp(self):
+        """SP-01b：计算**期间**发生的策略升级不得改变该 run 的戳（TOCTOU）。
+
+        SP-01 是「先跑完、再升级、再读」，证明的是历史读取不回退；它无法区分
+        「计算前 pin」与「计算后才发现 head 变了」——因为升级发生在读取之后。
+
+        这里把升级**放进 ``_run_one`` 内部**（返回结果之前），也就是真正模拟
+        T0 pin=v1 → T1 开始计算 → T2 升级 v2 → T3 计算完成 → T4 解析 provenance。
+        若实现是在计算后才读 current head，记录下来的就会是 v2；正确实现记录 v1。
+
+        每一步都显式断言，避免「碰巧都是 v1」造成的空测试。
+        """
+        import strategy_registry as _SR
+        with self._registry() as conn:
+            v1 = SR.get_version("tq_breakout", conn=conn)
+        self.assertEqual(v1.version, 1, "前提：初始 head 是 v1")
+
+        observed = []
+
+        def _run_one_then_upgrade(model_id, topn):
+            # T1：计算已经开始。此刻 head 仍是 v1。
+            with self._registry() as conn:
+                observed.append(_SR.get_version("tq_breakout", conn=conn).version)
+            result = _payload(count=3)
+            # T2：计算**尚未结束**时策略升级到 v2。
+            with self._registry() as conn:
+                upgraded = _SR.save_definition(
+                    conn, "tq_breakout", {"name": "SP-01b mid-run upgrade"},
+                    actor="sp-matrix", change_note="v2 during selection")
+                conn.commit()
+                observed.append(upgraded.version)
+            # T3：返回结果 —— selection 完成。
+            return result
+
+        original = PS._run_one
+        PS._run_one = _run_one_then_upgrade
+        self.addCleanup(setattr, PS, "_run_one", original)
+        # 只跑一个策略：hook 会在**同一个** run 的计算中途升级版本，从而真正
+        # 制造 TOCTOU 窗口（多策略时升级会落在别的 run 的轮次里，测不到本 run）。
+        PS.run_daily(topn=5, run_date=DAY, strategies=["tq_breakout"])
+
+        self.assertEqual(observed[:2], [v1.version, 2],
+                         "前提：计算开始时 head 是 v1，计算期间升级到 v2")
+        with self._registry() as conn:
+            head = SR.get_version("tq_breakout", conn=conn)
+        self.assertEqual(head.version, 2, "前提：最终 head 是 v2")
+
+        row = self.run_row()
+        self.assertEqual(row["strategy_version"], v1.version,
+                         "run 被记成了计算期间才发布的 v2（pin 发生在计算之后）")
+        self.assertEqual(row["strategy_checksum"], v1.checksum)
+        self.assertNotEqual(row["strategy_checksum"], head.checksum,
+                            "run 的 checksum 是 v2 的（current-fill）")
+
     def test_SP02_same_day_versions_do_not_overwrite_each_other(self):
         """SP-02：同日 v1/v2 是两份证据，互相不覆盖。"""
         PS.run_daily(topn=5, run_date=DAY)
@@ -487,7 +541,8 @@ class LedgerProvenanceTests(unittest.TestCase):
         pinned = SR.cycle_stamp_for_account(self.conn, self.ACCOUNT,
                                             cycle_id=self.cycle_id)
         self.assertIsNotNone(pinned, "cycle 上必须有 pin")
-        cycle_id, stamp = self.PT._cycle_signal_provenance(self.conn, self.ACCOUNT)
+        cycle_id, stamp = self.PT._cycle_signal_provenance(
+            self.conn, self.ACCOUNT, cycle_id=self.cycle_id)
         self.assertEqual(cycle_id, self.cycle_id)
         self.assertEqual(tuple(stamp), tuple(pinned))
         # 把 current head 升级：signal 的写入器**不得**跟随
@@ -496,7 +551,8 @@ class LedgerProvenanceTests(unittest.TestCase):
                                      actor="sp-matrix", change_note="v2")
         self.conn.commit()
         self.assertGreater(version.version, pinned[1])
-        cycle_id2, stamp2 = self.PT._cycle_signal_provenance(self.conn, self.ACCOUNT)
+        cycle_id2, stamp2 = self.PT._cycle_signal_provenance(
+            self.conn, self.ACCOUNT, cycle_id=self.cycle_id)
         self.assertEqual(stamp2, tuple(pinned), "signal 写入器跟随了 current head")
         self.assertEqual(cycle_id2, self.cycle_id)
 
@@ -598,14 +654,15 @@ class LedgerProvenanceTests(unittest.TestCase):
             (self.ACCOUNT,)).fetchone()
         self.assertIsNotNone(legacy, "前提：legacy binding 存在，才谈得上「回退」")
         with self.assertRaises(self.PT.SignalCycleUnprovable) as caught:
-            self.PT._cycle_signal_provenance(self.conn, self.ACCOUNT)
+            self.PT._cycle_signal_provenance(
+                self.conn, self.ACCOUNT, cycle_id=self.cycle_id)
         self.assertEqual(caught.exception.cycle_id, self.cycle_id)
         self.assertIn("no pinned immutable strategy version", caught.exception.detail)
 
-        # 账户自己**没有** durable cycle 时同样必须拒绝：不得顺手采纳「当前
-        # active cycle」（规格 C4 明确禁止 paper_accounts.cycle_id / active cycle
-        # 作为 fallback）。这里保证账本里**确实**存在一个 running cycle，否则
-        # 「拒绝」可以是因为无处可退，而不是因为拒绝采纳。
+        # 账户自己**没有** durable cycle 时，解析结果必须仍由**显式传入**的 cycle
+        # 决定 —— 规格 C4 禁止把 paper_accounts.cycle_id / active cycle 当 fallback。
+        # 这里保证账本里**确实**有一个 running cycle 可供误采纳，否则「解析正确」
+        # 可以只是因为无处可退。
         self.conn.execute("UPDATE paper_cycles SET status='running' WHERE id=?",
                           (self.cycle_id,))
         self.conn.commit()
@@ -617,23 +674,254 @@ class LedgerProvenanceTests(unittest.TestCase):
                           (self.ACCOUNT,))
         self.conn.commit()
         with self.assertRaises(self.PT.SignalCycleUnprovable) as orphan:
-            self.PT._cycle_signal_provenance(self.conn, self.ACCOUNT)
-        self.assertIsNone(orphan.exception.cycle_id,
-                          "signal 的周期归属从 active cycle 推导出来了")
-        self.assertIn("no durable cycle", orphan.exception.detail)
-        self.conn.execute("UPDATE paper_accounts SET cycle_id=? WHERE id=?",
-                          (self.cycle_id, self.ACCOUNT))
-        self.conn.commit()
-
-        # 正对照：pin 放回去后同一个调用必须成功
+            self.PT._cycle_signal_provenance(
+                self.conn, self.ACCOUNT, cycle_id=self.cycle_id)
+        self.assertEqual(orphan.exception.cycle_id, self.cycle_id,
+                         "拒绝时汇报的 cycle 不是调用方请求的那个")
+        self.assertIn("no pinned immutable strategy version", orphan.exception.detail)
+        # 正对照：账户周期仍为 NULL 时把 pin 装回去，同一个调用必须成功，且拿回的
+        # 正是**请求的** cycle —— 证明 resolver 不看账户的 current cycle。
         self.conn.execute(
             "INSERT INTO paper_cycle_strategy_versions(cycle_id,account_id,strategy_id,"
             "strategy_version,strategy_checksum,bound_at) VALUES(?,?,?,?,?,datetime('now'))",
             (self.cycle_id, self.ACCOUNT) + tuple(pinned))
         self.conn.commit()
-        cycle_id, stamp = self.PT._cycle_signal_provenance(self.conn, self.ACCOUNT)
+        cycle_id, stamp = self.PT._cycle_signal_provenance(
+            self.conn, self.ACCOUNT, cycle_id=self.cycle_id)
         self.assertEqual(cycle_id, self.cycle_id)
         self.assertEqual(tuple(stamp), tuple(pinned))
+        self.conn.execute("UPDATE paper_accounts SET cycle_id=? WHERE id=?",
+                          (self.cycle_id, self.ACCOUNT))
+        self.conn.commit()
+
+    def test_SP11c_explicit_cycle_beats_rebound_account_cycle(self):
+        """SP-11c：显式传入的 cycle 必须胜过账户已重绑定的 current cycle。
+
+        规格把 signal 的周期定为「调用方在本事务里已经读过并检查过的事实」。
+        夹具里 cycle A 有 v1、cycle B 有 v2、账户当前属于 B：只有显式传入 A 才能
+        区分「照调用方的事实走」与「resolver 自己去查账户当前周期」。后者会返回
+        B/v2，把一条属于 A 的决定静默改写成 B 的策略版本。
+        """
+        import strategy_registry as _SR
+        cycle_a = self.cycle_id
+        pinned_a = SR.cycle_stamp_for_account(self.conn, self.ACCOUNT, cycle_id=cycle_a)
+        self.assertIsNotNone(pinned_a, "cycle A 上必须有 pin")
+
+        # 建 cycle B 并 pin 上另一个版本，然后把账户搬到 B。
+        self.conn.execute(
+            "INSERT INTO paper_cycles(cycle_key,status,capital,risk_profile,created_at,"
+            "updated_at) VALUES('sp-11c-b','running',1000000,'shared-risk',"
+            "datetime('now'),datetime('now'))")
+        cycle_b = int(self.conn.execute("SELECT last_insert_rowid()").fetchone()[0])
+        v2 = _SR.save_definition(self.conn, self.ACCOUNT, {"name": "SP-11c v2"},
+                                 actor="sp-matrix", change_note="v2")
+        self.conn.execute(
+            "INSERT INTO paper_cycle_strategy_versions(cycle_id,account_id,strategy_id,"
+            "strategy_version,strategy_checksum,bound_at) VALUES(?,?,?,?,?,datetime('now'))",
+            (cycle_b, self.ACCOUNT, self.ACCOUNT, v2.version, v2.checksum))
+        self.conn.execute("UPDATE paper_accounts SET cycle_id=? WHERE id=?",
+                          (cycle_b, self.ACCOUNT))
+        self.conn.commit()
+        self.assertNotEqual(cycle_a, cycle_b)
+
+        # 显式 A → 必须得到 A 的 v1，而不是账户当前所属 B 的 v2。
+        got_cycle, got_stamp = self.PT._cycle_signal_provenance(
+            self.conn, self.ACCOUNT, cycle_id=cycle_a)
+        self.assertEqual(got_cycle, cycle_a, "返回了账户重绑定后的 cycle")
+        self.assertEqual(tuple(got_stamp), tuple(pinned_a),
+                         "显式 cycle 被账户 current cycle 覆盖了")
+        self.assertNotEqual(got_stamp[1], v2.version)
+
+        # 正对照：显式 B 确实会拿到 B 的 v2 —— 说明两者真的不同，
+        # 上面那条断言不是「无论传什么都一样」的空断言。
+        cycle_b_got, stamp_b = self.PT._cycle_signal_provenance(
+            self.conn, self.ACCOUNT, cycle_id=cycle_b)
+        self.assertEqual(cycle_b_got, cycle_b)
+        self.assertEqual(stamp_b[1], v2.version)
+
+    def test_SP11d_explicit_cycle_missing_pin_fails_closed_even_if_account_pin_is_valid(self):
+        """SP-11d：请求的 cycle 没有 pin → fail closed，不得借账户 current cycle 的。
+
+        账户当前所属的 cycle B **有**合法 pin，所以「无条件回退到账户周期」的
+        实现在这里会成功返回 —— 这条测试就是用来把那种实现杀掉的。
+        """
+        import strategy_registry as _SR
+        cycle_a = self.cycle_id
+
+        # cycle A 卸掉 pin；cycle B 留一个**合法** pin，账户属于 B。
+        self.conn.execute(
+            "DELETE FROM paper_cycle_strategy_versions WHERE cycle_id=? AND account_id=?",
+            (cycle_a, self.ACCOUNT))
+        self.conn.commit()
+        self.conn.execute(
+            "INSERT INTO paper_cycles(cycle_key,status,capital,risk_profile,created_at,"
+            "updated_at) VALUES('sp-11d-b','running',1000000,'shared-risk',"
+            "datetime('now'),datetime('now'))")
+        cycle_b = int(self.conn.execute("SELECT last_insert_rowid()").fetchone()[0])
+        v2 = _SR.save_definition(self.conn, self.ACCOUNT, {"name": "SP-11d v2"},
+                                 actor="sp-matrix", change_note="v2")
+        self.conn.execute(
+            "INSERT INTO paper_cycle_strategy_versions(cycle_id,account_id,strategy_id,"
+            "strategy_version,strategy_checksum,bound_at) VALUES(?,?,?,?,?,datetime('now'))",
+            (cycle_b, self.ACCOUNT, self.ACCOUNT, v2.version, v2.checksum))
+        self.conn.execute("UPDATE paper_accounts SET cycle_id=? WHERE id=?",
+                          (cycle_b, self.ACCOUNT))
+        self.conn.commit()
+        # 前提：账户 current cycle 的 pin 确实合法可用（否则「拒绝」可能是因为无处可借）。
+        self.assertIsNotNone(
+            SR.cycle_stamp_for_account(self.conn, self.ACCOUNT, cycle_id=cycle_b))
+
+        with self.assertRaises(self.PT.SignalCycleUnprovable) as caught:
+            self.PT._cycle_signal_provenance(self.conn, self.ACCOUNT, cycle_id=cycle_a)
+        self.assertEqual(caught.exception.cycle_id, cycle_a,
+                         "拒绝时汇报的 cycle 不是调用方请求的那个")
+        self.assertIn("no pinned immutable strategy version", caught.exception.detail)
+
+        # 非 canonical 的 cycle 也必须拒绝（不能当成 0 / None 继续）。
+        for bogus in (None, 0, -1, "abc"):
+            with self.assertRaises(self.PT.SignalCycleUnprovable):
+                self.PT._cycle_signal_provenance(self.conn, self.ACCOUNT, cycle_id=bogus)
+
+    # ---- SP-12b..e：signal-linked order 必须继承**完整** signal provenance ----
+
+    def _insert_signal(self, code, *, stamp, cycle_id, drop_guard=False):
+        """写一行 signal；``drop_guard`` 用于构造 legacy 形状（仓库既有写法）。
+
+        legacy 形状（version/checksum 为 NULL）会同时撞上两个 guard：cycle 归属
+        guard 与既有的 strategy-stamp guard。两者都按仓库惯例**临时卸下再装回**，
+        绝不放宽 guard 本身。
+        """
+        import paper_schema_migrations as PSM
+        triggers = ("trg_paper_signals_cycle_provenance_insert",
+                    "trg_paper_signals_strategy_stamp_insert")
+        if drop_guard:
+            for trigger in triggers:
+                self.conn.execute(f"DROP TRIGGER IF EXISTS {trigger}")
+        try:
+            cursor = self.conn.execute(
+                "INSERT INTO paper_signals(account_id,signal_date,intended_date,code,name,"
+                "payload,status,reason,created_at,strategy_id,strategy_version,"
+                "strategy_checksum,cycle_id) "
+                "VALUES(?,?,?,?,?,'{}','pending','','2026-09-07T15:00:00',?,?,?,?)",
+                (self.ACCOUNT, DAY, DAY, code, "测试") + tuple(stamp) + (cycle_id,))
+        finally:
+            if drop_guard:
+                PSM._ensure_signal_cycle_provenance_guards(self.conn)
+                PSM._ensure_strategy_reference_guards(self.conn)
+        self.conn.commit()
+        return int(cursor.lastrowid)
+
+    def _new_cycle_with_pin(self, key, strategy_id=None, name="v2"):
+        import strategy_registry as _SR
+        self.conn.execute(
+            "INSERT INTO paper_cycles(cycle_key,status,capital,risk_profile,created_at,"
+            "updated_at) VALUES(?,'running',1000000,'shared-risk',"
+            "datetime('now'),datetime('now'))", (key,))
+        cycle = int(self.conn.execute("SELECT last_insert_rowid()").fetchone()[0])
+        version = _SR.save_definition(self.conn, strategy_id or self.ACCOUNT,
+                                      {"name": f"SP-12x {name}"}, actor="sp-matrix",
+                                      change_note=name)
+        self.conn.execute(
+            "INSERT INTO paper_cycle_strategy_versions(cycle_id,account_id,strategy_id,"
+            "strategy_version,strategy_checksum,bound_at) VALUES(?,?,?,?,?,datetime('now'))",
+            (cycle, self.ACCOUNT, self.ACCOUNT, version.version, version.checksum))
+        self.conn.commit()
+        return cycle, version.version
+
+    def test_SP12b_legacy_signal_stamp_must_not_current_fill(self):
+        """SP-12b：legacy signal（无 version/checksum）+ current head v2 → 不得补成 v2。
+
+        这是 P1-B 的核心：signal 存在、account 存在、``strategy_id`` 也在，但
+        ``strategy_version``/``strategy_checksum`` 是 NULL。老实现会在
+        ``row`` 不完整时回退到 ``stamp_for_account``，于是今天的 v2 被盖到一条
+        「不知道自己用哪一版做的」历史上。必须 fail closed。
+        """
+        legacy_code = "600902"
+        signal_id = self._insert_signal(
+            legacy_code,
+            stamp=(self.ACCOUNT, None, None),
+            cycle_id=self.cycle_id, drop_guard=True)
+        # current head 升到 v2，作为「可被误补」的诱饵。
+        _, v2 = self._new_cycle_with_pin("sp-12b-b", name="v2")
+        head = SR.get_version(self.ACCOUNT, conn=self.conn)
+        self.assertEqual(head.version, v2, "前提：current head 已经是 v2")
+
+        with self.assertRaises(SRES.SignalOrderUnprovable) as caught:
+            self.PT._strategy_stamp(self.conn, self.ACCOUNT, signal_id)
+        self.assertEqual(caught.exception.signal_id, signal_id)
+        self.assertIn("no complete immutable provenance", caught.exception.detail)
+
+        # 反向断言：确实**没有**产生任何 v2 stamped 的东西。
+        self.assertEqual(
+            self.conn.execute(
+                "SELECT COUNT(*) FROM paper_orders WHERE signal_id=?", (signal_id,)
+            ).fetchone()[0], 0, "legacy signal 不该产生委托")
+
+    def test_SP12c_missing_signal_row_must_not_current_fill(self):
+        """SP-12c：``signal_id`` 指向不存在的行 → 同样 fail closed。"""
+        ghost = 987654321
+        self.assertEqual(
+            self.conn.execute("SELECT COUNT(*) FROM paper_signals WHERE id=?",
+                              (ghost,)).fetchone()[0], 0)
+        with self.assertRaises(SRES.SignalOrderUnprovable) as caught:
+            self.PT._strategy_stamp(self.conn, self.ACCOUNT, ghost)
+        self.assertIn("does not exist", caught.exception.detail)
+
+    def test_SP12d_signal_cycle_mismatch_blocks_order(self):
+        """SP-12d：signal 属 cycle A、执行上下文是 cycle B → 拒绝，不得重绑。
+
+        两种「将就」写法都要被杀掉：写成「order cycle B + signal v1」是 split-brain；
+        改成「order cycle B + current v2」是篡改历史。
+        """
+        stamp_a = self.PT._strategy_stamp(self.conn, self.ACCOUNT)
+        signal_id = self._insert_signal("600903", stamp=stamp_a,
+                                        cycle_id=self.cycle_id)
+        cycle_b, v2 = self._new_cycle_with_pin("sp-12d-b", name="v2")
+        self.assertNotEqual(cycle_b, self.cycle_id)
+        self.assertEqual(v2, stamp_a[1] + 1, "前提：B 上 pin 的是另一个版本")
+
+        with self.assertRaises(SRES.SignalOrderUnprovable) as caught:
+            self.PT._strategy_stamp(self.conn, self.ACCOUNT, signal_id,
+                                    cycle_id=cycle_b)
+        self.assertIn("does not match execution cycle", caught.exception.detail)
+        # 也不能被当成 signal 归属 B 而放行。
+        self.assertEqual(
+            self.conn.execute(
+                "SELECT COUNT(*) FROM paper_orders WHERE signal_id=?", (signal_id,)
+            ).fetchone()[0], 0, "cycle mismatch 不该产生委托")
+
+        # 正对照：传入 signal 自己的 cycle A 时解析成功，且拿的是 v1 不是 v2。
+        provenance = SRES.signal_order_provenance(
+            self.conn, signal_id=signal_id, account_id=self.ACCOUNT,
+            expected_cycle_id=self.cycle_id)
+        self.assertEqual(provenance.cycle_id, self.cycle_id)
+        self.assertEqual(provenance.strategy_version, stamp_a[1])
+        self.assertNotEqual(provenance.strategy_version, v2)
+
+    def test_SP12e_complete_signal_lineage_survives_account_rebound(self):
+        """SP-12e：账户被搬到 B 之后，signal 的完整血缘仍解析为 A/v1。
+
+        解析必须只读 signal 自己的持久化事实；而真实 order writer 在 B 的上下文里
+        执行这条 A 的 signal 时，必须因 cycle mismatch 拒绝（见 SP-12d）。
+        """
+        stamp_a = self.PT._strategy_stamp(self.conn, self.ACCOUNT)
+        cycle_a = self.cycle_id
+        signal_id = self._insert_signal("600904", stamp=stamp_a, cycle_id=cycle_a)
+        cycle_b, v2 = self._new_cycle_with_pin("sp-12e-b", name="v2")
+        self.conn.execute("UPDATE paper_accounts SET cycle_id=? WHERE id=?",
+                          (cycle_b, self.ACCOUNT))
+        self.conn.commit()
+
+        inherited = SRES.signal_order_provenance(
+            self.conn, signal_id=signal_id, account_id=self.ACCOUNT)
+        self.assertEqual(inherited.cycle_id, cycle_a, "血缘被账户重绑定改写了")
+        self.assertEqual(inherited.stamp, tuple(stamp_a))
+        self.assertNotEqual(inherited.strategy_version, v2)
+
+        # 业务规则不允许旧 cycle signal 在 B 执行 → 真实 writer 必须拒绝。
+        with self.assertRaises(SRES.SignalOrderUnprovable):
+            self.PT._strategy_stamp(self.conn, self.ACCOUNT, signal_id,
+                                    cycle_id=cycle_b)
 
     def test_SP13_archive_copy_preserves_full_provenance(self):
         """SP-13：归档整行拷贝保留完整 provenance（列数与顺序严格一致）。"""
