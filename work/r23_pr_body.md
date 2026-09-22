@@ -200,6 +200,88 @@ added; no mutation was weakened to manufacture a kill.
 The only manual-review items are the pre-existing `docs/assets/dashboard.png`
 image entries. No credentials, tokens, or connection strings are introduced.
 
-## 14. Merge status
+## 14. Review round 1 (P1 ×2, P2 ×1) — fixed
+
+Three findings arrived after the first CI green. Each was **reproduced against the
+pre-fix tree before being fixed**; the probe (`work/r23_review_repro.py`) prints the
+BEFORE values and can be pointed at the pre-fix source via `R23_SIGNAL_INSERT_SRC`.
+
+| # | sev | before (measured) | after (measured) | file |
+|---|---|---|---|---|
+| F1 | P1 | child FK rewritten to `selection_runs_legacy`; pick insert → `OperationalError: no such table: main.selection_runs_legacy` | FK target back to `selection_runs`; picks survive and stay writable | `backend/selection_tracking.py` |
+| F2 | P1 | interrupted rebuild → recovery throws `OperationalError: no such table: selection_runs`, history lost | leftover absorbed (promoted or folded back by `id`, stamped `legacy_unproven`), no row discarded | `backend/selection_tracking.py` |
+| F3 | P2 | first post-upgrade refresh → `IntegrityError: signal cycle provenance is immutable` | refresh succeeds; existing row's provenance left untouched | `backend/paper_trading.py` |
+
+### F1 — the rebuild must not rename the referenced parent
+
+`ALTER TABLE selection_runs RENAME TO selection_runs_legacy` rewrites
+`selection_picks.run_id`'s FK target **even with `foreign_keys` disabled**; dropping
+the legacy table then left the child schema pointing at a nonexistent table. The
+rebuild now uses the documented create → copy → drop → rename order, so the parent
+name is valid at every point. Fresh and rebuilt tables share one `_runs_ddl()`
+definition, which is what keeps the two paths from drifting again.
+
+### F2 — absorb leftovers, never delete the only copy
+
+The unconditional `DROP TABLE selection_runs_legacy` at the top of the migration
+destroyed the sole remaining copy when a previous run died between the rename and the
+copy. `_absorb_leftover_runs()` now promotes the leftover when the parent is gone, or
+folds its rows back in by `id` (explicitly stamped `legacy_unproven`) when the parent
+survived — and only then drops it. This implementation's own `selection_runs_new`
+staging table is recovered the same way, so a crash *during recovery* is itself
+recoverable.
+
+### F3 — the class audit found the defect wider than reported
+
+Reported as `cycle_id` only. A class audit (`work/r23_review_class_audit.py`) measured
+that the **stamp trio** in the same `DO UPDATE SET` (`strategy_id` /
+`strategy_version` / `strategy_checksum`) is rejected by the pre-existing
+strategy-stamp immutability trigger in exactly the same way
+(`strategy version stamp is immutable`), so removing `cycle_id` alone would have left
+a second broken path. **All four immutable columns** are now out of the conflict
+update.
+
+The same audit checked the siblings and found them immune rather than missed:
+`paper_selection_runs` / `paper_selection_picks` declare **no `REFERENCES` clause**, so
+the F1/F2 shape does not exist there; and no other `ON CONFLICT ... DO UPDATE` in the
+tree targets a guarded table (`rebalance_scans` uses `INSERT OR REPLACE` with
+`cycle_id` already in the conflict target — existing intentional design).
+
+### Regression coverage added
+
+| test | covers |
+|---|---|
+| `RunTableRebuildTests.test_RF01` | child FK still points at `selection_runs`; picks not taken by CASCADE and still writable |
+| `test_RF02` | interrupted rebuild keeps the history; recovered rows stamped `legacy_unproven` |
+| `test_RF03` | rebuild is idempotent, no leftover temp tables (positive control) |
+| `SignalRefreshTests.test_RF04` | first refresh after upgrade neither raises nor back-fills immutable columns |
+| `test_RF05` | static assertion: `DO UPDATE SET` never names the four immutable columns |
+
+Three fixture details were required to make these honest rather than vacuously green:
+RF01-RF03 go through the real `ST.ensure_schema()` (the migration ordering — FK
+toggling and guard installation — is itself the subject); the legacy run fixture
+**carries `REFERENCES`** (without it the finding tests green forever); and RF04 runs
+the production statement extracted from source with values in the statement's **true
+column order** (a hand-written tuple silently took the insert-new-row path and never
+touched the conflict branch).
+
+### Verification for this round
+
+| gate | result |
+|---|---|
+| full backend suite (post-fix) | **3973 tests, OK (skipped=5)** in 288s |
+| `test_strategy_selection_provenance` | **44 tests OK** |
+| targeted 4 modules (`test_strategy_selection_provenance`, `test_paper_trading_architecture_guard`, `test_paper_selection`, `test_selection_tradability`) | **288 tests OK** (44 + 105 + 15 + 124) |
+| ruff / compileall | `All checks passed!` / clean |
+| mutation matrix (18, non-vacuity, **serial**) | **18/18 CAUGHT; survived=0; fake=0; baseline-red=0; restore sha256 PASS** |
+| leak scan `--scope worktree` and `--scope all` | `values: 0` |
+
+Mutation note: the matrix **must** run serially. An earlier 5-way sharded run was
+**invalid** — the shards rewrote the same production files concurrently and polluted
+each other (tally 0-1/3). Sharding is only safe when shards touch disjoint files. The
+matrix also restores byte-identically from a snapshot taken at launch, so production
+files must not be edited while it runs.
+
+## 15. Merge status
 
 Not merged, not deployed. Awaiting human review.
