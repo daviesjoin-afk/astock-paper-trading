@@ -81,10 +81,19 @@ CODE = "600901"
 
 
 def _git(*args):
-    result = subprocess.run(
-        ["git", *args], cwd=REPO_ROOT, capture_output=True, text=True,
-        encoding="utf-8", errors="replace",
-    )
+    """运行一条 git 命令；**环境没有 git 时返回"不可用"而不是抛异常**。
+
+    Docker 运行时镜像刻意不装 git（只 COPY backend/ 等运行所需文件），而
+    docker-smoke 作业就在那个镜像里跑测试。此时"用 git 校验 fixture 来源"这类
+    断言无法执行 —— 它必须诚实 skip，而不是让整个 job 因为 FileNotFoundError 变红。
+    """
+    try:
+        result = subprocess.run(
+            ["git", *args], cwd=REPO_ROOT, capture_output=True, text=True,
+            encoding="utf-8", errors="replace",
+        )
+    except (FileNotFoundError, NotADirectoryError, OSError):
+        return 127, "", "git is not available in this environment"
     return result.returncode, (result.stdout or "").strip(), (result.stderr or "").strip()
 
 
@@ -177,6 +186,9 @@ class PreviousReleaseFixtureTests(unittest.TestCase):
 
     def test_fixture_matches_the_live_release_tag_when_available(self):
         """tag 可解析时逐字比对，防止 fixture 摘录漂移。"""
+        code, _out, _err = _git("rev-parse", "--git-dir")
+        if code != 0:
+            self.skipTest("当前环境没有可用的 git（例如 Docker 运行时镜像）")
         live = _live_release_ddl()
         if live is None:
             self.skipTest(
@@ -190,6 +202,9 @@ class PreviousReleaseFixtureTests(unittest.TestCase):
 
     def test_previous_release_commit_is_an_ancestor_of_the_current_line(self):
         """上一版本必须真的在我们这条线上（用 commit，而不是 tag 名）。"""
+        code, _out, _err = _git("rev-parse", "--git-dir")
+        if code != 0:
+            self.skipTest("当前环境没有可用的 git（例如 Docker 运行时镜像）")
         code, _out, _err = _git(
             "merge-base", "--is-ancestor", PREVIOUS_RELEASE_COMMIT, "HEAD",
         )
