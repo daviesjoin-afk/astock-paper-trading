@@ -25,7 +25,6 @@ BACKEND_DIR = os.path.dirname(os.path.abspath(__file__))
 if BACKEND_DIR not in sys.path:
     sys.path.insert(0, BACKEND_DIR)
 
-import execution_verification as EV  # noqa: E402
 import paper_trading as PT  # noqa: E402
 from test_production_path_golden_replay import (  # noqa: E402
     ProductionPathGoldenReplayTests,
@@ -90,7 +89,7 @@ class PaperFillWritePathGuardTests(unittest.TestCase):
                     )
                     continue
                 insert_at = segment.find("INSERT INTO paper_fills")
-                stamp_at = segment.find("stamp_order")
+                stamp_at = segment.rfind("EV.stamp_order(")
                 if stamp_at < insert_at:
                     offenders.append(
                         f"{name}:{node.lineno} {node.name} 在写入流水**之前**就盖章，"
@@ -103,12 +102,12 @@ class PaperFillWritePathGuardTests(unittest.TestCase):
                 any(entry.startswith(expected) for entry in seen),
                 f"{expected} 的成交流水写路径未被门禁扫到（门禁失效？）：{seen}",
             )
-        # R20：所有生产 SELL/BUY 收敛到 ``execution_planner.commit_fill`` 之后，
+        # R26：所有生产 SELL/BUY 收敛到 ``execution_planner.execute_order`` 之后，
         # paper_trading 不再直接 INSERT INTO paper_fills；活跃写路径只剩
-        # commit_fill 与 demo_seed 夹具写入器。
+        # execute_order 与 demo_seed 夹具写入器。
         self.assertEqual(
             len(seen), 2,
-            f"成交流水写路径数量异常（应统一走 execution_planner.commit_fill）：{seen}",
+            f"成交流水写路径数量异常（应统一走 execution_planner.execute_order）：{seen}",
         )
 
     def test_no_module_reimplements_the_verified_predicate(self):
@@ -159,7 +158,7 @@ class PaperFillWritePathGuardTests(unittest.TestCase):
 
 
 class IntradaySellStampTests(unittest.TestCase):
-    """运行时：日内做T高抛（``_intraday_sell``）必须盖章。"""
+    """运行时：缺少可信成交量时，日内做 T 委托不得落成交流水。"""
 
     def setUp(self):
         self.tmp_dir = tempfile.mkdtemp(prefix="astock-ev-intraday-")
@@ -184,7 +183,7 @@ class IntradaySellStampTests(unittest.TestCase):
              (self.today - dt.timedelta(days=1)).isoformat(), "stock_t1"),
         )
 
-    def test_intraday_t_sell_stamps_execution_verification(self):
+    def test_intraday_t_sell_without_liquidity_evidence_does_not_fill(self):
         with PT._db(immediate=True) as conn:
             conn.execute("UPDATE paper_cycles SET status='running' WHERE id=1")
             cycle = dict(conn.execute(
@@ -209,18 +208,11 @@ class IntradaySellStampTests(unittest.TestCase):
                 conn, account, position, quote, self.today,
                 {"min_cost_edge": 0.012}, cycle,
             )
-            self.assertIsNotNone(result, f"日内做T卖点未命中：{reason}")
-            order_id = result["order_id"]
-            fills = conn.execute(
-                "SELECT * FROM paper_fills WHERE order_id=?", (order_id,)).fetchall()
-            order = dict(conn.execute(
-                "SELECT * FROM paper_orders WHERE id=?", (order_id,)).fetchone())
+            self.assertIsNone(result, f"缺少可成交流动性却报告卖出成交：{result}")
+            self.assertIn("未成交", reason)
+            fill_count = conn.execute("SELECT COUNT(*) FROM paper_fills").fetchone()[0]
 
-        self.assertEqual(len(fills), 1, "生产写路径必须落一条成交流水")
-        self.assertIsNotNone(order["execution_status"], "写路径必须盖章，不能留 NULL")
-        self.assertEqual(order["execution_status"], "verified", order)
-        self.assertEqual(order["execution_verified"], 1, order)
-        self.assertTrue(EV.is_verified_row(order), order)
+        self.assertEqual(0, fill_count, "缺少可成交数量证据时不得创建 fill")
 
 
 class ProductionFillPathStampTests(ProductionPathGoldenReplayTests):
@@ -228,7 +220,7 @@ class ProductionFillPathStampTests(ProductionPathGoldenReplayTests):
 
     直接继承黄金回放：它的第 7 步经 ``_buy_order`` 开仓、第 8 步经
     ``_monitor_risk_impl`` 深跌退出 —— 两条腿都是 PR153 漏接闸门的生产路径。
-    只把 ``commit_fill``（手动下单）接上是不够的。
+    单独验证手动下单链路是不够的。
     """
 
     def test_production_path_golden_replay(self):

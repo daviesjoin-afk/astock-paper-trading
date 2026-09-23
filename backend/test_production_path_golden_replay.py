@@ -239,6 +239,7 @@ def _fake_quotes(codes, asof_date=None):
             stamp = f"{day.isoformat()} {quote_time}:00"
         result[code] = {
             "code": code, "name": NAMES.get(code, code), "price": price,
+            "prev_close": price,
             "pct": scenario.get("pct", 0.6),
             "open_price": round(price * (1.02 if open_above else 0.998), 2),
             "high": round(price * (1.021 if open_above else 1.01), 2),
@@ -479,6 +480,8 @@ class ProductionPathGoldenReplayTests(OfflinePaperEnv, unittest.TestCase):
             self.assertIn(signal["code"], PASS_CODES)
 
         # 7) T+1 开仓执行（OrderIntent → planner → revalidate → commit）
+        with self._conn() as conn:
+            cash_before_buy = PT._shared_cash(conn)
         opened = PT.run_slot("open", D1, force=True)
         self.assertNotEqual(opened.get("status"), "failed", opened)
         with self._conn() as conn:
@@ -503,6 +506,26 @@ class ProductionPathGoldenReplayTests(OfflinePaperEnv, unittest.TestCase):
             buy_fill = fills[0]
             self.assertGreater(buy_fill["qty"], 0)
             order = self._one(conn, "SELECT * FROM paper_orders WHERE id=?", (buy_fill["order_id"],))
+            # R26 characterization: the current production path treats an approved
+            # request as a full fill. Keep its ledger arithmetic explicit while the
+            # execution authority is being centralized.
+            for fill in fills:
+                fill_order = self._one(
+                    conn, "SELECT * FROM paper_orders WHERE id=?", (fill["order_id"],),
+                )
+                self.assertEqual(fill_order["status"], "filled")
+                self.assertEqual(int(fill_order["qty"]), int(fill["qty"]))
+                self.assertEqual(int(fill["qty"]) % 100, 0)
+                self.assertAlmostEqual(
+                    float(fill["qty"]) * float(fill["price"]),
+                    float(fill["amount"]), places=2,
+                )
+                self.assertGreaterEqual(float(fill["fees"]), 0.0)
+            cash_after_buy = PT._shared_cash(conn)
+            self.assertAlmostEqual(
+                cash_before_buy - cash_after_buy,
+                sum(float(fill["amount"]) + float(fill["fees"]) for fill in fills), places=2,
+            )
             self.assertEqual(order["status"], "filled")
             self.assertEqual(order["strategy_id"], STRATEGY_ID)
             self.assertIsNotNone(order["strategy_version"])
@@ -542,18 +565,27 @@ class ProductionPathGoldenReplayTests(OfflinePaperEnv, unittest.TestCase):
             }
             for code in PASS_CODES:
                 QUOTE_PRICES[(code, day.isoformat())] = round(cost * 0.83, 2)
+            with self._conn() as conn:
+                cash_before_sell = PT._shared_cash(conn)
             _run_risk(day)
             with self._conn() as conn:
                 day_sells = conn.execute(
-                    "SELECT code,qty,price,fill_date FROM paper_fills "
+                    "SELECT code,qty,price,amount,fees,fill_date FROM paper_fills "
                     "WHERE account_id=? AND side='sell' AND fill_date=?",
                     (STRATEGY_ID, day.isoformat()),
                 ).fetchall()
                 sell_history.extend(dict(r) for r in day_sells)
+                cash_after_sell = PT._shared_cash(conn)
                 open_qty = self._one(
                     conn,
                     "SELECT COALESCE(SUM(qty),0) AS n FROM paper_positions WHERE account_id=?",
                     (STRATEGY_ID,),
+                )
+            if day_sells:
+                self.assertAlmostEqual(
+                    cash_after_sell - cash_before_sell,
+                    sum(float(row["amount"]) - float(row["fees"]) for row in day_sells),
+                    places=2,
                 )
             if int(open_qty["n"]) == 0:
                 break

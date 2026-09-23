@@ -15,7 +15,7 @@
 Round-2（本文件后半部分）额外钉住一条：**episode 结束只有一个判据** ——
 同周期权威 lots 剩余量为 0，由 ``paper_position_risk_state.finalize_sell``
 自己判定。因此 full-exit 用例必须驱动**真实生产 SELL 路径**（risk scan /
-``execution_planner.commit_fill`` / ``_intraday_sell``），不能自己调用
+``execution_planner.execute_order`` / ``_intraday_sell``），不能自己调用
 ``delete_episode`` 来"假装"生产链路被覆盖 —— 那只证明 delete 原语可用。
 
 全部用例驱动**真实生产 schema**（``PT.init_db``）与**真实生产原语**
@@ -750,14 +750,14 @@ class DualDatabaseOwnership(unittest.TestCase):
 # ══════════════════════════════════════════════════════════════════════════
 # Round-2 Blocker A：full exit 必须由**每一条**生产 SELL 路径收尾
 #
-# Round-1 只把状态清理写进了风控扫描分支，于是 ``execution_planner.commit_fill``
+# Round-1 只把状态清理写进了风控扫描分支，于是 ``execution_planner.execute_order``
 # 与 ``_intraday_sell`` 在卖光最后一股权威 lot 之后仍然留着 risk-state 行。
-# 下面的用例**驱动真实生产路径**（``PT.monitor_risk`` / ``EP.commit_fill`` /
+# 下面的用例**驱动真实生产路径**（``PT.monitor_risk`` / ``EP.execute_order`` /
 # ``PT._intraday_sell``），而不是自己调用 delete 原语 —— 「测试手工 delete 一次」
 # 只能证明 delete helper 可用，证明不了生产链路会调用它。
 # ══════════════════════════════════════════════════════════════════════════
 class ProductionSellPathClosesEpisode(_LedgerCase):
-    """B / C / F —— ``execution_planner.commit_fill`` 的 SELL 分支。
+    """B / C / F —— ``execution_planner.execute_order`` 的 SELL 分支。
 
     这是 manual / deferred 委托的真实成交入口（``reserved=True`` 跳过预占，
     只聚焦成交阶段），也是 Round-1 漏掉的第一条 full-exit 路径。
@@ -788,12 +788,19 @@ class ProductionSellPathClosesEpisode(_LedgerCase):
 
     def commit_sell(self, order_id, qty, *, price=13.0, day="2026-09-05"):
         with mock.patch.object(PT, "_completed_kline", return_value=None):
-            return EP.commit_fill(
+            return EP.execute_order(
                 self.conn, account={"id": ACCOUNT},
                 plan={"side": "sell", "code": CODE, "qty": qty, "fill_price": price,
-                      "amount": qty * price, "fees": 5.0, "quote_at": None, "risk": {}},
+                      "amount": qty * price, "fees": 5.0, "risk": {},
+                      "execution_quote": {
+                          "code": CODE, "name": NAME, "price": price,
+                          "prev_close": price, "pct": 0.0,
+                          "amount": max(100000.0, qty * price * 200),
+                          "quote_at": "2026-09-10T10:00:00", "quote_source": "live",
+                          "quote_validation": "cross_source_checked",
+                      }},
                 order_id=order_id, asof_day=dt.date.fromisoformat(day),
-                reserved=True, action="manual_filled", reason="测试手动卖出",
+                action="manual_filled", reason="测试手动卖出",
             )
 
     def remaining_lots(self):
@@ -867,7 +874,7 @@ class ProductionSellPathClosesEpisode(_LedgerCase):
                          "re-entry 复用了旧 episode 的起点时间（旧行没被清掉）")
         self.assertEqual(int(self.state_count()), 1)
 
-    def test_buy_through_commit_fill_records_the_source_order(self):
+    def test_buy_through_execute_order_records_the_source_order(self):
         """BUY 侧生命周期同样只有一条入口：``_record_lot``（§21）。"""
         stamp = PT._strategy_stamp(self.conn, ACCOUNT)
         cur = self.conn.execute(
@@ -881,18 +888,27 @@ class ProductionSellPathClosesEpisode(_LedgerCase):
         self.conn.commit()
 
         with mock.patch.object(PT, "_completed_kline", return_value=None):
-            EP.commit_fill(
+            EP.execute_order(
                 self.conn, account={"id": ACCOUNT},
                 plan={"side": "buy", "code": CODE, "qty": 100, "fill_price": 10.0,
-                      "amount": 1000.0, "fees": 5.0, "quote_at": None, "risk": {}},
+                      "amount": 1000.0, "fees": 5.0, "risk": {},
+                      "execution_quote": {
+                          "code": CODE, "name": NAME, "price": 10.0,
+                          "prev_close": 10.0, "pct": 0.0, "amount": 100000.0,
+                          "quote_at": "2026-09-10T10:00:00", "quote_source": "live",
+                          "quote_validation": "cross_source_checked",
+                      }},
                 order_id=order, asof_day=dt.date.fromisoformat("2026-09-01"),
-                reserved=True, action="manual_filled", reason="测试手动买入",
+                action="manual_filled", reason="测试手动买入",
             )
         self.conn.commit()
 
         row = self.state_row(self.cycle1)
         self.assertIsNotNone(row, "verified BUY 未建立 episode 状态")
-        self.assertAlmostEqual(float(row["peak_price"]), 10.0)
+        fill_price = self.conn.execute(
+            "SELECT price FROM paper_fills WHERE order_id=?", (order,)
+        ).fetchone()[0]
+        self.assertAlmostEqual(float(row["peak_price"]), float(fill_price))
         self.assertEqual(int(row["take_stage"]), 0)
         self.assertEqual(int(row["opened_order_id"]), order,
                          "episode 出处不是本笔 verified 买单")
@@ -997,7 +1013,7 @@ class IntradaySellClosesEpisode(_ProductionRiskScanCase):
         self._inner.quotes_map[self.code] = {
             "code": self.code, "name": f"测试股_{self.code}", "price": price,
             "high": high, "low": round(price - 0.2, 4), "pct": 0.0,
-            "prev_close": prev_close, "amount": 100000.0, "volume": 10000.0,
+            "prev_close": prev_close, "amount": 1000000.0, "volume": 10000.0,
             "turnover": 1.0, "quote_source": "live",
             "quote_at": f"{self.day.isoformat()} 10:30:00",
             "quote_validation": "cross_source_checked",

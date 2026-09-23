@@ -13,6 +13,7 @@ api_paper.py call sites are unchanged.
 from __future__ import annotations
 
 import market_data_service as MDSvc
+import paper_trading_rules as PTR
 
 
 def _manual_risk_state(conn, account, nav, asof_day):
@@ -62,11 +63,8 @@ def _manual_order_plan(
         LOT_SIZE,
         RSET,
         SHARED_POOL_MAX_EXPOSURE,
-        SLIPPAGE,
         _spec_for,
-        STAMP_SELL,
         _asset_type,
-        _commission,
         _completed_kline,
         _date,
         _dynamic_position_limits,
@@ -292,7 +290,7 @@ def _manual_order_plan(
             nav, shared_cash, position_value, industry_value, code_value,
             # PR-39：用户策略账户不在 ACCOUNT_SPECS 里，直接下标会 KeyError；
             # 统一走 paper_trading._spec_for（内置 → 表，用户 → RuntimeContext）。
-            fill_reference * (1 + SLIPPAGE), _spec_for(account_id, conn=conn)["hard_stop"], profile,
+            fill_reference * (1 + PTR.SLIPPAGE), _spec_for(account_id, conn=conn)["hard_stop"], profile,
             exposure_cap=RSET.get(conn, "shared_pool_exposure_cap", SHARED_POOL_MAX_EXPOSURE),
             max_exposure_cap=RSET.get(conn, "shared_pool_exposure_cap", SHARED_POOL_MAX_EXPOSURE),
             strategy_position_value=strategy_budget["current_amount"],
@@ -332,7 +330,11 @@ def _manual_order_plan(
         plan["recommended_qty"] = available_qty
         plan["qty"] = requested_qty
 
-    if plan["qty"] < LOT_SIZE or plan["qty"] % LOT_SIZE:
+    odd_lot_liquidation = (
+        side == "sell" and requested_qty == available_qty
+        and requested_qty > 0 and requested_qty % LOT_SIZE != 0
+    ) if side == "sell" else False
+    if (plan["qty"] < LOT_SIZE or plan["qty"] % LOT_SIZE) and not odd_lot_liquidation:
         reasons.append("委托数量必须为 100 股的正整数倍")
     if order_type == "limit":
         limit_value = _num(limit_price)
@@ -366,15 +368,13 @@ def _manual_order_plan(
                 "kind": "limit_down",
                 "reason": f"当前触及 {limit_pct:.1f}% 跌停保护",
             }
-    fill_price = (
-        min(price * (1 + SLIPPAGE), _num(limit_price))
-        if side == "buy" and order_type == "limit" and plan["triggered"]
-        else max(price * (1 - SLIPPAGE), _num(limit_price))
-        if side == "sell" and order_type == "limit" and plan["triggered"]
-        else price * (1 + SLIPPAGE if side == "buy" else 1 - SLIPPAGE)
+    fill_terms = PTR.simulated_execution_terms(
+        price, side, plan["qty"],
+        limit_price=limit_price if order_type == "limit" and plan["triggered"] else None,
     )
-    amount = max(plan["qty"], 0) * max(fill_price, 0)
-    fees = _commission(amount) + (amount * STAMP_SELL if side == "sell" else 0.0)
+    fill_price = fill_terms["fill_price"]
+    amount = fill_terms["amount"]
+    fees = fill_terms["fees"]
     if side == "buy":
         # 共享资金池可用性（含在途预占）同样交给 planner，保持与自动路径同口径。
         cash_check = EP.cash_gate(
@@ -444,13 +444,16 @@ def _execute_manual_plan(conn, account, plan, order_id, asof_day):
         raise RuntimeError(_entry_frozen_reason("成交执行"))
     # 成交落库统一走中央执行计划器：预留已在提交阶段完成，这里只消费预占。
     # 自动策略买入（_commit_strategy_buy）复用同一原语，只是由 planner 内部预占。
-    return EP.commit_fill(
+    return EP.execute_order(
         conn,
         account=account,
         plan=plan,
         order_id=order_id,
         asof_day=asof_day,
-        reserved=True,
+        execution_quote=plan.get("quote") or (plan.get("risk") or {}).get("quote"),
+        execution_as_of=plan.get("quote_at"),
+        order_type=plan.get("order_type"),
+        limit_price=plan.get("limit_price"),
         action="manual_filled",
         risk_log_reason="手动模拟委托通过模型门禁并成交",
         audit_action="manual_order_filled",
@@ -462,7 +465,8 @@ def _execute_manual_plan(conn, account, plan, order_id, asof_day):
 
 def _commit_strategy_buy(
     conn, account, plan, asof_day, *, reason, detail, action,
-    is_t_base=True, assumption="实时行情 + 滑点模拟；不代表真实可成交价格",
+    execution_quote=None, is_t_base=True,
+    assumption="实时行情快照 + 规则版本化滑点；不代表真实可成交价格",
 ):
     """Commit a strategy buy through one reservation/debit/fill transaction.
 
@@ -505,13 +509,14 @@ def _commit_strategy_buy(
     conn.execute(f"SAVEPOINT {savepoint}")
     try:
         # 与手动成交共用同一落库原语（planner 内部完成预占 → 扣款 → 记 lot → 写 fill）。
-        EP.commit_fill(
+        execution_result = EP.execute_order(
             conn,
             account=account,
             plan={**plan, "quote_at": plan.get("quote_at")},
             order_id=order_id,
             asof_day=asof_day,
-            reserved=False,
+            execution_quote=execution_quote or plan.get("execution_quote") or (detail or {}).get("quote"),
+            execution_as_of=(execution_quote or {}).get("quote_at") or plan.get("quote_at"),
             action=action,
             audit_message=f"{code} {qty}股 @ {fill_price:.2f}",
             reason=reason,
@@ -534,9 +539,9 @@ def _commit_strategy_buy(
         _risk_log(conn, account_id, code, "buy", STRATEGY_EXECUTION_RETRY_STATUS, failure, detail)
         return None, failure
     _assert_active_lease(conn, "strategy auxiliary audit")
-    # risk/audit 事件由 planner 的 commit_fill 统一写入，此处不再重复记录，
+    # risk/audit 事件由 planner 的 execute_order 统一写入，此处不再重复记录，
     # 避免同一笔成交在 paper_risk_decisions / paper_audit 中出现两次。
-    return {"order_id": order_id, "side": "buy", "code": code, "qty": qty}, None
+    return execution_result, None
 
 
 def strategy_fill_failure(conn, exc, *, signal, order_id, account, code, risk, cycle_id):
@@ -613,7 +618,7 @@ def commit_strategy_entry_fill(
     订单创建仍归 ``paper_trading._buy_order``（§42：本 PR 不搬 Entry Service）。
     本函数承接「SAVEPOINT → 提交成交 → 切片账面推进 → 失败处置」这段编排，
     与 ``_commit_strategy_buy`` 同处一个模块。**成交落库本身仍唯一由
-    ``execution_planner.commit_fill`` 拥有** —— reserve / cash / lot / fill /
+    ``execution_planner.execute_order`` 拥有** —— reserve / cash / lot / fill /
     执行验证 / risk log / audit 一律不在此重写（§65）。
     """
     # Phase 2 extraction: resolved at call time to avoid a circular import.
@@ -625,7 +630,7 @@ def commit_strategy_entry_fill(
         _assert_active_lease(conn, "strategy fill commit")
         # §43：plan 必须携带完整 lot 身份（code/name/industry），否则
         # `_record_lot` 会丢失持仓元数据。
-        EP.commit_fill(
+        execution_result = EP.execute_order(
             conn,
             account=account,
             plan={
@@ -636,8 +641,9 @@ def commit_strategy_entry_fill(
             },
             order_id=order_id,
             asof_day=asof_day,
+            execution_quote=quote,
+            execution_as_of=quote.get("quote_at"),
             side="buy",
-            reserved=False,
             action=decision_name,
             risk_log_reason=reason,
             audit_action="buy_filled",
@@ -648,6 +654,22 @@ def commit_strategy_entry_fill(
             is_t_base=True,
         )
         _assert_active_lease(conn, "strategy fill finalization")
+        event_filled_qty = int(execution_result.get("event_filled_qty") or 0)
+        if event_filled_qty <= 0:
+            conn.execute(
+                "UPDATE paper_signals SET status='deferred_capacity',reason=? WHERE id=?",
+                ("执行规则暂未发现可成交量；后续调度重新评估", signal["id"]),
+            )
+            conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+            return execution_result
+        if execution_result.get("status") == "partially_filled":
+            conn.execute(
+                "UPDATE paper_signals SET status='deferred_capacity',reason=? WHERE id=?",
+                (f"已成交 {execution_result.get('filled_qty')}/{execution_result.get('desired_qty')} 股；剩余委托待复核",
+                 signal["id"]),
+            )
+            conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+            return execution_result
         slice_done = slice_state is None
         if slice_state is not None:
             slice_plan = [int(item) for item in (slice_state.get("plan") or [])]
@@ -673,7 +695,7 @@ def commit_strategy_entry_fill(
                 (reason, signal["id"]),
             )
         conn.execute(f"RELEASE SAVEPOINT {savepoint}")
-        return None
+        return execution_result
     except Exception as exc:
         conn.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
         conn.execute(f"RELEASE SAVEPOINT {savepoint}")
@@ -802,9 +824,14 @@ def submit_manual_order(
             savepoint = f"manual_fill_{int(order_id)}"
             conn.execute(f"SAVEPOINT {savepoint}")
             try:
-                _execute_manual_plan(conn, account, plan, order_id, day)
+                execution_result = _execute_manual_plan(conn, account, plan, order_id, day)
                 conn.execute(f"RELEASE SAVEPOINT {savepoint}")
-                status = "filled"
+                status = str(execution_result.get("status") or "pending_execution")
+                if status != "filled":
+                    execution = execution_result.get("execution") or {}
+                    reason = "；".join(execution.get("reasons") or []) or (
+                        f"已成交 {execution_result.get('filled_qty', 0)}/{execution_result.get('desired_qty', plan.get('qty', 0))} 股"
+                    )
             except Exception as exc:
                 conn.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
                 conn.execute(f"RELEASE SAVEPOINT {savepoint}")
@@ -828,7 +855,10 @@ def submit_manual_order(
         elif status == "risk_rejected":
             _risk_log(conn, account_id, code, side, "manual_rejected", reason, plan)
         _record_nav(conn, day, quotes=quote_map)
-        return {"order_id": order_id, "status": status, "plan": plan}
+        return {
+            "order_id": order_id, "status": status, "plan": plan,
+            "execution": locals().get("execution_result"),
+        }
 
 
 def cancel_manual_order(order_id):
@@ -841,6 +871,7 @@ def cancel_manual_order(order_id):
         _now,
         init_db,
     )
+    import execution_lifecycle as EL
     init_db()
     with _db() as conn:
         row = conn.execute(
@@ -850,6 +881,7 @@ def cancel_manual_order(order_id):
             raise ValueError("未找到手动模拟委托")
         if row["status"] not in set(ENTRY_RETRY_ORDER_STATUSES):
             raise ValueError("只有待触发的限价委托可以撤销")
+        EL.assert_simulated_transition(row["status"], "cancelled")
         conn.execute(
             "UPDATE paper_orders SET status='cancelled',reason='用户撤销模拟委托',cancelled_at=? WHERE id=?",
             (_now(), int(order_id)),
@@ -1054,7 +1086,7 @@ def process_pending_manual_orders(asof_date=None):
             # ── execution-cycle 预检（§7/§16/§23）：必须在**任何** reservation /
             # cash / lot / fill mutation 之前。旧代码在触发后才调用
             # ``_reserve_shared_capital``，而预占会读当前共享现金并写入**当前**
-            # active cycle 的 reservation —— 等到 commit_fill 才发现周期漂移就
+            # active cycle 的 reservation —— 等到 execute_order 才发现周期漂移就
             # 太晚了：cycle 9 的 reservation 已经落库，形成另一种账本错配。
             #
             # 归属未知（legacy NULL / pre-v18 schema）与账本已搬家是两类不同的
@@ -1185,7 +1217,12 @@ def process_pending_manual_orders(asof_date=None):
                 "SELECT * FROM paper_accounts WHERE id=?", (order["account_id"],)
             ).fetchone())
             reserve_price = _num(plan.get("fill_price"), _num(order.get("planned_price")))
-            reserve_amount = max(0, int(plan.get("qty") or 0)) * max(reserve_price, 0.0)
+            already_filled = int(conn.execute(
+                "SELECT COALESCE(SUM(qty),0) FROM paper_fills WHERE order_id=?",
+                (order["id"],),
+            ).fetchone()[0] or 0)
+            reserve_qty = max(0, int(order.get("qty") or 0) - already_filled)
+            reserve_amount = reserve_qty * max(reserve_price, 0.0)
             reserve_fees = _commission(reserve_amount)
             try:
                 reserved, reserve_reason = _reserve_shared_capital(
@@ -1222,9 +1259,9 @@ def process_pending_manual_orders(asof_date=None):
             savepoint = f"pending_exec_{int(order['id'])}"
             conn.execute(f"SAVEPOINT {savepoint}")
             try:
-                _execute_manual_plan(conn, account, plan, order["id"], day)
+                execution_result = _execute_manual_plan(conn, account, plan, order["id"], day)
                 conn.execute(f"RELEASE SAVEPOINT {savepoint}")
-                output.append({"order_id": order["id"], "status": "filled"})
+                output.append(execution_result)
             except Exception as exc:
                 conn.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
                 conn.execute(f"RELEASE SAVEPOINT {savepoint}")
@@ -1257,4 +1294,119 @@ def process_pending_manual_orders(asof_date=None):
                     "reason": reason,
                 })
         _record_nav(conn, day, quotes=quote_map)
+    return output
+
+
+def process_pending_strategy_executions(asof_date=None):
+    """用新行情继续已批准策略委托的剩余数量，不重新运行策略审批。
+
+    只做执行层需要的重试：先在账本锁外批量取可信报价，再将冻结的订单意图交给
+    Execution Authority。这样部分成交可续行，且历史 signal/strategy 不会被当前头
+    重新解释。
+    """
+    from paper_trading import (
+        _assert_active_lease,
+        _date,
+        _db,
+        _finish_capital_reservation,
+        _lease_lost,
+        _quotes,
+        _risk_log,
+        _rows,
+        init_db,
+    )
+    import execution_planner as EP
+    import execution_lifecycle as EL
+
+    init_db()
+    day = _date(asof_date)
+    active_statuses = ("pending_execution", "partially_filled")
+    with _db() as snapshot_conn:
+        pending = _rows(
+            snapshot_conn,
+            """SELECT id,account_id,signal_id,side,code,name,qty,status,expires_at,created_at
+                 FROM paper_orders WHERE COALESCE(origin,'strategy')<>'manual' AND side='buy'
+                   AND status IN (?,?) ORDER BY id""",
+            active_statuses,
+        )
+    if not pending:
+        return []
+
+    quote_map = _quotes(sorted({str(row["code"]) for row in pending}), asof_date=day)
+    output = []
+    with _db(immediate=True) as conn:
+        for snapshot_order in pending:
+            order_id = int(snapshot_order["id"])
+            order = conn.execute(
+                "SELECT * FROM paper_orders WHERE id=?", (order_id,),
+            ).fetchone()
+            if order is None or str(order["status"]) not in active_statuses:
+                continue
+            order = dict(order)
+            _assert_active_lease(conn, "pending strategy execution")
+            try:
+                EL.assert_simulated_transition(order["status"], "partially_filled")
+            except EL.IllegalLifecycleTransition:
+                continue
+            if order.get("expires_at") and str(order["expires_at"])[:10] < day.isoformat():
+                conn.execute(
+                    "UPDATE paper_orders SET status='expired',reason=COALESCE(reason,'') || '；执行委托已过期',cancelled_at=? WHERE id=?",
+                    (day.isoformat(), order_id),
+                )
+                _finish_capital_reservation(conn, order_id, "released")
+                output.append({"order_id": order_id, "status": "expired"})
+                continue
+            quote = dict(quote_map.get(str(order["code"])) or {})
+            account_row = conn.execute(
+                "SELECT * FROM paper_accounts WHERE id=?", (order["account_id"],),
+            ).fetchone()
+            if account_row is None:
+                output.append({"order_id": order_id, "status": "pending_execution",
+                               "reason": "订单账户暂不可用"})
+                continue
+            account = dict(account_row)
+            savepoint = f"strategy_execution_{order_id}"
+            conn.execute(f"SAVEPOINT {savepoint}")
+            try:
+                result = EP.execute_order(
+                    conn, account=account,
+                    plan={"side": "buy", "code": order["code"], "name": order.get("name"),
+                          "qty": int(order["qty"] or 0)},
+                    order_id=order_id, asof_day=day,
+                    execution_quote=quote, execution_as_of=quote.get("quote_at"),
+                    action="strategy_execution_retry",
+                    risk_log_reason="已批准策略委托按新行情继续模拟执行",
+                    audit_action="strategy_execution_retry",
+                    reason="已批准策略委托模拟成交",
+                    detail={"execution_retry": True, "signal_id": order.get("signal_id")},
+                )
+                conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+                signal_id = order.get("signal_id")
+                if signal_id is not None and int(result.get("event_filled_qty") or 0) > 0:
+                    if result.get("status") == "filled":
+                        conn.execute(
+                            "UPDATE paper_signals SET status='filled',reason='策略订单已完成模拟成交' WHERE id=? AND status IN ('pending','deferred_capacity')",
+                            (int(signal_id),),
+                        )
+                    elif result.get("status") == "partially_filled":
+                        conn.execute(
+                            "UPDATE paper_signals SET status='deferred_capacity',reason=? WHERE id=? AND status IN ('pending','deferred_capacity')",
+                            (f"已成交 {result.get('filled_qty')}/{result.get('desired_qty')} 股；剩余委托等待下一次可信行情",
+                             int(signal_id)),
+                        )
+                output.append(result)
+            except Exception as exc:
+                conn.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+                conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+                if _lease_lost(exc):
+                    raise
+                reason = f"策略委托执行事件失败，可重试：{type(exc).__name__}: {exc}"
+                conn.execute(
+                    "UPDATE paper_orders SET reason=? WHERE id=?",
+                    (reason, order_id),
+                )
+                _risk_log(conn, order["account_id"], order["code"], "buy",
+                          "strategy_execution_retry_error", reason,
+                          {"order_id": order_id, "error": str(exc)})
+                output.append({"order_id": order_id, "status": order["status"], "reason": reason})
     return output

@@ -265,7 +265,10 @@ export function paperOrderStatusView(status,reason){
   if(status==='deferred_capacity' && /入场时机|确认中|确认未完成|回踩/.test(String(reason||'')))
     return ['pending','等待入场确认'];
   var map={
-    filled:['filled','已成交'],pending_limit:['pending','待触发'],risk_rejected:['rejected','风控拒绝'],deferred_capacity:['pending','容量等待重排'],
+    filled:['filled','全部成交'],partially_filled:['pending','部分成交'],pending_execution:['pending','等待成交'],
+    pending_limit:['pending','待触发'],pending_execution_guard:['pending','等待市场条件'],
+    pending_execution_retry:['pending','等待重试'],manual_execution_retry:['pending','等待重试'],execution_retry:['pending','等待重试'],
+    risk_rejected:['rejected','风控拒绝'],deferred_capacity:['pending','容量等待重排'],
     unfilled_limit_down:['rejected','跌停未成交'],cancelled:['cancelled','已撤销'],
     expired:['cancelled','已过期'],ready_to_fill:['pending','待成交']
   };
@@ -767,10 +770,14 @@ export async function renderPaperDashboard(d,auditRequest){
         +'<button class="paper-mini-btn sell" '+(p.available_qty<100?'disabled':'')+' onclick="preparePaperSell(\''+p.account_id+'\',\''+p.code+'\','+p.available_qty+')">'+(p.available_qty<100?'T+1\u9501\u5b9a':'\u6a21\u62df\u5356\u51fa')+'</button></div>';
     }).join('');
     var recentOrders=(d.orders||[]).map(function(o){
-      var view=paperOrderStatusView(o.status,o.reason), cancel=(!o.archived_cycle&&o.status==='pending_limit')?'<button class="paper-mini-btn cancel" onclick="cancelPaperOrder('+o.id+')">撤单</button>':'';
+      var view=paperOrderStatusView(o.status,o.reason), cancel=(o.allowed_actions||[]).indexOf('cancel')>=0?'<button class="paper-mini-btn cancel" onclick="cancelPaperOrder('+o.id+')">撤销剩余</button>':'';
+      var qtyText=(o.filled_qty||0)+' 已成交 / '+(o.desired_qty||o.qty||0)+' 委托 / '+(o.remaining_qty||0)+' 剩余';
+      var priceText=fmt(o.filled_price||o.planned_price)+' · 费用 '+cny(o.fees)+' · 滑点 '+cny(o.slippage_amount||0,true);
+      var marketText=(o.execution_asof||'未执行')+' · 行情 '+(o.market_data_asof||'未知')+' · '+(o.market_data_validation||o.market_data_state||'行情状态未知');
+      var reasonText=o.blocking_reason||o.reason||'—';
       return '<div class="paper-order-row" data-account="'+o.account_id+'" data-date="'+String(o.created_at||'').slice(0,10)+'" data-side="'+o.side+'" data-status="'+o.status+'"><span>'+String(o.created_at||'').slice(5,16)+'</span><span><button class="paper-stock-link" onclick="showPaperStockHistory(\''+o.code+'\')">'+o.name+'</button><br><small>'+o.code+' · '+(o.account_name||accountName[o.account_id]||o.account_id)+'</small></span>'
-        +'<span class="'+(o.side==='buy'?'up':'down')+'">'+(o.side==='buy'?'买入':'卖出')+' '+o.qty+'</span><span>'+fmt(o.filled_price||o.planned_price)+'</span>'
-        +'<span class="paper-order-status '+view[0]+'">'+view[1]+'</span><span>'+cancel+'</span></div>';
+        +'<span class="'+(o.side==='buy'?'up':'down')+'">'+(o.side==='buy'?'买入':'卖出')+'<br><small>'+qtyText+'</small></span><span>'+priceText+'</span>'
+        +'<span><span class="paper-order-status '+view[0]+'">'+view[1]+'</span><br><small>'+marketText+'</small></span><span>'+riskText(reasonText)+'<br>'+cancel+'</span></div>';
     }).join('');
     var riskFeed=(d.risk_decisions||[]).slice(0,5).map(function(r){
       return '<div style="padding:8px 0;border-bottom:1px solid #edf1ef;font-size:12px"><b>'+(r.account_name||r.account_id)+' · '+(r.side==='buy'?'买入':'卖出')+' '+(r.code||'')+'</b><br><span style="color:var(--text-secondary)">'+zhRiskText(r.reason||r.decision)+'</span></div>';
@@ -854,13 +861,14 @@ export async function renderPaperDashboard(d,auditRequest){
     }).join('');
     var signalItems = d.signals||[];
     var orders = (d.orders||[]).map(function(o){
-      var view=paperOrderStatusView(o.status), cancel=(!o.archived_cycle&&o.status==='pending_limit')?'<button class="paper-mini-btn cancel" onclick="cancelPaperOrder('+o.id+')">撤单</button>':'';
+      var view=paperOrderStatusView(o.status,o.reason), cancel=(o.allowed_actions||[]).indexOf('cancel')>=0?'<button class="paper-mini-btn cancel" onclick="cancelPaperOrder('+o.id+')">撤销剩余</button>':'';
       return '<tr><td>'+o.created_at+'</td><td>'+(o.account_name||accountName[o.account_id]||o.account_id)+'</td><td>'+(o.origin==='manual'?'手动模拟':'策略自动')+'<br><small>'+(o.order_type==='limit'?'限价':'市价')+'</small></td>'
         +'<td class="'+(o.side==='buy'?'up':'down')+'">'+(o.side==='buy'?'买入':'卖出')+'</td><td><b>'+o.name+'</b> '+o.code+'</td>'
-        +'<td>'+o.qty+'</td><td>'+fmt(o.filled_price||o.planned_price)+'</td><td>'+cny(o.realized_pnl,true)+'</td><td><span class="paper-order-status '+view[0]+'">'+view[1]+'</span></td><td style="font-size:12px">'+(o.reason||'-')+cancel+'</td></tr>';
+        +'<td>'+o.desired_qty+' 委托<br><small>'+o.filled_qty+' 成交 / '+o.remaining_qty+' 剩余</small></td><td>'+fmt(o.filled_price||o.planned_price)+'<br><small>'+cny(o.fees)+' 费用 · 滑点 '+cny(o.slippage_amount||0,true)+'</small></td><td>'+cny(o.realized_pnl,true)+'</td><td><span class="paper-order-status '+view[0]+'">'+view[1]+'</span></td><td style="font-size:12px">'+(o.blocking_reason||o.reason||'-')+'<br><small>执行 '+(o.execution_asof||'—')+' · 行情 '+(o.market_data_asof||'—')+' · '+(o.market_data_validation||o.market_data_state||'未知')+'</small>'+cancel+'</td></tr>';
     }).join('');
     var fills = (d.fills||[]).map(function(f){
-      return '<tr><td>'+f.fill_date+'</td><td>'+(f.account_name||accountName[f.account_id]||f.account_id)+'</td><td class="'+(f.side==='buy'?'up':'down')+'">'+(f.side==='buy'?'买入':'卖出')+'</td><td>'+f.code+'</td><td>'+f.qty+'</td><td>'+fmt(f.price)+'</td><td>'+cny(f.amount)+'</td><td>'+cny(f.fees)+'</td><td style="font-size:12px">'+f.assumption+'</td></tr>';
+      var evidence=f.market_evidence||{};
+      return '<tr><td>'+f.fill_date+'<br><small>'+ (f.execution_asof||'—')+'</small></td><td>'+(f.account_name||accountName[f.account_id]||f.account_id)+'</td><td class="'+(f.side==='buy'?'up':'down')+'">'+(f.side==='buy'?'买入':'卖出')+'</td><td>'+f.code+'</td><td>'+f.qty+'</td><td>'+fmt(f.price)+'<br><small>'+(f.pricing_basis||'—')+' · 滑点 '+cny(f.slippage_amount||0,true)+'</small></td><td>'+cny(f.amount)+'</td><td>'+cny(f.fees)+'</td><td style="font-size:12px">行情 '+(evidence.quote_at||f.quote_at||'—')+' · '+(evidence.quote_validation||'未记录')+'<br>'+riskText(f.assumption||'执行规则模拟')+'</td></tr>';
     }).join('');
     var reviews = (d.reviews||[]).map(function(r){ return '<details style="margin:6px 0"><summary><b>'+r.account_id+'</b> · '+r.week_key+' · '+r.recommendation+'</summary><pre style="white-space:pre-wrap;font:12px Microsoft YaHei;color:var(--text-secondary);padding:8px">'+r.report+'</pre></details>'; }).join('');
     var observationNames={scan:'候选扫描',observe:'观察',t_sell:'日内高抛',t_rebuy:'日内回补'};
@@ -881,10 +889,10 @@ export async function renderPaperDashboard(d,auditRequest){
       ? tableScroll('<table><tr><th>策略决策</th><th>标的</th><th>持仓股数</th><th>持仓市值 / 总池占比</th><th>成本</th><th>现价</th><th>浮盈亏</th><th>质量评分 / 处置</th><th>持有</th><th>份额状态</th><th>交易制度</th><th>最早可卖 / 报价</th></tr>'+positions+'</table>',1260)
       : '<div class="paper-empty">暂无模拟持仓。</div>';
     var ordersAudit = orders
-      ? tableScroll('<table><tr><th>时间</th><th>策略</th><th>来源</th><th>方向</th><th>标的</th><th>数量</th><th>成交/委托价</th><th>已实现盈亏</th><th>状态</th><th>模型结论</th></tr>'+orders+'</table>',1080)
+      ? tableScroll('<table><tr><th>时间</th><th>策略</th><th>来源</th><th>方向</th><th>标的</th><th>委托 / 已成交 / 剩余</th><th>模拟价格 / 费用 / 滑点</th><th>已实现盈亏</th><th>状态</th><th>执行与行情证据 / 原因</th></tr>'+orders+'</table>',1240)
       : '<div class="paper-empty">暂无订单；每笔成交、挂单、拒单与撤单都会在此留痕。</div>';
     var fillsAudit = fills
-      ? tableScroll('<table><tr><th>成交日</th><th>策略</th><th>方向</th><th>代码</th><th>数量</th><th>成交价</th><th>成交额</th><th>费用</th><th>成交假设</th></tr>'+fills+'</table>',900)
+      ? tableScroll('<table><tr><th>成交日 / 执行时点</th><th>策略</th><th>方向</th><th>代码</th><th>数量</th><th>成交价 / 定价依据 / 滑点</th><th>成交额</th><th>费用</th><th>市场证据</th></tr>'+fills+'</table>',1080)
       : '<div class="paper-empty">暂无成交记录。</div>';
     var observationsAudit = observations
       ? tableScroll('<table><tr><th>时间</th><th>策略</th><th>标的</th><th>报价</th><th>结论</th><th>原因</th></tr>'+observations+'</table>',820)

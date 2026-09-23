@@ -371,6 +371,11 @@ def dashboard(include_activity=False, include_history_symbols=False):
             candidate_overlap = []
             reviews = []
             last_jobs = []
+            fills = [
+                event
+                for order in orders
+                for event in (order.get("fill_events") or [])
+            ][:2000]
         else:
             # Do not load the full signal payload here.  A signal's immutable
             # decision snapshot can be hundreds of KB, and loading 120 of them

@@ -331,7 +331,7 @@ class RiskServiceContractTests(_RiskServiceCase):
     def test_rsvc7_risk_sell_commits_through_execution_planner_once(self):
         self.add_lot(100, 10.0)
         self.set_sell_quote()
-        with mock.patch.object(EP, "commit_fill", wraps=EP.commit_fill) as commit:
+        with mock.patch.object(EP, "execute_order", wraps=EP.execute_order) as commit:
             result = self.run_risk()
         self.assertEqual(commit.call_count, 1)
         self.assertEqual(

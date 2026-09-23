@@ -53,7 +53,7 @@ ORDER_EXPIRED_STATUS = "expired"
 # 可恢复但必须受 TTL 约束的买单状态。
 RECOVERABLE_ORDER_STATUSES = (
     "pending_limit", "execution_retry", "manual_execution_retry",
-    "deferred_capacity", "entry_frozen_waitlist",
+    "pending_execution", "partially_filled", "deferred_capacity", "entry_frozen_waitlist",
 )
 # 这些状态对应的信号仍在复试管道里，可被 TTL 收敛为终态。
 RETRY_SIGNAL_STATUSES = ("pending", "deferred_capacity", "entry_frozen_waitlist")
@@ -351,22 +351,36 @@ def expire_stale_signals(
         )
         summary["expired"] += 1
     # 回收已失效信号名下的活动买单。
+    has_fill_ledger = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='paper_fills'"
+    ).fetchone() is not None
+    filled_qty_sql = (
+        "COALESCE((SELECT SUM(f.qty) FROM paper_fills f WHERE f.order_id=o.id),0)"
+        if has_fill_ledger else "0"
+    )
     stale = conn.execute(
-        """SELECT o.id FROM paper_orders o
+        f"""SELECT o.id,o.status,o.qty,{filled_qty_sql} AS filled_qty
+              FROM paper_orders o
              JOIN paper_signals s ON s.id=o.signal_id
-            WHERE o.side='buy' AND o.status IN (?,?,?,?,?)
+            WHERE o.side='buy' AND o.status IN ({','.join('?' for _ in RECOVERABLE_ORDER_STATUSES)})
               AND s.status IN ('expired','superseded','rejected','blocked','shadow_q3')""",
         RECOVERABLE_ORDER_STATUSES,
     ).fetchall()
     for row in stale:
         order_id = int(row["id"])
+        had_fills = int(row["filled_qty"] or 0) > 0
+        terminal_status = "cancelled" if had_fills else "superseded"
+        terminal_reason = (
+            "信号已失效，撤销剩余数量；已成交部分保留" if had_fills
+            else "信号已失效，委托回收"
+        )
         _release_reservation(conn, order_id)
         conn.execute(
-            """UPDATE paper_orders
-                  SET status='superseded',reason=COALESCE(reason,'') || '；信号已失效，委托回收',
-                      cancelled_at=?
-                WHERE id=? AND status IN (?,?,?,?,?)""",
-            (moment.isoformat(timespec="seconds"), order_id, *RECOVERABLE_ORDER_STATUSES),
+            f"""UPDATE paper_orders
+                   SET status=?,reason=COALESCE(reason,'') || '；' || ?,cancelled_at=?
+                 WHERE id=? AND status IN ({','.join('?' for _ in RECOVERABLE_ORDER_STATUSES)})""",
+            (terminal_status, terminal_reason, moment.isoformat(timespec="seconds"),
+             order_id, *RECOVERABLE_ORDER_STATUSES),
         )
         summary["orders_cancelled"] += 1
     return summary

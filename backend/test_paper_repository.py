@@ -3,6 +3,7 @@ import os
 import sqlite3
 import sys
 import unittest
+import json
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -85,6 +86,51 @@ class PaperRepositoryTests(unittest.TestCase):
         self.assertEqual(rows[0]["account_name"], "策略 A")
         self.assertIsNone(rows[0]["archived_cycle"])
         self.assertNotIn("risk_payload", rows[0])
+
+    def test_recent_live_orders_projects_partial_execution_and_fill_evidence(self):
+        self.conn.executescript(
+            """
+            CREATE TABLE paper_orders(
+                id INTEGER PRIMARY KEY, account_id TEXT, signal_id INTEGER, side TEXT, code TEXT,
+                name TEXT, qty INTEGER, planned_price REAL, filled_price REAL, amount REAL,
+                fees REAL, status TEXT, reason TEXT, realized_pnl REAL, created_at TEXT,
+                executed_at TEXT, order_type TEXT, origin TEXT, expires_at TEXT, cancelled_at TEXT,
+                risk_payload TEXT,cycle_id INTEGER,execution_status TEXT,execution_verified INTEGER,
+                execution_evidence_source TEXT
+            );
+            CREATE TABLE paper_fills(
+                id INTEGER PRIMARY KEY,order_id INTEGER,account_id TEXT,side TEXT,code TEXT,
+                qty INTEGER,price REAL,amount REAL,fees REAL,fill_date TEXT,quote_at TEXT,
+                execution_event_key TEXT,execution_asof TEXT,pricing_basis TEXT,
+                slippage_amount REAL,execution_evidence TEXT
+            );
+            """
+        )
+        quote = {"quote_at": "2026-09-08T10:00:00", "quote_validation": "cross_source_checked"}
+        decision = {"as_of": "2026-09-08T10:00:00", "market_state": "cross_source_checked",
+                    "market_evidence": quote, "reason_codes": []}
+        self.conn.execute(
+            """INSERT INTO paper_orders(id,account_id,side,code,name,qty,planned_price,status,
+               reason,created_at,origin,risk_payload,cycle_id,execution_status,execution_verified)
+               VALUES(1,'acct','buy','600000','浦发',300,10,'partially_filled','剩余待执行',
+               '2026-09-08T10:00:00','manual',?,3,'partial',0)""",
+            (json.dumps({"execution": decision}),),
+        )
+        self.conn.execute(
+            """INSERT INTO paper_fills VALUES(1,1,'acct','buy','600000',100,10.01,1001,0.1,
+               '2026-09-08','2026-09-08T10:00:00','event-1','2026-09-08T10:00:00',
+               'reference_plus_slippage',1,'{}')"""
+        )
+
+        order = repository.recent_live_orders(self.conn, {"acct": "策略 A"}, 20)[0]
+
+        self.assertEqual((300, 100, 200), (
+            order["desired_qty"], order["filled_qty"], order["remaining_qty"],
+        ))
+        self.assertEqual("cross_source_checked", order["market_data_validation"])
+        self.assertEqual(["cancel"], order["allowed_actions"])
+        self.assertEqual("event-1", order["fill_events"][0]["execution_event_key"])
+        self.assertNotIn("risk_payload", order)
 
 
 if __name__ == "__main__":

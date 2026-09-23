@@ -502,7 +502,8 @@ class ProductionProvenanceRegression(ProductionEpisodeCase):
         # 现价 9.0（-10%）→ 硬止损应照常触发，与 model provenance 无关
         self.quotes[CODE] = {
             "code": CODE, "name": "测试股", "price": 9.0, "high": 9.2, "low": 8.9,
-            "pct": -8.0, "amount": 100000.0, "volume": 10000.0, "turnover": 1.0,
+            "pct": -8.0, "prev_close": 9.78,
+            "amount": 100000.0, "volume": 10000.0, "turnover": 1.0,
             "quote_source": "live", "quote_at": "2026-09-10 14:50:00",
             "quote_validation": "cross_source_checked",
         }

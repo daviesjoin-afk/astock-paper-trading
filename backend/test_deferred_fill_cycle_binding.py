@@ -5,7 +5,7 @@
 与 §13（真实可达路径 E2E）。
 
 全部用例都驱动**真实**生产 schema 与**真实**生产原语（``paper_trading.init_db``
-+ ``execution_planner.commit_fill``）。手写最小 DDL 只能证明夹具自洽：本轮两个
++ ``execution_planner.execute_order``）。手写最小 DDL 只能证明夹具自洽：本轮两个
 缺陷恰恰是「订单行与 lot 行的周期可以不一致」，而那个不变量由生产代码持有。
 
 不变量（本文件存在的全部理由）：
@@ -207,22 +207,26 @@ class _LedgerCase(unittest.TestCase):
         }
 
     def plan(self, *, side, qty, code=CODE, price=10.0):
+        quote = {
+            "code": code, "name": NAME, "price": price, "prev_close": price,
+            "pct": 0.0, "amount": max(100000.0, qty * price * 200),
+            "quote_at": "2026-09-10T10:00:00",
+            "quote_source": "live", "quote_validation": "cross_source_checked",
+        }
         return {
-            "side": side, "code": code, "qty": qty, "fill_price": price,
-            "amount": qty * price, "fees": 5.0, "quote_at": "2026-09-05T10:00:00",
+            "side": side, "code": code, "qty": qty, "execution_quote": quote,
             "risk": {"x": 1},
         }
 
     def commit(self, order_id, *, side, qty, reserved=True, code=CODE, price=10.0):
-        """经**生产** ``commit_fill`` 成交（reserved=True 跳过预占，聚焦周期归属）。"""
+        """经**生产** ``execute_order`` 成交（reserved=True 跳过预占，聚焦周期归属）。"""
         with PT._db(immediate=True) as conn:
-            return EP.commit_fill(
+            return EP.execute_order(
                 conn,
                 account={"id": ACCOUNT},
                 plan=self.plan(side=side, qty=qty, code=code, price=price),
                 order_id=order_id,
-                asof_day=dt.date(2026, 9, 5),
-                reserved=reserved,
+                asof_day=dt.date(2026, 9, 10),
                 action="manual_filled",
                 reason="测试成交",
             )
@@ -253,8 +257,9 @@ class PendingSellStaysInItsOwnCycle(_LedgerCase):
         self.assertEqual(self.active_cycle(), later, "夹具必须真的把 active 切走")
         before = self.counts()
 
-        with self.assertRaises(PT.OrderExecutionCycleChanged) as ctx:
-            self.commit(order, side="sell", qty=100)
+        with mock.patch.object(PT, "_date", return_value=dt.date(2026, 9, 10)):
+            with self.assertRaises(PT.OrderExecutionCycleChanged) as ctx:
+                self.commit(order, side="sell", qty=100)
 
         self.assertEqual(ctx.exception.order_cycle_id, self.cycle)
         self.assertEqual(ctx.exception.active_cycle_id, later)
@@ -297,26 +302,21 @@ class PendingSellStaysInItsOwnCycle(_LedgerCase):
 class InsufficientOwnCycleMustNotBorrow(_LedgerCase):
     """cycle 8 只有 50、cycle 9 有 100、要卖 100 ⇒ 必须整体失败。"""
 
-    def test_R2_short_own_cycle_fails_instead_of_borrowing_the_next(self):
+    def test_R2_sub_lot_own_cycle_waits_without_borrowing_the_next(self):
         self.add_lot(self.cycle, 50)
         order = self.add_order(side="sell", qty=100, cycle_id=self.cycle)
         later = self.add_cycle()
         self.add_lot(later, 100)
         before = self.counts()
 
-        with self.assertRaises(RuntimeError):
-            self.commit(order, side="sell", qty=100)
+        result = self.commit(order, side="sell", qty=100)
 
-        # 四个「不得」：两边余额都不变、无 fill、无现金入账、订单未标记成交。
-        self.assertEqual(self.lot_remaining(self.cycle), 50, "cycle 8 余额不得变化")
-        self.assertEqual(self.lot_remaining(later), 100, "cycle 9 余额不得被借走")
-        after = self.counts()
-        self.assertEqual(after["fills"], before["fills"], "不得写入 fill")
-        self.assertEqual(self._cash(), self.cash_before, "不得入账现金")
-        status = self.conn.execute(
-            "SELECT status FROM paper_orders WHERE id=?", (order,)
-        ).fetchone()["status"]
-        self.assertNotEqual(status, "filled", "订单不得被标记成交")
+        self.assertEqual(result["status"], "pending_execution")
+        self.assertEqual(result["filled_qty"], 0)
+        self.assertEqual(self.lot_remaining(self.cycle), 50)
+        self.assertEqual(self.lot_remaining(later), 100)
+        self.assertEqual(self.counts()["fills"], before["fills"])
+        self.assertEqual(self._cash(), self.cash_before)
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -401,10 +401,10 @@ class OrderIdentityMismatchFailsClosed(_LedgerCase):
 
     def _commit_with(self, order_id, *, account_id, code, side, qty=100):
         with PT._db(immediate=True) as conn:
-            return EP.commit_fill(
+            return EP.execute_order(
                 conn, account={"id": account_id},
                 plan=self.plan(side=side, qty=qty, code=code), order_id=order_id,
-                asof_day=dt.date(2026, 9, 5), reserved=True,
+                asof_day=dt.date(2026, 9, 10),
                 action="manual_filled", reason="测试成交",
             )
 
@@ -866,7 +866,7 @@ class RealPendingSellPathEndToEnd(_ProvenRiskHarness):
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# §4/§9/§11 原语级契约（不可由 commit_fill 的外层预检代替）
+# §4/§9/§11 原语级契约（不可由 execute_order 的外层预检代替）
 # ══════════════════════════════════════════════════════════════════════════
 class ReadOnlyCycleLookupHasNoSideEffects(_LedgerCase):
     """§9/§10：周期闸门**只读**，绝不能顺手创建周期。"""
@@ -964,10 +964,10 @@ class ExecutionCycleInvariantIsChecked(_LedgerCase):
     def test_guard_refuses_an_unprovable_order_directly(self):
         """§19：闸门**自己**必须拒绝归属不可证明的订单，绝不回退到 active cycle。
 
-        必须直接驱动闸门：``commit_fill`` 在调用闸门**之前**也读了一次归属并抛异常，
-        所以从 ``commit_fill`` 那条路径看，闸门内部的这个判断是被遮蔽的（防御纵深
-        的第二层）。只测 ``commit_fill`` 无法证明闸门自己会拒绝 —— 把闸门的判断换成
-        「拿当前 active cycle 顶上」之后，``commit_fill`` 的用例依然全绿。
+        必须直接驱动闸门：``execute_order`` 在调用闸门**之前**也读了一次归属并抛异常，
+        所以从 ``execute_order`` 那条路径看，闸门内部的这个判断是被遮蔽的（防御纵深
+        的第二层）。只测 ``execute_order`` 无法证明闸门自己会拒绝 —— 把闸门的判断换成
+        「拿当前 active cycle 顶上」之后，``execute_order`` 的用例依然全绿。
         """
         legacy = self.add_order(side="buy", qty=100, cycle_id=None)
         with PT._db(immediate=True) as conn:
@@ -1523,13 +1523,13 @@ class FinalReviewGateAllSixAbsences(_ProvenRiskHarness):
 
 
 class PrimitiveGuardsAreReachableDirectly(_LedgerCase):
-    """两个原语**自己**必须 fail closed，不能只靠 ``commit_fill`` 的外层预检。
+    """两个原语**自己**必须 fail closed，不能只靠 ``execute_order`` 的外层预检。
 
-    ``commit_fill`` 现在先校验归属再调用原语，因此从那条路径**看不到**原语内部的
-    守卫。测试若只走 ``commit_fill``，就会在守卫被删掉后依然通过 —— 防御纵深层
+    ``execute_order`` 现在先校验归属再调用原语，因此从那条路径**看不到**原语内部的
+    守卫。测试若只走 ``execute_order``，就会在守卫被删掉后依然通过 —— 防御纵深层
     等于没有被验证。这里直接驱动原语。
 
-    （另注：``commit_fill`` 包在事务里，**回滚会把已发生的 mutation 抹掉**，所以
+    （另注：``execute_order`` 包在事务里，**回滚会把已发生的 mutation 抹掉**，所以
     「事后账本没变」并不能证明「mutation 发生在校验之后」。要证明顺序，必须观察
     副作用函数是否被调用。）
     """
@@ -1587,7 +1587,7 @@ class PrimitiveGuardsAreReachableDirectly(_LedgerCase):
 class ProvenancePrecheckHappensBeforeAnyMutation(_LedgerCase):
     """§11：归属校验必须发生在**任何**业务 mutation 之前（观察调用顺序）。
 
-    只断言「事后账本没变」是无效的：``commit_fill`` 在事务内，抛异常会整体回滚，
+    只断言「事后账本没变」是无效的：``execute_order`` 在事务内，抛异常会整体回滚，
     于是「先扣款再拒绝」与「先拒绝」在账本上完全一样。要证明顺序，必须观察
     ``_reserve_shared_capital`` / ``_debit_shared_cash`` / ``_record_lot`` /
     ``_consume_available_lots`` / ``_credit_shared_cash`` 有没有被**调用**。
@@ -1625,10 +1625,10 @@ class ProvenancePrecheckHappensBeforeAnyMutation(_LedgerCase):
         with mock.patch.object(EP, "_pt", lambda: self._spy_stub(calls)):
             with PT._db(immediate=True) as conn:
                 with self.assertRaises((PT.OrderCycleProvenanceUnknown, RuntimeError)):
-                    EP.commit_fill(
+                    EP.execute_order(
                         conn, account={"id": ACCOUNT},
                         plan=self.plan(side=side, qty=100), order_id=order,
-                        asof_day=dt.date(2026, 9, 5), reserved=reserved,
+                        asof_day=dt.date(2026, 9, 10),
                         action="manual_filled", reason="测试成交",
                     )
         return calls
@@ -1655,9 +1655,9 @@ class ProvenancePrecheckHappensBeforeAnyMutation(_LedgerCase):
         with mock.patch.object(EP, "_pt", lambda: stub):
             with PT._db(immediate=True) as conn:
                 with self.assertRaisesRegex(RuntimeError, "order identity mismatch"):
-                    EP.commit_fill(
+                    EP.execute_order(
                         conn, account={"id": ACCOUNT}, plan=plan, order_id=order,
-                        asof_day=dt.date(2026, 9, 5), reserved=True,
+                        asof_day=dt.date(2026, 9, 10),
                         action="manual_filled", reason="测试成交",
                     )
         self.assertEqual(calls, [], "身份不符时不得发生任何业务 mutation")

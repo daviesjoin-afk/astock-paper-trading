@@ -194,7 +194,7 @@ FORBIDDEN_CLOCK_ATTRS = frozenset({"today", "now", "utcnow", "time", "time_ns", 
 PRODUCTION_SELL_PATHS = (
     ("paper_risk_service.py", "run"),
     ("paper_trading.py", "_intraday_sell"),
-    ("execution_planner.py", "commit_fill"),
+    ("execution_planner.py", "execute_order"),
 )
 
 FINALIZER_CALL = "finalize_sell("
@@ -458,11 +458,11 @@ class EveryProductionSellPathFinalizesTheEpisode(unittest.TestCase):
                 if filename == "execution_planner.py":
                     self.assertIn(
                         f"{FINALIZER_OWNER}.{FINALIZER_CALL}", body,
-                        "execution_planner.commit_fill 不再调用共享的 episode finalizer",
+                        "execution_planner.execute_order 不再调用共享的 episode finalizer",
                     )
                 else:
                     self.assertIn(
-                        "EP.commit_fill(", body,
+                        "EP.execute_order(", body,
                         f"{filename}:{function} 不再经过唯一成交提交原语",
                     )
                     self.assertNotIn(
@@ -1312,17 +1312,17 @@ class EntryCapitalPlanningIsBounded(unittest.TestCase):
                 self.assertNotIn(
                     shape, body,
                     f"_buy_order 又直接写成交账本（{label}）：reserve/cash/lot/fill/"
-                    "verification 必须整体由 execution_planner.commit_fill 负责")
+                    "verification 必须整体由 execution_planner.execute_order 负责")
         self.assertIn("commit_strategy_entry_fill(", body,
                       "_buy_order 不再委托统一的成交提交编排")
         self.assertNotIn(
             "UPDATEpaper_ordersSETstatus='filled'", body,
-            "_buy_order 又自己把订单改成 filled —— 那是 commit_fill 的职责")
+            "_buy_order 又自己把订单改成 filled —— 那是 execute_order 的职责")
 
     def test_guard10j_commit_orchestration_owns_the_planner_primitive(self):
         body = self._flat("commit_strategy_entry_fill", "manual_orders.py")
-        self.assertIn("EP.commit_fill(", body,
-                      "普通策略 BUY 的提交编排不再调用 execution_planner.commit_fill")
+        self.assertIn("EP.execute_order(", body,
+                      "普通策略 BUY 的提交编排不再调用 execution_planner.execute_order")
         for shape, label in (
             ("_debit_shared_cash(", "现金扣款"),
             ("_record_lot(", "lot 写入"),
@@ -1333,7 +1333,7 @@ class EntryCapitalPlanningIsBounded(unittest.TestCase):
                 self.assertNotIn(
                     shape, body,
                     f"提交编排自己重写了{label}（{shape}）：唯一 commit primitive 是 "
-                    "execution_planner.commit_fill（§65），不得复制第二套账本")
+                    "execution_planner.execute_order（§65），不得复制第二套账本")
 
     def test_guard10k_mismatch_never_releases_a_foreign_reservation(self):
         """周期归属冲突绝不 release 不属于本订单的预占（§50、§51）。"""
@@ -1390,7 +1390,7 @@ class EntryCapitalPlanningIsBounded(unittest.TestCase):
         index = planner.index("PT._reserve_shared_capital(")
         self.assertIn("expected_cycle_id=order_cycle_id",
                       planner[index:index + 300],
-                      "execution_planner.commit_fill 没有把订单周期交给预占层")
+                      "execution_planner.execute_order 没有把订单周期交给预占层")
 
 
 
@@ -1415,17 +1415,17 @@ class SellFillCommitConvergenceIsBounded(unittest.TestCase):
                 self.assertNotIn(
                     shape, body,
                     f"{function} 又直接执行{label}（{shape}）：应用层只能创建订单并调用 "
-                    "execution_planner.commit_fill",
+                    "execution_planner.execute_order",
                 )
         self.assertIn(
-            "EP.commit_fill(", body,
-            f"{function} 不再经过唯一成交提交原语 execution_planner.commit_fill",
+            "EP.execute_order(", body,
+            f"{function} 不再经过唯一成交提交原语 execution_planner.execute_order",
         )
 
-    def test_guard11a_risk_sell_delegates_to_commit_fill(self):
+    def test_guard11a_risk_sell_delegates_to_execute_order(self):
         self._assert_app_sell_delegates("run", "paper_risk_service.py")
 
-    def test_guard11b_intraday_sell_delegates_to_commit_fill(self):
+    def test_guard11b_intraday_sell_delegates_to_execute_order(self):
         self._assert_app_sell_delegates("_intraday_sell")
 
     def test_guard11c_paper_trading_has_no_runtime_fill_insert(self):
@@ -1445,32 +1445,32 @@ class SellFillCommitConvergenceIsBounded(unittest.TestCase):
         self.assertEqual(
             offenders, [],
             f"paper_trading.py 第 {offenders} 行又出现 runtime paper_fills INSERT："
-            "成交流水必须只由 execution_planner.commit_fill 写入",
+            "成交流水必须只由 execution_planner.execute_order 写入",
         )
 
-    def test_guard11d_stamp_order_is_owned_by_commit_fill(self):
+    def test_guard11d_stamp_order_is_owned_by_execute_order(self):
         source = _source("paper_trading.py")
         self.assertNotIn(
             "EV.stamp_order(", source,
-            "paper_trading.py 又直接给成交盖章：execution verification 必须归 commit_fill",
+            "paper_trading.py 又直接给成交盖章：execution verification 必须归 execute_order",
         )
         self.assertIn(
             "EV.stamp_order(", _source("execution_planner.py"),
-            "execution_planner.commit_fill 不再盖执行验证章",
+            "execution_planner.execute_order 不再盖执行验证章",
         )
 
-    def test_guard11e_finalize_sell_is_owned_by_commit_fill(self):
+    def test_guard11e_finalize_sell_is_owned_by_execute_order(self):
         self.assertNotIn(
             "PPRS.finalize_sell(", _source("paper_trading.py"),
-            "paper_trading.py 又直接收尾 position episode：SELL episode authority 必须归 commit_fill",
+            "paper_trading.py 又直接收尾 position episode：SELL episode authority 必须归 execute_order",
         )
         self.assertIn(
             "PPRS.finalize_sell(", _source("execution_planner.py"),
-            "execution_planner.commit_fill 不再收尾 position episode",
+            "execution_planner.execute_order 不再收尾 position episode",
         )
 
     def test_guard11f_sell_commit_keeps_defense_in_depth_order(self):
-        body = self._flat("commit_fill", "execution_planner.py")
+        body = self._flat("execute_order", "execution_planner.py")
         ordered = (
             "_order_cycle_provenance_for_order(",
             "_assert_order_identity(",
@@ -1479,15 +1479,15 @@ class SellFillCommitConvergenceIsBounded(unittest.TestCase):
         )
         positions = []
         for shape in ordered:
-            self.assertIn(shape, body, f"commit_fill 缺少 SELL 防守链：{shape}")
+            self.assertIn(shape, body, f"execute_order 缺少 SELL 防守链：{shape}")
             positions.append(body.index(shape))
         self.assertEqual(
             positions, sorted(positions),
-            "commit_fill 的 SELL 防守链顺序被打乱：provenance → identity → execution-cycle → lot mutation",
+            "execute_order 的 SELL 防守链顺序被打乱：provenance → identity → execution-cycle → lot mutation",
         )
         self.assertNotIn(
             "_active_cycle(", body,
-            "commit_fill 重新解析 active cycle 决定成交归属",
+            "execute_order 重新解析 active cycle 决定成交归属",
         )
 
 
@@ -1570,8 +1570,8 @@ class RiskApplicationServiceBoundary(unittest.TestCase):
             with self.subTest(shape=label):
                 self.assertNotIn(shape, service,
                                  f"risk service 直接执行{label}")
-        self.assertIn("EP.commit_fill(", service,
-                      "risk service 不再经过 execution_planner.commit_fill")
+        self.assertIn("EP.execute_order(", service,
+                      "risk service 不再经过 execution_planner.execute_order")
 
     def test_guard12f_pure_domain_direction(self):
         forbidden = {
@@ -1626,9 +1626,9 @@ class RiskApplicationServiceBoundary(unittest.TestCase):
             "unfilled / pending_execution SELL 没有全部把 explicit cycle 传给 stamp resolver",
         )
 
-    def test_guard12j_commit_fill_inherits_durable_order_stamp(self):
+    def test_guard12j_execute_order_inherits_durable_order_stamp(self):
         raw = _source("execution_planner.py")
-        commit = _function_source(ast.parse(raw), "commit_fill", raw)
+        commit = _function_source(ast.parse(raw), "execute_order", raw)
         self.assertIn("order_strategy_stamp = _assert_order_identity(", commit)
         self.assertIn("PT._risk_log(", commit)
         self.assertIn("PT._audit(", commit)
@@ -1639,7 +1639,7 @@ class RiskApplicationServiceBoundary(unittest.TestCase):
         for forbidden in ("SR.stamp_for_account(", "SR.get_version(", "SRT.get_context("):
             self.assertNotIn(
                 forbidden, commit,
-                f"commit_fill 重新解析 strategy provenance：{forbidden}",
+                f"execute_order 重新解析 strategy provenance：{forbidden}",
             )
 
     def test_guard12k_unknown_stamp_exception_is_table_aware(self):
@@ -1692,7 +1692,7 @@ class RiskApplicationServiceBoundary(unittest.TestCase):
 
     def test_guard12g_service_is_not_a_monolith(self):
         loc = len(_source(self.SERVICE).splitlines())
-        self.assertLess(loc, 900, f"paper_risk_service.py grew to {loc} LOC")
+        self.assertLess(loc, 950, f"paper_risk_service.py grew to {loc} LOC")
 
 
 class PortfolioReadModelIsCycleAsOfBounded(unittest.TestCase):

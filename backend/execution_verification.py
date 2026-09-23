@@ -54,6 +54,8 @@
 
 from __future__ import annotations
 
+import json
+import math
 import sqlite3
 from typing import Any, Mapping
 
@@ -223,6 +225,97 @@ def is_verified_row(row: Any) -> bool:
     return _verified_flag_value(flag) and _verified_status_value(status)
 
 
+def is_verified_fill_event(row: Any) -> bool:
+    """验证 R26 单笔 Fill Event；不把部分订单升级成完整成交。
+
+    部分订单的总量小于目标量，所以旧的整单 ``verified`` 谓词必须继续为假。
+    但每个已经落库的成交事件仍可凭不可变决策和市场证据独立核验，以便账面持仓、
+    现金与剩余委托准确反映已成交部分。旧 fill 没有这份结构化证据时一律不通过。
+    """
+    if row is None:
+        return False
+    raw = _row_field(row, "fill_execution_evidence")
+    if raw is None:
+        raw = _row_field(row, "execution_evidence")
+    try:
+        envelope = json.loads(raw) if isinstance(raw, (str, bytes)) else raw
+    except (TypeError, ValueError):
+        return False
+    if not isinstance(envelope, Mapping):
+        return False
+    decision = envelope.get("decision")
+    market = envelope.get("market_evidence")
+    if not isinstance(decision, Mapping) or not isinstance(market, Mapping):
+        return False
+    if decision.get("executable_now") is not True:
+        return False
+    if str(decision.get("status") or "") not in {"filled", "partially_filled"}:
+        return False
+    side = str(_row_field(row, "fill_side") or "").lower()
+    if side not in {"buy", "sell"} or str(decision.get("side") or side).lower() != side:
+        return False
+    validation = str(market.get("quote_validation") or "")
+    valid_validation = {"cross_source_checked"}
+    if side == "sell":
+        valid_validation.update({"cross_source_unavailable", "range_timestamp_checked"})
+    if validation not in valid_validation or str(market.get("quote_source") or "") != "live":
+        return False
+    quote_at = str(market.get("quote_at") or "")
+    as_of = str(decision.get("as_of") or "")
+    if not quote_at or not as_of or quote_at[:10] != as_of[:10] or quote_at > as_of:
+        return False
+    if str(market.get("code") or _row_field(row, "fill_code") or "") != str(_row_field(row, "fill_code") or ""):
+        return False
+    try:
+        qty = int(_row_field(row, "fill_qty"))
+        price = float(_row_field(row, "fill_price"))
+        amount = float(_row_field(row, "fill_amount"))
+        fees = float(_row_field(row, "fill_fees"))
+        decision_qty = int(decision.get("filled_qty"))
+        decision_price = float(decision.get("fill_price"))
+        decision_amount = float(decision.get("amount"))
+        decision_fees = float(decision.get("fees"))
+    except (TypeError, ValueError, OverflowError):
+        return False
+    numbers = (price, amount, fees, decision_price, decision_amount, decision_fees)
+    if qty <= 0 or decision_qty != qty or not all(math.isfinite(value) for value in numbers):
+        return False
+    if abs(price - decision_price) > 0.0001 or abs(amount - decision_amount) > 0.01:
+        return False
+    if abs(fees - decision_fees) > 0.01:
+        return False
+    event_key = _row_field(row, "execution_event_key")
+    return bool(event_key and decision.get("ruleset_version"))
+
+
+def is_verified_partial_order(order: Any, fill_rows: Any) -> bool:
+    """确认部分订单的已成交事件齐全且数量/账面汇总一致。"""
+    if str(_row_field(order, "execution_status") or "") != EXECUTION_STATUS_PARTIAL:
+        return False
+    if str(_row_field(order, "status") or "").lower() not in {
+        "partially_filled", "pending_execution", "pending_limit",
+        "execution_retry", "manual_execution_retry", "deferred_capacity",
+        "cancelled", "expired", "superseded", "risk_rejected",
+    }:
+        return False
+    rows = list(fill_rows or ())
+    if not rows or not all(is_verified_fill_event(row) for row in rows):
+        return False
+    try:
+        desired = int(_row_field(order, "qty"))
+        filled = sum(int(_row_field(row, "fill_qty")) for row in rows)
+        amount = sum(float(_row_field(row, "fill_amount")) for row in rows)
+        fees = sum(float(_row_field(row, "fill_fees")) for row in rows)
+        stored_amount = float(_row_field(order, "amount") or 0)
+        stored_fees = float(_row_field(order, "fees") or 0)
+    except (TypeError, ValueError, OverflowError):
+        return False
+    return (
+        0 < filled < desired and abs(amount - stored_amount) <= 0.01
+        and abs(fees - stored_fees) <= 0.01
+    )
+
+
 def verification_from_evidence(evidence: Any, *, fill_rows_present: bool = True) -> dict:
     """从一条 :class:`execution_evidence.ExecutionEvidence` 得出验证结论。
 
@@ -291,7 +384,7 @@ def legacy_verification(*, has_fill_rows: bool = False) -> dict:
 def verification_for_order(order: Any, fill_rows: Any = None) -> dict:
     """给一行 ``paper_orders``（+ 它的 ``paper_fills``）算出验证结论。
 
-    这是写入路径的**唯一**入口：:func:`execution_planner.commit_fill` 与迁移脚本
+    这是写入路径的**唯一**入口：:func:`execution_planner.execute_order` 与迁移脚本
     都调用它，因此"什么算成交"只有一处实现。
 
     **没有成交流水不等于"未知"**：被拒 / 撤单 / 过期且没有流水的订单是**肯定性的

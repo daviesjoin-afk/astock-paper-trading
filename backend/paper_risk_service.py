@@ -753,7 +753,7 @@ def run(context: RiskRunContext, *, ports: RiskServicePorts):
                      *strategy_stamp, sell_cycle_id),
                 )
                 order_id = int(cursor.lastrowid)
-                EP.commit_fill(
+                execution_result = EP.execute_order(
                     conn,
                     account=account_map.get(position["account_id"], {"id": position["account_id"]}),
                     plan={
@@ -764,6 +764,8 @@ def run(context: RiskRunContext, *, ports: RiskServicePorts):
                     },
                     order_id=order_id,
                     asof_day=day,
+                    execution_quote=quote,
+                    execution_as_of=quote.get("quote_at"),
                     side="sell",
                     action="filled",
                     audit_action="sell_filled",
@@ -773,13 +775,33 @@ def run(context: RiskRunContext, *, ports: RiskServicePorts):
                     assumption="实时价 - 0.10% 滑点，含佣金及印花税",
                     sell_next_take_stage=next_stage,
                 )
-                if detail.get("protective_exit") and ratio >= 0.999:
+                event_filled_qty = int(execution_result.get("event_filled_qty") or 0)
+                if event_filled_qty <= 0:
+                    conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+                    execution = execution_result.get("execution") or {}
+                    orders.append({
+                        "code": position["code"],
+                        "status": execution_result.get("status") or "pending_execution",
+                        "qty": 0, "reason": "；".join(execution.get("reasons") or [])
+                        or "当前没有可成交流动性",
+                        "execution": execution,
+                    })
+                    continue
+                actual_remaining = int(conn.execute(
+                    """SELECT COALESCE(SUM(remaining_qty),0) FROM paper_position_lots
+                       WHERE cycle_id=? AND account_id=? AND code=? AND remaining_qty>0""",
+                    (cycle_id, position["account_id"], position["code"]),
+                ).fetchone()[0] or 0)
+                detail["remaining_qty"] = actual_remaining
+                detail["position_closed"] = actual_remaining == 0
+                if detail.get("protective_exit") and ratio >= 0.999 and actual_remaining == 0:
                     policy = SPOL.recovery_policy(position["account_id"])
                     _audit(conn, position["account_id"], "protective_exit_recovery_watch", _json({
                         "status": "watching", "code": position["code"],
                         "account_id": position["account_id"], "exit_class": detail.get("exit_class"),
                         "exit_reason_code": detail.get("exit_reason_code"),
-                        "exit_price": fill_price, "exit_at": _now(),
+                        "exit_price": execution_result.get("fill_price"),
+                        "exit_at": execution_result.get("execution", {}).get("as_of"),
                         "min_reclaim_pct": policy["reclaim_pct"],
                         "required_scans": policy["min_scans"],
                         "cooldown_minutes": policy["cooldown_minutes"],
@@ -862,7 +884,10 @@ def run(context: RiskRunContext, *, ports: RiskServicePorts):
                         rotation_bought_codes.add(replacement_code)
                     detail["replacement_buy"] = replacement_result
             orders.append({
-                "code": position["code"], "status": "filled", "qty": qty,
+                "code": position["code"], "status": execution_result.get("status"),
+                "qty": execution_result.get("event_filled_qty"),
+                "desired_qty": qty,
+                "remaining_order_qty": execution_result.get("remaining_qty"),
                 "reason": reason, "concentration_rotation": concentration_triggered,
                 "quality_score": quality_review.get("score"),
                 "position_closed": detail["position_closed"],

@@ -60,6 +60,7 @@ __all__ = [
     "allowed_targets",
     "can_transition",
     "canonical_state",
+    "assert_simulated_transition",
     "observed_fill_supported",
 ]
 
@@ -121,6 +122,7 @@ ALLOWED_TRANSITIONS: Mapping[str, frozenset] = {
 # ─────────────────── 仓库 stored status → 权威状态 ───────────────────
 
 FILLED_STORED_STATUSES = frozenset({"filled"})
+PARTIAL_FILLED_STORED_STATUSES = frozenset({"partially_filled"})
 REJECTED_STORED_STATUSES = frozenset({
     "risk_rejected", "rejected", "manual_rejected", "order_intent_rejected",
     "unfilled_limit_down", "unfilled_limit_down_wait",
@@ -130,7 +132,7 @@ EXPIRED_STORED_STATUSES = frozenset({"expired", "signal_expired"})
 #: 影子记录：产生了"本来会买"的证据，但**从未提交**，所以只能停在 CREATED。
 SHADOW_STORED_STATUSES = frozenset({"shadow_q3"})
 SUBMITTED_STORED_STATUSES = frozenset({
-    "pending_execution", "pending_limit", "deferred_capacity", "entry_frozen_waitlist",
+    "pending_execution", "pending_limit", "ready_to_fill", "deferred_capacity", "entry_frozen_waitlist",
     "execution_retry", "manual_execution_retry", "awaiting_batch", "pending_verification",
     "pending_execution_guard", "pending_execution_retry",
 })
@@ -162,6 +164,29 @@ def can_transition(from_status: Any, to_status: Any) -> bool:
     return target in allowed_targets(from_status)
 
 
+def assert_simulated_transition(from_status: Any, to_status: Any) -> tuple[str, str]:
+    """校验模拟执行状态变更；成交决策本身提供内部受理点，不冒充券商回报。
+
+    本地模拟器没有场所 ACK，但一笔通过 Execution Authority 的成交需要经过
+    ``SUBMITTED → (模拟器受理) ACCEPTED → PARTIAL/FILLED``。将这一步留在
+    生命周期 owner 中，避免执行入口各自绕过终态与部分成交约束。
+    """
+    source = canonical_state(from_status)
+    target = canonical_state(to_status, has_fill=(str(to_status or "").lower() == "partially_filled"))
+    if source == target:
+        return source, target
+    if source == STATE_SUBMITTED and target in {STATE_PARTIAL_FILLED, STATE_FILLED}:
+        legal = can_transition(source, STATE_ACCEPTED) and can_transition(STATE_ACCEPTED, target)
+    else:
+        legal = can_transition(source, target)
+    if not legal:
+        raise IllegalLifecycleTransition(
+            f"simulated order transition is not allowed: {from_status!r} ({source}) "
+            f"-> {to_status!r} ({target})"
+        )
+    return source, target
+
+
 def canonical_state(stored_status: Any, *, has_fill: bool = False) -> str:
     """把 ``paper_orders.status`` 翻译成权威状态。**唯一**映射实现。
 
@@ -172,6 +197,8 @@ def canonical_state(stored_status: Any, *, has_fill: bool = False) -> str:
     status = str(stored_status or "").strip().lower()
     if status in FILLED_STORED_STATUSES:
         return STATE_FILLED
+    if status in PARTIAL_FILLED_STORED_STATUSES:
+        return STATE_PARTIAL_FILLED
     if status in REJECTED_STORED_STATUSES:
         return STATE_REJECTED
     if status in CANCELLED_STORED_STATUSES:

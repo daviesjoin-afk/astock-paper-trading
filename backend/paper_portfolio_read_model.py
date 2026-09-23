@@ -140,6 +140,52 @@ def _identity_ok(row: Mapping) -> bool:
     )
 
 
+def _fill_event_select(conn) -> str:
+    """Optional R26 fill evidence; legacy schemas remain readable but unverified."""
+    columns = _columns(conn, "paper_fills")
+    evidence = (
+        "f.execution_evidence AS fill_execution_evidence"
+        if "execution_evidence" in columns else "NULL AS fill_execution_evidence"
+    )
+    event_key = (
+        "f.execution_event_key AS execution_event_key"
+        if "execution_event_key" in columns else "NULL AS execution_event_key"
+    )
+    return f",{evidence},{event_key}"
+
+
+def _fill_event_verified(row: Mapping) -> bool:
+    """An order-level full verification or an immutable per-fill R26 proof."""
+    return EV.is_verified_row(row) or EV.is_verified_fill_event(row)
+
+
+def _order_fills(conn, order_id: int) -> list[dict]:
+    """Load all fill events for aggregate verification of one durable order."""
+    if not _has_columns(conn, "paper_fills", _FILL_SELECT_COLUMNS):
+        return []
+    rows = _row_dicts(conn.execute(
+        "SELECT f.id AS fill_id,f.order_id,f.account_id AS fill_account_id,"
+        " f.side AS fill_side,f.code AS fill_code,f.qty AS fill_qty,"
+        " f.price AS fill_price,f.amount AS fill_amount,f.fees AS fill_fees,"
+        " f.fill_date,o.account_id AS order_account_id,o.side AS order_side,"
+        " o.code AS order_code,o.execution_status,o.execution_verified"
+        + _fill_event_select(conn) +
+        " FROM paper_fills f JOIN paper_orders o ON o.id=f.order_id"
+        " WHERE f.order_id=? ORDER BY f.id",
+        (int(order_id),),
+    ))
+    return rows
+
+
+def _order_execution_verified(conn, order: Mapping, rows: list[dict]) -> bool:
+    """Validate full-order evidence or the complete set of partial fill events."""
+    if not rows or any(not _identity_ok(row) or not _fill_event_verified(row) for row in rows):
+        return False
+    if EV.is_verified_row(order):
+        return True
+    return EV.is_verified_partial_order(order, rows)
+
+
 def _columns(conn, table: str) -> set[str]:
     try:
         return {str(row[1]) for row in conn.execute(f"PRAGMA table_info({table})")}
@@ -225,8 +271,9 @@ def _sell_fills(conn, context: PortfolioReadContext, account_id: str | None = No
         "       o.code AS order_code, o.status AS order_status, o.cycle_id,"
         "       o.execution_status, o.execution_verified, o.realized_pnl,"
         "       o.amount AS order_amount, o.fees AS order_fees, o.executed_at"
+        + _fill_event_select(conn) +
         "  FROM paper_fills f JOIN paper_orders o ON o.id=f.order_id"
-        " WHERE o.cycle_id=? AND o.side='sell' AND o.status='filled'"
+        " WHERE o.cycle_id=? AND o.side='sell'"
         "   AND f.fill_date IS NOT NULL"
         "   AND length(f.fill_date)>=10 AND substr(f.fill_date,1,10)<=?"
         + account_sql +
@@ -235,7 +282,7 @@ def _sell_fills(conn, context: PortfolioReadContext, account_id: str | None = No
     ))
     verified = []
     for row in rows:
-        if _identity_ok(row) and EV.is_verified_row(row):
+        if _identity_ok(row) and _fill_event_verified(row):
             verified.append(row)
     return verified, rows, True
 
@@ -243,6 +290,12 @@ def _sell_fills(conn, context: PortfolioReadContext, account_id: str | None = No
 def _all_filled_sell_orders(conn, context: PortfolioReadContext, account_id: str | None = None):
     if not _has_columns(conn, "paper_orders", _ORDER_COLUMNS):
         return [], False
+    status_sql = "status='filled'"
+    if _has_columns(conn, "paper_fills", {"order_id"}):
+        status_sql = (
+            "(status='filled' OR EXISTS "
+            "(SELECT 1 FROM paper_fills f WHERE f.order_id=paper_orders.id))"
+        )
     params: list[Any] = [context.cycle_id]
     account_sql = ""
     if account_id:
@@ -250,9 +303,9 @@ def _all_filled_sell_orders(conn, context: PortfolioReadContext, account_id: str
         params.append(str(account_id))
     rows = _row_dicts(conn.execute(
         "SELECT id,account_id,code,status,cycle_id,execution_status,"
-        "       execution_verified,realized_pnl,executed_at"
+        "       execution_verified,realized_pnl,executed_at,qty,amount,fees"
         "  FROM paper_orders"
-        " WHERE cycle_id=? AND side='sell' AND status='filled'"
+        " WHERE cycle_id=? AND side='sell' AND " + status_sql
         + account_sql +
         " ORDER BY id",
         tuple(params),
@@ -270,6 +323,12 @@ def _all_filled_buy_orders(conn, context: PortfolioReadContext,
                            account_id: str | None = None):
     if not _has_columns(conn, "paper_orders", _ORDER_COLUMNS):
         return [], False
+    status_sql = "status='filled'"
+    if _has_columns(conn, "paper_fills", {"order_id"}):
+        status_sql = (
+            "(status='filled' OR EXISTS "
+            "(SELECT 1 FROM paper_fills f WHERE f.order_id=paper_orders.id))"
+        )
     params: list[Any] = [context.cycle_id]
     account_sql = ""
     if account_id:
@@ -277,9 +336,9 @@ def _all_filled_buy_orders(conn, context: PortfolioReadContext,
         params.append(str(account_id))
     rows = _row_dicts(conn.execute(
         "SELECT id,account_id,code,status,cycle_id,execution_status,"
-        "       execution_verified,realized_pnl,executed_at"
+        "       execution_verified,realized_pnl,executed_at,qty,amount,fees"
         "  FROM paper_orders"
-        " WHERE cycle_id=? AND side='buy' AND status='filled'"
+        " WHERE cycle_id=? AND side='buy' AND " + status_sql
         + account_sql +
         " ORDER BY id",
         tuple(params),
@@ -319,8 +378,9 @@ def _buy_fills(conn, context: PortfolioReadContext, account_id: str | None = Non
         "       o.code AS order_code, o.status AS order_status, o.cycle_id,"
         "       o.execution_status, o.execution_verified, o.realized_pnl,"
         "       o.amount AS order_amount, o.fees AS order_fees, o.executed_at"
+        + _fill_event_select(conn) +
         "  FROM paper_fills f JOIN paper_orders o ON o.id=f.order_id"
-        " WHERE o.cycle_id=? AND o.side='buy' AND o.status='filled'"
+        " WHERE o.cycle_id=? AND o.side='buy'"
         "   AND f.fill_date IS NOT NULL"
         "   AND length(f.fill_date)>=10 AND substr(f.fill_date,1,10)<=?"
         + account_sql +
@@ -329,7 +389,7 @@ def _buy_fills(conn, context: PortfolioReadContext, account_id: str | None = Non
     ))
     verified = []
     for row in rows:
-        if _identity_ok(row) and EV.is_verified_row(row):
+        if _identity_ok(row) and _fill_event_verified(row):
             verified.append(row)
     return verified, rows, True
 
@@ -386,20 +446,14 @@ def _unproven_sell_exists(conn, context: PortfolioReadContext,
             return bool(conn.execute(sql, tuple(params)).fetchone()[0])
         return False
     unproven_fill = any(
-        not _identity_ok(row) or not EV.is_verified_row(row)
+        not _identity_ok(row) or not _fill_event_verified(row)
         for row in rows
     )
     if unproven_fill:
         return True
-    verified_fill_order_ids = {
-        int(row["order_id"]) for row in _verified
-        if row.get("order_id") is not None
-    }
     orders, _proof = _all_filled_sell_orders(conn, context, account_id)
     for order in orders:
-        if not EV.is_verified_row(order):
-            return True
-        if int(order["id"]) not in verified_fill_order_ids:
+        if not _order_execution_verified(conn, order, _order_fills(conn, int(order["id"]))):
             return True
     return False
 
@@ -493,7 +547,8 @@ def _lot_economic_dates(conn, order_ids) -> tuple[dict[int, str], bool]:
             placeholders = ",".join("?" for _ in missing)
             rows = conn.execute(
                 f"SELECT id,executed_at FROM paper_orders WHERE id IN ({placeholders})"
-                f"   AND status='filled' AND executed_at IS NOT NULL"
+                f"   AND status IN ('filled','partially_filled','cancelled','expired','superseded','risk_rejected')"
+                f"   AND executed_at IS NOT NULL"
                 f"   AND length(executed_at)>=10",
                 tuple(missing),
             ).fetchall()
@@ -502,27 +557,24 @@ def _lot_economic_dates(conn, order_ids) -> tuple[dict[int, str], bool]:
     return dates, True
 
 
-def _reused_source_orders(lots) -> set[int]:
-    """Return source order ids claimed by more than one durable lot.
-
-    ``paper_position_lots.source_order_id`` carries no uniqueness constraint, so
-    two lot rows can point at the same verified single-fill BUY order.  Each
-    per-lot check would then pass independently while cash only ever subtracts
-    that one fill: a duplicated 100-share lot becomes 200 verified shares and
-    halves the display cost.  Reused sources are therefore not evidence.
-    """
-    counts: dict[int, int] = {}
+def _reused_source_orders(lots) -> set[tuple[str, int]]:
+    """Return fill ids (or legacy order ids) claimed by multiple durable lots."""
+    counts: dict[tuple[str, int], int] = {}
     for lot in lots:
+        source_fill_id = lot.get("source_fill_id")
         try:
-            order_id = int(lot.get("source_order_id"))
+            if source_fill_id is not None:
+                key = ("fill", int(source_fill_id))
+            else:
+                key = ("order", int(lot.get("source_order_id")))
         except (TypeError, ValueError):
             continue
-        counts[order_id] = counts.get(order_id, 0) + 1
-    return {order_id for order_id, count in counts.items() if count > 1}
+        counts[key] = counts.get(key, 0) + 1
+    return {key for key, count in counts.items() if count > 1}
 
 
 def _verified_source_buy_fill(conn, lot: Mapping, *,
-                              reused_sources: set[int] | None = None) -> dict | None:
+                              reused_sources: set[tuple[str, int]] | None = None) -> dict | None:
     """Return a fully matching verified BUY fill for one durable lot."""
     source_order_id = lot.get("source_order_id")
     if source_order_id is None:
@@ -536,23 +588,30 @@ def _verified_source_buy_fill(conn, lot: Mapping, *,
         order_id = int(source_order_id)
     except (TypeError, ValueError):
         return None
-    if reused_sources and order_id in reused_sources:
+    source_fill_id = lot.get("source_fill_id")
+    try:
+        source_fill_id = int(source_fill_id) if source_fill_id is not None else None
+    except (TypeError, ValueError):
         return None
-    row = conn.execute(
+    source_key = ("fill", source_fill_id) if source_fill_id is not None else ("order", order_id)
+    if reused_sources and source_key in reused_sources:
+        return None
+    fill_filter = "f.order_id=? AND f.id=?" if source_fill_id is not None else "f.order_id=?"
+    params = (order_id, source_fill_id) if source_fill_id is not None else (order_id,)
+    sql = (
         "SELECT f.id AS fill_id, f.order_id, f.qty AS fill_qty,"
         "       f.account_id AS fill_account_id, f.side AS fill_side,"
-        "       f.code AS fill_code, f.fill_date,"
+        "       f.code AS fill_code, f.fill_date, f.price AS fill_price,"
+        "       f.amount AS fill_amount, f.fees AS fill_fees,"
         "       o.account_id AS order_account_id, o.side AS order_side,"
         "       o.code AS order_code, o.status AS order_status, o.cycle_id,"
-        "       o.execution_status, o.execution_verified, o.executed_at"
-        "  FROM paper_fills f JOIN paper_orders o ON o.id=f.order_id"
-        " WHERE f.order_id=? ORDER BY f.id",
-        (order_id,),
-    ).fetchall()
-    # A durable lot has no fill-level allocation key.  A source order with
-    # multiple fills therefore cannot prove which fill funded this lot (nor
-    # prevent two lots from reusing the same fill).  Keep it fail-closed until
-    # the ledger carries that allocation explicitly.
+        "       o.execution_status, o.execution_verified, o.executed_at,"
+        "       o.qty AS order_qty,o.amount AS order_amount,o.fees AS order_fees"
+        + _fill_event_select(conn)
+        + " FROM paper_fills f JOIN paper_orders o ON o.id=f.order_id"
+        + f" WHERE {fill_filter} ORDER BY f.id"
+    )
+    row = conn.execute(sql, params).fetchall()
     if len(row) != 1:
         return None
     row = dict(row[0])
@@ -570,9 +629,13 @@ def _verified_source_buy_fill(conn, lot: Mapping, *,
         return None
     if str(row.get("fill_side") or "").lower() != "buy":
         return None
-    if str(row.get("order_status") or "").lower() != "filled":
+    if str(row.get("order_status") or "").lower() not in {
+        "filled", "partially_filled", "pending_execution", "pending_limit",
+        "execution_retry", "manual_execution_retry", "deferred_capacity",
+        "cancelled", "expired", "superseded", "risk_rejected",
+    }:
         return None
-    if not EV.is_verified_row(row):
+    if not _fill_event_verified(row):
         return None
     if _num(row.get("fill_qty"), None) != _num(lot.get("qty"), None):
         return None
@@ -695,27 +758,17 @@ def verified_cash_flows(conn, context: PortfolioReadContext, *,
     for rows in (all_buys, all_sells):
         for row in rows:
             key = (str(row.get("fill_account_id") or ""), str(row.get("fill_code") or ""))
-            if not _identity_ok(row) or not EV.is_verified_row(row):
+            if not _identity_ok(row) or not _fill_event_verified(row):
                 incomplete.add(key)
-    # A filled order with no verified fill row is not evidence of zero cash;
-    # it blocks the per-symbol projection for that key.  An order only counts as
-    # covered when **every** fill selected for it is identity-consistent and
-    # verified: one valid fill alongside a mismatched one would otherwise leave
-    # a partial projection on the order's real account/code.
-    for orders, all_rows in (
-        (_all_filled_buy_orders(conn, context, account_id)[0], all_buys),
-        (_all_filled_sell_orders(conn, context, account_id)[0], all_sells),
+    # Orders with no fill evidence, a mismatched fill, or an incomplete partial
+    # aggregate block the per-symbol projection.
+    for orders in (
+        _all_filled_buy_orders(conn, context, account_id)[0],
+        _all_filled_sell_orders(conn, context, account_id)[0],
     ):
-        rows_by_order: dict[int, list[dict]] = {}
-        for row in all_rows:
-            if row.get("order_id") is not None:
-                rows_by_order.setdefault(int(row["order_id"]), []).append(row)
         for order in orders:
             key = (str(order.get("account_id") or ""), str(order.get("code") or ""))
-            rows = rows_by_order.get(int(order["id"]), [])
-            if not EV.is_verified_row(order) or not rows or any(
-                not _identity_ok(row) or not EV.is_verified_row(row) for row in rows
-            ):
+            if not _order_execution_verified(conn, order, _order_fills(conn, int(order["id"]))):
                 incomplete.add(key)
     for side, rows in (("buy", buys), ("sell", sells)):
         for row in rows:
@@ -942,13 +995,8 @@ def _cash_flow_total(conn, context: PortfolioReadContext, account_id: str | None
     sells, _sell_rows, sell_proof = _sell_fills(conn, context, account_id)
     buy_orders, buy_orders_proof = _all_filled_buy_orders(conn, context, account_id)
     if buy_orders_proof:
-        verified_buy_order_ids = {
-            int(row["order_id"]) for row in buys if row.get("order_id") is not None
-        }
         for order in buy_orders:
-            if not EV.is_verified_row(order):
-                return None, STATUS_UNKNOWN
-            if int(order["id"]) not in verified_buy_order_ids:
+            if not _order_execution_verified(conn, order, _order_fills(conn, int(order["id"]))):
                 return None, STATUS_UNKNOWN
     if not buy_proof or not sell_proof:
         any_fill = _has_any_fill_rows(conn, context, account_id)
@@ -965,7 +1013,7 @@ def _cash_flow_total(conn, context: PortfolioReadContext, account_id: str | None
         return 0.0, STATUS_VERIFIED
     if _unproven_sell_exists(conn, context, account_id):
         return None, STATUS_UNKNOWN
-    if any(not _identity_ok(row) or not EV.is_verified_row(row) for row in buy_rows):
+    if any(not _identity_ok(row) or not _fill_event_verified(row) for row in buy_rows):
         return None, STATUS_UNKNOWN
     total = 0.0
     for row in buys:

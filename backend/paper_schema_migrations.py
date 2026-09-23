@@ -29,7 +29,7 @@ def ensure_columns(conn, table, definitions):
 
 
 def ensure_paper_columns(conn):
-    """补齐旧 paper ledger 的订单、lot、持仓和账户字段。"""
+    """补齐旧 paper ledger 的订单、成交证据、lot、持仓和账户字段。"""
     changes = {}
     changes["paper_orders"] = ensure_columns(
         conn,
@@ -52,13 +52,33 @@ def ensure_paper_columns(conn):
     changes["paper_position_lots"] = ensure_columns(
         conn,
         "paper_position_lots",
-        {"cost_fee_included": "INTEGER NOT NULL DEFAULT 0"},
+        {
+            "cost_fee_included": "INTEGER NOT NULL DEFAULT 0",
+            "source_fill_id": "INTEGER",
+        },
     )
     changes["paper_positions"] = ensure_columns(
         conn,
         "paper_positions",
         {"asset_type": "TEXT NOT NULL DEFAULT 'stock_t1'"},
     )
+    changes["paper_fills"] = ensure_columns(
+        conn,
+        "paper_fills",
+        {
+            "execution_event_key": "TEXT",
+            "execution_asof": "TEXT",
+            "pricing_basis": "TEXT",
+            "slippage_amount": "REAL",
+            "execution_evidence": "TEXT",
+        },
+    )
+    if "execution_event_key" in table_columns(conn, "paper_fills"):
+        conn.execute(
+            """CREATE UNIQUE INDEX IF NOT EXISTS idx_paper_fills_execution_event
+               ON paper_fills(execution_event_key)
+               WHERE execution_event_key IS NOT NULL"""
+        )
     changes["paper_accounts"] = ensure_columns(
         conn,
         "paper_accounts",

@@ -119,6 +119,18 @@ class IllegalTransitionTests(unittest.TestCase):
         self.assertIn("REJECTED", EL.allowed_targets("UNKNOWN"))
         self.assertNotIn("UNKNOWN", EL.allowed_targets("UNKNOWN"))
 
+    def test_simulation_owner_accepts_only_executable_fill_edges(self):
+        self.assertEqual(
+            (EL.STATE_SUBMITTED, EL.STATE_PARTIAL_FILLED),
+            EL.assert_simulated_transition("pending_execution", "partially_filled"),
+        )
+        self.assertEqual(
+            (EL.STATE_PARTIAL_FILLED, EL.STATE_FILLED),
+            EL.assert_simulated_transition("partially_filled", "filled"),
+        )
+        with self.assertRaises(EL.IllegalLifecycleTransition):
+            EL.assert_simulated_transition("cancelled", "filled")
+
     def test_unknown_target_state_is_rejected(self):
         lifecycle = EL.OrderLifecycle(1)
         with self.assertRaises(EL.IllegalLifecycleTransition):

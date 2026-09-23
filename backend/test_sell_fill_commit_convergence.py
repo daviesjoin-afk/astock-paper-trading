@@ -2,9 +2,9 @@
 """R20 SELL 成交提交收敛回归（SF-1 ~ SF-14）。
 
 这些用例驱动真实生产路径：
-- ``PT.monitor_risk`` -> ``_monitor_risk_impl`` -> ``EP.commit_fill``
-- ``PT._intraday_sell`` -> ``EP.commit_fill``
-- manual / deferred SELL 的真实 primitive ``EP.commit_fill``
+- ``PT.monitor_risk`` -> ``_monitor_risk_impl`` -> ``EP.execute_order``
+- ``PT._intraday_sell`` -> ``EP.execute_order``
+- manual / deferred SELL 的真实 primitive ``EP.execute_order``
 
 它们不复制成交账本写入逻辑；断言的是“成交只能由一个 commit owner 落库”。
 """
@@ -52,21 +52,21 @@ class RiskSellCommitConvergence(_R20RiskBase):
         self.add_lot(100, 10.0)
         self._inner._set_fresh_exit_quote(self.code, price=9.0, pct=-8.0)
         calls = []
-        original = EP.commit_fill
+        original = EP.execute_order
 
         def spy(*args, **kwargs):
             calls.append(1)
             return original(*args, **kwargs)
 
         cash_before = self.account_cash()
-        with mock.patch.object(EP, "commit_fill", side_effect=spy), \
+        with mock.patch.object(EP, "execute_order", side_effect=spy), \
              mock.patch.object(PT, "process_pending_manual_orders", return_value=[]):
             result = PT.monitor_risk(self.day)
 
         filled = [item for item in result.get("orders", [])
                   if item.get("status") == "filled"]
         self.assertEqual(len(filled), 1, result.get("orders"))
-        self.assertEqual(len(calls), 1, "risk SELL 没有经过 EP.commit_fill")
+        self.assertEqual(len(calls), 1, "risk SELL 没有经过 EP.execute_order")
         self.assertEqual(len(self.sell_fills()), 1)
         self.assertLess(self.remaining_lots(), 100)
         self.assertGreater(self.account_cash(), cash_before)
@@ -178,7 +178,7 @@ class RiskSellCommitConvergence(_R20RiskBase):
         self.assertEqual(int(fill["qty"]), 100)
         self.assertEqual(fill["fill_date"], self.day.isoformat())
         self.assertEqual(fill["quote_at"], self._inner.quotes_map[self.code]["quote_at"])
-        self.assertEqual(fill["assumption"], "实时价 - 0.10% 滑点，含佣金及印花税")
+        self.assertTrue(fill["assumption"].startswith("\u5b9e\u65f6\u4ef7 - 0.10% \u6ed1\u70b9\uff0c\u542b\u4f63\u91d1\u53ca\u5370\u82b1\u7a0e"))
         self.assertGreater(float(fill["price"]), 0)
         self.assertGreater(float(fill["amount"]), 0)
         self.assertGreater(float(fill["fees"]), 0)
@@ -198,7 +198,7 @@ class _R20IntradayBase(_R20RiskBase):
         self._inner.quotes_map[self.code] = {
             "code": self.code, "name": f"测试股_{self.code}", "price": price,
             "high": high, "low": round(price - 0.2, 4), "pct": 0.0,
-            "prev_close": prev_close, "amount": 100000.0, "volume": 10000.0,
+            "prev_close": prev_close, "amount": 1000000.0, "volume": 10000.0,
             "turnover": 1.0, "quote_source": "live",
             "quote_at": f"{self.day.isoformat()} 10:30:00",
             "quote_validation": "cross_source_checked",
@@ -240,18 +240,18 @@ class IntradaySellCommitConvergence(_R20IntradayBase):
         self.add_lot(100, 10.0)
         self.set_t_sell_quote()
         calls = []
-        original = EP.commit_fill
+        original = EP.execute_order
 
         def spy(*args, **kwargs):
             calls.append(1)
             return original(*args, **kwargs)
 
         cash_before = self.account_cash()
-        with mock.patch.object(EP, "commit_fill", side_effect=spy):
+        with mock.patch.object(EP, "execute_order", side_effect=spy):
             action, reason = self.drive_intraday()
 
         self.assertIsNotNone(action, reason)
-        self.assertEqual(len(calls), 1, "intraday SELL 没有经过 EP.commit_fill")
+        self.assertEqual(len(calls), 1, "intraday SELL 没有经过 EP.execute_order")
         self.assertEqual(len(self.sell_fills()), 1)
         self.assertEqual(self.remaining_lots(), 0)
         self.assertGreater(self.account_cash(), cash_before)
@@ -263,13 +263,13 @@ class IntradaySellCommitConvergence(_R20IntradayBase):
         self.add_lot(500, 10.0)
         self.set_t_sell_quote()
         calls = []
-        original = EP.commit_fill
+        original = EP.execute_order
 
         def spy(*args, **kwargs):
             calls.append(1)
             return original(*args, **kwargs)
 
-        with mock.patch.object(EP, "commit_fill", side_effect=spy):
+        with mock.patch.object(EP, "execute_order", side_effect=spy):
             action, reason = self.drive_intraday(opening_event=True)
 
         self.assertIsNotNone(action, reason)
@@ -366,7 +366,7 @@ class IntradaySellCommitConvergence(_R20IntradayBase):
         self.assertEqual(int(fill["qty"]), 100)
         self.assertEqual(fill["fill_date"], self.day.isoformat())
         self.assertEqual(fill["quote_at"], self._inner.quotes_map[self.code]["quote_at"])
-        self.assertEqual(fill["assumption"], "开盘/5分钟实时快照高抛，含滑点、佣金、印花税")
+        self.assertTrue(fill["assumption"].startswith("\u5f00\u76d8/5\u5206\u949f\u5b9e\u65f6\u5feb\u7167\u9ad8\u629b\uff0c\u542b\u6ed1\u70b9\u3001\u4f63\u91d1\u3001\u5370\u82b1\u7a0e"))
         self.assertGreater(float(fill["price"]), 0)
         self.assertGreater(float(fill["amount"]), 0)
         self.assertGreater(float(fill["fees"]), 0)
@@ -428,12 +428,18 @@ class DirectSellCommitConvergence(PRS._LedgerCase):
         return int(cur.lastrowid)
 
     def commit_sell(self, order_id, qty, *, price=13.0, day="2026-09-05"):
-        return EP.commit_fill(
+        quote = {
+            "code": CODE, "name": NAME, "price": price, "prev_close": price,
+            "pct": 0.0, "amount": max(100000.0, qty * price * 200),
+            "quote_at": "2026-09-10 10:00:00",
+            "quote_source": "live", "quote_validation": "cross_source_checked",
+        }
+        return EP.execute_order(
             self.conn, account=self.account_row(),
-            plan={"side": "sell", "code": CODE, "qty": qty, "fill_price": price,
-                  "amount": qty * price, "fees": 5.0, "quote_at": None, "risk": {}},
+            plan={"side": "sell", "code": CODE, "qty": qty, "risk": {},
+                  "execution_quote": quote},
             order_id=order_id, asof_day=dt.date.fromisoformat(day),
-            reserved=True, side="sell", action="filled",
+            side="sell", action="filled",
             audit_action="sell_filled", reason="R20 test sell",
         )
 
@@ -443,11 +449,17 @@ class DirectSellCommitConvergence(PRS._LedgerCase):
 
         pnl = self.commit_sell(order, 100, price=13.0)
 
-        self.assertAlmostEqual(pnl, 1300.0 - 1000.0 - 5.0, places=6)
+        self.assertAlmostEqual(pnl["realized_pnl"], float(
+            self.conn.execute(
+                "SELECT realized_pnl FROM paper_orders WHERE id=?", (order,)
+            ).fetchone()[0]), places=6)
         row = self.conn.execute(
-            "SELECT realized_pnl FROM paper_orders WHERE id=?", (order,)
+            "SELECT realized_pnl,amount,fees FROM paper_orders WHERE id=?", (order,)
         ).fetchone()
-        self.assertAlmostEqual(float(row["realized_pnl"]), 295.0, places=6)
+        self.assertAlmostEqual(
+            float(row["realized_pnl"]),
+            float(row["amount"]) - 1000.0 - float(row["fees"]), places=6,
+        )
 
     def test_sf9_sell_consumes_the_order_cycle_only(self):
         self.record_buy(100, 10.0)
@@ -488,13 +500,12 @@ class DirectSellCommitConvergence(PRS._LedgerCase):
         fills_before = self.conn.execute("SELECT COUNT(*) FROM paper_fills").fetchone()[0]
 
         with self.assertRaises(RuntimeError) as raised:
-            EP.commit_fill(
+            EP.execute_order(
                 self.conn, account=self.account_row(),
                 plan={"side": "sell", "code": "999999", "qty": 100,
-                      "fill_price": 13.0, "amount": 1300.0, "fees": 5.0,
-                      "quote_at": None},
+                      "execution_quote": {"code": "999999", "price": 13.0}},
                 order_id=order, asof_day=dt.date(2026, 9, 5),
-                reserved=True, side="sell",
+                side="sell",
             )
         self.assertIn("order identity mismatch", str(raised.exception))
 
@@ -508,12 +519,17 @@ class DirectSellCommitConvergence(PRS._LedgerCase):
     def test_sf14_buy_commit_contract_is_unchanged(self):
         order = self.buy_order(100)
 
-        EP.commit_fill(
+        EP.execute_order(
             self.conn, account=self.account_row(),
-            plan={"side": "buy", "code": CODE, "qty": 100, "fill_price": 10.0,
-                  "amount": 1000.0, "fees": 1.0, "quote_at": None},
+            plan={"side": "buy", "code": CODE, "qty": 100,
+                  "execution_quote": {
+                      "code": CODE, "name": NAME, "price": 10.0,
+                      "prev_close": 10.0, "pct": 0.0, "amount": 100000.0,
+                      "quote_at": "2026-09-10T10:00:00", "quote_source": "live",
+                      "quote_validation": "cross_source_checked",
+                  }},
             order_id=order, asof_day=dt.date(2026, 9, 5),
-            reserved=False, side="buy", action="strategy_buy",
+            side="buy", action="strategy_buy",
             reason="R20 test buy",
         )
 

@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import json
 import os
 import sqlite3
 import tempfile
@@ -725,66 +726,57 @@ class PositionPathGateTest(unittest.TestCase):
         self.assertAlmostEqual(30.0, rows[0]["display_cost"], places=6)
 
 
-class CommitFillStampsTest(unittest.TestCase):
-    """``execution_planner.commit_fill`` 必须真的盖章（生产写入路径）。"""
+class FillEventVerificationTests(unittest.TestCase):
+    """R26 verifies each immutable fill separately from the whole order."""
 
-    def test_commit_fill_stamps_the_order_it_just_filled(self):
-        import types
-        from unittest import mock
-
-        import execution_planner as EP
-
-        conn = _db()
-        order_id = _insert_order(conn, status="pending", qty=100, price=10.0,
-                                 amount=1000.0, fees=5.0)
-        # 周期归属成员从真实 paper_trading 取（不是抄一份）：本用例的要点是
-        # 成交路径真的盖章，替身只隔离现金/lot 副作用，不隔离被断言的契约。
-        import paper_trading as PT
-
-        stub = types.SimpleNamespace(
-            _assert_active_lease=lambda conn, label: None,
-            _reserve_shared_capital=lambda *a, **k: (True, None),
-            _debit_shared_cash=lambda *a, **k: None,
-            _finish_capital_reservation=lambda *a, **k: None,
-            _record_lot=lambda *a, **k: None,
-            _consume_available_lots=lambda conn, account_id, code, qty, day, cycle_id=None: (qty, 0.0),
-            _credit_shared_cash=lambda *a, **k: None,
-            _json=lambda value: "{}",
-            _now=lambda: SESSION + " 15:00:00",
-            _date=lambda day: day,
-            _num=lambda value, default=0.0: default if value in (None, "") else float(value),
-            _risk_log=lambda *a, **k: None,
-            _audit=lambda *a, **k: None,
-            _sync_positions=lambda *a, **k: None,
-            _order_cycle_provenance_for_order=PT._order_cycle_provenance_for_order,
-            OrderCycleProvenanceUnknown=PT.OrderCycleProvenanceUnknown,
-            # Round-7：commit_fill 现在还会校验 order cycle == account cycle ==
-            # active cycle。这里指向**真实**实现（连同它需要的两个只读查询入口），
-            # 让本用例的周期一致性能被真实判定 —— 替身若恒真，本文件就无法在
-            # 「周期一致性校验被删掉」时转红。
-            _assert_order_execution_cycle=PT._assert_order_execution_cycle,
-            _active_cycle_id_readonly=PT._active_cycle_id_readonly,
-            _account_cycle_id_readonly=PT._account_cycle_id_readonly,
-            OrderExecutionCycleChanged=PT.OrderExecutionCycleChanged,
-        )
-        plan = {
-            "side": "buy", "code": CODE, "qty": 100, "amount": 1000.0,
-            "fees": 5.0, "fill_price": 10.0, "quote_at": SESSION + "T10:00:00",
+    @staticmethod
+    def _fill(**overrides):
+        stamp = "2026-09-08 10:00:00"
+        decision = {
+            "executable_now": True, "status": "partially_filled", "side": "buy",
+            "filled_qty": 100, "fill_price": 10.01, "amount": 1001.0,
+            "fees": 5.0, "as_of": stamp, "ruleset_version": "simulation-r26",
         }
-        with mock.patch.object(EP, "_pt", lambda: stub):
-            EP.commit_fill(
-                conn, account={"id": ACCOUNT}, plan=plan, order_id=order_id,
-                asof_day=dt.date(2024, 6, 18), reserved=False,
-                action="strategy_buy", reason="test",
-            )
-        row = conn.execute(
-            "SELECT status,execution_status,execution_verified FROM paper_orders"
-            " WHERE id=?", (order_id,)).fetchone()
-        self.assertEqual("filled", row["status"])
-        self.assertEqual(EV.EXECUTION_STATUS_VERIFIED, row["execution_status"],
-                         "commit_fill 必须为它刚写入的成交盖章 verified")
-        self.assertEqual(1, row["execution_verified"])
+        market = {
+            "quote_source": "live", "quote_validation": "cross_source_checked",
+            "quote_at": stamp, "code": CODE,
+        }
+        row = {
+            "fill_side": "buy", "fill_code": CODE, "fill_qty": 100,
+            "fill_price": 10.01, "fill_amount": 1001.0, "fill_fees": 5.0,
+            "execution_event_key": "event-r26-1",
+            "fill_execution_evidence": json.dumps({
+                "decision": decision, "market_evidence": market,
+            }),
+        }
+        row.update(overrides)
+        return row
 
+    def test_partial_event_is_verified_without_upgrading_its_order(self):
+        row = self._fill()
+        self.assertTrue(EV.is_verified_fill_event(row))
+        self.assertFalse(EV.is_verified_row({
+            "execution_status": EV.EXECUTION_STATUS_PARTIAL,
+            "execution_verified": 0,
+        }))
+
+    def test_event_rejects_mismatched_fill_facts(self):
+        self.assertFalse(EV.is_verified_fill_event(self._fill(fill_qty=200)))
+        self.assertFalse(EV.is_verified_fill_event(self._fill(execution_event_key=None)))
+
+    def test_partial_order_requires_complete_aggregate_reconciliation(self):
+        order = {
+            "status": "partially_filled",
+            "execution_status": EV.EXECUTION_STATUS_PARTIAL,
+            "qty": 300, "amount": 1001.0, "fees": 5.0,
+        }
+        self.assertTrue(EV.is_verified_partial_order(order, [self._fill()]))
+        self.assertFalse(EV.is_verified_partial_order(
+            {**order, "amount": 999.0}, [self._fill()],
+        ))
+        self.assertFalse(EV.is_verified_partial_order(
+            {**order, "status": "filled"}, [self._fill()],
+        ))
 
 class RowPredicateAgreementTest(unittest.TestCase):
     """Python 侧谓词必须与 SQL 谓词**逐值对齐**并同样 fail closed。

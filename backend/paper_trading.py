@@ -262,6 +262,7 @@ MANUAL_EXECUTION_RETRY_STATUS = "manual_execution_retry"
 STRATEGY_EXECUTION_RETRY_STATUS = "execution_retry"
 ENTRY_RETRY_ORDER_STATUSES = (
     "pending_limit", "deferred_capacity", ENTRY_FROZEN_WAITLIST_STATUS,
+    "pending_execution", "partially_filled",
     MANUAL_EXECUTION_RETRY_STATUS, STRATEGY_EXECUTION_RETRY_STATUS,
 )
 # Retry/waitlist states are kept for research and re-ranking, but are not all
@@ -271,7 +272,8 @@ ENTRY_RETRY_ORDER_STATUSES = (
 # necessary for lifecycle reconciliation; slot accounting uses this narrower
 # set only.
 ENTRY_SLOT_OCCUPYING_ORDER_STATUSES = (
-    "pending_limit", MANUAL_EXECUTION_RETRY_STATUS, STRATEGY_EXECUTION_RETRY_STATUS,
+    "pending_limit", "pending_execution", "partially_filled",
+    MANUAL_EXECUTION_RETRY_STATUS, STRATEGY_EXECUTION_RETRY_STATUS,
 )
 ENTRY_AUTO_SOURCE_MAX_AGE_SECONDS = 15 * 60
 ENTRY_AUTO_FACTOR_MAX_AGE_SECONDS = 2 * 24 * 60 * 60
@@ -1930,7 +1932,9 @@ def init_db():
                 id INTEGER PRIMARY KEY AUTOINCREMENT, order_id INTEGER NOT NULL,
                 account_id TEXT NOT NULL, side TEXT NOT NULL, code TEXT NOT NULL,
                 qty INTEGER NOT NULL, price REAL NOT NULL, amount REAL NOT NULL, fees REAL NOT NULL,
-                fill_date TEXT NOT NULL, quote_at TEXT, assumption TEXT NOT NULL
+                fill_date TEXT NOT NULL, quote_at TEXT, assumption TEXT NOT NULL,
+                execution_event_key TEXT, execution_asof TEXT, pricing_basis TEXT,
+                slippage_amount REAL, execution_evidence TEXT
             );
             CREATE TABLE IF NOT EXISTS paper_risk_decisions (
                 id INTEGER PRIMARY KEY AUTOINCREMENT, account_id TEXT NOT NULL,
@@ -2040,7 +2044,7 @@ def init_db():
                 acquired_at TEXT NOT NULL, available_date TEXT NOT NULL,
                 asset_type TEXT NOT NULL DEFAULT 'stock_t1', source_order_id INTEGER,
                 cost_fee_included INTEGER NOT NULL DEFAULT 0,
-                is_t_base INTEGER NOT NULL DEFAULT 1
+                is_t_base INTEGER NOT NULL DEFAULT 1, source_fill_id INTEGER
             );
             CREATE INDEX IF NOT EXISTS idx_paper_lots_active
                 ON paper_position_lots(cycle_id, account_id, code, available_date);
@@ -3533,7 +3537,7 @@ def _consume_available_lots(conn, account_id, code, qty, asof_day, cycle_id=None
 
     ``cycle_id`` 是**调用链里已经确定**的周期身份（v18 write-time fact），且现在是
     **必填语义**：成交路径必须把来源订单的 durable ``cycle_id`` 传进来（见
-    ``execution_planner.commit_fill``）。传 ``None`` 一律 fail closed，**不再**回退到
+    ``execution_planner.execute_order``）。传 ``None`` 一律 fail closed，**不再**回退到
     当前 active cycle —— 那正是本轮要修的 split-brain：cycle 8 创建的 pending SELL 在
     cycle 9 激活后成交，会去消费 cycle 9 的 lot，而成交单仍挂在 cycle 8 订单上。
 
@@ -3605,7 +3609,7 @@ def _record_lot(conn, account, signal, qty, fill_price, asof_day, order_id=None,
     # peak 只升不降。判定统一走 risk-state 模块的权威聚合，不在这里另写一份 SQL。
     prior_qty = PPRS.remaining_qty(
         conn, cycle_id=cycle_id, account_id=account["id"], code=signal["code"])
-    conn.execute(
+    cursor = conn.execute(
         """INSERT INTO paper_position_lots(cycle_id,account_id,code,name,industry,qty,remaining_qty,cost,acquired_at,available_date,asset_type,source_order_id,cost_fee_included,is_t_base)
            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (cycle_id, account["id"], signal["code"], signal.get("name"), signal.get("industry"), int(qty), int(qty),
@@ -3620,6 +3624,7 @@ def _record_lot(conn, account, signal, qty, fill_price, asof_day, order_id=None,
         PPRS.update_peak(
             conn, cycle_id=cycle_id, account_id=account["id"], code=signal["code"],
             peak_price=fill_price)
+    return int(cursor.lastrowid)
 
 
 def _latest_price_map(codes=None):
@@ -9956,7 +9961,7 @@ def _buy_order(conn, account, signal, quote, market, news, asof_day, *, all_quot
     # undersized order into a seemingly valid research observation.
     q3_shadow_ready = q3_shadow and not reasons
     allowed = not reasons and not q3_shadow_ready and not limit_deferred
-    order_status = "filled" if allowed else (
+    order_status = "pending_execution" if allowed else (
         "shadow_q3" if q3_shadow_ready else (
             STRATEGY_EXECUTION_RETRY_STATUS if limit_deferred else
             ("deferred_capacity" if capacity_deferred else "risk_rejected"))
@@ -10032,9 +10037,8 @@ def _buy_order(conn, account, signal, quote, market, news, asof_day, *, all_quot
         (account["id"], signal["id"], "buy", code, signal.get("name"), qty,
          entry_limit["limit_price"] if entry_limit["limit_price"] is not None else price,
          entry_limit["order_type"],
-         fill_price if allowed else None,
-         amount if allowed else None, fees if allowed else None, order_status, reason,
-         _json(risk), _now(), _now() if allowed else None, dispatch_plan["expires_at"],
+         None, None, None, order_status, reason,
+         _json(risk), _now(), None, dispatch_plan["expires_at"],
          strategy_id, strategy_version, strategy_checksum, retry_of_order_id,
          _order_cycle_id(conn, current_cycle["id"])),
     )
@@ -10074,7 +10078,7 @@ def _buy_order(conn, account, signal, quote, market, news, asof_day, *, all_quot
     )
     if not allowed:
         # §56：闸门未放行的决策在此记录一次 risk 事件。成功路径的 risk log 与
-        # audit 由 execution_planner.commit_fill 统一写入，绝不在此重复记录
+        # audit 由 execution_planner.execute_order 统一写入，绝不在此重复记录
         # （否则同一笔成交会在 paper_risk_decisions 里出现两次）。
         _risk_log(conn, account["id"], code, "buy", decision_name, reason, risk)
         if (risk.get("slot_borrow") or {}).get("allowed"):
@@ -10144,7 +10148,7 @@ def _buy_order(conn, account, signal, quote, market, news, asof_day, *, all_quot
     order_id = int(cursor.lastrowid)
     # ET 是纯内存状态机，无法参与事务回滚；只在成交落库成功之后推进，
     # 否则提交失败会留下一个"已入场"的虚假状态（§48）。
-    failure = MO.commit_strategy_entry_fill(
+    execution_result = MO.commit_strategy_entry_fill(
         conn, account=account, signal=signal, quote=quote, payload=payload,
         slice_state=slice_state, asof_day=asof_day, order_id=order_id,
         plan={"code": code, "name": signal.get("name"),
@@ -10153,17 +10157,41 @@ def _buy_order(conn, account, signal, quote, market, news, asof_day, *, all_quot
         decision_name=decision_name, reason=reason, risk=risk,
         cycle_id=current_cycle["id"],
     )
-    if failure is not None:
-        return failure
+    if int(execution_result.get("event_filled_qty") or 0) <= 0:
+        if (risk.get("slot_borrow") or {}).get("allowed"):
+            risk["slot_borrow_rollback"] = _rollback_slot_borrow(
+                conn, risk["slot_borrow"], cycle_id=current_cycle["id"],
+            )
+        execution = execution_result.get("execution") or {}
+        return {
+            "filled": False, "deferred": True,
+            "status": execution_result.get("status") or "pending_execution",
+            "order_id": order_id, "signal_id": signal.get("id"), "code": code,
+            "qty": 0, "desired_qty": qty, "remaining_qty": execution_result.get("remaining_qty", qty),
+            "reason": execution_result.get("reason")
+            or "；".join(execution.get("reasons") or []) or "执行规则暂未发现可成交量",
+            "execution": execution,
+            "reservation_cycle_mismatch": bool(
+                execution_result.get("reservation_cycle_mismatch")
+            ),
+        }
+    actual_fill_price = float(execution_result.get("fill_price") or fill_price)
     if ET is not None:
-        ET.mark_entered(account["id"], code, fill_price)
+        ET.mark_entered(account["id"], code, actual_fill_price)
     if exceptional.get("approved"):
         cycle = _active_cycle(conn)
         _observe_intraday(
-            conn, cycle["id"], account["id"], code, fill_price, "exceptional_entry",
+            conn, cycle["id"], account["id"], code, actual_fill_price, "exceptional_entry",
             exceptional["reason"], {"signal_id": signal["id"], "sizing": sizing, "risk": risk},
         )
-    return {"filled": True, "code": code, "qty": qty, "price": round(fill_price, 2)}
+    return {
+        "filled": execution_result.get("status") == "filled",
+        "partial": execution_result.get("status") == "partially_filled",
+        "order_id": order_id, "code": code,
+        "qty": execution_result.get("event_filled_qty", 0),
+        "desired_qty": qty, "remaining_qty": execution_result.get("remaining_qty", 0),
+        "price": round(actual_fill_price, 4), "status": execution_result.get("status"),
+    }
 
 
 def _manual_risk_state(*args, **kwargs):
@@ -10209,9 +10237,13 @@ def cancel_manual_order(*args, **kwargs):
 
 
 def process_pending_manual_orders(*args, **kwargs):
-    """Facade (Phase 2): moved to manual_orders. Original signature: process_pending_manual_orders(asof_date=None)"""
-    from manual_orders import process_pending_manual_orders as _impl
-    return _impl(*args, **kwargs)
+    """复核手动挂单，并让已批准策略委托按新行情继续成交剩余数量。"""
+    import manual_orders as MO
+    asof_date = kwargs.get("asof_date", args[0] if args else None)
+    return (
+        MO.process_pending_manual_orders(*args, **kwargs)
+        + MO.process_pending_strategy_executions(asof_date)
+    )
 
 
 def execute_open(asof_date=None):
@@ -11879,7 +11911,7 @@ def _intraday_sell(conn, account, position, quote, asof_day, profile, cycle, ope
              order_reason, _json(payload), _now(), *strategy_stamp, sell_cycle_id),
         )
         order_id = int(cursor.lastrowid)
-        pnl = EP.commit_fill(
+        execution_result = EP.execute_order(
             conn,
             account=account,
             plan={
@@ -11890,6 +11922,8 @@ def _intraday_sell(conn, account, position, quote, asof_day, profile, cycle, ope
             },
             order_id=order_id,
             asof_day=asof_day,
+            execution_quote=quote,
+            execution_as_of=quote.get("quote_at"),
             side="sell",
             action=audit_action,
             audit_action=audit_action,
@@ -11907,11 +11941,19 @@ def _intraday_sell(conn, account, position, quote, asof_day, profile, cycle, ope
         if _lease_lost(exc):
             raise
         return None, f"高抛执行失败，可重试：{type(exc).__name__}: {exc}"
+    if int(execution_result.get("event_filled_qty") or 0) <= 0:
+        execution = execution_result.get("execution") or {}
+        return None, "高抛委托暂未成交：" + ("；".join(execution.get("reasons") or []) or "可成交量不足")
     return {
-        "order_id": cursor.lastrowid, "side": "sell", "code": position["code"],
-        "qty": qty, "pnl": round(pnl, 2), "sell_price": round(fill, 4),
+        **execution_result, "order_id": cursor.lastrowid, "side": "sell", "code": position["code"],
+        "qty": execution_result.get("event_filled_qty"),
+        "pnl": round(_num(execution_result.get("realized_pnl")), 2),
+        "sell_price": round(_num(execution_result.get("fill_price")), 4),
         "opening_event": bool(opening_event), "trigger": trigger,
-    }, "高抛成交"
+    }, (
+        "高抛成交" if execution_result.get("status") == "filled"
+        else f"高抛部分成交 {execution_result.get('filled_qty')}/{execution_result.get('desired_qty')} 股"
+    )
 
 
 def _intraday_buyback(conn, account, position, quote, market, asof_day, profile, cycle, *, all_quotes=None):
@@ -12039,12 +12081,17 @@ def _intraday_buyback(conn, account, position, quote, market, asof_day, profile,
         asof_day,
         reason=("确认后回补：新买份额次日可卖"
                 if payload.get("opening_event") else "日内做T回补：新买份额次日可卖"),
-        detail=detail, action=action_name, is_t_base=False,
+        detail=detail, action=action_name, execution_quote=quote, is_t_base=False,
         assumption="实时双源快照回补 + 滑点模拟；股票份额次日可卖",
     )
     if failure:
         return None, failure
-    return commit_result, "回补成交"
+    return commit_result, (
+        "回补成交" if commit_result.get("status") == "filled"
+        else f"回补部分成交 {commit_result.get('filled_qty', 0)}/{commit_result.get('desired_qty', qty)} 股"
+        if int(commit_result.get("event_filled_qty") or 0) > 0
+        else "回补委托等待可成交行情"
+    )
 
 
 def _swing_scale_in(conn, account, position, quote, market, asof_day, profile, cycle, *, all_quotes=None):
@@ -12219,12 +12266,17 @@ def _swing_scale_in(conn, account, position, quote, market, asof_day, profile, c
             "fees": fees, "quote_at": quote.get("quote_at"),
         },
         asof_day, reason=label, detail=detail, action="swing_scale_in",
-        is_t_base=True,
+        execution_quote=quote, is_t_base=True,
         assumption=f"{label}；实时双源行情含滑点和佣金",
     )
     if failure:
         return None, failure
-    return commit_result, label
+    return commit_result, (
+        label if commit_result.get("status") == "filled"
+        else f"{label}部分成交 {commit_result.get('filled_qty', 0)}/{commit_result.get('desired_qty', qty)} 股"
+        if int(commit_result.get("event_filled_qty") or 0) > 0
+        else f"{label}暂未形成成交"
+    )
 
 
 def monitor_opening_events(asof_date=None, event_clock=None):

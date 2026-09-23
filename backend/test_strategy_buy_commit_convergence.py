@@ -3,7 +3,7 @@
 
 直接驱动**真实** ``PT._buy_order``（不 mock 闸门），证明：
 
-    SB-1  普通策略买入经过 execution_planner.commit_fill
+    SB-1  普通策略买入经过 execution_planner.execute_order
     SB-2  正常成交的 order / reservation / lot 同周期
     SB-3  错周期预占 fail closed
     SB-4  错周期预占保持原样（不被改写、不被释放）
@@ -56,6 +56,7 @@ MARKET = {
 def _quote(code, price=10.0, pct=1.5):
     return {
         "code": code, "name": f"测试股_{code}", "price": price, "pct": pct,
+        "prev_close": round(price / (1.0 + pct / 100.0), 2),
         "open_price": round(price * 0.998, 2),
         "high": round(price * 1.01, 2), "low": round(price * 0.99, 2),
         "vol_ratio": 2.0, "main_pct": 2.0,
@@ -227,17 +228,17 @@ class NormalBuyConvergence(_BuyCase):
         self.quotes[CODE] = _quote(CODE)
         signal_id = self.add_signal(signal_date=DAY_PREV.isoformat())
         calls = []
-        original = EP.commit_fill
+        original = EP.execute_order
 
         def spy(*args, **kwargs):
             calls.append((args, kwargs))
             return original(*args, **kwargs)
 
-        with mock.patch.object(EP, "commit_fill", side_effect=spy):
+        with mock.patch.object(EP, "execute_order", side_effect=spy):
             result, order = self.run_buy(signal_id=signal_id)
 
         # SB-1：普通策略 BUY 必须经过唯一 commit primitive。
-        self.assertTrue(calls, "普通策略买入没有调用 execution_planner.commit_fill")
+        self.assertTrue(calls, "普通策略买入没有调用 execution_planner.execute_order")
         self.assertTrue(result.get("filled"), f"正常买入未成交：{result}")
         with PT._db() as conn:
             order_row = dict(conn.execute(
@@ -288,7 +289,7 @@ class NormalBuyConvergence(_BuyCase):
         deployment = (payload.get("sizing") or {}).get("capital_deployment") or {}
         self.assertFalse(deployment.get("allowed"),
                          "第二笔不是因部署额度不足而等待（等待原因不属于资金约束）")
-        # §56：成功路径的 risk 事件由 commit_fill 写一次；被闸门挡下的决策
+        # §56：成功路径的 risk 事件由 execute_order 写一次；被闸门挡下的决策
         # 各写一次。两笔合计恰好 2 条，既不多也不少。
         self.assertEqual(2, self.counters()["risk"],
                          "risk 事件数量不符：成功成交重复记录或等待决策漏记")
@@ -301,10 +302,10 @@ class CommitFailureRollsBack(_BuyCase):
         self.quotes[CODE] = _quote(CODE)
         signal_id = self.add_signal(signal_date=DAY_PREV.isoformat())
         # 非空门禁：同一 fixture 无 sentinel 时必须能成交。
-        with mock.patch.object(EP, "commit_fill", side_effect=RuntimeError("R19_SENTINEL")):
+        with mock.patch.object(EP, "execute_order", side_effect=RuntimeError("R19_SENTINEL")):
             result, order = self.run_buy(signal_id=signal_id)
         counts = self.counters()
-        self.assertFalse(result.get("filled"), "commit_fill 失败却报告成交")
+        self.assertFalse(result.get("filled"), "execute_order 失败却报告成交")
         # SB-12 / SB-11：不留 fill / lot。
         self.assertEqual(0, counts["fills"], "提交失败留下了成交流水")
         self.assertEqual(0, counts["lots"], "提交失败留下了 lot")
