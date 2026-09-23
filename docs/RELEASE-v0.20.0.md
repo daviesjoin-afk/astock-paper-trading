@@ -1,8 +1,8 @@
-# v2.0.0 发布说明 — 确定性策略平台、Point-in-Time 研究、权威账本与风险闭环
+# v0.20.0 发布说明 — 确定性策略平台、Point-in-Time 研究、权威账本与风险闭环
 
 发布日期：2026-09-20。功能基线截至 PR #174（merge commit `d754fd4e8ac966a8f0e50f079906aa029c1cb4c0`）；release-prep 仅更新版本标识、README、CHANGELOG 与本发布说明。
 
-v2.0.0 是自 v1.3.0（2026-09-08）以来的一次**平台级升级**。期间共合入 **126 个 PR（#45–#174，未合并编号不计）**，后端全量回归从 v1.3.0 发布说明记录的约 285 项增长到 **3727 项**。这不是单纯功能堆叠：项目从“带自进化和策略选股的 A 股模拟盘”演进为一个强调 **声明式策略、Point-in-Time 正确性、可验证执行、cycle-owned ledger、deterministic risk/replay、可审计学习评估** 的本地优先研究平台。
+v0.20.0 是自 v0.13.0（2026-09-08）以来的一次**平台级升级**。期间共合入 **126 个 PR（#45–#174，未合并编号不计）**，后端全量回归从 v0.13.0 发布说明记录的约 285 项增长到 **3727 项**。这不是单纯功能堆叠：项目从“带自进化和策略选股的 A 股模拟盘”演进为一个强调 **声明式策略、Point-in-Time 正确性、可验证执行、cycle-owned ledger、deterministic risk/replay、可审计学习评估** 的本地优先研究平台。
 
 > **仍然是 paper trading only。** 本版本不连接券商、不触碰真实资金，也不提供杠杆、做空或普通股票 T+0 回转。
 
@@ -10,7 +10,7 @@ v2.0.0 是自 v1.3.0（2026-09-08）以来的一次**平台级升级**。期间�
 
 ### 1. 动态策略平台取代“固定五策略”产品模型
 
-v2.0.0 把策略从硬编码配置升级为完整的平台对象：
+v0.20.0 把策略从硬编码配置升级为完整的平台对象：
 
 - 动态 Strategy Registry 与生命周期：draft / validated / active / paused / retiring / archived；
 - 不可变策略版本与 structure checksum，历史 cycle 固定自己使用的版本；
@@ -23,7 +23,7 @@ v2.0.0 把策略从硬编码配置升级为完整的平台对象：
 - registry-driven Settings 取代固定五策略 UI；
 - 自定义策略生产路径、归档与历史 replay 均有完整回归覆盖。
 
-平台语义在 v2.0.0 被明确锁定：
+平台语义在 v0.20.0 被明确锁定：
 
 1. 自定义策略不运行任意 Python；
 2. 策略不能指定最终下单数量；
@@ -68,7 +68,7 @@ v2.0.0 把策略从硬编码配置升级为完整的平台对象：
 
 ### 4. Point-in-Time 数据与 Learning/Evaluation 正确性
 
-v2.0.0 大幅收紧历史研究中的“当时是否可知”：
+v0.20.0 大幅收紧历史研究中的“当时是否可知”：
 
 - point-in-time reproducible dataset foundation；
 - model-agnostic reproducible evaluation gate；
@@ -90,7 +90,7 @@ unknown != false != zero
 
 ### 5. 历史可交易性从“当前状态猜测”升级为事实资产
 
-v2.0.0 建立完整的 historical tradability 事实链：
+v0.20.0 建立完整的 historical tradability 事实链：
 
 - point-in-time historical tradability archive；
 - provider ingestion 与运行审计；
@@ -116,7 +116,7 @@ v2.0.0 建立完整的 historical tradability 事实链：
 
 ### 6. Execution Reality：从“订单说 filled”升级为“证据证明成交”
 
-执行真实性是 v2.0.0 的另一条主线：
+执行真实性是 v0.20.0 的另一条主线：
 
 - evidence-based execution reality layer；
 - execution lifecycle / outcome contract；
@@ -138,7 +138,7 @@ execution verified
 
 ### 7. 权威持仓与 cycle-owned ledger
 
-v2.0.0 完成了持仓事实的 authority 收敛：
+v0.20.0 完成了持仓事实的 authority 收敛：
 
 - `paper_position_lots` 是数量 / 成本 / 来源订单的执行权威；
 - `paper_positions` 降级为 compatibility/display projection，零执行权威；
@@ -177,7 +177,7 @@ PR #170–#174 完成了一条连续的风险正确性闭环：
 
 ### 9. Paper monolith 持续收敛为 application facade
 
-v2.0.0 没有用“大爆炸重写”替换 `paper_trading.py`，而是随着真实 correctness 问题逐步抽边界：
+v0.20.0 没有用“大爆炸重写”替换 `paper_trading.py`，而是随着真实 correctness 问题逐步抽边界：
 
 - slot preflight service；
 - decision audit；
@@ -227,7 +227,7 @@ v2.0.0 没有用“大爆炸重写”替换 `paper_trading.py`，而是随着真
 
 ## Breaking / behavior changes
 
-v2.0.0 是 major release，以下变化需要升级方主动理解：
+v0.20.0 是一次平台级 release，以下变化需要升级方主动理解：
 
 ### Strategy scope
 
@@ -247,7 +247,7 @@ v2.0.0 是 major release，以下变化需要升级方主动理解：
 
 ### Historical data
 
-v2.0.0 不会给无法证明的旧数据伪造 provenance。升级前的 cycle attribution、tradability observation time、risk episode state 等若无法可靠重建，会明确保持 NULL / unknown / legacy-unprovable，而不是猜。
+v0.20.0 不会给无法证明的旧数据伪造 provenance。升级前的 cycle attribution、tradability observation time、risk episode state 等若无法可靠重建，会明确保持 NULL / unknown / legacy-unprovable，而不是猜。
 
 ### HTTP write security
 
@@ -265,7 +265,7 @@ v2.0.0 不会给无法证明的旧数据伪造 provenance。升级前的 cycle a
 - `paper_trading`: **v21**
 - `adaptive_learning`: **v1**
 
-v1.3.0 的旧数据库升级时会顺序执行后续迁移，并在首次应用待迁移项前通过 SQLite backup API 创建一致性备份。
+v0.13.0 的旧数据库升级时会顺序执行后续迁移，并在首次应用待迁移项前通过 SQLite backup API 创建一致性备份。
 
 推荐升级前先自行额外备份运行目录，然后：
 
@@ -293,7 +293,7 @@ python backend/db_migrate.py all
 
 1. 停止 scheduler / cron / 写入进程；
 2. 备份 `paper_trading.sqlite3`、`adaptive_learning.sqlite3` 与自定义策略配置；
-3. 拉取 v2.0.0；
+3. 拉取 v0.20.0；
 4. 执行 migration dry-run；
 5. 正式迁移；
 6. 如果通过反向代理或远程访问写接口，配置 `ASTOCK_OPERATOR_TOKEN`；
@@ -339,9 +339,9 @@ python -m uvicorn backend.main:app --port 8600
 - deterministic replay 已有 golden / candidate / PIT 基础，但“任意 cycle 全链路重算并逐事实 diff”仍属于后续路线；
 - Adaptive/AI 仍是 shadow/recommend/evaluate 边界，不直接取得交易 execution authority。
 
-## 从 v1.3.0 到 v2.0.0 的 merged PR 索引
+## 从 v0.13.0 到 v0.20.0 的 merged PR 索引
 
-以下为正式纳入 v2.0.0 的全部 post-v1.3.0 merged PR（未合并编号不列）：
+以下为正式纳入 v0.20.0 的全部 post-v0.13.0 merged PR（未合并编号不列）：
 
 - #45 — feat(strategy): dynamic strategy registry and lifecycle
 - #46 — feat(strategy): versioned strategy definitions

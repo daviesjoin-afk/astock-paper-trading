@@ -2,11 +2,11 @@
 
 本文记录版本变化；GitHub Release 同步提供详细更新、升级步骤和已知限制。
 
-## v2.0.0 — 确定性策略平台、Point-in-Time 研究、权威账本与风险闭环
+## v0.20.0 — 确定性策略平台、Point-in-Time 研究、权威账本与风险闭环
 
-发布日期：2026-09-20。详见 [完整发布说明](docs/RELEASE-v2.0.0.md)。
+发布日期：2026-09-20。详见 [完整发布说明](docs/RELEASE-v0.20.0.md)。
 
-- 自 v1.3.0 后合入 126 个 PR：动态 Strategy Registry、不可变版本、声明式 DSL、Strategy Workbench、统一 RuntimeContext / OrderIntent / Execution Planner 与 N-strategy allocation。
+- 自 v0.13.0 后合入 126 个 PR：动态 Strategy Registry、不可变版本、声明式 DSL、Strategy Workbench、统一 RuntimeContext / OrderIntent / Execution Planner 与 N-strategy allocation。
 - 建立 point-in-time learning/evaluation、purged walk-forward、historical tradability archive/observation ledger 与 replayable candidate provenance，系统性关闭 future leakage。
 - 引入 execution reality / verification：订单自称 filled 不再等于真实成交；verified fills、immutable order cycle provenance 成为收益与执行统计的证据门槛。
 - `paper_position_lots` 成为当前持仓数量/成本权威，`paper_positions` 降级为兼容投影；rebalance、risk state、risk scan 和 replacement/slot decisions 全面 cycle/as-of 化。
@@ -15,9 +15,9 @@
 - paper schema 演进至 v21；无法证明的 legacy provenance 保持 unknown/NULL，不做猜测性回填。
 - #174 合并后的 master：Python 3.11/3.12 与 Docker 均运行 3727 项后端测试，syntax / quality / frontend / Chromium / security 全绿。
 
-## v1.3.0 — 自进化闭环、策略选股页与前端性能修复
+## v0.13.0 — 自进化闭环、策略选股页与前端性能修复
 
-发布日期：2026-09-08。GitHub Release：`v1.3.0`。
+发布日期：2026-09-08。GitHub Release：`v0.13.0`。
 
 - 自进化 apply + A/B validation 闭环完成；
 - 上线按五套模拟盘策略分组的“策略选股”页；
@@ -26,9 +26,9 @@
 - 发布时后端回归约 285 项。
 
 
-## v1.2.0 — 确定性演示、离线 CI 与引擎模块化
+## v0.12.0 — 确定性演示、离线 CI 与引擎模块化
 
-发布日期：2026-09-07。详见 [完整发布说明](docs/RELEASE-v1.2.0.md)。
+发布日期：2026-09-07。详见 [完整发布说明](docs/RELEASE-v0.12.0.md)。
 
 - 新增确定性离线演示（`ASTOCK_DEMO=1`）：合成标的 + 完整叙事账本，零网络零凭据，幂等注入，CI 以 golden replay 逐字节比对结构摘要。
 - CI 增加 `--network none` 离线测试层；`CONTRIBUTING.md` 明确测试分层规范；回归总数增至 239 项。
@@ -37,21 +37,21 @@
 - 活动概览响应瘦身约 59%，手动下单提交防重复守卫；前端引入 esbuild 构建管线。
 - 新增 `.gitattributes` 强制 LF 根治 EOL 问题；开启 Discussions 与 good-first-issue 子任务体系。
 
-## v1.1.0 — 运行设置、五策略与恢复流程修复
+## v0.11.0 — 运行设置、五策略与恢复流程修复
 
-发布日期：2026-09-05。详见 [完整发布说明](docs/RELEASE-v1.1.0.md)。
+发布日期：2026-09-05。详见 [完整发布说明](docs/RELEASE-v0.11.0.md)。
 
 - 发布设置中心、五策略新周期和动态建仓门槛。
 - 修复前端镜像、备份压缩与校验、脚本执行权限。
 - 恢复先校验再停服，包含所有写入工作容器；保留一致性回滚点并增加三项 Linux 隔离回归。
 - PR #11、#12 已合并；原有 209 项测试、新增 3 项 Linux 回归及 PR #12 CI 通过。
-- 原 v1.0.1 修订没有独立发布标签，现纳入 v1.1.0。
+- 原 v0.10.1 修订没有独立发布标签，现纳入 v0.11.0。
 
-## v1.0.1 — 五策略正式启用修正
+## v0.10.1 — 五策略正式启用修正
 
 发布日期：2026-09-04
 
-本补丁修正 v1.0.0 发布后发现的 active 范围错误：五套已注册模拟盘策略现在都正常参与新建/重置周期。v1.0.0 的 tag 保持不可变；本版本作为后续修正版，不改写历史周期或历史审计记录。
+本补丁修正 v0.10.0 发布后发现的 active 范围错误：五套已注册模拟盘策略现在都正常参与新建/重置周期。v0.10.0 的 tag 保持不可变；本版本作为后续修正版，不改写历史周期或历史审计记录。
 
 ### 运行范围
 
@@ -73,7 +73,7 @@
 - 更新后端启动兼容分配、前端策略卡片/研究证据/风控文案和中英文 README；保留历史版本说明作为审计记录。
 - 发布前仅提交源码、测试和脱敏文档；运行时数据库、历史成交、服务器路径、凭据和 API key 不进入 Git。
 
-## v1.0.0 — Five-strategy public baseline and runtime hardening
+## v0.10.0 — Five-strategy public baseline and runtime hardening
 
 发布日期：2026-09-04
 

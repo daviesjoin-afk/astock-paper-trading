@@ -369,7 +369,7 @@ class DocumentationLinkTests(unittest.TestCase):
 
     def test_release_notes_and_current_docs_are_kept(self):
         # 明确不许删的正式文档必须仍在原位。
-        for rel in ("docs/RELEASE-v1.1.0.md", "docs/RELEASE-v1.2.0.md",
+        for rel in ("docs/RELEASE-v0.11.0.md", "docs/RELEASE-v0.12.0.md",
                     "docs/RUNBOOK.md", "docs/TEST_MATRIX.md", "docs/SETTINGS_PRD.md",
                     "docs/DEMO.md", "docs/STRATEGY_PLATFORM.md",
                     "docs/EVOLUTION_ARCHITECTURE.md",

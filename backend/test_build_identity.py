@@ -49,6 +49,18 @@ class BuildIdentityTests(unittest.TestCase):
         self.assertEqual(BI.build_payload()["build"], BI.APP_BUILD_ID)
         self.assertEqual(main.version()["build"], BI.APP_BUILD_ID)
 
+    def test_version_endpoint_label_is_current_product_release(self):
+        """产品 Release 重编号到 v0.x 后，公开 label 必须同步。
+
+        旧 ``v2.0.0`` label 会让运维/部署方拿 ``/api/version`` 核对时把
+        当前构建误判成已被重编号掉的产品版本。这里只锁公开产品版本这一
+        个字段，不对整个响应体做快照。
+        """
+        label = main.version()["label"]
+        self.assertEqual(label, BI.APP_BUILD_LABEL)
+        self.assertTrue(label.startswith("v0.20.0"), label)
+        self.assertNotIn("v2.0.0", label)
+
     def test_frontend_script_declares_same_build(self):
         match = re.search(r"__ASTOCK_ADAPTIVE_UI_BUILD__='([^']+)'", self.app_source)
         self.assertIsNotNone(match, "app.js 缺少 __ASTOCK_ADAPTIVE_UI_BUILD__ 声明")
