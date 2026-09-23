@@ -763,7 +763,9 @@ Risk → Order → Fill（各自既有 authority）
    （outcome / reason / evidence 状态），前端只渲染。
 8. **为 R27 AI 预留的插槽**：AI 以后可以是 **Candidate Producer**，但**不是**
    Signal Persistence Owner / Risk Authority / Promotion Authority。
-   `R25 does NOT allow AI to write signals.`
+   `R25 does NOT allow AI to write signals.` R27-A 已落地这条插槽的研究侧契约
+   （见「AI Information & Research Contract（R27-A）」）：AI 输出是 research，
+   且 `commit_signal` 要求真正的 `SignalDecision`，把研究假设当裁决传入会在落库前失败。
 9. 回归门禁见 `backend/test_signal_pipeline.py`（SIG01 ~ SIG15 契约 / writer /
    ledger 集成，SIG-WRITER-01 ~ 05 的 Decision→Commit 契约；SIGG01 ~ SIGG05 架构
    guard，含"两条 production 路径必须交入明确 SignalDecision"），语义 mutation 见
@@ -889,6 +891,81 @@ facts、reason codes、pricing basis、slippage、fees、ruleset version，以�
   cancel、historical as-of、duplicate event、fees、slippage、locked limit、部分 signal 对账、
   风控部分去重、归档 collapse、累计容量、手动剩余量、signal 依赖回流、集合竞价时段，
   必须全部 CAUGHT（survived = 0）。
+
+## AI Information & Research Contract（R27-A）
+
+R27-A 只建立 AI 信息/研究层的**最小稳定边界**：让 AI 能读取可信事实并产出研究性
+结论，但永远不能成为行情、Signal、Risk、Execution、Promotion 的 authority。
+本轮**不**包含 LLM provider、自动选股、自动下单、Signal 写入、策略生成与晋升、
+prompt 管理、agent framework、vector DB 与 RAG。
+
+### Authority 边界（AI 是纯消费者）
+
+```text
+R24 Market Data Reading ─┐
+R25 Signal Evidence      ├─→ ai_research_contract ─→ research / advisory / hypothesis
+R26 Execution Evidence   │        （只读、纯契约）        ✗ pending signal
+历史 strategy/portfolio ─┘                               ✗ paper_orders / paper_fills
+                                                          ✗ risk decision
+                                                          ✗ strategy promotion
+```
+
+`ai_research_contract` **只** import `market_data_contract`（R24 纯契约）与标准库。
+它不 import `signal_service` / `execution_*` / `paper_*` / `promotion_*`，也不 import
+DB、网络、时钟、随机数或任何 LLM SDK 模块。依赖方向单向：
+**authority 绝不 import AI 研究层**（guard AIG-02 / AIG-03）。接入生产消费者必须
+先把模块登记进 `ALLOWED_AI_CONSUMERS`（当前为空），使"谁依赖了 AI"是一次有意识的
+决定而不是静默扩散。
+
+### 三个概念（刻意只有三个）
+
+| 概念 | 回答的问题 | 关键约束 |
+| --- | --- | --- |
+| `InformationEvent` | AI 看到了什么事实？ | `kind` 由 `evidence_ref.source_type` **派生**，错标无法表达 |
+| `ResearchEvidenceRef` | 事实来自谁、哪一天、核验到什么程度？ | `source_type` 是闭集；`as_of` 必填；`verification` 逐字来自 owner |
+| `ResearchHypothesis` | 基于这些事实提出了什么假设？ | `status` **派生**；`is_authoritative` 恒为 `False` |
+
+`status` / `kind` / `is_authoritative` 都是派生只读属性，**不是**可传参数：若
+`status` 可以由调用方给出，那么"给一个没有证据的假设贴上 `supported`"就只是一个
+关键字参数 —— 这正是本轮要根除的默认批准。
+
+### 证据强度与 PIT
+
+证据对结论的方向由 R24 verification **派生**，不合成质量分数：
+
+```text
+verified                              → supporting
+single_source / not_attempted         → degraded      （不足以支撑结论）
+disagreement / unavailable            → rejecting     （证据反对结论）
+```
+
+假设状态由证据推出：无证据 → `insufficient_evidence`；有反对证据 → `unsupported`
+（核验源不可用与多源否证记不同 reason）；至少一条 `supporting` 且无反对 →
+`supported`。
+
+- `confidence` 是 AI 的自评，**不参与** status 判定 —— 参与就会得到"越自信越强"的环路。
+- 研究词汇（`supported` / `insufficient_evidence` / `unsupported`）与
+  `paper_signals` 生命周期（`pending` / `approved` / …）**不相交**，因此 AI 结论在
+  词汇层面就无法被直接写成一条正式 signal；`commit_signal` 也要求真正的
+  `SignalDecision`，把研究假设传进去会在触碰连接前失败。
+- PIT：`as_of` 必须显式且可证明（无法证明即构造期拒绝，绝不回落 `today()`）；
+  任一证据 `as_of` 晚于假设日即**拒绝构造**（不静默过滤，否则会掩盖"用未来信息
+  解释过去"本身）。
+- 缺失即缺失：没有可引用的证据 → `insufficient_evidence`，绝不默认 `supported`。
+
+### 持久化范围
+
+本轮是**纯契约**：无 DB、无 writer、无前端。仓库里没有既有的
+hypothesis / research-ledger owner，为这个 PR 新建一套 AI 数据库体系会提前引入
+第二个事实存放点，因此持久化留给 R27-B。
+
+### 回归门禁
+
+`backend/test_ai_research_contract.py`（AI-01 ~ AI-08 契约语义、AIG-01 ~ AIG-06
+架构 guard、`GuardIsNotVacuouslyPassing` 非空性）；语义 mutation 在
+`work/r27_ai_mutation_check.py`：去掉 future-evidence check、单源升级为 supporting、
+空证据默认批准、authority 反向 import、AI 文本进入证据闭集，必须全部 CAUGHT
+（survived = 0、fake = 0）。
 
 ## 目标依赖方向
 
