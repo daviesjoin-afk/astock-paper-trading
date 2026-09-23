@@ -226,15 +226,20 @@ exact-head CI 由 GitHub 承担；本轮未改 frontend，故不重复本地 bro
 #### Exact-head verification
 
 ```text
-base:              d5418c80e8cfaede40c88ba4e62cecc658333d35
-                  （refactor(execution): establish high-fidelity A-share simulation execution (#186)）
-current exact-head: 0ac1c371184fa8f705cc7f333109c49639a44f15
+base:            d5418c80e8cfaede40c88ba4e62cecc658333d35
+                 （refactor(execution): establish high-fidelity A-share simulation execution (#186)）
 
-exact-head CI:     PASS（9/9 —— tests 3.11 / tests 3.12 / syntax / quality /
-                   docker-smoke / frontend / browser-e2e / security-leak-scan ×2）
+production head: 0ac1c371184fa8f705cc7f333109c49639a44f15
+                 （feat(ai): establish research information contract —— 承载全部
+                   production / test / ARCHITECTURE 改动的那一个提交）
+
+exact-head CI:   PASS 9/9 —— tests 3.11 / tests 3.12 / syntax / quality /
+                 docker-smoke / frontend / browser-e2e / security-leak-scan ×2
 ```
 
-merge authority 是**当前 PR HEAD 的 exact-head CI**，不是文档里写的某个旧 SHA。
+merge authority 是**当前 PR HEAD 的 exact-head CI**（从 GitHub API 读取），
+不是文档里记录的某个 SHA：后续只改这份 body 源文件的文档提交不会使上面的
+production head 失效，而它同样必须自己通过一遍 exact-head CI。
 
 ---
 
