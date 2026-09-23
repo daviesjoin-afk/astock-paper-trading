@@ -329,6 +329,36 @@ class SimulationExecutionContractTests(unittest.TestCase):
         self.assertEqual(700, result.remaining_quantity)
         self.assertIn(EP.ExecutionReason.INSUFFICIENT_LIQUIDITY.value, result.reasons)
 
+    def test_odd_lot_liquidation_only_when_it_closes_the_sellable_remainder(self):
+        """不足一手的**清仓**卖出必须放行；不足一手的部分卖出必须拒绝。
+
+        奇数股余额（送转/配股后会留下不足 100 股的残额）如果按 ``lot_size`` 向下
+        取整就永远卖不掉：``50 // 100 * 100 == 0``，残额被困在账户里。因此 planner
+        对"卖出量 == 当前可卖余额、且小于一手"放行整笔；其余不足一手的卖出仍然拒绝，
+        绝不静默取整成一个更小（甚至为 0）的单子。
+
+        两条分支必须同时断言：只验证拒绝路径时，把清仓分支整个禁用也不会有测试失败
+        （本 PR 合并前实测确认过），残额回退就成了无人看守的缺口。
+        """
+        # 清仓：可卖余额就是这 50 股，整笔放行（不按手数取整）。
+        # 流动性给足，确保结论由 odd-lot 分支而非参与度上限决定。
+        _, exit_context = self._facts(sellable=50, amount=500_000_000.0)
+        exit_result = EP.evaluate_simulated_execution(
+            self._intent(side="sell", qty=50), exit_context,
+        )
+        self.assertTrue(exit_result.executable_now)
+        self.assertEqual("filled", exit_result.status)
+        self.assertEqual(50, exit_result.fill_quantity,
+                         "不足一手的清仓卖出被按手数取整（取整后为 0），残额永远卖不掉")
+
+        # 部分卖出：同样 50 股，但可卖余额更大（200），必须拒绝而不是取整成 0。
+        _, partial_context = self._facts(sellable=200, amount=500_000_000.0)
+        partial_result = EP.evaluate_simulated_execution(
+            self._intent(side="sell", qty=50), partial_context,
+        )
+        self.assertIn(EP.ExecutionReason.INVALID_QUANTITY.value, partial_result.reasons,
+                      "不足一手的部分卖出被接受（应拒绝，绝不静默取整）")
+
     def test_same_day_consumption_is_subtracted_from_cumulative_participation(self):
         """同一个累计成交量不得被重复消费（R26）。
 
