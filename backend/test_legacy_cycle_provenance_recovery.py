@@ -11,7 +11,7 @@ from pathlib import Path
 from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
-SCRIPT = ROOT / "work" / "recover_legacy_order_cycle_provenance.py"
+SCRIPT = ROOT / "backend" / "recover_legacy_order_cycle_provenance.py"
 SPEC = importlib.util.spec_from_file_location("legacy_cycle_recovery", SCRIPT)
 RECOVERY = importlib.util.module_from_spec(SPEC)
 assert SPEC.loader is not None
