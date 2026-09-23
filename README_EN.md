@@ -22,9 +22,9 @@ Platform capabilities: immutable **strategy versions**, a **lifecycle** state ma
 
 See [strategy platform](docs/STRATEGY_PLATFORM.md), [evolution architecture](docs/EVOLUTION_ARCHITECTURE.md) and [architecture notes](ARCHITECTURE.md).
 
-## v2.0.0: deterministic, auditable, point-in-time-correct platform baseline
+## v0.20.0: deterministic, auditable, point-in-time-correct platform baseline
 
-**v2.0.0** is a major release covering 126 merged PRs since v1.3.0. The project now treats provenance, historical knowability, execution verification, cycle ownership and deterministic decisions as first-class contracts instead of best-effort metadata.
+**v0.20.0** is a platform-level release covering 126 merged PRs since v0.13.0. The project now treats provenance, historical knowability, execution verification, cycle ownership and deterministic decisions as first-class contracts instead of best-effort metadata.
 
 Highlights:
 
@@ -37,9 +37,9 @@ Highlights:
 - **Cycle/as-of deterministic risk** — position episodes, sell decisions, risk-scan lifecycle, position reviews and replacement/slot-upgrade decisions are bound to explicit cycle/as-of facts.
 - **Security and maintainability** — unified operator write boundary, frontend feature modules, Playwright E2E, DataFeed/StrategyPlugin boundaries and mandatory secret scanning.
 
-The paper schema is now **v21**. Historical provenance that cannot be proven stays `unknown` / `NULL`; v2.0.0 does not fabricate certainty from current state.
+The paper schema is now **v21**. Historical provenance that cannot be proven stays `unknown` / `NULL`; v0.20.0 does not fabricate certainty from current state.
 
-See the **[full v2.0.0 release notes](docs/RELEASE-v2.0.0.md)**, [CHANGELOG](CHANGELOG.md) and [GitHub Releases](https://github.com/daviesjoin-afk/astock-paper-trading/releases).
+See the **[full v0.20.0 release notes](docs/RELEASE-v0.20.0.md)**, [CHANGELOG](CHANGELOG.md) and [GitHub Releases](https://github.com/daviesjoin-afk/astock-paper-trading/releases).
 
 
 ## Six platform semantics you must know
@@ -242,7 +242,7 @@ MIT. See [`LICENSE`](LICENSE).
 
 ## Release and deployment status
 
-Current release: **v2.0.0** — see the [full release notes](docs/RELEASE-v2.0.0.md), [GitHub Releases](https://github.com/daviesjoin-afk/astock-paper-trading/releases) and [`CHANGELOG.md`](CHANGELOG.md). See [security boundaries](SECURITY.md), the [strategy platform](docs/STRATEGY_PLATFORM.md) and the [repository layout](docs/REPOSITORY_LAYOUT.md). CI covers Python 3.11/3.12, the offline Docker regression suite, frontend build checks and Chromium E2E.
+Current release: **v0.20.0** — see the [full release notes](docs/RELEASE-v0.20.0.md), [GitHub Releases](https://github.com/daviesjoin-afk/astock-paper-trading/releases) and [`CHANGELOG.md`](CHANGELOG.md). See [security boundaries](SECURITY.md), the [strategy platform](docs/STRATEGY_PLATFORM.md) and the [repository layout](docs/REPOSITORY_LAYOUT.md). CI covers Python 3.11/3.12, the offline Docker regression suite, frontend build checks and Chromium E2E.
 
 The local Compose mapping binds the host port to loopback only (`127.0.0.1:8600:8600`); inside the container Uvicorn still listens on `0.0.0.0` for port publishing, health checks and reverse proxying.
 
