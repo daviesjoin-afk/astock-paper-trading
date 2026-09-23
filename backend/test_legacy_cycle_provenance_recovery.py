@@ -461,5 +461,237 @@ class CliCyclePlanMismatchTests(unittest.TestCase):
             ])
 
 
+class PreviousVersionCompatibilityTests(unittest.TestCase):
+    """The incident itself becomes a permanent compatibility fixture.
+
+    A previous-version ledger legitimately contains ``paper_orders.cycle_id IS
+    NULL``: the column did not exist, so no row could carry provenance. The
+    upgrade must (a) leave those rows untouched, (b) keep them unprovable
+    rather than guessing, and (c) let the recovery tool classify them without
+    inventing an assignment. Exercised across fresh install, upgrade,
+    repeat/crash migration, restart and migration idempotency.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.db_path = os.path.join(self.tmp.name, "paper.sqlite3")
+        import paper_trading as PT
+        self._patchers = (
+            mock.patch.object(PT, "DB_PATH", self.db_path),
+            mock.patch.object(PT, "_RUNBOOK_BOOT", None, create=True),
+        )
+        for patcher in self._patchers:
+            patcher.start()
+        self.PT = PT
+        PT.init_db()
+
+    def tearDown(self):
+        for patcher in reversed(self._patchers):
+            patcher.stop()
+        self.tmp.cleanup()
+
+    def _conn(self):
+        conn = sqlite3.connect(self.db_path, isolation_level=None)
+        conn.row_factory = sqlite3.Row
+        return conn
+
+    def _downgrade_to_previous_version(self, conn):
+        """Reconstruct the pre-provenance schema from the current one.
+
+        Dropping the column and its guards is exactly the shape a
+        previous-version production ledger has, so the real migration below is
+        the genuine upgrade path rather than a hand-written approximation. Any
+        trigger that mentions ``cycle_id`` has to go with the column, otherwise
+        SQLite raises on the DROP (the pre-provenance schema had neither).
+        """
+        for row in list(conn.execute(
+            "SELECT name, sql FROM sqlite_master WHERE type='trigger'"
+        )):
+            if "cycle_id" in str(row["sql"] or ""):
+                conn.execute(f'DROP TRIGGER IF EXISTS "{row["name"]}"')
+        for table in ("paper_orders", "paper_orders_archive"):
+            if "cycle_id" in {
+                str(r[1]) for r in conn.execute(f'PRAGMA table_info("{table}")')
+            }:
+                conn.execute(f'ALTER TABLE "{table}" DROP COLUMN cycle_id')
+        self.assertNotIn("cycle_id", {
+            str(r[1]) for r in conn.execute("PRAGMA table_info(paper_orders)")
+        }, "downgrade must actually remove the previous-version column")
+
+    def _seed_previous_version_ledger(self, conn):
+        """Legal previous-version data: a running cycle, orders, fills and lots.
+
+        No order can carry a cycle_id because the column did not exist yet.
+        Durable lots *do* carry cycle ownership (they are cycle-owned), which
+        is the evidence real historical ledgers leave behind.
+        """
+        created = "2026-08-19 09:30:00"
+        cycle_id = int(conn.execute(
+            "INSERT INTO paper_cycles(cycle_key,status,capital,risk_profile,"
+            "created_at,updated_at,started_at) VALUES(?,?,?,?,?,?,?)",
+            ("legacy-upgrade-1", "running", 100000.0, "shared_pool",
+             created, created, created),
+        ).lastrowid)
+        # Reuse a real account row so the fixture carries the full NOT NULL
+        # shape the engine expects, instead of hand-filling every column.
+        account_id = str(conn.execute(
+            "SELECT id FROM paper_accounts ORDER BY id LIMIT 1"
+        ).fetchone()[0])
+        conn.execute(
+            "UPDATE paper_accounts SET cycle_id=?, cash=90000.0 WHERE id=?",
+            (cycle_id, account_id),
+        )
+        stamp = self.PT._strategy_stamp(conn, account_id)
+        for order_id, code, side, qty, price in (
+            (9001, "600901", "buy", 100, 10.0),
+            (9002, "600902", "buy", 200, 20.0),
+        ):
+            conn.execute(
+                "INSERT INTO paper_orders(id,account_id,side,code,name,qty,"
+                "planned_price,filled_price,amount,fees,status,reason,risk_payload,"
+                "created_at,executed_at,order_type,origin,strategy_id,"
+                "strategy_version,strategy_checksum,execution_status,"
+                "execution_verified) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (order_id, account_id, side, code, "升级股", qty, price, price,
+                 qty * price, 5.0, "filled", "legacy", "{}", created, created,
+                 "market", "seed", *stamp, "verified", 1),
+            )
+            conn.execute(
+                "INSERT INTO paper_fills(order_id,account_id,side,code,qty,price,"
+                "amount,fees,fill_date,quote_at,assumption) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                (order_id, account_id, side, code, qty, price, qty * price,
+                 5.0, "2026-08-19", created, "legacy-upgrade"),
+            )
+        # Durable lots keep cycle ownership — the one surviving direct proof.
+        for lot_id, order_id, code, qty, cost in (
+            (8001, 9001, "600901", 100, 10.0),
+            (8002, 9002, "600902", 200, 20.0),
+        ):
+            conn.execute(
+                "INSERT INTO paper_position_lots(cycle_id,account_id,code,name,"
+                "industry,qty,remaining_qty,cost,acquired_at,available_date,"
+                "asset_type,source_order_id,cost_fee_included,is_t_base) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (cycle_id, account_id, code, "升级股", "测试", qty, qty, cost,
+                 f"{created[:10]} 10:00:00", "2026-08-20", "stock_t1", order_id, 1, 1),
+            )
+        return cycle_id
+
+    def test_previous_version_upgrade_preserves_legacy_null_provenance(self):
+        """FRESH → DOWNGRADE → UPGRADE: legacy NULL rows survive untouched."""
+        conn = self._conn()
+        try:
+            self._downgrade_to_previous_version(conn)
+            cycle_id = self._seed_previous_version_ledger(conn)
+            before = RECOVERY._table_fingerprint(conn, "paper_orders")
+            before_fills = RECOVERY._table_fingerprint(conn, "paper_fills")
+            before_lots = RECOVERY._table_fingerprint(conn, "paper_position_lots")
+
+            # The real upgrade path, exactly as a deployment would run it.
+            RECOVERY.PSM.ensure_order_cycle_provenance(conn)
+        finally:
+            conn.close()
+
+        conn = self._conn()
+        try:
+            self.assertIn("cycle_id", {
+                str(r[1]) for r in conn.execute("PRAGMA table_info(paper_orders)")
+            })
+            # Legacy rows are still NULL and no other fact was rewritten.
+            self.assertEqual(
+                [int(r[0]) for r in conn.execute(
+                    "SELECT id FROM paper_orders WHERE cycle_id IS NULL ORDER BY id")],
+                [9001, 9002],
+            )
+            self.assertEqual(before, RECOVERY._table_fingerprint(conn, "paper_orders"))
+            self.assertEqual(before_fills,
+                             RECOVERY._table_fingerprint(conn, "paper_fills"))
+            self.assertEqual(before_lots,
+                             RECOVERY._table_fingerprint(conn, "paper_position_lots"))
+
+            # Recovery classifies them; the durable lot is a direct proof.
+            plan = RECOVERY.build_plan(conn, cycle_id)
+            self.assertEqual(plan["proven_count_for_requested_cycle"], 2)
+            self.assertEqual(
+                {i["order_id"] for i in plan["proven"]}, {9001, 9002}
+            )
+        finally:
+            conn.close()
+
+    def test_previous_version_ledger_without_lot_proof_stays_unknown(self):
+        """Upgraded legacy rows with no direct evidence must not be guessed."""
+        conn = self._conn()
+        try:
+            self._downgrade_to_previous_version(conn)
+            cycle_id = self._seed_previous_version_ledger(conn)
+            # Strip the one direct proof: a pruned/legacy lot keeps the order
+            # unprovable rather than inferable from the account binding.
+            conn.execute("UPDATE paper_position_lots SET source_order_id=NULL")
+            RECOVERY.PSM.ensure_order_cycle_provenance(conn)
+        finally:
+            conn.close()
+
+        conn = self._conn()
+        try:
+            plan = RECOVERY.build_plan(conn, cycle_id)
+            self.assertEqual(plan["proven"], [],
+                             "no direct evidence must never become a cycle_id")
+            self.assertEqual(plan["proven_count_for_requested_cycle"], 0)
+        finally:
+            conn.close()
+
+    def test_migration_is_idempotent_across_repeat_and_restart(self):
+        """Repeat migration (crash resume) and a restart change nothing."""
+        conn = self._conn()
+        try:
+            self._downgrade_to_previous_version(conn)
+            cycle_id = self._seed_previous_version_ledger(conn)
+            RECOVERY.PSM.ensure_order_cycle_provenance(conn)
+            first = RECOVERY._schema_identity(conn)
+            after_first = RECOVERY._table_fingerprint(conn, "paper_orders")
+            # Crash-resume: the migration runs again on the already-upgraded db.
+            RECOVERY.PSM.ensure_order_cycle_provenance(conn)
+            self.assertEqual(first, RECOVERY._schema_identity(conn),
+                             "re-running the migration must not change schema")
+            self.assertEqual(after_first,
+                             RECOVERY._table_fingerprint(conn, "paper_orders"))
+            plan_before = RECOVERY.build_plan(conn, cycle_id)
+        finally:
+            conn.close()
+
+        # Restart: a brand-new connection sees the same classification.
+        conn = self._conn()
+        try:
+            plan_after = RECOVERY.build_plan(conn, cycle_id)
+            self.assertEqual(plan_before["plan_sha256"], plan_after["plan_sha256"],
+                             "classification must be stable across a restart")
+        finally:
+            conn.close()
+
+    def test_upgraded_legacy_ledger_triggers_still_guard_new_writes(self):
+        """After upgrading, the immutability guard still rejects new bad writes."""
+        conn = self._conn()
+        try:
+            self._downgrade_to_previous_version(conn)
+            cycle_id = self._seed_previous_version_ledger(conn)
+            RECOVERY.PSM.ensure_order_cycle_provenance(conn)
+            self.assertEqual(RECOVERY._trigger_sql(conn),
+                             RECOVERY._canonical_trigger_sql())
+            with self.assertRaises(sqlite3.IntegrityError):
+                conn.execute(
+                    "UPDATE paper_orders SET cycle_id=? WHERE id=9001", (cycle_id,)
+                )
+            with self.assertRaises(sqlite3.IntegrityError):
+                conn.execute(
+                    "INSERT INTO paper_orders(account_id,side,code,qty,status,"
+                    "created_at) VALUES('upgrade_acct','buy','600903',10,'pending',"
+                    "'2026-09-01 09:30:00')"
+                )
+        finally:
+            conn.close()
+
+
 if __name__ == "__main__":
     unittest.main()
