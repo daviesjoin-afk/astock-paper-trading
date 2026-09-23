@@ -1,24 +1,23 @@
 # -*- coding: utf-8 -*-
 """R27-A —— AI Information & Research Contract 的语义与依赖方向回归。
 
-本文件存在的全部理由，是这个不变量：
+存在理由是这个不变量：
 
     **AI 只能读取可信事实并产出 research 结论；它永远不是 Market Data /
     Signal / Execution / Risk / Promotion 的 authority。**
 
-因此分三组：
+分四组：
 
-    AI-*   contract：事实观测、证据引用、假设强度、PIT、fail-closed 消费
-    AIG-*  architecture guard：依赖方向（AI → R24 contract）、反向 import、
-           时钟/IO/DB 依赖、以及"AI 产物无法成为账本行"
-    非空性  护栏必须真的能失败，否则它只是装饰
+    AI-*       contract 语义：两个维度分离、owner-issued、冲突、深冻结、PIT
+    AI-OWNER-* evidence 必须由 owner 签发，raw 调用方无法伪造 authority
+    AIG-*      architecture guard：依赖方向、"AI 不能 commit signal"、无 IO/时钟
+    非空性      护栏必须真的能失败，否则它只是装饰
 
-时间一律**显式**传入（固定的 as_of 字符串），绝不 ``time.sleep()``、绝不读墙上
-时钟 —— 本轮的 PIT 语义恰恰是最容易假绿的地方。
+时间一律**显式**传入（固定的业务日字符串），绝不 ``time.sleep()``、绝不读墙上时钟 ——
+本轮的 PIT 语义恰恰是最容易假绿的地方。
 
-刻意**不**起数据库：AI-07 要证明的是"writer 在触碰任何连接之前就拒绝一个非
-裁决的 decision"，而 ``commit_signal`` 的校验顺序正好让这一点可以用 ``conn=None``
-验证。不需要 sqlite，测试因此是秒级的。
+刻意**不**起数据库：AIG-05 要证明的是"writer 在触碰任何连接之前就拒绝一个非裁决的
+decision"，而 ``commit_signal`` 的校验顺序正好让这一点可以用 ``conn=None`` 验证。
 """
 from __future__ import annotations
 
@@ -41,12 +40,14 @@ DAY = "2026-08-27"
 NEXT_DAY = "2026-08-28"
 PREV_DAY = "2026-08-26"
 
+OWNER_ID = "LIVE_MARKET_POLICY"
+
 #: 只有这一个项目模块允许被 AI 契约 import：R24 的纯行情契约（**读**事实）。
 ALLOWED_PROJECT_IMPORTS = {"market_data_contract"}
 ALLOWED_STDLIB_IMPORTS = {"__future__", "dataclasses", "types", "typing"}
 
 #: 现有 authority owner。它们**不得**反向 import AI 研究层 —— AI 是消费者。
-#: 按 authority 领域分组，新增 authority 时同步登记（R26 的执行权威已在此）。
+#: 按 authority 领域分组，新增 authority 时同步登记。
 AUTHORITY_MODULES = (
     # R24 market data
     "market_data_contract.py",
@@ -84,9 +85,8 @@ AUTHORITY_MODULES = (
     "strategy_champion.py",
 )
 
-#: 允许 import AI 研究层的模块。**现在为空**：R27-A 只建立契约，没有任何
-#: 生产消费者。将来接入时必须显式加到这份清单里，使"谁依赖了 AI"是一次
-#: 有意识的决定，而不是一次静默扩散。
+#: 允许 import AI 研究层的生产模块。**现在为空**：R27-A 只建立契约，没有任何生产
+#: 消费者。将来接入时必须显式加入，使"谁依赖了 AI"是一次有意识的决定。
 ALLOWED_AI_CONSUMERS: set[str] = set()
 
 #: 时钟 / 随机数 / IO —— 研究契约一旦读它们，就能拿 current state 回填历史。
@@ -127,7 +127,7 @@ def _imported_roots(tree: ast.Module) -> set[str]:
 
 
 def _imported_names(tree: ast.Module) -> list[str]:
-    """所有 import 的完整名字（用于判断是否 import 了某个具体模块）。"""
+    """所有 import 的完整模块名（用于判断是否 import 了某个具体模块）。"""
     names: list[str] = []
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
@@ -165,58 +165,55 @@ def _code_string_constants(tree: ast.Module) -> list[str]:
             and id(node) not in docstrings]
 
 
-def _verified_ref(source_type: str = ARC.EVIDENCE_SOURCE_MARKET_DATA, *, as_of: str = DAY):
-    """一条**通过核验**的证据引用（R24 双源）。"""
-    return ARC.ResearchEvidenceRef(
-        source_type=source_type,
-        source_id=f"{source_type}-fact-1",
-        as_of=as_of,
-        verification=MDC.VERIFICATION_VERIFIED,
-        verification_method=MDC.VERIFICATION_METHOD_CROSS_SOURCE,
+def _reading(
+    verification: str = MDC.VERIFICATION_VERIFIED,
+    method: str = MDC.VERIFICATION_METHOD_CROSS_SOURCE,
+    *, as_of: str = DAY,
+):
+    """一个真实的 R24 owner projection（``MarketDataReading``）。"""
+    return MDC.MarketDataReading(
+        availability=MDC.AVAILABILITY_AVAILABLE,
+        freshness=MDC.FRESHNESS_FRESH,
+        status=MDC.STATUS_FRESH,
+        policy_name="live_market",
+        snapshot=MDC.MarketDataSnapshot(
+            kind="symbol_quote", as_of=as_of, observed_at=f"{as_of}T10:30:00+08:00",
+            verification=verification, verification_method=method,
+        ),
     )
 
 
-def _single_source_ref(*, as_of: str = DAY):
-    """一条**只有单源**的证据引用 —— 可用，但不得自称已核验。"""
-    return ARC.ResearchEvidenceRef(
-        source_type=ARC.EVIDENCE_SOURCE_MARKET_DATA,
-        source_id="market_data-fact-single",
-        as_of=as_of,
-        verification=MDC.VERIFICATION_SINGLE_SOURCE,
-        verification_method=MDC.VERIFICATION_METHOD_CROSS_SOURCE,
+def _ref(*, verification=MDC.VERIFICATION_VERIFIED,
+         method=MDC.VERIFICATION_METHOD_CROSS_SOURCE, as_of=DAY, source_id=OWNER_ID):
+    """一条由 owner factory 签发的证据引用。"""
+    return ARC.evidence_ref_from_market_reading(
+        _reading(verification, method, as_of=as_of), source_id=source_id,
     )
 
 
-def _disagreement_ref(*, as_of: str = DAY):
-    """一条**被多源否证**的证据引用。"""
-    return ARC.ResearchEvidenceRef(
-        source_type=ARC.EVIDENCE_SOURCE_MARKET_DATA,
-        source_id="market_data-fact-contested",
-        as_of=as_of,
-        verification=MDC.VERIFICATION_DISAGREEMENT,
-        verification_method=MDC.VERIFICATION_METHOD_CROSS_SOURCE,
-    )
+def _evidence(ref, relation=ARC.RELATION_SUPPORTS):
+    return ARC.HypothesisEvidence(ref=ref, relation=relation)
 
 
-def _hypothesis(*, as_of: str = DAY, refs=(), confidence: float = 0.5):
+def _hypothesis(*, as_of=DAY, evidence=(), confidence=0.5):
     return ARC.ResearchHypothesis(
         hypothesis_id="H-1", as_of=as_of, subject="600000",
         thesis="momentum persists into the next session",
-        evidence_refs=tuple(refs), confidence=confidence,
+        evidence=tuple(evidence), confidence=confidence,
     )
 
 
 # ---------------------------------------------------------------------------
-# AI-01 ~ AI-05 —— contract 语义
+# AI-01 ~ AI-05 —— 事实层面
 # ---------------------------------------------------------------------------
 
 
-class AiResearchContractTests(unittest.TestCase):
-    """契约层的业务语义：事实 → 证据 → 假设，以及 PIT 与 fail-closed。"""
+class AiResearchFactTests(unittest.TestCase):
+    """事实观测与证据引用：只能回答事实层面的问题。"""
 
     def test_AI01_verified_market_evidence_yields_a_verified_information_event(self):
-        """AI-01：已核验的行情事实 → 合法的 InformationEvent，且状态被逐字保留。"""
-        ref = _verified_ref()
+        """AI-01：已核验的行情事实 → 合法的 InformationEvent，状态被逐字保留。"""
+        ref = _ref()
         event = ARC.InformationEvent(
             as_of=DAY, source="market_data_service.read_snapshot", evidence_ref=ref,
             payload={"price": 10.5},
@@ -224,175 +221,388 @@ class AiResearchContractTests(unittest.TestCase):
         self.assertEqual(ARC.EVENT_MARKET_OBSERVED, event.kind)
         self.assertEqual(MDC.VERIFICATION_VERIFIED, event.verification)
         self.assertEqual(MDC.VERIFICATION_METHOD_CROSS_SOURCE, event.verification_method)
-        self.assertEqual("market_data-fact-1", event.evidence_id)
+        self.assertEqual(OWNER_ID, event.evidence_id)
         self.assertTrue(ref.cross_source_verified)
 
-        # kind 与 source_type 一一对应，且是派生只读的 —— 错标无法表达。
-        self.assertEqual(
-            _KIND_BY_SOURCE[ref.source_type], event.kind,
-            "InformationEvent.kind 必须由 source_type 派生",
-        )
-        for source_type, expected_kind in _KIND_BY_SOURCE.items():
+        # kind 与 source_type 一一对应，且派生只读 —— 错标无法表达。
+        self.assertEqual(ARC.EVENT_MARKET_OBSERVED, event.kind)
+        for source_type, expected in (
+            (ARC.EVIDENCE_SOURCE_MARKET_DATA, ARC.EVENT_MARKET_OBSERVED),
+            (ARC.EVIDENCE_SOURCE_SIGNAL, ARC.EVENT_SIGNAL_OBSERVED),
+            (ARC.EVIDENCE_SOURCE_EXECUTION, ARC.EVENT_EXECUTION_OBSERVED),
+            (ARC.EVIDENCE_SOURCE_STRATEGY_RESEARCH, ARC.EVENT_STRATEGY_RESEARCH_OBSERVED),
+            (ARC.EVIDENCE_SOURCE_PORTFOLIO_RESEARCH, ARC.EVENT_PORTFOLIO_RESEARCH_OBSERVED),
+            (ARC.EVIDENCE_SOURCE_NEWS, ARC.EVENT_NEWS_OBSERVED),
+        ):
             with self.subTest(source_type=source_type):
-                self.assertEqual(
-                    expected_kind,
-                    ARC.InformationEvent(
-                        as_of=DAY, source="s", evidence_ref=_verified_ref(source_type),
-                    ).kind,
-                )
+                self.assertEqual(expected, ARC._KIND_BY_SOURCE_TYPE[source_type])
+        self.assertEqual(len(ARC._KIND_BY_SOURCE_TYPE), len(ARC.EVIDENCE_SOURCE_TYPES))
 
-        # 投影只 render，不重算：verification 与 method 同时下发。
         projected = event.projection()
         self.assertEqual(MDC.VERIFICATION_VERIFIED, projected["verification"])
-        self.assertEqual(MDC.VERIFICATION_METHOD_CROSS_SOURCE,
-                         projected["verification_method"])
+        self.assertEqual(MDC.VERIFICATION_METHOD_CROSS_SOURCE, projected["verification_method"])
 
-    def test_AI02_stale_or_unverified_evidence_keeps_its_original_state(self):
-        """AI-02：未核验的事实**保持原状**，绝不被升级成 verified。
-
-        这是 §五 的核心：把 ``single_source`` / ``not_attempted`` 当成
-        ``verified`` 会让 AI 侧凭空提高事实可信度，而事实的核验程度只有一个
-        owner（R24）。
-        """
-        single = _single_source_ref()
+    def test_AI02_unverified_evidence_keeps_its_original_state(self):
+        """AI-02：未核验的事实保持原状，绝不升级成 verified。"""
+        single = _ref(verification=MDC.VERIFICATION_SINGLE_SOURCE)
         self.assertEqual(MDC.VERIFICATION_SINGLE_SOURCE, single.verification)
-        self.assertNotEqual(MDC.VERIFICATION_VERIFIED, single.verification)
         self.assertFalse(
             single.cross_source_verified,
             "单源证据不得自称通过了逐票双源交叉核验",
         )
-        self.assertEqual(ARC.STANDING_DEGRADED, single.standing)
 
-        # 未核验事件：verification 从证据继承，不被事件层改写。
         event = ARC.InformationEvent(as_of=DAY, source="s", evidence_ref=single)
         self.assertEqual(MDC.VERIFICATION_SINGLE_SOURCE, event.verification)
 
-        # 单源证据不足以支撑一个假设 —— 是"证据不足"，不是"支持"。
-        self.assertEqual(
-            ARC.HYPOTHESIS_INSUFFICIENT_EVIDENCE, _hypothesis(refs=(single,)).status,
+        untouched = MDC.MarketDataReading(
+            availability=MDC.AVAILABILITY_AVAILABLE, freshness=MDC.FRESHNESS_STALE,
+            status=MDC.STATUS_STALE, policy_name="live_market",
+            snapshot=MDC.MarketDataSnapshot(
+                kind="symbol_quote", as_of=DAY, observed_at=f"{DAY}T10:30:00+08:00",
+            ),
         )
+        stale_ref = ARC.evidence_ref_from_market_reading(untouched, source_id=OWNER_ID)
+        self.assertEqual(MDC.VERIFICATION_NOT_ATTEMPTED, stale_ref.verification)
 
-        # 从未核验（not_attempted）同样是 degraded，绝不因为"没人反对"就通过。
-        untouched = ARC.ResearchEvidenceRef(
-            source_type=ARC.EVIDENCE_SOURCE_NEWS, source_id="news-1", as_of=DAY,
-        )
-        self.assertEqual(MDC.VERIFICATION_NOT_ATTEMPTED, untouched.verification)
-        self.assertEqual(ARC.STANDING_DEGRADED, untouched.standing)
-        hypothesis = _hypothesis(refs=(untouched,))
-        self.assertEqual(ARC.HYPOTHESIS_INSUFFICIENT_EVIDENCE, hypothesis.status)
-        self.assertEqual(ARC.RESEARCH_REASON_EVIDENCE_NOT_VERIFIED, hypothesis.reason)
-
-        # 非法核验组合（verified 配 none）在**构造期**就被拒绝，而不是被降级。
+        # 非法核验组合（verified 配 none）在构造期就被拒绝，而不是被降级。
         with self.assertRaises(ValueError) as caught:
-            ARC.ResearchEvidenceRef(
+            ARC._issue_evidence_ref(
                 source_type=ARC.EVIDENCE_SOURCE_MARKET_DATA, source_id="x", as_of=DAY,
                 verification=MDC.VERIFICATION_VERIFIED,
-                verification_method=MDC.VERIFICATION_METHOD_NONE,
+                verification_method=MDC.VERIFICATION_METHOD_NONE, detail={},
             )
         self.assertIn("illegal verification pair", str(caught.exception))
 
     def test_AI03_hypothesis_referencing_future_evidence_is_rejected(self):
-        """AI-03：引用未来证据的假设在**构造期**被拒绝，而不是静默过滤。"""
-        future = _verified_ref(as_of=NEXT_DAY)
+        """AI-03：引用未来证据的假设在构造期被拒绝，而不是静默过滤。"""
+        future = _ref(as_of=NEXT_DAY)
         with self.assertRaises(ValueError) as caught:
-            _hypothesis(as_of=DAY, refs=(future,))
+            _hypothesis(as_of=DAY, evidence=(_evidence(future),))
         message = str(caught.exception)
         self.assertIn("future evidence", message)
         self.assertIn(NEXT_DAY, message, "错误信息必须点名那条未来事实")
 
-        # 同一天的证据是合法的（as_of <= hypothesis.as_of）。
-        self.assertEqual(ARC.HYPOTHESIS_SUPPORTED, _hypothesis(as_of=DAY, refs=(_verified_ref(),)).status)
+        self.assertEqual(ARC.HYPOTHESIS_SUPPORTED, _hypothesis(evidence=(_evidence(_ref()),)).status)
 
-        # 历史假设引用"今天"的事实同样被拒 —— 这正是 PIT 的 look-ahead 漏洞。
-        stale_hypothesis_as_of = PREV_DAY
+        # 历史假设引用"今天"的事实同样被拒 —— PIT 的 look-ahead 漏洞。
         with self.assertRaises(ValueError):
-            _hypothesis(as_of=stale_hypothesis_as_of, refs=(_verified_ref(as_of=DAY),))
+            _hypothesis(as_of=PREV_DAY, evidence=(_evidence(_ref(as_of=DAY)),))
 
     def test_AI04_hypothesis_without_evidence_is_insufficient_not_approved(self):
-        """AI-04：没有证据的假设是 ``insufficient_evidence``，绝不默认批准。"""
-        empty = _hypothesis(refs=())
+        """AI-04：没有证据的假设是 insufficient_evidence，绝不默认批准。"""
+        empty = _hypothesis(evidence=())
         self.assertEqual(ARC.HYPOTHESIS_INSUFFICIENT_EVIDENCE, empty.status)
         self.assertEqual(ARC.RESEARCH_REASON_NO_EVIDENCE, empty.reason)
         self.assertFalse(empty.is_supported)
 
-        # 高 confidence 不能替代证据 —— 自信不是事实。
-        confident = _hypothesis(refs=(), confidence=1.0)
+        confident = _hypothesis(evidence=(), confidence=1.0)
         self.assertEqual(ARC.HYPOTHESIS_INSUFFICIENT_EVIDENCE, confident.status)
 
-        # 消费端 fail closed：拿不到结论就拿不到默认值。
         with self.assertRaises(ARC.UnsupportedResearch):
             empty.require_supported()
 
-        # 被否证的证据让假设变成 ``unsupported``（证据反对），与"证据不足"可区分。
-        contradicted = _hypothesis(refs=(_disagreement_ref(),))
-        self.assertEqual(ARC.HYPOTHESIS_UNSUPPORTED, contradicted.status)
-        self.assertEqual(ARC.RESEARCH_REASON_EVIDENCE_CONTRADICTED, contradicted.reason)
-
-        # 支持证据与反对证据并存 → 反对优先（保守），绝不"票数过半"。
-        mixed = _hypothesis(refs=(_verified_ref(), _disagreement_ref()))
-        self.assertEqual(ARC.HYPOTHESIS_UNSUPPORTED, mixed.status)
-
-        # 核验源不可用与"两个源互相否证"是两个结论，原因必须不同。
-        unavailable = ARC.ResearchEvidenceRef(
-            source_type=ARC.EVIDENCE_SOURCE_EXECUTION, source_id="order-1", as_of=DAY,
-            verification=MDC.VERIFICATION_UNAVAILABLE,
-            verification_method=MDC.VERIFICATION_METHOD_CROSS_SOURCE,
-        )
-        unavailable_hypothesis = _hypothesis(refs=(unavailable,))
-        self.assertEqual(ARC.HYPOTHESIS_UNSUPPORTED, unavailable_hypothesis.status)
-        self.assertEqual(
-            ARC.RESEARCH_REASON_EVIDENCE_UNAVAILABLE, unavailable_hypothesis.reason,
-        )
-        self.assertNotEqual(contradicted.reason, unavailable_hypothesis.reason)
-
     def test_AI05_historical_hypothesis_cannot_read_current_state(self):
         """AI-05：历史假设不读取 current state —— as-of 必须显式且证明得出来。"""
-        # 业务日无法证明 → 构造期拒绝（绝不回落到 today()）。
         for bad in (None, "", "not-a-day", "2026-13-45"):
             with self.subTest(as_of=bad):
                 with self.assertRaises(ValueError):
-                    _hypothesis(as_of=bad)  # type: ignore[arg-type]
-                with self.assertRaises(ValueError):
-                    ARC.ResearchEvidenceRef(
-                        source_type=ARC.EVIDENCE_SOURCE_MARKET_DATA,
-                        source_id="x", as_of=bad,
-                    )
+                    _hypothesis(as_of=bad)
 
-        # 契约本身没有任何读时钟的入口 —— 这是"无法回填 current"的结构性保证。
+        # owner projection 若没有可证明的 as-of（unavailable reading），拒绝签发。
+        with self.assertRaises(ValueError):
+            ARC.evidence_ref_from_market_reading(
+                MDC.unavailable_reading(MDC.LIVE_MARKET_POLICY), source_id=OWNER_ID,
+            )
+
+        # 契约本身没有读时钟的入口 —— 这是"无法回填 current"的结构性保证。
         tree = _tree(CONTRACT_MODULE)
         called = _called_names(tree)
         for forbidden in FORBIDDEN_CLOCK_CALLS:
             with self.subTest(call=forbidden):
                 self.assertNotIn(
                     forbidden, called,
-                    f"{CONTRACT_MODULE} 调用了 {forbidden} —— "
-                    "研究契约不得读时钟/随机/环境，否则历史研究会被 current 回填",
+                    f"{CONTRACT_MODULE} 调用了 {forbidden} —— 研究契约不得读时钟/随机/环境",
                 )
         self.assertNotIn("time", _imported_roots(tree))
         self.assertNotIn("datetime", _imported_roots(tree))
 
-        # 整份证据集合都必须是"过去或当天"，没有例外。
         historical = _hypothesis(
-            as_of=DAY, refs=(_verified_ref(as_of=PREV_DAY), _verified_ref(as_of=DAY)),
+            evidence=(_evidence(_ref(as_of=PREV_DAY)), _evidence(_ref(as_of=DAY))),
         )
         self.assertEqual((), historical.look_ahead_refs)
         self.assertEqual(ARC.HYPOTHESIS_SUPPORTED, historical.status)
 
-    def test_AI06_research_vocabulary_never_overlaps_the_signal_lifecycle(self):
-        """AI-06：研究词汇与 signal 生命周期**不相交** —— 结论无法直接落成 signal。"""
-        signal_lifecycle = {"pending", "approved", "blocked", "waitlist", "recovery"}
-        overlap = set(ARC.HYPOTHESIS_STATUSES) & signal_lifecycle
-        self.assertEqual(
-            set(), overlap,
-            f"研究状态与 paper_signals 生命周期重叠：{sorted(overlap)} —— "
-            "重叠会让 supported 被当作 approved 使用",
-        )
-        # decision outcome 词汇同样不得复用。
-        self.assertEqual(set(), set(ARC.HYPOTHESIS_STATUSES) & {"approved", "blocked"})
 
-    def test_AI07_hypothesis_projection_declares_itself_non_authoritative(self):
-        """AI-07：假设投影必须自带"这只是研究"的结论，供下游离线判断。"""
-        hypothesis = _hypothesis(refs=(_verified_ref(),), confidence=0.62)
+# ---------------------------------------------------------------------------
+# AI-09 ~ AI-15 —— 两个维度的分离与冲突
+# ---------------------------------------------------------------------------
+
+
+class AiResearchRelationTests(unittest.TestCase):
+    """P1-1：fact verification 与 hypothesis relation 是两个正交维度。"""
+
+    def test_AI09_verified_fact_with_context_relation_is_not_supported(self):
+        """AI-09：verified 事实 + relation=context → **不**支持 hypothesis。
+
+        verified 只说明"这个事实可信"，不说明"它支持当前 thesis"。一条可信报价
+        对"下一日 momentum 会继续"只是背景信息。
+        """
+        hypothesis = _hypothesis(evidence=(_evidence(_ref(), ARC.RELATION_CONTEXT),))
+        self.assertEqual(ARC.HYPOTHESIS_INSUFFICIENT_EVIDENCE, hypothesis.status)
+        self.assertEqual(ARC.RESEARCH_REASON_EVIDENCE_NOT_VERIFIED, hypothesis.reason)
+        self.assertFalse(hypothesis.is_supported)
+
+    def test_AI10_verified_fact_with_supports_relation_is_supported(self):
+        """AI-10：verified 事实 + relation=supports → supported。"""
+        hypothesis = _hypothesis(evidence=(_evidence(_ref(), ARC.RELATION_SUPPORTS),))
+        self.assertEqual(ARC.HYPOTHESIS_SUPPORTED, hypothesis.status)
+        self.assertIsNone(hypothesis.reason)
+        self.assertTrue(hypothesis.is_supported)
+
+    def test_AI11_verified_fact_with_contradicts_relation_is_unsupported(self):
+        """AI-11：verified 事实 + relation=contradicts → unsupported。"""
+        hypothesis = _hypothesis(evidence=(_evidence(_ref(), ARC.RELATION_CONTRADICTS),))
+        self.assertEqual(ARC.HYPOTHESIS_UNSUPPORTED, hypothesis.status)
+        self.assertEqual(ARC.RESEARCH_REASON_EVIDENCE_CONTRADICTED, hypothesis.reason)
+
+        # 可信支持与可信反对并存 → 反对优先（保守），不"票数过半"。
+        mixed = _hypothesis(evidence=(
+            _evidence(_ref(), ARC.RELATION_SUPPORTS),
+            _evidence(_ref(source_id="OTHER_POLICY"), ARC.RELATION_CONTRADICTS),
+        ))
+        self.assertEqual(ARC.HYPOTHESIS_UNSUPPORTED, mixed.status)
+
+    def test_AI12_unverified_fact_with_supports_is_insufficient(self):
+        """AI-12：未核验事实 + supports → insufficient_evidence（不是 supported）。"""
+        hypothesis = _hypothesis(
+            evidence=(_evidence(_ref(verification=MDC.VERIFICATION_SINGLE_SOURCE), ), ),
+        )
+        self.assertEqual(ARC.HYPOTHESIS_INSUFFICIENT_EVIDENCE, hypothesis.status)
+        self.assertEqual(ARC.RESEARCH_REASON_EVIDENCE_NOT_VERIFIED, hypothesis.reason)
+
+    def test_AI13_unavailable_source_does_not_contradict_the_thesis(self):
+        """AI-13：source unavailable + supports → insufficient_evidence，**不是** unsupported。
+
+        provider disagreement / unavailable 只说明"这条 evidence 本身不能成为可靠依据"，
+        不说明"这个 thesis 被事实反驳"。两者必须完全独立。
+        """
+        for verification in (MDC.VERIFICATION_UNAVAILABLE, MDC.VERIFICATION_DISAGREEMENT):
+            with self.subTest(verification=verification):
+                ref = _ref(verification=verification)
+                hypothesis = _hypothesis(evidence=(_evidence(ref, ARC.RELATION_SUPPORTS),))
+                self.assertEqual(
+                    ARC.HYPOTHESIS_INSUFFICIENT_EVIDENCE, hypothesis.status,
+                    "来源不可用/冲突不得自动升级为 thesis 被反驳",
+                )
+                self.assertEqual(
+                    ARC.RESEARCH_REASON_EVIDENCE_UNAVAILABLE, hypothesis.reason,
+                )
+
+        # 与"可信事实反对"是两个结论：原因必须不同。
+        contradicted = _hypothesis(evidence=(_evidence(_ref(), ARC.RELATION_CONTRADICTS),))
+        self.assertNotEqual(ARC.RESEARCH_REASON_EVIDENCE_UNAVAILABLE, contradicted.reason)
+
+    def test_AI14_conflicting_duplicate_evidence_fails_closed_order_independently(self):
+        """AI-14：同 identity 但事实状态不同的证据 → fail closed，且顺序无关。"""
+        verified = _ref()                                     # verified / cross_source
+        disagreement = _ref(verification=MDC.VERIFICATION_DISAGREEMENT)
+        self.assertEqual(verified.identity(), disagreement.identity())
+
+        for label, order in (("A,B", (verified, disagreement)),
+                             ("B,A", (disagreement, verified))):
+            with self.subTest(order=label):
+                with self.assertRaises(ARC.EvidenceConflict):
+                    _hypothesis(evidence=tuple(_evidence(ref) for ref in order))
+
+        # 完全相同（含 detail）→ 安全去重，不误报。
+        identical = _hypothesis(evidence=(_evidence(verified), _evidence(verified)))
+        self.assertEqual(1, len(identical.evidence))
+        self.assertEqual(ARC.HYPOTHESIS_SUPPORTED, identical.status)
+        self.assertEqual(1, identical.projection()["evidence_count"])
+
+    def test_AI15_conflicting_relation_on_the_same_evidence_fails_closed(self):
+        """AI-15：同一条 evidence 同时 supports + contradicts → fail closed，顺序无关。"""
+        ref = _ref()
+        for label, order in (("supports,contradicts",
+                              ((ref, ARC.RELATION_SUPPORTS), (ref, ARC.RELATION_CONTRADICTS))),
+                             ("contradicts,supports",
+                              ((ref, ARC.RELATION_CONTRADICTS), (ref, ARC.RELATION_SUPPORTS)))):
+            with self.subTest(order=label):
+                with self.assertRaises(ARC.EvidenceRelationConflict):
+                    _hypothesis(evidence=tuple(_evidence(r, rel) for r, rel in order))
+
+        # 同一 relation 重复不是冲突。
+        same = _hypothesis(evidence=(_evidence(ref, ARC.RELATION_CONTEXT),
+                                     _evidence(ref, ARC.RELATION_CONTEXT)))
+        self.assertEqual(1, len(same.evidence))
+
+    def test_AI16_relation_vocabulary_is_a_minimal_closed_set(self):
+        """AI-16：relation 是最小闭集，不含评分档位。"""
+        self.assertEqual(
+            (ARC.RELATION_SUPPORTS, ARC.RELATION_CONTRADICTS, ARC.RELATION_CONTEXT),
+            ARC.RELATIONS,
+        )
+        for forbidden in ("strong_support", "weak_support", "neutral_positive",
+                          "negative", "uncertain", "support"):
+            with self.subTest(relation=forbidden):
+                with self.assertRaises(ValueError):
+                    _evidence(_ref(), forbidden)
+
+
+# ---------------------------------------------------------------------------
+# AI-17 / AI-18 —— owner-issued evidence
+# ---------------------------------------------------------------------------
+
+
+class AiResearchOwnerIssuedTests(unittest.TestCase):
+    """P1-2：调用方不能仅凭传字符串声明一条 owner authority 事实。"""
+
+    def test_AI_OWNER_01_raw_caller_cannot_forge_owner_issued_evidence(self):
+        """AI-OWNER-01：raw 构造不得得到 trusted owner-issued evidence。
+
+        这是 P1-2 的核心：只要 ``ResearchEvidenceRef`` 能被调用方自由构造，
+        "这是 R24 verified market fact"就只是一句自述，闭集 source 列表与
+        authority 边界都形同虚设。
+        """
+        for attempt in (
+            {"source_type": ARC.EVIDENCE_SOURCE_MARKET_DATA, "source_id": "fake",
+             "as_of": DAY, "verification": MDC.VERIFICATION_VERIFIED,
+             "verification_method": MDC.VERIFICATION_METHOD_CROSS_SOURCE},
+            {"source_type": ARC.EVIDENCE_SOURCE_NEWS, "source_id": "fake",
+             "as_of": DAY, "verification": MDC.VERIFICATION_VERIFIED,
+             "verification_method": MDC.VERIFICATION_METHOD_CROSS_SOURCE},
+            {"source_type": ARC.EVIDENCE_SOURCE_EXECUTION, "source_id": "fake", "as_of": DAY},
+        ):
+            with self.subTest(source_type=attempt["source_type"]):
+                with self.assertRaises(TypeError) as caught:
+                    ARC.ResearchEvidenceRef(**attempt)
+                self.assertIn("owner-issued", str(caught.exception))
+
+        # 没有任何可观测量能让调用方把 raw 值变成 trusted evidence。
+        self.assertFalse(hasattr(ARC, "_OWNER_ISSUED"),
+                         "不得存在可 import 的构造哨兵（那是伪安全）")
+
+    def test_AI_OWNER_02_factory_preserves_owner_identity_asof_and_verification(self):
+        """AI-OWNER-02：真实 owner projection → factory 必须保留全部原值。"""
+        reading = _reading(as_of=DAY)
+        ref = ARC.evidence_ref_from_market_reading(reading, source_id=OWNER_ID)
+        projected = reading.projection()
+
+        self.assertEqual(ARC.EVIDENCE_SOURCE_MARKET_DATA, ref.source_type)
+        self.assertEqual(OWNER_ID, ref.source_id)
+        self.assertEqual(projected["as_of"], ref.as_of)
+        self.assertEqual(projected["verification"], ref.verification)
+        self.assertEqual(projected["verification_method"], ref.verification_method)
+        self.assertEqual(DAY, ref.as_of)
+
+    def test_AI_OWNER_03_single_source_reading_is_never_upgraded_to_verified(self):
+        """AI-OWNER-03：single_source reading 不得变成 verified。"""
+        ref = ARC.evidence_ref_from_market_reading(
+            _reading(MDC.VERIFICATION_SINGLE_SOURCE), source_id=OWNER_ID,
+        )
+        self.assertEqual(MDC.VERIFICATION_SINGLE_SOURCE, ref.verification)
+        self.assertNotEqual(MDC.VERIFICATION_VERIFIED, ref.verification)
+        self.assertFalse(ref.cross_source_verified)
+        self.assertEqual(
+            ARC.HYPOTHESIS_INSUFFICIENT_EVIDENCE, _hypothesis(evidence=(_evidence(ref),)).status,
+        )
+
+    def test_AI_OWNER_04_unprovable_as_of_fails_closed(self):
+        """AI-OWNER-04：无法证明 as_of 的 owner projection 必须 fail closed。"""
+        # 完全没有 snapshot（unavailable）→ 没有可证明的业务日。
+        with self.assertRaises(ValueError):
+            ARC.evidence_ref_from_market_reading(
+                MDC.unavailable_reading(MDC.LIVE_MARKET_POLICY), source_id=OWNER_ID,
+            )
+
+        # duck-typed 对象（带 projection() 但不是 owner 类型）同样拒绝。
+        class FakeReading:
+            def projection(self):
+                return {"as_of": DAY, "verification": MDC.VERIFICATION_VERIFIED,
+                        "verification_method": MDC.VERIFICATION_METHOD_CROSS_SOURCE}
+
+        with self.assertRaises(TypeError) as caught:
+            ARC.evidence_ref_from_market_reading(FakeReading(), source_id=OWNER_ID)
+        self.assertIn("typed owner projection", str(caught.exception))
+
+    def test_AI_OWNER_05_future_owner_projection_cannot_enter_a_historical_hypothesis(self):
+        """AI-OWNER-05：未来的 owner projection 不得进入历史 hypothesis。"""
+        future = ARC.evidence_ref_from_market_reading(
+            _reading(as_of=NEXT_DAY), source_id=OWNER_ID,
+        )
+        with self.assertRaises(ValueError) as caught:
+            _hypothesis(as_of=DAY, evidence=(_evidence(future),))
+        self.assertIn("future evidence", str(caught.exception))
+
+
+# ---------------------------------------------------------------------------
+# AI-17 / AI-18（续）—— 深冻结与投影
+# ---------------------------------------------------------------------------
+
+
+class AiResearchImmutabilityTests(unittest.TestCase):
+    """P2-2：payload / detail 必须**递归**不可变。"""
+
+    def test_AI17_nested_payload_is_deeply_frozen(self):
+        """AI-17：嵌套 dict / list / set 全部冻结，原始输入无法改写已记录内容。"""
+        original = {
+            "nested": {"items": [1, 2], "tags": {"a"}, "inner": {"deep": [3]}},
+            "top": 1,
+        }
+        event = ARC.InformationEvent(
+            as_of=DAY, source="s", evidence_ref=_ref(), payload=original,
+        )
+        ref = ARC.evidence_ref_from_market_reading(
+            _reading(), source_id=OWNER_ID,
+        )
+
+        # 调用方保留的原始对象继续被改写 —— 契约内部值必须不变。
+        original["nested"]["items"].append(9)
+        original["nested"]["new_key"] = "leak"
+        original["nested"]["inner"]["deep"].append(9)
+
+        self.assertEqual((1, 2), event.payload["nested"]["items"])
+        self.assertEqual(("inner", "items", "tags"), tuple(sorted(event.payload["nested"])))
+        self.assertEqual((3,), event.payload["nested"]["inner"]["deep"])
+        self.assertNotIn("new_key", event.payload["nested"])
+
+        # 容器类型被规范化成不可变形态。
+        self.assertIsInstance(event.payload["nested"]["items"], tuple)
+        self.assertIsInstance(event.payload["nested"]["tags"], frozenset)
+        self.assertIsInstance(ref.detail, type(event.payload))
+        self.assertIsInstance(ref.detail["policy"], str)
+
+        # 通过契约对象写入被拒绝。
+        with self.assertRaises(TypeError):
+            event.payload["nested"]["x"] = 1
+        with self.assertRaises(TypeError):
+            event.payload["nested"]["items"] += (4,)
+        with self.assertRaises(TypeError):
+            ref.detail["policy"] = "changed"
+        self.assertEqual(OWNER_ID, ref.source_id)
+
+    def test_AI18_non_json_payload_values_are_rejected(self):
+        """AI-18：只接受 JSON-like 值；任意可变对象 fail closed。"""
+        for bad in (object(), bytearray(b"x"), {"k": object()}, [object()]):
+            with self.subTest(value=type(bad).__name__):
+                with self.assertRaises(TypeError):
+                    ARC.InformationEvent(
+                        as_of=DAY, source="s", evidence_ref=_ref(), payload={"v": bad},
+                    )
+
+        # 标量与 None 是允许的。
+        event = ARC.InformationEvent(
+            as_of=DAY, source="s", evidence_ref=_ref(),
+            payload={"price": 10.5, "flag": True, "note": None, "count": 3, "b": b"x"},
+        )
+        self.assertEqual(10.5, event.payload["price"])
+        self.assertIsNone(event.payload["note"])
+
+    def test_AI19_hypothesis_projection_declares_itself_non_authoritative(self):
+        """AI-19：投影自带"这只是研究"的结论，供下游离线判断。"""
+        hypothesis = _hypothesis(
+            evidence=(_evidence(_ref(), ARC.RELATION_SUPPORTS),), confidence=0.62,
+        )
         projected = hypothesis.projection()
 
         self.assertEqual(ARC.HYPOTHESIS_SUPPORTED, projected["status"])
@@ -401,66 +611,28 @@ class AiResearchContractTests(unittest.TestCase):
         self.assertIs(False, projected["is_authoritative"])
         self.assertIs(False, hypothesis.is_authoritative)
         self.assertEqual(1, projected["evidence_count"])
-        self.assertEqual(DAY, projected["evidence"][0]["as_of"])
+        self.assertEqual(ARC.RELATION_SUPPORTS, projected["evidence"][0]["relation"])
         self.assertEqual(MDC.VERIFICATION_VERIFIED, projected["evidence"][0]["verification"])
+        self.assertEqual(DAY, projected["evidence"][0]["as_of"])
 
-        # 证据不足时，投影如实说出原因，而不是给一个空 status。
-        weak = _hypothesis(refs=()).projection()
+        weak = _hypothesis(evidence=()).projection()
         self.assertEqual(ARC.HYPOTHESIS_INSUFFICIENT_EVIDENCE, weak["status"])
         self.assertEqual(ARC.RESEARCH_REASON_NO_EVIDENCE, weak["reason"])
 
-    def test_AI08_evidence_refs_are_frozen_deduped_and_ai_text_is_not_a_source(self):
-        """AI-08：引用是冻结的、去重的；AI 自产文本**无法**表达成事实来源。"""
-        # 闭集：没有任何 AI 自产类别。
-        for forbidden in ("llm_output", "ai_narrative", "hypothesis", "ai_research", ""):
-            with self.subTest(source_type=forbidden):
-                with self.assertRaises(ValueError):
-                    ARC.ResearchEvidenceRef(
-                        source_type=forbidden, source_id="x", as_of=DAY,
-                    )
-
-        # 重复引用同一条事实不是两份独立证据。
-        duplicated = _hypothesis(refs=(_verified_ref(), _verified_ref()))
-        self.assertEqual(1, len(duplicated.evidence_refs))
-        self.assertEqual(1, duplicated.projection()["evidence_count"])
-
-        # payload / detail 冻结：不可原位改写。
-        ref = _verified_ref()
-        with self.assertRaises(TypeError):
-            ref.detail["mutated"] = 1  # type: ignore[index]
-        event = ARC.InformationEvent(
-            as_of=DAY, source="s", evidence_ref=ref, payload={"a": 1},
+    def test_AI20_research_vocabulary_never_overlaps_the_signal_lifecycle(self):
+        """AI-20：研究词汇与 signal 生命周期不相交 —— 结论无法直接落成 signal。"""
+        signal_lifecycle = {"pending", "approved", "blocked", "waitlist", "recovery"}
+        overlap = set(ARC.HYPOTHESIS_STATUSES) & signal_lifecycle
+        self.assertEqual(
+            set(), overlap,
+            f"研究状态与 paper_signals 生命周期重叠：{sorted(overlap)} —— "
+            "重叠会让 supported 被当作 approved 使用",
         )
-        with self.assertRaises(TypeError):
-            event.payload["mutated"] = 1  # type: ignore[index]
-
-        # 事实必须来自 owner 的投影，且 as-of 不可证明时拒绝构造。
-        reading = MDC.MarketDataReading(
-            availability=MDC.AVAILABILITY_AVAILABLE, freshness=MDC.FRESHNESS_FRESH,
-            status=MDC.STATUS_FRESH, policy_name="live_market",
-            snapshot=MDC.MarketDataSnapshot(
-                kind="symbol_quote", as_of=DAY, observed_at=f"{DAY}T10:30:00+08:00",
-                verification=MDC.VERIFICATION_VERIFIED,
-                verification_method=MDC.VERIFICATION_METHOD_CROSS_SOURCE,
-            ),
-        )
-        mapped = ARC.evidence_ref_from_reading(
-            ARC.EVIDENCE_SOURCE_MARKET_DATA, "LIVE_MARKET_POLICY", reading,
-        )
-        self.assertEqual(DAY, mapped.as_of)
-        self.assertEqual(MDC.VERIFICATION_VERIFIED, mapped.verification)
-        self.assertEqual(MDC.VERIFICATION_METHOD_CROSS_SOURCE, mapped.verification_method)
-
-        # 不可用的 reading 没有可证明的 as-of → 拒绝，而不是造一条"空事实"。
-        unavailable = MDC.unavailable_reading(MDC.LIVE_MARKET_POLICY)
-        with self.assertRaises(ValueError):
-            ARC.evidence_ref_from_reading(
-                ARC.EVIDENCE_SOURCE_MARKET_DATA, "LIVE_MARKET_POLICY", unavailable,
-            )
+        self.assertEqual(set(), set(ARC.HYPOTHESIS_STATUSES) & {"approved", "blocked"})
 
 
 # ---------------------------------------------------------------------------
-# AIG-* —— architecture guard：依赖方向与"AI 不是 authority"
+# AIG-* —— architecture guard
 # ---------------------------------------------------------------------------
 
 
@@ -484,7 +656,7 @@ class AiResearchArchitectureGuardTests(unittest.TestCase):
         )
 
     def test_AIG02_no_authority_module_imports_the_ai_research_layer(self):
-        """AIG-02：现有 authority **不得** import AI 研究层（依赖方向单向）。"""
+        """AIG-02：现有 authority 不得 import AI 研究层（依赖方向单向）。"""
         offenders = []
         for name in AUTHORITY_MODULES:
             for imported in _imported_names(_tree(name)):
@@ -492,12 +664,11 @@ class AiResearchArchitectureGuardTests(unittest.TestCase):
                     offenders.append(f"{name}: import {imported}")
         self.assertEqual(
             [], offenders,
-            "authority 反向 import 了 AI 研究层 —— AI 必须是纯消费者，"
-            "不得成为行情/signal/执行/风控/晋升的依据",
+            "authority 反向 import 了 AI 研究层 —— AI 必须是纯消费者",
         )
 
     def test_AIG03_no_production_module_consumes_the_ai_layer_without_registration(self):
-        """AIG-03：生产链路依赖 AI 层必须**显式登记**（当前为 0）。"""
+        """AIG-03：生产链路依赖 AI 层必须显式登记（当前为 0）。"""
         offenders = []
         for name in sorted(os.listdir(BACKEND)):
             if not name.endswith(".py") or name == CONTRACT_MODULE:
@@ -509,9 +680,8 @@ class AiResearchArchitectureGuardTests(unittest.TestCase):
                     offenders.append(f"{name}: import {imported}")
         self.assertEqual(
             [], offenders,
-            "有生产模块在未登记的情况下 import 了 AI 研究层。"
-            "接入 AI 研究结论必须先把该模块加入 ALLOWED_AI_CONSUMERS，"
-            "使'谁依赖了 AI'成为一次有意识的决定，而不是静默扩散",
+            "有生产模块在未登记的情况下 import 了 AI 研究层。接入必须先把该模块加入 "
+            "ALLOWED_AI_CONSUMERS，使'谁依赖了 AI'成为一次有意识的决定",
         )
 
     def test_AIG04_contract_has_no_io_dependency(self):
@@ -524,7 +694,6 @@ class AiResearchArchitectureGuardTests(unittest.TestCase):
                     f"{CONTRACT_MODULE} import 了 {forbidden} —— 研究契约必须是纯契约",
                 )
 
-        # 也不得出现任何 SQL 文本（它没有账本，也不该有）。
         for text in _code_string_constants(_tree(CONTRACT_MODULE)):
             upper = text.upper()
             for keyword in ("INSERT INTO", "UPDATE ", "DELETE FROM", "SELECT "):
@@ -535,14 +704,14 @@ class AiResearchArchitectureGuardTests(unittest.TestCase):
                     )
 
     def test_AIG05_ai_output_cannot_be_committed_as_a_signal(self):
-        """AIG-05：AI 产物**无法**被当作裁决提交成正式 signal。
+        """AIG-05：AI 产物无法被当作裁决提交成正式 signal。
 
         行为证明，而不是约定：``commit_signal`` 在触碰连接之前就要求一个真正的
-        :class:`signal_service.SignalDecision`，因此把一份研究假设当 decision 传进去
-        会在**任何落库发生前**失败（``conn=None`` 足以验证这一点 —— 校验顺序
-        决定了它先于 ``conn.execute``）。
+        ``SignalDecision``，因此把研究假设（或其投影、或其状态字符串）传进去会在
+        **任何落库发生前**失败（``conn=None`` 足以验证 —— 校验顺序决定了它先于
+        ``conn.execute``）。刻意不修改 ``signal_service`` 来迁就 AI。
         """
-        hypothesis = _hypothesis(refs=(_verified_ref(),))
+        hypothesis = _hypothesis(evidence=(_evidence(_ref()),))
         context = SIG.SignalWriteContext(
             account_id="acct-1", cycle_id=1, strategy_id="strat-1",
             strategy_version=1, strategy_checksum="0" * 64, asof_day=DAY,
@@ -571,8 +740,7 @@ class GuardIsNotVacuouslyPassing(unittest.TestCase):
     """护栏必须真的能失败；否则它只是装饰。"""
 
     def test_import_scanner_fires_on_a_reverse_import(self):
-        tree = ast.parse("import ai_research_contract\n")
-        self.assertIn("ai_research_contract", _imported_roots(tree))
+        self.assertIn("ai_research_contract", _imported_roots(ast.parse("import ai_research_contract\n")))
 
     def test_import_scanner_reads_from_imports_too(self):
         tree = ast.parse("from ai_research_contract import ResearchHypothesis\n")
@@ -592,17 +760,6 @@ class GuardIsNotVacuouslyPassing(unittest.TestCase):
         """文档里解释"禁止 INSERT INTO"不该让守卫变红。"""
         tree = ast.parse('"""Never INSERT INTO paper_signals here."""\nX = 1\n')
         self.assertEqual([], _code_string_constants(tree))
-
-
-#: ``kind`` ↔ ``source_type`` 的期望映射，与被测模块的闭集对齐。
-_KIND_BY_SOURCE = {
-    ARC.EVIDENCE_SOURCE_MARKET_DATA: ARC.EVENT_MARKET_OBSERVED,
-    ARC.EVIDENCE_SOURCE_SIGNAL: ARC.EVENT_SIGNAL_OBSERVED,
-    ARC.EVIDENCE_SOURCE_EXECUTION: ARC.EVENT_EXECUTION_OBSERVED,
-    ARC.EVIDENCE_SOURCE_STRATEGY_RESEARCH: ARC.EVENT_STRATEGY_RESEARCH_OBSERVED,
-    ARC.EVIDENCE_SOURCE_PORTFOLIO_RESEARCH: ARC.EVENT_PORTFOLIO_RESEARCH_OBSERVED,
-    ARC.EVIDENCE_SOURCE_NEWS: ARC.EVENT_NEWS_OBSERVED,
-}
 
 
 if __name__ == "__main__":

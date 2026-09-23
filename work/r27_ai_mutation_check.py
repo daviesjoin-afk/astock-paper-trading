@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""R27-A mutation matrix —— M-AI1..M-AI5。
+"""R27-A mutation matrix —— M-AI1..M-AI6。
 
 只覆盖本轮**新的核心 invariant**。刻意不造几十条，也不扩成通用平台：每条
 mutation 都必须让**唯一指定的永久回归**变 RED，且 anchor 恰好命中一次；
@@ -29,7 +29,6 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BACKEND = os.path.join(ROOT, "backend")
 
 CONTRACT = "backend/ai_research_contract.py"
-RISK = "backend/paper_risk_service.py"
 
 ARC = "test_ai_research_contract"
 
@@ -48,70 +47,107 @@ MUTATIONS = [
         "old": "        if self.look_ahead_refs:\n",
         "new": "        if False:\n",
         "test": _arc(
-            "AiResearchContractTests."
+            "AiResearchFactTests."
             "test_AI03_hypothesis_referencing_future_evidence_is_rejected"
         ),
         "desc": "future-evidence check 被移除（历史假设可引用未来事实）",
     },
     {
         "id": "M-AI2",
-        # 单源证据被乐观升级为 supporting：`single_source` 在 standing 映射里
-        # 被当成 `verified`。于是"只有单源、没通过核验"的事实也能支撑结论 ——
-        # 正是 §五 禁止的 unverified → verified 自动升级。
+        # 把"未经核验"当成"通过核验"：is_verified 恒为 True。
+        # 于是 single_source / not_attempted 的 supports 也能让假设 supported ——
+        # P1-1 那一类"事实可信度被凭空抬高"的回归。
         "file": CONTRACT,
-        "old": "    MDC.VERIFICATION_SINGLE_SOURCE: STANDING_DEGRADED,\n",
-        "new": "    MDC.VERIFICATION_SINGLE_SOURCE: STANDING_SUPPORTING,\n",
-        "test": _arc(
-            "AiResearchContractTests."
-            "test_AI02_stale_or_unverified_evidence_keeps_its_original_state"
+        "old": (
+            "    def is_verified(self) -> bool:\n"
+            "        \"\"\"这条事实本身是否通过 owner 的核验（fact level）。\"\"\"\n"
+            "        return self.ref.verification == MDC.VERIFICATION_VERIFIED\n"
         ),
-        "desc": "单源证据被升级成 supporting（unverified → verified）",
+        "new": (
+            "    def is_verified(self) -> bool:\n"
+            "        \"\"\"这条事实本身是否通过 owner 的核验（fact level）。\"\"\"\n"
+            "        return True\n"
+        ),
+        "test": _arc(
+            "AiResearchRelationTests."
+            "test_AI12_unverified_fact_with_supports_is_insufficient"
+        ),
+        "desc": "未核验事实被当作已核验（unverified + supports → supported）",
     },
     {
         "id": "M-AI3",
-        # 允许空证据假设：没有 evidence 也返回 `supported` —— 默认批准。
-        # §五 明令："如果 evidence 不足，不要默认批准。"
+        # 把 relation 从"显式声明"退化成"由 verification 决定"：
+        # 校验时把任何 relation 强制重写成 supports。这正是 P1 禁止的语义绑定 ——
+        # verified 只能回答"事实是否可信"，不能回答"是否支持 thesis"。
         "file": CONTRACT,
-        "old": (
-            "    if not evidence_refs:\n"
-            "        return HYPOTHESIS_INSUFFICIENT_EVIDENCE, RESEARCH_REASON_NO_EVIDENCE\n"
-        ),
-        "new": (
-            "    if not evidence_refs:\n"
-            "        return HYPOTHESIS_SUPPORTED, None\n"
-        ),
+        "old": "        object.__setattr__(self, \"relation\", relation)\n",
+        "new": "        object.__setattr__(self, \"relation\", RELATION_SUPPORTS)\n",
         "test": _arc(
-            "AiResearchContractTests."
-            "test_AI04_hypothesis_without_evidence_is_insufficient_not_approved"
+            "AiResearchRelationTests."
+            "test_AI09_verified_fact_with_context_relation_is_not_supported"
         ),
-        "desc": "空证据假设被默认批准（insufficient_evidence → supported）",
+        "desc": "relation 被强制成 supports（verified 事实自动支持 thesis）",
     },
     {
         "id": "M-AI4",
-        # authority 反向 import AI 研究层：风控服务把 AI 研究契约当成依赖。
-        # §六 明令禁止 —— AI 必须是纯消费者，不得反向进入现有 authority。
-        "file": RISK,
-        "old": "import execution_planner as EP\n",
-        "new": "import ai_research_contract as ARC\nimport execution_planner as EP\n",
-        "test": _arc(
-            "AiResearchArchitectureGuardTests."
-            "test_AIG02_no_authority_module_imports_the_ai_research_layer"
+        # 重新打开 raw 构造入口：ResearchEvidenceRef(...) 不再抛错。
+        # 调用方于是可以仅凭传字符串伪造一条"R24 verified market fact" ——
+        # P1-2 的 authority spoofing 回归。
+        "file": CONTRACT,
+        "old": (
+            "    def __init__(self, *args: Any, **kwargs: Any) -> None:\n"
+            "        raise TypeError(\n"
         ),
-        "desc": "authority（paper_risk_service）反向 import AI 研究层",
+        "new": (
+            "    def __init__(self, *args: Any, **kwargs: Any) -> None:\n"
+            "        if False:\n"
+            "            raise TypeError(\n"
+        ),
+        "test": _arc(
+            "AiResearchOwnerIssuedTests."
+            "test_AI_OWNER_01_raw_caller_cannot_forge_owner_issued_evidence"
+        ),
+        "desc": "raw caller 可伪造 owner-issued evidence（authority spoof）",
     },
     {
         "id": "M-AI5",
-        # 给 evidence source 闭集加一个 AI 自产类别：AI 自己的文本于是变成了
-        # 可引用的"事实来源"。这是让数据冒充另一类 authority 的起点，也是
-        # §52 的核心禁止项。
+        # 冲突检测退化为 first-wins：不再比较同一 identity 的事实状态。
+        # 于是一条 verified 后跟一条 disagreement 会产生 supported，
+        # 反过来则 unsupported —— 研究结论依赖 collection order。
         "file": CONTRACT,
-        "old": "    EVIDENCE_SOURCE_NEWS,\n)\n",
-        "new": "    EVIDENCE_SOURCE_NEWS, \"llm_output\",\n)\n",
-        "test": _arc(
-            "AiResearchContractTests."
-            "test_AI08_evidence_refs_are_frozen_deduped_and_ai_text_is_not_a_source"
+        "old": (
+            "        states = [entry.ref.fact_state() for entry in group]\n"
+            "        if any(state != states[0] for state in states):\n"
         ),
-        "desc": "AI 自产文本被加入 evidence source 闭集（AI 输出冒充事实）",
+        "new": (
+            "        states = [entry.ref.fact_state() for entry in group]\n"
+            "        if False:\n"
+        ),
+        "test": _arc(
+            "AiResearchRelationTests."
+            "test_AI14_conflicting_duplicate_evidence_fails_closed_order_independently"
+        ),
+        "desc": "冲突 duplicate 退化为 first-wins（结果依赖输入顺序）",
+    },
+    {
+        "id": "M-AI6",
+        # deep freeze 退回浅冻结：嵌套 dict / list 仍可被外部改写。
+        # 调用方保留的原始对象于是能篡改"已冻结"的研究内容。
+        "file": CONTRACT,
+        "old": (
+            "    if isinstance(value, Mapping):\n"
+            "        return MappingProxyType(\n"
+            "            {key: _deep_freeze(item, what=what) for key, item in value.items()}\n"
+            "        )\n"
+        ),
+        "new": (
+            "    if isinstance(value, Mapping):\n"
+            "        return MappingProxyType(dict(value))\n"
+        ),
+        "test": _arc(
+            "AiResearchImmutabilityTests.test_AI17_nested_payload_is_deeply_frozen"
+        ),
+        "desc": "deep freeze 退回浅冻结（嵌套 payload 可被外部改写）",
     },
 ]
 

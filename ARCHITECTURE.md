@@ -903,11 +903,15 @@ prompt 管理、agent framework、vector DB 与 RAG。
 
 ```text
 R24 Market Data Reading ─┐
-R25 Signal Evidence      ├─→ ai_research_contract ─→ research / advisory / hypothesis
-R26 Execution Evidence   │        （只读、纯契约）        ✗ pending signal
-历史 strategy/portfolio ─┘                               ✗ paper_orders / paper_fills
-                                                          ✗ risk decision
-                                                          ✗ strategy promotion
+R25 Signal Evidence      ├─→ owner-issued evidence ref ─→ explicit hypothesis relation
+R26 Execution Evidence   │        （只读、纯契约）              │
+历史 strategy/portfolio ─┘                                     ↓
+                                                       ResearchHypothesis
+                                                       research / advisory only
+                                                       ✗ pending signal
+                                                       ✗ paper_orders / paper_fills
+                                                       ✗ risk decision
+                                                       ✗ strategy promotion
 ```
 
 `ai_research_contract` **只** import `market_data_contract`（R24 纯契约）与标准库。
@@ -917,31 +921,88 @@ DB、网络、时钟、随机数或任何 LLM SDK 模块。依赖方向单向：
 先把模块登记进 `ALLOWED_AI_CONSUMERS`（当前为空），使"谁依赖了 AI"是一次有意识的
 决定而不是静默扩散。
 
-### 三个概念（刻意只有三个）
+### 两个正交维度（本契约的核心）
+
+```text
+fact verification    事实 owner 回答："这条事实是否通过它自己那套核验？"
+hypothesis relation  research reasoning 显式声明："它对当前 thesis 是 supports /
+                     contradicts / context？"
+```
+
+两者必须分开，且本契约**不做**语义绑定：
+
+```text
+✗ verification=verified  →  relation=supports     （verified 事实自动支持 thesis）
+✗ disagreement/unavailable →  thesis 被反驳        （只说明 evidence 本身不可靠）
+```
+
+一条 cross-source verified 的报价只说明"这个价格事实可信"。它可能是
+`relation=context`，对"下一交易日 momentum 会继续"毫无支撑。同理 provider
+disagreement / unavailable 只说明**这条 evidence 不能成为可靠依据**，不等于
+"thesis 被可信事实反驳" —— 后者才是 `unsupported`。
+
+relation 是最小闭集（`supports` / `contradicts` / `context`），刻意不含
+strong/weak/uncertain 等评分档位：本轮不做评分模型，也没有 `quality_score` /
+`weighted_support` / Bayesian 合并。
+
+### 四个概念
 
 | 概念 | 回答的问题 | 关键约束 |
 | --- | --- | --- |
 | `InformationEvent` | AI 看到了什么事实？ | `kind` 由 `evidence_ref.source_type` **派生**，错标无法表达 |
-| `ResearchEvidenceRef` | 事实来自谁、哪一天、核验到什么程度？ | `source_type` 是闭集；`as_of` 必填；`verification` 逐字来自 owner |
-| `ResearchHypothesis` | 基于这些事实提出了什么假设？ | `status` **派生**；`is_authoritative` 恒为 `False` |
+| `ResearchEvidenceRef` | 事实来自谁、哪一天、owner 的核验结论是什么？ | **无公开 raw 构造器**；只能由 owner factory 签发 |
+| `HypothesisEvidence` | 这条事实对 thesis 是什么关系？ | `relation` 显式传入，**不**从 verification 派生 |
+| `ResearchHypothesis` | 基于这些证据提出了什么假设？ | `status` **派生**；`is_authoritative` 恒为 `False` |
 
 `status` / `kind` / `is_authoritative` 都是派生只读属性，**不是**可传参数：若
 `status` 可以由调用方给出，那么"给一个没有证据的假设贴上 `supported`"就只是一个
 关键字参数 —— 这正是本轮要根除的默认批准。
 
-### 证据强度与 PIT
+### owner-issued evidence
 
-证据对结论的方向由 R24 verification **派生**，不合成质量分数：
+唯一公开签发入口是 `evidence_ref_from_market_reading(reading, source_id=...)`，
+它要求一个真正的 `market_data_contract.MarketDataReading` 并从中逐字复制核验维度。
+`ResearchEvidenceRef(...)` 一律抛 `TypeError`（没有可 import 的哨兵，也没有
+`issued=True` 之类的开关 —— 那种"标记位"呼叫方一样能写）。
+
+因此调用方**无法仅凭传字符串**把自己声明成"R24 verified market fact"，
+`single_source` 也不可能在签发时变成 `verified`。`as_of` 只取自 owner 投影，
+调用方不能覆盖。
+
+诚实声明这一层的强度：这是**类型层构造边界**，不是密码学封印 —— Python 无法阻止
+有人 `object.__new__` 或伪造一个 reading。它保证的是：AI 代码里**不再出现自由形式
+的核验字符串**，任何 AI 事实都必须由一个 owner 类型对象承载。
+
+当前 `SUPPORTED_OWNER_ADAPTERS` **只有 market_data**。signal / execution / news 等
+仍在 `EVIDENCE_SOURCE_TYPES` 闭集里作为已声明的未来来源，但没有 factory 可以签发 ——
+少支持一个 source 好过允许伪造一个 authority。
+
+### 证据集合：去重与冲突
+
+identity 是 `(source_type, source_id, as_of)`。
 
 ```text
-verified                              → supporting
-single_source / not_attempted         → degraded      （不足以支撑结论）
-disagreement / unavailable            → rejecting     （证据反对结论）
+完全相同（含 detail）            → 安全去重
+同 identity 但事实状态不同        → EvidenceConflict
+同一条 evidence 同时两种 relation → EvidenceRelationConflict
 ```
 
-假设状态由证据推出：无证据 → `insufficient_evidence`；有反对证据 → `unsupported`
-（核验源不可用与多源否证记不同 reason）；至少一条 `supporting` 且无反对 →
-`supported`。
+两种冲突都**与顺序无关**（先按 identity 分组再判定）：`[A, B]` 与 `[B, A]` 必然
+同一结果。first-wins 会让研究结论依赖 collection order，而顺序不是业务语义。
+刻意不做"保守合并"：fail closed 更清楚。
+
+### 假设状态
+
+```text
+无 evidence                          → insufficient_evidence / no_evidence
+有 verified contradicts              → unsupported / evidence_contradicted
+有 verified supports 且无 contradicts → supported
+只有 context / 未验证 supports        → insufficient_evidence / evidence_not_verified
+只有 unavailable / disagreement      → insufficient_evidence / evidence_unavailable
+```
+
+注意末两行：来源不可用**不是** `unsupported` —— 它只让证据不足以判断。这与
+"可信事实反对结论"是两个结论，因此 reason 也不同。
 
 - `confidence` 是 AI 的自评，**不参与** status 判定 —— 参与就会得到"越自信越强"的环路。
 - 研究词汇（`supported` / `insufficient_evidence` / `unsupported`）与
@@ -952,6 +1013,15 @@ disagreement / unavailable            → rejecting     （证据反对结论）
   任一证据 `as_of` 晚于假设日即**拒绝构造**（不静默过滤，否则会掩盖"用未来信息
   解释过去"本身）。
 - 缺失即缺失：没有可引用的证据 → `insufficient_evidence`，绝不默认 `supported`。
+- payload / detail **递归冻结**（Mapping → MappingProxyType、list → tuple、
+  set → frozenset）；非 JSON-like 值（任意可变对象）fail closed。只做浅冻结会让
+  调用方保留的原始对象继续改写"已冻结"的研究内容。
+
+### freshness 不参与
+
+本契约只引用 R24 的 `verification`，**不**引用 freshness。freshness 回答"对当前时间
+是否仍新鲜"，与"来源是否经过核验"是两个维度，本层不把它们压成 `trusted=True`，
+也不发明 AI quality score。
 
 ### 持久化范围
 
@@ -961,10 +1031,11 @@ hypothesis / research-ledger owner，为这个 PR 新建一套 AI 数据库体�
 
 ### 回归门禁
 
-`backend/test_ai_research_contract.py`（AI-01 ~ AI-08 契约语义、AIG-01 ~ AIG-06
-架构 guard、`GuardIsNotVacuouslyPassing` 非空性）；语义 mutation 在
-`work/r27_ai_mutation_check.py`：去掉 future-evidence check、单源升级为 supporting、
-空证据默认批准、authority 反向 import、AI 文本进入证据闭集，必须全部 CAUGHT
+`backend/test_ai_research_contract.py`（AI-01 ~ AI-20 契约语义、AI-OWNER-01 ~ 05
+owner-issued 边界、AIG-01 ~ AIG-06 架构 guard、`GuardIsNotVacuouslyPassing` 非空性）；
+语义 mutation 在 `work/r27_ai_mutation_check.py`：去掉 future-evidence check、
+未核验事实当作已核验、relation 强制成 supports、raw 伪造 owner evidence、
+冲突 duplicate first-wins、deep freeze 退回浅冻结，必须全部 CAUGHT
 （survived = 0、fake = 0）。
 
 ## 目标依赖方向
