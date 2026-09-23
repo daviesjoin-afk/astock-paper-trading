@@ -67,8 +67,13 @@ from paper_portfolio_read_model import (  # noqa: E402
 REPO_ROOT = os.path.dirname(BACKEND)
 
 #: **Previous Version**：本轮目标 release 之前最近一个正式受支持 release。
-#: 它必须存在于仓库标签里，且是当前 master 的祖先（测试会断言这两点）。
 PREVIOUS_RELEASE_TAG = "v2.0.0"
+#: 该 release 的 commit，写在 fixture 头部作为来源凭证。
+PREVIOUS_RELEASE_COMMIT = "cbb1863b8d3cc1f07e52dfe9b99a360494f53be4"
+#: 上一版本真实 schema 的逐字摘录。
+PREVIOUS_RELEASE_SCHEMA_FIXTURE = os.path.join(
+    BACKEND, "fixtures", f"previous_release_{PREVIOUS_RELEASE_TAG}_schema.sql",
+)
 
 DAY = "2026-09-01"
 ACCOUNT = "tq_breakout"
@@ -83,48 +88,116 @@ def _git(*args):
     return result.returncode, (result.stdout or "").strip(), (result.stderr or "").strip()
 
 
-def _previous_release_ddl():
-    """取出上一版本 ``init_db`` 里那段 ``CREATE TABLE`` DDL（真实来源，非手抄）。
+def _extract_ddl(source):
+    """从上一版本 ``paper_trading.py`` 里取出 ``init_db`` 的 ``CREATE TABLE`` DDL 块。
 
-    直接读 tag 里的文件，而不是把 schema 抄进测试：抄写会随时间漂移，而这条 gate
-    的全部价值就在于 fixture 必须**真的**是上一版本产生的形状。
-
-    边界取该 ``executescript`` 字符串字面量的结尾，而不是第一个 ``def`` ——
-    DDL 块之后紧跟着的仍是同一个函数里的 Python 代码。
+    该 DDL 是被三引号包裹的字符串字面量；结束行是该字面量的收尾引号。
     """
-    code, source, err = _git("show", f"{PREVIOUS_RELEASE_TAG}:backend/paper_trading.py")
-    if code != 0:
-        return None, f"无法读取 {PREVIOUS_RELEASE_TAG}:backend/paper_trading.py: {err}"
     marker = "CREATE TABLE IF NOT EXISTS paper_accounts"
     start = source.find(marker)
     if start < 0:
-        return None, f"{PREVIOUS_RELEASE_TAG} 的 init_db DDL 未找到"
-    # 该 DDL 是被三引号包裹的字符串字面量；结束行是收尾引号（行首无缩进）。
-    terminator = '\n"""\n'
-    end = source.find(terminator, start)
+        return None
+    end = source.find('\n"""\n', start)
     if end < 0:
-        return None, f"{PREVIOUS_RELEASE_TAG} 的 DDL 结束边界未找到"
-    return source[start:end], None
+        return None
+    return source[start:end]
+
+
+def _live_release_ddl():
+    """从 release tag 读取上一版本的 DDL；tag 不可解析时返回 ``None``。
+
+    CI 的 actions/checkout 默认浅克隆且 ``--no-tags``，测试进程里解析不到 tag，
+    所以这条路径**可选**：fixture 文件才是常规来源，这里是防漂移的交叉校验。
+    """
+    code, source, _err = _git("show", f"{PREVIOUS_RELEASE_TAG}:backend/paper_trading.py")
+    if code != 0:
+        return None
+    return _extract_ddl(source)
+
+
+def _fixture_ddl():
+    """读取随仓库提交的上一版本 schema fixture（去掉来源注释头）。
+
+    fixture 必须真的**是**上一版本产生的形状，所以它逐字摘录自 release 的
+    ``init_db`` DDL，并在头部标注来源 commit；测试会断言这份摘录可执行、且
+    （tag 可解析时）与 live tag 逐字一致。
+
+    只剥掉开头那一段来源说明注释（连续注释行直到第一个非注释行），**保留** DDL
+    内部原有的 SQL 注释 —— 它们也是上一版本形状的一部分。
+    """
+    with open(PREVIOUS_RELEASE_SCHEMA_FIXTURE, encoding="utf-8") as handle:
+        lines = handle.read().splitlines()
+    body_start = 0
+    for index, line in enumerate(lines):
+        if line.strip() and not line.lstrip().startswith("--"):
+            body_start = index
+            break
+    return "\n".join(lines[body_start:]).strip("\n")
 
 
 class PreviousReleaseFixtureTests(unittest.TestCase):
-    """先证明"上一版本"这个前提本身成立，再谈兼容性。"""
+    """先证明"上一版本"这个前提本身成立，再谈兼容性。
 
-    def test_previous_release_tag_exists(self):
-        code, _out, err = _git("rev-parse", f"{PREVIOUS_RELEASE_TAG}^{{commit}}")
+    常规路径读**随仓库提交的 fixture**（CI 浅克隆解析不到 tag）；只要 tag 可解析
+    （本地或完整检出），就额外逐字比对 live tag，防止 fixture 摘录悄悄漂移。
+    """
+
+    def test_fixture_declares_a_real_release_source(self):
+        with open(PREVIOUS_RELEASE_SCHEMA_FIXTURE, encoding="utf-8") as handle:
+            head = handle.read(1200)
+        self.assertIn(PREVIOUS_RELEASE_TAG, head)
+        self.assertIn(PREVIOUS_RELEASE_COMMIT, head, "fixture 必须标注来源 commit")
+
+    def test_fixture_is_executable_and_creates_the_previous_version_tables(self):
+        ddl = _fixture_ddl()
+        conn = sqlite3.connect(":memory:")
+        try:
+            conn.executescript(ddl)
+            tables = {
+                row[0] for row in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                )
+            }
+        finally:
+            conn.close()
+        for table in ("paper_accounts", "paper_orders", "paper_fills",
+                      "paper_position_lots", "paper_cycles", "paper_archives"):
+            self.assertIn(table, tables, f"fixture 缺少上一版本的 {table}")
+
+    def test_fixture_records_the_previous_version_shape(self):
+        """上一版本的形状必须与 R26 之后**不同**，否则这条 gate 是空转。"""
+        ddl = _fixture_ddl()
+        # R26 新增的列在上一版本里不存在 —— 这正是需要迁移的原因。
+        for absent in ("source_fill_id", "filled_qty", "execution_asof",
+                       "pricing_basis", "ruleset_version", "event_key"):
+            self.assertNotIn(
+                absent, ddl,
+                f"{absent} 出现在上一版本 DDL 里：fixture 取错了版本，gate 会空转",
+            )
+
+    def test_fixture_matches_the_live_release_tag_when_available(self):
+        """tag 可解析时逐字比对，防止 fixture 摘录漂移。"""
+        live = _live_release_ddl()
+        if live is None:
+            self.skipTest(
+                f"{PREVIOUS_RELEASE_TAG} 在当前检出里不可解析（CI 浅克隆 / --no-tags）；"
+                "fixture 的权威来源是其头部标注的 commit",
+            )
         self.assertEqual(
-            0, code,
-            f"找不到上一正式 release 标签 {PREVIOUS_RELEASE_TAG}（{err}）。"
-            "兼容性 gate 必须绑定真实 release，而不是 PR/commit/schema number。",
+            live.strip("\n"), _fixture_ddl().strip("\n"),
+            f"fixture 与 {PREVIOUS_RELEASE_TAG} 的 init_db DDL 不一致：请按头部说明重新生成",
         )
 
-    def test_previous_release_is_an_ancestor_of_the_current_line(self):
+    def test_previous_release_commit_is_an_ancestor_of_the_current_line(self):
+        """上一版本必须真的在我们这条线上（用 commit，而不是 tag 名）。"""
         code, _out, _err = _git(
-            "merge-base", "--is-ancestor", PREVIOUS_RELEASE_TAG, "HEAD",
+            "merge-base", "--is-ancestor", PREVIOUS_RELEASE_COMMIT, "HEAD",
         )
+        if code == 128:
+            self.skipTest("当前检出缺少该 commit（浅克隆）；本地/完整检出会执行此断言")
         self.assertEqual(
             0, code,
-            f"{PREVIOUS_RELEASE_TAG} 不是当前分支的祖先：它就不是我们的上一版本",
+            f"{PREVIOUS_RELEASE_COMMIT}（{PREVIOUS_RELEASE_TAG}）不是当前分支的祖先",
         )
 
 
@@ -144,12 +217,10 @@ class PreviousVersionUpgradeTests(unittest.TestCase):
     # ---------- fixture：由上一版本 DDL 建库 ----------
 
     def _create_previous_version_db(self):
-        ddl, error = _previous_release_ddl()
-        if ddl is None:
-            self.skipTest(error)
+        """用**上一版本真实 DDL** 建库（fixture 逐字摘录自 release commit）。"""
         conn = sqlite3.connect(self.db_path)
         conn.row_factory = sqlite3.Row
-        conn.executescript(ddl)
+        conn.executescript(_fixture_ddl())
         conn.commit()
         return conn
 
