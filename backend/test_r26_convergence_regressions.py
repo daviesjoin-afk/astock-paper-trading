@@ -26,7 +26,6 @@ if BACKEND not in sys.path:
     sys.path.insert(0, BACKEND)
 
 import execution_verification as EV  # noqa: E402
-import paper_archive_projection as PAP  # noqa: E402
 import paper_trading as PT  # noqa: E402
 
 DAY = "2026-09-08"
@@ -455,7 +454,7 @@ class CumulativeLiquidityConsumptionTests(_LedgerTestCase):
         order_id = self._order(side="buy", qty=3000, status="filled", filled=3000)
         self._fill(order_id, qty=3000, quote_at=f"{DAY} 10:00:00")
         # 另一个 symbol 不参与本 symbol 的额度。
-        other = self.conn.execute(
+        self.conn.execute(
             "INSERT INTO paper_fills(order_id,account_id,side,code,qty,price,amount,"
             "fees,fill_date,quote_at,assumption) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
             (order_id, ACCOUNT, "buy", "600902", 9999, 10.0, 99990.0, 1.0, DAY,
