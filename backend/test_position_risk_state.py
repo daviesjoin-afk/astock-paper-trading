@@ -32,6 +32,7 @@ import os
 import sqlite3
 import sys
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest import mock
 
@@ -57,6 +58,35 @@ OVERRIDE = {
     "hold_min": 0,
     "hold_max": 15,
 }
+
+
+def _approved_execution_facts(day, side, qty, price):
+    """Explicit trusted facts for ledger-focused commit_fill characterization tests."""
+    day_text = day.isoformat() if isinstance(day, dt.date) else str(day)[:10]
+    observed = f"{day_text}T10:00:00+08:00"
+    quote = {
+        "price": float(price), "amount": 10000000.0,
+        "quote_at": observed, "execution_asof": observed,
+        "quote_source": "live", "quote_validation": "cross_source_checked",
+    }
+    reading = EP.market_reading_for_execution(
+        quote, asof_day=day_text, execution_asof=observed,
+    )
+    tradability = SimpleNamespace(
+        evidence_present=True, can_buy=True, can_sell=True,
+        buy_block_reason=None, sell_block_reason=None,
+        to_dict=lambda: {
+            "evidence_present": True, "can_buy": True, "can_sell": True,
+            "source": "unit_test_injection",
+        },
+    )
+    return quote, EP.ExecutionContext(
+        session_date=day_text, execution_asof=observed, quote=quote,
+        market_reading=reading, tradability=tradability,
+        session_phase="continuous_morning", available_liquidity=max(1, int(qty)) * 100,
+        sellable_quantity=int(qty) if side == "sell" else None,
+        buying_power=1_000_000_000.0 if side == "buy" else None,
+    )
 #: 现价 12.9 / 成本 10：若 peak 被陈旧值 13.75 污染 → 回撤 6.2% ≥ 5% 触发
 #: 移动止损；fail-safe 成本锚下 peak=12.9（吸收当日 high）→ 回撤 0。
 QUOTE_PEAK_TRAP = {"price": 12.9, "high": 12.9, "pct": 5.0}
@@ -787,13 +817,17 @@ class ProductionSellPathClosesEpisode(_LedgerCase):
         return int(cur.lastrowid)
 
     def commit_sell(self, order_id, qty, *, price=13.0, day="2026-09-05"):
+        execution_quote, execution_context = _approved_execution_facts(day, "sell", qty, price)
         with mock.patch.object(PT, "_completed_kline", return_value=None):
             return EP.commit_fill(
                 self.conn, account={"id": ACCOUNT},
                 plan={"side": "sell", "code": CODE, "qty": qty, "fill_price": price,
-                      "amount": qty * price, "fees": 5.0, "quote_at": None, "risk": {}},
+                      "amount": qty * price, "fees": 5.0,
+                      "quote_at": execution_quote["quote_at"],
+                      "execution_quote": execution_quote, "risk": {}},
                 order_id=order_id, asof_day=dt.date.fromisoformat(day),
                 reserved=True, action="manual_filled", reason="测试手动卖出",
+                execution_context=execution_context,
             )
 
     def remaining_lots(self):
@@ -879,20 +913,26 @@ class ProductionSellPathClosesEpisode(_LedgerCase):
         )
         order = int(cur.lastrowid)
         self.conn.commit()
+        execution_quote, execution_context = _approved_execution_facts(
+            "2026-09-05", "buy", 100, 10.0,
+        )
 
         with mock.patch.object(PT, "_completed_kline", return_value=None):
             EP.commit_fill(
                 self.conn, account={"id": ACCOUNT},
                 plan={"side": "buy", "code": CODE, "qty": 100, "fill_price": 10.0,
-                      "amount": 1000.0, "fees": 5.0, "quote_at": None, "risk": {}},
-                order_id=order, asof_day=dt.date.fromisoformat("2026-09-01"),
-                reserved=True, action="manual_filled", reason="测试手动买入",
+                      "amount": 1000.0, "fees": 5.0,
+                      "quote_at": execution_quote["quote_at"],
+                      "execution_quote": execution_quote, "risk": {}},
+                order_id=order, asof_day=dt.date.fromisoformat("2026-09-05"),
+                reserved=False, action="manual_filled", reason="测试手动买入",
+                execution_context=execution_context,
             )
         self.conn.commit()
 
         row = self.state_row(self.cycle1)
         self.assertIsNotNone(row, "verified BUY 未建立 episode 状态")
-        self.assertAlmostEqual(float(row["peak_price"]), 10.0)
+        self.assertAlmostEqual(float(row["peak_price"]), 10.01)
         self.assertEqual(int(row["take_stage"]), 0)
         self.assertEqual(int(row["opened_order_id"]), order,
                          "episode 出处不是本笔 verified 买单")
@@ -994,14 +1034,27 @@ class IntradaySellClosesEpisode(_ProductionRiskScanCase):
 
     def _set_t_sell_quote(self, *, price=11.0, high=11.5, prev_close=11.0):
         """构造通过做T卖点门槛的行情：峰值 4.5%↑ + 回撤 4.3% + 收益 10%。"""
+        quote_at = f"{self.day.isoformat()} 10:30:00"
         self._inner.quotes_map[self.code] = {
             "code": self.code, "name": f"测试股_{self.code}", "price": price,
             "high": high, "low": round(price - 0.2, 4), "pct": 0.0,
-            "prev_close": prev_close, "amount": 100000.0, "volume": 10000.0,
+            "prev_close": prev_close, "amount": 10000000.0, "volume": 10000.0,
             "turnover": 1.0, "quote_source": "live",
-            "quote_at": f"{self.day.isoformat()} 10:30:00",
+            "quote_at": quote_at, "execution_asof": quote_at,
             "quote_validation": "cross_source_checked",
         }
+        import tradability_archive as TA
+        with PT._db(immediate=True) as conn:
+            TA.ensure_schema(conn)
+            TA.TradabilityArchiveRepository(conn).save(TA.TradabilityEvidence(
+                code=self.code, session_date=self.day.isoformat(), is_listed=True,
+                listing_date="2000-01-01", delisting_date=None, is_st=False,
+                is_suspended=False, suspension_reason=None, has_market_quote=True,
+                has_trade_volume=True, is_price_limit_locked=False,
+                price_limit_direction=None, source="unit_test_injection",
+                observed_at=f"{self.day.isoformat()}T08:50:00+08:00",
+                effective_at=f"{self.day.isoformat()}T09:00:00+08:00",
+            ))
 
     def _drive(self):
         """驱动真实生产入口 ``_intraday_sell``（非 opening_event 分支）。"""

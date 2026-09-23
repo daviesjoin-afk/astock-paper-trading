@@ -186,3 +186,41 @@ def finish_capital_reservation(conn, order_key, status, *, now_fn):
            WHERE order_key=? AND status='reserved'""",
         (status, now_fn(), str(order_key)),
     )
+
+
+def consume_capital_reservation_amount(
+    conn, order_key, amount, fees=0.0, *, num_fn, now_fn, final=False,
+):
+    """Consume one execution event while retaining a partial order's remainder."""
+    key = str(order_key)
+    row = _query_one(
+        conn,
+        "SELECT amount,fees,status FROM paper_capital_reservations WHERE order_key=?",
+        (key,),
+    )
+    if row is None or row.get("status") != "reserved":
+        raise RuntimeError("缺少有效的买入资金预占，拒绝成交")
+    raw_remaining_amount = num_fn(row.get("amount")) - num_fn(amount)
+    raw_remaining_fees = num_fn(row.get("fees")) - num_fn(fees)
+    if raw_remaining_amount < -1e-6 or raw_remaining_fees < -1e-6:
+        raise RuntimeError("成交金额超过该订单的剩余资金预占")
+    remaining_amount = max(0.0, raw_remaining_amount)
+    remaining_fees = max(0.0, raw_remaining_fees)
+    if final or remaining_amount + remaining_fees <= 0.01:
+        conn.execute(
+            """UPDATE paper_capital_reservations
+                  SET amount=0,fees=0,status='consumed',released_at=?
+                WHERE order_key=? AND status='reserved'""",
+            (now_fn(), key),
+        )
+        return {"status": "consumed", "amount": 0.0, "fees": 0.0}
+    conn.execute(
+        """UPDATE paper_capital_reservations
+              SET amount=?,fees=?,released_at=NULL
+            WHERE order_key=? AND status='reserved'""",
+        (round(remaining_amount, 2), round(remaining_fees, 2), key),
+    )
+    return {
+        "status": "reserved", "amount": round(remaining_amount, 2),
+        "fees": round(remaining_fees, 2),
+    }

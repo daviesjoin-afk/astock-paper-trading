@@ -20,6 +20,7 @@ import os
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 BACKEND_DIR = os.path.dirname(os.path.abspath(__file__))
 if BACKEND_DIR not in sys.path:
@@ -27,6 +28,7 @@ if BACKEND_DIR not in sys.path:
 
 import execution_verification as EV  # noqa: E402
 import paper_trading as PT  # noqa: E402
+import tradability_archive as TA  # noqa: E402
 from test_production_path_golden_replay import (  # noqa: E402
     ProductionPathGoldenReplayTests,
 )
@@ -202,13 +204,29 @@ class IntradaySellStampTests(unittest.TestCase):
             # 行情必须带当日源时间戳并通过校验（生产口径），否则连卖点都进不去。
             quote = {
                 "code": self.code, "price": 11.0, "prev_close": 10.0, "high": 11.5,
-                "low": 10.2, "pct": -0.3, "quote_source": "live", "quote_at": PT._now(),
+                "low": 10.2, "pct": -0.3, "quote_source": "live",
+                "quote_at": f"{self.today.isoformat()} 10:00:00",
+                "execution_asof": f"{self.today.isoformat()} 10:00:00",
+                "amount": 10000000.0, "volume": 1000000.0,
                 "quote_validation": "cross_source_checked",
             }
-            result, reason = PT._intraday_sell(
-                conn, account, position, quote, self.today,
-                {"min_cost_edge": 0.012}, cycle,
-            )
+            TA.ensure_schema(conn)
+            TA.TradabilityArchiveRepository(conn).save(TA.TradabilityEvidence(
+                code=self.code, session_date=self.today.isoformat(), is_listed=True,
+                listing_date="2000-01-01", delisting_date=None, is_st=False,
+                is_suspended=False, suspension_reason=None, has_market_quote=True,
+                has_trade_volume=True, is_price_limit_locked=False,
+                price_limit_direction=None, source="unit_test_injection",
+                observed_at=f"{self.today.isoformat()}T08:50:00+08:00",
+                effective_at=f"{self.today.isoformat()}T09:00:00+08:00",
+            ))
+            # Freeze the wall-clock freshness check; execution itself still
+            # evaluates the explicit 10:00 quote/as-of and session contract.
+            with mock.patch.object(PT.PQP, "quote_is_fresh", return_value=True):
+                result, reason = PT._intraday_sell(
+                    conn, account, position, quote, self.today,
+                    {"min_cost_edge": 0.012}, cycle,
+                )
             self.assertIsNotNone(result, f"日内做T卖点未命中：{reason}")
             order_id = result["order_id"]
             fills = conn.execute(

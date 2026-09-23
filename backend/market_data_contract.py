@@ -77,7 +77,8 @@ __all__ = [
     # policy
     "MarketDataPolicy", "LIVE_MARKET_POLICY", "AUCTION_PRESELECTION_POLICY",
     "OPENING_EVENT_POLICY", "UNIVERSE_BUILD_POLICY", "ATTRIBUTION_POLICY",
-    "CLOSE_SNAPSHOT_POLICY", "MARKET_HEALTH_POLICY", "POLICIES", "policy_named",
+    "CLOSE_SNAPSHOT_POLICY", "MARKET_HEALTH_POLICY", "EXECUTION_QUOTE_POLICY",
+    "POLICIES", "policy_named",
     "CROSS_SECTION_MIN_FRESH_RATIO", "fresh_ratio",
     # snapshot / reading
     "MarketDataSnapshot", "MarketDataReading",
@@ -307,10 +308,14 @@ CLOSE_SNAPSHOT_POLICY = MarketDataPolicy("close_snapshot", 0.0)
 #: 现在由 authority 执行同一 policy。
 MARKET_HEALTH_POLICY = MarketDataPolicy("market_health_display", 1800.0)
 
+# 逐票执行行情：执行必须使用双源核验后的源时间戳，最多接受 20 分钟。
+# 历史回放的 ``now`` 是同一次执行的显式 as-of，而非运行机器当前时间。
+EXECUTION_QUOTE_POLICY = MarketDataPolicy("execution_quote", 1200.0)
+
 POLICIES = (
     LIVE_MARKET_POLICY, AUCTION_PRESELECTION_POLICY, OPENING_EVENT_POLICY,
     UNIVERSE_BUILD_POLICY, ATTRIBUTION_POLICY, CLOSE_SNAPSHOT_POLICY,
-    MARKET_HEALTH_POLICY,
+    MARKET_HEALTH_POLICY, EXECUTION_QUOTE_POLICY,
 )
 
 _POLICY_BY_NAME = {policy.name: policy for policy in POLICIES}

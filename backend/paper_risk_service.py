@@ -32,12 +32,7 @@ import strategy_selection_resolver as SRES
 import strategy_risk_enforcement as SRE
 import strategy_runtime as SRT
 import user_strategy_participation as USP
-from paper_trading_rules import (
-    SLIPPAGE,
-    STAMP_SELL,
-    commission as _commission,
-    limit_pct as _limit_pct,
-)
+from paper_trading_rules import limit_pct as _limit_pct
 
 __all__ = ["RiskRunContext", "RiskServicePorts", "run"]
 
@@ -723,9 +718,6 @@ def run(context: RiskRunContext, *, ports: RiskServicePorts):
                 orders.append({"code": position["code"], "status": status, "reason": order_reason})
                 continue
             qty = planned_qty
-            fill_price = price * (1 - SLIPPAGE)
-            amount = qty * fill_price
-            fees = _commission(amount) + amount * STAMP_SELL
             detail["remaining_qty"] = max(0, int(_num(position.get("qty"))) - qty)
             detail["position_closed"] = detail["remaining_qty"] < ports.evidence.lot_size
             if concentration_triggered and not detail["position_closed"]:
@@ -759,20 +751,41 @@ def run(context: RiskRunContext, *, ports: RiskServicePorts):
                     plan={
                         "side": "sell", "code": position["code"],
                         "name": position.get("name"), "qty": qty,
-                        "fill_price": fill_price, "amount": amount, "fees": fees,
-                        "quote_at": quote.get("quote_at") or _now(),
+                        "quote_at": quote.get("quote_at"),
+                        "execution_quote": quote,
                     },
                     order_id=order_id,
                     asof_day=day,
                     side="sell",
                     action="filled",
                     audit_action="sell_filled",
-                    audit_message=f"{position['code']} {qty}股 @ {fill_price:.2f}",
+                    audit_message=f"{position['code']} {qty}股，参考价 {price:.2f}",
                     reason=reason,
                     detail=detail,
-                    assumption="实时价 - 0.10% 滑点，含佣金及印花税",
+                    assumption="由模拟执行权威根据已核验行情计算价格和费用",
                     sell_next_take_stage=next_stage,
                 )
+                committed = conn.execute(
+                    "SELECT status,filled_qty,filled_price,execution_reasons "
+                    "FROM paper_orders WHERE id=?", (order_id,),
+                ).fetchone()
+                if not committed or str(committed[0]) not in {"filled", "partially_filled"}:
+                    conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+                    blocked = str(committed[3] or "execution_not_filled") if committed else "execution_state_unavailable"
+                    orders.append({
+                        "code": position["code"],
+                        "status": str(committed[0]) if committed else "pending_execution",
+                        "qty": int(committed[1] or 0) if committed else 0,
+                        "remaining_qty": int(qty),
+                        "reason": blocked,
+                    })
+                    continue
+                qty = int(committed[1] or 0)
+                fill_price = float(committed[2] or price)
+                detail["remaining_qty"] = max(0, int(_num(position.get("qty"))) - qty)
+                detail["position_closed"] = detail["remaining_qty"] < ports.evidence.lot_size
+                if not detail["position_closed"]:
+                    detail["capacity_state"] = "partial_execution"
                 if detail.get("protective_exit") and ratio >= 0.999:
                     policy = SPOL.recovery_policy(position["account_id"])
                     _audit(conn, position["account_id"], "protective_exit_recovery_watch", _json({
@@ -862,7 +875,7 @@ def run(context: RiskRunContext, *, ports: RiskServicePorts):
                         rotation_bought_codes.add(replacement_code)
                     detail["replacement_buy"] = replacement_result
             orders.append({
-                "code": position["code"], "status": "filled", "qty": qty,
+                "code": position["code"], "status": str(committed[0]), "qty": qty,
                 "reason": reason, "concentration_rotation": concentration_triggered,
                 "quality_score": quality_review.get("score"),
                 "position_closed": detail["position_closed"],

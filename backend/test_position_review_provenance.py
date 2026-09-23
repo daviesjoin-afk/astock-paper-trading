@@ -44,6 +44,7 @@ if BACKEND_DIR not in sys.path:
 
 import paper_position_review_evidence as PREV  # noqa: E402
 import paper_trading as PT  # noqa: E402
+import tradability_archive as TA  # noqa: E402
 import universe as U  # noqa: E402
 
 ACCOUNT = "tq_breakout"
@@ -502,10 +503,22 @@ class ProductionProvenanceRegression(ProductionEpisodeCase):
         # 现价 9.0（-10%）→ 硬止损应照常触发，与 model provenance 无关
         self.quotes[CODE] = {
             "code": CODE, "name": "测试股", "price": 9.0, "high": 9.2, "low": 8.9,
-            "pct": -8.0, "amount": 100000.0, "volume": 10000.0, "turnover": 1.0,
+            "pct": -8.0, "amount": 10000000.0, "volume": 1000000.0, "turnover": 1.0,
             "quote_source": "live", "quote_at": "2026-09-10 14:50:00",
+            "execution_asof": "2026-09-10 14:50:00",
             "quote_validation": "cross_source_checked",
         }
+        with PT._db(immediate=True) as conn:
+            TA.ensure_schema(conn)
+            TA.TradabilityArchiveRepository(conn).save(TA.TradabilityEvidence(
+                code=CODE, session_date=DAY.isoformat(), is_listed=True,
+                listing_date="2000-01-01", delisting_date=None, is_st=False,
+                is_suspended=False, suspension_reason=None, has_market_quote=True,
+                has_trade_volume=True, is_price_limit_locked=False,
+                price_limit_direction=None, source="unit_test_injection",
+                observed_at=f"{DAY.isoformat()}T08:50:00+08:00",
+                effective_at=f"{DAY.isoformat()}T09:00:00+08:00",
+            ))
         result = PT.monitor_risk(DAY)
         sells = [o for o in result.get("orders", []) if o.get("status") == "filled"]
         self.assertTrue(sells, "保护性硬止损被 provenance 改动影响")

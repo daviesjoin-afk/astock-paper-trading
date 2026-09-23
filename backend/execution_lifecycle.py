@@ -130,10 +130,11 @@ EXPIRED_STORED_STATUSES = frozenset({"expired", "signal_expired"})
 #: 影子记录：产生了"本来会买"的证据，但**从未提交**，所以只能停在 CREATED。
 SHADOW_STORED_STATUSES = frozenset({"shadow_q3"})
 SUBMITTED_STORED_STATUSES = frozenset({
-    "pending_execution", "pending_limit", "deferred_capacity", "entry_frozen_waitlist",
+    "pending_execution", "pending_limit", "ready_to_fill", "deferred_capacity", "entry_frozen_waitlist",
     "execution_retry", "manual_execution_retry", "awaiting_batch", "pending_verification",
     "pending_execution_guard", "pending_execution_retry",
 })
+PARTIAL_FILLED_STORED_STATUSES = frozenset({"partially_filled"})
 #: **故意为空**：仓库没有场所受理证据，不允许任何 stored status 自称 ACCEPTED。
 ACCEPTED_STORED_STATUSES: frozenset = frozenset()
 
@@ -180,6 +181,8 @@ def canonical_state(stored_status: Any, *, has_fill: bool = False) -> str:
         return STATE_EXPIRED
     if status in SHADOW_STORED_STATUSES:
         return STATE_CREATED
+    if status in PARTIAL_FILLED_STORED_STATUSES:
+        return STATE_PARTIAL_FILLED
     if status in SUBMITTED_STORED_STATUSES:
         return STATE_PARTIAL_FILLED if has_fill else STATE_SUBMITTED
     if status in ACCEPTED_STORED_STATUSES:  # pragma: no cover - 当前为空集，保留映射位

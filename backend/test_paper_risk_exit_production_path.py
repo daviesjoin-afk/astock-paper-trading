@@ -39,6 +39,7 @@ if BACKEND_DIR not in sys.path:
     sys.path.insert(0, BACKEND_DIR)
 
 import paper_trading as PT  # noqa: E402
+import tradability_archive as TA  # noqa: E402
 import universe as U  # noqa: E402
 
 
@@ -104,13 +105,27 @@ class PaperRiskExitProductionPathTestCase(unittest.TestCase):
             "high": high,
             "low": low,
             "pct": pct,
-            "amount": 100000.0,
+            # The 1% participation cap needs a sufficiently deep synthetic book
+            # for legacy full-exit characterization cases to remain full fills.
+            "amount": 10000000.0,
             "volume": 10000.0,
             "turnover": 1.0,
             "quote_source": "live",
             "quote_at": f"{self.day.isoformat()} 14:50:00",
+            "execution_asof": f"{self.day.isoformat()} 14:50:00",
             "quote_validation": "cross_source_checked",
         }
+        with PT._db(immediate=True) as conn:
+            TA.ensure_schema(conn)
+            TA.TradabilityArchiveRepository(conn).save(TA.TradabilityEvidence(
+                code=code, session_date=self.day.isoformat(), is_listed=True,
+                listing_date="2000-01-01", delisting_date=None, is_st=False,
+                is_suspended=False, suspension_reason=None, has_market_quote=True,
+                has_trade_volume=True, is_price_limit_locked=False,
+                price_limit_direction=None, source="unit_test_injection",
+                observed_at=f"{self.day.isoformat()}T08:50:00+08:00",
+                effective_at=f"{self.day.isoformat()}T09:00:00+08:00",
+            ))
 
     def _insert_lot(
         self,

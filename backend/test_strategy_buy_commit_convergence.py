@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import ast
 import datetime as dt
+import hashlib
 import os
 import shutil
 import sys
@@ -62,6 +63,7 @@ def _quote(code, price=10.0, pct=1.5):
         "main_net": 3_000_000.0, "super_net": 2_000_000.0,
         "amount": 50_000_000.0, "volume": 10_000.0, "turnover": 1.0,
         "quote_at": f"{DAY.isoformat()} 10:00:00",
+        "execution_asof": f"{DAY.isoformat()} 10:00:00",
         "quote_source": "live", "source": "unit_test_injection",
         "quote_validation": "cross_source_checked", "risk_flag": 0,
     }
@@ -90,6 +92,7 @@ class _BuyCase(unittest.TestCase):
         PT._ENTRY_FREEZE_CACHE.update({"at": 0.0, "status": None})
         PT.init_db()
         PT.start_new_cycle(capital=CAPITAL, include_dashboard=False)
+        self._seed_tradability_archive()
 
     def tearDown(self):
         for patch in reversed(self._patches):
@@ -98,6 +101,22 @@ class _BuyCase(unittest.TestCase):
 
     def _quotes(self, codes, asof_date=None):
         return {code: self.quotes[code] for code in codes if code in self.quotes}
+
+    def _seed_tradability_archive(self):
+        import tradability_archive as TA
+        with PT._db(immediate=True) as conn:
+            TA.ensure_schema(conn)
+            repository = TA.TradabilityArchiveRepository(conn)
+            for code in (CODE, "600911"):
+                repository.save(TA.TradabilityEvidence(
+                    code=code, session_date=DAY.isoformat(), is_listed=True,
+                    listing_date="2000-01-01", delisting_date=None, is_st=False,
+                    is_suspended=False, suspension_reason=None, has_market_quote=True,
+                    has_trade_volume=True, is_price_limit_locked=False,
+                    price_limit_direction=None, source="unit_test_injection",
+                    observed_at=f"{DAY.isoformat()}T08:50:00+08:00",
+                    effective_at=f"{DAY.isoformat()}T09:00:00+08:00",
+                ))
 
     def cycle_id(self):
         with PT._db() as conn:
@@ -242,9 +261,13 @@ class NormalBuyConvergence(_BuyCase):
         with PT._db() as conn:
             order_row = dict(conn.execute(
                 "SELECT * FROM paper_orders WHERE id=?", (order["id"],)).fetchone())
+            fill = dict(conn.execute(
+                "SELECT event_key FROM paper_fills WHERE order_id=?", (order["id"],)
+            ).fetchone())
+            reservation_key = f"{order['id']}:execution:{fill['event_key']}"
             reservation = dict(conn.execute(
                 "SELECT * FROM paper_capital_reservations WHERE order_key=?",
-                (str(order["id"]),)).fetchone())
+                (reservation_key,)).fetchone())
             lots = [dict(row) for row in conn.execute(
                 "SELECT * FROM paper_position_lots")]
         # SB-2：order / reservation / lot 必须是同一个周期。
@@ -342,16 +365,28 @@ class WrongCycleReservationFailsClosed(_BuyCase):
                 "side,amount,fees,status,created_at) VALUES(?,?,?,?,'buy',4321.0,7.0,"
                 "'reserved',?)",
                 (older, str(next_order_id), ACCOUNT, CODE, f"{DAY.isoformat()} 09:00:00"))
-        return older, newer, next_order_id
+        # R26 策略 BUY 按 fill event 预占，键包含订单、行情时点和规则集；
+        # 在这笔成交将使用的 event key 上制造真实的周期冲突。
+        quote_at = f"{DAY.isoformat()} 10:00:00"
+        event_key = hashlib.sha256(
+            f"{next_order_id}|{quote_at}|{EP.SIMULATION_EXECUTION_RULESET}".encode("utf-8")
+        ).hexdigest()
+        reservation_key = f"{next_order_id}:execution:{event_key}"
+        with PT._db(immediate=True) as conn:
+            conn.execute(
+                "UPDATE paper_capital_reservations SET order_key=? WHERE order_key=?",
+                (reservation_key, str(next_order_id)),
+            )
+        return older, newer, next_order_id, reservation_key
 
     def test_wrong_cycle_reservation_is_rejected_and_untouched(self):
-        older, newer, next_order_id = self._prepare()
+        older, newer, next_order_id, reservation_key = self._prepare()
         self.quotes[CODE] = _quote(CODE)
         # 非空门禁：预占存在、reserved、周期不同于将建的订单周期。
         with PT._db() as conn:
             before = dict(conn.execute(
                 "SELECT * FROM paper_capital_reservations WHERE order_key=?",
-                (str(next_order_id),)).fetchone())
+                (reservation_key,)).fetchone())
         self.assertEqual("reserved", before["status"])
         self.assertEqual(older, int(before["cycle_id"]))
         self.assertNotEqual(older, newer)
@@ -366,7 +401,7 @@ class WrongCycleReservationFailsClosed(_BuyCase):
         with PT._db() as conn:
             after = dict(conn.execute(
                 "SELECT * FROM paper_capital_reservations WHERE order_key=?",
-                (str(next_order_id),)).fetchone())
+                (reservation_key,)).fetchone())
             counts = self.counters()
             order_row = dict(conn.execute(
                 "SELECT * FROM paper_orders WHERE id=?", (order["id"],)).fetchone())
