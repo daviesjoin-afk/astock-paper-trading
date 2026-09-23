@@ -25,8 +25,6 @@ import tempfile
 import unittest
 import unittest.mock as mock  # noqa: F401  # noqa: F401 - 供子类 mock.patch 使用
 
-from pathlib import Path
-
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import paper_selection as PS
@@ -1427,15 +1425,15 @@ class SignalRefreshTests(LedgerProvenanceTests):
         self.conn.commit()
 
     def _upsert(self):
-        """抽取**生产**的 ``INSERT ... ON CONFLICT`` 语句。
+        """取**生产**的 ``INSERT ... ON CONFLICT`` 语句。
 
-        手抄一份 SQL 会在生产语句改动后继续通过 —— 那正是探针失明的成因。
+        R25 起这段 SQL 的唯一构造入口是 ``signal_service.conflict_statement``，
+        所以探针直接问生产要语句，而不是按字面量从某个 .py 文件里 grep ——
+        后者在写入点迁移后会静默失明（R25 之前它正是这样红的：``paper_trading.py``
+        里已找不到那段字面量，探针抛 ValueError 而不是断言失败）。
         """
-        src = (Path(__file__).resolve().parent / "paper_trading.py").read_text(
-            encoding="utf-8")
-        start = src.index('"""INSERT INTO paper_signals(\n')
-        end = src.index('"""', start + 3)
-        stmt = src[start + 3:end]
+        import signal_service as SIG
+        stmt = SIG.conflict_statement(SIG.CONFLICT_REFRESH)
         self.assertIn("ON CONFLICT(account_id,signal_date,code)", stmt)
         head = stmt.split(")", 1)[0].split("(", 1)[1]
         return stmt, [part.strip() for part in head.split(",")]

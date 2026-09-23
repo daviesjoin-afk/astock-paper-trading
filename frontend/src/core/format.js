@@ -52,11 +52,39 @@ export function paperStatusTag(status){
     running:['tag-ok','运行中'],paused:['tag-info','已暂停'],
     pending:['tag-info','待执行'],filled:['tag-ok','已成交'],
     blocked:['tag-warn','已拦截'],rejected:['tag-warn','已拒绝'],
-    superseded:['tag-info','已失效'],cancelled:['tag-info','已撤销']
+    superseded:['tag-info','已失效'],cancelled:['tag-info','已撤销'],
+    // R25：signal 生命周期状态此前落到 raw token（前端直接打印英文枚举）。
+    // 这些是**已落库的裁决结果**，只做展示映射，不在这里推断任何业务规则。
+    deferred_capacity:['tag-info','容量等待'],
+    entry_frozen_waitlist:['tag-info','冻结待买'],
+    recheck_capacity:['tag-info','容量复核'],
+    recovery_watch:['tag-info','恢复观察'],
+    shadow_q3:['tag-info','影子Q3'],
+    expired:['tag-info','已过期'],
+    risk_rejected:['tag-warn','风控拒绝']
   };
   var view=map[status]||['tag-info',status||'未知'];
   var cls=view[0], text=view[1];
   return '<span class="tag '+cls+'">'+text+'</span>';
+}
+
+// R25：signal decision 的展示投影。后端下发 outcome / reason / evidence 状态，
+// 前端只渲染 —— **不得**在这里比较 verification === 'verified' 就显示"双源验证
+// 通过"（那是重算后端 policy）。双源结论只认后端算好的 cross_source_verified。
+export function signalDecisionView(decision){
+  var d=decision||{}, ev=d.evidence||{};
+  var labels={approved:'已通过',blocked:'未通过'};
+  var outcome=d.outcome||'';
+  var evidenceText=ev.cross_source_verified?'证据：双源可信'
+    :(ev.verification_method?('证据：'+riskText(zhRiskText(ev.verification||'未核验')))
+      :'证据：未知');
+  return {
+    outcome: outcome,
+    outcomeText: labels[outcome]||'待复核',
+    reason: d.reason||'',
+    evidenceText: evidenceText,
+    crossSourceVerified: ev.cross_source_verified===true
+  };
 }
 
 export function riskText(value){

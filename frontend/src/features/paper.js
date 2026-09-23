@@ -6,6 +6,7 @@ import { adaptiveEsc, cny, fmt, paperStatusTag, pctCls, pctTxt, riskText, zhRisk
 import { showPaperWorkspace } from "../core/navigation.js";
 import { PAPER_NAV_TTL_MS } from "../core/state.js";
 import { renderPaperAudit } from "./risk.js";
+import { renderSignalAuditTable } from "./signal-audit-table.js";
 import { openInStrategyWorkbench, wbStatusBadge } from "./strategies.js";
 import { toast, inlineError, confirmDialog } from "../ui/dialog.js";
 
@@ -851,15 +852,7 @@ export async function renderPaperDashboard(d,auditRequest){
         +'<td><b>'+qualityPhase+' · '+qualityScore+' · '+qualityGrade+'</b><br/><small>入场 '+(p.quality_model_score===null||p.quality_model_score===undefined?'—':fmt(p.quality_model_score,1))+' · 资金 '+(p.quality_flow_score===null||p.quality_flow_score===undefined?'—':fmt(p.quality_flow_score,1))+' · 动量 '+(p.quality_momentum_score===null||p.quality_momentum_score===undefined?'—':fmt(p.quality_momentum_score,1))+'</small><br/><small>'+qualityAction+' · '+replacement+'</small></td>'
         +'<td>'+p.hold_days+'日</td><td>'+p.available_qty+' 可卖 / '+p.locked_qty+' 锁定<br/><span style="font-size:11px;color:var(--text-muted)" title="'+(p.t1_reason||'')+'">'+(p.t1_status||'-')+'</span></td><td><span class="tag '+(p.asset_type==='etf_t0'?'tag-ok':'tag-info')+'">'+(p.asset_type==='etf_t0'?'ETF T+0':'股票 T+1')+'</span><br/><span style="font-size:11px;color:var(--text-muted)">风控价 '+fmt(p.risk_price)+' · '+(p.price_state||'-')+'</span></td><td>'+p.available_date+'<br/><span style="font-size:11px;color:var(--text-muted)">'+(p.quote_at||'')+'</span></td></tr>';
     }).join('');
-    var signals = (d.signals||[]).map(function(s){
-      var model=(s.payload&&s.payload.decision&&s.payload.decision.entry_model)||{},audit=s.audit||{};
-      var quotePct=audit.signal_quote_pct;
-      var marketText=(audit.signal_quote_at||'\u2014')+(typeof quotePct==='number'?' ? '+(quotePct>=0?'+':'')+fmt(quotePct,2)+'%':'');
-      var actual=audit.execution_status==='filled'
-        ? ((audit.executed_at||'\u2014')+'<br><small>\u884c\u60c5 '+(audit.execution_quote_at||'\u2014')+'</small>')
-        : '\u672a\u6210\u4ea4<br><small>'+(s.status==='blocked'||s.status==='rejected'?'\u4fe1\u53f7\u65f6\u70b9\u98ce\u63a7\u62e6\u622a':'\u5c1a\u672a\u6267\u884c')+'</small>';
-      return '<tr><td>'+(accountName[s.account_id]||s.account_id)+'</td><td><b>'+s.name+'</b><br/><span style="font-size:11px;color:var(--text-muted)">'+s.code+'</span></td><td>'+(audit.factor_date||s.signal_date||'\u2014')+'</td><td>'+marketText+'</td><td>'+(audit.planned_review_date||s.intended_date||'\u2014')+'</td><td>'+actual+'</td><td>'+(model.name||'\u72ec\u7acb\u5165\u573a\u6a21\u578b')+'<br><small>'+fmt(s.t_score,2)+'</small></td><td>'+paperStatusTag(s.status)+'</td><td style="font-size:12px">'+(s.reason||'\u5f85\u5b9e\u65f6\u884c\u60c5\u4e0e\u8d26\u6237\u98ce\u63a7\u590d\u6838')+'</td></tr>';
-    }).join('');
+    var signalItems = d.signals||[];
     var orders = (d.orders||[]).map(function(o){
       var view=paperOrderStatusView(o.status), cancel=(!o.archived_cycle&&o.status==='pending_limit')?'<button class="paper-mini-btn cancel" onclick="cancelPaperOrder('+o.id+')">撤单</button>':'';
       return '<tr><td>'+o.created_at+'</td><td>'+(o.account_name||accountName[o.account_id]||o.account_id)+'</td><td>'+(o.origin==='manual'?'手动模拟':'策略自动')+'<br><small>'+(o.order_type==='limit'?'限价':'市价')+'</small></td>'
@@ -881,8 +874,8 @@ export async function renderPaperDashboard(d,auditRequest){
     var challengeMsg = curvePoints>=2
       ? '曲线按各策略绩效参考本金归一化；策略启用前保持空值，并与沪深300收盘快照对比。'
       : (running?'本周期已启动；净值点不足两个，后续有效快照会自动补齐曲线。':'挑战将在确认资金并启动新周期后开始。');
-    var signalsAudit = signals
-      ? tableScroll('<table><tr><th>策略</th><th>标的</th><th>信号日</th><th>执行日</th><th>独立模型评分</th><th>状态</th><th>说明</th></tr>'+signals+'</table>',980)
+    var signalsAudit = signalItems.length
+      ? tableScroll(renderSignalAuditTable(signalItems,accountName),1080)
       : '<div class="paper-empty">暂无信号。已启用策略会按各自模型、行情时间戳和仓位上限分别审批。</div>';
     var positionsAudit = positions
       ? tableScroll('<table><tr><th>策略决策</th><th>标的</th><th>持仓股数</th><th>持仓市值 / 总池占比</th><th>成本</th><th>现价</th><th>浮盈亏</th><th>质量评分 / 处置</th><th>持有</th><th>份额状态</th><th>交易制度</th><th>最早可卖 / 报价</th></tr>'+positions+'</table>',1260)
