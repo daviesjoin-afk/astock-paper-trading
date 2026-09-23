@@ -737,6 +737,16 @@ def _read_plan(path: str) -> dict[str, Any]:
 
 
 def main(argv: list[str] | None = None) -> int:
+    try:
+        return _main(argv)
+    except RecoveryError as exc:
+        # A contract violation is an expected operator-facing failure, not a
+        # crash: report it plainly and fail closed with a non-zero status.
+        print(f"recovery refused: {exc}", file=sys.stderr)
+        return 2
+
+
+def _main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--db", required=True, help="SQLite ledger path")
     parser.add_argument("--cycle-id", type=int, required=True,
@@ -750,9 +760,26 @@ def main(argv: list[str] | None = None) -> int:
     if not args.apply and args.plan:
         parser.error("--plan is only used with --apply")
     if args.apply:
+        # Validate the reviewed plan *before* opening anything writable. An
+        # operator who selects cycle N but passes a reviewed cycle-M plan must
+        # never mutate cycle M, so the requested cycle is checked against the
+        # plan here — no connection, no transaction, no trigger change yet.
+        plan = _read_plan(args.plan)
+        requested_cycle = int(args.cycle_id)
+        try:
+            plan_cycle = int(plan.get("cycle_id"))
+        except (TypeError, ValueError):
+            raise RecoveryError(
+                "saved plan does not declare a usable cycle: "
+                f"requested={requested_cycle} plan={plan.get('cycle_id')!r}"
+            ) from None
+        if requested_cycle != plan_cycle:
+            raise RecoveryError(
+                "requested cycle does not match reviewed plan: "
+                f"requested={requested_cycle} plan={plan_cycle}"
+            )
         conn = connect_writable(args.db)
         try:
-            plan = _read_plan(args.plan)
             changed = apply_plan(conn, plan)
             print(_canonical_json({
                 "status": "applied", "changed_rows": changed,
