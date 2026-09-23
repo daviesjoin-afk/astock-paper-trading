@@ -15,7 +15,7 @@ from __future__ import annotations
 
 APP_NAME = "astock-paper-trading"
 APP_BUILD_ID = "20260920-v2-platform"
-APP_BUILD_LABEL = "v2.0.0 确定性策略研究平台"
+APP_BUILD_LABEL = "v0.20.0 确定性策略研究平台"
 
 
 def build_payload() -> dict:
