@@ -2,18 +2,19 @@
 
 本文记录版本变化；GitHub Release 同步提供详细更新、升级步骤和已知限制。
 
-## v2.0.0 — 确定性策略平台、Point-in-Time 研究、权威账本与风险闭环
+## v2.0.0 — 从“能跑”升级为“可验证、可回放、可扩展”
 
 发布日期：2026-09-20。详见 [完整发布说明](docs/RELEASE-v2.0.0.md)。
 
-- 自 v1.3.0 后合入 126 个 PR：动态 Strategy Registry、不可变版本、声明式 DSL、Strategy Workbench、统一 RuntimeContext / OrderIntent / Execution Planner 与 N-strategy allocation。
-- 建立 point-in-time learning/evaluation、purged walk-forward、historical tradability archive/observation ledger 与 replayable candidate provenance，系统性关闭 future leakage。
-- 引入 execution reality / verification：订单自称 filled 不再等于真实成交；verified fills、immutable order cycle provenance 成为收益与执行统计的证据门槛。
-- `paper_position_lots` 成为当前持仓数量/成本权威，`paper_positions` 降级为兼容投影；rebalance、risk state、risk scan 和 replacement/slot decisions 全面 cycle/as-of 化。
-- 风险域完成 position episode → deterministic sell → durable risk scan → episode-bound review → as-of-bound replacement 的连续闭环。
-- DataFeed/StrategyPlugin、operator security boundary、前端模块化与 Playwright E2E、security leak scan 等工程基础同步强化。
-- paper schema 演进至 v21；无法证明的 legacy provenance 保持 unknown/NULL，不做猜测性回填。
-- #174 合并后的 master：Python 3.11/3.12 与 Docker 均运行 3727 项后端测试，syntax / quality / frontend / Chromium / security 全绿。
+- 策略从固定集合升级为可创建、验证、版本化、启停和归档的平台能力；历史周期继续使用当时实际运行的版本，不会被今天的修改重新解释。
+- 多策略共享资金时统一进行额度、仓位、敞口和执行校验；策略表达交易意图，但不能绕过系统直接决定最终下单数量。
+- 成交真实性进一步收紧：只有有证据的模拟成交才进入正式持仓、收益和 NAV 统计，旧数据无法证明时保持 unknown。
+- 历史研究全面强化 point-in-time 边界，减少未来数据泄漏；回放、选股、学习和评估尽量只使用当时已经可知的事实。
+- 持仓、成本、风险状态和周期归属进一步统一，旧周期不会因为新周期数据、当前日期或后来出现的新候选而被改写。
+- 风险扫描和换仓判断更可追溯：历史决策绑定明确周期、日期和开仓来源，找不到可靠证据时不回退到“最新值”猜测。
+- 自进化与 AI 保持 shadow / evaluate / recommend 边界，新版本先评估再晋级，不能自动绕过风险和执行门禁。
+- 写接口统一纳入 operator 安全边界；本地模式限制本机写入，远程写入需要显式认证，配置异常时 fail closed。
+- v2.0.0 发布基线在 Python 3.11、Python 3.12、Docker smoke、前端构建/单测、Chromium E2E、静态检查和安全扫描中全部通过。
 
 ## v1.3.0 — 自进化闭环、策略选股页与前端性能修复
 
