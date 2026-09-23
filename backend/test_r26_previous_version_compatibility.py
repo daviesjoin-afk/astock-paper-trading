@@ -23,9 +23,9 @@ R26 给 ``paper_orders`` / ``paper_fills`` / ``paper_position_lots`` 增加了�
 release** 的数据形状。它不是"上一个 PR"、也不是"上一个 commit"，更不是"上一个
 schema number"。
 
-本测试因此绑定**真实 release tag** 的 **commit + 数据形状**，而不是任何脚本名或
-进行中的 release 重编号 PR：版本重编号仍在独立分支上推进，把 fixture 绑到它的
-tag 名会让这条 gate 在别人改版本号时假失败。这里用
+本测试因此绑定**真实 release tag** 的 **commit + 数据形状**，而不是任何脚本名：产品
+版本号已经从 ``v2.0.0`` 重编号为 ``v0.20.0``，但两个 tag 指向同一个 commit，所以
+这份 gate 的权威始终是 commit 与 fixture 字节，不是 tag 的显示名。这里用
 ``PREVIOUS_RELEASE_TAG`` 常量显式声明，并在测试里断言该 tag 存在且是 master 的祖先
 ——"它确实是我们的上一版本"这件事本身也是被测对象。
 
@@ -41,6 +41,7 @@ tag 名会让这条 gate 在别人改版本号时假失败。这里用
 """
 from __future__ import annotations
 
+import importlib.util
 import json
 import os
 import shutil
@@ -67,8 +68,13 @@ from paper_portfolio_read_model import (  # noqa: E402
 REPO_ROOT = os.path.dirname(BACKEND)
 
 #: **Previous Version**：本轮目标 release 之前最近一个正式受支持 release。
-PREVIOUS_RELEASE_TAG = "v2.0.0"
+#:
+#: 该 release 的产品版本号已由重编号 PR 从 ``v2.0.0`` 改为 ``v0.20.0``；两个 tag
+#: 指向**同一个 commit**，只是显示名变了。权威身份是下面的 commit —— 所以重编号
+#: 不改变这份 fixture 的字节，也不改变它代表的上一版本数据形状。
+PREVIOUS_RELEASE_TAG = "v0.20.0"
 #: 该 release 的 commit，写在 fixture 头部作为来源凭证。
+#: 这是身份本身：tag 名可以随产品版本号重编号而变，commit 不会。
 PREVIOUS_RELEASE_COMMIT = "cbb1863b8d3cc1f07e52dfe9b99a360494f53be4"
 #: 上一版本真实 schema 的逐字摘录。
 PREVIOUS_RELEASE_SCHEMA_FIXTURE = os.path.join(
@@ -243,7 +249,7 @@ class PreviousVersionUpgradeTests(unittest.TestCase):
         """写入上一版本**真实允许**的数据形状（含没有流水自称成交的旧行）。
 
         注意：这里只使用上一版本 base DDL 里**真实存在**的列。``paper_accounts.
-        cycle_id`` 在 v2.0.0 的建表语句里没有（它是后续迁移补上的），所以本 fixture
+        cycle_id`` 在上一版本的建表语句里没有（它是后续迁移补上的），所以本 fixture
         不写它 —— 兼容性 gate 的前提正是"fixture 的形状必须真的是上一版本的形状"。
 
         ``phantom_claim`` 控制是否写入那条"自称成交却没有流水"的旧行。它与
@@ -605,6 +611,241 @@ class PreviousVersionUpgradeTests(unittest.TestCase):
             fresh_signature, upgraded_signature,
             "fresh install 与升级上来的库列集不一致：两条路径已经开始分叉",
         )
+
+
+class RecoveredLegacyLedgerTests(unittest.TestCase):
+    """上一版本库 → #185 provenance recovery → #186 migration → R26 runtime（§五/§七）。
+
+    这条链路正是生产事故的收尾顺序：旧库先升级到当前 schema，再跑 #185 的证据化
+    recovery 把可证明的 ``cycle_id`` 补回，然后本轮的 R26 迁移与运行时读模型必须
+    仍然成立。它比纯 synthetic fixture 多一层意义 —— 验证"刚恢复过的服务器不会被
+    R26 再次弄停"。
+
+    三个必须守住的约束：
+
+    1. R26 的新字段（``source_fill_id`` / ``filled_qty`` / 执行证据）不会为 legacy
+       lot 猜值：不可证明就保持 NULL，且不凭空生成 FillEvent；
+    2. R26 Execution Authority 不从"当前周期"反推订单归属，只认 durable order
+       provenance；
+    3. recovery 只写可证明的行，AMBIGUOUS/UNPROVABLE 保持原样。
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="r26-recovered-")
+        self.db_path = os.path.join(self.tmp, "paper.sqlite3")
+        self._old_db_path = PT.DB_PATH
+        PT.DB_PATH = self.db_path
+
+    def tearDown(self):
+        PT.DB_PATH = self._old_db_path
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _load_recovery(self):
+        """载入 #185 的 recovery 工具（与它自己的测试同一套加载方式）。"""
+        path = os.path.join(BACKEND, "recover_legacy_order_cycle_provenance.py")
+        spec = importlib.util.spec_from_file_location("r26_legacy_recovery", path)
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = module
+        spec.loader.exec_module(module)
+        return module
+
+    def _open(self):
+        conn = sqlite3.connect(self.db_path, timeout=30)
+        conn.row_factory = sqlite3.Row
+        return conn
+
+    def _seed_previous_version_ledger(self):
+        """上一版本形状：一条有流水的买入，其 ``cycle_id`` 留空（事故形状）。
+
+        只使用上一版本 base DDL 里真实存在的列 —— 执行验证列是后续迁移补上的。
+        """
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
+        conn.executescript(_fixture_ddl())
+        stamp = f"{DAY} 09:00:00"
+        cycle_id = int(conn.execute(
+            "INSERT INTO paper_cycles(cycle_key,status,capital,risk_profile,"
+            "started_at,created_at,updated_at) VALUES(?,?,?,?,?,?,?)",
+            (f"cycle-{DAY}", "running", 1_000_000.0, "shared_pool",
+             stamp, stamp, stamp),
+        ).lastrowid)
+        conn.execute(
+            "INSERT INTO paper_accounts(id,name,source_strategy,status,initial_cash,"
+            "cash,cycle_days,max_positions,max_weight,max_exposure,version,"
+            "created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (ACCOUNT, "首板接力", "test", "running", 1_000_000.0, 900_000.0,
+             30, 5, 0.3, 1.0, "v2.0.0", stamp, stamp),
+        )
+        # 旧订单：有真实流水，但周期归属为 NULL —— 待 #185 恢复。
+        order_id = int(conn.execute(
+            "INSERT INTO paper_orders(account_id,side,code,name,qty,planned_price,"
+            "filled_price,amount,fees,status,reason,risk_payload,created_at,"
+            "executed_at,order_type,origin,cycle_id) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (ACCOUNT, "buy", CODE, "恢复甲", 300, 20.0, 20.0, 6000.0, 6.0,
+             "filled", "旧版本成交", "{}", f"{DAY} 09:35:00",
+             f"{DAY} 09:36:00", "market", "strategy", None),
+        ).lastrowid)
+        conn.execute(
+            "INSERT INTO paper_fills(order_id,account_id,side,code,qty,price,amount,"
+            "fees,fill_date,quote_at,assumption) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+            (order_id, ACCOUNT, "buy", CODE, 300, 20.0, 6000.0, 6.0, DAY,
+             f"{DAY} 09:36:00", "旧版本假设"),
+        )
+        # 旧 lot：当时没有 source_fill_id 列；durable source_order 是唯一直接证据。
+        conn.execute(
+            "INSERT INTO paper_position_lots(cycle_id,account_id,code,name,industry,"
+            "qty,remaining_qty,cost,acquired_at,available_date,asset_type,"
+            "source_order_id,cost_fee_included,is_t_base) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (cycle_id, ACCOUNT, CODE, "恢复甲", "测试", 300, 300, 20.02,
+             f"{DAY} 09:36:00", "2026-09-02", "stock_t1", order_id, 1, 1),
+        )
+        conn.commit()
+        conn.close()
+        return {"cycle_id": cycle_id, "order_id": order_id}
+
+    def _upgrade(self):
+        """真实升级入口：#186 的迁移器 + 运行时重新初始化。"""
+        import db_migrate
+        db_migrate.migrate("paper_trading", path=self.db_path, backup=False)
+        PT.init_db()
+        return self._open()
+
+    def _stamp_genuinely_verified(self, conn, order_id):
+        """把这条真实成交标记为已验证。
+
+        legacy 行本身没有验证戳记（列是后来加的），所以"有流水的真实成交"在升级后
+        仍需运行时写入验证结论。#185 的证据契约要求 fills 是 verified 才可作为
+        durable lot 的直接证明，这里如实模拟那一刻的账本状态。
+        """
+        conn.execute(
+            "UPDATE paper_orders SET execution_status='verified',execution_verified=1 "
+            "WHERE id=?", (order_id,),
+        )
+        conn.execute(
+            "UPDATE paper_fills SET quote_at=COALESCE(quote_at,?) "
+            "WHERE order_id=?", (f"{DAY} 09:36:00", order_id),
+        )
+        conn.commit()
+
+    # ---------- §五：恢复后 DB 的迁移兼容性 ----------
+
+    def test_recovered_ledger_survives_r26_migration_without_fabrication(self):
+        seeded = self._seed_previous_version_ledger()
+        conn = self._upgrade()
+        self._stamp_genuinely_verified(conn, seeded["order_id"])
+
+        # 升级后 R26 的新列存在，但 legacy lot 的 source_fill_id 必须仍是 NULL。
+        lot_cols = {row[1] for row in conn.execute("PRAGMA table_info(paper_position_lots)")}
+        self.assertIn("source_fill_id", lot_cols, "R26 未添加 source_fill_id 列")
+        self.assertIsNone(
+            conn.execute("SELECT source_fill_id FROM paper_position_lots "
+                         "WHERE source_order_id=?", (seeded["order_id"],)).fetchone()[0],
+            "R26 迁移为 legacy lot 猜了 source_fill_id",
+        )
+        # 不得凭空生成 FillEvent：填充事件数必须等于真实流水数。
+        fill_rows = conn.execute(
+            "SELECT COUNT(1) FROM paper_fills WHERE order_id=?", (seeded["order_id"],)
+        ).fetchone()[0]
+        self.assertEqual(1, fill_rows, "迁移凭空生成或丢掉了成交流水")
+        if "paper_fill_events" in {
+            row[0] for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'")
+        }:
+            self.assertEqual(
+                0, conn.execute(
+                    "SELECT COUNT(1) FROM paper_fill_events").fetchone()[0],
+                "迁移为 legacy 成交凭空生成了 FillEvent",
+            )
+
+        # 订单周期归属仍为 NULL（未恢复），且 R26 不得从当前周期反推。
+        self.assertIsNone(
+            conn.execute("SELECT cycle_id FROM paper_orders WHERE id=?",
+                         (seeded["order_id"],)).fetchone()[0],
+            "R26 迁移或运行时应为 legacy 订单反推周期",
+        )
+        conn.close()
+
+    def test_recovery_then_r26_runtime_reads_are_consistent(self):
+        """#185 恢复 cycle_id 后，R26 读模型的四类归属必须一致。"""
+        seeded = self._seed_previous_version_ledger()
+        conn = self._upgrade()
+        self._stamp_genuinely_verified(conn, seeded["order_id"])
+        conn.close()
+
+        # 跑 #185 的证据化 recovery：只允许 PROVEN 行被写入。
+        recovery = self._load_recovery()
+        conn = self._open()
+        try:
+            plan = recovery.build_plan(conn, seeded["cycle_id"])
+            self.assertEqual(
+                1, plan["proven_count_for_requested_cycle"],
+                "durable lot 应能唯一证明该订单的历史周期",
+            )
+            changed = recovery.apply_plan(conn, plan)
+            self.assertEqual(1, changed, "recovery 未按 reviewed plan 写入 1 行")
+            # 幂等：第二次 apply 不得再改任何行。
+            self.assertEqual(0, recovery.apply_plan(conn, plan))
+        finally:
+            conn.close()
+
+        conn = self._open()
+        try:
+            order = conn.execute(
+                "SELECT cycle_id FROM paper_orders WHERE id=?", (seeded["order_id"],)
+            ).fetchone()
+            lot = conn.execute(
+                "SELECT cycle_id, source_order_id, source_fill_id "
+                "FROM paper_position_lots WHERE source_order_id=?",
+                (seeded["order_id"],),
+            ).fetchone()
+            fill_count = conn.execute(
+                "SELECT COUNT(1) FROM paper_fills WHERE order_id=?",
+                (seeded["order_id"],),
+            ).fetchone()[0]
+
+            # 四类归属一致：订单周期 == lot 周期，且 lot 仍指向该 durable 订单。
+            self.assertEqual(seeded["cycle_id"], order["cycle_id"])
+            self.assertEqual(seeded["cycle_id"], lot["cycle_id"])
+            self.assertEqual(seeded["order_id"], lot["source_order_id"])
+            # source_fill_id 仍为 NULL —— recovery 只恢复周期归属，不重写血缘。
+            self.assertIsNone(lot["source_fill_id"],
+                              "recovery 不应改写 lot 的 source_fill_id")
+            # 经济事实不变：流水条数未被 recovery 改动。
+            self.assertEqual(1, fill_count)
+        finally:
+            conn.close()
+
+    def test_recovery_leaves_unprovable_legacy_rows_alone(self):
+        """没有直接证据的 legacy 行必须保持 NULL，不被 recovery 猜测。"""
+        seeded = self._seed_previous_version_ledger()
+        conn = self._upgrade()
+        # 抹掉唯一直接证据：lot 不再指向该订单。
+        conn.execute("UPDATE paper_position_lots SET source_order_id=NULL")
+        conn.commit()
+        conn.close()
+
+        recovery = self._load_recovery()
+        conn = self._open()
+        try:
+            plan = recovery.build_plan(conn, seeded["cycle_id"])
+            self.assertEqual(
+                [], plan["proven"],
+                "缺少直接证据时不得产生任何 PROVEN 行",
+            )
+        finally:
+            conn.close()
+
+        conn = self._open()
+        try:
+            self.assertIsNone(
+                conn.execute("SELECT cycle_id FROM paper_orders WHERE id=?",
+                             (seeded["order_id"],)).fetchone()[0],
+                "无证据的 legacy 行被写入了周期：recovery 在猜",
+            )
+        finally:
+            conn.close()
 
 
 if __name__ == "__main__":

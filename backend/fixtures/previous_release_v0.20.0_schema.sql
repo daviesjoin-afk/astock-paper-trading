@@ -1,16 +1,20 @@
 -- R26 previous-version compatibility fixture.
 --
--- 来源：release tag v2.0.0 的 commit cbb1863b8d3cc1f07e52dfe9b99a360494f53be4
+-- 来源：release tag v0.20.0（重编号前名为 v2.0.0，指向同一 commit）
+-- 的 commit cbb1863b8d3cc1f07e52dfe9b99a360494f53be4
 -- 里的 backend/paper_trading.py init_db() ``executescript`` DDL 块，**逐字**摘录。
+--
+-- 产品版本号从 v2.0.0 重编号为 v0.20.0 只改了 tag 的显示名：commit 不变，
+-- 因此下面这份 DDL 摘录逐字不变，它代表的"上一版本数据形状"也不变。
 --
 -- 为什么把它落成文件而不是在测试里跑 ``git show``：CI 的 actions/checkout 默认
 -- 浅克隆且 --no-tags，测试进程里根本解析不到 tag。兼容性 gate 的价值在于 fixture
 -- 必须**真的**是上一版本产生的形状，所以这里固定住真实来源并标注 commit；
 -- 只要 tag 可解析（本地/完整检出），
--- ``test_fixture_matches_the_live_release_tag`` 就会逐字比对，防止这份摘录漂移。
+-- ``test_fixture_matches_the_live_release_tag_when_available`` 就会逐字比对，防止这份摘录漂移。
 --
 -- 手动重新生成：
---   git show v2.0.0:backend/paper_trading.py
+--   git show v0.20.0:backend/paper_trading.py
 -- 取 "CREATE TABLE IF NOT EXISTS paper_accounts" 到其所在字符串字面量的收尾引号。
 
 CREATE TABLE IF NOT EXISTS paper_accounts (
