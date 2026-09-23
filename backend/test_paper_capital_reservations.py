@@ -291,7 +291,9 @@ class ArchitectureGuardTests(unittest.TestCase):
         for forbidden in ("paper_orders", "paper_positions", "paper_cycles", "COMMIT", "ROLLBACK", "SAVEPOINT"):
             self.assertNotIn(forbidden, source)
         self.assertEqual(1, source.count("INSERT INTO paper_capital_reservations"))
-        self.assertEqual(2, source.count('"""UPDATE paper_capital_reservations'))
+        # Two updates manage reservation lifecycle; two consume amounts as R26
+        # partial fills commit. Keep all reservation writes in this owner.
+        self.assertEqual(4, source.count('"""UPDATE paper_capital_reservations'))
 
     def test_recovery_exception_is_documented(self):
         architecture_path = pathlib.Path(__file__).parents[1].joinpath("ARCHITECTURE.md")

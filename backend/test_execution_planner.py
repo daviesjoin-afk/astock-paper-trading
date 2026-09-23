@@ -24,16 +24,17 @@ ORDER_CYCLE = 8
 
 
 def _order_row(**overrides):
-    """A filled buy order row as `paper_orders` would return it."""
+    """A working order row as `paper_orders` would return before execution."""
     row = {
         "id": 7, "account_id": "tq_breakout", "signal_id": None, "side": "buy",
         "code": "002241", "name": None, "qty": 100, "planned_price": 21.5,
-        "filled_price": 21.5, "amount": 2150.0, "fees": 2.15, "status": "filled",
+        "filled_price": None, "amount": None, "fees": None, "status": "pending_execution",
         "reason": "\u7a81\u7834\u4e70\u5165", "risk_payload": "{}", "realized_pnl": None,
-        "created_at": NOW, "executed_at": NOW, "order_type": "limit",
+        "created_at": NOW, "executed_at": None, "order_type": "market",
         "origin": "strategy", "expires_at": None, "cancelled_at": None,
         "strategy_id": None, "strategy_version": None, "strategy_checksum": None,
         "retry_of_order_id": None, "cycle_id": ORDER_CYCLE,
+        "filled_qty": 0, "remaining_qty": 100, "execution_version": 0,
     }
     row.update(overrides)
     return row
@@ -91,6 +92,30 @@ def _fill_row(**overrides):
     }
     row.update(overrides)
     return row
+
+
+def _valid_execution_context(*, side="buy", quantity=100, sellable=1000, quote_at=NOW,
+                             status="pending_execution", already_filled=0):
+    """Explicit verified market and tradability evidence for writer contract tests."""
+    quote = {
+        "code": "002241", "price": 21.5, "amount": 50_000_000.0,
+        "quote_at": quote_at, "execution_asof": quote_at,
+        "quote_source": "test_market", "quote_validation": "cross_source_checked",
+    }
+    reading = EP.market_reading_for_execution(
+        quote, asof_day="2026-09-08", execution_asof=quote_at,
+    )
+    tradability = types.SimpleNamespace(
+        evidence_present=True, can_buy=True, can_sell=True,
+        buy_block_reason="ok", sell_block_reason="ok",
+        to_dict=lambda: {"evidence_present": True, "can_buy": True, "can_sell": True},
+    )
+    return EP.ExecutionContext(
+        session_date="2026-09-08", execution_asof=quote_at, quote=quote,
+        market_reading=reading, tradability=tradability,
+        available_liquidity=1_000_000, sellable_quantity=sellable,
+        already_filled_quantity=already_filled, current_order_status=status,
+    )
 
 
 class _FakeResult:
@@ -160,6 +185,10 @@ class _FakeConn:
             return _FakeResult(row=self._identity_row())
         if text.startswith("select * from paper_orders where id"):
             return _FakeResult(row=self.order_row)
+        if text.startswith("select 1 from paper_fills where order_id"):
+            return _FakeResult(row=())
+        if text.startswith("select coalesce(sum(qty),0),coalesce(sum(amount),0),coalesce(sum(fees),0)"):
+            return _FakeResult(row=(0, 0.0, 0.0))
         # ── execution-cycle invariant 的两次只读查询（顺序无关，各自可辨认）──
         if text.startswith("select cycle_id from paper_accounts"):
             return _FakeResult(row=(self.account_cycle,))
@@ -235,6 +264,178 @@ class ExecutionPolicyTests(_StubbedPlannerTest):
             nxt = re.search(r"^def ", source[start + 1:], re.M)
             body = source[start:start + 1 + (nxt.start() if nxt else len(source))]
             self.assertIsNone(pattern.search(body), name)
+
+
+class SimulationExecutionContractTests(unittest.TestCase):
+    DAY = "2026-09-08"
+
+    def _facts(self, *, quote_at=None, execution_asof=None, amount=50_000_000.0,
+               can_buy=True, can_sell=True, buy_reason="ok", sell_reason="ok",
+               liquidity=50_000, sellable=50_000, status="pending_execution",
+               verification="cross_source_checked", session_consumed=0):
+        quote_at = quote_at or f"{self.DAY} 10:00:00"
+        execution_asof = execution_asof or quote_at
+        quote = {
+            "code": "600901", "price": 20.0, "amount": amount,
+            "quote_at": quote_at, "execution_asof": execution_asof,
+            "quote_source": "live", "quote_validation": verification,
+        }
+        reading = EP.market_reading_for_execution(
+            quote, asof_day=self.DAY, execution_asof=execution_asof,
+        )
+        tradability = types.SimpleNamespace(
+            evidence_present=True, can_buy=can_buy, can_sell=can_sell,
+            buy_block_reason=buy_reason, sell_block_reason=sell_reason,
+            to_dict=lambda: {
+                "evidence_present": True, "can_buy": can_buy, "can_sell": can_sell,
+                "buy_block_reason": buy_reason, "sell_block_reason": sell_reason,
+            },
+        )
+        context = EP.ExecutionContext(
+            session_date=self.DAY, execution_asof=execution_asof, quote=quote,
+            market_reading=reading, tradability=tradability,
+            available_liquidity=liquidity, sellable_quantity=sellable,
+            same_day_consumed_quantity=session_consumed,
+            current_order_status=status,
+        )
+        return quote, context
+
+    def _intent(self, *, side="buy", qty=1000, order_type="market", reference_price=20.0):
+        return EP.PersistedOrderIntent(
+            order_id=1, account_id="test", cycle_id=1,
+            strategy_id="test", strategy_version=1, strategy_checksum="sha256:test",
+            signal_id=9, symbol="600901", side=side, desired_quantity=qty,
+            intent_at=f"{self.DAY} 09:35:00", reference_price=reference_price,
+            order_type=order_type, signal_provenance={"frozen": True},
+        )
+
+    def test_verified_liquid_quote_produces_deterministic_full_fill_and_fees(self):
+        _, context = self._facts(liquidity=200_000)
+        first = EP.evaluate_simulated_execution(self._intent(), context)
+        second = EP.evaluate_simulated_execution(self._intent(), context)
+        self.assertTrue(first.executable_now)
+        self.assertEqual("filled", first.status)
+        self.assertEqual(1000, first.fill_quantity)
+        self.assertEqual(0, first.remaining_quantity)
+        self.assertEqual(20.02, first.fill_price)
+        self.assertEqual(2.0, first.fees)
+        self.assertEqual(first, second)
+
+    def test_liquidity_caps_fill_and_preserves_remaining_quantity(self):
+        _, context = self._facts(liquidity=30_000)
+        result = EP.evaluate_simulated_execution(self._intent(), context)
+        self.assertEqual("partially_filled", result.status)
+        self.assertEqual(300, result.fill_quantity)
+        self.assertEqual(700, result.remaining_quantity)
+        self.assertIn(EP.ExecutionReason.INSUFFICIENT_LIQUIDITY.value, result.reasons)
+
+    def test_same_day_consumption_is_subtracted_from_cumulative_participation(self):
+        """同一个累计成交量不得被重复消费（R26）。
+
+        行情给出的是**当日累计**成交额，10:05 的 snapshot 仍然包含 10:00 之前那部分
+        成交量。若把已消耗量减掉，10:00 吃掉的 1% 参与额度就不能在 10:05 再吃一次。
+        """
+        _, context = self._facts(liquidity=10_000, session_consumed=3_000)
+        result = EP.evaluate_simulated_execution(self._intent(), context)
+        # 参与额度 = 10_000 × 1% = 100 股，已消耗 3_000 ⇒ 本事件可执行 0。
+        self.assertFalse(result.executable_now)
+        self.assertEqual(0, result.fill_quantity)
+        self.assertEqual(1000, result.remaining_quantity)
+        self.assertIn(EP.ExecutionReason.INSUFFICIENT_LIQUIDITY.value, result.reasons)
+        self.assertEqual(
+            0, result.liquidity_evidence["executable_capacity"],
+            result.liquidity_evidence,
+        )
+
+    def test_growing_cumulative_volume_releases_further_capacity(self):
+        """行情累计成交额增长后，剩余参与额度允许继续成交（R26）。"""
+        # 10:00：累计 10_000 股 ⇒ 1% = 100 股额度，消耗 0 ⇒ 成交 100 股。
+        _, first_context = self._facts(liquidity=10_000, session_consumed=0)
+        first = EP.evaluate_simulated_execution(self._intent(qty=100), first_context)
+        self.assertTrue(first.executable_now)
+        self.assertEqual(100, first.fill_quantity)
+        # 10:05：累计增长到 300_000 股（1% = 3_000 股），已消耗 100 ⇒ 仍可继续。
+        _, second_context = self._facts(liquidity=300_000, session_consumed=100)
+        second = EP.evaluate_simulated_execution(self._intent(qty=100), second_context)
+        self.assertTrue(second.executable_now)
+        self.assertEqual(100, second.fill_quantity)
+        self.assertEqual(
+            3_000, second.liquidity_evidence["participation_capacity"],
+        )
+        self.assertEqual(100, second.liquidity_evidence["session_consumed_quantity"])
+
+    def test_session_consumption_blocks_when_participation_is_fully_used(self):
+        """已消耗量吃掉全部参与额度时，本事件必须零成交（不能超买）。"""
+        _, context = self._facts(liquidity=10_000, session_consumed=100)
+        result = EP.evaluate_simulated_execution(self._intent(qty=100), context)
+        self.assertFalse(result.executable_now)
+        self.assertEqual(0, result.fill_quantity)
+        self.assertEqual(
+            "participation_exhausted", result.liquidity_evidence["capped_by"],
+        )
+
+    def test_stale_market_evidence_blocks_fill(self):
+        _, context = self._facts(execution_asof=f"{self.DAY} 10:25:00")
+        result = EP.evaluate_simulated_execution(self._intent(), context)
+        self.assertFalse(result.executable_now)
+        self.assertEqual(0, result.fill_quantity)
+        self.assertIn(EP.ExecutionReason.MARKET_STALE.value, result.reasons)
+
+    def test_historical_execution_rejects_a_quote_from_a_later_session(self):
+        # 历史执行必须保持请求的交易日；不能把之后的行情日期当作执行日回退。
+        later_quote = {
+            "code": "600901", "price": 20.0, "amount": 50_000_000.0,
+            "quote_at": "2026-09-09 10:00:00", "quote_source": "live",
+            "quote_validation": "cross_source_checked",
+        }
+        reading = EP.market_reading_for_execution(
+            later_quote, asof_day="2026-09-08",
+            execution_asof="2026-09-09 10:00:00",
+        )
+        self.assertNotEqual("fresh", reading.status)
+        self.assertIn(reading.reason, {"asof_mismatch", "asof_unprovable", "stale"})
+
+    def test_single_source_evidence_blocks_fill(self):
+        _, context = self._facts(verification="range_timestamp_checked")
+        result = EP.evaluate_simulated_execution(self._intent(), context)
+        self.assertIn(EP.ExecutionReason.MARKET_UNVERIFIED.value, result.reasons)
+
+    def test_midday_break_and_closed_session_block_fill(self):
+        _, lunch = self._facts(
+            quote_at=f"{self.DAY} 12:00:00", execution_asof=f"{self.DAY} 12:00:00",
+        )
+        _, closed = self._facts(
+            quote_at=f"{self.DAY} 15:00:00", execution_asof=f"{self.DAY} 15:00:00",
+        )
+        for context in (lunch, closed):
+            result = EP.evaluate_simulated_execution(self._intent(), context)
+            self.assertIn(EP.ExecutionReason.OUT_OF_SESSION.value, result.reasons)
+
+    def test_t1_and_locked_limit_facts_block_the_relevant_side(self):
+        _, t1 = self._facts(sellable=0)
+        t1_result = EP.evaluate_simulated_execution(self._intent(side="sell"), t1)
+        self.assertFalse(t1_result.executable_now)
+        self.assertEqual(0, t1_result.fill_quantity)
+        self.assertIn(EP.ExecutionReason.T1_NOT_SELLABLE.value, t1_result.reasons)
+        _, locked = self._facts(can_buy=False, buy_reason="buy_limit_locked")
+        locked_result = EP.evaluate_simulated_execution(self._intent(), locked)
+        self.assertIn(EP.ExecutionReason.PRICE_LIMIT_LOCKED.value, locked_result.reasons)
+
+    def test_invalid_lot_and_cancelled_order_cannot_fill(self):
+        _, context = self._facts()
+        invalid = EP.evaluate_simulated_execution(self._intent(qty=150), context)
+        self.assertIn(EP.ExecutionReason.INVALID_QUANTITY.value, invalid.reasons)
+        _, cancelled = self._facts(status="cancelled")
+        result = EP.evaluate_simulated_execution(self._intent(), cancelled)
+        self.assertFalse(result.executable_now)
+        self.assertIn(EP.ExecutionReason.CANCELLED.value, result.reasons)
+
+    def test_limit_order_respects_slippage_adjusted_price(self):
+        _, context = self._facts()
+        result = EP.evaluate_simulated_execution(
+            self._intent(order_type="limit", reference_price=20.00), context,
+        )
+        self.assertIn(EP.ExecutionReason.LIMIT_PRICE_NOT_REACHED.value, result.reasons)
 
 
 class SeatReserveGateTests(_StubbedPlannerTest):
@@ -361,7 +562,7 @@ class CommitFillTests(_StubbedPlannerTest):
             _finish_capital_reservation=lambda conn, order_id, status: calls.append(
                 ("reservation", status)),
             _record_lot=lambda conn, account, plan, qty, price, day, order_id, is_t_base=True, fees=0.0,
-            cycle_id=None: calls.append(("lot", qty, cycle_id)),
+            cycle_id=None, acquired_at=None: calls.append(("lot", qty, cycle_id)),
             _consume_available_lots=lambda conn, account_id, code, qty, day, cycle_id=None: (
                 calls.append(("consume_cycle", cycle_id)), (qty, 0.0))[1],
             _credit_shared_cash=lambda conn, value, account_id=None: calls.append(("credit", value)),
@@ -388,6 +589,7 @@ class CommitFillTests(_StubbedPlannerTest):
                 conn, account={"id": "tq_breakout"}, plan=plan, order_id=7,
                 asof_day=dt.date(2026, 9, 8), reserved=False, action="strategy_buy",
                 reason="突破买入", detail={"x": 1},
+                execution_context=_valid_execution_context(),
             )
         kinds = [item[0] for item in calls]
         self.assertIn("reserve", kinds)
@@ -401,7 +603,7 @@ class CommitFillTests(_StubbedPlannerTest):
         self.assertEqual(reserve_call[3], ORDER_CYCLE,
                          "预占必须携带订单的 durable 周期")
         self.assertIn(("reservation", "consumed"), calls)
-        self.assertEqual(2152.15, [item for item in calls if item[0] == "debit"][0][1])
+        self.assertEqual(2152.22, [item for item in calls if item[0] == "debit"][0][1])
         self.assertIn(("audit", "strategy_buy"), [(c[0], c[1]) for c in calls if c[0] == "audit"])
 
     def test_manual_commit_does_not_reserve_again(self):
@@ -411,6 +613,8 @@ class CommitFillTests(_StubbedPlannerTest):
             _reserve_shared_capital=lambda *args, **kwargs: calls.append(("reserve",)) or (True, None),
             _debit_shared_cash=lambda conn, value, preferred_account_id=None: calls.append(("debit",)),
             _finish_capital_reservation=lambda conn, order_id, status: calls.append(("reservation", status)),
+            _consume_capital_reservation=lambda conn, order_id, amount, fees, final=False: calls.append(
+                ("consume_reservation", amount, fees, final)),
             _record_lot=lambda *args, **kwargs: calls.append(("lot",)),
             _consume_available_lots=lambda conn, account_id, code, qty, day, cycle_id=None: (
                 None or (qty, 0.0)),
@@ -435,6 +639,7 @@ class CommitFillTests(_StubbedPlannerTest):
                 asof_day=dt.date(2026, 9, 8), reserved=True,
                 risk_log_reason="手动模拟委托通过模型门禁并成交",
                 reason="手动模拟委托经模型复核后成交",
+                execution_context=_valid_execution_context(quote_at=NOW),
             )
         self.assertNotIn("reserve", [item[0] for item in calls])
         self.assertIn(("risk_log", "手动模拟委托通过模型门禁并成交"), calls)
@@ -468,6 +673,7 @@ class CommitFillTests(_StubbedPlannerTest):
                 _FakeConn(order_row=_order_row(id=11), fill_rows=[_fill_row(order_id=11)]),
                 account={"id": "tq_breakout"}, plan=plan, order_id=11,
                 asof_day=dt.date(2026, 9, 8), reserved=False, action="strategy_buy",
+                execution_context=_valid_execution_context(quote_at=NOW),
             )
         self.assertEqual(1, [item[0] for item in calls].count("risk_log"))
         self.assertEqual(1, [item[0] for item in calls].count("audit"))
@@ -508,9 +714,13 @@ class CommitFillTests(_StubbedPlannerTest):
         with mock.patch.object(EP, "_pt", lambda: stub):
             with self.assertRaises(RuntimeError):
                 EP.commit_fill(
-                    _FakeConn(order_row=_order_row(), fill_rows=[_fill_row()]),
+                    _FakeConn(order_row=_order_row(side="sell", order_type="market"), fill_rows=[]),
                     account={"id": "tq_breakout"}, plan=plan,
-                               order_id=11, asof_day=dt.date(2026, 9, 8), reserved=True)
+                    order_id=11, asof_day=dt.date(2026, 9, 8), reserved=True,
+                    execution_context=_valid_execution_context(
+                        side="sell", quantity=200, sellable=200,
+                    ),
+                )
 
 
 class RevalidateTests(_StubbedPlannerTest):
@@ -592,6 +802,26 @@ class PlanEntryTests(_StubbedPlannerTest):
         self.assertIn("单日亏损已触发熔断", reasons)
         self.assertTrue(any("共享资金池可用现金不足" in item for item in reasons))
         self.assertTrue(any("成交行情未通过校验" in item for item in reasons))
+
+
+class ExecutionEstimateTests(unittest.TestCase):
+    def test_buy_and_sell_terms_use_one_deterministic_price_and_fee_policy(self):
+        buy_price, buy_amount, buy_fees = EP.estimate_execution_terms(10.0, 1000, "buy")
+        sell_price, sell_amount, sell_fees = EP.estimate_execution_terms(10.0, 1000, "sell")
+
+        self.assertAlmostEqual(buy_price, 10.01)
+        self.assertAlmostEqual(buy_amount, 10010.0)
+        self.assertAlmostEqual(buy_fees, 1.001)
+        self.assertAlmostEqual(sell_price, 9.99)
+        self.assertAlmostEqual(sell_amount, 9990.0)
+        self.assertAlmostEqual(sell_fees, 5.994)
+
+    def test_limit_estimate_caps_planning_price_without_promising_a_fill(self):
+        price, amount, fees = EP.estimate_execution_terms(
+            10.0, 100, "buy", limit_price=10.0,
+        )
+        self.assertEqual((price, amount), (10.0, 1000.0))
+        self.assertAlmostEqual(fees, 0.1)
 
 
 if __name__ == "__main__":

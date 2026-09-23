@@ -99,12 +99,12 @@ from paper_trading_rules import (
     COMMISSION,  # noqa: F401 - legacy public compatibility export
     MAIN_BOARD_PREFIXES,  # noqa: F401 - legacy public compatibility export
     MIN_COMMISSION,  # noqa: F401 - legacy public compatibility export
-    SLIPPAGE,
+    SLIPPAGE,  # noqa: F401 - public compatibility export
     STAR_PREFIXES,  # noqa: F401 - legacy public compatibility export
-    STAMP_SELL,
+    STAMP_SELL,  # noqa: F401 - public compatibility export
     T0_ETF_PREFIXES,  # noqa: F401 - legacy public compatibility export
     asset_type as _asset_type,
-    commission as _commission,
+    commission as _commission,  # noqa: F401 - public compatibility export
     is_st_or_delisting as _is_st_or_delisting,  # noqa: F401 - legacy public compatibility export
     is_trade_weekday as _is_trade_weekday,
     limit_pct as _limit_pct,
@@ -263,6 +263,7 @@ STRATEGY_EXECUTION_RETRY_STATUS = "execution_retry"
 ENTRY_RETRY_ORDER_STATUSES = (
     "pending_limit", "deferred_capacity", ENTRY_FROZEN_WAITLIST_STATUS,
     MANUAL_EXECUTION_RETRY_STATUS, STRATEGY_EXECUTION_RETRY_STATUS,
+    "pending_execution", "partially_filled",
 )
 # Retry/waitlist states are kept for research and re-ranking, but are not all
 # real capacity reservations.  In particular, a deferred candidate has no
@@ -272,6 +273,7 @@ ENTRY_RETRY_ORDER_STATUSES = (
 # set only.
 ENTRY_SLOT_OCCUPYING_ORDER_STATUSES = (
     "pending_limit", MANUAL_EXECUTION_RETRY_STATUS, STRATEGY_EXECUTION_RETRY_STATUS,
+    "pending_execution", "partially_filled",
 )
 ENTRY_AUTO_SOURCE_MAX_AGE_SECONDS = 15 * 60
 ENTRY_AUTO_FACTOR_MAX_AGE_SECONDS = 2 * 24 * 60 * 60
@@ -1642,8 +1644,14 @@ def _reconcile_signal_order_states(conn):
     terminal_signal_statuses = {
         "superseded", "filled", "rejected", "blocked", "expired", "shadow_q3",
     }
+    # 订单状态 → 信号状态的唯一映射。``partially_filled`` **不能**降级成
+    # ``pending``：部分成交是已经发生的事实（有经过验证的 FillEvent），把它对账回
+    # 待处理会让"这张信号到底成没成交"在两次读之间自相矛盾，并让后续执行窗口
+    # 误以为还剩一整笔未成交的意图。
     signal_for_order = {
         "pending_limit": "pending",
+        "pending_execution": "pending",
+        "partially_filled": "partially_filled",
         "deferred_capacity": "deferred_capacity",
         ENTRY_FROZEN_WAITLIST_STATUS: ENTRY_FROZEN_WAITLIST_STATUS,
         MANUAL_EXECUTION_RETRY_STATUS: "pending",
@@ -2040,7 +2048,7 @@ def init_db():
                 acquired_at TEXT NOT NULL, available_date TEXT NOT NULL,
                 asset_type TEXT NOT NULL DEFAULT 'stock_t1', source_order_id INTEGER,
                 cost_fee_included INTEGER NOT NULL DEFAULT 0,
-                is_t_base INTEGER NOT NULL DEFAULT 1
+                is_t_base INTEGER NOT NULL DEFAULT 1, source_fill_id INTEGER
             );
             CREATE INDEX IF NOT EXISTS idx_paper_lots_active
                 ON paper_position_lots(cycle_id, account_id, code, available_date);
@@ -3028,6 +3036,13 @@ def _finish_capital_reservation(conn, order_key, status):
     return PCR.finish_capital_reservation(conn, order_key, status, now_fn=_now)
 
 
+def _consume_capital_reservation(conn, order_key, amount, fees, *, final=False):
+    return PCR.consume_capital_reservation_amount(
+        conn, order_key, amount, fees,
+        num_fn=_num, now_fn=_now, final=final,
+    )
+
+
 def _debit_shared_cash(conn, amount, preferred_account_id=None):
     """Debit a shared cash pool while retaining per-strategy audit ownership."""
     return PSC.debit_shared_cash(
@@ -3573,7 +3588,7 @@ def _consume_available_lots(conn, account_id, code, qty, asof_day, cycle_id=None
     return int(qty) - remaining, cost_amount
 
 
-def _record_lot(conn, account, signal, qty, fill_price, asof_day, order_id=None, is_t_base=True, fees=0.0, cycle_id=None):
+def _record_lot(conn, account, signal, qty, fill_price, asof_day, order_id=None, is_t_base=True, fees=0.0, cycle_id=None, acquired_at=None):
     """写入买入 lot。周期归属必须与**来源买单**一致（§15 硬 invariant）。
 
     归属**只**接受两种来源，且都不允许回退到当前 active cycle：
@@ -3605,12 +3620,13 @@ def _record_lot(conn, account, signal, qty, fill_price, asof_day, order_id=None,
     # peak 只升不降。判定统一走 risk-state 模块的权威聚合，不在这里另写一份 SQL。
     prior_qty = PPRS.remaining_qty(
         conn, cycle_id=cycle_id, account_id=account["id"], code=signal["code"])
-    conn.execute(
-        """INSERT INTO paper_position_lots(cycle_id,account_id,code,name,industry,qty,remaining_qty,cost,acquired_at,available_date,asset_type,source_order_id,cost_fee_included,is_t_base)
-           VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+    cursor = conn.execute(
+        """INSERT INTO paper_position_lots(cycle_id,account_id,code,name,industry,qty,remaining_qty,cost,acquired_at,available_date,asset_type,source_order_id,cost_fee_included,is_t_base,source_fill_id)
+           VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (cycle_id, account["id"], signal["code"], signal.get("name"), signal.get("industry"), int(qty), int(qty),
-         fill_price + _num(fees) / max(int(qty), 1), _now(), available.isoformat(), asset_type, order_id, 1, int(bool(is_t_base))),
+         fill_price + _num(fees) / max(int(qty), 1), acquired_at or _now(), available.isoformat(), asset_type, order_id, 1, int(bool(is_t_base)), None),
     )
+    lot_id = int(cursor.lastrowid)
     # 生命周期初始化/吸收由 paper_position_risk_state 持有；只传已证明的 cycle。
     if prior_qty <= 0:
         PPRS.initialize_episode(
@@ -3620,6 +3636,7 @@ def _record_lot(conn, account, signal, qty, fill_price, asof_day, order_id=None,
         PPRS.update_peak(
             conn, cycle_id=cycle_id, account_id=account["id"], code=signal["code"],
             peak_price=fill_price)
+    return lot_id
 
 
 def _latest_price_map(codes=None):
@@ -6496,6 +6513,8 @@ def _quotes(codes, asof_date=None):
     local_snapshot_at = _universe_snapshot_time()
     out = {}
     expected_day = _date(asof_date or dt.date.today())
+    quote_execution_asof = dt.datetime.now().isoformat(timespec="seconds")
+    is_historical_asof = expected_day != dt.date.today()
     for code in codes:
         live_row = dict(live.get(code) or {})
         flow_row = dict(flow_details.get(code) or {})
@@ -6517,6 +6536,12 @@ def _quotes(codes, asof_date=None):
         else:
             row = dict(local.get(code) or {})
         row["quote_at"] = live_row.get("quote_at") if is_live else local_snapshot_at
+        # R26 freezes the exact execution observation time with the prefetched
+        # quote. Historical replay uses the quote's own observed instant and
+        # never substitutes the machine's current time.
+        row["execution_asof"] = (
+            row.get("quote_at") if is_historical_asof else quote_execution_asof
+        )
         row["quote_source"] = "live" if is_live else "local_cache"
         flow_at = flow_row.get("quote_at") or flow_row.get("flow_fetched_at") or live_row.get("quote_at")
         flow_time = _parse_quote_timestamp(flow_at)
@@ -9147,6 +9172,20 @@ def _buy_order(conn, account, signal, quote, market, news, asof_day, *, all_quot
             "reason": "策略未被当前周期启用（cycle snapshot），本次候选不参与执行",
         }
     code = signal["code"]
+    active_order = conn.execute(
+        """SELECT id,status,filled_qty,remaining_qty,reason FROM paper_orders
+             WHERE signal_id=? AND side='buy' AND status IN ('pending_execution','partially_filled')
+             ORDER BY id DESC LIMIT 1""",
+        (signal.get("id"),),
+    ).fetchone() if signal.get("id") is not None else None
+    if active_order:
+        return {
+            "code": code, "order_id": int(active_order[0]),
+            "status": str(active_order[1]), "filled": bool(active_order[2]),
+            "qty": int(active_order[2] or 0),
+            "remaining_qty": int(active_order[3] or 0),
+            "pending_execution": True, "reason": active_order[4],
+        }
     if _entry_freeze_enabled():
         freeze_reason = _entry_frozen_reason("自动候选")
         payload = _loads(signal.get("payload"), {})
@@ -9554,7 +9593,7 @@ def _buy_order(conn, account, signal, quote, market, news, asof_day, *, all_quot
     pending_same_symbol = pending_by_symbol.get(code, 0.0)
     code_value += pending_same_symbol
     industry_value = industries.get(signal.get("industry") or "未知", 0.0)
-    fill_price = price * (1 + SLIPPAGE)
+    fill_price = EP.estimated_fill_price(price, "buy")
     if signal_close > 0 and lim > 0:
         # P3 审计修复：涨停价封顶对所有买入生效，不只追买分支。
         # 旧逻辑非 chase 候选在封板价位会模拟出 price×1.001 高于交易所
@@ -9821,9 +9860,11 @@ def _buy_order(conn, account, signal, quote, market, news, asof_day, *, all_quot
             sizing["lifecycle_deployment_amount"] = _num(deployment.get("deployable_amount"))
             qty = max(0, max_qty)
     amount = qty * fill_price
-    fees = _commission(amount) if amount else 0.0
+    fees = EP.estimate_execution_fees(amount, "buy")
     sizing["one_lot_amount"] = round(LOT_SIZE * fill_price, 2)
-    sizing["one_lot_fee"] = round(_commission(LOT_SIZE * fill_price), 2)
+    sizing["one_lot_fee"] = round(
+        EP.estimate_execution_fees(LOT_SIZE * fill_price, "buy"), 2,
+    )
     sizing["cash_available"] = round(shared_cash, 2)
     sizing["qty_final"] = int(qty)
     if qty < LOT_SIZE and not reasons:
@@ -9895,9 +9936,12 @@ def _buy_order(conn, account, signal, quote, market, news, asof_day, *, all_quot
         # 用实际买入佣金 + 预估卖出佣金/印花税 + 双向滑点做保守成本门槛；
         # 不把未实现收益当现金，只判断该委托是否值得发生。
         expected_profit = amount * expected_edge
-        estimated_round_trip_cost = (
-            fees + _commission(amount) + amount * STAMP_SELL + amount * SLIPPAGE * 2
+        sell_fees = EP.estimate_execution_fees(amount, "sell")
+        slippage_cost = qty * (
+            abs(fill_price - price)
+            + abs(EP.estimated_fill_price(price, "sell") - price)
         )
+        estimated_round_trip_cost = fees + sell_fees + slippage_cost
         sizing["minimum_effective_order_amount"] = min_effective_amount
         sizing["expected_edge_pct"] = round(expected_edge * 100, 2)
         sizing["expected_profit_amount"] = round(expected_profit, 2)
@@ -9956,7 +10000,7 @@ def _buy_order(conn, account, signal, quote, market, news, asof_day, *, all_quot
     # undersized order into a seemingly valid research observation.
     q3_shadow_ready = q3_shadow and not reasons
     allowed = not reasons and not q3_shadow_ready and not limit_deferred
-    order_status = "filled" if allowed else (
+    order_status = "pending_execution" if allowed else (
         "shadow_q3" if q3_shadow_ready else (
             STRATEGY_EXECUTION_RETRY_STATUS if limit_deferred else
             ("deferred_capacity" if capacity_deferred else "risk_rejected"))
@@ -10032,9 +10076,9 @@ def _buy_order(conn, account, signal, quote, market, news, asof_day, *, all_quot
         (account["id"], signal["id"], "buy", code, signal.get("name"), qty,
          entry_limit["limit_price"] if entry_limit["limit_price"] is not None else price,
          entry_limit["order_type"],
-         fill_price if allowed else None,
-         amount if allowed else None, fees if allowed else None, order_status, reason,
-         _json(risk), _now(), _now() if allowed else None, dispatch_plan["expires_at"],
+         None,
+         None, None, order_status, reason,
+         _json(risk), _now(), None, dispatch_plan["expires_at"],
          strategy_id, strategy_version, strategy_checksum, retry_of_order_id,
          _order_cycle_id(conn, current_cycle["id"])),
     )
@@ -10154,6 +10198,8 @@ def _buy_order(conn, account, signal, quote, market, news, asof_day, *, all_quot
         cycle_id=current_cycle["id"],
     )
     if failure is not None:
+        if failure.get("filled") and ET is not None and failure.get("filled_price"):
+            ET.mark_entered(account["id"], code, failure["filled_price"])
         return failure
     if ET is not None:
         ET.mark_entered(account["id"], code, fill_price)
@@ -10214,6 +10260,117 @@ def process_pending_manual_orders(*args, **kwargs):
     return _impl(*args, **kwargs)
 
 
+def process_pending_execution_orders(asof_date=None):
+    """Resume persisted non-manual working orders using a newly fetched quote.
+
+    Market reads complete before opening the writer transaction. Strategy/risk
+    approval is not rerun here: each persisted order already carries its
+    approved intent and frozen provenance; only Execution Simulation Authority
+    may decide whether this event adds a fill.
+    """
+    import execution_planner as EP
+
+    init_db()
+    day = _date(asof_date)
+    placeholders = "?,?"
+    with _db() as snapshot_conn:
+        candidates = _rows(
+            snapshot_conn,
+            f"""SELECT id,code FROM paper_orders
+                 WHERE COALESCE(origin,'strategy')<>'manual'
+                   AND status IN ({placeholders})
+                 ORDER BY id""",
+            ("pending_execution", "partially_filled"),
+        )
+    if not candidates:
+        return []
+
+    candidate_ids = {int(row["id"]) for row in candidates}
+    quote_map = _quotes(
+        sorted({str(row.get("code") or "") for row in candidates if row.get("code")}),
+        asof_date=day,
+    )
+    output = []
+    with _db(immediate=True) as conn:
+        active = _rows(
+            conn,
+            f"""SELECT * FROM paper_orders
+                 WHERE COALESCE(origin,'strategy')<>'manual'
+                   AND status IN ({placeholders})
+                 ORDER BY id""",
+            ("pending_execution", "partially_filled"),
+        )
+        for order in active:
+            order_id = int(order["id"])
+            if order_id not in candidate_ids:
+                continue
+            _assert_active_lease(conn, "resume pending execution order")
+            account_row = conn.execute(
+                "SELECT * FROM paper_accounts WHERE id=?", (order["account_id"],),
+            ).fetchone()
+            if account_row is None:
+                output.append({"order_id": order_id, "status": "blocked", "reason": "账户不存在"})
+                continue
+            quote = dict(quote_map.get(str(order["code"])) or {})
+            savepoint = f"resume_execution_{order_id}"
+            conn.execute(f"SAVEPOINT {savepoint}")
+            try:
+                EP.commit_fill(
+                    conn,
+                    account=dict(account_row),
+                    plan={
+                        "side": str(order["side"] or "").lower(),
+                        "code": order["code"], "name": order["name"],
+                        "qty": int(order["remaining_qty"] or 0),
+                        "quote_at": quote.get("quote_at"),
+                        "execution_quote": quote,
+                    },
+                    order_id=order_id, asof_day=day,
+                    side=str(order["side"] or "").lower(), reserved=False,
+                    action="execution_event_resumed",
+                    reason=str(order.get("reason") or "已批准委托等待模拟执行"),
+                    detail={"resumed": True, "source_order_id": order_id},
+                )
+                conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+            except Exception as exc:
+                conn.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+                conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+                if _lease_lost(exc):
+                    raise
+                reason = f"执行事件异常，可在后续窗口重试：{type(exc).__name__}: {exc}"
+                retry_status = "partially_filled" if int(order.get("filled_qty") or 0) else "pending_execution"
+                conn.execute(
+                    "UPDATE paper_orders SET status=?,reason=? WHERE id=? AND execution_version=?",
+                    (retry_status, reason, order_id, int(order.get("execution_version") or 0)),
+                )
+                _risk_log(
+                    conn, order["account_id"], order["code"], order["side"],
+                    "execution_event_error", reason, {"order_id": order_id},
+                )
+            state = conn.execute(
+                "SELECT status,filled_qty,remaining_qty,execution_reasons FROM paper_orders WHERE id=?",
+                (order_id,),
+            ).fetchone()
+            if order.get("signal_id") is not None and str(state[0]) in {
+                "filled", "partially_filled", "pending_execution",
+            }:
+                signal_status = {
+                    "filled": "filled", "partially_filled": "partially_filled",
+                    "pending_execution": "pending",
+                }[str(state[0])]
+                conn.execute(
+                    """UPDATE paper_signals SET status=?,reason=?
+                         WHERE id=? AND status IN ('pending','partially_filled','deferred_capacity')""",
+                    (signal_status, str(state[3] or "执行事件已处理"), order["signal_id"]),
+                )
+            output.append({
+                "order_id": order_id, "status": str(state[0]),
+                "filled_qty": int(state[1] or 0), "remaining_qty": int(state[2] or 0),
+                "reasons": state[3],
+            })
+    return output
+
+
 def execute_open(asof_date=None):
     """09:31 开盘审批：先复核共享开盘事件，再查询待执行候选。"""
     init_db()
@@ -10222,6 +10379,7 @@ def execute_open(asof_date=None):
     # order is reconsidered.  A quote gate may stop buys, but never stops a
     # protective sell pass.
     opening_risk = monitor_risk(day)
+    execution_orders = process_pending_execution_orders(day)
     # P3 审计修复（2026-09-03）：开盘 slot 与 monitor_intraday 一样先做
     # 轻量数据源探活。此前 09:31 只拉快照而不探活，入场门禁
     # _entry_freeze_status 读到的仍是上一交易日收盘的 data_source_health
@@ -10263,6 +10421,7 @@ def execute_open(asof_date=None):
             "slot": "open", "date": day.isoformat(), "status": "blocked",
             "orders": list(opening_risk.get("orders", [])),
             "manual_orders": list(opening_risk.get("manual_orders", [])), "expired": 0,
+            "execution_orders": execution_orders,
             "reason": reason, "live_scan_gate": open_gate,
             "data_source_health": open_source_health,
         }
@@ -10313,6 +10472,11 @@ def execute_open(asof_date=None):
             conn,
             """SELECT * FROM paper_signals
                WHERE status IN ('pending',?)
+                 AND NOT EXISTS (
+                     SELECT 1 FROM paper_orders o
+                      WHERE o.signal_id=paper_signals.id AND o.side='buy'
+                        AND o.status IN ('pending_execution','partially_filled')
+                 )
                ORDER BY COALESCE(t_score,0) DESC,
                         COALESCE(rank_score,0) DESC,account_id,id""",
             (ENTRY_FROZEN_WAITLIST_STATUS,),
@@ -10342,6 +10506,7 @@ def execute_open(asof_date=None):
                 "orders": list(opening_risk.get("orders", [])) + list(opening_event.get("orders", [])),
                 "opening_event": opening_event,
                 "manual_orders": list(opening_risk.get("manual_orders", [])) + manual_orders,
+                "execution_orders": execution_orders,
                 "expired": len(expired),
             }
         market = prefetch_market
@@ -10394,6 +10559,7 @@ def execute_open(asof_date=None):
             "orders": list(opening_risk.get("orders", [])) + list(opening_event.get("orders", [])) + result,
             "opening_event": opening_event,
             "manual_orders": list(opening_risk.get("manual_orders", [])) + manual_orders,
+            "execution_orders": execution_orders,
             "expired": len(expired),
         }
 
@@ -11843,11 +12009,8 @@ def _intraday_sell(conn, account, position, quote, asof_day, profile, cycle, ope
         trigger = "冲高后回撤确认且收益覆盖成本"
     qty = max(LOT_SIZE, int(available * qty_ratio / LOT_SIZE) * LOT_SIZE)
     qty = min(qty, available)
-    fill = price * (1 - SLIPPAGE)
-    amount = qty * fill
-    fees = _commission(amount) + amount * STAMP_SELL
     payload = {
-        "kind": "stock_inventory_t", "sell_price": round(fill, 4), "qty": qty,
+        "kind": "stock_inventory_t", "reference_price": round(price, 4), "qty": qty,
         "quote_at": quote.get("quote_at"),
         "edge_pct": round(edge * 100, 2), "trigger": trigger,
         "opening_event": bool(opening_event), "opening_assessment": event,
@@ -11885,21 +12048,39 @@ def _intraday_sell(conn, account, position, quote, asof_day, profile, cycle, ope
             plan={
                 "side": "sell", "code": position["code"],
                 "name": position.get("name"), "qty": qty,
-                "fill_price": fill, "amount": amount, "fees": fees,
-                "quote_at": quote.get("quote_at"),
+                "quote_at": quote.get("quote_at"), "execution_quote": quote,
             },
             order_id=order_id,
             asof_day=asof_day,
             side="sell",
             action=audit_action,
             audit_action=audit_action,
-            audit_message=f"{position['code']} {qty}股 @ {fill:.2f}",
+            audit_message=f"{position['code']} {qty}股，参考价 {price:.2f}",
             risk_log_reason="开盘事件高抛通过" if opening_event else "日内高抛通过",
             reason=order_reason,
             detail=payload,
-            assumption="开盘/5分钟实时快照高抛，含滑点、佣金、印花税",
+            assumption="开盘/5分钟实时快照；成交价格和费用由模拟执行权威计算",
             sell_next_take_stage=None,
         )
+        committed = conn.execute(
+            "SELECT status,filled_qty,filled_price,realized_pnl,execution_reasons,"
+            "execution_version,risk_payload "
+            "FROM paper_orders WHERE id=?", (order_id,),
+        ).fetchone()
+        if not committed or str(committed[0]) not in {"filled", "partially_filled"}:
+            conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+            blocked = str(committed[4] or "execution_not_filled") if committed else "execution_state_unavailable"
+            return None, blocked
+        qty = int(committed[1] or 0)
+        fill = float(committed[2] or price)
+        pnl = float(committed[3] or 0.0)
+        final_payload = _loads(committed[6], {})
+        final_payload.update({"intended_qty": int(payload["qty"]), "qty": qty, "sell_price": fill})
+        conn.execute(
+            "UPDATE paper_orders SET risk_payload=? WHERE id=? AND execution_version=?",
+            (_json(final_payload), order_id, int(committed[5] or 0)),
+        )
+        payload = final_payload
         conn.execute(f"RELEASE SAVEPOINT {savepoint}")
     except Exception as exc:
         conn.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
@@ -11910,6 +12091,7 @@ def _intraday_sell(conn, account, position, quote, asof_day, profile, cycle, ope
     return {
         "order_id": cursor.lastrowid, "side": "sell", "code": position["code"],
         "qty": qty, "pnl": round(pnl, 2), "sell_price": round(fill, 4),
+        "status": str(committed[0]),
         "opening_event": bool(opening_event), "trigger": trigger,
     }, "高抛成交"
 
@@ -11970,7 +12152,7 @@ def _intraday_buyback(conn, account, position, quote, market, asof_day, profile,
     code_value = code_values.get(position["code"], 0.0)
     qty, sizing = _price_aware_qty(
         nav, shared_cash, value, industries.get(position.get("industry") or "未知", 0.0),
-        code_value, price * (1 + SLIPPAGE),
+        code_value, EP.estimated_fill_price(price, "buy"),
         SRE.effective_spec(conn, account["id"], ACCOUNT_SPECS.get(account["id"]) or {})["hard_stop"],
         profile,
         exposure_cap=RSET.get(conn, "shared_pool_exposure_cap", SHARED_POOL_MAX_EXPOSURE),
@@ -11986,9 +12168,9 @@ def _intraday_buyback(conn, account, position, quote, market, asof_day, profile,
     qty = min(qty, sold_qty)
     if qty < LOT_SIZE:
         return None, "价格或风控预算不足以回补一手"
-    fill = price * (1 + SLIPPAGE)
+    fill = EP.estimated_fill_price(price, "buy")
     amount = qty * fill
-    fees = _commission(amount)
+    fees = EP.estimate_execution_fees(amount, "buy")
     if amount + fees > shared_cash:
         return None, "共享资金池可用现金不足"
     if _entry_freeze_enabled():
@@ -12035,6 +12217,7 @@ def _intraday_buyback(conn, account, position, quote, market, asof_day, profile,
             "industry": position.get("industry"), "qty": qty,
             "planned_price": price, "fill_price": fill, "amount": amount,
             "fees": fees, "quote_at": quote.get("quote_at"),
+            "execution_quote": quote,
         },
         asof_day,
         reason=("确认后回补：新买份额次日可卖"
@@ -12134,7 +12317,7 @@ def _swing_scale_in(conn, account, position, quote, market, asof_day, profile, c
     code_value = code_values.get(position["code"], 0.0) + PCO.pending_symbol_amounts(
         conn, exclude_signal_id=None,
     ).get(position["code"], 0.0)
-    fill = price * (1 + SLIPPAGE)
+    fill = EP.estimated_fill_price(price, "buy")
     qty, sizing = _price_aware_qty(
         nav, shared_cash, position_value,
         industries.get(position.get("industry") or "未知", 0.0), code_value, fill,
@@ -12173,7 +12356,8 @@ def _swing_scale_in(conn, account, position, quote, market, asof_day, profile, c
     qty = min(qty, tranche)
     if qty < LOT_SIZE:
         return None, "剩余风险预算或仓位空间不足一手"
-    amount, fees = qty * fill, _commission(qty * fill)
+    amount = qty * fill
+    fees = EP.estimate_execution_fees(amount, "buy")
     if amount + fees > shared_cash:
         return None, "共享资金池可用现金不足"
     if _entry_freeze_enabled():
@@ -12217,6 +12401,7 @@ def _swing_scale_in(conn, account, position, quote, market, asof_day, profile, c
             "industry": position.get("industry"), "qty": qty,
             "planned_price": price, "fill_price": fill, "amount": amount,
             "fees": fees, "quote_at": quote.get("quote_at"),
+            "execution_quote": quote,
         },
         asof_day, reason=label, detail=detail, action="swing_scale_in",
         is_t_base=True,
@@ -12648,6 +12833,7 @@ def monitor_intraday(asof_datetime=None, force=False):
         # 午后窗口同样先跑完整持仓风控；本分支随后只生成候选/事件，
         # 不得让待买或事件处理抢在风险退出之前。
         opening_risk = monitor_risk(day)
+        execution_orders = process_pending_execution_orders(day)
         opening_event = monitor_opening_events(day, event_clock=clock)
         bootstrap = (
             _bootstrap_signals_for_today(day, live_universe=live_universe, source_slot="open_scan")
@@ -12665,6 +12851,7 @@ def monitor_intraday(asof_datetime=None, force=False):
             "market": market, "bootstrap": bootstrap,
             "opening_event": opening_event,
             "risk": opening_risk,
+            "execution_orders": execution_orders,
             "running_accounts": len(accounts), "data_source_health": data_source_health,
             "live_universe_coverage": len(live_universe),
         }
@@ -12674,6 +12861,9 @@ def monitor_intraday(asof_datetime=None, force=False):
     # previously suppressed scan markers, recovery bookkeeping and pending
     # manual-order handling after a restart.
     risk_result = monitor_risk(day)
+    execution_orders = []
+    if not scan_ready:
+        execution_orders = process_pending_execution_orders(day)
     bootstrap = (
         _bootstrap_signals_for_today(day, live_universe=live_universe)
         if scan_ready else {"status": "blocked", "reason": scan_block, "accounts": []}
@@ -12704,6 +12894,7 @@ def monitor_intraday(asof_datetime=None, force=False):
             "reason": "首次建仓候选已检查，暂无可做T底仓",
             "bootstrap": bootstrap,
             "opening_event": open_result.get("opening_event"),
+            "execution_orders": open_result.get("execution_orders", execution_orders),
             "data_source_health": data_source_health,
             "live_universe_coverage": len(live_universe),
         }
@@ -12723,6 +12914,7 @@ def monitor_intraday(asof_datetime=None, force=False):
                 "reason": "持仓在行情抓取期间已被平仓或暂停",
                 "bootstrap": bootstrap,
                 "opening_event": open_result.get("opening_event"),
+                "execution_orders": open_result.get("execution_orders", execution_orders),
                 "data_source_health": data_source_health,
                 "live_universe_coverage": len(live_universe),
             }
@@ -12819,6 +13011,7 @@ def monitor_intraday(asof_datetime=None, force=False):
         return {"slot": "intraday", "date": day.isoformat(), "observed": len(positions), "orders": actions,
                 "market": live_market, "bootstrap": bootstrap,
                 "opening_event": open_result.get("opening_event"),
+                "execution_orders": open_result.get("execution_orders", execution_orders),
                 "data_source_health": data_source_health,
                 "live_universe_coverage": len(live_universe),
                 "note": "3分钟监控仅观察；未满足阈值时不生成订单"}
@@ -13999,6 +14192,12 @@ def _recent_orders_with_archives(conn, account_names, limit=500):
     orders = PRP.recent_live_orders(conn, account_names, live_window)
 
     orders.extend(_archived_order_rows(conn))
+    for order in orders:
+        if "execution_market_freshness" not in order:
+            order.update(PRP.execution_display_facts(
+                order.get("execution_evidence"), order.get("execution_reasons"),
+            ))
+        order.pop("execution_evidence", None)
     orders.sort(
         key=lambda item: (item.get("executed_at") or item.get("created_at") or "", item.get("id") or 0),
         reverse=True,
@@ -14098,9 +14297,11 @@ def stock_trade_history(code, account_id=None):
         args = (code, account_id) if account_id else (code,)
         orders = _rows(
             conn,
-            f"""SELECT o.*,f.fill_date AS fill_date,f.quote_at AS fill_quote_at,f.assumption AS fill_assumption
+            f"""SELECT o.*,
+                         (SELECT MAX(f.fill_date) FROM paper_fills f WHERE f.order_id=o.id) AS fill_date,
+                         (SELECT f.quote_at FROM paper_fills f WHERE f.order_id=o.id ORDER BY f.id DESC LIMIT 1) AS fill_quote_at,
+                         (SELECT f.assumption FROM paper_fills f WHERE f.order_id=o.id ORDER BY f.id DESC LIMIT 1) AS fill_assumption
                   FROM paper_orders o
-                  LEFT JOIN paper_fills f ON f.order_id=o.id
                   {where}
                   ORDER BY COALESCE(o.executed_at,o.created_at) DESC,o.id DESC""",
             args,
@@ -14108,6 +14309,10 @@ def stock_trade_history(code, account_id=None):
         for order in orders:
             order.pop("risk_payload", None)
             order["account_name"] = account_names.get(order["account_id"], order["account_id"])
+            order.update(PRP.execution_display_facts(
+                order.get("execution_evidence"), order.get("execution_reasons"),
+            ))
+            order.pop("execution_evidence", None)
         fills = _rows(
             conn,
             "SELECT * FROM paper_fills WHERE code=?" + (" AND account_id=?" if account_id else "") + " ORDER BY fill_date DESC, id DESC",
@@ -14115,6 +14320,10 @@ def stock_trade_history(code, account_id=None):
         )
         for fill in fills:
             fill["account_name"] = account_names.get(fill["account_id"], fill["account_id"])
+            fill.update(PRP.execution_display_facts(
+                fill.get("execution_evidence"), None,
+            ))
+            fill.pop("execution_evidence", None)
         # 重置周期会将账本归档成只读快照；个股档案必须同时查询这些归档，
         # 否则“全部历史”会在重置后错误地只剩当前周期。
         archives = _rows(conn, "SELECT cycle_key,snapshot,created_at FROM paper_archives ORDER BY id DESC")
@@ -14124,30 +14333,48 @@ def stock_trade_history(code, account_id=None):
                 row.get("id"): row.get("name")
                 for row in (snapshot.get("paper_accounts") or [])
             }
-            archived_fills = {
-                item.get("order_id"): item
-                for item in (snapshot.get("paper_fills") or [])
-                if str(item.get("code") or "") == code
-            }
+            # 一笔委托可以有**多笔** FillEvent（部分成交）。这里必须按 order_id
+            # 聚成列表：旧实现用 ``{order_id: fill}`` 会让后一笔覆盖前一笔，
+            # 归档后历史接口只能看到其中一笔成交，这是不可接受的对账缺口。
+            archived_fills = {}
+            for archived_fill in (snapshot.get("paper_fills") or []):
+                if str(archived_fill.get("code") or "") != code:
+                    continue
+                archived_fills.setdefault(archived_fill.get("order_id"), []).append(archived_fill)
+            for order_fills in archived_fills.values():
+                order_fills.sort(key=lambda item: item.get("id") or 0)
             for order in snapshot.get("paper_orders") or []:
                 if str(order.get("code") or "") != code or (account_id and order.get("account_id") != account_id):
                     continue
                 item = dict(order)
                 item.pop("risk_payload", None)
-                fill = archived_fills.get(item.get("id")) or {}
-                item["fill_date"] = fill.get("fill_date")
-                item["fill_quote_at"] = fill.get("quote_at")
-                item["fill_assumption"] = fill.get("assumption")
+                # 订单行摘要保持与活动表读路径同一口径：成交日期取该订单所有
+                # 成交里的**最大** fill_date，行情源时点/假设取最后一笔成交。
+                order_fills = archived_fills.get(item.get("id")) or []
+                latest = order_fills[-1] if order_fills else {}
+                fill_dates = [str(fill.get("fill_date") or "") for fill in order_fills]
+                item["fill_date"] = max(fill_dates) if any(fill_dates) else None
+                item["fill_quote_at"] = latest.get("quote_at")
+                item["fill_assumption"] = latest.get("assumption")
                 item["account_name"] = archived_accounts.get(item.get("account_id"), item.get("account_id"))
                 item["archived_cycle"] = archive.get("cycle_key")
+                item.update(PRP.execution_display_facts(
+                    item.get("execution_evidence"), item.get("execution_reasons"),
+                ))
+                item.pop("execution_evidence", None)
                 orders.append(item)
-            for fill in archived_fills.values():
-                if account_id and fill.get("account_id") != account_id:
-                    continue
-                item = dict(fill)
-                item["account_name"] = archived_accounts.get(item.get("account_id"), item.get("account_id"))
-                item["archived_cycle"] = archive.get("cycle_key")
-                fills.append(item)
+            for order_fills in archived_fills.values():
+                for fill in order_fills:
+                    if account_id and fill.get("account_id") != account_id:
+                        continue
+                    item = dict(fill)
+                    item["account_name"] = archived_accounts.get(item.get("account_id"), item.get("account_id"))
+                    item["archived_cycle"] = archive.get("cycle_key")
+                    item.update(PRP.execution_display_facts(
+                        item.get("execution_evidence"), None,
+                    ))
+                    item.pop("execution_evidence", None)
+                    fills.append(item)
         orders.sort(key=lambda item: (item.get("executed_at") or item.get("created_at") or "", item.get("id") or 0), reverse=True)
         fills.sort(key=lambda item: (item.get("fill_date") or "", item.get("id") or 0), reverse=True)
         positions = [

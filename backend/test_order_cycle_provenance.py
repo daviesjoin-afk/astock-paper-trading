@@ -85,10 +85,18 @@ class SchemaContractTests(_RealLedgerCase):
         self.assertEqual(_cycle_columns(self.conn, "paper_orders"),
                          _cycle_columns(self.conn, "paper_orders_archive"))
 
-    def test_cycle_id_is_the_last_column_on_both_tables(self):
-        """新列加在末尾 ⇒ fresh DB 与 migrated DB 得到相同最终列顺序。"""
+    def test_execution_fields_follow_cycle_provenance_on_both_tables(self):
+        """R26 execution facts append after the existing frozen cycle field."""
+        execution_fields = (
+            "filled_qty", "remaining_qty", "execution_asof",
+            "execution_reasons", "execution_evidence", "pricing_basis", "slippage",
+            "ruleset_version", "execution_version",
+        )
         for table in ("paper_orders", "paper_orders_archive"):
-            self.assertEqual(_cycle_columns(self.conn, table)[-1], "cycle_id")
+            columns = _cycle_columns(self.conn, table)
+            self.assertEqual(columns[-1], "execution_version")
+            for column in execution_fields:
+                self.assertGreater(columns.index(column), columns.index("cycle_id"))
 
     def test_insert_and_immutability_guards_are_installed(self):
         """§11/§12：live 表有 INSERT + immutable guard；archive 只有 immutable。"""

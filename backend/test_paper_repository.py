@@ -75,7 +75,9 @@ class PaperRepositoryTests(unittest.TestCase):
                 name TEXT, qty INTEGER, planned_price REAL, filled_price REAL, amount REAL,
                 fees REAL, status TEXT, reason TEXT, realized_pnl REAL, created_at TEXT,
                 executed_at TEXT, order_type TEXT, origin TEXT, expires_at TEXT, cancelled_at TEXT,
-                risk_payload TEXT
+                filled_qty INTEGER, remaining_qty INTEGER, execution_asof TEXT,
+                execution_reasons TEXT, pricing_basis TEXT, slippage REAL,
+                ruleset_version TEXT, execution_evidence TEXT, risk_payload TEXT
             )"""
         )
         self.conn.execute(
@@ -85,6 +87,20 @@ class PaperRepositoryTests(unittest.TestCase):
         self.assertEqual(rows[0]["account_name"], "策略 A")
         self.assertIsNone(rows[0]["archived_cycle"])
         self.assertNotIn("risk_payload", rows[0])
+        self.assertNotIn("execution_evidence", rows[0])
+        self.assertEqual(rows[0]["execution_reasons"], [])
+
+    def test_execution_display_facts_projects_only_market_trust_and_reasons(self):
+        facts = repository.execution_display_facts(
+            '{"decision":{"market_evidence":{"freshness":"fresh",'
+            '"verification":"verified","availability":"available",'
+            '"as_of":"2026-09-10"}}}',
+            '["T1_NOT_SELLABLE","MARKET_STALE"]',
+        )
+        self.assertEqual(facts["execution_market_freshness"], "fresh")
+        self.assertEqual(facts["execution_market_verification"], "verified")
+        self.assertEqual(facts["execution_market_asof"], "2026-09-10")
+        self.assertEqual(facts["execution_reasons"], ["T1_NOT_SELLABLE", "MARKET_STALE"])
 
 
 if __name__ == "__main__":

@@ -62,11 +62,8 @@ def _manual_order_plan(
         LOT_SIZE,
         RSET,
         SHARED_POOL_MAX_EXPOSURE,
-        SLIPPAGE,
         _spec_for,
-        STAMP_SELL,
         _asset_type,
-        _commission,
         _completed_kline,
         _date,
         _dynamic_position_limits,
@@ -292,7 +289,8 @@ def _manual_order_plan(
             nav, shared_cash, position_value, industry_value, code_value,
             # PR-39：用户策略账户不在 ACCOUNT_SPECS 里，直接下标会 KeyError；
             # 统一走 paper_trading._spec_for（内置 → 表，用户 → RuntimeContext）。
-            fill_reference * (1 + SLIPPAGE), _spec_for(account_id, conn=conn)["hard_stop"], profile,
+            EP.estimated_fill_price(fill_reference, "buy"),
+            _spec_for(account_id, conn=conn)["hard_stop"], profile,
             exposure_cap=RSET.get(conn, "shared_pool_exposure_cap", SHARED_POOL_MAX_EXPOSURE),
             max_exposure_cap=RSET.get(conn, "shared_pool_exposure_cap", SHARED_POOL_MAX_EXPOSURE),
             strategy_position_value=strategy_budget["current_amount"],
@@ -366,15 +364,10 @@ def _manual_order_plan(
                 "kind": "limit_down",
                 "reason": f"当前触及 {limit_pct:.1f}% 跌停保护",
             }
-    fill_price = (
-        min(price * (1 + SLIPPAGE), _num(limit_price))
-        if side == "buy" and order_type == "limit" and plan["triggered"]
-        else max(price * (1 - SLIPPAGE), _num(limit_price))
-        if side == "sell" and order_type == "limit" and plan["triggered"]
-        else price * (1 + SLIPPAGE if side == "buy" else 1 - SLIPPAGE)
+    fill_price, amount, fees = EP.estimate_execution_terms(
+        price, plan["qty"], side,
+        limit_price=(limit_price if order_type == "limit" and plan["triggered"] else None),
     )
-    amount = max(plan["qty"], 0) * max(fill_price, 0)
-    fees = _commission(amount) + (amount * STAMP_SELL if side == "sell" else 0.0)
     if side == "buy":
         # 共享资金池可用性（含在途预占）同样交给 planner，保持与自动路径同口径。
         cash_check = EP.cash_gate(
@@ -447,7 +440,7 @@ def _execute_manual_plan(conn, account, plan, order_id, asof_day):
     return EP.commit_fill(
         conn,
         account=account,
-        plan=plan,
+        plan={**plan, "execution_quote": plan.get("quote")},
         order_id=order_id,
         asof_day=asof_day,
         reserved=True,
@@ -633,6 +626,7 @@ def commit_strategy_entry_fill(
                 "industry": plan.get("industry"), "qty": plan["qty"],
                 "fill_price": plan["fill_price"], "amount": plan["amount"],
                 "fees": plan["fees"], "quote_at": quote.get("quote_at"),
+                "execution_quote": quote,
             },
             order_id=order_id,
             asof_day=asof_day,
@@ -647,6 +641,30 @@ def commit_strategy_entry_fill(
             assumption="实时价 + 0.10% 滑点",
             is_t_base=True,
         )
+        committed = conn.execute(
+            "SELECT status,filled_qty,remaining_qty,execution_reasons,filled_price FROM paper_orders WHERE id=?",
+            (order_id,),
+        ).fetchone()
+        if not committed or str(committed[0]) != "filled":
+            filled_qty = int(committed[1] or 0) if committed else 0
+            remaining_qty = int(committed[2] or 0) if committed else int(plan["qty"])
+            reason_codes = str(committed[3] or "execution_not_filled") if committed else "execution_state_unavailable"
+            signal_status = "partially_filled" if filled_qty > 0 else "pending"
+            conn.execute(
+                "UPDATE paper_signals SET status=?,reason=? WHERE id=?",
+                (signal_status, reason_codes, signal["id"]),
+            )
+            conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+            return {
+                "filled": filled_qty > 0,
+                "partial": str(committed[0]) == "partially_filled" if committed else False,
+                "status": str(committed[0]) if committed else "unknown",
+                "filled_qty": filled_qty,
+                "remaining_qty": remaining_qty,
+                "filled_price": float(committed[4]) if committed and committed[4] is not None else None,
+                "reasons": reason_codes,
+                "order_id": order_id,
+            }
         _assert_active_lease(conn, "strategy fill finalization")
         slice_done = slice_state is None
         if slice_state is not None:
@@ -693,7 +711,6 @@ def submit_manual_order(
         ENTRY_FROZEN_WAITLIST_STATUS,
         MANUAL_EXECUTION_RETRY_STATUS,
         _audit,
-        _commission,
         _date,
         _db,
         _entry_frozen_reason,
@@ -712,6 +729,7 @@ def submit_manual_order(
         init_db,
     )
     from paper_trading import ReservationCycleMismatch as _ReservationCycleMismatch
+    import execution_planner as EP
     init_db()
     day = _date(asof_date)
     with _db() as snapshot_conn:
@@ -769,7 +787,7 @@ def submit_manual_order(
                 else _num(plan.get("fill_price"))
             )
             reserve_amount = max(0, int(plan.get("qty") or 0)) * max(reserve_price, 0.0)
-            reserve_fees = _commission(reserve_amount)
+            reserve_fees = EP.estimate_execution_fees(reserve_amount, "buy")
             # §40：已经有 durable order id 的预占必须带上订单周期 ——
             # 预先存在的同 key 预占若记在别的周期上，resize 会把它按本订单的
             # 规模改写，形成 durable provenance mismatch。
@@ -804,7 +822,11 @@ def submit_manual_order(
             try:
                 _execute_manual_plan(conn, account, plan, order_id, day)
                 conn.execute(f"RELEASE SAVEPOINT {savepoint}")
-                status = "filled"
+                order_after = conn.execute(
+                    "SELECT status,reason FROM paper_orders WHERE id=?", (order_id,),
+                ).fetchone()
+                status = str(order_after[0]) if order_after else "pending_execution"
+                reason = str(order_after[1] or "") if order_after else "执行状态不可读"
             except Exception as exc:
                 conn.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
                 conn.execute(f"RELEASE SAVEPOINT {savepoint}")
@@ -849,11 +871,17 @@ def cancel_manual_order(order_id):
         if not row:
             raise ValueError("未找到手动模拟委托")
         if row["status"] not in set(ENTRY_RETRY_ORDER_STATUSES):
-            raise ValueError("只有待触发的限价委托可以撤销")
-        conn.execute(
-            "UPDATE paper_orders SET status='cancelled',reason='用户撤销模拟委托',cancelled_at=? WHERE id=?",
-            (_now(), int(order_id)),
+            raise ValueError("只有仍有未成交份额的手动模拟委托可以撤销")
+        allowed = tuple(ENTRY_RETRY_ORDER_STATUSES)
+        placeholders = ",".join("?" for _ in allowed)
+        changed = conn.execute(
+            f"""UPDATE paper_orders
+                   SET status='cancelled',reason='用户撤销模拟委托',cancelled_at=?
+                 WHERE id=? AND status IN ({placeholders})""",
+            (_now(), int(order_id), *allowed),
         )
+        if changed.rowcount != 1:
+            raise ValueError("委托已成交或不再处于可撤销状态")
         _finish_capital_reservation(conn, order_id, "released")
         _audit(conn, row["account_id"], "manual_order_cancelled", f"order={order_id}")
     return {"order_id": int(order_id), "status": "cancelled"}
@@ -989,7 +1017,6 @@ def process_pending_manual_orders(asof_date=None):
         MANUAL_EXECUTION_RETRY_STATUS,
         _assert_active_lease,
         _audit,
-        _commission,
         _date,
         _db,
         _entry_freeze_enabled,
@@ -1149,7 +1176,7 @@ def process_pending_manual_orders(asof_date=None):
             if not plan["triggered"]:
                 reserve_price = _num(order.get("planned_price"), _num(plan.get("limit_price")))
                 reserve_amount = max(0, int(plan.get("qty") or 0)) * max(reserve_price, 0.0)
-                reserve_fees = _commission(reserve_amount)
+                reserve_fees = EP.estimate_execution_fees(reserve_amount, "buy")
                 # §2：本分支同样处理**已存在**订单的预占，必须带上订单周期 ——
                 # 否则「预占周期 == 订单周期」在这条路径上失去校验（旧预占可能记在
                 # 别的周期上，而 resize 会把它按本订单的规模改写）。
@@ -1186,7 +1213,7 @@ def process_pending_manual_orders(asof_date=None):
             ).fetchone())
             reserve_price = _num(plan.get("fill_price"), _num(order.get("planned_price")))
             reserve_amount = max(0, int(plan.get("qty") or 0)) * max(reserve_price, 0.0)
-            reserve_fees = _commission(reserve_amount)
+            reserve_fees = EP.estimate_execution_fees(reserve_amount, "buy")
             try:
                 reserved, reserve_reason = _reserve_shared_capital(
                     conn, order["id"], order["account_id"], order["code"],
@@ -1224,7 +1251,15 @@ def process_pending_manual_orders(asof_date=None):
             try:
                 _execute_manual_plan(conn, account, plan, order["id"], day)
                 conn.execute(f"RELEASE SAVEPOINT {savepoint}")
-                output.append({"order_id": order["id"], "status": "filled"})
+                state = conn.execute(
+                    "SELECT status,filled_qty,remaining_qty,reason FROM paper_orders WHERE id=?",
+                    (order["id"],),
+                ).fetchone()
+                output.append({
+                    "order_id": order["id"], "status": state[0],
+                    "filled_qty": state[1], "remaining_qty": state[2],
+                    "reason": state[3],
+                })
             except Exception as exc:
                 conn.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
                 conn.execute(f"RELEASE SAVEPOINT {savepoint}")

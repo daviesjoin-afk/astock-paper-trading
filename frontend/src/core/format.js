@@ -112,7 +112,20 @@ export function zhRiskText(value){
     'active':'运行中', 'paper-risk-v4-shadow':'风控模型 V4（审计模式）',
     'exit_pending_data':'等待有效行情后退出', 'rejected_stale_quote':'行情核验未通过',
     'held_t1':'T+1 锁定', 'unfilled_limit_down':'跌停未成交',
-    'filled':'已成交', 'pending':'待处理', 'local_cache':'本地缓存', 'unverified':'未核验', 'invalid':'无效', 'cross_source_failed':'双源核验未通过', 'cross_source_unavailable':'独立行情源未返回'
+    'MARKET_UNAVAILABLE':'缺少可用于成交的行情', 'MARKET_STALE':'成交行情已过期',
+    'MARKET_UNVERIFIED':'成交行情未通过双源核验', 'MARKET_DISAGREEMENT':'双源行情不一致',
+    'OUT_OF_SESSION':'当前不在连续交易时段', 'TRADABILITY_UNKNOWN':'缺少可交易性证据',
+    'SUSPENDED':'停牌，不可成交', 'PRICE_LIMIT_LOCKED':'涨跌停封板，不可成交',
+    'INVALID_QUANTITY':'委托数量不符合整手规则', 'T1_NOT_SELLABLE':'T+1 锁定，暂无可卖份额',
+    'INSUFFICIENT_LIQUIDITY':'成交量不足，等待后续成交', 'INSUFFICIENT_CASH':'可用资金不足',
+    'LIMIT_PRICE_NOT_REACHED':'限价未触发', 'CANCELLED':'委托已撤销',
+    'ORDER_NOT_WORKING':'委托已不在可执行状态',
+    'verified_quote_plus_deterministic_slippage':'可信行情加固定滑点',
+    'last_verified_quote':'最后可信行情',
+    'execution_quote':'成交行情', 'verified':'双源核验通过',
+    'single_source':'单源核验', 'disagreement':'双源不一致', 'unavailable':'不可用',
+    'not_attempted':'未核验',
+    'filled':'已成交', 'pending':'待处理', 'local_cache':'本地缓存', 'unverified':'未核验', 'invalid':'无效'
   };
   Object.keys(replacements).forEach(function(key){ text=text.split(key).join(replacements[key]); });
   return text;

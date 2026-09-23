@@ -770,6 +770,126 @@ Risk → Order → Fill（各自既有 authority）
    `work/r25_mutation_check.py`（M-SIG1 ~ M-SIG8 + M-SIG-D1，9/9 CAUGHT、
    0 survived、0 fake）。
 
+## Simulation Execution Fidelity（R26）
+
+### 唯一成交权威
+
+R25 的 approved signal 只形成已批准的订单意图，不再等于成交。自动策略买入先持久化
+`pending_execution` 委托，后续执行窗口携带新取得的 quote 到唯一成交权威；手动单、
+风险退出、日内交易也都把执行行情与日期交给同一入口：
+
+```text
+R24 MarketDataSnapshot / R25 approved signal + frozen provenance
+                         ↓
+                paper_orders intent
+                         ↓
+       ExecutionContext（quote / as-of / account / lots / tradability）
+                         ↓
+ execution_planner.evaluate_simulated_execution（纯规则）
+                         ↓
+            execution_planner.commit_fill（唯一状态与账务提交）
+                ├── blocked / working / partial / full / cancelled
+                ├── paper_fills（逐笔事件）
+                ├── paper_position_lots / position risk state
+                └── cash reservations / shared cash / audit
+```
+
+`execution_planner.py` 已是现存的订单复核、重验与 fill SQL owner，因此 R26 在此扩展
+执行边界，没有新增 `execution_service` 转发层。模块的业务责任是基于一个已批准的
+持久订单与冻结上下文，决定本次模拟是否成交及数量、价格、费用、原因；输入是 order、
+事务外取得的行情 quote、显式执行日、账户/lot 状态和历史可交易性档案；输出是不可变
+`ExecutionDecision`，并由 `commit_fill` 原子写入 `FillEvent` 与账本。依赖方向是
+`caller → execution_planner → market_data_contract / paper_trading_rules / ledger ports`；
+执行 authority 不访问 provider，不重新裁决策略，也不生成或升级 signal。把这份职责放在
+已经拥有唯一 fill writer 的模块，避免第二个服务层与跨层同步账本状态。
+
+**执行不依赖 signal 层。** 行情可信度是**行情边界**的事实，不是信号层的结论，因此
+执行只消费 R24 契约：逐票报价 → `MarketDataSnapshot` 的映射由
+`market_data_contract.symbol_quote_snapshot` 独占，执行侧不再经 `signal_service`
+转一手。依赖方向固定为 `Market Data → Execution`（而不是 `Signal → Execution`），
+架构护栏 Guard 15 静态禁止 `execution_planner` import `signal_service`，也禁止它
+自行构造 `MarketDataSnapshot` —— 否则"这份行情有多可信"会在两条路径上各自解释。
+
+### 执行事实与状态语义
+
+| 执行问题 | R26 authority 与行为 |
+| --- | --- |
+| 行情可信与 freshness | 使用 R24 `MarketDataReading` 和 `EXECUTION_QUOTE_POLICY`；缺失、过期、未验证、双源不一致都不成交 |
+| 交易日、执行时点、时段 | quote 带显式 `execution_asof`；只允许连续交易时段；历史回放保留 quote 自己的历史观测时间，不替换成当前时钟 |
+| suspension / 涨跌停锁定 | 读取 `tradability_archive` 对应交易日与决策时点的 PIT 证据；停牌和方向性封板给出稳定 reason code 并阻断 |
+| T+1 | `execution_context_from_facts` 从订单所属周期的 lots 计算当日可卖份额；`_consume_available_lots` 在提交时再次保护，不足即回滚 |
+| 整手与数量 | 买入整手；卖出整手，只有清空可卖余股时允许 odd lot；无效数量拒绝，不向下静默取整 |
+| 流动性与部分成交 | 可成交数量受行情累计成交额 / price × 1% participation cap 约束并按 lot 取整，再扣掉**本 session 截至 `execution_asof` 已消耗的模拟成交量**（见下）；未成交部分保留在 `remaining_qty`，下次用新的 quote 重试 |
+| 同日累计容量 | `consumed_session_quantity(symbol, session_date, execution_asof)` 按 symbol × session 聚合已成交股数，只统计 `quote_at <= execution_asof` 的 FillEvent；缺时间戳的 legacy 流水按"已消耗"处理（fail conservative） |
+| 限价委托 | 对确定性滑点后的模拟价比较限价；没触价保持 `pending_limit` |
+| 滑点、费用 | `SIMULATED_SLIPPAGE_RATE=0.10%` 按 side 确定性应用；佣金与 SELL 印花税在 authority 统一计算并逐笔持久化 |
+| 撤单 | 手动委托只撤未成交份额；已成交 fill 不回滚；CAS 状态更新使终态委托不能继续成交 |
+| 幂等与并发 | `_fill_event_key(order_id, quote_at, ruleset_version)` 是唯一事件身份（绑定 order × 行情观测 × ruleset，刻意不含墙上时钟）；数据库唯一键、执行版本 CAS 与账务 writer transaction 共同阻止重复成交、超额成交和资金/持仓不一致 |
+| lineage | 执行只消费持久订单上的 signal、cycle、strategy version/checksum；cycle 守卫验证订单和账户归属，不用新策略版本改写历史委托。BUY 成交的 lot 通过 `source_fill_id` 指向**那一笔** FillEvent |
+
+执行证据投影持久化 `execution_asof`、市场 freshness / verification / as-of、tradability
+facts、reason codes、pricing basis、slippage、fees、ruleset version，以及**流动性推导**
+（观察到多少累计成交量、参与率、本 session 已消耗多少、本次可执行上限）。前端仅按后端
+结果展示工作中、部分成交、已成交、拒绝、撤销，以及逐笔成交数量和证据；T+1、时段、封板、
+成交量、费用和滑点规则都不在浏览器重新计算。
+
+### "整单是否成交" vs "这笔委托是否已经成交过一部分"
+
+这两个问题的答案**刻意分开**，混用会同时产生两个方向的错误：
+
+| 问题 | 判据 | 部分成交的答案 |
+| --- | --- | --- |
+| 这张订单**是否被证明完整成交**？ | `execution_verification.VERIFIED_PREDICATE`（`execution_verified=1 AND execution_status='verified'`） | **否**（`status='partial'`，`execution_verified=0`） |
+| 这笔委托**是否已经真实成交过一部分**？ | `execution_verification.POSITIVE_EXECUTION_PREDICATE`（`verified` 或 `partial`，两列须一致） | **是** |
+
+用前者回答后者，就会把"已经卖出的 300 股"读成"什么都没发生"，于是风险扫描每轮再发一张
+同样的减仓单（300+300+300…）。用后者回答前者，则部分成交会冒充完整成交。因此：
+
+- **风险一次性动作去重**用后者：`execution_verification.has_verified_positive_execution(...)`
+  是"这个 risk marker 是否已执行过"的唯一实现，取代了此前散在 `paper_risk_service` 里的
+  4 处手写 `status='filled'` SQL。命中即不再新建同样的减仓单；而那张订单自己**剩余的份额**
+  仍由执行权威在后续行情事件里继续执行 —— **动作去重 ≠ 订单剩余量执行**，两者必须分开。
+- **仓位、成本、已实现盈亏**用后者：部分成交的 300 股是已发生的事实，参与 lot / cash /
+  FIFO 重建。
+- **胜率、完整成交统计**继续用前者。
+
+读路径选取"可能携带流水的委托"用 `FILL_CARRYING_PREDICATE`（生命周期维度），而不是
+硬编码 `status='filled'`：选取与证据是两件事，选取漏行会静默 fail open。
+
+### 本轮收敛修复的四个已确认缺陷
+
+| 缺陷 | 症状 | 修复 |
+| --- | --- | --- |
+| 部分成交 signal 被对账降级 | 自动 BUY 部分成交后 `signal.status='partially_filled'`，但 `_reconcile_signal_order_states` 又映射回 `pending` | 映射表把 `partially_filled` 映射到自身 |
+| 归档丢失同一订单的多笔成交 | `archived_fills = {order_id: fill}` 让后一笔覆盖前一笔，历史接口每单只见 1 笔 | 按 order_id 聚成列表；订单行摘要取该单最大 `fill_date` |
+| 风控部分减仓去重失效（merge blocker） | 目标卖 1000 只成交 300 时 `status='partially_filled'`，去重判据看不见 ⇒ 下轮重复减仓 | 4 处去重改用 `has_verified_positive_execution`（正成交口径） |
+| 同日累计流动性重复消费 | 行情给出的是**累计**成交额，10:00 吃过 1%，10:05 的 snapshot 仍含前面那部分量，又吃一份 | 容量 = 累计参与额度 − 本 session 截至 `execution_asof` 已消耗量 |
+
+### 迁移范围与核验
+
+- 生产仍有 7 个 `paper_orders` INSERT：其中包括意图创建、人工委托、风险退出和等待标记；
+  它们只记录 intent / queue。成交状态、累计/剩余份额和 fill event 由 `commit_fill` 管理。
+- `paper_fills` 生产 writer 保持 1 个（R25 之前数量也是 1），但此前调用方可直接请求 full
+  fill；现在每一笔必须先通过 R26 的纯执行评估。自动 BUY 的旧同步捷径（approved 即
+  `status='filled'` 并预写 full quantity / price）已删除，改为 pending intent 和可重试执行。
+- 现金 debit/credit 与 lot 创建/FIFO 消耗仍各有账务原语；R26 把它们限制在唯一成交提交的
+  原子事务中。`paper_positions` 继续是兼容投影，不成为持仓执行权威。
+- 行情获取在写事务外完成，再把不可变 `ExecutionContext` 传给 authority；writer 内只读
+  本地账本与 PIT archive，不联网。
+- 回归门禁：`backend/test_execution_planner.py`（规则、状态、费用、滑点与委托 writer），
+  `backend/test_production_path_golden_replay.py`（approved signal → 执行 → 部分成交重试、
+  T+1、现金与 position parity），`backend/test_strategy_buy_commit_convergence.py`，
+  `backend/test_sell_fill_commit_convergence.py`；本轮收敛的永久锚点在
+  `backend/test_r26_convergence_regressions.py`（部分成交 signal 对账、归档逐笔保留、
+  风控部分减仓去重、同日累计容量、手动剩余量复核、session/时区边界、事件幂等），
+  架构边界在 `backend/test_r26_execution_authority_guard.py`（Guard 15~20），
+  上一版本兼容性在 `backend/test_r26_previous_version_compatibility.py`。前端展示由
+  `frontend/tests/execution-display.test.mjs` 与 `frontend/e2e/specs/execution-display.spec.js`
+  覆盖。语义 mutation 在 `work/r26_mutation_check.py`：T+1、stale、liquidity、remaining、
+  cancel、historical as-of、duplicate event、fees、slippage、locked limit、部分 signal 对账、
+  风控部分去重、归档 collapse、累计容量、手动剩余量、signal 依赖回流、集合竞价时段，
+  必须全部 CAUGHT（survived = 0）。
+
 ## 目标依赖方向
 
 ```text

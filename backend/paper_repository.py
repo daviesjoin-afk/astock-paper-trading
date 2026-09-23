@@ -11,6 +11,8 @@
 """
 from __future__ import annotations
 
+import json
+
 import strategy_registry as SR
 
 try:  # ``backend`` on sys.path（生产与 ``cd backend`` 测试）
@@ -136,7 +138,8 @@ def recent_live_orders(conn, account_names, limit):
     fields = (
         "id,account_id,signal_id,side,code,name,qty,planned_price,filled_price,"
         "amount,fees,status,reason,realized_pnl,created_at,executed_at,"
-        "order_type,origin,expires_at,cancelled_at"
+        "order_type,origin,expires_at,cancelled_at,filled_qty,remaining_qty,"
+        "execution_asof,execution_reasons,pricing_basis,slippage,ruleset_version,execution_evidence"
     )
     orders = rows(
         conn,
@@ -147,4 +150,40 @@ def recent_live_orders(conn, account_names, limit):
         account_id = order.get("account_id")
         order["account_name"] = account_names.get(account_id, account_id)
         order["archived_cycle"] = None
+        order.update(execution_display_facts(
+            order.pop("execution_evidence", None), order.get("execution_reasons"),
+        ))
     return orders
+
+
+def execution_display_facts(evidence, reasons=None):
+    """Return the small, read-only execution facts needed by paper history UI."""
+    if isinstance(evidence, str):
+        try:
+            evidence = json.loads(evidence)
+        except (TypeError, ValueError):
+            evidence = {}
+    evidence = evidence if isinstance(evidence, dict) else {}
+    decision = evidence.get("decision") or evidence
+    market = decision.get("market_evidence") or evidence.get("market") or {}
+    if isinstance(market, str):
+        try:
+            market = json.loads(market)
+        except (TypeError, ValueError):
+            market = {}
+    if not isinstance(market, dict):
+        market = {}
+    if isinstance(reasons, str):
+        try:
+            reasons = json.loads(reasons)
+        except (TypeError, ValueError):
+            reasons = [reasons] if reasons else []
+    if not isinstance(reasons, (list, tuple)):
+        reasons = []
+    return {
+        "execution_reasons": [str(item) for item in reasons],
+        "execution_market_freshness": market.get("freshness"),
+        "execution_market_verification": market.get("verification"),
+        "execution_market_availability": market.get("availability"),
+        "execution_market_asof": market.get("as_of"),
+    }

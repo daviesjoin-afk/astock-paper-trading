@@ -41,18 +41,84 @@ def ensure_paper_columns(conn):
             "expires_at": "TEXT",
             "cancelled_at": "TEXT",
             "retry_of_order_id": "INTEGER",
+            "filled_qty": "INTEGER NOT NULL DEFAULT 0",
+            "remaining_qty": "INTEGER",
+            "execution_asof": "TEXT",
+            "execution_reasons": "TEXT NOT NULL DEFAULT '[]'",
+            "execution_evidence": "TEXT NOT NULL DEFAULT '{}'",
+            "pricing_basis": "TEXT",
+            "slippage": "REAL NOT NULL DEFAULT 0",
+            "ruleset_version": "TEXT",
+            "execution_version": "INTEGER NOT NULL DEFAULT 0",
         },
     )
     # 归档表列集必须与活跃表一致（retention 用 SELECT * 整行拷贝）。
     changes["paper_orders_archive"] = ensure_columns(
         conn,
         "paper_orders_archive",
-        {"retry_of_order_id": "INTEGER"},
+        {
+            "retry_of_order_id": "INTEGER",
+            "filled_qty": "INTEGER NOT NULL DEFAULT 0",
+            "remaining_qty": "INTEGER",
+            "execution_asof": "TEXT",
+            "execution_reasons": "TEXT NOT NULL DEFAULT '[]'",
+            "execution_evidence": "TEXT NOT NULL DEFAULT '{}'",
+            "pricing_basis": "TEXT",
+            "slippage": "REAL NOT NULL DEFAULT 0",
+            "ruleset_version": "TEXT",
+            "execution_version": "INTEGER NOT NULL DEFAULT 0",
+        },
     )
+    changes["paper_fills"] = ensure_columns(
+        conn,
+        "paper_fills",
+        {
+            "event_key": "TEXT",
+            "execution_asof": "TEXT",
+            "pricing_basis": "TEXT",
+            "slippage": "REAL NOT NULL DEFAULT 0",
+            "market_evidence": "TEXT NOT NULL DEFAULT '{}'",
+            "ruleset_version": "TEXT",
+            "execution_evidence": "TEXT NOT NULL DEFAULT '{}'",
+        },
+    )
+    if table_columns(conn, "paper_fills"):
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_paper_fills_event_key "
+            "ON paper_fills(event_key) WHERE event_key IS NOT NULL"
+        )
+    # Preserve only fill quantities supported by existing immutable fill rows.
+    # An old order status by itself is never upgraded into fill evidence.
+    if table_columns(conn, "paper_orders") and table_columns(conn, "paper_fills"):
+        conn.execute(
+            """UPDATE paper_orders
+                  SET filled_qty=COALESCE((SELECT SUM(f.qty) FROM paper_fills f
+                                            WHERE f.order_id=paper_orders.id),0),
+                      remaining_qty=MAX(0,qty-COALESCE((SELECT SUM(f.qty) FROM paper_fills f
+                                                         WHERE f.order_id=paper_orders.id),0))
+                WHERE remaining_qty IS NULL"""
+        )
+        conn.execute(
+            """CREATE TRIGGER IF NOT EXISTS trg_paper_orders_remaining_on_insert
+               AFTER INSERT ON paper_orders
+               WHEN NEW.remaining_qty IS NULL
+               BEGIN
+                   UPDATE paper_orders
+                      SET remaining_qty=MAX(0,NEW.qty-COALESCE(NEW.filled_qty,0))
+                    WHERE id=NEW.id;
+               END"""
+        )
     changes["paper_position_lots"] = ensure_columns(
         conn,
         "paper_position_lots",
-        {"cost_fee_included": "INTEGER NOT NULL DEFAULT 0"},
+        {
+            "cost_fee_included": "INTEGER NOT NULL DEFAULT 0",
+            # R26：lot 的**逐笔成交血缘**。``source_order_id`` 只说明"来自哪张委托"，
+            # 一笔委托可以有多个 FillEvent（部分成交）时无法证明某个 lot 到底由哪
+            # 一笔成交产生。历史旧 lot 保持 NULL —— 无法从任何当前状态反推它来自
+            # 哪笔流水，**绝不**按时间/价格猜一个 fill_id。
+            "source_fill_id": "INTEGER",
+        },
     )
     changes["paper_positions"] = ensure_columns(
         conn,

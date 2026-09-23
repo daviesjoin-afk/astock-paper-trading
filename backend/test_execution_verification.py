@@ -74,6 +74,7 @@ def _db():
         );
         """
     )
+    PSM.ensure_paper_columns(conn)
     PSM.ensure_execution_verification_columns(conn)
     # 账户绑定在 ORDER_CYCLE 上，active cycle 也是它 —— 即「账本与订单同周期」，
     # 这正是本文件其余用例想测的前提。
@@ -733,9 +734,10 @@ class CommitFillStampsTest(unittest.TestCase):
         from unittest import mock
 
         import execution_planner as EP
+        import test_position_risk_state as PRS
 
         conn = _db()
-        order_id = _insert_order(conn, status="pending", qty=100, price=10.0,
+        order_id = _insert_order(conn, status="pending_execution", qty=100, price=10.0,
                                  amount=1000.0, fees=5.0)
         # 周期归属成员从真实 paper_trading 取（不是抄一份）：本用例的要点是
         # 成交路径真的盖章，替身只隔离现金/lot 副作用，不隔离被断言的契约。
@@ -767,15 +769,21 @@ class CommitFillStampsTest(unittest.TestCase):
             _account_cycle_id_readonly=PT._account_cycle_id_readonly,
             OrderExecutionCycleChanged=PT.OrderExecutionCycleChanged,
         )
+        execution_quote, execution_context = PRS._approved_execution_facts(
+            dt.date.fromisoformat(SESSION), "buy", 100, 9.98,
+        )
         plan = {
             "side": "buy", "code": CODE, "qty": 100, "amount": 1000.0,
-            "fees": 5.0, "fill_price": 10.0, "quote_at": SESSION + "T10:00:00",
+            "fees": 5.0, "fill_price": 10.0,
+            "quote_at": execution_quote["quote_at"],
+            "execution_quote": execution_quote,
         }
         with mock.patch.object(EP, "_pt", lambda: stub):
             EP.commit_fill(
                 conn, account={"id": ACCOUNT}, plan=plan, order_id=order_id,
                 asof_day=dt.date(2024, 6, 18), reserved=False,
                 action="strategy_buy", reason="test",
+                execution_context=execution_context,
             )
         row = conn.execute(
             "SELECT status,execution_status,execution_verified FROM paper_orders"

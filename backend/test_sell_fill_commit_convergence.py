@@ -178,7 +178,7 @@ class RiskSellCommitConvergence(_R20RiskBase):
         self.assertEqual(int(fill["qty"]), 100)
         self.assertEqual(fill["fill_date"], self.day.isoformat())
         self.assertEqual(fill["quote_at"], self._inner.quotes_map[self.code]["quote_at"])
-        self.assertEqual(fill["assumption"], "实时价 - 0.10% 滑点，含佣金及印花税")
+        self.assertEqual(fill["assumption"], "由模拟执行权威根据已核验行情计算价格和费用")
         self.assertGreater(float(fill["price"]), 0)
         self.assertGreater(float(fill["amount"]), 0)
         self.assertGreater(float(fill["fees"]), 0)
@@ -195,14 +195,27 @@ class _R20IntradayBase(_R20RiskBase):
         self.conn.commit()
 
     def set_t_sell_quote(self, *, price=11.0, high=11.5, prev_close=11.0):
+        quote_at = f"{self.day.isoformat()} 10:30:00"
         self._inner.quotes_map[self.code] = {
             "code": self.code, "name": f"测试股_{self.code}", "price": price,
             "high": high, "low": round(price - 0.2, 4), "pct": 0.0,
-            "prev_close": prev_close, "amount": 100000.0, "volume": 10000.0,
+            "prev_close": prev_close, "amount": 10000000.0, "volume": 10000.0,
             "turnover": 1.0, "quote_source": "live",
-            "quote_at": f"{self.day.isoformat()} 10:30:00",
+            "quote_at": quote_at, "execution_asof": quote_at,
             "quote_validation": "cross_source_checked",
         }
+        import tradability_archive as TA
+        with PT._db(immediate=True) as conn:
+            TA.ensure_schema(conn)
+            TA.TradabilityArchiveRepository(conn).save(TA.TradabilityEvidence(
+                code=self.code, session_date=self.day.isoformat(), is_listed=True,
+                listing_date="2000-01-01", delisting_date=None, is_st=False,
+                is_suspended=False, suspension_reason=None, has_market_quote=True,
+                has_trade_volume=True, is_price_limit_locked=False,
+                price_limit_direction=None, source="unit_test_injection",
+                observed_at=f"{self.day.isoformat()}T08:50:00+08:00",
+                effective_at=f"{self.day.isoformat()}T09:00:00+08:00",
+            ))
 
     def drive_intraday(self, *, opening_event=False):
         account = dict(self.conn.execute(
@@ -366,7 +379,10 @@ class IntradaySellCommitConvergence(_R20IntradayBase):
         self.assertEqual(int(fill["qty"]), 100)
         self.assertEqual(fill["fill_date"], self.day.isoformat())
         self.assertEqual(fill["quote_at"], self._inner.quotes_map[self.code]["quote_at"])
-        self.assertEqual(fill["assumption"], "开盘/5分钟实时快照高抛，含滑点、佣金、印花税")
+        self.assertEqual(
+            fill["assumption"],
+            "开盘/5分钟实时快照；成交价格和费用由模拟执行权威计算",
+        )
         self.assertGreater(float(fill["price"]), 0)
         self.assertGreater(float(fill["amount"]), 0)
         self.assertGreater(float(fill["fees"]), 0)
@@ -428,26 +444,30 @@ class DirectSellCommitConvergence(PRS._LedgerCase):
         return int(cur.lastrowid)
 
     def commit_sell(self, order_id, qty, *, price=13.0, day="2026-09-05"):
+        execution_quote, execution_context = PRS._approved_execution_facts(day, "sell", qty, price)
         return EP.commit_fill(
             self.conn, account=self.account_row(),
             plan={"side": "sell", "code": CODE, "qty": qty, "fill_price": price,
-                  "amount": qty * price, "fees": 5.0, "quote_at": None, "risk": {}},
+                  "amount": qty * price, "fees": 5.0,
+                  "quote_at": execution_quote["quote_at"],
+                  "execution_quote": execution_quote, "risk": {}},
             order_id=order_id, asof_day=dt.date.fromisoformat(day),
             reserved=True, side="sell", action="filled",
             audit_action="sell_filled", reason="R20 test sell",
+            execution_context=execution_context,
         )
 
-    def test_sf8_realized_pnl_formula_unchanged(self):
+    def test_sf8_realized_pnl_uses_authoritative_fill_amount_and_fees(self):
         self.record_buy(200, 10.0)
         order = self.sell_order(100)
 
         pnl = self.commit_sell(order, 100, price=13.0)
 
-        self.assertAlmostEqual(pnl, 1300.0 - 1000.0 - 5.0, places=6)
         row = self.conn.execute(
-            "SELECT realized_pnl FROM paper_orders WHERE id=?", (order,)
+            "SELECT realized_pnl,amount,fees FROM paper_orders WHERE id=?", (order,)
         ).fetchone()
-        self.assertAlmostEqual(float(row["realized_pnl"]), 295.0, places=6)
+        self.assertAlmostEqual(pnl, float(row["amount"]) - 1000.0 - float(row["fees"]), places=6)
+        self.assertAlmostEqual(float(row["realized_pnl"]), pnl, places=6)
 
     def test_sf9_sell_consumes_the_order_cycle_only(self):
         self.record_buy(100, 10.0)
@@ -507,14 +527,20 @@ class DirectSellCommitConvergence(PRS._LedgerCase):
 
     def test_sf14_buy_commit_contract_is_unchanged(self):
         order = self.buy_order(100)
+        execution_quote, execution_context = PRS._approved_execution_facts(
+            dt.date(2026, 9, 5), "buy", 100, 10.0,
+        )
 
         EP.commit_fill(
             self.conn, account=self.account_row(),
             plan={"side": "buy", "code": CODE, "qty": 100, "fill_price": 10.0,
-                  "amount": 1000.0, "fees": 1.0, "quote_at": None},
+                  "amount": 1000.0, "fees": 1.0,
+                  "quote_at": execution_quote["quote_at"],
+                  "execution_quote": execution_quote},
             order_id=order, asof_day=dt.date(2026, 9, 5),
             reserved=False, side="buy", action="strategy_buy",
             reason="R20 test buy",
+            execution_context=execution_context,
         )
 
         row = self.conn.execute(

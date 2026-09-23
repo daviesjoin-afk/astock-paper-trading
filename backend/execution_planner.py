@@ -27,20 +27,36 @@
 from __future__ import annotations
 
 import sqlite3
+import datetime as dt
+import hashlib
+from dataclasses import dataclass, field
+from enum import Enum
+from types import MappingProxyType
+from zoneinfo import ZoneInfo
 
 from collections.abc import Mapping
-from dataclasses import dataclass
 from typing import Any
 
 import paper_position_risk_state as PPRS
+import market_data_contract as MDC
+import paper_trading_rules as PTR
 
 __all__ = [
     "EXECUTION_PLANNER_VERSION",
     "ExecutionPolicy",
+    "ExecutionContext",
+    "ExecutionDecision",
+    "ExecutionReason",
+    "FillEvent",
+    "PersistedOrderIntent",
     "account_risk_gate",
     "capacity_gate",
     "cash_gate",
     "commit_fill",
+    "estimate_execution_fees",
+    "estimate_execution_terms",
+    "estimated_fill_price",
+    "evaluate_simulated_execution",
     "market_gate",
     "plan_entry",
     "policy_for",
@@ -51,6 +67,609 @@ __all__ = [
 ]
 
 EXECUTION_PLANNER_VERSION = "execution-planner-v1"
+SIMULATION_EXECUTION_RULESET = "a-share-simulation-v1"
+SIMULATED_SLIPPAGE_RATE = PTR.SLIPPAGE
+MAX_VOLUME_PARTICIPATION = 0.01
+_CHINA_TZ = ZoneInfo("Asia/Shanghai")
+
+
+class ExecutionReason(str, Enum):
+    """Stable reason vocabulary emitted by the simulation execution authority."""
+
+    MARKET_UNAVAILABLE = "MARKET_UNAVAILABLE"
+    MARKET_STALE = "MARKET_STALE"
+    MARKET_UNVERIFIED = "MARKET_UNVERIFIED"
+    MARKET_DISAGREEMENT = "MARKET_DISAGREEMENT"
+    OUT_OF_SESSION = "OUT_OF_SESSION"
+    TRADABILITY_UNKNOWN = "TRADABILITY_UNKNOWN"
+    SUSPENDED = "SUSPENDED"
+    PRICE_LIMIT_LOCKED = "PRICE_LIMIT_LOCKED"
+    INVALID_QUANTITY = "INVALID_QUANTITY"
+    T1_NOT_SELLABLE = "T1_NOT_SELLABLE"
+    INSUFFICIENT_LIQUIDITY = "INSUFFICIENT_LIQUIDITY"
+    INSUFFICIENT_CASH = "INSUFFICIENT_CASH"
+    LIMIT_PRICE_NOT_REACHED = "LIMIT_PRICE_NOT_REACHED"
+    CANCELLED = "CANCELLED"
+    ORDER_NOT_WORKING = "ORDER_NOT_WORKING"
+
+
+def estimated_fill_price(reference_price, side):
+    """Apply the deterministic simulation slippage policy to a reference price."""
+    reference = _positive_number(reference_price)
+    normalized_side = str(side or "").lower()
+    if reference is None or normalized_side not in {"buy", "sell"}:
+        return None
+    direction = 1.0 if normalized_side == "buy" else -1.0
+    return reference * (1.0 + direction * SIMULATED_SLIPPAGE_RATE)
+
+
+def estimate_execution_fees(amount, side):
+    """Estimate canonical A-share commission and sell stamp duty for a gross amount."""
+    normalized_side = str(side or "").lower()
+    if normalized_side not in {"buy", "sell"}:
+        raise ValueError(f"unsupported execution side: {side!r}")
+    gross = max(0.0, float(amount or 0.0))
+    return PTR.commission(gross) + (
+        gross * PTR.STAMP_SELL if normalized_side == "sell" else 0.0
+    )
+
+
+def estimate_execution_terms(reference_price, quantity, side, *, limit_price=None):
+    """Return a planning estimate; commit_fill still recomputes the actual event."""
+    normalized_side = str(side or "").lower()
+    price = estimated_fill_price(reference_price, normalized_side)
+    if price is None:
+        raise ValueError("execution estimate requires a positive reference price and side")
+    limit = _positive_number(limit_price)
+    if limit is not None:
+        price = min(price, limit) if normalized_side == "buy" else max(price, limit)
+    amount = max(0, int(quantity or 0)) * price
+    return price, amount, estimate_execution_fees(amount, normalized_side)
+
+
+@dataclass(frozen=True, slots=True)
+class PersistedOrderIntent:
+    """Immutable persisted order request; distinct from strategy-side ``order_intent``."""
+
+    order_id: int
+    account_id: str
+    cycle_id: int | None
+    strategy_id: str | None
+    strategy_version: int | None
+    strategy_checksum: str | None
+    signal_id: int | None
+    symbol: str
+    side: str
+    desired_quantity: int
+    intent_at: str | None
+    reference_price: float | None
+    order_type: str = "market"
+    signal_provenance: Mapping[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self):
+        object.__setattr__(self, "signal_provenance", _freeze_evidence(self.signal_provenance))
+
+
+@dataclass(frozen=True, slots=True)
+class ExecutionContext:
+    """Frozen market/account/position facts for one simulated execution event."""
+
+    session_date: str
+    execution_asof: str | None
+    quote: Mapping[str, Any] = field(default_factory=dict)
+    market_reading: Any = None
+    tradability: Any = None
+    session_phase: str | None = None
+    available_liquidity: int | None = None
+    sellable_quantity: int | None = None
+    buying_power: float | None = None
+    already_filled_quantity: int = 0
+    #: 同一 symbol 在同一 session 内、截至 ``execution_asof`` **已经消耗掉**的
+    #: 模拟成交量（股）。``available_liquidity`` 是从行情累计成交额推出的**当日
+    #: 累计**容量；它不会因为我们已经成交过而变小，所以必须把已消耗量从这里减掉，
+    #: 否则每个新行情事件都能重新吃一遍同一份 1% 参与额度。
+    same_day_consumed_quantity: int = 0
+    current_order_status: str = "pending_execution"
+    lot_size: int = 100
+    participation_rate: float = MAX_VOLUME_PARTICIPATION
+    ruleset_version: str = SIMULATION_EXECUTION_RULESET
+
+    def __post_init__(self):
+        object.__setattr__(self, "quote", _freeze_evidence(self.quote))
+        if self.session_phase is None:
+            object.__setattr__(self, "session_phase", _session_phase(self.execution_asof))
+
+
+@dataclass(frozen=True, slots=True)
+class ExecutionDecision:
+    """Auditable outcome for one execution attempt, including zero-fill reasons."""
+
+    executable_now: bool
+    fill_quantity: int
+    remaining_quantity: int
+    status: str
+    reasons: tuple[str, ...]
+    pricing_basis: str | None
+    reference_price: float | None
+    fill_price: float | None
+    slippage_amount: float
+    fees: float
+    execution_asof: str | None
+    market_evidence: Mapping[str, Any] = field(default_factory=dict)
+    tradability_evidence: Mapping[str, Any] = field(default_factory=dict)
+    #: 参与额度的完整推导（观察到的累计成交额、参与率、本 session 已消耗量、
+    #: 本次可执行上限）。有了它，"为什么只成交 300"不需要再靠读多个模块猜。
+    liquidity_evidence: Mapping[str, Any] = field(default_factory=dict)
+    ruleset_version: str = SIMULATION_EXECUTION_RULESET
+
+    def __post_init__(self):
+        object.__setattr__(self, "reasons", tuple(str(item) for item in self.reasons))
+        object.__setattr__(self, "market_evidence", _freeze_evidence(self.market_evidence))
+        object.__setattr__(self, "tradability_evidence", _freeze_evidence(self.tradability_evidence))
+        object.__setattr__(self, "liquidity_evidence", _freeze_evidence(self.liquidity_evidence))
+
+
+@dataclass(frozen=True, slots=True)
+class FillEvent:
+    """One deterministic partial or full simulated fill."""
+
+    event_key: str
+    order_id: int
+    quantity: int
+    price: float
+    amount: float
+    fees: float
+    execution_asof: str
+    quote_asof: str
+    pricing_basis: str
+    slippage_amount: float
+    execution_evidence: Mapping[str, Any] = field(default_factory=dict)
+    ruleset_version: str = SIMULATION_EXECUTION_RULESET
+
+    def __post_init__(self):
+        object.__setattr__(self, "execution_evidence", _freeze_evidence(self.execution_evidence))
+
+
+def _freeze_evidence(value):
+    if isinstance(value, Mapping):
+        return MappingProxyType({key: _freeze_evidence(item) for key, item in value.items()})
+    if isinstance(value, list):
+        return tuple(_freeze_evidence(item) for item in value)
+    if isinstance(value, tuple):
+        return tuple(_freeze_evidence(item) for item in value)
+    return value
+
+
+def market_reading_for_execution(quote: Mapping[str, Any], *, asof_day, execution_asof):
+    """Turn one prefetched quote envelope into an R24 reading; never performs I/O.
+
+    Execution consumes the **R24 Market Data boundary** and nothing else. The
+    quote → snapshot mapping lives in :mod:`market_data_contract` so that
+    "how trustworthy is this quote" has exactly one owner; execution must not
+    route through the signal layer to learn a market fact.
+    """
+    day = MDC.canonical_day(asof_day)
+    snapshot = MDC.symbol_quote_snapshot(quote, asof_day=day)
+    return MDC.classify(
+        snapshot,
+        MDC.EXECUTION_QUOTE_POLICY,
+        now=execution_asof,
+        access_mode=MDC.ACCESS_READ,
+        asof_day=day,
+    )
+
+
+def _fill_event_key(*, order_id, quote_at, ruleset_version):
+    """一次模拟成交事件的**幂等身份**：订单 × 行情观测 × ruleset。
+
+    这三个维度共同定义"同一次执行事件"：
+
+    * ``order_id`` —— 同一张委托；
+    * ``quote_at`` —— **行情观测**的身份（不是墙上时钟）。同一个 ``quote_at`` 的
+      重放永远算同一次事件，无论重放发生在几点；
+    * ``ruleset_version`` —— 成交规则版本。规则变了则是另一次可解释的决策，
+      不能与旧规则下的成交混为一谈。
+
+    刻意**不**把 ``execution_asof``、墙上时钟、剩余量或 attempt 计数放进来：
+    那些都会让"同一份证据重放"被错误编码成新事件，从而重复成交、重复扣款。
+    """
+    return hashlib.sha256(
+        f"{int(order_id)}|{quote_at}|{ruleset_version}".encode("utf-8")
+    ).hexdigest()
+
+
+def consumed_session_quantity(conn, code, session_date, execution_asof) -> int:
+    """本 session 内、截至 ``execution_asof`` 已经模拟成交的股数（该 symbol）。
+
+    ``available_liquidity`` 是从行情**累计**成交额推出的参与额度，它在同一个
+    session 里单调增长但**不会**因为我们已经成交而减少。若不把已消耗量减掉，
+    10:00 吃掉 capacity、10:05 的 quote.amount 仍然包含 10:00 之前那部分成交量，
+    系统就会再吃一份同样的 1% —— 实际参与率被成倍放大，突破本模块自己的流动性
+    政策。因此容量必须表达为：
+
+        max simulated participation
+            = observed cumulative market volume × participation_rate
+              − 截至 execution_asof 已消耗的模拟成交量
+
+    **as-of 边界**：只统计成交时点不晚于 ``execution_asof`` 的 FillEvent，绝不把
+    该时点之后发生的成交算进来（否则"用未来的事实限制现在"）。``quote_at`` 缺失的
+    legacy 流水**按已消耗处理**（fail conservative）：无法证明它发生在之后，就不
+    能假装它没发生过，否则老数据会凭空放开参与额度。
+
+    按 symbol + session 聚合（不按账户/周期切分）：参与率约束的是"我们这个系统相对
+    市场成交量下了多少单"，这是市场层面的约束，与哪个模拟账户下的单无关。
+    """
+    day = MDC.canonical_day(session_date)
+    cutoff = _parse_execution_instant(execution_asof)
+    if not code or not day:
+        return 0
+    try:
+        rows = conn.execute(
+            "SELECT qty,quote_at FROM paper_fills WHERE code=? AND fill_date=?",
+            (str(code), day),
+        ).fetchall()
+    except sqlite3.Error:
+        # 流水表不可读时不能假装"没消耗过"，那会放大额度；按最保守处理：
+        # 只要读不出上限，就报一个不可能被满足的已消耗量级。
+        return _CONSUMED_UNREADABLE
+    consumed = 0
+    for row in rows:
+        quantity = row[0] if not hasattr(row, "keys") else row["qty"]
+        quote_at = row[1] if not hasattr(row, "keys") else row["quote_at"]
+        try:
+            quantity = max(0, int(quantity or 0))
+        except (TypeError, ValueError):
+            continue
+        stamp = _parse_execution_instant(quote_at)
+        if cutoff is None or stamp is None or stamp <= cutoff:
+            consumed += quantity
+    return consumed
+
+
+#: 流水不可读时的"已消耗"哨兵：足够大以致当次判定必然拒绝成交（fail closed），
+#: 但不至于溢出成负数。它只在 SQL 失败时出现，正常账本永远不会取到这个值。
+_CONSUMED_UNREADABLE = 2 ** 62
+
+
+def execution_context_from_facts(
+    *,
+    conn,
+    order: Mapping[str, Any],
+    quote: Mapping[str, Any],
+    asof_day,
+    reserved: bool = False,
+) -> ExecutionContext:
+    """Freeze supplied quote + PIT archive facts for the execution decision.
+
+    ``quote`` must have been fetched before the writer transaction and carry an
+    explicit ``execution_asof``. This function only reads the local ledger and
+    R24/Tradability contracts.
+    """
+    import tradability_archive as TA
+
+    row = dict(order or {})
+    quote = dict(quote or {})
+    day = MDC.canonical_day(asof_day) or ""
+    execution_asof = quote.get("execution_asof")
+    if execution_asof:
+        reading = market_reading_for_execution(
+            quote, asof_day=day, execution_asof=execution_asof,
+        )
+    else:
+        reading = MDC.unavailable_reading(
+            MDC.EXECUTION_QUOTE_POLICY, MDC.REASON_ASOF_UNPROVABLE,
+            access_mode=MDC.ACCESS_READ,
+        )
+    tradability = TA.tradability_at(
+        row.get("code"), day, decision_time=execution_asof,
+        repository=TA.TradabilityArchiveRepository(conn),
+    )
+    cycle_id = row.get("cycle_id")
+    sellable = None
+    if row.get("side") == "sell" and cycle_id is not None and day:
+        try:
+            sellable = int(conn.execute(
+                """SELECT COALESCE(SUM(remaining_qty),0)
+                     FROM paper_position_lots
+                    WHERE cycle_id=? AND account_id=? AND code=?
+                      AND remaining_qty>0 AND available_date<=?""",
+                (int(cycle_id), str(row.get("account_id") or ""),
+                 str(row.get("code") or ""), day),
+            ).fetchone()[0] or 0)
+        except (sqlite3.Error, TypeError, ValueError, IndexError):
+            sellable = None
+    buying_power = None
+    if row.get("side") == "buy":
+        PT = _pt()
+        if reserved:
+            reservation = conn.execute(
+                "SELECT amount,fees,status FROM paper_capital_reservations WHERE order_key=?",
+                (str(row.get("id")),),
+            ).fetchone()
+            if reservation is None or str(reservation[2]) != "reserved":
+                buying_power = 0.0
+            else:
+                buying_power = max(0.0, float(reservation[0] or 0) + float(reservation[1] or 0))
+        else:
+            _, pending = PT._pending_buy_reservations(
+                conn, exclude_order_key=str(row.get("id")),
+            )
+            buying_power = max(0.0, float(PT._shared_cash(conn) or 0) - float(pending or 0))
+    price = _positive_number(quote.get("price"))
+    amount = _positive_number(quote.get("amount"))
+    liquidity = max(0, int(amount / price)) if price and amount else 0
+    return ExecutionContext(
+        session_date=day,
+        execution_asof=str(execution_asof or "") or None,
+        quote=quote,
+        market_reading=reading,
+        tradability=tradability,
+        available_liquidity=liquidity,
+        sellable_quantity=sellable,
+        buying_power=buying_power,
+        already_filled_quantity=int(row.get("filled_qty") or 0),
+        same_day_consumed_quantity=consumed_session_quantity(
+            conn, row.get("code"), day, execution_asof,
+        ),
+        current_order_status=str(row.get("status") or ""),
+    )
+
+
+def evaluate_simulated_execution(
+    intent: PersistedOrderIntent, context: ExecutionContext,
+) -> ExecutionDecision:
+    """Pure A-share execution rules. No database, provider, or wall-clock reads."""
+    reasons: list[str] = []
+    side = str(intent.side or "").lower()
+    desired = int(intent.desired_quantity or 0)
+    already_filled = max(0, int(context.already_filled_quantity or 0))
+    remaining = max(0, desired - already_filled)
+    quote = context.quote
+    reading = context.market_reading
+    tradability = context.tradability
+    market_projection = reading.projection() if reading is not None else {}
+    tradability_projection = (
+        tradability.to_dict() if hasattr(tradability, "to_dict") else {}
+    )
+
+    if str(context.current_order_status or "").lower() in {
+        "cancelled", "rejected", "expired", "filled", "superseded",
+    }:
+        reasons.append(
+            ExecutionReason.CANCELLED.value
+            if str(context.current_order_status).lower() == "cancelled"
+            else ExecutionReason.ORDER_NOT_WORKING.value
+        )
+    if side not in {"buy", "sell"} or desired <= 0 or already_filled > desired:
+        reasons.append(ExecutionReason.INVALID_QUANTITY.value)
+    elif side == "buy" and desired % max(1, int(context.lot_size)):
+        reasons.append(ExecutionReason.INVALID_QUANTITY.value)
+    elif side == "sell" and desired % max(1, int(context.lot_size)) \
+            and desired != int(context.sellable_quantity or 0):
+        # Odd-lot sells are allowed only when they liquidate the whole currently
+        # sellable remainder. Invalid intents are rejected, never rounded down.
+        reasons.append(ExecutionReason.INVALID_QUANTITY.value)
+
+    stamp = _parse_execution_instant(context.execution_asof)
+    if stamp is None or stamp.date().isoformat() != str(context.session_date or ""):
+        reasons.append(ExecutionReason.MARKET_UNAVAILABLE.value)
+    elif context.session_phase not in {"continuous_morning", "continuous_afternoon"}:
+        reasons.append(ExecutionReason.OUT_OF_SESSION.value)
+
+    if reading is None or not reading.available:
+        reasons.append(ExecutionReason.MARKET_UNAVAILABLE.value)
+    else:
+        snapshot = reading.snapshot
+        if reading.freshness != MDC.FRESHNESS_FRESH:
+            reasons.append(ExecutionReason.MARKET_STALE.value)
+        elif snapshot is None or snapshot.verification == MDC.VERIFICATION_DISAGREEMENT:
+            reasons.append(ExecutionReason.MARKET_DISAGREEMENT.value)
+        elif not MDC.is_cross_source_verified(snapshot):
+            reasons.append(ExecutionReason.MARKET_UNVERIFIED.value)
+        if snapshot is not None and str(snapshot.as_of or "") != str(context.session_date or ""):
+            reasons.append(ExecutionReason.MARKET_UNAVAILABLE.value)
+
+    if tradability is None or not bool(getattr(tradability, "evidence_present", False)):
+        reasons.append(ExecutionReason.TRADABILITY_UNKNOWN.value)
+    else:
+        side_allowed = bool(
+            getattr(tradability, "can_buy", False) if side == "buy"
+            else getattr(tradability, "can_sell", False)
+        )
+        if not side_allowed:
+            block = getattr(
+                tradability,
+                "buy_block_reason" if side == "buy" else "sell_block_reason",
+                None,
+            )
+            block_code = getattr(block, "value", str(block or "unknown_state"))
+            if block_code == "suspended":
+                reasons.append(ExecutionReason.SUSPENDED.value)
+            elif block_code in {"buy_limit_locked", "sell_limit_locked"}:
+                reasons.append(ExecutionReason.PRICE_LIMIT_LOCKED.value)
+            else:
+                reasons.append(ExecutionReason.TRADABILITY_UNKNOWN.value)
+
+    if side == "sell":
+        if context.sellable_quantity is None:
+            reasons.append(ExecutionReason.TRADABILITY_UNKNOWN.value)
+        elif context.sellable_quantity <= 0:
+            reasons.append(ExecutionReason.T1_NOT_SELLABLE.value)
+
+    reference = _positive_number(quote.get("price"))
+    if reference is None:
+        reasons.append(ExecutionReason.MARKET_UNAVAILABLE.value)
+    # Remove duplicates without losing the fixed rule order.
+    reasons = list(dict.fromkeys(reasons))
+    if reasons:
+        return ExecutionDecision(
+            executable_now=False, fill_quantity=0, remaining_quantity=remaining,
+            status=("cancelled" if ExecutionReason.CANCELLED.value in reasons else "pending_execution"),
+            reasons=tuple(reasons), pricing_basis=None, reference_price=reference,
+            fill_price=None, slippage_amount=0.0, fees=0.0,
+            execution_asof=context.execution_asof, market_evidence=market_projection,
+            tradability_evidence=tradability_projection,
+            ruleset_version=context.ruleset_version,
+        )
+
+    if remaining <= 0:
+        return ExecutionDecision(
+            executable_now=False, fill_quantity=0, remaining_quantity=0,
+            status="filled", reasons=(), pricing_basis="already_filled",
+            reference_price=reference, fill_price=None, slippage_amount=0.0,
+            fees=0.0, execution_asof=context.execution_asof,
+            market_evidence=market_projection, tradability_evidence=tradability_projection,
+            ruleset_version=context.ruleset_version,
+        )
+
+    raw_liquidity = max(0, int(context.available_liquidity or 0))
+    participation = max(0.0, min(1.0, context.participation_rate))
+    observed_participation_capacity = int(raw_liquidity * participation)
+    # 已消耗量必须从**参与额度**里扣，而不是从本单剩余量里扣：行情给出的是当日
+    # 累计成交量，同一个 snapshot 可以被后续事件重复观测到。不扣的话，10:00 与
+    # 10:05 会各自吃满同一份 1%，system-wide 参与率被成倍放大。
+    already_consumed = max(0, int(context.same_day_consumed_quantity or 0))
+    liquidity_qty = max(0, observed_participation_capacity - already_consumed)
+    if raw_liquidity <= 0 or liquidity_qty <= 0:
+        reasons.append(ExecutionReason.INSUFFICIENT_LIQUIDITY.value)
+    capacity = min(remaining, liquidity_qty)
+    if side == "sell":
+        capacity = min(capacity, max(0, int(context.sellable_quantity or 0)))
+    odd_lot_exit = (
+        side == "sell" and context.sellable_quantity == remaining
+        and remaining < max(1, int(context.lot_size))
+    )
+    lot_size = max(1, int(context.lot_size))
+    fill_quantity = capacity if odd_lot_exit else (capacity // lot_size) * lot_size
+    liquidity_evidence = {
+        "observed_cumulative_market_quantity": raw_liquidity,
+        "participation_rate": participation,
+        "participation_capacity": observed_participation_capacity,
+        "session_consumed_quantity": already_consumed,
+        "executable_capacity": liquidity_qty,
+        "capped_by": (
+            "participation_exhausted" if liquidity_qty <= 0
+            else ("participation" if liquidity_qty < remaining else "none")
+        ),
+    }
+    if fill_quantity < remaining:
+        if side == "sell" and (context.sellable_quantity or 0) < remaining:
+            reasons.append(ExecutionReason.T1_NOT_SELLABLE.value)
+        if liquidity_qty < remaining or fill_quantity < capacity:
+            reasons.append(ExecutionReason.INSUFFICIENT_LIQUIDITY.value)
+    if fill_quantity <= 0:
+        return ExecutionDecision(
+            executable_now=False, fill_quantity=0, remaining_quantity=remaining,
+            status="pending_execution", reasons=tuple(dict.fromkeys(reasons)),
+            pricing_basis="last_verified_quote", reference_price=reference,
+            fill_price=None, slippage_amount=0.0, fees=0.0,
+            execution_asof=context.execution_asof, market_evidence=market_projection,
+            tradability_evidence=tradability_projection,
+            liquidity_evidence=liquidity_evidence,
+            ruleset_version=context.ruleset_version,
+        )
+
+    fill_price = round(estimated_fill_price(reference, side), 2)
+    if fill_price <= 0:
+        return ExecutionDecision(
+            executable_now=False, fill_quantity=0, remaining_quantity=remaining,
+            status="pending_execution", reasons=(ExecutionReason.MARKET_UNAVAILABLE.value,),
+            pricing_basis=None, reference_price=reference, fill_price=None,
+            slippage_amount=0.0, fees=0.0, execution_asof=context.execution_asof,
+            market_evidence=market_projection, tradability_evidence=tradability_projection,
+            ruleset_version=context.ruleset_version,
+        )
+    limit_price = _positive_number(intent.reference_price) if intent.order_type == "limit" else None
+    if limit_price is not None and (
+        (side == "buy" and fill_price > limit_price)
+        or (side == "sell" and fill_price < limit_price)
+    ):
+        return ExecutionDecision(
+            executable_now=False, fill_quantity=0, remaining_quantity=remaining,
+            status="pending_execution", reasons=(ExecutionReason.LIMIT_PRICE_NOT_REACHED.value,),
+            pricing_basis="limit_price", reference_price=reference, fill_price=None,
+            slippage_amount=0.0, fees=0.0, execution_asof=context.execution_asof,
+            market_evidence=market_projection, tradability_evidence=tradability_projection,
+            liquidity_evidence=liquidity_evidence,
+            ruleset_version=context.ruleset_version,
+        )
+    amount = round(fill_quantity * fill_price, 2)
+    if side == "buy" and context.buying_power is not None:
+        per_share_cost = fill_price * (1.0 + PTR.COMMISSION)
+        affordable = max(0, int(context.buying_power / per_share_cost)) if per_share_cost else 0
+        affordable = (affordable // lot_size) * lot_size
+        if affordable < fill_quantity:
+            reasons.append(ExecutionReason.INSUFFICIENT_CASH.value)
+            fill_quantity = min(fill_quantity, affordable)
+            if fill_quantity <= 0:
+                return ExecutionDecision(
+                    executable_now=False, fill_quantity=0, remaining_quantity=remaining,
+                    status="pending_execution", reasons=tuple(dict.fromkeys(reasons)),
+                    pricing_basis="verified_quote_plus_deterministic_slippage",
+                    reference_price=reference, fill_price=None, slippage_amount=0.0,
+                    fees=0.0, execution_asof=context.execution_asof,
+                    market_evidence=market_projection,
+                    tradability_evidence=tradability_projection,
+                    liquidity_evidence=liquidity_evidence,
+                    ruleset_version=context.ruleset_version,
+                )
+            amount = round(fill_quantity * fill_price, 2)
+    fees = round(estimate_execution_fees(amount, side), 2)
+    return ExecutionDecision(
+        executable_now=True, fill_quantity=fill_quantity,
+        remaining_quantity=remaining - fill_quantity,
+        status="filled" if fill_quantity == remaining else "partially_filled",
+        reasons=tuple(dict.fromkeys(reasons)),
+        pricing_basis="verified_quote_plus_deterministic_slippage",
+        reference_price=reference, fill_price=fill_price,
+        slippage_amount=round(fill_price - reference, 4), fees=fees,
+        execution_asof=context.execution_asof, market_evidence=market_projection,
+        tradability_evidence=tradability_projection,
+        liquidity_evidence=liquidity_evidence,
+        ruleset_version=context.ruleset_version,
+    )
+
+
+def _positive_number(value):
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        return None
+    return result if result > 0 else None
+
+
+def _parse_execution_instant(value):
+    if isinstance(value, dt.datetime):
+        parsed = value
+    elif isinstance(value, str) and value.strip():
+        try:
+            parsed = dt.datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    else:
+        return None
+    return parsed.replace(tzinfo=_CHINA_TZ) if parsed.tzinfo is None else parsed.astimezone(_CHINA_TZ)
+
+
+def _session_phase(value) -> str:
+    """Freeze the coarse Shanghai session phase into each execution context."""
+    stamp = _parse_execution_instant(value)
+    if stamp is None:
+        return "unknown"
+    if stamp.weekday() >= 5:
+        return "market_closed"
+    current = stamp.time().replace(tzinfo=None)
+    if current < dt.time(9, 30):
+        return "pre_open"
+    if current < dt.time(11, 30):
+        return "continuous_morning"
+    if current < dt.time(13, 0):
+        return "lunch_break"
+    if current < dt.time(14, 57):
+        return "continuous_afternoon"
+    if current < dt.time(15, 0):
+        return "closing_auction"
+    return "market_closed"
 
 # 席位预留与手动入场复核的“所有者”仍然来自 paper_trading 的单一常量定义，
 # 但只在构造策略表时读取一次；执行代码里不再出现身份比较。
@@ -474,7 +1093,8 @@ def revalidate_order_plan(conn, order, *, plan_builder, asof_day, quote=None, **
         row.get("account_id"),
         row.get("code"),
         (row.get("side") or "").lower(),
-        row.get("qty") or 0,
+        row.get("remaining_qty") if row.get("remaining_qty") is not None
+        else max(0, int(row.get("qty") or 0) - int(row.get("filled_qty") or 0)),
         (row.get("order_type") or "limit").lower(),
         row.get("planned_price") if (row.get("order_type") or "limit").lower() == "limit" else None,
         asof_day,
@@ -538,6 +1158,45 @@ def _assert_order_identity(conn, *, order_id, account_id, code, side):
     return order_strategy_stamp
 
 
+def _row_mapping(cursor, row):
+    if row is None:
+        return None
+    if hasattr(row, "keys"):
+        return dict(row)
+    columns = [item[0] for item in cursor.description or ()]
+    return dict(zip(columns, row, strict=True))
+
+
+def _plain_evidence(value):
+    if isinstance(value, Mapping):
+        return {str(key): _plain_evidence(item) for key, item in value.items()}
+    if isinstance(value, (tuple, list)):
+        return [_plain_evidence(item) for item in value]
+    if isinstance(value, Enum):
+        return value.value
+    return value
+
+
+def _decision_evidence(decision: ExecutionDecision) -> dict[str, Any]:
+    return {
+        "executable_now": decision.executable_now,
+        "fill_quantity": decision.fill_quantity,
+        "remaining_quantity": decision.remaining_quantity,
+        "status": decision.status,
+        "reasons": list(decision.reasons),
+        "pricing_basis": decision.pricing_basis,
+        "reference_price": decision.reference_price,
+        "fill_price": decision.fill_price,
+        "slippage_amount": decision.slippage_amount,
+        "fees": decision.fees,
+        "execution_asof": decision.execution_asof,
+        "market_evidence": _plain_evidence(decision.market_evidence),
+        "tradability_evidence": _plain_evidence(decision.tradability_evidence),
+        "liquidity_evidence": _plain_evidence(decision.liquidity_evidence),
+        "ruleset_version": decision.ruleset_version,
+    }
+
+
 def commit_fill(
     conn,
     *,
@@ -556,20 +1215,32 @@ def commit_fill(
     assumption: str = "本地行情快照按 0.10% 滑点模拟；不代表真实可成交价格",
     is_t_base: bool = True,
     sell_next_take_stage: int | None = None,
+    execution_context: ExecutionContext | None = None,
 ):
-    """统一成交落库原语：自动与手动共用“扣款 → 记 lot → 写 fill → 风险日志”。
+    """唯一模拟执行与账务提交权威：评估 → 有证据成交 → 原子写入。
 
-    - ``reserved=True``：资金已在委托阶段预占（手动/策略待成交），成交时消费预占；
-    - ``reserved=False``：本函数内部完成预占再扣款（策略辅助买入）。
+    ``plan`` 只携带调用方预先取到的行情事实；最终数量、价格、费用和状态都由
+    Execution Simulation Authority 重算。provider 读取绝不能发生在本事务中。
     """
     PT = _pt()
-    side = side or str(plan.get("side") or "")
-    qty = int(plan.get("qty") or 0)
-    amount = PT._num(plan.get("amount"))
-    fees = PT._num(plan.get("fees"))
-    fill_price = PT._num(plan.get("fill_price"))
-    code = str(plan.get("code"))
-    account_id = account["id"]
+    order_cursor = conn.execute("SELECT * FROM paper_orders WHERE id=?", (int(order_id),))
+    order = _row_mapping(order_cursor, order_cursor.fetchone())
+    if order is None:
+        raise RuntimeError(f"execution order not found: {order_id}")
+    # Provenance and identity are both read-only guards; resolve the order's
+    # immutable cycle before checking caller-supplied identity, and before any
+    # reservation, cash, lot, or fill mutation.
+    if account is None:
+        requested_account_id = ""
+    elif hasattr(account, "keys"):
+        requested_account_id = str(account["id"] if "id" in account.keys() else "")
+    else:
+        requested_account_id = str(account.get("id") or "")
+    requested_code = str(plan.get("code") or "")
+    side = str(side or plan.get("side") or order.get("side") or "").lower()
+    code = str(order.get("code") or "")
+    account_id = str(order.get("account_id") or "")
+    qty = int(order.get("qty") or 0)
     realized_pnl = None
     cost_amount = None
 
@@ -588,7 +1259,8 @@ def commit_fill(
             f"{side} 成交被拒绝：订单周期归属不可证明",
         )
     order_strategy_stamp = _assert_order_identity(
-        conn, order_id=order_id, account_id=account_id, code=code, side=side,
+        conn, order_id=order_id, account_id=requested_account_id,
+        code=requested_code, side=side,
     )
     # §5 execution-cycle invariant：订单周期 == 账户当前周期 == active 周期。
     # 上层 scanner 已检查过一遍，这里仍然校验（§12 defense in depth）：调用方可能
@@ -598,24 +1270,188 @@ def commit_fill(
         allow_out_of_cycle_account=(side == "sell"),
     )
 
+    quote = plan.get("execution_quote") or plan.get("quote") or {}
+    context = execution_context or execution_context_from_facts(
+        conn=conn, order=order, quote=quote, asof_day=asof_day, reserved=reserved,
+    )
+    intent = PersistedOrderIntent(
+        order_id=int(order_id), account_id=account_id,
+        cycle_id=order_cycle_id,
+        strategy_id=order.get("strategy_id"),
+        strategy_version=order.get("strategy_version"),
+        strategy_checksum=order.get("strategy_checksum"),
+        signal_id=order.get("signal_id"), symbol=code, side=side,
+        desired_quantity=qty, intent_at=order.get("created_at"),
+        reference_price=_positive_number(order.get("planned_price")),
+        order_type=str(order.get("order_type") or "market").lower(),
+        signal_provenance={
+            "signal_id": order.get("signal_id"),
+            "cycle_id": order_cycle_id,
+            "strategy_id": order.get("strategy_id"),
+            "strategy_version": order.get("strategy_version"),
+            "strategy_checksum": order.get("strategy_checksum"),
+        },
+    )
+    decision = evaluate_simulated_execution(intent, context)
+    current_status = str(order.get("status") or "")
+    current_version = int(order.get("execution_version") or 0)
+    execution_evidence = _decision_evidence(decision)
+    if not decision.executable_now:
+        if current_status not in {"filled", "cancelled", "rejected", "risk_rejected", "manual_rejected", "expired", "superseded"}:
+            next_status = decision.status
+            if current_status == "partially_filled" and decision.status == "pending_execution":
+                next_status = "partially_filled"
+            if current_status == "pending_limit" and (
+                ExecutionReason.LIMIT_PRICE_NOT_REACHED.value in decision.reasons
+            ):
+                next_status = "pending_limit"
+            reason_codes = ",".join(decision.reasons)
+            payload = _plain_evidence(detail if detail is not None else plan)
+            payload = payload if isinstance(payload, dict) else {"detail": payload}
+            payload["execution"] = execution_evidence
+            conn.execute(
+                """UPDATE paper_orders
+                      SET status=?,reason=?,execution_asof=?,execution_reasons=?,
+                          execution_evidence=?,ruleset_version=?,execution_version=execution_version+1,
+                          remaining_qty=MAX(0,qty-COALESCE(filled_qty,0))
+                    WHERE id=? AND execution_version=?""",
+                (next_status, reason_codes or reason, decision.execution_asof,
+                 PT._json(list(decision.reasons)), PT._json(execution_evidence),
+                 decision.ruleset_version, order_id, current_version),
+            )
+            PT._risk_log(
+                conn, account_id, code, side, "execution_blocked",
+                reason_codes or reason, execution_evidence,
+                strategy_stamp=order_strategy_stamp,
+            )
+        return None
+
+    quote_at = str(context.quote.get("quote_at") or "")
+    if not quote_at or not decision.execution_asof:
+        raise RuntimeError("成交事件缺少明确的 quote_at / execution_asof")
+    event_key = _fill_event_key(
+        order_id=order_id, quote_at=quote_at,
+        ruleset_version=decision.ruleset_version,
+    )
+    duplicate = conn.execute(
+        "SELECT 1 FROM paper_fills WHERE order_id=? AND event_key=? LIMIT 1",
+        (int(order_id), event_key),
+    ).fetchone()
+    if duplicate:
+        return None
+
+    fill_aggregate = conn.execute(
+        """SELECT COALESCE(SUM(qty),0),COALESCE(SUM(amount),0),COALESCE(SUM(fees),0)
+             FROM paper_fills WHERE order_id=?""",
+        (int(order_id),),
+    ).fetchone()
+    prior_qty = int(fill_aggregate[0] or 0)
+    prior_amount = float(fill_aggregate[1] or 0.0)
+    prior_fees = float(fill_aggregate[2] or 0.0)
+    stored_filled = int(order.get("filled_qty") or 0)
+    if prior_qty != stored_filled:
+        raise RuntimeError(
+            f"order/fill quantity mismatch for order_id={order_id}: "
+            f"order={stored_filled}, fills={prior_qty}"
+        )
+
+    qty = int(decision.fill_quantity)
+    fill_price = float(decision.fill_price)
+    amount = round(qty * fill_price, 2)
+    fees = float(decision.fees)
+    total_filled = prior_qty + qty
+    remaining_qty = max(0, int(order.get("qty") or 0) - total_filled)
+    total_amount = round(prior_amount + amount, 2)
+    total_fees = round(prior_fees + fees, 2)
+    average_price = round(total_amount / total_filled, 4) if total_filled else None
+    next_status = "filled" if remaining_qty == 0 else "partially_filled"
+    fill_event = FillEvent(
+        event_key=event_key, order_id=int(order_id), quantity=qty,
+        price=fill_price, amount=amount, fees=fees,
+        execution_asof=str(decision.execution_asof), quote_asof=quote_at,
+        pricing_basis=str(decision.pricing_basis or ""),
+        slippage_amount=decision.slippage_amount,
+        execution_evidence={
+            "decision": execution_evidence,
+            "market": _plain_evidence(decision.market_evidence),
+            "tradability": _plain_evidence(decision.tradability_evidence),
+        },
+        ruleset_version=decision.ruleset_version,
+    )
+    fill_detail = _plain_evidence(detail if detail is not None else plan)
+    fill_detail = fill_detail if isinstance(fill_detail, dict) else {"detail": fill_detail}
+    fill_detail["execution"] = execution_evidence
+    fill_detail["fill_event"] = {
+        "event_key": fill_event.event_key,
+        "quantity": fill_event.quantity,
+        "price": fill_event.price,
+        "amount": fill_event.amount,
+        "fees": fill_event.fees,
+        "execution_asof": fill_event.execution_asof,
+        "quote_asof": fill_event.quote_asof,
+        "ruleset_version": fill_event.ruleset_version,
+    }
+
+    PT._assert_active_lease(conn, "execution planner state transition")
+    changed = conn.execute(
+        """UPDATE paper_orders
+              SET status=?,filled_qty=?,remaining_qty=?,filled_price=?,amount=?,fees=?,
+                  reason=?,risk_payload=?,execution_asof=?,execution_reasons=?,
+                  execution_evidence=?,pricing_basis=?,slippage=?,ruleset_version=?,
+                  executed_at=?,execution_version=execution_version+1
+            WHERE id=? AND execution_version=?
+              AND COALESCE(filled_qty,0)=? AND COALESCE(remaining_qty,qty-COALESCE(filled_qty,0))>=?
+              AND status IN ('pending_execution','partially_filled','ready_to_fill',
+                             'pending_limit','pending_verification','execution_retry',
+                             'manual_execution_retry')""",
+        (next_status, total_filled, remaining_qty, average_price, total_amount,
+         total_fees, reason, PT._json(fill_detail), decision.execution_asof,
+         PT._json(list(decision.reasons)), PT._json(execution_evidence),
+         decision.pricing_basis, decision.slippage_amount, decision.ruleset_version,
+         decision.execution_asof, order_id, current_version, prior_qty, qty),
+    )
+    if getattr(changed, "rowcount", 1) != 1:
+        raise RuntimeError(f"concurrent or terminal order transition: order_id={order_id}")
+
+    fill_plan = {
+        **dict(plan), "side": side, "code": code,
+        "name": plan.get("name") or order.get("name"),
+        "industry": plan.get("industry"), "qty": qty,
+        "fill_price": fill_price, "amount": amount, "fees": fees,
+        "quote_at": quote_at,
+    }
+    # BUY 每次成交恰好产生一个 lot；记住它的 id，以便在流水写入后把
+    # ``source_fill_id`` 指向**这一笔** FillEvent（见下方 link 段）。
+    source_lot_id = None
+
     if side == "buy":
         if not reserved:
+            # Strategy fills can arrive in multiple execution events. Give each
+            # event its own short-lived reservation key so a consumed first fill
+            # cannot prevent a later event from reserving the remaining cash.
+            reservation_key = f"{order_id}:execution:{event_key}"
             # §20–§22：这张订单的周期归属已经在上面证明过，把它传给预占层，
             # 让「预占周期 == 订单周期」也在同一次写入里成立。
             ok, reserve_reason = PT._reserve_shared_capital(
-                conn, order_id, account_id, code, amount, fees,
+                conn, reservation_key, account_id, code, amount, fees,
                 expected_cycle_id=order_cycle_id,
             )
             if not ok:
                 raise RuntimeError(reserve_reason or "共享资金池预占失败")
         PT._assert_active_lease(conn, "execution planner cash debit")
         PT._debit_shared_cash(conn, amount + fees, preferred_account_id=account_id)
-        PT._finish_capital_reservation(conn, order_id, "consumed")
+        if reserved:
+            PT._consume_capital_reservation(
+                conn, order_id, amount, fees, final=(remaining_qty == 0),
+            )
+        else:
+            PT._finish_capital_reservation(conn, reservation_key, "consumed")
         # §10：lot 的周期**显式**来自来源订单（`_record_lot` 内部同样强制这一点，
         # 这里显式传入，让「订单 cycle == lot cycle」在调用点也读得出来）。
-        PT._record_lot(
-            conn, account, plan, qty, fill_price, asof_day, order_id,
+        source_lot_id = PT._record_lot(
+            conn, account, fill_plan, qty, fill_price, asof_day, order_id,
             is_t_base=is_t_base, fees=fees, cycle_id=order_cycle_id,
+            acquired_at=decision.execution_asof,
         )
     else:
         PT._assert_active_lease(conn, "execution planner lot consumption")
@@ -638,25 +1474,36 @@ def commit_fill(
             next_take_stage=sell_next_take_stage,
         )
 
-    fill_detail = detail if detail is not None else plan
-    if side == "sell" and cost_amount is not None:
-        fill_detail = dict(fill_detail)
-        fill_detail.setdefault("cost_amount", round(cost_amount, 2))
-        fill_detail.setdefault("realized_pnl", round(realized_pnl, 2))
-
     PT._assert_active_lease(conn, "execution planner finalization")
-    conn.execute(
-        """UPDATE paper_orders SET filled_price=?,amount=?,fees=?,status='filled',
-           reason=?,risk_payload=?,realized_pnl=?,executed_at=? WHERE id=?""",
-        (fill_price, amount, fees, reason, PT._json(fill_detail),
-         realized_pnl, PT._now(), order_id),
+    if side == "sell" and cost_amount is not None:
+        fill_detail["cost_amount"] = round(cost_amount, 2)
+        fill_detail["realized_pnl"] = round(realized_pnl, 2)
+        conn.execute(
+            "UPDATE paper_orders SET realized_pnl=COALESCE(realized_pnl,0)+? WHERE id=?",
+            (realized_pnl, order_id),
+        )
+    fill_cursor = conn.execute(
+        """INSERT INTO paper_fills(
+               order_id,account_id,side,code,qty,price,amount,fees,fill_date,quote_at,
+               assumption,event_key,execution_asof,pricing_basis,slippage,market_evidence,
+               ruleset_version,execution_evidence)
+           VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+         (order_id, account_id, side, code, qty, fill_price, amount, fees,
+          PT._date(asof_day).isoformat(), quote_at, assumption, event_key,
+          decision.execution_asof, decision.pricing_basis, decision.slippage_amount,
+          PT._json(_plain_evidence(decision.market_evidence)), decision.ruleset_version,
+          PT._json(_plain_evidence(fill_event.execution_evidence))),
     )
-    conn.execute(
-        """INSERT INTO paper_fills(order_id,account_id,side,code,qty,price,amount,fees,fill_date,quote_at,assumption)
-           VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
-        (order_id, account_id, side, code, qty, fill_price, amount, fees,
-         PT._date(asof_day).isoformat(), plan.get("quote_at"), assumption),
-    )
+    # 逐笔成交血缘（R26）：一次 BUY 成交 → 一个 lot → **这一笔** FillEvent。
+    # 只有 ``source_order_id`` 时，"一笔委托多次部分成交"的每个 lot 都只能指向
+    # 同一张订单，无法证明某个 lot 到底由哪一笔成交产生。这里在同一事务内回填
+    # ``source_fill_id``，使 lot ←→ FillEvent 成为可证明的一对一关系。
+    # 历史旧 lot 保持 NULL（不可证明，绝不猜），读取方必须按 legacy 处理。
+    if source_lot_id is not None:
+        conn.execute(
+            "UPDATE paper_position_lots SET source_fill_id=? WHERE id=?",
+            (int(fill_cursor.lastrowid), int(source_lot_id)),
+        )
     # 执行验证闸门（PR-150 wiring）：**必须在 fill 流水写入之后**盖章，否则
     # evidence_from_order 看不到这条流水，会把一次真实成交记成"没有证据"。
     # 结论本身委托 execution_verification（它再委托 execution_evidence），

@@ -30,6 +30,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import execution_planner as EP
 import paper_trading as PT
+import test_position_risk_state as PRS
 
 ACCOUNT = "tq_breakout"
 CODE = "600901"
@@ -215,16 +216,22 @@ class _LedgerCase(unittest.TestCase):
 
     def commit(self, order_id, *, side, qty, reserved=True, code=CODE, price=10.0):
         """经**生产** ``commit_fill`` 成交（reserved=True 跳过预占，聚焦周期归属）。"""
+        execution_quote, execution_context = PRS._approved_execution_facts(
+            dt.date(2026, 9, 5), side, qty, price,
+        )
         with PT._db(immediate=True) as conn:
             return EP.commit_fill(
                 conn,
                 account={"id": ACCOUNT},
-                plan=self.plan(side=side, qty=qty, code=code, price=price),
+                plan={**self.plan(side=side, qty=qty, code=code, price=price),
+                      "quote_at": execution_quote["quote_at"],
+                      "execution_quote": execution_quote},
                 order_id=order_id,
                 asof_day=dt.date(2026, 9, 5),
                 reserved=reserved,
                 action="manual_filled",
                 reason="测试成交",
+                execution_context=execution_context,
             )
 
 

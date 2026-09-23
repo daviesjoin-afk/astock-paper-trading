@@ -32,12 +32,7 @@ import strategy_selection_resolver as SRES
 import strategy_risk_enforcement as SRE
 import strategy_runtime as SRT
 import user_strategy_participation as USP
-from paper_trading_rules import (
-    SLIPPAGE,
-    STAMP_SELL,
-    commission as _commission,
-    limit_pct as _limit_pct,
-)
+from paper_trading_rules import limit_pct as _limit_pct
 
 __all__ = ["RiskRunContext", "RiskServicePorts", "run"]
 
@@ -447,21 +442,16 @@ def run(context: RiskRunContext, *, ports: RiskServicePorts):
                 deps=ports.evidence,
             )
             downside_guard["confirmed"] = downside_confirmed
-            # P1 审计修复（2026-09-02）：主判定改用订单 payload 的稳定标记
-            # exit_marker='hard_stop_first_trim'（由 _sell_plan 写入）；中文
-            # reason LIKE 仅保留为当日旧订单（标记上线前写入）的同日兜底。
-            hard_stop_touched_today = bool(conn.execute(
-                """SELECT 1 FROM paper_orders
-                   WHERE account_id=? AND code=? AND side='sell' AND status='filled'
-                     AND """ + EV.VERIFIED_PREDICATE + """
-                     AND substr(created_at,1,10)=?
-                       AND (
-                           json_extract(risk_payload,'$.exit_marker')='hard_stop_first_trim'
-                           OR reason LIKE '%硬止损首段减仓%'
-                       )
-                   LIMIT 1""",
-                (position["account_id"], position["code"], day.isoformat()),
-            ).fetchone())
+            # 一次性减仓动作的当日去重统一走 execution_verification 的**唯一**判据：
+            # "是否存在经过验证的**正成交**"。此前这里用整单谓词
+            # （status='filled' + VERIFIED_PREDICATE），部分成交会被读成"没发生过"，
+            # 于是每轮扫描再发一张同样的减仓单 —— 300+300+300… 突破配置比例。
+            # 中文 reason LIKE 仅作标记上线前旧订单的兜底。
+            hard_stop_touched_today = EV.has_verified_positive_execution(
+                conn, marker="hard_stop_first_trim",
+                account_id=position["account_id"], code=position["code"],
+                asof_day=day, legacy_reason_like="%硬止损首段减仓%",
+            )
             base_spec = _spec_for(position["account_id"], conn, cycle_id=cycle_id)
             ratio, reason, next_stage, detail = PREv.sell_plan(
                 position, quote, day, news, hard_stop_touched_today=hard_stop_touched_today,
@@ -513,57 +503,35 @@ def run(context: RiskRunContext, *, ports: RiskServicePorts):
                 quality_action = "risk_exit"
                 detail["position_quality"] = quality_review
             detail["downside_guard"] = downside_guard
-            # 下面三处"当日是否已减仓过"的门禁都是**成交声称**：只有被证据证明
-            # 卖出的委托才算减过仓。没有验证列的旧行不得吃掉今天的第一次减仓，
-            # 否则一个"没发生过的卖出"会把真实需要减仓的持仓永久挡住。
-            # P1 审计修复（2026-09-02）：预警/守卫减仓的当日去重同样改用
-            # 结构化标记（见下方 guard_actionable 分支写入 detail["exit_marker"]），
-            # 中文 LIKE 仅作标记上线前旧订单的同日兜底。
-            warning_trimmed = bool(conn.execute(
-                """SELECT 1 FROM paper_orders
-                   WHERE account_id=? AND code=? AND side='sell' AND status='filled'
-                     AND """ + EV.VERIFIED_PREDICATE + """
-                     AND substr(created_at,1,10)=?
-                       AND (
-                           json_extract(risk_payload,'$.exit_marker')='downside_warning_trim'
-                           OR reason LIKE '%下跌预警首段减仓%'
-                       )
-                   LIMIT 1""",
-                (position["account_id"], position["code"], day.isoformat()),
-            ).fetchone())
+            # 下面三处"当日是否已减仓过"的门禁同样走正成交判据：只有被证据证明
+            # （完整**或部分**）卖出的委托才算减过仓。没有验证列的旧行不得吃掉今天
+            # 的第一次减仓，否则一个"没发生过的卖出"会把真实需要减仓的持仓永久挡住。
+            # 结构化 marker 是主判据（见下方 guard_actionable 分支写入
+            # detail["exit_marker"]），中文 LIKE 仅作标记上线前旧订单的同日兜底。
+            warning_trimmed = EV.has_verified_positive_execution(
+                conn, marker="downside_warning_trim",
+                account_id=position["account_id"], code=position["code"],
+                asof_day=day, legacy_reason_like="%下跌预警首段减仓%",
+            )
             # P3 审计修复（P1）：partial/full 缺少一次性消费标记——确认后
             # 每个扫描周期都重复减仓，弱势日 ~10 分钟内复利式清仓。按级别
             # 去重：partial 已卖不重复 partial，但条件恶化仍可升级到 full。
             guard_level = downside_guard.get("level")
-            guard_level_trimmed = bool(conn.execute(
-                """SELECT 1 FROM paper_orders
-                   WHERE account_id=? AND code=? AND side='sell' AND status='filled'
-                     AND """ + EV.VERIFIED_PREDICATE + """
-                     AND substr(created_at,1,10)=?
-                       AND (
-                           json_extract(risk_payload,'$.exit_marker')=?
-                           OR reason LIKE ?
-                       )
-                   LIMIT 1""",
-                (position["account_id"], position["code"], day.isoformat(),
-                 f"downside_{guard_level}", f"%下跌{guard_level}已连续两次确认%"),
-            ).fetchone())
+            guard_level_trimmed = EV.has_verified_positive_execution(
+                conn, marker=f"downside_{guard_level}",
+                account_id=position["account_id"], code=position["code"],
+                asof_day=day,
+                legacy_reason_like=f"%下跌{guard_level}已连续两次确认%",
+            )
             # 2026-09-03 二次确认减仓：warning 级首段减仓（一天一次）用完
             # 之后，若连续两轮扫描（满足最小扫描间隔）均确认"疑似出货"，
             # 允许追加一次 partial 比例的减仓——兑现"连续两次扫描确认后
             # 才允许部分减仓"的审计口径；当日一次，条件恶化仍可升级 full。
-            warning_confirmed_trimmed = bool(conn.execute(
-                """SELECT 1 FROM paper_orders
-                   WHERE account_id=? AND code=? AND side='sell' AND status='filled'
-                     AND """ + EV.VERIFIED_PREDICATE + """
-                     AND substr(created_at,1,10)=?
-                       AND (
-                           json_extract(risk_payload,'$.exit_marker')='downside_warning_confirmed'
-                           OR reason LIKE '%下跌预警连续两次确认减仓%'
-                       )
-                   LIMIT 1""",
-                (position["account_id"], position["code"], day.isoformat()),
-            ).fetchone())
+            warning_confirmed_trimmed = EV.has_verified_positive_execution(
+                conn, marker="downside_warning_confirmed",
+                account_id=position["account_id"], code=position["code"],
+                asof_day=day, legacy_reason_like="%下跌预警连续两次确认减仓%",
+            )
             warning_actionable = bool(
                 position["account_id"] in {"tq_breakout", NEW_STRATEGY_ID}
                 and downside_guard.get("level") == "warning"
@@ -723,9 +691,6 @@ def run(context: RiskRunContext, *, ports: RiskServicePorts):
                 orders.append({"code": position["code"], "status": status, "reason": order_reason})
                 continue
             qty = planned_qty
-            fill_price = price * (1 - SLIPPAGE)
-            amount = qty * fill_price
-            fees = _commission(amount) + amount * STAMP_SELL
             detail["remaining_qty"] = max(0, int(_num(position.get("qty"))) - qty)
             detail["position_closed"] = detail["remaining_qty"] < ports.evidence.lot_size
             if concentration_triggered and not detail["position_closed"]:
@@ -759,20 +724,41 @@ def run(context: RiskRunContext, *, ports: RiskServicePorts):
                     plan={
                         "side": "sell", "code": position["code"],
                         "name": position.get("name"), "qty": qty,
-                        "fill_price": fill_price, "amount": amount, "fees": fees,
-                        "quote_at": quote.get("quote_at") or _now(),
+                        "quote_at": quote.get("quote_at"),
+                        "execution_quote": quote,
                     },
                     order_id=order_id,
                     asof_day=day,
                     side="sell",
                     action="filled",
                     audit_action="sell_filled",
-                    audit_message=f"{position['code']} {qty}股 @ {fill_price:.2f}",
+                    audit_message=f"{position['code']} {qty}股，参考价 {price:.2f}",
                     reason=reason,
                     detail=detail,
-                    assumption="实时价 - 0.10% 滑点，含佣金及印花税",
+                    assumption="由模拟执行权威根据已核验行情计算价格和费用",
                     sell_next_take_stage=next_stage,
                 )
+                committed = conn.execute(
+                    "SELECT status,filled_qty,filled_price,execution_reasons "
+                    "FROM paper_orders WHERE id=?", (order_id,),
+                ).fetchone()
+                if not committed or str(committed[0]) not in {"filled", "partially_filled"}:
+                    conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+                    blocked = str(committed[3] or "execution_not_filled") if committed else "execution_state_unavailable"
+                    orders.append({
+                        "code": position["code"],
+                        "status": str(committed[0]) if committed else "pending_execution",
+                        "qty": int(committed[1] or 0) if committed else 0,
+                        "remaining_qty": int(qty),
+                        "reason": blocked,
+                    })
+                    continue
+                qty = int(committed[1] or 0)
+                fill_price = float(committed[2] or price)
+                detail["remaining_qty"] = max(0, int(_num(position.get("qty"))) - qty)
+                detail["position_closed"] = detail["remaining_qty"] < ports.evidence.lot_size
+                if not detail["position_closed"]:
+                    detail["capacity_state"] = "partial_execution"
                 if detail.get("protective_exit") and ratio >= 0.999:
                     policy = SPOL.recovery_policy(position["account_id"])
                     _audit(conn, position["account_id"], "protective_exit_recovery_watch", _json({
@@ -862,7 +848,7 @@ def run(context: RiskRunContext, *, ports: RiskServicePorts):
                         rotation_bought_codes.add(replacement_code)
                     detail["replacement_buy"] = replacement_result
             orders.append({
-                "code": position["code"], "status": "filled", "qty": qty,
+                "code": position["code"], "status": str(committed[0]), "qty": qty,
                 "reason": reason, "concentration_rotation": concentration_triggered,
                 "quality_score": quality_review.get("score"),
                 "position_closed": detail["position_closed"],

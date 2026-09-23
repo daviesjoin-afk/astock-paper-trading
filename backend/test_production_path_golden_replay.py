@@ -32,6 +32,7 @@ import sqlite3
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 import pandas as pd
 
@@ -249,6 +250,7 @@ def _fake_quotes(codes, asof_date=None):
             "super_net": scenario.get("super_net", 2_000_000.0),
             "amount": 50_000_000.0,
             "quote_at": stamp,
+            "execution_asof": stamp,
             "quote_source": "live", "source": "unit_test_injection",
             "quote_validation": "cross_source_checked", "risk_flag": 0,
         }
@@ -372,6 +374,26 @@ class OfflinePaperEnv:
         SRT.clear_cache()
         _seed_market(cls._tmp)
         PT.init_db()
+        cls._seed_tradability_archive()
+
+    @classmethod
+    def _seed_tradability_archive(cls):
+        import tradability_archive as TA
+        with contextlib.closing(cls._conn_for_class()) as conn, conn:
+            TA.ensure_schema(conn)
+            repository = TA.TradabilityArchiveRepository(conn)
+            for day in (D0, D1, D2, D3, D4, D5, D6):
+                for code in ALL_CODES:
+                    observed = f"{day.isoformat()}T08:50:00+08:00"
+                    repository.save(TA.TradabilityEvidence(
+                        code=code, session_date=day.isoformat(), is_listed=True,
+                        listing_date=SYNTHETIC_LIST_DATE, delisting_date=None,
+                        is_st=False, is_suspended=False, suspension_reason=None,
+                        has_market_quote=True, has_trade_volume=True,
+                        is_price_limit_locked=False, price_limit_direction=None,
+                        source="unit_test_injection", observed_at=observed,
+                        effective_at=f"{day.isoformat()}T09:00:00+08:00",
+                    ))
 
     @classmethod
     def tearDownClass(cls):
@@ -383,6 +405,12 @@ class OfflinePaperEnv:
     # ---------- 断言辅助 ----------
 
     def _conn(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(PT.DB_PATH, timeout=30)
+        conn.row_factory = sqlite3.Row
+        return conn
+
+    @classmethod
+    def _conn_for_class(cls) -> sqlite3.Connection:
         conn = sqlite3.connect(PT.DB_PATH, timeout=30)
         conn.row_factory = sqlite3.Row
         return conn
@@ -748,6 +776,7 @@ class ProductionInvariantTests(OfflinePaperEnv, unittest.TestCase):
         QUOTE_SCENARIOS.clear()
         SRT.clear_cache()
         PT.init_db()
+        self._seed_tradability_archive()
 
     def tearDown(self):
         # unittest 按字母序运行测试类：本类（ProductionInvariantTests）先于
@@ -794,6 +823,168 @@ class ProductionInvariantTests(OfflinePaperEnv, unittest.TestCase):
         opened = PT.run_slot("open", D1, force=True)
         self.assertNotEqual(opened.get("status"), "failed", opened)
         return close_result, opened
+
+    def test_r26_approved_signal_uses_execution_authority_and_fill_evidence(self):
+        """Approved intent is distinct from fills and accounting follows fill evidence."""
+        self._boot_strategy()
+        PT.generate_signals(D0)
+        with self._conn() as conn:
+            cash_before = float(conn.execute(
+                "SELECT cash FROM paper_accounts WHERE id=?", (STRATEGY_ID,),
+            ).fetchone()[0])
+        opened = PT.run_slot("open", D1, force=True)
+        self.assertNotEqual(opened.get("status"), "failed", opened)
+
+        with self._conn() as conn:
+            signals = {
+                int(row["id"]): json.loads(row["payload"])
+                for row in conn.execute(
+                    "SELECT id,payload FROM paper_signals WHERE account_id=?",
+                    (STRATEGY_ID,),
+                )
+            }
+            orders = [dict(row) for row in conn.execute(
+                "SELECT * FROM paper_orders WHERE account_id=? AND side='buy'",
+                (STRATEGY_ID,),
+            )]
+            fills = [dict(row) for row in conn.execute(
+                "SELECT * FROM paper_fills WHERE account_id=? AND side='buy'",
+                (STRATEGY_ID,),
+            )]
+            positions = [dict(row) for row in conn.execute(
+                "SELECT * FROM paper_positions WHERE account_id=?",
+                (STRATEGY_ID,),
+            )]
+            cash_after = float(conn.execute(
+                "SELECT cash FROM paper_accounts WHERE id=?", (STRATEGY_ID,),
+            ).fetchone()[0])
+
+        self.assertTrue(fills, "fixture should produce at least one execution-authorized fill")
+        fills_by_order = {}
+        for fill in fills:
+            fills_by_order.setdefault(int(fill["order_id"]), []).append(fill)
+            self.assertEqual(fill["fill_date"], D1.isoformat())
+            self.assertAlmostEqual(fill["amount"], fill["qty"] * fill["price"], places=2)
+            self.assertAlmostEqual(
+                fill["fees"], round(PT._commission(fill["amount"]), 2), places=2,
+            )
+            self.assertTrue(fill["quote_at"])
+            self.assertIn("滑点", fill["assumption"])
+
+        for order in orders:
+            order_fills = fills_by_order.get(int(order["id"]), [])
+            if not order_fills:
+                continue
+            self.assertEqual(order["status"], "filled")
+            self.assertEqual(order["filled_qty"], sum(int(fill["qty"]) for fill in order_fills))
+            self.assertEqual(
+                int(order["qty"]), int(order["filled_qty"]) + int(order["remaining_qty"]),
+            )
+            self.assertTrue(order["execution_asof"])
+            self.assertTrue(order["pricing_basis"])
+            self.assertTrue(order["ruleset_version"])
+            self.assertGreaterEqual(order["execution_version"], 1)
+            decision = signals[int(order["signal_id"])]["signal_decision"]
+            self.assertEqual(decision["outcome"], "approved")
+
+        filled_qty = sum(int(fill["qty"]) for fill in fills)
+        position_qty = sum(int(position["qty"]) for position in positions)
+        cash_debit = sum(float(fill["amount"]) + float(fill["fees"]) for fill in fills)
+        self.assertEqual(position_qty, filled_qty)
+        self.assertAlmostEqual(cash_before - cash_after, cash_debit, places=2)
+
+    def test_r26_partial_fill_retry_is_idempotent_and_finishes_same_order(self):
+        """Two distinct execution events fill one frozen intent without double accounting."""
+        self._boot_strategy()
+        code = PASS_CODES[0]
+        quote = dict(PT._quotes([code], asof_date=D1).get(code) or {})
+        self.assertGreater(float(quote.get("price") or 0), 0, quote)
+        quote.update({
+            "quote_at": f"{D1.isoformat()} 10:00:00",
+            "execution_asof": f"{D1.isoformat()} 10:00:00",
+        })
+        with self._conn() as conn:
+            account = dict(conn.execute(
+                "SELECT * FROM paper_accounts WHERE id=?", (STRATEGY_ID,),
+            ).fetchone())
+            cycle_id = PT._order_cycle_id(conn, account["cycle_id"])
+            strategy_stamp = PT._strategy_stamp(conn, STRATEGY_ID)
+            cursor = conn.execute(
+                """INSERT INTO paper_orders(
+                       account_id,side,code,name,qty,planned_price,status,reason,
+                       risk_payload,created_at,strategy_id,strategy_version,
+                       strategy_checksum,cycle_id,order_type,origin)
+                   VALUES(?,?,?,?,?,?,'pending_execution','R26 partial replay','{}',
+                          ?,?,?,?,?,'market','strategy')""",
+                (STRATEGY_ID, "buy", code, NAMES[code], 1000, quote["price"],
+                 f"{D1.isoformat()} 09:40:00", *strategy_stamp, cycle_id),
+            )
+            order_id = int(cursor.lastrowid)
+            cash_before = float(account["cash"])
+
+        first = {**quote, "amount": float(quote["price"]) * 30_100}
+        # 参与额度是**当日累计**成交额推出的，且要扣掉本 session 已消耗的模拟成交量。
+        # 所以第二笔能成交 700 股的前提是行情累计成交额**继续增长**（到足以覆盖
+        # 1000 股 × 1% 参与率 = 需求 100,000 股），而不是同一个 snapshot 再吃一遍。
+        second = {
+            **quote, "quote_at": f"{D1.isoformat()} 10:02:00",
+            "execution_asof": f"{D1.isoformat()} 10:02:00",
+            "amount": float(quote["price"]) * 130_000,
+        }
+        events = [first, first, second]
+
+        def _prefetched_quotes(codes, asof_date=None):
+            return {code: events.pop(0)}
+
+        with mock.patch.object(PT, "_quotes", side_effect=_prefetched_quotes):
+            first_result = PT.process_pending_execution_orders(D1)
+            with self._conn() as conn:
+                row = dict(conn.execute(
+                    "SELECT * FROM paper_orders WHERE id=?", (order_id,),
+                ).fetchone())
+                self.assertEqual("partially_filled", row["status"])
+                self.assertEqual(300, row["filled_qty"])
+                self.assertEqual(700, row["remaining_qty"])
+                self.assertEqual(1, conn.execute(
+                    "SELECT COUNT(*) FROM paper_fills WHERE order_id=?", (order_id,),
+                ).fetchone()[0])
+
+            # Replaying the exact same event cannot add a second fill or accounting impact.
+            duplicate_result = PT.process_pending_execution_orders(D1)
+            with self._conn() as conn:
+                self.assertEqual(1, conn.execute(
+                    "SELECT COUNT(*) FROM paper_fills WHERE order_id=?", (order_id,),
+                ).fetchone()[0])
+                self.assertEqual(300, conn.execute(
+                    "SELECT filled_qty FROM paper_orders WHERE id=?", (order_id,),
+                ).fetchone()[0])
+            second_result = PT.process_pending_execution_orders(D1)
+        with self._conn() as conn:
+            final_order = dict(conn.execute(
+                "SELECT * FROM paper_orders WHERE id=?", (order_id,),
+            ).fetchone())
+            fills = [dict(row) for row in conn.execute(
+                "SELECT * FROM paper_fills WHERE order_id=? ORDER BY id", (order_id,),
+            )]
+            position_qty = conn.execute(
+                "SELECT COALESCE(SUM(qty),0) FROM paper_positions WHERE account_id=? AND code=?",
+                (STRATEGY_ID, code),
+            ).fetchone()[0]
+            cash_after = float(conn.execute(
+                "SELECT cash FROM paper_accounts WHERE id=?", (STRATEGY_ID,),
+            ).fetchone()[0])
+        self.assertEqual("filled", final_order["status"])
+        self.assertEqual(1000, final_order["filled_qty"])
+        self.assertEqual(0, final_order["remaining_qty"])
+        self.assertEqual([300, 700], [int(fill["qty"]) for fill in fills])
+        self.assertEqual(1000, position_qty)
+        self.assertTrue(all(fill["execution_evidence"] for fill in fills))
+        self.assertTrue(all(fill["pricing_basis"] for fill in fills))
+        cash_debit = sum(float(fill["amount"]) + float(fill["fees"]) for fill in fills)
+        self.assertAlmostEqual(cash_before - cash_after, cash_debit, places=2)
+        self.assertEqual("partially_filled", first_result[0]["status"])
+        self.assertEqual("partially_filled", duplicate_result[0]["status"])
+        self.assertEqual("filled", second_result[0]["status"])
 
     def _allocation(self, price, positions=None, nav=None, conn=None):
         """生产资金部署入口（唯一输入装配点），不做任何本地重算。"""
@@ -955,6 +1146,8 @@ class ProductionInvariantTests(OfflinePaperEnv, unittest.TestCase):
         PT.DB_PATH = os.path.join(self._tmp, "paper_invariant_second.sqlite3")
         SRT.clear_cache()
         PT.init_db()
+        # 每个临时账本都要有相同的 PIT 可交易性证据；不能复用上一库的档案。
+        self._seed_tradability_archive()
         second = self._run_fixture_and_digest()
         self.assertTrue(first["fills"], "前置条件：fixture 必须产生成交")
         self.assertEqual(first["digest"], second["digest"],
