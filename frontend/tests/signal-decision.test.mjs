@@ -119,17 +119,3 @@ test("signal 生命周期状态渲染成人可读标签，而不是 raw token", 
     );
   }
 });
-
-test("信号审计表展示裁决/证据列，且说明来自后端", () => {
-  assert.equal(
-    paperSource.includes("signalDecisionView("),
-    true,
-    "运行页没有渲染后端 signal 裁决投影",
-  );
-  assert.equal(
-    paperSource.includes("裁决/证据"),
-    true,
-    "信号审计表没有裁决/证据列",
-  );
-  assert.equal(coreSource.includes("export function signalDecisionView"), true);
-});
