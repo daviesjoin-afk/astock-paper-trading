@@ -24,9 +24,9 @@
 
 细节见 [策略平台文档](docs/STRATEGY_PLATFORM.md)、[自进化架构](docs/EVOLUTION_ARCHITECTURE.md) 与 [架构说明](ARCHITECTURE.md)。
 
-## v2.0.0：确定性、可审计、Point-in-Time 正确的平台基线
+## v0.20.0：确定性、可审计、Point-in-Time 正确的平台基线
 
-**v2.0.0** 是自 v1.3.0 以来的 major release：126 个 merged PR 把项目从“策略模拟盘 + 自进化”推进到强调**证据来源、历史可知性、执行真实性、周期归属和确定性决策**的研究平台。
+**v0.20.0** 是自 v0.13.0 以来的一次平台级 release：126 个 merged PR 把项目从“策略模拟盘 + 自进化”推进到强调**证据来源、历史可知性、执行真实性、周期归属和确定性决策**的研究平台。
 
 核心变化：
 
@@ -41,7 +41,7 @@
 
 当前 paper schema 为 **v21**；无法可靠重建的历史 provenance 会保持 `unknown` / `NULL`，不会被“最新状态”猜测性补齐。
 
-完整升级说明、breaking behavior、验证结果以及 v1.3.0 之后全部 126 个 merged PR 索引见 **[v2.0.0 发布说明](docs/RELEASE-v2.0.0.md)**。
+完整升级说明、breaking behavior、验证结果以及 v0.13.0 之后全部 126 个 merged PR 索引见 **[v0.20.0 发布说明](docs/RELEASE-v0.20.0.md)**。
 
 
 ## 必须知道的六条平台语义
@@ -57,7 +57,7 @@
 
 ## Dashboard 预览
 
-当前发布版本：**v2.0.0**（[完整发布说明](docs/RELEASE-v2.0.0.md) · [GitHub Releases](https://github.com/daviesjoin-afk/astock-paper-trading/releases) · [CHANGELOG](CHANGELOG.md)）。查看 [架构说明](ARCHITECTURE.md)、[策略平台](docs/STRATEGY_PLATFORM.md)、[仓库结构地图](docs/REPOSITORY_LAYOUT.md) 和 [安全边界](SECURITY.md)。CI 验证 Python 3.11/3.12、离线 Docker 全量回归、前端构建与 Chromium E2E。
+当前发布版本：**v0.20.0**（[完整发布说明](docs/RELEASE-v0.20.0.md) · [GitHub Releases](https://github.com/daviesjoin-afk/astock-paper-trading/releases) · [CHANGELOG](CHANGELOG.md)）。查看 [架构说明](ARCHITECTURE.md)、[策略平台](docs/STRATEGY_PLATFORM.md)、[仓库结构地图](docs/REPOSITORY_LAYOUT.md) 和 [安全边界](SECURITY.md)。CI 验证 Python 3.11/3.12、离线 Docker 全量回归、前端构建与 Chromium E2E。
 
 ![模拟盘 Dashboard 预览](docs/assets/dashboard.png)
 
@@ -337,7 +337,6 @@ Docker 使用仓库专用命名卷，不会自动连接其他实例的私有运�
 - [#1 扩展行情数据源适配与故障降级](https://github.com/daviesjoin-afk/astock-paper-trading/issues/1)
 - [#2 设计可插拔策略接口与策略回放规范](https://github.com/daviesjoin-afk/astock-paper-trading/issues/2)（策略平台与声明式 DSL 已落地，见 [`docs/STRATEGY_PLATFORM.md`](docs/STRATEGY_PLATFORM.md)；issue 保留用于跟踪剩余缺口）
 - [#3 补充回测、纸面撮合与审计回放验证](https://github.com/daviesjoin-afk/astock-paper-trading/issues/3)（场景矩阵与缺口见 [`docs/TEST_MATRIX.md`](docs/TEST_MATRIX.md)）
-
 提交代码前请阅读 [`CONTRIBUTING.md`](CONTRIBUTING.md)。版本变化见 [`CHANGELOG.md`](CHANGELOG.md) 和 [GitHub Releases](https://github.com/daviesjoin-afk/astock-paper-trading/releases)。安全问题请通过 [私密漏洞报告](https://github.com/daviesjoin-afk/astock-paper-trading/security/advisories/new) 提交，不要公开包含敏感信息的复现材料。
 
 ## 可选 LLM 研究能力
