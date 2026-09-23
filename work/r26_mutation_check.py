@@ -18,6 +18,7 @@ import tempfile
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BACKEND = os.path.join(ROOT, "backend")
 PLANNER = "backend/execution_planner.py"
+PRELUDE = "\n_REPLAY_PROBE = [0]\n"
 EXECUTION_TEST = "test_execution_planner.SimulationExecutionContractTests"
 
 
@@ -95,10 +96,24 @@ MUTATIONS = [
         "id": "M7", "file": PLANNER,
         # R26 收敛后 event key 有了唯一命名 owner；把"重放"错误编码成不同事件
         # 就等于让同一份证据再次成交。
-        "changes": [(
-            '        f"{int(order_id)}|{quote_at}|{ruleset_version}".encode("utf-8")',
-            '        f"{int(order_id)}|{quote_at}|{ruleset_version}|{dt.datetime.now()}".encode("utf-8")',
-        )],
+        #
+        # 变异必须**确定性**：早先用 ``dt.datetime.now()``，但粗粒度时钟上连续两次
+        # ``now()`` 可能完全相等（本机实测连调三次同值），于是这个变异体时灵时不灵，
+        # 报 SURVIVED 时其实什么都没测到。同一个语义缺陷改用单调计数器表达，
+        # 连续两次 key 推导必然不同，任何正确的不变式测试都必须稳定抓到它。
+        "changes": [
+            (
+                "def _fill_event_key(*, order_id, quote_at, ruleset_version):",
+                "def _fill_event_key(*, order_id, quote_at, ruleset_version):\n"
+                "    _REPLAY_PROBE[0] += 1  # mutant: replay becomes a new event",
+            ),
+            (
+                '        f"{int(order_id)}|{quote_at}|{ruleset_version}".encode("utf-8")',
+                '        f"{int(order_id)}|{quote_at}|{ruleset_version}|'
+                '{_REPLAY_PROBE[0]}".encode("utf-8")',
+            ),
+        ],
+        "prelude": PRELUDE,
         "test": "test_r26_convergence_regressions."
                 "IdempotencyTests.test_same_quote_observation_cannot_fill_twice",
         "desc": "相同行情重放被错误编码成新成交事件",
@@ -316,6 +331,8 @@ def main() -> int:
                     print(f"ANCHOR ERROR {item['id']}: expected 1 anchor, found {count}")
                     return 2
                 mutant_text = mutant_text.replace(old, new, 1)
+            if item.get("prelude"):
+                mutant_text += item["prelude"]
             with open(os.path.join(ROOT, rel), "wb") as handle:
                 handle.write(mutant_text.encode("utf-8"))
             try:
