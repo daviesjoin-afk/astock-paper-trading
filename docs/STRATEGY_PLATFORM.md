@@ -2,7 +2,7 @@
 
 本文描述**当前**策略平台的数据模型与运行语义：内置策略模板（builtin）+ 声明式用户策略（user）。
 
-- 历史版本与旧架构记录见 [`CHANGELOG.md`](../CHANGELOG.md)、[`RELEASE-v1.1.0.md`](RELEASE-v1.1.0.md)、[`RELEASE-v1.2.0.md`](RELEASE-v1.2.0.md) 与 [`archive/`](archive/README.md)，它们保留当时的真实口径，不回写。
+- 历史版本与旧架构记录见 [`CHANGELOG.md`](../CHANGELOG.md)、[`RELEASE-v0.11.0.md`](RELEASE-v0.11.0.md)、[`RELEASE-v0.12.0.md`](RELEASE-v0.12.0.md) 与 [`archive/`](archive/README.md)，它们保留当时的真实口径，不回写。
 - 系统分层与调用边界见 [`../ARCHITECTURE.md`](../ARCHITECTURE.md)；自进化见 [`EVOLUTION_ARCHITECTURE.md`](EVOLUTION_ARCHITECTURE.md)；模块地图见 [`REPOSITORY_LAYOUT.md`](REPOSITORY_LAYOUT.md)。
 
 > **一句话**：策略是**声明式定义 + 不可变版本**。用户策略**不运行 Python**，只提供 DSL；最终下单数量、止损深度、资金分配与执行方式由平台编译、收紧与决定。
