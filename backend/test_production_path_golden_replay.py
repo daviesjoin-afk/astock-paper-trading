@@ -923,10 +923,13 @@ class ProductionInvariantTests(OfflinePaperEnv, unittest.TestCase):
             cash_before = float(account["cash"])
 
         first = {**quote, "amount": float(quote["price"]) * 30_100}
+        # 参与额度是**当日累计**成交额推出的，且要扣掉本 session 已消耗的模拟成交量。
+        # 所以第二笔能成交 700 股的前提是行情累计成交额**继续增长**（到足以覆盖
+        # 1000 股 × 1% 参与率 = 需求 100,000 股），而不是同一个 snapshot 再吃一遍。
         second = {
             **quote, "quote_at": f"{D1.isoformat()} 10:02:00",
             "execution_asof": f"{D1.isoformat()} 10:02:00",
-            "amount": float(quote["price"]) * 70_100,
+            "amount": float(quote["price"]) * 130_000,
         }
         events = [first, first, second]
 

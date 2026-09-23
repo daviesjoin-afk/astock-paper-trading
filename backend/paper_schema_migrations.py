@@ -111,7 +111,14 @@ def ensure_paper_columns(conn):
     changes["paper_position_lots"] = ensure_columns(
         conn,
         "paper_position_lots",
-        {"cost_fee_included": "INTEGER NOT NULL DEFAULT 0"},
+        {
+            "cost_fee_included": "INTEGER NOT NULL DEFAULT 0",
+            # R26：lot 的**逐笔成交血缘**。``source_order_id`` 只说明"来自哪张委托"，
+            # 一笔委托可以有多个 FillEvent（部分成交）时无法证明某个 lot 到底由哪
+            # 一笔成交产生。历史旧 lot 保持 NULL —— 无法从任何当前状态反推它来自
+            # 哪笔流水，**绝不**按时间/价格猜一个 fill_id。
+            "source_fill_id": "INTEGER",
+        },
     )
     changes["paper_positions"] = ensure_columns(
         conn,

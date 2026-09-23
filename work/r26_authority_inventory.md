@@ -57,4 +57,20 @@
 - **Network/writer boundary：** R26 pending execution 先取 quote、再开 SQLite writer；`commit_fill` 只读本地事实。provider 被 monkeypatch 成异常的 writer-boundary 用例通过。
 - **复杂度与 facade：** 没有新增 production module；新增 1 个真正运行待成交事件的 scheduler/orchestrator（`process_pending_execution_orders`），没有转发 facade。删除了“approved signal → 预写 filled → 同步整笔成交”执行捷径。price/fee/limit/T+1 规则从多个 caller 收敛到单个 pure evaluator；策略 risk/approval 决策仍由原有 owner 负责。
 - **关键复杂度观察：** 旧系统要在 `_buy_order`、`_manual_order_plan`、risk sell 和 intraday special path 之间追执行规则；现在“为什么成交/未成交”从 evaluator + `commit_fill` + R24/tradability evidence 可追。`paper_risk_service.run` 仍是 risk policy 热点，未把 risk policy 挪进 execution。
-- **`paper_trading.py`：** 基线 `15,000 LOC / 282` 个顶层函数；修改后 `15,211 LOC / 284` 个。文件增加 211 行（主要是 pending intent 重试与执行队列协调），LOC 只作观察；没有新增 wrapper facade 或独立 production module。
+- **`paper_trading.py`：** 基线 `15,000 LOC / 282` 个顶层函数；修改后 `15,227 LOC / 310` 个（含本轮收敛的归档多笔成交与 signal 对账修复）。LOC 只作观察；没有新增 wrapper facade 或独立 production module。
+- **`paper_risk_service.py`（本轮）：884 LOC / 19 defs。** 低于架构 guard 的 925 上限，且是**变小**的（911 → 884）：4 处手写的 `exit_marker` 去重 SQL 被删除，改调 `execution_verification.has_verified_positive_execution`。本轮没有把 `900 → 925 → 950` 这类放宽上限当作可维护性解法。
+
+## 收敛轮（consolidation）增量
+
+在 #186 主体架构之上，本轮只做语义收敛与缺陷修复，没有新增 production module、没有新增
+facade / manager / helper：
+
+| 类别 | 内容 |
+| --- | --- |
+| 权威数量 | 执行决策 1、`paper_fills` writer 1、一次性风险动作去重 1、成交事件身份 1、session 阶段 1、逐笔血缘 1 —— 与上一版相同或更少；**没有新增 authority** |
+| 删除的重复规则 | `paper_risk_service` 4 处手写 `status='filled'` + exit_marker 去重 SQL；`execution_planner` 经 `signal_service` 取行情事实的旁路 |
+| 依赖方向 | `execution_planner` → `market_data_contract`（不再 → `signal_service`）；Guard 15 静态禁止回流 |
+| 新增命名契约 | `market_data_contract.symbol_quote_snapshot`、`execution_planner.consumed_session_quantity`、`execution_planner._fill_event_key`、`execution_verification.has_verified_positive_execution` / `POSITIVE_EXECUTION_PREDICATE` / `FILL_CARRYING_PREDICATE` / `is_positive_execution_row` |
+| 隐式 current-state 查询 | 无新增。session 阶段与执行时点一律来自显式 `execution_asof`；流动性已消耗量按 `execution_asof` 有界 |
+| 理解成本 | "这张单为什么没成交" = evaluator 的 `reasons` + `execution_reasons`（1 处）；"为什么只成交 300" = `liquidity_evidence`（观察量/参与率/已消耗/可执行上限 4 个数，1 处），不需要跨模块猜 |
+

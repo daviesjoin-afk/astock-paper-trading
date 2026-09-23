@@ -125,6 +125,58 @@ VERIFIED_PREDICATE_COLUMNS = ("execution_verified", "execution_status")
 VERIFIED_PREDICATE_SIGNATURE = "execution_status = 'verified'"
 
 
+# ────────────────── 正成交谓词：部分成交也算"发生过" ──────────────────
+#
+# ``VERIFIED_PREDICATE`` 回答的是"**整张订单**是否被证明完整成交"，
+# `execution_verified = 1` 只属于 ``verified``，**部分成交按设计为假**。
+#
+# 但"这个一次性动作是否已经真正执行过"是**另一个问题**：目标卖 1000 股、
+# 实际只成交 300 股，那 300 股是已经发生的事实。若用整单谓词去回答它，
+# 部分成交就会被读成"没发生过"，于是风险扫描每轮再生成一张同样的减仓单，
+# 300+300+300… 迅速突破配置的减仓比例。
+#
+# 因此这里给出**唯一**的"存在经过验证的正成交"谓词与函数：
+# ``verified`` 或 ``partial`` 两态都意味着"有正成交量"、且结论来自账本证据，
+# 而不是订单自称。``not_executed`` / ``unknown`` 一律排除 —— 前者是"确认的零"，
+# 后者是"证据不足"，都不能算动作已执行。
+#: 某笔委托是否**有经过验证的正成交**（完整成交或部分成交皆可）。
+#:
+#: 两态各自要求**两列一致**，与 :data:`VERIFIED_PREDICATE` 同样 fail closed：
+#:
+#: * ``verified``：``execution_verified = 1`` **且** ``execution_status = 'verified'``；
+#: * ``partial``：``execution_verified = 0`` **且** ``execution_status = 'partial'``
+#:   （部分成交按设计 ``execution_verified`` 就是 0，它只在完整成交时为 1）。
+#:
+#: 于是"两列被改得不一致"（例如手工把 flag 置 0 却留着 status='verified'）
+#: 会同时落空两态，被当作**没有正成交证据** —— 而不是被宽泛的 ``IN`` 收进来。
+POSITIVE_EXECUTION_PREDICATE = (
+    "((COALESCE(execution_verified, 0) = 1 AND execution_status = 'verified')"
+    " OR (execution_verified = 0 AND execution_status = 'partial'))"
+)
+
+#: 可能**携带成交流水**的委托生命周期状态。
+#:
+#: 这是"要不要去读这张订单的流水"的选取条件，与"这些流水是否构成成交证据"是
+#: 两件事，必须分开：
+#:
+#: * 选取（本常量）：只要订单可能已经有成交，就必须把它的流水读进来，
+#:   让验证层去判 —— 否则一条 ``status='filled'`` 却没有证据的旧行会被查询
+#:   直接漏掉，"证据不足"就变成了"没有这笔委托"，读路径静默放行（fail open）。
+#: * 证据（:data:`POSITIVE_EXECUTION_PREDICATE`）：读进来之后由它决定这些
+#:   流水算不算正成交。
+#:
+#: 因此 ``cancelled`` / ``expired`` / ``superseded`` / ``risk_rejected`` 也在集合里：
+#: 撤销或终止的委托**保留**已经发生的部分成交，剩余量不再执行。
+FILL_CARRYING_ORDER_STATUSES = (
+    "filled", "partially_filled",
+    "cancelled", "expired", "superseded", "risk_rejected",
+)
+#: 选取谓词：该委托是否可能携带成交流水。读路径用它取代 ``status='filled'``。
+FILL_CARRYING_PREDICATE = (
+    "(status IN ('" + "','".join(FILL_CARRYING_ORDER_STATUSES) + "'))"
+)
+
+
 def status_from_verdict(verdict: Any) -> str:
     """把 PR150 的 ``fill_verdict`` 映射成本层四态。
 
@@ -221,6 +273,33 @@ def is_verified_row(row: Any) -> bool:
     if flag is None or status is None:
         return False
     return _verified_flag_value(flag) and _verified_status_value(status)
+
+
+def is_positive_execution_row(row: Any) -> bool:
+    """Python 侧的 :data:`POSITIVE_EXECUTION_PREDICATE`：该行是否有**正成交**。
+
+    与 :func:`is_verified_row` 的关系是**包含**关系，不是替代：
+
+    * 完整成交（``execution_verified = 1`` 且 ``execution_status = 'verified'``）⇒ True；
+    * 部分成交（``execution_verified = 0`` 且 ``execution_status = 'partial'``）⇒ True；
+    * ``not_executed`` / ``unknown`` / 缺列 / NULL / 两列不一致 ⇒ False。
+
+    这个区分是 R26 的核心之一："**整张订单**是否完整成交"与"**这笔委托**是否已经
+    真实成交过一部分"是两个不同的问题。用前者回答后者，会让部分成交被读成"没发生"。
+
+    与 SQL 谓词逐值等价：只做精确比较（``_verified_flag_value`` /
+    exact ``str``），不做 ``int()`` 之类的宽容转换，两列必须**同时**成立。
+    """
+    status = _row_field(row, "execution_status")
+    if not isinstance(status, str):
+        return False
+    if status == EXECUTION_STATUS_VERIFIED:
+        return _verified_flag_value(_row_field(row, "execution_verified"))
+    if status == EXECUTION_STATUS_PARTIAL:
+        flag = _row_field(row, "execution_verified")
+        # 部分成交的 flag 必须是精确的 0（SQLite 存成整数 0）。
+        return flag is not None and not isinstance(flag, (str, bytes)) and flag == 0
+    return False
 
 
 def verification_from_evidence(evidence: Any, *, fill_rows_present: bool = True) -> dict:
@@ -390,6 +469,75 @@ def _fills_for_orders(conn, order_ids: Any) -> dict:
         for row in rows:
             grouped.setdefault(int(row["order_id"]), []).append(row)
     return grouped
+
+
+#: marker 读写允许的列 / JSON key 白名单（两者都会被拼进 SQL）。
+_MARKER_COLUMNS = frozenset({"risk_payload"})
+_MARKER_KEYS = frozenset({"exit_marker"})
+
+
+def has_verified_positive_execution(
+    conn,
+    *,
+    marker: str,
+    account_id: Any,
+    code: Any,
+    asof_day: Any,
+    legacy_reason_like: str | None = None,
+    column: str = "risk_payload",
+    marker_key: str = "exit_marker",
+) -> bool:
+    """某个一次性风险动作**是否已经真正执行过**（有经过验证的正成交）。
+
+    这是"这张减仓动作还要不要重发"的**唯一**判据，供风险扫描去重使用。它问的不是
+    "整张订单是否完全成交"（那会让部分成交被读成没发生），而是"是否存在一笔经过
+    证据验证、且带该 marker 的**正成交**委托"。
+
+    语义边界（必须与"订单剩余量继续执行"分开）：
+
+    * 命中 → 该 one-shot 动作**已经消费**，风险扫描**不再**新建第二张同样的单；
+    * 未命中 → 动作尚未发生，允许发起；
+    * 至于那张已存在、可能部分成交的订单自身的剩余股份，仍由 Execution Authority
+      在后续行情事件里继续执行 —— 这里**不**、也**不应**阻止它，两者是不同问题。
+
+    因此本函数只回答去重，不返回任何"剩余量"或"是否可继续成交"的信息。
+
+    ``legacy_reason_like`` 是**标记上线前**旧订单的兜底：那些行没有 ``exit_marker``，
+    只能靠中文 reason 文本识别。它刻意做成显式参数（而不是在 SQL 里悄悄多一个
+    ``OR``），让"这里在为历史数据破例"在读代码时无法被忽略；新写入的行一律走
+    结构化 marker。
+
+    ``column`` / ``marker_key`` 会被拼进 SQL，因此做白名单校验。
+    """
+    if column not in _MARKER_COLUMNS:
+        raise ValueError(f"unsupported marker column: {column!r}")
+    if marker_key not in _MARKER_KEYS:
+        raise ValueError(f"unsupported marker key: {marker_key!r}")
+    if not marker:
+        return False
+    day = str(asof_day or "")[:10]
+    if not day:
+        return False
+    matcher = f"json_extract({column},'$.{marker_key}')=?"
+    params: list = [str(account_id), str(code), day, str(marker)]
+    if legacy_reason_like:
+        matcher = f"({matcher} OR reason LIKE ?)"
+        params.append(str(legacy_reason_like))
+    sql = (
+        "SELECT 1 FROM paper_orders "
+        "WHERE account_id=? AND code=? AND side='sell' "
+        f"  AND {POSITIVE_EXECUTION_PREDICATE} "
+        "  AND substr(created_at,1,10)=? "
+        f"  AND {matcher} "
+        "LIMIT 1"
+    )
+    try:
+        row = conn.execute(sql, tuple(params)).fetchone()
+    except sqlite3.Error:
+        # 账本读不出结论时**不得**放行新动作：宁可暂缓一次减仓，也不能因为查询
+        # 失败而重复减仓（重复减仓会真正改变持仓，代价不可逆）。
+        return True
+    return row is not None
 
 
 def stamp_order(conn, order_id: Any) -> dict:

@@ -272,7 +272,7 @@ class SimulationExecutionContractTests(unittest.TestCase):
     def _facts(self, *, quote_at=None, execution_asof=None, amount=50_000_000.0,
                can_buy=True, can_sell=True, buy_reason="ok", sell_reason="ok",
                liquidity=50_000, sellable=50_000, status="pending_execution",
-               verification="cross_source_checked"):
+               verification="cross_source_checked", session_consumed=0):
         quote_at = quote_at or f"{self.DAY} 10:00:00"
         execution_asof = execution_asof or quote_at
         quote = {
@@ -295,6 +295,7 @@ class SimulationExecutionContractTests(unittest.TestCase):
             session_date=self.DAY, execution_asof=execution_asof, quote=quote,
             market_reading=reading, tradability=tradability,
             available_liquidity=liquidity, sellable_quantity=sellable,
+            same_day_consumed_quantity=session_consumed,
             current_order_status=status,
         )
         return quote, context
@@ -327,6 +328,51 @@ class SimulationExecutionContractTests(unittest.TestCase):
         self.assertEqual(300, result.fill_quantity)
         self.assertEqual(700, result.remaining_quantity)
         self.assertIn(EP.ExecutionReason.INSUFFICIENT_LIQUIDITY.value, result.reasons)
+
+    def test_same_day_consumption_is_subtracted_from_cumulative_participation(self):
+        """同一个累计成交量不得被重复消费（R26）。
+
+        行情给出的是**当日累计**成交额，10:05 的 snapshot 仍然包含 10:00 之前那部分
+        成交量。若把已消耗量减掉，10:00 吃掉的 1% 参与额度就不能在 10:05 再吃一次。
+        """
+        _, context = self._facts(liquidity=10_000, session_consumed=3_000)
+        result = EP.evaluate_simulated_execution(self._intent(), context)
+        # 参与额度 = 10_000 × 1% = 100 股，已消耗 3_000 ⇒ 本事件可执行 0。
+        self.assertFalse(result.executable_now)
+        self.assertEqual(0, result.fill_quantity)
+        self.assertEqual(1000, result.remaining_quantity)
+        self.assertIn(EP.ExecutionReason.INSUFFICIENT_LIQUIDITY.value, result.reasons)
+        self.assertEqual(
+            0, result.liquidity_evidence["executable_capacity"],
+            result.liquidity_evidence,
+        )
+
+    def test_growing_cumulative_volume_releases_further_capacity(self):
+        """行情累计成交额增长后，剩余参与额度允许继续成交（R26）。"""
+        # 10:00：累计 10_000 股 ⇒ 1% = 100 股额度，消耗 0 ⇒ 成交 100 股。
+        _, first_context = self._facts(liquidity=10_000, session_consumed=0)
+        first = EP.evaluate_simulated_execution(self._intent(qty=100), first_context)
+        self.assertTrue(first.executable_now)
+        self.assertEqual(100, first.fill_quantity)
+        # 10:05：累计增长到 300_000 股（1% = 3_000 股），已消耗 100 ⇒ 仍可继续。
+        _, second_context = self._facts(liquidity=300_000, session_consumed=100)
+        second = EP.evaluate_simulated_execution(self._intent(qty=100), second_context)
+        self.assertTrue(second.executable_now)
+        self.assertEqual(100, second.fill_quantity)
+        self.assertEqual(
+            3_000, second.liquidity_evidence["participation_capacity"],
+        )
+        self.assertEqual(100, second.liquidity_evidence["session_consumed_quantity"])
+
+    def test_session_consumption_blocks_when_participation_is_fully_used(self):
+        """已消耗量吃掉全部参与额度时，本事件必须零成交（不能超买）。"""
+        _, context = self._facts(liquidity=10_000, session_consumed=100)
+        result = EP.evaluate_simulated_execution(self._intent(qty=100), context)
+        self.assertFalse(result.executable_now)
+        self.assertEqual(0, result.fill_quantity)
+        self.assertEqual(
+            "participation_exhausted", result.liquidity_evidence["capped_by"],
+        )
 
     def test_stale_market_evidence_blocks_fill(self):
         _, context = self._facts(execution_asof=f"{self.DAY} 10:25:00")

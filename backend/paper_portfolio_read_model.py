@@ -86,6 +86,22 @@ def _num(value: Any, default: float | None = 0.0) -> float | None:
         return default
 
 
+def _known_int(value: Any) -> int | None:
+    """按 SQLite INTEGER 语义把存储值转成 ``int``；不可解析 → ``None``。
+
+    刻意不做 ``int(float(value))`` 之类的宽容转换：``source_fill_id`` 是血缘指针，
+    一旦把非整数"解释"成某个 id，就会指向一笔不存在的成交。无法证明即 ``None``
+    （调用方据此走 legacy 路径并 fail closed）。
+    """
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value) if value.is_integer() else None
+    return None
+
+
 def _ledger_num(value: Any, default: float | None = None) -> float | None:
     """Numeric ledger evidence where non-finite values are unknown, not data.
 
@@ -199,12 +215,19 @@ class PortfolioReadContext:
 
 
 def _sell_fills(conn, context: PortfolioReadContext, account_id: str | None = None):
-    """Return (verified rows, all rows, proof_available).
+    """Return (proven rows, all rows, proof_available).
 
     Every fill attached to a bounded SELL order is selected, **not** just the
     rows whose declared side agrees with the order: a contradictory fill is
     execution evidence that must fail closed, so it has to reach the
     completeness checks instead of being filtered out by ``f.side``.
+
+    R26：选择条件从"订单 ``status='filled'``"改为"**该委托有正成交**"
+    （完整或部分成交）。部分成交是已经发生的事实，它同样消耗了底仓；只认整单
+    全成交会让重建出来的持仓偏多，与 ``paper_position_lots.remaining_qty``
+    以及风险读路径给出**不同的持仓结论** —— 那正是不可接受的"同一张单在不同
+    路径得到不同结果"。数量口径由 :data:`EV.POSITIVE_EXECUTION_PREDICATE`
+    唯一决定，本模块不另写一份。
     """
     if not (
         _has_columns(conn, "paper_fills", _FILL_SELECT_COLUMNS)
@@ -226,18 +249,18 @@ def _sell_fills(conn, context: PortfolioReadContext, account_id: str | None = No
         "       o.execution_status, o.execution_verified, o.realized_pnl,"
         "       o.amount AS order_amount, o.fees AS order_fees, o.executed_at"
         "  FROM paper_fills f JOIN paper_orders o ON o.id=f.order_id"
-        " WHERE o.cycle_id=? AND o.side='sell' AND o.status='filled'"
+        " WHERE o.cycle_id=? AND o.side='sell' AND " + EV.FILL_CARRYING_PREDICATE +
         "   AND f.fill_date IS NOT NULL"
         "   AND length(f.fill_date)>=10 AND substr(f.fill_date,1,10)<=?"
         + account_sql +
         " ORDER BY f.fill_date,f.id",
         tuple(params),
     ))
-    verified = []
+    proven = []
     for row in rows:
-        if _identity_ok(row) and EV.is_verified_row(row):
-            verified.append(row)
-    return verified, rows, True
+        if _identity_ok(row) and EV.is_positive_execution_row(row):
+            proven.append(row)
+    return proven, rows, True
 
 
 def _all_filled_sell_orders(conn, context: PortfolioReadContext, account_id: str | None = None):
@@ -252,8 +275,8 @@ def _all_filled_sell_orders(conn, context: PortfolioReadContext, account_id: str
         "SELECT id,account_id,code,status,cycle_id,execution_status,"
         "       execution_verified,realized_pnl,executed_at"
         "  FROM paper_orders"
-        " WHERE cycle_id=? AND side='sell' AND status='filled'"
-        + account_sql +
+        " WHERE cycle_id=? AND side='sell' AND " + EV.FILL_CARRYING_PREDICATE +
+        account_sql +
         " ORDER BY id",
         tuple(params),
     ))
@@ -279,8 +302,8 @@ def _all_filled_buy_orders(conn, context: PortfolioReadContext,
         "SELECT id,account_id,code,status,cycle_id,execution_status,"
         "       execution_verified,realized_pnl,executed_at"
         "  FROM paper_orders"
-        " WHERE cycle_id=? AND side='buy' AND status='filled'"
-        + account_sql +
+        " WHERE cycle_id=? AND side='buy' AND " + EV.FILL_CARRYING_PREDICATE +
+        account_sql +
         " ORDER BY id",
         tuple(params),
     ))
@@ -320,18 +343,18 @@ def _buy_fills(conn, context: PortfolioReadContext, account_id: str | None = Non
         "       o.execution_status, o.execution_verified, o.realized_pnl,"
         "       o.amount AS order_amount, o.fees AS order_fees, o.executed_at"
         "  FROM paper_fills f JOIN paper_orders o ON o.id=f.order_id"
-        " WHERE o.cycle_id=? AND o.side='buy' AND o.status='filled'"
+        " WHERE o.cycle_id=? AND o.side='buy' AND " + EV.FILL_CARRYING_PREDICATE +
         "   AND f.fill_date IS NOT NULL"
         "   AND length(f.fill_date)>=10 AND substr(f.fill_date,1,10)<=?"
         + account_sql +
         " ORDER BY f.fill_date,f.id",
         tuple(params),
     ))
-    verified = []
+    proven = []
     for row in rows:
-        if _identity_ok(row) and EV.is_verified_row(row):
-            verified.append(row)
-    return verified, rows, True
+        if _identity_ok(row) and EV.is_positive_execution_row(row):
+            proven.append(row)
+    return proven, rows, True
 
 
 def _has_any_fill_rows(conn, context: PortfolioReadContext,
@@ -368,7 +391,7 @@ def _has_any_fill_rows(conn, context: PortfolioReadContext,
 
 def _unproven_sell_exists(conn, context: PortfolioReadContext,
                           account_id: str | None = None) -> bool:
-    _verified, rows, proof_available = _sell_fills(conn, context, account_id)
+    _proven, rows, proof_available = _sell_fills(conn, context, account_id)
     if not proof_available:
         # No verification columns at all: any historical sell row is unproven.
         required_columns = {"cycle_id", "side", "status", "executed_at"}
@@ -386,20 +409,23 @@ def _unproven_sell_exists(conn, context: PortfolioReadContext,
             return bool(conn.execute(sql, tuple(params)).fetchone()[0])
         return False
     unproven_fill = any(
-        not _identity_ok(row) or not EV.is_verified_row(row)
+        not _identity_ok(row) or not EV.is_positive_execution_row(row)
         for row in rows
     )
     if unproven_fill:
         return True
-    verified_fill_order_ids = {
-        int(row["order_id"]) for row in _verified
+    proven_fill_order_ids = {
+        int(row["order_id"]) for row in _proven
         if row.get("order_id") is not None
     }
     orders, _proof = _all_filled_sell_orders(conn, context, account_id)
     for order in orders:
-        if not EV.is_verified_row(order):
+        # 订单自身的判定同样用"正成交"口径：部分成交订单的已成交部分有流水为证，
+        # 已在上面的 ``proven_fill_order_ids`` 里；这里只在订单没有任何正成交证据时
+        # 才当成"未经证明"。
+        if not EV.is_positive_execution_row(order):
             return True
-        if int(order["id"]) not in verified_fill_order_ids:
+        if int(order["id"]) not in proven_fill_order_ids:
             return True
     return False
 
@@ -523,7 +549,13 @@ def _reused_source_orders(lots) -> set[int]:
 
 def _verified_source_buy_fill(conn, lot: Mapping, *,
                               reused_sources: set[int] | None = None) -> dict | None:
-    """Return a fully matching verified BUY fill for one durable lot."""
+    """Return a fully matching verified BUY fill for one durable lot.
+
+    精确血缘（R26）：lot 的 ``source_fill_id`` 直接指向**那一笔** FillEvent，
+    因此"这个 lot 由哪笔成交出资"是可证明的。没有该列（历史旧 lot，值为 NULL）
+    时退回订单级匹配，并要求该订单恰好只有一笔流水 —— 一笔委托多次部分成交时，
+    订单级匹配无法证明某个 lot 对应哪一笔，必须 fail closed 而不是随便挑一笔。
+    """
     source_order_id = lot.get("source_order_id")
     if source_order_id is None:
         return None
@@ -538,21 +570,35 @@ def _verified_source_buy_fill(conn, lot: Mapping, *,
         return None
     if reused_sources and order_id in reused_sources:
         return None
-    row = conn.execute(
-        "SELECT f.id AS fill_id, f.order_id, f.qty AS fill_qty,"
-        "       f.account_id AS fill_account_id, f.side AS fill_side,"
-        "       f.code AS fill_code, f.fill_date,"
-        "       o.account_id AS order_account_id, o.side AS order_side,"
-        "       o.code AS order_code, o.status AS order_status, o.cycle_id,"
-        "       o.execution_status, o.execution_verified, o.executed_at"
-        "  FROM paper_fills f JOIN paper_orders o ON o.id=f.order_id"
-        " WHERE f.order_id=? ORDER BY f.id",
-        (order_id,),
-    ).fetchall()
-    # A durable lot has no fill-level allocation key.  A source order with
-    # multiple fills therefore cannot prove which fill funded this lot (nor
-    # prevent two lots from reusing the same fill).  Keep it fail-closed until
-    # the ledger carries that allocation explicitly.
+    source_fill_id = _known_int(lot.get("source_fill_id"))
+    if source_fill_id is not None:
+        # 有逐笔血缘：直接定位那一笔流水，不再要求"订单只有一笔"。
+        row = conn.execute(
+            "SELECT f.id AS fill_id, f.order_id, f.qty AS fill_qty,"
+            "       f.account_id AS fill_account_id, f.side AS fill_side,"
+            "       f.code AS fill_code, f.fill_date,"
+            "       o.account_id AS order_account_id, o.side AS order_side,"
+            "       o.code AS order_code, o.status AS order_status, o.cycle_id,"
+            "       o.execution_status, o.execution_verified, o.executed_at"
+            "  FROM paper_fills f JOIN paper_orders o ON o.id=f.order_id"
+            " WHERE f.order_id=? AND f.id=?",
+            (order_id, source_fill_id),
+        ).fetchall()
+    else:
+        row = conn.execute(
+            "SELECT f.id AS fill_id, f.order_id, f.qty AS fill_qty,"
+            "       f.account_id AS fill_account_id, f.side AS fill_side,"
+            "       f.code AS fill_code, f.fill_date,"
+            "       o.account_id AS order_account_id, o.side AS order_side,"
+            "       o.code AS order_code, o.status AS order_status, o.cycle_id,"
+            "       o.execution_status, o.execution_verified, o.executed_at"
+            "  FROM paper_fills f JOIN paper_orders o ON o.id=f.order_id"
+            " WHERE f.order_id=? ORDER BY f.id",
+            (order_id,),
+        ).fetchall()
+        # 没有逐笔血缘的 legacy lot：多笔成交的订单无法证明出资关系。
+        if len(row) != 1:
+            return None
     if len(row) != 1:
         return None
     row = dict(row[0])
@@ -570,9 +616,9 @@ def _verified_source_buy_fill(conn, lot: Mapping, *,
         return None
     if str(row.get("fill_side") or "").lower() != "buy":
         return None
-    if str(row.get("order_status") or "").lower() != "filled":
-        return None
-    if not EV.is_verified_row(row):
+    # 该 lot 由这一笔流水出资，因此证明的是**这笔 FillEvent** 有效，而不是
+    # "整张订单完全成交"。部分成交委托的已成交部分同样是可信事实。
+    if not EV.is_positive_execution_row(row):
         return None
     if _num(row.get("fill_qty"), None) != _num(lot.get("qty"), None):
         return None

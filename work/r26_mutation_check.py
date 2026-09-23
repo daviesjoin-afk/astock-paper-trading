@@ -80,18 +80,27 @@ MUTATIONS = [
     },
     {
         "id": "M6", "file": PLANNER,
-        "changes": [("day = MDC.canonical_day(asof_day)\n    quote = dict(quote or {})",
-                     "day = MDC.canonical_day(quote.get(\"quote_at\"))\n    quote = dict(quote or {})")],
+        # R26 收敛后，行情映射已收敛到 R24 契约；"历史执行不得回退到较新行情日"
+        # 的锚点因此落在 planner 传下去的 asof_day 上。
+        "changes": [(
+            "    day = MDC.canonical_day(asof_day)\n"
+            "    snapshot = MDC.symbol_quote_snapshot(quote, asof_day=day)",
+            "    day = MDC.canonical_day(quote.get(\"quote_at\"))\n"
+            "    snapshot = MDC.symbol_quote_snapshot(quote, asof_day=day)",
+        )],
         "test": _execution_test("test_historical_execution_rejects_a_quote_from_a_later_session"),
         "desc": "历史执行忽略请求日期，改用较新的行情日期",
     },
     {
         "id": "M7", "file": PLANNER,
-        "changes": [
-            ("f\"{order_id}|{quote_at}|{decision.ruleset_version}\"",
-             "f\"{order_id}|{quote_at}|{decision.ruleset_version}|{current_version}\""),
-        ],
-        "test": "test_production_path_golden_replay.ProductionInvariantTests.test_r26_partial_fill_retry_is_idempotent_and_finishes_same_order",
+        # R26 收敛后 event key 有了唯一命名 owner；把"重放"错误编码成不同事件
+        # 就等于让同一份证据再次成交。
+        "changes": [(
+            '        f"{int(order_id)}|{quote_at}|{ruleset_version}".encode("utf-8")',
+            '        f"{int(order_id)}|{quote_at}|{ruleset_version}|{dt.datetime.now()}".encode("utf-8")',
+        )],
+        "test": "test_r26_convergence_regressions."
+                "IdempotencyTests.test_same_quote_observation_cannot_fill_twice",
         "desc": "相同行情重放被错误编码成新成交事件",
     },
     {
@@ -148,6 +157,94 @@ MUTATIONS = [
         ],
         "test": _execution_test("test_t1_and_locked_limit_facts_block_the_relevant_side"),
         "desc": "涨跌停封板仍允许模拟成交",
+    },
+    # ── R26 收敛轮（本次修复的四个已确认缺陷 + 血缘/守卫） ──────────────
+    {
+        "id": "M10-partial-signal", "file": "backend/paper_trading.py",
+        "changes": [(
+            '        "partially_filled": "partially_filled",',
+            '        "partially_filled": "pending",',
+        )],
+        "test": "test_r26_convergence_regressions."
+                "PartialSignalReconciliationTests"
+                ".test_partial_buy_fill_keeps_signal_partially_filled_across_reconciliation",
+        "desc": "对账把部分的 signal 状态降级回 pending",
+    },
+    {
+        "id": "M11-risk-partial-dedup", "file": "backend/execution_verification.py",
+        "changes": [
+            (
+                '    "((COALESCE(execution_verified, 0) = 1 AND execution_status = \'verified\')"\n'
+                '    " OR (execution_verified = 0 AND execution_status = \'partial\'))"',
+                '    "((COALESCE(execution_verified, 0) = 1 AND execution_status = \'verified\'))"',
+            ),
+            (
+                '    if status == EXECUTION_STATUS_PARTIAL:\n'
+                '        flag = _row_field(row, "execution_verified")\n'
+                '        # 部分成交的 flag 必须是精确的 0（SQLite 存成整数 0）。\n'
+                '        return flag is not None and not isinstance(flag, (str, bytes)) and flag == 0\n',
+                '',
+            ),
+        ],
+        "test": "test_r26_convergence_regressions."
+                "RiskPartialDedupTests.test_partial_trim_counts_as_executed_but_full_fill_also_does",
+        "desc": "部分成交不参与一次性减仓去重（会重复减仓）",
+    },
+    {
+        "id": "M12-archive-collapse", "file": "backend/paper_trading.py",
+        "changes": [(
+            'archived_fills.setdefault(archived_fill.get("order_id"), []).append(archived_fill)',
+            'archived_fills.setdefault(archived_fill.get("order_id"), [archived_fill])',
+        )],
+        "test": "test_r26_convergence_regressions."
+                "ArchiveMultiFillTests.test_archived_history_keeps_every_partial_fill",
+        "desc": "归档把同一订单的多笔成交 collapse 成一笔",
+    },
+    {
+        "id": "M13-cumulative-liquidity", "file": PLANNER,
+        "changes": [(
+            "    already_consumed = max(0, int(context.same_day_consumed_quantity or 0))",
+            "    already_consumed = 0",
+        )],
+        "test": "test_r26_convergence_regressions."
+                "CumulativeLiquidityConsumptionTests"
+                ".test_second_event_cannot_re_consume_the_same_cumulative_volume",
+        "desc": "同一份累计成交量被重复消费（参与率成倍放大）",
+    },
+    {
+        "id": "M14-manual-remaining", "file": PLANNER,
+        "changes": [(
+            '        row.get("remaining_qty") if row.get("remaining_qty") is not None\n'
+            '        else max(0, int(row.get("qty") or 0) - int(row.get("filled_qty") or 0)),',
+            '        max(0, int(row.get("qty") or 0)),',
+        )],
+        "test": "test_r26_convergence_regressions."
+                "ManualRemainingRevalidationTests"
+                ".test_revalidate_feeds_remaining_quantity_and_keeps_desired_qty",
+        "desc": "手动委托复核使用原始委托量而不是剩余量",
+    },
+    {
+        "id": "M15-execution-signal-dependency", "file": PLANNER,
+        "changes": [(
+            "    snapshot = MDC.symbol_quote_snapshot(quote, asof_day=day)",
+            "    import signal_service as SIG\n"
+            "    SIG.signal_evidence(quote or {}, asof_day=day or \"\")\n"
+            "    snapshot = MDC.symbol_quote_snapshot(quote, asof_day=day)",
+        )],
+        "test": "test_r26_execution_authority_guard."
+                "ExecutionConsumesOnlyTheMarketDataBoundary"
+                ".test_guard15a_execution_planner_does_not_import_signal_service",
+        "desc": "执行权威重新依赖 signal 层（架构守卫必须拦住）",
+    },
+    {
+        "id": "M16-session-closing-auction", "file": PLANNER,
+        "changes": [(
+            '    if current < dt.time(14, 57):\n        return "continuous_afternoon"',
+            '    if current < dt.time(15, 0):\n        return "continuous_afternoon"',
+        )],
+        "test": "test_r26_convergence_regressions."
+                "SessionAndTimezoneTests.test_closing_auction_is_not_a_continuous_phase",
+        "desc": "收盘集合竞价被当成连续竞价成交",
     },
 ]
 

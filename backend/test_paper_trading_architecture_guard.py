@@ -1692,8 +1692,11 @@ class RiskApplicationServiceBoundary(unittest.TestCase):
 
     def test_guard12g_service_is_not_a_monolith(self):
         loc = len(_source(self.SERVICE).splitlines())
-        # R26 adds the required post-commit reconciliation of blocked and
-        # partial execution state; the service remains below the 925-line cap.
+        # 这条上限是**观察**，不是维护性目标：R26 没有为提高它而放宽阈值，
+        # 而是把 4 处手写的 execute marker 去重 SQL 交给
+        # ``execution_verification.has_verified_positive_execution``，文件因此**变小**
+        # （911 → 884）。把 "LOC guard 越加越高" 当作可维护性解法，正是这条注释
+        # 想避免的做法。
         self.assertLess(loc, 925, f"paper_risk_service.py grew to {loc} LOC")
 
 

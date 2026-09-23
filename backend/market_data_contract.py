@@ -84,7 +84,7 @@ __all__ = [
     "MarketDataSnapshot", "MarketDataReading",
     # helpers
     "access_mode_allows_network", "canonical_day", "classify",
-    "reading_for_refresh_failure", "unavailable_reading",
+    "reading_for_refresh_failure", "unavailable_reading", "symbol_quote_snapshot",
 ]
 
 # ---------------------------------------------------------------------------
@@ -822,4 +822,49 @@ def is_cross_source_verified(snapshot: MarketDataSnapshot | None) -> bool:
     return (
         snapshot.verification == VERIFICATION_VERIFIED
         and snapshot.verification_method == VERIFICATION_METHOD_CROSS_SOURCE
+    )
+
+
+def symbol_quote_snapshot(
+    quote: Mapping[str, Any] | None, *, asof_day: Any = None,
+) -> MarketDataSnapshot | None:
+    """把一条**已预取**的单票报价映射成 :class:`MarketDataSnapshot`。
+
+    纯映射，无 I/O、无时钟：报价必须由调用方在事务与决策之前取好。这个函数住在
+    contract 里而不是某个消费者里，是为了让"逐票报价如何成为一条可判定的事实"
+    只有一个 owner —— 否则每个消费方都会各自解释 ``quote_validation`` /
+    ``quote_source``，同一份行情在不同路径上得到不同的可信度结论。
+
+    核验维度复用 :func:`verification_from_cross_status`（既有 ``quote_validation``
+    术语的唯一映射）：``cross_source_checked`` → ``verified`` + ``cross_source``；
+    ``range_timestamp_checked`` → 单源；未知文本 fail closed 成 ``not_attempted``，
+    绝不乐观地当成双源。
+
+    空报价返回 ``None``（"没有数据"），而不是一个 complete=False 的空快照 ——
+    后者会让调用方以为"有事实但结构不完整"。
+    """
+    envelope = dict(quote or {})
+    if not envelope:
+        return None
+    verification = verification_from_cross_status(envelope.get("quote_validation"))
+    method = (
+        VERIFICATION_METHOD_NONE
+        if verification == VERIFICATION_NOT_ATTEMPTED
+        else VERIFICATION_METHOD_CROSS_SOURCE
+    )
+    return MarketDataSnapshot(
+        kind="symbol_quote",
+        rows=(envelope,),
+        as_of=canonical_day(asof_day),
+        observed_at=envelope.get("quote_at"),
+        source=envelope.get("quote_source"),
+        complete=True,
+        expected_rows=1,
+        verification=verification,
+        verification_method=method,
+        verification_detail={
+            "quote_source": envelope.get("quote_source"),
+            "quote_validation": str(envelope.get("quote_validation") or "") or None,
+            "quote_cross_check": envelope.get("quote_cross_check"),
+        },
     )

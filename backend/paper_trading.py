@@ -1644,10 +1644,14 @@ def _reconcile_signal_order_states(conn):
     terminal_signal_statuses = {
         "superseded", "filled", "rejected", "blocked", "expired", "shadow_q3",
     }
+    # 订单状态 → 信号状态的唯一映射。``partially_filled`` **不能**降级成
+    # ``pending``：部分成交是已经发生的事实（有经过验证的 FillEvent），把它对账回
+    # 待处理会让"这张信号到底成没成交"在两次读之间自相矛盾，并让后续执行窗口
+    # 误以为还剩一整笔未成交的意图。
     signal_for_order = {
         "pending_limit": "pending",
         "pending_execution": "pending",
-        "partially_filled": "pending",
+        "partially_filled": "partially_filled",
         "deferred_capacity": "deferred_capacity",
         ENTRY_FROZEN_WAITLIST_STATUS: ENTRY_FROZEN_WAITLIST_STATUS,
         MANUAL_EXECUTION_RETRY_STATUS: "pending",
@@ -2044,7 +2048,7 @@ def init_db():
                 acquired_at TEXT NOT NULL, available_date TEXT NOT NULL,
                 asset_type TEXT NOT NULL DEFAULT 'stock_t1', source_order_id INTEGER,
                 cost_fee_included INTEGER NOT NULL DEFAULT 0,
-                is_t_base INTEGER NOT NULL DEFAULT 1
+                is_t_base INTEGER NOT NULL DEFAULT 1, source_fill_id INTEGER
             );
             CREATE INDEX IF NOT EXISTS idx_paper_lots_active
                 ON paper_position_lots(cycle_id, account_id, code, available_date);
@@ -3616,12 +3620,13 @@ def _record_lot(conn, account, signal, qty, fill_price, asof_day, order_id=None,
     # peak 只升不降。判定统一走 risk-state 模块的权威聚合，不在这里另写一份 SQL。
     prior_qty = PPRS.remaining_qty(
         conn, cycle_id=cycle_id, account_id=account["id"], code=signal["code"])
-    conn.execute(
-        """INSERT INTO paper_position_lots(cycle_id,account_id,code,name,industry,qty,remaining_qty,cost,acquired_at,available_date,asset_type,source_order_id,cost_fee_included,is_t_base)
-           VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+    cursor = conn.execute(
+        """INSERT INTO paper_position_lots(cycle_id,account_id,code,name,industry,qty,remaining_qty,cost,acquired_at,available_date,asset_type,source_order_id,cost_fee_included,is_t_base,source_fill_id)
+           VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (cycle_id, account["id"], signal["code"], signal.get("name"), signal.get("industry"), int(qty), int(qty),
-         fill_price + _num(fees) / max(int(qty), 1), acquired_at or _now(), available.isoformat(), asset_type, order_id, 1, int(bool(is_t_base))),
+         fill_price + _num(fees) / max(int(qty), 1), acquired_at or _now(), available.isoformat(), asset_type, order_id, 1, int(bool(is_t_base)), None),
     )
+    lot_id = int(cursor.lastrowid)
     # 生命周期初始化/吸收由 paper_position_risk_state 持有；只传已证明的 cycle。
     if prior_qty <= 0:
         PPRS.initialize_episode(
@@ -3631,6 +3636,7 @@ def _record_lot(conn, account, signal, qty, fill_price, asof_day, order_id=None,
         PPRS.update_peak(
             conn, cycle_id=cycle_id, account_id=account["id"], code=signal["code"],
             peak_price=fill_price)
+    return lot_id
 
 
 def _latest_price_map(codes=None):
@@ -14327,20 +14333,29 @@ def stock_trade_history(code, account_id=None):
                 row.get("id"): row.get("name")
                 for row in (snapshot.get("paper_accounts") or [])
             }
-            archived_fills = {
-                item.get("order_id"): item
-                for item in (snapshot.get("paper_fills") or [])
-                if str(item.get("code") or "") == code
-            }
+            # 一笔委托可以有**多笔** FillEvent（部分成交）。这里必须按 order_id
+            # 聚成列表：旧实现用 ``{order_id: fill}`` 会让后一笔覆盖前一笔，
+            # 归档后历史接口只能看到其中一笔成交，这是不可接受的对账缺口。
+            archived_fills = {}
+            for archived_fill in (snapshot.get("paper_fills") or []):
+                if str(archived_fill.get("code") or "") != code:
+                    continue
+                archived_fills.setdefault(archived_fill.get("order_id"), []).append(archived_fill)
+            for order_fills in archived_fills.values():
+                order_fills.sort(key=lambda item: item.get("id") or 0)
             for order in snapshot.get("paper_orders") or []:
                 if str(order.get("code") or "") != code or (account_id and order.get("account_id") != account_id):
                     continue
                 item = dict(order)
                 item.pop("risk_payload", None)
-                fill = archived_fills.get(item.get("id")) or {}
-                item["fill_date"] = fill.get("fill_date")
-                item["fill_quote_at"] = fill.get("quote_at")
-                item["fill_assumption"] = fill.get("assumption")
+                # 订单行摘要保持与活动表读路径同一口径：成交日期取该订单所有
+                # 成交里的**最大** fill_date，行情源时点/假设取最后一笔成交。
+                order_fills = archived_fills.get(item.get("id")) or []
+                latest = order_fills[-1] if order_fills else {}
+                fill_dates = [str(fill.get("fill_date") or "") for fill in order_fills]
+                item["fill_date"] = max(fill_dates) if any(fill_dates) else None
+                item["fill_quote_at"] = latest.get("quote_at")
+                item["fill_assumption"] = latest.get("assumption")
                 item["account_name"] = archived_accounts.get(item.get("account_id"), item.get("account_id"))
                 item["archived_cycle"] = archive.get("cycle_key")
                 item.update(PRP.execution_display_facts(
@@ -14348,17 +14363,18 @@ def stock_trade_history(code, account_id=None):
                 ))
                 item.pop("execution_evidence", None)
                 orders.append(item)
-            for fill in archived_fills.values():
-                if account_id and fill.get("account_id") != account_id:
-                    continue
-                item = dict(fill)
-                item["account_name"] = archived_accounts.get(item.get("account_id"), item.get("account_id"))
-                item["archived_cycle"] = archive.get("cycle_key")
-                item.update(PRP.execution_display_facts(
-                    item.get("execution_evidence"), None,
-                ))
-                item.pop("execution_evidence", None)
-                fills.append(item)
+            for order_fills in archived_fills.values():
+                for fill in order_fills:
+                    if account_id and fill.get("account_id") != account_id:
+                        continue
+                    item = dict(fill)
+                    item["account_name"] = archived_accounts.get(item.get("account_id"), item.get("account_id"))
+                    item["archived_cycle"] = archive.get("cycle_key")
+                    item.update(PRP.execution_display_facts(
+                        item.get("execution_evidence"), None,
+                    ))
+                    item.pop("execution_evidence", None)
+                    fills.append(item)
         orders.sort(key=lambda item: (item.get("executed_at") or item.get("created_at") or "", item.get("id") or 0), reverse=True)
         fills.sort(key=lambda item: (item.get("fill_date") or "", item.get("id") or 0), reverse=True)
         positions = [

@@ -164,6 +164,11 @@ class ExecutionContext:
     sellable_quantity: int | None = None
     buying_power: float | None = None
     already_filled_quantity: int = 0
+    #: 同一 symbol 在同一 session 内、截至 ``execution_asof`` **已经消耗掉**的
+    #: 模拟成交量（股）。``available_liquidity`` 是从行情累计成交额推出的**当日
+    #: 累计**容量；它不会因为我们已经成交过而变小，所以必须把已消耗量从这里减掉，
+    #: 否则每个新行情事件都能重新吃一遍同一份 1% 参与额度。
+    same_day_consumed_quantity: int = 0
     current_order_status: str = "pending_execution"
     lot_size: int = 100
     participation_rate: float = MAX_VOLUME_PARTICIPATION
@@ -192,12 +197,16 @@ class ExecutionDecision:
     execution_asof: str | None
     market_evidence: Mapping[str, Any] = field(default_factory=dict)
     tradability_evidence: Mapping[str, Any] = field(default_factory=dict)
+    #: 参与额度的完整推导（观察到的累计成交额、参与率、本 session 已消耗量、
+    #: 本次可执行上限）。有了它，"为什么只成交 300"不需要再靠读多个模块猜。
+    liquidity_evidence: Mapping[str, Any] = field(default_factory=dict)
     ruleset_version: str = SIMULATION_EXECUTION_RULESET
 
     def __post_init__(self):
         object.__setattr__(self, "reasons", tuple(str(item) for item in self.reasons))
         object.__setattr__(self, "market_evidence", _freeze_evidence(self.market_evidence))
         object.__setattr__(self, "tradability_evidence", _freeze_evidence(self.tradability_evidence))
+        object.__setattr__(self, "liquidity_evidence", _freeze_evidence(self.liquidity_evidence))
 
 
 @dataclass(frozen=True, slots=True)
@@ -232,33 +241,94 @@ def _freeze_evidence(value):
 
 
 def market_reading_for_execution(quote: Mapping[str, Any], *, asof_day, execution_asof):
-    """Turn one prefetched quote envelope into an R24 reading; never performs I/O."""
-    import signal_service as SIG
+    """Turn one prefetched quote envelope into an R24 reading; never performs I/O.
 
+    Execution consumes the **R24 Market Data boundary** and nothing else. The
+    quote → snapshot mapping lives in :mod:`market_data_contract` so that
+    "how trustworthy is this quote" has exactly one owner; execution must not
+    route through the signal layer to learn a market fact.
+    """
     day = MDC.canonical_day(asof_day)
-    quote = dict(quote or {})
-    evidence = SIG.signal_evidence(
-        quote, asof_day=day or "", policy=MDC.EXECUTION_QUOTE_POLICY.name,
-    )
-    snapshot = MDC.MarketDataSnapshot(
-        kind="symbol_quote",
-        rows=(quote,) if quote else (),
-        as_of=day,
-        observed_at=quote.get("quote_at"),
-        source=quote.get("quote_source"),
-        complete=bool(quote),
-        expected_rows=1,
-        verification=evidence.verification,
-        verification_method=evidence.verification_method,
-        verification_detail=evidence.detail,
-    )
+    snapshot = MDC.symbol_quote_snapshot(quote, asof_day=day)
     return MDC.classify(
-        snapshot if quote else None,
+        snapshot,
         MDC.EXECUTION_QUOTE_POLICY,
         now=execution_asof,
         access_mode=MDC.ACCESS_READ,
         asof_day=day,
     )
+
+
+def _fill_event_key(*, order_id, quote_at, ruleset_version):
+    """一次模拟成交事件的**幂等身份**：订单 × 行情观测 × ruleset。
+
+    这三个维度共同定义"同一次执行事件"：
+
+    * ``order_id`` —— 同一张委托；
+    * ``quote_at`` —— **行情观测**的身份（不是墙上时钟）。同一个 ``quote_at`` 的
+      重放永远算同一次事件，无论重放发生在几点；
+    * ``ruleset_version`` —— 成交规则版本。规则变了则是另一次可解释的决策，
+      不能与旧规则下的成交混为一谈。
+
+    刻意**不**把 ``execution_asof``、墙上时钟、剩余量或 attempt 计数放进来：
+    那些都会让"同一份证据重放"被错误编码成新事件，从而重复成交、重复扣款。
+    """
+    return hashlib.sha256(
+        f"{int(order_id)}|{quote_at}|{ruleset_version}".encode("utf-8")
+    ).hexdigest()
+
+
+def consumed_session_quantity(conn, code, session_date, execution_asof) -> int:
+    """本 session 内、截至 ``execution_asof`` 已经模拟成交的股数（该 symbol）。
+
+    ``available_liquidity`` 是从行情**累计**成交额推出的参与额度，它在同一个
+    session 里单调增长但**不会**因为我们已经成交而减少。若不把已消耗量减掉，
+    10:00 吃掉 capacity、10:05 的 quote.amount 仍然包含 10:00 之前那部分成交量，
+    系统就会再吃一份同样的 1% —— 实际参与率被成倍放大，突破本模块自己的流动性
+    政策。因此容量必须表达为：
+
+        max simulated participation
+            = observed cumulative market volume × participation_rate
+              − 截至 execution_asof 已消耗的模拟成交量
+
+    **as-of 边界**：只统计成交时点不晚于 ``execution_asof`` 的 FillEvent，绝不把
+    该时点之后发生的成交算进来（否则"用未来的事实限制现在"）。``quote_at`` 缺失的
+    legacy 流水**按已消耗处理**（fail conservative）：无法证明它发生在之后，就不
+    能假装它没发生过，否则老数据会凭空放开参与额度。
+
+    按 symbol + session 聚合（不按账户/周期切分）：参与率约束的是"我们这个系统相对
+    市场成交量下了多少单"，这是市场层面的约束，与哪个模拟账户下的单无关。
+    """
+    day = MDC.canonical_day(session_date)
+    cutoff = _parse_execution_instant(execution_asof)
+    if not code or not day:
+        return 0
+    try:
+        rows = conn.execute(
+            "SELECT qty,quote_at FROM paper_fills WHERE code=? AND fill_date=?",
+            (str(code), day),
+        ).fetchall()
+    except sqlite3.Error:
+        # 流水表不可读时不能假装"没消耗过"，那会放大额度；按最保守处理：
+        # 只要读不出上限，就报一个不可能被满足的已消耗量级。
+        return _CONSUMED_UNREADABLE
+    consumed = 0
+    for row in rows:
+        quantity = row[0] if not hasattr(row, "keys") else row["qty"]
+        quote_at = row[1] if not hasattr(row, "keys") else row["quote_at"]
+        try:
+            quantity = max(0, int(quantity or 0))
+        except (TypeError, ValueError):
+            continue
+        stamp = _parse_execution_instant(quote_at)
+        if cutoff is None or stamp is None or stamp <= cutoff:
+            consumed += quantity
+    return consumed
+
+
+#: 流水不可读时的"已消耗"哨兵：足够大以致当次判定必然拒绝成交（fail closed），
+#: 但不至于溢出成负数。它只在 SQL 失败时出现，正常账本永远不会取到这个值。
+_CONSUMED_UNREADABLE = 2 ** 62
 
 
 def execution_context_from_facts(
@@ -338,6 +408,9 @@ def execution_context_from_facts(
         sellable_quantity=sellable,
         buying_power=buying_power,
         already_filled_quantity=int(row.get("filled_qty") or 0),
+        same_day_consumed_quantity=consumed_session_quantity(
+            conn, row.get("code"), day, execution_asof,
+        ),
         current_order_status=str(row.get("status") or ""),
     )
 
@@ -450,11 +523,15 @@ def evaluate_simulated_execution(
         )
 
     raw_liquidity = max(0, int(context.available_liquidity or 0))
-    if raw_liquidity <= 0:
+    participation = max(0.0, min(1.0, context.participation_rate))
+    observed_participation_capacity = int(raw_liquidity * participation)
+    # 已消耗量必须从**参与额度**里扣，而不是从本单剩余量里扣：行情给出的是当日
+    # 累计成交量，同一个 snapshot 可以被后续事件重复观测到。不扣的话，10:00 与
+    # 10:05 会各自吃满同一份 1%，system-wide 参与率被成倍放大。
+    already_consumed = max(0, int(context.same_day_consumed_quantity or 0))
+    liquidity_qty = max(0, observed_participation_capacity - already_consumed)
+    if raw_liquidity <= 0 or liquidity_qty <= 0:
         reasons.append(ExecutionReason.INSUFFICIENT_LIQUIDITY.value)
-        liquidity_qty = 0
-    else:
-        liquidity_qty = int(raw_liquidity * max(0.0, min(1.0, context.participation_rate)))
     capacity = min(remaining, liquidity_qty)
     if side == "sell":
         capacity = min(capacity, max(0, int(context.sellable_quantity or 0)))
@@ -464,6 +541,17 @@ def evaluate_simulated_execution(
     )
     lot_size = max(1, int(context.lot_size))
     fill_quantity = capacity if odd_lot_exit else (capacity // lot_size) * lot_size
+    liquidity_evidence = {
+        "observed_cumulative_market_quantity": raw_liquidity,
+        "participation_rate": participation,
+        "participation_capacity": observed_participation_capacity,
+        "session_consumed_quantity": already_consumed,
+        "executable_capacity": liquidity_qty,
+        "capped_by": (
+            "participation_exhausted" if liquidity_qty <= 0
+            else ("participation" if liquidity_qty < remaining else "none")
+        ),
+    }
     if fill_quantity < remaining:
         if side == "sell" and (context.sellable_quantity or 0) < remaining:
             reasons.append(ExecutionReason.T1_NOT_SELLABLE.value)
@@ -477,6 +565,7 @@ def evaluate_simulated_execution(
             fill_price=None, slippage_amount=0.0, fees=0.0,
             execution_asof=context.execution_asof, market_evidence=market_projection,
             tradability_evidence=tradability_projection,
+            liquidity_evidence=liquidity_evidence,
             ruleset_version=context.ruleset_version,
         )
 
@@ -501,6 +590,7 @@ def evaluate_simulated_execution(
             pricing_basis="limit_price", reference_price=reference, fill_price=None,
             slippage_amount=0.0, fees=0.0, execution_asof=context.execution_asof,
             market_evidence=market_projection, tradability_evidence=tradability_projection,
+            liquidity_evidence=liquidity_evidence,
             ruleset_version=context.ruleset_version,
         )
     amount = round(fill_quantity * fill_price, 2)
@@ -520,6 +610,7 @@ def evaluate_simulated_execution(
                     fees=0.0, execution_asof=context.execution_asof,
                     market_evidence=market_projection,
                     tradability_evidence=tradability_projection,
+                    liquidity_evidence=liquidity_evidence,
                     ruleset_version=context.ruleset_version,
                 )
             amount = round(fill_quantity * fill_price, 2)
@@ -534,6 +625,7 @@ def evaluate_simulated_execution(
         slippage_amount=round(fill_price - reference, 4), fees=fees,
         execution_asof=context.execution_asof, market_evidence=market_projection,
         tradability_evidence=tradability_projection,
+        liquidity_evidence=liquidity_evidence,
         ruleset_version=context.ruleset_version,
     )
 
@@ -1100,6 +1192,7 @@ def _decision_evidence(decision: ExecutionDecision) -> dict[str, Any]:
         "execution_asof": decision.execution_asof,
         "market_evidence": _plain_evidence(decision.market_evidence),
         "tradability_evidence": _plain_evidence(decision.tradability_evidence),
+        "liquidity_evidence": _plain_evidence(decision.liquidity_evidence),
         "ruleset_version": decision.ruleset_version,
     }
 
@@ -1236,9 +1329,10 @@ def commit_fill(
     quote_at = str(context.quote.get("quote_at") or "")
     if not quote_at or not decision.execution_asof:
         raise RuntimeError("成交事件缺少明确的 quote_at / execution_asof")
-    event_key = hashlib.sha256(
-        f"{order_id}|{quote_at}|{decision.ruleset_version}".encode("utf-8")
-    ).hexdigest()
+    event_key = _fill_event_key(
+        order_id=order_id, quote_at=quote_at,
+        ruleset_version=decision.ruleset_version,
+    )
     duplicate = conn.execute(
         "SELECT 1 FROM paper_fills WHERE order_id=? AND event_key=? LIMIT 1",
         (int(order_id), event_key),
@@ -1326,6 +1420,9 @@ def commit_fill(
         "fill_price": fill_price, "amount": amount, "fees": fees,
         "quote_at": quote_at,
     }
+    # BUY 每次成交恰好产生一个 lot；记住它的 id，以便在流水写入后把
+    # ``source_fill_id`` 指向**这一笔** FillEvent（见下方 link 段）。
+    source_lot_id = None
 
     if side == "buy":
         if not reserved:
@@ -1351,7 +1448,7 @@ def commit_fill(
             PT._finish_capital_reservation(conn, reservation_key, "consumed")
         # §10：lot 的周期**显式**来自来源订单（`_record_lot` 内部同样强制这一点，
         # 这里显式传入，让「订单 cycle == lot cycle」在调用点也读得出来）。
-        PT._record_lot(
+        source_lot_id = PT._record_lot(
             conn, account, fill_plan, qty, fill_price, asof_day, order_id,
             is_t_base=is_t_base, fees=fees, cycle_id=order_cycle_id,
             acquired_at=decision.execution_asof,
@@ -1385,7 +1482,7 @@ def commit_fill(
             "UPDATE paper_orders SET realized_pnl=COALESCE(realized_pnl,0)+? WHERE id=?",
             (realized_pnl, order_id),
         )
-    conn.execute(
+    fill_cursor = conn.execute(
         """INSERT INTO paper_fills(
                order_id,account_id,side,code,qty,price,amount,fees,fill_date,quote_at,
                assumption,event_key,execution_asof,pricing_basis,slippage,market_evidence,
@@ -1397,6 +1494,16 @@ def commit_fill(
           PT._json(_plain_evidence(decision.market_evidence)), decision.ruleset_version,
           PT._json(_plain_evidence(fill_event.execution_evidence))),
     )
+    # 逐笔成交血缘（R26）：一次 BUY 成交 → 一个 lot → **这一笔** FillEvent。
+    # 只有 ``source_order_id`` 时，"一笔委托多次部分成交"的每个 lot 都只能指向
+    # 同一张订单，无法证明某个 lot 到底由哪一笔成交产生。这里在同一事务内回填
+    # ``source_fill_id``，使 lot ←→ FillEvent 成为可证明的一对一关系。
+    # 历史旧 lot 保持 NULL（不可证明，绝不猜），读取方必须按 legacy 处理。
+    if source_lot_id is not None:
+        conn.execute(
+            "UPDATE paper_position_lots SET source_fill_id=? WHERE id=?",
+            (int(fill_cursor.lastrowid), int(source_lot_id)),
+        )
     # 执行验证闸门（PR-150 wiring）：**必须在 fill 流水写入之后**盖章，否则
     # evidence_from_order 看不到这条流水，会把一次真实成交记成"没有证据"。
     # 结论本身委托 execution_verification（它再委托 execution_evidence），
