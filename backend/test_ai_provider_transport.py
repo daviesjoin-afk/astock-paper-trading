@@ -1042,6 +1042,8 @@ def _code_string_constants(tree):
 
 RESEARCH_MODULE = "ai_research_provider.py"
 TRANSPORT_MODULE = "ai_provider_transport.py"
+#: R27-B2A 的 canonical research 持久化 owner（**不是** authority，也不联网）。
+REPOSITORY_MODULE = "ai_research_repository.py"
 
 ALLOWED_RESEARCH_IMPORTS = {
     "__future__", "collections", "dataclasses", "typing", "json",
@@ -1114,11 +1116,12 @@ class AiResearchProviderArchitectureGuardTests(unittest.TestCase):
         self.assertIn("urllib", _imported_roots(transport_tree))
         self.assertIn("urlopen", _called_names(transport_tree))
 
-        research_source = _source(RESEARCH_MODULE)
-        for token in ("urllib", "urlopen", "requests.", "httpx", "socket."):
-            with self.subTest(token=token):
-                self.assertNotIn(token, research_source,
-                                 f"{RESEARCH_MODULE} 直接持有网络调用")
+        # research contract / typed adapter / persistence owner 都没有直接网络调用。
+        for name in (RESEARCH_MODULE, REPOSITORY_MODULE):
+            source = _source(name)
+            for token in ("urllib", "urlopen", "requests.", "httpx", "socket."):
+                with self.subTest(module=name, token=token):
+                    self.assertNotIn(token, source, f"{name} 直接持有网络调用")
 
     def test_RG_04_no_authority_module_reverse_imports_ai(self):
         """RG-04：authority → AI 的依赖必须为 0。"""
@@ -1126,15 +1129,21 @@ class AiResearchProviderArchitectureGuardTests(unittest.TestCase):
         for name in AUTHORITY_MODULES:
             for imported in _imported_names(_tree(name)):
                 if imported.split(".")[0] in ("ai_research_contract", "ai_research_provider",
-                                              "ai_provider_transport"):
+                                              "ai_provider_transport",
+                                              "ai_research_repository"):
                     offenders.append(f"{name}: import {imported}")
         self.assertEqual(
             [], offenders,
             "authority 反向 import 了 AI 层 —— AI 必须是纯消费者",
         )
 
-    def test_RG_05_the_adapter_is_the_only_new_registered_consumer(self):
-        """RG-05：唯一新增的 research-contract 生产消费者是 ai_research_provider.py。"""
+    def test_RG_05_only_registered_consumers_use_the_research_contract(self):
+        """RG-05：research contract 的生产消费者集合是**显式登记**的闭集。
+
+        R27-B1 是 ``ai_research_provider``（typed research producer），R27-B2A 增加
+        ``ai_research_repository``（typed research persistence consumer）。用等值断言
+        而不是"不含"断言：多出任何一个消费者都必须是一次有意识的决定。
+        """
         offenders = []
         for name in sorted(os.listdir(BACKEND)):
             if not name.endswith(".py") or name == "ai_research_contract.py":
@@ -1145,7 +1154,7 @@ class AiResearchProviderArchitectureGuardTests(unittest.TestCase):
                 if imported.split(".")[0] == "ai_research_contract":
                     offenders.append(name)
         self.assertEqual(
-            sorted(set(offenders)), [RESEARCH_MODULE],
+            sorted(set(offenders)), [RESEARCH_MODULE, REPOSITORY_MODULE],
             f"research contract 的生产消费者集合发生变化：{sorted(set(offenders))}",
         )
 

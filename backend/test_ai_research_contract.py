@@ -114,8 +114,15 @@ AUTHORITY_MODULES = (
 #:
 #: R27-A 时为空（只有契约，没有消费者）。R27-B1 新增**第一个**消费者：
 #: ``ai_research_provider`` —— 把 typed ``InformationEvent`` 投给 LLM，再把输出映射回
-#: ``ResearchHypothesis``。它只是 adapter，不是 authority；authority 仍然不得反向 import。
-ALLOWED_AI_CONSUMERS: set[str] = {"ai_research_provider.py"}
+#: ``ResearchHypothesis``。R27-B2A 新增**第二个**：``ai_research_repository`` ——
+#: typed research 的 append-only 持久化 owner。
+#:
+#: 两者都**不是** authority：provider 是 typed research producer，repository 是 typed
+#: research persistence consumer。authority 仍然不得反向 import 其中任何一个。
+ALLOWED_AI_CONSUMERS: set[str] = {
+    "ai_research_provider.py",
+    "ai_research_repository.py",
+}
 
 #: 时钟 / 随机数 / IO —— 研究契约一旦读它们，就能拿 current state 回填历史。
 FORBIDDEN_CLOCK_CALLS = (
@@ -977,15 +984,17 @@ class AiResearchArchitectureGuardTests(unittest.TestCase):
     def test_AIG02_no_authority_module_imports_the_ai_research_layer(self):
         """AIG-02：现有 authority 不得 import AI 研究层（依赖方向单向）。
 
-        R27-B1 起 AI 层有三个模块（契约 / transport / typed adapter）；authority
-        反向 import **其中任何一个**都算违规 —— 只守住契约会留下
-        "authority 直接 import adapter 发请求"这个后门。
+        R27-B1 起 AI 层有多个模块（契约 / transport / typed adapter / persistence
+        owner）；authority 反向 import **其中任何一个**都算违规 —— 只守住契约会留下
+        "authority 直接 import adapter 发请求"或"直接 import repository 写研究台账"
+        这两个后门。
         """
         offenders = []
         for name in AUTHORITY_MODULES:
             for imported in _imported_names(_tree(name)):
                 if imported.split(".")[0] in (
                     "ai_research_contract", "ai_research_provider", "ai_provider_transport",
+                    "ai_research_repository",
                 ):
                     offenders.append(f"{name}: import {imported}")
         self.assertEqual(

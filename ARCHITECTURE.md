@@ -1206,17 +1206,18 @@ response body 拼进异常。
 ### 本轮仍然 deferred
 
 ```text
-research persistence / ledger / hypothesis 落库   → 仍无 owner，留给 R27-B2
-research UI / API endpoint / frontend              → 未接入
+research persistence / ledger / hypothesis 落库   → R27-B2A 已建立 canonical owner
+                                                    （见「Research Persistence Owner（R27-B2A）」）
+research UI / API endpoint / frontend              → 未接入，留给 R27-B3
 旧 AI 路径迁移（deepseek_research / ai_analysis /
-  adaptive_engine / dual_ai_tuner）                → 业务行为本轮不变，留给 R27-B2
+  adaptive_engine / dual_ai_tuner）                → 业务行为本轮不变，留给 R27-B2B
 R24 provenance token（证明 reading 真的由 owner 产生）→ 仍然 deferred，本 PR 不解决
 ```
 
 旧路径（`deepseek_advisor` / `deepseek_research` / `ai_analysis` / `disclosure_timeline`
 等）仍有自己的 `urllib` 调用。它们同时牵涉 provider、旧持久化、runtime scheduling 与
 API/UI；一次一起迁会让 review 无法区分"provider contract 是否正确"与"持久化迁移是否
-正确"，因此刻意留到 R27-B2。本轮只保证 **R27 的 provider 链路**网络 owner 唯一。
+正确"，因此刻意留到 R27-B2B。R27-B1 只保证 **R27 的 provider 链路**网络 owner 唯一。
 
 `ai_research_provider` 不是 authority，也没有任何写路径：源码中不存在 `INSERT` /
 `UPDATE` / `DELETE` / `paper_signals` / `paper_orders` / `paper_fills` /
@@ -1238,6 +1239,207 @@ PIT 依赖去重结果"的复合形态，精确复现未来观测绕过 PIT）�
 PIT 与去重是两道独立防线的这一事实由 mutation 结构本身表达：单拆一道不会变红，
 故用复合 mutation 复现可观测的失效状态（`network_calls == 0` 不再成立、结果依赖
 collection order），并把"两种输入顺序都必须 look_ahead"钉成永久回归 `RPROV-10b`。
+
+
+## Research Persistence Owner（R27-B2A）
+
+R27-A 定义了契约，R27-B1 打通了 provider 链路，但**研究结论仍然没有正式存放点**。
+R27-B2A 只补这一件事：给 typed `ResearchHypothesis` 一个 canonical、append-only 的
+持久化 owner。
+
+### 为什么拆成 B2A 与 B2B
+
+旧系统同时存在 `adaptive_advisor_runs` / `adaptive_ai_analysis_runs` 两张表，以及
+`deepseek_advisor` / `deepseek_research` / `ai_analysis` 三条 runtime。它们带着旧 provider
+语义、旧 persistence schema、runtime scheduling 与历史 API/UI compatibility。若同一轮里
+既建 canonical schema、又迁全部旧写路径、还改 provider / scheduler / API/UI，review 将
+无法判断**"新 persistence contract 本身是否正确"**还是**"legacy migration 出了问题"**。
+因此拆开：
+
+```text
+R27-B2A  只建立 canonical persistence owner（本 PR）
+R27-B2B  再迁 deepseek_research / ai_analysis / 相关 legacy research writer
+R27-B3   才提供 canonical research API / UI
+```
+
+### 能力变化（不是文件清单）
+
+| 之前（R27-B1） | 现在（R27-B2A） |
+| --- | --- |
+| research 结论只在内存里，无法审计 | 有了 canonical append-only ledger `ai_research_runs` |
+| 没有人拥有"研究结论怎么落库" | `ai_research_repository` 是**唯一** writer |
+| 旧表是唯一的 AI 持久化痕迹 | canonical ledger 与 legacy 表**并存但互不写入** |
+| `ai_research_contract` 有一个生产消费者 | 增加第二个：typed research persistence consumer |
+
+```text
+R27-A   ai_research_contract        纯契约
+                 ↑
+R27-B1  ai_research_provider        typed research producer（不是 authority）
+                 ↑
+R27-B2A ai_research_repository      typed research persistence consumer（不是 authority）
+```
+
+repository **可以**访问 DB，但**不做**：联网、调 LLM、读 market / signal / execution、
+做 risk decision、做 strategy promotion、生成 research status、修改 hypothesis。它只依赖
+stdlib 与 `ai_research_contract`，不 import 任何 authority / orchestration 模块，也不读
+墙上时钟。
+
+### Persistence does not re-authorize research
+
+这是本轮最重要的不变量。`ai_research_runs` 是 **audit / persistence layer**，不是
+market-data owner、不是 verification owner、不是 signal / risk / promotion authority：
+
+```text
+历史 supported 行   ≠  当前 signal
+历史 supported 行   ≠  current verified fact
+历史 supported 行   ≠  promotion permission
+```
+
+数据库里写着 `status='supported'`，只说明**当初**那次研究派生出了这个结论，**不**说明
+"现在仍然成立"。要判断当下，必须回到对应 authority（R24 / R25 / R26）取正式事实。
+因此 `recent_runs()` / `get_run()` 返回的是 **persisted research projection**，而不是
+重新核验过的实时证据。
+
+**不把 DB row 重新抬成 owner evidence。** 读路径**不**把一行记录重建成
+`ResearchEvidenceRef` / `InformationEvent` / `ResearchHypothesis` 用于新的业务判定，
+也**不**从持久化记录创建 `SignalDecision`。这是一条写进代码的边界，不是注释里的期望：
+本模块源码里不存在 `commit_signal` / `paper_signals` / `paper_orders` /
+`risk_decision` / `promotion` / `SignalDecision`，读路径也不调用契约的构造函数。
+
+### 派生值只能来自 typed hypothesis
+
+`status` / `reason` / `confidence` / `authority` / `is_authoritative` **全部**在写入时
+从 `ResearchHypothesis` 派生。`append_run` 的签名里**根本没有**这些参数 —— 调用方不是
+"被禁止"传它们，而是**传不进来**。同理也没有 `verification` / `verification_method`
+参数。
+
+"调用方不能自己声明裁决"因此不是口头约定，而是类型与签名上都表达不出来的东西：
+若 dict 能冒充 typed hypothesis，调用方就能自述 `status="supported"` /
+`authority="signal"`，所以入口先做 `isinstance(..., ResearchHypothesis)` 检查，dict /
+裸字符串 / duck-typed 假对象一律 fail closed。
+
+两条不变量同时写进 schema，使其不依赖调用方自觉：
+
+```text
+CHECK(authority = 'research')          authority 只能是 research
+CHECK(is_authoritative = 0)            研究记录永远不是权威
+CHECK(confidence BETWEEN 0 AND 1)      confidence 语义不越界
+CHECK(input_tokens/output_tokens/latency_ms >= 0)
+```
+
+读路径还会**再校验一次** `authority` / `is_authoritative` 并 fail closed：schema 保证本
+模块写不出别的值，但持久化层不能假设**只有自己**写过这张表。一条自称权威的历史记录，
+绝不能被本层当成权威继续传播；投影里的 `is_authoritative` 因此**恒为** `false`，不会因为
+`status == supported` 变成真。
+
+### 不重新解释 evidence 维度
+
+`verification` / `verification_method` / `cross_source_verified` / `relation` 只**逐字
+记录** R27-A 投影给出的结果，repository **不重算**。尤其**禁止**
+`cross_source_verified = (verification == "verified")`：R24 的 `verified` 也可能来自
+`coverage_integrity`（快照完整且覆盖达标），那不是逐票第二源。于是：
+
+```text
+single_source     落库后仍是 single_source（不升级成 verified）
+verified + coverage_integrity  →  cross_source_verified == false（R24 永久不变量）
+supports / contradicts / context  逐字保存，不被改写方向
+```
+
+### append-only 与 schema
+
+```text
+表名            ai_research_runs
+                （刻意不叫 deepseek_* / advisor_* / adaptive_ai_*：
+                  canonical contract 已与厂商、adaptive tuning 解耦）
+写入            CREATE TABLE / CREATE INDEX / INSERT / SELECT —— 只有这些
+禁止            UPDATE / DELETE / INSERT OR REPLACE / ON CONFLICT DO UPDATE / upsert
+唯一 writer     ai_research_repository（guard 用 AST + SQL 文本扫描锁死 writer count == 1）
+索引            (as_of, id DESC) / (subject, as_of, id DESC) / (hypothesis_id, id DESC)
+UNIQUE          刻意**没有**（除主键）
+```
+
+**刻意不加任何业务幂等键。** R27-A 从未声明"同一个 `hypothesis_id` 只能持久化一次"，
+所以持久化层不擅自发明这条规则。append-only 意味着**两次明确执行 → 两条运行记录**，
+这不是 bug；真正的幂等键属于未来 orchestration 的 business key。
+
+同一原因，索引只建**实际有意义的读取索引**，`limit` 有硬上界（≤ 200），非法 `limit`
+直接拒绝而不是退化成无限查询。
+
+### 持久化的是什么
+
+持久化 `hypothesis.projection()` —— **hypothesis audit projection**，而**不是**
+"完整重放模型输入"：R27-A 的 hypothesis 只保存 evidence reference + relation，不保存
+原始 `InformationEvent.payload`。本 PR 不偷偷改变这个契约，也不顺手塞 raw prompt /
+raw response。完整 provider-visible evidence input persistence 若未来需要，另立明确
+contract。
+
+`record_hash` 是实际持久化内容的 SHA-256（stable JSON：`sort_keys` /
+`separators` / `allow_nan=False`），**不含** `created_at`（那是 operational persistence
+time，不是研究产物内容）、不含 DB `id`、不含 api key / `Authorization` / raw HTTP body。
+
+### 事务语义
+
+`append_run` 只做**一次**本地 DB write，**不在 transaction 内发网络请求**（本模块天然
+没有网络依赖）。R27-B1 已经完成 provider 调用；未来 orchestration 的顺序必须是：
+
+```text
+provider 完成 → 得到 typed result → 短事务 append
+```
+
+绝不 `BEGIN transaction → call provider → INSERT`。
+
+### Secret / prompt 边界
+
+本表**绝不**出现 `api_key` / `authorization` / `request_headers` / `raw_prompt` /
+`system_prompt` / `user_prompt` / `raw_response`。`provider_config` 整体**不**传进
+repository，最多接受 `provider_slot` 与 `provider_model` 两个 audit label。
+
+`provider_slot` 是**纯 audit label**，不具备业务语义：本层刻意识别它时**不**校验
+`ai1` / `ai2`，因为那需要 import `ai_review_service` 的槽位定义，等于让持久化 owner
+依赖整个 provider orchestration 并造出第二份会漂移的槽位词表。它只做长度上界，且
+**不影响** status / authority。
+
+### legacy 与本轮不碰的东西
+
+```text
+adaptive_advisor_runs         保持原样，仍是 legacy
+adaptive_ai_analysis_runs     保持原样，仍是 legacy
+deepseek_research / ai_analysis / adaptive_engine / api_adaptive
+                              runtime 行为本轮**一行未改**
+frontend / API endpoint       本轮未改
+```
+
+**绝不迁移或回填旧行。** 旧记录没有 R27 typed contract 的保证；把历史 free-form 行标成
+R27 typed research 会伪造 provenance 与语义。正确策略是 **legacy rows stay legacy**：
+从 R27-B2B 完成迁移的那一刻起，新 typed research 才进入 canonical ledger。本轮也**不做**
+dual-write —— 未来 B2B 迁某条 runtime 时必须**切换 writer owner**，而不是长期两张表各写
+一份。
+
+**R24 provenance token 仍然 deferred。** 本轮不声称"数据库能证明 `MarketDataReading`
+真的由 `market_data_owner` 产生"：持久化只记录 typed contract 交给它的东西，契约层那
+两层伪造路径（见 R27-A「诚实声明这一层的强度」）在本轮没有被关闭，也不会因为多了一张
+表而被关闭。
+
+### 回归门禁
+
+`backend/test_ai_research_repository.py`：RPERSIST-01 ~ 02（schema 幂等、无业务 UNIQUE、
+只接受 typed hypothesis）、RPERSIST-03 ~ 06（status / reason / authority 全部派生，
+签名里没有裁决参数）、RPERSIST-07 ~ 09（single_source / coverage_integrity / relation
+逐字保存）、RPERSIST-10 ~ 13（append-only 真成立、record_hash 覆盖研究内容且不含
+`created_at`）、RPERSIST-14（secret / raw prompt 无法到达本层）、RPERSIST-15 ~ 19（损坏
+行 fail closed、不回显损坏内容、`limit` 有界、顺序与过滤确定）、RPERSIST-20 ~ 25（无时钟、
+无网络、无 authority import、唯一 canonical writer、无改数据语句、投影恒非权威），加上
+guard 非空性用例。
+
+语义 mutation 在 `work/r27b2a_research_persistence_mutation_check.py`：dict 冒充 typed
+hypothesis、`is_authoritative` 恒写 1、`authority` 固定成 `signal`、丢失
+`verification_method`、重算 `cross_source_verified`、INSERT 退化成 `INSERT OR REPLACE`、
+损坏 JSON 时 `except → {}`、`record_hash` 不再覆盖研究内容，必须全部 CAUGHT
+（survived = 0、fake = 0、restore sha256 一致）。
+
+其中"唯一 writer"与"无改数据语句"两条 guard 由**扫描器**实现，因此扫描器本身也有非空性
+用例：它必须看得见 `f"INSERT INTO {TABLE} ..."` 这种 f-string 形式（真实写入口正是这种），
+并且必须忽略 docstring（否则"解释为什么禁止 UPDATE"会让护栏变红）。
 
 
 ## 目标依赖方向
@@ -1277,10 +1479,20 @@ signal 侧自带"什么算双源"的判据（R25：必须委托 is_cross_source_
 绕过 Decision→Commit 边界写 signal（R25：commit_signal 必须消费 SignalDecision，
 调用方不得自述 status/reason/裁决 payload）
 AI provider 网络 owner 不唯一（R27-B1：AI provider 的 urlopen 只允许在
-ai_provider_transport；research contract / typed adapter 不得直接联网）
+ai_provider_transport；research contract / typed adapter / persistence owner
+不得直接联网）
 LLM 输出声明事实身份或裁决字段（R27-B1：status / reason / authority /
 verification / verification_method / source_type / source_id / as_of 一律
 invalid_provider_response，禁止"忽略后继续运行"）
+canonical research 持久化出现第二个 writer（R27-B2A：INSERT INTO
+ai_research_runs 只允许出现在 ai_research_repository，且该 INSERT 必须真的存在）
+canonical research 台账出现改数据语句（R27-B2A：引用 ai_research_runs 的 SQL
+不得出现 UPDATE / DELETE / REPLACE / upsert / ON CONFLICT / DROP / ALTER）
+数据库 row 成为 research authority（R27-B2A：读投影 is_authoritative 恒为
+false；status / reason / authority 只能从 typed ResearchHypothesis 派生，
+调用方传不进来）
+research 持久化层读墙上时钟或持有网络依赖（R27-B2A：created_at 必须由调用方
+显式提供，as_of 与 created_at 必须分离）
 ```
 
 ### 仅作 review signal（不进入 CI gate）
