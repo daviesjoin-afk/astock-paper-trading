@@ -26,10 +26,10 @@ research，见文末「明确排除」。
 | 3 | **可证明的业务日（PIT）** —— owner 记录（而非推断）业务日 / 可用时间 | `as_of` 由调用方猜 = 用未来事实解释过去 |
 | 4 | **owner 签发的核验维度** —— owner 用**自己**的闭集词表声明核验状态与方式 | 研究层翻译 / 借用别人的词表 = 发明核验结论 |
 
-第 4 条是本轮的决定性约束，因为 research 契约把它**硬绑定到市场数据的词表**：
+第 4 条是本轮的决定性约束。**B2C-2 之前**，research 契约把它**硬绑定到市场数据的词表**：
 
 ```text
-ai_research_contract._owner_verification_pair()          backend/ai_research_contract.py:288-310
+ai_research_contract._owner_verification_pair()          （B2C-2 已改名为 _market_verification_pair）
     → 构造 market_data_contract.MarketDataSnapshot(kind="research_evidence", ...) 让 R24 拒绝非法组合
 
 合法闭集（R24 拥有）                                       backend/market_data_contract.py:117-167
@@ -37,16 +37,22 @@ ai_research_contract._owner_verification_pair()          backend/ai_research_con
     verification_method ∈ cross_source / coverage_integrity / none
 ```
 
-因此**任何非市场 owner 的事实，今天都无法在不翻译的前提下填出合法的
+因此**任何非市场 owner 的事实，都无法在不翻译的前提下填出合法的
 `(verification, verification_method)`**。翻译就是发明，而 R27-A 的整个存在理由就是禁止它。
+
+**B2C-2 已消除这个耦合**：canonical 存储改为 owner-neutral 的 `OwnerVerification`
+（`outcome` 三态 + owner 自己的 `status` + owner-specific `attributes`），research core
+只消费 `outcome`，**不解释**任何 owner 的状态字符串。market 的校验与归口仍然完全由
+R24 负责（`_market_verification_pair` / `_market_owner_verification`，
+`backend/ai_research_contract.py:338-489`）。
 
 另外两条今天已经成立、也一并确认的事实：
 
 ```text
-ResearchEvidenceRef 无公开构造器            backend/ai_research_contract.py:367-373
-唯一签发路径 evidence_ref_from_market_reading  :545-587（要求真正的 MarketDataReading）
-SUPPORTED_OWNER_ADAPTERS = {"market_data"}  :113
-生产里构造 InformationEvent 的地方**恰好一处**  backend/deepseek_advisor.py:552-583（由 R24 reading 喂入）
+ResearchEvidenceRef 无公开构造器            backend/ai_research_contract.py:553-559
+唯一签发路径 evidence_ref_from_market_reading  :790-830（要求真正的 MarketDataReading）
+SUPPORTED_OWNER_ADAPTERS = {"market_data"}  :120
+生产里构造 InformationEvent 的地方**恰好一处**  backend/deepseek_advisor.py:577（由 R24 reading 喂入）
 ```
 
 ### 两层不变量：本 PR 强制的是哪一层
@@ -147,6 +153,46 @@ B2C-4  迁移 pnl_attribution
 `paper_orders` 上**没有** owner 记录的交易日列，因此 `business_day` 如实报 `unknown`。
 要让它变成 `known`，需要 owner 自己记录业务日（而不是让消费者用 `created_at` 推断）。
 
+### B2C-2 进展（research core 可以携带 owner-native 核验）
+
+`ResearchEvidenceRef` 的 canonical 核验存储从 **market-shaped** 改为 **owner-neutral**：
+
+```text
+B2C-2 之前  verification + verification_method        （一对 market 形状的字段）
+            ↓
+            _owner_verification_pair() 实际只问 MarketDataSnapshot 是否合法
+            ⇒ research contract 本质上仍是 "market verification vocabulary"
+
+B2C-2 之后  OwnerVerification（outcome / status / attributes）
+            ↓
+            market 的归口函数 = _market_owner_verification()（R24 仍是唯一 authority）
+            非 market owner 只需发布自己的 OwnerVerification，无需伪装或翻译
+```
+
+**已经解决的**：research core 不再比较任何 owner 的状态字符串
+（`HypothesisEvidence.is_verified` 读 `ref.is_verified` → `OwnerVerification.outcome`）；
+`fact_state` / 冲突检测 owner-neutral（market 的 `verification_method` 仍参与冲突，
+因为它是 owner attributes）；market 兼容面逐字不变；market 校验器诚实改名为
+`_market_verification_pair`。
+
+**仍然没有解决的**：
+
+```text
+B2C-3  execution → ResearchEvidenceRef adapter（**仍未开始**，公开 factory 仍只有 market_data）
+B2C-4  迁移 pnl_attribution
+B2C-5  news owner readiness
+B2C-6  adaptive / experiment owner readiness
+B2C-7  runtime / incident owner readiness
+B2C-8  remaining deepseek_research typed convergence
+B2C-9  ai_analysis lifecycle convergence
+B2C-10 / B3  canonical research API/UI + 删除 B2B 兼容投影
+```
+
+**owner-origin provenance 仍然 OPEN / REQUIRED。** owner-neutral 化解决的是"research 能
+携带谁的核验"（能力问题），**不是**"输入对象确实由该 owner 产生"（provenance 问题）：
+`MarketDataReading` / `ExecutionEvidence` 都仍是公开可构造的，两步伪造路径照旧。不得
+因为 B2C-2 的 generic 化就宣称 provenance 已关闭。
+
 ---
 
 ## 三、Family B —— Adaptive / experiment facts
@@ -213,24 +259,26 @@ invariant 2 禁止的伪造 provenance。
 
 按顺序，且**每一步都必须是 owner 自己的动作**，不能由研究层代做：
 
-1. **owner 发布自己的核验闭集**（Family A → `execution_verification`）。
-   今天它有 `EXECUTION_VERIFICATION_VERSION`、4 态状态、证据来源词表与唯一 SQL 判定，
-   但**没有把核验结果发布成 `(verification, verification_method)` 形状的闭集**。
-   必须有：一个 frozen 词表常量 + 一个 allow-table（哪个状态允许配哪个 method）+
-   一个 legacy/unknown 取值。形状照抄 `market_data_contract.py:117-167` 的
-   `VERIFICATIONS` / `VERIFICATION_METHODS` / `_VERIFICATION_METHODS_BY_STATE`。
-2. **研究契约接受按 owner 分区的词表**（`ai_research_contract`）。
-   今天 `_owner_verification_pair()` 只问 R24。需要让每个 source_type **自带**它的
-   pair 校验器 —— 关键约束：**研究层不做翻译**，它只调用 owner 提供的校验器。
-   owner 提供的校验器是 owner 的模块，因此不会出现"研究层裁决执行语义"。
-   注意方向：owner **不得** import research 契约（AIG-02 / RG-04 已禁止），所以校验器
-   由研究层在 adapter 注册时**引用** owner 的常量，而不是 owner 反过来依赖研究层。
-3. **owner 提供 typed 投影 + 契约形状的业务日**。
-   `ExecutionEvidence` 今天有 `order_time`（= `created_at` 墙钟）但**没有可证明的业务日**；
-   `paper_fills.fill_date` 存在却不在 typed 对象上。需要 `projection()` 至少给出
-   `{verdict, business_day, observed_at, order_id, event_key, verification, verification_method}`。
+1. **owner 发布自己的核验闭集**（Family A → `execution_verification`）。**已完成（B2C-1）**：
+   owner 发布了 `EXECUTION_FACT_CONTRACT_VERSION` / `EXECUTION_VERIFICATION_SCOPE` /
+   `verification_contract(status, source)`（四态 + 证据来源 + 状态×来源穷尽合法组合表）。
+   注意它**没有**照抄 market 的 `(verification, verification_method)` 形状 —— 那正是
+   B2C-1 拒绝的"翻译"。owner 发布的是**它自己的**词表。
+2. **研究契约能携带 owner 自己的核验结论**（`ai_research_contract`）。**已完成（B2C-2）**：
+   canonical 存储改为 owner-neutral 的 `OwnerVerification`（`outcome` 三态 + owner 自己的
+   `status` + owner-specific `attributes`），research core 只消费 `outcome`。
+   关键约束不变：**研究层不做翻译** —— 每个 owner 的 factory 把自己的状态词归口到三态
+   （market 的那份是 `_market_owner_verification`），research core 看不到任何 owner 词表。
+   方向也不变：owner **不得** import research 契约（AIG-02 / RG-04 已禁止），归口函数住在
+   研究契约里并**引用** owner 的公开判定（例如 `MDC.is_cross_source_verified`）。
+3. **owner 提供 typed 投影 + 契约形状的业务日**。**已完成（B2C-1）**：
+   `ExecutionFactProjection`（identity / `identity_kind` / `business_day` / `observed_at` /
+   owner-native verification），由唯一发布入口 `fact_projection(evidence)` 产出。
 4. **一个 owner 侧的 row→typed 读取口**（不是 dict 包装器）。
    已有的无 DB 纯函数 `execution_evidence.evidence_from_order:585-721` 就是正确的接缝。
+
+四件前提都已在 B2C-1 / B2C-2 就位，但 **adapter 本身仍然没有写**：B2C-3 才登记
+`execution → ResearchEvidenceRef` 的 factory。
 
 ### 建议的迁移顺序（与 §六 的排除项一致）
 
@@ -266,6 +314,16 @@ ResearchEvidenceRef public construction:            仍然不可绕 owner
 Legacy dict → typed event wrapper:                  0
 Implicit current lookup:                            before = 0   after = 0
 Modules needed to understand one fact:              before = 1   after = 1
+```
+
+B2C-2 之后这些数字**不变**（owner-neutral 化没有新增 adapter，也没有放宽签发边界）：
+
+```text
+Public evidence factories:                          before = 1   after = 1   （只有 market_data）
+Owner verification model:                           before = market-shaped
+                                                    after  = owner-neutral
+Market verification authority:                      before = R24   after = R24
+Market-specific checks in generic hypothesis logic: before = >0  after  = 0
 ```
 
 `after = 0` 这两条**只有在本轮不写 adapter 时才成立**，而且必须被永久锁住 ——

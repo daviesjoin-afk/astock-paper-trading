@@ -22,10 +22,14 @@
 * provider disagreement / unavailable 只说明"这条 evidence 本身不能成为可靠依据"，
   **不**自动等于"这个 thesis 被事实反驳"。
 
-fact verification 的**语义**由 R24 authority 定义（``verification`` /
-``verification_method`` 的含义与合法组合都归它）；R27 只**逐字复制 supplied R24
-reading**，不重新判定，也**不证明**该 reading 的 provenance。relation 只有 research 层
-能声明，且是显式输入。
+fact verification 的**语义**由**事实的 owner 自己**定义：market 事实的
+``verification`` / ``verification_method`` 含义与合法组合归 R24，execution 事实的四态
+与证据来源归 ``execution_verification``。research core **不解释**任何一个 owner 的
+状态词 —— 它只消费一个 owner-neutral 的三态结论
+(:data:`OWNER_OUTCOMES`)，而把"owner 词表 → 该结论"的映射留在**各 owner 自己的
+factory** 里（market 的那一份就是 :func:`_market_owner_verification`）。R27 因此既
+不重新判定，也**不证明**输入对象的 provenance。relation 只有 research 层能声明，
+且是显式输入。
 本契约不做评分体系（没有 ``quality_score`` / ``weighted_support`` / Bayesian 合并），
 因为把两个正交维度压成一个分数会让下游只能猜。
 
@@ -37,12 +41,13 @@ AI 只消费事实，永不成为 authority：:attr:`ResearchHypothesis.is_autho
 import ``market_data_contract``（R24 纯契约）与标准库，不 import DB / 网络 / 时钟 /
 LLM SDK。authority 不得反向 import 本模块。
 
-evidence 走**类型化 market evidence** 边界：唯一公开构造入口是
+evidence 走**类型化 owner evidence** 边界：唯一公开构造入口是
 :func:`evidence_ref_from_market_reading`，它要求一个 typed R24 projection
 (``market_data_contract.MarketDataReading``)，并从投影**派生** identity、业务日与核验
-维度；裸构造 ``ResearchEvidenceRef(...)`` 抛 ``TypeError``。保证与**已知限制**
-（两层伪造路径、以及为什么需要 R24 签发 token）集中在
-:class:`ResearchEvidenceRef` 的 docstring 里，此处不重复。
+维度；裸构造 ``ResearchEvidenceRef(...)`` 抛 ``TypeError``。核验维度本身是
+**owner-neutral** 的 (:class:`OwnerVerification`)：owner 自己发布结论，research core
+不解释任何 owner 的状态字符串。保证与**已知限制**（两层伪造路径、以及为什么需要 R24
+签发 token）集中在 :class:`ResearchEvidenceRef` 的 docstring 里，此处不重复。
 
 ──────────────── 能力边界 ────────────────
 
@@ -81,6 +86,9 @@ __all__ = [
     "RESEARCH_REASON_NO_EVIDENCE", "RESEARCH_REASON_NO_SUPPORTING_EVIDENCE",
     "RESEARCH_REASON_EVIDENCE_NOT_VERIFIED", "RESEARCH_REASON_EVIDENCE_CONTRADICTED",
     "RESEARCH_REASON_EVIDENCE_UNAVAILABLE", "RESEARCH_REASONS",
+    # owner-native verification —— research 唯一认识的核验形状
+    "OWNER_OUTCOME_VERIFIED", "OWNER_OUTCOME_UNVERIFIED", "OWNER_OUTCOME_SOURCE_UNUSABLE",
+    "OWNER_OUTCOMES", "OwnerVerification",
     # contract
     "ResearchEvidenceRef", "InformationEvent", "HypothesisEvidence", "ResearchHypothesis",
     # errors
@@ -196,6 +204,33 @@ RESEARCH_REASONS = (
     RESEARCH_REASON_EVIDENCE_UNAVAILABLE,
 )
 
+# ---------------------------------------------------------------------------
+# owner-native verification —— research 唯一认识的核验形状
+# ---------------------------------------------------------------------------
+#
+# 这三个值是 **owner-neutral** 的：market / execution / news / adaptive / runtime
+# 各自有自己的状态词，但都必须把自己的结论归到这三态之一。于是：
+#
+# * research core **不**比较任何 owner 的状态字符串（因此 market 的 ``"verified"``
+#   与 execution 的 ``"verified"`` 是两套不同词表，不会互相污染）；
+# * "为什么这条证据还不足以判断"仍然能给出**准确且互不相同**的 reason；
+# * 一个 owner 新增状态词只需要更新**它自己的** factory 映射，不需要动 research。
+
+#: owner 自己判定"这条事实通过了它那套核验"。
+OWNER_OUTCOME_VERIFIED = "verified"
+#: owner 做了核验判定，结论是**没有通过**（单源 / 从未核验 / 证据不足）。
+OWNER_OUTCOME_UNVERIFIED = "unverified"
+#: owner 的核验**没能做出判定**：核验源本身不可用，或多个源互相否证。
+#: 与 ``unverified`` 的区别在于障碍出在**核验过程**，而不是"这条事实不够好" ——
+#: 因此假设的 reason 也不同（``evidence_unavailable`` vs ``evidence_not_verified``）。
+OWNER_OUTCOME_SOURCE_UNUSABLE = "source_unusable"
+
+#: 刻意**不含** verified_with_caveat / partially_verified / trusted 这类档位：
+#: 那会把"通过核验"与"有多可信"压成一个刻度，而本契约不做评分模型。
+OWNER_OUTCOMES = (
+    OWNER_OUTCOME_VERIFIED, OWNER_OUTCOME_UNVERIFIED, OWNER_OUTCOME_SOURCE_UNUSABLE,
+)
+
 
 class EvidenceConflict(ValueError):
     """同一个 identity 出现了**互相矛盾的事实状态** —— fail closed。
@@ -285,12 +320,33 @@ def _required_text(value: Any, *, what: str) -> str:
     return text
 
 
-def _owner_verification_pair(verification: Any, method: Any) -> tuple[str, str]:
+def _plain(value: Any) -> Any:
+    """已冻结的 JSON-like 容器 → 普通 dict / list，供投影输出。
+
+    只做**一层形状还原**（与 provider 的 ``_jsonable`` 同手法），不改变任何内容，也不
+    引入通用 serializer 框架：``_deep_freeze`` 保证输入里只有 str key 与 JSON-like
+    标量，因此还原是可逆且无歧义的。
+    """
+    if isinstance(value, Mapping):
+        return {key: _plain(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_plain(item) for item in value]
+    if isinstance(value, (set, frozenset)):
+        return [_plain(item) for item in sorted(value, key=repr)]
+    return value
+
+
+def _market_verification_pair(verification: Any, method: Any) -> tuple[str, str]:
     """``(verification, method)`` 的合法性由 R24 authority **独占**判定。
 
-    刻意构造一个 ``MarketDataSnapshot`` 来问它，而不是在这里重写"``verified`` 允许配
-    哪些 method"：核验词汇只有一个 owner，R24 收紧定义时本契约自动跟随（与
+    **这是 market-specific 的**，不是通用的 owner verification 校验：它刻意构造一个
+    ``MarketDataSnapshot`` 来问 R24，而不是在这里重写"``verified`` 允许配哪些 method"。
+    核验词汇只有一个 owner，R24 收紧定义时本契约自动跟随（与
     ``signal_service._cross_source_verified`` 同一手法）。
+
+    命名刻意带 ``market``：把 market 专属校验叫作"owner verification"会重新制造一个
+    假的通用抽象 —— 它只认识 ``market_data_contract`` 的词表，对 execution / news
+    的核验闭集一无所知。
 
     非法组合（``verified`` 配 ``none``，或闻所未闻的状态词）构造期即拒绝，
     而不是被静默降级成"看起来能用"。
@@ -311,6 +367,131 @@ def _owner_verification_pair(verification: Any, method: Any) -> tuple[str, str]:
 
 
 # ---------------------------------------------------------------------------
+# owner-native verification —— 事实的 owner 对"这条事实是否通过核验"的发布结果
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class OwnerVerification:
+    """一个 owner 对**它自己那条事实**的核验发布结果，形状对 research 中性。
+
+    三个字段各有明确归属：
+
+    ``outcome``
+        owner-neutral 的**三态结论**，是 research core 唯一消费的字段。owner 有自己
+        的状态词（market 的 ``verified`` / ``single_source`` / …；execution 的四态），
+        但每个 owner 的 factory 必须把自己的结论归到 :data:`OWNER_OUTCOMES` 之一。
+        三态而不是布尔，是因为"核验源不可用"与"事实没通过核验"必须给出**不同**的
+        research reason —— 压成一个 bool 会让这两种情况在假设层无法区分。
+
+    ``status``
+        owner 自己的状态词，**逐字保留**。research core 不解释这个字符串，也不拿它
+        做任何比较：它只用于展示、审计与冲突诊断。因此两个 owner 可以同时使用
+        ``"verified"`` 而互不干扰。
+
+    ``attributes``
+        owner-specific 的不可变附加维度（market：``verification_method`` /
+        ``cross_source_verified``；未来的 execution：``verification_scope`` /
+        ``verification_source`` 等）。**只有产生它的 owner factory 知道这些键的
+        语义**，research core 只保存、投影与参与冲突检测。
+
+    刻意**没有** ``verified_at`` / ``confidence`` / ``score``：核验结论不是评分，
+    时间维度也不属于"这条事实是否通过核验"。
+    """
+
+    outcome: str
+    status: str
+    attributes: Mapping[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        outcome = str(self.outcome or "").strip()
+        if outcome not in OWNER_OUTCOMES:
+            raise ValueError(
+                f"unknown owner verification outcome: {outcome!r}; allowed: {OWNER_OUTCOMES}"
+            )
+        object.__setattr__(self, "outcome", outcome)
+        object.__setattr__(
+            self, "status",
+            _required_text(self.status, what="owner verification status"),
+        )
+        object.__setattr__(
+            self, "attributes",
+            _deep_freeze(self.attributes, what="owner verification attributes"),
+        )
+
+    @property
+    def is_verified(self) -> bool:
+        """owner 是否判定这条事实**通过**了它那套核验。
+
+        这是 research hypothesis 消费的唯一判据 —— 不是 ``status`` 的字符串比较。
+        """
+        return self.outcome == OWNER_OUTCOME_VERIFIED
+
+    @property
+    def source_unusable(self) -> bool:
+        """核验过程本身没能做出判定（源不可用 / 多源互相否证）。"""
+        return self.outcome == OWNER_OUTCOME_SOURCE_UNUSABLE
+
+    def canonical(self) -> tuple:
+        """deterministic canonical form —— 冲突检测的比较键。
+
+        必须包含 ``status`` **与** ``attributes``，否则同一 identity 下
+        ``verified + cross_source`` 与 ``verified + coverage_integrity`` 会被误判成
+        同一条事实状态（market 的永久不变量，见 RVERIFY-06）。
+        """
+        return (self.outcome, self.status, _canonical_attributes(self.attributes))
+
+
+def _canonical_attributes(value: Any) -> Any:
+    """把已冻结的 owner attributes 归一成**顺序无关**的可比较形状。
+
+    只做形状归一，不做序列化框架：mapping 按键排序成 tuple、序列成 tuple、集合成
+    frozenset。输入已经过 :func:`_deep_freeze`，因此这里只处理 JSON-like 容器。
+    """
+    if isinstance(value, Mapping):
+        return tuple(sorted((key, _canonical_attributes(item)) for key, item in value.items()))
+    if isinstance(value, (list, tuple)):
+        return tuple(_canonical_attributes(item) for item in value)
+    if isinstance(value, (set, frozenset)):
+        return frozenset(_canonical_attributes(item) for item in value)
+    return value
+
+
+def _market_owner_verification(projection: Mapping[str, Any], snapshot: Any) -> OwnerVerification:
+    """R24 投影 → owner-neutral 核验发布结果。**market owner 的 factory**。
+
+    owner authority 完整保留在 R24 一侧，本函数只做**归口**，不做判定：
+
+    1. ``(verification, verification_method)`` 的合法性问 R24（:func:`_market_verification_pair`）；
+    2. ``cross_source_verified`` 问 R24 的 :func:`market_data_contract.is_cross_source_verified`
+       —— 本层**不**比较 ``verification == "verified"``（``coverage_integrity`` 的
+       ``verified`` 不是逐票双源）；
+    3. 把 R24 的状态词归到 owner-neutral 三态。
+
+    第 3 步是本层唯一的解释行为，且方向是"把 owner 的词映射到中性结论"，**不是**
+    "用中性结论替代 owner 判定"。research core 反过来看不到这张表。
+    """
+    verification, method = _market_verification_pair(
+        projection.get("verification") or MDC.VERIFICATION_NOT_ATTEMPTED,
+        projection.get("verification_method") or MDC.VERIFICATION_METHOD_NONE,
+    )
+    if verification == MDC.VERIFICATION_VERIFIED:
+        outcome = OWNER_OUTCOME_VERIFIED
+    elif verification in (MDC.VERIFICATION_UNAVAILABLE, MDC.VERIFICATION_DISAGREEMENT):
+        outcome = OWNER_OUTCOME_SOURCE_UNUSABLE
+    else:
+        outcome = OWNER_OUTCOME_UNVERIFIED
+    return OwnerVerification(
+        outcome=outcome,
+        status=verification,
+        attributes={
+            "verification_method": method,
+            "cross_source_verified": MDC.is_cross_source_verified(snapshot),
+        },
+    )
+
+
+# ---------------------------------------------------------------------------
 # evidence ref —— "这个结论引用了哪一条已存在的事实"
 # ---------------------------------------------------------------------------
 
@@ -324,10 +505,17 @@ class ResearchEvidenceRef:
     :class:`HypothesisEvidence.relation` 显式声明。因此这里没有 ``standing`` 之类的
     派生方向字段：``verified`` 只意味着"来源通过了它自己的核验"。
 
+    **canonical 存储是 owner-neutral 的**（:class:`OwnerVerification`），不是
+    ``(verification, verification_method)`` 那一对 market 形状。这一层曾经只携带
+    market 词表，于是 execution / news / adaptive 想进入 research 时只剩两个错误选择：
+    假装自己是 ``market_data``，或把自己的核验结论翻译成 market 词 —— 后者就是由非
+    owner 发明核验结论。现在 owner 自己发布 :class:`OwnerVerification`，research core
+    只消费它，**不解释**任何 owner 的状态字符串。
+
     **没有公开 raw 构造器。** ``ResearchEvidenceRef(...)`` 一律抛 ``TypeError``；
     唯一的签发路径是 :func:`evidence_ref_from_market_reading`。identity 由 reading
-    派生（调用方不提供），核验维度由投影逐字复制 —— 因此"传字符串把自己声明成 R24
-    verified market fact"不可表达。
+    派生（调用方不提供），核验维度由**该 owner 的 factory** 归口 —— 因此"传字符串把
+    自己声明成 R24 verified market fact"不可表达。
 
     **保证与已知限制**（不要把这个边界读成 provenance 证明）。R24 的
     ``MarketDataReading`` / ``MarketDataSnapshot`` 是**公开 dataclass**，因此
@@ -340,8 +528,8 @@ class ResearchEvidenceRef:
     * 调用方**不能提供 identity** —— ``source_id`` 由 reading 派生
       （``policy | kind | subject @ observed_at``），所以同一份事实无法被改名成
       FACT_A / FACT_B / FACT_C 绕过去重与冲突检测，两只不同股票也不会撞成一条；
-    * 本层**没有独立的 ``verification`` 参数** —— verification 逐字复制自 supplied
-      reading 的投影，R27 无从自行发明一个核验结论；
+    * 本层**没有独立的 ``verification`` 参数** —— 核验结论来自 supplied reading 的
+      投影，且由 market factory 归口，R27 无从自行发明一个核验结论；
     * AI 代码里不再出现自由形式的核验字符串。
 
     **不要把第二点读成"核验结论可信"。** 准确表述是：R27 factory 没有独立的
@@ -360,8 +548,7 @@ class ResearchEvidenceRef:
     source_type: str
     source_id: str
     as_of: str
-    verification: str = MDC.VERIFICATION_NOT_ATTEMPTED
-    verification_method: str = MDC.VERIFICATION_METHOD_NONE
+    owner_verification: OwnerVerification
     detail: Mapping[str, Any] = field(default_factory=dict)
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
@@ -387,31 +574,72 @@ class ResearchEvidenceRef:
         object.__setattr__(
             self, "as_of", _required_day(self.as_of, what=f"{source_type} evidence"),
         )
-        verification, method = _owner_verification_pair(
-            self.verification, self.verification_method,
-        )
-        object.__setattr__(self, "verification", verification)
-        object.__setattr__(self, "verification_method", method)
+        if not isinstance(self.owner_verification, OwnerVerification):
+            raise TypeError(
+                "research evidence requires an OwnerVerification; got "
+                f"{type(self.owner_verification).__name__} — 核验结论必须由 owner 的 "
+                "factory 发布，而不是由调用方传一个同名字段的对象"
+            )
         object.__setattr__(
             self, "detail", _deep_freeze(self.detail, what="research evidence detail"),
         )
 
-    # ---------- fact-level questions only ----------
+    # ---------- owner-neutral fact-level questions ----------
+
+    @property
+    def is_verified(self) -> bool:
+        """这条事实是否通过**它自己那个 owner** 的核验。
+
+        research hypothesis 只消费这一项 —— 它**不是** ``verification == "verified"``
+        的字符串比较，因此 market / execution / news 各自的状态词不会互相污染。
+        """
+        return self.owner_verification.is_verified
+
+    @property
+    def verification_attributes(self) -> Mapping[str, Any]:
+        """owner-specific 的不可变附加维度（research core 不解释其语义）。"""
+        return self.owner_verification.attributes
+
+    @property
+    def verification(self) -> str:
+        """这条事实的**owner-native 状态词**（兼容读法）。
+
+        对 ``market_data`` 它与 B2C-2 之前逐字相同（R24 的状态词）；对其它 owner 它是
+        该 owner 自己的状态词。**research core 不比较这个字符串** —— 判据是
+        :attr:`is_verified`。保留它是因为读侧 / 前端 / 持久化投影都在用它做展示与审计。
+        """
+        return self.owner_verification.status
+
+    @property
+    def verification_method(self) -> str | None:
+        """**market 兼容语义，不是通用 owner 维度。**
+
+        R24 的 ``verified`` 可能来自 ``cross_source`` 或 ``coverage_integrity``，因此
+        需要双源保证的消费者必须同时读这一项。它**只对 market 事实有定义**：对非
+        ``market_data`` 来源返回 ``None``（明确的"不适用"），而不是填
+        ``MDC.VERIFICATION_METHOD_NONE`` —— 那个值本身属于 market 词表，用它表示
+        "非 market owner" 会把别的 owner 重新塞回 market 的坐标系。
+        """
+        if self.source_type != EVIDENCE_SOURCE_MARKET_DATA:
+            return None
+        return self.owner_verification.attributes.get("verification_method")
 
     @property
     def cross_source_verified(self) -> bool:
-        """是否**真的**通过了逐票多源交叉核验（判据委托给 R24 authority）。
+        """**market-only 兼容问题**：这条事实是否真的通过了逐票多源交叉核验。
 
-        读它而不是比较 ``verification == "verified"``：R24 的 ``verified`` 也可能来自
-        ``coverage_integrity``（快照完整且覆盖达标），那不是逐票第二源。
+        判据由 market factory 委托 R24 的 :func:`market_data_contract.is_cross_source_verified`
+        （本层不比较 ``verification == "verified"``：``coverage_integrity`` 的
+        ``verified`` 不是逐票第二源）。
+
+        对非 ``market_data`` 来源返回 ``False``，且**这必须被正确理解**：``False``
+        不代表"那条 execution 事实的核验失败"，只代表"这不是一条 market
+        cross-source claim"。将来要求 execution / news 提供这个字段是把 market 语义
+        强加给别的 owner。
         """
-        return MDC.is_cross_source_verified(
-            MDC.MarketDataSnapshot(
-                kind="research_evidence",
-                verification=self.verification,
-                verification_method=self.verification_method,
-            )
-        )
+        if self.source_type != EVIDENCE_SOURCE_MARKET_DATA:
+            return False
+        return bool(self.owner_verification.attributes.get("cross_source_verified"))
 
     def identity(self) -> tuple[str, str, str]:
         """让两条引用指向**同一条事实**的字段。
@@ -424,18 +652,32 @@ class ResearchEvidenceRef:
     def fact_state(self) -> tuple:
         """这条事实被 owner 观测到的**事实内容**状态（用于冲突检测）。
 
-        刻意只取三个事实维度：核验结论、核验方式、内容指纹。**不**包含 ``status`` 那种
-        reading 级展示判定 —— 同一份快照在不同 ``now`` 下可能是 fresh 或 stale，那属于
-        时效而非"事实变了"，不该触发 :class:`EvidenceConflict`。
+        **owner-neutral**：核验维度取 owner 发布的整个
+        :meth:`OwnerVerification.canonical`（三态结论 + owner 状态词 + owner-specific
+        attributes），而不是 market 的 ``(verification, verification_method)`` 那一对。
+        因此"同一 identity + owner 核验状态不同 → :class:`EvidenceConflict`"对任何
+        owner 都成立，而 market 的
+        ``verified + cross_source`` vs ``verified + coverage_integrity`` 仍然算冲突
+        （attributes 参与了 canonical form）。
+
+        刻意**不**包含 ``status`` 那种 reading 级展示判定 —— 同一份快照在不同 ``now``
+        下可能是 fresh 或 stale，那属于时效而非"事实变了"。
         """
         return (
-            self.verification,
-            self.verification_method,
+            self.owner_verification.canonical(),
             self.detail.get("content_fingerprint"),
         )
 
     def projection(self) -> dict[str, Any]:
-        """给 API / 前端的稳定投影：只 render，不重算核验语义。"""
+        """给 API / 前端的稳定投影：只 render，不重算核验语义。
+
+        已有 market key/value 刻意**逐字不变**（``verification`` /
+        ``verification_method`` / ``cross_source_verified``），B2C-2 只做 additive：
+        新增 ``is_verified`` 与 ``verification_attributes`` 两个 owner-neutral 维度。
+        非 market 事实的 ``verification_method`` 是 ``None``，``cross_source_verified``
+        是 ``False`` —— 见 :attr:`verification_method` 的说明，它们是 market-only
+        问题而不是通用核验结论。
+        """
         return {
             "source_type": self.source_type,
             "source_id": self.source_id,
@@ -443,6 +685,8 @@ class ResearchEvidenceRef:
             "verification": self.verification,
             "verification_method": self.verification_method,
             "cross_source_verified": self.cross_source_verified,
+            "is_verified": self.is_verified,
+            "verification_attributes": _plain(self.owner_verification.attributes),
         }
 
 
@@ -524,19 +768,21 @@ def _market_evidence_identity(reading: Any) -> tuple[str, str, str]:
 
 def _issue_evidence_ref(
     *, source_type: str, source_id: Any, as_of: Any,
-    verification: Any, verification_method: Any, detail: Mapping[str, Any],
+    owner_verification: OwnerVerification, detail: Mapping[str, Any],
 ) -> ResearchEvidenceRef:
-    """签发一个 ref。只有本模块的 market-evidence adapter 调用它。
+    """签发一个 ref。只有本模块的 owner factory 调用它。
 
     绕过 ``__init__``（它恒抛错）并在设置完全部字段后跑 ``__post_init__``，
     使校验逻辑仍然只有一份、且紧挨字段定义。
+
+    ``owner_verification`` 是**必须**的具名参数：调用方不能靠省略它来签发一条"没有核验
+    结论"的证据，也不能靠传一个 duck-typed 对象绕过 :class:`OwnerVerification` 的校验。
     """
     ref = object.__new__(ResearchEvidenceRef)
     object.__setattr__(ref, "source_type", source_type)
     object.__setattr__(ref, "source_id", source_id)
     object.__setattr__(ref, "as_of", as_of)
-    object.__setattr__(ref, "verification", verification)
-    object.__setattr__(ref, "verification_method", verification_method)
+    object.__setattr__(ref, "owner_verification", owner_verification)
     object.__setattr__(ref, "detail", detail)
     ref.__post_init__()
     return ref
@@ -545,17 +791,19 @@ def _issue_evidence_ref(
 def evidence_ref_from_market_reading(reading: Any) -> ResearchEvidenceRef:
     """把 R24 的 typed projection 映射成 :class:`ResearchEvidenceRef`。
 
-    **唯一的 evidence 签发入口。** 要求 ``reading`` 是真正的
+    **market_data 的 owner factory。** 要求 ``reading`` 是真正的
     ``market_data_contract.MarketDataReading``（不是任何带 ``projection()`` 的
     duck-typed 对象），并从它派生全部身份与核验维度：
 
     * ``source_id`` / ``as_of`` / 内容指纹由 :func:`_market_evidence_identity` 从
       **reading 自身**派生（policy + kind + subject + 观测时点），**调用方不提供** ——
       因此既无法把一份事实改名成多条，也无法对两只不同股票造出同一个 identity；
-    * ``verification`` / ``verification_method`` 逐字复制自 reading：本层**没有**独立的
-      ``verification`` 参数，因此调用方不能通过本层把 ``single_source`` 声明成
-      ``verified``。注意这**不等于**"这条事实一定由 owner 产生" —— 见
-      :class:`ResearchEvidenceRef` 的已知限制。
+    * 核验维度由 :func:`_market_owner_verification` 归口成 owner-neutral 的
+      :class:`OwnerVerification`：R24 仍然是**唯一**的 market 核验 authority
+      （合法性、``cross_source_verified`` 全部问它），本层只把它的状态词映射到中性三态。
+
+    注意这**不等于**"这条事实一定由 owner 产生" —— 见
+    :class:`ResearchEvidenceRef` 的已知限制。
 
     刻意**没有** ``source_id`` 参数：一个由调用方命名的 identity 不是 identity，
     而是一个可以被用来绕过去重与冲突检测的自由字符串。
@@ -572,10 +820,7 @@ def evidence_ref_from_market_reading(reading: Any) -> ResearchEvidenceRef:
         source_type=EVIDENCE_SOURCE_MARKET_DATA,
         source_id=source_id,
         as_of=as_of or projection.get("observed_at"),
-        verification=projection.get("verification") or MDC.VERIFICATION_NOT_ATTEMPTED,
-        verification_method=(
-            projection.get("verification_method") or MDC.VERIFICATION_METHOD_NONE
-        ),
+        owner_verification=_market_owner_verification(projection, reading.snapshot),
         detail={
             "observed_at": projection.get("observed_at"),
             "policy": projection.get("policy"),
@@ -645,12 +890,31 @@ class InformationEvent:
 
     @property
     def verification(self) -> str:
-        """这条事实的核验状态 —— **继承**自证据引用，AI 层无权改写。"""
+        """这条事实的核验状态 —— **继承**自证据引用，AI 层无权改写。
+
+        owner-native：market 事实是 R24 的状态词，其它 owner 是它自己的状态词。
+        """
         return self.evidence_ref.verification
 
     @property
-    def verification_method(self) -> str:
+    def verification_method(self) -> str | None:
+        """**market 兼容属性**：R24 的 ``verified`` 通过哪套 policy 得到。
+
+        对非 ``market_data`` 事实返回 ``None`` —— 它不是一个通用 owner 维度，让
+        execution / news 提供它就是把 market 语义强加给别的 owner。owner-neutral 的
+        核验维度请读 :attr:`is_verified` / :attr:`verification_attributes`。
+        """
         return self.evidence_ref.verification_method
+
+    @property
+    def is_verified(self) -> bool:
+        """owner 是否判定这条事实通过了它自己那套核验（owner-neutral）。"""
+        return self.evidence_ref.is_verified
+
+    @property
+    def verification_attributes(self) -> Mapping[str, Any]:
+        """owner-specific 的不可变核验维度（research core 不解释其语义）。"""
+        return self.evidence_ref.verification_attributes
 
     def projection(self) -> dict[str, Any]:
         return {
@@ -660,6 +924,7 @@ class InformationEvent:
             "evidence_id": self.evidence_id,
             "verification": self.verification,
             "verification_method": self.verification_method,
+            "is_verified": self.is_verified,
             "evidence": self.evidence_ref.projection(),
         }
 
@@ -694,8 +959,14 @@ class HypothesisEvidence:
 
     @property
     def is_verified(self) -> bool:
-        """这条事实本身是否通过 owner 的核验（fact level）。"""
-        return self.ref.verification == MDC.VERIFICATION_VERIFIED
+        """这条事实本身是否通过 owner 的核验（fact level）。
+
+        **判据完全来自 owner 的发布结果**（``ref.is_verified`` → ``OwnerVerification``），
+        不是 ``verification == MDC.VERIFICATION_VERIFIED`` 这种 market 字符串比较。因此
+        execution / news / adaptive 的核验结论不需要翻译成 market 词就能进入假设判定，
+        而 market 的行为逐字不变。
+        """
+        return self.ref.is_verified
 
     @property
     def bears_on_thesis(self) -> bool:
@@ -729,7 +1000,7 @@ def _normalise_evidence(items: Any) -> tuple[HypothesisEvidence, ...]:
     for identity, group in grouped.items():
         states = [entry.ref.fact_state() for entry in group]
         if any(state != states[0] for state in states):
-            seen = sorted({entry.ref.verification for entry in group})
+            seen = sorted({entry.ref.owner_verification.status for entry in group})
             raise EvidenceConflict(
                 f"conflicting evidence for {identity[0]}:{identity[1]}@{identity[2]}: "
                 f"owner reports {seen} — 同一条事实的状态互相矛盾时 fail closed，"
@@ -774,14 +1045,15 @@ def _derive_status(
         return HYPOTHESIS_SUPPORTED, None
 
     # 没有可信的 supports / contradicts。依次区分三种不同的"不足以判断"：
-    # 1. owner 自己都没核验成功（disagreement / unavailable）—— 障碍最根本；
+    # 1. owner 自己都没核验成功（源不可用 / 多源否证）—— 障碍最根本；
     # 2. 有 supports 关系，但那条事实未通过核验（单源 / 从未核验）；
     # 3. 事实可信，却没有一条与 thesis 相关（例如只有 context）。
     # 三者都不足以判断，但给用户的原因必须准确且互不相同。
-    if any(
-        e.ref.verification in (MDC.VERIFICATION_UNAVAILABLE, MDC.VERIFICATION_DISAGREEMENT)
-        for e in evidence
-    ):
+    #
+    # 第 1 条读的是 owner-neutral 的 ``source_unusable`` 结论，**不是**
+    # ``verification in (MDC.VERIFICATION_UNAVAILABLE, MDC.VERIFICATION_DISAGREEMENT)``
+    # —— 后者是 market 词表，会让其它 owner 的"核验源不可用"永远识别不出来。
+    if any(e.ref.owner_verification.source_unusable for e in evidence):
         return HYPOTHESIS_INSUFFICIENT_EVIDENCE, RESEARCH_REASON_EVIDENCE_UNAVAILABLE
     if any(e.relation == RELATION_SUPPORTS for e in evidence):
         return HYPOTHESIS_INSUFFICIENT_EVIDENCE, RESEARCH_REASON_EVIDENCE_NOT_VERIFIED

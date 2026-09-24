@@ -968,9 +968,14 @@ strong/weak/uncertain 等评分档位：本轮不做评分模型，也没有 `qu
 ```text
 source_id  ←  policy | kind | subject @ observed_at   （调用方不提供）
 as_of      ←  reading 的 as_of / observed_at          （调用方不覆盖）
-verification / verification_method  ←  逐字复制自 reading 投影
+owner_verification                  ←  market owner factory 归口的 owner-neutral 值对象
+                                      （outcome / status / attributes）
 content_fingerprint                 ←  snapshot 事实性字段的稳定指纹
 ```
+
+R27-B2C-2 之前这里是 `verification / verification_method`（逐字复制自 reading 投影）——
+一对 **market 形状**的字段。它已被 `owner_verification` 取代，那两个字段降级为**派生
+只读的 market 兼容视图**（见下文 "research core 消费 owner-native verification"）。
 
 `source_id` **不接受**调用方传参：一个由调用方命名的 identity 不是 identity，而是
 一个能被用来把同一份事实改名成 FACT_A / FACT_B / FACT_C 从而绕过去重与冲突检测的
@@ -1003,8 +1008,9 @@ content_fingerprint                 ←  snapshot 事实性字段的稳定指纹
 在本层是**可以通过**的 —— 伪造只是从一步变成两步。本层真正保证的是：
 
 * 调用方**不能提供 identity**，所以同一份事实无法被改名绕过去重 / 冲突检测；
-* 本层**没有独立的 `verification` 参数** —— verification 逐字复制自 supplied
-  reading 的投影，R27 无从自行发明一个核验结论；
+* 本层**没有独立的 `verification` 参数** —— 核验结论来自 supplied reading 的投影，
+  并由 **market owner factory** 归口成 `OwnerVerification`（R27-B2C-2 起），R27 无从
+  自行发明一个核验结论；
 * AI 代码里不再出现自由形式的核验字符串。
 
 准确说法是：**R27 factory 没有独立的 `verification` 参数，它逐字复制 supplied R24
@@ -1032,7 +1038,7 @@ identity 是 `(source_type, source_id, as_of)`，其中 `source_id` 由 reading 
 同一条 evidence 同时两种 relation      → EvidenceRelationConflict
 ```
 
-冲突判定只取**事实维度**（verification / verification_method / 内容指纹），
+冲突判定只取**事实维度**（owner 发布的核验结论 + owner-specific 属性 + 内容指纹），
 **不含** `status` 那种 reading 级展示判定 —— 同一份快照在不同 `now` 下可能是 fresh 或
 stale，那属于时效而非"事实变了"。
 
@@ -1047,7 +1053,7 @@ stale，那属于时效而非"事实变了"。
 有 verified contradicts              → unsupported / evidence_contradicted
 有 verified supports 且无 contradicts → supported
 有 supports 但该事实未通过核验        → insufficient_evidence / evidence_not_verified
-owner 核验失败或来源不可用            → insufficient_evidence / evidence_unavailable
+owner 核验源不可用 / 多源否证          → insufficient_evidence / evidence_unavailable
 事实可信但无一与 thesis 相关（context）→ insufficient_evidence / no_supporting_evidence
 ```
 
@@ -1725,15 +1731,20 @@ dataclass，因此
 
 ### owner-native verification（第 2 层的关键约束）
 
-research 契约当前把 `(verification, verification_method)` 绑定到 R24 的市场词表
-（`_owner_verification_pair` 构造 `MarketDataSnapshot` 让 R24 拒绝非法组合）。
+**B2C-2 之前**，research 契约把 `(verification, verification_method)` 绑定到 R24 的市场
+词表（`_owner_verification_pair` 构造 `MarketDataSnapshot` 让 R24 拒绝非法组合）。
 **这不能被复制到其它 owner**：给 execution / news / adaptive / runtime 各抄一份
 `VERIFICATIONS` / `VERIFICATION_METHODS` / `_VERIFICATION_METHODS_BY_STATE`，
 最终只会得到四五套平行契约。
 
 正确方向是让每个 owner 发布**自己语义**的核验闭集（execution 已经有自己的四态
 `execution_status` + 证据来源 + `EXECUTION_VERIFICATION_VERSION`），再由 research 契约
-学会消费 **owner-native verification** —— 而不是让所有 owner 伪装成 market_data。
+消费 **owner-native verification** —— 而不是让所有 owner 伪装成 market_data。
+
+**B2C-1 + B2C-2 已经走完这条方向的前两步**：execution 发布了 owner-native 核验声明
+（B2C-1），research 契约的 canonical 存储改为 owner-neutral 的 `OwnerVerification`
+（B2C-2，见下文 "research core 消费 owner-native verification"）。
+剩下的**接线**（execution → `ResearchEvidenceRef` adapter）属于 B2C-3，本轮未开始。
 
 ### 第一个 owner contract：execution（R27-B2C-1）
 
@@ -1789,6 +1800,68 @@ owner-origin provenance              = OPEN / REQUIRED
 它**不**改 `ResearchEvidenceRef`、**不**加 adapter、**不**让 research 层读 execution：
 `verification_from_evidence` 的结论要进入 research，仍然需要 B2C-2（research 契约学会
 消费 owner-native 核验）与 B2C-3（adapter）。路线没有缩短。
+
+### research core 消费 owner-native verification（R27-B2C-2）
+
+B2C-1 让 execution 发布了 owner-native 核验声明，但 research 契约当时**还认不出**它：
+`ResearchEvidenceRef` 直接携带 `verification` / `verification_method`（一对 **market
+形状**的字段），而 `_owner_verification_pair()` 实际只会问 `MarketDataSnapshot` 是否合法。
+于是 execution / news / adaptive / runtime 想进入 research 时只剩两个错误选择：
+
+```text
+1. 假装自己是 market_data；
+2. 把自己的核验结论**翻译**成 market 词 —— 由非 owner 发明核验结论。
+```
+
+B2C-2 消除这个结构性耦合：canonical 存储不再是那一对 market 字段，而是 owner 自己发布的
+`OwnerVerification`。
+
+```text
+OwnerVerification
+    outcome      三态，owner-neutral，research **唯一**消费的判据
+                 verified / unverified / source_unusable
+    status       owner 自己的状态词，逐字保留；research **不解释**、不比较
+    attributes   owner-specific 不可变维度（research 只保存 / 投影 / 参与冲突检测）
+
+ResearchEvidenceRef
+    canonical:      owner_verification（不是 verification + verification_method）
+    compatibility:  verification / verification_method / cross_source_verified（派生只读）
+```
+
+关键边界：
+
+* **research core 不解释 owner 的状态字符串。** `HypothesisEvidence.is_verified` 读的是
+  `ref.is_verified`（→ `OwnerVerification.outcome`），**不是**
+  `verification == MDC.VERIFICATION_VERIFIED`。因此 market 与 execution 可以各自使用
+  `"verified"` 而互不干扰，也不需要任何一方翻译成对方的词。
+* **market 的核验 authority 仍然完全在 R24。** `(verification, verification_method)`
+  的合法性问 R24；`cross_source_verified` 问 R24 的 `is_cross_source_verified`
+  （`coverage_integrity` 的 `verified` **不是**逐票双源）。本层只把 R24 的状态词**归口**
+  到中性三态，不替代它的判定。
+* **market 校验器诚实命名。** 原来的 `_owner_verification_pair()` 实际只认识 R24 词表，
+  已改名为 `_market_verification_pair()`，market 的归口函数是
+  `_market_owner_verification()`。把 market 专属校验叫作"owner verification"会重新
+  制造一个假的通用抽象。
+* **market 兼容面逐字不变。** `verification` / `verification_method` /
+  `cross_source_verified` 三个读法对 `source_type == market_data` 的行为与 B2C-2 之前
+  完全一致；投影只做 additive（新增 `is_verified` / `verification_attributes`）。
+  对非 market 事实，`verification_method` 是 `None`（明确的"不适用"）而**不是**
+  `MDC.VERIFICATION_METHOD_NONE` —— 后者本身属于 market 词表，用它表示"非 market
+  owner"会把别的 owner 重新塞回 market 坐标系。`cross_source_verified` 为 `False`，
+  含义是"这不是一条 market cross-source claim"，**不是**"那条事实核验失败"。
+* **冲突检测 owner-neutral。** `fact_state` 取 `OwnerVerification.canonical()`（三态 +
+  owner 状态词 + attributes）与内容指纹。于是 market 的
+  `verified + cross_source` vs `verified + coverage_integrity` 仍然算冲突（attributes
+  参与 canonical form），而"同一 identity + owner 核验状态不同 → `EvidenceConflict`"
+  对任何 owner 都成立。freshness 依旧**不**进入事实冲突（R27-A 的永久不变量）。
+* **签发边界不放宽。** `_issue_evidence_ref` 现在**要求**一个真正的 `OwnerVerification`
+  （duck-typed 对象被拒），`ResearchEvidenceRef` 仍无公开构造器；公开 evidence factory
+  仍然**只有** `market_data` 一个 —— 本轮不登记 execution adapter。
+
+**owner-origin provenance 仍然 OPEN / REQUIRED**：owner-neutral 化让"能携带谁的核验"
+变成能力问题，但**没有**证明输入对象真的由该 owner 产生。`MarketDataReading` /
+`ExecutionEvidence` 都仍是公开可构造的，两步伪造路径照旧，必须由 owner/provenance
+架构继续关闭。
 
 
 ## 目标依赖方向
