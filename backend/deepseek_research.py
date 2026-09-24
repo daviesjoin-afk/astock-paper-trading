@@ -45,13 +45,34 @@ def _hash(evidence):
 
 
 def _latest_data_quality(adaptive_conn):
-    row = adaptive_conn.execute(
-        "SELECT evidence,report,status,finished_at FROM adaptive_advisor_runs WHERE purpose='data_quality' ORDER BY id DESC LIMIT 1"
-    ).fetchone()
+    """最近一次市场数据质量研究 —— R27-B2B 起读 **canonical** research ledger。
+
+    ``data_quality`` 这个 purpose 的 writer 已经迁到 ``ai_research_runs``（见
+    ``deepseek_advisor.run_review``），所以这里改读 canonical 台账。读入口只有一处
+    （``deepseek_advisor.latest_data_quality_research``），避免两个读侧各自实现
+    "最近一条"而漂移。
+
+    **shape 变化是刻意的，也是可观察的**：canonical 台账存的是 typed
+    ``ResearchHypothesis`` 投影，不是 legacy 的聚合 evidence blob，因此
+    ``evidence`` 换成 ``hypothesis`` + ``report``。``incident_triage`` 送给模型的
+    输入因此从"上一轮证据聚合"变成"上一轮的研究推理"。
+
+    损坏的 canonical 行**不**被静默降级成 ``not_run``：``recent_runs`` 会对损坏
+    fail closed，把"读不出来"伪装成"没有研究结论"正好是数据损坏变成业务结论的路径。
+    """
+    row = advisor.latest_data_quality_research(adaptive_conn)
     if not row:
         return {"status": "not_run", "evidence": {}, "report": {}}
-    return {"status": row["status"], "finished_at": row["finished_at"],
-            "evidence": _loads(row["evidence"], {}), "report": _loads(row["report"], {})}
+    return {
+        "status": row["status"],
+        "finished_at": row["created_at"],
+        "as_of": row["as_of"],
+        "hypothesis": row["hypothesis"],
+        "report": advisor.research_report_view_from_row(row),
+        "authority": "research",
+        "is_authoritative": False,
+        "source": "canonical_research_ledger",
+    }
 
 
 def _pnl_evidence(adaptive_conn, paper_db_path):

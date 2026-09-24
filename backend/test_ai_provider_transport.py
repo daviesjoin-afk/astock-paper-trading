@@ -1044,6 +1044,8 @@ RESEARCH_MODULE = "ai_research_provider.py"
 TRANSPORT_MODULE = "ai_provider_transport.py"
 #: R27-B2A 的 canonical research 持久化 owner（**不是** authority，也不联网）。
 REPOSITORY_MODULE = "ai_research_repository.py"
+#: R27-B2B 的研究 orchestration boundary（**不是** authority，也不联网，不 import 契约）。
+SERVICE_MODULE = "ai_research_service.py"
 
 ALLOWED_RESEARCH_IMPORTS = {
     "__future__", "collections", "dataclasses", "typing", "json",
@@ -1116,8 +1118,9 @@ class AiResearchProviderArchitectureGuardTests(unittest.TestCase):
         self.assertIn("urllib", _imported_roots(transport_tree))
         self.assertIn("urlopen", _called_names(transport_tree))
 
-        # research contract / typed adapter / persistence owner 都没有直接网络调用。
-        for name in (RESEARCH_MODULE, REPOSITORY_MODULE):
+        # research contract / typed adapter / persistence owner / orchestration boundary
+        # 都没有直接网络调用。
+        for name in (RESEARCH_MODULE, REPOSITORY_MODULE, SERVICE_MODULE):
             source = _source(name)
             for token in ("urllib", "urlopen", "requests.", "httpx", "socket."):
                 with self.subTest(module=name, token=token):
@@ -1130,7 +1133,7 @@ class AiResearchProviderArchitectureGuardTests(unittest.TestCase):
             for imported in _imported_names(_tree(name)):
                 if imported.split(".")[0] in ("ai_research_contract", "ai_research_provider",
                                               "ai_provider_transport",
-                                              "ai_research_repository"):
+                                              "ai_research_repository", "ai_research_service"):
                     offenders.append(f"{name}: import {imported}")
         self.assertEqual(
             [], offenders,
@@ -1141,8 +1144,13 @@ class AiResearchProviderArchitectureGuardTests(unittest.TestCase):
         """RG-05：research contract 的生产消费者集合是**显式登记**的闭集。
 
         R27-B1 是 ``ai_research_provider``（typed research producer），R27-B2A 增加
-        ``ai_research_repository``（typed research persistence consumer）。用等值断言
-        而不是"不含"断言：多出任何一个消费者都必须是一次有意识的决定。
+        ``ai_research_repository``（typed research persistence consumer），R27-B2B 增加
+        ``deepseek_advisor``（``data_quality`` runtime 的**调用方** —— 它自己从 R24
+        reading 签发 typed ``InformationEvent``）。用等值断言而不是"不含"断言：多出
+        任何一个消费者都必须是一次有意识的决定。
+
+        ``ai_research_service`` 刻意**不**在这里：orchestration boundary 只依赖 provider
+        与 repository，不 import 契约。
         """
         offenders = []
         for name in sorted(os.listdir(BACKEND)):
@@ -1154,7 +1162,8 @@ class AiResearchProviderArchitectureGuardTests(unittest.TestCase):
                 if imported.split(".")[0] == "ai_research_contract":
                     offenders.append(name)
         self.assertEqual(
-            sorted(set(offenders)), [RESEARCH_MODULE, REPOSITORY_MODULE],
+            sorted(set(offenders)),
+            [RESEARCH_MODULE, REPOSITORY_MODULE, "deepseek_advisor.py"],
             f"research contract 的生产消费者集合发生变化：{sorted(set(offenders))}",
         )
 
@@ -1199,12 +1208,14 @@ class AiResearchProviderArchitectureGuardTests(unittest.TestCase):
                 self.assertNotIn(token, research_source)
 
         # 本轮 provider 链路里，真实 urlopen 只允许出现在 transport。
-        # 链路 = R27-A 契约 + transport + adapter + 已完成迁移的 ai_review_service。
-        # 历史遗留模块（deepseek_advisor / deepseek_research / ai_analysis /
-        # disclosure_timeline / main）本轮**刻意不动**，留给 R27-B2；它们不在本
-        # 断言的范围内，否则这条 guard 会变成"顺手重写历史"的借口。
+        # 链路 = R27-A 契约 + transport + adapter + 已完成迁移的 ai_review_service
+        #        + R27-B2B 的 orchestration boundary（它**必须**不联网）。
+        # 历史遗留模块（dual_ai_tuner / adaptive_engine / deepseek_research /
+        # ai_analysis / disclosure_timeline / main）不在本断言的范围内；其中
+        # deepseek_advisor 参与了 R27-B2B 的**读侧**接线，但它保留的 urlopen 属于
+        # 尚未迁移的 tuner 路径（call_json），因此它同样不在这个链里。
         chain = (TRANSPORT_MODULE, RESEARCH_MODULE, "ai_research_contract.py",
-                 "ai_review_service.py")
+                 SERVICE_MODULE, REPOSITORY_MODULE, "ai_review_service.py")
         owners = [name for name in chain if "urlopen" in _called_names(_tree(name))]
         self.assertEqual([TRANSPORT_MODULE], owners,
                          f"provider 链路里网络 owner 不再唯一：{owners}")

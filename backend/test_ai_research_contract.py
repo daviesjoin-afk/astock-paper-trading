@@ -117,11 +117,22 @@ AUTHORITY_MODULES = (
 #: ``ResearchHypothesis``。R27-B2A 新增**第二个**：``ai_research_repository`` ——
 #: typed research 的 append-only 持久化 owner。
 #:
-#: 两者都**不是** authority：provider 是 typed research producer，repository 是 typed
-#: research persistence consumer。authority 仍然不得反向 import 其中任何一个。
+#: R27-B2B 新增**第三个**：``deepseek_advisor`` —— 它原来就是 ``data_quality`` 这个
+#: purpose 的 writer，本轮把那条 runtime 迁到 typed 路径，因此它必须自己签发 typed
+#: ``InformationEvent``（从 R24 reading 派生）。这正是"迁移"与"静默扩散"的区别：
+#: 它从 legacy 消费者变成了 typed 消费者，并且必须在这里留下一条可审计的记录。
+#:
+#: 四个都**不是** authority：provider 是 typed research producer，repository 是 typed
+#: research persistence consumer，``deepseek_advisor`` 是 runtime caller。authority 仍然
+#: 不得反向 import 其中任何一个。
+#:
+#: 注意 ``ai_research_service`` **不**在这个集合里：orchestration boundary 只依赖
+#: provider 与 repository，刻意不 import 契约 —— 多一个消费者就多一份"两套规则必然
+#: 漂移"的风险。
 ALLOWED_AI_CONSUMERS: set[str] = {
     "ai_research_provider.py",
     "ai_research_repository.py",
+    "deepseek_advisor.py",
 }
 
 #: 时钟 / 随机数 / IO —— 研究契约一旦读它们，就能拿 current state 回填历史。
@@ -994,7 +1005,7 @@ class AiResearchArchitectureGuardTests(unittest.TestCase):
             for imported in _imported_names(_tree(name)):
                 if imported.split(".")[0] in (
                     "ai_research_contract", "ai_research_provider", "ai_provider_transport",
-                    "ai_research_repository",
+                    "ai_research_repository", "ai_research_service",
                 ):
                     offenders.append(f"{name}: import {imported}")
         self.assertEqual(
