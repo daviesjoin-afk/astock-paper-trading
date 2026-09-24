@@ -175,6 +175,12 @@ B2C-2 之后  OwnerVerification（outcome / status / attributes）
 因为它是 owner attributes）；market 兼容面逐字不变；market 校验器诚实改名为
 `_market_verification_pair`。
 
+**归口是显式穷尽表，不是 catch-all。** `_MARKET_OUTCOME_BY_VERIFICATION` 必须**恰好**
+覆盖 `MDC.VERIFICATIONS`，`_market_owner_verification()` 每次归口前做双向漂移检查
+（缺已知状态 / 多未知状态都拒绝）。因此 R24 新增合法状态时 research 层 **fail closed**，
+必须人工决定它归哪一态；**不会**静默落进 `else` 被当成 `unverified`。由 `RVERIFY-11`
+锁定（含"模拟 R24 新增状态必须拒绝"的行为用例）。
+
 **仍然没有解决的**：
 
 ```text
@@ -187,6 +193,19 @@ B2C-8  remaining deepseek_research typed convergence
 B2C-9  ai_analysis lifecycle convergence
 B2C-10 / B3  canonical research API/UI + 删除 B2B 兼容投影
 ```
+
+**记入 B2C-3 的一项（本轮非 blocker）**：`_issue_evidence_ref()` 今天在 production 里
+只有 `evidence_ref_from_market_reading()` 一个调用点（正确），#193 guard 保证契约**外**
+零调用；但"契约**内**只能由已批准 factory 调用"尚未被锁定（对比 #194 的 EXFACT-19）。
+当前没有实际越界，因此不作为 B2C-2 的 blocker。B2C-3 引入第二个 approved factory 时，
+应把 issuer caller set 做成**精确 allowlist**：
+
+```text
+B2C-2:  {evidence_ref_from_market_reading}
+B2C-3:  {evidence_ref_from_market_reading, evidence_ref_from_execution_projection}
+```
+
+只需 caller-set equality，不需要 CFG 分析。
 
 **owner-origin provenance 仍然 OPEN / REQUIRED。** owner-neutral 化解决的是"research 能
 携带谁的核验"（能力问题），**不是**"输入对象确实由该 owner 产生"（provenance 问题）：

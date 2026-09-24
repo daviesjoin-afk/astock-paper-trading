@@ -92,6 +92,38 @@ Nothing about market verification moved:
 
 `market_data_contract.py` is untouched.
 
+## Market outcome mapping is explicit and exhaustive (fail closed)
+
+`_MARKET_OUTCOME_BY_VERIFICATION` maps **every** R24 state to an owner-neutral outcome explicitly:
+
+```
+verified        → verified
+single_source   → unverified
+not_attempted   → unverified
+disagreement    → source_unusable
+unavailable     → source_unusable
+```
+
+and `_market_owner_verification()` checks **both directions** against `MDC.VERIFICATIONS` before classifying.
+
+This closed a real fail-open in an earlier revision of this branch. That version used a catch-all:
+
+```python
+if   verification == MDC.VERIFICATION_VERIFIED:            outcome = VERIFIED
+elif verification in (UNAVAILABLE, DISAGREEMENT):          outcome = SOURCE_UNUSABLE
+else:                                                      outcome = UNVERIFIED   # ← fail-open
+```
+
+Today's five R24 states happen to classify correctly, so the behaviour was invisible. But `_market_verification_pair()` accepts whatever R24 accepts, so a **future** valid R24 state would have silently fallen into `else` — research deciding the meaning of a state the owner never published a mapping for. That is the same class of coupling this PR exists to remove, just relocated.
+
+With the explicit table, "R24 adds a state" stops being a silent semantic invention and becomes a contract change that must be resolved by hand:
+
+```
+R24 adds a state  →  fail closed (ValueError naming the unmapped state)  →  human decides its outcome
+```
+
+`RVERIFY-11` locks it: exhaustive coverage, both drift directions RED, all three outcomes actually used (non-vacuity), and a behavioural case that **patches `MDC.VERIFICATIONS` to simulate R24 adding a state** and requires the mapping to refuse it. The catch-all shape is additionally rejected by an AST check (so docstrings explaining the rule do not trip it).
+
 ## Owner-neutral conflict detection
 
 `fact_state` now takes `OwnerVerification.canonical()` (outcome + status + attributes, deterministic and insertion-order independent) plus the content fingerprint.
@@ -175,7 +207,7 @@ second: python -m unittest test_ai_research_contract test_ai_provider_transport 
         → 213 tests OK
 ```
 
-`backend/test_ai_research_contract.py` gained the `RVERIFY-*` group (10 tests):
+`backend/test_ai_research_contract.py` gained the `RVERIFY-*` group (11 tests):
 
 - **RVERIFY-01** market ref compatibility surface is unchanged (all three legacy reads + projection key/values)
 - **RVERIFY-02** research verification does not depend on market status vocabulary — including a synthetic `source_type=execution`, `status="owner_verified"` fact whose status word is **deliberately not** `MDC.VERIFICATION_VERIFIED`
@@ -187,6 +219,7 @@ second: python -m unittest test_ai_research_contract test_ai_provider_transport 
 - **RVERIFY-08** non-market verification does not require a market method (None, not `"none"`)
 - **RVERIFY-09** `ResearchEvidenceRef` still has no public constructor; the issuer requires a real `OwnerVerification`
 - **RVERIFY-10** private issuer / factory registry boundary unchanged (exactly one issuer call site, factory set not expanded)
+- **RVERIFY-11** market outcome mapping exhaustively covers `MDC.VERIFICATIONS`; missing/extra state → RED; simulated "R24 adds a state" → fail closed; no catch-all fallback
 
 `AI_TYPED_02` was updated to exercise the market validator at its new honest name — same assertion (illegal `verified` + `none` pair fails closed), now pointed at the market-specific factory.
 
@@ -195,7 +228,7 @@ second: python -m unittest test_ai_research_contract test_ai_provider_transport 
 `work/r27b2c2_owner_native_verification_mutation_check.py`:
 
 ```
-7/7 CAUGHT, survived=0, fake=0, restore sha256 PASS
+9/9 CAUGHT, survived=0, fake=0, restore sha256 PASS
 ```
 
 - M-RVERIFY-1 — `HypothesisEvidence.is_verified` goes back to `verification == MDC.VERIFICATION_VERIFIED`
@@ -205,13 +238,15 @@ second: python -m unittest test_ai_research_contract test_ai_provider_transport 
 - M-RVERIFY-5 — owner verification attributes stop being deep-frozen
 - M-RVERIFY-6 — non-market ref is forced to carry `MDC.VERIFICATION_METHOD_NONE`
 - M-RVERIFY-7 — market `cross_source_verified` stops delegating to R24
+- M-RVERIFY-8 — the explicit exhaustive mapping reverts to a catch-all `else`
+- M-RVERIFY-9 — the vocabulary drift check is removed (new R24 state passes silently)
 
 Each mutation is anchored exactly once; `--non-vacuity` runs the baseline first; `SyntaxError` / `ImportError` / `NameError` count as FAKE, not caught.
 
 ## Verification
 
-- targeted suites `66/66` and `213/213` PASS
-- full backend suite `4393 tests OK (skipped=5)`
+- targeted suites `67/67` and `214/214` PASS
+- full backend suite `4394 tests OK (skipped=5)`
 - key suites re-run on Python 3.11 and 3.12: `167/167` PASS each
 - `ruff check backend` clean (ruff 0.16.6, the pinned CI version), `compileall` clean
 - leak scan (worktree) `0 findings`
@@ -241,6 +276,15 @@ B2C-10 canonical research API/UI + delete the B2B compatibility projection
 ```
 
 Also unchanged: rejected/cancelled execution facts still have no owner-recorded business day, so `business_day` remains `unknown` for them until the owner records one.
+
+**Recorded for B2C-3 (not a blocker this round).** `_issue_evidence_ref()` currently has exactly one production caller — `evidence_ref_from_market_reading()` — which is correct, and #193's guard proves zero calls outside the contract. What is not yet locked is the *inside* of the contract: that the issuer may only be called by an approved factory (the analogue of #194's EXFACT-19). There is no actual over-reach today, so it is not treated as a blocker. When B2C-3 adds the second approved factory, the issuer caller set should become an exact allowlist:
+
+```
+B2C-2:  {evidence_ref_from_market_reading}
+B2C-3:  {evidence_ref_from_market_reading, evidence_ref_from_execution_projection}
+```
+
+Caller-set equality only — no CFG analysis needed.
 
 Docs synced in the same commit: `ARCHITECTURE.md` (R27-A verification storage, conflict state, hypothesis reason table, new B2C-2 section, B2C-1 section's forward reference) and `docs/R27_B2C_EVIDENCE_OWNER_MATRIX.md` (prerequisite list now records B2C-1/B2C-2 as done while B2C-3 stays absent, maintainability metrics, stale line references corrected).
 

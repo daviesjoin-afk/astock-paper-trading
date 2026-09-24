@@ -1842,6 +1842,12 @@ ResearchEvidenceRef
   已改名为 `_market_verification_pair()`，market 的归口函数是
   `_market_owner_verification()`。把 market 专属校验叫作"owner verification"会重新
   制造一个假的通用抽象。
+* **归口是显式穷尽表，不是 catch-all。** `_MARKET_OUTCOME_BY_VERIFICATION` 必须**恰好**
+  覆盖 `MDC.VERIFICATIONS`，且 `_market_owner_verification()` 在每次归口前做**双向**
+  一致性检查（缺一个已知状态 / 多一个未知状态都拒绝）。因此 R24 未来新增一个合法状态
+  时，research 层会 **fail closed** 并要求人工决定它归哪一态，而**不是**让新状态静默落进
+  `else` 被当成 `unverified` —— 后者等于 research 替 owner 决定它自己的词是什么意思。
+  这条保证由 `RVERIFY-11` 锁定（含"模拟 R24 新增状态必须拒绝"的行为用例）。
 * **market 兼容面逐字不变。** `verification` / `verification_method` /
   `cross_source_verified` 三个读法对 `source_type == market_data` 的行为与 B2C-2 之前
   完全一致；投影只做 additive（新增 `is_verified` / `verification_attributes`）。

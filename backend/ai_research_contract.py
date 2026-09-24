@@ -457,6 +457,56 @@ def _canonical_attributes(value: Any) -> Any:
     return value
 
 
+#: R24 的**每一个**合法状态 → owner-neutral 三态的**显式穷尽**映射。
+#:
+#: 刻意是一张完整表，而不是 ``if/elif/else``：catch-all ``else`` 会让 R24 未来新增一个
+#: 合法状态时被 research 层**静默**归成 ``unverified`` —— 那正是"research 替 owner 决定
+#: 它自己的词是什么意思"，与本契约的核心原则直接冲突。显式表把这件事变成
+#: :func:`_market_owner_verification` 的 fail-closed 拒绝，从而要求**人工**决定新状态
+#: 如何归口（见 RVERIFY-11）。
+#:
+#: 与 :data:`_KIND_BY_SOURCE_TYPE` 同一手法：词表只有一份，一致性由构造期检查强制。
+_MARKET_OUTCOME_BY_VERIFICATION = {
+    # 通过了该 kind 的 verification policy（含 coverage_integrity）。
+    MDC.VERIFICATION_VERIFIED: OWNER_OUTCOME_VERIFIED,
+    # 有事实，但**没有**通过核验：单源证据，或本次读取根本没发起核验。
+    MDC.VERIFICATION_SINGLE_SOURCE: OWNER_OUTCOME_UNVERIFIED,
+    MDC.VERIFICATION_NOT_ATTEMPTED: OWNER_OUTCOME_UNVERIFIED,
+    # 核验**过程**没能做出判定：两个源互相否证，或核验源本身不可用。
+    # 与"没通过核验"必须分开，否则假设层给不出 ``evidence_unavailable`` 这个原因。
+    MDC.VERIFICATION_DISAGREEMENT: OWNER_OUTCOME_SOURCE_UNUSABLE,
+    MDC.VERIFICATION_UNAVAILABLE: OWNER_OUTCOME_SOURCE_UNUSABLE,
+}
+
+
+def _market_outcome_mapping_problems(
+    mapping: Mapping[str, str], verifications: Any,
+) -> list[str]:
+    """显式 outcome 映射与 owner 词表的**双向**一致性检查（纯函数）。
+
+    单独抽成纯函数，是为了让"缺一个已知状态"与"多一个未知状态"两个方向都能被**直接
+    测到**（见 RVERIFY-11 的非空性），而不是只能靠改 R24 源码来验 —— 与
+    ``test_ai_research_evidence_ownership_guard._registry_problems`` 同一手法。
+
+    两个方向都必须报问题：任何一处漂移都意味着"某个 owner 状态的含义"已经不再由人工
+    决定，而是由 research 层的默认分支决定。
+    """
+    problems: list[str] = []
+    missing = sorted(set(verifications) - set(mapping))
+    if missing:
+        problems.append(
+            f"owner 已有但没有登记 owner-neutral outcome 的状态：{missing}"
+            "（research 层不得替 owner 猜一个新状态的含义）"
+        )
+    unknown = sorted(set(mapping) - set(verifications))
+    if unknown:
+        problems.append(
+            f"outcome 映射里有 owner 已不认识的状态：{unknown}"
+            "（说明这张表与 owner 词表漂移了）"
+        )
+    return problems
+
+
 def _market_owner_verification(projection: Mapping[str, Any], snapshot: Any) -> OwnerVerification:
     """R24 投影 → owner-neutral 核验发布结果。**market owner 的 factory**。
 
@@ -466,21 +516,37 @@ def _market_owner_verification(projection: Mapping[str, Any], snapshot: Any) -> 
     2. ``cross_source_verified`` 问 R24 的 :func:`market_data_contract.is_cross_source_verified`
        —— 本层**不**比较 ``verification == "verified"``（``coverage_integrity`` 的
        ``verified`` 不是逐票双源）；
-    3. 把 R24 的状态词归到 owner-neutral 三态。
+    3. 把 R24 的状态词**按显式穷尽表**归到 owner-neutral 三态。
 
     第 3 步是本层唯一的解释行为，且方向是"把 owner 的词映射到中性结论"，**不是**
     "用中性结论替代 owner 判定"。research core 反过来看不到这张表。
+
+    **fail closed 是这里的关键性质。** 映射表必须**恰好**覆盖 :data:`MDC.VERIFICATIONS`：
+
+    * R24 新增一个合法状态 → ``_market_verification_pair`` 会放行它，但下表查不到 →
+      **拒绝**，而不是静默归成 ``unverified``。人工必须明确决定新状态归哪一态；
+    * 表里出现 R24 已不认识的状态 → 同样拒绝（说明这张表与 R24 漂移了）。
+
+    少了这条，"R24 加状态"会变成一次静默的语义发明；有了它，那是一次必须人工处理的
+    契约变更。这也是本模块唯一允许引入 owner 词表的地方，因此穷尽性必须在此强制。
     """
+    # 词表漂移在**构造期**就 fail closed，而不是等到某个新状态恰好出现在数据里。
+    # 这一步同时让下面的直接查表成为**全函数**：R24 词表被完整覆盖，且
+    # ``_market_verification_pair`` 已保证状态属于该词表。
+    problems = _market_outcome_mapping_problems(
+        _MARKET_OUTCOME_BY_VERIFICATION, MDC.VERIFICATIONS,
+    )
+    if problems:
+        raise ValueError(
+            "market verification vocabulary drifted from the explicit outcome mapping: "
+            + "; ".join(problems)
+        )
+
     verification, method = _market_verification_pair(
         projection.get("verification") or MDC.VERIFICATION_NOT_ATTEMPTED,
         projection.get("verification_method") or MDC.VERIFICATION_METHOD_NONE,
     )
-    if verification == MDC.VERIFICATION_VERIFIED:
-        outcome = OWNER_OUTCOME_VERIFIED
-    elif verification in (MDC.VERIFICATION_UNAVAILABLE, MDC.VERIFICATION_DISAGREEMENT):
-        outcome = OWNER_OUTCOME_SOURCE_UNUSABLE
-    else:
-        outcome = OWNER_OUTCOME_UNVERIFIED
+    outcome = _MARKET_OUTCOME_BY_VERIFICATION[verification]
     return OwnerVerification(
         outcome=outcome,
         status=verification,

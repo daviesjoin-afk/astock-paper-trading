@@ -28,6 +28,7 @@ import os
 import sys
 import unittest
 from collections.abc import Mapping
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -227,6 +228,42 @@ def _function_symbols(source: str, name: str) -> set[str]:
                 found.add(inner.id)
         return found
     raise AssertionError(f"{name} 不是 {CONTRACT_MODULE} 的顶层函数")
+
+
+def _assigned_names(nodes) -> set[str]:
+    """一组语句里被赋值的裸名（``x = ...`` / ``x += ...``）。"""
+    names: set[str] = set()
+    for node in nodes:
+        targets = []
+        if isinstance(node, ast.Assign):
+            targets = node.targets
+        elif isinstance(node, (ast.AugAssign, ast.AnnAssign)):
+            targets = [node.target]
+        for target in targets:
+            if isinstance(target, ast.Name):
+                names.add(target.id)
+    return names
+
+
+def _has_catch_all_outcome_fallback(source: str) -> bool:
+    """源码里是否存在"对 ``outcome`` 的 catch-all ``else`` 兜底"。
+
+    这正是被修掉的 fail-open 形状：
+
+        if   <cond A>: outcome = ...
+        elif <cond B>: outcome = ...
+        else:          outcome = UNVERIFIED      ← 静默替 owner 决定新状态的含义
+
+    判定方式是 AST 级的：找一个 ``orelse`` **非空**、且其直接语句里给 ``outcome``
+    赋值的 ``ast.If``（``elif`` 在 AST 里是嵌套的 ``If``，因此"最后那个裸 ``else``"
+    就是唯一满足该形状的节点）。文本搜索会误伤注释里解释"不要写 else 兜底"的文档。
+    """
+    for node in ast.walk(ast.parse(source)):
+        if not isinstance(node, ast.If) or not node.orelse:
+            continue
+        if "outcome" in _assigned_names(node.orelse):
+            return True
+    return False
 
 
 def _code_string_constants(tree: ast.Module) -> list[str]:
@@ -1229,6 +1266,90 @@ class OwnerNativeVerificationTests(unittest.TestCase):
             and node.func.id == "_issue_evidence_ref"
         ]
         self.assertEqual(1, len(issuer_calls), "契约里出现了第二个私有签发调用点")
+
+    def test_RVERIFY_11_market_outcome_mapping_is_exhaustive_and_fail_closed(self):
+        """RVERIFY-11：market outcome 映射必须**显式穷尽**，owner 新增状态即 fail closed。
+
+        这是 #195 的核心架构原则在 market 归口上的可执行形式：**owner 词表的含义由
+        owner 决定，research 不猜**。
+
+        曾经的实现是一个 catch-all ``else``：
+
+            if   verification == VERIFIED:       outcome = VERIFIED
+            elif verification in (UNAVAILABLE, DISAGREEMENT): outcome = SOURCE_UNUSABLE
+            else:                                outcome = UNVERIFIED   # ← fail-open
+
+        今天 R24 的五个状态恰好被正确分类，所以**行为上看不出来**。但
+        ``_market_verification_pair()`` 会让 R24 未来新增的合法状态通过，于是那个新状态
+        会自动落进 ``else`` —— research 层静默替 R24 决定了一个它没有发布过的语义。
+        这正是 B2C-2 要消除的那类耦合，只是换了个位置。
+
+        现在的实现是一张显式表 + 双向穷尽检查，因此"R24 加状态"从**静默语义发明**变成
+        **必须人工处理的契约变更**。
+        """
+        mapping = ARC._MARKET_OUTCOME_BY_VERIFICATION
+
+        # 1. 正向：映射恰好覆盖 R24 的词表（不多、不少）。
+        self.assertEqual(
+            set(MDC.VERIFICATIONS), set(mapping),
+            "market outcome 映射与 R24 的核验词表不一致 —— 新增/删除状态必须人工归口",
+        )
+        self.assertEqual([], ARC._market_outcome_mapping_problems(mapping, MDC.VERIFICATIONS))
+
+        # 2. 每个 R24 状态都真的映射到一个合法的 owner-neutral outcome。
+        for status in MDC.VERIFICATIONS:
+            with self.subTest(status=status):
+                outcome = mapping[status]
+                self.assertIn(outcome, ARC.OWNER_OUTCOMES)
+        # 非空性：三态都必须真的被用到，否则"穷尽"可能只是把一切都归到一态。
+        self.assertEqual(
+            set(ARC.OWNER_OUTCOMES), set(mapping.values()),
+            "三态没有被完整使用 —— 映射可能把所有状态压成了同一态",
+        )
+
+        # 3. 两个方向都必须 RED（纯函数直接可测，不依赖改 R24 源码）。
+        missing = ARC._market_outcome_mapping_problems(
+            {k: v for k, v in mapping.items() if k != MDC.VERIFICATION_SINGLE_SOURCE},
+            MDC.VERIFICATIONS,
+        )
+        self.assertTrue(missing, "缺一个已知状态未被发现")
+        self.assertTrue(any("没有登记" in item for item in missing))
+
+        extra = ARC._market_outcome_mapping_problems(
+            {**mapping, "brand_new_state": ARC.OWNER_OUTCOME_UNVERIFIED},
+            MDC.VERIFICATIONS,
+        )
+        self.assertTrue(extra, "映射里多一个未知状态未被发现")
+        self.assertTrue(any("已不认识" in item for item in extra))
+
+        # 4. 行为：**模拟 R24 新增一个合法状态**，归口必须 fail closed。
+        #    只 patch 词表（不动源码），从而证明这条保证真的挂在"词表穷尽性"上。
+        with mock.patch.object(
+            MDC, "VERIFICATIONS", (*MDC.VERIFICATIONS, "brand_new_state"),
+        ):
+            with self.assertRaises(ValueError) as caught:
+                ARC._market_owner_verification(
+                    {"verification": MDC.VERIFICATION_VERIFIED,
+                     "verification_method": MDC.VERIFICATION_METHOD_CROSS_SOURCE},
+                    None,
+                )
+            message = str(caught.exception)
+            self.assertIn("drifted", message)
+            self.assertIn("brand_new_state", message, "错误信息必须点名那个未归口的状态")
+
+        # 5. 非空性对照：词表一致时同一调用必须成功 —— 否则上面可能只是因为该函数恒抛。
+        self.assertIs(True, ARC._market_owner_verification(
+            {"verification": MDC.VERIFICATION_VERIFIED,
+             "verification_method": MDC.VERIFICATION_METHOD_CROSS_SOURCE},
+            None,
+        ).is_verified)
+
+        # 6. 静态：归口函数里**不得**再有 catch-all 的 outcome 兜底。
+        #    按 AST 判定：函数体里不应存在"对 outcome 的裸 else 赋值"。
+        self.assertFalse(
+            _has_catch_all_outcome_fallback(_source(CONTRACT_MODULE)),
+            "market 归口出现了 catch-all 兜底 —— 新状态会被静默分类",
+        )
 
 
 # ---------------------------------------------------------------------------

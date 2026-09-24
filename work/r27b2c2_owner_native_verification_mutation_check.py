@@ -148,6 +148,37 @@ MUTATIONS = [
         "test": _case("test_RVERIFY_07_market_cross_source_semantics_stay_delegated_to_r24"),
         "desc": "market cross_source_verified 不再委托 R24，改为比较 verified 字面量",
     },
+    {
+        "id": "M-RVERIFY-8",
+        # 显式穷尽映射退回 catch-all else：R24 未来的新状态被静默分类。
+        "file": CONTRACT,
+        "old": "    outcome = _MARKET_OUTCOME_BY_VERIFICATION[verification]\n",
+        "new": (
+            "    if verification == MDC.VERIFICATION_VERIFIED:  # MUTANT —— 退回 catch-all\n"
+            "        outcome = OWNER_OUTCOME_VERIFIED\n"
+            "    else:\n"
+            "        outcome = OWNER_OUTCOME_UNVERIFIED\n"
+        ),
+        "test": _case("test_RVERIFY_11_market_outcome_mapping_is_exhaustive_and_fail_closed"),
+        "desc": "显式穷尽映射退回 catch-all else（新状态被静默归为 unverified）",
+    },
+    {
+        "id": "M-RVERIFY-9",
+        # 取消词表穷尽检查：R24 新增合法状态不再 fail closed。
+        "file": CONTRACT,
+        "old": (
+            "    problems = _market_outcome_mapping_problems(\n"
+            "        _MARKET_OUTCOME_BY_VERIFICATION, MDC.VERIFICATIONS,\n"
+            "    )\n"
+            "    if problems:\n"
+        ),
+        "new": (
+            "    problems = []  # MUTANT —— 词表漂移不再被检查\n"
+            "    if problems:\n"
+        ),
+        "test": _case("test_RVERIFY_11_market_outcome_mapping_is_exhaustive_and_fail_closed"),
+        "desc": "取消 market outcome 映射的穷尽性检查（R24 新状态静默通过）",
+    },
 ]
 
 
