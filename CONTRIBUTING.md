@@ -43,6 +43,26 @@ GitHub backend 单测 CI  → Python 3.14（单一 lane）
 
 判断标准：如果一个测试在没有网络时会变红、变慢或产生随机结果，它属于第 2/3 层，必须显式标记。
 
+## 评审分层与 OpenCodeReview（观察模式）
+
+评审分四层，OpenCodeReview（OCR）只占第三层，而且只是**补充性的观察层**：
+
+```text
+Layer 1 deterministic  ruff / compileall / unittest / security scan / docker-smoke
+Layer 2 behavioral     targeted regression / mutation / full backend suite
+Layer 3 semantic       OpenCodeReview：跨文件语义、owner/authority、PIT/provenance
+Layer 4 human          authority / provenance / architecture / roadmap
+```
+
+OCR **不替代** unittest、mutation、ruff、security scan、exact-head CI 或人工审核；**「OCR 没发现问题」不等于正确性已被证明**。它只做 read / analyze / comment / summarize，**不自动修代码、不自动改 PR、不自动合并**，第一阶段也不自动 resolve review thread。
+
+- **双重固定**：action 固定到 full commit SHA（`bccbc15f785269400735d5255540c231e6c02b6d`，# v1.12.9），CLI 固定到 `ocr_version: "1.12.9"`。升级必须走单独的、经过评审的 dependency bump，不允许 `@main` 或 `latest` 漂移。
+- **安全模型**：触发方式是 `pull_request_target`（使用 base 分支上的 workflow 定义，secrets 可用）；wrapper **不 checkout PR head、不执行 PR 代码**，权限只有 `contents: read` 与 `pull-requests: write`。密钥只从仓库配置注入，仓库内不提交任何 token 或 endpoint。
+- **项目规则**在 `.opencodereview/rule.json`：backend 的 owner / authority / PIT / provenance 不变量、contract 测试与 mutation harness 的非空真性、GitHub workflow 的 runtime / security 约束。`backend/test_*.py` 与 `work/*mutation*.py` 被**有意**强制纳入评审 —— 本仓库的 contract 测试、architecture guard 与 mutation 校验本身就是 correctness surface。
+- **它不是 required check**：OCR provider / auth / action 自己坏掉时会看到 job RED（因此不写 `continue-on-error`），但不会阻塞 merge。「不阻塞」由 branch protection 不把它列为 required context 实现，而不是靠吞掉失败。先观察 5–10 个真实 PR 的真阳性 / 假阳性 / 噪声 / token 用量，再决定是否升级为门禁。
+- **凭据由人工配置**：仓库 Settings → Secrets and variables → Actions（`OCR_LLM_URL`、`OCR_LLM_AUTH_TOKEN`、`OCR_LLM_MODEL`、`OCR_LLM_USE_ANTHROPIC`）。注意 v1.12.9 把**空值**当作 Anthropic 协议，所以 `OCR_LLM_USE_ANTHROPIC` 必须显式写 `false`（OpenAI-compatible）或 `true`（Anthropic），不要留空；也不要按模型名猜协议。
+- **bootstrap 限制**：`pull_request_target` 的 workflow 由 base 分支定义触发，因此新增该 workflow 的那个 PR 本身不会被自己评审 —— 这不是失败，首次真实运行发生在它合并之后的正常 PR 上。
+
 ## Pull Request 清单
 
 - 说明改动目的、影响范围和验证命令。
