@@ -1735,6 +1735,35 @@ research 契约当前把 `(verification, verification_method)` 绑定到 R24 的
 `execution_status` + 证据来源 + `EXECUTION_VERIFICATION_VERSION`），再由 research 契约
 学会消费 **owner-native verification** —— 而不是让所有 owner 伪装成 market_data。
 
+### 第一个 owner contract：execution（R27-B2C-1）
+
+execution owner 已经正式发布了自己的 fact contract（`execution_verification.py`）：
+
+```text
+EXECUTION_FACT_CONTRACT_VERSION   owner fact 契约版本
+EXECUTION_VERIFICATION_SCOPE      "这条核验是关于什么的"（execution_order_fill_evidence）
+verification_contract(status, source)
+                                  owner-native 核验声明：四态 + 证据来源 + 状态×来源合法组合表
+ExecutionFactProjection           identity / business_day / observed_at / verification
+fact_projection(evidence)         唯一发布入口：调用方**不能**提供身份、业务日或核验结论
+```
+
+四条刻意的不变量：
+
+* **identity 由 owner 派生**：有 `event_key` 就是逐次成交身份，多个成交是**成交集合**
+  身份（`identity_kind` 写明），都没有时退成 `order:<id>` 并**如实标注**它只标识委托；
+* **业务日不编造**：多个不同业务日 → `unknown` 并把集合写进 `detail`，绝不挑一个代表值；
+  被拒/被撤的委托今天没有 owner 记录的业务日，因此如实报 `unknown`，**不**拿
+  `created_at` 的墙钟日期冒充（这是 B2C-1 明确记录的下一步前置条件）；
+* **核验是 owner-native 的**：`(状态, 来源)` 有穷尽合法组合表，market 的词
+  （`cross_source` / `coverage_integrity` / `single_source`）进不来；
+* **只有一份判定**：`fact_projection` 委托既有的 `verification_from_evidence`，
+  自己不算 verdict。
+
+它**不**改 `ResearchEvidenceRef`、**不**加 adapter、**不**让 research 层读 execution：
+`verification_from_evidence` 的结论要进入 research，仍然需要 B2C-2（research 契约学会
+消费 owner-native 核验）与 B2C-3（adapter）。路线没有缩短。
+
 
 ## 目标依赖方向
 
@@ -1815,6 +1844,11 @@ best-effort 返回值，而不是把异常抛给调用方）
 allowlist** 且必须真的解析到 `ai_research_contract`（本地同名函数 / 其它对象的同名
 方法 / 其它模块的同名工厂一律拒绝），owner registry 与契约导出的 factory registry
 **双向等值**，生产里构造 `InformationEvent` 的模块集合显式登记）
+owner fact contract 被降级为 market 语义或缺少 owner 发布（R27-B2C-1：execution 的
+核验词表是它自己的四态 + 证据来源，`(状态, 来源)` 有穷尽合法组合表；market 的词
+不得进入；identity 必须由 owner 派生并在 `identity_kind` 里说明来源；多个业务日 /
+观测时点时不得挑代表值，没有 owner 记录的业务日必须报 `unknown` 而不是用墙钟日期
+冒充；verdict 只有 `verification_from_evidence` 一份实现）
 ```
 
 ### 仅作 review signal（不进入 CI gate）

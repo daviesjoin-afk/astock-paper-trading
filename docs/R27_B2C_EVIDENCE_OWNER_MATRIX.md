@@ -122,6 +122,31 @@ paper_orders 整体 writer         → **不是**单一 owner
 因此 B2C-1 的范围是"**fill-backed execution fact** 的 owner contract"，而不是"把
 `paper_orders` 收编成一个 owner"。后者是另一件事，本轮不声称已经具备。
 
+### B2C-1 进展（owner contract 已发布）
+
+`execution_verification.py` 现在正式发布 execution 自己的 fact contract：
+`EXECUTION_FACT_CONTRACT_VERSION` / `EXECUTION_VERIFICATION_SCOPE` /
+`verification_contract(status, source)`（四态 + 证据来源 + 穷尽合法组合表）/
+`ExecutionFactProjection`（identity · `identity_kind` · business_day · observed_at ·
+owner-native verification）/ `fact_projection(evidence)`。
+
+**已经解决的**：本表 §五 第 2 条之前的"owner 没有发布核验闭集"这件事（按
+owner-native 方式，不是复制 market 词表）；identity 与业务日的 owner 派生与
+逐成交可达性；`quote_at` / `event_key` 随流水读出。
+
+**仍然没有解决的（路线不变）**：
+
+```text
+B2C-2  research 契约学会消费 owner-native verification（本契约今天还不是
+       ResearchEvidenceRef 的合法输入 —— _owner_verification_pair 只认 R24 词表）
+B2C-3  execution → ResearchEvidenceRef adapter
+B2C-4  迁移 pnl_attribution
+```
+
+以及一条 B2C-1 明确记录、**没有**被掩盖的缺口：被拒 / 被撤的委托今天在
+`paper_orders` 上**没有** owner 记录的交易日列，因此 `business_day` 如实报 `unknown`。
+要让它变成 `known`，需要 owner 自己记录业务日（而不是让消费者用 `created_at` 推断）。
+
 ---
 
 ## 三、Family B —— Adaptive / experiment facts

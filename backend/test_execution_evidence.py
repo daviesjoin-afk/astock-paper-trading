@@ -10,6 +10,7 @@
 """
 from __future__ import annotations
 
+import ast
 import dataclasses
 import json
 import os
@@ -364,8 +365,39 @@ class LoadExecutionEvidenceTests(unittest.TestCase):
         "cancelled_at", "order_type",
     )
     #: 身份列必须在读取列集里：只按 order_id 关联会把错行当成权威成交证据。
+    #: ``event_key`` 是 owner 的**逐次执行事实身份**（``sha256(order_id|quote_at|ruleset_version)``），
+    #: R27-B2C-1 起随流水一起读出，供 owner fact 投影使用。
     SIGMA_FILLS = ("order_id", "account_id", "side", "code", "qty", "price", "amount",
-                   "fees", "fill_date", "quote_at")
+                   "fees", "fill_date", "quote_at", "event_key")
+
+    @classmethod
+    def _migrated_columns(cls, table):
+        """``paper_schema_migrations.ensure_columns(conn, "<table>", {...})`` 声明的列名。
+
+        生产 schema **不只是**基础 ``CREATE TABLE``：增量列由 migration 补齐
+        （``paper_fills.event_key`` 就在这里，基础 DDL 里没有）。少了这一步，
+        "被选中的列真的存在于生产 schema"会退化成"存在于某一份不完整的表结构快照"。
+        """
+        with open(os.path.join(BACKEND_DIR, "paper_schema_migrations.py"),
+                  encoding="utf-8") as handle:
+            tree = ast.parse(handle.read())
+        found = set()
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call) or len(node.args) < 3:
+                continue
+            func = node.func
+            name = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", "")
+            if name != "ensure_columns":
+                continue
+            table_arg, definitions = node.args[1], node.args[2]
+            if not (isinstance(table_arg, ast.Constant) and table_arg.value == table):
+                continue
+            if isinstance(definitions, ast.Dict):
+                found.update(
+                    key.value for key in definitions.keys
+                    if isinstance(key, ast.Constant) and isinstance(key.value, str)
+                )
+        return found
 
     @classmethod
     def _real_ddl(cls, table):
@@ -385,7 +417,7 @@ class LoadExecutionEvidenceTests(unittest.TestCase):
             name = token.split()[0].strip().strip('"').strip("`")
             if name and name.upper() not in ("PRIMARY", "UNIQUE", "CHECK", "FOREIGN"):
                 columns.add(name)
-        return columns
+        return columns | cls._migrated_columns(table)
 
     def test_selected_columns_exist_in_the_production_schema(self):
         orders = self._real_ddl("paper_orders")
@@ -415,7 +447,8 @@ class LoadExecutionEvidenceTests(unittest.TestCase):
                 id INTEGER PRIMARY KEY AUTOINCREMENT, order_id INTEGER NOT NULL,
                 account_id TEXT NOT NULL, side TEXT NOT NULL, code TEXT NOT NULL,
                 qty INTEGER NOT NULL, price REAL NOT NULL, amount REAL NOT NULL, fees REAL NOT NULL,
-                fill_date TEXT NOT NULL, quote_at TEXT, assumption TEXT NOT NULL DEFAULT ''
+                fill_date TEXT NOT NULL, quote_at TEXT, event_key TEXT,
+                assumption TEXT NOT NULL DEFAULT ''
             );
             """
         )

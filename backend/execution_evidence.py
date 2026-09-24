@@ -135,8 +135,15 @@ ALL_EVIDENCE_FIELDS = EXECUTION_EVIDENCE_FIELDS + EXECUTION_EVIDENCE_EXTRA_FIELD
 #: 收益层字段名。它们与执行证据共用同一套三态语义（known/unknown/
 #: not_applicable），但**不是** :class:`ExecutionEvidence` 的成员。
 RETURN_FIELDS = ("market_return", "selection_return", "execution_return")
+#: owner fact 投影（``execution_verification.ExecutionFactProjection``）的字段名。
+#:
+#: 与 :data:`RETURN_FIELDS` 同一模式：需要三态语义、但**不属于**"这笔委托的执行证据
+#: 字段"的东西不塞进 :class:`ExecutionEvidence`。硬塞会改到 ``ALL_EVIDENCE_FIELDS`` →
+#: ``__post_init__`` → ``as_dict``/``fingerprint``，而 ``fill_verdict`` / ``inconsistencies``
+#: 的结论会经 ``execution_status`` 传播到十几条读路径。
+FACT_FIELDS = ("business_day", "observed_at")
 #: :class:`EvidenceField` 认可的全部字段名。
-KNOWN_EVIDENCE_FIELD_NAMES = ALL_EVIDENCE_FIELDS + RETURN_FIELDS
+KNOWN_EVIDENCE_FIELD_NAMES = ALL_EVIDENCE_FIELDS + RETURN_FIELDS + FACT_FIELDS
 
 FILL_VERDICT_VERIFIED = "fill_verified"
 FILL_VERDICT_PARTIAL = "fill_partial"
@@ -504,11 +511,27 @@ def _get(record: Any, key: str, default: Any = None) -> Any:
 
 
 def _aggregate_fills(fill_rows: Any) -> dict:
-    """汇总成交流水。``qty<=0`` 的行不是成交，单独计数而不是静默丢弃。"""
+    """汇总成交流水。``qty<=0`` 的行不是成交，单独计数而不是静默丢弃。
+
+    除数量/金额外，这里还把 owner **已经记录**的 fact 维度带出来（每个可用成交行）：
+
+    * ``fill_date`` —— 业务日（trading date，由 ``commit_fill`` 从调用方的 ``asof_day``
+      派生，不是墙钟）；
+    * ``quote_at`` —— 该次成交对应的**行情观测时点**（owner 把它当作"行情观测的身份，
+      不是墙上时钟"，见 ``execution_planner`` 的 ``event_key`` 注释）。刻意**不**用
+      ``execution_asof``：那是决策墙钟，且被 ``event_key`` 明确排除；
+    * ``event_key`` —— owner 的逐次执行事实身份（``sha256(order_id|quote_at|ruleset_version)``，
+      部分唯一索引）。
+
+    带出来而不是在别处再查一遍，是因为"一条 execution fact 的身份与业务日"必须由
+    **同一个 owner 读取口**给出；否则每个消费者都会自己拼一份。
+    """
     total_qty = 0.0
     total_amount = 0.0
     total_fees = 0.0
     sessions: list = []
+    observed_ats: list = []
+    event_keys: list = []
     usable = 0
     ignored = 0
     for row in fill_rows or ():
@@ -526,6 +549,12 @@ def _aggregate_fills(fill_rows: Any) -> dict:
         session = _text(_get(row, "fill_date"))
         if session:
             sessions.append(session)
+        observed_at = _text(_get(row, "quote_at"))
+        if observed_at:
+            observed_ats.append(observed_at)
+        event_key = _text(_get(row, "event_key"))
+        if event_key:
+            event_keys.append(event_key)
     weighted = (total_amount / total_qty) if total_qty > 0 else None
     return {
         "fill_rows": usable,
@@ -535,6 +564,8 @@ def _aggregate_fills(fill_rows: Any) -> dict:
         "fees": total_fees if usable else None,
         "weighted_price": weighted,
         "sessions": sessions,
+        "observed_ats": observed_ats,
+        "event_keys": event_keys,
     }
 
 
@@ -703,6 +734,8 @@ def evidence_from_order(
             "planned_price": planned_price,
             "order_type": _text(_get(order, "order_type")),
             "fill_sessions": aggregated["sessions"],
+            "fill_observed_ats": aggregated["observed_ats"],
+            "fill_event_keys": aggregated["event_keys"],
             "available_qty_source": available_source,
         },
         fees=fields["fees"],
@@ -948,7 +981,7 @@ def load_execution_evidence(
     #: 身份列必须与数量/价格一起读出来：``paper_fills`` 没有外键，只按
     #: ``order_id`` 关联会把历史错行或手工导入行当成权威成交证据。
     fill_rows = conn.execute(
-        "SELECT order_id,account_id,side,code,qty,price,amount,fees,fill_date,quote_at "
+        "SELECT order_id,account_id,side,code,qty,price,amount,fees,fill_date,quote_at,event_key "
         "FROM paper_fills "
         "WHERE order_id IN (%s) ORDER BY id" % ",".join("?" for _ in keys),
         tuple(keys),
