@@ -103,7 +103,7 @@ if ($null -ne $pyLauncher) {
     $pythonCommand = (Get-Command "python3").Source
 }
 if ($null -eq $pythonCommand) {
-    throw "Python 3 was not found. Install Python 3.11 or newer and try again."
+    throw "Python 3 was not found. Install Python 3.14 and try again."
 }
 
 $venv = Join-Path $root ".venv"

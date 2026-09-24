@@ -30,7 +30,7 @@ ROOT = os.path.dirname(BACKEND)
 sys.path.insert(0, BACKEND)
 
 # 运行时镜像（Dockerfile）只 COPY backend/、frontend/、deploy/ 与依赖清单，
-# 不带 docs/ 与根目录 markdown。CI 的 tests(3.11/3.12) 作业在完整检出上跑，
+# 不带 docs/ 与根目录 markdown。CI 的 tests job 在完整检出上跑，
 # 这些断言在那边照常生效；docker-smoke 的镜像里则跳过，而不是假装通过。
 FULL_TREE = os.path.isdir(os.path.join(ROOT, "docs")) and os.path.isfile(
     os.path.join(ROOT, "ARCHITECTURE.md"))

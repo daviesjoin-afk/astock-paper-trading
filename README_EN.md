@@ -4,7 +4,7 @@
 
 [![CI](https://github.com/daviesjoin-afk/astock-paper-trading/actions/workflows/ci.yml/badge.svg)](https://github.com/daviesjoin-afk/astock-paper-trading/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![Python 3.11+](https://img.shields.io/badge/Python-3.11%2B-blue.svg)](https://www.python.org/)
+[![Python 3.14](https://img.shields.io/badge/Python-3.14-blue.svg)](https://www.python.org/)
 
 A local-first **A-share paper-trading and strategy platform**. It models market-specific execution constraints, layered risk controls, multi-source quote validation, replayable audit trails, and strategy-isolated accounting without connecting to a broker or touching real funds — and it runs both built-in strategy templates and user-defined strategies written in a declarative DSL.
 
@@ -141,7 +141,9 @@ The engine is **paper trading only**. It does not include broker routing, levera
 
 ## Quick start
 
-Requirements: **Python 3.11+**. Docker is optional.
+Requirements: **Python 3.14** (the canonical development / CI / container runtime). Docker is optional.
+
+The single exception is the `native-centos9` native deployment profile: CentOS Stream 9's default repositories do not ship 3.14, so that profile stays on Python 3.11 as an **explicit legacy deployment exception**, to be migrated or retired in a separate reviewed change (see [`deploy/README.md`](deploy/README.md)). It is not a second canonical runtime baseline and not a PR compatibility lane, and it is not permission to reintroduce 3.11 into development, CI, Docker or the test matrix.
 
 ### Windows
 
@@ -201,7 +203,7 @@ The repository uses instance-specific Docker volumes and does not ship runtime d
 
 ## Validation and maintenance
 
-- Backend regression tests run in GitHub Actions on Python 3.11 and 3.12, together with Ruff, lock-file consistency, pip-audit, frontend build consistency, **Playwright browser E2E** (Strategy Workbench journeys) and a Docker smoke job.
+- Backend regression tests run in GitHub Actions on Python 3.14, together with Ruff, lock-file consistency, pip-audit, frontend build consistency, **Playwright browser E2E** (Strategy Workbench journeys) and a Docker smoke job.
 - The repository contains dedicated tests for execution guardrails, point-in-time data behavior, risk auditing, concurrency leases, strategy-entry constraints, strategy-platform invariants (version immutability, draft hard-delete boundary, cycle ownership, dynamic-allocation properties) and replay-related behavior.
 - Releases and maintenance history are tracked through [GitHub Releases](https://github.com/daviesjoin-afk/astock-paper-trading/releases) and [`CHANGELOG.md`](CHANGELOG.md).
 - Bugs, reproducible edge cases and focused pull requests are welcome. See [`CONTRIBUTING.md`](CONTRIBUTING.md).
@@ -242,7 +244,7 @@ MIT. See [`LICENSE`](LICENSE).
 
 ## Release and deployment status
 
-Current release: **v0.20.0** — see the [full release notes](docs/RELEASE-v0.20.0.md), [GitHub Releases](https://github.com/daviesjoin-afk/astock-paper-trading/releases) and [`CHANGELOG.md`](CHANGELOG.md). See [security boundaries](SECURITY.md), the [strategy platform](docs/STRATEGY_PLATFORM.md) and the [repository layout](docs/REPOSITORY_LAYOUT.md). CI covers Python 3.11/3.12, the offline Docker regression suite, frontend build checks and Chromium E2E.
+Current release: **v0.20.0** — see the [full release notes](docs/RELEASE-v0.20.0.md), [GitHub Releases](https://github.com/daviesjoin-afk/astock-paper-trading/releases) and [`CHANGELOG.md`](CHANGELOG.md). See [security boundaries](SECURITY.md), the [strategy platform](docs/STRATEGY_PLATFORM.md) and the [repository layout](docs/REPOSITORY_LAYOUT.md). CI covers Python 3.14, the offline Docker regression suite, frontend build checks and Chromium E2E.
 
 The local Compose mapping binds the host port to loopback only (`127.0.0.1:8600:8600`); inside the container Uvicorn still listens on `0.0.0.0` for port publishing, health checks and reverse proxying.
 

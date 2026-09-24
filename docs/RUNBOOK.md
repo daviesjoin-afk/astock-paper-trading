@@ -5,7 +5,7 @@
 
 ## 0. 前置
 
-- Python 3.11+
+- Python 3.14（canonical development / CI / container runtime）
 - 可访问公网（A 股行情/码表/日K 来自公开接口：东方财富/腾讯/新浪）
 - 建议 8 GB 内存以上（pandas 全市场数据处理）
 

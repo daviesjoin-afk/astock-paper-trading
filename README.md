@@ -4,7 +4,7 @@
 
 [![CI](https://github.com/daviesjoin-afk/astock-paper-trading/actions/workflows/ci.yml/badge.svg)](https://github.com/daviesjoin-afk/astock-paper-trading/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![Python 3.11+](https://img.shields.io/badge/Python-3.11%2B-blue.svg)](https://www.python.org/)
+[![Python 3.14](https://img.shields.io/badge/Python-3.14-blue.svg)](https://www.python.org/)
 
 > **Local-first A-share strategy research & paper-trading platform with declarative strategies, point-in-time evidence, verified execution, cycle-owned ledgers, deterministic risk/replay and auditable evolution.**
 
@@ -57,7 +57,7 @@
 
 ## Dashboard 预览
 
-当前发布版本：**v0.20.0**（[完整发布说明](docs/RELEASE-v0.20.0.md) · [GitHub Releases](https://github.com/daviesjoin-afk/astock-paper-trading/releases) · [CHANGELOG](CHANGELOG.md)）。查看 [架构说明](ARCHITECTURE.md)、[策略平台](docs/STRATEGY_PLATFORM.md)、[仓库结构地图](docs/REPOSITORY_LAYOUT.md) 和 [安全边界](SECURITY.md)。CI 验证 Python 3.11/3.12、离线 Docker 全量回归、前端构建与 Chromium E2E。
+当前发布版本：**v0.20.0**（[完整发布说明](docs/RELEASE-v0.20.0.md) · [GitHub Releases](https://github.com/daviesjoin-afk/astock-paper-trading/releases) · [CHANGELOG](CHANGELOG.md)）。查看 [架构说明](ARCHITECTURE.md)、[策略平台](docs/STRATEGY_PLATFORM.md)、[仓库结构地图](docs/REPOSITORY_LAYOUT.md) 和 [安全边界](SECURITY.md)。CI 在 Python 3.14 上验证、离线 Docker 全量回归、前端构建与 Chromium E2E。
 
 ![模拟盘 Dashboard 预览](docs/assets/dashboard.png)
 
@@ -191,7 +191,9 @@ docker-compose.yml      本地/单机容器运行
 
 ## 一键启动
 
-要求：**Python 3.11+**。Docker 可选。
+要求：**Python 3.14**（canonical development / CI / container runtime）。Docker 可选。
+
+唯一例外是 `native-centos9` 原生部署 profile：CentOS Stream 9 的默认仓库不提供 3.14，该 profile 仍使用 Python 3.11，属于**明确保留的 legacy 部署例外**，其升级或退役另开独立 PR 处理（见 [`deploy/README.md`](deploy/README.md)）。该例外不得被用来把 3.11 重新引入开发环境、CI、Docker 或测试矩阵。
 
 ### Windows
 
@@ -277,7 +279,7 @@ python paper_runner.py --slot open
 
 `requirements.txt` 声明允许的依赖范围，`requirements.lock` 固定可复现安装版本。修改依赖范围后必须重新生成并提交锁文件。
 
-GitHub Actions 会在 **Python 3.11 / 3.12** 上安装锁定依赖并执行后端回归，同时运行 Ruff 静态检查、锁文件一致性检查、pip-audit 已知漏洞审计、前端构建一致性校验、**Playwright 浏览器 E2E**（策略工坊关键旅程：创建草稿 / 生命周期 / 设置集成 / 版本 / 克隆 / 深链接 / 响应式与可访问性）和 Docker 冒烟。Docker 冒烟阶段以 `--network none` + tmpfs 缓存目录运行**全量离线测试层**：回归用例默认禁止联网，联网用例须显式设置 `ASTOCK_NET_TESTS=1` 才运行（分层规范见 [`CONTRIBUTING.md`](CONTRIBUTING.md)）。测试覆盖撮合门禁、point-in-time 数据、行情新鲜度、风险审计、并发租约、策略入场与策略平台不变量（版本不可变、草稿删除边界、周期所有权、动态分配性质）、确定性演示回放与共享资金行为，完整场景矩阵见 [`docs/TEST_MATRIX.md`](docs/TEST_MATRIX.md)。
+GitHub Actions 会在 **Python 3.14** 上安装锁定依赖并执行后端回归，同时运行 Ruff 静态检查、锁文件一致性检查、pip-audit 已知漏洞审计、前端构建一致性校验、**Playwright 浏览器 E2E**（策略工坊关键旅程：创建草稿 / 生命周期 / 设置集成 / 版本 / 克隆 / 深链接 / 响应式与可访问性）和 Docker 冒烟。Docker 冒烟阶段以 `--network none` + tmpfs 缓存目录运行**全量离线测试层**：回归用例默认禁止联网，联网用例须显式设置 `ASTOCK_NET_TESTS=1` 才运行（分层规范见 [`CONTRIBUTING.md`](CONTRIBUTING.md)）。测试覆盖撮合门禁、point-in-time 数据、行情新鲜度、风险审计、并发租约、策略入场与策略平台不变量（版本不可变、草稿删除边界、周期所有权、动态分配性质）、确定性演示回放与共享资金行为，完整场景矩阵见 [`docs/TEST_MATRIX.md`](docs/TEST_MATRIX.md)。
 
 ## Docker
 

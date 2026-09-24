@@ -5,7 +5,7 @@ addopts = "-q"
 
 [tool.ruff]
 line-length = 110
-target-version = "py311"
+target-version = "py314"
 
 [tool.ruff.lint]
 select = ["E9", "F", "B"]

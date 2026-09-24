@@ -17,6 +17,16 @@ Docker 生产 profile 请使用 `docker-compose.server.yml` 与 `astock-codex.cr
 该规格适合单人使用，但应保持
 一个 Uvicorn worker；Pandas 数据与进程内缓存会在多 worker 间重复占用内存。
 
+## Python 运行时
+
+本 profile 是项目 canonical Python 3.14 runtime 的**唯一明确例外**。CentOS Stream 9
+的默认仓库不提供 3.14，因此 `install-centos9.sh` 仍然安装 `python3.11` 并用它建立 venv。
+
+它的状态是 **isolated legacy deployment exception**：既不是第二个 canonical runtime
+baseline，也不是 PR 兼容 lane。该 profile 的升级或退役将在后续独立的部署 profile 变更
+中处理。不要因为本 profile 仍在使用 3.11，就把 Python 3.11 重新引入开发环境、
+GitHub CI、Docker 镜像或测试矩阵。
+
 ## 架构
 
 - Nginx 对外监听 80，提供 Basic Auth、限流、压缩和静态首页。

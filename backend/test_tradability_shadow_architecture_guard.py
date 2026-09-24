@@ -288,7 +288,7 @@ class OperatorCliExposesNoAuthority(unittest.TestCase):
     用例（构造一个假 AST 喂给检测器）必须在**任何**环境里都跑，否则"护栏的护栏"就
     在运行时镜像里消失了。
 
-    跳过的代价是可控的：CI 的 ``tests (3.11)`` / ``tests (3.12)`` job 用的是**完整
+    跳过的代价是可控的：CI 的 ``tests`` job 用的是**完整
     仓库 checkout**，读文件的用例在那里一定会真的执行。
     """
 
