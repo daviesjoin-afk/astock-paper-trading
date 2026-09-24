@@ -103,6 +103,20 @@
 
 **这直接决定了一条硬边界**：任何 legacy research runtime 的证据若**不是**市场数据，就不可能在不伪造 provenance 的前提下迁进 typed path。
 
+### provider 配置权威（迁移后的事实）
+
+profiles / 凭据也有一条同类边界：
+
+| 谁 | 判据 | 管什么 |
+| --- | --- | --- |
+| `ai_review_service.slot_readiness(cfg)` | Key + `enabled` + 可请求地址 + 模型 | **已迁移的** canonical research |
+| `deepseek_advisor.configured()` | 厂商环境变量（`DEEPSEEK_API_KEY` 等） | **未迁移**的 tuner / 研究套件 |
+
+两者刻意不共用判据 —— 它们问的是两个不同的 provider owner 能不能付钱。这条边界由两个方向的
+真实缺陷写下来：用 legacy 环境变量当准入条件会让「只在 `ai_provider_slots` / UI 里配好的槽位」
+永远跑不起来；不检查 `enabled` 则让操作员的 disable 只挡住 UI、挡不住真实付费调用（因为
+`ai_provider_transport.call_json` 只看 `api_key` / `base_url` / `model`）。
+
 ---
 
 ## 四、迁移决策：Step 1 为什么是 `data_quality` 运行时

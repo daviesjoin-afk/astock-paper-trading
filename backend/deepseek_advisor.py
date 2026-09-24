@@ -26,6 +26,19 @@ the deterministic data-quality and evolution gates.
 research 迁移里改掉它，会同时改变它的业务 authority，因此刻意留给后续单独一轮。
 这也意味着本模块**仍然**持有 legacy provider 网络调用（``call_json``），它不是 R27
 provider 链路的一部分。
+
+──────────────── 迁移后的 provider 配置权威 ────────────────
+
+``run_review`` 的 provider 凭据来自 ``ai_review_service`` 的 **canonical 槽位配置**，不是
+legacy 的 ``DEEPSEEK_API_KEY`` 环境变量：
+
+* **就绪判据只有一份**：``ai_review_service.slot_readiness()``。它同时要求 Key、操作员的
+  ``enabled``、可请求地址与模型 —— 因此"操作员禁用了槽位"会**真的**阻止网络请求，而不是
+  只阻止 UI 上的一次点击。
+* **legacy 的 ``configured()`` 不再是 canonical research 的准入条件**：只配在数据库 / UI 里的
+  槽位（没有对应的厂商环境变量）过去会被错误判成"未配置"。反之，``configured()`` 仍然
+  是尚未迁移的 tuner 与研究套件的凭据门禁 —— 两者刻意**不共用**同一个判据，因为它们问的是
+  两个不同的 provider owner 能不能付钱。
 """
 from __future__ import annotations
 
@@ -62,6 +75,23 @@ RESEARCH_QUESTION_DATA_QUALITY = "当前全市场行情快照自身是否完整�
 
 #: 把一条 typed 市场事实送进来的来源标签（审计用，不参与判定）。
 RESEARCH_EVIDENCE_SOURCE = "market_data_service.read_snapshot_with_meta"
+
+
+class ResearchReadinessError(RuntimeError):
+    """canonical research 的 provider 槽位**不允许**发起调用 —— 阻塞，不是崩溃。
+
+    ``reason`` 是唯一可被程序依赖的字段，取自 ``ai_review_service.slot_readiness``
+    （``not_configured`` / ``disabled`` / ``unusable_base_url`` / ``model_missing``）
+    或本层的槽位映射失败（``provider_slot_unavailable``）。
+
+    刻意与"调用失败"分开：这些都是**在付费之前**就已知的阻塞条件，因此它们必须表现为
+    "这次没有也**不会有**网络请求"，而不是"我们试过了但失败了"。混成一个原因会让"禁用槽位
+    仍然扣费"这种缺陷无法从审计里看出来。
+    """
+
+    def __init__(self, reason) -> None:
+        self.reason = str(reason)
+        super().__init__(self.reason)
 
 # Provider-neutral catalog: only DeepSeek is active today; Kimi/MIMO are
 # deliberately capability placeholders until their credentials are configured.
@@ -552,22 +582,31 @@ def market_research_events(snapshot_paths):
 
 
 def _research_provider_config(connect_factory):
-    """解析 canonical 槽位配置 —— provider 凭据的**唯一**来源。
+    """解析 canonical 槽位配置并**判定就绪** —— provider 凭据的唯一来源。
 
-    本轮不新增 provider 配置模型，也没有第三套 API Key：槽位词表与解析都在
+    本轮不新增 provider 配置模型，也没有第三套 API Key：槽位词表、解析与就绪判据都在
     ``ai_review_service``。legacy 的 provider 选择（``LLM_PROVIDER``）按既有别名表映射到
     槽位，因此"这次研究由哪个厂商执行"不会被迁移顺手改掉。
 
-    映射不存在时显式失败，而不是回落到某个槽位：静默换 provider 等于换掉这次研究的实际
-    执行者，而那正是审计必须看得见的东西。
+    两件事刻意都在这里、都在**任何网络请求之前**做完：
+
+    * **尊重操作员的 ``enabled``**。``ai_provider_transport.call_json`` 只检查
+      ``api_key`` / ``base_url`` / ``model``，因此"被禁用的槽位"必须在交给它之前就拦下 ——
+      否则禁用只挡住了 UI，挡不住真实付费调用。
+    * **映射/解析失败显式失败**，而不是回落到某个槽位：静默换 provider 等于换掉这次研究的
+      实际执行者，而那正是审计必须看得见的东西。
     """
     import ai_review_service
     try:
         slot = ai_review_service.resolve_slot(provider_name())
     except ValueError as exc:
-        raise RuntimeError("research_provider_slot_unavailable") from exc
+        raise ResearchReadinessError("provider_slot_unavailable") from exc
     with connect_factory() as conn:
-        return ai_review_service.get_slot_config(conn, slot)
+        cfg = ai_review_service.get_slot_config(conn, slot)
+    readiness = ai_review_service.slot_readiness(cfg)
+    if not readiness["ready"]:
+        raise ResearchReadinessError(readiness["reason"])
+    return cfg
 
 
 def _research_report_view(*, run_id, hypothesis, narrative, counter_arguments):
@@ -699,17 +738,21 @@ def run_review(connect_factory, paper_db_path, snapshot_paths, config=None, trig
     没有可证明的 typed 事实时，本函数**不调用 provider、不写 canonical 行**，直接返回明确
     失败。原因：一条没有证据的研究运行连 ``as_of``（业务日）都无法从事实派生，用墙上时钟
     补一个就伪造了 PIT 声明。
+
+    **准入条件只有两个，且都不是 legacy 的 provider 凭据**：``advisor_disabled``（本 runtime
+    的功能开关）与"canonical 槽位未就绪"。后者由 ``ai_review_service.slot_readiness`` 判定，
+    返回 ``status='blocked'`` + 稳定 ``error_code``；``enabled=False`` 的槽位因此是
+    **零网络、零 canonical row、零 legacy row**。
     """
     if not enabled(config):
         raise RuntimeError("advisor_disabled")
-    if not configured():
-        raise RuntimeError("api_key_missing")
     events = market_research_events(snapshot_paths)
     if not events:
         return {"id": None, "status": "failed", "report": None,
                 "error_code": "market_evidence_unavailable", "latency_ms": 0}
     as_of = events[0].as_of
     try:
+        provider_config = _research_provider_config(connect_factory)
         run = ai_research_service.run_research_run(
             connect_factory,
             purpose=RESEARCH_PURPOSE_DATA_QUALITY,
@@ -719,13 +762,22 @@ def run_review(connect_factory, paper_db_path, snapshot_paths, config=None, trig
             subject=events[0].evidence_id,
             question=RESEARCH_QUESTION_DATA_QUALITY,
             events=events,
-            provider_config=_research_provider_config(connect_factory),
+            provider_config=provider_config,
         )
+    except ResearchReadinessError as exc:
+        # 付费之前就已确定的阻塞：零网络、零 canonical row、零 legacy row。
+        return {"id": None, "status": "blocked", "report": None,
+                "error_code": ("research_%s" % exc.reason)[:80], "latency_ms": 0}
     except ai_research_service.ResearchServiceError as exc:
         # 明确失败：**不**回落 legacy provider、**不**写 legacy 表、**不**假装"AI 没意见"。
         # provider 或持久化任一段失败都不留下 canonical 行，调用方必须看到失败。
         return {"id": None, "status": "failed", "report": None,
                 "error_code": ("%s_%s" % (exc.stage, exc.reason))[:80], "latency_ms": 0}
+    except Exception as exc:  # noqa: BLE001
+        # 配置解析或落库之外的裸异常也不得逃逸：本函数的契约是 best-effort，只声明
+        # ``advisor_disabled`` 一种抛出（与 ``ai_review_service._call_reviewer`` 同一约定）。
+        return {"id": None, "status": "failed", "report": None,
+                "error_code": ("research_config_%s" % type(exc).__name__)[:80], "latency_ms": 0}
     return {
         "id": run.run_id,
         "status": run.hypothesis.status,

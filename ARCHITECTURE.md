@@ -1526,6 +1526,31 @@ ai_research_service
 `ai_research_contract` —— provider 交出来的已经是契约对象，repository 会再独立校验一次；多
 一个消费者就多一份"两套规则必然漂移"的风险。
 
+### provider 配置权威只有一份
+
+迁移后的 research runtime 的凭据来自 **canonical 槽位配置**（`ai_review_service`），不是
+legacy 的厂商环境变量：
+
+```text
+canonical research readiness = ai_review_service.slot_readiness(cfg)
+                               （Key + enabled + 可请求地址 + 模型）
+legacy tuner / 研究套件         = deepseek_advisor.configured()（厂商环境变量）
+```
+
+两者刻意**不共用**判据：它们问的是两个不同的 provider owner 能不能付钱。这条边界由两个方向
+的真实缺陷写下来：
+
+- **准入不能用 legacy 环境变量。** 只在 `ai_provider_slots` / UI 里配好的槽位，在没有
+  `DEEPSEEK_API_KEY` 时会被 legacy `configured()` 错误判成"未配置"，于是 research 根本跑不起来。
+- **就绪必须尊重 `enabled`。** `ai_provider_transport.call_json` 只检查
+  `api_key` / `base_url` / `model`，因此"被禁用的槽位"必须在交给它**之前**拦下 —— 否则操作员
+  的 disable 只挡住了 UI，挡不住真实付费调用。`enabled=False` 的结果是**零网络、零 canonical
+  row、零 legacy row**，并返回 `status='blocked'` + 稳定 `error_code`。
+
+就绪判据只有一份：`slot_public_view`（GET 视图）与 research runtime 都从
+`slot_readiness` 取，谁都不许自己比较字段。配置解析失败（槽位映射不存在、读配置抛错）一律
+映射成声明的 best-effort 返回值，**不**裸异常逃逸。
+
 ### 事务与网络边界
 
 顺序是硬约束，不是风格问题：
@@ -1620,14 +1645,22 @@ RUNTIME-07 ~ 08（legacy 历史行不被迁移、迁移路径的 legacy writer =
 canonical 行不会被当成重新授权）、RUNTIME-11 ~ 12（网络 owner 仍唯一、网络调用不在任何事务
 内，用连接深度计数器而不是读代码）、RUNTIME-13 ~ 14（`as_of` 与 `created_at` 分离、重复执行
 = 两条 run 且没有业务键）、RUNTIME-15 ~ 17（canonical 表在首次运行之前不存在时读路径仍可用、
-`overview` 以 canonical 为准且旧行仍可见、`purpose` 过滤精确且有界），以及 service 的架构
+`overview` 以 canonical 为准且旧行仍可见、`purpose` 过滤精确且有界）、RUNTIME-18 ~ 21
+（provider 配置权威：DB / UI-only 槽位可用、`enabled=False` 零网络、配置解析失败不裸逃逸、
+就绪判据只有一份），以及 service 的架构
 guard（import 闭集、不 import 契约、无 SQL、无网络、依赖方向不可反转）与扫描器非空性用例。
 
 语义 mutation 在 `work/r27b2b_research_runtime_mutation_check.py`：service 绕过 typed
 provider 用 legacy 形状的 dict 充当结论、失败被降级成 `completed`、canonical 之后继续
 dual-write legacy 表、`status == supported` 驱动 authority 标记、网络调用被移进事务、legacy
 历史行被伪装成 canonical typed 研究、迁移路径又调一次 legacy provider、`as_of` 被运维时间
-替换，必须全部 CAUGHT（survived = 0、fake = 0、restore sha256 一致）。
+替换、就绪判据忽略槽位 `enabled`、legacy 环境变量重新成为准入条件、配置解析异常裸逃逸，
+必须全部 CAUGHT（survived = 0、fake = 0、restore sha256 一致）。
+
+RUNTIME-18 ~ 21 覆盖 provider 配置权威的四个方向：DB / UI-only 槽位（没有厂商环境变量）必须
+能跑完 research、`enabled=False` 的槽位必须零 provider 调用、配置解析失败必须按 best-effort
+契约稳定映射、就绪判据必须只有一份且与 GET 视图一致。前两条来自人工审核在 exact-head 上发现
+的**同一个根因**（provider 配置权威只收敛了一半），后两条是它必然伴生的语义缺口。
 
 `RUNTIME-15` 是一条由**生产缺陷**写下来的回归：canonical 表只有在一次 append 之后才存在，
 而 `overview` 是每次刷新概览都会走的路径 —— 少了读路径的 schema 引导，全新库会直接
@@ -1703,6 +1736,11 @@ provider 网络调用进入 DB transaction（R27-B2B：一次 LLM 等待不得�
 canonical 读路径在台账尚不存在时崩溃（R27-B2B：overview 是每次刷新概览都会走
 的路径，读入口必须先保证 schema 已建；「首次运行之前读不到」必须表现为空，
 而不是 no such table）
+canonical research 的就绪判据被绕过或分叉（R27-B2B：就绪只有
+ai_review_service.slot_readiness 一份；忽略槽位 enabled 等于让操作员的 disable
+挡不住真实付费调用，而用 legacy 环境变量当准入条件会让 DB/UI-only 槽位永远跑不起来）
+provider 配置解析异常裸逃逸（R27-B2B：槽位映射不存在或读配置失败必须映射成声明的
+best-effort 返回值，而不是把异常抛给调用方）
 ```
 
 ### 仅作 review signal（不进入 CI gate）

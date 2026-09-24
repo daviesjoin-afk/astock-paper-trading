@@ -523,6 +523,40 @@ def _key_preview(value):
     return "****"
 
 
+#: 槽位就绪判据的稳定 machine reasons。
+#: ``ready`` 之外的每一个值都表示"这次调用不允许发生"，而不是"调用失败了"。
+SLOT_READY = "ready"
+SLOT_NOT_CONFIGURED = "not_configured"
+SLOT_DISABLED = "disabled"
+SLOT_BASE_URL_UNUSABLE = "unusable_base_url"
+SLOT_MODEL_MISSING = "model_missing"
+
+
+def slot_readiness(cfg):
+    """一个槽位**能不能真的发出一次请求** —— 唯一真值。
+
+    ``ready`` 要求 Key、``enabled``、可请求地址与模型**全部**满足；否则返回稳定 reason，让
+    调用方能区分"操作员禁用了"（``disabled``）与"凭据缺失"（``not_configured``）。
+
+    存在理由是 R27-B2B 的一处真实缺陷：迁移后的 research runtime 只把 ``provider_config``
+    交给 transport，而 transport 只检查 ``api_key`` / ``base_url`` / ``model`` ——
+    ``enabled=False`` 于是被绕过，被禁用的槽位照样发起真实网络请求。就绪判据只有一份，
+    ``slot_public_view``（GET 视图）与 research runtime 都从这里取，谁都不许自己比较字段。
+
+    顺序刻意是"凭据 → 启用 → 地址 → 模型"：与 ``_run_single_review`` / ``_run_dual_review``
+    的既有 fail-closed 报告顺序一致，因此同一个槽位在两条路径上得到同一个 reason。
+    """
+    if not str(cfg.get("api_key") or "").strip():
+        return {"ready": False, "reason": SLOT_NOT_CONFIGURED}
+    if not bool(cfg.get("enabled")):
+        return {"ready": False, "reason": SLOT_DISABLED}
+    if not is_usable_base_url(cfg.get("base_url")):
+        return {"ready": False, "reason": SLOT_BASE_URL_UNUSABLE}
+    if not str(cfg.get("model") or "").strip():
+        return {"ready": False, "reason": SLOT_MODEL_MISSING}
+    return {"ready": True, "reason": SLOT_READY}
+
+
 def slot_public_view(cfg):
     """GET 层视图：**绝不含明文 Key**，只给是否已配置与掩码预览。"""
     api_key = str(cfg.get("api_key") or "")
@@ -537,15 +571,10 @@ def slot_public_view(cfg):
         "timeout_seconds": cfg.get("timeout_seconds"),
         "updated_at": cfg.get("updated_at"),
         "source": cfg.get("source"),
-        # 就绪 = 真正能发出一次请求所需的**全部**字段：Key、启用、合法地址、模型。
+        # 就绪 = 真正能发出一次请求所需的**全部**字段（判据见 slot_readiness，只有一份）。
         # 地址不只看非空——``abc`` / ``123`` / ``://wrong`` 这类不是可请求的 URL，
         # 历史脏数据也要被这里拦下（保存路径另有 validate_base_url 严格拒绝）。
-        "ready": (
-            bool(api_key.strip())
-            and bool(cfg.get("enabled"))
-            and is_usable_base_url(cfg.get("base_url"))
-            and bool(str(cfg.get("model") or "").strip())
-        ),
+        "ready": slot_readiness(cfg)["ready"],
     }
 
 

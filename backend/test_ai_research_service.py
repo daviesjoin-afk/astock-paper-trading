@@ -18,6 +18,8 @@
     RUNTIME-13 ~ 14   ``as_of`` 与 ``created_at`` 分离；重复执行 = 两条 run
     RUNTIME-15 ~ 17   读路径在首次运行之前可用、``overview`` 以 canonical 为准、
                       ``purpose`` 过滤精确且有界
+    RUNTIME-18 ~ 21   provider 配置权威：DB-only 槽位可用、``enabled=False`` 零网络、
+                      配置解析失败不裸逃逸、就绪判据只有一份
     架构 guard        service 的 import 闭集 / 无 SQL / 无网络 / 依赖方向不可反转
 
 **全部离线**：provider 那一次真实 HTTP 调用被 ``ai_provider_transport.call_json`` 的桩
@@ -334,15 +336,33 @@ class _Base(unittest.TestCase):
         advisor.ensure_schema(self.factory.conn)
 
     def env(self, **overrides):
+        """设定 provider 相关环境变量；传 ``None`` 表示该变量**必须不存在**。
+
+        ``None`` 这条路径是给"只在数据库 / UI 里配好槽位"的场景用的：canonical research
+        的准入不允许再依赖厂商环境变量。
+        """
         values = {
             "LLM_PROVIDER": "deepseek",
             "LLM_ADVISOR_ENABLED": "1",
             "DEEPSEEK_API_KEY": "test-key",
         }
         values.update(overrides)
-        patcher = mock.patch.dict(os.environ, values, clear=False)
+        patcher = mock.patch.dict(
+            os.environ, {k: v for k, v in values.items() if v is not None}, clear=False,
+        )
         patcher.start()
         self.addCleanup(patcher.stop)
+        # LIFO：先把这个变量放回去，再让 patch.dict 还原整份快照。
+        for name in (k for k, v in values.items() if v is None):
+            if name in os.environ:
+                original = os.environ.pop(name)
+                self.addCleanup(os.environ.__setitem__, name, original)
+
+    def slot_row(self, slot, **fields):
+        """直接写 ``ai_provider_slots`` —— 模拟"只在数据库 / UI 里配置"的部署。"""
+        import ai_review_service
+        ai_review_service.update_slot(self.factory.conn, slot, **fields)
+        self.factory.conn.commit()
 
     def canonical(self):
         """canonical 行数。表还不存在即 0 —— "一次都没写"是正确的零，不是错误。"""
@@ -781,6 +801,146 @@ class PurposeFilterTests(_Base):
             with self.subTest(bad=repr(bad)[:24]):
                 with self.assertRaises((TypeError, ValueError)):
                     REP.recent_runs(self.factory.conn, limit=5, purpose=bad)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# provider 配置权威 —— canonical 槽位，不是 legacy 环境变量
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+class ProviderConfigAuthorityTests(_Base):
+    """这两半是同一个根因：provider 配置权威只收敛了一半。
+
+    * 只查 legacy ``configured()`` → **只在数据库/UI 里配好的槽位**被错误判成"未配置"；
+    * 只把 ``provider_config`` 交给 transport → ``enabled=False`` 被绕过，
+      操作员的 disable 挡不住真实付费调用。
+    """
+
+    #: "只在数据库 / UI 里配置"的槽位：没有对应的厂商环境变量。
+    DB_ONLY = {
+        "api_key": "db-only-key",
+        "base_url": "https://api.deepseek.com",
+        "model": "db-only-model",
+        "enabled": True,
+    }
+
+    def _run(self):
+        return advisor.run_review(
+            self.factory, "/nonexistent/paper.sqlite3", ("/nonexistent/snapshot.json",),
+            config={"llm_advisor_enabled": True}, trigger=TRIGGER,
+        )
+
+    def _stub(self):
+        stub = _TransportStub(self.factory, payload=_payload_for((_event(),)))
+        for patcher in _install(stub):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        return stub
+
+    def test_RUNTIME_18_db_only_canonical_slot_runs_without_legacy_env_key(self):
+        """RUNTIME-18：槽位只在 DB / UI 里配好、没有任何厂商环境变量时，research 必须能跑。
+
+        ``configured()`` 在这个状态下是 **False** —— 断言它，才能证明旧的 legacy 准入条件
+        真的被移除了，而不是碰巧两条判据同时为真。
+        """
+        self.env(DEEPSEEK_API_KEY=None, LLM_PROVIDER="deepseek")
+        self.slot_row("ai2", **self.DB_ONLY)
+        self.assertFalse(advisor.configured(), "前置条件：本用例必须没有 legacy 环境变量")
+
+        stub = self._stub()
+        result = self._run()
+
+        self.assertEqual("supported", result["status"])
+        self.assertIsNone(result["error_code"])
+        self.assertEqual(1, stub.calls, "DB-only 槽位没有发出那次 provider 调用")
+        self.assertEqual(0, stub.legacy_calls)
+        self.assertEqual(1, self.canonical())
+        row = REP.recent_runs(self.factory.conn, limit=1)[0]
+        self.assertEqual(TRIGGER, row["trigger"])
+        self.assertEqual("db-only-model", row["provider_model"])
+        self.assertEqual("ai2", row["provider_slot"])
+
+    def test_RUNTIME_19_disabled_slot_performs_zero_provider_calls(self):
+        """RUNTIME-19：``enabled=False`` 的槽位 —— 零网络、零 canonical row、零 legacy row。
+
+        ``ai_provider_transport.call_json`` 只检查 ``api_key`` / ``base_url`` / ``model``，
+        所以"被禁用"必须在交给它之前就拦下。否则操作员的 disable 只挡住了 UI，挡不住付费。
+        """
+        self.env(DEEPSEEK_API_KEY=None, LLM_PROVIDER="deepseek")
+        self.slot_row("ai2", **{**self.DB_ONLY, "enabled": False})
+
+        stub = self._stub()
+        result = self._run()
+
+        self.assertEqual(0, stub.calls, "被禁用的槽位仍然发起了 provider 调用")
+        self.assertEqual(0, stub.legacy_calls)
+        self.assertEqual(0, self.canonical(), "被禁用的槽位仍然写入了 canonical row")
+        self.assertEqual(0, self.legacy())
+        self.assertEqual("blocked", result["status"])
+        self.assertEqual("research_disabled", result["error_code"])
+        self.assertIsNone(result["report"])
+
+    def test_RUNTIME_20_config_resolution_failure_obeys_declared_failure_semantics(self):
+        """RUNTIME-20：配置解析失败不得裸异常逃逸 —— 按声明的 best-effort 契约稳定映射。
+
+        两种失败都要覆盖：槽位映射不存在（``LLM_PROVIDER`` 指向没有 canonical 槽位的厂商），
+        以及读取槽位配置本身抛错。两者都必须表现为返回值里的稳定 ``error_code``。
+        """
+        # ① 映射不存在：``kimi`` 没有 canonical 槽位（ai1/ai2 只对应 mimo/deepseek）。
+        self.env(DEEPSEEK_API_KEY=None, KIMI_API_KEY="kimi-key", LLM_PROVIDER="kimi")
+        stub = self._stub()
+        result = self._run()
+        self.assertEqual("blocked", result["status"])
+        self.assertEqual("research_provider_slot_unavailable", result["error_code"])
+        self.assertEqual(0, stub.calls)
+        self.assertEqual(0, self.canonical())
+
+        # ② 读取槽位配置抛错：不得逃逸。
+        self.env()
+        stub = self._stub()
+        import ai_review_service
+        with mock.patch.object(
+            ai_review_service, "get_slot_config", side_effect=RuntimeError("boom"),
+        ):
+            result = self._run()
+        self.assertEqual("failed", result["status"])
+        self.assertEqual("research_config_RuntimeError", result["error_code"])
+        self.assertEqual(0, stub.calls)
+        self.assertEqual(0, self.canonical())
+        self.assertEqual(0, self.legacy())
+
+    def test_RUNTIME_21_readiness_predicate_is_single_and_public_view_agrees(self):
+        """RUNTIME-21：就绪判据只有一份，GET 视图与 research runtime 从同一处取。"""
+        import ai_review_service
+
+        base = {
+            "slot": "ai2", "display_name": "AI 2", "api_key": "k",
+            "base_url": "https://api.deepseek.com", "model": "m", "enabled": True,
+            "timeout_seconds": 40, "updated_at": None, "source": "database",
+        }
+        cases = [
+            (dict(base), ai_review_service.SLOT_READY, True),
+            ({**base, "api_key": ""}, ai_review_service.SLOT_NOT_CONFIGURED, False),
+            ({**base, "api_key": "   "}, ai_review_service.SLOT_NOT_CONFIGURED, False),
+            ({**base, "enabled": False}, ai_review_service.SLOT_DISABLED, False),
+            ({**base, "base_url": "abc"}, ai_review_service.SLOT_BASE_URL_UNUSABLE, False),
+            ({**base, "model": ""}, ai_review_service.SLOT_MODEL_MISSING, False),
+        ]
+        for cfg, reason, ready in cases:
+            with self.subTest(reason=reason, ready=ready):
+                verdict = ai_review_service.slot_readiness(cfg)
+                self.assertEqual(ready, verdict["ready"])
+                self.assertEqual(reason, verdict["reason"])
+                # GET 视图的 ready 必须与判据一致（两处各写一遍必然漂移）。
+                self.assertEqual(
+                    verdict["ready"],
+                    ai_review_service.slot_public_view(cfg)["ready"],
+                )
+        # 非空性：禁用确实会改变判据结果，而不是两种情况恰好同值。
+        self.assertNotEqual(
+            ai_review_service.slot_readiness({**base, "enabled": False})["reason"],
+            ai_review_service.slot_readiness(dict(base))["reason"],
+        )
 
 
 # ─────────────────────────────────────────────────────────────────────────────

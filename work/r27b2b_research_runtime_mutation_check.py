@@ -1,12 +1,12 @@
 # -*- coding: utf-8 -*-
-"""R27-B2B mutation matrix —— M-B2B-1 .. M-B2B-8。
+"""R27-B2B mutation matrix —— M-B2B-1 .. M-B2B-11。
 
 只覆盖本轮**新的高风险 invariant**，刻意不造几十条。每条 mutation 都必须让**唯一指定
 的永久回归**变 RED，anchor 恰好命中一次；``--non-vacuity`` 先跑 baseline，
 ``SyntaxError`` / ``ImportError`` / ``NameError`` 一律计为 FAKE（改红了不等于证明了业务
 性质）。
 
-本轮的核心不变量分四组，mutation 也按这四组设计：
+本轮的核心不变量分五组，mutation 也按这五组设计：
 
 * **只有一个 orchestration boundary，且它只走 typed provider**
   （M-B2B-1 / 7）：绕过 provider 自己造结论、或迁移路径又调一次 legacy provider，都必须
@@ -16,6 +16,9 @@
   dual-write legacy 表、或把 legacy 历史行抬成 canonical 研究，都必须 RED。
 * **research 不获得权限、时间语义不混用**（M-B2B-4 / 5 / 8）：``status == supported``
   变成权威标记、网络调用被移进事务、``as_of`` 被运维时间替换，都必须 RED。
+* **provider 配置权威只有一份**（M-B2B-9 / 10 / 11，来自人工审核的两处 blocker）：
+  忽略槽位的 ``enabled``、把 legacy 环境变量重新当成准入条件、或让配置解析异常裸逃逸，
+  都必须 RED。
 
 沿用 R27-B2A 已修好的 ``PYTHONPYCACHEPREFIX`` 逐次唯一目录，否则 baseline 与 mutant 会
 共享字节码缓存，整张矩阵静默失效。
@@ -25,7 +28,7 @@ byte-identical 还原并校验 sha256。
 
 用法：
     python work/r27b2b_research_runtime_mutation_check.py
-    python work/r27b2b_research_runtime_mutation_check.py --only M-B2B-1,M-B2B-8 --non-vacuity
+    python work/r27b2b_research_runtime_mutation_check.py --only M-B2B-1,M-B2B-11 --non-vacuity
 """
 from __future__ import annotations
 
@@ -41,6 +44,7 @@ BACKEND = os.path.join(ROOT, "backend")
 
 SERVICE = "backend/ai_research_service.py"
 ADVISOR = "backend/deepseek_advisor.py"
+REVIEW_SERVICE = "backend/ai_review_service.py"
 
 SUITE = "test_ai_research_service"
 
@@ -252,6 +256,60 @@ MUTATIONS = [
         "test": _svc("TimeAndIdempotencyTests."
                      "test_RUNTIME_13_as_of_and_created_at_are_separate"),
         "desc": "as_of 被 current wall-clock（运维时间）替换",
+    },
+    {
+        "id": "M-B2B-9",
+        # 就绪判据忽略槽位 enabled：操作员的 disable 只挡住 UI，挡不住真实付费调用
+        # （transport 只检查 api_key / base_url / model）。
+        "file": REVIEW_SERVICE,
+        "old": (
+            "    if not bool(cfg.get(\"enabled\")):\n"
+            "        return {\"ready\": False, \"reason\": SLOT_DISABLED}\n"
+        ),
+        "new": (
+            "    if False:  # MUTANT —— 忽略操作员的 enabled\n"
+            "        return {\"ready\": False, \"reason\": SLOT_DISABLED}\n"
+        ),
+        "test": _svc("ProviderConfigAuthorityTests."
+                     "test_RUNTIME_19_disabled_slot_performs_zero_provider_calls"),
+        "desc": "canonical 就绪判据忽略 enabled（禁用槽位照样付费）",
+    },
+    {
+        "id": "M-B2B-10",
+        # 把 legacy 环境变量重新当成 canonical research 的准入条件：只在数据库 / UI 里
+        # 配好的槽位被判成"未配置"。
+        "file": ADVISOR,
+        "old": (
+            "    if not enabled(config):\n"
+            "        raise RuntimeError(\"advisor_disabled\")\n"
+            "    events = market_research_events(snapshot_paths)\n"
+        ),
+        "new": (
+            "    if not enabled(config):\n"
+            "        raise RuntimeError(\"advisor_disabled\")\n"
+            "    if not configured():  # MUTANT —— legacy env 重新成为准入条件\n"
+            "        raise RuntimeError(\"api_key_missing\")\n"
+            "    events = market_research_events(snapshot_paths)\n"
+        ),
+        "test": _svc("ProviderConfigAuthorityTests."
+                     "test_RUNTIME_18_db_only_canonical_slot_runs_without_legacy_env_key"),
+        "desc": "legacy 环境变量重新成为 canonical research 的准入条件",
+    },
+    {
+        "id": "M-B2B-11",
+        # 配置解析异常裸逃逸：与 run_review 声明的 best-effort 契约不一致。
+        "file": ADVISOR,
+        "old": (
+            "    except Exception as exc:  # noqa: BLE001\n"
+            "        # 配置解析或落库之外的裸异常也不得逃逸：本函数的契约是 best-effort，只声明\n"
+            "        # ``advisor_disabled`` 一种抛出（与 ``ai_review_service._call_reviewer`` 同一约定）。\n"
+            "        return {\"id\": None, \"status\": \"failed\", \"report\": None,\n"
+            "                \"error_code\": (\"research_config_%s\" % type(exc).__name__)[:80], \"latency_ms\": 0}\n"
+        ),
+        "new": "",
+        "test": _svc("ProviderConfigAuthorityTests."
+                     "test_RUNTIME_20_config_resolution_failure_obeys_declared_failure_semantics"),
+        "desc": "配置解析异常裸逃逸（不遵守声明的 best-effort 契约）",
     },
 ]
 
