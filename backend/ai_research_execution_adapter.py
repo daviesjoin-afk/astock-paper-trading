@@ -101,10 +101,27 @@ R27_B2C_EVIDENCE_OWNER_MATRIX.md`` 一并记录。
 不应该把同一条事实变成另一条事实。
 
 内容指纹覆盖 factual projection（version / identity_kind / order_id / lifecycle_state /
-fill_verdict / business_day / observed_at / inconsistencies），使用
+fill_verdict / code / action / requested_qty / filled_qty / fill_price / fees / account_id /
+cycle_id / business_day / observed_at / inconsistencies），使用
 ``json.dumps(sort_keys=True)`` + sha256 的确定性编码。刻意**不**用 ``hash()``（Python
 进程间不稳定）/ ``repr(object)`` / 内存地址 / 当前时间 / 随机数。verification statement
 不重复进指纹：它已经由 ``OwnerVerification.canonical()`` 单独进入 ``fact_state``。
+
+B2C-4A 新增两类内容：
+
+* **成交事实** ``code`` / ``action`` / ``requested_qty`` / ``filled_qty`` / ``fill_price`` /
+  ``fees``：同一条 execution identity 下数量 / 价格 / 费用 / 标的 / 方向被改写，必须报
+  ``EvidenceConflict``，而不是被当成"同一条事实"静默去重。
+* **跨 owner join identity** ``account_id`` / ``cycle_id``：同一条成交被错误地搬到另一个
+  account 或 cycle 同样必须报冲突 —— 否则一次跨 owner 的 PnL 归因会静默落到错误的账户上。
+
+它们以 ``EvidenceField.as_dict()`` 入指纹（**不是** ``maybe()``），因此 ``unknown`` 与
+``not_applicable`` 不会撞成同一个值。
+
+``ResearchEvidenceRef.detail`` **不**复制这些字段：detail 的职责是
+identity + 核验 + 内容指纹 + 最小审计元数据。factual projection 本身是 owner 的事实真值，
+真正的 research 观测投影（``InformationEvent.payload``）在迁移时（B2C-4C）直接从
+``ExecutionFactProjection`` 产生，不在 detail 里养第二份 payload。
 
 ──────────────────────── 已知限制：owner-origin provenance = OPEN ────────────────────────
 
@@ -122,8 +139,9 @@ adapter 不接受 duck-typed / dict / 子类输入，身份、业务日、核验
 ──────────────────────── 本轮没有 production consumer ────────────────────────
 
 B2C-3 的交付物是**能力 + 契约 + 回归**：factory 存在、research contract 支持 execution、
-测试覆盖它。production runtime 仍然**没有**调用本 factory —— ``pnl_attribution`` 的迁移是
-B2C-4。因此"本模块今天零调用点"是预期的，不是空转。
+测试覆盖它。B2C-4A 只让 execution 投影**足以承载** ``pnl_attribution`` 需要的成交事实；
+production runtime 仍然**没有**调用本 factory —— ``pnl_attribution`` 的迁移是 B2C-4C，
+portfolio/accounting 事实是 B2C-4B。因此"本模块今天零调用点"是预期的，不是空转。
 """
 from __future__ import annotations
 
@@ -342,6 +360,13 @@ def _content_fingerprint(projection: Any) -> str:
     ``OwnerVerification.canonical()`` 单独进入 ``fact_state``，重复放进指纹会让同一件事有
     两个 authority。
 
+    B2C-4A 起 factual projection 还包含 owner-native 的成交事实
+    （``code`` / ``action`` / ``requested_qty`` / ``filled_qty`` / ``fill_price`` / ``fees``）
+    与跨 owner 的 join identity（``account_id`` / ``cycle_id``）。这些字段各自直接写
+    ``EvidenceField.as_dict()``，**不**写 ``maybe()`` —— 那会把 ``unknown`` 与
+    ``not_applicable`` 一起压成 ``None``，于是"成交数量未知"与"从未提交、成交数量不适用"
+    会在指纹上撞成同一个值，冲突检测随之失效。
+
     编码必须是**确定性**的：``json.dumps(sort_keys=True, separators=(",", ":"))`` + sha256。
     刻意**不**用 ``hash()``（跨进程不稳定）/ ``repr(object)`` / 内存地址 / 当前时间 /
     随机数 —— 任何一个都会让"内容没变"被报成"内容变了"（或反之），从而让冲突检测失去意义。
@@ -352,6 +377,14 @@ def _content_fingerprint(projection: Any) -> str:
         "order_id": projection.order_id,
         "lifecycle_state": projection.lifecycle_state,
         "fill_verdict": projection.fill_verdict,
+        "code": projection.code.as_dict(),
+        "action": projection.action.as_dict(),
+        "requested_qty": projection.requested_qty.as_dict(),
+        "filled_qty": projection.filled_qty.as_dict(),
+        "fill_price": projection.fill_price.as_dict(),
+        "fees": projection.fees.as_dict(),
+        "account_id": projection.account_id.as_dict(),
+        "cycle_id": projection.cycle_id.as_dict(),
         "business_day": projection.business_day.as_dict(),
         "observed_at": projection.observed_at.as_dict(),
         "inconsistencies": list(projection.inconsistencies),
@@ -386,13 +419,21 @@ def evidence_ref_from_execution_projection(projection: Any) -> ARC.ResearchEvide
     少了这一步，调用方就能自己拼 ``identity`` / ``business_day`` / ``verification`` 然后
     冒充 execution owner 投影 —— 那会让 owner contract 这个边界形同虚设。
 
+    **B2C-4A 起 owner 投影自带成交事实与 join identity。** ``projection`` 的
+    ``code`` / ``action`` / ``requested_qty`` / ``filled_qty`` / ``fill_price`` / ``fees``
+    与 ``account_id`` / ``cycle_id`` 是 owner 发布的三态
+    :class:`execution_evidence.EvidenceField`，参与 :func:`_content_fingerprint`。
+    本 factory **不**把它们复制进 ``detail``：detail 保持
+    "identity + 核验 + 内容指纹 + 最小审计元数据"，需要成交事实或账户/周期归属的消费者读
+    owner 投影本身（B2C-4C 构造 typed event 时即如此），不读 detail。
+
     **已知限制**：``ExecutionEvidence`` 仍然公开可构造，因此"手工造 evidence →
     ``fact_projection`` → 本函数"仍是一条两步伪造路径。owner-origin provenance 仍是
     **OPEN / REQUIRED**，本层不声称已关闭它（见模块 docstring）。
 
     .. note::
        B2C-3 结束时 production 里**没有**调用点：本 factory 是 roadmap 要求的能力交付，
-       ``pnl_attribution`` 的运行时迁移属于 B2C-4。
+       ``pnl_attribution`` 的运行时迁移属于 B2C-4C（B2C-4A 只补齐事实完整度）。
     """
     if type(projection) is not EV.ExecutionFactProjection:
         raise TypeError(

@@ -141,7 +141,16 @@ RETURN_FIELDS = ("market_return", "selection_return", "execution_return")
 #: 字段"的东西不塞进 :class:`ExecutionEvidence`。硬塞会改到 ``ALL_EVIDENCE_FIELDS`` →
 #: ``__post_init__`` → ``as_dict``/``fingerprint``，而 ``fill_verdict`` / ``inconsistencies``
 #: 的结论会经 ``execution_status`` 传播到十几条读路径。
-FACT_FIELDS = ("business_day", "observed_at")
+#:
+#: ``account_id`` / ``cycle_id``（B2C-4A 起）回答的是**这条 execution fact 属于谁**，而不是
+#: "这笔委托成交了多少"。这个 join identity 属于 execution owner：``execution_planner``
+#: 已经把它当成写入与成交的不变量（订单归属哪个 account、属于哪个 cycle）。若不在这里
+#: 发布，跨 owner 的 PnL join 就只能由消费者重新查 ``paper_orders``、或依赖调用方"记得自己
+#: 刚才按哪个 account 过滤" —— 那是在 typed owner projection 之外重建一条事实来源。
+#:
+#: 它**不**是 portfolio 事实：portfolio owner 拥有的是"某个 account/cycle 在某日的
+#: cash / positions / realized pnl / NAV"，而"这笔成交属于哪个 account/cycle"归 execution。
+FACT_FIELDS = ("account_id", "cycle_id", "business_day", "observed_at")
 #: :class:`EvidenceField` 认可的全部字段名。
 KNOWN_EVIDENCE_FIELD_NAMES = ALL_EVIDENCE_FIELDS + RETURN_FIELDS + FACT_FIELDS
 
@@ -643,6 +652,11 @@ def evidence_from_order(
     调用方只要省略 ``fill_identity_rows`` 就能在 ``provenance`` 里留下
     ``fill_identity_checked=True``，而实际**一项都没比对**，"未核对"被读成
     "核对通过"，身份不符的流水照样能把委托验证成成交。
+
+    订单的**归属身份**（``account_id`` / ``cycle_id``）原样带进 ``provenance``：它们回答
+    "这条 execution fact 属于谁"，是跨 owner 的 PnL join 必需的 join identity。这里既不
+    校验也不补值 —— 三态判定归 :func:`execution_verification.fact_projection`，缺失即
+    ``unknown``，绝不用"当前 active cycle / 当前账户"之类的推导值冒充 owner 记录。
     """
     order = order if order is not None else {}
     aggregated = _aggregate_fills(fill_rows)
@@ -732,6 +746,12 @@ def evidence_from_order(
             "fill_rows": aggregated["fill_rows"],
             "ignored_fill_rows": aggregated["ignored_fill_rows"],
             "excluded_fill_rows": excluded_rows,
+            # 这条 execution fact **属于谁**：owner 记录的账户与周期归属。原样存下（不做
+            # fallback、不查"当前 active cycle"），三态判定留给 fact_projection ——
+            # 没有记录就是 unknown，而不是被推到一个它可能不属于的 account/cycle 上。
+            # 老账本没有 ``cycle_id`` 列时（见 load_execution_evidence）同样是 None。
+            "account_id": _text(_get(order, "account_id")),
+            "cycle_id": _get(order, "cycle_id"),
             "fill_identity_mismatches": [
                 {"field": field, "expected": expected, "actual": actual}
                 for field, expected, actual in identity_mismatches
@@ -955,6 +975,26 @@ def _slippage_field(lifecycle_state, aggregated, planned_price, action, source) 
     )
 
 
+def _order_columns(conn: Any) -> set:
+    """``paper_orders`` 当前实际存在的列名（只读探测，不迁移、不写入）。
+
+    存在理由是列集会演进：``cycle_id`` 是后续迁移补上的，而 :func:`load_execution_evidence`
+    必须能在**升级前**的账本上照常读出执行证据（那里的周期归属就是"owner 没有记录"）。
+    与 ``paper_portfolio_read_model`` / ``adaptive_risk`` 的列探测同一手法。
+    """
+    try:
+        rows = conn.execute("PRAGMA table_info(paper_orders)").fetchall()
+    except Exception:  # pragma: no cover - 表都无法探测时不猜列集
+        return set()
+    columns = set()
+    for row in rows:
+        try:
+            columns.add(str(row["name"]))
+        except (TypeError, IndexError, KeyError):  # pragma: no cover - 非 Row 连接
+            columns.add(str(row[1]))
+    return columns
+
+
 def load_execution_evidence(
     conn,
     *,
@@ -976,12 +1016,20 @@ def load_execution_evidence(
         where.append("o.id IN (%s)" % ",".join("?" for _ in keys))
         params.extend(keys)
     clause = (" WHERE " + " AND ".join(where)) if where else ""
+    selected = [
+        "o.id", "o.account_id", "o.side", "o.code", "o.qty", "o.planned_price",
+        "o.filled_price", "o.amount", "o.fees", "o.status", "o.reason", "o.created_at",
+        "o.executed_at", "o.cancelled_at", "o.order_type",
+    ]
+    # ``cycle_id`` 是后续迁移才加到 ``paper_orders`` 上的列。老账本没有它时**不请求**它：
+    # 选一个不存在的列会直接抛 ``OperationalError``，而"owner 没有记录这条事实的周期归属"
+    # 是一个应当如实发布的 ``unknown``，不是读路径崩溃。也**不**回填 —— 升级前的订单属于
+    # 哪个周期无法从任何**当前**状态反推（账户上的周期绑定是可变的），因此该列的历史 NULL
+    # 正是诚实的 legacy provenance 状态。
+    if "cycle_id" in _order_columns(conn):
+        selected.append("o.cycle_id")
     rows = conn.execute(
-        """SELECT o.id,o.account_id,o.side,o.code,o.qty,o.planned_price,o.filled_price,
-                  o.amount,o.fees,o.status,o.reason,o.created_at,o.executed_at,
-                  o.cancelled_at,o.order_type
-             FROM paper_orders o"""
-        + clause
+        "SELECT " + ",".join(selected) + " FROM paper_orders o" + clause
         + " ORDER BY o.id DESC LIMIT ?",
         (*params, max(1, int(limit))),
     ).fetchall()

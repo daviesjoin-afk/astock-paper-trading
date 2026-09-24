@@ -18,8 +18,16 @@
     EXEC-REF-15 ~ 16  同 identity + 内容变了 → EvidenceConflict；同 identity + 同内容 → 安全去重
     EXEC-REF-17       签名不给调用方任何自述入口
     EXEC-REF-18 ~ 20  owner-origin provenance 仍 OPEN、依赖方向单向、映射只有 adapter 一份
+    EXEC-REF-21 ~ 23  B2C-4A：同 identity 下 filled_qty / fill_price / fees 被改写
+                      → EvidenceConflict（每对投影只差那**一个**字段，夹具自带隔离自检）
+    EXEC-REF-24       新增成交事实不参与核验语义（owner-neutral 归口逐字不变）
+    EXEC-REF-25       ``load_execution_evidence`` → ``fact_projection`` → adapter 全链路
+    EXEC-REF-26 ~ 27  同 identity 下 account_id / cycle_id 被改写 → EvidenceConflict
+    EXEC-REF-28       真实读路径保留 account / cycle provenance；legacy 无 cycle_id 列的
+                      账本照常可读且如实报 unknown
 
-全部离线：只用 ``evidence_from_order`` 的纯函数路径与 owner 自己的签发口，不连数据库。
+全部离线：``evidence_from_order`` 的纯函数路径、owner 自己的签发口，以及一个 ``:memory:``
+替身账本（只为 EXEC-REF-25 跑 owner 的只读口 ``load_execution_evidence``），不连真实库。
 """
 from __future__ import annotations
 
@@ -27,6 +35,7 @@ import ast
 import dataclasses
 import inspect
 import os
+import sqlite3
 import sys
 import unittest
 from types import MappingProxyType
@@ -169,6 +178,14 @@ def _owner_records_the_business_day(projection, *, business_day=DAY):
         order_id=projection.order_id,
         lifecycle_state=projection.lifecycle_state,
         fill_verdict=projection.fill_verdict,
+        code=projection.code,
+        action=projection.action,
+        requested_qty=projection.requested_qty,
+        filled_qty=projection.filled_qty,
+        fill_price=projection.fill_price,
+        fees=projection.fees,
+        account_id=projection.account_id,
+        cycle_id=projection.cycle_id,
         business_day=EE.EvidenceField.known("business_day", business_day),
         observed_at=projection.observed_at,
         verification=projection.verification,
@@ -182,6 +199,175 @@ def _hypothesis(ref, relation=ARC.RELATION_SUPPORTS):
         thesis="the paper ledger reflects real fills",
         evidence=(ARC.HypothesisEvidence(ref=ref, relation=relation),),
     )
+
+
+# ---------------------------------------------------------------------------
+# B2C-4A fixtures —— 只暴露**一个**事实维度的成对投影
+# ---------------------------------------------------------------------------
+#
+# 要证明"某字段真的进了内容指纹"，两支投影必须**只**在该字段上不同：否则去掉那个字段
+# 之后冲突仍然由别的维度触发，用例照样通过（变绿的原因是错的）。
+#
+# 三个构造技巧是必须的：
+#   * 委托数量刻意留空（``qty=None``）→ owner 的判据是"有正成交量、但目标数量不明"，
+#     verdict 恒为 ``partial``；因此"成交数量变了"**不会**顺带改掉 verdict / lifecycle；
+#   * 流水费用刻意取一个**对不上费率模型**的值 → 两条都报 ``fees_not_reconciled``
+#     （同一条 inconsistency），commission 与证据来源也一致。
+#   * 改归属身份时 **order 与 fill 一起改**：只改一侧会命中
+#     ``fill_identity_mismatch``，指纹就多出一个维度，隔离随之失效。
+# 成交价格用金额与数量控制（``weighted = amount / qty``），因此换价时数量可以不变。
+
+LEDGER_PRICE = 10.5
+#: 对不上 ``paper_trading_rules`` 费率模型的费用 —— 用来把"费用不同"隔离出来。
+ISOLATED_FEES = 1.0
+LEDGER_ACCOUNT = "acct"
+LEDGER_CYCLE = 8
+
+
+def _isolated_projection(*, qty=30, amount=None, fees=ISOLATED_FEES,
+                        account_id=LEDGER_ACCOUNT, cycle_id=LEDGER_CYCLE):
+    """委托数量未知、单一成交行的投影；``amount`` 决定加权成交价。"""
+    gross = qty * LEDGER_PRICE if amount is None else amount
+    return _projection(
+        _order(status="partially_filled", qty=None, account_id=account_id,
+               cycle_id=cycle_id),
+        (_fill(qty=qty, amount=gross, fees=fees, account_id=account_id),),
+    )
+
+
+#: 成对投影：每对的差异**恰好**是键名那一个字段。
+ISOLATED_DIMENSIONS = {
+    "filled_qty": (
+        _isolated_projection(qty=30),
+        _isolated_projection(qty=40, amount=40 * LEDGER_PRICE),
+    ),
+    "fill_price": (
+        _isolated_projection(qty=30),
+        _isolated_projection(qty=30, amount=30 * 11.0),
+    ),
+    "fees": (
+        _isolated_projection(qty=30, fees=1.0),
+        _isolated_projection(qty=30, fees=2.0),
+    ),
+    # 归属身份：同一条成交被搬到另一个账户 / 另一个周期，必须报冲突 ——
+    # 否则一次跨 owner 的 PnL 归因会静默落到错误的账户上。
+    "account_id": (
+        _isolated_projection(account_id="acct"),
+        _isolated_projection(account_id="acct2"),
+    ),
+    "cycle_id": (
+        _isolated_projection(cycle_id=8),
+        _isolated_projection(cycle_id=9),
+    ),
+}
+
+
+def _projection_fingerprint_inputs(projection):
+    """``_content_fingerprint`` 的输入（外加 verification），独立于被测实现。
+
+    用来断言**夹具**的隔离性：不依赖 adapter 的指纹函数，否则"指纹忽略了某字段"会让
+    隔离断言跟着一起失效，于是变异体永远杀不掉。
+    """
+    return {
+        "version": projection.version,
+        "identity": projection.identity,
+        "identity_kind": projection.identity_kind,
+        "order_id": projection.order_id,
+        "lifecycle_state": projection.lifecycle_state,
+        "fill_verdict": projection.fill_verdict,
+        "code": projection.code.as_dict(),
+        "action": projection.action.as_dict(),
+        "requested_qty": projection.requested_qty.as_dict(),
+        "filled_qty": projection.filled_qty.as_dict(),
+        "fill_price": projection.fill_price.as_dict(),
+        "fees": projection.fees.as_dict(),
+        "account_id": projection.account_id.as_dict(),
+        "cycle_id": projection.cycle_id.as_dict(),
+        "business_day": projection.business_day.as_dict(),
+        "observed_at": projection.observed_at.as_dict(),
+        "verification": dict(projection.verification),
+        "inconsistencies": list(projection.inconsistencies),
+    }
+
+
+def _differing_dimensions(first, second):
+    left, right = _projection_fingerprint_inputs(first), _projection_fingerprint_inputs(second)
+    return {key for key in left if left[key] != right[key]}
+
+
+def _ledger_definition(*, cycle_column=True):
+    """替身账本里 ``paper_orders`` 的列定义。
+
+    ``cycle_id`` 是后续迁移补上的列，因此真账本**可能还没有它** —— 这里两种形态都能造，
+    用来证明"没有该列"时读路径不崩、并且如实发布 ``unknown``，而不是回填一个推导值。
+    """
+    columns = [
+        "id INTEGER PRIMARY KEY", "account_id TEXT", "side TEXT", "code TEXT",
+        "qty INTEGER", "planned_price REAL", "filled_price REAL", "amount REAL",
+        "fees REAL", "status TEXT", "reason TEXT", "created_at TEXT",
+        "executed_at TEXT", "cancelled_at TEXT", "order_type TEXT",
+    ]
+    if cycle_column:
+        columns.append("cycle_id INTEGER")
+    return columns
+
+
+def _ledger(*, order_qty=100, fill_qty=100, fees=None, event_key=KEY_A,
+            account_id=LEDGER_ACCOUNT, cycle_id=LEDGER_CYCLE, cycle_column=True):
+    """``load_execution_evidence`` 会读到的列齐全的替身账本（``:memory:``）。
+
+    刻意**只用** owner 的读路径需要的列：这张夹具要证明的是"DB → owner 读口 → 投影 →
+    adapter"这条真实链路可用，而不是重建仓库的完整 schema。
+    """
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    conn.executescript(
+        "CREATE TABLE paper_orders (%s);"
+        "CREATE TABLE paper_fills ("
+        "    id INTEGER PRIMARY KEY AUTOINCREMENT, order_id INTEGER, account_id TEXT,"
+        "    side TEXT, code TEXT, qty INTEGER, price REAL, amount REAL, fees REAL,"
+        "    fill_date TEXT, quote_at TEXT, event_key TEXT"
+        ");" % ",".join(_ledger_definition(cycle_column=cycle_column))
+    )
+    amount = fill_qty * LEDGER_PRICE
+    charged = PTR.commission(amount) if fees is None else fees
+    order_columns = [
+        "id", "account_id", "side", "code", "qty", "planned_price", "filled_price",
+        "amount", "fees", "status", "reason", "created_at", "executed_at",
+        "cancelled_at", "order_type",
+    ]
+    order_values = [
+        7, account_id, "buy", "600001", order_qty, 10.4, LEDGER_PRICE, amount, charged,
+        "partially_filled" if order_qty is None else "filled", "",
+        CREATED_AT, f"{DAY} 10:30:00", None, "market",
+    ]
+    if cycle_column:
+        order_columns.append("cycle_id")
+        order_values.append(cycle_id)
+    conn.execute(
+        "INSERT INTO paper_orders(%s) VALUES(%s)"
+        % (",".join(order_columns), ",".join("?" for _ in order_columns)),
+        tuple(order_values),
+    )
+    conn.execute(
+        "INSERT INTO paper_fills(order_id,account_id,side,code,qty,price,amount,fees,"
+        "fill_date,quote_at,event_key) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+        (7, account_id, "buy", "600001", fill_qty, LEDGER_PRICE, amount, charged,
+         DAY, OBSERVED_AT, event_key),
+    )
+    conn.commit()
+    return conn
+
+
+def _ledger_projection(**kwargs):
+    """走 owner 的真实只读路径取一条投影，然后关掉连接。"""
+    conn = _ledger(**kwargs)
+    try:
+        rows = EE.load_execution_evidence(conn)
+    finally:
+        conn.close()
+    assert len(rows) == 1, rows
+    return EV.fact_projection(rows[0])
 
 
 def _module_source(name):
@@ -922,6 +1108,239 @@ class AdapterBoundaryTests(unittest.TestCase):
                     continue
                 roots.add(node.module.split(".")[0])
         return roots
+
+
+class AttributionFactFingerprintTests(unittest.TestCase):
+    """EXEC-REF-21 ~ 28 —— B2C-4A：成交事实与归属身份进入内容指纹，但不进入核验语义。
+
+    这条不变量是：**同一条 execution identity 下，成交数量 / 价格 / 费用 / 归属账户 /
+    归属周期被改写必须报 ``EvidenceConflict``，而"这个结论可不可信"的归口一个字都不许动。**
+
+    两件事必须分开：B2C-3 建立了核验归口，B2C-4A 只增加事实内容。本组同时锁住
+    "内容变了要红"（21 ~ 23、26 ~ 27）与"核验语义没被顺手改掉"（24）。
+    """
+
+    def _assert_single_dimension(self, name):
+        """夹具自检：这一对投影**只**在 ``name`` 上不同。
+
+        少了这一步，用例会以错误的原因变绿 —— 例如 verdict / lifecycle 也变了，那么
+        去掉指纹里的 ``name`` 之后冲突仍然由别的维度触发，"该字段进了指纹"就没被证明。
+        """
+        first, second = ISOLATED_DIMENSIONS[name]
+        self.assertEqual(
+            {name}, _differing_dimensions(first, second),
+            f"这一对投影必须只在 {name} 上不同，否则本用例测的不是指纹覆盖",
+        )
+        return first, second
+
+    def _assert_conflict(self, name):
+        first, second = self._assert_single_dimension(name)
+        first_ref = ADA.evidence_ref_from_execution_projection(first)
+        second_ref = ADA.evidence_ref_from_execution_projection(second)
+
+        self.assertEqual(first_ref.identity(), second_ref.identity(), "必须是同一条事实")
+        self.assertNotEqual(first_ref.fact_state(), second_ref.fact_state())
+
+        with self.assertRaises(ARC.EvidenceConflict):
+            ARC.ResearchHypothesis(
+                hypothesis_id="H-EXEC-1", as_of=DAY, subject="600001", thesis="t",
+                evidence=(
+                    ARC.HypothesisEvidence(ref=first_ref, relation=ARC.RELATION_SUPPORTS),
+                    ARC.HypothesisEvidence(ref=second_ref, relation=ARC.RELATION_SUPPORTS),
+                ),
+            )
+        return first_ref, second_ref
+
+    def test_EXEC_REF_21_a_changed_filled_quantity_is_a_conflict(self):
+        """EXEC-REF-21：同 identity + ``filled_qty`` 改变 → ``EvidenceConflict``。
+
+        "成交了 30 股"与"成交了 40 股"不是同一条事实。B2C-4A 之前 ``filled_qty`` 不在
+        指纹里，这两条会被静默去重成一个依据 —— 研究报告的结论因此可以悄悄换掉依据。
+        """
+        first_ref, second_ref = self._assert_conflict("filled_qty")
+        self.assertEqual(
+            (30, 40),
+            (
+                ISOLATED_DIMENSIONS["filled_qty"][0].filled_qty.require(),
+                ISOLATED_DIMENSIONS["filled_qty"][1].filled_qty.require(),
+            ),
+        )
+        self.assertNotEqual(
+            first_ref.detail["content_fingerprint"], second_ref.detail["content_fingerprint"],
+        )
+
+    def test_EXEC_REF_22_a_changed_fill_price_is_a_conflict(self):
+        """EXEC-REF-22：同 identity + ``fill_price`` 改变 → ``EvidenceConflict``。
+
+        数量相同但成交价不同意味着不同的一笔成交（或同一笔被改写）。指纹必须看得见它。
+        """
+        first, second = ISOLATED_DIMENSIONS["fill_price"]
+        self.assertAlmostEqual(10.5, first.fill_price.require())
+        self.assertAlmostEqual(11.0, second.fill_price.require())
+        self.assertEqual(first.filled_qty.as_dict(), second.filled_qty.as_dict())
+        self._assert_conflict("fill_price")
+
+    def test_EXEC_REF_23_a_changed_fee_is_a_conflict(self):
+        """EXEC-REF-23：同 identity + ``fees`` 改变 → ``EvidenceConflict``。
+
+        费用是 PnL attribution 的直接输入：同一条成交在两次观测之间费用从 1.0 变成 2.0，
+        研究结论的依据已经不同，不能静默当成"同一条证据"。
+        """
+        first, second = ISOLATED_DIMENSIONS["fees"]
+        self.assertEqual(1.0, first.fees.require())
+        self.assertEqual(2.0, second.fees.require())
+        self.assertEqual(first.fill_price.as_dict(), second.fill_price.as_dict())
+        self._assert_conflict("fees")
+
+    def test_EXEC_REF_24_factual_fields_do_not_touch_the_owner_verification_mapping(self):
+        """EXEC-REF-24：新增成交事实**不**参与核验语义。
+
+        两条只差一个 factual 字段的投影必须给出**逐字相同**的 owner-neutral 核验结论：
+        ``owner_verification.canonical()`` 相同、market 兼容面相同，``fact_state`` 的差异
+        **只**来自内容指纹。B2C-4A 加的是事实内容，不是核验词表。
+        """
+        for name in ISOLATED_DIMENSIONS:
+            with self.subTest(field=name):
+                first, second = ISOLATED_DIMENSIONS[name]
+                first_ref = ADA.evidence_ref_from_execution_projection(first)
+                second_ref = ADA.evidence_ref_from_execution_projection(second)
+
+                self.assertEqual(
+                    first_ref.owner_verification.canonical(),
+                    second_ref.owner_verification.canonical(),
+                )
+                self.assertEqual(first_ref.verification, second_ref.verification)
+                self.assertEqual(first_ref.verification_method, second_ref.verification_method)
+                self.assertEqual(
+                    first_ref.cross_source_verified, second_ref.cross_source_verified,
+                )
+                self.assertEqual(first_ref.is_verified, second_ref.is_verified)
+                self.assertEqual(first_ref.fact_state()[0], second_ref.fact_state()[0])
+                self.assertNotEqual(first_ref.fact_state()[1], second_ref.fact_state()[1])
+
+        # 归口表仍然只按 (owner 状态, owner 来源) 分派 —— 它不认识任何 factual 字段。
+        for pair in ADA._EXECUTION_OUTCOME_BY_VERIFICATION:
+            with self.subTest(pair=pair):
+                self.assertEqual(2, len(pair))
+                self.assertIn(pair[0], EV.EXECUTION_STATUSES)
+                self.assertIn(pair[1], EV.EVIDENCE_SOURCES)
+
+    def test_EXEC_REF_25_the_owner_read_path_feeds_the_adapter_end_to_end(self):
+        """EXEC-REF-25：``load_execution_evidence`` → ``fact_projection`` → adapter 全链路。
+
+        这条路径用的是 owner **自己**的只读口（``paper_orders`` + ``paper_fills``），
+        不是 B2C-4C 将来要新写的 SQL。B2C-4A 的交付物正是"这条链路今天已经能给出
+        attribution 需要的成交事实"，因此这里从真实账本读一遍。
+        """
+        projection = _ledger_projection()
+        self.assertEqual(EV.IDENTITY_KIND_FILL_EVENT_KEY, projection.identity_kind)
+        self.assertEqual(KEY_A, projection.identity)
+        self.assertTrue(projection.business_day.is_known)
+        self.assertEqual(EE.EVIDENCE_KNOWN, projection.filled_qty.state)
+        self.assertEqual(100, projection.filled_qty.require())
+        self.assertEqual(100, projection.requested_qty.require())
+        self.assertEqual(10.5, projection.fill_price.require())
+        self.assertEqual(PTR.commission(100 * LEDGER_PRICE), projection.fees.require())
+        self.assertEqual("600001", projection.code.require())
+        self.assertEqual("buy", projection.action.require())
+
+        ref = ADA.evidence_ref_from_execution_projection(projection)
+        self.assertEqual(ARC.EVIDENCE_SOURCE_EXECUTION, ref.source_type)
+        self.assertEqual(f"{EV.IDENTITY_KIND_FILL_EVENT_KEY}|{KEY_A}", ref.source_id)
+        self.assertEqual(DAY, ref.as_of)
+        self.assertEqual(ARC.OWNER_OUTCOME_VERIFIED, ref.owner_verification.outcome)
+        self.assertIs(True, ref.is_verified)
+        self.assertEqual(64, len(ref.detail["content_fingerprint"]))
+
+        # ``detail`` **不**复制成交事实或归属身份：它是 identity + 核验 + 指纹，
+        # 不是第二份 payload。
+        for name in EV.EXECUTION_FACTUAL_FIELDS + ("account_id", "cycle_id"):
+            with self.subTest(not_in_detail=name):
+                self.assertNotIn(name, ref.detail)
+
+        # 账本里那一笔流水的费用被改写 → 指纹变、报冲突（同一 identity、同一天）。
+        rewritten = _ledger_projection(order_qty=None, fill_qty=30, fees=ISOLATED_FEES)
+        changed = _ledger_projection(order_qty=None, fill_qty=30, fees=2.0)
+        self.assertEqual({"fees"}, _differing_dimensions(rewritten, changed))
+        rewritten_ref = ADA.evidence_ref_from_execution_projection(rewritten)
+        changed_ref = ADA.evidence_ref_from_execution_projection(changed)
+        self.assertEqual(rewritten_ref.identity(), changed_ref.identity())
+        with self.assertRaises(ARC.EvidenceConflict):
+            ARC.ResearchHypothesis(
+                hypothesis_id="H-EXEC-1", as_of=DAY, subject="600001", thesis="t",
+                evidence=(
+                    ARC.HypothesisEvidence(ref=rewritten_ref, relation=ARC.RELATION_SUPPORTS),
+                    ARC.HypothesisEvidence(ref=changed_ref, relation=ARC.RELATION_SUPPORTS),
+                ),
+            )
+
+    def test_EXEC_REF_26_a_changed_account_is_a_conflict(self):
+        """EXEC-REF-26：同 identity + ``account_id`` 改变 → ``EvidenceConflict``。
+
+        旧 ``pnl_attribution`` 按**账户**归因，B2C-4B 的 portfolio fact 也以
+        ``cycle_id / account_id / asof_day`` 为上下文。同一条成交被搬到另一个账户却仍被
+        当成"同一条证据"，会让一次跨 owner 的 PnL 归因静默落到错误的账户上。
+        """
+        first, second = ISOLATED_DIMENSIONS["account_id"]
+        self.assertEqual(LEDGER_ACCOUNT, first.account_id.require())
+        self.assertEqual("acct2", second.account_id.require())
+        self.assertEqual(first.cycle_id.as_dict(), second.cycle_id.as_dict())
+        self._assert_conflict("account_id")
+
+    def test_EXEC_REF_27_a_changed_cycle_is_a_conflict(self):
+        """EXEC-REF-27：同 identity + ``cycle_id`` 改变 → ``EvidenceConflict``。
+
+        周期是 PnL 归因的另一个 join 键（组合事实按 cycle 定界）。把一条成交换到另一个
+        周期必须报冲突，而不是静默接受。
+        """
+        first, second = ISOLATED_DIMENSIONS["cycle_id"]
+        self.assertEqual(LEDGER_CYCLE, first.cycle_id.require())
+        self.assertEqual(9, second.cycle_id.require())
+        self.assertEqual(first.account_id.as_dict(), second.account_id.as_dict())
+        self._assert_conflict("cycle_id")
+
+    def test_EXEC_REF_28_the_read_path_preserves_the_ownership_provenance(self):
+        """EXEC-REF-28：``load_execution_evidence`` → 投影确实保留 account / cycle provenance。
+
+        这条 join identity 必须由 owner 的读路径带出来，B2C-4C 才不需要自己再查一遍
+        ``paper_orders``，也不需要依赖调用方"记得自己刚才按哪个 account 过滤"。
+        同时锁住 legacy 形态：**没有** ``cycle_id`` 列的老账本照常可读，周期归属如实报
+        ``unknown`` —— 不崩、不回填、不推给"当前周期"。
+        """
+        projection = _ledger_projection(account_id="acct_a", cycle_id=11)
+        self.assertEqual("acct_a", projection.account_id.require())
+        self.assertEqual(11, projection.cycle_id.require())
+        self.assertEqual(EE.EVIDENCE_KNOWN, projection.account_id.state)
+        self.assertEqual(EE.EVIDENCE_KNOWN, projection.cycle_id.state)
+
+        # 同一个账户下的另一条成交属于另一个周期 → 不同的事实（冲突），不是同一条。
+        other = _ledger_projection(account_id="acct_a", cycle_id=12)
+        self.assertEqual({"cycle_id"}, _differing_dimensions(projection, other))
+        with self.assertRaises(ARC.EvidenceConflict):
+            ARC.ResearchHypothesis(
+                hypothesis_id="H-EXEC-1", as_of=DAY, subject="600001", thesis="t",
+                evidence=(
+                    ARC.HypothesisEvidence(
+                        ref=ADA.evidence_ref_from_execution_projection(projection),
+                        relation=ARC.RELATION_SUPPORTS,
+                    ),
+                    ARC.HypothesisEvidence(
+                        ref=ADA.evidence_ref_from_execution_projection(other),
+                        relation=ARC.RELATION_SUPPORTS,
+                    ),
+                ),
+            )
+
+        # legacy 账本：paper_orders 还没有 cycle_id 列 → 照常读出，周期归属报 unknown。
+        legacy = _ledger_projection(cycle_column=False)
+        self.assertEqual(EE.EVIDENCE_KNOWN, legacy.account_id.state)
+        self.assertEqual(LEDGER_ACCOUNT, legacy.account_id.require())
+        self.assertEqual(EE.EVIDENCE_UNKNOWN, legacy.cycle_id.state)
+        self.assertIsNone(legacy.cycle_id.value)
+        self.assertIn("records no cycle", legacy.cycle_id.detail or "")
+        # 仍然可签发：缺的是**事实**，不是 PIT。
+        legacy_ref = ADA.evidence_ref_from_execution_projection(legacy)
+        self.assertEqual(DAY, legacy_ref.as_of)
 
 
 if __name__ == "__main__":
