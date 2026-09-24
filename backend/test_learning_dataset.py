@@ -1972,11 +1972,20 @@ class CutoffSpellingIndependenceTests(DbTestCase):
 
     # ── H. a fraction the parser *discards* is still refused ──
     #
-    # ``datetime.fromisoformat`` drops the fractional part of a zero-hour /
-    # zero-minute offset, so ``+00:00:00.100000`` parses to a plain UTC
-    # datetime whose wall clock *and* absolute instant both read as a whole
-    # second.  No semantic check can see the fraction the caller spelled; only
-    # a spelling gate can, which is why one is applied before parsing.
+    # A parser that drops the fractional part of a zero-hour / zero-minute /
+    # zero-second offset turns ``+00:00:00.100000`` into a plain UTC datetime
+    # whose wall clock *and* absolute instant both read as a whole second.  No
+    # semantic check can see the fraction the caller spelled; only a spelling
+    # gate can, which is why one is applied before parsing.
+    #
+    # *Whether* the running interpreter drops it is an implementation detail of
+    # ``datetime.fromisoformat``: CPython dropped it through 3.14.6 and preserves
+    # it from 3.14.7, where the semantic checks would refuse these spellings on
+    # their own.  The contract's guarantee therefore may not be stated by reading
+    # whichever shape the live parser produces.  These tests *state* the
+    # condition the gate exists for -- by pinning the module's parser to the
+    # value a fraction-discarding parser yields -- and then assert the refusal is
+    # made on the spelling, before any parsing.
 
     ZERO_OFF_FINE_A = "2026-01-02T10:00:00+00:00:00.100000"
     ZERO_OFF_FINE_B = "2026-01-02T10:00:00+00:00:00.900000"
@@ -1991,35 +2000,58 @@ class CutoffSpellingIndependenceTests(DbTestCase):
         "20260102T100000+000000.100000",         # basic ISO spelling
     )
 
+    def _assert_refused_on_the_spelling(self, values):
+        """The refusal is decided on the spelling, before the parser is reached.
+
+        The module's parser is pinned to the value a fraction-discarding parser
+        yields, so the proof does not rest on which shape the running interpreter
+        produces.  Under that pin the semantic path alone accepts the collapsed
+        instant -- which is what makes the gate load-bearing -- while every
+        fraction-carrying spelling is refused without the parser being consulted
+        at all.
+        """
+        collapsed = LD._parse_datetime(self.ZERO_OFF_FINE_UTC)
+        # Non-vacuity: the instant a fraction-discarding parser yields really is
+        # semantically clean ...
+        self.assertEqual(collapsed.microsecond, 0)
+        self.assertEqual(LD._utc_instant(collapsed).microsecond, 0)
+        with mock.patch.object(LD, "_parse_datetime", return_value=collapsed) as pinned:
+            # ... so the semantic path on its own accepts it ...
+            self.assertEqual(
+                LD.normalize_cutoff(self.ZERO_OFF_FINE_UTC), self.ZERO_OFF_FINE_UTC
+            )
+            self.assertTrue(pinned.called)
+            # ... and the fraction-carrying spellings must be refused *before*
+            # any parsing.  Remove the gate and this turns red on every
+            # interpreter: the parser is reached and the collapsed instant is
+            # accepted as the caller's cutoff.
+            pinned.reset_mock()
+            for value in values:
+                with self.subTest(value=value):
+                    self.assertIsNone(LD.normalize_cutoff(value))
+            self.assertFalse(
+                pinned.called,
+                "拼写 gate 必须在解析之前拒绝，而不是靠语义检查顺手拒绝",
+            )
+
     def test_a_discarded_zero_offset_fraction_is_invisible_to_both_checks(self):
         """Non-vacuity: neither semantic check can see this case at all.
 
-        Where the interpreter still *parses* a fractional offset (3.11--3.13)
-        the module's own parser keeps a datetime whose wall clock and absolute
-        instant both read as a whole second, so a semantic-only guard would
-        accept it.  3.14 refuses these spellings at parse time and so fails
-        closed one layer earlier; the spelling gate is what makes the refusal a
-        property of the contract rather than of the interpreter.
+        A parser that discards a zero-offset fraction yields a whole second, and
+        both semantic checks are clean on it, so a semantic-only guard would
+        accept the cutoff.  The spelling gate is what refuses it -- and it does so
+        before parsing, which is asserted by pinning the parser rather than by
+        observing whichever shape the running interpreter happens to produce.
         """
-        import datetime as _dt
-
         for value in (self.ZERO_OFF_FINE_A, self.ZERO_OFF_FINE_B):
             with self.subTest(value=value):
                 # The gate is the only layer that can see the fraction ...
                 self.assertIsNotNone(LD._ZERO_OFFSET_FRACTION.search(value))
                 # ... and the contract refuses the cutoff.
                 self.assertIsNone(LD.normalize_cutoff(value))
-                # The module's own parser, though, keeps a whole second -- i.e.
-                # the semantic checks have nothing to object to.
-                parsed = LD._parse_datetime(value)
-                if parsed is None:
-                    continue  # 3.14+: the parser refuses the spelling outright
-                self.assertEqual(parsed.microsecond, 0)
-                self.assertEqual(LD._utc_instant(parsed).microsecond, 0)
-                self.assertEqual(
-                    parsed,
-                    _dt.datetime.fromisoformat("2026-01-02T10:00:00+00:00"),
-                )
+        self._assert_refused_on_the_spelling(
+            (self.ZERO_OFF_FINE_A, self.ZERO_OFF_FINE_B)
+        )
 
     def test_discarded_zero_offset_fraction_cutoffs_are_refused(self):
         for value in self.ZERO_OFF_FINE:
@@ -2054,20 +2086,22 @@ class CutoffSpellingIndependenceTests(DbTestCase):
         for value in (self.ZERO_OFF_FINE_A, self.ZERO_OFF_FINE_B):
             with self.subTest(value=value):
                 self.assertIsNone(LD.normalize_cutoff(value))
-        # ... and neither is accepted as the whole-second instant the parser
-        # collapsed both of them to -- which is exactly the collapse.
+        # ... and neither is accepted as the whole-second instant a
+        # fraction-discarding parser collapses both of them onto -- which is
+        # exactly the collapse.
         for value in (self.ZERO_OFF_FINE_A, self.ZERO_OFF_FINE_B):
             with self.subTest(value=value):
                 self.assertNotEqual(LD.normalize_cutoff(value), self.ZERO_OFF_FINE_UTC)
         # The whole-second instant itself keeps its identity (non-vacuous).
         self.assertEqual(LD.normalize_cutoff("2026-01-02T10:00:00+00:00"), self.ZERO_OFF_FINE_UTC)
-        # The two spellings differ textually, yet -- wherever the interpreter
-        # still parses a fractional offset -- the parser collapses them onto one
-        # datetime.  That is precisely why a *semantic* guard cannot separate
-        # them and a spelling gate is required.
-        parsed_a = LD._parse_datetime(self.ZERO_OFF_FINE_A)
-        if parsed_a is not None:
-            self.assertEqual(parsed_a, LD._parse_datetime(self.ZERO_OFF_FINE_B))
+        # The two spellings differ textually, yet a parser that discards a
+        # zero-offset fraction collapses them onto one whole-second instant.  That
+        # is precisely why a *semantic* guard cannot separate them and a spelling
+        # gate is required -- and why the separation is asserted here without
+        # reading the shape of whichever parser happens to be running.
+        self._assert_refused_on_the_spelling(
+            (self.ZERO_OFF_FINE_A, self.ZERO_OFF_FINE_B)
+        )
 
     def test_whole_second_zero_offsets_are_still_accepted(self):
         """Non-vacuous control: every whole-second zero-offset form keeps working."""

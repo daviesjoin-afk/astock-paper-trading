@@ -14,7 +14,7 @@ frontend/e2e/       Playwright 浏览器 E2E（合成数据 server.py + specs/ �
 docs/               运行手册、设置 PRD、策略平台、自进化、测试矩阵、发布说明、本文件
 docs/archive/       已完成的历史计划与快照（只作追溯）
 deploy/             服务器脚本（备份/恢复/健康检查/cron）
-.github/workflows/  CI（语法、ruff、锁文件、pip-audit、前端、测试 3.11/3.12、浏览器 E2E、Docker 冒烟）
+.github/workflows/  CI（语法、ruff、锁文件、pip-audit、前端、后端测试 Python 3.14、浏览器 E2E、Docker 冒烟）
 Dockerfile          应用镜像；docker-compose*.yml 本地与服务器编排
 ```
 

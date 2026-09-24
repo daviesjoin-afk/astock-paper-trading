@@ -5,11 +5,27 @@
 ## 开发流程
 
 1. 从 `master` 创建短分支，说明要解决的问题。
-2. 在 Python 3.11 或 3.12 环境安装 `requirements.lock`；`requirements.txt` 仅用于维护允许的版本范围。
+2. 使用 **Python 3.14** 安装 `requirements.lock`；`requirements.txt` 仅用于维护允许的版本范围。
 3. 运行 `python -m unittest discover -s backend -p "test_*.py" -v`。
 4. 运行 `ruff check backend` 和 `pip-audit --requirement requirements.lock --strict`；修改依赖后用仓库约定的 uv 命令重新生成锁文件。
 5. 对策略、撮合或风控改动补充回归测试，并在 PR 中说明数据假设和风险边界。
 6. 不提交 `data_cache/`、`reports/`、`.env`、日志、运行时数据库或任何凭据。
+
+## Python 运行时
+
+**Python 3.14 是本项目的 canonical development / CI / container runtime。** `Dockerfile` 的基础镜像、`.python-version`、Ruff `target-version`、依赖锁的编译目标与 GitHub Actions 的全部 Python 作业都以 3.14 为唯一版本。项目**不维护 per-PR 的多 Python 兼容矩阵**：不为每个 PR 重复在多个 Python minor 上跑同一套测试。
+
+因此本地与 agent 的默认验证流程是：
+
+```text
+python --version        → Python 3.14.x
+targeted tests          → Python 3.14
+full backend suite      → Python 3.14，最终只跑一次
+compileall / ruff       → Python 3.14
+GitHub backend 单测 CI  → Python 3.14（单一 lane）
+```
+
+提交 PR 时不要写成"分别在 3.11 / 3.12 / 3.14 运行"。确认旧解释器上是否还能跑属于一次性的人工兼容性检查，不构成 CI 承诺。`docker-smoke` 与 backend 单测是两个不同性质的 gate（前者验证生产镜像 + 无网络打包，后者验证宿主 runner + 锁文件），都要保留。
 
 ## 交易安全边界
 
