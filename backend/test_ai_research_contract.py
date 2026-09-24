@@ -9,6 +9,7 @@
 分四组：
 
     AI-*         contract 语义：两个维度分离、冲突、深冻结、PIT
+    AI-18*       JSON-like payload 边界：bytes / 非 str key 在**契约期**就 fail closed
     AI-TYPED-*   类型化 evidence：identity 由 R24 投影派生，调用方不提供
     AIG-*        architecture guard：依赖方向、"AI 不能 commit signal"、无 IO/时钟
     非空性        护栏必须真的能失败，否则它只是装饰
@@ -26,6 +27,7 @@ import inspect
 import os
 import sys
 import unittest
+from collections.abc import Mapping
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -107,9 +109,13 @@ AUTHORITY_MODULES = (
     "strategy_champion.py",
 )
 
-#: 允许 import AI 研究层的生产模块。**现在为空**：R27-A 只建立契约，没有任何生产
-#: 消费者。将来接入时必须显式加入，使"谁依赖了 AI"是一次有意识的决定。
-ALLOWED_AI_CONSUMERS: set[str] = set()
+#: 允许 import AI 研究层的生产模块。**必须显式登记** —— "谁依赖了 AI"是一次有意识
+#: 的决定，而不是静默扩散。
+#:
+#: R27-A 时为空（只有契约，没有消费者）。R27-B1 新增**第一个**消费者：
+#: ``ai_research_provider`` —— 把 typed ``InformationEvent`` 投给 LLM，再把输出映射回
+#: ``ResearchHypothesis``。它只是 adapter，不是 authority；authority 仍然不得反向 import。
+ALLOWED_AI_CONSUMERS: set[str] = {"ai_research_provider.py"}
 
 #: 时钟 / 随机数 / IO —— 研究契约一旦读它们，就能拿 current state 回填历史。
 FORBIDDEN_CLOCK_CALLS = (
@@ -812,13 +818,104 @@ class AiResearchImmutabilityTests(unittest.TestCase):
                         as_of=DAY, source="s", evidence_ref=_ref(), payload={"v": bad},
                     )
 
-        # 标量与 None 是允许的。
+        # 标量与 None 是允许的（bytes 刻意不在其中 —— 见 AI-18b）。
         event = ARC.InformationEvent(
             as_of=DAY, source="s", evidence_ref=_ref(),
-            payload={"price": 10.5, "flag": True, "note": None, "count": 3, "b": b"x"},
+            payload={"price": 10.5, "flag": True, "note": None, "count": 3},
         )
         self.assertEqual(10.5, event.payload["price"])
         self.assertIsNone(event.payload["note"])
+
+    def test_AI18b_bytes_fails_closed_at_the_contract_boundary(self):
+        """AI-18b：``bytes`` 在契约边界就拒绝 —— 绝不放行到下游的裸 json.dumps。
+
+        R27 的 payload / detail 是要投给 JSON provider 的 JSON-like 内容，而
+        ``json.dumps`` **从不**接受 bytes。若契约放行 bytes，一个**合法构造**的 typed
+        event 会一路走到下游序列化才抛
+        ``TypeError: Object of type bytes is not JSON serializable`` ——
+        那是一个没有契约的失败：不在本层、没有 machine reason、也无法保证在任何网络
+        调用之前发生。本层因此是唯一正确的拒绝点。
+
+        拒绝文案逐字列出合法标量，使"bytes 会被拒绝"这件事可被调用方稳定依赖。
+        """
+        cases = (
+            (b"x", "bytes"),
+            (bytearray(b"x"), "bytearray"),
+            ({"k": b"x"}, "bytes"),
+            ([b"x"], "bytes"),
+            ({"s": {b"x"}}, "bytes"),
+            ({"deep": {"inner": [b"x"]}}, "bytes"),
+        )
+        for bad, offender in cases:
+            with self.subTest(value=type(bad).__name__):
+                with self.assertRaises(TypeError) as caught:
+                    ARC.InformationEvent(
+                        as_of=DAY, source="s", evidence_ref=_ref(), payload={"v": bad},
+                    )
+                message = str(caught.exception)
+                self.assertIn(f"got {offender}", message)
+                self.assertIn("JSON-like", message)
+
+    def test_AI18c_non_string_mapping_keys_are_rejected(self):
+        """AI-18c：mapping key 也必须是 ``str`` —— 只查 value 会留下同族的后门。
+
+        ``{b"k": 1}`` 的 value 完全合法，却会让 ``json.dumps`` 抛
+        ``TypeError: keys must be str, int, float, bool or None, not bytes``。
+        契约声称"payload 是 JSON-like 内容"，这个声称就必须在**构造期**完整成立，
+        而不是只对 value 成立。
+
+        ``detail`` 走同一个 freezer，因此自动受同一约束。
+        """
+        for bad_key in (b"k", 1, None, ("a",), True):
+            with self.subTest(key=type(bad_key).__name__):
+                with self.assertRaises(TypeError) as caught:
+                    ARC.InformationEvent(
+                        as_of=DAY, source="s", evidence_ref=_ref(), payload={bad_key: 1},
+                    )
+                self.assertIn("mapping keys must be str", str(caught.exception))
+
+    def test_AI18d_accepted_content_is_always_json_like(self):
+        """AI-18d：契约接受的任何 payload，递归下去只有 JSON-like 标量与 str key。
+
+        这是 AI-18b / AI-18c 的**非空性**对照：把 freezer 收紧成一律拒绝也能让上面两条
+        变绿，所以必须同时证明"该接受的确实接受"。
+
+        断言的是**契约自己的**保证（递归的标量 / key 形状），而不是"能直接
+        ``json.dumps``"：契约把 set 规范化为 frozenset、把序列规范化为 tuple，
+        再由 provider 的 ``_jsonable`` 做一层形状还原 —— 端到端的可序列化由
+        RPROV-24 在 provider 那一侧锁定。契约层不 import provider（依赖方向单向）。
+        """
+        payload = {
+            "price": 10.5, "flag": True, "note": None, "count": 3,
+            "tags": {"a", "b"}, "items": (1, 2), "nested": {"deep": [{"x": 1}]},
+        }
+        event = ARC.InformationEvent(
+            as_of=DAY, source="s", evidence_ref=_ref(), payload=payload,
+        )
+
+        leaves = []
+
+        def walk(value):
+            if isinstance(value, Mapping):
+                for key, item in value.items():
+                    self.assertIsInstance(key, str)
+                    walk(item)
+                return
+            if isinstance(value, (tuple, frozenset, list, set)):
+                for item in value:
+                    walk(item)
+                return
+            leaves.append(value)
+
+        walk(event.payload)
+        self.assertTrue(leaves, "非空性：必须真的走到了叶子")
+        for leaf in leaves:
+            with self.subTest(leaf=repr(leaf)[:30]):
+                self.assertTrue(
+                    leaf is None or isinstance(leaf, (str, bool, int, float)),
+                    f"契约放行了非 JSON-like 标量 {type(leaf).__name__}",
+                )
+                self.assertNotIsInstance(leaf, (bytes, bytearray))
 
     def test_AI19_hypothesis_projection_declares_itself_non_authoritative(self):
         """AI-19：投影自带"这只是研究"的结论，供下游离线判断。"""
@@ -878,11 +975,18 @@ class AiResearchArchitectureGuardTests(unittest.TestCase):
         )
 
     def test_AIG02_no_authority_module_imports_the_ai_research_layer(self):
-        """AIG-02：现有 authority 不得 import AI 研究层（依赖方向单向）。"""
+        """AIG-02：现有 authority 不得 import AI 研究层（依赖方向单向）。
+
+        R27-B1 起 AI 层有三个模块（契约 / transport / typed adapter）；authority
+        反向 import **其中任何一个**都算违规 —— 只守住契约会留下
+        "authority 直接 import adapter 发请求"这个后门。
+        """
         offenders = []
         for name in AUTHORITY_MODULES:
             for imported in _imported_names(_tree(name)):
-                if imported.split(".")[0] == "ai_research_contract":
+                if imported.split(".")[0] in (
+                    "ai_research_contract", "ai_research_provider", "ai_provider_transport",
+                ):
                     offenders.append(f"{name}: import {imported}")
         self.assertEqual(
             [], offenders,

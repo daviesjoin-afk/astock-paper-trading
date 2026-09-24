@@ -77,10 +77,9 @@ import os
 import re
 import sqlite3
 import time
-import urllib.parse
-import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+import ai_provider_transport as transport
 from adaptive_common import _json, _loads, _now
 
 # ─── 槽位与审核模式 ───
@@ -141,7 +140,7 @@ DISAGREEMENT_CODES = (
     DISAGREEMENT_NO_MERGEABLE_PROPOSAL,
 )
 
-# ─── 字段边界 ───
+# ─── 字段边界（槽位配置的**保存**校验；协议层边界见 ai_provider_transport）───
 MAX_API_KEY_LENGTH = 200
 MAX_BASE_URL_LENGTH = 500
 MAX_MODEL_LENGTH = 100
@@ -149,8 +148,6 @@ MAX_DISPLAY_NAME_LENGTH = 40
 DEFAULT_TIMEOUT_SECONDS = 40
 MIN_TIMEOUT_SECONDS = 5
 MAX_TIMEOUT_SECONDS = 300
-
-_CHAT_COMPLETIONS_SUFFIX = "/chat/completions"
 
 # 旧库迁移：历史上 dual_ai_api_keys 里只有这两个厂商身份。
 # 这里是一次性回填映射，**不是**运行期分支；迁移后的 display_name 沿用旧标签，
@@ -216,58 +213,23 @@ def resolve_slot(value):
 
 
 def normalize_base_url(value):
-    """规范化 base_url：去空白、去尾斜杠；若用户直接粘贴完整接口地址也接受。"""
-    text = str(value or "").strip().rstrip("/")
-    if text.lower().endswith(_CHAT_COMPLETIONS_SUFFIX):
-        text = text[: -len(_CHAT_COMPLETIONS_SUFFIX)].rstrip("/")
-    return text
+    """兼容别名 —— 实现在 :mod:`ai_provider_transport`（网络层唯一 owner）。"""
+    return transport.normalize_base_url(value)
 
 
 def chat_completions_url(base_url):
-    """由 base_url 拼出 Chat Completions 地址。``/v1`` 与 ``/v1/`` 等价。"""
-    base = normalize_base_url(base_url)
-    if not base:
-        raise ValueError("base_url_missing")
-    return base + _CHAT_COMPLETIONS_SUFFIX
+    """兼容别名 —— 实现在 :mod:`ai_provider_transport`。"""
+    return transport.chat_completions_url(base_url)
 
 
 def is_usable_base_url(value):
-    """base_url 是否是**真能发请求**的地址：scheme ∈ {http, https} 且 hostname 非空。
-
-    这是 readiness 用的宽松判定（不抛异常），既兜住保存校验，也兜住历史脏数据。
-    """
-    text = normalize_base_url(value)
-    if not text or any(ch.isspace() for ch in text):
-        return False
-    try:
-        parts = urllib.parse.urlsplit(text)
-        hostname = parts.hostname
-    except ValueError:  # 例如非法 IPv6 字面量
-        return False
-    return parts.scheme.lower() in ("http", "https") and bool(hostname)
+    """兼容别名 —— 实现在 :mod:`ai_provider_transport`。"""
+    return transport.is_usable_base_url(value)
 
 
 def validate_base_url(value):
-    """保存时的严格校验：不合法直接 ``ValueError``，把清晰原因回给调用方。
-
-    刻意**不**依赖浏览器 ``<input type=url>`` —— 接口可能被直接调用，校验必须在
-    后端。空字符串表示"未配置 / 清除该字段"，允许通过（由 readiness 拦下）。
-    """
-    text = normalize_base_url(value)
-    if not text:
-        return ""
-    if any(ch.isspace() for ch in text):
-        raise ValueError("base_url 不能包含空白字符")
-    try:
-        parts = urllib.parse.urlsplit(text)
-        hostname = parts.hostname
-    except ValueError as exc:
-        raise ValueError("base_url 无法解析：%s" % exc) from exc
-    if parts.scheme.lower() not in ("http", "https"):
-        raise ValueError("base_url 必须以 http:// 或 https:// 开头")
-    if not hostname:
-        raise ValueError("base_url 缺少主机名")
-    return text
+    """兼容别名 —— 实现在 :mod:`ai_provider_transport`。"""
+    return transport.validate_base_url(value)
 
 
 def _clamp_timeout(value):
@@ -739,47 +701,23 @@ def review_settings_view(conn):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def build_request_body(slot_config, system_prompt, user_prompt, max_tokens=1800):
-    """构造最小公共 OpenAI 兼容请求体。
+    """兼容别名 —— 请求体构造已收敛到 :mod:`ai_provider_transport`。
 
-    刻意**只**包含所有兼容端点都认识的字段；没有任何按槽位身份增删字段的逻辑
-    （历史上 DeepSeek 会被额外塞 ``thinking``，那正是本 PR 要消灭的厂商耦合）。
+    保留本入口是因为调用方与回归测试依赖它（``test_t12`` / ``test_t13``）；
+    它现在只是一层转发，不再自己持有协议定义。
     """
-    model = str(slot_config.get("model") or "").strip()
-    if not model:
-        raise RuntimeError("%s_model_missing" % slot_config.get("slot"))
-    return {
-        "model": model,
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ],
-        "response_format": {"type": "json_object"},
-        "max_tokens": max(400, min(int(max_tokens), 4000)),
-        "stream": False,
-    }
+    return transport.build_request_body(
+        slot_config, system_prompt, user_prompt, max_tokens=max_tokens)
 
 
 def _call_slot(slot_config, system_prompt, user_prompt, max_tokens=1800):
-    """调用单个槽位，返回 (parsed_json, input_tokens, output_tokens, latency_ms)。"""
-    api_key = str(slot_config.get("api_key") or "")
-    if not api_key.strip():
-        raise RuntimeError("%s_api_key_missing" % slot_config.get("slot"))
-    url = chat_completions_url(slot_config.get("base_url"))
-    body = build_request_body(slot_config, system_prompt, user_prompt, max_tokens=max_tokens)
-    request = urllib.request.Request(
-        url,
-        data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
-        headers={"Authorization": "Bearer " + api_key, "Content-Type": "application/json"},
-        method="POST",
-    )
-    started = time.monotonic()
-    with urllib.request.urlopen(request, timeout=float(slot_config.get("timeout_seconds") or DEFAULT_TIMEOUT_SECONDS)) as response:
-        payload = json.loads(response.read().decode("utf-8"))
-    latency_ms = round((time.monotonic() - started) * 1000)
-    content = payload["choices"][0]["message"]["content"]
-    usage = payload.get("usage") or {}
-    parsed = json.loads(content)
-    return parsed, int(usage.get("prompt_tokens") or 0), int(usage.get("completion_tokens") or 0), latency_ms
+    """兼容别名 —— 真实网络调用已收敛到 :mod:`ai_provider_transport`。
+
+    返回结构保持 ``(parsed_json, input_tokens, output_tokens, latency_ms)`` 不变，
+    因此审核编排、dual 共识与审计路径的行为完全不受影响。
+    """
+    return transport.call_json(
+        slot_config, system_prompt, user_prompt, max_tokens=max_tokens)
 
 
 def slot_config_snapshot(cfg):

@@ -764,7 +764,8 @@ Risk → Order → Fill（各自既有 authority）
 8. **为 R27 AI 预留的插槽**：AI 以后可以是 **Candidate Producer**，但**不是**
    Signal Persistence Owner / Risk Authority / Promotion Authority。
    `R25 does NOT allow AI to write signals.` R27-A 已落地这条插槽的研究侧契约
-   （见「AI Information & Research Contract（R27-A）」）：AI 输出是 research，
+   （见「AI Information & Research Contract（R27-A）」），R27-B1 补上真实的 typed
+   provider adapter（见「AI Research Provider Adapter（R27-B1）」）：AI 输出是 research，
    且 `commit_signal` 要求真正的 `SignalDecision`，把研究假设当裁决传入会在落库前失败。
 9. 回归门禁见 `backend/test_signal_pipeline.py`（SIG01 ~ SIG15 契约 / writer /
    ledger 集成，SIG-WRITER-01 ~ 05 的 Decision→Commit 契约；SIGG01 ~ SIGG05 架构
@@ -918,8 +919,9 @@ R26 Execution Evidence   │        （只读、纯契约）              │
 它不 import `signal_service` / `execution_*` / `paper_*` / `promotion_*`，也不 import
 DB、网络、时钟、随机数或任何 LLM SDK 模块。依赖方向单向：
 **authority 绝不 import AI 研究层**（guard AIG-02 / AIG-03）。接入生产消费者必须
-先把模块登记进 `ALLOWED_AI_CONSUMERS`（当前为空），使"谁依赖了 AI"是一次有意识的
-决定而不是静默扩散。
+先把模块登记进 `ALLOWED_AI_CONSUMERS`，使"谁依赖了 AI"是一次有意识的决定而不是静默
+扩散；R27-A 时该集合为空，R27-B1 起唯一成员是 `ai_research_provider`（见
+「AI Research Provider Adapter（R27-B1）」）。
 
 ### 两个正交维度（本契约的核心）
 
@@ -1091,6 +1093,153 @@ relation 强制成 supports、identity 丢失观测时点、冲突 duplicate fir
 deep freeze 退回浅冻结、identity 丢失观测主体、内容指纹退出冲突判定，必须全部 CAUGHT
 （survived = 0、fake = 0）。
 
+## AI Research Provider Adapter（R27-B1）
+
+R27-A 只定义了**契约**：没有任何东西能真的去问模型。R27-B1 补上这条链路的第一段实
+代码，并把它切成两个职责不同、依赖方向明确的模块。
+
+### 能力变化（不是文件清单）
+
+| 之前（R27-A） | 现在（R27-B1） |
+| --- | --- |
+| 契约只能被构造，没有真实 provider | 可以把一组 typed 事实真的投给 LLM 并取回研究结论 |
+| 网络调用散落在厂商耦合的历史模块里 | AI provider 的 HTTP **收敛成一个 vendor-neutral 边界** |
+| `ai_research_contract` 没有生产消费者 | `ai_research_provider` 是**第一个**显式登记的消费者 |
+
+### 依赖方向与两个新模块
+
+```text
+R27-A  ai_research_contract        纯契约：无网络、无 DB、无 provider、无时钟
+                 ↑
+R27-B1  ai_research_provider       contract ↔ LLM 的 typed adapter
+                 ↓
+R27-B1  ai_provider_transport      provider-neutral OpenAI-compatible HTTP transport
+                 ↑
+        ai_review_service          继续拥有 ai1 / ai2 配置、审核模式与调参业务
+```
+
+`ai_provider_transport` 是**故意**很窄的一层："给定一份已经解析好的 provider config，
+执行一次 OpenAI-compatible JSON chat request"。它不认识 market / stock / signal /
+research / risk / execution / strategy / account / consensus / tuning —— 因此这里没有
+`if provider == "deepseek"`，也没有 `if slot == "ai1"`。`slot` 只出现在错误文案里。
+它不读 `os.getenv`、不开 `sqlite3`、不碰 `ai_provider_slots`：配置解析仍由外层负责。
+
+**没有第三套 provider 配置。** R27-B1 复用 `ai_review_service` 已存在的
+`ai1` / `ai2` 槽位模型（`api_key` / `base_url` / `model` / `timeout_seconds`），没有
+新增 `RESEARCH_API_KEY` / `OPENAI_API_KEY`，也没有第二个网络 owner。`ai_review_service`
+的 `build_request_body` / `_call_slot` / `normalize_base_url` / `chat_completions_url`
+保留为**薄包装**转发到 transport，因此现有调用方与 `test_ai_review_slots.py` 的行为
+逐字不变 —— 这是兼容性迁移，不是重写。
+
+### LLM 能决定什么、不能决定什么
+
+```text
+LLM 可以产生    thesis / confidence / evidence relation / narrative / counter_arguments
+LLM 无权产生    market fact、verification、verification_method、source_type、source_id、
+                as_of、status、reason、authority、signal / order / risk decision
+```
+
+准确表述是 **"LLM output is research reasoning mapped onto typed owner evidence"**，
+不是 "LLM output is trusted"。这条边界不靠 prompt 语气，而靠三件机械事实：
+
+1. **strict parser** —— 输出协议只认识那五个键。出现 `status` / `reason` /
+   `authority` / `is_authoritative` / `verification` / `verification_method` /
+   `source_type` / `source_id` / `as_of` 一律 `invalid_provider_response`，
+   **不**"忽略这些字段继续运行"。让越权输出明确 RED 比静默忽略更容易审计。
+2. **known evidence id** —— provider 返回的每个 `evidence_id` 必须已存在于本次输入。
+   未知 id 直接 fail closed，**绝不**新建一条 `ResearchEvidenceRef`，也绝不把未知 id
+   当 context。（provider 因此不能伪造一条不存在的证据。）
+3. **R27-A constructors** —— `HypothesisEvidence.ref` **直接复用**输入
+   `InformationEvent.evidence_ref`（不复制、不重建），`status` / `reason` 由
+   `ResearchHypothesis` 自己派生，adapter 不复制那些 if/else。
+
+于是这些结论是**由契约、而不是由 adapter 或 LLM** 决定的：
+
+```text
+verified + supports          → supported          （R27-A 派生）
+verified + context           → insufficient_evidence / no_supporting_evidence
+verified + contradicts       → unsupported
+single_source + supports     → insufficient_evidence / evidence_not_verified（禁止升级）
+没有任何 evidence            → insufficient_evidence / no_evidence（绝不默认 supported）
+```
+
+**provider 不能改写核验维度。** `single_source` 永远是 `single_source`，
+`not_attempted` 永远是 `not_attempted`，`coverage_integrity` 的 `verification_method`
+逐字保留。adapter 刻意**不**比较 `ref.verification == "verified"` 来推断双源 ——
+那条判据属于 R24（`is_cross_source_verified`），需要时必须委托它（见 §「R24
+verification_method」）。本 adapter 正常路径甚至不需要这个判断。
+
+### PIT 与输入纪律
+
+调用顺序刻意是"先校验、后付费"：规范 caller 身份 → 类型校验 → PIT 预检 →
+去重/冲突检测 → **才**发起网络请求。因此 `event.as_of > 请求 as_of` 在任何请求发出前
+就被拒绝（回归断言 `network_calls == 0`），绝不先付费调用一次再在构造 hypothesis 时
+才发现 look-ahead。`as_of` 一律由调用方显式传入，adapter 不读墙上时钟。
+
+**PIT 预检刻意作用于全部原始 events，且排在去重之前。** 若把它建立在去重结果之上，
+重复判定的任何缺陷都会连带绕过 PIT —— 于是"是否付费调用"变成输入顺序的函数。同理，
+重复判定不能只看事实维度：`evidence_id` 只是 `evidence_ref.source_id`，而
+`InformationEvent` 自己还带独立的 `as_of` / `source` / `payload`，它们都会被渲染进
+provider 看到的投影。因此"安全去重"要求 identity、fact_state、`event.as_of`、
+`source` 与 payload **全部**一致；任何一项不同即 `EvidenceConflict`，不 first-wins、
+不 last-wins，两种输入顺序结果相同。这两处是**两道独立防线**，各自都能单独拦住
+look-ahead，不是同一判定的重复表述。
+
+输入 evidence 必须是 R27-A 的 typed `InformationEvent`；dict 或裸字符串
+（`source_id="xxx"`）不得冒充证据。同一 evidence 被声明成两种 relation 时，由 R27-A
+的 `EvidenceRelationConflict` 裁决，adapter 不自己挑一条。
+
+provider 输出协议是**严格 schema，嵌套对象同样严格**：顶层只认识那五个键，每个
+`evidence_relations` item 的键必须恰好是 `{evidence_id, relation}`。本轮刻意选 strict
+parser 而非 tolerant parser，所以"顶层拒绝 authority 字段、嵌套却静默接受"是不自洽的
+—— 嵌套里塞 `verification` / `authority` 同样判 `invalid_provider_response`。
+
+`confidence` 语义是 R27-A 的 `[0, 1]` 小数。`73` / `-0.2` / `1.5` / `true` /
+`"0.8"` 一律拒绝 —— 刻意**不**自动 `73 / 100`：猜一次就永久引入一个静默语义分支。
+输出长度有硬上界（thesis ≤ 2000 字符、narrative ≤ 8000 字符、
+counter_arguments ≤ 20 条、每条 ≤ 1000 字符），畸形返回不得无限增长。
+
+**Secret 安全**：API Key 不出现在异常文案、`repr`、日志或返回对象里；HTTP 错误只保留
+status code 与稳定 machine reason，绝不把 request headers / `Authorization` / prompt /
+response body 拼进异常。
+
+### 本轮仍然 deferred
+
+```text
+research persistence / ledger / hypothesis 落库   → 仍无 owner，留给 R27-B2
+research UI / API endpoint / frontend              → 未接入
+旧 AI 路径迁移（deepseek_research / ai_analysis /
+  adaptive_engine / dual_ai_tuner）                → 业务行为本轮不变，留给 R27-B2
+R24 provenance token（证明 reading 真的由 owner 产生）→ 仍然 deferred，本 PR 不解决
+```
+
+旧路径（`deepseek_advisor` / `deepseek_research` / `ai_analysis` / `disclosure_timeline`
+等）仍有自己的 `urllib` 调用。它们同时牵涉 provider、旧持久化、runtime scheduling 与
+API/UI；一次一起迁会让 review 无法区分"provider contract 是否正确"与"持久化迁移是否
+正确"，因此刻意留到 R27-B2。本轮只保证 **R27 的 provider 链路**网络 owner 唯一。
+
+`ai_research_provider` 不是 authority，也没有任何写路径：源码中不存在 `INSERT` /
+`UPDATE` / `DELETE` / `paper_signals` / `paper_orders` / `paper_fills` /
+`commit_signal` / `apply_tuner_proposals`。authority → AI 的依赖方向仍然为 0。
+
+### 回归门禁
+
+`backend/test_ai_provider_transport.py`：PROVIDER-01 ~ 10（请求体稳定、槽位不影响协议、
+配置不全 fail closed、非 object 响应 fail closed、错误不泄漏凭据、旧入口兼容）、
+RPROV-01 ~ 22（typed 输入、strict 输出协议、authority 边界、PIT 先于网络、证据去重与
+冲突、confidence 语义、长度上界）、RG-01 ~ 08（依赖方向、网络 owner 唯一、无写路径、
+guard 非空性）。语义 mutation 在 `work/r27b1_ai_provider_mutation_check.py`：
+unknown evidence_id 不再拒绝、relation 强制成 supports、authority 字段被接受、
+confidence >1 自动 /100、未来证据不在调用前拒绝、重复 id first-wins、
+transport 接受 JSON list、dict 冒充 typed evidence、重复判定只看事实维度（含"加上
+PIT 依赖去重结果"的复合形态，精确复现未来观测绕过 PIT）、PIT 依赖去重结果、
+嵌套 relation 接受额外字段，必须全部 CAUGHT（survived = 0、fake = 0）。
+
+PIT 与去重是两道独立防线的这一事实由 mutation 结构本身表达：单拆一道不会变红，
+故用复合 mutation 复现可观测的失效状态（`network_calls == 0` 不再成立、结果依赖
+collection order），并把"两种输入顺序都必须 look_ahead"钉成永久回归 `RPROV-10b`。
+
+
 ## 目标依赖方向
 
 ```text
@@ -1127,6 +1276,11 @@ network I/O 进入 DB writer transaction
 signal 侧自带"什么算双源"的判据（R25：必须委托 is_cross_source_verified）
 绕过 Decision→Commit 边界写 signal（R25：commit_signal 必须消费 SignalDecision，
 调用方不得自述 status/reason/裁决 payload）
+AI provider 网络 owner 不唯一（R27-B1：AI provider 的 urlopen 只允许在
+ai_provider_transport；research contract / typed adapter 不得直接联网）
+LLM 输出声明事实身份或裁决字段（R27-B1：status / reason / authority /
+verification / verification_method / source_type / source_id / as_of 一律
+invalid_provider_response，禁止"忽略后继续运行"）
 ```
 
 ### 仅作 review signal（不进入 CI gate）
