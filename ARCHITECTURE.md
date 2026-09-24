@@ -1526,7 +1526,7 @@ ai_research_service
 `ai_research_contract` —— provider 交出来的已经是契约对象，repository 会再独立校验一次；多
 一个消费者就多一份"两套规则必然漂移"的风险。
 
-### provider 配置权威只有一份
+### provider 配置权威：canonical research 与 legacy 路径的分界
 
 迁移后的 research runtime 的凭据来自 **canonical 槽位配置**（`ai_review_service`），不是
 legacy 的厂商环境变量：
@@ -1547,9 +1547,13 @@ legacy tuner / 研究套件         = deepseek_advisor.configured()（厂商环�
   的 disable 只挡住了 UI，挡不住真实付费调用。`enabled=False` 的结果是**零网络、零 canonical
   row、零 legacy row**，并返回 `status='blocked'` + 稳定 `error_code`。
 
-就绪判据只有一份：`slot_public_view`（GET 视图）与 research runtime 都从
-`slot_readiness` 取，谁都不许自己比较字段。配置解析失败（槽位映射不存在、读配置抛错）一律
-映射成声明的 best-effort 返回值，**不**裸异常逃逸。
+**R27 canonical research runtime 与 provider slot public view 共用同一 readiness predicate**
+（`slot_readiness`，`slot_public_view["ready"]` 从它派生）。`ai_review_service` 里既有的
+single / dual review 状态机（`test_slot` / `_run_single_review` / `_run_dual_review`）仍保留
+自己的 api_key / enabled / base_url / model 兼容检查与各自的 `status` 词汇 —— 本轮**不迁移、
+不重构**它们，因此这里不声称"整个模块只有一份就绪判断"。
+
+配置解析失败（槽位映射不存在、读配置抛错）一律映射成声明的 best-effort 返回值，**不**裸异常逃逸。
 
 ### 事务与网络边界
 
@@ -1647,7 +1651,7 @@ canonical 行不会被当成重新授权）、RUNTIME-11 ~ 12（网络 owner 仍
 = 两条 run 且没有业务键）、RUNTIME-15 ~ 17（canonical 表在首次运行之前不存在时读路径仍可用、
 `overview` 以 canonical 为准且旧行仍可见、`purpose` 过滤精确且有界）、RUNTIME-18 ~ 21
 （provider 配置权威：DB / UI-only 槽位可用、`enabled=False` 零网络、配置解析失败不裸逃逸、
-就绪判据只有一份），以及 service 的架构
+canonical research 与 slot public view 共用同一 readiness predicate），以及 service 的架构
 guard（import 闭集、不 import 契约、无 SQL、无网络、依赖方向不可反转）与扫描器非空性用例。
 
 语义 mutation 在 `work/r27b2b_research_runtime_mutation_check.py`：service 绕过 typed
@@ -1659,8 +1663,9 @@ dual-write legacy 表、`status == supported` 驱动 authority 标记、网络�
 
 RUNTIME-18 ~ 21 覆盖 provider 配置权威的四个方向：DB / UI-only 槽位（没有厂商环境变量）必须
 能跑完 research、`enabled=False` 的槽位必须零 provider 调用、配置解析失败必须按 best-effort
-契约稳定映射、就绪判据必须只有一份且与 GET 视图一致。前两条来自人工审核在 exact-head 上发现
-的**同一个根因**（provider 配置权威只收敛了一半），后两条是它必然伴生的语义缺口。
+契约稳定映射、canonical research 的就绪判据必须与 slot public view 一致。前两条来自人工审核
+在 exact-head 上发现的**同一个根因**（provider 配置权威只收敛了一半），后两条是它必然伴生的
+语义缺口。
 
 `RUNTIME-15` 是一条由**生产缺陷**写下来的回归：canonical 表只有在一次 append 之后才存在，
 而 `overview` 是每次刷新概览都会走的路径 —— 少了读路径的 schema 引导，全新库会直接
@@ -1736,9 +1741,10 @@ provider 网络调用进入 DB transaction（R27-B2B：一次 LLM 等待不得�
 canonical 读路径在台账尚不存在时崩溃（R27-B2B：overview 是每次刷新概览都会走
 的路径，读入口必须先保证 schema 已建；「首次运行之前读不到」必须表现为空，
 而不是 no such table）
-canonical research 的就绪判据被绕过或分叉（R27-B2B：就绪只有
-ai_review_service.slot_readiness 一份；忽略槽位 enabled 等于让操作员的 disable
-挡不住真实付费调用，而用 legacy 环境变量当准入条件会让 DB/UI-only 槽位永远跑不起来）
+canonical research 的就绪判据被绕过或分叉（R27-B2B：canonical research 与 slot
+public view 共用 ai_review_service.slot_readiness；忽略槽位 enabled 等于让操作员的
+disable 挡不住真实付费调用，而用 legacy 环境变量当准入条件会让 DB/UI-only 槽位永远
+跑不起来。legacy single/dual review 状态机的兼容检查本轮不迁移，不在本 guard 内）
 provider 配置解析异常裸逃逸（R27-B2B：槽位映射不存在或读配置失败必须映射成声明的
 best-effort 返回值，而不是把异常抛给调用方）
 ```

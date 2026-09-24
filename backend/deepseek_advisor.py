@@ -32,9 +32,11 @@ provider 链路的一部分。
 ``run_review`` 的 provider 凭据来自 ``ai_review_service`` 的 **canonical 槽位配置**，不是
 legacy 的 ``DEEPSEEK_API_KEY`` 环境变量：
 
-* **就绪判据只有一份**：``ai_review_service.slot_readiness()``。它同时要求 Key、操作员的
-  ``enabled``、可请求地址与模型 —— 因此"操作员禁用了槽位"会**真的**阻止网络请求，而不是
-  只阻止 UI 上的一次点击。
+* **canonical research 与 public view 共用同一 readiness predicate**：
+  ``ai_review_service.slot_readiness()``。它同时要求 Key、操作员的 ``enabled``、可请求地址与
+  模型 —— 因此"操作员禁用了槽位"会**真的**阻止网络请求，而不是只阻止 UI 上的一次点击。
+  （``ai_review_service`` 的 legacy single / dual review 状态机仍保留自己的兼容检查，
+  本轮不迁移、也不为文字一致性顺手重构。）
 * **legacy 的 ``configured()`` 不再是 canonical research 的准入条件**：只配在数据库 / UI 里的
   槽位（没有对应的厂商环境变量）过去会被错误判成"未配置"。反之，``configured()`` 仍然
   是尚未迁移的 tuner 与研究套件的凭据门禁 —— 两者刻意**不共用**同一个判据，因为它们问的是
@@ -582,11 +584,12 @@ def market_research_events(snapshot_paths):
 
 
 def _research_provider_config(connect_factory):
-    """解析 canonical 槽位配置并**判定就绪** —— provider 凭据的唯一来源。
+    """解析 canonical 槽位配置并**判定就绪** —— 已经迁移的 research 路径的 provider 凭据来源。
 
     本轮不新增 provider 配置模型，也没有第三套 API Key：槽位词表、解析与就绪判据都在
     ``ai_review_service``。legacy 的 provider 选择（``LLM_PROVIDER``）按既有别名表映射到
-    槽位，因此"这次研究由哪个厂商执行"不会被迁移顺手改掉。
+    槽位，因此"这次研究由哪个厂商执行"不会被迁移顺手改掉。尚未迁移的 tuner 与研究套件仍然
+    走它们自己的 legacy 凭据门禁（``configured()``），两者的判据刻意不同。
 
     两件事刻意都在这里、都在**任何网络请求之前**做完：
 
@@ -726,8 +729,22 @@ def run_review(connect_factory, paper_db_path, snapshot_paths, config=None, trig
     R27-B2B 迁移：本函数从"legacy ``call_json`` + 写 ``adaptive_advisor_runs``"改成 typed
     research orchestration（``ai_research_service`` → ``ai_research_provider`` →
     ``ai_research_runs``）。返回 dict 的键**保持不变**，因此四个既有调用方与 ``overview``
-    的接线不需要跟着改；``best-effort`` 语义也保持不变（只有 ``advisor_disabled`` /
-    ``api_key_missing`` 会抛错，其余失败以明确的 ``status='failed'`` + ``error_code`` 返回）。
+    的接线不需要跟着改。
+
+    迁移后的失败契约是 **best-effort，且只有``advisor_disabled`` 一个已声明的准入异常**：
+
+    * ``advisor_disabled`` —— 功能开关关闭，``raise RuntimeError("advisor_disabled")``；
+    * **canonical 槽位未就绪**（``not_configured`` / ``disabled`` / ``unusable_base_url`` /
+      ``model_missing`` / ``provider_slot_unavailable``）—— **不抛**，返回
+      ``status='blocked'`` + 稳定 ``error_code``；
+    * **provider / contract / persistence 失败** —— **不抛**，返回 ``status='failed'`` +
+      稳定 ``error_code``；
+    * **意外的配置解析异常** —— **不抛**，返回 ``status='failed'`` +
+      ``error_code='research_config_<ExceptionType>'``。
+
+    被 blocked 或被 failed 的运行**既不留 canonical 行、也不留 legacy 行**，并且**不**回落到
+    legacy provider 或 legacy 研究表。``configured()``（legacy 厂商环境变量）**不是**本函数的
+    准入条件 —— 它只留给尚未迁移的 tuner 与研究套件。
 
     ``paper_db_path`` / ``snapshot_paths`` 刻意保留在签名里（调用方契约不变），但本函数不再
     读它们 —— typed 路径只接受 authority 签发的事实。**这是本轮一处能力收窄**：legacy 的
@@ -735,14 +752,9 @@ def run_review(connect_factory, paper_db_path, snapshot_paths, config=None, trig
     payload 会伪造 provenance，因此它们不进入这次研究。``collect_evidence`` 仍然保留这些
     确定性检查（tuner 门禁与 ``/ai/overview`` 仍在使用）。
 
-    没有可证明的 typed 事实时，本函数**不调用 provider、不写 canonical 行**，直接返回明确
-    失败。原因：一条没有证据的研究运行连 ``as_of``（业务日）都无法从事实派生，用墙上时钟
-    补一个就伪造了 PIT 声明。
-
-    **准入条件只有两个，且都不是 legacy 的 provider 凭据**：``advisor_disabled``（本 runtime
-    的功能开关）与"canonical 槽位未就绪"。后者由 ``ai_review_service.slot_readiness`` 判定，
-    返回 ``status='blocked'`` + 稳定 ``error_code``；``enabled=False`` 的槽位因此是
-    **零网络、零 canonical row、零 legacy row**。
+    没有可证明的 typed 事实时同样不调用 provider、不写任何行，返回 ``status='failed'`` +
+    ``error_code='market_evidence_unavailable'``：一条没有证据的研究运行连 ``as_of``（业务日）
+    都无法从事实派生，用墙上时钟补一个就伪造了 PIT 声明。
     """
     if not enabled(config):
         raise RuntimeError("advisor_disabled")
