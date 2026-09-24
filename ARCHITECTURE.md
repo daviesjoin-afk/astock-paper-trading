@@ -1747,6 +1747,10 @@ disable 挡不住真实付费调用，而用 legacy 环境变量当准入条件�
 跑不起来。legacy single/dual review 状态机的兼容检查本轮不迁移，不在本 guard 内）
 provider 配置解析异常裸逃逸（R27-B2B：槽位映射不存在或读配置失败必须映射成声明的
 best-effort 返回值，而不是把异常抛给调用方）
+非 owner 签发 typed evidence（R27-B2C：可签发 owner 是显式登记表；每个
+InformationEvent 的 evidence_ref 必须来自 evidence_ref_from_* 或同一函数内由该
+命名空间绑定的名字。legacy dict / 裸值 / 手拼 ref 一律视为伪造 provenance ——
+这是"不得写 dict → typed event 包装器"的可执行形式）
 ```
 
 ### 仅作 review signal（不进入 CI gate）
