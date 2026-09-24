@@ -302,9 +302,9 @@ class ResearchEvidenceRef:
     派生方向字段：``verified`` 只意味着"来源通过了它自己的核验"。
 
     **没有公开 raw 构造器。** ``ResearchEvidenceRef(...)`` 一律抛 ``TypeError``；
-    唯一的签发路径是 :func:`evidence_ref_from_market_reading`。身份与核验维度都由
-    R24 投影派生，调用方既不提供 ``source_id`` 也不提供 verification —— 因此
-    "传字符串把自己声明成 R24 verified market fact"不可表达。
+    唯一的签发路径是 :func:`evidence_ref_from_market_reading`。identity 由 reading
+    派生（调用方不提供），核验维度由投影逐字复制 —— 因此"传字符串把自己声明成 R24
+    verified market fact"不可表达。
 
     **保证与已知限制**（不要把这个边界读成 provenance 证明）。R24 的
     ``MarketDataReading`` / ``MarketDataSnapshot`` 是**公开 dataclass**，因此
@@ -314,10 +314,18 @@ class ResearchEvidenceRef:
 
     在本层是**可以通过**的：伪造只是从一步变成两步。本层真正保证的是：
 
-    * 调用方**不能提供 identity** —— ``source_id`` 由投影派生（policy + 观测时点），
-      所以同一份事实无法被改名成 FACT_A / FACT_B / FACT_C 绕过去重与冲突检测；
-    * 调用方**不能提供核验结论** —— ``single_source`` 不可能在签发时变成 ``verified``；
+    * 调用方**不能提供 identity** —— ``source_id`` 由 reading 派生
+      （``policy | kind | subject @ observed_at``），所以同一份事实无法被改名成
+      FACT_A / FACT_B / FACT_C 绕过去重与冲突检测，两只不同股票也不会撞成一条；
+    * 本层**没有独立的 ``verification`` 参数** —— verification 逐字复制自 supplied
+      reading 的投影，R27 无从自行发明一个核验结论；
     * AI 代码里不再出现自由形式的核验字符串。
+
+    **不要把第二点读成"核验结论可信"。** 准确表述是：R27 factory 没有独立的
+    ``verification`` 参数，它逐字复制 supplied R24 reading projection 的 verification；
+    R27 **本身无法证明**该 reading 是 owner 产生还是调用方手工构造。所以
+    ``single_source`` 不会在**本层**被改写，但一个手工构造的 reading 里写了什么，本层
+    照样原样复制。
 
     要真正证明"这份事实由 ``market_data_service`` 产生"，需要 **R24 自己签发 evidence
     token**（R24 的职责，不在 R27-A 范围内）。本条限制由
@@ -383,12 +391,25 @@ class ResearchEvidenceRef:
         )
 
     def identity(self) -> tuple[str, str, str]:
-        """让两条引用指向**同一条事实**的字段。"""
+        """让两条引用指向**同一条事实**的字段。
+
+        ``source_id`` 已编码 ``policy | kind | subject @ observed_at``，因此两只不同股票
+        （或两个不同时点）的 identity 必然不同 —— 不会被误认成同一条事实而静默去重。
+        """
         return (self.source_type, self.source_id, self.as_of)
 
     def fact_state(self) -> tuple:
-        """这条事实被 owner 观测到的核验状态（用于冲突检测）。"""
-        return (self.verification, self.verification_method, self.detail)
+        """这条事实被 owner 观测到的**事实内容**状态（用于冲突检测）。
+
+        刻意只取三个事实维度：核验结论、核验方式、内容指纹。**不**包含 ``status`` 那种
+        reading 级展示判定 —— 同一份快照在不同 ``now`` 下可能是 fresh 或 stale，那属于
+        时效而非"事实变了"，不该触发 :class:`EvidenceConflict`。
+        """
+        return (
+            self.verification,
+            self.verification_method,
+            self.detail.get("content_fingerprint"),
+        )
 
     def projection(self) -> dict[str, Any]:
         """给 API / 前端的稳定投影：只 render，不重算核验语义。"""
@@ -402,33 +423,80 @@ class ResearchEvidenceRef:
         }
 
 
-def _market_evidence_identity(
-    projection: Mapping[str, Any],
-) -> tuple[str, str]:
-    """从 R24 投影**派生** ``(source_id, as_of)`` —— 调用方不参与。
+def _subject_of(snapshot: Any) -> str:
+    """从 R24 snapshot 取**观测主体** —— 这条事实是关于"谁"的。
 
-    identity 只描述这份事实自己：``policy``（哪一套读取口径）+ 观测时点（这一份快照）。
-    调用方无法改名，也就无法对同一份事实造出第二个 identity 去绕过去重与冲突检测
-    （为什么这件事重要见 :class:`ResearchEvidenceRef`）。
+    ``symbol_quote`` 把单票放进 ``rows=(envelope,)``，因此 ``code`` 是主体。横截面
+    (``full_market`` 等) 没有单一主体，用行数做 scope，而不是编一个假 id。
 
-    缺 ``policy`` 或缺时点时 fail closed：无口径的事实无法稳定识别，而没有可证明业务日
-    的事实不得进入研究链路。
+    这一项是 identity 的唯一性来源：``live_market @ 10:30`` 对 600000 与 000001 是
+    **两条不同的事实**，只靠 policy + 时点会撞成一条（并被静默去重）。
     """
-    policy = str(projection.get("policy") or "").strip()
+    if snapshot is None:
+        return ""
+    by_code = snapshot.by_code()
+    if by_code:
+        return "|".join(sorted(by_code))
+    return f"rows={snapshot.row_count}"
+
+
+def _content_fingerprint(snapshot: Any) -> str:
+    """这份快照**内容**的稳定指纹（用于区分"同一条事实"与"内容变了"）。
+
+    刻意只覆盖事实性字段并按 key 排序：同一个 identity 下内容不同就是
+    :class:`EvidenceConflict`，而不是静默去重 —— 把 payload 完全排除在冲突判断之外
+    会让"报价被悄悄改写"看起来像"同一条事实"。
+    """
+    if snapshot is None:
+        return ""
+    parts: list[str] = []
+    for row in snapshot.rows:
+        if not isinstance(row, Mapping):
+            parts.append(repr(row))
+            continue
+        parts.append("&".join(f"{key}={row[key]!r}" for key in sorted(row)))
+    return "||".join(parts)
+
+
+def _market_evidence_identity(reading: Any) -> tuple[str, str, str]:
+    """从 R24 reading **派生** ``(source_id, as_of, content_fingerprint)``。
+
+    调用方完全不参与。identity 需要四个正交维度才能唯一标识一条市场事实：
+
+        policy          哪一套读取口径
+        kind            这是哪一类事实（symbol_quote / full_market …）
+        subject         关于谁（单票 code；横截面用 scope）
+        observed_at     哪一份快照
+
+    早期版本只有 ``policy @ observed_at``，于是同一时刻的两只**不同股票**得到完全相同的
+    identity —— 不只 identity 相同，连冲突状态也相同，因此会被静默去重成一条事实。
+    这是本 contract 自己的 correctness 缺陷，不是理论问题。
+
+    缺 policy / kind / 时点即 fail closed：无法稳定识别的事实不得进入研究链路。
+    """
+    policy = str(reading.policy_name or "").strip()
     if not policy:
         raise ValueError(
-            "market reading projection carries no policy — 无法派生稳定的 evidence "
-            "identity；研究层不接受无口径的事实"
+            "market reading carries no policy — 无法派生稳定的 evidence identity；"
+            "研究层不接受无口径的事实"
         )
-    observed_at = str(projection.get("observed_at") or "").strip()
-    as_of = projection.get("as_of")
+    snapshot = reading.snapshot
+    kind = str(getattr(snapshot, "kind", "") or "").strip()
+    if not kind:
+        raise ValueError(
+            "market reading snapshot carries no kind — 无法区分 symbol_quote 与横截面，"
+            "identity 会碰撞"
+        )
+    observed_at = str(getattr(snapshot, "observed_at", "") or "").strip()
+    as_of = snapshot.as_of
     stamp = observed_at or str(as_of or "").strip()
     if not stamp:
         raise ValueError(
-            "market reading projection carries neither observed_at nor as_of — "
+            "market reading snapshot carries neither observed_at nor as_of — "
             "PIT 不可证明的事实不得进入研究链路"
         )
-    return f"{policy}@{stamp}", as_of
+    source_id = f"{policy}|{kind}|{_subject_of(snapshot)}@{stamp}"
+    return source_id, as_of, _content_fingerprint(snapshot)
 
 
 def _issue_evidence_ref(
@@ -458,10 +526,13 @@ def evidence_ref_from_market_reading(reading: Any) -> ResearchEvidenceRef:
     ``market_data_contract.MarketDataReading``（不是任何带 ``projection()`` 的
     duck-typed 对象），并从它派生全部身份与核验维度：
 
-    * ``source_id`` / ``as_of`` 由 :func:`_market_evidence_identity` 从投影派生，
-      **调用方不提供** —— 因此无法把一份事实改名成多条，也无法覆盖业务日；
-    * ``verification`` / ``verification_method`` 逐字复制，``single_source`` /
-      ``not_attempted`` 在这里**不可能**变成 ``verified``。
+    * ``source_id`` / ``as_of`` / 内容指纹由 :func:`_market_evidence_identity` 从
+      **reading 自身**派生（policy + kind + subject + 观测时点），**调用方不提供** ——
+      因此既无法把一份事实改名成多条，也无法对两只不同股票造出同一个 identity；
+    * ``verification`` / ``verification_method`` 逐字复制自 reading：本层**没有**独立的
+      ``verification`` 参数，因此调用方不能通过本层把 ``single_source`` 声明成
+      ``verified``。注意这**不等于**"这条事实一定由 owner 产生" —— 见
+      :class:`ResearchEvidenceRef` 的已知限制。
 
     刻意**没有** ``source_id`` 参数：一个由调用方命名的 identity 不是 identity，
     而是一个可以被用来绕过去重与冲突检测的自由字符串。
@@ -473,7 +544,7 @@ def evidence_ref_from_market_reading(reading: Any) -> ResearchEvidenceRef:
         )
 
     projection = reading.projection()
-    source_id, as_of = _market_evidence_identity(projection)
+    source_id, as_of, fingerprint = _market_evidence_identity(reading)
     return _issue_evidence_ref(
         source_type=EVIDENCE_SOURCE_MARKET_DATA,
         source_id=source_id,
@@ -486,6 +557,9 @@ def evidence_ref_from_market_reading(reading: Any) -> ResearchEvidenceRef:
             "observed_at": projection.get("observed_at"),
             "policy": projection.get("policy"),
             "status": projection.get("status"),
+            "kind": getattr(reading.snapshot, "kind", None),
+            "subject": _subject_of(reading.snapshot),
+            "content_fingerprint": fingerprint,
         },
     )
 

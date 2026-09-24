@@ -961,12 +961,13 @@ strong/weak/uncertain 等评分档位：本轮不做评分模型，也没有 `qu
 ### 类型化 market evidence（不是 owner-issued provenance）
 
 唯一公开签发入口是 `evidence_ref_from_market_reading(reading)`，它要求一个真正的
-`market_data_contract.MarketDataReading`，并从投影**派生**全部身份与核验维度：
+`market_data_contract.MarketDataReading`，并**从 reading 本身派生**身份与核验维度：
 
 ```text
-source_id  ←  policy @ 观测时点   （调用方不提供）
-as_of      ←  投影的 as_of / observed_at（调用方不覆盖）
-verification / verification_method  ←  逐字复制
+source_id  ←  policy | kind | subject @ observed_at   （调用方不提供）
+as_of      ←  reading 的 as_of / observed_at          （调用方不覆盖）
+verification / verification_method  ←  逐字复制自 reading 投影
+content_fingerprint                 ←  snapshot 事实性字段的稳定指纹
 ```
 
 `source_id` **不接受**调用方传参：一个由调用方命名的 identity 不是 identity，而是
@@ -974,8 +975,22 @@ verification / verification_method  ←  逐字复制
 自由字符串。`ResearchEvidenceRef(...)` 一律抛 `TypeError`；没有可 import 的哨兵，也
 没有 `issued=True` 之类的开关（那种"标记位"调用方一样能写）。
 
-**诚实声明这一层的强度。** 早期版本把它描述成 "owner-issued provenance"，那是
-**过度声称**：`MarketDataReading` / `MarketDataSnapshot` 都是**公开 dataclass**，因此
+**为什么 identity 必须含 kind 与 subject。** 早期版本只有 `policy @ observed_at`，
+于是同一时刻的**两只不同股票**得到完全相同的 identity。由于 `fact_state` 当时也不含
+内容指纹，它们不只是 identity 相同，**连冲突状态也相同** —— 会被静默去重成一条事实。
+这曾经是本 contract 自己的 correctness 缺陷（不是理论性的 provenance 问题），
+现在 identity 纳入 `kind` + `subject`（单票 code / 横截面 scope），
+`fact_state` 纳入内容指纹，因此：
+
+```text
+不同 code、同 policy/时点        → 不同 identity，两条独立事实
+同 identity、内容变了            → EvidenceConflict（不再静默去重）
+同 identity、内容相同、freshness 不同 → 仍是一条事实（时效不是事实内容）
+```
+
+**诚实声明这一层的强度 —— 保证与已知限制分开。** 早期版本把它描述成
+"owner-issued provenance"，那是**过度声称**：`MarketDataReading` /
+`MarketDataSnapshot` 都是**公开 dataclass**，因此
 
 ```text
 手工造 MarketDataSnapshot(verified, cross_source)
@@ -986,8 +1001,14 @@ verification / verification_method  ←  逐字复制
 在本层是**可以通过**的 —— 伪造只是从一步变成两步。本层真正保证的是：
 
 * 调用方**不能提供 identity**，所以同一份事实无法被改名绕过去重 / 冲突检测；
-* 调用方**不能提供核验结论**，`single_source` 不可能在签发时变成 `verified`；
+* 本层**没有独立的 `verification` 参数** —— verification 逐字复制自 supplied
+  reading 的投影，R27 无从自行发明一个核验结论；
 * AI 代码里不再出现自由形式的核验字符串。
+
+准确说法是：**R27 factory 没有独立的 `verification` 参数，它逐字复制 supplied R24
+reading projection 的 verification；R27 本身无法证明该 reading 是 owner 产生还是调用方
+手工构造。** 所以 `single_source` 不会在**本层**被改写，但一个手工构造的 reading 里写
+了什么，本层照样原样复制。不要把这句读成"核验结论可信"。
 
 要真正证明"这份事实由 `market_data_service` 产生"，需要 **R24 自己签发 evidence
 token** —— 那是 R24 的职责，不在 R27-A 范围内。这条限制由
@@ -1000,13 +1021,18 @@ token** —— 那是 R24 的职责，不在 R27-A 范围内。这条限制由
 
 ### 证据集合：去重与冲突
 
-identity 是 `(source_type, source_id, as_of)`，其中 `source_id` 由 R24 投影派生。
+identity 是 `(source_type, source_id, as_of)`，其中 `source_id` 由 reading 派生
+（`policy | kind | subject @ observed_at`）。
 
 ```text
-完全相同（含 detail）            → 安全去重
-同 identity 但事实状态不同        → EvidenceConflict
-同一条 evidence 同时两种 relation → EvidenceRelationConflict
+完全相同（同 identity + 同事实内容）   → 安全去重
+同 identity 但事实内容不同             → EvidenceConflict
+同一条 evidence 同时两种 relation      → EvidenceRelationConflict
 ```
+
+冲突判定只取**事实维度**（verification / verification_method / 内容指纹），
+**不含** `status` 那种 reading 级展示判定 —— 同一份快照在不同 `now` 下可能是 fresh 或
+stale，那属于时效而非"事实变了"。
 
 两种冲突都**与顺序无关**（先按 identity 分组再判定）：`[A, B]` 与 `[B, A]` 必然
 同一结果。first-wins 会让研究结论依赖 collection order，而顺序不是业务语义。
@@ -1057,11 +1083,12 @@ hypothesis / research-ledger owner，为这个 PR 新建一套 AI 数据库体�
 
 ### 回归门禁
 
-`backend/test_ai_research_contract.py`（AI-01 ~ AI-20 契约语义、AI-TYPED-01 ~ 06
-identity 派生与诚实边界、AIG-01 ~ AIG-06 架构 guard、`GuardIsNotVacuouslyPassing`
-非空性）；语义 mutation 在 `work/r27_ai_mutation_check.py`：去掉 future-evidence check、
-未核验事实当作已核验、relation 强制成 supports、identity 不再由投影派生、
-冲突 duplicate first-wins、deep freeze 退回浅冻结，必须全部 CAUGHT
+`backend/test_ai_research_contract.py`（AI-01 ~ AI-20 契约语义、AI-TYPED-01 ~ 09
+identity 派生 / 唯一性 / 冲突与诚实边界、AIG-01 ~ AIG-06 架构 guard、
+`GuardIsNotVacuouslyPassing` 非空性）；语义 mutation 在
+`work/r27_ai_mutation_check.py`：去掉 future-evidence check、未核验事实当作已核验、
+relation 强制成 supports、identity 丢失观测时点、冲突 duplicate first-wins、
+deep freeze 退回浅冻结、identity 丢失观测主体、内容指纹退出冲突判定，必须全部 CAUGHT
 （survived = 0、fake = 0）。
 
 ## 目标依赖方向

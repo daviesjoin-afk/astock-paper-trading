@@ -90,17 +90,16 @@ MUTATIONS = [
     },
     {
         "id": "M-AI4",
-        # identity 不再由 R24 投影派生：丢掉观测时点，只留 policy。
-        # 于是**不同的两份快照**塌成同一个 identity —— 去重与冲突检测认不出它们，
-        # duplicate / conflict 语义随之失效。这正是本轮 P1 修正要守住的性质。
+        # identity 不再纳入观测时点：同一 subject 的所有快照塌成同一个 identity。
+        # 于是不同时间的报价被当成同一条事实 —— 去重与冲突检测认不出它们是不同的观测。
         "file": CONTRACT,
-        "old": '    return f"{policy}@{stamp}", as_of\n',
-        "new": "    return policy, as_of\n",
+        "old": '    source_id = f"{policy}|{kind}|{_subject_of(snapshot)}@{stamp}"\n',
+        "new": '    source_id = f"{policy}|{kind}|{_subject_of(snapshot)}"\n',
         "test": _arc(
             "AiResearchTypedEvidenceTests."
             "test_AI_TYPED_02_identity_is_derived_from_the_owner_projection"
         ),
-        "desc": "identity 不再由投影派生（不同快照塌成同一 identity）",
+        "desc": "identity 丢失观测时点（不同快照塌成同一 identity）",
     },
     {
         "id": "M-AI5",
@@ -141,6 +140,39 @@ MUTATIONS = [
             "AiResearchImmutabilityTests.test_AI17_nested_payload_is_deeply_frozen"
         ),
         "desc": "deep freeze 退回浅冻结（嵌套 payload 可被外部改写）",
+    },
+    {
+        "id": "M-AI7",
+        # identity 丢掉观测主体：只留 policy|kind@时点。
+        # 于是同一时刻的两只**不同股票**得到同一个 identity —— 会被静默去重成一条事实。
+        # 这正是 review 指出的 identity 碰撞。
+        "file": CONTRACT,
+        "old": '    source_id = f"{policy}|{kind}|{_subject_of(snapshot)}@{stamp}"\n',
+        "new": '    source_id = f"{policy}|{kind}@{stamp}"\n',
+        "test": _arc(
+            "AiResearchTypedEvidenceTests."
+            "test_AI_TYPED_07_distinct_symbols_never_share_an_identity"
+        ),
+        "desc": "identity 丢失观测主体（不同股票撞成同一 identity）",
+    },
+    {
+        "id": "M-AI8",
+        # 内容指纹不参与冲突判定：同 identity 下内容变了也不再报 conflict，
+        # 被静默当成同一条事实（"报价被悄悄改写"看起来像"同一条事实"）。
+        "file": CONTRACT,
+        "old": (
+            "            self.verification_method,\n"
+            '            self.detail.get("content_fingerprint"),\n'
+        ),
+        "new": (
+            "            self.verification_method,\n"
+            "            None,\n"
+        ),
+        "test": _arc(
+            "AiResearchTypedEvidenceTests."
+            "test_AI_TYPED_08_same_identity_with_changed_content_is_a_conflict"
+        ),
+        "desc": "内容指纹退出冲突判定（内容变化被静默去重）",
     },
 ]
 

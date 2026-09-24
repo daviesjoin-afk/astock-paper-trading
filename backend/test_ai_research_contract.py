@@ -41,14 +41,28 @@ DAY = "2026-08-27"
 NEXT_DAY = "2026-08-28"
 PREV_DAY = "2026-08-26"
 
-#: 默认 reading 的 owner 口径与观测时点 —— evidence identity 由它们**派生**，
-#: 调用方不再提供 source_id（见 AI-TYPED-02）。
+#: 默认 reading 的 owner 口径 —— evidence identity 由它加 kind / subject / 观测时点
+#: **派生**，调用方不提供 source_id（见 AI-TYPED-02）。
 DEFAULT_POLICY = "live_market"
+DEFAULT_CODE = "600000"
+SNAPSHOT_KIND = "symbol_quote"
+
+#: R24 既有的逐票核验术语（``quote_validation``）—— 唯一的映射入口在 R24 那侧。
+VALIDATION_CROSS_SOURCE = "cross_source_checked"
+VALIDATION_SINGLE_SOURCE = "range_timestamp_checked"
+VALIDATION_DISAGREEMENT = "cross_source_failed"
+VALIDATION_UNAVAILABLE = "cross_source_unavailable"
 
 
-def _derived_identity(*, policy: str = DEFAULT_POLICY, as_of: str = DAY) -> str:
-    """R24 投影派生出的 evidence identity：``policy@观测时点``。"""
-    return f"{policy}@{as_of}T10:30:00+08:00"
+def _derived_identity(*, policy: str = DEFAULT_POLICY, code: str = DEFAULT_CODE,
+                      as_of: str = DAY, observed_at: str | None = None) -> str:
+    """reading 派生出的 evidence identity：``policy|kind|subject@观测时点``。
+
+    单票事实的 subject 就是 ``code`` —— 这正是修复 identity 碰撞的那一维：
+    同一时刻的两只不同股票必须得到不同 identity。
+    """
+    stamp = observed_at or f"{as_of}T10:30:00+08:00"
+    return f"{policy}|{SNAPSHOT_KIND}|{code}@{stamp}"
 
 #: 只有这一个项目模块允许被 AI 契约 import：R24 的纯行情契约（**读**事实）。
 ALLOWED_PROJECT_IMPORTS = {"market_data_contract"}
@@ -173,36 +187,51 @@ def _code_string_constants(tree: ast.Module) -> list[str]:
             and id(node) not in docstrings]
 
 
-def _reading(
-    verification: str = MDC.VERIFICATION_VERIFIED,
-    method: str = MDC.VERIFICATION_METHOD_CROSS_SOURCE,
-    *, as_of: str = DAY, policy: str = "live_market", observed_at: str | None = None,
-):
-    """一个 R24 typed projection（``MarketDataReading``）。
+def _quote(code: str = DEFAULT_CODE, price: float = 10.5,
+           validation: str = VALIDATION_CROSS_SOURCE, *, observed_at: str | None = None):
+    """一条已预取的逐票报价 envelope（R24 ``symbol_quote_snapshot`` 的输入形态）。
 
-    刻意手工构造：这正是本契约**无法**排除的伪造路径（``MarketDataReading`` 是公开
-    dataclass）。测试 helper 里保留它，是为了让"两步伪造"这条限制可见，而不是假装
-    它不存在 —— 见 AI-TYPED-01。
+    ``validation`` 用的是**既有业务术语**（``quote_validation``），由 R24 的唯一映射
+    ``verification_from_cross_status`` 翻成契约维度 —— 测试不发明第二套核验词汇。
     """
-    return MDC.MarketDataReading(
-        availability=MDC.AVAILABILITY_AVAILABLE,
-        freshness=MDC.FRESHNESS_FRESH,
-        status=MDC.STATUS_FRESH,
-        policy_name=policy,
-        snapshot=MDC.MarketDataSnapshot(
-            kind="symbol_quote", as_of=as_of,
-            observed_at=observed_at or f"{as_of}T10:30:00+08:00",
-            verification=verification, verification_method=method,
-        ),
+    return {
+        "code": code, "price": price,
+        "quote_at": observed_at or f"{DAY}T10:30:00+08:00",
+        "quote_source": "eastmoney", "quote_validation": validation,
+    }
+
+
+def _reading(
+    *, as_of: str = DAY, policy: str = DEFAULT_POLICY,
+    validation: str = VALIDATION_CROSS_SOURCE, code: str = DEFAULT_CODE,
+    observed_at: str | None = None, price: float = 10.5, now: str | None = None,
+):
+    """一个 R24 typed projection（``MarketDataReading``），走真实的 owner 路径。
+
+    ``symbol_quote_snapshot`` + ``classify`` 都是 R24 的公开入口，因此这里产出的
+    reading 与生产路径同形（含 ``kind`` / ``rows`` / ``policy``）。
+
+    刻意仍由测试手工调用：这正是本契约**无法**排除的两步伪造路径
+    （``MarketDataReading`` / ``MarketDataSnapshot`` 都是公开 dataclass）。测试里保留
+    它，是为了让这条限制可见 —— 见 AI-TYPED-06。
+    """
+    stamp = observed_at or f"{as_of}T10:30:00+08:00"
+    snapshot = MDC.symbol_quote_snapshot(
+        _quote(code, price, validation, observed_at=stamp), asof_day=as_of,
+    )
+    return MDC.classify(
+        snapshot, MDC.policy_named(policy), now=now or stamp,
+        asof_day=as_of if policy == DEFAULT_POLICY else None,
     )
 
 
-def _ref(*, verification=MDC.VERIFICATION_VERIFIED,
-         method=MDC.VERIFICATION_METHOD_CROSS_SOURCE, as_of=DAY,
-         policy="live_market", observed_at=None):
-    """一条由唯一 factory 签发的证据引用（identity 由 R24 投影派生）。"""
+def _ref(*, as_of: str = DAY, code: str = DEFAULT_CODE,
+         validation: str = VALIDATION_CROSS_SOURCE, observed_at: str | None = None,
+         price: float = 10.5):
+    """一条由唯一 factory 签发的证据引用（identity 由 reading 派生）。"""
     return ARC.evidence_ref_from_market_reading(
-        _reading(verification, method, as_of=as_of, policy=policy, observed_at=observed_at),
+        _reading(as_of=as_of, code=code, validation=validation,
+                 observed_at=observed_at, price=price),
     )
 
 
@@ -259,7 +288,7 @@ class AiResearchFactTests(unittest.TestCase):
 
     def test_AI02_unverified_evidence_keeps_its_original_state(self):
         """AI-02：未核验的事实保持原状，绝不升级成 verified。"""
-        single = _ref(verification=MDC.VERIFICATION_SINGLE_SOURCE)
+        single = _ref(validation=VALIDATION_SINGLE_SOURCE)
         self.assertEqual(MDC.VERIFICATION_SINGLE_SOURCE, single.verification)
         self.assertFalse(
             single.cross_source_verified,
@@ -388,7 +417,7 @@ class AiResearchRelationTests(unittest.TestCase):
         # 可信支持与可信反对并存 → 反对优先（保守），不"票数过半"。
         mixed = _hypothesis(evidence=(
             _evidence(_ref(), ARC.RELATION_SUPPORTS),
-            _evidence(_ref(policy="close_snapshot", observed_at=f"{DAY}T15:00:00+08:00"),
+            _evidence(_ref(code="000001", observed_at=f"{DAY}T15:00:00+08:00"),
                       ARC.RELATION_CONTRADICTS),
         ))
         self.assertEqual(ARC.HYPOTHESIS_UNSUPPORTED, mixed.status)
@@ -396,7 +425,7 @@ class AiResearchRelationTests(unittest.TestCase):
     def test_AI12_unverified_fact_with_supports_is_insufficient(self):
         """AI-12：未核验事实 + supports → insufficient_evidence（不是 supported）。"""
         hypothesis = _hypothesis(
-            evidence=(_evidence(_ref(verification=MDC.VERIFICATION_SINGLE_SOURCE), ), ),
+            evidence=(_evidence(_ref(validation=VALIDATION_SINGLE_SOURCE), ), ),
         )
         self.assertEqual(ARC.HYPOTHESIS_INSUFFICIENT_EVIDENCE, hypothesis.status)
         self.assertEqual(ARC.RESEARCH_REASON_EVIDENCE_NOT_VERIFIED, hypothesis.reason)
@@ -407,9 +436,9 @@ class AiResearchRelationTests(unittest.TestCase):
         provider disagreement / unavailable 只说明"这条 evidence 本身不能成为可靠依据"，
         不说明"这个 thesis 被事实反驳"。两者必须完全独立。
         """
-        for verification in (MDC.VERIFICATION_UNAVAILABLE, MDC.VERIFICATION_DISAGREEMENT):
-            with self.subTest(verification=verification):
-                ref = _ref(verification=verification)
+        for validation in (VALIDATION_UNAVAILABLE, VALIDATION_DISAGREEMENT):
+            with self.subTest(validation=validation):
+                ref = _ref(validation=validation)
                 hypothesis = _hypothesis(evidence=(_evidence(ref, ARC.RELATION_SUPPORTS),))
                 self.assertEqual(
                     ARC.HYPOTHESIS_INSUFFICIENT_EVIDENCE, hypothesis.status,
@@ -426,7 +455,7 @@ class AiResearchRelationTests(unittest.TestCase):
     def test_AI14_conflicting_duplicate_evidence_fails_closed_order_independently(self):
         """AI-14：同 identity 但事实状态不同的证据 → fail closed，且顺序无关。"""
         verified = _ref()                                     # verified / cross_source
-        disagreement = _ref(verification=MDC.VERIFICATION_DISAGREEMENT)
+        disagreement = _ref(validation=VALIDATION_DISAGREEMENT)
         self.assertEqual(verified.identity(), disagreement.identity())
 
         for label, order in (("A,B", (verified, disagreement)),
@@ -551,7 +580,7 @@ class AiResearchTypedEvidenceTests(unittest.TestCase):
         self.assertEqual(projected["verification_method"], ref.verification_method)
 
         single = ARC.evidence_ref_from_market_reading(
-            _reading(MDC.VERIFICATION_SINGLE_SOURCE),
+            _reading(validation=VALIDATION_SINGLE_SOURCE),
         )
         self.assertEqual(MDC.VERIFICATION_SINGLE_SOURCE, single.verification)
         self.assertNotEqual(MDC.VERIFICATION_VERIFIED, single.verification)
@@ -579,9 +608,33 @@ class AiResearchTypedEvidenceTests(unittest.TestCase):
             ARC.evidence_ref_from_market_reading(FakeReading())
         self.assertIn("R24 projection", str(caught.exception))
 
-        # 缺 policy 的投影无法派生稳定 identity → 拒绝。
-        with self.assertRaises(ValueError):
-            ARC._market_evidence_identity({"as_of": DAY, "observed_at": f"{DAY}T10:00:00+08:00"})
+        # 缺 kind 的快照无法区分 symbol_quote 与横截面 → identity 会碰撞，拒绝。
+        bare = MDC.MarketDataReading(
+            availability=MDC.AVAILABILITY_AVAILABLE, freshness=MDC.FRESHNESS_FRESH,
+            status=MDC.STATUS_FRESH, policy_name=DEFAULT_POLICY,
+            snapshot=MDC.MarketDataSnapshot(
+                kind="", as_of=DAY, observed_at=f"{DAY}T10:00:00+08:00",
+                verification=MDC.VERIFICATION_VERIFIED,
+                verification_method=MDC.VERIFICATION_METHOD_CROSS_SOURCE,
+            ),
+        )
+        with self.assertRaises(ValueError) as caught:
+            ARC.evidence_ref_from_market_reading(bare)
+        self.assertIn("kind", str(caught.exception))
+
+        # 缺 observed_at / as_of 的快照无法证明业务日 → 拒绝。
+        undated = MDC.MarketDataReading(
+            availability=MDC.AVAILABILITY_AVAILABLE, freshness=MDC.FRESHNESS_UNKNOWN,
+            status=MDC.STATUS_STALE, policy_name=DEFAULT_POLICY,
+            snapshot=MDC.MarketDataSnapshot(
+                kind=SNAPSHOT_KIND, observed_at=None, as_of=None,
+                verification=MDC.VERIFICATION_VERIFIED,
+                verification_method=MDC.VERIFICATION_METHOD_CROSS_SOURCE,
+            ),
+        )
+        with self.assertRaises(ValueError) as caught:
+            ARC.evidence_ref_from_market_reading(undated)
+        self.assertIn("observed_at", str(caught.exception))
 
     def test_AI_TYPED_05_future_projection_cannot_enter_a_historical_hypothesis(self):
         """AI-TYPED-05：未来的 R24 投影不得进入历史 hypothesis。"""
@@ -603,14 +656,107 @@ class AiResearchTypedEvidenceTests(unittest.TestCase):
         本层把它作为**已知限制**断言下来，而不是假装已经封堵。真正的修复需要 R24 自己
         签发 evidence token（属于 R24 的职责，不在 R27-A 范围内）。
         """
-        forged = ARC.evidence_ref_from_market_reading(
-            _reading(MDC.VERIFICATION_VERIFIED, policy="forged_policy"),
+        # 完整的两步伪造：手工拼一个声称 verified 的 R24 类型对象。
+        forged_snapshot = MDC.MarketDataSnapshot(
+            kind=SNAPSHOT_KIND, rows=({"code": "999999", "price": 1.0,
+                                       "quote_at": f"{DAY}T10:30:00+08:00"},),
+            as_of=DAY, observed_at=f"{DAY}T10:30:00+08:00", source="handmade",
+            complete=True, expected_rows=1,
+            verification=MDC.VERIFICATION_VERIFIED,
+            verification_method=MDC.VERIFICATION_METHOD_CROSS_SOURCE,
         )
+        forged = ARC.evidence_ref_from_market_reading(
+            MDC.MarketDataReading(
+                availability=MDC.AVAILABILITY_AVAILABLE, freshness=MDC.FRESHNESS_FRESH,
+                status=MDC.STATUS_FRESH, policy_name=DEFAULT_POLICY,
+                snapshot=forged_snapshot,
+            ),
+        )
+        # 本层**照原样复制**了这个自述的核验结论 —— 它无从证明 reading 的来源。
         self.assertEqual(MDC.VERIFICATION_VERIFIED, forged.verification)
+        self.assertEqual(MDC.VERIFICATION_METHOD_CROSS_SOURCE, forged.verification_method)
         self.assertEqual(ARC.EVIDENCE_SOURCE_MARKET_DATA, forged.source_type)
+        self.assertTrue(forged.cross_source_verified)
 
-        # 但伪造者仍然**无法**选择 identity：它只能是投影派生出来的那个值。
-        self.assertEqual(_derived_identity(policy="forged_policy"), forged.source_id)
+        # 但伪造者仍然**无法**选择 identity：它只能是被派生出来的那个值。
+        self.assertEqual(
+            _derived_identity(code="999999"), forged.source_id,
+            "伪造者不能凭自己的意愿命名 identity",
+        )
+
+    def test_AI_TYPED_07_distinct_symbols_never_share_an_identity(self):
+        """AI-TYPED-07：不同股票、同 policy / 同时点，必须有**不同** identity。
+
+        这是 identity 碰撞的永久回归。早期 identity 只有 ``policy @ observed_at``，
+        于是同一时刻的两只不同股票得到完全相同的 identity；由于 ``fact_state`` 当时也
+        不含内容指纹，它们连冲突状态都相同 —— 会被**静默去重成一条事实**，既不报错也
+        不报 conflict。这是本 contract 自己的 correctness 缺陷。
+        """
+        first = _ref(code="600000")
+        second = _ref(code="000001")
+
+        self.assertNotEqual(first.identity(), second.identity())
+        self.assertNotEqual(first.fact_state(), second.fact_state())
+
+        # 两条独立事实必须都保留，而不是被折叠成 1 条。
+        hypothesis = _hypothesis(
+            evidence=(_evidence(first), _evidence(second)),
+        )
+        self.assertEqual(2, len(hypothesis.evidence))
+        self.assertEqual(2, hypothesis.projection()["evidence_count"])
+
+        # identity 必须能读出 subject，否则"不同股票"这件事不可审计。
+        self.assertIn("600000", first.source_id)
+        self.assertIn("000001", second.source_id)
+        self.assertIn(SNAPSHOT_KIND, first.source_id)
+
+    def test_AI_TYPED_08_same_identity_with_changed_content_is_a_conflict(self):
+        """AI-TYPED-08：同 identity 但事实内容变了 → EvidenceConflict，不静默去重。
+
+        payload 完全排除在冲突判断之外，会让"报价被悄悄改写"看起来像"同一条事实"。
+        同时确认：freshness 差异**不是**内容变化，不该误报 conflict。
+        """
+        original = _ref(code=DEFAULT_CODE, price=10.50)
+        changed = _ref(code=DEFAULT_CODE, price=11.90)
+        self.assertEqual(original.identity(), changed.identity())
+        self.assertNotEqual(original.fact_state(), changed.fact_state())
+
+        for label, order in (("A,B", (original, changed)), ("B,A", (changed, original))):
+            with self.subTest(order=label):
+                with self.assertRaises(ARC.EvidenceConflict):
+                    _hypothesis(evidence=tuple(_evidence(ref) for ref in order))
+
+        # 内容完全一致 → 安全去重。
+        identical = _hypothesis(
+            evidence=(_evidence(original), _evidence(_ref(code=DEFAULT_CODE, price=10.50))),
+        )
+        self.assertEqual(1, len(identical.evidence))
+
+        # 同一份快照在不同 now 下 fresh vs stale 是**时效**，不是事实变化。
+        fresh = _reading(now=f"{DAY}T10:30:00+08:00")
+        stale = _reading(now=f"{DAY}T23:59:00+08:00")
+        fresh_ref = ARC.evidence_ref_from_market_reading(fresh)
+        stale_ref = ARC.evidence_ref_from_market_reading(stale)
+        self.assertEqual(fresh_ref.identity(), stale_ref.identity())
+        self.assertEqual(
+            fresh_ref.fact_state(), stale_ref.fact_state(),
+            "freshness 属于时效维度，不得进入事实冲突判定",
+        )
+        self.assertEqual(
+            1,
+            len(_hypothesis(evidence=(_evidence(fresh_ref), _evidence(stale_ref))).evidence),
+        )
+
+    def test_AI_TYPED_09_kind_is_part_of_the_identity(self):
+        """AI-TYPED-09：snapshot kind 参与 identity —— 横截面与单票不得相撞。"""
+        single = _ref(code=DEFAULT_CODE)
+        self.assertIn(SNAPSHOT_KIND, single.source_id)
+
+        # policy 也参与：同一份快照在不同口径下是不同的研究事实。
+        self.assertNotEqual(
+            _derived_identity(code=DEFAULT_CODE),
+            _derived_identity(code=DEFAULT_CODE).replace(DEFAULT_POLICY, "close_snapshot"),
+        )
 
 
 # ---------------------------------------------------------------------------
