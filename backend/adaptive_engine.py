@@ -2081,40 +2081,49 @@ def run_midday_advisor(trigger="scheduled-midday-dp"):
             config = _config(conn)
         if not deepseek_advisor.enabled(config):
             detail.update({"reason": "advisor_disabled"})
-        elif not deepseek_advisor.configured():
-            detail.update({"reason": "api_key_missing"})
         else:
-            deepseek_advisor.run_review(
+            # canonical research review：就绪由 ai_review_service 的槽位配置决定（含操作员
+            # 的 `enabled`），因此这里**不再**用 legacy `configured()` 当准入条件 —— 只在
+            # 数据库 / UI 里配好的槽位会被它错误判成"未配置"。
+            review = deepseek_advisor.run_review(
                 _connect, PAPER_DB_PATH, SNAPSHOT_PATHS,
                 config=config, trigger=str(trigger or "scheduled-midday-dp")[:80],
             )
-            if bool(config.get("llm_realtime_tuning_enabled", False)):
+            detail["research_review"] = {
+                "status": review.get("status"), "error_code": review.get("error_code"),
+            }
+            # legacy tuner 与候选评审仍然是 legacy provider：它们的凭据门禁保留，
+            # 而且只挡它们 —— 两套 provider owner 不共用同一个判据。
+            if not deepseek_advisor.configured():
+                detail.update({"reason": "api_key_missing"})
+            else:
+                if bool(config.get("llm_realtime_tuning_enabled", False)):
+                    try:
+                        tuning = deepseek_advisor.run_realtime_tuning(
+                            _connect, PAPER_DB_PATH, SNAPSHOT_PATHS,
+                            config=config, profile=_market_profile(),
+                            trigger=f"{str(trigger or 'scheduled-midday-dp')}:bounded-tuning",
+                            mode="intraday",
+                        )
+                        detail["ai_tuning"] = {
+                            "status": tuning.get("status"),
+                            "applied_ids": tuning.get("applied_ids", []),
+                            "reason": tuning.get("reason"),
+                        }
+                    except Exception as exc:
+                        detail["ai_tuning"] = {"status": "failed", "reason": type(exc).__name__}
+                # A focused candidate challenge gives the close cycle a useful
+                # second opinion without paying for the full six-task suite.
                 try:
-                    tuning = deepseek_advisor.run_realtime_tuning(
-                        _connect, PAPER_DB_PATH, SNAPSHOT_PATHS,
-                        config=config, profile=_market_profile(),
-                        trigger=f"{str(trigger or 'scheduled-midday-dp')}:bounded-tuning",
-                        mode="intraday",
+                    deepseek_research.run_task(
+                        _connect, PAPER_DB_PATH, "candidate_challenge",
+                        trigger=f"{str(trigger or 'scheduled-midday-dp')}:candidate",
                     )
-                    detail["ai_tuning"] = {
-                        "status": tuning.get("status"),
-                        "applied_ids": tuning.get("applied_ids", []),
-                        "reason": tuning.get("reason"),
-                    }
+                    detail["candidate_challenge"] = "completed"
                 except Exception as exc:
-                    detail["ai_tuning"] = {"status": "failed", "reason": type(exc).__name__}
-            # A focused candidate challenge gives the close cycle a useful
-            # second opinion without paying for the full six-task suite.
-            try:
-                deepseek_research.run_task(
-                    _connect, PAPER_DB_PATH, "candidate_challenge",
-                    trigger=f"{str(trigger or 'scheduled-midday-dp')}:candidate",
-                )
-                detail["candidate_challenge"] = "completed"
-            except Exception as exc:
-                detail["candidate_challenge"] = f"failed:{type(exc).__name__}"
-            status = "advisor_batch"
-            detail.update({"reason": "completed", "provider": "DeepSeek"})
+                    detail["candidate_challenge"] = f"failed:{type(exc).__name__}"
+                status = "advisor_batch"
+                detail.update({"reason": "completed", "provider": "DeepSeek"})
         with _connect() as conn:
             conn.execute(
                 "INSERT INTO adaptive_runs(trigger,status,profile_date,new_rewards,detail,started_at,finished_at) VALUES(?,?,?,?,?,?,?)",
@@ -2355,7 +2364,9 @@ def run_learning_cycle(trigger="manual"):
         # The language-model review is deliberately outside the learning
         # transaction. A timeout or provider failure must never roll back the
         # deterministic paper-trading evolution cycle.
-        if deepseek_advisor.enabled(advisor_config) and deepseek_advisor.configured():
+        if deepseek_advisor.enabled(advisor_config):
+            # canonical research review：准入由槽位配置（含 enabled）决定，不由 legacy
+            # `configured()` 决定 —— 见 deepseek_advisor 的 provider 配置权威说明。
             try:
                 deepseek_advisor.run_review(
                     _connect, PAPER_DB_PATH, SNAPSHOT_PATHS,
@@ -2363,7 +2374,8 @@ def run_learning_cycle(trigger="manual"):
                 )
             except Exception:
                 pass
-            if trigger == "scheduled-close":
+            # 研究套件尚未迁移，仍然走 legacy provider：凭据门禁只挡它。
+            if trigger == "scheduled-close" and deepseek_advisor.configured():
                 try:
                     deepseek_research.run_suite(
                         _connect, PAPER_DB_PATH, trigger="scheduled-close",

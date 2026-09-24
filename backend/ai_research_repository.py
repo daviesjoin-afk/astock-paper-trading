@@ -720,7 +720,7 @@ def _row_limit(limit: Any) -> int:
     return limit
 
 
-def _filters(as_of: Any, subject: Any) -> tuple[str, list]:
+def _filters(as_of: Any, subject: Any, purpose: Any) -> tuple[str, list]:
     clauses: list[str] = []
     params: list = []
     if as_of is not None:
@@ -729,6 +729,12 @@ def _filters(as_of: Any, subject: Any) -> tuple[str, list]:
     if subject is not None:
         clauses.append('"subject" = ?')
         params.append(_required_text(subject, what="subject filter", limit=MAX_FILTER_CHARS))
+    if purpose is not None:
+        # ``purpose`` 过滤**只做等值筛选**：它不改变返回行的含义，也不选择 writer，
+        # 更不参与任何裁决。写路径早就在 ``MAX_PURPOSE_CHARS`` 上界内落库，这里用同一个
+        # 上界，避免"读侧比写侧宽"造出一个写入路径永远无法满足的查询。
+        clauses.append('"purpose" = ?')
+        params.append(_required_text(purpose, what="purpose filter", limit=MAX_PURPOSE_CHARS))
     return (" WHERE " + " AND ".join(clauses) if clauses else "", params)
 
 
@@ -738,6 +744,7 @@ def recent_runs(
     limit: Any = 50,
     as_of: Any = None,
     subject: Any = None,
+    purpose: Any = None,
 ) -> list[dict]:
     """最近的研究运行，**按 ``id DESC``** 稳定返回（写入顺序，即 append 顺序）。
 
@@ -751,9 +758,13 @@ def recent_runs(
     损坏的行**不会**被跳过或替换成空记录 —— 直接 fail closed：JSON 解析失败、行内重复
     字段不自洽、自称 research 之外的权威、或内容与 ``record_hash`` 不符，任一情况都抛
     :class:`ResearchPersistenceError`，而不是把损坏当成"这里没有研究结论"。
+
+    ``purpose`` 是**纯筛选**参数（R27-B2B 加入）：迁移后的调用方需要问"这一类研究最近
+    一次运行是什么"。它刻意只是一个等值条件 —— 不排序、不聚合、不解释 purpose 的业务
+    含义，因此"按 purpose 取最新"仍然是"按 ``id DESC`` 取最新"的同一件事。
     """
     size = _row_limit(limit)
-    where, params = _filters(as_of, subject)
+    where, params = _filters(as_of, subject, purpose)
     rows = conn.execute(
         f"SELECT {_SELECT_LIST} FROM {TABLE}{where} ORDER BY id DESC LIMIT ?",
         [*params, size],

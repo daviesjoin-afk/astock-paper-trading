@@ -523,6 +523,50 @@ def _key_preview(value):
     return "****"
 
 
+#: 槽位就绪判据的稳定 machine reasons。
+#: ``ready`` 之外的每一个值都表示"这次调用不允许发生"，而不是"调用失败了"。
+SLOT_READY = "ready"
+SLOT_NOT_CONFIGURED = "not_configured"
+SLOT_DISABLED = "disabled"
+SLOT_BASE_URL_UNUSABLE = "unusable_base_url"
+SLOT_MODEL_MISSING = "model_missing"
+
+
+def slot_readiness(cfg):
+    """返回 canonical slot readiness —— 供**需要判定"这次 provider 请求能不能发"**的调用方使用。
+
+    ``ready`` 要求 Key、``enabled``、可请求地址与模型**全部**满足；否则返回稳定 reason，让
+    调用方能区分"操作员禁用了"（``disabled``）与"凭据缺失"（``not_configured``）。
+
+    R27-B2B 把它作为以下两处**共用**的 readiness 定义：
+
+    * public slot 的 ``ready`` 投影（``slot_public_view``）；
+    * canonical research runtime（``deepseek_advisor`` 的迁移路径）。
+
+    它**刻意不**在本 PR 里重写既有的 single / dual review 状态机（``test_slot`` /
+    ``_run_single_review`` / ``_run_dual_review``）。那些路径仍然保留自己的 api_key /
+    enabled / base_url / model 兼容检查与各自的 ``status`` 词汇（``*_not_configured`` /
+    ``*_disabled`` …），属于 **R27-B2B 之外**的范围，本轮不为文字一致性顺手重构。
+
+    存在理由是 R27-B2B 的一处真实缺陷：迁移后的 research runtime 只把 ``provider_config``
+    交给 transport，而 transport 只检查 ``api_key`` / ``base_url`` / ``model`` ——
+    ``enabled=False`` 于是被绕过，被禁用的槽位照样发起真实网络请求。
+
+    顺序刻意是"凭据 → 启用 → 地址 → 模型"，与上述 legacy 路径的 fail-closed 报告顺序保持
+    **同一种**先后，使两条路径对同一个槽位给出方向一致的判定（这是刻意保持的一致性，
+    不是"共用同一实现"）。
+    """
+    if not str(cfg.get("api_key") or "").strip():
+        return {"ready": False, "reason": SLOT_NOT_CONFIGURED}
+    if not bool(cfg.get("enabled")):
+        return {"ready": False, "reason": SLOT_DISABLED}
+    if not is_usable_base_url(cfg.get("base_url")):
+        return {"ready": False, "reason": SLOT_BASE_URL_UNUSABLE}
+    if not str(cfg.get("model") or "").strip():
+        return {"ready": False, "reason": SLOT_MODEL_MISSING}
+    return {"ready": True, "reason": SLOT_READY}
+
+
 def slot_public_view(cfg):
     """GET 层视图：**绝不含明文 Key**，只给是否已配置与掩码预览。"""
     api_key = str(cfg.get("api_key") or "")
@@ -537,15 +581,12 @@ def slot_public_view(cfg):
         "timeout_seconds": cfg.get("timeout_seconds"),
         "updated_at": cfg.get("updated_at"),
         "source": cfg.get("source"),
-        # 就绪 = 真正能发出一次请求所需的**全部**字段：Key、启用、合法地址、模型。
+        # 就绪 = 真正能发出一次请求所需的**全部**字段。判据由 slot_readiness 提供，
+        # canonical research runtime 与本 public view 共用它；legacy single/dual review
+        # 状态机仍保留自己的兼容检查（本轮不迁移）。
         # 地址不只看非空——``abc`` / ``123`` / ``://wrong`` 这类不是可请求的 URL，
         # 历史脏数据也要被这里拦下（保存路径另有 validate_base_url 严格拒绝）。
-        "ready": (
-            bool(api_key.strip())
-            and bool(cfg.get("enabled"))
-            and is_usable_base_url(cfg.get("base_url"))
-            and bool(str(cfg.get("model") or "").strip())
-        ),
+        "ready": slot_readiness(cfg)["ready"],
     }
 
 

@@ -1479,6 +1479,200 @@ SURVIVED。让回归具体到"是哪一道防线拦下的"，是它重新变成 
 并且必须忽略 docstring（否则"解释为什么禁止 UPDATE"会让护栏变红）。
 
 
+## Legacy Research Runtime Convergence（R27-B2B）
+
+R27-A 定义了契约，R27-B1 打通了 provider，R27-B2A 给了 typed hypothesis 一个 append-only
+的存放点 —— 但**没有任何一层负责"一次研究运行的生命周期"**，legacy research runtime 仍然
+各自调用模型、各自写自己的表。R27-B2B 补上这一层，并迁移**第一条** runtime 路径。
+
+审计产物的完整盘点见 `docs/R27_B2B_RESEARCH_RUNTIME_INVENTORY.md`。
+
+### 能力变化（不是文件清单）
+
+```text
+之前（R27-B2A）                          现在（R27-B2B）
+------------------------------------    ------------------------------------------
+research 没有 orchestration 层           ai_research_service 是唯一 orchestration boundary
+「谁发起 / 用谁付费 / 写哪张表」          它一次问清：purpose、trigger、typed events、
+  散落在各个 runtime 里                    provider 槽位；网络恰一次、append 恰一次
+data_quality 研究写 adaptive_advisor_runs  data_quality 研究写 ai_research_runs
+  （legacy provider 直连）                  （经 typed provider，R24 reading 派生证据）
+overview / incident_triage 读旧表         读 canonical 台账（唯一读入口）
+legacy 表 writer = 2                      legacy 表 writer = 1（deepseek_research 未迁移）
+```
+
+模块清单：
+
+```text
+R27-A   ai_research_contract         纯契约：无网络、无 DB、无 provider、无时钟
+R27-B1  ai_research_provider         typed research producer（不是 authority）
+R27-B1  ai_provider_transport        provider-neutral HTTP transport（唯一网络 owner）
+R27-B2A ai_research_repository       typed research persistence consumer（不是 authority）
+R27-B2B ai_research_service          research orchestration boundary（不是 authority）
+```
+
+### 依赖方向不可反转
+
+```text
+runtime caller
+    ↓
+ai_research_service
+    ├── ai_research_provider
+    └── ai_research_repository
+```
+
+`repository → service`、`provider → service`、`contract → service` 都**不存在**：service 在
+最上层，不是被下层回调的钩子。`ai_research_service` 因此**不** import
+`ai_research_contract` —— provider 交出来的已经是契约对象，repository 会再独立校验一次；多
+一个消费者就多一份"两套规则必然漂移"的风险。
+
+### provider 配置权威：canonical research 与 legacy 路径的分界
+
+迁移后的 research runtime 的凭据来自 **canonical 槽位配置**（`ai_review_service`），不是
+legacy 的厂商环境变量：
+
+```text
+canonical research readiness = ai_review_service.slot_readiness(cfg)
+                               （Key + enabled + 可请求地址 + 模型）
+legacy tuner / 研究套件         = deepseek_advisor.configured()（厂商环境变量）
+```
+
+两者刻意**不共用**判据：它们问的是两个不同的 provider owner 能不能付钱。这条边界由两个方向
+的真实缺陷写下来：
+
+- **准入不能用 legacy 环境变量。** 只在 `ai_provider_slots` / UI 里配好的槽位，在没有
+  `DEEPSEEK_API_KEY` 时会被 legacy `configured()` 错误判成"未配置"，于是 research 根本跑不起来。
+- **就绪必须尊重 `enabled`。** `ai_provider_transport.call_json` 只检查
+  `api_key` / `base_url` / `model`，因此"被禁用的槽位"必须在交给它**之前**拦下 —— 否则操作员
+  的 disable 只挡住了 UI，挡不住真实付费调用。`enabled=False` 的结果是**零网络、零 canonical
+  row、零 legacy row**，并返回 `status='blocked'` + 稳定 `error_code`。
+
+**R27 canonical research runtime 与 provider slot public view 共用同一 readiness predicate**
+（`slot_readiness`，`slot_public_view["ready"]` 从它派生）。`ai_review_service` 里既有的
+single / dual review 状态机（`test_slot` / `_run_single_review` / `_run_dual_review`）仍保留
+自己的 api_key / enabled / base_url / model 兼容检查与各自的 `status` 词汇 —— 本轮**不迁移、
+不重构**它们，因此这里不声称"整个模块只有一份就绪判断"。
+
+配置解析失败（槽位映射不存在、读配置抛错）一律映射成声明的 best-effort 返回值，**不**裸异常逃逸。
+
+### 事务与网络边界
+
+顺序是硬约束，不是风格问题：
+
+```text
+provider / network call          ← 不在任何事务内
+        ↓
+typed ResearchHypothesis
+        ↓
+短 DB transaction                ← 只有 append_run 一次本地写
+        ↓
+append_run
+```
+
+把网络请求放进事务会让一次 LLM 等待持有 SQLite 写锁（并发下整库阻塞），也会让"provider
+失败但事务已开始"变成需要靠 rollback 兜底的状态。`connect_factory()` 只在 provider 返回
+**之后**才被打开一次。
+
+### 失败语义：失败必须可观测
+
+```text
+provider / contract 失败  → provider_failed，canonical row = 0
+持久化失败                → persistence_failed
+任何一类失败              → 不回落 legacy provider、不写 legacy 表
+```
+
+刻意**不**把失败翻译成"AI 没有意见"：把**调用失败**写成**业务结论**会让失败不可观测，并让
+下游把一次零产出当成一次成功的复核。任何"新路失败 → 静默改走 legacy LLM → 写 legacy 表 →
+调用方以为成功"的 fallback 都会同时制造双 authority、双付费路径与不可审计状态。
+
+### Business idempotency 留在 application 层
+
+service **不**生成 `research_run_key` / job id / cycle id，也**不**把 `hypothesis_id` 当唯一键。
+两次明确执行 = 两条 run —— 这与 append-only 台账的语义一致，也与被迁移的 legacy writer 的
+既有行为一致（legacy 表同样是每次执行插一行）。真正的 exactly-once 需求若在某条 runtime 上
+出现，属于 application 层的 business key，不能污染 append-only 台账的含义。
+
+### 证据来源的现实约束（决定了迁移顺序）
+
+```text
+SUPPORTED_OWNER_ADAPTERS = { market_data }
+```
+
+只有市场数据有可签发的 typed owner adapter，而 `ResearchEvidenceRef` 没有公开构造器。这条
+约束意味着：**证据不是市场数据的 legacy research runtime 在本轮不可能迁移**，除非先为它们
+的真实 owner 新增 adapter（那是契约工作，不是接线工作）。
+
+因此本轮迁移的是 `deepseek_advisor.run_review`（`purpose='data_quality'`）—— 它的证据本来就是
+R24 Market Data Authority 的全市场快照，是**唯一**证据已经类型化的 legacy research runtime。
+
+`deepseek_research`（paper / adaptive / news 证据）与 `ai_analysis`（业务键 + 生命周期）本轮
+**不迁移**，理由与删除条件逐条记录在 inventory 文档里。把它们的事实塞进市场事实的 payload
+会伪造 provenance —— 这正是 R27 契约要根除的东西。
+
+### 一处刻意记录的**能力收窄**
+
+legacy 的 `data_quality` 证据里还混着未类型化的事实（模拟盘账本对账等）。它们**不进入**这次
+研究：账本事实不是市场事实，写进 payload 就是伪造 provenance。这些确定性检查仍然保留在
+`collect_evidence` 中（tuner 门禁与展示仍在使用）。
+
+同时，判定依据从"模型自述的严重度"变成"R27-A 从 R24 核验维度派生的 status"：研究的
+`status` 不再由模型宣布，而由契约从 owner 的核验维度派生。
+
+### legacy 与读侧收敛
+
+- **`run_review` 不再是 `adaptive_advisor_runs` 的 writer。** 该 purpose 的旧行继续留在旧表
+  （legacy rows stay legacy）：不迁移、不回填、不改写。旧记录没有 typed contract 的保证，
+  把它们标成 R27 typed research 会伪造 provenance 与语义。
+- writer 迁走之后，两处**读投影**必须收敛，否则展示会停在历史行、下一条研究任务会静默失去
+  输入：`deepseek_advisor.overview` 与 `deepseek_research._latest_data_quality` 改读 canonical
+  台账。它们只读，不写第二份数据。
+- `overview` 的 legacy 形状兼容投影（`_canonical_research_display`）是**唯一**新增的兼容层，
+  并且有明确删除条件：R27-B3 提供 canonical research API / UI 时随调用点一起删除。
+
+### 本轮不碰的边界
+
+`dual_ai_tuning_runs` 是 `evolution_apply` 的 **apply 门禁**（`status='consensus'` +
+`merged_proposals`），`adaptive_selection_candidates` 是 **proposal** 边界，
+`deepseek_advisor.call_json` 仍被 tuner 与成交归因使用。它们都不是 research 迁移的对象：
+顺手改会同时改变它们的业务 authority。它们因此继续留在"未迁移"清单里，连同各自的删除条件。
+
+`deepseek_advisor` 的 legacy provider 网络调用（`call_json`）因此**仍然存在**：R27 只保证
+**R27 provider 链路**的网络 owner 唯一，而不是假装全仓库只剩一个 HTTP 调用点。
+
+### 回归门禁
+
+`backend/test_ai_research_service.py`：RUNTIME-01 ~ 03（真实 production entrypoint 进入
+canonical ledger、provider 恰一次、append 恰一次且无 dual-write）、RUNTIME-04 ~ 06
+（provider / contract / persistence 失败都不留 canonical 行，且失败不被降级成成功）、
+RUNTIME-07 ~ 08（legacy 历史行不被迁移、迁移路径的 legacy writer = 0，静态 + 运行时两重
+证据）、RUNTIME-09 ~ 10（research 不获得 signal / order / risk / promotion 权限；读一条
+canonical 行不会被当成重新授权）、RUNTIME-11 ~ 12（网络 owner 仍唯一、网络调用不在任何事务
+内，用连接深度计数器而不是读代码）、RUNTIME-13 ~ 14（`as_of` 与 `created_at` 分离、重复执行
+= 两条 run 且没有业务键）、RUNTIME-15 ~ 17（canonical 表在首次运行之前不存在时读路径仍可用、
+`overview` 以 canonical 为准且旧行仍可见、`purpose` 过滤精确且有界）、RUNTIME-18 ~ 21
+（provider 配置权威：DB / UI-only 槽位可用、`enabled=False` 零网络、配置解析失败不裸逃逸、
+canonical research 与 slot public view 共用同一 readiness predicate），以及 service 的架构
+guard（import 闭集、不 import 契约、无 SQL、无网络、依赖方向不可反转）与扫描器非空性用例。
+
+语义 mutation 在 `work/r27b2b_research_runtime_mutation_check.py`：service 绕过 typed
+provider 用 legacy 形状的 dict 充当结论、失败被降级成 `completed`、canonical 之后继续
+dual-write legacy 表、`status == supported` 驱动 authority 标记、网络调用被移进事务、legacy
+历史行被伪装成 canonical typed 研究、迁移路径又调一次 legacy provider、`as_of` 被运维时间
+替换、就绪判据忽略槽位 `enabled`、legacy 环境变量重新成为准入条件、配置解析异常裸逃逸，
+必须全部 CAUGHT（survived = 0、fake = 0、restore sha256 一致）。
+
+RUNTIME-18 ~ 21 覆盖 provider 配置权威的四个方向：DB / UI-only 槽位（没有厂商环境变量）必须
+能跑完 research、`enabled=False` 的槽位必须零 provider 调用、配置解析失败必须按 best-effort
+契约稳定映射、canonical research 的就绪判据必须与 slot public view 一致。前两条来自人工审核
+在 exact-head 上发现的**同一个根因**（provider 配置权威只收敛了一半），后两条是它必然伴生的
+语义缺口。
+
+`RUNTIME-15` 是一条由**生产缺陷**写下来的回归：canonical 表只有在一次 append 之后才存在，
+而 `overview` 是每次刷新概览都会走的路径 —— 少了读路径的 schema 引导，全新库会直接
+`no such table: ai_research_runs`。这类缺陷在没有集成测试覆盖读路径时是**静默的**，因此它被
+固化成永久回归，而不是靠"记得先跑一次研究"。
+
+
 ## 目标依赖方向
 
 ```text
@@ -1532,6 +1726,27 @@ research 台账内容与完整性指纹脱节（R27-B2A：读取时重算 record
 比较，不一致即 corrupt_research_record —— 完整性指纹，不是防篡改签名）
 research 持久化层读墙上时钟或持有网络依赖（R27-B2A：created_at 必须由调用方
 显式提供，as_of 与 created_at 必须分离）
+research orchestration 出现第二个 boundary 或绕过 typed provider
+（R27-B2B：服务自己造结论 = 第二个 research authority；迁移路径不得直接消费
+legacy provider 结果）
+迁移路径保留 legacy writer 或 dual-write（R27-B2B：canonical 之后写 legacy 表
+即两条审计链；迁移路径对应的 legacy writer 计数必须为 0，且必须有静态扫描
+证明，而不是只靠运行时观察）
+研究失败被降级成成功（R27-B2B：provider / contract / persistence 任一失败都
+不得回落 legacy provider、不得写 legacy 表、不得报 completed）
+legacy 历史行被抬成 canonical typed 研究（R27-B2B：只有 legacy 行时 canonical
+读入口必须返回「没有」，而不是把 free-form 旧行伪装成 typed 结论）
+provider 网络调用进入 DB transaction（R27-B2B：一次 LLM 等待不得持有 SQLite
+写锁；用 connect_factory 的连接深度可观测，而不是靠读代码）
+canonical 读路径在台账尚不存在时崩溃（R27-B2B：overview 是每次刷新概览都会走
+的路径，读入口必须先保证 schema 已建；「首次运行之前读不到」必须表现为空，
+而不是 no such table）
+canonical research 的就绪判据被绕过或分叉（R27-B2B：canonical research 与 slot
+public view 共用 ai_review_service.slot_readiness；忽略槽位 enabled 等于让操作员的
+disable 挡不住真实付费调用，而用 legacy 环境变量当准入条件会让 DB/UI-only 槽位永远
+跑不起来。legacy single/dual review 状态机的兼容检查本轮不迁移，不在本 guard 内）
+provider 配置解析异常裸逃逸（R27-B2B：槽位映射不存在或读配置失败必须映射成声明的
+best-effort 返回值，而不是把异常抛给调用方）
 ```
 
 ### 仅作 review signal（不进入 CI gate）
