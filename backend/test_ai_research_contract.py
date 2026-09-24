@@ -8,10 +8,10 @@
 
 分四组：
 
-    AI-*       contract 语义：两个维度分离、owner-issued、冲突、深冻结、PIT
-    AI-OWNER-* evidence 必须由 owner 签发，raw 调用方无法伪造 authority
-    AIG-*      architecture guard：依赖方向、"AI 不能 commit signal"、无 IO/时钟
-    非空性      护栏必须真的能失败，否则它只是装饰
+    AI-*         contract 语义：两个维度分离、冲突、深冻结、PIT
+    AI-TYPED-*   类型化 evidence：identity 由 R24 投影派生，调用方不提供
+    AIG-*        architecture guard：依赖方向、"AI 不能 commit signal"、无 IO/时钟
+    非空性        护栏必须真的能失败，否则它只是装饰
 
 时间一律**显式**传入（固定的业务日字符串），绝不 ``time.sleep()``、绝不读墙上时钟 ——
 本轮的 PIT 语义恰恰是最容易假绿的地方。
@@ -22,6 +22,7 @@ decision"，而 ``commit_signal`` 的校验顺序正好让这一点可以用 ``c
 from __future__ import annotations
 
 import ast
+import inspect
 import os
 import sys
 import unittest
@@ -40,7 +41,14 @@ DAY = "2026-08-27"
 NEXT_DAY = "2026-08-28"
 PREV_DAY = "2026-08-26"
 
-OWNER_ID = "LIVE_MARKET_POLICY"
+#: 默认 reading 的 owner 口径与观测时点 —— evidence identity 由它们**派生**，
+#: 调用方不再提供 source_id（见 AI-TYPED-02）。
+DEFAULT_POLICY = "live_market"
+
+
+def _derived_identity(*, policy: str = DEFAULT_POLICY, as_of: str = DAY) -> str:
+    """R24 投影派生出的 evidence identity：``policy@观测时点``。"""
+    return f"{policy}@{as_of}T10:30:00+08:00"
 
 #: 只有这一个项目模块允许被 AI 契约 import：R24 的纯行情契约（**读**事实）。
 ALLOWED_PROJECT_IMPORTS = {"market_data_contract"}
@@ -168,26 +176,33 @@ def _code_string_constants(tree: ast.Module) -> list[str]:
 def _reading(
     verification: str = MDC.VERIFICATION_VERIFIED,
     method: str = MDC.VERIFICATION_METHOD_CROSS_SOURCE,
-    *, as_of: str = DAY,
+    *, as_of: str = DAY, policy: str = "live_market", observed_at: str | None = None,
 ):
-    """一个真实的 R24 owner projection（``MarketDataReading``）。"""
+    """一个 R24 typed projection（``MarketDataReading``）。
+
+    刻意手工构造：这正是本契约**无法**排除的伪造路径（``MarketDataReading`` 是公开
+    dataclass）。测试 helper 里保留它，是为了让"两步伪造"这条限制可见，而不是假装
+    它不存在 —— 见 AI-TYPED-01。
+    """
     return MDC.MarketDataReading(
         availability=MDC.AVAILABILITY_AVAILABLE,
         freshness=MDC.FRESHNESS_FRESH,
         status=MDC.STATUS_FRESH,
-        policy_name="live_market",
+        policy_name=policy,
         snapshot=MDC.MarketDataSnapshot(
-            kind="symbol_quote", as_of=as_of, observed_at=f"{as_of}T10:30:00+08:00",
+            kind="symbol_quote", as_of=as_of,
+            observed_at=observed_at or f"{as_of}T10:30:00+08:00",
             verification=verification, verification_method=method,
         ),
     )
 
 
 def _ref(*, verification=MDC.VERIFICATION_VERIFIED,
-         method=MDC.VERIFICATION_METHOD_CROSS_SOURCE, as_of=DAY, source_id=OWNER_ID):
-    """一条由 owner factory 签发的证据引用。"""
+         method=MDC.VERIFICATION_METHOD_CROSS_SOURCE, as_of=DAY,
+         policy="live_market", observed_at=None):
+    """一条由唯一 factory 签发的证据引用（identity 由 R24 投影派生）。"""
     return ARC.evidence_ref_from_market_reading(
-        _reading(verification, method, as_of=as_of), source_id=source_id,
+        _reading(verification, method, as_of=as_of, policy=policy, observed_at=observed_at),
     )
 
 
@@ -221,7 +236,7 @@ class AiResearchFactTests(unittest.TestCase):
         self.assertEqual(ARC.EVENT_MARKET_OBSERVED, event.kind)
         self.assertEqual(MDC.VERIFICATION_VERIFIED, event.verification)
         self.assertEqual(MDC.VERIFICATION_METHOD_CROSS_SOURCE, event.verification_method)
-        self.assertEqual(OWNER_ID, event.evidence_id)
+        self.assertEqual(_derived_identity(), event.evidence_id)
         self.assertTrue(ref.cross_source_verified)
 
         # kind 与 source_type 一一对应，且派生只读 —— 错标无法表达。
@@ -261,7 +276,7 @@ class AiResearchFactTests(unittest.TestCase):
                 kind="symbol_quote", as_of=DAY, observed_at=f"{DAY}T10:30:00+08:00",
             ),
         )
-        stale_ref = ARC.evidence_ref_from_market_reading(untouched, source_id=OWNER_ID)
+        stale_ref = ARC.evidence_ref_from_market_reading(untouched)
         self.assertEqual(MDC.VERIFICATION_NOT_ATTEMPTED, stale_ref.verification)
 
         # 非法核验组合（verified 配 none）在构造期就被拒绝，而不是被降级。
@@ -308,10 +323,10 @@ class AiResearchFactTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     _hypothesis(as_of=bad)
 
-        # owner projection 若没有可证明的 as-of（unavailable reading），拒绝签发。
+        # R24 投影若没有可证明的业务日（unavailable reading），拒绝映射。
         with self.assertRaises(ValueError):
             ARC.evidence_ref_from_market_reading(
-                MDC.unavailable_reading(MDC.LIVE_MARKET_POLICY), source_id=OWNER_ID,
+                MDC.unavailable_reading(MDC.LIVE_MARKET_POLICY),
             )
 
         # 契约本身没有读时钟的入口 —— 这是"无法回填 current"的结构性保证。
@@ -349,8 +364,13 @@ class AiResearchRelationTests(unittest.TestCase):
         """
         hypothesis = _hypothesis(evidence=(_evidence(_ref(), ARC.RELATION_CONTEXT),))
         self.assertEqual(ARC.HYPOTHESIS_INSUFFICIENT_EVIDENCE, hypothesis.status)
-        self.assertEqual(ARC.RESEARCH_REASON_EVIDENCE_NOT_VERIFIED, hypothesis.reason)
+        self.assertEqual(ARC.RESEARCH_REASON_NO_SUPPORTING_EVIDENCE, hypothesis.reason)
         self.assertFalse(hypothesis.is_supported)
+
+        # reason 必须与事实层的结论一致：事实**已经** verified，所以原因不能是
+        # evidence_not_verified —— 那会把刚拆开的两个维度又混回去。
+        self.assertNotEqual(ARC.RESEARCH_REASON_EVIDENCE_NOT_VERIFIED, hypothesis.reason)
+        self.assertNotEqual(ARC.RESEARCH_REASON_EVIDENCE_UNAVAILABLE, hypothesis.reason)
 
     def test_AI10_verified_fact_with_supports_relation_is_supported(self):
         """AI-10：verified 事实 + relation=supports → supported。"""
@@ -368,7 +388,8 @@ class AiResearchRelationTests(unittest.TestCase):
         # 可信支持与可信反对并存 → 反对优先（保守），不"票数过半"。
         mixed = _hypothesis(evidence=(
             _evidence(_ref(), ARC.RELATION_SUPPORTS),
-            _evidence(_ref(source_id="OTHER_POLICY"), ARC.RELATION_CONTRADICTS),
+            _evidence(_ref(policy="close_snapshot", observed_at=f"{DAY}T15:00:00+08:00"),
+                      ARC.RELATION_CONTRADICTS),
         ))
         self.assertEqual(ARC.HYPOTHESIS_UNSUPPORTED, mixed.status)
 
@@ -450,20 +471,20 @@ class AiResearchRelationTests(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# AI-17 / AI-18 —— owner-issued evidence
+# AI-TYPED-* —— 类型化 evidence：identity 由 owner 投影派生
 # ---------------------------------------------------------------------------
 
 
-class AiResearchOwnerIssuedTests(unittest.TestCase):
-    """P1-2：调用方不能仅凭传字符串声明一条 owner authority 事实。"""
+class AiResearchTypedEvidenceTests(unittest.TestCase):
+    """P1-2（修正版）：调用方不能提供 identity，也不能提供核验结论。
 
-    def test_AI_OWNER_01_raw_caller_cannot_forge_owner_issued_evidence(self):
-        """AI-OWNER-01：raw 构造不得得到 trusted owner-issued evidence。
+    前一轮把这一层描述成 "owner-issued provenance" 是**过度声称**：
+    ``MarketDataReading`` / ``MarketDataSnapshot`` 都是公开 dataclass，一个手工拼出来的
+    reading 与本层不可区分。本轮改为诚实命名，并把边界写成可执行的断言。
+    """
 
-        这是 P1-2 的核心：只要 ``ResearchEvidenceRef`` 能被调用方自由构造，
-        "这是 R24 verified market fact"就只是一句自述，闭集 source 列表与
-        authority 边界都形同虚设。
-        """
+    def test_AI_TYPED_01_raw_caller_cannot_construct_evidence(self):
+        """AI-TYPED-01：没有公开 raw 构造器，身份与核验结论都不来自调用方。"""
         for attempt in (
             {"source_type": ARC.EVIDENCE_SOURCE_MARKET_DATA, "source_id": "fake",
              "as_of": DAY, "verification": MDC.VERIFICATION_VERIFIED,
@@ -476,63 +497,120 @@ class AiResearchOwnerIssuedTests(unittest.TestCase):
             with self.subTest(source_type=attempt["source_type"]):
                 with self.assertRaises(TypeError) as caught:
                     ARC.ResearchEvidenceRef(**attempt)
-                self.assertIn("owner-issued", str(caught.exception))
+                self.assertIn("no public constructor", str(caught.exception))
 
-        # 没有任何可观测量能让调用方把 raw 值变成 trusted evidence。
         self.assertFalse(hasattr(ARC, "_OWNER_ISSUED"),
                          "不得存在可 import 的构造哨兵（那是伪安全）")
 
-    def test_AI_OWNER_02_factory_preserves_owner_identity_asof_and_verification(self):
-        """AI-OWNER-02：真实 owner projection → factory 必须保留全部原值。"""
+    def test_AI_TYPED_02_identity_is_derived_from_the_owner_projection(self):
+        """AI-TYPED-02：identity 由 R24 投影派生，调用方无法命名或改名。
+
+        这是本轮复审的核心修正：``source_id`` 曾经是 caller 的自由字符串，于是同一份
+        真实 reading 可以被重命名成 FACT_A / FACT_B / FACT_C，绕过
+        ``(source_type, source_id, as_of)`` 的 duplicate / conflict identity。
+        """
+        signature = inspect.signature(ARC.evidence_ref_from_market_reading)
+        self.assertEqual(
+            ["reading"], list(signature.parameters),
+            "factory 不得接受调用方提供的 source_id —— 一个由调用方命名的 identity "
+            "不是 identity，而是一个能绕过去重与冲突检测的自由字符串",
+        )
+
+        first = ARC.evidence_ref_from_market_reading(_reading())
+        second = ARC.evidence_ref_from_market_reading(_reading())
+        self.assertEqual(_derived_identity(), first.source_id)
+        self.assertEqual(first.identity(), second.identity(),
+                         "同一份事实必须派生出同一个 identity")
+
+        # 不同快照（观测时点不同）→ 不同 identity：这是真实的另一份事实。
+        other = ARC.evidence_ref_from_market_reading(
+            _reading(observed_at=f"{DAY}T14:00:00+08:00"),
+        )
+        self.assertNotEqual(first.identity(), other.identity())
+
+        # 不同口径（policy）→ 不同 identity。
+        other_policy = ARC.evidence_ref_from_market_reading(_reading(policy="close_snapshot"))
+        self.assertNotEqual(first.identity(), other_policy.identity())
+
+        # 同一份事实无法被造成两条：duplicate 检查因此不可被绕过。
+        hypothesis = _hypothesis(
+            evidence=(_evidence(first), _evidence(ARC.evidence_ref_from_market_reading(_reading()))),
+        )
+        self.assertEqual(1, len(hypothesis.evidence))
+
+    def test_AI_TYPED_03_verification_and_asof_are_copied_verbatim(self):
+        """AI-TYPED-03：核验维度与业务日逐字来自投影，不被改写也不被升级。"""
         reading = _reading(as_of=DAY)
-        ref = ARC.evidence_ref_from_market_reading(reading, source_id=OWNER_ID)
+        ref = ARC.evidence_ref_from_market_reading(reading)
         projected = reading.projection()
 
         self.assertEqual(ARC.EVIDENCE_SOURCE_MARKET_DATA, ref.source_type)
-        self.assertEqual(OWNER_ID, ref.source_id)
         self.assertEqual(projected["as_of"], ref.as_of)
+        self.assertEqual(DAY, ref.as_of)
         self.assertEqual(projected["verification"], ref.verification)
         self.assertEqual(projected["verification_method"], ref.verification_method)
-        self.assertEqual(DAY, ref.as_of)
 
-    def test_AI_OWNER_03_single_source_reading_is_never_upgraded_to_verified(self):
-        """AI-OWNER-03：single_source reading 不得变成 verified。"""
-        ref = ARC.evidence_ref_from_market_reading(
-            _reading(MDC.VERIFICATION_SINGLE_SOURCE), source_id=OWNER_ID,
+        single = ARC.evidence_ref_from_market_reading(
+            _reading(MDC.VERIFICATION_SINGLE_SOURCE),
         )
-        self.assertEqual(MDC.VERIFICATION_SINGLE_SOURCE, ref.verification)
-        self.assertNotEqual(MDC.VERIFICATION_VERIFIED, ref.verification)
-        self.assertFalse(ref.cross_source_verified)
+        self.assertEqual(MDC.VERIFICATION_SINGLE_SOURCE, single.verification)
+        self.assertNotEqual(MDC.VERIFICATION_VERIFIED, single.verification)
+        self.assertFalse(single.cross_source_verified)
         self.assertEqual(
-            ARC.HYPOTHESIS_INSUFFICIENT_EVIDENCE, _hypothesis(evidence=(_evidence(ref),)).status,
+            ARC.HYPOTHESIS_INSUFFICIENT_EVIDENCE, _hypothesis(evidence=(_evidence(single),)).status,
         )
 
-    def test_AI_OWNER_04_unprovable_as_of_fails_closed(self):
-        """AI-OWNER-04：无法证明 as_of 的 owner projection 必须 fail closed。"""
+    def test_AI_TYPED_04_unprovable_business_day_fails_closed(self):
+        """AI-TYPED-04：无法证明业务日的 R24 投影必须 fail closed。"""
         # 完全没有 snapshot（unavailable）→ 没有可证明的业务日。
         with self.assertRaises(ValueError):
             ARC.evidence_ref_from_market_reading(
-                MDC.unavailable_reading(MDC.LIVE_MARKET_POLICY), source_id=OWNER_ID,
+                MDC.unavailable_reading(MDC.LIVE_MARKET_POLICY),
             )
 
-        # duck-typed 对象（带 projection() 但不是 owner 类型）同样拒绝。
+        # duck-typed 对象（带 projection() 但不是 R24 类型）同样拒绝。
         class FakeReading:
             def projection(self):
-                return {"as_of": DAY, "verification": MDC.VERIFICATION_VERIFIED,
+                return {"as_of": DAY, "policy": "live_market",
+                        "verification": MDC.VERIFICATION_VERIFIED,
                         "verification_method": MDC.VERIFICATION_METHOD_CROSS_SOURCE}
 
         with self.assertRaises(TypeError) as caught:
-            ARC.evidence_ref_from_market_reading(FakeReading(), source_id=OWNER_ID)
-        self.assertIn("typed owner projection", str(caught.exception))
+            ARC.evidence_ref_from_market_reading(FakeReading())
+        self.assertIn("R24 projection", str(caught.exception))
 
-    def test_AI_OWNER_05_future_owner_projection_cannot_enter_a_historical_hypothesis(self):
-        """AI-OWNER-05：未来的 owner projection 不得进入历史 hypothesis。"""
-        future = ARC.evidence_ref_from_market_reading(
-            _reading(as_of=NEXT_DAY), source_id=OWNER_ID,
-        )
+        # 缺 policy 的投影无法派生稳定 identity → 拒绝。
+        with self.assertRaises(ValueError):
+            ARC._market_evidence_identity({"as_of": DAY, "observed_at": f"{DAY}T10:00:00+08:00"})
+
+    def test_AI_TYPED_05_future_projection_cannot_enter_a_historical_hypothesis(self):
+        """AI-TYPED-05：未来的 R24 投影不得进入历史 hypothesis。"""
+        future = ARC.evidence_ref_from_market_reading(_reading(as_of=NEXT_DAY))
         with self.assertRaises(ValueError) as caught:
             _hypothesis(as_of=DAY, evidence=(_evidence(future),))
         self.assertIn("future evidence", str(caught.exception))
+
+    def test_AI_TYPED_06_two_step_forgery_is_documented_not_claimed_closed(self):
+        """AI-TYPED-06：诚实记录本层**不能**排除的路径（两步伪造）。
+
+        ``MarketDataReading`` 是公开 dataclass，因此下列路径在本层是**可以通过**的：
+
+            手工造 MarketDataSnapshot(verified, cross_source)
+                → 手工造 MarketDataReading
+                → evidence_ref_from_market_reading(...)
+                → 得到一条 verification=verified 的 ref
+
+        本层把它作为**已知限制**断言下来，而不是假装已经封堵。真正的修复需要 R24 自己
+        签发 evidence token（属于 R24 的职责，不在 R27-A 范围内）。
+        """
+        forged = ARC.evidence_ref_from_market_reading(
+            _reading(MDC.VERIFICATION_VERIFIED, policy="forged_policy"),
+        )
+        self.assertEqual(MDC.VERIFICATION_VERIFIED, forged.verification)
+        self.assertEqual(ARC.EVIDENCE_SOURCE_MARKET_DATA, forged.source_type)
+
+        # 但伪造者仍然**无法**选择 identity：它只能是投影派生出来的那个值。
+        self.assertEqual(_derived_identity(policy="forged_policy"), forged.source_id)
 
 
 # ---------------------------------------------------------------------------
@@ -552,9 +630,7 @@ class AiResearchImmutabilityTests(unittest.TestCase):
         event = ARC.InformationEvent(
             as_of=DAY, source="s", evidence_ref=_ref(), payload=original,
         )
-        ref = ARC.evidence_ref_from_market_reading(
-            _reading(), source_id=OWNER_ID,
-        )
+        ref = ARC.evidence_ref_from_market_reading(_reading())
 
         # 调用方保留的原始对象继续被改写 —— 契约内部值必须不变。
         original["nested"]["items"].append(9)
@@ -579,7 +655,7 @@ class AiResearchImmutabilityTests(unittest.TestCase):
             event.payload["nested"]["items"] += (4,)
         with self.assertRaises(TypeError):
             ref.detail["policy"] = "changed"
-        self.assertEqual(OWNER_ID, ref.source_id)
+        self.assertEqual(_derived_identity(), ref.source_id)
 
     def test_AI18_non_json_payload_values_are_rejected(self):
         """AI-18：只接受 JSON-like 值；任意可变对象 fail closed。"""

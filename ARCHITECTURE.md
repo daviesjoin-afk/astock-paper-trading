@@ -903,7 +903,7 @@ prompt 管理、agent framework、vector DB 与 RAG。
 
 ```text
 R24 Market Data Reading ─┐
-R25 Signal Evidence      ├─→ owner-issued evidence ref ─→ explicit hypothesis relation
+R25 Signal Evidence      ├─→ typed market evidence ref ─→ explicit hypothesis relation
 R26 Execution Evidence   │        （只读、纯契约）              │
 历史 strategy/portfolio ─┘                                     ↓
                                                        ResearchHypothesis
@@ -950,7 +950,7 @@ strong/weak/uncertain 等评分档位：本轮不做评分模型，也没有 `qu
 | 概念 | 回答的问题 | 关键约束 |
 | --- | --- | --- |
 | `InformationEvent` | AI 看到了什么事实？ | `kind` 由 `evidence_ref.source_type` **派生**，错标无法表达 |
-| `ResearchEvidenceRef` | 事实来自谁、哪一天、owner 的核验结论是什么？ | **无公开 raw 构造器**；只能由 owner factory 签发 |
+| `ResearchEvidenceRef` | 事实来自哪个 owner 口径、哪一份快照、owner 的核验结论是什么？ | **无公开 raw 构造器**；identity 由 R24 投影派生，调用方不提供 |
 | `HypothesisEvidence` | 这条事实对 thesis 是什么关系？ | `relation` 显式传入，**不**从 verification 派生 |
 | `ResearchHypothesis` | 基于这些证据提出了什么假设？ | `status` **派生**；`is_authoritative` 恒为 `False` |
 
@@ -958,20 +958,41 @@ strong/weak/uncertain 等评分档位：本轮不做评分模型，也没有 `qu
 `status` 可以由调用方给出，那么"给一个没有证据的假设贴上 `supported`"就只是一个
 关键字参数 —— 这正是本轮要根除的默认批准。
 
-### owner-issued evidence
+### 类型化 market evidence（不是 owner-issued provenance）
 
-唯一公开签发入口是 `evidence_ref_from_market_reading(reading, source_id=...)`，
-它要求一个真正的 `market_data_contract.MarketDataReading` 并从中逐字复制核验维度。
-`ResearchEvidenceRef(...)` 一律抛 `TypeError`（没有可 import 的哨兵，也没有
-`issued=True` 之类的开关 —— 那种"标记位"呼叫方一样能写）。
+唯一公开签发入口是 `evidence_ref_from_market_reading(reading)`，它要求一个真正的
+`market_data_contract.MarketDataReading`，并从投影**派生**全部身份与核验维度：
 
-因此调用方**无法仅凭传字符串**把自己声明成"R24 verified market fact"，
-`single_source` 也不可能在签发时变成 `verified`。`as_of` 只取自 owner 投影，
-调用方不能覆盖。
+```text
+source_id  ←  policy @ 观测时点   （调用方不提供）
+as_of      ←  投影的 as_of / observed_at（调用方不覆盖）
+verification / verification_method  ←  逐字复制
+```
 
-诚实声明这一层的强度：这是**类型层构造边界**，不是密码学封印 —— Python 无法阻止
-有人 `object.__new__` 或伪造一个 reading。它保证的是：AI 代码里**不再出现自由形式
-的核验字符串**，任何 AI 事实都必须由一个 owner 类型对象承载。
+`source_id` **不接受**调用方传参：一个由调用方命名的 identity 不是 identity，而是
+一个能被用来把同一份事实改名成 FACT_A / FACT_B / FACT_C 从而绕过去重与冲突检测的
+自由字符串。`ResearchEvidenceRef(...)` 一律抛 `TypeError`；没有可 import 的哨兵，也
+没有 `issued=True` 之类的开关（那种"标记位"调用方一样能写）。
+
+**诚实声明这一层的强度。** 早期版本把它描述成 "owner-issued provenance"，那是
+**过度声称**：`MarketDataReading` / `MarketDataSnapshot` 都是**公开 dataclass**，因此
+
+```text
+手工造 MarketDataSnapshot(verified, cross_source)
+    → 手工造 MarketDataReading
+    → evidence_ref_from_market_reading(...)
+```
+
+在本层是**可以通过**的 —— 伪造只是从一步变成两步。本层真正保证的是：
+
+* 调用方**不能提供 identity**，所以同一份事实无法被改名绕过去重 / 冲突检测；
+* 调用方**不能提供核验结论**，`single_source` 不可能在签发时变成 `verified`；
+* AI 代码里不再出现自由形式的核验字符串。
+
+要真正证明"这份事实由 `market_data_service` 产生"，需要 **R24 自己签发 evidence
+token** —— 那是 R24 的职责，不在 R27-A 范围内。这条限制由
+`test_AI_TYPED_06_two_step_forgery_is_documented_not_claimed_closed` 作为**已知
+限制**断言下来，而不是假装已封堵。
 
 当前 `SUPPORTED_OWNER_ADAPTERS` **只有 market_data**。signal / execution / news 等
 仍在 `EVIDENCE_SOURCE_TYPES` 闭集里作为已声明的未来来源，但没有 factory 可以签发 ——
@@ -979,7 +1000,7 @@ strong/weak/uncertain 等评分档位：本轮不做评分模型，也没有 `qu
 
 ### 证据集合：去重与冲突
 
-identity 是 `(source_type, source_id, as_of)`。
+identity 是 `(source_type, source_id, as_of)`，其中 `source_id` 由 R24 投影派生。
 
 ```text
 完全相同（含 detail）            → 安全去重
@@ -997,11 +1018,16 @@ identity 是 `(source_type, source_id, as_of)`。
 无 evidence                          → insufficient_evidence / no_evidence
 有 verified contradicts              → unsupported / evidence_contradicted
 有 verified supports 且无 contradicts → supported
-只有 context / 未验证 supports        → insufficient_evidence / evidence_not_verified
-只有 unavailable / disagreement      → insufficient_evidence / evidence_unavailable
+有 supports 但该事实未通过核验        → insufficient_evidence / evidence_not_verified
+owner 核验失败或来源不可用            → insufficient_evidence / evidence_unavailable
+事实可信但无一与 thesis 相关（context）→ insufficient_evidence / no_supporting_evidence
 ```
 
-注意末两行：来源不可用**不是** `unsupported` —— 它只让证据不足以判断。这与
+`reason` 必须与事实层的核验结论**一致**：一条 verified 的事实若只是
+`relation=context`，原因只能是 `no_supporting_evidence`，绝不能报成
+`evidence_not_verified` —— 那会把刚拆开的两个维度又混回去（这正是 early 版本的缺陷）。
+
+注意"来源不可用"**不是** `unsupported` —— 它只让证据不足以判断。这与
 "可信事实反对结论"是两个结论，因此 reason 也不同。
 
 - `confidence` 是 AI 的自评，**不参与** status 判定 —— 参与就会得到"越自信越强"的环路。
@@ -1031,10 +1057,10 @@ hypothesis / research-ledger owner，为这个 PR 新建一套 AI 数据库体�
 
 ### 回归门禁
 
-`backend/test_ai_research_contract.py`（AI-01 ~ AI-20 契约语义、AI-OWNER-01 ~ 05
-owner-issued 边界、AIG-01 ~ AIG-06 架构 guard、`GuardIsNotVacuouslyPassing` 非空性）；
-语义 mutation 在 `work/r27_ai_mutation_check.py`：去掉 future-evidence check、
-未核验事实当作已核验、relation 强制成 supports、raw 伪造 owner evidence、
+`backend/test_ai_research_contract.py`（AI-01 ~ AI-20 契约语义、AI-TYPED-01 ~ 06
+identity 派生与诚实边界、AIG-01 ~ AIG-06 架构 guard、`GuardIsNotVacuouslyPassing`
+非空性）；语义 mutation 在 `work/r27_ai_mutation_check.py`：去掉 future-evidence check、
+未核验事实当作已核验、relation 强制成 supports、identity 不再由投影派生、
 冲突 duplicate first-wins、deep freeze 退回浅冻结，必须全部 CAUGHT
 （survived = 0、fake = 0）。
 

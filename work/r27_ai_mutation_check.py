@@ -90,24 +90,17 @@ MUTATIONS = [
     },
     {
         "id": "M-AI4",
-        # 重新打开 raw 构造入口：ResearchEvidenceRef(...) 不再抛错。
-        # 调用方于是可以仅凭传字符串伪造一条"R24 verified market fact" ——
-        # P1-2 的 authority spoofing 回归。
+        # identity 不再由 R24 投影派生：丢掉观测时点，只留 policy。
+        # 于是**不同的两份快照**塌成同一个 identity —— 去重与冲突检测认不出它们，
+        # duplicate / conflict 语义随之失效。这正是本轮 P1 修正要守住的性质。
         "file": CONTRACT,
-        "old": (
-            "    def __init__(self, *args: Any, **kwargs: Any) -> None:\n"
-            "        raise TypeError(\n"
-        ),
-        "new": (
-            "    def __init__(self, *args: Any, **kwargs: Any) -> None:\n"
-            "        if False:\n"
-            "            raise TypeError(\n"
-        ),
+        "old": '    return f"{policy}@{stamp}", as_of\n',
+        "new": "    return policy, as_of\n",
         "test": _arc(
-            "AiResearchOwnerIssuedTests."
-            "test_AI_OWNER_01_raw_caller_cannot_forge_owner_issued_evidence"
+            "AiResearchTypedEvidenceTests."
+            "test_AI_TYPED_02_identity_is_derived_from_the_owner_projection"
         ),
-        "desc": "raw caller 可伪造 owner-issued evidence（authority spoof）",
+        "desc": "identity 不再由投影派生（不同快照塌成同一 identity）",
     },
     {
         "id": "M-AI5",

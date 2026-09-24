@@ -35,16 +35,12 @@ AI 只消费事实，永不成为 authority：:attr:`ResearchHypothesis.is_autho
 import ``market_data_contract``（R24 纯契约）与标准库，不 import DB / 网络 / 时钟 /
 LLM SDK。authority 不得反向 import 本模块。
 
-evidence 是 **owner-issued**：唯一公开构造入口是
-:func:`evidence_ref_from_market_reading`，它要求一个 typed owner projection
-(``market_data_contract.MarketDataReading``) 并从中复制核验维度。裸构造
-``ResearchEvidenceRef(...)`` 抛 ``TypeError``，因此调用方**无法仅凭传字符串**把自己
-声明成"R24 verified market fact"。
-
-诚实声明这一层的强度：这是**类型层构造边界**，不是密码学封印。Python 无法阻止有人
-import 私有哨兵，也无法区分一个由 ``classify()`` 得出的 reading 和一个被手工拼出来的
-reading —— 后者在 R24 自己的 API 里同样可能。本层能保证的是：AI 代码里**不再出现
-自由形式的核验字符串**，任何 AI 事实都必须由一个 R24 类型对象承载。
+evidence 走**类型化 market evidence** 边界：唯一公开构造入口是
+:func:`evidence_ref_from_market_reading`，它要求一个 typed R24 projection
+(``market_data_contract.MarketDataReading``)，并从投影**派生** identity、业务日与核验
+维度；裸构造 ``ResearchEvidenceRef(...)`` 抛 ``TypeError``。保证与**已知限制**
+（两层伪造路径、以及为什么需要 R24 签发 token）集中在
+:class:`ResearchEvidenceRef` 的 docstring 里，此处不重复。
 
 ──────────────── 能力边界 ────────────────
 
@@ -80,9 +76,9 @@ __all__ = [
     "HYPOTHESIS_SUPPORTED", "HYPOTHESIS_INSUFFICIENT_EVIDENCE", "HYPOTHESIS_UNSUPPORTED",
     "HYPOTHESIS_STATUSES",
     # reasons
-    "RESEARCH_REASON_NO_EVIDENCE", "RESEARCH_REASON_EVIDENCE_NOT_VERIFIED",
-    "RESEARCH_REASON_EVIDENCE_CONTRADICTED", "RESEARCH_REASON_EVIDENCE_UNAVAILABLE",
-    "RESEARCH_REASONS",
+    "RESEARCH_REASON_NO_EVIDENCE", "RESEARCH_REASON_NO_SUPPORTING_EVIDENCE",
+    "RESEARCH_REASON_EVIDENCE_NOT_VERIFIED", "RESEARCH_REASON_EVIDENCE_CONTRADICTED",
+    "RESEARCH_REASON_EVIDENCE_UNAVAILABLE", "RESEARCH_REASONS",
     # contract
     "ResearchEvidenceRef", "InformationEvent", "HypothesisEvidence", "ResearchHypothesis",
     # errors
@@ -180,13 +176,22 @@ HYPOTHESIS_STATUSES = (
 # reasons —— 为什么这个假设（还）不成立
 # ---------------------------------------------------------------------------
 
+#: 没有任何 evidence。
 RESEARCH_REASON_NO_EVIDENCE = "no_evidence"
+#: 有 evidence，但**没有一条**通过核验的 supports —— 例如只有 context。
+#: 与 ``evidence_not_verified`` 的区别是这里的事实**本身可信**，只是与 thesis 无关。
+RESEARCH_REASON_NO_SUPPORTING_EVIDENCE = "no_supporting_evidence"
+#: 有 relation=supports 的 evidence，但它自己没通过 owner 核验（单源 / 从未核验）。
 RESEARCH_REASON_EVIDENCE_NOT_VERIFIED = "evidence_not_verified"
+#: 存在通过核验的 contradicts —— 可信事实反对这个结论。
 RESEARCH_REASON_EVIDENCE_CONTRADICTED = "evidence_contradicted"
+#: evidence 的 owner 核验失败或来源不可用（disagreement / unavailable）。
+#: 只说明这条 evidence 不可靠，**不**等于 thesis 被反驳。
 RESEARCH_REASON_EVIDENCE_UNAVAILABLE = "evidence_unavailable"
 RESEARCH_REASONS = (
-    RESEARCH_REASON_NO_EVIDENCE, RESEARCH_REASON_EVIDENCE_NOT_VERIFIED,
-    RESEARCH_REASON_EVIDENCE_CONTRADICTED, RESEARCH_REASON_EVIDENCE_UNAVAILABLE,
+    RESEARCH_REASON_NO_EVIDENCE, RESEARCH_REASON_NO_SUPPORTING_EVIDENCE,
+    RESEARCH_REASON_EVIDENCE_NOT_VERIFIED, RESEARCH_REASON_EVIDENCE_CONTRADICTED,
+    RESEARCH_REASON_EVIDENCE_UNAVAILABLE,
 )
 
 
@@ -289,18 +294,36 @@ def _owner_verification_pair(verification: Any, method: Any) -> tuple[str, str]:
 
 @dataclass(frozen=True)
 class ResearchEvidenceRef:
-    """一条**已存在事实**的 owner-issued 引用。只留引用与核验维度，不复制 payload。
+    """一条**已存在事实**的类型化引用。只留引用与核验维度，不复制 payload。
 
-    本类只回答"这是什么事实 / 谁拥有它 / 是哪一条 / 业务日是什么 / owner 对它的
-    verification 是什么"。它**不能**回答"它支持什么 thesis" —— 那由
+    本类只回答"这是什么事实 / 哪一个 owner 口径 / 哪一份快照 / 业务日是什么 / owner 对
+    它的 verification 是什么"。它**不能**回答"它支持什么 thesis" —— 那由
     :class:`HypothesisEvidence.relation` 显式声明。因此这里没有 ``standing`` 之类的
     派生方向字段：``verified`` 只意味着"来源通过了它自己的核验"。
 
     **没有公开 raw 构造器。** ``ResearchEvidenceRef(...)`` 一律抛 ``TypeError``；
-    唯一的签发路径是 :func:`evidence_ref_from_market_reading`，它要求一个 typed owner
-    projection。这不是"标记位"式的假防护：没有可 import 的哨兵，也没有
-    ``issued=True`` 之类的开关，因此调用方无法仅凭传字符串把自己声明成
-    "R24 verified market fact"。
+    唯一的签发路径是 :func:`evidence_ref_from_market_reading`。身份与核验维度都由
+    R24 投影派生，调用方既不提供 ``source_id`` 也不提供 verification —— 因此
+    "传字符串把自己声明成 R24 verified market fact"不可表达。
+
+    **保证与已知限制**（不要把这个边界读成 provenance 证明）。R24 的
+    ``MarketDataReading`` / ``MarketDataSnapshot`` 是**公开 dataclass**，因此
+
+        手工造 MarketDataSnapshot(verified, cross_source) → 手工造 MarketDataReading
+            → evidence_ref_from_market_reading(...) → 得到一条 verified 的 ref
+
+    在本层是**可以通过**的：伪造只是从一步变成两步。本层真正保证的是：
+
+    * 调用方**不能提供 identity** —— ``source_id`` 由投影派生（policy + 观测时点），
+      所以同一份事实无法被改名成 FACT_A / FACT_B / FACT_C 绕过去重与冲突检测；
+    * 调用方**不能提供核验结论** —— ``single_source`` 不可能在签发时变成 ``verified``；
+    * AI 代码里不再出现自由形式的核验字符串。
+
+    要真正证明"这份事实由 ``market_data_service`` 产生"，需要 **R24 自己签发 evidence
+    token**（R24 的职责，不在 R27-A 范围内）。本条限制由
+    ``test_AI_TYPED_06_two_step_forgery_is_documented_not_claimed_closed`` 断言下来，
+    而不是假装已封堵；也不引入 ``issued=True`` / 私有哨兵 / factory registry 这类
+    只提供虚假安全感的形式主义。
     """
 
     source_type: str
@@ -312,10 +335,10 @@ class ResearchEvidenceRef:
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         raise TypeError(
-            "ResearchEvidenceRef is owner-issued: 调用方不能仅凭传 source_type / "
-            "source_id / verification 字符串声明一条 R24 verified 事实。"
-            "请使用 evidence_ref_from_market_reading(reading, source_id=...) "
-            "并提供 owner 的 typed projection"
+            "ResearchEvidenceRef has no public constructor: 调用方不能仅凭传 "
+            "source_type / source_id / verification 字符串声明一条 R24 事实。"
+            "请使用 evidence_ref_from_market_reading(reading)：identity 与核验维度"
+            "都由 R24 投影派生，调用方不参与"
         )
 
     def __post_init__(self) -> None:
@@ -379,11 +402,40 @@ class ResearchEvidenceRef:
         }
 
 
+def _market_evidence_identity(
+    projection: Mapping[str, Any],
+) -> tuple[str, str]:
+    """从 R24 投影**派生** ``(source_id, as_of)`` —— 调用方不参与。
+
+    identity 只描述这份事实自己：``policy``（哪一套读取口径）+ 观测时点（这一份快照）。
+    调用方无法改名，也就无法对同一份事实造出第二个 identity 去绕过去重与冲突检测
+    （为什么这件事重要见 :class:`ResearchEvidenceRef`）。
+
+    缺 ``policy`` 或缺时点时 fail closed：无口径的事实无法稳定识别，而没有可证明业务日
+    的事实不得进入研究链路。
+    """
+    policy = str(projection.get("policy") or "").strip()
+    if not policy:
+        raise ValueError(
+            "market reading projection carries no policy — 无法派生稳定的 evidence "
+            "identity；研究层不接受无口径的事实"
+        )
+    observed_at = str(projection.get("observed_at") or "").strip()
+    as_of = projection.get("as_of")
+    stamp = observed_at or str(as_of or "").strip()
+    if not stamp:
+        raise ValueError(
+            "market reading projection carries neither observed_at nor as_of — "
+            "PIT 不可证明的事实不得进入研究链路"
+        )
+    return f"{policy}@{stamp}", as_of
+
+
 def _issue_evidence_ref(
     *, source_type: str, source_id: Any, as_of: Any,
     verification: Any, verification_method: Any, detail: Mapping[str, Any],
 ) -> ResearchEvidenceRef:
-    """签发一个 ref。只有本模块的 owner factory 调用它。
+    """签发一个 ref。只有本模块的 market-evidence adapter 调用它。
 
     绕过 ``__init__``（它恒抛错）并在设置完全部字段后跑 ``__post_init__``，
     使校验逻辑仍然只有一份、且紧挨字段定义。
@@ -399,37 +451,33 @@ def _issue_evidence_ref(
     return ref
 
 
-def evidence_ref_from_market_reading(
-    reading: Any, *, source_id: Any,
-) -> ResearchEvidenceRef:
-    """把 R24 的 typed owner projection 映射成 :class:`ResearchEvidenceRef`。
+def evidence_ref_from_market_reading(reading: Any) -> ResearchEvidenceRef:
+    """把 R24 的 typed projection 映射成 :class:`ResearchEvidenceRef`。
 
     **唯一的 evidence 签发入口。** 要求 ``reading`` 是真正的
-    ``market_data_contract.MarketDataReading``（而不是任何带 ``projection()`` 的
-    duck-typed 对象），并从它逐字复制核验维度：于是 ``single_source`` /
-    ``not_attempted`` 在这里**不可能**变成 ``verified``，AI 代码里也不存在自由形式的
-    核验字符串。
+    ``market_data_contract.MarketDataReading``（不是任何带 ``projection()`` 的
+    duck-typed 对象），并从它派生全部身份与核验维度：
 
-    ``as_of`` 只取自 owner 投影（本函数不接受调用方覆盖），因此一条事实的业务日无法
-    被调用方改写 —— PIT 证明链完整。
+    * ``source_id`` / ``as_of`` 由 :func:`_market_evidence_identity` 从投影派生，
+      **调用方不提供** —— 因此无法把一份事实改名成多条，也无法覆盖业务日；
+    * ``verification`` / ``verification_method`` 逐字复制，``single_source`` /
+      ``not_attempted`` 在这里**不可能**变成 ``verified``。
 
-    ``source_id`` 是"是哪一条事实"的标识（例如 policy 名）。它只是一个**标识**，
-    不是 authority 声明：核验结论来自 owner，不来自这个字符串。
-
-    缺少可证明的业务日时拒绝（R24 ``unavailable`` 的 reading 没有 snapshot，
-    因此没有可证明的 as_of）—— 缺失就是缺失，研究层不得自己补一个。
+    刻意**没有** ``source_id`` 参数：一个由调用方命名的 identity 不是 identity，
+    而是一个可以被用来绕过去重与冲突检测的自由字符串。
     """
     if not isinstance(reading, MDC.MarketDataReading):
         raise TypeError(
-            "evidence must be issued from a typed owner projection: "
+            "evidence must be mapped from a typed R24 projection: "
             f"expected market_data_contract.MarketDataReading, got {type(reading).__name__}"
         )
 
     projection = reading.projection()
+    source_id, as_of = _market_evidence_identity(projection)
     return _issue_evidence_ref(
         source_type=EVIDENCE_SOURCE_MARKET_DATA,
         source_id=source_id,
-        as_of=projection.get("as_of") or projection.get("observed_at"),
+        as_of=as_of or projection.get("observed_at"),
         verification=projection.get("verification") or MDC.VERIFICATION_NOT_ATTEMPTED,
         verification_method=(
             projection.get("verification_method") or MDC.VERIFICATION_METHOD_NONE
@@ -526,7 +574,7 @@ class InformationEvent:
 
 @dataclass(frozen=True)
 class HypothesisEvidence:
-    """把一条 owner-issued 事实与一个**显式声明**的 relation 绑在一起。
+    """把一条类型化事实与一个**显式声明**的 relation 绑在一起。
 
     relation 由 research reasoning 给出，**不是**从 ``verification`` 推出来的。
     这正是 P1 的修正：事实可信 ≠ 事实支持 thesis。
@@ -610,6 +658,10 @@ def _derive_status(
     支持；只有"通过核验 + relation=contradicts"才算反驳。provider disagreement /
     unavailable 说明**这条 evidence 本身不可靠**，因此既不支持也不反驳 —— 它只让证据
     数量不足以判断。
+
+    reason 必须与事实层的核验结论**一致**：一条 verified 的事实若只是
+    ``relation=context``，原因只能是"没有 supporting evidence"，绝不能报成
+    ``evidence_not_verified`` —— 那会把刚刚拆开的两个维度又混回去。
     """
     if not evidence:
         return HYPOTHESIS_INSUFFICIENT_EVIDENCE, RESEARCH_REASON_NO_EVIDENCE
@@ -624,14 +676,19 @@ def _derive_status(
     if verified_supports:
         return HYPOTHESIS_SUPPORTED, None
 
-    # 没有可信的 supports / contradicts。若证据里存在 owner 自己都没核验成功的事实
-    # （disagreement / unavailable），那个障碍比"只有单源"更根本，如实区分原因。
+    # 没有可信的 supports / contradicts。依次区分三种不同的"不足以判断"：
+    # 1. owner 自己都没核验成功（disagreement / unavailable）—— 障碍最根本；
+    # 2. 有 supports 关系，但那条事实未通过核验（单源 / 从未核验）；
+    # 3. 事实可信，却没有一条与 thesis 相关（例如只有 context）。
+    # 三者都不足以判断，但给用户的原因必须准确且互不相同。
     if any(
         e.ref.verification in (MDC.VERIFICATION_UNAVAILABLE, MDC.VERIFICATION_DISAGREEMENT)
         for e in evidence
     ):
         return HYPOTHESIS_INSUFFICIENT_EVIDENCE, RESEARCH_REASON_EVIDENCE_UNAVAILABLE
-    return HYPOTHESIS_INSUFFICIENT_EVIDENCE, RESEARCH_REASON_EVIDENCE_NOT_VERIFIED
+    if any(e.relation == RELATION_SUPPORTS for e in evidence):
+        return HYPOTHESIS_INSUFFICIENT_EVIDENCE, RESEARCH_REASON_EVIDENCE_NOT_VERIFIED
+    return HYPOTHESIS_INSUFFICIENT_EVIDENCE, RESEARCH_REASON_NO_SUPPORTING_EVIDENCE
 
 
 # ---------------------------------------------------------------------------
