@@ -41,13 +41,23 @@ AI 只消费事实，永不成为 authority：:attr:`ResearchHypothesis.is_autho
 import ``market_data_contract``（R24 纯契约）与标准库，不 import DB / 网络 / 时钟 /
 LLM SDK。authority 不得反向 import 本模块。
 
-evidence 走**类型化 owner evidence** 边界：唯一公开构造入口是
-:func:`evidence_ref_from_market_reading`，它要求一个 typed R24 projection
-(``market_data_contract.MarketDataReading``)，并从投影**派生** identity、业务日与核验
-维度；裸构造 ``ResearchEvidenceRef(...)`` 抛 ``TypeError``。核验维度本身是
-**owner-neutral** 的 (:class:`OwnerVerification`)：owner 自己发布结论，research core
-不解释任何 owner 的状态字符串。保证与**已知限制**（两层伪造路径、以及为什么需要 R24
-签发 token）集中在 :class:`ResearchEvidenceRef` 的 docstring 里，此处不重复。
+evidence 走**类型化 owner evidence** 边界：每个已批准的 owner 有**一个**公开构造入口，
+它要求该 owner 的 typed projection，并从投影**派生** identity、业务日与核验维度；
+裸构造 ``ResearchEvidenceRef(...)`` 抛 ``TypeError``。当前批准的 owner adapter 由
+:data:`SUPPORTED_OWNER_ADAPTERS` 登记：
+
+```text
+market_data   evidence_ref_from_market_reading      （本模块；typed R24 reading）
+execution     evidence_ref_from_execution_projection（ai_research_execution_adapter）
+```
+
+**factory 不必都住在本文件里。** execution 的 factory 住在
+``ai_research_execution_adapter``，因为它是唯一需要同时认识 execution owner 词表与
+research 契约的接缝；本契约继续**不** import 任何 execution 模块（依赖方向单向）。
+核验维度本身是 **owner-neutral** 的 (:class:`OwnerVerification`)：owner 自己发布结论，
+research core 不解释任何 owner 的状态字符串。保证与**已知限制**（两层伪造路径、以及
+为什么需要 owner 签发 token）集中在 :class:`ResearchEvidenceRef` 的 docstring 里，
+此处不重复。
 
 ──────────────── 能力边界 ────────────────
 
@@ -118,7 +128,17 @@ EVIDENCE_SOURCE_TYPES = (
 
 #: 当前**真的**接好 typed projection 的 owner。其余是已声明的未来来源，
 #: 没有公开 factory 可以签发 —— 少支持一个 source 好过允许伪造一个 authority。
-SUPPORTED_OWNER_ADAPTERS = frozenset({EVIDENCE_SOURCE_MARKET_DATA})
+#:
+#: R27-B2C-3 起 ``execution`` 也在其中。这张表表示的是"研究层已经存在**批准的
+#: owner adapter**"，**不是**"所有 public factory 都定义在本文件里"：execution 的
+#: factory 住在 ``ai_research_execution_adapter``（它必须同时认识 execution 与
+#: research 两套词表，而本契约刻意不 import 任何 execution 模块）。
+#: 本契约不需要、也不得 import 那个 adapter —— registry 是声明式的，一致性由
+#: ``test_ai_research_evidence_ownership_guard`` 双向强制。
+SUPPORTED_OWNER_ADAPTERS = frozenset({
+    EVIDENCE_SOURCE_MARKET_DATA,
+    EVIDENCE_SOURCE_EXECUTION,
+})
 
 # ---------------------------------------------------------------------------
 # information event kind —— 与 source_type 一一对应
@@ -579,9 +599,11 @@ class ResearchEvidenceRef:
     只消费它，**不解释**任何 owner 的状态字符串。
 
     **没有公开 raw 构造器。** ``ResearchEvidenceRef(...)`` 一律抛 ``TypeError``；
-    唯一的签发路径是 :func:`evidence_ref_from_market_reading`。identity 由 reading
-    派生（调用方不提供），核验维度由**该 owner 的 factory** 归口 —— 因此"传字符串把
-    自己声明成 R24 verified market fact"不可表达。
+    唯一的签发路径是**该 owner 自己的 factory**（market 的每一份是
+    :func:`evidence_ref_from_market_reading`，execution 的每一份是
+    ``ai_research_execution_adapter.evidence_ref_from_execution_projection``）。identity
+    由 owner 投影派生（调用方不提供），核验维度由**该 owner 的 factory** 归口 —— 因此
+    "传字符串把自己声明成 owner 已核验事实"不可表达。
 
     **保证与已知限制**（不要把这个边界读成 provenance 证明）。R24 的
     ``MarketDataReading`` / ``MarketDataSnapshot`` 是**公开 dataclass**，因此
@@ -589,7 +611,9 @@ class ResearchEvidenceRef:
         手工造 MarketDataSnapshot(verified, cross_source) → 手工造 MarketDataReading
             → evidence_ref_from_market_reading(...) → 得到一条 verified 的 ref
 
-    在本层是**可以通过**的：伪造只是从一步变成两步。本层真正保证的是：
+    在本层是**可以通过**的：伪造只是从一步变成两步。execution 亦然
+    （``ExecutionEvidence`` 公开可构造 → ``fact_projection`` → execution factory）。
+    本层真正保证的是：
 
     * 调用方**不能提供 identity** —— ``source_id`` 由 reading 派生
       （``policy | kind | subject @ observed_at``），所以同一份事实无法被改名成
@@ -620,9 +644,11 @@ class ResearchEvidenceRef:
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         raise TypeError(
             "ResearchEvidenceRef has no public constructor: 调用方不能仅凭传 "
-            "source_type / source_id / verification 字符串声明一条 R24 事实。"
-            "请使用 evidence_ref_from_market_reading(reading)：identity 与核验维度"
-            "都由 R24 投影派生，调用方不参与"
+            "source_type / source_id / verification 字符串声明一条事实。"
+            "请使用该 owner 已批准的 factory（market_data: "
+            "evidence_ref_from_market_reading；execution: "
+            "ai_research_execution_adapter.evidence_ref_from_execution_projection）："
+            "identity 与核验维度都由 owner 投影派生，调用方不参与"
         )
 
     def __post_init__(self) -> None:
@@ -836,7 +862,15 @@ def _issue_evidence_ref(
     *, source_type: str, source_id: Any, as_of: Any,
     owner_verification: OwnerVerification, detail: Mapping[str, Any],
 ) -> ResearchEvidenceRef:
-    """签发一个 ref。只有本模块的 owner factory 调用它。
+    """签发一个 ref。只有**已批准的 owner factory** 调用它。
+
+    调用者集合是**精确 allowlist**（由 ``test_ai_research_evidence_ownership_guard``
+    结构扫描强制，module + enclosing function，不做控制流分析）：
+
+    ```text
+    ai_research_contract.evidence_ref_from_market_reading
+    ai_research_execution_adapter.evidence_ref_from_execution_projection
+    ```
 
     绕过 ``__init__``（它恒抛错）并在设置完全部字段后跑 ``__post_init__``，
     使校验逻辑仍然只有一份、且紧挨字段定义。

@@ -123,9 +123,14 @@ AUTHORITY_MODULES = (
 #: ``InformationEvent``（从 R24 reading 派生）。这正是"迁移"与"静默扩散"的区别：
 #: 它从 legacy 消费者变成了 typed 消费者，并且必须在这里留下一条可审计的记录。
 #:
-#: 四个都**不是** authority：provider 是 typed research producer，repository 是 typed
-#: research persistence consumer，``deepseek_advisor`` 是 runtime caller。authority 仍然
-#: 不得反向 import 其中任何一个。
+#: R27-B2C-3 新增**第四个**：``ai_research_execution_adapter`` —— execution 事实的
+#: owner adapter。它必须 import 契约才能调用私有签发口，因此这次登记是"新增一个 owner
+#: 需要一条批准过的接缝"的显式记录，而不是静默扩散。
+#:
+#: 五个都**不是** authority：provider 是 typed research producer，repository 是 typed
+#: research persistence consumer，``deepseek_advisor`` 是 runtime caller，
+#: ``ai_research_execution_adapter`` 是 owner 侧接缝。authority 仍然不得反向 import
+#: 其中任何一个。
 #:
 #: 注意 ``ai_research_service`` **不**在这个集合里：orchestration boundary 只依赖
 #: provider 与 repository，刻意不 import 契约 —— 多一个消费者就多一份"两套规则必然
@@ -134,6 +139,7 @@ ALLOWED_AI_CONSUMERS: set[str] = {
     "ai_research_provider.py",
     "ai_research_repository.py",
     "deepseek_advisor.py",
+    "ai_research_execution_adapter.py",
 }
 
 #: 时钟 / 随机数 / IO —— 研究契约一旦读它们，就能拿 current state 回填历史。
@@ -1240,23 +1246,37 @@ class OwnerNativeVerificationTests(unittest.TestCase):
             )
 
     def test_RVERIFY_10_private_issuer_and_factory_registry_boundary_unchanged(self):
-        """RVERIFY-10：私有签发口边界与 factory registry 保持不变。
+        """RVERIFY-10：私有签发口边界与 factory registry 的形状（B2C-3 更新）。
 
-        B2C-2 只让**核心数据结构**从 market-shaped 变成 owner-neutral，**没有**提前
-        登记 execution adapter（那是 B2C-3）：公开 evidence factory 仍然只有
-        ``market_data`` 一个，``SUPPORTED_OWNER_ADAPTERS`` 不得扩张。
+        B2C-3 登记了第二个 owner（``execution``），因此 ``SUPPORTED_OWNER_ADAPTERS`` 从
+        ``{market_data}`` 变成 ``{market_data, execution}``。这**不代表** factory 都搬进了
+        契约：execution 的 factory 住在 ``ai_research_execution_adapter``，所以契约模块
+        自己导出的 factory 仍然**只有** market 一份，而契约仍然不 import execution。
+
+        签发口本身依旧只有本契约内部的一处调用（caller-set 的精确 allowlist 由
+        ``test_ai_research_evidence_ownership_guard`` 强制）。
         """
         exported = frozenset(
             name for name in ARC.__all__ if name.startswith("evidence_ref_from_")
         )
         self.assertEqual(
             frozenset({"evidence_ref_from_market_reading"}), exported,
-            "B2C-2 不得新增公开 owner factory（execution adapter 属于 B2C-3）",
+            "契约模块导出的 factory 集合发生变化（execution 的那一份应住在 adapter 模块）",
         )
-        self.assertEqual(frozenset({ARC.EVIDENCE_SOURCE_MARKET_DATA}),
-                         ARC.SUPPORTED_OWNER_ADAPTERS)
+        self.assertEqual(
+            frozenset({ARC.EVIDENCE_SOURCE_MARKET_DATA, ARC.EVIDENCE_SOURCE_EXECUTION}),
+            ARC.SUPPORTED_OWNER_ADAPTERS,
+            "已批准的 owner adapter registry 与 B2C-3 的范围不一致",
+        )
         self.assertFalse(hasattr(ARC, "_OWNER_ISSUED"),
                          "不得存在可 import 的构造哨兵（那是伪安全）")
+
+        # 契约**自己**不 import 任何 execution 模块 —— 依赖方向单向。
+        self.assertEqual(
+            set(), _imported_roots(_tree(CONTRACT_MODULE))
+            & {"execution_verification", "execution_evidence", "ai_research_execution_adapter"},
+            "research contract 不得 import execution 或 adapter",
+        )
 
         # 契约模块里签发口只被 owner factory 调用（**唯一**一处）。
         tree = _tree(CONTRACT_MODULE)
@@ -1575,6 +1595,7 @@ class AiResearchArchitectureGuardTests(unittest.TestCase):
                 if imported.split(".")[0] in (
                     "ai_research_contract", "ai_research_provider", "ai_provider_transport",
                     "ai_research_repository", "ai_research_service",
+                    "ai_research_execution_adapter",
                 ):
                     offenders.append(f"{name}: import {imported}")
         self.assertEqual(
