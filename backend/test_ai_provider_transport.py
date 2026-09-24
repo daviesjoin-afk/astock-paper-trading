@@ -17,6 +17,7 @@ CI 绝不产生 API 费用，也不访问任何真实 endpoint。
 from __future__ import annotations
 
 import ast
+import http.client
 import json
 import os
 import sys
@@ -102,6 +103,22 @@ class _FakeResponse:
         return False
 
 
+class _ReadFailureResponse:
+    """连接**已经成功**、但 ``read()`` 阶段失败 —— 这正是 review 指出的逃逸口。"""
+
+    def __init__(self, exc):
+        self._exc = exc
+
+    def read(self):
+        raise self._exc
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
 class TransportTestBase(unittest.TestCase):
     """替换 urllib 传输；``network_calls`` 计数供"未发出请求"断言使用。"""
 
@@ -115,6 +132,15 @@ class TransportTestBase(unittest.TestCase):
             if isinstance(payload, Exception):
                 raise payload
             return _FakeResponse(payload)
+
+        return mock.patch.object(T.urllib.request, "urlopen", side_effect=fake_urlopen)
+
+    def patch_read_failure(self, exc):
+        """``urlopen`` 返回一个连接，但 ``read()`` 抛 ``exc``。"""
+        def fake_urlopen(request, timeout=None):
+            self.network_calls += 1
+            self.last_request = request
+            return _ReadFailureResponse(exc)
 
         return mock.patch.object(T.urllib.request, "urlopen", side_effect=fake_urlopen)
 
@@ -253,6 +279,57 @@ class ProviderTransportTests(TransportTestBase):
                 T.call_json(CONFIG, "s", "u")
         self.assertEqual(T.REASON_HTTP_ERROR, ctx.exception.reason)
         self.assertEqual(503, ctx.exception.status)
+
+    def test_PROVIDER_08c_read_phase_network_failures_are_normalized(self):
+        """PROVIDER-08c：连接成功但 ``read()`` 失败时，必须归一化成稳定 reason。
+
+        ``urlopen`` 只把**一部分**失败包成 ``URLError``。连接建立之后，
+        ``response.read()`` 在读超时 / 连接被重置 / 响应被截断时抛的是
+        ``TimeoutError`` / ``ConnectionResetError`` / ``http.client.IncompleteRead``，
+        它们都不是 ``URLError``。只捕获 ``URLError`` 会让这些失败以原始异常逃逸，
+        调用方既拿不到 ``reason``，也无法按 machine reason 分类处理。
+
+        这些失败同样不得携带 body / headers / 凭据。
+        """
+        secret = "sk-super-secret-value-1234567890"
+        cases = (
+            TimeoutError("timed out"),
+            ConnectionResetError("connection reset by peer"),
+            ConnectionAbortedError("software caused connection abort"),
+            http.client.IncompleteRead(b"partial", 500),
+            http.client.RemoteDisconnected("remote end closed connection"),
+            http.client.BadStatusLine("garbage"),
+            OSError("low level socket failure"),
+        )
+        for exc in cases:
+            with self.subTest(exc=type(exc).__name__):
+                with self.patch_read_failure(exc):
+                    with self.assertRaises(T.ProviderTransportError) as ctx:
+                        T.call_json(dict(CONFIG, api_key=secret), "SYS-PROMPT", "USER-PROMPT")
+                self.assertEqual(T.REASON_NETWORK_ERROR, ctx.exception.reason)
+                self.assertIsNone(ctx.exception.status)
+                blob = "%s|%s|%s" % (ctx.exception, ctx.exception.reason, repr(ctx.exception))
+                for leaked in (secret, "Bearer", "SYS-PROMPT", "USER-PROMPT", "Authorization"):
+                    self.assertNotIn(leaked, blob, f"异常泄漏了 {leaked}")
+
+    def test_PROVIDER_08d_http_error_is_not_downgraded_to_a_network_error(self):
+        """PROVIDER-08d：``HTTPError`` 必须优先于 umbrella 网络失败被识别。
+
+        ``HTTPError`` 是 ``URLError``（进而 ``OSError``）的子类。若异常子句顺序颠倒，
+        "服务端用 429/503 明确拒绝"会被降级成一个笼统的 ``network_error``，
+        丢掉唯一的 status code —— 调用方再也分不清"限流"和"网线断了"。
+        """
+        import urllib.error
+
+        for status in (401, 429, 503):
+            with self.subTest(status=status):
+                with self.patch_urlopen(urllib.error.HTTPError(
+                        "https://provider.example.com/v1/chat/completions",
+                        status, "rejected", {}, None)):
+                    with self.assertRaises(T.ProviderTransportError) as ctx:
+                        T.call_json(CONFIG, "s", "u")
+                self.assertEqual(T.REASON_HTTP_ERROR, ctx.exception.reason)
+                self.assertEqual(status, ctx.exception.status)
 
     def test_PROVIDER_09_transport_has_no_database_or_environment_access(self):
         """PROVIDER-09：transport 不自读配置来源（无 sqlite3 / getenv / environ）。"""
@@ -866,6 +943,41 @@ class ResearchProviderTests(ResearchTestBase):
                 self.assertIn(token, system)
         # 但真正的边界是 parser，不是 prompt 长度
         self.assertLess(len(system), 4000)
+
+    def test_RPROV_23_non_json_payload_fails_before_any_network_call(self):
+        """RPROV-23：契约放不下的 payload 在**付费之前**就被拒绝。
+
+        R27-A 的 payload 是"投给 JSON provider 的 JSON-like 内容"。bytes 与
+        非 str key 会合 ``json.dumps`` 抛裸 ``TypeError``，因此在契约边界 fail closed。
+        这里锁住的是**时序**：拒绝发生在任何网络调用之前，而不是先花钱发一次请求、
+        再在序列化 prompt 时才发现。
+
+        护栏走真实路径：typed event 仍然由 R24 reading 派生，只是 payload 放不下。
+        """
+        for bad in ({"blob": b"\x00\x01"}, {b"blob": 1}, {"deep": [b"x"]}):
+            with self.subTest(payload=repr(bad)[:40]):
+                with self.patch_urlopen(_reply({"thesis": "t", "confidence": 0.5})):
+                    with self.assertRaises(TypeError):
+                        _event(payload=bad)
+                    self.assertEqual(0, self.network_calls, "拒绝发生在网络调用之前")
+
+    def test_RPROV_24_contract_accepted_payload_is_always_serialisable(self):
+        """RPROV-24：契约接受的 payload 经 ``_jsonable`` 后必能被 ``json.dumps`` 处理。
+
+        这是 RPROV-23 的**非空性**对照：把 freezer 收紧成一律拒绝也能让上述断言变绿，
+        所以必须同时证明"接受的确实可用"—— provider 组装 prompt 的序列化路径不会对
+        任何契约认可的 payload 逃逸裸 ``TypeError``。
+        """
+        payloads = (
+            {"price": 10.5, "flag": True, "note": None},
+            {"tags": {"a", "b"}, "items": (1, 2)},
+            {"nested": {"deep": [{"x": 1}, [2, {"y": "z"}]]}},
+        )
+        for payload in payloads:
+            with self.subTest(payload=repr(payload)[:40]):
+                event = _event(payload=payload)
+                json.dumps(_jsonable(event.payload), ensure_ascii=False)
+                json.dumps(P._evidence_projection(event), ensure_ascii=False)
 
 
 # ─────────────────────────────────────────────────────────────────────────────

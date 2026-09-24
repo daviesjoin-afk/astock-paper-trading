@@ -1,10 +1,13 @@
 # -*- coding: utf-8 -*-
-"""R27-A mutation matrix —— M-AI1..M-AI8。
+"""R27-A mutation matrix —— M-AI1..M-AI8 与 M-AI9..M-AI10。
 
 只覆盖本轮**新的核心 invariant**。刻意不造几十条，也不扩成通用平台：每条
 mutation 都必须让**唯一指定的永久回归**变 RED，且 anchor 恰好命中一次；
 ``--non-vacuity`` 先跑 baseline，``SyntaxError`` / ``ImportError`` / ``NameError``
 一律计为 FAKE（改红了不等于证明了业务性质）。
+
+M-AI9 / M-AI10 针对 review 报告的两个 JSON-like 边界缺陷（bytes 值 / 非 str key）：
+两者都会让 ``json.dumps`` 抛裸 ``TypeError``，因此契约必须在构造期就 fail closed。
 
 沿用 R23/R24/R25 已修好的 ``PYTHONPYCACHEPREFIX`` 逐次唯一目录，否则 baseline
 与 mutant 会共享字节码缓存，整张矩阵静默失效。
@@ -14,7 +17,7 @@ byte-identical 还原并校验 sha256。
 
 用法：
     python work/r27_ai_mutation_check.py
-    python work/r27_ai_mutation_check.py --only M-AI1,M-AI4 --non-vacuity
+    python work/r27_ai_mutation_check.py --only M-AI1,M-AI9 --non-vacuity
 """
 from __future__ import annotations
 
@@ -128,9 +131,15 @@ MUTATIONS = [
         "file": CONTRACT,
         "old": (
             "    if isinstance(value, Mapping):\n"
-            "        return MappingProxyType(\n"
-            "            {key: _deep_freeze(item, what=what) for key, item in value.items()}\n"
-            "        )\n"
+            "        frozen = {}\n"
+            "        for key, item in value.items():\n"
+            "            if not isinstance(key, str):\n"
+            "                raise TypeError(\n"
+            '                    f"{what} mapping keys must be str; got {type(key).__name__} — "\n'
+            '                    f"合法标量：{_SCALAR_NAMES}；研究内容必须能稳定 JSON 序列化"\n'
+            "                )\n"
+            "            frozen[key] = _deep_freeze(item, what=what)\n"
+            "        return MappingProxyType(frozen)\n"
         ),
         "new": (
             "    if isinstance(value, Mapping):\n"
@@ -173,6 +182,42 @@ MUTATIONS = [
             "test_AI_TYPED_08_same_identity_with_changed_content_is_a_conflict"
         ),
         "desc": "内容指纹退出冲突判定（内容变化被静默去重）",
+    },
+    {
+        "id": "M-AI9",
+        # 把 bytes 重新放回允许的标量：契约号称 payload 是 JSON-like，却放行一个
+        # ``json.dumps`` 从不接受的类型。于是**合法构造**的 typed event 会一路走到
+        # 下游序列化才抛裸 ``TypeError: Object of type bytes is not JSON serializable``
+        # —— 失败点不在契约层、没有 machine reason，也不保证发生在网络调用之前。
+        "file": CONTRACT,
+        "old": "_SCALARS = (str, bool, int, float)\n",
+        "new": "_SCALARS = (str, bytes, bool, int, float)\n",
+        "test": _arc(
+            "AiResearchImmutabilityTests."
+            "test_AI18b_bytes_fails_closed_at_the_contract_boundary"
+        ),
+        "desc": "bytes 重新被契约放行（下游 json.dumps 抛裸 TypeError）",
+    },
+    {
+        "id": "M-AI10",
+        # 只校验 value 而不校验 mapping key：``{b"k": 1}`` 的 value 完全合法，
+        # 却会让 ``json.dumps`` 抛
+        # ``TypeError: keys must be str, int, float, bool or None, not bytes``。
+        # 这是 M-AI9 同一族缺陷的后门 —— 契约的"JSON-like"声称只对 value 成立。
+        "file": CONTRACT,
+        "old": (
+            "            if not isinstance(key, str):\n"
+            "                raise TypeError(\n"
+            '                    f"{what} mapping keys must be str; got {type(key).__name__} — "\n'
+            '                    f"合法标量：{_SCALAR_NAMES}；研究内容必须能稳定 JSON 序列化"\n'
+            "                )\n"
+        ),
+        "new": "",
+        "test": _arc(
+            "AiResearchImmutabilityTests."
+            "test_AI18c_non_string_mapping_keys_are_rejected"
+        ),
+        "desc": "非 str mapping key 被放行（bytes key 逃逸到 json.dumps）",
     },
 ]
 

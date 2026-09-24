@@ -22,12 +22,17 @@ HTTP 失败、外层响应不可解析、``choices`` 缺失、``content`` 不是
 ``content`` 不是合法 JSON、解析结果不是 JSON **object** —— 全部拒绝。
 ``[]`` / ``"abc"`` / ``123`` / ``null`` 都不是成功的响应。
 
+网络失败**在两个阶段都**被归一化：``urlopen`` 阶段与 ``response.read()`` 阶段
+（读超时 / 连接重置 / 响应截断）同样收敛为 ``network_error``，不留下裸异常逃逸口。
+HTTP 失败仍然单独保留 status code（见 :data:`_NETWORK_FAILURES`）。
+
 **Secret 安全**：API Key 不出现在异常文案、``repr``、日志或返回值里。HTTP 错误
 只保留 status code 与稳定 reason，绝不把 request headers / ``Authorization`` /
 prompt / response body 拼进异常。
 """
 from __future__ import annotations
 
+import http.client
 import json
 import time
 import urllib.error
@@ -79,6 +84,25 @@ REASON_RESPONSE_NOT_OBJECT = "response_not_object"
 REASON_CHOICES_MISSING = "choices_missing"
 REASON_CONTENT_NOT_STRING = "content_not_string"
 REASON_CONTENT_NOT_OBJECT = "content_not_object"
+
+#: 传输期间**除 HTTPError 之外**的全部网络失败（``HTTPError`` 单独处理以保留 status）。
+#:
+#: ``urlopen`` 只把**一部分**失败包成 ``URLError``：连接成功之后，
+#: ``response.read()`` 在读超时 / 连接被重置 / 响应被截断时抛的是 ``TimeoutError`` /
+#: ``ConnectionResetError`` / ``http.client.IncompleteRead`` —— 它们都不是
+#: ``URLError``。只捕获 ``URLError`` 会让这些失败以原始异常逃逸，调用方既拿不到
+#: :attr:`ProviderTransportError.reason` 这个稳定 machine reason，也无法按类型分类。
+#:
+#: 刻意用 umbrella 类型而不是逐类列举：``OSError`` 覆盖 socket / DNS / TLS 的整族失败
+#: （``URLError`` / ``TimeoutError`` / ``ConnectionError`` 各子类 / ``ssl.SSLError`` /
+#: ``socket.gaierror``），``http.client.HTTPException`` 覆盖响应流异常
+#: （``IncompleteRead`` / ``RemoteDisconnected`` / ``BadStatusLine``）。逐类列举则在
+#: 每次 CPython 新增/细化异常时都会留下新的逃逸口。
+#:
+#: 刻意**不**写 ``except Exception``：本 try 块只做一次网络往返，归一化的对象是网络
+#: 失败本身；代码缺陷（``TypeError`` / ``MemoryError`` / …）必须继续以原始形态暴露，
+#: 不能被伪装成"网络问题"。
+_NETWORK_FAILURES = (OSError, http.client.HTTPException)
 
 
 class ProviderTransportError(RuntimeError, ValueError):
@@ -263,8 +287,11 @@ def call_json(provider_config, system_prompt, user_prompt, max_tokens=1800):
             raw = response.read()
     except urllib.error.HTTPError as exc:
         # 只保留 status code：response body 可能回显 prompt，headers 可能带凭据。
+        # 必须排在 umbrella 之前：HTTPError 是 URLError（因而也是 OSError）的子类，
+        # 顺序颠倒会把"服务端明确拒绝"降级成一个笼统的 network_error。
         raise ProviderTransportError(REASON_HTTP_ERROR, status=exc.code) from None
-    except urllib.error.URLError:
+    except _NETWORK_FAILURES:
+        # 覆盖 urlopen 阶段逃逸的失败与 response.read() 阶段的失败。
         raise ProviderTransportError(REASON_NETWORK_ERROR) from None
     latency_ms = round((time.monotonic() - started) * 1000)
 

@@ -218,31 +218,52 @@ class UnsupportedResearch(ValueError):
 # ---------------------------------------------------------------------------
 
 #: 允许原样保留的 JSON-like 标量。
-_SCALARS = (str, bytes, bool, int, float)
+#:
+#: 刻意**不含** ``bytes``：``payload`` / ``detail`` 是"投给 JSON provider 的 JSON-like
+#: 内容"这一契约的字面含义，而 ``json.dumps`` 从不接受 bytes。在**契约边界**拒绝，
+#: 才能让"bytes 进不了研究链路"成为一个构造期就成立的保证；否则一个**合法构造**的
+#: typed event 会在下游 ``json.dumps`` 时抛裸 ``TypeError: Object of type bytes is not
+#: JSON serializable`` —— 那是没有契约的失败，既不在本层，也不带 machine reason。
+_SCALARS = (str, bool, int, float)
+
+#: 冻结失败文案里逐字列出的合法标量 —— 错误信息本身也是一份对外契约。
+_SCALAR_NAMES = "str / bool / int / float / None"
 
 
 def _deep_freeze(value: Any, *, what: str) -> Any:
-    """递归冻结容器；遇到无法冻结的对象**拒绝**（fail closed）。
+    """递归冻结容器；遇到非 JSON-like 值**拒绝**（fail closed）。
 
     只做浅拷贝会让 ``ref.detail["nested"]["items"].append(...)`` 或调用方自己保留的
     原始 dict 继续改写"已冻结"的研究内容 —— 那会直接破坏本契约承诺的可审计性。
 
     刻意只支持 JSON-like 值：遇到自定义 mutable object 就拒绝，而不是保留一个以后
     可能被改写的引用，也不写通用 object freezer 框架。
+
+    **mapping key 也必须在冻结时是 ``str``。** 只校验 value 会留下同一族缺陷的后门：
+    ``{b"k": 1}`` 的 value 完全合法，却会在下游 ``json.dumps`` 抛裸
+    ``TypeError: keys must be str, int, float, bool or None, not bytes``。
+    契约一旦声称"payload 是 JSON-like 内容"，这个声称就必须在构造期完整成立。
     """
     if value is None or isinstance(value, _SCALARS):
         return value
     if isinstance(value, Mapping):
-        return MappingProxyType(
-            {key: _deep_freeze(item, what=what) for key, item in value.items()}
-        )
+        frozen = {}
+        for key, item in value.items():
+            if not isinstance(key, str):
+                raise TypeError(
+                    f"{what} mapping keys must be str; got {type(key).__name__} — "
+                    f"合法标量：{_SCALAR_NAMES}；研究内容必须能稳定 JSON 序列化"
+                )
+            frozen[key] = _deep_freeze(item, what=what)
+        return MappingProxyType(frozen)
     if isinstance(value, (list, tuple)):
         return tuple(_deep_freeze(item, what=what) for item in value)
     if isinstance(value, (set, frozenset)):
         return frozenset(_deep_freeze(item, what=what) for item in value)
     raise TypeError(
-        f"{what} must contain only JSON-like values (mapping / sequence / set / scalar); "
-        f"got {type(value).__name__} — 研究事实不接受任意可变对象"
+        f"{what} must contain only JSON-like values (mapping with str keys / sequence / "
+        f"set / scalar: {_SCALAR_NAMES}); got {type(value).__name__} — "
+        "研究事实不接受任意对象，也不接受 bytes 这类无法 JSON 序列化的标量"
     )
 
 

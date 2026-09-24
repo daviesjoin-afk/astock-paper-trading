@@ -1,10 +1,16 @@
 # -*- coding: utf-8 -*-
-"""R27-B1 mutation matrix —— M-B1-1 .. M-B1-8。
+"""R27-B1 mutation matrix —— M-B1-1 .. M-B1-8 与 M-B1-9..M-B1-13。
 
 只覆盖本轮**新的核心 invariant**，刻意不造几十条，也不扩成通用平台：每条 mutation
 都必须让**唯一指定的永久回归**变 RED，且 anchor 恰好命中一次；``--non-vacuity``
 先跑 baseline，``SyntaxError`` / ``ImportError`` / ``NameError`` 一律计为 FAKE
 （改红了不等于证明了业务性质）。
+
+M-B1-12 / M-B1-13 针对 review 报告的网络失败归一化缺口：``urlopen`` 只把一部分失败
+包成 ``URLError``，``response.read()`` 阶段的 ``TimeoutError`` / ``ConnectionResetError``
+/ ``http.client.IncompleteRead`` 会裸奔；而修好之后又引入了一个**新的**顺序风险 ——
+``HTTPError`` 是 ``OSError`` 的子类，子句顺序颠倒会把 401/429/503 降级成
+``network_error`` 并丢掉 status code。两者都必须被永久钉住。
 
 沿用 R27-A 已修好的 ``PYTHONPYCACHEPREFIX`` 逐次唯一目录，否则 baseline 与 mutant
 会共享字节码缓存，整张矩阵静默失效。
@@ -14,7 +20,7 @@ byte-identical 还原并校验 sha256。
 
 用法：
     python work/r27b1_ai_provider_mutation_check.py
-    python work/r27b1_ai_provider_mutation_check.py --only M-B1-1,M-B1-4 --non-vacuity
+    python work/r27b1_ai_provider_mutation_check.py --only M-B1-1,M-B1-12 --non-vacuity
 """
 from __future__ import annotations
 
@@ -285,6 +291,51 @@ MUTATIONS = [
             "test_RPROV_19_input_must_be_typed_events_not_dicts_or_strings"
         ),
         "desc": "dict / raw string 可以冒充 typed evidence 进入研究链路",
+    },
+    {
+        "id": "M-B1-12",
+        # 网络归一化退回只捕获 ``URLError``：连接成功之后 ``response.read()`` 抛的
+        # ``TimeoutError`` / ``ConnectionResetError`` / ``http.client.IncompleteRead``
+        # 都不是 ``URLError``，于是以原始异常逃逸 ——
+        # 调用方既拿不到 ``reason`` 这个稳定 machine reason，也无法按类型分类处理。
+        "file": TRANSPORT,
+        "old": (
+            "    except _NETWORK_FAILURES:\n"
+            "        # 覆盖 urlopen 阶段逃逸的失败与 response.read() 阶段的失败。\n"
+            "        raise ProviderTransportError(REASON_NETWORK_ERROR) from None\n"
+        ),
+        "new": (
+            "    except urllib.error.URLError:\n"
+            "        raise ProviderTransportError(REASON_NETWORK_ERROR) from None\n"
+        ),
+        "test": f"{SUITE}.ProviderTransportTests.test_PROVIDER_08c_read_phase_network_failures_are_normalized",
+        "desc": "读阶段网络失败不再归一化（TimeoutError / reset / IncompleteRead 裸奔）",
+    },
+    {
+        "id": "M-B1-13",
+        # umbrella 网络失败子句排到 ``HTTPError`` **之前**：``HTTPError`` 是
+        # ``URLError``（进而 ``OSError``）的子类，顺序颠倒会把"服务端用 401/429/503
+        # 明确拒绝"降级成一个笼统的 network_error，丢掉唯一的 status code ——
+        # 调用方再也分不清"被限流"和"网线断了"。
+        "file": TRANSPORT,
+        "old": (
+            "    except urllib.error.HTTPError as exc:\n"
+            "        # 只保留 status code：response body 可能回显 prompt，headers 可能带凭据。\n"
+            "        # 必须排在 umbrella 之前：HTTPError 是 URLError（因而也是 OSError）的子类，\n"
+            "        # 顺序颠倒会把\"服务端明确拒绝\"降级成一个笼统的 network_error。\n"
+            "        raise ProviderTransportError(REASON_HTTP_ERROR, status=exc.code) from None\n"
+            "    except _NETWORK_FAILURES:\n"
+            "        # 覆盖 urlopen 阶段逃逸的失败与 response.read() 阶段的失败。\n"
+            "        raise ProviderTransportError(REASON_NETWORK_ERROR) from None\n"
+        ),
+        "new": (
+            "    except _NETWORK_FAILURES:\n"
+            "        raise ProviderTransportError(REASON_NETWORK_ERROR) from None\n"
+            "    except urllib.error.HTTPError as exc:\n"
+            "        raise ProviderTransportError(REASON_HTTP_ERROR, status=exc.code) from None\n"
+        ),
+        "test": f"{SUITE}.ProviderTransportTests.test_PROVIDER_08d_http_error_is_not_downgraded_to_a_network_error",
+        "desc": "HTTPError 被 umbrella 网络失败吞掉（429/503 丢掉 status code）",
     },
 ]
 
