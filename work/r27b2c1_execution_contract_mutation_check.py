@@ -1,18 +1,21 @@
 # -*- coding: utf-8 -*-
-"""R27-B2C-1 mutation matrix —— M-EXFACT-1 .. M-EXFACT-6。
+"""R27-B2C-1 mutation matrix —— M-EXFACT-1 .. M-EXFACT-11。
 
 只覆盖本轮**新的高风险 invariant**。每条 mutation 都必须让唯一指定的永久回归变 RED，
 anchor 恰好命中一次；``--non-vacuity`` 先跑 baseline，``SyntaxError`` / ``ImportError`` /
 ``NameError`` 一律计为 FAKE。
 
-本轮的核心不变量分三组：
+本轮的核心不变量分四组：
 
 * **owner 自己的词表与组合**（M-EXFACT-1 / 2 / 6）：接受未知状态、取消"状态×来源"的
   合法组合表、或把 market 的词塞进核验声明，都必须 RED —— 这三条正是"owner-native
   verification 不许退化"的可执行形式。
 * **PIT 不许编造**（M-EXFACT-3）：多个业务日时挑一个"代表值"，必须 RED。
+  （M-EXFACT-10 是它的姊妹：取消 PIT 值的格式校验。）
 * **契约确实委托既有判定**（M-EXFACT-4 / 5）：identity 退化成 order_id、或绕过
   ``verification_from_evidence`` 自己宣布 verified，都必须 RED。
+* **发布边界**（M-EXFACT-7 / 8 / 9 / 11）：接受 duck-typed 伪对象、不做 canonical
+  精确相等、缺 order id 时拼占位身份、或出现第二个私有签发调用点，都必须 RED。
 
 沿用 R27-B2B 的逐次唯一 ``PYTHONPYCACHEPREFIX``，否则 baseline 与 mutant 会共享字节码
 缓存，整张矩阵静默失效。**必须串行运行**：每条 mutation 就地改写 production source，
@@ -170,6 +173,22 @@ MUTATIONS = [
         "test": _case("InputBoundaryTests."
                       "test_EXFACT_18_day_and_instant_values_are_format_validated"),
         "desc": "取消 business_day / observed_at 的格式校验（banana 也能成为 known）",
+    },
+    {
+        "id": "M-EXFACT-11",
+        # 出现第二个私有签发调用点：绕开 fact_projection 的类型/identity/PIT 派生直接造投影。
+        "file": VERIFICATION,
+        "old": "def fact_projection(evidence: Any, *, fill_rows_present: bool = True) -> ExecutionFactProjection:\n",
+        "new": (
+            "def _second_production_issuer(**fields: Any) -> ExecutionFactProjection:  # MUTANT\n"
+            "    return _issue_fact_projection(**fields)\n"
+            "\n"
+            "\n"
+            "def fact_projection(evidence: Any, *, fill_rows_present: bool = True) -> ExecutionFactProjection:\n"
+        ),
+        "test": _case("PublicationBoundaryTests."
+                      "test_EXFACT_19_private_issuer_is_reachable_only_from_the_owner_factory"),
+        "desc": "出现第二个 production 私有签发调用点",
     },
 ]
 

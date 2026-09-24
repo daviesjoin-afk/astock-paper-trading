@@ -5,14 +5,19 @@
 
     **一条 execution 事实的身份、业务日与核验结论由 owner 发布，不由消费者拼。**
 
-分五组：
+分六组：
 
     EXFACT-01 ~ 03   filled fact 的投影完整；核验是 owner-native 词表，不是 market 词表
     EXFACT-04        没有 owner 记录的业务日时如实报 unknown（**不**用墙钟日期冒充）
     EXFACT-05 ~ 07   多成交身份、投影不可变且不含 research 语义、调用方无法自述
     EXFACT-08        非法词表 / 非法组合 / 版本不符 / 字段类型错一律 fail closed
-    EXFACT-09 ~ 11   identity 真的从读路径可达；信号唯一来源仍是 execution_verification；
-                     本契约按"新增独立投影"落地，没有改动 ExecutionEvidence 的字段集
+    EXFACT-09 ~ 11   identity 真的从读路径可达； verdict 唯一来源仍是
+                     ``verification_from_evidence``；本契约按"新增独立投影"落地，
+                     没有改动 ``ExecutionEvidence`` 的字段集
+    EXFACT-12 ~ 14   无公开 raw 构造器、嵌套核验声明不可变、部分流水证据不冒充整笔事实
+    EXFACT-15 ~ 18   入口只接受 typed evidence、核验声明精确相等、缺 order id fail closed、
+                     PIT 值格式可证明
+    EXFACT-19        私有签发口只能由 owner 工厂调用（可执行边界，不是命名约定）
 
 全部离线：只用 ``evidence_from_order`` 的纯函数路径，不连数据库。
 """
@@ -32,6 +37,77 @@ if BACKEND not in sys.path:
 import execution_evidence as EE  # noqa: E402
 import execution_verification as EV  # noqa: E402
 import paper_trading_rules as PTR  # noqa: E402
+
+#: 私有签发口所在的 owner 模块，以及唯一允许调用它的函数。
+PROJECTION_MODULE = "execution_verification.py"
+PRIVATE_ISSUER = "_issue_fact_projection"
+ALLOWED_ISSUER_CALLERS = frozenset({"fact_projection"})
+
+
+def _production_modules() -> list:
+    return sorted(
+        name for name in os.listdir(BACKEND)
+        if name.endswith(".py") and not name.startswith("test_")
+    )
+
+
+def _tree(name: str):
+    with open(os.path.join(BACKEND, name), encoding="utf-8") as handle:
+        return ast.parse(handle.read())
+
+
+def _call_name(node) -> str:
+    func = node.func
+    if isinstance(func, ast.Attribute):
+        return func.attr
+    if isinstance(func, ast.Name):
+        return func.id
+    return ""
+
+
+def _imported_issuer_aliases(tree) -> set:
+    """``from execution_verification import _issue_fact_projection as X`` 的本地名。
+
+    别名必须解析：否则 ``import ... as issue`` 之后 ``issue(...)`` 会让"唯一调用点"
+    这条边界完全看不到。
+    """
+    names = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom):
+            if (node.module or "").split(".")[0] == PROJECTION_MODULE[:-3]:
+                for alias in node.names:
+                    if alias.name == PRIVATE_ISSUER:
+                        names.add(alias.asname or alias.name)
+    return names
+
+
+def _issuer_calls(tree) -> list:
+    """每次对私有签发口的调用 → ``(所在函数名, 行号)``。
+
+    刻意只回答"哪个函数里出现了这次调用"这一层（caller/function-scope），
+    不做控制流或数据流分析。
+    """
+    aliases = _imported_issuer_aliases(tree)
+    found = []
+
+    def is_issuer(node) -> bool:
+        if not isinstance(node, ast.Call):
+            return False
+        name = _call_name(node)
+        return name == PRIVATE_ISSUER or name in aliases
+
+    def walk(node, func_name):
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                walk(child, child.name)
+                continue
+            if is_issuer(child):
+                found.append((func_name, child.lineno))
+            walk(child, func_name)
+
+    walk(tree, None)
+    return found
+
 
 DAY = "2026-08-27"
 OBSERVED_AT = f"{DAY}T10:30:00+08:00"
@@ -436,6 +512,72 @@ class InputBoundaryTests(unittest.TestCase):
         self.assertTrue(_projection(
             fills=(_fill(event_key=KEY_A, fill_date="2026-02-30"),),
         ).business_day.is_unknown)
+
+
+class PublicationBoundaryTests(unittest.TestCase):
+    def test_EXFACT_19_private_issuer_is_reachable_only_from_the_owner_factory(self):
+        """EXFACT-19：私有签发口**结构上**只能由 owner 工厂调用。
+
+        ``_issue_fact_projection`` 名字是 private，但 Python 层任何模块都能直接
+        ``EV._issue_fact_projection(...)``；只要传入的 verification shape 合法，就能绕过
+        ``fact_projection`` 的类型校验、identity 派生与 PIT 派生，直接造一条投影。
+        少了这条 guard，"single publication entry point" 与 "contract-issued = CLOSED"
+        就只是命名约定。
+
+        与 R27-A 的 ``_issue_evidence_ref`` 同一模式：不需要隐藏函数，只需要把
+        **谁可以调用它** 变成可执行的边界。
+        """
+        offenders = []
+        for name in _production_modules():
+            if name == PROJECTION_MODULE:
+                continue
+            if _issuer_calls(_tree(name)):
+                offenders.append(name)
+        self.assertEqual(
+            [], offenders,
+            f"契约模块之外出现了私有签发调用：{offenders}。"
+            f"{PRIVATE_ISSUER} 只能由 {sorted(ALLOWED_ISSUER_CALLERS)} 调用。",
+        )
+
+        module_calls = _issuer_calls(_tree(PROJECTION_MODULE))
+        self.assertTrue(module_calls, "非空性：owner 模块必须真的在调用私有签发口")
+        callers = {func for func, _ in module_calls}
+        self.assertEqual(
+            ALLOWED_ISSUER_CALLERS, callers,
+            f"私有签发口的调用点发生变化：{sorted(callers)}",
+        )
+
+    def test_EXFACT_19b_issuer_scanner_is_not_vacuous(self):
+        """EXFACT-19b：扫描器必须能区分"owner 工厂调用"与"别的 production 函数调用"。"""
+        legal = ast.parse(
+            "def fact_projection(evidence):\n"
+            "    return _issue_fact_projection(version='v')\n"
+        )
+        self.assertEqual([("fact_projection", 2)], _issuer_calls(legal))
+
+        illegal = ast.parse(
+            "def another_production_function(fields):\n"
+            "    return _issue_fact_projection(**fields)\n"
+        )
+        self.assertEqual([("another_production_function", 2)], _issuer_calls(illegal))
+        self.assertNotEqual(
+            ALLOWED_ISSUER_CALLERS,
+            {func for func, _ in _issuer_calls(illegal)},
+            "第二个 production 调用点没有被判为越界",
+        )
+
+        # 别名同样要被识破（否则 `... import X as issue` 就绕过了这条边界）。
+        aliased = ast.parse(
+            "from execution_verification import _issue_fact_projection as issue\n"
+            "def somewhere_else(fields):\n"
+            "    return issue(**fields)\n"
+        )
+        self.assertEqual([("somewhere_else", 3)], _issuer_calls(aliased))
+
+        # 属性形式也一律计入：同名方法不可能是本模块的签发口，但**宁可从严**——
+        # 这条边界的目标是"找不到第二个调用点"，而不是"精确分类每一个同名调用"。
+        unrelated = ast.parse("def f():\n    return obj._issue_fact_projection()\n")
+        self.assertEqual(1, len(_issuer_calls(unrelated)))
 
 
 class SingleSourceTests(unittest.TestCase):

@@ -702,10 +702,19 @@ IDENTITY_KINDS = (
 class ExecutionFactContractError(ValueError):
     """owner fact contract 的构造被拒绝 —— fail closed。
 
-    ``reason`` 是稳定 machine code（``unknown_verification_status`` /
-    ``unknown_evidence_source`` / ``illegal_verification_pair`` / ``unknown_identity_kind`` /
-    ``alien_identity`` / ``version_mismatch`` / ``field_not_an_evidence_field``），
-    供调用方与测试依赖；文案本身不承载判定。
+    ``reason`` 是稳定 machine code，供调用方与测试依赖；文案本身不承载判定：
+
+    * ``not_execution_evidence`` —— 入口收到非 typed ``ExecutionEvidence``（含子类）；
+    * ``unknown_verification_status`` —— 状态不在 owner 的四态闭集里；
+    * ``unknown_evidence_source`` —— 证据来源不在 owner 的闭集里；
+    * ``illegal_verification_pair`` —— 状态与来源的组合不在合法组合表里；
+    * ``alien_verification_scope`` —— 核验声明不是本 owner 的核验范围；
+    * ``non_canonical_verification`` —— 声明与 ``verification_contract`` 的产出不精确相等
+      （伪造的 version / 相反的 is_verified / 额外字段）；
+    * ``identity_unavailable`` —— 既没有完整成交身份，也没有可用的 order id；
+    * ``unknown_identity_kind`` / ``alien_identity`` —— identity 形态非法；
+    * ``version_mismatch`` —— fact contract 版本不符；
+    * ``field_not_an_evidence_field`` —— 三态字段缺失或名不对。
     """
 
     def __init__(self, reason: str, detail: str = "") -> None:
