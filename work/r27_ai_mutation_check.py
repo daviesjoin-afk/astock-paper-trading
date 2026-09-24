@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""R27-A mutation matrix —— M-AI1..M-AI6。
+"""R27-A mutation matrix —— M-AI1..M-AI8。
 
 只覆盖本轮**新的核心 invariant**。刻意不造几十条，也不扩成通用平台：每条
 mutation 都必须让**唯一指定的永久回归**变 RED，且 anchor 恰好命中一次；

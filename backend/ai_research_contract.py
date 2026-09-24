@@ -22,8 +22,10 @@
 * provider disagreement / unavailable 只说明"这条 evidence 本身不能成为可靠依据"，
   **不**自动等于"这个 thesis 被事实反驳"。
 
-fact verification 只有 owner 能回答，``verification`` / ``verification_method``
-**逐字**来自 owner 的投影；relation 只有 research 层能声明，且是显式输入。
+fact verification 的**语义**由 R24 authority 定义（``verification`` /
+``verification_method`` 的含义与合法组合都归它）；R27 只**逐字复制 supplied R24
+reading**，不重新判定，也**不证明**该 reading 的 provenance。relation 只有 research 层
+能声明，且是显式输入。
 本契约不做评分体系（没有 ``quality_score`` / ``weighted_support`` / Bayesian 合并），
 因为把两个正交维度压成一个分数会让下游只能猜。
 
