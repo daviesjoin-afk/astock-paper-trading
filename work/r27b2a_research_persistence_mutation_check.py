@@ -1,20 +1,23 @@
 # -*- coding: utf-8 -*-
-"""R27-B2A mutation matrix —— M-B2A-1 .. M-B2A-8。
+"""R27-B2A mutation matrix —— M-B2A-1 .. M-B2A-11。
 
 只覆盖本轮**新的高风险 invariant**，刻意不造几十条，也不扩成通用平台：每条 mutation
 都必须让**唯一指定的永久回归**变 RED，且 anchor 恰好命中一次；``--non-vacuity`` 先跑
 baseline，``SyntaxError`` / ``ImportError`` / ``NameError`` 一律计为 FAKE
 （改红了不等于证明了业务性质）。
 
-本轮的核心不变量有三组，mutation 也按这三组设计：
+本轮的核心不变量分四组，mutation 也按这四组设计：
 
 * **派生值不能被改写**（M-B2A-2 / 3）：``status`` / ``authority`` / ``is_authoritative``
   只能来自 typed hypothesis。改坏之后由 schema 的 ``CHECK`` 直接拦下 —— 那是生产防线
   真的生效，不是接线错误。
 * **数据库不重新解释 evidence**（M-B2A-4 / 5）：丢字段、或把
   ``cross_source_verified`` 重算成 ``verification == "verified"``，必须立刻 RED。
-* **append-only 与内容指纹**（M-B2A-6 / 8）：静默 upsert 必须被 append-only guard 抓到；
-  ``record_hash`` 必须真的覆盖研究内容，而不是"稳定但空洞"。
+* **append-only 与内容指纹**（M-B2A-6 / 8 / 10）：静默 upsert 必须被 append-only guard
+  抓到；``record_hash`` 必须真的覆盖**全部**持久化内容（含 ``trigger``），
+  而不是"稳定但空洞"。
+* **读路径的存储自洽性与完整性**（M-B2A-9 / 11）：行内重复字段不一致、或内容与
+  ``record_hash`` 脱节的行，不得被正常读出。
 
 沿用 R27-B1 已修好的 ``PYTHONPYCACHEPREFIX`` 逐次唯一目录，否则 baseline 与 mutant 会
 共享字节码缓存，整张矩阵静默失效。
@@ -24,7 +27,7 @@ byte-identical 还原并校验 sha256。
 
 用法：
     python work/r27b2a_research_persistence_mutation_check.py
-    python work/r27b2a_research_persistence_mutation_check.py --only M-B2A-1,M-B2A-7 --non-vacuity
+    python work/r27b2a_research_persistence_mutation_check.py --only M-B2A-1,M-B2A-11 --non-vacuity
 """
 from __future__ import annotations
 
@@ -166,11 +169,49 @@ MUTATIONS = [
         # record_hash 不再覆盖 hypothesis 内容：hash 依然"稳定"，但 thesis / relation /
         # verification_method 的变化都不会改变它 —— 一个证明不了研究产物的指纹。
         "file": REPOSITORY,
-        "old": '        "hypothesis": projection,\n',
-        "new": "",
+        "old": (
+            '        "trigger": trigger,\n'
+            '        "hypothesis": hypothesis,\n'
+        ),
+        "new": '        "trigger": trigger,\n',
         "test": _rep("ResearchPersistenceAppendOnlyTests."
                      "test_RPERSIST_12_record_hash_covers_the_research_content"),
         "desc": "record_hash 不再覆盖研究内容（指纹稳定但空洞）",
+    },
+    {
+        "id": "M-B2A-9",
+        # 不再校验行内**重复字段**是否与 hypothesis JSON 一致：一条
+        # "JSON 说 insufficient_evidence、判别列说 supported" 的外来行会被正常读成
+        # supported —— 数据库事实上成了第二个 verdict authority。
+        "file": REPOSITORY,
+        "old": "    _check_stored_consistency(values, hypothesis)\n",
+        "new": "    if False:\n        _check_stored_consistency(values, hypothesis)\n",
+        "test": _rep("ResearchPersistenceReadIntegrityTests."
+                     "test_RPERSIST_26_duplicated_verdict_fields_must_agree_with_the_hypothesis"),
+        "desc": "判别列与 hypothesis JSON 不一致的行仍被正常读出",
+    },
+    {
+        "id": "M-B2A-10",
+        # trigger 退出 record_hash 输入：cli 与 scheduled 得到同一个指纹，审计来源不可区分。
+        "file": REPOSITORY,
+        "old": '        "trigger": trigger,\n',
+        "new": "",
+        "test": _rep("ResearchPersistenceReadIntegrityTests."
+                     "test_RPERSIST_27_trigger_participates_in_the_record_hash"),
+        "desc": "trigger 不影响 record_hash（不同审计来源指纹相同）",
+    },
+    {
+        "id": "M-B2A-11",
+        # 读取时不再重算 record_hash：内容被改、旧指纹还在的行被正常读出。
+        "file": REPOSITORY,
+        "old": "    _check_record_integrity(values, hypothesis, counter_arguments)\n",
+        "new": (
+            "    if False:\n"
+            "        _check_record_integrity(values, hypothesis, counter_arguments)\n"
+        ),
+        "test": _rep("ResearchPersistenceReadIntegrityTests."
+                     "test_RPERSIST_28_read_path_verifies_the_stored_record_hash"),
+        "desc": "内容被改但保留旧 record_hash 的行仍被正常读出",
     },
 ]
 

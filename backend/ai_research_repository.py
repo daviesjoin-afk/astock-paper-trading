@@ -25,7 +25,9 @@ owner、不是 signal / risk / promotion authority。因此：
 * ``verification`` / ``verification_method`` / ``cross_source_verified`` 只**逐字记录**
   R27-A 投影给出的事实维度，本模块**不重算** —— 尤其绝不把 ``verified`` 重新解释成
   ``cross_source_verified``（``coverage_integrity`` 的 ``verified`` 不是逐票双源）。
-* 读出来的 row 是**历史 research artifact**，不是重新核验过的实时证据。
+* 读出来的 row 是**历史 research artifact**，不是重新核验过的实时证据。读取时会校验
+  同一行的**自洽性**（重复字段一致）与 **`record_hash` 完整性**，不一致即 fail closed
+  —— 但那是**完整性指纹**，不是防篡改签名，更不构成"数据库能证明这条事实来自 owner"。
 
 **Persistence does not re-authorize research.** 一条历史 ``supported`` 行不等于当前
 signal、不等于 current verified fact、不等于 promotion permission。任何要用研究结论的
@@ -273,6 +275,42 @@ def _canonical_json(payload: Any) -> str:
     )
 
 
+def _hash_input(
+    *,
+    purpose: Any,
+    trigger: Any,
+    hypothesis: Any,
+    provider_slot: Any,
+    provider_model: Any,
+    narrative: Any,
+    counter_arguments: Any,
+    input_tokens: Any,
+    output_tokens: Any,
+    latency_ms: Any,
+) -> dict:
+    """``record_hash`` 的输入 —— **写路径与读路径共用同一份定义**。
+
+    共用是有意的：读路径要重算 hash 才能发现"内容被改过、hash 没跟着改"。如果两边各拼
+    一份输入，一旦漂移就会把全部历史行判成损坏，或者（更糟）让校验静默失效。
+
+    **只排除 ``id`` 与 ``created_at``**：``id`` 是自增主键、不是产物身份；``created_at``
+    是 operational persistence time、不是研究内容。其余**每一个被持久化的内容字段**都在
+    这里，包括 ``trigger`` —— ``cli`` 与 ``scheduled`` 是不同审计来源，必须产生不同指纹。
+    """
+    return {
+        "purpose": purpose,
+        "trigger": trigger,
+        "hypothesis": hypothesis,
+        "provider_slot": provider_slot,
+        "provider_model": provider_model,
+        "narrative": narrative,
+        "counter_arguments": list(counter_arguments),
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "latency_ms": latency_ms,
+    }
+
+
 def _record_hash(payload: Any) -> str:
     """``record_hash`` = 实际持久化 research 内容的 SHA-256。
 
@@ -280,6 +318,10 @@ def _record_hash(payload: Any) -> str:
     operational persistence time —— 把运维时间混进内容指纹，会让同一次研究产物在不同
     落库时刻得到不同 hash。刻意也**不含** DB ``id``（自增主键不是产物身份），更不含
     api_key / Authorization / raw HTTP body。
+
+    **它是一个完整性指纹，不是防篡改签名。** 它能回答"这一行的内容与写入时是否一致"，
+    **不能**回答"这一行是否由可信 writer 产生"：任何能写这张表的人都能同时改内容与
+    hash。本层不把它宣传成密码学保证。
     """
     return hashlib.sha256(_canonical_json(payload).encode("utf-8")).hexdigest()
 
@@ -411,17 +453,18 @@ def append_run(
     projection = hypothesis.projection()
     hypothesis_json = _canonical_json(projection)
 
-    content = {
-        "purpose": purpose_text,
-        "hypothesis": projection,
-        "provider_slot": slot,
-        "provider_model": model,
-        "narrative": narrative_text,
-        "counter_arguments": list(counters),
-        "input_tokens": in_tokens,
-        "output_tokens": out_tokens,
-        "latency_ms": latency,
-    }
+    record_hash = _record_hash(_hash_input(
+        purpose=purpose_text,
+        trigger=trigger_text,
+        hypothesis=projection,
+        provider_slot=slot,
+        provider_model=model,
+        narrative=narrative_text,
+        counter_arguments=counters,
+        input_tokens=in_tokens,
+        output_tokens=out_tokens,
+        latency_ms=latency,
+    ))
 
     row = {
         "purpose": purpose_text,
@@ -443,7 +486,7 @@ def append_run(
         "input_tokens": in_tokens,
         "output_tokens": out_tokens,
         "latency_ms": latency,
-        "record_hash": _record_hash(content),
+        "record_hash": record_hash,
         "created_at": created_text,
     }
 
@@ -500,19 +543,138 @@ def _row_values(row: Any) -> dict:
     return dict(zip(RUN_COLUMNS, row, strict=False))
 
 
-def _projection_from_row(row: Any) -> dict:
-    """一行 → audit projection。损坏即 fail closed（:class:`ResearchPersistenceError`）。
+#: 在**同一行内被重复保存**的字段：既是判别列，也在 hypothesis JSON 里各存一份。
+#: 读取时两份必须一致 —— 只校验其中一份，会留下"hypothesis JSON 写
+#: ``insufficient_evidence``、判别列写 ``supported``"这种自相矛盾的行被正常读出来，
+#: 于是数据库事实上成了第二个 verdict authority。
+_DUPLICATED_FIELDS = (
+    "hypothesis_id", "as_of", "subject", "status", "reason", "confidence",
+    "authority", "is_authoritative",
+)
 
-    ``authority`` / ``is_authoritative`` 在返回前被重新校验一次，并在投影里**写成常量**：
-    schema 的 ``CHECK`` 已经保证本模块写不出别的值，这里再校验是为了挡住"由别的 writer
-    造出来的行"——一条自称权威的历史记录，绝不能被本层当成权威继续传播。投影里的
-    ``is_authoritative`` 因此**恒为** ``False``，不会因为 ``status == supported`` 变成真。
+
+def _stored_int(value: Any, *, what: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ResearchPersistenceError(
+            REASON_CORRUPT_RECORD, f"persisted {what} is not an integer",
+        )
+    return value
+
+
+def _stored_text(value: Any, *, what: str) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ResearchPersistenceError(
+            REASON_CORRUPT_RECORD, f"persisted {what} is not a string",
+        )
+    return value
+
+
+def _stored_confidence(value: Any) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ResearchPersistenceError(
+            REASON_CORRUPT_RECORD, "persisted confidence is not a number",
+        )
+    return float(value)
+
+
+def _stored_flag(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int) and value in (0, 1):
+        return bool(value)
+    raise ResearchPersistenceError(
+        REASON_CORRUPT_RECORD, "persisted is_authoritative is not a boolean flag",
+    )
+
+
+def _check_stored_consistency(values: dict, hypothesis: dict) -> None:
+    """同一条记录里的**重复字段**必须彼此一致。
+
+    这是 **storage consistency check**，不是重新裁决：本层刻意**不**调用（也不重新实现）
+    R27-A 的 ``_derive_status()`` —— 那会造出第二套 research authority，正是本轮要根除的
+    东西。它只问一个纯存储层面的问题："这一行自己前后是否自洽？"
+
+    必要性：schema 的 ``CHECK`` 只约束 ``authority`` / ``is_authoritative``。``status`` /
+    ``reason`` / ``confidence`` 在列里是任意值，所以一条由别的 writer（或更早版本）造出来
+    的行可以是"JSON 说 ``insufficient_evidence``、列说 ``supported``" —— 少了这一步，
+    它会被正常读出来，数据库就真的成了 verdict authority。
+    """
+    for name in _DUPLICATED_FIELDS:
+        if name not in hypothesis:
+            raise ResearchPersistenceError(
+                REASON_CORRUPT_RECORD, f"persisted hypothesis omits {name}",
+            )
+        stored = values[name]
+        embedded = hypothesis[name]
+        if name == "confidence":
+            same = _stored_confidence(stored) == _stored_confidence(embedded)
+        elif name == "is_authoritative":
+            same = _stored_flag(stored) == _stored_flag(embedded)
+        else:
+            same = _stored_text(stored, what=name) == _stored_text(embedded, what=name)
+        if not same:
+            raise ResearchPersistenceError(
+                REASON_CORRUPT_RECORD,
+                f"persisted {name} disagrees with the stored hypothesis",
+            )
+
+
+def _check_record_integrity(values: dict, hypothesis: dict, counter_arguments: list) -> None:
+    """读取时重算 ``record_hash`` 并与存储值比较 —— 不一致即 fail closed。
+
+    没有这一步，把 ``hypothesis`` / ``purpose`` / ``trigger`` / ``narrative`` 任何一项改掉
+    之后，历史 ``record_hash`` 已经失效，而本层仍会正常返回这条记录 —— 那与"hash 是
+    persisted audit content 的指纹"这个语义不成立。
+
+    **只是完整性指纹，不是防篡改签名。** 能写这张表的人可以同时改内容与 hash；这里挡的是
+    "内容与指纹脱节"（意外损坏、半次迁移、旧版本写入），不是敌意 writer。
+    """
+    expected = _record_hash(_hash_input(
+        purpose=values["purpose"],
+        trigger=values["trigger"],
+        hypothesis=hypothesis,
+        provider_slot=values["provider_slot"],
+        provider_model=values["provider_model"],
+        narrative=values["narrative"],
+        counter_arguments=counter_arguments,
+        input_tokens=_stored_int(values["input_tokens"], what="input_tokens"),
+        output_tokens=_stored_int(values["output_tokens"], what="output_tokens"),
+        latency_ms=_stored_int(values["latency_ms"], what="latency_ms"),
+    ))
+    if str(values["record_hash"]) != expected:
+        raise ResearchPersistenceError(
+            REASON_CORRUPT_RECORD,
+            "persisted record_hash does not match the stored content",
+        )
+
+
+def _projection_from_row(row: Any) -> dict:
+    """一行 → audit projection。损坏、不自洽或指纹不符即 fail closed。
+
+    三道检查都只回答**存储层面**的问题，都不重新裁决 research：
+
+    1. :func:`_check_stored_consistency` —— 行内重复字段（``status`` / ``reason`` /
+       ``confidence`` / ``authority`` / ``is_authoritative`` / identity）两份必须一致，
+       否则一行"JSON 说 insufficient_evidence、列说 supported"的记录会被当成 supported；
+    2. ``authority`` / ``is_authoritative`` 常量不变量 —— 一条自称权威的历史记录，绝不能
+       被本层当成权威继续传播。投影里的 ``is_authoritative`` 因此**恒为** ``False``，
+       不会因为 ``status == supported`` 变成真；
+    3. :func:`_check_record_integrity` —— 重算 ``record_hash`` 与存储值比较，挡住"内容被
+       改过、旧指纹还在"的行。
     """
     values = _row_values(row)
     hypothesis = _json_object(values["hypothesis"], what="persisted hypothesis")
     counter_arguments = _json_list(
         values["counter_arguments"], what="persisted counter_arguments",
     )
+
+    # 三步都 fail closed，且都不是重新裁决：
+    #   1. 行内重复字段必须自洽（storage consistency）；
+    #   2. 行不得自称 research 之外的权威（常量不变量）；
+    #   3. 内容必须与持久化时的 record_hash 一致（integrity fingerprint）。
+    _check_stored_consistency(values, hypothesis)
 
     authority = values["authority"]
     stored_authoritative = values["is_authoritative"]
@@ -521,6 +683,8 @@ def _projection_from_row(row: Any) -> dict:
             REASON_CORRUPT_RECORD,
             "persisted row claims an authority outside research",
         )
+
+    _check_record_integrity(values, hypothesis, counter_arguments)
 
     return {
         "id": int(values["id"]),
@@ -584,8 +748,9 @@ def recent_runs(
     把一行 ``status='supported'`` 读成"当前仍然支持"：它是历史研究产物，persistence
     不重新授权 research。
 
-    损坏的行**不会**被跳过或替换成空记录 —— 直接 fail closed（见
-    :class:`ResearchPersistenceError`）。
+    损坏的行**不会**被跳过或替换成空记录 —— 直接 fail closed：JSON 解析失败、行内重复
+    字段不自洽、自称 research 之外的权威、或内容与 ``record_hash`` 不符，任一情况都抛
+    :class:`ResearchPersistenceError`，而不是把损坏当成"这里没有研究结论"。
     """
     size = _row_limit(limit)
     where, params = _filters(as_of, subject)
@@ -599,7 +764,8 @@ def recent_runs(
 def get_run(conn: sqlite3.Connection, run_id: Any) -> dict | None:
     """按 ``id`` 取一条研究运行；不存在返回 ``None``（**不**抛错，这是"查无此行"）。
 
-    与 :func:`recent_runs` 一样，返回的是历史 audit projection，且同样 fail closed。
+    与 :func:`recent_runs` 一样，返回的是历史 audit projection，且同样对损坏、不自洽与
+    指纹不符的行 fail closed。
     """
     if isinstance(run_id, bool) or not isinstance(run_id, int):
         raise TypeError(f"run_id must be an int, got {type(run_id).__name__}")

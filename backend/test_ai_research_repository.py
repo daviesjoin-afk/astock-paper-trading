@@ -14,6 +14,8 @@
     RPERSIST-14        secret / raw prompt 绝不落库
     RPERSIST-15 ~ 19   损坏行 fail closed；读取有界、顺序稳定、过滤正确
     RPERSIST-20 ~ 25   边界 guard：无时钟、无网络、无 authority import、唯一 writer
+    RPERSIST-26 ~ 28   读路径的存储自洽性与完整性（重复字段一致 / trigger 进指纹 /
+                       内容与 record_hash 必须相符）
     非空性             护栏必须真的能失败，否则它只是装饰
 
 时间一律**显式**传入（固定业务日与固定 created_at 字符串），绝不读墙上时钟 ——
@@ -61,6 +63,16 @@ FORBIDDEN_CALLER_FIELDS = frozenset({
     "verification", "verification_method", "cross_source_verified",
     "source_type", "source_id", "as_of", "hypothesis_id",
 })
+
+#: 指纹输入里**不单独出现**的持久化列。
+#:
+#: * ``id`` / ``created_at`` 刻意排除（自增主键、operational time）；
+#: * ``record_hash`` 不可能包含自身；
+#: * 其余是 hypothesis 投影里的标量在列里的**重复副本**，它们由 ``hypothesis`` 那一项
+#:   覆盖（见 RPERSIST-27 的覆盖断言）。
+_HASH_EXCLUDED = frozenset({"id", "created_at", "record_hash"}) | frozenset(
+    REP._DUPLICATED_FIELDS
+)
 
 #: secret / raw prompt 相关的列名与参数名：本表与签名里都不允许出现。
 #: 刻意用**精确**名字而不是 "auth" 这类前缀 —— 那会把 ``authority`` 也误判成 secret。
@@ -638,22 +650,21 @@ class ResearchPersistenceAppendOnlyTests(RepositoryTestCase):
         self.assertEqual(OTHER_CREATED_AT, row_b["created_at"])
         self.assertEqual(row_a["record_hash"], row_b["record_hash"])
 
-        # 直接证明 hash 输入集合不含 created_at / id。
-        content = {
-            "purpose": row_a["purpose"],
-            "hypothesis": row_a["hypothesis"],
-            "provider_slot": row_a["provider_slot"],
-            "provider_model": row_a["provider_model"],
-            "narrative": row_a["narrative"],
-            "counter_arguments": row_a["counter_arguments"],
-            "input_tokens": row_a["input_tokens"],
-            "output_tokens": row_a["output_tokens"],
-            "latency_ms": row_a["latency_ms"],
-        }
+        # 直接证明 hash 输入集合：除 id 与 created_at 之外**全部**持久化列都在指纹内。
+        content = REP._hash_input(
+            purpose=row_a["purpose"],
+            trigger=row_a["trigger"],
+            hypothesis=row_a["hypothesis"],
+            provider_slot=row_a["provider_slot"],
+            provider_model=row_a["provider_model"],
+            narrative=row_a["narrative"],
+            counter_arguments=row_a["counter_arguments"],
+            input_tokens=row_a["input_tokens"],
+            output_tokens=row_a["output_tokens"],
+            latency_ms=row_a["latency_ms"],
+        )
         self.assertEqual(REP._record_hash(content), row_a["record_hash"])
-        self.assertNotIn("created_at", content)
-        self.assertNotIn("id", content)
-        self.assertNotIn("record_hash", content)
+        self.assertEqual(set(REP.RUN_COLUMNS) - _HASH_EXCLUDED, set(content))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -693,21 +704,23 @@ class ResearchPersistenceSecretTests(RepositoryTestCase):
                 self.assertNotIn(forbidden, roots)
 
     def test_RPERSIST_14b_record_hash_input_excludes_secret_fields(self):
-        """RPERSIST-14b：hash 输入集合恰好是研究内容 + audit label，没有别的。"""
+        """RPERSIST-14b：hash 输入集合恰好是全部持久化内容，没有别的。"""
         conn = self.conn()
         row = REP.get_run(conn, _append(conn, provider_slot="ai1", provider_model="m"))
-        content = {
-            "purpose": row["purpose"],
-            "hypothesis": row["hypothesis"],
-            "provider_slot": row["provider_slot"],
-            "provider_model": row["provider_model"],
-            "narrative": row["narrative"],
-            "counter_arguments": row["counter_arguments"],
-            "input_tokens": row["input_tokens"],
-            "output_tokens": row["output_tokens"],
-            "latency_ms": row["latency_ms"],
-        }
+        content = REP._hash_input(
+            purpose=row["purpose"],
+            trigger=row["trigger"],
+            hypothesis=row["hypothesis"],
+            provider_slot=row["provider_slot"],
+            provider_model=row["provider_model"],
+            narrative=row["narrative"],
+            counter_arguments=row["counter_arguments"],
+            input_tokens=row["input_tokens"],
+            output_tokens=row["output_tokens"],
+            latency_ms=row["latency_ms"],
+        )
         self.assertEqual(REP._record_hash(content), row["record_hash"])
+        self.assertEqual(set(REP.RUN_COLUMNS) - _HASH_EXCLUDED, set(content))
         for token in SECRET_FIELD_TOKENS:
             with self.subTest(token=token):
                 self.assertEqual([], [key for key in content if token in key.lower()])
@@ -728,34 +741,48 @@ class ResearchPersistenceSecretTests(RepositoryTestCase):
 
 class ResearchPersistenceCorruptReadTests(RepositoryTestCase):
     def test_RPERSIST_15_corrupt_hypothesis_json_fails_closed(self):
-        """RPERSIST-15：hypothesis JSON 损坏 → :class:`ResearchPersistenceError`，**不**返回 {}。"""
+        """RPERSIST-15：hypothesis JSON 损坏 → :class:`ResearchPersistenceError`，**不**返回 {}。
+
+        刻意断言**报的是哪一类**损坏：JSON 非法必须报 ``not valid JSON``，而不是被后续的
+        一致性 / 完整性检查顺手拦下报成"缺字段"。否则 ``except → {}`` 这种 fail-open
+        写法会被后面的检查掩盖住（mutation M-B2A-7 正是这个形状），这条回归就成了空转。
+        """
         conn = self.conn()
         run_id = _append(conn)
-        conn.execute(f"UPDATE {REP.TABLE} SET hypothesis=? WHERE id=?", ("{不是 JSON", run_id))
+        _tamper(conn, run_id, hypothesis="{不是 JSON")
 
         for reader in (lambda: REP.recent_runs(conn), lambda: REP.get_run(conn, run_id)):
             with self.subTest(reader=reader):
                 with self.assertRaises(REP.ResearchPersistenceError) as caught:
                     reader()
                 self.assertEqual(REP.REASON_CORRUPT_RECORD, caught.exception.reason)
+                self.assertIn("not valid JSON", str(caught.exception))
 
-        # 非 object 的合法 JSON 同样拒绝。
-        conn.execute(f"UPDATE {REP.TABLE} SET hypothesis=? WHERE id=?", ("[1,2]", run_id))
-        with self.assertRaises(REP.ResearchPersistenceError):
+        # 合法 JSON 但不是 object：换一类明确原因，同样 fail closed。
+        _tamper(conn, run_id, hypothesis="[1,2]")
+        with self.assertRaises(REP.ResearchPersistenceError) as caught:
             REP.get_run(conn, run_id)
+        self.assertEqual(REP.REASON_CORRUPT_RECORD, caught.exception.reason)
+        self.assertIn("not a JSON object", str(caught.exception))
 
     def test_RPERSIST_16_corrupt_counter_arguments_fails_closed(self):
-        """RPERSIST-16：counter_arguments JSON 损坏同样 fail closed。"""
+        """RPERSIST-16：counter_arguments JSON 损坏同样 fail closed（并报出是哪一类）。"""
         conn = self.conn()
         run_id = _append(conn, counter_arguments=["a", "b"])
-        for broken in ("{", "null", '"a string"', "42"):
+        cases = (
+            ("{", "not valid JSON"),
+            ("null", "not a JSON array"),
+            ('"a string"', "not a JSON array"),
+            ("42", "not a JSON array"),
+            ("{}", "not a JSON array"),
+        )
+        for broken, fragment in cases:
             with self.subTest(value=broken):
-                conn.execute(
-                    f"UPDATE {REP.TABLE} SET counter_arguments=? WHERE id=?", (broken, run_id),
-                )
+                _tamper(conn, run_id, counter_arguments=broken)
                 with self.assertRaises(REP.ResearchPersistenceError) as caught:
                     REP.recent_runs(conn)
                 self.assertEqual(REP.REASON_CORRUPT_RECORD, caught.exception.reason)
+                self.assertIn(fragment, str(caught.exception))
 
     def test_RPERSIST_16b_corrupt_errors_do_not_echo_the_damaged_payload(self):
         """RPERSIST-16b：fail-closed 错误不回显原始损坏内容（也不回显 SQL / raw row）。"""
@@ -832,6 +859,204 @@ class ResearchPersistenceCorruptReadTests(RepositoryTestCase):
                     continue
                 with self.assertRaises((TypeError, ValueError)):
                     REP.recent_runs(conn, as_of=bad)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# RPERSIST-26 ~ 28 —— 读路径的存储自洽性与完整性
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+class ResearchPersistenceReadIntegrityTests(RepositoryTestCase):
+    """三条都只回答**存储层面**的问题，都不重新裁决 research。"""
+
+    def test_RPERSIST_26_duplicated_verdict_fields_must_agree_with_the_hypothesis(self):
+        """RPERSIST-26：行内重复字段必须与 hypothesis JSON 一致。
+
+        这是 **storage consistency check**，不是第二个 verdict authority：本层刻意不调用
+        也不重新实现 R27-A 的 ``_derive_status()``。它挡的是"JSON 说 insufficient_evidence、
+        判别列说 supported"这种自相矛盾的行 —— 少了这一步，``status`` / ``reason`` /
+        ``confidence`` 在列里没有任何约束，数据库事实上就成了第二个 verdict authority。
+        """
+        # 正例：自洽的行正常读出。
+        conn = self.conn()
+        run_id = _append(conn, hypothesis=_plain_hypothesis())
+        row = REP.get_run(conn, run_id)
+        self.assertEqual(ARC.HYPOTHESIS_INSUFFICIENT_EVIDENCE, row["status"])
+        self.assertEqual(ARC.RESEARCH_REASON_NO_EVIDENCE, row["reason"])
+        self.assertEqual(row["status"], row["hypothesis"]["status"])
+
+        # 反例：逐个把判别列改成与 JSON 不一致。
+        # ``authority`` / ``is_authoritative`` 不在其中 —— 它们在 canonical 表上被 ``CHECK``
+        # 直接挡住（改都改不动），因此用无 CHECK 的同名表单独验证，见下。
+        cases = (
+            ("status", ARC.HYPOTHESIS_SUPPORTED),
+            ("reason", ARC.RESEARCH_REASON_NO_SUPPORTING_EVIDENCE),
+            ("confidence", 0.99),
+            ("hypothesis_id", "H-9"),
+            ("as_of", "2026-08-26"),
+            ("subject", "000001"),
+        )
+        for column, value in cases:
+            with self.subTest(column=column):
+                conn = self.conn()
+                run_id = _append(conn, hypothesis=_plain_hypothesis())
+                _tamper(conn, run_id, **{column: value})
+                with self.assertRaises(REP.ResearchPersistenceError) as caught:
+                    REP.get_run(conn, run_id)
+                self.assertEqual(REP.REASON_CORRUPT_RECORD, caught.exception.reason)
+                self.assertIn("disagrees", str(caught.exception))
+
+        # 反例：JSON 里干脆缺字段，同样 fail closed（缺字段 ≠ 一致）。
+        for missing in sorted(REP._DUPLICATED_FIELDS):
+            with self.subTest(missing=missing):
+                conn = self.conn()
+                run_id = _append(conn, hypothesis=_plain_hypothesis())
+                stored = json.loads(_row_dict(conn, run_id)["hypothesis"])
+                stored.pop(missing)
+                _tamper(conn, run_id,
+                        hypothesis=json.dumps(stored, ensure_ascii=False))
+                with self.assertRaises(REP.ResearchPersistenceError) as caught:
+                    REP.get_run(conn, run_id)
+                self.assertEqual(REP.REASON_CORRUPT_RECORD, caught.exception.reason)
+                self.assertIn("omits", str(caught.exception))
+
+        # 反例：列说 signal、JSON 说 research —— 必须由**一致性**检查拦下
+        # （schema 拦不住这一行的其他列，而这条行也没有自称权威到触发常量检查）。
+        for column, value in (("authority", "signal"), ("is_authoritative", 1)):
+            with self.subTest(column=column):
+                foreign = self.lenient_conn()
+                row = list(_foreign_row())
+                row[REP.RUN_COLUMNS.index(column)] = value
+                _insert_foreign(foreign, row)
+                with self.assertRaises(REP.ResearchPersistenceError) as caught:
+                    REP.recent_runs(foreign)
+                self.assertEqual(REP.REASON_CORRUPT_RECORD, caught.exception.reason)
+                self.assertIn("disagrees", str(caught.exception))
+
+    def test_RPERSIST_27_trigger_participates_in_the_record_hash(self):
+        """RPERSIST-27：``trigger`` 进入 record_hash —— cli / scheduled 是不同审计来源。
+
+        指纹只排除 ``id``（自增主键）与 ``created_at``（operational time）。其余每一个被
+        持久化的内容字段都参与：``trigger`` 曾经例外，而它与 ``purpose`` 同类，没有稳定的
+        语义理由把它排除在外。
+        """
+        conn = self.conn()
+        hypothesis = _hypothesis(ref=_cross_source_ref())
+        base = _append(conn, hypothesis=hypothesis, trigger="cli")
+        same = _append(conn, hypothesis=hypothesis, trigger="cli")
+        other = _append(conn, hypothesis=hypothesis, trigger="scheduled")
+
+        base_hash = REP.get_run(conn, base)["record_hash"]
+        # 正例：内容全同 → 指纹相同。
+        self.assertEqual(base_hash, REP.get_run(conn, same)["record_hash"])
+        # 反例：只改 trigger → 指纹必须变。
+        self.assertNotEqual(base_hash, REP.get_run(conn, other)["record_hash"])
+        # 同类：只改 purpose 也必须变。
+        self.assertNotEqual(
+            base_hash,
+            REP.get_run(conn, _append(conn, hypothesis=hypothesis, trigger="cli",
+                                      purpose="scheduled_audit"))["record_hash"],
+        )
+
+        # 指纹输入集合 = 全部持久化列 − {id, created_at, record_hash} − 重复标量列
+        # （后者已由 hypothesis 那一项覆盖）。
+        self.assertEqual(
+            set(REP.RUN_COLUMNS) - _HASH_EXCLUDED,
+            set(REP._hash_input(
+                purpose="", trigger="", hypothesis={}, provider_slot=None,
+                provider_model="", narrative="", counter_arguments=(),
+                input_tokens=0, output_tokens=0, latency_ms=0,
+            )),
+        )
+
+        # 覆盖性：重复标量列虽然在指纹输入里不单独出现，但改动**投影内部**的任一项都会
+        # 改变指纹 —— 它们确实被 hypothesis 那一项覆盖了。
+        projection = REP.get_run(conn, base)["hypothesis"]
+        baseline = REP._record_hash(REP._hash_input(
+            purpose="p", trigger="t", hypothesis=projection, provider_slot=None,
+            provider_model="", narrative="", counter_arguments=(),
+            input_tokens=0, output_tokens=0, latency_ms=0,
+        ))
+        for field in sorted(REP._DUPLICATED_FIELDS):
+            with self.subTest(field=field):
+                changed = dict(projection)
+                changed[field] = "被改过的值" if field != "confidence" else 0.123
+                if field == "is_authoritative":
+                    changed[field] = True
+                self.assertNotEqual(baseline, REP._record_hash(REP._hash_input(
+                    purpose="p", trigger="t", hypothesis=changed, provider_slot=None,
+                    provider_model="", narrative="", counter_arguments=(),
+                    input_tokens=0, output_tokens=0, latency_ms=0,
+                )), f"{field} 在指纹之外")
+
+    def test_RPERSIST_28_read_path_verifies_the_stored_record_hash(self):
+        """RPERSIST-28：内容被改过、旧 ``record_hash`` 还在的行不得被正常读出。
+
+        没有这一步，"hash 是 persisted audit content 的指纹"这个语义只是文档：改掉
+        ``hypothesis`` / ``purpose`` / ``trigger`` / ``narrative`` 任何一项之后，历史指纹
+        已经失效，而读路径仍会正常返回这条记录。
+        """
+        # 正例：未改动的行读出且内容完整。
+        conn = self.conn()
+        run_id = _append(conn, hypothesis=_hypothesis(ref=_cross_source_ref()),
+                         narrative="原始叙述")
+        row = REP.get_run(conn, run_id)
+        self.assertEqual("原始叙述", row["narrative"])
+        self.assertEqual(REP._record_hash(REP._hash_input(
+            purpose=row["purpose"], trigger=row["trigger"], hypothesis=row["hypothesis"],
+            provider_slot=row["provider_slot"], provider_model=row["provider_model"],
+            narrative=row["narrative"], counter_arguments=row["counter_arguments"],
+            input_tokens=row["input_tokens"], output_tokens=row["output_tokens"],
+            latency_ms=row["latency_ms"],
+        )), row["record_hash"])
+
+        # 反例：只改单个持久化字段，旧 fingerprint 留在库里。
+        for column, value in (
+            ("narrative", "被改过的叙述"),
+            ("purpose", "被改过的 purpose"),
+            ("trigger", "被改过的 trigger"),
+            ("provider_model", "改过的模型"),
+            ("input_tokens", 999),
+            ("provider_slot", "ai2"),
+        ):
+            with self.subTest(column=column):
+                conn = self.conn()
+                run_id = _append(conn, hypothesis=_hypothesis(ref=_cross_source_ref()),
+                                 narrative="原始叙述")
+                _tamper(conn, run_id, **{column: value})
+                with self.assertRaises(REP.ResearchPersistenceError) as caught:
+                    REP.recent_runs(conn)
+                self.assertEqual(REP.REASON_CORRUPT_RECORD, caught.exception.reason)
+
+        # 反例（关键）：连 hypothesis JSON 一起改、判别列保持一致 —— 一致性检查会放行，
+        # 必须由完整性检查拦下。这证明指纹真的覆盖了研究内容本身。
+        conn = self.conn()
+        run_id = _append(conn, hypothesis=_hypothesis(ref=_cross_source_ref()))
+        stored = json.loads(_row_dict(conn, run_id)["hypothesis"])
+        stored["thesis"] = "被换掉的 thesis"
+        _tamper(conn, run_id, hypothesis=json.dumps(stored, ensure_ascii=False))
+        with self.assertRaises(REP.ResearchPersistenceError) as caught:
+            REP.get_run(conn, run_id)
+        self.assertEqual(REP.REASON_CORRUPT_RECORD, caught.exception.reason)
+
+        # **诚实标注本检查的强度**：能写这张表的人可以同时改内容与 fingerprint，那时读取会
+        # 成功。本层提供的是完整性指纹（挡住意外损坏 / 半次迁移 / 旧版本写入），
+        # **不是**防篡改签名。
+        conn = self.conn()
+        run_id = _append(conn, hypothesis=_hypothesis(ref=_cross_source_ref()),
+                         narrative="原始叙述")
+        tampered = "被改过的叙述"
+        _tamper(
+            conn, run_id,
+            narrative=tampered,
+            record_hash=REP._record_hash(REP._hash_input(
+                purpose="manual_research", trigger="cli",
+                hypothesis=json.loads(_row_dict(conn, run_id)["hypothesis"]),
+                provider_slot=None, provider_model="", narrative=tampered,
+                counter_arguments=[], input_tokens=0, output_tokens=0, latency_ms=0,
+            )),
+        )
+        self.assertEqual(tampered, REP.get_run(conn, run_id)["narrative"])
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -954,14 +1179,16 @@ class ResearchPersistenceBoundaryGuardTests(RepositoryTestCase):
         for claimed in (("signal", 0), ("research", 1)):
             with self.subTest(claimed=claimed):
                 foreign = self.lenient_conn()
-                foreign.execute(
-                    f'INSERT INTO {REP.TABLE}({", ".join(REP.RUN_COLUMNS)}) '
-                    f"VALUES(" + ", ".join("?" for _ in REP.RUN_COLUMNS) + ")",
+                _insert_foreign(
+                    foreign,
                     _foreign_row(authority=claimed[0], is_authoritative=claimed[1]),
                 )
                 with self.assertRaises(REP.ResearchPersistenceError) as caught:
                     REP.recent_runs(foreign)
                 self.assertEqual(REP.REASON_CORRUPT_RECORD, caught.exception.reason)
+                # 该行完全自洽（含合法 fingerprint），所以拦下它的必须是**权威**那条检查，
+                # 而不是更早的一致性检查 —— 否则这条 guard 是空转的。
+                self.assertIn("outside research", str(caught.exception))
 
     def test_RPERSIST_25b_repository_never_becomes_a_signal_or_promotion_writer(self):
         """RPERSIST-25b：本层没有任何 signal / order / risk / promotion 写路径。"""
@@ -989,7 +1216,25 @@ class ResearchPersistenceBoundaryGuardTests(RepositoryTestCase):
 
 
 def _foreign_row(*, authority="research", is_authoritative=0):
-    """一行"合法 JSON、但自称权威"的记录（列序按 :data:`REP.RUN_COLUMNS`）。"""
+    """一行"**完全自洽**、但自称权威"的记录（列序按 :data:`REP.RUN_COLUMNS`）。
+
+    刻意做成自洽的（含合法的 ``record_hash``）：这样"不得自称 research 之外的权威"
+    才是真正被触发的那一条检查，而不是被更早的一致性 / 完整性检查顺手拦掉 ——
+    否则那条 guard 会变成空转。
+    """
+    hypothesis = {
+        "hypothesis_id": "H-1",
+        "as_of": DAY,
+        "subject": CODE,
+        "thesis": "t",
+        "status": ARC.HYPOTHESIS_SUPPORTED,
+        "reason": None,
+        "confidence": 0.5,
+        "authority": authority,
+        "is_authoritative": bool(is_authoritative),
+        "evidence_count": 0,
+        "evidence": [],
+    }
     values = {
         "id": 1,
         "purpose": "p",
@@ -997,23 +1242,47 @@ def _foreign_row(*, authority="research", is_authoritative=0):
         "hypothesis_id": "H-1",
         "as_of": DAY,
         "subject": CODE,
-        "status": "supported",
+        "status": ARC.HYPOTHESIS_SUPPORTED,
         "reason": None,
         "confidence": 0.5,
         "authority": authority,
         "is_authoritative": is_authoritative,
         "provider_slot": None,
         "provider_model": "",
-        "hypothesis": json.dumps({"hypothesis_id": "H-1"}, ensure_ascii=False),
+        "hypothesis": json.dumps(hypothesis, ensure_ascii=False),
         "narrative": "",
         "counter_arguments": json.dumps([]),
         "input_tokens": 0,
         "output_tokens": 0,
         "latency_ms": 0,
-        "record_hash": "h",
+        "record_hash": "",
         "created_at": CREATED_AT,
     }
+    values["record_hash"] = REP._record_hash(REP._hash_input(
+        purpose="p", trigger="t", hypothesis=hypothesis,
+        provider_slot=None, provider_model="", narrative="", counter_arguments=[],
+        input_tokens=0, output_tokens=0, latency_ms=0,
+    ))
     return tuple(values[name] for name in REP.RUN_COLUMNS)
+
+
+def _tamper(conn, run_id, **columns):
+    """直改库里的列，绕过本模块的写路径 —— 用于构造损坏 / 不自洽 / 指纹脱节的行。"""
+    assignments = ", ".join(f'"{name}"=?' for name in columns)
+    conn.execute(
+        f"UPDATE {REP.TABLE} SET {assignments} WHERE id=?",
+        [*columns.values(), run_id],
+    )
+
+
+def _insert_foreign(conn, values):
+    """把一行按 :data:`REP.RUN_COLUMNS` 列序插进（可能无 CHECK 的）同名表。"""
+    conn.execute(
+        f"INSERT INTO {REP.TABLE}("
+        + ", ".join(f'"{name}"' for name in REP.RUN_COLUMNS)
+        + ") VALUES(" + ", ".join("?" for _ in REP.RUN_COLUMNS) + ")",
+        values,
+    )
 
 
 def _source(name):

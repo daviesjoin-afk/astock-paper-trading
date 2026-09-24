@@ -1327,10 +1327,38 @@ CHECK(confidence BETWEEN 0 AND 1)      confidence 语义不越界
 CHECK(input_tokens/output_tokens/latency_ms >= 0)
 ```
 
-读路径还会**再校验一次** `authority` / `is_authoritative` 并 fail closed：schema 保证本
-模块写不出别的值，但持久化层不能假设**只有自己**写过这张表。一条自称权威的历史记录，
-绝不能被本层当成权威继续传播；投影里的 `is_authoritative` 因此**恒为** `false`，不会因为
-`status == supported` 变成真。
+投影里的 `is_authoritative` **恒为** `false`，不会因为 `status == supported` 变成真。
+
+### 读取时的存储自洽性与完整性
+
+读一条历史记录时做三道检查，**都不重新裁决 research** —— 它们只回答存储层面的问题：
+
+```text
+1. storage consistency   行内**重复字段**两份必须一致
+2. authority invariant   行不得自称 research 之外的权威
+3. integrity fingerprint 内容必须与持久化时的 record_hash 相符
+```
+
+第 1 条针对的是一个具体缺口：`status` / `reason` / `confidence` 既是判别列、又在
+hypothesis JSON 里各存一份，而 schema 的 `CHECK` 只约束 `authority` /
+`is_authoritative`。少了这一步，一条由别的 writer（或更早版本）写出的行完全可以是
+"hypothesis JSON 写 `insufficient_evidence`、判别列写 `supported`"，并被正常读成
+`supported` —— 数据库事实上就成了第二个 verdict authority。因此读取时逐一比对
+`hypothesis_id` / `as_of` / `subject` / `status` / `reason` / `confidence` /
+`authority` / `is_authoritative`，缺字段或不一致一律 `corrupt_research_record`。
+
+**这是 storage consistency check，不是第二套 research 判定。** 本层刻意**不**调用、
+也不重新实现 R27-A 的 `_derive_status()`：那会造出第二个 authority，正是本轮要根除的
+东西。它只问"这一行自己前后是否自洽"。
+
+第 3 条让 `record_hash` 的语义真正成立：没有它，把 `hypothesis` / `purpose` /
+`trigger` / `narrative` 任何一项改掉之后历史指纹已经失效，而读路径仍会返回这条记录。
+写路径与读路径**共用同一个 hash 输入定义**，避免两边漂移后把全部历史行误判成损坏。
+
+**它只是完整性指纹，不是防篡改签名。** 能写这张表的人可以同时改内容与 hash，那时读取
+会成功 —— 本层挡的是"内容与指纹脱节"（意外损坏、半次迁移、旧版本写入），不是敌意
+writer；更不构成"数据库能证明这条事实来自 owner"。这条限制由
+`test_RPERSIST_28` 的最后一段显式断言下来，而不是靠文档自觉。
 
 ### 不重新解释 evidence 维度
 
@@ -1374,8 +1402,10 @@ raw response。完整 provider-visible evidence input persistence 若未来需�
 contract。
 
 `record_hash` 是实际持久化内容的 SHA-256（stable JSON：`sort_keys` /
-`separators` / `allow_nan=False`），**不含** `created_at`（那是 operational persistence
-time，不是研究产物内容）、不含 DB `id`、不含 api key / `Authorization` / raw HTTP body。
+`separators` / `allow_nan=False`）。指纹**只排除两项**：`created_at`（operational
+persistence time，不是研究产物内容）与 DB `id`（自增主键不是产物身份）。其余**每一个被
+持久化的内容字段都参与**，包括 `trigger` —— `cli` 与 `scheduled` 是不同审计来源，必须
+得到不同指纹。也不含 api key / `Authorization` / raw HTTP body。
 
 ### 事务语义
 
@@ -1427,15 +1457,22 @@ dual-write —— 未来 B2B 迁某条 runtime 时必须**切换 writer owner**�
 签名里没有裁决参数）、RPERSIST-07 ~ 09（single_source / coverage_integrity / relation
 逐字保存）、RPERSIST-10 ~ 13（append-only 真成立、record_hash 覆盖研究内容且不含
 `created_at`）、RPERSIST-14（secret / raw prompt 无法到达本层）、RPERSIST-15 ~ 19（损坏
-行 fail closed、不回显损坏内容、`limit` 有界、顺序与过滤确定）、RPERSIST-20 ~ 25（无时钟、
-无网络、无 authority import、唯一 canonical writer、无改数据语句、投影恒非权威），加上
-guard 非空性用例。
+行 fail closed 且报出**哪一类**损坏、`limit` 有界、顺序与过滤确定）、RPERSIST-20 ~ 25
+（无时钟、无网络、无 authority import、唯一 canonical writer、无改数据语句、投影恒非
+权威）、RPERSIST-26 ~ 28（读路径的存储自洽性、`trigger` 进指纹、内容与 `record_hash`
+必须相符），加上 guard 非空性用例。
 
 语义 mutation 在 `work/r27b2a_research_persistence_mutation_check.py`：dict 冒充 typed
 hypothesis、`is_authoritative` 恒写 1、`authority` 固定成 `signal`、丢失
 `verification_method`、重算 `cross_source_verified`、INSERT 退化成 `INSERT OR REPLACE`、
-损坏 JSON 时 `except → {}`、`record_hash` 不再覆盖研究内容，必须全部 CAUGHT
+损坏 JSON 时 `except → {}`、`record_hash` 不再覆盖研究内容、判别列与 JSON 不一致仍被
+读出、`trigger` 不影响 hash、内容被改但旧指纹仍被读出，必须全部 CAUGHT
 （survived = 0、fake = 0、restore sha256 一致）。
+
+`RPERSIST-15` 刻意断言**报的是哪一类**损坏（JSON 非法 → ``not valid JSON``，而不是被后续
+检查顺手报成"缺字段"）。这个细节由 mutation 结构暴露：加上读路径自洽性检查之后，
+`except → {}` 这种 fail-open 写法会**被后面的检查掩盖住**，M-B2A-7 因此在第一版里
+SURVIVED。让回归具体到"是哪一道防线拦下的"，是它重新变成 CAUGHT 的原因。
 
 其中"唯一 writer"与"无改数据语句"两条 guard 由**扫描器**实现，因此扫描器本身也有非空性
 用例：它必须看得见 `f"INSERT INTO {TABLE} ..."` 这种 f-string 形式（真实写入口正是这种），
@@ -1490,7 +1527,9 @@ canonical research 台账出现改数据语句（R27-B2A：引用 ai_research_ru
 不得出现 UPDATE / DELETE / REPLACE / upsert / ON CONFLICT / DROP / ALTER）
 数据库 row 成为 research authority（R27-B2A：读投影 is_authoritative 恒为
 false；status / reason / authority 只能从 typed ResearchHypothesis 派生，
-调用方传不进来）
+调用方传不进来；行内重复字段与 hypothesis JSON 不一致即 fail closed）
+research 台账内容与完整性指纹脱节（R27-B2A：读取时重算 record_hash 并与存储值
+比较，不一致即 corrupt_research_record —— 完整性指纹，不是防篡改签名）
 research 持久化层读墙上时钟或持有网络依赖（R27-B2A：created_at 必须由调用方
 显式提供，as_of 与 created_at 必须分离）
 ```
