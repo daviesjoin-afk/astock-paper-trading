@@ -2110,29 +2110,66 @@ B2C-1 的 `ExecutionFactProjection` 只有 identity / lifecycle / verdict / PIT 
 ```text
 ExecutionFactProjection 新增（顺序即 EXECUTION_FACTUAL_FIELDS）
     code · action · requested_qty · filled_qty · fill_price · fees
+
+ExecutionFactProjection 新增（顺序即 EXECUTION_OWNER_FACT_FIELDS）
+    account_id · cycle_id                 （与既有 business_day / observed_at 同组）
 ```
 
-六条形态约束：
+#### 为什么 `account_id` / `cycle_id` 归 execution，而不是 portfolio
+
+它们是**跨 owner 的 join identity**，也是最容易被顺手推给下一步的一对字段：
+
+```text
+Execution owner:   这笔 order / fill 属于哪个 account / cycle
+Portfolio owner:   这个 account / cycle 在 D 日的 cash / positions / realized pnl / NAV
+```
+
+`execution_planner` 早已把"订单归属哪个 account、属于哪个 cycle"当成写入与成交的
+不变量，所以它属于 execution。若不在投影里发布，B2C-4C 只剩两条错路：
+
+```text
+order_id → 重新查 paper_orders → account_id / cycle_id
+    或
+依赖调用方"记得自己刚才按哪个 account 过滤"
+```
+
+两条都在 typed owner projection 之外重建一条事实来源。而旧 `_pnl_evidence()` 明确按账户
+归因、B2C-4B 的 portfolio fact 也以 `cycle_id / account_id / asof_day` 为上下文 ——
+缺了这两项，未来的跨 owner PnL join 无法完全由 typed facts 证明。
+
+读取路径也一并补齐：`execution_evidence.load_execution_evidence` 只读探测
+`paper_orders` 是否已有 `cycle_id` 列（它是后续迁移补上的），**没有就不请求它** ——
+选一个不存在的列会直接 `OperationalError`，而"owner 没有记录这条事实的周期归属"是应当
+如实发布的 `unknown`，不是读路径崩溃。也**不**回填：升级前的订单属于哪个周期无法从任何
+当前状态反推，该列的历史 NULL 正是诚实的 legacy provenance 状态。
+
+八条形态约束：
 
 ```text
 1. 唯一 authority     仍只有 ExecutionEvidence → ExecutionFactProjection。
                       刻意没有 ExecutionAttributionEvidence / TradeResearchEvidence /
-                      PnLExecutionEvidence / ExecutionResearchFact；
-                      execution_evidence.py 本轮未改动。
-2. 逐字派生           六个值直接复制 evidence 的同名 EvidenceField。不查 DB、
+                      PnLExecutionEvidence / ExecutionResearchFact。
+2. 逐字派生           六个成交事实直接复制 evidence 的同名 EvidenceField。不查 DB、
                       不重算价格/费用、不从 paper_orders 的兼容列补值。
                       回归用 assertIs 锁死"同一个对象"，因此"顺手重算一遍"会立刻变红。
-3. 真三态字段         __post_init__ 要求 isinstance + name 精确匹配；
-                      裸数字 / dict / duck-typed / 名字错位的真 EvidenceField 一律
-                      fail closed。known(0) 不退化成 0 也不变成 unknown。
-4. 不压平语义         as_dict() 写 EvidenceField.as_dict()，不写 maybe()。
-5. 指纹跟着扩展       adapter 的 _content_fingerprint 纳入六个字段 →
-                      同一 identity 下事实被改写即 EvidenceConflict，不再静默去重。
-6. detail 不膨胀      ResearchEvidenceRef.detail 仍只放 identity / 核验 / 指纹 /
-                      最小审计元数据；六个字段不复制进去。职责三分：
+3. 归属身份也由 owner 派生  account_id / cycle_id 取自订单行（provenance），同样三态、
+                      同样不由 caller 自述。缺失 / 不可证明 → unknown，
+                      **绝不**取"当前 active cycle / 当前账户 / 0 / None"做 fallback。
+4. 真三态字段         __post_init__ 要求 isinstance + name 精确匹配（八个字段逐一校验）；
+                      裸数字 / 裸字符串 / None / dict / duck-typed / 名字错位的真
+                      EvidenceField 一律 fail closed。known(0) 不退化成 0 也不变成 unknown。
+5. 不压平语义         as_dict() 写 EvidenceField.as_dict()，不写 maybe()。
+6. 指纹跟着扩展       adapter 的 _content_fingerprint 纳入这八个字段 →
+                      同一 identity 下事实被改写（含被搬到另一个 account / cycle）
+                      即 EvidenceConflict，不再静默去重。
+7. detail 不膨胀      ResearchEvidenceRef.detail 仍只放 identity / 核验 / 指纹 /
+                      最小审计元数据；八个字段都不复制进去。职责三分：
                           ExecutionFactProjection    owner factual truth
                           InformationEvent.payload   一次 research observation 投影（B2C-4C）
                           ResearchEvidenceRef        identity + verification + fingerprint
+8. execution_evidence.py 只改两处   provenance 带出 account_id / cycle_id；
+                      读路径探测 cycle_id 列。字段集、判定、核验结论**零改动**
+                      （这正是它仍只认识 orders + fills 的原因，见该模块的只读护栏）。
 ```
 
 #### 硬边界：`realized_pnl` / `NAV` / position cost 不进来
@@ -2149,6 +2186,9 @@ legacy `pnl_attribution` 确实读 `paper_orders.realized_pnl`，但它**不是�
 本段没有为了方便把它塞进 execution contract，也没有把改动扩大成"复制整份
 `ExecutionEvidence`"：`order_time` / `reject_reason` / `cancel_reason` / `available_qty` /
 `commission` / `slippage` 都**没有**加进投影。
+
+同样**没有**加进去的还有 market valuation 一侧的任何东西（市值 / NAV 的估值腿）：那属于
+R24 typed market fact，不是 portfolio owner 也不是 execution owner 能自述的事实。
 
 #### 核验语义与 PIT 语义零改动
 
@@ -2190,22 +2230,30 @@ market valuation authority   市值 / 未实现盈亏 / NAV 的估值腿
 #### 回归门禁（B2C-4A）
 
 `backend/test_execution_fact_contract.py`：EXFACT-20（六个字段逐个发布且与 owner 的
-`EvidenceField` **同一对象**、没有组合/记账事实混入）、EXFACT-21（真 `EvidenceField` +
-name 精确匹配，裸值 / dict / duck-typed / 名字错位一律 fail closed，且没有发明新 evidence
-词表）、EXFACT-22（`known` / `unknown` / `not_applicable` 三态逐字保留）、EXFACT-23
-（部分成交保留真实数量 / 加权价 / 费用）、EXFACT-24（确认未执行时 owner 的肯定性零与
-"不适用"各自保留，不互相伪装）、EXFACT-25（`as_dict` 保留完整三态，不用 `maybe()`）。
+`EvidenceField` **同一对象**、没有组合/记账事实混入）、EXFACT-21（**每个**已发布字段都是真
+`EvidenceField` + name 精确匹配，裸值 / dict / duck-typed / 名字错位一律 fail closed，且没有
+发明新 evidence 词表）、EXFACT-22（`known` / `unknown` / `not_applicable` 三态逐字保留）、
+EXFACT-23（部分成交保留真实数量 / 加权价 / 费用）、EXFACT-24（确认未执行时 owner 的肯定性零
+与"不适用"各自保留，不互相伪装）、EXFACT-25（`as_dict` 保留完整三态，不用 `maybe()`）、
+EXFACT-26（归属身份 `account_id` / `cycle_id` 由 owner 订单行发布；与 `EE.FACT_FIELDS`
+逐字一致；没有变成 `ExecutionEvidence` 的证据字段）、EXFACT-27（缺 account / cycle 时如实报
+`unknown`；`0` / `True` / `8.5` / `"8"` 等不可证明值同样 unknown；缺一个不影响另一个）。
 
 `backend/test_ai_research_execution_adapter.py`：EXEC-REF-21 ~ 23（同一 identity 下
 `filled_qty` / `fill_price` / `fees` 被改写 → `EvidenceConflict`；每对投影只差那**一个**
 字段，夹具自带隔离自检）、EXEC-REF-24（新增事实**不**参与核验语义：`canonical()` 逐字相同，
 `fact_state` 的差异只来自内容指纹）、EXEC-REF-25（`load_execution_evidence` 的只读口 →
-`fact_projection` → adapter 全链路，且 `detail` 不复制事实 payload）。
+`fact_projection` → adapter 全链路，且 `detail` 不复制事实 payload）、EXEC-REF-26 ~ 27
+（同一 identity 下 `account_id` / `cycle_id` 被改写 → `EvidenceConflict`）、EXEC-REF-28
+（真实读路径保留 account / cycle provenance；**没有** `cycle_id` 列的 legacy 账本照常可读
+且如实报 `unknown`）。
 
 语义 mutation 在 `work/r27b2c4a_execution_attribution_mutation_check.py`：投影丢弃
-`filled_qty` / `fees`、`as_dict` 用 `maybe()` 压平三态、指纹忽略 `filled_qty` /
-`fill_price` / `fees`、owner 的 `known(0)` 被降级成 `unknown`、owner 的 `not_applicable`
-被伪造成 `known(0)` —— 必须全部 CAUGHT（survived = 0、fake = 0、restore sha256 一致）。
+`filled_qty` / `fees` / `account_id`、`as_dict` 用 `maybe()` 压平三态、指纹忽略 `filled_qty` /
+`fill_price` / `fees` / `cycle_id`、owner 的 `known(0)` 被降级成 `unknown`、owner 的
+`not_applicable` 被伪造成 `known(0)` —— 必须全部 CAUGHT（survived = 0、fake = 0、
+restore sha256 一致）。矩阵用 `--non-vacuity` 跑：每条先跑 baseline，因此**目标用例路径写错
+会被报成 BASELINE-RED 而不是静默通过**。
 
 #### 架构面：中性
 

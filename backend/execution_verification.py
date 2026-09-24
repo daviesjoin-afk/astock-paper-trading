@@ -703,6 +703,20 @@ EXECUTION_FACTUAL_FIELDS = (
     "code", "action", "requested_qty", "filled_qty", "fill_price", "fees",
 )
 
+#: 投影发布的 owner **事实元数据**字段，顺序固定。
+#:
+#: 它们与 :data:`EXECUTION_FACTUAL_FIELDS` 的区别是回答的问题不同：那六个说"这笔委托
+#: 成交了多少"，这四个说"这条 execution fact 属于谁、发生在哪一天、什么时候被观测到"。
+#:
+#: ``account_id`` / ``cycle_id`` 是跨 owner 的 PnL join identity，**属于 execution owner**：
+#: ``execution_planner`` 早已把"订单归属哪个 account / 属于哪个 cycle"当成写入与成交的
+#: 不变量。portfolio owner 拥有的是"某个 account/cycle 在某日的 cash / positions /
+#: realized pnl / NAV"，不是"这笔成交属于谁"。因此不能把它推给 portfolio 那一侧。
+#:
+#: 四个字段都是三态、都由 owner 记录派生，缺失即 ``unknown``：绝不用"当前 active cycle /
+#: 当前账户 / 0 / None 当 known"做 fallback —— 那会把一条历史事实搬到它不属于的地方。
+EXECUTION_OWNER_FACT_FIELDS = ("account_id", "cycle_id", "business_day", "observed_at")
+
 #: identity 的来源。审计必须看得见"这条身份是怎么来的"，否则一个字符串无法复核。
 IDENTITY_KIND_FILL_EVENT_KEY = "fill_event_key"
 IDENTITY_KIND_FILL_EVENT_KEY_SET = "fill_event_key_set"
@@ -919,6 +933,48 @@ def _single_value(field_name: str, values: Any, *, subject: str,
     )
 
 
+def _order_fact(field_name: str, value: Any, *, subject: str, validator: Any) -> EE.EvidenceField:
+    """一条**委托级** owner fact 的三态判定（不是逐成交聚合出来的）。
+
+    与 :func:`_single_value` 的区别是它只有一个来源行：订单行自己记的归属身份要么有、
+    要么没有，不存在"多个成交给出不同取值"那种聚合歧义。因此判定只有两条：
+
+    * 有值且格式可证明 → ``known``；
+    * 没有记录（列不存在 / NULL / 空串），或记录的格式不可证明 → ``unknown``。
+
+    ``unknown`` 就是终点。这里**不**去查 ``paper_accounts.cycle_id``、不取"当前 active
+    cycle"、不取账户当前绑定，也**不**用 ``0`` / ``None`` 冒充一个 known 值 —— 升级前的
+    成交属于哪个周期若 owner 没有记，就无法从任何**当前**状态反推；假装知道比报
+    ``unknown`` 危险得多（它会让一条历史事实出现在一个它并不属于的 account/cycle 上）。
+    """
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return EE.EvidenceField.unknown(
+            field_name, source=EXECUTION_VERIFICATION_SCOPE,
+            detail="the order row records no %s for this execution fact" % subject,
+        )
+    if not validator(value):
+        return EE.EvidenceField.unknown(
+            field_name, source=EXECUTION_VERIFICATION_SCOPE,
+            detail="the recorded %s is not a provable value: %r" % (subject, value),
+        )
+    return EE.EvidenceField.known(field_name, value, source=EXECUTION_VERIFICATION_SCOPE)
+
+
+def _is_account_id(value: Any) -> bool:
+    """账户身份必须是**非空文本**：账户 id 是 ``paper_accounts`` 的 TEXT 主键。"""
+    return isinstance(value, str) and bool(value.strip())
+
+
+def _is_cycle_id(value: Any) -> bool:
+    """周期身份必须是**正整数**。
+
+    ``0`` 不是合法 cycle id（自增主键从 1 起），``True`` 也不是 ``1`` —— 判断身份时不
+    允许布尔量混进来，否则 ``cycle_id=True`` 会被发布成 ``known(1)``，指向一个真实存在的
+    周期。两种情形都报 ``unknown``。
+    """
+    return isinstance(value, int) and not isinstance(value, bool) and value > 0
+
+
 @dataclass(frozen=True, slots=True, init=False)
 class ExecutionFactProjection:
     """execution owner 对**一条 execution fact** 的正式投影。
@@ -943,6 +999,12 @@ class ExecutionFactProjection:
     :class:`execution_evidence.ExecutionEvidence`：投影只发布，不重算成交数量/价格/费用。
     ``as_dict()`` 写的是 ``EvidenceField.as_dict()`` 而不是 ``maybe()`` —— ``maybe()``
     会把 ``unknown`` 与 ``not_applicable`` 一起压成 ``None``，那正是本契约要区分的三态。
+
+    :data:`EXECUTION_OWNER_FACT_FIELDS` 里的 ``account_id`` / ``cycle_id`` 是**跨 owner 的
+    join identity**：这条 execution fact 属于哪个 account / cycle 由 execution owner 拥有
+    （``execution_planner`` 早已把它当成写入与成交的不变量），portfolio owner 拥有的是
+    "某个 account/cycle 在某日的现金 / 持仓 / 已实现盈亏 / NAV"。因此不能让 B2C-4C 的消费者
+    重新查 ``paper_orders`` 去补这两个字段，也不能把它们推给 portfolio 那一侧。
     """
 
     version: str
@@ -957,6 +1019,8 @@ class ExecutionFactProjection:
     filled_qty: EE.EvidenceField
     fill_price: EE.EvidenceField
     fees: EE.EvidenceField
+    account_id: EE.EvidenceField
+    cycle_id: EE.EvidenceField
     business_day: EE.EvidenceField
     observed_at: EE.EvidenceField
     verification: Mapping
@@ -980,7 +1044,7 @@ class ExecutionFactProjection:
             raise ExecutionFactContractError("unknown_identity_kind", str(self.identity_kind))
         if not str(self.identity or "").strip():
             raise ExecutionFactContractError("alien_identity", "identity must be non-empty")
-        for name in EXECUTION_FACTUAL_FIELDS + ("business_day", "observed_at"):
+        for name in EXECUTION_FACTUAL_FIELDS + EXECUTION_OWNER_FACT_FIELDS:
             holder = getattr(self, name)
             if not isinstance(holder, EE.EvidenceField) or holder.name != name:
                 raise ExecutionFactContractError(
@@ -1030,6 +1094,8 @@ class ExecutionFactProjection:
             "filled_qty": self.filled_qty.as_dict(),
             "fill_price": self.fill_price.as_dict(),
             "fees": self.fees.as_dict(),
+            "account_id": self.account_id.as_dict(),
+            "cycle_id": self.cycle_id.as_dict(),
             "business_day": self.business_day.as_dict(),
             "observed_at": self.observed_at.as_dict(),
             "verification": dict(self.verification or {}),
@@ -1097,6 +1163,16 @@ def fact_projection(evidence: Any, *, fill_rows_present: bool = True) -> Executi
         filled_qty=evidence.filled_qty,
         fill_price=evidence.fill_price,
         fees=evidence.fees,
+        # 归属身份（B2C-4A）：这条 execution fact 属于哪个 account / cycle。全部由 owner
+        # 记录的订单行派生，缺失即 unknown —— 不查"当前 active cycle"，也不回填 legacy 行。
+        account_id=_order_fact(
+            "account_id", provenance.get("account_id"), subject="account",
+            validator=_is_account_id,
+        ),
+        cycle_id=_order_fact(
+            "cycle_id", provenance.get("cycle_id"), subject="cycle",
+            validator=_is_cycle_id,
+        ),
         business_day=_single_value(
             "business_day", provenance.get("fill_sessions"), subject="a fill business date",
             recorded_rows=provenance.get("fill_session_rows"), usable_rows=usable,

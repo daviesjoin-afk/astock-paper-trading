@@ -1,22 +1,22 @@
 # -*- coding: utf-8 -*-
-"""R27-B2C-4A mutation matrix —— M-EXATTR-1 .. M-EXATTR-8。
+"""R27-B2C-4A mutation matrix —— M-EXATTR-1 .. M-EXATTR-10。
 
 只覆盖本轮**新的高风险 invariant**。每条 mutation 都必须让唯一指定的永久回归变 RED，
 anchor 恰好命中一次；``--non-vacuity`` 先跑 baseline，``SyntaxError`` / ``ImportError`` /
 ``NameError`` 一律计为 FAKE（接线错误是假杀，不能算 caught）。
 
-本轮的核心不变量分三组：
+本轮的核心不变量分四组：
 
-* **事实必须真的从 owner 到达投影**（M-EXATTR-1 / 2 / 8）：``filled_qty`` 或 ``fees``
-  在投影里被替换成别的值（unknown / known zero），意味着 owner 已经发布的事实被本层
-  重新解释 —— 那正是 B2C-4A 要根除的东西；而把 owner 的 ``not_applicable`` 伪造成
-  ``known(0)`` 是**发明**一笔零元费用。
+* **事实必须真的从 owner 到达投影**（M-EXATTR-1 / 2 / 8 / 9）：``filled_qty`` / ``fees`` /
+  ``account_id`` 在投影里被替换成别的值（unknown / known zero / 常量账户），意味着 owner
+  已经发布的事实被本层重新解释 —— 那正是 B2C-4A 要根除的东西；而把 owner 的
+  ``not_applicable`` 伪造成 ``known(0)`` 是**发明**一笔零元费用。
 * **三态不许被压平**（M-EXATTR-3）：``as_dict`` 退回 ``maybe()`` 会让 ``unknown`` 与
   ``not_applicable`` 一起变成 ``None``，于是下游再也分不清"我们不知道成交了多少"与
   "这笔委托从未提交、这个问题不存在"。
-* **内容变了必须报冲突**（M-EXATTR-4 / 5 / 6）：指纹忽略 ``filled_qty`` / ``fill_price`` /
-  ``fees`` 中的任何一个，同一条 execution identity 下被改写的成交就会被静默去重，
-  研究结论可以悄悄换掉依据。
+* **内容变了必须报冲突**（M-EXATTR-4 / 5 / 6 / 10）：指纹忽略 ``filled_qty`` /
+  ``fill_price`` / ``fees`` / ``cycle_id`` 中的任何一个，同一条 execution identity 下被
+  改写的成交就会被静默去重，研究结论可以悄悄换掉依据、甚至落到错误的周期上。
 * **确认未执行的肯定性零不许被降级**（M-EXATTR-7）：owner 发布 ``known(0)`` 时把它变成
   ``unknown``，等于把一个肯定的事实说成"不知道"。
 
@@ -47,15 +47,23 @@ CONTRACT_SUITE = "test_execution_fact_contract"
 ADAPTER_SUITE = "test_ai_research_execution_adapter"
 
 COMPLETENESS = f"{CONTRACT_SUITE}.AttributionFactCompletenessTests"
+OWNERSHIP = f"{CONTRACT_SUITE}.OwnershipIdentityTests"
 FINGERPRINT = f"{ADAPTER_SUITE}.AttributionFactFingerprintTests"
 
 #: 投影逐字复制 owner 字段的那两行 —— 多个 mutation 共用同一个 anchor（各自独立运行）。
 FILLED_QTY_LINE = "        filled_qty=evidence.filled_qty,\n"
 FEES_LINE = "        fees=evidence.fees,\n"
+ACCOUNT_ID_LINE = (
+    '        account_id=_order_fact(\n'
+    '            "account_id", provenance.get("account_id"), subject="account",\n'
+    "            validator=_is_account_id,\n"
+    "        ),\n"
+)
 PROJECTED_FILLED_QTY_LINE = '            "filled_qty": self.filled_qty.as_dict(),\n'
 FINGERPRINT_FILLED_QTY_LINE = '        "filled_qty": projection.filled_qty.as_dict(),\n'
 FINGERPRINT_FILL_PRICE_LINE = '        "fill_price": projection.fill_price.as_dict(),\n'
 FINGERPRINT_FEES_LINE = '        "fees": projection.fees.as_dict(),\n'
+FINGERPRINT_CYCLE_ID_LINE = '        "cycle_id": projection.cycle_id.as_dict(),\n'
 
 MUTATIONS = [
     {
@@ -147,6 +155,32 @@ MUTATIONS = [
         "test": f"{COMPLETENESS}."
                 "test_EXFACT_24_a_confirmed_non_execution_is_not_padded_with_known_zeros",
         "desc": "owner 的 not_applicable fees 被伪造成 known(0)",
+    },
+    {
+        "id": "M-EXATTR-9",
+        # 投影不再发布归属账户：跨 owner 的 PnL join 键消失。
+        "file": VERIFICATION,
+        "old": ACCOUNT_ID_LINE,
+        "new": (
+            "        account_id=(  # MUTANT —— 归属账户不再由 owner 记录派生\n"
+            '            EE.EvidenceField.unknown("account_id")\n'
+            "            if not provenance.get(\"account_id\")\n"
+            '            else EE.EvidenceField.known("account_id", "active")\n'
+            "        ),\n"
+        ),
+        "test": f"{OWNERSHIP}."
+                "test_EXFACT_26_the_ownership_identity_is_published_from_the_owner_order_row",
+        "desc": "投影不再发布 owner 记录的 account_id（改成常量/unknown）",
+    },
+    {
+        "id": "M-EXATTR-10",
+        # 指纹忽略周期：同一条成交被搬到另一个周期会被静默接受。
+        "file": ADAPTER,
+        "old": FINGERPRINT_CYCLE_ID_LINE,
+        "new": "",
+        "test": f"{FINGERPRINT}."
+                "test_EXEC_REF_27_a_changed_cycle_is_a_conflict",
+        "desc": "内容指纹忽略 cycle_id",
     },
 ]
 

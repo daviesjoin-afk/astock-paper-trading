@@ -23,6 +23,8 @@
                       部分成交不美化
     EXFACT-24        确认未执行时，owner 的肯定性零与"不适用"都不被伪造成 known zero
     EXFACT-25        ``as_dict`` 保留完整三态语义（不用 ``maybe()`` 把三态压成 ``None``）
+    EXFACT-26 ~ 27   B2C-4A：归属身份（``account_id`` / ``cycle_id``）由 owner 订单行发布，
+                      缺失即 ``unknown``，绝不用"当前周期 / 当前账户 / 0 / None" fallback
 
 全部离线：只用 ``evidence_from_order`` 的纯函数路径，不连数据库。
 """
@@ -153,6 +155,28 @@ def _evidence(order=None, fills=(), **kwargs):
 
 def _projection(order=None, fills=(), **kwargs):
     return EV.fact_projection(_evidence(order, fills, **kwargs))
+
+
+def _all_projection_fields(projection) -> dict:
+    """``_issue_fact_projection`` 需要的**全部**输入字段，逐字取自一条真投影。
+
+    集中一处，避免契约新增字段时只有部分用例被更新：漏掉一个字段会让那些用例在
+    ``getattr`` 上炸掉，而"非空性"断言（"合法字段本身必须被接受"）会在别的用例上
+    静默失效。
+    """
+    fields = {
+        "version": projection.version,
+        "identity": projection.identity,
+        "identity_kind": projection.identity_kind,
+        "order_id": projection.order_id,
+        "lifecycle_state": projection.lifecycle_state,
+        "fill_verdict": projection.fill_verdict,
+        "verification": dict(projection.verification),
+        "inconsistencies": projection.inconsistencies,
+    }
+    for name in EV.EXECUTION_FACTUAL_FIELDS + EV.EXECUTION_OWNER_FACT_FIELDS:
+        fields[name] = getattr(projection, name)
+    return fields
 
 
 class OwnerNativeVerificationTests(unittest.TestCase):
@@ -297,15 +321,7 @@ class FailClosedTests(unittest.TestCase):
     def test_EXFACT_08_illegal_projections_are_rejected(self):
         """EXFACT-08：版本 / 范围 / 字段类型不符一律 fail closed。"""
         base = _projection(fills=(_fill(event_key=KEY_A),))
-        good = {
-            "version": base.version, "identity": base.identity,
-            "identity_kind": base.identity_kind, "order_id": base.order_id,
-            "lifecycle_state": base.lifecycle_state, "fill_verdict": base.fill_verdict,
-            "code": base.code, "action": base.action, "requested_qty": base.requested_qty,
-            "filled_qty": base.filled_qty, "fill_price": base.fill_price, "fees": base.fees,
-            "business_day": base.business_day, "observed_at": base.observed_at,
-            "verification": base.verification, "inconsistencies": base.inconsistencies,
-        }
+        good = _all_projection_fields(base)
 
         cases = (
             ("version_mismatch", {"version": "execution-fact-v0"}),
@@ -314,6 +330,8 @@ class FailClosedTests(unittest.TestCase):
             ("field_not_an_evidence_field", {"business_day": DAY}),
             ("field_not_an_evidence_field", {"observed_at": EE.EvidenceField.known("code", "x")}),
             ("field_not_an_evidence_field", {"filled_qty": 100}),
+            ("field_not_an_evidence_field", {"account_id": "acct"}),
+            ("field_not_an_evidence_field", {"cycle_id": 8}),
             ("field_not_an_evidence_field", {"fees": EE.EvidenceField.known("commission", 5.0)}),
             ("alien_verification_scope", {"verification": {"verification_scope": "market_data"}}),
             ("unknown_verification_status", {"verification": {
@@ -446,15 +464,7 @@ class InputBoundaryTests(unittest.TestCase):
         "这是一条已发布的裁决"。
         """
         base = _projection(fills=(_fill(event_key=KEY_A),))
-        good = {
-            "version": base.version, "identity": base.identity,
-            "identity_kind": base.identity_kind, "order_id": base.order_id,
-            "lifecycle_state": base.lifecycle_state, "fill_verdict": base.fill_verdict,
-            "code": base.code, "action": base.action, "requested_qty": base.requested_qty,
-            "filled_qty": base.filled_qty, "fill_price": base.fill_price, "fees": base.fees,
-            "business_day": base.business_day, "observed_at": base.observed_at,
-            "verification": dict(base.verification), "inconsistencies": base.inconsistencies,
-        }
+        good = _all_projection_fields(base)
 
         tampered = {
             "wrong version": {"verification_version": "fake-version"},
@@ -638,7 +648,10 @@ class SingleSourceTests(unittest.TestCase):
         for fact_field in EE.FACT_FIELDS:
             with self.subTest(field=fact_field):
                 self.assertNotIn(fact_field, names)
-        self.assertEqual(("business_day", "observed_at"), EE.FACT_FIELDS)
+        # owner fact 词表 = owner 发布的归属身份 + PIT（B2C-4A 起含 account / cycle）。
+        # 两个常量必须逐字一致：投影发布的事实元数据不允许与 owner 登记的词表漂移。
+        self.assertEqual(("account_id", "cycle_id", "business_day", "observed_at"), EE.FACT_FIELDS)
+        self.assertEqual(EE.FACT_FIELDS, EV.EXECUTION_OWNER_FACT_FIELDS)
 
 
 class AttributionFactCompletenessTests(unittest.TestCase):
@@ -693,23 +706,17 @@ class AttributionFactCompletenessTests(unittest.TestCase):
             with self.subTest(excluded=excluded):
                 self.assertNotIn(excluded, keys)
 
-    def test_EXFACT_21_every_factual_field_must_be_a_correctly_named_evidence_field(self):
-        """EXFACT-21：六个字段必须是真 ``EvidenceField`` 且 name 精确匹配。
+    def test_EXFACT_21_every_published_field_must_be_a_correctly_named_evidence_field(self):
+        """EXFACT-21：契约发布的每个字段都必须是真 ``EvidenceField`` 且 name 精确匹配。
 
-        裸数字 / dict / duck-typed 对象 / **名字错位的真 EvidenceField** 一律 fail closed。
-        名字错位这一条最要紧：``EvidenceField.known("commission", 5.0)`` 装进 ``fees``
-        会让"这笔成交的总费用"伪装成"佣金"，而下游只会看到"这是一个已发布的三态字段"。
+        覆盖成交事实与 owner 事实元数据（含归属身份 ``account_id`` / ``cycle_id``）。
+        裸数字 / 裸字符串 / ``None`` / dict / duck-typed 对象 / **名字错位的真
+        EvidenceField** 一律 fail closed。名字错位这一条最要紧：
+        ``EvidenceField.known("commission", 5.0)`` 装进 ``fees`` 会让"这笔成交的总费用"
+        伪装成"佣金"，而下游只会看到"这是一个已发布的三态字段"。
         """
         base = _projection(fills=(_fill(event_key=KEY_A),))
-        good = {
-            "version": base.version, "identity": base.identity,
-            "identity_kind": base.identity_kind, "order_id": base.order_id,
-            "lifecycle_state": base.lifecycle_state, "fill_verdict": base.fill_verdict,
-            "code": base.code, "action": base.action, "requested_qty": base.requested_qty,
-            "filled_qty": base.filled_qty, "fill_price": base.fill_price, "fees": base.fees,
-            "business_day": base.business_day, "observed_at": base.observed_at,
-            "verification": base.verification, "inconsistencies": base.inconsistencies,
-        }
+        good = _all_projection_fields(base)
 
         class DuckTyped:
             """长得像 EvidenceField 的普通对象：``isinstance`` 必须挡住它。"""
@@ -722,31 +729,32 @@ class AttributionFactCompletenessTests(unittest.TestCase):
             def as_dict(self):
                 return {"state": self.state, "value": self.value}
 
-        for name in EV.EXECUTION_FACTUAL_FIELDS:
-            wrong_name = "commission" if name != "commission" else "fees"
+        published = EV.EXECUTION_FACTUAL_FIELDS + EV.EXECUTION_OWNER_FACT_FIELDS
+        for field_name in published:
+            other = "code" if field_name != "code" else "fees"
             for label, bad in (
                 ("bare number", 100),
                 ("bare string", "600001"),
                 ("bare None", None),
                 ("plain dict", {"state": EE.EVIDENCE_KNOWN, "value": 100}),
-                ("duck typed", DuckTyped(name)),
-                ("wrong field name", EE.EvidenceField.known(wrong_name, 5.0)),
+                ("duck typed", DuckTyped(field_name)),
+                ("wrong field name", EE.EvidenceField.known(other, 5.0)),
             ):
-                with self.subTest(field=name, case=label):
+                with self.subTest(field=field_name, case=label):
                     with self.assertRaises(EV.ExecutionFactContractError) as caught:
-                        EV._issue_fact_projection(**{**good, name: bad})
+                        EV._issue_fact_projection(**{**good, field_name: bad})
                     self.assertEqual(
                         "field_not_an_evidence_field", caught.exception.reason,
                     )
 
-        # 非空性：六个合法字段本身必须被接受，否则上面只是在证明"全都拒绝"。
+        # 非空性：全部合法字段必须被接受，否则上面只是在证明"全都拒绝"。
         self.assertIsInstance(
             EV._issue_fact_projection(**good), EV.ExecutionFactProjection,
         )
-        # 也没有发明新的 evidence 词表：六个名字都是 owner 已登记的字段。
-        for name in EV.EXECUTION_FACTUAL_FIELDS:
-            with self.subTest(registered=name):
-                self.assertIn(name, EE.KNOWN_EVIDENCE_FIELD_NAMES)
+        # 也没有发明新的 evidence 词表：每个名字都是 owner 已登记的字段。
+        for field_name in published:
+            with self.subTest(registered=field_name):
+                self.assertIn(field_name, EE.KNOWN_EVIDENCE_FIELD_NAMES)
 
     def test_EXFACT_22_known_unknown_and_not_applicable_survive_verbatim(self):
         """EXFACT-22：``known`` / ``unknown`` / ``not_applicable`` 三态逐字保留。
@@ -886,6 +894,113 @@ class AttributionFactCompletenessTests(unittest.TestCase):
         self.assertNotEqual(
             unknown.as_dict()["filled_qty"], not_attempted.as_dict()["filled_qty"],
         )
+
+
+class OwnershipIdentityTests(unittest.TestCase):
+    """EXFACT-26 ~ 27 —— B2C-4A：归属身份由 execution owner 发布，缺失即 unknown。
+
+    这条不变量是：**这条 execution fact 属于哪个 account / cycle 由 owner 记录，不由
+    消费者回查、也不由"当前周期"推断。**
+
+    旧 ``pnl_attribution`` 按账户归因，B2C-4B 的 portfolio fact 也以
+    ``cycle_id / account_id / asof_day`` 为上下文。若 execution 投影不发布这两项，
+    B2C-4C 只剩两条路：``order_id → 重新查 paper_orders``，或依赖调用方"记得自己刚才按
+    哪个 account 过滤" —— 两者都在 typed owner projection 之外重建一条事实来源。
+    """
+
+    def test_EXFACT_26_the_ownership_identity_is_published_from_the_owner_order_row(self):
+        """EXFACT-26：``account_id`` / ``cycle_id`` 从 owner 的订单行发布。"""
+        projection = _projection(
+            _order(account_id="acct", cycle_id=8), fills=(_fill(event_key=KEY_A),),
+        )
+        self.assertEqual(EE.EVIDENCE_KNOWN, projection.account_id.state)
+        self.assertEqual(EE.EVIDENCE_KNOWN, projection.cycle_id.state)
+        self.assertEqual("acct", projection.account_id.require())
+        self.assertEqual(8, projection.cycle_id.require())
+
+        # 与 owner 自己登记的事实词表逐字一致（不多不少、不漂移）。
+        self.assertEqual(EE.FACT_FIELDS, EV.EXECUTION_OWNER_FACT_FIELDS)
+        self.assertEqual(
+            ("account_id", "cycle_id", "business_day", "observed_at"),
+            EV.EXECUTION_OWNER_FACT_FIELDS,
+        )
+
+        # 进了投影输出，但**没有**成为 ExecutionEvidence 的证据字段：
+        # 归属身份不是"这笔委托成交了多少"，硬塞会波及 fill_verdict / inconsistencies。
+        payload = projection.as_dict()
+        for name in ("account_id", "cycle_id"):
+            with self.subTest(name=name):
+                self.assertIn(name, payload)
+                self.assertNotIn(name, EE.ALL_EVIDENCE_FIELDS)
+                self.assertNotIn(name, EE.EXECUTION_EVIDENCE_FIELDS)
+
+        # 不同账户 / 不同周期是不同的 join identity。
+        other = _projection(
+            _order(account_id="acct2", cycle_id=8), fills=(_fill(event_key=KEY_A),),
+        )
+        self.assertNotEqual(projection.account_id, other.account_id)
+        self.assertNotEqual(
+            projection.account_id.as_dict(), other.account_id.as_dict(),
+        )
+        self.assertEqual(projection.cycle_id, other.cycle_id)
+
+        # 投影不可变：拿到一条合法投影的人不能改掉归属。
+        with self.assertRaises(dataclasses.FrozenInstanceError):
+            projection.account_id = EE.EvidenceField.known("account_id", "forged")
+
+        # 六个成交事实与未动过的 PIT 语义都还在（这是 additive，不是替换）。
+        self.assertEqual(100, projection.filled_qty.require())
+        self.assertEqual(DAY, projection.business_day.require())
+
+    def test_EXFACT_27_a_missing_ownership_identity_is_never_invented(self):
+        """EXFACT-27：缺 account / cycle 时如实报 ``unknown``，绝不 fallback。
+
+        三条 fallback 全是**发明**：取"当前 active cycle"、取账户当前绑定的周期、用
+        ``0`` / ``None`` 冒充一个 known 值。它们会让一条历史成交出现在一个它并不属于的
+        账户/周期上，而跨 owner 的 PnL 归因正是按这两列 join 的。
+        """
+        # (a) 订单行根本没有这两项（key 不存在 / 值为 NULL）。
+        absent = _order()
+        absent.pop("account_id")
+        no_account = _projection(absent, fills=(_fill(event_key=KEY_A),))
+        self.assertEqual(EE.EVIDENCE_UNKNOWN, no_account.account_id.state)
+        self.assertIsNone(no_account.account_id.value)
+
+        for missing in (None, "", "   "):
+            with self.subTest(account_id=repr(missing)):
+                null_account = _projection(
+                    _order(account_id=missing), fills=(_fill(event_key=KEY_A),),
+                )
+                self.assertEqual(EE.EVIDENCE_UNKNOWN, null_account.account_id.state)
+        for missing in (None, "", 0, "8"):
+            with self.subTest(cycle_id=repr(missing)):
+                null_cycle = _projection(
+                    _order(cycle_id=missing), fills=(_fill(event_key=KEY_A),),
+                )
+                self.assertEqual(EE.EVIDENCE_UNKNOWN, null_cycle.cycle_id.state)
+                self.assertIsNone(null_cycle.cycle_id.value)
+
+        # (b) 记录的格式不可证明 → 同样 unknown，不猜一个"最像的"周期。
+        #     ``0`` 不是合法 cycle id（自增主键从 1 起），``True`` 也不是 ``1``。
+        for unprovable in (True, False, -1, 8.5, "8", [8], {"id": 8}):
+            with self.subTest(cycle_id=repr(unprovable)):
+                bad = _projection(
+                    _order(cycle_id=unprovable), fills=(_fill(event_key=KEY_A),),
+                )
+                self.assertEqual(EE.EVIDENCE_UNKNOWN, bad.cycle_id.state)
+                self.assertIsNone(bad.cycle_id.value)
+
+        # (c) 默认形态下 account 有记录、cycle 没有 —— 两者必须各自成立，
+        #     缺一个**不**影响另一个，也**不**让谁变成 known(0) / known(None)。
+        mixed = _projection(fills=(_fill(event_key=KEY_A),))
+        self.assertEqual(EE.EVIDENCE_KNOWN, mixed.account_id.state)
+        self.assertEqual("acct", mixed.account_id.require())
+        self.assertEqual(EE.EVIDENCE_UNKNOWN, mixed.cycle_id.state)
+        self.assertIsNone(mixed.cycle_id.value)
+
+        # 归属身份缺失**不**影响 PIT 与成交事实：那是三个独立的问题。
+        self.assertEqual(DAY, mixed.business_day.require())
+        self.assertEqual(100, mixed.filled_qty.require())
 
 
 if __name__ == "__main__":

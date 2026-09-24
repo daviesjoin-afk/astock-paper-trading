@@ -382,29 +382,68 @@ B2C-4A 只关闭这个缺口，方式是**扩展既有投影**：
 ```text
 ExecutionFactProjection 新增（顺序即 EXECUTION_FACTUAL_FIELDS）
     code · action · requested_qty · filled_qty · fill_price · fees
+
+ExecutionFactProjection 新增（顺序即 EXECUTION_OWNER_FACT_FIELDS）
+    account_id · cycle_id                 （与既有 business_day / observed_at 同组）
 ```
 
-六条形态约束：
+#### 为什么 account_id / cycle_id 必须归 execution（不能推给 B2C-4B）
+
+它们是**跨 owner 的 join identity**：
+
+```text
+Execution owner:   这笔 order / fill 属于哪个 account / cycle
+Portfolio owner:   这个 account / cycle 在 D 日的 cash / positions / realized pnl / NAV
+```
+
+前者属于 execution：`execution_planner` 早已把"订单归属哪个 account、属于哪个 cycle"当成
+写入与成交的不变量。若不发布，B2C-4C 只能二选一：
+
+```text
+order_id → 重新查 paper_orders → account_id / cycle_id
+    或
+依赖调用方"记得自己刚才按哪个 account 过滤"
+```
+
+两条都在 typed owner projection 之外重建一条事实来源。而旧 `_pnl_evidence()` 明确按账户
+归因、B2C-4B 的 portfolio fact 也以 `cycle_id / account_id / asof_day` 为上下文 ——
+缺这两项，跨 owner 的 PnL join 无法完全由 typed facts 证明。
+
+因此 `execution_evidence.py` 本轮改了**两处**（不是零处）：
+
+```text
+evidence_from_order()        provenance 带出 account_id / cycle_id（原样，不校验、不补值）
+load_execution_evidence()    只读探测 paper_orders 是否已有 cycle_id 列；
+                             没有就不请求它 → 该事实的周期归属如实报 unknown（不崩、不回填）
+```
+
+字段集、`fill_verdict`、`inconsistencies`、核验结论**零改动** —— 这也是该模块的只读护栏
+（"证据模块只认识 orders + fills"）仍然成立的原因。
+
+十条形态约束：
 
 1. **不新增第二套 execution fact。** 刻意没有
    `ExecutionAttributionEvidence` / `TradeResearchEvidence` / `PnLExecutionEvidence` /
    `ExecutionResearchFact`。`ExecutionEvidence → ExecutionFactProjection` 仍是**唯一**
-   execution fact contract，`execution_evidence.py` 本轮**未改动**。
-2. **逐字派生，不重算。** `fact_projection` 直接复制 `evidence.code` / `action` /
+   execution fact contract。
+2. **成交事实逐字派生，不重算。** `fact_projection` 直接复制 `evidence.code` / `action` /
    `requested_qty` / `filled_qty` / `fill_price` / `fees`；不查 DB、不重算价格或费用、
-   不从 `paper_orders` 的兼容列补值。测试用 `assertIs` 锁住"同一个对象"，因此有人"顺手"
-   在投影里重算一遍会立刻变红。
-3. **必须是真三态字段。** 六个字段都是 `execution_evidence.EvidenceField`，
-   `__post_init__` 要求 `isinstance(...)` 且 **name 精确匹配**；裸数字 / dict / duck-typed
-   对象 / 名字错位的真 `EvidenceField` 一律 fail closed。三态区别必须保留：
+   不从 `paper_orders` 的兼容列补值。测试用 `assertIs` 锁住"同一个对象"。
+3. **归属身份同样由 owner 派生。** `account_id` / `cycle_id` 取自订单行 provenance，
+   同样三态、同样不由 caller 自述。缺失 / 不可证明 → `unknown`，**绝不**取
+   "当前 active cycle / 当前账户 / `0` / `None`"做 fallback。
+4. **必须是真三态字段。** 八个字段都是 `execution_evidence.EvidenceField`，
+   `__post_init__` 要求 `isinstance(...)` 且 **name 精确匹配**；裸数字 / 裸字符串 / `None` /
+   dict / duck-typed 对象 / 名字错位的真 `EvidenceField` 一律 fail closed。
    `known(0)` **不**退化成 `0`，**不**变成 `unknown`，`unknown` 也不许变成 `known(0)`。
-4. **`as_dict()` 写 `EvidenceField.as_dict()`，不写 `maybe()`。** `maybe()` 会把
-   `unknown` 与 `not_applicable` 一起压成 `None`。
-5. **内容指纹随之扩展**（`ai_research_execution_adapter._content_fingerprint`）。
-   同一条 execution identity 下数量 / 价格 / 费用 / 标的被改写 → `fact_state` 不同 →
-   `EvidenceConflict`，不再被静默去重。
-6. **`ResearchEvidenceRef.detail` 不膨胀。** detail 仍然只放 identity / 核验 / 内容指纹 /
-   最小审计元数据；六个字段**不**复制进去。职责保持三分：
+5. **`as_dict()` 写 `EvidenceField.as_dict()`，不写 `maybe()`。**
+6. **内容指纹随之扩展**（`ai_research_execution_adapter._content_fingerprint`）。
+   同一条 execution identity 下数量 / 价格 / 费用 / 标的被改写、或这条成交被搬到另一个
+   account / cycle → `fact_state` 不同 → `EvidenceConflict`。
+7. **`ResearchEvidenceRef.detail` 不膨胀。** detail 仍然只放 identity / 核验 / 内容指纹 /
+   最小审计元数据；八个字段**不**复制进去。
+8. **合计 8 个字段，没有更多。** `order_time` / `reject_reason` / `cancel_reason` /
+   `available_qty` / `commission` / `slippage` 都没有加进投影。
 
 ```text
 ExecutionFactProjection      owner factual truth
@@ -422,7 +461,7 @@ benchmark / account cash                    ✗ 属于 portfolio/accounting owne
 
 legacy `pnl_attribution` 确实读 `paper_orders.realized_pnl`，但 `realized_pnl` **不是纯
 execution fact**。本段没有为了方便把它塞进 execution contract，也没有扩大成"复制整份
-`ExecutionEvidence`"：除六个字段外，`order_time` / `reject_reason` / `cancel_reason` /
+`ExecutionEvidence`"：除新增的八个字段外，`order_time` / `reject_reason` / `cancel_reason` /
 `available_qty` / `commission` / `slippage` 都**没有**加进投影。
 
 #### 核验语义与 PIT 语义一个字都没动
@@ -436,7 +475,12 @@ legacy / absent / inconsistent → source_unusable
 ```
 
 上表逐字不变。B2C-4A 只增加**事实内容**，不重新讨论**核验语义**。`business_day` /
-`observed_at` / identity 的派生方式同样不变。
+`observed_at` 的派生方式与格式校验同样不变。
+
+identity 的派生方式也不变：`source_id = <identity_kind>|<identity>` 仍然只由 owner 的
+`event_key` 派生，`account_id` / `cycle_id` **不进入 identity** —— 它们进入的是**事实内容**
+与内容指纹。这正是 EXEC-REF-26 / 27 要的语义：同一条 identity（同一次成交）被搬到另一个
+account / cycle 时，identity 相同而**事实不同**，因此是冲突而不是新事实。
 
 #### 本段仍然没有 production consumer（刻意）
 
@@ -672,9 +716,13 @@ Execution factual fields published:                before = identity / lifecycle
                                                              PIT / verification
                                                    after  = 上面 + code / action /
                                                              requested_qty / filled_qty /
-                                                             fill_price / fees
+                                                             fill_price / fees /
+                                                             account_id / cycle_id
 Execution verification semantics changed:          NO
 PIT semantics changed:                             NO
+Execution identity derivation changed:             NO（account/cycle 进的是事实内容，不是 identity）
+Existing modules touched:                          execution_evidence.py（2 处：provenance
+                                                   带出归属身份；读路径探测 cycle_id 列）
 Runtime migrations:                                0
 Legacy pnl writer changed:                         NO
 deepseek_research 新增 order/fill SQL:             0
