@@ -49,6 +49,46 @@ SUPPORTED_OWNER_ADAPTERS = {"market_data"}  :113
 生产里构造 InformationEvent 的地方**恰好一处**  backend/deepseek_advisor.py:552-583（由 R24 reading 喂入）
 ```
 
+### 两层不变量：本 PR 强制的是哪一层
+
+必须分清"已经强制了什么"与"最终还必须证明什么"，否则会把必要条件当成终局。
+
+| 层 | 名称 | 状态 |
+| --- | --- | --- |
+| 第 1 层 | **contract-issued evidence boundary** —— ref 只能由契约登记的 factory 签发，研究层不能自己发明 `source_id` / `verification` / `verification_method`，也不能新增未登记的 legacy-dict adapter | **已强制、可 CI 化**（`backend/test_ai_research_evidence_ownership_guard.py`） |
+| 第 2 层 | **owner-origin provenance** —— factory 的**输入本身**必须可证明来自该 canonical owner，而不是调用方手工造了一份长得一样的 typed object | **OPEN / REQUIRED，尚未完成** |
+
+第 2 层今天是**做不到**的：`MarketDataSnapshot` / `MarketDataReading` 都是公开 dataclass，
+所以"手工造 reading → `evidence_ref_from_market_reading(...)`"仍能得到一个 ref。这条限制由
+`AI_TYPED_06_two_step_forgery_is_documented_not_claimed_closed` 记录。
+
+```text
+第 1 层是**必要条件**，不是最终条件。
+第 2 层是 R27 必须关闭的架构目标，必须由 owner/provenance 架构逐个关闭
+（execution → news → adaptive/experiment → runtime/incident）。
+在 R27 宣布完成之前不得降级，也不得写成"以后不需要证明"。
+```
+
+### owner-native verification：不要复制 market 语义
+
+research 契约今天把 `(verification, verification_method)` 绑定到 R24 的市场词表。**这不能被
+复制给其它 owner**：
+
+```text
+错误方向（会产生四五套平行契约）：
+    execution 抄 VERIFICATIONS / VERIFICATION_METHODS / _VERIFICATION_METHODS_BY_STATE
+    news / adaptive / runtime 各再抄一份
+    → 所有 owner 都伪装成 market_data
+
+正确方向：
+    每个 owner 发布**自己语义**的核验闭集
+      （execution 已有 execution_status 四态 + 证据来源 + EXECUTION_VERIFICATION_VERSION）
+    再由 research 契约学会消费 owner-native verification
+```
+
+因此下一阶段要解决的是"research contract 如何消费 **owner-native** verification"，
+而不是"所有 owner 如何把语义翻译成 market_data"。
+
 ---
 
 ## 二、Family A —— Paper trading facts
@@ -63,10 +103,24 @@ SUPPORTED_OWNER_ADAPTERS = {"market_data"}  :113
 | 当前持仓 | `paper_position_lots`（执行权威）+ `paper_position_read_model`（唯一只读权威） | `_overfit_evidence:166`（positions） | ⚠️ 读取权威明确，事实无 owner 契约 | ⚠️ `tradability_position_evidence` 有 frozen dataclass + `verification_status`，但不是"持仓观测"契约 | ✅ `feature_available_at` 类字段存在于相邻契约 | ⚠️ `verification_status` 词表未作为闭集发布 | ❌ **NO** | 发布持仓观测的 typed 契约 + 它自己的核验闭集 | R27-B2C-2 |
 | 账户 / 参数版本 | `paper_accounts`；`paper_parameter_versions` 有 4+ writer | `_pnl_evidence:60`、`_overfit_evidence:152` | ❌ 参数版本**无单一 owner** | ❌ 无 | ⚠️ `effective_date` | ❌ 无 | ❌ **NOT MIGRATABLE** | 属于配置 / 生命周期状态，不是"事实"；不进入 research evidence | — |
 
-**Family A 结论**：唯一具备"单一 owner + 已有 typed 契约雏形 + owner 级核验权威"的是
-**执行事实**（`execution_verification` 有自己的 `EXECUTION_VERIFICATION_VERSION`、
-4 态状态、证据来源词表、唯一 SQL 判定）。它因此是**第一个**值得补齐的 owner ——
-但它今天仍缺三样东西（见 §五）。
+**Family A 结论**：**execution verification / fill-backed facts** 是第一个最接近完整
+owner contract 的事实族 —— 它的**成交流水**写入有 guard 强制的单一 owner
+（`execution_planner.commit_fill`），它的**执行裁定**有统一 authority
+（`execution_verification.verification_for_order` / `VERIFIED_PREDICATE`），它的业务日由
+owner 记录（`fill_date` / `execution_asof`），identity 无碰撞（`event_key`）。
+
+但必须把这句收窄，不要扩张成"整个 execution domain 已经单一 owner"：
+
+```text
+paper_fills 的 writer            → 单一 owner（allowlist 强制）
+execution verification verdict   → 统一 authority
+paper_orders 整体 writer         → **不是**单一 owner
+                                   （paper_trading 多处 + paper_risk_service，
+                                     详见本表第 2 行）
+```
+
+因此 B2C-1 的范围是"**fill-backed execution fact** 的 owner contract"，而不是"把
+`paper_orders` 收编成一个 owner"。后者是另一件事，本轮不声称已经具备。
 
 ---
 
@@ -190,5 +244,8 @@ Modules needed to understand one fact:              before = 1   after = 1
 ```
 
 `after = 0` 这两条**只有在本轮不写 adapter 时才成立**，而且必须被永久锁住 ——
-见 `backend/test_ai_research_evidence_ownership_guard.py`（把"只有 owner 能签发证据"
-变成可执行的不变量，而不是一句承诺）。
+见 `backend/test_ai_research_evidence_ownership_guard.py`：它把 **contract-issued
+evidence boundary（第 1 层）** 变成可执行的不变量，而不是一句承诺。
+
+它**不**声称第 2 层（owner-origin provenance）已经成立。第 2 层仍是 OPEN / REQUIRED，
+且是 R27 完成的前置条件。

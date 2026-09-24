@@ -1673,6 +1673,69 @@ RUNTIME-18 ~ 21 覆盖 provider 配置权威的四个方向：DB / UI-only 槽�
 固化成永久回归，而不是靠"记得先跑一次研究"。
 
 
+## Evidence Ownership Boundary（R27-B2C）
+
+R27-B2B 收敛了唯一一条证据已经类型化的 legacy research runtime。R27-B2C 回答它之后的
+问题：**剩下的事实分别归谁拥有？** 盘点产物见
+`docs/R27_B2C_EVIDENCE_OWNER_MATRIX.md`。
+
+这里必须把**两层**不变量分清，否则会把"已经证明了什么"与"最终还要证明什么"混为一谈。
+
+### 第 1 层：contract-issued evidence boundary（**已强制、可 CI 化**）
+
+```text
+ResearchEvidenceRef 无 public raw constructor
+私有 _issue_evidence_ref 在 contract 之外零调用
+owner → factory 映射是精确 allowlist，且必须真的解析到 ai_research_contract
+owner registry 与契约导出的 factory registry 双向等值（不许静默漂移）
+InformationEvent 运行期只接受真正的 ResearchEvidenceRef
+```
+
+它拦住的是：研究层自己发明 `source_id` / `verification` / `verification_method`，或者
+新增一个未登记的 legacy-dict adapter（`paper_dict_to_information_event(row)`）。
+
+实现刻意**短且结构化**（`backend/test_ai_research_evidence_ownership_guard.py`）：只做
+import 别名解析 + "callable 是否解析到契约导出的符号" + 模块集合显式登记。它
+**不**静态追踪局部变量来源，也**不**自建控制流 / reaching-definition 近似 —— 那类近似
+不能可靠证明它声称的不变量，只会把测试拖成一个劣质静态分析器；"传进来的到底是哪个
+局部变量"由上面的运行期类型检查与模块集合登记承担。
+
+### 第 2 层：owner-origin provenance（**OPEN / REQUIRED，尚未完成**）
+
+```text
+一条 evidence 不只是"经过 contract factory"，
+还必须能证明 factory 的**输入本身**来自该 canonical owner，
+而不是调用方手工造了一份长得一样的 typed object。
+```
+
+今天 `market_data` 路径做不到：`MarketDataSnapshot` / `MarketDataReading` 都是公开
+dataclass，因此
+
+```text
+手工造 MarketDataSnapshot → 手工造 MarketDataReading
+    → evidence_ref_from_market_reading(...) → 得到一个 ResearchEvidenceRef
+```
+
+是可以通过的。这条限制由 `AI_TYPED_06_two_step_forgery_is_documented_not_claimed_closed`
+记录。第 1 层因此只是**必要条件**，不是最终条件。
+
+**这是 OPEN 架构要求，不是 WONTFIX。** 它必须由 owner/provenance 架构逐个关闭
+（execution → news → adaptive/experiment → runtime/incident），在 R27 宣布完成之前
+不得被降级、也不得改写为"以后不需要证明"。
+
+### owner-native verification（第 2 层的关键约束）
+
+research 契约当前把 `(verification, verification_method)` 绑定到 R24 的市场词表
+（`_owner_verification_pair` 构造 `MarketDataSnapshot` 让 R24 拒绝非法组合）。
+**这不能被复制到其它 owner**：给 execution / news / adaptive / runtime 各抄一份
+`VERIFICATIONS` / `VERIFICATION_METHODS` / `_VERIFICATION_METHODS_BY_STATE`，
+最终只会得到四五套平行契约。
+
+正确方向是让每个 owner 发布**自己语义**的核验闭集（execution 已经有自己的四态
+`execution_status` + 证据来源 + `EXECUTION_VERIFICATION_VERSION`），再由 research 契约
+学会消费 **owner-native verification** —— 而不是让所有 owner 伪装成 market_data。
+
+
 ## 目标依赖方向
 
 ```text
@@ -1747,10 +1810,11 @@ disable 挡不住真实付费调用，而用 legacy 环境变量当准入条件�
 跑不起来。legacy single/dual review 状态机的兼容检查本轮不迁移，不在本 guard 内）
 provider 配置解析异常裸逃逸（R27-B2B：槽位映射不存在或读配置失败必须映射成声明的
 best-effort 返回值，而不是把异常抛给调用方）
-非 owner 签发 typed evidence（R27-B2C：可签发 owner 是显式登记表；每个
-InformationEvent 的 evidence_ref 必须来自 evidence_ref_from_* 或同一函数内由该
-命名空间绑定的名字。legacy dict / 裸值 / 手拼 ref 一律视为伪造 provenance ——
-这是"不得写 dict → typed event 包装器"的可执行形式）
+未登记的 evidence factory / 未登记的 event 构造模块（R27-B2C：`ResearchEvidenceRef`
+无 public raw constructor，私有签发口在契约外零调用，owner→factory 映射是**精确
+allowlist** 且必须真的解析到 `ai_research_contract`（本地同名函数 / 其它对象的同名
+方法 / 其它模块的同名工厂一律拒绝），owner registry 与契约导出的 factory registry
+**双向等值**，生产里构造 `InformationEvent` 的模块集合显式登记）
 ```
 
 ### 仅作 review signal（不进入 CI gate）

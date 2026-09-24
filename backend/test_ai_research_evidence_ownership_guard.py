@@ -1,46 +1,46 @@
 # -*- coding: utf-8 -*-
-"""R27-B2C —— "只有 owner 能签发证据" 的可执行不变量。
+"""R27-B2C —— research evidence 的 **contract-issued boundary**。
 
-存在理由是 R27-B2C 的 audit 结论（见 ``docs/R27_B2C_EVIDENCE_OWNER_MATRIX.md``）：
+────────────────── 两层不变量，必须分清 ──────────────────
 
-    剩余 research runtime 的事实**全部** NOT MIGRATABLE，因为它们缺的不是接线，
-    而是**owner 签发的核验维度**。今天只有 ``market_data`` 有可签发的 adapter。
+**第 1 层（本文件真正强制，今天就能可靠做到）：contract-issued evidence boundary**
 
-于是本轮**唯一的**风险是"为了迁移速度"绕过这条约束，用 legacy dict 手拼一条 typed
-evidence：
+    ResearchEvidenceRef 无 public raw constructor；
+    _issue_evidence_ref 在 contract 之外零调用；
+    public evidence factory 是**精确 allowlist**，且必须真的来自 ai_research_contract；
+    owner registry 与 factory registry 双向强制一致，不许静默漂移；
+    InformationEvent 在运行期只接受真正的 ResearchEvidenceRef。
 
-    paper_dict_to_information_event(paper_row)          ← 禁止
-        evidence_ref=手填 verification / source_id / as_of
+**第 2 层（R27 最终目标，**尚未**完成 —— OPEN / REQUIRED，不是 WONTFIX）：owner-origin provenance**
 
-那条路会伪造 provenance，而且不会让任何现存测试变红（R27-B1/B2A/B2B 的回归都从 typed
-输入开始）。所以这里把"只有 owner 能签发证据"写成会失败的断言：
+    一条 evidence 不只是"经过了 contract factory"，还必须能证明 **factory 的输入本身
+    来自该 canonical owner**，而不是调用方手工造了一份长得一样的 typed object。
 
-    EVIDENCE-01  SUPPORTED_OWNER_ADAPTERS 是**等值闭集**：新增 owner 必须是一次有意识的决定
-    EVIDENCE-02  ResearchEvidenceRef 仍然**没有公开构造器**（构造即抛 TypeError）
-    EVIDENCE-03  私有签发口 _issue_evidence_ref 只在契约模块里被调用
-    EVIDENCE-04  生产里每个 InformationEvent 的 evidence_ref 都必须来自**契约导出的**
-                 owner 工厂，且该绑定必须真的能到达这次使用
-    EVIDENCE-05  生产里**没有**任何地方直接构造 ResearchEvidenceRef
-    非空性        上面的扫描器必须真的能失败，否则它们只是装饰
+    今天 market_data 路径做不到这一点：``MarketDataSnapshot`` / ``MarketDataReading``
+    都是公开 dataclass，所以"手工造 reading → evidence_ref_from_market_reading(...)"
+    仍能得到一个 ref。这条限制由 ``test_ai_research_contract`` 的
+    ``AI_TYPED_06_two_step_forgery_is_documented_not_claimed_closed`` 明确记录。
 
-────────────── 这个守卫刻意做到多强（以及不做什么）──────────────
+    因此本文件**不**声称"已经证明所有 evidence 都是 owner-originated"。第 1 层只是
+    **必要条件**。owner-origin provenance 必须由 owner/provenance 架构关闭
+    （execution → news → adaptive/experiment → runtime/incident，见
+    ``docs/R27_B2C_EVIDENCE_OWNER_MATRIX.md``），在 R27 宣布完成之前不得降级。
 
-三条"看起来能过、其实不该过"的写法必须被判违规，因此扫描器不是字符串前缀匹配：
+────────────────── 为什么这里没有静态数据流分析 ──────────────────
 
-1. **别名不能绕过。** ``from ai_research_contract import InformationEvent as Event``
-   之后 ``Event(...)`` 仍然被认出是受保护符号（import 别名解析表）。
-2. **靠拼写不算 owner 工厂。** ``evidence_ref_from_paper_dict(row)`` 即使前缀正确，
-   只要它不是 ``ai_research_contract`` 真正导出的工厂，就判违规 —— 登记表
-   ``SUPPORTED_OWNER_ADAPTERS`` 因此不会被"名字长得像"绕过去。
-3. **看的是真的到达那次使用的赋值。** 比使用点更晚的赋值、被不安全赋值覆盖过的名字、
-   嵌套函数里的同名绑定，都不算数；在条件块里绑定而使用在其外面也不算数。
+本文件曾经尝试自己实现 import 别名解析 + 作用域分析 + reaching-definition +
+支配关系 + branch/try 特例，以证明"每个 InformationEvent 的 evidence_ref 都来自 owner"。
+那套实现**不能可靠证明它声称的不变量**，而且会持续膨胀成一个劣质静态分析器。
 
-它**不**做完整控制流分析（没有 CFG、没有跨模块追踪），因此它的强度是"名称解析 +
-同作用域内按行序取最后一个**能支配**使用点的绑定"。这是刻意的取舍：更强需要真正的
-数据流分析，而这里的目的是拦住 dict → typed event 这类写法，不是证明整个程序安全。
+现在改成三条**确定、结构化**的边界，并且明确写出各自能证明什么：
 
-刻意的边界：本文件**不**新增 owner、**不**新增 adapter、**不**改变任何生产行为。
-它只是把矩阵文档 §六 的禁令变成 CI 会拦下的东西。
+* 谁可以构造 ``InformationEvent`` —— 模块集合显式登记（新增模块必须改这里，是架构变化）；
+* 谁可以签发 ref —— 所有 ``evidence_ref_from_*`` 调用必须解析到
+  ``ai_research_contract``；本地同名函数 / 其它对象的同名方法 / 其它模块的同名工厂全部拒绝；
+* ref 在运行期是否真的是 ref —— 由 ``InformationEvent.__post_init__`` 的类型检查保证。
+
+刻意**不再**静态追踪局部变量（``ref = ...; InformationEvent(evidence_ref=ref)``）的来源：
+那条保证由上面第 3 条（运行期类型）与第 1 条（构造模块集合）承担，而不是靠一个近似分析。
 """
 from __future__ import annotations
 
@@ -55,28 +55,24 @@ if BACKEND not in sys.path:
 
 import ai_research_contract as ARC  # noqa: E402
 
-CONTRACT_MODULE = "ai_research_contract.py"
+CONTRACT_MODULE_FILE = "ai_research_contract.py"
 CONTRACT_MODULE_NAME = "ai_research_contract"
 
-#: 受保护的符号：构造研究事件、构造证据引用、以及私有签发口。
+#: 受保护符号：构造研究事件、构造证据引用、以及私有签发口。
 PROTECTED_SYMBOLS = frozenset({"InformationEvent", "ResearchEvidenceRef", "_issue_evidence_ref"})
 
-#: owner 工厂的命名空间前缀。前缀**本身不构成授权**（见 :func:`_is_owner_factory_call`）。
+#: owner 签发口的命名空间前缀。**前缀本身不构成授权** —— 见 :func:`_approved_factory`。
 OWNER_FACTORY_PREFIX = "evidence_ref_from_"
 
-#: 目前真的有签发能力的 owner。新增一项必须同时是一次有意识的决定：
-#: 该 owner 必须先发布自己的核验闭集（matrix 文档 §五 的 1–4 步）。
-EXPECTED_OWNER_ADAPTERS = frozenset({"market_data"})
+#: 允许的 owner → factory 映射。**精确等值**，不是 contains / prefix / non-empty。
+#: 新增一个 owner 必须同时出现：owner 自己发布核验闭集 + 这里的一行 + 契约的导出。
+EXPECTED_OWNER_FACTORIES = {
+    "market_data": "evidence_ref_from_market_reading",
+}
 
-#: 目前生产里构造 ``InformationEvent`` 的模块集合。等值断言：多一个模块就意味着多出
-#: 一条"事实 → 研究事件"的路径，而它必须被审阅。
+#: 目前生产里构造 ``InformationEvent`` 的模块集合。等值断言：多一个模块就是一次
+#: 架构变化（多出一条"事实 → 研究事件"的路径），必须人工修改这里。
 EXPECTED_EVENT_CONSTRUCTORS = frozenset({"deepseek_advisor.py"})
-
-#: 只在条件 / 循环容器处切分"支配块"。``try`` / ``with`` 刻意透明：
-#: 把绑定写在 ``try`` 里、在 ``try`` 之后使用是正常写法，而"except 分支里换成不安全的值"
-#: 仍然会被"最后一个能支配使用点的绑定优先"抓住。
-_BLOCK_CONTAINERS = (ast.If, ast.For, ast.AsyncFor, ast.While)
-_NESTED_SCOPES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)
 
 
 def _source(name: str) -> str:
@@ -96,235 +92,155 @@ def _production_modules() -> list[str]:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 名称解析：import 别名 → 受保护符号 / owner 工厂
+# 调用的真实来源 —— 只回答一个问题：
+# "这个 callable 是否解析到 ai_research_contract 导出的符号？"
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-def _import_aliases(tree: ast.Module) -> dict[str, tuple[str, str | None]]:
-    """本地名 → ``(模块, 属性或 None)``。只关心契约模块的别名。
+def _import_origins(tree: ast.Module) -> dict[str, tuple[str, str | None]]:
+    """本地名 → ``(模块, 导出名)``。只记录契约模块的 import。
 
     ``import ai_research_contract as ARC``      → ``{"ARC": ("ai_research_contract", None)}``
     ``from ai_research_contract import X as Y`` → ``{"Y": ("ai_research_contract", "X")}``
     """
-    aliases: dict[str, tuple[str, str | None]] = {}
+    origins: dict[str, tuple[str, str | None]] = {}
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             for alias in node.names:
                 if alias.name.split(".")[0] == CONTRACT_MODULE_NAME:
-                    aliases[alias.asname or alias.name.split(".")[0]] = (
+                    origins[alias.asname or alias.name.split(".")[0]] = (
                         CONTRACT_MODULE_NAME, None,
                     )
         elif isinstance(node, ast.ImportFrom):
             if (node.module or "").split(".")[0] == CONTRACT_MODULE_NAME:
                 for alias in node.names:
-                    aliases[alias.asname or alias.name] = (CONTRACT_MODULE_NAME, alias.name)
-    return aliases
+                    origins[alias.asname or alias.name] = (CONTRACT_MODULE_NAME, alias.name)
+    return origins
 
 
-def _resolved_symbol(node, aliases) -> str:
-    """调用的**规范**名字：别名会被还原成契约里的原名。
+def _call_origin(node: ast.Call, origins) -> tuple[str | None, str]:
+    """``(module_origin, symbol)``。
 
-    还原不出来时退回末端名字 —— 因此 ``InformationEvent`` 这种裸名**仍然**受保护，
-    别名不能凭"名字对不上"溜过去。
+    * ``ARC.f(...)`` 且 ``ARC`` 来自契约 → ``("ai_research_contract", "f")``
+    * ``f(...)`` 且 ``f`` 是 ``from ai_research_contract import f`` → ``("ai_research_contract", "f")``
+    * ``f(...)`` 且 ``f`` 是契约导出名的别名 → 归一到原名
+    * ``obj.f(...)`` / ``other.f(...)`` → ``(None, "f")``（**来源不明，一律不算契约**）
+    * 本模块 ``def f(...)`` → ``(None, "f")``
     """
     func = node.func
     if isinstance(func, ast.Name):
-        canonical = aliases.get(func.id)
-        if canonical is not None and canonical[1]:
-            return canonical[1]
-        return func.id
+        origin = origins.get(func.id)
+        if origin is not None:
+            module, exported = origin
+            return module, (exported or func.id)
+        return None, func.id
     if isinstance(func, ast.Attribute):
         base = func.value
         if isinstance(base, ast.Name):
-            canonical = aliases.get(base.id)
-            if canonical is not None and canonical[1] is None:
-                # 契约模块属性访问：``ARC.InformationEvent``
-                return func.attr
-        return func.attr
-    return ""
+            origin = origins.get(base.id)
+            if origin is not None and origin[1] is None:
+                return origin[0], func.attr
+            if origin is not None and origin[1] is not None:
+                # ``f.attr`` 其中 f 是从契约导入的名字 —— 不是模块属性访问，来源不明
+                return None, func.attr
+        return None, func.attr
+    return None, ""
 
 
-def _calls_to(tree: ast.Module, symbol: str, aliases=None) -> int:
-    aliases = _import_aliases(tree) if aliases is None else aliases
-    return sum(
-        1 for node in ast.walk(tree)
-        if isinstance(node, ast.Call) and _resolved_symbol(node, aliases) == symbol
-    )
+def _protected_symbol(node: ast.Call, origins) -> str | None:
+    """这次调用是否是受保护符号（别名会被还原）。
 
-
-def _contract_public_factories() -> frozenset[str]:
-    """契约**自己导出**的 owner 工厂名。
-
-    这是"前缀不构成授权"的依据：只有契约导出的工厂才算签发口，因此一个本地的
-    ``evidence_ref_from_paper_dict`` 无法靠名字混进来。
+    裸名（``InformationEvent``）**始终**算受保护，即使它并非从契约导入 —— 否则
+    "本地定义一个同名工厂"就能让构造点从扫描里消失。
     """
+    module, symbol = _call_origin(node, origins)
+    if module == CONTRACT_MODULE_NAME and symbol in PROTECTED_SYMBOLS:
+        return symbol
+    if module is None and symbol in PROTECTED_SYMBOLS:
+        return symbol
+    return None
+
+
+def _is_owner_factory_namespace(node: ast.Call, origins) -> bool:
+    _, symbol = _call_origin(node, origins)
+    return symbol.startswith(OWNER_FACTORY_PREFIX)
+
+
+def _approved_factory(node: ast.Call, origins) -> bool:
+    """这次调用是否**真的**是契约导出的、已登记的 owner 工厂。
+
+    三个条件缺一不可：来源是契约模块、符号在登记表里、且契约确实导出它。
+    因此 ``def evidence_ref_from_market_reading(row): ...``（本地同名）与
+    ``fake.evidence_ref_from_market_reading(row)``（其它对象同名）都不算。
+    """
+    module, symbol = _call_origin(node, origins)
+    if module != CONTRACT_MODULE_NAME:
+        return False
+    if symbol not in EXPECTED_OWNER_FACTORIES.values():
+        return False
+    return symbol in _contract_exported_factories()
+
+
+def _contract_exported_factories() -> frozenset[str]:
     return frozenset(
         name for name in getattr(ARC, "__all__", ())
         if name.startswith(OWNER_FACTORY_PREFIX)
     )
 
 
-def _is_owner_factory_call(node, aliases) -> bool:
-    """这次调用是不是**契约导出的** owner 工厂 —— 不是"名字以某前缀开头"。"""
-    if not isinstance(node, ast.Call):
-        return False
-    symbol = _resolved_symbol(node, aliases)
-    if not symbol.startswith(OWNER_FACTORY_PREFIX):
-        return False
-    return symbol in _contract_public_factories()
+def _registry_problems(owners, factories) -> list[str]:
+    """owner registry 与 factory registry 的双向一致性。
+
+    单独抽成纯函数，是为了让"两个方向都要红"能被**直接测到**（见非空性用例），
+    而不是只能靠改契约源码来验。
+    """
+    problems = []
+    missing_factories = sorted(set(owners) - set(factories))
+    if missing_factories:
+        problems.append(f"owner 已登记但没有 factory：{missing_factories}")
+    unregistered_factories = sorted(set(factories) - set(owners))
+    if unregistered_factories:
+        problems.append(
+            f"factory 已存在但对应 owner 未登记：{unregistered_factories}"
+            "（新增 owner 必须先让该 owner 发布自己的核验闭集）"
+        )
+    return problems
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 同作用域内的绑定解析（只做"能支配使用点的最后一个绑定"这一层）
-# ─────────────────────────────────────────────────────────────────────────────
-
-
-def _same_scope_nodes(func):
-    """``func`` 自身作用域内的节点 —— 不进入嵌套函数 / 类 / lambda。"""
+def _calls(tree: ast.Module, *, namespace: bool = False, symbol: str | None = None):
+    origins = _import_origins(tree)
     out = []
-
-    def walk(node):
-        for child in ast.iter_child_nodes(node):
-            if isinstance(child, _NESTED_SCOPES):
-                continue
-            out.append(child)
-            walk(child)
-
-    walk(func)
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        if namespace and _is_owner_factory_namespace(node, origins):
+            out.append(node)
+        elif symbol is not None and _protected_symbol(node, origins) == symbol:
+            out.append(node)
     return out
 
 
-def _scope_chains(func) -> dict[int, tuple[int, ...]]:
-    """节点 → 从函数体到它的**条件 / 循环**容器链（``try`` / ``with`` 透明）。"""
-    chains: dict[int, tuple[int, ...]] = {}
+class EvidenceFactoryBoundaryTests(unittest.TestCase):
+    def test_EVIDENCE_01_owner_and_factory_registries_agree_exactly(self):
+        """EVIDENCE-01：owner registry 与契约导出的 factory registry 双向等值。
 
-    def walk(node, chain):
-        for child in ast.iter_child_nodes(node):
-            if isinstance(child, _NESTED_SCOPES):
-                continue
-            next_chain = chain + (id(child),) if isinstance(child, _BLOCK_CONTAINERS) else chain
-            chains[id(child)] = next_chain
-            walk(child, next_chain)
-
-    walk(func, ())
-    return chains
-
-
-def _dominates(binding_chain, use_chain) -> bool:
-    """绑定所在的条件块必须是使用点所在条件块的前缀（结构支配的近似）。"""
-    return use_chain[:len(binding_chain)] == binding_chain
-
-
-def _owner_bindings(func, aliases) -> dict[str, list[tuple[int, tuple[int, ...], bool]]]:
-    """``name → [(行号, 条件块链, 是否 owner 工厂结果)]``（同作用域）。"""
-    bindings: dict[str, list[tuple[int, tuple[int, ...], bool]]] = {}
-    chains = _scope_chains(func)
-    for node in _same_scope_nodes(func):
-        if not isinstance(node, ast.Assign):
-            continue
-        is_owner = _is_owner_factory_call(node.value, aliases)
-        for target in node.targets:
-            if isinstance(target, ast.Name):
-                bindings.setdefault(target.id, []).append(
-                    (node.lineno, chains.get(id(node), ()), is_owner),
-                )
-    return bindings
-
-
-def _name_is_owner_issued(func, name: str, use_node, aliases) -> bool:
-    """``name`` 在这次使用点上是否**真的**解析到 owner 工厂的结果。
-
-    取"能支配使用点、且行号在使用点之前"的**最后一个**绑定：
-    * 更晚的赋值不算（绑定还没发生）；
-    * 被不安全赋值覆盖过的名字不算（最后一个绑定的来源不是 owner 工厂）；
-    * 条件块里绑定、条件块外使用不算（绑定可能没执行）；
-    * 嵌套函数里的同名绑定不算（不同作用域）。
-    """
-    bindings = _owner_bindings(func, aliases)
-    chains = _scope_chains(func)
-    use_chain = chains.get(id(use_node), ())
-    candidates = [
-        (lineno, is_owner)
-        for lineno, chain, is_owner in bindings.get(name, [])
-        if lineno < use_node.lineno and _dominates(chain, use_chain)
-    ]
-    if not candidates:
-        return False
-    return max(candidates, key=lambda item: item[0])[1]
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# InformationEvent 构造点
-# ─────────────────────────────────────────────────────────────────────────────
-
-
-def _keyword_value(call: ast.Call, name: str):
-    for keyword in call.keywords:
-        if keyword.arg == name:
-            return keyword.value
-    return None
-
-
-def _event_construction_sites(tree: ast.Module):
-    """每个 ``InformationEvent(...)`` → ``(所在函数或 None, 调用节点, evidence_ref 实参)``。
-
-    只按关键字取 ``evidence_ref``；位置参数形式返回 ``None`` 并由断言判为违规 ——
-    "漏掉位置参数"正好是给伪造留后门，静默忽略等于护栏空转。
-    """
-    aliases = _import_aliases(tree)
-    sites = []
-
-    def walk(node, func):
-        for child in ast.iter_child_nodes(node):
-            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                walk(child, child)
-                continue
-            if isinstance(child, ast.Call) and _resolved_symbol(child, aliases) == "InformationEvent":
-                sites.append((func, child, _keyword_value(child, "evidence_ref")))
-            walk(child, func)
-
-    walk(tree, None)
-    return sites
-
-
-def _is_owner_issued_ref(func, call_node, value, aliases) -> bool:
-    if _is_owner_factory_call(value, aliases):
-        return True
-    if isinstance(value, ast.Name) and func is not None:
-        return _name_is_owner_issued(func, value.id, call_node, aliases)
-    return False
-
-
-def _fake_event_construction_modules() -> list[str]:
-    """用非 owner 签发方式构造 ``InformationEvent`` 的模块。"""
-    offenders = []
-    for name in _production_modules():
-        tree = _tree(name)
-        aliases = _import_aliases(tree)
-        for func, call_node, value in _event_construction_sites(tree):
-            if value is None or not _is_owner_issued_ref(func, call_node, value, aliases):
-                offenders.append(name)
-    return offenders
-
-
-class OwnerAdapterRegistryTests(unittest.TestCase):
-    def test_EVIDENCE_01_owner_adapter_set_is_an_equality_closed_registry(self):
-        """EVIDENCE-01：可签发 owner 是显式登记表，不是"谁都能接一条"。"""
+        两个方向都必须红：契约新增 factory 而没人登记 owner，或者登记了 owner 却没有
+        factory。任何一处漂移都意味着"谁能签发证据"已经不受这条边界管辖。
+        """
         self.assertEqual(
-            EXPECTED_OWNER_ADAPTERS, set(ARC.SUPPORTED_OWNER_ADAPTERS),
-            "可签发 owner 集合发生变化。新增 owner 必须先让该 owner 发布自己的核验闭集，"
-            "再改这张登记表 —— 这是有意识的决定，不是顺手加一项。",
+            set(EXPECTED_OWNER_FACTORIES), set(ARC.SUPPORTED_OWNER_ADAPTERS),
+            "SUPPORTED_OWNER_ADAPTERS 与已批准的 owner→factory 映射不一致",
         )
-        self.assertTrue(
-            EXPECTED_OWNER_ADAPTERS <= set(ARC.EVIDENCE_SOURCE_TYPES),
-            "登记的 owner 不在 EVIDENCE_SOURCE_TYPES 里",
+        exported = _contract_exported_factories()
+        self.assertEqual(
+            set(EXPECTED_OWNER_FACTORIES.values()), set(exported),
+            f"契约导出的 owner factory 集合发生变化：{sorted(exported)}",
         )
-        # 登记表必须与"契约真的导出多少工厂"对得上：两者脱节说明有一方在说空话。
-        self.assertTrue(_contract_public_factories(), "契约没有导出任何 owner 工厂")
-        self.assertIn("evidence_ref_from_market_reading", _contract_public_factories())
+        # 非空性：只有真的存在 factory 时，上面两条等值断言才有内容可查。
+        self.assertTrue(exported, "契约没有导出任何 owner factory")
 
-    def test_EVIDENCE_02_research_evidence_ref_still_has_no_public_constructor(self):
-        """EVIDENCE-02：调用方不能仅凭传字符串就声明一条事实。"""
+    def test_EVIDENCE_02_research_evidence_ref_has_no_public_constructor(self):
+        """EVIDENCE-02：调用方不能仅凭传字符串声明一条事实。"""
         with self.assertRaises(TypeError):
             ARC.ResearchEvidenceRef(
                 source_type="market_data", source_id="forged", as_of="2026-08-27",
@@ -332,193 +248,146 @@ class OwnerAdapterRegistryTests(unittest.TestCase):
         self.assertTrue(callable(ARC.evidence_ref_from_market_reading))
 
     def test_EVIDENCE_03_private_issuer_is_called_only_from_the_contract(self):
-        """EVIDENCE-03：私有签发口只在契约模块里被调用（别名同样会被识破）。"""
+        """EVIDENCE-03：私有签发口在契约模块外零调用（别名也会被识破）。"""
         offenders = [
             name for name in _production_modules()
-            if name != CONTRACT_MODULE
-            and _calls_to(_tree(name), "_issue_evidence_ref")
+            if name != CONTRACT_MODULE_FILE
+            and _calls(_tree(name), symbol="_issue_evidence_ref")
         ]
         self.assertEqual([], offenders, f"契约之外出现了私有签发调用：{offenders}")
-        self.assertGreater(_calls_to(_tree(CONTRACT_MODULE), "_issue_evidence_ref"), 0)
+        # 非空性：契约自己必须真的在调用它。
+        self.assertTrue(_calls(_tree(CONTRACT_MODULE_FILE), symbol="_issue_evidence_ref"))
 
+    def test_EVIDENCE_04_every_evidence_factory_call_comes_from_the_contract(self):
+        """EVIDENCE-04：生产里每个 owner 签发命名空间调用都必须来自契约。
 
-class TypedEventConstructionTests(unittest.TestCase):
-    def test_EVIDENCE_04_every_information_event_is_built_from_an_owner_issued_ref(self):
-        """EVIDENCE-04：typed event 只能由**契约导出的** owner 工厂签发的 ref 构造。
-
-        这是"不得写 legacy dict → typed event 包装器"的可执行形式。
+        这是"不得新增未登记 adapter"的可执行形式：本地同名函数、其它对象的同名方法、
+        其它模块的同名工厂，全部因为**来源不是契约**而被拒绝。
         """
-        offenders = _fake_event_construction_modules()
+        offenders = []
+        approved = 0
+        for name in _production_modules():
+            tree = _tree(name)
+            origins = _import_origins(tree)
+            for node in _calls(tree, namespace=True):
+                if _approved_factory(node, origins):
+                    approved += 1
+                else:
+                    offenders.append(name)
         self.assertEqual(
             [], offenders,
-            f"这些模块用非 owner 签发的方式构造了 InformationEvent：{offenders}。"
-            "evidence_ref 必须来自契约导出的 evidence_ref_from_* 工厂，"
-            "dict / 裸值 / 手拼对象 / 本地同名包装一律视为伪造 provenance。",
+            f"这些模块调用了来源不明的 evidence factory：{offenders}。"
+            "evidence_ref_from_* 只能解析到 ai_research_contract 已导出的工厂。",
         )
+        # 非空性：真实生产里确实存在被批准的签发调用（否则上面的空 offender 无意义）。
+        self.assertGreater(approved, 0, "扫描器看不到任何被批准的签发调用（护栏会空转）")
 
     def test_EVIDENCE_05_no_production_module_constructs_a_ref_directly(self):
         """EVIDENCE-05：生产里没有任何地方直接构造 ``ResearchEvidenceRef``。"""
         offenders = [
             name for name in _production_modules()
-            if _calls_to(_tree(name), "ResearchEvidenceRef")
+            if _calls(_tree(name), symbol="ResearchEvidenceRef")
         ]
         self.assertEqual([], offenders, f"直接构造 ResearchEvidenceRef：{offenders}")
 
-    def test_EVIDENCE_05b_event_constructor_set_is_explicit(self):
-        """EVIDENCE-05b：构造 typed event 的模块集合是显式登记的等值集合。"""
+    def test_EVIDENCE_06_event_constructor_module_set_is_explicit(self):
+        """EVIDENCE-06：构造 typed event 的模块集合是显式登记的等值集合。
+
+        这是删掉数据流分析之后承担主要保证的那一条：一条新的"事实 → 研究事件"路径
+        必然引入一个新的构造模块，因此会被这里拦下并要求人工确认。
+        """
         constructors = {
             name for name in _production_modules()
-            if _event_construction_sites(_tree(name))
+            if _calls(_tree(name), symbol="InformationEvent")
         }
         self.assertEqual(
             EXPECTED_EVENT_CONSTRUCTORS, constructors,
             f"构造 InformationEvent 的模块集合发生变化：{sorted(constructors)}",
         )
 
+    def test_EVIDENCE_07_information_event_rejects_non_ref_evidence(self):
+        """EVIDENCE-07：运行期类型边界 —— event 只接受真正的 ResearchEvidenceRef。
 
-class GuardNonVacuityTests(unittest.TestCase):
-    """扫描器必须真的能失败 —— 否则 EVIDENCE-01..05 只是装饰。
+        数据流分析删掉之后，"传进来的那个局部变量到底是什么"由这条运行期保证回答，
+        而不是靠一个近似静态分析。
+        """
+        for payload in ({}, "source_id", 42, None):
+            with self.subTest(payload=repr(payload)[:20]):
+                with self.assertRaises(TypeError):
+                    ARC.InformationEvent(as_of="2026-08-27", source="s", evidence_ref=payload)
 
-    这三组正是"看起来能过、其实不该过"的写法：靠拼写的工厂、import 别名、以及
-    不等同于使用点的绑定。
+
+class FactoryOriginNonVacuityTests(unittest.TestCase):
+    """factory origin 解析必须真的能区分"来自契约"与"只是名字像"。
+
+    这六种写法覆盖 review 提出的绕过方式：本地同名函数、其它对象同名方法、
+    其它模块同名工厂；以及三种合法写法：模块别名、直接 import、直接 import 的别名。
     """
 
-    def _sites(self, text: str):
+    def _approved(self, text: str) -> bool:
         tree = ast.parse(text)
-        return tree, _event_construction_sites(tree)
+        origins = _import_origins(tree)
+        calls = _calls(tree, namespace=True)
+        self.assertEqual(1, len(calls), f"扫描器看到了 {len(calls)} 个签发调用：{text!r}")
+        return _approved_factory(calls[0], origins)
 
-    def _accepted(self, text: str) -> bool:
-        tree, sites = self._sites(text)
-        aliases = _import_aliases(tree)
-        func, call_node, value = sites[0]
-        return _is_owner_issued_ref(func, call_node, value, aliases)
-
-    def test_fake_prefixed_factory_is_rejected(self):
-        """靠拼写混进来的"工厂"不算 owner 签发。"""
-        self.assertFalse(self._accepted(
+    def test_CASE_1_module_alias_is_approved(self):
+        self.assertTrue(self._approved(
             "import ai_research_contract as ARC\n"
-            "def f(row):\n"
-            "    ref = evidence_ref_from_paper_dict(row)\n"
-            "    return ARC.InformationEvent(as_of='2026-08-27', source='s', evidence_ref=ref)\n"
-        ), "本地同名包装 evidence_ref_from_paper_dict 被当成 owner 签发")
-        self.assertFalse(self._accepted(
-            "import ai_research_contract as ARC\n"
-            "def f(row):\n"
-            "    return ARC.InformationEvent(as_of='2026-08-27', source='s', "
-            "evidence_ref=evidence_ref_from_paper_dict(row))\n"
-        ), "内联的本地包装未被判为违规")
+            "ARC.evidence_ref_from_market_reading(reading)\n"
+        ))
 
-    def test_import_alias_cannot_hide_protected_symbols(self):
-        """``... import InformationEvent as Event`` 之后 ``Event(...)`` 仍然被看见。"""
-        tree, sites = self._sites(
+    def test_CASE_2_direct_import_is_approved(self):
+        self.assertTrue(self._approved(
+            "from ai_research_contract import evidence_ref_from_market_reading\n"
+            "evidence_ref_from_market_reading(reading)\n"
+        ))
+
+    def test_CASE_3_direct_import_alias_is_approved(self):
+        self.assertTrue(self._approved(
+            "from ai_research_contract import evidence_ref_from_market_reading as make_ref\n"
+            "make_ref(reading)\n"
+        ))
+
+    def test_CASE_4_local_function_with_the_same_name_is_rejected(self):
+        self.assertFalse(self._approved(
+            "def evidence_ref_from_market_reading(row):\n"
+            "    return row\n"
+            "evidence_ref_from_market_reading(row)\n"
+        ))
+
+    def test_CASE_5_same_named_method_on_another_object_is_rejected(self):
+        self.assertFalse(self._approved("fake.evidence_ref_from_market_reading(row)\n"))
+
+    def test_CASE_6_same_named_factory_in_another_module_is_rejected(self):
+        self.assertFalse(self._approved(
+            "import fake_contract\n"
+            "fake_contract.evidence_ref_from_market_reading(row)\n"
+        ))
+
+    def test_CASE_7_extra_contract_factory_without_registered_owner_fails(self):
+        """契约新增 factory，但 owner registry 没跟上 → 必须报问题。"""
+        problems = _registry_problems(["market_data"], ["market_data", "paper"])
+        self.assertTrue(problems, "多余 factory 未被发现")
+        self.assertTrue(any("未登记" in item for item in problems))
+
+    def test_CASE_8_registered_owner_without_factory_fails(self):
+        """owner registry 新增 execution，但没有对应 factory → 必须报问题。"""
+        problems = _registry_problems(["market_data", "execution"], ["market_data"])
+        self.assertTrue(problems, "缺失 factory 未被发现")
+        self.assertTrue(any("没有 factory" in item for item in problems))
+        # 双向都干净时不得假报。
+        self.assertEqual([], _registry_problems(["market_data"], ["market_data"]))
+
+    def test_protected_symbols_survive_import_aliases(self):
+        tree = ast.parse(
             "from ai_research_contract import InformationEvent as Event\n"
-            "def f(row):\n"
-            "    return Event(as_of='2026-08-27', source='s', evidence_ref=row)\n"
-        )
-        self.assertEqual(1, len(sites), "别名构造点被完全漏掉了")
-        aliases = _import_aliases(tree)
-        func, call_node, value = sites[0]
-        self.assertFalse(_is_owner_issued_ref(func, call_node, value, aliases))
-
-        # 模块别名下的私有签发口 / ref 构造器同样要被看见。
-        aliased = ast.parse(
             "from ai_research_contract import _issue_evidence_ref as issue\n"
-            "from ai_research_contract import ResearchEvidenceRef as Ref\n"
-            "issue()\nRef(a=1)\n"
+            "Event(as_of='2026-08-27', source='s', evidence_ref=row)\n"
+            "issue()\n"
         )
-        self.assertEqual(1, _calls_to(aliased, "_issue_evidence_ref"))
-        self.assertEqual(1, _calls_to(aliased, "ResearchEvidenceRef"))
-
-    def test_only_the_binding_that_reaches_the_use_counts(self):
-        """绑定必须真的能到达那次使用。"""
-        accepted = (
-            "import ai_research_contract as ARC\n"
-            "def f(reading):\n"
-            "    ref = ARC.evidence_ref_from_market_reading(reading)\n"
-            "    return ARC.InformationEvent(as_of='2026-08-27', source='s', "
-            "evidence_ref=ref)\n"
-        )
-        self.assertTrue(self._accepted(accepted), "合法的 owner 绑定被误判为违规")
-
-        # ① 绑定在使用点之后 → 不算
-        self.assertFalse(self._accepted(
-            "import ai_research_contract as ARC\n"
-            "def f(reading):\n"
-            "    event = ARC.InformationEvent(as_of='2026-08-27', source='s', "
-            "evidence_ref=ref)\n"
-            "    ref = ARC.evidence_ref_from_market_reading(reading)\n"
-            "    return event\n"
-        ), "使用点之后的绑定被当成了有效来源")
-
-        # ② 被不安全赋值覆盖 → 不算
-        self.assertFalse(self._accepted(
-            "import ai_research_contract as ARC\n"
-            "def f(reading, row):\n"
-            "    ref = ARC.evidence_ref_from_market_reading(reading)\n"
-            "    ref = row\n"
-            "    return ARC.InformationEvent(as_of='2026-08-27', source='s', "
-            "evidence_ref=ref)\n"
-        ), "被不安全赋值覆盖后的名字仍被当成 owner 签发")
-
-        # ③ 嵌套函数里的同名绑定 → 不算
-        self.assertFalse(self._accepted(
-            "import ai_research_contract as ARC\n"
-            "def f(reading):\n"
-            "    def inner():\n"
-            "        ref = ARC.evidence_ref_from_market_reading(reading)\n"
-            "    return ARC.InformationEvent(as_of='2026-08-27', source='s', "
-            "evidence_ref=ref)\n"
-        ), "嵌套函数内的绑定逃过了作用域检查")
-
-        # ④ 条件块里绑定、条件块外使用 → 不算
-        self.assertFalse(self._accepted(
-            "import ai_research_contract as ARC\n"
-            "def f(reading, flag, row):\n"
-            "    if flag:\n"
-            "        ref = ARC.evidence_ref_from_market_reading(reading)\n"
-            "    else:\n"
-            "        ref = row\n"
-            "    return ARC.InformationEvent(as_of='2026-08-27', source='s', "
-            "evidence_ref=ref)\n"
-        ), "分支绑定被当成能支配使用点")
-
-        # ⑤ 同一个条件块内绑定并使用 → 算（否则这条规则会误杀正常写法）
-        self.assertTrue(self._accepted(
-            "import ai_research_contract as ARC\n"
-            "def f(flag, reading):\n"
-            "    if flag:\n"
-            "        ref = ARC.evidence_ref_from_market_reading(reading)\n"
-            "        return ARC.InformationEvent(as_of='2026-08-27', source='s', "
-            "evidence_ref=ref)\n"
-            "    return None\n"
-        ), "同一条件块内的合法绑定被误判为违规")
-
-        # ⑥ try 里的绑定 + try 之后使用 → 算（正常写法，try/with 刻意透明）
-        self.assertTrue(self._accepted(
-            "import ai_research_contract as ARC\n"
-            "def f(reading):\n"
-            "    try:\n"
-            "        ref = ARC.evidence_ref_from_market_reading(reading)\n"
-            "    except Exception:\n"
-            "        return ()\n"
-            "    return ARC.InformationEvent(as_of='2026-08-27', source='s', "
-            "evidence_ref=ref)\n"
-        ), "try 内绑定 + try 后使用被误判为违规")
-
-    def test_miscellaneous_scanners(self):
-        # 位置参数形式必须被看见（返回 None → 判违规），不能静默忽略
-        _, sites = self._sites(
-            "import ai_research_contract as ARC\n"
-            "ARC.InformationEvent('2026-08-27', 's', row)\n"
-        )
-        self.assertIsNone(sites[0][2], "位置参数形式被静默忽略了")
-        # 真实生产写法（模块别名 + 直接调用）必须被接受
-        self.assertTrue(self._accepted(
-            "import ai_research_contract as ARC\n"
-            "def f(reading):\n"
-            "    return ARC.InformationEvent(as_of='2026-08-27', source='s', "
-            "evidence_ref=ARC.evidence_ref_from_market_reading(reading))\n"
-        ), "模块别名下的直接 owner 调用被误判为违规")
+        self.assertEqual(1, len(_calls(tree, symbol="InformationEvent")))
+        self.assertEqual(1, len(_calls(tree, symbol="_issue_evidence_ref")))
 
 
 if __name__ == "__main__":
