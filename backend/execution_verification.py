@@ -54,7 +54,11 @@
 
 from __future__ import annotations
 
+import datetime as dt
+import re
 import sqlite3
+from dataclasses import dataclass
+from types import MappingProxyType
 from typing import Any, Mapping
 
 try:  # ``backend`` on sys.path（生产与 ``cd backend`` 测试）
@@ -642,6 +646,423 @@ def gate_report(rows: Any) -> dict:
         "blocked_from_execution_stats": blocked,
         "verified": counts[EXECUTION_STATUS_VERIFIED],
     }
+
+
+# ─────────────────── owner fact contract（R27-B2C-1）───────────────────
+#
+# 这一段是 execution owner **正式发布**的 fact contract：它回答"这条 execution 事实的
+# 身份是什么、业务日是什么、观测时点是什么、owner 自己怎么核验它"。
+#
+# 三条刻意的边界：
+#
+# * **不回答 research 语义**（status / reason / confidence / 支持什么 thesis）—— 那些属于
+#   research 契约，不属于 owner。
+# * **不使用 market 的核验词表**。execution 有自己的四态与证据来源；把 market 的
+#   ``verified / single_source / cross_source / coverage_integrity`` 抄过来，会让
+#   "行情双源核验"与"账本证明成交"变成同一句话。research 层将来必须消费
+#   **owner-native** 核验，而不是让所有 owner 伪装成 market_data。
+# * **不推断业务日**。owner 记录了什么就报什么；没有记录就如实报 unknown，
+#   绝不用 ``created_at`` 的墙钟日期冒充交易日。
+
+EXECUTION_FACT_CONTRACT_VERSION = "execution-fact-v1"
+
+#: 本 owner 的核验**语义范围**。research 层必须能区分"这笔委托是否被账本证据证明成交"
+#: 与"行情是否可信" —— 两者是不同的维度，因此范围是契约的一部分。
+EXECUTION_VERIFICATION_SCOPE = "execution_order_fill_evidence"
+
+#: 状态 × 证据来源的**合法组合**（穷尽表，与 :data:`VERDICT_TO_STATUS` 同一风格）。
+#: 不在表里的组合 fail closed：``evidence_inconsistent`` 只是一个来源标签，
+#: 不代表"任何状态都可以配它"。
+_LEGAL_SOURCES_BY_STATUS = {
+    EXECUTION_STATUS_VERIFIED: (EVIDENCE_SOURCE_LEDGER, EVIDENCE_SOURCE_INCONSISTENT),
+    EXECUTION_STATUS_PARTIAL: (EVIDENCE_SOURCE_LEDGER, EVIDENCE_SOURCE_INCONSISTENT),
+    EXECUTION_STATUS_NOT_EXECUTED: (
+        EVIDENCE_SOURCE_LEDGER, EVIDENCE_SOURCE_LEGACY, EVIDENCE_SOURCE_INCONSISTENT,
+    ),
+    EXECUTION_STATUS_UNKNOWN: (
+        EVIDENCE_SOURCE_LEDGER, EVIDENCE_SOURCE_LEGACY, EVIDENCE_SOURCE_INCONSISTENT,
+        EVIDENCE_SOURCE_ABSENT,
+    ),
+}
+
+#: identity 的来源。审计必须看得见"这条身份是怎么来的"，否则一个字符串无法复核。
+IDENTITY_KIND_FILL_EVENT_KEY = "fill_event_key"
+IDENTITY_KIND_FILL_EVENT_KEY_SET = "fill_event_key_set"
+IDENTITY_KIND_ORDER_ONLY = "order_id_only"
+#: 部分成交行缺 ``event_key``（两个身份列都可空，旧行没有 event_key）。此时**不**能
+#: 用"存在的那几个 key"代表整笔成交的身份：那会把一条混合了新旧的成交说成一个完整的
+#: 逐次身份。身份退成 ``order:<id>``，并由本 kind 明确说明原因。
+IDENTITY_KIND_INCOMPLETE_EVENT_KEYS = "fill_event_key_incomplete"
+IDENTITY_KINDS = (
+    IDENTITY_KIND_FILL_EVENT_KEY, IDENTITY_KIND_FILL_EVENT_KEY_SET,
+    IDENTITY_KIND_ORDER_ONLY, IDENTITY_KIND_INCOMPLETE_EVENT_KEYS,
+)
+
+
+class ExecutionFactContractError(ValueError):
+    """owner fact contract 的构造被拒绝 —— fail closed。
+
+    ``reason`` 是稳定 machine code，供调用方与测试依赖；文案本身不承载判定：
+
+    * ``not_execution_evidence`` —— 入口收到非 typed ``ExecutionEvidence``（含子类）；
+    * ``unknown_verification_status`` —— 状态不在 owner 的四态闭集里；
+    * ``unknown_evidence_source`` —— 证据来源不在 owner 的闭集里；
+    * ``illegal_verification_pair`` —— 状态与来源的组合不在合法组合表里；
+    * ``alien_verification_scope`` —— 核验声明不是本 owner 的核验范围；
+    * ``non_canonical_verification`` —— 声明与 ``verification_contract`` 的产出不精确相等
+      （伪造的 version / 相反的 is_verified / 额外字段）；
+    * ``identity_unavailable`` —— 既没有完整成交身份，也没有可用的 order id；
+    * ``unknown_identity_kind`` / ``alien_identity`` —— identity 形态非法；
+    * ``version_mismatch`` —— fact contract 版本不符；
+    * ``field_not_an_evidence_field`` —— 三态字段缺失或名不对。
+    """
+
+    def __init__(self, reason: str, detail: str = "") -> None:
+        self.reason = str(reason)
+        text = self.reason if not detail else "%s: %s" % (self.reason, detail)
+        super().__init__(text)
+
+
+def verification_contract(status: Any, source: Any) -> Mapping:
+    """execution owner **正式发布**的一条核验声明（owner-native 词表）。
+
+    返回 owner 自己的维度：``verification_status`` 是四态之一，``verification_source``
+    是证据来源之一，``verification_scope`` 说明"这条核验是关于什么的"。它**不是** market
+    的 ``(verification, verification_method)`` 对，也刻意不做任何到那套词表的翻译 ——
+    翻译就是由非 owner 发明核验结论。
+
+    非法词表或**不可能的组合**一律 :class:`ExecutionFactContractError`，
+    而不是被静默降级成"看起来能用"。
+    """
+    text_status = str(status or "")
+    text_source = str(source or "")
+    if text_status not in EXECUTION_STATUSES:
+        raise ExecutionFactContractError(
+            "unknown_verification_status", f"{text_status!r} not in {EXECUTION_STATUSES}",
+        )
+    if text_source not in EVIDENCE_SOURCES:
+        raise ExecutionFactContractError(
+            "unknown_evidence_source", f"{text_source!r} not in {EVIDENCE_SOURCES}",
+        )
+    if text_source not in _LEGAL_SOURCES_BY_STATUS.get(text_status, ()):
+        raise ExecutionFactContractError(
+            "illegal_verification_pair",
+            f"{text_status!r} cannot carry source {text_source!r}",
+        )
+    # 不可变：投影是 frozen dataclass，但嵌套的 dict 是可变的 —— 拿到一条合法投影的人
+    # 可以改掉 ``verification["verification_status"]``，然后 ``as_dict()`` 会用同一个
+    # "owner 已发布"的对象发布一个被改过的裁决。这里用只读视图封住它
+    # （与 ``ai_research_contract`` 冻结 payload 的手法一致）。
+    return MappingProxyType({
+        "verification_scope": EXECUTION_VERIFICATION_SCOPE,
+        "verification_version": EXECUTION_VERIFICATION_VERSION,
+        "verification_status": text_status,
+        "verification_source": text_source,
+        "is_verified": is_verified_status(text_status),
+    })
+
+
+def _fact_identity(provenance: Any, order_id: Any) -> tuple:
+    """owner 派生的 identity，以及它是怎么来的。
+
+    * 有**完整**的逐次成交身份（``event_key``）→ 用它；多个成交 → 按排序后拼接
+      （``identity_kind`` 说明这是一条**成交集合**的身份，而不是某一次成交）；
+    * 只有部分成交行带 ``event_key`` → 不冒充完整身份，退成 ``order:<id>`` 并标注
+      ``fill_event_key_incomplete``；
+    * 没有任何成交身份 → ``order:{id}``，并且 ``identity_kind`` 明确写
+      ``order_id_only``：这只标识**委托**，不冒充"逐次执行事实身份"。
+
+    **没有可用的 order id 时 fail closed**（``identity_unavailable``）。绝不拼出
+    ``order:None`` / ``order:`` 这种"看起来稳定、其实会把多条不同事实撞成同一条"的
+    占位身份 —— 那正是本轮 identity contract 要根除的东西。
+    """
+    data = provenance if isinstance(provenance, Mapping) else {}
+    keys = sorted({
+        str(item) for item in (data.get("fill_event_keys") or []) if str(item or "").strip()
+    })
+    usable = _int_or_zero(data.get("fill_rows"))
+    recorded = _int_or_zero(data.get("fill_event_key_rows"))
+    if usable and recorded < usable:
+        return "order:%s" % _required_identity_anchor(order_id), IDENTITY_KIND_INCOMPLETE_EVENT_KEYS
+    if len(keys) == 1:
+        return keys[0], IDENTITY_KIND_FILL_EVENT_KEY
+    if keys:
+        return "|".join(keys), IDENTITY_KIND_FILL_EVENT_KEY_SET
+    return "order:%s" % _required_identity_anchor(order_id), IDENTITY_KIND_ORDER_ONLY
+
+
+def _required_identity_anchor(order_id: Any) -> Any:
+    """identity 的兜底锚点：必须是**真实存在**的 order id。
+
+    ``ExecutionEvidence.order_id`` 默认允许 ``None``，所以这里不能直接字符串化：
+    ``"order:%s" % None`` 是一个非空字符串，会被 ``__post_init__`` 当成合法 identity，
+    于是多条没有 order id 的不同事实共享同一个身份。
+    """
+    if isinstance(order_id, bool) or order_id is None:
+        raise ExecutionFactContractError(
+            "identity_unavailable",
+            "no complete fill event identity and no usable order id",
+        )
+    if isinstance(order_id, int):
+        return order_id
+    text = str(order_id).strip()
+    if not text:
+        raise ExecutionFactContractError(
+            "identity_unavailable",
+            "no complete fill event identity and no usable order id",
+        )
+    return text
+
+
+#: 业务日必须是**可证明的**交易日写法（``YYYY-MM-DD``）。数据库列是 TEXT，契约不能
+#: 因为"非空"就把 ``banana`` 发布成 typed PIT 事实。
+_BUSINESS_DAY_RE = re.compile(r"\d{4}-\d{2}-\d{2}\Z")
+
+
+def _is_business_day(value: Any) -> bool:
+    text = str(value or "")
+    if not _BUSINESS_DAY_RE.match(text):
+        return False
+    try:
+        dt.date.fromisoformat(text)
+    except ValueError:
+        return False
+    return True
+
+
+def _is_observed_at(value: Any) -> bool:
+    """观测时点必须是**带时区**的可解析时间戳。
+
+    不带时区的时间戳不是一个可证明的瞬时（它取决于解释方的时区），因此不发布为
+    ``known``。这一条宁可在 owner contract 里 fail closed，也不要让脏值流到
+    research adapter 再被发现。
+    """
+    text = str(value or "")
+    if not text:
+        return False
+    try:
+        parsed = dt.datetime.fromisoformat(text)
+    except ValueError:
+        return False
+    return parsed.tzinfo is not None
+
+
+def _int_or_zero(value: Any) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _single_value(field_name: str, values: Any, *, subject: str,
+                  recorded_rows: Any = None, usable_rows: Any = None,
+                  validator=None) -> EE.EvidenceField:
+    """逐成交的取值聚合成一个 owner 字段。
+
+    只有一个不同取值 → ``known``；多个不同取值 → ``unknown`` 并把集合写进 ``detail``。
+    刻意**不**挑一个代表值，也刻意不取 min/max：一次跨业务日的成交，报"某一个业务日"
+    就是在编造一个它没有的 PIT 事实。
+
+    ``recorded_rows`` / ``usable_rows`` 是**完整性**判据：两个身份列都可空，所以一次
+    混合了新旧的成交可能只有部分流水带时间戳。那种情况下报 ``known`` 等于把"其中一条
+    有"说成"这一整笔有" —— 因此只要行数对不上就报 ``unknown``。
+
+    ``validator`` 是**格式**判据：``business_day`` 必须是 ``YYYY-MM-DD``，``observed_at``
+    必须是带时区的可解析时间戳。格式不合法同样报 ``unknown``（不是 known、也不是
+    not_applicable）—— 契约在 owner 这一侧就拒绝把脏值发布成 typed PIT 事实。
+    """
+    if recorded_rows is not None and usable_rows is not None:
+        recorded, usable = _int_or_zero(recorded_rows), _int_or_zero(usable_rows)
+        if recorded < usable:
+            return EE.EvidenceField.unknown(
+                field_name, source=EXECUTION_VERIFICATION_SCOPE,
+                detail="%s is recorded for only %d of %d usable fills"
+                       % (subject, recorded, usable),
+            )
+    distinct = sorted({str(item) for item in (values or ()) if str(item or "").strip()})
+    if len(distinct) == 1:
+        value = distinct[0]
+        if validator is not None and not validator(value):
+            return EE.EvidenceField.unknown(
+                field_name, source=EXECUTION_VERIFICATION_SCOPE,
+                detail="%s is not a provable value: %r" % (subject, value[:40]),
+            )
+        return EE.EvidenceField.known(
+            field_name, value, source=EXECUTION_VERIFICATION_SCOPE,
+        )
+    if distinct:
+        return EE.EvidenceField.unknown(
+            field_name, source=EXECUTION_VERIFICATION_SCOPE,
+            detail="%s spans several values: %s" % (subject, distinct),
+        )
+    return EE.EvidenceField.unknown(
+        field_name, source=EXECUTION_VERIFICATION_SCOPE,
+        detail="no %s recorded by the owner for this fact" % subject,
+    )
+
+
+@dataclass(frozen=True, slots=True, init=False)
+class ExecutionFactProjection:
+    """execution owner 对**一条 execution fact** 的正式投影。
+
+    研究层将来引用一条 execution 事实时，读到的就是它：身份、业务日、观测时点、
+    以及 owner 自己的核验声明。它**不**包含 research 语义，也**不**携带 market 词表。
+
+    **没有公开 raw 构造器。** ``ExecutionFactProjection(...)`` 一律抛 ``TypeError``；
+    唯一签发路径是 :func:`fact_projection`（它再走私有 :func:`_issue_fact_projection`）。
+    否则任何调用方都能拿一个自造的 ``identity`` / 业务日字段拼出一个与 owner 签发的对象
+    **无法区分**的投影 —— "唯一发布入口"就只是一句声明。这与
+    ``ai_research_contract.ResearchEvidenceRef`` 的处理方式一致。
+
+    ``business_day`` 与 ``observed_at`` 刻意都是三态字段：一次被拒/被撤的委托今天
+    **没有** owner 记录的业务日（``paper_orders`` 没有交易日列），因此它如实报
+    ``unknown`` —— 而不是拿 ``created_at`` 的墙钟日期冒充。这个缺口是 R27-B2C-1 明确
+    记录的下一步前置条件，不是被隐藏的"以后再说"。
+    """
+
+    version: str
+    identity: str
+    identity_kind: str
+    order_id: Any
+    lifecycle_state: str
+    fill_verdict: str
+    business_day: EE.EvidenceField
+    observed_at: EE.EvidenceField
+    verification: Mapping
+    inconsistencies: tuple
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        raise TypeError(
+            "ExecutionFactProjection has no public constructor: 调用方不能自述一条 "
+            "execution 事实的身份 / 业务日 / 核验结论。请使用 fact_projection(evidence) —— "
+            "identity、business_day、observed_at 与 verification 全部由 owner 从它自己"
+            "记录的证据派生"
+        )
+
+    def __post_init__(self) -> None:
+        if self.version != EXECUTION_FACT_CONTRACT_VERSION:
+            raise ExecutionFactContractError(
+                "version_mismatch",
+                f"{self.version!r} != {EXECUTION_FACT_CONTRACT_VERSION!r}",
+            )
+        if self.identity_kind not in IDENTITY_KINDS:
+            raise ExecutionFactContractError("unknown_identity_kind", str(self.identity_kind))
+        if not str(self.identity or "").strip():
+            raise ExecutionFactContractError("alien_identity", "identity must be non-empty")
+        for name, holder in (("business_day", self.business_day), ("observed_at", self.observed_at)):
+            if not isinstance(holder, EE.EvidenceField) or holder.name != name:
+                raise ExecutionFactContractError(
+                    "field_not_an_evidence_field",
+                    f"{name} must be an EvidenceField named {name!r}",
+                )
+        declared = dict(self.verification or {})
+        # 核验声明必须是 owner **自己**发布的 canonical 形状。三层判定，每层给一个更具体的
+        # 原因（"范围不对"与"版本/布尔位被改过"是不同的事故，不该共用一个 reason）：
+        #
+        #   1. 范围必须是本 owner 的核验范围；
+        #   2. 状态 / 来源必须是 owner 的闭集词，且组合合法；
+        #   3. 整份 mapping 与 ``verification_contract(status, source)`` **精确相等** ——
+        #      含 scope / version / status / source / is_verified 五个字段，且**不接受额外字段**。
+        #
+        # 只校验前两层是不够的：那样同一个对象可以同时说 ``status='verified'`` 与
+        # ``is_verified=False``，或者带一个伪造的 ``verification_version``，而下游只会看到
+        # "这是一条已发布的裁决"。
+        if declared.get("verification_scope") != EXECUTION_VERIFICATION_SCOPE:
+            raise ExecutionFactContractError(
+                "alien_verification_scope",
+                f"verification scope is {declared.get('verification_scope')!r}, expected "
+                f"{EXECUTION_VERIFICATION_SCOPE!r}",
+            )
+        canonical = dict(verification_contract(
+            declared.get("verification_status"), declared.get("verification_source"),
+        ))
+        if declared != canonical:
+            extra = sorted(set(declared) - set(canonical))
+            raise ExecutionFactContractError(
+                "non_canonical_verification",
+                "verification statement does not match the owner statement"
+                + (f"; unexpected fields {extra}" if extra else ""),
+            )
+
+    def as_dict(self) -> Mapping:
+        return {
+            "version": self.version,
+            "identity": self.identity,
+            "identity_kind": self.identity_kind,
+            "order_id": self.order_id,
+            "lifecycle_state": self.lifecycle_state,
+            "fill_verdict": self.fill_verdict,
+            "business_day": self.business_day.as_dict(),
+            "observed_at": self.observed_at.as_dict(),
+            "verification": dict(self.verification or {}),
+            "inconsistencies": list(self.inconsistencies),
+        }
+
+
+def _issue_fact_projection(**fields: Any) -> ExecutionFactProjection:
+    """签发一条 owner fact 投影。只有 :func:`fact_projection` 调用它。
+
+    绕过恒抛错的 ``__init__`` 并在设置完全部字段后跑 ``__post_init__``，使校验逻辑仍然
+    只有一份、且紧挨字段定义（与 ``ai_research_contract._issue_evidence_ref`` 同一手法）。
+    """
+    projection = object.__new__(ExecutionFactProjection)
+    for name, value in fields.items():
+        object.__setattr__(projection, name, value)
+    projection.__post_init__()
+    return projection
+
+
+def fact_projection(evidence: Any, *, fill_rows_present: bool = True) -> ExecutionFactProjection:
+    """把一个 :class:`execution_evidence.ExecutionEvidence` 投影成 owner fact contract。
+
+    这是"owner 发布事实"的**唯一**入口：身份、业务日、观测时点全部从 owner 自己记录的
+    ``provenance`` 派生，核验声明由 :func:`verification_contract` 出。调用方
+    **不能**提供这些值（签名里没有这些参数），也无法绕开本函数自造一个投影。
+
+    **入口先做类型校验**：``evidence`` 必须是真正的
+    :class:`execution_evidence.ExecutionEvidence`（``type(...) is``，子类也不算）。
+    少了这一步，一个普通伪对象只要实现 ``fill_verdict_value()`` / ``inconsistencies()``
+    并塞一个看起来合法的 ``provenance``，就能让本函数发布一条 ``verified + ledger`` 的
+    "owner projection" —— 那会让"owner contract"这个边界形同虚设。
+
+    **已知限制（不假装已关闭）**：``ExecutionEvidence`` 本身仍是公开可构造的，因此
+    "手工造 evidence → fact_projection(...)" 仍是一条两步伪造路径，与
+    ``MarketDataReading`` 在 R27-A 的情况相同。本层关闭的是
+    *contract-issued execution projection*；*owner-origin provenance* 仍是
+    **OPEN / REQUIRED**，由 owner/provenance 架构（B2C-2 起）继续关闭。
+    """
+    if type(evidence) is not EE.ExecutionEvidence:
+        raise ExecutionFactContractError(
+            "not_execution_evidence",
+            "fact_projection requires a typed execution_evidence.ExecutionEvidence; "
+            f"got {type(evidence).__name__} — 伪对象不得冒充 owner 证据",
+        )
+    verdict = verification_from_evidence(evidence, fill_rows_present=fill_rows_present)
+    provenance = getattr(evidence, "provenance", None) or {}
+    usable = provenance.get("fill_rows")
+    identity, identity_kind = _fact_identity(provenance, getattr(evidence, "order_id", None))
+    return _issue_fact_projection(
+        version=EXECUTION_FACT_CONTRACT_VERSION,
+        identity=identity,
+        identity_kind=identity_kind,
+        order_id=getattr(evidence, "order_id", None),
+        lifecycle_state=str(getattr(evidence, "lifecycle_state", "") or ""),
+        fill_verdict=str(evidence.fill_verdict_value()),
+        business_day=_single_value(
+            "business_day", provenance.get("fill_sessions"), subject="a fill business date",
+            recorded_rows=provenance.get("fill_session_rows"), usable_rows=usable,
+            validator=_is_business_day,
+        ),
+        observed_at=_single_value(
+            "observed_at", provenance.get("fill_observed_ats"), subject="a fill observation time",
+            recorded_rows=provenance.get("fill_observed_at_rows"), usable_rows=usable,
+            validator=_is_observed_at,
+        ),
+        verification=verification_contract(
+            verdict["execution_status"], verdict["execution_evidence_source"],
+        ),
+        inconsistencies=tuple(evidence.inconsistencies()),
+    )
 
 
 # ───────────────────────────── self-check ─────────────────────────────
