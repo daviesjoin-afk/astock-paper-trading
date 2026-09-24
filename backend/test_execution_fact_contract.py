@@ -239,8 +239,71 @@ class FailClosedTests(unittest.TestCase):
         for reason, override in cases:
             with self.subTest(reason=reason, override=str(override)[:40]):
                 with self.assertRaises(EV.ExecutionFactContractError) as caught:
-                    EV.ExecutionFactProjection(**{**good, **override})
+                    EV._issue_fact_projection(**{**good, **override})
                 self.assertEqual(reason, caught.exception.reason)
+
+    def test_EXFACT_12_the_projection_has_no_public_raw_constructor(self):
+        """EXFACT-12：调用方不能自造一个与 owner 签发无法区分的投影。
+
+        少了这一条，"唯一发布入口"只是声明：任何调用方都能拼一个自述身份 / 业务日的对象，
+        而它的形状与 owner 签发的完全一样。这与 ``ResearchEvidenceRef`` 同一处理方式。
+        """
+        base = _projection(fills=(_fill(event_key=KEY_A),))
+        with self.assertRaises(TypeError):
+            EV.ExecutionFactProjection(
+                version=base.version, identity="forged", identity_kind=base.identity_kind,
+                order_id=7, lifecycle_state=base.lifecycle_state,
+                fill_verdict=base.fill_verdict, business_day=base.business_day,
+                observed_at=base.observed_at, verification=base.verification,
+                inconsistencies=(),
+            )
+        # 非空性：正常路径仍然可用。
+        self.assertIsInstance(base, EV.ExecutionFactProjection)
+
+    def test_EXFACT_13_the_nested_verification_declaration_is_immutable(self):
+        """EXFACT-13：投影 frozen，但嵌套的核验声明也必须不可改。
+
+        否则拿到一条合法投影的人可以改掉 ``verification["verification_status"]``，
+        然后 ``as_dict()`` 会用同一个"owner 已发布"的对象发布一个被改过的裁决。
+        """
+        projection = _projection(fills=(_fill(event_key=KEY_A),))
+        declared = projection.verification
+        for key in ("verification_status", "is_verified", "verification_scope"):
+            with self.subTest(key=key):
+                with self.assertRaises(TypeError):
+                    declared[key] = "tampered"
+        # as_dict 仍然给出可序列化的普通映射，且内容未被改动。
+        self.assertEqual(
+            EV.EXECUTION_STATUS_VERIFIED, projection.as_dict()["verification"]["verification_status"],
+        )
+
+    def test_EXFACT_14_partial_fill_evidence_does_not_become_a_whole_fact_claim(self):
+        """EXFACT-14：混合新旧流水时，只有部分行带证据 → 不得声称整笔都有。
+
+        两个身份列都可空（旧行没有 ``event_key``，``quote_at`` 也可能为空）。若聚合只把
+        "存在的值"交出去，一次混合成交就会被说成"有一个观测时点 / 有一个完整身份"，
+        而其中一些被包含进来的流水根本没有该证据。
+        """
+        projection = _projection(fills=(
+            _fill(event_key=KEY_A, quote_at=OBSERVED_AT),
+            _fill(event_key="", quote_at=""),          # 旧行：两个身份列都空
+        ))
+        # 业务日两行都有（生产里 fill_date 是 NOT NULL）→ 仍然 known。
+        self.assertTrue(projection.business_day.is_known)
+        # 观测时点与身份都**不完整** → 不许报 known / 不许冒充完整身份。
+        self.assertTrue(projection.observed_at.is_unknown)
+        self.assertIn("1 of 2", str(projection.observed_at.detail))
+        self.assertEqual(EV.IDENTITY_KIND_INCOMPLETE_EVENT_KEYS, projection.identity_kind)
+        self.assertEqual("order:7", projection.identity)
+        self.assertNotEqual(KEY_A, projection.identity)
+
+        # 非空性：业务日的完整性判据同样真的会生效（合成一行缺 fill_date 的流水）。
+        no_session = _projection(fills=(
+            _fill(event_key=KEY_A),
+            _fill(event_key=KEY_B, fill_date=""),
+        ))
+        self.assertTrue(no_session.business_day.is_unknown)
+        self.assertIn("1 of 2", str(no_session.business_day.detail))
 
 
 class SingleSourceTests(unittest.TestCase):

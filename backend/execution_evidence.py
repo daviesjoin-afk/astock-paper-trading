@@ -566,6 +566,12 @@ def _aggregate_fills(fill_rows: Any) -> dict:
         "sessions": sessions,
         "observed_ats": observed_ats,
         "event_keys": event_keys,
+        # 逐行**完整性**必须一起带出来：两个身份列都是可空的（旧行没有 event_key，
+        # quote_at 也可能为空）。只把"存在的值"交出去，会让一次混合了新旧的成交被
+        # 聚合成"有一个业务日 / 有一个身份"，而另一些被包含进来的成交根本没有该证据。
+        "session_rows": len(sessions),
+        "observed_at_rows": len(observed_ats),
+        "event_key_rows": len(event_keys),
     }
 
 
@@ -736,6 +742,11 @@ def evidence_from_order(
             "fill_sessions": aggregated["sessions"],
             "fill_observed_ats": aggregated["observed_ats"],
             "fill_event_keys": aggregated["event_keys"],
+            # 与 "fill_rows" 配对使用：只有三者相等，聚合出的业务日/观测时点/身份才是
+            # "这一整笔成交都具备"的证据，而不是"其中一条具备"。
+            "fill_session_rows": aggregated["session_rows"],
+            "fill_observed_at_rows": aggregated["observed_at_rows"],
+            "fill_event_key_rows": aggregated["event_key_rows"],
             "available_qty_source": available_source,
         },
         fees=fields["fees"],
