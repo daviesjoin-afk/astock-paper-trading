@@ -141,7 +141,9 @@ The engine is **paper trading only**. It does not include broker routing, levera
 
 ## Quick start
 
-Requirements: **Python 3.14**. Docker is optional.
+Requirements: **Python 3.14** (the canonical development / CI / container runtime). Docker is optional.
+
+The single exception is the `native-centos9` native deployment profile: CentOS Stream 9's default repositories do not ship 3.14, so that profile stays on Python 3.11 as an **explicit legacy deployment exception**, to be migrated or retired in a separate reviewed change (see [`deploy/README.md`](deploy/README.md)). It is not a second canonical runtime baseline and not a PR compatibility lane, and it is not permission to reintroduce 3.11 into development, CI, Docker or the test matrix.
 
 ### Windows
 

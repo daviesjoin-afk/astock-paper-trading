@@ -163,28 +163,37 @@ _DATE_ONLY = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 # gave day precision or instant precision, so an intraday timestamp can never be
 # mistaken for a date.
 _DAY_PRECISION = re.compile(r"^\d{4}[-/]\d{2}[-/]\d{2}$")
-# A *spelling* gate for the one fraction ``datetime.fromisoformat`` destroys.
-# The parser normalizes a **zero** offset -- in any grammar ISO 8601 allows --
-# to a plain ``timezone.utc`` and, before 3.14, *discards* any fractional second
-# on it, so ``2026-01-02T10:00:00+00:00:00.100000`` parses to a datetime whose
-# wall ``microsecond`` is 0 **and** whose absolute ``microsecond`` is 0 -- the
+# A *spelling* gate for the one fraction a fraction-collapsing parser loses.
+# Parsing normalizes a **zero** offset -- in any grammar ISO 8601 allows -- to a
+# plain ``timezone.utc``, and some parser versions go on to *discard* any
+# fractional second spelled on it, so
+# ``2026-01-02T10:00:00+00:00:00.100000`` parses to a datetime whose wall
+# ``microsecond`` is 0 **and** whose absolute ``microsecond`` is 0 -- the
 # sub-second information is gone before either semantic check can observe it,
 # and two spellings encoding *different* fractional offsets (``.100000`` vs
 # ``.900000``) would collapse onto one dataset identity.
 #
-# Empirically only a **zero** offset loses data: ``+00:00:01.5``,
-# ``+00:30:00.5``, ``+08:00:00.5`` and every other non-zero offset keep their
-# fraction and are still handled by the semantic checks.  The gate is therefore
-# deliberately narrow: an offset sign, a zero offset in *any* grammar ISO 8601
-# allows (``+00``, ``+0000`` / ``+00:00``, ``+000000`` / ``+00:00:00``), then a
-# decimal separator and a fraction containing a non-zero digit.  Spelling all
-# three grammars matters, because the parser reads -- and, before 3.14, discards
-# -- a trailing fraction on the hours-only and hours+minutes forms exactly as it
-# does on the explicit-seconds form; keying on the seconds-bearing shape alone
-# left ``+00.5`` / ``+0000.5`` / ``+00:00.5`` free to collapse onto a whole
-# second.  The ``$`` anchor keeps the match on the trailing offset (the only
-# place an offset can appear) while still admitting further fraction digits, and
-# the non-zero digit keeps an explicit **all-zero** fraction
+# Whether a given parser collapses that fraction is interpreter-specific and may
+# change between patch releases, so the dataset contract must not be allowed to
+# depend on it.  The gate therefore decides on the *spelling*, before parsing:
+# **a spelling that carries non-zero sub-second offset information must never be
+# allowed to collapse onto the same canonical dataset identity as a whole-second
+# offset** -- on any interpreter, whether or not the running parser would have
+# destroyed the fraction by itself.
+#
+# Only a **zero** offset is at risk: ``+00:00:01.5``, ``+00:30:00.5``,
+# ``+08:00:00.5`` and every other non-zero offset keep their fraction and are
+# still handled by the semantic checks.  The gate is therefore deliberately
+# narrow: an offset sign, a zero offset in *any* grammar ISO 8601 allows
+# (``+00``, ``+0000`` / ``+00:00``, ``+000000`` / ``+00:00:00``), then a decimal
+# separator and a fraction containing a non-zero digit.  Spelling all three
+# grammars matters, because a trailing fraction on the hours-only and
+# hours+minutes forms is read -- and, on a collapsing parser, swallowed --
+# exactly as it is on the explicit-seconds form; keying on the seconds-bearing
+# shape alone would leave ``+00.5`` / ``+0000.5`` / ``+00:00.5`` free to collapse
+# onto a whole second.  The ``$`` anchor keeps the match on the trailing offset
+# (the only place an offset can appear) while still admitting further fraction
+# digits, and the non-zero digit keeps an explicit **all-zero** fraction
 # (``+00:00.000000``) a legitimate whole second, exactly like ``+00:00``.
 # Keying on this *grammar* rather than on a colon (as the removed
 # ``:\d{2}[.,]\d+`` did) is what makes it spelling-independent.  A whole-second
@@ -445,17 +454,20 @@ def _normalize_cutoff(value: Any) -> Optional[str]:
       instead of silently falling back to a looser cutoff.
     * a cutoff carrying **sub-second** precision *anywhere* -- in the wall clock
       (``10:00:00.5+08:00``), in the UTC offset (``10:00:00+08:00:00.5``), in an
-      offset ``datetime.fromisoformat`` would silently *discard*
+      offset a fraction-collapsing parser can silently swallow
       (``10:00:00+00:00:00.100000``, or the same fraction on an abbreviated zero
       offset such as ``10:00:00+00:00.100000``), or below the microsecond
-      resolution the parser can represent at all
+      resolution ``datetime`` can represent at all
       (``10:00:00.0000001+08:00`` / ``10:00:00+08:00:00.0000001``) -- is refused
       for the same reason: the canonical PIT clock is second-granularity, so
       rounding it would move the freeze and collapse two distinct instants onto
-      one dataset identity.  The decision is semantic wherever the parser
-      preserves the fraction, plus a narrow *spelling* gate for each fraction
-      the parser destroys -- see below.  An all-zero fraction (``.000000`` or
-      ``.0000000``) still spells a whole second, and stays accepted.
+      one dataset identity.  The decision is semantic wherever the parsed value
+      still carries the fraction, plus a narrow *spelling* gate for each
+      fraction a parser may destroy -- see below.  Because which fractions a
+      parser destroys is interpreter-specific, each gate is decided on the
+      spelling **before** parsing rather than on what the running parser
+      returns.  An all-zero fraction (``.000000`` or ``.0000000``) still spells
+      a whole second, and stays accepted.
 
     Equivalent spellings of the same instant (``+08:00``, ``Z``, naive
     exchange-local, or an already-canonical ``+00:00``) collapse to one string.
@@ -465,12 +477,13 @@ def _normalize_cutoff(value: Any) -> Optional[str]:
         return None
     if _ZERO_OFFSET_FRACTION.search(text):
         # Parser-loss boundary -- see ``_ZERO_OFFSET_FRACTION``.  This runs
-        # *before* parsing because ``datetime.fromisoformat`` destroys the
-        # fraction of a zero offset: by the time a parsed value exists, both the
-        # wall clock and the absolute instant read as a whole second, so no
-        # semantic check can still see the fraction the caller spelled.  Only
-        # the fractions the parser *discards* need a spelling gate; every other
-        # sub-second spelling is caught semantically below.
+        # *before* parsing because a fraction-collapsing parser leaves no trace
+        # of the fraction in the parsed value: once one exists, the wall clock
+        # and the absolute instant can both read as a whole second, so no
+        # semantic check can still see what the caller spelled.  Whether the
+        # running interpreter would have collapsed it is exactly the
+        # interpreter-specific detail this gate keeps out of the contract; every
+        # other sub-second spelling is caught semantically below.
         return None
     if _SUB_MICROSECOND_FRACTION.search(text):
         # Below the canonical clock *and* below what the parser can hold at all

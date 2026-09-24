@@ -191,7 +191,9 @@ docker-compose.yml      本地/单机容器运行
 
 ## 一键启动
 
-要求：**Python 3.14**。Docker 可选。
+要求：**Python 3.14**（canonical development / CI / container runtime）。Docker 可选。
+
+唯一例外是 `native-centos9` 原生部署 profile：CentOS Stream 9 的默认仓库不提供 3.14，该 profile 仍使用 Python 3.11，属于**明确保留的 legacy 部署例外**，其升级或退役另开独立 PR 处理（见 [`deploy/README.md`](deploy/README.md)）。该例外不得被用来把 3.11 重新引入开发环境、CI、Docker 或测试矩阵。
 
 ### Windows
 
