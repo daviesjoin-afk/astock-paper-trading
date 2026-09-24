@@ -1,21 +1,50 @@
 # -*- coding: utf-8 -*-
-"""Cycle/as-of bounded portfolio read model.
+"""Cycle/as-of bounded portfolio read model —— portfolio/accounting **factual owner**.
 
 Authority and dependency direction::
 
     verified execution / durable lot facts
             |
             v
-    cycle/as-of bounded portfolio facts
+    cycle/as-of bounded portfolio facts          （本模块：唯一 owner）
             |
-            v
-    API / dashboard / risk / research consumers
+            +--> API / dashboard / risk consumers
+            |
+            +--> PortfolioFactProjection   （owner fact contract，R27-B2C-4B）
+                        |
+                        v
+                 ai_research_portfolio_adapter （只翻译，不判定）
+                        |
+                        v
+                 ai_research_contract.ResearchEvidenceRef
 
 This module is read-only.  It never imports :mod:`paper_trading`, never inserts
 or updates execution facts, and never resolves the active cycle or the machine
 clock.  The only market-value input is an explicit ``valuations`` mapping; a
 missing price stays ``None`` (unknown) instead of falling back to a current
 quote.
+
+──────────────── authority 边界：本模块**不**拥有 NAV ────────────────
+
+``portfolio_for_context(...)`` 可以接收调用方显式传入的价格映射并据此算出
+``market_value`` / ``unrealized_pnl`` / ``nav``。那只是"调用方给了一个合法数字"，
+**不能**证明这些价格来自 R24 market owner、通过了哪套核验、对应哪个真实 market
+snapshot。因此 typed fact contract（:func:`accounting_fact_projections`）**刻意不发布**
+``nav`` / ``latest_nav`` / ``prior_nav`` / ``daily_pnl`` / ``daily_return`` /
+``market_value`` / ``unrealized_pnl`` / ``benchmark`` / 估值价格 / ``quote_status``，
+其签名也不接受 ``valuations`` / ``MarketDataReading`` / current quote。
+
+```text
+portfolio ledger authority   现金 / 已实现盈亏 / 持仓成本 / cycle·account·asof 身份
+market valuation authority   估值价格 / market 核验 / market observation 的 as-of
+cross-owner composition      NAV / 市值 / 未实现盈亏 / 日 PnL / 日收益   （B2C-4C）
+```
+
+把 caller 提供的裸价格升级成"owner 已证明的估值"，就是伪造 provenance —— 这正是
+R27 要根除的东西。``paper_nav`` 本轮仍是 legacy/compatibility（它的
+``quote_status='verified'`` 不是 R24 的 OwnerVerification，也没有 typed market evidence
+identity），因此**不**被读来签发 typed fact；``paper_positions`` 同理仍是
+compatibility-only 投影，**不**作为 typed fact 的事实来源。
 """
 from __future__ import annotations
 
@@ -50,6 +79,18 @@ __all__ = [
     "initial_capital",
     "compatibility_cash",
     "portfolio_for_cycle",
+    # owner fact contract（R27-B2C-4B）
+    "PORTFOLIO_FACT_CONTRACT_VERSION",
+    "PORTFOLIO_FACT_VERIFICATION_SCOPE",
+    "PORTFOLIO_FACT_CASH",
+    "PORTFOLIO_FACT_REALIZED_PNL",
+    "PORTFOLIO_FACT_POSITION_COST_SUMMARY",
+    "PORTFOLIO_FACT_KINDS",
+    "PORTFOLIO_FACT_STATUSES",
+    "PortfolioFactContractError",
+    "PositionCostSummary",
+    "PortfolioFactProjection",
+    "accounting_fact_projections",
 ]
 
 PORTFOLIO_READ_MODEL_VERSION = "portfolio-read-model-v1"
@@ -1277,4 +1318,368 @@ def portfolio_for_cycle(
         PortfolioReadContext(cycle_id=cycle_id, asof_day=asof_day),
         account_id=account_id,
         valuations=valuations,
+    )
+
+
+# ─────────────────── owner fact contract（R27-B2C-4B）───────────────────
+#
+# 这一段是 portfolio/accounting owner **正式发布**的 fact contract：它回答"这个
+# account 在这个 cycle 的这个业务日上，哪些记账事实能被证明"。三条刻意的边界：
+#
+# * **不回答 research 语义**（status / reason / 支持什么 thesis）—— 那些属于 research。
+# * **不重复 market 词表**：本 owner 的核验范围是"cycle + account + asof 上的记账重建"，
+#   不是"行情是否可信"。把 market 的 ``verification / verification_method`` 抄过来，
+#   research 层就再也分不清"组合账本被证明"与"估值被证明"。
+# * **不接受调用方提供的估值**。``nav`` / ``market_value`` / ``unrealized_pnl`` /
+#   ``daily_pnl`` / ``daily_return`` 是**跨 owner 组合**事实（portfolio ledger + R24
+#   market valuation），因此**不在**本契约的发布面上，签名里也没有 ``valuations``。
+#
+# fail closed 的两条硬规则（与 ``ExecutionFactContract`` 同一风格）：
+#
+# * ``status == unknown`` 时 ``value`` **必须**是 ``None``。绝不允许
+#   ``status=unknown, value=123.45`` —— 那会让消费者忽略 status 后偷偷用一个没有被
+#   证明的数字。
+# * 归属（account 属于该 cycle、且在 asof 前已挂载）不可证明时，三种事实**全部**
+#   ``unknown``，而不是"没卖出所以已实现盈亏 = verified 0"。（见 PFACT-06）
+
+PORTFOLIO_FACT_CONTRACT_VERSION = "portfolio-fact-v1"
+
+#: 本 owner 的核验**语义范围**。research 层必须能区分"组合记账是否被重建证明"与
+#: "行情估值是否可信" —— 两者是不同维度，因此范围是契约的一部分。
+PORTFOLIO_FACT_VERIFICATION_SCOPE = "cycle_account_asof_accounting"
+
+PORTFOLIO_FACT_CASH = "cash"
+PORTFOLIO_FACT_REALIZED_PNL = "realized_pnl"
+PORTFOLIO_FACT_POSITION_COST_SUMMARY = "position_cost_summary"
+
+#: 本 owner 发布的 fact 种类闭集，**顺序固定**（= 发布顺序）。
+#: 调用方不需要猜顺序，deterministic fingerprint 与测试也因此稳定。
+#:
+#: 刻意**不含** ``nav`` / ``market_value`` / ``unrealized_pnl`` / ``daily_pnl`` /
+#: ``daily_return`` / ``benchmark`` / ``quote_status``：它们是跨 owner 组合事实。
+PORTFOLIO_FACT_KINDS = (
+    PORTFOLIO_FACT_CASH,
+    PORTFOLIO_FACT_REALIZED_PNL,
+    PORTFOLIO_FACT_POSITION_COST_SUMMARY,
+)
+
+#: 本 owner 的核验结论闭集。刻意只有两态：owner 要么**证明了**这条记账事实，
+#: 要么**证明不了**。"证据源本身不可用"（``source_unusable``）不是本 owner 发布的
+#: 独立状态，因此 research 侧不得替它猜一个。
+PORTFOLIO_FACT_STATUSES = (
+    STATUS_VERIFIED,
+    STATUS_UNKNOWN,
+)
+
+
+class PortfolioFactContractError(ValueError):
+    """owner fact contract 的构造被拒绝 —— fail closed。
+
+    ``reason`` 是稳定 machine code，供调用方与测试依赖；文案本身不承载判定：
+
+    * ``version_mismatch`` —— fact contract 版本不符；
+    * ``unknown_fact_kind`` —— fact 种类不在本 owner 的闭集里；
+    * ``unknown_fact_status`` —— 核验结论不在本 owner 的闭集里；
+    * ``alien_cycle_id`` / ``alien_account_id`` / ``alien_asof_day`` —— identity 不可证明；
+    * ``unknown_fact_with_value`` —— ``status=unknown`` 却带了一个值（必须为 ``None``）；
+    * ``field_not_a_position_cost_summary`` —— 该 kind 的值不是 typed summary；
+    * ``field_not_a_finite_number`` / ``non_finite_fact_value`` —— 数值事实不是有限数；
+    * ``non_canonical_position_count`` / ``non_canonical_cost_value`` —— summary 形状非法。
+    """
+
+    def __init__(self, reason: str, detail: str = "") -> None:
+        self.reason = str(reason)
+        text = self.reason if not detail else "%s: %s" % (self.reason, detail)
+        super().__init__(text)
+
+
+@dataclass(frozen=True, slots=True)
+class PositionCostSummary:
+    """组合持仓成本的聚合摘要 —— 纯 value type。
+
+    ``position_count`` 是**开仓**（``remaining_qty > 0``）的唯一 account/code 持仓数，
+    ``cost_value`` 是 ``Σ remaining_qty × durable acquisition cost``。两者都从
+    :func:`bounded_lots_with_status` 的 as-of bounded durable lots 派生，
+    **不读** ``paper_positions``（R22 已明确它是 compatibility-only 投影）。
+    """
+
+    position_count: int
+    cost_value: float
+
+    def __post_init__(self) -> None:
+        count = self.position_count
+        if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+            raise PortfolioFactContractError(
+                "non_canonical_position_count", repr(count),
+            )
+        value = self.cost_value
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise PortfolioFactContractError("non_canonical_cost_value", repr(value))
+        number = float(value)
+        if not math.isfinite(number):
+            raise PortfolioFactContractError("non_canonical_cost_value", repr(value))
+        object.__setattr__(self, "position_count", int(count))
+        object.__setattr__(self, "cost_value", number)
+
+    def as_dict(self) -> Mapping:
+        return {"position_count": self.position_count, "cost_value": self.cost_value}
+
+
+@dataclass(frozen=True, slots=True, init=False)
+class PortfolioFactProjection:
+    """portfolio/accounting owner 对**一条记账事实**的正式投影。
+
+    research 层将来引用一条组合记账事实时，读到的就是它：fact contract 版本、事实种类、
+    ``cycle`` / ``account`` / ``asof`` 身份、owner 自己的核验结论，以及**已经证明**的值。
+    它**不**包含 research 语义，**不**携带 market 词表，也**不**包含任何估值表面。
+
+    **没有公开 raw 构造器。** ``PortfolioFactProjection(...)`` 一律抛 ``TypeError``；
+    唯一签发路径是 :func:`accounting_fact_projections`（它再走私有
+    :func:`_issue_portfolio_fact_projection`）。否则任何调用方都能自述
+    ``status`` / ``value`` / ``cycle_id`` / ``account_id`` / ``asof_day`` 然后声称
+    "这是一条 portfolio fact" —— "唯一发布入口"就只是一句声明。
+
+    两条结构性规则：
+
+    * ``status == STATUS_UNKNOWN`` 时 ``value`` **必须**是 ``None``（构造期强制）；
+    * 数值事实的值必须是**有限**浮点数，``position_cost_summary`` 的值必须是
+      :class:`PositionCostSummary`。``known(0)`` 是**合法且已验证**的零，不会退化成
+      ``unknown``；反之 ``unknown`` 也不会被补成 0。
+    """
+
+    version: str
+    fact_kind: str
+    cycle_id: int
+    account_id: str
+    asof_day: str
+    status: str
+    value: float | PositionCostSummary | None
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        raise TypeError(
+            "PortfolioFactProjection has no public constructor: 调用方不能自述一条组合"
+            "记账事实的种类 / 身份 / 业务日 / 核验结论 / 值。请使用 "
+            "accounting_fact_projections(conn, context, account_id=...) —— 全部字段由 "
+            "portfolio owner 从它自己 bounded 的重建结果派生"
+        )
+
+    def __post_init__(self) -> None:
+        if self.version != PORTFOLIO_FACT_CONTRACT_VERSION:
+            raise PortfolioFactContractError(
+                "version_mismatch",
+                f"{self.version!r} != {PORTFOLIO_FACT_CONTRACT_VERSION!r}",
+            )
+        if self.fact_kind not in PORTFOLIO_FACT_KINDS:
+            raise PortfolioFactContractError("unknown_fact_kind", repr(self.fact_kind))
+        if self.status not in PORTFOLIO_FACT_STATUSES:
+            raise PortfolioFactContractError("unknown_fact_status", repr(self.status))
+        if (
+            isinstance(self.cycle_id, bool)
+            or not isinstance(self.cycle_id, int)
+            or self.cycle_id <= 0
+        ):
+            raise PortfolioFactContractError("alien_cycle_id", repr(self.cycle_id))
+        account = str(self.account_id or "").strip()
+        if not account:
+            raise PortfolioFactContractError("alien_account_id", repr(self.account_id))
+        object.__setattr__(self, "account_id", account)
+        try:
+            parsed_day = dt.date.fromisoformat(str(self.asof_day))
+        except (TypeError, ValueError) as exc:
+            raise PortfolioFactContractError(
+                "alien_asof_day", repr(self.asof_day),
+            ) from exc
+        if parsed_day.isoformat() != str(self.asof_day):
+            raise PortfolioFactContractError("alien_asof_day", repr(self.asof_day))
+
+        if self.status == STATUS_UNKNOWN:
+            # 结构性保证：未证明的事实**没有**值，消费者无法忽略 status 偷用数字。
+            if self.value is not None:
+                raise PortfolioFactContractError(
+                    "unknown_fact_with_value",
+                    f"{self.fact_kind} is unknown but carries {self.value!r}",
+                )
+            return
+        if self.fact_kind == PORTFOLIO_FACT_POSITION_COST_SUMMARY:
+            if type(self.value) is not PositionCostSummary:
+                raise PortfolioFactContractError(
+                    "field_not_a_position_cost_summary",
+                    f"expected PositionCostSummary, got {type(self.value).__name__}",
+                )
+            return
+        raw = self.value
+        if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+            raise PortfolioFactContractError(
+                "field_not_a_finite_number",
+                f"{self.fact_kind} requires a finite number, got {type(raw).__name__}",
+            )
+        number = float(raw)
+        if not math.isfinite(number):
+            raise PortfolioFactContractError(
+                "non_finite_fact_value", f"{self.fact_kind}={number!r}",
+            )
+        object.__setattr__(self, "value", number)
+
+    def as_dict(self) -> Mapping:
+        value = self.value
+        return {
+            "version": self.version,
+            "fact_kind": self.fact_kind,
+            "cycle_id": self.cycle_id,
+            "account_id": self.account_id,
+            "asof_day": self.asof_day,
+            "status": self.status,
+            "value": value.as_dict() if isinstance(value, PositionCostSummary) else value,
+        }
+
+
+def _issue_portfolio_fact_projection(**fields: Any) -> PortfolioFactProjection:
+    """签发一条 owner fact 投影。只有本模块的 :func:`_portfolio_fact` 调用它。
+
+    绕过恒抛错的 ``__init__`` 并在设置完全部字段后跑 ``__post_init__``，使校验逻辑仍然
+    只有一份、且紧挨字段定义（与 ``execution_verification._issue_fact_projection`` 及
+    ``ai_research_contract._issue_evidence_ref`` 同一手法）。
+    """
+    projection = object.__new__(PortfolioFactProjection)
+    for name, value in fields.items():
+        object.__setattr__(projection, name, value)
+    projection.__post_init__()
+    return projection
+
+
+def _portfolio_fact(
+    context: PortfolioReadContext,
+    account_id: str,
+    fact_kind: str,
+    value: float | PositionCostSummary | None,
+) -> PortfolioFactProjection:
+    """把 owner 的重建结果包成一条 typed fact。
+
+    ``status`` **刻意不是参数**：它只由 ``value is None`` 决定。于是"自述
+    ``status=verified`` 却没有值"（以及反过来）在结构上无法表达 —— 这正是
+    ``PortfolioFactProjection.__post_init__`` 那条规则在上游的对应物。
+    """
+    unknown = value is None
+    return _issue_portfolio_fact_projection(
+        version=PORTFOLIO_FACT_CONTRACT_VERSION,
+        fact_kind=fact_kind,
+        cycle_id=context.cycle_id,
+        account_id=str(account_id),
+        asof_day=context.asof_day.isoformat(),
+        status=STATUS_UNKNOWN if unknown else STATUS_VERIFIED,
+        value=None if unknown else value,
+    )
+
+
+def _numeric_fact_value(value: Any, status: str) -> float | None:
+    """``(owner 重建值, owner 核验结论)`` → 可发布的有限数值，否则 ``None``。
+
+    ``verified 0.0`` 与 ``unknown`` 必须分开：前者返回 ``0.0``（一个**已被证明**的零），
+    后者返回 ``None``。非有限账本值同样返回 ``None`` —— 绝不发布"已验证的无穷大"。
+    """
+    if status != STATUS_VERIFIED or value is None:
+        return None
+    number = _ledger_num(value)
+    if number is None or not math.isfinite(number):
+        return None
+    return number
+
+
+def _position_cost_summary(
+    conn, context: PortfolioReadContext, account_id: str,
+) -> PositionCostSummary | None:
+    """as-of bounded durable-lot 成本摘要；无法证明时返回 ``None``。
+
+    事实来源是 durable lots（``paper_position_lots``）减去 as-of 之前已验证的 SELL
+    成交，而**不是** ``paper_positions``：R22 已明确后者是 compatibility-only 投影，
+    它既没有 cycle 归属，也不携带 as-of 证据。
+    """
+    # 唯一 authority 仍然是 cycle/as-of bounded durable lots —— 兼容投影不参与。
+    lots, quantity_status = bounded_lots_with_status(
+        conn, context, account_id=account_id,
+    )
+    if quantity_status != STATUS_VERIFIED:
+        # 数量未经证明时**不发布** summary：既不发 "能算多少算多少"，
+        # 也不发 verified zero。
+        return None
+    positions: set[tuple[str, str]] = set()
+    cost_value = 0.0
+    for row in lots:
+        remaining = _ledger_num(row.get("remaining_qty"))
+        cost = _ledger_num(row.get("cost"))
+        if remaining is None or cost is None:
+            return None
+        if remaining <= 0:
+            continue
+        positions.add((
+            str(row.get("account_id") or ""), str(row.get("code") or ""),
+        ))
+        cost_value += remaining * cost
+    if not math.isfinite(cost_value):
+        return None
+    return PositionCostSummary(position_count=len(positions), cost_value=cost_value)
+
+
+def accounting_fact_projections(
+    conn, context: PortfolioReadContext, *, account_id: str,
+) -> tuple[PortfolioFactProjection, ...]:
+    """本 owner 的**唯一** public typed fact 入口（R27-B2C-4B）。
+
+    返回**固定顺序**的三条事实：``cash`` → ``realized_pnl`` →
+    ``position_cost_summary``。顺序固定使调用方不需要猜，也便于 deterministic
+    fingerprint 与回归断言。
+
+    调用方必须显式给出 ``account_id``（非空）与 context 的 ``cycle_id`` /
+    ``asof_day``。刻意**没有**任何 fallback：不取 active account、不取 active /
+    current cycle、不取 ``today()``、不取 ``latest()``、不读 ``paper_accounts.cash``
+    当前可变状态、不读 ``paper_nav``，签名里也**没有** ``valuations`` /
+    ``MarketDataReading`` / current quote —— 组合账本 owner 不能把调用方给的裸市场价
+    升级成自己的 verified 事实。
+
+    归属证明优先复用既有 bounded owner logic：先要求
+    :func:`_cycle_initial`（内部即 ``paper_accounts`` 的 cycle 绑定 +
+    :func:`_account_attached_by`）能证明该 account 属于该 cycle 且在 ``asof_day`` 前已
+    挂载。**证明不了**时三条事实全部 ``unknown`` 且 ``value=None`` —— 绝不退化成
+    "这个账户没有卖出，所以已实现盈亏 = verified 0"（PFACT-06）。
+
+    每条事实各自消费既有 owner 读路径：``cash`` 用 :func:`cash`（bounded 重建现金，
+    不是当前账户余额），``realized_pnl`` 用 :func:`realized_pnl`（cycle/as-of bounded、
+    只认已验证 SELL、incomplete sell fail closed、``realized_pnl`` 非有限即 unknown），
+    ``position_cost_summary`` 用 :func:`_position_cost_summary`（durable lots）。
+    本函数**不**再写第二套 SQL 判定。
+    """
+    if not isinstance(context, PortfolioReadContext):
+        raise TypeError(
+            "accounting_fact_projections requires a PortfolioReadContext, got "
+            f"{type(context).__name__} — 业务日与 cycle 身份不得由调用方自述"
+        )
+    account = str(account_id or "").strip()
+    if not account:
+        raise ValueError(
+            "accounting_fact_projections requires an explicit non-empty account_id "
+            "（不接受 active account fallback）"
+        )
+
+    if _cycle_initial(conn, context, account_id=account) is None:
+        # 归属/挂载不可证明 —— 绝不能发布 verified zero，也不能发布别的数字。
+        return tuple(
+            _portfolio_fact(context, account, kind, None)
+            for kind in PORTFOLIO_FACT_KINDS
+        )
+
+    cash_value, cash_status = cash(conn, context, account_id=account)
+    realized_value, realized_status = realized_pnl(conn, context, account_id=account)
+    summary = _position_cost_summary(conn, context, account)
+    return (
+        _portfolio_fact(
+            context, account, PORTFOLIO_FACT_CASH,
+            _numeric_fact_value(cash_value, cash_status),
+        ),
+        _portfolio_fact(
+            context, account, PORTFOLIO_FACT_REALIZED_PNL,
+            _numeric_fact_value(realized_value, realized_status),
+        ),
+        _portfolio_fact(
+            context, account, PORTFOLIO_FACT_POSITION_COST_SUMMARY, summary,
+        ),
     )

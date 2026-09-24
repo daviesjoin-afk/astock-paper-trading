@@ -1152,8 +1152,9 @@ class AiResearchProviderArchitectureGuardTests(unittest.TestCase):
         ``deepseek_advisor``（``data_quality`` runtime 的**调用方** —— 它自己从 R24
         reading 签发 typed ``InformationEvent``），R27-B2C-3 增加
         ``ai_research_execution_adapter``（execution owner 的接缝 —— 它必须 import 契约
-        才能调用私有签发口）。用等值断言而不是"不含"断言：多出任何一个消费者都必须是
-        一次有意识的决定。
+        才能调用私有签发口），R27-B2C-4B 增加 ``ai_research_portfolio_adapter``
+        （portfolio/accounting owner 的同构接缝）。用等值断言而不是"不含"断言：多出任何
+        一个消费者都必须是一次有意识的决定。
 
         ``ai_research_service`` 刻意**不**在这里：orchestration boundary 只依赖 provider
         与 repository，不 import 契约。
@@ -1169,8 +1170,8 @@ class AiResearchProviderArchitectureGuardTests(unittest.TestCase):
                     offenders.append(name)
         self.assertEqual(
             sorted(set(offenders)),
-            ["ai_research_execution_adapter.py", RESEARCH_MODULE, REPOSITORY_MODULE,
-             "deepseek_advisor.py"],
+            ["ai_research_execution_adapter.py", "ai_research_portfolio_adapter.py",
+             RESEARCH_MODULE, REPOSITORY_MODULE, "deepseek_advisor.py"],
             f"research contract 的生产消费者集合发生变化：{sorted(set(offenders))}",
         )
 
