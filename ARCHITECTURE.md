@@ -1748,17 +1748,43 @@ ExecutionFactProjection           identity / business_day / observed_at / verifi
 fact_projection(evidence)         唯一发布入口：调用方**不能**提供身份、业务日或核验结论
 ```
 
-四条刻意的不变量：
+六条刻意的不变量：
 
-* **identity 由 owner 派生**：有 `event_key` 就是逐次成交身份，多个成交是**成交集合**
-  身份（`identity_kind` 写明），都没有时退成 `order:<id>` 并**如实标注**它只标识委托；
+* **入口只接受真正 typed 的 evidence**（``type(...) is ExecutionEvidence``，子类也不算）：
+  少了这一步，一个普通伪对象只要实现 ``fill_verdict_value()`` / ``inconsistencies()`` 并塞
+  一段看起来合法的 ``provenance``，就能让 ``fact_projection`` 发布一条 `verified` 的
+  "owner projection"；
+* **核验声明必须与 owner 的 canonical 声明精确相等**：范围 → 词表 → 整份 mapping（含
+  ``verification_version`` / ``is_verified``，且不接受额外字段）。只校验词表是不够的 ——
+  同一个对象可以同时说 ``status='verified'`` 与 ``is_verified=False``；
+* **identity 由 owner 派生**：有完整 `event_key` 就是逐次成交身份，多个成交是**成交集合**
+  身份（`identity_kind` 写明），只有部分行带 event_key 时退成 `order:<id>` 并标注
+  `fill_event_key_incomplete`；**没有可用 order id 时 fail closed**
+  （`identity_unavailable`）—— 绝不产出 `order:None` 这种会把多条事实撞成同一条的占位身份；
 * **业务日不编造**：多个不同业务日 → `unknown` 并把集合写进 `detail`，绝不挑一个代表值；
   被拒/被撤的委托今天没有 owner 记录的业务日，因此如实报 `unknown`，**不**拿
-  `created_at` 的墙钟日期冒充（这是 B2C-1 明确记录的下一步前置条件）；
+  `created_at` 的墙钟日期冒充。逐行**完整性**也参与判定：可空列意味着"部分行有" ≠ "这条事实有"；
+* **PIT 值必须格式可证明**：`business_day` 必须是 `YYYY-MM-DD`（真实日历，不是只看形状），
+  `observed_at` 必须是**带时区**的可解析时间戳。数据库列是 TEXT，"非空"不等于"可证明"，
+  脏值在 owner 这一侧就报 `unknown`，不推给下游 adapter；
 * **核验是 owner-native 的**：`(状态, 来源)` 有穷尽合法组合表，market 的词
-  （`cross_source` / `coverage_integrity` / `single_source`）进不来；
-* **只有一份判定**：`fact_projection` 委托既有的 `verification_from_evidence`，
-  自己不算 verdict。
+  （`cross_source` / `coverage_integrity` / `single_source`）进不来；且 **只有一份判定** ——
+  `fact_projection` 委托既有的 `verification_from_evidence`，自己不算 verdict。
+
+### 两层 provenance 在 execution 上的现状（不许含糊）
+
+```text
+contract-issued execution projection = CLOSED
+      伪对象 / 非 canonical 声明 / 占位身份 / 脏 PIT 值一律被拒
+
+owner-origin provenance              = OPEN / REQUIRED
+      ExecutionEvidence 本身仍是公开可构造的，因此
+      "手工造 evidence → fact_projection(...)" 仍是一条**两步伪造**路径，
+      与 MarketDataReading 在 R27-A 的情况相同（AI_TYPED_06 记录）。
+```
+
+第 1 层是必要条件，第 2 层是 R27 完成的前置条件，由 owner/provenance 架构（B2C-2 起）
+继续关闭。**不得**把第 2 层写成"以后不需要证明"。
 
 它**不**改 `ResearchEvidenceRef`、**不**加 adapter、**不**让 research 层读 execution：
 `verification_from_evidence` 的结论要进入 research，仍然需要 B2C-2（research 契约学会
@@ -1844,11 +1870,16 @@ best-effort 返回值，而不是把异常抛给调用方）
 allowlist** 且必须真的解析到 `ai_research_contract`（本地同名函数 / 其它对象的同名
 方法 / 其它模块的同名工厂一律拒绝），owner registry 与契约导出的 factory registry
 **双向等值**，生产里构造 `InformationEvent` 的模块集合显式登记）
-owner fact contract 被降级为 market 语义或缺少 owner 发布（R27-B2C-1：execution 的
-核验词表是它自己的四态 + 证据来源，`(状态, 来源)` 有穷尽合法组合表；market 的词
-不得进入；identity 必须由 owner 派生并在 `identity_kind` 里说明来源；多个业务日 /
+owner fact contract 被降级为 market 语义、缺少 owner 发布或被冒充（R27-B2C-1：
+execution 的核验词表是它自己的四态 + 证据来源，`(状态, 来源)` 有穷尽合法组合表，
+market 的词不得进入；核验声明必须与 `verification_contract` 的产出**精确相等**
+（含 version / is_verified，且不接受额外字段）；发布入口只接受真正 typed 的
+`ExecutionEvidence`，duck-typed 伪对象不得签发投影；identity 必须由 owner 派生并在
+`identity_kind` 里说明来源，只有部分成交行带 event_key 时不得冒充完整身份，
+没有可用 order id 时必须 fail closed（不得产出 `order:None` 占位身份）；多个业务日 /
 观测时点时不得挑代表值，没有 owner 记录的业务日必须报 `unknown` 而不是用墙钟日期
-冒充；verdict 只有 `verification_from_evidence` 一份实现）
+冒充；`business_day` / `observed_at` 必须格式可证明（真实日历日、带时区时间戳）；
+verdict 只有 `verification_from_evidence` 一份实现）
 ```
 
 ### 仅作 review signal（不进入 CI gate）

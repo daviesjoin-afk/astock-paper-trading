@@ -230,7 +230,7 @@ class FailClosedTests(unittest.TestCase):
             ("alien_identity", {"identity": "  "}),
             ("field_not_an_evidence_field", {"business_day": DAY}),
             ("field_not_an_evidence_field", {"observed_at": EE.EvidenceField.known("code", "x")}),
-            ("alien_identity", {"verification": {"verification_scope": "market_data"}}),
+            ("alien_verification_scope", {"verification": {"verification_scope": "market_data"}}),
             ("unknown_verification_status", {"verification": {
                 "verification_scope": EV.EXECUTION_VERIFICATION_SCOPE,
                 "verification_status": "supported", "verification_source": EV.EVIDENCE_SOURCE_LEDGER,
@@ -304,6 +304,138 @@ class FailClosedTests(unittest.TestCase):
         ))
         self.assertTrue(no_session.business_day.is_unknown)
         self.assertIn("1 of 2", str(no_session.business_day.detail))
+
+
+class InputBoundaryTests(unittest.TestCase):
+    def test_EXFACT_15_duck_typed_evidence_cannot_be_published_as_an_owner_projection(self):
+        """EXFACT-15：入口只接受真正的 ``ExecutionEvidence``。
+
+        少了这一步，一个普通伪对象只要实现 ``fill_verdict_value()`` / ``inconsistencies()``
+        并塞一段看起来合法的 ``provenance``，就能让 ``fact_projection`` 发布一条
+        ``verified + ledger`` 的"owner projection" —— owner contract 这个边界就形同虚设。
+        """
+
+        class FakeEvidence:
+            order_id = 7
+            lifecycle_state = "filled"
+            provenance = {
+                "fill_rows": 1,
+                "fill_session_rows": 1,
+                "fill_sessions": [DAY],
+                "fill_observed_at_rows": 1,
+                "fill_observed_ats": [OBSERVED_AT],
+                "fill_event_key_rows": 1,
+                "fill_event_keys": [KEY_A],
+            }
+
+            def fill_verdict_value(self):
+                return EE.FILL_VERDICT_VERIFIED
+
+            def inconsistencies(self):
+                return ()
+
+        for payload in (FakeEvidence(), {}, "evidence", None, 42):
+            with self.subTest(payload=type(payload).__name__):
+                with self.assertRaises(EV.ExecutionFactContractError) as caught:
+                    EV.fact_projection(payload)
+                self.assertEqual("not_execution_evidence", caught.exception.reason)
+
+        # 子类同样不算：入口要求的就是**这一个**类型，不是"长得像 ExecutionEvidence"。
+        class Subclassed(EE.ExecutionEvidence):
+            pass
+
+        real = _evidence(fills=(_fill(event_key=KEY_A),))
+        subclassed = object.__new__(Subclassed)
+        for member in dataclasses.fields(EE.ExecutionEvidence):
+            object.__setattr__(subclassed, member.name, getattr(real, member.name, None))
+        self.assertIsInstance(subclassed, EE.ExecutionEvidence)
+        with self.assertRaises(EV.ExecutionFactContractError) as caught:
+            EV.fact_projection(subclassed)
+        self.assertEqual("not_execution_evidence", caught.exception.reason)
+
+    def test_EXFACT_16_non_canonical_verification_statement_is_rejected(self):
+        """EXFACT-16：核验声明必须与 owner 的 canonical 声明**精确相等**。
+
+        只校验 scope/status/source 是不够的：同一个对象可以同时说 ``status='verified'``
+        与 ``is_verified=False``，或带一个伪造的 ``verification_version``，而下游只看到
+        "这是一条已发布的裁决"。
+        """
+        base = _projection(fills=(_fill(event_key=KEY_A),))
+        good = {
+            "version": base.version, "identity": base.identity,
+            "identity_kind": base.identity_kind, "order_id": base.order_id,
+            "lifecycle_state": base.lifecycle_state, "fill_verdict": base.fill_verdict,
+            "business_day": base.business_day, "observed_at": base.observed_at,
+            "verification": dict(base.verification), "inconsistencies": base.inconsistencies,
+        }
+
+        tampered = {
+            "wrong version": {"verification_version": "fake-version"},
+            "wrong is_verified": {"is_verified": False},
+            "extra field": {"verification_method": "cross_source"},
+        }
+        for label, patch in tampered.items():
+            with self.subTest(case=label):
+                statement = {**good["verification"], **patch}
+                with self.assertRaises(EV.ExecutionFactContractError) as caught:
+                    EV._issue_fact_projection(**{**good, "verification": statement})
+                self.assertEqual("non_canonical_verification", caught.exception.reason)
+
+        # 非空性：canonical 声明本身必须被接受（否则上面三条只是在证明"全都拒绝"）。
+        self.assertIsInstance(EV._issue_fact_projection(**good), EV.ExecutionFactProjection)
+
+    def test_EXFACT_17_absent_order_id_never_becomes_a_placeholder_identity(self):
+        """EXFACT-17：没有完整成交身份、也没有可用 order id → fail closed。
+
+        ``ExecutionEvidence.order_id`` 默认允许 ``None``，而 ``"order:%s" % None`` 是一个
+        **非空字符串**，会被 ``__post_init__`` 当成合法 identity —— 于是多条没有 order id
+        的不同事实会共享同一个身份。这是本轮 identity contract 最核心的一条。
+        """
+        for missing in (None, "", "   ", True):
+            with self.subTest(order_id=repr(missing)):
+                with self.assertRaises(EV.ExecutionFactContractError) as caught:
+                    _projection(_order(id=missing), fills=())
+                self.assertEqual("identity_unavailable", caught.exception.reason)
+
+        # 绝不产出占位身份：不同委托的真实 id 必须给出不同身份。
+        self.assertNotEqual(
+            _projection(_order(id=7), fills=()).identity,
+            _projection(_order(id=8), fills=()).identity,
+        )
+
+        # 非空性：真实 order id 仍然可用，而且身份里带着它。
+        self.assertEqual("order:7", _projection(_order(id=7), fills=()).identity)
+        self.assertEqual("order:ABC", _projection(_order(id="ABC"), fills=()).identity)
+
+    def test_EXFACT_18_day_and_instant_values_are_format_validated(self):
+        """EXFACT-18：PIT 字段必须是可证明的格式，脏值不得发布为 ``known``。
+
+        数据库列是 TEXT，所以"非空"不等于"可证明"：``banana`` 不能变成 typed PIT 事实，
+        不带时区的时间戳也不是一个可证明的瞬时。
+        """
+        bad_day = _projection(fills=(_fill(event_key=KEY_A, fill_date="banana"),))
+        self.assertTrue(bad_day.business_day.is_unknown)
+        self.assertIn("not a provable value", str(bad_day.business_day.detail))
+
+        for bad_instant in ("banana", f"{DAY} 10:30:00", "2026-08-27T10:30:00"):
+            with self.subTest(observed_at=bad_instant):
+                projection = _projection(fills=(
+                    _fill(event_key=KEY_A, quote_at=bad_instant),
+                ))
+                self.assertTrue(projection.observed_at.is_unknown)
+                self.assertIn("not a provable value", str(projection.observed_at.detail))
+
+        # 非空性：合法值仍然是 known（否则这条断言只是在证明"全都 unknown"）。
+        good = _projection(fills=(_fill(event_key=KEY_A),))
+        self.assertEqual(DAY, good.business_day.require())
+        self.assertEqual(OBSERVED_AT, good.observed_at.require())
+        # 闰日与非闰日都要按真实日历判定，而不是只看形状。
+        self.assertTrue(_projection(
+            fills=(_fill(event_key=KEY_A, fill_date="2026-02-28"),),
+        ).business_day.is_known)
+        self.assertTrue(_projection(
+            fills=(_fill(event_key=KEY_A, fill_date="2026-02-30"),),
+        ).business_day.is_unknown)
 
 
 class SingleSourceTests(unittest.TestCase):

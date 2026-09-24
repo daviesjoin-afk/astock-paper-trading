@@ -71,15 +71,11 @@ MUTATIONS = [
         "file": VERIFICATION,
         "old": (
             "    if len(distinct) == 1:\n"
-            "        return EE.EvidenceField.known(\n"
-            "            field_name, distinct[0], source=EXECUTION_VERIFICATION_SCOPE,\n"
-            "        )\n"
+            "        value = distinct[0]\n"
         ),
         "new": (
             "    if distinct:  # MUTANT —— 多个取值时挑一个当代表\n"
-            "        return EE.EvidenceField.known(\n"
-            "            field_name, distinct[0], source=EXECUTION_VERIFICATION_SCOPE,\n"
-            "        )\n"
+            "        value = distinct[0]\n"
         ),
         "test": _case("PitHonestyTests."
                       "test_EXFACT_04_no_owner_recorded_business_day_is_reported_unknown"),
@@ -132,6 +128,48 @@ MUTATIONS = [
         "test": _case("OwnerNativeVerificationTests."
                       "test_EXFACT_03_the_contract_is_owner_native_not_market_vocabulary"),
         "desc": "核验声明里混入 market 的 verification_method / cross_source",
+    },
+    {
+        "id": "M-EXFACT-7",
+        # 入口不再要求真正 typed evidence：伪对象也能签发"owner projection"。
+        "file": VERIFICATION,
+        "old": "    if type(evidence) is not EE.ExecutionEvidence:\n",
+        "new": "    if False:  # MUTANT —— 伪对象可以冒充 owner 证据\n",
+        "test": _case("InputBoundaryTests."
+                      "test_EXFACT_15_duck_typed_evidence_cannot_be_published_as_an_owner_projection"),
+        "desc": "fact_projection 接受任意 duck-typed 伪对象",
+    },
+    {
+        "id": "M-EXFACT-8",
+        # 只校验词表、不做整份声明的精确相等：version / is_verified 可以被改。
+        "file": VERIFICATION,
+        "old": "        if declared != canonical:\n",
+        "new": "        if False:  # MUTANT —— 非 canonical 声明被接受\n",
+        "test": _case("InputBoundaryTests."
+                      "test_EXFACT_16_non_canonical_verification_statement_is_rejected"),
+        "desc": "核验声明不做精确相等校验（伪 version / 相反 is_verified 可通过）",
+    },
+    {
+        "id": "M-EXFACT-9",
+        # 缺 order id 时不再 fail closed：拼出 order:None 这种占位身份。
+        "file": VERIFICATION,
+        "old": "    if isinstance(order_id, bool) or order_id is None:\n",
+        "new": "    if False:  # MUTANT —— 缺 order id 时拼占位身份\n",
+        "test": _case("InputBoundaryTests."
+                      "test_EXFACT_17_absent_order_id_never_becomes_a_placeholder_identity"),
+        "desc": "缺 order id 时不再 fail closed（产出 order:None 占位身份）",
+    },
+    {
+        "id": "M-EXFACT-10",
+        # 取消 PIT 字段的格式校验：banana / 无时区时间戳都能变成 typed PIT fact。
+        "file": VERIFICATION,
+        "old": (
+            "        if validator is not None and not validator(value):\n"
+        ),
+        "new": "        if False:  # MUTANT —— 脏值可以变成 known\n",
+        "test": _case("InputBoundaryTests."
+                      "test_EXFACT_18_day_and_instant_values_are_format_validated"),
+        "desc": "取消 business_day / observed_at 的格式校验（banana 也能成为 known）",
     },
 ]
 
