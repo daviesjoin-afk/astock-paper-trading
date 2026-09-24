@@ -763,7 +763,9 @@ Risk → Order → Fill（各自既有 authority）
    （outcome / reason / evidence 状态），前端只渲染。
 8. **为 R27 AI 预留的插槽**：AI 以后可以是 **Candidate Producer**，但**不是**
    Signal Persistence Owner / Risk Authority / Promotion Authority。
-   `R25 does NOT allow AI to write signals.`
+   `R25 does NOT allow AI to write signals.` R27-A 已落地这条插槽的研究侧契约
+   （见「AI Information & Research Contract（R27-A）」）：AI 输出是 research，
+   且 `commit_signal` 要求真正的 `SignalDecision`，把研究假设当裁决传入会在落库前失败。
 9. 回归门禁见 `backend/test_signal_pipeline.py`（SIG01 ~ SIG15 契约 / writer /
    ledger 集成，SIG-WRITER-01 ~ 05 的 Decision→Commit 契约；SIGG01 ~ SIGG05 架构
    guard，含"两条 production 路径必须交入明确 SignalDecision"），语义 mutation 见
@@ -889,6 +891,205 @@ facts、reason codes、pricing basis、slippage、fees、ruleset version，以�
   cancel、historical as-of、duplicate event、fees、slippage、locked limit、部分 signal 对账、
   风控部分去重、归档 collapse、累计容量、手动剩余量、signal 依赖回流、集合竞价时段，
   必须全部 CAUGHT（survived = 0）。
+
+## AI Information & Research Contract（R27-A）
+
+R27-A 只建立 AI 信息/研究层的**最小稳定边界**：让 AI 能读取可信事实并产出研究性
+结论，但永远不能成为行情、Signal、Risk、Execution、Promotion 的 authority。
+本轮**不**包含 LLM provider、自动选股、自动下单、Signal 写入、策略生成与晋升、
+prompt 管理、agent framework、vector DB 与 RAG。
+
+### Authority 边界（AI 是纯消费者）
+
+```text
+R24 Market Data Reading ─┐
+R25 Signal Evidence      ├─→ typed market evidence ref ─→ explicit hypothesis relation
+R26 Execution Evidence   │        （只读、纯契约）              │
+历史 strategy/portfolio ─┘                                     ↓
+                                                       ResearchHypothesis
+                                                       research / advisory only
+                                                       ✗ pending signal
+                                                       ✗ paper_orders / paper_fills
+                                                       ✗ risk decision
+                                                       ✗ strategy promotion
+```
+
+`ai_research_contract` **只** import `market_data_contract`（R24 纯契约）与标准库。
+它不 import `signal_service` / `execution_*` / `paper_*` / `promotion_*`，也不 import
+DB、网络、时钟、随机数或任何 LLM SDK 模块。依赖方向单向：
+**authority 绝不 import AI 研究层**（guard AIG-02 / AIG-03）。接入生产消费者必须
+先把模块登记进 `ALLOWED_AI_CONSUMERS`（当前为空），使"谁依赖了 AI"是一次有意识的
+决定而不是静默扩散。
+
+### 两个正交维度（本契约的核心）
+
+```text
+fact verification    事实 owner 回答："这条事实是否通过它自己那套核验？"
+hypothesis relation  research reasoning 显式声明："它对当前 thesis 是 supports /
+                     contradicts / context？"
+```
+
+两者必须分开，且本契约**不做**语义绑定：
+
+```text
+✗ verification=verified  →  relation=supports     （verified 事实自动支持 thesis）
+✗ disagreement/unavailable →  thesis 被反驳        （只说明 evidence 本身不可靠）
+```
+
+一条 cross-source verified 的报价只说明"这个价格事实可信"。它可能是
+`relation=context`，对"下一交易日 momentum 会继续"毫无支撑。同理 provider
+disagreement / unavailable 只说明**这条 evidence 不能成为可靠依据**，不等于
+"thesis 被可信事实反驳" —— 后者才是 `unsupported`。
+
+relation 是最小闭集（`supports` / `contradicts` / `context`），刻意不含
+strong/weak/uncertain 等评分档位：本轮不做评分模型，也没有 `quality_score` /
+`weighted_support` / Bayesian 合并。
+
+### 四个概念
+
+| 概念 | 回答的问题 | 关键约束 |
+| --- | --- | --- |
+| `InformationEvent` | AI 看到了什么事实？ | `kind` 由 `evidence_ref.source_type` **派生**，错标无法表达 |
+| `ResearchEvidenceRef` | 事实来自哪个 owner 口径、哪一份快照、owner 的核验结论是什么？ | **无公开 raw 构造器**；identity 由 R24 投影派生，调用方不提供 |
+| `HypothesisEvidence` | 这条事实对 thesis 是什么关系？ | `relation` 显式传入，**不**从 verification 派生 |
+| `ResearchHypothesis` | 基于这些证据提出了什么假设？ | `status` **派生**；`is_authoritative` 恒为 `False` |
+
+`status` / `kind` / `is_authoritative` 都是派生只读属性，**不是**可传参数：若
+`status` 可以由调用方给出，那么"给一个没有证据的假设贴上 `supported`"就只是一个
+关键字参数 —— 这正是本轮要根除的默认批准。
+
+### 类型化 market evidence（不是 owner-issued provenance）
+
+唯一公开签发入口是 `evidence_ref_from_market_reading(reading)`，它要求一个真正的
+`market_data_contract.MarketDataReading`，并**从 reading 本身派生**身份与核验维度：
+
+```text
+source_id  ←  policy | kind | subject @ observed_at   （调用方不提供）
+as_of      ←  reading 的 as_of / observed_at          （调用方不覆盖）
+verification / verification_method  ←  逐字复制自 reading 投影
+content_fingerprint                 ←  snapshot 事实性字段的稳定指纹
+```
+
+`source_id` **不接受**调用方传参：一个由调用方命名的 identity 不是 identity，而是
+一个能被用来把同一份事实改名成 FACT_A / FACT_B / FACT_C 从而绕过去重与冲突检测的
+自由字符串。`ResearchEvidenceRef(...)` 一律抛 `TypeError`；没有可 import 的哨兵，也
+没有 `issued=True` 之类的开关（那种"标记位"调用方一样能写）。
+
+**为什么 identity 必须含 kind 与 subject。** 早期版本只有 `policy @ observed_at`，
+于是同一时刻的**两只不同股票**得到完全相同的 identity。由于 `fact_state` 当时也不含
+内容指纹，它们不只是 identity 相同，**连冲突状态也相同** —— 会被静默去重成一条事实。
+这曾经是本 contract 自己的 correctness 缺陷（不是理论性的 provenance 问题），
+现在 identity 纳入 `kind` + `subject`（单票 code / 横截面 scope），
+`fact_state` 纳入内容指纹，因此：
+
+```text
+不同 code、同 policy/时点        → 不同 identity，两条独立事实
+同 identity、内容变了            → EvidenceConflict（不再静默去重）
+同 identity、内容相同、freshness 不同 → 仍是一条事实（时效不是事实内容）
+```
+
+**诚实声明这一层的强度 —— 保证与已知限制分开。** 早期版本把它描述成
+"owner-issued provenance"，那是**过度声称**：`MarketDataReading` /
+`MarketDataSnapshot` 都是**公开 dataclass**，因此
+
+```text
+手工造 MarketDataSnapshot(verified, cross_source)
+    → 手工造 MarketDataReading
+    → evidence_ref_from_market_reading(...)
+```
+
+在本层是**可以通过**的 —— 伪造只是从一步变成两步。本层真正保证的是：
+
+* 调用方**不能提供 identity**，所以同一份事实无法被改名绕过去重 / 冲突检测；
+* 本层**没有独立的 `verification` 参数** —— verification 逐字复制自 supplied
+  reading 的投影，R27 无从自行发明一个核验结论；
+* AI 代码里不再出现自由形式的核验字符串。
+
+准确说法是：**R27 factory 没有独立的 `verification` 参数，它逐字复制 supplied R24
+reading projection 的 verification；R27 本身无法证明该 reading 是 owner 产生还是调用方
+手工构造。** 所以 `single_source` 不会在**本层**被改写，但一个手工构造的 reading 里写
+了什么，本层照样原样复制。不要把这句读成"核验结论可信"。
+
+要真正证明"这份事实由 `market_data_service` 产生"，需要 **R24 自己签发 evidence
+token** —— 那是 R24 的职责，不在 R27-A 范围内。这条限制由
+`test_AI_TYPED_06_two_step_forgery_is_documented_not_claimed_closed` 作为**已知
+限制**断言下来，而不是假装已封堵。
+
+当前 `SUPPORTED_OWNER_ADAPTERS` **只有 market_data**。signal / execution / news 等
+仍在 `EVIDENCE_SOURCE_TYPES` 闭集里作为已声明的未来来源，但没有 factory 可以签发 ——
+少支持一个 source 好过允许伪造一个 authority。
+
+### 证据集合：去重与冲突
+
+identity 是 `(source_type, source_id, as_of)`，其中 `source_id` 由 reading 派生
+（`policy | kind | subject @ observed_at`）。
+
+```text
+完全相同（同 identity + 同事实内容）   → 安全去重
+同 identity 但事实内容不同             → EvidenceConflict
+同一条 evidence 同时两种 relation      → EvidenceRelationConflict
+```
+
+冲突判定只取**事实维度**（verification / verification_method / 内容指纹），
+**不含** `status` 那种 reading 级展示判定 —— 同一份快照在不同 `now` 下可能是 fresh 或
+stale，那属于时效而非"事实变了"。
+
+两种冲突都**与顺序无关**（先按 identity 分组再判定）：`[A, B]` 与 `[B, A]` 必然
+同一结果。first-wins 会让研究结论依赖 collection order，而顺序不是业务语义。
+刻意不做"保守合并"：fail closed 更清楚。
+
+### 假设状态
+
+```text
+无 evidence                          → insufficient_evidence / no_evidence
+有 verified contradicts              → unsupported / evidence_contradicted
+有 verified supports 且无 contradicts → supported
+有 supports 但该事实未通过核验        → insufficient_evidence / evidence_not_verified
+owner 核验失败或来源不可用            → insufficient_evidence / evidence_unavailable
+事实可信但无一与 thesis 相关（context）→ insufficient_evidence / no_supporting_evidence
+```
+
+`reason` 必须与事实层的核验结论**一致**：一条 verified 的事实若只是
+`relation=context`，原因只能是 `no_supporting_evidence`，绝不能报成
+`evidence_not_verified` —— 那会把刚拆开的两个维度又混回去（这正是 early 版本的缺陷）。
+
+注意"来源不可用"**不是** `unsupported` —— 它只让证据不足以判断。这与
+"可信事实反对结论"是两个结论，因此 reason 也不同。
+
+- `confidence` 是 AI 的自评，**不参与** status 判定 —— 参与就会得到"越自信越强"的环路。
+- 研究词汇（`supported` / `insufficient_evidence` / `unsupported`）与
+  `paper_signals` 生命周期（`pending` / `approved` / …）**不相交**，因此 AI 结论在
+  词汇层面就无法被直接写成一条正式 signal；`commit_signal` 也要求真正的
+  `SignalDecision`，把研究假设传进去会在触碰连接前失败。
+- PIT：`as_of` 必须显式且可证明（无法证明即构造期拒绝，绝不回落 `today()`）；
+  任一证据 `as_of` 晚于假设日即**拒绝构造**（不静默过滤，否则会掩盖"用未来信息
+  解释过去"本身）。
+- 缺失即缺失：没有可引用的证据 → `insufficient_evidence`，绝不默认 `supported`。
+- payload / detail **递归冻结**（Mapping → MappingProxyType、list → tuple、
+  set → frozenset）；非 JSON-like 值（任意可变对象）fail closed。只做浅冻结会让
+  调用方保留的原始对象继续改写"已冻结"的研究内容。
+
+### freshness 不参与
+
+本契约只引用 R24 的 `verification`，**不**引用 freshness。freshness 回答"对当前时间
+是否仍新鲜"，与"来源是否经过核验"是两个维度，本层不把它们压成 `trusted=True`，
+也不发明 AI quality score。
+
+### 持久化范围
+
+本轮是**纯契约**：无 DB、无 writer、无前端。仓库里没有既有的
+hypothesis / research-ledger owner，为这个 PR 新建一套 AI 数据库体系会提前引入
+第二个事实存放点，因此持久化留给 R27-B。
+
+### 回归门禁
+
+`backend/test_ai_research_contract.py`（AI-01 ~ AI-20 契约语义、AI-TYPED-01 ~ 09
+identity 派生 / 唯一性 / 冲突与诚实边界、AIG-01 ~ AIG-06 架构 guard、
+`GuardIsNotVacuouslyPassing` 非空性）；语义 mutation 在
+`work/r27_ai_mutation_check.py`：去掉 future-evidence check、未核验事实当作已核验、
+relation 强制成 supports、identity 丢失观测时点、冲突 duplicate first-wins、
+deep freeze 退回浅冻结、identity 丢失观测主体、内容指纹退出冲突判定，必须全部 CAUGHT
+（survived = 0、fake = 0）。
 
 ## 目标依赖方向
 
