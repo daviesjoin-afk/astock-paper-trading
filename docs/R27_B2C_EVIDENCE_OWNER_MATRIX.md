@@ -13,7 +13,7 @@ research，见文末「明确排除」。
 基线：`master` @ `649cabe0829af4d9aba5c31d06f6e230b21832a8`（R27-B2B 合并后）。
 
 本文件的表格是**盘点时的审计产物**，其"safe?"结论刻意保持当时的判断；每个 substage
-的实际进展记录在各家自己的 "B2C-n 进展" 小节（当前已到 **B2C-3 COMPLETE**）。
+的实际进展记录在各家自己的 "B2C-n 进展" 小节（当前已到 **B2C-4A COMPLETE**）。
 
 ---
 
@@ -154,7 +154,9 @@ owner-native 方式，不是复制 market 词表）；identity 与业务日的 o
 ```text
 B2C-2  research 契约学会消费 owner-native verification（**已完成**）
 B2C-3  execution → ResearchEvidenceRef adapter（**已完成**，见下文 "B2C-3 进展"）
-B2C-4  迁移 pnl_attribution（**未开始**）
+B2C-4A execution attribution fact completeness（**已完成**，见下文 "B2C-4A 进展"）
+B2C-4B portfolio/accounting owner facts for pnl_attribution（**未开始**）
+B2C-4C 迁移 pnl_attribution runtime（**未开始**）
 ```
 
 以及一条 B2C-1 明确记录、**没有**被掩盖的缺口：被拒 / 被撤的委托今天在
@@ -193,7 +195,9 @@ B2C-2 之后  OwnerVerification（outcome / status / attributes）
 
 ```text
 B2C-3  execution → ResearchEvidenceRef adapter（**已完成**）
-B2C-4  迁移 pnl_attribution（**未开始**）
+B2C-4A execution attribution fact completeness（**已完成**）
+B2C-4B portfolio/accounting owner facts for pnl_attribution（**未开始**）
+B2C-4C 迁移 pnl_attribution runtime（**未开始**）
 B2C-5  news owner readiness
 B2C-6  adaptive / experiment owner readiness
 B2C-7  runtime / incident owner readiness
@@ -319,10 +323,16 @@ adapter 不重算 event key、不接受 `order_id`：identity authority 是 exec
 fact contract 版本刻意**不**进入 identity —— 版本升级不应该把同一条事实变成另一条事实。
 
 内容指纹覆盖 factual projection（version / identity_kind / order_id / lifecycle_state /
-fill_verdict / business_day / observed_at / inconsistencies），用
+fill_verdict / code / action / requested_qty / filled_qty / fill_price / fees /
+business_day / observed_at / inconsistencies），用
 `json.dumps(sort_keys=True)` + sha256；刻意不用 `hash()`（跨进程不稳定）/ `repr(object)` /
 地址 / 时间 / 随机数。verification statement 不重复进指纹 —— 它已经由
 `OwnerVerification.canonical()` 单独进入 `fact_state`。
+
+其中六个成交事实字段是 **B2C-4A** 追加的（见下文 "B2C-4A 进展"）：同一条 execution
+identity 下数量 / 价格 / 费用 / 标的 / 方向被改写必须报 `EvidenceConflict`。它们以
+`EvidenceField.as_dict()` 入指纹而不是 `maybe()`，因此 `unknown` 与 `not_applicable`
+不会在指纹上撞成同一个值。
 
 #### 本轮没有 production consumer（刻意）
 
@@ -333,6 +343,148 @@ B2C-4。因此"本模块今天零调用点"是预期状态，不是空转。
 **owner-origin provenance 仍然 OPEN / REQUIRED**（见上）。adapter 关闭的是"调用方不能自述
 身份 / 业务日 / 核验结论"，**不是**"输入对象确实由 owner 产生"。B2C-3 不宣称关闭
 two-step forgery。
+
+### B2C-4A 进展（execution attribution facts 已发布）
+
+#### 为什么把原 B2C-4 拆成三段
+
+源码复核在动手前发现：**不能**把 `pnl_attribution` 直接迁到 execution 上。
+
+```text
+deepseek_research._pnl_evidence() 同时读四张表
+    paper_accounts / paper_nav / paper_orders / paper_positions
+其语义包括：NAV 变化、daily return、成交、fees、realized PnL、position cost / exposure
+```
+
+今天**只有 execution** 具备 typed owner contract + research adapter。所以"把整个 legacy
+`_pnl_evidence` dict 塞进一个 execution `InformationEvent.payload`"会让 **NAV / position
+cost / realized PnL / account state 冒充 execution owner 事实** —— 那正是 R27 禁止的
+provenance 伪造。反过来，"为了现在就迁移而删掉这些能力"是**删 roadmap 能力**，同样禁止。
+
+因此最终目标不变，只把实现顺序拆开：
+
+```text
+B2C-4A  execution attribution fact completeness      ← 本段（**已完成**）
+B2C-4B  portfolio/accounting owner facts pnl_attribution 需要（**未开始**）
+B2C-4C  迁移 pnl_attribution runtime 到 canonical typed research（**未开始**）
+```
+
+这是**实现顺序调整，不是 roadmap 缩减**。
+
+#### 本段交付：投影足以承载 attribution 需要的成交事实
+
+B2C-1 的 `ExecutionFactProjection` 只有 identity / lifecycle / verdict / PIT / verification，
+因此 B2C-3 能证明"发生了 `partial` / `verified` / `not_executed`"，却**拿不出**
+`pnl_attribution` 需要的成交数量、成交价格、费用、方向与股票代码。
+
+B2C-4A 只关闭这个缺口，方式是**扩展既有投影**：
+
+```text
+ExecutionFactProjection 新增（顺序即 EXECUTION_FACTUAL_FIELDS）
+    code · action · requested_qty · filled_qty · fill_price · fees
+```
+
+六条形态约束：
+
+1. **不新增第二套 execution fact。** 刻意没有
+   `ExecutionAttributionEvidence` / `TradeResearchEvidence` / `PnLExecutionEvidence` /
+   `ExecutionResearchFact`。`ExecutionEvidence → ExecutionFactProjection` 仍是**唯一**
+   execution fact contract，`execution_evidence.py` 本轮**未改动**。
+2. **逐字派生，不重算。** `fact_projection` 直接复制 `evidence.code` / `action` /
+   `requested_qty` / `filled_qty` / `fill_price` / `fees`；不查 DB、不重算价格或费用、
+   不从 `paper_orders` 的兼容列补值。测试用 `assertIs` 锁住"同一个对象"，因此有人"顺手"
+   在投影里重算一遍会立刻变红。
+3. **必须是真三态字段。** 六个字段都是 `execution_evidence.EvidenceField`，
+   `__post_init__` 要求 `isinstance(...)` 且 **name 精确匹配**；裸数字 / dict / duck-typed
+   对象 / 名字错位的真 `EvidenceField` 一律 fail closed。三态区别必须保留：
+   `known(0)` **不**退化成 `0`，**不**变成 `unknown`，`unknown` 也不许变成 `known(0)`。
+4. **`as_dict()` 写 `EvidenceField.as_dict()`，不写 `maybe()`。** `maybe()` 会把
+   `unknown` 与 `not_applicable` 一起压成 `None`。
+5. **内容指纹随之扩展**（`ai_research_execution_adapter._content_fingerprint`）。
+   同一条 execution identity 下数量 / 价格 / 费用 / 标的被改写 → `fact_state` 不同 →
+   `EvidenceConflict`，不再被静默去重。
+6. **`ResearchEvidenceRef.detail` 不膨胀。** detail 仍然只放 identity / 核验 / 内容指纹 /
+   最小审计元数据；六个字段**不**复制进去。职责保持三分：
+
+```text
+ExecutionFactProjection      owner factual truth
+InformationEvent.payload     一次 research observation 投影（B2C-4C 直接从投影产生）
+ResearchEvidenceRef          identity + verification + fingerprint
+```
+
+#### 硬边界：哪些事实**不**属于 execution
+
+```text
+realized_pnl      ✗ 依赖 position cost basis / sell quantity / portfolio accounting
+NAV / daily_pnl / daily_return / position_cost / market_value / unrealized_pnl /
+benchmark / account cash                    ✗ 属于 portfolio/accounting owner
+```
+
+legacy `pnl_attribution` 确实读 `paper_orders.realized_pnl`，但 `realized_pnl` **不是纯
+execution fact**。本段没有为了方便把它塞进 execution contract，也没有扩大成"复制整份
+`ExecutionEvidence`"：除六个字段外，`order_time` / `reject_reason` / `cancel_reason` /
+`available_qty` / `commission` / `slippage` 都**没有**加进投影。
+
+#### 核验语义与 PIT 语义一个字都没动
+
+```text
+verified + ledger       → verified
+partial + ledger        → verified
+not_executed + ledger   → verified
+unknown + ledger        → unverified
+legacy / absent / inconsistent → source_unusable
+```
+
+上表逐字不变。B2C-4A 只增加**事实内容**，不重新讨论**核验语义**。`business_day` /
+`observed_at` / identity 的派生方式同样不变。
+
+#### 本段仍然没有 production consumer（刻意）
+
+`evidence_ref_from_execution_projection` 在 production 里的调用点仍然 **0**：
+`pnl_attribution` 的迁移是 **B2C-4C**，组合/记账事实是 **B2C-4B**。`deepseek_research`、
+`adaptive_engine`、`ai_analysis` 本段**未改动**。
+
+**owner-origin provenance 仍然 OPEN / REQUIRED。** 本轮增加字段**不等于**关闭
+`ExecutionEvidence 公开构造 → fact_projection → research adapter` 这条两步伪造路径。
+本段不把它改成 CLOSED。
+
+#### B2C-4B 的剩余 owner gap（提前写清）
+
+legacy `pnl_attribution` 当前仍依赖、且**不能**由 execution adapter 冒充的事实：
+
+```text
+latest / prior NAV
+daily PnL
+daily return
+realized PnL
+position cost summary
+account / cycle context
+```
+
+优先复用**已经存在**的 `paper_portfolio_read_model.py`（R22 已建立 cycle/as-of bounded
+portfolio read model）：
+
+```text
+PortfolioReadContext
+positions_for_context_with_status
+realized_pnl / cash / portfolio_for_context
+STATUS_VERIFIED / STATUS_UNKNOWN
+```
+
+B2C-4B 应在这个既有 owner 上建立 typed portfolio/accounting fact projection，而不是新增
+`new_pnl_repository` / `pnl_fact_manager` / `pnl_owner_service`。
+
+**一条必须提前守住的限制**：`portfolio_for_context(... valuations=...)` 今天仍接受
+**调用方提供**的 valuation Mapping。因此 B2C-4B **不得**把"调用了 `portfolio_for_context`"
+当成"market valuation 的 owner provenance 已成立" —— market valuation 的来源仍必须来自
+**R24 typed market fact**。B2C-4B 要继续区分：
+
+```text
+portfolio ledger authority        （持仓数量 / 成本 / 已实现盈亏 / 现金）
+market valuation authority        （市值 / 未实现盈亏 / NAV 的估值腿）
+```
+
+不把两者揉成一个假 owner。
 
 ---
 
@@ -420,12 +572,17 @@ invariant 2 禁止的伪造 provenance。
 
 四件前提都已在 B2C-1 / B2C-2 就位，**adapter 本身由 B2C-3 落地**：execution 的
 `evidence_ref_from_execution_projection` 已登记进 `SUPPORTED_OWNER_ADAPTERS`，并在生产里
-**零调用点**（迁移是 B2C-4）。
+**零调用点**（迁移是 B2C-4C）。B2C-4A 进一步让该投影携带 attribution 需要的成交事实。
 
 ### 建议的迁移顺序（与 §六 的排除项一致）
 
 ```text
-1. pnl_attribution        前提：execution facts 先有 owner 核验闭集（上面 1–4）
+1. pnl_attribution        拆成三段：
+                           B2C-4A execution capability（已完成）
+                           B2C-4B portfolio/accounting owner facts
+                                 前提：portfolio ledger 与 market valuation 两种 authority
+                                 各自能签发 typed fact（不允许把估值腿归给 ledger owner）
+                           B2C-4C runtime 迁移（前提：A + B 都完成）
 2. event_evidence         前提：news/information owner 能签发 PIT identity 与核验闭集
                           （今天 grade 由抓取端硬编码 → 先解决"谁签核验"）
 3. candidate_challenge / overfit_watch
@@ -499,3 +656,31 @@ forwarding layer —— 它隔离 execution owner 与 generic research contract�
 
 它**不**声称第 2 层（owner-origin provenance）已经成立。第 2 层仍是 OPEN / REQUIRED，
 且是 R27 完成的前置条件。
+
+### B2C-4A 之后的数字（能力补完，架构面中性）
+
+```text
+Roadmap capability removed:                        0
+Roadmap invariant weakened:                        0
+Production modules added:                          0
+Production modules removed:                        0
+New service / manager / repository / facade:       0
+New owner:                                         0
+Execution fact authorities:                        before = 1   after = 1
+Execution research adapters:                       before = 1   after = 1
+Execution factual fields published:                before = identity / lifecycle / verdict /
+                                                             PIT / verification
+                                                   after  = 上面 + code / action /
+                                                             requested_qty / filled_qty /
+                                                             fill_price / fees
+Execution verification semantics changed:          NO
+PIT semantics changed:                             NO
+Runtime migrations:                                0
+Legacy pnl writer changed:                         NO
+deepseek_research 新增 order/fill SQL:             0
+Net architecture surface:                          NEUTRAL
+```
+
+这一轮**不是**新增一层，而是让既有 owner contract 达到原 roadmap runtime 需要的完整度：
+投影仍然只有一个发布入口、一个 authority、一个 adapter。`realized_pnl` / `NAV` /
+position cost 没有被塞进来，它们留给 B2C-4B 的 portfolio/accounting owner。

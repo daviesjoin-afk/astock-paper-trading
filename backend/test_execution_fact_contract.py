@@ -18,6 +18,11 @@
     EXFACT-15 ~ 18   入口只接受 typed evidence、核验声明精确相等、缺 order id fail closed、
                      PIT 值格式可证明
     EXFACT-19        私有签发口只能由 owner 工厂调用（可执行边界，不是命名约定）
+    EXFACT-20 ~ 23   B2C-4A：投影发布 owner-native 成交事实（标的 / 方向 / 委托数量 /
+                      成交数量 / 成交价格 / 费用）—— 逐字派生、真 EvidenceField、三态保留、
+                      部分成交不美化
+    EXFACT-24        确认未执行时，owner 的肯定性零与"不适用"都不被伪造成 known zero
+    EXFACT-25        ``as_dict`` 保留完整三态语义（不用 ``maybe()`` 把三态压成 ``None``）
 
 全部离线：只用 ``evidence_from_order`` 的纯函数路径，不连数据库。
 """
@@ -296,6 +301,8 @@ class FailClosedTests(unittest.TestCase):
             "version": base.version, "identity": base.identity,
             "identity_kind": base.identity_kind, "order_id": base.order_id,
             "lifecycle_state": base.lifecycle_state, "fill_verdict": base.fill_verdict,
+            "code": base.code, "action": base.action, "requested_qty": base.requested_qty,
+            "filled_qty": base.filled_qty, "fill_price": base.fill_price, "fees": base.fees,
             "business_day": base.business_day, "observed_at": base.observed_at,
             "verification": base.verification, "inconsistencies": base.inconsistencies,
         }
@@ -306,6 +313,8 @@ class FailClosedTests(unittest.TestCase):
             ("alien_identity", {"identity": "  "}),
             ("field_not_an_evidence_field", {"business_day": DAY}),
             ("field_not_an_evidence_field", {"observed_at": EE.EvidenceField.known("code", "x")}),
+            ("field_not_an_evidence_field", {"filled_qty": 100}),
+            ("field_not_an_evidence_field", {"fees": EE.EvidenceField.known("commission", 5.0)}),
             ("alien_verification_scope", {"verification": {"verification_scope": "market_data"}}),
             ("unknown_verification_status", {"verification": {
                 "verification_scope": EV.EXECUTION_VERIFICATION_SCOPE,
@@ -441,6 +450,8 @@ class InputBoundaryTests(unittest.TestCase):
             "version": base.version, "identity": base.identity,
             "identity_kind": base.identity_kind, "order_id": base.order_id,
             "lifecycle_state": base.lifecycle_state, "fill_verdict": base.fill_verdict,
+            "code": base.code, "action": base.action, "requested_qty": base.requested_qty,
+            "filled_qty": base.filled_qty, "fill_price": base.fill_price, "fees": base.fees,
             "business_day": base.business_day, "observed_at": base.observed_at,
             "verification": dict(base.verification), "inconsistencies": base.inconsistencies,
         }
@@ -628,6 +639,253 @@ class SingleSourceTests(unittest.TestCase):
             with self.subTest(field=fact_field):
                 self.assertNotIn(fact_field, names)
         self.assertEqual(("business_day", "observed_at"), EE.FACT_FIELDS)
+
+
+class AttributionFactCompletenessTests(unittest.TestCase):
+    """EXFACT-20 ~ 24 —— B2C-4A：投影必须足以承载 PnL attribution 需要的成交事实。
+
+    这条不变量是：**投影只发布 owner 的成交事实，不重算、不美化、不把三态压平。**
+
+    B2C-1 的投影只有 identity / 生命周期 / verdict / PIT / 核验，因此 B2C-3 能证明
+    "发生了 partial / verified / not_executed"，却拿不出 ``pnl_attribution`` 需要的
+    成交数量、成交价格、费用、方向与标的。本组锁住那个缺口已被关闭，且关闭方式是
+    **复用** ``ExecutionEvidence`` 而不是另造一套 execution fact。
+    """
+
+    def test_EXFACT_20_the_projection_publishes_the_owner_execution_facts(self):
+        """EXFACT-20：六个 factual 字段逐个发布，且与 owner 的 ``EvidenceField`` 同一对象。
+
+        ``assertIs`` 是这条断言的要点：投影**不重算**（不重新求和数量、不重新加权价格、
+        不重新算费用、不查 DB、不从兼容列补值）。若某天有人在投影里"顺手"重算一遍，
+        这里立刻变红。
+        """
+        evidence = _evidence(fills=(_fill(event_key=KEY_A),))
+        projection = EV.fact_projection(evidence)
+
+        self.assertEqual(
+            ("code", "action", "requested_qty", "filled_qty", "fill_price", "fees"),
+            EV.EXECUTION_FACTUAL_FIELDS,
+        )
+        for name in EV.EXECUTION_FACTUAL_FIELDS:
+            with self.subTest(field=name):
+                holder = getattr(projection, name)
+                self.assertIsInstance(holder, EE.EvidenceField)
+                self.assertEqual(name, holder.name)
+                self.assertIs(holder, evidence.field(name), "投影必须逐字复制 owner 的字段")
+
+        # 值本身来自所有者记录的账本行。
+        self.assertEqual("600001", projection.code.require())
+        self.assertEqual("buy", projection.action.require())
+        self.assertEqual(100, projection.requested_qty.require())
+        self.assertEqual(100, projection.filled_qty.require())
+        self.assertEqual(10.5, projection.fill_price.require())
+        self.assertEqual(FEES, projection.fees.require())
+
+        # 六个字段都进了 as_dict（B2C-4C 的 payload 与冲突指纹都从这里读）。
+        keys = set(projection.as_dict())
+        for name in EV.EXECUTION_FACTUAL_FIELDS:
+            with self.subTest(projected=name):
+                self.assertIn(name, keys)
+
+        # 但**没有**任何组合/记账事实被塞进 execution contract。
+        for excluded in ("realized_pnl", "nav", "daily_pnl", "daily_return",
+                         "position_cost", "market_value", "unrealized_pnl", "cash"):
+            with self.subTest(excluded=excluded):
+                self.assertNotIn(excluded, keys)
+
+    def test_EXFACT_21_every_factual_field_must_be_a_correctly_named_evidence_field(self):
+        """EXFACT-21：六个字段必须是真 ``EvidenceField`` 且 name 精确匹配。
+
+        裸数字 / dict / duck-typed 对象 / **名字错位的真 EvidenceField** 一律 fail closed。
+        名字错位这一条最要紧：``EvidenceField.known("commission", 5.0)`` 装进 ``fees``
+        会让"这笔成交的总费用"伪装成"佣金"，而下游只会看到"这是一个已发布的三态字段"。
+        """
+        base = _projection(fills=(_fill(event_key=KEY_A),))
+        good = {
+            "version": base.version, "identity": base.identity,
+            "identity_kind": base.identity_kind, "order_id": base.order_id,
+            "lifecycle_state": base.lifecycle_state, "fill_verdict": base.fill_verdict,
+            "code": base.code, "action": base.action, "requested_qty": base.requested_qty,
+            "filled_qty": base.filled_qty, "fill_price": base.fill_price, "fees": base.fees,
+            "business_day": base.business_day, "observed_at": base.observed_at,
+            "verification": base.verification, "inconsistencies": base.inconsistencies,
+        }
+
+        class DuckTyped:
+            """长得像 EvidenceField 的普通对象：``isinstance`` 必须挡住它。"""
+
+            def __init__(self, name):
+                self.name = name
+                self.state = EE.EVIDENCE_KNOWN
+                self.value = 100
+
+            def as_dict(self):
+                return {"state": self.state, "value": self.value}
+
+        for name in EV.EXECUTION_FACTUAL_FIELDS:
+            wrong_name = "commission" if name != "commission" else "fees"
+            for label, bad in (
+                ("bare number", 100),
+                ("bare string", "600001"),
+                ("bare None", None),
+                ("plain dict", {"state": EE.EVIDENCE_KNOWN, "value": 100}),
+                ("duck typed", DuckTyped(name)),
+                ("wrong field name", EE.EvidenceField.known(wrong_name, 5.0)),
+            ):
+                with self.subTest(field=name, case=label):
+                    with self.assertRaises(EV.ExecutionFactContractError) as caught:
+                        EV._issue_fact_projection(**{**good, name: bad})
+                    self.assertEqual(
+                        "field_not_an_evidence_field", caught.exception.reason,
+                    )
+
+        # 非空性：六个合法字段本身必须被接受，否则上面只是在证明"全都拒绝"。
+        self.assertIsInstance(
+            EV._issue_fact_projection(**good), EV.ExecutionFactProjection,
+        )
+        # 也没有发明新的 evidence 词表：六个名字都是 owner 已登记的字段。
+        for name in EV.EXECUTION_FACTUAL_FIELDS:
+            with self.subTest(registered=name):
+                self.assertIn(name, EE.KNOWN_EVIDENCE_FIELD_NAMES)
+
+    def test_EXFACT_22_known_unknown_and_not_applicable_survive_verbatim(self):
+        """EXFACT-22：``known`` / ``unknown`` / ``not_applicable`` 三态逐字保留。
+
+        三种状态在投影里必须是三件不同的事：把 ``unknown`` 说成 ``known``（或反过来）
+        会让 research 把一个已知事实当未知、或把一个未知当已知。
+        """
+        known = _projection(fills=(_fill(event_key=KEY_A),))
+        # 账本说成交了、却没有任何成交流水：证据缺失 → unknown（**不是**按目标量成交）。
+        unknown = _projection(_order(status="filled"), fills=())
+        # 影子记录（本仓库里"从未提交"的 owner 状态）：成交问题**不存在** → not_applicable。
+        not_attempted = _projection(_order(status="shadow_q3"), fills=())
+
+        expectations = (
+            (known, "filled_qty", EE.EVIDENCE_KNOWN, 100),
+            (unknown, "filled_qty", EE.EVIDENCE_UNKNOWN, None),
+            (not_attempted, "filled_qty", EE.EVIDENCE_NOT_APPLICABLE, None),
+            (known, "fill_price", EE.EVIDENCE_KNOWN, 10.5),
+            (unknown, "fill_price", EE.EVIDENCE_UNKNOWN, None),
+            (not_attempted, "fill_price", EE.EVIDENCE_NOT_APPLICABLE, None),
+            (known, "fees", EE.EVIDENCE_KNOWN, FEES),
+            (unknown, "fees", EE.EVIDENCE_UNKNOWN, None),
+            (not_attempted, "fees", EE.EVIDENCE_NOT_APPLICABLE, None),
+        )
+        for projection, name, state, value in expectations:
+            with self.subTest(field=name, state=state):
+                holder = getattr(projection, name)
+                self.assertEqual(state, holder.state)
+                self.assertEqual(value, holder.value)
+
+        # 三态在投影层仍然互不相同（不是三个长得一样的 None）。
+        self.assertNotEqual(
+            unknown.as_dict()["filled_qty"], not_attempted.as_dict()["filled_qty"],
+        )
+        # 而且状态由 owner 判定 —— 投影不参与解读。同一个 owner 字段在同一份 evidence
+        # 上只有一个答案。
+        self.assertEqual(known.filled_qty, _projection(fills=(_fill(event_key=KEY_A),)).filled_qty)
+
+    def test_EXFACT_23_a_partial_fill_keeps_its_real_quantity_price_and_fees(self):
+        """EXFACT-23：部分成交的投影保留**真实** filled_qty / fill_price / fees。
+
+        B2C-3 能证明"发生过部分成交"，但拿不出"成交了多少、什么价、花了多少费用" ——
+        本测试锁住这三个数字真的从账本到达了投影，且没有被"整单没成交完"这件事抹掉。
+        """
+        amount = 30 * 10.5
+        projection = _projection(
+            _order(status="partially_filled", qty=100),
+            (_fill(qty=30, amount=amount, fees=PTR.commission(amount), event_key=KEY_A),),
+        )
+
+        self.assertEqual(EE.FILL_VERDICT_PARTIAL, projection.fill_verdict)
+        self.assertEqual(100, projection.requested_qty.require())
+        self.assertEqual(30, projection.filled_qty.require())
+        self.assertEqual(10.5, projection.fill_price.require())
+        self.assertEqual(PTR.commission(amount), projection.fees.require())
+        self.assertEqual("600001", projection.code.require())
+        self.assertEqual("buy", projection.action.require())
+
+        # 数量加权：两笔不同价的成交 → 投影报**加权**价，而不是挑一笔（挑一笔就是编造）。
+        two = _projection(
+            _order(status="partially_filled", qty=100),
+            (
+                _fill(qty=30, amount=30 * 10.0, fees=PTR.commission(30 * 10.0), event_key=KEY_A),
+                _fill(qty=10, amount=10 * 11.0, fees=PTR.commission(10 * 11.0), event_key=KEY_B),
+            ),
+        )
+        self.assertEqual(40, two.filled_qty.require())
+        self.assertAlmostEqual((30 * 10.0 + 10 * 11.0) / 40, two.fill_price.require())
+
+    def test_EXFACT_24_a_confirmed_non_execution_is_not_padded_with_known_zeros(self):
+        """EXFACT-24：确认未执行时，owner 的肯定性零与"不适用"各自保留。
+
+        ``ExecutionEvidence`` 明确区分三种"没有成交"：``confirmed zero`` /
+        ``unknown`` / ``not attempted``。投影必须原样发布 owner 的结论 —— 既不能把
+        生成的 ``known(0)`` 改成 ``unknown``（那就把一个肯定的事实说成不知道），也不能把
+        "不适用"伪造成 ``known(0)``（那就是**发明**一笔零元费用 / 零元成交价）。
+        """
+        rejected = _projection(_order(status="rejected", reason="risk rejected"), fills=())
+
+        # owner 在终态无成交时发布的是一个**肯定性的零**，不是 unknown。
+        self.assertEqual(EE.EVIDENCE_KNOWN, rejected.filled_qty.state)
+        self.assertEqual(0, rejected.filled_qty.value)
+        self.assertIn("affirmative zero", rejected.filled_qty.detail or "")
+
+        # 而"这笔委托的成交价 / 费用"根本没有被提出过 → not_applicable，不是 known(0)。
+        for name in ("fill_price", "fees"):
+            with self.subTest(field=name):
+                holder = getattr(rejected, name)
+                self.assertEqual(EE.EVIDENCE_NOT_APPLICABLE, holder.state)
+                self.assertIsNone(holder.value, "不适用绝不能伪装成一笔已知的零")
+
+        # 反方向同样必须成立：证据缺失是 unknown，不许被降级/升级成已知零。
+        missing = _projection(_order(status="filled"), fills=())
+        self.assertEqual(EE.EVIDENCE_UNKNOWN, missing.filled_qty.state)
+        self.assertIsNone(missing.filled_qty.value)
+
+        # 三种"没有成交"在投影上一次都没有被混同。
+        self.assertEqual(
+            {EE.EVIDENCE_KNOWN, EE.EVIDENCE_NOT_APPLICABLE},
+            {rejected.filled_qty.state, rejected.fill_price.state},
+        )
+        self.assertNotEqual(rejected.filled_qty.state, missing.filled_qty.state)
+
+    def test_EXFACT_25_as_dict_carries_the_full_three_state_payload(self):
+        """EXFACT-25：``as_dict`` 输出 ``EvidenceField.as_dict()``，**不是** ``maybe()``。
+
+        ``maybe()`` 会把 ``unknown`` 与 ``not_applicable`` 一起压成 ``None``，于是
+        "我们不知道成交了多少"与"这笔委托从未提交、成交数量问题不存在"在序列化结果里
+        变成同一句话。B2C-4C 的 payload 与冲突指纹都读 ``as_dict()``，所以这一条是
+        下游能否区分三态的前提。
+        """
+        known = _projection(fills=(_fill(event_key=KEY_A),))
+        unknown = _projection(_order(status="filled"), fills=())
+        not_attempted = _projection(_order(status="shadow_q3"), fills=())
+
+        for projection in (known, unknown, not_attempted):
+            payload = projection.as_dict()
+            for name in EV.EXECUTION_FACTUAL_FIELDS:
+                with self.subTest(state=getattr(projection, name).state, field=name):
+                    holder = getattr(projection, name)
+                    self.assertEqual(holder.as_dict(), payload[name])
+                    self.assertEqual(holder.state, payload[name]["state"])
+                    self.assertEqual(holder.value, payload[name]["value"])
+                    self.assertIn("detail", payload[name])
+
+        # 三态在序列化后仍然可区分。
+        self.assertEqual(EE.EVIDENCE_KNOWN, known.as_dict()["filled_qty"]["state"])
+        self.assertEqual(EE.EVIDENCE_UNKNOWN, unknown.as_dict()["filled_qty"]["state"])
+        self.assertEqual(
+            EE.EVIDENCE_NOT_APPLICABLE, not_attempted.as_dict()["filled_qty"]["state"],
+        )
+
+        # 关键对比：unknown 与 not_applicable 的 ``maybe()`` **都是** None —— 这正是
+        # 不能把 ``maybe()`` 用作投影输出的原因。
+        self.assertIsNone(unknown.filled_qty.maybe())
+        self.assertIsNone(not_attempted.filled_qty.maybe())
+        self.assertNotEqual(
+            unknown.as_dict()["filled_qty"], not_attempted.as_dict()["filled_qty"],
+        )
 
 
 if __name__ == "__main__":

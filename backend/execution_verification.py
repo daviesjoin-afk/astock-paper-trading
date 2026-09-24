@@ -685,6 +685,24 @@ _LEGAL_SOURCES_BY_STATUS = {
     ),
 }
 
+#: ``ExecutionFactProjection`` 发布的 owner-native execution **事实字段**，顺序固定。
+#:
+#: 这是 B2C-4A 关闭的缺口：B2C-1 的投影只有 identity / 生命周期 / verdict / PIT / 核验，
+#: 因此 B2C-3 能证明"发生了 partial / verified / not_executed"，却拿不出
+#: ``pnl_attribution`` 需要的成交数量、成交价格、费用、方向与标的。
+#:
+#: 六个字段**直接**取自 :class:`execution_evidence.ExecutionEvidence` 的同名
+#: :class:`execution_evidence.EvidenceField`，不重算、不从兼容列补值，也**不**压成裸值 ——
+#: ``known`` / ``unknown`` / ``not_applicable`` 必须继续保有区别（``known(0)`` 不等于
+#: ``unknown``，也不等于"没成交"）。
+#:
+#: 刻意**不**包含 ``realized_pnl`` / ``NAV`` / ``position_cost`` / ``daily_return``：
+#: 那些依赖成本基准与组合记账，不是 execution owner 的事实（属于 B2C-4B 的
+#: portfolio/accounting owner）。硬塞进来等于让组合事实冒充执行事实。
+EXECUTION_FACTUAL_FIELDS = (
+    "code", "action", "requested_qty", "filled_qty", "fill_price", "fees",
+)
+
 #: identity 的来源。审计必须看得见"这条身份是怎么来的"，否则一个字符串无法复核。
 IDENTITY_KIND_FILL_EVENT_KEY = "fill_event_key"
 IDENTITY_KIND_FILL_EVENT_KEY_SET = "fill_event_key_set"
@@ -906,6 +924,7 @@ class ExecutionFactProjection:
     """execution owner 对**一条 execution fact** 的正式投影。
 
     研究层将来引用一条 execution 事实时，读到的就是它：身份、业务日、观测时点、
+    owner-native 的执行事实字段（方向 / 标的 / 委托数量 / 成交数量 / 成交价格 / 费用），
     以及 owner 自己的核验声明。它**不**包含 research 语义，也**不**携带 market 词表。
 
     **没有公开 raw 构造器。** ``ExecutionFactProjection(...)`` 一律抛 ``TypeError``；
@@ -918,6 +937,12 @@ class ExecutionFactProjection:
     **没有** owner 记录的业务日（``paper_orders`` 没有交易日列），因此它如实报
     ``unknown`` —— 而不是拿 ``created_at`` 的墙钟日期冒充。这个缺口是 R27-B2C-1 明确
     记录的下一步前置条件，不是被隐藏的"以后再说"。
+
+    :data:`EXECUTION_FACTUAL_FIELDS` 里的六个字段（B2C-4A 起）同样是三态
+    :class:`execution_evidence.EvidenceField`，且**逐字**派生自 owner 的
+    :class:`execution_evidence.ExecutionEvidence`：投影只发布，不重算成交数量/价格/费用。
+    ``as_dict()`` 写的是 ``EvidenceField.as_dict()`` 而不是 ``maybe()`` —— ``maybe()``
+    会把 ``unknown`` 与 ``not_applicable`` 一起压成 ``None``，那正是本契约要区分的三态。
     """
 
     version: str
@@ -926,6 +951,12 @@ class ExecutionFactProjection:
     order_id: Any
     lifecycle_state: str
     fill_verdict: str
+    code: EE.EvidenceField
+    action: EE.EvidenceField
+    requested_qty: EE.EvidenceField
+    filled_qty: EE.EvidenceField
+    fill_price: EE.EvidenceField
+    fees: EE.EvidenceField
     business_day: EE.EvidenceField
     observed_at: EE.EvidenceField
     verification: Mapping
@@ -949,7 +980,8 @@ class ExecutionFactProjection:
             raise ExecutionFactContractError("unknown_identity_kind", str(self.identity_kind))
         if not str(self.identity or "").strip():
             raise ExecutionFactContractError("alien_identity", "identity must be non-empty")
-        for name, holder in (("business_day", self.business_day), ("observed_at", self.observed_at)):
+        for name in EXECUTION_FACTUAL_FIELDS + ("business_day", "observed_at"):
+            holder = getattr(self, name)
             if not isinstance(holder, EE.EvidenceField) or holder.name != name:
                 raise ExecutionFactContractError(
                     "field_not_an_evidence_field",
@@ -992,6 +1024,12 @@ class ExecutionFactProjection:
             "order_id": self.order_id,
             "lifecycle_state": self.lifecycle_state,
             "fill_verdict": self.fill_verdict,
+            "code": self.code.as_dict(),
+            "action": self.action.as_dict(),
+            "requested_qty": self.requested_qty.as_dict(),
+            "filled_qty": self.filled_qty.as_dict(),
+            "fill_price": self.fill_price.as_dict(),
+            "fees": self.fees.as_dict(),
             "business_day": self.business_day.as_dict(),
             "observed_at": self.observed_at.as_dict(),
             "verification": dict(self.verification or {}),
@@ -1016,8 +1054,10 @@ def fact_projection(evidence: Any, *, fill_rows_present: bool = True) -> Executi
     """把一个 :class:`execution_evidence.ExecutionEvidence` 投影成 owner fact contract。
 
     这是"owner 发布事实"的**唯一**入口：身份、业务日、观测时点全部从 owner 自己记录的
-    ``provenance`` 派生，核验声明由 :func:`verification_contract` 出。调用方
-    **不能**提供这些值（签名里没有这些参数），也无法绕开本函数自造一个投影。
+    ``provenance`` 派生，核验声明由 :func:`verification_contract` 出，
+    :data:`EXECUTION_FACTUAL_FIELDS` 六个事实字段逐字取自 evidence 自己发布的
+    :class:`execution_evidence.EvidenceField`。调用方**不能**提供这些值（签名里没有这些
+    参数），也无法绕开本函数自造一个投影。
 
     **入口先做类型校验**：``evidence`` 必须是真正的
     :class:`execution_evidence.ExecutionEvidence`（``type(...) is``，子类也不算）。
@@ -1048,6 +1088,15 @@ def fact_projection(evidence: Any, *, fill_rows_present: bool = True) -> Executi
         order_id=getattr(evidence, "order_id", None),
         lifecycle_state=str(getattr(evidence, "lifecycle_state", "") or ""),
         fill_verdict=str(evidence.fill_verdict_value()),
+        # 六个 factual 字段**逐字**复制 owner 自己发布的 EvidenceField（B2C-4A）。
+        # 刻意不取 ``.maybe()``：那会把 unknown / not_applicable 压成 None，而三态的区别
+        # 正是 research 必须看见的东西。也刻意不重算 / 不查 DB / 不从兼容列补值。
+        code=evidence.code,
+        action=evidence.action,
+        requested_qty=evidence.requested_qty,
+        filled_qty=evidence.filled_qty,
+        fill_price=evidence.fill_price,
+        fees=evidence.fees,
         business_day=_single_value(
             "business_day", provenance.get("fill_sessions"), subject="a fill business date",
             recorded_rows=provenance.get("fill_session_rows"), usable_rows=usable,
