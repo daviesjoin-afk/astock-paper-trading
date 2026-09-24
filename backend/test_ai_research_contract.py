@@ -28,6 +28,7 @@ import os
 import sys
 import unittest
 from collections.abc import Mapping
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -196,6 +197,75 @@ def _called_names(tree: ast.Module) -> set[str]:
     return names
 
 
+def _function_source(source: str, name: str) -> str:
+    """某个顶层函数（含嵌套定义）的源码文本 —— 用于"这段逻辑里没有 X"的静态断言。
+
+    按 AST 定位而不是子串搜索：docstring 里解释"不要比较 market 常量"不该让断言变红。
+    """
+    tree = ast.parse(source)
+    for node in tree.body:
+        if isinstance(node, ast.FunctionDef) and node.name == name:
+            return ast.get_source_segment(source, node) or ""
+    raise AssertionError(f"{name} 不是 {CONTRACT_MODULE} 的顶层函数")
+
+
+def _function_symbols(source: str, name: str) -> set[str]:
+    """顶层函数体里出现的**被引用符号名**（``X.Y`` 的 ``Y``、裸名 ``Z``）。
+
+    刻意按 AST 取符号而不是搜文本：注释与 docstring 里解释"不得比较
+    ``MDC.VERIFICATION_*``"是**正确**的文档行为，不该让"这段逻辑没有依赖 market
+    词表"的断言变红。
+    """
+    tree = ast.parse(source)
+    for node in tree.body:
+        if not isinstance(node, ast.FunctionDef) or node.name != name:
+            continue
+        found: set[str] = set()
+        for inner in ast.walk(node):
+            if isinstance(inner, ast.Attribute):
+                found.add(inner.attr)
+            elif isinstance(inner, ast.Name):
+                found.add(inner.id)
+        return found
+    raise AssertionError(f"{name} 不是 {CONTRACT_MODULE} 的顶层函数")
+
+
+def _assigned_names(nodes) -> set[str]:
+    """一组语句里被赋值的裸名（``x = ...`` / ``x += ...``）。"""
+    names: set[str] = set()
+    for node in nodes:
+        targets = []
+        if isinstance(node, ast.Assign):
+            targets = node.targets
+        elif isinstance(node, (ast.AugAssign, ast.AnnAssign)):
+            targets = [node.target]
+        for target in targets:
+            if isinstance(target, ast.Name):
+                names.add(target.id)
+    return names
+
+
+def _has_catch_all_outcome_fallback(source: str) -> bool:
+    """源码里是否存在"对 ``outcome`` 的 catch-all ``else`` 兜底"。
+
+    这正是被修掉的 fail-open 形状：
+
+        if   <cond A>: outcome = ...
+        elif <cond B>: outcome = ...
+        else:          outcome = UNVERIFIED      ← 静默替 owner 决定新状态的含义
+
+    判定方式是 AST 级的：找一个 ``orelse`` **非空**、且其直接语句里给 ``outcome``
+    赋值的 ``ast.If``（``elif`` 在 AST 里是嵌套的 ``If``，因此"最后那个裸 ``else``"
+    就是唯一满足该形状的节点）。文本搜索会误伤注释里解释"不要写 else 兜底"的文档。
+    """
+    for node in ast.walk(ast.parse(source)):
+        if not isinstance(node, ast.If) or not node.orelse:
+            continue
+        if "outcome" in _assigned_names(node.orelse):
+            return True
+    return False
+
+
 def _code_string_constants(tree: ast.Module) -> list[str]:
     """docstring 之外的字符串常量（即真正的 SQL / 命令文本）。"""
     docstrings = set()
@@ -271,6 +341,59 @@ def _hypothesis(*, as_of=DAY, evidence=(), confidence=0.5):
     )
 
 
+#: **仅测试使用**的 owner-native 核验状态词。刻意不等于
+#: ``market_data_contract.VERIFICATION_VERIFIED`` —— 用它才能证明 research 的
+#: "是否通过核验"判据真的与 market 字符串解耦，而不是碰巧两边都叫 ``verified``。
+OWNER_NATIVE_STATUS = "owner_verified"
+
+
+def _owner_native_ref(
+    *, source_type=ARC.EVIDENCE_SOURCE_EXECUTION, source_id="fill:abc",
+    as_of=DAY, outcome=ARC.OWNER_OUTCOME_VERIFIED, status=OWNER_NATIVE_STATUS,
+    attributes=None, fingerprint="owner-native-fp",
+):
+    """一个**非 market** 的 typed ref，用契约私有签发口构造（仅测试）。
+
+    刻意**不**新增 production public factory —— B2C-2 的 factory registry 仍然只有
+    ``market_data``，execution adapter 属于 B2C-3。这里只是把"契约核心能否携带
+    owner-native 核验"变成一条可执行的断言。
+    """
+    return ARC._issue_evidence_ref(
+        source_type=source_type,
+        source_id=source_id,
+        as_of=as_of,
+        owner_verification=ARC.OwnerVerification(
+            outcome=outcome, status=status,
+            attributes=(
+                {"verification_scope": "execution_order_fill_evidence"}
+                if attributes is None else attributes
+            ),
+        ),
+        detail={"content_fingerprint": fingerprint},
+    )
+
+
+def _market_ref_with_method(*, method, code=DEFAULT_CODE,
+                            observed_at=None, price=10.5):
+    """一条 method 明确指定的 market ref（identity / 内容指纹与 method 无关）。
+
+    刻意手工构造 snapshot 再让 R24 自己 ``classify``：``symbol_quote_snapshot``
+    只会产出 ``cross_source``，而 ``coverage_integrity`` 是 R24 的另一个合法
+    method（它**不是**逐票双源）。
+    """
+    stamp = observed_at or f"{DAY}T10:30:00+08:00"
+    snapshot = MDC.MarketDataSnapshot(
+        kind=SNAPSHOT_KIND,
+        rows=({"code": code, "price": price, "quote_at": stamp},),
+        as_of=DAY, observed_at=stamp, source="eastmoney", complete=True,
+        expected_rows=1,
+        verification=MDC.VERIFICATION_VERIFIED, verification_method=method,
+    )
+    return ARC.evidence_ref_from_market_reading(
+        MDC.classify(snapshot, MDC.policy_named(DEFAULT_POLICY), now=stamp, asof_day=DAY),
+    )
+
+
 # ---------------------------------------------------------------------------
 # AI-01 ~ AI-05 —— 事实层面
 # ---------------------------------------------------------------------------
@@ -333,11 +456,13 @@ class AiResearchFactTests(unittest.TestCase):
         self.assertEqual(MDC.VERIFICATION_NOT_ATTEMPTED, stale_ref.verification)
 
         # 非法核验组合（verified 配 none）在构造期就被拒绝，而不是被降级。
+        # 这条判据现在住在 **market owner 的 factory** 里（B2C-2 起它不再被命名为
+        # "owner verification" —— 它只认识 R24 的词表），research core 看不到它。
         with self.assertRaises(ValueError) as caught:
-            ARC._issue_evidence_ref(
-                source_type=ARC.EVIDENCE_SOURCE_MARKET_DATA, source_id="x", as_of=DAY,
-                verification=MDC.VERIFICATION_VERIFIED,
-                verification_method=MDC.VERIFICATION_METHOD_NONE, detail={},
+            ARC._market_owner_verification(
+                {"verification": MDC.VERIFICATION_VERIFIED,
+                 "verification_method": MDC.VERIFICATION_METHOD_NONE},
+                None,
             )
         self.assertIn("illegal verification pair", str(caught.exception))
 
@@ -780,6 +905,450 @@ class AiResearchTypedEvidenceTests(unittest.TestCase):
         self.assertNotEqual(
             _derived_identity(code=DEFAULT_CODE),
             _derived_identity(code=DEFAULT_CODE).replace(DEFAULT_POLICY, "close_snapshot"),
+        )
+
+
+# ---------------------------------------------------------------------------
+# RVERIFY-* —— B2C-2：research core 消费 **owner-native** 核验
+# ---------------------------------------------------------------------------
+
+
+class OwnerNativeVerificationTests(unittest.TestCase):
+    """R27-B2C-2：`ResearchEvidenceRef` 的 canonical 核验是 owner-neutral 的。
+
+    本轮要消除的结构性耦合：ref 曾经直接携带 ``verification`` /
+    ``verification_method``（一对 **market 形状**的字段），而
+    ``_owner_verification_pair()`` 实际只会问 ``MarketDataSnapshot`` 是否合法。于是
+    execution / news / adaptive 想进入 research 时只剩两个错误选择：假装自己是
+    ``market_data``，或把自己的核验结论**翻译**成 market 词 —— 后者就是由非 owner
+    发明核验结论。
+
+    现在 owner 自己发布 :class:`ai_research_contract.OwnerVerification`，research core
+    只消费 ``outcome``（三态）而不解释任何 owner 的状态字符串。
+    """
+
+    def test_RVERIFY_01_market_ref_compatibility_surface_is_unchanged(self):
+        """RVERIFY-01：market 事实的既有读取行为与 B2C-2 之前**逐字相同**。
+
+        B2C-2 不做 B3 的 API/UI cleanup，因此 ``verification`` /
+        ``verification_method`` / ``cross_source_verified`` 三个 market 读法必须保持
+        原语义；canonical storage 换成 owner-neutral 值对象**不得**改变它们的值。
+        """
+        cross = _ref(validation=VALIDATION_CROSS_SOURCE)
+        self.assertEqual(MDC.VERIFICATION_VERIFIED, cross.verification)
+        self.assertEqual(MDC.VERIFICATION_METHOD_CROSS_SOURCE, cross.verification_method)
+        self.assertIs(True, cross.cross_source_verified)
+        self.assertIs(True, cross.is_verified)
+
+        single = _ref(validation=VALIDATION_SINGLE_SOURCE)
+        self.assertEqual(MDC.VERIFICATION_SINGLE_SOURCE, single.verification)
+        self.assertIs(False, single.cross_source_verified)
+        self.assertIs(False, single.is_verified)
+
+        disagreement = _ref(validation=VALIDATION_DISAGREEMENT)
+        self.assertEqual(MDC.VERIFICATION_DISAGREEMENT, disagreement.verification)
+
+        # 投影里既有的 market key/value 一个不少、一个不改（additive only）。
+        projected = cross.projection()
+        for key, value in (
+            ("source_type", ARC.EVIDENCE_SOURCE_MARKET_DATA),
+            ("source_id", _derived_identity()),
+            ("as_of", DAY),
+            ("verification", MDC.VERIFICATION_VERIFIED),
+            ("verification_method", MDC.VERIFICATION_METHOD_CROSS_SOURCE),
+            ("cross_source_verified", True),
+        ):
+            with self.subTest(key=key):
+                self.assertEqual(value, projected[key])
+        # additive 的 owner-neutral 维度同时存在。
+        self.assertIs(True, projected["is_verified"])
+        self.assertEqual(
+            MDC.VERIFICATION_METHOD_CROSS_SOURCE,
+            projected["verification_attributes"]["verification_method"],
+        )
+
+        # InformationEvent 的 market 兼容读法同样保持。
+        event = ARC.InformationEvent(as_of=DAY, source="s", evidence_ref=cross)
+        self.assertEqual(MDC.VERIFICATION_VERIFIED, event.verification)
+        self.assertEqual(MDC.VERIFICATION_METHOD_CROSS_SOURCE, event.verification_method)
+        self.assertEqual(MDC.VERIFICATION_METHOD_CROSS_SOURCE,
+                         event.projection()["verification_method"])
+
+    def test_RVERIFY_02_verified_judgement_does_not_depend_on_market_vocabulary(self):
+        """RVERIFY-02：research 的"是否通过核验"判据与 market 状态词**解耦**。
+
+        构造一条 ``source_type=execution``、``status="owner_verified"`` 的事实 —— 这个
+        状态词**刻意不等于** ``MDC.VERIFICATION_VERIFIED``。若 hypothesis 判定仍然比较
+        market 字符串，它就永远不可能被判定为"通过核验"，本用例必红。
+
+        同时确认 research core 不再 import/比较任何 market 核验常量：静态断言
+        ``_derive_status`` 与 ``HypothesisEvidence.is_verified`` 的源码里不出现
+        ``VERIFICATION_`` 常量。
+        """
+        self.assertNotEqual(MDC.VERIFICATION_VERIFIED, OWNER_NATIVE_STATUS)
+
+        ref = _owner_native_ref()
+        self.assertEqual(ARC.EVIDENCE_SOURCE_EXECUTION, ref.source_type)
+        self.assertEqual(OWNER_NATIVE_STATUS, ref.verification)
+        self.assertIs(True, ref.is_verified)
+        self.assertIs(True, ARC.HypothesisEvidence(
+            ref=ref, relation=ARC.RELATION_SUPPORTS,
+        ).is_verified)
+
+        hypothesis = _hypothesis(evidence=(_evidence(ref, ARC.RELATION_SUPPORTS),))
+        self.assertEqual(ARC.HYPOTHESIS_SUPPORTED, hypothesis.status)
+        self.assertIsNone(hypothesis.reason)
+
+        # 非 market 事实不提供 market 的两个兼容字段，且**不**用 market 词填充。
+        self.assertIsNone(ref.verification_method)
+        self.assertIs(False, ref.cross_source_verified)
+
+        # 静态：通用 hypothesis 判定里不得再引用 market 核验常量。
+        symbols = _function_symbols(_source(CONTRACT_MODULE), "_derive_status")
+        for forbidden in ("VERIFICATION_UNAVAILABLE", "VERIFICATION_DISAGREEMENT",
+                          "VERIFICATION_VERIFIED"):
+            with self.subTest(constant=forbidden):
+                self.assertNotIn(
+                    forbidden, symbols,
+                    "_derive_status 仍引用 market 核验常量 —— research core 不得依赖 market 词表",
+                )
+
+    def test_RVERIFY_03_owner_is_verified_false_cannot_support_regardless_of_spelling(self):
+        """RVERIFY-03：owner 说"没通过核验"时，任何状态词拼写都不能让它支持假设。"""
+        for status in (OWNER_NATIVE_STATUS, "verified", "partially_verified", "not_executed"):
+            with self.subTest(status=status):
+                ref = _owner_native_ref(
+                    outcome=ARC.OWNER_OUTCOME_UNVERIFIED, status=status,
+                )
+                self.assertIs(False, ref.is_verified)
+                hypothesis = _hypothesis(evidence=(_evidence(ref, ARC.RELATION_SUPPORTS),))
+                self.assertEqual(ARC.HYPOTHESIS_INSUFFICIENT_EVIDENCE, hypothesis.status)
+                self.assertEqual(
+                    ARC.RESEARCH_REASON_EVIDENCE_NOT_VERIFIED, hypothesis.reason,
+                    "未通过核验的 supports 只能报 evidence_not_verified",
+                )
+
+        # 非空性对照：同一状态词、outcome=verified → 必须支持。否则上面的断言可能只是
+        # 因为"非 market 事实永远不通过"而变绿。
+        supported = _hypothesis(evidence=(
+            _evidence(_owner_native_ref(outcome=ARC.OWNER_OUTCOME_VERIFIED), ARC.RELATION_SUPPORTS),
+        ))
+        self.assertEqual(ARC.HYPOTHESIS_SUPPORTED, supported.status)
+
+    def test_RVERIFY_04_owner_verification_is_deeply_immutable(self):
+        """RVERIFY-04：owner 核验结论（含嵌套 attributes）必须**递归**不可改。"""
+        ref = _owner_native_ref(attributes={
+            "verification_scope": "execution_order_fill_evidence",
+            "verification_source": "ledger",
+            "nested": {"sources": ["ledger", "fills"], "counts": {"n": 2}},
+        })
+        verification = ref.owner_verification
+
+        with self.assertRaises((TypeError, AttributeError)):
+            verification.outcome = ARC.OWNER_OUTCOME_UNVERIFIED
+        with self.assertRaises((TypeError, AttributeError)):
+            verification.status = "spoofed"
+        with self.assertRaises(TypeError):
+            verification.attributes["verification_source"] = "spoofed"
+        with self.assertRaises(TypeError):
+            verification.attributes["nested"]["sources"] += ("extra",)
+        with self.assertRaises(TypeError):
+            verification.attributes["nested"]["counts"]["n"] = 99
+
+        # 通过 ref 拿到的视图同样不可写。
+        with self.assertRaises(TypeError):
+            ref.verification_attributes["verification_scope"] = "spoofed"
+
+        # 值本身没被上面的尝试改掉。
+        self.assertEqual("ledger", verification.attributes["verification_source"])
+        self.assertEqual(("ledger", "fills"), verification.attributes["nested"]["sources"])
+        self.assertEqual(2, verification.attributes["nested"]["counts"]["n"])
+
+        # 调用方保留的原始 dict 继续被改写也不影响已发布的值。
+        original = {"verification_source": "ledger", "extra": {"items": [1]}}
+        held = _owner_native_ref(attributes=original)
+        original["extra"]["items"].append(2)
+        original["new_key"] = "leak"
+        self.assertEqual((1,), held.verification_attributes["extra"]["items"])
+        self.assertNotIn("new_key", held.verification_attributes)
+
+    def test_RVERIFY_05_changed_owner_verification_state_is_a_conflict(self):
+        """RVERIFY-05：同 identity + owner 核验状态不同 → EvidenceConflict（顺序无关）。
+
+        这是 ``fact_state`` owner-neutral 化的行为证明：状态比较不再只看 market 那一对
+        字段，而是 owner 发布的整个核验结论。
+        """
+        verified = _owner_native_ref(outcome=ARC.OWNER_OUTCOME_VERIFIED)
+        unverified = _owner_native_ref(outcome=ARC.OWNER_OUTCOME_UNVERIFIED)
+        unusable = _owner_native_ref(outcome=ARC.OWNER_OUTCOME_SOURCE_UNUSABLE)
+
+        self.assertEqual(verified.identity(), unverified.identity())
+        self.assertNotEqual(verified.fact_state(), unverified.fact_state())
+
+        for label, order in (
+            ("verified,unverified", (verified, unverified)),
+            ("unverified,verified", (unverified, verified)),
+            ("verified,source_unusable", (verified, unusable)),
+        ):
+            with self.subTest(order=label):
+                with self.assertRaises(ARC.EvidenceConflict):
+                    _hypothesis(evidence=tuple(_evidence(ref) for ref in order))
+
+        # 完全相同 → 安全去重。
+        identical = _hypothesis(evidence=(_evidence(verified), _evidence(_owner_native_ref())))
+        self.assertEqual(1, len(identical.evidence))
+
+    def test_RVERIFY_06_market_verification_method_remains_part_of_conflict_state(self):
+        """RVERIFY-06：market 的 ``verification_method`` 仍参与冲突判定。
+
+        R24 的永久不变量：``verified + cross_source`` 与 ``verified + coverage_integrity``
+        是**不同**的核验结论（后者不是逐票双源）。owner-neutral 化以后，差异必须由
+        ``OwnerVerification.attributes`` 承载并进入 canonical form —— 只比较 ``status``
+        会让这两条事实被误判成同一条（并静默去重）。
+        """
+        cross = _market_ref_with_method(method=MDC.VERIFICATION_METHOD_CROSS_SOURCE)
+        coverage = _market_ref_with_method(method=MDC.VERIFICATION_METHOD_COVERAGE_INTEGRITY)
+
+        # 前置：这两条事实的 status 相同、method 不同 —— 正是最容易被压平的情形。
+        self.assertEqual(MDC.VERIFICATION_VERIFIED, cross.verification)
+        self.assertEqual(MDC.VERIFICATION_VERIFIED, coverage.verification)
+        self.assertNotEqual(cross.verification_method, coverage.verification_method)
+        self.assertEqual(cross.identity(), coverage.identity())
+
+        self.assertNotEqual(
+            cross.fact_state(), coverage.fact_state(),
+            "status 相同但 method 不同必须算事实状态不同（attributes 参与 canonical form）",
+        )
+        for label, order in (("cross,coverage", (cross, coverage)),
+                             ("coverage,cross", (coverage, cross))):
+            with self.subTest(order=label):
+                with self.assertRaises(ARC.EvidenceConflict):
+                    _hypothesis(evidence=tuple(_evidence(ref) for ref in order))
+
+        # attributes 键顺序不影响 canonical form（deterministic）。
+        reordered = ARC.OwnerVerification(
+            outcome=ARC.OWNER_OUTCOME_VERIFIED, status=MDC.VERIFICATION_VERIFIED,
+            attributes={
+                "cross_source_verified": True,
+                "verification_method": MDC.VERIFICATION_METHOD_CROSS_SOURCE,
+            },
+        )
+        self.assertEqual(
+            cross.owner_verification.canonical(), reordered.canonical(),
+            "canonical form 必须与 attributes 的插入顺序无关",
+        )
+
+    def test_RVERIFY_07_market_cross_source_semantics_stay_delegated_to_r24(self):
+        """RVERIFY-07：market 的 ``cross_source_verified`` 仍然**委托** R24，不由本层推断。
+
+        ``verified + coverage_integrity`` 不是逐票双源，因此 ``cross_source_verified``
+        必须是 ``False`` 而 ``is_verified`` 仍是 ``True`` —— 说明"是否通过核验"与
+        "是否真的双源"是两个问题，后者仍然只有 R24 能回答。
+        """
+        coverage = _market_ref_with_method(method=MDC.VERIFICATION_METHOD_COVERAGE_INTEGRITY)
+        self.assertEqual(MDC.VERIFICATION_VERIFIED, coverage.verification)
+        self.assertIs(True, coverage.is_verified)
+        self.assertIs(False, coverage.cross_source_verified)
+        self.assertEqual(
+            MDC.is_cross_source_verified(MDC.MarketDataSnapshot(
+                kind="symbol_quote", verification=coverage.verification,
+                verification_method=coverage.verification_method,
+            )),
+            coverage.cross_source_verified,
+        )
+
+        # 静态：本层不自行比较 market 的 verified 字面量（判据必须来自 R24）。
+        compares = [
+            node for node in ast.walk(_tree(CONTRACT_MODULE))
+            if isinstance(node, ast.Compare)
+            and any(isinstance(c, ast.Constant) and c.value == "verified"
+                    for c in [node.left, *node.comparators])
+        ]
+        self.assertEqual(
+            [], compares,
+            "契约自行比较了 market 的 verified 字面量 —— 双源判据必须委托 R24",
+        )
+
+        # 行为：coverage_integrity 的 verified 事实仍然支持假设（核验通过），
+        # 但双源结论如实为 False。
+        hypothesis = _hypothesis(evidence=(_evidence(coverage, ARC.RELATION_SUPPORTS),))
+        self.assertEqual(ARC.HYPOTHESIS_SUPPORTED, hypothesis.status)
+        self.assertIs(False, hypothesis.evidence[0].ref.cross_source_verified)
+
+    def test_RVERIFY_08_non_market_verification_does_not_require_a_market_method(self):
+        """RVERIFY-08：非 market 事实**不**被要求提供 ``verification_method``。
+
+        本轮禁止的两个错误做法：把 execution 的 ``verification_source`` 塞进
+        ``verification_method``，或用 ``MDC.VERIFICATION_METHOD_NONE`` 代表"非 market
+        owner"。前者是把 market 语义强加给别的 owner，后者是让 market 词表继续充当
+        通用坐标。
+        """
+        ref = _owner_native_ref(
+            attributes={
+                "verification_scope": "execution_order_fill_evidence",
+                "verification_version": "execution-fact-v1",
+                "verification_source": "ledger",
+            },
+        )
+        self.assertIsNone(
+            ref.verification_method,
+            "非 market 事实的 verification_method 必须是明确的「不适用」，而不是 market 词",
+        )
+        self.assertNotEqual(MDC.VERIFICATION_METHOD_NONE, ref.verification_method)
+        self.assertIs(False, ref.cross_source_verified)
+        self.assertNotIn("verification_method", ref.verification_attributes)
+
+        # owner-specific 维度完整保留（research core 只保存，不解释）。
+        self.assertEqual("ledger", ref.verification_attributes["verification_source"])
+        self.assertEqual(
+            "execution-fact-v1", ref.verification_attributes["verification_version"],
+        )
+        self.assertIsNone(ref.projection()["verification_method"])
+        self.assertIs(False, ref.projection()["cross_source_verified"])
+
+        # InformationEvent 同样不要求 market method。
+        event = ARC.InformationEvent(as_of=DAY, source="execution_owner", evidence_ref=ref)
+        self.assertIsNone(event.verification_method)
+        self.assertIs(True, event.is_verified)
+        self.assertIsNone(event.projection()["verification_method"])
+        self.assertEqual(ARC.EVENT_EXECUTION_OBSERVED, event.kind)
+
+    def test_RVERIFY_09_research_evidence_ref_still_has_no_public_constructor(self):
+        """RVERIFY-09：改签名不得放宽签发边界 —— 仍然没有公开 raw 构造器。"""
+        for attempt in (
+            {"source_type": ARC.EVIDENCE_SOURCE_EXECUTION, "source_id": "x", "as_of": DAY},
+            {"source_type": ARC.EVIDENCE_SOURCE_MARKET_DATA, "source_id": "x", "as_of": DAY,
+             "owner_verification": ARC.OwnerVerification(
+                 outcome=ARC.OWNER_OUTCOME_VERIFIED, status=OWNER_NATIVE_STATUS)},
+        ):
+            with self.subTest(source_type=attempt["source_type"]):
+                with self.assertRaises(TypeError) as caught:
+                    ARC.ResearchEvidenceRef(**attempt)
+                self.assertIn("no public constructor", str(caught.exception))
+
+        # 私有签发口**要求** owner 发布的核验结论：省略它无法签发一条"没有核验"的证据。
+        with self.assertRaises(TypeError):
+            ARC._issue_evidence_ref(
+                source_type=ARC.EVIDENCE_SOURCE_EXECUTION, source_id="x", as_of=DAY,
+                detail={},
+            )
+        # duck-typed 对象不能冒充 OwnerVerification。
+        with self.assertRaises(TypeError):
+            ARC._issue_evidence_ref(
+                source_type=ARC.EVIDENCE_SOURCE_EXECUTION, source_id="x", as_of=DAY,
+                owner_verification="verified", detail={},
+            )
+
+    def test_RVERIFY_10_private_issuer_and_factory_registry_boundary_unchanged(self):
+        """RVERIFY-10：私有签发口边界与 factory registry 保持不变。
+
+        B2C-2 只让**核心数据结构**从 market-shaped 变成 owner-neutral，**没有**提前
+        登记 execution adapter（那是 B2C-3）：公开 evidence factory 仍然只有
+        ``market_data`` 一个，``SUPPORTED_OWNER_ADAPTERS`` 不得扩张。
+        """
+        exported = frozenset(
+            name for name in ARC.__all__ if name.startswith("evidence_ref_from_")
+        )
+        self.assertEqual(
+            frozenset({"evidence_ref_from_market_reading"}), exported,
+            "B2C-2 不得新增公开 owner factory（execution adapter 属于 B2C-3）",
+        )
+        self.assertEqual(frozenset({ARC.EVIDENCE_SOURCE_MARKET_DATA}),
+                         ARC.SUPPORTED_OWNER_ADAPTERS)
+        self.assertFalse(hasattr(ARC, "_OWNER_ISSUED"),
+                         "不得存在可 import 的构造哨兵（那是伪安全）")
+
+        # 契约模块里签发口只被 owner factory 调用（**唯一**一处）。
+        tree = _tree(CONTRACT_MODULE)
+        issuer_calls = [
+            node for node in ast.walk(tree)
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+            and node.func.id == "_issue_evidence_ref"
+        ]
+        self.assertEqual(1, len(issuer_calls), "契约里出现了第二个私有签发调用点")
+
+    def test_RVERIFY_11_market_outcome_mapping_is_exhaustive_and_fail_closed(self):
+        """RVERIFY-11：market outcome 映射必须**显式穷尽**，owner 新增状态即 fail closed。
+
+        这是 #195 的核心架构原则在 market 归口上的可执行形式：**owner 词表的含义由
+        owner 决定，research 不猜**。
+
+        曾经的实现是一个 catch-all ``else``：
+
+            if   verification == VERIFIED:       outcome = VERIFIED
+            elif verification in (UNAVAILABLE, DISAGREEMENT): outcome = SOURCE_UNUSABLE
+            else:                                outcome = UNVERIFIED   # ← fail-open
+
+        今天 R24 的五个状态恰好被正确分类，所以**行为上看不出来**。但
+        ``_market_verification_pair()`` 会让 R24 未来新增的合法状态通过，于是那个新状态
+        会自动落进 ``else`` —— research 层静默替 R24 决定了一个它没有发布过的语义。
+        这正是 B2C-2 要消除的那类耦合，只是换了个位置。
+
+        现在的实现是一张显式表 + 双向穷尽检查，因此"R24 加状态"从**静默语义发明**变成
+        **必须人工处理的契约变更**。
+        """
+        mapping = ARC._MARKET_OUTCOME_BY_VERIFICATION
+
+        # 1. 正向：映射恰好覆盖 R24 的词表（不多、不少）。
+        self.assertEqual(
+            set(MDC.VERIFICATIONS), set(mapping),
+            "market outcome 映射与 R24 的核验词表不一致 —— 新增/删除状态必须人工归口",
+        )
+        self.assertEqual([], ARC._market_outcome_mapping_problems(mapping, MDC.VERIFICATIONS))
+
+        # 2. 每个 R24 状态都真的映射到一个合法的 owner-neutral outcome。
+        for status in MDC.VERIFICATIONS:
+            with self.subTest(status=status):
+                outcome = mapping[status]
+                self.assertIn(outcome, ARC.OWNER_OUTCOMES)
+        # 非空性：三态都必须真的被用到，否则"穷尽"可能只是把一切都归到一态。
+        self.assertEqual(
+            set(ARC.OWNER_OUTCOMES), set(mapping.values()),
+            "三态没有被完整使用 —— 映射可能把所有状态压成了同一态",
+        )
+
+        # 3. 两个方向都必须 RED（纯函数直接可测，不依赖改 R24 源码）。
+        missing = ARC._market_outcome_mapping_problems(
+            {k: v for k, v in mapping.items() if k != MDC.VERIFICATION_SINGLE_SOURCE},
+            MDC.VERIFICATIONS,
+        )
+        self.assertTrue(missing, "缺一个已知状态未被发现")
+        self.assertTrue(any("没有登记" in item for item in missing))
+
+        extra = ARC._market_outcome_mapping_problems(
+            {**mapping, "brand_new_state": ARC.OWNER_OUTCOME_UNVERIFIED},
+            MDC.VERIFICATIONS,
+        )
+        self.assertTrue(extra, "映射里多一个未知状态未被发现")
+        self.assertTrue(any("已不认识" in item for item in extra))
+
+        # 4. 行为：**模拟 R24 新增一个合法状态**，归口必须 fail closed。
+        #    只 patch 词表（不动源码），从而证明这条保证真的挂在"词表穷尽性"上。
+        with mock.patch.object(
+            MDC, "VERIFICATIONS", (*MDC.VERIFICATIONS, "brand_new_state"),
+        ):
+            with self.assertRaises(ValueError) as caught:
+                ARC._market_owner_verification(
+                    {"verification": MDC.VERIFICATION_VERIFIED,
+                     "verification_method": MDC.VERIFICATION_METHOD_CROSS_SOURCE},
+                    None,
+                )
+            message = str(caught.exception)
+            self.assertIn("drifted", message)
+            self.assertIn("brand_new_state", message, "错误信息必须点名那个未归口的状态")
+
+        # 5. 非空性对照：词表一致时同一调用必须成功 —— 否则上面可能只是因为该函数恒抛。
+        self.assertIs(True, ARC._market_owner_verification(
+            {"verification": MDC.VERIFICATION_VERIFIED,
+             "verification_method": MDC.VERIFICATION_METHOD_CROSS_SOURCE},
+            None,
+        ).is_verified)
+
+        # 6. 静态：归口函数里**不得**再有 catch-all 的 outcome 兜底。
+        #    按 AST 判定：函数体里不应存在"对 outcome 的裸 else 赋值"。
+        self.assertFalse(
+            _has_catch_all_outcome_fallback(_source(CONTRACT_MODULE)),
+            "market 归口出现了 catch-all 兜底 —— 新状态会被静默分类",
         )
 
 
