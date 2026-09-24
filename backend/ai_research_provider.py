@@ -106,10 +106,16 @@ AUTHORITY_FIELDS = frozenset({
     "verification", "verification_method", "source_type", "source_id", "as_of",
 })
 
-#: provider 允许输出的**全部**键。不在其中的键也一律拒绝（严格 schema）。
+#: 顶层 provider 允许输出的**全部**键。不在其中的键也一律拒绝（严格 schema）。
 _ALLOWED_PROVIDER_FIELDS = frozenset({
     "thesis", "confidence", "evidence_relations", "narrative", "counter_arguments",
 })
+
+#: 每个 ``evidence_relations`` item 允许的**全部**键。
+#: 嵌套对象同样按严格 schema 判定：本轮刻意选择 strict parser 而不是 tolerant
+#: parser，所以"顶层拒绝 authority 字段、嵌套却静默接受"是不自洽的 ——
+#: 那会让 provider 把 ``verification`` / ``authority`` 塞进 relation item 而不被发现。
+_ALLOWED_RELATION_FIELDS = frozenset({"evidence_id", "relation"})
 
 #: 用来借 R27-A 自己的校验器规范化 caller 输入的一次性占位 thesis，构造后即丢弃。
 _PROBE_THESIS = "pending"
@@ -202,30 +208,63 @@ def _canonical_caller_inputs(*, hypothesis_id, as_of, subject):
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-def _index_events(events) -> dict[str, ARC.InformationEvent]:
-    """按 ``evidence_id`` 建查找表；重复与冲突在这里 fail closed。
+def _typed_events(events) -> tuple[ARC.InformationEvent, ...]:
+    """入口类型校验：dict / 裸字符串不得冒充 typed evidence。
 
-    与 R27-A 同一设计思想（同 identity + 不同 fact state → conflict）：
-
-    * 同一 id、**完全相同**的 event  → 安全去重；
-    * 同一 id 但投影不一致           → 输入本身有歧义，``EvidenceConflict``。
-
-    刻意不 first-wins / last-wins / 随机挑一条：那会让研究结论依赖 collection
-    order，而顺序不是业务语义。
+    刻意在**任何**其它检查之前跑完，因为后面的 PIT 预检与去重都要读 typed 字段。
     """
-    indexed: dict[str, ARC.InformationEvent] = {}
+    checked = []
     for event in events or ():
         if not isinstance(event, ARC.InformationEvent):
             raise TypeError(
                 "research provider requires typed ai_research_contract.InformationEvent; "
                 f"got {type(event).__name__} — dict 或裸字符串不得冒充 evidence"
             )
+        checked.append(event)
+    return tuple(checked)
+
+
+def _event_state(event: ARC.InformationEvent):
+    """一条 event 的**全部**可观测状态 —— 重复判定不能只看事实维度。
+
+    ``evidence_id`` 只是 ``evidence_ref.source_id``，而 R27-A 的 fact identity 是
+    ``(source_type, source_id, as_of)``；``InformationEvent`` 自己还带独立的
+    ``as_of`` / ``source`` / ``payload``。
+
+    只比较 ``fact_state + payload`` 会漏掉 ``event.as_of`` / ``event.source``，于是
+    "同一条 evidence_ref、但 event.as_of 不同"的输入看起来像完全重复项而被静默丢弃。
+    那正好绕过 PIT 预检（未来观测被当成重复项丢掉，网络调用照常发生），并且让结果
+    依赖 collection order —— 交换输入顺序会改变"是否付费调用"。
+    """
+    ref = event.evidence_ref
+    return (
+        ref.identity(),
+        ref.fact_state(),
+        event.as_of,
+        event.source,
+        _jsonable(event.payload),
+    )
+
+
+def _index_events(events) -> dict[str, ARC.InformationEvent]:
+    """按 ``evidence_id`` 建查找表；重复与冲突在这里 fail closed。
+
+    与 R27-A 同一设计思想（同 identity + 不同 fact state → conflict）：
+
+    * 同一 id、**全部状态相同**的 event  → 安全去重；
+    * 同一 id 但任何状态不同             → 输入本身有歧义，``EvidenceConflict``。
+
+    "全部状态"见 :func:`_event_state`：identity、fact_state、``event.as_of``、
+    ``source`` 与 payload 缺一不可。刻意不 first-wins / last-wins / 随机挑一条：
+    那会让研究结论依赖 collection order，而顺序不是业务语义。
+    """
+    indexed: dict[str, ARC.InformationEvent] = {}
+    for event in events:
         existing = indexed.get(event.evidence_id)
         if existing is None:
             indexed[event.evidence_id] = event
             continue
-        if existing.evidence_ref.fact_state() != event.evidence_ref.fact_state() or \
-                _jsonable(existing.payload) != _jsonable(event.payload):
+        if _event_state(existing) != _event_state(event):
             raise ARC.EvidenceConflict(
                 f"input events carry conflicting content for evidence_id="
                 f"{event.evidence_id!r} — 输入本身有歧义时 fail closed，"
@@ -234,15 +273,17 @@ def _index_events(events) -> dict[str, ARC.InformationEvent]:
     return indexed
 
 
-def _reject_future_evidence(indexed, as_of: str) -> None:
+def _reject_future_evidence(events, as_of: str) -> None:
     """PIT 的便宜检查：**先于任何网络请求**拒绝 look-ahead。
+
+    刻意针对**全部原始 typed events**，而不是去重之后的集合：把这条保证建立在
+    "去重逻辑恰好正确"之上太脆弱 —— 一条被误判为重复项的未来观测会连带绕过 PIT，
+    于是"是否付费调用"变成输入顺序的函数。两处独立执行，任一失效另一处仍然拦截。
 
     若等 provider 返回、在 ``ResearchHypothesis`` 构造时才发现引用了未来事实，
     就已经为一次注定无效的研究付过费了。
     """
-    offenders = sorted(
-        event.evidence_id for event in indexed.values() if event.as_of > as_of
-    )
+    offenders = sorted({event.evidence_id for event in events if event.as_of > as_of})
     if offenders:
         raise ResearchProviderProtocolError(
             REASON_LOOK_AHEAD_EVIDENCE,
@@ -363,6 +404,14 @@ def _relation_entries(payload: Mapping[str, Any], indexed):
             raise ResearchProviderProtocolError(
                 REASON_INVALID_PROVIDER_RESPONSE, "evidence relation must be an object",
             )
+        # 嵌套 item 也走严格 schema：额外字段（含 authority / verification）一律拒绝，
+        # 与顶层同一标准。静默忽略会让"LLM 无权声明这些字段"这条保证出现缺口。
+        unexpected = sorted(set(item) - _ALLOWED_RELATION_FIELDS)
+        if unexpected:
+            raise ResearchProviderProtocolError(
+                REASON_INVALID_PROVIDER_RESPONSE,
+                f"evidence relation carries unexpected fields {unexpected}",
+            )
         evidence_id = item.get("evidence_id")
         if not isinstance(evidence_id, str) or evidence_id not in indexed:
             raise ResearchProviderProtocolError(
@@ -435,14 +484,18 @@ def run_research(
     API Key。本函数不认识厂商身份，网络部分完全委托
     :func:`ai_provider_transport.call_json`。
 
-    调用顺序刻意是"先校验、后付费"：规范 caller 身份 → 校验 typed events 并
-    去重/冲突检测 → PIT 预检 → 才发起网络请求。任何输入问题都在花钱之前失败。
+    调用顺序刻意是"先校验、后付费"：规范 caller 身份 → 类型校验 → PIT 预检 →
+    去重/冲突检测 → 才发起网络请求。任何输入问题都在花钱之前失败。
+
+    PIT 预检**刻意排在去重之前**，且直接作用于全部原始 events：若依赖去重后的集合，
+    一条被误判为重复项的未来观测会连同 PIT 一起绕过。
     """
     canonical_id, canonical_as_of, canonical_subject = _canonical_caller_inputs(
         hypothesis_id=hypothesis_id, as_of=as_of, subject=subject,
     )
-    indexed = _index_events(events)
-    _reject_future_evidence(indexed, canonical_as_of)
+    typed_events = _typed_events(events)
+    _reject_future_evidence(typed_events, canonical_as_of)
+    indexed = _index_events(typed_events)
 
     user_prompt = _build_user_prompt(
         as_of=canonical_as_of, subject=canonical_subject, question=question,

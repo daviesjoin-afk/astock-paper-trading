@@ -32,6 +32,9 @@ import ai_research_contract as ARC  # noqa: E402
 import ai_research_provider as P  # noqa: E402
 import market_data_contract as MDC  # noqa: E402
 
+#: 把 R27-A 冻结后的 payload（MappingProxyType / tuple）还原成可比较的普通结构。
+_jsonable = P._jsonable
+
 DAY = "2026-08-27"
 NEXT_DAY = "2026-08-28"
 CODE = "600000"
@@ -469,6 +472,121 @@ class ResearchProviderTests(ResearchTestBase):
             with self.assertRaises(P.ResearchProviderProtocolError) as ctx:
                 self.run_research({"thesis": "t", "confidence": 0.5, "status": "supported"})
         self.assertEqual(P.REASON_INVALID_PROVIDER_RESPONSE, ctx.exception.reason)
+
+    def test_RPROV_10b_duplicate_dedupe_cannot_bypass_the_pit_check(self):
+        """RPROV-10b：重复判定不得让未来观测绕过 PIT —— 两种输入顺序都必须拒绝。
+
+        构造：同一条 ``evidence_ref``（因此 evidence_id / fact_state / payload 全同），
+        但 ``event.as_of`` 是未来。若重复判定只看事实维度，未来那条会被当成"完全重复项"
+        静默丢弃，PIT 预检就看不到它，网络调用照常发生 —— 而交换输入顺序又会拒绝。
+        那正是被禁止的 first-wins / collection-order dependency。
+        """
+        first = _event(as_of=DAY)
+        future = ARC.InformationEvent(
+            as_of=NEXT_DAY, source=first.source,
+            evidence_ref=first.evidence_ref, payload=first.payload,
+        )
+        # 前置事实：这三项确实相同 —— 否则本用例没有测到想去重的那条路径
+        self.assertEqual(first.evidence_id, future.evidence_id)
+        self.assertEqual(first.evidence_ref.fact_state(), future.evidence_ref.fact_state())
+        self.assertEqual(_jsonable(first.payload), _jsonable(future.payload))
+
+        for label, events in (("(first, future)", (first, future)),
+                              ("(future, first)", (future, first))):
+            with self.subTest(order=label):
+                with self.patch_urlopen(_reply({"thesis": "t", "confidence": 0.5})):
+                    with self.assertRaises(P.ResearchProviderProtocolError) as ctx:
+                        P.run_research(
+                            provider_config=dict(CONFIG), hypothesis_id="H-1", as_of=DAY,
+                            subject=CODE, question="q", events=events,
+                        )
+                self.assertEqual(P.REASON_LOOK_AHEAD_EVIDENCE, ctx.exception.reason)
+                self.assertEqual(0, self.network_calls,
+                                 f"{label}：PIT 必须在该顺序下也于网络请求之前拦截")
+
+    def test_RPROV_12b_event_level_state_participates_in_conflict_detection(self):
+        """RPROV-12b：同 evidence_id + 同 fact_state + 同 payload，但 event 层不同 → conflict。
+
+        ``InformationEvent`` 自带独立的 ``as_of`` / ``source``，它们是 provider 实际看到
+        的投影的一部分（``_evidence_projection`` 会渲染出去）。只比较事实维度会让两条
+        投影不同的输入被静默去重，研究结论重新依赖 collection order。
+
+        这里用 ``source`` 这一维。``event.as_of`` 那一维无法在"同一条 evidence_ref"下
+        构造成非未来值（R27-A 要求 ``ref.as_of <= event.as_of``，而 ref 的 as_of 就是
+        DAY），因此它唯一可达的形态必然指向未来 —— 由 RPROV-10b 的 PIT 先于去重拦截
+        覆盖，两种顺序同样 fail closed。
+        """
+        base = _event(as_of=DAY)
+        other_source = ARC.InformationEvent(
+            as_of=DAY, source="another_owner",
+            evidence_ref=base.evidence_ref, payload=base.payload,
+        )
+        # 前置事实：事实维度与 payload 全同，只有 event 层不同
+        self.assertEqual(base.evidence_id, other_source.evidence_id)
+        self.assertEqual(base.evidence_ref.fact_state(), other_source.evidence_ref.fact_state())
+        self.assertEqual(_jsonable(base.payload), _jsonable(other_source.payload))
+        self.assertNotEqual(base.source, other_source.source)
+
+        for label, order in (("(base, other)", (base, other_source)),
+                             ("(other, base)", (other_source, base))):
+            with self.subTest(order=label):
+                with self.assertRaises(ARC.EvidenceConflict):
+                    self.run_research({"thesis": "t", "confidence": 0.5}, events=order)
+
+    def test_RPROV_12c_pit_precheck_does_not_depend_on_dedupe_correctness(self):
+        """RPROV-12c：PIT 预检直接作用于**全部原始 events**，不由去重结果决定。
+
+        静态 + 行为双重断言：即使去重被改坏，未来观测也不能悄悄溜过 PIT。
+        """
+        source = _source("ai_research_provider.py")
+        # 静态：run_research 里 PIT 预检在 _index_events 之前调用，且传入原始 typed events
+        self.assertLess(
+            source.index("_reject_future_evidence(typed_events"),
+            source.index("_index_events(typed_events"),
+            "PIT 预检必须在去重之前执行",
+        )
+        # 行为：重复的未来观测（同一 id 出现两次）同样拦截
+        first = _event(as_of=DAY)
+        future = ARC.InformationEvent(
+            as_of=NEXT_DAY, source=first.source,
+            evidence_ref=first.evidence_ref, payload=first.payload,
+        )
+        with self.patch_urlopen(_reply({"thesis": "t", "confidence": 0.5})):
+            with self.assertRaises(P.ResearchProviderProtocolError) as ctx:
+                P.run_research(
+                    provider_config=dict(CONFIG), hypothesis_id="H-1", as_of=DAY,
+                    subject=CODE, question="q",
+                    events=(first, future, future),
+                )
+        self.assertEqual(P.REASON_LOOK_AHEAD_EVIDENCE, ctx.exception.reason)
+        self.assertEqual(0, self.network_calls)
+
+    def test_RPROV_08d_nested_evidence_relations_use_a_strict_schema(self):
+        """RPROV-08d：relation item 的键必须严格等于 {evidence_id, relation}。
+
+        本轮刻意选择 strict parser。顶层已经拒绝 authority 字段，嵌套却静默接受
+        ``verification`` / ``authority`` 是不自洽的 —— 那会让"LLM 无权声明这些字段"
+        这条保证出现缺口，尽管这些字段不会真正改变 R27-A 的 authority 判定。
+        """
+        event = _event()
+        for extra in ({"verification": "verified"}, {"authority": "signal"},
+                      {"status": "supported"}, {"is_authoritative": True},
+                      {"as_of": DAY}, {"source_id": "x"}):
+            with self.subTest(extra=extra):
+                item = {"evidence_id": event.evidence_id, "relation": "supports"}
+                item.update(extra)
+                with self.assertRaises(P.ResearchProviderProtocolError) as ctx:
+                    self.run_research({
+                        "thesis": "t", "confidence": 0.5, "evidence_relations": [item],
+                    }, events=(event,))
+                self.assertEqual(P.REASON_INVALID_PROVIDER_RESPONSE, ctx.exception.reason)
+
+        # 恰好两个键仍然正常通过 —— 严格不等于拒绝合法输入
+        result = self.run_research({
+            "thesis": "t", "confidence": 0.5,
+            "evidence_relations": [{"evidence_id": event.evidence_id, "relation": "supports"}],
+        }, events=(event,))
+        self.assertEqual(ARC.HYPOTHESIS_SUPPORTED, result.hypothesis.status)
 
     def test_RPROV_09_confidence_must_be_a_fraction_in_unit_interval(self):
         """RPROV-09：``confidence=73`` → fail closed；``0.73`` → PASS。"""

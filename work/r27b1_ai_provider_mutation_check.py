@@ -143,10 +143,7 @@ MUTATIONS = [
         # 重复 evidence_id 改用 first-wins：同一 id 内容不同时静默保留先到者，
         # 研究结论开始依赖 collection order。
         "file": ADAPTER,
-        "old": (
-            "        if existing.evidence_ref.fact_state() != event.evidence_ref.fact_state() or \\\n"
-            "                _jsonable(existing.payload) != _jsonable(event.payload):\n"
-        ),
+        "old": "        if _event_state(existing) != _event_state(event):\n",
         "new": "        if False:\n",
         "test": (
             f"{SUITE}.ResearchProviderTests."
@@ -163,6 +160,118 @@ MUTATIONS = [
         "new": "    if parsed is None:\n        raise ProviderTransportError(REASON_CONTENT_NOT_OBJECT)\n",
         "test": f"{SUITE}.ProviderTransportTests.test_PROVIDER_07_non_object_content_fails_closed",
         "desc": "transport 接受 JSON list 作为合法 response",
+    },
+    {
+        "id": "M-B1-9",
+        # 复合 mutation：**精确复现被报告的 BLOCKER**。
+        #
+        # 同时（a）把重复判定退回只比较事实维度、（b）把 PIT 预检挪到去重之后。
+        # 两者合起来才是"future 观测被当成重复项丢弃 → PIT 看不到 → 付费调用照发，
+        # 且是否付费取决于输入顺序"这个失效状态。
+        #
+        # 刻意是复合的：修复后 PIT 与去重是**两道独立防线**，单拆任何一道另一道仍会
+        # 在"同 evidence_ref + 未来 as_of"这个形状上拦住（因为 event-state 纳入 as_of
+        # 后该输入不再算重复；而 PIT 作用于原始 events 时根本不需要去重正确）。
+        # 单拆不会变红说明的是"两道防线都在",不是"不变量没被测到" —— 期望由
+        # RPROV-10b 钉住的可观测契约（两种输入顺序都必须 look_ahead + 0 次网络调用）。
+        "file": ADAPTER,
+        "old": (
+            "    ref = event.evidence_ref\n"
+            "    return (\n"
+            "        ref.identity(),\n"
+            "        ref.fact_state(),\n"
+            "        event.as_of,\n"
+            "        event.source,\n"
+            "        _jsonable(event.payload),\n"
+            "    )\n"
+        ),
+        "new": (
+            "    ref = event.evidence_ref\n"
+            "    return (\n"
+            "        ref.fact_state(),\n"
+            "        _jsonable(event.payload),\n"
+            "    )\n"
+        ),
+        "extra": [(
+            "    typed_events = _typed_events(events)\n"
+            "    _reject_future_evidence(typed_events, canonical_as_of)\n"
+            "    indexed = _index_events(typed_events)\n",
+            "    typed_events = _typed_events(events)\n"
+            "    indexed = _index_events(typed_events)\n"
+            "    _reject_future_evidence(indexed.values(), canonical_as_of)\n",
+        )],
+        "test": (
+            f"{SUITE}.ResearchProviderTests."
+            "test_RPROV_10b_duplicate_dedupe_cannot_bypass_the_pit_check"
+        ),
+        "desc": "重复判定只看事实维度 + PIT 依赖去重结果（复现 BLOCKER：未来观测绕过 PIT）",
+    },
+    {
+        "id": "M-B1-9b",
+        # 只弱化重复判定（PIT 仍在去重之前作用于全部原始 events）：
+        # 未来观测这一形状仍被 PIT 拦下，但 event 层差异被静默去重。
+        "file": ADAPTER,
+        "old": (
+            "    ref = event.evidence_ref\n"
+            "    return (\n"
+            "        ref.identity(),\n"
+            "        ref.fact_state(),\n"
+            "        event.as_of,\n"
+            "        event.source,\n"
+            "        _jsonable(event.payload),\n"
+            "    )\n"
+        ),
+        "new": (
+            "    ref = event.evidence_ref\n"
+            "    return (\n"
+            "        ref.fact_state(),\n"
+            "        _jsonable(event.payload),\n"
+            "    )\n"
+        ),
+        "test": (
+            f"{SUITE}.ResearchProviderTests."
+            "test_RPROV_12b_event_level_state_participates_in_conflict_detection"
+        ),
+        "desc": "重复判定只比较事实维度（event 层差异被静默去重）",
+    },
+    {
+        "id": "M-B1-10",
+        # PIT 预检退回只作用于去重后的集合：把"是否付费调用"建立在去重逻辑正确之上。
+        "file": ADAPTER,
+        "old": (
+            "    typed_events = _typed_events(events)\n"
+            "    _reject_future_evidence(typed_events, canonical_as_of)\n"
+            "    indexed = _index_events(typed_events)\n"
+        ),
+        "new": (
+            "    typed_events = _typed_events(events)\n"
+            "    indexed = _index_events(typed_events)\n"
+            "    _reject_future_evidence(indexed.values(), canonical_as_of)\n"
+        ),
+        "test": (
+            f"{SUITE}.ResearchProviderTests."
+            "test_RPROV_12c_pit_precheck_does_not_depend_on_dedupe_correctness"
+        ),
+        "desc": "PIT 预检依赖去重结果（而非全部原始 events）",
+    },
+    {
+        "id": "M-B1-11",
+        # 嵌套 relation item 不再走严格 schema：顶层拒绝 authority 字段，嵌套却静默接受。
+        "file": ADAPTER,
+        "old": (
+            "        unexpected = sorted(set(item) - _ALLOWED_RELATION_FIELDS)\n"
+            "        if unexpected:\n"
+            "            raise ResearchProviderProtocolError(\n"
+            "                REASON_INVALID_PROVIDER_RESPONSE,\n"
+            '                f"evidence relation carries unexpected fields {unexpected}",\n'
+            "            )\n"
+        ),
+        "new": "        unexpected = []\n        if False:\n            pass\n",
+        "test": (
+            f"{SUITE}.ResearchProviderTests."
+            "test_RPROV_08d_nested_evidence_relations_use_a_strict_schema"
+        ),
+        "desc": "嵌套 relation item 接受额外字段（authority 字段静默通过）",
     },
     {
         "id": "M-B1-8",

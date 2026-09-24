@@ -1171,16 +1171,28 @@ verification_method」）。本 adapter 正常路径甚至不需要这个判断�
 
 ### PIT 与输入纪律
 
-调用顺序刻意是"先校验、后付费"：规范 caller 身份 → 校验 typed events（去重 / 冲突）
-→ PIT 预检 → **才**发起网络请求。因此 `event.as_of > 请求 as_of` 在任何请求发出前就
-被拒绝（回归断言 `network_calls == 0`），绝不先付费调用一次再在构造 hypothesis 时
+调用顺序刻意是"先校验、后付费"：规范 caller 身份 → 类型校验 → PIT 预检 →
+去重/冲突检测 → **才**发起网络请求。因此 `event.as_of > 请求 as_of` 在任何请求发出前
+就被拒绝（回归断言 `network_calls == 0`），绝不先付费调用一次再在构造 hypothesis 时
 才发现 look-ahead。`as_of` 一律由调用方显式传入，adapter 不读墙上时钟。
 
+**PIT 预检刻意作用于全部原始 events，且排在去重之前。** 若把它建立在去重结果之上，
+重复判定的任何缺陷都会连带绕过 PIT —— 于是"是否付费调用"变成输入顺序的函数。同理，
+重复判定不能只看事实维度：`evidence_id` 只是 `evidence_ref.source_id`，而
+`InformationEvent` 自己还带独立的 `as_of` / `source` / `payload`，它们都会被渲染进
+provider 看到的投影。因此"安全去重"要求 identity、fact_state、`event.as_of`、
+`source` 与 payload **全部**一致；任何一项不同即 `EvidenceConflict`，不 first-wins、
+不 last-wins，两种输入顺序结果相同。这两处是**两道独立防线**，各自都能单独拦住
+look-ahead，不是同一判定的重复表述。
+
 输入 evidence 必须是 R27-A 的 typed `InformationEvent`；dict 或裸字符串
-（`source_id="xxx"`）不得冒充证据。同一 `evidence_id` 内容完全相同 → 安全去重；
-**内容不同 → fail closed**（不 first-wins、不 last-wins），与 R27-A
-"同 identity + 不同 fact state → conflict" 是同一设计思想。同一 evidence 被声明成
-两种 relation 时，由 R27-A 的 `EvidenceRelationConflict` 裁决，adapter 不自己挑一条。
+（`source_id="xxx"`）不得冒充证据。同一 evidence 被声明成两种 relation 时，由 R27-A
+的 `EvidenceRelationConflict` 裁决，adapter 不自己挑一条。
+
+provider 输出协议是**严格 schema，嵌套对象同样严格**：顶层只认识那五个键，每个
+`evidence_relations` item 的键必须恰好是 `{evidence_id, relation}`。本轮刻意选 strict
+parser 而非 tolerant parser，所以"顶层拒绝 authority 字段、嵌套却静默接受"是不自洽的
+—— 嵌套里塞 `verification` / `authority` 同样判 `invalid_provider_response`。
 
 `confidence` 语义是 R27-A 的 `[0, 1]` 小数。`73` / `-0.2` / `1.5` / `true` /
 `"0.8"` 一律拒绝 —— 刻意**不**自动 `73 / 100`：猜一次就永久引入一个静默语义分支。
@@ -1219,8 +1231,13 @@ RPROV-01 ~ 22（typed 输入、strict 输出协议、authority 边界、PIT 先�
 guard 非空性）。语义 mutation 在 `work/r27b1_ai_provider_mutation_check.py`：
 unknown evidence_id 不再拒绝、relation 强制成 supports、authority 字段被接受、
 confidence >1 自动 /100、未来证据不在调用前拒绝、重复 id first-wins、
-transport 接受 JSON list、dict 冒充 typed evidence，必须全部 CAUGHT
-（survived = 0、fake = 0）。
+transport 接受 JSON list、dict 冒充 typed evidence、重复判定只看事实维度（含"加上
+PIT 依赖去重结果"的复合形态，精确复现未来观测绕过 PIT）、PIT 依赖去重结果、
+嵌套 relation 接受额外字段，必须全部 CAUGHT（survived = 0、fake = 0）。
+
+PIT 与去重是两道独立防线的这一事实由 mutation 结构本身表达：单拆一道不会变红，
+故用复合 mutation 复现可观测的失效状态（`network_calls == 0` 不再成立、结果依赖
+collection order），并把"两种输入顺序都必须 look_ahead"钉成永久回归 `RPROV-10b`。
 
 
 ## 目标依赖方向
