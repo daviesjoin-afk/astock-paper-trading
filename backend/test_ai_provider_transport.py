@@ -1046,6 +1046,8 @@ TRANSPORT_MODULE = "ai_provider_transport.py"
 REPOSITORY_MODULE = "ai_research_repository.py"
 #: R27-B2B 的研究 orchestration boundary（**不是** authority，也不联网，不 import 契约）。
 SERVICE_MODULE = "ai_research_service.py"
+#: R27-B2C-3 的 execution owner 接缝（**不是** authority；只做词表归口，不联网、不碰 DB）。
+EXECUTION_ADAPTER_MODULE = "ai_research_execution_adapter.py"
 
 ALLOWED_RESEARCH_IMPORTS = {
     "__future__", "collections", "dataclasses", "typing", "json",
@@ -1119,8 +1121,9 @@ class AiResearchProviderArchitectureGuardTests(unittest.TestCase):
         self.assertIn("urlopen", _called_names(transport_tree))
 
         # research contract / typed adapter / persistence owner / orchestration boundary
-        # 都没有直接网络调用。
-        for name in (RESEARCH_MODULE, REPOSITORY_MODULE, SERVICE_MODULE):
+        # / execution owner 接缝 都没有直接网络调用。
+        for name in (RESEARCH_MODULE, REPOSITORY_MODULE, SERVICE_MODULE,
+                     EXECUTION_ADAPTER_MODULE):
             source = _source(name)
             for token in ("urllib", "urlopen", "requests.", "httpx", "socket."):
                 with self.subTest(module=name, token=token):
@@ -1133,7 +1136,8 @@ class AiResearchProviderArchitectureGuardTests(unittest.TestCase):
             for imported in _imported_names(_tree(name)):
                 if imported.split(".")[0] in ("ai_research_contract", "ai_research_provider",
                                               "ai_provider_transport",
-                                              "ai_research_repository", "ai_research_service"):
+                                              "ai_research_repository", "ai_research_service",
+                                              "ai_research_execution_adapter"):
                     offenders.append(f"{name}: import {imported}")
         self.assertEqual(
             [], offenders,
@@ -1146,8 +1150,10 @@ class AiResearchProviderArchitectureGuardTests(unittest.TestCase):
         R27-B1 是 ``ai_research_provider``（typed research producer），R27-B2A 增加
         ``ai_research_repository``（typed research persistence consumer），R27-B2B 增加
         ``deepseek_advisor``（``data_quality`` runtime 的**调用方** —— 它自己从 R24
-        reading 签发 typed ``InformationEvent``）。用等值断言而不是"不含"断言：多出
-        任何一个消费者都必须是一次有意识的决定。
+        reading 签发 typed ``InformationEvent``），R27-B2C-3 增加
+        ``ai_research_execution_adapter``（execution owner 的接缝 —— 它必须 import 契约
+        才能调用私有签发口）。用等值断言而不是"不含"断言：多出任何一个消费者都必须是
+        一次有意识的决定。
 
         ``ai_research_service`` 刻意**不**在这里：orchestration boundary 只依赖 provider
         与 repository，不 import 契约。
@@ -1163,7 +1169,8 @@ class AiResearchProviderArchitectureGuardTests(unittest.TestCase):
                     offenders.append(name)
         self.assertEqual(
             sorted(set(offenders)),
-            [RESEARCH_MODULE, REPOSITORY_MODULE, "deepseek_advisor.py"],
+            ["ai_research_execution_adapter.py", RESEARCH_MODULE, REPOSITORY_MODULE,
+             "deepseek_advisor.py"],
             f"research contract 的生产消费者集合发生变化：{sorted(set(offenders))}",
         )
 

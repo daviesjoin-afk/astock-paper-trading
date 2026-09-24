@@ -1023,9 +1023,14 @@ token** —— 那是 R24 的职责，不在 R27-A 范围内。这条限制由
 `test_AI_TYPED_06_two_step_forgery_is_documented_not_claimed_closed` 作为**已知
 限制**断言下来，而不是假装已封堵。
 
-当前 `SUPPORTED_OWNER_ADAPTERS` **只有 market_data**。signal / execution / news 等
-仍在 `EVIDENCE_SOURCE_TYPES` 闭集里作为已声明的未来来源，但没有 factory 可以签发 ——
+当前 `SUPPORTED_OWNER_ADAPTERS` 是 `{ market_data, execution }`（R27-B2C-3 起）。signal / news
+等仍在 `EVIDENCE_SOURCE_TYPES` 闭集里作为已声明的未来来源，但没有 factory 可以签发 ——
 少支持一个 source 好过允许伪造一个 authority。
+
+这张 registry 表示"研究层已经存在**批准的 owner adapter**"，**不**表示"所有 public factory
+都定义在 `ai_research_contract` 里"：execution 的 factory 住在
+`ai_research_execution_adapter`，因为它必须同时认识两套词表，而研究契约刻意不 import 任何
+execution 模块（见下文 "execution fact adapter"）。
 
 ### 证据集合：去重与冲突
 
@@ -1601,12 +1606,18 @@ service **不**生成 `research_run_key` / job id / cycle id，也**不**把 `hy
 ### 证据来源的现实约束（决定了迁移顺序）
 
 ```text
-SUPPORTED_OWNER_ADAPTERS = { market_data }
+SUPPORTED_OWNER_ADAPTERS = { market_data, execution }   （R27-B2C-3 起）
 ```
 
-只有市场数据有可签发的 typed owner adapter，而 `ResearchEvidenceRef` 没有公开构造器。这条
-约束意味着：**证据不是市场数据的 legacy research runtime 在本轮不可能迁移**，除非先为它们
-的真实 owner 新增 adapter（那是契约工作，不是接线工作）。
+只有已经为该 owner 建好 typed projection + owner 签发核验的 owner 才能被签发，而
+`ResearchEvidenceRef` 没有公开构造器。这条约束意味着：**证据不是市场数据的 legacy
+research runtime 在本轮不可能迁移**，除非先为它们的真实 owner 新增 adapter（那是契约
+工作，不是接线工作）。
+
+R27-B2C-3 之前只有 `market_data`；B2C-3 登记了第二个 owner（`execution`），因此
+`deepseek_research` 的 paper 事实族第一次有了**可以合法引用**的 typed 证据来源。但
+B2C-3 只交付**能力**：`pnl_attribution` 的运行时迁移是 B2C-4，本轮的 adapter 在生产里
+**没有调用点**。
 
 因此本轮迁移的是 `deepseek_advisor.run_review`（`purpose='data_quality'`）—— 它的证据本来就是
 R24 Market Data Authority 的全市场快照，是**唯一**证据已经类型化的 legacy research runtime。
@@ -1691,9 +1702,9 @@ R27-B2B 收敛了唯一一条证据已经类型化的 legacy research runtime。
 
 ```text
 ResearchEvidenceRef 无 public raw constructor
-私有 _issue_evidence_ref 在 contract 之外零调用
-owner → factory 映射是精确 allowlist，且必须真的解析到 ai_research_contract
-owner registry 与契约导出的 factory registry 双向等值（不许静默漂移）
+私有 _issue_evidence_ref 的调用者是 (模块, enclosing function) 精确 allowlist
+owner → (module, factory) 映射是精确 allowlist，且该模块必须真的导出该符号
+owner registry 与 factory registry 双向等值（不许静默漂移）
 InformationEvent 运行期只接受真正的 ResearchEvidenceRef
 ```
 
@@ -1701,8 +1712,8 @@ InformationEvent 运行期只接受真正的 ResearchEvidenceRef
 新增一个未登记的 legacy-dict adapter（`paper_dict_to_information_event(row)`）。
 
 实现刻意**短且结构化**（`backend/test_ai_research_evidence_ownership_guard.py`）：只做
-import 别名解析 + "callable 是否解析到契约导出的符号" + 模块集合显式登记。它
-**不**静态追踪局部变量来源，也**不**自建控制流 / reaching-definition 近似 —— 那类近似
+import 别名解析 + "callable 是否解析到**已登记模块导出的**那个符号" + 模块集合显式登记。
+它**不**静态追踪局部变量来源，也**不**自建控制流 / reaching-definition 近似 —— 那类近似
 不能可靠证明它声称的不变量，只会把测试拖成一个劣质静态分析器；"传进来的到底是哪个
 局部变量"由上面的运行期类型检查与模块集合登记承担。
 
@@ -1714,16 +1725,21 @@ import 别名解析 + "callable 是否解析到契约导出的符号" + 模块�
 而不是调用方手工造了一份长得一样的 typed object。
 ```
 
-今天 `market_data` 路径做不到：`MarketDataSnapshot` / `MarketDataReading` 都是公开
-dataclass，因此
+今天两条已批准路径都做不到：`MarketDataSnapshot` / `MarketDataReading` 与
+`ExecutionEvidence` 都是公开可构造的类型，因此
 
 ```text
 手工造 MarketDataSnapshot → 手工造 MarketDataReading
     → evidence_ref_from_market_reading(...) → 得到一个 ResearchEvidenceRef
+
+手工造 ExecutionEvidence → fact_projection(...)
+    → evidence_ref_from_execution_projection(...) → 得到一个 ResearchEvidenceRef
 ```
 
-是可以通过的。这条限制由 `AI_TYPED_06_two_step_forgery_is_documented_not_claimed_closed`
-记录。第 1 层因此只是**必要条件**，不是最终条件。
+是可以通过的。这两条限制分别由
+`AI_TYPED_06_two_step_forgery_is_documented_not_claimed_closed` 与
+`EXEC_REF_18_owner_origin_provenance_is_still_open_and_required` 记录。第 1 层因此只是
+**必要条件**，不是最终条件 —— B2C-3 新增第二个 adapter 时**没有**顺带宣称关闭它。
 
 **这是 OPEN 架构要求，不是 WONTFIX。** 它必须由 owner/provenance 架构逐个关闭
 （execution → news → adaptive/experiment → runtime/incident），在 R27 宣布完成之前
@@ -1741,10 +1757,11 @@ dataclass，因此
 `execution_status` + 证据来源 + `EXECUTION_VERIFICATION_VERSION`），再由 research 契约
 消费 **owner-native verification** —— 而不是让所有 owner 伪装成 market_data。
 
-**B2C-1 + B2C-2 已经走完这条方向的前两步**：execution 发布了 owner-native 核验声明
+**B2C-1 + B2C-2 + B2C-3 已经走完这条方向的三步**：execution 发布了 owner-native 核验声明
 （B2C-1），research 契约的 canonical 存储改为 owner-neutral 的 `OwnerVerification`
-（B2C-2，见下文 "research core 消费 owner-native verification"）。
-剩下的**接线**（execution → `ResearchEvidenceRef` adapter）属于 B2C-3，本轮未开始。
+（B2C-2，见下文 "research core 消费 owner-native verification"），接缝
+（execution → `ResearchEvidenceRef` adapter）由 B2C-3 落地（见下文 "execution fact
+adapter"）。
 
 ### 第一个 owner contract：execution（R27-B2C-1）
 
@@ -1861,13 +1878,186 @@ ResearchEvidenceRef
   参与 canonical form），而"同一 identity + owner 核验状态不同 → `EvidenceConflict`"
   对任何 owner 都成立。freshness 依旧**不**进入事实冲突（R27-A 的永久不变量）。
 * **签发边界不放宽。** `_issue_evidence_ref` 现在**要求**一个真正的 `OwnerVerification`
-  （duck-typed 对象被拒），`ResearchEvidenceRef` 仍无公开构造器；公开 evidence factory
-  仍然**只有** `market_data` 一个 —— 本轮不登记 execution adapter。
+  （duck-typed 对象被拒），`ResearchEvidenceRef` 仍无公开构造器；B2C-2 的那一轮公开
+  evidence factory 仍然**只有** `market_data` 一个（execution adapter 属于 B2C-3，见下文）。
 
 **owner-origin provenance 仍然 OPEN / REQUIRED**：owner-neutral 化让"能携带谁的核验"
 变成能力问题，但**没有**证明输入对象真的由该 owner 产生。`MarketDataReading` /
 `ExecutionEvidence` 都仍是公开可构造的，两步伪造路径照旧，必须由 owner/provenance
 架构继续关闭。
+
+### execution fact adapter（R27-B2C-3）
+
+B2C-1 让 execution 发布了自己的 fact contract，B2C-2 让 research 能携带 owner-native
+核验。B2C-3 是这两者之间**唯一**的接缝：
+
+```text
+execution_verification                  （owner：事实 / 身份 / 业务日 / 核验结论的 authority）
+        ↓
+ai_research_execution_adapter           （唯一同时认识两套词表的 production 模块）
+        ↓
+ai_research_contract                    （research core；继续**不** import execution）
+```
+
+**为什么这是一个真实的 boundary，而不是 wrapper 债。** `execution_verification` 同时承担
+owner fact contract（纯 value type）与 SQLite 读路径 / 回填 / 闸门谓词。让 research domain
+contract 直接 import 它会把手写研究契约绑到 execution 的 DB 读实现上；反过来让
+`execution_verification` import research 又会反转依赖方向（AIG-02 / RG-04 已禁止）。
+本模块是 roadmap 本身要求的那一个接缝，不是 forwarding layer。它刻意不新增 registry
+framework / `BaseAdapter` / service / manager / repository / facade；公开面只有一个函数。
+
+#### 两个不同的问题（本节的要点）
+
+```text
+execution verification["is_verified"]     "**整张订单**是否被证明完整成交？"
+OwnerVerification.is_verified             "这个 owner-native 结论是否可作为 research fact 依赖？"
+```
+
+两者**不是**同一个问题。execution owner 明确区分四态，其中两种是**可以依赖的事实结论**：
+
+```text
+partial        账本证明**发生过真实的部分成交**，只是整单没有成交完
+not_executed   owner 有肯定性证据确认"没有执行"
+```
+
+因此**禁止** `outcome = VERIFIED if verification["is_verified"] else UNVERIFIED`：那会把
+"部分成交是真的"与"确认没有执行"一律降级成"不可信事实"，研究层再也引用不到它们。
+
+```text
+status = partial        execution is_verified = False   research outcome = verified
+                        ⇔ 完整成交？NO；"部分成交"这个事实可信？YES
+status = not_executed   execution is_verified = False   research outcome = verified
+                        ⇔ 完整成交？NO；确认没有执行？YES
+```
+
+owner 原来的整单布尔位不丢，只是换了一个**准确**的 key 进入 research attributes：
+`execution_fully_verified`。刻意不沿用 `is_verified` —— 那样同一份对象上会同时出现
+`ref.is_verified = True` 与 `verification_attributes["is_verified"] = False`，而两者对
+`partial` 的取值本来就不同，极易被误读。
+
+#### status × source → owner-neutral outcome
+
+映射是**显式穷尽表**，不是 catch-all：
+
+```text
+verified       + ledger        → verified          完整成交
+partial        + ledger        → verified          可信的"部分成交"事实
+not_executed   + ledger        → verified          可信的"确认未执行"事实
+unknown        + ledger        → unverified        核验做了，但得不出明确 execution fact
+
+evidence_inconsistent    （四种状态都可配）  → source_unusable
+legacy_row_without_fill_evidence            → source_unusable
+no_evidence_available                       → source_unusable
+```
+
+最后三条是**来源**层面的判定，与结论内容无关：`not_executed + legacy` 归 `source_unusable`
+并不是说"确认未执行"这个结论不可信，而是说**证据基础**是一条 owner 不愿背书的旧行。因此
+研究层给的原因是 `evidence_unavailable`（去修数据），而 `unknown + ledger` 给的是
+`evidence_not_verified`（这条事实还不够好）。两者必须分开。
+
+合法组合集合**由 owner 公开的** `verification_contract(status, source)` 推导（遍历
+`EXECUTION_STATUSES × EVIDENCE_SOURCES`），并断言映射与它**精确相等**；刻意**不缓存**，
+因此 owner 增删状态 / 来源 / 组合时 adapter 在**下一次调用**就 fail closed。与 B2C-2 的
+`_MARKET_OUTCOME_BY_VERIFICATION` 同一手法。
+
+#### PIT：只有 owner 记录的业务日能进
+
+`ResearchEvidenceRef.as_of` 取自 `projection.business_day`，且必须 `is_known`；否则**拒绝
+签发**，绝不 fallback 到 `created_at` / `observed_at` 的日期 / `order_time` / 墙钟。
+
+已知且**故意保留**的缺口：被拒 / 被撤等部分 execution facts 今天在 `paper_orders` 上
+没有 owner 记录的交易日列，因此
+
+```text
+execution fact without owner business_day
+    → NOT ADAPTABLE YET（owner data prerequisite 未满足）
+    → owner data gap = OPEN
+```
+
+这不是删能力：owner 一旦记录业务日，同一条事实立刻可签发（`EXEC-REF-09` 用 owner 自己的
+签发口断言了这一点）。
+
+#### identity 与内容指纹
+
+```text
+source_id  ←  <identity_kind>|<identity>     完全由 owner 投影派生
+```
+
+adapter **不**重算 event key、不接受 `order_id`：identity authority 是 execution owner。
+fact contract 版本刻意**不**进入 identity —— 版本升级不应该把同一条事实变成另一条事实。
+
+内容指纹覆盖 factual projection（version / identity_kind / order_id / lifecycle_state /
+fill_verdict / business_day / observed_at / inconsistencies），用
+`json.dumps(sort_keys=True)` + sha256 的确定性编码；刻意不用 `hash()`（跨进程不稳定）/
+`repr(object)` / 内存地址 / 当前时间 / 随机数。verification statement 不重复进指纹：它已经由
+`OwnerVerification.canonical()` 单独进入 `fact_state`。
+
+#### 签发边界的收紧（B2C-3 的可执行不变量）
+
+`_issue_evidence_ref` 的调用者从"契约外零调用"升级成 **(模块, enclosing function) 精确
+allowlist**：
+
+```text
+ai_research_contract.evidence_ref_from_market_reading
+ai_research_execution_adapter.evidence_ref_from_execution_projection
+```
+
+同时 owner→factory registry 从 `{owner: factory}` 升级成
+`{owner: (module, factory)}`，授权判据是 **(module, symbol) 对** —— 因此
+"在已登记模块里借用另一个 owner 的工厂名"不再算授权。只需 module + enclosing function
+这一层结构信息，**不做** CFG / reaching definition / dominance / branch / try-flow 分析。
+
+#### 本轮没有 production consumer（刻意）
+
+B2C-3 的交付物是**能力 + 契约 + 回归**：factory 存在、research contract 支持 execution、
+测试覆盖它。production runtime 仍然**没有**调用本 factory —— `pnl_attribution` 的迁移是
+B2C-4。因此"本模块今天零调用点"是预期状态，不是空转。
+
+**owner-origin provenance 仍然 OPEN / REQUIRED**：`ExecutionEvidence` 仍是公开可构造的，
+`手工造 evidence → fact_projection → adapter` 仍是一条两步伪造路径。adapter 关闭的是
+"调用方不能自述身份 / 业务日 / 核验结论"，**不是**"输入对象确实由 owner 产生"。B2C-3 不
+宣称关闭 two-step forgery。
+
+#### 回归门禁
+
+`backend/test_ai_research_execution_adapter.py`：EXEC-REF-01 ~ 06（真投影才可签发、dict /
+伪对象 / 子类拒绝、`source_type` / `kind` 派生、`source_id` 完全由 owner identity 派生、
+业务日 known 才签发、unknown 时 fail closed 且**不** fallback）、EXEC-REF-07 ~ 11
+（status × source → outcome 全表逐个断言，含 `partial` / `not_executed` 两个**永久回归**：
+它们是可信事实，`execution_fully_verified=False` 不得被误读成"不可信"）、EXEC-REF-12
+（映射与 owner 公开契约双向穷尽，两个方向都能红，并**模拟 owner 侧契约变更**验证 fail
+closed）、EXEC-REF-13 ~ 14（非 market 不携带 market 核验维度、owner attributes 深冻结）、
+EXEC-REF-15 ~ 16（同 identity 内容变了 → `EvidenceConflict`；同内容 → 安全去重、指纹确定）、
+EXEC-REF-17（签名不给调用方任何自述入口）、EXEC-REF-18 ~ 20（owner-origin provenance 仍
+OPEN、依赖方向单向且 adapter 是唯一接缝、execution 词表只出现在 adapter 且映射只有一份）。
+
+语义 mutation 在 `work/r27b2c3_execution_adapter_mutation_check.py`：`partial + ledger`
+被降级、`not_executed + ledger` 被降级、`unknown + ledger` 被升级、`evidence_inconsistent`
+被当成已核验、业务日 unknown 时 fallback 到 `observed_at`、`source_id` 丢掉 owner identity、
+内容指纹被常量化、adapter 接受 duck-typed 投影、status × source 映射退回 catch-all、出现
+第三个未批准的私有签发调用、取消与 owner 契约的双向穷尽检查 —— 必须全部 CAUGHT
+（survived = 0、fake = 0、restore sha256 一致）。
+
+`backend/test_ai_research_evidence_ownership_guard.py` 的 EVIDENCE-03 从"契约外零调用"升级为
+issuer caller **精确 allowlist** 等值，`FactoryOriginNonVacuityTests` 增加了
+"已登记模块不得借用另一个 owner 的工厂名"与"同一模块里的第二个签发 helper"两组反例。
+
+#### 为什么新增这一个 production 模块是合理的
+
+按本文 "拆分与抽象的纪律" 的四条：
+
+```text
+business responsibility  execution owner fact → typed research evidence 的唯一映射
+authority                它不拥有任何事实；owner 语义仍归 execution_verification
+dependency direction     execution_verification → ai_research_execution_adapter → ai_research_contract
+为什么认知复杂度下降      把"两套词表 + 一个归口表"收在一个有名字的接缝里；
+                         研究契约因此可以继续不 import 带 DB 读路径的 execution 模块
+```
+
+它**不是** forwarding layer：调用链上没有多出一个只转发的中间层，而是把一条原本不可表达的
+能力（execution 事实进入研究）变成可表达，并且这个接缝是 roadmap 明确要求的。同步新增的
+只有这一个 production 模块 —— 没有 service / manager / repository / facade / registry
+framework / `BaseAdapter`。
 
 
 ## 目标依赖方向
@@ -1959,6 +2149,31 @@ market 的词不得进入；核验声明必须与 `verification_contract` 的产
 观测时点时不得挑代表值，没有 owner 记录的业务日必须报 `unknown` 而不是用墙钟日期
 冒充；`business_day` / `observed_at` 必须格式可证明（真实日历日、带时区时间戳）；
 verdict 只有 `verification_from_evidence` 一份实现）
+owner 事实的两个不同问题被混同（R27-B2C-3：execution 的
+`verification["is_verified"]` 回答"整张订单是否完整成交"，research 的
+`OwnerVerification.is_verified` 回答"这个结论是否可作为事实依赖"。`partial + ledger` 与
+`not_executed + ledger` 是**可信的事实结论**，必须归 `verified`；整单布尔位不得被当成
+research 判据 —— 那会把真实发生的部分成交与确认未执行降级成"不可信事实"。整单布尔位必须以
+`execution_fully_verified` 这个**不同**的名字暴露，避免与 `ref.is_verified` 混淆）
+research adapter 静默发明或升级 owner 语义（R27-B2C-3：adapter 不得接受
+dict / Mapping / duck-typed / 子类投影（`type(projection) is ExecutionFactProjection`）；
+`source_id` 必须由 owner 的 `identity_kind` + `identity` 派生，fact contract 版本不得进入
+identity；`owner_verification.status` 必须逐字保留 execution 自己的状态词，不得翻译成 market
+词；status × source 映射必须与 owner 公开的 `verification_contract` **精确相等**（双向穷尽、
+不缓存，owner 词表漂移即 fail closed），不得退化成 catch-all；来源不可用必须归
+`source_unusable` 而不是 `unverified`；必须派生确定性的 content fingerprint，不得用 `hash()`
+/ `repr(object)` / 地址 / 时间 / 随机数）
+execution 事实被凭空赋予业务日（R27-B2C-3：`as_of` 只能来自
+`projection.business_day` 且必须 `is_known`；unknown 时必须**拒绝签发**，
+不得 fallback 到 `created_at` / `observed_at` 的日期 / `order_time` / 墙钟）
+私有签发口出现未批准的调用者（R27-B2C-3：`_issue_evidence_ref` 的调用者是
+`(模块, enclosing function)` **精确 allowlist** —— 契约外零调用、契约内只能由已批准的
+owner factory 调用；adapter 里出现第二个 helper 调签发口同样 RED。只做 module + enclosing
+function 结构扫描，不做 CFG）
+owner factory registry 允许借用同名工厂（R27-B2C-3：已批准 owner → factory 映射是
+`{owner: (module, factory)}`，授权判据是 **(module, symbol) 对**且该模块必须**真的导出**该
+符号 —— 本地同名函数、其它对象的同名方法、以及"在另一个已登记模块里借用同一个名字"全部
+拒绝；registry 与 `SUPPORTED_OWNER_ADAPTERS` 双向等值）
 ```
 
 ### 仅作 review signal（不进入 CI gate）
