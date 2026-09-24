@@ -1606,6 +1606,11 @@ class AiResearchArchitectureGuardTests(unittest.TestCase):
         owner）；authority 反向 import **其中任何一个**都算违规 —— 只守住契约会留下
         "authority 直接 import adapter 发请求"或"直接 import repository 写研究台账"
         这两个后门。
+
+        R27-B2C-4B 起 AI 层是**五个**模块：portfolio/accounting 的 owner adapter 也是
+        AI 层成员，因此必须与 execution adapter 一起出现在下面的枚举里。**每次新增一个
+        AI 层模块，这里必须同步补一行** —— 漏掉一行，这条 guard 对新模块就是空洞（OCR
+        第一次真实观察正是抓到了这个缺口）。
         """
         offenders = []
         for name in AUTHORITY_MODULES:
@@ -1614,6 +1619,7 @@ class AiResearchArchitectureGuardTests(unittest.TestCase):
                     "ai_research_contract", "ai_research_provider", "ai_provider_transport",
                     "ai_research_repository", "ai_research_service",
                     "ai_research_execution_adapter",
+                    "ai_research_portfolio_adapter",
                 ):
                     offenders.append(f"{name}: import {imported}")
         self.assertEqual(

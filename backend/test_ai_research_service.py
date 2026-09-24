@@ -964,9 +964,14 @@ class ServiceArchitectureGuardTests(unittest.TestCase):
         self.assertNotIn("ai_research_contract", _imported_roots(_tree(SERVICE_MODULE)))
 
     def test_REPOSITORY_and_PROVIDER_never_depend_on_the_service(self):
-        """依赖方向不可反转：下层不得 import 上层 orchestration。"""
+        """依赖方向不可反转：下层不得 import 上层 orchestration。
+
+        R27-B2C-4B 起 portfolio/accounting 的 owner adapter 也是 AI 层**下层**成员，
+        与 provider / repository / contract / transport 同属"不得反向依赖 service"的集合。
+        """
         for name in ("ai_research_provider.py", REPOSITORY_MODULE,
-                     "ai_research_contract.py", "ai_provider_transport.py"):
+                     "ai_research_contract.py", "ai_provider_transport.py",
+                     "ai_research_portfolio_adapter.py"):
             with self.subTest(module=name):
                 self.assertNotIn(
                     "ai_research_service", _imported_roots(_tree(name)),

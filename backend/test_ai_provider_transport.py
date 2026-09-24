@@ -1137,7 +1137,8 @@ class AiResearchProviderArchitectureGuardTests(unittest.TestCase):
                 if imported.split(".")[0] in ("ai_research_contract", "ai_research_provider",
                                               "ai_provider_transport",
                                               "ai_research_repository", "ai_research_service",
-                                              "ai_research_execution_adapter"):
+                                              "ai_research_execution_adapter",
+                                              "ai_research_portfolio_adapter"):
                     offenders.append(f"{name}: import {imported}")
         self.assertEqual(
             [], offenders,
