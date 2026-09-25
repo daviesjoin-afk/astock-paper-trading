@@ -17,6 +17,8 @@ import re
 import sqlite3
 import statistics
 from collections import Counter, defaultdict
+from dataclasses import dataclass
+from typing import Any, Mapping
 from zoneinfo import ZoneInfo
 
 import data_fetcher as dfc
@@ -932,3 +934,616 @@ def overview(conn=None):
     finally:
         if owns:
             conn.close()
+
+
+# ---------------------------------------------------------------------------
+# R27-B2C-5 —— news owner 的 typed fact contract（owner → research readiness）
+# ---------------------------------------------------------------------------
+#
+# 本节只做一件事：把 owner **已经**存在的 durable 事实边界整理成一个 typed projection，
+# 并发布一个**只包含 owner 真能产生的状态**的核验闭集。它刻意**不**新增核验列
+# （DB migration = 0），也刻意**不**产生 verified。
+#
+# 为什么没有 verified —— 这是 R27-B2C-5 审计出来的硬事实，不是设计偏好：
+# ``verification_status`` 在整个仓库里只有**一个** writer（``capture_major_events``），
+# 它只写得出 ``"single_source_linked"`` / ``"unverified"`` 两个值，而这两个值都只回答
+# "有没有 source_url"；没有任何 UPDATE、第二 writer 或多源复算路径能把一行升级成
+# "已核验"。``news_events`` 连核验列都没有。于是：
+#
+#     CURRENT NEWS OWNER HAS NO VERIFIED STATE
+#
+# 发明一个 ``NEWS_OWNER_VERIFIED`` 就是伪造 provenance，所以本节拒绝这么做；等 owner
+# 真的发布核验 writer 时，人工把它登记进下面的闭集即可。
+#
+# 三条不变量，本节全部代码都只为它们服务：
+#
+# 1. ``first_seen_at`` 是**唯一**的 historical availability authority。
+#    ``published_at`` 只说明"来源声称事件何时发布"，**永远不能**把可用性提前 ——
+#    否则 9/20 发布、9/21 才被摄取的事件会倒填进 as_of=9/20 的历史研究。
+# 2. ``evidence_grade`` 是**来源可追溯性**分级（A 官方原文 / B 可定位披露聚合 /
+#    C 带链接媒体 / D 无链接），不是核验结论，不能升级任何核验状态。
+# 3. durable normalized 列是 ledger authority。``raw_payload`` 只是原始观察材料，
+#    不得覆盖任何列值 —— 因此下面每个 SELECT 都显式列出列名，**从不**读 raw_payload。
+#
+# 本节**不**联网、不读时钟：typed read 只读 durable ledger。live fetch 只属于
+# ``capture_events`` / ``capture_major_events`` 这两条 ingestion writer 路径。
+
+NEWS_FACT_CONTRACT_VERSION = "news-fact-v1"
+
+#: 两个 durable ledger 各自的 record kind。identity 的 namespace 就是它。
+NEWS_RECORD_KIND_EVENT = "news_event"
+NEWS_RECORD_KIND_MAJOR_EVENT = "market_major_event"
+
+#: 固定顺序闭集（= 读取顺序），调用方不需要猜，deterministic fingerprint 也因此稳定。
+NEWS_RECORD_KINDS = (
+    NEWS_RECORD_KIND_EVENT,
+    NEWS_RECORD_KIND_MAJOR_EVENT,
+)
+
+#: 本 owner 的核验结论闭集。**刻意只有三态，且没有 verified。**
+#:
+#: * :data:`NEWS_OWNER_SINGLE_SOURCE` —— 可追溯到**一条**来源（有 source_url 或
+#:   article_id）。这是"单源可追溯"，**不是**核验通过：没有任何第二来源复算过它。
+#: * :data:`NEWS_OWNER_UNVERIFIED` —— owner 记录的 ledger 状态**明确是未核验**
+#:   （``market_major_events.verification_status == "unverified"`）。
+#: * :data:`NEWS_OWNER_SOURCE_UNUSABLE` —— 来源**不可追溯**（既没有 source_url 也没有
+#:   article_id），核验过程无从下手 → fail closed。
+NEWS_OWNER_SINGLE_SOURCE = "single_source"
+NEWS_OWNER_UNVERIFIED = "unverified"
+NEWS_OWNER_SOURCE_UNUSABLE = "source_unusable"
+
+NEWS_OWNER_VERIFICATION_STATUSES = (
+    NEWS_OWNER_SINGLE_SOURCE,
+    NEWS_OWNER_UNVERIFIED,
+    NEWS_OWNER_SOURCE_UNUSABLE,
+)
+
+#: ``market_major_events.verification_status`` 的 **writer 闭集**（R27-B2C-5 审计所得）。
+#:
+#: 闭集的唯一来源是 ``capture_major_events`` 里那个内联表达式
+#: ``"single_source_linked" if source_url else "unverified"``。这个元组是它的显式登记：
+#: 未知值一律 hard error，绝不静默落进 ``unverified``。``test_news_fact_contract`` 会
+#: 直接扫描 writer 源码，要求它与本元组逐字一致 —— 未来新增状态却没有更新映射时，
+#: 那条测试必须变 RED。
+NEWS_MAJOR_EVENT_WRITER_STATUSES = ("single_source_linked", "unverified")
+
+#: ledger 状态词 → news owner 核验闭集。**完整表，不是 ``if/else`` 链。**
+#: catch-all ``else`` 会把 owner 未来新增的状态静默归成一态 —— 那正是"非 owner 替
+#: owner 决定它自己的词是什么意思"。
+_NEWS_MAJOR_LEDGER_STATUS_TO_OWNER = {
+    "single_source_linked": NEWS_OWNER_SINGLE_SOURCE,
+    "unverified": NEWS_OWNER_UNVERIFIED,
+}
+
+#: 一次 typed read 的默认上限（在 PIT 过滤**之后**应用）。
+NEWS_FACT_READ_LIMIT = 200
+
+
+class NewsFactContractError(ValueError):
+    """owner fact contract 的构造 / 读取被拒绝 —— fail closed。
+
+    ``reason`` 是稳定 machine code，供调用方与测试依赖；文案本身不承载判定：
+
+    * ``version_mismatch`` —— fact contract 版本不符；
+    * ``unknown_record_kind`` —— record kind 不在闭集里；
+    * ``unknown_owner_status`` —— 核验结论不在本 owner 的闭集里；
+    * ``unknown_verification_status`` —— ledger 核验状态不在审计过的 writer 闭集里；
+    * ``missing_first_seen_at`` / ``malformed_first_seen_at`` / ``naive_first_seen_at``
+      —— PIT availability 不可证明（**不**回退 published_at / created_at / now）；
+    * ``bad_as_of`` —— 历史读的 as_of 不是 ``YYYY-MM-DD``；
+    * ``bad_record_kinds`` / ``bad_limit`` —— 读取参数非法；
+    * ``ledger_unavailable`` —— durable ledger 不存在（**不**创建、**不**抓取）；
+    * ``empty_fact_field`` —— 身份 / 指纹 / 标题 / 来源 / 事件类型 / grade 为空；
+    * ``alien_code`` / ``field_not_a_finite_number`` / ``non_finite_significance``
+      —— 字段形状与 record kind 不符；
+    * ``malformed_themes`` / ``malformed_affected_industries`` —— major event 的
+      normalized 列不是合法 JSON；
+    * ``ledger_status_mismatch`` / ``traceability_status_mismatch`` —— 发布的核验结论
+      与 durable 列不自洽。
+    """
+
+    def __init__(self, reason: str, detail: str = "") -> None:
+        self.reason = str(reason)
+        text = self.reason if not detail else "%s: %s" % (self.reason, detail)
+        super().__init__(text)
+
+
+def news_owner_status_mapping_problems(mapping: Mapping, writer_statuses: Any) -> list[str]:
+    """显式映射与 writer 闭集的**双向**一致性检查（纯函数）。
+
+    单独抽成纯函数，是为了让"缺一个合法状态"与"多一个已不存在的状态"两个方向都能被
+    **直接测到**，而不是只能靠改 owner 源码来验 —— 与
+    ``ai_research_portfolio_adapter._portfolio_outcome_mapping_problems`` 同一手法。
+
+    任何一处漂移都意味着"某个 ledger 状态的含义"已经不再由人工决定，而是由映射表的
+    默认分支决定。
+    """
+    problems: list[str] = []
+    missing = sorted(set(writer_statuses) - set(mapping))
+    if missing:
+        problems.append(
+            f"writer 写得出但没有登记 owner 核验结论的 ledger 状态：{missing}"
+            "（owner 不得替自己猜一个新状态的含义）"
+        )
+    unknown = sorted(set(mapping) - set(writer_statuses))
+    if unknown:
+        problems.append(
+            f"映射里有 writer 已不再产生的 ledger 状态：{unknown}"
+            "（说明这张表与审计过的 writer 闭集漂移了）"
+        )
+    return problems
+
+
+def _major_event_owner_status(ledger_status: str) -> str:
+    """``market_major_events.verification_status`` → news owner 核验闭集。
+
+    **fail closed 是这里的关键性质。** 映射表必须与审计过的 writer 闭集精确相等：
+
+    * writer 新增一个状态 → 表里查不到 → 抛 ``unknown_verification_status``；
+    * 表里出现 writer 已不产生的状态 → 同样抛（说明这张表已经漂移）。
+
+    刻意**不**缓存：漂移必须在**下一次调用**就 fail closed，而不是等进程重启。
+    这也直接落实了两条禁止事项：``single_source_linked`` 不得映射成 verified；
+    未知状态不得默认成 unverified。
+    """
+    problems = news_owner_status_mapping_problems(
+        _NEWS_MAJOR_LEDGER_STATUS_TO_OWNER, NEWS_MAJOR_EVENT_WRITER_STATUSES,
+    )
+    if problems:
+        raise NewsFactContractError(
+            "unknown_verification_status",
+            "ledger 状态词表与显式映射漂移：" + "; ".join(problems),
+        )
+    mapped = _NEWS_MAJOR_LEDGER_STATUS_TO_OWNER.get(str(ledger_status))
+    if mapped is None:
+        raise NewsFactContractError(
+            "unknown_verification_status",
+            f"{ledger_status!r} 不在审计过的 writer 闭集 "
+            f"{NEWS_MAJOR_EVENT_WRITER_STATUSES} 里",
+        )
+    return mapped
+
+
+def _traceable(source_url: Any, article_id: Any) -> bool:
+    """这一行能不能被追溯回它声称的来源（有链接或有文章 id）。"""
+    return bool(str(source_url or "").strip() or str(article_id or "").strip())
+
+
+def _news_event_owner_status(source_url: Any, article_id: Any) -> str:
+    """``news_events`` 行的 owner 核验结论 —— 由 durable 列确定性派生。
+
+    ``news_events`` **没有**核验列，因此本 owner 只发布它能从 durable 列证明的结论：
+    这一行能不能被追溯到它声称的那条来源。刻意**不**读 ``evidence_grade`` —— grade 是
+    可追溯性分级，把它当核验就是把"抓取方式"冒充"事实核验"。
+    """
+    if _traceable(source_url, article_id):
+        return NEWS_OWNER_SINGLE_SOURCE
+    return NEWS_OWNER_SOURCE_UNUSABLE
+
+
+def _parse_owner_instant(value: Any, *, what: str) -> dt.datetime:
+    """解析一个 owner 记录的 instant；**必须**带可证明的时区。
+
+    缺失 / 无法解析 / naive 一律 fail closed。这里**没有**任何 fallback：
+    不回退 ``published_at``、不回退 ``created_at``、不回退 ``now()`` —— PIT 不可证明的
+    事实不得进入研究链路。
+    """
+    raw = str(value or "").strip()
+    if not raw:
+        raise NewsFactContractError("missing_first_seen_at", f"{what} is empty")
+    try:
+        parsed = dt.datetime.fromisoformat(raw)
+    except ValueError as exc:
+        raise NewsFactContractError(
+            "malformed_first_seen_at", f"{what}={raw!r}",
+        ) from exc
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise NewsFactContractError(
+            "naive_first_seen_at",
+            f"{what}={raw!r} 没有可证明的时区语义 —— 不得假设本机时区",
+        )
+    return parsed
+
+
+def _as_of_boundary(as_of: Any) -> dt.datetime:
+    """``'YYYY-MM-DD'`` → 该日历日在 owner 时区的**日末**边界。
+
+    与既有的 :func:`code_overlay` 约定一致（``asof + "T23:59:59+08:00"``）：``as_of``
+    是一个**日历日**，因此"当日系统已知"= ``first_seen_at <= 当日 23:59:59``。
+
+    刻意**只**接受 ``YYYY-MM-DD``：一个带时刻的 as_of 会让人以为边界是那个时刻，而
+    research contract 的 ``as_of`` 本身就是业务日（``YYYY-MM-DD``）。
+    """
+    text = str(as_of or "").strip()
+    try:
+        day = dt.date.fromisoformat(text)
+    except ValueError as exc:
+        raise NewsFactContractError(
+            "bad_as_of", f"{as_of!r} 不是 YYYY-MM-DD",
+        ) from exc
+    if day.isoformat() != text:
+        raise NewsFactContractError("bad_as_of", f"{as_of!r} 不是规范日期")
+    return dt.datetime.combine(day, dt.time(23, 59, 59), tzinfo=TZ)
+
+
+def _validated_record_kinds(record_kinds: Any) -> tuple[str, ...]:
+    """校验 record kind 选择器：非空子集，并按 owner 的固定顺序返回。"""
+    try:
+        requested = set(record_kinds)
+    except TypeError as exc:
+        raise NewsFactContractError("bad_record_kinds", repr(record_kinds)) from exc
+    if not requested:
+        raise NewsFactContractError("bad_record_kinds", "至少需要一个 record kind")
+    unknown = sorted(requested - set(NEWS_RECORD_KINDS))
+    if unknown:
+        raise NewsFactContractError("bad_record_kinds", f"未知 record kind：{unknown}")
+    return tuple(kind for kind in NEWS_RECORD_KINDS if kind in requested)
+
+
+def _validated_limit(limit: Any) -> int:
+    if isinstance(limit, bool) or not isinstance(limit, int) or limit <= 0:
+        raise NewsFactContractError("bad_limit", repr(limit))
+    return int(limit)
+
+
+def _text_or_none(value: Any) -> str | None:
+    """列值 → 非空文本或 ``None``；刻意**不**把空白列升级成占位符。"""
+    text = str(value if value is not None else "").strip()
+    return text or None
+
+
+def _loads_list(value: Any, *, what: str) -> list:
+    """严格解析一个 normalized JSON 列（``themes`` / ``affected_industries``）。
+
+    不清空、不吞异常：owner 自己用 ``_json()`` 写这两列，畸形值意味着 ledger 已被
+    非 owner 写入 —— 那必须 fail closed，而不是当成空列表静默降级。
+    """
+    try:
+        parsed = json.loads(value) if value else []
+    except (TypeError, ValueError) as exc:
+        raise NewsFactContractError(
+            what, repr(value)[:120],
+        ) from exc
+    if not isinstance(parsed, list):
+        raise NewsFactContractError(what, f"expected a JSON list, got {type(parsed).__name__}")
+    return parsed
+
+
+def _theme_pairs(value: Any) -> tuple[tuple[str, str], ...]:
+    """``themes`` JSON → 不可变 ``((id, label), ...)``，**保留 ledger 里的顺序**。
+
+    不做排序、不做去重：durable 列是 authority，本层只把它变成不可变形状，好让
+    fingerprint 与比较不依赖可变对象。
+    """
+    pairs: list[tuple[str, str]] = []
+    for item in _loads_list(value, what="malformed_themes"):
+        if isinstance(item, Mapping):
+            pairs.append((str(item.get("id") or ""), str(item.get("label") or "")))
+        else:
+            pairs.append((str(item), ""))
+    return tuple(pairs)
+
+
+def _industry_tuple(value: Any) -> tuple[str, ...]:
+    return tuple(str(item) for item in _loads_list(value, what="malformed_affected_industries"))
+
+
+@dataclass(frozen=True, slots=True, init=False)
+class NewsFactProjection:
+    """news owner 对**一条 durable 事件事实**的正式投影。
+
+    research 层引用一条 news 事实时读到的就是它：fact contract 版本、record kind、
+    owner 自己的身份（``event_key``）、PIT 可用日、来源身份、以及 owner 自己的核验结论。
+
+    它**不**包含 research 语义，**不**携带 ``evidence_grade`` 之外的任何"可信度"表面，
+    也**不**包含 source reputation / candidate-link confidence —— 那两个问题不属于
+    "这条事件是否被核验"。
+
+    **没有公开 raw 构造器。** ``NewsFactProjection(...)`` 一律抛 ``TypeError``；唯一签发
+    路径是 :func:`news_fact_projections`（它再走私有
+    :func:`_issue_news_fact_projection`）。否则任何调用方都能自述
+    ``identity`` / ``first_seen_at`` / ``owner_verification_status`` 然后声称"这是一条
+    news owner 事实" —— "owner 派生身份"就只是一句声明。
+
+    四条结构性规则（构造期强制，因此无法表达自相矛盾的投影）：
+
+    * ``first_seen_at`` 必须可解析且带时区；``availability_day`` 由它派生，**不**单独传入；
+    * ``availability_day`` 与 ``first_seen_at`` 是**两个**字段：前者是业务日，后者是
+      exact timestamp，二者不得互换；
+    * ``record_kind`` 决定哪些字段适用 —— 不适用的一律是 ``None`` / 空元组，
+      **不补假值**；
+    * 发布的核验结论必须与 durable 列自洽：major event 必须等于 ledger 状态词的映射，
+      news event 必须等于可追溯性判定。
+    """
+
+    version: str
+    record_kind: str
+    identity: str
+    canonical_hash: str
+    code: str | None
+    title: str
+    source_name: str
+    source_type: str
+    source_url: str | None
+    article_id: str | None
+    published_at: str | None
+    first_seen_at: str
+    availability_day: str
+    event_type: str
+    evidence_grade: str
+    owner_verification_status: str
+    ledger_verification_status: str | None
+    significance_score: float | None
+    themes: tuple[tuple[str, str], ...]
+    affected_industries: tuple[str, ...]
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        raise TypeError(
+            "NewsFactProjection has no public constructor: 调用方不能自述一条 news 事实的"
+            "身份 / PIT / 核验结论。请使用 "
+            "news_learning.news_fact_projections(conn, as_of=...) —— 全部字段由 news owner "
+            "从它自己的 durable ledger 行派生"
+        )
+
+    def __post_init__(self) -> None:
+        if self.version != NEWS_FACT_CONTRACT_VERSION:
+            raise NewsFactContractError(
+                "version_mismatch", f"{self.version!r} != {NEWS_FACT_CONTRACT_VERSION!r}",
+            )
+        if self.record_kind not in NEWS_RECORD_KINDS:
+            raise NewsFactContractError("unknown_record_kind", repr(self.record_kind))
+        for name in ("identity", "canonical_hash", "title", "source_name",
+                     "source_type", "event_type", "evidence_grade"):
+            value = str(getattr(self, name) or "").strip()
+            if not value:
+                raise NewsFactContractError("empty_fact_field", f"{name} 为空")
+            object.__setattr__(self, name, value)
+        if self.owner_verification_status not in NEWS_OWNER_VERIFICATION_STATUSES:
+            raise NewsFactContractError(
+                "unknown_owner_status", repr(self.owner_verification_status),
+            )
+        object.__setattr__(self, "source_url", _text_or_none(self.source_url))
+        object.__setattr__(self, "article_id", _text_or_none(self.article_id))
+        object.__setattr__(self, "published_at", _text_or_none(self.published_at))
+
+        # PIT：availability 只由 first_seen_at 派生。published_at 在这里只被当作描述性
+        # 文本保存，**从不**参与边界计算。
+        instant = _parse_owner_instant(self.first_seen_at, what="first_seen_at")
+        object.__setattr__(self, "availability_day", instant.date().isoformat())
+
+        if self.record_kind == NEWS_RECORD_KIND_EVENT:
+            if self.significance_score is not None:
+                raise NewsFactContractError(
+                    "field_not_a_finite_number",
+                    "news_event 没有 significance_score —— 不补假值",
+                )
+            if self.themes or self.affected_industries:
+                raise NewsFactContractError(
+                    "malformed_themes", "news_event 没有 themes / affected_industries",
+                )
+            if self.ledger_verification_status is not None:
+                raise NewsFactContractError(
+                    "ledger_status_mismatch",
+                    "news_events 没有 verification_status 列 —— 不得伪造一个",
+                )
+            code = str(self.code or "").strip()
+            if len(code) != 6 or not code.isdigit():
+                raise NewsFactContractError("alien_code", repr(self.code))
+            object.__setattr__(self, "code", code)
+        else:
+            if self.code is not None:
+                raise NewsFactContractError(
+                    "alien_code", "market_major_event 是市场级的，没有 code —— 不补假值",
+                )
+            score = self.significance_score
+            if isinstance(score, bool) or not isinstance(score, (int, float)):
+                raise NewsFactContractError(
+                    "field_not_a_finite_number", repr(score),
+                )
+            number = float(score)
+            if not math.isfinite(number):
+                raise NewsFactContractError("non_finite_significance", repr(score))
+            object.__setattr__(self, "significance_score", number)
+            # 未知的 ledger 状态词在这里**没有**第二个检查点：闭集合法性只有
+            # :func:`_major_event_owner_status` 一处判定（它自己就会抛
+            # ``unknown_verification_status``）。刻意不重复一遍 —— 两处等价的 fail-closed
+            # 会互相掩盖，使"某个状态被静默默认"这类退化逃过一次单点变异。
+            status = str(self.ledger_verification_status or "")
+            object.__setattr__(self, "ledger_verification_status", status)
+            expected = _major_event_owner_status(status)
+            if self.owner_verification_status != expected:
+                raise NewsFactContractError(
+                    "ledger_status_mismatch",
+                    f"ledger 状态 {status!r} 只能对应 {expected!r}，"
+                    f"但投影发布的是 {self.owner_verification_status!r}",
+                )
+        if self.record_kind == NEWS_RECORD_KIND_EVENT:
+            expected = _news_event_owner_status(self.source_url, self.article_id)
+            if self.owner_verification_status != expected:
+                raise NewsFactContractError(
+                    "traceability_status_mismatch",
+                    f"可追溯性只能对应 {expected!r}，"
+                    f"但投影发布的是 {self.owner_verification_status!r}",
+                )
+        object.__setattr__(self, "themes", tuple(self.themes))
+        object.__setattr__(self, "affected_industries", tuple(self.affected_industries))
+
+    @property
+    def is_owner_verified(self) -> bool:
+        """owner 是否判定这条事实**通过**了核验。
+
+        今天是**恒 False**：本 owner 没有 verified 状态（见本节开头）。保留这个只读属性
+        是为了让"news 事实从不自称已核验"成为可断言的形状，而不是靠调用方记得。
+        """
+        return False
+
+    def as_dict(self) -> Mapping:
+        """本投影的 canonical 形状（fingerprint / 审计共用）。"""
+        return {
+            "version": self.version,
+            "record_kind": self.record_kind,
+            "identity": self.identity,
+            "canonical_hash": self.canonical_hash,
+            "code": self.code,
+            "title": self.title,
+            "source_name": self.source_name,
+            "source_type": self.source_type,
+            "source_url": self.source_url,
+            "article_id": self.article_id,
+            "published_at": self.published_at,
+            "first_seen_at": self.first_seen_at,
+            "availability_day": self.availability_day,
+            "event_type": self.event_type,
+            "evidence_grade": self.evidence_grade,
+            "owner_verification_status": self.owner_verification_status,
+            "ledger_verification_status": self.ledger_verification_status,
+            "significance_score": self.significance_score,
+            "themes": [list(item) for item in self.themes],
+            "affected_industries": list(self.affected_industries),
+        }
+
+
+def _issue_news_fact_projection(**fields: Any) -> NewsFactProjection:
+    """签发一条 owner fact 投影。只有本模块的 :func:`_news_fact_row` 调用它。
+
+    绕过恒抛错的 ``__init__`` 并在设置完全部字段后跑 ``__post_init__``，使校验逻辑仍然
+    只有一份、且紧挨字段定义（与 ``paper_portfolio_read_model._issue_portfolio_fact_projection``
+    及 ``ai_research_contract._issue_evidence_ref`` 同一手法）。
+    """
+    projection = object.__new__(NewsFactProjection)
+    for name, value in fields.items():
+        object.__setattr__(projection, name, value)
+    projection.__post_init__()
+    return projection
+
+
+#: 显式列清单 —— 刻意列出而不是 ``SELECT *``：``raw_payload`` **不得**成为 authority，
+#: 因此它根本不出现在读路径里。
+#:
+#: ``created_at`` 被列出，但它**不是**事实成分、也不进入投影：列出它只为让"created_at
+#: 永远不能成为 availability authority"这条不变量**可被 mutation 证明** —— 一条关于某列的
+#: 禁令只有在那一列可见的地方才可证伪，否则"created_at fallback"这种写法在源码里根本
+#: 无法表达（于是它测出来的只会是一次接线错误，是假杀而不是证据）。
+_NEWS_FACT_EVENT_COLUMNS = (
+    "event_key,canonical_hash,article_id,code,title,source_name,source_type,source_url,"
+    "evidence_grade,published_at,first_seen_at,event_type,created_at"
+)
+_NEWS_FACT_MAJOR_COLUMNS = (
+    "event_key,canonical_hash,article_id,title,summary,source_name,source_type,source_url,"
+    "evidence_grade,published_at,first_seen_at,event_type,significance_score,themes,"
+    "affected_industries,verification_status,created_at"
+)
+
+_NEWS_FACT_READ_SQL = {
+    NEWS_RECORD_KIND_EVENT: f"SELECT {_NEWS_FACT_EVENT_COLUMNS} FROM news_events",
+    NEWS_RECORD_KIND_MAJOR_EVENT: (
+        f"SELECT {_NEWS_FACT_MAJOR_COLUMNS} FROM market_major_events"
+    ),
+}
+
+
+def _news_fact_row(kind: str, row: Any) -> NewsFactProjection:
+    """一条 durable 行 → 一条 typed 投影。字段全部来自 normalized 列。"""
+    if kind == NEWS_RECORD_KIND_EVENT:
+        return _issue_news_fact_projection(
+            version=NEWS_FACT_CONTRACT_VERSION,
+            record_kind=kind,
+            identity=row["event_key"],
+            canonical_hash=row["canonical_hash"],
+            code=row["code"],
+            title=row["title"],
+            source_name=row["source_name"],
+            source_type=row["source_type"],
+            source_url=row["source_url"],
+            article_id=row["article_id"],
+            published_at=row["published_at"],
+            first_seen_at=row["first_seen_at"],
+            availability_day="",
+            event_type=row["event_type"],
+            evidence_grade=row["evidence_grade"],
+            owner_verification_status=_news_event_owner_status(
+                row["source_url"], row["article_id"],
+            ),
+            ledger_verification_status=None,
+            significance_score=None,
+            themes=(),
+            affected_industries=(),
+        )
+    return _issue_news_fact_projection(
+        version=NEWS_FACT_CONTRACT_VERSION,
+        record_kind=kind,
+        identity=row["event_key"],
+        canonical_hash=row["canonical_hash"],
+        code=None,
+        title=row["title"],
+        source_name=row["source_name"],
+        source_type=row["source_type"],
+        source_url=row["source_url"],
+        article_id=row["article_id"],
+        published_at=row["published_at"],
+        first_seen_at=row["first_seen_at"],
+        availability_day="",
+        event_type=row["event_type"],
+        evidence_grade=row["evidence_grade"],
+        owner_verification_status=_major_event_owner_status(row["verification_status"]),
+        ledger_verification_status=row["verification_status"],
+        significance_score=row["significance_score"],
+        themes=_theme_pairs(row["themes"]),
+        affected_industries=_industry_tuple(row["affected_industries"]),
+    )
+
+
+def news_fact_projections(
+    conn, *, as_of: Any, record_kinds: Any = NEWS_RECORD_KINDS, limit: Any = NEWS_FACT_READ_LIMIT,
+) -> tuple[NewsFactProjection, ...]:
+    """news owner 的**唯一** public typed 历史读入口（R27-B2C-5）。
+
+    ``as_of`` 是**必填的关键字参数**，而且刻意**没有默认值**：一个能同时表示"当前"与
+    "历史某日"的双义接口后面很难审。本函数只回答"到 ``as_of`` 这个日历日为止，系统
+    **当时**已经观测到哪些事件"：
+
+    ```text
+    保留条件：  first_seen_at <= as_of 当日 23:59:59（owner 时区）
+    排除条件：  first_seen_at >  as_of        ⇒ 那时系统还不知道它
+    ```
+
+    **``published_at`` 不参与边界计算。** 一条 ``published_at=9/20`` 但
+    ``first_seen_at=9/21`` 的事件，在 ``as_of=9/20`` 必须不可见 —— 否则就是把 9/21 才
+    摄取到的数据倒填进历史。
+
+    **不联网、不写库。** 本函数只发 SELECT，而且刻意**不**调用 :func:`ensure_schema`
+    （那会写 DDL）：ledger 不存在时 fail closed 成 ``ledger_unavailable``，**不**创建表、
+    **不**回退去抓 live news、**不**做 backfill。历史缺数据就是"当时没有证据"，
+    不是"现在补一条再假装当时知道"。
+
+    刻意**没有** ``latest`` / ``recent`` / ``today`` / ``now`` 这类隐式回退入口。
+    需要当前视图请读 :func:`overview`（它是展示层，不是 evidence）。
+
+    边界比较在 Python 侧逐行完成，而不是把 ISO 文本交给 SQL 的字典序：owner 不能假设
+    每一行的 offset 都和 owner 一样，那等于把 PIT 交给一个没被证明的假设。畸形 / naive
+    的 ``first_seen_at`` 使整次读取 fail closed —— 因为"跳过这一行"就是静默降级。
+    """
+    kinds = _validated_record_kinds(record_kinds)
+    boundary = _as_of_boundary(as_of)
+    bound = _validated_limit(limit)
+
+    rows: list[tuple[str, Any]] = []
+    for kind in kinds:
+        try:
+            rows.extend((kind, row) for row in conn.execute(_NEWS_FACT_READ_SQL[kind]))
+        except sqlite3.OperationalError as exc:
+            raise NewsFactContractError(
+                "ledger_unavailable",
+                f"{kind} 的 durable ledger 不可读：{exc}",
+            ) from exc
+
+    available: list[tuple[dt.datetime, str, NewsFactProjection]] = []
+    for kind, row in rows:
+        instant = _parse_owner_instant(row["first_seen_at"], what="first_seen_at")
+        if instant > boundary:
+            continue
+        projection = _news_fact_row(kind, row)
+        available.append((instant, kind, projection))
+    # 固定顺序：先按 owner 记录的时刻，再按 record kind，最后按 owner identity。
+    available.sort(key=lambda item: (item[0], item[1], item[2].identity))
+    return tuple(item[2] for item in available[:bound])
