@@ -2101,6 +2101,41 @@ B2C-4C  migrate pnl_attribution runtime to canonical typed research
 
 这是实现顺序调整，**不是** roadmap 缩减。
 
+#### B2C-4C 之后的硬不变量（pnl_attribution 是跨 owner 组合）
+
+```text
+execution owner / portfolio-accounting owner / R24 market owner
+        各自仍是事实 owner，各自保留 identity
+                ↓
+        research composition（不是第四个 owner）
+                ↓
+        InformationEvent（一条事件引多个 owner ref）
+                ↓
+        pnl_attribution prompt projection（展示层，非 authority）
+```
+
+- `pnl_attribution` 是**跨 owner research 组合**，不签发新的 `ResearchEvidenceRef`；
+  组合结论不是新的底层 owner fact。
+- research 层**不能**把一个裸 valuation mapping 升级成"已验证的市场证据"：valuation 只能由
+  组合层自己从 `MarketDataReading.snapshot.rows` 构造，组合入口不接受调用方的
+  `Mapping` / current quote / latest 兜底。
+- `portfolio_for_context(...).nav_status == verified` **不是**市场核验（它只说明"账本可重建 +
+  拿到了完整 numeric valuations"）。跨 owner 派生事实的可信度必须同时满足它声明需要的
+  **所有** owner legs，且市场侧的 `verification` / `verification_method` 必须一起发布。
+  `verification == "verified"` 也不等于多源：需要双源保证的判据只能问
+  `market_data_contract.is_cross_source_verified`。
+- `paper_nav` 与 `paper_positions` **不是** canonical research authority：`paper_nav` 是 legacy
+  表（它自己的 `quote_status` 尤其不得进入 market 的 owner 核验），`paper_positions` 只是
+  兼容展示投影。
+- PIT context 是**显式**的：归因业务日、`(account_id, cycle_id)`、市场观测时刻都必须由编排
+  边界声明；collector 不得用 `max(paper_nav.nav_date)` / `today()` / 墙钟 / current cycle /
+  current active account 推断任何一项。缺 context 即 fail closed。
+- typed 迁移之后**没有** legacy fallback：typed 路径抛错不得回落 SQL。
+  `load_execution_evidence` → `fact_projection` → adapter 是唯一执行事实入口。
+- owner 证明不了的事实**永远**保持 unknown / unavailable（带 reason）：不补零、不回落成本价
+  或当前报价，也不从 schema 里悄悄删掉字段位置。
+
+
 #### 本段只做一件事：让投影足以承载 attribution 需要的成交事实
 
 B2C-1 的 `ExecutionFactProjection` 只有 identity / lifecycle / verdict / PIT / verification，

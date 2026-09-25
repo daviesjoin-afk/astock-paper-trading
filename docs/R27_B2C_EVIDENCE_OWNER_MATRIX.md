@@ -156,7 +156,7 @@ B2C-2  research 契约学会消费 owner-native verification（**已完成**）
 B2C-3  execution → ResearchEvidenceRef adapter（**已完成**，见下文 "B2C-3 进展"）
 B2C-4A execution attribution fact completeness（**已完成**，见下文 "B2C-4A 进展"）
 B2C-4B portfolio/accounting owner facts（**已完成**，见下文 "B2C-4B 进展"）
-B2C-4C 迁移 pnl_attribution runtime（**未开始**）
+B2C-4C 迁移 pnl_attribution runtime（**已完成** —— 见下文 "B2C-4C 进展"；历史行情一条 OPEN PREREQUISITE）
 ```
 
 以及一条 B2C-1 明确记录、**没有**被掩盖的缺口：被拒 / 被撤的委托今天在
@@ -197,7 +197,7 @@ B2C-2 之后  OwnerVerification（outcome / status / attributes）
 B2C-3  execution → ResearchEvidenceRef adapter（**已完成**）
 B2C-4A execution attribution fact completeness（**已完成**）
 B2C-4B portfolio/accounting owner facts（**已完成**）
-B2C-4C 迁移 pnl_attribution runtime（**未开始**）
+B2C-4C 迁移 pnl_attribution runtime（**已完成** —— 见下文 "B2C-4C 进展"；历史行情一条 OPEN PREREQUISITE）
 B2C-5  news owner readiness
 B2C-6  adaptive / experiment owner readiness
 B2C-7  runtime / incident owner readiness
@@ -366,7 +366,7 @@ provenance 伪造。反过来，"为了现在就迁移而删掉这些能力"是*
 ```text
 B2C-4A  execution attribution fact completeness      **COMPLETE**
 B2C-4B  portfolio/accounting owner facts             **COMPLETE**
-B2C-4C  pnl_attribution runtime migration            **NOT STARTED**
+B2C-4C  pnl_attribution runtime migration            **COMPLETE**（历史行情一条 OPEN PREREQUISITE）
 ```
 
 这是**实现顺序调整，不是 roadmap 缩减**。
@@ -537,7 +537,7 @@ market valuation authority        （市值 / 未实现盈亏 / NAV 的估值腿
 ```text
 B2C-4A  execution attribution fact completeness       COMPLETE
 B2C-4B  portfolio/accounting owner facts              COMPLETE   ← 本节
-B2C-4C  pnl_attribution runtime migration             NOT STARTED
+B2C-4C  pnl_attribution runtime migration             COMPLETE（历史行情一条 OPEN PREREQUISITE）
 ```
 
 本段是**能力 + 契约 + 回归**，不是 runtime 迁移：`deepseek_research._pnl_evidence()` 与
@@ -1025,7 +1025,7 @@ paper_nav writer changed:                           NO
 paper_positions writer changed:                     NO
 DB migration / API change / frontend change:        0
 Runtime migrations:                                 0
-Production adapter callers:                         0（迁移是 B2C-4C）
+Production adapter callers:                         ≥1（R27-B2C-4C 已接线，见 "B2C-4C 进展"）
 Modules needed to understand portfolio → evidence:  3
                                                         paper_portfolio_read_model
                                                         ai_research_portfolio_adapter
@@ -1050,3 +1050,72 @@ physical database origin / trusted database provenance:  OPEN / REQUIRED
 **Roadmap capability removed = 0；Roadmap invariant weakened = 0。** 本轮没有把
 `NAV = portfolio-only authority` 写进任何地方，也没有删掉 `pnl_attribution` 仍需要的
 NAV / daily PnL / daily return 能力 —— 它们只是被正确地留在跨 owner 组合那一步（B2C-4C）。
+
+### B2C-4C 进展（pnl_attribution 的 runtime 已迁到 canonical typed 事实）
+
+`deepseek_research._pnl_evidence()` 原来同时是 DB reader、事实 owner、PIT 推断、
+跨 owner 组合与 research 投影。四条 legacy SQL（`paper_accounts` / `paper_nav` /
+`paper_orders` / `paper_positions`）**已全部删除**，现在这条路径只消费 owner typed 事实：
+
+```text
+execution owner      execution_evidence.load_execution_evidence
+                     → execution_verification.fact_projection
+                     → ai_research_execution_adapter.evidence_ref_from_execution_projection
+portfolio owner      paper_portfolio_read_model.accounting_fact_projections
+                     → ai_research_portfolio_adapter.evidence_ref_from_portfolio_projection
+R24 market owner     market_data_service.read_snapshot(ATTRIBUTION_POLICY, now=…, asof_day=…)
+                     → ai_research_contract.evidence_ref_from_market_reading
+                     ↓
+             ARC.InformationEvent（每一条都携带 evidence_ref）
+                     ↓
+             pnl_attribution compatibility projection（展示层，非 authority）
+```
+
+**固定矩阵（谁拥有什么）**：
+
+| 事实 | owner | typed 来源 |
+|---|---|---|
+| code / action / requested_qty / filled_qty / fill_price / fees | execution | `ExecutionFactProjection`（`EvidenceField` 三态） |
+| account_id / cycle_id / business_day / observed_at | execution | 同上（owner 记录的订单行派生，缺失即 `unknown`） |
+| cash / realized_pnl / position_cost_summary | portfolio/accounting | `PortfolioFactProjection`（cycle + account + asof 定界） |
+| valuation observation / market verification | R24 market | `MarketDataReading`（`verification` + `verification_method` 一起发布） |
+| latest NAV（= 组合账本 + R24 估值） | **组合** | `portfolio_for_context(..., valuations=…)`，valuations 只能由组合层内部从 reading rows 构造 |
+| prior NAV / daily PnL / daily return | **组合** | 需要前一业务日 + 前一组合状态 + 前一 R24 reading —— 见下 |
+| 填充与去重/冲突判定 | research composition | `InformationEvent` + `EvidenceConflict`（不是新的 owner） |
+
+**PIT context 是显式的**：`deepseek_research.AttributionRequest(asof_day, market_now,
+targets)` 三个字段都没有默认值 —— 业务日、`(account_id, cycle_id)` 与市场观测时刻全部由
+编排边界（`adaptive_engine`）声明，collector 不再用 `max(paper_nav.nav_date)` / `today()` /
+current cycle / current active account 推断任何一项；缺 context 即 fail closed（记
+`_collection_error`），不发布"看起来正常"的归因。
+
+**OPEN PREREQUISITE（不是 REMOVED）**：
+
+```text
+OPEN PREREQUISITE: historical market owner evidence required for prior-day valuation
+```
+
+R24 今天只有**当前** full-market snapshot（`read_snapshot` 支持 `asof_day` fail-closed 检查，
+但这不等于拥有任意历史日 archive）。因此 `prior_nav` / `daily_pnl` / `daily_return` 在拿不到
+可证明的前一业务日 R24 valuation 时如实报 `unavailable` +
+`historical_market_evidence_unavailable`，**字段位置保留**：不删 schema、不回落
+`paper_nav LIMIT 2`、不拿 D 日行情回填 D-1。这条能力由后续 PIT/market archive 阶段关闭，
+本轮不顺手实现历史行情系统。
+
+**本轮的 shape 变化（显式记录，不静默）**：
+
+```text
+accounts[].name / status / version     →  已移除（它们是 current metadata，没有
+                                          cycle + asof 历史契约，不得进入 canonical
+                                          historical evidence；旧 shape 依赖见 compatibility
+                                          projection 的 presentation_authority / is_authoritative）
+accounts[].nav_observations            →  已移除（legacy 的 paper_nav 行数不是事实）
+asof                                   →  改由显式 context 提供（原来是 max(nav_date)）
+filled_trades[].amount                 →  仅当 filled_qty 与 fill_price 都 owner-known 时派生，
+                                          并标 amount_basis=derived_filled_qty_times_fill_price
+fees / realized_pnl                    →  unknown 时不再补零，而是 None + availability 原因码
+```
+
+**Legacy surface removed = YES**（pnl 路径的 direct-SQL authority）；**Roadmap capability
+removed = 0**；**Original invariant weakened = NO**。
+
