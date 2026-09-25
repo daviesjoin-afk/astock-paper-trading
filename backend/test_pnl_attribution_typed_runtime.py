@@ -23,6 +23,7 @@
                     payload 不得覆盖）
     PNL-26 ~ 30     架构边界（生产调用点、无 legacy SQL fallback、展示元数据不是证据）
     PNL-31          历史行情缺口 fail closed
+    PNL-32          stale-but-available 行情切片必须发布新鲜度（不得只看 availability）
 
 全部离线：临时 SQLite 账本 + owner 自己的 public read + 被 patch 的 R24 缓存事实。
 不连真实库、不联网、不读墙钟（业务日固定为 ``DAY`` / ``NEXT``）。
@@ -199,6 +200,31 @@ def _source_strings(func) -> tuple:
         node.value for node in ast.walk(ast.Module(body=body, type_ignores=[]))
         if isinstance(node, ast.Constant) and isinstance(node.value, str)
     )
+
+
+def _numeric_leaves(value) -> list:
+    """结构里所有数值叶子。
+
+    "某个价格没有被搬进来"这类断言必须看**解析后的数值叶子**，而不是序列化后的子串：
+    子串匹配会被无关数值碰撞（``"2199.0"`` 就含 ``"99.0"``），把 fixture 的正常调整
+    变成假红，且失败时无法区分"真的泄漏"与"碰巧撞上"。
+    """
+    if isinstance(value, bool) or value is None or isinstance(value, str):
+        return []
+    if isinstance(value, (int, float)):
+        return [value]
+    if isinstance(value, dict):
+        out = []
+        for key, item in value.items():
+            out.extend(_numeric_leaves(key))
+            out.extend(_numeric_leaves(item))
+        return out
+    if isinstance(value, (list, tuple, set)):
+        out = []
+        for item in value:
+            out.extend(_numeric_leaves(item))
+        return out
+    return []
 
 
 def _pnl_source() -> str:
@@ -563,7 +589,10 @@ class PnlAttributionTypedRuntimeTests(unittest.TestCase):
 
         body = _pnl_source()
         self.assertNotIn("paper_nav", body)
-        self.assertNotIn("max(", body)
+        # 只禁掉"用 max(...) 从 paper_nav 推 asof"这一种用法。禁掉整条 ``max(`` 记号会
+        # 把任何无关的合法用法（例如 ``max(1, int(limit))``）也判红，只增加易碎性、
+        # 不增加判别力 —— 同一不变量已由标识符视图与行为断言覆盖。
+        self.assertNotIn("max(paper_nav", body)
         self.assertNotIn("paper_nav", _pnl_identifiers())
         # 非空性：剥 docstring / 抹字符串是有效的 —— 原文（含错误文案）确实提到
         # paper_nav，剥掉后没有；而标识符集合会看见真正的引用（见 PNL-12 的对照）。
@@ -1073,7 +1102,10 @@ class PnlAttributionTypedRuntimeTests(unittest.TestCase):
         self.assertIsNone(nav["nav"])
         self.assertIsNone(nav["market_value"])
         self.assertIsNone(nav["market_evidence_ref"])
-        self.assertNotIn("99.0", json.dumps(result, default=str))
+        self.assertNotIn(99.0, _numeric_leaves(result),
+                         "as-of mismatch 的报价不得出现在归因结构里")
+        # 非空性：同一套扫描真的看得见一个存在的数值叶子。
+        self.assertIn(99.0, _numeric_leaves({"price": 99.0}))
 
         control = self._compose()
         self.assertEqual(MDC.AVAILABILITY_AVAILABLE, control["market"]["availability"])
@@ -1231,7 +1263,8 @@ class PnlAttributionTypedRuntimeTests(unittest.TestCase):
         self.assertIsNone(self._account_row(result)["latest_nav"]["market_evidence_ref"])
         self.assertEqual(MDC.AVAILABILITY_UNAVAILABLE, result["market"]["availability"])
         serialized = json.dumps(result, ensure_ascii=False, default=str)
-        self.assertNotIn("99.0", serialized)
+        self.assertNotIn(99.0, _numeric_leaves(result),
+                         "未来读数不得出现在更早归因的结构里")
         self.assertNotIn(NEXT.isoformat(), serialized)
 
         control = self._compose()
@@ -1244,42 +1277,6 @@ class PnlAttributionTypedRuntimeTests(unittest.TestCase):
         )
 
     # ------------- PNL-24 ~ 25：canonical InformationEvent -------------
-
-    def test_PNL_32_stale_market_slice_publishes_freshness(self):
-        """PNL-32：stale-but-available 的行情切片必须把新鲜度一起发布。
-
-        R24 对 ``observed <= requested`` 的读数是 **stale-but-available**，不是
-        unavailable。所以只看 ``availability`` 无法区分"当日读数"与"隔夜切片"：
-        只发布 availability 会让一份过期行情在消费侧与当日行情无从分辨。组合层因此必须
-        把 freshness / status / age_seconds / observed_at 一起发布，事件 payload 也要带上。
-        """
-        self._happy_fixture()
-        # 阳性对照：当日读数确实是 fresh（否则下面的"stale"断言可能只是恒真）。
-        fresh = self._compose(market=self._snapshot())["market"]
-        self.assertEqual(MDC.FRESHNESS_FRESH, fresh["freshness"])
-
-        stale_at = f"{DAY_TEXT} 09:00:00+08:00"
-        result = self._compose(market=self._snapshot(as_of=DAY_TEXT, observed_at=stale_at))
-        market = result["market"]
-        self.assertEqual(MDC.AVAILABILITY_AVAILABLE, market["availability"])
-        self.assertNotEqual(
-            MDC.FRESHNESS_FRESH, market["freshness"],
-            "隔夜切片不得被发布成 fresh",
-        )
-        self.assertIsNotNone(market["age_seconds"])
-        self.assertGreater(market["age_seconds"], 3600.0)
-        self.assertEqual(stale_at, market["observed_at"])
-
-        row = self._account_row(result)
-        self.assertEqual(market["freshness"], row["latest_nav"]["market_freshness"])
-        self.assertEqual(market["status"], row["latest_nav"]["market_status"])
-        self.assertEqual(market["age_seconds"], row["latest_nav"]["market_age_seconds"])
-        self.assertIsNotNone(row["latest_nav"]["market_age_seconds"])
-
-        events = self._events_by_source(result, ARC.EVIDENCE_SOURCE_MARKET_DATA)
-        self.assertEqual(1, len(events))
-        for key in ("freshness", "status", "observed_at", "verification_method"):
-            self.assertIn(key, events[0]["payload_fields"])
 
     def _expected_events(self, market_snapshot):
         """三条 owner 路径各自重算 canonical event（组合层不得自己解释 kind）。"""
@@ -1564,6 +1561,44 @@ class PnlAttributionTypedRuntimeTests(unittest.TestCase):
                 )
         self.assertFalse(self._events_by_source(blocked, ARC.EVIDENCE_SOURCE_MARKET_DATA))
         self.refresh_mock.assert_not_called()
+
+    # ------------------ PNL-32：market 新鲜度 ------------------
+
+    def test_PNL_32_stale_market_slice_publishes_freshness(self):
+        """PNL-32：stale-but-available 的行情切片必须把新鲜度一起发布。
+
+        R24 对 ``observed <= requested`` 的读数是 **stale-but-available**，不是
+        unavailable。所以只看 ``availability`` 无法区分"当日读数"与"隔夜切片"：
+        只发布 availability 会让一份过期行情在消费侧与当日行情无从分辨。组合层因此必须
+        把 freshness / status / age_seconds / observed_at 一起发布，事件 payload 也要带上。
+        """
+        self._happy_fixture()
+        # 阳性对照：当日读数确实是 fresh（否则下面的"stale"断言可能只是恒真）。
+        fresh = self._compose(market=self._snapshot())["market"]
+        self.assertEqual(MDC.FRESHNESS_FRESH, fresh["freshness"])
+
+        stale_at = f"{DAY_TEXT} 09:00:00+08:00"
+        result = self._compose(market=self._snapshot(as_of=DAY_TEXT, observed_at=stale_at))
+        market = result["market"]
+        self.assertEqual(MDC.AVAILABILITY_AVAILABLE, market["availability"])
+        self.assertNotEqual(
+            MDC.FRESHNESS_FRESH, market["freshness"],
+            "隔夜切片不得被发布成 fresh",
+        )
+        self.assertIsNotNone(market["age_seconds"])
+        self.assertGreater(market["age_seconds"], 3600.0)
+        self.assertEqual(stale_at, market["observed_at"])
+
+        row = self._account_row(result)
+        self.assertEqual(market["freshness"], row["latest_nav"]["market_freshness"])
+        self.assertEqual(market["status"], row["latest_nav"]["market_status"])
+        self.assertEqual(market["age_seconds"], row["latest_nav"]["market_age_seconds"])
+        self.assertIsNotNone(row["latest_nav"]["market_age_seconds"])
+
+        events = self._events_by_source(result, ARC.EVIDENCE_SOURCE_MARKET_DATA)
+        self.assertEqual(1, len(events))
+        for key in ("freshness", "status", "observed_at", "verification_method"):
+            self.assertIn(key, events[0]["payload_fields"])
 
 
 def _except_probe(value=None) -> object:

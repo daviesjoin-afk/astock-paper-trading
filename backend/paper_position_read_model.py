@@ -107,13 +107,20 @@ def attribution_targets(conn) -> tuple:
 
     R27-B2C-4C：pnl_attribution 的 PIT context 必须由编排边界**显式**声明，其中
     cycle 归属不能由 collector 回落"当前周期"。本函数只回答"这一轮要归因哪些
-    (account, cycle)"：逐行要求 ``paper_accounts.cycle_id`` 有值，账户没有周期绑定时
-    **排除**它 —— 那是"归属不可证明"，不是"属于现在"。读不到就是空元组。
+    (account, cycle)"：逐行要求 ``paper_accounts.cycle_id`` 有值 —— 那是**归属**的证据。
+
+    唯一判据是 **cycle 绑定**，刻意**不**叠加 ``status='running'``：按本仓库自己的
+    owner contract（``paper_cycle_ownership``：经济所有权 = enabled_strategies ∩
+    ``paper_accounts.cycle_id == 目标周期``，且 lifecycle pause 不改变该集合，
+    cycle ownership ≠ execution eligibility），归因目标是 provenance 问题而不是执行资格
+    问题。一个已挂周期但被暂停的账户，其 realized_pnl / fees 仍是**可证明事实**；
+    在这里按 status 过滤会让它既不进入汇总也不发布任何 unavailable 标记 —— 那就是静默
+    丢事实。读不到就是空元组。
     """
     try:
         rows = conn.execute(
             "SELECT id, cycle_id FROM paper_accounts"
-            " WHERE status='running' AND cycle_id IS NOT NULL ORDER BY id"
+            " WHERE cycle_id IS NOT NULL ORDER BY id"
         ).fetchall()
     except sqlite3.Error:
         return ()

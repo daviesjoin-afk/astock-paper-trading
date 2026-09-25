@@ -2590,22 +2590,37 @@ def _attribution_request(asof_day=None, market_now=None):
     三项都必须由调用方给出。这里就是那个调用方，且刻意做成"显式声明"而不是"帮忙猜"：
 
     * ``market_now`` 是**本次运行的显式时刻**（同一个 instant 也交给 R24 做
-      freshness 判定，``market_data_service`` 只接受 ``datetime``）。
+      freshness 判定，``market_data_service`` 只接受 ``datetime``）。只有 ``None``
+      才回落墙钟：显式给了非法值就失败 —— 静默换成"现在"等于篡改调用方声明的 PIT 时刻，
+      而 ``asof_day`` 还会从被替换的时刻派生。
     * ``asof_day`` 只取调用方显式传入的业务日；缺省时取本次观测时刻的日期 ——
       这条声明只在"这次就是当日 post-close 归因"时成立，历史归因必须显式传业务日。
     * ``(account_id, cycle_id)`` 来自只读的 :func:`paper_position_read_model.attribution_targets`：
       没有可证明周期绑定的账户被排除，而不是回落"当前 active account"。
     * 一个 target 都拿不到时返回 ``None`` —— 让 ``pnl_attribution`` 自己 fail closed
-      （记 ``_collection_error``），而不是发布一份"看起来正常"的归因。
+      （记 ``_collection_error``），而不是发布一份"看起来正常"的归因。**读失败**与
+      "没有可证明绑定的账户"都 fail closed，但根因会被打印出来，避免两者在排障时无从区分。
     """
-    moment = market_now if isinstance(market_now, dt.datetime) else dt.datetime.now(TZ)
+    if market_now is None:
+        moment = dt.datetime.now(TZ)
+    elif isinstance(market_now, dt.datetime):
+        moment = market_now
+    else:
+        raise ValueError(
+            "market_now must be an explicit timezone-aware datetime; "
+            f"got {type(market_now).__name__}（非法显式值不得回落墙钟）"
+        )
     day = str(asof_day or moment.date().isoformat())
     conn = None
+    targets = ()
+    read_error = None
     try:
         conn = PPRM.connect_readonly(PAPER_DB_PATH)
         targets = PPRM.attribution_targets(conn)
-    except Exception:
-        targets = ()
+    except Exception as exc:
+        # 读失败与"没有可证明周期绑定的账户"是两件事。两者都 fail closed，但静默合并会
+        # 让一个 schema/IO 故障在下游只表现为笼统的 attribution_context_required。
+        read_error = f"{type(exc).__name__}: {exc}"
     finally:
         if conn is not None:
             try:
@@ -2613,6 +2628,11 @@ def _attribution_request(asof_day=None, market_now=None):
             except Exception:
                 pass
     if not targets:
+        print(
+            "[attribution] pnl context unavailable: "
+            + (read_error or "no account with a provable cycle binding"),
+            flush=True,
+        )
         return None
     return deepseek_research.AttributionRequest(
         asof_day=day, market_now=moment, targets=targets,
