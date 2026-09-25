@@ -102,6 +102,33 @@ def active_cycle_id(conn) -> int | None:
         return None
 
 
+def attribution_targets(conn) -> tuple:
+    """归因覆盖的 ``((account_id, cycle_id), ...)`` —— **只读**，不造周期、不猜账户。
+
+    R27-B2C-4C：pnl_attribution 的 PIT context 必须由编排边界**显式**声明，其中
+    cycle 归属不能由 collector 回落"当前周期"。本函数只回答"这一轮要归因哪些
+    (account, cycle)"：逐行要求 ``paper_accounts.cycle_id`` 有值，账户没有周期绑定时
+    **排除**它 —— 那是"归属不可证明"，不是"属于现在"。读不到就是空元组。
+    """
+    try:
+        rows = conn.execute(
+            "SELECT id, cycle_id FROM paper_accounts"
+            " WHERE status='running' AND cycle_id IS NOT NULL ORDER BY id"
+        ).fetchall()
+    except sqlite3.Error:
+        return ()
+    targets = []
+    for row in rows:
+        account = str(row["id"] if hasattr(row, "keys") else row[0] or "").strip()
+        try:
+            cycle = int(row["cycle_id"] if hasattr(row, "keys") else row[1])
+        except (TypeError, ValueError):
+            continue
+        if account and cycle > 0:
+            targets.append((account, cycle))
+    return tuple(targets)
+
+
 def _verified_cash_flows(conn) -> dict:
     """已验证成交的现金流，供展示成本（摊薄成本）使用。
 

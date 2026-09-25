@@ -2379,6 +2379,7 @@ def run_learning_cycle(trigger="manual"):
                 try:
                     deepseek_research.run_suite(
                         _connect, PAPER_DB_PATH, trigger="scheduled-close",
+                        attribution=_attribution_request(),
                     )
                 except Exception:
                     pass
@@ -2582,6 +2583,42 @@ def approve_neural_network(confirmed: bool = False, approved_by: str = "human-ui
     return overview()
 
 
+def _attribution_request(asof_day=None, market_now=None):
+    """**编排边界**显式声明 pnl_attribution 的 PIT context（R27-B2C-4C §7/§9/§10）。
+
+    ``pnl_attribution`` 的 collector 不再自己推断任何 identity：业务日、账户、周期
+    三项都必须由调用方给出。这里就是那个调用方，且刻意做成"显式声明"而不是"帮忙猜"：
+
+    * ``market_now`` 是**本次运行的显式时刻**（同一个 instant 也交给 R24 做
+      freshness 判定，``market_data_service`` 只接受 ``datetime``）。
+    * ``asof_day`` 只取调用方显式传入的业务日；缺省时取本次观测时刻的日期 ——
+      这条声明只在"这次就是当日 post-close 归因"时成立，历史归因必须显式传业务日。
+    * ``(account_id, cycle_id)`` 来自只读的 :func:`paper_position_read_model.attribution_targets`：
+      没有可证明周期绑定的账户被排除，而不是回落"当前 active account"。
+    * 一个 target 都拿不到时返回 ``None`` —— 让 ``pnl_attribution`` 自己 fail closed
+      （记 ``_collection_error``），而不是发布一份"看起来正常"的归因。
+    """
+    moment = market_now if isinstance(market_now, dt.datetime) else dt.datetime.now(TZ)
+    day = str(asof_day or moment.date().isoformat())
+    conn = None
+    try:
+        conn = PPRM.connect_readonly(PAPER_DB_PATH)
+        targets = PPRM.attribution_targets(conn)
+    except Exception:
+        targets = ()
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+    if not targets:
+        return None
+    return deepseek_research.AttributionRequest(
+        asof_day=day, market_now=moment, targets=targets,
+    )
+
+
 def run_advisor_review(trigger="manual-ui", purpose="data_quality"):
     """Run an evidence-only DeepSeek review and return the refreshed view."""
     with _connect() as conn:
@@ -2595,6 +2632,7 @@ def run_advisor_review(trigger="manual-ui", purpose="data_quality"):
         deepseek_research.run_task(
             _connect, PAPER_DB_PATH, purpose,
             trigger=str(trigger or "manual-ui")[:80],
+            attribution=_attribution_request() if purpose == "pnl_attribution" else None,
         )
     return overview()
 
@@ -2640,7 +2678,8 @@ def run_advisor_suite(trigger="manual-suite"):
     if not deepseek_advisor.configured():
         raise RuntimeError("api_key_missing")
     deepseek_advisor.run_review(_connect, PAPER_DB_PATH, SNAPSHOT_PATHS, config=cfg, trigger=trigger)
-    deepseek_research.run_suite(_connect, PAPER_DB_PATH, trigger=trigger)
+    deepseek_research.run_suite(_connect, PAPER_DB_PATH, trigger=trigger,
+                                attribution=_attribution_request())
     return overview()
 
 

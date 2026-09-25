@@ -2,14 +2,23 @@
 """Structured DeepSeek research tasks for the paper-trading system."""
 from __future__ import annotations
 
+import dataclasses
+import datetime as dt
 import hashlib
 import json
 import sqlite3
 import time
 import urllib.error
 
+import ai_research_contract as ARC
+import ai_research_execution_adapter as XEA
+import ai_research_portfolio_adapter as PFA
 import deepseek_advisor as advisor
+import execution_evidence as EE
 import execution_verification as EV
+import market_data_contract as MDC
+import market_data_service as MDS
+import paper_portfolio_read_model as PPRM
 
 
 TASKS = {
@@ -75,45 +84,441 @@ def _latest_data_quality(adaptive_conn):
     }
 
 
-def _pnl_evidence(adaptive_conn, paper_db_path):
+# ---------------------------------------------------------------------------
+# pnl_attribution：canonical typed runtime（R27-B2C-4C）
+# ---------------------------------------------------------------------------
+#: canonical 事件里的 source 标签。**不是** authority 声明 —— 事实的 owner 由
+#: ``evidence_ref.source_type`` 保留（execution / portfolio_research / market_data）。
+PNL_EXECUTION_SOURCE = "execution_owner"
+PNL_PORTFOLIO_SOURCE = "portfolio_owner"
+PNL_MARKET_SOURCE = "market_owner"
+
+#: 不可用原因码。刻意保留字段的语义位置（而不是删掉字段）：把"拿不到"写清楚，
+#: 和用 legacy fallback 填一个数字，是同一类错误的两个方向。
+PNL_UNAVAILABLE_NO_CONTEXT = "attribution_context_required"
+PNL_UNAVAILABLE_NO_MARKET = "market_evidence_unavailable"
+PNL_UNAVAILABLE_HISTORICAL_MARKET = "historical_market_evidence_unavailable"
+PNL_UNAVAILABLE_OWNER_FACT = "owner_fact_unknown"
+
+#: compatibility 投影里明确标注的"仅展示"权威标签（绝不进 evidence identity）。
+PRESENTATION_AUTHORITY = "presentation_only_not_evidence"
+
+
+@dataclasses.dataclass(frozen=True)
+class AttributionRequest:
+    """pnl_attribution 的**显式** PIT context。
+
+    三个字段都**没有默认值**，因为每一个都是"编排边界必须自己知道的事实"：
+
+    * ``asof_day`` —— 归因业务日（canonical ``YYYY-MM-DD``）。这是 §七 的核心修正：
+      legacy 路径用 ``max(paper_nav.nav_date)`` 自己推断业务日，等于让**被解释的数据**
+      决定**解释的口径**。现在只能由调用方声明。
+    * ``market_now`` —— R24 freshness 判定用的显式时刻（必须 timezone-aware）。
+      ``market_data_service._resolve_now`` 只接受 ``datetime``，字符串会被它拒绝 ——
+      所以这里不能直接透传 ``advisor._now()`` 的 ISO 字符串。
+    * ``targets`` —— ``((account_id, cycle_id), ...)``。cycle 归属必须显式给出：
+      portfolio owner 的 ``_cycle_initial`` 要求 ``paper_accounts.cycle_id`` 与
+      context 的 cycle_id 一致，如果这里不给，owner 只能去猜"当前周期"。
+
+    刻意**没有**任何 fallback：不取 active account、不取 current cycle、不取
+    ``today()``、不取 latest。缺 context 时调用方应当拿到失败，而不是一个看起来
+    正常的历史归因。
+    """
+
+    asof_day: str
+    market_now: dt.datetime
+    targets: tuple
+
+    def __post_init__(self) -> None:
+        day = str(self.asof_day or "").strip()
+        try:
+            parsed = dt.date.fromisoformat(day)
+        except ValueError as exc:
+            raise ValueError(
+                "AttributionRequest asof_day must be a canonical YYYY-MM-DD business day; "
+                f"got {self.asof_day!r}（业务日必须由调用边界显式声明）"
+            ) from exc
+        if parsed.isoformat() != day:
+            raise ValueError(f"AttributionRequest asof_day is not canonical: {self.asof_day!r}")
+        object.__setattr__(self, "asof_day", day)
+
+        if not isinstance(self.market_now, dt.datetime):
+            raise ValueError(
+                "AttributionRequest market_now must be an explicit datetime "
+                "(market_data_service rejects strings/None)"
+            )
+        if self.market_now.tzinfo is None or self.market_now.tzinfo.utcoffset(self.market_now) is None:
+            raise ValueError("AttributionRequest market_now must be timezone-aware")
+
+        targets = tuple((str(account).strip(), int(cycle)) for account, cycle in (self.targets or ()))
+        if not targets:
+            raise ValueError(
+                "AttributionRequest requires at least one explicit (account_id, cycle_id) target "
+                "—— 不得回落'当前 active account / current cycle'"
+            )
+        for account, cycle in targets:
+            if not account:
+                raise ValueError("AttributionRequest target account_id must be non-empty")
+            if cycle <= 0:
+                raise ValueError(f"AttributionRequest target cycle_id must be positive, got {cycle}")
+        object.__setattr__(self, "targets", targets)
+
+
+def _market_leg(attribution):
+    """读 R24 owner 的 attributed market slice —— **只读**，绝不触发 provider refresh。
+
+    返回 ``(valuations, market_evidence_ref, unavailable_reason)``。valuations 由本函数
+    **从 ``reading.snapshot.rows`` 内部构造**：组合层刻意不接受调用方给的裸
+    ``Mapping``，否则 ``{"600000": 10.0}`` 就能冒充 canonical valuation evidence。
+
+    历史归因请求 D-1 而缓存是 D 时，R24 的 ``classify`` 会给出
+    ``unavailable / asof_unprovable``（§23）—— 这里如实把 market leg 判为不可用，
+    既不拿 D 回填 D-1，也不回头读 ``paper_nav``。
+    """
+    reading = MDS.read_snapshot(
+        MDC.ATTRIBUTION_POLICY,
+        now=attribution.market_now,
+        asof_day=attribution.asof_day,
+    )
+    snapshot = reading.snapshot
+    if reading.availability != MDC.AVAILABILITY_AVAILABLE or snapshot is None:
+        return None, None, str(reading.reason or reading.status or "market_unavailable"), reading
+    valuations = {}
+    for row in snapshot.rows:
+        if not hasattr(row, "get"):
+            continue
+        code = str(row.get("code") or "").strip()
+        price = row.get("price")
+        if not code or isinstance(price, bool) or not isinstance(price, (int, float)):
+            continue
+        if price > 0 and price == price and price not in (float("inf"), float("-inf")):
+            valuations[code] = float(price)
+    if not valuations:
+        return None, None, "market_slice_has_no_usable_valuation", reading
+    return valuations, ARC.evidence_ref_from_market_reading(reading), None, reading
+
+
+def _market_provenance(reading, reason):
+    """market leg 的 provenance —— 必须同时发布**新鲜度**与 `verification_method`。
+
+    两个都容易被漏掉，而漏掉任何一个都会把"我知道得多不确定"这件事藏起来：
+
+    * ``verification == "verified"`` 不等于双源核验：full-market snapshot 通常只是
+      ``coverage_integrity``。所以这里同时发布 method 与
+      :func:`market_data_contract.is_cross_source_verified` 的结论，且**不**把
+      coverage_integrity 描述成 cross-source（§22）。
+    * ``availability == "available"`` 也不等于"当日新鲜"：R24 对
+      ``observed <= requested`` 的读数给出的是 stale-but-available。只发布 availability
+      会让一份 24 小时前的切片在组合边界看起来与当日读数无从区分，因此 freshness /
+      status / age_seconds / snapshot 自己的 as_of 与 observed_at 必须一起发布。
+    """
+    if reading is None:
+        return {"availability": "unavailable", "reason": reason, "freshness": None,
+                "status": None, "age_seconds": None, "as_of": None, "observed_at": None,
+                "verification": None, "verification_method": None,
+                "cross_source_verified": False}
+    snapshot = reading.snapshot
+    return {
+        "availability": reading.availability,
+        "reason": reading.reason or reason,
+        "freshness": reading.freshness,
+        "status": reading.status,
+        "age_seconds": reading.age_seconds,
+        "as_of": None if snapshot is None else snapshot.as_of,
+        "observed_at": None if snapshot is None else snapshot.observed_at,
+        "verification": None if snapshot is None else snapshot.verification,
+        "verification_method": None if snapshot is None else snapshot.verification_method,
+        "cross_source_verified": bool(MDC.is_cross_source_verified(snapshot)),
+    }
+
+
+def _evidence_field_state(holder) -> str:
+    return str(getattr(holder, "state", "") or "")
+
+
+def _matches_target(projection, account_id, cycle_id, asof_day) -> bool:
+    """execution fact 是否属于本次归因的 (account, cycle, business_day)。
+
+    三个 owner 字段必须**全部 known 且全部匹配**。任何一项 unknown 或不符即排除 ——
+    绝不用 ``executed_at[:10]`` 之类的 legacy 时间戳猜业务日，也绝不重绑定
+    （§11 / §12：owner 的数据缺口必须保持 visible）。
+    """
+    owner_account = projection.account_id
+    owner_cycle = projection.cycle_id
+    owner_day = projection.business_day
+    if not (owner_account.is_known and owner_cycle.is_known and owner_day.is_known):
+        return False
+    if str(owner_account.value) != str(account_id):
+        return False
+    try:
+        if int(owner_cycle.value) != int(cycle_id):
+            return False
+    except (TypeError, ValueError):
+        return False
+    return str(owner_day.value) == str(asof_day)
+
+
+def _execution_leg(conn, account_id, cycle_id, attribution):
+    """execution owner typed facts → InformationEvent。
+
+    核验判据用的是 ``ResearchEvidenceRef.is_verified``（"owner 的这条结论是否可信"），
+    **不是** ``verification["is_verified"]``（"整单是否完整成交"）：``partial`` /
+    ``not_executed`` 配合账本证据同样是一条**可信的**研究事实（§13）。
+    """
+    events, trade_rows = [], []
+    fee_total, fees_complete = 0.0, True
+    for evidence in EE.load_execution_evidence(conn, account_id=account_id, limit=500):
+        projection = EV.fact_projection(evidence)
+        if not _matches_target(projection, account_id, cycle_id, attribution.asof_day):
+            continue
+        ref = XEA.evidence_ref_from_execution_projection(projection)
+        filled_qty = projection.filled_qty.maybe()
+        fill_price = projection.fill_price.maybe()
+        amount = None
+        amount_basis = None
+        if filled_qty is not None and fill_price is not None:
+            # 派生展示值：owner contract 没有 ``amount`` 列，只有在两腿都 owner-known
+            # 时才允许派生，并明确标注它不是 owner raw fact（§14）。
+            amount = round(float(filled_qty) * float(fill_price), 4)
+            amount_basis = "derived_filled_qty_times_fill_price"
+        payload = {
+            "identity": projection.identity,
+            "identity_kind": projection.identity_kind,
+            "lifecycle_state": projection.lifecycle_state,
+            "fill_verdict": projection.fill_verdict,
+            "code": projection.code.maybe(),
+            "action": projection.action.maybe(),
+            "requested_qty": projection.requested_qty.maybe(),
+            "filled_qty": filled_qty,
+            "fill_price": fill_price,
+            "fees": projection.fees.maybe(),
+            "business_day": projection.business_day.maybe(),
+            "observed_at": projection.observed_at.maybe(),
+            "field_states": {
+                name: _evidence_field_state(getattr(projection, name))
+                for name in EV.EXECUTION_FACTUAL_FIELDS
+            },
+            "amount": amount,
+            "amount_basis": amount_basis,
+            "verified_by": "research_evidence_ref",
+        }
+        events.append(ARC.InformationEvent(
+            as_of=attribution.asof_day, source=PNL_EXECUTION_SOURCE,
+            evidence_ref=ref, payload=payload,
+        ))
+        trade_rows.append(dict(payload, is_verified=bool(ref.is_verified)))
+        if projection.fees.is_known:
+            fee_total += float(projection.fees.value)
+        else:
+            # unknown ≠ 0：把没证明的费用补零，就是把"不知道"发布成"没有费用"。
+            fees_complete = False
+    return events, trade_rows, (round(fee_total, 4) if fees_complete else None), fees_complete
+
+
+def _portfolio_leg(conn, context, account_id, attribution):
+    """portfolio owner typed facts → InformationEvent（cash / realized / position cost）。"""
+    events, facts, provenance = [], {}, {}
+    for projection in PPRM.accounting_fact_projections(conn, context, account_id=account_id):
+        ref = PFA.evidence_ref_from_portfolio_projection(projection)
+        verified = projection.status == PPRM.STATUS_VERIFIED
+        payload = {
+            "fact_kind": projection.fact_kind,
+            "status": projection.status,
+            "asof_day": projection.asof_day,
+            "cycle_id": projection.cycle_id,
+            "account_id": projection.account_id,
+            "value": None,
+        }
+        if verified:
+            if projection.fact_kind == PPRM.PORTFOLIO_FACT_POSITION_COST_SUMMARY:
+                summary = projection.value
+                payload["position_count"] = summary.position_count
+                payload["cost_value"] = summary.cost_value
+                facts[projection.fact_kind] = {
+                    "position_count": summary.position_count,
+                    "cost_value": summary.cost_value,
+                }
+            else:
+                payload["value"] = projection.value
+                facts[projection.fact_kind] = projection.value
+        provenance[projection.fact_kind] = {
+            "status": projection.status,
+            "source_id": ref.source_id,
+            "as_of": ref.as_of,
+            "is_verified": bool(ref.is_verified),
+            "authority": "portfolio_owner_typed_fact",
+        }
+        events.append(ARC.InformationEvent(
+            as_of=attribution.asof_day, source=PNL_PORTFOLIO_SOURCE,
+            evidence_ref=ref, payload=payload,
+        ))
+    return events, facts, provenance
+
+
+def _compose_pnl_attribution(conn, attribution):
+    """cross-owner research composition。
+
+    本层只做三件被允许的事：消费 owner typed facts、把它们组合成可归因的展示值、
+    把"证明不了"如实写成 unavailable + reason。它**不是**第四个事实 owner：
+    execution / portfolio / market 各自保留 identity（§31），也不签发新的
+    ``ResearchEvidenceRef``（§32）。
+    """
+    events = []
+    valuations, market_ref, market_reason, market_reading = _market_leg(attribution)
+    market_provenance = _market_provenance(market_reading, market_reason)
+    if market_ref is not None:
+        events.append(ARC.InformationEvent(
+            as_of=attribution.asof_day, source=PNL_MARKET_SOURCE, evidence_ref=market_ref,
+            payload={"policy": MDC.ATTRIBUTION_POLICY.name, "asof_day": attribution.asof_day,
+                     "valuation_codes": sorted(valuations),
+                     # 新鲜度随证据一起发布：stale-but-available 与当日读数不得在
+                     # 消费侧无从区分。
+                     "freshness": market_provenance["freshness"],
+                     "status": market_provenance["status"],
+                     "observed_at": market_provenance["observed_at"],
+                     "verification_method": market_provenance["verification_method"]},
+        ))
+
+    account_rows, trade_rows = [], []
+    realized_total, realized_complete = 0.0, True
+    fees_total, fees_complete = 0.0, True
+    position_rows = []
+    for account_id, cycle_id in attribution.targets:
+        context = PPRM.PortfolioReadContext(cycle_id, attribution.asof_day)
+        portfolio_events, facts, fact_provenance = _portfolio_leg(
+            conn, context, account_id, attribution)
+        events.extend(portfolio_events)
+
+        execution_events, trades, fees_value, fees_ok = _execution_leg(
+            conn, account_id, cycle_id, attribution)
+        events.extend(execution_events)
+        trade_rows.extend(trades)
+        if fees_ok:
+            fees_total += float(fees_value or 0.0)
+        else:
+            fees_complete = False
+
+        realized = facts.get(PPRM.PORTFOLIO_FACT_REALIZED_PNL)
+        if isinstance(realized, (int, float)) and not isinstance(realized, bool):
+            realized_total += float(realized)
+        else:
+            realized_complete = False
+
+        summary = facts.get(PPRM.PORTFOLIO_FACT_POSITION_COST_SUMMARY)
+        if isinstance(summary, dict):
+            position_rows.append(dict(summary, account_id=account_id, cycle_id=cycle_id,
+                                      authority="portfolio_owner_typed_fact"))
+        else:
+            position_rows.append({"account_id": account_id, "cycle_id": cycle_id,
+                                  "position_count": None, "cost_value": None,
+                                  "availability": PNL_UNAVAILABLE_OWNER_FACT,
+                                  "authority": "portfolio_owner_typed_fact"})
+
+        nav_block = {"nav": None, "market_value": None, "unrealized_pnl": None,
+                     "availability": "unavailable", "reason": market_reason,
+                     "market_evidence_ref": None,
+                     "market_verification": market_provenance["verification"],
+                     "market_verification_method": market_provenance["verification_method"],
+                     "market_cross_source_verified": market_provenance["cross_source_verified"],
+                     # NAV 的可信度基础必须完整：一份 stale-but-available 的切片不能因为
+                     # ``availability == available`` 就被当成当日读数。
+                     "market_freshness": market_provenance["freshness"],
+                     "market_status": market_provenance["status"],
+                     "market_age_seconds": market_provenance["age_seconds"],
+                     "market_as_of": market_provenance["as_of"]}
+        if valuations is not None:
+            view = PPRM.portfolio_for_context(
+                conn, context, account_id=account_id, valuations=valuations)
+            nav_block.update({
+                "nav": view.get("nav"),
+                "market_value": view.get("market_value"),
+                "unrealized_pnl": view.get("unrealized_pnl"),
+                "availability": "available" if view.get("nav") is not None else "unavailable",
+                "reason": None if view.get("nav") is not None else PNL_UNAVAILABLE_OWNER_FACT,
+                "nav_status": view.get("nav_status"),
+                "market_value_status": view.get("market_value_status"),
+                "market_evidence_ref": market_ref.source_id if market_ref is not None else None,
+            })
+            # portfolio 的 nav_status 只说明"ledger 可重建 + 拿到了完整 numeric
+            # valuations"，**不是**市场核验（§20）：市场侧 provenance 必须一起发布。
+        account_rows.append({
+            "account_id": account_id,
+            "cycle_id": cycle_id,
+            "cash": facts.get(PPRM.PORTFOLIO_FACT_CASH),
+            "realized_pnl": realized,
+            "position_cost_summary": summary,
+            "latest_nav": nav_block,
+            "prior_nav": {"value": None, "availability": "unavailable",
+                          "reason": PNL_UNAVAILABLE_HISTORICAL_MARKET},
+            "daily_pnl": {"value": None, "availability": "unavailable",
+                          "reason": PNL_UNAVAILABLE_HISTORICAL_MARKET},
+            "daily_return_pct": {"value": None, "availability": "unavailable",
+                                 "reason": PNL_UNAVAILABLE_HISTORICAL_MARKET},
+            "owner_fact_provenance": fact_provenance,
+            "presentation_authority": PRESENTATION_AUTHORITY,
+            "is_authoritative": False,
+        })
+
+    return {
+        "scope": "paper_trading_only",
+        "purpose": "pnl_attribution",
+        "asof": attribution.asof_day,
+        "asof_source": "explicit_attribution_request",
+        "targets": [{"account_id": a, "cycle_id": c} for a, c in attribution.targets],
+        "accounts": account_rows,
+        "filled_trades": trade_rows,
+        "fees": round(fees_total, 4) if fees_complete else None,
+        "fees_availability": "known" if fees_complete else PNL_UNAVAILABLE_OWNER_FACT,
+        "realized_pnl": round(realized_total, 4) if realized_complete else None,
+        "realized_pnl_availability": "known" if realized_complete else PNL_UNAVAILABLE_OWNER_FACT,
+        "position_cost_summary": position_rows,
+        "market": dict(market_provenance, policy=MDC.ATTRIBUTION_POLICY.name),
+        #: canonical typed 事件真实进入 runtime（§29）：每一条都携带
+        #: ``evidence_ref``，kind / verification 由 ref 派生，payload 只是观察投影。
+        "canonical_events": [
+            {"source_type": event.evidence_ref.source_type, "source_id": event.evidence_ref.source_id,
+             "kind": event.kind, "as_of": event.as_of, "source": event.source,
+             "verification": event.verification,
+             "verification_method": event.verification_method,
+             "evidence_id": event.evidence_id,
+             "payload_fields": sorted(event.payload)}
+            for event in events
+        ],
+        "event_count": len(events),
+        "limitations": [
+            "不能证明前一交易日业务日 / 前一交易日组合状态 / 前一交易日 R24 行情时，"
+            "不把累计浮盈伪装成单日归因（prior_nav / daily_pnl / daily_return 报 unavailable）",
+            "归因只解释模拟盘账本，不推断实盘收益",
+            "market leg 的 verification 必须连同 verification_method 一起读："
+            "coverage_integrity 不是双源核验",
+        ],
+        "authority": "research_composition_only_not_an_owner",
+    }
+
+
+def _pnl_evidence(adaptive_conn, paper_db_path, attribution=None):
+    """pnl_attribution 的 canonical typed 入口。
+
+    没有显式 :class:`AttributionRequest` 时**fail closed**（抛出，而不是猜一个业务日）。
+    ``adaptive_conn`` 刻意不参与：legacy 路径用它读 ``paper_nav``，现在 attribution
+    与 adaptive 库无关 —— 保留参数只为与 ``COLLECTORS`` 其它四个 collector 同形。
+    """
+    if attribution is None:
+        raise ValueError(
+            f"{PNL_UNAVAILABLE_NO_CONTEXT}: pnl_attribution requires an explicit "
+            "AttributionRequest (asof_day / market_now / targets) —— 拒绝用墙钟或 "
+            "max(paper_nav.nav_date) 推断业务日"
+        )
+    if not isinstance(attribution, AttributionRequest):
+        raise TypeError(
+            "pnl_attribution attribution context must be an AttributionRequest, "
+            f"got {type(attribution).__name__}"
+        )
     paper = _paper(paper_db_path)
     try:
-        accounts = _rows(paper, "SELECT id,name,initial_cash,cash,status,version FROM paper_accounts ORDER BY id")
-        account_rows = []
-        asof_dates = []
-        for account in accounts:
-            navs = _rows(paper, "SELECT nav_date,cash,market_value,nav,benchmark FROM paper_nav WHERE account_id=? ORDER BY nav_date DESC LIMIT 2", (account["id"],))
-            latest = navs[0] if navs else None
-            prior = navs[1] if len(navs) > 1 else None
-            if latest:
-                asof_dates.append(latest["nav_date"])
-            daily_pnl = (latest["nav"] - prior["nav"]) if latest and prior else None
-            daily_return = (daily_pnl / prior["nav"] * 100) if daily_pnl is not None and prior and prior["nav"] else None
-            account_rows.append({
-                "account_id": account["id"], "name": account["name"], "status": account["status"],
-                "version": account["version"], "latest_nav": latest, "prior_nav": prior,
-                "daily_pnl": round(daily_pnl, 2) if daily_pnl is not None else None,
-                "daily_return_pct": round(daily_return, 4) if daily_return is not None else None,
-                "nav_observations": len(navs),
-            })
-        asof = max(asof_dates) if asof_dates else None
-        # 归因报告是**执行绩效**：只有被证据证明成交的委托才进入成交明细、
-        # 费用与已实现盈亏汇总。没有验证列的旧行按 fail closed 排除。
-        trades = _rows(paper, """SELECT account_id,side,code,name,qty,filled_price,amount,fees,realized_pnl,executed_at
-                                  FROM paper_orders WHERE status='filled' AND substr(executed_at,1,10)=?
-                                    AND """ + EV.VERIFIED_PREDICATE + """
-                                  ORDER BY abs(COALESCE(realized_pnl,0)) DESC,id DESC LIMIT 30""", (asof,)) if asof else []
-        fee_total = round(sum(float(row.get("fees") or 0) for row in trades), 2)
-        realized_total = round(sum(float(row.get("realized_pnl") or 0) for row in trades), 2)
-        positions = _rows(paper, "SELECT account_id,COUNT(*) position_count,SUM(qty*cost) cost_value FROM paper_positions GROUP BY account_id")
+        return _compose_pnl_attribution(paper, attribution)
     finally:
         paper.close()
-    return {
-        "scope": "paper_trading_only", "purpose": "pnl_attribution", "asof": asof,
-        "accounts": account_rows, "filled_trades": trades, "fees": fee_total,
-        "realized_pnl": realized_total, "position_cost_summary": positions,
-        "limitations": ["没有逐持仓前一收盘价时，不把累计浮盈伪装成单日个股归因", "归因只解释模拟盘账本，不推断实盘收益"],
-    }
 
 
 def _candidate_evidence(adaptive_conn, paper_db_path):
@@ -281,9 +686,16 @@ COLLECTORS = {
 }
 
 
-def collect(purpose, adaptive_conn, paper_db_path):
+def collect(purpose, adaptive_conn, paper_db_path, *, attribution=None):
+    """Materialize one collector's evidence.
+
+    ``attribution`` 只对 ``pnl_attribution`` 有效；其余四个 collector 仍是 legacy
+    读路径（迁移在 B2C-5 之后），因此它们**不接受**也不需要这个 context。
+    """
     if purpose not in COLLECTORS:
         raise ValueError("unsupported_advisor_purpose")
+    if purpose == "pnl_attribution":
+        return _pnl_evidence(adaptive_conn, paper_db_path, attribution=attribution)
     return COLLECTORS[purpose](adaptive_conn, paper_db_path)
 
 
@@ -395,16 +807,16 @@ def _run_evidence_task(connect_factory, purpose, evidence, trigger="manual"):
                      evidence, report, error_code, latency_ms, input_tokens, output_tokens)
 
 
-def run_task(connect_factory, paper_db_path, purpose, trigger="manual"):
+def run_task(connect_factory, paper_db_path, purpose, trigger="manual", *, attribution=None):
     if purpose not in TASKS:
         raise ValueError("unsupported_advisor_purpose")
     with connect_factory() as conn:
         advisor.ensure_schema(conn)
-        evidence = collect(purpose, conn, paper_db_path)
+        evidence = collect(purpose, conn, paper_db_path, attribution=attribution)
     return _run_evidence_task(connect_factory, purpose, evidence, trigger)
 
 
-def _collect_suite_snapshot(connect_factory, paper_db_path):
+def _collect_suite_snapshot(connect_factory, paper_db_path, attribution=None):
     """Materialize one immutable suite snapshot for all five projections.
 
     The adaptive read connection is shared for the collection phase, so the
@@ -424,7 +836,7 @@ def _collect_suite_snapshot(connect_factory, paper_db_path):
         advisor.ensure_schema(conn)
         for purpose in TASKS:
             try:
-                evidence = collect(purpose, conn, paper_db_path)
+                evidence = collect(purpose, conn, paper_db_path, attribution=attribution)
                 # Force a JSON round-trip: model projections must not share
                 # mutable row/list objects or accidentally alter each other's
                 # evidence before hashing/persistence.
@@ -437,11 +849,11 @@ def _collect_suite_snapshot(connect_factory, paper_db_path):
     return snapshot_id, snapshot_asof, evidence_by_purpose
 
 
-def run_suite(connect_factory, paper_db_path, trigger="post-close"):
+def run_suite(connect_factory, paper_db_path, trigger="post-close", *, attribution=None):
     results = []
     try:
         snapshot_id, _snapshot_asof, evidence_by_purpose = _collect_suite_snapshot(
-            connect_factory, paper_db_path
+            connect_factory, paper_db_path, attribution=attribution
         )
     except Exception as exc:
         # A schema/open failure before the snapshot exists is still isolated
