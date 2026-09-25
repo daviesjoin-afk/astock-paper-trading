@@ -994,12 +994,21 @@ class AdapterBoundaryTests(unittest.TestCase):
         self.assertIn("ai_research_contract", adapter_imports)
         self.assertIn("execution_verification", adapter_imports)
 
-        # 同时认识两套词表的 production 模块**只有** adapter 一个。
+        # 同时认识两套词表的 production 模块：唯一接缝 adapter + pnl 组合层。
+        # R27-B2C-4C 起组合层也必须同时认识两套词表（跨 owner 组合的定义），但角色不同：
+        # 组合层只**消费** owner 投影，绝不签发 ref。
         both = [
             name for name in _production_modules()
             if {"ai_research_contract", "execution_verification"} <= self._imported_roots(name)
         ]
-        self.assertEqual([ADAPTER_MODULE], both, f"不止一个模块同时认识两套词表：{both}")
+        self.assertEqual(
+            sorted([ADAPTER_MODULE, "deepseek_research.py"]), sorted(both),
+            f"同时认识两套词表的模块集合发生变化：{sorted(both)}",
+        )
+        self.assertNotIn(
+            "_issue_evidence_ref", _module_source("deepseek_research.py"),
+            "pnl 组合层不得调用契约的私有签发口 —— 组合结论不是新的 owner fact",
+        )
         # 非空性：扫描器确实能看到那个唯一的模块。
         self.assertIn("execution_verification", adapter_imports)
 
