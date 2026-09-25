@@ -835,6 +835,12 @@ Owner 模块是 `news_learning.py`；`linkage.py` / `alt_data.py` / `disclosure_
 `evidence_grade` 是**抓取适配器按 endpoint 硬编码**的常量，`verification_status` 只等价于
 "有没有 URL"。把这两者当核验维度使用，就是**用抓取方式冒充事实核验**。
 
+> **R27-B2C-5 复查更正（不删上方原文，保留当时判断依据）**：上表是"research 侧还没有
+> owner-native 归口"时的判断，逐条事实仍然成立。R27-B2C-5 重新审计后把**可迁移的那部分**
+> 交付了：news owner 发布 typed fact contract + 唯一 adapter，并且**只**用
+> `owner-neutral unverified` / `source_unusable` 归口 —— 既不发明核验结论，也不把
+> `evidence_grade` 当核验。见文末 [B2C-5 进展](#b2c-5-进展news-owner-readiness)。
+
 ---
 
 ## 五、跨族结论与前置条件
@@ -1145,4 +1151,88 @@ fees / realized_pnl                    →  unknown 时不再补零，而是 Non
 
 **Legacy surface removed = YES**（pnl 路径的 direct-SQL authority）；**Roadmap capability
 removed = 0**；**Original invariant weakened = NO**。
+
+---
+
+## B2C-5 进展（news owner readiness）
+
+owner 是 `news_learning` 的 durable event ledger。本轮**只**建立 owner→research 接缝，
+**不**迁移 `deepseek_research._event_evidence` 的 runtime（那是后续 event_evidence
+convergence），因此 news adapter 的 production 调用点今天仍然是 **0**。
+
+### NEWS OWNER MATRIX
+
+| table / fact | writer | identity | PIT availability | verification input | canonical owner? | target treatment |
+| --- | --- | --- | --- | --- | --- | --- |
+| `news_events` 公司级公告/新闻事件 | `news_learning.capture_events:465`（`INSERT OR IGNORE`） | `event_key` UNIQUE（`sha256(source_name\|code\|identity)`，`identity = source_url \|\| article_id \|\| normalized_title`） | **`first_seen_at`**（`seen = first_seen_at or _now()`，`INSERT OR IGNORE` ⇒ 不可被后一次抓取覆盖） | 无核验列；`source_url` / `article_id` 决定**可追溯性** | ✅ `news_learning` | **TYPED EVENT FACT** |
+| `market_major_events` 市场级重大事件 | `news_learning.capture_major_events:542`（`INSERT OR IGNORE`） | `event_key` UNIQUE（`sha256(source_name\|identity)`） | **`first_seen_at`** | `verification_status` NOT NULL，唯一 writer 的内联表达式只写出 `single_source_linked` / `unverified`；`evidence_grade` | ✅ `news_learning` | **TYPED EVENT FACT** |
+| `market_event_candidate_links` 事件↔候选/行业映射 | `capture_major_events:587`（`INSERT OR IGNORE`） | `(event_id, code)` PK | `created_at`（不是事件可用性） | 启发式 `confidence`（0.95 直接标签 / 0.72 行业映射） | ✅ `news_learning` | **PRESENTATION / CONTEXT**（**不是** event truth，**不是** causal verification） |
+| `news_source_reputation` 来源级聚合统计 | `news_learning.recalibrate:695`（**DELETE + INSERT**，可变快照） | `source_name` PK | 无（`updated_at` 是 now，没有 as-of） | `credibility_score` 是确定性公式，输入含调用方 grade | ✅ `news_learning` | **OWNER METADATA**（**不是** per-event verification） |
+| `news_event_outcomes` 事件后 1/3/5 交易日结果 | `mature_outcomes:639` | `(event_id, horizon)` PK | 严格取 `first_seen_at` 之后的交易日 | 无核验维度；`price_source` 是自由字符串 | ✅ `news_learning` | **DERIVED LEARNING METADATA** |
+| `news_effectiveness` 事件类型 × grade 效果统计 | `recalibrate:723`（DELETE + INSERT） | `(event_type, evidence_grade, horizon)` PK | `updated_at`（无 as-of） | 无 | ✅ `news_learning` | **DERIVED LEARNING METADATA** |
+| `news_factor_versions` news-learning overlay 版本 | `recalibrate:763` | `version` UNIQUE | 只有 `created_at` | `status ∈ {shadow, micro_eligible}` 是**门禁词**，不是核验词 | ✅ `news_learning` | **OWNER METADATA / OUT OF EVENT EVIDENCE SCOPE** |
+| `news_learning_runs` 运行台账 | `run_cycle:852/:858` | `id` | `started_at` / `finished_at` | 无 | ✅ `news_learning` | **OUT OF B2C-5 SCOPE** |
+| `news_candidate_snapshots` 候选池快照 | `capture_candidate_snapshot:321`（唯一真 upsert） | `(snapshot_date, slot, account_id, code)` UNIQUE | `captured_at` / `valid_until` | 无 | ✅ `news_learning` | **OUT OF B2C-5 SCOPE**（不是事件事实） |
+| 公司公告 fetch 端的 `"verified": True` | `data_fetcher.fetch_company_announcements:1653` | — | — | 抓取端布尔，**落库时被丢弃**（`news_events` 没有该列） | ❌ 不是 owner 事实 | **NOT VERIFICATION**（不得持久化、不得引用） |
+
+### 与上表对应的强制边界
+
+```text
+availability authority                     first_seen_at（exact timestamp）
+published_at                               描述性来源时间（只进 payload / detail，永不进 as_of）
+evidence_grade                             provenance / traceability 元数据，**不是**核验
+market_major verification_status           owner 词汇；当前**审计过的** writer 闭集
+                                           {single_source_linked, unverified}
+single_source_linked                       → OWNER_OUTCOME_UNVERIFIED（**不是** verified）
+candidate mapping confidence               → 不是 event verification
+source reputation credibility_score        → 不是 event verification
+typed read 读的表                          只读 news_events / market_major_events
+typed read 的网络访问                      0（不联网、不建表、不回填）
+adapter                                    ai_research_news_adapter（唯一接缝）
+runtime `_event_evidence` 迁移              OPEN / later（本轮**没有**迁移）
+```
+
+`CURRENT NEWS OWNER HAS NO VERIFIED STATE` 是本轮审计出来的**事实**：整个仓库只有一处
+`verification_status` writer，没有任何 UPDATE / 第二 writer / 多源复算路径能把它升级，
+`news_events` 连核验列都没有。因此 owner 的核验闭集刻意只有三态、且没有 verified ——
+发明一个就是伪造 provenance。
+
+### B2C-5 之后的数字
+
+```text
+news factual owners:                                before = 1（news_learning）  after = 1（未迁移）
+news typed fact contract:                           before = 0                  after = 1
+news adapter count:                                 before = 0                  after = 1
+news adapter production callers:                    before = 0                  after = 0（预期状态）
+duplicate news ledgers:                             before = 0                  after = 0
+production modules added / removed:                 1（ai_research_news_adapter）/ 0
+new typed projection modules added:                 0（住在既有 news_learning 里）
+new service / manager / repository / facade:        0
+DB migration / schema change:                      0（沿用既有 event_key / first_seen_at / evidence_grade / verification_status）
+network-capable typed read paths:                  0
+implicit historical time fallbacks:                0
+deleted roadmap capability:                        0
+weakened original invariant:                       NO
+```
+
+**Roadmap capability removed = 0；Original invariant weakened = NO；Net architecture surface =
+由 NEUTRAL 变为 INCREASED（有理由）** —— 增大的那一份是 roadmap 明确要求的
+owner→research 接缝（`ai_research_contract` 不得 import DB-backed 且会联网的
+`news_learning`，news owner 也不得 import research），不是新增第二个 news owner。
+
+### 已知 OPEN 项（不是 roadmap 删除）
+
+```text
+OPEN / REQUIRED:
+deepseek_research._event_evidence still contains legacy direct-ledger reads
+and live-fetch fallback（没有 durable events 时会去抓 live news）。
+
+该 fallback **不**代表 canonical news evidence path：canonical 路径是
+news_learning.news_fact_projections（纯读 durable ledger）
+  → ai_research_news_adapter.evidence_ref_from_news_projection。
+
+event_evidence runtime convergence = DEFERRED（不是 COMPLETE）
+```
+
+B2C-5 只能写 **news owner readiness = COMPLETE**，不能写"news runtime 已完全迁移"。
 
