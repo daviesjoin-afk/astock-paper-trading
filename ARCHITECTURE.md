@@ -2557,11 +2557,12 @@ typed read 不联网 / 不写库（只读连接可跑通、空库不建表）、
 （直接扫描 writer 源码）、`first_seen_at` 跨重抓不可变、同 identity 读 durable 行）。
 
 `backend/test_ai_research_news_adapter.py`：NEWS-03 / 04 / 09 / 10 / 12 / 17 / 18 / 19 /
-20 / 21 / 22 / 25 / 26 / 31 / 32 / 33（复用 `EVIDENCE_SOURCE_NEWS`、kind 自动为
+20 / 21 / 22 / 25 / 26 / 31 / 32 / 33 / 34（复用 `EVIDENCE_SOURCE_NEWS`、kind 自动为
 `news_observed`、grade A/B/C 都不升级、`single_source_linked` → `unverified`、
 dict / 子类 / duck type 全部拒绝、指纹确定性与敏感性、payload 不能覆盖核验、
 未来证据不能进入更早事件、registry 三方双向一致、production 调用点 = 0、
-签名只接受 owner 投影、adapter 是纯的（不 import DB / 网络 / 时钟））。
+签名只接受 owner 投影、adapter 是纯的（不 import DB / 网络 / 时钟）、
+`availability_day` 归一到 owner 时区（跨 UTC 午夜与 +14:00 对照））。
 
 `backend/test_ai_research_evidence_ownership_guard.py`：`EXPECTED_OWNER_FACTORIES` 与
 `APPROVED_ISSUER_CALLERS` 各增加 news 一行，最终 caller set 恰好四个 owner factory。
@@ -2575,7 +2576,7 @@ dict / 子类 / duck type 全部拒绝、指纹确定性与敏感性、payload �
 最新那条正是让旧接缝静默失效的形状。注意 news owner（`news_learning`）本身是 ingestion
 writer，**允许**在写路径联网，因此它刻意不在网络闭集里；被登记的是它的 typed 读接缝。
 
-语义 mutation 在 `work/r27b2c5_news_owner_mutation_check.py`（M-NEWS-01 ~ 17）必须全部
+语义 mutation 在 `work/r27b2c5_news_owner_mutation_check.py`（M-NEWS-01 ~ 18）必须全部
 CAUGHT（baseline GREEN、survived = 0、fake = 0、timeout = 0、三个被改写文件的 restore
 sha256 一致），并且每条都指定了由哪条**永久**回归捕获。
 
@@ -2722,7 +2723,13 @@ news 事实的历史可用性被发布时间提前（R27-B2C-5：news 的 availa
 first_seen=9/21 的事件在 `as_of=9/20` 必须不可见，created_at 更晚也不得把它推出窗口。
 PIT 不可证明（缺失 / 畸形 / naive）时整次读取 fail closed，**没有** `published_at` /
 `created_at` / `now()` fallback。边界比较在 Python 侧逐行解析完成，不把 ISO 文本交给
-SQL 字典序 —— 那等于假设每一行的 offset 都和 owner 一样）
+SQL 字典序 —— 那等于假设每一行的 offset 都和 owner 一样。**owner instant 必须归一到
+owner 时区**（Asia/Shanghai）之后才派生业务日：`first_seen_at` 允许带任意 offset，
+`2026-09-20T16:30+00:00` 在上海已经是 9/21 00:30，它的业务日必须是 9/21。若照抄原始
+offset 的 `.date()`，projection 会声明一个**比真实可用日更早**的业务日，于是
+`InformationEvent` 的 look-ahead guard 被绕过 —— read 的日边界（`as_of + 23:59:59+08:00`）
+与 projection 的 `availability_day` 必须是**同一套**日历口径。绝对时刻的比较与时区无关，
+受影响的是**由它派生的日历日**）
 live provider fetch 被当成历史证据读（R27-B2C-5：typed news 读只发 SELECT、不建表、
 不联网；ledger 不可读时 fail closed 成 `ledger_unavailable`，**不得**触发
 `capture_events` / `capture_major_events` 的 ingestion fetch 或 backfill。这条边界是

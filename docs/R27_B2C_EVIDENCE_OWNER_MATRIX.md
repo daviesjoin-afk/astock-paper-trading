@@ -1179,6 +1179,9 @@ convergence），因此 news adapter 的 production 调用点今天仍然是 **0
 
 ```text
 availability authority                     first_seen_at（exact timestamp）
+availability_day 口径                      first_seen_at 归一到 **owner 时区**（Asia/Shanghai）
+                                           之后的日历日；与 read 的 as_of+23:59:59+08:00
+                                           日边界是同一套口径
 published_at                               描述性来源时间（只进 payload / detail，永不进 as_of）
 evidence_grade                             provenance / traceability 元数据，**不是**核验
 market_major verification_status           owner 词汇；当前**审计过的** writer 闭集
@@ -1191,6 +1194,15 @@ typed read 的网络访问                      0（不联网、不建表、不�
 adapter                                    ai_research_news_adapter（唯一接缝）
 runtime `_event_evidence` 迁移              OPEN / later（本轮**没有**迁移）
 ```
+
+**复审修正（#206 review）—— 跨 offset 的 `availability_day` 是 PIT blocker**：第一版的
+`_parse_owner_instant` 返回**未归一**的 instant，于是 `availability_day` 取自**原始
+offset** 的 `.date()`，而 read 的日边界取自上海日末 —— 同一件事有了两套日历口径。一个
+`first_seen_at = 2026-09-20T16:30+00:00`（上海其实是 9/21 00:30）的事件会读出
+`availability_day = 2026-09-20`，让 `ResearchEvidenceRef.as_of` 声明一个**比真实可用日更早**
+的业务日，进而使 `InformationEvent(as_of="2026-09-20")` 通过 look-ahead guard。修正：owner
+instant 解析后 `astimezone(TZ)` 再派生日历日；并用 `NEWS-34`（含反向对照
+`2026-09-21T01:00+14:00` ⇒ 上海 9/20 19:00 ⇒ 业务日 9/20）与 `M-NEWS-18` 双向钉住。
 
 `CURRENT NEWS OWNER HAS NO VERIFIED STATE` 是本轮审计出来的**事实**：整个仓库只有一处
 `verification_status` writer，没有任何 UPDATE / 第二 writer / 多源复算路径能把它升级，

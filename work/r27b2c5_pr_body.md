@@ -45,6 +45,11 @@ ARC.ResearchEvidenceRef(source_type="news")
 1. **`first_seen_at` 是唯一的 historical availability authority。**
    `published_at`（来源声称的发布时间）与 `created_at`（行写入时刻）在任何方向上都不得改变
    可用性。`published=9/20`、`first_seen=9/21` 的事件在 `as_of=9/20` **必须不可见**。
+   `availability_day` 还必须把 owner instant **归一到 owner 时区**（Asia/Shanghai）之后再
+   派生：`first_seen_at="2026-09-20T16:30+00:00"` 在上海已经是 9/21 00:30，业务日必须是
+   9/21。若照抄原始 offset 的 `.date()`，ref 会声明一个比真实可用日更早的业务日，从而绕过
+   `InformationEvent` 的 look-ahead guard —— read 的日边界（`as_of + 23:59:59+08:00`）与
+   projection 的 `availability_day` 必须是**同一套**日历口径。
 2. **PIT 不可证明时 fail closed。** 缺失 / 畸形 / naive 的 `first_seen_at` 一律拒绝，
    **没有** `published_at` / `created_at` / `now()` fallback。
 3. **typed read 不联网、不写库。** 只发 SELECT、不建表；ledger 不可读时 fail closed 成
@@ -145,6 +150,16 @@ event_evidence runtime convergence = DEFERRED
 使两条路径中的一条实际上不受回归保护。修正是**去掉重复**（闭集合法性只有一处判定，与
 `paper_portfolio_read_model` 的"校验逻辑只有一份"一致），而不是给变异找借口。
 
+**一处被 review 抓出来的 PIT blocker（已修，同一 PR，不扩大范围）**：第一版的
+`_parse_owner_instant` 返回**未归一**的 instant，`availability_day` 因此取自**原始 offset**
+的 `.date()`，而 read 的日边界取自上海日末 —— 同一件事有了两套日历口径。
+`first_seen_at="2026-09-20T16:30+00:00"`（上海 9/21 00:30）会读出
+`availability_day="2026-09-20"`，于是 `ResearchEvidenceRef.as_of` 声明了一个**比真实可用日
+更早**的业务日，`InformationEvent(as_of="2026-09-20")` 反而能通过 look-ahead guard。修正为
+解析后 `astimezone(TZ)`（exact timestamp 仍逐字保留在 `first_seen_at` 里），并用
+`NEWS-34` + `M-NEWS-18` 双向钉住，含反向 offset 对照
+（`2026-09-21T01:00+14:00` ⇒ 上海 9/20 19:00 ⇒ 业务日 9/20）。
+
 ## 变更清单
 
 **production（3 个文件）**
@@ -172,8 +187,8 @@ event_evidence runtime convergence = DEFERRED
 **回归与验证（3 个文件）**
 
 - `backend/test_news_fact_contract.py`（新增）：NEWS-01 ~ 30（owner 侧）。
-- `backend/test_ai_research_news_adapter.py`（新增）：NEWS-03 ~ 33（research 侧）。
-- `work/r27b2c5_news_owner_mutation_check.py`（新增）：M-NEWS-01 ~ 17。
+- `backend/test_ai_research_news_adapter.py`（新增）：NEWS-03 ~ 34（research 侧）。
+- `work/r27b2c5_news_owner_mutation_check.py`（新增）：M-NEWS-01 ~ 18。
 
 **文档（2 个文件）**
 
@@ -192,18 +207,21 @@ L1  python --version                        3.14.5
 
 L2  focused
     test_news_fact_contract                 17 tests PASS
-    test_ai_research_news_adapter           16 tests PASS
+    test_ai_research_news_adapter           17 tests PASS
     test_ai_research_evidence_ownership_guard / test_ai_research_contract /
     test_ai_provider_transport / test_ai_research_service        PASS
     test_ai_research_execution_adapter / test_ai_research_portfolio_adapter
     test_portfolio_fact_contract / test_execution_fact_contract  PASS
 
 L3  work/r27b2c5_news_owner_mutation_check.py
-    baseline = GREEN（29 个永久回归目标先于 mutation 验证）
-    detected = 17/17   survived = 0   fake = 0   timeout = 0
+    baseline = GREEN（30 个永久回归目标先于 mutation 验证）
+    detected = 18/18   survived = 0   fake = 0   timeout = 0
     restore sha256 = PASS（adapter / news_learning / contract 三个被改写文件）
 
-L4  python -m unittest discover -s backend -p "test_*.py"   见 CI / 本地记录
+L4  python -m unittest discover -s backend -p "test_*.py"
+    4541 tests，OK，failures = 0，errors = 0，skipped = 5
+    （skip 全部是环境条件跳过：完整 checkout / git 可用性 / pandas / POSIX shell /
+      精简镜像缺 docs 等，与 news 无关）
 
 CI  见 "GitHub Actions checks on current PR HEAD"（tests / syntax / quality /
     docker-smoke / frontend / browser-e2e (chromium) / security-leak-scan）
