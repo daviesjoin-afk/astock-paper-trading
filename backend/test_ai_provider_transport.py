@@ -1040,6 +1040,16 @@ def _code_string_constants(tree):
             and id(node) not in docstrings]
 
 
+#: RG-03 认定的"直接网络调用"词表。字符串层判定，不做 CFG/dataflow —— 目标是挡住
+#: honest mistake（某个接缝里加一次 ``urlopen`` 去拉行情/兜底估值），不是挡住刻意混淆。
+NETWORK_CALL_TOKENS = ("urllib", "urlopen", "requests.", "httpx", "socket.")
+
+
+def _direct_network_tokens(source: str) -> list[str]:
+    """返回源码里出现的直接网络 token（空列表 = 通过 RG-03 的判定）。"""
+    return [token for token in NETWORK_CALL_TOKENS if token in source]
+
+
 RESEARCH_MODULE = "ai_research_provider.py"
 TRANSPORT_MODULE = "ai_provider_transport.py"
 #: R27-B2A 的 canonical research 持久化 owner（**不是** authority，也不联网）。
@@ -1048,6 +1058,23 @@ REPOSITORY_MODULE = "ai_research_repository.py"
 SERVICE_MODULE = "ai_research_service.py"
 #: R27-B2C-3 的 execution owner 接缝（**不是** authority；只做词表归口，不联网、不碰 DB）。
 EXECUTION_ADAPTER_MODULE = "ai_research_execution_adapter.py"
+#: R27-B2C-4B 的 portfolio/accounting owner 接缝（**不是** authority；与 execution 那一份
+#: 同构：只做词表归口，不联网、不碰 DB）。
+PORTFOLIO_ADAPTER_MODULE = "ai_research_portfolio_adapter.py"
+
+#: RG-03 的扫描闭集：这些接缝**都不得**直接持有网络调用（真实网络调用只属于 transport）。
+#: 写成显式闭集而不是"扫全部文件"是有意的 —— 新增一个接缝必须是一次有意识的登记，
+#: 而漏登记的后果正是本 guard 对新接缝静默失效（OCR 在 #200 上抓到的就是这个缺口：
+#: RG-04 / RG-05 登记了新接缝，RG-03 没有）。
+#: 注意它**不是** RG-08 的 provider chain：execution / portfolio 两份 owner adapter
+#: 都不属于 provider runtime 链路，因此刻意不进 RG-08。
+NETWORK_FREE_SEAMS = (
+    RESEARCH_MODULE,
+    REPOSITORY_MODULE,
+    SERVICE_MODULE,
+    EXECUTION_ADAPTER_MODULE,
+    PORTFOLIO_ADAPTER_MODULE,
+)
 
 ALLOWED_RESEARCH_IMPORTS = {
     "__future__", "collections", "dataclasses", "typing", "json",
@@ -1115,19 +1142,61 @@ class AiResearchProviderArchitectureGuardTests(unittest.TestCase):
                 self.assertNotIn(forbidden, called, f"{RESEARCH_MODULE} 调用了 {forbidden}()")
 
     def test_RG_03_real_network_calls_live_only_in_the_transport(self):
-        """RG-03：真实网络调用只出现在 ai_provider_transport。"""
+        """RG-03：真实网络调用只出现在 ai_provider_transport。
+
+        ``NETWORK_FREE_SEAMS`` 里的每一个接缝（research provider / persistence owner /
+        orchestration boundary / execution owner adapter / portfolio-accounting owner
+        adapter）都不得直接持有网络调用。聚合成一个等值断言而不是逐条 ``subTest``：
+        (a) 失败信息一次列全所有 ``module: token``；(b) 断言可被
+        :meth:`test_RG_03b_...` 用 in-memory mutation 直接驱动成 RED。
+        """
         transport_tree = _tree(TRANSPORT_MODULE)
         self.assertIn("urllib", _imported_roots(transport_tree))
         self.assertIn("urlopen", _called_names(transport_tree))
 
-        # research contract / typed adapter / persistence owner / orchestration boundary
-        # / execution owner 接缝 都没有直接网络调用。
-        for name in (RESEARCH_MODULE, REPOSITORY_MODULE, SERVICE_MODULE,
-                     EXECUTION_ADAPTER_MODULE):
-            source = _source(name)
-            for token in ("urllib", "urlopen", "requests.", "httpx", "socket."):
-                with self.subTest(module=name, token=token):
-                    self.assertNotIn(token, source, f"{name} 直接持有网络调用")
+        offenders = [
+            f"{name}: {token}"
+            for name in NETWORK_FREE_SEAMS
+            for token in _direct_network_tokens(_source(name))
+        ]
+        self.assertEqual(
+            [], offenders,
+            f"非 transport 接缝直接持有网络调用：{offenders}",
+        )
+
+    def test_RG_03b_every_registered_seam_is_really_scanned_for_network_calls(self):
+        """RG-03 非空性：登记进闭集的接缝必须**真的**被 RG-03 扫描。
+
+        只断言 ``PORTFOLIO_ADAPTER_MODULE in NETWORK_FREE_SEAMS`` 是自我验证 —— 它证明
+        不了 RG-03 的判定在那条新接缝上会开口（登记了但扫描逻辑不认，等于装饰）。这里做
+        一次 in-memory mutation：把 portfolio adapter 的源码临时替换成含
+        ``urllib.request.urlopen`` 的版本，要求 RG-03 **变 RED**；换回原源码必须重新
+        GREEN。两步都成立才说明这次登记是有效的守卫。
+        """
+        self.assertIn(PORTFOLIO_ADAPTER_MODULE, NETWORK_FREE_SEAMS)
+
+        clean_source = _source(PORTFOLIO_ADAPTER_MODULE)
+        self.assertEqual(
+            [], _direct_network_tokens(clean_source),
+            "portfolio adapter 当前已持有网络调用 —— 这条非空性断言就是最后一道防线",
+        )
+
+        tainted = clean_source + (
+            "\n\n_TAINT = urllib.request.urlopen('https://example.invalid')\n")
+        original_source = globals()["_source"]
+
+        def _tainted(name):
+            return tainted if name == PORTFOLIO_ADAPTER_MODULE else original_source(name)
+
+        globals()["_source"] = _tainted
+        try:
+            with self.assertRaises(AssertionError):
+                self.test_RG_03_real_network_calls_live_only_in_the_transport()
+        finally:
+            globals()["_source"] = original_source
+
+        # 恢复后必须重新 GREEN —— RED 来自那次注入，而不是 guard 本来就坏。
+        self.test_RG_03_real_network_calls_live_only_in_the_transport()
 
     def test_RG_04_no_authority_module_reverse_imports_ai(self):
         """RG-04：authority → AI 的依赖必须为 0。"""

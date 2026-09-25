@@ -34,9 +34,12 @@ baseline 规则（OCR finding 的修正）：``--non-vacuity`` 开关已删除�
 ``subprocess.TimeoutExpired`` 记 ``TIMEOUT``；baseline 抛则记 ``BASELINE-TIMEOUT``，
 两者都让 matrix FAIL。把超时折叠进 "被杀死"，等于把一个从未作出判定的运行发布成有效证据。
 
-``--only`` 的选择语义**绝不能静默变化**：除正常形态（``--only <ids>`` / ``--only=<ids>``）之外的
-任何 ``--only*`` 拼写、空 id 列表、重复 selector，都是受控 ERROR + exit 2，而不是"没有 selector
-所以跑全量 matrix"——操作者请求 targeted mutation 时，覆盖范围不能因为 CLI 拼写问题被悄悄放大。
+CLI 的选择语义**绝不能静默变化**：受支持的形式只有 ``--only <ids>`` 与 ``--only=<ids>``。
+除此之外的任何 argv —— ``--only*`` 的拼写错误、空 id 列表、重复 selector，以及
+``--onl M-PFACT-1`` / ``--dry-run`` / 裸位置参数这类完全不认识的 token —— 都是受控
+ERROR + exit 2，而不是"没有 selector 所以跑全量 matrix"。操作者请求 targeted mutation 时，
+覆盖范围绝不能因为 CLI 拼写问题被悄悄放大：``--onl`` 连 ``--only`` 前缀都不匹配，
+静默忽略它等于把"只跑 1 条"变成"跑 10 条"。
 
 本文件自身的硬不变量**不使用 Python ``assert``**：``python -O`` 会剥除 assert，而证据链的守卫
 不能因为一个优化开关消失。所有 runtime evidence 断言走 :func:`_require`（显式 ``RuntimeError``），
@@ -396,12 +399,25 @@ def _cli_probe(argv: list[str], timeout: int = 300) -> tuple[int, str]:
     return proc.returncode, (proc.stdout or "") + (proc.stderr or "")
 
 
+def _assert_cli_rejected(argv: list[str]) -> None:
+    """真实 CLI 上，一个非法 argv 必须 exit 2 + 受控 ERROR，且不进入任何执行阶段。
+
+    ``selected:`` 只在参数与选择都通过之后才打印，因此它的缺席直接证明这次调用
+    没有走到 selection / baseline / mutation —— 也就不会改写 production source。
+    """
+    code, blob = _cli_probe(argv)
+    _require(code == 2, f"{argv}: expected exit 2, got {code}: {blob[:200]}")
+    _require("Traceback" not in blob, f"{argv}: must not raise a bare traceback: {blob[:200]}")
+    _require("ERROR:" in blob, f"{argv}: expected a controlled ERROR: {blob[:200]}")
+    _require("selected:" not in blob, f"{argv}: must not reach the mutation phase")
+
+
 def self_test_semantics() -> None:
     """在临时目录里自证分类语义（stub 掉真实 runner，不触碰任何 production source）。
 
     覆盖：anchor 唯一性、BASELINE-RED / BASELINE-TIMEOUT 且不进入 mutation、CAUGHT、
     SURVIVED、FAKE（四类接线错误）、TIMEOUT、restore sha256 硬失败、byte-identical
-    还原、``--only`` 的全部参数边界。
+    还原、``--only`` 选择器与 argv 白名单的全部参数边界。
     """
     root = tempfile.mkdtemp(prefix="r27b2c4b_mutation_semantics_")
     rel = "semantics_target.py"
@@ -533,15 +549,46 @@ def self_test_semantics() -> None:
         _require(only is None and isinstance(err, str) and err.startswith("ERROR:"),
                  f"{argv} must be a controlled ERROR, got {(only, err)}")
 
+    # 9b) argv 白名单（main 真正走的入口）：不认识的 token 不是"没有 selector"，
+    #     不能被静默忽略成一次全量 matrix。
+    _require(_parse_argv([]) == (None, None), "empty argv must mean the full matrix")
+    for argv, ids in (
+        (["--only", "M-PFACT-1"], {"M-PFACT-1"}),
+        (["--only=M-PFACT-1"], {"M-PFACT-1"}),
+    ):
+        _require(_parse_argv(argv) == (ids, None), f"{argv} must select {ids}")
+    _require(_parse_argv(["--only", "UNKNOWN-ID"]) == ({"UNKNOWN-ID"}, None),
+             "an unknown id is a selection miss, not a parse error")
+    for argv in (
+        ["--only"],
+        ["--only="],
+        ["--onlyy=M-PFACT-1"],
+        ["--onl", "M-PFACT-1"],
+        ["--dry-run"],
+        ["foo"],
+        ["--only", "M-PFACT-1", "foo"],
+        ["--only", "M-PFACT-1", "--only", "M-PFACT-2"],
+        ["--non-vacuity"],
+    ):
+        only, err = _parse_argv(argv)
+        _require(only is None and isinstance(err, str) and err.startswith("ERROR:"),
+                 f"{argv} must be a controlled ERROR, got {(only, err)}")
+
     # 10) 同一条边界在**真实 CLI** 上：exit 2、受控 ERROR、不抛裸 traceback、
-    #     不进 baseline 阶段（因此一个字节的 mutation 都不会落盘）。
-    for argv in (["--only"], ["--only="], ["--onlyy=M-PFACT-1"],
+    #     不进选择/baseline/mutation 阶段，且 production source 逐字节不变。
+    guarded = {}
+    for name in (OWNER, ADAPTER):
+        with open(os.path.join(ROOT, name), "rb") as handle:
+            guarded[name] = sha256(handle.read())
+    for argv in (["--only"], ["--only="], ["--onlyy=M-PFACT-1"], ["--onl", "M-PFACT-1"],
+                 ["--dry-run"], ["foo"], ["--non-vacuity"],
+                 ["--only", "M-PFACT-1", "foo"],
                  ["--only", "M-PFACT-1", "--only", "M-PFACT-2"]):
-        code, blob = _cli_probe(argv)
-        _require(code == 2, f"{argv}: expected exit 2, got {code}: {blob[:200]}")
-        _require("Traceback" not in blob, f"{argv}: must not raise a bare traceback: {blob[:200]}")
-        _require("ERROR:" in blob, f"{argv}: expected a controlled ERROR: {blob[:200]}")
-        _require("baseline" not in blob, f"{argv}: must not enter the baseline phase")
+        _assert_cli_rejected(argv)
+    for name, before in guarded.items():
+        with open(os.path.join(ROOT, name), "rb") as handle:
+            _require(sha256(handle.read()) == before,
+                     f"{name} 被一次被拒的 CLI 调用改动了")
     #     --only=<ids> 必须真的走到选择阶段（不是被解析层拒掉）：未知 id → 空选择。
     code, blob = _cli_probe(["--only=NO-SUCH-MUTATION"])
     _require(code == 2, f"--only=<ids>: expected exit 2, got {code}: {blob[:200]}")
@@ -757,17 +804,53 @@ def _parse_only(argv: list[str]) -> tuple[set[str] | None, str | None]:
     return ids, None
 
 
+def _parse_argv(argv: list[str]) -> tuple[set[str] | None, str | None]:
+    """argv 白名单 + ``--only`` 选择器；返回 ``(selected_ids, error_message)``，两者互斥。
+
+    与 :func:`_parse_only` 同构的三态，但把"不认识的 token"也算进来：
+
+    1. 无参数 → ``(None, None)`` → 默认 full matrix；
+    2. 合法请求 → ``(ids, None)``；
+    3. 其余一律 ``(None, "ERROR: ...")`` → 调用方 exit 2。
+
+    **不做静默忽略**：``--onl M-PFACT-1`` / ``--dry-run`` / ``foo`` 都不是"没有 selector"，
+    而是参数错误。理由与 ``--only`` 那条完全相同 —— 操作者请求 targeted mutation 时，
+    实际覆盖范围绝不能因为 CLI 拼写问题被悄悄放大成全量 matrix。
+
+    被显式拒绝的 ``--non-vacuity`` 也在这里判定，保证参数判定只有一个入口：
+    任何 argv 先过白名单，再交给 :func:`_parse_only` 判选择器形态。
+    """
+    if "--non-vacuity" in argv:
+        return None, (
+            "ERROR: --non-vacuity 已删除。baseline 现在是 matrix 的强制前提，"
+            "无条件先于任何 mutation 运行，没有开关。"
+        )
+    unknown: list[str] = []
+    expects_value = False
+    for token in argv:
+        if expects_value:
+            # ``--only`` 的取值 token：它就是 mutation id，形态交给 _parse_only 判。
+            expects_value = False
+        elif token == "--only":
+            expects_value = True
+        elif token.startswith("--only"):
+            continue
+        else:
+            unknown.append(token)
+    if unknown:
+        return None, (
+            f"ERROR: unrecognized argument(s) {unknown}；受支持的形式只有 "
+            "--only <ids> 与 --only=<ids>（以及被显式拒绝的 --non-vacuity）。"
+            "未知 token 不会被当作'没有 selector'而跑全量 matrix。"
+        )
+    return _parse_only(argv)
+
+
 def main() -> int:
     print(f"repo root: {ROOT}")
-    argv = sys.argv[1:]
-    if "--non-vacuity" in argv:
-        print(
-            "ERROR: --non-vacuity 已删除。baseline 现在是 matrix 的强制前提，"
-            "无条件先于任何 mutation 运行，没有开关。",
-            flush=True,
-        )
-        return 2
-    only, parse_error = _parse_only(argv)
+    #: 参数判定只有一个入口：白名单 + 选择器形态。任何不认识的 token 都是受控 ERROR，
+    #: 绝不静默退化成"跑全量 matrix"。
+    only, parse_error = _parse_argv(sys.argv[1:])
     if parse_error:
         print(parse_error, flush=True)
         return 2
