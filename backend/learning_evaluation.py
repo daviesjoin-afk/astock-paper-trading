@@ -2122,6 +2122,595 @@ def _check_sample(code: str, asof: str, label_end: str, partition: str, target: 
     )
 
 
+# ──────────────────────────────────────────────────────────────────────────────
+# R27-B2C-6 —— experiment evaluation 的 typed owner fact contract
+# ──────────────────────────────────────────────────────────────────────────────
+#
+# ``learning_evaluation_manifests`` 是**追加式**事实（PK = ``evaluation_fingerprint``，
+# ``INSERT OR IGNORE``，从不改写）。这个形状决定了本段与候选表那两段完全不同的两个重点：
+#
+#     dataset cutoff      ≠ evaluation result availability
+#     evaluation admitted ≠ strategy verified
+#
+# **第一条。** ``cutoff`` 是**数据集内容冻结边界**，回答"这份数据集看到哪一天"。它**不是**
+# "这份评估什么时候产生"。把 9/20 的 cutoff 当成 9/20 的可用性，会让 9/21 才跑出来的评估
+# 被倒填进 9/20 的研究 —— 那正是 look-ahead。因此本段的 ``availability_day`` **只**从
+# evaluation manifest 自己的 ``created_at`` 派生；``cutoff`` 作为**事实字段**保留（它归属
+# 于 ``learning_dataset`` 的 manifest，本段只读不改）。
+#
+# **第二条。** ``evaluation_contract_ok`` / ``evaluation_blockers`` 回答的是"这份评估是否
+# 通过它自己的契约门禁"。它**不是**"这个策略为真"，也**不是**"候选应该晋级"。因此本段
+# **不**把它们映射成 owner verification：核验闭集只回答"这条评估结果是不是 owner 自洽签发
+# 的事实"。一个 ``evaluation_contract_ok=False`` 的评估完全可以是一条**owner 已核验的
+# 事实**（"科学门禁明确判定这次评估不通过"本身是可信事实）—— 这与 execution 侧
+# "not_executed but verified fact" 是同一种语义区分。
+#
+# 同理，``promotion_science`` 的 ``promotable`` 是**晋升结论**，不是核验结论：
+# ``evaluable=True, promotable=False`` 同样是一条可信事实。本段**不**读 promotion verdict，
+# 也不把 ``promotable`` 当成"这条证据可信"的定义。
+
+EXPERIMENT_FACT_CONTRACT_VERSION = "experiment-evaluation-fact-v1"
+EXPERIMENT_EVALUATION_RECORD_KIND = "experiment_evaluation"
+
+#: owner 签发的**极小** factual verification 闭集。
+#:
+#: * ``experiment_evaluation_recorded``：owner 能证明这条评估 manifest 是**它自己签发**的、
+#:   必要归一列齐全且自洽的事实（含数据集冻结边界可证）。含义**仅**是"这是一条可靠的
+#:   owner 事实"，**不是**"这个策略被验证为真"，也**不是**"值得晋级"。
+#: * ``experiment_evaluation_unproven``：manifest 可读，但 owner **无法自证**一条必要维度
+#:   —— 今天唯一的真实情形是**数据集 manifest 不存在**，于是内容冻结边界不可证。
+#:   记录仍然是事实，但 owner 不为它的完整性背书，因此它在 research 层只能是 ``unverified``。
+EXPERIMENT_FACT_RECORDED = "experiment_evaluation_recorded"
+EXPERIMENT_FACT_OWNER_UNPROVEN = "experiment_evaluation_unproven"
+EXPERIMENT_FACT_VERIFICATION_STATUSES = (
+    EXPERIMENT_FACT_RECORDED, EXPERIMENT_FACT_OWNER_UNPROVEN,
+)
+
+#: typed 读侧要求的**必需**归一列（evaluation manifest 侧）。
+_EXPERIMENT_REQUIRED_COLUMNS = (
+    "evaluation_fingerprint", "dataset_fingerprint", "model_id", "holdout_partition",
+    "metric", "scoring", "prediction_digest", "evaluated_dates", "evaluated_rows",
+    "dropped_dates", "per_date_ic", "exclusion_reasons", "evaluation_blockers",
+    "evaluation_contract_ok", "created_at",
+)
+
+
+class ExperimentFactContractError(ValueError):
+    """typed experiment fact 读侧的 **fail closed** 拒绝。
+
+    manifest 缺列、JSON 列坏掉、``created_at`` 不是可解析的**带时区**瞬间 —— 一律抛这个
+    错误，而不是沿用 legacy 读侧 ``read_evaluation_manifest`` 的宽松行为（它在 JSON 解析
+    失败时**保留原字符串**）。宽松读法对展示无害，但会让 typed evidence path 把一份损坏的
+    评估当成可引用事实。
+    """
+
+
+def _experiment_instant(value: Any, *, what: str) -> _dt.datetime:
+    """owner 的**结果可用瞬间** —— 必须显式、可解析、带时区。"""
+    text = _text(value)
+    if text is None:
+        raise ExperimentFactContractError(f"{what} is required for a typed experiment fact")
+    try:
+        parsed = _dt.datetime.fromisoformat(text)
+    except ValueError as exc:
+        raise ExperimentFactContractError(
+            f"{what} is not a parsable owner instant: {text!r}"
+        ) from exc
+    if parsed.tzinfo is None or parsed.tzinfo.utcoffset(parsed) is None:
+        raise ExperimentFactContractError(
+            f"{what} must be timezone-aware; got naive {text!r} — "
+            "结果可用瞬间不可证明，禁止用本地时区猜"
+        )
+    return parsed
+
+
+def _exchange_day(instant: _dt.datetime, *, what: str) -> str:
+    """交易所时区（Asia/Shanghai，即 UTC+8）归一后的业务日。
+
+    与 dataset 层同一条规则（见 :data:`_EXCHANGE_TZ`）：**不接受**原始 offset 的日期。
+    ``2026-09-20T16:30+00:00`` 在上海已经是 9/21 00:30，业务日必须是 9/21。
+    """
+    return instant.astimezone(_EXCHANGE_TZ).date().isoformat()
+
+
+def _experiment_day(value: Any, *, what: str) -> str:
+    """显式、canonical 的 ``YYYY-MM-DD`` 业务日。**没有默认值，也不看今天。**"""
+    text = _text(value)
+    if text is None or not _DATE_ONLY.match(text):
+        raise ExperimentFactContractError(
+            f"{what} requires an explicit canonical YYYY-MM-DD business day; got {value!r}"
+        )
+    return text
+
+
+def _experiment_json(value: Any, *, what: str) -> Any:
+    """JSON 列的**严格** parse。坏 JSON → fail closed（绝不保留原字符串、绝不 ``{}``）。"""
+    text = _text(value)
+    if text is None:
+        raise ExperimentFactContractError(f"{what} is required for a typed experiment fact")
+    try:
+        return json.loads(text)
+    except ValueError as exc:
+        raise ExperimentFactContractError(f"{what} is not parsable JSON: {exc}") from exc
+
+
+def _experiment_mapping(value: Any, *, what: str) -> dict:
+    parsed = _experiment_json(value, what=what)
+    if not isinstance(parsed, dict):
+        raise ExperimentFactContractError(
+            f"{what} must parse to a JSON object; got {type(parsed).__name__}"
+        )
+    return parsed
+
+
+def _experiment_canonical(value: Any, *, what: str) -> str:
+    """确定性 canonical 文本。NaN / Inf → fail closed。"""
+    try:
+        return json.dumps(
+            value, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False,
+        )
+    except (TypeError, ValueError) as exc:
+        raise ExperimentFactContractError(f"{what} is not canonically serializable: {exc}") from exc
+
+
+def _experiment_count(value: Any, *, what: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ExperimentFactContractError(f"{what} must be an integer, got {value!r}")
+    return int(value)
+
+
+def _experiment_number_text(value: Any, *, what: str) -> Optional[str]:
+    """canonical 数值列的**原样**保留；不可解析或非有限 → fail closed。
+
+    刻意不做 ``or 0.0``：把"缺失的 IC"读成 0 就是一个被制造出来的度量。
+    """
+    text = _text(value)
+    if text is None:
+        return None
+    if _finite(text) is None:
+        raise ExperimentFactContractError(f"{what} is not a finite number: {value!r}")
+    return text
+
+
+@dataclass(frozen=True)
+class ExperimentEvaluationProjection:
+    """**learning_evaluation owner 自己签发**的评估事实投影 —— 一次不可变快照。
+
+    它只回答事实层问题：这份评估**是哪一份**（``evaluation_fingerprint``）、它引用的数据集
+    是哪一份（``dataset_fingerprint`` + ``dataset_cutoff``）、什么时候**才可用**
+    （``result_available_at`` / ``availability_day``）、以及 owner 能不能自证它是自己签发的
+    事实（``fact_verification_status``）。
+
+    它**不**回答"这个策略够不够好"：``evaluation_contract_ok`` / ``evaluation_blockers`` /
+    ``evaluation_admitted`` 都是**事实字段**，不是核验维度；``promotable`` 根本不在其中。
+
+    ``cutoff`` 与 ``result_available_at`` 的区分是本类的核心：前者是数据集内容冻结边界，
+    后者是结果产生的瞬间。``availability_day`` **只**由后者派生。
+
+    已知限制与候选侧一致：contract-issued ≠ physical database origin；physical provenance
+    仍是 OPEN / REQUIRED。
+    """
+
+    version: str
+    record_kind: str
+    evaluation_fingerprint: str
+    dataset_fingerprint: str
+    dataset_cutoff: str
+    contract_version: str
+    metric: str
+    holdout_partition: str
+    scoring_canonical: str
+    prediction_digest: str
+    evaluated_dates: int
+    evaluated_rows: int
+    dropped_dates: int
+    mean_rank_ic: Optional[str]
+    ic_std: Optional[str]
+    ic_std_error: Optional[str]
+    ic_lower_bound: Optional[str]
+    per_date_ic_canonical: str
+    exclusion_reasons_canonical: str
+    evaluation_blockers: tuple
+    evaluation_contract_ok: bool
+    coverage_canonical: str
+    holdout_canonical: str
+    model_id: str
+    model_version: Optional[str]
+    model_artifact_fingerprint: Optional[str]
+    training_dataset_fingerprint: Optional[str]
+    trained_through: Optional[str]
+    selection_partition: Optional[str]
+    provenance_fingerprint: Optional[str]
+    result_available_at: str
+    availability_day: str
+    fact_verification_status: str
+    content_fingerprint: str = ""
+
+    def __post_init__(self) -> None:
+        record_kind = str(self.record_kind or "").strip()
+        if record_kind != EXPERIMENT_EVALUATION_RECORD_KIND:
+            raise ExperimentFactContractError(
+                f"unknown experiment fact record_kind: {record_kind!r}; "
+                f"allowed: {EXPERIMENT_EVALUATION_RECORD_KIND!r}"
+            )
+        object.__setattr__(self, "record_kind", record_kind)
+        object.__setattr__(
+            self, "version", str(self.version or "").strip() or EXPERIMENT_FACT_CONTRACT_VERSION,
+        )
+        for name in ("evaluation_fingerprint", "dataset_fingerprint", "metric", "holdout_partition"):
+            text = str(getattr(self, name) or "").strip()
+            if not text:
+                raise ExperimentFactContractError(f"experiment fact requires {name}")
+            object.__setattr__(self, name, text)
+        cutoff = _text(self.dataset_cutoff)
+        if cutoff is not None:
+            cutoff = _experiment_day(cutoff, what="experiment fact dataset_cutoff")
+        object.__setattr__(self, "dataset_cutoff", cutoff)
+        object.__setattr__(self, "contract_version", str(self.contract_version or "").strip())
+        for name in (
+            "prediction_digest", "model_id",
+        ):
+            object.__setattr__(self, name, str(getattr(self, name) or "").strip())
+        for name in (
+            "model_version", "model_artifact_fingerprint", "training_dataset_fingerprint",
+            "selection_partition", "provenance_fingerprint",
+        ):
+            text = _text(getattr(self, name))
+            object.__setattr__(self, name, text)
+        trained = _text(self.trained_through)
+        if trained is not None:
+            trained = _experiment_day(trained, what="experiment fact trained_through")
+        object.__setattr__(self, "trained_through", trained)
+
+        for name in ("evaluated_dates", "evaluated_rows", "dropped_dates"):
+            value = _experiment_count(getattr(self, name), what=f"experiment fact {name}")
+            if value < 0:
+                raise ExperimentFactContractError(
+                    f"experiment fact {name} must not be negative, got {value}"
+                )
+            object.__setattr__(self, name, value)
+        for name in ("mean_rank_ic", "ic_std", "ic_std_error", "ic_lower_bound"):
+            object.__setattr__(
+                self, name, _experiment_number_text(getattr(self, name), what=f"experiment fact {name}"),
+            )
+
+        blockers = self.evaluation_blockers
+        if isinstance(blockers, str) or not isinstance(blockers, (list, tuple)):
+            raise ExperimentFactContractError(
+                "experiment fact evaluation_blockers must be a sequence of strings; "
+                f"got {type(blockers).__name__}"
+            )
+        normalized = []
+        for item in blockers:
+            text = str(item or "").strip()
+            if not text:
+                raise ExperimentFactContractError(
+                    "experiment fact evaluation_blockers must not contain blank entries"
+                )
+            normalized.append(text)
+        object.__setattr__(self, "evaluation_blockers", tuple(normalized))
+        if not isinstance(self.evaluation_contract_ok, bool):
+            raise ExperimentFactContractError(
+                "experiment fact evaluation_contract_ok must be a bool, "
+                f"got {type(self.evaluation_contract_ok).__name__}"
+            )
+
+        for name in (
+            "scoring_canonical", "per_date_ic_canonical", "exclusion_reasons_canonical",
+            "coverage_canonical", "holdout_canonical",
+        ):
+            text = str(getattr(self, name) or "")
+            canonical = _experiment_canonical(
+                _experiment_mapping(text, what=f"experiment fact {name}"),
+                what=f"experiment fact {name}",
+            )
+            if canonical != text:
+                raise ExperimentFactContractError(
+                    f"experiment fact {name} is not canonical — 事实内容必须能确定性重算指纹"
+                )
+
+        available = _experiment_instant(
+            self.result_available_at, what="experiment fact result_available_at",
+        )
+        object.__setattr__(
+            self, "result_available_at", available.isoformat(timespec="seconds"),
+        )
+        day = _experiment_day(self.availability_day, what="experiment fact availability_day")
+        expected = _exchange_day(available, what="experiment result availability")
+        if day != expected:
+            raise ExperimentFactContractError(
+                f"experiment fact availability_day {day} disagrees with the exchange-local day "
+                f"derived from result_available_at ({expected}) — 可用性只能来自结果产生瞬间，"
+                "不得来自 dataset cutoff"
+            )
+
+        status = str(self.fact_verification_status or "").strip()
+        if status not in EXPERIMENT_FACT_VERIFICATION_STATUSES:
+            raise ExperimentFactContractError(
+                f"unknown experiment fact verification status: {status!r}; "
+                f"allowed: {EXPERIMENT_FACT_VERIFICATION_STATUSES}"
+            )
+        # 核验状态**不是**自由字段：它逐字等价于"内容冻结边界是否可证"。把两者绑死，
+        # 使 ``recorded`` 无法被一个没证明任何东西的调用方贴上来。
+        derived = (
+            EXPERIMENT_FACT_RECORDED if self.dataset_cutoff is not None
+            else EXPERIMENT_FACT_OWNER_UNPROVEN
+        )
+        if status != derived:
+            raise ExperimentFactContractError(
+                f"experiment fact verification status {status!r} contradicts dataset cutoff "
+                f"provability (expected {derived!r})"
+            )
+        object.__setattr__(self, "fact_verification_status", status)
+        object.__setattr__(self, "content_fingerprint", self._fingerprint())
+
+    # ---------- owner-derived identity / derived factual questions ----------
+
+    @property
+    def revision_identity(self) -> str:
+        """评估事实的 identity 就是 owner 的 content-addressed fingerprint。"""
+        return self.evaluation_fingerprint
+
+    @property
+    def identity(self) -> tuple:
+        return (self.record_kind, self.revision_identity, self.availability_day)
+
+    @property
+    def evaluation_admitted(self) -> bool:
+        """**派生的事实字段**，不是核验维度：这份评估是否通过它自己的契约门禁。
+
+        ``True`` **不**等于"策略为真"，``False`` 也**不**等于"这条事实不可信"。
+        """
+        return not self.evaluation_blockers
+
+    @property
+    def scoring(self) -> dict:
+        return json.loads(self.scoring_canonical)
+
+    @property
+    def per_date_ic(self) -> dict:
+        return json.loads(self.per_date_ic_canonical)
+
+    @property
+    def exclusion_reasons(self) -> dict:
+        return json.loads(self.exclusion_reasons_canonical)
+
+    @property
+    def coverage(self) -> dict:
+        return json.loads(self.coverage_canonical)
+
+    @property
+    def holdout(self) -> dict:
+        return json.loads(self.holdout_canonical)
+
+    def _fingerprint(self) -> str:
+        payload = {
+            "version": self.version,
+            "record_kind": self.record_kind,
+            "evaluation_fingerprint": self.evaluation_fingerprint,
+            "dataset_fingerprint": self.dataset_fingerprint,
+            "dataset_cutoff": self.dataset_cutoff,
+            "contract_version": self.contract_version,
+            "metric": self.metric,
+            "holdout_partition": self.holdout_partition,
+            "scoring": self.scoring_canonical,
+            "prediction_digest": self.prediction_digest,
+            "evaluated_dates": self.evaluated_dates,
+            "evaluated_rows": self.evaluated_rows,
+            "dropped_dates": self.dropped_dates,
+            "mean_rank_ic": self.mean_rank_ic,
+            "ic_std": self.ic_std,
+            "ic_std_error": self.ic_std_error,
+            "ic_lower_bound": self.ic_lower_bound,
+            "per_date_ic": self.per_date_ic_canonical,
+            "exclusion_reasons": self.exclusion_reasons_canonical,
+            "evaluation_blockers": list(self.evaluation_blockers),
+            "evaluation_contract_ok": self.evaluation_contract_ok,
+            "coverage": self.coverage_canonical,
+            "holdout": self.holdout_canonical,
+            "model_id": self.model_id,
+            "model_version": self.model_version,
+            "model_artifact_fingerprint": self.model_artifact_fingerprint,
+            "training_dataset_fingerprint": self.training_dataset_fingerprint,
+            "trained_through": self.trained_through,
+            "selection_partition": self.selection_partition,
+            "provenance_fingerprint": self.provenance_fingerprint,
+            "result_available_at": self.result_available_at,
+            "availability_day": self.availability_day,
+            "fact_verification_status": self.fact_verification_status,
+        }
+        encoded = json.dumps(
+            payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False,
+        )
+        return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+    def projection(self) -> dict:
+        return {
+            "version": self.version,
+            "record_kind": self.record_kind,
+            "identity": self.revision_identity,
+            "record_id": self.evaluation_fingerprint,
+            "dataset_fingerprint": self.dataset_fingerprint,
+            "dataset_cutoff": self.dataset_cutoff,
+            "metric": self.metric,
+            "holdout_partition": self.holdout_partition,
+            "evaluated_dates": self.evaluated_dates,
+            "evaluated_rows": self.evaluated_rows,
+            "mean_rank_ic": self.mean_rank_ic,
+            "ic_lower_bound": self.ic_lower_bound,
+            "evaluation_blockers": list(self.evaluation_blockers),
+            "evaluation_contract_ok": self.evaluation_contract_ok,
+            "evaluation_admitted": self.evaluation_admitted,
+            "result_available_at": self.result_available_at,
+            "availability_day": self.availability_day,
+            "fact_verification_status": self.fact_verification_status,
+            "content_fingerprint": self.content_fingerprint,
+            "authority": "owner_fact",
+            "evaluation_admitted_is_verification": False,
+        }
+
+
+def experiment_evaluation_fact(
+    conn: sqlite3.Connection, evaluation_fingerprint: str, *, as_of: Any
+) -> Optional[ExperimentEvaluationProjection]:
+    """把一份评估 manifest 读成 typed owner fact。``as_of`` **必须显式**。
+
+    ``availability_day`` 由 manifest 自己的 ``created_at``（**结果产生瞬间**）派生。它**不**
+    等于 dataset cutoff：把二者当成同一件事就是让 9/21 才跑出来的评估出现在 9/20 的研究里。
+
+    **fail-closed 的 PIT 语义**：``availability_day`` 晚于 ``as_of`` 时返回 ``None``
+    （UNAVAILABLE / not returned）。刻意**没有** ``as_of=None → latest``、没有墙钟、没有
+    ``today()``、也不按 fingerprint "取最近一份"。
+
+    manifest 不存在返回 ``None``；存在但结构损坏（缺列 / 坏 JSON / naive ``created_at``）
+    抛 :class:`ExperimentFactContractError`。数据集 manifest 不存在**不**抛错 —— 它是
+    "owner 无法证明内容冻结边界"这一**可表达**的事实，归 ``unproven``。
+    """
+    day = _experiment_day(as_of, what="experiment evaluation fact as_of")
+    fingerprint = _text(evaluation_fingerprint)
+    if fingerprint is None:
+        raise ExperimentFactContractError(
+            "experiment evaluation fact requires an explicit evaluation_fingerprint"
+        )
+    manifest = _row_as_dict(
+        conn,
+        f"SELECT * FROM {EVALUATION_MANIFEST_TABLE} WHERE evaluation_fingerprint=?",
+        (fingerprint,),
+    )
+    if manifest is None:
+        return None
+    missing = [name for name in _EXPERIMENT_REQUIRED_COLUMNS if name not in manifest]
+    if missing:
+        raise ExperimentFactContractError(
+            f"evaluation manifest {fingerprint} is missing required normalized columns: {missing}"
+        )
+    available = _experiment_instant(
+        manifest.get("created_at"), what="evaluation manifest created_at",
+    )
+    available_day = _exchange_day(available, what="evaluation manifest created_at")
+    if available_day > day:
+        return None
+
+    dataset_fingerprint = _text(manifest.get("dataset_fingerprint"))
+    if dataset_fingerprint is None:
+        raise ExperimentFactContractError(
+            f"evaluation manifest {fingerprint} carries no dataset_fingerprint"
+        )
+    dataset_manifest = _row_as_dict(
+        conn,
+        f"SELECT cutoff FROM {LD.MANIFEST_TABLE} WHERE dataset_fingerprint=?",
+        (dataset_fingerprint,),
+    )
+    cutoff = None if dataset_manifest is None else _text(dataset_manifest.get("cutoff"))
+
+    blockers_raw = _experiment_json(
+        manifest.get("evaluation_blockers"), what="evaluation manifest evaluation_blockers",
+    )
+    if not isinstance(blockers_raw, (list, tuple)):
+        raise ExperimentFactContractError(
+            "evaluation manifest evaluation_blockers must be a JSON array; "
+            f"got {type(blockers_raw).__name__}"
+        )
+    contract_ok = _experiment_count(
+        manifest.get("evaluation_contract_ok"), what="evaluation manifest evaluation_contract_ok",
+    )
+    if contract_ok not in (0, 1):
+        raise ExperimentFactContractError(
+            f"evaluation manifest evaluation_contract_ok must be 0 or 1, got {contract_ok}"
+        )
+
+    # 内容冻结边界不可证 → owner 不为本次评估的完整性背书（fail closed，但仍是可读事实）。
+    if cutoff is None:
+        status = EXPERIMENT_FACT_OWNER_UNPROVEN
+    else:
+        status = EXPERIMENT_FACT_RECORDED
+
+    return ExperimentEvaluationProjection(
+        version=EXPERIMENT_FACT_CONTRACT_VERSION,
+        record_kind=EXPERIMENT_EVALUATION_RECORD_KIND,
+        evaluation_fingerprint=str(manifest["evaluation_fingerprint"]),
+        dataset_fingerprint=dataset_fingerprint,
+        dataset_cutoff=cutoff,
+        contract_version=str(manifest.get("evaluation_contract_version") or ""),
+        metric=str(manifest.get("metric") or ""),
+        holdout_partition=str(manifest.get("holdout_partition") or ""),
+        scoring_canonical=_experiment_canonical(
+            _experiment_mapping(manifest.get("scoring"), what="evaluation manifest scoring"),
+            what="evaluation manifest scoring",
+        ),
+        prediction_digest=str(manifest.get("prediction_digest") or ""),
+        evaluated_dates=_experiment_count(
+            manifest.get("evaluated_dates"), what="evaluation manifest evaluated_dates",
+        ),
+        evaluated_rows=_experiment_count(
+            manifest.get("evaluated_rows"), what="evaluation manifest evaluated_rows",
+        ),
+        dropped_dates=_experiment_count(
+            manifest.get("dropped_dates"), what="evaluation manifest dropped_dates",
+        ),
+        mean_rank_ic=manifest.get("mean_rank_ic"),
+        ic_std=manifest.get("ic_std"),
+        ic_std_error=manifest.get("ic_std_error"),
+        ic_lower_bound=manifest.get("ic_lower_bound"),
+        per_date_ic_canonical=_experiment_canonical(
+            _experiment_mapping(
+                manifest.get("per_date_ic"), what="evaluation manifest per_date_ic",
+            ),
+            what="evaluation manifest per_date_ic",
+        ),
+        exclusion_reasons_canonical=_experiment_canonical(
+            _experiment_mapping(
+                manifest.get("exclusion_reasons"), what="evaluation manifest exclusion_reasons",
+            ),
+            what="evaluation manifest exclusion_reasons",
+        ),
+        evaluation_blockers=tuple(blockers_raw),
+        evaluation_contract_ok=bool(contract_ok),
+        coverage_canonical=_experiment_canonical(
+            {
+                "coverage_ratio": _canon_number(manifest.get("coverage_ratio")),
+                "expected_prediction_rows": manifest.get("expected_prediction_rows"),
+                "observed_prediction_rows": manifest.get("observed_prediction_rows"),
+                "missing_prediction_rows": manifest.get("missing_prediction_rows"),
+            },
+            what="evaluation manifest coverage",
+        ),
+        holdout_canonical=_experiment_canonical(
+            {
+                "holdout_date_count": manifest.get("holdout_date_count"),
+                "holdout_mean_rank_ic": _canon_number(manifest.get("holdout_mean_rank_ic")),
+                "holdout_positive_ratio": _canon_number(manifest.get("holdout_positive_ratio")),
+                "holdout_start_date": manifest.get("holdout_start_date"),
+                "holdout_end_date": manifest.get("holdout_end_date"),
+                "holdout_valid_date_count": manifest.get("holdout_valid_date_count"),
+                "holdout_undefined_date_count": manifest.get("holdout_undefined_date_count"),
+                "holdout_undefined_dates": _experiment_json(
+                    manifest.get("holdout_undefined_dates") or "[]",
+                    what="evaluation manifest holdout_undefined_dates",
+                ),
+                "canonical_test_date_count": manifest.get("canonical_test_date_count"),
+                "valid_ic_date_count": manifest.get("valid_ic_date_count"),
+                "undefined_ic_date_count": manifest.get("undefined_ic_date_count"),
+                "undefined_ic_dates": _experiment_json(
+                    manifest.get("undefined_ic_dates") or "[]",
+                    what="evaluation manifest undefined_ic_dates",
+                ),
+            },
+            what="evaluation manifest holdout",
+        ),
+        model_id=str(manifest.get("model_id") or ""),
+        model_version=manifest.get("model_version"),
+        model_artifact_fingerprint=manifest.get("model_artifact_fingerprint"),
+        training_dataset_fingerprint=manifest.get("training_dataset_fingerprint"),
+        trained_through=manifest.get("trained_through"),
+        selection_partition=manifest.get("selection_partition"),
+        provenance_fingerprint=manifest.get("provenance_fingerprint"),
+        result_available_at=available.isoformat(timespec="seconds"),
+        availability_day=available_day,
+        fact_verification_status=status,
+    )
+
+
 def _self_check() -> None:
     assert forbidden_dependencies() == [], forbidden_dependencies()
     assert spearman_rank_ic([1, 2, 3], [1, 2, 3]) == 1.0
