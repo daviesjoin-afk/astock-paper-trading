@@ -55,6 +55,20 @@ SERVICE_MODULE = "ai_research_service.py"
 ADVISOR_MODULE = "deepseek_advisor.py"
 REPOSITORY_MODULE = "ai_research_repository.py"
 
+#: 依赖方向：这些模块都是 AI 层**下层**成员，**不得**反向 import orchestration（service）。
+#: provider / repository / contract / transport 是 R27-B1 / B2A / B2B 的既有下层；
+#: R27-B2C-3 的 execution owner adapter 与 R27-B2C-4B 的 portfolio/accounting owner
+#: adapter 是两份**同构**的 owner 侧接缝，必须**同时**登记 —— 只登记其中一份会让分层
+#: 不变量对另一份静默失效（OCR 在 #200 上抓到的正是这种不对称）。
+LOWER_LAYER_MODULES = (
+    "ai_research_provider.py",
+    REPOSITORY_MODULE,
+    "ai_research_contract.py",
+    "ai_provider_transport.py",
+    "ai_research_execution_adapter.py",
+    "ai_research_portfolio_adapter.py",
+)
+
 #: 固定业务日 / 固定运维时刻 —— 与本机时钟无关，测试因此完全确定。
 DAY = "2026-08-27"
 OBSERVED_AT = f"{DAY}T10:30:00+08:00"
@@ -966,17 +980,49 @@ class ServiceArchitectureGuardTests(unittest.TestCase):
     def test_REPOSITORY_and_PROVIDER_never_depend_on_the_service(self):
         """依赖方向不可反转：下层不得 import 上层 orchestration。
 
-        R27-B2C-4B 起 portfolio/accounting 的 owner adapter 也是 AI 层**下层**成员，
-        与 provider / repository / contract / transport 同属"不得反向依赖 service"的集合。
+        R27-B2C-3 / B2C-4B 起 execution 与 portfolio/accounting 的 owner adapter 也是
+        AI 层**下层**成员，与 provider / repository / contract / transport 同属"不得反向
+        依赖 service"的集合。聚合成一个等值断言而不是逐条 ``subTest``：失败信息一次列全
+        所有反向依赖者，且断言可被
+        :meth:`test_LOWER_LAYER_guard_really_scans_every_registered_seam` 直接驱动成 RED。
         """
-        for name in ("ai_research_provider.py", REPOSITORY_MODULE,
-                     "ai_research_contract.py", "ai_provider_transport.py",
+        offenders = [
+            name for name in LOWER_LAYER_MODULES
+            if "ai_research_service" in _imported_roots(_tree(name))
+        ]
+        self.assertEqual(
+            [], offenders,
+            f"下层模块反向依赖 orchestration 层：{offenders}",
+        )
+
+    def test_LOWER_LAYER_guard_really_scans_every_registered_seam(self):
+        """非空性：登记进下层的每一份 owner 接缝都必须**真的**被反向依赖 guard 扫描。
+
+        只断言名字在 ``LOWER_LAYER_MODULES`` 里是自我验证 —— 它证明不了扫描逻辑在这条
+        接缝上会开口（登记了但没被扫到，等于装饰）。这里对两份**同构** owner 接缝各做一次
+        in-memory mutation：把该模块的 AST 临时替换成 ``import ai_research_service`` 的版本，
+        要求 guard **变 RED**；换回真实 AST 必须重新 GREEN。两份都各自被证一次，正是为了
+        挡住"只登记其中一份"这种不对称。
+        """
+        real_tree = globals()["_tree"]
+        for seam in ("ai_research_execution_adapter.py",
                      "ai_research_portfolio_adapter.py"):
-            with self.subTest(module=name):
-                self.assertNotIn(
-                    "ai_research_service", _imported_roots(_tree(name)),
-                    f"{name} 反向依赖 orchestration 层",
-                )
+            self.assertIn(seam, LOWER_LAYER_MODULES)
+
+            def _tainted(name, _seam=seam):
+                if name == _seam:
+                    return ast.parse("import ai_research_service\n")
+                return real_tree(name)
+
+            globals()["_tree"] = _tainted
+            try:
+                with self.assertRaises(AssertionError):
+                    self.test_REPOSITORY_and_PROVIDER_never_depend_on_the_service()
+            finally:
+                globals()["_tree"] = real_tree
+
+        # 恢复后必须重新 GREEN —— RED 来自那次注入，而不是 guard 本来就坏。
+        self.test_REPOSITORY_and_PROVIDER_never_depend_on_the_service()
 
     def test_SERVICE_contains_no_sql_and_no_network(self):
         """service 不持有 SQL、不持有网络、不持有第三套 provider 配置来源。"""
