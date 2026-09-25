@@ -56,8 +56,10 @@ jobs:
     # run 1d27fa1 = 10 selected / 0 completed / 10 failed（490,743 tokens / 12m29s）。
     # 两个独立 blocker：① budget 截断（effort=high 单文件组估算 ~392k，300k 装不下）；
     # ② 2 个 LLM request 在默认 300s 处 timeout（timeout/context/300004ms、300000ms）。
-    # timeout 分三层，必须一起给足：llm_timeout（单次 LLM 请求）/
-    # review_task_timeout（每个 semantic group）/ timeout-minutes（整个 job）。
+    # timeout 分三层，三层不可混淆、必须分别给足：
+    #   llm_timeout          = 900 秒 —— 单次 LLM HTTP request
+    #   review_task_timeout  = 30 分钟 —— 单个 semantic group
+    #   timeout-minutes      = 60 分钟 —— 整个 GitHub job
     timeout-minutes: 60
     steps:
       - name: Run OpenCodeReview
@@ -92,12 +94,25 @@ jobs:
           # 只会增加 429 / provider 队列压力与瞬时 token 消耗。观察 5-10 个 PR 后
           # 若 group count 经常 > 4 再上调。
           review_concurrency: "4"
-          # 300000 实测连一个文件组都装不下。这是 coverage/completeness 修正，
-          # 不是提速（预算变大反而允许消耗更多 token）。budget 是 cap，不代表一定用满。
-          max_tokens_budget: "1200000"
-          # 默认 300s 已有两次真实 timeout（duration_to_headers_ms=300004/300000）。
-          # 先用 600 而不是 900：单个坏请求最多等 10 分钟；观察数据仍不足再升 900。
-          llm_timeout: "600"
+          # budget 历史（都是 coverage/completeness 修正，不是提速）：
+          #   300000 实测连一个文件组都装不下 → 1200000。
+          #   1200000 已被真实数据证明不足：run 36079009095
+          #   （PR #200，effort=medium + concurrency=4 + llm_timeout=600）实测
+          #   selected/completed/failed = 10/4/6，total tokens = 1,474,255，
+          #   group 1 在 used = 1,378,271 时触发 aggregate budget stop ——
+          #   即 1.2M 档在第一个大组就被截断，后 6 个 review task 未跑完。
+          # 2500000 是下一档**观察值**，不是目标消耗量；budget 是 cap，
+          # 不代表一定用满。若该档仍出现 budget_exceeded，停下报人工，
+          # 不要机械继续加预算。
+          max_tokens_budget: "2500000"
+          # llm_timeout 历史（都是单次 LLM HTTP request 的超时上上限）：
+          #   默认 300s 两次真实 timeout（300004ms / 300000ms）→ 600。
+          #   600s 已被真实 workload 证明不足：同一 run 出现一次
+          #   timeout / phase=context / duration_to_headers_ms=600009。
+          # 900 是下一档观察阈值——**不声称 900 一定足够**，只声称 600 已被
+          # 证明不够。与 review_task_timeout(30m)、timeout-minutes(60m) 是
+          # 三层不同的超时，不可互相替代。
+          llm_timeout: "900"
           # 默认 15m 可能截断单个大 group；30m 给 medium 档留余量（action 上限 120）。
           review_task_timeout: "30"
 
