@@ -127,10 +127,15 @@ AUTHORITY_MODULES = (
 #: owner adapter。它必须 import 契约才能调用私有签发口，因此这次登记是"新增一个 owner
 #: 需要一条批准过的接缝"的显式记录，而不是静默扩散。
 #:
+#: R27-B2C-4B 新增**第五个**：``ai_research_portfolio_adapter`` —— portfolio/accounting
+#: 事实的 owner adapter。它与 execution 的那一份同构：owner（``paper_portfolio_read_model``）
+#: 不得 import research，research 契约也不得 import DB-backed owner，因此必须有一条
+#: 同时认识两套词表的接缝，并且只能是**一条**。
+#:
 #: 五个都**不是** authority：provider 是 typed research producer，repository 是 typed
 #: research persistence consumer，``deepseek_advisor`` 是 runtime caller，
-#: ``ai_research_execution_adapter`` 是 owner 侧接缝。authority 仍然不得反向 import
-#: 其中任何一个。
+#: ``ai_research_execution_adapter`` / ``ai_research_portfolio_adapter`` 是 owner 侧接缝。
+#: authority 仍然不得反向 import 其中任何一个。
 #:
 #: 注意 ``ai_research_service`` **不**在这个集合里：orchestration boundary 只依赖
 #: provider 与 repository，刻意不 import 契约 —— 多一个消费者就多一份"两套规则必然
@@ -140,6 +145,7 @@ ALLOWED_AI_CONSUMERS: set[str] = {
     "ai_research_repository.py",
     "deepseek_advisor.py",
     "ai_research_execution_adapter.py",
+    "ai_research_portfolio_adapter.py",
 }
 
 #: 时钟 / 随机数 / IO —— 研究契约一旦读它们，就能拿 current state 回填历史。
@@ -1246,12 +1252,14 @@ class OwnerNativeVerificationTests(unittest.TestCase):
             )
 
     def test_RVERIFY_10_private_issuer_and_factory_registry_boundary_unchanged(self):
-        """RVERIFY-10：私有签发口边界与 factory registry 的形状（B2C-3 更新）。
+        """RVERIFY-10：私有签发口边界与 factory registry 的形状（B2C-3 / B2C-4B 更新）。
 
-        B2C-3 登记了第二个 owner（``execution``），因此 ``SUPPORTED_OWNER_ADAPTERS`` 从
-        ``{market_data}`` 变成 ``{market_data, execution}``。这**不代表** factory 都搬进了
-        契约：execution 的 factory 住在 ``ai_research_execution_adapter``，所以契约模块
-        自己导出的 factory 仍然**只有** market 一份，而契约仍然不 import execution。
+        B2C-3 登记了第二个 owner（``execution``），B2C-4B 登记了第三个
+        （``portfolio_research``），因此 ``SUPPORTED_OWNER_ADAPTERS`` 从 ``{market_data}``
+        变成 ``{market_data, execution, portfolio_research}``。这**不代表** factory 都搬进了
+        契约：execution 的住在 ``ai_research_execution_adapter``、portfolio/accounting 的住在
+        ``ai_research_portfolio_adapter``，所以契约模块自己导出的 factory 仍然**只有** market
+        一份，而契约仍然不 import 任何 owner 模块。
 
         签发口本身依旧只有本契约内部的一处调用（caller-set 的精确 allowlist 由
         ``test_ai_research_evidence_ownership_guard`` 强制）。
@@ -1261,21 +1269,31 @@ class OwnerNativeVerificationTests(unittest.TestCase):
         )
         self.assertEqual(
             frozenset({"evidence_ref_from_market_reading"}), exported,
-            "契约模块导出的 factory 集合发生变化（execution 的那一份应住在 adapter 模块）",
+            "契约模块导出的 factory 集合发生变化（execution / portfolio 的那两份应住在 adapter 模块）",
         )
         self.assertEqual(
-            frozenset({ARC.EVIDENCE_SOURCE_MARKET_DATA, ARC.EVIDENCE_SOURCE_EXECUTION}),
+            frozenset({
+                ARC.EVIDENCE_SOURCE_MARKET_DATA,
+                ARC.EVIDENCE_SOURCE_EXECUTION,
+                ARC.EVIDENCE_SOURCE_PORTFOLIO_RESEARCH,
+            }),
             ARC.SUPPORTED_OWNER_ADAPTERS,
-            "已批准的 owner adapter registry 与 B2C-3 的范围不一致",
+            "已批准的 owner adapter registry 与 B2C-3 / B2C-4B 的范围不一致",
         )
         self.assertFalse(hasattr(ARC, "_OWNER_ISSUED"),
                          "不得存在可 import 的构造哨兵（那是伪安全）")
+        # 契约模块**没有**为了"方便"而 re-export portfolio 的 factory。
+        self.assertFalse(hasattr(ARC, "evidence_ref_from_portfolio_projection"))
 
-        # 契约**自己**不 import 任何 execution 模块 —— 依赖方向单向。
+        # 契约**自己**不 import 任何 execution / portfolio 模块 —— 依赖方向单向。
         self.assertEqual(
             set(), _imported_roots(_tree(CONTRACT_MODULE))
-            & {"execution_verification", "execution_evidence", "ai_research_execution_adapter"},
-            "research contract 不得 import execution 或 adapter",
+            & {
+                "execution_verification", "execution_evidence",
+                "ai_research_execution_adapter",
+                "paper_portfolio_read_model", "ai_research_portfolio_adapter",
+            },
+            "research contract 不得 import execution / portfolio owner 或它们的 adapter",
         )
 
         # 契约模块里签发口只被 owner factory 调用（**唯一**一处）。
@@ -1588,6 +1606,11 @@ class AiResearchArchitectureGuardTests(unittest.TestCase):
         owner）；authority 反向 import **其中任何一个**都算违规 —— 只守住契约会留下
         "authority 直接 import adapter 发请求"或"直接 import repository 写研究台账"
         这两个后门。
+
+        R27-B2C-4B 起 AI 层是**五个**模块：portfolio/accounting 的 owner adapter 也是
+        AI 层成员，因此必须与 execution adapter 一起出现在下面的枚举里。**每次新增一个
+        AI 层模块，这里必须同步补一行** —— 漏掉一行，这条 guard 对新模块就是空洞（OCR
+        第一次真实观察正是抓到了这个缺口）。
         """
         offenders = []
         for name in AUTHORITY_MODULES:
@@ -1596,6 +1619,7 @@ class AiResearchArchitectureGuardTests(unittest.TestCase):
                     "ai_research_contract", "ai_research_provider", "ai_provider_transport",
                     "ai_research_repository", "ai_research_service",
                     "ai_research_execution_adapter",
+                    "ai_research_portfolio_adapter",
                 ):
                     offenders.append(f"{name}: import {imported}")
         self.assertEqual(

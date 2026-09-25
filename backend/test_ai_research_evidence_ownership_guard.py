@@ -18,11 +18,14 @@
     一条 evidence 不只是"经过了 contract factory"，还必须能证明 **factory 的输入本身
     来自该 canonical owner**，而不是调用方手工造了一份长得一样的 typed object。
 
-    今天两条 owner 路径都做不到这一点：``MarketDataSnapshot`` / ``MarketDataReading`` 与
-    ``ExecutionEvidence`` 都是公开可构造的类型，所以"手工造 typed object → factory"
-    仍能得到一个 ref。这条限制由 ``test_ai_research_contract`` 的
-    ``AI_TYPED_06_two_step_forgery_is_documented_not_claimed_closed`` 与
-    ``test_ai_research_execution_adapter`` 的 ``EXEC-REF-18`` 明确记录。
+    今天**三条** owner 路径都做不到这一点：``MarketDataSnapshot`` / ``MarketDataReading``、
+    ``ExecutionEvidence`` 都是公开可构造的类型，而 ``PortfolioFactProjection`` 虽然有私有
+    构造器，调用方仍可自造 SQLite connection / fixture 调 owner 的 public read 拿到投影。
+    所以"手工造输入 → factory"仍能得到一个 ref。这条限制由
+    ``test_ai_research_contract`` 的
+    ``AI_TYPED_06_two_step_forgery_is_documented_not_claimed_closed``、
+    ``test_ai_research_execution_adapter`` 的 ``EXEC-REF-18`` 与
+    ``test_ai_research_portfolio_adapter`` 的 ``PORT-REF-18`` 明确记录。
 
     因此本文件**不**声称"已经证明所有 evidence 都是 owner-originated"。第 1 层只是
     **必要条件**。owner-origin provenance 必须由 owner/provenance 架构关闭
@@ -83,6 +86,9 @@ EXPECTED_OWNER_FACTORIES = {
     "execution": (
         "ai_research_execution_adapter", "evidence_ref_from_execution_projection",
     ),
+    "portfolio_research": (
+        "ai_research_portfolio_adapter", "evidence_ref_from_portfolio_projection",
+    ),
 }
 
 #: 需要在 import 别名解析里被识别的模块 —— 已登记 factory 的宿主模块。
@@ -97,11 +103,12 @@ OWNER_FACTORY_ORIGINS = frozenset(EXPECTED_OWNER_FACTORIES.values())
 #:
 #: **精确 allowlist，双向等值**：少一个（登记了却不调用）或多一个（有人偷偷调用）都算
 #: 违规。R27-B2C-3 引入第二个 approved factory 时把 B2C-2 的
-#: "契约外零调用" 升级成这条 caller-set 等值 —— 只需 module + enclosing function 这一层
-#: 结构信息，不需要 CFG。
+#: "契约外零调用" 升级成这条 caller-set 等值；R27-B2C-4B 引入 portfolio/accounting 的
+#: 第三个 —— 只需 module + enclosing function 这一层结构信息，不需要 CFG。
 APPROVED_ISSUER_CALLERS = frozenset({
     (CONTRACT_MODULE_FILE, "evidence_ref_from_market_reading"),
     ("ai_research_execution_adapter.py", "evidence_ref_from_execution_projection"),
+    ("ai_research_portfolio_adapter.py", "evidence_ref_from_portfolio_projection"),
 })
 
 #: 目前生产里构造 ``InformationEvent`` 的模块集合。等值断言：多一个模块就是一次
@@ -345,11 +352,11 @@ class EvidenceFactoryBoundaryTests(unittest.TestCase):
 
         # 非空性：只有真的存在 factory 时，上面两条等值断言才有内容可查。
         self.assertTrue(EXPECTED_OWNER_FACTORIES, "没有任何已登记的 owner factory")
-        # 契约自己导出的 factory 只有 market 一份：execution 的住在 adapter 模块里。
+        # 契约自己导出的 factory 只有 market 一份：execution / portfolio 的住在各自 adapter 里。
         self.assertEqual(
             frozenset({"evidence_ref_from_market_reading"}),
             _contract_exported_factories(),
-            "契约模块导出的 factory 集合发生变化（execution 的那一份应住在 adapter 模块）",
+            "契约模块导出的 factory 集合发生变化（execution / portfolio 的那两份应住在 adapter 模块）",
         )
         # 只借用一个已登记的名字不算授权：模块 origin 与符号必须同时匹配。
         self.assertFalse(_module_exports_factory(
@@ -357,6 +364,17 @@ class EvidenceFactoryBoundaryTests(unittest.TestCase):
         ))
         self.assertFalse(_module_exports_factory(
             "ai_research_execution_adapter", "evidence_ref_from_market_reading",
+        ))
+        # R27-B2C-4B：contract 模块**不得**为了方便 re-export portfolio 的 factory，
+        # portfolio adapter 也**不得**借用 market / execution 的 factory 名。
+        self.assertFalse(_module_exports_factory(
+            "ai_research_contract", "evidence_ref_from_portfolio_projection",
+        ))
+        self.assertFalse(_module_exports_factory(
+            "ai_research_portfolio_adapter", "evidence_ref_from_market_reading",
+        ))
+        self.assertFalse(_module_exports_factory(
+            "ai_research_portfolio_adapter", "evidence_ref_from_execution_projection",
         ))
         self.assertFalse(_module_exports_factory("ai_research_contract", "not_a_factory"))
 
@@ -568,6 +586,78 @@ class FactoryOriginNonVacuityTests(unittest.TestCase):
                 ["market_data", "execution"], ["execution", "market_data"],
             ),
         )
+
+    def test_CASE_12_the_portfolio_adapter_factory_is_approved(self):
+        """B2C-4B 新增的第三个 owner：模块别名与直接 import 都必须被批准。"""
+        self.assertTrue(self._approved(
+            "import ai_research_portfolio_adapter as PFA\n"
+            "PFA.evidence_ref_from_portfolio_projection(projection)\n"
+        ))
+        self.assertTrue(self._approved(
+            "from ai_research_portfolio_adapter import "
+            "evidence_ref_from_portfolio_projection as make_ref\n"
+            "make_ref(projection)\n"
+        ))
+        # 非空性对照：execution / market 的 factory 仍然必须被批准（新 owner 不排挤旧 owner）。
+        self.assertTrue(self._approved(
+            "import ai_research_execution_adapter as ADA\n"
+            "ADA.evidence_ref_from_execution_projection(projection)\n"
+        ))
+
+    def test_CASE_13_portfolio_factory_cannot_be_forged_or_borrowed(self):
+        """B2C-4B 的四条负向路径 —— 每一条都必须被拒绝。
+
+        1. 本地同名函数：``def evidence_ref_from_portfolio_projection`` 自己签发；
+        2. 其它对象的同名方法；
+        3. portfolio adapter 偷调 market / execution 的 factory（**(module, symbol) 对**
+           不匹配，即使两个模块都已登记）；
+        4. contract 模块偷导出 portfolio 的 factory（registry 里必须只有 market 那一份，
+           且 ``ai_research_contract`` **没有**该符号）。
+
+        刻意只回答 module + symbol 这一层结构事实，不扩展成 CFG / dataflow scanner。
+        """
+        self.assertFalse(self._approved(
+            "def evidence_ref_from_portfolio_projection(row):\n"
+            "    return row\n"
+            "evidence_ref_from_portfolio_projection(row)\n"
+        ))
+        self.assertFalse(self._approved(
+            "fake.evidence_ref_from_portfolio_projection(row)\n"
+        ))
+        self.assertFalse(self._approved(
+            "import fake_contract\n"
+            "fake_contract.evidence_ref_from_portfolio_projection(row)\n"
+        ))
+        # 3. 已登记模块之间不得互相借用 factory 名。
+        self.assertFalse(self._approved(
+            "import ai_research_portfolio_adapter as PFA\n"
+            "PFA.evidence_ref_from_market_reading(reading)\n"
+        ))
+        self.assertFalse(self._approved(
+            "import ai_research_portfolio_adapter as PFA\n"
+            "PFA.evidence_ref_from_execution_projection(projection)\n"
+        ))
+        self.assertFalse(self._approved(
+            "import ai_research_execution_adapter as ADA\n"
+            "ADA.evidence_ref_from_portfolio_projection(projection)\n"
+        ))
+        self.assertFalse(self._approved(
+            "import ai_research_contract as ARC\n"
+            "ARC.evidence_ref_from_portfolio_projection(projection)\n"
+        ))
+        # 4. contract 模块**没有**这个符号，且 registry 里 market 仍然只对应它自己那一份。
+        self.assertFalse(_module_exports_factory(
+            "ai_research_contract", "evidence_ref_from_portfolio_projection",
+        ))
+        self.assertEqual(
+            ("ai_research_contract", "evidence_ref_from_market_reading"),
+            EXPECTED_OWNER_FACTORIES["market_data"],
+        )
+        # 非空性对照：portfolio adapter 写自己的 factory 名必须被批准。
+        self.assertTrue(self._approved(
+            "import ai_research_portfolio_adapter as PFA\n"
+            "PFA.evidence_ref_from_portfolio_projection(projection)\n"
+        ))
 
     def test_CASE_11_issuer_caller_scan_detects_second_helpers_and_aliases(self):
         """签发口扫描必须能看见别名，也能看见同一模块里的第二个 caller。"""

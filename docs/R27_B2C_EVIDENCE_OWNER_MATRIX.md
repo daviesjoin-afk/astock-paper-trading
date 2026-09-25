@@ -13,7 +13,7 @@ research，见文末「明确排除」。
 基线：`master` @ `649cabe0829af4d9aba5c31d06f6e230b21832a8`（R27-B2B 合并后）。
 
 本文件的表格是**盘点时的审计产物**，其"safe?"结论刻意保持当时的判断；每个 substage
-的实际进展记录在各家自己的 "B2C-n 进展" 小节（当前已到 **B2C-4A COMPLETE**）。
+的实际进展记录在各家自己的 "B2C-n 进展" 小节（当前已到 **B2C-4B COMPLETE**）。
 
 ---
 
@@ -155,7 +155,7 @@ owner-native 方式，不是复制 market 词表）；identity 与业务日的 o
 B2C-2  research 契约学会消费 owner-native verification（**已完成**）
 B2C-3  execution → ResearchEvidenceRef adapter（**已完成**，见下文 "B2C-3 进展"）
 B2C-4A execution attribution fact completeness（**已完成**，见下文 "B2C-4A 进展"）
-B2C-4B portfolio/accounting owner facts for pnl_attribution（**未开始**）
+B2C-4B portfolio/accounting owner facts（**已完成**，见下文 "B2C-4B 进展"）
 B2C-4C 迁移 pnl_attribution runtime（**未开始**）
 ```
 
@@ -196,7 +196,7 @@ B2C-2 之后  OwnerVerification（outcome / status / attributes）
 ```text
 B2C-3  execution → ResearchEvidenceRef adapter（**已完成**）
 B2C-4A execution attribution fact completeness（**已完成**）
-B2C-4B portfolio/accounting owner facts for pnl_attribution（**未开始**）
+B2C-4B portfolio/accounting owner facts（**已完成**）
 B2C-4C 迁移 pnl_attribution runtime（**未开始**）
 B2C-5  news owner readiness
 B2C-6  adaptive / experiment owner readiness
@@ -364,9 +364,9 @@ provenance 伪造。反过来，"为了现在就迁移而删掉这些能力"是*
 因此最终目标不变，只把实现顺序拆开：
 
 ```text
-B2C-4A  execution attribution fact completeness      ← 本段（**已完成**）
-B2C-4B  portfolio/accounting owner facts pnl_attribution 需要（**未开始**）
-B2C-4C  迁移 pnl_attribution runtime 到 canonical typed research（**未开始**）
+B2C-4A  execution attribution fact completeness      **COMPLETE**
+B2C-4B  portfolio/accounting owner facts             **COMPLETE**
+B2C-4C  pnl_attribution runtime migration            **NOT STARTED**
 ```
 
 这是**实现顺序调整，不是 roadmap 缩减**。
@@ -530,6 +530,269 @@ market valuation authority        （市值 / 未实现盈亏 / NAV 的估值腿
 
 不把两者揉成一个假 owner。
 
+### B2C-4B 进展（portfolio/accounting owner facts 已发布）
+
+#### 状态
+
+```text
+B2C-4A  execution attribution fact completeness       COMPLETE
+B2C-4B  portfolio/accounting owner facts              COMPLETE   ← 本节
+B2C-4C  pnl_attribution runtime migration             NOT STARTED
+```
+
+本段是**能力 + 契约 + 回归**，不是 runtime 迁移：`deepseek_research._pnl_evidence()` 与
+`paper_nav` writer / `paper_positions` writer **一行未改**。真正的 consumer 迁移是 B2C-4C。
+
+#### owner 仍然是既有模块（没有第二个 portfolio owner）
+
+```text
+backend/paper_portfolio_read_model.py
+    PORTFOLIO_FACT_CONTRACT_VERSION      = "portfolio-fact-v1"
+    PORTFOLIO_FACT_VERIFICATION_SCOPE    = "cycle_account_asof_accounting"
+    PORTFOLIO_FACT_KINDS                 = cash / realized_pnl / position_cost_summary
+    PORTFOLIO_FACT_STATUSES              = verified / unknown
+    PositionCostSummary                  （position_count + cost_value，纯 value type）
+    PortfolioFactProjection              （无 public raw 构造器；私有签发口）
+    accounting_fact_projections(conn, context, *, account_id)   ← 唯一 public 入口
+```
+
+刻意**没有** `pnl_repository.py` / `pnl_service.py` / `portfolio_fact_manager.py` /
+`accounting_facade.py` / `research_portfolio_repository.py` / `BaseOwnerAdapter` /
+adapter registry framework。portfolio/accounting 的 factual authority 仍然**只有一个**：
+`paper_portfolio_read_model`。
+
+#### 依赖方向
+
+```text
+verified execution / durable lots
+          ↓
+paper_portfolio_read_model            （owner：事实、身份、业务日、核验结论）
+          ↓
+PortfolioFactProjection               （owner fact contract）
+          ↓
+ai_research_portfolio_adapter         （唯一接缝：owner → research 翻译）
+          ↓
+ai_research_contract.ResearchEvidenceRef
+          ↓
+InformationEvent.payload              （B2C-4C 再从投影产生）
+```
+
+owner **不得** import research，research 契约**不得** import DB-backed owner。
+`ai_research_portfolio_adapter` 是唯一同时认识两套词表的 production 模块。
+
+#### 本段发布的事实（全部 bounded by cycle + account + asof）
+
+```text
+cash                      bounded 重建现金（cycle/account 初始本金 + 已验证成交现金流）
+                          ≠ paper_accounts.cash（当前可变状态，不是历史 authority）
+realized_pnl              已验证 SELL 的 owner realized_pnl 合计
+                          （cycle bounded / as-of bounded / incomplete sell fail closed）
+position_cost_summary     durable lots 的开仓数与成本合计
+                          = 开仓（remaining_qty>0）的唯一 account/code 数 + Σ qty×cost
+```
+
+三条事实**顺序固定**（cash → realized_pnl → position_cost_summary），便于 deterministic
+fingerprint 与调用方读取。
+
+**必须先证明归属**：`accounting_fact_projections()` 先要求 `_cycle_initial(...)`
+（内部即 `paper_accounts` 的 cycle 绑定 + `_account_attached_by`）能证明该 account 属于该
+cycle 且在 `asof_day` 前已挂载。证明不了时三条事实**全部** `unknown` 且 `value=None` ——
+绝不退化成"这个账户没有卖出，所以已实现盈亏 = verified 0"。这是本段最容易做错的一处：
+单独调 `realized_pnl()` 时，"账户存在但没卖出"与"账户压根不存在"都可能返回
+`0.0, verified`。
+
+**结构性 fail closed**：`status == unknown` 时 `value` **必须**是 `None`（构造期强制）；
+数值事实必须是有限浮点数；`position_cost_summary` 的值必须是 typed `PositionCostSummary`。
+`status=unknown, value=123.45` 在类型层面不可表达，消费者无法忽略 status 偷用一个没有被
+证明的数字。反之 `verified 0.0` **不是** `unknown` —— 肯定性的零必须保留。
+
+#### 为什么 NAV **不是** portfolio-only 事实（本段最重要的边界）
+
+`portfolio_for_context(...)` 今天允许调用方显式传入 `valuations: Mapping`。那只能证明
+"调用方给了一个合法数字"，**不能**证明：
+
+```text
+这些价格来自 R24 owner
+这些价格通过了哪套 verification
+这些价格对应哪个真实 market snapshot
+```
+
+因此 `portfolio_for_context(..., valuations={"600000": 12.3})` 返回的
+`market_value_status = verified` / `nav_status = verified` **不得**被包装成 owner-verified
+research fact —— 那会把"caller 给了一个合法数字"错误升级成"R24 market owner 已证明这条
+估值"。于是本段的 typed projection **禁止包含**：
+
+```text
+nav · latest_nav · prior_nav · daily_pnl · daily_return
+market_value · unrealized_pnl · benchmark · valuation price · quote_status
+```
+
+也**禁止接受** `valuations` Mapping / `MarketDataReading` / current quote / latest quote 作为
+portfolio fact factory 的参数（签名里只有 `conn` / `context` / `account_id`）。
+
+正确的后续组合是跨 owner 的：
+
+```text
+execution owner facts + portfolio/accounting owner facts + R24 market owner facts
+        ↓
+B2C-4C cross-owner pnl_attribution composition
+```
+
+B2C-4C 若拿不到能证明**对应业务日**的 R24 valuation，结论必须是 `unknown`，而不是
+current quote fallback / cost fallback / `paper_nav.quote_status == "verified"` 冒充
+canonical market provenance。
+
+#### `paper_nav` 本轮继续是 legacy / compatibility，不升级成 owner fact
+
+当前 `paper_nav` writer 的估值允许 `local_snapshot_fallback` / `cost_fallback`，且
+`quote_status` 取值 `verified` / `cost_fallback`。这个 `quote_status="verified"`：
+
+```text
+不是 R24 OwnerVerification
+不是 cross-source verification
+没有 typed market evidence identity
+```
+
+所以**禁止**写 `paper_nav.quote_status == "verified"` → research owner fact verified。
+本段不读 `paper_nav` 签发任何 typed evidence，也不删除 / 迁移 `paper_nav` writer、不改
+`_record_nav` —— 实际的 runtime convergence 留给 B2C-4C。
+
+#### `paper_positions` 继续是 compatibility-only 投影
+
+R22 已明确 `paper_positions = compatibility-only projection`。typed portfolio facts 建立在
+`paper_position_lots` + 已验证 fills/orders + cycle/as-of bounded reconstruction 之上；
+`position_cost_summary` 从 `bounded_lots_with_status(...)` 派生，**不读**
+`SELECT ... FROM paper_positions`（它甚至没有 `cycle_id` 列，也不携带 as-of 证据）。
+
+#### 唯一 research adapter
+
+```text
+backend/ai_research_portfolio_adapter.py
+    __all__ = ("evidence_ref_from_portfolio_projection",)
+```
+
+依赖方向 `paper_portfolio_read_model → ai_research_portfolio_adapter → ai_research_contract`。
+复用既有的 `EVIDENCE_SOURCE_PORTFOLIO_RESEARCH`（`"portfolio_research"`）与
+`EVENT_PORTFOLIO_RESEARCH_OBSERVED`，**不**新增 `portfolio_accounting` / `portfolio_fact` /
+`pnl_fact` / `accounting_research` 这类第二套 source type。
+
+`SUPPORTED_OWNER_ADAPTERS` 因此变成：
+
+```text
+market_data
+execution
+portfolio_research
+```
+
+adapter 刻意**不**新增 `PortfolioResearchService` / `PortfolioAdapterManager` / `BaseAdapter` /
+registry framework / repository / facade。
+
+#### status → owner-neutral outcome：显式穷尽表
+
+```text
+STATUS_VERIFIED → OWNER_OUTCOME_VERIFIED
+STATUS_UNKNOWN  → OWNER_OUTCOME_UNVERIFIED
+```
+
+刻意**不**产生 `source_unusable`：本 owner 今天没有发布"证据源不可用"这个独立状态，
+research 侧不得替它猜一个。映射是一张**完整表**（`_PORTFOLIO_OUTCOME_BY_STATUS`），并且
+每次签发前做**双向**一致性检查（`mapping keys == PORTFOLIO_FACT_STATUSES`，不缓存）：
+owner 新增一个状态时 adapter 在**下一次调用**就 fail closed，而不是静默落进 `else`
+被当成 `unverified`。**禁止** `else: outcome = OWNER_OUTCOME_UNVERIFIED`。
+
+#### identity / 内容指纹 / detail
+
+```text
+source_type = portfolio_research
+source_id   = <fact_kind>|cycle=<cycle_id>|account=<account_id>
+as_of       = projection.asof_day（= PortfolioReadContext.asof_day）
+```
+
+调用方**不能**传 `source_id` / `as_of` / `status` / `outcome` / `cycle` / `account`。
+`as_of` 只能来自 owner context —— 没有 `created_at` / `updated_at` / `today()` /
+latest NAV date fallback。
+
+内容指纹覆盖 fact contract 版本 / `fact_kind` / `cycle_id` / `account_id` / `asof_day` /
+**canonical value**，用 `json.dumps(sort_keys=True, separators=(",", ":"))` + sha256；
+刻意不用 `hash()` / `repr(object)` / 内存地址 / 当前时间 / 随机数。verification statement
+不重复进指纹：它已经由 `OwnerVerification.canonical()` 参与 `fact_state()`。
+
+`ResearchEvidenceRef.detail` 只放 `content_fingerprint` / `contract_version` /
+`read_model_version`，**不**复制 owner 的 factual payload（cash / realized_pnl /
+position_count / cost_value）。分层仍然是：
+
+```text
+PortfolioFactProjection   owner factual truth
+ResearchEvidenceRef       identity + verification + fingerprint
+InformationEvent.payload  一次 research observation 投影（B2C-4C 再建立）
+```
+
+`OwnerVerification.attributes` 只有 `verification_scope` / `fact_contract_version` /
+`read_model_version` / `fact_kind`；刻意没有 `confidence` / `score` / `quality_score`，
+也没有 market-only 的 `verification_method` / `cross_source_verified`（对非 market owner
+它们保持"不适用"：`None` / `False`，不是"核验失败"）。
+
+#### provenance 的诚实声明（不许含糊）
+
+```text
+contract-issued portfolio projection:                    CLOSED
+caller self-declared identity / status / as_of:          CLOSED
+physical database origin / trusted database provenance:  OPEN / REQUIRED
+```
+
+调用方仍然可以自造 SQLite connection / fixture 并调用 owner 的 public read 拿到投影。本段
+**不**声称"all owner-origin provenance solved"，R27 的总目标也不因此降低。
+
+#### 本段仍然没有 production consumer（刻意）
+
+```text
+evidence_ref_from_portfolio_projection   production callers = 0
+EXPECTED_EVENT_CONSTRUCTORS              不变（deepseek_advisor 仍是唯一）
+deepseek_research / paper_trading        未改动
+```
+
+B2C-4B = capability + contract；runtime consumer migration = B2C-4C。若本轮就出现
+`deepseek_research` / `ai_analysis` / `adaptive_engine` 的生产调用，那是 scope violation。
+
+#### 回归门禁（B2C-4B）
+
+`backend/test_portfolio_fact_contract.py`：PFACT-01（public 构造器被拒绝）、PFACT-02
+（kind/status 闭集，非法值 / 非有限值 / 类型错位的值全部在构造期 fail closed）、PFACT-03
+（cycle/account/asof 由 context 派生，签名零 fallback）、PFACT-04（现金来自 bounded 重建，
+`paper_accounts.cash` 不能覆盖它）、PFACT-05（只认已验证 SELL；未验证 SELL 即整体
+fail closed）、PFACT-06（不存在 / 未挂载账户绝不变成 verified zero）、PFACT-07（持仓成本
+来自 durable lots，不是 `paper_positions`）、PFACT-08（数量未证明 → unknown/None）、
+PFACT-09（未来 fill/lot 不进当日事实）、PFACT-10（archived / 不可证明 context 全部
+fail closed）、PFACT-11（非有限账本值不得成为 verified fact）、PFACT-12（已验证的零不得被
+误判成 unknown）、PFACT-13（固定且确定性的发布顺序）、PFACT-14（投影没有 NAV /
+market_value / unrealized / daily_return / quote_status 表面）、PFACT-15（factory 不接受
+valuations / current quote / latest fallback —— 断言只看**会执行**的代码，不看 docstring）。
+
+`backend/test_ai_research_portfolio_adapter.py`：PORT-REF-01 ~ 04（只接受真投影、
+`source_type = portfolio_research`、identity 完全由 kind/cycle/account 派生、`as_of` 完全
+来自 owner context）、PORT-REF-05 ~ 06（verified → verified；unknown → unverified 且**不是**
+source_unusable）、PORT-REF-07 ~ 08（映射与 owner 公开闭集双向穷尽；模拟 owner 新增状态
+必须 fail closed）、PORT-REF-09 ~ 12（同 identity 下 cash / realized PnL / position summary
+被改写 → `EvidenceConflict`；不同 account/cycle/kind → 不同 identity）、PORT-REF-13（detail
+不复制 factual payload）、PORT-REF-14（不引入 market 核验词汇）、PORT-REF-15
+（`InformationEvent.kind = portfolio_research_observed`）、PORT-REF-16（production 调用点
+= 0）、PORT-REF-17（签名不给自述入口）、PORT-REF-18（依赖方向单向 + provenance 仍 OPEN）。
+
+`backend/test_ai_research_evidence_ownership_guard.py`：`EXPECTED_OWNER_FACTORIES` 增加
+`portfolio_research`，`APPROVED_ISSUER_CALLERS` 增加
+`ai_research_portfolio_adapter.py → evidence_ref_from_portfolio_projection`；最终精确的
+caller set 只有三个（market / execution / portfolio），**不能多、不能少**。负向用例覆盖：
+本地同名 portfolio factory 被拒、其它模块同名被拒、portfolio adapter 偷调 market/execution
+的 factory 被拒、contract 模块偷导出 portfolio factory 被拒。只做 module + symbol /
+module + enclosing function 结构扫描，不扩展成 CFG / dataflow scanner。
+
+语义 mutation 在 `work/r27b2c4b_portfolio_accounting_mutation_check.py`：移除归属证明、
+现金改读 `paper_accounts.cash`、持仓成本改读 `paper_positions`、数量未知时仍发 summary、
+去掉 as-of 边界、`realized_pnl` 绕过 verified 口径、adapter 把 unknown 映成 verified、
+`source_id` 丢掉 account、指纹忽略 factual value、adapter 接受 duck-typed —— 必须全部
+CAUGHT（survived = 0、fake = 0、restore sha256 一致）。矩阵用 `--non-vacuity` 跑：每条先跑
+baseline，因此**目标用例路径写错会被报成 BASELINE-RED 而不是静默通过**。
+
 ---
 
 ## 三、Family B —— Adaptive / experiment facts
@@ -616,17 +879,21 @@ invariant 2 禁止的伪造 provenance。
 
 四件前提都已在 B2C-1 / B2C-2 就位，**adapter 本身由 B2C-3 落地**：execution 的
 `evidence_ref_from_execution_projection` 已登记进 `SUPPORTED_OWNER_ADAPTERS`，并在生产里
-**零调用点**（迁移是 B2C-4C）。B2C-4A 进一步让该投影携带 attribution 需要的成交事实。
+**零调用点**（迁移是 B2C-4C）。B2C-4A 进一步让该投影携带 attribution 需要的成交事实；
+B2C-4B 为同一目标补上**第二个 owner**（`portfolio_research`）—— portfolio/accounting 的
+typed 记账事实与它自己的 adapter，同样**零调用点**。三类 typed fact（execution /
+portfolio accounting / R24 market）齐备之后，B2C-4C 才能做跨 owner 组合。
 
 ### 建议的迁移顺序（与 §六 的排除项一致）
 
 ```text
 1. pnl_attribution        拆成三段：
                            B2C-4A execution capability（已完成）
-                           B2C-4B portfolio/accounting owner facts
-                                 前提：portfolio ledger 与 market valuation 两种 authority
-                                 各自能签发 typed fact（不允许把估值腿归给 ledger owner）
+                           B2C-4B portfolio/accounting owner facts（已完成）
+                                 只发布 ledger owner 能证明的记账事实；
+                                 NAV / 市值 / 未实现盈亏 / 日 PnL 留给跨 owner 组合
                            B2C-4C runtime 迁移（前提：A + B 都完成）
+                                  需要执行 + 组合记账 + R24 估值三类 typed fact 同时到位
 2. event_evidence         前提：news/information owner 能签发 PIT identity 与核验闭集
                           （今天 grade 由抓取端硬编码 → 先解决"谁签核验"）
 3. candidate_challenge / overfit_watch
@@ -732,3 +999,54 @@ Net architecture surface:                          NEUTRAL
 这一轮**不是**新增一层，而是让既有 owner contract 达到原 roadmap runtime 需要的完整度：
 投影仍然只有一个发布入口、一个 authority、一个 adapter。`realized_pnl` / `NAV` /
 position cost 没有被塞进来，它们留给 B2C-4B 的 portfolio/accounting owner。
+
+### B2C-4B 之后的数字（能力补完 + 一个真实 adapter 接缝）
+
+```text
+Typed fact owners:                                  before = 2   after = 3   （+ portfolio_research）
+Public evidence factories:                          before = 2   after = 3   （+ portfolio_research）
+Owner verification model:                           owner-neutral（B2C-2 起不变）
+Portfolio/accounting fact authority:                before = paper_portfolio_read_model
+                                                    after  = paper_portfolio_read_model（未迁移）
+Research-owned portfolio status semantics:          0（状态词只出现在 adapter 的归口表）
+Portfolio → market vocabulary translation:          0
+Production modules added:                           1（ai_research_portfolio_adapter）
+Production modules removed:                         0
+New service / manager / repository / facade:        0
+Registry framework / BaseAdapter:                   0
+Second portfolio owner / repository:                0
+Portfolio fact kinds published:                     cash / realized_pnl / position_cost_summary
+NAV / market_value / unrealized_pnl published:      0
+paper_nav used to issue typed evidence:             NO
+paper_positions used as typed fact authority:       NO
+Raw valuations accepted by the fact factory:        NO
+deepseek_research / paper_trading changed:          NO
+paper_nav writer changed:                           NO
+paper_positions writer changed:                     NO
+DB migration / API change / frontend change:        0
+Runtime migrations:                                 0
+Production adapter callers:                         0（迁移是 B2C-4C）
+Modules needed to understand portfolio → evidence:  3
+                                                        paper_portfolio_read_model
+                                                        ai_research_portfolio_adapter
+                                                        ai_research_contract
+Net architecture surface:                           INCREASED（有理由）
+```
+
+架构面**增大**了，而且是**有理由的**：新增的是 roadmap 明确要求的 owner→research 接缝，不是
+forwarding layer —— `ai_research_contract` 不得 import DB-backed 的
+`paper_portfolio_read_model`，而 portfolio owner 也不得 import research。三类事实（execution /
+portfolio accounting / R24 market）在 B2C-4C 汇合成 `pnl_attribution` 之前，这条接缝必须
+存在，而且**只能有一条**。
+
+它**不**声称第 2 层（owner-origin provenance）已经成立：
+
+```text
+contract-issued portfolio projection:                    CLOSED
+caller self-declared identity / status / as_of:          CLOSED
+physical database origin / trusted database provenance:  OPEN / REQUIRED
+```
+
+**Roadmap capability removed = 0；Roadmap invariant weakened = 0。** 本轮没有把
+`NAV = portfolio-only authority` 写进任何地方，也没有删掉 `pnl_attribution` 仍需要的
+NAV / daily PnL / daily return 能力 —— 它们只是被正确地留在跨 owner 组合那一步（B2C-4C）。

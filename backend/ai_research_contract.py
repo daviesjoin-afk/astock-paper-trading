@@ -49,11 +49,13 @@ evidence 走**类型化 owner evidence** 边界：每个已批准的 owner 有**
 ```text
 market_data   evidence_ref_from_market_reading      （本模块；typed R24 reading）
 execution     evidence_ref_from_execution_projection（ai_research_execution_adapter）
+portfolio     evidence_ref_from_portfolio_projection（ai_research_portfolio_adapter）
 ```
 
 **factory 不必都住在本文件里。** execution 的 factory 住在
-``ai_research_execution_adapter``，因为它是唯一需要同时认识 execution owner 词表与
-research 契约的接缝；本契约继续**不** import 任何 execution 模块（依赖方向单向）。
+``ai_research_execution_adapter``、portfolio/accounting 的住在
+``ai_research_portfolio_adapter``，因为它们是唯一需要同时认识各自 owner 词表与 research
+契约的接缝；本契约继续**不** import 任何 execution / portfolio 模块（依赖方向单向）。
 核验维度本身是 **owner-neutral** 的 (:class:`OwnerVerification`)：owner 自己发布结论，
 research core 不解释任何 owner 的状态字符串。保证与**已知限制**（两层伪造路径、以及
 为什么需要 owner 签发 token）集中在 :class:`ResearchEvidenceRef` 的 docstring 里，
@@ -129,15 +131,17 @@ EVIDENCE_SOURCE_TYPES = (
 #: 当前**真的**接好 typed projection 的 owner。其余是已声明的未来来源，
 #: 没有公开 factory 可以签发 —— 少支持一个 source 好过允许伪造一个 authority。
 #:
-#: R27-B2C-3 起 ``execution`` 也在其中。这张表表示的是"研究层已经存在**批准的
-#: owner adapter**"，**不是**"所有 public factory 都定义在本文件里"：execution 的
-#: factory 住在 ``ai_research_execution_adapter``（它必须同时认识 execution 与
-#: research 两套词表，而本契约刻意不 import 任何 execution 模块）。
-#: 本契约不需要、也不得 import 那个 adapter —— registry 是声明式的，一致性由
+#: R27-B2C-3 起 ``execution`` 也在其中，R27-B2C-4B 起 ``portfolio_research`` 也在。
+#: 这张表表示的是"研究层已经存在**批准的 owner adapter**"，**不是**"所有 public factory
+#: 都定义在本文件里"：execution 的 factory 住在 ``ai_research_execution_adapter``、
+#: portfolio/accounting 的住在 ``ai_research_portfolio_adapter``（它们必须同时认识各自
+#: owner 与 research 两套词表，而本契约刻意不 import 任何 owner 模块）。
+#: 本契约不需要、也不得 import 那些 adapter —— registry 是声明式的，一致性由
 #: ``test_ai_research_evidence_ownership_guard`` 双向强制。
 SUPPORTED_OWNER_ADAPTERS = frozenset({
     EVIDENCE_SOURCE_MARKET_DATA,
     EVIDENCE_SOURCE_EXECUTION,
+    EVIDENCE_SOURCE_PORTFOLIO_RESEARCH,
 })
 
 # ---------------------------------------------------------------------------
@@ -601,7 +605,9 @@ class ResearchEvidenceRef:
     **没有公开 raw 构造器。** ``ResearchEvidenceRef(...)`` 一律抛 ``TypeError``；
     唯一的签发路径是**该 owner 自己的 factory**（market 的每一份是
     :func:`evidence_ref_from_market_reading`，execution 的每一份是
-    ``ai_research_execution_adapter.evidence_ref_from_execution_projection``）。identity
+    ``ai_research_execution_adapter.evidence_ref_from_execution_projection``，
+    portfolio/accounting 的每一份是
+    ``ai_research_portfolio_adapter.evidence_ref_from_portfolio_projection``）。identity
     由 owner 投影派生（调用方不提供），核验维度由**该 owner 的 factory** 归口 —— 因此
     "传字符串把自己声明成 owner 已核验事实"不可表达。
 
@@ -647,7 +653,9 @@ class ResearchEvidenceRef:
             "source_type / source_id / verification 字符串声明一条事实。"
             "请使用该 owner 已批准的 factory（market_data: "
             "evidence_ref_from_market_reading；execution: "
-            "ai_research_execution_adapter.evidence_ref_from_execution_projection）："
+            "ai_research_execution_adapter.evidence_ref_from_execution_projection；"
+            "portfolio/accounting: "
+            "ai_research_portfolio_adapter.evidence_ref_from_portfolio_projection）："
             "identity 与核验维度都由 owner 投影派生，调用方不参与"
         )
 
@@ -870,6 +878,7 @@ def _issue_evidence_ref(
     ```text
     ai_research_contract.evidence_ref_from_market_reading
     ai_research_execution_adapter.evidence_ref_from_execution_projection
+    ai_research_portfolio_adapter.evidence_ref_from_portfolio_projection
     ```
 
     绕过 ``__init__``（它恒抛错）并在设置完全部字段后跑 ``__post_init__``，
