@@ -369,6 +369,27 @@ def self_test_semantics() -> None:
     assert _is_fake_kill(result(1, err="SyntaxError: invalid syntax"))
     assert not _is_fake_kill(result(1, err="AssertionError: 2 != 3"))
 
+    # 6) --only 参数边界（OCR LOW TP 的修正点）。
+    #    case 1：缺 value → 受控 ERROR + exit 2，不抛 IndexError，不进 baseline，
+    #            不触碰 production source（真实子进程只走到参数解析即退出）。
+    proc = subprocess.run(
+        [sys.executable, os.path.abspath(__file__), "--only"],
+        capture_output=True, text=True, encoding="utf-8", errors="replace",
+        cwd=ROOT, timeout=300,
+    )
+    blob = (proc.stdout or "") + (proc.stderr or "")
+    assert proc.returncode == 2, f"expected exit 2, got {proc.returncode}: {blob[:200]}"
+    assert "Traceback" not in blob, "must not raise a bare IndexError"
+    assert "ERROR: --only requires" in blob, blob[:200]
+    assert "baseline" not in blob, "must not enter the baseline phase"
+    #    case 2/3 的选择语义（纯 helper 层）：正常选择 / 未知 id 交给 main 统一处理。
+    only, err = _parse_only(["--only", "M-PFACT-1"])
+    assert err is None and only == {"M-PFACT-1"}, (only, err)
+    only, err = _parse_only([])
+    assert only is None and err is None, (only, err)
+    only, err = _parse_only(["--only", "UNKNOWN-ID"])
+    assert err is None and only == {"UNKNOWN-ID"}, "unknown id → main 的 no-mutation-selected"
+
 
 def assert_no_leftover(path: str, mutation_id: str) -> None:
     with open(path, encoding="utf-8") as handle:
@@ -462,6 +483,25 @@ def _is_fake_kill(result: subprocess.CompletedProcess) -> bool:
     return bool(BROKEN_RE.search(blob))
 
 
+def _parse_only(argv: list[str]) -> tuple[set[str] | None, str | None]:
+    """解析 ``--only`` 选择器；返回 ``(selected_ids, error_message)``，两者互斥。
+
+    边界与同级处理一致：``--only`` 缺 value 时给可控的 ERROR（调用方 exit 2），
+    而不是让 ``argv.index("--only") + 1`` 越界抛裸 IndexError —— 那是 OCR 抓到的
+    LOW TP：调用方只会看到 traceback，而不是参数用法提示。``--only`` 指向未知
+    id / 空集合的情况由 main 的 "no mutation selected" 统一处理，不在本 helper 重复。
+    """
+    if "--only" not in argv:
+        return None, None
+    index = argv.index("--only")
+    if index + 1 >= len(argv):
+        return None, (
+            "ERROR: --only requires a comma-separated mutation id list "
+            "(for example: --only M-PFACT-1,M-PFACT-2)"
+        )
+    return {item for item in argv[index + 1].split(",") if item}, None
+
+
 def main() -> int:
     print(f"repo root: {ROOT}")
     argv = sys.argv[1:]
@@ -472,9 +512,10 @@ def main() -> int:
             flush=True,
         )
         return 2
-    only: set[str] | None = None
-    if "--only" in argv:
-        only = {item for item in argv[argv.index("--only") + 1].split(",") if item}
+    only, parse_error = _parse_only(argv)
+    if parse_error:
+        print(parse_error, flush=True)
+        return 2
 
     self_test_sequence()
     print("runner self-test: PASS (unique, increasing pycache sequence)")
