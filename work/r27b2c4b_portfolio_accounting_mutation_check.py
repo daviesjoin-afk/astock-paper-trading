@@ -30,13 +30,27 @@ baseline 规则（OCR finding 的修正）：``--non-vacuity`` 开关已删除�
 ``BASELINE-RED`` 并立即失败，**不进入** mutation 阶段。若不强制，一个在干净源码上本来就红的
 目标会让它的所有 mutation 都被记成 CAUGHT —— 那是假证据，违反 harness 自身的证据链要求。
 
+超时是**独立的分类**，既不是 CAUGHT 也不是 FAKE：mutation 运行抛
+``subprocess.TimeoutExpired`` 记 ``TIMEOUT``；baseline 抛则记 ``BASELINE-TIMEOUT``，
+两者都让 matrix FAIL。把超时折叠进 "被杀死"，等于把一个从未作出判定的运行发布成有效证据。
+
+``--only`` 的选择语义**绝不能静默变化**：除正常形态（``--only <ids>`` / ``--only=<ids>``）之外的
+任何 ``--only*`` 拼写、空 id 列表、重复 selector，都是受控 ERROR + exit 2，而不是"没有 selector
+所以跑全量 matrix"——操作者请求 targeted mutation 时，覆盖范围不能因为 CLI 拼写问题被悄悄放大。
+
+本文件自身的硬不变量**不使用 Python ``assert``**：``python -O`` 会剥除 assert，而证据链的守卫
+不能因为一个优化开关消失。所有 runtime evidence 断言走 :func:`_require`（显式 ``RuntimeError``），
+并由 :func:`self_test_optimization` 在 ``python -O`` 子进程里证明守卫没有被 optimization 消掉。
+
 用法：
     python work/r27b2c4b_portfolio_accounting_mutation_check.py
     python work/r27b2c4b_portfolio_accounting_mutation_check.py --only M-PFACT-1
+    python work/r27b2c4b_portfolio_accounting_mutation_check.py --only=M-PFACT-1,M-PFACT-2
 """
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import re
 import subprocess
@@ -238,8 +252,30 @@ MUTATIONS = [
 ]
 
 
+#: mutation 的终态分类。TIMEOUT 与 CAUGHT 语义不同：前者从未作出判定。
+VERDICT_CAUGHT = "CAUGHT"
+VERDICT_SURVIVED = "SURVIVED"
+VERDICT_FAKE = "FAKE"
+VERDICT_TIMEOUT = "TIMEOUT"
+
+#: baseline 超时 —— 与 BASELINE-RED 语义不同（测试根本没跑完，而非在干净源码上失败）。
+BASELINE_RED = "BASELINE-RED"
+BASELINE_TIMEOUT = "BASELINE-TIMEOUT"
+
+
 def sha256(blob: bytes) -> str:
     return hashlib.sha256(blob).hexdigest()
+
+
+def _require(condition: bool, message: str) -> None:
+    """本 harness 的 runtime evidence 断言 —— 显式失败，绝不用 ``assert``。
+
+    ``python -O`` 会把 ``assert`` 整条剥掉，于是"证明自己 PASS"的语句静默消失，
+    一个应该硬失败的证据链缺口会变成通过。所有 correctness / non-vacuity /
+    restore / classification 断言都走这里。
+    """
+    if not condition:
+        raise RuntimeError(message)
 
 
 def _adapt_eol(text: str, original: bytes) -> bytes:
@@ -287,8 +323,8 @@ class _ShortCircuit(RuntimeError):
 
 def self_test_sequence() -> None:
     seen = [_next_seq() for _ in range(5)]
-    assert len(set(seen)) == len(seen), f"sequence not unique: {seen}"
-    assert seen == sorted(seen), f"sequence not increasing: {seen}"
+    _require(len(set(seen)) == len(seen), f"sequence not unique: {seen}")
+    _require(seen == sorted(seen), f"sequence not increasing: {seen}")
     dirs: list[str] = []
     original = subprocess.run
     try:
@@ -303,15 +339,69 @@ def self_test_sequence() -> None:
                 pass
     finally:
         subprocess.run = original  # type: ignore[assignment]
-    assert len(dirs) == 3, f"expected 3 invocations, got {dirs}"
-    assert len(set(dirs)) == 3, f"invocations share a cache dir: {dirs}"
+    _require(len(dirs) == 3, f"expected 3 invocations, got {dirs}")
+    _require(len(set(dirs)) == 3, f"invocations share a cache dir: {dirs}")
+
+
+#: ``-O`` 探针：在优化解释器里复算 harness 的硬守卫，输出一行 JSON 报告。
+_OPTIMIZATION_PROBE = '''\
+"""在普通 / ``-O`` 解释器下复算 harness 的硬守卫。"""
+import importlib.util
+import json
+import sys
+
+spec = importlib.util.spec_from_file_location("_harness_under_probe", sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+
+ANCHOR = "    return a + b\\n"
+
+
+def outcome(call):
+    try:
+        call()
+    except RuntimeError:
+        return "RuntimeError"
+    except AssertionError:
+        return "AssertionError"
+    return "NO-ERROR"
+
+
+def apply_anchor(text):
+    return module._apply(
+        text, {"id": "PROBE", "file": "probe.py", "old": ANCHOR, "new": ""}
+    )
+
+
+print(json.dumps({
+    "optimized": not __debug__,
+    "implementation": sys.implementation.name,
+    "results": [
+        outcome(lambda: apply_anchor("def add(a, b):\\n    return a * b\\n")),
+        outcome(lambda: apply_anchor("def add(a, b):\\n" + ANCHOR + ANCHOR)),
+        outcome(lambda: apply_anchor("def add(a, b):\\n" + ANCHOR)),
+        outcome(lambda: module._require(False, "probe: hard guard must survive -O")),
+    ],
+}))
+'''
+
+
+def _cli_probe(argv: list[str], timeout: int = 300) -> tuple[int, str]:
+    """真实跑一次 CLI —— 只用于**参数解析阶段就退出**的用例，不触碰 production source。"""
+    proc = subprocess.run(
+        [sys.executable, os.path.abspath(__file__), *argv],
+        capture_output=True, text=True, encoding="utf-8", errors="replace",
+        cwd=ROOT, timeout=timeout,
+    )
+    return proc.returncode, (proc.stdout or "") + (proc.stderr or "")
 
 
 def self_test_semantics() -> None:
     """在临时目录里自证分类语义（stub 掉真实 runner，不触碰任何 production source）。
 
-    覆盖：BASELINE-RED 且不进入 mutation、CAUGHT、SURVIVED、FAKE（四类接线错误）、
-    restore 不一致硬失败、正常路径 byte-identical 还原。
+    覆盖：anchor 唯一性、BASELINE-RED / BASELINE-TIMEOUT 且不进入 mutation、CAUGHT、
+    SURVIVED、FAKE（四类接线错误）、TIMEOUT、restore sha256 硬失败、byte-identical
+    还原、``--only`` 的全部参数边界。
     """
     root = tempfile.mkdtemp(prefix="r27b2c4b_mutation_semantics_")
     rel = "semantics_target.py"
@@ -323,11 +413,29 @@ def self_test_semantics() -> None:
     def result(code: int, out: str = "", err: str = "") -> subprocess.CompletedProcess:
         return subprocess.CompletedProcess(args=[], returncode=code, stdout=out, stderr=err)
 
+    def source_bytes() -> bytes:
+        with open(path, "rb") as handle:
+            return handle.read()
+
     mutation = {
         "id": "SELF-1", "file": rel,
         "old": "    return a + b\n", "new": "    return a - b  # MUTANT\n",
         "test": "test_semantics.Fake.test_add", "desc": "self-test semantic mutant",
     }
+
+    # 0) anchor 唯一性是证据链的硬不变量：0 次命中与多次命中都必须硬失败，
+    #    绝不允许落到 replace(..., 1) 上（那会让"测试被杀"归因到一个没发生的改写）。
+    for label, text in (
+        ("count=0", "def add(a, b):\n    return a * b\n"),
+        ("count=2", "def add(a, b):\n    return a + b\n    return a + b\n"),
+    ):
+        try:
+            _apply(text, {"id": "SELF-ANCHOR", "file": rel,
+                          "old": mutation["old"], "new": ""})
+        except RuntimeError as exc:
+            _require("anchor must be unique" in str(exc) and label in str(exc), exc)
+        else:
+            raise RuntimeError(f"{label}: non-unique anchor did not hard-fail")
 
     # 1) baseline RED → 整体失败，且 production source 一个字节都不被触碰。
     seen: list[str] = []
@@ -336,59 +444,147 @@ def self_test_semantics() -> None:
         seen.append(target)
         return result(1, "", "AssertionError: expected 2 got 3")
 
-    assert run_baselines([mutation], runner=red_baseline) == 1, "baseline RED must fail"
-    assert seen == [mutation["test"]], f"baseline must run exactly the deduped target: {seen}"
-    with open(path, "rb") as handle:
-        assert handle.read() == original.encode("utf-8"), (
-            "baseline phase must not touch the source")
+    _require(run_baselines([mutation], runner=red_baseline) == 1, "baseline RED must fail")
+    _require(seen == [mutation["test"]], f"baseline must run exactly the deduped target: {seen}")
+    _require(source_bytes() == original.encode("utf-8"),
+             "baseline phase must not touch the source")
 
-    # 2/3/4) baseline GREEN 之后的分类：CAUGHT / SURVIVED / FAKE。
+    # 2) baseline TIMEOUT → 同样整体失败、mutation 阶段不启动。
+    #    它与 BASELINE-RED 语义不同：测试根本没跑完，不是"在干净源码上本来就是红的"。
+    seen.clear()
+
+    def timeout_baseline(target: str, seq: int | None = None):
+        seen.append(target)
+        raise subprocess.TimeoutExpired(cmd=target, timeout=900)
+
+    _require(run_baselines([mutation], runner=timeout_baseline) == 1,
+             "baseline TIMEOUT must fail the matrix")
+    _require(seen == [mutation["test"]],
+             f"baseline TIMEOUT must stop after the first target: {seen}")
+    _require(source_bytes() == original.encode("utf-8"),
+             "baseline TIMEOUT must not touch the source")
+
+    # 3/4/5) baseline GREEN 之后的分类：CAUGHT / SURVIVED / FAKE。
     def runner_for(code: int, out: str = "", err: str = ""):
         def _run(target: str, seq: int | None = None):
             return result(code, out, err)
         return _run
 
-    assert run_mutation(mutation, root=root, runner=runner_for(1)) == "CAUGHT"
-    with open(path, "rb") as handle:
-        assert handle.read() == original.encode("utf-8"), "bytes must be restored exactly"
-    assert run_mutation(mutation, root=root, runner=runner_for(0)) == "SURVIVED"
+    _require(run_mutation(mutation, root=root, runner=runner_for(1)) == VERDICT_CAUGHT,
+             "returncode 1 with a business assertion failure must be CAUGHT")
+    _require(source_bytes() == original.encode("utf-8"), "bytes must be restored exactly")
+    _require(run_mutation(mutation, root=root, runner=runner_for(0)) == VERDICT_SURVIVED,
+             "returncode 0 must be SURVIVED")
+    _require(source_bytes() == original.encode("utf-8"), "bytes must be restored exactly")
     for err in ("SyntaxError: invalid syntax", "ImportError: no module named x",
                 "NameError: name 'x' is not defined", "_FailedTest: collection failure"):
         verdict = run_mutation(mutation, root=root, runner=runner_for(1, err=err))
-        assert verdict == "FAKE", f"{err} must be FAKE, got {verdict}"
+        _require(verdict == VERDICT_FAKE, f"{err} must be FAKE, got {verdict}")
 
-    # 5) restore 不一致 → 硬失败（人为给一个错误的启动快照 sha）。
+    # 6) 超时是独立分类：不能算 CAUGHT，也不能算 FAKE，且必须仍然完整还原源码。
+    def timeout_runner(target: str, seq: int | None = None):
+        raise subprocess.TimeoutExpired(cmd=target, timeout=900)
+
+    _require(run_mutation(mutation, root=root, runner=timeout_runner) == VERDICT_TIMEOUT,
+             "TimeoutExpired must classify as TIMEOUT, not CAUGHT/FAKE")
+    _require(source_bytes() == original.encode("utf-8"),
+             "TIMEOUT must still restore the source byte-identically")
+    _require("MUTANT" not in source_bytes().decode("utf-8"),
+             "TIMEOUT must not leave the mutant on disk")
+
+    # 7) restore 不一致 → 硬失败（人为给一个错误的启动快照 sha）。
     try:
         _restore_and_verify(path, original.encode("utf-8"), "0" * 64, mutation["id"])
     except RuntimeError as exc:
-        assert "restore sha256 mismatch" in str(exc), exc
+        _require("restore sha256 mismatch" in str(exc), exc)
     else:
-        raise AssertionError("restore mismatch did not hard-fail")
+        raise RuntimeError("restore mismatch did not hard-fail")
 
-    # 非空性：BROKEN_RE 必须真的能区分接线错误与业务断言失败。
-    assert _is_fake_kill(result(1, err="SyntaxError: invalid syntax"))
-    assert not _is_fake_kill(result(1, err="AssertionError: 2 != 3"))
+    # 8) 非空性：BROKEN_RE 必须真的能区分接线错误与业务断言失败。
+    _require(_is_fake_kill(result(1, err="SyntaxError: invalid syntax")),
+             "BROKEN_RE failed to flag a wiring error")
+    _require(not _is_fake_kill(result(1, err="AssertionError: 2 != 3")),
+             "BROKEN_RE must not flag a business assertion failure")
 
-    # 6) --only 参数边界（OCR LOW TP 的修正点）。
-    #    case 1：缺 value → 受控 ERROR + exit 2，不抛 IndexError，不进 baseline，
-    #            不触碰 production source（真实子进程只走到参数解析即退出）。
-    proc = subprocess.run(
-        [sys.executable, os.path.abspath(__file__), "--only"],
-        capture_output=True, text=True, encoding="utf-8", errors="replace",
-        cwd=ROOT, timeout=300,
-    )
-    blob = (proc.stdout or "") + (proc.stderr or "")
-    assert proc.returncode == 2, f"expected exit 2, got {proc.returncode}: {blob[:200]}"
-    assert "Traceback" not in blob, "must not raise a bare IndexError"
-    assert "ERROR: --only requires" in blob, blob[:200]
-    assert "baseline" not in blob, "must not enter the baseline phase"
-    #    case 2/3 的选择语义（纯 helper 层）：正常选择 / 未知 id 交给 main 统一处理。
-    only, err = _parse_only(["--only", "M-PFACT-1"])
-    assert err is None and only == {"M-PFACT-1"}, (only, err)
-    only, err = _parse_only([])
-    assert only is None and err is None, (only, err)
-    only, err = _parse_only(["--only", "UNKNOWN-ID"])
-    assert err is None and only == {"UNKNOWN-ID"}, "unknown id → main 的 no-mutation-selected"
+    # 9) --only 的选择语义（helper 层）：只有"没有 selector / 合法 ids / 受控 ERROR"三态，
+    #    绝不能把未知拼写解释成"没有 selector，所以跑全量 matrix"。
+    _require(_parse_only([]) == (None, None), "no selector must mean the full matrix")
+    for argv, ids in (
+        (["--only", "M-PFACT-1"], {"M-PFACT-1"}),
+        (["--only=M-PFACT-1"], {"M-PFACT-1"}),
+        (["--only", "M-PFACT-1,M-PFACT-2"], {"M-PFACT-1", "M-PFACT-2"}),
+        (["--only=M-PFACT-1,M-PFACT-2"], {"M-PFACT-1", "M-PFACT-2"}),
+    ):
+        _require(_parse_only(argv) == (ids, None), f"{argv} must select {ids}")
+    #    未知 id 的解析本身是成功的 —— 由 main 的 "no mutation selected" 统一处理。
+    _require(_parse_only(["--only", "UNKNOWN-ID"]) == ({"UNKNOWN-ID"}, None),
+             "an unknown id is a selection miss, not a parse error")
+    for argv in (
+        ["--only"],
+        ["--only="],
+        ["--only", ""],
+        ["--only", ","],
+        ["--only=,"],
+        ["--onlyy=M-PFACT-1"],
+        ["--only", "--only"],
+        ["--only", "M-PFACT-1", "--only", "M-PFACT-2"],
+    ):
+        only, err = _parse_only(argv)
+        _require(only is None and isinstance(err, str) and err.startswith("ERROR:"),
+                 f"{argv} must be a controlled ERROR, got {(only, err)}")
+
+    # 10) 同一条边界在**真实 CLI** 上：exit 2、受控 ERROR、不抛裸 traceback、
+    #     不进 baseline 阶段（因此一个字节的 mutation 都不会落盘）。
+    for argv in (["--only"], ["--only="], ["--onlyy=M-PFACT-1"],
+                 ["--only", "M-PFACT-1", "--only", "M-PFACT-2"]):
+        code, blob = _cli_probe(argv)
+        _require(code == 2, f"{argv}: expected exit 2, got {code}: {blob[:200]}")
+        _require("Traceback" not in blob, f"{argv}: must not raise a bare traceback: {blob[:200]}")
+        _require("ERROR:" in blob, f"{argv}: expected a controlled ERROR: {blob[:200]}")
+        _require("baseline" not in blob, f"{argv}: must not enter the baseline phase")
+    #     --only=<ids> 必须真的走到选择阶段（不是被解析层拒掉）：未知 id → 空选择。
+    code, blob = _cli_probe(["--only=NO-SUCH-MUTATION"])
+    _require(code == 2, f"--only=<ids>: expected exit 2, got {code}: {blob[:200]}")
+    _require("no mutation selected" in blob,
+             f"--only=<ids> must reach the selection stage: {blob[:200]}")
+
+
+def self_test_optimization() -> None:
+    """证明 harness 的硬守卫在 ``python -O`` 下**仍然存在**。
+
+    ``assert`` 会被 ``-O`` 整条剥除。本 harness 的证据链守卫（anchor 唯一性、restore
+    sha256、分类语义）一律走 :func:`_require`，这个 self-test 就是它的非空性证明：用
+    ``sys.executable`` 起两个最小子进程（普通解释器 / ``-O``）跑同一份探针，要求两者都
+    得到 ``RuntimeError``，并且 ``-O`` 那次**确实**处于优化模式（``__debug__ is False``）。
+    否则"在 -O 下也成立"就是对着普通解释器做的空证明。
+    """
+    root = tempfile.mkdtemp(prefix="r27b2c4b_optimization_probe_")
+    probe = os.path.join(root, "optimization_probe.py")
+    with open(probe, "w", encoding="utf-8", newline="") as handle:
+        handle.write(_OPTIMIZATION_PROBE)
+
+    #: count=0 / count=2 / count=1 / _require(False) —— 前两个与第四个必须硬失败，
+    #: 第三个是阳性对照：守卫不能被做得"一律失败"。
+    expected = ["RuntimeError", "RuntimeError", "NO-ERROR", "RuntimeError"]
+    env = {key: value for key, value in os.environ.items() if key != "PYTHONOPTIMIZE"}
+    for flags, want_optimized in (([], False), (["-O"], True)):
+        proc = subprocess.run(
+            [sys.executable, *flags, probe, os.path.abspath(__file__)],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            cwd=ROOT, timeout=300, env=env,
+        )
+        label = " ".join(flags) or "(default)"
+        blob = (proc.stdout or "") + (proc.stderr or "")
+        _require(proc.returncode == 0, f"optimization probe {label} failed: {blob[:400]}")
+        try:
+            report = json.loads((proc.stdout or "").strip().splitlines()[-1])
+        except (ValueError, IndexError) as exc:
+            raise RuntimeError(
+                f"optimization probe {label} produced no report: {blob[:400]}") from exc
+        _require(report.get("optimized") is want_optimized,
+                 f"python {label} did not run in the expected mode: {report}")
+        _require(report.get("results") == expected,
+                 f"hard guards differ under python {label}: {report}")
 
 
 def assert_no_leftover(path: str, mutation_id: str) -> None:
@@ -415,6 +611,10 @@ def run_baselines(selected, *, runner=run_test) -> int:
     它的所有 mutation 都会因 ``returncode != 0`` 被记成 CAUGHT —— 那是假证据。因此对
     selected mutations 的**去重** target 集合依次运行；任一非 GREEN 立即失败，
     **不进入** mutation 阶段。
+
+    baseline 阶段的 ``subprocess.TimeoutExpired`` 记 :data:`BASELINE_TIMEOUT`，与
+    ``BASELINE-RED`` **语义不同**（前者根本没跑完，后者是在干净源码上失败），但同样
+    让 matrix FAIL 且 mutation 阶段不启动。
     """
     targets: list[str] = []
     for mutation in selected:
@@ -423,31 +623,47 @@ def run_baselines(selected, *, runner=run_test) -> int:
     if not targets:
         print("baseline: no target selected", flush=True)
         return 1
-    bad: list[str] = []
+    red: list[str] = []
+    timed_out: list[str] = []
     for target in targets:
-        result = runner(target)
+        try:
+            result = runner(target)
+        except subprocess.TimeoutExpired:
+            print(f"baseline {target}: {BASELINE_TIMEOUT}", flush=True)
+            timed_out.append(target)
+            continue
         if result.returncode == 0:
             print(f"baseline {target}: GREEN", flush=True)
         else:
-            print(f"baseline {target}: BASELINE-RED({result.returncode})", flush=True)
-            bad.append(target)
-    if bad:
-        print(
-            f"baseline: RED —— {len(bad)}/{len(targets)} 个目标在干净源码上非 GREEN：{bad}",
-            "mutation 阶段不启动（baseline 是强制前提）",
-            sep="\n", flush=True,
-        )
+            print(f"baseline {target}: {BASELINE_RED}({result.returncode})", flush=True)
+            red.append(target)
+    if timed_out or red:
+        if timed_out:
+            print(
+                f"baseline: TIMEOUT —— {len(timed_out)}/{len(targets)} 个目标未跑完：{timed_out}",
+                flush=True,
+            )
+        if red:
+            print(
+                f"baseline: RED —— {len(red)}/{len(targets)} 个目标在干净源码上非 GREEN：{red}",
+                flush=True,
+            )
+        print("mutation 阶段不启动（baseline 是强制前提）", flush=True)
         return 1
     print(f"baseline: GREEN（{len(targets)} 个目标全部先于 mutation 验证）", flush=True)
     return 0
 
 
 def run_mutation(mutation: dict, *, root: str = ROOT, runner=run_test) -> str:
-    """Return ``CAUGHT`` / ``SURVIVED`` / ``FAKE``。
+    """Return ``CAUGHT`` / ``SURVIVED`` / ``FAKE`` / ``TIMEOUT``。
 
     baseline 由 :func:`run_baselines` 在进入 mutation 阶段**之前**统一证明；本函数不再
     含任何"是否跑 baseline"的分支 —— 那正是 OCR 抓到的假证据缺口：默认路径允许跳过
     baseline，于是一个本来就红的目标会让它的所有 mutation 被记成 CAUGHT。
+
+    ``subprocess.TimeoutExpired`` 单独归为 :data:`VERDICT_TIMEOUT`：超时既不是被业务断言
+    杀死（CAUGHT），也不是接线错误（FAKE），它是一个**从未作出判定**的运行。无论走哪条
+    路径，``finally`` 都按启动快照 byte-identical 还原并校验 sha256。
     """
     path = os.path.join(root, mutation["file"])
     with open(path, "rb") as handle:
@@ -459,22 +675,32 @@ def run_mutation(mutation: dict, *, root: str = ROOT, runner=run_test) -> str:
     try:
         with open(path, "wb") as handle:
             handle.write(_adapt_eol(mutated, original))
-        result = runner(mutation["test"])
+        try:
+            result = runner(mutation["test"])
+        except subprocess.TimeoutExpired:
+            return VERDICT_TIMEOUT
         if result.returncode == 0:
-            return "SURVIVED"
+            return VERDICT_SURVIVED
         if _is_fake_kill(result):
-            return "FAKE"
-        return "CAUGHT"
+            return VERDICT_FAKE
+        return VERDICT_CAUGHT
     finally:
         _restore_and_verify(path, original, before, mutation["id"])
 
 
 def _apply(text: str, mutation: dict) -> str:
+    """应用 mutation；anchor 必须**恰好命中一次**，否则硬失败。
+
+    ``count == 0`` 会让 ``str.replace`` 静默返回原文 —— mutation 从未落盘，随后那条测试
+    "被杀死" 就另有原因，是假证据；``count > 1`` 会让 ``replace(..., 1)`` 只改第一处，
+    改的不是被证明的那一处。两种都必须硬失败，且在 ``python -O`` 下同样硬失败，
+    所以这里（以及本文件所有 runtime evidence 检查）走 :func:`_require`，不用 ``assert``。
+    """
     count = text.count(mutation["old"])
-    assert count == 1, (
+    _require(count == 1, (
         f'{mutation["id"]}: mutation anchor must be unique; count={count}; '
         f'file={mutation["file"]}; anchor={mutation["old"][:60]!r}'
-    )
+    ))
     return text.replace(mutation["old"], mutation["new"], 1)
 
 
@@ -486,20 +712,49 @@ def _is_fake_kill(result: subprocess.CompletedProcess) -> bool:
 def _parse_only(argv: list[str]) -> tuple[set[str] | None, str | None]:
     """解析 ``--only`` 选择器；返回 ``(selected_ids, error_message)``，两者互斥。
 
-    边界与同级处理一致：``--only`` 缺 value 时给可控的 ERROR（调用方 exit 2），
-    而不是让 ``argv.index("--only") + 1`` 越界抛裸 IndexError —— 那是 OCR 抓到的
-    LOW TP：调用方只会看到 traceback，而不是参数用法提示。``--only`` 指向未知
-    id / 空集合的情况由 main 的 "no mutation selected" 统一处理，不在本 helper 重复。
+    只有三种结果，不存在第四种：
+
+    1. argv 里没有 selector → ``(None, None)`` → 默认 full matrix；
+    2. selector 合法 → ``(ids, None)``；
+    3. selector 形态存在但非法 → ``(None, "ERROR: ...")`` → 调用方 exit 2。
+
+    受支持的形式只有 ``--only <ids>`` 与 ``--only=<ids>``。**任何**以 ``--only`` 开头但
+    不属于这两种的 token（``--onlyy=...`` 之类的拼写错误、``--only=`` 空列表、缺少
+    value、重复 selector）都是第 3 类，而不是"没有 selector 所以跑全量 matrix"。
+    理由：操作者请求 targeted mutation 时，实际覆盖范围绝不能因为 CLI 拼写问题被静默放大 ——
+    那会让一份"只跑了 1 条 mutation"的证据看起来像一次全量验证。
+
+    ``--only`` 指向未知 id 由 main 的 "no mutation selected" 统一处理，不在本 helper 重复：
+    那是**选择落空**，不是**参数非法**。
     """
-    if "--only" not in argv:
+    matches = [item for item in argv if item.startswith("--only")]
+    if not matches:
         return None, None
-    index = argv.index("--only")
-    if index + 1 >= len(argv):
+    if len(matches) > 1:
         return None, (
-            "ERROR: --only requires a comma-separated mutation id list "
-            "(for example: --only M-PFACT-1,M-PFACT-2)"
+            f"ERROR: --only 只能出现一次（收到 {len(matches)} 个：{matches}）。"
+            "重复选择器不是'取并集'，因此拒绝而不是猜。"
         )
-    return {item for item in argv[index + 1].split(",") if item}, None
+    token = matches[0]
+    if token == "--only":
+        index = argv.index(token)
+        if index + 1 >= len(argv) or argv[index + 1].startswith("-"):
+            return None, (
+                "ERROR: --only requires a comma-separated mutation id list "
+                "(for example: --only M-PFACT-1,M-PFACT-2)"
+            )
+        raw = argv[index + 1]
+    elif token.startswith("--only="):
+        raw = token[len("--only="):]
+    else:
+        return None, (
+            f"ERROR: unrecognized selector argument {token!r}; 受支持的形式只有 "
+            "--only <ids> 与 --only=<ids>。未知拼写不会被当作'没有 selector'来处理。"
+        )
+    ids = {item for item in raw.split(",") if item}
+    if not ids:
+        return None, f"ERROR: --only 需要非空的逗号分隔 id 列表，收到 {raw!r}"
+    return ids, None
 
 
 def main() -> int:
@@ -517,15 +772,23 @@ def main() -> int:
         print(parse_error, flush=True)
         return 2
 
-    self_test_sequence()
-    print("runner self-test: PASS (unique, increasing pycache sequence)")
-    self_test_semantics()
-    print("semantics self-test: PASS (BASELINE-RED / CAUGHT / SURVIVED / FAKE / restore)")
-
+    #: 选择阶段先于 self-test：参数 / 选择非法时立刻退出，不为一条误用的命令跑全套自检；
+    #: 这也让 self-test 能用**真实子进程**验证 CLI 边界而不产生自递归。
     selected = [m for m in MUTATIONS if only is None or m["id"] in only]
     if not selected:
         print("no mutation selected", flush=True)
         return 2
+    #: 覆盖范围必须显式回显 —— 参数谜题的代价正是"以为只跑了 1 条，其实跑了 10 条"。
+    print(f'selected: {len(selected)}/{len(MUTATIONS)} mutation(s): '
+          f'{[m["id"] for m in selected]}', flush=True)
+
+    self_test_sequence()
+    print("runner self-test: PASS (unique, increasing pycache sequence)")
+    self_test_semantics()
+    print("semantics self-test: PASS (anchor uniqueness / BASELINE-RED / BASELINE-TIMEOUT / "
+          "CAUGHT / SURVIVED / FAKE / TIMEOUT / restore / --only)")
+    self_test_optimization()
+    print("optimization self-test: PASS (hard guards survive python -O)")
 
     if run_baselines(selected) != 0:
         print("mutation matrix: FAILED —— baseline 非 GREEN，mutation 阶段未启动", flush=True)
@@ -537,16 +800,18 @@ def main() -> int:
         results.append((mutation["id"], verdict))
         print(f'{mutation["id"]} {mutation["desc"]}: {verdict}', flush=True)
 
-    bad = [(mid, v) for mid, v in results if v != "CAUGHT"]
+    bad = [(mid, v) for mid, v in results if v != VERDICT_CAUGHT]
     for mid, verdict in bad:
         print(f"NOT-CAUGHT {mid}: {verdict}")
-    detected = len(results) - len(bad)
-    survived = sum(1 for _, v in bad if v.startswith("SURVIVED"))
-    fake = sum(1 for _, v in bad if v == "FAKE")
+    detected = sum(1 for _, v in results if v == VERDICT_CAUGHT)
+    survived = sum(1 for _, v in results if v == VERDICT_SURVIVED)
+    fake = sum(1 for _, v in results if v == VERDICT_FAKE)
+    timeout = sum(1 for _, v in results if v == VERDICT_TIMEOUT)
     print(f"R27-B2C-4B mutation matrix: baseline=GREEN; "
-          f"{detected}/{len(results)} DETECTED; survived={survived}; fake={fake}")
+          f"{detected}/{len(results)} DETECTED; survived={survived}; fake={fake}; "
+          f"timeout={timeout}")
     gate_pass = not bad
-    print("gate: baseline=GREEN, survived=0, fake=0, restore sha256=PASS -> "
+    print("gate: baseline=GREEN, survived=0, fake=0, timeout=0, restore sha256=PASS -> "
           f"{'PASS' if gate_pass else 'FAIL'}")
     return 0 if gate_pass else 1
 
