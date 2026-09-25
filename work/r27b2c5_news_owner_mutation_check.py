@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""R27-B2C-5 mutation matrix —— M-NEWS-01 .. M-NEWS-17。
+"""R27-B2C-5 mutation matrix —— M-NEWS-01 .. M-NEWS-18。
 
 只覆盖本轮**新的高风险 invariant**。每条 mutation 都必须让唯一指定的永久回归变 RED，
 anchor 恰好命中一次；baseline 是 matrix 的强制前提，接线错误（SyntaxError / ImportError /
@@ -7,9 +7,12 @@ NameError …）一律计为 FAKE（假杀不能算证据）。
 
 本轮的不变量分五组：
 
-* **availability 只能来自 first_seen_at**（M-NEWS-01 / 05 / 06 / 13）：
+* **availability 只能来自 first_seen_at**（M-NEWS-01 / 05 / 06 / 13 / 18）：
   ``published_at``（来源声称的发布时间）与 ``created_at``（行写入时刻）都**不是**可用性
   authority；把任一个拿来做边界，或让不可证明的 PIT 回退到描述性时间，都必须 RED。
+  M-NEWS-18 覆盖同一条不变量的**日历口径**一侧：owner instant 必须归一到 owner 时区，
+  否则 ``availability_day`` 会按原始 offset 的日期派生，让一个跨 UTC 午夜的 instant 声明
+  出比真实可用日更早的业务日 —— 那会直接绕过 ``InformationEvent`` 的 look-ahead guard。
 * **grade / 单源 / 未知状态都不是核验**（M-NEWS-02 / 03 / 04 / 16）：
   ``grade="A"`` 不得升级；``single_source_linked`` 不得升级；未知 ledger 状态不得默认；
   归口退回 catch-all（把 source-unusable 压平进 unverified）同样必须 RED。
@@ -121,6 +124,7 @@ T_NEWS_30 = _owner("test_NEWS_30_created_at_is_never_an_availability_authority")
 T_NEWS_31 = _adapter("test_NEWS_31_adapter_signature_takes_only_the_owner_projection")
 T_NEWS_32 = _adapter("test_NEWS_32_caller_cannot_name_the_identity_or_the_as_of")
 T_NEWS_33 = _adapter("test_NEWS_33_adapter_is_pure_no_db_no_network_no_clock")
+T_NEWS_34 = _adapter("test_NEWS_34_availability_day_is_normalized_to_the_owner_timezone")
 
 #: brief 点名、但本 matrix **不**声称能打红的永久回归：它们必须在 baseline 里是 GREEN。
 #: 这些是"能力/边界已经存在"的断言（owner 端到端、契约层 look-ahead、registry 三方一致、
@@ -140,6 +144,8 @@ AVAILABILITY_LINE = (
 POST_INIT_PIT_LINE = (
     "        instant = _parse_owner_instant(self.first_seen_at, what=\"first_seen_at\")\n"
 )
+#: ``_parse_owner_instant`` 的返回 —— 必须归一到 **owner 时区**，否则派生日历日会换口径。
+OWNER_INSTANT_RETURN = "    return parsed.astimezone(TZ)\n"
 #: 历史读遇到不可读 ledger 的 fail-closed 分支。
 LEDGER_UNAVAILABLE = (
     "        except sqlite3.OperationalError as exc:\n"
@@ -406,6 +412,15 @@ MUTATIONS = [
         + "# MUTANT —— registry 与已存在的 news adapter 漂移\n",
         "test": T_NEWS_25,
         "desc": "SUPPORTED_OWNER_ADAPTERS 删掉 news，与已存在的 news adapter 漂移",
+    },
+    {
+        "id": "M-NEWS-18",
+        # 派生日历日换口径：跨 UTC 午夜的 instant 会让 ref 声明一个更早的业务日。
+        "file": OWNER_FILE,
+        "old": OWNER_INSTANT_RETURN,
+        "new": "    return parsed  # MUTANT —— 不归一到 owner 时区\n",
+        "test": T_NEWS_34,
+        "desc": "owner instant 不再归一到 owner 时区（availability_day 照抄原始 offset 的日期）",
     },
 ]
 

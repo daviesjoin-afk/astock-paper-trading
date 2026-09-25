@@ -513,6 +513,46 @@ class NewsAdapterTests(unittest.TestCase):
         self.assertIn("ai_research_contract", _imported_roots(ADAPTER_MODULE))
         self.assertIn("news_learning", _imported_roots(ADAPTER_MODULE))
 
+    # ---------- NEWS-34：availability_day 必须按 owner 时区归一 ----------
+
+    def test_NEWS_34_availability_day_is_normalized_to_the_owner_timezone(self):
+        """``first_seen_at`` 允许带任意 offset —— 业务日必须按 **owner 时区**算。
+
+        owner 的日历语义是 Asia/Shanghai：read 的日边界是 ``as_of + 23:59:59+08:00``。
+        如果 projection 的 ``availability_day`` 改照抄原始 offset 的 ``.date()``，两边就会
+        用**两套日期口径**：一个跨过 UTC 午夜的 instant 会让 ref 声明一个比真实可用日**更早**
+        的业务日，于是 ``InformationEvent`` 的 look-ahead guard 被绕过 —— 那正是 B2C-5 最
+        核心的 PIT invariant。
+        """
+        # 2026-09-20T16:30+00:00 == 上海 2026-09-21 00:30 ⇒ 业务日是 9/21，不是 9/20。
+        self._event(event_key="EK-UTC-MIDNIGHT", first_seen_at="2026-09-20T16:30:00+00:00")
+        # 反向对照：2026-09-21T01:00+14:00 == 上海 2026-09-20 19:00 ⇒ 业务日是 9/20。
+        self._event(event_key="EK-FAR-EAST", first_seen_at="2026-09-21T01:00:00+14:00")
+
+        def identities(as_of):
+            return {f.identity for f in NL.news_fact_projections(self.conn, as_of=as_of)}
+
+        # 日边界本来就比较 aware instant，因此 filter 两个方向都正确（这是对照，不是被测点）。
+        self.assertNotIn("EK-UTC-MIDNIGHT", identities(ASOF_DAY))
+        self.assertIn("EK-UTC-MIDNIGHT", identities(INGEST_DAY))
+        self.assertIn("EK-FAR-EAST", identities(ASOF_DAY))
+
+        facts = {f.identity: f for f in NL.news_fact_projections(self.conn, as_of=INGEST_DAY)}
+        # 被测点：业务日按 owner 时区归一，而不是原始 offset 的日期。
+        self.assertEqual(facts["EK-UTC-MIDNIGHT"].availability_day, INGEST_DAY)
+        self.assertEqual(facts["EK-FAR-EAST"].availability_day, ASOF_DAY)
+        # exact timestamp 逐字保留 —— first_seen_at 与 availability_day 不得互换。
+        self.assertEqual(facts["EK-UTC-MIDNIGHT"].first_seen_at, "2026-09-20T16:30:00+00:00")
+
+        # 跨到 adapter：ref.as_of 必须是归一后的业务日，否则下游会拿到一个更早的日期。
+        ref = _ref(facts["EK-UTC-MIDNIGHT"])
+        self.assertEqual(ref.as_of, INGEST_DAY)
+        event = ARC.InformationEvent(as_of=INGEST_DAY, source="news_test", evidence_ref=ref)
+        self.assertEqual(event.as_of, INGEST_DAY)
+        # 而且不得被塞进一个更早的事件里（否则 look-ahead guard 就形同虚设）。
+        with self.assertRaises(ValueError):
+            ARC.InformationEvent(as_of=ASOF_DAY, source="news_test", evidence_ref=ref)
+
 
 if __name__ == "__main__":
     unittest.main()
