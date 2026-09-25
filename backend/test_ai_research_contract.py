@@ -151,6 +151,12 @@ ALLOWED_AI_CONSUMERS: set[str] = {
     #: import 契约才能构造 ``InformationEvent`` / 调用 market factory。它**不是**
     #: authority，也**不是**接缝：只消费 owner 投影，不签发 ref。
     "deepseek_research.py",
+    #: R27-B2C-5 新增**第七个**：``ai_research_news_adapter`` —— news 事实的 owner
+    #: adapter。它与 execution / portfolio 那两份同构：owner（``news_learning``）不得
+    #: import research，research 契约也不得 import DB-backed news owner，因此必须有一条
+    #: 同时认识两套词表的接缝，并且只能是**一条**。它今天是**零 production 调用点**的
+    #: 能力交付（event_evidence runtime 迁移属于后续 convergence）。
+    "ai_research_news_adapter.py",
 }
 
 #: 时钟 / 随机数 / IO —— 研究契约一旦读它们，就能拿 current state 回填历史。
@@ -1281,9 +1287,10 @@ class OwnerNativeVerificationTests(unittest.TestCase):
                 ARC.EVIDENCE_SOURCE_MARKET_DATA,
                 ARC.EVIDENCE_SOURCE_EXECUTION,
                 ARC.EVIDENCE_SOURCE_PORTFOLIO_RESEARCH,
+                ARC.EVIDENCE_SOURCE_NEWS,
             }),
             ARC.SUPPORTED_OWNER_ADAPTERS,
-            "已批准的 owner adapter registry 与 B2C-3 / B2C-4B 的范围不一致",
+            "已批准的 owner adapter registry 与 B2C-3 / B2C-4B / B2C-5 的范围不一致",
         )
         self.assertFalse(hasattr(ARC, "_OWNER_ISSUED"),
                          "不得存在可 import 的构造哨兵（那是伪安全）")
@@ -1297,8 +1304,9 @@ class OwnerNativeVerificationTests(unittest.TestCase):
                 "execution_verification", "execution_evidence",
                 "ai_research_execution_adapter",
                 "paper_portfolio_read_model", "ai_research_portfolio_adapter",
+                "news_learning", "ai_research_news_adapter",
             },
-            "research contract 不得 import execution / portfolio owner 或它们的 adapter",
+            "research contract 不得 import execution / portfolio / news owner 或它们的 adapter",
         )
 
         # 契约模块里签发口只被 owner factory 调用（**唯一**一处）。
@@ -1625,6 +1633,7 @@ class AiResearchArchitectureGuardTests(unittest.TestCase):
                     "ai_research_repository", "ai_research_service",
                     "ai_research_execution_adapter",
                     "ai_research_portfolio_adapter",
+                    "ai_research_news_adapter",
                 ):
                     offenders.append(f"{name}: import {imported}")
         self.assertEqual(

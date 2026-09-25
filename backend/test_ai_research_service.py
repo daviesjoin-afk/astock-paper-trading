@@ -67,6 +67,7 @@ LOWER_LAYER_MODULES = (
     "ai_provider_transport.py",
     "ai_research_execution_adapter.py",
     "ai_research_portfolio_adapter.py",
+    "ai_research_news_adapter.py",
 )
 
 #: 固定业务日 / 固定运维时刻 —— 与本机时钟无关，测试因此完全确定。

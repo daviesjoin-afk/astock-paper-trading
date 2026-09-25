@@ -2492,6 +2492,95 @@ portfolio owner 也不得 import research。这条接缝在 B2C-4C 的跨 owner 
 而且**只能有一条**。
 
 
+### news owner readiness（R27-B2C-5）
+
+news owner 是 `news_learning` 的 durable event ledger（`news_events` /
+`market_major_events`）。本轮的交付物是 **owner typed 事实 + 唯一 adapter + 回归**，
+**不是** runtime 迁移。
+
+```text
+news_learning.news_fact_projections(conn, as_of=…)      owner 的 typed 历史读（纯读 ledger）
+              ↓
+        NewsFactProjection                              owner factual truth（identity / PIT / 核验）
+              ↓
+ai_research_news_adapter.evidence_ref_from_news_projection
+              ↓
+        ARC.ResearchEvidenceRef(source_type="news")     research 侧唯一认识的形状
+```
+
+**这就是 Family C 的可迁移部分，而且是全部。** 本轮**没有**：删 `_event_evidence`、
+改 deepseek runtime、消灭 live fallback —— 那些属于后续 event_evidence convergence。
+因此 `evidence_ref_from_news_projection` 的 production 调用点是 **0**（预期状态）。
+
+#### 四条被刻意关掉的"看起来像核验"的表面
+
+本 owner 的 ledger 里有四个很容易被误当核验维度使用的表面：
+
+```text
+evidence_grade            A/B/C/D 是来源可追溯性分级（官方原文 / 可定位披露聚合 /
+                          带链接媒体 / 无链接），不是核验结论
+verification_status       只表达"有没有 source_url"（唯一 writer 的内联二值）
+news_source_reputation    来源级聚合统计（credibility_score 是确定性公式）
+market_event_candidate_links  启发式相关性映射（confidence 0.95 / 0.72）
+```
+
+前两者由 owner 自己归口成闭集（`single_source` / `unverified` / `source_unusable`），
+**没有 verified**：审计证明整个仓库只有一处 `verification_status` writer，没有任何
+UPDATE / 第二 writer / 多源复算路径能升级一行，`news_events` 连核验列都没有。于是：
+
+```text
+CURRENT NEWS OWNER HAS NO VERIFIED STATE     （事实，不是缺陷）
+```
+
+后两者**根本不在读路径里**：`news_fact_projections` 只 SELECT 两张事件账本，
+projection 不携带任何 confidence / score 字段，adapter 不碰 DB。所以
+"credibility_score 高 → verified"、"link.confidence=0.95 → verified" 这两件事在本层是
+**结构上不可表达**的，而不是"记得别这么写"。
+
+#### 本轮被 mutation 逼出来的一处 production 修正
+
+`M-NEWS-04`（"未知 ledger 状态被静默默认"）第一次跑出来是 **SURVIVED**：因为
+`NewsFactProjection.__post_init__` 当时**重复**了一遍与 `_major_event_owner_status`
+等价的闭集检查，把这次退化挡住了。两处等价的 fail-closed 互相掩盖，使两条路径中的一条
+实际上不受回归保护。修正不是放宽变异，而是**去掉重复** —— 闭集合法性现在只有
+`_major_event_owner_status` 一处判定（与 `paper_portfolio_read_model` 的
+"校验逻辑只有一份"一致），它因此既被回归打红，也仍然对所有构造路径生效。
+
+#### 回归门禁（B2C-5）
+
+`backend/test_news_fact_contract.py`：NEWS-01 ~ 30（identity 来自 durable `event_key`、
+availability 只由 `first_seen_at` 决定、`published_at` 不能把可用性提前、`created_at`
+两个方向都不能改变可用性、PIT 不可证明即 fail closed（无任何 fallback）、
+不可追溯 → `source_unusable`、未知 `verification_status` hard error、reputation /
+candidate-link 不影响核验且**不在读路径**、`raw_payload` 不覆盖 normalized 列、
+typed read 不联网 / 不写库（只读连接可跑通、空库不建表）、writer 闭集是审计产物
+（直接扫描 writer 源码）、`first_seen_at` 跨重抓不可变、同 identity 读 durable 行）。
+
+`backend/test_ai_research_news_adapter.py`：NEWS-03 / 04 / 09 / 10 / 12 / 17 / 18 / 19 /
+20 / 21 / 22 / 25 / 26 / 31 / 32 / 33 / 34（复用 `EVIDENCE_SOURCE_NEWS`、kind 自动为
+`news_observed`、grade A/B/C 都不升级、`single_source_linked` → `unverified`、
+dict / 子类 / duck type 全部拒绝、指纹确定性与敏感性、payload 不能覆盖核验、
+未来证据不能进入更早事件、registry 三方双向一致、production 调用点 = 0、
+签名只接受 owner 投影、adapter 是纯的（不 import DB / 网络 / 时钟）、
+`availability_day` 归一到 owner 时区（跨 UTC 午夜与 +14:00 对照））。
+
+`backend/test_ai_research_evidence_ownership_guard.py`：`EXPECTED_OWNER_FACTORIES` 与
+`APPROVED_ISSUER_CALLERS` 各增加 news 一行，最终 caller set 恰好四个 owner factory。
+
+`backend/ai_research_contract.py`：`SUPPORTED_OWNER_ADAPTERS` 加入
+`EVIDENCE_SOURCE_NEWS`；`_issue_evidence_ref` 的批准 caller 增加
+`ai_research_news_adapter.evidence_ref_from_news_projection`。
+
+`backend/test_ai_provider_transport.py`：`NETWORK_FREE_SEAMS` / RG-04 / RG-05 登记新接缝，
+且 RG-03b 的非空性证明改成**对闭集里每一条**接缝各做一次 in-memory mutation —— 只证明
+最新那条正是让旧接缝静默失效的形状。注意 news owner（`news_learning`）本身是 ingestion
+writer，**允许**在写路径联网，因此它刻意不在网络闭集里；被登记的是它的 typed 读接缝。
+
+语义 mutation 在 `work/r27b2c5_news_owner_mutation_check.py`（M-NEWS-01 ~ 18）必须全部
+CAUGHT（baseline GREEN、survived = 0、fake = 0、timeout = 0、三个被改写文件的 restore
+sha256 一致），并且每条都指定了由哪条**永久**回归捕获。
+
+
 ## 目标依赖方向
 
 ```text
@@ -2628,6 +2717,55 @@ portfolio 事实的 identity / 业务日 / 核验结论被 caller 自述（R27-B
 与 owner 公开闭集**双向精确一致**的显式穷尽表（不缓存、不得 catch-all、不得替 owner 猜
 `source_unusable`）；内容指纹必须覆盖 canonical value 且必须是确定性的 sha256，
 不得用 `hash()` / `repr(object)` / 地址 / 时间 / 随机数）
+news 事实的历史可用性被发布时间提前（R27-B2C-5：news 的 availability authority 只有
+`first_seen_at`（系统第一次观测到它的时刻）。`published_at`（来源**声称**的发布时间）与
+`created_at`（行写入时刻）在任何方向上都不得改变可用性 —— published=9/20 而
+first_seen=9/21 的事件在 `as_of=9/20` 必须不可见，created_at 更晚也不得把它推出窗口。
+PIT 不可证明（缺失 / 畸形 / naive）时整次读取 fail closed，**没有** `published_at` /
+`created_at` / `now()` fallback。边界比较在 Python 侧逐行解析完成，不把 ISO 文本交给
+SQL 字典序 —— 那等于假设每一行的 offset 都和 owner 一样。**owner instant 必须归一到
+owner 时区**（Asia/Shanghai）之后才派生业务日：`first_seen_at` 允许带任意 offset，
+`2026-09-20T16:30+00:00` 在上海已经是 9/21 00:30，它的业务日必须是 9/21。若照抄原始
+offset 的 `.date()`，projection 会声明一个**比真实可用日更早**的业务日，于是
+`InformationEvent` 的 look-ahead guard 被绕过 —— read 的日边界（`as_of + 23:59:59+08:00`）
+与 projection 的 `availability_day` 必须是**同一套**日历口径。绝对时刻的比较与时区无关，
+受影响的是**由它派生的日历日**）
+live provider fetch 被当成历史证据读（R27-B2C-5：typed news 读只发 SELECT、不建表、
+不联网；ledger 不可读时 fail closed 成 `ledger_unavailable`，**不得**触发
+`capture_events` / `capture_major_events` 的 ingestion fetch 或 backfill。这条边界是
+**不对称**的：ingestion writer 允许联网，typed owner read 与 adapter 不允许 —— 把 owner
+的写路径也纳入"永不联网"会让真正的采集 owner 无法工作，把写路径的联网当成读路径的许可是
+PIT blocker）
+news 事实的来源可追溯性 / 热度被当成核验结论（R27-B2C-5：`evidence_grade`（A/B/C/D）是
+来源可追溯性分级，`verification_status` 只表达"有没有 source_url"，
+`news_source_reputation.credibility_score` 是来源级聚合统计，
+`market_event_candidate_links.confidence` 是启发式相关性映射 —— 四者都**不得**升级任何
+核验结论。typed 读的 SELECT 里不出现 reputation / candidate-link 表，projection 不携带
+任何 confidence / score 字段。可追溯单源归 `unverified`，不可追溯归 `source_unusable`；
+本 owner **今天没有 verified 状态**，因此归口表刻意不产生 `OWNER_OUTCOME_VERIFIED` ——
+宁可让所有现存单源事件保持中性未核验，也不造一个假的已核验）
+news writer 的新状态被静默吞掉（R27-B2C-5：`market_major_events.verification_status` 的
+合法值是**审计产物** —— 回归直接扫描 writer 源码，要求它能写出的字面量与 owner 登记
+（`NEWS_MAJOR_EVENT_WRITER_STATUSES`）逐字一致；未知状态 hard error，不得
+`else: unverified`。闭集合法性只由 `_major_event_owner_status` **一处**判定：两处等价的
+fail-closed 会互相掩盖，让"某个状态被静默默认"逃过一次单点变异）
+news 事实的 identity / PIT / 核验结论被 caller 自述（R27-B2C-5：adapter 只接受
+`type(projection) is NewsFactProjection`（dict / Mapping / duck-typed / 子类一律拒绝），
+签名只接受 owner 投影 —— 没有 `source_id` / `as_of` / `verification` 入口；`source_id`
+由 `record_kind|event_key` 派生，`as_of` 只能来自 owner 从 `first_seen_at` 派生的
+`availability_day`；归口映射与 owner 公开闭集双向穷尽、不缓存、不得 catch-all；
+reputation / candidate-link 不参与核验；内容指纹必须是确定性 sha256，不得用 `hash()` /
+`repr(object)` / 地址 / 时间 / 随机数）
+news 证据绕过唯一 typed 接缝（R27-B2C-5：research 只通过
+`ai_research_news_adapter.evidence_ref_from_news_projection` 消费 news；该 adapter 必须
+是**纯的** —— 不 import `sqlite3` / `data_fetcher` / 网络 / 时钟 / 文件系统，只 import
+`ai_research_contract` 与 `news_learning`。依赖方向单向：news owner 不得 import research，
+research 契约也不得 import news owner 或 adapter）
+legacy news runtime 被当成已迁移（R27-B2C-5：
+`deepseek_research._event_evidence` 仍然直读 ledger、并在没有 durable events 时回退去抓
+live news。这条 legacy 路径**明确保持 OPEN**，直到后续 event_evidence convergence；
+"news owner readiness = COMPLETE" 不等于"news runtime 已完全迁移"，
+adapter 的 production 调用点 = 0 是本轮的预期状态而不是空转）
 ```
 
 ### 仅作 review signal（不进入 CI gate）

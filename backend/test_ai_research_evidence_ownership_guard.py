@@ -89,6 +89,9 @@ EXPECTED_OWNER_FACTORIES = {
     "portfolio_research": (
         "ai_research_portfolio_adapter", "evidence_ref_from_portfolio_projection",
     ),
+    "news": (
+        "ai_research_news_adapter", "evidence_ref_from_news_projection",
+    ),
 }
 
 #: 需要在 import 别名解析里被识别的模块 —— 已登记 factory 的宿主模块。
@@ -104,11 +107,13 @@ OWNER_FACTORY_ORIGINS = frozenset(EXPECTED_OWNER_FACTORIES.values())
 #: **精确 allowlist，双向等值**：少一个（登记了却不调用）或多一个（有人偷偷调用）都算
 #: 违规。R27-B2C-3 引入第二个 approved factory 时把 B2C-2 的
 #: "契约外零调用" 升级成这条 caller-set 等值；R27-B2C-4B 引入 portfolio/accounting 的
-#: 第三个 —— 只需 module + enclosing function 这一层结构信息，不需要 CFG。
+#: 第三个 —— 只需 module + enclosing function 这一层结构信息，不需要 CFG；
+#: R27-B2C-5 引入 news 的第四个（news owner readiness：owner 发布 typed 事实 + 唯一接缝）。
 APPROVED_ISSUER_CALLERS = frozenset({
     (CONTRACT_MODULE_FILE, "evidence_ref_from_market_reading"),
     ("ai_research_execution_adapter.py", "evidence_ref_from_execution_projection"),
     ("ai_research_portfolio_adapter.py", "evidence_ref_from_portfolio_projection"),
+    ("ai_research_news_adapter.py", "evidence_ref_from_news_projection"),
 })
 
 #: 目前生产里构造 ``InformationEvent`` 的模块集合。等值断言：多一个模块就是一次
