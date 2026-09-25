@@ -1061,12 +1061,16 @@ EXECUTION_ADAPTER_MODULE = "ai_research_execution_adapter.py"
 #: R27-B2C-4B 的 portfolio/accounting owner 接缝（**不是** authority；与 execution 那一份
 #: 同构：只做词表归口，不联网、不碰 DB）。
 PORTFOLIO_ADAPTER_MODULE = "ai_research_portfolio_adapter.py"
+#: R27-B2C-5 的 news owner 接缝（**不是** authority；与另两份同构：只做词表归口）。
+#: 注意 news owner（``news_learning``）**本身**是 ingestion writer，允许在写路径联网，
+#: 因此它刻意**不**在这个网络闭集里 —— 被登记的是它的 typed 读接缝。
+NEWS_ADAPTER_MODULE = "ai_research_news_adapter.py"
 
 #: RG-03 的扫描闭集：这些接缝**都不得**直接持有网络调用（真实网络调用只属于 transport）。
 #: 写成显式闭集而不是"扫全部文件"是有意的 —— 新增一个接缝必须是一次有意识的登记，
 #: 而漏登记的后果正是本 guard 对新接缝静默失效（OCR 在 #200 上抓到的就是这个缺口：
 #: RG-04 / RG-05 登记了新接缝，RG-03 没有）。
-#: 注意它**不是** RG-08 的 provider chain：execution / portfolio 两份 owner adapter
+#: 注意它**不是** RG-08 的 provider chain：execution / portfolio / news 三份 owner adapter
 #: 都不属于 provider runtime 链路，因此刻意不进 RG-08。
 NETWORK_FREE_SEAMS = (
     RESEARCH_MODULE,
@@ -1074,6 +1078,7 @@ NETWORK_FREE_SEAMS = (
     SERVICE_MODULE,
     EXECUTION_ADAPTER_MODULE,
     PORTFOLIO_ADAPTER_MODULE,
+    NEWS_ADAPTER_MODULE,
 )
 
 ALLOWED_RESEARCH_IMPORTS = {
@@ -1169,34 +1174,41 @@ class AiResearchProviderArchitectureGuardTests(unittest.TestCase):
 
         只断言 ``PORTFOLIO_ADAPTER_MODULE in NETWORK_FREE_SEAMS`` 是自我验证 —— 它证明
         不了 RG-03 的判定在那条新接缝上会开口（登记了但扫描逻辑不认，等于装饰）。这里做
-        一次 in-memory mutation：把 portfolio adapter 的源码临时替换成含
-        ``urllib.request.urlopen`` 的版本，要求 RG-03 **变 RED**；换回原源码必须重新
-        GREEN。两步都成立才说明这次登记是有效的守卫。
+        一次 in-memory mutation：把接缝的源码临时替换成含 ``urllib.request.urlopen`` 的
+        版本，要求 RG-03 **变 RED**；换回原源码必须重新 GREEN。两步都成立才说明这次登记
+        是有效的守卫。
+
+        R27-B2C-5 起对 ``NETWORK_FREE_SEAMS`` 里**每一条**接缝都做一次，而不是只对最新
+        登记的那一条：guard 会随接缝集合增长而自动扩展，未来新增接缝时不需要再手工挑一条
+        来做非空性证明（"只证明最新那条"正是让旧接缝静默失效的形状）。
         """
         self.assertIn(PORTFOLIO_ADAPTER_MODULE, NETWORK_FREE_SEAMS)
+        self.assertIn(NEWS_ADAPTER_MODULE, NETWORK_FREE_SEAMS)
 
-        clean_source = _source(PORTFOLIO_ADAPTER_MODULE)
-        self.assertEqual(
-            [], _direct_network_tokens(clean_source),
-            "portfolio adapter 当前已持有网络调用 —— 这条非空性断言就是最后一道防线",
-        )
-
-        tainted = clean_source + (
-            "\n\n_TAINT = urllib.request.urlopen('https://example.invalid')\n")
         original_source = globals()["_source"]
+        for seam in NETWORK_FREE_SEAMS:
+            with self.subTest(seam=seam):
+                clean_source = _source(seam)
+                self.assertEqual(
+                    [], _direct_network_tokens(clean_source),
+                    f"{seam} 当前已持有网络调用 —— 这条非空性断言就是最后一道防线",
+                )
 
-        def _tainted(name):
-            return tainted if name == PORTFOLIO_ADAPTER_MODULE else original_source(name)
+                tainted = clean_source + (
+                    "\n\n_TAINT = urllib.request.urlopen('https://example.invalid')\n")
 
-        globals()["_source"] = _tainted
-        try:
-            with self.assertRaises(AssertionError):
+                def _tainted(name, _seam=seam, _tainted_source=tainted):
+                    return _tainted_source if name == _seam else original_source(name)
+
+                globals()["_source"] = _tainted
+                try:
+                    with self.assertRaises(AssertionError):
+                        self.test_RG_03_real_network_calls_live_only_in_the_transport()
+                finally:
+                    globals()["_source"] = original_source
+
+                # 恢复后必须重新 GREEN —— RED 来自那次注入，而不是 guard 本来就坏。
                 self.test_RG_03_real_network_calls_live_only_in_the_transport()
-        finally:
-            globals()["_source"] = original_source
-
-        # 恢复后必须重新 GREEN —— RED 来自那次注入，而不是 guard 本来就坏。
-        self.test_RG_03_real_network_calls_live_only_in_the_transport()
 
     def test_RG_04_no_authority_module_reverse_imports_ai(self):
         """RG-04：authority → AI 的依赖必须为 0。"""
@@ -1207,7 +1219,8 @@ class AiResearchProviderArchitectureGuardTests(unittest.TestCase):
                                               "ai_provider_transport",
                                               "ai_research_repository", "ai_research_service",
                                               "ai_research_execution_adapter",
-                                              "ai_research_portfolio_adapter"):
+                                              "ai_research_portfolio_adapter",
+                                              "ai_research_news_adapter"):
                     offenders.append(f"{name}: import {imported}")
         self.assertEqual(
             [], offenders,
@@ -1225,7 +1238,8 @@ class AiResearchProviderArchitectureGuardTests(unittest.TestCase):
         才能调用私有签发口），R27-B2C-4B 增加 ``ai_research_portfolio_adapter``
         （portfolio/accounting owner 的同构接缝），R27-B2C-4C 增加 ``deepseek_research``
         （``pnl_attribution`` 的 cross-owner research composition —— 它从"自己造事实"
-        改成了"消费 owner typed 事实"，因此第一次成为契约的正式消费者）。用等值断言而不是
+        改成了"消费 owner typed 事实"，因此第一次成为契约的正式消费者），R27-B2C-5 增加
+        ``ai_research_news_adapter``（news owner 的同构接缝）。用等值断言而不是
         "不含"断言：多出任何一个消费者都必须是一次有意识的决定。
 
         ``ai_research_service`` 刻意**不**在这里：orchestration boundary 只依赖 provider
@@ -1242,7 +1256,8 @@ class AiResearchProviderArchitectureGuardTests(unittest.TestCase):
                     offenders.append(name)
         self.assertEqual(
             sorted(set(offenders)),
-            ["ai_research_execution_adapter.py", "ai_research_portfolio_adapter.py",
+            ["ai_research_execution_adapter.py", NEWS_ADAPTER_MODULE,
+             "ai_research_portfolio_adapter.py",
              RESEARCH_MODULE, REPOSITORY_MODULE, "deepseek_advisor.py",
              "deepseek_research.py"],
             f"research contract 的生产消费者集合发生变化：{sorted(set(offenders))}",

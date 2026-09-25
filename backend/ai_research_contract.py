@@ -131,17 +131,20 @@ EVIDENCE_SOURCE_TYPES = (
 #: 当前**真的**接好 typed projection 的 owner。其余是已声明的未来来源，
 #: 没有公开 factory 可以签发 —— 少支持一个 source 好过允许伪造一个 authority。
 #:
-#: R27-B2C-3 起 ``execution`` 也在其中，R27-B2C-4B 起 ``portfolio_research`` 也在。
+#: R27-B2C-3 起 ``execution`` 也在其中，R27-B2C-4B 起 ``portfolio_research`` 也在，
+#: R27-B2C-5 起 ``news`` 也在。
 #: 这张表表示的是"研究层已经存在**批准的 owner adapter**"，**不是**"所有 public factory
 #: 都定义在本文件里"：execution 的 factory 住在 ``ai_research_execution_adapter``、
-#: portfolio/accounting 的住在 ``ai_research_portfolio_adapter``（它们必须同时认识各自
-#: owner 与 research 两套词表，而本契约刻意不 import 任何 owner 模块）。
+#: portfolio/accounting 的住在 ``ai_research_portfolio_adapter``、news 的住在
+#: ``ai_research_news_adapter``（它们必须同时认识各自 owner 与 research 两套词表，而本契约
+#: 刻意不 import 任何 owner 模块）。
 #: 本契约不需要、也不得 import 那些 adapter —— registry 是声明式的，一致性由
 #: ``test_ai_research_evidence_ownership_guard`` 双向强制。
 SUPPORTED_OWNER_ADAPTERS = frozenset({
     EVIDENCE_SOURCE_MARKET_DATA,
     EVIDENCE_SOURCE_EXECUTION,
     EVIDENCE_SOURCE_PORTFOLIO_RESEARCH,
+    EVIDENCE_SOURCE_NEWS,
 })
 
 # ---------------------------------------------------------------------------
@@ -607,7 +610,9 @@ class ResearchEvidenceRef:
     :func:`evidence_ref_from_market_reading`，execution 的每一份是
     ``ai_research_execution_adapter.evidence_ref_from_execution_projection``，
     portfolio/accounting 的每一份是
-    ``ai_research_portfolio_adapter.evidence_ref_from_portfolio_projection``）。identity
+    ``ai_research_portfolio_adapter.evidence_ref_from_portfolio_projection``，
+    news 的每一份是 ``ai_research_news_adapter.evidence_ref_from_news_projection``）。
+    identity
     由 owner 投影派生（调用方不提供），核验维度由**该 owner 的 factory** 归口 —— 因此
     "传字符串把自己声明成 owner 已核验事实"不可表达。
 
@@ -655,7 +660,9 @@ class ResearchEvidenceRef:
             "evidence_ref_from_market_reading；execution: "
             "ai_research_execution_adapter.evidence_ref_from_execution_projection；"
             "portfolio/accounting: "
-            "ai_research_portfolio_adapter.evidence_ref_from_portfolio_projection）："
+            "ai_research_portfolio_adapter.evidence_ref_from_portfolio_projection；"
+            "news: "
+            "ai_research_news_adapter.evidence_ref_from_news_projection）："
             "identity 与核验维度都由 owner 投影派生，调用方不参与"
         )
 
@@ -879,6 +886,7 @@ def _issue_evidence_ref(
     ai_research_contract.evidence_ref_from_market_reading
     ai_research_execution_adapter.evidence_ref_from_execution_projection
     ai_research_portfolio_adapter.evidence_ref_from_portfolio_projection
+    ai_research_news_adapter.evidence_ref_from_news_projection
     ```
 
     绕过 ``__init__``（它恒抛错）并在设置完全部字段后跑 ``__post_init__``，
