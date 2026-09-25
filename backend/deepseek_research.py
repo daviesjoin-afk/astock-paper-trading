@@ -112,7 +112,17 @@ class AttributionRequest:
 
     * ``asof_day`` —— 归因业务日（canonical ``YYYY-MM-DD``）。这是 §七 的核心修正：
       legacy 路径用 ``max(paper_nav.nav_date)`` 自己推断业务日，等于让**被解释的数据**
-      决定**解释的口径**。现在只能由调用方声明。
+      决定**解释的口径**。现在只能由调用方声明，而且必须是一个**可证明的业务日**
+      （已完成交易日，不是任意日历日）。生产里唯一的签发口是
+      ``adaptive_engine._post_close_attribution_request``：业务日由**交易日历**从调用方
+      显式给出的 instant 解析（周末/法定假日与 15:05 前都不算完成日），它本身**不读墙钟**，
+      也不接受调用方指定业务日。
+    * 与之配套的归属限制：那条生产路径的 ``targets`` 来自 ``paper_accounts.cycle_id``
+      （**当前**绑定），因此它只支撑"当日 post-close"。**历史业务日不得借用当前绑定** ——
+      账户后来解绑或换周期后，用当前绑定解释历史日就是 current-state leak。本 PR 不提供
+      "历史 asof + 当前绑定自动发现 targets"的路径（详见
+      ``OPEN PREREQUISITE: owner-provable historical cycle membership``）；真要历史归因，
+      必须由调用方**显式给出 targets**。
     * ``market_now`` —— R24 freshness 判定用的显式时刻（必须 timezone-aware）。
       ``market_data_service._resolve_now`` 只接受 ``datetime``，字符串会被它拒绝 ——
       所以这里不能直接透传 ``advisor._now()`` 的 ISO 字符串。

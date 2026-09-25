@@ -2379,7 +2379,7 @@ def run_learning_cycle(trigger="manual"):
                 try:
                     deepseek_research.run_suite(
                         _connect, PAPER_DB_PATH, trigger="scheduled-close",
-                        attribution=_attribution_request(),
+                        attribution=_post_close_attribution_request(now=dt.datetime.now(TZ)),
                     )
                 except Exception:
                     pass
@@ -2583,34 +2583,46 @@ def approve_neural_network(confirmed: bool = False, approved_by: str = "human-ui
     return overview()
 
 
-def _attribution_request(asof_day=None, market_now=None):
-    """**编排边界**显式声明 pnl_attribution 的 PIT context（R27-B2C-4C §7/§9/§10）。
+def _post_close_attribution_request(*, now):
+    """**编排边界**显式声明"当日 post-close 归因"的 PIT context（R27-B2C-4C）。
 
-    ``pnl_attribution`` 的 collector 不再自己推断任何 identity：业务日、账户、周期
-    三项都必须由调用方给出。这里就是那个调用方，且刻意做成"显式声明"而不是"帮忙猜"：
+    ``pnl_attribution`` 的 collector 不推断任何 identity；这个函数就是那个调用方。它刻意
+    **只回答"当日 post-close"这一种归因**，因为这是本 PR 唯一能诚实支撑的场景：
 
-    * ``market_now`` 是**本次运行的显式时刻**（同一个 instant 也交给 R24 做
-      freshness 判定，``market_data_service`` 只接受 ``datetime``）。只有 ``None``
-      才回落墙钟：显式给了非法值就失败 —— 静默换成"现在"等于篡改调用方声明的 PIT 时刻，
-      而 ``asof_day`` 还会从被替换的时刻派生。
-    * ``asof_day`` 只取调用方显式传入的业务日；缺省时取本次观测时刻的日期 ——
-      这条声明只在"这次就是当日 post-close 归因"时成立，历史归因必须显式传业务日。
-    * ``(account_id, cycle_id)`` 来自只读的 :func:`paper_position_read_model.attribution_targets`：
-      没有可证明周期绑定的账户被排除，而不是回落"当前 active account"。
-    * 一个 target 都拿不到时返回 ``None`` —— 让 ``pnl_attribution`` 自己 fail closed
-      （记 ``_collection_error``），而不是发布一份"看起来正常"的归因。**读失败**与
-      "没有可证明绑定的账户"都 fail closed，但根因会被打印出来，避免两者在排障时无从区分。
+    * ``now`` —— **必填**的本次运行观测 instant（tz-aware）。本函数**不读墙钟**：少了这个
+      参数就是"没人声明观测时刻"，直接 ``TypeError``；显式给了非法值也失败，绝不回落
+      ``datetime.now()``（静默替换等于篡改调用方声明的 PIT 时刻）。
+    * 业务日 —— 由**交易日历**从 ``now`` 解析：``universe.latest_complete_trade_date(now=now)``。
+      刻意**不**用 ``now.date()``：日历日不是"已完成交易日"（周末/法定假日不是，15:05 前的
+      当日也还不是），所以这个函数永远不会把业务日声明成一个尚未完成的日。同一 instant 也
+      交给 R24 做 freshness 判定。
+    * ``targets`` —— ``paper_position_read_model.attribution_targets()`` 读的是
+      ``paper_accounts.cycle_id``，也就是**当前**绑定。它只能支撑"当日"的归属，因此本函数
+      只允许在这个场景里用它，且**不接受**调用方指定业务日。
+
+    **历史归因为什么在这里不可表达**：历史业务日的归属必须由 owner **可证明的历史挂载证据**
+    给出，而"当前 ``cycle_id`` 绑定"不是那种证据 —— 账户后来解绑或换周期后，用当前绑定解释
+    历史日就是 current-state leak。所以本 PR 不提供任何"历史 ``asof_day`` + 当前绑定自动发现
+    targets"的路径：函数签名里根本没有 ``asof_day`` / ``targets`` 参数，那种组合**不可表达**。
+    历史归因需要 owner 侧的历史归属契约：
+
+        OPEN PREREQUISITE: owner-provable historical cycle membership for back-dated attribution
+
+    届时应由调用方**显式给出 targets**，而不是让这里去自动发现。
+
+    一个 target 都拿不到时返回 ``None`` —— 让 ``pnl_attribution`` 自己 fail closed
+    （记 ``_collection_error``），而不是发布一份"看起来正常"的归因。**读失败**与"没有可证明
+    绑定的账户"都 fail closed，但根因会被打印出来，避免两者在排障时无从区分。
     """
-    if market_now is None:
-        moment = dt.datetime.now(TZ)
-    elif isinstance(market_now, dt.datetime):
-        moment = market_now
-    else:
+    if not isinstance(now, dt.datetime):
         raise ValueError(
-            "market_now must be an explicit timezone-aware datetime; "
-            f"got {type(market_now).__name__}（非法显式值不得回落墙钟）"
+            "post-close attribution requires an explicit datetime 'now'; "
+            f"got {type(now).__name__}（本函数不读墙钟）"
         )
-    day = str(asof_day or moment.date().isoformat())
+    if now.tzinfo is None or now.tzinfo.utcoffset(now) is None:
+        raise ValueError("post-close attribution requires a timezone-aware 'now'")
+    import universe as U  # 与模块内既有的交易日历用法一致（见 K 线完成日解析）
+    day = U.latest_complete_trade_date(now=now).isoformat()
     conn = None
     targets = ()
     read_error = None
@@ -2635,7 +2647,7 @@ def _attribution_request(asof_day=None, market_now=None):
         )
         return None
     return deepseek_research.AttributionRequest(
-        asof_day=day, market_now=moment, targets=targets,
+        asof_day=day, market_now=now, targets=targets,
     )
 
 
@@ -2652,7 +2664,8 @@ def run_advisor_review(trigger="manual-ui", purpose="data_quality"):
         deepseek_research.run_task(
             _connect, PAPER_DB_PATH, purpose,
             trigger=str(trigger or "manual-ui")[:80],
-            attribution=_attribution_request() if purpose == "pnl_attribution" else None,
+            attribution=(_post_close_attribution_request(now=dt.datetime.now(TZ))
+                         if purpose == "pnl_attribution" else None),
         )
     return overview()
 
@@ -2699,7 +2712,8 @@ def run_advisor_suite(trigger="manual-suite"):
         raise RuntimeError("api_key_missing")
     deepseek_advisor.run_review(_connect, PAPER_DB_PATH, SNAPSHOT_PATHS, config=cfg, trigger=trigger)
     deepseek_research.run_suite(_connect, PAPER_DB_PATH, trigger=trigger,
-                                attribution=_attribution_request())
+                                attribution=_post_close_attribution_request(
+                                    now=dt.datetime.now(TZ)))
     return overview()
 
 

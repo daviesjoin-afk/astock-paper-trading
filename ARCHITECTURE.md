@@ -2130,6 +2130,16 @@ execution owner / portfolio-accounting owner / R24 market owner
 - PIT context 是**显式**的：归因业务日、`(account_id, cycle_id)`、市场观测时刻都必须由编排
   边界声明；collector 不得用 `max(paper_nav.nav_date)` / `today()` / 墙钟 / current cycle /
   current active account 推断任何一项。缺 context 即 fail closed。
+  更具体地说：生产里唯一的 attribution context 签发口是
+  `adaptive_engine._post_close_attribution_request(now=…)` —— 它**必填**一个显式观测
+  instant（不读墙钟），业务日由**交易日历**从该 instant 解析（周末/法定假日与 15:05 前都
+  不算完成日，因此业务日绝不是 `now().date()`），签名里**没有**业务日参数。
+  它只回答"当日 post-close"这一种归因：`targets` 来自 `paper_accounts.cycle_id`
+  （**当前**绑定），签发后是不可变快照。
+  **历史归因不得借用当前绑定**（账户后来解绑/换周期后，用当前绑定解释历史日即
+  current-state leak）；本轮不提供该路径。
+  `OPEN PREREQUISITE: owner-provable historical cycle membership for back-dated attribution`
+  —— 届时应由调用方**显式给出 targets**，而不是自动发现。
 - typed 迁移之后**没有** legacy fallback：typed 路径抛错不得回落 SQL。
   `load_execution_evidence` → `fact_projection` → adapter 是唯一执行事实入口。
 - owner 证明不了的事实**永远**保持 unknown / unavailable（带 reason）：不补零、不回落成本价

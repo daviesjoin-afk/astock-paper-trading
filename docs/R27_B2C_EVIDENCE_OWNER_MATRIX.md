@@ -1089,6 +1089,26 @@ targets)` 三个字段都没有默认值 —— 业务日、`(account_id, cycle_
 current cycle / current active account 推断任何一项；缺 context 即 fail closed（记
 `_collection_error`），不发布"看起来正常"的归因。
 
+生产里唯一的签发口是 `adaptive_engine._post_close_attribution_request(now=…)`：
+
+```text
+now     必填的显式观测 instant（tz-aware）—— 签发口自己不读墙钟；无参调用直接 TypeError
+asof_day 由**交易日历**从 now 解析（universe.latest_complete_trade_date(now=now)）：
+         周末/法定假日不是完成日；15:05 前的当日也还不是完成日
+         ⇒ 业务日不是 now().date()，也不允许调用方指定
+targets  来自 paper_accounts.cycle_id（**当前**绑定）
+         ⇒ 只支撑"当日 post-close"；签发后是不可变快照，之后解绑/换周期不会重绑定
+```
+
+因此"历史 `asof_day` + 当前绑定自动发现 targets"这种组合在签名层面**不可表达**（不是靠
+调用方自觉）。历史归因需要 owner **可证明的历史挂载证据**：
+
+```text
+OPEN PREREQUISITE: owner-provable historical cycle membership for back-dated attribution
+```
+
+届时应由调用方**显式给出 targets**，而不是让边界去自动发现。
+
 **OPEN PREREQUISITE（不是 REMOVED）**：
 
 ```text
