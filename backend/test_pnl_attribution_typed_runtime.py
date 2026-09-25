@@ -26,8 +26,8 @@
     PNL-32          stale-but-available 行情切片必须发布新鲜度（不得只看 availability）
     PNL-33          归因目标的唯一判据是 cycle 绑定，不是账户生命周期状态
                     （cycle ownership ≠ execution eligibility）
-    PNL-34 ~ 36     编排边界必须显式声明 PIT context：签发口无参即失败、业务日来自交易日历
-                    （不是 now().date()）、历史 as-of 不得借用当前绑定（不可表达 + 冻结快照）
+    PNL-34 ~ 36     编排边界必须显式声明 PIT context：签发口无参即失败；业务日必须**同时**是
+                    完成交易日**且**等于声明的本日历日（否则 fail closed，绝不退到上一交易日）；
 
 全部离线：临时 SQLite 账本 + owner 自己的 public read + 被 patch 的 R24 缓存事实。
 不连真实库、不联网、不读墙钟（业务日固定为 ``DAY`` / ``NEXT``）。
@@ -309,6 +309,31 @@ def _production_modules() -> list:
         name for name in os.listdir(BACKEND)
         if name.endswith(".py") and not name.startswith("test_")
     )
+
+
+def _module_text(name) -> str:
+    with open(os.path.join(BACKEND, name), encoding="utf-8") as handle:
+        return handle.read()
+
+
+def _attribution_request_constructor_modules(sources=None) -> set:
+    """生产模块里**构造** ``AttributionRequest`` 的集合（``sources`` 供非空性对照使用）。
+
+    只看 ``ast.Call``：类的定义、docstring 与字符串里的写法都不算构造点。
+    """
+    if sources is None:
+        sources = {name: _module_text(name) for name in _production_modules()}
+    holders = set()
+    for name, text in sources.items():
+        for node in ast.walk(ast.parse(text)):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            called = (func.id if isinstance(func, ast.Name)
+                      else func.attr if isinstance(func, ast.Attribute) else None)
+            if called == "AttributionRequest":
+                holders.add(name)
+    return holders
 
 
 class PnlAttributionTypedRuntimeTests(unittest.TestCase):
@@ -1725,12 +1750,14 @@ class PnlAttributionTypedRuntimeTests(unittest.TestCase):
         self.assertTrue(U.is_trade_day(dt.date.fromisoformat(request.asof_day)))
         self.assertEqual(instant, request.market_now)
 
-    def test_PNL_35_business_day_comes_from_the_trading_calendar_not_the_wall_clock(self):
-        """PNL-35：业务日由**交易日历**从显式 instant 解析，不是 ``now().date()``。
+    def test_PNL_35_only_a_completed_same_day_can_be_declared(self):
+        """PNL-35：只有"本日历日自身已是完成交易日"才签发；盘中与周末/节假日 fail closed。
 
-        日历日不是"已完成交易日"：周末/法定假日不是，15:05 前的当日也还不是。所以边界声明
-        的业务日必须走交易日历，而且它必须把**调用方给的那个 instant** 原样传下去 ——
-        不能自己再读一次钟（那等于把 PIT 时刻换成另一个时刻）。
+        交易日历在盘中（未过 15:05）与周末/法定节假日会返回**上一个已完成交易日**。若照此
+        签发，就会得到"历史业务日 + 当前 ``paper_accounts.cycle_id`` 绑定"这一组合 ——
+        账户后来解绑或换周期后，那就是用当前归属解释历史日（current-state leak）。所以边界
+        必须**拒绝回退**：``asof_day`` 恒等于调用方声明的那个本日历日，且该日本身必须是完成
+        交易日；否则 fail closed。
         """
         t = self._a_trading_day_on_or_before(DAY)
         n = t
@@ -1740,6 +1767,10 @@ class PnlAttributionTypedRuntimeTests(unittest.TestCase):
                 break
         self.assertFalse(U.is_trade_day(n), "需要找到一个非交易日（周末必然满足）")
 
+        close = self._instant(t)              # 交易日收盘后（> 15:05）
+        intraday = self._instant(t, hour=11)  # 交易日盘中（< 15:05）
+        weekend = self._instant(n)            # 非交易日 16:00
+
         seen = []
         real = U.latest_complete_trade_date
 
@@ -1748,22 +1779,29 @@ class PnlAttributionTypedRuntimeTests(unittest.TestCase):
             return real(asof_day=asof_day, now=now)
 
         with mock.patch.object(U, "latest_complete_trade_date", side_effect=spy):
-            # 交易日 16:00（已过 15:05）→ 业务日就是它自己。
-            completed = AE._post_close_attribution_request(now=self._instant(t))
-            self.assertEqual(t.isoformat(), completed.asof_day)
-            # 同一交易日但 11:00（未过截止）→ 当日还没完成，业务日必须回退。
-            early = AE._post_close_attribution_request(now=self._instant(t, hour=11))
-            self.assertLess(early.asof_day, t.isoformat())
-            # 非交易日 16:00 → 业务日**不是**这个日历日，而是上一个交易日。
-            weekend = AE._post_close_attribution_request(now=self._instant(n))
-            self.assertEqual(t.isoformat(), weekend.asof_day)
-            self.assertNotEqual(n.isoformat(), weekend.asof_day)
+            # 盘中 / 非交易日：必须 fail closed，而且**不得**去发现 targets ——
+            # 否则就真的构造过"历史业务日 + 当前绑定"这一对了。
+            with mock.patch.object(
+                PPOS, "attribution_targets",
+                side_effect=AssertionError("fail-closed 分支不得发现 targets"),
+            ):
+                self.assertIsNone(
+                    AE._post_close_attribution_request(now=intraday),
+                    "交易日盘中时归因日会是上一交易日 —— 必须 fail closed",
+                )
+                self.assertIsNone(
+                    AE._post_close_attribution_request(now=weekend),
+                    "非交易日同样不得签发上一个交易日的归因",
+                )
+            # 交易日收盘后：正常签发。
+            signed = AE._post_close_attribution_request(now=close)
 
+        self.assertIs(type(signed), DS.AttributionRequest)
+        self.assertEqual(t.isoformat(), signed.asof_day)
+        # 本轮的核心不变量：成功签发的业务日**永远**是调用方声明的那个本日历日。
+        self.assertEqual(close.date().isoformat(), signed.asof_day)
         # instant 被原样传下去：边界只声明一次时刻，签发口不读第二次钟。
-        self.assertEqual(
-            [(None, self._instant(t)), (None, self._instant(t, hour=11)), (None, self._instant(n))],
-            seen,
-        )
+        self.assertEqual([(None, intraday), (None, weekend), (None, close)], seen)
 
         # 边界补充（行为证据是主证据）：签发口不得出现墙钟读数，且必须真的调用交易日历。
         called = set()
@@ -1781,14 +1819,28 @@ class PnlAttributionTypedRuntimeTests(unittest.TestCase):
     def test_PNL_36_historical_asof_cannot_reuse_current_binding(self):
         """PNL-36：历史业务日不得借用**当前** ``paper_accounts.cycle_id`` 归属。
 
-        生产里唯一的签发口只回答"当日 post-close"：签名里没有业务日 / targets 参数，所以
-        "历史 asof + 当前绑定自动发现 targets"这种组合**不可表达**（无效状态不可表示，而不是
-        靠调用方自觉）。另外 targets 必须是签发时刻的**冻结快照**：之后账户解绑或换周期，
-        不得把已经签发的 context 静默重绑定成新的归属。
+        生产里唯一的签发口只回答"当日 post-close"：签名里没有业务日 / targets 参数，而且
+        运行期会把"本日历日不是完成交易日"直接判为 fail closed（见 PNL-35），因此
+        "历史 asof + 当前绑定自动发现 targets"不可达。这里额外锁两件事：只有编排边界能构造
+        ``AttributionRequest``（任何模块都不得自述一个历史请求），以及 targets 是签发时刻的
+        **冻结快照** —— 之后账户解绑或换周期，不得把已签发的 context 静默重绑定。
         """
         # 结构性拒绝：只接受一个显式 instant。
         self.assertEqual(
             {"now"}, set(inspect.signature(AE._post_close_attribution_request).parameters),
+        )
+        # 生产里构造 AttributionRequest 的模块只能是编排边界。
+        self.assertEqual(
+            {"adaptive_engine.py"}, _attribution_request_constructor_modules(),
+            "只有编排边界的签发口可以构造 AttributionRequest",
+        )
+        # 非空性：扫描器真的看得见构造点。
+        self.assertEqual(
+            {"probe.py"},
+            _attribution_request_constructor_modules(
+                {"probe.py": "from deepseek_research import AttributionRequest\n"
+                             "X = AttributionRequest(asof_day='2020-01-01', market_now=None, targets=())\n"}
+            ),
         )
 
         instant = self._instant(self._a_trading_day_on_or_before(DAY))
@@ -1801,6 +1853,7 @@ class PnlAttributionTypedRuntimeTests(unittest.TestCase):
         request = AE._post_close_attribution_request(now=instant)
         before = request.targets
         self.assertEqual(((ACCOUNT, self.cycle),), before)
+        self.assertEqual(instant.date().isoformat(), request.asof_day)
 
         # 冻结快照：账户解绑后，已签发 context 的 targets 必须一字不变。
         self.conn.execute("UPDATE paper_accounts SET cycle_id=NULL WHERE id=?", (ACCOUNT,))
