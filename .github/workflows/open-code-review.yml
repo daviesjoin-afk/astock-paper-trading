@@ -51,7 +51,10 @@ concurrency:
 jobs:
   semantic-review:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # 实测（PR #200，effort=high + concurrency=4 + budget=300000）：10 个文件只完成 1 个
+    # 就触发 budget_exceeded（490k tokens / 12m29s）→ job 判 RED，观察窗口拿不到完整样本。
+    # 四个旋钮必须一起调（effort / concurrency / budget / timeout），只调一个无效。
+    timeout-minutes: 60
     steps:
       - name: Run OpenCodeReview
         # v1.12.9 release commit（bccbc15f785269400735d5255540c231e6c02b6d）。
@@ -76,9 +79,13 @@ jobs:
           # GitHub workflow runtime/security。
           rule: ".opencodereview/rule.json"
 
-          effort: "high"
-          review_concurrency: "4"
-          max_tokens_budget: "300000"
+          # effort=high 时单文件组的 token 估算高达 ~392k，任何合理预算都装不下
+          # → 永远跑不完。medium 让评审真正完成（跑得完的评审 > 跑不完的完美评审）。
+          effort: "medium"
+          # 本仓库一个 PR 约 10-11 个变更文件，并发 8 = 两个批次；网关 429 时 CLI 自带退避。
+          review_concurrency: "8"
+          # 300000 实测连一个文件组都装不下。
+          max_tokens_budget: "1200000"
 
           sticky_summary: "true"
           incremental: "true"
