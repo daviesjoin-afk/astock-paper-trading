@@ -138,11 +138,15 @@ class PaperFillWritePathGuardTests(unittest.TestCase):
 
     def test_execution_performance_reads_reference_the_canonical_predicate(self):
         """每个执行绩效读路径都必须引用唯一谓词（而不是各写一份）。"""
+        #: ``deepseek_research.py`` 刻意**不在**这里：R27-B2C-4C 起它的
+        #: ``pnl_attribution`` 路径不再直读账本 —— 它消费 execution / portfolio owner
+        #: 的 typed facts（``load_execution_evidence`` → ``fact_projection`` → adapter），
+        #: 因此"引用唯一谓词"对它不再适用。反过来要求见下方 ``migrated`` 断言：
+        #: 已经迁走的路径不得重新长出自己那份执行绩效判定。
         required = {
             "paper_trading.py": ("_execution_verified_predicate", "_row_is_verified"),
             "paper_repository.py": ("EV.VERIFIED_PREDICATE",),
             "dashboard_queries.py": ("_execution_verified_predicate",),
-            "deepseek_research.py": ("EV.VERIFIED_PREDICATE",),
             "strategy_champion.py": ("EV.VERIFIED_PREDICATE",),
             "adaptive_risk.py": ("EV.VERIFIED_PREDICATE", "EV.is_verified_row"),
             "adaptive_selection.py": ("EV.VERIFIED_PREDICATE",),
@@ -158,6 +162,29 @@ class PaperFillWritePathGuardTests(unittest.TestCase):
                 if needle not in source:
                     missing.append(f"{name} 未引用 {needle}")
         self.assertEqual(missing, [], "执行绩效读路径未接唯一谓词：\n" + "\n".join(missing))
+
+        #: 已迁移路径的反向断言：pnl 归因不得重新持有执行绩效谓词。
+        #: 用 AST 的 ``Attribute`` 视图而不是裸子串扫描 —— 本仓库的文档风格会在注释里
+        #: 逐字写出被禁止的符号（本构造函数上方的注释、``test_pnl_attribution_typed_runtime``
+        #: 的 FORBIDDEN 词表都是这种形态），裸子串会把散文当成违规而误报 RED。
+        migrated_tree = ast.parse(sources.get("deepseek_research.py", ""))
+        predicate_holders = [
+            node.attr for node in ast.walk(migrated_tree)
+            if isinstance(node, ast.Attribute) and node.attr == "VERIFIED_PREDICATE"
+        ]
+        self.assertEqual(
+            [], predicate_holders,
+            "deepseek_research 的 pnl 路径已迁到 typed owner facts，"
+            "不得重新持有执行绩效谓词（判定只能有一份实现）",
+        )
+        # 非空性：同一套扫描真的看得见这种引用（否则上面只是"恒空"）。
+        probe = ast.parse(
+            "import execution_verification as EV\nX = EV.VERIFIED_PREDICATE\n")
+        self.assertEqual(
+            ["VERIFIED_PREDICATE"],
+            [node.attr for node in ast.walk(probe)
+             if isinstance(node, ast.Attribute) and node.attr == "VERIFIED_PREDICATE"],
+        )
 
 
 class IntradaySellStampTests(unittest.TestCase):

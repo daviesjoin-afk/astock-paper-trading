@@ -146,6 +146,11 @@ ALLOWED_AI_CONSUMERS: set[str] = {
     "deepseek_advisor.py",
     "ai_research_execution_adapter.py",
     "ai_research_portfolio_adapter.py",
+    #: R27-B2C-4C 新增**第六个**：``deepseek_research`` —— ``pnl_attribution`` 的
+    #: cross-owner research composition。它原来靠直读账本"自己造"事实；迁移后它必须
+    #: import 契约才能构造 ``InformationEvent`` / 调用 market factory。它**不是**
+    #: authority，也**不是**接缝：只消费 owner 投影，不签发 ref。
+    "deepseek_research.py",
 }
 
 #: 时钟 / 随机数 / IO —— 研究契约一旦读它们，就能拿 current state 回填历史。

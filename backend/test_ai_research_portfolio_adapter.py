@@ -112,6 +112,31 @@ def _imported_roots(source: str) -> set[str]:
     return roots
 
 
+def _enclosing_functions(source: str, symbol: str) -> list:
+    """源码里调用 ``symbol`` 的**外层函数名**（按出现顺序；模块级调用记 ``<module>``）。
+
+    用来回答"这个 factory 到底被哪条路径调用"：调用点落在模块级或一个无关函数里，
+    都说明迁移没有接在批准的组合路径上。
+    """
+    found: list = []
+
+    def _walk(node, current=None):
+        for child in ast.iter_child_nodes(node):
+            name = current
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                name = child.name
+            elif isinstance(child, ast.Call):
+                func = child.func
+                called = (func.id if isinstance(func, ast.Name)
+                          else func.attr if isinstance(func, ast.Attribute) else None)
+                if called == symbol:
+                    found.append(current or "<module>")
+            _walk(child, name)
+
+    _walk(ast.parse(source))
+    return found
+
+
 def _factory_call_sites(source: str) -> int:
     """源码里对 ``evidence_ref_from_portfolio_projection`` 的**调用**点数量。
 
@@ -667,18 +692,34 @@ class PortfolioAdapterTests(unittest.TestCase):
 
     # ---------- PORT-REF-16 ~ 18：调用点、签名、依赖方向 ----------
 
-    def test_PORT_REF_16_production_adapter_callers_are_zero_before_b2c4c(self):
-        """PORT-REF-16：B2C-4C 之前 production 调用点必须**恰好为 0**。
+    def test_PORT_REF_16_production_adapter_caller_is_the_approved_pnl_path(self):
+        """PORT-REF-16：B2C-4C 之后 production 调用点**必须出现**，且只能是批准的 pnl 组合路径。
 
-        B2C-4B = capability + contract；runtime consumer migration 属于 B2C-4C。若本轮已经
-        出现 production 调用者，那就是 scope violation，而不是"顺便接好了"。
+        B2C-4B 时这条断言要求"恰好为 0"（runtime 迁移属于 B2C-4C）。R27-B2C-4C 落地后，
+        "0 个调用者"反而成了缺陷信号 —— 那说明 portfolio 的 typed fact 仍然没有进入 runtime，
+        组合层还在自己读 `paper_accounts` / `paper_orders` / `paper_positions`。
+
+        断言的不是 "grep > 0"，而是**批准的那一个**：调用必须落在 `deepseek_research` 的
+        pnl 组合函数（``_portfolio_leg``）里，而不是"随便哪个 production 模块调了就算接好"。
         """
         callers = {
             name: _factory_call_sites(_module_source(name))
             for name in _production_modules()
         }
         offenders = {name: count for name, count in callers.items() if count}
-        self.assertEqual({}, offenders, f"factory 出现 production 调用点：{offenders}")
+        self.assertEqual(
+            {"deepseek_research.py": offenders.get("deepseek_research.py")}, offenders,
+            f"portfolio adapter 的 production 调用者集合发生变化：{offenders}",
+        )
+        self.assertGreaterEqual(offenders["deepseek_research.py"], 1)
+        self.assertEqual(
+            ["_portfolio_leg"],
+            _enclosing_functions(
+                _module_source("deepseek_research.py"),
+                "evidence_ref_from_portfolio_projection",
+            ),
+            "portfolio adapter 只能在批准的 pnl 组合函数里被调用",
+        )
         # 非空性：扫描器真的看得见调用点（在**测试**文件里找一个真调用）。
         self.assertIn(
             "evidence_ref_from_portfolio_projection",
@@ -691,8 +732,8 @@ class PortfolioAdapterTests(unittest.TestCase):
         )
         self.assertEqual(1, _factory_call_sites(probe))
         self.assertEqual(0, _factory_call_sites("def f():\n    return 1\n"))
-        # 明确点名的三个"将来才会迁移"的模块本轮不得 import adapter。
-        for name in ("deepseek_research.py", "ai_analysis.py", "adaptive_engine.py"):
+        # 明确点名的两个"将来才会迁移"的模块本轮不得 import adapter。
+        for name in ("ai_analysis.py", "adaptive_engine.py"):
             with self.subTest(module=name):
                 self.assertNotIn(
                     "ai_research_portfolio_adapter", _imported_roots(_module_source(name)),
@@ -753,13 +794,22 @@ class PortfolioAdapterTests(unittest.TestCase):
         self.assertIn("ai_research_contract", adapter_imports)
         self.assertIn("paper_portfolio_read_model", adapter_imports)
 
-        # 同时认识两套词表的 production 模块**只有** adapter 一个。
+        # 同时认识两套词表的 production 模块：唯一接缝 adapter + pnl 组合层。
+        # R27-B2C-4C 起组合层也必须同时认识两套词表 —— 跨 owner 组合的定义就是如此 ——
+        # 但角色不同：组合层只**消费** owner 投影，绝不签发 ref（下面显式断言）。
         both = [
             name for name in _production_modules()
             if {"ai_research_contract", "paper_portfolio_read_model"}
             <= _imported_roots(_module_source(name))
         ]
-        self.assertEqual([ADAPTER_MODULE], both, f"不止一个模块同时认识两套词表：{both}")
+        self.assertEqual(
+            sorted([ADAPTER_MODULE, "deepseek_research.py"]), sorted(both),
+            f"同时认识两套词表的模块集合发生变化：{sorted(both)}",
+        )
+        self.assertNotIn(
+            "_issue_evidence_ref", _module_source("deepseek_research.py"),
+            "pnl 组合层不得调用契约的私有签发口 —— 组合结论不是新的 owner fact",
+        )
 
         # 已知限制必须被诚实写下，而不是声称已解决。
         doc = PFA.__doc__ or ""

@@ -2101,6 +2101,55 @@ B2C-4C  migrate pnl_attribution runtime to canonical typed research
 
 这是实现顺序调整，**不是** roadmap 缩减。
 
+#### B2C-4C 之后的硬不变量（pnl_attribution 是跨 owner 组合）
+
+```text
+execution owner / portfolio-accounting owner / R24 market owner
+        各自仍是事实 owner，各自保留 identity
+                ↓
+        research composition（不是第四个 owner）
+                ↓
+        InformationEvent（一条事件引多个 owner ref）
+                ↓
+        pnl_attribution prompt projection（展示层，非 authority）
+```
+
+- `pnl_attribution` 是**跨 owner research 组合**，不签发新的 `ResearchEvidenceRef`；
+  组合结论不是新的底层 owner fact。
+- research 层**不能**把一个裸 valuation mapping 升级成"已验证的市场证据"：valuation 只能由
+  组合层自己从 `MarketDataReading.snapshot.rows` 构造，组合入口不接受调用方的
+  `Mapping` / current quote / latest 兜底。
+- `portfolio_for_context(...).nav_status == verified` **不是**市场核验（它只说明"账本可重建 +
+  拿到了完整 numeric valuations"）。跨 owner 派生事实的可信度必须同时满足它声明需要的
+  **所有** owner legs，且市场侧的 `verification` / `verification_method` 必须一起发布。
+  `verification == "verified"` 也不等于多源：需要双源保证的判据只能问
+  `market_data_contract.is_cross_source_verified`。
+- `paper_nav` 与 `paper_positions` **不是** canonical research authority：`paper_nav` 是 legacy
+  表（它自己的 `quote_status` 尤其不得进入 market 的 owner 核验），`paper_positions` 只是
+  兼容展示投影。
+- PIT context 是**显式**的：归因业务日、`(account_id, cycle_id)`、市场观测时刻都必须由编排
+  边界声明；collector 不得用 `max(paper_nav.nav_date)` / `today()` / 墙钟 / current cycle /
+  current active account 推断任何一项。缺 context 即 fail closed。
+  更具体地说：生产里唯一的 attribution context 签发口是
+  `adaptive_engine._post_close_attribution_request(now=…)` —— 它**必填**一个显式观测
+  instant（不读墙钟，无参即 `TypeError`），签名里**没有**业务日参数。
+  业务日必须满足两个条件才允许签发：① 由**交易日历**判定为完成交易日；② 它就是调用方声明的
+  那个**本日历日**。任一不满足即 fail closed（返回 `None`，collector 记 `_collection_error`），
+  而**不是**退到"最近已完成交易日" —— 那个回退会给出"上一交易日 asof + 当前
+  `paper_accounts.cycle_id` 绑定"这一组合。
+  它只回答"当日 post-close"这一种归因：`targets` 来自 `paper_accounts.cycle_id`
+  （**当前**绑定），签发后是不可变快照，且只有 `adaptive_engine` 能构造
+  `AttributionRequest`。
+  **历史归因不得借用当前绑定**（账户后来解绑/换周期后，用当前绑定解释历史日即
+  current-state leak）；本轮不提供该路径。
+  `OPEN PREREQUISITE: owner-provable historical cycle membership for back-dated attribution`
+  —— 届时应由调用方**显式给出 targets**，而不是自动发现。
+- typed 迁移之后**没有** legacy fallback：typed 路径抛错不得回落 SQL。
+  `load_execution_evidence` → `fact_projection` → adapter 是唯一执行事实入口。
+- owner 证明不了的事实**永远**保持 unknown / unavailable（带 reason）：不补零、不回落成本价
+  或当前报价，也不从 schema 里悄悄删掉字段位置。
+
+
 #### 本段只做一件事：让投影足以承载 attribution 需要的成交事实
 
 B2C-1 的 `ExecutionFactProjection` 只有 identity / lifecycle / verdict / PIT / verification，

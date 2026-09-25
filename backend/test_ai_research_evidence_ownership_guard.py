@@ -113,7 +113,9 @@ APPROVED_ISSUER_CALLERS = frozenset({
 
 #: 目前生产里构造 ``InformationEvent`` 的模块集合。等值断言：多一个模块就是一次
 #: 架构变化（多出一条"事实 → 研究事件"的路径），必须人工修改这里。
-EXPECTED_EVENT_CONSTRUCTORS = frozenset({"deepseek_advisor.py"})
+#: R27-B2C-4C 增加 ``deepseek_research.py`` —— pnl 组合层把 execution / portfolio /
+#: market 三条 owner 事实各自投影成事件；它只是消费者，不签发 ref。
+EXPECTED_EVENT_CONSTRUCTORS = frozenset({"deepseek_advisor.py", "deepseek_research.py"})
 
 
 def _source(name: str) -> str:
