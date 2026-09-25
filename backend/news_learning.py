@@ -1127,6 +1127,13 @@ def _parse_owner_instant(value: Any, *, what: str) -> dt.datetime:
     缺失 / 无法解析 / naive 一律 fail closed。这里**没有**任何 fallback：
     不回退 ``published_at``、不回退 ``created_at``、不回退 ``now()`` —— PIT 不可证明的
     事实不得进入研究链路。
+
+    返回的 instant **归一到 owner 时区**（``TZ``）。row 里的文本允许带任意 offset，而本
+    owner 的日历语义只有一个：read 的日边界是 ``as_of + 23:59:59+08:00``。若这里原样返回
+    原始 offset，``availability_day`` 就会改用另一套日期口径 —— 一个跨过 UTC 午夜的
+    instant（``2026-09-20T16:30+00:00`` 在上海已经是 9/21 00:30）会让 projection 声明一个
+    **比真实可用日更早**的业务日，于是 ``InformationEvent`` 的 look-ahead guard 被绕过。
+    绝对时刻的比较不受此影响（aware 比较与时区无关），受影响的是**由它派生的日历日**。
     """
     raw = str(value or "").strip()
     if not raw:
@@ -1142,7 +1149,7 @@ def _parse_owner_instant(value: Any, *, what: str) -> dt.datetime:
             "naive_first_seen_at",
             f"{what}={raw!r} 没有可证明的时区语义 —— 不得假设本机时区",
         )
-    return parsed
+    return parsed.astimezone(TZ)
 
 
 def _as_of_boundary(as_of: Any) -> dt.datetime:
@@ -1307,7 +1314,9 @@ class NewsFactProjection:
         object.__setattr__(self, "published_at", _text_or_none(self.published_at))
 
         # PIT：availability 只由 first_seen_at 派生。published_at 在这里只被当作描述性
-        # 文本保存，**从不**参与边界计算。
+        # 文本保存，**从不**参与边界计算。业务日按 owner 时区算（见
+        # :func:`_parse_owner_instant`）—— 与 read 的 ``as_of + 23:59:59+08:00`` 日边界
+        # 是**同一套**日历口径。
         instant = _parse_owner_instant(self.first_seen_at, what="first_seen_at")
         object.__setattr__(self, "availability_day", instant.date().isoformat())
 
