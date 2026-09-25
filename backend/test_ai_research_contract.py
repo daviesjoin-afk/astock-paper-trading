@@ -157,6 +157,13 @@ ALLOWED_AI_CONSUMERS: set[str] = {
     #: 同时认识两套词表的接缝，并且只能是**一条**。它今天是**零 production 调用点**的
     #: 能力交付（event_evidence runtime 迁移属于后续 convergence）。
     "ai_research_news_adapter.py",
+    #: R27-B2C-6 新增**第八个**：``ai_research_strategy_adapter`` —— adaptive /
+    #: experiment 事实的 owner adapter。它与 execution / portfolio / news 那三份同构：
+    #: 三个 owner（``adaptive_risk`` / ``adaptive_selection`` / ``learning_evaluation``）
+    #: 都不得 import research，research 契约也不得 import 任何 DB-backed owner，因此必须有
+    #: 一条同时认识这几套词表的接缝，并且只能是**一条**。它同样是**零 production 调用点**的
+    #: 能力交付（candidate_challenge / overfit_watch runtime 迁移属于后续 convergence）。
+    "ai_research_strategy_adapter.py",
 }
 
 #: 时钟 / 随机数 / IO —— 研究契约一旦读它们，就能拿 current state 回填历史。
@@ -1288,16 +1295,18 @@ class OwnerNativeVerificationTests(unittest.TestCase):
                 ARC.EVIDENCE_SOURCE_EXECUTION,
                 ARC.EVIDENCE_SOURCE_PORTFOLIO_RESEARCH,
                 ARC.EVIDENCE_SOURCE_NEWS,
+                ARC.EVIDENCE_SOURCE_STRATEGY_RESEARCH,
             }),
             ARC.SUPPORTED_OWNER_ADAPTERS,
-            "已批准的 owner adapter registry 与 B2C-3 / B2C-4B / B2C-5 的范围不一致",
+            "已批准的 owner adapter registry 与 B2C-3 / B2C-4B / B2C-5 / B2C-6 的范围不一致",
         )
         self.assertFalse(hasattr(ARC, "_OWNER_ISSUED"),
                          "不得存在可 import 的构造哨兵（那是伪安全）")
         # 契约模块**没有**为了"方便"而 re-export portfolio 的 factory。
         self.assertFalse(hasattr(ARC, "evidence_ref_from_portfolio_projection"))
 
-        # 契约**自己**不 import 任何 execution / portfolio 模块 —— 依赖方向单向。
+        # 契约**自己**不 import 任何 execution / portfolio / news / adaptive owner
+        # 或它们的 adapter —— 依赖方向单向。
         self.assertEqual(
             set(), _imported_roots(_tree(CONTRACT_MODULE))
             & {
@@ -1305,8 +1314,11 @@ class OwnerNativeVerificationTests(unittest.TestCase):
                 "ai_research_execution_adapter",
                 "paper_portfolio_read_model", "ai_research_portfolio_adapter",
                 "news_learning", "ai_research_news_adapter",
+                "adaptive_risk", "adaptive_selection", "learning_evaluation",
+                "ai_research_strategy_adapter",
             },
-            "research contract 不得 import execution / portfolio / news owner 或它们的 adapter",
+            "research contract 不得 import execution / portfolio / news / adaptive owner "
+            "或它们的 adapter",
         )
 
         # 契约模块里签发口只被 owner factory 调用（**唯一**一处）。
