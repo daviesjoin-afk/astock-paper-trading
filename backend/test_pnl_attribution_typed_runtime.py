@@ -24,6 +24,8 @@
     PNL-26 ~ 30     架构边界（生产调用点、无 legacy SQL fallback、展示元数据不是证据）
     PNL-31          历史行情缺口 fail closed
     PNL-32          stale-but-available 行情切片必须发布新鲜度（不得只看 availability）
+    PNL-33          归因目标的唯一判据是 cycle 绑定，不是账户生命周期状态
+                    （cycle ownership ≠ execution eligibility）
 
 全部离线：临时 SQLite 账本 + owner 自己的 public read + 被 patch 的 R24 缓存事实。
 不连真实库、不联网、不读墙钟（业务日固定为 ``DAY`` / ``NEXT``）。
@@ -55,6 +57,7 @@ import execution_verification as EV  # noqa: E402
 import market_data_contract as MDC  # noqa: E402
 import market_data_service as MDS  # noqa: E402
 import paper_portfolio_read_model as PPRM  # noqa: E402
+import paper_position_read_model as PPOS  # noqa: E402
 import paper_trading as PT  # noqa: E402
 import paper_trading_rules as PTR  # noqa: E402
 
@@ -1599,6 +1602,117 @@ class PnlAttributionTypedRuntimeTests(unittest.TestCase):
         self.assertEqual(1, len(events))
         for key in ("freshness", "status", "observed_at", "verification_method"):
             self.assertIn(key, events[0]["payload_fields"])
+
+    # ------------- PNL-33：归因目标的唯一判据是 cycle 绑定 -------------
+
+    def test_PNL_33_attribution_targets_use_cycle_binding_not_account_status(self):
+        """PNL-33：``attribution_targets`` 的判据是 **cycle 绑定**，不是账户生命周期状态。
+
+        归因回答的是"哪个 account 属于哪个 cycle，因而其历史事实应被归因"，**不是**
+        "这个 account 当前是否允许产生新交易"。按本仓库自己的 owner contract
+        （``paper_cycle_ownership``：economic ownership = enabled_strategies ∩
+        ``paper_accounts.cycle_id == 目标周期``，lifecycle pause 不改变该集合，
+        cycle ownership ≠ execution eligibility），一个已绑定 cycle 但当前 paused 的账户，
+        其 fees / realized_pnl / 持仓成本仍是**可证明事实**；在这里按 status 过滤会让它
+        既不进入汇总、也不发布任何 unavailable 标记 —— 那是静默丢事实。
+
+        本测试用**真实生产 schema**（``PT.init_db()`` 的 ``paper_accounts`` / ``paper_cycles``），
+        不改任何 production enum：非 running 状态取仓库自己的 ``'paused'``。
+        """
+        a, b, c = self._three_real_accounts()
+        cycle = self.cycle
+        # 先把所有绑定清空，使目标集合只由本测试构造（避免依赖 seed 的偶然绑定）。
+        self.conn.execute("UPDATE paper_accounts SET cycle_id=NULL")
+        self.conn.execute(
+            "UPDATE paper_accounts SET cycle_id=?, status='running' WHERE id=?", (cycle, a))
+        self.conn.execute(
+            "UPDATE paper_accounts SET cycle_id=?, status='paused' WHERE id=?", (cycle, b))
+        self.conn.execute(
+            "UPDATE paper_accounts SET cycle_id=NULL, status='running' WHERE id=?", (c,))
+        self.conn.commit()
+
+        # ── 前置事实（非空性）：B 确实"非 running **且**已绑定目标 cycle"。
+        # 没有这一步，下面的断言可能只是碰巧成立（例如 B 恰好是 running，或 B 没绑定）。
+        b_row = self.conn.execute(
+            "SELECT status, cycle_id FROM paper_accounts WHERE id=?", (b,)).fetchone()
+        self.assertNotEqual("running", b_row["status"], "B 必须是非 running 状态")
+        self.assertEqual(cycle, int(b_row["cycle_id"]), "B 必须绑定目标 cycle")
+        c_row = self.conn.execute(
+            "SELECT cycle_id FROM paper_accounts WHERE id=?", (c,)).fetchone()
+        self.assertIsNone(c_row["cycle_id"], "C 必须没有 cycle 绑定")
+
+        # ── 主证据（行为断言）：绑定即入选，与 status 无关；无绑定即落选。
+        targets = dict(PPOS.attribution_targets(self.conn))
+        self.assertEqual({a: cycle, b: cycle}, targets)
+
+        # ── 非空性：证明本测试真的能区分"旧的借用执行资格"实现。
+        # 在**同一份真实数据**上跑一遍旧判据（``cycle_id IS NOT NULL AND status='running'``），
+        # 它必须会把 B 丢掉；否则上面"B 仍在"这条断言就没有判别力（碰巧成立）。
+        legacy = {
+            str(row["id"]): int(row["cycle_id"])
+            for row in self.conn.execute(
+                "SELECT id, cycle_id FROM paper_accounts"
+                " WHERE cycle_id IS NOT NULL AND status='running' ORDER BY id"
+            ).fetchall()
+        }
+        self.assertIn(a, legacy)
+        self.assertNotIn(
+            b, legacy,
+            "旧判据（叠加 status='running'）会丢掉 paused 的绑定账户 —— 本测试正因此有判别力",
+        )
+
+        # ── 核心证明 1：改变 status **不**改变 cycle-bound 归属。
+        self.conn.execute("UPDATE paper_accounts SET status='running' WHERE id=?", (b,))
+        self.conn.commit()
+        self.assertEqual(
+            {a: cycle, b: cycle}, dict(PPOS.attribution_targets(self.conn)),
+            "把绑定账户从 paused 改成 running 不得改变归因目标集合",
+        )
+        self.conn.execute("UPDATE paper_accounts SET status='paused' WHERE id=?", (a,))
+        self.conn.commit()
+        self.assertEqual(
+            {a: cycle, b: cycle}, dict(PPOS.attribution_targets(self.conn)),
+            "把另一个绑定账户改成 paused 也不得改变归因目标集合",
+        )
+
+        # ── 核心证明 2：cycle_id 非 NULL → NULL 必须让 target 消失。
+        self.conn.execute("UPDATE paper_accounts SET cycle_id=NULL WHERE id=?", (a,))
+        self.conn.commit()
+        after = dict(PPOS.attribution_targets(self.conn))
+        self.assertNotIn(a, after, "失去 cycle 绑定的账户必须从归因目标消失")
+        self.assertIn(b, after, "另一个绑定账户不受影响")
+
+        # ── 边界补充（行为证据是主证据，这里只补充实现边界）：可执行 SQL 里不得出现
+        # account status 谓词，也不得回落"当前 cycle"（那会引入 current-cycle fallback）。
+        sql = _attribution_targets_sql()
+        self.assertIn("paper_accounts", sql, "非空性：确实取到了真实 SQL 字面量")
+        self.assertNotIn("status", sql.lower(), "归因目标不得依赖账户生命周期状态")
+        self.assertNotIn("paper_cycles", sql.lower(), "归因目标不得回落当前 cycle")
+
+    def _three_real_accounts(self):
+        """三个**真实**的 seed 账户 id（不新建账户、不改 production 配置）。"""
+        ids = [str(key) for key in PT.ACCOUNT_SPECS]
+        self.assertGreaterEqual(len(ids), 3, "fixture 需要至少 3 个真实账户")
+        return ids[0], ids[1], ids[2]
+
+
+def _attribution_targets_sql() -> str:
+    """``attribution_targets`` 源码里的字符串字面量拼接（docstring 已剥掉）。
+
+    刻意**不**复用模块级的 ``_executable_source``：那个助手为"标识符视图"服务，会把所有
+    字符串字面量替换成 ``…``，因此拿不到 SQL 原文。这里要的恰恰是 SQL 文本本身。
+    """
+    tree = ast.parse(inspect.getsource(PPOS.attribution_targets))
+    body = list(tree.body[0].body)
+    if (body and isinstance(body[0], ast.Expr)
+            and isinstance(body[0].value, ast.Constant)
+            and isinstance(body[0].value.value, str)):
+        body = body[1:]
+    node = ast.Module(body=body, type_ignores=[])
+    return " ".join(
+        item.value for item in ast.walk(node)
+        if isinstance(item, ast.Constant) and isinstance(item.value, str)
+    )
 
 
 def _except_probe(value=None) -> object:
