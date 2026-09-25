@@ -51,9 +51,13 @@ concurrency:
 jobs:
   semantic-review:
     runs-on: ubuntu-latest
-    # 实测（PR #200，effort=high + concurrency=4 + budget=300000）：10 个文件只完成 1 个
-    # 就触发 budget_exceeded（490k tokens / 12m29s）→ job 判 RED，观察窗口拿不到完整样本。
-    # 四个旋钮必须一起调（effort / concurrency / budget / timeout），只调一个无效。
+    # 实测（PR #200，effort=high + concurrency=4 + budget=300000 + llm_timeout=300）：
+    # run 9fff47b = 9 selected / 1 completed / 8 failed（367,963 tokens / 13m42s）；
+    # run 1d27fa1 = 10 selected / 0 completed / 10 failed（490,743 tokens / 12m29s）。
+    # 两个独立 blocker：① budget 截断（effort=high 单文件组估算 ~392k，300k 装不下）；
+    # ② 2 个 LLM request 在默认 300s 处 timeout（timeout/context/300004ms、300000ms）。
+    # timeout 分三层，必须一起给足：llm_timeout（单次 LLM 请求）/
+    # review_task_timeout（每个 semantic group）/ timeout-minutes（整个 job）。
     timeout-minutes: 60
     steps:
       - name: Run OpenCodeReview
@@ -80,12 +84,22 @@ jobs:
           rule: ".opencodereview/rule.json"
 
           # effort=high 时单文件组的 token 估算高达 ~392k，任何合理预算都装不下
-          # → 永远跑不完。medium 让评审真正完成（跑得完的评审 > 跑不完的完美评审）。
+          # → 永远跑不完。medium（2 rounds，high 是 3 rounds）让评审真正完成
+          # （跑得完的评审 > 跑不完的完美评审）。这是真正的吞吐杠杆。
           effort: "medium"
-          # 本仓库一个 PR 约 10-11 个变更文件，并发 8 = 两个批次；网关 429 时 CLI 自带退避。
-          review_concurrency: "8"
-          # 300000 实测连一个文件组都装不下。
+          # 实测两次 run 的 semantic grouping 都是 3 个 group（3/5/1 与 3/4/3），
+          # concurrency=4 已能同时覆盖全部 group —— 调大对当前 PR 理论提速为 0，
+          # 只会增加 429 / provider 队列压力与瞬时 token 消耗。观察 5-10 个 PR 后
+          # 若 group count 经常 > 4 再上调。
+          review_concurrency: "4"
+          # 300000 实测连一个文件组都装不下。这是 coverage/completeness 修正，
+          # 不是提速（预算变大反而允许消耗更多 token）。budget 是 cap，不代表一定用满。
           max_tokens_budget: "1200000"
+          # 默认 300s 已有两次真实 timeout（duration_to_headers_ms=300004/300000）。
+          # 先用 600 而不是 900：单个坏请求最多等 10 分钟；观察数据仍不足再升 900。
+          llm_timeout: "600"
+          # 默认 15m 可能截断单个大 group；30m 给 medium 档留余量（action 上限 120）。
+          review_task_timeout: "30"
 
           sticky_summary: "true"
           incremental: "true"
