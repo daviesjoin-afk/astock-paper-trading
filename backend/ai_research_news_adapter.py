@@ -102,10 +102,11 @@ market_major_event|<event_key>
 ```
 
 调用方不能提供 ``source_id`` / ``as_of`` / ``verification`` / ``outcome``：本函数的签名里
-**只有** projection。``as_of`` 只能来自 ``NewsFactProjection.availability_day``，即 owner 从
-``first_seen_at`` 派生的业务日 —— 本项目**不**接受 ``published_at`` / ``created_at`` /
-``today()`` 作为 fallback。news 的可用性 authority 是 ``first_seen_at``（系统第一次观测到
-它的时刻），不是来源声称的发布时间。
+**只有** projection。``as_of`` 只能来自 ``NewsFactProjection.availability_day``，即 owner 把
+``first_seen_at`` **归一到 owner 时区**（Asia/Shanghai）之后派生的业务日 —— 本项目**不**接受
+``published_at`` / ``created_at`` / ``today()`` 作为 fallback，也不接受原始 offset 的日期
+（``2026-09-20T16:30+00:00`` 在上海已经是 9/21 00:30，业务日必须是 9/21）。news 的可用性
+authority 是 ``first_seen_at``（系统第一次观测到它的时刻），不是来源声称的发布时间。
 
 内容指纹覆盖 record_kind / identity / canonical_hash / first_seen_at / availability_day /
 来源身份 / event_type / evidence_grade / owner 核验状态，以及事实 payload 的 canonical
