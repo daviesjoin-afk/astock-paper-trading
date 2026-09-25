@@ -2132,10 +2132,14 @@ execution owner / portfolio-accounting owner / R24 market owner
   current active account 推断任何一项。缺 context 即 fail closed。
   更具体地说：生产里唯一的 attribution context 签发口是
   `adaptive_engine._post_close_attribution_request(now=…)` —— 它**必填**一个显式观测
-  instant（不读墙钟），业务日由**交易日历**从该 instant 解析（周末/法定假日与 15:05 前都
-  不算完成日，因此业务日绝不是 `now().date()`），签名里**没有**业务日参数。
+  instant（不读墙钟，无参即 `TypeError`），签名里**没有**业务日参数。
+  业务日必须满足两个条件才允许签发：① 由**交易日历**判定为完成交易日；② 它就是调用方声明的
+  那个**本日历日**。任一不满足即 fail closed（返回 `None`，collector 记 `_collection_error`），
+  而**不是**退到"最近已完成交易日" —— 那个回退会给出"上一交易日 asof + 当前
+  `paper_accounts.cycle_id` 绑定"这一组合。
   它只回答"当日 post-close"这一种归因：`targets` 来自 `paper_accounts.cycle_id`
-  （**当前**绑定），签发后是不可变快照。
+  （**当前**绑定），签发后是不可变快照，且只有 `adaptive_engine` 能构造
+  `AttributionRequest`。
   **历史归因不得借用当前绑定**（账户后来解绑/换周期后，用当前绑定解释历史日即
   current-state leak）；本轮不提供该路径。
   `OPEN PREREQUISITE: owner-provable historical cycle membership for back-dated attribution`

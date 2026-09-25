@@ -1092,16 +1092,23 @@ current cycle / current active account 推断任何一项；缺 context 即 fail
 生产里唯一的签发口是 `adaptive_engine._post_close_attribution_request(now=…)`：
 
 ```text
-now     必填的显式观测 instant（tz-aware）—— 签发口自己不读墙钟；无参调用直接 TypeError
-asof_day 由**交易日历**从 now 解析（universe.latest_complete_trade_date(now=now)）：
-         周末/法定假日不是完成日；15:05 前的当日也还不是完成日
-         ⇒ 业务日不是 now().date()，也不允许调用方指定
+now      必填的显式观测 instant（tz-aware）—— 签发口自己不读墙钟；无参调用直接 TypeError
+asof_day 必须同时满足两条才允许签发：
+         ① 交易日历判定它是完成交易日（universe.latest_complete_trade_date(now=now)：
+            周末/法定假日不是，15:05 前的当日也不是）
+         ② 它就是调用方声明的那个**本日历日**
+         任一不满足 → fail closed（返回 None），**不**退到"最近已完成交易日"
+         ⇒ asof_day 恒等于本日历日；签名里也没有业务日参数
 targets  来自 paper_accounts.cycle_id（**当前**绑定）
          ⇒ 只支撑"当日 post-close"；签发后是不可变快照，之后解绑/换周期不会重绑定
 ```
 
-因此"历史 `asof_day` + 当前绑定自动发现 targets"这种组合在签名层面**不可表达**（不是靠
-调用方自觉）。历史归因需要 owner **可证明的历史挂载证据**：
+为什么必须拒绝那个回退：交易日历在盘中/周末/节假日会返回**上一个已完成交易日**。照此签发
+就会得到"上一交易日 asof + 当前 cycle 绑定"——账户后来解绑或换周期后，那就是用当前归属解释
+历史日，即 current-state leak。因此这条限制是**运行期强制**的（不满足即 fail closed），而不是
+只在签名上"不提供"。另外生产里只有 `adaptive_engine` 能构造 `AttributionRequest`。
+
+历史归因需要 owner **可证明的历史挂载证据**：
 
 ```text
 OPEN PREREQUISITE: owner-provable historical cycle membership for back-dated attribution

@@ -2592,27 +2592,30 @@ def _post_close_attribution_request(*, now):
     * ``now`` —— **必填**的本次运行观测 instant（tz-aware）。本函数**不读墙钟**：少了这个
       参数就是"没人声明观测时刻"，直接 ``TypeError``；显式给了非法值也失败，绝不回落
       ``datetime.now()``（静默替换等于篡改调用方声明的 PIT 时刻）。
-    * 业务日 —— 由**交易日历**从 ``now`` 解析：``universe.latest_complete_trade_date(now=now)``。
-      刻意**不**用 ``now.date()``：日历日不是"已完成交易日"（周末/法定假日不是，15:05 前的
-      当日也还不是），所以这个函数永远不会把业务日声明成一个尚未完成的日。同一 instant 也
-      交给 R24 做 freshness 判定。
+    * 业务日 —— **只在本日历日自身是已完成交易日时**才签发；业务日由**交易日历**给出
+      （``universe.latest_complete_trade_date(now=now)``，同一 instant 也交给 R24 做
+      freshness 判定）。所以在盘中（未过 15:05）与周末/法定节假日时本函数**fail closed
+      返回 ``None``**，而不是退到"最近已完成交易日"。
     * ``targets`` —— ``paper_position_read_model.attribution_targets()`` 读的是
       ``paper_accounts.cycle_id``，也就是**当前**绑定。它只能支撑"当日"的归属，因此本函数
-      只允许在这个场景里用它，且**不接受**调用方指定业务日。
+      只在这个场景里用它，且**不接受**调用方指定业务日。
 
-    **历史归因为什么在这里不可表达**：历史业务日的归属必须由 owner **可证明的历史挂载证据**
-    给出，而"当前 ``cycle_id`` 绑定"不是那种证据 —— 账户后来解绑或换周期后，用当前绑定解释
-    历史日就是 current-state leak。所以本 PR 不提供任何"历史 ``asof_day`` + 当前绑定自动发现
-    targets"的路径：函数签名里根本没有 ``asof_day`` / ``targets`` 参数，那种组合**不可表达**。
-    历史归因需要 owner 侧的历史归属契约：
+    **为什么必须拒绝回退到上一交易日**（本项是前一轮的修正点）：交易日历在盘中/周末/节假日
+    会返回**上一个已完成交易日**。若照此签发，就会得到"历史业务日 + 当前 ``cycle_id``
+    绑定"这一组合 —— 账户后来解绑或换周期后，那就是用当前归属解释历史日，即 current-state
+    leak。所以本函数不是在签名上"不提供"这种组合，而是在**运行期**直接拒绝：``asof_day``
+    恒等于调用方声明的那个本日历日，且该日必须是已完成交易日。
+
+    因此历史归因在这里**确实不可表达**，需要 owner 侧可证明的历史挂载证据：
 
         OPEN PREREQUISITE: owner-provable historical cycle membership for back-dated attribution
 
     届时应由调用方**显式给出 targets**，而不是让这里去自动发现。
 
-    一个 target 都拿不到时返回 ``None`` —— 让 ``pnl_attribution`` 自己 fail closed
-    （记 ``_collection_error``），而不是发布一份"看起来正常"的归因。**读失败**与"没有可证明
-    绑定的账户"都 fail closed，但根因会被打印出来，避免两者在排障时无从区分。
+    一个 target 都拿不到时同样返回 ``None`` —— 让 ``pnl_attribution`` 自己 fail closed
+    （记 ``_collection_error``），而不是发布一份"看起来正常"的归因。**非完成交易日**、
+    **读失败**、**没有可证明绑定的账户**三者都 fail closed，但根因都会被打印出来，避免在
+    排障时无从区分。
     """
     if not isinstance(now, dt.datetime):
         raise ValueError(
@@ -2622,7 +2625,23 @@ def _post_close_attribution_request(*, now):
     if now.tzinfo is None or now.tzinfo.utcoffset(now) is None:
         raise ValueError("post-close attribution requires a timezone-aware 'now'")
     import universe as U  # 与模块内既有的交易日历用法一致（见 K 线完成日解析）
-    day = U.latest_complete_trade_date(now=now).isoformat()
+    #: 只有**本日历日自身**是已完成交易日时才签发。盘中（未过 15:05）与周末/法定节假日时，
+    #: 交易日历给出的"最近已完成交易日"是**上一个交易日** —— 那时归因日就是历史日，而本函数
+    #: 可用的 targets 只有**当前** ``paper_accounts.cycle_id`` 绑定。两者不可以一起用
+    #: （用当前绑定解释历史日就是 current-state leak），所以这里直接 fail closed，而不是签发
+    #: 一份看起来正常的归因。
+    local_day = now.date()
+    completed = U.latest_complete_trade_date(now=now)
+    if completed != local_day:
+        print(
+            "[attribution] pnl context unavailable: "
+            f"{local_day.isoformat()} is not a completed trading day "
+            f"(latest complete = {completed.isoformat()}) —— 当日 post-close 归因只声明"
+            "自己那个已完成交易日，拒绝用历史业务日配合当前 cycle 绑定",
+            flush=True,
+        )
+        return None
+    day = completed.isoformat()
     conn = None
     targets = ()
     read_error = None
