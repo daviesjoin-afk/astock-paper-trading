@@ -2,8 +2,9 @@
 """R27-B2C-4B mutation matrix —— M-PFACT-1 .. M-PFACT-10。
 
 只覆盖本轮**新的高风险 invariant**。每条 mutation 都必须让**唯一指定**的永久回归变 RED，
-anchor 恰好命中一次；``--non-vacuity`` 先跑 baseline，``SyntaxError`` / ``ImportError`` /
-``NameError`` / collection failure 一律计为 FAKE（接线错误是假杀，不能算 detected）。
+anchor 恰好命中一次；baseline 是 matrix 的**强制前提**（无条件先于任何 mutation 运行，
+没有开关），``SyntaxError`` / ``ImportError`` / ``NameError`` / collection failure 一律计为
+FAKE（接线错误是假杀，不能算 detected）。
 
 本轮的核心不变量分四组：
 
@@ -24,9 +25,13 @@ anchor 恰好命中一次；``--non-vacuity`` 先跑 baseline，``SyntaxError`` 
 字节码缓存，整张矩阵静默失效。**必须串行运行**：每条 mutation 就地改写 production source，
 跑完按启动快照做 byte-identical 还原并校验 sha256。
 
+baseline 规则（OCR finding 的修正）：``--non-vacuity`` 开关已删除。selected mutations 确定
+后，先对**全部去重后的永久 regression target** 依次运行 baseline；任一非 GREEN 即输出
+``BASELINE-RED`` 并立即失败，**不进入** mutation 阶段。若不强制，一个在干净源码上本来就红的
+目标会让它的所有 mutation 都被记成 CAUGHT —— 那是假证据，违反 harness 自身的证据链要求。
+
 用法：
     python work/r27b2c4b_portfolio_accounting_mutation_check.py
-    python work/r27b2c4b_portfolio_accounting_mutation_check.py --non-vacuity
     python work/r27b2c4b_portfolio_accounting_mutation_check.py --only M-PFACT-1
 """
 from __future__ import annotations
@@ -302,11 +307,145 @@ def self_test_sequence() -> None:
     assert len(set(dirs)) == 3, f"invocations share a cache dir: {dirs}"
 
 
-def assert_no_leftover(mutation: dict) -> None:
-    path = os.path.join(ROOT, mutation["file"])
+def self_test_semantics() -> None:
+    """在临时目录里自证分类语义（stub 掉真实 runner，不触碰任何 production source）。
+
+    覆盖：BASELINE-RED 且不进入 mutation、CAUGHT、SURVIVED、FAKE（四类接线错误）、
+    restore 不一致硬失败、正常路径 byte-identical 还原。
+    """
+    root = tempfile.mkdtemp(prefix="r27b2c4b_mutation_semantics_")
+    rel = "semantics_target.py"
+    path = os.path.join(root, rel)
+    original = "def add(a, b):\n    return a + b\n"
+    with open(path, "w", encoding="utf-8", newline="") as handle:
+        handle.write(original)
+
+    def result(code: int, out: str = "", err: str = "") -> subprocess.CompletedProcess:
+        return subprocess.CompletedProcess(args=[], returncode=code, stdout=out, stderr=err)
+
+    mutation = {
+        "id": "SELF-1", "file": rel,
+        "old": "    return a + b\n", "new": "    return a - b  # MUTANT\n",
+        "test": "test_semantics.Fake.test_add", "desc": "self-test semantic mutant",
+    }
+
+    # 1) baseline RED → 整体失败，且 production source 一个字节都不被触碰。
+    seen: list[str] = []
+
+    def red_baseline(target: str, seq: int | None = None):
+        seen.append(target)
+        return result(1, "", "AssertionError: expected 2 got 3")
+
+    assert run_baselines([mutation], runner=red_baseline) == 1, "baseline RED must fail"
+    assert seen == [mutation["test"]], f"baseline must run exactly the deduped target: {seen}"
+    with open(path, "rb") as handle:
+        assert handle.read() == original.encode("utf-8"), (
+            "baseline phase must not touch the source")
+
+    # 2/3/4) baseline GREEN 之后的分类：CAUGHT / SURVIVED / FAKE。
+    def runner_for(code: int, out: str = "", err: str = ""):
+        def _run(target: str, seq: int | None = None):
+            return result(code, out, err)
+        return _run
+
+    assert run_mutation(mutation, root=root, runner=runner_for(1)) == "CAUGHT"
+    with open(path, "rb") as handle:
+        assert handle.read() == original.encode("utf-8"), "bytes must be restored exactly"
+    assert run_mutation(mutation, root=root, runner=runner_for(0)) == "SURVIVED"
+    for err in ("SyntaxError: invalid syntax", "ImportError: no module named x",
+                "NameError: name 'x' is not defined", "_FailedTest: collection failure"):
+        verdict = run_mutation(mutation, root=root, runner=runner_for(1, err=err))
+        assert verdict == "FAKE", f"{err} must be FAKE, got {verdict}"
+
+    # 5) restore 不一致 → 硬失败（人为给一个错误的启动快照 sha）。
+    try:
+        _restore_and_verify(path, original.encode("utf-8"), "0" * 64, mutation["id"])
+    except RuntimeError as exc:
+        assert "restore sha256 mismatch" in str(exc), exc
+    else:
+        raise AssertionError("restore mismatch did not hard-fail")
+
+    # 非空性：BROKEN_RE 必须真的能区分接线错误与业务断言失败。
+    assert _is_fake_kill(result(1, err="SyntaxError: invalid syntax"))
+    assert not _is_fake_kill(result(1, err="AssertionError: 2 != 3"))
+
+
+def assert_no_leftover(path: str, mutation_id: str) -> None:
     with open(path, encoding="utf-8") as handle:
         if "MUTANT" in handle.read():
-            raise RuntimeError(f'{mutation["id"]}: leftover mutant in {mutation["file"]}')
+            raise RuntimeError(f"{mutation_id}: leftover mutant in {path}")
+
+
+def _restore_and_verify(path: str, original: bytes, before: str, mutation_id: str) -> None:
+    """按启动快照 byte-identical 还原，并校验 sha256 —— 不一致即硬失败。"""
+    with open(path, "wb") as handle:
+        handle.write(original)
+    with open(path, "rb") as handle:
+        after = sha256(handle.read())
+    if after != before:
+        raise RuntimeError(f"{mutation_id}: restore sha256 mismatch")
+    assert_no_leftover(path, mutation_id)
+
+
+def run_baselines(selected, *, runner=run_test) -> int:
+    """在触碰任何 production source **之前**，先证明全部目标永久回归都是 GREEN。
+
+    baseline 是 matrix 自身的强制前提，不是可选观察项：某个目标若在干净源码上本来就红，
+    它的所有 mutation 都会因 ``returncode != 0`` 被记成 CAUGHT —— 那是假证据。因此对
+    selected mutations 的**去重** target 集合依次运行；任一非 GREEN 立即失败，
+    **不进入** mutation 阶段。
+    """
+    targets: list[str] = []
+    for mutation in selected:
+        if mutation["test"] not in targets:
+            targets.append(mutation["test"])
+    if not targets:
+        print("baseline: no target selected", flush=True)
+        return 1
+    bad: list[str] = []
+    for target in targets:
+        result = runner(target)
+        if result.returncode == 0:
+            print(f"baseline {target}: GREEN", flush=True)
+        else:
+            print(f"baseline {target}: BASELINE-RED({result.returncode})", flush=True)
+            bad.append(target)
+    if bad:
+        print(
+            f"baseline: RED —— {len(bad)}/{len(targets)} 个目标在干净源码上非 GREEN：{bad}",
+            "mutation 阶段不启动（baseline 是强制前提）",
+            sep="\n", flush=True,
+        )
+        return 1
+    print(f"baseline: GREEN（{len(targets)} 个目标全部先于 mutation 验证）", flush=True)
+    return 0
+
+
+def run_mutation(mutation: dict, *, root: str = ROOT, runner=run_test) -> str:
+    """Return ``CAUGHT`` / ``SURVIVED`` / ``FAKE``。
+
+    baseline 由 :func:`run_baselines` 在进入 mutation 阶段**之前**统一证明；本函数不再
+    含任何"是否跑 baseline"的分支 —— 那正是 OCR 抓到的假证据缺口：默认路径允许跳过
+    baseline，于是一个本来就红的目标会让它的所有 mutation 被记成 CAUGHT。
+    """
+    path = os.path.join(root, mutation["file"])
+    with open(path, "rb") as handle:
+        original = handle.read()
+    before = sha256(original)
+    text = original.decode("utf-8").replace("\r\n", "\n")
+
+    mutated = _apply(text, mutation)
+    try:
+        with open(path, "wb") as handle:
+            handle.write(_adapt_eol(mutated, original))
+        result = runner(mutation["test"])
+        if result.returncode == 0:
+            return "SURVIVED"
+        if _is_fake_kill(result):
+            return "FAKE"
+        return "CAUGHT"
+    finally:
+        _restore_and_verify(path, original, before, mutation["id"])
 
 
 def _apply(text: str, mutation: dict) -> str:
@@ -323,66 +462,52 @@ def _is_fake_kill(result: subprocess.CompletedProcess) -> bool:
     return bool(BROKEN_RE.search(blob))
 
 
-def run_mutation(mutation: dict, *, non_vacuity: bool) -> str:
-    """Return ``CAUGHT`` / ``SURVIVED`` / ``FAKE`` / ``BASELINE-RED``."""
-    path = os.path.join(ROOT, mutation["file"])
-    with open(path, "rb") as handle:
-        original = handle.read()
-    before = sha256(original)
-    text = original.decode("utf-8").replace("\r\n", "\n")
-
-    if non_vacuity:
-        baseline = run_test(mutation["test"])
-        if baseline.returncode != 0:
-            return f"BASELINE-RED({baseline.returncode})"
-
-    mutated = _apply(text, mutation)
-    try:
-        with open(path, "wb") as handle:
-            handle.write(_adapt_eol(mutated, original))
-        result = run_test(mutation["test"])
-        if result.returncode == 0:
-            return "SURVIVED"
-        if _is_fake_kill(result):
-            return "FAKE"
-        return "CAUGHT"
-    finally:
-        with open(path, "wb") as handle:
-            handle.write(original)
-        with open(path, "rb") as handle:
-            after = sha256(handle.read())
-        if after != before:
-            raise RuntimeError(f'{mutation["id"]}: restore sha256 mismatch')
-        assert_no_leftover(mutation)
-
-
 def main() -> int:
     print(f"repo root: {ROOT}")
     argv = sys.argv[1:]
+    if "--non-vacuity" in argv:
+        print(
+            "ERROR: --non-vacuity 已删除。baseline 现在是 matrix 的强制前提，"
+            "无条件先于任何 mutation 运行，没有开关。",
+            flush=True,
+        )
+        return 2
     only: set[str] | None = None
     if "--only" in argv:
         only = {item for item in argv[argv.index("--only") + 1].split(",") if item}
-    non_vacuity = "--non-vacuity" in argv
 
     self_test_sequence()
     print("runner self-test: PASS (unique, increasing pycache sequence)")
+    self_test_semantics()
+    print("semantics self-test: PASS (BASELINE-RED / CAUGHT / SURVIVED / FAKE / restore)")
 
     selected = [m for m in MUTATIONS if only is None or m["id"] in only]
+    if not selected:
+        print("no mutation selected", flush=True)
+        return 2
+
+    if run_baselines(selected) != 0:
+        print("mutation matrix: FAILED —— baseline 非 GREEN，mutation 阶段未启动", flush=True)
+        return 1
+
     results: list[tuple[str, str]] = []
     for mutation in selected:
-        verdict = run_mutation(mutation, non_vacuity=non_vacuity)
+        verdict = run_mutation(mutation)
         results.append((mutation["id"], verdict))
         print(f'{mutation["id"]} {mutation["desc"]}: {verdict}', flush=True)
 
     bad = [(mid, v) for mid, v in results if v != "CAUGHT"]
     for mid, verdict in bad:
         print(f"NOT-CAUGHT {mid}: {verdict}")
-    print(f"R27-B2C-4B mutations: {len(results) - len(bad)}/{len(results)} DETECTED; "
-          f"survived={sum(1 for _, v in bad if v.startswith('SURVIVED'))}; "
-          f"fake={sum(1 for _, v in bad if v == 'FAKE')}; "
-          f"other={sum(1 for _, v in bad if not v.startswith('SURVIVED') and v != 'FAKE')}")
-    print("restore sha256: PASS")
-    return 0 if not bad else 1
+    detected = len(results) - len(bad)
+    survived = sum(1 for _, v in bad if v.startswith("SURVIVED"))
+    fake = sum(1 for _, v in bad if v == "FAKE")
+    print(f"R27-B2C-4B mutation matrix: baseline=GREEN; "
+          f"{detected}/{len(results)} DETECTED; survived={survived}; fake={fake}")
+    gate_pass = not bad
+    print("gate: baseline=GREEN, survived=0, fake=0, restore sha256=PASS -> "
+          f"{'PASS' if gate_pass else 'FAIL'}")
+    return 0 if gate_pass else 1
 
 
 if __name__ == "__main__":
