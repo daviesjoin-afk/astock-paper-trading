@@ -1,13 +1,14 @@
 # -*- coding: utf-8 -*-
 """R27-B2C-6 —— adaptive / experiment owner fact 与 strategy adapter 的 **mutation matrix**。
 
-覆盖 ``M-EXP-01`` ~ ``M-EXP-18``，逐条对应本轮要钉死的不变量：
+覆盖 ``M-EXP-01`` ~ ``M-EXP-19``，逐条对应本轮要钉死的不变量：
 
 ```text
 selection candidate 只有一个 production writer（owner 自己）
 candidate 的 writer origin 只能由 owner 的 durable 记号证明（词汇不是来源）
 proposal 槽位冲突必须显式拒绝，不得谎报"已保存"
 幂等判据必须覆盖 proposal 的**完整 factual payload**（含 evidence / reason）
+幂等成功还要求既有行**仍处于 shadow 状态**（applied / rolled_back 不算"已存在"）
 candidate lifecycle status  ≠ owner verification
 run_date                    ≠ revision availability
 dataset cutoff              ≠ evaluation availability
@@ -17,18 +18,19 @@ adapter 只接受已批准的精确类型，且不接受 caller 命名的 identi
 registry 与真实 factory 双向一致
 ```
 
-────────────── review 后发现的三条 ──────────────
+────────────── review 后发现的四条 ──────────────
 
 ```text
 M-EXP-16  来源判据退回"只看词汇" → 历史 DeepSeek 直写行被判成 owner verified
 M-EXP-17  proposal 槽位冲突被静默吞掉 → runtime 报告"仅保存候选"但实际没写
 M-EXP-18  幂等只看 weights → evidence / reason 变化被当成"同一个请求"，
           候选 ledger 与 tuning run 对"这次持久化了什么"说法不一致
+M-EXP-19  删掉幂等资格条件 → 生命周期已推进的行被当成"同一条 shadow proposal 已存在"
 ```
 
-三条都是 review 抓出的真实缺陷，因此它们的 mutation 必须**先红**，并各自指定由哪条永久回归
-捕获（``EXP-04d`` / ``EXP-03e`` / ``EXP-03f``）。review 发现的漏洞立刻转成 mutation，
-否则下一轮回归仍然守不住它。
+四条都是 review 抓出的真实缺陷，因此它们的 mutation 必须**先红**，并各自指定由哪条永久回归
+捕获（``EXP-04d`` / ``EXP-03e`` / ``EXP-03f`` / ``EXP-03b``；runtime 侧的 ``EXP-03h`` 也覆盖
+最后一条）。review 发现的漏洞立刻转成 mutation，否则下一轮回归仍然守不住它。
 
 ────────────── 与 brief 的偏差（记录，不静默） ──────────────
 
@@ -105,6 +107,8 @@ T_EXP_02 = _owner("SelectionWriterConvergenceTests."
                   "test_EXP_02_deepseek_advisor_never_writes_the_selection_ledger")
 T_EXP_03 = _owner("SelectionWriterConvergenceTests."
                   "test_EXP_03_ai_proposal_still_cannot_auto_apply")
+T_EXP_03B = _owner("SelectionWriterConvergenceTests."
+                   "test_EXP_03b_idempotency_requires_a_still_shadow_proposal")
 T_EXP_03D = _owner("SelectionWriterConvergenceTests."
                    "test_EXP_03d_an_occupied_slot_with_different_content_is_an_explicit_conflict")
 T_EXP_03E = _owner("SelectionWriterConvergenceTests."
@@ -113,6 +117,8 @@ T_EXP_03F = _owner("SelectionWriterConvergenceTests."
                    "test_EXP_03f_idempotency_must_cover_the_whole_factual_payload")
 T_EXP_03G = _owner("SelectionWriterConvergenceTests."
                    "test_EXP_03g_the_runtime_never_reuses_a_row_for_a_different_proposal")
+T_EXP_03H = _owner("SelectionWriterConvergenceTests."
+                   "test_EXP_03h_an_advanced_lifecycle_row_blocks_a_reproposed_identical_payload")
 T_EXP_04 = _owner("CandidateLifecycleIsNotVerificationTests."
                   "test_EXP_04_candidate_lifecycle_status_never_changes_verification")
 T_EXP_04B = _owner("CandidateLifecycleIsNotVerificationTests."
@@ -185,6 +191,7 @@ BASELINE_ONLY_TARGETS = (
     T_EXP_03,
     T_EXP_03D,
     T_EXP_03G,
+    T_EXP_03H,
     T_EXP_04B,
     T_EXP_04E,
     T_EXP_05,
@@ -238,8 +245,10 @@ SEL_ORIGIN_CHECK = (
 #: 槽位冲突的显式拒绝（与幂等成功分开）。
 SEL_PROPOSAL_CONFLICT = (
     "    raise SelectionProposalConflict(\n"
-    "        f\"shadow proposal slot {day}/{account}/{regime_text} is already occupied by candidate \"\n"
-    "        f\"{item.get('id')} with different factual content — 本次提案**没有**被持久化\"\n"
+    "        f\"shadow proposal slot {day}/{account}/{regime_text} is not available for this proposal: \"\n"
+    "        f\"candidate {item.get('id')} (status={item.get('status')!r}, tier={item.get('tier')!r}) \"\n"
+    "        \"既不是一条 factual payload 相同的 shadow proposal，也没有被本次调用改写 —— \"\n"
+    "        \"本次提案**没有**被持久化\"\n"
     "    )\n"
 )
 
@@ -251,6 +260,14 @@ SEL_IDEMPOTENCY_COMPARISON = (
     "        and stored_evidence == evidence_canonical\n"
     '        and str(item.get("reason") or "") == reason_text\n'
     "    )\n"
+)
+
+#: 幂等**资格**条件 —— 既有行必须仍是一条 AI 影子提案。
+SEL_IDEMPOTENCY_ELIGIBILITY = (
+    '    if str(item.get("status") or "").strip() != SHADOW_PROPOSAL_STATUS:\n'
+    "        return False\n"
+    '    if str(item.get("tier") or "").strip() != AI_REALTIME_TIER:\n'
+    "        return False\n"
 )
 
 #: selection owner 的核验闭集判据尾部。
@@ -606,6 +623,17 @@ MUTATIONS: list[dict] = [
         ),
         "test": T_EXP_03F,
         "desc": "幂等判据忽略 evidence / reason（两个 durable 层描述不一致）",
+    },
+    {
+        "id": "M-EXP-19",
+        # 删掉幂等**资格**条件 —— 生命周期已推进（applied / rolled_back）的行会被当成
+        # "同一条 shadow proposal 已存在"，上层于是报告 shadow_proposal / "仅保存候选"，
+        # 而 durable row 其实是 applied。这是 R27-B2C-6 第三轮 review 抓出的 blocker。
+        "file": SELECTION_FILE,
+        "old": SEL_IDEMPOTENCY_ELIGIBILITY,
+        "new": "    # MUTANT —— 删除 shadow_proposal / ai_realtime 幂等资格条件\n",
+        "test": T_EXP_03B,
+        "desc": "删除幂等资格条件（applied 行被当成影子提案的幂等成功）",
     },
 ]
 

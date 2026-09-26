@@ -356,10 +356,17 @@ class SelectionWriterConvergenceTests(_DbTestCase):
             ASEL.apply_candidate(conn, "unused-paper.db", candidate_id, lambda: "now",
                                  approved_by="bounded-auto")
 
-    def test_EXP_03b_shadow_proposal_is_append_only_and_never_rewrites_lifecycle(self):
-        """EXP-03（补充）：提案是**追加**的，绝不把已 apply / 回滚的候选改回影子态。
+    def test_EXP_03b_idempotency_requires_a_still_shadow_proposal(self):
+        """EXP-03b：幂等成功**要求既有行仍处在 shadow 状态**。
 
-        否则一次 AI 提案就能把一条已经生效的候选"洗白"成新的影子候选。
+        这是第三轮 review 抓出的 blocker。"幂等重放"必须定义为"**同一条仍在 shadow 状态的**
+        提案已经存在"，而不是"历史上曾经有过相同 payload 的某个 candidate"。否则
+        ``applied`` 的行占着同一个 UNIQUE 槽位时，只要 payload 相同就会被返回 id，上层于是报告
+        ``shadow_proposal`` / "仅保存候选"，而 durable row 其实是 ``applied`` —— 本次调用
+        根本没有保存任何新的 shadow proposal。
+
+        覆盖：仍处 shadow 且 payload 相同 → 幂等成功；生命周期已推进（``applied`` /
+        ``rolled_back``）→ 冲突；tier 不同 → 冲突。所有冲突路径都不得改写既有行，也不得新增行。
         """
         conn = _selection_conn()
         baseline, candidate = _weights_patch()
@@ -369,17 +376,64 @@ class SelectionWriterConvergenceTests(_DbTestCase):
             evidence={"source": "DeepSeek"}, reason="bounded",
         )
         first = ASEL.record_shadow_proposal(conn, now="2026-09-21T09:10:00+08:00", **args)
-        conn.execute(
-            f"UPDATE {SELECTION_TABLE} SET status='applied',updated_at=? WHERE id=?",
-            ("2026-09-22T09:00:00+08:00", first),
+        before = dict(conn.execute(
+            f"SELECT * FROM {SELECTION_TABLE} WHERE id=?", (first,),
+        ).fetchone())
+        self.assertEqual(ASEL.SHADOW_PROPOSAL_STATUS, before["status"])
+        self.assertEqual(ASEL.AI_REALTIME_TIER, before["tier"])
+
+        # (a) 仍处 shadow 状态 + 完全相同 payload → 幂等成功，行逐字不变。
+        self.assertEqual(
+            first,
+            ASEL.record_shadow_proposal(conn, now="2026-09-21T09:20:00+08:00", **args),
         )
-        again = ASEL.record_shadow_proposal(conn, now="2026-09-23T09:10:00+08:00", **args)
-        self.assertEqual(first, again)
-        row = conn.execute(
-            f"SELECT status,updated_at FROM {SELECTION_TABLE} WHERE id=?", (first,),
-        ).fetchone()
-        self.assertEqual("applied", row["status"])
-        self.assertEqual("2026-09-22T09:00:00+08:00", row["updated_at"])
+        self.assertEqual(
+            before, dict(conn.execute(
+                f"SELECT * FROM {SELECTION_TABLE} WHERE id=?", (first,),
+            ).fetchone()),
+            "幂等成功不得改写既有行（含 lifecycle 与 updated_at）",
+        )
+
+        # (b) 生命周期已推进 → 即使 payload 完全相同也必须冲突，且行逐字不变。
+        for advanced in ("applied", "rolled_back", "eligible_auto_adjust"):
+            with self.subTest(advanced_status=advanced):
+                conn.execute(
+                    f"UPDATE {SELECTION_TABLE} SET status=?,updated_at=? WHERE id=?",
+                    (advanced, "2026-09-22T09:00:00+08:00", first),
+                )
+                frozen = dict(conn.execute(
+                    f"SELECT * FROM {SELECTION_TABLE} WHERE id=?", (first,),
+                ).fetchone())
+                with self.assertRaises(ASEL.SelectionProposalConflict):
+                    ASEL.record_shadow_proposal(
+                        conn, now="2026-09-23T09:10:00+08:00", **args,
+                    )
+                self.assertEqual(
+                    frozen, dict(conn.execute(
+                        f"SELECT * FROM {SELECTION_TABLE} WHERE id=?", (first,),
+                    ).fetchone()),
+                    "冲突路径不得改写既有行的 lifecycle 或 updated_at",
+                )
+                self.assertEqual(
+                    1, conn.execute(f"SELECT COUNT(*) FROM {SELECTION_TABLE}").fetchone()[0],
+                    "冲突路径不得新增行",
+                )
+
+        # (c) 资格条件也包括 tier：影子提案只能是 owner 的 ai_realtime tier。
+        conn.execute(
+            f"UPDATE {SELECTION_TABLE} SET status=?,tier='micro',updated_at=? WHERE id=?",
+            (ASEL.SHADOW_PROPOSAL_STATUS, "2026-09-24T09:00:00+08:00", first),
+        )
+        with self.assertRaises(ASEL.SelectionProposalConflict):
+            ASEL.record_shadow_proposal(conn, now="2026-09-25T09:10:00+08:00", **args)
+
+        # (d) 资格条件也包括 owner 来源记号：记号无效的行不算"同一条 shadow proposal"。
+        conn.execute(
+            f"UPDATE {SELECTION_TABLE} SET tier=?,evidence='{{}}',updated_at=? WHERE id=?",
+            (ASEL.AI_REALTIME_TIER, "2026-09-26T09:00:00+08:00", first),
+        )
+        with self.assertRaises(ASEL.SelectionProposalConflict):
+            ASEL.record_shadow_proposal(conn, now="2026-09-27T09:10:00+08:00", **args)
 
     def test_EXP_03c_shadow_proposal_rejects_anything_but_a_bounded_factor_patch(self):
         """EXP-03（补充）：阈值 / 条件 / 入场路径 / 越界幅度一律被 owner 拒绝。
@@ -671,6 +725,71 @@ class SelectionWriterConvergenceTests(_DbTestCase):
         still = ASEL.selection_candidate_fact(conn, first["persisted_ids"][0], as_of="2026-09-18")
         self.assertEqual("R1", still.reason)
         self.assertEqual("H" * 8, still.evidence["evidence_hash"])
+
+
+    def test_EXP_03h_an_advanced_lifecycle_row_blocks_a_reproposed_identical_payload(self):
+        """EXP-03h：生命周期已推进的行占着槽位时，重放同一提案必须冲突（runtime 版本）。
+
+        review 给的场景：同一个 payload 第二次提交时，槽位里那一行**已经 applied**。
+        owner 不把 ``applied`` 改回 ``shadow_proposal`` 是对的，但上层
+        ``run_realtime_tuning`` 若把这个 id 记进 ``persisted_ids``，就会报告
+        ``shadow_proposal`` / "仅保存候选"，而 durable row 其实是 ``applied`` ——
+        runtime audit 与 ledger 状态不一致，而且本次调用**没有**保存任何新的 shadow proposal。
+
+        这里真实跑两轮 tuner（同一槽位、同一 payload），中途把那一行推进到 ``applied``：
+        第二轮必须 ``proposal_conflict``、``persisted_ids`` 为空、且不得出现"仅保存候选"。
+        """
+        conn = _adaptive_conn()
+        _baseline, candidate = _weights_patch()
+        profile = {"profile_date": "2026-09-18", "regime": "momentum",
+                   "quality": "valid_close", "valid_rows": 5000}
+        accounts = [{"account_id": "tq_breakout", "version": "v1", "style": "s",
+                     "weights": {}, "entry_score_delta": 0.0, "conditions": {}}]
+        response = {"decision": "propose", "confidence": 90, "proposals": [
+            {"account_id": "tq_breakout", "reason": "R1", "weights": candidate["weights"]},
+        ]}
+
+        def run():
+            with mock.patch.object(DA, "enabled", return_value=True), \
+                    mock.patch.object(DA, "configured", return_value=True), \
+                    mock.patch.object(DA, "_now", return_value="2026-09-18T10:30:00+08:00"), \
+                    mock.patch.object(DA, "_tuning_accounts", return_value=accounts), \
+                    mock.patch.object(DA, "collect_evidence",
+                                      return_value=({"market_snapshot": {}}, "H" * 8)), \
+                    mock.patch.object(DA, "call_json", return_value=(response, 0, 0)):
+                return DA.run_realtime_tuning(
+                    lambda: conn, "unused-paper.db", [],
+                    config={"llm_realtime_require_cross_source": False}, profile=profile,
+                )
+
+        first = run()
+        self.assertEqual(1, len(first["persisted_ids"]))
+        candidate_id = first["persisted_ids"][0]
+
+        # 让人工 apply 路径推进这一行的生命周期（owner 永远不会把它改回影子态）。
+        conn.execute(
+            f"UPDATE {SELECTION_TABLE} SET status='applied',updated_at=? WHERE id=?",
+            ("2026-09-18T11:00:00+08:00", candidate_id),
+        )
+        applied = dict(conn.execute(
+            f"SELECT * FROM {SELECTION_TABLE} WHERE id=?", (candidate_id,),
+        ).fetchone())
+
+        second = run()
+        self.assertEqual("proposal_conflict", second["status"])
+        self.assertEqual([], second.get("persisted_ids", []))
+        self.assertEqual([], second["applied_ids"])
+        self.assertTrue(second["conflicts"])
+        self.assertNotIn("仅保存候选", second["reason"])
+        self.assertEqual(
+            applied, dict(conn.execute(
+                f"SELECT * FROM {SELECTION_TABLE} WHERE id=?", (candidate_id,),
+            ).fetchone()),
+            "冲突路径不得改写已 applied 的行，也不得把它改回影子态",
+        )
+        self.assertEqual(
+            1, conn.execute(f"SELECT COUNT(*) FROM {SELECTION_TABLE}").fetchone()[0],
+        )
 
 
 class CandidateLifecycleIsNotVerificationTests(_DbTestCase):
