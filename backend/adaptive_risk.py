@@ -8,13 +8,18 @@ creates orders and never connects to a broker.
 """
 from __future__ import annotations
 
+import dataclasses
 import datetime as dt
+import hashlib
+import json
 import math
 import os
 import sqlite3
 import statistics
 from collections import Counter
+from typing import Any
 from adaptive_common import _loads, _json, _clamp  # C3: 收敛重复工具函数
+from adaptive_common import TZ as OWNER_TZ
 import paper_repository as PRP
 import execution_verification as EV
 from strategy_registry import labels as strategy_labels
@@ -1543,3 +1548,403 @@ def overview(conn, config, paper_db_path):
             "cannot": ["直接下单", "绕过门禁", "直接改参数", "接触API密钥前端"],
         },
     }
+
+
+# ---------------------------------------------------------------------------
+# R27-B2C-6 —— risk candidate 的 typed owner fact contract
+# ---------------------------------------------------------------------------
+#
+# ``adaptive_risk_candidates`` 同样是一张**可变**行表（``_upsert_candidate`` 会原地改写
+# ``baseline_params`` / ``candidate_params`` / ``risk_reduction_pct`` / ``change_kind`` /
+# ``status`` 并推进 ``updated_at``；apply / rollback 还会继续改 ``status``）。因此在这段
+# 契约之前，research 侧无法回答 identity / availability / owner verification 三个问题。
+#
+# 与 selection owner 完全一致的两条分离：
+#
+#     candidate lifecycle status ≠ owner verification
+#     run_date                   ≠ revision availability
+#
+# ``eligible_auto_tighten`` 不比 ``waiting_data`` 更"核验通过"；``applied`` 也不等于
+# "已验证"。本段只让 owner 回答"这条记录是不是我自己签发的事实"。
+
+RISK_FACT_CONTRACT_VERSION = "adaptive-risk-fact-v1"
+
+#: owner 自己能签发的 lifecycle status 闭集。**不是**核验词表。
+RISK_LIFECYCLE_STATUSES = (
+    "deployment_observing", "no_change", "eligible_auto_tighten",
+    "human_review_required", "shadow_candidate", "waiting_data",
+    "applied", "rolled_back",
+)
+
+#: ``_change_kind`` 的值域 —— owner 确定性算出。
+RISK_CHANGE_KINDS = ("no_change", "conservative_tighten", "includes_loosening")
+
+#: owner 签发的**极小** factual verification 闭集。两态，且与 lifecycle status 词表**零
+#: 交集**。
+#:
+#: * ``risk_candidate_recorded``：owner 能证明这条记录是**它自己签发**的、必要归一列齐全
+#:   且自洽的事实。含义**仅**是"这是一条可靠的 owner 事实"，**不是**"这次收紧通过了验证"，
+#:   也不是"它应该生效"。
+#: * ``risk_candidate_unproven``：记录可读，但 owner **无法自证**它是自己签发的（用了
+#:   owner 不签发的 account / status / change_kind 词汇，或缺少必要归一列）。它仍然是一条
+#:   事实，但 owner 不为它的来源背书。
+RISK_FACT_RECORDED = "risk_candidate_recorded"
+RISK_FACT_OWNER_UNPROVEN = "risk_candidate_unproven"
+RISK_FACT_VERIFICATION_STATUSES = (RISK_FACT_RECORDED, RISK_FACT_OWNER_UNPROVEN)
+
+RISK_CANDIDATE_RECORD_KIND = "risk_candidate"
+
+#: typed 读侧要求的**必需归一列**。
+_RISK_REQUIRED_COLUMNS = (
+    "id", "run_date", "account_id", "regime", "baseline_params", "candidate_params",
+    "evidence", "risk_reduction_pct", "change_kind", "status", "reason",
+    "created_at", "updated_at",
+)
+
+
+class RiskFactContractError(ValueError):
+    """typed risk fact 读侧的 **fail closed** 拒绝（坏 JSON / 缺列 / naive 时间戳）。"""
+
+
+def _risk_owner_instant(value: Any, *, what: str) -> dt.datetime:
+    text = str(value or "").strip()
+    if not text:
+        raise RiskFactContractError(f"{what} is required for a typed risk fact")
+    try:
+        parsed = dt.datetime.fromisoformat(text)
+    except ValueError as exc:
+        raise RiskFactContractError(f"{what} is not a parsable owner instant: {text!r}") from exc
+    if parsed.tzinfo is None or parsed.tzinfo.utcoffset(parsed) is None:
+        raise RiskFactContractError(
+            f"{what} must be timezone-aware; got naive {text!r} — "
+            "无法证明可用瞬间，禁止用本地时区猜"
+        )
+    return parsed
+
+
+def _risk_owner_day(instant: dt.datetime, *, what: str) -> str:
+    if OWNER_TZ is None:  # pragma: no cover - 只在 tzdata 缺失时
+        raise RiskFactContractError(
+            f"{what}: owner timezone (Asia/Shanghai) unavailable — 拒绝派生业务日"
+        )
+    return instant.astimezone(OWNER_TZ).date().isoformat()
+
+
+def _risk_business_day(value: Any, *, what: str) -> str:
+    text = str(value or "").strip()
+    try:
+        parsed = dt.date.fromisoformat(text)
+    except ValueError as exc:
+        raise RiskFactContractError(
+            f"{what} requires an explicit canonical YYYY-MM-DD business day; got {value!r}"
+        ) from exc
+    if parsed.isoformat() != text:
+        raise RiskFactContractError(f"{what} is not canonical: {value!r}")
+    return text
+
+
+def _risk_strict_mapping(value: Any, *, what: str) -> dict:
+    """严格 JSON parse + 顶层必须是 object。坏 JSON → fail closed（绝不 ``{}``）。"""
+    if value is None or (isinstance(value, str) and not value.strip()):
+        raise RiskFactContractError(f"{what} is empty — 缺内容不是空对象")
+    try:
+        parsed = json.loads(value) if isinstance(value, str) else value
+    except (TypeError, ValueError) as exc:
+        raise RiskFactContractError(f"{what} is not parsable JSON: {exc}") from exc
+    if not isinstance(parsed, dict):
+        raise RiskFactContractError(
+            f"{what} must parse to a JSON object; got {type(parsed).__name__}"
+        )
+    return parsed
+
+
+def _risk_canonical_json(value: Any, *, what: str) -> str:
+    try:
+        return json.dumps(
+            value, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False,
+        )
+    except (TypeError, ValueError) as exc:
+        raise RiskFactContractError(f"{what} is not canonically serializable: {exc}") from exc
+
+
+def _risk_canonical_params(value: Any, *, what: str) -> str:
+    return _risk_canonical_json(_risk_strict_mapping(value, what=what), what=what)
+
+
+def _risk_number(value: Any, *, what: str):
+    """``risk_reduction_pct`` 必须是一个**有限**数或 NULL —— 不做 ``or 0.0`` 兜底。"""
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        raise RiskFactContractError(f"{what} must be a number or NULL, got a bool")
+    try:
+        number = float(value)
+    except (TypeError, ValueError) as exc:
+        raise RiskFactContractError(f"{what} is not numeric: {value!r}") from exc
+    if not math.isfinite(number):
+        raise RiskFactContractError(f"{what} must be finite, got {value!r}")
+    return number
+
+
+def _risk_fact_verification_status(*, account_id: str, lifecycle_status: str, change_kind: str) -> str:
+    """owner 自洽性 → 极小 factual verification 闭集。
+
+    判据只回答"这条记录是不是 owner 自己签发的事实"，由**词汇归属**构成：account /
+    lifecycle / change_kind 三张词表只有 owner 自己的 emitter 会产出。
+
+    **刻意不看** ``status`` 的业务含义，也**刻意不把 ``application_mode`` 纳入判据** ——
+    apply 路径会把该列覆写成 ``approved_by``（人工审批者身份），因此它承载的是"谁批的"，
+    不是 owner 的签发词汇。把它当成来源证据会制造一个假的核验维度。
+    """
+    if not (account_id and lifecycle_status and change_kind):
+        return RISK_FACT_OWNER_UNPROVEN
+    if account_id not in BASE_RISK:
+        return RISK_FACT_OWNER_UNPROVEN
+    if lifecycle_status not in RISK_LIFECYCLE_STATUSES:
+        return RISK_FACT_OWNER_UNPROVEN
+    if change_kind not in RISK_CHANGE_KINDS:
+        return RISK_FACT_OWNER_UNPROVEN
+    return RISK_FACT_RECORDED
+
+
+@dataclasses.dataclass(frozen=True)
+class AdaptiveRiskFactProjection:
+    """**risk owner 自己签发**的候选事实投影 —— 一次不可变快照。
+
+    identity 由 ``<candidate_id>@<revision_at>`` 构成：行是**可变**的，所以 ``id`` 不是
+    revision identity。``revision_at`` 是 owner 每次改写都会推进的 ``updated_at``，因此
+    内容一变 identity 就变，同一个 ``source_id`` 不会在内容变化后指向两条不同的事实。
+
+    ``availability_day`` 从 ``revision_at`` 按 owner 时区派生，**不是** ``run_date``：
+    ``run_date`` 是"这次评估关于哪一天"的标签，当前行内容在 ``updated_at`` 之前并不存在。
+
+    已知限制与 selection 侧相同：contract-issued ≠ physical database origin；
+    physical provenance 仍是 OPEN / REQUIRED。
+    """
+
+    version: str
+    record_kind: str
+    candidate_id: int
+    account_id: str
+    run_date: str
+    regime: str
+    baseline_params_canonical: str
+    candidate_params_canonical: str
+    evidence_canonical: str
+    risk_reduction_pct: float | None
+    change_kind: str
+    lifecycle_status: str
+    application_mode: str | None
+    reason: str
+    revision_at: str
+    availability_day: str
+    created_at: str
+    fact_verification_status: str
+    content_fingerprint: str = ""
+
+    def __post_init__(self) -> None:
+        record_kind = str(self.record_kind or "").strip()
+        if record_kind != RISK_CANDIDATE_RECORD_KIND:
+            raise RiskFactContractError(
+                f"unknown risk fact record_kind: {record_kind!r}; "
+                f"allowed: {RISK_CANDIDATE_RECORD_KIND!r}"
+            )
+        object.__setattr__(self, "record_kind", record_kind)
+        object.__setattr__(
+            self, "version", str(self.version or "").strip() or RISK_FACT_CONTRACT_VERSION,
+        )
+        if isinstance(self.candidate_id, bool) or not isinstance(self.candidate_id, int):
+            raise RiskFactContractError(
+                f"risk candidate_id must be an int, got {self.candidate_id!r}"
+            )
+        if self.candidate_id <= 0:
+            raise RiskFactContractError(
+                f"risk candidate_id must be positive, got {self.candidate_id}"
+            )
+        for name in ("account_id", "regime"):
+            text = str(getattr(self, name) or "").strip()
+            if not text:
+                raise RiskFactContractError(f"risk fact requires {name}")
+            object.__setattr__(self, name, text)
+        object.__setattr__(
+            self, "run_date", _risk_business_day(self.run_date, what="risk fact run_date"),
+        )
+        object.__setattr__(self, "reason", str(self.reason or "").strip())
+        object.__setattr__(
+            self, "lifecycle_status", str(self.lifecycle_status or "").strip(),
+        )
+        object.__setattr__(self, "change_kind", str(self.change_kind or "").strip())
+        mode = None if self.application_mode is None else str(self.application_mode).strip()
+        object.__setattr__(self, "application_mode", mode or None)
+        object.__setattr__(
+            self, "risk_reduction_pct",
+            _risk_number(self.risk_reduction_pct, what="risk fact risk_reduction_pct"),
+        )
+
+        revision = _risk_owner_instant(self.revision_at, what="risk fact revision_at")
+        object.__setattr__(self, "revision_at", revision.isoformat(timespec="seconds"))
+        day = _risk_business_day(self.availability_day, what="risk fact availability_day")
+        expected = _risk_owner_day(revision, what="risk fact revision_at")
+        if day != expected:
+            raise RiskFactContractError(
+                f"risk fact availability_day {day} disagrees with the owner-timezone day "
+                f"derived from revision_at ({expected}) — 业务日只能由 owner 派生"
+            )
+        if not str(self.created_at or "").strip():
+            raise RiskFactContractError("risk fact requires created_at")
+
+        for name in (
+            "baseline_params_canonical", "candidate_params_canonical", "evidence_canonical",
+        ):
+            text = str(getattr(self, name) or "")
+            canonical = _risk_canonical_json(
+                _risk_strict_mapping(text, what=f"risk fact {name}"),
+                what=f"risk fact {name}",
+            )
+            if canonical != text:
+                raise RiskFactContractError(
+                    f"risk fact {name} is not canonical — 事实内容必须能确定性重算指纹"
+                )
+
+        status = str(self.fact_verification_status or "").strip()
+        if status not in RISK_FACT_VERIFICATION_STATUSES:
+            raise RiskFactContractError(
+                f"unknown risk fact verification status: {status!r}; "
+                f"allowed: {RISK_FACT_VERIFICATION_STATUSES}"
+            )
+        object.__setattr__(self, "fact_verification_status", status)
+        object.__setattr__(self, "content_fingerprint", self._fingerprint())
+
+    @property
+    def revision_identity(self) -> str:
+        return f"{self.candidate_id}@{self.revision_at}"
+
+    @property
+    def identity(self) -> tuple[str, str, str]:
+        return (self.record_kind, self.revision_identity, self.availability_day)
+
+    @property
+    def baseline_params(self) -> dict:
+        return json.loads(self.baseline_params_canonical)
+
+    @property
+    def candidate_params(self) -> dict:
+        return json.loads(self.candidate_params_canonical)
+
+    @property
+    def evidence(self) -> dict:
+        return json.loads(self.evidence_canonical)
+
+    def _fingerprint(self) -> str:
+        payload = {
+            "version": self.version,
+            "record_kind": self.record_kind,
+            "candidate_id": self.candidate_id,
+            "account_id": self.account_id,
+            "run_date": self.run_date,
+            "regime": self.regime,
+            "baseline_params": self.baseline_params_canonical,
+            "candidate_params": self.candidate_params_canonical,
+            "evidence": self.evidence_canonical,
+            "risk_reduction_pct": self.risk_reduction_pct,
+            "change_kind": self.change_kind,
+            "lifecycle_status": self.lifecycle_status,
+            "application_mode": self.application_mode,
+            "reason": self.reason,
+            "revision_at": self.revision_at,
+            "availability_day": self.availability_day,
+            "created_at": self.created_at,
+            "fact_verification_status": self.fact_verification_status,
+        }
+        encoded = json.dumps(
+            payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False,
+        )
+        return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+    def projection(self) -> dict:
+        return {
+            "version": self.version,
+            "record_kind": self.record_kind,
+            "identity": self.revision_identity,
+            "record_id": self.candidate_id,
+            "account_id": self.account_id,
+            "run_date": self.run_date,
+            "regime": self.regime,
+            "risk_reduction_pct": self.risk_reduction_pct,
+            "change_kind": self.change_kind,
+            "lifecycle_status": self.lifecycle_status,
+            "application_mode": self.application_mode,
+            "reason": self.reason,
+            "revision_at": self.revision_at,
+            "availability_day": self.availability_day,
+            "created_at": self.created_at,
+            "fact_verification_status": self.fact_verification_status,
+            "content_fingerprint": self.content_fingerprint,
+            "authority": "owner_fact",
+            "lifecycle_status_is_verification": False,
+        }
+
+
+def risk_candidate_fact(conn, candidate_id, *, as_of):
+    """把一条 risk 候选行读成 typed owner fact。``as_of`` **必须显式**。
+
+    **fail-closed 的历史语义**：行可变，旧 revision 被覆盖后不复存在。当当前 revision 的
+    ``availability_day`` 晚于 ``as_of`` 时返回 ``None``（UNAVAILABLE），**不**倒填历史，
+    也不按 ``run_date`` 回退。刻意**没有** ``as_of=None → latest`` / 取墙钟 /
+    取"当前 active candidate"。
+
+    行不存在返回 ``None``；行存在但内容损坏（坏 JSON / 缺列 / naive ``updated_at``）则抛
+    :class:`RiskFactContractError`。
+    """
+    day = _risk_business_day(as_of, what="risk candidate fact as_of")
+    cursor = conn.execute(
+        "SELECT * FROM adaptive_risk_candidates WHERE id=?", (int(candidate_id),),
+    )
+    row = cursor.fetchone()
+    if row is None:
+        return None
+    # 行形状是**调用方**的事实：生产连接设了 ``row_factory = sqlite3.Row``，迁移 / 运维
+    # 入口却是裸 tuple。两种都必须能读。
+    item = EV._row_as_dict(cursor, row)
+    missing = [name for name in _RISK_REQUIRED_COLUMNS if name not in item]
+    if missing:
+        raise RiskFactContractError(
+            f"risk candidate {candidate_id} is missing required normalized columns: {missing}"
+        )
+    revision = _risk_owner_instant(item.get("updated_at"), what="risk candidate updated_at")
+    available_day = _risk_owner_day(revision, what="risk candidate updated_at")
+    if available_day > day:
+        return None
+
+    account_id = str(item.get("account_id") or "").strip()
+    lifecycle = str(item.get("status") or "").strip()
+    change_kind = str(item.get("change_kind") or "").strip()
+    mode = item.get("application_mode")
+    return AdaptiveRiskFactProjection(
+        version=RISK_FACT_CONTRACT_VERSION,
+        record_kind=RISK_CANDIDATE_RECORD_KIND,
+        candidate_id=int(item["id"]),
+        account_id=account_id,
+        run_date=str(item.get("run_date") or ""),
+        regime=str(item.get("regime") or ""),
+        baseline_params_canonical=_risk_canonical_params(
+            item.get("baseline_params"), what="risk candidate baseline_params",
+        ),
+        candidate_params_canonical=_risk_canonical_params(
+            item.get("candidate_params"), what="risk candidate candidate_params",
+        ),
+        evidence_canonical=_risk_canonical_params(
+            item.get("evidence"), what="risk candidate evidence",
+        ),
+        risk_reduction_pct=item.get("risk_reduction_pct"),
+        change_kind=change_kind,
+        lifecycle_status=lifecycle,
+        application_mode=None if mode is None else str(mode),
+        reason=str(item.get("reason") or ""),
+        revision_at=revision.isoformat(timespec="seconds"),
+        availability_day=available_day,
+        created_at=str(item.get("created_at") or ""),
+        fact_verification_status=_risk_fact_verification_status(
+            account_id=account_id, lifecycle_status=lifecycle, change_kind=change_kind,
+        ),
+    )

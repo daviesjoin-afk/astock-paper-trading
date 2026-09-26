@@ -21,9 +21,10 @@ the deterministic data-quality and evolution gates.
 留在旧表（legacy rows stay legacy，不迁移、不回填）。
 
 **本模块里没有迁移的是 tuner。** ``run_realtime_tuning`` / ``_tuning_*`` 仍然是有界调参
-的 legacy writer，仍然走 ``call_json``。它写的是 `adaptive_selection_candidates`
-（``status='shadow_proposal'``），属于 **proposal** 边界而不是 research —— 顺手在
-research 迁移里改掉它，会同时改变它的业务 authority，因此刻意留给后续单独一轮。
+的 legacy 路径，仍然走 ``call_json``。R27-B2C-6 起它**不再自己写候选 ledger**：影子候选由
+selection owner 的窄接口 ``adaptive_selection.record_shadow_proposal`` 持久化，``status`` /
+``tier`` 由 owner 独占决定，本模块只作为 **proposal producer / caller**。tuner 自身的运行
+记录仍写在本模块自己的 ``adaptive_ai_tuning_runs`` 里，属于它的 legacy 记账。
 这也意味着本模块**仍然**持有 legacy provider 网络调用（``call_json``），它不是 R27
 provider 链路的一部分。
 
@@ -1046,6 +1047,8 @@ def run_realtime_tuning(connect_factory, paper_db_path, snapshot_paths, config=N
                                              "no_change", "未生成通过白名单和幅度限制的参数变更", response=response)
                 return {"id": run_id, "status": "no_change", "applied_ids": [], "response": response}
             now = _now()
+            persisted_ids = []
+            conflicts = []
             for item in proposals:
                 account_id = item["account_id"]
                 model_id = selection.ACCOUNT_MODELS[account_id]
@@ -1064,20 +1067,50 @@ def run_realtime_tuning(connect_factory, paper_db_path, snapshot_paths, config=N
                 # even when a stale/forged config explicitly asks for it.
                 # Apply is available only through the human UI boundary.
                 auto_apply = False
-                candidate_status = "shadow_proposal"
-                cursor = conn.execute(
-                    """INSERT INTO adaptive_selection_candidates(
-                       run_date,account_id,regime,model_id,baseline_params,candidate_params,evidence,status,tier,reason,created_at,updated_at)
-                       VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
-                    (str(profile.get("profile_date") or dt.datetime.now(TZ).date().isoformat())[:10], account_id, regime, model_id,
-                     json.dumps(baseline, ensure_ascii=False, separators=(",", ":")),
-                     json.dumps(candidate, ensure_ascii=False, separators=(",", ":")),
-                     json.dumps({"source": "DeepSeek", "confidence": item["confidence"], "evidence_hash": evidence_hash}, ensure_ascii=False),
-                     candidate_status, "ai_realtime", item["reason"], now, now),
+                # Writer 收敛（R27-B2C-6）：本模块不再自己拼 INSERT。影子候选由
+                # selection owner 的窄接口持久化，status / tier 由 owner 独占决定 ——
+                # 因此"AI 提案直接生效"在这里结构性不可表达（见 owner 侧
+                # ``record_shadow_proposal`` 与 ``SHADOW_PROPOSAL_STATUS``）。
+                #
+                # 槽位冲突**必须显式记账**：owner 只在"同一条提案的幂等重放"时返回既有 id，
+                # 内容不同则抛 SelectionProposalConflict。这里绝不能把冲突吞掉后继续报告
+                # "仅保存候选" —— 那会让 API 层的成功与 durable 状态分开。
+                try:
+                    persisted_ids.append(selection.record_shadow_proposal(
+                        conn,
+                        run_date=str(
+                            profile.get("profile_date") or dt.datetime.now(TZ).date().isoformat()
+                        )[:10],
+                        account_id=account_id,
+                        regime=regime,
+                        model_id=model_id,
+                        baseline_params=baseline,
+                        candidate_params=candidate,
+                        evidence={"source": "DeepSeek", "confidence": item["confidence"],
+                                  "evidence_hash": evidence_hash},
+                        reason=item["reason"],
+                        now=now,
+                    ))
+                except selection.SelectionProposalConflict as exc:
+                    conflicts.append({"account_id": account_id, "reason": str(exc)[:300]})
+            if conflicts and not persisted_ids:
+                run_id = _tuning_failure_row(
+                    conn, trigger, mode, profile, evidence, evidence_hash, "proposal_conflict",
+                    f"{len(conflicts)}/{len(proposals)} 个提案因候选槽位冲突未持久化",
+                    response=response, proposals=proposals,
                 )
+                return {"id": run_id, "status": "proposal_conflict", "applied_ids": [],
+                        "proposals": proposals, "response": response, "conflicts": conflicts,
+                        "reason": "候选槽位已被占用，且不是同一条仍处影子状态的提案；"
+                                  "本次提案未持久化"}
             status = "applied" if applied_ids else ("shadow_proposal" if mode == "shadow" else "proposal_only")
-            reason = (f"通过确定性门禁；应用{len(applied_ids)}/{len(proposals)}个模拟盘候选"
-                      if auto_apply else "通过确定性门禁；仅保存候选，未同日应用")
+            if auto_apply:
+                reason = f"通过确定性门禁；应用{len(applied_ids)}/{len(proposals)}个模拟盘候选"
+            elif conflicts:
+                reason = (f"通过确定性门禁；仅保存候选 {len(persisted_ids)}/{len(proposals)} 个，"
+                          f"{len(conflicts)} 个因候选槽位冲突未持久化")
+            else:
+                reason = "通过确定性门禁；仅保存候选，未同日应用"
             latency = round((time.monotonic() - started_clock) * 1000)
             cursor = conn.execute(
                 """INSERT INTO adaptive_ai_tuning_runs(
@@ -1089,7 +1122,8 @@ def run_realtime_tuning(connect_factory, paper_db_path, snapshot_paths, config=N
                  json.dumps(applied_ids), reason, latency, now, _now()),
             )
             return {"id": int(cursor.lastrowid), "status": status, "applied_ids": applied_ids,
-                    "proposals": proposals, "response": response, "reason": reason}
+                    "proposals": proposals, "response": response, "reason": reason,
+                    "persisted_ids": persisted_ids, "conflicts": conflicts}
         except Exception as exc:
             run_id = _tuning_failure_row(conn, trigger, mode, profile, evidence, evidence_hash,
                                          "failed", f"{type(exc).__name__}: {exc}", response=response,

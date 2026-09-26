@@ -2,11 +2,15 @@
 """Bounded evolution of paper-account candidate ranking models."""
 from __future__ import annotations
 
+import dataclasses
 import datetime as dt
+import hashlib
+import json
 import math
 import os
 import sqlite3
 import statistics
+from typing import Any
 
 import strategies as S
 import paper_repository as PRP
@@ -14,6 +18,7 @@ import execution_verification as EV
 import adaptive_selection_compat as UNIT_COMPAT
 from strategy_registry import labels as strategy_labels
 from adaptive_common import _loads, _json  # C3: 收敛重复工具函数
+from adaptive_common import TZ as OWNER_TZ
 
 ACCOUNT_NAMES = strategy_labels()
 ACCOUNT_MODELS = {
@@ -421,7 +426,9 @@ def _upsert(conn, payload, now):
              model_id=excluded.model_id,baseline_params=excluded.baseline_params,candidate_params=excluded.candidate_params,
              evidence=excluded.evidence,status=excluded.status,tier=excluded.tier,reason=excluded.reason,updated_at=excluded.updated_at""",
         (payload["run_date"], payload["account_id"], payload["regime"], payload["model_id"],
-         _json(payload["baseline_params"]), _json(payload["candidate_params"]), _json(payload["evidence"]),
+         _json(payload["baseline_params"]), _json(payload["candidate_params"]),
+         # owner 写路径盖章：typed 读侧据此区分"owner 写的行"与"R27-B2C-6 之前的第二 writer 行"。
+         _json(_stamp_owner_origin(payload["evidence"])),
          payload["status"], payload["tier"], payload["reason"], now, now),
     )
     return conn.execute(
@@ -914,3 +921,747 @@ def overview(conn, config, paper_db_path):
         },
         "candidates": candidates, "active_versions": active,
     }
+
+
+# ---------------------------------------------------------------------------
+# R27-B2C-6 —— selection candidate 的 typed owner fact contract
+# ---------------------------------------------------------------------------
+#
+# ``adaptive_selection_candidates`` 是一张**可变**行表：同一个
+# ``(run_date,account_id,regime)`` 会被 owner 反复 UPDATE，行还会一路走到 ``applied`` /
+# ``rolled_back``。因此在这段契约之前，research 侧没有任何东西能回答三个事实层问题：
+#
+#     identity          这条候选事实究竟是哪一条（row 会被覆盖 → 只知道 ``id`` 不够）
+#     availability      这条候选**在哪个瞬间**才成为可引用的事实
+#     verification      owner 能不能证明这是**它自己签发**的事实
+#
+# 本段只回答这三个问题，并把两件极易混淆的事刻意分开：
+#
+#     candidate lifecycle status ≠ owner verification
+#     run_date                   ≠ revision availability
+#
+# ``eligible_auto_adjust`` / ``applied`` / ``shadow_candidate`` 是**业务生命周期与资格**
+# 词，供 reviewer 与 apply 门禁使用。本段**不**把它们（或它们的任何组合）映射成核验结论，
+# 也**不**认为 ``applied`` 让一条候选更"可信"。
+
+SELECTION_FACT_CONTRACT_VERSION = "adaptive-selection-fact-v1"
+
+#: AI 影子提案的 tier 记号 —— 由 owner 独占签发，调用方不能传入。
+AI_REALTIME_TIER = "ai_realtime"
+
+#: 影子提案候选的生命周期状态 —— 同样由 owner 独占决定。
+#:
+#: 它刻意**不在** ``apply_candidate`` 允许的资格集合里（``eligible_auto_adjust`` /
+#: ``eligible_manual_review`` / ``eligible_structural_review``），因此"AI 提案直接生效"
+#: 在这条链路上结构性不可表达：AI 只能产出影子候选，apply 仍必须由既有的
+#: 人工/门禁路径发起并重新校验。
+SHADOW_PROPOSAL_STATUS = "shadow_proposal"
+
+#: owner 自己能签发的 lifecycle status 闭集。**不是**核验词表。
+SELECTION_LIFECYCLE_STATUSES = (
+    "waiting_data", "shadow_candidate", "no_change",
+    "eligible_auto_adjust", "eligible_manual_review", "eligible_structural_review",
+    SHADOW_PROPOSAL_STATUS, "applied", "rolled_back",
+)
+
+#: owner 自己能签发的 tier 闭集。
+SELECTION_TIERS = ("waiting", "fast_shadow", "micro", "standard", "mature", AI_REALTIME_TIER)
+
+#: owner 签发的**极小** factual verification 闭集。两态，且与 lifecycle status 词表**零
+#: 交集** —— 因此 ``status`` 的任何取值都不可能被读成核验结论。
+#:
+#: * ``selection_candidate_recorded``：owner 能证明这条记录是**它自己签发**的、必要归一
+#:   列齐全且自洽的事实。这个值的含义**仅**是"这是一条可靠的 owner 事实"，
+#:   **不是**"这条候选通过了晋级验证"，更不是"它值得 apply"。
+#: * ``selection_candidate_unproven``：记录可读，但 owner **无法自证**它是自己签发的
+#:   （用了 owner 不签发的 status / tier / account / model 词汇，或缺少必要归一列）。
+#:   它仍然是一条事实，但 owner 不为它的来源背书 —— 于是它在 research 层只能是
+#:   ``unverified``，永远不会因为"看起来像候选"而升级。
+SELECTION_FACT_RECORDED = "selection_candidate_recorded"
+SELECTION_FACT_OWNER_UNPROVEN = "selection_candidate_unproven"
+SELECTION_FACT_VERIFICATION_STATUSES = (
+    SELECTION_FACT_RECORDED, SELECTION_FACT_OWNER_UNPROVEN,
+)
+
+SELECTION_CANDIDATE_RECORD_KIND = "selection_candidate"
+
+#: owner 写入候选 ledger 时**自己盖**的 durable 来源记号。
+#:
+#: 为什么需要它：R27-B2C-6 之前这张表有**两个**生产 writer，而旧的
+#: ``deepseek_advisor`` 直写行用的是 ``status='shadow_proposal'`` / ``tier='ai_realtime'``
+#: —— 两个值现在都是 owner 合法词汇。只用词汇做判据就会让新 owner 反向认证那些它明确没有
+#: 独占写入的历史行。因此 writer origin 必须是一条**只有 owner 写路径会盖**的信号。
+#:
+#: 它放在 durable ``evidence`` 列里（owner 已持久化、owner 可严格验证的字段），因此
+#: **不需要 schema migration**，也**不**新增第二套 ledger。写路径**覆盖式**盖章：
+#: caller 传任何同名值都会被 owner 覆盖，因此调用方无法自己"申明"这条记号。
+SELECTION_OWNER_ORIGIN_KEY = "owner_writer_origin"
+SELECTION_OWNER_ORIGIN_MARKER = "adaptive_selection.owner_writer"
+
+
+def _stamp_owner_origin(evidence) -> dict:
+    """owner 写路径的**覆盖式**盖章：caller 传什么都不算数，也不改写 caller 的其它键。"""
+    stamped = dict(evidence or {})
+    stamped[SELECTION_OWNER_ORIGIN_KEY] = SELECTION_OWNER_ORIGIN_MARKER
+    return stamped
+
+
+def _owner_origin_marker(evidence_mapping) -> object:
+    """从已严格解析的 evidence 里取来源记号；缺失返回 ``None``（→ ``unproven``）。"""
+    if not isinstance(evidence_mapping, dict):
+        return None
+    return evidence_mapping.get(SELECTION_OWNER_ORIGIN_KEY)
+
+#: typed 读侧要求的**必需归一列**：少一个就不构成一条可引用的候选事实。
+_SELECTION_REQUIRED_COLUMNS = (
+    "id", "run_date", "account_id", "regime", "model_id",
+    "baseline_params", "candidate_params", "evidence", "status", "tier", "reason",
+    "created_at", "updated_at",
+)
+
+
+class SelectionFactContractError(ValueError):
+    """typed selection fact 读侧的 **fail closed** 拒绝。
+
+    JSON 坏掉、必需归一列缺失、``updated_at`` 不是可解析的**带时区**瞬间 —— 一律抛这个
+    错误，而不是回落到 ``{}`` / ``run_date`` / ``created_at`` / ``now()``。把"读不出来"
+    伪装成"没有候选"或"还在等数据"，正是数据损坏变成业务结论的路径。
+    """
+
+
+class SelectionProposalConflict(ValueError):
+    """唯一槽位已被**另一条**候选占用 —— 本次提案**没有**被持久化。
+
+    刻意与"幂等重放"分开：幂等重放返回既有行 id（内容确实已在 durable ledger 里），
+    冲突则抛错，调用方必须把它记成 not persisted。两者若共用一个返回值，上层就会在什么都没
+    写进去的情况下报告"候选已保存"。
+    """
+
+
+def _owner_instant(value: Any, *, what: str) -> dt.datetime:
+    """owner 的 revision 瞬间 —— 必须显式、可解析、**带时区**。
+
+    naive 时间戳一律拒绝：``updated_at`` 是可用性的唯一 authority，用本地时区去猜它就等于
+    猜"这条事实什么时候可见"，而那正是 PIT 泄漏的入口。
+    """
+    text = str(value or "").strip()
+    if not text:
+        raise SelectionFactContractError(f"{what} is required for a typed selection fact")
+    try:
+        parsed = dt.datetime.fromisoformat(text)
+    except ValueError as exc:
+        raise SelectionFactContractError(
+            f"{what} is not a parsable owner instant: {text!r}"
+        ) from exc
+    if parsed.tzinfo is None or parsed.tzinfo.utcoffset(parsed) is None:
+        raise SelectionFactContractError(
+            f"{what} must be timezone-aware; got naive {text!r} — "
+            "无法证明可用瞬间，禁止用本地时区猜"
+        )
+    return parsed
+
+
+def _owner_availability_day(instant: dt.datetime, *, what: str) -> str:
+    """owner 时区归一后的业务日。
+
+    与 news adapter 同一条规则：**不接受**原始 offset 的日期。
+    ``2026-09-20T16:30+00:00`` 在上海已经是 9/21 00:30，业务日必须是 9/21。
+    """
+    if OWNER_TZ is None:  # pragma: no cover - 只在 tzdata 缺失时
+        raise SelectionFactContractError(
+            f"{what}: owner timezone (Asia/Shanghai) unavailable — "
+            "拒绝在无时区定义的前提下派生业务日"
+        )
+    return instant.astimezone(OWNER_TZ).date().isoformat()
+
+
+def _business_day(value: Any, *, what: str) -> str:
+    """显式、canonical 的 ``YYYY-MM-DD`` 业务日。**没有默认值，也不看今天。**"""
+    text = str(value or "").strip()
+    try:
+        parsed = dt.date.fromisoformat(text)
+    except ValueError as exc:
+        raise SelectionFactContractError(
+            f"{what} requires an explicit canonical YYYY-MM-DD business day; got {value!r}"
+        ) from exc
+    if parsed.isoformat() != text:
+        raise SelectionFactContractError(f"{what} is not canonical: {value!r}")
+    return text
+
+
+def _strict_mapping(value: Any, *, what: str) -> dict:
+    """严格 JSON parse + 顶层必须是 object。
+
+    坏 JSON / 空值 → fail closed。**绝不** ``_loads(value, {})``：在 typed evidence path
+    上把损坏内容静默变成空对象，就是让"读不出来"冒充"是一个空事实"。
+    """
+    if value is None or (isinstance(value, str) and not value.strip()):
+        raise SelectionFactContractError(f"{what} is empty — 缺内容不是空对象")
+    try:
+        parsed = json.loads(value) if isinstance(value, str) else value
+    except (TypeError, ValueError) as exc:
+        raise SelectionFactContractError(f"{what} is not parsable JSON: {exc}") from exc
+    if not isinstance(parsed, dict):
+        raise SelectionFactContractError(
+            f"{what} must parse to a JSON object; got {type(parsed).__name__}"
+        )
+    return parsed
+
+
+def _canonical_json(value: Any, *, what: str) -> str:
+    """确定性 canonical 文本。NaN / Inf → fail closed（不可审计的内容不进事实）。"""
+    try:
+        return json.dumps(
+            value, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False,
+        )
+    except (TypeError, ValueError) as exc:
+        raise SelectionFactContractError(f"{what} is not canonically serializable: {exc}") from exc
+
+
+def _canonical_params(value: Any, *, what: str) -> str:
+    return _canonical_json(_strict_mapping(value, what=what), what=what)
+
+
+def _selection_fact_verification_status(
+    *, origin_marker, account_id: str, model_id: str, lifecycle_status: str, tier: str,
+) -> str:
+    """owner 来源证明 → 极小 factual verification 闭集。
+
+    **第一判据是来源，不是词汇。** 只有 :func:`_stamp_owner_origin` 会盖上
+    :data:`SELECTION_OWNER_ORIGIN_MARKER`，而它只在 owner 自己的写路径
+    (:func:`_upsert` / :func:`record_shadow_proposal`) 上被调用。因此：
+
+    * 行带着 owner 亲自盖的来源记号 → 才可能是 ``recorded``；
+    * 记号缺失（R27-B2C-6 之前的历史行）或取值不是 owner 签发的那一个 → ``unproven``。
+
+    这一条是 R27-B2C-6 review 抓出的**错误修正**。第一版只用**词汇归属**做判据，于是历史上
+    由 ``deepseek_advisor`` **直接 INSERT** 的行（``status='shadow_proposal'``、
+    ``tier='ai_realtime'`` —— 两个值现在都在 owner 词表里）会被判成
+    ``selection_candidate_recorded`` → ``is_verified = True``。那就等于新 owner
+    **反向认证**了一批它明确没有独占写入的行。词表是"这行看起来像 owner 的产物"，不是
+    "这行是 owner 写的"；把前者当后者用，就是把 contract-issued 冒充成 writer-origin。
+
+    词汇检查**保留**，但降级为**自洽性**判据（第二层）：带记号却用了 owner 不签发的
+    account / model / lifecycle / tier 的行仍然是 ``unproven``。
+
+    **刻意不看** ``status`` 的业务含义：``eligible_auto_adjust`` 不比 ``waiting_data``
+    更"核验通过"，``applied`` 也不等于"已验证"。
+
+    已知限制（不声称已关闭）：记号是 durable ``evidence`` 列里的一个字符串，因此未来任何
+    **新的**直接 DB writer 若逐字抄写它，仍能把自己伪装成 owner 行。本层的保证是
+    "历史第二 writer 的行不可能带它" + "owner 的写路径一定会盖它且覆盖 caller 传值"，
+    而 **physical database origin / trusted provenance 仍是 OPEN / REQUIRED**
+    （与 R27 其余三个 owner 接缝逐字一致）。
+    """
+    if origin_marker != SELECTION_OWNER_ORIGIN_MARKER:
+        return SELECTION_FACT_OWNER_UNPROVEN
+    if not (account_id and model_id and lifecycle_status and tier):
+        return SELECTION_FACT_OWNER_UNPROVEN
+    if account_id not in ACCOUNT_MODELS:
+        return SELECTION_FACT_OWNER_UNPROVEN
+    if model_id not in (ACCOUNT_ALLOWED_MODELS.get(account_id) or set()):
+        return SELECTION_FACT_OWNER_UNPROVEN
+    if lifecycle_status not in SELECTION_LIFECYCLE_STATUSES:
+        return SELECTION_FACT_OWNER_UNPROVEN
+    if tier not in SELECTION_TIERS:
+        return SELECTION_FACT_OWNER_UNPROVEN
+    return SELECTION_FACT_RECORDED
+
+
+@dataclasses.dataclass(frozen=True)
+class AdaptiveSelectionFactProjection:
+    """**selection owner 自己签发**的候选事实投影 —— 一次不可变快照。
+
+    它携带的每一列都直接来自 owner 的 durable 归一列，没有任何一列由调用方提供：
+
+    ``identity`` / ``revision_identity``
+        行是**可变**的，所以 ``id`` 不是 revision identity。identity 由
+        ``<candidate_id>@<revision_at>`` 构成 —— ``revision_at`` 是 owner 在每次改写时
+        都会推进的 ``updated_at``。内容一变，identity 就变，因此同一个 ``source_id``
+        不会在内容变化后指向两条不同的事实（那会让冲突检测失效）。
+
+    ``availability_day``
+        **从 ``revision_at`` 派生的 owner 时区业务日**，不是 ``run_date``。``run_date``
+        是"这次评估关于哪一天"的标签；当前行内容在 ``updated_at`` 之前并不存在。
+
+    ``fact_verification_status``
+        owner 签发的极小闭集（见 :data:`SELECTION_FACT_VERIFICATION_STATUSES`）。
+        它回答"这是不是一条 owner 自洽签发的候选事实"，
+        **不**回答"这条候选是否通过晋级验证"。
+
+    ``content_fingerprint``
+        构造期确定性计算（sha256 over canonical JSON），因此即使调用方保留了内部容器的
+        引用也无法改写它。指纹覆盖 record kind / identity / revision / availability /
+        核验状态与全部事实内容。
+
+    已知限制：dataclass 是可构造的，所以"手工造投影 → adapter"这条两步伪造路径在本层
+    **只**被限制在"identity 只能由候选列派生、指纹只能是内容的函数"，而**不是**被证明
+    关闭。physical database provenance 仍是 OPEN / REQUIRED。
+    """
+
+    version: str
+    record_kind: str
+    candidate_id: int
+    account_id: str
+    run_date: str
+    regime: str
+    model_id: str
+    baseline_params_canonical: str
+    candidate_params_canonical: str
+    evidence_canonical: str
+    lifecycle_status: str
+    tier: str
+    reason: str
+    revision_at: str
+    availability_day: str
+    created_at: str
+    fact_verification_status: str
+    content_fingerprint: str = ""
+
+    def __post_init__(self) -> None:
+        record_kind = str(self.record_kind or "").strip()
+        if record_kind != SELECTION_CANDIDATE_RECORD_KIND:
+            raise SelectionFactContractError(
+                f"unknown selection fact record_kind: {record_kind!r}; "
+                f"allowed: {SELECTION_CANDIDATE_RECORD_KIND!r}"
+            )
+        object.__setattr__(self, "record_kind", record_kind)
+        object.__setattr__(
+            self, "version",
+            str(self.version or "").strip() or SELECTION_FACT_CONTRACT_VERSION,
+        )
+        if isinstance(self.candidate_id, bool) or not isinstance(self.candidate_id, int):
+            raise SelectionFactContractError(
+                f"selection candidate_id must be an int, got {self.candidate_id!r}"
+            )
+        if self.candidate_id <= 0:
+            raise SelectionFactContractError(
+                f"selection candidate_id must be positive, got {self.candidate_id}"
+            )
+        for name in ("account_id", "regime", "model_id"):
+            text = str(getattr(self, name) or "").strip()
+            if not text:
+                raise SelectionFactContractError(f"selection fact requires {name}")
+            object.__setattr__(self, name, text)
+        object.__setattr__(
+            self, "run_date", _business_day(self.run_date, what="selection fact run_date"),
+        )
+        object.__setattr__(self, "reason", str(self.reason or "").strip())
+        object.__setattr__(
+            self, "lifecycle_status", str(self.lifecycle_status or "").strip(),
+        )
+        object.__setattr__(self, "tier", str(self.tier or "").strip())
+
+        revision = _owner_instant(self.revision_at, what="selection fact revision_at")
+        object.__setattr__(self, "revision_at", revision.isoformat(timespec="seconds"))
+        day = _business_day(self.availability_day, what="selection fact availability_day")
+        expected = _owner_availability_day(revision, what="selection fact revision_at")
+        if day != expected:
+            raise SelectionFactContractError(
+                f"selection fact availability_day {day} disagrees with the owner-timezone "
+                f"day derived from revision_at ({expected}) — 业务日只能由 owner 从 "
+                "revision 瞬间派生，不能由调用方指定"
+            )
+        if not str(self.created_at or "").strip():
+            raise SelectionFactContractError("selection fact requires created_at")
+
+        for name in (
+            "baseline_params_canonical", "candidate_params_canonical", "evidence_canonical",
+        ):
+            text = str(getattr(self, name) or "")
+            _strict_mapping(text, what=f"selection fact {name}")
+            canonical = _canonical_json(
+                _strict_mapping(text, what=f"selection fact {name}"),
+                what=f"selection fact {name}",
+            )
+            if canonical != text:
+                raise SelectionFactContractError(
+                    f"selection fact {name} is not canonical — 事实内容必须能确定性重算指纹"
+                )
+
+        status = str(self.fact_verification_status or "").strip()
+        if status not in SELECTION_FACT_VERIFICATION_STATUSES:
+            raise SelectionFactContractError(
+                f"unknown selection fact verification status: {status!r}; "
+                f"allowed: {SELECTION_FACT_VERIFICATION_STATUSES}"
+            )
+        object.__setattr__(self, "fact_verification_status", status)
+
+        # 指纹在**构造期**算出：调用方即使保留了内部容器的引用也改不动它。
+        object.__setattr__(self, "content_fingerprint", self._fingerprint())
+
+    # ---------- owner-derived identity ----------
+
+    @property
+    def revision_identity(self) -> str:
+        """owner 的 revision identity —— ``<candidate_id>@<revision_at>``。"""
+        return f"{self.candidate_id}@{self.revision_at}"
+
+    @property
+    def identity(self) -> tuple[str, str, str]:
+        """``(record_kind, revision_identity, availability_day)``。"""
+        return (self.record_kind, self.revision_identity, self.availability_day)
+
+    # ---------- factual payload (parsed copies) ----------
+
+    @property
+    def baseline_params(self) -> dict:
+        return json.loads(self.baseline_params_canonical)
+
+    @property
+    def candidate_params(self) -> dict:
+        return json.loads(self.candidate_params_canonical)
+
+    @property
+    def evidence(self) -> dict:
+        return json.loads(self.evidence_canonical)
+
+    # ---------- fingerprint ----------
+
+    def _fingerprint(self) -> str:
+        payload = {
+            "version": self.version,
+            "record_kind": self.record_kind,
+            "candidate_id": self.candidate_id,
+            "account_id": self.account_id,
+            "run_date": self.run_date,
+            "regime": self.regime,
+            "model_id": self.model_id,
+            "baseline_params": self.baseline_params_canonical,
+            "candidate_params": self.candidate_params_canonical,
+            "evidence": self.evidence_canonical,
+            "lifecycle_status": self.lifecycle_status,
+            "tier": self.tier,
+            "reason": self.reason,
+            "revision_at": self.revision_at,
+            "availability_day": self.availability_day,
+            "created_at": self.created_at,
+            "fact_verification_status": self.fact_verification_status,
+        }
+        encoded = json.dumps(
+            payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False,
+        )
+        return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+    def projection(self) -> dict:
+        """给 API / 前端的稳定投影：只 render，不重算任何核验语义。"""
+        return {
+            "version": self.version,
+            "record_kind": self.record_kind,
+            "identity": self.revision_identity,
+            "record_id": self.candidate_id,
+            "account_id": self.account_id,
+            "run_date": self.run_date,
+            "regime": self.regime,
+            "model_id": self.model_id,
+            "lifecycle_status": self.lifecycle_status,
+            "tier": self.tier,
+            "reason": self.reason,
+            "revision_at": self.revision_at,
+            "availability_day": self.availability_day,
+            "created_at": self.created_at,
+            "fact_verification_status": self.fact_verification_status,
+            "content_fingerprint": self.content_fingerprint,
+            "authority": "owner_fact",
+            "lifecycle_status_is_verification": False,
+        }
+
+
+def _selection_projection_from_row(item: dict, *, revision: dt.datetime, available_day: str):
+    account_id = str(item.get("account_id") or "").strip()
+    model_id = str(item.get("model_id") or "").strip()
+    lifecycle = str(item.get("status") or "").strip()
+    tier = str(item.get("tier") or "").strip()
+    # 严格解析一次，供两处使用：事实内容（canonical 文本）与**来源记号**。
+    evidence_mapping = _strict_mapping(
+        item.get("evidence"), what="selection candidate evidence",
+    )
+    return AdaptiveSelectionFactProjection(
+        version=SELECTION_FACT_CONTRACT_VERSION,
+        record_kind=SELECTION_CANDIDATE_RECORD_KIND,
+        candidate_id=int(item["id"]),
+        account_id=account_id,
+        run_date=str(item.get("run_date") or ""),
+        regime=str(item.get("regime") or ""),
+        model_id=model_id,
+        baseline_params_canonical=_canonical_params(
+            item.get("baseline_params"), what="selection candidate baseline_params",
+        ),
+        candidate_params_canonical=_canonical_params(
+            item.get("candidate_params"), what="selection candidate candidate_params",
+        ),
+        evidence_canonical=_canonical_json(
+            evidence_mapping, what="selection candidate evidence",
+        ),
+        lifecycle_status=lifecycle,
+        tier=tier,
+        reason=str(item.get("reason") or ""),
+        revision_at=revision.isoformat(timespec="seconds"),
+        availability_day=available_day,
+        created_at=str(item.get("created_at") or ""),
+        fact_verification_status=_selection_fact_verification_status(
+            origin_marker=_owner_origin_marker(evidence_mapping),
+            account_id=account_id, model_id=model_id,
+            lifecycle_status=lifecycle, tier=tier,
+        ),
+    )
+
+
+def selection_candidate_fact(conn, candidate_id, *, as_of):
+    """把一条 selection 候选行读成 typed owner fact。``as_of`` **必须显式**。
+
+    **fail-closed 的历史语义。** 行是**可变**的，旧 revision 一旦被覆盖就不复存在。因此当
+    当前 revision 的 ``availability_day`` 晚于 ``as_of`` 时，本函数返回 ``None``
+    （UNAVAILABLE / not returned），而**不是**把当前行倒填进更早的 ``as_of`` ——
+    那正是 look-ahead。``updated_at`` 是唯一的可用性 authority；``run_date`` 不是。
+
+    刻意**没有**这些 fallback：
+
+    * ``as_of=None`` → latest；
+    * 取墙钟 / ``today()`` / ``now()``；
+    * 取"当前 active candidate"或按 ``run_date`` 找最近一行。
+
+    ``as_of`` 缺失或不是 canonical 业务日即 :class:`SelectionFactContractError`。行不存在
+    返回 ``None``；行存在但内容损坏（坏 JSON / 缺列 / ``updated_at`` naive）则**抛错**，
+    绝不用 ``{}`` / ``created_at`` / ``run_date`` 兜底。
+    """
+    day = _business_day(as_of, what="selection candidate fact as_of")
+    cursor = conn.execute(
+        "SELECT * FROM adaptive_selection_candidates WHERE id=?", (int(candidate_id),),
+    )
+    row = cursor.fetchone()
+    if row is None:
+        return None
+    # 行形状是**调用方**的事实，不是本读侧可以假定的前提：生产连接设了
+    # ``row_factory = sqlite3.Row``，迁移 / 运维入口却是裸 tuple。两种都必须能读。
+    item = EV._row_as_dict(cursor, row)
+    missing = [name for name in _SELECTION_REQUIRED_COLUMNS if name not in item]
+    if missing:
+        raise SelectionFactContractError(
+            f"selection candidate {candidate_id} is missing required normalized columns: "
+            f"{missing}"
+        )
+    # 可用性判定**先于**内容解析：一条在 as_of 那天还不存在的 revision 的正确结论是
+    # "拿不到"，而不是"损坏"。两者都 fail closed，但语义不同。
+    revision = _owner_instant(
+        item.get("updated_at"), what="selection candidate updated_at",
+    )
+    available_day = _owner_availability_day(
+        revision, what="selection candidate updated_at",
+    )
+    if available_day > day:
+        return None
+    return _selection_projection_from_row(item, revision=revision, available_day=available_day)
+
+
+def record_shadow_proposal(conn, *, run_date, account_id, regime, model_id,
+                           baseline_params, candidate_params, evidence, reason, now):
+    """owner 的**唯一窄接口**：持久化一条 AI 影子候选提案。
+
+    这是 R27-B2C-6 writer 收敛的落点：``deepseek_advisor.run_realtime_tuning`` 不再自己拼
+    ``INSERT INTO adaptive_selection_candidates``，而是调用本函数。DeepSeek 因此是
+    **producer / caller**，``adaptive_selection`` 才是这张 ledger 的 owner。
+
+    本接口**只**做 owner 持久化，刻意不做以下任何一件事：
+
+    * 不调用 LLM、不决定 proposal 内容（内容由 caller 提出，本函数只校验）；
+    * 不自动 apply、不写 paper account、不碰 outbox；
+    * 不扩大 selection 权限 —— ``status`` 与 ``tier`` 由 **owner 独占决定**
+      (:data:`SHADOW_PROPOSAL_STATUS` / :data:`AI_REALTIME_TIER`)，caller 无法传入。
+      因为 ``shadow_proposal`` 不在 ``apply_candidate`` 的资格集合里，
+      "AI 提案直接生效"在这里结构性不可表达，human apply 边界逐字未变。
+
+    校验（fail closed，不合格即抛错而不是记一条坏候选）：
+
+    * ``run_date`` 必须是 canonical 业务日；
+    * ``account_id`` / ``model_id`` 必须落在 owner 自己的词表内；
+    * ``candidate_params`` 必须是**纯因子权重**补丁（键集恰为 ``{"weights"}``），且单因子
+      变化不超过既有的 ±3 个百分点边界。阈值 / 条件 / 入场路径一律在这里被拒绝，而不是
+      被记成一个以后可能被 apply 的候选。**apply 边界仍然独立重新校验一次**：本函数校验的
+      是提案自洽性，权威边界依旧是 :func:`apply_candidate` 与人工确认。
+
+    **追加而非改写，但绝不谎报保存成功。** ``(run_date, account_id, regime)`` 是一个 UNIQUE
+    槽位。槽位已被占用时只有两种可能，而它们必须给出**不同**的结论：
+
+    * **同一个 shadow proposal 已经存在** —— 既有行**仍处于** ``shadow_proposal`` /
+      ``ai_realtime``、owner 来源记号有效，且 factual payload 与本次提案**逐项相同**
+      （``model_id`` / ``baseline_params`` / ``candidate_params`` / ``evidence`` /
+      ``reason``，见 :func:`_shadow_proposal_is_identical`）：那就不需要再写一次，返回既有行
+      id，并且这是**明确的幂等成功**。
+    * **槽位被别的候选占用** —— 生命周期已经推进（``applied`` / ``rolled_back`` /
+      ``eligible_*`` …）、tier 不同、记号无效、任一 factual 字段不同，或既有行损坏无法比较：
+      抛 :class:`SelectionProposalConflict`，因为本次 proposal **没有**被持久化。
+
+    第一类刻意**要求既有行仍处在 shadow 状态**：一条 ``applied`` 的行不等于"这个 shadow
+    proposal 已经存在"，它已经走完了自己的生命周期。若只比 payload 就返回它的 id，上层会报告
+    ``shadow_proposal`` / "仅保存候选"，而 durable row 其实是 ``applied`` —— 本次调用根本没保存
+    任何新的 shadow proposal。
+
+    幂等判据的 factual 部分刻意与 owner fact 的 payload 对齐，而不是"weights 相同就算同一个
+    请求"：``evidence`` / ``reason`` 都参与
+    :meth:`AdaptiveSelectionFactProjection._fingerprint`，owner 已经声明它们变化即事实内容变化。
+    若写入口用更松的定义，同一次重放会在两个 durable 层留下不一致的描述（候选 ledger 还是
+    E1/R1，而 ``adaptive_ai_tuning_runs`` 记着 E2/R2）。
+
+    第二类刻意**不是**静默返回既有 id：那会让 ``run_realtime_tuning`` 在什么都没写进去的
+    情况下报告"仅保存候选"，也就是把 API 层的成功与实际 durable 状态分开。旧的裸 INSERT
+    在 UNIQUE 冲突时至少会失败；收敛后如果改成静默吞掉，就比收敛前更危险。既有行的
+    lifecycle 仍然逐字不变（提案不得把已 ``applied`` / ``rolled_back`` 的候选改回影子态）。
+    """
+    ensure_schema(conn)
+    day = _business_day(run_date, what="shadow proposal run_date")
+    account = str(account_id or "").strip()
+    if account not in ACCOUNT_MODELS:
+        raise ValueError(f"shadow proposal account_id is not owner-managed: {account!r}")
+    resolved_model = str(model_id or "").strip()
+    if resolved_model not in (ACCOUNT_ALLOWED_MODELS.get(account) or set()):
+        raise ValueError(
+            f"shadow proposal model_id {resolved_model!r} is not allowed for account {account!r}"
+        )
+    regime_text = str(regime or "").strip()
+    if not regime_text:
+        raise ValueError("shadow proposal requires a non-empty regime")
+    baseline = _strict_mapping(baseline_params, what="shadow proposal baseline_params")
+    candidate = _strict_mapping(candidate_params, what="shadow proposal candidate_params")
+    if set(candidate) != {"weights"}:
+        raise ValueError(
+            "shadow proposal candidate_params must be a factor-weights-only patch; "
+            f"got keys {sorted(candidate)}"
+        )
+    if not _factor_only_patch(
+        {"weights": candidate["weights"]}, {"weights": baseline.get("weights")}, resolved_model,
+    ):
+        raise ValueError(
+            "shadow proposal must reuse the existing factor set and stay within the "
+            "±3pp per-factor bound"
+        )
+    evidence_payload = _strict_mapping(evidence, what="shadow proposal evidence")
+    # writer 落库的瞬间必须能被 owner 自己的 typed read 重新解析 —— 否则写进去的就是一条
+    # 其 owner 读不出来的事实。
+    opened = _owner_instant(now, what="shadow proposal now")
+    now_text = opened.isoformat(timespec="seconds")
+    # 幂等比较用**canonical** 文本：写入用 ``_json``（不排序），读取用 canonical（排序），
+    # 直接比原始字符串会因为键序不同而把同一份内容判成冲突。
+    baseline_canonical = _canonical_json(baseline, what="shadow proposal baseline_params")
+    candidate_canonical = _canonical_json(candidate, what="shadow proposal candidate_params")
+    # 事实 payload 的完整集合：evidence 用**盖章后**的文本（durable 行存的就是它），reason 用
+    # 与落库一致的截断形式。两者都必须参与幂等判定 —— owner fact 自己就把它们纳入了
+    # content fingerprint，写入口用更松的定义会让两层对"这次持久化的 candidate fact"说法不一致。
+    stamped_evidence = _stamp_owner_origin(evidence_payload)
+    evidence_canonical = _canonical_json(stamped_evidence, what="shadow proposal evidence")
+    reason_text = str(reason or "")[:500]
+
+    cursor = conn.execute(
+        """INSERT INTO adaptive_selection_candidates(
+           run_date,account_id,regime,model_id,baseline_params,candidate_params,evidence,status,tier,reason,created_at,updated_at)
+           VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
+           ON CONFLICT(run_date,account_id,regime) DO NOTHING""",
+        (day, account, regime_text, resolved_model, _json(baseline), _json(candidate),
+         _json(stamped_evidence), SHADOW_PROPOSAL_STATUS, AI_REALTIME_TIER,
+         reason_text, now_text, now_text),
+    )
+    if cursor.rowcount:
+        return int(cursor.lastrowid)
+
+    # 槽位已被占用：必须区分"幂等重放"与"真的冲突"，绝不用同一个返回值掩盖两者。
+    probe = conn.execute(
+        "SELECT * FROM adaptive_selection_candidates WHERE run_date=? AND account_id=? AND regime=?",
+        (day, account, regime_text),
+    )
+    existing_row = probe.fetchone()
+    if existing_row is None:  # pragma: no cover - DO NOTHING 之后必然存在
+        raise SelectionProposalConflict(
+            f"shadow proposal slot {day}/{account}/{regime_text} vanished during the insert"
+        )
+    item = EV._row_as_dict(probe, existing_row)
+    if _shadow_proposal_is_identical(
+        item, stored_model=resolved_model,
+        baseline_canonical=baseline_canonical, candidate_canonical=candidate_canonical,
+        evidence_canonical=evidence_canonical, reason_text=reason_text,
+    ):
+        return int(item["id"])
+    raise SelectionProposalConflict(
+        f"shadow proposal slot {day}/{account}/{regime_text} is not available for this proposal: "
+        f"candidate {item.get('id')} (status={item.get('status')!r}, tier={item.get('tier')!r}) "
+        "既不是一条 factual payload 相同的 shadow proposal，也没有被本次调用改写 —— "
+        "本次提案**没有**被持久化"
+    )
+
+
+def _shadow_proposal_is_identical(
+    item: dict, *, stored_model: str, baseline_canonical: str, candidate_canonical: str,
+    evidence_canonical: str, reason_text: str,
+) -> bool:
+    """既有行是否就是**同一条、且仍在 shadow 状态的**提案（幂等重放）。
+
+    返回 ``True`` 需要两组条件同时成立，但它们回答的是**不同**问题，因此刻意分开写。
+
+    **一、幂等资格（既有行本身还得是一条 AI 影子提案）**
+
+    ```text
+    status == shadow_proposal
+    tier   == ai_realtime
+    owner 来源记号有效
+    ```
+
+    这一组是第二轮 review 补上的。原先只比 payload，于是生命周期**已经推进**的 candidate
+    （``applied`` / ``rolled_back`` / ``eligible_*``）占着同一个 UNIQUE 槽位时，只要 payload
+    相同就会被当成"幂等成功"。那会让上层 ``run_realtime_tuning`` 报告
+    ``shadow_proposal`` / "仅保存候选"，而 durable row 其实是 ``applied`` —— 本次调用
+    **没有**保存任何新的 shadow proposal，两层状态再次不一致。
+
+    ``applied`` 的行不等于"这个 shadow proposal 已经存在"：它已经走完了自己的生命周期。
+    因此这种情形必须抛 :class:`SelectionProposalConflict`，而不是返回它的 id。
+
+    **二、factual payload 逐项相同**
+
+    ``model_id`` / ``baseline_params`` / ``candidate_params`` / ``evidence`` / ``reason``。
+    第一版把它写成"weights 相同就算同一个请求"，忽略了 owner contract 已经把
+    ``evidence_canonical`` 与 ``reason`` 计入 :meth:`AdaptiveSelectionFactProjection._fingerprint`
+    —— 用更松的定义会让候选 ledger（E1/R1）与 ``adaptive_ai_tuning_runs``（E2/R2）对同一次
+    成功持久化给出不同描述。
+
+    ``evidence`` 用 **owner 盖章后**的 canonical 文本比较：durable 行里存的就是盖章后的内容，
+    而调用方无法自行提供该记号。
+
+    **刻意不比较** ``revision_at`` / ``availability_day`` / ``created_at``：它们由写入口的
+    ``now`` 派生，属于"这条事实何时可用"，不是提案断言的 payload —— 一个重放本来就会带新的
+    ``now``，要求它们相等会让**任何**重放都变成冲突，也就没有"明确的幂等成功"可言。注意这意味着
+    幂等成功返回的行，其 content fingerprint 不会等于"此刻新写一行"会得到的指纹
+    （``revision_at`` 不同）：本函数声明的是"这份 payload 已在 ledger 里且仍处 shadow 状态"，
+    **不是**"这一行等于一次全新写入"。
+
+    既有行内容损坏（无法 canonical 解析）时返回 ``False`` ⇒ 走 conflict，而不是"读不出来就当
+    它一样"。
+    """
+    if str(item.get("model_id") or "").strip() != stored_model:
+        return False
+    # ---- 幂等资格：既有行必须仍是一条 AI 影子提案 ----
+    if str(item.get("status") or "").strip() != SHADOW_PROPOSAL_STATUS:
+        return False
+    if str(item.get("tier") or "").strip() != AI_REALTIME_TIER:
+        return False
+    try:
+        stored_evidence_mapping = _strict_mapping(
+            item.get("evidence"), what="shadow proposal existing evidence",
+        )
+        stored_baseline = _canonical_params(
+            item.get("baseline_params"), what="shadow proposal existing baseline_params",
+        )
+        stored_candidate = _canonical_params(
+            item.get("candidate_params"), what="shadow proposal existing candidate_params",
+        )
+    except SelectionFactContractError:
+        return False
+    if _owner_origin_marker(stored_evidence_mapping) != SELECTION_OWNER_ORIGIN_MARKER:
+        return False
+    stored_evidence = _canonical_json(
+        stored_evidence_mapping, what="shadow proposal existing evidence",
+    )
+    # ---- factual payload 逐项相同 ----
+    return (
+        stored_baseline == baseline_canonical
+        and stored_candidate == candidate_canonical
+        and stored_evidence == evidence_canonical
+        and str(item.get("reason") or "") == reason_text
+    )

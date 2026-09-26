@@ -2581,6 +2581,197 @@ CAUGHT（baseline GREEN、survived = 0、fake = 0、timeout = 0、三个被改�
 sha256 一致），并且每条都指定了由哪条**永久**回归捕获。
 
 
+### adaptive / experiment owner readiness（R27-B2C-6）
+
+Family B（adaptive / experiment）在此之前**整族不可迁移**，两个硬原因：`adaptive_selection_candidates`
+有**两个**生产 writer（`adaptive_selection._upsert` 与 `deepseek_advisor` 的裸 INSERT），
+且**没有任何** owner 发布过核验闭集。B2C-6 先收敛 writer，再让三个 owner 各自发布 typed
+事实 + 极小核验闭集，最后由**唯一** adapter 归口。
+
+#### writer 收敛（先决条件）
+
+```text
+before  adaptive_selection._upsert   +   deepseek_advisor 的裸 INSERT      → 2 个生产 writer
+after   adaptive_selection（含新窄接口 record_shadow_proposal）             → 1 个 owner
+```
+
+`deepseek_advisor.run_realtime_tuning` 变成 **producer / caller**。owner 窄接口只做持久化：
+`status` / `tier` 由 owner 独占决定（`shadow_proposal` / `ai_realtime`），`candidate_params`
+必须是纯因子权重补丁且单因子 ≤ ±3pp，`(run_date, account_id, regime)` 已存在时返回既有 id
+且**绝不**改写其生命周期。因为 `shadow_proposal` 不在 `apply_candidate` 的资格集合里，
+"AI 提案直接生效"结构性不可表达 —— **human apply 边界、`selection_auto_apply_bounded`、
+outbox 语义与 paper account 参数写权限逐字未变。**
+
+#### 三个 owner 各发一个 typed 投影 + 极小核验闭集
+
+```text
+adaptive_risk        AdaptiveRiskFactProjection       risk_candidate|<id>@<updated_at>
+adaptive_selection   AdaptiveSelectionFactProjection  selection_candidate|<id>@<updated_at>
+learning_evaluation  ExperimentEvaluationProjection   experiment_evaluation|<evaluation_fingerprint>
+```
+
+核验闭集每家两态、三家**互不重叠**：`<owner>_recorded → OWNER_OUTCOME_VERIFIED`、
+`<owner>_unproven → OWNER_OUTCOME_UNVERIFIED`。`recorded` 的含义**仅**是"这是一条 owner
+自洽签发、identity / 必要归一列 / revision 可用性都成立的可靠事实"——**不是**"候选通过了
+晋级验证"、**不是**"策略为真"、**不是**"值得 apply"。
+
+三条 PIT 语义是本轮的核心修正，每条都可以被 mutation 打红：
+
+```text
+candidate availability_day ← updated_at（owner 时区归一）   绝不来自 run_date
+evaluation availability_day ← evaluation manifest created_at  绝不来自 dataset cutoff
+updated_at > as_of           → UNAVAILABLE（返回 None）       绝不倒填当前行
+```
+
+历史 read 因此是 fail-closed 的：旧 revision 已被覆盖就不复存在，正确的答复是"拿不到"。
+代价是无法做真正的历史 candidate 回溯 —— 那需要 owner 新增 additive append-only revision
+台账（DB migration），本轮刻意**不**静默新增第二套 ledger，而是记为 OPEN PREREQUISITE。
+
+#### writer origin 必须由 owner 签发，词汇不是来源
+
+只用词汇（account / model / lifecycle / tier 是否落在 owner 词表内）判定
+``selection_candidate_recorded`` 是**错的**，而且错在已知的历史事实上：R27-B2C-6 之前这张表
+有两个生产 writer，而旧的 ``deepseek_advisor`` 直写行用的正是
+``status='shadow_proposal'`` / ``tier='ai_realtime'`` —— 两个值现在都是 owner 合法词汇。
+于是新 owner 会反向认证一批它明确没有独占写入的行。
+
+```text
+owner 写路径在 durable ``evidence`` 列的 ``owner_writer_origin`` 键上**覆盖式**盖章
+  （owner 已持久化、可严格验证的字段 ⇒ 不需要 schema migration，也不新增第二套 ledger）
+读侧判据：记号必须逐字等于 owner 签发值 → 否则 unproven
+  （词汇检查降级为自洽性第二层）
+caller 无法申明来源：写路径覆盖同名键
+历史行（两个旧 writer）都没有记号 ⇒ 一律 unproven —— 诚实结论是"不可证"
+```
+
+``adaptive_risk_candidates`` 刻意**没有**这一层，因为它只有一个业务 writer 模块；这条不对称
+由 ``EXP-05b`` 断言（出现第二个业务 writer 就红，届时必须为 risk 补同样的证明）。
+``adaptive_engine._restore_candidate_snapshot`` 是跨库补偿 —— 用动态表名把**同一行**的旧快照
+逐列还原，不产生新的 origin，因此不算第二个 writer。
+
+#### proposal 槽位冲突必须显式拒绝
+
+``record_shadow_proposal`` 的 ``(run_date, account_id, regime)`` 是 UNIQUE 槽位。第一版对
+"槽位已存在"一律返回既有 id，于是在什么都没写进去的情况下让 ``run_realtime_tuning`` 报告
+"仅保存候选" —— API 层的成功与 durable 状态被分开，比收敛前的裸 INSERT 更危险（旧逻辑遇到
+UNIQUE 冲突至少会失败）。现在两种情形给出不同结论：
+
+```text
+既有行的 factual payload 与本次提案逐项相同  → 明确的幂等成功（返回既有行 id）
+任一 factual 字段不同 / 既有行损坏            → 抛 SelectionProposalConflict：本次提案**没有**被持久化
+```
+
+幂等判据必须覆盖**完整 factual payload**（``model_id`` / ``baseline_params`` /
+``candidate_params`` / ``evidence`` / ``reason``），而不是"weights 相同就算同一个请求" ——
+owner fact 的 ``content_fingerprint`` **已经**把 ``evidence`` 与 ``reason`` 计入，也就是 owner
+已声明"这两个字段变化 ⇒ 事实内容变化"。写入口用更松的定义会造成两个 durable 层对**同一次成功
+持久化**给出不同描述（候选 ledger 留着 E1/R1，而 ``adaptive_ai_tuning_runs`` 记着 E2/R2）。
+``evidence`` 用**盖章后**的 canonical 文本比较，``reason`` 用与落库一致的截断形式。
+
+幂等成功还要求既有行**仍处在 shadow 状态**（``status == shadow_proposal``、
+``tier == ai_realtime``、owner 来源记号有效）。否则一条生命周期已经推进的 ``applied`` 行占着
+同一个 UNIQUE 槽位时，只要 payload 相同就会被返回 id —— 上层报告 ``shadow_proposal`` /
+"仅保存候选"，而 durable row 其实是 ``applied``，本次调用根本没保存任何新的 shadow proposal。
+所以幂等重放的含义是"**同一条仍处于 shadow 状态的**提案已经存在"，不是"历史上曾经有过相同
+payload 的某个 candidate"。这两组条件回答不同问题，在实现里刻意分开写。
+
+刻意**不**比较 ``revision_at`` / ``availability_day`` / ``created_at``：它们由写入口的 ``now``
+派生，属于"这条事实何时可用"而非提案断言的 payload；要求它们相等会让**任何**重放都变成冲突。
+代价是幂等成功返回的行其 fingerprint 不等于"此刻新写一行"的指纹 —— 本层声明的是"这份 payload
+已在 ledger 里且仍处 shadow 状态"，**不是**"这一行等于一次全新写入"。
+
+``run_realtime_tuning`` 逐条捕获并返回 ``persisted_ids`` / ``conflicts``：部分冲突时理由写明
+"N/M 个未持久化"，全部冲突时 ``status='proposal_conflict'``。既有行 lifecycle 逐字不变。
+
+#### 唯一 adapter
+
+```text
+backend/ai_research_strategy_adapter.py
+    evidence_ref_from_strategy_projection(projection)   ← 公开面只有这一个
+```
+
+入口只做 `type(projection) is …` 精确类型判定（dict / `Mapping` / duck-typed / 子类一律
+`TypeError`），且不读 DB、不读墙钟、不联网、不调 LLM，也不重算任何 owner 的业务量。复用既有
+`EVIDENCE_SOURCE_STRATEGY_RESEARCH`，**不新增** source type；risk / selection / evaluation 的
+细分放在 `record_kind` 与 `detail` 里，因此 `InformationEvent.kind` 自动仍是
+`strategy_research_observed`。
+
+依赖方向与既有三条接缝一致，且是**单向**的：
+
+```text
+adaptive_risk / adaptive_selection / learning_evaluation    （owner：identity / 可用性 / 核验）
+        ↓
+ai_research_strategy_adapter                                （唯一同时认识两套词表的接缝）
+        ↓
+ai_research_contract                                        （不 import 任何 owner / DB 模块）
+```
+
+`learning_evaluation` 既有的 `forbidden_dependencies()` 把 `adaptive_risk` /
+`adaptive_selection` 列为禁用前缀 —— 这条依赖约束本轮**没有**放宽，因此 experiment 投影
+住在 `learning_evaluation` 内部而不是新模块。
+
+#### 回归门禁（B2C-6）
+
+```text
+backend/test_adaptive_experiment_evidence_ownership.py   EXP-01 ~ EXP-18（owner 侧）
+    selection ledger 只有一个生产 writer；deepseek_advisor 不再提到该表；
+    AI 提案仍不能自动 apply（且提案追加而非改写生命周期）；
+    槽位被内容不同的候选占用 → 显式 SelectionProposalConflict，且不写任何行；
+    幂等判据覆盖**完整 factual payload**：candidate / baseline / evidence / reason
+    单字段隔离矩阵各自变化都必须冲突（含 evidence_hash 与 reason），全同才幂等成功；
+    幂等成功还要求既有行**仍处 shadow 状态**：applied / rolled_back / 改过 tier /
+    记号无效的行即使 payload 相同也必须冲突，且 lifecycle 与 updated_at 逐字不变；
+    tuner 把冲突记成 not persisted（部分冲突写明 N/M，全部冲突 status=proposal_conflict），
+    不得报告"仅保存候选"；同一槽位里 evidence/reason 变化时 runtime 不得复用旧行；
+    已 applied 的行 + 同一提案再跑 tuner → proposal_conflict、persisted_ids 为空；
+    writer origin 只能由 owner 的 durable 记号证明 —— 历史第二 writer（含旧 owner 行）一律
+    unproven，caller 无法申明该记号，带记号但词汇不合法仍 unproven；
+    risk ledger 只有一个业务 writer 模块（不对称是被断言的，不是口头的）；
+    lifecycle status 与核验闭集零交集（遍历 owner 的**每一个**状态）；
+    未知词汇 → unproven 而不是"照样可信"；application_mode 不参与来源证明；
+    identity 由 owner 派生且随 revision 移动；updated_at > as_of → None；
+    run_date 不能替代可用性；跨 offset 归一（含 +14:00 对照）；
+    坏 JSON / naive 时间戳 / 缺归一列 fail closed；as_of 缺失即错误且无 latest 回落；
+    dataset cutoff ≠ evaluation availability（9/21 的结果不得出现在 9/20）；
+    评估结果晚于 as_of → None；dataset manifest 缺失 → unproven；
+    evaluation_admitted 不是策略为真、False 仍是已核验事实；
+    promotable 不是核验定义、False 也不是 source_unusable；
+    learning pit_status 与核验词表不相交。
+
+backend/test_ai_research_strategy_adapter.py             EXP-19 ~ EXP-28（接缝侧）
+    只接受三个已批准类型的本类型（dict / Mapping / 伪对象 / **子类**全拒）；
+    复用既有 strategy_research 而不新增 source type；签名不接受 source_id / as_of；
+    指纹确定性且随事实与 revision 移动；adapter 不 import DB / 网络 / 时钟；
+    registry 与真实 factory 双向一致（漂移函数两个方向都会红）；
+    production 调用点 = 0；detail 不复制 owner payload；
+    candidate_challenge / overfit_watch 的 legacy 直读 runtime 仍在且仍被记为 deferred。
+```
+
+`backend/test_ai_research_evidence_ownership_guard.py`：`EXPECTED_OWNER_FACTORIES` 与
+`APPROVED_ISSUER_CALLERS` 各增加 strategy_research 一行，最终 caller set 恰好五个 owner
+factory。`backend/ai_research_contract.py`：`SUPPORTED_OWNER_ADAPTERS` 加入
+`EVIDENCE_SOURCE_STRATEGY_RESEARCH`；`backend/test_ai_research_contract.py` 的
+`ALLOWED_AI_CONSUMERS` 登记新接缝（谁依赖了 AI 必须是一次有意识的决定）。
+
+语义 mutation 在 `work/r27b2c6_adaptive_experiment_mutation_check.py`（M-EXP-01 ~ 19）必须
+全部 CAUGHT（baseline GREEN、survived = 0、fake = 0、timeout = 0、被改写文件的 restore
+sha256 一致）。其中四条是 **review 先发现、随后立刻转成 mutation** 的：
+
+```text
+M-EXP-14  （第一版存活）内容指纹忽略 revision identity
+M-EXP-16  来源判据退回词汇归属 → 历史第二 writer 的行被判成 owner verified
+M-EXP-17  proposal 槽位冲突被静默吞掉 → runtime 谎报"已保存"
+M-EXP-18  幂等只看 weights → evidence / reason 变化被当成"同一个请求"
+M-EXP-19  删掉幂等资格条件 → applied 行被当成"影子提案已存在"
+```
+
+review 发现的漏洞必须立刻变成 mutation，否则下一轮回归仍然守不住它。
+
+**本轮的 runtime 迁移是 DEFERRED，不是 REMOVED**：`deepseek_research._candidate_evidence` /
+`_overfit_evidence` 仍直读 ledger，且**不**做 dual run（legacy + typed 同时跑），也不让 typed
+provider 多调一次。`candidate_challenge` / `overfit_watch` 的 runtime convergence 留给后续一轮。
+
+
 ## 目标依赖方向
 
 ```text
@@ -2766,6 +2957,66 @@ legacy news runtime 被当成已迁移（R27-B2C-5：
 live news。这条 legacy 路径**明确保持 OPEN**，直到后续 event_evidence convergence；
 "news owner readiness = COMPLETE" 不等于"news runtime 已完全迁移"，
 adapter 的 production 调用点 = 0 是本轮的预期状态而不是空转）
+selection candidate ledger 重新长出第二个生产 writer（R27-B2C-6：写
+`adaptive_selection_candidates` 的模块集合必须恰好是 owner 一个；`deepseek_advisor` 连该表
+名字都不得出现 —— 它只能是 proposal **producer**，通过 owner 窄接口持久化。提案是追加的：
+已存在的行（含已 applied / rolled_back 的）逐字节不变）
+candidate 的 lifecycle status 被当成 owner verification（R27-B2C-6：
+`waiting_data` / `shadow_candidate` / `eligible_*` / `applied` / `rolled_back` 是生命周期与
+资格词，与核验闭集**零交集**；遍历 owner 的每一个状态，核验结论都必须不变。同理
+`evaluation_admitted` / `evaluation_contract_ok` 是契约门禁结果、`promotion_science.promotable`
+是晋升结论 —— 三者都不得进入任何核验维度，也不得写进
+`OwnerVerification.attributes`（键集被精确断言为三个事实性审计维度））
+adaptive / experiment 事实的可用性被 run_date 或 dataset cutoff 顶替（R27-B2C-6：candidate 的
+`availability_day` 只能由 `updated_at` 按 owner 时区派生，evaluation 的只能由
+`learning_evaluation_manifests.created_at`（结果产生瞬间）派生；`run_date` 是标签、`cutoff`
+是内容冻结边界，二者都只作事实字段。`updated_at > as_of` 时读侧必须返回 UNAVAILABLE，绝不
+拿当前行倒填更早的 `as_of`）
+typed adaptive fact 的读侧出现宽松回落（R27-B2C-6：坏 JSON / 缺必需归一列 / naive 时间戳
+一律 fail closed —— 绝不 `_loads(..., {})`、绝不 `run_date` / `created_at` / `now()` 兜底；
+`as_of` 必须显式，没有 `None → latest`、没有 `today()`、不按 `run_date` 找最近一行，
+也不回落到"当前 active candidate"。legacy `overview` 可以继续宽松，typed evidence path 不行）
+learning PIT 可用性词被当成 owner 核验（R27-B2C-6：`learning_dataset` 的
+`verified` / `unproven` / `legacy_unproven` / `unknown` / `future` 表达的是 PIT 可用性与资格，
+与 strategy 归口表及 owner 核验闭集**双向不相交**；`pit_status == verified` 不得变成
+owner verified）
+adaptive / experiment 事实绕过唯一 typed 接缝（R27-B2C-6：research 只通过
+`ai_research_strategy_adapter.evidence_ref_from_strategy_projection` 消费这三个 owner；该
+adapter 必须是**纯的** —— 不 import `sqlite3` / 网络 / 时钟 / 文件系统 / 随机源，只 import
+契约与三个 owner，也不得 import promotion_science。入口只接受
+`type(projection) is …` 精确类型，签名里没有 `source_id` / `as_of`。依赖方向单向：三个 owner
+不得 import research，research 契约也不得 import 任何 owner 或 adapter，且
+`SUPPORTED_OWNER_ADAPTERS` 必须与真实 factory 双向等值）
+legacy adaptive / experiment runtime 被当成已迁移（R27-B2C-6：
+`deepseek_research._candidate_evidence` / `_overfit_evidence` 仍然直读
+`adaptive_risk_candidates` / `adaptive_selection_candidates` / `adaptive_rewards` /
+`adaptive_alpha_candidates`。这条 legacy 路径**明确保持 OPEN 且 DEFERRED**；本轮不做 dual run、
+不让 typed provider 多调一次，adapter 的 production 调用点 = 0 是预期状态而不是空转）
+candidate 的 writer origin 由**词汇**推断（R27-B2C-6 review 修正：account / model /
+lifecycle / tier 落在 owner 词表内**不**证明这行是 owner 写的 —— R27-B2C-6 之前
+`deepseek_advisor` 直写行用的正是 `shadow_proposal` / `ai_realtime`，两个值现在都是 owner
+合法词汇，仅凭词汇就会把它们反向认证成 owner verified。来源只能由 owner 在 durable
+`evidence` 列上**覆盖式**盖的 `owner_writer_origin` 记号证明；历史行没有该记号 ⇒ 一律
+`unproven`。且该记号是来源判据而非免检通行证：带记号但用了 owner 不签发词汇的行仍然
+`unproven`）
+proposal 槽位冲突被静默当成保存成功（R27-B2C-6 review 修正：
+`record_shadow_proposal` 的 `(run_date, account_id, regime)` 是 UNIQUE 槽位。既有行的
+factual payload 与本次提案**逐项相同** → 明确的幂等成功；**任一** factual 字段不同或既有行
+损坏 → 抛 `SelectionProposalConflict`，本次提案**没有**被持久化。`run_realtime_tuning` 必须把
+冲突记成 not persisted —— 部分冲突时理由写明 N/M 未持久化，全部冲突时
+`status='proposal_conflict'`，**不得**继续报告"仅保存候选"）
+幂等判据被收紧成"weights 相同"（R27-B2C-6 review 修正：幂等比较必须覆盖**完整 factual
+payload**（`model_id` / `baseline_params` / `candidate_params` / `evidence` / `reason`），
+因为 owner fact 的 `content_fingerprint` 已经把 `evidence` 与 `reason` 计入 —— 用更松的定义
+会让候选 ledger 与 `adaptive_ai_tuning_runs` 对同一次成功持久化给出不同描述。`evidence` 在
+owner 盖章后比较；`revision_at` / `availability_day` / `created_at` 刻意排除，因为它们由
+`now` 派生、要求相等会让任何重放都变成冲突）
+生命周期已推进的行被当成"影子提案已存在"（R27-B2C-6 review 修正：幂等成功额外要求既有行
+**仍处于 shadow 状态** —— `status == shadow_proposal`、`tier == ai_realtime`、owner 来源记号
+有效。一条 `applied` / `rolled_back` / `eligible_*` 的行占着同一个 UNIQUE 槽位时，即使 payload
+完全相同也必须抛 `SelectionProposalConflict`：它不等于"这个 shadow proposal 已经存在"，而且
+本次调用并没有保存任何新的 shadow proposal。`run_realtime_tuning` 因此不得把该行记进
+`persisted_ids`，也不得报告"仅保存候选"）
 ```
 
 ### 仅作 review signal（不进入 CI gate）

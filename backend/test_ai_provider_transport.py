@@ -1065,6 +1065,11 @@ PORTFOLIO_ADAPTER_MODULE = "ai_research_portfolio_adapter.py"
 #: 注意 news owner（``news_learning``）**本身**是 ingestion writer，允许在写路径联网，
 #: 因此它刻意**不**在这个网络闭集里 —— 被登记的是它的 typed 读接缝。
 NEWS_ADAPTER_MODULE = "ai_research_news_adapter.py"
+#: R27-B2C-6 的 adaptive / experiment owner 接缝（**不是** authority；与前三份同构：只做词表
+#: 归口，不联网、不碰 DB）。注意三个 owner（``adaptive_risk`` / ``adaptive_selection`` /
+#: ``learning_evaluation``）本身都是 DB-backed，因此它们**不**在这个网络闭集里 —— 被登记的
+#: 是它们的 typed 读接缝。
+STRATEGY_ADAPTER_MODULE = "ai_research_strategy_adapter.py"
 
 #: RG-03 的扫描闭集：这些接缝**都不得**直接持有网络调用（真实网络调用只属于 transport）。
 #: 写成显式闭集而不是"扫全部文件"是有意的 —— 新增一个接缝必须是一次有意识的登记，
@@ -1079,6 +1084,7 @@ NETWORK_FREE_SEAMS = (
     EXECUTION_ADAPTER_MODULE,
     PORTFOLIO_ADAPTER_MODULE,
     NEWS_ADAPTER_MODULE,
+    STRATEGY_ADAPTER_MODULE,
 )
 
 ALLOWED_RESEARCH_IMPORTS = {
@@ -1094,6 +1100,7 @@ FORBIDDEN_RESEARCH_IMPORTS = {
     "paper_risk_service", "paper_risk_decision", "risk_center",
     "promotion_science", "self_evolution", "evolution_apply", "strategy_champion",
     "ai_review_service", "dual_ai_tuner", "adaptive_engine", "deepseek_advisor",
+    "adaptive_risk", "adaptive_selection", "learning_evaluation",
     "sqlite3", "requests", "urllib", "httpx", "socket", "os", "pathlib", "subprocess",
 }
 
@@ -1184,6 +1191,7 @@ class AiResearchProviderArchitectureGuardTests(unittest.TestCase):
         """
         self.assertIn(PORTFOLIO_ADAPTER_MODULE, NETWORK_FREE_SEAMS)
         self.assertIn(NEWS_ADAPTER_MODULE, NETWORK_FREE_SEAMS)
+        self.assertIn(STRATEGY_ADAPTER_MODULE, NETWORK_FREE_SEAMS)
 
         original_source = globals()["_source"]
         for seam in NETWORK_FREE_SEAMS:
@@ -1220,7 +1228,8 @@ class AiResearchProviderArchitectureGuardTests(unittest.TestCase):
                                               "ai_research_repository", "ai_research_service",
                                               "ai_research_execution_adapter",
                                               "ai_research_portfolio_adapter",
-                                              "ai_research_news_adapter"):
+                                              "ai_research_news_adapter",
+                                              "ai_research_strategy_adapter"):
                     offenders.append(f"{name}: import {imported}")
         self.assertEqual(
             [], offenders,
@@ -1239,7 +1248,10 @@ class AiResearchProviderArchitectureGuardTests(unittest.TestCase):
         （portfolio/accounting owner 的同构接缝），R27-B2C-4C 增加 ``deepseek_research``
         （``pnl_attribution`` 的 cross-owner research composition —— 它从"自己造事实"
         改成了"消费 owner typed 事实"，因此第一次成为契约的正式消费者），R27-B2C-5 增加
-        ``ai_research_news_adapter``（news owner 的同构接缝）。用等值断言而不是
+        ``ai_research_news_adapter``（news owner 的同构接缝），R27-B2C-6 增加
+        ``ai_research_strategy_adapter``（adaptive / experiment owner 的同构接缝 ——
+        三个 owner 各自发布 typed 投影与核验闭集，唯一 adapter 归口）。
+        用等值断言而不是
         "不含"断言：多出任何一个消费者都必须是一次有意识的决定。
 
         ``ai_research_service`` 刻意**不**在这里：orchestration boundary 只依赖 provider
@@ -1258,8 +1270,8 @@ class AiResearchProviderArchitectureGuardTests(unittest.TestCase):
             sorted(set(offenders)),
             ["ai_research_execution_adapter.py", NEWS_ADAPTER_MODULE,
              "ai_research_portfolio_adapter.py",
-             RESEARCH_MODULE, REPOSITORY_MODULE, "deepseek_advisor.py",
-             "deepseek_research.py"],
+             RESEARCH_MODULE, REPOSITORY_MODULE, STRATEGY_ADAPTER_MODULE,
+             "deepseek_advisor.py", "deepseek_research.py"],
             f"research contract 的生产消费者集合发生变化：{sorted(set(offenders))}",
         )
 

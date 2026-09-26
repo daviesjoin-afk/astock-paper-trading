@@ -814,6 +814,14 @@ baseline，因此**目标用例路径写错会被报成 BASELINE-RED 而不是�
 （`adaptive_evidence_chains`、`alpha_samples`/`alpha_returns`），但 every single case 都缺
 第 4 条：**没有任何 owner 发布过核验闭集**。
 
+> **R27-B2C-6 复查更正（不删上方原文，保留当时判断依据）**：上表逐条事实仍然成立，两条关键
+> 判断也都被 B2C-6 复核确认 —— `adaptive_selection_candidates` 确实有**两个**生产 writer，
+> 且 family B 里**没有**任何 owner 发布过核验闭集。B2C-6 因此先**收敛 writer**，再让三个
+> owner 各自发布 typed 事实 + 极小核验闭集，最后由**唯一** adapter 归口。可迁移的那部分
+> 交付了；不可迁移的那部分（`adaptive_rewards` 可用性、`adaptive_alpha_candidates` 的稳定
+> identity、`paper_parameter_versions` 的实验解释）被显式记为 **OPEN PREREQUISITE**，而不是
+> "不需要"。见文末 [B2C-6 进展](#b2c-6-进展adaptive--experiment-owner-readiness)。
+
 ---
 
 ## 四、Family C —— Information / news facts
@@ -1248,3 +1256,416 @@ event_evidence runtime convergence = DEFERRED（不是 COMPLETE）
 
 B2C-5 只能写 **news owner readiness = COMPLETE**，不能写"news runtime 已完全迁移"。
 
+
+---
+
+## B2C-6 进展（adaptive / experiment owner readiness）
+
+本轮**只**回答"adaptive / experiment 的事实证据到底谁拥有、何时可用、如何被 owner 核验"。
+它不是 `candidate_challenge` / `overfit_watch` 的 runtime 迁移，不是 AI tuner 权限重构，也不是
+R28 Experiment Contract。
+
+### FAMILY B OWNER MATRIX（逐项审计）
+
+| FACT / TABLE | CURRENT WRITER(S) | CANONICAL OWNER | IDENTITY | MUTABLE? | PIT AVAILABILITY | OWNER VERIFICATION | CURRENT RESEARCH READER | B2C-6 TREATMENT |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| `adaptive_risk_candidates` | `adaptive_risk._upsert_candidate:912`、`_finalize_apply:1030`、`_finish_rollback:1303`；`adaptive_engine._restore_candidate_snapshot:696`（跨库补偿，逐列还原旧值） | `adaptive_risk` | `UNIQUE(run_date,account_id,regime)` + `id` PK；行可 UPDATE ⇒ `id` **不是** revision identity | MUTABLE（每次改写都推进 `updated_at`） | 无可用性列；`run_date` 是标签。当前内容的可用性 ≥ `updated_at` | **无** —— `status ∈ {waiting_data, shadow_candidate, deployment_observing, no_change, eligible_auto_tighten, human_review_required, applied, rolled_back}` 是生命周期 | `deepseek_research._candidate_evidence:536`；`adaptive_risk.overview:1444` | **TYPED OWNER FACT** |
+| `adaptive_risk_deployments` | `adaptive_risk._register_deployment:654`、`:729`、`:648`、`_finish_rollback:1310` | `adaptive_risk` | `candidate_id` PK（稳定），但 `post_metrics` 会改写 | MUTABLE | `effective_date`；post-metric 内容 ≥ `updated_at` | 无 | `_candidate_evidence:541` | **OUT OF B2C-6 SCOPE** |
+| `adaptive_risk_daily_outcomes` | `adaptive_risk:588` | `adaptive_risk` | PK`(account_id,outcome_date)` | APPEND-ONLY | `outcome_date` | 无 | `overview` | **OUT OF B2C-6 SCOPE** |
+| `adaptive_order_risk_attribution` | `adaptive_risk:534` | `adaptive_risk` | `order_id` PK | APPEND-ONLY | `order_date` | 无（ratio 是派生值） | `_candidate_evidence:545` | **OUT OF B2C-6 SCOPE** |
+| `adaptive_selection_candidates` | **两个**：`adaptive_selection._upsert:417`（+`apply:606`、`rollback:707`）**与** `deepseek_advisor:1069` 裸 INSERT | `adaptive_selection`（收敛后唯一） | `UNIQUE(run_date,account_id,regime)` + `id`；行可 UPDATE | MUTABLE | 无可用性列；`run_date` 是标签 ⇒ 当前内容可用性 ≥ `updated_at` | **无** —— `status ∈ {waiting_data, shadow_candidate, no_change, eligible_auto_adjust, eligible_manual_review, eligible_structural_review, shadow_proposal, applied, rolled_back}` 是生命周期 | `_candidate_evidence:537` | **CONVERGE OWNER FIRST** → 然后 **TYPED OWNER FACT** |
+| `adaptive_rewards` | `adaptive_engine:1777`（`DELETE :1794`） | `adaptive_engine` | 无稳定自然键 | MUTABLE / 派生自 `paper_nav`+benchmark+fills | `start/end_date` 复制自 `paper_nav.nav_date`；只有 `created_at` | **无** | `_overfit_evidence:578`、`adaptive_selection._evidence:296` | **NOT EVIDENCE** → 由 canonical learning dataset/evaluation 取代；可用性契约 = **OPEN PREREQUISITE** |
+| `adaptive_alpha_candidates` | `adaptive_engine`：**DELETE**`:1594`/`:1722` 后 INSERT`:1737` | `adaptive_engine` | **不稳定** —— 每次运行按 `run_date` 硬删重插 | 整体重写 | 只有 `run_date` 标签 | **无** | `_overfit_evidence:582` | **NOT EVIDENCE**（无可证 reconstructability）→ **OPEN PREREQUISITE**；**不得**硬套 `ResearchEvidenceRef` |
+| `adaptive_alpha_runs` | `adaptive_engine:1602/1629/1760` | `adaptive_engine` | 按 `(run_date,status)` upsert；无 revision id | MUTABLE | `run_date` | 无 | — | **OUT OF B2C-6 SCOPE** |
+| `adaptive_alpha_samples` | `adaptive_engine:1192`（`INSERT OR REPLACE`） | **`learning_dataset`**（`CanonicalSample`，frozen） | canonical sample identity | 经 canonical 契约 append | **逐行 `feature_available_at`**（owner 从快照 `saved_at` 派生） | `pit_status ∈ {verified, unproven, legacy_unproven, unknown, future}` = **可用性 / 资格，不是核验** | `learning_dataset` | **TYPED OWNER FACT（已由 learning_dataset 拥有）** —— 复用；PIT 状态 ≠ 核验 |
+| `adaptive_alpha_returns` | `adaptive_engine:1210` | **`learning_dataset`** | canonical label identity | append | `label_available_at`（保守继承） | 同上（可用性，不是核验） | `learning_dataset` | 同上；`horizon` 明确**不是**交易日 |
+| learning dataset manifest（`learning_dataset_manifests`） | `learning_dataset.persist_manifest:1478`（`INSERT OR IGNORE`） | `learning_dataset` | **`dataset_fingerprint`** PK（sha256 canonical；`created_at` 不参与） | APPEND-ONLY | **`cutoff`** = 内容冻结边界；manifest 可用性 = 其 `created_at` | 无 —— dataset 级契约标志，**不是**逐事实裁定 | 暂无 research 消费者 | **DERIVED EXPERIMENT METADATA**（作为事实字段携带进 experiment evaluation fact） |
+| learning evaluation manifest（`learning_evaluation_manifests`）+ `contract_status` | `learning_evaluation.persist_evaluation_manifest:1759`（`INSERT OR IGNORE`） | `learning_evaluation` | **`evaluation_fingerprint`** PK（sha256 canonical） | APPEND-ONLY | cutoff 在**dataset** manifest 里（按 `dataset_fingerprint` join）；**结果可用性 = manifest `created_at`** | `evaluation_contract_ok` / `blockers` = 契约门禁结果；`evaluation_admitted` **只在 `contract_status` 里派生，不落库** | `neural_shadow.py:260` | **TYPED OWNER FACT** —— `as_of` 来自结果产生瞬间，**绝不**来自 `cutoff` |
+| `adaptive_evidence_chains` | `adaptive_engine:2894` | `adaptive_engine` | family 内最好（`signal_date/decision_at/order_at/fill_at/snapshot_at`） | MUTABLE | 逐行 instant | `integrity_status ∈ {valid, legacy_gap, invalid}` = 确定性账本连边计算，**不是** owner 核验 | `_candidate_evidence`（间接） | **OUT OF B2C-6 SCOPE**（`valid`→`verified` 就是发明声明） |
+| `adaptive_execution_evidence` | `adaptive_engine:3381` | `adaptive_engine` | `(evidence_date, metric)` | MUTABLE | `evidence_date` | 自由字符串 `status` | `_incident_evidence`（间接） | **OUT OF B2C-6 SCOPE**（属 B2C-7 runtime / incident） |
+| `paper_parameter_versions` | `adaptive_selection.apply_candidate:572`、`_finish_rollback:677`、`adaptive_risk`、evolution appliers | paper ledger（按约定多 applier） | `(account_id, version)` | APPEND-ONLY | `effective_date` + `created_at` | 无 | `_overfit_evidence:589` | **OPEN PREREQUISITE**（实验解释需要 writer 收敛后的 applier 契约） |
+| `paper_nav` | paper ledger | paper ledger | `(account_id, nav_date)` | APPEND-ONLY | `nav_date` | 无 | `_overfit_evidence:590`、`_evidence:286` | **PRESENTATION ONLY**（B2C-4B 已声明 `paper_nav` 为 legacy / compatibility） |
+
+### 与上表对应的强制边界
+
+```text
+selection candidate production writer              adaptive_selection owner 一个（收敛前 = 2）
+candidate writer origin                            owner 在 durable evidence 列里盖的来源记号
+                                                   （写路径**覆盖式**盖章，caller 无法申明）
+                                                   —— 词汇**不是** writer provenance
+candidate lifecycle status                         生命周期 / 资格；**不是** owner verification
+candidate revision identity                        <candidate_id>@<updated_at>
+candidate availability_day                         updated_at 归一到 owner 时区（Asia/Shanghai）后的日历日
+run_date                                           标签，永不进 as_of
+proposal 槽位冲突                                  显式 SelectionProposalConflict（与幂等重放分开）；
+                                                   幂等判据 = 资格（仍处 shadow / ai_realtime /
+                                                     owner 记号有效）+ 完整 factual payload
+                                                   （model_id / baseline / candidate /
+                                                     evidence / reason 五项全同）
+evaluation availability_day                        evaluation manifest created_at 归一后的日历日
+dataset cutoff                                     内容冻结边界，只作为**事实字段**保留
+evaluation_admitted / evaluation_contract_ok       契约门禁结果；**不是**"策略为真"
+promotion_science.promotable                       晋升结论；**不是**核验结论
+learning_dataset pit_status                        可用性 / 资格词表；与核验词表**不相交**
+typed read 的 as_of                                必须显式；**没有** None→latest / today() / current fallback
+updated_at > as_of                                 返回 UNAVAILABLE（**不**倒填当前行）
+malformed JSON / 缺归一列 / naive 时间戳            fail closed（抛错；绝不 {} / run_date / created_at 兜底）
+adapter                                            ai_research_strategy_adapter（唯一接缝）
+strategy adapter production callers                 0（预期状态；runtime 迁移 = DEFERRED）
+```
+
+### review 修正一：writer origin 不能由**词汇**证明
+
+第一版只用**词汇归属**（account / model / lifecycle / tier 是否落在 owner 词表内）判定
+``selection_candidate_recorded``。这是错的，而且错在**已知的历史事实**上：R27-B2C-6 之前
+这张表有两个生产 writer，而旧的 ``deepseek_advisor`` 直写行用的正是
+``status='shadow_proposal'`` / ``tier='ai_realtime'`` —— 两个值现在**都是** owner 的合法
+词汇。于是新 owner 会**反向认证**一批它明确没有独占写入的行：
+
+```text
+historical deepseek direct write  →  合法词汇  →  selection_candidate_recorded
+                                  →  ResearchEvidenceRef.is_verified = True     ✗
+```
+
+词表回答的是"这行**看起来像** owner 的产物"，不是"这行**是** owner 写的"。收敛后正确的做法
+是让 owner 在写路径上盖一条**只有它会盖**的 durable 记号：
+
+```text
+记号位置   durable ``evidence`` 列的 ``owner_writer_origin`` 键
+           （owner 已持久化、owner 可严格验证的字段 ⇒ 不需要 schema migration，
+             也不新增第二套 ledger）
+盖章方式   写路径**覆盖式**盖章：caller 传同名键会被 owner 覆写 ⇒ 调用方无法"申明"来源
+读侧判据   记号**必须**逐字等于 owner 签发值，否则 unproven（词汇检查降级为自洽性第二层）
+```
+
+因此：
+
+```text
+owner 写路径产出的行                                 → selection_candidate_recorded
+R27-B2C-6 之前第二 writer（deepseek 直写）的行       → selection_candidate_unproven
+R27-B2C-6 之前 owner ``_upsert`` 的行               → selection_candidate_unproven
+      （与上一行在数据上**无法区分** —— 两者都没有记号。诚实结论就是"不可证"，
+        而不是"大概率是 owner 写的"。代价是历史行全部 unproven。）
+带记号但用了 owner 不签发词汇的行                    → selection_candidate_unproven
+```
+
+**已知限制（不声称已关闭）**：记号是 durable 列里的一个字符串，因此未来**新增的**直接 DB
+writer 若逐字抄写它，仍能把自己伪装成 owner 行。本层保证的是"历史第二 writer 的行不可能带
+它" + "owner 写路径一定会盖它且覆盖 caller 传值"；
+**physical database origin / trusted provenance 仍是 OPEN / REQUIRED**。
+
+**risk owner 为什么没有这一层**：``adaptive_risk_candidates`` 只有一个业务 writer 模块
+（``adaptive_engine._restore_candidate_snapshot`` 只是把**同一行**的旧快照逐列还原回去，
+不是第二个 origin）。这条不对称是**被断言的**，不是口头的：``EXP-05b`` 把 risk ledger 的
+写入模块集合钉成闭集，出现第二个业务 writer 就红 —— 那时必须为 risk 补上同样一层证明。
+
+### review 修正二：proposal 槽位冲突必须显式拒绝，不能谎报保存
+
+第一版对"``(run_date, account_id, regime)`` 槽位已存在"一律 ``return existing["id"]``。
+后果不是一般性的保守，而是**审计失真**：
+
+```text
+DeepSeek 生成 proposal B → 槽位已被 candidate A 占用 → 直接返回 A.id
+                        → B 没有落库
+                        → run_realtime_tuning 仍报告 shadow_proposal / "仅保存候选"   ✗
+```
+
+API 层的成功与 durable ledger 的实际状态被分开了 —— 这比收敛前的裸 INSERT 更危险（旧逻辑遇到
+UNIQUE 冲突至少会失败）。现在两种情形给出**不同**结论：
+
+```text
+既有行的 model_id / baseline_params / candidate_params 与本次提案逐字相同
+    → 明确的**幂等成功**，返回既有行 id（内容确实已在 durable ledger 里）
+内容不同 / 既有行损坏无法比较
+    → 抛 SelectionProposalConflict：本次 proposal **没有**被持久化
+```
+
+``run_realtime_tuning`` 逐条捕获该异常并记账，返回 ``persisted_ids`` 与 ``conflicts``：
+部分冲突时理由写明"N/M 个未持久化"，全部冲突时 ``status='proposal_conflict'``。既有行的
+lifecycle 仍然逐字不变（提案不得把已 ``applied`` / ``rolled_back`` 的候选改回影子态）。
+
+### review 修正二（续）：幂等判据必须覆盖**完整 factual payload**
+
+上面那一段第一版的判据是 "``model_id`` / ``baseline_params`` / ``candidate_params`` 逐字相同
+⇒ 同一个请求"，并刻意**排除** ``evidence`` / ``reason``。第二次 review 指出这与 owner 自己的
+契约不一致 —— :meth:`AdaptiveSelectionFactProjection._fingerprint` **已经**把
+``evidence_canonical`` 与 ``reason`` 计入，也就是 owner 已声明"这两个字段变化 ⇒ 事实内容变化"。
+写入口用更松的定义会造成两个 durable 层对**同一次成功持久化**给出不同描述：
+
+```text
+旧 candidate:  weights=W, evidence=E1, reason=R1
+新 proposal:   weights=W, evidence=E2, reason=R2
+→ 返回旧 id（幂等成功），E2/R2 没有写进候选 ledger
+→ 但本次 tuning runtime 把 W+E2+R2 记进 adaptive_ai_tuning_runs
+→ 两层对"这次持久化的 candidate fact"说法不一致     ✗
+```
+
+这与"没有真正保存却报告保存"是同一类缺陷，只是更隐蔽。现在幂等判据与 owner fact 的 factual
+payload **逐项对齐**：
+
+```text
+model_id / baseline_params / candidate_params / evidence / reason  五项全部逐字相同
+    → 明确的幂等成功
+任一 factual 字段不同
+    → SelectionProposalConflict
+```
+
+**并且"幂等成功"还要求既有行仍处在 shadow 状态**（第三轮 review 补上）。原先只比 payload，
+于是生命周期**已经推进**的 candidate（``applied`` / ``rolled_back`` / ``eligible_*``）占着同一个
+UNIQUE 槽位时，只要 payload 相同就会被返回 id —— 上层于是报告 ``shadow_proposal`` /
+"仅保存候选"，而 durable row 其实是 ``applied``，且本次调用**没有**保存任何新的 shadow proposal：
+
+```text
+existing candidate:  payload = P, lifecycle = applied
+new tuning request:  payload = P, requested lifecycle = shadow_proposal
+→ 返回 applied 行的 id → persisted_ids 含它 → 报告 "shadow_proposal / 仅保存候选"   ✗
+```
+
+因此幂等判据分成两组条件，刻意分开写（它们回答的是不同问题）：
+
+```text
+幂等资格       status == shadow_proposal、tier == ai_realtime、owner 来源记号有效
+factual 相同   model_id / baseline_params / candidate_params / evidence / reason
+```
+
+一条 ``applied`` 的行不等于"这个 shadow proposal 已经存在" —— 它已经走完了自己的生命周期。
+所以幂等重放的准确含义是"**同一条仍处于 shadow 状态的**提案已经存在"，而不是"历史上曾经有过
+相同 payload 的某个 candidate"。
+
+三个实现细节：
+
+```text
+evidence 用**盖章后**的 canonical 文本比较
+    durable 行存的就是盖章后的内容；因盖章是覆盖式的，两侧比较的都是 owner 实际会落库的字节
+reason 用与落库一致的截断形式（[:500]）比较
+刻意不比较 revision_at / availability_day / created_at
+    它们由写入口的 now 派生，属于"这条事实何时可用"，不是提案断言的 payload。重放本来就会
+    带新的 now，要求它们相等会让**任何**重放都变成冲突 —— 那样"明确的幂等成功"就不存在了。
+    代价是幂等成功返回的那一行，其 content fingerprint 不会等于"此刻新写一行"会得到的指纹：
+    本层声明的是"这份 payload 已在 ledger 里且仍处 shadow 状态"，**不是**"这一行等于一次
+    全新写入"。
+```
+
+
+### 三个 owner 各自发布的核验闭集
+
+```text
+adaptive_risk        risk_candidate_recorded        → OWNER_OUTCOME_VERIFIED
+                     risk_candidate_unproven        → OWNER_OUTCOME_UNVERIFIED
+adaptive_selection   selection_candidate_recorded   → OWNER_OUTCOME_VERIFIED
+                     selection_candidate_unproven   → OWNER_OUTCOME_UNVERIFIED
+learning_evaluation  experiment_evaluation_recorded → OWNER_OUTCOME_VERIFIED
+                     experiment_evaluation_unproven → OWNER_OUTCOME_UNVERIFIED
+```
+
+三张闭集刻意**互不重叠**，因此归口表里每个键的 owner 归属是唯一的，漂移可以逐 owner 精确
+归因（重叠本身就是一条被断言的失败条件）。三家都**没有** `source_unusable`：`*_unproven`
+表示"owner 无法自证这条记录是它签发的"，障碍不在核验过程，因此归 `unverified` 而不是
+`source_unusable`（那会让假设层报出错误的 `evidence_unavailable` 原因）。
+
+**`*_recorded` 的含义必须被准确读取**：它**仅**表示"这是一条 owner 自洽签发、identity /
+必要归一列 / revision 可用性都成立的可靠事实"。它**不是**"这条候选通过了晋级验证"、
+**不是**"这个策略为真"、**不是**"值得 apply"。`AI_TYPED_*` 那套"事实 vs 结论"的区分在这里
+逐字适用。
+
+### owner 侧三个 typed 投影
+
+```text
+adaptive_risk.AdaptiveRiskFactProjection
+    record_kind = risk_candidate
+    identity    = <candidate_id>@<updated_at>
+    availability_day ← updated_at（owner 时区）
+    read        = adaptive_risk.risk_candidate_fact(conn, candidate_id, *, as_of)
+
+adaptive_selection.AdaptiveSelectionFactProjection
+    record_kind = selection_candidate
+    identity    = <candidate_id>@<updated_at>
+    availability_day ← updated_at（owner 时区）
+    read        = adaptive_selection.selection_candidate_fact(conn, candidate_id, *, as_of)
+
+learning_evaluation.ExperimentEvaluationProjection
+    record_kind = experiment_evaluation
+    identity    = <evaluation_fingerprint>
+    availability_day ← evaluation manifest created_at（结果产生瞬间）
+    read        = learning_evaluation.experiment_evaluation_fact(conn, fingerprint, *, as_of)
+```
+
+每个投影在**构造期**算出确定性内容指纹（`json.dumps(sort_keys=True, separators=…)` +
+sha256，`allow_nan=False`），因此调用方即使保留了内部容器的引用也改不动它；指纹覆盖 record
+kind / identity / revision / availability / 核验状态与全部事实内容。
+
+### writer 收敛（selection candidates）
+
+```text
+before: adaptive_selection._upsert + deepseek_advisor 的裸 INSERT   → 2 个生产 writer
+after : adaptive_selection（含新窄接口 record_shadow_proposal）      → 1 个 owner
+```
+
+`deepseek_advisor.run_realtime_tuning` 现在是 **producer / caller**：它提出 bounded proposal，
+由 owner 的窄接口校验并持久化。这个接口刻意**只**做 owner 持久化 —— 不调 LLM、不决定
+proposal 内容、不自动 apply、不碰 outbox、不扩大 selection 权限：
+
+```text
+status / tier 由 owner 独占决定（shadow_proposal / ai_realtime），caller 无法传入
+candidate_params 必须是纯因子权重补丁（键集恰为 {"weights"}）且单因子 ≤ ±3pp
+(run_date, account_id, regime) 已存在时返回既有 id，绝不改写其生命周期
+```
+
+因为 `shadow_proposal` **不在** `apply_candidate` 的资格集合里（`eligible_auto_adjust` /
+`eligible_manual_review` / `eligible_structural_review`），"AI 提案直接生效"在这条链路上
+结构性不可表达。**human apply 边界、`selection_auto_apply_bounded`、outbox 语义与 paper
+account 参数写权限逐字未变。**
+
+### 唯一 adapter
+
+```text
+module      backend/ai_research_strategy_adapter.py
+public API  evidence_ref_from_strategy_projection(projection)   ← 只有这一个
+source_type strategy_research（复用既有 family seam，**不新增** source type）
+source_id   <record_kind>|<owner revision identity>
+as_of       projection.availability_day（owner 已证明的可用性）
+detail      content_fingerprint / contract_version / record_kind（**不**复制 owner payload）
+```
+
+入口只做 `type(projection) is …` **精确**类型判定（三个已批准类型的本类型；dict / `Mapping`
+/ duck-typed / 子类一律 `TypeError`），且不做任何业务计算：不读 DB、不读墙钟、不联网、不调
+LLM，也不重算 candidate eligibility / evaluation fitness / promotion gate / risk reduction /
+selection weights / experiment metrics —— 那些全归各自 owner。
+
+`strategy_research` 已登记进 `ai_research_contract.SUPPORTED_OWNER_ADAPTERS`，一致性由
+`test_ai_research_evidence_ownership_guard` 与 `test_ai_research_contract` 双向强制。
+
+### B2C-6 之后的数字
+
+```text
+selection candidate writer count:                  before = 2（owner + deepseek_advisor）  after = 1（owner）
+risk candidate owner count:                         before = 1   after = 1（未变）
+selection candidate owner count:                    before = 0（连单一 owner 都不成立）  after = 1
+experiment evidence owners:                         before = 0   after = 1（learning_evaluation；dataset 身份仍归 learning_dataset）
+typed adaptive fact contracts:                      before = 0   after = 3
+strategy research adapter count:                    before = 0   after = 1
+strategy adapter production callers:                before = 0   after = 0（预期状态）
+selection writer-origin proof:                      before = 0   after = 1（durable owner marker；词汇不再当来源）
+proposal collision semantics:                        before = 静默返回既有 id
+                                                     after = 幂等重放（完整 factual payload 全同）
+                                                             / 显式 SelectionProposalConflict
+new public exception types:                         1（SelectionProposalConflict）
+implicit current / latest lookup:                   before = 0   after = 0
+lifecycle → verification coupling:                  before = 0   after = 0
+PIT status → verification mapping:                  before = 0   after = 0
+promotion verdict → verification mapping:           before = 0   after = 0
+production modules added / removed:                 1（ai_research_strategy_adapter）/ 0
+new typed projection modules added:                 0（住在既有 owner 模块里）
+new wrappers / new service / manager / facade:      0
+new abstraction layers:                            0
+compatibility paths added:                         0
+DB migration / schema change:                      0（沿用既有 updated_at / evaluation_fingerprint / cutoff）
+deleted roadmap capability:                        0
+weakened original invariant:                       NO
+```
+
+**Roadmap capability removed = 0；Original invariant weakened = NO；Net architecture surface =
+NEUTRAL → minimally INCREASED** —— 增大的那一份是 roadmap 明确要求的
+owner→research 接缝（`ai_research_contract` 不得 import DB-backed 的 `adaptive_risk` /
+`adaptive_selection` / `learning_evaluation`，三个 owner 也不得 import research）加三个
+owner contract，**不是**新增业务 authority。
+
+`learning_evaluation` 的既有 `forbidden_dependencies()` 继续把 `adaptive_risk` /
+`adaptive_selection` 列为禁用前缀，因此 experiment 投影必须住在 `learning_evaluation` 内部
+（不能反向 import 那两个模块）—— 这条依赖约束是**已存在**的，本轮没有放宽它。
+
+### 本轮**没有**迁移 runtime（DEFERRED，不是 REMOVED）
+
+```text
+deepseek_research._candidate_evidence   仍直读 adaptive_risk_candidates / adaptive_selection_candidates /
+                                        adaptive_risk_deployments / adaptive_order_risk_attribution
+deepseek_research._overfit_evidence     仍直读 adaptive_rewards / adaptive_alpha_candidates /
+                                        paper_parameter_versions / paper_nav
+
+candidate_challenge runtime migration = DEFERRED
+overfit_watch     runtime migration = DEFERRED
+```
+
+本轮**不做** dual run（legacy + typed 同时跑），也不让 typed provider 多调一次 ——
+runtime migration 留给 **R27-B2C-8**。
+
+### 已知 OPEN / REQUIRED（未来 convergence 的前置能力，不是"不需要"）
+
+```text
+OPEN / REQUIRED:
+adaptive_rewards availability contract
+    owner 未发布可用性证明列（start/end_date 复制自纸盘 nav_date，只有 created_at）。
+    本轮的处置是"由 canonical learning dataset/evaluation 取代它作为 research 科学证据"，
+    而不是宣称 reward 的经济事实已核验。
+
+historical candidate revisions
+    candidate 行是**可变**的，旧 revision 被覆盖后即不可引用。typed read 因此对
+    updated_at > as_of 返回 UNAVAILABLE（fail closed 的历史语义），代价是**无法**做真正
+    的历史 candidate 回溯。要支持它必须由 owner 新增 additive append-only revision 台账
+    （DB migration），本轮刻意**不**静默新增第二套 ledger。
+
+adaptive_alpha_candidates stable identity
+    每次运行 DELETE + INSERT 重建，id / run_date / generation 都不是长期稳定 evidence
+    identity。要 typed 化必须先由 owner 提供 stable identity + availability +
+    reconstructability，否则就是伪造 identity。
+
+paper_parameter_versions experiment interpretation
+    多 applier 按约定写同一张版本表，缺一个收敛后的 applier 契约来回答"哪次参数变更是哪次
+    实验的结果"。
+
+paper_nav legacy overfit context
+    B2C-4B 已声明 paper_nav 为 legacy / compatibility；overfit_watch 仍把它当上下文使用。
+
+physical database provenance（全 R27 共有）
+    contract-issued typed projection:                      CLOSED
+    caller self-declared identity / as_of / verification:   CLOSED
+    physical database origin / trusted provenance:          OPEN / REQUIRED
+    调用方仍可自造 SQLite fixture 并调用 owner 的 public read 拿到投影。
+```
+
+### B2C-6 的验证（分层）
+
+```text
+L1 FAST     python --version（3.14.x）/ compileall -q backend / ruff check backend / git diff --check
+L2 FOCUSED  adaptive / selection / risk / learning dataset / learning evaluation / promotion
+            science / strategy adapter / research ownership guard / ai_research_contract /
+            network boundary guards（含 deepseek_advisor tuner 回归）
+L3 MUTATION work/r27b2c6_adaptive_experiment_mutation_check.py
+            M-EXP-01 ~ M-EXP-19；baseline=GREEN, 19/19 DETECTED, survived=0, fake=0,
+            timeout=0, restore sha256=PASS
+L4 FINAL    python -m unittest discover -s backend -p "test_*.py"
+            4587 tests, failures=0, errors=0, skipped=5
+```
+
+### review 修正三：测试的墙钟依赖（execution 域，只动测试）
+
+``docker-smoke`` 在 master 上就已经红，失败的是
+``test_execution_verification_wiring.IntradaySellStampTests.test_intraday_t_sell_stamps_execution_verification``
+（``["OUT_OF_SESSION"]``）。根因不是产品缺陷，而是**测试把"跑在星期几"当成了前提**：
+
+```text
+self.today = dt.date.today()            ← runner 墙钟
+execution_planner._session_phase(周末)  → "market_closed"
+⇒ 周末跑 CI 时，10:00 的连续竞价卖点永远进不去
+```
+
+修正是把 fixture 的日期对齐到最近的**交易日**（周一~周五），从而消除这一维度的不确定性：
+**只改测试的日期取值，执行侧的 session 规则一个字都没改**（本 PR 的改动集合里除这条测试
+之外不含任何 execution / session / intraday / tradability 文件）。
+
+### L3 抓到的两个真实缺口（记录，不静默）
+
+```text
+M-EXP-14  第一版**存活**过：当时的 EXP-23 断言同时改动了 availability_day，于是"业务日变了"
+          掩盖了"指纹忽略了 revision identity"。修正后断言只在**同一业务日内**换一个瞬间。
+
+M-EXP-16 / M-EXP-17 / M-EXP-18 / M-EXP-19  由 **review** 先发现（不是 mutation matrix）：
+          来源判据退回词汇归属、槽位冲突被静默吞掉、幂等判据忽略 evidence/reason、
+          删除幂等资格条件（applied 行被当成影子提案的幂等成功）。
+          补上 mutation 之后四条都被对应的永久回归捕获
+          （EXP-04d / EXP-03e / EXP-03f / EXP-03b，runtime 侧还有 EXP-03h），
+          因此这不再依赖下一次人工审核才被发现。
+```
+
+这正是 mutation matrix 的价值：它把"看起来合理、实则空转"的断言变成可执行的缺口；而 review
+发现的漏洞必须**立刻转成 mutation**，否则下一轮回归仍然不会守住它。
