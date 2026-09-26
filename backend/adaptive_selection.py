@@ -426,7 +426,9 @@ def _upsert(conn, payload, now):
              model_id=excluded.model_id,baseline_params=excluded.baseline_params,candidate_params=excluded.candidate_params,
              evidence=excluded.evidence,status=excluded.status,tier=excluded.tier,reason=excluded.reason,updated_at=excluded.updated_at""",
         (payload["run_date"], payload["account_id"], payload["regime"], payload["model_id"],
-         _json(payload["baseline_params"]), _json(payload["candidate_params"]), _json(payload["evidence"]),
+         _json(payload["baseline_params"]), _json(payload["candidate_params"]),
+         # owner 写路径盖章：typed 读侧据此区分"owner 写的行"与"R27-B2C-6 之前的第二 writer 行"。
+         _json(_stamp_owner_origin(payload["evidence"])),
          payload["status"], payload["tier"], payload["reason"], now, now),
     )
     return conn.execute(
@@ -983,6 +985,33 @@ SELECTION_FACT_VERIFICATION_STATUSES = (
 
 SELECTION_CANDIDATE_RECORD_KIND = "selection_candidate"
 
+#: owner 写入候选 ledger 时**自己盖**的 durable 来源记号。
+#:
+#: 为什么需要它：R27-B2C-6 之前这张表有**两个**生产 writer，而旧的
+#: ``deepseek_advisor`` 直写行用的是 ``status='shadow_proposal'`` / ``tier='ai_realtime'``
+#: —— 两个值现在都是 owner 合法词汇。只用词汇做判据就会让新 owner 反向认证那些它明确没有
+#: 独占写入的历史行。因此 writer origin 必须是一条**只有 owner 写路径会盖**的信号。
+#:
+#: 它放在 durable ``evidence`` 列里（owner 已持久化、owner 可严格验证的字段），因此
+#: **不需要 schema migration**，也**不**新增第二套 ledger。写路径**覆盖式**盖章：
+#: caller 传任何同名值都会被 owner 覆盖，因此调用方无法自己"申明"这条记号。
+SELECTION_OWNER_ORIGIN_KEY = "owner_writer_origin"
+SELECTION_OWNER_ORIGIN_MARKER = "adaptive_selection.owner_writer"
+
+
+def _stamp_owner_origin(evidence) -> dict:
+    """owner 写路径的**覆盖式**盖章：caller 传什么都不算数，也不改写 caller 的其它键。"""
+    stamped = dict(evidence or {})
+    stamped[SELECTION_OWNER_ORIGIN_KEY] = SELECTION_OWNER_ORIGIN_MARKER
+    return stamped
+
+
+def _owner_origin_marker(evidence_mapping) -> object:
+    """从已严格解析的 evidence 里取来源记号；缺失返回 ``None``（→ ``unproven``）。"""
+    if not isinstance(evidence_mapping, dict):
+        return None
+    return evidence_mapping.get(SELECTION_OWNER_ORIGIN_KEY)
+
 #: typed 读侧要求的**必需归一列**：少一个就不构成一条可引用的候选事实。
 _SELECTION_REQUIRED_COLUMNS = (
     "id", "run_date", "account_id", "regime", "model_id",
@@ -997,6 +1026,15 @@ class SelectionFactContractError(ValueError):
     JSON 坏掉、必需归一列缺失、``updated_at`` 不是可解析的**带时区**瞬间 —— 一律抛这个
     错误，而不是回落到 ``{}`` / ``run_date`` / ``created_at`` / ``now()``。把"读不出来"
     伪装成"没有候选"或"还在等数据"，正是数据损坏变成业务结论的路径。
+    """
+
+
+class SelectionProposalConflict(ValueError):
+    """唯一槽位已被**另一条**候选占用 —— 本次提案**没有**被持久化。
+
+    刻意与"幂等重放"分开：幂等重放返回既有行 id（内容确实已在 durable ledger 里），
+    冲突则抛错，调用方必须把它记成 not persisted。两者若共用一个返回值，上层就会在什么都没
+    写进去的情况下报告"候选已保存"。
     """
 
 
@@ -1085,23 +1123,38 @@ def _canonical_params(value: Any, *, what: str) -> str:
 
 
 def _selection_fact_verification_status(
-    *, account_id: str, model_id: str, lifecycle_status: str, tier: str,
+    *, origin_marker, account_id: str, model_id: str, lifecycle_status: str, tier: str,
 ) -> str:
-    """owner 自洽性 → 极小 factual verification 闭集。
+    """owner 来源证明 → 极小 factual verification 闭集。
 
-    判据**只**回答"这条记录是不是 owner 自己签发的事实"，由**词汇归属**构成：owner 的
-    account / model / lifecycle / tier 词表只有 owner 自己的 emitter 会产出。四项里任何
-    一项落在 owner 词表之外，说明这行不是本 owner 签发的（legacy 行、别处写入的行、或用了
-    未登记词的新行），于是归 ``unproven``。
+    **第一判据是来源，不是词汇。** 只有 :func:`_stamp_owner_origin` 会盖上
+    :data:`SELECTION_OWNER_ORIGIN_MARKER`，而它只在 owner 自己的写路径
+    (:func:`_upsert` / :func:`record_shadow_proposal`) 上被调用。因此：
+
+    * 行带着 owner 亲自盖的来源记号 → 才可能是 ``recorded``；
+    * 记号缺失（R27-B2C-6 之前的历史行）或取值不是 owner 签发的那一个 → ``unproven``。
+
+    这一条是 R27-B2C-6 review 抓出的**错误修正**。第一版只用**词汇归属**做判据，于是历史上
+    由 ``deepseek_advisor`` **直接 INSERT** 的行（``status='shadow_proposal'``、
+    ``tier='ai_realtime'`` —— 两个值现在都在 owner 词表里）会被判成
+    ``selection_candidate_recorded`` → ``is_verified = True``。那就等于新 owner
+    **反向认证**了一批它明确没有独占写入的行。词表是"这行看起来像 owner 的产物"，不是
+    "这行是 owner 写的"；把前者当后者用，就是把 contract-issued 冒充成 writer-origin。
+
+    词汇检查**保留**，但降级为**自洽性**判据（第二层）：带记号却用了 owner 不签发的
+    account / model / lifecycle / tier 的行仍然是 ``unproven``。
 
     **刻意不看** ``status`` 的业务含义：``eligible_auto_adjust`` 不比 ``waiting_data``
-    更"核验通过"，``applied`` 也不等于"已验证"。lifecycle 只参与"这是不是 owner 的词汇"
-    这一个问题，不参与"这条候选值不值得晋级"。
+    更"核验通过"，``applied`` 也不等于"已验证"。
 
-    已知限制（与 R27 其余 owner 一致，不声称已关闭）：词汇归属证明的是 **contract-issued**，
-    不是 **physical database origin**。调用方仍可自造 SQLite fixture 写入恰好合法词汇的行。
-    见 ``docs/R27_B2C_EVIDENCE_OWNER_MATRIX.md`` 的 OPEN / REQUIRED 条目。
+    已知限制（不声称已关闭）：记号是 durable ``evidence`` 列里的一个字符串，因此未来任何
+    **新的**直接 DB writer 若逐字抄写它，仍能把自己伪装成 owner 行。本层的保证是
+    "历史第二 writer 的行不可能带它" + "owner 的写路径一定会盖它且覆盖 caller 传值"，
+    而 **physical database origin / trusted provenance 仍是 OPEN / REQUIRED**
+    （与 R27 其余三个 owner 接缝逐字一致）。
     """
+    if origin_marker != SELECTION_OWNER_ORIGIN_MARKER:
+        return SELECTION_FACT_OWNER_UNPROVEN
     if not (account_id and model_id and lifecycle_status and tier):
         return SELECTION_FACT_OWNER_UNPROVEN
     if account_id not in ACCOUNT_MODELS:
@@ -1319,6 +1372,10 @@ def _selection_projection_from_row(item: dict, *, revision: dt.datetime, availab
     model_id = str(item.get("model_id") or "").strip()
     lifecycle = str(item.get("status") or "").strip()
     tier = str(item.get("tier") or "").strip()
+    # 严格解析一次，供两处使用：事实内容（canonical 文本）与**来源记号**。
+    evidence_mapping = _strict_mapping(
+        item.get("evidence"), what="selection candidate evidence",
+    )
     return AdaptiveSelectionFactProjection(
         version=SELECTION_FACT_CONTRACT_VERSION,
         record_kind=SELECTION_CANDIDATE_RECORD_KIND,
@@ -1333,8 +1390,8 @@ def _selection_projection_from_row(item: dict, *, revision: dt.datetime, availab
         candidate_params_canonical=_canonical_params(
             item.get("candidate_params"), what="selection candidate candidate_params",
         ),
-        evidence_canonical=_canonical_params(
-            item.get("evidence"), what="selection candidate evidence",
+        evidence_canonical=_canonical_json(
+            evidence_mapping, what="selection candidate evidence",
         ),
         lifecycle_status=lifecycle,
         tier=tier,
@@ -1343,6 +1400,7 @@ def _selection_projection_from_row(item: dict, *, revision: dt.datetime, availab
         availability_day=available_day,
         created_at=str(item.get("created_at") or ""),
         fact_verification_status=_selection_fact_verification_status(
+            origin_marker=_owner_origin_marker(evidence_mapping),
             account_id=account_id, model_id=model_id,
             lifecycle_status=lifecycle, tier=tier,
         ),
@@ -1422,8 +1480,19 @@ def record_shadow_proposal(conn, *, run_date, account_id, regime, model_id,
       被记成一个以后可能被 apply 的候选。**apply 边界仍然独立重新校验一次**：本函数校验的
       是提案自洽性，权威边界依旧是 :func:`apply_candidate` 与人工确认。
 
-    **追加而非改写**：``(run_date, account_id, regime)`` 已存在时返回既有行 id，绝不改写
-    它的生命周期 —— 提案不得把一条已 ``applied`` / ``rolled_back`` 的候选改回影子态。
+    **追加而非改写，但绝不谎报保存成功。** ``(run_date, account_id, regime)`` 是一个 UNIQUE
+    槽位。槽位已被占用时只有两种可能，而它们必须给出**不同**的结论：
+
+    * **同一个请求的幂等重放** —— 既有行的 ``model_id`` / ``baseline_params`` /
+      ``candidate_params`` 与本次提案**逐字相同**：那就不需要再写一次，返回既有行 id，
+      并且这是**明确的幂等成功**（内容确实在 durable ledger 里）。
+    * **另一条候选占用了槽位** —— 内容不同（或既有行损坏、无法比较）：抛
+      :class:`SelectionProposalConflict`，因为本次 proposal **没有**被持久化。
+
+    第二类刻意**不是**静默返回既有 id：那会让 ``run_realtime_tuning`` 在什么都没写进去的
+    情况下报告"仅保存候选"，也就是把 API 层的成功与实际 durable 状态分开。旧的裸 INSERT
+    在 UNIQUE 冲突时至少会失败；收敛后如果改成静默吞掉，就比收敛前更危险。既有行的
+    lifecyle 仍然逐字不变（提案不得把已 ``applied`` / ``rolled_back`` 的候选改回影子态）。
     """
     ensure_schema(conn)
     day = _business_day(run_date, what="shadow proposal run_date")
@@ -1457,26 +1526,64 @@ def record_shadow_proposal(conn, *, run_date, account_id, regime, model_id,
     # 其 owner 读不出来的事实。
     opened = _owner_instant(now, what="shadow proposal now")
     now_text = opened.isoformat(timespec="seconds")
+    # 幂等比较用**canonical** 文本：写入用 ``_json``（不排序），读取用 canonical（排序），
+    # 直接比原始字符串会因为键序不同而把同一份内容判成冲突。
+    baseline_canonical = _canonical_json(baseline, what="shadow proposal baseline_params")
+    candidate_canonical = _canonical_json(candidate, what="shadow proposal candidate_params")
 
-    existing = conn.execute(
-        "SELECT id FROM adaptive_selection_candidates WHERE run_date=? AND account_id=? AND regime=?",
-        (day, account, regime_text),
-    ).fetchone()
-    if existing is not None:
-        return int(existing["id"])
     cursor = conn.execute(
         """INSERT INTO adaptive_selection_candidates(
            run_date,account_id,regime,model_id,baseline_params,candidate_params,evidence,status,tier,reason,created_at,updated_at)
            VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
            ON CONFLICT(run_date,account_id,regime) DO NOTHING""",
         (day, account, regime_text, resolved_model, _json(baseline), _json(candidate),
-         _json(evidence_payload), SHADOW_PROPOSAL_STATUS, AI_REALTIME_TIER,
+         _json(_stamp_owner_origin(evidence_payload)), SHADOW_PROPOSAL_STATUS, AI_REALTIME_TIER,
          str(reason or "")[:500], now_text, now_text),
     )
-    if not cursor.rowcount:
-        row = conn.execute(
-            "SELECT id FROM adaptive_selection_candidates WHERE run_date=? AND account_id=? AND regime=?",
-            (day, account, regime_text),
-        ).fetchone()
-        return int(row["id"])
-    return int(cursor.lastrowid)
+    if cursor.rowcount:
+        return int(cursor.lastrowid)
+
+    # 槽位已被占用：必须区分"幂等重放"与"真的冲突"，绝不用同一个返回值掩盖两者。
+    probe = conn.execute(
+        "SELECT * FROM adaptive_selection_candidates WHERE run_date=? AND account_id=? AND regime=?",
+        (day, account, regime_text),
+    )
+    existing_row = probe.fetchone()
+    if existing_row is None:  # pragma: no cover - DO NOTHING 之后必然存在
+        raise SelectionProposalConflict(
+            f"shadow proposal slot {day}/{account}/{regime_text} vanished during the insert"
+        )
+    item = EV._row_as_dict(probe, existing_row)
+    if _shadow_proposal_is_identical(
+        item, stored_model=resolved_model,
+        baseline_canonical=baseline_canonical, candidate_canonical=candidate_canonical,
+    ):
+        return int(item["id"])
+    raise SelectionProposalConflict(
+        f"shadow proposal slot {day}/{account}/{regime_text} is already occupied by candidate "
+        f"{item.get('id')} with different content — 本次提案**没有**被持久化"
+    )
+
+
+def _shadow_proposal_is_identical(
+    item: dict, *, stored_model: str, baseline_canonical: str, candidate_canonical: str,
+) -> bool:
+    """既有行是否就是**同一条**提案（幂等重放）。
+
+    只比较提案身份与内容（model_id / baseline_params / candidate_params）。刻意**不**比较
+    ``evidence``：同一次 proposer 重跑会带上不同的 confidence / evidence_hash，那不是
+    proposal 内容的差异，也不能因此把一条已存在的提案判成冲突。既有行内容损坏（无法
+    canonical 解析）时返回 ``False`` ⇒ 走 conflict，而不是"读不出来就当它一样"。
+    """
+    if str(item.get("model_id") or "").strip() != stored_model:
+        return False
+    try:
+        stored_baseline = _canonical_params(
+            item.get("baseline_params"), what="shadow proposal existing baseline_params",
+        )
+        stored_candidate = _canonical_params(
+            item.get("candidate_params"), what="shadow proposal existing candidate_params",
+        )
+    except SelectionFactContractError:
+        return False
+    return stored_baseline == baseline_canonical and stored_candidate == candidate_canonical
