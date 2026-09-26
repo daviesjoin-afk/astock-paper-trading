@@ -187,6 +187,19 @@ class PaperFillWritePathGuardTests(unittest.TestCase):
         )
 
 
+def _recent_trading_weekday(day: dt.date) -> dt.date:
+    """最近的一个周一~周五（含当天）。
+
+    **只**用于让 fixture 不依赖"CI 跑在星期几"。它不是交易日历：本仓库的完整交易日历
+    （节假日、半日市）属于 ``tradability_archive`` / 执行层的口径，这里只需要一个
+    "星期几不是周末"的业务日，好让 ``_session_phase`` 落在连续竞价时段。
+    """
+    candidate = day
+    while candidate.weekday() >= 5:
+        candidate -= dt.timedelta(days=1)
+    return candidate
+
+
 class IntradaySellStampTests(unittest.TestCase):
     """运行时：日内做T高抛（``_intraday_sell``）必须盖章。"""
 
@@ -196,7 +209,13 @@ class IntradaySellStampTests(unittest.TestCase):
         self.old_db_path = PT.DB_PATH
         PT.DB_PATH = self.db_path
         PT.init_db()
-        self.today = dt.date.today()
+        # 会话阶段是**业务日**的函数（``execution_planner._session_phase`` 对周末返回
+        # market_closed），因此把 ``today`` 直接绑到 runner 墙钟会让本 fixture 在周末
+        # 永远不可达：周六/日的业务日下，10:00 的连续竞价卖点根本进不去，测试会以
+        # ``["OUT_OF_SESSION"]`` 失败 —— 而那不是产品缺陷，是测试把"跑在星期几"当成了
+        # 前提。这里只把日期对齐到最近的**交易日**（周一~周五），从而消除这一维度的
+        # 不确定性。执行侧的 session 规则一个字都没改（本修复只动测试的日期取值）。
+        self.today = _recent_trading_weekday(dt.date.today())
         self.code = "600001"
 
     def tearDown(self):
