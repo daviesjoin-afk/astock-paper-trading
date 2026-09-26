@@ -1483,18 +1483,25 @@ def record_shadow_proposal(conn, *, run_date, account_id, regime, model_id,
     **追加而非改写，但绝不谎报保存成功。** ``(run_date, account_id, regime)`` 是一个 UNIQUE
     槽位。槽位已被占用时只有两种可能，而它们必须给出**不同**的结论：
 
-    * **同一个请求的幂等重放** —— 既有行的 factual payload 与本次提案**逐字相同**
+    * **同一个 shadow proposal 已经存在** —— 既有行**仍处于** ``shadow_proposal`` /
+      ``ai_realtime``、owner 来源记号有效，且 factual payload 与本次提案**逐项相同**
       （``model_id`` / ``baseline_params`` / ``candidate_params`` / ``evidence`` /
       ``reason``，见 :func:`_shadow_proposal_is_identical`）：那就不需要再写一次，返回既有行
-      id，并且这是**明确的幂等成功**（这份 payload 确实已经在 durable ledger 里）。
-    * **另一条候选占用了槽位** —— **任一** factual 字段不同（或既有行损坏、无法比较）：抛
-      :class:`SelectionProposalConflict`，因为本次 proposal **没有**被持久化。
+      id，并且这是**明确的幂等成功**。
+    * **槽位被别的候选占用** —— 生命周期已经推进（``applied`` / ``rolled_back`` /
+      ``eligible_*`` …）、tier 不同、记号无效、任一 factual 字段不同，或既有行损坏无法比较：
+      抛 :class:`SelectionProposalConflict`，因为本次 proposal **没有**被持久化。
 
-    幂等判据刻意与 owner fact 的 factual payload 对齐，而不是"weights 相同就算同一个请求"：
-    ``evidence`` / ``reason`` 都参与 :meth:`AdaptiveSelectionFactProjection._fingerprint`，
-    owner 已经声明它们变化即事实内容变化。若写入口用更松的定义，同一次重放会在两个 durable
-    层留下不一致的描述（候选 ledger 还是 E1/R1，而 ``adaptive_ai_tuning_runs`` 记着 E2/R2）
-    —— 与"没有真正保存却报告保存"是同一类缺陷，只是更隐蔽。
+    第一类刻意**要求既有行仍处在 shadow 状态**：一条 ``applied`` 的行不等于"这个 shadow
+    proposal 已经存在"，它已经走完了自己的生命周期。若只比 payload 就返回它的 id，上层会报告
+    ``shadow_proposal`` / "仅保存候选"，而 durable row 其实是 ``applied`` —— 本次调用根本没保存
+    任何新的 shadow proposal。
+
+    幂等判据的 factual 部分刻意与 owner fact 的 payload 对齐，而不是"weights 相同就算同一个
+    请求"：``evidence`` / ``reason`` 都参与
+    :meth:`AdaptiveSelectionFactProjection._fingerprint`，owner 已经声明它们变化即事实内容变化。
+    若写入口用更松的定义，同一次重放会在两个 durable 层留下不一致的描述（候选 ledger 还是
+    E1/R1，而 ``adaptive_ai_tuning_runs`` 记着 E2/R2）。
 
     第二类刻意**不是**静默返回既有 id：那会让 ``run_realtime_tuning`` 在什么都没写进去的
     情况下报告"仅保存候选"，也就是把 API 层的成功与实际 durable 状态分开。旧的裸 INSERT
@@ -1574,8 +1581,10 @@ def record_shadow_proposal(conn, *, run_date, account_id, regime, model_id,
     ):
         return int(item["id"])
     raise SelectionProposalConflict(
-        f"shadow proposal slot {day}/{account}/{regime_text} is already occupied by candidate "
-        f"{item.get('id')} with different factual content — 本次提案**没有**被持久化"
+        f"shadow proposal slot {day}/{account}/{regime_text} is not available for this proposal: "
+        f"candidate {item.get('id')} (status={item.get('status')!r}, tier={item.get('tier')!r}) "
+        "既不是一条 factual payload 相同的 shadow proposal，也没有被本次调用改写 —— "
+        "本次提案**没有**被持久化"
     )
 
 
@@ -1583,54 +1592,73 @@ def _shadow_proposal_is_identical(
     item: dict, *, stored_model: str, baseline_canonical: str, candidate_canonical: str,
     evidence_canonical: str, reason_text: str,
 ) -> bool:
-    """既有行是否已经就是**同一条**提案（幂等重放）。
+    """既有行是否就是**同一条、且仍在 shadow 状态的**提案（幂等重放）。
 
-    比较集合必须与 owner fact 的**factual payload** 对齐，即 ``model_id`` /
-    ``baseline_params`` / ``candidate_params`` / ``evidence`` / ``reason``。
+    返回 ``True`` 需要两组条件同时成立，但它们回答的是**不同**问题，因此刻意分开写。
 
-    为什么 ``evidence`` 与 ``reason`` 必须在内：owner contract **自己**把
-    ``evidence_canonical`` 与 ``reason`` 纳入了 :meth:`AdaptiveSelectionFactProjection._fingerprint`
-    —— 也就是说 owner 已经声明"这两个字段变化 ⇒ 事实内容变化"。如果写入口仍然用"weights 相同"
-    定义"同一个请求"，就会出现两个 durable 层对**同一次成功持久化**给出不同描述：
+    **一、幂等资格（既有行本身还得是一条 AI 影子提案）**
 
     ```text
-    旧 candidate:  weights=W, evidence=E1, reason=R1
-    新 proposal:   weights=W, evidence=E2, reason=R2
-    → 返回旧 id（幂等成功），E2/R2 **没有**写进候选 ledger
-    → 但本次 tuning runtime 把 W+E2+R2 记进 adaptive_ai_tuning_runs
-    → 两层对"这次持久化的 candidate fact"说法不一致   ✗
+    status == shadow_proposal
+    tier   == ai_realtime
+    owner 来源记号有效
     ```
 
-    这与"没有真正保存却报告保存"是同一类缺陷，只是更隐蔽。因此任一 factual 字段不同即
-    :class:`SelectionProposalConflict`。
+    这一组是第二轮 review 补上的。原先只比 payload，于是生命周期**已经推进**的 candidate
+    （``applied`` / ``rolled_back`` / ``eligible_*``）占着同一个 UNIQUE 槽位时，只要 payload
+    相同就会被当成"幂等成功"。那会让上层 ``run_realtime_tuning`` 报告
+    ``shadow_proposal`` / "仅保存候选"，而 durable row 其实是 ``applied`` —— 本次调用
+    **没有**保存任何新的 shadow proposal，两层状态再次不一致。
+
+    ``applied`` 的行不等于"这个 shadow proposal 已经存在"：它已经走完了自己的生命周期。
+    因此这种情形必须抛 :class:`SelectionProposalConflict`，而不是返回它的 id。
+
+    **二、factual payload 逐项相同**
+
+    ``model_id`` / ``baseline_params`` / ``candidate_params`` / ``evidence`` / ``reason``。
+    第一版把它写成"weights 相同就算同一个请求"，忽略了 owner contract 已经把
+    ``evidence_canonical`` 与 ``reason`` 计入 :meth:`AdaptiveSelectionFactProjection._fingerprint`
+    —— 用更松的定义会让候选 ledger（E1/R1）与 ``adaptive_ai_tuning_runs``（E2/R2）对同一次
+    成功持久化给出不同描述。
+
+    ``evidence`` 用 **owner 盖章后**的 canonical 文本比较：durable 行里存的就是盖章后的内容，
+    而调用方无法自行提供该记号。
 
     **刻意不比较** ``revision_at`` / ``availability_day`` / ``created_at``：它们由写入口的
     ``now`` 派生，属于"这条事实何时可用"，不是提案断言的 payload —— 一个重放本来就会带新的
     ``now``，要求它们相等会让**任何**重放都变成冲突，也就没有"明确的幂等成功"可言。注意这意味着
     幂等成功返回的行，其 content fingerprint 不会等于"此刻新写一行"会得到的指纹
-    （``revision_at`` 不同）：本函数声明的是"这份 payload 已在 ledger 里"，**不是**"这一行等于
-    一次全新写入"。
+    （``revision_at`` 不同）：本函数声明的是"这份 payload 已在 ledger 里且仍处 shadow 状态"，
+    **不是**"这一行等于一次全新写入"。
 
     既有行内容损坏（无法 canonical 解析）时返回 ``False`` ⇒ 走 conflict，而不是"读不出来就当
     它一样"。
-
-    ``evidence`` 用 **owner 盖章后**的 canonical 文本比较：durable 行里存的就是盖章后的内容，
-    而调用方无法自行提供该记号，因此比较两侧都是 owner 实际会落库的字节。
     """
     if str(item.get("model_id") or "").strip() != stored_model:
         return False
+    # ---- 幂等资格：既有行必须仍是一条 AI 影子提案 ----
+    if str(item.get("status") or "").strip() != SHADOW_PROPOSAL_STATUS:
+        return False
+    if str(item.get("tier") or "").strip() != AI_REALTIME_TIER:
+        return False
     try:
+        stored_evidence_mapping = _strict_mapping(
+            item.get("evidence"), what="shadow proposal existing evidence",
+        )
         stored_baseline = _canonical_params(
             item.get("baseline_params"), what="shadow proposal existing baseline_params",
         )
         stored_candidate = _canonical_params(
             item.get("candidate_params"), what="shadow proposal existing candidate_params",
         )
-        stored_evidence = _canonical_params(
-            item.get("evidence"), what="shadow proposal existing evidence",
-        )
     except SelectionFactContractError:
         return False
+    if _owner_origin_marker(stored_evidence_mapping) != SELECTION_OWNER_ORIGIN_MARKER:
+        return False
+    stored_evidence = _canonical_json(
+        stored_evidence_mapping, what="shadow proposal existing evidence",
+    )
+    # ---- factual payload 逐项相同 ----
     return (
         stored_baseline == baseline_canonical
         and stored_candidate == candidate_canonical

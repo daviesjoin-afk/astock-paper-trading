@@ -1101,7 +1101,8 @@ def run_realtime_tuning(connect_factory, paper_db_path, snapshot_paths, config=N
                 )
                 return {"id": run_id, "status": "proposal_conflict", "applied_ids": [],
                         "proposals": proposals, "response": response, "conflicts": conflicts,
-                        "reason": "候选槽位已被另一条内容不同的候选占用；本次提案未持久化"}
+                        "reason": "候选槽位已被占用，且不是同一条仍处影子状态的提案；"
+                                  "本次提案未持久化"}
             status = "applied" if applied_ids else ("shadow_proposal" if mode == "shadow" else "proposal_only")
             if auto_apply:
                 reason = f"通过确定性门禁；应用{len(applied_ids)}/{len(proposals)}个模拟盘候选"
