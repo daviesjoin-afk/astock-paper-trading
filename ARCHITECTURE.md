@@ -2627,6 +2627,44 @@ updated_at > as_of           → UNAVAILABLE（返回 None）       绝不倒填
 代价是无法做真正的历史 candidate 回溯 —— 那需要 owner 新增 additive append-only revision
 台账（DB migration），本轮刻意**不**静默新增第二套 ledger，而是记为 OPEN PREREQUISITE。
 
+#### writer origin 必须由 owner 签发，词汇不是来源
+
+只用词汇（account / model / lifecycle / tier 是否落在 owner 词表内）判定
+``selection_candidate_recorded`` 是**错的**，而且错在已知的历史事实上：R27-B2C-6 之前这张表
+有两个生产 writer，而旧的 ``deepseek_advisor`` 直写行用的正是
+``status='shadow_proposal'`` / ``tier='ai_realtime'`` —— 两个值现在都是 owner 合法词汇。
+于是新 owner 会反向认证一批它明确没有独占写入的行。
+
+```text
+owner 写路径在 durable ``evidence`` 列的 ``owner_writer_origin`` 键上**覆盖式**盖章
+  （owner 已持久化、可严格验证的字段 ⇒ 不需要 schema migration，也不新增第二套 ledger）
+读侧判据：记号必须逐字等于 owner 签发值 → 否则 unproven
+  （词汇检查降级为自洽性第二层）
+caller 无法申明来源：写路径覆盖同名键
+历史行（两个旧 writer）都没有记号 ⇒ 一律 unproven —— 诚实结论是"不可证"
+```
+
+``adaptive_risk_candidates`` 刻意**没有**这一层，因为它只有一个业务 writer 模块；这条不对称
+由 ``EXP-05b`` 断言（出现第二个业务 writer 就红，届时必须为 risk 补同样的证明）。
+``adaptive_engine._restore_candidate_snapshot`` 是跨库补偿 —— 用动态表名把**同一行**的旧快照
+逐列还原，不产生新的 origin，因此不算第二个 writer。
+
+#### proposal 槽位冲突必须显式拒绝
+
+``record_shadow_proposal`` 的 ``(run_date, account_id, regime)`` 是 UNIQUE 槽位。第一版对
+"槽位已存在"一律返回既有 id，于是在什么都没写进去的情况下让 ``run_realtime_tuning`` 报告
+"仅保存候选" —— API 层的成功与 durable 状态被分开，比收敛前的裸 INSERT 更危险（旧逻辑遇到
+UNIQUE 冲突至少会失败）。现在两种情形给出不同结论：
+
+```text
+既有行内容与本次提案逐字相同  → 明确的幂等成功（返回既有行 id）
+内容不同 / 既有行损坏          → 抛 SelectionProposalConflict：本次提案**没有**被持久化
+```
+
+``run_realtime_tuning`` 逐条捕获并返回 ``persisted_ids`` / ``conflicts``：部分冲突时理由写明
+"N/M 个未持久化"，全部冲突时 ``status='proposal_conflict'``。既有行 lifecycle 逐字不变。
+幂等比较刻意不含 ``evidence``（proposer 重跑会带不同 confidence，那不是提案内容的差异）。
+
 #### 唯一 adapter
 
 ```text
@@ -2660,6 +2698,12 @@ ai_research_contract                                        （不 import 任何
 backend/test_adaptive_experiment_evidence_ownership.py   EXP-01 ~ EXP-18（owner 侧）
     selection ledger 只有一个生产 writer；deepseek_advisor 不再提到该表；
     AI 提案仍不能自动 apply（且提案追加而非改写生命周期）；
+    槽位被内容不同的候选占用 → 显式 SelectionProposalConflict，且不写任何行；
+    tuner 把冲突记成 not persisted（部分冲突写明 N/M，全部冲突 status=proposal_conflict），
+    不得报告"仅保存候选"；
+    writer origin 只能由 owner 的 durable 记号证明 —— 历史第二 writer（含旧 owner 行）一律
+    unproven，caller 无法申明该记号，带记号但词汇不合法仍 unproven；
+    risk ledger 只有一个业务 writer 模块（不对称是被断言的，不是口头的）；
     lifecycle status 与核验闭集零交集（遍历 owner 的**每一个**状态）；
     未知词汇 → unproven 而不是"照样可信"；application_mode 不参与来源证明；
     identity 由 owner 派生且随 revision 移动；updated_at > as_of → None；
@@ -2686,11 +2730,17 @@ factory。`backend/ai_research_contract.py`：`SUPPORTED_OWNER_ADAPTERS` 加入
 `EVIDENCE_SOURCE_STRATEGY_RESEARCH`；`backend/test_ai_research_contract.py` 的
 `ALLOWED_AI_CONSUMERS` 登记新接缝（谁依赖了 AI 必须是一次有意识的决定）。
 
-语义 mutation 在 `work/r27b2c6_adaptive_experiment_mutation_check.py`（M-EXP-01 ~ 15）必须
-全部 CAUGHT（baseline GREEN、survived = 0、fake = 0、timeout = 0、五个被改写文件的 restore
-sha256 一致）。`M-EXP-14` 第一版**存活**过：当时的断言同时改动了 `availability_day`，于是
-"业务日变了"掩盖了"指纹忽略了 revision identity"；修正后断言只在**同一业务日内**换一个瞬间，
-把一条看起来合理、实则空转的断言变成了可执行的缺口。
+语义 mutation 在 `work/r27b2c6_adaptive_experiment_mutation_check.py`（M-EXP-01 ~ 17）必须
+全部 CAUGHT（baseline GREEN、survived = 0、fake = 0、timeout = 0、被改写文件的 restore
+sha256 一致）。其中两条是 **review 先发现、随后立刻转成 mutation** 的：
+
+```text
+M-EXP-14  （第一版存活）内容指纹忽略 revision identity
+M-EXP-16  来源判据退回词汇归属 → 历史第二 writer 的行被判成 owner verified
+M-EXP-17  proposal 槽位冲突被静默吞掉 → runtime 谎报"已保存"
+```
+
+review 发现的漏洞必须立刻变成 mutation，否则下一轮回归仍然守不住它。
 
 **本轮的 runtime 迁移是 DEFERRED，不是 REMOVED**：`deepseek_research._candidate_evidence` /
 `_overfit_evidence` 仍直读 ledger，且**不**做 dual run（legacy + typed 同时跑），也不让 typed
@@ -2917,6 +2967,19 @@ legacy adaptive / experiment runtime 被当成已迁移（R27-B2C-6：
 `adaptive_risk_candidates` / `adaptive_selection_candidates` / `adaptive_rewards` /
 `adaptive_alpha_candidates`。这条 legacy 路径**明确保持 OPEN 且 DEFERRED**；本轮不做 dual run、
 不让 typed provider 多调一次，adapter 的 production 调用点 = 0 是预期状态而不是空转）
+candidate 的 writer origin 由**词汇**推断（R27-B2C-6 review 修正：account / model /
+lifecycle / tier 落在 owner 词表内**不**证明这行是 owner 写的 —— R27-B2C-6 之前
+`deepseek_advisor` 直写行用的正是 `shadow_proposal` / `ai_realtime`，两个值现在都是 owner
+合法词汇，仅凭词汇就会把它们反向认证成 owner verified。来源只能由 owner 在 durable
+`evidence` 列上**覆盖式**盖的 `owner_writer_origin` 记号证明；历史行没有该记号 ⇒ 一律
+`unproven`。且该记号是来源判据而非免检通行证：带记号但用了 owner 不签发词汇的行仍然
+`unproven`）
+proposal 槽位冲突被静默当成保存成功（R27-B2C-6 review 修正：
+`record_shadow_proposal` 的 `(run_date, account_id, regime)` 是 UNIQUE 槽位。既有行内容与
+本次提案逐字相同 → 明确的幂等成功；内容不同或既有行损坏 → 抛 `SelectionProposalConflict`，
+本次提案**没有**被持久化。`run_realtime_tuning` 必须把冲突记成 not persisted ——
+部分冲突时理由写明 N/M 未持久化，全部冲突时 `status='proposal_conflict'`，
+**不得**继续报告"仅保存候选"）
 ```
 
 ### 仅作 review signal（不进入 CI gate）

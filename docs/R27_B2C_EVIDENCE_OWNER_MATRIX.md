@@ -1290,10 +1290,14 @@ R28 Experiment Contract。
 
 ```text
 selection candidate production writer              adaptive_selection owner 一个（收敛前 = 2）
+candidate writer origin                            owner 在 durable evidence 列里盖的来源记号
+                                                   （写路径**覆盖式**盖章，caller 无法申明）
+                                                   —— 词汇**不是** writer provenance
 candidate lifecycle status                         生命周期 / 资格；**不是** owner verification
 candidate revision identity                        <candidate_id>@<updated_at>
 candidate availability_day                         updated_at 归一到 owner 时区（Asia/Shanghai）后的日历日
 run_date                                           标签，永不进 as_of
+proposal 槽位冲突                                  显式 SelectionProposalConflict（与幂等重放分开）
 evaluation availability_day                        evaluation manifest created_at 归一后的日历日
 dataset cutoff                                     内容冻结边界，只作为**事实字段**保留
 evaluation_admitted / evaluation_contract_ok       契约门禁结果；**不是**"策略为真"
@@ -1305,6 +1309,79 @@ malformed JSON / 缺归一列 / naive 时间戳            fail closed（抛错�
 adapter                                            ai_research_strategy_adapter（唯一接缝）
 strategy adapter production callers                 0（预期状态；runtime 迁移 = DEFERRED）
 ```
+
+### review 修正一：writer origin 不能由**词汇**证明
+
+第一版只用**词汇归属**（account / model / lifecycle / tier 是否落在 owner 词表内）判定
+``selection_candidate_recorded``。这是错的，而且错在**已知的历史事实**上：R27-B2C-6 之前
+这张表有两个生产 writer，而旧的 ``deepseek_advisor`` 直写行用的正是
+``status='shadow_proposal'`` / ``tier='ai_realtime'`` —— 两个值现在**都是** owner 的合法
+词汇。于是新 owner 会**反向认证**一批它明确没有独占写入的行：
+
+```text
+historical deepseek direct write  →  合法词汇  →  selection_candidate_recorded
+                                  →  ResearchEvidenceRef.is_verified = True     ✗
+```
+
+词表回答的是"这行**看起来像** owner 的产物"，不是"这行**是** owner 写的"。收敛后正确的做法
+是让 owner 在写路径上盖一条**只有它会盖**的 durable 记号：
+
+```text
+记号位置   durable ``evidence`` 列的 ``owner_writer_origin`` 键
+           （owner 已持久化、owner 可严格验证的字段 ⇒ 不需要 schema migration，
+             也不新增第二套 ledger）
+盖章方式   写路径**覆盖式**盖章：caller 传同名键会被 owner 覆写 ⇒ 调用方无法"申明"来源
+读侧判据   记号**必须**逐字等于 owner 签发值，否则 unproven（词汇检查降级为自洽性第二层）
+```
+
+因此：
+
+```text
+owner 写路径产出的行                                 → selection_candidate_recorded
+R27-B2C-6 之前第二 writer（deepseek 直写）的行       → selection_candidate_unproven
+R27-B2C-6 之前 owner ``_upsert`` 的行               → selection_candidate_unproven
+      （与上一行在数据上**无法区分** —— 两者都没有记号。诚实结论就是"不可证"，
+        而不是"大概率是 owner 写的"。代价是历史行全部 unproven。）
+带记号但用了 owner 不签发词汇的行                    → selection_candidate_unproven
+```
+
+**已知限制（不声称已关闭）**：记号是 durable 列里的一个字符串，因此未来**新增的**直接 DB
+writer 若逐字抄写它，仍能把自己伪装成 owner 行。本层保证的是"历史第二 writer 的行不可能带
+它" + "owner 写路径一定会盖它且覆盖 caller 传值"；
+**physical database origin / trusted provenance 仍是 OPEN / REQUIRED**。
+
+**risk owner 为什么没有这一层**：``adaptive_risk_candidates`` 只有一个业务 writer 模块
+（``adaptive_engine._restore_candidate_snapshot`` 只是把**同一行**的旧快照逐列还原回去，
+不是第二个 origin）。这条不对称是**被断言的**，不是口头的：``EXP-05b`` 把 risk ledger 的
+写入模块集合钉成闭集，出现第二个业务 writer 就红 —— 那时必须为 risk 补上同样一层证明。
+
+### review 修正二：proposal 槽位冲突必须显式拒绝，不能谎报保存
+
+第一版对"``(run_date, account_id, regime)`` 槽位已存在"一律 ``return existing["id"]``。
+后果不是一般性的保守，而是**审计失真**：
+
+```text
+DeepSeek 生成 proposal B → 槽位已被 candidate A 占用 → 直接返回 A.id
+                        → B 没有落库
+                        → run_realtime_tuning 仍报告 shadow_proposal / "仅保存候选"   ✗
+```
+
+API 层的成功与 durable ledger 的实际状态被分开了 —— 这比收敛前的裸 INSERT 更危险（旧逻辑遇到
+UNIQUE 冲突至少会失败）。现在两种情形给出**不同**结论：
+
+```text
+既有行的 model_id / baseline_params / candidate_params 与本次提案逐字相同
+    → 明确的**幂等成功**，返回既有行 id（内容确实已在 durable ledger 里）
+内容不同 / 既有行损坏无法比较
+    → 抛 SelectionProposalConflict：本次 proposal **没有**被持久化
+```
+
+``run_realtime_tuning`` 逐条捕获该异常并记账，返回 ``persisted_ids`` 与 ``conflicts``：
+部分冲突时理由写明"N/M 个未持久化"，全部冲突时 ``status='proposal_conflict'``。既有行的
+lifecycle 仍然逐字不变（提案不得把已 ``applied`` / ``rolled_back`` 的候选改回影子态）。
+幂等比较刻意**不**包含 ``evidence``：同一次 proposer 重跑会带不同的 confidence /
+evidence_hash，那不是 proposal 内容的差异，也不能因此把已存在的提案判成冲突。
+
 
 ### 三个 owner 各自发布的核验闭集
 
@@ -1404,6 +1481,10 @@ experiment evidence owners:                         before = 0   after = 1（lea
 typed adaptive fact contracts:                      before = 0   after = 3
 strategy research adapter count:                    before = 0   after = 1
 strategy adapter production callers:                before = 0   after = 0（预期状态）
+selection writer-origin proof:                      before = 0   after = 1（durable owner marker；词汇不再当来源）
+proposal collision semantics:                        before = 静默返回既有 id
+                                                     after = 幂等重放 / 显式 SelectionProposalConflict
+new public exception types:                         1（SelectionProposalConflict）
 implicit current / latest lookup:                   before = 0   after = 0
 lifecycle → verification coupling:                  before = 0   after = 0
 PIT status → verification mapping:                  before = 0   after = 0
@@ -1485,12 +1566,37 @@ L2 FOCUSED  adaptive / selection / risk / learning dataset / learning evaluation
             science / strategy adapter / research ownership guard / ai_research_contract /
             network boundary guards（含 deepseek_advisor tuner 回归）
 L3 MUTATION work/r27b2c6_adaptive_experiment_mutation_check.py
-            M-EXP-01 ~ M-EXP-15；baseline=GREEN, 15/15 DETECTED, survived=0, fake=0,
+            M-EXP-01 ~ M-EXP-17；baseline=GREEN, 17/17 DETECTED, survived=0, fake=0,
             timeout=0, restore sha256=PASS
 L4 FINAL    python -m unittest discover -s backend -p "test_*.py"
 ```
 
-`M-EXP-14`（内容指纹忽略 revision identity）在第一版**存活**过：当时的断言同时改动了
-`availability_day`，于是"业务日变了"掩盖了"指纹忽略了 revision"。修正后断言只在**同一业务日
-内**换一个瞬间，从而隔离出 revision identity 的贡献 —— 这正是 mutation matrix 的价值：
-它把一条看起来合理、实则空转的断言变成了可执行的缺口。
+### review 修正三：测试的墙钟依赖（execution 域，只动测试）
+
+``docker-smoke`` 在 master 上就已经红，失败的是
+``test_execution_verification_wiring.IntradaySellStampTests.test_intraday_t_sell_stamps_execution_verification``
+（``["OUT_OF_SESSION"]``）。根因不是产品缺陷，而是**测试把"跑在星期几"当成了前提**：
+
+```text
+self.today = dt.date.today()            ← runner 墙钟
+execution_planner._session_phase(周末)  → "market_closed"
+⇒ 周末跑 CI 时，10:00 的连续竞价卖点永远进不去
+```
+
+修正是把 fixture 的日期对齐到最近的**交易日**（周一~周五），从而消除这一维度的不确定性：
+**只改测试的日期取值，执行侧的 session 规则一个字都没改**（本 PR 的改动集合里除这条测试
+之外不含任何 execution / session / intraday / tradability 文件）。
+
+### L3 抓到的两个真实缺口（记录，不静默）
+
+```text
+M-EXP-14  第一版**存活**过：当时的 EXP-23 断言同时改动了 availability_day，于是"业务日变了"
+          掩盖了"指纹忽略了 revision identity"。修正后断言只在**同一业务日内**换一个瞬间。
+
+M-EXP-16 / M-EXP-17  由 **review** 先发现（不是 mutation matrix）：来源判据退回词汇归属，
+          以及槽位冲突被静默吞掉。补上 mutation 之后两条都被对应的永久回归捕获
+          （EXP-04d / EXP-03e），因此这不再依赖下一次人工审核才被发现。
+```
+
+这正是 mutation matrix 的价值：它把"看起来合理、实则空转"的断言变成可执行的缺口；而 review
+发现的漏洞必须**立刻转成 mutation**，否则下一轮回归仍然不会守住它。
