@@ -1483,16 +1483,23 @@ def record_shadow_proposal(conn, *, run_date, account_id, regime, model_id,
     **追加而非改写，但绝不谎报保存成功。** ``(run_date, account_id, regime)`` 是一个 UNIQUE
     槽位。槽位已被占用时只有两种可能，而它们必须给出**不同**的结论：
 
-    * **同一个请求的幂等重放** —— 既有行的 ``model_id`` / ``baseline_params`` /
-      ``candidate_params`` 与本次提案**逐字相同**：那就不需要再写一次，返回既有行 id，
-      并且这是**明确的幂等成功**（内容确实在 durable ledger 里）。
-    * **另一条候选占用了槽位** —— 内容不同（或既有行损坏、无法比较）：抛
+    * **同一个请求的幂等重放** —— 既有行的 factual payload 与本次提案**逐字相同**
+      （``model_id`` / ``baseline_params`` / ``candidate_params`` / ``evidence`` /
+      ``reason``，见 :func:`_shadow_proposal_is_identical`）：那就不需要再写一次，返回既有行
+      id，并且这是**明确的幂等成功**（这份 payload 确实已经在 durable ledger 里）。
+    * **另一条候选占用了槽位** —— **任一** factual 字段不同（或既有行损坏、无法比较）：抛
       :class:`SelectionProposalConflict`，因为本次 proposal **没有**被持久化。
+
+    幂等判据刻意与 owner fact 的 factual payload 对齐，而不是"weights 相同就算同一个请求"：
+    ``evidence`` / ``reason`` 都参与 :meth:`AdaptiveSelectionFactProjection._fingerprint`，
+    owner 已经声明它们变化即事实内容变化。若写入口用更松的定义，同一次重放会在两个 durable
+    层留下不一致的描述（候选 ledger 还是 E1/R1，而 ``adaptive_ai_tuning_runs`` 记着 E2/R2）
+    —— 与"没有真正保存却报告保存"是同一类缺陷，只是更隐蔽。
 
     第二类刻意**不是**静默返回既有 id：那会让 ``run_realtime_tuning`` 在什么都没写进去的
     情况下报告"仅保存候选"，也就是把 API 层的成功与实际 durable 状态分开。旧的裸 INSERT
     在 UNIQUE 冲突时至少会失败；收敛后如果改成静默吞掉，就比收敛前更危险。既有行的
-    lifecyle 仍然逐字不变（提案不得把已 ``applied`` / ``rolled_back`` 的候选改回影子态）。
+    lifecycle 仍然逐字不变（提案不得把已 ``applied`` / ``rolled_back`` 的候选改回影子态）。
     """
     ensure_schema(conn)
     day = _business_day(run_date, what="shadow proposal run_date")
@@ -1530,6 +1537,12 @@ def record_shadow_proposal(conn, *, run_date, account_id, regime, model_id,
     # 直接比原始字符串会因为键序不同而把同一份内容判成冲突。
     baseline_canonical = _canonical_json(baseline, what="shadow proposal baseline_params")
     candidate_canonical = _canonical_json(candidate, what="shadow proposal candidate_params")
+    # 事实 payload 的完整集合：evidence 用**盖章后**的文本（durable 行存的就是它），reason 用
+    # 与落库一致的截断形式。两者都必须参与幂等判定 —— owner fact 自己就把它们纳入了
+    # content fingerprint，写入口用更松的定义会让两层对"这次持久化的 candidate fact"说法不一致。
+    stamped_evidence = _stamp_owner_origin(evidence_payload)
+    evidence_canonical = _canonical_json(stamped_evidence, what="shadow proposal evidence")
+    reason_text = str(reason or "")[:500]
 
     cursor = conn.execute(
         """INSERT INTO adaptive_selection_candidates(
@@ -1537,8 +1550,8 @@ def record_shadow_proposal(conn, *, run_date, account_id, regime, model_id,
            VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
            ON CONFLICT(run_date,account_id,regime) DO NOTHING""",
         (day, account, regime_text, resolved_model, _json(baseline), _json(candidate),
-         _json(_stamp_owner_origin(evidence_payload)), SHADOW_PROPOSAL_STATUS, AI_REALTIME_TIER,
-         str(reason or "")[:500], now_text, now_text),
+         _json(stamped_evidence), SHADOW_PROPOSAL_STATUS, AI_REALTIME_TIER,
+         reason_text, now_text, now_text),
     )
     if cursor.rowcount:
         return int(cursor.lastrowid)
@@ -1557,23 +1570,52 @@ def record_shadow_proposal(conn, *, run_date, account_id, regime, model_id,
     if _shadow_proposal_is_identical(
         item, stored_model=resolved_model,
         baseline_canonical=baseline_canonical, candidate_canonical=candidate_canonical,
+        evidence_canonical=evidence_canonical, reason_text=reason_text,
     ):
         return int(item["id"])
     raise SelectionProposalConflict(
         f"shadow proposal slot {day}/{account}/{regime_text} is already occupied by candidate "
-        f"{item.get('id')} with different content — 本次提案**没有**被持久化"
+        f"{item.get('id')} with different factual content — 本次提案**没有**被持久化"
     )
 
 
 def _shadow_proposal_is_identical(
     item: dict, *, stored_model: str, baseline_canonical: str, candidate_canonical: str,
+    evidence_canonical: str, reason_text: str,
 ) -> bool:
-    """既有行是否就是**同一条**提案（幂等重放）。
+    """既有行是否已经就是**同一条**提案（幂等重放）。
 
-    只比较提案身份与内容（model_id / baseline_params / candidate_params）。刻意**不**比较
-    ``evidence``：同一次 proposer 重跑会带上不同的 confidence / evidence_hash，那不是
-    proposal 内容的差异，也不能因此把一条已存在的提案判成冲突。既有行内容损坏（无法
-    canonical 解析）时返回 ``False`` ⇒ 走 conflict，而不是"读不出来就当它一样"。
+    比较集合必须与 owner fact 的**factual payload** 对齐，即 ``model_id`` /
+    ``baseline_params`` / ``candidate_params`` / ``evidence`` / ``reason``。
+
+    为什么 ``evidence`` 与 ``reason`` 必须在内：owner contract **自己**把
+    ``evidence_canonical`` 与 ``reason`` 纳入了 :meth:`AdaptiveSelectionFactProjection._fingerprint`
+    —— 也就是说 owner 已经声明"这两个字段变化 ⇒ 事实内容变化"。如果写入口仍然用"weights 相同"
+    定义"同一个请求"，就会出现两个 durable 层对**同一次成功持久化**给出不同描述：
+
+    ```text
+    旧 candidate:  weights=W, evidence=E1, reason=R1
+    新 proposal:   weights=W, evidence=E2, reason=R2
+    → 返回旧 id（幂等成功），E2/R2 **没有**写进候选 ledger
+    → 但本次 tuning runtime 把 W+E2+R2 记进 adaptive_ai_tuning_runs
+    → 两层对"这次持久化的 candidate fact"说法不一致   ✗
+    ```
+
+    这与"没有真正保存却报告保存"是同一类缺陷，只是更隐蔽。因此任一 factual 字段不同即
+    :class:`SelectionProposalConflict`。
+
+    **刻意不比较** ``revision_at`` / ``availability_day`` / ``created_at``：它们由写入口的
+    ``now`` 派生，属于"这条事实何时可用"，不是提案断言的 payload —— 一个重放本来就会带新的
+    ``now``，要求它们相等会让**任何**重放都变成冲突，也就没有"明确的幂等成功"可言。注意这意味着
+    幂等成功返回的行，其 content fingerprint 不会等于"此刻新写一行"会得到的指纹
+    （``revision_at`` 不同）：本函数声明的是"这份 payload 已在 ledger 里"，**不是**"这一行等于
+    一次全新写入"。
+
+    既有行内容损坏（无法 canonical 解析）时返回 ``False`` ⇒ 走 conflict，而不是"读不出来就当
+    它一样"。
+
+    ``evidence`` 用 **owner 盖章后**的 canonical 文本比较：durable 行里存的就是盖章后的内容，
+    而调用方无法自行提供该记号，因此比较两侧都是 owner 实际会落库的字节。
     """
     if str(item.get("model_id") or "").strip() != stored_model:
         return False
@@ -1584,6 +1626,14 @@ def _shadow_proposal_is_identical(
         stored_candidate = _canonical_params(
             item.get("candidate_params"), what="shadow proposal existing candidate_params",
         )
+        stored_evidence = _canonical_params(
+            item.get("evidence"), what="shadow proposal existing evidence",
+        )
     except SelectionFactContractError:
         return False
-    return stored_baseline == baseline_canonical and stored_candidate == candidate_canonical
+    return (
+        stored_baseline == baseline_canonical
+        and stored_candidate == candidate_canonical
+        and stored_evidence == evidence_canonical
+        and str(item.get("reason") or "") == reason_text
+    )
