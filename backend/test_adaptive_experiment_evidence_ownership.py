@@ -26,11 +26,13 @@ from __future__ import annotations
 import dataclasses
 import ast
 import inspect
+import json
 import os
 import re
 import sqlite3
 import sys
 import unittest
+from unittest import mock
 
 BACKEND = os.path.dirname(os.path.abspath(__file__))
 if BACKEND not in sys.path:
@@ -39,6 +41,7 @@ if BACKEND not in sys.path:
 import adaptive_risk as AR  # noqa: E402
 import adaptive_selection as ASEL  # noqa: E402
 import ai_research_strategy_adapter as ADAPTER  # noqa: E402
+import deepseek_advisor as DA  # noqa: E402
 import learning_dataset as LD  # noqa: E402
 import learning_evaluation as LE  # noqa: E402
 
@@ -127,6 +130,15 @@ def _risk_conn() -> sqlite3.Connection:
     return _track(conn)
 
 
+def _adaptive_conn() -> sqlite3.Connection:
+    """tuner 用的 adaptive 库：同时具备 advisor 记账表与 selection candidate ledger。"""
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    DA.ensure_schema(conn)
+    ASEL.ensure_schema(conn)
+    return _track(conn)
+
+
 def _weights_patch(model_id: str = "one_to_two", *, spread: float = 0.02):
     """在有界幅度内造一个纯因子权重补丁（键集与 BASE_WEIGHTS 完全一致）。"""
     baseline = {"weights": dict(ASEL.BASE_WEIGHTS[model_id])}
@@ -138,11 +150,22 @@ def _weights_patch(model_id: str = "one_to_two", *, spread: float = 0.02):
     return baseline, {"weights": candidate}
 
 
-def _insert_selection(conn, **overrides) -> int:
+def _insert_selection(conn, *, owner_written=True, **overrides) -> int:
+    """直接写一行 selection candidate。
+
+    ``owner_written=True``（默认）会带上 owner 的 durable 来源记号，代表"这条行是 owner
+    写路径产出的"。要构造 **R27-B2C-6 之前第二 writer 的行**（旧的 ``deepseek_advisor``
+    裸 INSERT）就必须显式 ``owner_written=False`` —— 那个区别是本轮 review 抓出的核心
+    不变量，所以它必须是调用点上的**显式选择**，不能由 helper 悄悄补齐。
+    """
     row = {
         "run_date": "2026-09-18", "account_id": "tq_breakout", "regime": "momentum",
         "model_id": "one_to_two", "baseline_params": "{}", "candidate_params": "{}",
-        "evidence": "{}", "status": "shadow_candidate", "tier": "micro",
+        "evidence": (
+            json.dumps({ASEL.SELECTION_OWNER_ORIGIN_KEY: ASEL.SELECTION_OWNER_ORIGIN_MARKER})
+            if owner_written else "{}"
+        ),
+        "status": "shadow_candidate", "tier": "micro",
         "reason": "r", "created_at": "2026-09-18T09:00:00+08:00",
         "updated_at": "2026-09-21T09:00:00+08:00",
     }
@@ -392,6 +415,126 @@ class SelectionWriterConvergenceTests(_DbTestCase):
         self.assertIsInstance(accepted, int)
 
 
+    def test_EXP_03d_an_occupied_slot_with_different_content_is_an_explicit_conflict(self):
+        """EXP-03d：槽位被**另一条**候选占用时抛冲突，而不是静默返回既有 id。
+
+        这是 R27-B2C-6 review 抓出的第二个 blocker：第一版对"槽位已存在"一律
+        ``return existing["id"]``，于是本次 proposal 根本没落库，runtime 却继续报告
+        "仅保存候选"。收敛前旧逻辑遇到 UNIQUE 冲突至少会失败，收敛后如果静默吞掉就比收敛前
+        更危险 —— API 层的成功与实际 durable 状态被分开了。
+
+        三种情形必须给出**不同**结论：同一提案重放 → 幂等成功；内容不同 → 抛冲突；
+        冲突路径不得改写既有行、也不得留下新行。
+        """
+        conn = _selection_conn()
+        baseline, candidate = _weights_patch()
+        common = dict(
+            run_date="2026-09-18", account_id="tq_breakout", regime="momentum:ai:1030",
+            model_id="one_to_two", baseline_params=baseline,
+            evidence={"source": "DeepSeek"}, reason="bounded",
+        )
+        first = ASEL.record_shadow_proposal(
+            conn, candidate_params=candidate, now="2026-09-21T09:10:00+08:00", **common,
+        )
+        before = dict(conn.execute(
+            f"SELECT * FROM {SELECTION_TABLE} WHERE id=?", (first,),
+        ).fetchone())
+
+        # 同一个提案（内容逐字相同）→ 幂等成功，返回同一个 id，不新增行。
+        _same_baseline, same_candidate = _weights_patch(spread=0.02)
+        self.assertEqual(
+            first,
+            ASEL.record_shadow_proposal(
+                conn, candidate_params=same_candidate, now="2026-09-21T09:20:00+08:00", **common,
+            ),
+        )
+
+        # 内容不同 → 显式冲突，且**什么都不写**。
+        _other_baseline, other_candidate = _weights_patch(spread=0.01)
+        with self.assertRaises(ASEL.SelectionProposalConflict):
+            ASEL.record_shadow_proposal(
+                conn, candidate_params=other_candidate, now="2026-09-21T09:30:00+08:00", **common,
+            )
+        self.assertEqual(
+            1, conn.execute(f"SELECT COUNT(*) FROM {SELECTION_TABLE}").fetchone()[0],
+            "冲突的提案不得留下任何行",
+        )
+        after = dict(conn.execute(
+            f"SELECT * FROM {SELECTION_TABLE} WHERE id=?", (first,),
+        ).fetchone())
+        self.assertEqual(before, after, "冲突不得改写既有行（含 lifecycle 与 updated_at）")
+
+    def test_EXP_03e_the_tuner_reports_a_slot_conflict_instead_of_claiming_it_saved(self):
+        """EXP-03e：``run_realtime_tuning`` 必须把冲突记成 not persisted。
+
+        owner 只在"同一条提案的幂等重放"时返回既有 id，内容不同则抛
+        :class:`SelectionProposalConflict`。若 runtime 把这个异常吞掉后继续报告
+        "仅保存候选"，审计就会看到一次**没有发生**的持久化 —— 这正是 blocker 2 的形态。
+        本测试真实驱动 tuner（只 mock 掉 provider / evidence 这两个外部边界），断言：
+        部分冲突时理由必须写明 1/2 未持久化；全部冲突时状态必须是 ``proposal_conflict``
+        且不得声称保存。
+        """
+        conn = _adaptive_conn()
+        baseline, candidate = _weights_patch()
+        _other_baseline, other_candidate = _weights_patch(spread=0.01)
+        profile = {"profile_date": "2026-09-18", "regime": "momentum",
+                   "quality": "valid_close", "valid_rows": 5000}
+        accounts = [{"account_id": "tq_breakout", "version": "v1", "style": "s",
+                     "weights": {}, "entry_score_delta": 0.0, "conditions": {}}]
+
+        def response_for(*candidates):
+            return {"decision": "propose", "confidence": 90, "proposals": [
+                {"account_id": "tq_breakout", "reason": "r", "weights": item["weights"]}
+                for item in candidates
+            ]}
+
+        def run(target_conn, response):
+            with mock.patch.object(DA, "enabled", return_value=True), \
+                    mock.patch.object(DA, "configured", return_value=True), \
+                    mock.patch.object(DA, "_now", return_value="2026-09-18T10:30:00+08:00"), \
+                    mock.patch.object(DA, "_tuning_accounts", return_value=accounts), \
+                    mock.patch.object(
+                        DA, "collect_evidence",
+                        return_value=({"market_snapshot": {}}, "h" * 8)), \
+                    mock.patch.object(DA, "call_json", return_value=(response, 0, 0)):
+                return DA.run_realtime_tuning(
+                    lambda: target_conn, "unused-paper.db", [],
+                    config={"llm_realtime_require_cross_source": False},
+                    profile=profile,
+                )
+
+        # (a) 两条内容不同的提案落在同一个槽位 → 1 条持久化、1 条冲突。
+        result = run(conn, response_for(candidate, other_candidate))
+        self.assertEqual(1, len(result["persisted_ids"]))
+        self.assertEqual(1, len(result["conflicts"]))
+        self.assertIn("1/2", result["reason"])
+        self.assertIn("未持久化", result["reason"])
+        self.assertNotIn("仅保存候选，未同日应用", result["reason"])
+        self.assertEqual(
+            1, conn.execute(f"SELECT COUNT(*) FROM {SELECTION_TABLE}").fetchone()[0],
+        )
+
+        # (b) 槽位已被一条内容不同的 owner 候选占用 → 全部冲突，状态必须显式。
+        #     用新的库，避免 (a) 已经占用了同一个槽位。
+        blocked_conn = _adaptive_conn()
+        ASEL.record_shadow_proposal(
+            blocked_conn, run_date="2026-09-18", account_id="tq_breakout",
+            regime="momentum:ai:1030", model_id="one_to_two",
+            baseline_params=baseline, candidate_params=candidate,
+            evidence={"source": "other"}, reason="occupied",
+            now="2026-09-18T10:29:00+08:00",
+        )
+        blocked = run(blocked_conn, response_for(other_candidate))
+        self.assertEqual("proposal_conflict", blocked["status"])
+        self.assertEqual([], blocked["applied_ids"])
+        self.assertEqual([], blocked.get("persisted_ids", []))
+        self.assertTrue(blocked["conflicts"])
+        self.assertEqual(
+            1, blocked_conn.execute(f"SELECT COUNT(*) FROM {SELECTION_TABLE}").fetchone()[0],
+            "冲突路径不得写入任何行",
+        )
+
+
 class CandidateLifecycleIsNotVerificationTests(_DbTestCase):
     """EXP-04：lifecycle status 不是核验。"""
 
@@ -474,6 +617,100 @@ class CandidateLifecycleIsNotVerificationTests(_DbTestCase):
         self.assertEqual("zhang.san@ops", fact.application_mode)
         self.assertNotIn("zhang.san@ops", fact.fact_verification_status)
 
+    def test_EXP_04d_legacy_second_writer_rows_are_unproven_not_recorded(self):
+        """EXP-04d：历史**第二 writer**的行必须是 ``unproven``，哪怕词汇完全合法。
+
+        这是 R27-B2C-6 review 抓出的第一个 blocker，也是本轮最重要的一条。收敛前这张表有
+        两个生产 writer，而旧的 ``deepseek_advisor`` 直写行用的正是
+        ``status='shadow_proposal'`` / ``tier='ai_realtime'`` —— 两个值现在都是 owner 的
+        合法词汇。第一版只用**词汇归属**做判据，于是这些行会被判成
+        ``selection_candidate_recorded`` → ``is_verified = True``：新 owner **反向认证**了
+        一批它明确没有独占写入的行。
+
+        词表回答的是"这行看起来像 owner 的产物"，不是"这行是 owner 写的"。因此 writer
+        origin 必须来自一条只有 owner 写路径会盖的 durable 记号；本测试把两个历史 writer
+        的形状**都**钉住，并附一条正向对照（owner 行仍然 ``recorded``），证明这不是"什么都
+        判 unproven"。
+        """
+        conn = _selection_conn()
+        # 旧 deepseek_advisor 裸 INSERT 的形状（含它写下的 status / tier）。
+        legacy_ai = _insert_selection(
+            conn, owner_written=False, regime="momentum:ai:0900",
+            status="shadow_proposal", tier="ai_realtime",
+            candidate_params='{"weights":{"flow":0.25}}',
+        )
+        # 旧 owner ``_upsert`` 的行同样在记号引入之前 —— 无法与上一行区分，因此也必须 unproven。
+        legacy_owner = _insert_selection(
+            conn, owner_written=False, regime="momentum",
+            status="eligible_auto_adjust", tier="micro",
+        )
+        for label, candidate_id in (("legacy ai direct write", legacy_ai),
+                                    ("pre-marker owner row", legacy_owner)):
+            with self.subTest(row=label):
+                fact = ASEL.selection_candidate_fact(conn, candidate_id, as_of="2026-09-21")
+                self.assertEqual(
+                    ASEL.SELECTION_FACT_OWNER_UNPROVEN, fact.fact_verification_status,
+                    "没有 owner 来源记号的行不得被认证成 owner 事实",
+                )
+                ref = ADAPTER.evidence_ref_from_strategy_projection(fact)
+                self.assertFalse(ref.is_verified)
+
+        # 正向对照：带记号（默认 owner_written=True）的同形行仍然 recorded。
+        owner_row = _insert_selection(
+            conn, regime="momentum:ai:0900:owner",
+            status="shadow_proposal", tier="ai_realtime",
+        )
+        self.assertEqual(
+            ASEL.SELECTION_FACT_RECORDED,
+            ASEL.selection_candidate_fact(conn, owner_row, as_of="2026-09-21")
+            .fact_verification_status,
+        )
+
+    def test_EXP_04e_the_caller_cannot_supply_the_owner_origin_marker(self):
+        """EXP-04e：来源记号由 owner 覆盖式盖章，调用方无法自己"声明"。
+
+        否则 ``deepseek_advisor`` 只要在 evidence 里塞一个同名键就能把自己提升成 owner 行 ——
+        那会把"谁来证明来源"重新交回 producer。同时断言：带记号但用了 owner 不签发的词汇的
+        行仍然是 ``unproven``（记号是来源判据，不是"免检通行证"）。
+        """
+        conn = _selection_conn()
+        baseline, candidate = _weights_patch()
+        for forge in ("forged.by.caller", ASEL.SELECTION_OWNER_ORIGIN_MARKER):
+            with self.subTest(forge=forge):
+                candidate_id = ASEL.record_shadow_proposal(
+                    conn, run_date="2026-09-18", account_id="tq_breakout",
+                    regime=f"momentum:ai:10{len(forge) % 10}", model_id="one_to_two",
+                    baseline_params=baseline, candidate_params=candidate,
+                    evidence={"source": "x", ASEL.SELECTION_OWNER_ORIGIN_KEY: forge},
+                    reason="r", now="2026-09-21T09:10:00+08:00",
+                )
+                raw = conn.execute(
+                    f"SELECT evidence FROM {SELECTION_TABLE} WHERE id=?", (candidate_id,),
+                ).fetchone()[0]
+                # 盖章是**覆盖式**：caller 传的值（包括逐字抄写正确值）都被 owner 覆写，
+                # 因此"调用方申明来源"这件事在 API 上不可表达。
+                self.assertEqual(
+                    1, raw.count(ASEL.SELECTION_OWNER_ORIGIN_KEY),
+                    "evidence 里只能有一个来源记号（owner 覆盖 caller 的同名键）",
+                )
+                if forge != ASEL.SELECTION_OWNER_ORIGIN_MARKER:
+                    self.assertNotIn(forge, raw, "caller 传入的伪造记号必须被覆盖")
+                self.assertEqual(
+                    ASEL.SELECTION_FACT_RECORDED,
+                    ASEL.selection_candidate_fact(conn, candidate_id, as_of="2026-09-21")
+                    .fact_verification_status,
+                )
+
+        # 记号是来源判据，不是免检：带记号 + owner 不签发的词汇 → 仍然 unproven。
+        crafted = _insert_selection(
+            conn, regime="momentum:ai:0800", status="some_foreign_status",
+        )
+        self.assertEqual(
+            ASEL.SELECTION_FACT_OWNER_UNPROVEN,
+            ASEL.selection_candidate_fact(conn, crafted, as_of="2026-09-21")
+            .fact_verification_status,
+        )
+
 
 class CandidateIdentityTests(_DbTestCase):
     """EXP-05 ~ EXP-07：identity 只能由 owner 派生，且随 revision 变化。"""
@@ -533,6 +770,36 @@ class CandidateIdentityTests(_DbTestCase):
         self.assertIsNone(
             ASEL.selection_candidate_fact(conn, candidate_id, as_of="2026-09-21")
         )
+
+
+    def test_EXP_05b_the_risk_ledger_has_a_single_business_writer_module(self):
+        """EXP-05b：risk candidate ledger 只有一个业务 writer 模块 —— 因此它**不需要**
+        selection 那一层 writer-origin 记号。
+
+        R27-B2C-6 review 指出 selection 侧必须有一条只有 owner 写路径会盖的 durable 记号，
+        否则历史第二 writer 的行会被反向认证。risk 侧刻意**没有**加同一层，理由必须是
+        **可执行的不对称**而不是口头说明：这条断言把写 ``adaptive_risk_candidates`` 的模块
+        钉成闭集，一旦出现第二个业务 writer 就红 —— 届时必须为 risk 补上同样的证明。
+
+        跨库补偿（``adaptive_engine._restore_candidate_snapshot``）刻意**不**算第二个 origin：
+        它用**动态**表名把**同一行**的旧快照逐列还原回去，不产生新的来源。这一点也一并断言
+        （engine 里不得出现对这两张表的字面写语句）。
+        """
+        self.assertEqual(
+            {"adaptive_risk.py"}, _candidate_table_writers(RISK_TABLE),
+            "risk ledger 出现第二个业务 writer —— 那时必须为 risk 补上 writer-origin 证明",
+        )
+        engine_source = _source("adaptive_engine.py")
+        for literal in (f"INTO {RISK_TABLE}", f"UPDATE {RISK_TABLE}",
+                        f"INTO {SELECTION_TABLE}", f"UPDATE {SELECTION_TABLE}"):
+            self.assertNotIn(
+                literal, engine_source,
+                "补偿路径必须走动态表名；出现字面写语句意味着它已经是第二个业务 writer",
+            )
+        # 非空性：补偿路径确实存在，且确实用动态表名（否则上面的否定断言会空转）。
+        self.assertIn("{candidate_table}", engine_source)
+        self.assertIn(RISK_TABLE, engine_source)
+        self.assertIn(SELECTION_TABLE, engine_source)
 
 
 class CandidatePITTests(_DbTestCase):

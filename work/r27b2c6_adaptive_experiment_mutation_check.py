@@ -1,10 +1,12 @@
 # -*- coding: utf-8 -*-
 """R27-B2C-6 —— adaptive / experiment owner fact 与 strategy adapter 的 **mutation matrix**。
 
-覆盖 ``M-EXP-01`` ~ ``M-EXP-15``，逐条对应本轮四条要钉死的不变量：
+覆盖 ``M-EXP-01`` ~ ``M-EXP-17``，逐条对应本轮要钉死的不变量：
 
 ```text
 selection candidate 只有一个 production writer（owner 自己）
+candidate 的 writer origin 只能由 owner 的 durable 记号证明（词汇不是来源）
+proposal 槽位冲突必须显式拒绝，不得谎报"已保存"
 candidate lifecycle status  ≠ owner verification
 run_date                    ≠ revision availability
 dataset cutoff              ≠ evaluation availability
@@ -13,6 +15,16 @@ malformed / 不可证           fail closed（绝不 {} / latest / created_at �
 adapter 只接受已批准的精确类型，且不接受 caller 命名的 identity / as_of
 registry 与真实 factory 双向一致
 ```
+
+────────────── review 后新增的两条（blocker 1 / blocker 2） ──────────────
+
+```text
+M-EXP-16  来源判据退回"只看词汇" → 历史 DeepSeek 直写行被判成 owner verified
+M-EXP-17  proposal 槽位冲突被静默吞掉 → runtime 报告"仅保存候选"但实际没写
+```
+
+这两条是 R27-B2C-6 review 抓出的真实缺陷，因此它们的 mutation 必须**先红**：
+``M-EXP-16`` 由 ``EXP-04d`` 捕获，``M-EXP-17`` 由 ``EXP-03e``（真实驱动 tuner）捕获。
 
 ────────────── 与 brief 的偏差（记录，不静默） ──────────────
 
@@ -89,12 +101,22 @@ T_EXP_02 = _owner("SelectionWriterConvergenceTests."
                   "test_EXP_02_deepseek_advisor_never_writes_the_selection_ledger")
 T_EXP_03 = _owner("SelectionWriterConvergenceTests."
                   "test_EXP_03_ai_proposal_still_cannot_auto_apply")
+T_EXP_03D = _owner("SelectionWriterConvergenceTests."
+                   "test_EXP_03d_an_occupied_slot_with_different_content_is_an_explicit_conflict")
+T_EXP_03E = _owner("SelectionWriterConvergenceTests."
+                   "test_EXP_03e_the_tuner_reports_a_slot_conflict_instead_of_claiming_it_saved")
 T_EXP_04 = _owner("CandidateLifecycleIsNotVerificationTests."
                   "test_EXP_04_candidate_lifecycle_status_never_changes_verification")
 T_EXP_04B = _owner("CandidateLifecycleIsNotVerificationTests."
                    "test_EXP_04b_unknown_vocabulary_is_unproven_not_verified")
+T_EXP_04D = _owner("CandidateLifecycleIsNotVerificationTests."
+                   "test_EXP_04d_legacy_second_writer_rows_are_unproven_not_recorded")
+T_EXP_04E = _owner("CandidateLifecycleIsNotVerificationTests."
+                   "test_EXP_04e_the_caller_cannot_supply_the_owner_origin_marker")
 T_EXP_05 = _owner("CandidateIdentityTests."
                   "test_EXP_05_risk_candidate_identity_comes_from_the_owner_revision")
+T_EXP_05B = _owner("CandidateIdentityTests."
+                   "test_EXP_05b_the_risk_ledger_has_a_single_business_writer_module")
 T_EXP_06 = _owner("CandidateIdentityTests."
                   "test_EXP_06_selection_candidate_identity_comes_from_the_owner_revision")
 T_EXP_07 = _owner("CandidateIdentityTests."
@@ -152,7 +174,12 @@ T_EXP_28 = _adapter("DeferredLegacyRuntimeTests."
 #: 点名的永久回归目标：不在本 matrix 的 mutation 里，但必须与 mutation target 一起先证明
 #: 在**干净源码**上 GREEN。否则"这些目标也验过"只是句话。
 BASELINE_ONLY_TARGETS = (
+    T_EXP_03,
+    T_EXP_03D,
+    T_EXP_04B,
+    T_EXP_04E,
     T_EXP_05,
+    T_EXP_05B,
     T_EXP_06,
     T_EXP_07,
     T_EXP_12,
@@ -173,23 +200,38 @@ BASELINE_ONLY_TARGETS = (
 
 
 # --- mutation anchors（逐字节，必须恰好命中一次）--------------------------------
-#: ``deepseek_advisor`` 现在通过 owner 的窄接口持久化影子候选。
+#: ``deepseek_advisor`` 现在通过 owner 的窄接口持久化影子候选，并把**冲突**显式记账。
 DS_OWNER_CALL = (
-    "                selection.record_shadow_proposal(\n"
-    "                    conn,\n"
-    "                    run_date=str(\n"
-    '                        profile.get("profile_date") or dt.datetime.now(TZ).date().isoformat()\n'
-    "                    )[:10],\n"
-    "                    account_id=account_id,\n"
-    "                    regime=regime,\n"
-    "                    model_id=model_id,\n"
-    "                    baseline_params=baseline,\n"
-    "                    candidate_params=candidate,\n"
-    '                    evidence={"source": "DeepSeek", "confidence": item["confidence"],\n'
-    '                              "evidence_hash": evidence_hash},\n'
-    '                    reason=item["reason"],\n'
-    "                    now=now,\n"
-    "                )\n"
+    "                    persisted_ids.append(selection.record_shadow_proposal(\n"
+    "                        conn,\n"
+    "                        run_date=str(\n"
+    "                            profile.get(\"profile_date\") or "
+    "dt.datetime.now(TZ).date().isoformat()\n"
+    "                        )[:10],\n"
+    "                        account_id=account_id,\n"
+    "                        regime=regime,\n"
+    "                        model_id=model_id,\n"
+    "                        baseline_params=baseline,\n"
+    "                        candidate_params=candidate,\n"
+    '                        evidence={"source": "DeepSeek", "confidence": item["confidence"],\n'
+    '                                  "evidence_hash": evidence_hash},\n'
+    '                        reason=item["reason"],\n'
+    "                        now=now,\n"
+    "                    ))\n"
+)
+
+#: owner 来源记号检查 —— writer origin 的**唯一**判据。
+SEL_ORIGIN_CHECK = (
+    "    if origin_marker != SELECTION_OWNER_ORIGIN_MARKER:\n"
+    "        return SELECTION_FACT_OWNER_UNPROVEN\n"
+)
+
+#: 槽位冲突的显式拒绝（与幂等成功分开）。
+SEL_PROPOSAL_CONFLICT = (
+    "    raise SelectionProposalConflict(\n"
+    "        f\"shadow proposal slot {day}/{account}/{regime_text} is already occupied by candidate \"\n"
+    "        f\"{item.get('id')} with different content — 本次提案**没有**被持久化\"\n"
+    "    )\n"
 )
 
 #: selection owner 的核验闭集判据尾部。
@@ -294,19 +336,20 @@ MUTATIONS: list[dict] = [
         "file": ADVISOR_FILE,
         "old": DS_OWNER_CALL,
         "new": (
-            "                conn.execute(\n"
-            '                    """INSERT INTO adaptive_selection_candidates(\n'
-            "                       run_date,account_id,regime,model_id,baseline_params,"
+            "                    persisted_ids.append(conn.execute(\n"
+            '                        """INSERT INTO adaptive_selection_candidates(\n'
+            "                           run_date,account_id,regime,model_id,baseline_params,"
             "candidate_params,evidence,status,tier,reason,created_at,updated_at)\n"
-            '                       VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",  # MUTANT\n'
-            "                    (str(profile.get(\"profile_date\") or "
+            '                           VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",  # MUTANT\n'
+            "                        (str(profile.get(\"profile_date\") or "
             "dt.datetime.now(TZ).date().isoformat())[:10],\n"
-            "                     account_id, regime, model_id,\n"
-            "                     json.dumps(baseline, ensure_ascii=False), "
+            "                         account_id, regime, model_id,\n"
+            "                         json.dumps(baseline, ensure_ascii=False), "
             "json.dumps(candidate, ensure_ascii=False),\n"
-            '                     json.dumps({"source": "DeepSeek"}, ensure_ascii=False),\n'
-            '                     "shadow_proposal", "ai_realtime", item["reason"], now, now),\n'
-            "                )\n"
+            '                         json.dumps({"source": "DeepSeek"}, ensure_ascii=False),\n'
+            '                         "shadow_proposal", "ai_realtime", '
+            'item["reason"], now, now),\n'
+            "                    ).lastrowid)\n"
         ),
         "test": T_EXP_02,
         "desc": "deepseek_advisor 恢复对 selection ledger 的直接 INSERT（双 writer 复发）",
@@ -504,6 +547,30 @@ MUTATIONS: list[dict] = [
         ),
         "test": T_EXP_25,
         "desc": "SUPPORTED_OWNER_ADAPTERS 与真实 factory 漂移",
+    },
+    {
+        "id": "M-EXP-16",
+        # 回到"只看词汇"的来源判据 —— 历史第二 writer 的行会被反向认证成 owner 事实。
+        # 这是 R27-B2C-6 review 抓出的 blocker 1。
+        "file": SELECTION_FILE,
+        "old": SEL_ORIGIN_CHECK,
+        "new": (
+            "    if origin_marker != SELECTION_OWNER_ORIGIN_MARKER and False:"
+            "  # MUTANT —— 回到只看词汇\n"
+            "        return SELECTION_FACT_OWNER_UNPROVEN\n"
+        ),
+        "test": T_EXP_04D,
+        "desc": "来源判据退回词汇归属（旧 DeepSeek 直写行被判成 owner verified）",
+    },
+    {
+        "id": "M-EXP-17",
+        # 把槽位冲突静默当成幂等成功 —— runtime 会报告"仅保存候选"但实际什么都没写。
+        # 这是 R27-B2C-6 review 抓出的 blocker 2。
+        "file": SELECTION_FILE,
+        "old": SEL_PROPOSAL_CONFLICT,
+        "new": "    return int(item[\"id\"])  # MUTANT —— 冲突被当成幂等成功\n",
+        "test": T_EXP_03E,
+        "desc": "proposal 槽位冲突被静默吞掉并谎报保存成功",
     },
 ]
 
