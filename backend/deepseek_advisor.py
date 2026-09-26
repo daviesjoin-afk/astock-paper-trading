@@ -1047,6 +1047,8 @@ def run_realtime_tuning(connect_factory, paper_db_path, snapshot_paths, config=N
                                              "no_change", "未生成通过白名单和幅度限制的参数变更", response=response)
                 return {"id": run_id, "status": "no_change", "applied_ids": [], "response": response}
             now = _now()
+            persisted_ids = []
+            conflicts = []
             for item in proposals:
                 account_id = item["account_id"]
                 model_id = selection.ACCOUNT_MODELS[account_id]
@@ -1069,24 +1071,45 @@ def run_realtime_tuning(connect_factory, paper_db_path, snapshot_paths, config=N
                 # selection owner 的窄接口持久化，status / tier 由 owner 独占决定 ——
                 # 因此"AI 提案直接生效"在这里结构性不可表达（见 owner 侧
                 # ``record_shadow_proposal`` 与 ``SHADOW_PROPOSAL_STATUS``）。
-                selection.record_shadow_proposal(
-                    conn,
-                    run_date=str(
-                        profile.get("profile_date") or dt.datetime.now(TZ).date().isoformat()
-                    )[:10],
-                    account_id=account_id,
-                    regime=regime,
-                    model_id=model_id,
-                    baseline_params=baseline,
-                    candidate_params=candidate,
-                    evidence={"source": "DeepSeek", "confidence": item["confidence"],
-                              "evidence_hash": evidence_hash},
-                    reason=item["reason"],
-                    now=now,
+                #
+                # 槽位冲突**必须显式记账**：owner 只在"同一条提案的幂等重放"时返回既有 id，
+                # 内容不同则抛 SelectionProposalConflict。这里绝不能把冲突吞掉后继续报告
+                # "仅保存候选" —— 那会让 API 层的成功与 durable 状态分开。
+                try:
+                    persisted_ids.append(selection.record_shadow_proposal(
+                        conn,
+                        run_date=str(
+                            profile.get("profile_date") or dt.datetime.now(TZ).date().isoformat()
+                        )[:10],
+                        account_id=account_id,
+                        regime=regime,
+                        model_id=model_id,
+                        baseline_params=baseline,
+                        candidate_params=candidate,
+                        evidence={"source": "DeepSeek", "confidence": item["confidence"],
+                                  "evidence_hash": evidence_hash},
+                        reason=item["reason"],
+                        now=now,
+                    ))
+                except selection.SelectionProposalConflict as exc:
+                    conflicts.append({"account_id": account_id, "reason": str(exc)[:300]})
+            if conflicts and not persisted_ids:
+                run_id = _tuning_failure_row(
+                    conn, trigger, mode, profile, evidence, evidence_hash, "proposal_conflict",
+                    f"{len(conflicts)}/{len(proposals)} 个提案因候选槽位冲突未持久化",
+                    response=response, proposals=proposals,
                 )
+                return {"id": run_id, "status": "proposal_conflict", "applied_ids": [],
+                        "proposals": proposals, "response": response, "conflicts": conflicts,
+                        "reason": "候选槽位已被另一条内容不同的候选占用；本次提案未持久化"}
             status = "applied" if applied_ids else ("shadow_proposal" if mode == "shadow" else "proposal_only")
-            reason = (f"通过确定性门禁；应用{len(applied_ids)}/{len(proposals)}个模拟盘候选"
-                      if auto_apply else "通过确定性门禁；仅保存候选，未同日应用")
+            if auto_apply:
+                reason = f"通过确定性门禁；应用{len(applied_ids)}/{len(proposals)}个模拟盘候选"
+            elif conflicts:
+                reason = (f"通过确定性门禁；仅保存候选 {len(persisted_ids)}/{len(proposals)} 个，"
+                          f"{len(conflicts)} 个因候选槽位冲突未持久化")
+            else:
+                reason = "通过确定性门禁；仅保存候选，未同日应用"
             latency = round((time.monotonic() - started_clock) * 1000)
             cursor = conn.execute(
                 """INSERT INTO adaptive_ai_tuning_runs(
@@ -1098,7 +1121,8 @@ def run_realtime_tuning(connect_factory, paper_db_path, snapshot_paths, config=N
                  json.dumps(applied_ids), reason, latency, now, _now()),
             )
             return {"id": int(cursor.lastrowid), "status": status, "applied_ids": applied_ids,
-                    "proposals": proposals, "response": response, "reason": reason}
+                    "proposals": proposals, "response": response, "reason": reason,
+                    "persisted_ids": persisted_ids, "conflicts": conflicts}
         except Exception as exc:
             run_id = _tuning_failure_row(conn, trigger, mode, profile, evidence, evidence_hash,
                                          "failed", f"{type(exc).__name__}: {exc}", response=response,
