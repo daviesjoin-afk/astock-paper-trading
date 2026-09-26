@@ -186,6 +186,33 @@ reason 用与落库一致的截断形式（[:500]）比较
     本层声明的是"这份 payload 已在 ledger 里"，**不是**"这一行等于一次全新写入"。
 ```
 
+### 修正二（续·二）：幂等成功还要求既有行**仍处于 shadow 状态**
+
+payload 对齐之后仍有同类缺口：`_shadow_proposal_is_identical()` 完全不看既有 row 的
+lifecycle。于是生命周期**已经推进**的 candidate 占着同一个 UNIQUE 槽位时，只要 payload 相同
+就会被返回 id：
+
+```text
+existing candidate:  payload = P, lifecycle = applied
+new tuning request:  payload = P, requested lifecycle = shadow_proposal
+→ record_shadow_proposal() 返回 applied 行的 id
+→ run_realtime_tuning() 把它记进 persisted_ids
+→ 报告 status = shadow_proposal / "仅保存候选"
+但 durable row 实际是 status = applied，且本次调用**没有**保存任何新的 shadow proposal   ✗
+```
+
+owner 不把 `applied` 改回 `shadow_proposal` 是对的（那次改动本身没问题），问题在上层据此报告
+"已保存"。因此幂等判据拆成两组条件，回答的是不同问题：
+
+```text
+幂等资格       status == shadow_proposal、tier == ai_realtime、owner 来源记号有效
+factual 相同   model_id / baseline_params / candidate_params / evidence / reason
+```
+
+一条 `applied` 的行不等于"这个 shadow proposal 已经存在" —— 它已经走完了自己的生命周期。
+所以幂等重放的准确含义是"**同一条仍处于 shadow 状态的**提案已经存在"，而不是"历史上曾经有过
+相同 payload 的某个 candidate"。
+
 ### 修正三：测试的墙钟依赖（execution 域，**只动测试**）
 
 `docker-smoke` 在 master 上就已经红，失败的是
@@ -301,12 +328,12 @@ physical database provenance                   contract-issued = CLOSED；
 L1 FAST     python 3.14.5 / compileall -q backend / ruff check backend / git diff --check  → PASS
 L2 FOCUSED  adaptive + selection + risk + learning dataset/evaluation + promotion science +
             strategy adapter + research ownership guard + ai_research_contract + network
-            boundary guard + execution wiring + tuner 回归（542 tests）                    → PASS
+            boundary guard + execution wiring + tuner 回归（543 tests）                    → PASS
 L3 MUTATION work/r27b2c6_adaptive_experiment_mutation_check.py
-            baseline=GREEN, 18/18 DETECTED, survived=0, fake=0, timeout=0,
+            baseline=GREEN, 19/19 DETECTED, survived=0, fake=0, timeout=0,
             restore sha256=PASS                                                            → PASS
 L4 FINAL    python -m unittest discover -s backend -p "test_*.py"
-            4586 tests, failures=0, errors=0, skipped=5                                    → PASS
+            4587 tests, failures=0, errors=0, skipped=5                                    → PASS
 ```
 
 （`skipped` 数量随运行环境而变：本地 5、GitHub exact-head 的 `tests` job 报 3、`docker-smoke`
@@ -324,6 +351,8 @@ M-EXP-17  **review 先发现**：proposal 槽位冲突被静默吞掉并谎报�
           补上 mutation 后由 EXP-03e（真实驱动 tuner）捕获。
 M-EXP-18  **review 先发现**：幂等只看 weights → evidence / reason 变化被当成"同一个请求"。
           补上 mutation 后由 EXP-03f（单字段隔离矩阵）捕获。
+M-EXP-19  **review 先发现**：删掉幂等资格条件 → applied 行被当成"影子提案已存在"。
+          补上 mutation 后由 EXP-03b（单元）+ EXP-03h（runtime）捕获。
 ```
 
 review 发现的漏洞已立刻转成 mutation —— 否则下一轮回归仍然守不住它。

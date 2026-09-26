@@ -1298,7 +1298,8 @@ candidate revision identity                        <candidate_id>@<updated_at>
 candidate availability_day                         updated_at 归一到 owner 时区（Asia/Shanghai）后的日历日
 run_date                                           标签，永不进 as_of
 proposal 槽位冲突                                  显式 SelectionProposalConflict（与幂等重放分开）；
-                                                   幂等判据 = 完整 factual payload
+                                                   幂等判据 = 资格（仍处 shadow / ai_realtime /
+                                                     owner 记号有效）+ 完整 factual payload
                                                    （model_id / baseline / candidate /
                                                      evidence / reason 五项全同）
 evaluation availability_day                        evaluation manifest created_at 归一后的日历日
@@ -1409,7 +1410,29 @@ model_id / baseline_params / candidate_params / evidence / reason  五项全部�
     → SelectionProposalConflict
 ```
 
-两个实现细节：
+**并且"幂等成功"还要求既有行仍处在 shadow 状态**（第三轮 review 补上）。原先只比 payload，
+于是生命周期**已经推进**的 candidate（``applied`` / ``rolled_back`` / ``eligible_*``）占着同一个
+UNIQUE 槽位时，只要 payload 相同就会被返回 id —— 上层于是报告 ``shadow_proposal`` /
+"仅保存候选"，而 durable row 其实是 ``applied``，且本次调用**没有**保存任何新的 shadow proposal：
+
+```text
+existing candidate:  payload = P, lifecycle = applied
+new tuning request:  payload = P, requested lifecycle = shadow_proposal
+→ 返回 applied 行的 id → persisted_ids 含它 → 报告 "shadow_proposal / 仅保存候选"   ✗
+```
+
+因此幂等判据分成两组条件，刻意分开写（它们回答的是不同问题）：
+
+```text
+幂等资格       status == shadow_proposal、tier == ai_realtime、owner 来源记号有效
+factual 相同   model_id / baseline_params / candidate_params / evidence / reason
+```
+
+一条 ``applied`` 的行不等于"这个 shadow proposal 已经存在" —— 它已经走完了自己的生命周期。
+所以幂等重放的准确含义是"**同一条仍处于 shadow 状态的**提案已经存在"，而不是"历史上曾经有过
+相同 payload 的某个 candidate"。
+
+三个实现细节：
 
 ```text
 evidence 用**盖章后**的 canonical 文本比较
@@ -1419,7 +1442,8 @@ reason 用与落库一致的截断形式（[:500]）比较
     它们由写入口的 now 派生，属于"这条事实何时可用"，不是提案断言的 payload。重放本来就会
     带新的 now，要求它们相等会让**任何**重放都变成冲突 —— 那样"明确的幂等成功"就不存在了。
     代价是幂等成功返回的那一行，其 content fingerprint 不会等于"此刻新写一行"会得到的指纹：
-    本层声明的是"这份 payload 已在 ledger 里"，**不是**"这一行等于一次全新写入"。
+    本层声明的是"这份 payload 已在 ledger 里且仍处 shadow 状态"，**不是**"这一行等于一次
+    全新写入"。
 ```
 
 
@@ -1607,10 +1631,10 @@ L2 FOCUSED  adaptive / selection / risk / learning dataset / learning evaluation
             science / strategy adapter / research ownership guard / ai_research_contract /
             network boundary guards（含 deepseek_advisor tuner 回归）
 L3 MUTATION work/r27b2c6_adaptive_experiment_mutation_check.py
-            M-EXP-01 ~ M-EXP-18；baseline=GREEN, 18/18 DETECTED, survived=0, fake=0,
+            M-EXP-01 ~ M-EXP-19；baseline=GREEN, 19/19 DETECTED, survived=0, fake=0,
             timeout=0, restore sha256=PASS
 L4 FINAL    python -m unittest discover -s backend -p "test_*.py"
-            4586 tests, failures=0, errors=0, skipped=5
+            4587 tests, failures=0, errors=0, skipped=5
 ```
 
 ### review 修正三：测试的墙钟依赖（execution 域，只动测试）
@@ -1635,10 +1659,12 @@ execution_planner._session_phase(周末)  → "market_closed"
 M-EXP-14  第一版**存活**过：当时的 EXP-23 断言同时改动了 availability_day，于是"业务日变了"
           掩盖了"指纹忽略了 revision identity"。修正后断言只在**同一业务日内**换一个瞬间。
 
-M-EXP-16 / M-EXP-17 / M-EXP-18  由 **review** 先发现（不是 mutation matrix）：
-          来源判据退回词汇归属、槽位冲突被静默吞掉、幂等判据忽略 evidence/reason。
-          补上 mutation 之后三条都被对应的永久回归捕获
-          （EXP-04d / EXP-03e / EXP-03f），因此这不再依赖下一次人工审核才被发现。
+M-EXP-16 / M-EXP-17 / M-EXP-18 / M-EXP-19  由 **review** 先发现（不是 mutation matrix）：
+          来源判据退回词汇归属、槽位冲突被静默吞掉、幂等判据忽略 evidence/reason、
+          删除幂等资格条件（applied 行被当成影子提案的幂等成功）。
+          补上 mutation 之后四条都被对应的永久回归捕获
+          （EXP-04d / EXP-03e / EXP-03f / EXP-03b，runtime 侧还有 EXP-03h），
+          因此这不再依赖下一次人工审核才被发现。
 ```
 
 这正是 mutation matrix 的价值：它把"看起来合理、实则空转"的断言变成可执行的缺口；而 review
