@@ -1023,9 +1023,11 @@ token** —— 那是 R24 的职责，不在 R27-A 范围内。这条限制由
 `test_AI_TYPED_06_two_step_forgery_is_documented_not_claimed_closed` 作为**已知
 限制**断言下来，而不是假装已封堵。
 
-当前 `SUPPORTED_OWNER_ADAPTERS` 是 `{ market_data, execution, portfolio_research }`
-（R27-B2C-3 起有 execution，R27-B2C-4B 起有 portfolio_research）。signal / news
-等仍在 `EVIDENCE_SOURCE_TYPES` 闭集里作为已声明的未来来源，但没有 factory 可以签发 ——
+当前 `SUPPORTED_OWNER_ADAPTERS` 是
+`{ market_data, execution, portfolio_research, news, strategy_research, runtime_incident }`
+（B2C-3 起有 execution，B2C-4B 起有 portfolio_research，B2C-5 起有 news，B2C-6 起有
+strategy_research，B2C-7 起有 runtime_incident）。`signal` 仍在
+`EVIDENCE_SOURCE_TYPES` 闭集里作为已声明的未来来源，但没有 factory 可以签发 ——
 少支持一个 source 好过允许伪造一个 authority。
 
 这张 registry 表示"研究层已经存在**批准的 owner adapter**"，**不**表示"所有 public factory
@@ -1607,8 +1609,11 @@ service **不**生成 `research_run_key` / job id / cycle id，也**不**把 `hy
 ### 证据来源的现实约束（决定了迁移顺序）
 
 ```text
-SUPPORTED_OWNER_ADAPTERS = { market_data, execution, portfolio_research }
-                           （R27-B2C-3 起有 execution；R27-B2C-4B 起有 portfolio_research）
+SUPPORTED_OWNER_ADAPTERS = { market_data, execution, portfolio_research,
+                             news, strategy_research, runtime_incident }
+                           （B2C-3 起有 execution；B2C-4B 起有 portfolio_research；
+                             B2C-5 起有 news；B2C-6 起有 strategy_research；
+                             B2C-7 起有 runtime_incident）
 ```
 
 只有已经为该 owner 建好 typed projection + owner 签发核验的 owner 才能被签发，而
@@ -2771,6 +2776,187 @@ review 发现的漏洞必须立刻变成 mutation，否则下一轮回归仍然�
 `_overfit_evidence` 仍直读 ledger，且**不**做 dual run（legacy + typed 同时跑），也不让 typed
 provider 多调一次。`candidate_challenge` / `overfit_watch` 的 runtime convergence 留给后续一轮。
 
+### runtime / incident owner readiness（R27-B2C-7）
+
+incident_triage 在此之前读的是**裸行**：`adaptive_runs WHERE status!='completed'`、
+`paper_jobs WHERE status NOT IN ('completed','success')`、
+`paper_orders WHERE status!='filled' GROUP BY status`。于是 `deepseek_research` 必须自己解释
+"`status='killed'` 是什么意思"、"`market_date` 能不能当失败被知悉的时刻"、"没成交是不是系统
+事故"。B2C-7 把这三个问题还给 owner。
+
+#### owner matrix（逐表审计的结论）
+
+```text
+adaptive_runs                writer = adaptive_engine 唯一（9 个 lifecycle 字面量）
+                             → TYPED INCIDENT FACT（AdaptiveRunFactProjection）
+paper_job_runs（intraday）     writer = paper_trading 唯一
+                             → TYPED INCIDENT FACT（PaperJobRunFactProjection，attempt 级）
+paper_jobs                    PK(slot, market_date)，retry 物理覆盖旧失败
+                             → CONTEXT ONLY + OPEN PREREQUISITE（非 intraday 的 attempt identity）
+paper_runtime_locks           lease context，不是事故事实 → NOT INCIDENT
+paper_orders                  11 个生产模块写入 → EXISTING EXECUTION OWNER（不复制第二 authority）
+paper_signals                 5 个生产模块写入 → NOT INCIDENT（业务生命周期）
+adaptive_execution_evidence   status 是自由字符串（无闭集、无语义声明）→ OPEN PREREQUISITE
+上一轮 canonical research      研究自身产物 → EXISTING RESEARCH CONTEXT（不得自我背书）
+```
+
+#### 四条红线（本轮的核心修正）
+
+```text
+1. 业务拒绝 ≠ 系统事故      blocked / rejected / deferred_capacity / waitlist 都不能因为
+                          "没有 filled" 被升级成 incident verified；本层根本不读 paper_orders
+2. mutable row 不得倒填历史  retry 会把 failed 覆盖成 running；当前行不能解释被 UPDATE 之前的时点
+3. lifecycle ≠ verification failed / completed / killed 是**事实内容**；verified 的意思是
+                          "这个事实可信"，不是"运行成功"。两个词表零交集
+4. severity ≠ verification  critical / high / medium / low / info 是 research 结论；
+                          owner 层没有 severity 参数、字段或标识符
+```
+
+第 1 条是**结构**保证而不是注释：`test_runtime_incident_owner_facts` 断言两个 owner 模块与
+adapter 的源码里不出现 `paper_orders` / 非成交分布，且两个 typed 读入口（`adaptive_run_fact` /
+`paper_job_run_fact`）的函数体不引用它。
+
+#### 两个 owner 各发一个 typed 投影 + 极小核验闭集
+
+```text
+adaptive_engine   AdaptiveRunFactProjection    adaptive_run|<run_id>@<status>@<finished_at>
+paper_trading     PaperJobRunFactProjection    paper_job_run|<run_key>@<started_at>|<finished_at>
+```
+
+核验闭集每家两态、两家**互不重叠**，且与 lifecycle 词表零交集：
+`<owner>_recorded → OWNER_OUTCOME_VERIFIED`、`<owner>_unproven → OWNER_OUTCOME_UNVERIFIED`。
+
+`paper_jobs` 刻意**不**发布 typed 事实：它的 PK 是 `(slot, market_date)`，**每天每 slot 只有
+一行**，retry 把 `failed` 改写成 `running`（`finished_at=NULL`）再成 `completed` —— 旧失败
+**物理消失**。attempt 级 identity 只能来自 `paper_job_runs`（`run_key = intraday:YYYYMMDDHHMM`），
+而它**只覆盖 `slot='intraday'`**。把 `paper_jobs` 的当前行当成历史 incident ledger 就是倒填，
+因此那个缺口被记为 `OPEN PREREQUISITE: append-only attempt identity for non-intraday paper job
+failures`，而**不是**用当前行伪造可重建性。
+
+#### PIT 语义（每条都能被 mutation 打红）
+
+```text
+adaptive 终态可用性   ← finished_at（终态写入时盖）           绝不来自 started_at
+adaptive 进行中可用性 ← started_at（行只声明"正在跑"）        并显式标注 availability_kind
+paper    终态可用性   ← finished_at                         绝不来自 market_date
+paper    进行中可用性 ← started_at（finished_at 为 NULL 才是 owner 形状）
+finished_at/available_day > as_of → UNAVAILABLE（返回 None）  绝不倒填当前行
+profile_date / market_date        业务标签，永不进 as_of
+```
+
+时间戳口径是**两个 owner 各自的显式契约**，不是"naive 就当本地时间"：`adaptive_common._now()`
+写带 offset 的 aware ISO（naive 一律 fail closed）；paper 调度器写裸 `%Y-%m-%d %H:%M:%S`，而它
+由 `paper_trading._market_session:914`（"生产环境为 Asia/Shanghai"）、`Dockerfile` /
+`docker-compose.yml` 的 `TZ=Asia/Shanghai` 与 `deploy/install-centos9.sh` 一致固定，且
+`paper_schema_migrations.ensure_runtime_lease_columns` 会把旧行的 `T` 分隔符归一掉。因此本层
+**只认那一种形状**，其余（带 offset / date-only / 其它分隔符）一律 fail closed。可用日一律按
+Asia/Shanghai 归一，**不读运行机器的 local timezone**。
+
+#### `killed` 行与 `interrupted` 行：不硬签 ref
+
+```text
+killed       终态，但终态 instant 不可证：_learning_detect_stale:94 只改 status/detail，
+             甚至在自己的 detail 里写 "no finished_at" ⇒ finished_at 仍等于 started_at。
+             用 started_at 代替终态 instant 是**超前声明**（"进程被杀"要到悬挂检测跑过才知道）
+             ⇒ adaptive_run_fact 返回 None（UNAVAILABLE），而不是硬签一个 ref
+interrupted  只在 retry CAS 里作为**输入**词汇出现；当前**没有任何 production writer** 会写它
+             ⇒ 不在可签发闭集内，读到即 UNAVAILABLE
+```
+
+两者都是 `OPEN PREREQUISITE`（前者需要 owner 在终态写入时盖一个 terminal instant，后者需要
+先有人决定它是什么），而不是"以后不需要证明"。
+
+#### `runtime_incident`：新增 source type，而不是冒充 signal
+
+```text
+signal               "市场信号"      —— run/job 失败不是信号
+strategy_research    "策略实验事实"  —— runtime 运行失败不是实验事实
+runtime_incident     ← 本 PR 新增；配套 event kind = runtime_incident_observed
+```
+
+新增成员必须同步**四处**闭集：`EVIDENCE_SOURCE_TYPES` / `EVENT_KINDS` /
+`_KIND_BY_SOURCE_TYPE` / `SUPPORTED_OWNER_ADAPTERS`，并由
+`test_ai_research_runtime_adapter` 双向强制。细分放在 **`record_kind`**（`adaptive_run` /
+`paper_job_run`）与 `detail` 里。
+
+唯一接缝是 `backend/ai_research_runtime_adapter.py`，公开面只有一个函数
+`evidence_ref_from_runtime_projection(projection)`：签名里**只有** projection（不接受
+`source_id` / `as_of` / `verification`），入口只做 `type(...) is` 精确判定，归口是一张显式
+穷尽表（每次调用做双向漂移检查、**不缓存**）。它不读 DB、不读墙钟、不联网、不调 LLM，也
+**不重算** incident 分级 / job 重试 / 租约状态 / 订单状态分布。
+
+#### writer closed-set guard：按代码真实形状，而不是只 grep 一个 INSERT
+
+静态写法与**动态表名**写法分开处理，因为同一张表确实存在两类写路径：
+
+```text
+literal  adaptive_runs / paper_jobs / paper_job_runs / adaptive_execution_evidence
+         → 字面写语句（含 INSERT OR REPLACE / OR IGNORE / UPSERT 头）必须恰好等于 owner 模块
+dynamic  retention_maintenance（adaptive_runs 的 180 天裁剪，DELETE）
+         paper_cycle_service（周期归档后清空活动表，DELETE）
+         paper_schema_migrations（旧时间戳 T→空格的归一 + 整表重建搬运）
+         → 逐项登记 scope（purge_only / normalization_only），且模板里
+           **列名占位符的绑定词表不得包含 lifecycle 列**（status / finished_at）
+```
+
+第三项是必要的：`f"UPDATE {table} SET {column}=replace(...)"` 的 `{column}` 由
+`for column in ("started_at", "acquired_at", "heartbeat_at", "expires_at")` 决定，因此"这条
+语句会不会改 lifecycle"必须看那个元组，只看语句文本是查不出来的。另外"必须以写动词开头"
+这条限制也是必要的：否则 `CREATE TRIGGER ... BEFORE INSERT ON {}` 会被误判成一次 INSERT。
+
+`adaptive_execution_evidence.status` 是**自由字符串**（`str(detail.get("status") or "unknown")`，
+由三段各自的 `state[...]["status"]` 决定），既没有闭集也没有语义声明，因此本轮**不**为它
+发布 typed 契约 —— 记为 `OPEN PREREQUISITE`。
+
+#### 回归门禁（B2C-7）
+
+```text
+backend/test_runtime_incident_owner_facts.py             INC-01 ~ INC-23（owner 侧）
+    字面 + 动态 writer 闭集与写入范围（含列占位符绑定词表）；
+    lifecycle 词表与核验闭集零交集（两家各自、彼此、与 research 三态都查）；
+    failed 与 completed 都是 owner-verified 的事实；completed 不是通用 verified 状态；
+    owner / adapter 里没有 severity 标识符（扫 AST 标识符，不扫散文）；
+    跨午夜与跨 offset 的可用日归一；profile_date / market_date 不能替代可用性；
+    finished_at > as_of → None；mutable 当前行不回填旧 revision；
+    坏 JSON fail closed（含"SQL NULL 是合法 in-progress 形状，归一成 null 而不是 {}"）；
+    未知 status 与 legacy interrupted 都不可签发；killed 无终态可用性；
+    自洽性不成立 → unproven 而不是 recorded；as_of 缺失即错误且无 latest 回落；
+    租约字段不进投影；paper_orders 不成为 incident fact；execution nonfill 仍归 execution owner；
+    上一轮 research 只作上下文（两个 owner 与 adapter 都不 import research 持久化层）。
+
+backend/test_ai_research_runtime_adapter.py              INC-24 ~ INC-32（接缝侧）
+    只接受两个已批准类型的本类型（dict / Mapping / 伪对象 / **子类**全拒）；
+    签名不接受 source_id / as_of / verification / outcome；指纹确定性且随内容与 revision 移动；
+    adapter 不 import DB / 网络 / 时钟（import 集合精确等值）；
+    runtime_incident 在四处闭集同时登记且 factory 真实存在、契约模块不 re-export；
+    归口表漂移检查两个方向都会红、未知核验词签发时 fail closed；
+    InformationEvent.kind 由 source_type 独占地派生为 runtime_incident_observed；
+    production 调用点 = 0；incident_triage 的 legacy 直读 runtime 仍在且仍被记为 deferred。
+```
+
+`backend/test_ai_research_evidence_ownership_guard.py`：`EXPECTED_OWNER_FACTORIES` 与
+`APPROVED_ISSUER_CALLERS` 各增加 runtime_incident 一行，最终 caller set 恰好六个 owner
+factory。`backend/ai_research_contract.py`：`SUPPORTED_OWNER_ADAPTERS` 加入
+`EVIDENCE_SOURCE_RUNTIME_INCIDENT`；`backend/test_ai_provider_transport.py`：
+`NETWORK_FREE_SEAMS` 登记新接缝（owner 模块本身**不**进网络闭集 —— `paper_trading` 另有联网
+职责，被登记的是它的 typed 读接缝）；`backend/test_ai_research_contract.py` 的
+`ALLOWED_AI_CONSUMERS` 登记新接缝。
+
+语义 mutation 在 `work/r27b2c7_runtime_incident_mutation_check.py`（M-INC-01 ~ 15）必须全部
+CAUGHT（baseline GREEN、survived = 0、fake = 0、timeout = 0、被改写文件的 restore sha256 一致）。
+B43 建议清单里有两条在本轮**没有对应契约**，因此按真实接缝落点而不是造假锚点：
+
+```text
+adaptive_execution_evidence.status → verification   本轮刻意没有为它发布契约（自由字符串）
+adapter 接受 Mapping                                真正的宽化风险是 isinstance（子类）；
+                                                    Mapping 会以 AttributeError 失败，属接线错误
+```
+
+**本轮的 runtime 迁移是 DEFERRED，不是 REMOVED**：`deepseek_research._incident_evidence` 仍直读
+`adaptive_runs` / `paper_jobs` / `paper_orders`，它自己写着的那条业务规则（"业务风控拒单不是
+系统事故"）本轮落实到了**架构**上，但**不**做 dual run。`incident_triage` 的 runtime
+convergence 留给 **R27-B2C-8**（`remaining deepseek_research typed convergence`）。
+
 
 ## 目标依赖方向
 
@@ -3017,6 +3203,73 @@ owner 盖章后比较；`revision_at` / `availability_day` / `created_at` 刻意
 完全相同也必须抛 `SelectionProposalConflict`：它不等于"这个 shadow proposal 已经存在"，而且
 本次调用并没有保存任何新的 shadow proposal。`run_realtime_tuning` 因此不得把该行记进
 `persisted_ids`，也不得报告"仅保存候选"）
+runtime 表的 production writer 集合漂移（R27-B2C-7：`adaptive_runs` / `paper_jobs` /
+`paper_job_runs` / `adaptive_execution_evidence` 的**字面**写语句（含 `INSERT OR REPLACE` /
+`OR IGNORE` / UPSERT 头）必须恰好等于 owner 一个模块；**动态表名**写法（`f"DELETE FROM
+{table}"`）单独逐项登记 scope 并断言"列名占位符的绑定词表不得包含 lifecycle 列"。只扫字面
+语句会给动态派发留一条静默通道，只断言"登记过"则会漏掉"已登记模块顺手改了 status"）
+runtime lifecycle status 被当成 owner fact verification（R27-B2C-7：`running` / `completed` /
+`failed` / `killed` / `intraday_failed` / `advisor_batch` … 是**事实内容**，与两家 owner 的
+核验闭集零交集，且两家闭集彼此也不相交。`failed` 与 `completed` 同样可以是
+`OWNER_OUTCOME_VERIFIED` 的事实 —— verified 的意思是"这个事实可信"，不是"运行成功"；
+`completed` 也**不是**通用的 verified 状态）
+事故严重级别被当成 owner verification（R27-B2C-7：`critical` / `high` / `medium` / `low` /
+`info` 是 research 结论。owner 模块与 runtime adapter 的**标识符**里不得出现 severity /
+is_incident / root_cause / promotable —— 扫的是 AST 标识符而不是散文，因为契约文档正是在
+解释它为什么不在这里）
+runtime 事实的可用性被 `started_at` / `profile_date` / `market_date` 顶替（R27-B2C-7：
+adaptive 的终态可用性是 `finished_at`、进行中是 `started_at`（显式标注
+`availability_kind`）；paper 的终态是 `finished_at`、进行中是 `started_at`（`finished_at`
+为 NULL 才是 owner 形状）。`profile_date` / `market_date` 只是业务标签：D 日任务失败可能
+D 15:30 甚至 D+1 的回收扫描才被系统知道。跨 offset 一律归一到 Asia/Shanghai 后再派生业务日，
+**不读运行机器的 local timezone**）
+mutable runtime 当前行被用来倒填历史（R27-B2C-7：`paper_jobs` 的 PK 是
+`(slot, market_date)`，retry 把 `failed` 改写成 `running`（`finished_at=NULL`）再成
+`completed` —— 旧失败**物理消失**；`paper_job_runs` 的 `run_key` 也只是**窗口**身份，同一窗口
+的 retry 会改写同一行。当前 revision 的可用日晚于 `as_of` 时必须返回 UNAVAILABLE，绝不
+"因为 id 相同所以拿当前值"）
+终态可用性不可证的 runtime 行被硬签成 evidence（R27-B2C-7：`adaptive_runs.status='killed'`
+的 `finished_at` 仍等于 `started_at`（`_learning_detect_stale` 只改 status/detail，自己的
+detail 里写着 `no finished_at`），用 `started_at` 代替终态 instant 是**超前声明** ⇒ 读侧返回
+UNAVAILABLE。legacy 只读的 `paper_job_runs.status='interrupted'` 当前**没有任何 production
+writer** 会写它 ⇒ 不在可签发闭集内。两者都是 OPEN PREREQUISITE，不是"以后不需要证明"）
+runtime typed 读侧出现宽松回落（R27-B2C-7：坏 JSON / 缺必需归一列 / naive 时间戳一律
+fail closed —— 绝不把 malformed 的 `detail` 变成 `{}`。注意 `paper_job_runs.detail` 的 SQL
+NULL 是 owner 的**合法** in-progress 形状（`running` 的 INSERT 不写该列），归一成 JSON 字面量
+`null` 而不是 `{}`：`null` 表示"owner 还没有写 detail"，`{}` 表示"owner 写了空对象"。`as_of`
+必须显式，没有 `None → latest`、没有 `today()`、没有"当前 slot 的当前行"）
+未知 runtime status 被默认成 owner-recorded（R27-B2C-7：`adaptive_runs` 的 status 闭集是九个
+写侧字面量的审计产物；两个 owner 各发布一张 lifecycle 闭集并各自发布两张核验闭集。任何不在
+闭集里的 status 都意味着"没有人为它的可用性语义做过决定" ⇒ 返回 UNAVAILABLE，**不得**落进
+某个默认分支被当成已记录事实）
+业务拒绝被当成系统事故（R27-B2C-7：`paper_orders.status != 'filled'` 里绝大多数是正常业务
+规则（风控拒单 / 容量延后 / 等待池 / 部分成交 / 已替代）。runtime owner 与 adapter 的源码里
+不得出现 `paper_orders` / 非成交分布，两个 typed 读入口的函数体也不得引用它 —— 订单执行事实
+继续归 existing execution owner，本轮**不**新增 `RuntimeOrderFact` / `IncidentOrderFact` /
+`OrderFailureFact`，**不**复制第二个 authority）
+租约上下文被当成事故事实（R27-B2C-7：`paper_runtime_locks` 的 `owner_key` / `heartbeat_at` /
+`expires_at` / `fencing_token` 是 lease context，两个投影都不携带这些字段，也没有
+`lock expired → incident` 这条转换。心跳只改租约字段，**不得**让同一条事实变成两条 —— identity
+与内容指纹对它稳定）
+上一轮 AI research 的结论被重签成 owner fact（R27-B2C-7：
+`latest_data_quality_research` 读的是 canonical research ledger，那是**研究产物**。两个 owner
+与 runtime adapter 都不得 import `ai_research_repository` / `ai_research_provider` /
+`ai_research_service` —— 否则研究就能给自己签 factual verification，形成自引用回路）
+runtime 事实绕过唯一 typed 接缝，或冒充 signal / strategy_research（R27-B2C-7：research 只通过
+`ai_research_runtime_adapter.evidence_ref_from_runtime_projection` 消费 runtime owner；source
+type 是本轮**新增**的 `runtime_incident`（配套 `runtime_incident_observed`），因为 `signal` /
+`strategy_research` 的语义都不准确 —— run/job 失败既不是市场信号，也不是策略实验事实。该
+adapter 必须是**纯的** —— 不 import `sqlite3` / 网络 / 时钟 / 随机源，只 import 契约与两个
+owner，也不得 import 任何 execution authority 模块。入口只接受 `type(projection) is …` 精确
+类型（子类 / dict / Mapping / duck-typed 全拒），签名里没有 `source_id` / `as_of` /
+`verification` / `outcome`；`runtime_incident` 必须在四处闭集同时登记且与真实 factory 双向
+等值。依赖方向单向：两个 owner 不得 import research，research 契约也不得 import 任何 owner
+或 adapter）
+legacy incident runtime 被当成已迁移（R27-B2C-7：
+`deepseek_research._incident_evidence` 仍然直读 `adaptive_runs` / `paper_jobs` /
+`paper_orders`，它自己写着的那条业务规则（"业务风控拒单不是系统事故"）本轮落实到了架构上，
+但 runtime 迁移**明确保持 OPEN 且 DEFERRED 到 B2C-8**；本轮不做 dual run、不让 typed provider
+多调一次，adapter 的 production 调用点 = 0 是预期状态而不是空转）
 ```
 
 ### 仅作 review signal（不进入 CI gate）
