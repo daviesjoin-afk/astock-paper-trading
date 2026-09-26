@@ -95,6 +95,9 @@ EXPECTED_OWNER_FACTORIES = {
     "strategy_research": (
         "ai_research_strategy_adapter", "evidence_ref_from_strategy_projection",
     ),
+    "runtime_incident": (
+        "ai_research_runtime_adapter", "evidence_ref_from_runtime_projection",
+    ),
 }
 
 #: 需要在 import 别名解析里被识别的模块 —— 已登记 factory 的宿主模块。
@@ -114,12 +117,15 @@ OWNER_FACTORY_ORIGINS = frozenset(EXPECTED_OWNER_FACTORIES.values())
 #: R27-B2C-5 引入 news 的第四个（news owner readiness：owner 发布 typed 事实 + 唯一接缝）；
 #: R27-B2C-6 引入 strategy_research 的第五个（adaptive / experiment owner readiness：
 #: 三个 owner 各自发布 typed 事实与核验闭集，唯一 adapter 归口）。
+#: R27-B2C-7 引入 runtime_incident 的第六个（runtime / incident owner readiness：
+#: 两个 owner 各自发布 typed attempt / run 事实与核验闭集，唯一 adapter 归口）。
 APPROVED_ISSUER_CALLERS = frozenset({
     (CONTRACT_MODULE_FILE, "evidence_ref_from_market_reading"),
     ("ai_research_execution_adapter.py", "evidence_ref_from_execution_projection"),
     ("ai_research_portfolio_adapter.py", "evidence_ref_from_portfolio_projection"),
     ("ai_research_news_adapter.py", "evidence_ref_from_news_projection"),
     ("ai_research_strategy_adapter.py", "evidence_ref_from_strategy_projection"),
+    ("ai_research_runtime_adapter.py", "evidence_ref_from_runtime_projection"),
 })
 
 #: 目前生产里构造 ``InformationEvent`` 的模块集合。等值断言：多一个模块就是一次
@@ -670,6 +676,70 @@ class FactoryOriginNonVacuityTests(unittest.TestCase):
         self.assertTrue(self._approved(
             "import ai_research_portfolio_adapter as PFA\n"
             "PFA.evidence_ref_from_portfolio_projection(projection)\n"
+        ))
+
+    def test_CASE_14_the_runtime_adapter_factory_is_approved(self):
+        """B2C-7 新增的第六个 owner：模块别名与直接 import 都必须被批准。"""
+        self.assertTrue(self._approved(
+            "import ai_research_runtime_adapter as RTA\n"
+            "RTA.evidence_ref_from_runtime_projection(projection)\n"
+        ))
+        self.assertTrue(self._approved(
+            "from ai_research_runtime_adapter import "
+            "evidence_ref_from_runtime_projection as make_ref\n"
+            "make_ref(projection)\n"
+        ))
+        # 非空性对照：既有 owner 的 factory 仍然必须被批准（新 owner 不排挤旧 owner）。
+        self.assertTrue(self._approved(
+            "import ai_research_strategy_adapter as STA\n"
+            "STA.evidence_ref_from_strategy_projection(projection)\n"
+        ))
+
+    def test_CASE_15_runtime_factory_cannot_be_forged_or_borrowed(self):
+        """B2C-7 的四条负向路径 —— 每一条都必须被拒绝。
+
+        1. 本地同名函数：``def evidence_ref_from_runtime_projection`` 自己签发；
+        2. 其它对象的同名方法；
+        3. 已登记模块之间互相借用 factory 名（**(module, symbol) 对**不匹配）；
+        4. contract 模块偷导出 runtime 的 factory（registry 里必须只有 market 那一份）。
+        """
+        self.assertFalse(self._approved(
+            "def evidence_ref_from_runtime_projection(row):\n"
+            "    return row\n"
+            "evidence_ref_from_runtime_projection(row)\n"
+        ))
+        self.assertFalse(self._approved(
+            "fake.evidence_ref_from_runtime_projection(row)\n"
+        ))
+        self.assertFalse(self._approved(
+            "import fake_contract\n"
+            "fake_contract.evidence_ref_from_runtime_projection(row)\n"
+        ))
+        # 3. 已登记模块之间不得互相借用 factory 名。
+        self.assertFalse(self._approved(
+            "import ai_research_runtime_adapter as RTA\n"
+            "RTA.evidence_ref_from_strategy_projection(projection)\n"
+        ))
+        self.assertFalse(self._approved(
+            "import ai_research_strategy_adapter as STA\n"
+            "STA.evidence_ref_from_runtime_projection(projection)\n"
+        ))
+        self.assertFalse(self._approved(
+            "import ai_research_contract as ARC\n"
+            "ARC.evidence_ref_from_runtime_projection(projection)\n"
+        ))
+        # 4. contract 模块**没有**这个符号，且 registry 里 market 仍然只对应它自己那一份。
+        self.assertFalse(_module_exports_factory(
+            "ai_research_contract", "evidence_ref_from_runtime_projection",
+        ))
+        self.assertEqual(
+            ("ai_research_runtime_adapter", "evidence_ref_from_runtime_projection"),
+            EXPECTED_OWNER_FACTORIES["runtime_incident"],
+        )
+        # 非空性对照：runtime adapter 写自己的 factory 名必须被批准。
+        self.assertTrue(self._approved(
+            "import ai_research_runtime_adapter as RTA\n"
+            "RTA.evidence_ref_from_runtime_projection(projection)\n"
         ))
 
     def test_CASE_11_issuer_caller_scan_detects_second_helpers_and_aliases(self):

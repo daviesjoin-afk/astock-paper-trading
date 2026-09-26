@@ -52,6 +52,7 @@ execution     evidence_ref_from_execution_projection（ai_research_execution_ada
 portfolio     evidence_ref_from_portfolio_projection（ai_research_portfolio_adapter）
 news          evidence_ref_from_news_projection      （ai_research_news_adapter）
 strategy_research evidence_ref_from_strategy_projection（ai_research_strategy_adapter）
+runtime_incident  evidence_ref_from_runtime_projection（ai_research_runtime_adapter）
 ```
 
 **factory 不必都住在本文件里。** execution 的 factory 住在
@@ -87,11 +88,12 @@ __all__ = [
     # evidence source —— 事实来自哪一类 owner
     "EVIDENCE_SOURCE_MARKET_DATA", "EVIDENCE_SOURCE_SIGNAL", "EVIDENCE_SOURCE_EXECUTION",
     "EVIDENCE_SOURCE_STRATEGY_RESEARCH", "EVIDENCE_SOURCE_PORTFOLIO_RESEARCH",
-    "EVIDENCE_SOURCE_NEWS", "EVIDENCE_SOURCE_TYPES", "SUPPORTED_OWNER_ADAPTERS",
+    "EVIDENCE_SOURCE_NEWS", "EVIDENCE_SOURCE_RUNTIME_INCIDENT",
+    "EVIDENCE_SOURCE_TYPES", "SUPPORTED_OWNER_ADAPTERS",
     # information event kind
     "EVENT_MARKET_OBSERVED", "EVENT_SIGNAL_OBSERVED", "EVENT_EXECUTION_OBSERVED",
     "EVENT_STRATEGY_RESEARCH_OBSERVED", "EVENT_PORTFOLIO_RESEARCH_OBSERVED",
-    "EVENT_NEWS_OBSERVED", "EVENT_KINDS",
+    "EVENT_NEWS_OBSERVED", "EVENT_RUNTIME_INCIDENT_OBSERVED", "EVENT_KINDS",
     # hypothesis relation —— 事实对 thesis 的关系（由 research 层显式声明）
     "RELATION_SUPPORTS", "RELATION_CONTRADICTS", "RELATION_CONTEXT", "RELATIONS",
     # hypothesis status —— research 专用，与 signal 生命周期无交集
@@ -122,25 +124,36 @@ EVIDENCE_SOURCE_EXECUTION = "execution"
 EVIDENCE_SOURCE_STRATEGY_RESEARCH = "strategy_research"
 EVIDENCE_SOURCE_PORTFOLIO_RESEARCH = "portfolio_research"
 EVIDENCE_SOURCE_NEWS = "news"
+#: runtime / incident owner 的事实（**R27-B2C-7 新增**）。
+#:
+#: 刻意**不复用** ``signal`` / ``strategy_research``：job / run 的失败既不是市场信号，也
+#: 不是策略实验事实 —— 用那两个词表等于让 runtime 事实冒充另一类 authority。
+#:
+#: 它**只**承载 owner 能自证的 **runtime 事实**（"run X 的终态是 failed"、"job
+#: close/D 的当前记录是 failed"）。它**不**承载事故严重级别、根因、处置建议 ——
+#: 那些是 research 结论（见各 owner 的 typed projection docstring）。
+EVIDENCE_SOURCE_RUNTIME_INCIDENT = "runtime_incident"
 
 #: **刻意**是一个闭集：AI 的 hypothesis / narrative / LLM 输出不在其中。
 #: 于是"把 AI 自己生成的文本当成市场事实"在类型层面就无法表达。
 EVIDENCE_SOURCE_TYPES = (
     EVIDENCE_SOURCE_MARKET_DATA, EVIDENCE_SOURCE_SIGNAL, EVIDENCE_SOURCE_EXECUTION,
     EVIDENCE_SOURCE_STRATEGY_RESEARCH, EVIDENCE_SOURCE_PORTFOLIO_RESEARCH,
-    EVIDENCE_SOURCE_NEWS,
+    EVIDENCE_SOURCE_NEWS, EVIDENCE_SOURCE_RUNTIME_INCIDENT,
 )
 
 #: 当前**真的**接好 typed projection 的 owner。其余是已声明的未来来源，
 #: 没有公开 factory 可以签发 —— 少支持一个 source 好过允许伪造一个 authority。
 #:
 #: R27-B2C-3 起 ``execution`` 也在其中，R27-B2C-4B 起 ``portfolio_research`` 也在，
-#: R27-B2C-5 起 ``news`` 也在，R27-B2C-6 起 ``strategy_research`` 也在。
+#: R27-B2C-5 起 ``news`` 也在，R27-B2C-6 起 ``strategy_research`` 也在，
+#: R27-B2C-7 起 ``runtime_incident`` 也在。
 #: 这张表表示的是"研究层已经存在**批准的 owner adapter**"，**不是**"所有 public factory
 #: 都定义在本文件里"：execution 的 factory 住在 ``ai_research_execution_adapter``、
 #: portfolio/accounting 的住在 ``ai_research_portfolio_adapter``、news 的住在
 #: ``ai_research_news_adapter``、adaptive/experiment 的住在
-#: ``ai_research_strategy_adapter``（它们必须同时认识各自 owner 与 research 两套词表，而本契约
+#: ``ai_research_strategy_adapter``、runtime/incident 的住在
+#: ``ai_research_runtime_adapter``（它们必须同时认识各自 owner 与 research 两套词表，而本契约
 #: 刻意不 import 任何 owner 模块）。
 #: 本契约不需要、也不得 import 那些 adapter —— registry 是声明式的，一致性由
 #: ``test_ai_research_evidence_ownership_guard`` 双向强制。
@@ -150,6 +163,7 @@ SUPPORTED_OWNER_ADAPTERS = frozenset({
     EVIDENCE_SOURCE_PORTFOLIO_RESEARCH,
     EVIDENCE_SOURCE_NEWS,
     EVIDENCE_SOURCE_STRATEGY_RESEARCH,
+    EVIDENCE_SOURCE_RUNTIME_INCIDENT,
 })
 
 # ---------------------------------------------------------------------------
@@ -162,10 +176,11 @@ EVENT_EXECUTION_OBSERVED = "execution_observed"
 EVENT_STRATEGY_RESEARCH_OBSERVED = "strategy_research_observed"
 EVENT_PORTFOLIO_RESEARCH_OBSERVED = "portfolio_research_observed"
 EVENT_NEWS_OBSERVED = "news_observed"
+EVENT_RUNTIME_INCIDENT_OBSERVED = "runtime_incident_observed"
 EVENT_KINDS = (
     EVENT_MARKET_OBSERVED, EVENT_SIGNAL_OBSERVED, EVENT_EXECUTION_OBSERVED,
     EVENT_STRATEGY_RESEARCH_OBSERVED, EVENT_PORTFOLIO_RESEARCH_OBSERVED,
-    EVENT_NEWS_OBSERVED,
+    EVENT_NEWS_OBSERVED, EVENT_RUNTIME_INCIDENT_OBSERVED,
 )
 
 #: 唯一的 kind ↔ source_type 映射。``InformationEvent.kind`` 是派生只读属性，
@@ -178,6 +193,7 @@ _KIND_BY_SOURCE_TYPE = {
     EVIDENCE_SOURCE_STRATEGY_RESEARCH: EVENT_STRATEGY_RESEARCH_OBSERVED,
     EVIDENCE_SOURCE_PORTFOLIO_RESEARCH: EVENT_PORTFOLIO_RESEARCH_OBSERVED,
     EVIDENCE_SOURCE_NEWS: EVENT_NEWS_OBSERVED,
+    EVIDENCE_SOURCE_RUNTIME_INCIDENT: EVENT_RUNTIME_INCIDENT_OBSERVED,
 }
 
 # ---------------------------------------------------------------------------
@@ -618,7 +634,9 @@ class ResearchEvidenceRef:
     ``ai_research_portfolio_adapter.evidence_ref_from_portfolio_projection``，
     news 的每一份是 ``ai_research_news_adapter.evidence_ref_from_news_projection``，
     adaptive/experiment 的每一份是
-    ``ai_research_strategy_adapter.evidence_ref_from_strategy_projection``）。
+    ``ai_research_strategy_adapter.evidence_ref_from_strategy_projection``，
+    runtime/incident 的每一份是
+    ``ai_research_runtime_adapter.evidence_ref_from_runtime_projection``）。
     identity
     由 owner 投影派生（调用方不提供），核验维度由**该 owner 的 factory** 归口 —— 因此
     "传字符串把自己声明成 owner 已核验事实"不可表达。
@@ -671,7 +689,9 @@ class ResearchEvidenceRef:
             "news: "
             "ai_research_news_adapter.evidence_ref_from_news_projection；"
             "adaptive/experiment: "
-            "ai_research_strategy_adapter.evidence_ref_from_strategy_projection）："
+            "ai_research_strategy_adapter.evidence_ref_from_strategy_projection；"
+            "runtime/incident: "
+            "ai_research_runtime_adapter.evidence_ref_from_runtime_projection）："
             "identity 与核验维度都由 owner 投影派生，调用方不参与"
         )
 
@@ -897,6 +917,7 @@ def _issue_evidence_ref(
     ai_research_portfolio_adapter.evidence_ref_from_portfolio_projection
     ai_research_news_adapter.evidence_ref_from_news_projection
     ai_research_strategy_adapter.evidence_ref_from_strategy_projection
+    ai_research_runtime_adapter.evidence_ref_from_runtime_projection
     ```
 
     绕过 ``__init__``（它恒抛错）并在设置完全部字段后跑 ``__post_init__``，
