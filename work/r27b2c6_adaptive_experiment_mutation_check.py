@@ -1,12 +1,13 @@
 # -*- coding: utf-8 -*-
 """R27-B2C-6 —— adaptive / experiment owner fact 与 strategy adapter 的 **mutation matrix**。
 
-覆盖 ``M-EXP-01`` ~ ``M-EXP-17``，逐条对应本轮要钉死的不变量：
+覆盖 ``M-EXP-01`` ~ ``M-EXP-18``，逐条对应本轮要钉死的不变量：
 
 ```text
 selection candidate 只有一个 production writer（owner 自己）
 candidate 的 writer origin 只能由 owner 的 durable 记号证明（词汇不是来源）
 proposal 槽位冲突必须显式拒绝，不得谎报"已保存"
+幂等判据必须覆盖 proposal 的**完整 factual payload**（含 evidence / reason）
 candidate lifecycle status  ≠ owner verification
 run_date                    ≠ revision availability
 dataset cutoff              ≠ evaluation availability
@@ -16,15 +17,18 @@ adapter 只接受已批准的精确类型，且不接受 caller 命名的 identi
 registry 与真实 factory 双向一致
 ```
 
-────────────── review 后新增的两条（blocker 1 / blocker 2） ──────────────
+────────────── review 后发现的三条 ──────────────
 
 ```text
 M-EXP-16  来源判据退回"只看词汇" → 历史 DeepSeek 直写行被判成 owner verified
 M-EXP-17  proposal 槽位冲突被静默吞掉 → runtime 报告"仅保存候选"但实际没写
+M-EXP-18  幂等只看 weights → evidence / reason 变化被当成"同一个请求"，
+          候选 ledger 与 tuning run 对"这次持久化了什么"说法不一致
 ```
 
-这两条是 R27-B2C-6 review 抓出的真实缺陷，因此它们的 mutation 必须**先红**：
-``M-EXP-16`` 由 ``EXP-04d`` 捕获，``M-EXP-17`` 由 ``EXP-03e``（真实驱动 tuner）捕获。
+三条都是 review 抓出的真实缺陷，因此它们的 mutation 必须**先红**，并各自指定由哪条永久回归
+捕获（``EXP-04d`` / ``EXP-03e`` / ``EXP-03f``）。review 发现的漏洞立刻转成 mutation，
+否则下一轮回归仍然守不住它。
 
 ────────────── 与 brief 的偏差（记录，不静默） ──────────────
 
@@ -105,6 +109,10 @@ T_EXP_03D = _owner("SelectionWriterConvergenceTests."
                    "test_EXP_03d_an_occupied_slot_with_different_content_is_an_explicit_conflict")
 T_EXP_03E = _owner("SelectionWriterConvergenceTests."
                    "test_EXP_03e_the_tuner_reports_a_slot_conflict_instead_of_claiming_it_saved")
+T_EXP_03F = _owner("SelectionWriterConvergenceTests."
+                   "test_EXP_03f_idempotency_must_cover_the_whole_factual_payload")
+T_EXP_03G = _owner("SelectionWriterConvergenceTests."
+                   "test_EXP_03g_the_runtime_never_reuses_a_row_for_a_different_proposal")
 T_EXP_04 = _owner("CandidateLifecycleIsNotVerificationTests."
                   "test_EXP_04_candidate_lifecycle_status_never_changes_verification")
 T_EXP_04B = _owner("CandidateLifecycleIsNotVerificationTests."
@@ -176,6 +184,7 @@ T_EXP_28 = _adapter("DeferredLegacyRuntimeTests."
 BASELINE_ONLY_TARGETS = (
     T_EXP_03,
     T_EXP_03D,
+    T_EXP_03G,
     T_EXP_04B,
     T_EXP_04E,
     T_EXP_05,
@@ -230,7 +239,17 @@ SEL_ORIGIN_CHECK = (
 SEL_PROPOSAL_CONFLICT = (
     "    raise SelectionProposalConflict(\n"
     "        f\"shadow proposal slot {day}/{account}/{regime_text} is already occupied by candidate \"\n"
-    "        f\"{item.get('id')} with different content — 本次提案**没有**被持久化\"\n"
+    "        f\"{item.get('id')} with different factual content — 本次提案**没有**被持久化\"\n"
+    "    )\n"
+)
+
+#: 幂等判据的比较集合 —— 必须覆盖完整 factual payload。
+SEL_IDEMPOTENCY_COMPARISON = (
+    "    return (\n"
+    "        stored_baseline == baseline_canonical\n"
+    "        and stored_candidate == candidate_canonical\n"
+    "        and stored_evidence == evidence_canonical\n"
+    '        and str(item.get("reason") or "") == reason_text\n'
     "    )\n"
 )
 
@@ -571,6 +590,22 @@ MUTATIONS: list[dict] = [
         "new": "    return int(item[\"id\"])  # MUTANT —— 冲突被当成幂等成功\n",
         "test": T_EXP_03E,
         "desc": "proposal 槽位冲突被静默吞掉并谎报保存成功",
+    },
+    {
+        "id": "M-EXP-18",
+        # 幂等只看 weights —— evidence / reason 变化被当成"同一个请求"，于是候选 ledger 留着
+        # E1/R1 而 tuning run 记着 E2/R2，两层对"这次持久化了什么"说法不一致。
+        # 这是 R27-B2C-6 第二轮 review 抓出的剩余 blocker。
+        "file": SELECTION_FILE,
+        "old": SEL_IDEMPOTENCY_COMPARISON,
+        "new": (
+            "    return (  # MUTANT —— 幂等只看 weights，忽略 evidence / reason\n"
+            "        stored_baseline == baseline_canonical\n"
+            "        and stored_candidate == candidate_canonical\n"
+            "    )\n"
+        ),
+        "test": T_EXP_03F,
+        "desc": "幂等判据忽略 evidence / reason（两个 durable 层描述不一致）",
     },
 ]
 

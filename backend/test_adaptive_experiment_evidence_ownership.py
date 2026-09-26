@@ -535,6 +535,144 @@ class SelectionWriterConvergenceTests(_DbTestCase):
         )
 
 
+    def test_EXP_03f_idempotency_must_cover_the_whole_factual_payload(self):
+        """EXP-03f：幂等判据必须覆盖**完整 factual payload**（含 ``evidence`` / ``reason``）。
+
+        review 抓出的剩余缺口：owner fact 自己把 ``evidence_canonical`` 与 ``reason`` 纳入了
+        ``content_fingerprint``（也就是 owner 已声明"这两个字段变化 ⇒ 事实内容变化"），但
+        写入口一度只用"weights 相同"定义"同一个请求"。于是同一次重放会在两个 durable 层留下
+        **不一致**的描述：
+
+        ```text
+        旧 candidate: weights=W, evidence=E1, reason=R1
+        新 proposal:  weights=W, evidence=E2, reason=R2
+        → 返回旧 id（幂等成功），E2/R2 没有写进候选 ledger
+        → 但本次 tuning runtime 把 W+E2+R2 记进 adaptive_ai_tuning_runs
+        ```
+
+        这与"没有真正保存却报告保存"是同一类缺陷。本测试用**单字段隔离矩阵**钉住它：
+        candidate 权重、baseline、evidence、reason 四个 factual 字段**各自**变化都必须冲突；
+        四个全部一致才允许幂等成功（正向非空性）。
+        """
+        conn = _selection_conn()
+        baseline, candidate = _weights_patch()
+        base_evidence = {"source": "DeepSeek", "confidence": 90, "evidence_hash": "A"}
+        base_reason = "R1"
+        common = dict(
+            run_date="2026-09-18", account_id="tq_breakout", regime="momentum:ai:1030",
+            model_id="one_to_two",
+        )
+        first = ASEL.record_shadow_proposal(
+            conn, baseline_params=baseline, candidate_params=candidate,
+            evidence=base_evidence, reason=base_reason,
+            now="2026-09-21T09:10:00+08:00", **common,
+        )
+
+        # 正向非空性：四个 factual 字段全部一致 → 幂等成功（同一个 id，不新增行）。
+        _same_baseline, same_candidate = _weights_patch(spread=0.02)
+        self.assertEqual(
+            first,
+            ASEL.record_shadow_proposal(
+                conn, baseline_params=dict(baseline), candidate_params=same_candidate,
+                evidence={"confidence": 90, "evidence_hash": "A", "source": "DeepSeek"},
+                reason="R1", now="2026-09-21T09:20:00+08:00", **common,
+            ),
+            "factual payload 完全一致时必须幂等成功（键序不同不算差异）",
+        )
+        self.assertEqual(
+            1, conn.execute(f"SELECT COUNT(*) FROM {SELECTION_TABLE}").fetchone()[0],
+        )
+
+        # 单字段隔离矩阵：任一 factual 字段变化 → 显式冲突。
+        _other_baseline, other_candidate = _weights_patch(spread=0.01)
+        shifted_baseline = {"weights": dict(baseline["weights"]), "entry_score_delta": 0.02}
+        for label, overrides in (
+            ("candidate_params", {"candidate_params": other_candidate}),
+            ("baseline_params", {"baseline_params": shifted_baseline}),
+            ("evidence", {"evidence": {"source": "DeepSeek", "confidence": 80,
+                                       "evidence_hash": "B"}}),
+            ("reason", {"reason": "R2"}),
+        ):
+            with self.subTest(field=label):
+                payload = dict(
+                    baseline_params=baseline, candidate_params=candidate,
+                    evidence=base_evidence, reason=base_reason,
+                )
+                payload.update(overrides)
+                with self.assertRaises(ASEL.SelectionProposalConflict):
+                    ASEL.record_shadow_proposal(
+                        conn, now="2026-09-21T09:30:00+08:00", **{**common, **payload},
+                    )
+        self.assertEqual(
+            1, conn.execute(f"SELECT COUNT(*) FROM {SELECTION_TABLE}").fetchone()[0],
+            "冲突路径不得留下任何行",
+        )
+
+    def test_EXP_03g_the_runtime_never_reuses_a_row_for_a_different_proposal(self):
+        """EXP-03g：同一槽位里 evidence / reason 变化时，runtime 必须报冲突而不是复用旧行。
+
+        端到端版本（review 给的场景）：两次 tuning 运行命中**同一个槽位**、**同样的 weights**，
+        但 `evidence_hash` 与 `reason` 不同。第一版会把这判成"同一个请求"，返回旧 id ——
+        于是候选 ledger 里留着 E1/R1，而 `adaptive_ai_tuning_runs` 记着 E2/R2，两层对"这次
+        持久化了什么"说法不一致。
+
+        现在第二次必须 `proposal_conflict`，且候选 ledger **仍然只有一行**（E1/R1 未被静默
+        替换，也没有多出第二行）。同时断言第一次落库的 factual payload 确实就是它报告的那份。
+        """
+        conn = _adaptive_conn()
+        _baseline, candidate = _weights_patch()
+        profile = {"profile_date": "2026-09-18", "regime": "momentum",
+                   "quality": "valid_close", "valid_rows": 5000}
+        accounts = [{"account_id": "tq_breakout", "version": "v1", "style": "s",
+                     "weights": {}, "entry_score_delta": 0.0, "conditions": {}}]
+
+        def run(evidence_hash, reason):
+            response = {"decision": "propose", "confidence": 90, "proposals": [
+                {"account_id": "tq_breakout", "reason": reason, "weights": candidate["weights"]},
+            ]}
+            with mock.patch.object(DA, "enabled", return_value=True), \
+                    mock.patch.object(DA, "configured", return_value=True), \
+                    mock.patch.object(DA, "_now", return_value="2026-09-18T10:30:00+08:00"), \
+                    mock.patch.object(DA, "_tuning_accounts", return_value=accounts), \
+                    mock.patch.object(DA, "collect_evidence",
+                                      return_value=({"market_snapshot": {}}, evidence_hash)), \
+                    mock.patch.object(DA, "call_json", return_value=(response, 0, 0)):
+                return DA.run_realtime_tuning(
+                    lambda: conn, "unused-paper.db", [],
+                    config={"llm_realtime_require_cross_source": False}, profile=profile,
+                )
+
+        first = run("H" * 8, "R1")
+        self.assertEqual(1, len(first["persisted_ids"]))
+        self.assertEqual([], first["conflicts"])
+        fact = ASEL.selection_candidate_fact(conn, first["persisted_ids"][0], as_of="2026-09-18")
+        self.assertEqual("R1", fact.reason)
+        self.assertEqual("H" * 8, fact.evidence["evidence_hash"])
+        self.assertEqual(90.0, fact.evidence["confidence"])
+        self.assertEqual(
+            candidate["weights"], fact.candidate_params["weights"],
+            "落库候选的权重必须就是本次提案请求的权重",
+        )
+        self.assertEqual(
+            ASEL.SELECTION_OWNER_ORIGIN_MARKER,
+            fact.evidence[ASEL.SELECTION_OWNER_ORIGIN_KEY],
+            "来源记号必须落在同一份 evidence 里，不引入第二套 metadata",
+        )
+
+        # 同一槽位、同一 weights，但 evidence_hash 与 reason 不同 → 不得复用旧行。
+        second = run("G" * 8, "R2")
+        self.assertEqual("proposal_conflict", second["status"])
+        self.assertEqual([], second.get("persisted_ids", []))
+        self.assertTrue(second["conflicts"])
+        self.assertEqual(
+            1, conn.execute(f"SELECT COUNT(*) FROM {SELECTION_TABLE}").fetchone()[0],
+            "冲突路径不得新增行，也不得改写既有行",
+        )
+        still = ASEL.selection_candidate_fact(conn, first["persisted_ids"][0], as_of="2026-09-18")
+        self.assertEqual("R1", still.reason)
+        self.assertEqual("H" * 8, still.evidence["evidence_hash"])
+
+
 class CandidateLifecycleIsNotVerificationTests(_DbTestCase):
     """EXP-04：lifecycle status 不是核验。"""
 
