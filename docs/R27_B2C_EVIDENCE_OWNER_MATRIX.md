@@ -1297,7 +1297,10 @@ candidate lifecycle status                         生命周期 / 资格；**不
 candidate revision identity                        <candidate_id>@<updated_at>
 candidate availability_day                         updated_at 归一到 owner 时区（Asia/Shanghai）后的日历日
 run_date                                           标签，永不进 as_of
-proposal 槽位冲突                                  显式 SelectionProposalConflict（与幂等重放分开）
+proposal 槽位冲突                                  显式 SelectionProposalConflict（与幂等重放分开）；
+                                                   幂等判据 = 完整 factual payload
+                                                   （model_id / baseline / candidate /
+                                                     evidence / reason 五项全同）
 evaluation availability_day                        evaluation manifest created_at 归一后的日历日
 dataset cutoff                                     内容冻结边界，只作为**事实字段**保留
 evaluation_admitted / evaluation_contract_ok       契约门禁结果；**不是**"策略为真"
@@ -1379,8 +1382,45 @@ UNIQUE 冲突至少会失败）。现在两种情形给出**不同**结论：
 ``run_realtime_tuning`` 逐条捕获该异常并记账，返回 ``persisted_ids`` 与 ``conflicts``：
 部分冲突时理由写明"N/M 个未持久化"，全部冲突时 ``status='proposal_conflict'``。既有行的
 lifecycle 仍然逐字不变（提案不得把已 ``applied`` / ``rolled_back`` 的候选改回影子态）。
-幂等比较刻意**不**包含 ``evidence``：同一次 proposer 重跑会带不同的 confidence /
-evidence_hash，那不是 proposal 内容的差异，也不能因此把已存在的提案判成冲突。
+
+### review 修正二（续）：幂等判据必须覆盖**完整 factual payload**
+
+上面那一段第一版的判据是 "``model_id`` / ``baseline_params`` / ``candidate_params`` 逐字相同
+⇒ 同一个请求"，并刻意**排除** ``evidence`` / ``reason``。第二次 review 指出这与 owner 自己的
+契约不一致 —— :meth:`AdaptiveSelectionFactProjection._fingerprint` **已经**把
+``evidence_canonical`` 与 ``reason`` 计入，也就是 owner 已声明"这两个字段变化 ⇒ 事实内容变化"。
+写入口用更松的定义会造成两个 durable 层对**同一次成功持久化**给出不同描述：
+
+```text
+旧 candidate:  weights=W, evidence=E1, reason=R1
+新 proposal:   weights=W, evidence=E2, reason=R2
+→ 返回旧 id（幂等成功），E2/R2 没有写进候选 ledger
+→ 但本次 tuning runtime 把 W+E2+R2 记进 adaptive_ai_tuning_runs
+→ 两层对"这次持久化的 candidate fact"说法不一致     ✗
+```
+
+这与"没有真正保存却报告保存"是同一类缺陷，只是更隐蔽。现在幂等判据与 owner fact 的 factual
+payload **逐项对齐**：
+
+```text
+model_id / baseline_params / candidate_params / evidence / reason  五项全部逐字相同
+    → 明确的幂等成功
+任一 factual 字段不同
+    → SelectionProposalConflict
+```
+
+两个实现细节：
+
+```text
+evidence 用**盖章后**的 canonical 文本比较
+    durable 行存的就是盖章后的内容；因盖章是覆盖式的，两侧比较的都是 owner 实际会落库的字节
+reason 用与落库一致的截断形式（[:500]）比较
+刻意不比较 revision_at / availability_day / created_at
+    它们由写入口的 now 派生，属于"这条事实何时可用"，不是提案断言的 payload。重放本来就会
+    带新的 now，要求它们相等会让**任何**重放都变成冲突 —— 那样"明确的幂等成功"就不存在了。
+    代价是幂等成功返回的那一行，其 content fingerprint 不会等于"此刻新写一行"会得到的指纹：
+    本层声明的是"这份 payload 已在 ledger 里"，**不是**"这一行等于一次全新写入"。
+```
 
 
 ### 三个 owner 各自发布的核验闭集
@@ -1483,7 +1523,8 @@ strategy research adapter count:                    before = 0   after = 1
 strategy adapter production callers:                before = 0   after = 0（预期状态）
 selection writer-origin proof:                      before = 0   after = 1（durable owner marker；词汇不再当来源）
 proposal collision semantics:                        before = 静默返回既有 id
-                                                     after = 幂等重放 / 显式 SelectionProposalConflict
+                                                     after = 幂等重放（完整 factual payload 全同）
+                                                             / 显式 SelectionProposalConflict
 new public exception types:                         1（SelectionProposalConflict）
 implicit current / latest lookup:                   before = 0   after = 0
 lifecycle → verification coupling:                  before = 0   after = 0
@@ -1566,9 +1607,10 @@ L2 FOCUSED  adaptive / selection / risk / learning dataset / learning evaluation
             science / strategy adapter / research ownership guard / ai_research_contract /
             network boundary guards（含 deepseek_advisor tuner 回归）
 L3 MUTATION work/r27b2c6_adaptive_experiment_mutation_check.py
-            M-EXP-01 ~ M-EXP-17；baseline=GREEN, 17/17 DETECTED, survived=0, fake=0,
+            M-EXP-01 ~ M-EXP-18；baseline=GREEN, 18/18 DETECTED, survived=0, fake=0,
             timeout=0, restore sha256=PASS
 L4 FINAL    python -m unittest discover -s backend -p "test_*.py"
+            4586 tests, failures=0, errors=0, skipped=5
 ```
 
 ### review 修正三：测试的墙钟依赖（execution 域，只动测试）
@@ -1593,9 +1635,10 @@ execution_planner._session_phase(周末)  → "market_closed"
 M-EXP-14  第一版**存活**过：当时的 EXP-23 断言同时改动了 availability_day，于是"业务日变了"
           掩盖了"指纹忽略了 revision identity"。修正后断言只在**同一业务日内**换一个瞬间。
 
-M-EXP-16 / M-EXP-17  由 **review** 先发现（不是 mutation matrix）：来源判据退回词汇归属，
-          以及槽位冲突被静默吞掉。补上 mutation 之后两条都被对应的永久回归捕获
-          （EXP-04d / EXP-03e），因此这不再依赖下一次人工审核才被发现。
+M-EXP-16 / M-EXP-17 / M-EXP-18  由 **review** 先发现（不是 mutation matrix）：
+          来源判据退回词汇归属、槽位冲突被静默吞掉、幂等判据忽略 evidence/reason。
+          补上 mutation 之后三条都被对应的永久回归捕获
+          （EXP-04d / EXP-03e / EXP-03f），因此这不再依赖下一次人工审核才被发现。
 ```
 
 这正是 mutation matrix 的价值：它把"看起来合理、实则空转"的断言变成可执行的缺口；而 review

@@ -143,13 +143,48 @@ API 层的成功与 durable 状态被分开 —— 比收敛前的裸 INSERT 更
 会失败）。现在两种情形给出**不同**结论：
 
 ```text
-既有行内容与本次提案逐字相同 → 明确的**幂等成功**（返回既有行 id）
-内容不同 / 既有行损坏无法比较 → 抛 SelectionProposalConflict：本次提案**没有**被持久化
+既有行 factual payload 与本次提案逐项相同 → 明确的**幂等成功**（返回既有行 id）
+任一 factual 字段不同 / 既有行损坏          → 抛 SelectionProposalConflict：本次提案**没有**被持久化
 ```
 
 `run_realtime_tuning` 逐条捕获并返回 `persisted_ids` / `conflicts`：部分冲突时理由写明
 "N/M 个未持久化"，全部冲突时 `status='proposal_conflict'`。既有行 lifecycle 逐字不变。
-幂等比较刻意**不**包含 `evidence`（proposer 重跑会带不同 confidence，那不是提案内容的差异）。
+
+### 修正二（续）：幂等判据必须覆盖**完整 factual payload**
+
+第一版的幂等判据是"`model_id` / `baseline_params` / `candidate_params` 逐字相同"，并刻意
+**排除** `evidence` / `reason`。这与 owner 自己的契约不一致：
+`AdaptiveSelectionFactProjection._fingerprint` **已经**把 `evidence_canonical` 与 `reason`
+计入 —— owner 已声明"这两个字段变化 ⇒ 事实内容变化"。写入口用更松的定义会造成两个 durable 层
+对**同一次成功持久化**给出不同描述：
+
+```text
+旧 candidate:  weights=W, evidence=E1, reason=R1
+新 proposal:   weights=W, evidence=E2, reason=R2
+→ 返回旧 id（幂等成功），E2/R2 没有写进候选 ledger
+→ 但本次 tuning runtime 把 W+E2+R2 记进 adaptive_ai_tuning_runs
+→ 两层对"这次持久化的 candidate fact"说法不一致     ✗
+```
+
+这与"没有真正保存却报告保存"是同一类缺陷，只是更隐蔽。现在幂等判据与 owner fact 的 factual
+payload **逐项对齐**：
+
+```text
+model_id / baseline_params / candidate_params / evidence / reason  五项全部逐字相同
+    → 明确的幂等成功
+任一 factual 字段不同
+    → SelectionProposalConflict
+```
+
+```text
+evidence 用**盖章后**的 canonical 文本比较（durable 行存的就是盖章后内容）
+reason 用与落库一致的截断形式（[:500]）比较
+刻意不比较 revision_at / availability_day / created_at
+    它们由写入口的 now 派生，属于"这条事实何时可用"，不是提案断言的 payload。重放本来就会带
+    新的 now，要求它们相等会让**任何**重放都变成冲突 —— 那样"明确的幂等成功"就不存在了。
+    代价是幂等成功返回的那一行，其 content fingerprint 不等于"此刻新写一行"会得到的指纹：
+    本层声明的是"这份 payload 已在 ledger 里"，**不是**"这一行等于一次全新写入"。
+```
 
 ### 修正三：测试的墙钟依赖（execution 域，**只动测试**）
 
@@ -163,9 +198,10 @@ execution_planner._session_phase(周末)  → "market_closed"
 ⇒ 周末跑 CI 时，10:00 的连续竞价卖点永远进不去
 ```
 
-修正：把 fixture 的日期对齐到最近的**交易日**（周一~周五）。**执行侧的 session 规则一个字都
-没改**；本 PR 的改动集合里除这条测试之外不含任何 execution / session / intraday / tradability
-文件。修完后 `docker-smoke` 在 exact-head 上 **PASS**。
+修正：把 fixture 的日期对齐到最近的非周末日（helper 名为 `_recent_non_weekend_day` —— 刻意
+不叫 "trading day"，因为它**不是**交易日历，只是"星期几不是周六周日"）。**执行侧的 session
+规则一个字都没改**；本 PR 的改动集合里除这条测试之外不含任何 execution / session / intraday /
+tradability 文件。修完后 `docker-smoke` 在 exact-head 上 **PASS**。
 
 ---
 
@@ -265,15 +301,18 @@ physical database provenance                   contract-issued = CLOSED；
 L1 FAST     python 3.14.5 / compileall -q backend / ruff check backend / git diff --check  → PASS
 L2 FOCUSED  adaptive + selection + risk + learning dataset/evaluation + promotion science +
             strategy adapter + research ownership guard + ai_research_contract + network
-            boundary guard + execution wiring + tuner 回归（540 tests）                    → PASS
+            boundary guard + execution wiring + tuner 回归（542 tests）                    → PASS
 L3 MUTATION work/r27b2c6_adaptive_experiment_mutation_check.py
-            baseline=GREEN, 17/17 DETECTED, survived=0, fake=0, timeout=0,
+            baseline=GREEN, 18/18 DETECTED, survived=0, fake=0, timeout=0,
             restore sha256=PASS                                                            → PASS
 L4 FINAL    python -m unittest discover -s backend -p "test_*.py"
-            4584 tests, failures=0, errors=0, skipped=5                                    → PASS
+            4586 tests, failures=0, errors=0, skipped=5                                    → PASS
 ```
 
-### L3 里的三个真实缺口（记录，不静默）
+（`skipped` 数量随运行环境而变：本地 5、GitHub exact-head 的 `tests` job 报 3、`docker-smoke`
+（`--network none`）报 30 —— 都是"网络可选测试按分层规则 skip"，不是失败。）
+
+### L3 里的真实缺口（记录，不静默）
 
 ```text
 M-EXP-14  第一版**存活**过（mutation matrix 自己抓到）：当时的 EXP-23 断言同时改动了
@@ -283,6 +322,8 @@ M-EXP-16  **review 先发现**：来源判据退回词汇归属 → 历史第二
           补上 mutation 后由 EXP-04d 捕获。
 M-EXP-17  **review 先发现**：proposal 槽位冲突被静默吞掉并谎报保存。
           补上 mutation 后由 EXP-03e（真实驱动 tuner）捕获。
+M-EXP-18  **review 先发现**：幂等只看 weights → evidence / reason 变化被当成"同一个请求"。
+          补上 mutation 后由 EXP-03f（单字段隔离矩阵）捕获。
 ```
 
 review 发现的漏洞已立刻转成 mutation —— 否则下一轮回归仍然守不住它。
@@ -291,19 +332,20 @@ review 发现的漏洞已立刻转成 mutation —— 否则下一轮回归仍�
 
 ---
 
-## exact-head CI（head = `dcd99ed`）
+## exact-head CI
 
 ```text
-tests                  PASS  11m41s
-syntax                 PASS  9s
-quality                PASS  20s
-frontend               PASS  11s
-browser-e2e (chromium) PASS  2m27s
-security-leak-scan     PASS  1m30s
-docker-smoke           PASS  8m37s      ← 墙钟依赖修正后由 FAIL 转 PASS
+tests                  PASS
+syntax                 PASS
+quality                PASS
+frontend               PASS
+browser-e2e (chromium) PASS
+security-leak-scan     PASS
+docker-smoke           PASS      ← 修正三（墙钟依赖）后由 FAIL 转 PASS
 ```
 
 `mergeStateStatus = CLEAN`，`mergeable = true`，unresolved threads = 0。
+具体 head 与耗时见 PR 的 checks 面板（本文不写死 hash，避免与 checks 漂移）。
 
 ---
 

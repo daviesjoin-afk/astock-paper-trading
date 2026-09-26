@@ -2657,13 +2657,24 @@ caller 无法申明来源：写路径覆盖同名键
 UNIQUE 冲突至少会失败）。现在两种情形给出不同结论：
 
 ```text
-既有行内容与本次提案逐字相同  → 明确的幂等成功（返回既有行 id）
-内容不同 / 既有行损坏          → 抛 SelectionProposalConflict：本次提案**没有**被持久化
+既有行的 factual payload 与本次提案逐项相同  → 明确的幂等成功（返回既有行 id）
+任一 factual 字段不同 / 既有行损坏            → 抛 SelectionProposalConflict：本次提案**没有**被持久化
 ```
+
+幂等判据必须覆盖**完整 factual payload**（``model_id`` / ``baseline_params`` /
+``candidate_params`` / ``evidence`` / ``reason``），而不是"weights 相同就算同一个请求" ——
+owner fact 的 ``content_fingerprint`` **已经**把 ``evidence`` 与 ``reason`` 计入，也就是 owner
+已声明"这两个字段变化 ⇒ 事实内容变化"。写入口用更松的定义会造成两个 durable 层对**同一次成功
+持久化**给出不同描述（候选 ledger 留着 E1/R1，而 ``adaptive_ai_tuning_runs`` 记着 E2/R2）。
+``evidence`` 用**盖章后**的 canonical 文本比较，``reason`` 用与落库一致的截断形式。
+
+刻意**不**比较 ``revision_at`` / ``availability_day`` / ``created_at``：它们由写入口的 ``now``
+派生，属于"这条事实何时可用"而非提案断言的 payload；要求它们相等会让**任何**重放都变成冲突。
+代价是幂等成功返回的行其 fingerprint 不等于"此刻新写一行"的指纹 —— 本层声明的是"这份 payload
+已在 ledger 里"，**不是**"这一行等于一次全新写入"。
 
 ``run_realtime_tuning`` 逐条捕获并返回 ``persisted_ids`` / ``conflicts``：部分冲突时理由写明
 "N/M 个未持久化"，全部冲突时 ``status='proposal_conflict'``。既有行 lifecycle 逐字不变。
-幂等比较刻意不含 ``evidence``（proposer 重跑会带不同 confidence，那不是提案内容的差异）。
 
 #### 唯一 adapter
 
@@ -2699,8 +2710,10 @@ backend/test_adaptive_experiment_evidence_ownership.py   EXP-01 ~ EXP-18（owner
     selection ledger 只有一个生产 writer；deepseek_advisor 不再提到该表；
     AI 提案仍不能自动 apply（且提案追加而非改写生命周期）；
     槽位被内容不同的候选占用 → 显式 SelectionProposalConflict，且不写任何行；
+    幂等判据覆盖**完整 factual payload**：candidate / baseline / evidence / reason
+    单字段隔离矩阵各自变化都必须冲突（含 evidence_hash 与 reason），全同才幂等成功；
     tuner 把冲突记成 not persisted（部分冲突写明 N/M，全部冲突 status=proposal_conflict），
-    不得报告"仅保存候选"；
+    不得报告"仅保存候选"；同一槽位里 evidence/reason 变化时 runtime 不得复用旧行；
     writer origin 只能由 owner 的 durable 记号证明 —— 历史第二 writer（含旧 owner 行）一律
     unproven，caller 无法申明该记号，带记号但词汇不合法仍 unproven；
     risk ledger 只有一个业务 writer 模块（不对称是被断言的，不是口头的）；
@@ -2730,14 +2743,15 @@ factory。`backend/ai_research_contract.py`：`SUPPORTED_OWNER_ADAPTERS` 加入
 `EVIDENCE_SOURCE_STRATEGY_RESEARCH`；`backend/test_ai_research_contract.py` 的
 `ALLOWED_AI_CONSUMERS` 登记新接缝（谁依赖了 AI 必须是一次有意识的决定）。
 
-语义 mutation 在 `work/r27b2c6_adaptive_experiment_mutation_check.py`（M-EXP-01 ~ 17）必须
+语义 mutation 在 `work/r27b2c6_adaptive_experiment_mutation_check.py`（M-EXP-01 ~ 18）必须
 全部 CAUGHT（baseline GREEN、survived = 0、fake = 0、timeout = 0、被改写文件的 restore
-sha256 一致）。其中两条是 **review 先发现、随后立刻转成 mutation** 的：
+sha256 一致）。其中三条是 **review 先发现、随后立刻转成 mutation** 的：
 
 ```text
 M-EXP-14  （第一版存活）内容指纹忽略 revision identity
 M-EXP-16  来源判据退回词汇归属 → 历史第二 writer 的行被判成 owner verified
 M-EXP-17  proposal 槽位冲突被静默吞掉 → runtime 谎报"已保存"
+M-EXP-18  幂等只看 weights → evidence / reason 变化被当成"同一个请求"
 ```
 
 review 发现的漏洞必须立刻变成 mutation，否则下一轮回归仍然守不住它。
@@ -2975,11 +2989,17 @@ lifecycle / tier 落在 owner 词表内**不**证明这行是 owner 写的 —�
 `unproven`。且该记号是来源判据而非免检通行证：带记号但用了 owner 不签发词汇的行仍然
 `unproven`）
 proposal 槽位冲突被静默当成保存成功（R27-B2C-6 review 修正：
-`record_shadow_proposal` 的 `(run_date, account_id, regime)` 是 UNIQUE 槽位。既有行内容与
-本次提案逐字相同 → 明确的幂等成功；内容不同或既有行损坏 → 抛 `SelectionProposalConflict`，
-本次提案**没有**被持久化。`run_realtime_tuning` 必须把冲突记成 not persisted ——
-部分冲突时理由写明 N/M 未持久化，全部冲突时 `status='proposal_conflict'`，
-**不得**继续报告"仅保存候选"）
+`record_shadow_proposal` 的 `(run_date, account_id, regime)` 是 UNIQUE 槽位。既有行的
+factual payload 与本次提案**逐项相同** → 明确的幂等成功；**任一** factual 字段不同或既有行
+损坏 → 抛 `SelectionProposalConflict`，本次提案**没有**被持久化。`run_realtime_tuning` 必须把
+冲突记成 not persisted —— 部分冲突时理由写明 N/M 未持久化，全部冲突时
+`status='proposal_conflict'`，**不得**继续报告"仅保存候选"）
+幂等判据被收紧成"weights 相同"（R27-B2C-6 review 修正：幂等比较必须覆盖**完整 factual
+payload**（`model_id` / `baseline_params` / `candidate_params` / `evidence` / `reason`），
+因为 owner fact 的 `content_fingerprint` 已经把 `evidence` 与 `reason` 计入 —— 用更松的定义
+会让候选 ledger 与 `adaptive_ai_tuning_runs` 对同一次成功持久化给出不同描述。`evidence` 在
+owner 盖章后比较；`revision_at` / `availability_day` / `created_at` 刻意排除，因为它们由
+`now` 派生、要求相等会让任何重放都变成冲突）
 ```
 
 ### 仅作 review signal（不进入 CI gate）
