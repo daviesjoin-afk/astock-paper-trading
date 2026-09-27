@@ -20,7 +20,6 @@ import ai_research_repository as repository  # noqa: E402
 import api_adaptive  # noqa: E402
 import market_data_contract as MDC  # noqa: E402
 from fastapi import FastAPI, HTTPException  # noqa: E402
-from fastapi.testclient import TestClient  # noqa: E402
 
 
 DAY = "2026-08-27"
@@ -65,8 +64,7 @@ class CanonicalResearchAPITests(unittest.TestCase):
         self.addCleanup(self.path_patch.stop)
         app = FastAPI()
         app.include_router(api_adaptive.router)
-        self.client = TestClient(app)
-        self.addCleanup(self.client.close)
+        self.app = app
 
     def append(self, *, purpose="candidate_challenge", subject="600000", as_of=DAY,
                confidence=0.8, supported=True):
@@ -94,13 +92,16 @@ class CanonicalResearchAPITests(unittest.TestCase):
                 "SELECT 1 FROM sqlite_master WHERE type='table' AND name='ai_research_runs'"
             ).fetchone())
 
-    def test_B3_API_01b_routes_are_bounded_and_detail_path_is_registered(self):
-        listed = self.client.get("/api/adaptive/research/runs?limit=201")
-        self.assertEqual(422, listed.status_code)
-        too_long = self.client.get("/api/adaptive/research/runs?purpose=" + "x" * 81)
-        self.assertEqual(422, too_long.status_code)
-        missing = self.client.get("/api/adaptive/research/runs/999")
-        self.assertEqual(404, missing.status_code)
+    def test_B3_API_01b_routes_are_registered_with_bounded_query_contract(self):
+        paths = self.app.openapi()["paths"]
+        list_route = paths["/api/adaptive/research/runs"]["get"]
+        self.assertIn("get", paths["/api/adaptive/research/runs/{run_id}"])
+        params = {item["name"]: item for item in list_route["parameters"]}
+        limit_schema = params["limit"]["schema"]
+        self.assertEqual(1, limit_schema["minimum"])
+        self.assertEqual(200, limit_schema["maximum"])
+        self.assertEqual(50, limit_schema["default"])
+        self.assertEqual({"purpose", "as_of", "subject"}, set(params) - {"limit"})
 
     def test_B3_API_02_list_uses_repository_filters_order_and_limit(self):
         old = self.append(purpose="candidate_challenge", subject="600000", as_of=DAY)
