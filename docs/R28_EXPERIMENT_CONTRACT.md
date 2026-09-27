@@ -6,7 +6,8 @@
 | --- | --- | --- |
 | R27 | COMPLETE | R27-B2C 与 R27-B3 均已合并完成；既有 provenance 缺口仍 OPEN / REQUIRED。 |
 | R28-A | COMPLETE | 只定义不可变实验身份与统一结果结构；没有 runner、caller、API 或数据库迁移。 |
-| R29 | NOT STARTED | 负责 PIT Validation Lab 与 canonical execution。 |
+| R29-A | IN PROGRESS | 建立 PIT Validation Evidence 与输入门禁；canonical runner 延后。 |
+| R29 canonical runner | NOT STARTED / DEFERRED | 需要 historical market-data archive/provenance 等 owner 缺口先闭合。 |
 | R30 | NOT STARTED | 负责 robustness。 |
 
 **R28-A 回答两个问题：什么输入构成同一个策略实验，以及实验结果至少如何表达。** 它不执行
@@ -70,6 +71,9 @@ capacity proxy、exposure 与 regime breakdown 可以保持 unavailable；本阶
 契约不含 approved/promotable/champion/production 状态，也不读取数据库、网络、文件、Git、时钟、LLM 或
 全局配置。不新增 service、manager、facade、framework、API、生产 caller 或 DB migration。当前 R28-A 的
 business authority 仅为 **experiment identity/result contract**。
+
+R29-A 将在 [`R29_PIT_VALIDATION.md`](R29_PIT_VALIDATION.md) 接入这份 spec，并将身份与历史来源证明分开。
+R29-A 不会把声明的 dataset/universe/market-data fingerprint 当作 PIT 来源证明；canonical runner 与持久化执行仍 deferred。
 
 ## R27 缺口状态
 
