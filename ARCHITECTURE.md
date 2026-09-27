@@ -3340,7 +3340,7 @@ timeline 不嵌入结论，未关联 canonical id 的 legacy result 保持 unava
 B3 不新增 ledger、migration、provider 或 authority，不改变 trading/tuning 权限，也不删除 roadmap
 能力。owner identity、PIT、verification、runtime terminal instant、stable attempt identity、历史市场证据、
 cycle membership 与 physical DB origin 等缺口继续 **OPEN / REQUIRED**，production fail closed。
-R27-B2C = **COMPLETE**；R27-B3 = **COMPLETE（PR #210 MERGED）**；R28-A = **COMPLETE**；R29 = **NOT STARTED**；R30 = **NOT STARTED**。
+R27-B2C = **COMPLETE**；R27-B3 = **COMPLETE（PR #210 MERGED）**；R28-A = **COMPLETE**；R29-A = **IN PROGRESS**；R29 canonical runner = **NOT STARTED / DEFERRED**；R30 = **NOT STARTED**。
 
 ### R28-A：Strategy Experiment Identity & Result Contract（COMPLETE）
 
@@ -3356,6 +3356,23 @@ R28-A 是 contract-first 阶段：production runner/caller = **0**，因为 cano
 experiment result）。现有 universe、完整 tradability snapshot、experiment market-data identity、parameter
 historical linkage 与 execution provenance 缺口继续 OPEN / REQUIRED；不接受 current/latest/today 回退，
 缺失身份 fail closed。权威来源矩阵与完整边界见 [`docs/R28_EXPERIMENT_CONTRACT.md`](docs/R28_EXPERIMENT_CONTRACT.md)。
+
+### R29-A：Point-in-Time Validation Gate（IN PROGRESS）
+
+`backend/experiment_pit_validation.py` 只组合现有 owner / validator，签发不可变 `PITValidationEvidence`，
+并以 `READY / BLOCKED` 表示输入能否进入未来 canonical runner。它不生成策略表现、approval、promotion 或 AI score，
+也不连接 legacy `backtest.py`。walk-forward 继续由 `walk_forward_validation.build_walk_forward_folds` 处理，
+canonical 路径必须显式传入 authoritative `sessions` 和 ExperimentSpec evaluation as-of。
+Universe membership 按每个实验 session 单独求值；tradability 仅核验该 session 的成员，并将 available、blocked、unknown
+作为互斥 coverage 桶。Session calendar 还必须由明确 provenance 证明完整覆盖 ExperimentSpec 全范围，缺证时 universe、
+tradability、walk-forward 均保持 BLOCKED。财务观察必须关联实际使用它的 sample，并按该 sample 的 decision session 检查披露可见性；
+walk-forward calendar 与 samples 限定在 ExperimentSpec 日期范围内，越界日期不会进入 folds。
+
+当前没有完整 historical universe archive owner、ExperimentSpec 全范围的 session-calendar provenance 或 arbitrary historical market-data archive/provenance，因此相关维度保持
+OPEN / REQUIRED，缺少证据时整体 BLOCKED。current universe、current market snapshot、current strategy head、paper runtime
+assumptions、latest dataset 和联网刷新都不能补历史缺口。未来 UI projection 已包含 train / validation / OOS、fold windows、
+coverage 和 PIT warnings；frontend consumer deferred until canonical R29 run/read model exists。完整 authority matrix 见
+[`docs/R29_PIT_VALIDATION.md`](docs/R29_PIT_VALIDATION.md)。
 
 ### 仅作 review signal（不进入 CI gate）
 
