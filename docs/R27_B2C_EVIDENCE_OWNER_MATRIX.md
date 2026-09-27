@@ -1842,8 +1842,10 @@ OPEN / REQUIRED:
 R27-B2C backend research evidence convergence = COMPLETE
 B2C-8 = SUPERSEDED BY R27-B2C-FINAL
 B2C-9 = SUPERSEDED BY R27-B2C-FINAL
-B3 = COMPLETE（canonical research API/UI 已实现，PR 等待人工审核）
-R28 = NOT STARTED
+B3 = COMPLETE（canonical research API/UI 已由 PR #210 合并）
+R28-A = COMPLETE（纯 Strategy Experiment Identity & Result Contract；production caller = 0）
+R29 = NOT STARTED
+R30 = NOT STARTED
 ```
 
 四条 research collector 与 `ai_analysis` 当前消费 canonical owner typed facts，并通过
@@ -1852,7 +1854,7 @@ verification 的字段仍为 OPEN / REQUIRED，production 以 unavailable 处理
 adapter production callers = 0、collector 直读 legacy raw SQL、`adaptive_advisor_runs` 尚有 writer
 等状态均已由本节和 ARCHITECTURE.md 的 R27-B2C-FINAL 说明取代。
 
-## R27-B3 canonical research history API/UI（COMPLETE，PR 待人工审核）
+## R27-B3 canonical research history API/UI（COMPLETE，PR #210 MERGED）
 
 B3 的唯一 research result authority 仍是 `ai_research_runs`。列表和详情 API 复用
 `ai_research_repository` 的验证读取；UI 直接读取 canonical API，并在研究执行完成后刷新记录。
@@ -1870,4 +1872,6 @@ adaptive killed terminal instant、non-intraday paper job stable attempt identit
 alpha candidate stable identity、historical mutable candidate revisions、parameter/experiment linkage、
 historical market evidence、historical cycle membership，以及 physical DB origin / trusted provenance
 继续 **OPEN / REQUIRED**；缺失证据仍 fail closed。R27-B2C = **COMPLETE**，R27-B3 =
-**COMPLETE（PR 等待人工审核）**，R28 = **NOT STARTED**。
+**COMPLETE（PR #210 MERGED）**，R28-A = **COMPLETE**，R29 / R30 = **NOT STARTED**。R28-A 的
+实验身份来源矩阵见 `docs/R28_EXPERIMENT_CONTRACT.md`；它没有关闭 parameter/experiment linkage 或其他
+provenance 缺口。

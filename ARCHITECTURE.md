@@ -3321,9 +3321,9 @@ parameter/experiment linkage、历史 market evidence、历史 cycle membership�
 这些缺口不阻止“有 owner fact 就使用，否则明确 unavailable”的 B2C 完成定义。
 
 早期路线图中 B2C-8（deepseek research convergence）和 B2C-9（ai_analysis convergence）的
-未完成/延期描述均为历史状态，现由 **R27-B2C-FINAL（COMPLETE）** 取代。R27-B3 已完成实现并进入 PR 人工审核；R28 保持 **NOT STARTED**。
+未完成/延期描述均为历史状态，现由 **R27-B2C-FINAL（COMPLETE）** 取代。R27-B3 已由 PR #210 合并完成。
 
-### R27-B3：canonical research history API/UI（COMPLETE，PR 待人工审核）
+### R27-B3：canonical research history API/UI（COMPLETE，PR #210 MERGED）
 
 研究历史直接读取 `ai_research_runs`：`GET /api/adaptive/research/runs` 与
 `GET /api/adaptive/research/runs/{run_id}` 只调用 `ai_research_repository` 的验证读取，列表沿用
@@ -3340,7 +3340,22 @@ timeline 不嵌入结论，未关联 canonical id 的 legacy result 保持 unava
 B3 不新增 ledger、migration、provider 或 authority，不改变 trading/tuning 权限，也不删除 roadmap
 能力。owner identity、PIT、verification、runtime terminal instant、stable attempt identity、历史市场证据、
 cycle membership 与 physical DB origin 等缺口继续 **OPEN / REQUIRED**，production fail closed。
-R27-B2C = **COMPLETE**；R27-B3 = **COMPLETE（PR 等待人工审核）**；R28 = **NOT STARTED**。
+R27-B2C = **COMPLETE**；R27-B3 = **COMPLETE（PR #210 MERGED）**；R28-A = **COMPLETE**；R29 = **NOT STARTED**；R30 = **NOT STARTED**。
+
+### R28-A：Strategy Experiment Identity & Result Contract（COMPLETE）
+
+`backend/experiment_contract.py` 定义唯一的纯 `ExperimentSpec` / `ExperimentResult` contract。Spec 显式固定
+strategy version/checksum、code revision、dataset/universe/tradability/market-data identities、完整参数、
+date range、as-of policy、execution assumptions、cost model 与整数 seed；规范 JSON 的 SHA-256 是唯一
+experiment identity。Result 使用 `completed / failed / unavailable` 闭集，unknown 指标保留为空，且绑定 exact
+experiment fingerprint；没有 approval、promotion 或 AI scoring authority。
+
+R28-A 是 contract-first 阶段：production runner/caller = **0**，因为 canonical PIT execution 属于 R29。它不
+连接 legacy `backtest.py`，不增加 API、数据库迁移或 persistence，也不复制
+`learning_evaluation.ExperimentEvaluationProjection`（该类型仍是 evaluation owner fact，不是 top-level
+experiment result）。现有 universe、完整 tradability snapshot、experiment market-data identity、parameter
+historical linkage 与 execution provenance 缺口继续 OPEN / REQUIRED；不接受 current/latest/today 回退，
+缺失身份 fail closed。权威来源矩阵与完整边界见 [`docs/R28_EXPERIMENT_CONTRACT.md`](docs/R28_EXPERIMENT_CONTRACT.md)。
 
 ### 仅作 review signal（不进入 CI gate）
 
