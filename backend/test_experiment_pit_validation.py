@@ -69,6 +69,20 @@ def _sessions():
     return [f"2026-01-0{day}" for day in range(1, 7)]
 
 
+def _calendar_provenance(sessions=None, *, spec=None, complete=True, session_count=None):
+    sessions = list(_sessions() if sessions is None else sessions)
+    spec = spec or _spec()
+    in_range = [day for day in sessions if spec.start_date <= day <= spec.end_date]
+    return {
+        "kind": "historical_session_calendar",
+        "source": "fixture-exchange-calendar-v1",
+        "coverage_start": spec.start_date,
+        "coverage_end": spec.end_date,
+        "range_complete": complete,
+        "session_count": len(in_range) if session_count is None else session_count,
+    }
+
+
 def _samples():
     return [
         WFV.ValidationSample(
@@ -118,8 +132,11 @@ def _evaluate(**changes):
         "universe_source": _universe()[1],
         "tradability_repository": None,
         "fundamental_records": [{
-            "report_period": "2025-12-31", "published_at": "2026-03-20",
-            "net_profit": 10,
+            "record": {
+                "report_period": "2025-12-31", "published_at": "2026-03-20",
+                "net_profit": 10,
+            },
+            "sample_keys": [sample.sample_key for sample in _samples()],
         }],
         "samples": _samples(),
         "walk_forward_config": WFV.WalkForwardConfig(
@@ -142,28 +159,40 @@ class PITValidationTests(unittest.TestCase):
         self.assertIn("strategy_identity_mismatch", evidence.reason_codes)
 
     def test_R29_03_universe_sha_alone_does_not_prove_history(self):
-        evidence = _evaluate(universe_rows=None, universe_source=None)
+        evidence = _evaluate(
+            universe_rows=None, universe_source=None,
+            session_calendar_provenance=_calendar_provenance(),
+        )
         self.assertEqual("blocked", evidence.dimensions["historical_universe"]["status"])
 
     def test_R29_04_current_universe_source_cannot_pass_historical_completeness(self):
         rows, source = _universe("current_snapshot")
-        evidence = _evaluate(universe_rows=rows, universe_source=source)
+        evidence = _evaluate(
+            universe_rows=rows, universe_source=source,
+            session_calendar_provenance=_calendar_provenance(),
+        )
         self.assertEqual("blocked", evidence.dimensions["historical_universe"]["status"])
 
     def test_R29_05_complete_historical_archive_can_pass_universe_gate(self):
         rows, source = _universe()
-        evidence = _evaluate(universe_rows=rows, universe_source=source)
+        evidence = _evaluate(
+            universe_rows=rows, universe_source=source,
+            session_calendar_provenance=_calendar_provenance(),
+        )
         self.assertEqual("proven", evidence.dimensions["historical_universe"]["status"])
 
     def test_R29_06_missing_tradability_evidence_blocks(self):
-        evidence = _evaluate()
+        evidence = _evaluate(session_calendar_provenance=_calendar_provenance())
         self.assertEqual("blocked", evidence.dimensions["historical_tradability"]["status"])
         self.assertGreater(evidence.data_coverage["tradability"]["unknown"], 0)
 
     def test_R29_07_unknown_st_is_not_non_st(self):
         conn, repo = _tradability_repo(unknown_st=True)
         try:
-            evidence = _evaluate(tradability_repository=repo)
+            evidence = _evaluate(
+                tradability_repository=repo,
+                session_calendar_provenance=_calendar_provenance(),
+            )
             self.assertEqual("blocked", evidence.dimensions["historical_tradability"]["status"])
             self.assertGreater(evidence.data_coverage["tradability"]["unknown"], 0)
         finally:
@@ -172,7 +201,10 @@ class PITValidationTests(unittest.TestCase):
     def test_R29_07b_complete_requested_tradability_facts_are_reported(self):
         conn, repo = _tradability_repo()
         try:
-            evidence = _evaluate(tradability_repository=repo)
+            evidence = _evaluate(
+                tradability_repository=repo,
+                session_calendar_provenance=_calendar_provenance(),
+            )
             self.assertEqual("proven", evidence.dimensions["historical_tradability"]["status"])
             self.assertEqual(6, evidence.data_coverage["tradability"]["available"])
             self.assertEqual(1.0, evidence.data_coverage["tradability"]["ratio"])
@@ -196,23 +228,35 @@ class PITValidationTests(unittest.TestCase):
         self.assertIn("build_pit_validation_evidence", names)
 
     def test_R29_10_report_period_cannot_substitute_publication_time(self):
-        evidence = _evaluate(fundamental_records=[{"report_period": "2025-12-31", "net_profit": 3}])
+        evidence = _evaluate(fundamental_records=[{
+            "record": {"report_period": "2025-12-31", "net_profit": 3},
+            "sample_keys": ["sample-1"],
+        }])
         self.assertEqual("blocked", evidence.dimensions["fundamental_pit"]["status"])
 
     def test_R29_11_future_publication_is_invisible(self):
         evidence = _evaluate(fundamental_records=[{
-            "report_period": "2025-12-31", "published_at": "2026-04-01", "net_profit": 3,
+            "record": {
+                "report_period": "2025-12-31", "published_at": "2026-04-01", "net_profit": 3,
+            },
+            "sample_keys": ["sample-1"],
         }])
         self.assertEqual(1, evidence.data_coverage["fundamental"]["future"])
         self.assertEqual("blocked", evidence.dimensions["fundamental_pit"]["status"])
 
     def test_R29_12_missing_publication_is_blocked_in_strict_mode(self):
-        evidence = _evaluate(fundamental_records=[{"report_period": "2025-12-31", "eps": 0.1}])
+        evidence = _evaluate(fundamental_records=[{
+            "record": {"report_period": "2025-12-31", "eps": 0.1},
+            "sample_keys": ["sample-1"],
+        }])
         self.assertEqual(1, evidence.data_coverage["fundamental"]["publication_unproven"])
 
     def test_R29_12b_invalid_publication_metadata_has_its_own_bucket(self):
         evidence = _evaluate(fundamental_records=[{
-            "report_period": "2025-12-31", "published_at": "not-a-date", "eps": 0.1,
+            "record": {
+                "report_period": "2025-12-31", "published_at": "not-a-date", "eps": 0.1,
+            },
+            "sample_keys": ["sample-1"],
         }])
         self.assertEqual(1, evidence.data_coverage["fundamental"]["invalid"])
 
@@ -256,7 +300,10 @@ class PITValidationTests(unittest.TestCase):
             label_available_at="2026-04-01T15:00:00+08:00", target=0.1,
             pit_status=WFV.PIT_VERIFIED,
         )
-        evidence = _evaluate(samples=samples)
+        evidence = _evaluate(
+            samples=samples,
+            session_calendar_provenance=_calendar_provenance(),
+        )
         self.assertEqual("proven", evidence.dimensions["walk_forward"]["status"])
         self.assertIn("walk_forward_window_not_matured", evidence.pit_warnings)
         self.assertTrue(any(
@@ -273,7 +320,7 @@ class PITValidationTests(unittest.TestCase):
         self.assertIn("label_not_available_before_fold", result["report"]["exclusion_reasons"])
 
     def test_R29_20_blocked_required_dimension_blocks_whole_validation(self):
-        evidence = _evaluate()
+        evidence = _evaluate(session_calendar_provenance=_calendar_provenance())
         self.assertEqual("blocked", evidence.status)
         self.assertIn("historical_market_data_unavailable", evidence.reason_codes)
 
@@ -317,6 +364,7 @@ class PITValidationTests(unittest.TestCase):
             evidence = _evaluate(
                 universe_rows=rows, tradability_repository=repo,
                 authoritative_sessions=_sessions(),
+                session_calendar_provenance=_calendar_provenance(),
             )
             self.assertEqual("proven", evidence.dimensions["historical_universe"]["status"])
             self.assertEqual(9, evidence.data_coverage["tradability"]["requested"])
@@ -339,7 +387,10 @@ class PITValidationTests(unittest.TestCase):
                 effective_at=f"{day}T09:30:00+08:00",
             ))
         try:
-            evidence = _evaluate(tradability_repository=repo)
+            evidence = _evaluate(
+                tradability_repository=repo,
+                session_calendar_provenance=_calendar_provenance(),
+            )
             coverage = evidence.data_coverage["tradability"]
             self.assertEqual("proven", evidence.dimensions["historical_tradability"]["status"])
             self.assertEqual(6, coverage["blocked"])
@@ -354,6 +405,7 @@ class PITValidationTests(unittest.TestCase):
         spec = _spec(start_date="2026-01-02", end_date="2026-01-05")
         evidence = _evaluate(
             spec=spec, authoritative_sessions=_sessions(), samples=_samples(),
+            session_calendar_provenance=_calendar_provenance(_sessions(), spec=spec),
         )
         self.assertEqual(2, evidence.walk_forward["sessions"]["excluded_outside_experiment_range"])
         self.assertEqual(2, evidence.walk_forward["label_coverage"]["samples_excluded_outside_experiment_range"])
@@ -377,10 +429,59 @@ class PITValidationTests(unittest.TestCase):
             label_available_at="2026-01-07T15:00:00+08:00", target=0.1,
             pit_status=WFV.PIT_VERIFIED,
         )
-        sample_evidence = _evaluate(samples=[*_samples(), invalid_sample])
+        sample_evidence = _evaluate(
+            samples=[*_samples(), invalid_sample],
+            session_calendar_provenance=_calendar_provenance(),
+        )
         self.assertEqual("blocked", sample_evidence.dimensions["walk_forward"]["status"])
         self.assertIn("walk_forward_sample_session_invalid", sample_evidence.reason_codes)
         self.assertEqual(1, sample_evidence.walk_forward["label_coverage"]["samples_with_invalid_session"])
+
+    def test_R29_30_short_calendar_without_full_range_provenance_blocks(self):
+        evidence = _evaluate(authoritative_sessions=_sessions())
+        self.assertEqual("blocked", evidence.dimensions["walk_forward"]["status"])
+        self.assertEqual("walk_forward_session_calendar_unproven",
+                         evidence.dimensions["walk_forward"]["reason_code"])
+        self.assertEqual("blocked", evidence.dimensions["historical_universe"]["status"])
+        self.assertIsNone(evidence.data_coverage["session_calendar"]["ratio"])
+
+        incomplete = _calendar_provenance(
+            _sessions(), complete=False, session_count=len(_sessions()),
+        )
+        evidence = _evaluate(
+            authoritative_sessions=_sessions(), session_calendar_provenance=incomplete,
+        )
+        self.assertEqual("blocked", evidence.dimensions["walk_forward"]["status"])
+
+    def test_R29_31_financial_observations_use_linked_decision_session(self):
+        samples = _samples()
+        early_filed = [{
+            "record": {
+                "report_period": "2025-12-31", "published_at": "2025-12-31",
+                "net_profit": 10,
+            },
+            "sample_keys": [sample.sample_key for sample in samples],
+        }]
+        evidence = _evaluate(fundamental_records=early_filed)
+        self.assertEqual("proven", evidence.dimensions["fundamental_pit"]["status"])
+        self.assertEqual(6, evidence.data_coverage["fundamental"]["visible"])
+
+        late_filed = [{
+            "record": {
+                "report_period": "2025-12-31", "published_at": "2026-03-20",
+                "net_profit": 10,
+            },
+            "sample_keys": [sample.sample_key for sample in samples],
+        }]
+        evidence = _evaluate(fundamental_records=late_filed)
+        self.assertEqual("blocked", evidence.dimensions["fundamental_pit"]["status"])
+        self.assertEqual(6, evidence.data_coverage["fundamental"]["future"])
+
+        unlinked = _evaluate(fundamental_records=[{
+            "record": late_filed[0]["record"], "sample_keys": ["missing-sample"],
+        }])
+        self.assertEqual("blocked", unlinked.dimensions["fundamental_pit"]["status"])
+        self.assertEqual(1, unlinked.data_coverage["fundamental"]["invalid"])
 
     def test_R29_24_no_clock_or_latest_fallback(self):
         source = Path(BACKEND, "experiment_pit_validation.py").read_text(encoding="utf-8")

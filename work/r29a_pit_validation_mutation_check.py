@@ -86,8 +86,10 @@ def _all_future_probe(module) -> bool:
             label_available_at="2026-04-01T15:00:00+08:00", target=0.1,
             pit_status=WFV.PIT_VERIFIED,
         )
-        report = TESTS._evaluate(samples=samples,
-                                 authoritative_sessions=TESTS._sessions()[:4])
+        report = TESTS._evaluate(
+            samples=samples, authoritative_sessions=TESTS._sessions()[:4],
+            session_calendar_provenance=TESTS._calendar_provenance(TESTS._sessions()[:4]),
+        )
         return report.dimensions["walk_forward"]["status"] == "blocked"
     finally:
         TESTS.PV = original
@@ -99,7 +101,7 @@ def _mutations():
          lambda s: s.replace('row_list, session, source=source, drop_unproven=True,', 'row_list, session, source={"kind": "historical_archive", "historical_membership_complete": True, "historical_membership_asof": "2026-03-31", "source": "mutant"}, drop_unproven=True,', 1),
          lambda m, s: _unit_probe(m, "test_R29_04_current_universe_source_cannot_pass_historical_completeness")),
         ("M-R29-02", "universe fingerprint is not provenance",
-         lambda s: s.replace('passed = bool(sessions) and len(members_by_session) == len(sessions)', 'passed = bool(spec.universe_fingerprint)', 1),
+         lambda s: s.replace('memberships_complete = bool(sessions) and len(members_by_session) == len(sessions)', 'memberships_complete = bool(spec.universe_fingerprint)', 1),
          lambda m, s: _unit_probe(m, "test_R29_03_universe_sha_alone_does_not_prove_history")),
         ("M-R29-03", "missing tradability facts block",
          lambda s: s.replace('unknown == 0', 'unknown >= 0', 1),
@@ -114,10 +116,10 @@ def _mutations():
          lambda s: s.replace('\n\n_DIMENSIONS = (', '\n\nimport data_fetcher\n\n_DIMENSIONS = (', 1),
          lambda m, s: _static_probe(s, "no-network")),
         ("M-R29-07", "report period is not publication time",
-         lambda s: s.replace('view = FPIT.financial_visibility(record, cutoff)', 'view = FPIT.financial_visibility({**record, "published_at": record.get("report_period")}, cutoff)', 1),
+         lambda s: s.replace('view = FPIT.financial_visibility(record, decision_asof)', 'view = FPIT.financial_visibility({**record, "published_at": record.get("report_period")}, decision_asof)', 1),
          lambda m, s: _unit_probe(m, "test_R29_10_report_period_cannot_substitute_publication_time")),
         ("M-R29-08", "future publication is invisible",
-         lambda s: s.replace('if source == "future":\n            counts["future"] += 1', 'if source == "future":\n            counts["visible"] += 1', 1),
+         lambda s: s.replace('elif source == "future":\n                counts["future"] += 1', 'elif source == "future":\n                counts["visible"] += 1', 1),
          lambda m, s: _unit_probe(m, "test_R29_11_future_publication_is_invisible")),
         ("M-R29-09", "dataset manifest must match exact fingerprint",
          lambda s: s.replace('manifest.get("dataset_fingerprint") == spec.dataset_fingerprint', 'True', 1),
@@ -173,6 +175,12 @@ def _mutations():
         ("M-R29-26", "session parser rejects trailing non-date content",
          lambda s: s.replace('text = str(value or "").strip().replace("/", "-")', 'text = str(value or "").strip()[:10].replace("/", "-")', 1),
          lambda m, s: _unit_probe(m, "test_R29_29_invalid_session_or_sample_date_blocks")),
+        ("M-R29-27", "calendar requires explicit full-range completeness proof",
+         lambda s: s.replace('and source.get("range_complete") is True', 'and True', 1),
+         lambda m, s: _unit_probe(m, "test_R29_30_short_calendar_without_full_range_provenance_blocks")),
+        ("M-R29-28", "financial visibility uses linked decision session",
+         lambda s: s.replace('decision_asof = _session_text(sample.decision_session)', 'decision_asof = spec.asof_policy["cutoff"]', 1),
+         lambda m, s: _unit_probe(m, "test_R29_31_financial_observations_use_linked_decision_session")),
     ]
 
 

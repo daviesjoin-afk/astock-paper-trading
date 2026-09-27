@@ -41,7 +41,7 @@ _REASON_CODES = frozenset({
     "strategy_identity_mismatch", "tradability_coverage_incomplete",
     "walk_forward_explicit_sessions_required", "walk_forward_window_not_matured",
     "walk_forward_sample_session_invalid", "walk_forward_unavailable",
-    "walk_forward_ready_fold_missing",
+    "walk_forward_ready_fold_missing", "walk_forward_session_calendar_unproven",
 })
 
 
@@ -181,7 +181,8 @@ def _manifest_dimension(spec: EC.ExperimentSpec, manifest: Any) -> dict:
 
 
 def _universe(
-    spec: EC.ExperimentSpec, rows: Any, source: Any, sessions: Sequence[str],
+    spec: EC.ExperimentSpec, rows: Any, source: Any, sessions: Sequence[str], *,
+    session_calendar_complete: bool,
 ) -> tuple[dict, dict[str, list], dict]:
     row_list = list(rows or ())
     members_by_session: dict[str, list] = {}
@@ -199,19 +200,22 @@ def _universe(
                 and report.get("historical_membership_complete")
                 and result.get("members")):
             members_by_session[session] = list(result["members"])
-    passed = bool(sessions) and len(members_by_session) == len(sessions)
+    memberships_complete = bool(sessions) and len(members_by_session) == len(sessions)
+    passed = memberships_complete and session_calendar_complete
     available_sessions = len(members_by_session)
     identity = {"universe_fingerprint": spec.universe_fingerprint}
     detail = _dimension("proven" if passed else "blocked",
                         None if passed else "historical_universe_unproven", identity,
-        "historical_archive_complete" if passed else next((
+        "historical_archive_complete" if passed else "session_calendar_unproven"
+        if memberships_complete and not session_calendar_complete else next((
             str(item.get("status") or "unproven")
             for item in session_reports.values()
             if not item.get("historical_membership_complete")
         ), "unproven"),
         {"sessions_requested": len(sessions),
                          "sessions_proven": available_sessions,
-                         "ratio": _ratio(available_sessions, len(sessions))})
+                         "ratio": _ratio(available_sessions, len(sessions))
+                         if session_calendar_complete else None})
     report = {"sessions": session_reports}
     return detail, members_by_session, report
 
@@ -293,7 +297,9 @@ def _session_text(value: Any) -> str | None:
         return None
 
 
-def _bounded_sessions(sessions: Any, *, start: str, end: str) -> tuple[list[str], int, int, int]:
+def _bounded_sessions(
+    sessions: Any, *, start: str, end: str,
+) -> tuple[list[str], int, int, int, int]:
     raw = list(sessions or ())
     bounded = set()
     invalid = outside_range = 0
@@ -305,42 +311,113 @@ def _bounded_sessions(sessions: Any, *, start: str, end: str) -> tuple[list[str]
             outside_range += 1
         else:
             bounded.add(day)
-    return sorted(bounded), len(raw), outside_range, invalid
+    unique = sorted(bounded)
+    duplicates = len(raw) - outside_range - invalid - len(unique)
+    return unique, len(raw), outside_range, invalid, duplicates
 
 
-def _fundamental(spec: EC.ExperimentSpec, records: Any) -> tuple[dict, dict]:
+def _session_calendar_provenance(
+    spec: EC.ExperimentSpec,
+    sessions: Sequence[str],
+    provenance: Any,
+    *,
+    requested: int,
+    outside_range: int,
+    invalid: int,
+    duplicates: int,
+) -> tuple[bool, dict]:
+    source = provenance if isinstance(provenance, Mapping) else {}
+    declared_count = source.get("session_count")
+    complete = (
+        source.get("kind") == "historical_session_calendar"
+        and isinstance(source.get("source"), str)
+        and bool(source.get("source").strip())
+        and _session_text(source.get("coverage_start")) == spec.start_date
+        and _session_text(source.get("coverage_end")) == spec.end_date
+        and source.get("range_complete") is True
+        and isinstance(declared_count, int) and not isinstance(declared_count, bool)
+        and declared_count == len(sessions)
+        and requested - outside_range - invalid - duplicates == len(sessions)
+        and invalid == 0 and duplicates == 0
+    )
+    report = {
+        "status": "proven" if complete else "blocked",
+        "kind": source.get("kind"),
+        "source": source.get("source"),
+        "coverage_start": _session_text(source.get("coverage_start")),
+        "coverage_end": _session_text(source.get("coverage_end")),
+        "range_complete": source.get("range_complete") is True,
+        "sessions_declared": declared_count if isinstance(declared_count, int) else None,
+        "sessions_supplied": len(sessions),
+        "sessions_requested": requested,
+        "excluded_outside_experiment_range": outside_range,
+        "invalid": invalid,
+        "duplicates": duplicates,
+        "ratio": 1.0 if complete else None,
+    }
+    return complete, report
+
+
+def _fundamental(
+    spec: EC.ExperimentSpec, records: Any, samples: Sequence[WFV.ValidationSample],
+) -> tuple[dict, dict]:
     items = list(records or ())
-    total = len(items)
-    counts = {"visible": 0, "future": 0, "publication_unproven": 0, "invalid": 0}
-    cutoff = spec.asof_policy["cutoff"]
-    cutoff_valid = PIT.parse_asof(cutoff) is not None
-    for record in items:
-        if not isinstance(record, Mapping) or not cutoff_valid:
-            counts["invalid"] += 1
-            continue
-        view = FPIT.financial_visibility(record, cutoff)
-        source = view.get("profit_source")
-        publication_declared = any(
-            record.get(key) not in (None, "") for key in FPIT.REPORT_PUBLISHED_KEYS
-        )
-        if publication_declared and view.get("report_published_at") is None:
-            counts["invalid"] += 1
-            continue
-        if source == "future":
-            counts["future"] += 1
-        elif view.get("visible") and source == "reported":
-            counts["visible"] += 1
-        elif source in {"shadow", "unknown"}:
-            counts["publication_unproven"] += 1
+    samples_by_key: dict[str, WFV.ValidationSample | None] = {}
+    for sample in samples:
+        key = str(sample.sample_key or "").strip()
+        if key in samples_by_key:
+            samples_by_key[key] = None
         else:
+            samples_by_key[key] = sample
+    total = 0
+    counts = {"visible": 0, "future": 0, "publication_unproven": 0, "invalid": 0}
+    for item in items:
+        if not isinstance(item, Mapping):
+            total += 1
             counts["invalid"] += 1
-    complete = cutoff_valid and total > 0 and counts["visible"] == total
+            continue
+        record = item.get("record")
+        sample_keys = item.get("sample_keys")
+        if (not isinstance(record, Mapping) or not isinstance(sample_keys, (list, tuple))
+                or not sample_keys or any(not isinstance(key, str) or not key.strip()
+                                          for key in sample_keys)
+                or len(set(sample_keys)) != len(sample_keys)):
+            total += 1
+            counts["invalid"] += 1
+            continue
+        for sample_key in sample_keys:
+            total += 1
+            sample = samples_by_key.get(sample_key)
+            if sample is None:
+                counts["invalid"] += 1
+                continue
+            decision_asof = _session_text(sample.decision_session)
+            if decision_asof is None:
+                counts["invalid"] += 1
+                continue
+            view = FPIT.financial_visibility(record, decision_asof)
+            source = view.get("profit_source")
+            publication_declared = any(
+                record.get(key) not in (None, "") for key in FPIT.REPORT_PUBLISHED_KEYS
+            )
+            if publication_declared and view.get("report_published_at") is None:
+                counts["invalid"] += 1
+            elif source == "future":
+                counts["future"] += 1
+            elif view.get("visible") and source == "reported":
+                counts["visible"] += 1
+            elif source in {"shadow", "unknown"}:
+                counts["publication_unproven"] += 1
+            else:
+                counts["invalid"] += 1
+    complete = total > 0 and counts["visible"] == total
     identity = {"dataset_fingerprint": spec.dataset_fingerprint}
     coverage = {**counts, "requested": total,
                 "ratio": _ratio(counts["visible"], total)}
     detail = _dimension("proven" if complete else "blocked",
                         None if complete else "fundamental_publication_unproven", identity,
-                        "publication_visible_at_cutoff" if complete else "partial_or_unproven",
+                        "publication_visible_at_each_linked_decision_session"
+                        if complete else "sample_link_or_publication_unproven",
                         coverage)
     return detail, coverage
 
@@ -409,6 +486,7 @@ def build_pit_validation_evidence(
     samples: Sequence[Any] = (),
     walk_forward_config: WFV.WalkForwardConfig | None = None,
     authoritative_sessions: Sequence[Any] | None = None,
+    session_calendar_provenance: Mapping[str, Any] | None = None,
 ) -> PITValidationEvidence:
     """Compose explicit owner evidence into a READY/BLOCKED input gate.
 
@@ -427,11 +505,20 @@ def build_pit_validation_evidence(
     reasons: list[str] = []
     warnings: list[str] = []
 
-    bounded_sessions, _sessions_requested, sessions_excluded, sessions_invalid = _bounded_sessions(
+    bounded_sessions, _sessions_requested, sessions_excluded, sessions_invalid, sessions_duplicates = _bounded_sessions(
         authoritative_sessions, start=spec.start_date, end=spec.end_date,
+    )
+    session_calendar_complete, session_calendar_coverage = _session_calendar_provenance(
+        spec, bounded_sessions, session_calendar_provenance,
+        requested=_sessions_requested, outside_range=sessions_excluded,
+        invalid=sessions_invalid, duplicates=sessions_duplicates,
+    )
+    normalized_samples, samples_excluded, samples_invalid = _normalize_samples(
+        samples, start=spec.start_date, end=spec.end_date,
     )
     universe_dim, members, _universe_report = _universe(
         spec, universe_rows, universe_source, bounded_sessions,
+        session_calendar_complete=session_calendar_complete,
     )
     dimensions["historical_universe"] = universe_dim
     if universe_dim["status"] == "blocked":
@@ -457,7 +544,9 @@ def build_pit_validation_evidence(
     reasons.append("historical_market_data_unavailable")
     warnings.append("historical_market_data_unavailable")
 
-    fundamental_dim, fundamental_coverage = _fundamental(spec, fundamental_records)
+    fundamental_dim, fundamental_coverage = _fundamental(
+        spec, fundamental_records, normalized_samples,
+    )
     dimensions["fundamental_pit"] = fundamental_dim
     if fundamental_dim["status"] == "blocked":
         reasons.append(fundamental_dim["reason_code"])
@@ -494,6 +583,7 @@ def build_pit_validation_evidence(
         "timeline_source": None, "ready_folds": 0, "folds": 0,
         "evaluation_asof": cutoff, "config": None, "windows": [],
         "label_coverage": {"available": 0, "requested": 0, "ratio": None},
+        "session_calendar": session_calendar_coverage,
         "sessions": {
             "requested": _sessions_requested,
             "used": len(bounded_sessions),
@@ -513,16 +603,13 @@ def build_pit_validation_evidence(
         )
         reasons.append("walk_forward_unavailable")
     else:
-        normalized, samples_excluded, samples_invalid = _normalize_samples(
-            samples, start=spec.start_date, end=spec.end_date,
-        )
         result = WFV.build_walk_forward_folds(
-            normalized, walk_forward_config, sessions=bounded_sessions, asof=cutoff,
+            normalized_samples, walk_forward_config, sessions=bounded_sessions, asof=cutoff,
         )
         report = result["report"]
         folds = list(result.get("folds") or ())
         labels_available = sum(
-            1 for sample in normalized
+            1 for sample in normalized_samples
             if sample.pit_status == WFV.PIT_VERIFIED
             and WFV.label_ready_by_asof(sample, asof=cutoff)
         )
@@ -535,8 +622,8 @@ def build_pit_validation_evidence(
             "windows": [_fold_projection(fold) for fold in folds],
             "label_coverage": {
                 "available": labels_available,
-                "requested": len(normalized),
-                "ratio": _ratio(labels_available, len(normalized)),
+                "requested": len(normalized_samples),
+                "ratio": _ratio(labels_available, len(normalized_samples)),
                 "samples_excluded_outside_experiment_range": samples_excluded,
                 "samples_with_invalid_session": samples_invalid,
             },
@@ -549,10 +636,12 @@ def build_pit_validation_evidence(
         }
         if any(fold.reason == WFV.REASON_WINDOW_NOT_MATURED for fold in folds):
             warnings.append("walk_forward_window_not_matured")
-        ready = (walk["timeline_source"] == "explicit_sessions"
+        ready = (session_calendar_complete
+                 and walk["timeline_source"] == "explicit_sessions"
                  and walk["ready_folds"] > 0 and samples_invalid == 0)
         reason = None if ready else (
-            "walk_forward_sample_session_invalid" if samples_invalid
+            "walk_forward_session_calendar_unproven" if not session_calendar_complete
+            else "walk_forward_sample_session_invalid" if samples_invalid
             else "walk_forward_window_not_matured"
             if any(fold.reason == WFV.REASON_WINDOW_NOT_MATURED for fold in folds)
             else "walk_forward_ready_fold_missing"
@@ -578,6 +667,7 @@ def build_pit_validation_evidence(
     oos_period = first.get("oos_period") if first else None
     coverage = {
         "universe": universe_dim["coverage"],
+        "session_calendar": session_calendar_coverage,
         "tradability": tradability_coverage,
         "market_data": None,
         "fundamental": fundamental_coverage,

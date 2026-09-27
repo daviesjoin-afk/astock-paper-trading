@@ -3364,9 +3364,11 @@ historical linkage 与 execution provenance 缺口继续 OPEN / REQUIRED；不�
 也不连接 legacy `backtest.py`。walk-forward 继续由 `walk_forward_validation.build_walk_forward_folds` 处理，
 canonical 路径必须显式传入 authoritative `sessions` 和 ExperimentSpec evaluation as-of。
 Universe membership 按每个实验 session 单独求值；tradability 仅核验该 session 的成员，并将 available、blocked、unknown
-作为互斥 coverage 桶。Walk-forward calendar 与 samples 限定在 ExperimentSpec 日期范围内，越界日期不会进入 folds。
+作为互斥 coverage 桶。Session calendar 还必须由明确 provenance 证明完整覆盖 ExperimentSpec 全范围，缺证时 universe、
+tradability、walk-forward 均保持 BLOCKED。财务观察必须关联实际使用它的 sample，并按该 sample 的 decision session 检查披露可见性；
+walk-forward calendar 与 samples 限定在 ExperimentSpec 日期范围内，越界日期不会进入 folds。
 
-当前没有完整 historical universe archive owner 或 arbitrary historical market-data archive/provenance，因此相关维度保持
+当前没有完整 historical universe archive owner、ExperimentSpec 全范围的 session-calendar provenance 或 arbitrary historical market-data archive/provenance，因此相关维度保持
 OPEN / REQUIRED，缺少证据时整体 BLOCKED。current universe、current market snapshot、current strategy head、paper runtime
 assumptions、latest dataset 和联网刷新都不能补历史缺口。未来 UI projection 已包含 train / validation / OOS、fold windows、
 coverage 和 PIT warnings；frontend consumer deferred until canonical R29 run/read model exists。完整 authority matrix 见
