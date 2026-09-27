@@ -86,8 +86,19 @@ def architecture_violations(sources: dict[str, str]) -> list[str]:
         token in ui_status.lower() for token in ("approved", "actionable", "should_trade", "可以执行")
     ):
         problems.append("B3-G10 supported status was presented as authority or approval")
-    if "ref.cross_source_verified===true" not in ui_evidence or "verification==='verified'" in ui_evidence:
+    flat_fields = (
+        "item.relation", "item.source_type", "item.source_id", "item.as_of",
+        "item.verification", "item.verification_method", "item.cross_source_verified",
+    )
+    if "item.evidence" in ui_evidence or any(field not in ui_evidence for field in flat_fields):
+        problems.append("B3-G19 evidence renderer does not consume the flat canonical projection")
+    if (
+        "item.cross_source_verified===true" not in ui_evidence
+        or "verification==='verified'" in ui_evidence
+    ):
         problems.append("B3-G11 verification status was treated as cross-source verification")
+    if "item.source_type!=='market_data'" not in ui_evidence or "cross='不适用'" not in ui_evidence:
+        problems.append("B3-G20 non-market evidence treats market-only cross-source status as applicable")
     if "number*100" not in ui_confidence or re_search_confidence_conversion(list_api + detail_api):
         problems.append("B3-G12 confidence contract is not raw API and presentation-only percent")
     if "le=200" not in list_api or "ge=1" not in list_api:
@@ -166,7 +177,7 @@ def main() -> int:
         ("M-B3-08", "supported becomes actionable", "frontend/src/features/adaptive.js",
          lambda s: _replace_once(s, "supported:'支持（研究假设）'", "supported:'可以执行（actionable）'")),
         ("M-B3-09", "verified implies cross-source", "frontend/src/features/adaptive.js",
-         lambda s: _replace_once(s, "ref.cross_source_verified===true", "ref.verification==='verified'")),
+         lambda s: _replace_once(s, "item.cross_source_verified===true", "item.verification==='verified'")),
         ("M-B3-10", "API multiplies confidence", "backend/api_adaptive.py",
          lambda s: _replace_once(s, "runs = repository.recent_runs(", "confidence_percent = 0.8 * 100\n            runs = repository.recent_runs(")),
         ("M-B3-11", "corrupt row is stringified", "backend/api_adaptive.py",
@@ -185,6 +196,13 @@ def main() -> int:
          lambda s: _replace_once(s, "export function adaptiveResearchHistoryHtml(payload){", "var legacyHistory=deepseek.latest;\nexport function adaptiveResearchHistoryHtml(payload){")),
         ("M-B3-18", "adaptive rerender drops research history refresh", "frontend/src/features/adaptive.js",
          lambda s: _replace_once(s, "  refreshAdaptiveResearchHistory();\n}", "  // research history refresh removed\n}")),
+        ("M-B3-19", "renderer restores nested evidence shape", "frontend/src/features/adaptive.js",
+         lambda s: _replace_once(
+             _replace_once(s, "var sourceType=item.source_type||", "var sourceType=(item.evidence||{}).source_type||"),
+             "var sourceId=item.source_id||", "var sourceId=(item.evidence||{}).source_id||",
+         )),
+        ("M-B3-20", "non-market cross-source false appears unconfirmed", "frontend/src/features/adaptive.js",
+         lambda s: _replace_once(s, "if(item.source_type!=='market_data') cross='不适用';", "if(item.source_type!=='market_data') cross='未确认';")),
     ]
 
     detected = 0

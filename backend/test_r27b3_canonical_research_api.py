@@ -130,6 +130,19 @@ class CanonicalResearchAPITests(unittest.TestCase):
         self.assertNotIn("approved", run)
         self.assertNotIn("actionable", run)
 
+    def test_B3_API_03b_detail_exposes_flat_canonical_evidence_projection(self):
+        run_id = self.append(confidence=0.8, supported=True)
+        result = api_adaptive.canonical_research_run(run_id)
+        item = result["run"]["hypothesis"]["evidence"][0]
+        self.assertIn("relation", item)
+        self.assertEqual("market_data", item["source_type"])
+        self.assertTrue(item["source_id"])
+        self.assertTrue(item["as_of"])
+        self.assertTrue(item["verification"])
+        self.assertTrue(item["verification_method"])
+        self.assertIs(type(item["cross_source_verified"]), bool)
+        self.assertNotIn("evidence", item)
+
     def test_B3_API_04_missing_run_is_404_not_empty_success(self):
         with self.assertRaises(HTTPException) as caught:
             api_adaptive.canonical_research_run(999)

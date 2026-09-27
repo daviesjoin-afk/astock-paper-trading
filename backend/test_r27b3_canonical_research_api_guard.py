@@ -76,9 +76,22 @@ class CanonicalResearchAPIGuards(unittest.TestCase):
         evidence_renderer = frontend.split("export function adaptiveResearchEvidenceHtml(")[1].split("\n}")[0]
         confidence_renderer = frontend.split("export function adaptiveResearchConfidencePercent(")[1].split("\n}")[0]
         self.assertNotIn("is_authoritative", status_renderer)
-        self.assertIn("ref.cross_source_verified===true", evidence_renderer)
+        for field in (
+            "relation", "source_type", "source_id", "as_of", "verification",
+            "verification_method", "cross_source_verified",
+        ):
+            self.assertIn(f"item.{field}", evidence_renderer)
+        self.assertNotIn("item.evidence", evidence_renderer)
+        self.assertIn("item.source_type!=='market_data'", evidence_renderer)
+        self.assertIn("cross='不适用'", evidence_renderer)
+        self.assertIn("cross='未确认'", evidence_renderer)
         self.assertNotRegex(evidence_renderer, r"verification\s*===?\s*['\"]verified")
         self.assertIn("number*100", confidence_renderer)
+
+    def test_B3_G19_api_evidence_is_flat_canonical_projection(self):
+        source = _read("backend/test_r27b3_canonical_research_api.py")
+        self.assertIn("test_B3_API_03b_detail_exposes_flat_canonical_evidence_projection", source)
+        self.assertIn('self.assertNotIn("evidence", item)', source)
 
     def test_B3_G13_list_limit_is_bounded_in_fastapi_contract(self):
         parameter = inspect.signature(api_adaptive.canonical_research_runs).parameters["limit"].default

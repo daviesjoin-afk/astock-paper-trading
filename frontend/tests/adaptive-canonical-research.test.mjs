@@ -29,14 +29,14 @@ const run = {
     thesis: '研究假设文本',
     evidence: [{
       relation: 'supports',
-      evidence: {
-        source_type: 'market_data',
-        source_id: 'snapshot:600000',
-        as_of: '2026-08-27T10:00:00+08:00',
-        verification: 'verified',
-        verification_method: 'coverage_integrity',
-        cross_source_verified: false,
-      },
+      source_type: 'market_data',
+      source_id: 'snapshot:600000',
+      as_of: '2026-08-27T10:00:00+08:00',
+      verification: 'verified',
+      verification_method: 'coverage_integrity',
+      cross_source_verified: false,
+      is_verified: true,
+      verification_attributes: { source_count: 2 },
     }],
   },
   narrative: '历史研究叙述',
@@ -79,15 +79,43 @@ test('canonical history and detail render saved fields without legacy advisor sh
   assert.doesNotMatch(detail, /AI 已验证|交易已确认|可以执行|真实性通过/);
 });
 
-test('cross-source label only says confirmed for the canonical true flag', () => {
-  const falseHtml = adaptiveResearchEvidenceHtml([{
-    evidence: { verification: 'verified', cross_source_verified: false },
-  }]);
+test('flat canonical market evidence renders source and confirmed cross-source state', () => {
   const trueHtml = adaptiveResearchEvidenceHtml([{
-    evidence: { verification: 'verified', cross_source_verified: true },
+    relation: 'supports', source_type: 'market_data', source_id: 'snapshot:600000',
+    as_of: '2026-08-27T10:00:00+08:00', verification: 'verified',
+    verification_method: 'coverage_integrity', cross_source_verified: true,
+    is_verified: true, verification_attributes: { source_count: 2 },
   }]);
-  assert.match(falseHtml, /双源核验<\/dt><dd>未确认/);
+  assert.match(trueHtml, /market_data/);
+  assert.match(trueHtml, /snapshot:600000/);
   assert.match(trueHtml, /双源核验<\/dt><dd>已确认/);
+});
+
+test('verified market evidence with cross_source_verified false remains unconfirmed', () => {
+  const falseHtml = adaptiveResearchEvidenceHtml([{
+    relation: 'supports', source_type: 'market_data', source_id: 'snapshot:000001',
+    as_of: '2026-08-27T10:00:00+08:00', verification: 'verified',
+    verification_method: 'coverage_integrity', cross_source_verified: false,
+    is_verified: true, verification_attributes: { source_count: 1 },
+  }]);
+  assert.match(falseHtml, /来源核验状态<\/dt><dd>verified/);
+  assert.match(falseHtml, /双源核验<\/dt><dd>未确认/);
+});
+
+test('non-market evidence labels the market-only cross-source dimension not applicable', () => {
+  for (const sourceType of [
+    'execution', 'portfolio_research', 'news', 'strategy_research', 'runtime_incident',
+  ]) {
+    const html = adaptiveResearchEvidenceHtml([{
+      relation: 'supports', source_type: sourceType, source_id: `${sourceType}:1`,
+      as_of: '2026-08-27T10:00:00+08:00', verification: 'verified',
+      verification_method: null, cross_source_verified: false,
+      is_verified: true, verification_attributes: {},
+    }]);
+    assert.match(html, new RegExp(sourceType));
+    assert.match(html, /双源核验<\/dt><dd>不适用/);
+    assert.doesNotMatch(html, /双源核验<\/dt><dd>未确认/);
+  }
 });
 
 test('history and detail refresh use only canonical read endpoints', async () => {

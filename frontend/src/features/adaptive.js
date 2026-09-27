@@ -74,13 +74,17 @@ export function adaptiveResearchEvidenceHtml(items){
   if(!Array.isArray(items)||!items.length) return '<p class="adaptive-research-empty">没有保存可展示的 evidence refs。</p>';
   return '<div class="adaptive-canonical-evidence-list">'+items.map(function(item){
     item=item&&typeof item==='object'?item:{};
-    var ref=item.evidence&&typeof item.evidence==='object'?item.evidence:{};
-    var sourceType=ref.source_type||item.source||item.kind||'来源未记录';
-    var sourceId=ref.source_id||item.evidence_id||'ID 未记录';
-    var asOf=ref.as_of||item.as_of||'时间未记录';
-    var cross=ref.cross_source_verified===true?'已确认':(ref.cross_source_verified===false?'未确认':'未记录');
-    var verification=ref.verification||item.verification||'未记录';
-    var method=ref.verification_method||item.verification_method;
+    var sourceType=item.source_type||'来源未记录';
+    var sourceId=item.source_id||'ID 未记录';
+    var asOf=item.as_of||'时间未记录';
+    var cross='未记录';
+    if(item.source_type){
+      if(item.source_type!=='market_data') cross='不适用';
+      else if(item.cross_source_verified===true) cross='已确认';
+      else if(item.cross_source_verified===false) cross='未确认';
+    }
+    var verification=item.verification||'未记录';
+    var method=item.verification_method;
     return '<article class="adaptive-canonical-evidence"><header><b>'+adaptiveEsc(sourceType)+'</b><span>'+adaptiveEsc(item.relation||'引用')+'</span></header>'
       +'<dl><div><dt>来源 ID</dt><dd>'+adaptiveEsc(sourceId)+'</dd></div><div><dt>业务时间</dt><dd>'+adaptiveEsc(asOf)+'</dd></div>'
       +'<div><dt>来源核验状态</dt><dd>'+adaptiveEsc(verification)+'</dd></div>'
