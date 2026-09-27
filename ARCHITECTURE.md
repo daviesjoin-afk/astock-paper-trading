@@ -3284,6 +3284,46 @@ legacy incident runtime 被当成已迁移（R27-B2C-7：
 多调一次，adapter 的 production 调用点 = 0 是预期状态而不是空转）
 ```
 
+### R27-B2C-FINAL：research evidence convergence（COMPLETE）
+
+R27-B2C-FINAL 将 research collection 收敛到已批准的 typed owner projections：
+
+```text
+market       → R24 reading → ai_research_contract
+execution    → execution projection → ai_research_execution_adapter
+portfolio    → portfolio projection → ai_research_portfolio_adapter
+news         → news projection → ai_research_news_adapter
+strategy     → candidate/evaluation projections → ai_research_strategy_adapter
+runtime      → adaptive run / paper job projections → ai_research_runtime_adapter
+```
+
+`candidate_challenge`、`incident_triage`、`overfit_watch`、`event_evidence` 和
+`pnl_attribution` 现在只组合这些 typed facts。旧 collector 对 candidate、runtime、reward、NAV、
+news 和当前持仓的 raw evidence SQL 已移除。事件研究只读已知 news owner evidence，不联网回填历史。
+缺少 stable identity、PIT availability 或 owner verification 的字段继续明确 unavailable。
+`paper_orders` 的业务拒绝与 runtime lifecycle status 不再被解释为事故或核验结论。
+
+`deepseek_research` 将 typed `InformationEvent` 交给 `ai_research_service`，canonical conclusion
+只追加到 `ai_research_runs`；`_save_run` 已退出生产路径，`adaptive_advisor_runs` 没有 canonical
+research production writer。`ai_analysis` 负责时间窗、scope、人工触发和 operational timeline，
+市场事实来自 R24，portfolio/execution facts 需要调用方显式提供 account/cycle context，研究结论走
+同一个 canonical service。`adaptive_ai_analysis_runs` 只保存 operational state 和 canonical run
+reference；历史 legacy response 只作为 presentation-only 记录，计划在 B3 移除。
+
+所有 research run 共用显式 `ResearchAsOfContext`（业务日、带时区 market time、显式 targets）。
+suite 的执行时间只用于 operational capture timestamp，不会替代 evidence PIT。
+research compatibility payload 标为 `research_composition_only_not_an_owner`。
+
+仍为 OPEN / REQUIRED、并由 production fail closed 的缺口包括：adaptive killed terminal instant、
+non-intraday paper job attempt identity、execution evidence 的 owner metric/status semantics、
+adaptive rewards 历史可用性、alpha candidate stable identity、mutable candidate revisions、
+parameter/experiment linkage、历史 market evidence、历史 cycle membership，以及 physical DB origin。
+这些缺口不阻止“有 owner fact 就使用，否则明确 unavailable”的 B2C 完成定义。
+
+早期路线图中 B2C-8（deepseek research convergence）和 B2C-9（ai_analysis convergence）的
+未完成/延期描述均为历史状态，现由 **R27-B2C-FINAL（COMPLETE）** 取代。B3 与 R28 均为
+**NOT STARTED**。
+
 ### 仅作 review signal（不进入 CI gate）
 
 ```text

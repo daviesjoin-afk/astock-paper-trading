@@ -430,34 +430,24 @@ class NewsAdapterTests(unittest.TestCase):
         self.assertNotIn(("news_learning.py", "news_fact_projections"),
                          GUARD.APPROVED_ISSUER_CALLERS)
 
-    # ---------- NEWS-26：production 调用点 = 0（预期状态） ----------
+    # ---------- NEWS-26：production runtime consumes the adapter ----------
 
-    def test_NEWS_26_news_adapter_has_zero_production_callers(self):
-        """B2C-5 的交付物是能力 + 契约 + 回归：runtime 迁移属于后续 convergence。
-
-        判据是**真实 import**（AST），不是文本提及：契约的 docstring / 报错文案会**点名**
-        adapter（"请使用该 owner 已批准的 factory"），那是文档，不是依赖。
-        """
+    def test_NEWS_26_news_adapter_has_production_caller(self):
+        """event evidence is composed from owner projections through the adapter."""
         importers = [
             name for name in _production_modules()
             if "ai_research_news_adapter" in _imported_roots(name)
         ]
-        self.assertEqual([], importers,
-                         f"news adapter 出现了 production 调用点：{importers}")
+        self.assertIn("deepseek_research.py", importers)
         # 非空性：扫描器真的在扫生产模块（否则上面可能是空集空转）。
         self.assertIn("ai_research_contract.py", _production_modules())
         self.assertIn("ai_research_contract", _imported_roots(ADAPTER_MODULE))
         self.assertIn("ai_research_contract", _imported_roots("deepseek_research.py"))
 
-        # 文档必须**明说** legacy runtime 仍然存在且被推迟，不得声称已迁移。
-        doc = ANA.__doc__ or ""
-        self.assertIn("OPEN / REQUIRED", doc)
-        self.assertIn("deepseek_research._event_evidence", doc)
-        self.assertIn("DEFERRED", doc)
-        self.assertIn("physical database origin", doc)
-        self.assertIn("CLOSED", doc)
-        self.assertNotIn("news runtime fully migrated", doc)
-        self.assertNotIn("event_evidence runtime = COMPLETE", doc)
+        import deepseek_research as DR
+        self.assertIn("news_fact_projections", inspect.getsource(DR._collect_typed_events))
+        self.assertIn("evidence_ref_from_news_projection",
+                      inspect.getsource(DR._collect_typed_events))
 
     # ---------- NEWS-31 / NEWS-32：签名只接受 owner 投影 ----------
 

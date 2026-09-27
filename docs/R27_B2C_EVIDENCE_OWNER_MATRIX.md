@@ -201,8 +201,8 @@ B2C-4C 迁移 pnl_attribution runtime（**已完成** —— 见下文 "B2C-4C �
 B2C-5  news owner readiness
 B2C-6  adaptive / experiment owner readiness
 B2C-7  runtime / incident owner readiness
-B2C-8  remaining deepseek_research typed convergence
-B2C-9  ai_analysis lifecycle convergence
+B2C-8  remaining deepseek_research typed convergence — SUPERSEDED BY R27-B2C-FINAL (COMPLETE)
+B2C-9  ai_analysis lifecycle convergence — SUPERSEDED BY R27-B2C-FINAL (COMPLETE)
 B2C-10 / B3  canonical research API/UI + 删除 B2B 兼容投影
 ```
 
@@ -1672,7 +1672,11 @@ M-EXP-16 / M-EXP-17 / M-EXP-18 / M-EXP-19  由 **review** 先发现（不是 mut
 
 ---
 
-## B2C-7 进展（runtime / incident owner readiness）
+> **历史阶段快照说明：**以下 B2C-7 的“未迁移 / deferred”结论记录的是 B2C-7 交付时状态。
+> B2C-8 research runtime convergence 与 B2C-9 `ai_analysis` convergence 已由
+> **R27-B2C-FINAL（COMPLETE）** 取代；不要把下方历史快照读作当前生产状态。
+
+## B2C-7 进展（runtime / incident owner readiness，历史记录）
 
 本轮**只**回答"runtime / incident 的事实证据到底谁拥有、何时可用、如何被 owner 核验"。
 
@@ -1831,3 +1835,19 @@ OPEN / REQUIRED:
 
 **未经人工确认不创建** `runtime_incidents` / `runtime_events` / `ai_incidents` /
 `paper_job_history` / `incident_facts` 这类第二套 generic incident ledger。
+
+## R27-B2C-FINAL 当前状态（COMPLETE）
+
+```text
+R27-B2C backend research evidence convergence = COMPLETE
+B2C-8 = SUPERSEDED BY R27-B2C-FINAL
+B2C-9 = SUPERSEDED BY R27-B2C-FINAL
+B3 = NOT STARTED
+R28 = NOT STARTED
+```
+
+四条 research collector 与 `ai_analysis` 当前消费 canonical owner typed facts，并通过
+`ai_research_service` 写入唯一 canonical result ledger。缺少 owner-provable identity、PIT 或
+verification 的字段仍为 OPEN / REQUIRED，production 以 unavailable 处理。旧快照中
+adapter production callers = 0、collector 直读 legacy raw SQL、`adaptive_advisor_runs` 尚有 writer
+等状态均已由本节和 ARCHITECTURE.md 的 R27-B2C-FINAL 说明取代。

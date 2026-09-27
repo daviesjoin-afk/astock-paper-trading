@@ -129,7 +129,7 @@ export async function refreshAdaptiveTimeline(base){
 export async function retryAdaptiveAiWindow(encodedWindow){
   var windowName='manual'; try{windowName=decodeURIComponent(encodedWindow||'manual');}catch(ignore){}
   var confirmation=await adaptiveConfirm({title:'重试分时段 AI 分析',detail:'将重新生成该时段的确定性快照与影子建议。',boundary:'不会下单、不会直接应用 AI 调参；结果仍需人工确认。'}); if(!confirmation.approved) return;
-  try{await apiPost('/api/adaptive/ai/analyze?trigger=manual-retry&window='+encodeURIComponent(windowName)+'&scope=all&confirmed=true');await refreshAdaptiveTimeline(window._adaptiveOverviewPayload||{});}
+  try{var instant=new Date();var asOf=adaptiveLocalDate();var marketNow=instant.toISOString();await apiPost('/api/adaptive/ai/analyze?trigger=manual-retry&window='+encodeURIComponent(windowName)+'&scope=all&as_of='+encodeURIComponent(asOf)+'&market_now='+encodeURIComponent(marketNow)+'&confirmed=true');await refreshAdaptiveTimeline(window._adaptiveOverviewPayload||{});}
   catch(e){adaptiveActionNotice('分时段 AI 分析重试失败',e.message);}
 }
 
@@ -723,7 +723,7 @@ export async function runAdaptiveAdvisor(){
 export async function runAdaptiveResearchTask(purpose,button){
   var confirmation=await adaptiveConfirm({title:'运行研究任务',detail:'将运行该项 AI 研究并写入可追溯的影子证据。',boundary:'不会直接改变策略参数或交易。'}); if(!confirmation.approved) return;
   if(button){button.disabled=true;button.textContent='运行中…';}
-  try{renderAdaptive(await apiPost('/api/adaptive/advisor/run?trigger=manual-ui&purpose='+encodeURIComponent(purpose)+'&confirmed=true'));}
+  try{var researchNow=new Date();renderAdaptive(await apiPost('/api/adaptive/advisor/run?trigger=manual-ui&purpose='+encodeURIComponent(purpose)+'&as_of='+encodeURIComponent(adaptiveLocalDate())+'&market_now='+encodeURIComponent(researchNow.toISOString())+'&confirmed=true'));}
   catch(e){
     var handled=await handleOperatorError(e, '运行研究任务', function(){ return runAdaptiveResearchTask(purpose, button); });
     if(!handled) adaptiveActionNotice('研究任务失败',e.message);
@@ -734,7 +734,7 @@ export async function runAdaptiveResearchTask(purpose,button){
 export async function runAdaptiveResearchSuite(){
   var confirmation=await adaptiveConfirm({title:'运行全部研究任务',detail:'将依次运行已启用的 AI 研究任务。',boundary:'只生成研究证据，不会直接交易或放宽风控。'}); if(!confirmation.approved) return;
   var button=$('advisorSuiteButton'); if(button){button.disabled=true;button.textContent='研究套件运行中…';}
-  try{renderAdaptive(await apiPost('/api/adaptive/advisor/suite?trigger=manual-suite&confirmed=true'));}
+  try{var researchNow=new Date();renderAdaptive(await apiPost('/api/adaptive/advisor/suite?trigger=manual-suite&as_of='+encodeURIComponent(adaptiveLocalDate())+'&market_now='+encodeURIComponent(researchNow.toISOString())+'&confirmed=true'));}
   catch(e){
     var handled=await handleOperatorError(e, '运行全部研究任务', runAdaptiveResearchSuite);
     if(!handled) adaptiveActionNotice('研究套件失败',e.message);

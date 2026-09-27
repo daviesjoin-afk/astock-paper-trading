@@ -132,7 +132,9 @@ APPROVED_ISSUER_CALLERS = frozenset({
 #: 架构变化（多出一条"事实 → 研究事件"的路径），必须人工修改这里。
 #: R27-B2C-4C 增加 ``deepseek_research.py`` —— pnl 组合层把 execution / portfolio /
 #: market 三条 owner 事实各自投影成事件；它只是消费者，不签发 ref。
-EXPECTED_EVENT_CONSTRUCTORS = frozenset({"deepseek_advisor.py", "deepseek_research.py"})
+EXPECTED_EVENT_CONSTRUCTORS = frozenset({
+    "deepseek_advisor.py", "deepseek_research.py", "ai_analysis.py",
+})
 
 
 def _source(name: str) -> str:

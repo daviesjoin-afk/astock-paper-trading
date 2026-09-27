@@ -2711,6 +2711,25 @@ def experiment_evaluation_fact(
     )
 
 
+def experiment_evaluation_facts(conn, *, as_of: Any, limit: int = 100):
+    """读取显式 ``as_of`` 可见的 evaluation owner projections。"""
+    if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
+        raise ValueError("experiment_evaluation_facts limit must be a positive int")
+    size = min(limit, 500)
+    rows = conn.execute(
+        f"SELECT evaluation_fingerprint FROM {EVALUATION_MANIFEST_TABLE} "
+        "ORDER BY created_at DESC,evaluation_fingerprint DESC LIMIT ?", (size,),
+    ).fetchall()
+    facts = []
+    for row in rows:
+        fingerprint = row[0] if not hasattr(row, "keys") else row["evaluation_fingerprint"]
+        projection = experiment_evaluation_fact(conn, fingerprint, as_of=as_of)
+        if projection is not None:
+            facts.append(projection)
+    facts.sort(key=lambda fact: (fact.availability_day, fact.revision_identity), reverse=True)
+    return tuple(facts)
+
+
 def _self_check() -> None:
     assert forbidden_dependencies() == [], forbidden_dependencies()
     assert spearman_rank_ic([1, 2, 3], [1, 2, 3]) == 1.0

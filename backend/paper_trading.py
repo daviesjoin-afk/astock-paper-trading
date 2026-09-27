@@ -15805,3 +15805,27 @@ def paper_job_run_fact(conn, run_key, *, as_of):
             started_at=started_at, finished_at=finished_at,
         ),
     )
+
+
+def paper_job_run_facts(conn, *, as_of, limit=100):
+    """按显式 ``as_of`` 发布可证明的 job attempt typed facts。
+
+    run key 的枚举与 row → projection 的转换都属于 paper runtime owner。非 intraday
+    attempt、被 retry 覆盖的失败 revision 与其他不可证明记录继续由单条读取器返回为
+    unavailable；本 API 不创建历史 ledger。
+    """
+    if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
+        raise ValueError("paper_job_run_facts limit must be a positive int")
+    size = min(limit, 500)
+    rows = conn.execute(
+        "SELECT run_key FROM paper_job_runs ORDER BY started_at DESC,run_key DESC LIMIT ?",
+        (size,),
+    ).fetchall()
+    facts = []
+    for row in rows:
+        run_key = row[0] if not hasattr(row, "keys") else row["run_key"]
+        projection = paper_job_run_fact(conn, run_key, as_of=as_of)
+        if projection is not None:
+            facts.append(projection)
+    facts.sort(key=lambda fact: (fact.availability_day, fact.revision_identity), reverse=True)
+    return tuple(facts[:size])

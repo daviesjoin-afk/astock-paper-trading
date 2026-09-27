@@ -1948,3 +1948,21 @@ def risk_candidate_fact(conn, candidate_id, *, as_of):
             account_id=account_id, lifecycle_status=lifecycle, change_kind=change_kind,
         ),
     )
+
+
+def risk_candidate_facts(conn, *, as_of, limit=100):
+    """读取显式 ``as_of`` 可见的候选投影；SQL 与投影转换留在 risk owner。"""
+    if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
+        raise ValueError("risk_candidate_facts limit must be a positive int")
+    size = min(limit, 500)
+    rows = conn.execute(
+        "SELECT id FROM adaptive_risk_candidates ORDER BY id DESC LIMIT ?", (size,),
+    ).fetchall()
+    facts = []
+    for row in rows:
+        candidate_id = row[0] if not hasattr(row, "keys") else row["id"]
+        projection = risk_candidate_fact(conn, candidate_id, as_of=as_of)
+        if projection is not None:
+            facts.append(projection)
+    facts.sort(key=lambda fact: (fact.availability_day, fact.revision_identity), reverse=True)
+    return tuple(facts)
