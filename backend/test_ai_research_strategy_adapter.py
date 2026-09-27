@@ -512,37 +512,33 @@ class StrategyRegistryTests(unittest.TestCase):
                     self.assertNotIn(leaked, ref.detail)
 
 
-class DeferredLegacyRuntimeTests(unittest.TestCase):
-    """EXP-27 ~ EXP-28：非结构化判定的 legacy runtime 仍然在，且明确记为 deferred。"""
+class CanonicalStrategyRuntimeTests(unittest.TestCase):
+    """EXP-27 ~ EXP-28：research consumes typed strategy owner facts."""
 
     def test_EXP_27_candidate_challenge_runtime_is_unchanged_and_deferred(self):
-        """EXP-27：``candidate_challenge`` 的 legacy 直读 runtime **仍然存在**。
-
-        B2C-6 **不**迁移它（那属于后续 convergence）。把它删掉会假装"已经迁移"，把 PIT /
-        provenance 的论证留白；因此本轮断言它逐字还在，并且仍然走 legacy 直读。
-        """
+        """EXP-27：candidate challenge uses risk, selection, and evaluation owners."""
         self.assertIn("candidate_challenge", DR.COLLECTORS)
         self.assertIs(DR._candidate_evidence, DR.COLLECTORS["candidate_challenge"])
         source = _source("deepseek_research.py")
         self.assertIn("_candidate_evidence", source)
-        # legacy 直读仍然存在（这就是"未迁移"的可执行证据）。
-        self.assertIn("FROM adaptive_risk_candidates", source)
-        self.assertIn("FROM adaptive_selection_candidates", source)
-        # 但 legacy collector **不**经 adapter：它不 import strategy adapter 的任何符号。
-        self.assertNotIn("ai_research_strategy_adapter", _imported_roots("deepseek_research.py"))
+        self.assertNotIn("FROM adaptive_risk_candidates", source)
+        self.assertNotIn("FROM adaptive_selection_candidates", source)
+        self.assertIn("risk_candidate_facts", source)
+        self.assertIn("selection_candidate_facts", source)
+        self.assertIn("experiment_evaluation_facts", source)
+        self.assertIn("ai_research_strategy_adapter", source)
 
     def test_EXP_28_overfit_watch_runtime_is_unchanged_and_deferred(self):
-        """EXP-28：``overfit_watch`` 的 legacy 直读 runtime 同样还在、同样 deferred。
-
-        它的输入里有 ``adaptive_rewards`` / ``adaptive_alpha_candidates`` —— 这两张表在本轮
-        被判定为 **NOT EVIDENCE**（无可证可用性 / identity 会被 DELETE+INSERT 重建），因此
-        它们**没有** typed 投影，也**不得**被硬套成 ``ResearchEvidenceRef``。
-        """
+        """EXP-28：overfit watch uses typed evaluations and leaves weak sources unavailable."""
         self.assertIn("overfit_watch", DR.COLLECTORS)
         self.assertIs(DR._overfit_evidence, DR.COLLECTORS["overfit_watch"])
         source = _source("deepseek_research.py")
-        self.assertIn("FROM adaptive_rewards", source)
-        self.assertIn("FROM adaptive_alpha_candidates", source)
+        self.assertNotIn("FROM adaptive_rewards", source)
+        self.assertNotIn("FROM adaptive_alpha_candidates", source)
+        self.assertNotIn("FROM paper_nav", source)
+        self.assertIn('purpose == "overfit_watch"', source)
+        self.assertIn("experiment_evaluation_facts", source)
+        self.assertIn("ai_research_strategy_adapter", source)
         # 这两张表**没有**得到 typed owner fact contract —— 本轮刻意不伪造 identity。
         # 断言方式刻意选"发布了几个投影类型"而不是"哪个模块提到了哪张表"：owner 读自己的
         # 其它列（例如 ``adaptive_risk._evidence`` 读 ``adaptive_rewards``）是合法的，

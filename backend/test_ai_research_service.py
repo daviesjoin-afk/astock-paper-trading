@@ -591,17 +591,12 @@ class LegacyBoundaryTests(_Base):
         )
 
     def test_RUNTIME_08_migrated_path_writes_zero_legacy_rows(self):
-        """RUNTIME-08：迁移路径的 legacy writer = 0（静态 + 运行时两重证据）。
-
-        静态：``deepseek_advisor.py`` 不再含 ``INSERT INTO adaptive_advisor_runs``，该表的
-        production writer 收缩到尚未迁移的 ``deepseek_research.py``。
-        运行时：跑一次迁移路径，legacy 行数不变。
-        """
+        """RUNTIME-08：canonical path 不再写 legacy research ledger。"""
         writers = _production_insert_writers("adaptive_advisor_runs")
         self.assertNotIn(ADVISOR_MODULE, writers,
                          f"{ADVISOR_MODULE} 仍然是 adaptive_advisor_runs 的 writer：{writers}")
-        self.assertEqual({"deepseek_research.py"}, writers,
-                         f"adaptive_advisor_runs 的 writer 集合意外变化：{writers}")
+        self.assertEqual(set(), writers,
+                         f"adaptive_advisor_runs 仍有 production writer：{writers}")
 
         self.assertEqual(0, self.legacy())
         self.service_call()
@@ -1049,7 +1044,7 @@ class ServiceArchitectureGuardTests(unittest.TestCase):
         self.assertIn("INSERT", "INSERT INTO x(a) VALUES(?)")
         self.assertNotIn("INSERT", ast.dump(ast.parse('"""docstring only"""\nX = 1\n')))
         # 扫描器必须能看出"谁写了这张表"。
-        self.assertEqual({"deepseek_research.py"},
+        self.assertEqual(set(),
                          _production_insert_writers("adaptive_advisor_runs"))
         self.assertEqual({REPOSITORY_MODULE},
                          _production_insert_writers(REP.TABLE))

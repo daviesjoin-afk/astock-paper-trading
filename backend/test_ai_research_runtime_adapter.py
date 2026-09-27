@@ -617,29 +617,19 @@ class RuntimeMigrationDeferralTests(unittest.TestCase):
                 existing.add(name)
         self.assertTrue(existing, "扫描器看不见既有的 adapter 调用点（护栏会空转）")
 
-    def test_INC_32_incident_evidence_remains_deferred_legacy_runtime(self):
-        """INC-32：``deepseek_research._incident_evidence`` 仍是 **deferred legacy runtime**。
-
-        本轮**不**改它的 shape：直读 ``adaptive_runs`` / ``paper_jobs`` / ``paper_orders`` 的
-        SQL 必须还在（迁移是 B2C-8 的事），而且它不得 import runtime adapter（否则就是
-        "边定义 owner 边重写 runtime"）。
-        """
+    def test_INC_32_incident_research_consumes_runtime_owner_facts(self):
+        """INC-32：incident research 只消费 runtime owner projections。"""
         import deepseek_research as DR
 
         legacy = inspect.getsource(DR._incident_evidence)
-        self.assertIn("adaptive_runs", legacy)
-        self.assertIn("paper_jobs", legacy)
-        self.assertIn("paper_orders", legacy)
-        # 它**仍然**用把坏 JSON 变成空对象的 legacy 读法 —— 本轮刻意不动（迁移是 B2C-8）。
-        self.assertIn("_loads", legacy)
-        # research 套件仍在用这个 legacy purpose。
+        collector = inspect.getsource(DR._collect_typed_events)
+        self.assertNotIn("SELECT", legacy.upper())
+        self.assertNotIn("paper_orders", legacy)
+        self.assertIn("adaptive_run_facts", collector)
+        self.assertIn("paper_job_run_facts", collector)
+        self.assertIn("ai_research_runtime_adapter", collector)
         self.assertIs(DR.COLLECTORS["incident_triage"], DR._incident_evidence)
         self.assertIn("incident_triage", DR.TASKS)
-        # 它没有被改成 typed 路径。
-        roots = _imported_roots("deepseek_research.py")
-        self.assertNotIn("ai_research_runtime_adapter", roots)
-        self.assertNotIn("ai_research_strategy_adapter", roots)
-        # 非空性：adapter 确实**存在**（"未迁移"不等于"不存在"）。
         self.assertTrue(callable(ADAPTER.evidence_ref_from_runtime_projection))
 
 

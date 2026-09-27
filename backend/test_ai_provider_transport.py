@@ -1085,6 +1085,7 @@ RUNTIME_ADAPTER_MODULE = "ai_research_runtime_adapter.py"
 #: 五份 owner adapter 都不属于 provider runtime 链路，因此刻意不进 RG-08。
 NETWORK_FREE_SEAMS = (
     RESEARCH_MODULE,
+    "ai_analysis.py",
     REPOSITORY_MODULE,
     SERVICE_MODULE,
     EXECUTION_ADAPTER_MODULE,
@@ -1279,7 +1280,7 @@ class AiResearchProviderArchitectureGuardTests(unittest.TestCase):
                     offenders.append(name)
         self.assertEqual(
             sorted(set(offenders)),
-            ["ai_research_execution_adapter.py", NEWS_ADAPTER_MODULE,
+            ["ai_analysis.py", "ai_research_execution_adapter.py", NEWS_ADAPTER_MODULE,
              "ai_research_portfolio_adapter.py", RESEARCH_MODULE, REPOSITORY_MODULE,
              RUNTIME_ADAPTER_MODULE, STRATEGY_ADAPTER_MODULE,
              "deepseek_advisor.py", "deepseek_research.py"],

@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import ast
 import dataclasses
+import inspect
 import os
 import re
 import sqlite3
@@ -1079,12 +1080,12 @@ class RuntimeAuthoritySeparationTests(_DbTestCase):
             for leaked in ("order_status", "filled", "rejected", "blocked", "nonfill"):
                 self.assertNotIn(leaked, fields, f"{name} 携带了订单生命周期字段 {leaked!r}")
 
-        # 非空性：legacy collector **确实**还在做这个聚合（说明这条断言有内容），
-        # 而且它自己也写着这条业务规则 —— 本轮把它落实到架构上。
-        legacy = _source("deepseek_research.py")
-        self.assertIn("paper_orders", legacy)
-        self.assertIn("order_nonfill_distribution", legacy)
-        self.assertIn("业务风控拒单不是系统事故", legacy)
+        # incident research 已退出订单生命周期读取；拒单继续只属于 execution owner。
+        import deepseek_research as DR
+        research = _source("deepseek_research.py")
+        incident_source = inspect.getsource(DR._incident_evidence)
+        self.assertNotIn("paper_orders", research)
+        self.assertNotIn("paper_orders", incident_source)
 
     def test_INC_22_execution_nonfill_still_belongs_to_the_execution_owner(self):
         """INC-22：订单执行事实继续归 existing execution owner，本层**不复制**它。

@@ -1454,6 +1454,32 @@ def selection_candidate_fact(conn, candidate_id, *, as_of):
     return _selection_projection_from_row(item, revision=revision, available_day=available_day)
 
 
+def selection_candidate_facts(conn, *, as_of, limit=100):
+    """读取显式 ``as_of`` 可见的候选投影；裸行转换留在 selection owner。"""
+    if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
+        raise ValueError("selection_candidate_facts limit must be a positive int")
+    size = min(limit, 500)
+    facts = []
+    offset = 0
+    while len(facts) < size:
+        rows = conn.execute(
+            "SELECT id FROM adaptive_selection_candidates ORDER BY id DESC LIMIT ? OFFSET ?",
+            (min(size, 100), offset),
+        ).fetchall()
+        if not rows:
+            break
+        for row in rows:
+            candidate_id = row[0] if not hasattr(row, "keys") else row["id"]
+            projection = selection_candidate_fact(conn, candidate_id, as_of=as_of)
+            if projection is not None:
+                facts.append(projection)
+                if len(facts) == size:
+                    break
+        offset += len(rows)
+    facts.sort(key=lambda fact: (fact.availability_day, fact.revision_identity), reverse=True)
+    return tuple(facts[:size])
+
+
 def record_shadow_proposal(conn, *, run_date, account_id, regime, model_id,
                            baseline_params, candidate_params, evidence, reason, now):
     """owner 的**唯一窄接口**：持久化一条 AI 影子候选提案。

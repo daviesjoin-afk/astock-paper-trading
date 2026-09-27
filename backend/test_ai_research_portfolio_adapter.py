@@ -708,18 +708,15 @@ class PortfolioAdapterTests(unittest.TestCase):
         }
         offenders = {name: count for name, count in callers.items() if count}
         self.assertEqual(
-            {"deepseek_research.py": offenders.get("deepseek_research.py")}, offenders,
+            {"deepseek_research.py": offenders.get("deepseek_research.py"),
+             "ai_analysis.py": offenders.get("ai_analysis.py")}, offenders,
             f"portfolio adapter 的 production 调用者集合发生变化：{offenders}",
         )
         self.assertGreaterEqual(offenders["deepseek_research.py"], 1)
-        self.assertEqual(
-            ["_portfolio_leg"],
-            _enclosing_functions(
-                _module_source("deepseek_research.py"),
-                "evidence_ref_from_portfolio_projection",
-            ),
-            "portfolio adapter 只能在批准的 pnl 组合函数里被调用",
-        )
+        self.assertEqual(["_portfolio_leg"], _enclosing_functions(
+            _module_source("deepseek_research.py"), "evidence_ref_from_portfolio_projection"))
+        self.assertEqual(["_portfolio_events"], _enclosing_functions(
+            _module_source("ai_analysis.py"), "evidence_ref_from_portfolio_projection"))
         # 非空性：扫描器真的看得见调用点（在**测试**文件里找一个真调用）。
         self.assertIn(
             "evidence_ref_from_portfolio_projection",
@@ -732,8 +729,11 @@ class PortfolioAdapterTests(unittest.TestCase):
         )
         self.assertEqual(1, _factory_call_sites(probe))
         self.assertEqual(0, _factory_call_sites("def f():\n    return 1\n"))
-        # 明确点名的两个"将来才会迁移"的模块本轮不得 import adapter。
-        for name in ("ai_analysis.py", "adaptive_engine.py"):
+        # ai_analysis 已接入 typed portfolio context；owner engine 仍不得反向依赖 research。
+        roots = _imported_roots(_module_source("ai_analysis.py"))
+        self.assertIn("ai_research_portfolio_adapter", roots)
+        self.assertIn("paper_portfolio_read_model", roots)
+        for name in ("adaptive_engine.py",):
             with self.subTest(module=name):
                 self.assertNotIn(
                     "ai_research_portfolio_adapter", _imported_roots(_module_source(name)),
@@ -803,7 +803,7 @@ class PortfolioAdapterTests(unittest.TestCase):
             <= _imported_roots(_module_source(name))
         ]
         self.assertEqual(
-            sorted([ADAPTER_MODULE, "deepseek_research.py"]), sorted(both),
+            sorted([ADAPTER_MODULE, "deepseek_research.py", "ai_analysis.py"]), sorted(both),
             f"同时认识两套词表的模块集合发生变化：{sorted(both)}",
         )
         self.assertNotIn(

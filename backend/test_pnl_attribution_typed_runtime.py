@@ -661,7 +661,6 @@ class PnlAttributionTypedRuntimeTests(unittest.TestCase):
              "targets": ((ACCOUNT, 1),)},
             {"asof_day": DAY.isoformat(), "market_now": "2026-09-20T16:00:00+08:00",
              "targets": ((ACCOUNT, 1),)},
-            {"asof_day": DAY.isoformat(), "market_now": market_now, "targets": ()},
             {"asof_day": DAY.isoformat(), "market_now": market_now, "targets": None},
             {"asof_day": DAY.isoformat(), "market_now": market_now, "targets": (("", 1),)},
             {"asof_day": DAY.isoformat(), "market_now": market_now, "targets": ((ACCOUNT, 0),)},
@@ -678,6 +677,12 @@ class PnlAttributionTypedRuntimeTests(unittest.TestCase):
         self.assertEqual(DAY.isoformat(), accepted.asof_day)
         self.assertEqual(((ACCOUNT, self.cycle),), accepted.targets)
         self.assertIs(market_now.tzinfo, accepted.market_now.tzinfo)
+
+        empty_targets = DS.ResearchAsOfContext(
+            asof_day=DAY.isoformat(), market_now=market_now, targets=(),
+        )
+        with self.assertRaisesRegex(ValueError, DS.PNL_UNAVAILABLE_NO_CONTEXT):
+            DS._pnl_evidence(self.conn, self.path, attribution=empty_targets)
 
     # ------------------- PNL-03 ~ 08：execution owner typed fact -------------------
 
@@ -1442,11 +1447,14 @@ class PnlAttributionTypedRuntimeTests(unittest.TestCase):
         probe = ast.parse("def outer():\n    def inner():\n        target()\n    inner()\n")
         self.assertEqual({"inner": 1}, _call_sites(probe, "target"), "扫描器非空性对照")
         sites = self._adapter_call_sites("evidence_ref_from_portfolio_projection")
-        self.assertEqual({"deepseek_research.py": {"_portfolio_leg": 1}}, sites)
+        self.assertEqual({"deepseek_research.py": {"_portfolio_leg": 1},
+                          "ai_analysis.py": {"_portfolio_events": 1}}, sites)
         self.assertEqual(
             {"_portfolio_leg"},
             {name for name, _count in sites["deepseek_research.py"].items()},
         )
+        self.assertEqual({"_portfolio_events"},
+                         {name for name, _count in sites["ai_analysis.py"].items()})
 
     def test_PNL_28_no_legacy_sql_fallback_exists_in_the_pnl_path(self):
         """PNL-28：canonical 路径既没有 legacy SQL，也没有 ``except`` 兜底分支。"""
@@ -1861,10 +1869,9 @@ class PnlAttributionTypedRuntimeTests(unittest.TestCase):
         self.assertEqual(before, request.targets, "已签发的 context 不得被当前绑定改写")
 
         # 非空性：此刻**重新**签发才会反映当前状态（否则上面那条可能是发现逻辑空转）。
-        self.assertIsNone(
-            AE._post_close_attribution_request(now=instant),
-            "没有可证明绑定的账户时必须 fail closed（返回 None）",
-        )
+        without_targets = AE._post_close_attribution_request(now=instant)
+        self.assertEqual((), without_targets.targets,
+                         "没有可证明绑定的账户时必须签发空 targets context，组合 collector fail closed")
 
     @staticmethod
     def _instant(day, *, hour=16):

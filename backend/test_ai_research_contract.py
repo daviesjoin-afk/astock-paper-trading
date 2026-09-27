@@ -172,6 +172,7 @@ ALLOWED_AI_CONSUMERS: set[str] = {
     #: 它同样是**零 production 调用点**的能力交付（``incident_triage`` runtime 迁移属于
     #: 后续 convergence）。
     "ai_research_runtime_adapter.py",
+    "ai_analysis.py",
 }
 
 #: 时钟 / 随机数 / IO —— 研究契约一旦读它们，就能拿 current state 回填历史。

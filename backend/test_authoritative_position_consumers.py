@@ -574,7 +574,6 @@ class ProjectionContractGuard(unittest.TestCase):
         # ``backend/deepseek_research.py::_pnl_evidence`` 的豁免已在 R27-B2C-4C 删除：该
         # 路径不再读 ``paper_positions``（持仓成本只从 portfolio owner 的 typed fact 来），
         # 所以它不再是"经批准的投影消费者"。留着过宽的白名单就是下一个漏洞。
-        "backend/deepseek_research.py::_event_evidence": "display/research aggregate",
         # 历史符号发现（明确非 holding）。
         "backend/news_learning.py::_paper_codes":
             "recent symbol discovery only (documented non-holding)",

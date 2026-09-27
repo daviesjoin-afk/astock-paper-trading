@@ -2065,7 +2065,7 @@ def run_midday_observation(trigger="scheduled-midday"):
         _RUN_LOCK.release()
 
 
-def run_midday_advisor(trigger="scheduled-midday-dp"):
+def run_midday_advisor(trigger="scheduled-midday-dp", *, market_now=None):
     """Run a bounded midday DeepSeek batch outside the five-minute quote loop.
 
     The batch reviews the just-saved midday snapshot and candidate evidence;
@@ -2078,6 +2078,12 @@ def run_midday_advisor(trigger="scheduled-midday-dp"):
     status = "advisor_skipped"
     detail = {"session": "midday-dp", "official_close_learning": False}
     try:
+        if not isinstance(market_now, dt.datetime) or market_now.tzinfo is None or market_now.utcoffset() is None:
+            raise ValueError("market_now_must_be_timezone_aware")
+        research_day = market_now.astimezone(TZ).date().isoformat()
+        research_context = deepseek_research.ResearchAsOfContext(
+            asof_day=research_day, market_now=market_now, targets=(),
+        )
         with _connect() as conn:
             config = _config(conn)
         if not deepseek_advisor.enabled(config):
@@ -2116,15 +2122,32 @@ def run_midday_advisor(trigger="scheduled-midday-dp"):
                 # A focused candidate challenge gives the close cycle a useful
                 # second opinion without paying for the full six-task suite.
                 try:
-                    deepseek_research.run_task(
+                    challenge = deepseek_research.run_task(
                         _connect, PAPER_DB_PATH, "candidate_challenge",
                         trigger=f"{str(trigger or 'scheduled-midday-dp')}:candidate",
+                        context=research_context,
                     )
-                    detail["candidate_challenge"] = "completed"
+                    challenge_status = challenge.get("status") if isinstance(challenge, dict) else None
+                    recorded_status = challenge_status if challenge_status in {"completed", "blocked", "failed"} else "failed"
+                    challenge_error = challenge.get("error_code") if isinstance(challenge, dict) else None
+                    if recorded_status != "completed" and not challenge_error:
+                        challenge_error = "research_not_completed" if recorded_status == "blocked" else "invalid_research_result"
+                    detail["candidate_challenge"] = {
+                        "status": recorded_status,
+                        "error_code": challenge_error,
+                    }
+                    if recorded_status != "completed":
+                        status = "advisor_failed"
+                        detail["reason"] = challenge_error
+                    else:
+                        status = "advisor_batch"
+                        detail.update({"reason": "completed", "provider": "DeepSeek"})
                 except Exception as exc:
-                    detail["candidate_challenge"] = f"failed:{type(exc).__name__}"
-                status = "advisor_batch"
-                detail.update({"reason": "completed", "provider": "DeepSeek"})
+                    detail["candidate_challenge"] = {
+                        "status": "failed", "error_code": type(exc).__name__,
+                    }
+                    status = "advisor_failed"
+                    detail["reason"] = f"research_failed:{type(exc).__name__}"
         with _connect() as conn:
             conn.execute(
                 "INSERT INTO adaptive_runs(trigger,status,profile_date,new_rewards,detail,started_at,finished_at) VALUES(?,?,?,?,?,?,?)",
@@ -2375,12 +2398,12 @@ def run_learning_cycle(trigger="manual"):
                 )
             except Exception:
                 pass
-            # 研究套件尚未迁移，仍然走 legacy provider：凭据门禁只挡它。
-            if trigger == "scheduled-close" and deepseek_advisor.configured():
+            # 所有研究目的共享 canonical provider 与 typed evidence lifecycle。
+            if trigger == "scheduled-close":
                 try:
                     deepseek_research.run_suite(
                         _connect, PAPER_DB_PATH, trigger="scheduled-close",
-                        attribution=_post_close_attribution_request(now=dt.datetime.now(TZ)),
+                        context=_post_close_attribution_request(now=dt.datetime.now(TZ)),
                     )
                 except Exception:
                     pass
@@ -2613,10 +2636,9 @@ def _post_close_attribution_request(*, now):
 
     届时应由调用方**显式给出 targets**，而不是让这里去自动发现。
 
-    一个 target 都拿不到时同样返回 ``None`` —— 让 ``pnl_attribution`` 自己 fail closed
-    （记 ``_collection_error``），而不是发布一份"看起来正常"的归因。**非完成交易日**、
-    **读失败**、**没有可证明绑定的账户**三者都 fail closed，但根因都会被打印出来，避免在
-    排障时无从区分。
+    一个 target 都拿不到时仍然返回共享 as-of context，但 ``targets=()``。需要组合身份的
+    collector（尤其 pnl attribution）随后会 fail closed；其他 owner 可以继续提供不依赖组合
+    绑定的 typed facts。**非完成交易日**仍然没有可签发 context。
     """
     if not isinstance(now, dt.datetime):
         raise ValueError(
@@ -2661,18 +2683,20 @@ def _post_close_attribution_request(*, now):
                 pass
     if not targets:
         print(
-            "[attribution] pnl context unavailable: "
+            "[research] portfolio context unavailable: "
             + (read_error or "no account with a provable cycle binding"),
             flush=True,
         )
-        return None
     return deepseek_research.AttributionRequest(
         asof_day=day, market_now=now, targets=targets,
     )
 
 
-def run_advisor_review(trigger="manual-ui", purpose="data_quality"):
+def run_advisor_review(trigger="manual-ui", purpose="data_quality", *,
+                       asof_day=None, market_now=None, account_id=None, cycle_id=None):
     """Run an evidence-only DeepSeek review and return the refreshed view."""
+    if purpose != "data_quality" and (asof_day is None or market_now is None):
+        raise ValueError("research_asof_context_required")
     with _connect() as conn:
         cfg = _config(conn)
     if purpose == "data_quality":
@@ -2681,22 +2705,54 @@ def run_advisor_review(trigger="manual-ui", purpose="data_quality"):
             config=cfg, trigger=str(trigger or "manual-ui")[:80],
         )
     else:
-        deepseek_research.run_task(
+        if asof_day is None or market_now is None:
+            raise ValueError("research_asof_context_required")
+        if account_id is not None or cycle_id is not None:
+            if account_id is None or cycle_id is None:
+                raise ValueError("portfolio_context_requires_account_and_cycle")
+            targets = ((account_id, cycle_id),)
+        else:
+            targets = ()
+        if purpose == "pnl_attribution" and not targets:
+            raise ValueError("attribution_context_required")
+        try:
+            market_instant = dt.datetime.fromisoformat(str(market_now).replace("Z", "+00:00"))
+        except ValueError as exc:
+            raise ValueError("market_now_must_be_timezone_aware_iso8601") from exc
+        context = deepseek_research.ResearchAsOfContext(
+            asof_day=asof_day, market_now=market_instant, targets=targets,
+        )
+        result = deepseek_research.run_task(
             _connect, PAPER_DB_PATH, purpose,
             trigger=str(trigger or "manual-ui")[:80],
-            attribution=(_post_close_attribution_request(now=dt.datetime.now(TZ))
-                         if purpose == "pnl_attribution" else None),
+            context=context,
         )
+        view = overview()
+        view["research_task_result"] = result
+        return view
     return overview()
 
 
-def run_scheduled_ai_analysis(trigger="manual-ui", window="manual", scope="all"):
+def run_scheduled_ai_analysis(trigger="manual-ui", window="manual", scope="all", *,
+                              asof_day=None, market_now=None, account_id=None, cycle_id=None):
     """Run one idempotent time-window AI analysis outside trading paths."""
-    with _connect() as conn:
-        cfg = _config(conn)
+    targets = ()
+    if account_id is not None or cycle_id is not None:
+        if account_id is None or cycle_id is None:
+            raise ValueError("portfolio_context_requires_account_and_cycle")
+        targets = ((account_id, cycle_id),)
+    if asof_day is None or market_now is None:
+        raise ValueError("research_asof_context_required")
+    try:
+        market_instant = dt.datetime.fromisoformat(str(market_now).replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise ValueError("market_now_must_be_timezone_aware_iso8601") from exc
+    context = deepseek_research.ResearchAsOfContext(
+        asof_day=asof_day, market_now=market_instant, targets=targets,
+    )
     return ai_analysis.run_analysis(
         _connect, PAPER_DB_PATH, SNAPSHOT_PATHS, deepseek_advisor,
-        config=cfg, trigger=str(trigger or "manual-ui")[:80],
+        trigger=str(trigger or "manual-ui")[:80], context=context,
         window=str(window or "manual")[:30], scope=str(scope or "all")[:30],
     )
 
@@ -2723,18 +2779,34 @@ def run_ai_tuning(trigger="manual-ai-tuning", mode="intraday"):
     return view
 
 
-def run_advisor_suite(trigger="manual-suite"):
+def run_advisor_suite(trigger="manual-suite", *, asof_day=None, market_now=None,
+                      account_id=None, cycle_id=None):
+    if asof_day is None or market_now is None:
+        raise ValueError("research_asof_context_required")
     with _connect() as conn:
         cfg = _config(conn)
     if not deepseek_advisor.enabled(cfg):
         raise RuntimeError("advisor_disabled")
-    if not deepseek_advisor.configured():
-        raise RuntimeError("api_key_missing")
+    if asof_day is None or market_now is None:
+        raise ValueError("research_asof_context_required")
+    if account_id is not None or cycle_id is not None:
+        if account_id is None or cycle_id is None:
+            raise ValueError("portfolio_context_requires_account_and_cycle")
+        targets = ((account_id, cycle_id),)
+    else:
+        targets = ()
+    try:
+        market_instant = dt.datetime.fromisoformat(str(market_now).replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise ValueError("market_now_must_be_timezone_aware_iso8601") from exc
+    context = deepseek_research.ResearchAsOfContext(
+        asof_day=asof_day, market_now=market_instant, targets=targets,
+    )
     deepseek_advisor.run_review(_connect, PAPER_DB_PATH, SNAPSHOT_PATHS, config=cfg, trigger=trigger)
-    deepseek_research.run_suite(_connect, PAPER_DB_PATH, trigger=trigger,
-                                attribution=_post_close_attribution_request(
-                                    now=dt.datetime.now(TZ)))
-    return overview()
+    results = deepseek_research.run_suite(_connect, PAPER_DB_PATH, trigger=trigger, context=context)
+    view = overview()
+    view["research_suite_results"] = results
+    return view
 
 
 def run_news_learning(trigger="manual-ui"):
@@ -4941,3 +5013,34 @@ def adaptive_run_fact(conn, run_id, *, as_of):
             started_at=started_at, finished_at=finished_at,
         ),
     )
+
+
+def adaptive_run_facts(conn, *, as_of, limit=100):
+    """按显式 ``as_of`` 发布可用的 adaptive run typed facts。
+
+    查询与投影都留在 runtime owner 内。research 只拿到投影，不读 ``adaptive_runs``
+    的裸行；``killed`` 和时间戳无法证明的记录由 :func:`adaptive_run_fact` 保持
+    unavailable。
+    """
+    if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
+        raise ValueError("adaptive_run_facts limit must be a positive int")
+    size = min(limit, 500)
+    facts = []
+    offset = 0
+    while len(facts) < size:
+        rows = conn.execute(
+            "SELECT id FROM adaptive_runs ORDER BY id DESC LIMIT ? OFFSET ?",
+            (min(size, 100), offset),
+        ).fetchall()
+        if not rows:
+            break
+        for row in rows:
+            run_id = row[0] if not hasattr(row, "keys") else row["id"]
+            projection = adaptive_run_fact(conn, run_id, as_of=as_of)
+            if projection is not None:
+                facts.append(projection)
+                if len(facts) == size:
+                    break
+        offset += len(rows)
+    facts.sort(key=lambda fact: (fact.availability_day, fact.revision_identity), reverse=True)
+    return tuple(facts[:size])

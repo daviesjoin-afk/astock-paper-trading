@@ -291,12 +291,19 @@ def run_ai_analysis(
     trigger: str = Query("manual-ui", max_length=80),
     window: str = Query("manual", max_length=30),
     scope: str = Query("all", max_length=30),
+    as_of: str = Query(..., min_length=10, max_length=10),
+    market_now: str = Query(..., min_length=20, max_length=40),
+    account_id: str | None = Query(None, max_length=40),
+    cycle_id: int | None = Query(None, gt=0),
     confirmed: bool = Query(False),
 ):
-    """Run an explicitly-confirmed, non-trading AI evidence analysis."""
+    """Run research at the caller-declared business day and market instant."""
     _require_confirmation(confirmed, "重试分时段AI分析")
     try:
-        return adaptive.run_scheduled_ai_analysis(trigger=trigger, window=window, scope=scope)
+        return adaptive.run_scheduled_ai_analysis(
+            trigger=trigger, window=window, scope=scope, asof_day=as_of,
+            market_now=market_now, account_id=account_id, cycle_id=cycle_id,
+        )
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     except Exception as exc:
@@ -335,11 +342,18 @@ def run_status():
 def run_advisor(
     trigger: str = Query("manual-ui", max_length=40),
     purpose: str = Query("data_quality", max_length=40),
+    as_of: str | None = Query(None, min_length=10, max_length=10),
+    market_now: str | None = Query(None, min_length=20, max_length=40),
+    account_id: str | None = Query(None, max_length=40),
+    cycle_id: int | None = Query(None, gt=0),
     confirmed: bool = Query(False),
 ):
     _require_confirmation(confirmed, "运行数据质量审阅")
     try:
-        return adaptive.run_advisor_review(trigger=trigger, purpose=purpose)
+        return adaptive.run_advisor_review(
+            trigger=trigger, purpose=purpose, asof_day=as_of, market_now=market_now,
+            account_id=account_id, cycle_id=cycle_id,
+        )
     except RuntimeError as exc:
         error = str(exc)
         messages = {
@@ -348,6 +362,11 @@ def run_advisor(
         }
         raise HTTPException(status_code=409, detail=messages.get(error, "DeepSeek 审阅暂不可用")) from exc
     except ValueError as exc:
+        error = str(exc)
+        if error == "attribution_context_required":
+            raise HTTPException(status_code=422, detail="P&L 归因需要明确选择账户和周期") from exc
+        if error == "portfolio_context_requires_account_and_cycle":
+            raise HTTPException(status_code=422, detail="账户和周期必须同时提供") from exc
         raise HTTPException(status_code=422, detail="不支持的 DeepSeek 研究任务") from exc
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"DeepSeek 审阅失败：{type(exc).__name__}") from exc
@@ -356,13 +375,22 @@ def run_advisor(
 @router.post("/advisor/suite")
 def run_advisor_suite(
     trigger: str = Query("manual-suite", max_length=40),
+    as_of: str = Query(..., min_length=10, max_length=10),
+    market_now: str = Query(..., min_length=20, max_length=40),
+    account_id: str | None = Query(None, max_length=40),
+    cycle_id: int | None = Query(None, gt=0),
     confirmed: bool = Query(False),
 ):
     _require_confirmation(confirmed, "运行研究套件")
     try:
-        return adaptive.run_advisor_suite(trigger=trigger)
+        return adaptive.run_advisor_suite(
+            trigger=trigger, asof_day=as_of, market_now=market_now,
+            account_id=account_id, cycle_id=cycle_id,
+        )
     except RuntimeError as exc:
         raise HTTPException(status_code=409, detail="DeepSeek 研究套件尚未启用或密钥不可用") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"DeepSeek 研究套件运行失败：{type(exc).__name__}") from exc
 

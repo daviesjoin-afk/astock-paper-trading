@@ -154,17 +154,26 @@ class ResearchSuiteSnapshotTests(unittest.TestCase):
     def test_suite_collects_with_one_adaptive_connection_and_marks_each_projection(self):
         conn = self._Conn()
         factory = mock.Mock(return_value=conn)
-        with mock.patch.object(DS.advisor, "ensure_schema"), \
-             mock.patch.object(DS.advisor, "_now", return_value="2026-08-25T15:35:00+08:00"), \
-             mock.patch.object(DS, "collect", side_effect=lambda purpose, _conn, _path: {"purpose": purpose}):
-            snapshot_id, asof, evidence = DS._collect_suite_snapshot(factory, "paper.sqlite3")
+        context = DS.ResearchAsOfContext(
+            asof_day="2026-08-25",
+            market_now=dt.datetime.fromisoformat("2026-08-25T15:35:00+08:00"),
+            targets=(),
+        )
+        with mock.patch.object(
+            DS, "_collect_typed_events",
+            side_effect=lambda purpose, _conn, _path, passed_context: (purpose, passed_context),
+        ) as collect_events:
+            snapshot_id, asof, evidence = DS._collect_suite_snapshot(
+                factory, "paper.sqlite3", context,
+            )
         self.assertEqual(factory.call_count, 1)
         self.assertTrue(snapshot_id)
         self.assertEqual(asof, "2026-08-25T15:35:00+08:00")
         self.assertEqual(set(evidence), set(DS.TASKS))
         for purpose, item in evidence.items():
-            self.assertEqual(item["purpose"], purpose)
-            self.assertEqual(item["_suite_snapshot"]["id"], snapshot_id)
+            self.assertEqual(item, (purpose, context))
+        self.assertEqual(collect_events.call_count, len(DS.TASKS))
+        self.assertTrue(all(call.args[3] is context for call in collect_events.call_args_list))
 
 
 class AdaptiveApiQuoteTests(unittest.TestCase):
