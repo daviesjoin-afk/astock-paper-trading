@@ -4514,10 +4514,6 @@ ADAPTIVE_RUN_TERMINAL_STATUSES = (
     "advisor_skipped", "advisor_batch", "advisor_failed",
 )
 
-#: 非终态：行只声明"这一轮正在跑"，其**可用瞬间**是 `started_at`。
-#: 它仍是 owner 能自证的事实，但**不是**终态事实 —— 消费者不得把它读成"运行结果"。
-ADAPTIVE_RUN_IN_PROGRESS_STATUSES = ("running",)
-
 #: `killed` 是终态，但终态 instant **不可证**：`_learning_detect_stale:94` 只改
 #: `status` 与 `detail`，甚至在自己的 detail 里写明 `no finished_at`，因此该行的
 #: `finished_at` 仍等于 `started_at`（`running` INSERT 写入的占位值）。
@@ -4540,13 +4536,9 @@ ADAPTIVE_RUN_FACT_VERIFICATION_STATUSES = (
     ADAPTIVE_RUN_FACT_RECORDED, ADAPTIVE_RUN_FACT_OWNER_UNPROVEN,
 )
 
-#: 这条事实的可用瞬间是**哪一类**。它是 owner 的显式声明，进指纹，因此
-#: "把 `started_at` 当成终态可用性"不可能只靠读侧疏忽发生。
+#: typed adaptive 事实只支持 owner 可证明的终态瞬间。
 ADAPTIVE_RUN_AVAILABILITY_TERMINAL = "terminal"
-ADAPTIVE_RUN_AVAILABILITY_IN_PROGRESS = "in_progress"
-ADAPTIVE_RUN_AVAILABILITY_KINDS = (
-    ADAPTIVE_RUN_AVAILABILITY_TERMINAL, ADAPTIVE_RUN_AVAILABILITY_IN_PROGRESS,
-)
+ADAPTIVE_RUN_AVAILABILITY_KINDS = (ADAPTIVE_RUN_AVAILABILITY_TERMINAL,)
 
 #: typed 读侧要求的**必需归一列**。
 _ADAPTIVE_RUN_REQUIRED_COLUMNS = (
@@ -4651,16 +4643,14 @@ def _adaptive_run_availability_kind(runtime_status: str) -> str | None:
     """owner 能否为这个 status **证明**一个可用瞬间；不能则 ``None``（不可签发）。
 
     * 终态且 owner 盖了 `finished_at` → ``terminal``；
-    * `running` → ``in_progress``（可用瞬间 = `started_at`）；
-    * `killed`（终态但无终态 instant）与**任何不在闭集里的 status** → ``None``。
+    * `running`（detail 可变且无 revision 时间戳）、`killed`（终态 instant 不可证）与
+      **任何不在终态闭集里的 status** → ``None``。
 
     未知 status 一并走这里，因此"新增一个 status 却没人决定它的可用性语义"不会静默
     落进某个默认分支被当成已记录事实 —— 它直接不可签发。
     """
     if runtime_status in ADAPTIVE_RUN_TERMINAL_STATUSES:
         return ADAPTIVE_RUN_AVAILABILITY_TERMINAL
-    if runtime_status in ADAPTIVE_RUN_IN_PROGRESS_STATUSES:
-        return ADAPTIVE_RUN_AVAILABILITY_IN_PROGRESS
     return None
 
 
@@ -4673,9 +4663,8 @@ def _adaptive_run_fact_verification_status(
 
     * status 必须落在 owner 的 lifecycle 闭集内；
     * **终态**行的 `finished_at >= started_at`（终态写入发生在开始之后）；
-    * **进行中**行的 `finished_at == started_at` —— 这是 owner 的 `running` INSERT 的
-      形状（列 NOT NULL，于是它把 `finished_at` 与 `started_at` 写成同一个值）。一个
-      `running` 行若带着别的 `finished_at`，owner 无法自证它，因此不背书。
+    * 只有终态 availability 可签发；`running` 的 detail 会持续变化，但没有 revision
+      timestamp，故它不属于 typed research evidence。
 
     刻意**不看** status 的"好坏"：`failed` 与 `completed` 都可以是
     ``adaptive_run_recorded`` —— 见本段开头的三条分离。
@@ -4684,10 +4673,6 @@ def _adaptive_run_fact_verification_status(
         return ADAPTIVE_RUN_FACT_OWNER_UNPROVEN
     if availability_kind == ADAPTIVE_RUN_AVAILABILITY_TERMINAL:
         if finished_at < started_at:
-            return ADAPTIVE_RUN_FACT_OWNER_UNPROVEN
-        return ADAPTIVE_RUN_FACT_RECORDED
-    if availability_kind == ADAPTIVE_RUN_AVAILABILITY_IN_PROGRESS:
-        if finished_at != started_at:
             return ADAPTIVE_RUN_FACT_OWNER_UNPROVEN
         return ADAPTIVE_RUN_FACT_RECORDED
     return ADAPTIVE_RUN_FACT_OWNER_UNPROVEN
@@ -4779,13 +4764,19 @@ class AdaptiveRunFactProjection:
         object.__setattr__(self, "started_at", started_at.isoformat(timespec="seconds"))
         object.__setattr__(self, "finished_at", finished_at.isoformat(timespec="seconds"))
 
+        expected_kind = _adaptive_run_availability_kind(runtime_status)
+        if expected_kind is None:
+            raise AdaptiveRuntimeFactError(
+                f"adaptive runtime status {runtime_status!r} has no owner-provable typed availability"
+            )
+
         kind = str(self.availability_kind or "").strip()
         if kind not in ADAPTIVE_RUN_AVAILABILITY_KINDS:
             raise AdaptiveRuntimeFactError(
                 f"unknown adaptive runtime availability_kind: {kind!r}; "
                 f"allowed: {ADAPTIVE_RUN_AVAILABILITY_KINDS}"
             )
-        if kind != _adaptive_run_availability_kind(runtime_status):
+        if kind != expected_kind:
             raise AdaptiveRuntimeFactError(
                 f"adaptive runtime availability_kind {kind!r} disagrees with the status "
                 f"{runtime_status!r} — 可用瞬间的种类只能由 owner 从 status 派生"
@@ -4793,7 +4784,7 @@ class AdaptiveRunFactProjection:
         object.__setattr__(self, "availability_kind", kind)
 
         day = _runtime_business_day(self.availability_day, what="adaptive runtime availability_day")
-        instant = finished_at if kind == ADAPTIVE_RUN_AVAILABILITY_TERMINAL else started_at
+        instant = finished_at
         expected = _runtime_owner_day(instant, what="adaptive runtime availability instant")
         if day != expected:
             raise AdaptiveRuntimeFactError(
@@ -4807,7 +4798,16 @@ class AdaptiveRunFactProjection:
                 f"unknown adaptive runtime fact verification status: {status!r}; "
                 f"allowed: {ADAPTIVE_RUN_FACT_VERIFICATION_STATUSES}"
             )
-        object.__setattr__(self, "fact_verification_status", status)
+        expected_status = _adaptive_run_fact_verification_status(
+            runtime_status=runtime_status, availability_kind=kind,
+            started_at=started_at, finished_at=finished_at,
+        )
+        if status != expected_status:
+            raise AdaptiveRuntimeFactError(
+                "adaptive runtime fact_verification_status disagrees with owner-derived "
+                "verification from factual fields"
+            )
+        object.__setattr__(self, "fact_verification_status", expected_status)
         object.__setattr__(self, "content_fingerprint", self._fingerprint())
 
     @property
@@ -4907,7 +4907,7 @@ def adaptive_run_fact(conn, run_id, *, as_of):
 
     started_at = _runtime_owner_instant(item.get("started_at"), what="adaptive run started_at")
     finished_at = _runtime_owner_instant(item.get("finished_at"), what="adaptive run finished_at")
-    instant = finished_at if kind == ADAPTIVE_RUN_AVAILABILITY_TERMINAL else started_at
+    instant = finished_at
     available_day = _runtime_owner_day(instant, what="adaptive run availability instant")
     if available_day > day:
         return None

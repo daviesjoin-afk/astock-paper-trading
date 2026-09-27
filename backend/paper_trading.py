@@ -15640,7 +15640,16 @@ class PaperJobRunFactProjection:
                 f"unknown paper job attempt fact verification status: {status!r}; "
                 f"allowed: {PAPER_JOB_RUN_FACT_VERIFICATION_STATUSES}"
             )
-        object.__setattr__(self, "fact_verification_status", status)
+        expected_status = _paper_job_run_fact_verification_status(
+            runtime_status=runtime_status, availability_kind=kind,
+            started_at=started_at, finished_at=finished_at,
+        )
+        if status != expected_status:
+            raise PaperJobRuntimeFactError(
+                "paper job attempt fact_verification_status disagrees with owner-derived "
+                "verification from factual fields"
+            )
+        object.__setattr__(self, "fact_verification_status", expected_status)
         object.__setattr__(self, "content_fingerprint", self._fingerprint())
 
     @property

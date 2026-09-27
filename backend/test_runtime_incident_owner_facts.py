@@ -20,6 +20,7 @@
 from __future__ import annotations
 
 import ast
+import dataclasses
 import os
 import re
 import sqlite3
@@ -833,20 +834,102 @@ class RuntimePitAvailabilityTests(_DbTestCase):
         self.assertNotIn("heartbeat_at", first.projection())
         self.assertNotIn("expires_at", first.projection())
 
-    def test_INC_19c_a_running_row_never_claims_terminal_availability(self):
-        """INC-19c：``running`` 行的可用瞬间是 ``started_at``，且被显式标注为 in_progress。
-
-        这正是"``started_at`` 不是终态可用性"的可执行形式：进行中的事实**不冒充**终态
-        结果，消费者能一眼看出它还没结束。
-        """
+    def test_INC_19h_adaptive_running_row_is_not_issuable(self):
+        """INC-19h：running 是 lifecycle state，但不是 typed research evidence。"""
         conn = _adaptive_conn()
         run_id = _insert_adaptive_run(
-            conn, status="running", started_at="2026-09-20T15:05:00+08:00",
+            conn, status="running", started_at="2026-09-20T23:50:00+08:00",
+            finished_at="2026-09-20T23:50:00+08:00", detail='{"stage":"init"}',
+        )
+        self.assertIsNone(AE.adaptive_run_fact(conn, run_id, as_of="2026-09-20"))
+
+    def test_INC_19i_running_detail_mutation_cannot_backfill_either_day(self):
+        """INC-19i：没有 running detail revision instant，D 与 D+1 都不可签发。"""
+        conn = _adaptive_conn()
+        run_id = _insert_adaptive_run(
+            conn, status="running", started_at="2026-09-20T23:50:00+08:00",
+            finished_at="2026-09-20T23:50:00+08:00", detail='{"stage":"init"}',
+        )
+        conn.execute(
+            "UPDATE adaptive_runs SET detail=? WHERE id=? AND status='running'",
+            ('{"stage":"training"}', run_id),
+        )
+        for as_of in ("2026-09-20", "2026-09-21"):
+            with self.subTest(as_of=as_of):
+                self.assertIsNone(AE.adaptive_run_fact(conn, run_id, as_of=as_of))
+
+    def test_INC_19j_direct_running_projection_construction_is_rejected(self):
+        """INC-19j：projection value contract 拒绝 running typed evidence。"""
+        conn = _adaptive_conn()
+        run_id = _insert_adaptive_run(
+            conn, status="failed", started_at="2026-09-20T15:05:00+08:00",
+            finished_at="2026-09-20T15:10:00+08:00",
+        )
+        terminal = AE.adaptive_run_fact(conn, run_id, as_of="2026-09-20")
+        with self.assertRaises(AE.AdaptiveRuntimeFactError):
+            dataclasses.replace(
+                terminal, runtime_status="running", availability_kind="terminal",
+                started_at="2026-09-20T15:05:00+08:00",
+                finished_at="2026-09-20T15:05:00+08:00",
+                fact_verification_status=AE.ADAPTIVE_RUN_FACT_RECORDED,
+            )
+
+    def test_INC_26c_projection_verification_cannot_be_forged_with_replace(self):
+        """INC-26c：两家 owner 都从事实字段重算核验，replace 不能升级 unproven。"""
+        conn = _adaptive_conn()
+        run_id = _insert_adaptive_run(
+            conn, status="failed", started_at="2026-09-20T15:10:00+08:00",
             finished_at="2026-09-20T15:05:00+08:00",
         )
-        fact = AE.adaptive_run_fact(conn, run_id, as_of="2026-09-20")
-        self.assertEqual(AE.ADAPTIVE_RUN_AVAILABILITY_IN_PROGRESS, fact.availability_kind)
-        self.assertEqual("2026-09-20", fact.availability_day)
+        adaptive_unproven = AE.adaptive_run_fact(conn, run_id, as_of="2026-09-20")
+        self.assertEqual(AE.ADAPTIVE_RUN_FACT_OWNER_UNPROVEN,
+                         adaptive_unproven.fact_verification_status)
+        with self.assertRaises(AE.AdaptiveRuntimeFactError):
+            dataclasses.replace(
+                adaptive_unproven,
+                fact_verification_status=AE.ADAPTIVE_RUN_FACT_RECORDED,
+            )
+
+        adaptive_recorded_id = _insert_adaptive_run(
+            conn, status="failed", started_at="2026-09-20T15:05:00+08:00",
+            finished_at="2026-09-20T15:10:00+08:00",
+        )
+        adaptive_recorded = AE.adaptive_run_fact(conn, adaptive_recorded_id, as_of="2026-09-20")
+        self.assertEqual(
+            AE.ADAPTIVE_RUN_FACT_RECORDED,
+            dataclasses.replace(
+                adaptive_recorded,
+                fact_verification_status=adaptive_recorded.fact_verification_status,
+            ).fact_verification_status,
+        )
+
+        pconn = _paper_conn()
+        _insert_paper_attempt(
+            pconn, status="running", finished_at="2026-09-20 09:40:00",
+        )
+        paper_unproven = PT.paper_job_run_fact(
+            pconn, "intraday:202609200930", as_of="2026-09-20",
+        )
+        self.assertEqual(PT.PAPER_JOB_RUN_FACT_OWNER_UNPROVEN,
+                         paper_unproven.fact_verification_status)
+        with self.assertRaises(PT.PaperJobRuntimeFactError):
+            dataclasses.replace(
+                paper_unproven,
+                fact_verification_status=PT.PAPER_JOB_RUN_FACT_RECORDED,
+            )
+
+        paper_recorded_key = _insert_paper_attempt(
+            pconn, run_key="intraday:202609200945", status="failed",
+            started_at="2026-09-20 09:45:00", finished_at="2026-09-20 09:47:00",
+        )
+        paper_recorded = PT.paper_job_run_fact(pconn, paper_recorded_key, as_of="2026-09-20")
+        self.assertEqual(
+            PT.PAPER_JOB_RUN_FACT_RECORDED,
+            dataclasses.replace(
+                paper_recorded,
+                fact_verification_status=paper_recorded.fact_verification_status,
+            ).fact_verification_status,
+        )
 
         pconn = _paper_conn()
         _insert_paper_attempt(pconn, status="running")

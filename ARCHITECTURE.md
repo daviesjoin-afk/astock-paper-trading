@@ -2836,8 +2836,8 @@ failures`，而**不是**用当前行伪造可重建性。
 #### PIT 语义（每条都能被 mutation 打红）
 
 ```text
-adaptive 终态可用性   ← finished_at（终态写入时盖）           绝不来自 started_at
-adaptive 进行中可用性 ← started_at（行只声明"正在跑"）        并显式标注 availability_kind
+adaptive 终态可用性   ← owner 可证明的 finished_at（终态写入时盖）
+adaptive running      → 不签发 typed evidence（detail 可变且无 revision/update timestamp）
 paper    终态可用性   ← finished_at                         绝不来自 market_date
 paper    进行中可用性 ← started_at（finished_at 为 NULL 才是 owner 形状）
 finished_at/available_day > as_of → UNAVAILABLE（返回 None）  绝不倒填当前行
@@ -2852,7 +2852,18 @@ profile_date / market_date        业务标签，永不进 as_of
 **只认那一种形状**，其余（带 offset / date-only / 其它分隔符）一律 fail closed。可用日一律按
 Asia/Shanghai 归一，**不读运行机器的 local timezone**。
 
-#### `killed` 行与 `interrupted` 行：不硬签 ref
+#### adaptive `running` / `killed` 与 paper `interrupted`：不硬签 ref
+
+```text
+adaptive running  lifecycle state；detail 会被学习阶段反复 UPDATE，但没有 revision/update timestamp，
+                  因而不签发 typed research evidence，也不能把 D+1 的 detail 倒填到 D
+adaptive terminal 仅当 owner 可证明 finished_at 时才签发 typed fact
+```
+
+Owner projection 会从 runtime status、availability kind 与归一后的时间戳重算 verification；
+传入的 `fact_verification_status` 必须与 owner 推导值精确相等。`dataclasses.replace` 因此不能把
+unproven projection 提升为 recorded。该自校验只保证 typed projection 的内部一致性；physical
+database origin / trusted database provenance 仍是 OPEN / REQUIRED。
 
 ```text
 killed       终态，但终态 instant 不可证：_learning_detect_stale:94 只改 status/detail，
@@ -2942,8 +2953,8 @@ factory。`backend/ai_research_contract.py`：`SUPPORTED_OWNER_ADAPTERS` 加入
 职责，被登记的是它的 typed 读接缝）；`backend/test_ai_research_contract.py` 的
 `ALLOWED_AI_CONSUMERS` 登记新接缝。
 
-语义 mutation 在 `work/r27b2c7_runtime_incident_mutation_check.py`（M-INC-01 ~ 15）必须全部
-CAUGHT（baseline GREEN、survived = 0、fake = 0、timeout = 0、被改写文件的 restore sha256 一致）。
+语义 mutation 在 `work/r27b2c7_runtime_incident_mutation_check.py`（M-INC-01 ~ 17B，含
+owner verification 自校验与 adaptive running 不签发的独立变异）必须全部 CAUGHT（baseline GREEN、survived = 0、fake = 0、timeout = 0、被改写文件的 restore sha256 一致）。
 B43 建议清单里有两条在本轮**没有对应契约**，因此按真实接缝落点而不是造假锚点：
 
 ```text
@@ -3218,8 +3229,9 @@ runtime lifecycle status 被当成 owner fact verification（R27-B2C-7：`runnin
 is_incident / root_cause / promotable —— 扫的是 AST 标识符而不是散文，因为契约文档正是在
 解释它为什么不在这里）
 runtime 事实的可用性被 `started_at` / `profile_date` / `market_date` 顶替（R27-B2C-7：
-adaptive 的终态可用性是 `finished_at`、进行中是 `started_at`（显式标注
-`availability_kind`）；paper 的终态是 `finished_at`、进行中是 `started_at`（`finished_at`
+adaptive 仅签发 owner 可证明 `finished_at` 的终态；running 的 detail 可变且无 revision/update
+timestamp，因此 running 虽是 lifecycle state，却不是 typed research evidence。paper 的终态是
+`finished_at`、进行中是 `started_at`（`finished_at`
 为 NULL 才是 owner 形状）。`profile_date` / `market_date` 只是业务标签：D 日任务失败可能
 D 15:30 甚至 D+1 的回收扫描才被系统知道。跨 offset 一律归一到 Asia/Shanghai 后再派生业务日，
 **不读运行机器的 local timezone**）

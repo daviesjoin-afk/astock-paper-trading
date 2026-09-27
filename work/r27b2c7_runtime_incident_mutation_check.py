@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """R27-B2C-7 —— runtime / incident owner fact 与 runtime adapter 的 **mutation matrix**。
 
-覆盖 ``M-INC-01`` ~ ``M-INC-15``，逐条对应本轮要钉死的不变量：
+覆盖 ``M-INC-01`` ~ ``M-INC-17B``，逐条对应本轮要钉死的不变量：
 
 ```text
 runtime lifecycle status      ≠ owner fact verification（含 failed / completed 两侧）
@@ -128,7 +128,14 @@ T_INC_19 = _owner("RuntimePitAvailabilityTests."
 T_INC_19B = _owner("RuntimePitAvailabilityTests."
                    "test_INC_19b_heartbeat_does_not_move_the_fact_identity")
 T_INC_19C = _owner("RuntimePitAvailabilityTests."
-                   "test_INC_19c_a_running_row_never_claims_terminal_availability")
+                    "test_INC_19h_adaptive_running_row_is_not_issuable")
+T_INC_19H = T_INC_19C
+T_INC_19I = _owner("RuntimePitAvailabilityTests."
+                   "test_INC_19i_running_detail_mutation_cannot_backfill_either_day")
+T_INC_19J = _owner("RuntimePitAvailabilityTests."
+                   "test_INC_19j_direct_running_projection_construction_is_rejected")
+T_INC_26C = _owner("RuntimePitAvailabilityTests."
+                   "test_INC_26c_projection_verification_cannot_be_forged_with_replace")
 T_INC_19D = _owner("RuntimePitAvailabilityTests."
                    "test_INC_19d_a_terminal_row_without_its_terminal_instant_is_refused")
 T_INC_19E = _owner("RuntimePitAvailabilityTests."
@@ -194,6 +201,9 @@ BASELINE_ONLY_TARGETS = (
     T_INC_19,
     T_INC_19B,
     T_INC_19C,
+    T_INC_19I,
+    T_INC_19J,
+    T_INC_26C,
     T_INC_19D,
     T_INC_19E,
     T_INC_19F,
@@ -270,7 +280,7 @@ MUTATIONS: list[dict] = [
         "file": ADAPTIVE_FILE,
         "desc": "as_of 从 finished_at 退化成 started_at",
         "old": (
-            "    instant = finished_at if kind == ADAPTIVE_RUN_AVAILABILITY_TERMINAL else started_at\n"
+            "    instant = finished_at\n"
             '    available_day = _runtime_owner_day(instant, what="adaptive run availability instant")'
         ),
         "new": (
@@ -319,13 +329,13 @@ MUTATIONS: list[dict] = [
         "file": ADAPTIVE_FILE,
         "desc": "unknown runtime status 默认成可签发的 terminal",
         "old": (
-            "    if runtime_status in ADAPTIVE_RUN_IN_PROGRESS_STATUSES:\n"
-            "        return ADAPTIVE_RUN_AVAILABILITY_IN_PROGRESS\n"
+            "    if runtime_status in ADAPTIVE_RUN_TERMINAL_STATUSES:\n"
+            "        return ADAPTIVE_RUN_AVAILABILITY_TERMINAL\n"
             "    return None"
         ),
         "new": (
-            "    if runtime_status in ADAPTIVE_RUN_IN_PROGRESS_STATUSES:\n"
-            "        return ADAPTIVE_RUN_AVAILABILITY_IN_PROGRESS\n"
+            "    if runtime_status in ADAPTIVE_RUN_TERMINAL_STATUSES:\n"
+            "        return ADAPTIVE_RUN_AVAILABILITY_TERMINAL\n"
             "    return ADAPTIVE_RUN_AVAILABILITY_TERMINAL  # MUTANT"
         ),
         "test": T_INC_15,
@@ -445,6 +455,69 @@ MUTATIONS: list[dict] = [
         ),
         "test": T_INC_30,
     },
+    {
+        "id": "M-INC-16A",
+        "file": ADAPTIVE_FILE,
+        "desc": "adaptive projection 不再校验 owner-derived verification",
+        "old": (
+            "        if status != expected_status:\n"
+            "            raise AdaptiveRuntimeFactError("
+        ),
+        "new": (
+            "        if False:  # MUTANT\n"
+            "            raise AdaptiveRuntimeFactError("
+        ),
+        "test": T_INC_26C,
+    },
+    {
+        "id": "M-INC-16B",
+        "file": PAPER_FILE,
+        "desc": "paper projection 不再校验 owner-derived verification",
+        "old": (
+            "        if status != expected_status:\n"
+            "            raise PaperJobRuntimeFactError("
+        ),
+        "new": (
+            "        if False:  # MUTANT\n"
+            "            raise PaperJobRuntimeFactError("
+        ),
+        "test": T_INC_26C,
+    },
+    {
+        "id": "M-INC-17A",
+        "file": ADAPTIVE_FILE,
+        "desc": "adaptive running row 再次获得 typed availability",
+        "old": (
+            "    if runtime_status in ADAPTIVE_RUN_TERMINAL_STATUSES:\n"
+            "        return ADAPTIVE_RUN_AVAILABILITY_TERMINAL\n"
+            "    return None"
+        ),
+        "new": (
+            "    if runtime_status in ADAPTIVE_RUN_TERMINAL_STATUSES:\n"
+            "        return ADAPTIVE_RUN_AVAILABILITY_TERMINAL\n"
+            '    if runtime_status == "running":  # MUTANT\n'
+            "        return ADAPTIVE_RUN_AVAILABILITY_TERMINAL\n"
+            "    return None"
+        ),
+        "test": T_INC_19I,
+    },
+    {
+        "id": "M-INC-17B",
+        "file": ADAPTIVE_FILE,
+        "desc": "adaptive projection 允许无 owner-provable availability 的 status",
+        "old": (
+            "        if expected_kind is None:\n"
+            "            raise AdaptiveRuntimeFactError(\n"
+            "                f\"adaptive runtime status {runtime_status!r} has no owner-provable "
+            "typed availability\"\n"
+            "            )"
+        ),
+        "new": (
+            "        if expected_kind is None:  # MUTANT\n"
+            "            expected_kind = ADAPTIVE_RUN_AVAILABILITY_TERMINAL"
+        ),
+        "test": T_INC_19J,
+    },
 ]
 
 VERDICT_CAUGHT = "CAUGHT"
@@ -542,7 +615,7 @@ def self_test_sequence() -> None:
 
 
 #: ``-O`` 探针：在优化解释器里复算 harness 的硬守卫，输出一行 JSON 报告。
-_OPTIMIZATION_PROBE = '''
+_OPTIMIZATION_PROBE = r'''
 """在普通 / ``-O`` 解释器下复算 harness 的硬守卫。"""
 import importlib.util
 import json
@@ -552,7 +625,7 @@ spec = importlib.util.spec_from_file_location("_harness_under_probe", sys.argv[1
 module = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(module)
 
-ANCHOR = "    return a + b\\n"
+ANCHOR = "    return a + b\n"
 
 
 def outcome(call):
@@ -575,9 +648,9 @@ print(json.dumps({
     "optimized": not __debug__,
     "implementation": sys.implementation.name,
     "results": [
-        outcome(lambda: apply_anchor("def add(a, b):\\n    return a * b\\n")),
-        outcome(lambda: apply_anchor("def add(a, b):\\n" + ANCHOR + ANCHOR)),
-        outcome(lambda: apply_anchor("def add(a, b):\\n" + ANCHOR)),
+        outcome(lambda: apply_anchor("def add(a, b):\n    return a * b\n")),
+        outcome(lambda: apply_anchor("def add(a, b):\n" + ANCHOR + ANCHOR)),
+        outcome(lambda: apply_anchor("def add(a, b):\n" + ANCHOR)),
         outcome(lambda: module._require(False, "probe: hard guard must survive -O")),
     ],
 }))
