@@ -326,27 +326,25 @@ def _session_calendar_provenance(
     invalid: int,
     duplicates: int,
 ) -> tuple[bool, dict]:
+    """Report calendar claims without treating caller declarations as authority.
+
+    There is no connected owner that can issue a typed, complete historical
+    session-calendar projection yet. Until one exists, this dimension stays
+    blocked regardless of caller-provided metadata.
+    """
     source = provenance if isinstance(provenance, Mapping) else {}
     declared_count = source.get("session_count")
-    complete = (
-        source.get("kind") == "historical_session_calendar"
-        and isinstance(source.get("source"), str)
-        and bool(source.get("source").strip())
-        and _session_text(source.get("coverage_start")) == spec.start_date
-        and _session_text(source.get("coverage_end")) == spec.end_date
-        and source.get("range_complete") is True
-        and isinstance(declared_count, int) and not isinstance(declared_count, bool)
-        and declared_count == len(sessions)
-        and requested - outside_range - invalid - duplicates == len(sessions)
-        and invalid == 0 and duplicates == 0
-    )
+    complete = False
     report = {
-        "status": "proven" if complete else "blocked",
+        "status": "blocked",
+        "reason_code": "walk_forward_session_calendar_unproven",
+        "authority": "historical_session_calendar_owner_unavailable",
+        "caller_claim_supplied": bool(source),
         "kind": source.get("kind"),
         "source": source.get("source"),
         "coverage_start": _session_text(source.get("coverage_start")),
         "coverage_end": _session_text(source.get("coverage_end")),
-        "range_complete": source.get("range_complete") is True,
+        "range_complete_claimed": source.get("range_complete") is True,
         "sessions_declared": declared_count if isinstance(declared_count, int) else None,
         "sessions_supplied": len(sessions),
         "sessions_requested": requested,
@@ -391,9 +389,9 @@ def _fundamental(
             if sample is None:
                 counts["invalid"] += 1
                 continue
-            decision_asof = _session_text(sample.decision_session)
+            decision_asof = _decision_instant(sample.decision_at)
             if decision_asof is None:
-                counts["invalid"] += 1
+                counts["publication_unproven"] += 1
                 continue
             view = FPIT.financial_visibility(record, decision_asof)
             source = view.get("profit_source")
@@ -422,6 +420,17 @@ def _fundamental(
     return detail, coverage
 
 
+def _decision_instant(value: Any) -> str | None:
+    """Return an exact timezone-aware decision instant; dates cannot prove PIT."""
+    if not isinstance(value, str) or "T" not in value:
+        return None
+    text = value.strip()
+    parsed = PIT.parse_asof(text)
+    if parsed is None:
+        return None
+    return parsed.isoformat(timespec="microseconds" if parsed.microsecond else "seconds")
+
+
 def _normalize_samples(
     samples: Sequence[Any], *, start: str, end: str,
 ) -> tuple[list[WFV.ValidationSample], int, int]:
@@ -433,6 +442,7 @@ def _normalize_samples(
             normalized.append(WFV.ValidationSample(
                 sample_key=row.sample_key, code=row.code,
                 decision_session=row.feature_asof,
+                decision_at=row.feature_available_at,
                 label_available_at=row.label_available_at or "",
                 target=row.target, horizon=row.horizon,
                 label_version=row.horizon_semantics,

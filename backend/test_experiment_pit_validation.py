@@ -14,6 +14,7 @@ if BACKEND not in sys.path:
 
 import experiment_contract as EC  # noqa: E402
 import experiment_pit_validation as PV  # noqa: E402
+import learning_dataset as LD  # noqa: E402
 import strategy_registry as SR  # noqa: E402
 import tradability_archive as TA  # noqa: E402
 import walk_forward_validation as WFV  # noqa: E402
@@ -88,6 +89,7 @@ def _samples():
         WFV.ValidationSample(
             sample_key=f"sample-{day}", code="600000",
             decision_session=f"2026-01-0{day}",
+            decision_at=f"2026-01-0{day}T09:30:00+08:00",
             label_available_at=f"2026-01-0{day}T15:00:00+08:00",
             target=0.01 * day, pit_status=WFV.PIT_VERIFIED,
         )
@@ -164,6 +166,8 @@ class PITValidationTests(unittest.TestCase):
             session_calendar_provenance=_calendar_provenance(),
         )
         self.assertEqual("blocked", evidence.dimensions["historical_universe"]["status"])
+        self.assertNotEqual("session_calendar_unproven",
+                            evidence.dimensions["historical_universe"]["provenance_status"])
 
     def test_R29_04_current_universe_source_cannot_pass_historical_completeness(self):
         rows, source = _universe("current_snapshot")
@@ -172,19 +176,25 @@ class PITValidationTests(unittest.TestCase):
             session_calendar_provenance=_calendar_provenance(),
         )
         self.assertEqual("blocked", evidence.dimensions["historical_universe"]["status"])
+        self.assertEqual(0, evidence.dimensions["historical_universe"]["coverage"]["sessions_proven"])
 
-    def test_R29_05_complete_historical_archive_can_pass_universe_gate(self):
+    def test_R29_05_caller_calendar_claim_cannot_prove_historical_universe(self):
         rows, source = _universe()
         evidence = _evaluate(
             universe_rows=rows, universe_source=source,
             session_calendar_provenance=_calendar_provenance(),
         )
-        self.assertEqual("proven", evidence.dimensions["historical_universe"]["status"])
+        self.assertEqual("blocked", evidence.dimensions["historical_universe"]["status"])
 
     def test_R29_06_missing_tradability_evidence_blocks(self):
         evidence = _evaluate(session_calendar_provenance=_calendar_provenance())
         self.assertEqual("blocked", evidence.dimensions["historical_tradability"]["status"])
         self.assertGreater(evidence.data_coverage["tradability"]["unknown"], 0)
+        isolated, _coverage = PV._tradability(
+            _spec(), {day: [{"code": "600000"}] for day in _sessions()},
+            _sessions(), None, universe_complete=True,
+        )
+        self.assertEqual("blocked", isolated["status"])
 
     def test_R29_07_unknown_st_is_not_non_st(self):
         conn, repo = _tradability_repo(unknown_st=True)
@@ -198,16 +208,15 @@ class PITValidationTests(unittest.TestCase):
         finally:
             conn.close()
 
-    def test_R29_07b_complete_requested_tradability_facts_are_reported(self):
+    def test_R29_07b_complete_requested_tradability_facts_still_require_calendar_owner(self):
         conn, repo = _tradability_repo()
         try:
             evidence = _evaluate(
                 tradability_repository=repo,
                 session_calendar_provenance=_calendar_provenance(),
             )
-            self.assertEqual("proven", evidence.dimensions["historical_tradability"]["status"])
-            self.assertEqual(6, evidence.data_coverage["tradability"]["available"])
-            self.assertEqual(1.0, evidence.data_coverage["tradability"]["ratio"])
+            self.assertEqual("blocked", evidence.dimensions["historical_tradability"]["status"])
+            self.assertIsNone(evidence.data_coverage["tradability"]["ratio"])
         finally:
             conn.close()
 
@@ -304,7 +313,9 @@ class PITValidationTests(unittest.TestCase):
             samples=samples,
             session_calendar_provenance=_calendar_provenance(),
         )
-        self.assertEqual("proven", evidence.dimensions["walk_forward"]["status"])
+        self.assertEqual("blocked", evidence.dimensions["walk_forward"]["status"])
+        self.assertEqual("walk_forward_session_calendar_unproven",
+                         evidence.dimensions["walk_forward"]["reason_code"])
         self.assertIn("walk_forward_window_not_matured", evidence.pit_warnings)
         self.assertTrue(any(
             window["status"] == "not_ready" and window["reason"] == "window_not_matured"
@@ -366,9 +377,10 @@ class PITValidationTests(unittest.TestCase):
                 authoritative_sessions=_sessions(),
                 session_calendar_provenance=_calendar_provenance(),
             )
-            self.assertEqual("proven", evidence.dimensions["historical_universe"]["status"])
+            self.assertEqual("blocked", evidence.dimensions["historical_universe"]["status"])
             self.assertEqual(9, evidence.data_coverage["tradability"]["requested"])
             self.assertEqual(9, evidence.data_coverage["tradability"]["available"])
+            self.assertIsNone(evidence.data_coverage["tradability"]["ratio"])
         finally:
             conn.close()
 
@@ -392,12 +404,11 @@ class PITValidationTests(unittest.TestCase):
                 session_calendar_provenance=_calendar_provenance(),
             )
             coverage = evidence.data_coverage["tradability"]
-            self.assertEqual("proven", evidence.dimensions["historical_tradability"]["status"])
+            self.assertEqual("blocked", evidence.dimensions["historical_tradability"]["status"])
             self.assertEqual(6, coverage["blocked"])
             self.assertEqual(0, coverage["available"])
             self.assertEqual(0, coverage["unknown"])
-            self.assertEqual(1.0, coverage["ratio"])
-            self.assertLessEqual(coverage["ratio"], 1.0)
+            self.assertIsNone(coverage["ratio"])
         finally:
             conn.close()
 
@@ -434,7 +445,6 @@ class PITValidationTests(unittest.TestCase):
             session_calendar_provenance=_calendar_provenance(),
         )
         self.assertEqual("blocked", sample_evidence.dimensions["walk_forward"]["status"])
-        self.assertIn("walk_forward_sample_session_invalid", sample_evidence.reason_codes)
         self.assertEqual(1, sample_evidence.walk_forward["label_coverage"]["samples_with_invalid_session"])
 
     def test_R29_30_short_calendar_without_full_range_provenance_blocks(self):
@@ -482,6 +492,99 @@ class PITValidationTests(unittest.TestCase):
         }])
         self.assertEqual("blocked", unlinked.dimensions["fundamental_pit"]["status"])
         self.assertEqual(1, unlinked.data_coverage["fundamental"]["invalid"])
+
+    def test_R29_32_caller_calendar_claim_never_creates_authoritative_proof(self):
+        forged_claim = _calendar_provenance(
+            _sessions(), complete=True, session_count=6,
+        )
+        evidence = _evaluate(
+            authoritative_sessions=_sessions(),
+            session_calendar_provenance=forged_claim,
+        )
+        coverage = evidence.data_coverage["session_calendar"]
+        self.assertTrue(coverage["caller_claim_supplied"])
+        self.assertEqual("blocked", coverage["status"])
+        self.assertEqual("historical_session_calendar_owner_unavailable", coverage["authority"])
+        self.assertEqual("blocked", evidence.dimensions["historical_universe"]["status"])
+        self.assertEqual("blocked", evidence.dimensions["walk_forward"]["status"])
+        self.assertIsNone(coverage["ratio"])
+
+    def test_R29_33_same_day_future_financial_publication_is_not_visible(self):
+        sample = WFV.ValidationSample(
+            sample_key="morning-decision", code="600000",
+            decision_session="2026-01-05", decision_at="2026-01-05T09:30:00+08:00",
+            label_available_at="2026-01-05T15:00:00+08:00", target=0.01,
+            pit_status=WFV.PIT_VERIFIED,
+        )
+        evidence = _evaluate(
+            samples=[sample],
+            fundamental_records=[{
+                "record": {
+                    "report_period": "2025-12-31",
+                    "published_at": "2026-01-05T14:00:00+08:00", "net_profit": 10,
+                },
+                "sample_keys": [sample.sample_key],
+            }],
+        )
+        self.assertEqual(1, evidence.data_coverage["fundamental"]["future"])
+        self.assertEqual("blocked", evidence.dimensions["fundamental_pit"]["status"])
+
+        date_only = _evaluate(
+            samples=[sample],
+            fundamental_records=[{
+                "record": {
+                    "report_period": "2025-12-31", "published_at": "2026-01-05",
+                    "net_profit": 10,
+                },
+                "sample_keys": [sample.sample_key],
+            }],
+        )
+        self.assertEqual(1, date_only.data_coverage["fundamental"]["publication_unproven"])
+        self.assertEqual("blocked", date_only.dimensions["fundamental_pit"]["status"])
+
+        canonical = LD.CanonicalSample(
+            sample_key="canonical-morning", source="fixture", source_version="v1",
+            code="600000", strategy_id="trend_pullback", model_family="test",
+            feature_asof="2026-01-05",
+            feature_available_at="2026-01-05T09:30:00+08:00",
+            label_start_date="2026-01-05", label_end_date="2026-01-06",
+            label_available_at="2026-01-06T15:00:00+08:00", horizon=1,
+            horizon_semantics="close_to_close_v1", features={}, target=0.01,
+            pit_status=WFV.PIT_VERIFIED,
+        )
+        canonical_evidence = _evaluate(
+            samples=[canonical],
+            fundamental_records=[{
+                "record": {
+                    "report_period": "2025-12-31",
+                    "published_at": "2026-01-05T14:00:00+08:00", "net_profit": 10,
+                },
+                "sample_keys": [canonical.sample_key],
+            }],
+        )
+        self.assertEqual(1, canonical_evidence.data_coverage["fundamental"]["future"])
+
+    def test_R29_34_fundamental_pit_requires_exact_decision_instant(self):
+        for decision_at in (None, "2026-01-05"):
+            with self.subTest(decision_at=decision_at):
+                sample = WFV.ValidationSample(
+                    sample_key="no-exact-instant", code="600000",
+                    decision_session="2026-01-05", decision_at=decision_at,
+                    label_available_at="2026-01-05T15:00:00+08:00", target=0.01,
+                    pit_status=WFV.PIT_VERIFIED,
+                )
+                evidence = _evaluate(
+                    samples=[sample],
+                    fundamental_records=[{
+                        "record": {
+                            "report_period": "2025-12-31",
+                            "published_at": "2025-12-31", "net_profit": 10,
+                        },
+                        "sample_keys": [sample.sample_key],
+                    }],
+                )
+                self.assertEqual(1, evidence.data_coverage["fundamental"]["publication_unproven"])
+                self.assertEqual("blocked", evidence.dimensions["fundamental_pit"]["status"])
 
     def test_R29_24_no_clock_or_latest_fallback(self):
         source = Path(BACKEND, "experiment_pit_validation.py").read_text(encoding="utf-8")

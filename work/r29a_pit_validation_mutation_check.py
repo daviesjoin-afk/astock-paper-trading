@@ -75,26 +75,6 @@ def _static_probe(source: str, requirement: str) -> bool:
     raise AssertionError(requirement)
 
 
-def _all_future_probe(module) -> bool:
-    original = TESTS.PV
-    TESTS.PV = module
-    try:
-        samples = TESTS._samples()[:4]
-        import walk_forward_validation as WFV
-        samples[-1] = WFV.ValidationSample(
-            sample_key="future-oos", code="600000", decision_session="2026-01-04",
-            label_available_at="2026-04-01T15:00:00+08:00", target=0.1,
-            pit_status=WFV.PIT_VERIFIED,
-        )
-        report = TESTS._evaluate(
-            samples=samples, authoritative_sessions=TESTS._sessions()[:4],
-            session_calendar_provenance=TESTS._calendar_provenance(TESTS._sessions()[:4]),
-        )
-        return report.dimensions["walk_forward"]["status"] == "blocked"
-    finally:
-        TESTS.PV = original
-
-
 def _mutations():
     return [
         ("M-R29-01", "current universe source rejected",
@@ -139,9 +119,9 @@ def _mutations():
         ("M-R29-14", "canonical split requires explicit sessions",
          lambda s: s.replace('_bounded_sessions(\n        authoritative_sessions,', '_bounded_sessions(\n        None,', 1),
          lambda m, s: _unit_probe(m, "test_R29_17_walk_forward_requires_explicit_sessions")),
-        ("M-R29-15", "not-matured OOS cannot be ready",
-         lambda s: s.replace('and walk["ready_folds"] > 0 and samples_invalid == 0', 'and walk["ready_folds"] >= 0 and samples_invalid == 0', 1),
-         lambda m, s: _all_future_probe(m)),
+        ("M-R29-15", "calendar report cannot claim an owner-issued proof",
+         lambda s: s.replace('"status": "blocked",\n        "reason_code": "walk_forward_session_calendar_unproven",', '"status": "proven",\n        "reason_code": "walk_forward_session_calendar_unproven",', 1),
+         lambda m, s: _unit_probe(m, "test_R29_32_caller_calendar_claim_never_creates_authoritative_proof")),
         ("M-R29-16", "purge stays in session/label owner",
          lambda s: s.replace('def _normalize_samples(\n', 'def _calendar_day_purge():\n    return dt.timedelta(days=5)\n\ndef _normalize_samples(\n', 1),
          lambda m, s: _static_probe(s, "no-calendar-purge")),
@@ -175,12 +155,18 @@ def _mutations():
         ("M-R29-26", "session parser rejects trailing non-date content",
          lambda s: s.replace('text = str(value or "").strip().replace("/", "-")', 'text = str(value or "").strip()[:10].replace("/", "-")', 1),
          lambda m, s: _unit_probe(m, "test_R29_29_invalid_session_or_sample_date_blocks")),
-        ("M-R29-27", "calendar requires explicit full-range completeness proof",
-         lambda s: s.replace('and source.get("range_complete") is True', 'and True', 1),
-         lambda m, s: _unit_probe(m, "test_R29_30_short_calendar_without_full_range_provenance_blocks")),
+        ("M-R29-27", "caller calendar completeness claim is not authority",
+         lambda s: s.replace('complete = False', 'complete = bool(source.get("range_complete"))', 1),
+         lambda m, s: _unit_probe(m, "test_R29_32_caller_calendar_claim_never_creates_authoritative_proof")),
         ("M-R29-28", "financial visibility uses linked decision session",
-         lambda s: s.replace('decision_asof = _session_text(sample.decision_session)', 'decision_asof = spec.asof_policy["cutoff"]', 1),
+         lambda s: s.replace('decision_asof = _decision_instant(sample.decision_at)', 'decision_asof = spec.asof_policy["cutoff"]', 1),
          lambda m, s: _unit_probe(m, "test_R29_31_financial_observations_use_linked_decision_session")),
+        ("M-R29-29", "date-only decision cannot substitute for decision instant",
+         lambda s: s.replace('decision_asof = _decision_instant(sample.decision_at)', 'decision_asof = _session_text(sample.decision_session)', 1),
+         lambda m, s: _unit_probe(m, "test_R29_34_fundamental_pit_requires_exact_decision_instant")),
+        ("M-R29-30", "same-day later financial publication stays future",
+         lambda s: s.replace('return parsed.isoformat(timespec="microseconds" if parsed.microsecond else "seconds")', 'return parsed.date().isoformat()', 1),
+         lambda m, s: _unit_probe(m, "test_R29_33_same_day_future_financial_publication_is_not_visible")),
     ]
 
 
