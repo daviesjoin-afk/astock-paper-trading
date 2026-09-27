@@ -2,12 +2,13 @@
 """HTTP boundary for the auditable self-evolution subsystem."""
 import json
 import os
+import sqlite3
 import tempfile
 import threading
 import time
 from contextlib import contextmanager
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Path, Query
 
 import adaptive_engine as adaptive
 import adaptive_learning_dispatch as learning_dispatch
@@ -284,6 +285,69 @@ def ai_timeline(
         return adaptive.ai_analysis_timeline(limit=limit, trade_date=trade_date)
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"读取AI分析时间线失败：{type(exc).__name__}") from exc
+
+
+@contextmanager
+def _canonical_research_connection():
+    """Open the adaptive DB for canonical research reads without engine side effects.
+
+    The general adaptive connection initializes unrelated learning tables and state. A
+    history GET must not run that initialization, providers, or orchestration. The only
+    permitted setup is the idempotent canonical ledger schema, followed by SQLite's
+    query-only mode for the actual repository read.
+    """
+    db_path = adaptive.DB_PATH
+    db_directory = os.path.dirname(os.path.abspath(db_path))
+    if db_directory:
+        os.makedirs(db_directory, exist_ok=True)
+    conn = sqlite3.connect(db_path, timeout=30)
+    conn.row_factory = sqlite3.Row
+    try:
+        import ai_research_repository as repository
+
+        repository.ensure_schema(conn)
+        conn.commit()
+        conn.execute("PRAGMA query_only=ON")
+        yield conn
+    finally:
+        conn.close()
+
+
+@router.get("/research/runs")
+def canonical_research_runs(
+    limit: int = Query(50, ge=1, le=200),
+    purpose: str | None = Query(None, max_length=80),
+    as_of: str | None = Query(None, max_length=200),
+    subject: str | None = Query(None, max_length=200),
+):
+    """Return persisted canonical research artifacts in append order, never current truth."""
+    import ai_research_repository as repository
+
+    try:
+        with _canonical_research_connection() as conn:
+            runs = repository.recent_runs(
+                conn, limit=limit, purpose=purpose, as_of=as_of, subject=subject,
+            )
+    except repository.ResearchPersistenceError as exc:
+        raise HTTPException(status_code=500, detail=exc.reason) from exc
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=422, detail="invalid_research_filter") from exc
+    return {"status": "ok", "runs": runs}
+
+
+@router.get("/research/runs/{run_id}")
+def canonical_research_run(run_id: int = Path(..., gt=0)):
+    """Return one validated persisted research artifact; missing rows are 404."""
+    import ai_research_repository as repository
+
+    try:
+        with _canonical_research_connection() as conn:
+            run = repository.get_run(conn, run_id)
+    except repository.ResearchPersistenceError as exc:
+        raise HTTPException(status_code=500, detail=exc.reason) from exc
+    if run is None:
+        raise HTTPException(status_code=404, detail="research_run_not_found")
+    return {"status": "ok", "run": run}
 
 
 @router.post("/ai/analyze")

@@ -3308,7 +3308,7 @@ news 和当前持仓的 raw evidence SQL 已移除。事件研究只读已知 ne
 research production writer。`ai_analysis` 负责时间窗、scope、人工触发和 operational timeline，
 市场事实来自 R24，portfolio/execution facts 需要调用方显式提供 account/cycle context，研究结论走
 同一个 canonical service。`adaptive_ai_analysis_runs` 只保存 operational state 和 canonical run
-reference；历史 legacy response 只作为 presentation-only 记录，计划在 B3 移除。
+reference；未关联 canonical id 的 legacy result 标记 unavailable，不进入 canonical history，也不回填。
 
 所有 research run 共用显式 `ResearchAsOfContext`（业务日、带时区 market time、显式 targets）。
 suite 的执行时间只用于 operational capture timestamp，不会替代 evidence PIT。
@@ -3321,8 +3321,26 @@ parameter/experiment linkage、历史 market evidence、历史 cycle membership�
 这些缺口不阻止“有 owner fact 就使用，否则明确 unavailable”的 B2C 完成定义。
 
 早期路线图中 B2C-8（deepseek research convergence）和 B2C-9（ai_analysis convergence）的
-未完成/延期描述均为历史状态，现由 **R27-B2C-FINAL（COMPLETE）** 取代。B3 与 R28 均为
-**NOT STARTED**。
+未完成/延期描述均为历史状态，现由 **R27-B2C-FINAL（COMPLETE）** 取代。R27-B3 已完成实现并进入 PR 人工审核；R28 保持 **NOT STARTED**。
+
+### R27-B3：canonical research history API/UI（COMPLETE，PR 待人工审核）
+
+研究历史直接读取 `ai_research_runs`：`GET /api/adaptive/research/runs` 与
+`GET /api/adaptive/research/runs/{run_id}` 只调用 `ai_research_repository` 的验证读取，列表沿用
+`id DESC`、现有精确过滤和最多 200 条边界。全新数据库先确保 canonical schema；损坏记录返回稳定错误并 fail closed；GET 连接在 schema 确保后进入 SQLite query-only 模式。
+
+前端研究历史与详情只消费 canonical API。运行单项研究或套件后直接刷新 history；status 明确表示历史研究假设，confidence 仅在展示时从 0–1 转成百分比，只有 `cross_source_verified == true` 才展示双源确认。research API/UI 不授予事实、交易、风险或策略审批权限。
+
+`deepseek_advisor.overview()` 不再输出 research `latest` / `latest_by_purpose`，
+`_canonical_research_display()` 已删除，`adaptive_advisor_runs` 的 production research reader/writer
+均为 0。其历史表和数据允许在既有数据库中物理保留；本阶段不 DROP、不清理历史、不迁移。
+`adaptive_ai_analysis_runs` 继续只保存 operational timeline、幂等状态和 `canonical_run_id`；
+timeline 不嵌入结论，未关联 canonical id 的 legacy result 保持 unavailable，不回填。
+
+B3 不新增 ledger、migration、provider 或 authority，不改变 trading/tuning 权限，也不删除 roadmap
+能力。owner identity、PIT、verification、runtime terminal instant、stable attempt identity、历史市场证据、
+cycle membership 与 physical DB origin 等缺口继续 **OPEN / REQUIRED**，production fail closed。
+R27-B2C = **COMPLETE**；R27-B3 = **COMPLETE（PR 等待人工审核）**；R28 = **NOT STARTED**。
 
 ### 仅作 review signal（不进入 CI gate）
 

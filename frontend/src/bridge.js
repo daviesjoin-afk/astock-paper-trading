@@ -6,7 +6,7 @@
 
 import { adaptiveEsc } from "./core/format.js";
 import { activatePage, refreshApp, showPaperWorkspace, toggleDark } from "./core/navigation.js";
-import { applyAdaptiveRiskCandidate, applyAdaptiveSelectionCandidate, approveAdaptiveNeural, loadAdaptive, loadEvolutionStatus, recordAdaptiveFeedback, refreshAdaptiveTimelineNow, retryAdaptiveAiWindow, rollbackAdaptiveRebalance, rollbackAdaptiveRisk, rollbackAdaptiveSelection, runAdaptive, runAdaptiveAdvisor, runAdaptiveAiTuning, runAdaptiveResearchSuite, runAdaptiveResearchTask, runDualAiTuning, runNewsLearning, setAdaptiveSection, switchToAdaptiveAI, testModlensRead, triggerEvolution } from "./features/adaptive.js";
+import { applyAdaptiveRiskCandidate, applyAdaptiveSelectionCandidate, approveAdaptiveNeural, loadAdaptive, loadEvolutionStatus, openAdaptiveResearchRun, recordAdaptiveFeedback, refreshAdaptiveResearchHistory, refreshAdaptiveTimelineNow, retryAdaptiveAiWindow, rollbackAdaptiveRebalance, rollbackAdaptiveRisk, rollbackAdaptiveSelection, runAdaptive, runAdaptiveAdvisor, runAdaptiveAiTuning, runAdaptiveResearchSuite, runAdaptiveResearchTask, runDualAiTuning, runNewsLearning, setAdaptiveSection, switchToAdaptiveAI, testModlensRead, triggerEvolution } from "./features/adaptive.js";
 import { loadPaperExecution, verifyExecutionOrder } from "./features/execution.js";
 import { backfillPaperResearch, cancelPaperOrder, clearPaperOrderDate, clearPaperOrderPreview, filterPaperHistoryRows, loadPaperStockHistory, pausePaper, preparePaperSell, previewPaperOrder, refreshPaperResearchValidation, resetPaper, resumePaper, runPaperNow, selectPaperHistoryQuick, setPaperOrderSide, setPaperTerminalFilter, showPaperStockHistory, startPaper, submitPaperOrder, syncPaperCapitalHint, togglePaperLimitPrice } from "./features/paper.js";
 import { applyPaperRiskAuditFilter, loadPaperRisk, refreshPaperRisk } from "./features/risk.js";
@@ -41,11 +41,13 @@ window.loadPaperStockHistory = loadPaperStockHistory;
 window.loadSelectionEvaluation = loadSelectionEvaluation;
 window.loadStrategyWorkbench = loadStrategyWorkbench;
 window.openInStrategyWorkbench = openInStrategyWorkbench;
+window.openAdaptiveResearchRun = openAdaptiveResearchRun;
 window.pausePaper = pausePaper;
 window.preparePaperSell = preparePaperSell;
 window.previewPaperOrder = previewPaperOrder;
 window.recordAdaptiveFeedback = recordAdaptiveFeedback;
 window.refreshAdaptiveTimelineNow = refreshAdaptiveTimelineNow;
+window.refreshAdaptiveResearchHistory = refreshAdaptiveResearchHistory;
 window.refreshApp = refreshApp;
 window.refreshPaperResearchValidation = refreshPaperResearchValidation;
 window.refreshPaperRisk = refreshPaperRisk;

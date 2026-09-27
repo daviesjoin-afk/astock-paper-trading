@@ -69,8 +69,7 @@ PROVIDER = "DeepSeek"  # legacy display label; runtime selection is provider_nam
 DEFAULT_MODEL = "deepseek-v4-flash"
 
 #: 迁移后的 market-data-quality 研究运行在 canonical ledger 里使用的 purpose 标签。
-#: 刻意保留 legacy 的字符串，因为**读侧**（``overview`` / ``deepseek_research``）要问
-#: "这一类研究最近一次运行是什么"，两套标签会让同一种研究出现两个名字。
+#: 刻意保留既有字符串，作为 canonical ledger 中的稳定精确筛选值。
 RESEARCH_PURPOSE_DATA_QUALITY = "data_quality"
 
 #: 研究问题。它是 caller intent，不是 prompt：prompt 由 ``ai_research_provider`` 独占。
@@ -150,25 +149,6 @@ def model_name():
 def ensure_schema(conn):
     conn.executescript(
         """
-        CREATE TABLE IF NOT EXISTS adaptive_advisor_runs(
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            purpose TEXT NOT NULL,
-            trigger TEXT NOT NULL,
-            status TEXT NOT NULL,
-            provider TEXT NOT NULL,
-            model TEXT NOT NULL,
-            evidence_hash TEXT NOT NULL,
-            evidence TEXT NOT NULL,
-            report TEXT,
-            error_code TEXT,
-            latency_ms INTEGER,
-            input_tokens INTEGER,
-            output_tokens INTEGER,
-            created_at TEXT NOT NULL,
-            finished_at TEXT NOT NULL
-        );
-        CREATE INDEX IF NOT EXISTS idx_advisor_runs_recent
-            ON adaptive_advisor_runs(id DESC);
         CREATE TABLE IF NOT EXISTS adaptive_ai_tuning_runs(
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             purpose TEXT NOT NULL,
@@ -673,15 +653,11 @@ def research_report_view_from_row(row):
 def latest_data_quality_research(conn):
     """canonical ledger 里最近一次 ``data_quality`` 研究运行；没有则 ``None``。
 
-    **唯一**的"最新市场数据质量研究"读入口。``overview`` 与
-    ``deepseek_research._latest_data_quality`` 都用它，避免两个读侧各自实现一遍"最近一条"
-    而出现漂移。
+    给 ``deepseek_research._latest_data_quality`` 提供 prior-run context；前端历史查询
+    走 canonical read API，不从 overview 读取。
 
-    刻意先 ``ensure_schema``：读路径必须在**首次研究运行成功之前**也能工作。canonical 台账
-    只有在一次 append 之后才存在，而 ``overview`` 是每次刷新概览都会走的路径 —— 少了这一步，
-    全新库（或尚未跑过研究的库）上会直接 ``no such table: ai_research_runs``。这与
-    ``ai_review_service.get_slot_config`` 的处理方式一致：读函数自己保证 schema 已建，
-    而不是要求调用方先做一次写。
+    刻意先 ``ensure_schema``：canonical 台账只有在一次 append 之后才存在，研究上下文在首次
+    运行前也必须能读到"没有 prior run"。
 
     刻意不吞 :class:`ai_research_repository.ResearchPersistenceError`：``recent_runs`` 对
     损坏行 fail closed，所以一条读不出来的台账记录必须表现为**损坏**，而不是"这里没有研究
@@ -692,36 +668,6 @@ def latest_data_quality_research(conn):
         conn, limit=1, purpose=RESEARCH_PURPOSE_DATA_QUALITY,
     )
     return rows[0] if rows else None
-
-
-def _canonical_research_display(row):
-    """canonical 研究行 → legacy 展示形状的**兼容投影**（有明确删除条件）。
-
-    存在的唯一理由：writer 迁到 canonical ledger 之后，``/ai/overview`` 的读路径不必同时
-    在同一个 PR 里改接线。它**不**写入任何东西，也**不**把 canonical 行转回 legacy 表的
-    形状去存储 —— 那会变成 dual-write。
-
-    **删除条件**：R27-B3 提供 canonical research API / UI 的那一轮，前端直接读
-    ``ai_research_runs`` 时，本函数与 ``overview`` 里的调用点一起删除。
-    """
-    return {
-        "id": row["id"],
-        "purpose": row["purpose"],
-        "trigger": row["trigger"],
-        "status": row["status"],
-        "provider": row["provider_model"] or None,
-        "model": row["provider_model"] or None,
-        "evidence": {},
-        "report": research_report_view_from_row(row),
-        "created_at": row["created_at"],
-        "finished_at": row["created_at"],
-        "as_of": row["as_of"],
-        "reason": row["reason"],
-        "authority": "research",
-        "is_authoritative": False,
-        "research_run_id": row["id"],
-        "source": "canonical_research_ledger",
-    }
 
 
 def run_review(connect_factory, paper_db_path, snapshot_paths, config=None, trigger="manual"):
@@ -1135,25 +1081,6 @@ def run_realtime_tuning(connect_factory, paper_db_path, snapshot_paths, config=N
 
 def overview(conn, config=None):
     ensure_schema(conn)
-    latest_by_purpose = {}
-    for row in conn.execute("SELECT * FROM adaptive_advisor_runs ORDER BY id DESC LIMIT 100"):
-        if row["purpose"] in latest_by_purpose:
-            continue
-        item = dict(row)
-        item["evidence"] = _loads(item.get("evidence"), {})
-        item["report"] = _loads(item.get("report"), None)
-        item.pop("evidence_hash", None)
-        latest_by_purpose[row["purpose"]] = item
-    # R27-B2B：`data_quality` 这个 purpose 的 writer 已经迁到 canonical research
-    # ledger，旧表只剩历史行。读侧因此以 canonical 为准；旧行仍然可见（legacy rows
-    # stay legacy），但不再被当成"最新的市场数据质量研究"。
-    latest = latest_by_purpose.get(RESEARCH_PURPOSE_DATA_QUALITY)
-    if latest is not None:
-        latest["source"] = "legacy_adaptive_advisor_runs"
-    canonical = latest_data_quality_research(conn)
-    if canonical is not None:
-        latest = _canonical_research_display(canonical)
-        latest_by_purpose[RESEARCH_PURPOSE_DATA_QUALITY] = latest
     tuning_row = conn.execute(
         "SELECT * FROM adaptive_ai_tuning_runs ORDER BY id DESC LIMIT 1"
     ).fetchone()
@@ -1171,8 +1098,6 @@ def overview(conn, config=None):
         "truth_boundary": "DeepSeek负责复核与解释证据，不能单独证明行情真实；真实门禁仍由时效、约束对账和独立数据源决定。",
         "can": ["审阅数据质量证据", "解释账本矛盾", "提出待验证原因", "生成收盘复盘摘要", "在模拟盘内提出并小步应用白名单参数"],
         "cannot": ["直接下单", "修改公共选股", "修改风控上限", "绕过门禁", "把单一来源包装成真实"],
-        "latest": latest,
-        "latest_by_purpose": latest_by_purpose,
         "realtime_tuning": {
             "enabled": bool((config or {}).get("llm_realtime_tuning_enabled", False)) and enabled(config),
             "auto_apply": False,
