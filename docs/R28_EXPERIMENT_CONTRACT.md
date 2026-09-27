@@ -28,9 +28,9 @@ R28 定义 immutable contract，R29 才负责 canonical PIT execution。
 | Market-data version | `market_data_contract` / `market_data_service` | R24 market-data owner | snapshot 有内容、as-of、observed-at 与 verification；没有实验级 snapshot fingerprint | 对某次显式读取可判断；不能据此证明当前缓存重建历史数据 | cache 可更新 | research 读路径不得联网回填历史 | OPEN / REQUIRED；必填显式 fingerprint，不声称 owner provenance |
 | Parameter set | explicit experiment input；邻近数据在 `paper_parameter_versions` | parameter history owner/linkage 尚未闭合 | 本次完整参数快照可 canonicalize；版本到历史实验的链接仍 OPEN / REQUIRED | 参数快照本身可冻结；其历史来源未证明 | 当前配置可变；历史链接未证明 | 禁止读 current parameters 补值 | DEFINE PURE CONTRACT FIELD；完整深冻结参数对象 |
 | Date range | caller input | ExperimentSpec | 显式 `start` / `end` 日期 | 只证明范围声明，不证明底层数据 PIT | immutable in spec | 无 earliest / today 默认 | DEFINE PURE CONTRACT FIELD |
-| As-of policy | caller input；R27 的 `ResearchAsOfContext` 是 research 语义，不是实验执行 owner | future R29 runner boundary | `policy_id + cutoff` | 必须由未来 runner 解释并执行；当前纯契约只固定声明 | immutable in spec | 禁止运行时选择“当天最新数据” | DEFINE PURE CONTRACT FIELD |
+| As-of policy | caller input；R27 的 `ResearchAsOfContext` 是 research 语义，不是实验执行 owner | future R29 runner boundary | `policy_id + cutoff` | 必须由未来 runner 解释并执行；当前纯契约只固定声明 | immutable in spec | 禁止运行时选择“当天最新数据” | DEFINE PURE CONTRACT FIELD；instant 转为 UTC，date-only 保留日期语义 |
 | Execution assumptions | `execution_profiles` 与 paper execution rules | 分散于现有 execution owners | `execution_profile_version` 存在；完整 fill/T+1/涨跌停/部分成交/容量快照尚无一份 owner fingerprint | 版本与显式快照可以绑定；历史 rule provenance 未完全证明 | 规则版本可演进 | 禁止读取 current runtime profile | DEFINE PURE CONTRACT FIELD；保存完整显式快照 |
-| Cost model | `paper_trading_rules` 与 `backtest.py` 中有独立常量 | 未形成 canonical experiment cost owner | 无统一实验级 identity | 不可由 legacy constants 证明 | 常量可修改 | 禁止隐式读取 backtest 全局常量 | DEFINE PURE CONTRACT FIELD；费率、最低佣金、印花税、滑点与版本必填 |
+| Cost model | `paper_trading_rules` 与 `backtest.py` 中有独立常量 | 未形成 canonical experiment cost owner | 无统一实验级 identity | 不可由 legacy constants 证明 | 常量可修改 | 禁止隐式读取 backtest 全局常量 | DEFINE PURE CONTRACT FIELD；费率、最低佣金、印花税、滑点模型、非空滑点参数对象与版本必填，并全部进入 fingerprint |
 | Random seed | caller input | 无运行时 owner | 显式整数 | 可固定声明 | immutable in spec | 禁止 timestamp / random default | DEFINE PURE CONTRACT FIELD |
 
 ### Existing evaluation and legacy surfaces
@@ -62,7 +62,8 @@ R28 定义 immutable contract，R29 才负责 canonical PIT execution。
 改变 identity。Result 含其 exact experiment fingerprint，并用另一份 SHA-256 覆盖身份、status、全部指标与
 failure reason。
 
-缺少身份、current/latest 占位、缺失日期、反向日期、非有限数值、错误结果绑定都会拒绝。completed 要求
+缺少身份、current/latest 占位、缺失滑点参数、缺失日期、反向日期、非有限数值、错误结果绑定都会拒绝。
+带时区的 as-of instant 统一转换为 UTC `+00:00`；date-only cutoff 仍表示日期，不转换成 midnight instant。completed 要求
 核心指标齐全；failed / unavailable 要求稳定 reason 且不允许填造指标。unknown 保持 `null`，不折算为零。
 capacity proxy、exposure 与 regime breakdown 可以保持 unavailable；本阶段不发明评分。
 

@@ -36,7 +36,8 @@ def _spec_kwargs():
         },
         "cost_model": {
             "commission_rate": 0.0001, "minimum_commission": 0,
-            "stamp_duty_rate": 0.0005, "slippage_model": "fixed-v1", "version": "cost-v1",
+            "stamp_duty_rate": 0.0005, "slippage_model": "fixed-v1",
+            "slippage_parameters": {"rate": 0.001}, "version": "cost-v1",
         },
         "random_seed": 17,
     }
@@ -135,6 +136,29 @@ def _probe(ec, mutant_id: str, source: str) -> bool:
         fingerprint = _spec(ec).fingerprint
         result = _result(ec, fingerprint)
         return result.projection().get("experiment_fingerprint") == fingerprint
+    if mutant_id == "M-R28-21":
+        try:
+            cost = dict(_spec_kwargs()["cost_model"])
+            del cost["slippage_parameters"]
+            _spec(ec, cost_model=cost)
+        except Exception as exc:
+            return isinstance(exc, ValueError)
+        return False
+    if mutant_id == "M-R28-22":
+        first = _spec(ec, asof_policy={"policy_id": "pit-v1", "cutoff": "2026-03-31T15:00:00+08:00"})
+        second = _spec(ec, asof_policy={"policy_id": "pit-v1", "cutoff": "2026-03-31T07:00:00Z"})
+        return (
+            first.fingerprint == second.fingerprint
+            and first.asof_policy["cutoff"] == "2026-03-31T07:00:00+00:00"
+        )
+    if mutant_id == "M-R28-23":
+        try:
+            cost = dict(_spec_kwargs()["cost_model"])
+            cost["slippage_parameters"] = {}
+            _spec(ec, cost_model=cost)
+        except ValueError:
+            return True
+        return False
     raise AssertionError(f"unknown probe {mutant_id}")
 
 
@@ -179,6 +203,13 @@ def _mutations():
             'from dataclasses import dataclass', 'from dataclasses import dataclass\nfrom backtest import run_backtest', 1)),
         ("M-R28-20", "result binds exact spec fingerprint", lambda s: s.replace(
             '"experiment_fingerprint": self.experiment_fingerprint,', '"experiment_fingerprint": None,', 1)),
+        ("M-R28-21", "cost model requires explicit slippage parameters", lambda s: s.replace(
+            '    "slippage_parameters", "version",\n', '    "version",\n', 1)),
+        ("M-R28-22", "equivalent as-of instants share UTC identity", lambda s: s.replace(
+            'return instant.astimezone(timezone.utc).isoformat()', 'return text', 1)),
+        ("M-R28-23", "slippage parameter object cannot be empty", lambda s: s.replace(
+            'if not isinstance(cost["slippage_parameters"], Mapping) or not cost["slippage_parameters"]:',
+            'if False:', 1)),
     ])
     return mutations
 

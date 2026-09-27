@@ -40,6 +40,7 @@ def _spec(**changes):
             "minimum_commission": 0,
             "stamp_duty_rate": 0.0005,
             "slippage_model": "fixed-rate-v1",
+            "slippage_parameters": {"rate": 0.001},
             "version": "cn-equity-cost-v1",
         },
         "random_seed": 17,
@@ -151,6 +152,23 @@ class ExperimentSpecTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             _spec(cost_model={"commission_rate": 0})
 
+    def test_EXP_31_slippage_parameters_are_required_and_fingerprinted(self):
+        baseline = _spec()
+        changed_cost = dict(baseline.cost_model)
+        changed_cost["slippage_parameters"] = {"rate": 0.002}
+        self.assertNotEqual(baseline.fingerprint, _spec(cost_model=changed_cost).fingerprint)
+
+        missing_cost = dict(baseline.cost_model)
+        del missing_cost["slippage_parameters"]
+        with self.assertRaises(ValueError):
+            _spec(cost_model=missing_cost)
+
+        for value in (None, {}, []):
+            cost = dict(baseline.cost_model)
+            cost["slippage_parameters"] = value
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                _spec(cost_model=cost)
+
     def test_EXP_28_equivalent_numeric_spellings_have_one_identity(self):
         first = _spec(parameter_set={"integer": 1, "negative_zero": -0.0})
         second = _spec(parameter_set={"integer": 1.0, "negative_zero": 0}, cost_model={
@@ -158,6 +176,7 @@ class ExperimentSpecTests(unittest.TestCase):
             "minimum_commission": 0.0,
             "stamp_duty_rate": 0.0005,
             "slippage_model": "fixed-rate-v1",
+            "slippage_parameters": {"rate": 0.001},
             "version": "cn-equity-cost-v1",
         })
         self.assertEqual(first.fingerprint, second.fingerprint)
@@ -246,6 +265,7 @@ class ExperimentResultTests(unittest.TestCase):
                 "minimum_commission": 0,
                 "stamp_duty_rate": 0.0005,
                 "slippage_model": " fixed-rate-v1 ",
+                "slippage_parameters": {"rate": 0.001},
                 "version": " cn-equity-cost-v1 ",
             },
         )
@@ -254,6 +274,23 @@ class ExperimentResultTests(unittest.TestCase):
         self.assertEqual("sell_after_next_session", spec.execution_assumptions["t_plus_one_semantics"])
         self.assertEqual("fixed-rate-v1", spec.cost_model["slippage_model"])
         self.assertEqual(_spec().fingerprint, spec.fingerprint)
+
+    def test_EXP_32_equivalent_asof_instants_have_one_utc_identity(self):
+        cutoffs = (
+            "2026-03-31T15:00:00+08:00",
+            "2026-03-31T07:00:00+00:00",
+            "2026-03-31T07:00:00Z",
+        )
+        specs = [
+            _spec(asof_policy={"policy_id": "pit-close-v1", "cutoff": cutoff})
+            for cutoff in cutoffs
+        ]
+        self.assertEqual({"2026-03-31T07:00:00+00:00"},
+                         {spec.asof_policy["cutoff"] for spec in specs})
+        self.assertEqual(1, len({spec.fingerprint for spec in specs}))
+        date_only = _spec(asof_policy={"policy_id": "pit-close-v1", "cutoff": "2026-03-31"})
+        self.assertEqual("2026-03-31", date_only.asof_policy["cutoff"])
+        self.assertNotEqual(specs[0].fingerprint, date_only.fingerprint)
 
     def test_EXP_30_explicit_falsy_result_fingerprints_fail_closed(self):
         for value in (None, False, 0, "", {}, []):

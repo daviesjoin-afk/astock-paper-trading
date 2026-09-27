@@ -6,7 +6,7 @@ state. Callers must supply every identity and assumption explicitly.
 from __future__ import annotations
 
 from dataclasses import dataclass, field as dataclass_field
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 import hashlib
 import json
 import math
@@ -27,7 +27,8 @@ _REQUIRED_COMPLETED_METRICS = (
     "total_cost", "data_coverage",
 )
 _COST_FIELDS = (
-    "commission_rate", "minimum_commission", "stamp_duty_rate", "slippage_model", "version",
+    "commission_rate", "minimum_commission", "stamp_duty_rate", "slippage_model",
+    "slippage_parameters", "version",
 )
 _UNSET_RESULT_FINGERPRINT = object()
 _EXECUTION_FIELDS = (
@@ -124,7 +125,7 @@ def _asof_cutoff(value: Any) -> str:
         raise ValueError("asof_policy.cutoff must be an explicit ISO date or timezone-aware instant") from exc
     if instant.tzinfo is None or instant.utcoffset() is None or "T" not in text:
         raise ValueError("asof_policy.cutoff must be an explicit ISO date or timezone-aware instant")
-    return text
+    return instant.astimezone(timezone.utc).isoformat()
 
 
 def _finite_number(value: Any, *, name: str) -> int | float:
@@ -246,6 +247,8 @@ class ExperimentSpec:
             normalized_cost[field] = amount
         for field in ("slippage_model", "version"):
             normalized_cost[field] = _explicit_label(cost[field], name=f"cost_model.{field}")
+        if not isinstance(cost["slippage_parameters"], Mapping) or not cost["slippage_parameters"]:
+            raise ValueError("cost_model.slippage_parameters must be a non-empty explicit object")
         cost = _freeze_json(normalized_cost, path="cost_model")
         object.__setattr__(self, "cost_model", cost)
 
