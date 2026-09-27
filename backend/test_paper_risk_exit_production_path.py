@@ -472,11 +472,22 @@ class TestPaperRiskExitProductionPath(PaperRiskExitProductionPathTestCase):
         self._insert_lot(account_id, self.code, 500, 10.0)
         self._set_fresh_exit_quote(self.code, price=9.0, pct=-8.0)
 
-        res1 = PT.monitor_risk(self.day)
-        self.assertEqual(len(res1.get("orders", [])), 1)
+        # Fix the scan clock: the contract under test is a repeated call in the
+        # same minute, not behavior that depends on how long the first scan takes.
+        real_datetime = dt.datetime
 
-        # Call again without clearing scan marker
-        res2 = PT.monitor_risk(self.day)
+        class SameMinuteDateTime(real_datetime):
+            @classmethod
+            def now(cls, tz=None):
+                fixed = real_datetime(2026, 9, 10, 14, 50)
+                return fixed.replace(tzinfo=tz) if tz is not None else fixed
+
+        with mock.patch.object(PT.dt, "datetime", SameMinuteDateTime):
+            res1 = PT.monitor_risk(self.day)
+            self.assertEqual(len(res1.get("orders", [])), 1)
+
+            # Call again without clearing scan marker in the exact same minute.
+            res2 = PT.monitor_risk(self.day)
         self.assertEqual(res2.get("status"), "already_scanned")
         self.assertEqual(len(res2.get("orders", [])), 0)
 
