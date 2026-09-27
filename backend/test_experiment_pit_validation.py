@@ -117,7 +117,6 @@ def _evaluate(**changes):
         "universe_rows": _universe()[0],
         "universe_source": _universe()[1],
         "tradability_repository": None,
-        "tradability_sessions": _sessions(),
         "fundamental_records": [{
             "report_period": "2025-12-31", "published_at": "2026-03-20",
             "net_profit": 10,
@@ -291,9 +290,97 @@ class PITValidationTests(unittest.TestCase):
         self.assertEqual("blocked", market["status"])
 
     def test_R29_23_unknown_coverage_remains_none(self):
-        evidence = _evaluate(tradability_sessions=[])
+        evidence = _evaluate(authoritative_sessions=[])
         self.assertIsNone(evidence.data_coverage["tradability"]["ratio"])
         self.assertIsNone(evidence.data_coverage["market_data"])
+
+    def test_R29_26_universe_and_tradability_follow_each_historical_session(self):
+        rows = [
+            {"code": "600000", "list_date": "2020-01-01", "delist_date": "2026-01-04"},
+            {"code": "000001", "list_date": "2020-01-01"},
+        ]
+        conn = sqlite3.connect(":memory:")
+        repo = TA.TradabilityArchiveRepository(conn)
+        repo.ensure_schema()
+        for day in _sessions():
+            for code in ("600000", "000001"):
+                repo.save(TA.TradabilityEvidence(
+                    code=code, session_date=day, is_listed=True,
+                    listing_date="2020-01-01", delisting_date="2026-01-04" if code == "600000" else None,
+                    is_st=False, is_suspended=False, suspension_reason=None,
+                    has_market_quote=True, has_trade_volume=True,
+                    is_price_limit_locked=False, price_limit_direction=None,
+                    source="fixture", observed_at=f"{day}T15:00:00+08:00",
+                    effective_at=f"{day}T09:30:00+08:00",
+                ))
+        try:
+            evidence = _evaluate(
+                universe_rows=rows, tradability_repository=repo,
+                authoritative_sessions=_sessions(),
+            )
+            self.assertEqual("proven", evidence.dimensions["historical_universe"]["status"])
+            self.assertEqual(9, evidence.data_coverage["tradability"]["requested"])
+            self.assertEqual(9, evidence.data_coverage["tradability"]["available"])
+        finally:
+            conn.close()
+
+    def test_R29_27_complete_suspension_facts_are_blocked_not_unknown(self):
+        conn = sqlite3.connect(":memory:")
+        repo = TA.TradabilityArchiveRepository(conn)
+        repo.ensure_schema()
+        for day in _sessions():
+            repo.save(TA.TradabilityEvidence(
+                code="600000", session_date=day, is_listed=True,
+                listing_date="2020-01-01", delisting_date=None,
+                is_st=False, is_suspended=True, suspension_reason="fixture",
+                has_market_quote=False, has_trade_volume=False,
+                is_price_limit_locked=False, price_limit_direction=None,
+                source="fixture", observed_at=f"{day}T15:00:00+08:00",
+                effective_at=f"{day}T09:30:00+08:00",
+            ))
+        try:
+            evidence = _evaluate(tradability_repository=repo)
+            coverage = evidence.data_coverage["tradability"]
+            self.assertEqual("proven", evidence.dimensions["historical_tradability"]["status"])
+            self.assertEqual(6, coverage["blocked"])
+            self.assertEqual(0, coverage["available"])
+            self.assertEqual(0, coverage["unknown"])
+            self.assertEqual(1.0, coverage["ratio"])
+            self.assertLessEqual(coverage["ratio"], 1.0)
+        finally:
+            conn.close()
+
+    def test_R29_28_walk_forward_sessions_and_samples_stay_inside_spec_range(self):
+        spec = _spec(start_date="2026-01-02", end_date="2026-01-05")
+        evidence = _evaluate(
+            spec=spec, authoritative_sessions=_sessions(), samples=_samples(),
+        )
+        self.assertEqual(2, evidence.walk_forward["sessions"]["excluded_outside_experiment_range"])
+        self.assertEqual(2, evidence.walk_forward["label_coverage"]["samples_excluded_outside_experiment_range"])
+        for window in evidence.walk_forward["windows"]:
+            for period_name in ("train_period", "validation_period", "oos_period"):
+                period = window[period_name]
+                if period["start"] is not None:
+                    self.assertGreaterEqual(period["start"], spec.start_date)
+                if period["end"] is not None:
+                    self.assertLessEqual(period["end"], spec.end_date)
+
+    def test_R29_29_invalid_session_or_sample_date_blocks(self):
+        calendar_evidence = _evaluate(
+            authoritative_sessions=[*_sessions(), "2026-01-07 trailing-garbage"],
+        )
+        self.assertEqual("blocked", calendar_evidence.dimensions["walk_forward"]["status"])
+        self.assertEqual(1, calendar_evidence.walk_forward["sessions"]["invalid"])
+
+        invalid_sample = WFV.ValidationSample(
+            sample_key="invalid-date", code="600000", decision_session="bad-date",
+            label_available_at="2026-01-07T15:00:00+08:00", target=0.1,
+            pit_status=WFV.PIT_VERIFIED,
+        )
+        sample_evidence = _evaluate(samples=[*_samples(), invalid_sample])
+        self.assertEqual("blocked", sample_evidence.dimensions["walk_forward"]["status"])
+        self.assertIn("walk_forward_sample_session_invalid", sample_evidence.reason_codes)
+        self.assertEqual(1, sample_evidence.walk_forward["label_coverage"]["samples_with_invalid_session"])
 
     def test_R29_24_no_clock_or_latest_fallback(self):
         source = Path(BACKEND, "experiment_pit_validation.py").read_text(encoding="utf-8")

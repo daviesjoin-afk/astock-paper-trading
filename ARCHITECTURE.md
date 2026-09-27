@@ -3363,6 +3363,8 @@ historical linkage 与 execution provenance 缺口继续 OPEN / REQUIRED；不�
 并以 `READY / BLOCKED` 表示输入能否进入未来 canonical runner。它不生成策略表现、approval、promotion 或 AI score，
 也不连接 legacy `backtest.py`。walk-forward 继续由 `walk_forward_validation.build_walk_forward_folds` 处理，
 canonical 路径必须显式传入 authoritative `sessions` 和 ExperimentSpec evaluation as-of。
+Universe membership 按每个实验 session 单独求值；tradability 仅核验该 session 的成员，并将 available、blocked、unknown
+作为互斥 coverage 桶。Walk-forward calendar 与 samples 限定在 ExperimentSpec 日期范围内，越界日期不会进入 folds。
 
 当前没有完整 historical universe archive owner 或 arbitrary historical market-data archive/provenance，因此相关维度保持
 OPEN / REQUIRED，缺少证据时整体 BLOCKED。current universe、current market snapshot、current strategy head、paper runtime

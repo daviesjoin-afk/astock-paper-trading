@@ -5,6 +5,7 @@ fetch data, or grant selection/promotion authority.
 """
 from __future__ import annotations
 
+import datetime as dt
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from types import MappingProxyType
@@ -39,7 +40,8 @@ _REASON_CODES = frozenset({
     "historical_market_data_unavailable", "historical_universe_unproven",
     "strategy_identity_mismatch", "tradability_coverage_incomplete",
     "walk_forward_explicit_sessions_required", "walk_forward_window_not_matured",
-    "walk_forward_unavailable", "walk_forward_ready_fold_missing",
+    "walk_forward_sample_session_invalid", "walk_forward_unavailable",
+    "walk_forward_ready_fold_missing",
 })
 
 
@@ -178,21 +180,40 @@ def _manifest_dimension(spec: EC.ExperimentSpec, manifest: Any) -> dict:
                       "exact_manifest_match" if matches else "manifest_missing_or_mismatch")
 
 
-def _universe(spec: EC.ExperimentSpec, rows: Any, source: Any) -> tuple[dict, list, dict]:
-    cutoff = spec.asof_policy["cutoff"]
-    try:
-        result = PIT.historical_universe(rows, cutoff, source=source, drop_unproven=True)
-    except (TypeError, ValueError):
-        result = {"passed": False, "members": [], "report": {}}
-    report = result.get("report", {})
-    passed = bool(result.get("passed")) and bool(report.get("historical_membership_complete"))
-    members = list(result.get("members") or ()) if passed else []
+def _universe(
+    spec: EC.ExperimentSpec, rows: Any, source: Any, sessions: Sequence[str],
+) -> tuple[dict, dict[str, list], dict]:
+    row_list = list(rows or ())
+    members_by_session: dict[str, list] = {}
+    session_reports: dict[str, Any] = {}
+    for session in sessions:
+        try:
+            result = PIT.historical_universe(
+                row_list, session, source=source, drop_unproven=True,
+            )
+        except (TypeError, ValueError):
+            result = {"passed": False, "members": [], "report": {}}
+        report = result.get("report", {})
+        session_reports[session] = report
+        if (result.get("passed")
+                and report.get("historical_membership_complete")
+                and result.get("members")):
+            members_by_session[session] = list(result["members"])
+    passed = bool(sessions) and len(members_by_session) == len(sessions)
+    available_sessions = len(members_by_session)
     identity = {"universe_fingerprint": spec.universe_fingerprint}
     detail = _dimension("proven" if passed else "blocked",
                         None if passed else "historical_universe_unproven", identity,
-                        "historical_archive_complete" if passed else str(report.get("status") or "unproven"),
-                        {"members": len(members) if passed else None})
-    return detail, members, report
+        "historical_archive_complete" if passed else next((
+            str(item.get("status") or "unproven")
+            for item in session_reports.values()
+            if not item.get("historical_membership_complete")
+        ), "unproven"),
+        {"sessions_requested": len(sessions),
+                         "sessions_proven": available_sessions,
+                         "ratio": _ratio(available_sessions, len(sessions))})
+    report = {"sessions": session_reports}
+    return detail, members_by_session, report
 
 
 def _member_code(member: Any) -> str | None:
@@ -204,14 +225,22 @@ def _member_code(member: Any) -> str | None:
     return text or None
 
 
-def _tradability(spec: EC.ExperimentSpec, members: Sequence[Any], sessions: Any,
-                 repository: Any) -> tuple[dict, dict]:
-    codes = sorted({code for code in (_member_code(row) for row in members) if code})
-    days = sorted({str(day)[:10] for day in (sessions or ()) if str(day).strip()})
-    requested = len(codes) * len(days)
+def _tradability(
+    spec: EC.ExperimentSpec,
+    members_by_session: Mapping[str, Sequence[Any]],
+    sessions: Sequence[str],
+    repository: Any,
+    *,
+    universe_complete: bool,
+) -> tuple[dict, dict]:
+    codes_by_session = {
+        session: sorted({code for code in (_member_code(row) for row in members) if code})
+        for session, members in members_by_session.items()
+    }
+    requested = sum(len(codes_by_session.get(session, ())) for session in sessions)
     available = unknown = blocked = 0
-    for code in codes:
-        for session in days:
+    for session in sessions:
+        for code in codes_by_session.get(session, ()):
             decision_time = PIT.bar_available_at(session)
             if repository is None or decision_time is None:
                 unknown += 1
@@ -229,15 +258,18 @@ def _tradability(spec: EC.ExperimentSpec, members: Sequence[Any], sessions: Any,
             )) or (evidence.is_price_limit_locked is True and not evidence.price_limit_direction):
                 unknown += 1
                 continue
-            available += 1
             if decision.buy_block_reason == TA.TradabilityReason.UNKNOWN_STATE or \
                     decision.sell_block_reason == TA.TradabilityReason.UNKNOWN_STATE:
                 unknown += 1
-                available -= 1
             elif not decision.can_buy and not decision.can_sell:
                 blocked += 1
-    complete = requested > 0 and available + blocked == requested and unknown == 0
-    ratio = _ratio(available + blocked, requested)
+            else:
+                available += 1
+    complete = (
+        universe_complete and requested > 0
+        and available + blocked + unknown == requested and unknown == 0
+    )
+    ratio = _ratio(available + blocked, requested) if universe_complete else None
     identity = {"tradability_fingerprint": spec.tradability_fingerprint}
     detail = _dimension("proven" if complete else "blocked",
                         None if complete else "tradability_coverage_incomplete", identity,
@@ -245,7 +277,35 @@ def _tradability(spec: EC.ExperimentSpec, members: Sequence[Any], sessions: Any,
                         {"requested": requested, "available": available,
                          "unknown": unknown, "blocked": blocked, "ratio": ratio})
     return detail, {"requested": requested, "available": available,
-                    "unknown": unknown, "blocked": blocked, "ratio": ratio}
+                    "unknown": unknown, "blocked": blocked, "ratio": ratio,
+                    "universe_sessions_unknown": len(sessions) - len(members_by_session)}
+
+
+def _session_text(value: Any) -> str | None:
+    if isinstance(value, (dt.date, dt.datetime)):
+        return value.date().isoformat() if isinstance(value, dt.datetime) else value.isoformat()
+    text = str(value or "").strip().replace("/", "-")
+    try:
+        if len(text) == 10:
+            return dt.date.fromisoformat(text).isoformat()
+        return dt.datetime.fromisoformat(text.replace("Z", "+00:00")).date().isoformat()
+    except ValueError:
+        return None
+
+
+def _bounded_sessions(sessions: Any, *, start: str, end: str) -> tuple[list[str], int, int, int]:
+    raw = list(sessions or ())
+    bounded = set()
+    invalid = outside_range = 0
+    for item in raw:
+        day = _session_text(item)
+        if day is None:
+            invalid += 1
+        elif day < start or day > end:
+            outside_range += 1
+        else:
+            bounded.add(day)
+    return sorted(bounded), len(raw), outside_range, invalid
 
 
 def _fundamental(spec: EC.ExperimentSpec, records: Any) -> tuple[dict, dict]:
@@ -285,7 +345,9 @@ def _fundamental(spec: EC.ExperimentSpec, records: Any) -> tuple[dict, dict]:
     return detail, coverage
 
 
-def _normalize_samples(samples: Sequence[Any]) -> list[WFV.ValidationSample]:
+def _normalize_samples(
+    samples: Sequence[Any], *, start: str, end: str,
+) -> tuple[list[WFV.ValidationSample], int, int]:
     normalized = []
     for row in samples or ():
         if isinstance(row, WFV.ValidationSample):
@@ -302,7 +364,18 @@ def _normalize_samples(samples: Sequence[Any]) -> list[WFV.ValidationSample]:
             ))
         else:
             raise ValueError("samples must be canonical learning or walk-forward samples")
-    return normalized
+    bounded = []
+    outside_range = invalid_dates = 0
+    for sample in normalized:
+        day = _session_text(sample.decision_session)
+        if day is None:
+            invalid_dates += 1
+            continue
+        if day < start or day > end:
+            outside_range += 1
+            continue
+        bounded.append(sample)
+    return bounded, outside_range, invalid_dates
 
 
 def _fold_projection(fold: Any) -> dict:
@@ -331,7 +404,6 @@ def build_pit_validation_evidence(
     universe_rows: Any = None,
     universe_source: Any = None,
     tradability_repository: Any = None,
-    tradability_sessions: Any = None,
     fundamental_records: Any = None,
     market_snapshot: Any = None,
     samples: Sequence[Any] = (),
@@ -355,14 +427,20 @@ def build_pit_validation_evidence(
     reasons: list[str] = []
     warnings: list[str] = []
 
-    universe_dim, members, _universe_report = _universe(spec, universe_rows, universe_source)
+    bounded_sessions, _sessions_requested, sessions_excluded, sessions_invalid = _bounded_sessions(
+        authoritative_sessions, start=spec.start_date, end=spec.end_date,
+    )
+    universe_dim, members, _universe_report = _universe(
+        spec, universe_rows, universe_source, bounded_sessions,
+    )
     dimensions["historical_universe"] = universe_dim
     if universe_dim["status"] == "blocked":
         reasons.append(universe_dim["reason_code"])
         warnings.append("historical_universe_unproven")
 
     tradability_dim, tradability_coverage = _tradability(
-        spec, members, tradability_sessions, tradability_repository,
+        spec, members, bounded_sessions, tradability_repository,
+        universe_complete=universe_dim["status"] == "proven",
     )
     dimensions["historical_tradability"] = tradability_dim
     if tradability_dim["status"] == "blocked":
@@ -416,11 +494,17 @@ def build_pit_validation_evidence(
         "timeline_source": None, "ready_folds": 0, "folds": 0,
         "evaluation_asof": cutoff, "config": None, "windows": [],
         "label_coverage": {"available": 0, "requested": 0, "ratio": None},
+        "sessions": {
+            "requested": _sessions_requested,
+            "used": len(bounded_sessions),
+            "excluded_outside_experiment_range": sessions_excluded,
+            "invalid": sessions_invalid,
+        },
     }
-    if not authoritative_sessions:
+    if not authoritative_sessions or not bounded_sessions or sessions_invalid:
         dimensions["walk_forward"] = _dimension(
             "blocked", "walk_forward_explicit_sessions_required", None,
-            "authoritative_sessions_missing",
+            "authoritative_sessions_missing_or_invalid",
         )
         reasons.append("walk_forward_explicit_sessions_required")
     elif not isinstance(walk_forward_config, WFV.WalkForwardConfig):
@@ -429,10 +513,11 @@ def build_pit_validation_evidence(
         )
         reasons.append("walk_forward_unavailable")
     else:
-        normalized = _normalize_samples(samples)
+        normalized, samples_excluded, samples_invalid = _normalize_samples(
+            samples, start=spec.start_date, end=spec.end_date,
+        )
         result = WFV.build_walk_forward_folds(
-            normalized, walk_forward_config,
-            sessions=authoritative_sessions, asof=cutoff,
+            normalized, walk_forward_config, sessions=bounded_sessions, asof=cutoff,
         )
         report = result["report"]
         folds = list(result.get("folds") or ())
@@ -452,13 +537,23 @@ def build_pit_validation_evidence(
                 "available": labels_available,
                 "requested": len(normalized),
                 "ratio": _ratio(labels_available, len(normalized)),
+                "samples_excluded_outside_experiment_range": samples_excluded,
+                "samples_with_invalid_session": samples_invalid,
+            },
+            "sessions": {
+                "requested": _sessions_requested,
+                "used": len(bounded_sessions),
+                "excluded_outside_experiment_range": sessions_excluded,
+                "invalid": sessions_invalid,
             },
         }
         if any(fold.reason == WFV.REASON_WINDOW_NOT_MATURED for fold in folds):
             warnings.append("walk_forward_window_not_matured")
-        ready = walk["timeline_source"] == "explicit_sessions" and walk["ready_folds"] > 0
+        ready = (walk["timeline_source"] == "explicit_sessions"
+                 and walk["ready_folds"] > 0 and samples_invalid == 0)
         reason = None if ready else (
-            "walk_forward_window_not_matured"
+            "walk_forward_sample_session_invalid" if samples_invalid
+            else "walk_forward_window_not_matured"
             if any(fold.reason == WFV.REASON_WINDOW_NOT_MATURED for fold in folds)
             else "walk_forward_ready_fold_missing"
         )
@@ -482,8 +577,7 @@ def build_pit_validation_evidence(
     validation_period = first.get("validation_period") if first else None
     oos_period = first.get("oos_period") if first else None
     coverage = {
-        "universe": {"available": universe_dim["coverage"].get("members"),
-                     "requested": None, "ratio": None},
+        "universe": universe_dim["coverage"],
         "tradability": tradability_coverage,
         "market_data": None,
         "fundamental": fundamental_coverage,
