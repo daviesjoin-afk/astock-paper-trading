@@ -57,7 +57,10 @@ class CanonicalResearchAPIGuards(unittest.TestCase):
         self.assertNotIn("latest_by_purpose", frontend)
         self.assertNotIn("deepseek.latest", frontend)
         self.assertNotIn("legacy_adaptive_advisor_runs", frontend)
-        self.assertIn("await refreshAdaptiveResearchHistory()", frontend)
+        render = frontend.split("export function renderAdaptive(", 1)[1].split(
+            "\nexport async function loadAdaptive(", 1
+        )[0]
+        self.assertIn("refreshAdaptiveResearchHistory();", render)
 
     def test_B3_G08_G09_timeline_never_embeds_or_promotes_conclusions(self):
         source = inspect.getsource(ai_analysis.timeline)

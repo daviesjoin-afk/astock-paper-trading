@@ -120,12 +120,9 @@ test('history and detail refresh use only canonical read endpoints', async () =>
   assert.match(detail.innerHTML, /历史研究叙述/);
 });
 
-test('task and suite actions refresh canonical history after execution', async () => {
+test('every adaptive rerender refreshes canonical history', async () => {
   const source = await readFile(new URL('../src/features/adaptive.js', import.meta.url), 'utf8');
-  const task = source.split('export async function runAdaptiveResearchTask(')[1]
-    .split('export async function runAdaptiveResearchSuite(')[0];
-  const suite = source.split('export async function runAdaptiveResearchSuite(')[1]
-    .split('export async function recordAdaptiveFeedback(')[0];
-  assert.match(task, /await refreshAdaptiveResearchHistory\(\)/);
-  assert.match(suite, /await refreshAdaptiveResearchHistory\(\)/);
+  const render = source.split('export function renderAdaptive(')[1]
+    .split('\nexport async function loadAdaptive(')[0];
+  assert.match(render, /refreshAdaptiveResearchHistory\(\)/);
 });

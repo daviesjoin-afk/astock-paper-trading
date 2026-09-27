@@ -59,6 +59,7 @@ def architecture_violations(sources: dict[str, str]) -> list[str]:
     ui_status = _js_function(frontend, "export function adaptiveResearchStatusLabel(")
     ui_evidence = _js_function(frontend, "export function adaptiveResearchEvidenceHtml(")
     ui_confidence = _js_function(frontend, "export function adaptiveResearchConfidencePercent(")
+    ui_render = _js_function(frontend, "export function renderAdaptive(")
 
     problems = []
     if "repository.recent_runs" not in list_api or re_search_sql(list_api):
@@ -102,6 +103,8 @@ def architecture_violations(sources: dict[str, str]) -> list[str]:
         problems.append("B3-G16 canonical list no longer follows append order")
     if "legacy_adaptive_advisor_runs" in frontend or "latest_by_purpose" in frontend:
         problems.append("B3-G17 old advisor history remains a frontend fallback")
+    if "\n  refreshAdaptiveResearchHistory();\n}" not in ui_render:
+        problems.append("B3-G18 adaptive rerender leaves canonical research history stale")
     return problems
 
 
@@ -180,6 +183,8 @@ def main() -> int:
          lambda s: _replace_once(s, "ORDER BY id DESC LIMIT ?", "ORDER BY created_at DESC LIMIT ?")),
         ("M-B3-17", "old advisor is frontend fallback", "frontend/src/features/adaptive.js",
          lambda s: _replace_once(s, "export function adaptiveResearchHistoryHtml(payload){", "var legacyHistory=deepseek.latest;\nexport function adaptiveResearchHistoryHtml(payload){")),
+        ("M-B3-18", "adaptive rerender drops research history refresh", "frontend/src/features/adaptive.js",
+         lambda s: _replace_once(s, "  refreshAdaptiveResearchHistory();\n}", "  // research history refresh removed\n}")),
     ]
 
     detected = 0

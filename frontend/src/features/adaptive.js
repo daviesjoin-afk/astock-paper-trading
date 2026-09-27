@@ -505,6 +505,7 @@ export function renderAdaptive(d){
     setAdaptiveSection(sessionStorage.getItem('astock.adaptiveSection')||'overview');
   }
   refreshAdaptiveTimeline(adaptiveTimelineFallback);
+  refreshAdaptiveResearchHistory();
 }
 
 export async function loadAdaptive(){
@@ -513,7 +514,7 @@ export async function loadAdaptive(){
   var snapshotKey='astock.adaptiveOverview.v3';
   var cached=null;
   try{cached=JSON.parse(sessionStorage.getItem(snapshotKey)||'null');}catch(ignore){}
-  if(adaptiveOverviewComplete(cached)){renderAdaptive(cached);refreshAdaptiveResearchHistory();}
+  if(adaptiveOverviewComplete(cached)){renderAdaptive(cached);}
   else if($('adaptiveResult')) $('adaptiveResult').innerHTML='<div class="loading">正在读取模拟盘选股、风控与学习账本…</div>';
   try{
     // The evolution view is a live operational surface.  A browser-cached
@@ -529,7 +530,6 @@ export async function loadAdaptive(){
       return;
     }
     renderAdaptive(adaptiveData);
-    refreshAdaptiveResearchHistory();
     try{sessionStorage.setItem(snapshotKey,JSON.stringify(adaptiveData));}catch(ignore){}
   }
   catch(e){$('adaptiveResult').innerHTML='<div class="banner">自进化中心加载失败：'+e.message+'</div>';}
@@ -815,7 +815,7 @@ export async function runNewsLearning(){
 export async function runAdaptiveAdvisor(){
   var confirmation=await adaptiveConfirm({title:'运行数据质量审阅',detail:'将校验全市场行情、双源一致性与模拟盘账本。',boundary:'审阅只输出证据和异常，不会下单或修改风控。'}); if(!confirmation.approved) return;
   var button=$('advisorRunButton'); if(button){button.disabled=true;button.textContent='审阅中…';}
-  try{renderAdaptive(await apiPost('/api/adaptive/advisor/run?trigger=manual-ui&confirmed=true'));await refreshAdaptiveResearchHistory();}
+  try{renderAdaptive(await apiPost('/api/adaptive/advisor/run?trigger=manual-ui&confirmed=true'));}
   catch(e){
     var handled=await handleOperatorError(e, '运行数据质量审阅', runAdaptiveAdvisor);
     if(!handled) adaptiveActionNotice('数据质量审阅失败',e.message);
@@ -829,7 +829,7 @@ export async function runAdaptiveResearchTask(purpose,button){
   if(purpose==='pnl_attribution'&&(!researchContext.accountId||!researchContext.cycleId)){adaptiveActionNotice('P&L 归因需要账户和周期','请在研究面板明确填写账户 ID 与周期 ID 后重试。');return;}
   var confirmation=await adaptiveConfirm({title:'运行研究任务',detail:'将运行该项 AI 研究并写入可追溯的影子证据。',boundary:'不会直接改变策略参数或交易。'}); if(!confirmation.approved) return;
   if(button){button.disabled=true;button.textContent='运行中…';}
-  try{var researchNow=new Date();var query='/api/adaptive/advisor/run?trigger=manual-ui&purpose='+encodeURIComponent(purpose)+'&as_of='+encodeURIComponent(researchContext.asOf)+'&market_now='+encodeURIComponent(researchNow.toISOString())+'&confirmed=true';if(researchContext.accountId){query+='&account_id='+encodeURIComponent(researchContext.accountId)+'&cycle_id='+encodeURIComponent(researchContext.cycleId);}var result=await apiPost(query);renderAdaptive(result);adaptiveResearchResultNotice({research_suite_results:[result.research_task_result].filter(Boolean)});await refreshAdaptiveResearchHistory();}
+  try{var researchNow=new Date();var query='/api/adaptive/advisor/run?trigger=manual-ui&purpose='+encodeURIComponent(purpose)+'&as_of='+encodeURIComponent(researchContext.asOf)+'&market_now='+encodeURIComponent(researchNow.toISOString())+'&confirmed=true';if(researchContext.accountId){query+='&account_id='+encodeURIComponent(researchContext.accountId)+'&cycle_id='+encodeURIComponent(researchContext.cycleId);}var result=await apiPost(query);renderAdaptive(result);adaptiveResearchResultNotice({research_suite_results:[result.research_task_result].filter(Boolean)});}
   catch(e){
     var handled=await handleOperatorError(e, '运行研究任务', function(){ return runAdaptiveResearchTask(purpose, button); });
     if(!handled) adaptiveActionNotice('研究任务失败',e.message);
@@ -842,7 +842,7 @@ export async function runAdaptiveResearchSuite(){
   try{researchContext=adaptiveResearchContext();}catch(e){adaptiveActionNotice('研究套件缺少明确上下文',e.message);return;}
   var confirmation=await adaptiveConfirm({title:'运行全部研究任务',detail:'将依次运行已启用的 AI 研究任务。',boundary:'只生成研究证据，不会直接交易或放宽风控。'}); if(!confirmation.approved) return;
   var button=$('advisorSuiteButton'); if(button){button.disabled=true;button.textContent='研究套件运行中…';}
-  try{var researchNow=new Date();var query='/api/adaptive/advisor/suite?trigger=manual-suite&as_of='+encodeURIComponent(researchContext.asOf)+'&market_now='+encodeURIComponent(researchNow.toISOString())+'&confirmed=true';if(researchContext.accountId){query+='&account_id='+encodeURIComponent(researchContext.accountId)+'&cycle_id='+encodeURIComponent(researchContext.cycleId);}var result=await apiPost(query);renderAdaptive(result);adaptiveResearchResultNotice(result);await refreshAdaptiveResearchHistory();}
+  try{var researchNow=new Date();var query='/api/adaptive/advisor/suite?trigger=manual-suite&as_of='+encodeURIComponent(researchContext.asOf)+'&market_now='+encodeURIComponent(researchNow.toISOString())+'&confirmed=true';if(researchContext.accountId){query+='&account_id='+encodeURIComponent(researchContext.accountId)+'&cycle_id='+encodeURIComponent(researchContext.cycleId);}var result=await apiPost(query);renderAdaptive(result);adaptiveResearchResultNotice(result);}
   catch(e){
     var handled=await handleOperatorError(e, '运行全部研究任务', runAdaptiveResearchSuite);
     if(!handled) adaptiveActionNotice('研究套件失败',e.message);
