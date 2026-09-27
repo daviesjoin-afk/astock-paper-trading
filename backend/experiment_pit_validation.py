@@ -6,6 +6,8 @@ fetch data, or grant selection/promotion authority.
 from __future__ import annotations
 
 import datetime as dt
+import hashlib
+import json
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from types import MappingProxyType
@@ -13,18 +15,24 @@ from typing import Any
 
 try:
     import experiment_contract as EC
-    import financial_point_in_time as FPIT
+    import historical_market_archive as HMA
+    import historical_session_calendar as HSC
+    import historical_universe_archive as HUA
     import learning_dataset as LD
     import point_in_time as PIT
     import strategy_registry as SR
+    import strategy_dsl_schema as DSL
     import tradability_archive as TA
     import walk_forward_validation as WFV
 except ImportError:  # pragma: no cover - package-style import
     from . import experiment_contract as EC
-    from . import financial_point_in_time as FPIT
+    from . import historical_market_archive as HMA
+    from . import historical_session_calendar as HSC
+    from . import historical_universe_archive as HUA
     from . import learning_dataset as LD
     from . import point_in_time as PIT
     from . import strategy_registry as SR
+    from . import strategy_dsl_schema as DSL
     from . import tradability_archive as TA
     from . import walk_forward_validation as WFV
 
@@ -42,6 +50,11 @@ _REASON_CODES = frozenset({
     "walk_forward_explicit_sessions_required", "walk_forward_window_not_matured",
     "walk_forward_sample_session_invalid", "walk_forward_unavailable",
     "walk_forward_ready_fold_missing", "walk_forward_session_calendar_unproven",
+    "historical_market_archive_identity_mismatch", "historical_session_calendar_unavailable",
+    "strategy_input_owner_unavailable", "strategy_replay_definition_unavailable",
+    "financial_feature_evidence_missing", "financial_feature_value_mismatch",
+    "financial_record_unavailable", "financial_publication_unproven",
+    "financial_feature_derivation_unsupported", "financial_feature_decision_mismatch",
 })
 
 
@@ -65,6 +78,12 @@ def _ratio(numerator: int, denominator: int) -> float | None:
     if denominator <= 0:
         return None
     return numerator / denominator
+
+
+def _digest(value: Any) -> str:
+    encoded = json.dumps(value, sort_keys=True, separators=(",", ":"),
+                         ensure_ascii=False, allow_nan=False).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def _dimension(
@@ -154,6 +173,35 @@ class PITValidationEvidence:
             "windows": _thaw(self.windows),
         }
 
+    @property
+    def validation_evidence_fingerprint(self) -> str:
+        """Stable identity excludes storage ids and wall-clock metadata."""
+        encoded = json.dumps(self.projection(), sort_keys=True, separators=(",", ":"),
+                             ensure_ascii=False, allow_nan=False).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
+
+
+def strategy_dsl_dependencies(ast: Any) -> dict[str, list[str]]:
+    """Extract allowlisted input dependencies from a pinned DSL AST."""
+    normalized = DSL.normalize(ast)
+    found: set[str] = set()
+    def visit(node: Any) -> None:
+        if isinstance(node, Mapping):
+            if node.get("op") == "field" and isinstance(node.get("name"), str):
+                found.add(node["name"])
+            for value in node.values():
+                visit(value)
+        elif isinstance(node, (list, tuple)):
+            for value in node:
+                visit(value)
+    visit(normalized)
+    return {
+        "price_fields": sorted(found & DSL.PRICE_FIELDS),
+        "financial_fields": sorted(found & DSL.FINANCIAL_FIELDS),
+        "fund_flow_fields": sorted(found & DSL.FLOW_FIELDS),
+        "other_fields": sorted(found - DSL.FIELD_NAMES),
+    }
+
 
 def _strategy_identity(spec: EC.ExperimentSpec, version: Any) -> dict:
     identity = spec.strategy.projection()
@@ -182,15 +230,31 @@ def _manifest_dimension(spec: EC.ExperimentSpec, manifest: Any) -> dict:
 
 def _universe(
     spec: EC.ExperimentSpec, rows: Any, source: Any, sessions: Sequence[str], *,
-    session_calendar_complete: bool,
+    session_calendar_complete: bool, owner_issued: bool = False,
 ) -> tuple[dict, dict[str, list], dict]:
     row_list = list(rows or ())
     members_by_session: dict[str, list] = {}
     session_reports: dict[str, Any] = {}
     for session in sessions:
         try:
+            session_instant = PIT.bar_available_at(session)
+            visible_by_code = {}
+            for row in row_list:
+                if not isinstance(row, Mapping):
+                    continue
+                observed_at = row.get("observed_at")
+                if observed_at and (session_instant is None or not PIT.is_visible_at(
+                        observed_at, session_instant).get("visible")):
+                    continue
+                code = _member_code(row)
+                prior = visible_by_code.get(code)
+                observed = PIT.parse_asof(observed_at) if observed_at else None
+                prior_observed = PIT.parse_asof(prior.get("observed_at")) if prior and prior.get("observed_at") else None
+                if code and (prior is None or (observed and prior_observed and observed > prior_observed)):
+                    visible_by_code[code] = row
+            visible_rows = list(visible_by_code.values())
             result = PIT.historical_universe(
-                row_list, session, source=source, drop_unproven=True,
+                visible_rows, session, source=source, drop_unproven=True,
             )
         except (TypeError, ValueError):
             result = {"passed": False, "members": [], "report": {}}
@@ -201,7 +265,7 @@ def _universe(
                 and result.get("members")):
             members_by_session[session] = list(result["members"])
     memberships_complete = bool(sessions) and len(members_by_session) == len(sessions)
-    passed = memberships_complete and session_calendar_complete
+    passed = owner_issued and memberships_complete and session_calendar_complete
     available_sessions = len(members_by_session)
     identity = {"universe_fingerprint": spec.universe_fingerprint}
     detail = _dimension("proven" if passed else "blocked",
@@ -233,7 +297,7 @@ def _tradability(
     spec: EC.ExperimentSpec,
     members_by_session: Mapping[str, Sequence[Any]],
     sessions: Sequence[str],
-    repository: Any,
+    repository: TA.TradabilityArchiveRepository | None,
     *,
     universe_complete: bool,
 ) -> tuple[dict, dict]:
@@ -242,36 +306,25 @@ def _tradability(
         for session, members in members_by_session.items()
     }
     requested = sum(len(codes_by_session.get(session, ())) for session in sessions)
-    available = unknown = blocked = 0
-    for session in sessions:
-        for code in codes_by_session.get(session, ()):
-            decision_time = PIT.bar_available_at(session)
-            if repository is None or decision_time is None:
-                unknown += 1
-                continue
-            evidence = repository.evidence_at(code, session, decision_time)
-            decision = TA.tradability_at(
-                code, session, decision_time=decision_time, repository=repository,
-            )
-            if evidence is None or not decision.evidence_present:
-                unknown += 1
-                continue
-            if any(getattr(evidence, name, None) is None for name in (
-                "is_listed", "is_st", "is_suspended", "has_market_quote",
-                "has_trade_volume", "is_price_limit_locked",
-            )) or (evidence.is_price_limit_locked is True and not evidence.price_limit_direction):
-                unknown += 1
-                continue
-            if decision.buy_block_reason == TA.TradabilityReason.UNKNOWN_STATE or \
-                    decision.sell_block_reason == TA.TradabilityReason.UNKNOWN_STATE:
-                unknown += 1
-            elif not decision.can_buy and not decision.can_sell:
-                blocked += 1
-            else:
-                available += 1
+    requests = {(code, session): PIT.bar_available_at(session)
+                for session in sessions for code in codes_by_session.get(session, ())}
+    if repository is not None and hasattr(repository, "coverage_projection"):
+        owner_projection = repository.coverage_projection(requests).projection()
+        available = int(owner_projection["available_pairs"])
+        blocked = int(owner_projection["blocked_pairs"])
+        unknown = int(owner_projection["unknown_pairs"])
+        evidence_fingerprint = owner_projection["evidence_fingerprint"]
+    else:
+        available = blocked = 0
+        unknown = requested
+        evidence_rows = [{"code": code, "session": session, "evidence": None}
+                         for code, session in sorted(requests)]
+        evidence_fingerprint = _digest(evidence_rows)
+    identity_matches = evidence_fingerprint == spec.tradability_fingerprint
     complete = (
         universe_complete and requested > 0
         and available + blocked + unknown == requested and unknown == 0
+        and identity_matches
     )
     ratio = _ratio(available + blocked, requested) if universe_complete else None
     identity = {"tradability_fingerprint": spec.tradability_fingerprint}
@@ -279,9 +332,13 @@ def _tradability(
                         None if complete else "tradability_coverage_incomplete", identity,
                         "archive_facts_complete_for_requested_pairs" if complete else "partial_or_unknown",
                         {"requested": requested, "available": available,
-                         "unknown": unknown, "blocked": blocked, "ratio": ratio})
+                         "unknown": unknown, "blocked": blocked, "ratio": ratio,
+                         "evidence_fingerprint": evidence_fingerprint,
+                         "identity_matches": identity_matches})
     return detail, {"requested": requested, "available": available,
                     "unknown": unknown, "blocked": blocked, "ratio": ratio,
+                    "evidence_fingerprint": evidence_fingerprint,
+                    "identity_matches": identity_matches,
                     "universe_sessions_unknown": len(sessions) - len(members_by_session)}
 
 
@@ -356,66 +413,208 @@ def _session_calendar_provenance(
     return complete, report
 
 
-def _fundamental(
-    spec: EC.ExperimentSpec, records: Any, samples: Sequence[WFV.ValidationSample],
-) -> tuple[dict, dict]:
-    items = list(records or ())
-    samples_by_key: dict[str, WFV.ValidationSample | None] = {}
-    for sample in samples:
-        key = str(sample.sample_key or "").strip()
-        if key in samples_by_key:
-            samples_by_key[key] = None
-        else:
-            samples_by_key[key] = sample
-    total = 0
-    counts = {"visible": 0, "future": 0, "publication_unproven": 0, "invalid": 0}
-    for item in items:
-        if not isinstance(item, Mapping):
-            total += 1
-            counts["invalid"] += 1
-            continue
-        record = item.get("record")
-        sample_keys = item.get("sample_keys")
-        if (not isinstance(record, Mapping) or not isinstance(sample_keys, (list, tuple))
-                or not sample_keys or any(not isinstance(key, str) or not key.strip()
-                                          for key in sample_keys)
-                or len(set(sample_keys)) != len(sample_keys)):
-            total += 1
-            counts["invalid"] += 1
-            continue
-        for sample_key in sample_keys:
-            total += 1
-            sample = samples_by_key.get(sample_key)
-            if sample is None:
-                counts["invalid"] += 1
-                continue
-            decision_asof = _decision_instant(sample.decision_at)
-            if decision_asof is None:
-                counts["publication_unproven"] += 1
-                continue
-            view = FPIT.financial_visibility(record, decision_asof)
-            source = view.get("profit_source")
-            publication_declared = any(
-                record.get(key) not in (None, "") for key in FPIT.REPORT_PUBLISHED_KEYS
+def _owner_calendar(
+    spec: EC.ExperimentSpec, calendar: Any, market_repository: Any,
+    market_archive_fingerprint: str | None,
+) -> tuple[list[str], bool, dict]:
+    """Validate an owner-issued calendar against its immutable raw archive."""
+    if not isinstance(calendar, HSC.HistoricalSessionCalendar):
+        return [], False, {"status": "blocked",
+                           "reason_code": "historical_session_calendar_unavailable",
+                           "authority": "historical_session_calendar_owner_unavailable"}
+    if market_repository is None or not market_archive_fingerprint:
+        return [], False, {"status": "blocked", "reason_code": "historical_market_archive_identity_mismatch",
+                           "authority": "market_archive_missing"}
+    manifest = market_repository.get_manifest(market_archive_fingerprint)
+    sessions = list(calendar.sessions)
+    reissued = None
+    if manifest is not None:
+        try:
+            reissued = HSC.issue_from_market_archive(
+                market_repository, archive_fingerprint=market_archive_fingerprint,
+                benchmark_symbol=calendar.benchmark_symbol,
+                start=calendar.coverage_start, end=calendar.coverage_end,
             )
-            if publication_declared and view.get("report_published_at") is None:
-                counts["invalid"] += 1
-            elif source == "future":
-                counts["future"] += 1
-            elif view.get("visible") and source == "reported":
-                counts["visible"] += 1
-            elif source in {"shadow", "unknown"}:
-                counts["publication_unproven"] += 1
+        except (TypeError, ValueError):
+            reissued = None
+    valid = (
+        manifest is not None and manifest.adjustment == "raw"
+        and reissued == calendar
+        and calendar.source_archive_fingerprint == market_archive_fingerprint
+        and spec.market_data_fingerprint == market_archive_fingerprint
+        and calendar.coverage_start <= spec.start_date
+        and calendar.coverage_end >= spec.end_date
+        and calendar.session_count == len(sessions) and sessions == sorted(set(sessions))
+        and all(spec.start_date <= item <= spec.end_date for item in sessions)
+        and calendar.verification_status == "owner_issued_from_raw_benchmark_archive"
+    )
+    report = {"status": "proven" if valid else "blocked",
+              "reason_code": None if valid else "historical_session_calendar_unavailable",
+              "authority": "historical_session_calendar_owner" if valid else "owner_projection_mismatch",
+              "calendar_fingerprint": calendar.calendar_fingerprint,
+              "source_archive_fingerprint": calendar.source_archive_fingerprint,
+              "coverage_start": calendar.coverage_start, "coverage_end": calendar.coverage_end,
+              "sessions": sessions, "session_count": calendar.session_count,
+              "content_hash": calendar.content_hash}
+    return sessions if valid else [], valid, report
+
+
+def _market_coverage(
+    spec: EC.ExperimentSpec, repository: Any, archive_fingerprint: str | None,
+    sessions: Sequence[str], members_by_session: Mapping[str, Sequence[Any]],
+    tradability_repository: Any,
+) -> tuple[dict, dict]:
+    identity = {"market_data_fingerprint": spec.market_data_fingerprint}
+    manifest = repository.get_manifest(archive_fingerprint) if repository is not None and archive_fingerprint else None
+    if (manifest is None or manifest.archive_fingerprint != spec.market_data_fingerprint
+            or manifest.adjustment != "raw" or manifest.coverage_start > spec.start_date
+            or manifest.coverage_end < spec.end_date):
+        coverage = {"requested": 0, "present": 0, "expected_absent": 0, "missing": None,
+                    "ratio": None, "archive_status": "unavailable"}
+        return _dimension("blocked", "historical_market_data_unavailable", identity,
+                          "declared_identity_only" if repository is None
+                          else "raw_archive_missing_or_range_incomplete", coverage), coverage
+    symbols = sorted({code for rows in members_by_session.values()
+                      for code in (_member_code(row) for row in rows) if code})
+    bars = repository.read_bars(archive_fingerprint, start=spec.start_date,
+                                end=spec.end_date, symbols=symbols)
+    by_pair = {(row["code"], row["session"]): row for row in bars}
+    requested = present = expected_absent = missing = 0
+    requests = {(code, session): PIT.bar_available_at(session)
+                for session in sessions for member in members_by_session.get(session, ())
+                for code in (_member_code(member),) if code}
+    facts = (tradability_repository.evidence_many(requests)
+             if tradability_repository is not None and hasattr(tradability_repository, "evidence_many")
+             else {})
+    for session in sessions:
+        for member in members_by_session.get(session, ()):
+            code = _member_code(member)
+            if not code:
+                missing += 1
+                continue
+            requested += 1
+            if (code, session) in by_pair:
+                present += 1
+                continue
+            instant = PIT.bar_available_at(session)
+            fact = (facts.get((code, session)) if facts else
+                    tradability_repository.evidence_at(code, session, instant)
+                    if tradability_repository is not None and instant is not None else None)
+            if fact is not None and fact.is_suspended is True:
+                expected_absent += 1
             else:
-                counts["invalid"] += 1
+                missing += 1
+    complete = requested > 0 and missing == 0 and present + expected_absent == requested
+    coverage = {"requested": requested, "present": present,
+                "expected_absent": expected_absent, "missing": missing,
+                "ratio": _ratio(present + expected_absent, requested),
+                "archive_status": "raw_immutable"}
+    return _dimension("proven" if complete else "blocked",
+                      None if complete else "historical_market_data_unavailable",
+                      {**identity, "archive_fingerprint": manifest.archive_fingerprint,
+                       "content_hash": manifest.content_hash},
+                      "archive_bars_and_historical_suspension_facts" if complete else "market_coverage_gap",
+                      coverage), coverage
+
+
+def _fundamental_features(
+    spec: EC.ExperimentSpec, samples: Sequence[WFV.ValidationSample],
+    feature_names: Sequence[str], repository: Any, archive_fingerprint: str | None,
+) -> tuple[dict, dict]:
+    """Require owner-issued field lineage for every exact canonical sample."""
+    total = len(samples) * len(feature_names)
+    counts = {"visible": 0, "future": 0, "publication_unproven": 0, "invalid": 0,
+              "missing": 0, "value_mismatch": 0, "unsupported": 0,
+              "decision_mismatch": 0}
+    fingerprints: list[str] = []
+    if repository is None or not archive_fingerprint:
+        counts["missing"] = total
+        reason = "financial_feature_evidence_missing"
+    elif total == 0:
+        counts["missing"] = 1
+        total = 1
+        reason = "financial_feature_evidence_missing"
+    else:
+        reason = "financial_feature_evidence_missing"
+        seen = set()
+        for sample in samples:
+            sample_key = str(sample.sample_key or "").strip()
+            if not sample_key or sample_key in seen:
+                counts["invalid"] += len(feature_names)
+                continue
+            seen.add(sample_key)
+            decision = _decision_instant(sample.decision_at)
+            for feature_name in feature_names:
+                try:
+                    evidence = repository.resolve_for_dataset_sample(
+                        dataset_fingerprint=spec.dataset_fingerprint,
+                        sample_key=sample_key, feature_name=feature_name,
+                        financial_archive_fingerprint=archive_fingerprint,
+                    )
+                    item = evidence.projection()
+                except Exception:
+                    counts["missing"] += 1
+                    continue
+                if (item.get("sample_key") != sample_key
+                        or item.get("feature_name") != feature_name
+                        or item.get("financial_archive_fingerprint") != archive_fingerprint):
+                    counts["invalid"] += 1
+                elif decision is None or item.get("decision_at") != decision:
+                    counts["decision_mismatch"] += 1
+                elif item.get("code") != sample.code:
+                    counts["invalid"] += 1
+                elif item.get("verification") != "proven":
+                    code = item.get("reason_code")
+                    if code == "financial_feature_value_mismatch":
+                        counts["value_mismatch"] += 1
+                    elif code == "financial_feature_derivation_unsupported":
+                        counts["unsupported"] += 1
+                    elif code == "financial_publication_unproven":
+                        counts["publication_unproven"] += 1
+                    elif code == "financial_feature_decision_mismatch":
+                        counts["decision_mismatch"] += 1
+                    elif code == "financial_feature_evidence_missing":
+                        counts["missing"] += 1
+                    else:
+                        counts["future"] += 1
+                else:
+                    stored = (sample.features or {}).get(feature_name)
+                    try:
+                        stored_value = float(stored)
+                        evidence_value = float(item.get("feature_value"))
+                    except (TypeError, ValueError):
+                        stored_value = evidence_value = float("nan")
+                    if (stored_value != evidence_value or not item.get("input_record_fingerprints")
+                            or not item.get("derivation_version")
+                            or not item.get("feature_available_at")):
+                        counts["value_mismatch"] += 1
+                    else:
+                        counts["visible"] += 1
+                        fingerprints.append(str(item.get("evidence_fingerprint")))
+        if counts["value_mismatch"]:
+            reason = "financial_feature_value_mismatch"
+        elif counts["decision_mismatch"]:
+            reason = "financial_feature_decision_mismatch"
+        elif counts["unsupported"]:
+            reason = "financial_feature_derivation_unsupported"
+        elif counts["publication_unproven"]:
+            reason = "financial_publication_unproven"
+        elif counts["future"]:
+            reason = "financial_record_unavailable"
+        elif counts["missing"] or counts["invalid"]:
+            reason = "financial_feature_evidence_missing"
+        else:
+            reason = None
     complete = total > 0 and counts["visible"] == total
-    identity = {"dataset_fingerprint": spec.dataset_fingerprint}
     coverage = {**counts, "requested": total,
                 "ratio": _ratio(counts["visible"], total)}
+    identity = {"dataset_fingerprint": spec.dataset_fingerprint,
+                "financial_archive_fingerprint": archive_fingerprint,
+                "evidence_fingerprints": sorted(fingerprints)}
     detail = _dimension("proven" if complete else "blocked",
-                        None if complete else "fundamental_publication_unproven", identity,
-                        "publication_visible_at_each_linked_decision_session"
-                        if complete else "sample_link_or_publication_unproven",
+                        None if complete else reason or "financial_feature_evidence_missing",
+                        identity,
+                        "owner_derived_sample_field_lineage" if complete else "financial_feature_lineage_unproven",
                         coverage)
     return detail, coverage
 
@@ -428,7 +627,8 @@ def _decision_instant(value: Any) -> str | None:
     parsed = PIT.parse_asof(text)
     if parsed is None:
         return None
-    return parsed.isoformat(timespec="microseconds" if parsed.microsecond else "seconds")
+    normalized = parsed.astimezone(dt.timezone.utc)
+    return normalized.isoformat(timespec="microseconds" if normalized.microsecond else "seconds")
 
 
 def _normalize_samples(
@@ -490,13 +690,20 @@ def build_pit_validation_evidence(
     dataset_manifest: Any = None,
     universe_rows: Any = None,
     universe_source: Any = None,
-    tradability_repository: Any = None,
+    tradability_repository: TA.TradabilityArchiveRepository | None = None,
     fundamental_records: Any = None,
+    financial_feature_repository: Any = None,
+    financial_archive_fingerprint: str | None = None,
     market_snapshot: Any = None,
     samples: Sequence[Any] = (),
     walk_forward_config: WFV.WalkForwardConfig | None = None,
     authoritative_sessions: Sequence[Any] | None = None,
     session_calendar_provenance: Mapping[str, Any] | None = None,
+    session_calendar: HSC.HistoricalSessionCalendar | None = None,
+    market_archive_repository: HMA.HistoricalMarketArchiveRepository | None = None,
+    market_archive_fingerprint: str | None = None,
+    universe_archive_repository: HUA.HistoricalUniverseArchiveRepository | None = None,
+    universe_archive_fingerprint: str | None = None,
 ) -> PITValidationEvidence:
     """Compose explicit owner evidence into a READY/BLOCKED input gate.
 
@@ -515,20 +722,39 @@ def build_pit_validation_evidence(
     reasons: list[str] = []
     warnings: list[str] = []
 
-    bounded_sessions, _sessions_requested, sessions_excluded, sessions_invalid, sessions_duplicates = _bounded_sessions(
-        authoritative_sessions, start=spec.start_date, end=spec.end_date,
-    )
-    session_calendar_complete, session_calendar_coverage = _session_calendar_provenance(
-        spec, bounded_sessions, session_calendar_provenance,
-        requested=_sessions_requested, outside_range=sessions_excluded,
-        invalid=sessions_invalid, duplicates=sessions_duplicates,
-    )
+    if session_calendar is not None:
+        bounded_sessions, session_calendar_complete, session_calendar_coverage = _owner_calendar(
+            spec, session_calendar, market_archive_repository, market_archive_fingerprint,
+        )
+        _sessions_requested = len(session_calendar.sessions)
+        sessions_excluded = sessions_invalid = sessions_duplicates = 0
+    else:
+        bounded_sessions, _sessions_requested, sessions_excluded, sessions_invalid, sessions_duplicates = _bounded_sessions(
+            authoritative_sessions, start=spec.start_date, end=spec.end_date,
+        )
+        session_calendar_complete, session_calendar_coverage = _session_calendar_provenance(
+            spec, bounded_sessions, session_calendar_provenance,
+            requested=_sessions_requested, outside_range=sessions_excluded,
+            invalid=sessions_invalid, duplicates=sessions_duplicates,
+        )
     normalized_samples, samples_excluded, samples_invalid = _normalize_samples(
         samples, start=spec.start_date, end=spec.end_date,
     )
+    universe_manifest = None
+    if universe_archive_repository is not None and universe_archive_fingerprint is not None:
+        universe_manifest = universe_archive_repository.manifest(universe_archive_fingerprint)
+        if (universe_manifest is None
+                or universe_manifest.universe_archive_fingerprint != spec.universe_fingerprint
+                or universe_manifest.coverage_start > spec.start_date
+                or universe_manifest.coverage_end < spec.end_date):
+            universe_rows, universe_source = (), None
+        else:
+            universe_rows = universe_archive_repository.membership_records(universe_archive_fingerprint)
+            universe_source = universe_archive_repository.source_projection(universe_archive_fingerprint)
     universe_dim, members, _universe_report = _universe(
         spec, universe_rows, universe_source, bounded_sessions,
         session_calendar_complete=session_calendar_complete,
+        owner_issued=universe_manifest is not None,
     )
     dimensions["historical_universe"] = universe_dim
     if universe_dim["status"] == "blocked":
@@ -544,23 +770,48 @@ def build_pit_validation_evidence(
         reasons.append(tradability_dim["reason_code"])
         warnings.append("tradability_coverage_incomplete")
 
-    # A current full-market snapshot has no authority over arbitrary historical dates.
+    # Current full-market snapshots are diagnostic only, never historical inputs.
     _ = market_snapshot
-    dimensions["market_data_pit"] = _dimension(
-        "blocked", "historical_market_data_unavailable",
-        {"market_data_fingerprint": spec.market_data_fingerprint},
-        "declared_identity_only",
+    dimensions["market_data_pit"], market_coverage = _market_coverage(
+        spec, market_archive_repository, market_archive_fingerprint, bounded_sessions,
+        members, tradability_repository,
     )
-    reasons.append("historical_market_data_unavailable")
-    warnings.append("historical_market_data_unavailable")
+    if dimensions["market_data_pit"]["status"] == "blocked":
+        reasons.append(dimensions["market_data_pit"]["reason_code"])
+        warnings.append("historical_market_data_unavailable")
 
-    fundamental_dim, fundamental_coverage = _fundamental(
-        spec, fundamental_records, normalized_samples,
-    )
+    strategy_ast = (strategy_version.definition.get("dsl_ast")
+                    if isinstance(strategy_version, SR.StrategyVersion)
+                    and isinstance(strategy_version.definition, Mapping) else None)
+    dependencies = None
+    if strategy_ast is not None:
+        try:
+            dependencies = strategy_dsl_dependencies(strategy_ast)
+        except (TypeError, ValueError):
+            dependencies = None
+    if dependencies is not None and (dependencies["other_fields"]
+                                     or dependencies["fund_flow_fields"]):
+        reasons.append("strategy_input_owner_unavailable")
+        warnings.append("strategy_input_owner_unavailable")
+    if strategy_ast is None or dependencies is None:
+        reasons.append("strategy_replay_definition_unavailable")
+        warnings.append("strategy_replay_definition_unavailable")
+    if dependencies is not None and not dependencies["financial_fields"]:
+        fundamental_dim = _dimension("not_applicable", None,
+                                     {"dataset_fingerprint": spec.dataset_fingerprint},
+                                     "pinned_strategy_has_no_financial_dependencies",
+                                     {"requested": 0, "ratio": None})
+        fundamental_coverage = {"requested": 0, "visible": 0, "future": 0,
+                                "publication_unproven": 0, "invalid": 0, "ratio": None}
+    else:
+        fundamental_dim, fundamental_coverage = _fundamental_features(
+            spec, normalized_samples, dependencies["financial_fields"] if dependencies else (),
+            financial_feature_repository, financial_archive_fingerprint,
+        )
     dimensions["fundamental_pit"] = fundamental_dim
     if fundamental_dim["status"] == "blocked":
         reasons.append(fundamental_dim["reason_code"])
-        warnings.append("fundamental_publication_unproven")
+        warnings.append(fundamental_dim["reason_code"] or "fundamental_publication_unproven")
 
     dimensions["strategy_version"] = _strategy_identity(spec, strategy_version)
     if dimensions["strategy_version"]["status"] == "blocked":
@@ -601,7 +852,7 @@ def build_pit_validation_evidence(
             "invalid": sessions_invalid,
         },
     }
-    if not authoritative_sessions or not bounded_sessions or sessions_invalid:
+    if not bounded_sessions or sessions_invalid:
         dimensions["walk_forward"] = _dimension(
             "blocked", "walk_forward_explicit_sessions_required", None,
             "authoritative_sessions_missing_or_invalid",
@@ -679,7 +930,7 @@ def build_pit_validation_evidence(
         "universe": universe_dim["coverage"],
         "session_calendar": session_calendar_coverage,
         "tradability": tradability_coverage,
-        "market_data": None,
+        "market_data": market_coverage if market_archive_repository is not None else None,
         "fundamental": fundamental_coverage,
         "labels": walk.get("label_coverage"),
     }

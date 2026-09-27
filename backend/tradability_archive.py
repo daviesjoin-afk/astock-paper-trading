@@ -133,6 +133,7 @@ __all__ = [
     "TradabilityReason",
     "TradabilityEvidence",
     "TradabilityDecision",
+    "TradabilityCoverageProjection",
     "TradabilityProvider",
     "TradabilityArchiveRepository",
     "TradabilityEvaluator",
@@ -356,6 +357,25 @@ class TradabilityDecision:
             "suspension_reason": self.suspension_reason,
             "contract_version": CONTRACT_VERSION,
         }
+
+
+@dataclass(frozen=True, slots=True)
+class TradabilityCoverageProjection:
+    """Owner-derived mutually exclusive coverage for exact historical pairs."""
+
+    requested_pairs: int
+    proven_pairs: int
+    available_pairs: int
+    blocked_pairs: int
+    unknown_pairs: int
+    coverage_ratio: Optional[float]
+    evidence_fingerprint: str
+
+    def projection(self) -> dict:
+        return {"requested_pairs": self.requested_pairs, "proven_pairs": self.proven_pairs,
+                "available_pairs": self.available_pairs, "blocked_pairs": self.blocked_pairs,
+                "unknown_pairs": self.unknown_pairs, "coverage_ratio": self.coverage_ratio,
+                "evidence_fingerprint": self.evidence_fingerprint}
 
 
 # ───────────────────────────── 规范化 / 指纹 ─────────────────────────────
@@ -728,6 +748,83 @@ class TradabilityArchiveRepository:
             while len(self._cache) > self._cache_size:
                 self._cache.popitem(last=False)
         return chosen
+
+    def evidence_many(self, requests: Mapping[tuple[str, str], Any]) -> dict[tuple[str, str], Optional[TradabilityEvidence]]:
+        """Read many exact ``(code, session)`` evidence pairs with bounded range queries.
+
+        The query count scales with symbol chunks, not with session × symbol pairs.
+        Visibility and latest-effective selection remain the same as ``evidence_at``.
+        """
+        normalized = {}
+        for (code, session), decision_time in requests.items():
+            code_text, session_text = _text(code), _session(session)
+            if code_text and session_text and _canonical_instant(decision_time):
+                normalized[(code_text, session_text)] = decision_time
+        if not normalized:
+            return {}
+        codes = sorted({code for code, _ in normalized})
+        low, high = min(session for _, session in normalized), max(session for _, session in normalized)
+        grouped: dict[tuple[str, str], list[TradabilityEvidence]] = {key: [] for key in normalized}
+        for offset in range(0, len(codes), 400):
+            batch = codes[offset:offset + 400]
+            placeholders = ",".join("?" for _ in batch)
+            rows = self._conn.execute(
+                f"SELECT {_COLUMN_LIST} FROM {ARCHIVE_TABLE} "
+                f"WHERE session_date>=? AND session_date<=? AND code IN ({placeholders})",
+                (low, high, *batch),
+            ).fetchall()
+            for row in rows:
+                evidence = _row_to_evidence(row)
+                key = (evidence.code, evidence.session_date)
+                decision_time = normalized.get(key)
+                if decision_time is not None and _visible_at(evidence, decision_time):
+                    grouped[key].append(evidence)
+        result = {}
+        for key, items in grouped.items():
+            items.sort(key=lambda item: (item.effective_at, item.observed_at))
+            result[key] = items[-1] if items else None
+        return result
+
+    def coverage_projection(self, requests: Mapping[tuple[str, str], Any]) -> TradabilityCoverageProjection:
+        """Project complete/blocked/unknown exact pairs without per-pair queries."""
+        evidence_by_pair = self.evidence_many(requests)
+        requested = available = blocked = unknown = 0
+        evidence_rows = []
+        for pair in sorted(requests):
+            code, session = pair
+            requested += 1
+            evidence = evidence_by_pair.get(pair)
+            if evidence is None:
+                unknown += 1
+                evidence_rows.append({"code": code, "session": session, "evidence": None})
+                continue
+            fingerprint = evidence_fingerprint(evidence)
+            evidence_rows.append({"code": code, "session": session, "evidence": fingerprint})
+            required = ("is_listed", "is_st", "is_suspended", "has_market_quote",
+                        "has_trade_volume", "is_price_limit_locked")
+            if any(getattr(evidence, name) is None for name in required) or (
+                    evidence.is_price_limit_locked is True and not evidence.price_limit_direction):
+                unknown += 1
+                continue
+            decision_time = requests[pair]
+            decision = TradabilityEvaluator.evaluate(evidence, decision_time=decision_time,
+                                                      fingerprint=fingerprint)
+            if (decision.buy_block_reason == TradabilityReason.UNKNOWN_STATE
+                    or decision.sell_block_reason == TradabilityReason.UNKNOWN_STATE):
+                unknown += 1
+            elif not decision.can_buy and not decision.can_sell:
+                blocked += 1
+            else:
+                available += 1
+        proven = available + blocked
+        return TradabilityCoverageProjection(
+            requested_pairs=requested, proven_pairs=proven, available_pairs=available,
+            blocked_pairs=blocked, unknown_pairs=unknown,
+            coverage_ratio=proven / requested if requested else None,
+            evidence_fingerprint=hashlib.sha256(json.dumps(
+                evidence_rows, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+                allow_nan=False).encode("utf-8")).hexdigest(),
+        )
 
     def _data_version(self) -> Optional[int]:
         """本连接看到的数据库版本号。

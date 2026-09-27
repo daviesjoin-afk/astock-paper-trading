@@ -7,6 +7,8 @@ import {
   adaptiveResearchEvidenceHtml,
   adaptiveResearchHistoryHtml,
   adaptiveResearchStatusLabel,
+  adaptiveValidationDetailHtml,
+  adaptiveValidationRunsHtml,
   openAdaptiveResearchRun,
   refreshAdaptiveResearchHistory,
 } from '../src/features/adaptive.js';
@@ -48,6 +50,41 @@ test('research status is labeled as a hypothesis, never as approval', () => {
   assert.equal(adaptiveResearchStatusLabel('supported'), '支持（研究假设）');
   assert.equal(adaptiveResearchStatusLabel('unsupported'), '不支持（研究假设）');
   assert.equal(adaptiveResearchStatusLabel('insufficient_evidence'), '证据不足（研究假设）');
+});
+
+test('R29 validation view renders periods, windows, per-owner coverage and warnings without zero-filling', () => {
+  const html = adaptiveValidationDetailHtml({
+    run_key: 'a'.repeat(64), experiment_fingerprint: 'b'.repeat(64),
+    strategy_id: 'trend', strategy_version: 3, strategy_checksum: 'c'.repeat(64),
+    runner_code_revision: 'a'.repeat(40),
+    dataset_fingerprint: 'd'.repeat(64), market_archive_fingerprint: 'e'.repeat(64),
+    financial_archive_fingerprint: '2'.repeat(64),
+    universe_archive_fingerprint: 'f'.repeat(64), calendar_fingerprint: '1'.repeat(64),
+    validation_evidence: { status: 'blocked', reason_codes: ['historical_market_data_unavailable'],
+      pit_warnings: ['market gap'], periods: {train:{start:'2026-01-01',end:'2026-01-05'},
+        validation:{start:'2026-01-06',end:'2026-01-07'},oos:{start:'2026-01-08',end:'2026-01-09'}},
+      data_coverage: {session_calendar:{ratio:1,requested:3}, universe:{ratio:1,requested:3},
+        tradability:{ratio:null,requested:3,unknown:3}, market_data:{ratio:null},
+        fundamental:{ratio:null}, labels:{ratio:0.5,requested:4}} },
+    result: {status:'unavailable', failure_reason:'historical_market_data_unavailable', metrics:{}},
+    folds: [{fold_id:1,status:'ready',reason:'ok',train_period:{start:'2026-01-01',end:'2026-01-05'},
+      validation_period:{start:'2026-01-06',end:'2026-01-07'},oos_period:{start:'2026-01-08',end:'2026-01-09'}}],
+  });
+  for (const expected of ['2026-01-01', '2026-01-07', '2026-01-09', 'historical_market_data_unavailable',
+    'Walk-forward windows', '交易日历', '可交易性', 'Code revision', 'a'.repeat(40), 'Financial archive', '2'.repeat(64), 'PIT warnings', '不可用']) assert.match(html, new RegExp(expected));
+  assert.doesNotMatch(html, /收益<\/dt><dd>0(?:\.0+)?<\/dd>/);
+  assert.doesNotMatch(html, /winner|champion|promot|可上线/i);
+});
+
+test('R29 run list offers detail and neutral comparison without ranking language', () => {
+  const html = adaptiveValidationRunsHtml({status:'ok',runs:[{
+    run_key:'a'.repeat(64), strategy_id:'trend', strategy_version:2,
+    experiment_fingerprint:'b'.repeat(64), validation_status:'blocked', created_at:'2026-09-28',
+    result:{status:'unavailable'},
+  }]});
+  assert.match(html, /查看 Experiment \/ Evidence \/ Result/);
+  assert.match(html, /加入比较/);
+  assert.doesNotMatch(html, /winner|best strategy|冠军|晋级/);
 });
 
 test('confidence conversion happens only in presentation and preserves the 0..1 contract', () => {

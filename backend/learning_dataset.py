@@ -59,7 +59,7 @@ import json
 import math
 import re
 import sqlite3
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Mapping, Optional, Sequence
 
 import financial_point_in_time as PIT
@@ -125,6 +125,12 @@ DEFAULT_ALPHA_FEATURES = (
     "volume_ratio",
     "small_size",
     "value",
+)
+
+# Additive nullable storage for future owner-derived financial features. Existing
+# rows are not populated or promoted; a null value remains unavailable.
+FINANCIAL_FEATURE_FIELDS = (
+    "pe", "pb", "roe", "revenue_yoy", "profit_yoy", "gross_margin", "debt_ratio",
 )
 
 # Stable, unique, deterministic row order.  Two datasets holding the same
@@ -709,13 +715,14 @@ class CanonicalSample:
     quality_flags: tuple = ()
     provenance: Mapping[str, Any] = field(default_factory=dict)
     partition: Optional[str] = None
+    financial_evidence_refs: Mapping[str, str] = field(default_factory=dict)
 
     def with_partition(self, partition: Optional[str]) -> "CanonicalSample":
         return _replace_partition(self, partition)
 
     def canonical(self, feature_names: Sequence[str]) -> dict:
         """Return the canonical dict consumed by the fingerprint."""
-        return {
+        projection = {
             "sample_key": self.sample_key,
             "source": self.source,
             "source_version": self.source_version,
@@ -739,6 +746,12 @@ class CanonicalSample:
             "provenance": _canon_json(dict(self.provenance or {})),
             "partition": self.partition,
         }
+        refs = dict(self.financial_evidence_refs or {})
+        if refs:
+            projection["financial_evidence_refs"] = {
+                str(name): str(ref) for name, ref in sorted(refs.items())
+            }
+        return projection
 
 
 def _replace_partition(sample: CanonicalSample, partition: Optional[str]) -> CanonicalSample:
@@ -762,6 +775,7 @@ def _replace_partition(sample: CanonicalSample, partition: Optional[str]) -> Can
         quality_flags=tuple(sample.quality_flags or ()),
         provenance=dict(sample.provenance or {}),
         partition=partition,
+        financial_evidence_refs=dict(sample.financial_evidence_refs or {}),
     )
 
 
@@ -864,6 +878,12 @@ def ensure_schema(conn: sqlite3.Connection) -> dict:
             conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {sql_type}")
             report["added_columns"] += 1
 
+    sample_columns = _table_columns(conn, ALPHA_SAMPLE_TABLE)
+    for name in FINANCIAL_FEATURE_FIELDS:
+        if sample_columns and name not in sample_columns:
+            conn.execute(f"ALTER TABLE {ALPHA_SAMPLE_TABLE} ADD COLUMN {name} REAL")
+            report["added_columns"] += 1
+
     # Mark, never invent: a legacy row with no availability evidence becomes
     # explicitly unproven instead of defaulting to "trusted".
     report["legacy_marked"] = _mark_legacy_rows(conn, ALPHA_SAMPLE_TABLE)
@@ -913,7 +933,7 @@ _SAMPLE_FIELDS = (
     "contract_version",
     "provenance_json",
     "quality_json",
-) + DEFAULT_ALPHA_FEATURES
+) + DEFAULT_ALPHA_FEATURES + FINANCIAL_FEATURE_FIELDS
 
 _RETURN_FIELDS = (
     "start_date",
@@ -997,8 +1017,11 @@ def _read_alpha_evidence_page(
 
     evidence = []
     for record in raw_rows:
-        sample = {name: record.get(name) for name in _SAMPLE_FIELDS if name not in DEFAULT_ALPHA_FEATURES}
-        sample["sample_features"] = {name: record.get(name) for name in DEFAULT_ALPHA_FEATURES}
+        feature_fields = DEFAULT_ALPHA_FEATURES + FINANCIAL_FEATURE_FIELDS
+        sample = {name: record.get(name) for name in _SAMPLE_FIELDS if name not in feature_fields}
+        sample["sample_features"] = {
+            name: record.get(name) for name in DEFAULT_ALPHA_FEATURES + FINANCIAL_FEATURE_FIELDS
+        }
         label = {name: record.get(f"r_{name}") for name in _RETURN_FIELDS}
         evidence.append({"sample": sample, "label": label})
 
@@ -1549,6 +1572,8 @@ def build_dataset(
     contract_version: str = CONTRACT_VERSION,
     code_build_identity: Optional[str] = None,
     max_evidence_rows: Optional[int] = None,
+    financial_feature_repository: Any = None,
+    financial_archive_fingerprint: Optional[str] = None,
     persist: bool = False,
 ) -> DatasetBuild:
     """Build the strict canonical dataset from persisted evidence only.
@@ -1591,6 +1616,22 @@ def build_dataset(
             continue
         seen.add(sample.sample_key)
         accepted.append(sample)
+
+    financial_fields = sorted(set(features) & set(FINANCIAL_FEATURE_FIELDS))
+    if financial_fields and financial_feature_repository is not None:
+        if not financial_archive_fingerprint:
+            raise ValueError("financial_archive_identity_required")
+        owner_samples = []
+        for sample in accepted:
+            references = {}
+            for name in financial_fields:
+                item = financial_feature_repository.derive_candidate(
+                    sample=sample, feature_name=name,
+                    financial_archive_fingerprint=financial_archive_fingerprint,
+                )
+                references[name] = item.evidence_fingerprint
+            owner_samples.append(replace(sample, financial_evidence_refs=references))
+        accepted = owner_samples
 
     partitions, purge_counts = chronological_split(accepted, split_spec=spec)
     exclusions["overlapping_label_purged"] = int(purge_counts["train"] + purge_counts["validation"])

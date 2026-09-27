@@ -6,9 +6,11 @@ import sqlite3
 import tempfile
 import threading
 import time
+import datetime as dt
 from contextlib import contextmanager
 
 from fastapi import APIRouter, HTTPException, Path, Query
+from pydantic import BaseModel, Field
 
 import adaptive_engine as adaptive
 import adaptive_learning_dispatch as learning_dispatch
@@ -18,6 +20,54 @@ import self_evolution as SE
 
 
 router = APIRouter(prefix="/api/adaptive", tags=["adaptive-learning"])
+
+
+class ExperimentValidationRequest(BaseModel):
+    """Exact identities required to run one offline canonical validation."""
+    spec: dict
+    market_archive_fingerprint: str = Field(min_length=64, max_length=64)
+    universe_archive_fingerprint: str = Field(min_length=64, max_length=64)
+    financial_archive_fingerprint: str | None = Field(default=None, min_length=64, max_length=64)
+    calendar_fingerprint: str = Field(min_length=64, max_length=64)
+    benchmark_symbol: str = Field(min_length=1, max_length=24)
+    walk_forward: dict
+
+
+@contextmanager
+def _experiment_validation_connection(*, query_only: bool):
+    """Open only the adaptive DB and the additive validation ledger schema."""
+    db_path = adaptive.DB_PATH
+    if query_only:
+        if not os.path.exists(db_path):
+            raise FileNotFoundError("validation ledger unavailable")
+        uri = "file:" + os.path.abspath(db_path).replace(os.sep, "/") + "?mode=ro"
+        conn = sqlite3.connect(uri, uri=True, timeout=5)
+    else:
+        directory = os.path.dirname(os.path.abspath(db_path))
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+        conn = sqlite3.connect(db_path, timeout=30)
+    conn.row_factory = sqlite3.Row
+    try:
+        if query_only:
+            conn.execute("PRAGMA query_only=ON")
+        else:
+            import experiment_validation_repository as repository
+            repository.ensure_schema(conn)
+            conn.commit()
+        yield conn
+    finally:
+        conn.close()
+
+
+def _validation_run_projection(row):
+    return {key: row.get(key) for key in (
+        "id", "run_key", "experiment_fingerprint", "strategy_id", "strategy_version",
+        "strategy_checksum", "calendar_fingerprint", "universe_archive_fingerprint",
+        "financial_archive_fingerprint", "tradability_evidence_fingerprint",
+        "market_archive_fingerprint", "dataset_fingerprint",
+        "validation_status", "validation_evidence", "result", "folds", "runner_version",
+        "runner_code_revision", "created_at")}
 
 
 @contextmanager
@@ -348,6 +398,160 @@ def canonical_research_run(run_id: int = Path(..., gt=0)):
     if run is None:
         raise HTTPException(status_code=404, detail="research_run_not_found")
     return {"status": "ok", "run": run}
+
+
+@router.post("/experiments/validate")
+def validate_canonical_experiment(request: ExperimentValidationRequest):
+    """Run an exact-identity validation offline; never refresh or select inputs."""
+    try:
+        import experiment_contract as EC
+        import experiment_execution_model  # noqa: F401
+        import financial_feature_evidence as FFE
+        import experiment_validation_repository as EVR
+        import historical_financial_archive as HFA
+        import experiment_validation_runner as runner
+        import historical_market_archive as HMA
+        import historical_session_calendar as HSC
+        import historical_universe_archive as HUA
+        import learning_dataset as LD
+        import strategy_registry as SR
+        import tradability_archive as TA
+        import walk_forward_validation as WFV
+
+        raw = dict(request.spec)
+        strategy = raw.get("strategy")
+        if not isinstance(strategy, dict):
+            raise ValueError("strategy_identity_required")
+        raw["strategy"] = EC.StrategyIdentity(**strategy)
+        raw["start_date"] = raw.pop("start_date", raw.get("date_range", {}).get("start"))
+        raw["end_date"] = raw.pop("end_date", raw.get("date_range", {}).get("end"))
+        raw.pop("date_range", None)
+        spec = EC.ExperimentSpec(**raw)
+        if (spec.market_data_fingerprint != request.market_archive_fingerprint
+                or spec.universe_fingerprint != request.universe_archive_fingerprint
+                or spec.parameter_set.get("validation_calendar_fingerprint") != request.calendar_fingerprint
+                or spec.parameter_set.get("financial_archive_fingerprint") != request.financial_archive_fingerprint):
+            raise ValueError("owner_identity_mismatch")
+        config = WFV.WalkForwardConfig(**request.walk_forward)
+        with _experiment_validation_connection(query_only=False) as conn:
+            market_repo = HMA.HistoricalMarketArchiveRepository(conn)
+            financial_archive_repo = HFA.HistoricalFinancialArchiveRepository(conn)
+            financial_feature_repo = FFE.FinancialFeatureEvidenceRepository(conn, financial_archive_repo)
+            universe_repo = HUA.HistoricalUniverseArchiveRepository(conn)
+            tradability_repo = TA.TradabilityArchiveRepository(conn)
+            ledger = EVR.ExperimentValidationRepository(conn)
+            calendar = HSC.issue_from_market_archive(
+                market_repo, archive_fingerprint=request.market_archive_fingerprint,
+                benchmark_symbol=request.benchmark_symbol, start=spec.start_date, end=spec.end_date,
+            )
+            if calendar.calendar_fingerprint != request.calendar_fingerprint:
+                raise ValueError("calendar_identity_mismatch")
+            LD.ensure_schema(conn)
+            manifest = LD.read_manifest(conn, spec.dataset_fingerprint)
+            if manifest is None:
+                raise ValueError("dataset_identity_unavailable")
+            dataset = LD.build_dataset(
+                conn, cutoff=manifest["cutoff"], split_spec=manifest["split_spec"],
+                feature_names=manifest["feature_names"],
+                horizon_semantics=manifest["horizon_semantics"],
+                contract_version=manifest["contract_version"],
+                financial_feature_repository=financial_feature_repo
+                if request.financial_archive_fingerprint else None,
+                financial_archive_fingerprint=request.financial_archive_fingerprint,
+                persist=False,
+            )
+            if dataset.fingerprint != spec.dataset_fingerprint:
+                raise ValueError("dataset_identity_mismatch")
+            samples = [sample for partition in LD.PARTITIONS
+                       for sample in dataset.partitions.get(partition, ())]
+            strategy_version = SR.get_version(
+                spec.strategy.strategy_id, spec.strategy.version,
+                checksum=spec.strategy.checksum,
+            )
+            # The app process injects its build identity. The request cannot claim it.
+            build_revision = os.environ.get("ASTOCK_BUILD_REVISION", "")
+            output = runner.run_validation(
+                spec, runner_code_revision=build_revision,
+                strategy_version=strategy_version, dataset_manifest=manifest,
+                samples=samples, walk_forward_config=config,
+                session_calendar=calendar, market_archive_repository=market_repo,
+                market_archive_fingerprint=request.market_archive_fingerprint,
+                universe_archive_repository=universe_repo,
+                universe_archive_fingerprint=request.universe_archive_fingerprint,
+                tradability_repository=tradability_repo,
+                financial_feature_repository=financial_feature_repo,
+                financial_archive_fingerprint=request.financial_archive_fingerprint,
+                validation_repository=ledger,
+                created_at=dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),
+            )
+            if output.get("run"):
+                output["run"] = _validation_run_projection(output["run"])
+            return output
+    except (TypeError, ValueError, KeyError) as exc:
+        reason = str(exc) if str(exc).isidentifier() else "validation_request_invalid"
+        raise HTTPException(status_code=422, detail=reason) from exc
+    except Exception as exc:
+        # Do not expose SQL, filesystem details, paths, or raw exception text.
+        raise HTTPException(status_code=503, detail="validation_inputs_unavailable") from exc
+
+
+@router.get("/experiments/runs")
+def canonical_experiment_runs(
+    limit: int = Query(50, ge=1, le=200),
+    experiment_fingerprint: str | None = Query(None, min_length=64, max_length=64),
+    strategy_id: str | None = Query(None, max_length=80),
+):
+    import experiment_validation_repository as repository
+
+    try:
+        with _experiment_validation_connection(query_only=True) as conn:
+            table = conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='experiment_validation_runs'").fetchone()
+            if not table:
+                runs = []
+            else:
+                repo = object.__new__(repository.ExperimentValidationRepository)
+                repo.conn = conn
+                runs = repo.recent_runs(limit=limit, experiment_fingerprint=experiment_fingerprint,
+                                        strategy_id=strategy_id)
+    except repository.ExperimentValidationPersistenceError as exc:
+        raise HTTPException(status_code=503, detail=exc.args[0]) from exc
+    except FileNotFoundError:
+        return {"status": "ok", "runs": []}
+    except sqlite3.Error as exc:
+        raise HTTPException(status_code=503, detail="validation_history_unavailable") from exc
+    return {"status": "ok", "runs": [_validation_run_projection(item) for item in runs]}
+
+
+@router.get("/experiments/runs/{run_id}")
+def canonical_experiment_run(run_id: str = Path(..., min_length=1, max_length=64)):
+    import experiment_validation_repository as repository
+
+    try:
+        with _experiment_validation_connection(query_only=True) as conn:
+            table = conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='experiment_validation_runs'").fetchone()
+            if not table:
+                run = None
+                repo = None
+            else:
+                repo = object.__new__(repository.ExperimentValidationRepository)
+                repo.conn = conn
+            if repo is None:
+                pass
+            elif run_id.isdecimal():
+                run = repo.get_run(run_id=int(run_id))
+            elif len(run_id) == 64:
+                run = repo.get_run(run_key=run_id)
+            else:
+                raise HTTPException(status_code=422, detail="exact_validation_run_identity_required")
+    except repository.ExperimentValidationPersistenceError as exc:
+        raise HTTPException(status_code=503, detail=exc.args[0]) from exc
+    except FileNotFoundError:
+        run = None
+    except sqlite3.Error as exc:
+        raise HTTPException(status_code=503, detail="validation_history_unavailable") from exc
+    if run is None:
+        raise HTTPException(status_code=404, detail="validation_run_not_found")
+    return {"status": "ok", "run": _validation_run_projection(run)}
 
 
 @router.post("/ai/analyze")

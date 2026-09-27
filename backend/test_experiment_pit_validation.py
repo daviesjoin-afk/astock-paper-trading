@@ -178,6 +178,13 @@ class PITValidationTests(unittest.TestCase):
         self.assertEqual("blocked", evidence.dimensions["historical_universe"]["status"])
         self.assertEqual(0, evidence.dimensions["historical_universe"]["coverage"]["sessions_proven"])
 
+    def test_R29_04b_caller_universe_claim_is_not_an_archive_owner(self):
+        rows, source = _universe()
+        detail, _members, _report = PV._universe(
+            _spec(), rows, source, _sessions(), session_calendar_complete=True,
+        )
+        self.assertEqual("blocked", detail["status"])
+
     def test_R29_05_caller_calendar_claim_cannot_prove_historical_universe(self):
         rows, source = _universe()
         evidence = _evaluate(
@@ -250,7 +257,8 @@ class PITValidationTests(unittest.TestCase):
             },
             "sample_keys": ["sample-1"],
         }])
-        self.assertEqual(1, evidence.data_coverage["fundamental"]["future"])
+        self.assertEqual("financial_feature_evidence_missing",
+                         evidence.dimensions["fundamental_pit"]["reason_code"])
         self.assertEqual("blocked", evidence.dimensions["fundamental_pit"]["status"])
 
     def test_R29_12_missing_publication_is_blocked_in_strict_mode(self):
@@ -258,7 +266,8 @@ class PITValidationTests(unittest.TestCase):
             "record": {"report_period": "2025-12-31", "eps": 0.1},
             "sample_keys": ["sample-1"],
         }])
-        self.assertEqual(1, evidence.data_coverage["fundamental"]["publication_unproven"])
+        self.assertEqual("financial_feature_evidence_missing",
+                         evidence.dimensions["fundamental_pit"]["reason_code"])
 
     def test_R29_12b_invalid_publication_metadata_has_its_own_bucket(self):
         evidence = _evaluate(fundamental_records=[{
@@ -267,7 +276,8 @@ class PITValidationTests(unittest.TestCase):
             },
             "sample_keys": ["sample-1"],
         }])
-        self.assertEqual(1, evidence.data_coverage["fundamental"]["invalid"])
+        self.assertEqual("financial_feature_evidence_missing",
+                         evidence.dimensions["fundamental_pit"]["reason_code"])
 
     def test_R29_13_dataset_fingerprint_mismatch_blocks(self):
         evidence = _evaluate(dataset_manifest={"dataset_fingerprint": "1" * 64})
@@ -473,8 +483,9 @@ class PITValidationTests(unittest.TestCase):
             "sample_keys": [sample.sample_key for sample in samples],
         }]
         evidence = _evaluate(fundamental_records=early_filed)
-        self.assertEqual("proven", evidence.dimensions["fundamental_pit"]["status"])
-        self.assertEqual(6, evidence.data_coverage["fundamental"]["visible"])
+        self.assertEqual("blocked", evidence.dimensions["fundamental_pit"]["status"])
+        self.assertEqual("financial_feature_evidence_missing",
+                         evidence.dimensions["fundamental_pit"]["reason_code"])
 
         late_filed = [{
             "record": {
@@ -485,13 +496,15 @@ class PITValidationTests(unittest.TestCase):
         }]
         evidence = _evaluate(fundamental_records=late_filed)
         self.assertEqual("blocked", evidence.dimensions["fundamental_pit"]["status"])
-        self.assertEqual(6, evidence.data_coverage["fundamental"]["future"])
+        self.assertEqual("financial_feature_evidence_missing",
+                         evidence.dimensions["fundamental_pit"]["reason_code"])
 
         unlinked = _evaluate(fundamental_records=[{
             "record": late_filed[0]["record"], "sample_keys": ["missing-sample"],
         }])
         self.assertEqual("blocked", unlinked.dimensions["fundamental_pit"]["status"])
-        self.assertEqual(1, unlinked.data_coverage["fundamental"]["invalid"])
+        self.assertEqual("financial_feature_evidence_missing",
+                         unlinked.dimensions["fundamental_pit"]["reason_code"])
 
     def test_R29_32_caller_calendar_claim_never_creates_authoritative_proof(self):
         forged_claim = _calendar_provenance(
@@ -526,7 +539,8 @@ class PITValidationTests(unittest.TestCase):
                 "sample_keys": [sample.sample_key],
             }],
         )
-        self.assertEqual(1, evidence.data_coverage["fundamental"]["future"])
+        self.assertEqual("financial_feature_evidence_missing",
+                         evidence.dimensions["fundamental_pit"]["reason_code"])
         self.assertEqual("blocked", evidence.dimensions["fundamental_pit"]["status"])
 
         date_only = _evaluate(
@@ -539,7 +553,8 @@ class PITValidationTests(unittest.TestCase):
                 "sample_keys": [sample.sample_key],
             }],
         )
-        self.assertEqual(1, date_only.data_coverage["fundamental"]["publication_unproven"])
+        self.assertEqual("financial_feature_evidence_missing",
+                         date_only.dimensions["fundamental_pit"]["reason_code"])
         self.assertEqual("blocked", date_only.dimensions["fundamental_pit"]["status"])
 
         canonical = LD.CanonicalSample(
@@ -562,7 +577,8 @@ class PITValidationTests(unittest.TestCase):
                 "sample_keys": [canonical.sample_key],
             }],
         )
-        self.assertEqual(1, canonical_evidence.data_coverage["fundamental"]["future"])
+        self.assertEqual("financial_feature_evidence_missing",
+                         canonical_evidence.dimensions["fundamental_pit"]["reason_code"])
 
     def test_R29_34_fundamental_pit_requires_exact_decision_instant(self):
         for decision_at in (None, "2026-01-05"):
@@ -583,8 +599,13 @@ class PITValidationTests(unittest.TestCase):
                         "sample_keys": [sample.sample_key],
                     }],
                 )
-                self.assertEqual(1, evidence.data_coverage["fundamental"]["publication_unproven"])
+                self.assertEqual("financial_feature_evidence_missing",
+                                 evidence.dimensions["fundamental_pit"]["reason_code"])
                 self.assertEqual("blocked", evidence.dimensions["fundamental_pit"]["status"])
+
+    def test_R29_35_decision_instant_is_normalized_to_utc(self):
+        self.assertEqual("2026-01-01T07:30:00+00:00",
+                         PV._decision_instant("2026-01-01T15:30:00+08:00"))
 
     def test_R29_24_no_clock_or_latest_fallback(self):
         source = Path(BACKEND, "experiment_pit_validation.py").read_text(encoding="utf-8")
@@ -638,13 +659,20 @@ class PITValidationTests(unittest.TestCase):
             )
         reused = (
             ("G-R29-07 universe", "historical_universe"),
-            ("G-R29-08 tradability", "tradability_at"),
-            ("G-R29-09 financial", "financial_visibility"),
             ("G-R29-10 walk-forward", "build_walk_forward_folds"),
         )
         for label, call in reused:
             with self.subTest(label=label):
                 self.assertIn(call, calls)
+        with self.subTest(label="G-R29-09 financial owner visibility"):
+            import financial_feature_evidence as financial_owner
+            owner_calls = {node.func.attr for node in ast.walk(ast.parse(
+                __import__("inspect").getsource(financial_owner)))
+                if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)}
+            self.assertIn("financial_visibility", owner_calls)
+        with self.subTest(label="G-R29-08 tradability owner evaluator"):
+            self.assertIn("TA.TradabilityArchiveRepository", source)
+            self.assertIn("coverage_projection", source)
         with self.subTest(label="G-R29-11 no promotion state"):
             self.assertFalse({"approved", "promotable", "champion"} & {
                 node.value.lower() for node in ast.walk(tree) if isinstance(node, ast.Constant)

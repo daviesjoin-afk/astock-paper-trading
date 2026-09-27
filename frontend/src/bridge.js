@@ -5,6 +5,7 @@
    由 backend/test_frontend_module_contract.py 校验覆盖率。 */
 
 import { adaptiveEsc } from "./core/format.js";
+import { compareAdaptiveValidationRun, openAdaptiveValidationRun, refreshAdaptiveValidationRuns, submitAdaptiveValidation } from "./features/adaptive.js";
 import { activatePage, refreshApp, showPaperWorkspace, toggleDark } from "./core/navigation.js";
 import { applyAdaptiveRiskCandidate, applyAdaptiveSelectionCandidate, approveAdaptiveNeural, loadAdaptive, loadEvolutionStatus, openAdaptiveResearchRun, recordAdaptiveFeedback, refreshAdaptiveResearchHistory, refreshAdaptiveTimelineNow, retryAdaptiveAiWindow, rollbackAdaptiveRebalance, rollbackAdaptiveRisk, rollbackAdaptiveSelection, runAdaptive, runAdaptiveAdvisor, runAdaptiveAiTuning, runAdaptiveResearchSuite, runAdaptiveResearchTask, runDualAiTuning, runNewsLearning, setAdaptiveSection, switchToAdaptiveAI, testModlensRead, triggerEvolution } from "./features/adaptive.js";
 import { loadPaperExecution, verifyExecutionOrder } from "./features/execution.js";
@@ -42,6 +43,10 @@ window.loadSelectionEvaluation = loadSelectionEvaluation;
 window.loadStrategyWorkbench = loadStrategyWorkbench;
 window.openInStrategyWorkbench = openInStrategyWorkbench;
 window.openAdaptiveResearchRun = openAdaptiveResearchRun;
+window.openAdaptiveValidationRun = openAdaptiveValidationRun;
+window.compareAdaptiveValidationRun = compareAdaptiveValidationRun;
+window.refreshAdaptiveValidationRuns = refreshAdaptiveValidationRuns;
+window.submitAdaptiveValidation = submitAdaptiveValidation;
 window.pausePaper = pausePaper;
 window.preparePaperSell = preparePaperSell;
 window.previewPaperOrder = previewPaperOrder;

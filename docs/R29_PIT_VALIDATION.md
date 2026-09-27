@@ -1,52 +1,67 @@
-# R29-A — Point-in-Time Validation Gate & Validation Evidence
+# R29 — Canonical Point-in-Time Validation Lab
 
 ## 阶段状态
 
 | 阶段 | 状态 | 边界 |
 | --- | --- | --- |
-| R28-A | COMPLETE | 固定实验 identity 和 result contract；没有 runner。 |
-| R29-A | IN PROGRESS | 建立 fail-closed PIT 输入证据与 READY/BLOCKED gate；以 exact-head PR 状态为准。 |
-| R29 canonical runner | NOT STARTED / DEFERRED | 尚无 canonical 历史执行与持久化 read model。 |
-| R30 | NOT STARTED | 本阶段不涉及 robustness。 |
+| R28-A | COMPLETE | 固定不可变 Experiment identity 和 canonical result contract。 |
+| R29-A | COMPLETE | PR #212 提供 fail-closed PIT evidence gate。 |
+| R29-FINAL | COMPLETE | 增加 canonical archives、validation runner、append-only ledger、API 与 Research Workspace consumer。 |
+| R30 | NOT STARTED | 不包含 robustness、扰动实验或策略晋级。 |
 
-`READY` 只表示已有 PIT 输入足以进入未来 canonical validation runner，不表示策略有效、可晋级或可上线。
-`BLOCKED` 表示输入证据不足；它不产生零收益、零回撤或零交易数。
+`R29 = COMPLETE` 表示代码具备完整、可复核的 authority path；不表示本地已经装有覆盖所有历史日期的市场、证券或财务数据。缺少归档或 PIT 证据的具体 run 仍返回 `unavailable` / `BLOCKED`，绝不补零或回退到当前数据。
 
-## R29 PIT input authority matrix
+## R29 canonical authority matrix
 
-| DIMENSION | DECLARED IDENTITY | FACT OWNER | PIT AVAILABILITY OWNER | CURRENT HISTORICAL COVERAGE | CAN PROVE R29? | CURRENT FALLBACK | R29-A TREATMENT |
+| Dimension | Declared identity | Canonical owner | Immutable? | PIT provenance / coverage | Runner consumer | Current or legacy surface | Final treatment |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| Historical universe | `ExperimentSpec.universe_fingerprint` | `universe` rows / future archive source | 每个实验 session 调用 `point_in_time.historical_universe` | 当前 `universe.json` 是 current snapshot；未发现完整历史成分归档 owner | 当前不能证明完整历史成分；只有 `historical_archive`、严格 complete 标志且 archive as-of 覆盖每个请求 session 才可通过 validator | current universe 和逐行 `list_date` 均不能补足源级完整性 | BLOCKED / REQUIRED |
-| Historical tradability | `ExperimentSpec.tradability_fingerprint` | `TradabilityArchiveRepository` | `evidence_at` + `tradability_at` | 有双时态逐条事实，没有实验级完整覆盖清单；只请求对应 session 历史 universe 中的证券 | 仅在请求集合有完整 owner-visible facts 时可证明该集合；available、blocked、unknown 是互斥桶，缺失或未知阻断 | 不读取当前 ST、停牌、上市、成交量或涨跌停状态 | REUSE EXISTING OWNER |
-| Market data PIT | `ExperimentSpec.market_data_fingerprint` | R24 market snapshot owner | `market_data_service.read_snapshot` / `market_data_contract.classify` | 只拥有当前持久化 full-market snapshot，不拥有任意历史日线归档 | 当前不能证明历史市场数据；SHA/as-of 声明不是来源或 coverage 证据 | 不把当前 snapshot 倒灌到历史；不 refresh、不联网补数 | BLOCKED / REQUIRED |
-| Fundamental PIT | dataset 的精确 manifest identity | 输入财务记录来源及其 sample linkage | `financial_point_in_time.financial_visibility` | owner 可判定显式记录的发布时间；缺披露时间的当前财务 endpoint 不能证明过去可见 | 每条记录必须列明它实际用于哪些 `sample_key`；validator 以对应 sample 的精确 `decision_at`（canonical sample 使用 `feature_available_at`）判定发布时间，不用日期或最终 experiment cutoff 代替 | report period 不代替 publication time；决策时点不精确、同日披露只有日期、发布时间晚于决策时点、缺失或非法时 fail closed | REUSE EXISTING VALIDATOR |
-| Strategy version | `strategy_id + version + checksum` | `strategy_registry.StrategyVersion` | exact version record | immutable version rows 可按显式 identity 核对 | 三字段全部与 ExperimentSpec 匹配时可证明 pinned identity | 禁止省略 version 读取 current head | REUSE EXISTING OWNER |
-| Dataset | `ExperimentSpec.dataset_fingerprint` | `learning_dataset` manifest | `read_manifest(conn, fingerprint)` / exact supplied manifest | append-only manifest 可按 fingerprint 查询；`created_at` 不是 identity | 仅 manifest fingerprint 与 spec 精确匹配时可证明绑定 | 禁止 latest / `MAX(created_at)` fallback | REUSE EXISTING OWNER |
-| Execution model | `ExperimentSpec.execution_assumptions` | ExperimentSpec caller boundary | R28 contract validation | 假设快照已显式固定；尚无 canonical runner 证明实际执行与声明相同 | 可证明声明字段完整；未来 runner 必须比对实际执行，偏离即 fail closed | 不读 current execution profile 或 paper 配置 | PROVEN |
-| Cost model | `ExperimentSpec.cost_model`：费率、最低佣金、印花税、slippage model/parameters、version | ExperimentSpec caller boundary | R28 contract validation | 假设已显式固定；尚无 canonical cost executor | 可证明声明字段完整；不能宣称已执行成本模拟 | 不读 backtest 或 paper 全局常量 | PROVEN |
-| Walk-forward | `ExperimentSpec` date range + as-of；显式 sessions | 尚无已接入的 owner-issued 完整历史 session calendar projection | `walk_forward_validation.build_walk_forward_folds` | 日历 owner 不存在；caller 提供的 Mapping 只能作为诊断声明 | session calendar、historical universe、tradability 与 walk-forward 均保持 BLOCKED，直到真实 owner 签发 typed、覆盖完整区间的证据；范围内显式 sessions 仍可用于 splitter 诊断，不能证明完整区间 | 不从 samples、caller 声明或当前日历推断完整性；不使用 wall clock | BLOCKED / REQUIRED |
-| Legacy backtest | 无 canonical PIT identity | `backend/backtest.py` | 无 | 使用 current cached K-line、data fetcher 与 current strategy assumptions | 不能证明 R29 canonical PIT execution | 维持 legacy 行为边界 | LEGACY NON-CANONICAL |
+| Historical market | `ExperimentSpec.market_data_fingerprint` | `HistoricalMarketArchiveRepository` | 是；manifest 与 bars append-only，按 raw 内容寻址 | 明确 source/revision；有限日期和证券范围读取；缺 bar 需逐 session 的 tradability 事实解释 | PIT gate 与 deterministic replay | current K-line、qfq cache 不进入 canonical archive | CANONICAL OWNER |
+| Session calendar | `validation_calendar_fingerprint` | `historical_session_calendar.issue_from_market_archive` | 是；projection 由 exact raw benchmark archive 派生 | typed owner-issued projection，含完整请求范围、session list、来源 archive 和内容 hash | PIT gate 与唯一 walk-forward splitter | live/chinese calendar 不作历史 authority | CANONICAL OWNER |
+| Historical universe | `ExperimentSpec.universe_fingerprint` | `HistoricalUniverseArchiveRepository` | 是；manifest 与 security master rows append-only | exact manifest 覆盖日期范围；逐 session 通过 `point_in_time.historical_universe` 求成员 | PIT gate 与 replay membership | `universe.json` 仍是 current snapshot | CANONICAL OWNER |
+| Tradability | `ExperimentSpec.tradability_fingerprint` | 既有 `TradabilityArchiveRepository` | 是；复用现有 owner | `coverage_projection` 将 available / blocked / unknown 分桶；unknown 大于 0 时阻断 | PIT gate 与执行模型 | current 状态不回填过去 | REUSE EXISTING OWNER |
+| Fundamental PIT | dataset fingerprint + financial archive fingerprint + sample/field evidence refs | `HistoricalFinancialArchiveRepository` 保存披露记录；`FinancialFeatureEvidenceRepository` 绑定 feature、sample、输入记录、派生版本和值 | 是；archive 与 evidence append-only | 复用 `financial_point_in_time.financial_visibility`；按精确 decision instant；feature refs 纳入 dataset fingerprint；旧 dataset 不回填 | PIT gate 与 financial DSL snapshot | caller record、通用 `pit_status`、current financial endpoint 均无 authority | CANONICAL OWNER |
+| Strategy | `strategy_id + version + checksum` | `strategy_registry.StrategyVersion` + immutable DSL AST | 是 | exact identity 三项匹配；只执行版本化 DSL AST | dependency analysis 与 DSL evaluator | current `strategies.py` implementation 不作历史回放 | CANONICAL CONSUMER |
+| Dataset | `ExperimentSpec.dataset_fingerprint` | `learning_dataset` manifest | 是 | exact manifest fingerprint；financial lineage refs 属于 identity | PIT gate 与 runner | 禁止 latest/current fallback | CANONICAL CONSUMER |
+| Walk-forward | ExperimentSpec date range + explicit as-of | `walk_forward_validation.build_walk_forward_folds` | 确定性投影 | 只消费 owner-issued sessions；保留 label availability purge 和 session embargo | runner | 不创建第二套 splitter | REUSE EXISTING OWNER |
+| Execution / cost | ExperimentSpec pinned assumptions and cost model | `experiment_execution_model` interprets declared assumptions | 结果确定且由 spec 固定 | next-open、T+1、历史 tradability、volume capacity、commission、tax、slippage 均来自精确 spec/archives | runner | production execution authority 仍是 R26；不读 paper runtime config 或 `backtest.py` 常量 | CANONICAL CONSUMER |
+| Run ledger | experiment fingerprint + exact owner identities + runner version | `ExperimentValidationRepository` | 是；同 key 同 payload 幂等，不同 payload 冲突 | append-only; corrupt JSON/hash fails closed | API list/detail | 不覆盖或替换 canonical result | CANONICAL OWNER |
+| API / UI | exact ExperimentSpec and archive identities | adaptive canonical experiment routes + Research Workspace | ledger-backed | POST offline；GET 不运行实验；UI 显示 backend status、period、windows、coverage、warnings 与 result | operator read/submit surface | 不使用 legacy backtest projection，不排序或晋级策略 | CANONICAL CONSUMER |
 
-## Evidence contract
+## Canonical chain and fail-closed semantics
 
-`backend/experiment_pit_validation.py` 组合以上现有 owner，输出唯一顶层 frozen contract `PITValidationEvidence`。
-九个维度分别记录 `status`、稳定 `reason_code`、`declared_identity`、`provenance_status` 和 coverage。
-身份声明和来源证明分开保存；有效 SHA 本身不能把维度改成 `proven`。
+```text
+exact ExperimentSpec and immutable identities
+  → market / calendar / universe / tradability / financial owners
+  → PITValidationEvidence
+  → pinned strategy DSL + declared execution model
+  → ExperimentResult
+  → append-only experiment_validation_runs
+  → canonical API
+  → Research Workspace
+```
 
-当前没有可接入的 owner-issued 历史 session calendar projection。`session_calendar_provenance` 中 caller 自报的 `kind`、来源、覆盖范围、`range_complete` 和 session count 仅供诊断，不能签发 authority。session calendar、universe、tradability 和 walk-forward 因此保持 BLOCKED / REQUIRED；裁进日期范围内的少数 sessions 也不能代表完整实验范围。
+- Raw market import 拒绝 qfq/adjusted data；ingestion 与 experiment execution 分离。runner 不联网、不调用 provider，也不刷新历史。
+- Calendar 只能从 exact raw benchmark archive 签发 typed projection；caller Mapping、samples、weekday guess、current calendar 不能声明完整历史范围。
+- Universe 证明必须经过 exact historical archive owner；caller 提供的 membership rows/source mapping 不能签发 universe proof。历史退市股票在其真实有效范围内保留。
+- Fundamental observations 必须来自归档 owner，并绑定实际 `sample_key`、feature、精确 decision instant、输入披露和 derivation version。date-only decision 不证明盘中时点；同日日期粒度披露对盘中决策 fail closed。
+- 只有 required PIT dimensions 全部 proven 且至少一个 walk-forward fold ready，runner 才开始 replay；否则 result 为 `unavailable`，无性能指标。
+- `failed` 表示 deterministic replay 真正执行后失败；`unavailable` 表示身份、owner 或 PIT 输入不足。unknown 不转成 0。
+- Ledger key 确定性绑定 Experiment、archive identities、strategy、dataset、evidence 与 runner version；`created_at` 不进入身份。
+- 前端只显示 canonical backend semantics。不存在 approval、promotable、champion、winner 或单一 magic score。
 
-`fundamental_records` 使用 `{record, sample_keys}` 关联结构。每个关联按对应样本的精确 `decision_at`（`CanonicalSample` 使用 `feature_available_at`）调用 `financial_visibility`；日期粒度或缺失时点不能证明盘中可见性。财报同日披露只有日期时，盘中决策保持不可证明；没有对应样本或关联缺失也保持 BLOCKED。最终 experiment cutoff 只用于实验评估时点，不用于替代历史样本的信息可见时点。
+## API and Research Workspace
 
-READY 要求所有 required dimensions 均 proven，并且至少有一个 ready walk-forward fold。整体 reason codes 稳定排序；
-universe、tradability、market data、fundamental、labels 分开报告覆盖。只有 denominator 明确时才提供 ratio，未知覆盖保持 `null`。
-报告投影已经包含 train、validation、OOS periods、fold windows、coverage 和 PIT warnings，供未来 read model 使用。
+- `POST /api/adaptive/experiments/validate`：只接收 exact ExperimentSpec、owner fingerprints 和 walk-forward 配置；offline execution。
+- `GET /api/adaptive/experiments/runs`：限制最多 200 条，按 append order 读取。
+- `GET /api/adaptive/experiments/runs/{run_id}`：只查 ledger；corrupt rows fail closed。
+- Research Workspace 可查看 Experiment / Run / Evidence / Result，并比较两条持久化 run；显示 code revision、dataset/archive fingerprints、Train / Validation / OOS、walk-forward windows、每类 data coverage 与 PIT warnings。
+- 未知指标显示 unavailable；UI 不推断成功或晋级，也不把 unavailable 渲染成 0。
 
-当前 market-data 历史归档和 owner-issued 完整 session calendar 都缺失，所以当前真实数据下 gate 会 fail closed。caller-provided calendar metadata 不构成完整性证明。
-Frontend consumer deferred until canonical R29 run/read model exists；没有删除 roadmap capability，也没有伪造 experiment 页面。
+## 数据准备不等于能力缺失
 
-## 保留的 OPEN / REQUIRED
+下面这些情况仍可使某一场实验 `BLOCKED / unavailable`，但不影响 R29 代码能力完成：raw benchmark archive 缺失或覆盖有缺口、historical security master 未导入、tradability facts 不完整、指定金融字段没有可见的历史披露记录、指定 dataset 没有带金融 lineage refs。所有情形继续 fail closed。
 
-下列问题不因 R27 / R28 / R29-A 完成而自动关闭；缺少可证明证据时继续 fail closed：
+以下相邻阶段问题继续按各自 owner 管理，不由 R29 自动关闭：
 
 - adaptive killed terminal instant
 - non-intraday paper job stable attempt identity
@@ -55,13 +70,7 @@ Frontend consumer deferred until canonical R29 run/read model exists；没有删
 - alpha candidate stable identity
 - historical mutable candidate revisions
 - parameter/experiment linkage
-- historical market evidence gaps
 - historical cycle membership
-- physical DB origin / trusted provenance
-- historical universe archive completeness
-- historical market-data archive/provenance
-- historical tradability experiment-wide completeness
-- fundamental source historical coverage
+- physical DB origin / trusted provenance outside the R29 archive import boundary
 
-本阶段不改 `backtest.py`，不创建 runner、API、数据库迁移或 frontend capability，不新增 manager/service/facade/framework，
-不做 promotion、AI scoring、联网历史回填、R29-B、R30 或 deployment。
+R29 不修改 legacy `backend/backtest.py`，不做 R30 robustness、bull/bear stress、cost shock、parameter/date/universe perturbation、strategy selection/promotion、AI scoring、paper promotion、真实交易、broker 或 deployment。
