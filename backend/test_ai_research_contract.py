@@ -164,6 +164,14 @@ ALLOWED_AI_CONSUMERS: set[str] = {
     #: 一条同时认识这几套词表的接缝，并且只能是**一条**。它同样是**零 production 调用点**的
     #: 能力交付（candidate_challenge / overfit_watch runtime 迁移属于后续 convergence）。
     "ai_research_strategy_adapter.py",
+    #: R27-B2C-7 新增**第九个**：``ai_research_runtime_adapter`` —— runtime / incident
+    #: 事实的 owner adapter。它与 execution / portfolio / news / strategy 那四份同构：
+    #: 两个 owner（``adaptive_engine`` 的 ``adaptive_runs``、``paper_trading`` 的
+    #: ``paper_job_runs``）都不得 import research，research 契约也不得 import 任何
+    #: DB-backed owner，因此必须有一条同时认识这几套词表的接缝，并且只能是**一条**。
+    #: 它同样是**零 production 调用点**的能力交付（``incident_triage`` runtime 迁移属于
+    #: 后续 convergence）。
+    "ai_research_runtime_adapter.py",
 }
 
 #: 时钟 / 随机数 / IO —— 研究契约一旦读它们，就能拿 current state 回填历史。
@@ -454,6 +462,7 @@ class AiResearchFactTests(unittest.TestCase):
             (ARC.EVIDENCE_SOURCE_STRATEGY_RESEARCH, ARC.EVENT_STRATEGY_RESEARCH_OBSERVED),
             (ARC.EVIDENCE_SOURCE_PORTFOLIO_RESEARCH, ARC.EVENT_PORTFOLIO_RESEARCH_OBSERVED),
             (ARC.EVIDENCE_SOURCE_NEWS, ARC.EVENT_NEWS_OBSERVED),
+            (ARC.EVIDENCE_SOURCE_RUNTIME_INCIDENT, ARC.EVENT_RUNTIME_INCIDENT_OBSERVED),
         ):
             with self.subTest(source_type=source_type):
                 self.assertEqual(expected, ARC._KIND_BY_SOURCE_TYPE[source_type])
@@ -1296,9 +1305,10 @@ class OwnerNativeVerificationTests(unittest.TestCase):
                 ARC.EVIDENCE_SOURCE_PORTFOLIO_RESEARCH,
                 ARC.EVIDENCE_SOURCE_NEWS,
                 ARC.EVIDENCE_SOURCE_STRATEGY_RESEARCH,
+                ARC.EVIDENCE_SOURCE_RUNTIME_INCIDENT,
             }),
             ARC.SUPPORTED_OWNER_ADAPTERS,
-            "已批准的 owner adapter registry 与 B2C-3 / B2C-4B / B2C-5 / B2C-6 的范围不一致",
+            "已批准的 owner adapter registry 与 B2C-3 ~ B2C-7 的范围不一致",
         )
         self.assertFalse(hasattr(ARC, "_OWNER_ISSUED"),
                          "不得存在可 import 的构造哨兵（那是伪安全）")
