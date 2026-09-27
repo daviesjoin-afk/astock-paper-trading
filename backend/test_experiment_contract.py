@@ -151,6 +151,17 @@ class ExperimentSpecTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             _spec(cost_model={"commission_rate": 0})
 
+    def test_EXP_28_equivalent_numeric_spellings_have_one_identity(self):
+        first = _spec(parameter_set={"integer": 1, "negative_zero": -0.0})
+        second = _spec(parameter_set={"integer": 1.0, "negative_zero": 0}, cost_model={
+            "commission_rate": 0.0001,
+            "minimum_commission": 0.0,
+            "stamp_duty_rate": 0.0005,
+            "slippage_model": "fixed-rate-v1",
+            "version": "cn-equity-cost-v1",
+        })
+        self.assertEqual(first.fingerprint, second.fingerprint)
+
 
 class ExperimentResultTests(unittest.TestCase):
     def test_EXP_18_completed_result_requires_core_metrics(self):
@@ -218,6 +229,36 @@ class ExperimentResultTests(unittest.TestCase):
         fingerprint = result.result_fingerprint
         data["bull"][0]["count"] = 9
         self.assertEqual(fingerprint, result.result_fingerprint)
+
+    def test_EXP_29_nested_identity_labels_are_normalized_before_storage(self):
+        spec = _spec(
+            asof_policy={"policy_id": " pit-close-v1 ", "cutoff": " 2026-03-31T15:00:00+08:00 "},
+            execution_assumptions={
+                "execution_profile_version": " execution-profile-v3 ",
+                "fill_assumptions": {"fill_price": "next_open", "priority": "price_time"},
+                "t_plus_one_semantics": " sell_after_next_session ",
+                "price_limit_semantics": " exchange_limit_rules-v1 ",
+                "partial_fill_semantics": " record_unfilled_remainder ",
+                "capacity_assumptions": {"participation_rate": 0.05},
+            },
+            cost_model={
+                "commission_rate": 0.0001,
+                "minimum_commission": 0,
+                "stamp_duty_rate": 0.0005,
+                "slippage_model": " fixed-rate-v1 ",
+                "version": " cn-equity-cost-v1 ",
+            },
+        )
+        self.assertEqual("pit-close-v1", spec.asof_policy["policy_id"])
+        self.assertEqual("execution-profile-v3", spec.execution_assumptions["execution_profile_version"])
+        self.assertEqual("sell_after_next_session", spec.execution_assumptions["t_plus_one_semantics"])
+        self.assertEqual("fixed-rate-v1", spec.cost_model["slippage_model"])
+        self.assertEqual(_spec().fingerprint, spec.fingerprint)
+
+    def test_EXP_30_explicit_falsy_result_fingerprints_fail_closed(self):
+        for value in (None, False, 0, "", {}, []):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                _completed(result_fingerprint=value)
 
 
 class ExperimentArchitectureTests(unittest.TestCase):

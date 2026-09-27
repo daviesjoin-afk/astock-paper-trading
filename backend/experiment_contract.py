@@ -5,7 +5,7 @@ state. Callers must supply every identity and assumption explicitly.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field as dataclass_field
 from datetime import date, datetime
 import hashlib
 import json
@@ -29,6 +29,7 @@ _REQUIRED_COMPLETED_METRICS = (
 _COST_FIELDS = (
     "commission_rate", "minimum_commission", "stamp_duty_rate", "slippage_model", "version",
 )
+_UNSET_RESULT_FINGERPRINT = object()
 _EXECUTION_FIELDS = (
     "execution_profile_version", "fill_assumptions", "t_plus_one_semantics",
     "price_limit_semantics", "partial_fill_semantics", "capacity_assumptions",
@@ -64,6 +65,8 @@ def _freeze_json(value: Any, *, path: str = "value") -> Any:
     if isinstance(value, float):
         if not math.isfinite(value):
             raise ValueError(f"{path} must contain only finite numbers")
+        if value.is_integer():
+            return int(value)
         return value
     if isinstance(value, Mapping):
         frozen = {}
@@ -129,6 +132,8 @@ def _finite_number(value: Any, *, name: str) -> int | float:
         raise ValueError(f"{name} must be a finite number")
     if isinstance(value, float) and not math.isfinite(value):
         raise ValueError(f"{name} must be a finite number")
+    if isinstance(value, float) and value.is_integer():
+        return int(value)
     return value
 
 
@@ -211,28 +216,37 @@ class ExperimentSpec:
             raise ValueError("parameter_set must be an explicit JSON-like object")
         object.__setattr__(self, "parameter_set", parameter_set)
         asof = _required_mapping(self.asof_policy, name="asof_policy", fields=("policy_id", "cutoff"))
-        _explicit_label(asof["policy_id"], name="asof_policy.policy_id")
         normalized_asof = dict(asof)
+        normalized_asof["policy_id"] = _explicit_label(
+            asof["policy_id"], name="asof_policy.policy_id",
+        )
         normalized_asof["cutoff"] = _asof_cutoff(asof["cutoff"])
         asof = _freeze_json(normalized_asof, path="asof_policy")
         object.__setattr__(self, "asof_policy", asof)
         execution = _required_mapping(
             self.execution_assumptions, name="execution_assumptions", fields=_EXECUTION_FIELDS,
         )
+        normalized_execution = dict(execution)
         for field in ("execution_profile_version", "t_plus_one_semantics",
                       "price_limit_semantics", "partial_fill_semantics"):
-            _explicit_label(execution[field], name=f"execution_assumptions.{field}")
+            normalized_execution[field] = _explicit_label(
+                execution[field], name=f"execution_assumptions.{field}",
+            )
         for field in ("fill_assumptions", "capacity_assumptions"):
             if not isinstance(execution[field], Mapping) or not execution[field]:
                 raise ValueError(f"execution_assumptions.{field} must be a non-empty object")
+        execution = _freeze_json(normalized_execution, path="execution_assumptions")
         object.__setattr__(self, "execution_assumptions", execution)
         cost = _required_mapping(self.cost_model, name="cost_model", fields=_COST_FIELDS)
+        normalized_cost = dict(cost)
         for field in ("commission_rate", "minimum_commission", "stamp_duty_rate"):
             amount = _finite_number(cost[field], name=f"cost_model.{field}")
             if amount < 0:
                 raise ValueError(f"cost_model.{field} must be >= 0")
+            normalized_cost[field] = amount
         for field in ("slippage_model", "version"):
-            _explicit_label(cost[field], name=f"cost_model.{field}")
+            normalized_cost[field] = _explicit_label(cost[field], name=f"cost_model.{field}")
+        cost = _freeze_json(normalized_cost, path="cost_model")
         object.__setattr__(self, "cost_model", cost)
 
     def projection(self) -> dict[str, Any]:
@@ -280,7 +294,7 @@ class ExperimentResult:
     regime_breakdown: Mapping[str, Any] | None = None
     data_coverage: int | float | None = None
     failure_reason: str | None = None
-    result_fingerprint: str = ""
+    result_fingerprint: Any = dataclass_field(default=_UNSET_RESULT_FINGERPRINT, repr=False)
 
     def __post_init__(self) -> None:
         experiment_fingerprint = _text(self.experiment_fingerprint, name="experiment_fingerprint")
@@ -338,9 +352,13 @@ class ExperimentResult:
 
         expected = _digest(self.projection(include_fingerprint=False))
         supplied = self.result_fingerprint
-        if supplied and supplied != expected:
-            raise ValueError("result_fingerprint does not match the canonical result")
-        object.__setattr__(self, "result_fingerprint", expected)
+        if supplied is _UNSET_RESULT_FINGERPRINT:
+            object.__setattr__(self, "result_fingerprint", expected)
+        else:
+            if not isinstance(supplied, str) or not _SHA256_PATTERN.fullmatch(supplied):
+                raise ValueError("result_fingerprint must be a lowercase SHA-256 hex digest")
+            if supplied != expected:
+                raise ValueError("result_fingerprint does not match the canonical result")
 
     def projection(self, *, include_fingerprint: bool = True) -> dict[str, Any]:
         value = {
