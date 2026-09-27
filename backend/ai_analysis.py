@@ -47,7 +47,7 @@ def _analysis_business_key(asof_day, window, scope, targets):
 
 
 def ensure_schema(conn):
-    """Create the API/timeline compatibility table; it stores run references only."""
+    """Create the operational API timeline; canonical research remains in its own ledger."""
     conn.executescript(
         """
         CREATE TABLE IF NOT EXISTS adaptive_ai_analysis_runs(
@@ -317,9 +317,8 @@ def run_analysis(connect_factory, paper_db_path, snapshot_paths, provider_module
 
 
 def timeline(connect_factory, limit=40, trade_date=None):
-    """Read operational rows and resolve canonical conclusion references on demand."""
+    """Read operational rows and expose only canonical run references, never conclusions."""
     day = str(trade_date or dt.datetime.now(TZ).date().isoformat())[:10]
-    import ai_research_repository as repository
 
     with connect_factory() as conn:
         ensure_schema(conn)
@@ -331,15 +330,14 @@ def timeline(connect_factory, limit=40, trade_date=None):
         for raw in cursor:
             item = _row_dict(cursor, raw)
             reference = _decode_result(item.get("result"))
-            if reference and reference.get("canonical_run_id"):
-                canonical = repository.get_run(conn, int(reference["canonical_run_id"]))
-                item["canonical_research"] = canonical
-                item["result"] = None
-            elif item.get("result"):
-                # Legacy stored conclusions remain historical display data only.
-                item["canonical_research"] = None
-                item["result"] = None
+            run_id = reference.get("canonical_run_id") if reference else None
+            if isinstance(run_id, bool) or not isinstance(run_id, int) or run_id <= 0:
+                run_id = None
+            item["canonical_run_id"] = run_id
+            if run_id is None and item.get("result"):
+                # Legacy conclusions remain marked as unavailable; never promote or expose them.
                 item["source"] = "legacy_compatibility_history"
+            item["result"] = None
             item["secondary_result"] = None
             rows.append(item)
     return {"status": "ok", "trade_date": day, "runs": rows, "windows": rows}

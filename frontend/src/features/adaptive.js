@@ -60,6 +60,97 @@ function adaptiveResearchResultNotice(payload){
   }).join('')+'</ul>';
 }
 
+export function adaptiveResearchStatusLabel(value){
+  return ({supported:'支持（研究假设）',unsupported:'不支持（研究假设）',insufficient_evidence:'证据不足（研究假设）'})[String(value||'').toLowerCase()]||'未知研究状态';
+}
+
+export function adaptiveResearchConfidencePercent(value){
+  if(value===null||value===undefined) return '—';
+  var number=Number(value);
+  return Number.isFinite(number)&&number>=0&&number<=1?fmt(number*100,0)+'%':'—';
+}
+
+export function adaptiveResearchEvidenceHtml(items){
+  if(!Array.isArray(items)||!items.length) return '<p class="adaptive-research-empty">没有保存可展示的 evidence refs。</p>';
+  return '<div class="adaptive-canonical-evidence-list">'+items.map(function(item){
+    item=item&&typeof item==='object'?item:{};
+    var sourceType=item.source_type||'来源未记录';
+    var sourceId=item.source_id||'ID 未记录';
+    var asOf=item.as_of||'时间未记录';
+    var cross='未记录';
+    if(item.source_type){
+      if(item.source_type!=='market_data') cross='不适用';
+      else if(item.cross_source_verified===true) cross='已确认';
+      else if(item.cross_source_verified===false) cross='未确认';
+    }
+    var verification=item.verification||'未记录';
+    var method=item.verification_method;
+    return '<article class="adaptive-canonical-evidence"><header><b>'+adaptiveEsc(sourceType)+'</b><span>'+adaptiveEsc(item.relation||'引用')+'</span></header>'
+      +'<dl><div><dt>来源 ID</dt><dd>'+adaptiveEsc(sourceId)+'</dd></div><div><dt>业务时间</dt><dd>'+adaptiveEsc(asOf)+'</dd></div>'
+      +'<div><dt>来源核验状态</dt><dd>'+adaptiveEsc(verification)+'</dd></div>'
+      +(method?'<div><dt>核验方法</dt><dd>'+adaptiveEsc(method)+'</dd></div>':'')
+      +'<div><dt>双源核验</dt><dd>'+adaptiveEsc(cross)+'</dd></div></dl></article>';
+  }).join('')+'</div>';
+}
+
+export function adaptiveResearchHistoryHtml(payload){
+  if(!payload||payload.status!=='ok'||!Array.isArray(payload.runs)){
+    return '<p class="adaptive-research-error">研究记录暂时无法读取。请刷新重试；读取失败不会当作没有研究记录。</p>';
+  }
+  if(!payload.runs.length) return '<p class="adaptive-research-empty">当前没有 canonical research runs。</p>';
+  return '<div class="adaptive-canonical-run-list">'+payload.runs.map(function(run){
+    run=run&&typeof run==='object'?run:{};
+    return '<article class="adaptive-canonical-run"><div><b>'+adaptiveEsc(run.purpose||'purpose 未记录')+'</b>'
+      +'<span>'+adaptiveEsc(adaptiveResearchStatusLabel(run.status))+'</span></div>'
+      +'<p>'+adaptiveEsc(run.subject||'subject 未记录')+' · 业务时间 '+adaptiveEsc(run.as_of||'未记录')+'</p>'
+      +'<small>run #'+adaptiveEsc(run.id)+' · 落库 '+adaptiveEsc(run.created_at||'未记录')
+      +' · 置信度 '+adaptiveResearchConfidencePercent(run.confidence)+' · '+adaptiveEsc(run.provider_slot||'provider 未记录')
+      +' / '+adaptiveEsc(run.provider_model||'model 未记录')+'</small>'
+      +'<button class="ghost" onclick="openAdaptiveResearchRun('+Number(run.id||0)+')">查看研究详情</button></article>';
+  }).join('')+'</div><div id="adaptiveCanonicalResearchDetail" class="adaptive-canonical-research-detail"><p class="adaptive-research-empty">选择一条记录查看研究详情与 evidence refs。</p></div>';
+}
+
+export function adaptiveResearchDetailHtml(payload){
+  var run=payload&&payload.run;
+  if(!run||typeof run!=='object') return '<p class="adaptive-research-error">研究详情暂时无法读取。</p>';
+  var hypothesis=run.hypothesis&&typeof run.hypothesis==='object'?run.hypothesis:{};
+  var counters=Array.isArray(run.counter_arguments)?run.counter_arguments:[];
+  return '<article class="adaptive-canonical-detail"><header><div><span>研究假设状态</span><h4>'+adaptiveEsc(adaptiveResearchStatusLabel(run.status))+'</h4></div>'
+    +'<b>run #'+adaptiveEsc(run.id)+'</b></header><p class="adaptive-canonical-boundary">这是历史研究产物，不是当前事实、交易许可、真实性证明或策略批准。</p>'
+    +'<dl><div><dt>Purpose</dt><dd>'+adaptiveEsc(run.purpose||'')+'</dd></div><div><dt>业务时间 as_of</dt><dd>'+adaptiveEsc(run.as_of||'')+'</dd></div>'
+    +'<div><dt>Subject</dt><dd>'+adaptiveEsc(run.subject||'')+'</dd></div><div><dt>Reason</dt><dd>'+adaptiveEsc(run.reason||'—')+'</dd></div>'
+    +'<div><dt>Confidence</dt><dd>'+adaptiveResearchConfidencePercent(run.confidence)+'</dd></div><div><dt>Provider / model</dt><dd>'+adaptiveEsc(run.provider_slot||'—')+' / '+adaptiveEsc(run.provider_model||'—')+'</dd></div>'
+    +'<div><dt>落库时间 created_at</dt><dd>'+adaptiveEsc(run.created_at||'')+'</dd></div><div><dt>Authority</dt><dd>'+adaptiveEsc(run.authority||'research')+' · is_authoritative='+String(run.is_authoritative===true)+'</dd></div></dl>'
+    +(hypothesis.thesis?'<h5>Hypothesis</h5><p>'+adaptiveEsc(hypothesis.thesis)+'</p>':'')
+    +'<h5>研究叙述</h5><p>'+adaptiveEsc(run.narrative||'暂无叙述')+'</p><h5>反方论据</h5>'
+    +(counters.length?'<ul>'+counters.map(function(item){return '<li>'+adaptiveEsc(item)+'</li>';}).join('')+'</ul>':'<p>没有保存反方论据。</p>')
+    +'<h5>Evidence refs</h5>'+adaptiveResearchEvidenceHtml(hypothesis.evidence)+'</article>';
+}
+
+export async function refreshAdaptiveResearchHistory(){
+  var target=$('adaptiveCanonicalResearchHistory');
+  if(!target) return;
+  target.innerHTML='<p class="adaptive-research-empty">正在读取 canonical research runs…</p>';
+  try{
+    var payload=await api('/api/adaptive/research/runs?limit=50&_='+Date.now());
+    target.innerHTML=adaptiveResearchHistoryHtml(payload);
+  }catch(e){
+    target.innerHTML=adaptiveResearchHistoryHtml({status:'error'});
+  }
+}
+
+export async function openAdaptiveResearchRun(runId){
+  var target=$('adaptiveCanonicalResearchDetail');
+  if(!target||!Number.isSafeInteger(Number(runId))||Number(runId)<=0) return;
+  target.innerHTML='<p class="adaptive-research-empty">正在读取研究详情…</p>';
+  try{
+    var payload=await api('/api/adaptive/research/runs/'+encodeURIComponent(String(runId))+'?_='+Date.now());
+    target.innerHTML=adaptiveResearchDetailHtml(payload);
+  }catch(e){
+    target.innerHTML=adaptiveResearchDetailHtml({status:'error'});
+  }
+}
+
 export function adaptiveTimelineRows(payload){
   var root=payload||{}, rows=root.windows||root.rows||root.runs||root.timeline||[];
   if(!Array.isArray(rows)&&rows&&typeof rows==='object') rows=rows.windows||rows.rows||rows.events||[];
@@ -296,21 +387,12 @@ export function renderAdaptive(d){
   var newsSchedule=(newsPolicy.times||['08:15','12:15','18:45']).map(function(t,i){return '<span><b>'+adaptiveEsc(t)+'</b>'+(['盘前','午间','盘后'][i]||'增量')+'</span>';}).join('');
   var majorEvents=(majorRadar.events||[]).slice(0,8).map(function(x){var url=adaptiveSafeUrl(x.source_url),themes=(x.themes||[]).map(function(t){return '<span>'+adaptiveEsc(t.label||t.id)+'</span>';}).join('');return '<li><div class="major-event-score"><b>'+fmt((x.significance_score||0)*100,0)+'</b><small>重要度</small></div><div><b>'+adaptiveEsc(x.title||'重大市场事件')+'</b><p>'+adaptiveEsc(x.event_type)+' · 首次看到 '+adaptiveEsc(String(x.first_seen_at||'').replace('T',' ').slice(5,16))+' · 关联候选 '+Number(x.candidate_links||0)+'</p><div class="major-event-themes">'+themes+'</div></div>'+(url==='#'?'<em>'+adaptiveEsc(x.verification_status||'待核验')+'</em>':'<a href="'+url+'" target="_blank" rel="noopener noreferrer">来源 ↗</a>')+'</li>';}).join('')||'<li class="adaptive-empty-row">尚未捕获达到重大事件阈值的市场新闻。</li>';
   var rebalanceRows=(selectionOpt.active_versions||[]).map(function(x){var version=adaptiveVersionInfo(x);return '<li><div><b>'+adaptiveEsc(x.account_name||x.account_id)+' · '+adaptiveEsc(version.revision)+'</b><p>版本生成：'+adaptiveEsc(version.generated)+' · 开始生效：'+adaptiveEsc(version.effective)+' · '+adaptiveEsc(version.source)+'</p><small>内部编号：'+adaptiveEsc(version.raw)+'。回滚将恢复该策略上一版参数。</small></div><button class="ghost" onclick="rollbackAdaptiveRebalance(\''+adaptiveEsc(x.account_id)+'\')">回滚到上一版</button></li>';}).join('')||'<li class="adaptive-empty-row">当前没有已生效的调仓版本。</li>';
-  var advisorRuns=deepseek.latest_by_purpose||{},advisorLatest=advisorRuns.data_quality||deepseek.latest||{},advisorReport=advisorLatest.report||{},advisorEvidence=advisorLatest.evidence||{},advisorMarket=advisorEvidence.market_snapshot||{},advisorLedger=advisorEvidence.paper_ledger||{},crossSource=advisorMarket.cross_source||{};
   var advisorReady=deepseek.enabled&&deepseek.configured;
-  var advisorState=advisorLatest.status==='completed'?'审阅完成':(advisorLatest.status==='failed'?'最近调用失败':(advisorReady?'已接入 · 等待首次审阅':'未启用'));
+  var advisorState=advisorReady?'已配置 · 可运行研究':'未启用或未配置';
   var aiTuning=deepseek.realtime_tuning||{},aiLatest=aiTuning.latest||{};
   var aiTuningState=aiLatest.status==='applied'?'已同日应用':(aiLatest.status==='hold'?'AI建议维持':(aiLatest.status==='cooldown'?'冷却中':(aiLatest.status||'等待运行')));
-  var severityNames={critical:'严重',high:'高',medium:'中',low:'低',info:'正常'};
-  var advisorFindings=(advisorReport.findings||[]).map(function(x){return '<li class="'+adaptiveEsc(x.severity||'info')+'"><div><span>'+adaptiveEsc(severityNames[x.severity]||x.severity||'提示')+'</span><b>'+adaptiveEsc(x.title||'待复核项')+'</b></div><p>'+adaptiveEsc(x.evidence||'')+'</p><small>'+adaptiveEsc(x.recommended_action||'')+'</small></li>';}).join('')||'<li class="adaptive-empty-row">'+(advisorLatest.status==='failed'?'调用未成功：'+adaptiveEsc(advisorLatest.error_code||'provider_error'):(advisorLatest.status==='completed'?'本次跨源与账本审阅未发现需要升级的问题。':'尚无 DeepSeek 审阅结论；确定性检查仍独立运行。'))+'</li>';
-  var deterministicCount=(advisorEvidence.deterministic_findings||[]).length;
-  var crossSourceLabel=advisorReport.cross_source_status==='verified'?'已验证':(advisorReport.cross_source_status==='partial'?'部分通过':'未通过');
   var researchCards=(deepseek.tasks||[]).map(function(task){
-    var latest=advisorRuns[task.purpose]||{},report=latest.report||{},taskEvidence=latest.evidence||{};
-    var topFinding=(report.findings||[])[0]||{};
-    var eventLinks=task.purpose==='event_evidence'?(taskEvidence.events||[]).slice(0,3).map(function(event){return '<a href="'+adaptiveSafeUrl(event.source_url)+'" target="_blank" rel="noopener noreferrer"><span>'+adaptiveEsc(event.evidence_grade||'C')+'</span><b>'+adaptiveEsc(event.summary||event.title||'来源事件')+'</b></a>';}).join(''):'';
-    var state=latest.status==='completed'?'已完成':(latest.status==='failed'?'调用失败':'等待首次运行');
-    return '<article class="adaptive-research-card '+adaptiveEsc(task.purpose)+'"><header><div><span>'+adaptiveEsc(task.purpose.replace(/_/g,' '))+'</span><h4>'+adaptiveEsc(task.label)+'</h4></div><em>'+state+'</em></header><p>'+adaptiveEsc(report.summary||task.short)+'</p><div class="adaptive-research-meta"><span>置信度 <b>'+adaptiveValue(report.confidence,'%',0)+'</b></span><span>发现 <b>'+Number((report.findings||[]).length)+'</b></span><span>耗时 <b>'+(latest.latency_ms==null?'—':Number(latest.latency_ms)+'ms')+'</b></span></div>'+(topFinding.title?'<div class="adaptive-research-finding"><span>'+adaptiveEsc(topFinding.severity||'info')+'</span><b>'+adaptiveEsc(topFinding.title)+'</b><p>'+adaptiveEsc(topFinding.evidence||'')+'</p></div>':'')+(eventLinks?'<div class="adaptive-event-links">'+eventLinks+'</div>':'')+'<button class="ghost" onclick="runAdaptiveResearchTask(\''+adaptiveEsc(task.purpose)+'\',this)">单独运行</button></article>';
+    return '<article class="adaptive-research-card '+adaptiveEsc(task.purpose)+'"><header><div><span>'+adaptiveEsc(task.purpose.replace(/_/g,' '))+'</span><h4>'+adaptiveEsc(task.label)+'</h4></div><em>研究任务</em></header><p>'+adaptiveEsc(task.short||'运行一次 typed research task。')+'</p><button class="ghost" onclick="runAdaptiveResearchTask(\''+adaptiveEsc(task.purpose)+'\',this)">单独运行</button></article>';
   }).join('')||'<div class="paper-empty">研究任务尚未加载。</div>';
   var tradeAttrAccountCards=Object.keys(tradeAttrAccounts).filter(function(id){return downsideAccountNames[id];}).map(function(id){var x=tradeAttrAccounts[id]||{};return '<div><small>'+adaptiveEsc(downsideAccountNames[id]||id)+'</small><b>'+Number(x.filled||0)+' 笔</b><span>个股 '+adaptiveValue(x.mean_stock_move_pct,'%',2)+' · 超额 '+adaptiveValue(x.mean_alpha_pct,'%',2)+'</span><em>公告偏空 '+Number(x.negative_news_records||0)+' 笔 · AI '+Number(x.ai_completed||0)+' 笔</em></div>';}).join('')||'<div class="adaptive-empty-row">盘后收盘后生成逐笔归因。</div>';
   var tradeAttrRows=(tradeAttribution.recent||[]).filter(function(x){return x.order_status==='filled';}).slice(0,8).map(function(x){var reason=adaptiveJsonArray(x.reason_codes).join('、');return '<li><time>'+adaptiveEsc(String(x.fill_date||'').slice(5,10))+'</time><div><b>'+adaptiveEsc(x.name||x.code)+' '+adaptiveEsc(x.code)+'</b><p>'+adaptiveEsc(({tq_breakout:'短线日内做T',trend_pullback:'趋势波段优选',sector_rotation:'板块轮动先锋',reported_profit_breakout:'三日策略'})[x.account_id]||x.account_id)+' · '+adaptiveEsc(x.side==='buy'?'买入':'卖出')+' '+Number(x.qty||0)+'股 · 成交 '+fmt(x.fill_price,2)+' · 收盘 '+fmt(x.close_price,2)+'</p><small>'+adaptiveEsc(reason||'暂无足够证据')+' · 大盘 '+adaptiveValue(x.benchmark_move_pct,'%',2)+' · 个股超额 '+adaptiveValue(x.stock_alpha_pct,'%',2)+'</small></div><em class="tag '+(x.ai_status==='completed'?'tag-ok':'tag-warn')+'">'+adaptiveEsc(x.ai_status==='completed'?'AI已归因':'规则归因')+'</em></li>';}).join('')||'<li class="adaptive-empty-row">当天没有已成交操作。</li>';
@@ -337,8 +419,8 @@ export function renderAdaptive(d){
     +'<section class="adaptive-panel adaptive-selection-evolution"><header><div><span>PAPER SELECTION EVOLUTION</span><h3>模拟盘选股进化</h3></div><em>'+adaptiveEsc(adaptiveText(selectionOpt.mode,'等待样本'))+'</em></header><p class="adaptive-copy">'+adaptiveEsc(adaptiveText(selectionOpt.policy,'等待选股进化证据汇总。'))+'</p><div class="adaptive-tier-track"><span><b>3日</b>快速影子</span><span><b>5日</b>明显微调</span><span><b>10日</b>标准进化</span><span><b>20日</b>成熟进化</span></div><div class="adaptive-selection-layout"><div class="adaptive-selection-candidates">'+selectionCandidateRows+'</div><aside class="adaptive-active-risk"><h4>已生效选股版本</h4><ul>'+activeSelectionRows+'</ul></aside></div></section>'
     +'<section class="adaptive-panel adaptive-risk-evolution"><header><div><span>PAPER RISK EVOLUTION</span><h3>模拟盘风控进化</h3></div><em>'+adaptiveEsc(adaptiveText(riskOpt.mode,'等待样本'))+'</em></header><p class="adaptive-copy">'+adaptiveEsc(adaptiveText(riskOpt.policy,'等待风控进化证据汇总。'))+'</p>'+downsideNotice+'<div class="adaptive-downside-policy"><header><b>当前已启用策略防线基准</b><span>只读展示；参数变更仍受版本、影子观察和人工放权约束</span></header>'+downsidePolicyRows+'</div><div class="adaptive-tier-track"><span><b>3日</b>快速影子</span><span><b>5日</b>明显微调</span><span><b>10日</b>标准进化</span><span><b>20日</b>完整受限区间</span></div><div class="adaptive-risk-layout"><div class="adaptive-risk-candidates">'+riskCandidateRows+'</div><aside class="adaptive-risk-side"><div class="adaptive-advisor-card"><span>AI EVIDENCE REVIEWER</span><h4>DeepSeek 数据审阅</h4><b class="'+(advisorReady?'on':'off')+'">'+adaptiveEsc(advisorState)+'</b><p>'+adaptiveEsc(adaptiveText(deepseek.truth_boundary,'证据解释器，不是真实性证明。'))+'</p></div><div class="adaptive-active-risk"><h4>已生效风控版本</h4><ul>'+activeRiskRows+'</ul></div></aside></div></section>'
     +'<section class="adaptive-panel news-learning-panel"><header><div><span>EVENT → OUTCOME → CALIBRATION</span><h3>统一情报与事件学习</h3></div><div class="adaptive-advisor-actions"><em>'+(newsLearning.mode==='paper_micro_eligible'?'有界微调资格':'影子学习')+'</em><button id="newsLearningRunButton" class="ghost" onclick="runNewsLearning()">运行新闻学习</button></div></header><p class="adaptive-copy">风控中心与自进化共用同一份新闻/公告事件账本；风控负责实时门禁，自进化负责1/3/5日兑现校准。</p>'+dynamicRiskNotice+'<div class="news-learning-flow"><span><b>01</b>采集去重</span><i></i><span><b>02</b>事件分型</span><i></i><span><b>03</b>1/3/5日兑现</span><i></i><span><b>04</b>来源校准</span><i></i><span><b>05</b>模拟盘微调</span></div><div class="news-kpis"><div><small>事件账本</small><b>'+Number(newsTotals.events||0)+'</b></div><div><small>可追溯链接</small><b>'+adaptiveValue(newsTotals.linked_pct,'%',1)+'</b></div><div><small>成熟结果</small><b>'+Number(newsTotals.mature_outcomes||0)+'</b></div><div><small>5日成熟事件</small><b>'+Number(newsTotals.mature_5d_events||0)+'</b></div></div><div class="news-learning-layout"><div><h4>最近进入账本</h4><ul class="news-event-list">'+newsEvents+'</ul></div><aside><h4>来源信誉（不使用涨跌评分）</h4><div class="news-source-list">'+newsSources+'</div><h4>微调门禁</h4><div class="news-gates">'+newsGateRows+'</div></aside></div><div class="adaptive-notice">'+adaptiveEsc(newsLearning.authority||'当前仅影子记录。')+'</div></section>'
-    +'<section class="adaptive-panel adaptive-advisor-evidence"><header><div><span>DEEPSEEK · DATA QUALITY + TUNING</span><h3>模拟盘数据校验与有界调参</h3></div><div class="adaptive-advisor-actions"><em>'+adaptiveEsc(deepseek.model||'deepseek-v4-flash')+'</em><button id="advisorRunButton" class="ghost" onclick="runAdaptiveAdvisor()" '+(advisorReady?'':'disabled')+'>运行数据质量审阅</button><button id="adaptiveAiTuneInlineButton" class="ghost" onclick="runAdaptiveAiTuning()" '+(advisorReady&&aiTuning.enabled?'':'disabled')+'>运行AI有界调参</button></div></header><div class="adaptive-advisor-summary"><div><small>数据审阅</small><b>'+adaptiveEsc(advisorState)+'</b></div><div><small>AI调参状态</small><b>'+adaptiveEsc(aiTuningState)+'</b></div><div><small>确定性异常</small><b>'+Number(deterministicCount)+'</b></div><div><small>审阅置信度</small><b>'+adaptiveValue(advisorReport.confidence,'%',0)+'</b></div><div><small>跨源真实性</small><b class="'+(advisorReport.cross_source_status==='verified'?'up':'down')+'">'+crossSourceLabel+'</b></div><div><small>双源覆盖 / 一致</small><b>'+adaptiveValue(crossSource.coverage_pct,'%',1)+' / '+adaptiveValue(crossSource.agreement_pct,'%',1)+'</b></div></div><div class="adaptive-advisor-report"><div><h4>审阅摘要</h4><p>'+adaptiveEsc(advisorReport.summary||deepseek.truth_boundary||'DeepSeek只复核确定性证据；行情真实性仍需独立数据源交叉验证。')+'</p><small>市场状态：'+(advisorMarket.session_status==='closed'?'已收盘':'交易中')+' · 收盘口径 '+adaptiveEsc(String(advisorMarket.close_cutoff_at||'—').replace('T',' '))+' · 源行情最后到达 '+adaptiveEsc(String(advisorMarket.latest_source_at||'—').replace('T',' '))+' · 最近审阅 '+adaptiveEsc(String(advisorLatest.finished_at||'—').replace('T',' '))+'</small></div><ul>'+advisorFindings+'</ul></div><div class="adaptive-notice">AI只可在已启用的模拟策略内提出白名单权重、入场阈值和选股条件的小步补丁；系统先做行情质量、跨源、幅度、冷却和回滚校验，再允许盘中同日生效。AI不能下单、修改公共选股或放宽风控；超出边界的建议只留在影子候选中。</div></section>'
-    +'<section class="adaptive-panel adaptive-research-suite"><header><div><span>DEEPSEEK · PAPER RESEARCH SUITE</span><h3>模拟盘智能研究任务</h3></div><button id="advisorSuiteButton" class="ghost" onclick="runAdaptiveResearchSuite()" '+(advisorReady?'':'disabled')+'>运行全部研究任务</button></header><p class="adaptive-copy">收盘后自动运行；每项独立留痕。结论只能进入研究和人工复核，不能直接改选股、风控或订单。</p><div class="adaptive-research-context"><label>研究业务日 <input id="adaptiveResearchAsOf" type="date" value="'+adaptiveShanghaiDate()+'"></label><label>账户 ID <input id="adaptiveResearchAccount" type="text" maxlength="40" autocomplete="off" placeholder="P&amp;L 归因时填写"></label><label>周期 ID <input id="adaptiveResearchCycle" type="number" min="1" step="1" placeholder="P&amp;L 归因时填写"></label><span>单独运行 P&amp;L 归因需同时填写账户和周期；套件未填写时会明确标记该项不可用。</span></div><div id="adaptiveResearchSuiteResults" class="adaptive-research-results" aria-live="polite"></div><div class="adaptive-research-grid">'+researchCards+'</div></section>'
+    +'<section class="adaptive-panel adaptive-advisor-evidence"><header><div><span>DEEPSEEK · RESEARCH + TUNING</span><h3>研究执行与有界调参</h3></div><div class="adaptive-advisor-actions"><em>'+adaptiveEsc(deepseek.model||'deepseek-v4-flash')+'</em><button id="advisorRunButton" class="ghost" onclick="runAdaptiveAdvisor()" '+(advisorReady?'':'disabled')+'>运行数据质量研究</button><button id="adaptiveAiTuneInlineButton" class="ghost" onclick="runAdaptiveAiTuning()" '+(advisorReady&&aiTuning.enabled?'':'disabled')+'>运行 AI 有界调参</button></div></header><div class="adaptive-advisor-summary"><div><small>研究入口</small><b>'+adaptiveEsc(advisorState)+'</b></div><div><small>AI 调参状态</small><b>'+adaptiveEsc(aiTuningState)+'</b></div></div><p class="adaptive-copy">研究结论和 typed evidence refs 在下方 canonical research history 中读取。研究假设是历史研究产物，不代表当前事实或交易许可。</p><div class="adaptive-notice">AI 调参候选继续由现有 tuner 与人工门禁管理；研究历史不包含调参 proposal 或 apply 记录。</div></section>'
+    +'<section class="adaptive-panel adaptive-research-suite"><header><div><span>CANONICAL RESEARCH LEDGER</span><h3>研究记录</h3></div><div class="adaptive-advisor-actions"><button class="ghost" onclick="refreshAdaptiveResearchHistory()">刷新研究记录</button><button id="advisorSuiteButton" class="ghost" onclick="runAdaptiveResearchSuite()" '+(advisorReady?'':'disabled')+'>运行全部研究任务</button></div></header><p class="adaptive-copy">状态表示研究假设的证据关系；即使状态为 supported，也不构成事实证明、批准或执行许可。</p><div class="adaptive-research-context"><label>研究业务日 <input id="adaptiveResearchAsOf" type="date" value="'+adaptiveShanghaiDate()+'"></label><label>账户 ID <input id="adaptiveResearchAccount" type="text" maxlength="40" autocomplete="off" placeholder="P&amp;L 归因时填写"></label><label>周期 ID <input id="adaptiveResearchCycle" type="number" min="1" step="1" placeholder="P&amp;L 归因时填写"></label><span>单独运行 P&amp;L 归因需同时填写账户和周期；套件未填写时会明确标记该项不可用。</span></div><div id="adaptiveResearchSuiteResults" class="adaptive-research-results" aria-live="polite"></div><div id="adaptiveCanonicalResearchHistory" class="adaptive-canonical-research" aria-live="polite">正在读取 canonical research runs…</div><h4>研究任务</h4><div class="adaptive-research-grid">'+researchCards+'</div></section>'
     +'<section class="adaptive-panel"><header><div><span>CONTEXTUAL BANDIT</span><h3>策略集合影子分配</h3></div><em>总和 100% · 不改变账户资金</em></header><div class="adaptive-strategy-grid">'+strategyCards+'</div>'+allocationActionPanel(d)+'<div class="adaptive-notice">'+adaptiveEsc(d.data_note||'')+'</div></section>'
     +'<section class="adaptive-panel"><header><div><span>EVOLUTION A/B · VERSION ATTRIBUTION</span><h3>进化版本对照归因</h3></div><em>部署后 5 净值日 vs 部署前等长基线</em></header>'+abValidationPanel(d)+'</section>'
     +'<div class="adaptive-grid"><section class="adaptive-panel"><header><div><span>GENETIC ALGORITHM</span><h3>GA Alpha 实验室</h3></div><em>非神经网络</em></header><p class="adaptive-copy">'+alpha.architecture+'</p><div class="adaptive-progress-copy"><span>画像日 '+Number(alpha.profile_days||0)+' / '+Number(alpha.required_profile_days||10)+'</span><span>成熟标签 '+Number(alpha.mature_rows||0)+' / '+Number(alpha.required_mature_rows||5000)+'</span></div>'+adaptiveBar(alphaProgress,'ga')+'<ul class="adaptive-alpha-list">'+candidateRows+'</ul></section><section class="adaptive-panel"><header><div><span>MULTI-HORIZON REWARD</span><h3>策略周期兑现</h3></div><em>1日 20% · 3日 35% · 5日 45%</em></header><div class="table-scroll"><table class="adaptive-horizon-table"><thead><tr><th>策略</th><th>1日超额</th><th>3日超额</th><th>5日超额</th></tr></thead><tbody>'+horizonRows+'</tbody></table></div></section></div>'
@@ -427,6 +509,7 @@ export function renderAdaptive(d){
     setAdaptiveSection(sessionStorage.getItem('astock.adaptiveSection')||'overview');
   }
   refreshAdaptiveTimeline(adaptiveTimelineFallback);
+  refreshAdaptiveResearchHistory();
 }
 
 export async function loadAdaptive(){
@@ -435,7 +518,7 @@ export async function loadAdaptive(){
   var snapshotKey='astock.adaptiveOverview.v3';
   var cached=null;
   try{cached=JSON.parse(sessionStorage.getItem(snapshotKey)||'null');}catch(ignore){}
-  if(adaptiveOverviewComplete(cached)) renderAdaptive(cached);
+  if(adaptiveOverviewComplete(cached)){renderAdaptive(cached);}
   else if($('adaptiveResult')) $('adaptiveResult').innerHTML='<div class="loading">正在读取模拟盘选股、风控与学习账本…</div>';
   try{
     // The evolution view is a live operational surface.  A browser-cached

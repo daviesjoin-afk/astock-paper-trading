@@ -349,6 +349,7 @@ class _Base(unittest.TestCase):
         self.factory = _TrackingFactory()
         self.addCleanup(self.factory.close)
         advisor.ensure_schema(self.factory.conn)
+        _create_legacy_advisor_table(self.factory.conn)
 
     def env(self, **overrides):
         """设定 provider 相关环境变量；传 ``None`` 表示该变量**必须不存在**。
@@ -532,6 +533,18 @@ class FailureSemanticsTests(_Base):
 # ─────────────────────────────────────────────────────────────────────────────
 
 
+def _create_legacy_advisor_table(conn):
+    """Create a historical database table explicitly; production no longer creates it."""
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS adaptive_advisor_runs("
+        "id INTEGER PRIMARY KEY AUTOINCREMENT,purpose TEXT NOT NULL,trigger TEXT NOT NULL,"
+        "status TEXT NOT NULL,provider TEXT NOT NULL,model TEXT NOT NULL,evidence_hash TEXT NOT NULL,"
+        "evidence TEXT NOT NULL,report TEXT,error_code TEXT,latency_ms INTEGER,input_tokens INTEGER,"
+        "output_tokens INTEGER,created_at TEXT NOT NULL,finished_at TEXT NOT NULL)"
+    )
+    conn.commit()
+
+
 class LegacyBoundaryTests(_Base):
     def _historic_legacy_row(self):
         self.factory.conn.execute(
@@ -576,6 +589,7 @@ class LegacyBoundaryTests(_Base):
         fresh = _TrackingFactory()
         self.addCleanup(fresh.close)
         advisor.ensure_schema(fresh.conn)
+        _create_legacy_advisor_table(fresh.conn)
         fresh.conn.execute(
             "INSERT INTO adaptive_advisor_runs("
             "purpose,trigger,status,provider,model,evidence_hash,evidence,report,error_code,"
@@ -751,12 +765,7 @@ class TimeAndIdempotencyTests(_Base):
 
 class ReadPathBootstrapTests(_Base):
     def test_RUNTIME_15_canonical_read_path_works_before_the_first_run(self):
-        """RUNTIME-15：canonical 表在首次研究运行成功之前**不存在**，读路径也必须能用。
-
-        ``overview`` 是每次刷新概览都会走的路径（``adaptive_engine._overview_uncached``），
-        而 canonical 台账只有在一次 append 之后才存在。读入口先 ``ensure_schema``，因此
-        全新库（或尚未跑过研究的库）不会 ``no such table: ai_research_runs``。
-        """
+        """RUNTIME-15：canonical research context 在首次研究前可读，overview 不带历史行。"""
         tables = {row[0] for row in self.factory.conn.execute(
             "SELECT name FROM sqlite_master WHERE type='table'"
         )}
@@ -764,13 +773,12 @@ class ReadPathBootstrapTests(_Base):
 
         self.assertIsNone(advisor.latest_data_quality_research(self.factory.conn))
         view = advisor.overview(self.factory.conn, {})
-        self.assertIsNone(view["latest"])
-        self.assertEqual({}, view["latest_by_purpose"])
-        # 读路径只建表，不写研究行。
+        self.assertNotIn("latest", view)
+        self.assertNotIn("latest_by_purpose", view)
         self.assertEqual(0, self.canonical())
 
-    def test_RUNTIME_16_overview_prefers_canonical_and_keeps_legacy_visible(self):
-        """RUNTIME-16：writer 迁移后 ``overview`` 以 canonical 为准，旧行仍可见但不冒充最新。"""
+    def test_RUNTIME_16_overview_does_not_expose_research_compatibility_rows(self):
+        """RUNTIME-16：research history is read separately; overview remains tuning/readiness only."""
         self.factory.conn.execute(
             "INSERT INTO adaptive_advisor_runs("
             "purpose,trigger,status,provider,model,evidence_hash,evidence,report,error_code,"
@@ -783,15 +791,10 @@ class ReadPathBootstrapTests(_Base):
         self.service_call()
 
         view = advisor.overview(self.factory.conn, {})
-        latest = view["latest"]
-        self.assertEqual("canonical_research_ledger", latest["source"])
-        self.assertEqual(TRIGGER, latest["trigger"])
-        self.assertEqual("research", latest["report"]["authority"])
-        self.assertFalse(latest["report"]["is_authoritative"])
-        self.assertEqual(
-            "canonical_research_ledger",
-            view["latest_by_purpose"]["data_quality"]["source"],
-        )
+        self.assertNotIn("latest", view)
+        self.assertNotIn("latest_by_purpose", view)
+        self.assertEqual(TRIGGER, advisor.latest_data_quality_research(self.factory.conn)["trigger"])
+        self.assertEqual(1, self.legacy(), "overview must leave physical history untouched")
 
 
 class PurposeFilterTests(_Base):

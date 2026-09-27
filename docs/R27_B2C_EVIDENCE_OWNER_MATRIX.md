@@ -1842,7 +1842,7 @@ OPEN / REQUIRED:
 R27-B2C backend research evidence convergence = COMPLETE
 B2C-8 = SUPERSEDED BY R27-B2C-FINAL
 B2C-9 = SUPERSEDED BY R27-B2C-FINAL
-B3 = NOT STARTED
+B3 = COMPLETE（canonical research API/UI 已实现，PR 等待人工审核）
 R28 = NOT STARTED
 ```
 
@@ -1851,3 +1851,23 @@ R28 = NOT STARTED
 verification 的字段仍为 OPEN / REQUIRED，production 以 unavailable 处理。旧快照中
 adapter production callers = 0、collector 直读 legacy raw SQL、`adaptive_advisor_runs` 尚有 writer
 等状态均已由本节和 ARCHITECTURE.md 的 R27-B2C-FINAL 说明取代。
+
+## R27-B3 canonical research history API/UI（COMPLETE，PR 待人工审核）
+
+B3 的唯一 research result authority 仍是 `ai_research_runs`。列表和详情 API 复用
+`ai_research_repository` 的验证读取；UI 直接读取 canonical API，并在研究执行完成后刷新记录。
+`deepseek_advisor.overview()` 已退出 research history 展示，`_canonical_research_display()` 已删除；
+`adaptive_advisor_runs` 的生产 research 读者和写者均为 0。历史表可留在既有数据库，但不再作为
+生产展示来源，也没有被删除或回填。
+
+`adaptive_ai_analysis_runs` 仍是 operational-only，保留状态、重试/幂等信息与
+`canonical_run_id`；timeline 不携带 canonical 结论，legacy result 不升级、不回填，canonical
+research unavailable 时明确保持不可用。没有新增 DB migration、ledger、provider path 或 authority，
+交易与 tuning/apply 权限未变，roadmap capability removed = 0，原有不变量未削弱。
+
+adaptive killed terminal instant、non-intraday paper job stable attempt identity、
+`adaptive_execution_evidence` metric/status semantics、adaptive rewards historical availability、
+alpha candidate stable identity、historical mutable candidate revisions、parameter/experiment linkage、
+historical market evidence、historical cycle membership，以及 physical DB origin / trusted provenance
+继续 **OPEN / REQUIRED**；缺失证据仍 fail closed。R27-B2C = **COMPLETE**，R27-B3 =
+**COMPLETE（PR 等待人工审核）**，R28 = **NOT STARTED**。
