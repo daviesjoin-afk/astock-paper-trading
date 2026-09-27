@@ -362,6 +362,11 @@ def run_advisor(
         }
         raise HTTPException(status_code=409, detail=messages.get(error, "DeepSeek 审阅暂不可用")) from exc
     except ValueError as exc:
+        error = str(exc)
+        if error == "attribution_context_required":
+            raise HTTPException(status_code=422, detail="P&L 归因需要明确选择账户和周期") from exc
+        if error == "portfolio_context_requires_account_and_cycle":
+            raise HTTPException(status_code=422, detail="账户和周期必须同时提供") from exc
         raise HTTPException(status_code=422, detail="不支持的 DeepSeek 研究任务") from exc
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"DeepSeek 审阅失败：{type(exc).__name__}") from exc

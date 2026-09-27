@@ -1459,17 +1459,25 @@ def selection_candidate_facts(conn, *, as_of, limit=100):
     if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
         raise ValueError("selection_candidate_facts limit must be a positive int")
     size = min(limit, 500)
-    rows = conn.execute(
-        "SELECT id FROM adaptive_selection_candidates ORDER BY id DESC LIMIT ?", (size,),
-    ).fetchall()
     facts = []
-    for row in rows:
-        candidate_id = row[0] if not hasattr(row, "keys") else row["id"]
-        projection = selection_candidate_fact(conn, candidate_id, as_of=as_of)
-        if projection is not None:
-            facts.append(projection)
+    offset = 0
+    while len(facts) < size:
+        rows = conn.execute(
+            "SELECT id FROM adaptive_selection_candidates ORDER BY id DESC LIMIT ? OFFSET ?",
+            (min(size, 100), offset),
+        ).fetchall()
+        if not rows:
+            break
+        for row in rows:
+            candidate_id = row[0] if not hasattr(row, "keys") else row["id"]
+            projection = selection_candidate_fact(conn, candidate_id, as_of=as_of)
+            if projection is not None:
+                facts.append(projection)
+                if len(facts) == size:
+                    break
+        offset += len(rows)
     facts.sort(key=lambda fact: (fact.availability_day, fact.revision_identity), reverse=True)
-    return tuple(facts)
+    return tuple(facts[:size])
 
 
 def record_shadow_proposal(conn, *, run_date, account_id, regime, model_id,

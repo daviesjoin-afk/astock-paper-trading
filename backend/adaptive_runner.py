@@ -143,7 +143,9 @@ def main():
     if args.session == "midday":
         dispatch = lambda: adaptive.run_midday_observation(trigger=args.trigger)
     elif args.session == "midday-advisor":
-        dispatch = lambda: adaptive.run_midday_advisor(trigger=args.trigger)
+        dispatch = lambda: adaptive.run_midday_advisor(
+            trigger=args.trigger, market_now=dt.datetime.now(adaptive.TZ),
+        )
     else:
         dispatch = lambda: adaptive.run_learning_cycle(trigger=args.trigger)
     # Midday observation is intentionally light.  Model/close learning is a

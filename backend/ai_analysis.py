@@ -35,6 +35,17 @@ def evidence_hash(value):
     return hashlib.sha256(_json(value).encode("utf-8")).hexdigest()
 
 
+def _analysis_business_key(asof_day, window, scope, targets):
+    normalized_targets = tuple(sorted(
+        (str(account_id).strip(), int(cycle_id)) for account_id, cycle_id in targets
+    ))
+    target_identity = (
+        "none" if not normalized_targets else
+        hashlib.sha256(_json(normalized_targets).encode("utf-8")).hexdigest()
+    )
+    return f"ai:{asof_day}:{window}:{scope}:targets:{target_identity}", target_identity
+
+
 def ensure_schema(conn):
     """Create the API/timeline compatibility table; it stores run references only."""
     conn.executescript(
@@ -196,7 +207,9 @@ def run_analysis(connect_factory, paper_db_path, snapshot_paths, provider_module
         raise ValueError("portfolio_context_required_for_holdings_scope")
 
     trade_date = context.asof_day
-    business_key = f"ai:{trade_date}:{window}:{scope}"
+    business_key, target_identity = _analysis_business_key(
+        trade_date, window, scope, context.targets,
+    )
     with connect_factory() as conn:
         ensure_schema(conn)
         cursor = conn.execute(
@@ -244,7 +257,7 @@ def run_analysis(connect_factory, paper_db_path, snapshot_paths, provider_module
             connect_factory,
             purpose="ai_analysis",
             trigger=str(trigger or "manual-ui")[:120],
-            hypothesis_id=f"ai_analysis:{trade_date}:{window}:{scope}",
+            hypothesis_id=f"ai_analysis:{trade_date}:{window}:{scope}:targets:{target_identity}",
             as_of=trade_date,
             subject=f"{window}:{scope}",
             question=("对所给 typed owner evidence 进行时间窗研究；只给研究假设，"

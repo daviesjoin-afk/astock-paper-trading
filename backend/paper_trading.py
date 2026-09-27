@@ -15817,15 +15817,22 @@ def paper_job_run_facts(conn, *, as_of, limit=100):
     if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
         raise ValueError("paper_job_run_facts limit must be a positive int")
     size = min(limit, 500)
-    rows = conn.execute(
-        "SELECT run_key FROM paper_job_runs ORDER BY started_at DESC,run_key DESC LIMIT ?",
-        (size,),
-    ).fetchall()
     facts = []
-    for row in rows:
-        run_key = row[0] if not hasattr(row, "keys") else row["run_key"]
-        projection = paper_job_run_fact(conn, run_key, as_of=as_of)
-        if projection is not None:
-            facts.append(projection)
+    offset = 0
+    while len(facts) < size:
+        rows = conn.execute(
+            "SELECT run_key FROM paper_job_runs ORDER BY started_at DESC,run_key DESC LIMIT ? OFFSET ?",
+            (min(size, 100), offset),
+        ).fetchall()
+        if not rows:
+            break
+        for row in rows:
+            run_key = row[0] if not hasattr(row, "keys") else row["run_key"]
+            projection = paper_job_run_fact(conn, run_key, as_of=as_of)
+            if projection is not None:
+                facts.append(projection)
+                if len(facts) == size:
+                    break
+        offset += len(rows)
     facts.sort(key=lambda fact: (fact.availability_day, fact.revision_identity), reverse=True)
     return tuple(facts[:size])

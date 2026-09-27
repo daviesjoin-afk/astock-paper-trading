@@ -2065,7 +2065,7 @@ def run_midday_observation(trigger="scheduled-midday"):
         _RUN_LOCK.release()
 
 
-def run_midday_advisor(trigger="scheduled-midday-dp"):
+def run_midday_advisor(trigger="scheduled-midday-dp", *, market_now=None):
     """Run a bounded midday DeepSeek batch outside the five-minute quote loop.
 
     The batch reviews the just-saved midday snapshot and candidate evidence;
@@ -2078,6 +2078,12 @@ def run_midday_advisor(trigger="scheduled-midday-dp"):
     status = "advisor_skipped"
     detail = {"session": "midday-dp", "official_close_learning": False}
     try:
+        if not isinstance(market_now, dt.datetime) or market_now.tzinfo is None or market_now.utcoffset() is None:
+            raise ValueError("market_now_must_be_timezone_aware")
+        research_day = market_now.astimezone(TZ).date().isoformat()
+        research_context = deepseek_research.ResearchAsOfContext(
+            asof_day=research_day, market_now=market_now, targets=(),
+        )
         with _connect() as conn:
             config = _config(conn)
         if not deepseek_advisor.enabled(config):
@@ -2116,15 +2122,32 @@ def run_midday_advisor(trigger="scheduled-midday-dp"):
                 # A focused candidate challenge gives the close cycle a useful
                 # second opinion without paying for the full six-task suite.
                 try:
-                    deepseek_research.run_task(
+                    challenge = deepseek_research.run_task(
                         _connect, PAPER_DB_PATH, "candidate_challenge",
                         trigger=f"{str(trigger or 'scheduled-midday-dp')}:candidate",
+                        context=research_context,
                     )
-                    detail["candidate_challenge"] = "completed"
+                    challenge_status = challenge.get("status") if isinstance(challenge, dict) else None
+                    recorded_status = challenge_status if challenge_status in {"completed", "blocked", "failed"} else "failed"
+                    challenge_error = challenge.get("error_code") if isinstance(challenge, dict) else None
+                    if recorded_status != "completed" and not challenge_error:
+                        challenge_error = "research_not_completed" if recorded_status == "blocked" else "invalid_research_result"
+                    detail["candidate_challenge"] = {
+                        "status": recorded_status,
+                        "error_code": challenge_error,
+                    }
+                    if recorded_status != "completed":
+                        status = "advisor_failed"
+                        detail["reason"] = challenge_error
+                    else:
+                        status = "advisor_batch"
+                        detail.update({"reason": "completed", "provider": "DeepSeek"})
                 except Exception as exc:
-                    detail["candidate_challenge"] = f"failed:{type(exc).__name__}"
-                status = "advisor_batch"
-                detail.update({"reason": "completed", "provider": "DeepSeek"})
+                    detail["candidate_challenge"] = {
+                        "status": "failed", "error_code": type(exc).__name__,
+                    }
+                    status = "advisor_failed"
+                    detail["reason"] = f"research_failed:{type(exc).__name__}"
         with _connect() as conn:
             conn.execute(
                 "INSERT INTO adaptive_runs(trigger,status,profile_date,new_rewards,detail,started_at,finished_at) VALUES(?,?,?,?,?,?,?)",
@@ -2690,6 +2713,8 @@ def run_advisor_review(trigger="manual-ui", purpose="data_quality", *,
             targets = ((account_id, cycle_id),)
         else:
             targets = ()
+        if purpose == "pnl_attribution" and not targets:
+            raise ValueError("attribution_context_required")
         try:
             market_instant = dt.datetime.fromisoformat(str(market_now).replace("Z", "+00:00"))
         except ValueError as exc:
@@ -2697,11 +2722,14 @@ def run_advisor_review(trigger="manual-ui", purpose="data_quality", *,
         context = deepseek_research.ResearchAsOfContext(
             asof_day=asof_day, market_now=market_instant, targets=targets,
         )
-        deepseek_research.run_task(
+        result = deepseek_research.run_task(
             _connect, PAPER_DB_PATH, purpose,
             trigger=str(trigger or "manual-ui")[:80],
             context=context,
         )
+        view = overview()
+        view["research_task_result"] = result
+        return view
     return overview()
 
 
@@ -2775,8 +2803,10 @@ def run_advisor_suite(trigger="manual-suite", *, asof_day=None, market_now=None,
         asof_day=asof_day, market_now=market_instant, targets=targets,
     )
     deepseek_advisor.run_review(_connect, PAPER_DB_PATH, SNAPSHOT_PATHS, config=cfg, trigger=trigger)
-    deepseek_research.run_suite(_connect, PAPER_DB_PATH, trigger=trigger, context=context)
-    return overview()
+    results = deepseek_research.run_suite(_connect, PAPER_DB_PATH, trigger=trigger, context=context)
+    view = overview()
+    view["research_suite_results"] = results
+    return view
 
 
 def run_news_learning(trigger="manual-ui"):
@@ -4995,14 +5025,22 @@ def adaptive_run_facts(conn, *, as_of, limit=100):
     if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
         raise ValueError("adaptive_run_facts limit must be a positive int")
     size = min(limit, 500)
-    rows = conn.execute(
-        "SELECT id FROM adaptive_runs ORDER BY id DESC LIMIT ?", (size,),
-    ).fetchall()
     facts = []
-    for row in rows:
-        run_id = row[0] if not hasattr(row, "keys") else row["id"]
-        projection = adaptive_run_fact(conn, run_id, as_of=as_of)
-        if projection is not None:
-            facts.append(projection)
+    offset = 0
+    while len(facts) < size:
+        rows = conn.execute(
+            "SELECT id FROM adaptive_runs ORDER BY id DESC LIMIT ? OFFSET ?",
+            (min(size, 100), offset),
+        ).fetchall()
+        if not rows:
+            break
+        for row in rows:
+            run_id = row[0] if not hasattr(row, "keys") else row["id"]
+            projection = adaptive_run_fact(conn, run_id, as_of=as_of)
+            if projection is not None:
+                facts.append(projection)
+                if len(facts) == size:
+                    break
+        offset += len(rows)
     facts.sort(key=lambda fact: (fact.availability_day, fact.revision_identity), reverse=True)
     return tuple(facts[:size])

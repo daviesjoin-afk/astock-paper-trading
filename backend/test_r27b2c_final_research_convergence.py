@@ -45,6 +45,14 @@ def _imported_roots(tree: ast.Module) -> set[str]:
     return roots
 
 
+def _js_function(source: str, name: str) -> str:
+    match = re.search(rf"export\s+(?:async\s+)?function\s+{re.escape(name)}\s*\(", source)
+    if not match:
+        return ""
+    end = source.find("\nexport ", match.end())
+    return source[match.start():] if end < 0 else source[match.start():end]
+
+
 def architecture_violations(sources: dict[str, str]) -> list[str]:
     """Return semantic boundary violations for a virtual source tree."""
     dr_name = "backend/deepseek_research.py"
@@ -52,6 +60,75 @@ def architecture_violations(sources: dict[str, str]) -> list[str]:
     dr = ast.parse(sources[dr_name])
     aa = ast.parse(sources[aa_name])
     issues: list[str] = []
+
+    # Review regressions: scheduled context/result propagation, identity, owner paging,
+    # explicit portfolio parameters, and exchange-local canonical dates.
+    ae_name = "backend/adaptive_engine.py"
+    runner_name = "backend/adaptive_runner.py"
+    frontend_name = "frontend/src/features/adaptive.js"
+    api_name = "backend/api_adaptive.py"
+    ae = ast.parse(sources.get(ae_name, ""))
+    runner = ast.parse(sources.get(runner_name, ""))
+    frontend = sources.get(frontend_name, "")
+    midday = _function(ae, "run_midday_advisor")
+    midday_source = ast.unparse(midday) if midday else ""
+    if (not midday or "context=research_context" not in midday_source
+            or "challenge_status" not in midday_source
+            or 'detail["candidate_challenge"] = "completed"' in midday_source):
+        issues.append("FINAL-G19: scheduled candidate challenge can lose context or mask failure")
+    runner_source = ast.unparse(runner)
+    if "market_now=dt.datetime.now(adaptive.TZ)" not in runner_source:
+        issues.append("FINAL-G19: scheduler does not supply an explicit Asia/Shanghai instant")
+    run_analysis_source = ast.unparse(_function(aa, "run_analysis") or aa)
+    identity_helper = _function(aa, "_analysis_business_key")
+    identity_source = ast.unparse(identity_helper) if identity_helper else ""
+    identity_return = next((node for node in ast.walk(identity_helper or aa)
+                            if isinstance(node, ast.Return) and isinstance(node.value, ast.Tuple)), None)
+    if ("_analysis_business_key" not in run_analysis_source
+            or "target_identity" not in identity_source
+            or identity_return is None or "target_identity" not in ast.unparse(identity_return.value.elts[0])):
+        issues.append("FINAL-G20: ai_analysis idempotency key omits portfolio identity")
+
+    list_specs = {
+        "backend/adaptive_risk.py": ("risk_candidate_facts", "risk_candidate_fact"),
+        "backend/adaptive_selection.py": ("selection_candidate_facts", "selection_candidate_fact"),
+        "backend/learning_evaluation.py": ("experiment_evaluation_facts", "experiment_evaluation_fact"),
+        "backend/adaptive_engine.py": ("adaptive_run_facts", "adaptive_run_fact"),
+        "backend/paper_trading.py": ("paper_job_run_facts", "paper_job_run_fact"),
+    }
+    for filename, (function_name, fact_name) in list_specs.items():
+        tree = ast.parse(sources.get(filename, ""))
+        node = _function(tree, function_name)
+        has_offset_query = any("OFFSET ?" in value.upper() for value in _string_constants(node or tree))
+        if not has_offset_query or fact_name not in _calls(node or tree):
+            issues.append(f"FINAL-G21: {function_name} no longer pages through owner facts")
+
+    manual = _function(ae, "run_advisor_review")
+    suite = _function(ae, "run_advisor_suite")
+    manual_source = ast.unparse(manual) if manual else ""
+    suite_source = ast.unparse(suite) if suite else ""
+    if "research_task_result" not in manual_source or "account_id" not in manual_source or "cycle_id" not in manual_source:
+        issues.append("FINAL-G22: manual P&L result or portfolio context is discarded")
+    if "research_suite_results" not in suite_source:
+        issues.append("FINAL-G22: suite result statuses are discarded")
+    run_action_source = _js_function(frontend, "runAdaptiveResearchTask")
+    suite_action_source = _js_function(frontend, "runAdaptiveResearchSuite")
+    analyze_action_source = _js_function(frontend, "retryAdaptiveAiWindow")
+    if ("&account_id=" not in run_action_source or "&cycle_id=" not in run_action_source
+            or "adaptiveResearchContext" not in run_action_source
+            or "&account_id=" not in suite_action_source or "&cycle_id=" not in suite_action_source
+            or "research_suite_results" not in frontend):
+        issues.append("FINAL-G22: manual P&L action omits account/cycle or visible result statuses")
+    if ("adaptiveShanghaiDate" not in frontend or "adaptiveLocalDate()" in run_action_source
+            or "adaptiveLocalDate()" in suite_action_source
+            or "adaptiveResearchAsOf" not in analyze_action_source
+            or "researchContext.asOf" not in run_action_source
+            or "researchContext.asOf" not in suite_action_source
+            or "Asia/Shanghai" not in _js_function(frontend, "adaptiveShanghaiDate")):
+        issues.append("FINAL-G23: canonical research as_of can use browser-local date")
+
+    if "account_id: str | None = Query" not in sources.get(api_name, "") or "cycle_id: int | None = Query" not in sources.get(api_name, ""):
+        issues.append("FINAL-G22: advisor API no longer accepts explicit portfolio context")
 
     collector_names = ("_candidate_evidence", "_incident_evidence", "_overfit_evidence",
                        "_event_evidence", "_collect_typed_events")
@@ -156,9 +233,17 @@ def architecture_violations(sources: dict[str, str]) -> list[str]:
 
 def _load_sources() -> dict[str, str]:
     sources = {}
-    for name in ("deepseek_research.py", "ai_analysis.py"):
+    names = (
+        "deepseek_research.py", "ai_analysis.py", "adaptive_engine.py", "adaptive_runner.py",
+        "adaptive_risk.py", "adaptive_selection.py", "learning_evaluation.py",
+        "paper_trading.py", "api_adaptive.py",
+    )
+    for name in names:
         with open(os.path.join(BACKEND, name), encoding="utf-8") as stream:
             sources[f"backend/{name}"] = stream.read()
+    frontend_path = os.path.join(ROOT, "frontend", "src", "features", "adaptive.js")
+    with open(frontend_path, encoding="utf-8") as stream:
+        sources["frontend/src/features/adaptive.js"] = stream.read()
     return sources
 
 

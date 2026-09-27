@@ -32,8 +32,32 @@ export function adaptiveJsonObject(value){
 }
 
 export function adaptiveLocalDate(){
-  var now=new Date();
-  return now.getFullYear()+'-'+String(now.getMonth()+1).padStart(2,'0')+'-'+String(now.getDate()).padStart(2,'0');
+  return adaptiveShanghaiDate();
+}
+
+export function adaptiveShanghaiDate(instant=new Date()){
+  var parts=new Intl.DateTimeFormat('en-CA',{timeZone:'Asia/Shanghai',year:'numeric',month:'2-digit',day:'2-digit'}).formatToParts(instant);
+  var values={};parts.forEach(function(part){if(part.type!=='literal') values[part.type]=part.value;});
+  return values.year+'-'+values.month+'-'+values.day;
+}
+
+function adaptiveResearchContext(){
+  var asOf=$('adaptiveResearchAsOf')&&$('adaptiveResearchAsOf').value;
+  var account=$('adaptiveResearchAccount')&&$('adaptiveResearchAccount').value.trim();
+  var cycle=$('adaptiveResearchCycle')&&$('adaptiveResearchCycle').value.trim();
+  if(!asOf) throw new Error('请选择研究业务日');
+  if(Boolean(account)!==Boolean(cycle)) throw new Error('账户和周期必须同时填写');
+  if(cycle&&(!/^\d+$/.test(cycle)||Number(cycle)<1)) throw new Error('周期 ID 必须是正整数');
+  return {asOf:asOf,accountId:account,cycleId:cycle};
+}
+
+function adaptiveResearchResultNotice(payload){
+  var results=payload&&payload.research_suite_results;
+  var target=$('adaptiveResearchSuiteResults');
+  if(!target||!Array.isArray(results)||!results.length) return;
+  target.innerHTML='<b>本次研究执行结果</b><ul>'+results.map(function(item){
+    return '<li>'+adaptiveEsc(item.purpose||'unknown')+'：'+adaptiveEsc(item.status||'unknown')+(item.error_code?'（'+adaptiveEsc(item.error_code)+'）':'')+'</li>';
+  }).join('')+'</ul>';
 }
 
 export function adaptiveTimelineRows(payload){
@@ -129,7 +153,7 @@ export async function refreshAdaptiveTimeline(base){
 export async function retryAdaptiveAiWindow(encodedWindow){
   var windowName='manual'; try{windowName=decodeURIComponent(encodedWindow||'manual');}catch(ignore){}
   var confirmation=await adaptiveConfirm({title:'重试分时段 AI 分析',detail:'将重新生成该时段的确定性快照与影子建议。',boundary:'不会下单、不会直接应用 AI 调参；结果仍需人工确认。'}); if(!confirmation.approved) return;
-  try{var instant=new Date();var asOf=adaptiveLocalDate();var marketNow=instant.toISOString();await apiPost('/api/adaptive/ai/analyze?trigger=manual-retry&window='+encodeURIComponent(windowName)+'&scope=all&as_of='+encodeURIComponent(asOf)+'&market_now='+encodeURIComponent(marketNow)+'&confirmed=true');await refreshAdaptiveTimeline(window._adaptiveOverviewPayload||{});}
+  try{var instant=new Date();var asOf=$('adaptiveResearchAsOf')&&$('adaptiveResearchAsOf').value;if(!asOf) throw new Error('请选择研究业务日');var marketNow=instant.toISOString();await apiPost('/api/adaptive/ai/analyze?trigger=manual-retry&window='+encodeURIComponent(windowName)+'&scope=all&as_of='+encodeURIComponent(asOf)+'&market_now='+encodeURIComponent(marketNow)+'&confirmed=true');await refreshAdaptiveTimeline(window._adaptiveOverviewPayload||{});}
   catch(e){adaptiveActionNotice('分时段 AI 分析重试失败',e.message);}
 }
 
@@ -314,7 +338,7 @@ export function renderAdaptive(d){
     +'<section class="adaptive-panel adaptive-risk-evolution"><header><div><span>PAPER RISK EVOLUTION</span><h3>模拟盘风控进化</h3></div><em>'+adaptiveEsc(adaptiveText(riskOpt.mode,'等待样本'))+'</em></header><p class="adaptive-copy">'+adaptiveEsc(adaptiveText(riskOpt.policy,'等待风控进化证据汇总。'))+'</p>'+downsideNotice+'<div class="adaptive-downside-policy"><header><b>当前已启用策略防线基准</b><span>只读展示；参数变更仍受版本、影子观察和人工放权约束</span></header>'+downsidePolicyRows+'</div><div class="adaptive-tier-track"><span><b>3日</b>快速影子</span><span><b>5日</b>明显微调</span><span><b>10日</b>标准进化</span><span><b>20日</b>完整受限区间</span></div><div class="adaptive-risk-layout"><div class="adaptive-risk-candidates">'+riskCandidateRows+'</div><aside class="adaptive-risk-side"><div class="adaptive-advisor-card"><span>AI EVIDENCE REVIEWER</span><h4>DeepSeek 数据审阅</h4><b class="'+(advisorReady?'on':'off')+'">'+adaptiveEsc(advisorState)+'</b><p>'+adaptiveEsc(adaptiveText(deepseek.truth_boundary,'证据解释器，不是真实性证明。'))+'</p></div><div class="adaptive-active-risk"><h4>已生效风控版本</h4><ul>'+activeRiskRows+'</ul></div></aside></div></section>'
     +'<section class="adaptive-panel news-learning-panel"><header><div><span>EVENT → OUTCOME → CALIBRATION</span><h3>统一情报与事件学习</h3></div><div class="adaptive-advisor-actions"><em>'+(newsLearning.mode==='paper_micro_eligible'?'有界微调资格':'影子学习')+'</em><button id="newsLearningRunButton" class="ghost" onclick="runNewsLearning()">运行新闻学习</button></div></header><p class="adaptive-copy">风控中心与自进化共用同一份新闻/公告事件账本；风控负责实时门禁，自进化负责1/3/5日兑现校准。</p>'+dynamicRiskNotice+'<div class="news-learning-flow"><span><b>01</b>采集去重</span><i></i><span><b>02</b>事件分型</span><i></i><span><b>03</b>1/3/5日兑现</span><i></i><span><b>04</b>来源校准</span><i></i><span><b>05</b>模拟盘微调</span></div><div class="news-kpis"><div><small>事件账本</small><b>'+Number(newsTotals.events||0)+'</b></div><div><small>可追溯链接</small><b>'+adaptiveValue(newsTotals.linked_pct,'%',1)+'</b></div><div><small>成熟结果</small><b>'+Number(newsTotals.mature_outcomes||0)+'</b></div><div><small>5日成熟事件</small><b>'+Number(newsTotals.mature_5d_events||0)+'</b></div></div><div class="news-learning-layout"><div><h4>最近进入账本</h4><ul class="news-event-list">'+newsEvents+'</ul></div><aside><h4>来源信誉（不使用涨跌评分）</h4><div class="news-source-list">'+newsSources+'</div><h4>微调门禁</h4><div class="news-gates">'+newsGateRows+'</div></aside></div><div class="adaptive-notice">'+adaptiveEsc(newsLearning.authority||'当前仅影子记录。')+'</div></section>'
     +'<section class="adaptive-panel adaptive-advisor-evidence"><header><div><span>DEEPSEEK · DATA QUALITY + TUNING</span><h3>模拟盘数据校验与有界调参</h3></div><div class="adaptive-advisor-actions"><em>'+adaptiveEsc(deepseek.model||'deepseek-v4-flash')+'</em><button id="advisorRunButton" class="ghost" onclick="runAdaptiveAdvisor()" '+(advisorReady?'':'disabled')+'>运行数据质量审阅</button><button id="adaptiveAiTuneInlineButton" class="ghost" onclick="runAdaptiveAiTuning()" '+(advisorReady&&aiTuning.enabled?'':'disabled')+'>运行AI有界调参</button></div></header><div class="adaptive-advisor-summary"><div><small>数据审阅</small><b>'+adaptiveEsc(advisorState)+'</b></div><div><small>AI调参状态</small><b>'+adaptiveEsc(aiTuningState)+'</b></div><div><small>确定性异常</small><b>'+Number(deterministicCount)+'</b></div><div><small>审阅置信度</small><b>'+adaptiveValue(advisorReport.confidence,'%',0)+'</b></div><div><small>跨源真实性</small><b class="'+(advisorReport.cross_source_status==='verified'?'up':'down')+'">'+crossSourceLabel+'</b></div><div><small>双源覆盖 / 一致</small><b>'+adaptiveValue(crossSource.coverage_pct,'%',1)+' / '+adaptiveValue(crossSource.agreement_pct,'%',1)+'</b></div></div><div class="adaptive-advisor-report"><div><h4>审阅摘要</h4><p>'+adaptiveEsc(advisorReport.summary||deepseek.truth_boundary||'DeepSeek只复核确定性证据；行情真实性仍需独立数据源交叉验证。')+'</p><small>市场状态：'+(advisorMarket.session_status==='closed'?'已收盘':'交易中')+' · 收盘口径 '+adaptiveEsc(String(advisorMarket.close_cutoff_at||'—').replace('T',' '))+' · 源行情最后到达 '+adaptiveEsc(String(advisorMarket.latest_source_at||'—').replace('T',' '))+' · 最近审阅 '+adaptiveEsc(String(advisorLatest.finished_at||'—').replace('T',' '))+'</small></div><ul>'+advisorFindings+'</ul></div><div class="adaptive-notice">AI只可在已启用的模拟策略内提出白名单权重、入场阈值和选股条件的小步补丁；系统先做行情质量、跨源、幅度、冷却和回滚校验，再允许盘中同日生效。AI不能下单、修改公共选股或放宽风控；超出边界的建议只留在影子候选中。</div></section>'
-    +'<section class="adaptive-panel adaptive-research-suite"><header><div><span>DEEPSEEK · PAPER RESEARCH SUITE</span><h3>模拟盘智能研究任务</h3></div><button id="advisorSuiteButton" class="ghost" onclick="runAdaptiveResearchSuite()" '+(advisorReady?'':'disabled')+'>运行全部研究任务</button></header><p class="adaptive-copy">收盘后自动运行；每项独立留痕。结论只能进入研究和人工复核，不能直接改选股、风控或订单。</p><div class="adaptive-research-grid">'+researchCards+'</div></section>'
+    +'<section class="adaptive-panel adaptive-research-suite"><header><div><span>DEEPSEEK · PAPER RESEARCH SUITE</span><h3>模拟盘智能研究任务</h3></div><button id="advisorSuiteButton" class="ghost" onclick="runAdaptiveResearchSuite()" '+(advisorReady?'':'disabled')+'>运行全部研究任务</button></header><p class="adaptive-copy">收盘后自动运行；每项独立留痕。结论只能进入研究和人工复核，不能直接改选股、风控或订单。</p><div class="adaptive-research-context"><label>研究业务日 <input id="adaptiveResearchAsOf" type="date" value="'+adaptiveShanghaiDate()+'"></label><label>账户 ID <input id="adaptiveResearchAccount" type="text" maxlength="40" autocomplete="off" placeholder="P&amp;L 归因时填写"></label><label>周期 ID <input id="adaptiveResearchCycle" type="number" min="1" step="1" placeholder="P&amp;L 归因时填写"></label><span>单独运行 P&amp;L 归因需同时填写账户和周期；套件未填写时会明确标记该项不可用。</span></div><div id="adaptiveResearchSuiteResults" class="adaptive-research-results" aria-live="polite"></div><div class="adaptive-research-grid">'+researchCards+'</div></section>'
     +'<section class="adaptive-panel"><header><div><span>CONTEXTUAL BANDIT</span><h3>策略集合影子分配</h3></div><em>总和 100% · 不改变账户资金</em></header><div class="adaptive-strategy-grid">'+strategyCards+'</div>'+allocationActionPanel(d)+'<div class="adaptive-notice">'+adaptiveEsc(d.data_note||'')+'</div></section>'
     +'<section class="adaptive-panel"><header><div><span>EVOLUTION A/B · VERSION ATTRIBUTION</span><h3>进化版本对照归因</h3></div><em>部署后 5 净值日 vs 部署前等长基线</em></header>'+abValidationPanel(d)+'</section>'
     +'<div class="adaptive-grid"><section class="adaptive-panel"><header><div><span>GENETIC ALGORITHM</span><h3>GA Alpha 实验室</h3></div><em>非神经网络</em></header><p class="adaptive-copy">'+alpha.architecture+'</p><div class="adaptive-progress-copy"><span>画像日 '+Number(alpha.profile_days||0)+' / '+Number(alpha.required_profile_days||10)+'</span><span>成熟标签 '+Number(alpha.mature_rows||0)+' / '+Number(alpha.required_mature_rows||5000)+'</span></div>'+adaptiveBar(alphaProgress,'ga')+'<ul class="adaptive-alpha-list">'+candidateRows+'</ul></section><section class="adaptive-panel"><header><div><span>MULTI-HORIZON REWARD</span><h3>策略周期兑现</h3></div><em>1日 20% · 3日 35% · 5日 45%</em></header><div class="table-scroll"><table class="adaptive-horizon-table"><thead><tr><th>策略</th><th>1日超额</th><th>3日超额</th><th>5日超额</th></tr></thead><tbody>'+horizonRows+'</tbody></table></div></section></div>'
@@ -721,9 +745,12 @@ export async function runAdaptiveAdvisor(){
 }
 
 export async function runAdaptiveResearchTask(purpose,button){
+  var researchContext;
+  try{researchContext=adaptiveResearchContext();}catch(e){adaptiveActionNotice('研究任务缺少明确上下文',e.message);return;}
+  if(purpose==='pnl_attribution'&&(!researchContext.accountId||!researchContext.cycleId)){adaptiveActionNotice('P&L 归因需要账户和周期','请在研究面板明确填写账户 ID 与周期 ID 后重试。');return;}
   var confirmation=await adaptiveConfirm({title:'运行研究任务',detail:'将运行该项 AI 研究并写入可追溯的影子证据。',boundary:'不会直接改变策略参数或交易。'}); if(!confirmation.approved) return;
   if(button){button.disabled=true;button.textContent='运行中…';}
-  try{var researchNow=new Date();renderAdaptive(await apiPost('/api/adaptive/advisor/run?trigger=manual-ui&purpose='+encodeURIComponent(purpose)+'&as_of='+encodeURIComponent(adaptiveLocalDate())+'&market_now='+encodeURIComponent(researchNow.toISOString())+'&confirmed=true'));}
+  try{var researchNow=new Date();var query='/api/adaptive/advisor/run?trigger=manual-ui&purpose='+encodeURIComponent(purpose)+'&as_of='+encodeURIComponent(researchContext.asOf)+'&market_now='+encodeURIComponent(researchNow.toISOString())+'&confirmed=true';if(researchContext.accountId){query+='&account_id='+encodeURIComponent(researchContext.accountId)+'&cycle_id='+encodeURIComponent(researchContext.cycleId);}var result=await apiPost(query);renderAdaptive(result);adaptiveResearchResultNotice({research_suite_results:[result.research_task_result].filter(Boolean)});}
   catch(e){
     var handled=await handleOperatorError(e, '运行研究任务', function(){ return runAdaptiveResearchTask(purpose, button); });
     if(!handled) adaptiveActionNotice('研究任务失败',e.message);
@@ -732,9 +759,11 @@ export async function runAdaptiveResearchTask(purpose,button){
 }
 
 export async function runAdaptiveResearchSuite(){
+  var researchContext;
+  try{researchContext=adaptiveResearchContext();}catch(e){adaptiveActionNotice('研究套件缺少明确上下文',e.message);return;}
   var confirmation=await adaptiveConfirm({title:'运行全部研究任务',detail:'将依次运行已启用的 AI 研究任务。',boundary:'只生成研究证据，不会直接交易或放宽风控。'}); if(!confirmation.approved) return;
   var button=$('advisorSuiteButton'); if(button){button.disabled=true;button.textContent='研究套件运行中…';}
-  try{var researchNow=new Date();renderAdaptive(await apiPost('/api/adaptive/advisor/suite?trigger=manual-suite&as_of='+encodeURIComponent(adaptiveLocalDate())+'&market_now='+encodeURIComponent(researchNow.toISOString())+'&confirmed=true'));}
+  try{var researchNow=new Date();var query='/api/adaptive/advisor/suite?trigger=manual-suite&as_of='+encodeURIComponent(researchContext.asOf)+'&market_now='+encodeURIComponent(researchNow.toISOString())+'&confirmed=true';if(researchContext.accountId){query+='&account_id='+encodeURIComponent(researchContext.accountId)+'&cycle_id='+encodeURIComponent(researchContext.cycleId);}var result=await apiPost(query);renderAdaptive(result);adaptiveResearchResultNotice(result);}
   catch(e){
     var handled=await handleOperatorError(e, '运行全部研究任务', runAdaptiveResearchSuite);
     if(!handled) adaptiveActionNotice('研究套件失败',e.message);

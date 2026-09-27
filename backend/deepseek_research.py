@@ -822,7 +822,10 @@ def run_suite(connect_factory, paper_db_path, trigger="post-close", *, context=N
     results = []
     for purpose in TASKS:
         events = evidence_by_purpose[purpose]
-        if len(events) == 1 and isinstance(events[0], Exception):
+        if purpose == "pnl_attribution" and not context.targets:
+            result = {"id": None, "purpose": purpose, "status": "failed",
+                      "error_code": "attribution_context_required", "latency_ms": 0}
+        elif len(events) == 1 and isinstance(events[0], Exception):
             result = {"id": None, "purpose": purpose, "status": "failed",
                       "error_code": f"evidence_{type(events[0]).__name__}"[:80],
                       "latency_ms": 0}

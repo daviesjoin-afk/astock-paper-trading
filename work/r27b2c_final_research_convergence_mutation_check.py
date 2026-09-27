@@ -85,6 +85,16 @@ def main() -> int:
          lambda s: _inject(s, "_incident_evidence", "verified = projection.status == 'completed'")),
         ("M-FINAL-18", "owner verification leaks into model payload", "backend/deepseek_research.py",
          lambda s: s.replace('"is_verified", "outcome",', '"verified_flag", "outcome",', 1)),
+        ("M-FINAL-19", "scheduled challenge ignores failed result", "backend/adaptive_engine.py",
+         lambda s: s.replace("context=research_context,", "", 1)),
+        ("M-FINAL-20", "ai_analysis business key drops target identity", "backend/ai_analysis.py",
+         lambda s: s.replace(":targets:{target_identity}", "", 1)),
+        ("M-FINAL-21", "owner list returns to LIMIT before as_of", "backend/adaptive_risk.py",
+         lambda s: s.replace("LIMIT ? OFFSET ?", "LIMIT ?", 1)),
+        ("M-FINAL-22", "manual P&L action drops account/cycle context", "frontend/src/features/adaptive.js",
+         lambda s: s.replace("if(researchContext.accountId){query+='&account_id='+encodeURIComponent(researchContext.accountId)+'&cycle_id='+encodeURIComponent(researchContext.cycleId);}", "")),
+        ("M-FINAL-23", "canonical date uses browser timezone", "frontend/src/features/adaptive.js",
+         lambda s: s.replace("timeZone:'Asia/Shanghai'", "timeZone:Intl.DateTimeFormat().resolvedOptions().timeZone", 1)),
     ]
 
     detected = 0
