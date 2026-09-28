@@ -8,13 +8,17 @@
 from __future__ import annotations
 
 import datetime as dt
+import ast
+import hashlib
 import os
 import re
 import types
 import unittest
+from dataclasses import replace
 from unittest import mock
 
 import execution_planner as EP
+import simulation_runtime_context as SRC
 
 BACKEND_DIR = os.path.dirname(os.path.abspath(__file__))
 NOW = "2026-09-08 10:00:00"
@@ -451,6 +455,41 @@ class SimulationExecutionContractTests(unittest.TestCase):
         locked_result = EP.evaluate_simulated_execution(self._intent(), locked)
         self.assertIn(EP.ExecutionReason.PRICE_LIMIT_LOCKED.value, locked_result.reasons)
 
+    def test_formal_and_explicit_state_decisions_match_across_execution_gates(self):
+        cases = (
+            (self._facts(liquidity=200_000)[1], self._intent()),
+            (self._facts(sellable=0)[1], self._intent(side="sell")),
+            (replace(self._facts(liquidity=200_000)[1], buying_power=0.0),
+             self._intent()),
+            (self._facts(liquidity=30_000)[1], self._intent()),
+            (self._facts(can_buy=False, buy_reason="suspended")[1], self._intent()),
+            (self._facts(can_buy=False, buy_reason="buy_limit_locked")[1],
+             self._intent()),
+        )
+        for formal_context, intent in cases:
+            with self.subTest(reasons=formal_context.tradability.to_dict()):
+                explicit_context = EP.execution_context_from_state(
+                    order={"code": intent.symbol, "side": intent.side},
+                    quote=dict(formal_context.quote),
+                    asof_day=formal_context.session_date,
+                    market_reading=formal_context.market_reading,
+                    tradability=formal_context.tradability,
+                    available_liquidity=formal_context.available_liquidity,
+                    state=EP.ExecutionStateSnapshot(
+                        buying_power=formal_context.buying_power,
+                        sellable_quantity=formal_context.sellable_quantity,
+                        already_filled_quantity=formal_context.already_filled_quantity,
+                        same_day_consumed_quantity=formal_context.same_day_consumed_quantity,
+                        current_order_status=formal_context.current_order_status,
+                        lot_size=formal_context.lot_size,
+                        participation_rate=formal_context.participation_rate,
+                    ),
+                )
+                self.assertEqual(
+                    EP.evaluate_simulated_execution(intent, formal_context),
+                    EP.evaluate_simulated_execution(intent, explicit_context),
+                )
+
     def test_invalid_lot_and_cancelled_order_cannot_fill(self):
         _, context = self._facts()
         invalid = EP.evaluate_simulated_execution(self._intent(qty=150), context)
@@ -832,6 +871,134 @@ class PlanEntryTests(_StubbedPlannerTest):
         self.assertIn("单日亏损已触发熔断", reasons)
         self.assertTrue(any("共享资金池可用现金不足" in item for item in reasons))
         self.assertTrue(any("成交行情未通过校验" in item for item in reasons))
+
+    def test_formal_adapter_and_explicit_entry_state_are_equivalent(self):
+        stub = types.SimpleNamespace(**vars(_pt_stub()),
+            _execution_quote_status=lambda quote, day, purpose="entry": {"fresh": True},
+            _security_scope=lambda code, name=None, risk_flag=None: {"allowed": True},
+            _pending_buy_reservations=lambda conn, exclude_order_key=None: (None, 125.0),
+            _shared_cash=lambda conn: 100000.0,
+        )
+        reserve = {"reserved": False, "owner": None, "interest": 0,
+                   "deadline": EP._SEAT_RESERVE_DEADLINE,
+                   "planner": EP.EXECUTION_PLANNER_VERSION}
+        with mock.patch.object(EP, "_pt", lambda: stub), \
+                mock.patch.object(EP, "seat_reserve_gate", lambda *a, **k: reserve):
+            formal = EP.plan_entry(
+                None, account={"id": "tq_breakout"}, code="002241", side="buy",
+                quote={"price": 21.5, "name": "test"}, asof_day=dt.date(2026, 9, 8),
+                market={"light": "green"}, open_codes={"600000"},
+                committed_open_codes={"600000"},
+                pool_open_positions={("tq_breakout", "600000")},
+                position_limit=4, pool_limit=6,
+                risk_state={"blocked": False, "reasons": []},
+                amount=2500.0, fees=2.5,
+            )
+            isolated = EP.evaluate_entry_state(
+                state=EP.EntryGateState(
+                    open_codes=frozenset({"600000"}),
+                    committed_open_codes=frozenset({"600000"}),
+                    pool_open_positions=frozenset({("tq_breakout", "600000")}),
+                    position_limit=4, pool_limit=6, capacity_available=True,
+                    seat_reserve=reserve,
+                    pending_cash=125.0, shared_cash=100000.0,
+                    account_risk_state={"blocked": False, "reasons": []},
+                    market_state={"light": "green"},
+                ),
+                account_id="tq_breakout", code="002241", side="buy",
+                quote={"price": 21.5, "name": "test"},
+                asof_day=dt.date(2026, 9, 8), amount=2500.0, fees=2.5,
+            )
+        self.assertEqual(formal, isolated)
+
+
+class ExecutionStateBuilderTests(unittest.TestCase):
+    def test_explicit_state_builder_is_bit_identical_to_formal_context_shape(self):
+        formal = _valid_execution_context(side="buy", quantity=100, sellable=300,
+                                          already_filled=0)
+        isolated = EP.execution_context_from_state(
+            order={"code": "002241", "side": "buy"},
+            quote=dict(formal.quote), asof_day=formal.session_date,
+            market_reading=formal.market_reading,
+            tradability=formal.tradability,
+            available_liquidity=formal.available_liquidity,
+            state=EP.ExecutionStateSnapshot(
+                buying_power=50000.0, sellable_quantity=300,
+                already_filled_quantity=0, same_day_consumed_quantity=0,
+                current_order_status="pending_execution",
+            ),
+        )
+        intent = EP.PersistedOrderIntent(
+            order_id=7, account_id="tq_breakout", cycle_id=8,
+            strategy_id=None, strategy_version=None, strategy_checksum=None,
+            signal_id=None, symbol="002241", side="buy", desired_quantity=100,
+            intent_at=NOW, reference_price=21.5,
+        )
+        formal = replace(formal, buying_power=50000.0)
+        self.assertEqual(
+            EP.evaluate_simulated_execution(intent, formal),
+            EP.evaluate_simulated_execution(intent, isolated),
+        )
+
+    def test_execution_audit_keeps_new_context_and_legacy_unknown_explicit(self):
+        context = _valid_execution_context()
+        sha = lambda value: hashlib.sha256(value.encode("utf-8")).hexdigest()
+        runtime = SRC.build_comparable_runtime_context(
+            strategy_id="trend_pullback", strategy_version=1,
+            strategy_checksum=sha("strategy"), session_date="2026-09-08",
+            decision_at=NOW, market_policy_name="execution_quote",
+            market_snapshot_fingerprint=sha("market"),
+            symbol_quote_fingerprints={"002241": sha("quote")},
+            tradability_evidence_fingerprints={"002241@2026-09-08": sha("tradability")},
+            execution_ruleset_version=EP.SIMULATION_EXECUTION_RULESET,
+            risk_policy_identity={"strategy_profile": {"max_positions": 4}},
+        )
+        context = replace(context, runtime_context=runtime)
+        intent = EP.PersistedOrderIntent(
+            order_id=7, account_id="tq_breakout", cycle_id=8,
+            strategy_id="trend_pullback", strategy_version=1,
+            strategy_checksum=sha("strategy"), signal_id=None,
+            symbol="002241", side="buy", desired_quantity=100,
+            intent_at=NOW, reference_price=21.5,
+        )
+        decision = EP.evaluate_simulated_execution(intent, context)
+        recorded = EP._decision_evidence(decision, context)
+        self.assertEqual(runtime.context_fingerprint,
+                         recorded["runtime_context_fingerprint"])
+        self.assertEqual(runtime.projection(), recorded["runtime_context"])
+        self.assertEqual("available", recorded["runtime_context_availability"])
+
+        legacy = EP._decision_evidence(decision, replace(context, runtime_context=None))
+        self.assertIsNone(legacy["runtime_context_fingerprint"])
+        self.assertEqual("active_runtime_context_unavailable",
+                         legacy["runtime_context_availability"])
+
+    def test_explicit_execution_state_builder_has_no_ledger_reads(self):
+        import pathlib
+
+        tree = ast.parse(pathlib.Path(EP.__file__).read_text(encoding="utf-8"))
+        function = next(node for node in tree.body
+                        if isinstance(node, ast.FunctionDef)
+                        and node.name == "execution_context_from_state")
+        names = {node.id for node in ast.walk(function) if isinstance(node, ast.Name)}
+        attrs = {node.attr for node in ast.walk(function) if isinstance(node, ast.Attribute)}
+        self.assertNotIn("conn", names)
+        self.assertNotIn("execute", attrs)
+        self.assertNotIn("connect", attrs)
+
+    def test_execution_fee_model_has_one_canonical_call_site(self):
+        import pathlib
+
+        tree = ast.parse(pathlib.Path(EP.__file__).read_text(encoding="utf-8"))
+        evaluator = next(node for node in tree.body
+                         if isinstance(node, ast.FunctionDef)
+                         and node.name == "evaluate_simulated_execution")
+        calls = [node.func.id for node in ast.walk(evaluator)
+                 if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)]
+        self.assertIn("estimate_execution_fees", calls)
+        self.assertEqual(1, sum(isinstance(node, ast.FunctionDef)
+                                and node.name == "estimate_execution_fees"
+                                for node in tree.body))
 
 
 class ExecutionEstimateTests(unittest.TestCase):

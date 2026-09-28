@@ -40,7 +40,7 @@ AUDIT_PATH = BACKEND / "paper_decision_audit.py"
 # are the contract keys of the envelope, so a renamed copy of the algorithm
 # still has to contain them.
 SERIALIZER_SENTINELS = {
-    "decision-snapshot-v1",
+    "decision-snapshot-v2",
     "rows_stored",
     "omitted_rows",
     "future_excluded",
@@ -77,6 +77,7 @@ RUNTIME_INJECTION_KEYWORDS = {
     "news_scan_meta",
     "risk_version",
     "now_fn",
+    "runtime_context",
 }
 
 
@@ -174,6 +175,18 @@ class DecisionSnapshotFacadeDelegationTests(unittest.TestCase):
         self.assertIs(recorded["news_scan_meta"], paper._NEWS_SCAN_META)
         self.assertEqual(recorded["risk_version"], paper.RISK_VERSION)
         self.assertIs(recorded["now_fn"], paper._now)
+
+    def test_runtime_context_is_forwarded_to_the_canonical_audit_owner(self):
+        runtime_context = object()
+        recorded = {}
+
+        def fake(payload=None, **kwargs):
+            recorded.update(kwargs)
+            return {}
+
+        with mock.patch.object(audit, "build_decision_snapshot", side_effect=fake):
+            paper._decision_snapshot({}, runtime_context=runtime_context)
+        self.assertIs(recorded["runtime_context"], runtime_context)
 
     def test_reads_patched_runtime_dependencies_instead_of_frozen_copies(self):
         recorded = {}

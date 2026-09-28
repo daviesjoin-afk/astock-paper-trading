@@ -14,7 +14,7 @@ import datetime as dt
 import pandas as pd
 
 
-DECISION_SNAPSHOT_VERSION = "decision-snapshot-v1"
+DECISION_SNAPSHOT_VERSION = "decision-snapshot-v2"
 DEFAULT_RISK_VERSION = "paper-risk-v4"
 _DEFAULT_NEWS_SCAN_META = {"observed_at": None, "stale": False, "error": None}
 
@@ -224,6 +224,7 @@ def build_decision_snapshot(
     news_scan_meta=None,
     risk_version=DEFAULT_RISK_VERSION,
     now_fn=None,
+    runtime_context=None,
 ):
     """Build one point-in-time evidence envelope without changing trade rules."""
     payload = payload if isinstance(payload, dict) else {}
@@ -397,6 +398,16 @@ def build_decision_snapshot(
         )
     )
     clock = now_fn if callable(now_fn) else _now
+    context_projection = None
+    context_fingerprint = None
+    if runtime_context is not None:
+        projection = getattr(runtime_context, "projection", None)
+        if callable(projection):
+            context_projection = projection()
+            context_fingerprint = getattr(runtime_context, "context_fingerprint", None)
+        elif isinstance(runtime_context, dict):
+            context_projection = dict(runtime_context)
+            context_fingerprint = context_projection.get("context_fingerprint")
     return snapshot_safe(
         {
             "version": DECISION_SNAPSHOT_VERSION,
@@ -437,6 +448,11 @@ def build_decision_snapshot(
                     or selection_meta
                 ),
             },
+            "runtime_context": context_projection,
+            "runtime_context_fingerprint": context_fingerprint,
+            "runtime_context_availability": (
+                "available" if context_fingerprint else "active_runtime_context_unavailable"
+            ),
             "data_quality": data_quality,
             "final": {
                 "score": final_score,

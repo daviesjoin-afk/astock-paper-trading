@@ -1231,7 +1231,7 @@ _snapshot_factor_evidence = PDA._snapshot_factor_evidence
 def _decision_snapshot(
     payload=None, *, account_id=None, code=None, side=None, decision=None,
     reason=None, asof_date=None, quote=None, kline=None, news=None,
-    final_score=None, decision_at=None,
+    final_score=None, decision_at=None, runtime_context=None,
 ):
     """Compatibility facade for the extracted point-in-time audit serializer.
 
@@ -1256,17 +1256,20 @@ def _decision_snapshot(
         news_scan_meta=_NEWS_SCAN_META,
         risk_version=RISK_VERSION,
         now_fn=_now,
+        runtime_context=runtime_context,
     )
 
 
 def _with_decision_snapshot(payload=None, **kwargs):
     """Compatibility facade that injects runtime dependencies then delegates."""
+    runtime_context = kwargs.pop("runtime_context", None)
     return PDA.with_decision_snapshot(
         payload,
         kline_loader=_completed_kline,
         news_scan_meta=_NEWS_SCAN_META,
         risk_version=RISK_VERSION,
         now_fn=_now,
+        runtime_context=runtime_context,
         **kwargs,
     )
 

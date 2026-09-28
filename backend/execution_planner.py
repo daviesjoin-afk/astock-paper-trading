@@ -44,6 +44,8 @@ import paper_trading_rules as PTR
 __all__ = [
     "EXECUTION_PLANNER_VERSION",
     "ExecutionPolicy",
+    "ExecutionStateSnapshot",
+    "EntryGateState",
     "ExecutionContext",
     "ExecutionDecision",
     "ExecutionReason",
@@ -51,18 +53,24 @@ __all__ = [
     "PersistedOrderIntent",
     "account_risk_gate",
     "capacity_gate",
+    "capacity_gate_from_state",
     "cash_gate",
+    "cash_gate_from_state",
     "commit_fill",
     "estimate_execution_fees",
     "estimate_execution_terms",
     "estimated_fill_price",
+    "execution_context_from_facts",
+    "execution_context_from_state",
     "evaluate_simulated_execution",
+    "evaluate_entry_state",
     "market_gate",
     "plan_entry",
     "policy_for",
     "quote_gate",
     "revalidate_order_plan",
     "seat_reserve_gate",
+    "seat_reserve_from_state",
     "security_gate",
 ]
 
@@ -173,6 +181,7 @@ class ExecutionContext:
     lot_size: int = 100
     participation_rate: float = MAX_VOLUME_PARTICIPATION
     ruleset_version: str = SIMULATION_EXECUTION_RULESET
+    runtime_context: Any = None
 
     def __post_init__(self):
         object.__setattr__(self, "quote", _freeze_evidence(self.quote))
@@ -238,6 +247,51 @@ def _freeze_evidence(value):
     if isinstance(value, tuple):
         return tuple(_freeze_evidence(item) for item in value)
     return value
+
+
+@dataclass(frozen=True, slots=True)
+class ExecutionStateSnapshot:
+    """Explicit mutable-state values needed by the pure execution authority."""
+
+    buying_power: float | None = None
+    sellable_quantity: int | None = None
+    already_filled_quantity: int = 0
+    same_day_consumed_quantity: int = 0
+    current_order_status: str = "pending_execution"
+    lot_size: int = 100
+    participation_rate: float = MAX_VOLUME_PARTICIPATION
+
+
+def execution_context_from_state(
+    *, order: Mapping[str, Any], quote: Mapping[str, Any], asof_day: Any,
+    market_reading: Any, tradability: Any, available_liquidity: int,
+    state: ExecutionStateSnapshot, runtime_context: Any = None,
+) -> ExecutionContext:
+    """Build canonical execution inputs from facts and explicit isolated state.
+
+    This function performs no DB/provider/filesystem/time reads. Formal paper
+    and future isolated-simulation adapters supply their own state snapshots.
+    """
+    if not isinstance(state, ExecutionStateSnapshot):
+        raise TypeError("execution state snapshot is required")
+    day = MDC.canonical_day(asof_day) or ""
+    execution_asof = (quote or {}).get("execution_asof")
+    return ExecutionContext(
+        session_date=day,
+        execution_asof=str(execution_asof or "") or None,
+        quote=dict(quote or {}),
+        market_reading=market_reading,
+        tradability=tradability,
+        available_liquidity=max(0, int(available_liquidity)),
+        sellable_quantity=state.sellable_quantity,
+        buying_power=state.buying_power,
+        already_filled_quantity=max(0, int(state.already_filled_quantity)),
+        same_day_consumed_quantity=max(0, int(state.same_day_consumed_quantity)),
+        current_order_status=str(state.current_order_status or "pending_execution"),
+        lot_size=max(1, int(state.lot_size)),
+        participation_rate=float(state.participation_rate),
+        runtime_context=runtime_context,
+    )
 
 
 def market_reading_for_execution(quote: Mapping[str, Any], *, asof_day, execution_asof):
@@ -398,21 +452,71 @@ def execution_context_from_facts(
     price = _positive_number(quote.get("price"))
     amount = _positive_number(quote.get("amount"))
     liquidity = max(0, int(amount / price)) if price and amount else 0
-    return ExecutionContext(
-        session_date=day,
-        execution_asof=str(execution_asof or "") or None,
-        quote=quote,
-        market_reading=reading,
-        tradability=tradability,
-        available_liquidity=liquidity,
-        sellable_quantity=sellable,
+    state = ExecutionStateSnapshot(
         buying_power=buying_power,
+        sellable_quantity=sellable,
         already_filled_quantity=int(row.get("filled_qty") or 0),
         same_day_consumed_quantity=consumed_session_quantity(
             conn, row.get("code"), day, execution_asof,
         ),
         current_order_status=str(row.get("status") or ""),
     )
+    runtime_context = _runtime_context_for_order(
+        conn, row, quote=quote, asof_day=day, reading=reading,
+        tradability=tradability,
+    )
+    return execution_context_from_state(
+        order=row, quote=quote, asof_day=day, market_reading=reading,
+        tradability=tradability, available_liquidity=liquidity,
+        state=state, runtime_context=runtime_context,
+    )
+
+
+def _runtime_context_for_order(conn, order, *, quote, asof_day, reading, tradability):
+    """Bind an Active execution audit to exact cycle/version and owner facts."""
+    row = dict(order or {})
+    try:
+        strategy_id = str(row.get("strategy_id") or "")
+        version = int(row.get("strategy_version"))
+        checksum = str(row.get("strategy_checksum") or "")
+        cycle_id = int(row.get("cycle_id"))
+        if not strategy_id or reading is None or reading.snapshot is None:
+            return None
+        if not bool(getattr(tradability, "evidence_present", False)):
+            return None
+        tradability_fingerprint = str(getattr(tradability, "fingerprint", "") or "")
+        if not tradability_fingerprint:
+            return None
+        import strategy_runtime as SRT
+        import simulation_runtime_context as SRC
+
+        runtime = SRT.get_context_for_cycle(conn, strategy_id, cycle_id=cycle_id)
+        if runtime.version != version or runtime.checksum != checksum:
+            return None
+        snapshot = MDC.symbol_quote_snapshot(quote, asof_day=asof_day)
+        if snapshot is None:
+            return None
+        risk_identity = {
+            "strategy_risk_fingerprint": runtime.risk_fingerprint.to_dict(),
+            "compiled_risk_profile": runtime.risk_profile.to_dict(),
+        }
+        return SRC.build_comparable_runtime_context(
+            strategy_id=strategy_id, strategy_version=version,
+            strategy_checksum=checksum, session_date=str(asof_day),
+            decision_at=str(quote.get("execution_asof") or ""),
+            market_policy_name=MDC.EXECUTION_QUOTE_POLICY.name,
+            market_snapshot_fingerprint=MDC.snapshot_fingerprint(reading.snapshot),
+            symbol_quote_fingerprints={
+                str(row.get("code") or ""): MDC.snapshot_fingerprint(snapshot),
+            },
+            tradability_evidence_fingerprints={
+                f"{row.get('code')}@{asof_day}": tradability_fingerprint,
+            },
+            execution_ruleset_version=SIMULATION_EXECUTION_RULESET,
+            risk_policy_identity=risk_identity,
+        )
+    except (KeyError, TypeError, ValueError, sqlite3.Error):
+        return None
 
 
 def evaluate_simulated_execution(
@@ -845,11 +949,33 @@ def seat_reserve_gate(
     now = PT._now()
     day = str(asof_day)[:10]
     deadline_at = f"{day} {policy.seat_reserve_deadline}:00" if day == now[:10] else None
-    detail.update({
-        "interest": interest,
+    return seat_reserve_from_state(
+        requester_id=requester_id, pool_open_positions=pool_open_positions,
+        pool_limit=pool_limit, interest=interest,
+        deadline_open=(deadline_at is None or now < deadline_at),
+        deadline_at=deadline_at,
+    )
+
+
+def seat_reserve_from_state(
+    *, requester_id: str, pool_open_positions, pool_limit: int,
+    interest: int, deadline_open: bool, deadline_at: str | None = None,
+) -> dict[str, Any]:
+    """Pure seat-reserve projection from already captured formal/isolated state."""
+    policy = policy_for(requester_id)
+    detail = {
+        "reserved": False,
+        "owner": policy.seat_reserve_owner or None,
+        "interest": max(0, int(interest)),
+        "deadline": policy.seat_reserve_deadline,
         "deadline_at": deadline_at,
-        "reserved": interest > 0 and (deadline_at is None or now < deadline_at),
-    })
+        "planner": EXECUTION_PLANNER_VERSION,
+    }
+    if (not policy.seat_reserve_owner or policy.holds_reserved_seat
+            or any(str(key[0]) == policy.seat_reserve_owner for key in pool_open_positions)
+            or pool_limit <= 1 or len(pool_open_positions) < pool_limit - 1):
+        return detail
+    detail["reserved"] = detail["interest"] > 0 and bool(deadline_open)
     return detail
 
 
@@ -874,6 +1000,22 @@ def capacity_gate(
         "reserved": False, "owner": None, "interest": 0,
         "deadline": _SEAT_RESERVE_DEADLINE, "planner": EXECUTION_PLANNER_VERSION,
     }
+    return capacity_gate_from_state(
+        code=code, account_id=account_id, open_codes=open_codes,
+        committed_open_codes=committed_open_codes,
+        pool_open_positions=pool_open_positions, position_limit=position_limit,
+        pool_limit=pool_limit, reserve=reserve,
+        allocation_source=allocation_source,
+        allocation_version=allocation_version,
+    )
+
+
+def capacity_gate_from_state(
+    *, code: str, account_id: str, open_codes, committed_open_codes,
+    pool_open_positions, position_limit: int, pool_limit: int,
+    reserve: Mapping[str, Any], allocation_source=None, allocation_version=None,
+) -> dict[str, Any]:
+    """Pure position/pool capacity evaluation against an explicit state snapshot."""
     gate = {
         "current": len(open_codes),
         "committed": len(committed_open_codes),
@@ -971,7 +1113,26 @@ def cash_gate(
         conn, exclude_order_key=exclude_reservation_key,
     )
     available = PT._shared_cash(conn) if shared_cash is None else float(shared_cash)
-    short = amount + fees > available - pending_cash + 1e-6
+    return cash_gate_from_state(
+        side=side, amount=amount, fees=fees, pending_cash=pending_cash,
+        shared_cash=available,
+    )
+
+
+def cash_gate_from_state(
+    *, side: str, amount: float, fees: float,
+    pending_cash: float, shared_cash: float | None,
+) -> dict[str, Any]:
+    """Pure buying-power gate over explicit available and reserved cash."""
+    if side != "buy":
+        return {"allowed": True, "reason": None, "pending_cash": 0.0,
+                "shared_cash": shared_cash}
+    if shared_cash is None:
+        return {"allowed": False, "reason": "共享资金池现金状态不可用",
+                "pending_cash": float(pending_cash), "shared_cash": None,
+                "planner": EXECUTION_PLANNER_VERSION}
+    available = float(shared_cash)
+    short = amount + fees > available - float(pending_cash) + 1e-6
     reason = None
     if short:
         reason = (
@@ -984,6 +1145,102 @@ def cash_gate(
         "pending_cash": pending_cash,
         "shared_cash": available,
         "planner": EXECUTION_PLANNER_VERSION,
+    }
+
+
+@dataclass(frozen=True, slots=True)
+class EntryGateState:
+    """Captured capacity, cash, risk, and market inputs for entry evaluation."""
+
+    open_codes: frozenset[str] = frozenset()
+    committed_open_codes: frozenset[str] = frozenset()
+    pool_open_positions: frozenset[tuple[str, str]] = frozenset()
+    position_limit: int = 1
+    pool_limit: int = 0
+    capacity_available: bool | None = None
+    seat_reserve: Mapping[str, Any] = field(default_factory=dict)
+    pending_cash: float = 0.0
+    shared_cash: float | None = None
+    account_risk_state: Mapping[str, Any] | None = None
+    market_state: Mapping[str, Any] | None = None
+    allocation_source: str | None = None
+    allocation_version: str | None = None
+
+    def __post_init__(self):
+        object.__setattr__(self, "open_codes", frozenset(self.open_codes))
+        object.__setattr__(self, "committed_open_codes", frozenset(self.committed_open_codes))
+        object.__setattr__(self, "pool_open_positions", frozenset(
+            (str(account), str(code)) for account, code in self.pool_open_positions
+        ))
+        object.__setattr__(self, "seat_reserve", MappingProxyType(dict(self.seat_reserve)))
+        if self.account_risk_state is not None:
+            object.__setattr__(self, "account_risk_state", MappingProxyType(dict(self.account_risk_state)))
+        if self.market_state is not None:
+            object.__setattr__(self, "market_state", MappingProxyType(dict(self.market_state)))
+
+
+def evaluate_entry_state(
+    *, state: EntryGateState, account_id: str, code: str, side: str,
+    quote: Mapping[str, Any], asof_day, require_market_gate: bool = True,
+    amount: float = 0.0, fees: float = 0.0,
+) -> dict[str, Any]:
+    """Pure canonical entry gate over a previously captured explicit state."""
+    if not isinstance(state, EntryGateState):
+        raise TypeError("entry gate state snapshot is required")
+    policy = policy_for(account_id)
+    reasons: list[str] = []
+    gates: dict[str, Any] = {}
+    scope = security_gate(code, quote.get("name"), quote.get("risk_flag"))
+    gates["security_scope"] = scope["scope"]
+    if not scope["allowed"]:
+        reasons.append(scope["reason"])
+    if require_market_gate and state.market_state is not None:
+        market_check = market_gate(state.market_state, account_id)
+        gates["market"] = market_check["market"]
+        if market_check["blocked"]:
+            reasons.append(market_check["reason"])
+    if state.account_risk_state is not None:
+        gates["account"] = dict(state.account_risk_state)
+        reasons.extend(account_risk_gate(state.account_risk_state))
+    if side == "buy" and state.capacity_available is None:
+        gates["position_count_gate"] = {"available": False}
+        reasons.append("策略席位状态不可用")
+    elif side == "buy" and state.capacity_available:
+        capacity = capacity_gate_from_state(
+            code=code, account_id=account_id, open_codes=state.open_codes,
+            committed_open_codes=state.committed_open_codes,
+            pool_open_positions=state.pool_open_positions,
+            position_limit=state.position_limit, pool_limit=state.pool_limit,
+            reserve=state.seat_reserve, allocation_source=state.allocation_source,
+            allocation_version=state.allocation_version,
+        )
+        gates["position_count_gate"] = capacity["gate"]
+        gates["seat_reserve"] = capacity["reserve"]
+        reasons.extend(capacity["reasons"])
+    freshness = quote_gate(quote, asof_day, purpose="entry" if side == "buy" else "exit")
+    gates["execution_quote"] = freshness["status"]
+    if not freshness["fresh"]:
+        reasons.append(f"成交行情未通过校验：{freshness['reason'] or '未知行情状态'}")
+    cash = cash_gate_from_state(
+        side=side, amount=amount, fees=fees,
+        pending_cash=state.pending_cash,
+        shared_cash=state.shared_cash,
+    )
+    gates["cash"] = cash
+    if not cash["allowed"]:
+        reasons.append(cash["reason"])
+    return {
+        "allowed": not reasons,
+        "reasons": list(dict.fromkeys(str(item) for item in reasons if item)),
+        "gates": gates,
+        "policy": {
+            "account_id": account_id,
+            "chase_lane": policy.chase_lane,
+            "manual_entry_review": policy.manual_entry_review,
+            "seat_reserve_owner": policy.seat_reserve_owner,
+            "planner": EXECUTION_PLANNER_VERSION,
+        },
+        "requires_manual_entry_review": bool(policy.manual_entry_review),
     }
 
 
@@ -1016,69 +1273,46 @@ def plan_entry(
     在执行时决定）。返回 ``{"allowed", "reasons", "gates", "policy"}``。
     """
     account_id = str((account or {}).get("id") or "")
-    policy = policy_for(account_id)
-    reasons: list[str] = []
-    gates: dict[str, Any] = {}
-
-    scope = security_gate(code, quote.get("name"), quote.get("risk_flag"))
-    gates["security_scope"] = scope["scope"]
-    if not scope["allowed"]:
-        reasons.append(scope["reason"])
-
-    if require_market_gate and market is not None:
-        market_check = market_gate(market, account_id)
-        gates["market"] = market_check["market"]
-        if market_check["blocked"]:
-            reasons.append(market_check["reason"])
-
-    if risk_state is not None:
-        gates["account"] = risk_state
-        reasons.extend(account_risk_gate(risk_state))
-
-    if side == "buy" and pool_open_positions is not None and pool_limit is not None:
-        capacity = capacity_gate(
-            code=code, account_id=account_id,
-            open_codes=open_codes or set(),
-            committed_open_codes=committed_open_codes or set(),
-            pool_open_positions=pool_open_positions,
-            position_limit=position_limit if position_limit is not None else 1,
-            pool_limit=pool_limit, asof_day=asof_day, conn=conn,
-            allocation_source=allocation_source,
-            allocation_version=allocation_version,
-        )
-        gates["position_count_gate"] = capacity["gate"]
-        gates["seat_reserve"] = capacity["reserve"]
-        reasons.extend(capacity["reasons"])
-
-    freshness = quote_gate(quote, asof_day, purpose="entry" if side == "buy" else "exit")
-    gates["execution_quote"] = freshness["status"]
-    if not freshness["fresh"]:
-        reasons.append(
-            f"成交行情未通过校验：{freshness['reason'] or '未知行情状态'}"
-        )
-
-    cash = cash_gate(
-        conn, side, amount, fees,
-        exclude_reservation_key=exclude_reservation_key, shared_cash=shared_cash,
-    )
-    gates["cash"] = cash
-    if not cash["allowed"]:
-        reasons.append(cash["reason"])
-
-    return {
-        "allowed": not reasons,
-        "reasons": list(dict.fromkeys([str(item) for item in reasons if item])),
-        "gates": gates,
-        "policy": {
-            "account_id": account_id,
-            "chase_lane": policy.chase_lane,
-            "manual_entry_review": policy.manual_entry_review,
-            "seat_reserve_owner": policy.seat_reserve_owner,
-            "planner": EXECUTION_PLANNER_VERSION,
-        },
-        # 手动/自动都据此决定是否需要策略专属入场复核，不再比较账户 ID。
-        "requires_manual_entry_review": bool(policy.manual_entry_review),
+    has_pool_state = pool_open_positions is not None and pool_limit is not None
+    open_codes = set(open_codes or ())
+    committed_open_codes = set(committed_open_codes or ())
+    pool_open_positions = set(pool_open_positions or ())
+    reserve = {
+        "reserved": False, "owner": None, "interest": 0,
+        "deadline": _SEAT_RESERVE_DEADLINE, "planner": EXECUTION_PLANNER_VERSION,
     }
+    if side == "buy" and has_pool_state:
+        reserve = seat_reserve_gate(
+            conn, account_id, pool_open_positions, pool_limit, asof_day,
+        )
+    PT = _pt()
+    if side == "buy":
+        _, pending_cash = PT._pending_buy_reservations(
+            conn, exclude_order_key=exclude_reservation_key,
+        )
+        available_cash = PT._shared_cash(conn) if shared_cash is None else float(shared_cash)
+    else:
+        pending_cash, available_cash = 0.0, shared_cash
+    state = EntryGateState(
+        open_codes=frozenset(open_codes),
+        committed_open_codes=frozenset(committed_open_codes),
+        pool_open_positions=frozenset(pool_open_positions),
+        position_limit=position_limit if position_limit is not None else 1,
+        pool_limit=pool_limit if pool_limit is not None else 0,
+        capacity_available=has_pool_state,
+        seat_reserve=reserve,
+        pending_cash=float(pending_cash or 0.0),
+        shared_cash=(float(available_cash) if available_cash is not None else None),
+        account_risk_state=risk_state,
+        market_state=market,
+        allocation_source=allocation_source,
+        allocation_version=allocation_version,
+    )
+    return evaluate_entry_state(
+        state=state, account_id=account_id, code=code, side=side,
+        quote=quote, asof_day=asof_day,
+        require_market_gate=require_market_gate, amount=amount, fees=fees,
+    )
 
 
 def revalidate_order_plan(conn, order, *, plan_builder, asof_day, quote=None, **kwargs):
@@ -1177,8 +1411,10 @@ def _plain_evidence(value):
     return value
 
 
-def _decision_evidence(decision: ExecutionDecision) -> dict[str, Any]:
-    return {
+def _decision_evidence(
+    decision: ExecutionDecision, context: ExecutionContext | None = None,
+) -> dict[str, Any]:
+    evidence = {
         "executable_now": decision.executable_now,
         "fill_quantity": decision.fill_quantity,
         "remaining_quantity": decision.remaining_quantity,
@@ -1195,6 +1431,17 @@ def _decision_evidence(decision: ExecutionDecision) -> dict[str, Any]:
         "liquidity_evidence": _plain_evidence(decision.liquidity_evidence),
         "ruleset_version": decision.ruleset_version,
     }
+    runtime_context = getattr(context, "runtime_context", None)
+    evidence["runtime_context"] = (
+        runtime_context.projection() if runtime_context is not None else None
+    )
+    evidence["runtime_context_fingerprint"] = (
+        getattr(runtime_context, "context_fingerprint", None)
+    )
+    evidence["runtime_context_availability"] = (
+        "available" if runtime_context is not None else "active_runtime_context_unavailable"
+    )
+    return evidence
 
 
 def commit_fill(
@@ -1295,7 +1542,7 @@ def commit_fill(
     decision = evaluate_simulated_execution(intent, context)
     current_status = str(order.get("status") or "")
     current_version = int(order.get("execution_version") or 0)
-    execution_evidence = _decision_evidence(decision)
+    execution_evidence = _decision_evidence(decision, context)
     if not decision.executable_now:
         if current_status not in {"filled", "cancelled", "rejected", "risk_rejected", "manual_rejected", "expired", "superseded"}:
             next_status = decision.status

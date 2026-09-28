@@ -142,13 +142,16 @@ GOLDEN_ENVELOPE = {
     },
     "side": "buy",
     "strategy_id": "tq_breakout",
+    "runtime_context": None,
+    "runtime_context_fingerprint": None,
+    "runtime_context_availability": "active_runtime_context_unavailable",
     "threshold": {
         "delta": -0.02,
         "dynamic": True,
         "value": 0.72,
         "version": "threshold-fixture-v1",
     },
-    "version": "decision-snapshot-v1",
+    "version": "decision-snapshot-v2",
 }
 
 
@@ -457,7 +460,7 @@ class BuildDecisionSnapshotContractTests(unittest.TestCase):
             news_scan_meta={**GOLDEN_SCAN_META, "stale": True},
             risk_version="paper-risk-v4",
         )
-        self.assertEqual(snapshot["version"], "decision-snapshot-v1")
+        self.assertEqual(snapshot["version"], "decision-snapshot-v2")
         self.assertIsNone(snapshot["account_id"])
         self.assertIsNone(snapshot["code"])
         self.assertIsNone(snapshot["side"])
@@ -626,6 +629,28 @@ class BuildDecisionSnapshotContractTests(unittest.TestCase):
 
 
 class WithDecisionSnapshotContractTests(unittest.TestCase):
+    def test_runtime_context_is_persisted_only_when_explicitly_supplied(self):
+        legacy = audit.build_decision_snapshot(
+            {}, decision_at="2026-09-11 10:01:03",
+            news_scan_meta=GOLDEN_SCAN_META,
+        )
+        self.assertIsNone(legacy["runtime_context_fingerprint"])
+        self.assertEqual("active_runtime_context_unavailable",
+                         legacy["runtime_context_availability"])
+
+        runtime_context = type("Context", (), {
+            "context_fingerprint": "a" * 64,
+            "projection": lambda self: {"context_fingerprint": self.context_fingerprint,
+                                         "strategy_version": 2},
+        })()
+        recorded = audit.build_decision_snapshot(
+            {}, decision_at="2026-09-11 10:01:03",
+            news_scan_meta=GOLDEN_SCAN_META, runtime_context=runtime_context,
+        )
+        self.assertEqual("a" * 64, recorded["runtime_context_fingerprint"])
+        self.assertEqual("available", recorded["runtime_context_availability"])
+        self.assertEqual(2, recorded["runtime_context"]["strategy_version"])
+
     def test_preserves_caller_payload_and_enriches_strategy_id(self):
         payload = {
             "side": "buy",
