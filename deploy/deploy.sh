@@ -20,11 +20,11 @@ else
   echo "▶ [1/6] 跳过备份（--no-backup）"
 fi
 
-# 2. 构建镜像。镜像上下文明确排除了 .git，因此把唯一允许进入运行时的
-# 版本信息限定为当前 commit short hash；策略回放只落这个值，不复制环境。
+# 2. 构建镜像。镜像上下文明确排除了 .git，因此把完整 commit SHA
+# 显式传入构建参数；ExperimentSpec 只接受完整 lowercase SHA。
 echo "▶ [2/6] 构建镜像..."
-ASTOCK_GIT_COMMIT="$(git rev-parse --short=12 HEAD)"
-if [[ ! "$ASTOCK_GIT_COMMIT" =~ ^[0-9a-fA-F]{7,12}$ ]]; then
+ASTOCK_GIT_COMMIT="$(git rev-parse HEAD)"
+if [[ ! "$ASTOCK_GIT_COMMIT" =~ ^[0-9a-f]{40}$ ]]; then
   echo "❌ 无法确定当前 git commit，拒绝构建不可追溯镜像"
   exit 1
 fi

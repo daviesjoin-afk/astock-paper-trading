@@ -186,9 +186,11 @@ def run_validation(
                 market_archive_fingerprint, start=spec.start_date, end=spec.end_date,
                 symbols=sorted({row["code"] for values in members.values() for row in values}),
             )
-            bar_pairs = {(row["code"], row["session"]) for row in bars}
             execution_requests = {
-                pair: f"{pair[1]}T09:30:00+08:00" for pair in bar_pairs
+                (str(member["code"]), session): f"{session}T09:30:00+08:00"
+                for session in session_calendar.sessions
+                for member in members.get(session, ())
+                if isinstance(member, Mapping) and member.get("code")
             }
             execution_facts = tradability_repository.evidence_many(execution_requests)
             financial_by_pair: dict[tuple[str, str], dict[str, Any]] = {}

@@ -12,6 +12,15 @@ APP_USER="astock"
 APP_GROUP="astock"
 PASSWORD_FILE="/etc/nginx/.astock-quant.htpasswd"
 
+# Native installs may run from an uploaded source bundle without its .git
+# directory. Require the exact source revision from the caller in that case.
+ASTOCK_GIT_COMMIT="${ASTOCK_GIT_COMMIT:-$(git -C "${SOURCE_DIR}" rev-parse HEAD 2>/dev/null || true)}"
+if [[ ! "${ASTOCK_GIT_COMMIT}" =~ ^[0-9a-f]{40}$ ]]; then
+  echo "ASTOCK_GIT_COMMIT must be the full lowercase 40-character source commit SHA." >&2
+  echo "Set it from the source checkout with: ASTOCK_GIT_COMMIT=\$(git rev-parse HEAD) sudo -E bash deploy/install-centos9.sh" >&2
+  exit 2
+fi
+
 # This script is the explicit native-CentOS profile.  Docker deployments must
 # use docker-compose.server.yml and astock-codex.cron; refusing an ambiguous
 # profile prevents installing the legacy scheduler by accident.
@@ -96,6 +105,11 @@ chmod -R u=rwX,g=rX,o= "${APP_DIR}/frontend"
 
 install -o root -g root -m 0644 \
   "${APP_DIR}/deploy/astock-quant.service" /etc/systemd/system/astock-quant.service
+# Persist the same full build identity for the native API after reboot.
+install -d -o root -g root -m 0755 /etc/systemd/system/astock-quant.service.d
+printf '[Service]\nEnvironment="ASTOCK_GIT_COMMIT=%s"\n' "${ASTOCK_GIT_COMMIT}" \
+  > /etc/systemd/system/astock-quant.service.d/20-build-identity.conf
+chmod 0644 /etc/systemd/system/astock-quant.service.d/20-build-identity.conf
 install -o root -g root -m 0644 \
   "${APP_DIR}/deploy/astock-quant.nginx.conf" /etc/nginx/conf.d/astock-quant.conf
 # This installer is the native CentOS profile.  After the preflight above has
