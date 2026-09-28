@@ -181,5 +181,3 @@ class RobustnessRepository:
             raise RobustnessPersistenceError("invalid_robustness_report_id")
         row = self.conn.execute("SELECT * FROM robustness_reports WHERE id=?", (report_id,)).fetchone()
         return _decode(row) if row is not None else None
-
-\n
