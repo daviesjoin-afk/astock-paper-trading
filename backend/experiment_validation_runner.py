@@ -67,24 +67,7 @@ def _universe_rows(repository: HUA.HistoricalUniverseArchiveRepository,
 
 def _tradability_fingerprint(members: Mapping[str, Sequence[Any]], sessions: Sequence[str],
                              repository: Any) -> str:
-    requests = {}
-    for session in sessions:
-        instant = PIT.bar_available_at(session)
-        for member in members.get(session, ()):
-            code = member.get("code") if isinstance(member, Mapping) else getattr(member, "code", None)
-            if code and instant is not None:
-                requests[(str(code), session)] = instant
-    bulk = (repository.evidence_many(requests) if repository is not None
-            and hasattr(repository, "evidence_many") else {})
-    facts = []
-    for code, session in sorted(requests):
-        instant = requests[(code, session)]
-        fact = (bulk.get((code, session)) if bulk else
-                repository.evidence_at(code, session, instant)
-                if repository is not None else None)
-        facts.append({"code": code, "session": session,
-                      "evidence": TA.evidence_fingerprint(fact) if fact is not None else None})
-    return _sha(facts)
+    return PV.tradability_replay_projection(members, sessions, repository)["fingerprint"]
 
 
 def _serialize_result(result: EC.ExperimentResult) -> dict[str, Any]:
@@ -107,6 +90,7 @@ def run_validation(
     fundamental_records: Sequence[Any] = (),
     validation_repository: EVR.ExperimentValidationRepository | None = None,
     created_at: str | None = None,
+    tradability_replay_capture: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Validate and, when ready, replay a strategy using only injected immutable owners.
 
@@ -162,6 +146,7 @@ def run_validation(
         return {"status": "unavailable", "result": result.projection(),
                 "validation_evidence": None, "folds": [], "run_key": None}
 
+    tradability_capture: dict[str, Any] = {}
     evidence = PV.build_pit_validation_evidence(
         spec, strategy_version=strategy_version, dataset_manifest=dataset_manifest,
         tradability_repository=tradability_repository, fundamental_records=fundamental_records,
@@ -172,27 +157,21 @@ def run_validation(
         market_archive_fingerprint=market_archive_fingerprint,
         universe_archive_repository=universe_archive_repository,
         universe_archive_fingerprint=universe_archive_fingerprint,
+        tradability_replay_capture=tradability_replay_capture,
+        tradability_capture_out=tradability_capture,
     )
     folds = list(evidence.walk_forward.get("windows") or ())
+    members = tradability_capture.get("members_by_session", {})
     if evidence.status != "ready":
         result = _unavailable(spec, evidence.reason_codes[0])
         run_status = "blocked"
-        members = {}
     else:
         try:
-            members = _universe_rows(universe_archive_repository, universe_archive_fingerprint,
-                                     session_calendar.sessions)
             bars = market_archive_repository.read_bars(
                 market_archive_fingerprint, start=spec.start_date, end=spec.end_date,
                 symbols=sorted({row["code"] for values in members.values() for row in values}),
             )
-            execution_requests = {
-                (str(member["code"]), session): f"{session}T09:30:00+08:00"
-                for session in session_calendar.sessions
-                for member in members.get(session, ())
-                if isinstance(member, Mapping) and member.get("code")
-            }
-            execution_facts = tradability_repository.evidence_many(execution_requests)
+            execution_facts = tradability_capture["execution_facts"]
             financial_by_pair: dict[tuple[str, str], dict[str, Any]] = {}
             if dependencies["financial_fields"]:
                 for sample in samples:
@@ -244,8 +223,7 @@ def run_validation(
     owner_identities = {
         "calendar_fingerprint": session_calendar.calendar_fingerprint if session_calendar else None,
         "universe_archive_fingerprint": universe_archive_fingerprint,
-        "tradability_evidence_fingerprint": _tradability_fingerprint(
-            members, session_calendar.sessions if session_calendar else (), tradability_repository),
+        "tradability_evidence_fingerprint": tradability_capture.get("fingerprint"),
         "market_archive_fingerprint": market_archive_fingerprint,
         "financial_archive_fingerprint": financial_archive_fingerprint,
         "dataset_fingerprint": spec.dataset_fingerprint,

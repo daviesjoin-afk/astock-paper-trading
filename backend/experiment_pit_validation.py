@@ -293,6 +293,70 @@ def _member_code(member: Any) -> str | None:
     return text or None
 
 
+def tradability_replay_projection(
+    members_by_session: Mapping[str, Sequence[Any]],
+    sessions: Sequence[str],
+    repository: Any,
+    *,
+    captured: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Capture and bind close plus execution facts for one owner read snapshot."""
+    pairs = sorted({(code, session)
+                    for session in sessions
+                    for code in (_member_code(row) for row in members_by_session.get(session, ()))
+                    if code})
+    close_requests = {(code, session): PIT.bar_available_at(session)
+                      for code, session in pairs}
+    execution_requests = {(code, session): f"{session}T09:30:00+08:00"
+                          for code, session in pairs}
+
+    if captured is None:
+        snapshot_requests = {
+            pair: {"close": close_requests[pair], "execution": execution_requests[pair]}
+            for pair in pairs
+        }
+        if repository is None:
+            selected = {pair: {"close": None, "execution": None} for pair in pairs}
+            capture_complete = True
+        elif hasattr(repository, "evidence_snapshot_many"):
+            selected = repository.evidence_snapshot_many(snapshot_requests)
+            capture_complete = (set(selected) == set(pairs)
+                                and all({"close", "execution"}.issubset(selected[pair])
+                                        for pair in pairs))
+        else:
+            selected = {}
+            capture_complete = False
+        close_facts = {pair: selected.get(pair, {}).get("close") for pair in pairs}
+        execution_facts = {pair: selected.get(pair, {}).get("execution") for pair in pairs}
+    else:
+        close_source = captured.get("close_facts")
+        execution_source = captured.get("execution_facts")
+        close_facts = {pair: close_source.get(pair) for pair in pairs} if isinstance(close_source, Mapping) else {}
+        execution_facts = ({pair: execution_source.get(pair) for pair in pairs}
+                           if isinstance(execution_source, Mapping) else {})
+        capture_complete = (bool(captured.get("capture_complete"))
+                           and isinstance(close_source, Mapping)
+                           and isinstance(execution_source, Mapping)
+                           and set(pairs).issubset(close_source)
+                           and set(pairs).issubset(execution_source))
+    facts = [{
+        "code": code,
+        "session": session,
+        "close_evidence": (TA.evidence_fingerprint(close_facts[(code, session)])
+                           if close_facts.get((code, session)) is not None else None),
+        "execution_evidence": (TA.evidence_fingerprint(execution_facts[(code, session)])
+                               if execution_facts.get((code, session)) is not None else None),
+    } for code, session in pairs]
+    return {
+        "fingerprint": _digest({"version": "r29-tradability-replay-v1", "facts": facts}),
+        "facts": facts,
+        "execution_unknown": sum(row["execution_evidence"] is None for row in facts),
+        "close_facts": close_facts,
+        "execution_facts": execution_facts,
+        "capture_complete": capture_complete,
+    }
+
+
 def _tradability(
     spec: EC.ExperimentSpec,
     members_by_session: Mapping[str, Sequence[Any]],
@@ -300,6 +364,7 @@ def _tradability(
     repository: TA.TradabilityArchiveRepository | None,
     *,
     universe_complete: bool,
+    replay_capture: Mapping[str, Any] | None = None,
 ) -> tuple[dict, dict]:
     codes_by_session = {
         session: sorted({code for code in (_member_code(row) for row in members) if code})
@@ -308,23 +373,33 @@ def _tradability(
     requested = sum(len(codes_by_session.get(session, ())) for session in sessions)
     requests = {(code, session): PIT.bar_available_at(session)
                 for session in sessions for code in codes_by_session.get(session, ())}
-    if repository is not None and hasattr(repository, "coverage_projection"):
-        owner_projection = repository.coverage_projection(requests).projection()
+    replay_projection = tradability_replay_projection(
+        members_by_session, sessions, repository, captured=replay_capture,
+    )
+    if (repository is not None and hasattr(repository, "coverage_projection_from_evidence")
+            and replay_projection["capture_complete"]):
+        owner_projection = repository.coverage_projection_from_evidence(
+            requests, replay_projection["close_facts"],
+        ).projection()
         available = int(owner_projection["available_pairs"])
         blocked = int(owner_projection["blocked_pairs"])
         unknown = int(owner_projection["unknown_pairs"])
-        evidence_fingerprint = owner_projection["evidence_fingerprint"]
+        close_evidence_fingerprint = owner_projection["evidence_fingerprint"]
     else:
         available = blocked = 0
         unknown = requested
-        evidence_rows = [{"code": code, "session": session, "evidence": None}
-                         for code, session in sorted(requests)]
-        evidence_fingerprint = _digest(evidence_rows)
-    identity_matches = evidence_fingerprint == spec.tradability_fingerprint
+        evidence_rows = []
+        for code, session in sorted(requests):
+            fact = replay_projection["close_facts"].get((code, session))
+            evidence_rows.append({"code": code, "session": session,
+                                  "evidence": TA.evidence_fingerprint(fact) if fact else None})
+        close_evidence_fingerprint = _digest(evidence_rows)
+    identity_matches = replay_projection["fingerprint"] == spec.tradability_fingerprint
     complete = (
         universe_complete and requested > 0
         and available + blocked + unknown == requested and unknown == 0
-        and identity_matches
+        and replay_projection["execution_unknown"] == 0
+        and replay_projection["capture_complete"] and identity_matches
     )
     ratio = _ratio(available + blocked, requested) if universe_complete else None
     identity = {"tradability_fingerprint": spec.tradability_fingerprint}
@@ -333,11 +408,15 @@ def _tradability(
                         "archive_facts_complete_for_requested_pairs" if complete else "partial_or_unknown",
                         {"requested": requested, "available": available,
                          "unknown": unknown, "blocked": blocked, "ratio": ratio,
-                         "evidence_fingerprint": evidence_fingerprint,
+                         "close_evidence_fingerprint": close_evidence_fingerprint,
+                         "execution_unknown": replay_projection["execution_unknown"],
+                         "replay_fingerprint": replay_projection["fingerprint"],
                          "identity_matches": identity_matches})
     return detail, {"requested": requested, "available": available,
                     "unknown": unknown, "blocked": blocked, "ratio": ratio,
-                    "evidence_fingerprint": evidence_fingerprint,
+                    "close_evidence_fingerprint": close_evidence_fingerprint,
+                    "execution_unknown": replay_projection["execution_unknown"],
+                    "replay_fingerprint": replay_projection["fingerprint"],
                     "identity_matches": identity_matches,
                     "universe_sessions_unknown": len(sessions) - len(members_by_session)}
 
@@ -463,6 +542,8 @@ def _market_coverage(
     spec: EC.ExperimentSpec, repository: Any, archive_fingerprint: str | None,
     sessions: Sequence[str], members_by_session: Mapping[str, Sequence[Any]],
     tradability_repository: Any,
+    *,
+    captured_tradability_facts: Mapping[tuple[str, str], Any] | None = None,
 ) -> tuple[dict, dict]:
     identity = {"market_data_fingerprint": spec.market_data_fingerprint}
     manifest = repository.get_manifest(archive_fingerprint) if repository is not None and archive_fingerprint else None
@@ -483,7 +564,8 @@ def _market_coverage(
     requests = {(code, session): PIT.bar_available_at(session)
                 for session in sessions for member in members_by_session.get(session, ())
                 for code in (_member_code(member),) if code}
-    facts = (tradability_repository.evidence_many(requests)
+    facts = (captured_tradability_facts if captured_tradability_facts is not None else
+             tradability_repository.evidence_many(requests)
              if tradability_repository is not None and hasattr(tradability_repository, "evidence_many")
              else {})
     for session in sessions:
@@ -704,6 +786,8 @@ def build_pit_validation_evidence(
     market_archive_fingerprint: str | None = None,
     universe_archive_repository: HUA.HistoricalUniverseArchiveRepository | None = None,
     universe_archive_fingerprint: str | None = None,
+    tradability_replay_capture: Mapping[str, Any] | None = None,
+    tradability_capture_out: dict[str, Any] | None = None,
 ) -> PITValidationEvidence:
     """Compose explicit owner evidence into a READY/BLOCKED input gate.
 
@@ -761,9 +845,19 @@ def build_pit_validation_evidence(
         reasons.append(universe_dim["reason_code"])
         warnings.append("historical_universe_unproven")
 
+    replay_capture = tradability_replay_projection(
+        members, bounded_sessions, tradability_repository,
+        captured=tradability_replay_capture,
+    )
+    if tradability_capture_out is not None:
+        tradability_capture_out.clear()
+        tradability_capture_out.update(replay_capture)
+        tradability_capture_out["members_by_session"] = members
+
     tradability_dim, tradability_coverage = _tradability(
         spec, members, bounded_sessions, tradability_repository,
         universe_complete=universe_dim["status"] == "proven",
+        replay_capture=replay_capture,
     )
     dimensions["historical_tradability"] = tradability_dim
     if tradability_dim["status"] == "blocked":
@@ -775,6 +869,7 @@ def build_pit_validation_evidence(
     dimensions["market_data_pit"], market_coverage = _market_coverage(
         spec, market_archive_repository, market_archive_fingerprint, bounded_sessions,
         members, tradability_repository,
+        captured_tradability_facts=replay_capture["close_facts"],
     )
     if dimensions["market_data_pit"]["status"] == "blocked":
         reasons.append(dimensions["market_data_pit"]["reason_code"])
