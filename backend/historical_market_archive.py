@@ -5,7 +5,7 @@ adjusted series because a retrospectively adjusted price is not point-in-time ra
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date
 import hashlib
 import json
@@ -14,7 +14,7 @@ import re
 import sqlite3
 from typing import Any, Iterable, Mapping
 
-SCHEMA_VERSION = "historical-market-archive-v1"
+SCHEMA_VERSION = "historical-market-archive-v2"
 _CODE = re.compile(r"^[0-9]{6}\.(SH|SZ|BJ)$")
 _TABLES = ("historical_market_manifests", "historical_market_bars")
 
@@ -81,6 +81,7 @@ class HistoricalMarketArchiveManifest:
     row_count: int
     content_hash: str
     imported_at: str | None
+    benchmark_calendars: Mapping[str, Mapping[str, Any]] = field(default_factory=dict)
     schema_version: str = SCHEMA_VERSION
 
     def projection(self) -> dict[str, Any]:
@@ -89,6 +90,7 @@ class HistoricalMarketArchiveManifest:
                 "coverage_start": self.coverage_start, "coverage_end": self.coverage_end,
                 "symbols": list(self.symbols), "row_count": self.row_count,
                 "content_hash": self.content_hash, "imported_at": self.imported_at,
+                "benchmark_calendars": dict(self.benchmark_calendars),
                 "schema_version": self.schema_version}
 
 
@@ -98,7 +100,8 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
       archive_fingerprint TEXT PRIMARY KEY, source TEXT NOT NULL, source_revision TEXT NOT NULL,
       adjustment TEXT NOT NULL CHECK(adjustment='raw'), coverage_start TEXT NOT NULL,
       coverage_end TEXT NOT NULL, symbols_json TEXT NOT NULL, row_count INTEGER NOT NULL,
-      content_hash TEXT NOT NULL, imported_at TEXT, schema_version TEXT NOT NULL
+      content_hash TEXT NOT NULL, imported_at TEXT, schema_version TEXT NOT NULL,
+      benchmark_calendars_json TEXT NOT NULL DEFAULT '{}'
     );
     CREATE TABLE IF NOT EXISTS historical_market_bars (
       archive_fingerprint TEXT NOT NULL REFERENCES historical_market_manifests(archive_fingerprint),
@@ -118,6 +121,45 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
     CREATE TRIGGER IF NOT EXISTS historical_market_bars_no_delete
       BEFORE DELETE ON historical_market_bars BEGIN SELECT RAISE(ABORT, 'immutable archive'); END;
     """)
+    # Existing v1 archives remain readable, but have no benchmark completeness
+    # evidence and therefore cannot issue a verified calendar.
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(historical_market_manifests)")}
+    if "benchmark_calendars_json" not in columns:
+        conn.execute("ALTER TABLE historical_market_manifests ADD COLUMN benchmark_calendars_json TEXT NOT NULL DEFAULT '{}'")
+
+
+def _benchmark_calendar_specs(
+    declarations: Mapping[str, Mapping[str, Any]] | None,
+    rows_by_symbol: Mapping[str, list[str]],
+) -> dict[str, dict[str, Any]]:
+    """Validate owner-imported expected sessions against raw benchmark bars."""
+    if declarations is None:
+        return {}
+    if not isinstance(declarations, Mapping):
+        raise HistoricalMarketArchiveError("benchmark_calendar_declarations_invalid")
+    normalized: dict[str, dict[str, Any]] = {}
+    for symbol, declaration in declarations.items():
+        if not isinstance(symbol, str) or not _CODE.fullmatch(symbol) or not isinstance(declaration, Mapping):
+            raise HistoricalMarketArchiveError("benchmark_calendar_declarations_invalid")
+        start, end = _date(declaration.get("coverage_start")), _date(declaration.get("coverage_end"))
+        source, revision = declaration.get("source"), declaration.get("source_revision")
+        sessions = declaration.get("sessions")
+        if (start > end or not isinstance(source, str) or not source.strip()
+                or not isinstance(revision, str) or not revision.strip()
+                or not isinstance(sessions, (list, tuple))):
+            raise HistoricalMarketArchiveError("benchmark_calendar_provenance_required")
+        expected = [_date(value) for value in sessions]
+        if (not expected or expected != sorted(set(expected))
+                or any(value < start or value > end for value in expected)):
+            raise HistoricalMarketArchiveError("benchmark_calendar_sessions_invalid")
+        observed = sorted(value for value in rows_by_symbol.get(symbol, ()) if start <= value <= end)
+        if observed != expected:
+            raise HistoricalMarketArchiveError("benchmark_calendar_bars_incomplete")
+        normalized[symbol] = {
+            "coverage_start": start, "coverage_end": end, "sessions": expected,
+            "source": source.strip(), "source_revision": revision.strip(),
+        }
+    return dict(sorted(normalized.items()))
 
 
 class HistoricalMarketArchiveRepository:
@@ -130,6 +172,7 @@ class HistoricalMarketArchiveRepository:
     def import_raw_market_archive(
         self, rows: Iterable[Mapping[str, Any]], *, source: str, source_revision: str,
         adjustment: str, imported_at: str | None = None,
+        benchmark_calendars: Mapping[str, Mapping[str, Any]] | None = None,
     ) -> HistoricalMarketArchiveManifest:
         if adjustment not in {"raw", "none", "unadjusted"}:
             raise HistoricalMarketArchiveError("adjusted_market_data_rejected")
@@ -147,13 +190,18 @@ class HistoricalMarketArchiveRepository:
                 raise HistoricalMarketArchiveError("conflicting_duplicate_bar")
             by_key[key] = item
         normalized = list(by_key.values())
+        rows_by_symbol: dict[str, list[str]] = {}
+        for row in normalized:
+            rows_by_symbol.setdefault(row["code"], []).append(row["session"])
+        calendar_specs = _benchmark_calendar_specs(benchmark_calendars, rows_by_symbol)
         content_hash = _sha(normalized)
         material = {"schema_version": SCHEMA_VERSION, "source": source.strip(),
                     "source_revision": source_revision.strip(), "adjustment": "raw",
                     "coverage_start": min(row["session"] for row in normalized),
                     "coverage_end": max(row["session"] for row in normalized),
                     "symbols": sorted({row["code"] for row in normalized}),
-                    "row_count": len(normalized), "content_hash": content_hash}
+                    "row_count": len(normalized), "content_hash": content_hash,
+                    "benchmark_calendars": calendar_specs}
         fingerprint = _sha(material)
         manifest = HistoricalMarketArchiveManifest(
             archive_fingerprint=fingerprint, source=material["source"],
@@ -161,6 +209,7 @@ class HistoricalMarketArchiveRepository:
             coverage_start=material["coverage_start"], coverage_end=material["coverage_end"],
             symbols=tuple(material["symbols"]), row_count=len(normalized),
             content_hash=content_hash, imported_at=imported_at,
+            benchmark_calendars=calendar_specs,
         )
         existing = self.conn.execute(
             "SELECT content_hash FROM historical_market_manifests WHERE archive_fingerprint=?",
@@ -172,12 +221,15 @@ class HistoricalMarketArchiveRepository:
             return self.get_manifest(fingerprint)
         try:
             with self.conn:
-                self.conn.execute("""INSERT INTO historical_market_manifests VALUES
-                  (?, ?, ?, 'raw', ?, ?, ?, ?, ?, ?, ?)""",
+                self.conn.execute("""INSERT INTO historical_market_manifests
+                  (archive_fingerprint, source, source_revision, adjustment, coverage_start,
+                   coverage_end, symbols_json, row_count, content_hash, imported_at,
+                   schema_version, benchmark_calendars_json)
+                  VALUES (?, ?, ?, 'raw', ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (fingerprint, material["source"], material["source_revision"],
                      material["coverage_start"], material["coverage_end"],
                      _canonical(material["symbols"]), len(normalized), content_hash,
-                     imported_at, SCHEMA_VERSION))
+                     imported_at, SCHEMA_VERSION, _canonical(calendar_specs)))
                 self.conn.executemany("""INSERT INTO historical_market_bars VALUES
                   (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     [(fingerprint, row["code"], row["session"], row["open"], row["high"],
@@ -199,12 +251,16 @@ class HistoricalMarketArchiveRepository:
             value["archive_fingerprint"], value["source"], value["source_revision"],
             value["adjustment"], value["coverage_start"], value["coverage_end"],
             tuple(json.loads(value["symbols_json"])), int(value["row_count"]),
-            value["content_hash"], value["imported_at"], value["schema_version"])
-        if _sha({"schema_version": manifest.schema_version, "source": manifest.source,
+            value["content_hash"], value["imported_at"],
+            json.loads(value.get("benchmark_calendars_json") or "{}"), value["schema_version"])
+        fingerprint_material = {"schema_version": manifest.schema_version, "source": manifest.source,
                  "source_revision": manifest.source_revision, "adjustment": manifest.adjustment,
                  "coverage_start": manifest.coverage_start, "coverage_end": manifest.coverage_end,
                  "symbols": list(manifest.symbols), "row_count": manifest.row_count,
-                 "content_hash": manifest.content_hash}) != manifest.archive_fingerprint:
+                 "content_hash": manifest.content_hash}
+        if manifest.schema_version != "historical-market-archive-v1":
+            fingerprint_material["benchmark_calendars"] = dict(manifest.benchmark_calendars)
+        if _sha(fingerprint_material) != manifest.archive_fingerprint:
             raise HistoricalMarketArchiveError("corrupt_market_manifest")
         bars = self.conn.execute("""SELECT code,session,open,high,low,close,volume,amount,source,source_revision
           FROM historical_market_bars WHERE archive_fingerprint=? ORDER BY session,code""",

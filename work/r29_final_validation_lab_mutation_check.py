@@ -18,6 +18,7 @@ import test_r29_final_archives as ARCHIVE_TESTS  # noqa: E402
 import test_r29_final_financial as FIN_TESTS  # noqa: E402
 import test_r29_final_runner as RUNNER_TESTS  # noqa: E402
 import test_r29_final_api as API_TESTS  # noqa: E402
+import test_experiment_execution_model as EXECUTION_TESTS  # noqa: E402
 
 BASE_PIT = "backend/experiment_pit_validation.py"
 EXTRA = [
@@ -32,7 +33,8 @@ EXTRA = [
      "BEFORE UPDATE ON historical_market_bars BEGIN SELECT 1; END;",
      ARCHIVE_TESTS, "HistoricalMarketArchiveTests", "HMA", "test_manifest_and_rows_are_immutable"),
     ("M-R29F-34", "calendar must cover the exact requested range", "backend/historical_session_calendar.py",
-     "if manifest.coverage_start > start or manifest.coverage_end < end:", "if False:",
+     'if (calendar_evidence.get("coverage_start", "") > start',
+     'if (False and calendar_evidence.get("coverage_start", "") > start',
      ARCHIVE_TESTS, "HistoricalMarketArchiveTests", "HSC", "test_calendar_issues_only_from_raw_archive_and_bounded_range"),
     ("M-R29F-35", "same-day later filing remains future", "backend/financial_feature_evidence.py",
      "financial_visibility(\n        row, decision_at,", "financial_visibility(\n        row, decision_at[:10],",
@@ -73,6 +75,29 @@ EXTRA = [
      "passed = owner_issued and memberships_complete and session_calendar_complete",
      "passed = memberships_complete and session_calendar_complete",
      PIT_TESTS, "PITValidationTests", "PV", "test_R29_04b_caller_universe_claim_is_not_an_archive_owner"),
+    ("M-R29-36", "build identity uses the canonical Docker variable", "backend/api_adaptive.py",
+     'return os.environ.get("ASTOCK_GIT_COMMIT", "")',
+     'return os.environ.get("ASTOCK_BUILD_REVISION", "")',
+     API_TESTS, "R29ValidationApiTests", "api_adaptive", "test_api_uses_the_canonical_docker_build_identity"),
+    ("M-R29-37", "trade count remains an integer", "backend/experiment_execution_model.py",
+     "trade_count = 0", "trade_count = 0.0",
+     EXECUTION_TESTS, "ExperimentExecutionModelTests", "EM",
+     "test_zero_and_one_trade_counts_are_integers_and_completed_results_validate"),
+    ("M-R29-38", "missing open evidence is unavailable", "backend/experiment_execution_model.py",
+     'if evidence is None:\n                raise ExperimentExecutionUnavailable("execution_tradability_unavailable")',
+     'if evidence is None:\n                continue',
+     EXECUTION_TESTS, "ExperimentExecutionModelTests", "EM",
+     "test_missing_open_tradability_evidence_makes_execution_unavailable"),
+    ("M-R29-39", "close-time facts cannot replace open-time facts", "backend/experiment_execution_model.py",
+     'instant = f"{session}T09:30:00+08:00"',
+     'instant = f"{session}T15:00:00+08:00"',
+     EXECUTION_TESTS, "ExperimentExecutionModelTests", "EM",
+     "test_close_time_evidence_cannot_replace_open_time_evidence"),
+    ("M-R29-40", "global archive coverage cannot prove benchmark sessions", "backend/historical_session_calendar.py",
+     'if not isinstance(calendar_evidence, dict):\n        raise HistoricalSessionCalendarError("historical_benchmark_calendar_unavailable")',
+     'if not isinstance(calendar_evidence, dict):\n        calendar_evidence = {"coverage_start": manifest.coverage_start, "coverage_end": manifest.coverage_end, "sessions": [row["session"] for row in repository.read_bars(archive_fingerprint, start=start, end=end, symbols=(benchmark_symbol,))]}',
+     ARCHIVE_TESTS, "HistoricalMarketArchiveTests", "HSC",
+     "test_global_archive_coverage_does_not_prove_benchmark_calendar"),
 ]
 
 
@@ -80,6 +105,7 @@ def _load(path: Path, source: str, name: str):
     module_name = f"_r29_final_mutant_{name.lower().replace('-', '_')}"
     spec = importlib.util.spec_from_loader(module_name, loader=None)
     module = importlib.util.module_from_spec(spec)
+    module.__file__ = str(path)
     sys.modules[module_name] = module
     exec(compile(source, str(path), "exec"), module.__dict__)
     return module

@@ -25,6 +25,15 @@ def _bar(code: str, session: str, close: float = 10.0) -> dict:
             "low": close - 1, "close": close, "volume": 1000, "amount": 10000}
 
 
+def _calendar(sessions, *, start=None, end=None):
+    sessions = list(sessions)
+    return {"000001.SH": {
+        "coverage_start": start or sessions[0], "coverage_end": end or sessions[-1],
+        "sessions": sessions, "source": "exchange-session-export",
+        "source_revision": "calendar-rev-1",
+    }}
+
+
 class HistoricalMarketArchiveTests(unittest.TestCase):
     def setUp(self):
         self.conn = sqlite3.connect(":memory:")
@@ -41,6 +50,53 @@ class HistoricalMarketArchiveTests(unittest.TestCase):
         second = self.repo.import_raw_market_archive(rows, source="trusted-export",
             source_revision="rev-1", adjustment="unadjusted", imported_at="2026-03-01T00:00:00Z")
         self.assertEqual(first.archive_fingerprint, second.archive_fingerprint)
+
+    def test_legacy_v1_archive_remains_readable_but_cannot_prove_calendar(self):
+        row = HMA._bar(_bar("000001.SH", "2026-01-05"), "legacy-export", "rev-1")
+        content_hash = HMA._sha([row])
+        material = {
+            "schema_version": "historical-market-archive-v1",
+            "source": "legacy-export", "source_revision": "rev-1",
+            "adjustment": "raw", "coverage_start": "2026-01-05",
+            "coverage_end": "2026-01-05", "symbols": ["000001.SH"],
+            "row_count": 1, "content_hash": content_hash,
+        }
+        fingerprint = HMA._sha(material)
+        self.conn.executescript("""
+        DROP TABLE historical_market_bars;
+        DROP TABLE historical_market_manifests;
+        CREATE TABLE historical_market_manifests (
+          archive_fingerprint TEXT PRIMARY KEY, source TEXT NOT NULL,
+          source_revision TEXT NOT NULL, adjustment TEXT NOT NULL,
+          coverage_start TEXT NOT NULL, coverage_end TEXT NOT NULL,
+          symbols_json TEXT NOT NULL, row_count INTEGER NOT NULL,
+          content_hash TEXT NOT NULL, imported_at TEXT, schema_version TEXT NOT NULL
+        );
+        CREATE TABLE historical_market_bars (
+          archive_fingerprint TEXT NOT NULL, code TEXT NOT NULL, session TEXT NOT NULL,
+          open REAL NOT NULL, high REAL NOT NULL, low REAL NOT NULL, close REAL NOT NULL,
+          volume REAL NOT NULL, amount REAL NOT NULL, source TEXT NOT NULL,
+          source_revision TEXT NOT NULL
+        );
+        """)
+        self.conn.execute("INSERT INTO historical_market_manifests VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (fingerprint, "legacy-export", "rev-1", "raw", "2026-01-05",
+             "2026-01-05", HMA._canonical(["000001.SH"]), 1, content_hash, None,
+             "historical-market-archive-v1"))
+        self.conn.execute("INSERT INTO historical_market_bars VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (fingerprint, row["code"], row["session"], row["open"], row["high"],
+             row["low"], row["close"], row["volume"], row["amount"], row["source"],
+             row["source_revision"]))
+        migrated = HMA.HistoricalMarketArchiveRepository(self.conn)
+        manifest = migrated.get_manifest(fingerprint)
+        self.assertIsNotNone(manifest)
+        self.assertEqual("historical-market-archive-v1", manifest.schema_version)
+        self.assertEqual({}, manifest.benchmark_calendars)
+        with self.assertRaisesRegex(HSC.HistoricalSessionCalendarError,
+                                    "historical_benchmark_calendar_unavailable"):
+            HSC.issue_from_market_archive(migrated,
+                archive_fingerprint=fingerprint, benchmark_symbol="000001.SH",
+                start="2026-01-05", end="2026-01-05")
 
     def test_qfq_is_rejected(self):
         with self.assertRaisesRegex(HMA.HistoricalMarketArchiveError, "adjusted_market_data_rejected"):
@@ -67,7 +123,8 @@ class HistoricalMarketArchiveTests(unittest.TestCase):
     def test_calendar_issues_only_from_raw_archive_and_bounded_range(self):
         rows = [_bar("000001.SH", "2026-01-05"), _bar("000001.SH", "2026-01-06")]
         manifest = self.repo.import_raw_market_archive(rows, source="trusted-benchmark-export",
-            source_revision="rev-1", adjustment="raw")
+            source_revision="rev-1", adjustment="raw",
+            benchmark_calendars=_calendar(["2026-01-05", "2026-01-06"]))
         calendar = HSC.issue_from_market_archive(self.repo,
             archive_fingerprint=manifest.archive_fingerprint, benchmark_symbol="000001.SH",
             start="2026-01-05", end="2026-01-06")
@@ -77,10 +134,33 @@ class HistoricalMarketArchiveTests(unittest.TestCase):
                 archive_fingerprint=manifest.archive_fingerprint, benchmark_symbol="000001.SH",
                 start="2026-01-01", end="2026-01-06")
 
+    def test_global_archive_coverage_does_not_prove_benchmark_calendar(self):
+        rows = [_bar("600000.SH", "2026-01-05"),
+                _bar("000001.SH", "2026-02-10"),
+                _bar("600000.SH", "2026-03-31")]
+        manifest = self.repo.import_raw_market_archive(rows, source="market-export",
+            source_revision="rev-2", adjustment="raw")
+        self.assertEqual("2026-01-05", manifest.coverage_start)
+        self.assertEqual("2026-03-31", manifest.coverage_end)
+        with self.assertRaisesRegex(HSC.HistoricalSessionCalendarError,
+                                    "historical_benchmark_calendar_unavailable"):
+            HSC.issue_from_market_archive(self.repo,
+                archive_fingerprint=manifest.archive_fingerprint, benchmark_symbol="000001.SH",
+                start="2026-01-05", end="2026-03-31")
+
+    def test_partial_benchmark_bars_cannot_match_complete_session_declaration(self):
+        rows = [_bar("000001.SH", "2026-01-05"), _bar("600000.SH", "2026-01-06")]
+        with self.assertRaisesRegex(HMA.HistoricalMarketArchiveError,
+                                    "benchmark_calendar_bars_incomplete"):
+            self.repo.import_raw_market_archive(rows, source="market-export",
+                source_revision="rev-3", adjustment="raw",
+                benchmark_calendars=_calendar(["2026-01-05", "2026-01-06"]))
+
     def test_forged_calendar_dataclass_is_rejected_against_archive(self):
         manifest = self.repo.import_raw_market_archive(
             [_bar("000001.SH", "2026-01-05"), _bar("000001.SH", "2026-01-06")],
-            source="trusted-benchmark-export", source_revision="rev-1", adjustment="raw")
+            source="trusted-benchmark-export", source_revision="rev-1", adjustment="raw",
+            benchmark_calendars=_calendar(["2026-01-05", "2026-01-06"]))
         calendar = HSC.issue_from_market_archive(self.repo,
             archive_fingerprint=manifest.archive_fingerprint, benchmark_symbol="000001.SH",
             start="2026-01-05", end="2026-01-06")

@@ -56,20 +56,26 @@ def issue_from_market_archive(repository: HMA.HistoricalMarketArchiveRepository,
     """Issue a typed projection only from an exact raw benchmark archive identity.
 
     Caller mappings, weekday rules, samples, and the live calendar are not accepted.
-    The archive must span the requested range and contain benchmark data throughout
-    that range. Its sessions are derived only from the benchmark's raw bars.
+    The archive must carry a benchmark-specific expected-session declaration from
+    its import owner. That declaration is checked against every raw benchmark bar;
+    global archive bounds and a nonempty benchmark sample cannot establish coverage.
     """
     if not _DATE.fullmatch(start or "") or not _DATE.fullmatch(end or "") or start > end:
         raise HistoricalSessionCalendarError("invalid_calendar_range")
     manifest = repository.get_manifest(archive_fingerprint)
     if manifest is None or manifest.adjustment != "raw":
         raise HistoricalSessionCalendarError("historical_market_archive_unavailable")
-    if manifest.coverage_start > start or manifest.coverage_end < end:
+    calendar_evidence = manifest.benchmark_calendars.get(benchmark_symbol)
+    if not isinstance(calendar_evidence, dict):
+        raise HistoricalSessionCalendarError("historical_benchmark_calendar_unavailable")
+    if (calendar_evidence.get("coverage_start", "") > start
+            or calendar_evidence.get("coverage_end", "") < end):
         raise HistoricalSessionCalendarError("historical_session_calendar_incomplete_range")
     bars = repository.read_bars(archive_fingerprint, start=start, end=end,
                                 symbols=(benchmark_symbol,))
-    sessions = tuple(sorted({row["session"] for row in bars}))
-    if not sessions:
+    sessions = tuple(value for value in calendar_evidence["sessions"] if start <= value <= end)
+    observed_sessions = tuple(sorted({row["session"] for row in bars}))
+    if not sessions or observed_sessions != sessions:
         raise HistoricalSessionCalendarError("historical_session_calendar_incomplete_range")
     content_hash = _digest({"benchmark_symbol": benchmark_symbol, "sessions": list(sessions)})
     projection = {"schema_version": CALENDAR_VERSION,

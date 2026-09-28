@@ -22,6 +22,11 @@ import self_evolution as SE
 router = APIRouter(prefix="/api/adaptive", tags=["adaptive-learning"])
 
 
+def _canonical_build_revision() -> str:
+    """Return the repository's single injected build identity."""
+    return os.environ.get("ASTOCK_GIT_COMMIT", "")
+
+
 class ExperimentValidationRequest(BaseModel):
     """Exact identities required to run one offline canonical validation."""
     spec: dict
@@ -469,7 +474,7 @@ def validate_canonical_experiment(request: ExperimentValidationRequest):
                 checksum=spec.strategy.checksum,
             )
             # The app process injects its build identity. The request cannot claim it.
-            build_revision = os.environ.get("ASTOCK_BUILD_REVISION", "")
+            build_revision = _canonical_build_revision()
             output = runner.run_validation(
                 spec, runner_code_revision=build_revision,
                 strategy_version=strategy_version, dataset_manifest=manifest,

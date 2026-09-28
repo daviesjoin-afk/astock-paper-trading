@@ -79,7 +79,8 @@ def simulate(spec: EC.ExperimentSpec, *, ast: Mapping[str, Any],
     history: dict[str, list[Mapping[str, Any]]] = {}
     positions: dict[str, dict[str, Any]] = {}
     cash = initial_cash
-    total_cost = traded = trade_count = capacity_sum = 0.0
+    total_cost = traded = capacity_sum = 0.0
+    trade_count = 0
     capacity_count = 0
     equity_path = []
     exposure_sum = 0.0
@@ -102,12 +103,24 @@ def simulate(spec: EC.ExperimentSpec, *, ast: Mapping[str, Any],
                         if tradability_evidence is not None else
                         tradability_repository.evidence_at(code, session, instant)
                         if tradability_repository is not None else None)
-            if bar is None or evidence is None or evidence.is_suspended is not False:
-                continue
+            if evidence is None:
+                raise ExperimentExecutionUnavailable("execution_tradability_unavailable")
             decision = TA.TradabilityEvaluator.evaluate(
                 evidence, decision_time=instant,
                 fingerprint=TA.evidence_fingerprint(evidence),
             )
+            block_reason = (decision.buy_block_reason if action == "buy"
+                            else decision.sell_block_reason)
+            if block_reason == TA.TradabilityReason.UNKNOWN_STATE:
+                raise ExperimentExecutionUnavailable("execution_tradability_unavailable")
+            can_execute = decision.can_buy if action == "buy" else decision.can_sell
+            if not can_execute:
+                # A proven market block explains why no fill occurred. Unknown facts
+                # were rejected above and cannot be recorded as strategy performance.
+                pending.pop(code, None)
+                continue
+            if bar is None:
+                raise ExperimentExecutionUnavailable("execution_market_bar_unavailable")
             direction = getattr(evidence, "price_limit_direction", None)
             if action == "buy" and (not decision.can_buy or direction == TA.PRICE_LIMIT_UP):
                 continue

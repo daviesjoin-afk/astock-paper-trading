@@ -44,3 +44,10 @@ class R29ValidationApiTests(unittest.TestCase):
         self.assertIn("post", paths["/api/adaptive/experiments/validate"])
         self.assertIn("get", paths["/api/adaptive/experiments/runs"])
         self.assertIn("get", paths["/api/adaptive/experiments/runs/{run_id}"])
+
+    def test_api_uses_the_canonical_docker_build_identity(self):
+        with mock.patch.dict(os.environ, {
+            "ASTOCK_GIT_COMMIT": "a" * 40,
+            "ASTOCK_BUILD_REVISION": "b" * 40,
+        }, clear=True):
+            self.assertEqual("a" * 40, api_adaptive._canonical_build_revision())
