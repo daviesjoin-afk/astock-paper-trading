@@ -692,22 +692,23 @@ def create_canonical_robustness_report(request: RobustnessRequest,
                 if not isinstance(benchmark_calendar, dict):
                     raise ValueError("historical_benchmark_calendar_unavailable")
                 owner_sessions = list(benchmark_calendar.get("sessions") or ())
-                if (spec.start_date not in owner_sessions or spec.end_date not in owner_sessions
-                        or owner_sessions != sorted(set(owner_sessions))):
+                try:
+                    base_start, base_end = RRUN._baseline_session_bounds(spec, owner_sessions)
+                except ValueError as exc:
+                    raise ValueError("historical_benchmark_calendar_unavailable") from exc
+                if owner_sessions != sorted(set(owner_sessions)):
                     raise ValueError("historical_benchmark_calendar_unavailable")
-                base_start, base_end = owner_sessions.index(spec.start_date), owner_sessions.index(spec.end_date)
+                baseline_sessions = owner_sessions[base_start:base_end + 1]
                 ranges = []
                 for scenario in date_scenarios:
-                    params = scenario["parameters"]
-                    start_index, end_index = base_start, base_end
-                    if scenario["category"] == "start_date":
-                        start_index += params["shift_sessions"]
-                    else:
-                        end_index += params["shift_sessions"]
-                    if 0 <= start_index <= end_index < len(owner_sessions):
-                        selected = owner_sessions[start_index:end_index + 1]
-                        if selected:
-                            ranges.append((selected[0], selected[-1]))
+                    try:
+                        selected = RRUN._scenario_sessions(scenario, spec, owner_sessions)
+                    except ValueError:
+                        # Out-of-coverage scenarios remain unavailable in the
+                        # runner; they must not make the whole POST fail.
+                        continue
+                    if selected != baseline_sessions:
+                        ranges.append((selected[0], selected[-1]))
                 if ranges:
                     coverage_start = min(spec.start_date, *(start for start, _ in ranges))
                     coverage_end = max(spec.end_date, *(end for _, end in ranges))

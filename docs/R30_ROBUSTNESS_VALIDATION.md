@@ -8,6 +8,8 @@ R30 examines where one exact, completed R29 experiment loses evidence or changes
 
 The only accepted baseline is one exact R29 ledger row with `validation_status=ready`, a completed `ExperimentResult`, matching experiment and result fingerprints, known R29 runner version, matching strategy identity, and matching calendar, market, universe, dataset, financial, and tradability identities. The caller supplies the complete `ExperimentSpec`; current/latest and legacy backtest fallbacks are not used.
 
+Before execution, R30 recomputes the R29 tradability evidence fingerprint from the baseline's exact owner sessions and historical-universe members. A mismatch against the stored run identity rejects the baseline. Each changed date range gets its own canonical tradability fingerprint in the ranged `ExperimentSpec` and R29 proof.
+
 ## Scenario dimensions
 
 The plan accepts explicit commission, minimum-commission, and stamp-duty multipliers; fixed-rate slippage multipliers; owner-session execution and signal delays; liquidity reduction; deterministic whole-bar missingness; allowlisted strategy-parameter perturbations; owner-session start/end shifts; and deterministic removal from the baseline historical universe. Plans are bounded to 1–100 scenarios.
@@ -16,7 +18,7 @@ Bull/bear/sideways trend and high/middle/low/unknown volatility are derived inde
 
 Stress views are in-memory derived inputs. They do not change OHLC truth or write to historical market, universe, tradability, or financial archives. Missing required bars and unproven execution inputs produce `unavailable` with null metrics. Parameter changes must name an allowlisted strategy DSL parameter path; there is no parameter search or performance-directed selection.
 
-Date shifts use the owner-issued benchmark session calendar. Every changed start or end range, including contractions, is revalidated by the existing R29 PIT validator with the exact dataset, samples, strategy, walk-forward policy, and historical owners. Expanded ranges also require the pinned raw archive to issue the exact extended calendar. A missing or blocked proof makes that case unavailable.
+Date shifts use the owner-issued benchmark session calendar. Spec boundaries may fall on non-trading dates: the baseline anchors to the first owner session on or after `start_date` and the last owner session on or before `end_date`, then applies session offsets. Every changed start or end range, including contractions, is revalidated by the existing R29 PIT validator with the exact dataset, samples, strategy, walk-forward policy, and historical owners. Expanded ranges also require the pinned raw archive to issue the exact extended calendar. A missing or blocked proof makes that case unavailable.
 
 ## Execution and reporting
 

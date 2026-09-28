@@ -17,6 +17,7 @@ if str(BACKEND) not in sys.path:
 import experiment_contract as EC
 import experiment_execution_model as EM
 import experiment_validation_repository as EVR
+import experiment_validation_runner as R29
 import historical_market_archive as HMA
 import historical_session_calendar as HSC
 import historical_universe_archive as HUA
@@ -89,14 +90,14 @@ class RobustnessFixture:
         self.market_manifest = self.market.import_raw_market_archive(
             bars, source="r30-fixture", source_revision="1", adjustment="raw",
             benchmark_calendars={BENCHMARK: {
-                "coverage_start": SESSIONS[0], "coverage_end": SESSIONS[-1],
+                "coverage_start": "2026-01-03", "coverage_end": "2026-01-11",
                 "sessions": list(SESSIONS), "source": "r30-calendar-owner",
                 "source_revision": "1"}})
         self.universe_manifest = self.universe.import_historical_security_master([{
             "code": CODE, "listed_from": "2020-01-01", "delisted_at": None,
             "security_type": "equity", "exchange": "SH",
             "observed_at": "2020-01-01T09:00:00+08:00",
-        }], coverage_start="2020-01-01", coverage_end=SESSIONS[-1],
+        }], coverage_start="2020-01-01", coverage_end="2026-01-11",
             source="r30-fixture", source_revision="1")
         base = EXEC._spec()
         self.calendar = HSC.issue_from_market_archive(
@@ -115,7 +116,11 @@ class RobustnessFixture:
                 "op": "gt", "left": {"op": "field", "name": "close"},
                 "right": {"op": "const", "value": 1000}}}},
             created_at="2026-01-01T00:00:00+00:00", created_by="test")
-        members = {session: [{"code": CODE}] for session in self.baseline_sessions}
+        members = R29._universe_rows(
+            self.universe, self.spec.universe_fingerprint, self.baseline_sessions)
+        tradability_fingerprint = R29._tradability_fingerprint(
+            members, self.baseline_sessions, self.tradability)
+        self.spec = replace(self.spec, tradability_fingerprint=tradability_fingerprint)
         security_bars = [row for row in bars if row["code"] == CODE
                          and row["session"] in self.baseline_sessions]
         open_facts = self.tradability.evidence_many({
@@ -140,7 +145,7 @@ class RobustnessFixture:
             "calendar_fingerprint": self.calendar.calendar_fingerprint,
             "universe_archive_fingerprint": self.spec.universe_fingerprint,
             "financial_archive_fingerprint": None,
-            "tradability_evidence_fingerprint": "c" * 64,
+            "tradability_evidence_fingerprint": tradability_fingerprint,
             "market_archive_fingerprint": self.spec.market_data_fingerprint,
             "dataset_fingerprint": self.spec.dataset_fingerprint,
             "validation_status": "ready", "validation_evidence": validation_evidence,
@@ -161,6 +166,65 @@ class RobustnessFixture:
             self.spec.fingerprint, owner_projection, RUN.R29_RUNNER_VERSION)
         self.plan = _plan(baseline_run_key=self.run["run_key"],
                           baseline_experiment_fingerprint=self.spec.fingerprint)
+
+    def rebind_dates(self, start: str, end: str):
+        calendar = HSC.issue_from_market_archive(
+            self.market, archive_fingerprint=self.spec.market_data_fingerprint,
+            benchmark_symbol=BENCHMARK, start=start, end=end)
+        spec = replace(self.spec, start_date=start, end_date=end,
+            parameter_set={**self.spec.parameter_set,
+                           "validation_calendar_fingerprint": calendar.calendar_fingerprint})
+        sessions = list(calendar.sessions)
+        members = R29._universe_rows(self.universe, spec.universe_fingerprint, sessions)
+        tradability_fingerprint = R29._tradability_fingerprint(members, sessions, self.tradability)
+        spec = replace(spec, tradability_fingerprint=tradability_fingerprint)
+        symbols = sorted({row["code"] for rows in members.values() for row in rows})
+        bars = self.market.read_bars(spec.market_data_fingerprint,
+            start=calendar.coverage_start, end=calendar.coverage_end, symbols=symbols)
+        facts = self.tradability.evidence_many({
+            (row["code"], session): f"{session}T09:30:00+08:00"
+            for session in sessions for row in members.get(session, ())})
+        metrics = EM.simulate(spec, ast=self.strategy.definition["dsl_ast"],
+            sessions=sessions, members_by_session=members, bars=bars,
+            tradability_repository=self.tradability, tradability_evidence=facts)
+        result = EC.ExperimentResult(
+            experiment_fingerprint=spec.fingerprint, status="completed",
+            total_return=metrics["total_return"], max_drawdown=metrics["max_drawdown"],
+            volatility=metrics["volatility"], turnover=metrics["turnover"],
+            trade_count=metrics["trade_count"], total_cost=metrics["total_cost"],
+            exposure=metrics["exposure"], capacity_proxy=metrics["capacity_proxy"],
+            data_coverage=metrics["data_coverage"], regime_breakdown=metrics["regime_breakdown"])
+        validation_evidence = {"experiment_fingerprint": spec.fingerprint,
+                               "status": "ready", "reason_codes": []}
+        self.spec, self.calendar = spec, calendar
+        self.run = {
+            "id": 1, "run_key": "", "experiment_fingerprint": spec.fingerprint,
+            "strategy_id": spec.strategy.strategy_id, "strategy_version": spec.strategy.version,
+            "strategy_checksum": spec.strategy.checksum,
+            "calendar_fingerprint": calendar.calendar_fingerprint,
+            "universe_archive_fingerprint": spec.universe_fingerprint,
+            "financial_archive_fingerprint": None,
+            "tradability_evidence_fingerprint": tradability_fingerprint,
+            "market_archive_fingerprint": spec.market_data_fingerprint,
+            "dataset_fingerprint": spec.dataset_fingerprint,
+            "validation_status": "ready", "validation_evidence": validation_evidence,
+            "result": result.projection(), "runner_version": RUN.R29_RUNNER_VERSION,
+            "runner_code_revision": spec.code_revision,
+        }
+        owner_projection = {
+            "calendar_fingerprint": calendar.calendar_fingerprint,
+            "universe_archive_fingerprint": spec.universe_fingerprint,
+            "tradability_evidence_fingerprint": tradability_fingerprint,
+            "market_archive_fingerprint": spec.market_data_fingerprint,
+            "financial_archive_fingerprint": None,
+            "dataset_fingerprint": spec.dataset_fingerprint,
+            "strategy_version": spec.strategy.projection(),
+            "validation_evidence_fingerprint": RUN._sha(validation_evidence),
+        }
+        self.run["run_key"] = EVR.ExperimentValidationRepository.build_run_key(
+            spec.fingerprint, owner_projection, RUN.R29_RUNNER_VERSION)
+        self.plan = _plan(baseline_run_key=self.run["run_key"],
+                          baseline_experiment_fingerprint=spec.fingerprint)
 
     def close(self):
         self.market_conn.close(); self.universe_conn.close(); self.tradability_conn.close()
@@ -546,6 +610,80 @@ class RobustnessRunnerTests(unittest.TestCase):
             RUN._scenario_sessions({"category": "start_date",
                 "parameters": {"shift_sessions": -2}}, self.fixture.spec,
                 self.fixture.calendar.sessions)
+
+    def test_baseline_rejects_later_tradability_archive_revision(self):
+        session = self.fixture.baseline_sessions[0]
+        self.fixture.tradability.save(TA.TradabilityEvidence(
+            code=CODE, session_date=session, is_listed=True, listing_date="2020-01-01",
+            delisting_date=None, is_st=True, is_suspended=False,
+            suspension_reason=None, has_market_quote=True, has_trade_volume=True,
+            is_price_limit_locked=False, price_limit_direction=None,
+            source="fixture-owner-revision", observed_at=f"{session}T10:00:00+08:00",
+            effective_at=f"{session}T09:30:00+08:00"))
+        with self.assertRaisesRegex(RUN.RobustnessBaselineError,
+                                   "baseline_tradability_identity_mismatch"):
+            self.fixture.execute()
+
+    def test_weekend_spec_boundaries_anchor_date_stresses_to_owner_sessions(self):
+        self.fixture.rebind_dates("2026-01-03", "2026-01-10")
+        RUN._verify_baseline(self.fixture.run, self.fixture.spec,
+                             self.fixture.plan, self.fixture.strategy)
+        calls = []
+        proof_fingerprints = []
+
+        def ready_r29_proof(ranged_spec, **kwargs):
+            calendar = kwargs["session_calendar"]
+            sessions = list(calendar.sessions)
+            members = R29._universe_rows(
+                self.fixture.universe, ranged_spec.universe_fingerprint, sessions)
+            tradability_fingerprint = R29._tradability_fingerprint(
+                members, sessions, self.fixture.tradability)
+            self.assertEqual(tradability_fingerprint, ranged_spec.tradability_fingerprint)
+            calls.append((ranged_spec.start_date, ranged_spec.end_date))
+            proof_fingerprints.append(tradability_fingerprint)
+            return {
+                "status": "ready", "result": {"status": "completed"},
+                "validation_evidence_fingerprint": "e" * 64,
+                "run_key": "f" * 64,
+                "owner_identities": {
+                    "calendar_fingerprint": calendar.calendar_fingerprint,
+                    "market_archive_fingerprint": ranged_spec.market_data_fingerprint,
+                    "universe_archive_fingerprint": ranged_spec.universe_fingerprint,
+                    "dataset_fingerprint": ranged_spec.dataset_fingerprint,
+                    "financial_archive_fingerprint": None,
+                    "tradability_evidence_fingerprint": tradability_fingerprint,
+                },
+            }
+
+        plan = _plan(
+            baseline_run_key=self.fixture.run["run_key"],
+            baseline_experiment_fingerprint=self.fixture.spec.fingerprint,
+            cost_stresses=[], slippage_stresses=[], liquidity_stresses=[],
+            missing_data_stresses=[], universe_stresses=[],
+            start_date_stresses=[{"shift_sessions": 1}],
+            end_date_stresses=[{"shift_sessions": -1}])
+        context = {"walk_forward_config": object(), "dataset_manifest": object(),
+                   "samples": [], "benchmark_symbol": BENCHMARK}
+        with mock.patch.object(RUN.R29, "run_validation", side_effect=ready_r29_proof):
+            report = RUN.run_robustness(
+                baseline_run=self.fixture.run, spec=self.fixture.spec, plan=plan,
+                strategy_version=self.fixture.strategy, session_calendar=self.fixture.calendar,
+                market_archive_repository=self.fixture.market,
+                universe_archive_repository=self.fixture.universe,
+                tradability_repository=self.fixture.tradability,
+                date_range_validation_context=context,
+                created_at="2026-01-10T00:00:00Z")
+
+        self.assertEqual([("2026-01-06", "2026-01-09"),
+                          ("2026-01-05", "2026-01-08")], calls)
+        self.assertEqual(["completed", "completed"],
+                         [case["result"]["status"] for case in report["cases"]])
+        for case, expected_fingerprint in zip(report["cases"], proof_fingerprints, strict=True):
+            self.assertEqual(self.fixture.run["tradability_evidence_fingerprint"],
+                             case["evidence"]["baseline_owner_identities"][
+                                 "tradability_evidence_fingerprint"])
+            self.assertEqual(expected_fingerprint,
+                case["evidence"]["date_range_pit_proof"]["tradability_evidence_fingerprint"])
 
     def test_date_expansion_requires_owner_issued_calendar_and_R29_revalidation(self):
         expanded_calendar = HSC.issue_from_market_archive(

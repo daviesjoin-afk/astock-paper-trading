@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+from bisect import bisect_left, bisect_right
 from dataclasses import replace
 from collections.abc import Mapping, Sequence
 from typing import Any
@@ -210,7 +211,7 @@ def _apply_parameter_stress(ast: Mapping[str, Any], parameters: Mapping[str, Any
 
 def _scenario_sessions(scenario: Mapping[str, Any], spec: EC.ExperimentSpec,
                        sessions: Sequence[str]) -> list[str]:
-    start, end = sessions.index(spec.start_date), sessions.index(spec.end_date)
+    start, end = _baseline_session_bounds(spec, sessions)
     parameters = scenario["parameters"]
     if scenario["category"] == "start_date":
         start += parameters["shift_sessions"]
@@ -219,6 +220,18 @@ def _scenario_sessions(scenario: Mapping[str, Any], spec: EC.ExperimentSpec,
     if start < 0 or end >= len(sessions) or start > end:
         raise ValueError("date_perturbation_outside_archive_coverage")
     return list(sessions[start:end + 1])
+
+
+def _baseline_session_bounds(spec: EC.ExperimentSpec,
+                             sessions: Sequence[str]) -> tuple[int, int]:
+    """Anchor a declared date interval to its first/last owner sessions."""
+    if not sessions or list(sessions) != sorted(set(sessions)):
+        raise ValueError("historical_session_calendar_invalid")
+    start = bisect_left(sessions, spec.start_date)
+    end = bisect_right(sessions, spec.end_date) - 1
+    if start >= len(sessions) or end < 0 or start > end:
+        raise ValueError("date_perturbation_baseline_sessions_unavailable")
+    return start, end
 
 
 def _revalidate_scenario_date_range(*, sessions: Sequence[str], spec: EC.ExperimentSpec,
@@ -239,7 +252,12 @@ def _revalidate_scenario_date_range(*, sessions: Sequence[str], spec: EC.Experim
         market_archive_repository, archive_fingerprint=spec.market_data_fingerprint,
         benchmark_symbol=validation_context["benchmark_symbol"],
         start=sessions[0], end=sessions[-1])
+    ranged_members = R29._universe_rows(
+        universe_archive_repository, spec.universe_fingerprint, sessions)
+    ranged_tradability_fingerprint = R29._tradability_fingerprint(
+        ranged_members, sessions, tradability_repository)
     ranged_spec = replace(spec, start_date=sessions[0], end_date=sessions[-1],
+        tradability_fingerprint=ranged_tradability_fingerprint,
         parameter_set={**spec.parameter_set,
                        "validation_calendar_fingerprint": exact_calendar.calendar_fingerprint})
     proof = R29.run_validation(
@@ -265,10 +283,14 @@ def _revalidate_scenario_date_range(*, sessions: Sequence[str], spec: EC.Experim
                 != baseline_identity.get("universe_archive_fingerprint")
             or owner_identities.get("dataset_fingerprint") != baseline_identity.get("dataset_fingerprint")
             or owner_identities.get("financial_archive_fingerprint")
-                != baseline_identity.get("financial_archive_fingerprint")):
+                != baseline_identity.get("financial_archive_fingerprint")
+            or not owner_identities.get("tradability_evidence_fingerprint")):
         raise ValueError("date_range_pit_revalidation_unavailable")
+    if owner_identities["tradability_evidence_fingerprint"] != ranged_tradability_fingerprint:
+        raise ValueError("date_range_tradability_identity_mismatch")
     return {"experiment_fingerprint": ranged_spec.fingerprint,
             "calendar_fingerprint": exact_calendar.calendar_fingerprint,
+            "tradability_evidence_fingerprint": ranged_tradability_fingerprint,
             "validation_evidence_fingerprint": proof.get("validation_evidence_fingerprint"),
             "run_key": proof.get("run_key"), "runner_version": R29_RUNNER_VERSION}
 
@@ -328,6 +350,14 @@ def run_robustness(*, baseline_run: Mapping[str, Any], spec: EC.ExperimentSpec,
     if (not isinstance(session_calendar, HSC.HistoricalSessionCalendar)
             or session_calendar.calendar_fingerprint != baseline_identity["calendar_fingerprint"]):
         raise RobustnessBaselineError("baseline_calendar_unavailable")
+    baseline_sessions = list(session_calendar.sessions)
+    baseline_members = R29._universe_rows(
+        universe_archive_repository, spec.universe_fingerprint, baseline_sessions)
+    archive_tradability_fingerprint = R29._tradability_fingerprint(
+        baseline_members, baseline_sessions, tradability_repository)
+    if (archive_tradability_fingerprint != baseline_identity["tradability_evidence_fingerprint"]
+            or archive_tradability_fingerprint != spec.tradability_fingerprint):
+        raise RobustnessBaselineError("baseline_tradability_identity_mismatch")
     market_manifest = market_archive_repository.get_manifest(spec.market_data_fingerprint)
     if market_manifest is None or market_manifest.adjustment != "raw":
         raise RobustnessBaselineError("baseline_market_archive_unavailable")
@@ -379,10 +409,11 @@ def run_robustness(*, baseline_run: Mapping[str, Any], spec: EC.ExperimentSpec,
         result = None
         try:
             scenario_sessions = _scenario_sessions(scenario, spec, sessions)
-            expands_baseline = (scenario_sessions[0] < spec.start_date
-                                or scenario_sessions[-1] > spec.end_date)
-            changes_date_range = (scenario_sessions[0] != spec.start_date
-                                  or scenario_sessions[-1] != spec.end_date)
+            baseline_start, baseline_end = _baseline_session_bounds(spec, sessions)
+            declared_baseline_sessions = sessions[baseline_start:baseline_end + 1]
+            expands_baseline = (scenario_sessions[0] < declared_baseline_sessions[0]
+                                or scenario_sessions[-1] > declared_baseline_sessions[-1])
+            changes_date_range = scenario_sessions != declared_baseline_sessions
             if changes_date_range:
                 if expands_baseline and extended_session_calendar is None:
                     raise ValueError("date_expansion_owner_calendar_missing")
