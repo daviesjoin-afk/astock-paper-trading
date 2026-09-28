@@ -138,7 +138,16 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Build application image
-        run: docker build --tag astock-codex:ci .
+        run: docker build --build-arg "ASTOCK_GIT_COMMIT=${GITHUB_SHA}" --tag astock-codex:ci .
+
+      - name: Assert the image carries the exact build revision
+        env:
+          EXPECTED_GIT_COMMIT: ${{ github.sha }}
+        run: >
+          docker run --rm
+          --env EXPECTED_GIT_COMMIT="${EXPECTED_GIT_COMMIT}"
+          astock-codex:ci
+          python -c "import os; actual = os.environ['ASTOCK_GIT_COMMIT']; expected = os.environ['EXPECTED_GIT_COMMIT']; assert actual == expected, (actual, expected); print(actual)"
 
       - name: Assert the image runtime is Python 3.14
         run: >

@@ -80,9 +80,14 @@ rsync -av --exclude-from=deploy/rsync-exclude.txt ./ root@服务器IP:/tmp/astoc
 
 ```bash
 cd /tmp/astock-quant
+# 在上传源码前，从本地源码仓库运行 git rev-parse HEAD，使用其完整 40 位输出。
+ASTOCK_GIT_COMMIT='<本地 git rev-parse HEAD 的完整输出>' \
 ASTOCK_ADMIN_USER=admin ASTOCK_ADMIN_PASSWORD='替换为强密码' \
   sudo -E bash deploy/install-centos9.sh
 ```
+
+安装器会把该 SHA 写入 systemd 服务配置，使 native API 进程使用与上传源码对应的
+完整构建身份。缺少或格式不正确时安装会停止，不会使用短 SHA 或 `unknown`。
 
 默认不会修改防火墙。请先在云安全组把 TCP 80 的来源限制为你自己的固定出口
 IP，再执行：
