@@ -28,6 +28,8 @@ import api_strategies as API
 import frontend_sources
 import main
 import paper_trading as P
+import strategy_api_models as Models
+import strategy_lifecycle as SL
 import strategy_registry as SR
 import strategy_runtime as SRT
 import strategy_service as SVC
@@ -224,44 +226,59 @@ class CanonicalLifecycleBehaviourTests(unittest.TestCase):
             pass
 
     def _transition(self, to_status, expected_status=None):
-        payload = {"to_status": to_status, "reason": "test", "actor": "test"}
-        if expected_status is not None:
-            payload["expected_status"] = expected_status
-        return API.transition_strategy(self.id, payload)
+        with P._db() as conn:
+            version = SR.get_version(self.id, conn=conn)
+        if to_status in SL.SAFETY_TRANSITION_TARGETS:
+            proposal_fingerprint = None
+            reason = "single editor lifecycle regression"
+        else:
+            proposal = SVC.create_promotion_proposal(self.id,
+                Models.PromotionProposalRequest.model_validate({
+                    "strategy_version": version.version,
+                    "strategy_checksum": version.checksum,
+                    "expected_state": expected_status,
+                    "target_state": to_status,
+                    "proposer_type": "human", "proposer_id": "single-editor-test",
+                    "rationale": "canonical lifecycle regression",
+                }))
+            proposal_fingerprint = proposal["proposal_fingerprint"]
+            reason = ""
+        return SVC.transition(self.id, Models.StrategyTransitionRequest.model_validate({
+            "strategy_version": version.version, "strategy_checksum": version.checksum,
+            "expected_state": expected_status, "target_state": to_status,
+            "actor_type": "human", "actor_id": "single-editor-test",
+            "proposal_fingerprint": proposal_fingerprint,
+            "reason_code": "test_safety_transition" if reason else "", "reason": reason,
+        }))
 
     def test_canonical_transition_drives_the_whole_lifecycle(self):
-        self.assertEqual("validated", self._transition("validated", "draft")["status"])
-        active = self._transition("active", "validated")
-        self.assertEqual("active", active["status"])
-        self.assertTrue(active["supports_new_cycle"])
-
-        paused = self._transition("paused", "active")
-        self.assertEqual("paused", paused["status"])
-        self.assertFalse(paused["supports_new_cycle"])
+        candidate = self._transition("candidate", "draft")
+        self.assertEqual("candidate", candidate["status"])
+        research = self._transition("research", "candidate")
+        self.assertEqual("research", research["status"])
+        retiring = self._transition("retiring", "research")
+        self.assertEqual("retiring", retiring["status"])
         # pause 不改变不可变版本：版本号与 checksum 原样保留（账本可继续解析）。
-        self.assertEqual(1, paused["version"])
+        self.assertEqual(1, retiring["version"])
         version = SVC.get_strategy(self.id)
         self.assertEqual(1, version.current_version)
         self.assertTrue(version.current_checksum)
-
-        self.assertEqual("active", self._transition("active", "paused")["status"])
-        self.assertEqual("retiring", self._transition("retiring", "active")["status"])
         archived = self._transition("archived", "retiring")
         self.assertEqual("archived", archived["status"])
         self.assertFalse(archived["supports_new_cycle"])
 
     def test_archive_keeps_history_readable(self):
-        self._transition("validated", "draft")
-        self._transition("active", "validated")
-        self._transition("retiring", "active")
+        self._transition("candidate", "draft")
+        self._transition("research", "candidate")
+        self._transition("retiring", "research")
         self._transition("archived", "retiring")
 
         versions = API.list_strategy_versions(self.id)
         self.assertEqual([1], [row["version"] for row in versions["items"]])
         self.assertTrue(versions["items"][0]["checksum"])
         events = API.list_strategy_events(self.id)
-        transitions = [(row["from_status"], row["to_status"]) for row in events["items"]]
-        self.assertIn(("active", "retiring"), transitions)
+        transitions = [(row["from_state"], row["to_state"]) for row in events["items"]]
+        self.assertIn(("research", "retiring"), transitions)
         self.assertIn(("retiring", "archived"), transitions)
         # 归档后的策略仍可读详情（历史血缘不删除）。
         self.assertEqual("archived", API.get_strategy(self.id)["status"])
