@@ -31,6 +31,7 @@ import unittest
 import paper_trading as PT
 import runtime_settings as RSET
 import strategy_registry as SR
+from test_strategy_lifecycle_fixtures import seed_legacy_state
 import strategy_runtime as SRT
 import test_production_path_golden_replay as G
 
@@ -84,9 +85,9 @@ class CycleParticipantResolverTests(G.OfflinePaperEnv, unittest.TestCase):
                 metadata={"candidate_topn": 10, "style": "trend", "hold": 8},
                 actor="cycle-participant-test",
             )
-            SR.transition(conn, strategy_id, "validated", expected_status="draft",
+            seed_legacy_state(conn, strategy_id, "validated", expected_status="draft",
                           reason="validate", actor="cycle-participant-test")
-            SR.transition(conn, strategy_id, "active", expected_status="validated",
+            seed_legacy_state(conn, strategy_id, "active", expected_status="validated",
                           reason="activate", actor="cycle-participant-test")
 
     def _enable(self, strategy_ids):
@@ -194,8 +195,8 @@ class CycleParticipantResolverTests(G.OfflinePaperEnv, unittest.TestCase):
             self.assertEqual(
                 tuple(PT.current_cycle_participant_ids(conn, cycle2["id"])), (STRATEGY_A,),
             )
-            # B 在注册表里仍然是 active —— 这正是修复前的漏点。
-            self.assertEqual(SR.get(STRATEGY_B, conn=conn).status, "active")
+            # B 仍处于 paper，但 Cycle2 所有权明确没有包含它。
+            self.assertEqual(SR.get(STRATEGY_B, conn=conn).status, "paper")
             # B 被显式摘出 Cycle2：不挂接、暂停、资金清零。
             row_b = self._one(conn, "SELECT * FROM paper_accounts WHERE id=?", (STRATEGY_B,))
             self.assertIsNone(row_b["cycle_id"])
@@ -250,7 +251,7 @@ class CycleParticipantResolverTests(G.OfflinePaperEnv, unittest.TestCase):
             before = self._one(conn, "SELECT * FROM paper_accounts WHERE id=?", (STRATEGY_B,))
 
         with self._conn() as conn:
-            SR.transition(conn, STRATEGY_B, "paused", expected_status="active",
+            seed_legacy_state(conn, STRATEGY_B, "paused", expected_status="active",
                           reason="lifecycle pause", actor="cycle-participant-test")
         SRT.clear_cache()
 

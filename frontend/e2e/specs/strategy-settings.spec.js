@@ -1,11 +1,11 @@
 // PR-56b Journey 3 + 6：设置集成与零策略 Idle。
 //
-// Journey 3：创建并激活自定义策略 → 设置中心 → 出现在"下一周期启用策略"里、
-//            可区分于内置、可勾选、保存后刷新仍选中；不可勾选状态不得被勾选。
+// Journey 3：设置中心只允许 canonical lifecycle owner 判定可进入正式周期的策略。
+//            缺少 R29/R30 promotion evidence 的自定义版本必须保持不可勾选。
 // Journey 6：取消全部策略 → 保存被接受 → UI 显示 idle 说明 → API enabled_strategies == []
- import {
-  test, expect, uniqueId, openWorkbench, createDraftViaUi, promoteToActive,
-  apiJson, openSettings, enabledStrategies, waitForApi, clickAndApprove,
+import {
+  test, expect, uniqueId, openWorkbench, createDraftViaUi,
+  openSettings, enabledStrategies, clickAndApprove,
 } from "../fixtures.js";
 
 test.describe("Journey 3 — 设置集成（下一周期策略集合）", () => {
@@ -14,35 +14,19 @@ test.describe("Journey 3 — 设置集成（下一周期策略集合）", () => 
   test.use({ operatorUnlocked: true });
 
 
-  test("激活的自定义策略可被选中，保存后刷新仍保持", async ({ page }) => {
+test("自定义策略缺少 canonical promotion evidence 时不能进入正式周期", async ({ page }) => {
     const id = uniqueId("e2e_settings");
     await openWorkbench(page);
     await createDraftViaUi(page, { id, name: "E2E 设置集成" });
-    await promoteToActive(page, id);
-
-    // 进入设置中心的模拟盘/资金子页
+    // 当前版本仍是 draft；界面必须遵循 lifecycle owner 的正式周期资格。
     await openSettings(page);
 
-    // 自定义策略行出现（稳定 testid），并且可勾选（active + supports_new_cycle）
+    // 自定义策略行出现，但不能通过 legacy active 别名或旧列绕过 promotion。
     const row = page.getByTestId(`settings-strategy-${id}`);
     await expect(row).toBeVisible();
-    // 与内置策略可区分：同一容器里同时存在内置行
     const checkbox = page.getByTestId(`settings-strategy-checkbox-${id}`);
-    await expect(checkbox).toBeEnabled();
-
-    // 勾选并保存（走真实按钮 + 真实 HTTP）
-    if (!(await checkbox.isChecked())) await checkbox.check();
-    const res = await clickAndApprove(page, page.getByTestId("settings-save-simulation"), /\/api\/settings\/$/);
-    // 200/201 都算成功；422 会被下面 API 回读暴露
-    expect([200, 201]).toContain(res.status());
-
-    // API 回读：该策略确实在启用集合里
-    await expect.poll(async () => (await enabledStrategies(page)).includes(id)).toBeTruthy();
-
-    // 刷新后仍选中
-    await page.reload();
-    await openSettings(page);
-    await expect(page.getByTestId(`settings-strategy-checkbox-${id}`)).toBeChecked();
+    await expect(checkbox).toBeDisabled();
+    await expect.poll(async () => (await enabledStrategies(page)).includes(id)).toBeFalsy();
   });
 
   test("非 active 状态（draft）不可勾选", async ({ page }) => {

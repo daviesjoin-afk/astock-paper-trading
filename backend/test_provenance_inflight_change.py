@@ -32,6 +32,7 @@ import paper_selection as PS
 import paper_trading as PT
 import runtime_settings as RSET
 import strategy_registry as SR
+from test_strategy_lifecycle_fixtures import seed_legacy_state
 import strategy_selection_resolver as SRES
 from test_production_path_golden_replay import (
     CAPITAL,
@@ -66,9 +67,9 @@ class _RolloverFixture(OfflinePaperEnv, unittest.TestCase):
                 metadata={"candidate_topn": 10, "style": "trend", "hold": 8},
                 actor="rollover-test",
             )
-            SR.transition(conn, STRATEGY_ID, "validated", expected_status="draft",
+            seed_legacy_state(conn, STRATEGY_ID, "validated", expected_status="draft",
                           reason="validate", actor="rollover-test")
-            SR.transition(conn, STRATEGY_ID, "active", expected_status="validated",
+            seed_legacy_state(conn, STRATEGY_ID, "active", expected_status="validated",
                           reason="activate", actor="rollover-test")
         # 账本 schema 必须先于任何 settings/cycle 写入建立。
         PT.init_db()

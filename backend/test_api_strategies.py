@@ -89,11 +89,38 @@ class ApiStrategiesTests(unittest.TestCase):
         self.assertEqual(status, 201, body)
         return body
 
-    def _transition(self, strategy_id: str, to_status: str, expected_status=None):
-        payload = {"to_status": to_status, "reason": "接口测试"}
-        if expected_status is not None:
-            payload["expected_status"] = expected_status
-        return self._call(API.transition_strategy, strategy_id, payload)
+    def _lifecycle(self, strategy_id):
+        return self._call(API.get_strategy_lifecycle, strategy_id)[1]
+
+    def _proposal(self, strategy_id, target_state, expected_state, evidence_bundle=None):
+        lifecycle = self._lifecycle(strategy_id)
+        return self._call(API.create_strategy_promotion_proposal, strategy_id, {
+            "strategy_version": lifecycle["version"],
+            "strategy_checksum": lifecycle["checksum"],
+            "expected_state": expected_state, "target_state": target_state,
+            "evidence_bundle": evidence_bundle or {}, "proposer_type": "human",
+            "proposer_id": "api-test", "rationale": "API lifecycle contract",
+        }, default_status=201)
+
+    def _apply_proposal(self, strategy_id, target_state, expected_state, proposal):
+        lifecycle = self._lifecycle(strategy_id)
+        return self._call(API.transition_strategy, strategy_id, {
+            "strategy_version": lifecycle["version"],
+            "strategy_checksum": lifecycle["checksum"],
+            "expected_state": expected_state, "target_state": target_state,
+            "actor_type": "human", "actor_id": "api-test",
+            "proposal_fingerprint": proposal["proposal_fingerprint"],
+        })
+
+    def _safety_transition(self, strategy_id, target_state, expected_state):
+        lifecycle = self._lifecycle(strategy_id)
+        return self._call(API.transition_strategy, strategy_id, {
+            "strategy_version": lifecycle["version"],
+            "strategy_checksum": lifecycle["checksum"],
+            "expected_state": expected_state, "target_state": target_state,
+            "actor_type": "human", "actor_id": "api-test",
+            "reason_code": "api-test-safety", "reason": "API safety contract",
+        })
 
     def _reference(self, strategy_id: str) -> None:
         """制造一条历史引用，使该 draft 不再可硬删除。"""
@@ -297,29 +324,34 @@ class ApiStrategiesTests(unittest.TestCase):
 
     # ---------- 7) 生命周期 ----------
 
-    def test_full_lifecycle_to_active_pause_resume(self):
+    def test_full_lifecycle_proposal_then_safety_archive(self):
         created = self._create_draft("api_life_alpha")
         sid = created["id"]
-        status, _body = self._transition(sid, "validated", "draft")
-        self.assertEqual(status, 200, "draft→validated")
-        status, active = self._transition(sid, "active", "validated")
-        self.assertEqual(status, 200, active)
-        self.assertTrue(active["supports_new_cycle"], "active 后必须可进新周期")
-        # 用户策略上线即试点：active 后 runtime 阶段为 pilot（内置才是 standard）。
-        self.assertEqual(active["runtime"]["lifecycle_stage"], "pilot")
-        status, paused = self._transition(sid, "paused", "active")
-        self.assertEqual(status, 200, paused)
-        self.assertFalse(paused["supports_new_cycle"])
-        status, resumed = self._transition(sid, "active", "paused")
-        self.assertEqual(status, 200, resumed)
-        self.assertTrue(resumed["supports_new_cycle"])
+        status, proposal = self._proposal(sid, "candidate", "draft")
+        self.assertEqual(status, 201, proposal)
+        self.assertTrue(proposal["decision"]["eligible"])
+        status, candidate = self._apply_proposal(sid, "candidate", "draft", proposal)
+        self.assertEqual(status, 200, candidate)
+        self.assertEqual(candidate["status"], "candidate")
+        self.assertFalse(candidate["supports_new_cycle"])
+        status, proposal = self._proposal(sid, "research", "candidate")
+        self.assertEqual(status, 201, proposal)
+        status, research = self._apply_proposal(sid, "research", "candidate", proposal)
+        self.assertEqual(status, 200, research)
+        self.assertEqual(research["status"], "research")
+        status, retiring = self._safety_transition(sid, "retiring", "research")
+        self.assertEqual(status, 200, retiring)
+        status, archived = self._safety_transition(sid, "archived", "retiring")
+        self.assertEqual(status, 200, archived)
+        self.assertEqual("archived", archived["status"])
+        self.assertFalse(archived["supports_new_cycle"])
 
     def test_invalid_transition_409(self):
         created = self._create_draft("api_jump_alpha")
-        status, _body = self._transition(created["id"], "active")
+        status, _body = self._safety_transition(created["id"], "paused", "draft")
         self.assertEqual(status, 409)
 
-    def test_transition_requires_to_status(self):
+    def test_transition_requires_exact_lifecycle_identity(self):
         created = self._create_draft("api_no_status")
         status, _body = self._call(API.transition_strategy, created["id"], {})
         self.assertEqual(status, 400)
@@ -357,13 +389,14 @@ class ApiStrategiesTests(unittest.TestCase):
         self.assertEqual(body["id"], "api_clone_legacy_dst")
 
     def test_transition_validated_requires_runtime_ready(self):
-        # 无 DSL 的用户策略不能进 validated（与旧 /validate 端点语义一致）。
+        # 无 DSL 的用户策略不能进入 candidate。
         status, created = self._create("api_no_dsl", dsl_ast=None)
         self.assertEqual(status, 201, created)
         self.assertEqual(created["status"], "draft")
-        status, body = self._transition(created["id"], "validated", "draft")
-        self.assertEqual(status, 409, body)
-        self.assertIn("runtime is not ready", str(body["detail"]))
+        status, proposal = self._proposal(created["id"], "candidate", "draft")
+        self.assertEqual(status, 201, proposal)
+        self.assertFalse(proposal["decision"]["eligible"])
+        self.assertIn("strategy_runtime_not_ready", proposal["decision"]["blocking_reasons"])
 
     def test_risk_expansion_cannot_bypass_gate_via_payload(self):
         # 非对称风险门不接受 HTTP 调用方自带的 risk_evidence/challenger_win：
@@ -419,16 +452,19 @@ class ApiStrategiesTests(unittest.TestCase):
 
     def test_versions_and_events_timeline(self):
         created = self._create_draft("api_hist_alpha")
-        self._transition(created["id"], "validated", "draft")
+        status, proposal = self._proposal(created["id"], "candidate", "draft")
+        self.assertEqual(status, 201, proposal)
+        status, _body = self._apply_proposal(created["id"], "candidate", "draft", proposal)
+        self.assertEqual(status, 200)
         _status, versions = self._call(API.list_strategy_versions, created["id"])
         self.assertEqual(len(versions["items"]), 1)
         self.assertEqual(versions["items"][0]["version"], 1)
         self.assertTrue(versions["items"][0]["checksum"])
         self.assertEqual(versions["items"][0]["change_note"], "initial user definition")
         _status, events = self._call(API.list_strategy_events, created["id"])
-        transitions = [(row["from_status"], row["to_status"]) for row in events["items"]]
+        transitions = [(row["from_state"], row["to_state"]) for row in events["items"]]
         self.assertIn((None, "draft"), transitions)
-        self.assertIn(("draft", "validated"), transitions)
+        self.assertIn(("draft", "candidate"), transitions)
 
     # ---------- 10) 删除 ----------
 
@@ -451,10 +487,11 @@ class ApiStrategiesTests(unittest.TestCase):
         status, _body = self._call(API.delete_strategy, "trend_pullback")
         self.assertEqual(status, 409)
 
-    def test_active_strategy_cannot_be_deleted(self):
+    def test_promoted_strategy_cannot_be_deleted(self):
         created = self._create_draft("api_del_active")
-        self._transition(created["id"], "validated", "draft")
-        status, body = self._transition(created["id"], "active", "validated")
+        status, proposal = self._proposal(created["id"], "candidate", "draft")
+        self.assertEqual(status, 201, proposal)
+        status, body = self._apply_proposal(created["id"], "candidate", "draft", proposal)
         self.assertEqual(status, 200, body)
         status, _body = self._call(API.delete_strategy, created["id"])
         self.assertEqual(status, 409)

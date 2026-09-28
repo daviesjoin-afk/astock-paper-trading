@@ -1,16 +1,13 @@
 # -*- coding: utf-8 -*-
-"""PR-49：Custom Strategy Web 产品线端到端验收（浏览器同款路径）。
+"""R31：Custom Strategy API 的生命周期与晋级路径验收。
 
 总任务书的闭环是"用户在浏览器里就能完成"，因此本测试**全程走 HTTP API
 路由函数**（与前端实际调用一致），而不是直接调用注册表内部函数：
 
     空库 → 创建 DSL 策略 → validate → preview → Draft 可见
-         → 激活（validated → active）
-         → 配置为下一周期参与策略 → 启动新周期（账本绑定 + 分配资金）
-         → 生产执行路径生成信号
-         → 暂停（经济所有权保留、执行资格退出）
-         → 复制为新 Draft
-         → 退役 → 归档（历史不删除、不再进新周期）
+         → exact candidate proposal/apply → research
+         → 缺少 R29 时 validated proposal 被阻断
+         → retiring → archived（历史保留，不能进入正式新周期）
 
 对照面：
 - ``test_api_strategies.py`` 锁 API 自身语义；
@@ -28,7 +25,6 @@ from fastapi import HTTPException
 
 import api_strategies as API
 import paper_trading as PT
-import runtime_settings as RSET
 import strategy_registry as SR
 import strategy_runtime as SRT
 import test_production_path_golden_replay as G
@@ -112,53 +108,52 @@ class StrategyProductLineE2ETests(G.OfflinePaperEnv, unittest.TestCase):
         self.assertEqual(1, listing["summary"]["user"])
         self.assertEqual(STRATEGY_ID, listing["items"][0]["id"])
 
-        # 5) 激活：draft → validated → active（两个按钮）。
-        status, validated = self._call(
-            API.transition_strategy, STRATEGY_ID,
-            {"to_status": "validated", "expected_status": "draft", "reason": "E2E"},
-        )
-        self.assertEqual(200, status, validated)
-        self.assertEqual("validated", validated["status"])
-        status, active = self._call(
-            API.transition_strategy, STRATEGY_ID,
-            {"to_status": "active", "expected_status": "validated", "reason": "E2E"},
-        )
-        self.assertEqual(200, status, active)
-        self.assertTrue(active["supports_new_cycle"])
-        self.assertEqual("pilot", active["runtime"]["lifecycle_stage"])
+        # 5) draft → candidate：必须提交 exact version proposal。
+        _status, lifecycle = self._call(API.get_strategy_lifecycle, STRATEGY_ID)
+        proposal_base = {"strategy_version": lifecycle["version"],
+            "strategy_checksum": lifecycle["checksum"], "expected_state": "draft",
+            "proposer_type": "human", "proposer_id": "product-line-e2e",
+            "rationale": "verify R31 promotion flow"}
+        status, candidate_proposal = self._call(API.create_strategy_promotion_proposal,
+            STRATEGY_ID, {**proposal_base, "target_state": "candidate", "evidence_bundle": {}},
+            default_status=201)
+        self.assertEqual(201, status, candidate_proposal)
+        self.assertTrue(candidate_proposal["decision"]["eligible"])
+        status, candidate = self._call(API.transition_strategy, STRATEGY_ID,
+            {"strategy_version": lifecycle["version"],
+             "strategy_checksum": lifecycle["checksum"], "expected_state": "draft",
+             "target_state": "candidate", "actor_type": "human",
+             "actor_id": "product-line-e2e",
+             "proposal_fingerprint": candidate_proposal["proposal_fingerprint"]})
+        self.assertEqual(200, status, candidate)
+        self.assertEqual("candidate", candidate["status"])
+        self.assertFalse(candidate["formal_cycle_allowed"])
 
-        # 6) 设为下一周期参与策略，并启动新周期：账本必须绑定并分配资金。
-        with self._conn() as conn:
-            RSET.update(conn, {"enabled_strategies": [STRATEGY_ID, BUILTIN_ID]}, actor="pr49-e2e")
-        _summary, cycle = PT.start_new_cycle(capital=CAPITAL, include_dashboard=False)
-        with self._conn() as conn:
-            self.assertIn(STRATEGY_ID, PT.cycle_ledger_ids(conn, cycle["id"]))
-            self.assertIn(STRATEGY_ID, PT.execution_participant_ids(conn, cycle["id"]))
-            rows = {row["id"]: row for row in PT._shared_account_rows(conn, cycle["id"])}
-            self.assertAlmostEqual(
-                CAPITAL / 2, float(rows[STRATEGY_ID]["initial_cash"]), delta=1.0,
-            )
-            self.assertAlmostEqual(
-                CAPITAL, PT._shared_cash(conn, cycle["id"]), delta=2.0,
-            )
+        # 6) candidate → research proposal can apply without performance evidence.
+        status, research_proposal = self._call(API.create_strategy_promotion_proposal,
+            STRATEGY_ID, {**proposal_base, "expected_state": "candidate",
+                "target_state": "research", "evidence_bundle": {}}, default_status=201)
+        self.assertEqual(201, status, research_proposal)
+        self.assertTrue(research_proposal["decision"]["eligible"])
+        status, research = self._call(API.transition_strategy, STRATEGY_ID,
+            {"strategy_version": lifecycle["version"],
+             "strategy_checksum": lifecycle["checksum"], "expected_state": "candidate",
+             "target_state": "research", "actor_type": "human",
+             "actor_id": "product-line-e2e",
+             "proposal_fingerprint": research_proposal["proposal_fingerprint"]})
+        self.assertEqual(200, status, research)
+        self.assertEqual("research", research["status"])
 
-        # 7) 生产执行路径真跑一轮：不得失败，且该策略账户没有任何越权 sizing。
-        result = PT.generate_signals(G.D0)
-        self.assertNotEqual("failed", result.get("status"), result)
+        # 7) 未提供 exact R29 run 时 proposal 保持 blocked / fail closed。
+        status, validation_proposal = self._call(API.create_strategy_promotion_proposal,
+            STRATEGY_ID, {**proposal_base, "expected_state": "research",
+                "target_state": "validated", "evidence_bundle": {}}, default_status=201)
+        self.assertEqual(201, status, validation_proposal)
+        self.assertFalse(validation_proposal["decision"]["eligible"])
+        self.assertIn("exact_r29_run_key_required",
+                      validation_proposal["decision"]["blocking_reasons"])
 
-        # 8) 暂停：经济所有权保留，执行资格退出。
-        status, paused = self._call(
-            API.transition_strategy, STRATEGY_ID,
-            {"to_status": "paused", "expected_status": "active", "reason": "E2E pause"},
-        )
-        self.assertEqual(200, status, paused)
-        self.assertFalse(paused["supports_new_cycle"])
-        with self._conn() as conn:
-            self.assertNotIn(STRATEGY_ID, PT.execution_participant_ids(conn, cycle["id"]))
-            self.assertIn(STRATEGY_ID, PT.cycle_ledger_ids(conn, cycle["id"]))
-            self.assertAlmostEqual(CAPITAL, PT._shared_cash(conn, cycle["id"]), delta=2.0)
-
-        # 9) 复制：暂停中的策略也能复制出新 Draft v1。
+        # 8) 克隆仍会创建独立 Draft v1。
         clone_id = STRATEGY_ID + "_clone"
         status, clone = self._call(
             API.clone_strategy, STRATEGY_ID,
@@ -169,21 +164,29 @@ class StrategyProductLineE2ETests(G.OfflinePaperEnv, unittest.TestCase):
         self.assertEqual("user", clone["origin"])
         self.assertEqual(1, clone["current_version"])
 
-        # 10) 退役 → 归档：暂停 → retiring → archived。
+        # 9) safety intent 退役 → 归档，仍要求精确版本与明确原因。
         status, _body = self._call(
             API.transition_strategy, STRATEGY_ID,
-            {"to_status": "retiring", "expected_status": "paused", "reason": "E2E retire"},
+            {"strategy_version": lifecycle["version"],
+             "strategy_checksum": lifecycle["checksum"], "expected_state": "research",
+             "target_state": "retiring", "actor_type": "human",
+             "actor_id": "product-line-e2e", "reason_code": "e2e-retire",
+             "reason": "E2E retire"},
         )
         self.assertEqual(200, status)
         status, archived = self._call(
             API.transition_strategy, STRATEGY_ID,
-            {"to_status": "archived", "expected_status": "retiring", "reason": "E2E archive"},
+            {"strategy_version": lifecycle["version"],
+             "strategy_checksum": lifecycle["checksum"], "expected_state": "retiring",
+             "target_state": "archived", "actor_type": "human",
+             "actor_id": "product-line-e2e", "reason_code": "e2e-archive",
+             "reason": "E2E archive"},
         )
         self.assertEqual(200, status, archived)
         self.assertEqual("archived", archived["status"])
         self.assertFalse(archived["supports_new_cycle"])
 
-        # 11) 归档后：默认列表不可见（副本草稿仍在），include_archived 能查到
+        # 10) 归档后：默认列表不可见（副本草稿仍在），include_archived 能查到
         # （历史不删除）。
         _status, visible = self._call(API.list_strategies, origin="user")
         visible_ids = [item["id"] for item in visible["items"]]
@@ -199,7 +202,7 @@ class StrategyProductLineE2ETests(G.OfflinePaperEnv, unittest.TestCase):
         self.assertEqual(200, status, events)
         self.assertGreaterEqual(len(events["items"]), 4)
 
-        # 12) 归档策略不再进入下一周期（eligible 排除），且不影响内置策略。
+        # 11) 归档策略不再进入正式新周期，内置 formal-cycle scope 不受影响。
         with self._conn() as conn:
             eligible = set(SR.active_ids(conn=conn))
         self.assertNotIn(STRATEGY_ID, eligible)

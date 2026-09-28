@@ -25,6 +25,7 @@ import paper_account_specs as ACS
 import paper_trading as PT
 import strategy_policies as SPOL
 import strategy_registry as SR
+from test_strategy_lifecycle_fixtures import seed_legacy_state
 import strategy_runtime as SRT
 
 BACKEND = os.path.dirname(os.path.abspath(__file__))
@@ -361,9 +362,9 @@ class UserStrategyResolutionTests(unittest.TestCase):
                     conn, strategy_id, name, dsl_ast=USER_RULE,
                     metadata=metadata or {}, actor="paper-account-specs-test",
                 )
-                SR.transition(conn, strategy_id, "validated", expected_status="draft",
+                seed_legacy_state(conn, strategy_id, "validated", expected_status="draft",
                               reason="validate", actor="paper-account-specs-test")
-                SR.transition(conn, strategy_id, "active", expected_status="validated",
+                seed_legacy_state(conn, strategy_id, "active", expected_status="validated",
                               reason="activate", actor="paper-account-specs-test")
         finally:
             conn.close()
@@ -440,10 +441,7 @@ class RegistryAgreementTests(unittest.TestCase):
             SR.ensure_schema(conn)
             before = set(SR.active_ids(conn=conn))
             self.assertTrue(before, "注册表应至少有一个 active 内置策略")
-            conn.execute(
-                "UPDATE strategy_definitions SET lifecycle_status='paused', supports_new_cycle=0 "
-                "WHERE id='tq_breakout'"
-            )
+            seed_legacy_state(conn, "tq_breakout", "paused")
             after = set(SR.active_ids(conn=conn))
             self.assertNotEqual(before, after, "注册表口径必须随 lifecycle 变化")
             self.assertIn("tq_breakout", before)

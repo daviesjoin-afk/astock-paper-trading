@@ -25,6 +25,7 @@ import unittest
 import paper_trading as PT
 import runtime_settings as RSET
 import strategy_registry as SR
+from test_strategy_lifecycle_fixtures import seed_legacy_state
 import strategy_runtime as SRT
 import test_production_path_golden_replay as G
 
@@ -111,9 +112,9 @@ class StaleFactorUserStrategyTests(G.OfflinePaperEnv, unittest.TestCase):
                 metadata={"candidate_topn": 10, "style": "trend", "hold": 8},
                 actor="stale-factor-test",
             )
-            SR.transition(conn, strategy_id, "validated", expected_status="draft",
+            seed_legacy_state(conn, strategy_id, "validated", expected_status="draft",
                           reason="validate", actor="stale-factor-test")
-            SR.transition(conn, strategy_id, "active", expected_status="validated",
+            seed_legacy_state(conn, strategy_id, "active", expected_status="validated",
                           reason="activate", actor="stale-factor-test")
 
     def _make_history_stale(self, lag=9):

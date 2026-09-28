@@ -8,6 +8,8 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import strategy_registry as registry
+from test_strategy_lifecycle_fixtures import archive_state, seed_legacy_state
+import strategy_promotion as promotion
 
 
 DSL = {
@@ -30,17 +32,20 @@ class StrategyCrudTests(unittest.TestCase):
         created = registry.create_user_definition(self.conn, "user_crud_alpha", "CRUD alpha", dsl_ast=DSL)
         readiness = registry.runtime_readiness(self.conn, created.id)
         self.assertTrue(readiness["runtime_ready"])
-        registry.transition(self.conn, created.id, "validated", expected_status="draft")
-        active = registry.transition(self.conn, created.id, "active", expected_status="validated")
+        seed_legacy_state(self.conn, created.id, "validated", expected_status="draft")
+        active = seed_legacy_state(self.conn, created.id, "active", expected_status="validated")
         self.assertTrue(active.supports_new_cycle)
         self.assertIn(created.id, registry.active_ids(conn=self.conn))
 
     def test_user_without_dsl_cannot_activate(self):
         created = registry.create_user_definition(self.conn, "user_no_dsl", "No DSL")
         self.assertFalse(registry.runtime_readiness(self.conn, created.id)["runtime_ready"])
-        registry.transition(self.conn, created.id, "validated", expected_status="draft")
-        with self.assertRaisesRegex(ValueError, "runtime is not ready"):
-            registry.transition(self.conn, created.id, "active", expected_status="validated")
+        version = registry.get_version(created.id, conn=self.conn)
+        decision = promotion.evaluate(self.conn, strategy_id=created.id,
+            strategy_version=version.version, strategy_checksum=version.checksum,
+            from_state="draft", target_state="candidate")
+        self.assertFalse(decision.eligible)
+        self.assertIn("strategy_runtime_not_ready", decision.blocking_reasons)
 
     def test_unused_draft_can_be_hard_deleted_but_history_forces_archive(self):
         draft = registry.create_user_definition(self.conn, "user_delete_me", "Delete me", dsl_ast=DSL)
@@ -52,7 +57,7 @@ class StrategyCrudTests(unittest.TestCase):
         self.conn.execute("INSERT INTO paper_signals VALUES(?,?)", (used.id, used.id))
         with self.assertRaisesRegex(ValueError, "historical references"):
             registry.hard_delete_unused_draft(self.conn, used.id)
-        archived = registry.archive_definition(self.conn, used.id)
+        archived = archive_state(self.conn, used.id)
         self.assertEqual(archived.status, "archived")
 
     def test_dsl_edit_appends_immutable_version(self):

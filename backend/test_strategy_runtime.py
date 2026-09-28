@@ -7,6 +7,7 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import strategy_registry as registry
+from test_strategy_lifecycle_fixtures import seed_legacy_state
 import strategy_runtime as runtime
 
 
@@ -23,8 +24,8 @@ class StrategyRuntimeTests(unittest.TestCase):
         strategy = registry.create_user_definition(
             self.conn, "runtime_breakout", "Runtime breakout", dsl_ast=_breakout_rule(), actor="test",
         )
-        registry.transition(self.conn, strategy.id, "validated", actor="test")
-        registry.transition(self.conn, strategy.id, "active", actor="test")
+        seed_legacy_state(self.conn, strategy.id, "validated", actor="test")
+        seed_legacy_state(self.conn, strategy.id, "active", actor="test")
         # 上下文缓存是模块级的（同 id+版本+revision 复用），用例之间必须清掉，
         # 否则上一个用例的生命周期状态会串到下一个用例。
         runtime.clear_cache()
@@ -63,7 +64,7 @@ class StrategyRuntimeTests(unittest.TestCase):
         self.assertEqual(context.capital_scale, 1.0)
 
     def test_paused_and_archived_are_quarantined(self):
-        registry.transition(self.conn, "runtime_breakout", "paused", actor="test")
+        seed_legacy_state(self.conn, "runtime_breakout", "paused", actor="test")
         runtime.clear_cache()
         context = runtime.get_context(self.conn, "runtime_breakout", settings_rev="1")
         self.assertEqual(context.lifecycle_stage, "quarantined")
@@ -73,14 +74,14 @@ class StrategyRuntimeTests(unittest.TestCase):
         """PR-26 评审 P1：状态迁移必须让旧上下文失效，不能靠手动清缓存。"""
         before = runtime.get_context(self.conn, "runtime_breakout", settings_rev="1")
         self.assertEqual(before.lifecycle_stage, "pilot")
-        registry.transition(self.conn, "runtime_breakout", "paused", actor="test")
+        seed_legacy_state(self.conn, "runtime_breakout", "paused", actor="test")
         after = runtime.get_context(self.conn, "runtime_breakout", settings_rev="1")
         self.assertIsNot(before, after)
         self.assertEqual(after.lifecycle_stage, "quarantined")
         self.assertEqual(after.capital_scale, 0.0)
         self.assertFalse(after.evolution_control.enabled)
         # 迁回 active 同样要立刻反映，而不是复用 quarantine 的上下文。
-        registry.transition(self.conn, "runtime_breakout", "active", actor="test")
+        seed_legacy_state(self.conn, "runtime_breakout", "active", actor="test")
         revived = runtime.get_context(self.conn, "runtime_breakout", settings_rev="1")
         self.assertEqual(revived.lifecycle_stage, "pilot")
         self.assertTrue(revived.evolution_control.enabled)

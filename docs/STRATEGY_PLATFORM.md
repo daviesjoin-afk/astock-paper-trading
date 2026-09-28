@@ -46,31 +46,36 @@ DSL 的边界（三条硬约束）：
 
 ## 4. 生命周期（lifecycle）
 
-状态机（`strategy_registry.LIFECYCLE_STATUSES` / `_TRANSITIONS`）：
+R31 起，身份/版本与生命周期分别由 `strategy_registry`、`strategy_lifecycle` 唯一拥有；promotion evidence 由 `strategy_promotion` 判定。状态值统一为 lowercase snake_case：
 
 ```text
-draft      → validated | archived
-validated  → draft | active | archived      （回退到 draft 会保留"已离开 draft"的历史）
-active     → paused | retiring
-paused     → active | retiring | archived
-retiring   → archived
-archived   → （终态，无出边）
+draft → candidate → research → validated → shadow → paper → production_sim
+paper / production_sim → degraded / paused / retiring / quarantined
+degraded → paused / retiring / quarantined
+paused → retiring / quarantined
+retiring → archived
+archived → （终态，无出边）
+candidate / research → rejected
+research → validation_failed
 ```
 
 | 状态 | 含义 | 允许的下一步 |
 | --- | --- | --- |
-| `draft` | 编辑中；不参与任何周期 | `validated`、`archived` |
-| `validated` | 已通过校验（含运行时就绪）；等待激活 | `draft`、`active`、`archived` |
-| `active` | 允许进入**下一**周期；执行层资格仍受周期快照约束（第 7、8 节） | `paused`、`retiring` |
-| `paused` | 生命周期暂停：**立即退出执行层**（不再产生新信号/新委托），但保留周期内经济所有权 | `active`、`retiring`、`archived` |
-| `retiring` | 只退出、不新开；存量持仓按各自风控退出规则收起 | `archived` |
-| `archived` | 终态只读；定义与全部版本永久保留，可回放/可审计 | — |
+| `draft` / `candidate` / `research` | 编辑、候选和研究阶段，不进入正式新周期 | 由显式 transition table 决定 |
+| `validated` | exact version 已通过 R29 PIT/OOS validation | `shadow`，或安全迁移 |
+| `shadow` | exact version 已通过 R29+R30 promotion policy；不代表已有 R32 shadow runtime | `paper` 暂因 shadow evidence owner 缺失而 blocked |
+| `paper` | 可进入新的 paper simulation 周期 | `production_sim` 暂因下游 runtime evidence owner 缺失而 blocked，也可安全降级/暂停/退休 |
+| `production_sim` | 当前最高正式模拟运行级别 | 安全降级、暂停或退休 |
+| `degraded` / `paused` | 禁止新正式周期；保留版本与历史 | 暂停或退休 |
+| `retiring` | 停止新周期并进入退休流程 | `archived` |
+| `archived` / `rejected` / `validation_failed` | 终态，保留定义、版本和审计 | — |
+| `quarantined` | 安全隔离，不等于归档 | 无恢复 evidence owner 时 fail closed |
 
-激活（`validated → active`）必须通过**运行时就绪**检查；就绪失败时激活被拒绝（不是"先激活再修"）。
+新正式周期只允许 `paper` 与 `production_sim`。每个状态属于 `strategy_id + strategy_version + strategy_checksum`；新版本自动从 `draft` 开始，旧版本历史和已 pin 周期保持原样。AI 可以创建 promotion proposal，但不能写 lifecycle state。
 
 ## 5. 运行时就绪与 RuntimeContext
 
-`strategy_registry.runtime_readiness()` 在激活前编译四项契约，全部通过才算就绪：
+`strategy_registry.runtime_readiness()` 为 `draft → candidate` 编译四项契约，全部通过才算就绪：
 
 | 检查 | 内容 |
 | --- | --- |
@@ -88,7 +93,7 @@ lifecycle_stage · capital_scale · allocation_runtime
 evolution_control · parameter_schema · settings_revision
 ```
 
-- 缓存键包含 `version` + `checksum` + `settings_revision` + `status` + `lifecycle_stage`：设置变更、状态迁移（如 `active → paused`）会立即产生新上下文，不会复用旧额度。
+- 缓存键包含 `version` + `checksum` + `settings_revision` + canonical state + `lifecycle_stage`：设置变更或 lifecycle transition 会立即产生新上下文，不会复用旧额度。
 - `runtime_ready=false` 只降级为"不可激活/不可进周期"，不会把策略从历史里抹掉。
 
 ## 6. 资金生命周期（capital lifecycle）
@@ -105,8 +110,8 @@ evolution_control · parameter_schema · settings_revision
 
 阶段推导顺序（`strategy_runtime.lifecycle_stage_for`）：
 
-1. 定义元数据显式指定 `metadata.lifecycle_stage`（或 `metadata.allocation.lifecycle_stage`）——人工晋升/隔离入口；
-2. 否则按状态推导：`draft→shadow`、`validated→pilot`、`paused/retiring/archived→quarantined`、`active→builtin: standard / user: pilot`；
+1. 若定义含 `metadata.lifecycle_stage`（或 `metadata.allocation.lifecycle_stage`），它只调节资金分配画像，不改变 canonical state，也不能赋予正式周期资格；
+2. 否则按 canonical state 推导：`draft/candidate/research/shadow→shadow`、`validated→pilot`、`degraded/paused/retiring/archived/rejected/validation_failed/quarantined→quarantined`、`paper/production_sim→builtin: standard / user: pilot`；
 3. 未知状态 `fail-closed → quarantined`。
 
 **试点是默认值，不是建议**：新用户策略以 25% 预算上线，验证后再人工晋升到 `standard`。系数只缩放该策略的可部署预算，不改变共享池硬上限、单票/行业上限、T+1 或行情门禁。
@@ -117,11 +122,11 @@ evolution_control · parameter_schema · settings_revision
 
 | 概念 | 由谁决定 | 何时生效 |
 | --- | --- | --- |
-| 能不能进**下一**周期 | Registry：`active` ∧ `supports_new_cycle` | 创建/启动新周期时 |
-| 是否**真的**进下一周期 | 设置中心的 `enabled_strategies`（候选来自 Registry，逐项校验） | 创建/启动新周期时写入周期快照 |
-| 是否在**当前**周期执行 | 周期快照（本次创建时冻结的集合） | 整个周期内不变 |
+| 能不能进**下一**周期 | `strategy_lifecycle.allows_formal_cycle(exact current state)`：只允许 `paper` / `production_sim` | 创建/启动新周期时 |
+| 是否**真的**进下一周期 | 设置中心的 `enabled_strategies`（候选来自 lifecycle eligible projection，逐项校验） | 创建/启动新周期时写入周期快照 |
+| 是否在**当前**周期执行 | 周期快照与其 pinned exact version，再应用当前安全状态 | 整个周期内不改写版本绑定 |
 
-- **激活 ≠ 参与当前周期**。`active` 只说明"下一周期可以启用"；已在运行的周期不会被改写，也不会自动收编新激活的策略。
+- **生命周期状态 ≠ 当前周期成员关系**。`paper`/`production_sim` 只说明该 exact current version 有资格进入新周期；已运行周期继续使用它 pinned 的版本，不会被改写或自动收编新版本。
 - 新周期创建时，`enabled_strategies` 与该周期的账户挂接、版本绑定一起落库（`paper_cycles.enabled_strategies` + `strategy_registry.bind_cycle_versions`）。旧周期与归档快照保持不可变。
 - **零策略是合法状态**：显式空列表 = Idle 周期，不产生新信号，风控扫描、存量退出与系统调度照常（`paper_trading._cycle_participant_resolution` 的 `cycle_idle`）。"未配置"与"显式空"语义不同：缺失/损坏才回落到内置集合。
 - 执行层参与者的权威口径（`paper_trading.current_cycle_participant_ids`）：
@@ -129,7 +134,7 @@ evolution_control · parameter_schema · settings_revision
 ```text
 参与者 = paper_cycles.enabled_strategies
        ∩ paper_accounts.cycle_id == 当前周期
-       − 生命周期为 paused 的策略
+       − pinned exact version 当前不允许正式执行的 lifecycle state
 ```
 
   解析来源会写进审计（`cycle_snapshot` / `cycle_enabled_unbound_fallback` / `cycle_idle` / `cycle_not_configured` / `no_cycle`），便于回放时解释"为什么这轮没有它"。
@@ -141,13 +146,13 @@ evolution_control · parameter_schema · settings_revision
 | | Cycle Ledger Ownership（经济所有权） | Execution Participation（执行资格） |
 | --- | --- | --- |
 | 含义 | 该策略在当前周期账本里占有的初始资金/净值归属 | 该策略是否还能产生新信号、新委托 |
-| 受什么影响 | 周期创建时的快照与资金分配 | 生命周期 `paused`、周期快照、风控门禁 |
+| 受什么影响 | 周期创建时的快照与资金分配 | pinned exact version 的安全状态、周期快照、风控门禁 |
 | 暂停时 | **不变**（仍计入共享池合计与 NAV） | **被剔除**（不再新开仓） |
 
 因此：
 
-- `pause` 只关闭执行资格，**不会**把这个策略的当前周期资金/净值从账本里删掉；
-- 恢复（`resume`）只是把执行资格放回来，**不会**凭空放大资本（账本合计仍是原值）；
+- 安全迁移只关闭新执行资格，**不会**把这个策略的当前周期资金/净值从账本里删掉；
+- 任何后续状态变化都不会凭空放大资本（账本合计仍是原值）；
 - 周期资本合计恒等于快照分配之和，与"当前有几个策略在动"无关（回归：`backend/test_cycle_ledger_ownership.py`）。
 
 ## 9. 风险与执行画像（risk / execution profiles）
@@ -179,7 +184,7 @@ DSL AST ─► Risk Fingerprint ─► Risk Profile ─► Enforcement ─► �
 
 ```text
 origin == 'user'
-∧ lifecycle_status == 'draft'
+∧ canonical lifecycle state == 'draft'
 ∧ never_left_draft            # 生命周期历史从未离开 draft（PR-56 canonical 谓词）
 ∧ no historical reference     # 账本/审计/执行引用为空
 ```
@@ -199,7 +204,7 @@ origin == 'user'
 | 策略工坊（Strategy Workbench） | **策略定义**：身份、DSL、版本、生命周期、预览 | 不决定资金/席位/共享池参数 |
 | 设置中心（Settings） | **运行参数**：资金、周期、下一周期参与集合、共享池风控、AI 开关 | **不实现第二套 DSL 编辑器**，不编辑策略定义 |
 
-设置中心里的策略勾选框只是"下一周期参与集合"的选择器：候选由 Registry 提供（`active` ∧ `supports_new_cycle`），保存后写入运行库并留审计；被 `paused` 的策略给出"去策略工坊恢复"的入口，而不是在设置页里改生命周期。
+设置中心里的策略勾选框只是"下一周期参与集合"的选择器：候选来自 canonical lifecycle owner，当前 exact version 处于 `paper` 或 `production_sim` 时才可选；保存后写入运行库并留审计。被 `paused` 的策略给出"去策略工坊恢复"的入口，而不是在设置页里改生命周期。
 
 ## 13. 代码与测试索引
 

@@ -40,6 +40,7 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import strategy_registry as registry  # noqa: E402
+import strategy_lifecycle as lifecycle  # noqa: E402
 import strategy_service as SVC  # noqa: E402
 
 DSL = {
@@ -76,10 +77,18 @@ class _HardDeleteFixture(unittest.TestCase):
         return spec
 
     def _promote(self, strategy_id, *statuses):
-        current = registry.get(strategy_id, conn=self.conn).status
-        for status in statuses:
-            registry.transition(self.conn, strategy_id, status, expected_status=current)
-            current = status
+        # The legacy test only needs immutable lifecycle evidence that the
+        # draft was used.  Record one legal canonical safety event; do not
+        # recreate the removed legacy status machine or synthetic history.
+        version = registry.get_version(strategy_id, conn=self.conn)
+        current = lifecycle.get_state(self.conn, strategy_id, version.version,
+                                      checksum=version.checksum)["state"]
+        if current == "draft":
+            lifecycle.transition(self.conn, strategy_id=strategy_id,
+                strategy_version=version.version, strategy_checksum=version.checksum,
+                expected_state="draft", target_state="quarantined", actor_type="human",
+                actor_id="hard-delete-test", transition_kind="safety",
+                reason_code="test_quarantine", reason_text="hard-delete lifecycle regression")
         self.conn.commit()
 
     def _events(self, strategy_id):
@@ -153,14 +162,13 @@ class LifecycleRollbackTests(_HardDeleteFixture):
     def test_c_draft_validated_draft_is_rejected(self):
         self._draft("pr56_rollback")
         self._promote("pr56_rollback", "validated", "draft")
-        self.assertEqual("draft", registry.get("pr56_rollback", conn=self.conn).status)
+        self.assertEqual("quarantined", registry.get("pr56_rollback", conn=self.conn).status)
         self.assertEqual([1], self._versions("pr56_rollback"))
 
         with self.assertRaises(ValueError) as ctx:
             registry.hard_delete_unused_draft(self.conn, "pr56_rollback")
 
-        self.assertIn("historical references", str(ctx.exception))
-        self.assertIn("left the draft state", str(ctx.exception))
+        self.assertIn("unused user drafts", str(ctx.exception))
         # 拒绝后一切照旧
         self.assertIsNotNone(registry.get("pr56_rollback", conn=self.conn))
         self.assertEqual([1], self._versions("pr56_rollback"))
@@ -219,8 +227,8 @@ class LifecycleRollbackTests(_HardDeleteFixture):
         self.assertFalse(registry._ever_left_draft(self.conn, "pr56_creation_only"))
         events = self._events("pr56_creation_only")
         self.assertEqual(1, len(events))
-        self.assertIsNone(events[0]["from_status"])
-        self.assertEqual("draft", events[0]["to_status"])
+        self.assertIsNone(events[0]["from_state"])
+        self.assertEqual("draft", events[0]["to_state"])
 
 
 class RejectionPreservationTests(_HardDeleteFixture):
@@ -244,7 +252,7 @@ class RejectionPreservationTests(_HardDeleteFixture):
         self.assertEqual(versions, self._versions("pr56_preserve"))
         self.assertEqual(checksums, self._checksums("pr56_preserve"))
         self.assertEqual(events, self._events("pr56_preserve"))
-        self.assertGreaterEqual(len(self._events("pr56_preserve")), 3)
+        self.assertGreaterEqual(len(self._events("pr56_preserve")), 2)
 
     def test_f_no_purge_token_is_minted_on_rejection(self):
         self._draft("pr56_token")
@@ -268,7 +276,7 @@ class RejectionPreservationTests(_HardDeleteFixture):
         self.conn.commit()
         self.assertEqual(2, updated.version)
         self._promote("pr56_still_editable", "validated")
-        self.assertEqual("validated", registry.get("pr56_still_editable", conn=self.conn).status)
+        self.assertEqual("quarantined", registry.get("pr56_still_editable", conn=self.conn).status)
 
 
 class DomainMappingTests(_HardDeleteFixture):

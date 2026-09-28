@@ -26,6 +26,7 @@ import asymmetric_risk as AR
 import self_evolution as SE
 import strategy_champion as SCM
 import strategy_registry as registry
+from test_strategy_lifecycle_fixtures import seed_legacy_state
 import strategy_runtime as runtime
 
 EVIDENCE = 50
@@ -71,8 +72,8 @@ class ManualApiPathTests(unittest.TestCase):
         registry.ensure_schema(self.conn)
         created = registry.create_user_definition(
             self.conn, "gate_api", "Gate API", dsl_ast=_rule(), actor="test")
-        registry.transition(self.conn, created.id, "validated", actor="test")
-        registry.transition(self.conn, created.id, "active", actor="test")
+        seed_legacy_state(self.conn, created.id, "validated", actor="test")
+        seed_legacy_state(self.conn, created.id, "active", actor="test")
         self.conn.commit()
         self.conn.close()
         runtime.clear_cache()

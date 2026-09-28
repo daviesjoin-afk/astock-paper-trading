@@ -42,8 +42,9 @@ test.describe("响应式与可访问性", () => {
     await openWorkbench(page);
     const id = uniqueId("e2e_a11y");
     await createDraftViaUi(page, { id, name: "E2E 键盘" });
-    // 触发应用内确认模态（验证并标记）
-    await page.getByTestId(`strategy-card-${id}`).getByTestId("strategy-transition-validated").click();
+    // exact-version lifecycle 的安全动作必须先打开详情并提交 reason。
+    await page.getByTestId(`strategy-card-${id}`).getByTestId("strategy-open-detail").click();
+    await page.getByTestId("lifecycle-safety-quarantined").click();
     const modal = page.getByTestId("app-confirm-dialog");
     await expect(modal).toBeVisible();
     // 焦点应落在模态内部
@@ -55,7 +56,7 @@ test.describe("响应式与可访问性", () => {
     // Escape 关闭（安全动作）
     await page.keyboard.press("Escape");
     await expect(modal).toHaveCount(0);
-    // 未确认则状态不变
+    // Escape 关闭后未确认，状态保持原样。
     await expect(page.getByTestId(`strategy-card-${id}`)).toHaveAttribute("data-status", "draft");
   });
 });

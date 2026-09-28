@@ -556,8 +556,8 @@ ACTIVE_ACCOUNT_SPECS = {account_id: ACCOUNT_SPECS[account_id] for account_id in 
 def _active_account_clause(column="id", conn=None):
     """Return a SQL predicate and parameters for current-cycle accounts.
 
-    PR-35：参与资格 = 内置五套 ∪ 注册表中 active 且 supports_new_cycle=1
-    的用户策略（``USP.user_participant_ids``）。传入 conn 才能看到用户
+    R31：参与资格 = 内置五套 ∪ canonical lifecycle owner 允许正式周期的用户策略
+    （``USP.user_participant_ids``）。传入 conn 才能看到用户
     策略；无 conn 的旧调用保持内置集合，行为不变。
     """
     ids = ACTIVE_ACCOUNT_IDS
@@ -576,7 +576,6 @@ def _active_account_clause(column="id", conn=None):
 # **调用时**注入注册表 active 投影 ``ACTIVE_ACCOUNT_IDS``（它是注册表真相，
 # 按不变量 #8 留在权威层，不进入所有权模块，也不得 import 期冻结）。
 _CYCLE_PARTICIPANT_VERSION = PCY.CYCLE_PARTICIPANT_VERSION
-_LIFECYCLE_PAUSED_STATUSES = PCY.LIFECYCLE_PAUSED_STATUSES
 
 
 def _lifecycle_paused_ids(conn) -> frozenset:
@@ -2235,9 +2234,9 @@ def _ensure_accounts(conn):
 
 
 def _ensure_user_strategy_accounts(conn):
-    """为可参与运行的用户策略补齐纸盘账户行（PR-35，幂等）。
+    """为可参与运行的用户策略补齐纸盘账户行（R31，幂等）。
 
-    active ∧ supports_new_cycle=1 的用户策略必须有 paper_accounts 行，
+    处于正式周期状态的用户策略必须有 paper_accounts 行，
     否则信号/订单/持仓没有账本主体。新建行保持 paused/零资金：
     资金与周期挂接只由 ``_create_cycle`` / ``_ensure_cycle`` 分配，
     激活绝不私自挪用共享池。策略暂停/归档后行保留（历史账本语义），

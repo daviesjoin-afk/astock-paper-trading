@@ -1,33 +1,48 @@
 /* PR-57：策略生命周期标签的**唯一**规范来源。
  *
- * 内部枚举（后端契约，不变）：draft / validated / active / paused / retiring / archived
- * 用户可见主标签：草稿 / 已验证 / 运行中 / 已暂停 / 退役中 / 已归档
+ * 内部枚举与展示词表跟随 Strategy Lifecycle owner。
  * 技术枚举只允许出现在"技术详情 / 审计"这类次级视图里。
  *
  * 任何 feature（Strategy Workbench、Settings、Paper）都必须从这里取标签，
  * 不允许各自再维护一份 map。
  */
 
-export var STRATEGY_STATUS_ENUM = ['draft', 'validated', 'active', 'paused', 'retiring', 'archived'];
+export var STRATEGY_STATUS_ENUM = ['draft','candidate','research','validated','shadow','paper','production_sim','degraded','paused','retiring','archived','rejected','validation_failed','quarantined'];
 
 /** 用户可见主标签（中文，界面主文案）。 */
 export var STRATEGY_STATUS_LABELS = {
   draft: '草稿',
+  candidate: '候选',
+  research: '研究中',
   validated: '已验证',
-  active: '运行中',
+  shadow: '影子阶段',
+  paper: '模拟运行中',
+  production_sim: '生产模拟',
+  degraded: '已降级',
   paused: '已暂停',
   retiring: '退役中',
   archived: '已归档',
+  rejected: '已拒绝',
+  validation_failed: '验证失败',
+  quarantined: '安全隔离',
 };
 
 /** 技术枚举（仅供技术详情 / 审计视图显示，不作用户主标签）。 */
 export var STRATEGY_STATUS_LABELS_TECH = {
   draft: 'draft',
+  candidate: 'candidate',
+  research: 'research',
   validated: 'validated',
-  active: 'active',
+  shadow: 'shadow',
+  paper: 'paper',
+  production_sim: 'production_sim',
+  degraded: 'degraded',
   paused: 'paused',
   retiring: 'retiring',
   archived: 'archived',
+  rejected: 'rejected',
+  validation_failed: 'validation_failed',
+  quarantined: 'quarantined',
 };
 
 /** 主标签；status 未知时回退为原值，绝不显示 undefined。 */
@@ -44,17 +59,25 @@ export function strategyStatusLabelTech(status) {
 
 /** 是否处于"不参与未来周期"的终态。 */
 export function strategyStatusIsTerminal(status) {
-  return status === 'archived';
+  return status === 'archived' || status === 'rejected' || status === 'validation_failed';
 }
 
 /* 徽标配色类名：与颜色无关的语义类，保留原命名以便既有 CSS/测试继续工作。 */
 export var STRATEGY_STATUS_BADGE_CLASS = {
   draft: 'strategy-status-draft',
   validated: 'strategy-status-validated',
-  active: 'strategy-status-active',
+  candidate: 'strategy-status-validated',
+  research: 'strategy-status-validated',
+  shadow: 'strategy-status-draft',
+  paper: 'strategy-status-active',
+  production_sim: 'strategy-status-active',
+  degraded: 'strategy-status-paused',
   paused: 'strategy-status-paused',
   retiring: 'strategy-status-retiring',
   archived: 'strategy-status-archived',
+  rejected: 'strategy-status-archived',
+  validation_failed: 'strategy-status-archived',
+  quarantined: 'strategy-status-paused',
 };
 
 /**
@@ -65,7 +88,7 @@ export function strategyStatusBadge(status) {
   var tone = STRATEGY_STATUS_BADGE_CLASS[status] || 'strategy-status-draft';
   var label = strategyStatusLabel(status);
   var tech = strategyStatusLabelTech(status);
-  var glyph = status === 'active' ? '●'
+  var glyph = status === 'paper' || status === 'production_sim' ? '●'
     : status === 'paused' ? '❙❙'
     : status === 'validated' ? '✓'
     : status === 'retiring' ? '⤳'

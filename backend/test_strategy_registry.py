@@ -21,7 +21,7 @@ class StrategyRegistryTests(unittest.TestCase):
         ))
 
     def test_all_registered_strategies_are_active_for_new_cycles(self):
-        self.assertTrue(all(spec.status == "active" for spec in registry.STRATEGY_REGISTRY))
+        self.assertTrue(all(spec.status == "paper" for spec in registry.STRATEGY_REGISTRY))
         self.assertTrue(all(spec.supports_new_cycle for spec in registry.STRATEGY_REGISTRY))
 
     def test_labels_returns_a_copy_without_mutating_registry(self):
@@ -43,7 +43,7 @@ class StrategyRegistryTests(unittest.TestCase):
     def test_strategy_center_exposes_five_strategy_active_scope(self):
         rows = {row["id"]: row for row in paper.strategy_center()["strategies"]}
         self.assertEqual(set(rows), set(registry.active_ids()))
-        self.assertTrue(all(row["strategy_status"] == "active" for row in rows.values()))
+        self.assertTrue(all(row["strategy_status"] == "paper" for row in rows.values()))
         self.assertTrue(all(row["supports_new_cycle"] for row in rows.values()))
 
     def test_clean_clone_bootstraps_five_equal_strategy_sleeves(self):

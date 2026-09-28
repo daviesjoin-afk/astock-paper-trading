@@ -68,9 +68,10 @@ class SettingsRegistryDrivenTests(unittest.TestCase):
         )
 
     def test_checkbox_only_for_active_new_cycle_strategies(self):
-        # 勾选资格门禁：active && supports_new_cycle；paused 提供恢复入口
+        # 正式周期资格由 lifecycle owner 提供；paused 提供恢复入口。
         # （PR-52 起该入口指向「策略工坊」，它是唯一的生命周期编辑器）。
-        self.assertIn("item.status==='active'&&item.supports_new_cycle", self.app_source)
+        self.assertIn("item.formal_cycle_allowed", self.app_source)
+        self.assertNotIn("item.status==='active'", self.app_source)
         self.assertIn("去策略工坊恢复", self.app_source)
 
     def test_explicit_empty_enabled_strategies_is_valid_idle_cycle(self):

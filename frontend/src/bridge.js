@@ -13,7 +13,7 @@ import { backfillPaperResearch, cancelPaperOrder, clearPaperOrderDate, clearPape
 import { applyPaperRiskAuditFilter, loadPaperRisk, refreshPaperRisk } from "./features/risk.js";
 import { cancelManualDataUpdate, choosePaperStrategy, chooseStrategy, filterSelectionEvaluationRows, loadDataValidity, loadPaperSelection, loadSelectionEvaluation, refreshSelectionEvaluation, runPaperSelection, showSelectionValidation, startFactorIncrementalUpdate, startInit, startManualDataUpdate, trackRemove } from "./features/selection.js";
 import { clearAiSlotKey, clearOperatorTab, resetSettingsSection, saveAiReviewMode, saveAiSlot, saveSettingsSection, setSettingsSection, testAiSlot, unlockOperatorTab } from "./features/settings.js";
-import { loadStrategyWorkbench, openInStrategyWorkbench, wbAddCondition, wbBackToList, wbCloneFirstBuiltin, wbCloneStrategy, wbDeleteDraft, wbFormatDsl, wbFromConditionsToDsl, wbNewStrategy, wbOpenDetail, wbOpenEditor, wbPreviewDraft, wbRemoveCondition, wbRenderList, wbResetFilters, wbSaveDraft, wbSetMode, wbSetOriginFilter, wbSetStatusFilter, wbTransition, wbValidateAndMark, wbValidateDraft } from "./features/strategies.js";
+import { loadStrategyWorkbench, openInStrategyWorkbench, wbAddCondition, wbApplyPromotionProposal, wbBackToList, wbCloneFirstBuiltin, wbCloneStrategy, wbCreatePromotionProposal, wbDeleteDraft, wbFormatDsl, wbFromConditionsToDsl, wbNewStrategy, wbOpenDetail, wbOpenEditor, wbPreviewDraft, wbRemoveCondition, wbRenderList, wbResetFilters, wbSaveDraft, wbSetMode, wbSetOriginFilter, wbSetStatusFilter, wbTransition, wbValidateDraft } from "./features/strategies.js";
 
 window.activatePage = activatePage;
 window.adaptiveEsc = adaptiveEsc;
@@ -103,9 +103,11 @@ window.trackRemove = trackRemove;
 window.triggerEvolution = triggerEvolution;
 window.verifyExecutionOrder = verifyExecutionOrder;
 window.wbAddCondition = wbAddCondition;
+window.wbApplyPromotionProposal = wbApplyPromotionProposal;
 window.wbBackToList = wbBackToList;
 window.wbCloneStrategy = wbCloneStrategy;
 window.wbCloneFirstBuiltin = wbCloneFirstBuiltin;
+window.wbCreatePromotionProposal = wbCreatePromotionProposal;
 window.wbDeleteDraft = wbDeleteDraft;
 window.wbFormatDsl = wbFormatDsl;
 window.wbFromConditionsToDsl = wbFromConditionsToDsl;
@@ -121,5 +123,4 @@ window.wbSetMode = wbSetMode;
 window.wbSetOriginFilter = wbSetOriginFilter;
 window.wbSetStatusFilter = wbSetStatusFilter;
 window.wbTransition = wbTransition;
-window.wbValidateAndMark = wbValidateAndMark;
 window.wbValidateDraft = wbValidateDraft;

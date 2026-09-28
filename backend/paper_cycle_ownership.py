@@ -14,16 +14,16 @@
 Existing exposure still owns risk-exit rights.**
 
 - **经济所有权** = ``paper_cycles.enabled_strategies``（能力位过滤，**不查**
-  Registry ``lifecycle_status``）∩ ``paper_accounts.cycle_id == 目标周期``。
+  lifecycle state）∩ ``paper_accounts.cycle_id == 目标周期``。
   lifecycle pause **不**改变这个集合——暂停一个策略不是把它从周期里删掉。
-- **执行资格** = 经济所有权 − ``strategy_definitions.lifecycle_status`` 处于
-  ``LIFECYCLE_PAUSED_STATUSES`` 的策略。pause 立即停止新信号 / 新委托 /
+- **执行资格** = 经济所有权 − canonical lifecycle state 不允许正式执行的策略。
+  安全状态立即停止新信号 / 新委托 /
   资金预占，但**不得**解绑 ``paper_accounts.cycle_id``、清零 ``cash`` /
   ``initial_cash``、改写 ``enabled_strategies`` 或破坏历史。
 - **显式 idle 周期**（``enabled_strategies == []``）是合法的零策略周期：
   执行参与者为空，**绝不**回落内置五套。缺失 / 损坏（``NULL`` 或不可解析）
   才是「未配置」，保留 legacy 回退。两者语义**不得**合并。
-- **注册表 active 作用域**（``ACTIVE_ACCOUNT_IDS`` / ``_active_account_clause``）
+- **canonical formal-cycle 作用域**（``ACTIVE_ACCOUNT_IDS`` / ``_active_account_clause``）
   与**风控退出资格**（``_risk_exit_account_ids``）**不在本模块**。
 
 注册表 active 投影（``SR.active_ids() ∩ 声明键``）按仓库不变量 #8 留在权威层
@@ -49,6 +49,7 @@ import sqlite3
 
 import paper_account_specs as PAS
 import user_strategy_participation as USP
+import strategy_lifecycle as SL
 
 OWNERSHIP_MODULE_VERSION = "paper-cycle-ownership-v1"
 
@@ -61,10 +62,9 @@ OWNERSHIP_MODULE_VERSION = "paper-cycle-ownership-v1"
 #
 # 否则"注册表里仍是 active"的策略会被执行层偷偷拉回一个已经把它摘掉的
 # 周期，继续占用共享池资金并产生本周期不该存在的信号与委托。
-# lifecycle pause（注册表 lifecycle_status='paused'）可以从执行层临时
+# lifecycle safety state 可以从执行层临时
 # 禁用新信号，而不必改写周期快照、也不必把账户摘出周期（历史仍可查）。
 CYCLE_PARTICIPANT_VERSION = "cycle-participant-v1"
-LIFECYCLE_PAUSED_STATUSES = ("paused",)
 
 
 def _rows(conn, sql, params=()):
@@ -115,23 +115,30 @@ def explicit_empty_cycle(conn, cycle_id) -> bool:
         return False
 
 
-def lifecycle_paused_ids(conn) -> frozenset:
+def lifecycle_paused_ids(conn, *, cycle_id=None) -> frozenset:
     """注册表中被生命周期暂停的策略 id；执行层据此临时禁用新信号。
 
-    只读查询 ``strategy_definitions.lifecycle_status``；注册表尚未建表时返回
+    只读查询 exact current lifecycle state；owner 尚未建表时返回
     空集，绝不抛异常阻断主流程。
     """
     if conn is None:
         return frozenset()
-    placeholders = ",".join("?" for _ in LIFECYCLE_PAUSED_STATUSES)
     try:
-        rows = conn.execute(
-            f"SELECT id FROM strategy_definitions WHERE lifecycle_status IN ({placeholders})",
-            LIFECYCLE_PAUSED_STATUSES,
-        ).fetchall()
+        if cycle_id is None:
+            rows = conn.execute("""SELECT d.id,l.state FROM strategy_definitions d
+                JOIN paper_strategy_version_heads h ON h.strategy_id=d.id
+                JOIN strategy_lifecycle_state l ON l.strategy_id=d.id
+                  AND l.strategy_version=h.current_version AND l.strategy_checksum=h.current_checksum""").fetchall()
+        else:
+            rows = conn.execute("""SELECT p.strategy_id,l.state
+                FROM paper_cycle_strategy_versions p JOIN strategy_lifecycle_state l
+                  ON l.strategy_id=p.strategy_id AND l.strategy_version=p.strategy_version
+                  AND l.strategy_checksum=p.strategy_checksum
+                WHERE p.cycle_id=?""", (int(cycle_id),)).fetchall()
     except sqlite3.Error:
         return frozenset()
-    return frozenset(str(row[0]) for row in rows if row[0])
+    return frozenset(str(row[0]) for row in rows
+                     if row[0] and not SL.allows_formal_cycle(row[1]))
 
 
 def cycle_ledger_filter(conn, cycle_id, column="id", *, builtin_scope):
@@ -263,7 +270,7 @@ def cycle_participant_resolution(conn, cycle_id=None, *, builtin_scope):
         )
     except sqlite3.Error:
         bound = frozenset()
-    paused = lifecycle_paused_ids(conn)
+    paused = lifecycle_paused_ids(conn, cycle_id=cycle_row["id"])
     ids = tuple(item for item in enabled if item in bound and item not in paused)
     source = "cycle_snapshot"
     if not ids:

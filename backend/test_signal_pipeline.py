@@ -41,6 +41,7 @@ import paper_trading as PT
 import runtime_settings as RSET
 import signal_service as SIG
 import strategy_registry as SR
+from test_strategy_lifecycle_fixtures import seed_legacy_state
 from test_production_path_golden_replay import (
     CAPITAL,
     D0,
@@ -745,9 +746,9 @@ class SignalLedgerTests(OfflinePaperEnv, unittest.TestCase):
                 metadata={"candidate_topn": 10, "style": "trend", "hold": 8},
                 actor="r25-test",
             )
-            SR.transition(conn, STRATEGY_ID, "validated", expected_status="draft",
+            seed_legacy_state(conn, STRATEGY_ID, "validated", expected_status="draft",
                           reason="r25 validate", actor="r25-test")
-            SR.transition(conn, STRATEGY_ID, "active", expected_status="validated",
+            seed_legacy_state(conn, STRATEGY_ID, "active", expected_status="validated",
                           reason="r25 activate", actor="r25-test")
         PT.init_db()
         with self._conn() as conn:

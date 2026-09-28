@@ -6,6 +6,7 @@ profiles.  This module deliberately has no order-placement or network I/O.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from dataclasses import replace as dataclass_replace
 import sqlite3
 from typing import Any
 
@@ -13,6 +14,7 @@ import execution_profiles as EP
 import paper_allocation as PA
 import strategy_dsl_schema as DSL
 import strategy_registry as SR
+import strategy_lifecycle as SL
 from strategy_parameter_schema import StrategyParameterSchema
 from strategy_risk_fingerprint import StrategyRiskFingerprint, compile_strategy_risk_fingerprint
 from strategy_risk_profiles import StrategyRiskProfile, compile_strategy_risk_profile
@@ -50,13 +52,14 @@ def lifecycle_stage_for(spec) -> str:
     if stage in PA.LIFECYCLE_STAGES:
         return stage
     status = str(getattr(spec, "status", "") or "").strip().lower()
-    if status == "draft":
+    if status in {"draft", "candidate", "research", "shadow"}:
         return "shadow"
     if status == "validated":
         return "pilot"
-    if status in {"paused", "retiring", "archived"}:
+    if status in {"degraded", "paused", "retiring", "archived", "rejected",
+                  "validation_failed", "quarantined"}:
         return "quarantined"
-    if status == "active":
+    if status in {"paper", "production_sim"}:
         # 内置五套是长期验证过的老账户；用户自建/AI 生成的策略一律从试点起步。
         return "standard" if str(getattr(spec, "origin", "") or "") == "builtin" else "pilot"
     return "quarantined"
@@ -144,7 +147,7 @@ def _build_context(
         capital_scale=PA.stage_capital_scale(allocation)[0],
         allocation_runtime=allocation,
         evolution_control=EvolutionControlProfile(
-            enabled=status == "active", lifecycle_stage=allocation.lifecycle_stage,
+            enabled=SL.allows_formal_cycle(status), lifecycle_stage=allocation.lifecycle_stage,
             interval_hours=24,
         ),
         parameter_schema=StrategyParameterSchema.from_dsl(compiled),
@@ -191,7 +194,15 @@ def get_context_for_cycle(
         raise ValueError(
             f"strategy version not pinned for cycle {cycle}: {strategy_id}"
         )
-    return _build_context(conn, spec, version, settings_rev=settings_rev)
+    lifecycle = SL.get_state(conn, strategy_id, version.version, checksum=version.checksum)
+    if lifecycle is None:
+        raise ValueError("strategy lifecycle state unavailable for pinned version")
+    pinned_spec = dataclass_replace(
+        spec, status=lifecycle["state"],
+        supports_new_cycle=SL.allows_formal_cycle(lifecycle["state"]),
+        current_version=version.version, current_checksum=version.checksum,
+    )
+    return _build_context(conn, pinned_spec, version, settings_rev=settings_rev)
 
 
 def _number(value, default=None):
@@ -249,6 +260,15 @@ def allocation_runtimes(
             own_exposure_cap = _number(profile.get("max_exposure"))
             try:
                 spec = SR.get(account_id, conn=conn) if conn is not None else None
+                if spec is not None and conn is not None:
+                    stamp = SR.cycle_stamp_for_account(conn, account_id, cycle_id=int(cycle_id))
+                    if stamp is not None:
+                        pinned_state = SL.get_state(conn, stamp[0], int(stamp[1]), checksum=stamp[2])
+                        if pinned_state is not None:
+                            spec = dataclass_replace(
+                                spec, status=pinned_state["state"],
+                                supports_new_cycle=SL.allows_formal_cycle(pinned_state["state"]),
+                            )
             except sqlite3.Error:
                 spec = None
             lifecycle_stage = lifecycle_stage_for(spec) if spec is not None else "quarantined"

@@ -22,7 +22,7 @@
 - 用户只能提交声明式 DSL/AST；本模块不做 eval/exec/动态 SQL/shell。
 - 编辑不等于 UPDATE 原版本：一律经 ``strategy_service.update_strategy`` 生成
   不可变新版本。
-- 状态迁移只走 ``SR.transition`` 的合法边，前端不能任意跳状态。
+- 状态迁移经 Strategy Promotion 证据 policy 与 Strategy Lifecycle CAS owner。
 - Runtime 构建失败时返回 ``runtime_ready=false`` + ``runtime_error``，
   不让整页 500；只有数据结构本身损坏才使用 5xx。
 - 风险放大唯一入口（PR-33）不由 HTTP 暴露：``risk_evidence`` /
@@ -116,7 +116,7 @@ def list_strategies(
     origin: Annotated[str | None, Query(description="builtin / user")] = None,
     status: Annotated[
         str | None,
-        Query(description="draft/validated/active/paused/retiring/archived"),
+        Query(description="draft/candidate/research/validated/shadow/paper/production_sim/degraded/paused/retiring/archived/rejected/validation_failed/quarantined"),
     ] = None,
     include_archived: Annotated[bool, Query()] = False,
 ):
@@ -132,7 +132,7 @@ def list_strategies(
         "builtin": sum(1 for item in items if item["origin"] == "builtin"),
         "user": sum(1 for item in items if item["origin"] == "user"),
         "draft": sum(1 for item in items if item["status"] == "draft"),
-        "active": sum(1 for item in items if item["status"] == "active"),
+        "formal_cycle_eligible": sum(1 for item in items if item["formal_cycle_allowed"]),
         "paused": sum(1 for item in items if item["status"] == "paused"),
     }
     return {"items": items, "summary": summary}
@@ -220,6 +220,39 @@ def transition_strategy(strategy_id: str, payload: Models.StrategyTransitionRequ
         return SVC.transition(
             strategy_id, _coerce(Models.StrategyTransitionRequest, payload),
         )
+    except SVC.StrategyError as exc:
+        _raise_http(exc)
+
+
+@router.get("/{strategy_id}/lifecycle")
+def get_strategy_lifecycle(strategy_id: str):
+    try:
+        return SVC.lifecycle_read_model(strategy_id)
+    except SVC.StrategyError as exc:
+        _raise_http(exc)
+
+
+@router.post("/{strategy_id}/promotion/proposals", status_code=201)
+def create_strategy_promotion_proposal(
+    strategy_id: str, payload: Models.PromotionProposalRequest | None = None,
+):
+    try:
+        return SVC.create_promotion_proposal(
+            strategy_id, _coerce(Models.PromotionProposalRequest, payload),
+        )
+    except SVC.StrategyError as exc:
+        _raise_http(exc)
+
+
+@router.get("/{strategy_id}/promotion/proposals")
+def list_strategy_promotion_proposals(
+    strategy_id: str,
+    version: Annotated[int | None, Query(ge=1)] = None,
+    limit: Annotated[int, Query(ge=1, le=200)] = 50,
+):
+    try:
+        return {"strategy_id": strategy_id,
+                "items": SVC.list_promotion_proposals(strategy_id, version=version, limit=limit)}
     except SVC.StrategyError as exc:
         _raise_http(exc)
 

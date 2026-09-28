@@ -2,8 +2,9 @@
 """PR-51：Strategy Admin API 的类型化请求契约（Pydantic v2）。
 
 只描述**输入形状**（字段名 / 类型 / 可选性 / 默认值），不承载业务语义：
-id 模式、DSL 合法性、生命周期合法边、非对称风险闸门仍然只由
-``strategy_registry`` / ``strategy_dsl_schema`` / ``asymmetric_risk`` 裁决，
+id 模式与 DSL 合法性由 ``strategy_registry`` / ``strategy_dsl_schema`` 裁决；
+生命周期合法边由 ``strategy_lifecycle`` 裁决，晋级证据由
+``strategy_promotion`` 裁决，非对称风险闸门由 ``asymmetric_risk`` 裁决，
 再由 ``strategy_service`` 翻译成 domain exception。这里**不复制第二套规则**。
 
 两条硬约束：
@@ -20,7 +21,7 @@ id 模式、DSL 合法性、生命周期合法边、非对称风险闸门仍然�
 """
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -102,12 +103,30 @@ class StrategyPreviewRequest(_Request):
 
 
 class StrategyTransitionRequest(_Request):
-    """``POST /api/strategies/{id}/transition``。"""
+    """Exact, compare-and-swap lifecycle intent."""
 
-    to_status: str
-    expected_status: str | None = None
+    strategy_version: int
+    strategy_checksum: str
+    expected_state: str
+    target_state: str
+    actor_type: Literal["human", "system", "ai"]
+    actor_id: str
+    proposal_fingerprint: str | None = None
+    reason_code: str = ""
     reason: str = ""
-    actor: str = "web-ui"
+
+
+class PromotionProposalRequest(_Request):
+    """AI/human/system proposal bound to explicit immutable identities."""
+
+    strategy_version: int
+    strategy_checksum: str
+    expected_state: str
+    target_state: str
+    evidence_bundle: dict[str, Any] = Field(default_factory=dict)
+    proposer_type: Literal["human", "system", "ai"]
+    proposer_id: str
+    rationale: str = ""
 
 
 class StrategyCloneRequest(_Request):

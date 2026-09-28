@@ -144,15 +144,14 @@ class FrontendPayloadContractTests(_ApiFixture):
         }, default_status=201)
         self.assertEqual(status, 201, created)
 
-        # 工作台「标记 Validated」只传 to_status + reason。
-        status, validated = self._call(API.transition_strategy, "fe_life", {
-            "to_status": "validated", "reason": "Web workbench 验证通过",
-        })
-        self.assertEqual(status, 200, validated)
-        # 其他动作带 expected_status 做乐观并发（validated -> archived 是合法边）。
+        # 安全迁移必须绑定当前 immutable version/state，并说明原因。
+        lifecycle = SVC.lifecycle_read_model("fe_life")
         status, archived = self._call(API.transition_strategy, "fe_life", {
-            "to_status": "archived", "expected_status": "validated",
-            "reason": "Web workbench 操作", "actor": "strategy-workbench",
+            "strategy_version": lifecycle["version"],
+            "strategy_checksum": lifecycle["checksum"],
+            "expected_state": lifecycle["state"], "target_state": "archived",
+            "actor_type": "human", "actor_id": "strategy-workbench",
+            "reason_code": "test_archive", "reason": "Web workbench 操作",
         })
         self.assertEqual(status, 200, archived)
 
@@ -204,7 +203,7 @@ class RequestSchemaTests(_ApiFixture):
 
         status, body = self._call(API.transition_strategy, "whatever", {})
         self.assertEqual(status, 400, body)
-        self.assertEqual(body["detail"], "to_status is required")
+        self.assertEqual(body["detail"], "strategy_version is required")
 
         status, body = self._call(API.clone_strategy, "whatever", {})
         self.assertEqual(status, 400, body)
@@ -213,7 +212,11 @@ class RequestSchemaTests(_ApiFixture):
     def test_wrong_shape_is_422(self):
         status, _body = self._call(API.create_strategy, {"id": "shape", "name": "x", "metadata": "not-an-object"})
         self.assertEqual(status, 422)
-        status, _body = self._call(API.transition_strategy, "shape", {"to_status": {"nested": 1}})
+        status, _body = self._call(API.transition_strategy, "shape", {
+            "strategy_version": "wrong", "strategy_checksum": "0" * 64,
+            "expected_state": "draft", "target_state": "candidate",
+            "actor_type": "human", "actor_id": "test",
+        })
         self.assertEqual(status, 422)
 
     def test_update_requires_a_non_empty_changes_object(self):
@@ -293,7 +296,9 @@ class OpenApiContractTests(_ApiFixture):
         props = create["properties"]
         for field in ("id", "name", "description", "metadata", "dsl_ast", "actor"):
             self.assertIn(field, props, field)
-        self.assertIn("to_status", components["StrategyTransitionRequest"].get("required", []))
+        for required in ("strategy_version", "strategy_checksum", "expected_state",
+                         "target_state", "actor_type", "actor_id"):
+            self.assertIn(required, components["StrategyTransitionRequest"].get("required", []))
 
     def test_response_models_are_published(self):
         schema = main.app.openapi()
@@ -309,6 +314,8 @@ class OpenApiContractTests(_ApiFixture):
             "/api/strategies/preview": {"post"},
             "/api/strategies/{strategy_id}": {"get", "put", "patch", "delete"},
             "/api/strategies/{strategy_id}/transition": {"post"},
+            "/api/strategies/{strategy_id}/lifecycle": {"get"},
+            "/api/strategies/{strategy_id}/promotion/proposals": {"get", "post"},
             "/api/strategies/{strategy_id}/clone": {"post"},
             "/api/strategies/{strategy_id}/versions": {"get"},
             "/api/strategies/{strategy_id}/events": {"get"},
@@ -368,11 +375,13 @@ class LayeringTests(_ApiFixture):
             "/api/strategies/x/transition", Models.StrategyTransitionRequest, {},
         )
         self.assertEqual(400, missing.status_code)
-        self.assertEqual("to_status is required", json.loads(missing.body)["detail"])
+        self.assertEqual("strategy_version is required", json.loads(missing.body)["detail"])
 
         wrong_shape = response_for(
             "/api/strategies/x/transition", Models.StrategyTransitionRequest,
-            {"to_status": {"nested": 1}},
+            {"strategy_version": "wrong", "strategy_checksum": "0" * 64,
+             "expected_state": "draft", "target_state": "candidate",
+             "actor_type": "human", "actor_id": "test"},
         )
         self.assertEqual(422, wrong_shape.status_code)
 
