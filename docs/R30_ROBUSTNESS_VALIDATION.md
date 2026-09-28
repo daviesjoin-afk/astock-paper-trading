@@ -8,7 +8,7 @@ R30 examines where one exact, completed R29 experiment loses evidence or changes
 
 The only accepted baseline is one exact R29 ledger row with `validation_status=ready`, a completed `ExperimentResult`, matching experiment and result fingerprints, known R29 runner version, matching strategy identity, and matching calendar, market, universe, dataset, financial, and tradability identities. The caller supplies the complete `ExperimentSpec`; current/latest and legacy backtest fallbacks are not used.
 
-Before execution, R30 recomputes the R29 replay tradability fingerprint from the baseline's exact owner sessions and historical-universe members. That identity covers both the 15:00 validation facts and the 09:30 execution facts consumed by replay. A mismatch against the stored run identity rejects the baseline, including an archive revision that changes only the open-time selection. Each changed date range gets its own canonical replay fingerprint in the ranged `ExperimentSpec` and R29 proof.
+Before execution, R30 captures tradability evidence for its owner sessions and historical-universe members in one SQLite read snapshot. It computes the R29 replay fingerprint from that capture, then reuses the same captured 09:30 facts for baseline and stress execution; the 15:00 validation facts are also taken from that snapshot. A mismatch against the stored run identity rejects the baseline. Date-range R29 revalidation derives its identity and execution from the same capture as well.
 
 ## Scenario dimensions
 

@@ -657,6 +657,44 @@ class RobustnessRunnerTests(unittest.TestCase):
                                    "baseline_tradability_identity_mismatch"):
             self.fixture.execute()
 
+    def test_R30_65_revision_after_capture_is_not_consumed_by_scenario_replay(self):
+        session = self.fixture.baseline_sessions[0]
+        original_capture = self.fixture.tradability.evidence_snapshot_many
+        capture_done = []
+
+        def capture_then_append(requests):
+            captured = original_capture(requests)
+            if not capture_done:
+                capture_done.append(True)
+                self.fixture.tradability.save(TA.TradabilityEvidence(
+                    code=CODE, session_date=session, is_listed=True,
+                    listing_date="2020-01-01", delisting_date=None,
+                    is_st=True, is_suspended=False, suspension_reason=None,
+                    has_market_quote=True, has_trade_volume=True,
+                    is_price_limit_locked=False, price_limit_direction=None,
+                    source="post-capture-revision",
+                    observed_at=f"{session}T09:20:00+08:00",
+                    effective_at=f"{session}T09:15:00+08:00"))
+            return captured
+
+        replay_facts = []
+        original_simulate = EM.simulate_with_trace
+
+        def record_replay(**kwargs):
+            replay_facts.append(kwargs["tradability_evidence"])
+            return original_simulate(**kwargs)
+
+        with (mock.patch.object(self.fixture.tradability, "evidence_snapshot_many",
+                                side_effect=capture_then_append),
+              mock.patch.object(RUN.EM, "simulate_with_trace", side_effect=record_replay)):
+            self.fixture.execute()
+
+        self.assertEqual("post-capture-revision", self.fixture.tradability.evidence_at(
+            CODE, session, f"{session}T09:30:00+08:00").source)
+        self.assertTrue(replay_facts)
+        self.assertTrue(all(facts[(CODE, session)].source == "fixture-owner"
+                            for facts in replay_facts))
+
     def test_weekend_spec_boundaries_anchor_date_stresses_to_owner_sessions(self):
         self.fixture.rebind_dates("2026-01-03", "2026-01-10")
         RUN._verify_baseline(self.fixture.run, self.fixture.spec,

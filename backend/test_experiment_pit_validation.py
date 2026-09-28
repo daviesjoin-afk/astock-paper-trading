@@ -6,7 +6,9 @@ import os
 import sqlite3
 import sys
 import unittest
+from dataclasses import replace
 from pathlib import Path
+from unittest import mock
 
 BACKEND = os.path.dirname(os.path.abspath(__file__))
 if BACKEND not in sys.path:
@@ -224,6 +226,51 @@ class PITValidationTests(unittest.TestCase):
             )
             self.assertEqual("blocked", evidence.dimensions["historical_tradability"]["status"])
             self.assertIsNone(evidence.data_coverage["tradability"]["ratio"])
+        finally:
+            conn.close()
+
+    def test_R29_tradability_gate_uses_close_and_execution_facts_from_one_capture(self):
+        conn = sqlite3.connect(":memory:")
+        repo = TA.TradabilityArchiveRepository(conn)
+        repo.ensure_schema()
+        sessions = _sessions()
+        members = {day: [{"code": "600000"}] for day in sessions}
+        common = dict(code="600000", is_listed=True, listing_date="2020-01-01",
+            delisting_date=None, is_st=False, is_suspended=False, suspension_reason=None,
+            has_market_quote=True, has_trade_volume=True, is_price_limit_locked=False,
+            price_limit_direction=None)
+        try:
+            for day in sessions:
+                repo.save(TA.TradabilityEvidence(
+                    **common, session_date=day, source="open-A",
+                    observed_at=f"{day}T09:00:00+08:00",
+                    effective_at=f"{day}T09:00:00+08:00"))
+            first = sessions[0]
+            repo.save(TA.TradabilityEvidence(
+                **common, session_date=first, source="close-B",
+                observed_at=f"{first}T14:00:00+08:00",
+                effective_at=f"{first}T14:00:00+08:00"))
+            captured = PV.tradability_replay_projection(members, sessions, repo)
+            spec = replace(_spec(), tradability_fingerprint=captured["fingerprint"])
+            original_capture = repo.evidence_snapshot_many
+
+            def capture_then_append(requests):
+                snapshot = original_capture(requests)
+                repo.save(TA.TradabilityEvidence(
+                    **common, session_date=first, source="post-capture-C",
+                    observed_at=f"{first}T09:20:00+08:00",
+                    effective_at=f"{first}T09:15:00+08:00"))
+                return snapshot
+
+            with mock.patch.object(repo, "evidence_snapshot_many", side_effect=capture_then_append):
+                detail, coverage = PV._tradability(
+                    spec, members, sessions, repo, universe_complete=True)
+
+            self.assertTrue(coverage["identity_matches"])
+            self.assertEqual(0, coverage["execution_unknown"])
+            self.assertEqual("post-capture-C", repo.evidence_at(
+                "600000", first, f"{first}T09:30:00+08:00").source)
+            self.assertEqual("proven", detail["status"])
         finally:
             conn.close()
 

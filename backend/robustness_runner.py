@@ -240,7 +240,8 @@ def _revalidate_scenario_date_range(*, sessions: Sequence[str], spec: EC.Experim
                                universe_archive_repository: HUA.HistoricalUniverseArchiveRepository,
                                tradability_repository: TA.TradabilityArchiveRepository,
                                strategy_version: SR.StrategyVersion,
-                               validation_context: Mapping[str, Any] | None) -> dict[str, Any]:
+                               validation_context: Mapping[str, Any] | None,
+                               replay_capture: Mapping[str, Any]) -> dict[str, Any]:
     if not isinstance(validation_context, Mapping):
                 raise ValueError("date_range_pit_context_missing")
     config = validation_context.get("walk_forward_config")
@@ -254,8 +255,11 @@ def _revalidate_scenario_date_range(*, sessions: Sequence[str], spec: EC.Experim
         start=sessions[0], end=sessions[-1])
     ranged_members = R29._universe_rows(
         universe_archive_repository, spec.universe_fingerprint, sessions)
-    ranged_tradability_fingerprint = R29._tradability_fingerprint(
-        ranged_members, sessions, tradability_repository)
+    ranged_capture = R29.PV.tradability_replay_projection(
+        ranged_members, sessions, tradability_repository, captured=replay_capture)
+    if not ranged_capture["capture_complete"]:
+        raise ValueError("date_range_tradability_snapshot_unavailable")
+    ranged_tradability_fingerprint = ranged_capture["fingerprint"]
     ranged_spec = replace(spec, start_date=sessions[0], end_date=sessions[-1],
         tradability_fingerprint=ranged_tradability_fingerprint,
         parameter_set={**spec.parameter_set,
@@ -269,6 +273,7 @@ def _revalidate_scenario_date_range(*, sessions: Sequence[str], spec: EC.Experim
         universe_archive_repository=universe_archive_repository,
         universe_archive_fingerprint=ranged_spec.universe_fingerprint,
         tradability_repository=tradability_repository,
+        tradability_replay_capture=replay_capture,
         financial_feature_repository=validation_context.get("financial_feature_repository"),
         financial_archive_fingerprint=baseline_identity.get("financial_archive_fingerprint"),
     )
@@ -351,13 +356,6 @@ def run_robustness(*, baseline_run: Mapping[str, Any], spec: EC.ExperimentSpec,
             or session_calendar.calendar_fingerprint != baseline_identity["calendar_fingerprint"]):
         raise RobustnessBaselineError("baseline_calendar_unavailable")
     baseline_sessions = list(session_calendar.sessions)
-    baseline_members = R29._universe_rows(
-        universe_archive_repository, spec.universe_fingerprint, baseline_sessions)
-    archive_tradability_fingerprint = R29._tradability_fingerprint(
-        baseline_members, baseline_sessions, tradability_repository)
-    if (archive_tradability_fingerprint != baseline_identity["tradability_evidence_fingerprint"]
-            or archive_tradability_fingerprint != spec.tradability_fingerprint):
-        raise RobustnessBaselineError("baseline_tradability_identity_mismatch")
     market_manifest = market_archive_repository.get_manifest(spec.market_data_fingerprint)
     if market_manifest is None or market_manifest.adjustment != "raw":
         raise RobustnessBaselineError("baseline_market_archive_unavailable")
@@ -376,6 +374,17 @@ def run_robustness(*, baseline_run: Mapping[str, Any], spec: EC.ExperimentSpec,
         raise RobustnessBaselineError("extended_calendar_not_owner_issued")
     sessions = list(coverage_calendar.sessions)
     members = R29._universe_rows(universe_archive_repository, spec.universe_fingerprint, sessions)
+    replay_capture = R29.PV.tradability_replay_projection(
+        members, sessions, tradability_repository)
+    baseline_members = {session: members[session] for session in baseline_sessions}
+    baseline_capture = R29.PV.tradability_replay_projection(
+        baseline_members, baseline_sessions, tradability_repository, captured=replay_capture)
+    archive_tradability_fingerprint = baseline_capture["fingerprint"]
+    if (not replay_capture["capture_complete"]
+            or not baseline_capture["capture_complete"]
+            or archive_tradability_fingerprint != baseline_identity["tradability_evidence_fingerprint"]
+            or archive_tradability_fingerprint != spec.tradability_fingerprint):
+        raise RobustnessBaselineError("baseline_tradability_identity_mismatch")
     symbols = sorted({row["code"] for rows in members.values() for row in rows})
     bars = market_archive_repository.read_bars(spec.market_data_fingerprint,
         start=coverage_calendar.coverage_start, end=coverage_calendar.coverage_end, symbols=symbols)
@@ -384,9 +393,7 @@ def run_robustness(*, baseline_run: Mapping[str, Any], spec: EC.ExperimentSpec,
         start=coverage_calendar.coverage_start, end=coverage_calendar.coverage_end,
         symbols=[regime_policy["benchmark_symbol"]])
     regime_labels = RR.classify_sessions(benchmark_bars, sessions, regime_policy)
-    requests = {(str(row["code"]), session): f"{session}T09:30:00+08:00"
-                for session in sessions for row in members.get(session, ())}
-    execution_facts = tradability_repository.evidence_many(requests)
+    execution_facts = replay_capture["execution_facts"]
     ast = DSL.normalize(strategy_version.definition["dsl_ast"])
     baseline_result = baseline_run["result"]["metrics"]
     baseline_metrics = {key: baseline_result.get(key) for key in _METRIC_KEYS}
@@ -424,7 +431,8 @@ def run_robustness(*, baseline_run: Mapping[str, Any], spec: EC.ExperimentSpec,
                     universe_archive_repository=universe_archive_repository,
                     tradability_repository=tradability_repository,
                     strategy_version=strategy_version,
-                    validation_context=date_range_validation_context)
+                    validation_context=date_range_validation_context,
+                    replay_capture=replay_capture)
             scenario_members = {session: list(members.get(session, ())) for session in scenario_sessions}
             scenario_bars = [row for row in bars if row["session"] in scenario_sessions]
             expected_bar_count = len(scenario_bars)

@@ -126,7 +126,7 @@ class R29RunnerTests(unittest.TestCase):
                     has_market_quote=not suspended, has_trade_volume=not suspended,
                     is_price_limit_locked=False, price_limit_direction=None,
                     source="runner-fixture", observed_at=f"{session}T09:00:00+08:00",
-                    effective_at=f"{session}T09:30:00+08:00"))
+                    effective_at=f"{session}T09:00:00+08:00"))
 
             calendar_fingerprint = "a" * 64
             initial = EXEC_FIXTURES._spec()
@@ -152,7 +152,27 @@ class R29RunnerTests(unittest.TestCase):
                 status="ready", reason_codes=(), walk_forward={"windows": []},
                 validation_evidence_fingerprint="c" * 64,
                 projection=lambda: {"status": "ready"})
-            with mock.patch.object(PV, "build_pit_validation_evidence", return_value=evidence):
+            captured_identity = {}
+
+            def ready_with_captured_facts(*args, **kwargs):
+                members = RUNNER._universe_rows(
+                    universe, universe_manifest.universe_archive_fingerprint, calendar.sessions)
+                captured = PV.tradability_replay_projection(members, calendar.sessions, tradability)
+                captured["members_by_session"] = members
+                kwargs["tradability_capture_out"].update(captured)
+                captured_identity["fingerprint"] = captured["fingerprint"]
+                tradability.save(TA.TradabilityEvidence(
+                    code=code, session_date=second, is_listed=True,
+                    listing_date="2020-01-01", delisting_date=None, is_st=False,
+                    is_suspended=False, suspension_reason=None, has_market_quote=True,
+                    has_trade_volume=True, is_price_limit_locked=False,
+                    price_limit_direction=None, source="late-revision",
+                    observed_at=f"{second}T09:20:00+08:00",
+                    effective_at=f"{second}T09:15:00+08:00"))
+                return evidence
+
+            with mock.patch.object(PV, "build_pit_validation_evidence",
+                                   side_effect=ready_with_captured_facts):
                 output = RUNNER.run_validation(
                     spec, runner_code_revision=spec.code_revision,
                     strategy_version=version,
@@ -168,6 +188,10 @@ class R29RunnerTests(unittest.TestCase):
             self.assertEqual("ready", output["status"])
             self.assertEqual("completed", output["result"]["status"])
             self.assertEqual(0, output["result"]["metrics"]["trade_count"])
+            self.assertEqual(captured_identity["fingerprint"],
+                             output["owner_identities"]["tradability_evidence_fingerprint"])
+            self.assertEqual("late-revision", tradability.evidence_at(
+                code, second, f"{second}T09:30:00+08:00").source)
         finally:
             market_conn.close()
             universe_conn.close()

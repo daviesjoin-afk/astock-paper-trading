@@ -785,9 +785,71 @@ class TradabilityArchiveRepository:
             result[key] = items[-1] if items else None
         return result
 
+    def evidence_snapshot_many(
+        self, requests: Mapping[tuple[str, str], Mapping[str, Any]],
+    ) -> dict[tuple[str, str], dict[str, Optional[TradabilityEvidence]]]:
+        """Select several as-of views from one SQLite read snapshot.
+
+        Each pair maps stable labels (for example ``close`` and ``execution``) to
+        decision instants. The archive rows are fetched once, then every view is
+        selected in memory from that same read snapshot.
+        """
+        normalized: dict[tuple[str, str], dict[str, Any]] = {}
+        for (code, session), instants in requests.items():
+            code_text, session_text = _text(code), _session(session)
+            if not code_text or not session_text or not isinstance(instants, Mapping):
+                continue
+            valid = {str(label): instant for label, instant in instants.items()
+                     if str(label) and _canonical_instant(instant) is not None}
+            if valid:
+                normalized[(code_text, session_text)] = valid
+        if not normalized:
+            return {}
+
+        codes = sorted({code for code, _ in normalized})
+        low, high = min(session for _, session in normalized), max(session for _, session in normalized)
+        grouped: dict[tuple[str, str], list[TradabilityEvidence]] = {key: [] for key in normalized}
+        self._conn.execute("SAVEPOINT tradability_evidence_snapshot")
+        try:
+            for offset in range(0, len(codes), 400):
+                batch = codes[offset:offset + 400]
+                placeholders = ",".join("?" for _ in batch)
+                rows = self._conn.execute(
+                    f"SELECT {_COLUMN_LIST} FROM {ARCHIVE_TABLE} "
+                    f"WHERE session_date>=? AND session_date<=? AND code IN ({placeholders})",
+                    (low, high, *batch),
+                ).fetchall()
+                for row in rows:
+                    evidence = _row_to_evidence(row)
+                    key = (evidence.code, evidence.session_date)
+                    if key in normalized:
+                        grouped[key].append(evidence)
+        except Exception:
+            self._conn.execute("ROLLBACK TO tradability_evidence_snapshot")
+            self._conn.execute("RELEASE tradability_evidence_snapshot")
+            raise
+        else:
+            self._conn.execute("RELEASE tradability_evidence_snapshot")
+
+        result: dict[tuple[str, str], dict[str, Optional[TradabilityEvidence]]] = {}
+        for key, instants in normalized.items():
+            result[key] = {}
+            items = sorted(grouped[key], key=lambda item: (item.effective_at, item.observed_at))
+            for label, instant in instants.items():
+                visible = [item for item in items if _visible_at(item, instant)]
+                result[key][label] = visible[-1] if visible else None
+        return result
+
     def coverage_projection(self, requests: Mapping[tuple[str, str], Any]) -> TradabilityCoverageProjection:
         """Project complete/blocked/unknown exact pairs without per-pair queries."""
         evidence_by_pair = self.evidence_many(requests)
+        return self.coverage_projection_from_evidence(requests, evidence_by_pair)
+
+    def coverage_projection_from_evidence(
+        self, requests: Mapping[tuple[str, str], Any],
+        evidence_by_pair: Mapping[tuple[str, str], Optional[TradabilityEvidence]],
+    ) -> TradabilityCoverageProjection:
+        """Project coverage from facts already captured by this owner."""
         requested = available = blocked = unknown = 0
         evidence_rows = []
         for pair in sorted(requests):
