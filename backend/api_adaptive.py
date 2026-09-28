@@ -38,6 +38,15 @@ class ExperimentValidationRequest(BaseModel):
     walk_forward: dict
 
 
+class RobustnessRequest(BaseModel):
+    """Exact R29 baseline spec, R30 plan, and pinned owner identities."""
+    spec: dict
+    plan: dict
+    owner_identities: dict
+    benchmark_symbol: str = Field(min_length=1, max_length=24)
+    walk_forward: dict | None = None
+
+
 @contextmanager
 def _experiment_validation_connection(*, query_only: bool):
     """Open only the adaptive DB and the additive validation ledger schema."""
@@ -73,6 +82,17 @@ def _validation_run_projection(row):
         "market_archive_fingerprint", "dataset_fingerprint",
         "validation_status", "validation_evidence", "result", "folds", "runner_version",
         "runner_code_revision", "created_at")}
+
+
+def _robustness_owner_identities(request, baseline):
+    expected = {key: baseline.get(key) for key in (
+        "calendar_fingerprint", "universe_archive_fingerprint",
+        "financial_archive_fingerprint", "tradability_evidence_fingerprint",
+        "market_archive_fingerprint", "dataset_fingerprint", "strategy_id",
+        "strategy_version", "strategy_checksum")}
+    if request.owner_identities != expected:
+        raise ValueError("baseline_owner_identity_mismatch")
+    return expected
 
 
 @contextmanager
@@ -557,6 +577,247 @@ def canonical_experiment_run(run_id: str = Path(..., min_length=1, max_length=64
     if run is None:
         raise HTTPException(status_code=404, detail="validation_run_not_found")
     return {"status": "ok", "run": _validation_run_projection(run)}
+
+
+@router.post("/experiments/runs/{run_id}/robustness")
+def create_canonical_robustness_report(request: RobustnessRequest,
+                                       run_id: int = Path(..., gt=0)):
+    """Run a bounded offline adversarial report against one canonical R29 run."""
+    try:
+        import experiment_contract as EC
+        import experiment_execution_model  # noqa: F401
+        import experiment_pit_validation as PV
+        import financial_feature_evidence as FFE
+        import experiment_validation_repository as EVR
+        import historical_financial_archive as HFA
+        import historical_market_archive as HMA
+        import historical_session_calendar as HSC
+        import historical_universe_archive as HUA
+        import learning_dataset as LD
+        import robustness_contract as RC
+        import robustness_repository as RREP
+        import robustness_runner as RRUN
+        import strategy_dsl_schema as DSL
+        import strategy_registry as SR
+        import tradability_archive as TA
+        import walk_forward_validation as WFV
+
+        raw = dict(request.spec)
+        strategy = raw.get("strategy")
+        if not isinstance(strategy, dict):
+            raise ValueError("strategy_identity_required")
+        raw["strategy"] = EC.StrategyIdentity(**strategy)
+        date_range = raw.get("date_range") or {}
+        raw["start_date"] = raw.pop("start_date", date_range.get("start"))
+        raw["end_date"] = raw.pop("end_date", date_range.get("end"))
+        raw.pop("date_range", None)
+        spec = EC.ExperimentSpec(**raw)
+        plan = RC.RobustnessPlan(**request.plan)
+        with _experiment_validation_connection(query_only=False) as conn:
+            market_repo = HMA.HistoricalMarketArchiveRepository(conn)
+            financial_archive_repo = HFA.HistoricalFinancialArchiveRepository(conn)
+            financial_feature_repo = FFE.FinancialFeatureEvidenceRepository(conn, financial_archive_repo)
+            universe_repo = HUA.HistoricalUniverseArchiveRepository(conn)
+            tradability_repo = TA.TradabilityArchiveRepository(conn)
+            validation_repo = EVR.ExperimentValidationRepository(conn)
+            baseline = validation_repo.get_run(run_id=run_id)
+            if baseline is None:
+                raise HTTPException(status_code=404, detail="validation_run_not_found")
+            expected_owners = _robustness_owner_identities(request, baseline)
+            if (spec.market_data_fingerprint != expected_owners["market_archive_fingerprint"]
+                    or spec.universe_fingerprint != expected_owners["universe_archive_fingerprint"]
+                    or spec.dataset_fingerprint != expected_owners["dataset_fingerprint"]
+                    or spec.parameter_set.get("validation_calendar_fingerprint") != expected_owners["calendar_fingerprint"]
+                    or spec.parameter_set.get("financial_archive_fingerprint") != expected_owners["financial_archive_fingerprint"]
+                    or request.benchmark_symbol != plan.regime_policy["benchmark_symbol"]):
+                raise ValueError("baseline_owner_identity_mismatch")
+            calendar = HSC.issue_from_market_archive(
+                market_repo, archive_fingerprint=spec.market_data_fingerprint,
+                benchmark_symbol=request.benchmark_symbol,
+                start=spec.start_date, end=spec.end_date)
+            if calendar.calendar_fingerprint != expected_owners["calendar_fingerprint"]:
+                raise ValueError("baseline_calendar_identity_mismatch")
+            manifest = LD.read_manifest(conn, spec.dataset_fingerprint)
+            if manifest is None:
+                raise ValueError("baseline_dataset_unavailable")
+            dataset = LD.build_dataset(
+                conn, cutoff=manifest["cutoff"], split_spec=manifest["split_spec"],
+                feature_names=manifest["feature_names"],
+                horizon_semantics=manifest["horizon_semantics"],
+                contract_version=manifest["contract_version"],
+                financial_feature_repository=financial_feature_repo
+                if expected_owners["financial_archive_fingerprint"] else None,
+                financial_archive_fingerprint=expected_owners["financial_archive_fingerprint"],
+                persist=False)
+            if dataset.fingerprint != spec.dataset_fingerprint:
+                raise ValueError("baseline_dataset_identity_mismatch")
+            samples = [sample for partition in LD.PARTITIONS
+                       for sample in dataset.partitions.get(partition, ())]
+            strategy_version = SR.get_version(spec.strategy.strategy_id, spec.strategy.version,
+                                              checksum=spec.strategy.checksum)
+            ast = DSL.normalize(strategy_version.definition.get("dsl_ast"))
+            dependencies = PV.strategy_dsl_dependencies(ast)
+            financial_by_pair = {}
+            if dependencies["financial_fields"]:
+                for sample in samples:
+                    sample_key = getattr(sample, "sample_key", None)
+                    code = getattr(sample, "code", None)
+                    session = (getattr(sample, "feature_asof", None)
+                               or getattr(sample, "decision_session", None))
+                    if not sample_key or not code or not session:
+                        continue
+                    for field_name in dependencies["financial_fields"]:
+                        item = financial_feature_repo.resolve_for_dataset_sample(
+                            dataset_fingerprint=spec.dataset_fingerprint,
+                            sample_key=str(sample_key), feature_name=field_name,
+                            financial_archive_fingerprint=expected_owners["financial_archive_fingerprint"],
+                        ).projection()
+                        if item.get("verification") != "proven":
+                            continue
+                        pair = (str(code), str(session))
+                        entry = financial_by_pair.setdefault(pair, {"decision_at": item.get("decision_at")})
+                        if entry["decision_at"] != item.get("decision_at"):
+                            raise ValueError("financial_feature_decision_mismatch")
+                        if field_name in entry and entry[field_name] != item.get("feature_value"):
+                            raise ValueError("financial_feature_value_mismatch")
+                        entry[field_name] = item.get("feature_value")
+            config = WFV.WalkForwardConfig(**request.walk_forward) if request.walk_forward else None
+            extended_calendar = None
+            date_scenarios = [scenario for scenario in plan.scenarios()
+                              if scenario["category"] in {"start_date", "end_date"}]
+            if date_scenarios:
+                calendar_manifest = market_repo.get_manifest(spec.market_data_fingerprint)
+                benchmark_calendar = (calendar_manifest.benchmark_calendars.get(request.benchmark_symbol)
+                                      if calendar_manifest is not None else None)
+                if not isinstance(benchmark_calendar, dict):
+                    raise ValueError("historical_benchmark_calendar_unavailable")
+                owner_sessions = list(benchmark_calendar.get("sessions") or ())
+                if (spec.start_date not in owner_sessions or spec.end_date not in owner_sessions
+                        or owner_sessions != sorted(set(owner_sessions))):
+                    raise ValueError("historical_benchmark_calendar_unavailable")
+                base_start, base_end = owner_sessions.index(spec.start_date), owner_sessions.index(spec.end_date)
+                ranges = []
+                for scenario in date_scenarios:
+                    params = scenario["parameters"]
+                    start_index, end_index = base_start, base_end
+                    if scenario["category"] == "start_date":
+                        start_index += params["shift_sessions"]
+                    else:
+                        end_index += params["shift_sessions"]
+                    if 0 <= start_index <= end_index < len(owner_sessions):
+                        selected = owner_sessions[start_index:end_index + 1]
+                        if selected:
+                            ranges.append((selected[0], selected[-1]))
+                if ranges:
+                    coverage_start = min(spec.start_date, *(start for start, _ in ranges))
+                    coverage_end = max(spec.end_date, *(end for _, end in ranges))
+                    try:
+                        extended_calendar = HSC.issue_from_market_archive(
+                            market_repo, archive_fingerprint=spec.market_data_fingerprint,
+                            benchmark_symbol=request.benchmark_symbol,
+                            start=coverage_start, end=coverage_end)
+                    except ValueError:
+                        # The owner cannot prove this expanded range. R30 records
+                        # each affected case as unavailable instead of guessing.
+                        extended_calendar = None
+            if extended_calendar is not None and extended_calendar.calendar_fingerprint == calendar.calendar_fingerprint:
+                extended_calendar = None
+            report = RRUN.run_robustness(
+                baseline_run=baseline, spec=spec, plan=plan,
+                strategy_version=strategy_version, session_calendar=calendar,
+                market_archive_repository=market_repo,
+                universe_archive_repository=universe_repo,
+                tradability_repository=tradability_repo,
+                financial_features=financial_by_pair,
+                required_financial_fields=dependencies["financial_fields"],
+                extended_session_calendar=extended_calendar,
+                date_range_validation_context={
+                    "benchmark_symbol": request.benchmark_symbol,
+                    "walk_forward_config": config,
+                    "dataset_manifest": manifest,
+                    "samples": samples,
+                    "financial_feature_repository": financial_feature_repo
+                        if expected_owners["financial_archive_fingerprint"] else None,
+                },
+                created_at=dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"))
+            report["plan_fingerprint"] = plan.fingerprint
+            repository = RREP.RobustnessRepository(conn)
+            stored = repository.append_report(report)
+            return {"status": "ok", "report_id": stored["id"],
+                    "report_key": stored["report_key"],
+                    "report_fingerprint": stored["report_fingerprint"],
+                    "report": stored["report"]}
+    except HTTPException:
+        raise
+    except RRUN.RobustnessBaselineError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except (TypeError, ValueError, KeyError) as exc:
+        reason = str(exc) if str(exc).isidentifier() else "robustness_request_invalid"
+        raise HTTPException(status_code=422, detail=reason) from exc
+    except RREP.RobustnessPersistenceError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail="robustness_inputs_unavailable") from exc
+
+
+@router.get("/experiments/runs/{run_id}/robustness")
+def canonical_robustness_reports(run_id: int = Path(..., gt=0),
+                                 limit: int = Query(50, ge=1, le=200)):
+    import experiment_validation_repository as EVR
+    import robustness_repository as RREP
+    try:
+        with _experiment_validation_connection(query_only=True) as conn:
+            ledger_table = conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='experiment_validation_runs'").fetchone()
+            report_table = conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='robustness_reports'").fetchone()
+            if not ledger_table or not report_table:
+                return {"status": "ok", "reports": []}
+            ledger = object.__new__(EVR.ExperimentValidationRepository)
+            ledger.conn = conn
+            baseline = ledger.get_run(run_id=run_id)
+            if baseline is None:
+                raise HTTPException(status_code=404, detail="validation_run_not_found")
+            repository = object.__new__(RREP.RobustnessRepository)
+            repository.conn = conn
+            reports = repository.recent_reports(limit=limit, baseline_run_key=baseline["run_key"])
+            return {"status": "ok", "reports": [
+                {"id": item["id"], "report_key": item["report_key"],
+                 "report_fingerprint": item["report_fingerprint"],
+                 "plan_fingerprint": item["plan_fingerprint"],
+                 "created_at": item["created_at"], "report": item["report"]}
+                for item in reports]}
+    except HTTPException:
+        raise
+    except RREP.RobustnessPersistenceError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except FileNotFoundError:
+        return {"status": "ok", "reports": []}
+    except sqlite3.Error as exc:
+        raise HTTPException(status_code=503, detail="robustness_history_unavailable") from exc
+
+
+@router.get("/robustness/{report_id}")
+def canonical_robustness_report(report_id: int = Path(..., gt=0)):
+    import robustness_repository as RREP
+    try:
+        with _experiment_validation_connection(query_only=True) as conn:
+            table = conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='robustness_reports'").fetchone()
+            if not table:
+                report = None
+            else:
+                repository = object.__new__(RREP.RobustnessRepository)
+                repository.conn = conn
+                report = repository.get_report(report_id)
+    except RREP.RobustnessPersistenceError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except FileNotFoundError:
+        report = None
+    except sqlite3.Error as exc:
+        raise HTTPException(status_code=503, detail="robustness_history_unavailable") from exc
+    if report is None:
+        raise HTTPException(status_code=404, detail="robustness_report_not_found")
+    return {"status": "ok", "report": report["report"], "plan": report["plan"],
+            "report_key": report["report_key"],
+            "report_fingerprint": report["report_fingerprint"]}
 
 
 @router.post("/ai/analyze")
