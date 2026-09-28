@@ -333,6 +333,22 @@ def execution_context_from_state(
     day = MDC.canonical_day(asof_day) or ""
     quote = dict(quote or {})
     execution_asof = quote.get("execution_asof")
+    if runtime_context is not None:
+        import simulation_runtime_context as SRC
+
+        if not isinstance(runtime_context, SRC.ComparableRuntimeContext):
+            raise ValueError("comparable runtime context is invalid")
+        expected_state_identity = execution_state_fingerprint(state)
+        if runtime_context.execution_state_fingerprint != expected_state_identity:
+            raise ValueError("execution runtime context state identity mismatch")
+        if runtime_context.execution_ruleset_version != SIMULATION_EXECUTION_RULESET:
+            raise ValueError("execution runtime context ruleset mismatch")
+        if runtime_context.session_date != day:
+            raise ValueError("execution runtime context session date mismatch")
+        context_instant = _parse_execution_instant(runtime_context.decision_at)
+        quote_instant = _parse_execution_instant(execution_asof)
+        if context_instant is None or quote_instant is None or context_instant != quote_instant:
+            raise ValueError("execution runtime context decision instant mismatch")
     price = _positive_number(quote.get("price"))
     amount = _positive_number(quote.get("amount"))
     available_liquidity = max(0, int(amount / price)) if price and amount else 0
@@ -1264,11 +1280,19 @@ def entry_gate_state_fingerprint(state: EntryGateState) -> str:
 def evaluate_entry_state(
     *, state: EntryGateState, account_id: str, code: str, side: str,
     quote: Mapping[str, Any], asof_day, require_market_gate: bool = True,
-    amount: float = 0.0, fees: float = 0.0,
+    amount: float = 0.0, fees: float = 0.0, runtime_context: Any = None,
 ) -> dict[str, Any]:
     """Pure canonical entry gate over a previously captured explicit state."""
     if not isinstance(state, EntryGateState):
         raise TypeError("entry gate state snapshot is required")
+    if runtime_context is not None:
+        import simulation_runtime_context as SRC
+
+        if not isinstance(runtime_context, SRC.ComparableRuntimeContext):
+            raise ValueError("comparable runtime context is invalid")
+        expected_state_identity = entry_gate_state_fingerprint(state)
+        if runtime_context.entry_gate_state_fingerprint != expected_state_identity:
+            raise ValueError("entry runtime context state identity mismatch")
     policy = policy_for(account_id)
     reasons: list[str] = []
     gates: dict[str, Any] = {}

@@ -123,6 +123,30 @@ def _valid_execution_context(*, side="buy", quantity=100, sellable=1000, quote_a
     )
 
 
+def _runtime_context_for_state(*, execution_state=None, entry_state=None,
+                               ruleset=EP.SIMULATION_EXECUTION_RULESET,
+                               session_date="2026-09-08", decision_at=NOW):
+    sha = lambda value: hashlib.sha256(value.encode("utf-8")).hexdigest()
+    return SRC.build_comparable_runtime_context(
+        strategy_id="trend_pullback", strategy_version=1,
+        strategy_checksum=sha("strategy"), session_date=session_date,
+        decision_at=decision_at, market_policy_name="execution_quote",
+        market_snapshot_fingerprint=sha("market"),
+        symbol_quote_fingerprints={"002241": sha("quote")},
+        tradability_evidence_fingerprints={"002241@2026-09-08": sha("tradability")},
+        execution_ruleset_version=ruleset,
+        risk_policy_identity={"strategy_profile": {"max_positions": 4}},
+        execution_state_fingerprint=(
+            EP.execution_state_fingerprint(execution_state)
+            if execution_state is not None else None
+        ),
+        entry_gate_state_fingerprint=(
+            EP.entry_gate_state_fingerprint(entry_state)
+            if entry_state is not None else None
+        ),
+    )
+
+
 class _FakeResult:
     def __init__(self, value=None, row=None, rows=None):
         self._value = value
@@ -913,8 +937,118 @@ class PlanEntryTests(_StubbedPlannerTest):
             )
         self.assertEqual(formal, isolated)
 
+    def test_entry_evaluation_rejects_state_context_mismatch(self):
+        state_a = EP.EntryGateState(
+            capacity_available=True, position_limit=4, pool_limit=6,
+            pending_cash=125.0, shared_cash=100000.0,
+            account_risk_state={"blocked": False, "reasons": []},
+            market_state={"light": "green"},
+        )
+        runtime_context = _runtime_context_for_state(entry_state=state_a)
+        kwargs = {
+            "state": state_a, "account_id": "tq_breakout", "code": "002241",
+            "side": "buy", "quote": {"price": 21.5, "name": "test"},
+            "asof_day": dt.date(2026, 9, 8), "amount": 2500.0, "fees": 2.5,
+        }
+        stub = types.SimpleNamespace(
+            _security_scope=lambda *args: {"allowed": True},
+            _execution_quote_status=lambda *args, **kwargs: {"fresh": True},
+        )
+        with mock.patch.object(EP, "_pt", lambda: stub):
+            unbound = EP.evaluate_entry_state(**kwargs)
+            bound = EP.evaluate_entry_state(**kwargs, runtime_context=runtime_context)
+        self.assertEqual(unbound, bound)
+        execution_only = _runtime_context_for_state(
+            execution_state=EP.ExecutionStateSnapshot(buying_power=100.0),
+        )
+        with mock.patch.object(EP, "_pt", lambda: stub):
+            with self.assertRaisesRegex(ValueError, "entry runtime context state identity mismatch"):
+                EP.evaluate_entry_state(
+                    **{**kwargs, "state": replace(state_a, pending_cash=126.0)},
+                    runtime_context=runtime_context,
+                )
+            with self.assertRaisesRegex(ValueError, "entry runtime context state identity mismatch"):
+                EP.evaluate_entry_state(**kwargs, runtime_context=execution_only)
+
 
 class ExecutionStateBuilderTests(unittest.TestCase):
+    def test_execution_context_rejects_state_context_mismatches(self):
+        formal = _valid_execution_context()
+        state_a = EP.ExecutionStateSnapshot(
+            buying_power=50_000.0, sellable_quantity=300,
+            already_filled_quantity=20, same_day_consumed_quantity=30,
+            current_order_status="pending_execution",
+        )
+        context_a = _runtime_context_for_state(execution_state=state_a)
+        for state_b in (
+            replace(state_a, sellable_quantity=200),
+            replace(state_a, buying_power=0.0),
+            replace(state_a, same_day_consumed_quantity=31),
+        ):
+            with self.subTest(state=state_b), self.assertRaisesRegex(
+                ValueError, "execution runtime context state identity mismatch",
+            ):
+                EP.execution_context_from_state(
+                    order={"code": "002241", "side": "buy"},
+                    quote=dict(formal.quote), asof_day=formal.session_date,
+                    market_reading=formal.market_reading,
+                    tradability=formal.tradability, state=state_b,
+                    runtime_context=context_a,
+                )
+
+    def test_execution_context_rejects_entry_only_context_and_wrong_ruleset(self):
+        formal = _valid_execution_context()
+        state = EP.ExecutionStateSnapshot(buying_power=50_000.0, sellable_quantity=300)
+        entry_only = _runtime_context_for_state(
+            entry_state=EP.EntryGateState(pending_cash=100.0),
+        )
+        wrong_ruleset = _runtime_context_for_state(
+            execution_state=state, ruleset="a-share-simulation-v2",
+        )
+        for context, message in (
+            (entry_only, "execution runtime context state identity mismatch"),
+            (wrong_ruleset, "execution runtime context ruleset mismatch"),
+            (_runtime_context_for_state(execution_state=state, session_date="2026-09-07"),
+             "execution runtime context session date mismatch"),
+            (_runtime_context_for_state(execution_state=state,
+                                        decision_at="2026-09-08T09:59:00+08:00"),
+             "execution runtime context decision instant mismatch"),
+        ):
+            with self.subTest(message=message), self.assertRaisesRegex(ValueError, message):
+                EP.execution_context_from_state(
+                    order={"code": "002241", "side": "buy"},
+                    quote=dict(formal.quote), asof_day=formal.session_date,
+                    market_reading=formal.market_reading,
+                    tradability=formal.tradability, state=state,
+                    runtime_context=context,
+                )
+
+    def test_exact_execution_state_context_is_accepted_with_formal_parity(self):
+        formal = _valid_execution_context(side="buy", sellable=300)
+        state = EP.ExecutionStateSnapshot(
+            buying_power=50_000.0, sellable_quantity=300,
+            already_filled_quantity=0, same_day_consumed_quantity=0,
+            current_order_status="pending_execution",
+        )
+        runtime_context = _runtime_context_for_state(execution_state=state)
+        bound = EP.execution_context_from_state(
+            order={"code": "002241", "side": "buy"},
+            quote=dict(formal.quote), asof_day=formal.session_date,
+            market_reading=formal.market_reading, tradability=formal.tradability,
+            state=state, runtime_context=runtime_context,
+        )
+        formal = replace(formal, buying_power=50_000.0)
+        intent = EP.PersistedOrderIntent(
+            order_id=7, account_id="tq_breakout", cycle_id=8,
+            strategy_id=None, strategy_version=None, strategy_checksum=None,
+            signal_id=None, symbol="002241", side="buy", desired_quantity=100,
+            intent_at=NOW, reference_price=21.5,
+        )
+        self.assertEqual(
+            EP.evaluate_simulated_execution(intent, formal),
+            EP.evaluate_simulated_execution(intent, bound),
+        )
+
     def test_execution_state_fingerprint_tracks_every_decision_field(self):
         base = EP.ExecutionStateSnapshot(
             buying_power=50_000.0, sellable_quantity=300,

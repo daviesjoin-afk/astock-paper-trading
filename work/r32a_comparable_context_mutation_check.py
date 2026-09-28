@@ -40,6 +40,14 @@ MUTATIONS = [
     ("backend/market_data_contract.py", '"degraded_reason": snapshot.degraded_reason,',
      '"degraded_reason": None,',
      "test_market_data_boundary.MarketDataContractTests.test_R32A_degraded_reason_is_part_of_market_fact_identity"),
+    ("backend/execution_planner.py",
+     'if runtime_context.execution_state_fingerprint != expected_state_identity:\n            raise ValueError("execution runtime context state identity mismatch")',
+     'if False:\n            raise ValueError("execution runtime context state identity mismatch")',
+     "test_execution_planner.ExecutionStateBuilderTests.test_execution_context_rejects_state_context_mismatches"),
+    ("backend/execution_planner.py",
+     'if runtime_context.entry_gate_state_fingerprint != expected_state_identity:\n            raise ValueError("entry runtime context state identity mismatch")',
+     'if False:\n            raise ValueError("entry runtime context state identity mismatch")',
+     "test_execution_planner.PlanEntryTests.test_entry_evaluation_rejects_state_context_mismatch"),
 ]
 
 
