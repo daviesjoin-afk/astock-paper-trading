@@ -3340,7 +3340,7 @@ timeline 不嵌入结论，未关联 canonical id 的 legacy result 保持 unava
 B3 不新增 ledger、migration、provider 或 authority，不改变 trading/tuning 权限，也不删除 roadmap
 能力。owner identity、PIT、verification、runtime terminal instant、stable attempt identity、历史市场证据、
 cycle membership 与 physical DB origin 等缺口继续 **OPEN / REQUIRED**，production fail closed。
-R27-B2C = **COMPLETE**；R27-B3 = **COMPLETE（PR #210 MERGED）**；R28-A = **COMPLETE**；R29-A = **COMPLETE（PR #212 MERGED）**；R29-FINAL = **COMPLETE**；R30 = **IN PROGRESS**；R31 = **NOT STARTED**。
+R27-B2C = **COMPLETE**；R27-B3 = **COMPLETE（PR #210 MERGED）**；R28-A = **COMPLETE**；R29-A = **COMPLETE（PR #212 MERGED）**；R29-FINAL = **COMPLETE**；R30 = **COMPLETE**；R31 = **NOT STARTED**。
 
 ### R28-A：Strategy Experiment Identity & Result Contract（COMPLETE）
 
@@ -3382,7 +3382,7 @@ feature evidence owner 分别保存披露事实和 sample/field/decision instant
 PIT inputs 的 run 仍返回 `unavailable / BLOCKED`，不把能力完成误报为数据就绪。验证和边界见
 [`docs/R29_PIT_VALIDATION.md`](docs/R29_PIT_VALIDATION.md)。R30 状态见下节。
 
-### R30：Robustness / Adversarial Validation（IN PROGRESS）
+### R30：Robustness / Adversarial Validation（COMPLETE）
 
 R30 从 exact completed R29 run 与完整 `ExperimentSpec` 建立不可变计划和确定性场景身份，复用唯一的
 `experiment_execution_model` loop，分析显式费用、滑点、延迟、流动性、缺失数据、参数、日期和历史 universe
@@ -3390,7 +3390,7 @@ R30 从 exact completed R29 run 与完整 `ExperimentSpec` 建立不可变计划
 任何发生变化的日期范围都必须在同一组 pinned owners 上重新运行 R29 PIT gate；扩展范围还必须由同一 market owner 签发 session calendar；
 缺少证据就标记 unavailable。Synthetic view 留在内存，不回写任何历史 owner。报告 ledger append-only，API 离线，
 Research Workspace 只渲染报告事实，unknown 保持 null；R30 不产生分数、晋级或生命周期状态。
-只有 R30 exit matrix、全量验证和 exact-head CI 均通过后，状态才改为 COMPLETE。完整 contract 与 API/UI 边界见
+R30 exit matrix、全量验证和 exact-head CI 均已通过。完整 contract 与 API/UI 边界见
 [`docs/R30_ROBUSTNESS_VALIDATION.md`](docs/R30_ROBUSTNESS_VALIDATION.md)。R31 = **NOT STARTED**。
 
 ### 仅作 review signal（不进入 CI gate）

@@ -36,4 +36,4 @@ GET routes are read-only and do not create the database or execute a report. The
 
 R29 remains the canonical PIT authority. R30 adds one plan contract, one offline robustness runner, one report ledger, and one derived regime module. There is still one R29 runner and one execution implementation. No provider/network, current/latest lookup, historical refill, lifecycle write, promotion action, AI score, or R31 logic is added.
 
-Roadmap state: R28 COMPLETE; R29 COMPLETE; R30 becomes COMPLETE only after its full exit matrix and exact-head checks pass; R31 NOT STARTED.
+Roadmap state: R28 COMPLETE; R29 COMPLETE; R30 COMPLETE after the full exit matrix, full backend validation, and exact-head CI passed; R31 NOT STARTED.
