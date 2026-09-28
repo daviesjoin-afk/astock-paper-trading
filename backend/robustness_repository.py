@@ -191,3 +191,11 @@ class RobustnessRepository:
             raise RobustnessPersistenceError("invalid_robustness_report_id")
         row = self.conn.execute("SELECT * FROM robustness_reports WHERE id=?", (report_id,)).fetchone()
         return _decode(row) if row is not None else None
+
+    def get_report_by_key(self, report_key: str) -> dict[str, Any] | None:
+        """Read one exact canonical report identity; never select a latest report."""
+        if not isinstance(report_key, str) or len(report_key) != 64:
+            raise RobustnessPersistenceError("exact_robustness_report_identity_required")
+        row = self.conn.execute("SELECT * FROM robustness_reports WHERE report_key=?",
+                                (report_key,)).fetchone()
+        return _decode(row) if row is not None else None

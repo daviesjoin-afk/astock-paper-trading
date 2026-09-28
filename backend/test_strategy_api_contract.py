@@ -20,6 +20,7 @@ import asyncio
 import ast
 import json
 import os
+import sqlite3
 import shutil
 import tempfile
 import types
@@ -34,6 +35,7 @@ import api_strategies as API
 import main
 import paper_trading as P
 import strategy_api_models as Models
+import strategy_lifecycle as SL
 import strategy_registry as SR
 import strategy_runtime as SRT
 import strategy_service as SVC
@@ -144,15 +146,14 @@ class FrontendPayloadContractTests(_ApiFixture):
         }, default_status=201)
         self.assertEqual(status, 201, created)
 
-        # 工作台「标记 Validated」只传 to_status + reason。
-        status, validated = self._call(API.transition_strategy, "fe_life", {
-            "to_status": "validated", "reason": "Web workbench 验证通过",
-        })
-        self.assertEqual(status, 200, validated)
-        # 其他动作带 expected_status 做乐观并发（validated -> archived 是合法边）。
+        # 安全迁移必须绑定当前 immutable version/state，并说明原因。
+        lifecycle = SVC.lifecycle_read_model("fe_life")
         status, archived = self._call(API.transition_strategy, "fe_life", {
-            "to_status": "archived", "expected_status": "validated",
-            "reason": "Web workbench 操作", "actor": "strategy-workbench",
+            "strategy_version": lifecycle["version"],
+            "strategy_checksum": lifecycle["checksum"],
+            "expected_state": lifecycle["state"], "target_state": "archived",
+            "actor_type": "human", "actor_id": "strategy-workbench",
+            "reason_code": "test_archive", "reason": "Web workbench 操作",
         })
         self.assertEqual(status, 200, archived)
 
@@ -193,6 +194,47 @@ class FrontendPayloadContractTests(_ApiFixture):
         self.assertTrue(deleted["deleted"])
         self.assertIsNone(deleted["archived_instead_hint"])
 
+    def test_workbench_can_resume_paused_strategy_with_human_reason(self):
+        status, created = self._call(API.create_strategy, {
+            "id": "fe_resume", "name": "fe_resume", "dsl_ast": RULE,
+        }, default_status=201)
+        self.assertEqual(status, 201, created)
+        conn = sqlite3.connect(P.DB_PATH)
+        conn.row_factory = sqlite3.Row
+        try:
+            conn.execute("PRAGMA foreign_keys=ON")
+            conn.execute("DROP TRIGGER strategy_lifecycle_events_no_delete")
+            conn.execute("DELETE FROM strategy_lifecycle_events WHERE strategy_id='fe_resume'")
+            conn.execute("DELETE FROM strategy_lifecycle_state WHERE strategy_id='fe_resume'")
+            conn.execute("UPDATE strategy_definitions SET lifecycle_status='active' WHERE id='fe_resume'")
+            SL.ensure_schema(conn)
+            conn.commit()
+        finally:
+            conn.close()
+
+        lifecycle = SVC.lifecycle_read_model("fe_resume")
+        self.assertEqual("paper", lifecycle["state"])
+        self.assertIn("paused", lifecycle["safety_transitions"])
+        status, paused = self._call(API.transition_strategy, "fe_resume", {
+            "strategy_version": lifecycle["version"], "strategy_checksum": lifecycle["checksum"],
+            "expected_state": "paper", "target_state": "paused", "actor_type": "human",
+            "actor_id": "strategy-workbench", "reason_code": "operator_pause",
+            "reason": "人工临时暂停",
+        })
+        self.assertEqual(status, 200, paused)
+
+        lifecycle = SVC.lifecycle_read_model("fe_resume")
+        self.assertEqual("paused", lifecycle["state"])
+        self.assertIn("paper", lifecycle["safety_transitions"])
+        status, resumed = self._call(API.transition_strategy, "fe_resume", {
+            "strategy_version": lifecycle["version"], "strategy_checksum": lifecycle["checksum"],
+            "expected_state": "paused", "target_state": "paper", "actor_type": "human",
+            "actor_id": "strategy-workbench", "reason_code": "operator_resume",
+            "reason": "人工复核后恢复",
+        })
+        self.assertEqual(status, 200, resumed)
+        self.assertEqual("paper", resumed["transitioned_version"]["state"])
+
 
 class RequestSchemaTests(_ApiFixture):
     """缺必填字段 400、形状错误 422、伪造风控字段被丢弃。"""
@@ -204,7 +246,7 @@ class RequestSchemaTests(_ApiFixture):
 
         status, body = self._call(API.transition_strategy, "whatever", {})
         self.assertEqual(status, 400, body)
-        self.assertEqual(body["detail"], "to_status is required")
+        self.assertEqual(body["detail"], "strategy_version is required")
 
         status, body = self._call(API.clone_strategy, "whatever", {})
         self.assertEqual(status, 400, body)
@@ -213,7 +255,11 @@ class RequestSchemaTests(_ApiFixture):
     def test_wrong_shape_is_422(self):
         status, _body = self._call(API.create_strategy, {"id": "shape", "name": "x", "metadata": "not-an-object"})
         self.assertEqual(status, 422)
-        status, _body = self._call(API.transition_strategy, "shape", {"to_status": {"nested": 1}})
+        status, _body = self._call(API.transition_strategy, "shape", {
+            "strategy_version": "wrong", "strategy_checksum": "0" * 64,
+            "expected_state": "draft", "target_state": "candidate",
+            "actor_type": "human", "actor_id": "test",
+        })
         self.assertEqual(status, 422)
 
     def test_update_requires_a_non_empty_changes_object(self):
@@ -293,7 +339,9 @@ class OpenApiContractTests(_ApiFixture):
         props = create["properties"]
         for field in ("id", "name", "description", "metadata", "dsl_ast", "actor"):
             self.assertIn(field, props, field)
-        self.assertIn("to_status", components["StrategyTransitionRequest"].get("required", []))
+        for required in ("strategy_version", "strategy_checksum", "expected_state",
+                         "target_state", "actor_type", "actor_id"):
+            self.assertIn(required, components["StrategyTransitionRequest"].get("required", []))
 
     def test_response_models_are_published(self):
         schema = main.app.openapi()
@@ -309,6 +357,8 @@ class OpenApiContractTests(_ApiFixture):
             "/api/strategies/preview": {"post"},
             "/api/strategies/{strategy_id}": {"get", "put", "patch", "delete"},
             "/api/strategies/{strategy_id}/transition": {"post"},
+            "/api/strategies/{strategy_id}/lifecycle": {"get"},
+            "/api/strategies/{strategy_id}/promotion/proposals": {"get", "post"},
             "/api/strategies/{strategy_id}/clone": {"post"},
             "/api/strategies/{strategy_id}/versions": {"get"},
             "/api/strategies/{strategy_id}/events": {"get"},
@@ -368,11 +418,13 @@ class LayeringTests(_ApiFixture):
             "/api/strategies/x/transition", Models.StrategyTransitionRequest, {},
         )
         self.assertEqual(400, missing.status_code)
-        self.assertEqual("to_status is required", json.loads(missing.body)["detail"])
+        self.assertEqual("strategy_version is required", json.loads(missing.body)["detail"])
 
         wrong_shape = response_for(
             "/api/strategies/x/transition", Models.StrategyTransitionRequest,
-            {"to_status": {"nested": 1}},
+            {"strategy_version": "wrong", "strategy_checksum": "0" * 64,
+             "expected_state": "draft", "target_state": "candidate",
+             "actor_type": "human", "actor_id": "test"},
         )
         self.assertEqual(422, wrong_shape.status_code)
 

@@ -43,13 +43,13 @@ USER_B = "own_user_b"
 
 # 冻结 golden：参与者解析版本标签（抽取前后必须一致）。
 GOLDEN_PARTICIPANT_VERSION = "cycle-participant-v1"
-GOLDEN_PAUSED_STATUSES = ("paused",)
 
 # ---------------------------------------------------------------------------
 # 架构守卫常量
 # ---------------------------------------------------------------------------
 ALLOWED_IMPORT_ROOTS = {
     "__future__", "json", "sqlite3", "paper_account_specs", "user_strategy_participation",
+    "strategy_lifecycle",
 }
 FORBIDDEN_IMPORT_ROOTS = {
     "paper_trading", "paper_storage", "paper_repository", "paper_schema_migrations",
@@ -204,7 +204,18 @@ def _make_conn():
         );
         CREATE TABLE strategy_definitions(
             id TEXT PRIMARY KEY, origin TEXT, lifecycle_status TEXT,
-            supports_new_cycle INTEGER
+            supports_new_cycle INTEGER, current_version INTEGER, current_checksum TEXT
+        );
+        CREATE TABLE paper_strategy_version_heads(
+            strategy_id TEXT PRIMARY KEY, current_version INTEGER, current_checksum TEXT
+        );
+        CREATE TABLE strategy_lifecycle_state(
+            strategy_id TEXT, strategy_version INTEGER, strategy_checksum TEXT, state TEXT,
+            PRIMARY KEY(strategy_id,strategy_version)
+        );
+        CREATE TABLE paper_cycle_strategy_versions(
+            cycle_id INTEGER, account_id TEXT, strategy_id TEXT,
+            strategy_version INTEGER, strategy_checksum TEXT, bound_at TEXT
         );
         CREATE TABLE paper_position_lots(
             account_id TEXT, remaining_qty REAL
@@ -221,6 +232,19 @@ def _cycle(conn, cycle_id, enabled, status="running"):
         "INSERT INTO paper_cycles(id,status,capital,enabled_strategies) VALUES(?,?,?,?)",
         (cycle_id, status, 300000.0, raw),
     )
+    if isinstance(enabled, list):
+        for strategy_id in enabled:
+            try:
+                identity = conn.execute(
+                    "SELECT current_version,current_checksum FROM strategy_definitions WHERE id=?",
+                    (strategy_id,),
+                ).fetchone()
+                if identity is not None:
+                    conn.execute("INSERT INTO paper_cycle_strategy_versions VALUES(?,?,?,?,?,?)",
+                        (cycle_id, strategy_id, strategy_id, identity[0], identity[1], "fixture"))
+            except sqlite3.Error:
+                # Some read-only boundary fixtures intentionally omit registry/history tables.
+                pass
 
 
 def _account(conn, account_id, cycle_id, *, status="running", cash=0.0, initial_cash=0.0):
@@ -235,11 +259,40 @@ def _account(conn, account_id, cycle_id, *, status="running", cash=0.0, initial_
 
 def _registry(conn, strategy_id, *, origin="user", lifecycle_status="active",
               supports_new_cycle=1):
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(strategy_definitions)")}
+    if "current_version" not in columns:
+        conn.execute("ALTER TABLE strategy_definitions ADD COLUMN current_version INTEGER")
+    if "current_checksum" not in columns:
+        conn.execute("ALTER TABLE strategy_definitions ADD COLUMN current_checksum TEXT")
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS paper_strategy_version_heads(
+            strategy_id TEXT PRIMARY KEY, current_version INTEGER, current_checksum TEXT
+        );
+        CREATE TABLE IF NOT EXISTS strategy_lifecycle_state(
+            strategy_id TEXT, strategy_version INTEGER, strategy_checksum TEXT, state TEXT,
+            PRIMARY KEY(strategy_id,strategy_version)
+        );
+        CREATE TABLE IF NOT EXISTS paper_cycle_strategy_versions(
+            cycle_id INTEGER, account_id TEXT, strategy_id TEXT,
+            strategy_version INTEGER, strategy_checksum TEXT, bound_at TEXT
+        );
+    """)
+    canonical_state = {"active": "paper"}.get(lifecycle_status, lifecycle_status)
+    checksum = f"{strategy_id}:v1"
     conn.execute(
-        "INSERT INTO strategy_definitions(id,origin,lifecycle_status,supports_new_cycle) "
-        "VALUES(?,?,?,?)",
-        (strategy_id, origin, lifecycle_status, supports_new_cycle),
+        "INSERT INTO strategy_definitions(id,origin,lifecycle_status,supports_new_cycle,current_version,current_checksum) "
+        "VALUES(?,?,?, ?,1,?)",
+        (strategy_id, origin, lifecycle_status, supports_new_cycle, checksum),
     )
+    conn.execute("INSERT INTO paper_strategy_version_heads VALUES(?,1,?)", (strategy_id, checksum))
+    conn.execute("INSERT INTO strategy_lifecycle_state VALUES(?,1,?,?)",
+                 (strategy_id, checksum, canonical_state))
+
+
+def _set_lifecycle(conn, strategy_id, state):
+    state = {"active": "paper"}.get(state, state)
+    conn.execute("UPDATE strategy_lifecycle_state SET state=? WHERE strategy_id=?",
+                 (state, strategy_id))
 
 
 def _ledger(conn, cycle_id):
@@ -300,10 +353,7 @@ class EconomicOwnershipContractTests(unittest.TestCase):
         _account(self.conn, USER_A, 1, cash=150000.0, initial_cash=150000.0)
         _account(self.conn, USER_B, 1, cash=150000.0, initial_cash=150000.0)
         self.assertIn(USER_A, _ledger(self.conn, 1))
-        self.conn.execute(
-            "UPDATE strategy_definitions SET lifecycle_status='paused', "
-            "supports_new_cycle=0 WHERE id=?", (USER_A,),
-        )
+        _set_lifecycle(self.conn, USER_A, "paused")
         # 经济账本不变，且账户行未被改写。
         self.assertIn(USER_A, _ledger(self.conn, 1))
         row = self.conn.execute(
@@ -415,16 +465,10 @@ class ExecutionParticipationContractTests(unittest.TestCase):
         _account(self.conn, USER_B, 1, cash=150000.0, initial_cash=150000.0)
 
     def _pause(self, strategy_id):
-        self.conn.execute(
-            "UPDATE strategy_definitions SET lifecycle_status='paused' WHERE id=?",
-            (strategy_id,),
-        )
+        _set_lifecycle(self.conn, strategy_id, "paused")
 
     def _resume(self, strategy_id):
-        self.conn.execute(
-            "UPDATE strategy_definitions SET lifecycle_status='active' WHERE id=?",
-            (strategy_id,),
-        )
+        _set_lifecycle(self.conn, strategy_id, "paper")
 
     def test_pause_removes_execution_permission_but_not_ownership(self):
         self.assertEqual((USER_A, USER_B), _participants(self.conn, 1))
@@ -563,9 +607,7 @@ class IdleAndLegacyFallbackContractTests(unittest.TestCase):
         _registry(self.conn, USER_A)
         _registry(self.conn, USER_B)
         _cycle(self.conn, 1, [USER_A, USER_B])
-        self.conn.execute(
-            "UPDATE strategy_definitions SET lifecycle_status='paused' WHERE id=?", (USER_B,)
-        )
+        _set_lifecycle(self.conn, USER_B, "paused")
         resolution = _resolve(self.conn, 1)
         self.assertEqual("cycle_enabled_unbound_fallback", resolution["source"])
         self.assertEqual((USER_A,), resolution["ids"])
@@ -644,8 +686,6 @@ class CompatibilityFacadeTests(unittest.TestCase):
     def test_version_constants_are_aliases(self):
         self.assertEqual(GOLDEN_PARTICIPANT_VERSION, PCY.CYCLE_PARTICIPANT_VERSION)
         self.assertEqual(GOLDEN_PARTICIPANT_VERSION, PT._CYCLE_PARTICIPANT_VERSION)
-        self.assertEqual(GOLDEN_PAUSED_STATUSES, PCY.LIFECYCLE_PAUSED_STATUSES)
-        self.assertEqual(GOLDEN_PAUSED_STATUSES, PT._LIFECYCLE_PAUSED_STATUSES)
 
     def test_paper_trading_exposes_every_compatibility_name(self):
         for name in FACADE_DELEGATIONS:
@@ -880,9 +920,7 @@ class RiskExitEligibilityTests(unittest.TestCase):
         _cycle(self.conn, 1, [USER_A, USER_B])
         _account(self.conn, USER_A, 1)
         _account(self.conn, USER_B, 1)
-        self.conn.execute(
-            "UPDATE strategy_definitions SET lifecycle_status='paused' WHERE id=?", (USER_A,)
-        )
+        _set_lifecycle(self.conn, USER_A, "paused")
         self._hold(USER_A, 100.0)
         self.assertNotIn(USER_A, _participants(self.conn, 1))
         risk_ids = PT._risk_exit_account_ids(self.conn)

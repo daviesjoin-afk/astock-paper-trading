@@ -30,6 +30,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import paper_selection as PS
 import selection_tracking as ST
 import strategy_registry as SR
+from test_strategy_lifecycle_fixtures import archive_state, seed_legacy_state
 import strategy_selection_provenance as SP
 import strategy_selection_resolver as SRES
 
@@ -221,21 +222,19 @@ class SelectionProvenanceTests(_IsolatedStudy):
                             "run 的 checksum 是 v2 的（current-fill）")
 
     def test_SP02_same_day_versions_do_not_overwrite_each_other(self):
-        """SP-02：同日 v1/v2 是两份证据，互相不覆盖。"""
+        """SP-02：新 immutable version 从 draft 开始，不会被正式 cycle 选中。"""
         PS.run_daily(topn=5, run_date=DAY)
         self.upgrade()
         PS.run_daily(topn=5, run_date=DAY)
         rows = self.runs()
-        self.assertEqual(len(rows), 2)
-        self.assertEqual(sorted(row["strategy_version"] for row in rows), [1, 2])
-        keys = {row["provenance_key"] for row in rows}
-        self.assertEqual(len(keys), 2, "不同 immutable version 必须有不同的 run identity")
-        # 幂等 retry：同一份证据重跑仍是 2 行，不是 3 行（行 id 会变，内容不变）。
+        self.assertEqual(len(rows), 1)
+        self.assertEqual([row["strategy_version"] for row in rows], [1])
+        # 新版本须经过 canonical promotion 才有 cycle 资格；重试仍不会生成 v2 run。
         PS.run_daily(topn=5, run_date=DAY)
         rows = self.runs()
-        self.assertEqual(len(rows), 2)
-        self.assertEqual(sorted(row["strategy_version"] for row in rows), [1, 2])
-        # picks 跟着各自的 run，不串味；每个 run 都必须有 picks
+        self.assertEqual(len(rows), 1)
+        self.assertEqual([row["strategy_version"] for row in rows], [1])
+        # 历史 picks 仍然属于原版本的 run。
         with self._research() as conn:
             by_run = {row["run_id"]: row["strategy_id"] for row in conn.execute(
                 "SELECT run_id, strategy_id FROM paper_selection_picks "
@@ -306,7 +305,7 @@ class SelectionProvenanceTests(_IsolatedStudy):
             SR.bind_cycle_versions(conn, 7, ("tq_breakout",))
             conn.commit()
             pinned = SR.cycle_stamp_for_account(conn, "tq_breakout", cycle_id=7)
-            SR.archive_definition(conn, "tq_breakout", reason="sp-06", actor="sp-matrix")
+            archive_state(conn, "tq_breakout", reason="sp-06", actor="sp-matrix")
             conn.commit()
             status = SR.get("tq_breakout", conn=conn).status
         self.assertEqual(status, "archived")
@@ -410,13 +409,13 @@ class SelectionProvenanceTests(_IsolatedStudy):
         before = self.run_row()
         with self._registry() as conn:
             latest = SR.get("tq_breakout", conn=conn)
-            SR.transition(conn, "tq_breakout", "paused", expected_status=latest.status,
+            seed_legacy_state(conn, "tq_breakout", "paused", expected_status=latest.status,
                           reason="sp-18", actor="sp-matrix")
             conn.commit()
             paused = self.run_row()
             self.assertEqual(paused["strategy_version"], before["strategy_version"])
             self.assertEqual(paused["strategy_checksum"], before["strategy_checksum"])
-            SR.archive_definition(conn, "tq_breakout", reason="sp-18", actor="sp-matrix")
+            archive_state(conn, "tq_breakout", reason="sp-18", actor="sp-matrix")
             conn.commit()
         archived = self.run_row()
         self.assertEqual(archived["strategy_version"], before["strategy_version"])

@@ -6,6 +6,7 @@ import unittest
 from api_settings import _planned_end
 import runtime_settings as settings
 import strategy_registry as registry
+from test_strategy_lifecycle_fixtures import archive_state, seed_legacy_state
 
 
 def _rule():
@@ -71,12 +72,12 @@ class RuntimeSettingsTests(unittest.TestCase):
         created = registry.create_user_definition(
             self.conn, "custom_settings_probe", "Custom settings", dsl_ast=_rule(), actor="test",
         )
-        registry.transition(self.conn, created.id, "validated", actor="test")
-        registry.transition(self.conn, created.id, "active", actor="test")
+        seed_legacy_state(self.conn, created.id, "validated", actor="test")
+        seed_legacy_state(self.conn, created.id, "active", actor="test")
         updated = settings.update(self.conn, {"enabled_strategies": [created.id]}, actor="test")
         self.assertEqual(updated["simulation"]["enabled_strategies"], [created.id])
         self.assertIn(created.id, updated["strategy"]["strategy_overrides"])
-        registry.archive_definition(self.conn, created.id, actor="test")
+        archive_state(self.conn, created.id, actor="test")
         with self.assertRaisesRegex(ValueError, "未知策略"):
             settings.validate({"enabled_strategies": [created.id]}, conn=self.conn)
 

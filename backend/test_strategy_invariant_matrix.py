@@ -38,6 +38,7 @@ import portfolio_coordinator as PCO
 import runtime_settings as RSET
 import strategy_dsl_schema as DSL
 import strategy_registry as SR
+import strategy_lifecycle as SL
 
 RULE = {
     "op": "and",
@@ -181,19 +182,18 @@ class DslBoundaryMatrixTests(unittest.TestCase):
 
 
 class LifecycleMatrixTests(_RegistryFixture):
-    """测试组 F：以 Registry 的迁移图为唯一来源，跑满 6×6 矩阵。"""
+    """测试组 F：以 canonical lifecycle owner 跑完整迁移矩阵。"""
 
     @staticmethod
     def _graph():
-        # 生产图是唯一权威：测试只读它，从不自己写一份生命周期表。
-        return SR._TRANSITIONS
+        return SL.TRANSITION_TABLE
 
     @classmethod
     def _statuses(cls):
         return tuple(SR.LIFECYCLE_STATUSES)
 
     def _walk_to(self, strategy_id, target):
-        """BFS 找路径，并**通过生产 transition** 走到目标状态。"""
+        """BFS 找路径，并通过 lifecycle owner 走到目标状态。"""
         if target == "draft":
             return  # 新建即 draft
         graph = self._graph()
@@ -202,17 +202,44 @@ class LifecycleMatrixTests(_RegistryFixture):
         while queue:
             node, path = queue.pop(0)
             for nxt in sorted(graph.get(node, ())):
+                # Resume is stateful: paused -> paper/production_sim is valid
+                # only after a pause event from that same formal state. It is
+                # not a context-free BFS edge.
+                if node == "paused" and nxt in SL.RESUME_TRANSITION_TARGETS:
+                    continue
                 if nxt in seen:
                     continue
                 trail = path + [nxt]
                 if nxt == target:
+                    current = "draft"
                     for step in trail:
-                        SR.transition(self.conn, strategy_id, step, actor="pr54")
-                        self.conn.commit()
+                        self._transition(strategy_id, current, step)
+                        current = step
                     return
                 seen.add(nxt)
                 queue.append((nxt, trail))
         raise AssertionError(f"{target} 在 Registry 图里从 draft 不可达")
+
+    def _transition(self, strategy_id, source, target):
+        version = SR.get_version(strategy_id, conn=self.conn)
+        resume = source == "paused" and target in SL.RESUME_TRANSITION_TARGETS
+        safety = target in SL.SAFETY_TRANSITION_TARGETS
+        decision = None if safety or resume else {
+            "eligible": True, "strategy_id": strategy_id,
+            "strategy_version": version.version, "strategy_checksum": version.checksum,
+            "from_state": source, "target_state": target,
+            "decision_fingerprint": "test-policy-decision", "policy_version": "test",
+        }
+        SL.transition(self.conn, strategy_id=strategy_id,
+            strategy_version=version.version, strategy_checksum=version.checksum,
+            expected_state=source, target_state=target, actor_type="human",
+            actor_id="matrix-test", transition_kind=("resume" if resume else
+                "safety" if safety else "promotion"),
+            promotion_decision=decision,
+            reason_code="matrix-resume" if resume else "matrix-safety" if safety else "",
+            reason_text="Matrix resume edge" if resume else
+                "Matrix safety edge" if safety else "")
+        self.conn.commit()
 
     def test_graph_is_well_formed(self):
         graph = self._graph()
@@ -229,14 +256,18 @@ class LifecycleMatrixTests(_RegistryFixture):
             for target in sorted(targets):
                 with self.subTest(source=source, target=target):
                     strategy_id = self._create(f"m_{source}_{target}")
-                    self._walk_to(strategy_id, source)
-                    spec = SR.transition(self.conn, strategy_id, target,
-                                         expected_status=source, actor="pr54")
-                    self.conn.commit()
+                    if source == "paused" and target in SL.RESUME_TRANSITION_TARGETS:
+                        # Build the exact origin, then record pause and resume.
+                        self._walk_to(strategy_id, target)
+                        self._transition(strategy_id, target, "paused")
+                    else:
+                        self._walk_to(strategy_id, source)
+                    self._transition(strategy_id, source, target)
+                    spec = SR.get(strategy_id, conn=self.conn)
                     self.assertEqual(target, spec.status)
                     events = SR.lifecycle_events(self.conn, strategy_id)
                     self.assertEqual((source, target),
-                                     (events[-1]["from_status"], events[-1]["to_status"]))
+                                     (events[-1]["from_state"], events[-1]["to_state"]))
 
     def test_every_illegal_edge_is_rejected(self):
         graph = self._graph()
@@ -248,18 +279,29 @@ class LifecycleMatrixTests(_RegistryFixture):
                     strategy_id = self._create(f"x_{source}_{target}")
                     self._walk_to(strategy_id, source)
                     before = SR.get(strategy_id, conn=self.conn).status
-                    with self.assertRaises(ValueError):
-                        SR.transition(self.conn, strategy_id, target, actor="pr54")
+                    with self.assertRaises(SL.LifecycleError):
+                        self._transition(strategy_id, source, target)
                     self.conn.rollback()
                     self.assertEqual(before, SR.get(strategy_id, conn=self.conn).status)
 
-    def test_supports_new_cycle_is_true_only_for_active(self):
+    def test_formal_cycle_is_available_only_for_paper_states(self):
         strategy_id = self._create("cycle_flag")
-        self._walk_to(strategy_id, "active")
+        self._walk_to(strategy_id, "paper")
         self.assertTrue(SR.get(strategy_id, conn=self.conn).supports_new_cycle)
-        SR.transition(self.conn, strategy_id, "paused", actor="pr54")
-        self.conn.commit()
+        self._transition(strategy_id, "paper", "paused")
         self.assertFalse(SR.get(strategy_id, conn=self.conn).supports_new_cycle)
+
+    def test_pausing_research_state_cannot_be_used_to_resume_to_paper(self):
+        strategy_id = self._create("resume_requires_formal_origin")
+        self._walk_to(strategy_id, "validated")
+        self._transition(strategy_id, "validated", "paused")
+        version = SR.get_version(strategy_id, conn=self.conn)
+        with self.assertRaisesRegex(SL.LifecycleError, "paused_resume_source_unavailable"):
+            SL.transition(self.conn, strategy_id=strategy_id,
+                strategy_version=version.version, strategy_checksum=version.checksum,
+                expected_state="paused", target_state="paper", actor_type="human",
+                actor_id="matrix-test", transition_kind="resume",
+                reason_code="resume", reason_text="Must not bypass formal promotion evidence.")
 
 
 class ImmutableVersionTimelineTests(_RegistryFixture):
@@ -315,15 +357,18 @@ class ImmutableVersionTimelineTests(_RegistryFixture):
         SR.save_definition(self.conn, strategy_id, {"description": "second"},
                            expected_version=v1.version, actor="pr54")
         self.conn.commit()
-        for status in ("validated", "archived"):
-            SR.transition(self.conn, strategy_id, status, actor="pr54")
-            self.conn.commit()
+        version = SR.get_version(strategy_id, conn=self.conn)
+        SL.transition(self.conn, strategy_id=strategy_id, strategy_version=version.version,
+            strategy_checksum=version.checksum, expected_state="draft", target_state="archived",
+            actor_type="human", actor_id="timeline-test", transition_kind="safety",
+            reason_code="test-archive", reason_text="Archive fixture strategy")
+        self.conn.commit()
         versions = SR.list_versions(strategy_id, conn=self.conn)
         self.assertEqual([1, 2], [version.version for version in versions])
         self.assertEqual(v1.checksum, versions[0].checksum)
         self.assertEqual(v1.definition, versions[0].definition)
         events = SR.lifecycle_events(self.conn, strategy_id)
-        self.assertEqual("archived", events[-1]["to_status"])
+        self.assertEqual("archived", events[-1]["to_state"])
 
 
 class SystemRiskNonOverrideTests(unittest.TestCase):

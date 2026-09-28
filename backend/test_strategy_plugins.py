@@ -8,6 +8,7 @@ from unittest import mock
 import pandas as pd
 
 import paper_trading as P
+import strategy_lifecycle as SL
 import strategy_plugins as plugins
 import strategy_registry as SR
 
@@ -143,17 +144,18 @@ class StrategyPluginContractTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "candidate output missing key"):
             plugins.select_candidates(plugin.strategy_id, pd.DataFrame({"factor_a": [1.0]}))
 
-    def test_lifecycle_transition_uses_registry_entrypoint(self):
+    def test_builtin_plugin_does_not_own_lifecycle_transition(self):
         conn = sqlite3.connect(":memory:")
         self.addCleanup(conn.close)
         SR.ensure_schema(conn)
         plugin = plugins.get_plugin("tq_breakout")
-        paused = plugin.transition(conn, "paused", reason="plugin contract test", actor="test")
-        self.assertEqual(paused.status, "paused")
-        self.assertFalse(paused.supports_new_cycle)
-        active = plugin.transition(conn, "active", reason="plugin contract test", actor="test")
-        self.assertEqual(active.status, "active")
-        self.assertTrue(active.supports_new_cycle)
+        self.assertFalse(hasattr(plugin, "transition"))
+        registered = SR.get(plugin.strategy_id, conn=conn)
+        self.assertEqual(registered.status, "paper")
+        self.assertTrue(registered.supports_new_cycle)
+        lifecycle = SL.get_state(conn, registered.id, registered.current_version,
+                                 checksum=registered.current_checksum)
+        self.assertEqual("paper", lifecycle["state"])
 
     def test_native_builtin_parameter_validation_rejects_undeclared_adjustments(self):
         conn = sqlite3.connect(":memory:")

@@ -11,8 +11,8 @@
 不负责：HTTP 状态码、查询参数校验、请求体形状（``strategy_api_models`` 与
 ``api_strategies`` 的职责）。
 
-边界原则：业务规则仍然只住在既有 domain 模块里。本模块**不**复制 id 模式、
-DSL 校验、生命周期合法边、非对称风险闸门，也**不**重新计算任何风险/资金画像；
+边界原则：业务规则仍然只住在 domain owner 里。本模块**不**复制 id 模式、
+DSL 校验、生命周期合法边、晋级证据规则、非对称风险闸门，也**不**重新计算任何风险/资金画像；
 它只决定"先调谁、失败算哪一类错误"。
 
 风险放大唯一入口（PR-33）：``update_strategy`` 不把 ``risk_evidence`` /
@@ -29,6 +29,8 @@ import paper_trading as P
 import strategy_api_models as Models
 import strategy_dsl_schema as DSL
 import strategy_registry as SR
+import strategy_lifecycle as SL
+import strategy_promotion as SPR
 import strategy_runtime as SRT
 
 
@@ -93,6 +95,15 @@ _RUNTIME_TOKENS = ("runtime is not ready",)
 _LIFECYCLE_TOKENS = (
     "status changed",
     "invalid lifecycle transition",
+    "strategy_lifecycle_conflict",
+    "strategy_version_changed",
+    "strategy_checksum_mismatch",
+    "promotion_",
+    "r29_",
+    "r30_",
+    "ai_cannot_apply_transition",
+    "quarantine_release_evidence_missing",
+    "lifecycle_",
     "strategy cannot be archived",
     "invalid strategy status",
     "evolution is disabled",
@@ -162,6 +173,7 @@ def item_payload(spec: SR.StrategySpec) -> dict:
         "origin": spec.origin,
         "status": spec.status,
         "supports_new_cycle": bool(spec.supports_new_cycle),
+        "formal_cycle_allowed": bool(spec.supports_new_cycle),
         "current_version": spec.current_version,
         "current_checksum": spec.current_checksum,
         "description": spec.description,
@@ -205,6 +217,9 @@ def runtime_payload(conn, strategy_id: str, spec: SR.StrategySpec) -> dict:
 
 def detail_payload(conn, spec: SR.StrategySpec, *, with_runtime: bool = True) -> dict:
     version = SR.get_version(spec.id, conn=conn)
+    lifecycle_state = (SL.get_state(conn, spec.id, version.version, checksum=version.checksum)
+                       if version else None)
+    lifecycle_history = SL.history(conn, spec.id, version.version if version else None)
     payload = {
         **item_payload(spec),
         "definition": dict(version.definition) if version else None,
@@ -214,11 +229,14 @@ def detail_payload(conn, spec: SR.StrategySpec, *, with_runtime: bool = True) ->
         "created_by": version.created_by if version else None,
         "change_note": version.change_note if version else None,
         "supports_new_cycle": bool(spec.supports_new_cycle),
+        "formal_cycle_allowed": bool(spec.supports_new_cycle),
         "lifecycle": {
-            "status": spec.status,
+            "state": lifecycle_state.get("state") if lifecycle_state else None,
+            "status": lifecycle_state.get("state") if lifecycle_state else None,
             "supports_new_cycle": bool(spec.supports_new_cycle),
+            "formal_cycle_allowed": bool(spec.supports_new_cycle),
         },
-        "events": [dict(row) for row in SR.lifecycle_events(conn, spec.id)[-20:]],
+        "events": [dict(row) for row in lifecycle_history[-20:]],
     }
     if with_runtime:
         payload["runtime"] = runtime_payload(conn, spec.id, spec)
@@ -286,7 +304,7 @@ def list_events(strategy_id: str) -> list[dict]:
     def _work(conn):
         if SR.get(strategy_id, conn=conn) is None:
             raise StrategyNotFound("unknown strategy id")
-        return [dict(row) for row in SR.lifecycle_events(conn, strategy_id)]
+        return [dict(row) for row in SL.history(conn, strategy_id)]
     return _with_connection(_work)
 
 
@@ -341,27 +359,156 @@ def update_strategy(strategy_id: str, request: Models.StrategyUpdateRequest) -> 
     return _with_connection(_work)
 
 
-def transition(strategy_id: str, request: Models.StrategyTransitionRequest) -> dict:
-    to_status = str(request.to_status or "").strip()
-    if not to_status:
-        raise InvalidStrategyDefinition("to_status is required")
+def _open_evidence_connection():
+    """Open the separate append-only adaptive evidence store for exact reads."""
+    return P._evolution_conn()
 
+
+def lifecycle_read_model(strategy_id: str) -> dict:
     def _work(conn):
-        # validated 与 active 同样是"可进新周期"的入口门槛：进入 validated
-        # 前先跑一遍生产编译闸门，不就绪就拒绝。
-        if to_status == "validated":
-            readiness = SR.runtime_readiness(conn, strategy_id)
-            if not readiness.get("runtime_ready"):
-                raise StrategyRuntimeNotReady(
-                    "strategy runtime is not ready: " + "; ".join(readiness.get("errors") or [])
-                )
-        spec = SR.transition(
-            conn, strategy_id, to_status, reason=str(request.reason or ""),
-            actor=str(request.actor or "web-ui"),
-            expected_status=request.expected_status,
-        )
-        return detail_payload(conn, spec)
+        spec = SR.get(strategy_id, conn=conn)
+        if spec is None:
+            raise StrategyNotFound("unknown strategy id")
+        version = SR.get_version(spec.id, conn=conn)
+        if version is None:
+            raise StrategyNotFound("strategy has no immutable version")
+        state = SL.get_state(conn, spec.id, version.version, checksum=version.checksum)
+        if state is None:
+            raise StrategyConflict("lifecycle_state_not_found")
+        evidence_conn = None
+        decisions = {}
+        try:
+            evidence_conn = _open_evidence_connection()
+        except Exception:
+            evidence_conn = None
+        try:
+            legal = sorted(SL.TRANSITION_TABLE[state["state"]])
+            eligible, blocked = [], {}
+            for target in legal:
+                if target in SL.SAFETY_TRANSITION_TARGETS:
+                    eligible.append(target)
+                    continue
+                if state["state"] == "paused" and target in SL.RESUME_TRANSITION_TARGETS:
+                    try:
+                        resume_target, _ = SL._resume_policy(
+                            conn, spec.id, version.version, version.checksum)
+                    except SL.LifecycleError:
+                        resume_target = None
+                    if state["state"] == "paused" and target == resume_target:
+                        eligible.append(target)
+                    else:
+                        blocked[target] = {"eligible": False,
+                            "blocking_reasons": ["resume_source_or_policy_unavailable"],
+                            "required_evidence": ["human_resume_reason"]}
+                    continue
+                decision = SPR.evaluate(conn, strategy_id=spec.id,
+                    strategy_version=version.version, strategy_checksum=version.checksum,
+                    from_state=state["state"], target_state=target,
+                    evidence_bundle=None, evidence_conn=evidence_conn)
+                decisions[target] = decision.projection()
+                if decision.eligible:
+                    eligible.append(target)
+                else:
+                    blocked[target] = decision.projection()
+            proposals = SPR.list_proposals(conn, spec.id, version=version.version, limit=50)
+            return {"strategy_id": spec.id, "state": state["state"],
+                "version": version.version, "checksum": version.checksum,
+                "state_history": SL.history(conn, spec.id),
+                "legal_transitions": legal, "eligible_transitions": eligible,
+                "safety_transitions": sorted((set(legal) & SL.SAFETY_TRANSITION_TARGETS)
+                    | (set(eligible) & SL.RESUME_TRANSITION_TARGETS
+                       if state["state"] == "paused" else set())),
+                "promotion_transitions": sorted(set(legal) - SL.SAFETY_TRANSITION_TARGETS
+                    - (SL.RESUME_TRANSITION_TARGETS if state["state"] == "paused" else set())),
+                "blocked_transitions": blocked,
+                "blocking_reasons": sorted({reason for row in blocked.values()
+                    for reason in row.get("blocking_reasons", [])}),
+                "required_evidence": {target: item.get("required_evidence", [])
+                    for target, item in blocked.items()},
+                "evidence": {target: item for target, item in decisions.items()},
+                "proposals": proposals,
+                "formal_cycle_allowed": SL.allows_formal_cycle(state["state"])}
+        finally:
+            if evidence_conn is not None:
+                evidence_conn.close()
     return _with_connection(_work)
+
+
+def create_promotion_proposal(strategy_id: str, request: Models.PromotionProposalRequest) -> dict:
+    def _work(conn):
+        spec = SR.get(strategy_id, conn=conn)
+        if spec is None:
+            raise StrategyNotFound("unknown strategy id")
+        version = SR.get_version(strategy_id, request.strategy_version, checksum=request.strategy_checksum, conn=conn)
+        if version is None:
+            raise StrategyNotFound("strategy version not found")
+        try:
+            evidence_conn = _open_evidence_connection()
+        except Exception:
+            evidence_conn = None
+        try:
+            return SPR.create_proposal(conn, strategy_id=strategy_id,
+                strategy_version=request.strategy_version, strategy_checksum=request.strategy_checksum,
+                from_state=request.expected_state, target_state=request.target_state,
+                evidence_bundle=request.evidence_bundle, proposer_type=request.proposer_type,
+                proposer_id=request.proposer_id, rationale=request.rationale,
+                evidence_conn=evidence_conn)
+        finally:
+            if evidence_conn is not None:
+                evidence_conn.close()
+    return _with_connection(_work, immediate=True)
+
+
+def list_promotion_proposals(strategy_id: str, *, version: int | None = None, limit: int = 50) -> list[dict]:
+    def _work(conn):
+        if SR.get(strategy_id, conn=conn) is None:
+            raise StrategyNotFound("unknown strategy id")
+        return SPR.list_proposals(conn, strategy_id, version=version, limit=limit)
+    return _with_connection(_work)
+
+
+def transition(strategy_id: str, request: Models.StrategyTransitionRequest) -> dict:
+    def _work(conn):
+        spec = SR.get(strategy_id, conn=conn)
+        if spec is None:
+            raise StrategyNotFound("unknown strategy id")
+        version = SR.get_version(strategy_id, request.strategy_version,
+                                 checksum=request.strategy_checksum, conn=conn)
+        if version is None:
+            raise StrategyNotFound("strategy version not found")
+        is_resume = (request.expected_state == "paused"
+                     and request.target_state in SL.RESUME_TRANSITION_TARGETS)
+        if request.target_state in SL.SAFETY_TRANSITION_TARGETS or is_resume:
+            transitioned = SL.transition(conn, strategy_id=strategy_id,
+                strategy_version=request.strategy_version, strategy_checksum=request.strategy_checksum,
+                expected_state=request.expected_state, target_state=request.target_state,
+                actor_type=request.actor_type, actor_id=request.actor_id,
+                reason_code=request.reason_code, reason_text=request.reason,
+                transition_kind="resume" if is_resume else "safety",
+                evidence={"source": "strategy_transition_api"})
+            return {**detail_payload(conn, SR.get(strategy_id, conn=conn)),
+                    "transitioned_version": {"version": request.strategy_version,
+                        "checksum": request.strategy_checksum,
+                        "state": transitioned["state"]}}
+        if not request.proposal_fingerprint:
+            raise InvalidStrategyDefinition("promotion_proposal_fingerprint_required")
+        proposal = SPR.get_proposal(conn, request.proposal_fingerprint)
+        if proposal is None:
+            raise StrategyNotFound("promotion_proposal_not_found")
+        if (proposal["strategy_id"] != strategy_id
+                or proposal["strategy_version"] != request.strategy_version
+                or proposal["strategy_checksum"] != request.strategy_checksum
+                or proposal["from_state"] != request.expected_state
+                or proposal["target_state"] != request.target_state):
+            raise StrategyVersionConflict("promotion_proposal_identity_mismatch")
+        evidence_conn = _open_evidence_connection()
+        try:
+            applied = SPR.apply_proposal(conn, evidence_conn, proposal,
+                actor_type=request.actor_type, actor_id=request.actor_id)
+        finally:
+            evidence_conn.close()
+        return {**detail_payload(conn, SR.get(strategy_id, conn=conn)), **applied}
+    return _with_connection(_work, immediate=True)
 
 
 def clone_strategy(strategy_id: str, request: Models.StrategyCloneRequest) -> dict:

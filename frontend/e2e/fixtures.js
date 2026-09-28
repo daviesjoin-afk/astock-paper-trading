@@ -214,20 +214,6 @@ export function cardAction(page, strategyId, testid) {
   return page.getByTestId(`strategy-card-${strategyId}`).getByTestId(testid);
 }
 
-/** 从 draft 推进到 active（全部 UI 点击 + 真实 HTTP + 真实确认框）。 */
-export async function promoteToActive(page, strategyId, { from = "draft" } = {}) {
-  const transition = /\/api\/strategies\/[^/]+\/transition$/;
-  if (from === "draft") {
-    const validated = await clickAndApprove(page, cardAction(page, strategyId, "strategy-transition-validated"), transition);
-    expect(validated.ok(), "draft→validated 必须 2xx").toBeTruthy();
-    await expect(page.getByTestId(`strategy-card-${strategyId}`)).toHaveAttribute("data-status", "validated");
-  }
-  const activated = await clickAndApprove(page, cardAction(page, strategyId, "strategy-transition-active"), transition);
-  expect(activated.ok(), "validated→active 必须 2xx").toBeTruthy();
-  await expect(page.getByTestId(`strategy-card-${strategyId}`)).toHaveAttribute("data-status", "active");
-  return strategyId;
-}
-
 /** 打开设置中心的"模拟盘与资金"子页（下一周期策略集合所在处）。 */
 export async function openSettings(page) {
   await gotoPage(page, "settings-nav");

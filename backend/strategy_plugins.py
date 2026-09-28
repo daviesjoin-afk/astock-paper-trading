@@ -69,7 +69,7 @@ class StrategyPlugin:
             "strategy_id": spec.id,
             "name": spec.name,
             "status": spec.status,
-            "enabled": bool(spec.status == "active" and spec.supports_new_cycle),
+            "enabled": bool(spec.supports_new_cycle),
             "origin": spec.origin,
             "implementation_key": spec.implementation_key,
             "selector_id": self.selector_id,
@@ -229,23 +229,6 @@ class StrategyPlugin:
             change_note=change_note,
             challenger_win=challenger_win,
         )
-
-    def transition(
-        self,
-        conn,
-        to_status: str,
-        *,
-        reason: str = "",
-        actor: str = "strategy_plugin",
-    ):
-        return SR.transition(
-            conn,
-            self.strategy_id,
-            to_status,
-            reason=reason,
-            actor=actor,
-        )
-
 
 _PLUGINS: dict[str, StrategyPlugin] = {}
 _PLUGINS_BY_SELECTOR: dict[str, StrategyPlugin] = {}

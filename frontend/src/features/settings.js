@@ -100,12 +100,12 @@ export function renderSettings(data){
     var durationOptions=SETTINGS_DURATION_OPTIONS.map(function(option){return '<option value="'+option+'"'+(Number(sim.cycle_duration_days)===option?' selected':'')+'>'+settingsDurationLabel(option)+'</option>';}).join('');
     var strategyChecks=(sim.enabled_strategies||[]);
     var strategyCheckbox=function(item){
-      var checkable=item.status==='active'&&item.supports_new_cycle;
+      var checkable=!!item.formal_cycle_allowed;
       var checked=strategyChecks.indexOf(item.id)>=0;
       var badge=wbStatusBadge(item.status);
       var extra='';
       if(item.status==='paused') extra='<button type="button" class="settings-strategy-link" onclick="activatePage(\'p-strategies\')">去策略工坊恢复</button>';
-      else if(!checkable&&item.status!=='active') extra='<small class="setting-help">'+adaptiveEsc((STRATEGY_STATUS_LABELS[item.status]||item.status)+' · 不可勾选')+'</small>';
+      else if(!checkable) extra='<small class="setting-help">'+adaptiveEsc((STRATEGY_STATUS_LABELS[item.status]||item.status)+' · 不可勾选')+'</small>';
       return '<label data-testid="settings-strategy-'+adaptiveEsc(item.id)+'" class="settings-strategy-item'+(checkable?'':' settings-strategy-item-disabled')+'">'
         +'<input data-testid="settings-strategy-checkbox-'+adaptiveEsc(item.id)+'" type="checkbox" class="setting-strategy-enabled" value="'+adaptiveEsc(item.id)+'"'+settingsChecked(checked)+(checkable?'':' disabled')+'>'
         +'<span><b>'+adaptiveEsc(item.name||item.id)+'</b>'
@@ -280,7 +280,7 @@ export function settingsStrategyItems(){
     return window._registryItems.filter(function(item){return item.status!=='archived';});
   }
   return Object.keys(SETTINGS_STRATEGY_NAMES).map(function(id){
-    return {id:id,name:SETTINGS_STRATEGY_NAMES[id],origin:'builtin',status:'active',supports_new_cycle:true,current_version:1,metadata:{},description:''};
+    return {id:id,name:SETTINGS_STRATEGY_NAMES[id],origin:'builtin',status:'paper',formal_cycle_allowed:true,current_version:1,metadata:{},description:''};
   });
 }
 

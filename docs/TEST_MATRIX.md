@@ -44,7 +44,8 @@
 | 版本不可变（编辑追加新版本，旧版本与 checksum 不变） | `strategy_registry.save_definition` | `test_strategy_version_immutability.py`、`test_strategy_versioning.py` | ✅ |
 | 乐观并发（`expected_version` 不匹配即冲突，不静默覆盖） | `strategy_registry` / `strategy_service` | `test_strategy_version_immutability.py`、`test_api_strategies.py` | ✅ |
 | 运行时就绪（DSL / 指纹 / 风险画像 / 执行画像四项编译） | `strategy_registry.runtime_readiness` | `test_strategy_crud.py`、`test_api_strategies.py::test_transition_validated_requires_runtime_ready` | ✅ |
-| 生命周期合法边与 `supports_new_cycle` 派生 | `strategy_registry._TRANSITIONS` | `test_strategy_registry_lifecycle.py`、`test_strategy_invariant_matrix.py` | ✅ |
+| exact-version 生命周期、CAS、history 与正式周期资格 | `strategy_lifecycle` | `test_strategy_lifecycle_promotion.py`（R31-01…93）、`test_strategy_registry_lifecycle.py` | ✅ |
+| R29/R30 exact evidence promotion 与 proposal apply | `strategy_promotion` | `test_strategy_lifecycle_promotion.py`（R31-28…58） | ✅ |
 | 草稿硬删除边界（从未离开 draft ∧ 无历史引用） | `strategy_registry.hard_delete_unused_draft` | `test_strategy_hard_delete_lifecycle.py`、`test_strategy_crud.py` | ✅ |
 | 归档而非删除（archived 保留版本与审计、可回放） | `strategy_registry`、`paper_archive_projection` | `test_strategy_archive_replay.py` | ✅ |
 | Strategy API 契约（路由/请求体/状态码/错误提示） | `api_strategies.py`、`strategy_api_models.py` | `test_strategy_api_contract.py`、`test_api_strategies.py` | ✅ |

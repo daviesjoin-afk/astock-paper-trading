@@ -20,6 +20,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import paper_trading as PT
 import strategy_runtime as SRT
+from test_strategy_lifecycle_fixtures import seed_legacy_state
 
 
 def _breakout_rule():
@@ -47,8 +48,8 @@ class OrderIntentContractTests(unittest.TestCase):
         strategy = SR.create_user_definition(
             self.conn, strategy_id, "User alpha", dsl_ast=_breakout_rule(), actor="test",
         )
-        SR.transition(self.conn, strategy.id, "validated", actor="test")
-        SR.transition(self.conn, strategy.id, "active", actor="test")
+        seed_legacy_state(self.conn, strategy.id, "validated", actor="test")
+        seed_legacy_state(self.conn, strategy.id, "active", actor="test")
         # 把策略版本绑定到同名账户（信号表触发器要求有效版本戳）。
         head = self.conn.execute(
             "SELECT current_version,current_checksum FROM paper_strategy_version_heads"

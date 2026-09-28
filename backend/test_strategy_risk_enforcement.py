@@ -25,7 +25,8 @@ sys.modules.setdefault("requests", mock.MagicMock())
 
 import execution_profiles as EPF  # noqa: E402
 import paper_trading as PT  # noqa: E402
-import strategy_registry as registry  # noqa: E402
+import strategy_registry as registry
+from test_strategy_lifecycle_fixtures import seed_legacy_state  # noqa: E402
 import strategy_risk_enforcement as SRE  # noqa: E402
 import strategy_runtime as runtime  # noqa: E402
 from strategy_risk_profiles import _SYSTEM_HARD_RULE_KEYS  # noqa: E402
@@ -70,8 +71,8 @@ class _RegistryCase(unittest.TestCase):
                 self.conn, f"acc_{archetype}", f"{archetype} strategy",
                 dsl_ast=_VALID_DSL, metadata=_METADATA[archetype], actor="test",
             )
-            registry.transition(self.conn, strategy.id, "validated", actor="test")
-            registry.transition(self.conn, strategy.id, "active", actor="test")
+            seed_legacy_state(self.conn, strategy.id, "validated", actor="test")
+            seed_legacy_state(self.conn, strategy.id, "active", actor="test")
         runtime.clear_cache()
 
     def tearDown(self):

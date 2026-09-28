@@ -9,6 +9,8 @@ from unittest import mock
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import strategy_registry as registry
+import strategy_lifecycle as lifecycle
+import strategy_promotion as promotion
 import paper_trading as paper
 
 
@@ -23,6 +25,26 @@ class StrategyDefinitionLifecycleTests(unittest.TestCase):
         self.conn.close()
         self.directory.cleanup()
 
+    def _transition(self, strategy_id, target, *, kind=None, reason="test intent"):
+        version = registry.get_version(strategy_id, conn=self.conn)
+        current = lifecycle.get_state(self.conn, strategy_id, version.version,
+                                      checksum=version.checksum)["state"]
+        if kind == "safety" or target in lifecycle.SAFETY_TRANSITION_TARGETS:
+            return lifecycle.transition(self.conn, strategy_id=strategy_id,
+                strategy_version=version.version, strategy_checksum=version.checksum,
+                expected_state=current, target_state=target, actor_type="human",
+                actor_id="test", transition_kind="safety", reason_code="test_intent",
+                reason_text=reason)
+        decision = promotion.evaluate(self.conn, strategy_id=strategy_id,
+            strategy_version=version.version, strategy_checksum=version.checksum,
+            from_state=current, target_state=target)
+        if not decision.eligible:
+            self.fail(f"policy unexpectedly blocked {current} -> {target}: {decision.blocking_reasons}")
+        return lifecycle.transition(self.conn, strategy_id=strategy_id,
+            strategy_version=version.version, strategy_checksum=version.checksum,
+            expected_state=current, target_state=target, actor_type="human", actor_id="test",
+            promotion_decision=decision.projection())
+
     def test_builtin_migration_is_idempotent_and_preserves_state(self):
         rows = registry.list_definitions(conn=self.conn)
         self.assertEqual([row.id for row in rows], [
@@ -30,10 +52,8 @@ class StrategyDefinitionLifecycleTests(unittest.TestCase):
             "reported_profit_breakout", "main_force_top10",
         ])
         self.assertTrue(all(row.origin == "builtin" for row in rows))
-        self.conn.execute(
-            "UPDATE strategy_definitions SET lifecycle_status='paused',supports_new_cycle=0 "
-            "WHERE id='tq_breakout'"
-        )
+        self._transition("tq_breakout", "paused", kind="safety")
+        self.conn.commit()
         registry.ensure_schema(self.conn)
         self.assertEqual(registry.get("tq_breakout", conn=self.conn).status, "paused")
 
@@ -54,9 +74,8 @@ class StrategyDefinitionLifecycleTests(unittest.TestCase):
                 '','{}',1,'2026-09-08','2026-09-08'
             )"""
         )
-        self.assertEqual(
-            registry.list_definitions(conn=self.conn)[0].current_version, None,
-        )
+        registry.ensure_schema(self.conn)
+        self.assertEqual(registry.get("legacy_strategy", conn=self.conn).status, "paper")
 
     def test_user_definition_can_be_queried_and_follows_lifecycle(self):
         created = registry.create_user_definition(
@@ -65,23 +84,24 @@ class StrategyDefinitionLifecycleTests(unittest.TestCase):
                      "right": {"op": "indicator", "name": "ma", "window": 20}},
         )
         self.assertEqual((created.origin, created.status), ("user", "draft"))
-        validated = registry.transition(
-            self.conn, created.id, "validated", expected_status="draft",
-            reason="offline checks passed", actor="unit-test",
-        )
-        active = registry.transition(
-            self.conn, created.id, "active", expected_status="validated",
-            actor="unit-test",
-        )
-        self.assertEqual(validated.status, "validated")
-        self.assertTrue(active.supports_new_cycle)
-        self.assertIn(created.id, registry.active_ids(conn=self.conn))
+        self._transition(created.id, "candidate")
+        self._transition(created.id, "research")
+        spec = registry.get(created.id, conn=self.conn)
+        self.assertEqual(spec.status, "research")
+        self.assertFalse(spec.supports_new_cycle)
+        self.assertNotIn(created.id, registry.active_ids(conn=self.conn))
         self.assertEqual(len(registry.lifecycle_events(self.conn, created.id)), 3)
 
     def test_invalid_transition_is_rejected(self):
-        registry.create_user_definition(self.conn, "user_value", "User Value")
-        with self.assertRaisesRegex(ValueError, "invalid lifecycle transition"):
-            registry.transition(self.conn, "user_value", "active")
+        registry.create_user_definition(self.conn, "user_value", "User Value", dsl_ast={
+            "op": "gt", "left": {"op": "field", "name": "close"},
+            "right": {"op": "const", "value": 1},
+        })
+        with self.assertRaisesRegex(ValueError, "invalid_lifecycle_transition"):
+            lifecycle.transition(self.conn, strategy_id="user_value", strategy_version=1,
+                strategy_checksum=registry.get_version("user_value", conn=self.conn).checksum,
+                expected_state="draft", target_state="paper", actor_type="human", actor_id="test",
+                transition_kind="safety", reason_code="test", reason_text="invalid jump")
 
     def test_catalogue_migration_does_not_rewrite_historical_ids(self):
         self.conn.execute("CREATE TABLE paper_accounts(id TEXT PRIMARY KEY, name TEXT)")
@@ -98,7 +118,7 @@ class StrategyDefinitionLifecycleTests(unittest.TestCase):
 
     def test_filters_and_archived_visibility(self):
         registry.create_user_definition(self.conn, "user_archived", "Archived")
-        registry.transition(self.conn, "user_archived", "archived")
+        self._transition("user_archived", "archived", kind="safety")
         visible = registry.list_definitions(
             conn=self.conn, origins=("user",), include_archived=False,
         )
@@ -132,9 +152,12 @@ class StrategyDefinitionLifecycleTests(unittest.TestCase):
             paper.init_db()
             conn = sqlite3.connect(paper_path)
             try:
-                registry.transition(
-                    conn, "tq_breakout", "paused", expected_status="active", actor="test",
-                )
+                version = registry.get_version("tq_breakout", conn=conn)
+                lifecycle.transition(conn, strategy_id="tq_breakout",
+                    strategy_version=version.version, strategy_checksum=version.checksum,
+                    expected_state="paper", target_state="paused", actor_type="human",
+                    actor_id="test", transition_kind="safety", reason_code="test_pause",
+                    reason_text="test pause")
                 conn.commit()
             finally:
                 conn.close()

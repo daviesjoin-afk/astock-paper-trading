@@ -49,6 +49,7 @@ import paper_trading as PT
 import runtime_settings as RSET
 import self_evolution as SE
 import strategy_registry as SR
+from test_strategy_lifecycle_fixtures import seed_legacy_state
 import strategy_runtime as SRT
 from test_production_path_golden_replay import (
     CAPITAL,
@@ -200,9 +201,9 @@ class DualClosedLoopProductionPathTests(OfflinePaperEnv, unittest.TestCase):
                 actor="dual_loop_test",
             )
             self.assertEqual(strategy.origin, "user")
-            SR.transition(p_conn, STRATEGY_ID, "validated", expected_status="draft",
+            seed_legacy_state(p_conn, STRATEGY_ID, "validated", expected_status="draft",
                           reason="dual loop validate", actor="dual_loop_test")
-            SR.transition(p_conn, STRATEGY_ID, "active", expected_status="validated",
+            seed_legacy_state(p_conn, STRATEGY_ID, "active", expected_status="validated",
                           reason="dual loop activate", actor="dual_loop_test")
 
         PT.init_db()

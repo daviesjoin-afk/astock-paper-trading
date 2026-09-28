@@ -22,6 +22,7 @@ import unittest
 
 import paper_trading as PT
 import strategy_registry as SR
+from test_strategy_lifecycle_fixtures import seed_legacy_state
 import strategy_runtime as SRT
 import test_production_path_golden_replay as G
 
@@ -52,19 +53,19 @@ class CycleLedgerOwnershipTests(G.OfflinePaperEnv, unittest.TestCase):
                 metadata={"candidate_topn": 10, "style": "trend", "hold": 8},
                 actor="pr48-test",
             )
-            SR.transition(conn, strategy_id, "validated", expected_status="draft",
+            seed_legacy_state(conn, strategy_id, "validated", expected_status="draft",
                           reason="validate", actor="pr48-test")
-            SR.transition(conn, strategy_id, "active", expected_status="validated",
+            seed_legacy_state(conn, strategy_id, "active", expected_status="validated",
                           reason="activate", actor="pr48-test")
 
     def _lifecycle_pause(self, strategy_id):
         with self._conn() as conn:
-            SR.transition(conn, strategy_id, "paused", expected_status="active",
+            seed_legacy_state(conn, strategy_id, "paused", expected_status="active",
                           reason="pr48 lifecycle pause", actor="pr48-test")
 
     def _lifecycle_resume(self, strategy_id):
         with self._conn() as conn:
-            SR.transition(conn, strategy_id, "active", expected_status="paused",
+            seed_legacy_state(conn, strategy_id, "active", expected_status="paused",
                           reason="pr48 lifecycle resume", actor="pr48-test")
 
     def _start_cycle_with(self, strategy_ids):

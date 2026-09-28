@@ -14,7 +14,7 @@ version 行，会先 ``DROP TRIGGER trg_strategy_versions_no_delete`` 再删、�
 - 触发器 ``trg_strategy_versions_no_delete`` 对 ``paper_strategy_versions`` 上的
   任何 ``DELETE`` 都 ``RAISE(ABORT)``，除非**同一事务内**存在一行一次性清除
   授权（``paper_strategy_version_purge_tokens``）且其 definition 仍是
-  ``origin='user' AND lifecycle_status='draft'``；
+  ``origin='user'`` 且 canonical lifecycle state 为 ``draft``；
 - 因此"validated 回退到 draft、但 ledger/audit 仍引用旧 checksum"的裸 DELETE
   同样被数据库拒绝——``paper_signals`` 等表对 version 没有 FK，只靠 lifecycle
   判断会漏，默认拒绝的触发器不依赖 FK；
@@ -38,6 +38,7 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import strategy_registry as registry
+from test_strategy_lifecycle_fixtures import seed_legacy_state
 
 DSL = {
     "op": "gt",
@@ -83,7 +84,7 @@ class _RegistryFixture(unittest.TestCase):
     def _promote(self, strategy_id, *statuses):
         current = registry.get(strategy_id, conn=self.conn).status
         for status in statuses:
-            registry.transition(self.conn, strategy_id, status, expected_status=current)
+            seed_legacy_state(self.conn, strategy_id, status, expected_status=current)
             current = status
         self.conn.commit()
 
@@ -287,7 +288,7 @@ class DatabaseLevelImmutabilityTests(_RegistryFixture):
         """清理前后 immutable protection 始终存在，且定义未被改动。"""
         self.assertEqual(1, self._trigger_count())
         before = self._trigger_sql()
-        self.assertIn("lifecycle_status='draft'", before)
+        self.assertIn("l.state='draft'", before)
 
         self._draft("pr50_trigger_probe")
         registry.hard_delete_unused_draft(self.conn, "pr50_trigger_probe")
@@ -353,7 +354,7 @@ class DatabaseLevelImmutabilityTests(_RegistryFixture):
         )
         self.conn.commit()
         legacy = self._trigger_sql()
-        self.assertNotIn("lifecycle_status='draft'", legacy)
+        self.assertNotIn("strategy_lifecycle_state", legacy)
         # 旧定义连 draft 的私有版本也拒绝删除——这正是修复前必须 DROP 的原因。
         with self.assertRaisesRegex(sqlite3.IntegrityError, "immutable"):
             self._delete_version_rows("pr50_legacy")
@@ -361,7 +362,7 @@ class DatabaseLevelImmutabilityTests(_RegistryFixture):
         registry.ensure_schema(self.conn)
         self.conn.commit()
 
-        self.assertIn("lifecycle_status='draft'", self._trigger_sql())
+        self.assertIn("l.state='draft'", self._trigger_sql())
         self.assertTrue(registry.hard_delete_unused_draft(self.conn, "pr50_legacy")["deleted"])
         self.assertEqual([], self._versions("pr50_legacy"))
 
@@ -439,7 +440,7 @@ class DefaultDenyTriggerTests(_RegistryFixture):
         self.assertIn(registry.VERSION_PURGE_TOKEN_TABLE, sql)
         self.assertIn("NOT EXISTS", sql)
         self.assertIn("origin='user'", sql)
-        self.assertIn("lifecycle_status='draft'", sql)
+        self.assertIn("l.state='draft'", sql)
         self.assertIn("BEFORE DELETE ON paper_strategy_versions", sql)
 
 

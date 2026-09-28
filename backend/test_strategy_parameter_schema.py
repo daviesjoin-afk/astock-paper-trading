@@ -11,6 +11,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import self_evolution as evolution
 import strategy_dsl as dsl
 import strategy_registry as registry
+from test_strategy_lifecycle_fixtures import seed_legacy_state
 import strategy_runtime as runtime
 from strategy_parameter_schema import (
     StrategyParameterAdjustmentError,
@@ -111,8 +112,8 @@ class StrategyParameterRuntimeTests(unittest.TestCase):
             self.conn, "parameterized_alpha", "Parameterized alpha",
             dsl_ast=_parameterized_rule(), actor="test",
         )
-        registry.transition(self.conn, created.id, "validated", actor="test")
-        registry.transition(self.conn, created.id, "active", actor="test")
+        seed_legacy_state(self.conn, created.id, "validated", actor="test")
+        seed_legacy_state(self.conn, created.id, "active", actor="test")
         runtime.clear_cache()
 
     def tearDown(self):

@@ -44,7 +44,9 @@ Dockerfile          应用镜像；docker-compose*.yml 本地与服务器编排
 
 ### 3. 策略域：`strategy_*.py`
 
-- **身份与版本**：`strategy_registry`（唯一权威；不可变版本 + 生命周期状态机）
+- **身份与版本**：`strategy_registry`（唯一权威；不可变版本与 current head）
+- **生命周期**：`strategy_lifecycle`（exact-version state、迁移、CAS、append-only history）
+- **晋级证据**：`strategy_promotion`（R29/R30 exact evidence policy 与 append-only proposals）
 - **应用服务**：`strategy_service`（用例、事务边界、异常翻译）、`strategy_api_models`（请求契约）
 - **DSL**：`strategy_dsl_schema`（规范/校验）、`strategy_dsl_evaluator`（求值）、
   `strategy_dsl`（**对外 facade**，保留）

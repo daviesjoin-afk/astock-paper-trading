@@ -1,10 +1,10 @@
 # -*- coding: utf-8 -*-
-"""Database-backed, immutable and versioned strategy definitions.
+"""Database-backed authority for strategy identity and immutable versions.
 
-``strategy_definitions`` owns stable identity and lifecycle state. Immutable
-definition snapshots live in ``paper_strategy_versions`` and a small head table
-selects the version used by the next cycle. Running cycles pin their own version
-so later edits cannot relabel signals, orders or audit evidence.
+Immutable snapshots live in ``paper_strategy_versions`` and a small head table
+selects the current version. Lifecycle state and history are owned separately by
+``strategy_lifecycle``. Running cycles pin their own exact version so later edits
+cannot relabel signals, orders or audit evidence.
 """
 from __future__ import annotations
 
@@ -18,20 +18,11 @@ from collections.abc import Mapping
 from dataclasses import asdict, dataclass
 
 import strategy_dsl_schema as DSL
+import strategy_lifecycle as SL
 
 
 ORIGINS = ("builtin", "user")
-LIFECYCLE_STATUSES = (
-    "draft", "validated", "active", "paused", "retiring", "archived",
-)
-_TRANSITIONS = {
-    "draft": frozenset({"validated", "archived"}),
-    "validated": frozenset({"draft", "active", "archived"}),
-    "active": frozenset({"paused", "retiring"}),
-    "paused": frozenset({"active", "retiring", "archived"}),
-    "retiring": frozenset({"archived"}),
-    "archived": frozenset(),
-}
+LIFECYCLE_STATUSES = SL.STATES  # compatibility export; transition ownership is SL.
 _ID_PATTERN = re.compile(r"^[a-z][a-z0-9_]{2,63}$")
 _BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEFAULT_DB_PATH = os.path.join(_BASE, "data_cache", "paper_trading.sqlite3")
@@ -83,15 +74,15 @@ class StrategyVersion:
 
 
 BUILTIN_STRATEGIES = (
-    StrategySpec("tq_breakout", "短线日内做T", "active", True,
+    StrategySpec("tq_breakout", "短线日内做T", "paper", True,
                  implementation_key="tq_breakout"),
-    StrategySpec("trend_pullback", "趋势波段优选", "active", True,
+    StrategySpec("trend_pullback", "趋势波段优选", "paper", True,
                  implementation_key="trend_pullback"),
-    StrategySpec("sector_rotation", "板块轮动先锋", "active", True,
+    StrategySpec("sector_rotation", "板块轮动先锋", "paper", True,
                  implementation_key="sector_rotation"),
-    StrategySpec("reported_profit_breakout", "三日策略", "active", True,
+    StrategySpec("reported_profit_breakout", "三日策略", "paper", True,
                  implementation_key="reported_profit_breakout"),
-    StrategySpec("main_force_top10", "超强主力股", "active", True,
+    StrategySpec("main_force_top10", "超强主力股", "paper", True,
                  implementation_key="main_force_top10"),
 )
 
@@ -163,8 +154,8 @@ def _add_column(conn, table, name, definition):
 #     draft→validated→draft 的回退不算"没用过"）与 ``_historical_reference_exists``
 #     （ledger/audit/执行引用）双重判定后，插入一次性授权、删除、再撤销授权，
 #     全程在调用方事务内。
-#   - 即便有人伪造授权，触发器仍要求 definition 是 ``origin='user' AND
-#     lifecycle_status='draft'``，因此正式版本永远删不掉。
+#   - 即便有人伪造授权，触发器仍要求 definition 是 ``origin='user'`` 且该
+#     exact version 的 canonical lifecycle state 为 draft，因此正式版本永远删不掉。
 #
 # 名称固定：``_install_immutable_version_trigger`` 按 SQL 内容比对，把老库上
 # 残留的"无条件拒绝"旧定义**在一个显式事务内原子替换**（见该函数文档）。
@@ -178,7 +169,11 @@ IMMUTABLE_VERSION_TRIGGER_SQL = (
            JOIN strategy_definitions d ON d.id=t.strategy_id
            WHERE t.strategy_id=OLD.strategy_id
              AND d.origin='user'
-             AND d.lifecycle_status='draft'
+             AND EXISTS (
+               SELECT 1 FROM strategy_lifecycle_state l
+               WHERE l.strategy_id=d.id AND l.strategy_version=OLD.version
+                 AND l.strategy_checksum=OLD.checksum AND l.state='draft'
+             )
        )
        BEGIN SELECT RAISE(ABORT, 'strategy versions are immutable'); END"""
 )
@@ -332,7 +327,11 @@ def _create_version_schema(conn):
 
 
 def ensure_schema(conn):
-    """Create lifecycle/version schema and seed the five built-ins as v1."""
+    """Create identity/version schema and seed the five built-ins as v1.
+
+    Lifecycle rows are initialized by the dedicated strategy_lifecycle owner.
+    The legacy status columns remain only as migration/bootstrap compatibility.
+    """
     conn.execute(
         """CREATE TABLE IF NOT EXISTS strategy_definitions (
             id TEXT PRIMARY KEY,
@@ -386,7 +385,9 @@ def ensure_schema(conn):
                 supports_new_cycle,description,metadata,sort_order,created_at,updated_at,
                 current_version,current_checksum)
                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-            (spec.id, payload["name"], "builtin", spec.status,
+            # Physical legacy column is bootstrap-only and retains its old enum;
+            # canonical lifecycle state is seeded by SL.ensure_schema below.
+            (spec.id, payload["name"], "builtin", "active" if spec.status == "paper" else spec.status,
              payload["implementation_key"], int(spec.supports_new_cycle),
              payload["description"], json.dumps(payload["metadata"], ensure_ascii=False,
                                                 sort_keys=True, separators=(",", ":")),
@@ -435,6 +436,7 @@ def ensure_schema(conn):
                                             sort_keys=True, separators=(",", ":")), checksum, row[0]),
             )
     _seed_legacy_bindings(conn)
+    SL.ensure_schema(conn)
     return True
 
 
@@ -463,11 +465,10 @@ def _table_exists(conn, table="strategy_definitions"):
 
 def _row_to_spec(row):
     values = dict(row) if isinstance(row, sqlite3.Row) else {
-        "id": row[0], "name": row[1], "origin": row[2],
-        "lifecycle_status": row[3], "implementation_key": row[4],
-        "supports_new_cycle": row[5], "description": row[6],
-        "metadata": row[7], "created_at": row[8], "updated_at": row[9],
-        "current_version": row[10], "current_checksum": row[11], "dsl_ast": row[12],
+        "id": row[0], "name": row[1], "origin": row[2], "state": row[3],
+        "implementation_key": row[4], "description": row[5], "metadata": row[6],
+        "created_at": row[7], "updated_at": row[8], "current_version": row[9],
+        "current_checksum": row[10], "dsl_ast": row[11],
     }
     try:
         metadata = json.loads(values.get("metadata") or "{}")
@@ -476,8 +477,8 @@ def _row_to_spec(row):
     if not isinstance(metadata, Mapping):
         metadata = {}
     return StrategySpec(
-        id=values["id"], name=values["name"], status=values["lifecycle_status"],
-        supports_new_cycle=bool(values["supports_new_cycle"]), origin=values["origin"],
+        id=values["id"], name=values["name"], status=values["state"],
+        supports_new_cycle=SL.allows_formal_cycle(values["state"]), origin=values["origin"],
         implementation_key=values["implementation_key"],
         description=values.get("description") or "", metadata=metadata,
         created_at=values.get("created_at"), updated_at=values.get("updated_at"),
@@ -526,32 +527,40 @@ def list_definitions(*, conn=None, db_path=None, origins=None, statuses=None,
             owned = True
         if not _table_exists(conn):
             return _filter_builtins(origins, statuses, include_archived)
+        lifecycle_owner_exists = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='strategy_lifecycle_state'"
+        ).fetchone()
+        if not lifecycle_owner_exists:
+            # Import-time read-only bootstrap: paper_trading.init_db performs the
+            # idempotent owner migration before production selection begins.
+            return _filter_builtins(origins, statuses, include_archived)
         clauses = []
         params = []
         if origins:
             clauses.append(f"origin IN ({','.join('?' for _ in origins)})")
             params.extend(origins)
         if statuses:
-            clauses.append(f"lifecycle_status IN ({','.join('?' for _ in statuses)})")
+            clauses.append(f"ls.state IN ({','.join('?' for _ in statuses)})")
             params.extend(statuses)
         elif not include_archived:
-            clauses.append("lifecycle_status<>'archived'")
+            clauses.append("ls.state<>'archived'")
         where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
         columns = {
             str(row[1]) for row in conn.execute("PRAGMA table_info(strategy_definitions)").fetchall()
         }
         version_projection = (
-            "current_version,current_checksum"
+            "d.current_version,d.current_checksum"
             if {"current_version", "current_checksum"}.issubset(columns)
             else "NULL AS current_version,NULL AS current_checksum"
         )
-        dsl_projection = "dsl_ast" if "dsl_ast" in columns else "NULL AS dsl_ast"
+        dsl_projection = "d.dsl_ast" if "dsl_ast" in columns else "NULL AS dsl_ast"
         rows = conn.execute(
-            "SELECT id,name,origin,lifecycle_status,implementation_key,"
-            "supports_new_cycle,description,metadata,created_at,updated_at,"
-            f"{version_projection} "
-            f",{dsl_projection} "
-            f"FROM strategy_definitions{where} ORDER BY origin,sort_order,id", params,
+            "SELECT d.id,d.name,d.origin,ls.state AS state,d.implementation_key,"
+            "d.description,d.metadata,d.created_at,d.updated_at,"
+            f"{version_projection}, {dsl_projection} FROM strategy_definitions d "
+            "JOIN strategy_lifecycle_state ls ON ls.strategy_id=d.id "
+            "AND ls.strategy_version=d.current_version AND ls.strategy_checksum=d.current_checksum"
+            f"{where} ORDER BY d.origin,d.sort_order,d.id", params,
         ).fetchall()
         return tuple(_row_to_spec(row) for row in rows)
     finally:
@@ -570,10 +579,8 @@ def labels(*, conn=None, db_path=None):
 
 
 def active_ids(*, conn=None, db_path=None):
-    return tuple(
-        spec.id for spec in list_definitions(conn=conn, db_path=db_path, statuses=("active",))
-        if spec.supports_new_cycle
-    )
+    return tuple(spec.id for spec in list_definitions(conn=conn, db_path=db_path)
+                 if SL.allows_formal_cycle(spec.status))
 
 
 def runtime_readiness(conn, strategy_id):
@@ -707,6 +714,9 @@ def create_user_definition(conn, strategy_id, name, *, implementation_key="",
     ensure_schema(conn)
     if get(strategy_id, conn=conn) is not None:
         raise ValueError("strategy id already exists")
+    if conn.execute("SELECT 1 FROM strategy_lifecycle_state WHERE strategy_id=? LIMIT 1",
+                    (strategy_id,)).fetchone():
+        raise ValueError("strategy identity has retained lifecycle history")
     payload, canonical, checksum = _canonical_definition(
         name=name, implementation_key=implementation_key or strategy_id,
         description=description, metadata=metadata, dsl_ast=dsl_ast,
@@ -744,12 +754,9 @@ def create_user_definition(conn, strategy_id, name, *, implementation_key="",
            (strategy_id,current_version,current_checksum,updated_at) VALUES(?,1,?,?)""",
         (strategy_id, checksum, now),
     )
-    conn.execute(
-        """INSERT INTO strategy_definition_events
-           (strategy_id,from_status,to_status,reason,actor,created_at)
-           VALUES(?,NULL,'draft','definition_created',?,?)""",
-        (strategy_id, str(actor or "system"), now),
-    )
+    SL.initialize_version(conn, strategy_id, 1, checksum,
+                          actor_type="human" if str(actor) not in {"system", "strategy_registry"} else "system",
+                          actor_id=str(actor or "system"))
     return get(strategy_id, conn=conn)
 
 
@@ -823,6 +830,9 @@ def save_definition(conn, strategy_id, changes, *, expected_version=None,
                                        sort_keys=True, separators=(",", ":")),
              next_version, checksum, now, str(strategy_id)),
         )
+        SL.initialize_version(conn, strategy_id, next_version, checksum,
+                              actor_type="human" if str(actor) not in {"system", "strategy_registry"} else "system",
+                              actor_id=str(actor or "system"))
         conn.execute(f"RELEASE SAVEPOINT {savepoint}")
     except Exception:
         conn.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
@@ -850,59 +860,6 @@ def clone_definition(conn, source_strategy_id, source_version, new_strategy_id,
     return clone
 
 
-def transition(conn, strategy_id, to_status, *, reason="", actor="system",
-               expected_status=None):
-    ensure_schema(conn)
-    current = get(strategy_id, conn=conn)
-    if current is None:
-        raise ValueError("unknown strategy id")
-    to_status = str(to_status or "").strip()
-    if to_status not in LIFECYCLE_STATUSES:
-        raise ValueError("invalid strategy status")
-    if expected_status is not None and current.status != expected_status:
-        raise ValueError(f"strategy status changed: expected {expected_status}, found {current.status}")
-    if to_status == current.status:
-        return current
-    if to_status not in _TRANSITIONS[current.status]:
-        raise ValueError(f"invalid lifecycle transition: {current.status} -> {to_status}")
-    now = _now()
-    readiness = runtime_readiness(conn, current.id) if to_status == "active" else None
-    if to_status == "active" and not readiness["runtime_ready"]:
-        raise ValueError("strategy runtime is not ready: " + "; ".join(readiness["errors"]))
-    supports_new_cycle = int(to_status == "active" and readiness["runtime_ready"])
-    cursor = conn.execute(
-        """UPDATE strategy_definitions
-           SET lifecycle_status=?,supports_new_cycle=?,updated_at=?
-           WHERE id=? AND lifecycle_status=?""",
-        (to_status, supports_new_cycle, now, current.id, current.status),
-    )
-    if cursor.rowcount != 1:
-        raise ValueError("strategy status changed concurrently")
-    conn.execute(
-        """INSERT INTO strategy_definition_events
-           (strategy_id,from_status,to_status,reason,actor,created_at)
-           VALUES(?,?,?,?,?,?)""",
-        (current.id, current.status, to_status, str(reason or "").strip(),
-         str(actor or "system"), now),
-    )
-    return get(current.id, conn=conn)
-
-
-def archive_definition(conn, strategy_id, *, reason="", actor="system"):
-    """Move a definition through legal lifecycle edges until archived."""
-    current = get(strategy_id, conn=conn)
-    if current is None:
-        raise ValueError("unknown strategy id")
-    while current.status != "archived":
-        target = {"active": "retiring", "paused": "retiring", "retiring": "archived",
-                  "draft": "archived", "validated": "archived"}.get(current.status)
-        if target is None:
-            raise ValueError("strategy cannot be archived")
-        current = transition(conn, current.id, target, reason=reason, actor=actor,
-                             expected_status=current.status)
-    return current
-
-
 def _table_columns(conn, table):
     return {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
 
@@ -921,33 +878,6 @@ def _historical_reference_exists(conn, strategy_id):
     return False
 
 
-def _left_draft_evidence(conn, strategy_id):
-    """Return the first lifecycle event proving the strategy left scratch draft.
-
-    PR-56：``draft -> validated -> draft`` 的回退不能把策略变回"从未使用过的
-    草稿"——生命周期历史本身就是"已正式使用"的证据。判定只看事件表：
-
-    - 创建事件 ``NULL -> draft``（reason=definition_created）每个 draft 都有，
-      **不算**离开 draft；
-    - 任何 ``to_status`` 非 draft 的事件（draft -> validated / draft -> archived）
-      算；``from_status`` 是真实非 draft 状态的事件（validated -> draft 的回退）
-      也算。
-
-    不能只看 ``current lifecycle_status``：状态可以退回 draft；也不能只数事件
-    条数：定义事件对任何草稿都存在。
-    """
-    row = conn.execute(
-        """SELECT from_status,to_status FROM strategy_definition_events
-           WHERE strategy_id=?
-             AND ( IFNULL(to_status,'draft') <> 'draft'
-                   OR (from_status IS NOT NULL AND from_status <> ''
-                       AND from_status <> 'draft') )
-           ORDER BY id LIMIT 1""",
-        (str(strategy_id),),
-    ).fetchone()
-    return None if row is None else (row[0], row[1])
-
-
 def _ever_left_draft(conn, strategy_id):
     """Canonical predicate：生命周期历史是否证明该策略离开过初始 draft。
 
@@ -955,11 +885,18 @@ def _ever_left_draft(conn, strategy_id):
     ``_historical_reference_exists`` 正交：后者看 ledger/audit 的经济与执行
     引用，本谓词只看生命周期形态。
     """
-    return _left_draft_evidence(conn, strategy_id) is not None
+    rows = conn.execute("""SELECT strategy_version,from_state,to_state,transition_kind
+        FROM strategy_lifecycle_events WHERE strategy_id=? ORDER BY id""", (str(strategy_id),)).fetchall()
+    return any(str(row[2]) != "draft" or row[1] is not None
+               or str(row[3]) not in {"version_created", "legacy_import"} for row in rows)
 
 
 def hard_delete_unused_draft(conn, strategy_id):
     """Physically delete only an unused user draft and its private version rows.
+
+    The canonical lifecycle state and append-only creation event remain as a
+    permanent identity tombstone. This preserves audit history and prevents
+    reusing the deleted strategy id.
 
     Why an unused draft may be deleted while a formal version may not:
 
@@ -982,8 +919,8 @@ def hard_delete_unused_draft(conn, strategy_id):
 
     The database trigger is **default-deny**: it aborts every delete on
     ``paper_strategy_versions`` unless the same transaction holds a one-shot
-    authorization row for a definition that is still ``origin='user' AND
-    lifecycle_status='draft'``.  So neither this function nor anyone else can
+      authorization row for a definition that is still ``origin='user'`` and
+      whose canonical lifecycle state is ``draft``. So neither this function nor anyone else can
     delete a version by just calling ``DELETE`` — a formal version is refused by
     the database even after a lifecycle rollback, because the trigger no longer
     trusts lifecycle alone.  This function is the only place that mints the
@@ -1003,16 +940,14 @@ def hard_delete_unused_draft(conn, strategy_id):
     # PR-56：先证明"从未离开 draft 生命周期"，再看经济/执行引用。顺序即
     # 形式化规则：origin ∧ status ∧ never_left_draft ∧ no historical reference。
     # 回退到 draft 的策略在这里就被挡住——早于任何 purge token 铸造。
-    evidence = _left_draft_evidence(conn, spec.id)
-    if evidence is not None:
+    evidence = _ever_left_draft(conn, spec.id)
+    if evidence:
         raise ValueError(
             "strategy has historical references and must be archived: "
-            "lifecycle history shows it already left the draft state "
-            f"({evidence[0] or 'NULL'} -> {evidence[1]})"
+            "canonical lifecycle history proves prior use"
         )
     if _historical_reference_exists(conn, spec.id):
         raise ValueError("strategy has historical references and must be archived")
-    conn.execute("DELETE FROM strategy_definition_events WHERE strategy_id=?", (spec.id,))
     conn.execute("DELETE FROM paper_strategy_version_heads WHERE strategy_id=?", (spec.id,))
     conn.execute(
         f"INSERT OR REPLACE INTO {VERSION_PURGE_TOKEN_TABLE} (strategy_id) VALUES(?)",
@@ -1022,19 +957,17 @@ def hard_delete_unused_draft(conn, strategy_id):
         conn.execute("DELETE FROM paper_strategy_versions WHERE strategy_id=?", (spec.id,))
     finally:
         conn.execute(f"DELETE FROM {VERSION_PURGE_TOKEN_TABLE} WHERE strategy_id=?", (spec.id,))
+    # Pre-R31 event rows have a restrictive FK to the definition. They belong
+    # to the disposable compatibility record; canonical lifecycle history is
+    # retained above as the identity tombstone.
+    conn.execute("DELETE FROM strategy_definition_events WHERE strategy_id=?", (spec.id,))
     conn.execute("DELETE FROM strategy_definitions WHERE id=?", (spec.id,))
     return {"strategy_id": spec.id, "deleted": True}
 
 
 def lifecycle_events(conn, strategy_id):
     ensure_schema(conn)
-    rows = conn.execute(
-        """SELECT id,strategy_id,from_status,to_status,reason,actor,created_at
-           FROM strategy_definition_events WHERE strategy_id=? ORDER BY id""",
-        (str(strategy_id or ""),),
-    ).fetchall()
-    columns = ("id", "strategy_id", "from_status", "to_status", "reason", "actor", "created_at")
-    return tuple(dict(zip(columns, row, strict=True)) for row in rows)
+    return tuple(SL.history(conn, str(strategy_id or "")))
 
 
 def bind_cycle_versions(conn, cycle_id, account_ids):

@@ -7,7 +7,7 @@
 ``_candidate_rows`` 还会直接 ``ACCOUNT_SPECS[account_id]`` KeyError。
 本模块补上缺失的声明式通道：
 
-1. ``user_participant_ids``：注册表中 active 且 supports_new_cycle=1 的
+1. ``user_participant_ids``：Lifecycle owner 中 exact current version 允许正式周期的
    用户策略 id 集合（动态参与资格的唯一事实来源）；
 2. ``user_spec_for``：从 StrategyRuntimeContext（Risk Fingerprint →
    Risk Profile → Execution Profile）派生纸盘账户 spec，替代固定五套
@@ -25,6 +25,7 @@ import sqlite3
 from typing import Any, Callable, Mapping
 
 import strategy_dsl_schema as DSL
+import strategy_lifecycle as SL
 from strategy_dsl_evaluator import (
     StrategyDslEvaluationError,
     evaluate as dsl_evaluate,
@@ -45,19 +46,21 @@ _FLOW_FIELDS = ("main_pct", "super_net")
 
 
 def user_participant_ids(conn: sqlite3.Connection) -> tuple[str, ...]:
-    """返回允许参与当前运行的用户策略 id（active ∧ supports_new_cycle=1）。
+    """返回当前 exact version 处于 PAPER/PRODUCTION_SIM 的用户策略。
 
     注册表尚未建表（极早期数据库）时返回空集，绝不抛异常阻断主流程。
     """
     try:
         rows = conn.execute(
-            "SELECT id FROM strategy_definitions "
-            "WHERE origin='user' AND lifecycle_status='active' AND supports_new_cycle=1 "
-            "ORDER BY id"
+            "SELECT d.id,l.state FROM strategy_definitions d "
+            "JOIN paper_strategy_version_heads h ON h.strategy_id=d.id "
+            "JOIN strategy_lifecycle_state l ON l.strategy_id=d.id "
+            "AND l.strategy_version=h.current_version AND l.strategy_checksum=h.current_checksum "
+            "WHERE d.origin='user' ORDER BY d.id"
         ).fetchall()
     except sqlite3.Error:
         return ()
-    return tuple(str(row[0]) for row in rows)
+    return tuple(str(row[0]) for row in rows if len(row) > 1 and SL.allows_formal_cycle(row[1]))
 
 
 def user_known_ids(conn: sqlite3.Connection) -> tuple[str, ...]:

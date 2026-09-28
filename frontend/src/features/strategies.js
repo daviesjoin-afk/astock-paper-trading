@@ -4,7 +4,7 @@ import { api, apiJson, apiPostJson } from "../core/api.js";
 import { $ } from "../core/dom.js";
 import { adaptiveEsc } from "../core/format.js";
 import { activatePage } from "../core/navigation.js";
-import { STRATEGY_STATUS_LABELS, strategyStatusBadge, strategyStatusLabelTech } from "../core/strategy_labels.js";
+import { STRATEGY_STATUS_LABELS, strategyStatusBadge, strategyStatusLabel, strategyStatusLabelTech } from "../core/strategy_labels.js";
 import { toast, inlineError, confirmDialog, promptDialog } from "../ui/dialog.js";
 
 // 生命周期状态中文名：设置中心的「启用策略」分组也在用（PR-52 从已删除的旧构建器里
@@ -48,7 +48,7 @@ export var WB_FIELD_LABELS={close:'收盘价',open:'开盘价',high:'最高价',
 
 export var WB_INDICATOR_LABELS={ma:'均线 MA',ema:'指数均线 EMA',rsi:'RSI',atr:'ATR',volume_mean:'均量'};
 
-export var WB_STATUS_BADGES={draft:['DRAFT','strategy-status-draft'],validated:['VALIDATED','strategy-status-validated'],active:['ACTIVE','strategy-status-active'],paused:['PAUSED','strategy-status-paused'],retiring:['RETIRING','strategy-status-retiring'],archived:['ARCHIVED','strategy-status-archived']};
+export var WB_STATUS_BADGES={draft:['DRAFT','strategy-status-draft'],candidate:['CANDIDATE','strategy-status-validated'],research:['RESEARCH','strategy-status-validated'],validated:['VALIDATED','strategy-status-validated'],shadow:['SHADOW','strategy-status-draft'],paper:['PAPER','strategy-status-active'],production_sim:['PRODUCTION_SIM','strategy-status-active'],degraded:['DEGRADED','strategy-status-paused'],paused:['PAUSED','strategy-status-paused'],retiring:['RETIRING','strategy-status-paused'],archived:['ARCHIVED','strategy-status-archived'],rejected:['REJECTED','strategy-status-archived'],validation_failed:['VALIDATION_FAILED','strategy-status-archived'],quarantined:['QUARANTINED','strategy-status-paused']};
 
 export var WB_STATE={items:[],summary:null,originFilter:'all',statusFilter:'all',view:'list',editingId:null,editingVersion:null,editorMode:'builder'};
 
@@ -84,7 +84,7 @@ export async function loadStrategyWorkbench(force){
 
 export function wbRenderSummary(){
   var s=WB_STATE.summary||{}; var box=$('wbSummary');
-  if(box) box.innerHTML='<b>'+(s.total||0)+'</b> 个策略 <span>·</span> '+(s.active||0)+' Active <span>·</span> '+(s.draft||0)+' Draft <span>·</span> '+(s.builtin||0)+' 内置 <span>·</span> '+(s.user||0)+' 自定义';
+  if(box) box.innerHTML='<b>'+(s.total||0)+'</b> 个策略 <span>·</span> '+(s.formal_cycle_eligible||0)+' 可进入新模拟周期 <span>·</span> '+(s.draft||0)+' 草稿 <span>·</span> '+(s.builtin||0)+' 内置 <span>·</span> '+(s.user||0)+' 自定义';
 }
 
 export function wbSetOriginFilter(value,btn){
@@ -120,22 +120,9 @@ export function wbCard(item){
   var actions='';
   if(userCard){
     var sid='\''+adaptiveEsc(item.id)+'\'';
-    var st=item.status;
-    // PR-49：按注册表合法迁移矩阵（draft→validated/archived、
-    // validated→draft/active/archived、active→paused/retiring、
-    // paused→active/retiring/archived、retiring→archived）补齐按钮，
-    // 让 Pause / Clone / Retire 在界面上真正闭环，不必再手搓 curl。
-    if(st==='draft'||st==='validated') actions+='<button type="button" data-testid="strategy-edit" onclick="wbOpenEditor('+sid+')">编辑</button>';
-    actions+='<button type="button" data-testid="strategy-clone" onclick="wbCloneStrategy('+sid+')">'+(st==='archived'?'复制并编辑':'复制')+'</button>';
-    if(st==='draft') actions+='<button type="button" data-testid="strategy-transition-validated" onclick="wbValidateAndMark('+sid+')">验证并标记可激活</button>';
-    if(st==='validated') actions+='<button type="button" data-testid="strategy-transition-draft" onclick="wbTransition('+sid+',\'draft\')">退回草稿</button>';
-    if(st==='validated') actions+='<button type="button" class="strategy-workbench-primary" data-testid="strategy-transition-active" onclick="wbTransition('+sid+',\'active\')">激活策略</button>';
-    if(st==='active') actions+='<button type="button" data-testid="strategy-transition-paused" onclick="wbTransition('+sid+',\'paused\')">暂停</button>';
-    if(st==='paused') actions+='<button type="button" data-testid="strategy-transition-resume" onclick="wbTransition('+sid+',\'active\')">恢复</button>';
-    if(st==='active'||st==='paused') actions+='<button type="button" data-testid="strategy-transition-retiring" onclick="wbTransition('+sid+',\'retiring\')">退役</button>';
-    if(st==='retiring') actions+='<button type="button" data-testid="strategy-transition-archived" onclick="wbTransition('+sid+',\'archived\')">完成归档</button>';
-    if(st==='draft'||st==='validated'||st==='paused') actions+='<button type="button" data-testid="strategy-transition-archive" onclick="wbTransition('+sid+',\'archived\')">归档</button>';
-    if(st==='draft') actions+='<button type="button" class="strategy-card-danger" onclick="wbDeleteDraft('+sid+')">删除草稿</button>';
+    actions+='<button type="button" data-testid="strategy-edit" onclick="wbOpenEditor('+sid+')">编辑并生成新版本</button>';
+    actions+='<button type="button" data-testid="strategy-clone" onclick="wbCloneStrategy('+sid+')">复制为新草稿</button>';
+    if(item.status==='draft') actions+='<button type="button" class="strategy-card-danger" onclick="wbDeleteDraft('+sid+')">删除未使用草稿</button>';
   }else{
     actions='<button type="button" data-testid="strategy-clone" onclick="wbCloneStrategy(\''+adaptiveEsc(item.id)+'\')">复制并编辑</button>';
   }
@@ -149,7 +136,7 @@ export function wbCard(item){
   if(runtime.capital_scale&&runtime.capital_scale.factor!=null) scale=Math.round(runtime.capital_scale.factor*100)+'%';
   else if(runtime.capital_scale!=null&&typeof runtime.capital_scale==='number') scale=Math.round(runtime.capital_scale*100)+'%';
   var seats=runtime.position_limit!=null?runtime.position_limit:(meta.max_positions!=null?meta.max_positions:null);
-  var eligible=!!item.supports_new_cycle&&item.status==='active';
+  var eligible=!!item.formal_cycle_allowed;
   var enabledIds=WB_STATE.enabledIds;
   var participates;
   var participation;
@@ -161,7 +148,7 @@ export function wbCard(item){
     participation='下一周期：符合条件（以设置为准）';
   }else{
     participates=false;
-    participation=item.status==='active'?'下一周期：不支持':'下一周期：不可参与';
+    participation='当前生命周期不允许进入正式新周期';
   }
   var checksum=String(item.current_checksum||item.checksum||'');
   var dslChecksum=String(item.dsl_checksum||item.dsl_checksum_sha256||'');
@@ -556,54 +543,66 @@ export async function wbSaveDraft(){
   }
 }
 
-export async function wbValidateAndMark(strategyId){
-  var ok=await confirmDialog({
-    kicker:'生命周期 · 标记已验证',
-    title:'标记为已验证？',
-    detail:strategyId,
-    bullets:['标记后仍不参与任何周期，也不会开仓。','可继续修改定义；修改会生成新版本。','只有已验证的策略才能被激活。'],
-    confirmText:'标记为已验证',
-  });
-  if(!ok.approved) return;
-  try{
-    await apiPostJson('/api/strategies/'+encodeURIComponent(strategyId)+'/transition',{to_status:'validated',reason:'Web workbench 验证通过'});
-    await loadStrategyWorkbench(true);
-    toast('已标记为已验证：'+strategyId);
-  }catch(e){ inlineError($('wbList'), e, { title:'标记失败', retryLabel:'重试', onRetry:function(){ wbValidateAndMark(strategyId); } }); }
-}
-
 export async function wbTransition(strategyId,toStatus){
-  var item=WB_STATE.items.filter(function(x){return x.id===strategyId;})[0]||{};
-  // PR-57：危险/高影响动作改用应用内模态，并明确说明各自的边界语义。
-  var DIALOGS={
-    draft:{ title:'退回草稿？', danger:false, confirmText:'退回草稿',
-      bullets:['退回后不参与未来周期，可继续修改定义。','已产生的订单、成交与审计记录不会回滚或删除。'] },
-    active:{ title:'激活策略？', danger:false, confirmText:'激活策略',
-      bullets:['激活不会把策略加入正在运行的周期。','请在「设置 → 模拟盘与资金」勾选它参与下一周期。','激活本身不改动历史版本与账本。'] },
-    paused:{ title:'暂停策略？', danger:false, confirmText:'暂停',
-      bullets:['暂停后不再产生新的开仓信号（停止新开仓）。','当前周期的经济账本归属保持不变，不会被删除。','存量持仓继续由系统风控执行退出。'] },
-    retiring:{ title:'退役策略？', danger:false, confirmText:'进入退役',
-      bullets:['退役表示不再参与未来周期、不再新开仓。','存量持仓按风控逐步退出。','退役不等于删除：历史版本、订单、成交与审计都保留。','退出完成后可选择归档。'] },
-    archived:{ title:'归档策略？', danger:true, confirmText:'确认归档',
-      bullets:['归档后该策略不再加入任何未来周期。','历史与详情仍可查看（版本、订单、成交、审计记录都不会删除）。','归档是高影响动作，但可逆性有限：如需再启用需重新创建或复制。'] },
-  };
-  var dlg=DIALOGS[toStatus]||{ title:'迁移到 '+toStatus+'？', confirmText:'确认迁移', bullets:[] };
-  var answer=await confirmDialog({
-    kicker:'生命周期 · '+strategyStatusLabelTech(toStatus),
-    title:dlg.title,
-    detail:strategyId,
-    bullets:dlg.bullets,
-    danger:dlg.danger,
-    confirmText:dlg.confirmText,
-  });
-  if(!answer.approved) return;
+  var lifecycle;
+  try{ lifecycle=await api('/api/strategies/'+encodeURIComponent(strategyId)+'/lifecycle'); }
+  catch(e){ inlineError($('wbDetail'),e,{title:'无法读取生命周期'}); return; }
+  if((lifecycle.safety_transitions||[]).indexOf(toStatus)<0){
+    inlineError($('wbDetail'),'该迁移不属于后端提供的安全操作。',{title:'迁移不可用'}); return;
+  }
+  var answer=await promptDialog({kicker:'Lifecycle safety intent',title:'填写原因后提交安全迁移',
+    detail:strategyId+' · '+lifecycle.state+' → '+toStatus,label:'原因',value:'人工安全操作'});
+  if(!answer.approved||!answer.value) return;
   try{
-    await apiPostJson('/api/strategies/'+encodeURIComponent(strategyId)+'/transition',{to_status:toStatus,expected_status:item.status,reason:'Web workbench 操作'});
-    await loadStrategyWorkbench(true);
-    toast('已更新生命周期：'+strategyId+' → '+strategyStatusLabelTech(toStatus));
-  }catch(e){ inlineError($('wbList'), e, { title:'生命周期迁移失败', retryLabel:'重试', onRetry:function(){ wbTransition(strategyId,toStatus); } }); }
+    await apiPostJson('/api/strategies/'+encodeURIComponent(strategyId)+'/transition',{
+      strategy_version:lifecycle.version,strategy_checksum:lifecycle.checksum,
+      expected_state:lifecycle.state,target_state:toStatus,actor_type:'human',actor_id:'strategy-workbench',
+      reason_code:'human_safety_intent',reason:answer.value});
+    await wbOpenDetail(strategyId); await loadStrategyWorkbench(true);
+    toast('安全迁移已记录：'+strategyId+' → '+strategyStatusLabelTech(toStatus));
+  }catch(e){ inlineError($('wbDetail'),e,{title:'安全迁移失败',retryLabel:'重试',onRetry:function(){wbTransition(strategyId,toStatus);}}); }
 }
 
+export async function wbCreatePromotionProposal(strategyId,targetState){
+  var lifecycle;
+  try{ lifecycle=await api('/api/strategies/'+encodeURIComponent(strategyId)+'/lifecycle'); }
+  catch(e){ inlineError($('wbDetail'),e,{title:'无法读取生命周期'}); return; }
+  if((lifecycle.promotion_transitions||[]).indexOf(targetState)<0){
+    inlineError($('wbDetail'),'该迁移不属于后端提供的 promotion path。',{title:'Proposal 不可用'}); return;
+  }
+  var value=function(id){return (document.getElementById(id)||{}).value||'';};
+  var evidence={};
+  if(value('wbPromotionR29').trim()) evidence.r29_run_key=value('wbPromotionR29').trim();
+  if(value('wbPromotionR30').trim()) evidence.r30_report_key=value('wbPromotionR30').trim();
+  if(value('wbPromotionShadow').trim()) evidence.future_shadow_evidence_ref=value('wbPromotionShadow').trim();
+  if(value('wbPromotionPaper').trim()) evidence.future_paper_evidence_ref=value('wbPromotionPaper').trim();
+  try{
+    var proposal=await apiPostJson('/api/strategies/'+encodeURIComponent(strategyId)+'/promotion/proposals',{
+      strategy_version:lifecycle.version,strategy_checksum:lifecycle.checksum,
+      expected_state:lifecycle.state,target_state:targetState,evidence_bundle:evidence,
+      proposer_type:'human',proposer_id:'strategy-workbench',rationale:'人工提交 exact evidence proposal'});
+    await wbOpenDetail(strategyId);
+    toast(proposal.decision&&proposal.decision.eligible?'Proposal 当前符合 evidence policy，可提交 transition。':'Proposal 已记录；查看后端返回的缺失 evidence 与阻断原因。');
+  }catch(e){ inlineError($('wbDetail'),e,{title:'Proposal 创建失败'}); }
+}
+
+export async function wbApplyPromotionProposal(strategyId,proposalFingerprint){
+  var lifecycle;
+  try{ lifecycle=await api('/api/strategies/'+encodeURIComponent(strategyId)+'/lifecycle'); }
+  catch(e){ inlineError($('wbDetail'),e,{title:'无法读取生命周期'}); return; }
+  var proposal=(lifecycle.proposals||[]).filter(function(item){return item.proposal_fingerprint===proposalFingerprint;})[0];
+  if(!proposal||!proposal.decision||!proposal.decision.eligible){
+    inlineError($('wbDetail'),'只有后端标记 eligible 的精确 proposal 可以提交 transition。',{title:'Proposal 当前不可应用'}); return;
+  }
+  try{
+    await apiPostJson('/api/strategies/'+encodeURIComponent(strategyId)+'/transition',{
+      strategy_version:proposal.strategy_version,strategy_checksum:proposal.strategy_checksum,
+      expected_state:proposal.from_state,target_state:proposal.target_state,
+      proposal_fingerprint:proposal.proposal_fingerprint,actor_type:'human',actor_id:'strategy-workbench'});
+    await wbOpenDetail(strategyId); await loadStrategyWorkbench(true);
+    toast('后端已重新验证 proposal 并记录状态迁移。');
+  }catch(e){ inlineError($('wbDetail'),e,{title:'Proposal 过期或 evidence 已不可用'}); }
+}
 export async function wbCloneFirstBuiltin(){
   // 空态 CTA：复制第一套内置策略（复用既有克隆流程与确认模态）。
   var builtin=(WB_STATE.items||[]).filter(function(x){return x.origin==='builtin';})[0];
@@ -666,45 +665,88 @@ export function wbRenderNotFound(strategyId,message){
 export async function wbOpenDetail(strategyId){
   var item;
   try{ item=await api('/api/strategies/'+encodeURIComponent(strategyId)+'?_='+Date.now()); }
-  catch(e){
-    // 未知/不可读的策略：给出可读状态，不弹 modal、不抛异常、不写坏 hash。
-    wbRenderNotFound(strategyId,e&&e.message);
-    return null;
-  }
-  var versions=[],events=[];
+  catch(e){ wbRenderNotFound(strategyId,e&&e.message); return null; }
+  var versions=[],lifecycle={};
   try{ versions=(await api('/api/strategies/'+encodeURIComponent(strategyId)+'/versions')).items||[]; }catch(e){}
-  try{ events=(await api('/api/strategies/'+encodeURIComponent(strategyId)+'/events')).items||[]; }catch(e){}
+  try{ lifecycle=await api('/api/strategies/'+encodeURIComponent(strategyId)+'/lifecycle'); }catch(e){}
   var box=$('wbDetail'); if(!box) return;
   WB_STATE.editingId=strategyId; WB_STATE.editingVersion=item.version||item.current_version;
-  var currentVersion=item.version||item.current_version||1;
+  var currentVersion=lifecycle.version||item.version||item.current_version||1;
   var runtime=item.runtime||{};
-  var timeline=events.slice().reverse().map(function(ev){
-    return '<li><span class="strategy-version-time">'+adaptiveEsc(ev.created_at||'')+'</span> '+adaptiveEsc(ev.from_status||'—')+' → <b>'+adaptiveEsc(ev.to_status||ev.status||'')+'</b>'
-      +(ev.reason?'<small> · '+adaptiveEsc(ev.reason)+'</small>':'')+'</li>';
+  var historyRows=(lifecycle.state_history||[]).slice().reverse().map(function(ev){
+    var evidence=ev.evidence_json||'';
+    var evidenceValue={};
+    try{ evidenceValue=JSON.parse(evidence||'{}'); }catch(e){}
+    var bundle=evidenceValue.evidence_bundle||evidenceValue;
+    var evidenceRefs=[];
+    if(bundle.r29_run_key) evidenceRefs.push('R29 '+bundle.r29_run_key);
+    if(bundle.r30_report_key) evidenceRefs.push('R30 '+bundle.r30_report_key);
+    return '<li data-testid="strategy-lifecycle-event"><span class="strategy-version-time">'+adaptiveEsc(ev.created_at||'')+'</span> '
+      +'<b>'+adaptiveEsc(ev.from_state||'initial')+' → '+adaptiveEsc(ev.to_state||'')+'</b>'
+      +'<small>v'+adaptiveEsc(ev.strategy_version)+' · '+adaptiveEsc(ev.actor_type||'')+':'+adaptiveEsc(ev.actor_id||'')
+      +' · '+adaptiveEsc(ev.reason_code||'')+' '+adaptiveEsc(ev.reason_text||'')
+      +(ev.promotion_policy_version?' · policy '+adaptiveEsc(ev.promotion_policy_version):'')
+      +(ev.promotion_decision_fingerprint?' · decision '+adaptiveEsc(ev.promotion_decision_fingerprint):'')+'</small>'
+      +(evidenceRefs.length?'<small data-testid="lifecycle-event-evidence">'+evidenceRefs.map(adaptiveEsc).join(' · ')+'</small>':'')
+      +(evidence?'<code>'+adaptiveEsc(evidence)+'</code>':'')+'</li>';
   }).join('');
   var versionRows=versions.slice().reverse().map(function(v){
     return '<li data-testid="strategy-version-'+v.version+'" class="strategy-version-row'+(v.version===currentVersion?' current':'')+'">'
-      +'<b>v'+v.version+'</b>'+(v.version===currentVersion?' <span class="strategy-status-badge strategy-status-validated">当前</span>':'')
+      +'<b>v'+v.version+'</b>'+(v.version===currentVersion?' <span class="strategy-status-badge strategy-status-validated">当前版本</span>':'')
       +'<span class="strategy-version-time">'+adaptiveEsc(v.created_at||'')+'</span>'
-      +'<small>'+adaptiveEsc(v.change_note||v.created_by||'')+'</small>'
-      +'<code>'+adaptiveEsc(String(v.checksum||'').slice(0,12))+'</code></li>';
+      +'<small>'+adaptiveEsc(v.change_note||v.created_by||'')+'</small><code>'+adaptiveEsc(String(v.checksum||''))+'</code></li>';
   }).join('');
-  box.innerHTML='<header class="strategy-editor-head"><h3>'+adaptiveEsc(item.name||item.id)+' '+wbStatusBadge(item.status)+'</h3>'
+  var eligible=(lifecycle.eligible_transitions||[]);
+  var safetyButtons=(lifecycle.safety_transitions||[]).map(function(target){
+    return '<button type="button" data-testid="lifecycle-safety-'+adaptiveEsc(target)+'" onclick="wbTransition(\''+adaptiveEsc(strategyId)+'\',\''+adaptiveEsc(target)+'\')">提交 '+adaptiveEsc(strategyStatusLabel(target))+'安全意图</button>';
+  }).join('');
+  var promotionButtons=(lifecycle.promotion_transitions||[]).map(function(target){
+    var allowed=eligible.indexOf(target)>=0;
+    var decision=(lifecycle.evidence||{})[target]||{};
+    var reasons=(decision.blocking_reasons||[]).map(function(reason){return '<li>'+adaptiveEsc(reason)+'</li>';}).join('');
+    return '<article class="strategy-promotion-target" data-testid="promotion-target-'+adaptiveEsc(target)+'"><b>'+adaptiveEsc(lifecycle.state)+' → '+adaptiveEsc(target)+'</b>'
+      +'<p>当前后端判断：'+(allowed?'eligible':'blocked')+'</p>'+(reasons?'<ul>'+reasons+'</ul>':'')
+      +'<button type="button" onclick="wbCreatePromotionProposal(\''+adaptiveEsc(strategyId)+'\',\''+adaptiveEsc(target)+'\')">为该目标创建 proposal</button></article>';
+  }).join('');
+  var proposals=(lifecycle.proposals||[]).map(function(proposal){
+    var decision=proposal.decision||{};
+    var bundle=proposal.evidence_bundle||{};
+    var reasons=(decision.blocking_reasons||[]).map(function(reason){return '<li>'+adaptiveEsc(reason)+'</li>';}).join('');
+    var evidence='<small>R29 '+adaptiveEsc(bundle.r29_run_key||'未指定')+' · R30 '+adaptiveEsc(bundle.r30_report_key||'未指定')+'</small>';
+    var apply=proposal.proposer_type!=='ai'&&decision.eligible
+      ?'<button type="button" data-testid="promotion-apply" onclick="wbApplyPromotionProposal(\''+adaptiveEsc(strategyId)+'\',\''+adaptiveEsc(proposal.proposal_fingerprint)+'\')">重新验证并提交 transition</button>':'';
+    return '<article class="strategy-proposal" data-testid="strategy-promotion-proposal"><b>PROPOSAL · '+adaptiveEsc(proposal.proposer_type)+' / '+adaptiveEsc(proposal.proposer_id)+'</b>'
+      +'<p>'+adaptiveEsc(proposal.from_state)+' → '+adaptiveEsc(proposal.target_state)+' · '+(decision.eligible?'后端当前 eligible':'blocked')+'</p>'
+      +evidence+(proposal.rationale?'<p>'+adaptiveEsc(proposal.rationale)+'</p>':'')+(reasons?'<ul>'+reasons+'</ul>':'')+apply+'</article>';
+  }).join('');
+  var evidenceInputs='<div class="strategy-promotion-evidence">'
+    +'<label>Exact R29 run key<input id="wbPromotionR29" maxlength="64" autocomplete="off"></label>'
+    +'<label>Exact R30 report key<input id="wbPromotionR30" maxlength="64" autocomplete="off"></label>'
+    +'<label>Future shadow evidence ref<input id="wbPromotionShadow" autocomplete="off"></label>'
+    +'<label>Future paper runtime evidence ref<input id="wbPromotionPaper" autocomplete="off"></label></div>';
+  var historyHtml=historyRows||'<li>当前 exact version 尚无生命周期事件。</li>';
+  box.innerHTML='<header class="strategy-editor-head"><h3>'+adaptiveEsc(item.name||item.id)+' '+wbStatusBadge(lifecycle.state||item.status)+'</h3>'
     +'<div><button type="button" onclick="wbBackToList()">返回列表</button></div></header>'
-    +'<div class="strategy-detail-columns"><section><h4>概况</h4><dl class="strategy-preview-grid">'
+    +'<section class="strategy-lifecycle-read-model" data-testid="strategy-lifecycle-read-model"><h4>当前生命周期</h4><dl class="strategy-preview-grid">'
+    +'<dt>Exact version</dt><dd>v'+adaptiveEsc(lifecycle.version||currentVersion)+'</dd><dt>Checksum</dt><dd><code>'+adaptiveEsc(lifecycle.checksum||item.current_checksum||'')+'</code></dd>'
+    +'<dt>允许正式新周期</dt><dd>'+(lifecycle.formal_cycle_allowed?'是':'否')+'</dd><dt>Legal transitions</dt><dd>'+adaptiveEsc((lifecycle.legal_transitions||[]).join(', ')||'无')+'</dd>'
+    +'<dt>Eligible transitions</dt><dd data-testid="eligible-transitions">'+adaptiveEsc(eligible.join(', ')||'无')+'</dd>'
+    +'<dt>Blocking reasons</dt><dd>'+adaptiveEsc((lifecycle.blocking_reasons||[]).join(', ')||'无')+'</dd></dl>'
+    +'<h4>安全意图</h4><div class="strategy-lifecycle-actions">'+(safetyButtons||'<small>没有安全迁移可用。</small>')+'</div>'
+    +'<h4>Promotion Policy 与 exact evidence</h4><p>eligibility 和阻断原因由后端返回；这里仅提交明确的 evidence identity 与 rationale。</p>'
+    +evidenceInputs+'<div class="strategy-promotion-targets">'+(promotionButtons||'<small>没有 promotion transition 可用。</small>')+'</div>'
+    +'<h4>Promotion proposals</h4><div class="strategy-promotion-proposals">'+(proposals||'<p>暂无 proposal。</p>')+'</div></section>'
+    +'<div class="strategy-detail-columns"><section><h4>运行时摘要</h4><dl class="strategy-preview-grid">'
     +'<dt>ID</dt><dd>'+adaptiveEsc(item.id)+'</dd><dt>来源</dt><dd>'+(item.origin==='user'?'自定义':'内置')+'</dd>'
-    +'<dt>当前版本</dt><dd>v'+currentVersion+'</dd><dt>支持新周期</dt><dd>'+(item.supports_new_cycle?'是':'否')+'</dd>'
     +'<dt>生命周期阶段</dt><dd>'+(runtime.runtime_ready?adaptiveEsc(runtime.lifecycle_stage||'—'):'—')+'</dd>'
-    +'<dt>资金系数</dt><dd>'+(runtime.runtime_ready&&runtime.capital_scale!=null?Math.round(runtime.capital_scale*100)+'%':'—')+'</dd>'
     +'<dt>运行时就绪</dt><dd>'+(item.runtime_ready===false?'否 · '+adaptiveEsc(item.runtime_error||''):'是')+'</dd></dl>'
-    +'<h4>生命周期时间线</h4><ul class="strategy-version-list">'+(timeline||'<li>暂无事件。</li>')+'</ul></section>'
-    +'<section><h4>版本历史（只读）</h4><ul class="strategy-version-list" data-testid="strategy-version-list">'+(versionRows||'<li>暂无版本。</li>')+'</ul></section></div>';
+    +'<h4>State history（全部版本）</h4><ul class="strategy-version-list" data-testid="strategy-lifecycle-history">'+historyHtml+'</ul></section>'
+    +'<section><h4>Strategy version history</h4><ul class="strategy-version-list" data-testid="strategy-version-list">'+(versionRows||'<li>暂无版本。</li>')+'</ul></section></div>';
   wbShowView('detail');
   window._strategiesRouteId=null;
   history.replaceState(null,'','#strategies/'+encodeURIComponent(strategyId));
   return item;
 }
-
 export function wbBackToList(){
   WB_STATE.view='list'; wbShowView('list');
   history.replaceState(null,'','#strategies');

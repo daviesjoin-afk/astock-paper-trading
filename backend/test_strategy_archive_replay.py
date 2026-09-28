@@ -17,7 +17,8 @@ from __future__ import annotations
 import sqlite3
 import unittest
 
-import strategy_registry as SR  # noqa: F401  (经由 G 暴露，显式导入便于阅读)
+import strategy_registry as SR
+from test_strategy_lifecycle_fixtures import archive_state, seed_legacy_state
 import test_production_path_golden_replay as G
 
 STRATEGY_ID = "arch_replay_beta"
@@ -53,9 +54,9 @@ class StrategyArchiveReplayTests(G.OfflinePaperEnv, unittest.TestCase):
                 metadata={"candidate_topn": 10, "style": "trend", "hold": 8},
                 actor="archive-test",
             )
-            SR.transition(conn, STRATEGY_ID, "validated", expected_status="draft",
+            seed_legacy_state(conn, STRATEGY_ID, "validated", expected_status="draft",
                           reason="archive validate", actor="archive-test")
-            SR.transition(conn, STRATEGY_ID, "active", expected_status="validated",
+            seed_legacy_state(conn, STRATEGY_ID, "active", expected_status="validated",
                           reason="archive activate", actor="archive-test")
             self.assertTrue(SR.get(STRATEGY_ID, conn=conn).supports_new_cycle)
 
@@ -90,22 +91,21 @@ class StrategyArchiveReplayTests(G.OfflinePaperEnv, unittest.TestCase):
                                actor="archive-test")
             spec = SR.get(STRATEGY_ID, conn=conn)
             self.assertEqual(spec.current_version, 2)
-            self.assertEqual(spec.status, "active")
+            self.assertEqual(spec.status, "draft")
 
-        # ---------- 4) pause：不再产生新信号 ----------
+        # ---------- 4) 新版本从 draft 开始，因此不能产生新信号 ----------
         with self._conn() as conn:
-            SR.transition(conn, STRATEGY_ID, "paused", expected_status="active",
-                          reason="archive pause", actor="archive-test")
             self.assertEqual(SR.get(STRATEGY_ID, conn=conn).supports_new_cycle, 0)
             signals_before = conn.execute(
                 "SELECT COUNT(*) FROM paper_signals WHERE account_id=?",
                 (STRATEGY_ID,),
             ).fetchone()[0]
         pause_scan = G.PT.generate_signals(G.D1)
-        self.assertFalse(
-            [row for row in pause_scan["accounts"] if row["id"] == STRATEGY_ID],
-            "暂停策略必须被排除出收盘扫描（无新信号通道）",
-        )
+        draft_rows = [row for row in pause_scan["accounts"] if row["id"] == STRATEGY_ID]
+        self.assertTrue(draft_rows)
+        self.assertTrue(draft_rows[0]["blocked"])
+        self.assertEqual(draft_rows[0]["created"], 0,
+                         "新版本 draft 可报告阻塞状态，但不能产生新信号")
         with self._conn() as conn:
             signals_after = conn.execute(
                 "SELECT COUNT(*) FROM paper_signals WHERE account_id=?",
@@ -113,10 +113,9 @@ class StrategyArchiveReplayTests(G.OfflinePaperEnv, unittest.TestCase):
             ).fetchone()[0]
         self.assertEqual(signals_before, signals_after)
 
-        # ---------- 5) retiring → archive ----------
+        # ---------- 5) archive ----------
         with self._conn() as conn:
-            SR.archive_definition(conn, STRATEGY_ID, reason="archive replay",
-                                  actor="archive-test")
+            archive_state(conn, STRATEGY_ID, reason="archive replay", actor="archive-test")
             spec = SR.get(STRATEGY_ID, conn=conn)
             self.assertEqual(spec.status, "archived")
             self.assertEqual(spec.supports_new_cycle, 0)

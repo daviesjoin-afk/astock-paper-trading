@@ -48,7 +48,8 @@ import paper_trading as PT  # noqa: E402
 import runtime_settings as RSET  # noqa: E402
 import self_evolution as SE  # noqa: E402
 import strategy_champion as SCM  # noqa: E402
-import strategy_registry as SR  # noqa: E402
+import strategy_registry as SR
+from test_strategy_lifecycle_fixtures import seed_legacy_state  # noqa: E402
 import strategy_runtime as SRT  # noqa: E402
 import universe as U  # noqa: E402
 
@@ -444,12 +445,12 @@ class ProductionPathGoldenReplayTests(OfflinePaperEnv, unittest.TestCase):
             )
             self.assertEqual(strategy.origin, "user")
             # 2) validate → activate（生产生命周期服务；激活即 supports_new_cycle）
-            SR.transition(conn, STRATEGY_ID, "validated", expected_status="draft",
+            seed_legacy_state(conn, STRATEGY_ID, "validated", expected_status="draft",
                           reason="golden validate", actor="golden-test")
-            SR.transition(conn, STRATEGY_ID, "active", expected_status="validated",
+            seed_legacy_state(conn, STRATEGY_ID, "active", expected_status="validated",
                           reason="golden activate", actor="golden-test")
             spec = SR.get(STRATEGY_ID, conn=conn)
-            self.assertEqual(spec.status, "active")
+            self.assertEqual(spec.status, "paper")
             self.assertTrue(spec.supports_new_cycle)
             readiness = SR.runtime_readiness(conn, STRATEGY_ID)
             self.assertTrue(all(readiness["checks"].values()), readiness)
@@ -808,9 +809,9 @@ class ProductionInvariantTests(OfflinePaperEnv, unittest.TestCase):
                 metadata={"candidate_topn": 10, "style": "trend", "hold": 8},
                 actor="invariant-test",
             )
-            SR.transition(conn, STRATEGY_ID, "validated", expected_status="draft",
+            seed_legacy_state(conn, STRATEGY_ID, "validated", expected_status="draft",
                           reason="validate", actor="invariant-test")
-            SR.transition(conn, STRATEGY_ID, "active", expected_status="validated",
+            seed_legacy_state(conn, STRATEGY_ID, "active", expected_status="validated",
                           reason="activate", actor="invariant-test")
             RSET.update(conn, {"enabled_strategies": [STRATEGY_ID]}, actor="invariant-test")
         PT.init_db()

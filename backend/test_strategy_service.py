@@ -94,6 +94,27 @@ class StrategyServiceTests(unittest.TestCase):
     def _draft(self, strategy_id: str, **overrides) -> dict:
         return SVC.create_strategy(self._create_request(strategy_id, **overrides))
 
+    def _propose(self, strategy_id, target_state, expected_state, *, evidence_bundle=None):
+        with P._db() as conn:
+            version = SR.get_version(strategy_id, conn=conn)
+        return SVC.create_promotion_proposal(strategy_id,
+            Models.PromotionProposalRequest.model_validate({
+                "strategy_version": version.version, "strategy_checksum": version.checksum,
+                "expected_state": expected_state, "target_state": target_state,
+                "evidence_bundle": evidence_bundle or {}, "proposer_type": "human",
+                "proposer_id": "service-test", "rationale": "service lifecycle test",
+            }))
+
+    def _apply(self, strategy_id, target_state, expected_state, proposal):
+        with P._db() as conn:
+            version = SR.get_version(strategy_id, conn=conn)
+        return SVC.transition(strategy_id, Models.StrategyTransitionRequest.model_validate({
+            "strategy_version": version.version, "strategy_checksum": version.checksum,
+            "expected_state": expected_state, "target_state": target_state,
+            "actor_type": "human", "actor_id": "service-test",
+            "proposal_fingerprint": proposal["proposal_fingerprint"],
+        }))
+
     # ---------- 1) 用例闭环 ----------
 
     def test_full_use_case_chain_without_fastapi(self):
@@ -115,23 +136,21 @@ class StrategyServiceTests(unittest.TestCase):
         self.assertEqual(updated["strategy"]["definition"]["description"], "第二版")
         self.assertEqual([row["version"] for row in SVC.list_versions("svc_alpha")], [1, 2])
 
-        self.assertEqual(SVC.transition("svc_alpha", Models.StrategyTransitionRequest.model_validate(
-            {"to_status": "validated", "expected_status": "draft"})).get("status"), "validated")
-        active = SVC.transition("svc_alpha", Models.StrategyTransitionRequest.model_validate(
-            {"to_status": "active", "expected_status": "validated"}))
-        self.assertEqual(active["status"], "active")
-        self.assertTrue(active["supports_new_cycle"])
-        # 用户策略 active 仍停在 pilot（PR-26 验收条件）。
-        self.assertEqual(active["runtime"]["lifecycle_stage"], "pilot")
+        proposal = self._propose("svc_alpha", "candidate", "draft")
+        self.assertTrue(proposal["decision"]["eligible"])
+        promoted = self._apply("svc_alpha", "candidate", "draft", proposal)
+        self.assertEqual(promoted["status"], "candidate")
+        self.assertFalse(promoted["supports_new_cycle"])
+        self.assertEqual(promoted["runtime"]["lifecycle_stage"], "shadow")
 
         cloned = SVC.clone_strategy("svc_alpha", Models.StrategyCloneRequest.model_validate(
             {"source_version": 1, "new_strategy_id": "svc_clone"}))
         self.assertEqual((cloned["id"], cloned["status"], cloned["version"]), ("svc_clone", "draft", 1))
 
         events = SVC.list_events("svc_alpha")
-        transitions = [(row["from_status"], row["to_status"]) for row in events]
+        transitions = [(row["from_state"], row["to_state"]) for row in events]
         self.assertIn((None, "draft"), transitions)
-        self.assertIn(("draft", "validated"), transitions)
+        self.assertIn(("draft", "candidate"), transitions)
 
         self.assertTrue(SVC.delete_unused_draft("svc_clone")["deleted"])
         with self.assertRaises(SVC.StrategyNotFound):
@@ -194,9 +213,14 @@ class StrategyServiceTests(unittest.TestCase):
                 {"id": "BAD ID!", "name": "x"}))
         with self.assertRaises(SVC.InvalidStrategyDefinition):
             SVC.update_strategy("svc_alpha2", Models.StrategyUpdateRequest.model_validate({}))
+        self._draft("svc_alpha2")
+        with P._db() as conn:
+            version = SR.get_version("svc_alpha2", conn=conn)
         with self.assertRaises(SVC.InvalidStrategyDefinition):
             SVC.transition("svc_alpha2", Models.StrategyTransitionRequest.model_validate(
-                {"to_status": ""}))
+                {"strategy_version": version.version, "strategy_checksum": version.checksum,
+                 "expected_state": "draft", "target_state": "candidate",
+                 "actor_type": "human", "actor_id": "service-test"}))
 
     def test_invalid_dsl_raises_dedicated_type(self):
         with self.assertRaises(SVC.InvalidStrategyDsl):
@@ -210,17 +234,20 @@ class StrategyServiceTests(unittest.TestCase):
         with self.assertRaises(SVC.StrategyVersionConflict):
             SVC.update_strategy("svc_conflict", Models.StrategyUpdateRequest.model_validate(
                 {"expected_version": 9, "changes": {"description": "过期写"}}))
-        # draft 不能直接跳 active。
+        # draft 的 safety transition 也受 canonical transition table 限制。
         with self.assertRaises(SVC.InvalidLifecycleTransition):
             SVC.transition("svc_conflict", Models.StrategyTransitionRequest.model_validate(
-                {"to_status": "active"}))
+                {"strategy_version": 1,
+                 "strategy_checksum": SR.get("svc_conflict").current_checksum,
+                 "expected_state": "draft", "target_state": "paused",
+                 "actor_type": "human", "actor_id": "service-test",
+                 "reason_code": "test", "reason": "invalid edge"}))
 
     def test_runtime_not_ready_raises_before_validated(self):
         self._draft("svc_no_dsl", dsl_ast=None)
-        with self.assertRaises(SVC.StrategyRuntimeNotReady) as ctx:
-            SVC.transition("svc_no_dsl", Models.StrategyTransitionRequest.model_validate(
-                {"to_status": "validated", "expected_status": "draft"}))
-        self.assertIn("runtime is not ready", str(ctx.exception))
+        proposal = self._propose("svc_no_dsl", "candidate", "draft")
+        self.assertFalse(proposal["decision"]["eligible"])
+        self.assertIn("strategy_runtime_not_ready", proposal["decision"]["blocking_reasons"])
 
     def test_historical_reference_raises_dedicated_type(self):
         self._draft("svc_referenced")
