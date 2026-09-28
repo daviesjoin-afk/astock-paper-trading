@@ -69,6 +69,11 @@ def allows_formal_cycle(state: str) -> bool:
     return str(state or "") in FORMAL_CYCLE_STATES
 
 
+def _table_columns(conn: sqlite3.Connection, table_name: str) -> set[str]:
+    return {str(row[1]) for row in conn.execute(
+        f"PRAGMA table_info({table_name})").fetchall()}
+
+
 def ensure_schema(conn: sqlite3.Connection) -> None:
     """Install lifecycle owners and idempotently migrate exact live-cycle pins."""
     conn.executescript("""
@@ -135,10 +140,16 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
     # leaves the live cycle without lifecycle authority. Use the legacy
     # strategy-level status as the migration source for these missing exact
     # pins; never copy the lifecycle state of the newer head.
-    required_tables = {"paper_cycles", "paper_cycle_strategy_versions"}
+    required_columns = {
+        "paper_cycles": {"id", "status"},
+        "paper_cycle_strategy_versions": {
+            "cycle_id", "strategy_id", "strategy_version", "strategy_checksum"},
+        "paper_strategy_versions": {"strategy_id", "version", "checksum"},
+    }
     existing_tables = {str(row[0]) for row in conn.execute(
         "SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
-    if required_tables.issubset(existing_tables):
+    if all(table in existing_tables and columns <= _table_columns(conn, table)
+           for table, columns in required_columns.items()):
         pinned = conn.execute("""SELECT p.strategy_id,p.strategy_version,p.strategy_checksum,
                 d.lifecycle_status,GROUP_CONCAT(DISTINCT c.id)
             FROM paper_cycle_strategy_versions p
@@ -193,9 +204,16 @@ def _is_current_head(conn, strategy_id: str, version: int, checksum: str) -> boo
 
 def is_live_cycle_pinned(conn: sqlite3.Connection, strategy_id: str, version: int,
                          checksum: str) -> bool:
+    required_columns = {
+        "paper_cycles": {"id", "status"},
+        "paper_cycle_strategy_versions": {
+            "cycle_id", "strategy_id", "strategy_version", "strategy_checksum"},
+        "paper_strategy_versions": {"strategy_id", "version", "checksum"},
+    }
     tables = {str(row[0]) for row in conn.execute(
         "SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
-    if not {"paper_cycles", "paper_cycle_strategy_versions"}.issubset(tables):
+    if not all(table in tables and columns <= _table_columns(conn, table)
+               for table, columns in required_columns.items()):
         return False
     return conn.execute("""SELECT 1 FROM paper_cycle_strategy_versions p
         JOIN paper_cycles c ON c.id=p.cycle_id

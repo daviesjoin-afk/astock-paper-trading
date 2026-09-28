@@ -22,7 +22,7 @@ Only `paper` and `production_sim` satisfy `strategy_lifecycle.allows_formal_cycl
 
 ## State changes and proposals
 
-Lifecycle writes bind an exact current version, expected state, actor, and target. State and event writes use one immediate SQLite transaction plus compare-and-swap. A conflict writes no event. Lifecycle events and promotion proposals have database-level append-only guards.
+Lifecycle writes bind an exact immutable version and checksum, expected state, actor, and target. Promotion remains current-head-only. Safety transitions can also target an older exact version while a live cycle still pins that version; the owner verifies its checksum and live cycle binding inside the write transaction. Arbitrary unpinned historical versions cannot be changed. State and event writes use one immediate SQLite transaction plus compare-and-swap. A conflict writes no event. Lifecycle events and promotion proposals have database-level append-only guards.
 
 Promotion rules are evidence checks, not return or win-rate thresholds:
 
@@ -39,9 +39,11 @@ No latest-run/report fallback exists. Apply re-reads the selected immutable R29/
 
 AI may create a proposal with exact references and rationale. AI cannot apply any lifecycle transition. Human/system safety intent can pause, quarantine, retire, archive, or reject only along legal edges and with a reason.
 
+`paused → paper` and `paused → production_sim` are explicit human-only resume operations, not promotions. A pause from either formal state records that exact resume target in its immutable event; resume must match it, name a reason, and audit the pause event it resumes. A pause from a non-formal state does not grant a route to `paper` or `production_sim`, so resume cannot bypass promotion evidence. Legacy rows that only say `paused` have no source mode; the fixed recovery policy maps them to `paper` and records that decision in the resume event. Cycle ownership, capital, lots, and exact version pins are independent of pause/resume; lifecycle only controls execution permission.
+
 ## Legacy migration
 
-The first lifecycle-owner schema initialization imports only the existing current state as one `legacy_import` event with `migration_source=legacy_strategy_registry`:
+The first lifecycle-owner schema initialization imports the existing current state as one `legacy_import` event with `migration_source=legacy_strategy_registry`:
 
 | Legacy value | Canonical value |
 | --- | --- |
@@ -52,7 +54,9 @@ The first lifecycle-owner schema initialization imports only the existing curren
 | `retiring` | `retiring` |
 | `archived` | `archived` |
 
-Migration does not invent `candidate`, `research`, or `shadow` history. Old `strategy_definition_events` remain available for audit but have no new writers. Legacy lifecycle columns remain because the current SQLite table is retained without a risky rebuild. They are non-authoritative and never read by production decisions. New identity-row creation writes only the required `draft` / `0` placeholders; the migration imports old values once, while lifecycle changes never write those columns. All state changes and reads use `strategy_lifecycle`.
+Migration does not invent `candidate`, `research`, or `shadow` history. Existing `strategy_definition_events` for retained definitions remain available for audit but have no new writers. Deleting an unused scratch definition removes its legacy event rows to satisfy the restrictive foreign key; its canonical lifecycle state/events remain as a permanent identity tombstone. Legacy lifecycle columns remain because the current SQLite table is retained without a risky rebuild. They are non-authoritative and never read by production decisions. New identity-row creation writes only the required `draft` / `0` placeholders; the migration imports old values once, while lifecycle changes never write those columns. All state changes and reads use `strategy_lifecycle`.
+
+Upgrade also checks exact versions pinned by cycles in `draft`, `running`, or `paused` status. For a missing pinned-version row, it imports the legacy strategy status as a one-time migration event for that exact immutable version; it never copies the newer head's lifecycle state. The migration runs only when the cycle, pin, and version tables expose all identity and status columns needed to prove the binding. A compatibility schema without those columns cannot claim a live pin, and safety operations on a non-head version fail closed. Repeated initialization is idempotent.
 
 ## API contract
 
@@ -63,7 +67,7 @@ Migration does not invent `candidate`, `research`, or `shadow` history. Old `str
 | `GET /api/strategies/{id}/events` | Canonical lifecycle events across exact versions |
 | `POST /api/strategies/{id}/promotion/proposals` | Append proposal with exact version/checksum/state/target, explicit evidence references, proposer and rationale |
 | `GET /api/strategies/{id}/promotion/proposals` | Bounded proposal list, optionally scoped to one version |
-| `POST /api/strategies/{id}/transition` | Requires version, checksum, expected state, target and actor. Promotion requires `proposal_fingerprint`; safety intent requires `reason_code` and `reason`. `actor_type=ai` is rejected. |
+| `POST /api/strategies/{id}/transition` | Requires version, checksum, expected state, target and actor. Promotion requires `proposal_fingerprint`; safety intent and explicit resume require `reason_code` and `reason`. Resume is human-only and must match the recorded pause origin. `actor_type=ai` is rejected. |
 
 The API delegates all transition and eligibility decisions to the two owners. The UI renders backend-provided legal/eligible states and evidence decisions; it does not calculate promotion rules.
 
@@ -76,7 +80,7 @@ The API delegates all transition and eligibility decisions to the two owners. Th
 | `api_strategies` / models | No | Through service | No direct writes | Response compatibility alias only | Before: indirectly | Exact version and proposal request contract |
 | Paper runtime / cycle selection | No | Current or pinned exact lifecycle owner state | No lifecycle writes | No physical read; derived compatibility projection only | Before: no | Formal-cycle eligibility comes from lifecycle owner |
 | Strategy list/detail | No | Yes | No | Derived API field only | Before: no | Canonical lifecycle read model and event history |
-| Hard-delete guard | No | Yes, including exact-version history | No lifecycle writes | No | Before: no | `never_left_draft` uses canonical event history |
+| Hard-delete guard | No | Yes, including exact-version history | No lifecycle writes | No | Before: no | `never_left_draft` uses canonical event history; scratch deletion removes legacy FK events but retains canonical state/events as an identity tombstone, so the id cannot be reused |
 | Frontend strategy admin | No | Backend read model only | Sends proposal/transition requests | Renders derived field only | Before: transition endpoint | Renders backend state, history, evidence, and decisions; no business rules |
 | `promotion_science.py` | No | No R31 lifecycle read | No R31 state writes | No | No | Retained for existing challenger science; not the generic R31 policy owner |
 

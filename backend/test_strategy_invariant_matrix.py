@@ -202,6 +202,11 @@ class LifecycleMatrixTests(_RegistryFixture):
         while queue:
             node, path = queue.pop(0)
             for nxt in sorted(graph.get(node, ())):
+                # Resume is stateful: paused -> paper/production_sim is valid
+                # only after a pause event from that same formal state. It is
+                # not a context-free BFS edge.
+                if node == "paused" and nxt in SL.RESUME_TRANSITION_TARGETS:
+                    continue
                 if nxt in seen:
                     continue
                 trail = path + [nxt]
@@ -217,8 +222,9 @@ class LifecycleMatrixTests(_RegistryFixture):
 
     def _transition(self, strategy_id, source, target):
         version = SR.get_version(strategy_id, conn=self.conn)
+        resume = source == "paused" and target in SL.RESUME_TRANSITION_TARGETS
         safety = target in SL.SAFETY_TRANSITION_TARGETS
-        decision = None if safety else {
+        decision = None if safety or resume else {
             "eligible": True, "strategy_id": strategy_id,
             "strategy_version": version.version, "strategy_checksum": version.checksum,
             "from_state": source, "target_state": target,
@@ -227,10 +233,12 @@ class LifecycleMatrixTests(_RegistryFixture):
         SL.transition(self.conn, strategy_id=strategy_id,
             strategy_version=version.version, strategy_checksum=version.checksum,
             expected_state=source, target_state=target, actor_type="human",
-            actor_id="matrix-test", transition_kind="safety" if safety else "promotion",
+            actor_id="matrix-test", transition_kind=("resume" if resume else
+                "safety" if safety else "promotion"),
             promotion_decision=decision,
-            reason_code="matrix-safety" if safety else "",
-            reason_text="Matrix safety edge" if safety else "")
+            reason_code="matrix-resume" if resume else "matrix-safety" if safety else "",
+            reason_text="Matrix resume edge" if resume else
+                "Matrix safety edge" if safety else "")
         self.conn.commit()
 
     def test_graph_is_well_formed(self):
@@ -248,7 +256,12 @@ class LifecycleMatrixTests(_RegistryFixture):
             for target in sorted(targets):
                 with self.subTest(source=source, target=target):
                     strategy_id = self._create(f"m_{source}_{target}")
-                    self._walk_to(strategy_id, source)
+                    if source == "paused" and target in SL.RESUME_TRANSITION_TARGETS:
+                        # Build the exact origin, then record pause and resume.
+                        self._walk_to(strategy_id, target)
+                        self._transition(strategy_id, target, "paused")
+                    else:
+                        self._walk_to(strategy_id, source)
                     self._transition(strategy_id, source, target)
                     spec = SR.get(strategy_id, conn=self.conn)
                     self.assertEqual(target, spec.status)
@@ -277,6 +290,18 @@ class LifecycleMatrixTests(_RegistryFixture):
         self.assertTrue(SR.get(strategy_id, conn=self.conn).supports_new_cycle)
         self._transition(strategy_id, "paper", "paused")
         self.assertFalse(SR.get(strategy_id, conn=self.conn).supports_new_cycle)
+
+    def test_pausing_research_state_cannot_be_used_to_resume_to_paper(self):
+        strategy_id = self._create("resume_requires_formal_origin")
+        self._walk_to(strategy_id, "validated")
+        self._transition(strategy_id, "validated", "paused")
+        version = SR.get_version(strategy_id, conn=self.conn)
+        with self.assertRaisesRegex(SL.LifecycleError, "paused_resume_source_unavailable"):
+            SL.transition(self.conn, strategy_id=strategy_id,
+                strategy_version=version.version, strategy_checksum=version.checksum,
+                expected_state="paused", target_state="paper", actor_type="human",
+                actor_id="matrix-test", transition_kind="resume",
+                reason_code="resume", reason_text="Must not bypass formal promotion evidence.")
 
 
 class ImmutableVersionTimelineTests(_RegistryFixture):

@@ -99,6 +99,30 @@ class R31LifecycleFinalBoundaries(unittest.TestCase):
         self.assertEqual("draft", SL.get_state(self.conn, "tq_breakout", newer.version,
                                                 checksum=newer.checksum)["state"])
 
+    def test_compat_cycle_schema_without_status_cannot_claim_live_pin(self):
+        old = SR.get_version("tq_breakout", conn=self.conn)
+        self.conn.execute("CREATE TABLE paper_cycles(id INTEGER PRIMARY KEY)")
+        self.conn.execute("INSERT INTO paper_cycles(id) VALUES(9)")
+        self.conn.execute("""INSERT INTO paper_cycle_strategy_versions
+            (cycle_id,account_id,strategy_id,strategy_version,strategy_checksum,bound_at)
+            VALUES(9,'tq_breakout','tq_breakout',?,?, '2026-09-28T00:00:00Z')""",
+            (old.version, old.checksum))
+        new = SR.save_definition(self.conn, "tq_breakout", {"description": "new head"})
+
+        # Both bootstrap and safety checks must fail closed when the legacy
+        # cycle table cannot prove whether a cycle is still live.
+        SL.ensure_schema(self.conn)
+        self.assertFalse(SL.is_live_cycle_pinned(
+            self.conn, "tq_breakout", old.version, old.checksum))
+        with self.assertRaisesRegex(SL.LifecycleError, "strategy_version_changed"):
+            SL.transition(self.conn, strategy_id="tq_breakout",
+                strategy_version=old.version, strategy_checksum=old.checksum,
+                expected_state="paper", target_state="paused", actor_type="human",
+                actor_id="r31-test", transition_kind="safety", reason_code="incident",
+                reason_text="Cannot prove a live binding from the compatibility schema.")
+        self.assertEqual("draft", SL.get_state(self.conn, "tq_breakout", new.version,
+                                                checksum=new.checksum)["state"])
+
     def test_pause_remove_resume_restores_participation_without_changing_cycle_or_lots(self):
         spec, version = self._paper_user()
         self._cycle_schema()
