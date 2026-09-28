@@ -117,7 +117,8 @@ def _valid_execution_context(*, side="buy", quantity=100, sellable=1000, quote_a
     return EP.ExecutionContext(
         session_date="2026-09-08", execution_asof=quote_at, quote=quote,
         market_reading=reading, tradability=tradability,
-        available_liquidity=1_000_000, sellable_quantity=sellable,
+        available_liquidity=max(0, int(quote["amount"] / quote["price"])),
+        sellable_quantity=sellable,
         already_filled_quantity=already_filled, current_order_status=status,
     )
 
@@ -273,12 +274,14 @@ class ExecutionPolicyTests(_StubbedPlannerTest):
 class SimulationExecutionContractTests(unittest.TestCase):
     DAY = "2026-09-08"
 
-    def _facts(self, *, quote_at=None, execution_asof=None, amount=50_000_000.0,
+    def _facts(self, *, quote_at=None, execution_asof=None, amount=None,
                can_buy=True, can_sell=True, buy_reason="ok", sell_reason="ok",
                liquidity=50_000, sellable=50_000, status="pending_execution",
                verification="cross_source_checked", session_consumed=0):
         quote_at = quote_at or f"{self.DAY} 10:00:00"
         execution_asof = execution_asof or quote_at
+        if amount is None:
+            amount = liquidity * 20.0
         quote = {
             "code": "600901", "price": 20.0, "amount": amount,
             "quote_at": quote_at, "execution_asof": execution_asof,
@@ -474,7 +477,6 @@ class SimulationExecutionContractTests(unittest.TestCase):
                     asof_day=formal_context.session_date,
                     market_reading=formal_context.market_reading,
                     tradability=formal_context.tradability,
-                    available_liquidity=formal_context.available_liquidity,
                     state=EP.ExecutionStateSnapshot(
                         buying_power=formal_context.buying_power,
                         sellable_quantity=formal_context.sellable_quantity,
@@ -913,6 +915,78 @@ class PlanEntryTests(_StubbedPlannerTest):
 
 
 class ExecutionStateBuilderTests(unittest.TestCase):
+    def test_execution_state_fingerprint_tracks_every_decision_field(self):
+        base = EP.ExecutionStateSnapshot(
+            buying_power=50_000.0, sellable_quantity=300,
+            already_filled_quantity=20, same_day_consumed_quantity=30,
+            current_order_status="pending_execution", lot_size=100,
+            participation_rate=0.01,
+        )
+        baseline = EP.execution_state_fingerprint(base)
+        for field, value in (
+            ("buying_power", 0.0),
+            ("sellable_quantity", 200),
+            ("already_filled_quantity", 21),
+            ("same_day_consumed_quantity", 31),
+            ("current_order_status", "cancelled"),
+            ("lot_size", 10),
+            ("participation_rate", 0.02),
+        ):
+            with self.subTest(field=field):
+                self.assertNotEqual(
+                    baseline,
+                    EP.execution_state_fingerprint(replace(base, **{field: value})),
+                )
+
+    def test_entry_gate_state_fingerprint_tracks_cash_risk_and_capacity(self):
+        base = EP.EntryGateState(
+            open_codes={"600000", "000001"},
+            committed_open_codes={"600000"},
+            pool_open_positions={("tq_breakout", "600000")},
+            position_limit=4, pool_limit=6, capacity_available=True,
+            seat_reserve={"reserved": False, "owner": None},
+            pending_cash=100.0, shared_cash=50_000.0,
+            account_risk_state={"blocked": False, "reasons": []},
+            market_state={"light": "green"},
+            allocation_source="canonical", allocation_version="v1",
+        )
+        baseline = EP.entry_gate_state_fingerprint(base)
+        for variation in (
+            {"pending_cash": 101.0},
+            {"shared_cash": 49_999.0},
+            {"account_risk_state": {"blocked": True, "reasons": ["risk"]}},
+            {"capacity_available": False},
+            {"position_limit": 3},
+            {"seat_reserve": {"reserved": True, "owner": "main_force_top10"}},
+        ):
+            with self.subTest(variation=variation):
+                self.assertNotEqual(
+                    baseline,
+                    EP.entry_gate_state_fingerprint(replace(base, **variation)),
+                )
+
+    def test_entry_gate_state_identity_ignores_mapping_and_set_order(self):
+        one = EP.EntryGateState(
+            open_codes={"600000", "000001"}, committed_open_codes={"600000"},
+            pool_open_positions={("tq_breakout", "600000"), ("sector_rotation", "300750")},
+            seat_reserve={"reserved": False, "detail": {"b": 2, "a": 1}},
+            account_risk_state={"blocked": False, "reasons": []},
+            market_state={"light": "green", "source": "owner"},
+        )
+        two = EP.EntryGateState(
+            open_codes=set(["000001", "600000"]),
+            committed_open_codes=set(["600000"]),
+            pool_open_positions=set([("sector_rotation", "300750"),
+                                     ("tq_breakout", "600000")]),
+            seat_reserve={"detail": {"a": 1, "b": 2}, "reserved": False},
+            account_risk_state={"reasons": [], "blocked": False},
+            market_state={"source": "owner", "light": "green"},
+        )
+        self.assertEqual(
+            EP.entry_gate_state_fingerprint(one),
+            EP.entry_gate_state_fingerprint(two),
+        )
+
     def test_explicit_state_builder_is_bit_identical_to_formal_context_shape(self):
         formal = _valid_execution_context(side="buy", quantity=100, sellable=300,
                                           already_filled=0)
@@ -921,7 +995,6 @@ class ExecutionStateBuilderTests(unittest.TestCase):
             quote=dict(formal.quote), asof_day=formal.session_date,
             market_reading=formal.market_reading,
             tradability=formal.tradability,
-            available_liquidity=formal.available_liquidity,
             state=EP.ExecutionStateSnapshot(
                 buying_power=50000.0, sellable_quantity=300,
                 already_filled_quantity=0, same_day_consumed_quantity=0,
@@ -940,6 +1013,20 @@ class ExecutionStateBuilderTests(unittest.TestCase):
             EP.evaluate_simulated_execution(intent, isolated),
         )
 
+    def test_formal_and_explicit_state_builders_share_quote_derived_liquidity(self):
+        formal = _valid_execution_context()
+        explicit = EP.execution_context_from_state(
+            order={"code": "002241", "side": "buy"},
+            quote=dict(formal.quote), asof_day=formal.session_date,
+            market_reading=formal.market_reading, tradability=formal.tradability,
+            state=EP.ExecutionStateSnapshot(buying_power=50_000.0,
+                                             sellable_quantity=1000),
+        )
+        self.assertEqual(
+            max(0, int(formal.quote["amount"] / formal.quote["price"])),
+            explicit.available_liquidity,
+        )
+
     def test_execution_audit_keeps_new_context_and_legacy_unknown_explicit(self):
         context = _valid_execution_context()
         sha = lambda value: hashlib.sha256(value.encode("utf-8")).hexdigest()
@@ -952,6 +1039,17 @@ class ExecutionStateBuilderTests(unittest.TestCase):
             tradability_evidence_fingerprints={"002241@2026-09-08": sha("tradability")},
             execution_ruleset_version=EP.SIMULATION_EXECUTION_RULESET,
             risk_policy_identity={"strategy_profile": {"max_positions": 4}},
+            execution_state_fingerprint=EP.execution_state_fingerprint(
+                EP.ExecutionStateSnapshot(
+                    buying_power=context.buying_power,
+                    sellable_quantity=context.sellable_quantity,
+                    already_filled_quantity=context.already_filled_quantity,
+                    same_day_consumed_quantity=context.same_day_consumed_quantity,
+                    current_order_status=context.current_order_status,
+                    lot_size=context.lot_size,
+                    participation_rate=context.participation_rate,
+                )
+            ),
         )
         context = replace(context, runtime_context=runtime)
         intent = EP.PersistedOrderIntent(

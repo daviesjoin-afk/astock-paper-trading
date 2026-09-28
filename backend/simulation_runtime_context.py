@@ -13,7 +13,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
-CONTEXT_SCHEMA_VERSION = "comparable-runtime-context-v1"
+CONTEXT_SCHEMA_VERSION = "comparable-runtime-context-v2"
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 
 
@@ -85,6 +85,8 @@ class ComparableRuntimeContext:
     tradability_evidence_fingerprints: tuple[tuple[str, str], ...]
     execution_ruleset_version: str
     risk_policy_identity: str
+    execution_state_fingerprint: str | None
+    entry_gate_state_fingerprint: str | None
     context_fingerprint: str
 
     def projection(self) -> dict[str, Any]:
@@ -101,6 +103,8 @@ class ComparableRuntimeContext:
             "tradability_evidence_fingerprints": dict(self.tradability_evidence_fingerprints),
             "execution_ruleset_version": self.execution_ruleset_version,
             "risk_policy_identity": json.loads(self.risk_policy_identity),
+            "execution_state_fingerprint": self.execution_state_fingerprint,
+            "entry_gate_state_fingerprint": self.entry_gate_state_fingerprint,
             "context_fingerprint": self.context_fingerprint,
         }
 
@@ -112,6 +116,8 @@ def build_comparable_runtime_context(
     symbol_quote_fingerprints: Mapping[str, str],
     tradability_evidence_fingerprints: Mapping[str, str],
     execution_ruleset_version: str, risk_policy_identity: Mapping[str, Any],
+    execution_state_fingerprint: str | None = None,
+    entry_gate_state_fingerprint: str | None = None,
 ) -> ComparableRuntimeContext:
     """Build the same context identity from the same explicit semantic inputs."""
     strategy_id = str(strategy_id or "").strip()
@@ -134,6 +140,14 @@ def build_comparable_runtime_context(
         raise ValueError("execution ruleset identity is required")
     if not isinstance(risk_policy_identity, Mapping) or not risk_policy_identity:
         raise ValueError("risk policy identity is required")
+    if execution_state_fingerprint is None and entry_gate_state_fingerprint is None:
+        raise ValueError("decision state identity is required")
+    for label, fingerprint in (
+        ("execution state", execution_state_fingerprint),
+        ("entry gate state", entry_gate_state_fingerprint),
+    ):
+        if fingerprint is not None and not _SHA256.fullmatch(str(fingerprint)):
+            raise ValueError(f"{label} identity is invalid")
     risk_json = _json(risk_policy_identity)
     identity = {
         "context_schema_version": CONTEXT_SCHEMA_VERSION,
@@ -148,6 +162,8 @@ def build_comparable_runtime_context(
         "tradability_evidence_fingerprints": dict(tradability),
         "execution_ruleset_version": str(execution_ruleset_version),
         "risk_policy_identity": json.loads(risk_json),
+        "execution_state_fingerprint": execution_state_fingerprint,
+        "entry_gate_state_fingerprint": entry_gate_state_fingerprint,
     }
     return ComparableRuntimeContext(
         context_schema_version=CONTEXT_SCHEMA_VERSION,
@@ -162,5 +178,9 @@ def build_comparable_runtime_context(
         tradability_evidence_fingerprints=tradability,
         execution_ruleset_version=str(execution_ruleset_version),
         risk_policy_identity=risk_json,
+        execution_state_fingerprint=(str(execution_state_fingerprint)
+                                     if execution_state_fingerprint is not None else None),
+        entry_gate_state_fingerprint=(str(entry_gate_state_fingerprint)
+                                      if entry_gate_state_fingerprint is not None else None),
         context_fingerprint=_sha256(identity),
     )

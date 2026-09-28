@@ -26,6 +26,7 @@ def _build(**changes):
         "tradability_evidence_fingerprints": {"600000@2026-09-28": _sha("tradability")},
         "execution_ruleset_version": "a-share-simulation-v1",
         "risk_policy_identity": {"compiled_profile": {"max_positions": 4}},
+        "execution_state_fingerprint": _sha("execution-state"),
     }
     values.update(changes)
     return SRC.build_comparable_runtime_context(**values)
@@ -59,6 +60,8 @@ class ComparableRuntimeContextTests(unittest.TestCase):
             {"risk_policy_identity": {"compiled_profile": {"max_positions": 3}}},
             {"market_snapshot_fingerprint": _sha("market-v2")},
             {"tradability_evidence_fingerprints": {"600000@2026-09-28": _sha("changed")}},
+            {"execution_state_fingerprint": _sha("changed-state")},
+            {"entry_gate_state_fingerprint": _sha("changed-entry-state")},
         )
         for variation in variations:
             with self.subTest(variation=variation):
@@ -71,9 +74,21 @@ class ComparableRuntimeContextTests(unittest.TestCase):
             {"tradability_evidence_fingerprints": {}},
             {"execution_ruleset_version": ""},
             {"risk_policy_identity": {}},
+            {"execution_state_fingerprint": "invalid"},
         ):
             with self.subTest(variation=variation), self.assertRaises(ValueError):
                 _build(**variation)
+
+    def test_decision_context_requires_and_binds_a_state_identity(self):
+        with self.assertRaisesRegex(ValueError, "decision state identity"):
+            _build(execution_state_fingerprint=None)
+        entry_context = _build(
+            execution_state_fingerprint=None,
+            entry_gate_state_fingerprint=_sha("entry-state"),
+        )
+        self.assertEqual(_sha("entry-state"),
+                         entry_context.entry_gate_state_fingerprint)
+        self.assertIsNone(entry_context.execution_state_fingerprint)
 
     def test_context_module_is_a_pure_contract(self):
         source = pathlib.Path(SRC.__file__).read_text(encoding="utf-8")

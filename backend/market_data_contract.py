@@ -528,6 +528,7 @@ def snapshot_fingerprint(snapshot: MarketDataSnapshot) -> str:
         "verification": snapshot.verification,
         "verification_method": snapshot.verification_method,
         "verification_detail": details,
+        "degraded_reason": snapshot.degraded_reason,
         "rows": sorted(row_blobs),
     }
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"),

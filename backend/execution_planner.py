@@ -29,6 +29,8 @@ from __future__ import annotations
 import sqlite3
 import datetime as dt
 import hashlib
+import json
+import math
 from dataclasses import dataclass, field
 from enum import Enum
 from types import MappingProxyType
@@ -46,6 +48,8 @@ __all__ = [
     "ExecutionPolicy",
     "ExecutionStateSnapshot",
     "EntryGateState",
+    "execution_state_fingerprint",
+    "entry_gate_state_fingerprint",
     "ExecutionContext",
     "ExecutionDecision",
     "ExecutionReason",
@@ -246,7 +250,44 @@ def _freeze_evidence(value):
         return tuple(_freeze_evidence(item) for item in value)
     if isinstance(value, tuple):
         return tuple(_freeze_evidence(item) for item in value)
+    if isinstance(value, (set, frozenset)):
+        return frozenset(_freeze_evidence(item) for item in value)
     return value
+
+
+def _canonical_state_value(value):
+    """Canonical JSON-ready representation owned by the execution state contract."""
+    if isinstance(value, Enum):
+        return _canonical_state_value(value.value)
+    if value is None or isinstance(value, (str, bool, int)):
+        return value
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ValueError("execution state contains a non-finite number")
+        return value
+    if isinstance(value, (dt.date, dt.datetime)):
+        return value.isoformat()
+    if isinstance(value, Mapping):
+        if any(not isinstance(key, str) for key in value):
+            raise ValueError("execution state mapping keys must be strings")
+        return {key: _canonical_state_value(item) for key, item in value.items()}
+    if isinstance(value, (tuple, list)):
+        return [_canonical_state_value(item) for item in value]
+    if isinstance(value, (set, frozenset)):
+        items = [_canonical_state_value(item) for item in value]
+        return sorted(items, key=lambda item: json.dumps(
+            item, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+            allow_nan=False,
+        ))
+    raise ValueError(f"unsupported execution state value: {type(value).__name__}")
+
+
+def _state_fingerprint(kind, values):
+    encoded = json.dumps(
+        _canonical_state_value({"schema": f"{kind}-v1", **values}),
+        sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 @dataclass(frozen=True, slots=True)
@@ -262,9 +303,24 @@ class ExecutionStateSnapshot:
     participation_rate: float = MAX_VOLUME_PARTICIPATION
 
 
+def execution_state_fingerprint(state: ExecutionStateSnapshot) -> str:
+    """Return identity for every captured value consumed by execution rules."""
+    if not isinstance(state, ExecutionStateSnapshot):
+        raise TypeError("execution state snapshot is required")
+    return _state_fingerprint("execution-state", {
+        "buying_power": state.buying_power,
+        "sellable_quantity": state.sellable_quantity,
+        "already_filled_quantity": state.already_filled_quantity,
+        "same_day_consumed_quantity": state.same_day_consumed_quantity,
+        "current_order_status": state.current_order_status,
+        "lot_size": state.lot_size,
+        "participation_rate": state.participation_rate,
+    })
+
+
 def execution_context_from_state(
     *, order: Mapping[str, Any], quote: Mapping[str, Any], asof_day: Any,
-    market_reading: Any, tradability: Any, available_liquidity: int,
+    market_reading: Any, tradability: Any,
     state: ExecutionStateSnapshot, runtime_context: Any = None,
 ) -> ExecutionContext:
     """Build canonical execution inputs from facts and explicit isolated state.
@@ -275,11 +331,15 @@ def execution_context_from_state(
     if not isinstance(state, ExecutionStateSnapshot):
         raise TypeError("execution state snapshot is required")
     day = MDC.canonical_day(asof_day) or ""
-    execution_asof = (quote or {}).get("execution_asof")
+    quote = dict(quote or {})
+    execution_asof = quote.get("execution_asof")
+    price = _positive_number(quote.get("price"))
+    amount = _positive_number(quote.get("amount"))
+    available_liquidity = max(0, int(amount / price)) if price and amount else 0
     return ExecutionContext(
         session_date=day,
         execution_asof=str(execution_asof or "") or None,
-        quote=dict(quote or {}),
+        quote=quote,
         market_reading=market_reading,
         tradability=tradability,
         available_liquidity=max(0, int(available_liquidity)),
@@ -449,9 +509,6 @@ def execution_context_from_facts(
                 conn, exclude_order_key=str(row.get("id")),
             )
             buying_power = max(0.0, float(PT._shared_cash(conn) or 0) - float(pending or 0))
-    price = _positive_number(quote.get("price"))
-    amount = _positive_number(quote.get("amount"))
-    liquidity = max(0, int(amount / price)) if price and amount else 0
     state = ExecutionStateSnapshot(
         buying_power=buying_power,
         sellable_quantity=sellable,
@@ -464,15 +521,18 @@ def execution_context_from_facts(
     runtime_context = _runtime_context_for_order(
         conn, row, quote=quote, asof_day=day, reading=reading,
         tradability=tradability,
+        execution_state_identity=execution_state_fingerprint(state),
     )
     return execution_context_from_state(
         order=row, quote=quote, asof_day=day, market_reading=reading,
-        tradability=tradability, available_liquidity=liquidity,
-        state=state, runtime_context=runtime_context,
+        tradability=tradability, state=state, runtime_context=runtime_context,
     )
 
 
-def _runtime_context_for_order(conn, order, *, quote, asof_day, reading, tradability):
+def _runtime_context_for_order(
+    conn, order, *, quote, asof_day, reading, tradability,
+    execution_state_identity,
+):
     """Bind an Active execution audit to exact cycle/version and owner facts."""
     row = dict(order or {})
     try:
@@ -514,6 +574,7 @@ def _runtime_context_for_order(conn, order, *, quote, asof_day, reading, tradabi
             },
             execution_ruleset_version=SIMULATION_EXECUTION_RULESET,
             risk_policy_identity=risk_identity,
+            execution_state_fingerprint=execution_state_identity,
         )
     except (KeyError, TypeError, ValueError, sqlite3.Error):
         return None
@@ -1172,11 +1233,32 @@ class EntryGateState:
         object.__setattr__(self, "pool_open_positions", frozenset(
             (str(account), str(code)) for account, code in self.pool_open_positions
         ))
-        object.__setattr__(self, "seat_reserve", MappingProxyType(dict(self.seat_reserve)))
+        object.__setattr__(self, "seat_reserve", _freeze_evidence(self.seat_reserve))
         if self.account_risk_state is not None:
-            object.__setattr__(self, "account_risk_state", MappingProxyType(dict(self.account_risk_state)))
+            object.__setattr__(self, "account_risk_state", _freeze_evidence(self.account_risk_state))
         if self.market_state is not None:
-            object.__setattr__(self, "market_state", MappingProxyType(dict(self.market_state)))
+            object.__setattr__(self, "market_state", _freeze_evidence(self.market_state))
+
+
+def entry_gate_state_fingerprint(state: EntryGateState) -> str:
+    """Return identity for every captured value consumed by entry gates."""
+    if not isinstance(state, EntryGateState):
+        raise TypeError("entry gate state snapshot is required")
+    return _state_fingerprint("entry-gate-state", {
+        "open_codes": state.open_codes,
+        "committed_open_codes": state.committed_open_codes,
+        "pool_open_positions": state.pool_open_positions,
+        "position_limit": state.position_limit,
+        "pool_limit": state.pool_limit,
+        "capacity_available": state.capacity_available,
+        "seat_reserve": state.seat_reserve,
+        "pending_cash": state.pending_cash,
+        "shared_cash": state.shared_cash,
+        "account_risk_state": state.account_risk_state,
+        "market_state": state.market_state,
+        "allocation_source": state.allocation_source,
+        "allocation_version": state.allocation_version,
+    })
 
 
 def evaluate_entry_state(

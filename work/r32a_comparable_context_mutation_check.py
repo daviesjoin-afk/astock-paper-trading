@@ -21,8 +21,8 @@ MUTATIONS = [
      '"market_policy_name": "ignored",', "test_simulation_runtime_context"),
     ("backend/paper_decision_audit.py", '"active_runtime_context_unavailable"',
      '"available"', "test_paper_decision_audit"),
-    ("backend/execution_planner.py", '    day = MDC.canonical_day(asof_day) or ""\n    execution_asof = (quote or {}).get("execution_asof")',
-     '    conn.execute("SELECT 1")\n    day = MDC.canonical_day(asof_day) or ""\n    execution_asof = (quote or {}).get("execution_asof")',
+    ("backend/execution_planner.py", '    day = MDC.canonical_day(asof_day) or ""\n    quote = dict(quote or {})',
+     '    conn.execute("SELECT 1")\n    day = MDC.canonical_day(asof_day) or ""\n    quote = dict(quote or {})',
      "test_execution_planner.ExecutionStateBuilderTests.test_explicit_execution_state_builder_has_no_ledger_reads"),
     ("backend/execution_planner.py", 'fees = round(estimate_execution_fees(amount, side), 2)',
      'fees = round(amount * 0.002, 2)',
@@ -34,6 +34,12 @@ MUTATIONS = [
      '"tradability_evidence_fingerprints": {},', "test_simulation_runtime_context"),
     ("backend/simulation_runtime_context.py", '"execution_ruleset_version": str(execution_ruleset_version),',
      '"execution_ruleset_version": "ignored",', "test_simulation_runtime_context"),
+    ("backend/execution_planner.py", '"buying_power": state.buying_power,',
+     '"buying_power": None,',
+     "test_execution_planner.ExecutionStateBuilderTests.test_execution_state_fingerprint_tracks_every_decision_field"),
+    ("backend/market_data_contract.py", '"degraded_reason": snapshot.degraded_reason,',
+     '"degraded_reason": None,',
+     "test_market_data_boundary.MarketDataContractTests.test_R32A_degraded_reason_is_part_of_market_fact_identity"),
 ]
 
 

@@ -469,6 +469,47 @@ class MarketDataContractTests(unittest.TestCase):
             changed = MDC.MarketDataSnapshot(**kwargs)
             self.assertNotEqual(baseline_fp, MDC.snapshot_fingerprint(changed), changes)
 
+    def test_R32A_degraded_reason_is_part_of_market_fact_identity(self):
+        baseline = _snapshot(
+            rows=[{"code": "600000", "price": 10.0}],
+            source="provider-a", as_of="2026-08-28",
+            degraded_reason=None,
+        )
+        degraded = MDC.MarketDataSnapshot(
+            kind=baseline.kind, rows=baseline.rows, as_of=baseline.as_of,
+            observed_at=baseline.observed_at, saved_at=baseline.saved_at,
+            source=baseline.source, complete=baseline.complete,
+            expected_rows=baseline.expected_rows,
+            verification=baseline.verification,
+            verification_method=baseline.verification_method,
+            verification_detail=baseline.verification_detail,
+            degraded_reason=MDC.REASON_INCOMPLETE,
+        )
+        self.assertNotEqual(
+            MDC.snapshot_fingerprint(baseline), MDC.snapshot_fingerprint(degraded),
+        )
+
+    def test_R32A_market_fact_identity_excludes_saved_at_and_reading_ratios(self):
+        baseline = _snapshot(
+            rows=[{"code": "600000", "price": 10.0}],
+            source="provider-a", as_of="2026-08-28",
+            verification_detail={"cross_check": "ok"},
+        )
+        changed_reading = MDC.MarketDataSnapshot(
+            kind=baseline.kind, rows=baseline.rows, as_of=baseline.as_of,
+            observed_at=baseline.observed_at, saved_at="2026-08-28T23:59:00+08:00",
+            source=baseline.source, complete=baseline.complete,
+            expected_rows=baseline.expected_rows,
+            verification=baseline.verification,
+            verification_method=baseline.verification_method,
+            verification_detail={"cross_check": "ok", "fresh_ratio": 0.5,
+                                 "min_fresh_ratio": 0.9},
+        )
+        self.assertEqual(
+            MDC.snapshot_fingerprint(baseline),
+            MDC.snapshot_fingerprint(changed_reading),
+        )
+
 
 # ---------------------------------------------------------------------------
 # MDR：只读路径绝不联网
