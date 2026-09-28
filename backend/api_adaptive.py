@@ -751,11 +751,11 @@ def create_canonical_robustness_report(request: RobustnessRequest,
         raise
     except RRUN.RobustnessBaselineError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except RREP.RobustnessPersistenceError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     except (TypeError, ValueError, KeyError) as exc:
         reason = str(exc) if str(exc).isidentifier() else "robustness_request_invalid"
         raise HTTPException(status_code=422, detail=reason) from exc
-    except RREP.RobustnessPersistenceError as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
     except Exception as exc:
         raise HTTPException(status_code=503, detail="robustness_inputs_unavailable") from exc
 

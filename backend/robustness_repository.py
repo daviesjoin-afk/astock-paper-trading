@@ -160,6 +160,16 @@ class RobustnessRepository:
                    payload["report_fingerprint"], plan_json, report_json,
                    payload["runner_version"], created_at, payload_fingerprint))
         except sqlite3.IntegrityError as exc:
+            # Another writer may have inserted this report after our first
+            # lookup. Re-read the winner so identical concurrent retries stay
+            # idempotent while a different payload remains a hard conflict.
+            existing = self.conn.execute("SELECT * FROM robustness_reports WHERE report_key=?",
+                                         (payload["report_key"],)).fetchone()
+            if existing is not None:
+                decoded = _decode(existing)
+                if decoded["payload_fingerprint"] == payload_fingerprint:
+                    return decoded
+                raise RobustnessPersistenceError("report_key_payload_conflict") from exc
             raise RobustnessPersistenceError("robustness_report_conflict") from exc
         row = self.conn.execute("SELECT * FROM robustness_reports WHERE id=?",
                                 (cursor.lastrowid,)).fetchone()

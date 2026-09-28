@@ -3,7 +3,10 @@ from __future__ import annotations
 
 import sqlite3
 import sys
+import tempfile
 import unittest
+from concurrent.futures import ThreadPoolExecutor
+from threading import Barrier
 from pathlib import Path
 
 BACKEND = Path(__file__).resolve().parent
@@ -38,6 +41,58 @@ class RobustnessRepositoryTests(unittest.TestCase):
         second = self.repo.append_report(replay)
         self.assertEqual(first["id"], second["id"])
         self.assertEqual(1, self.conn.execute("SELECT count(*) FROM robustness_reports").fetchone()[0])
+
+    def test_concurrent_identical_posts_are_idempotent(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "robustness.sqlite3"
+            setup = sqlite3.connect(path)
+            setup.row_factory = sqlite3.Row
+            RREP.ensure_schema(setup)
+            setup.close()
+            both_checked_absent = Barrier(2)
+
+            class RacingConnection:
+                def __init__(self, connection):
+                    self.connection = connection
+                    self.waited = False
+
+                def __getattr__(self, name):
+                    return getattr(self.connection, name)
+
+                def __enter__(self):
+                    self.connection.__enter__()
+                    return self
+
+                def __exit__(self, *args):
+                    return self.connection.__exit__(*args)
+
+                def execute(self, sql, parameters=()):
+                    result = self.connection.execute(sql, parameters)
+                    if (not self.waited and sql.startswith(
+                            "SELECT * FROM robustness_reports WHERE report_key=?")):
+                        self.waited = True
+                        both_checked_absent.wait(timeout=10)
+                    return result
+
+            def append_concurrently():
+                connection = sqlite3.connect(path, timeout=10)
+                connection.row_factory = sqlite3.Row
+                try:
+                    repo = object.__new__(RREP.RobustnessRepository)
+                    repo.conn = RacingConnection(connection)
+                    return repo.append_report(self.report)
+                finally:
+                    connection.close()
+
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                first, second = list(pool.map(lambda _: append_concurrently(), range(2)))
+            self.assertEqual(first["id"], second["id"])
+            check = sqlite3.connect(path)
+            try:
+                self.assertEqual(1, check.execute(
+                    "SELECT count(*) FROM robustness_reports").fetchone()[0])
+            finally:
+                check.close()
 
     def test_R30_66_same_key_with_different_content_is_rejected(self):
         self.repo.append_report(self.report)

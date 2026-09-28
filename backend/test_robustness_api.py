@@ -81,6 +81,14 @@ class RobustnessApiTests(unittest.TestCase):
             os.path.join(BACKEND, "api_adaptive.py")).read_text(encoding="utf-8"))
         self.assertNotIn(os.path.abspath(self.path), API.canonical_robustness_reports(1).__repr__())
 
+    def test_persistence_errors_are_mapped_before_value_error(self):
+        source = Path(os.path.join(BACKEND, "api_adaptive.py")).read_text(encoding="utf-8")
+        route_marker = "\n\n" + "@router" + '.get("/experiments/runs/{run_id}/robustness")'
+        handler = source[source.index("def create_canonical_robustness_report("):
+                         source.index(route_marker)]
+        self.assertLess(handler.index("except RREP.RobustnessPersistenceError"),
+                        handler.index("except (TypeError, ValueError, KeyError)"))
+
 
 if __name__ == "__main__":
     unittest.main()
