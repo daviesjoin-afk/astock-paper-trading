@@ -86,7 +86,7 @@ class RobustnessFixture:
                 suspension_reason=None, has_market_quote=True, has_trade_volume=True,
                 is_price_limit_locked=False, price_limit_direction=None,
                 source="fixture-owner", observed_at=observed,
-                effective_at=f"{day}T09:30:00+08:00"))
+                effective_at=f"{day}T09:00:00+08:00"))
         self.market_manifest = self.market.import_raw_market_archive(
             bars, source="r30-fixture", source_revision="1", adjustment="raw",
             benchmark_calendars={BENCHMARK: {
@@ -620,6 +620,39 @@ class RobustnessRunnerTests(unittest.TestCase):
             is_price_limit_locked=False, price_limit_direction=None,
             source="fixture-owner-revision", observed_at=f"{session}T10:00:00+08:00",
             effective_at=f"{session}T09:30:00+08:00"))
+        with self.assertRaisesRegex(RUN.RobustnessBaselineError,
+                                   "baseline_tradability_identity_mismatch"):
+            self.fixture.execute()
+
+    def test_R30_64_open_time_tradability_revision_rejects_baseline_when_close_fact_is_unchanged(self):
+        session = self.fixture.baseline_sessions[0]
+        common = dict(code=CODE, session_date=session, is_listed=True,
+            listing_date="2020-01-01", delisting_date=None, is_suspended=False,
+            suspension_reason=None, has_market_quote=True, has_trade_volume=True,
+            is_price_limit_locked=False, price_limit_direction=None)
+        # The R29 baseline sees A at execution time and B at close time.
+        self.fixture.tradability.save(TA.TradabilityEvidence(
+            **common, is_st=True, source="close-B",
+            observed_at=f"{session}T14:00:00+08:00",
+            effective_at=f"{session}T14:00:00+08:00"))
+        self.fixture.rebind_dates(self.fixture.spec.start_date, self.fixture.spec.end_date)
+        baseline_fingerprint = self.fixture.run["tradability_evidence_fingerprint"]
+        self.assertEqual("fixture-owner", self.fixture.tradability.evidence_at(
+            CODE, session, f"{session}T09:30:00+08:00").source)
+        self.assertEqual("close-B", self.fixture.tradability.evidence_at(
+            CODE, session, f"{session}T15:00:00+08:00").source)
+
+        # A later archive append changes only the execution-time selection A -> C.
+        self.fixture.tradability.save(TA.TradabilityEvidence(
+            **common, is_st=False, source="execution-C",
+            observed_at=f"{session}T09:20:00+08:00",
+            effective_at=f"{session}T09:15:00+08:00"))
+        self.assertEqual("execution-C", self.fixture.tradability.evidence_at(
+            CODE, session, f"{session}T09:30:00+08:00").source)
+        self.assertEqual("close-B", self.fixture.tradability.evidence_at(
+            CODE, session, f"{session}T15:00:00+08:00").source)
+        self.assertEqual(baseline_fingerprint,
+                         self.fixture.run["tradability_evidence_fingerprint"])
         with self.assertRaisesRegex(RUN.RobustnessBaselineError,
                                    "baseline_tradability_identity_mismatch"):
             self.fixture.execute()

@@ -293,6 +293,47 @@ def _member_code(member: Any) -> str | None:
     return text or None
 
 
+def tradability_replay_projection(
+    members_by_session: Mapping[str, Sequence[Any]],
+    sessions: Sequence[str],
+    repository: Any,
+) -> dict[str, Any]:
+    """Bind the R29 identity to both close validation and open execution facts."""
+    pairs = sorted({(code, session)
+                    for session in sessions
+                    for code in (_member_code(row) for row in members_by_session.get(session, ()))
+                    if code})
+    close_requests = {(code, session): PIT.bar_available_at(session)
+                      for code, session in pairs}
+    execution_requests = {(code, session): f"{session}T09:30:00+08:00"
+                          for code, session in pairs}
+
+    def selected(requests: Mapping[tuple[str, str], Any]) -> dict[tuple[str, str], Any]:
+        if repository is None:
+            return {}
+        if hasattr(repository, "evidence_many"):
+            return repository.evidence_many(requests)
+        return {(code, session): repository.evidence_at(code, session, instant)
+                for (code, session), instant in requests.items()
+                if hasattr(repository, "evidence_at")}
+
+    close_facts = selected(close_requests)
+    execution_facts = selected(execution_requests)
+    facts = [{
+        "code": code,
+        "session": session,
+        "close_evidence": (TA.evidence_fingerprint(close_facts[(code, session)])
+                           if close_facts.get((code, session)) is not None else None),
+        "execution_evidence": (TA.evidence_fingerprint(execution_facts[(code, session)])
+                               if execution_facts.get((code, session)) is not None else None),
+    } for code, session in pairs]
+    return {
+        "fingerprint": _digest({"version": "r29-tradability-replay-v1", "facts": facts}),
+        "facts": facts,
+        "execution_unknown": sum(row["execution_evidence"] is None for row in facts),
+    }
+
+
 def _tradability(
     spec: EC.ExperimentSpec,
     members_by_session: Mapping[str, Sequence[Any]],
@@ -313,18 +354,19 @@ def _tradability(
         available = int(owner_projection["available_pairs"])
         blocked = int(owner_projection["blocked_pairs"])
         unknown = int(owner_projection["unknown_pairs"])
-        evidence_fingerprint = owner_projection["evidence_fingerprint"]
+        close_evidence_fingerprint = owner_projection["evidence_fingerprint"]
     else:
         available = blocked = 0
         unknown = requested
         evidence_rows = [{"code": code, "session": session, "evidence": None}
                          for code, session in sorted(requests)]
-        evidence_fingerprint = _digest(evidence_rows)
-    identity_matches = evidence_fingerprint == spec.tradability_fingerprint
+        close_evidence_fingerprint = _digest(evidence_rows)
+    replay_projection = tradability_replay_projection(members_by_session, sessions, repository)
+    identity_matches = replay_projection["fingerprint"] == spec.tradability_fingerprint
     complete = (
         universe_complete and requested > 0
         and available + blocked + unknown == requested and unknown == 0
-        and identity_matches
+        and replay_projection["execution_unknown"] == 0 and identity_matches
     )
     ratio = _ratio(available + blocked, requested) if universe_complete else None
     identity = {"tradability_fingerprint": spec.tradability_fingerprint}
@@ -333,11 +375,15 @@ def _tradability(
                         "archive_facts_complete_for_requested_pairs" if complete else "partial_or_unknown",
                         {"requested": requested, "available": available,
                          "unknown": unknown, "blocked": blocked, "ratio": ratio,
-                         "evidence_fingerprint": evidence_fingerprint,
+                         "close_evidence_fingerprint": close_evidence_fingerprint,
+                         "execution_unknown": replay_projection["execution_unknown"],
+                         "replay_fingerprint": replay_projection["fingerprint"],
                          "identity_matches": identity_matches})
     return detail, {"requested": requested, "available": available,
                     "unknown": unknown, "blocked": blocked, "ratio": ratio,
-                    "evidence_fingerprint": evidence_fingerprint,
+                    "close_evidence_fingerprint": close_evidence_fingerprint,
+                    "execution_unknown": replay_projection["execution_unknown"],
+                    "replay_fingerprint": replay_projection["fingerprint"],
                     "identity_matches": identity_matches,
                     "universe_sessions_unknown": len(sessions) - len(members_by_session)}
 

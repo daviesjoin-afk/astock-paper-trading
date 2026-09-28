@@ -67,24 +67,7 @@ def _universe_rows(repository: HUA.HistoricalUniverseArchiveRepository,
 
 def _tradability_fingerprint(members: Mapping[str, Sequence[Any]], sessions: Sequence[str],
                              repository: Any) -> str:
-    requests = {}
-    for session in sessions:
-        instant = PIT.bar_available_at(session)
-        for member in members.get(session, ()):
-            code = member.get("code") if isinstance(member, Mapping) else getattr(member, "code", None)
-            if code and instant is not None:
-                requests[(str(code), session)] = instant
-    bulk = (repository.evidence_many(requests) if repository is not None
-            and hasattr(repository, "evidence_many") else {})
-    facts = []
-    for code, session in sorted(requests):
-        instant = requests[(code, session)]
-        fact = (bulk.get((code, session)) if bulk else
-                repository.evidence_at(code, session, instant)
-                if repository is not None else None)
-        facts.append({"code": code, "session": session,
-                      "evidence": TA.evidence_fingerprint(fact) if fact is not None else None})
-    return _sha(facts)
+    return PV.tradability_replay_projection(members, sessions, repository)["fingerprint"]
 
 
 def _serialize_result(result: EC.ExperimentResult) -> dict[str, Any]:

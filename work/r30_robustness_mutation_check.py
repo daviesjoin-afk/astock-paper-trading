@@ -66,6 +66,7 @@ mutations = [
     replace("frontend/src/features/adaptive.js", "+'<h5>Baseline identity</h5><pre>'+adaptiveEsc(JSON.stringify(report.baseline_identity||{},null,2))+'</pre>'", "+'<p>score: 0</p><h5>Baseline identity</h5><pre>'+adaptiveEsc(JSON.stringify(report.baseline_identity||{},null,2))+'</pre>'", "R30-83", frontend=True),
     replace("frontend/src/features/adaptive.js", "+'<h5>Sensitivity</h5>'+sensitivityHtml", "+'<button>promote</button><h5>Sensitivity</h5>'+sensitivityHtml", "R30-84", frontend=True),
     replace("frontend/src/features/adaptive.js", "'<dl>'+r30MetricRows(metrics)", "'<dl>'+r30MetricRows(Number(metrics))", "R30-85", frontend=True),
+    replace("backend/experiment_pit_validation.py", '"execution_evidence": (TA.evidence_fingerprint(execution_facts[(code, session)])\n                               if execution_facts.get((code, session)) is not None else None),', '"execution_evidence": None,', "test_robustness_runner.RobustnessRunnerTests.test_R30_64_open_time_tradability_revision_rejects_baseline_when_close_fact_is_unchanged"),
 ]
 
 
