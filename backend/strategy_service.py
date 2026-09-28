@@ -388,6 +388,19 @@ def lifecycle_read_model(strategy_id: str) -> dict:
                 if target in SL.SAFETY_TRANSITION_TARGETS:
                     eligible.append(target)
                     continue
+                if state["state"] == "paused" and target in SL.RESUME_TRANSITION_TARGETS:
+                    try:
+                        resume_target, _ = SL._resume_policy(
+                            conn, spec.id, version.version, version.checksum)
+                    except SL.LifecycleError:
+                        resume_target = None
+                    if state["state"] == "paused" and target == resume_target:
+                        eligible.append(target)
+                    else:
+                        blocked[target] = {"eligible": False,
+                            "blocking_reasons": ["resume_source_or_policy_unavailable"],
+                            "required_evidence": ["human_resume_reason"]}
+                    continue
                 decision = SPR.evaluate(conn, strategy_id=spec.id,
                     strategy_version=version.version, strategy_checksum=version.checksum,
                     from_state=state["state"], target_state=target,
@@ -402,8 +415,11 @@ def lifecycle_read_model(strategy_id: str) -> dict:
                 "version": version.version, "checksum": version.checksum,
                 "state_history": SL.history(conn, spec.id),
                 "legal_transitions": legal, "eligible_transitions": eligible,
-                "safety_transitions": sorted(set(legal) & SL.SAFETY_TRANSITION_TARGETS),
-                "promotion_transitions": sorted(set(legal) - SL.SAFETY_TRANSITION_TARGETS),
+                "safety_transitions": sorted((set(legal) & SL.SAFETY_TRANSITION_TARGETS)
+                    | (set(eligible) & SL.RESUME_TRANSITION_TARGETS
+                       if state["state"] == "paused" else set())),
+                "promotion_transitions": sorted(set(legal) - SL.SAFETY_TRANSITION_TARGETS
+                    - (SL.RESUME_TRANSITION_TARGETS if state["state"] == "paused" else set())),
                 "blocked_transitions": blocked,
                 "blocking_reasons": sorted({reason for row in blocked.values()
                     for reason in row.get("blocking_reasons", [])}),
@@ -460,14 +476,20 @@ def transition(strategy_id: str, request: Models.StrategyTransitionRequest) -> d
                                  checksum=request.strategy_checksum, conn=conn)
         if version is None:
             raise StrategyNotFound("strategy version not found")
-        if request.target_state in SL.SAFETY_TRANSITION_TARGETS:
-            SL.transition(conn, strategy_id=strategy_id,
+        is_resume = (request.expected_state == "paused"
+                     and request.target_state in SL.RESUME_TRANSITION_TARGETS)
+        if request.target_state in SL.SAFETY_TRANSITION_TARGETS or is_resume:
+            transitioned = SL.transition(conn, strategy_id=strategy_id,
                 strategy_version=request.strategy_version, strategy_checksum=request.strategy_checksum,
                 expected_state=request.expected_state, target_state=request.target_state,
                 actor_type=request.actor_type, actor_id=request.actor_id,
                 reason_code=request.reason_code, reason_text=request.reason,
-                transition_kind="safety", evidence={"source": "strategy_transition_api"})
-            return detail_payload(conn, SR.get(strategy_id, conn=conn))
+                transition_kind="resume" if is_resume else "safety",
+                evidence={"source": "strategy_transition_api"})
+            return {**detail_payload(conn, SR.get(strategy_id, conn=conn)),
+                    "transitioned_version": {"version": request.strategy_version,
+                        "checksum": request.strategy_checksum,
+                        "state": transitioned["state"]}}
         if not request.proposal_fingerprint:
             raise InvalidStrategyDefinition("promotion_proposal_fingerprint_required")
         proposal = SPR.get_proposal(conn, request.proposal_fingerprint)

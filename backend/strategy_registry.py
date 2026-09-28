@@ -894,6 +894,10 @@ def _ever_left_draft(conn, strategy_id):
 def hard_delete_unused_draft(conn, strategy_id):
     """Physically delete only an unused user draft and its private version rows.
 
+    The canonical lifecycle state and append-only creation event remain as a
+    permanent identity tombstone. This preserves audit history and prevents
+    reusing the deleted strategy id.
+
     Why an unused draft may be deleted while a formal version may not:
 
     - A **formal** version carries history — it was validated/activated, bound
@@ -953,6 +957,10 @@ def hard_delete_unused_draft(conn, strategy_id):
         conn.execute("DELETE FROM paper_strategy_versions WHERE strategy_id=?", (spec.id,))
     finally:
         conn.execute(f"DELETE FROM {VERSION_PURGE_TOKEN_TABLE} WHERE strategy_id=?", (spec.id,))
+    # Pre-R31 event rows have a restrictive FK to the definition. They belong
+    # to the disposable compatibility record; canonical lifecycle history is
+    # retained above as the identity tombstone.
+    conn.execute("DELETE FROM strategy_definition_events WHERE strategy_id=?", (spec.id,))
     conn.execute("DELETE FROM strategy_definitions WHERE id=?", (spec.id,))
     return {"strategy_id": spec.id, "deleted": True}
 

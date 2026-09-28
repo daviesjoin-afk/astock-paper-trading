@@ -20,6 +20,7 @@ import asyncio
 import ast
 import json
 import os
+import sqlite3
 import shutil
 import tempfile
 import types
@@ -34,6 +35,7 @@ import api_strategies as API
 import main
 import paper_trading as P
 import strategy_api_models as Models
+import strategy_lifecycle as SL
 import strategy_registry as SR
 import strategy_runtime as SRT
 import strategy_service as SVC
@@ -191,6 +193,47 @@ class FrontendPayloadContractTests(_ApiFixture):
         self.assertEqual(status, 200, deleted)
         self.assertTrue(deleted["deleted"])
         self.assertIsNone(deleted["archived_instead_hint"])
+
+    def test_workbench_can_resume_paused_strategy_with_human_reason(self):
+        status, created = self._call(API.create_strategy, {
+            "id": "fe_resume", "name": "fe_resume", "dsl_ast": RULE,
+        }, default_status=201)
+        self.assertEqual(status, 201, created)
+        conn = sqlite3.connect(P.DB_PATH)
+        conn.row_factory = sqlite3.Row
+        try:
+            conn.execute("PRAGMA foreign_keys=ON")
+            conn.execute("DROP TRIGGER strategy_lifecycle_events_no_delete")
+            conn.execute("DELETE FROM strategy_lifecycle_events WHERE strategy_id='fe_resume'")
+            conn.execute("DELETE FROM strategy_lifecycle_state WHERE strategy_id='fe_resume'")
+            conn.execute("UPDATE strategy_definitions SET lifecycle_status='active' WHERE id='fe_resume'")
+            SL.ensure_schema(conn)
+            conn.commit()
+        finally:
+            conn.close()
+
+        lifecycle = SVC.lifecycle_read_model("fe_resume")
+        self.assertEqual("paper", lifecycle["state"])
+        self.assertIn("paused", lifecycle["safety_transitions"])
+        status, paused = self._call(API.transition_strategy, "fe_resume", {
+            "strategy_version": lifecycle["version"], "strategy_checksum": lifecycle["checksum"],
+            "expected_state": "paper", "target_state": "paused", "actor_type": "human",
+            "actor_id": "strategy-workbench", "reason_code": "operator_pause",
+            "reason": "人工临时暂停",
+        })
+        self.assertEqual(status, 200, paused)
+
+        lifecycle = SVC.lifecycle_read_model("fe_resume")
+        self.assertEqual("paused", lifecycle["state"])
+        self.assertIn("paper", lifecycle["safety_transitions"])
+        status, resumed = self._call(API.transition_strategy, "fe_resume", {
+            "strategy_version": lifecycle["version"], "strategy_checksum": lifecycle["checksum"],
+            "expected_state": "paused", "target_state": "paper", "actor_type": "human",
+            "actor_id": "strategy-workbench", "reason_code": "operator_resume",
+            "reason": "人工复核后恢复",
+        })
+        self.assertEqual(status, 200, resumed)
+        self.assertEqual("paper", resumed["transitioned_version"]["state"])
 
 
 class RequestSchemaTests(_ApiFixture):

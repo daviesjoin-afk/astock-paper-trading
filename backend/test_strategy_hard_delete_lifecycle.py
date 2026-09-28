@@ -11,8 +11,8 @@
     draft -> validated -> draft
 
 的策略（从未进过 cycle、没有任何 signal/order/fill）会被当成"从没用过的草稿"
-物理删除，删除路径还会先把 ``strategy_definition_events`` 抹掉——生命周期审计
-被自己擦除。
+物理删除。R31 后，scratch 的旧兼容事件会随定义清理，但 canonical lifecycle
+事件和状态必须作为永久 identity tombstone 保留。
 
 修复后的形式化规则：
 
@@ -127,6 +127,32 @@ class ScratchDraftStillDeletableTests(_HardDeleteFixture):
         self.assertTrue(result["deleted"])
         self.assertIsNone(registry.get("pr56_scratch", conn=self.conn))
         self.assertEqual([], self._versions("pr56_scratch"))
+
+    def test_legacy_event_fk_is_cleaned_and_canonical_history_is_a_tombstone(self):
+        """Foreign keys stay enabled; scratch identity history is retained permanently."""
+        spec = self._draft("pr56_fk_scratch")
+        version = registry.get_version(spec.id, conn=self.conn)
+        self.conn.execute("""INSERT INTO strategy_definition_events
+            (strategy_id,from_status,to_status,reason,actor,created_at)
+            VALUES(?,NULL,'draft','legacy create','test','2026-09-28T00:00:00Z')""",
+            (spec.id,))
+        self.conn.commit()
+        self.assertEqual(1, self.conn.execute("PRAGMA foreign_keys").fetchone()[0])
+        canonical_events = lifecycle.history(self.conn, spec.id, version.version)
+        canonical_state = lifecycle.get_state(self.conn, spec.id, version.version,
+                                               checksum=version.checksum)
+
+        self.assertTrue(registry.hard_delete_unused_draft(self.conn, spec.id)["deleted"])
+
+        self.assertEqual(0, self.conn.execute(
+            "SELECT COUNT(*) FROM strategy_definition_events WHERE strategy_id=?",
+            (spec.id,)).fetchone()[0])
+        self.assertIsNone(registry.get(spec.id, conn=self.conn))
+        self.assertEqual(canonical_events, lifecycle.history(self.conn, spec.id, version.version))
+        self.assertEqual(canonical_state, lifecycle.get_state(self.conn, spec.id, version.version,
+                                                               checksum=version.checksum))
+        with self.assertRaisesRegex(ValueError, "retained lifecycle history"):
+            registry.create_user_definition(self.conn, spec.id, "reused id", dsl_ast=DSL)
 
     def test_b_edited_scratch_draft_v2_v3_is_deletable(self):
         """编辑出 v2/v3 不是"正式使用"——只要没离开过 draft 就能删。"""

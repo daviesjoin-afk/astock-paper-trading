@@ -28,7 +28,7 @@ TRANSITION_TABLE = {
     "paper": frozenset({"production_sim", "degraded", "paused", "retiring", "quarantined"}),
     "production_sim": frozenset({"degraded", "paused", "retiring", "quarantined"}),
     "degraded": frozenset({"paused", "retiring", "quarantined"}),
-    "paused": frozenset({"retiring", "quarantined"}),
+    "paused": frozenset({"paper", "production_sim", "retiring", "quarantined"}),
     "retiring": frozenset({"archived", "quarantined"}),
     "archived": frozenset(),
     "rejected": frozenset(),
@@ -40,6 +40,7 @@ FORMAL_CYCLE_STATES = frozenset({"paper", "production_sim"})
 SAFETY_TRANSITION_TARGETS = frozenset({
     "paused", "quarantined", "retiring", "archived", "rejected",
 })
+RESUME_TRANSITION_TARGETS = frozenset({"paper", "production_sim"})
 LEGACY_STATE_MAP = {
     "draft": "draft", "validated": "validated", "active": "paper",
     "paused": "paused", "retiring": "retiring", "archived": "archived",
@@ -69,7 +70,7 @@ def allows_formal_cycle(state: str) -> bool:
 
 
 def ensure_schema(conn: sqlite3.Connection) -> None:
-    """Install owner tables and honestly import the current legacy state once."""
+    """Install lifecycle owners and idempotently migrate exact live-cycle pins."""
     conn.executescript("""
     CREATE TABLE IF NOT EXISTS strategy_lifecycle_state (
       strategy_id TEXT NOT NULL,
@@ -129,20 +130,102 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
                             reason_code="legacy_state_imported",
                             reason_text="Imported existing lifecycle state without inventing intermediate states.")
 
+    # A running cycle owns its exact immutable version. On an upgrade, that
+    # version may no longer be the definition head, so importing only the head
+    # leaves the live cycle without lifecycle authority. Use the legacy
+    # strategy-level status as the migration source for these missing exact
+    # pins; never copy the lifecycle state of the newer head.
+    required_tables = {"paper_cycles", "paper_cycle_strategy_versions"}
+    existing_tables = {str(row[0]) for row in conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+    if required_tables.issubset(existing_tables):
+        pinned = conn.execute("""SELECT p.strategy_id,p.strategy_version,p.strategy_checksum,
+                d.lifecycle_status,GROUP_CONCAT(DISTINCT c.id)
+            FROM paper_cycle_strategy_versions p
+            JOIN paper_cycles c ON c.id=p.cycle_id
+            JOIN strategy_definitions d ON d.id=p.strategy_id
+            WHERE c.status IN ('draft','running','paused')
+            GROUP BY p.strategy_id,p.strategy_version,p.strategy_checksum,d.lifecycle_status
+            ORDER BY p.strategy_id,p.strategy_version,p.strategy_checksum""").fetchall()
+        for row in pinned:
+            strategy_id, version, checksum, legacy_status, cycle_ids = row
+            exact = conn.execute("""SELECT checksum FROM paper_strategy_versions
+                WHERE strategy_id=? AND version=?""", (strategy_id, int(version))).fetchone()
+            if exact is None or exact[0] != checksum:
+                raise LifecycleError("live_cycle_strategy_pin_checksum_mismatch")
+            if get_state(conn, strategy_id, int(version), checksum=checksum) is not None:
+                continue
+            legacy = LEGACY_STATE_MAP.get(str(legacy_status))
+            if legacy is None:
+                raise LifecycleError("legacy_lifecycle_state_unknown")
+            _insert_initial(conn, strategy_id, int(version), checksum, legacy,
+                transition_kind="live_cycle_pin_import",
+                evidence={"migration_source": "live_cycle_exact_version_pin",
+                          "legacy_status": str(legacy_status),
+                          "live_cycle_ids": sorted(str(value) for value in str(cycle_ids or "").split(",") if value)},
+                actor_type="system", actor_id="r31_migration",
+                reason_code="live_cycle_version_state_imported",
+                reason_text="Imported legacy lifecycle authority for the exact version still pinned by a live cycle.")
 
-def _exact_version(conn, strategy_id: str, version: int, checksum: str):
+
+def _exact_version(conn, strategy_id: str, version: int, checksum: str, *, require_head=True):
     row = conn.execute("""SELECT v.checksum FROM paper_strategy_versions v
         WHERE v.strategy_id=? AND v.version=?""", (str(strategy_id), int(version))).fetchone()
     if row is None:
         raise LifecycleError("strategy_version_not_found")
     if row[0] != checksum:
         raise LifecycleError("strategy_checksum_mismatch")
+    if not require_head:
+        return
     head = conn.execute("""SELECT current_version,current_checksum
         FROM paper_strategy_version_heads WHERE strategy_id=?""", (str(strategy_id),)).fetchone()
     if head is None:
         raise LifecycleError("strategy_version_head_missing")
     if int(head[0]) != int(version) or head[1] != checksum:
         raise LifecycleError("strategy_version_changed")
+
+
+def _is_current_head(conn, strategy_id: str, version: int, checksum: str) -> bool:
+    head = conn.execute("""SELECT current_version,current_checksum
+        FROM paper_strategy_version_heads WHERE strategy_id=?""", (str(strategy_id),)).fetchone()
+    return bool(head and int(head[0]) == int(version) and head[1] == checksum)
+
+
+def is_live_cycle_pinned(conn: sqlite3.Connection, strategy_id: str, version: int,
+                         checksum: str) -> bool:
+    tables = {str(row[0]) for row in conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+    if not {"paper_cycles", "paper_cycle_strategy_versions"}.issubset(tables):
+        return False
+    return conn.execute("""SELECT 1 FROM paper_cycle_strategy_versions p
+        JOIN paper_cycles c ON c.id=p.cycle_id
+        JOIN paper_strategy_versions v ON v.strategy_id=p.strategy_id AND v.version=p.strategy_version
+        WHERE p.strategy_id=? AND p.strategy_version=? AND p.strategy_checksum=?
+          AND v.checksum=p.strategy_checksum AND c.status IN ('draft','running','paused')
+        LIMIT 1""", (str(strategy_id), int(version), str(checksum))).fetchone() is not None
+
+
+def _resume_policy(conn: sqlite3.Connection, strategy_id: str, version: int,
+                   checksum: str) -> tuple[str, str | None]:
+    row = conn.execute("""SELECT event_fingerprint,transition_kind,evidence_json
+        FROM strategy_lifecycle_events WHERE strategy_id=? AND strategy_version=?
+          AND strategy_checksum=? AND to_state='paused'
+        ORDER BY id DESC LIMIT 1""", (str(strategy_id), int(version), str(checksum))).fetchone()
+    if row is None:
+        raise LifecycleError("paused_resume_source_unavailable")
+    try:
+        evidence = json.loads(row[2] or "{}")
+    except (TypeError, ValueError):
+        evidence = {}
+    target = evidence.get("resume_state")
+    if target in RESUME_TRANSITION_TARGETS:
+        return str(target), str(row[0])
+    # Legacy lifecycle stored only `paused`, with no prior execution mode.
+    # Its explicit, conservative recovery policy is PAPER and is recorded in
+    # the resume event so the choice remains auditable.
+    if row[1] == "legacy_import":
+        return "paper", str(row[0])
+    raise LifecycleError("paused_resume_source_unavailable")
 
 
 def _insert_initial(conn, strategy_id, version, checksum, state, *, transition_kind,
@@ -235,6 +318,9 @@ def transition(conn: sqlite3.Connection, *, strategy_id: str, strategy_version: 
         raise LifecycleError("quarantine_release_evidence_missing")
     if target_state not in TRANSITION_TABLE[expected_state]:
         raise LifecycleError("invalid_lifecycle_transition")
+    if (expected_state == "paused" and target_state in RESUME_TRANSITION_TARGETS
+            and transition_kind != "resume"):
+        raise LifecycleError("explicit_resume_required")
     if transition_kind == "promotion":
         decision = dict(promotion_decision or {})
         if (not decision.get("eligible")
@@ -253,10 +339,29 @@ def transition(conn: sqlite3.Connection, *, strategy_id: str, strategy_version: 
             raise LifecycleError("safety_transition_target_invalid")
         if not str(reason_code or "").strip() or not str(reason_text or "").strip():
             raise LifecycleError("safety_transition_reason_required")
+    elif transition_kind == "resume":
+        decision_fp, policy_version = None, "r31-explicit-resume-v1"
+        if actor_type != "human":
+            raise LifecycleError("resume_requires_human_actor")
+        if expected_state != "paused" or target_state not in RESUME_TRANSITION_TARGETS:
+            raise LifecycleError("resume_transition_invalid")
+        if not str(reason_code or "").strip() or not str(reason_text or "").strip():
+            raise LifecycleError("safety_transition_reason_required")
     else:
         raise LifecycleError("transition_kind_invalid")
 
     evidence_value = dict(evidence or {})
+    if transition_kind == "safety" and target_state == "paused":
+        evidence_value["resume_state"] = (expected_state
+            if expected_state in RESUME_TRANSITION_TARGETS else None)
+    resume_event_fingerprint = None
+    if transition_kind == "resume":
+        resume_target, resume_event_fingerprint = _resume_policy(
+            conn, strategy_id, strategy_version, strategy_checksum)
+        if target_state != resume_target:
+            raise LifecycleError("paused_resume_target_mismatch")
+        evidence_value.update({"resume_policy_version": policy_version,
+                               "resumed_from_event": resume_event_fingerprint})
     material = {"schema": _EVENT_SCHEMA, "strategy_id": str(strategy_id),
                 "strategy_version": int(strategy_version), "strategy_checksum": str(strategy_checksum),
                 "from_state": expected_state, "to_state": target_state,
@@ -274,7 +379,13 @@ def transition(conn: sqlite3.Connection, *, strategy_id: str, strategy_version: 
         conn.execute("BEGIN IMMEDIATE")
     try:
         conn.execute(f"SAVEPOINT {savepoint}")
-        _exact_version(conn, strategy_id, strategy_version, strategy_checksum)
+        allow_pinned_version = transition_kind in {"safety", "resume"}
+        _exact_version(conn, strategy_id, strategy_version, strategy_checksum,
+                       require_head=not allow_pinned_version)
+        if allow_pinned_version and not _is_current_head(
+                conn, strategy_id, strategy_version, strategy_checksum):
+            if not is_live_cycle_pinned(conn, strategy_id, strategy_version, strategy_checksum):
+                raise LifecycleError("strategy_version_changed")
         current = get_state(conn, strategy_id, strategy_version, checksum=strategy_checksum)
         if current is None:
             raise LifecycleError("lifecycle_state_not_found")

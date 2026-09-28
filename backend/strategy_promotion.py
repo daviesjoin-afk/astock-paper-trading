@@ -297,6 +297,8 @@ def evaluate(conn: sqlite3.Connection, *, strategy_id: str, strategy_version: in
     fingerprints: dict[str, str] = {}
     if target_state not in SL.TRANSITION_TABLE.get(from_state, ()):
         reasons.append("lifecycle_edge_not_legal")
+    if from_state == "paused" and target_state in SL.RESUME_TRANSITION_TARGETS:
+        reasons.append("explicit_resume_required")
     version = conn.execute("""SELECT v.checksum,h.current_version,h.current_checksum
         FROM paper_strategy_versions v JOIN paper_strategy_version_heads h USING(strategy_id)
         WHERE v.strategy_id=? AND v.version=?""",
