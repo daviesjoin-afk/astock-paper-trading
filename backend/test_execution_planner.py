@@ -129,7 +129,8 @@ def _runtime_context_for_state(*, execution_state=None, entry_state=None,
                                session_date="2026-09-08", decision_at=NOW,
                                quote=None, reading=None, tradability_fingerprint=None,
                                market_policy=None, strategy_id="trend_pullback",
-                               strategy_version=1, strategy_checksum=None):
+                               strategy_version=1, strategy_checksum=None,
+                               entry_policy_account_id=None):
     sha = lambda value: hashlib.sha256(value.encode("utf-8")).hexdigest()
     quote = quote or {
         "code": "002241", "price": 21.5, "amount": 50_000_000.0,
@@ -161,6 +162,10 @@ def _runtime_context_for_state(*, execution_state=None, entry_state=None,
         ),
         entry_gate_state_fingerprint=(
             EP.entry_gate_state_fingerprint(entry_state)
+            if entry_state is not None else None
+        ),
+        entry_policy_fingerprint=(
+            EP.execution_policy_fingerprint(entry_policy_account_id or strategy_id)
             if entry_state is not None else None
         ),
     )
@@ -965,11 +970,11 @@ class PlanEntryTests(_StubbedPlannerTest):
         )
         kwargs = {
             "state": state_a, "account_id": "tq_breakout", "code": "002241",
-            "side": "buy", "quote": {"price": 21.5, "name": "test"},
+            "side": "buy", "quote": {"code": "002241", "price": 21.5, "name": "test"},
             "asof_day": dt.date(2026, 9, 8), "amount": 2500.0, "fees": 2.5,
         }
         runtime_context = _runtime_context_for_state(
-            entry_state=state_a, quote=kwargs["quote"],
+            entry_state=state_a, quote=kwargs["quote"], strategy_id="tq_breakout",
         )
         stub = types.SimpleNamespace(
             _security_scope=lambda *args: {"allowed": True},
@@ -1196,16 +1201,152 @@ class ExecutionStateBuilderTests(unittest.TestCase):
             pending_cash=10.0, shared_cash=1000.0,
             account_risk_state={"blocked": False, "reasons": []},
         )
-        quote_a = {"price": 21.5, "amount": 5000.0, "name": "test"}
+        quote_a = {"code": "002241", "price": 21.5,
+                   "amount": 5000.0, "name": "test"}
         quote_b = {**quote_a, "price": 22.0}
         runtime_context = _runtime_context_for_state(
-            entry_state=state, quote=quote_a,
+            entry_state=state, quote=quote_a, strategy_id="tq_breakout",
         )
         with self.assertRaisesRegex(ValueError, "entry runtime context quote identity mismatch"):
             EP.evaluate_entry_state(
                 state=state, account_id="tq_breakout", code="002241", side="buy",
                 quote=quote_b, asof_day="2026-09-08", amount=100.0,
                 runtime_context=runtime_context,
+            )
+
+    def test_entry_context_rejects_strategy_policy_mismatch(self):
+        state = EP.EntryGateState(
+            account_risk_state={"blocked": False, "reasons": []},
+        )
+        quote = {"code": "002241", "price": 21.5, "name": "test"}
+        context = _runtime_context_for_state(
+            entry_state=state, quote=quote, strategy_id="trend_pullback",
+            entry_policy_account_id="tq_breakout",
+        )
+        with self.assertRaisesRegex(
+            ValueError, "entry runtime context strategy/account identity mismatch",
+        ):
+            EP.evaluate_entry_state(
+                state=state, account_id="tq_breakout", code="002241", side="sell",
+                quote=quote, asof_day="2026-09-08", runtime_context=context,
+            )
+
+    def test_entry_context_binds_execution_policy_identity(self):
+        state = EP.EntryGateState(
+            account_risk_state={"blocked": False, "reasons": []},
+        )
+        quote = {"code": "tq_breakout", "price": 21.5, "name": "test"}
+        context = _runtime_context_for_state(
+            entry_state=state, quote=quote, strategy_id="tq_breakout",
+        )
+        original = EP.policy_for("tq_breakout")
+        changed = replace(original, red_light_reason="不同的暂停理由")
+        with mock.patch.object(EP, "policy_for", lambda account_id: changed):
+            with self.assertRaisesRegex(
+                ValueError, "entry runtime context execution policy identity mismatch",
+            ):
+                EP.evaluate_entry_state(
+                    state=state, account_id="tq_breakout", code="tq_breakout",
+                    side="sell", quote=quote, asof_day="2026-09-08",
+                    runtime_context=context,
+                )
+
+        base_identity = EP.execution_policy_fingerprint("tq_breakout")
+        self.assertRegex(base_identity, r"^[0-9a-f]{64}$")
+        for field, value in (
+            ("account_id", "another_account"),
+            ("chase_lane", "none"),
+            ("manual_entry_review", not original.manual_entry_review),
+            ("seat_reserve_owner", "another_owner"),
+            ("holds_reserved_seat", not original.holds_reserved_seat),
+            ("seat_reserve_deadline", "14:00"),
+            ("red_light_reason", "another reason"),
+        ):
+            with self.subTest(policy_field=field), mock.patch.object(
+                    EP, "policy_for", lambda account_id, changed=replace(
+                        original, **{field: value}
+                    ): changed):
+                self.assertNotEqual(base_identity, EP.execution_policy_fingerprint("tq_breakout"))
+
+    def test_entry_context_binds_market_gate_option(self):
+        quote = {"code": "002241", "price": 21.5, "name": "test"}
+        state_with_gate = EP.EntryGateState(
+            market_state={"light": "red"}, require_market_gate=True,
+            capacity_available=True, position_limit=2, pool_limit=2,
+            shared_cash=100_000.0,
+            account_risk_state={"blocked": False, "reasons": []},
+        )
+        state_without_gate = replace(state_with_gate, require_market_gate=False)
+        context_with_gate = _runtime_context_for_state(
+            entry_state=state_with_gate, quote=quote, strategy_id="tq_breakout",
+        )
+        context_without_gate = _runtime_context_for_state(
+            entry_state=state_without_gate, quote=quote, strategy_id="tq_breakout",
+        )
+        self.assertNotEqual(
+            EP.entry_gate_state_fingerprint(state_with_gate),
+            EP.entry_gate_state_fingerprint(state_without_gate),
+        )
+        self.assertNotEqual(context_with_gate.context_fingerprint,
+                            context_without_gate.context_fingerprint)
+        with mock.patch.object(EP, "_pt", lambda: types.SimpleNamespace(
+                _security_scope=lambda *args: {"allowed": True},
+                _execution_quote_status=lambda *args, **kwargs: {"fresh": True},
+        )):
+            shared = {
+                "account_id": "tq_breakout", "code": "002241", "side": "buy",
+                "quote": quote, "asof_day": "2026-09-08", "amount": 100.0,
+            }
+            blocked = EP.evaluate_entry_state(
+                state=state_with_gate, runtime_context=context_with_gate, **shared,
+            )
+            allowed = EP.evaluate_entry_state(
+                state=state_without_gate,
+                runtime_context=context_without_gate, **shared,
+            )
+            with self.assertRaisesRegex(
+                ValueError, "entry runtime context state identity mismatch",
+            ):
+                EP.evaluate_entry_state(
+                    state=state_without_gate, runtime_context=context_with_gate, **shared,
+                )
+        self.assertFalse(blocked["allowed"])
+        self.assertTrue(allowed["allowed"])
+
+    def test_entry_context_rejects_quote_symbol_mismatch(self):
+        state = EP.EntryGateState(
+            account_risk_state={"blocked": False, "reasons": []},
+        )
+        quote = {"code": "600000", "price": 21.5, "name": "test"}
+        context = _runtime_context_for_state(
+            entry_state=state, quote=quote, strategy_id="tq_breakout",
+        )
+        with self.assertRaisesRegex(ValueError, "entry runtime context quote symbol mismatch"):
+            EP.evaluate_entry_state(
+                state=state, account_id="tq_breakout", code="002241", side="sell",
+                quote=quote, asof_day="2026-09-08", runtime_context=context,
+            )
+
+    def test_execution_context_rejects_quote_symbol_mismatch(self):
+        formal = _valid_execution_context()
+        state = EP.ExecutionStateSnapshot(buying_power=50_000.0)
+        mismatched_quote = {**dict(formal.quote), "code": "600000"}
+        context = _runtime_context_for_state(
+            execution_state=state, quote=mismatched_quote,
+            reading=EP.market_reading_for_execution(
+                mismatched_quote, asof_day="2026-09-08", execution_asof=NOW,
+            ),
+        )
+        with self.assertRaisesRegex(
+            ValueError, "execution runtime context quote symbol mismatch",
+        ):
+            EP.execution_context_from_state(
+                order={"code": "002241", "side": "buy"}, quote=mismatched_quote,
+                asof_day="2026-09-08",
+                market_reading=EP.market_reading_for_execution(
+                    mismatched_quote, asof_day="2026-09-08", execution_asof=NOW,
+                ),
+                tradability=formal.tradability, state=state, runtime_context=context,
             )
 
     def test_execution_state_fingerprint_tracks_every_decision_field(self):

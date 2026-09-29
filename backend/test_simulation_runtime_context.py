@@ -61,7 +61,8 @@ class ComparableRuntimeContextTests(unittest.TestCase):
             {"market_snapshot_fingerprint": _sha("market-v2")},
             {"tradability_evidence_fingerprints": {"600000@2026-09-28": _sha("changed")}},
             {"execution_state_fingerprint": _sha("changed-state")},
-            {"entry_gate_state_fingerprint": _sha("changed-entry-state")},
+            {"entry_gate_state_fingerprint": _sha("changed-entry-state"),
+             "entry_policy_fingerprint": _sha("entry-policy")},
         )
         for variation in variations:
             with self.subTest(variation=variation):
@@ -85,10 +86,34 @@ class ComparableRuntimeContextTests(unittest.TestCase):
         entry_context = _build(
             execution_state_fingerprint=None,
             entry_gate_state_fingerprint=_sha("entry-state"),
+            entry_policy_fingerprint=_sha("entry-policy"),
         )
         self.assertEqual(_sha("entry-state"),
                          entry_context.entry_gate_state_fingerprint)
         self.assertIsNone(entry_context.execution_state_fingerprint)
+        self.assertEqual(_sha("entry-policy"),
+                         entry_context.projection()["entry_policy_fingerprint"])
+
+    def test_entry_policy_identity_is_required_and_sha256_validated(self):
+        for changes in (
+            {"entry_gate_state_fingerprint": _sha("entry-state")},
+            {"entry_policy_fingerprint": _sha("entry-policy")},
+            {"entry_gate_state_fingerprint": _sha("entry-state"),
+             "entry_policy_fingerprint": "invalid"},
+        ):
+            with self.subTest(changes=changes), self.assertRaises(ValueError):
+                _build(**changes)
+        baseline = _build(
+            execution_state_fingerprint=None,
+            entry_gate_state_fingerprint=_sha("entry-state"),
+            entry_policy_fingerprint=_sha("entry-policy"),
+        )
+        changed = _build(
+            execution_state_fingerprint=None,
+            entry_gate_state_fingerprint=_sha("entry-state"),
+            entry_policy_fingerprint=_sha("entry-policy-v2"),
+        )
+        self.assertNotEqual(baseline.context_fingerprint, changed.context_fingerprint)
 
     def test_context_module_is_a_pure_contract(self):
         source = pathlib.Path(SRC.__file__).read_text(encoding="utf-8")

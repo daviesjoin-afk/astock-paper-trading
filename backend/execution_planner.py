@@ -49,6 +49,7 @@ __all__ = [
     "ExecutionStateSnapshot",
     "EntryGateState",
     "execution_state_fingerprint",
+    "execution_policy_fingerprint",
     "entry_gate_state_fingerprint",
     "ExecutionContext",
     "ExecutionDecision",
@@ -351,7 +352,13 @@ def execution_context_from_state(
             raise ValueError("execution runtime context decision instant mismatch")
         if runtime_context.market_policy_name != MDC.EXECUTION_QUOTE_POLICY.name:
             raise ValueError("execution runtime context market policy mismatch")
-        code = str((order or {}).get("code") or quote.get("code") or "").strip()
+        requested_code = str((order or {}).get("code") or "").strip()
+        quote_code = str(quote.get("code") or "").strip()
+        if not requested_code or not quote_code:
+            raise ValueError("execution runtime context quote symbol unavailable")
+        if quote_code != requested_code:
+            raise ValueError("execution runtime context quote symbol mismatch")
+        code = requested_code
         quote_snapshot = MDC.symbol_quote_snapshot(quote, asof_day=day)
         if (not code or quote_snapshot is None
                 or quote_snapshot.kind != "symbol_quote" or quote_snapshot.as_of != day):
@@ -1297,6 +1304,7 @@ class EntryGateState:
     shared_cash: float | None = None
     account_risk_state: Mapping[str, Any] | None = None
     market_state: Mapping[str, Any] | None = None
+    require_market_gate: bool = True
     allocation_source: str | None = None
     allocation_version: str | None = None
 
@@ -1329,14 +1337,34 @@ def entry_gate_state_fingerprint(state: EntryGateState) -> str:
         "shared_cash": state.shared_cash,
         "account_risk_state": state.account_risk_state,
         "market_state": state.market_state,
+        "require_market_gate": state.require_market_gate,
         "allocation_source": state.allocation_source,
         "allocation_version": state.allocation_version,
     })
 
 
+def _execution_policy_fingerprint_for(policy: ExecutionPolicy) -> str:
+    """Fingerprint only policy facts consumed by entry evaluation and its result."""
+    return _state_fingerprint("entry-execution-policy", {
+        "account_id": policy.account_id,
+        "chase_lane": policy.chase_lane,
+        "manual_entry_review": policy.manual_entry_review,
+        "seat_reserve_owner": policy.seat_reserve_owner,
+        "holds_reserved_seat": policy.holds_reserved_seat,
+        "seat_reserve_deadline": policy.seat_reserve_deadline,
+        "red_light_reason": policy.red_light_reason,
+        "execution_planner_version": EXECUTION_PLANNER_VERSION,
+    })
+
+
+def execution_policy_fingerprint(account_id: str) -> str:
+    """Return deterministic identity for the existing entry ExecutionPolicy owner."""
+    return _execution_policy_fingerprint_for(policy_for(account_id))
+
+
 def evaluate_entry_state(
     *, state: EntryGateState, account_id: str, code: str, side: str,
-    quote: Mapping[str, Any], asof_day, require_market_gate: bool = True,
+    quote: Mapping[str, Any], asof_day,
     amount: float = 0.0, fees: float = 0.0, runtime_context: Any = None,
 ) -> dict[str, Any]:
     """Pure canonical entry gate over a previously captured explicit state."""
@@ -1350,7 +1378,20 @@ def evaluate_entry_state(
         expected_state_identity = entry_gate_state_fingerprint(state)
         if runtime_context.entry_gate_state_fingerprint != expected_state_identity:
             raise ValueError("entry runtime context state identity mismatch")
+        if runtime_context.strategy_id != str(account_id or ""):
+            raise ValueError("entry runtime context strategy/account identity mismatch")
+        actual_policy = policy_for(account_id)
+        expected_policy_identity = runtime_context.entry_policy_fingerprint
+        if (not expected_policy_identity
+                or _execution_policy_fingerprint_for(actual_policy) != expected_policy_identity):
+            raise ValueError("entry runtime context execution policy identity mismatch")
         day = MDC.canonical_day(asof_day) or ""
+        requested_code = str(code or "").strip()
+        quote_code = str((quote or {}).get("code") or "").strip()
+        if not requested_code or not quote_code:
+            raise ValueError("entry runtime context quote symbol unavailable")
+        if quote_code != requested_code:
+            raise ValueError("entry runtime context quote symbol mismatch")
         quote_snapshot = MDC.symbol_quote_snapshot(quote, asof_day=day)
         if (quote_snapshot is None or quote_snapshot.kind != "symbol_quote"
                 or quote_snapshot.as_of != day):
@@ -1359,19 +1400,17 @@ def evaluate_entry_state(
             actual_quote_identity = MDC.snapshot_fingerprint(quote_snapshot)
         except (TypeError, ValueError) as exc:
             raise ValueError("entry runtime context quote identity unavailable") from exc
-        expected_quote_identity = dict(runtime_context.symbol_quote_fingerprints).get(
-            str(code or "").strip()
-        )
+        expected_quote_identity = dict(runtime_context.symbol_quote_fingerprints).get(requested_code)
         if not expected_quote_identity or actual_quote_identity != expected_quote_identity:
             raise ValueError("entry runtime context quote identity mismatch")
-    policy = policy_for(account_id)
+    policy = actual_policy if runtime_context is not None else policy_for(account_id)
     reasons: list[str] = []
     gates: dict[str, Any] = {}
     scope = security_gate(code, quote.get("name"), quote.get("risk_flag"))
     gates["security_scope"] = scope["scope"]
     if not scope["allowed"]:
         reasons.append(scope["reason"])
-    if require_market_gate and state.market_state is not None:
+    if state.require_market_gate and state.market_state is not None:
         market_check = market_gate(state.market_state, account_id)
         gates["market"] = market_check["market"]
         if market_check["blocked"]:
@@ -1482,13 +1521,14 @@ def plan_entry(
         shared_cash=(float(available_cash) if available_cash is not None else None),
         account_risk_state=risk_state,
         market_state=market,
+        require_market_gate=bool(require_market_gate),
         allocation_source=allocation_source,
         allocation_version=allocation_version,
     )
     return evaluate_entry_state(
         state=state, account_id=account_id, code=code, side=side,
         quote=quote, asof_day=asof_day,
-        require_market_gate=require_market_gate, amount=amount, fees=fees,
+        amount=amount, fees=fees,
     )
 
 

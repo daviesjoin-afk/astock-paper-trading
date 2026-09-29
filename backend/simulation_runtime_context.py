@@ -13,7 +13,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
-CONTEXT_SCHEMA_VERSION = "comparable-runtime-context-v2"
+CONTEXT_SCHEMA_VERSION = "comparable-runtime-context-v3"
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 
 
@@ -87,6 +87,7 @@ class ComparableRuntimeContext:
     risk_policy_identity: str
     execution_state_fingerprint: str | None
     entry_gate_state_fingerprint: str | None
+    entry_policy_fingerprint: str | None
     context_fingerprint: str
 
     def projection(self) -> dict[str, Any]:
@@ -105,6 +106,7 @@ class ComparableRuntimeContext:
             "risk_policy_identity": json.loads(self.risk_policy_identity),
             "execution_state_fingerprint": self.execution_state_fingerprint,
             "entry_gate_state_fingerprint": self.entry_gate_state_fingerprint,
+            "entry_policy_fingerprint": self.entry_policy_fingerprint,
             "context_fingerprint": self.context_fingerprint,
         }
 
@@ -118,6 +120,7 @@ def build_comparable_runtime_context(
     execution_ruleset_version: str, risk_policy_identity: Mapping[str, Any],
     execution_state_fingerprint: str | None = None,
     entry_gate_state_fingerprint: str | None = None,
+    entry_policy_fingerprint: str | None = None,
 ) -> ComparableRuntimeContext:
     """Build the same context identity from the same explicit semantic inputs."""
     strategy_id = str(strategy_id or "").strip()
@@ -142,9 +145,12 @@ def build_comparable_runtime_context(
         raise ValueError("risk policy identity is required")
     if execution_state_fingerprint is None and entry_gate_state_fingerprint is None:
         raise ValueError("decision state identity is required")
+    if (entry_gate_state_fingerprint is None) != (entry_policy_fingerprint is None):
+        raise ValueError("entry policy identity must accompany entry state identity")
     for label, fingerprint in (
         ("execution state", execution_state_fingerprint),
         ("entry gate state", entry_gate_state_fingerprint),
+        ("entry policy", entry_policy_fingerprint),
     ):
         if fingerprint is not None and not _SHA256.fullmatch(str(fingerprint)):
             raise ValueError(f"{label} identity is invalid")
@@ -164,6 +170,7 @@ def build_comparable_runtime_context(
         "risk_policy_identity": json.loads(risk_json),
         "execution_state_fingerprint": execution_state_fingerprint,
         "entry_gate_state_fingerprint": entry_gate_state_fingerprint,
+        "entry_policy_fingerprint": entry_policy_fingerprint,
     }
     return ComparableRuntimeContext(
         context_schema_version=CONTEXT_SCHEMA_VERSION,
@@ -182,5 +189,7 @@ def build_comparable_runtime_context(
                                      if execution_state_fingerprint is not None else None),
         entry_gate_state_fingerprint=(str(entry_gate_state_fingerprint)
                                       if entry_gate_state_fingerprint is not None else None),
+        entry_policy_fingerprint=(str(entry_policy_fingerprint)
+                                  if entry_policy_fingerprint is not None else None),
         context_fingerprint=_sha256(identity),
     )

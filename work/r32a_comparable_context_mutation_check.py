@@ -66,6 +66,35 @@ MUTATIONS = [
      'if False:\n'
      '            raise ValueError("execution runtime context market identity mismatch")',
      "test_execution_planner.ExecutionStateBuilderTests.test_execution_context_rejects_quote_market_and_tradability_identity_mismatch"),
+    ("backend/execution_planner.py",
+     'if runtime_context.strategy_id != str(account_id or ""):\n'
+     '            raise ValueError("entry runtime context strategy/account identity mismatch")',
+     'if False:\n'
+     '            raise ValueError("entry runtime context strategy/account identity mismatch")',
+     "test_execution_planner.ExecutionStateBuilderTests.test_entry_context_rejects_strategy_policy_mismatch"),
+    ("backend/execution_planner.py",
+     'if (not expected_policy_identity\n'
+     '                or _execution_policy_fingerprint_for(actual_policy) != expected_policy_identity):\n'
+     '            raise ValueError("entry runtime context execution policy identity mismatch")',
+     'if False:\n'
+     '            raise ValueError("entry runtime context execution policy identity mismatch")',
+     "test_execution_planner.ExecutionStateBuilderTests.test_entry_context_binds_execution_policy_identity"),
+    ("backend/execution_planner.py",
+     '        "require_market_gate": state.require_market_gate,\n',
+     '        # mutation: decision option omitted from state identity\n',
+     "test_execution_planner.ExecutionStateBuilderTests.test_entry_context_binds_market_gate_option"),
+    ("backend/execution_planner.py",
+     'if quote_code != requested_code:\n'
+     '            raise ValueError("execution runtime context quote symbol mismatch")',
+     'if False:\n'
+     '            raise ValueError("execution runtime context quote symbol mismatch")',
+     "test_execution_planner.ExecutionStateBuilderTests.test_execution_context_rejects_quote_symbol_mismatch"),
+    ("backend/execution_planner.py",
+     'if quote_code != requested_code:\n'
+     '            raise ValueError("entry runtime context quote symbol mismatch")',
+     'if False:\n'
+     '            raise ValueError("entry runtime context quote symbol mismatch")',
+     "test_execution_planner.ExecutionStateBuilderTests.test_entry_context_rejects_quote_symbol_mismatch"),
 ]
 
 
