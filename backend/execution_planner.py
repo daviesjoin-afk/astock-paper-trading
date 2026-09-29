@@ -625,78 +625,80 @@ def _runtime_context_for_order(
     import simulation_runtime_context as SRC
 
     row = dict(order or {})
+    strategy_id = str(row.get("strategy_id") or "")
+    checksum = str(row.get("strategy_checksum") or "")
     try:
-        strategy_id = str(row.get("strategy_id") or "")
-        checksum = str(row.get("strategy_checksum") or "")
-        try:
-            version = int(row.get("strategy_version"))
-            cycle_id = int(row.get("cycle_id"))
-        except (TypeError, ValueError):
-            return SRC.ActiveRuntimeContextResult.unavailable(
-                "missing_strategy_identity",
-            )
-        if not strategy_id or not checksum:
-            return SRC.ActiveRuntimeContextResult.unavailable(
-                "missing_strategy_identity",
-            )
-        if reading is None or reading.snapshot is None:
-            return SRC.ActiveRuntimeContextResult.unavailable(
-                "missing_market_snapshot",
-            )
-        if not bool(getattr(tradability, "evidence_present", False)):
-            return SRC.ActiveRuntimeContextResult.unavailable(
-                "missing_tradability_evidence",
-            )
-        tradability_fingerprint = str(getattr(tradability, "fingerprint", "") or "")
-        if not tradability_fingerprint:
-            return SRC.ActiveRuntimeContextResult.unavailable(
-                "missing_tradability_evidence",
-            )
-        import strategy_runtime as SRT
-
-        runtime = SRT.get_context_for_cycle(conn, strategy_id, cycle_id=cycle_id)
-        if runtime.version != version or runtime.checksum != checksum:
-            return SRC.ActiveRuntimeContextResult.unavailable(
-                "strategy_cycle_identity_mismatch",
-            )
-        snapshot = MDC.symbol_quote_snapshot(quote, asof_day=asof_day)
-        if snapshot is None:
-            return SRC.ActiveRuntimeContextResult.unavailable(
-                "missing_quote_identity",
-            )
-        if not execution_state_identity:
-            return SRC.ActiveRuntimeContextResult.unavailable(
-                "missing_execution_state",
-            )
-        risk_identity = {
-            "strategy_risk_fingerprint": runtime.risk_fingerprint.to_dict(),
-            "compiled_risk_profile": runtime.risk_profile.to_dict(),
-        }
-        context = SRC.build_comparable_runtime_context(
-            strategy_id=strategy_id, strategy_version=version,
-            strategy_checksum=checksum, session_date=str(asof_day),
-            decision_at=str(quote.get("execution_asof") or ""),
-            market_policy_name=MDC.EXECUTION_QUOTE_POLICY.name,
-            market_snapshot_fingerprint=MDC.snapshot_fingerprint(reading.snapshot),
-            symbol_quote_fingerprints={
-                str(row.get("code") or ""): MDC.snapshot_fingerprint(snapshot),
-            },
-            tradability_evidence_fingerprints={
-                f"{row.get('code')}@{asof_day}": tradability_fingerprint,
-            },
-            execution_ruleset_version=SIMULATION_EXECUTION_RULESET,
-            risk_policy_identity=risk_identity,
-            execution_state_fingerprint=execution_state_identity,
+        version = int(row.get("strategy_version"))
+        cycle_id = int(row.get("cycle_id"))
+    except (TypeError, ValueError):
+        return SRC.ActiveRuntimeContextResult.unavailable(
+            "missing_strategy_identity",
         )
-        return SRC.ActiveRuntimeContextResult.available(context)
+    if not strategy_id or not checksum:
+        return SRC.ActiveRuntimeContextResult.unavailable(
+            "missing_strategy_identity",
+        )
+    if reading is None or reading.snapshot is None:
+        return SRC.ActiveRuntimeContextResult.unavailable(
+            "missing_market_snapshot",
+        )
+    if not bool(getattr(tradability, "evidence_present", False)):
+        return SRC.ActiveRuntimeContextResult.unavailable(
+            "missing_tradability_evidence",
+        )
+    tradability_fingerprint = str(getattr(tradability, "fingerprint", "") or "")
+    if not tradability_fingerprint:
+        return SRC.ActiveRuntimeContextResult.unavailable(
+            "missing_tradability_evidence",
+        )
+    import strategy_runtime as SRT
+
+    try:
+        runtime = SRT.get_context_for_cycle(conn, strategy_id, cycle_id=cycle_id)
     except sqlite3.Error:
         return SRC.ActiveRuntimeContextResult.unavailable(
             "missing_strategy_identity",
         )
-    except (KeyError, TypeError, ValueError, AttributeError):
+    except ValueError:
+        # The cycle owner uses ValueError for an absent or unpinned identity.
         return SRC.ActiveRuntimeContextResult.unavailable(
-            "invalid_runtime_context_inputs",
+            "missing_strategy_identity",
         )
+
+    if runtime.version != version or runtime.checksum != checksum:
+        return SRC.ActiveRuntimeContextResult.unavailable(
+            "strategy_cycle_identity_mismatch",
+        )
+    snapshot = MDC.symbol_quote_snapshot(quote, asof_day=asof_day)
+    if snapshot is None:
+        return SRC.ActiveRuntimeContextResult.unavailable(
+            "missing_quote_identity",
+        )
+    if not execution_state_identity:
+        return SRC.ActiveRuntimeContextResult.unavailable(
+            "missing_execution_state",
+        )
+    risk_identity = {
+        "strategy_risk_fingerprint": runtime.risk_fingerprint.to_dict(),
+        "compiled_risk_profile": runtime.risk_profile.to_dict(),
+    }
+    context = SRC.build_comparable_runtime_context(
+        strategy_id=strategy_id, strategy_version=version,
+        strategy_checksum=checksum, session_date=str(asof_day),
+        decision_at=str(quote.get("execution_asof") or ""),
+        market_policy_name=MDC.EXECUTION_QUOTE_POLICY.name,
+        market_snapshot_fingerprint=MDC.snapshot_fingerprint(reading.snapshot),
+        symbol_quote_fingerprints={
+            str(row.get("code") or ""): MDC.snapshot_fingerprint(snapshot),
+        },
+        tradability_evidence_fingerprints={
+            f"{row.get('code')}@{asof_day}": tradability_fingerprint,
+        },
+        execution_ruleset_version=SIMULATION_EXECUTION_RULESET,
+        risk_policy_identity=risk_identity,
+        execution_state_fingerprint=execution_state_identity,
+    )
+    return SRC.ActiveRuntimeContextResult.available(context)
 
 
 def evaluate_simulated_execution(
