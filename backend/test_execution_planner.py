@@ -1097,6 +1097,163 @@ class ExecutionStateBuilderTests(unittest.TestCase):
         )
         return formal, state, quote, reading, tradability, runtime_context, context
 
+    def test_production_fact_capture_binds_the_single_owner_read_to_context_and_execution(self):
+        import strategy_runtime as SRT
+        import tradability_archive as TA
+
+        digest = hashlib.sha256(b"exact owner fact").hexdigest()
+        fact = types.SimpleNamespace(
+            evidence_present=True, fingerprint=digest, can_buy=True, can_sell=True,
+            buy_block_reason="ok", sell_block_reason="ok",
+            to_dict=lambda: {"evidence_present": True, "fingerprint": digest},
+        )
+        runtime = types.SimpleNamespace(
+            version=1, checksum=hashlib.sha256(b"strategy").hexdigest(),
+            risk_fingerprint=types.SimpleNamespace(to_dict=lambda: {"version": "risk-v1"}),
+            risk_profile=types.SimpleNamespace(to_dict=lambda: {"max_positions": 4}),
+        )
+        quote = {
+            "code": "002241", "price": 21.5, "amount": 50_000_000.0,
+            "quote_at": NOW, "execution_asof": NOW,
+            "quote_source": "test_market", "quote_validation": "cross_source_checked",
+        }
+        order = _order_row(
+            strategy_id="trend_pullback", strategy_version=1,
+            strategy_checksum=runtime.checksum,
+        )
+        conn = mock.Mock()
+        conn.execute.return_value.fetchall.return_value = []
+        paper = types.SimpleNamespace(
+            _pending_buy_reservations=lambda *args, **kwargs: ([], 0.0),
+            _shared_cash=lambda _conn: 50_000.0,
+        )
+        intent = EP.PersistedOrderIntent(
+            order_id=7, account_id="trend_pullback", cycle_id=ORDER_CYCLE,
+            strategy_id="trend_pullback", strategy_version=1,
+            strategy_checksum=runtime.checksum, signal_id=None,
+            symbol="002241", side="buy", desired_quantity=100,
+            intent_at=NOW, reference_price=21.5,
+        )
+        with (
+            mock.patch.object(TA, "tradability_at", return_value=fact) as owner_read,
+            mock.patch.object(SRT, "get_context_for_cycle", return_value=runtime),
+            mock.patch.object(EP, "_pt", return_value=paper),
+        ):
+            context = EP.execution_context_from_facts(
+                conn=conn, order=order, quote=quote, asof_day="2026-09-08",
+            )
+            result = EP._decision_evidence(
+                EP.evaluate_simulated_execution(intent, context), context,
+            )
+
+        self.assertEqual(1, owner_read.call_count)
+        self.assertIs(context.tradability, fact)
+        self.assertEqual(digest, dict(
+            context.runtime_context.tradability_evidence_fingerprints
+        )["002241@2026-09-08"])
+        self.assertEqual("AVAILABLE", result["runtime_context_availability"])
+        self.assertIsNone(result["runtime_context_unavailability_reason"])
+
+    def test_missing_owner_fact_remains_unavailable_after_a_later_archive_fact(self):
+        import strategy_runtime as SRT
+        import tradability_archive as TA
+
+        missing = types.SimpleNamespace(evidence_present=False, fingerprint=None)
+        runtime = types.SimpleNamespace(
+            version=1, checksum=hashlib.sha256(b"strategy").hexdigest(),
+            risk_fingerprint=types.SimpleNamespace(to_dict=lambda: {"version": "risk-v1"}),
+            risk_profile=types.SimpleNamespace(to_dict=lambda: {"max_positions": 4}),
+        )
+        quote = {
+            "code": "002241", "price": 21.5, "amount": 50_000_000.0,
+            "quote_at": NOW, "execution_asof": NOW,
+            "quote_source": "test_market", "quote_validation": "cross_source_checked",
+        }
+        order = _order_row(
+            strategy_id="trend_pullback", strategy_version=1,
+            strategy_checksum=runtime.checksum,
+        )
+        conn = mock.Mock()
+        conn.execute.return_value.fetchall.return_value = []
+        paper = types.SimpleNamespace(
+            _pending_buy_reservations=lambda *args, **kwargs: ([], 0.0),
+            _shared_cash=lambda _conn: 50_000.0,
+        )
+        intent = EP.PersistedOrderIntent(
+            order_id=7, account_id="trend_pullback", cycle_id=ORDER_CYCLE,
+            strategy_id="trend_pullback", strategy_version=1,
+            strategy_checksum=runtime.checksum, signal_id=None,
+            symbol="002241", side="buy", desired_quantity=100,
+            intent_at=NOW, reference_price=21.5,
+        )
+        with (
+            mock.patch.object(TA, "tradability_at", return_value=missing) as owner_read,
+            mock.patch.object(SRT, "get_context_for_cycle", return_value=runtime) as runtime_read,
+            mock.patch.object(EP, "_pt", return_value=paper),
+        ):
+            context = EP.execution_context_from_facts(
+                conn=conn, order=order, quote=quote, asof_day="2026-09-08",
+            )
+            first = EP._decision_evidence(
+                EP.evaluate_simulated_execution(intent, context), context,
+            )
+            self.assertEqual("UNAVAILABLE", first["runtime_context_availability"])
+            self.assertEqual("missing_tradability_evidence",
+                             first["runtime_context_unavailability_reason"])
+            self.assertIsNone(context.runtime_context)
+            later_fact = types.SimpleNamespace(
+                evidence_present=True,
+                fingerprint=hashlib.sha256(b"later owner fact").hexdigest(),
+            )
+            with mock.patch.object(TA, "tradability_at", return_value=later_fact):
+                replay = EP._decision_evidence(
+                    EP.evaluate_simulated_execution(intent, context), context,
+                )
+        self.assertEqual(first, replay)
+        self.assertEqual(1, owner_read.call_count)
+        runtime_read.assert_not_called()
+
+    def test_active_execution_replay_ignores_machine_wall_clock(self):
+        formal = _valid_execution_context()
+        state = EP.ExecutionStateSnapshot(buying_power=50_000.0, sellable_quantity=300)
+        runtime_context = _runtime_context_for_state(
+            execution_state=state, quote=dict(formal.quote),
+            reading=formal.market_reading,
+            tradability_fingerprint=formal.tradability.fingerprint,
+        )
+        context = EP.execution_context_from_state(
+            order={"code": "002241", "side": "buy"},
+            quote=dict(formal.quote), asof_day="2026-09-08",
+            market_reading=formal.market_reading, tradability=formal.tradability,
+            state=state, runtime_context=runtime_context,
+        )
+        intent = EP.PersistedOrderIntent(
+            order_id=7, account_id="trend_pullback", cycle_id=ORDER_CYCLE,
+            strategy_id="trend_pullback", strategy_version=1,
+            strategy_checksum=hashlib.sha256(b"strategy").hexdigest(),
+            signal_id=None, symbol="002241", side="buy", desired_quantity=100,
+            intent_at=NOW, reference_price=21.5,
+        )
+
+        class EarlyMachineClock(dt.datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return cls(2026, 9, 8, 10, 5, tzinfo=tz)
+
+        class LateMachineClock(dt.datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return cls(2026, 9, 9, 10, 0, tzinfo=tz)
+
+        with mock.patch.object(EP.dt, "datetime", EarlyMachineClock):
+            first = EP.evaluate_simulated_execution(intent, context)
+        with mock.patch.object(EP.dt, "datetime", LateMachineClock):
+            replay = EP.evaluate_simulated_execution(intent, context)
+
+        self.assertEqual(first, replay)
+        self.assertEqual(runtime_context.context_fingerprint,
+                         context.runtime_context.context_fingerprint)
+
     def test_execution_context_rejects_state_context_mismatches(self):
         formal = _valid_execution_context()
         state_a = EP.ExecutionStateSnapshot(
@@ -1576,12 +1733,15 @@ class ExecutionStateBuilderTests(unittest.TestCase):
         self.assertEqual(runtime.context_fingerprint,
                          recorded["runtime_context_fingerprint"])
         self.assertEqual(runtime.projection(), recorded["runtime_context"])
-        self.assertEqual("available", recorded["runtime_context_availability"])
+        self.assertEqual("AVAILABLE", recorded["runtime_context_availability"])
+        self.assertIsNone(recorded["runtime_context_unavailability_reason"])
 
         legacy = EP._decision_evidence(decision, replace(context, runtime_context=None))
         self.assertIsNone(legacy["runtime_context_fingerprint"])
-        self.assertEqual("active_runtime_context_unavailable",
+        self.assertEqual("UNAVAILABLE",
                          legacy["runtime_context_availability"])
+        self.assertEqual("missing_strategy_identity",
+                         legacy["runtime_context_unavailability_reason"])
 
     def test_explicit_execution_state_builder_has_no_ledger_reads(self):
         import pathlib

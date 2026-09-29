@@ -1232,6 +1232,7 @@ def _decision_snapshot(
     payload=None, *, account_id=None, code=None, side=None, decision=None,
     reason=None, asof_date=None, quote=None, kline=None, news=None,
     final_score=None, decision_at=None, runtime_context=None,
+    runtime_context_unavailability_reason=None,
 ):
     """Compatibility facade for the extracted point-in-time audit serializer.
 
@@ -1257,6 +1258,7 @@ def _decision_snapshot(
         risk_version=RISK_VERSION,
         now_fn=_now,
         runtime_context=runtime_context,
+        runtime_context_unavailability_reason=runtime_context_unavailability_reason,
     )
 
 
@@ -7778,6 +7780,7 @@ def generate_signals(asof_date=None):
                     reason=reason, asof_date=day, quote=quote, kline=kline,
                     news=payload.get("news"),
                     final_score=(decision.get("entry_model") or {}).get("score"),
+                    runtime_context_unavailability_reason="missing_entry_state",
                 )
                 decision_result = SIG.decide_signal(
                     passed=passed, reason=reason, evidence=approval_evidence,
@@ -11576,6 +11579,7 @@ def _bootstrap_signals_for_today(asof_day, live_universe=None, source_slot="intr
                         kline=kline,
                         news=payload.get("news"),
                         final_score=(decision.get("entry_model") or {}).get("score"),
+                        runtime_context_unavailability_reason="missing_entry_state",
                     )
                     # R25：入场冻结是**候选级**事实，先判定一次；随后 SignalDecision
                     # 用同一个事实同时产出 status 与 reason。此前这里和下方各算了一套

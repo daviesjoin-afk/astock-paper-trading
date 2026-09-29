@@ -16,6 +16,18 @@ from typing import Any
 CONTEXT_SCHEMA_VERSION = "comparable-runtime-context-v3"
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 
+ACTIVE_CONTEXT_UNAVAILABLE_REASONS = frozenset({
+    "missing_strategy_identity",
+    "missing_market_snapshot",
+    "missing_quote_identity",
+    "missing_tradability_evidence",
+    "missing_execution_state",
+    "missing_entry_state",
+    "missing_policy_identity",
+    "strategy_cycle_identity_mismatch",
+    "invalid_runtime_context_inputs",
+})
+
 
 def _canonical(value: Any) -> Any:
     if value is None or isinstance(value, (str, bool, int)):
@@ -108,6 +120,42 @@ class ComparableRuntimeContext:
             "entry_gate_state_fingerprint": self.entry_gate_state_fingerprint,
             "entry_policy_fingerprint": self.entry_policy_fingerprint,
             "context_fingerprint": self.context_fingerprint,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class ActiveRuntimeContextResult:
+    """Explicit outcome of capturing one Active decision's comparable inputs."""
+
+    availability: str
+    context: ComparableRuntimeContext | None = None
+    reason_code: str | None = None
+
+    def __post_init__(self):
+        if self.availability not in {"AVAILABLE", "UNAVAILABLE"}:
+            raise ValueError("runtime context availability is invalid")
+        if self.availability == "AVAILABLE":
+            if not isinstance(self.context, ComparableRuntimeContext) or self.reason_code is not None:
+                raise ValueError("available runtime context result is inconsistent")
+        elif self.context is not None or self.reason_code not in ACTIVE_CONTEXT_UNAVAILABLE_REASONS:
+            raise ValueError("unavailable runtime context result needs a stable reason")
+
+    @classmethod
+    def available(cls, context: ComparableRuntimeContext):
+        return cls("AVAILABLE", context=context)
+
+    @classmethod
+    def unavailable(cls, reason_code: str):
+        return cls("UNAVAILABLE", reason_code=str(reason_code or ""))
+
+    def projection(self) -> dict[str, Any]:
+        return {
+            "availability": self.availability,
+            "reason_code": self.reason_code,
+            "runtime_context": self.context.projection() if self.context else None,
+            "runtime_context_fingerprint": (
+                self.context.context_fingerprint if self.context else None
+            ),
         }
 
 

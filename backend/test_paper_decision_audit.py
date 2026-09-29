@@ -144,7 +144,8 @@ GOLDEN_ENVELOPE = {
     "strategy_id": "tq_breakout",
     "runtime_context": None,
     "runtime_context_fingerprint": None,
-    "runtime_context_availability": "active_runtime_context_unavailable",
+    "runtime_context_availability": "UNAVAILABLE",
+    "runtime_context_unavailability_reason": "missing_strategy_identity",
     "threshold": {
         "delta": -0.02,
         "dynamic": True,
@@ -635,8 +636,10 @@ class WithDecisionSnapshotContractTests(unittest.TestCase):
             news_scan_meta=GOLDEN_SCAN_META,
         )
         self.assertIsNone(legacy["runtime_context_fingerprint"])
-        self.assertEqual("active_runtime_context_unavailable",
+        self.assertEqual("UNAVAILABLE",
                          legacy["runtime_context_availability"])
+        self.assertEqual("missing_strategy_identity",
+                         legacy["runtime_context_unavailability_reason"])
 
         runtime_context = type("Context", (), {
             "context_fingerprint": "a" * 64,
@@ -648,8 +651,20 @@ class WithDecisionSnapshotContractTests(unittest.TestCase):
             news_scan_meta=GOLDEN_SCAN_META, runtime_context=runtime_context,
         )
         self.assertEqual("a" * 64, recorded["runtime_context_fingerprint"])
-        self.assertEqual("available", recorded["runtime_context_availability"])
+        self.assertEqual("AVAILABLE", recorded["runtime_context_availability"])
+        self.assertIsNone(recorded["runtime_context_unavailability_reason"])
         self.assertEqual(2, recorded["runtime_context"]["strategy_version"])
+
+    def test_snapshot_preserves_specific_unavailable_reason_without_lookup(self):
+        snapshot = audit.build_decision_snapshot(
+            {}, decision_at="2026-09-11 10:01:03",
+            news_scan_meta=GOLDEN_SCAN_META,
+            runtime_context_unavailability_reason="missing_tradability_evidence",
+        )
+        self.assertEqual("UNAVAILABLE", snapshot["runtime_context_availability"])
+        self.assertEqual("missing_tradability_evidence",
+                         snapshot["runtime_context_unavailability_reason"])
+        self.assertIsNone(snapshot["runtime_context_fingerprint"])
 
     def test_preserves_caller_payload_and_enriches_strategy_id(self):
         payload = {

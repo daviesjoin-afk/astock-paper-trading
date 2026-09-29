@@ -225,6 +225,7 @@ def build_decision_snapshot(
     risk_version=DEFAULT_RISK_VERSION,
     now_fn=None,
     runtime_context=None,
+    runtime_context_unavailability_reason=None,
 ):
     """Build one point-in-time evidence envelope without changing trade rules."""
     payload = payload if isinstance(payload, dict) else {}
@@ -408,6 +409,9 @@ def build_decision_snapshot(
         elif isinstance(runtime_context, dict):
             context_projection = dict(runtime_context)
             context_fingerprint = context_projection.get("context_fingerprint")
+    unavailable_reason = str(
+        runtime_context_unavailability_reason or "missing_strategy_identity"
+    )
     return snapshot_safe(
         {
             "version": DECISION_SNAPSHOT_VERSION,
@@ -451,7 +455,10 @@ def build_decision_snapshot(
             "runtime_context": context_projection,
             "runtime_context_fingerprint": context_fingerprint,
             "runtime_context_availability": (
-                "available" if context_fingerprint else "active_runtime_context_unavailable"
+                "AVAILABLE" if context_fingerprint else "UNAVAILABLE"
+            ),
+            "runtime_context_unavailability_reason": (
+                None if context_fingerprint else unavailable_reason
             ),
             "data_quality": data_quality,
             "final": {

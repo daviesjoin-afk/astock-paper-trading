@@ -86,7 +86,7 @@ research → validation_failed
 
 ### R32 阶段状态与可比较运行上下文
 
-R31 生命周期与晋级边界已完成。R32-A（Comparable Runtime Context）当前 **IN REVIEW**；R32-B Shadow runtime 和 R33 **NOT STARTED**。R32-A 的市场事实 identity 由 `market_data_contract.snapshot_fingerprint()` 提供；策略精确版本、market policy、tradability fingerprint、execution ruleset 与现有 risk identity 一起组成不可变运行上下文。正式路径把 ledger 状态收集成显式快照，再交给既有纯决策 authority；旧 Active 记录缺少事实时保持 `active_runtime_context_unavailable`，不做历史回填。完整契约见 [`R32_COMPARABLE_RUNTIME_CONTEXT.md`](R32_COMPARABLE_RUNTIME_CONTEXT.md)。
+R31 生命周期与晋级边界、R32-A（Comparable Runtime Context）已完成。R32-B（Active Comparable Evidence Closure）正在实现；R32-C Shadow runtime 和 R33 **NOT STARTED**。R32-A 的市场事实 identity 由 `market_data_contract.snapshot_fingerprint()` 提供；策略精确版本、market policy、tradability fingerprint、execution ruleset 与现有 risk identity 一起组成不可变运行上下文。正式执行路径从 Tradability Archive 单次捕获事实，并让 context 指纹与执行决策复用同一事实；缺失时记录 `UNAVAILABLE` 和稳定原因码，不做历史回填。完整契约见 [`R32_COMPARABLE_RUNTIME_CONTEXT.md`](R32_COMPARABLE_RUNTIME_CONTEXT.md) 和 [`R32B_ACTIVE_COMPARABLE_EVIDENCE.md`](R32B_ACTIVE_COMPARABLE_EVIDENCE.md)。
 
 就绪后，所有消费者读同一份不可变契约 `StrategyRuntimeContext`（`strategy_runtime.StrategyRuntimeContext`）：
 

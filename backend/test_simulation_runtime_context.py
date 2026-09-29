@@ -33,6 +33,40 @@ def _build(**changes):
 
 
 class ComparableRuntimeContextTests(unittest.TestCase):
+    def test_active_context_result_requires_complete_identity_or_stable_reason(self):
+        available_context = _build()
+        available = SRC.ActiveRuntimeContextResult.available(available_context)
+        self.assertEqual("AVAILABLE", available.availability)
+        self.assertEqual(available_context.context_fingerprint,
+                         available.projection()["runtime_context_fingerprint"])
+
+        unavailable = SRC.ActiveRuntimeContextResult.unavailable(
+            "missing_tradability_evidence",
+        )
+        self.assertEqual("UNAVAILABLE", unavailable.availability)
+        self.assertEqual("missing_tradability_evidence", unavailable.reason_code)
+        with self.assertRaisesRegex(ValueError, "stable reason"):
+            SRC.ActiveRuntimeContextResult.unavailable("unknown")
+        with self.assertRaisesRegex(ValueError, "inconsistent"):
+            SRC.ActiveRuntimeContextResult("AVAILABLE", reason_code="missing_quote_identity")
+
+    def test_same_owner_evidence_replays_stably_and_changed_owner_identity_does_not(self):
+        captured = _build()
+        replayed = _build(
+            symbol_quote_fingerprints=dict(captured.symbol_quote_fingerprints),
+            tradability_evidence_fingerprints=dict(
+                captured.tradability_evidence_fingerprints
+            ),
+        )
+        changed_owner_fact = _build(
+            tradability_evidence_fingerprints={
+                "600000@2026-09-28": _sha("new owner fact"),
+            },
+        )
+        self.assertEqual(captured.context_fingerprint, replayed.context_fingerprint)
+        self.assertNotEqual(captured.context_fingerprint,
+                            changed_owner_fact.context_fingerprint)
+
     def test_same_semantics_are_stable_across_clock_and_mapping_order(self):
         one = _build(risk_policy_identity={"compiled_profile": {"max_positions": 4,
                                                                   "max_exposure": 0.5}})

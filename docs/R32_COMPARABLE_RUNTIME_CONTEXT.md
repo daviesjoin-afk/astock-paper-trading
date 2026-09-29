@@ -1,6 +1,6 @@
 # R32-A Comparable Runtime Context
 
-Status: **R32-A IN REVIEW**. R31 is **COMPLETE**; R32-B and R33 are **NOT STARTED**.
+Status: **R32-A COMPLETE**. R31 is **COMPLETE**; R32-B is **IN PROGRESS**; R32-C through R32-E and R33 are **NOT STARTED**.
 
 R32-A gives a simulation run a deterministic identity over owner-issued facts and explicit mutable-state inputs. It does not create market, tradability, risk, or execution authority. It adds one contract that records which exact inputs a run consumed.
 
@@ -26,6 +26,6 @@ Entry checks follow the same pattern: the formal `plan_entry()` adapter captures
 
 ## Active evidence and legacy records
 
-The exact decision evidence is the persisted intent identity paired with `ComparableRuntimeContext`: the persisted order identifies what was requested, and the context identifies the owner facts and explicit mutable state used to decide it. The context fingerprint alone does not claim to represent the persisted intent. New decision audit envelopes can persist a supplied runtime context and its fingerprint. New execution evidence persists the exact context when all cycle-pinned strategy, market, tradability, and execution-state identities are available. If an input cannot be proven, evidence records `active_runtime_context_unavailable` and a null fingerprint. Historical Active rows are not backfilled or reconstructed from current data; they remain unavailable for comparison.
+The exact decision evidence is the persisted intent identity paired with `ComparableRuntimeContext`: the persisted order identifies what was requested, and the context identifies the owner facts and explicit mutable state used to decide it. The context fingerprint alone does not claim to represent the persisted intent. New decision audit envelopes persist an explicitly supplied runtime context or `UNAVAILABLE` with a stable reason code. New execution evidence persists the exact context when all cycle-pinned strategy, market, tradability, and execution-state identities are available. If an input cannot be proven, evidence has a null fingerprint and cannot be upgraded by a later lookup. Historical Active rows are not backfilled or reconstructed from current data; they remain unavailable for comparison.
 
-R32-A does not add a Shadow scheduler, account, portfolio, order ledger, comparison UI, lifecycle transition, or promotion path. R32-B remains **NOT STARTED** pending review of this contract and its readiness gates.
+R32-A does not add a Shadow scheduler, account, portfolio, order ledger, comparison UI, lifecycle transition, or promotion path. R32-B closes Active evidence coverage before any Shadow runner is added.
