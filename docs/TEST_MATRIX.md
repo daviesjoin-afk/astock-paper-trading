@@ -70,7 +70,7 @@
 
 阶段状态：R31 **COMPLETE**；R32-A **COMPLETE（PR #216 MERGED）**。
 
-## R32-B Active 可比较证据闭环（IN PROGRESS）
+## R32-B Active 可比较证据闭环（COMPLETE）
 
 | 场景 / 契约 | 实现位置 | 回归用例 | 状态 |
 | --- | --- | --- | --- |
@@ -79,7 +79,25 @@
 | 缺失 owner fact 明确 unavailable；后续出现新归档事实不升级已捕获结果 | `execution_planner`、`paper_decision_audit` | `test_execution_planner.ExecutionStateBuilderTests.test_missing_owner_fact_remains_unavailable_after_a_later_archive_fact` | ✅ |
 | 决策审计保存固定 reason code，不自行补查当前状态 | `paper_decision_audit` | `test_paper_decision_audit.py` | ✅ |
 
-阶段状态：R32-A **COMPLETE**；R32-B **IN PROGRESS**；R32-C、R33 **NOT STARTED**。
+阶段状态：R32-A **COMPLETE**；R32-B **COMPLETE（PR #217 MERGED）**。
+
+## R32-C 隔离式 Shadow Runtime（IN REVIEW）
+
+| 场景 / 契约 | 实现位置 | 回归用例 | 状态 |
+| --- | --- | --- | --- |
+| Environment identity 对象键及集合顺序稳定；冻结输入与调用者嵌套对象脱离；绑定 Active context、session、decision instant、market、quote、factor、tradability 与 execution ruleset | `shadow_runtime.ComparableEnvironmentIdentity`、`FrozenShadowEnvironment` | `test_shadow_runtime.py` | ✅ |
+| tradability 只接受 owner 的 typed immutable decision；Shadow execution 不读取 archive repository | `shadow_runtime.FrozenShadowEnvironment` | `test_shadow_runtime.py`（C3、typed evidence） | ✅ |
+| 同一冻结环境、exact Challenger version、reference state 与 reference capital 得到相同 append-only ShadowRun | `shadow_runtime.run_shadow` | `test_shadow_runtime.py`（C1） | ✅ |
+| decision 与 quote freshness 使用显式 `decision_at`，不读取机器时钟 | `execution_planner.evaluate_entry_state` | `test_shadow_runtime.py`（C2） | ✅ |
+| Shadow runner 不读 provider/archive/cache；只接受冻结 Active evidence | `shadow_runtime` | `test_shadow_runtime.py`（C3） | ✅ |
+| ShadowRun repository 只写自身 append-only 表；正式 cash/positions/lots/orders/fills/reservations/risk decisions/position risk state 不变 | `shadow_run_repository`、migration v24 | `test_shadow_runtime.py`（C4） | ✅ |
+| exact challenger lifecycle 必须为 `shadow`；环境不一致、continuation 未显式绑定 prior run 时 fail closed | `shadow_run_service`、`shadow_runtime.evaluate_shadow` | `test_shadow_runtime.py`（C5–C7） | ✅ |
+| 新 run 后按显式 ID 重读旧 run，旧 fingerprint/replay 不变；不提供 latest fallback | `shadow_run_repository.get_run` | `test_shadow_runtime.py`（C8） | ✅ |
+| Entry 与 execution 共用 isolated reference cash/state；formal cash 和 formal portfolio occupancy 不进入 Challenger 运行 | `shadow_runtime.evaluate_shadow` | `test_shadow_runtime.py`（C9–C10） | ✅ |
+| continuation 跨 session 使已有持仓可卖并重置当日成交量；同 session 保留 T+1 与消费量状态 | `shadow_runtime._state_for_run` | `test_shadow_runtime.py`（C8） | ✅ |
+| 语义 mutation（canonical order、provider、环境、账本、prior run、lifecycle、wall clock、reference cash、T+1 rollover、typed evidence） | `work/r32c_shadow_runtime_mutation_check.py` | 10/10 DETECTED，restore SHA256 PASS | ✅ |
+
+阶段状态：R32-A/B **COMPLETE**；R32-C **IN REVIEW**；R32-D/E、R33 **NOT STARTED**。
 | 策略产品线端到端（内置模板 + 用户策略同链路） | — | `test_strategy_product_line_e2e.py` | ✅ |
 | 风险收紧（画像只能更严，系统键不可触碰） | `strategy_risk_enforcement.py` | `test_strategy_risk_enforcement.py`、`test_asymmetric_risk_gate_wiring.py` | ✅ |
 
