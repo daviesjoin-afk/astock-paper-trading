@@ -12,6 +12,7 @@ import ast
 import hashlib
 import os
 import re
+import sqlite3
 import types
 import unittest
 from dataclasses import replace
@@ -670,6 +671,64 @@ class SharedGateTests(_StubbedPlannerTest):
 
 
 class CommitFillTests(_StubbedPlannerTest):
+    def test_context_capture_database_error_precedes_every_fill_mutation(self):
+        import strategy_runtime as SRT
+        import tradability_archive as TA
+
+        checksum = hashlib.sha256(b"strategy").hexdigest()
+        order = _order_row(
+            strategy_id="trend_pullback", strategy_version=1,
+            strategy_checksum=checksum,
+        )
+        conn = _FakeConn(order_row=order)
+        mutations = []
+        stub = types.SimpleNamespace(
+            **vars(_pt_stub()),
+            _assert_active_lease=lambda *_args: None,
+            _pending_buy_reservations=lambda *_args, **_kwargs: ([], 0.0),
+            _shared_cash=lambda *_args: 50_000.0,
+            _reserve_shared_capital=lambda *_args, **_kwargs: mutations.append("reserve"),
+            _debit_shared_cash=lambda *_args, **_kwargs: mutations.append("cash"),
+            _finish_capital_reservation=lambda *_args, **_kwargs: mutations.append("reservation"),
+            _record_lot=lambda *_args, **_kwargs: mutations.append("lot"),
+            _consume_available_lots=lambda *_args, **_kwargs: mutations.append("consume"),
+            _credit_shared_cash=lambda *_args, **_kwargs: mutations.append("credit"),
+            _risk_log=lambda *_args, **_kwargs: mutations.append("risk"),
+            _audit=lambda *_args, **_kwargs: mutations.append("audit"),
+            _sync_positions=lambda *_args, **_kwargs: mutations.append("positions"),
+            _json=lambda value: value,
+        )
+        quote = {
+            "code": "002241", "price": 21.5, "amount": 50_000_000.0,
+            "quote_at": NOW, "execution_asof": NOW,
+            "quote_source": "test_market", "quote_validation": "cross_source_checked",
+        }
+        fact = types.SimpleNamespace(
+            evidence_present=True, fingerprint=hashlib.sha256(b"tradability").hexdigest(),
+            can_buy=True, can_sell=True, buy_block_reason="ok", sell_block_reason="ok",
+            to_dict=lambda: {"evidence_present": True, "can_buy": True, "can_sell": True},
+        )
+
+        with (
+            mock.patch.object(EP, "_pt", return_value=stub),
+            mock.patch.object(TA, "tradability_at", return_value=fact),
+            mock.patch.object(
+                SRT, "get_context_for_cycle",
+                side_effect=sqlite3.OperationalError("runtime database read failed"),
+            ),
+            self.assertRaisesRegex(sqlite3.OperationalError, "runtime database read failed"),
+        ):
+            EP.commit_fill(
+                conn, account={"id": "tq_breakout"},
+                plan={"side": "buy", "code": "002241", "qty": 100,
+                      "execution_quote": quote},
+                order_id=7, asof_day=dt.date(2026, 9, 8), reserved=False,
+            )
+
+        self.assertEqual([], mutations)
+        self.assertTrue(all(" ".join(sql.split()).lower().startswith("select ")
+                            for sql, _params in conn.queries))
+
     def test_buy_commit_reserves_debits_and_writes_the_fill(self):
         calls = []
         stub = types.SimpleNamespace(
@@ -1191,6 +1250,42 @@ class ExecutionStateBuilderTests(unittest.TestCase):
                             tradability=formal.tradability,
                             execution_state_identity="execution-state-fingerprint",
                         )
+
+    def test_expected_cycle_runtime_absence_is_unavailable_but_system_errors_propagate(self):
+        import strategy_runtime as SRT
+
+        formal = _valid_execution_context()
+        checksum = hashlib.sha256(b"strategy").hexdigest()
+        order = _order_row(
+            strategy_id="trend_pullback",
+            strategy_version=1,
+            strategy_checksum=checksum,
+        )
+        call = lambda: EP._runtime_context_for_order(
+            mock.Mock(), order, quote=formal.quote,
+            asof_day="2026-09-08", reading=formal.market_reading,
+            tradability=formal.tradability,
+            execution_state_identity="execution-state-fingerprint",
+        )
+
+        with mock.patch.object(
+            SRT, "get_context_for_cycle",
+            side_effect=SRT.StrategyRuntimeContextUnavailable("version not pinned"),
+        ):
+            unavailable = call()
+        self.assertEqual("UNAVAILABLE", unavailable.availability)
+        self.assertEqual("missing_strategy_identity", unavailable.reason_code)
+
+        for failure in (
+            sqlite3.OperationalError("database read failed"),
+            ValueError("unexpected runtime compilation failure"),
+        ):
+            with self.subTest(failure=type(failure).__name__):
+                with mock.patch.object(
+                    SRT, "get_context_for_cycle", side_effect=failure,
+                ):
+                    with self.assertRaises(type(failure)):
+                        call()
 
     def test_missing_owner_fact_remains_unavailable_after_a_later_archive_fact(self):
         import strategy_runtime as SRT

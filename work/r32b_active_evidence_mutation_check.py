@@ -19,21 +19,21 @@ MUTATIONS = [
     ),
     (
         "backend/execution_planner.py",
-        '        if not bool(getattr(tradability, "evidence_present", False)):\n'
-        '            return SRC.ActiveRuntimeContextResult.unavailable(\n'
-        '                "missing_tradability_evidence",\n'
-        '            )\n'
+        '    if not bool(getattr(tradability, "evidence_present", False)):\n'
+        '        return SRC.ActiveRuntimeContextResult.unavailable(\n'
+        '            "missing_tradability_evidence",\n'
+        '        )\n'
+        '    tradability_fingerprint = str(getattr(tradability, "fingerprint", "") or "")\n'
+        '    if not tradability_fingerprint:\n'
+        '        return SRC.ActiveRuntimeContextResult.unavailable(\n'
+        '            "missing_tradability_evidence",\n'
+        '        )',
+        '    if not bool(getattr(tradability, "evidence_present", False)):\n'
+        '        tradability_fingerprint = "0" * 64\n'
+        '    else:\n'
         '        tradability_fingerprint = str(getattr(tradability, "fingerprint", "") or "")\n'
-        '        if not tradability_fingerprint:\n'
-        '            return SRC.ActiveRuntimeContextResult.unavailable(\n'
-        '                "missing_tradability_evidence",\n'
-        '            )',
-        '        if not bool(getattr(tradability, "evidence_present", False)):\n'
-        '            tradability_fingerprint = "0" * 64\n'
-        '        else:\n'
-        '            tradability_fingerprint = str(getattr(tradability, "fingerprint", "") or "")\n'
-        '        if not tradability_fingerprint:\n'
-        '            tradability_fingerprint = "0" * 64',
+        '    if not tradability_fingerprint:\n'
+        '        tradability_fingerprint = "0" * 64',
         "test_execution_planner.ExecutionStateBuilderTests.test_missing_owner_fact_remains_unavailable_after_a_later_archive_fact",
     ),
     (
@@ -63,6 +63,12 @@ MUTATIONS = [
         '"AVAILABLE" if runtime_context is not None else "UNAVAILABLE"',
         '"AVAILABLE"',
         "test_execution_planner.ExecutionStateBuilderTests.test_missing_owner_fact_remains_unavailable_after_a_later_archive_fact",
+    ),
+    (
+        "backend/execution_planner.py",
+        "    except SRT.StrategyRuntimeContextUnavailable:",
+        "    except ValueError:",
+        "test_execution_planner.ExecutionStateBuilderTests.test_expected_cycle_runtime_absence_is_unavailable_but_system_errors_propagate",
     ),
 ]
 

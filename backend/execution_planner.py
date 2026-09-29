@@ -655,12 +655,7 @@ def _runtime_context_for_order(
 
     try:
         runtime = SRT.get_context_for_cycle(conn, strategy_id, cycle_id=cycle_id)
-    except sqlite3.Error:
-        return SRC.ActiveRuntimeContextResult.unavailable(
-            "missing_strategy_identity",
-        )
-    except ValueError:
-        # The cycle owner uses ValueError for an absent or unpinned identity.
+    except SRT.StrategyRuntimeContextUnavailable:
         return SRC.ActiveRuntimeContextResult.unavailable(
             "missing_strategy_identity",
         )
