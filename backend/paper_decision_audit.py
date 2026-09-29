@@ -14,7 +14,7 @@ import datetime as dt
 import pandas as pd
 
 
-DECISION_SNAPSHOT_VERSION = "decision-snapshot-v2"
+DECISION_SNAPSHOT_VERSION = "decision-snapshot-v3"
 DEFAULT_RISK_VERSION = "paper-risk-v4"
 _DEFAULT_NEWS_SCAN_META = {"observed_at": None, "stale": False, "error": None}
 

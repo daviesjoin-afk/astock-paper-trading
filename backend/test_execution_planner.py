@@ -1154,6 +1154,38 @@ class ExecutionStateBuilderTests(unittest.TestCase):
         self.assertEqual("AVAILABLE", result["runtime_context_availability"])
         self.assertIsNone(result["runtime_context_unavailability_reason"])
 
+    def test_unexpected_context_capture_error_propagates(self):
+        import strategy_runtime as SRT
+
+        formal = _valid_execution_context()
+        checksum = hashlib.sha256(b"strategy").hexdigest()
+
+        def broken_profile_projection():
+            raise RuntimeError("risk profile projection failed")
+
+        runtime = types.SimpleNamespace(
+            version=1,
+            checksum=checksum,
+            risk_fingerprint=types.SimpleNamespace(
+                to_dict=lambda: {"version": "risk-v1"},
+            ),
+            risk_profile=types.SimpleNamespace(to_dict=broken_profile_projection),
+        )
+        order = _order_row(
+            strategy_id="trend_pullback",
+            strategy_version=1,
+            strategy_checksum=checksum,
+        )
+
+        with mock.patch.object(SRT, "get_context_for_cycle", return_value=runtime):
+            with self.assertRaisesRegex(RuntimeError, "risk profile projection failed"):
+                EP._runtime_context_for_order(
+                    mock.Mock(), order, quote=formal.quote,
+                    asof_day="2026-09-08", reading=formal.market_reading,
+                    tradability=formal.tradability,
+                    execution_state_identity="execution-state-fingerprint",
+                )
+
     def test_missing_owner_fact_remains_unavailable_after_a_later_archive_fact(self):
         import strategy_runtime as SRT
         import tradability_archive as TA

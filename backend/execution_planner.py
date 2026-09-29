@@ -697,10 +697,6 @@ def _runtime_context_for_order(
         return SRC.ActiveRuntimeContextResult.unavailable(
             "invalid_runtime_context_inputs",
         )
-    except Exception:
-        return SRC.ActiveRuntimeContextResult.unavailable(
-            "invalid_runtime_context_inputs",
-        )
 
 
 def evaluate_simulated_execution(

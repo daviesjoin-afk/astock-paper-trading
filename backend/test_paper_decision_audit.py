@@ -152,7 +152,7 @@ GOLDEN_ENVELOPE = {
         "value": 0.72,
         "version": "threshold-fixture-v1",
     },
-    "version": "decision-snapshot-v2",
+    "version": "decision-snapshot-v3",
 }
 
 
@@ -461,7 +461,7 @@ class BuildDecisionSnapshotContractTests(unittest.TestCase):
             news_scan_meta={**GOLDEN_SCAN_META, "stale": True},
             risk_version="paper-risk-v4",
         )
-        self.assertEqual(snapshot["version"], "decision-snapshot-v2")
+        self.assertEqual(snapshot["version"], "decision-snapshot-v3")
         self.assertIsNone(snapshot["account_id"])
         self.assertIsNone(snapshot["code"])
         self.assertIsNone(snapshot["side"])
