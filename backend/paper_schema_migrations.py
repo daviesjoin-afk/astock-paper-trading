@@ -1035,3 +1035,76 @@ def ensure_proposal_lifecycle_columns(conn):
         return True
     except Exception:
         return False
+
+
+# ─── 隔离式 ShadowRun 追加证据（v24 / R32-C） ────────────────────────────────
+#
+# 不变量::
+#
+#     shadow_runs = Challenger 运行的唯一追加式证据 owner
+#     paper_*     = 正式账本；Shadow 路径绝不写入其中任何一张表
+#
+# 这里刻意**不**建立 shadow_accounts / shadow_orders / shadow_fills /
+# shadow_positions / shadow_lots / shadow_cash 六套与正式账本平行的 authority。
+# 每一份 ShadowRun 保存该次运行的完整输入与输出 evidence，状态转移是纯函数；
+# 下一条 run 只以显式 ``previous_shadow_run_id`` 引用上一条的 ``after_state``，
+# 不查询"最新 run"。
+#
+# 身份：``run_id`` 是对 canonical evidence 的 SHA-256，因此
+# ``run_id == run_fingerprint``（CHECK 强制）；``PRIMARY KEY(run_id)`` +
+# ``UNIQUE(run_fingerprint)`` 让重复追加成为幂等 no-op，而不是第二条逻辑重复行。
+# ``created_at`` 只是写入时刻，永不参与任何决策。
+
+
+def shadow_run_ddl(table="shadow_runs"):
+    """``shadow_runs`` 的规范 DDL（单一事实来源，migration 与 ``init_db`` 共用）。"""
+    return f"""
+        CREATE TABLE IF NOT EXISTS {table}(
+            run_id TEXT PRIMARY KEY CHECK(length(run_id)=64),
+            run_fingerprint TEXT NOT NULL UNIQUE CHECK(length(run_fingerprint)=64),
+            challenger_strategy_id TEXT NOT NULL,
+            challenger_strategy_version INTEGER NOT NULL CHECK(challenger_strategy_version>0),
+            challenger_strategy_checksum TEXT NOT NULL CHECK(length(challenger_strategy_checksum)=64),
+            active_strategy_id TEXT NOT NULL,
+            active_strategy_version INTEGER NOT NULL CHECK(active_strategy_version>0),
+            active_strategy_checksum TEXT NOT NULL CHECK(length(active_strategy_checksum)=64),
+            environment_fingerprint TEXT NOT NULL CHECK(length(environment_fingerprint)=64),
+            session_date TEXT NOT NULL,
+            decision_at TEXT NOT NULL,
+            reference_capital REAL NOT NULL CHECK(reference_capital>0),
+            previous_shadow_run_id TEXT REFERENCES {table}(run_id),
+            evidence_json TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            CHECK(run_id=run_fingerprint)
+        )
+    """
+
+
+def ensure_shadow_runs_table(conn):
+    """v24：建 ShadowRun 追加证据表 + 链索引 + append-only guard（幂等、不回填）。
+
+    既有账本走 ``init_db`` 快路径时也必须执行本函数，否则升级后的线上库永远
+    没有 ``shadow_runs``，Shadow 运行只能 fail closed。本函数只创建自己的表，
+    不 INSERT、不 UPDATE 任何正式账本。
+    """
+    changes = {}
+    if not table_columns(conn, "shadow_runs"):
+        conn.execute(shadow_run_ddl("shadow_runs"))
+        changes["shadow_runs"] = "created"
+    else:
+        changes["shadow_runs"] = "ok"
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_shadow_runs_chain"
+        " ON shadow_runs(challenger_strategy_id,challenger_strategy_version,run_id)"
+    )
+    conn.execute(
+        """CREATE TRIGGER IF NOT EXISTS shadow_runs_no_update
+           BEFORE UPDATE ON shadow_runs
+           BEGIN SELECT RAISE(ABORT,'shadow runs are append-only'); END"""
+    )
+    conn.execute(
+        """CREATE TRIGGER IF NOT EXISTS shadow_runs_no_delete
+           BEFORE DELETE ON shadow_runs
+           BEGIN SELECT RAISE(ABORT,'shadow runs are append-only'); END"""
+    )
+    return changes

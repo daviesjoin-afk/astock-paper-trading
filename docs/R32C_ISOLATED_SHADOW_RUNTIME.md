@@ -15,12 +15,14 @@
 
 - ShadowRun append-only evidence 是 Shadow 执行事实的唯一 owner。派生展示数据必须从 run evidence 重建，不能反向成为事实来源。
 - `ComparableEnvironmentIdentity` 只证明两条策略腿共享同一外部输入。规范 JSON 排序后 SHA-256；不含策略身份、策略风险/持仓/资金状态，也不依赖进程 hash、repr、机器时间或随机 ID。
-- 本阶段的 `FrozenShadowEnvironment` 必须带 R32-B `ComparableRuntimeContext` 作为 Active capture 来源凭证；共享环境各 identity 字段必须与该 context 相符，active comparator exact stamp 也必须相符。tradability 输入必须是 Tradability Archive owner 的不可变 `TradabilityDecision` 类型，并与 code/session/decision instant/fingerprint 精确匹配；模块可以引用这个值契约，但绝不读取 `TradabilityArchiveRepository`。factor snapshots 是策略 DSL 实际消费的额外冻结输入，按内容生成 fingerprint；所有输入随 ShadowRun 保存。Shadow runner 不允许 provider、行情 cache、最新 tradability/market 查询。缺一个身份或身份不一致都返回不可比/不可运行。
+- 本阶段的 `FrozenShadowEnvironment` 必须带 R32-B `ComparableRuntimeContext` 作为 Active capture 来源凭证；共享环境七个维度（session date、decision instant、market policy、market snapshot fingerprint、quote fingerprints、tradability fingerprints、execution ruleset identity）必须逐项与该 context 相符——比较按维度整体进行，缺少任一维度即视为不同——active comparator exact stamp 也必须相符。tradability 输入必须是 Tradability Archive owner 的不可变 `TradabilityDecision` 类型，并与 code/session/decision instant/fingerprint 精确匹配；模块可以引用这个值契约，但绝不读取 `TradabilityArchiveRepository`。factor snapshots 是策略 DSL 实际消费的额外冻结输入，按内容生成 fingerprint；所有输入随 ShadowRun 保存。Shadow runner 不允许 provider、行情 cache、最新 tradability/market 查询。缺一个身份或身份不一致都返回不可比/不可运行。
 - 每次运行必须显式给出 challenger 与 active comparator 的 exact `(strategy_id, version, checksum)`、共享环境 fingerprint、精确 session/decision instant 和正数 reference capital。reference capital 是模拟基准，不读取正式 NAV/cash/allocation。
 - challenger exact version 的 R31 state 必须为 `shadow`；本模块没有 lifecycle transition API。版本缺失、checksum 不符、非 Shadow 状态、环境不一致或 continuation 链缺失都 fail closed。
 - continuation 必须显式引用 `previous_shadow_run_id`，并以那条不可变 run 的 after-state 作为 before-state。禁止查询“最新 run”。初次运行明确传 `None`。
 - Shadow reference state 只保留现金、持仓/可卖数量、同 session 已成交消费量和 turnover 所需数据，不复刻正式账户、lot 或订单表。Entry Authority 复用 `EntryGateState` 纯评估，但会先用该 Shadow 链的 reference cash、Shadow positions、空的正式预占/共享池状态构造隔离快照；调用者传入的 formal cash/positions/reservations 不会进入 Challenger 决策。
-- 允许的持久写入仅为正式 migration 建立的 ShadowRun append-only evidence。正式账户现金、持仓、lots、orders、fills、reservations、risk/capacity 状态在 Shadow run 前后不得变化。
+- 允许的持久写入仅为正式 migration 建立的 ShadowRun append-only evidence。正式账户现金、持仓、lots、orders、fills、reservations、risk/capacity 状态在 Shadow run 前后不得变化。DDL 的单一事实来源是 `paper_schema_migrations.ensure_shadow_runs_table`：migration v24 与 `init_db` 的两条路径（既有账本快路径、新建库路径）调用同一个函数，既有账本升级后不会缺表。
+- 每份 run evidence 保存本次运行**消费的输入**：每个 candidate 的 requested quantity、reference price、order type、捕获的 `EntryGateState` 全字段（含调用方捕获的 `account_risk_state`/`market_state`）与声明的 risk policy identity；因此旧 run 的输入不需要重新查询当前世界即可审计。同一 run 内 `(symbol, side)` 重复的 candidate 直接拒绝——重复腿没有自身确定顺序，不能靠调用方顺序决定 run identity。
+- entry policy 仍由现有 owner（`execution_planner.policy_for`）按 challenger strategy id 解析，R32-C 不新增 shadow policy 表，也不复制 chase lane / 席位预留 / 手动复核判据。捕获的 `account_risk_state` 与 `market_state` 是调用方显式提供的运行输入证据，不属于共享环境身份，也不回写正式风控状态。挑战者自己的 `position_limit` 仍然生效：Shadow 只忽略正式组合的占位与共享池预留，不取消该上限。
 
 ## 纯逻辑与适配边界
 
@@ -31,4 +33,4 @@
 
 ## R32-D 前置条件
 
-需要一个可审计的 Active capture producer，能对目标 session/decision instant 一次性输出覆盖 Active 所需 symbols 的 frozen external evidence；每一份 ShadowRun 保存同一个环境身份及两条策略腿的 exact stamps。R32-D 才能基于 exact Active evidence ID 与 ShadowRun ID 生成 comparison coverage/deltas。R32-C 不生成 winner、总分、晋级建议或 comparison report。
+需要一个可审计的 Active capture producer，能对目标 session/decision instant 一次性输出覆盖 Active 所需 symbols 的 frozen external evidence；每一份 ShadowRun 保存同一个环境身份及两条策略腿的 exact stamps 与本次运行消费的 candidate 输入。R32-D 才能基于 exact Active evidence ID 与 ShadowRun ID 生成 comparison coverage/deltas。R32-C 不生成 winner、总分、晋级建议或 comparison report，也不提供生产调用者（runtime wiring 属 R32-E）。

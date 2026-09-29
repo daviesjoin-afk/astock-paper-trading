@@ -297,36 +297,11 @@ MIGRATIONS = {
         (23, "新增信号的不可变周期归属字段 cycle_id（幂等，不回填）",
          paper_schema.ensure_signal_cycle_provenance),
         # R32-C ShadowRun 是隔离 challenger 的唯一追加式证据 owner；不建立
-        # 与正式 paper cash/orders/fills/positions 平行的账本表。
+        # 与正式 paper cash/orders/fills/positions 平行的账本表。DDL 单一事实
+        # 来源在 paper_schema_migrations：migration 与 init_db 快路径调用同一
+        # 个函数，既有账本升级后不会缺表。
         (24, "新增隔离式 ShadowRun 追加证据表",
-         """
-         CREATE TABLE IF NOT EXISTS shadow_runs(
-           run_id TEXT PRIMARY KEY CHECK(length(run_id)=64),
-           run_fingerprint TEXT NOT NULL UNIQUE CHECK(length(run_fingerprint)=64),
-           challenger_strategy_id TEXT NOT NULL,
-           challenger_strategy_version INTEGER NOT NULL CHECK(challenger_strategy_version>0),
-           challenger_strategy_checksum TEXT NOT NULL CHECK(length(challenger_strategy_checksum)=64),
-           active_strategy_id TEXT NOT NULL,
-           active_strategy_version INTEGER NOT NULL CHECK(active_strategy_version>0),
-           active_strategy_checksum TEXT NOT NULL CHECK(length(active_strategy_checksum)=64),
-           environment_fingerprint TEXT NOT NULL CHECK(length(environment_fingerprint)=64),
-           session_date TEXT NOT NULL,
-           decision_at TEXT NOT NULL,
-           reference_capital REAL NOT NULL CHECK(reference_capital>0),
-           previous_shadow_run_id TEXT REFERENCES shadow_runs(run_id),
-           evidence_json TEXT NOT NULL,
-           created_at TEXT NOT NULL DEFAULT (datetime('now')),
-           CHECK(run_id=run_fingerprint)
-         );
-         CREATE INDEX IF NOT EXISTS idx_shadow_runs_chain
-           ON shadow_runs(challenger_strategy_id,challenger_strategy_version,run_id);
-         CREATE TRIGGER IF NOT EXISTS shadow_runs_no_update
-           BEFORE UPDATE ON shadow_runs
-           BEGIN SELECT RAISE(ABORT,'shadow runs are append-only'); END;
-         CREATE TRIGGER IF NOT EXISTS shadow_runs_no_delete
-           BEFORE DELETE ON shadow_runs
-           BEGIN SELECT RAISE(ABORT,'shadow runs are append-only'); END;
-         """),
+         paper_schema.ensure_shadow_runs_table),
     ],
     "adaptive_learning": [
         (1, "创建 schema_version 表", """

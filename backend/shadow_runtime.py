@@ -12,7 +12,7 @@ import json
 import math
 import re
 from collections.abc import Mapping
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field, fields as dataclass_fields, replace
 from types import MappingProxyType
 from typing import Any
 
@@ -103,6 +103,15 @@ def _execution_projection(value: EP.ExecutionDecision | None) -> dict[str, Any] 
         "liquidity_evidence": _plain(value.liquidity_evidence),
         "ruleset_version": value.ruleset_version,
     }
+
+
+def _captured_entry_state_projection(state: EP.EntryGateState) -> dict[str, Any]:
+    """Every captured EntryGateState field, so a run's inputs survive as evidence.
+
+    The schema is read from the owner dataclass instead of being re-declared here:
+    a new entry input becomes evidence automatically rather than silently.
+    """
+    return {item.name: _plain(getattr(state, item.name)) for item in dataclass_fields(state)}
 
 
 def _instant(value: Any) -> str:
@@ -250,14 +259,33 @@ class FrozenShadowEnvironment:
         if rebuilt_identity != identity:
             raise ShadowRuntimeError("NOT_COMPARABLE", "shadow_environment_not_comparable")
         active = self.active_runtime_context
-        if (active.context_schema_version != SRC.CONTEXT_SCHEMA_VERSION
-                or active.session_date != self.identity.session_date
-                or active.decision_at != self.identity.decision_at
-                or active.market_policy_name != self.identity.market_policy_name
-                or active.market_snapshot_fingerprint != self.identity.market_snapshot_fingerprint
-                or dict(active.symbol_quote_fingerprints) != dict(self.identity.symbol_quote_fingerprints)
-                or dict(active.tradability_evidence_fingerprints)
-                != dict(self.identity.tradability_evidence_fingerprints)):
+        # Every shared-environment dimension is compared here, one key per
+        # dimension. Strategy-specific identity (strategy stamp, risk policy,
+        # entry/execution state) is deliberately absent: Active and Challenger
+        # are expected to differ there, and only there.
+        captured_environment = {
+            "session_date": active.session_date,
+            "decision_at": active.decision_at,
+            "market_policy_name": active.market_policy_name,
+            "market_snapshot_fingerprint": active.market_snapshot_fingerprint,
+            "symbol_quote_fingerprints": dict(active.symbol_quote_fingerprints),
+            "tradability_evidence_fingerprints": dict(
+                active.tradability_evidence_fingerprints),
+            "execution_ruleset_identity": active.execution_ruleset_version,
+        }
+        expected_environment = {
+            "session_date": self.identity.session_date,
+            "decision_at": self.identity.decision_at,
+            "market_policy_name": self.identity.market_policy_name,
+            "market_snapshot_fingerprint": self.identity.market_snapshot_fingerprint,
+            "symbol_quote_fingerprints": dict(self.identity.symbol_quote_fingerprints),
+            "tradability_evidence_fingerprints": dict(
+                self.identity.tradability_evidence_fingerprints),
+            "execution_ruleset_identity": self.identity.execution_ruleset_identity,
+        }
+        if captured_environment != expected_environment:
+            raise ShadowRuntimeError("NOT_COMPARABLE", "shadow_environment_not_comparable")
+        if active.context_schema_version != SRC.CONTEXT_SCHEMA_VERSION:
             raise ShadowRuntimeError("NOT_COMPARABLE", "shadow_environment_not_comparable")
         if _rebuild_runtime_context(active).context_fingerprint != active.context_fingerprint:
             raise ShadowRuntimeError("NOT_COMPARABLE", "shadow_environment_not_comparable")
@@ -488,6 +516,10 @@ def evaluate_shadow(*, spec: ShadowRunSpec, environment: FrozenShadowEnvironment
         raise ValueError("challenger_lifecycle_not_shadow")
     if not candidates:
         raise ValueError("shadow_candidates_required")
+    if len({(row.symbol, row.side) for row in candidates}) != len(candidates):
+        # Duplicate (symbol, side) legs have no deterministic order of their own;
+        # reject instead of letting caller order leak into the run identity.
+        raise ValueError("shadow_candidates_must_be_unique")
     stamp = (str(getattr(strategy_version, "strategy_id", "")),
              int(getattr(strategy_version, "version", 0)),
              str(getattr(strategy_version, "checksum", "")))
@@ -635,6 +667,16 @@ def evaluate_shadow(*, spec: ShadowRunSpec, environment: FrozenShadowEnvironment
                     )
         decisions.append({
             "symbol": code, "side": candidate.side,
+            # The exact inputs this run consumed are evidence, not just the outputs:
+            # R32-D and any replay must be able to read the requested quantity,
+            # captured entry inputs, and declared risk identity back out of the run.
+            "candidate": {
+                "desired_quantity": int(candidate.desired_quantity),
+                "reference_price": candidate.reference_price,
+                "order_type": candidate.order_type,
+                "entry_gate_state": _captured_entry_state_projection(candidate.entry_state),
+                "risk_policy_identity": _plain(candidate.risk_policy_identity),
+            },
             "signal": signal.projection(),
             "entry": entry_result,
             "execution": _execution_projection(execution_result),

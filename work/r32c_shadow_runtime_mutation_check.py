@@ -80,6 +80,36 @@ MUTATIONS = [
         'False',
         "test_shadow_runtime.ShadowRuntimeTests.test_frozen_environment_requires_owner_typed_tradability_decision",
     ),
+    (
+        "backend/shadow_runtime.py",
+        '        if captured_environment != expected_environment:\n',
+        '        if False:\n',
+        "test_shadow_runtime.ShadowRuntimeTests.test_c6_each_captured_shared_dimension_fails_not_comparable",
+    ),
+    (
+        "backend/shadow_runtime.py",
+        '            "execution_ruleset_identity": active.execution_ruleset_version,\n',
+        '',
+        "test_shadow_runtime.ShadowRuntimeTests.test_c6_each_captured_shared_dimension_fails_not_comparable",
+    ),
+    (
+        "backend/shadow_runtime.py",
+        '    if len({(row.symbol, row.side) for row in candidates}) != len(candidates):\n',
+        '    if False:\n',
+        "test_shadow_runtime.ShadowRuntimeTests.test_duplicate_candidate_legs_are_rejected",
+    ),
+    (
+        "backend/shadow_runtime.py",
+        '                "desired_quantity": int(candidate.desired_quantity),\n',
+        '                "desired_quantity": 0,\n',
+        "test_shadow_runtime.ShadowRuntimeTests.test_shadow_run_evidence_keeps_candidate_inputs",
+    ),
+    (
+        "backend/shadow_runtime.py",
+        '                "entry_gate_state": _captured_entry_state_projection(candidate.entry_state),\n',
+        '                "entry_gate_state": {},\n',
+        "test_shadow_runtime.ShadowRuntimeTests.test_shadow_run_evidence_keeps_candidate_inputs",
+    ),
 ]
 
 

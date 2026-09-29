@@ -1872,6 +1872,9 @@ def init_db():
                 # R14（v20）：既有账本走这条快路径，新表必须显式补建（幂等、不回填）。
                 PSM.ensure_position_risk_state(conn)
                 PSM.ensure_risk_scan_run_state(conn)  # R16 v21 风险扫描运行状态
+                # R32-C（v24）：既有账本同样要走这条快路径补建 ShadowRun 证据表，
+                # 否则升级后的库永远没有 shadow_runs（Shadow 运行只能 fail closed）。
+                PSM.ensure_shadow_runs_table(conn)
                 _ensure_accounts(conn)
                 _ensure_user_strategy_accounts(conn)
                 _ensure_cycle(conn)
@@ -2173,6 +2176,7 @@ def init_db():
         # R14（v20）：DDL 单一事实来源在 paper_schema_migrations，这里显式调用。
         PSM.ensure_position_risk_state(conn)
         PSM.ensure_risk_scan_run_state(conn)  # R16 v21（DDL 只在 migration）
+        PSM.ensure_shadow_runs_table(conn)  # R32-C v24（DDL 只在 paper_schema_migrations）
         _ensure_accounts(conn)
         _ensure_user_strategy_accounts(conn)
         _ensure_cycle(conn)

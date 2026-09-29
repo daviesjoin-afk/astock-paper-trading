@@ -6,6 +6,7 @@ import hashlib
 import os
 import sqlite3
 import sys
+import tempfile
 import types
 import unittest
 from dataclasses import replace
@@ -19,8 +20,9 @@ if BACKEND_DIR not in sys.path:
 import db_migrate
 import execution_planner as EP
 import market_data_contract as MDC
-import paper_trading as PT
 import paper_quote_policy as PQP
+import paper_schema_migrations as PSM
+import paper_trading as PT
 import shadow_run_repository as SRR
 import shadow_runtime as SH
 import shadow_run_service as SHS
@@ -179,6 +181,45 @@ class ShadowRuntimeTests(unittest.TestCase):
                 with self.assertRaises(SH.ShadowRuntimeError) as caught:
                     replace(self.environment, identity=altered)
                 self.assertEqual(caught.exception.availability, "NOT_COMPARABLE")
+
+    def test_c6_each_captured_shared_dimension_fails_not_comparable(self):
+        """The Active capture must match the environment on every shared dimension."""
+        base = {
+            "strategy_id": self.active.strategy_id, "strategy_version": self.active.version,
+            "strategy_checksum": self.active.checksum, "session_date": self.day,
+            "decision_at": self.decision_at,
+            "market_policy_name": MDC.EXECUTION_QUOTE_POLICY.name,
+            "market_snapshot_fingerprint": self.identity.market_snapshot_fingerprint,
+            "symbol_quote_fingerprints": dict(self.identity.symbol_quote_fingerprints),
+            "tradability_evidence_fingerprints": dict(
+                self.identity.tradability_evidence_fingerprints),
+            "execution_ruleset_version": EP.SIMULATION_EXECUTION_RULESET,
+            "risk_policy_identity": {"active_capture": "fixture"},
+            "execution_state_fingerprint": _sha("active-execution-state"),
+        }
+        changed = [
+            {"session_date": "2026-09-09"},
+            {"decision_at": "2026-09-08T10:06:00+08:00"},
+            {"market_policy_name": "other-quote-policy"},
+            {"market_snapshot_fingerprint": _sha("other-market")},
+            {"symbol_quote_fingerprints": {self.code: _sha("other-quote")}},
+            {"tradability_evidence_fingerprints": {
+                f"{self.code}@{self.day}": _sha("other-tradability")}},
+            {"execution_ruleset_version": "simulation-execution-ruleset-v0"},
+        ]
+        for delta in changed:
+            with self.subTest(dimension=next(iter(delta))):
+                captured = SRC.build_comparable_runtime_context(**(base | delta))
+                with self.assertRaises(SH.ShadowRuntimeError) as caught:
+                    replace(self.environment, active_runtime_context=captured)
+                self.assertEqual(caught.exception.availability, "NOT_COMPARABLE")
+                self.assertEqual(caught.exception.reason_code,
+                                 "shadow_environment_not_comparable")
+        canonical = SRC.build_comparable_runtime_context(**base)
+        self.assertEqual(
+            replace(self.environment, active_runtime_context=canonical).identity,
+            self.identity,
+        )
 
     def test_c2_entry_freshness_uses_supplied_decision_instant(self):
         real_freshness = PQP.quote_is_fresh
@@ -405,6 +446,148 @@ class ShadowRuntimeTests(unittest.TestCase):
         self.assertTrue(entry["allowed"])
         self.assertEqual(entry["gates"]["position_count_gate"]["current"], 0)
         self.assertEqual(entry["gates"]["position_count_gate"]["pool_current"], 0)
+
+    def test_shadow_entry_capacity_still_binds_the_challenger_position_limit(self):
+        """隔离正式持仓不等于取消挑战者自己的席位上限。"""
+        previous = SH.ShadowRunEvidence(
+            run_id=_sha("previous-run"), run_fingerprint=_sha("previous-run"),
+            spec={**self.spec.projection(),
+                  "decision_at": "2026-09-08T09:55:00+08:00",
+                  "previous_shadow_run_id": None},
+            environment={}, strategy_definition_fingerprint=_sha("definition"),
+            before_state=SH.ShadowRuntimeState.initial(
+                100_000.0, self.day).projection(),
+            decisions=(),
+            after_state=SH.ShadowRuntimeState(
+                session_date=self.day, reference_cash=99_000.0,
+                positions={"999999": 100},
+            ).projection(),
+            previous_run_fingerprint=None,
+        )
+        spec = replace(self.spec, previous_shadow_run_id=previous.run_id)
+
+        def entry_at_limit(limit):
+            candidate = replace(
+                self.candidate,
+                entry_state=replace(self.candidate.entry_state,
+                                    position_limit=limit, pool_limit=limit),
+            )
+            result = SH.evaluate_shadow(
+                spec=spec, environment=self.environment,
+                strategy_version=self.strategy_version, lifecycle_state="shadow",
+                candidates=(candidate,), previous_run=previous,
+            )
+            return result.decisions[0]
+
+        blocked = entry_at_limit(1)
+        self.assertFalse(blocked["entry"]["allowed"])
+        self.assertIsNone(blocked["execution"])
+        self.assertEqual(
+            blocked["entry"]["gates"]["position_count_gate"]["current"], 1)
+        self.assertTrue(any("席位" in reason for reason in blocked["entry"]["reasons"]))
+        self.assertTrue(entry_at_limit(2)["entry"]["allowed"])
+
+    def test_forged_runtime_context_fingerprint_is_rejected(self):
+        """重建校验不是恒真：手改 context_fingerprint 的 context 必须被拒。"""
+        forged = replace(self.active_context, context_fingerprint=_sha("forged"))
+        with self.assertRaises(SH.ShadowRuntimeError) as caught:
+            replace(self.environment, active_runtime_context=forged)
+        self.assertEqual(caught.exception.availability, "NOT_COMPARABLE")
+
+    def test_shadow_run_evidence_keeps_candidate_inputs(self):
+        """run evidence 必须能读回本次运行的输入，且与决策实际用的隔离状态分开。"""
+        captured = replace(
+            self.candidate,
+            entry_state=replace(self.candidate.entry_state, shared_cash=1.0),
+        )
+        with mock.patch.object(PT, "_execution_quote_status", return_value={
+                "fresh": True, "status": "cross_source_checked"}):
+            result = SH.evaluate_shadow(
+                spec=self.spec, environment=self.environment,
+                strategy_version=self.strategy_version, lifecycle_state="shadow",
+                candidates=(captured,),
+            )
+        candidate = result.decisions[0]["candidate"]
+        self.assertEqual(candidate["desired_quantity"], 100)
+        self.assertEqual(candidate["reference_price"], 10.0)
+        self.assertEqual(candidate["order_type"], "market")
+        self.assertEqual(candidate["risk_policy_identity"],
+                         {"captured_policy_fingerprint": _sha("risk-policy")})
+        # 记录的是调用方捕获的原始输入……
+        self.assertEqual(candidate["entry_gate_state"]["shared_cash"], 1.0)
+        self.assertEqual(candidate["entry_gate_state"]["position_limit"], 5)
+        self.assertEqual(candidate["entry_gate_state"]["open_codes"], [])
+        # ……而决策仍然只按 Shadow reference capital 评估。
+        entry = result.decisions[0]["entry"]
+        self.assertTrue(entry["allowed"])
+        self.assertEqual(entry["gates"]["cash"]["shared_cash"], 100_000.0)
+
+    def test_duplicate_candidate_legs_are_rejected(self):
+        with self.assertRaisesRegex(ValueError, "shadow_candidates_must_be_unique"):
+            SH.evaluate_shadow(
+                spec=self.spec, environment=self.environment,
+                strategy_version=self.strategy_version, lifecycle_state="shadow",
+                candidates=(self.candidate, self.candidate),
+            )
+
+    def test_c3_decision_path_opens_no_database(self):
+        """决策路径完全不碰 DB：任何 sqlite3.connect 都视为失败。"""
+        with mock.patch("sqlite3.connect",
+                        side_effect=AssertionError("shadow opened a database")), \
+                mock.patch.object(PT, "_execution_quote_status", return_value={
+                    "fresh": True, "status": "cross_source_checked"}):
+            result = self._run()
+        self.assertEqual(result.decisions[0]["execution"]["fill_quantity"], 100)
+
+    def test_v24_shadow_schema_has_one_ddl_owner_and_is_idempotent(self):
+        migration = next(item for item in db_migrate.MIGRATIONS["paper_trading"]
+                         if item[0] == 24)
+        self.assertIs(migration[2], PSM.ensure_shadow_runs_table)
+        conn = sqlite3.connect(":memory:")
+        try:
+            self.assertEqual(PSM.ensure_shadow_runs_table(conn),
+                             {"shadow_runs": "created"})
+            self.assertEqual(PSM.ensure_shadow_runs_table(conn),
+                             {"shadow_runs": "ok"})
+            names = {row[0] for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type IN ('table','trigger')")}
+            self.assertIn("shadow_runs", names)
+            self.assertIn("shadow_runs_no_update", names)
+            self.assertIn("shadow_runs_no_delete", names)
+        finally:
+            conn.close()
+
+    def test_existing_ledger_init_db_creates_shadow_runs(self):
+        """既有账本走 init_db 快路径时也必须拿到 ShadowRun 表。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "paper.sqlite3")
+            calls = []
+            real = PSM.ensure_shadow_runs_table
+            with mock.patch.object(PT, "DB_PATH", path), \
+                    mock.patch.object(PT, "_benchmark_close", return_value=None), \
+                    mock.patch.object(PT, "_RUNBOOK_BOOT", None, create=True), \
+                    mock.patch.object(PSM, "ensure_shadow_runs_table",
+                                      side_effect=lambda conn: (calls.append(conn),
+                                                                real(conn))[1]):
+                PT.init_db()
+                conn = sqlite3.connect(path)
+                conn.execute("DROP TRIGGER shadow_runs_no_update")
+                conn.execute("DROP TRIGGER shadow_runs_no_delete")
+                conn.execute("DROP TABLE shadow_runs")
+                conn.commit()
+                conn.close()
+                calls.clear()
+                PT.init_db()
+            conn = sqlite3.connect(path)
+            try:
+                self.assertEqual(len(calls), 1)
+                names = {row[0] for row in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type IN ('table','trigger')")}
+                self.assertIn("shadow_runs", names)
+                self.assertIn("shadow_runs_no_update", names)
+                self.assertIn("shadow_runs_no_delete", names)
+            finally:
+                conn.close()
 
 
 if __name__ == "__main__":
