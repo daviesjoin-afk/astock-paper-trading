@@ -111,6 +111,7 @@ def _valid_execution_context(*, side="buy", quantity=100, sellable=1000, quote_a
     )
     tradability = types.SimpleNamespace(
         evidence_present=True, can_buy=True, can_sell=True,
+        fingerprint=hashlib.sha256(b"tradability").hexdigest(),
         buy_block_reason="ok", sell_block_reason="ok",
         to_dict=lambda: {"evidence_present": True, "can_buy": True, "can_sell": True},
     )
@@ -125,15 +126,33 @@ def _valid_execution_context(*, side="buy", quantity=100, sellable=1000, quote_a
 
 def _runtime_context_for_state(*, execution_state=None, entry_state=None,
                                ruleset=EP.SIMULATION_EXECUTION_RULESET,
-                               session_date="2026-09-08", decision_at=NOW):
+                               session_date="2026-09-08", decision_at=NOW,
+                               quote=None, reading=None, tradability_fingerprint=None,
+                               market_policy=None, strategy_id="trend_pullback",
+                               strategy_version=1, strategy_checksum=None):
     sha = lambda value: hashlib.sha256(value.encode("utf-8")).hexdigest()
+    quote = quote or {
+        "code": "002241", "price": 21.5, "amount": 50_000_000.0,
+        "quote_at": decision_at, "execution_asof": decision_at,
+        "quote_source": "test_market", "quote_validation": "cross_source_checked",
+    }
+    snapshot_day = EP.MDC.canonical_day(decision_at) or session_date
+    reading = reading or EP.market_reading_for_execution(
+        quote, asof_day=snapshot_day, execution_asof=decision_at,
+    )
+    quote_snapshot = EP.MDC.symbol_quote_snapshot(quote, asof_day=snapshot_day)
     return SRC.build_comparable_runtime_context(
-        strategy_id="trend_pullback", strategy_version=1,
-        strategy_checksum=sha("strategy"), session_date=session_date,
-        decision_at=decision_at, market_policy_name="execution_quote",
-        market_snapshot_fingerprint=sha("market"),
-        symbol_quote_fingerprints={"002241": sha("quote")},
-        tradability_evidence_fingerprints={"002241@2026-09-08": sha("tradability")},
+        strategy_id=strategy_id, strategy_version=strategy_version,
+        strategy_checksum=strategy_checksum or sha("strategy"),
+        session_date=session_date, decision_at=decision_at,
+        market_policy_name=market_policy or EP.MDC.EXECUTION_QUOTE_POLICY.name,
+        market_snapshot_fingerprint=EP.MDC.snapshot_fingerprint(reading.snapshot),
+        symbol_quote_fingerprints={
+            "002241": EP.MDC.snapshot_fingerprint(quote_snapshot),
+        },
+        tradability_evidence_fingerprints={"002241@2026-09-08": (
+            tradability_fingerprint or sha("tradability")
+        )},
         execution_ruleset_version=ruleset,
         risk_policy_identity={"strategy_profile": {"max_positions": 4}},
         execution_state_fingerprint=(
@@ -944,12 +963,14 @@ class PlanEntryTests(_StubbedPlannerTest):
             account_risk_state={"blocked": False, "reasons": []},
             market_state={"light": "green"},
         )
-        runtime_context = _runtime_context_for_state(entry_state=state_a)
         kwargs = {
             "state": state_a, "account_id": "tq_breakout", "code": "002241",
             "side": "buy", "quote": {"price": 21.5, "name": "test"},
             "asof_day": dt.date(2026, 9, 8), "amount": 2500.0, "fees": 2.5,
         }
+        runtime_context = _runtime_context_for_state(
+            entry_state=state_a, quote=kwargs["quote"],
+        )
         stub = types.SimpleNamespace(
             _security_scope=lambda *args: {"allowed": True},
             _execution_quote_status=lambda *args, **kwargs: {"fresh": True},
@@ -972,6 +993,26 @@ class PlanEntryTests(_StubbedPlannerTest):
 
 
 class ExecutionStateBuilderTests(unittest.TestCase):
+    def _bound_execution_inputs(self, *, quote=None, reading=None, tradability=None,
+                                runtime_context=None, order=None):
+        formal = _valid_execution_context()
+        state = EP.ExecutionStateSnapshot(
+            buying_power=50_000.0, sellable_quantity=300,
+        )
+        quote = dict(quote or formal.quote)
+        reading = reading or formal.market_reading
+        tradability = tradability or formal.tradability
+        runtime_context = runtime_context or _runtime_context_for_state(
+            execution_state=state, quote=quote, reading=reading,
+            tradability_fingerprint=tradability.fingerprint,
+        )
+        context = EP.execution_context_from_state(
+            order=order or {"code": "002241", "side": "buy"},
+            quote=quote, asof_day="2026-09-08", market_reading=reading,
+            tradability=tradability, state=state, runtime_context=runtime_context,
+        )
+        return formal, state, quote, reading, tradability, runtime_context, context
+
     def test_execution_context_rejects_state_context_mismatches(self):
         formal = _valid_execution_context()
         state_a = EP.ExecutionStateSnapshot(
@@ -1048,6 +1089,124 @@ class ExecutionStateBuilderTests(unittest.TestCase):
             EP.evaluate_simulated_execution(intent, formal),
             EP.evaluate_simulated_execution(intent, bound),
         )
+
+    def test_execution_context_rejects_quote_market_and_tradability_identity_mismatch(self):
+        formal, state, quote, reading, tradability, runtime_context, _ = (
+            self._bound_execution_inputs()
+        )
+        for changed in (
+            {**quote, "price": quote["price"] + 1},
+            {**quote, "amount": quote["amount"] + 1},
+        ):
+            with self.subTest(quote_change=changed), self.assertRaisesRegex(
+                ValueError, "execution runtime context quote identity mismatch",
+            ):
+                EP.execution_context_from_state(
+                    order={"code": "002241", "side": "buy"}, quote=changed,
+                    asof_day="2026-09-08", market_reading=reading,
+                    tradability=tradability, state=state,
+                    runtime_context=runtime_context,
+                )
+
+        changed_snapshot = replace(
+            reading.snapshot,
+            rows=({**dict(reading.snapshot.rows[0]), "price": 99.0},),
+        )
+        changed_reading = replace(reading, snapshot=changed_snapshot)
+        with self.assertRaisesRegex(
+            ValueError, "execution runtime context market identity mismatch",
+        ):
+            EP.execution_context_from_state(
+                order={"code": "002241", "side": "buy"}, quote=quote,
+                asof_day="2026-09-08", market_reading=changed_reading,
+                tradability=tradability, state=state,
+                runtime_context=runtime_context,
+            )
+
+        changed_tradability = types.SimpleNamespace(
+            **{**vars(tradability),
+               "fingerprint": hashlib.sha256(b"changed tradability").hexdigest()},
+        )
+        with self.assertRaisesRegex(
+            ValueError, "execution runtime context tradability identity mismatch",
+        ):
+            EP.execution_context_from_state(
+                order={"code": "002241", "side": "buy"}, quote=quote,
+                asof_day="2026-09-08", market_reading=reading,
+                tradability=changed_tradability, state=state,
+                runtime_context=runtime_context,
+            )
+        missing_tradability = types.SimpleNamespace(
+            **{**vars(tradability), "fingerprint": None},
+        )
+        with self.assertRaisesRegex(
+            ValueError, "execution runtime context tradability identity unavailable",
+        ):
+            EP.execution_context_from_state(
+                order={"code": "002241", "side": "buy"}, quote=quote,
+                asof_day="2026-09-08", market_reading=reading,
+                tradability=missing_tradability, state=state,
+                runtime_context=runtime_context,
+            )
+
+    def test_execution_context_requires_policy_and_exact_order_strategy_stamp(self):
+        _, state, quote, reading, tradability, runtime_context, _ = (
+            self._bound_execution_inputs()
+        )
+        wrong_policy = _runtime_context_for_state(
+            execution_state=state, quote=quote, reading=reading,
+            tradability_fingerprint=tradability.fingerprint,
+            market_policy="other_policy",
+        )
+        with self.assertRaisesRegex(
+            ValueError, "execution runtime context market policy mismatch",
+        ):
+            EP.execution_context_from_state(
+                order={"code": "002241", "side": "buy"}, quote=quote,
+                asof_day="2026-09-08", market_reading=reading,
+                tradability=tradability, state=state, runtime_context=wrong_policy,
+            )
+
+        checksum = hashlib.sha256(b"strategy").hexdigest()
+        exact_order = {
+            "code": "002241", "side": "buy", "strategy_id": "trend_pullback",
+            "strategy_version": 1, "strategy_checksum": checksum,
+        }
+        accepted = EP.execution_context_from_state(
+            order=exact_order, quote=quote, asof_day="2026-09-08",
+            market_reading=reading, tradability=tradability, state=state,
+            runtime_context=runtime_context,
+        )
+        self.assertIs(accepted.runtime_context, runtime_context)
+        for stamp in (
+            {**exact_order, "strategy_version": 2},
+            {key: value for key, value in exact_order.items() if key != "strategy_checksum"},
+        ):
+            with self.subTest(strategy_stamp=stamp), self.assertRaisesRegex(
+                ValueError, "execution runtime context strategy identity",
+            ):
+                EP.execution_context_from_state(
+                    order=stamp, quote=quote, asof_day="2026-09-08",
+                    market_reading=reading, tradability=tradability, state=state,
+                    runtime_context=runtime_context,
+                )
+
+    def test_entry_context_rejects_quote_identity_mismatch(self):
+        state = EP.EntryGateState(
+            pending_cash=10.0, shared_cash=1000.0,
+            account_risk_state={"blocked": False, "reasons": []},
+        )
+        quote_a = {"price": 21.5, "amount": 5000.0, "name": "test"}
+        quote_b = {**quote_a, "price": 22.0}
+        runtime_context = _runtime_context_for_state(
+            entry_state=state, quote=quote_a,
+        )
+        with self.assertRaisesRegex(ValueError, "entry runtime context quote identity mismatch"):
+            EP.evaluate_entry_state(
+                state=state, account_id="tq_breakout", code="002241", side="buy",
+                quote=quote_b, asof_day="2026-09-08", amount=100.0,
+                runtime_context=runtime_context,
+            )
 
     def test_execution_state_fingerprint_tracks_every_decision_field(self):
         base = EP.ExecutionStateSnapshot(

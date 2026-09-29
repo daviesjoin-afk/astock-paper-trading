@@ -48,6 +48,24 @@ MUTATIONS = [
      'if runtime_context.entry_gate_state_fingerprint != expected_state_identity:\n            raise ValueError("entry runtime context state identity mismatch")',
      'if False:\n            raise ValueError("entry runtime context state identity mismatch")',
      "test_execution_planner.PlanEntryTests.test_entry_evaluation_rejects_state_context_mismatch"),
+    ("backend/execution_planner.py",
+     'if not expected_quote_identity or actual_quote_identity != expected_quote_identity:\n'
+     '            raise ValueError("execution runtime context quote identity mismatch")',
+     'if False:\n'
+     '            raise ValueError("execution runtime context quote identity mismatch")',
+     "test_execution_planner.ExecutionStateBuilderTests.test_execution_context_rejects_quote_market_and_tradability_identity_mismatch"),
+    ("backend/execution_planner.py",
+     'if tradability_identity != expected_tradability_identity:\n'
+     '            raise ValueError("execution runtime context tradability identity mismatch")',
+     'if False:\n'
+     '            raise ValueError("execution runtime context tradability identity mismatch")',
+     "test_execution_planner.ExecutionStateBuilderTests.test_execution_context_rejects_quote_market_and_tradability_identity_mismatch"),
+    ("backend/execution_planner.py",
+     'if actual_market_identity != runtime_context.market_snapshot_fingerprint:\n'
+     '            raise ValueError("execution runtime context market identity mismatch")',
+     'if False:\n'
+     '            raise ValueError("execution runtime context market identity mismatch")',
+     "test_execution_planner.ExecutionStateBuilderTests.test_execution_context_rejects_quote_market_and_tradability_identity_mismatch"),
 ]
 
 

@@ -349,6 +349,63 @@ def execution_context_from_state(
         quote_instant = _parse_execution_instant(execution_asof)
         if context_instant is None or quote_instant is None or context_instant != quote_instant:
             raise ValueError("execution runtime context decision instant mismatch")
+        if runtime_context.market_policy_name != MDC.EXECUTION_QUOTE_POLICY.name:
+            raise ValueError("execution runtime context market policy mismatch")
+        code = str((order or {}).get("code") or quote.get("code") or "").strip()
+        quote_snapshot = MDC.symbol_quote_snapshot(quote, asof_day=day)
+        if (not code or quote_snapshot is None
+                or quote_snapshot.kind != "symbol_quote" or quote_snapshot.as_of != day):
+            raise ValueError("execution runtime context quote identity unavailable")
+        try:
+            actual_quote_identity = MDC.snapshot_fingerprint(quote_snapshot)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("execution runtime context quote identity unavailable") from exc
+        expected_quote_identity = dict(runtime_context.symbol_quote_fingerprints).get(code)
+        if not expected_quote_identity or actual_quote_identity != expected_quote_identity:
+            raise ValueError("execution runtime context quote identity mismatch")
+        if (market_reading is None or market_reading.snapshot is None
+                or not isinstance(market_reading.snapshot, MDC.MarketDataSnapshot)):
+            raise ValueError("execution runtime context market identity unavailable")
+        try:
+            actual_market_identity = MDC.snapshot_fingerprint(market_reading.snapshot)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("execution runtime context market identity unavailable") from exc
+        if actual_market_identity != runtime_context.market_snapshot_fingerprint:
+            raise ValueError("execution runtime context market identity mismatch")
+        canonical_reading = MDC.classify(
+            market_reading.snapshot, MDC.EXECUTION_QUOTE_POLICY,
+            now=execution_asof, access_mode=MDC.ACCESS_READ, asof_day=day,
+        )
+        if (market_reading.policy_name != MDC.EXECUTION_QUOTE_POLICY.name
+                or any(getattr(market_reading, field) != getattr(canonical_reading, field)
+                       for field in ("availability", "freshness", "status", "reason"))):
+            raise ValueError("execution runtime context market reading mismatch")
+        market_reading = canonical_reading
+        tradability_identity = str(getattr(tradability, "fingerprint", "") or "")
+        expected_tradability_identity = dict(
+            runtime_context.tradability_evidence_fingerprints
+        ).get(f"{code}@{day}")
+        if (not bool(getattr(tradability, "evidence_present", False))
+                or not tradability_identity or not expected_tradability_identity):
+            raise ValueError("execution runtime context tradability identity unavailable")
+        if tradability_identity != expected_tradability_identity:
+            raise ValueError("execution runtime context tradability identity mismatch")
+        order_row = dict(order or {})
+        strategy_stamp = tuple(order_row.get(key) for key in (
+            "strategy_id", "strategy_version", "strategy_checksum",
+        ))
+        stamp_present = tuple(value not in (None, "") for value in strategy_stamp)
+        if any(stamp_present):
+            if not all(stamp_present):
+                raise ValueError("execution runtime context strategy identity incomplete")
+            strategy_id, strategy_version, strategy_checksum = strategy_stamp
+            if (isinstance(strategy_version, bool)
+                    or not isinstance(strategy_version, int)
+                    or (strategy_id, strategy_version, strategy_checksum) != (
+                        runtime_context.strategy_id, runtime_context.strategy_version,
+                        runtime_context.strategy_checksum,
+                    )):
+                raise ValueError("execution runtime context strategy identity mismatch")
     price = _positive_number(quote.get("price"))
     amount = _positive_number(quote.get("amount"))
     available_liquidity = max(0, int(amount / price)) if price and amount else 0
@@ -1293,6 +1350,20 @@ def evaluate_entry_state(
         expected_state_identity = entry_gate_state_fingerprint(state)
         if runtime_context.entry_gate_state_fingerprint != expected_state_identity:
             raise ValueError("entry runtime context state identity mismatch")
+        day = MDC.canonical_day(asof_day) or ""
+        quote_snapshot = MDC.symbol_quote_snapshot(quote, asof_day=day)
+        if (quote_snapshot is None or quote_snapshot.kind != "symbol_quote"
+                or quote_snapshot.as_of != day):
+            raise ValueError("entry runtime context quote identity unavailable")
+        try:
+            actual_quote_identity = MDC.snapshot_fingerprint(quote_snapshot)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("entry runtime context quote identity unavailable") from exc
+        expected_quote_identity = dict(runtime_context.symbol_quote_fingerprints).get(
+            str(code or "").strip()
+        )
+        if not expected_quote_identity or actual_quote_identity != expected_quote_identity:
+            raise ValueError("entry runtime context quote identity mismatch")
     policy = policy_for(account_id)
     reasons: list[str] = []
     gates: dict[str, Any] = {}
