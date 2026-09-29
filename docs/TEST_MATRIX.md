@@ -56,6 +56,19 @@
 | 周期所有权 ≠ 执行资格（pause 保留资金、resume 不放大） | `paper_trading.current_cycle_participant_ids` | `test_cycle_ledger_ownership.py`、`test_cycle_participant_resolver.py` | ✅ |
 | 零策略 Idle 周期（显式空集合合法，不回落全集） | `runtime_settings`、`paper_trading._cycle_participant_resolution` | `test_settings_registry_driven.py`、`test_runtime_settings.py` | ✅ |
 | 生产路径 golden replay（策略创建→激活→周期→信号→订单→成交→净值） | — | `test_production_path_golden_replay.py` | ✅ |
+
+## R32-A 可比较运行上下文（IN REVIEW）
+
+| 场景 / 契约 | 实现位置 | 回归用例 | 状态 |
+| --- | --- | --- | --- |
+| Market snapshot identity 对行/key 顺序稳定，保留重复行；saved_at 不改变事实 identity | `market_data_contract.snapshot_fingerprint` | `test_market_data_boundary.py`（R32A fingerprint tests） | ✅ |
+| 行情事实、核验语义或 observed_at 改变时 fingerprint 改变；runtime policy 单独参与 context identity | `market_data_contract`、`simulation_runtime_context` | `test_market_data_boundary.py`、`test_simulation_runtime_context.py` | ✅ |
+| 精确 strategy version/checksum、market、tradability、execution ruleset 与已有 risk identity 决定 context fingerprint | `simulation_runtime_context` | `test_simulation_runtime_context.py` | ✅ |
+| Active decision/execution envelope 保存显式 context；缺失身份保持 unavailable，不回填历史 | `paper_decision_audit`、`execution_planner` | `test_paper_decision_audit.py`、`test_execution_planner.py` | ✅ |
+| formal execution/entry adapter 与显式 state 进入相同 evaluator；explicit execution builder 不读账本 | `execution_planner` | `test_execution_planner.py`（adapter equivalence / state purity） | ✅ |
+| 语义 mutation M1–M10 覆盖事实、context identity、legacy fail-closed、state isolation、risk gate 与 fee authority | — | `work/r32a_comparable_context_mutation_check.py`（10/10 detected，restore SHA256 与恢复基线通过） | ✅ |
+
+阶段状态：R31 **COMPLETE**；R32-A **IN REVIEW**；R32-B、R33 **NOT STARTED**。
 | 策略产品线端到端（内置模板 + 用户策略同链路） | — | `test_strategy_product_line_e2e.py` | ✅ |
 | 风险收紧（画像只能更严，系统键不可触碰） | `strategy_risk_enforcement.py` | `test_strategy_risk_enforcement.py`、`test_asymmetric_risk_gate_wiring.py` | ✅ |
 

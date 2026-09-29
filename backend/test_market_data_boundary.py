@@ -410,6 +410,106 @@ class MarketDataContractTests(unittest.TestCase):
         )
         self.assertEqual(MDC.STATUS_FRESH, reading.status)
 
+    def test_R32A_market_fact_fingerprint_is_canonical_and_ignores_save_time(self):
+        first = MDC.MarketDataSnapshot(
+            kind="cross_section", rows=(
+                {"code": "600000", "price": 10.0, "amount": 100},
+                {"code": "000001", "price": 12.0, "amount": 200},
+                {"code": "000001", "price": 12.0, "amount": 200},
+            ), as_of="2026-09-28", observed_at="2026-09-28T10:00:00+08:00",
+            saved_at="2026-09-28T10:00:01+08:00", source="provider-a",
+            complete=True, expected_rows=3,
+            verification=MDC.VERIFICATION_VERIFIED,
+            verification_method=MDC.VERIFICATION_METHOD_CROSS_SOURCE,
+            verification_detail={"source_b": {"price_delta": 0.0}},
+        )
+        reordered = MDC.MarketDataSnapshot(
+            kind="cross_section", rows=(
+                {"amount": 200, "price": 12.0, "code": "000001"},
+                {"amount": 100, "price": 10.0, "code": "600000"},
+                {"code": "000001", "price": 12.0, "amount": 200},
+            ), as_of="2026-09-28", observed_at="2026-09-28T10:00:00+08:00",
+            saved_at="2026-09-28T12:00:00+08:00", source="provider-a",
+            complete=True, expected_rows=3,
+            verification=MDC.VERIFICATION_VERIFIED,
+            verification_method=MDC.VERIFICATION_METHOD_CROSS_SOURCE,
+            verification_detail={"source_b": {"price_delta": 0.0}},
+        )
+        self.assertEqual(MDC.snapshot_fingerprint(first), MDC.snapshot_fingerprint(reordered))
+
+    def test_R32A_market_fact_fingerprint_changes_for_each_fact_field(self):
+        baseline = _snapshot(rows=[{"code": "600000", "price": 10.0,
+                                   "amount": 100, "quote_at": NOW.isoformat()}],
+                             source="provider-a", as_of="2026-08-28",
+                             verification_detail={"cross_check": "ok"})
+        baseline_fp = MDC.snapshot_fingerprint(baseline)
+        for changes in (
+            {"rows": ({"code": "600000", "price": 10.1,
+                       "amount": 100, "quote_at": NOW.isoformat()},)},
+            {"rows": ({"code": "600000", "price": 10.0,
+                       "amount": 101, "quote_at": NOW.isoformat()},)},
+            {"rows": ({"code": "600000", "price": 10.0,
+                       "amount": 100, "quote_at": "2026-08-28T10:31:00+08:00"},)},
+            {"observed_at": "2026-08-28T10:31:00+08:00"},
+            {"verification": MDC.VERIFICATION_SINGLE_SOURCE},
+            {"verification_detail": {"cross_check": "failed"}},
+        ):
+            kwargs = {
+                "kind": baseline.kind, "rows": baseline.rows,
+                "as_of": baseline.as_of, "observed_at": baseline.observed_at,
+                "saved_at": baseline.saved_at, "source": baseline.source,
+                "complete": baseline.complete, "expected_rows": baseline.expected_rows,
+                "verification": baseline.verification,
+                "verification_method": baseline.verification_method,
+                "verification_detail": dict(baseline.verification_detail),
+            }
+            kwargs.update(changes)
+            if kwargs["verification"] == MDC.VERIFICATION_SINGLE_SOURCE:
+                kwargs["verification_method"] = MDC.VERIFICATION_METHOD_CROSS_SOURCE
+            changed = MDC.MarketDataSnapshot(**kwargs)
+            self.assertNotEqual(baseline_fp, MDC.snapshot_fingerprint(changed), changes)
+
+    def test_R32A_degraded_reason_is_part_of_market_fact_identity(self):
+        baseline = _snapshot(
+            rows=[{"code": "600000", "price": 10.0}],
+            source="provider-a", as_of="2026-08-28",
+            degraded_reason=None,
+        )
+        degraded = MDC.MarketDataSnapshot(
+            kind=baseline.kind, rows=baseline.rows, as_of=baseline.as_of,
+            observed_at=baseline.observed_at, saved_at=baseline.saved_at,
+            source=baseline.source, complete=baseline.complete,
+            expected_rows=baseline.expected_rows,
+            verification=baseline.verification,
+            verification_method=baseline.verification_method,
+            verification_detail=baseline.verification_detail,
+            degraded_reason=MDC.REASON_INCOMPLETE,
+        )
+        self.assertNotEqual(
+            MDC.snapshot_fingerprint(baseline), MDC.snapshot_fingerprint(degraded),
+        )
+
+    def test_R32A_market_fact_identity_excludes_saved_at_and_reading_ratios(self):
+        baseline = _snapshot(
+            rows=[{"code": "600000", "price": 10.0}],
+            source="provider-a", as_of="2026-08-28",
+            verification_detail={"cross_check": "ok"},
+        )
+        changed_reading = MDC.MarketDataSnapshot(
+            kind=baseline.kind, rows=baseline.rows, as_of=baseline.as_of,
+            observed_at=baseline.observed_at, saved_at="2026-08-28T23:59:00+08:00",
+            source=baseline.source, complete=baseline.complete,
+            expected_rows=baseline.expected_rows,
+            verification=baseline.verification,
+            verification_method=baseline.verification_method,
+            verification_detail={"cross_check": "ok", "fresh_ratio": 0.5,
+                                 "min_fresh_ratio": 0.9},
+        )
+        self.assertEqual(
+            MDC.snapshot_fingerprint(baseline),
+            MDC.snapshot_fingerprint(changed_reading),
+        )
+
 
 # ---------------------------------------------------------------------------
 # MDR：只读路径绝不联网
@@ -779,7 +879,8 @@ class MarketDataArchitectureGuardTests(unittest.TestCase):
 
     def test_MDG01_contract_has_zero_project_imports(self):
         """契约是纯的：只依赖标准库，不 import 任何项目模块、不碰 IO。"""
-        stdlib_ok = {"__future__", "datetime", "dataclasses", "types", "typing"}
+        stdlib_ok = {"__future__", "datetime", "dataclasses", "types", "typing",
+                     "hashlib", "json", "math", "enum"}
         imported = self._imported_modules("market_data_contract.py")
         self.assertEqual(
             set(), imported - stdlib_ok,

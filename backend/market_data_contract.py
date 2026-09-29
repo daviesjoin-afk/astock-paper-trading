@@ -47,7 +47,11 @@
 from __future__ import annotations
 
 import datetime as dt
+import hashlib
+import json
+import math
 from dataclasses import dataclass, field, replace
+from enum import Enum
 from types import MappingProxyType
 from typing import Any, Iterable, Mapping
 
@@ -81,7 +85,7 @@ __all__ = [
     "POLICIES", "policy_named",
     "CROSS_SECTION_MIN_FRESH_RATIO", "fresh_ratio",
     # snapshot / reading
-    "MarketDataSnapshot", "MarketDataReading",
+    "MarketDataSnapshot", "MarketDataReading", "snapshot_fingerprint",
     # helpers
     "access_mode_allows_network", "canonical_day", "classify",
     "reading_for_refresh_failure", "unavailable_reading", "symbol_quote_snapshot",
@@ -468,6 +472,68 @@ class MarketDataSnapshot:
             for row in self.rows
             if isinstance(row, Mapping) and row.get("code")
         }
+
+
+def _fact_value(value: Any) -> Any:
+    """Convert normalized snapshot facts to strict, deterministic JSON values."""
+    if value is None or isinstance(value, (str, bool, int)):
+        return value
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ValueError("market fact contains a non-finite number")
+        return value
+    if isinstance(value, Enum):
+        return _fact_value(value.value)
+    if isinstance(value, (dt.datetime, dt.date, dt.time)):
+        return value.isoformat()
+    if isinstance(value, Mapping):
+        return {str(key): _fact_value(item) for key, item in value.items()}
+    if isinstance(value, (tuple, list)):
+        return [_fact_value(item) for item in value]
+    scalar = getattr(value, "item", None)
+    if callable(scalar):
+        try:
+            return _fact_value(scalar())
+        except (TypeError, ValueError):
+            pass
+    raise ValueError(f"unsupported market fact value: {type(value).__name__}")
+
+
+def snapshot_fingerprint(snapshot: MarketDataSnapshot) -> str:
+    """Return identity for a snapshot's market facts, independent of read time.
+
+    Rows are a bag: their input order does not change identity, while duplicate
+    rows remain represented. ``saved_at`` and policy-derived classification
+    fields are intentionally excluded. The latter are reading semantics, not
+    provider facts.
+    """
+    if not isinstance(snapshot, MarketDataSnapshot):
+        raise TypeError("snapshot_fingerprint requires MarketDataSnapshot")
+    row_blobs = [json.dumps(
+        _fact_value(row), sort_keys=True, separators=(",", ":"),
+        ensure_ascii=False, allow_nan=False,
+    ) for row in snapshot.rows]
+    details = _fact_value(snapshot.verification_detail)
+    if isinstance(details, dict):
+        details.pop("fresh_ratio", None)
+        details.pop("min_fresh_ratio", None)
+    payload = {
+        "schema": "market-evidence-fingerprint-v1",
+        "kind": snapshot.kind,
+        "source": snapshot.source,
+        "as_of": snapshot.as_of,
+        "observed_at": snapshot.observed_at,
+        "complete": snapshot.complete,
+        "expected_rows": snapshot.expected_rows,
+        "verification": snapshot.verification,
+        "verification_method": snapshot.verification_method,
+        "verification_detail": details,
+        "degraded_reason": snapshot.degraded_reason,
+        "rows": sorted(row_blobs),
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"),
+                         ensure_ascii=False, allow_nan=False).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 # ---------------------------------------------------------------------------

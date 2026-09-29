@@ -84,6 +84,10 @@ research → validation_failed
 | `risk_profile_compiled` | 风险画像可编译（`strategy_risk_profiles`） |
 | `execution_profile_compiled` | 执行画像可编译（`execution_profiles`） |
 
+### R32 阶段状态与可比较运行上下文
+
+R31 生命周期与晋级边界已完成。R32-A（Comparable Runtime Context）当前 **IN REVIEW**；R32-B Shadow runtime 和 R33 **NOT STARTED**。R32-A 的市场事实 identity 由 `market_data_contract.snapshot_fingerprint()` 提供；策略精确版本、market policy、tradability fingerprint、execution ruleset 与现有 risk identity 一起组成不可变运行上下文。正式路径把 ledger 状态收集成显式快照，再交给既有纯决策 authority；旧 Active 记录缺少事实时保持 `active_runtime_context_unavailable`，不做历史回填。完整契约见 [`R32_COMPARABLE_RUNTIME_CONTEXT.md`](R32_COMPARABLE_RUNTIME_CONTEXT.md)。
+
 就绪后，所有消费者读同一份不可变契约 `StrategyRuntimeContext`（`strategy_runtime.StrategyRuntimeContext`）：
 
 ```text

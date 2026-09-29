@@ -56,6 +56,9 @@ Dockerfile          应用镜像；docker-compose*.yml 本地与服务器编排
   `user_strategy_participation`（用户策略接入生产链路）
 - **订单意图与执行**：`order_intent`（意图契约，拒绝数量越权）、`execution_planner`
   （中央计划/复核/落库）、`execution_dispatch`
+- **可比较运行上下文（R32-A，IN REVIEW）**：`market_data_contract.snapshot_fingerprint()`
+  拥有 Market Snapshot identity；`simulation_runtime_context` 只冻结现有 owner
+  签发的精确事实与风险/执行语义，不读取数据库或外部服务。R32-B Shadow runtime 尚未开始。
 - **执行真实性证据**：`execution_evidence`（三态成交证据契约）、`execution_lifecycle`
   （成交状态机与非法跳转拒绝）、`execution_outcome`（`selection_executable` ×
   `execution_verified` 连接与收益分层）
