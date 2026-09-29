@@ -3,6 +3,7 @@ import sqlite3
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -126,10 +127,26 @@ class StrategyRuntimeTests(unittest.TestCase):
         self.assertEqual(replay.definition, pinned.definition)
         self.assertEqual(replay.compiled_dsl, pinned.compiled_dsl)
         self.assertEqual(replay.risk_fingerprint, pinned.risk_fingerprint)
-        with self.assertRaises(ValueError):
+        with self.assertRaises(runtime.StrategyRuntimeContextUnavailable):
             runtime.get_context_for_cycle(
                 self.conn, "runtime_breakout", cycle_id=999, settings_rev="1",
             )
+
+    def test_get_context_for_cycle_propagates_runtime_compilation_value_errors(self):
+        registry.bind_cycle_versions(self.conn, 78, ["runtime_breakout"])
+        with mock.patch.object(
+            runtime, "_build_context",
+            side_effect=ValueError("unexpected runtime compilation failure"),
+        ):
+            with self.assertRaisesRegex(
+                ValueError, "unexpected runtime compilation failure",
+            ) as raised:
+                runtime.get_context_for_cycle(
+                    self.conn, "runtime_breakout", cycle_id=78, settings_rev="1",
+                )
+        self.assertNotIsInstance(
+            raised.exception, runtime.StrategyRuntimeContextUnavailable,
+        )
 
     def test_dsl_version_change_produces_new_context_contract(self):
         before = runtime.get_context(self.conn, "runtime_breakout", settings_rev="1")

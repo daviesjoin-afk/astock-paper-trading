@@ -3340,7 +3340,7 @@ timeline 不嵌入结论，未关联 canonical id 的 legacy result 保持 unava
 B3 不新增 ledger、migration、provider 或 authority，不改变 trading/tuning 权限，也不删除 roadmap
 能力。owner identity、PIT、verification、runtime terminal instant、stable attempt identity、历史市场证据、
 cycle membership 与 physical DB origin 等缺口继续 **OPEN / REQUIRED**，production fail closed。
-R27-B2C = **COMPLETE**；R27-B3 = **COMPLETE（PR #210 MERGED）**；R28-A = **COMPLETE**；R29-A = **COMPLETE（PR #212 MERGED）**；R29-FINAL = **COMPLETE**；R30 = **COMPLETE**；R31 = **COMPLETE（PR #215 MERGED）**；R32-A = **IN REVIEW**；R32-B / R33 = **NOT STARTED**。
+R27-B2C = **COMPLETE**；R27-B3 = **COMPLETE（PR #210 MERGED）**；R28-A = **COMPLETE**；R29-A = **COMPLETE（PR #212 MERGED）**；R29-FINAL = **COMPLETE**；R30 = **COMPLETE**；R31 = **COMPLETE（PR #215 MERGED）**；R32-A = **COMPLETE（PR #216 MERGED）**；R32-B = **IN PROGRESS**；R32-C / R33 = **NOT STARTED**。
 
 ### R28-A：Strategy Experiment Identity & Result Contract（COMPLETE）
 
@@ -3391,7 +3391,7 @@ R30 从 exact completed R29 run 与完整 `ExperimentSpec` 建立不可变计划
 缺少证据就标记 unavailable。Synthetic view 留在内存，不回写任何历史 owner。报告 ledger append-only，API 离线，
 Research Workspace 只渲染报告事实，unknown 保持 null；R30 不产生分数、晋级或生命周期状态。
 R30 exit matrix、全量验证和 exact-head CI 均已通过。完整 contract 与 API/UI 边界见
-[`docs/R30_ROBUSTNESS_VALIDATION.md`](docs/R30_ROBUSTNESS_VALIDATION.md) and [`docs/R32_COMPARABLE_RUNTIME_CONTEXT.md`](docs/R32_COMPARABLE_RUNTIME_CONTEXT.md). R32-A establishes deterministic market and runtime identity plus explicit state injection; R32-B Shadow runtime and R33 remain **NOT STARTED**.
+[`docs/R30_ROBUSTNESS_VALIDATION.md`](docs/R30_ROBUSTNESS_VALIDATION.md), [`docs/R32_COMPARABLE_RUNTIME_CONTEXT.md`](docs/R32_COMPARABLE_RUNTIME_CONTEXT.md), and [`docs/R32B_ACTIVE_COMPARABLE_EVIDENCE.md`](docs/R32B_ACTIVE_COMPARABLE_EVIDENCE.md). R32-A establishes deterministic market and runtime identity plus explicit state injection; R32-B closes Active evidence provenance before R32-C Shadow runtime begins. R33 remains **NOT STARTED**.
 
 ### 仅作 review signal（不进入 CI gate）
 

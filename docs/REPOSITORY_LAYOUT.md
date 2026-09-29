@@ -118,7 +118,8 @@ CI 会重建并校验一致性；服务端 `/app.js`、`/app.css` 直接下发 `
 ## docs/ 与 docs/archive/
 
 - 现行文档：`RUNBOOK`（运行手册）、`SETTINGS_PRD`、`TEST_MATRIX`、`DEMO`、
-  `STRATEGY_PLATFORM`（策略数据模型与生命周期）、`EVOLUTION_ARCHITECTURE`（自进化链路）、
+  `STRATEGY_PLATFORM`（策略数据模型与生命周期）、`R32_COMPARABLE_RUNTIME_CONTEXT` 与
+  `R32B_ACTIVE_COMPARABLE_EVIDENCE`（可比较运行证据）、`EVOLUTION_ARCHITECTURE`（自进化链路）、
   `RELEASE-v*`（**发布说明，不删除**）、`PRD-architecture-hardening`（仍然有效的分阶段计划）、本文件。
 - `docs/archive/`：**已完成**的历史计划与快照（含带日期的交接记录与仓库规范评审）。
   归档不等于删除——保留可追溯性，但不再代表当前设计；其中的路径/提交可能已过时。

@@ -40,7 +40,7 @@ AUDIT_PATH = BACKEND / "paper_decision_audit.py"
 # are the contract keys of the envelope, so a renamed copy of the algorithm
 # still has to contain them.
 SERIALIZER_SENTINELS = {
-    "decision-snapshot-v2",
+    "decision-snapshot-v3",
     "rows_stored",
     "omitted_rows",
     "future_excluded",

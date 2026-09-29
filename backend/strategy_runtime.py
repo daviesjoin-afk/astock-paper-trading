@@ -20,6 +20,10 @@ from strategy_risk_fingerprint import StrategyRiskFingerprint, compile_strategy_
 from strategy_risk_profiles import StrategyRiskProfile, compile_strategy_risk_profile
 
 
+class StrategyRuntimeContextUnavailable(ValueError):
+    """An exact cycle-pinned runtime is unavailable because owner evidence is absent."""
+
+
 @dataclass(frozen=True)
 class EvolutionControlProfile:
     enabled: bool
@@ -177,26 +181,33 @@ def get_context_for_cycle(
     """Build a context from the exact immutable version pinned to one cycle.
 
     Explicit-cycle callers must not fall back to the current head, legacy
-    bindings, or ``paper_accounts.cycle_id``.  A missing pin is an explicit
-    ValueError; lifecycle permission still comes from the current spec.
+    bindings, or ``paper_accounts.cycle_id``. A missing owner-issued identity
+    raises ``StrategyRuntimeContextUnavailable``; construction failures from
+    ``_build_context`` propagate unchanged.
     """
     if cycle_id is None:
-        raise ValueError("get_context_for_cycle requires explicit cycle_id")
+        raise StrategyRuntimeContextUnavailable(
+            "get_context_for_cycle requires explicit cycle_id",
+        )
     spec = SR.get(strategy_id, conn=conn)
     if spec is None:
-        raise ValueError("unknown strategy id")
+        raise StrategyRuntimeContextUnavailable("unknown strategy id")
     try:
         cycle = int(cycle_id)
     except (TypeError, ValueError) as exc:
-        raise ValueError(f"get_context_for_cycle cycle_id is invalid: {cycle_id!r}") from exc
+        raise StrategyRuntimeContextUnavailable(
+            f"get_context_for_cycle cycle_id is invalid: {cycle_id!r}"
+        ) from exc
     version = SR.cycle_version_for_account(conn, strategy_id, cycle_id=cycle)
     if version is None:
-        raise ValueError(
+        raise StrategyRuntimeContextUnavailable(
             f"strategy version not pinned for cycle {cycle}: {strategy_id}"
         )
     lifecycle = SL.get_state(conn, strategy_id, version.version, checksum=version.checksum)
     if lifecycle is None:
-        raise ValueError("strategy lifecycle state unavailable for pinned version")
+        raise StrategyRuntimeContextUnavailable(
+            "strategy lifecycle state unavailable for pinned version",
+        )
     pinned_spec = dataclass_replace(
         spec, status=lifecycle["state"],
         supports_new_cycle=SL.allows_formal_cycle(lifecycle["state"]),
