@@ -1262,10 +1262,9 @@ class ExecutionStateBuilderTests(unittest.TestCase):
             ("seat_reserve_deadline", "14:00"),
             ("red_light_reason", "another reason"),
         ):
+            changed_policy = replace(original, **{field: value})
             with self.subTest(policy_field=field), mock.patch.object(
-                    EP, "policy_for", lambda account_id, changed=replace(
-                        original, **{field: value}
-                    ): changed):
+                    EP, "policy_for", lambda account_id, policy=changed_policy: policy):
                 self.assertNotEqual(base_identity, EP.execution_policy_fingerprint("tq_breakout"))
 
     def test_entry_context_binds_market_gate_option(self):
