@@ -93,6 +93,8 @@ class ShadowRuntimeTests(unittest.TestCase):
             factor_snapshots={self.code: self.factor},
         )
         self.challenger = SH.StrategyStamp("challenger_fixture", 2, _sha("challenger-v2"))
+        self.execution_policy = EP.execution_policy_snapshot(
+            self.challenger.strategy_id)
         self.spec = SH.ShadowRunSpec(
             challenger=self.challenger, active_comparator=self.active,
             environment_fingerprint=self.identity.environment_fingerprint,
@@ -116,11 +118,14 @@ class ShadowRuntimeTests(unittest.TestCase):
             reference_price=10.0,
         )
 
-    def _run(self, *, spec=None, environment=None, previous=None, lifecycle="shadow"):
+    def _run(self, *, spec=None, environment=None, previous=None, lifecycle="shadow",
+             execution_policy=None, candidates=None):
         return SH.evaluate_shadow(
             spec=spec or self.spec, environment=environment or self.environment,
             strategy_version=self.strategy_version, lifecycle_state=lifecycle,
-            candidates=(self.candidate,), previous_run=previous,
+            execution_policy=(self.execution_policy if execution_policy is None
+                              else execution_policy),
+            candidates=candidates or (self.candidate,), previous_run=previous,
         )
 
     def test_c1_same_frozen_inputs_produce_same_shadow_evidence(self):
@@ -326,6 +331,47 @@ class ShadowRuntimeTests(unittest.TestCase):
                          evidence.run_fingerprint)
         conn.close()
 
+    def test_production_service_freezes_the_policy_once_before_evaluating(self):
+        """应用服务捕获一次；捕获之后策略表再变也不改变本次 run 的 policy identity。"""
+        conn = sqlite3.connect(":memory:")
+        migration = next(item for item in db_migrate.MIGRATIONS["paper_trading"] if item[0] == 24)
+        db_migrate._run_operation(conn, migration[2])
+        real_freeze = EP.execution_policy_snapshot
+        original_cache = EP._POLICY_CACHE
+
+        def freeze_then_poison(account_id):
+            snapshot = real_freeze(account_id)
+            # 捕获之后立刻把 owner 策略表换成另一份策略。
+            EP._POLICY_CACHE = {
+                **(EP._POLICY_CACHE or {}),
+                account_id: replace(EP.policy_for("tq_breakout"),
+                                    manual_entry_review=True,
+                                    chase_lane="sector_hot"),
+            }
+            return snapshot
+
+        try:
+            with mock.patch.object(EP, "execution_policy_snapshot",
+                                   side_effect=freeze_then_poison) as freeze, \
+                    mock.patch.object(SH, "resolve_exact_shadow_strategy",
+                                      return_value=(self.strategy_version, "shadow")), \
+                    mock.patch.object(PT, "_execution_quote_status", return_value={
+                        "fresh": True, "status": "cross_source_checked"}):
+                evidence = SHS.run_shadow(conn, spec=self.spec,
+                                          environment=self.environment,
+                                          candidates=(self.candidate,))
+        finally:
+            EP._POLICY_CACHE = original_cache
+        conn.close()
+        freeze.assert_called_once_with(self.challenger.strategy_id)
+        policy = evidence.challenger_runtime_inputs["entry_policy"]
+        self.assertEqual(policy["fingerprint"], self.execution_policy.fingerprint)
+        self.assertEqual(policy["account_id"], self.challenger.strategy_id)
+        # 捕获后的篡改没有进入决策，也没有进入 evidence。
+        self.assertFalse(policy["manual_entry_review"])
+        self.assertEqual(policy["chase_lane"], self.execution_policy.policy.chase_lane)
+        self.assertFalse(evidence.decisions[0]["entry"]["requires_manual_entry_review"])
+
     def test_c5_only_shadow_lifecycle_is_runnable(self):
         with self.assertRaisesRegex(ValueError, "challenger_lifecycle_not_shadow"):
             self._run(lifecycle="paper")
@@ -393,6 +439,7 @@ class ShadowRuntimeTests(unittest.TestCase):
                 "fresh": True, "status": "cross_source_checked"}):
             later = SH.evaluate_shadow(spec=later_spec, environment=later_environment,
                                        strategy_version=self.strategy_version, lifecycle_state="shadow",
+                                       execution_policy=self.execution_policy,
                                        candidates=(self.candidate,),
                                        previous_run=SRR.get_run(conn, original.run_id))
             SRR.append_run(conn, later)
@@ -417,6 +464,7 @@ class ShadowRuntimeTests(unittest.TestCase):
             result = SH.evaluate_shadow(
                 spec=spec, environment=self.environment,
                 strategy_version=self.strategy_version, lifecycle_state="shadow",
+                execution_policy=self.execution_policy,
                 candidates=(candidate,),
             )
         entry = result.decisions[0]["entry"]
@@ -440,6 +488,7 @@ class ShadowRuntimeTests(unittest.TestCase):
             result = SH.evaluate_shadow(
                 spec=self.spec, environment=self.environment,
                 strategy_version=self.strategy_version, lifecycle_state="shadow",
+                execution_policy=self.execution_policy,
                 candidates=(candidate,),
             )
         entry = result.decisions[0]["entry"]
@@ -454,7 +503,10 @@ class ShadowRuntimeTests(unittest.TestCase):
             spec={**self.spec.projection(),
                   "decision_at": "2026-09-08T09:55:00+08:00",
                   "previous_shadow_run_id": None},
-            environment={}, strategy_definition_fingerprint=_sha("definition"),
+            environment={},
+            challenger_runtime_inputs={
+                "entry_policy": self.execution_policy.projection()},
+            strategy_definition_fingerprint=_sha("definition"),
             before_state=SH.ShadowRuntimeState.initial(
                 100_000.0, self.day).projection(),
             decisions=(),
@@ -475,6 +527,7 @@ class ShadowRuntimeTests(unittest.TestCase):
             result = SH.evaluate_shadow(
                 spec=spec, environment=self.environment,
                 strategy_version=self.strategy_version, lifecycle_state="shadow",
+                execution_policy=self.execution_policy,
                 candidates=(candidate,), previous_run=previous,
             )
             return result.decisions[0]
@@ -505,6 +558,7 @@ class ShadowRuntimeTests(unittest.TestCase):
             result = SH.evaluate_shadow(
                 spec=self.spec, environment=self.environment,
                 strategy_version=self.strategy_version, lifecycle_state="shadow",
+                execution_policy=self.execution_policy,
                 candidates=(captured,),
             )
         candidate = result.decisions[0]["candidate"]
@@ -522,11 +576,112 @@ class ShadowRuntimeTests(unittest.TestCase):
         self.assertTrue(entry["allowed"])
         self.assertEqual(entry["gates"]["cash"]["shared_cash"], 100_000.0)
 
+    def test_shadow_run_evidence_keeps_the_exact_frozen_entry_policy(self):
+        """run 必须读回它消费的那一份 Entry Policy identity，且与决策用的同一份。"""
+        conn = sqlite3.connect(":memory:")
+        conn.execute("PRAGMA foreign_keys=ON")
+        migration = next(item for item in db_migrate.MIGRATIONS["paper_trading"] if item[0] == 24)
+        db_migrate._run_operation(conn, migration[2])
+        with mock.patch.object(PT, "_execution_quote_status", return_value={
+                "fresh": True, "status": "cross_source_checked"}):
+            result = self._run()
+            SRR.append_run(conn, result)
+            stored = SRR.get_run(conn, result.run_id)
+        conn.close()
+        frozen = self.execution_policy.projection()
+        for replay in (result, stored):
+            with self.subTest(source=type(replay).__name__):
+                evidence = dict(replay.challenger_runtime_inputs)
+                self.assertEqual(evidence, {"entry_policy": frozen})
+                policy = evidence["entry_policy"]
+                # Owner 字段集 + 绑定身份 + fingerprint 全部可读回。
+                self.assertEqual(policy["fingerprint"], self.execution_policy.fingerprint)
+                self.assertEqual(policy["account_id"], self.challenger.strategy_id)
+                self.assertEqual(policy["chase_lane"], self.execution_policy.policy.chase_lane)
+                self.assertEqual(policy["manual_entry_review"],
+                                 self.execution_policy.policy.manual_entry_review)
+                self.assertEqual(policy["seat_reserve_owner"],
+                                 self.execution_policy.policy.seat_reserve_owner)
+                self.assertEqual(policy["holds_reserved_seat"],
+                                 self.execution_policy.policy.holds_reserved_seat)
+                self.assertEqual(policy["seat_reserve_deadline"],
+                                 self.execution_policy.policy.seat_reserve_deadline)
+                self.assertEqual(policy["red_light_reason"],
+                                 self.execution_policy.policy.red_light_reason)
+                self.assertEqual(policy["execution_planner_version"],
+                                 EP.EXECUTION_PLANNER_VERSION)
+        # 决策实际消费的 policy 就是 evidence 里那一个 fingerprint。
+        self.assertEqual(result.decisions[0]["entry"]["policy"]["account_id"],
+                         self.challenger.strategy_id)
+        self.assertEqual(result.decisions[0]["entry"]["policy"]["chase_lane"],
+                         self.execution_policy.policy.chase_lane)
+
+    def test_frozen_entry_policy_is_the_only_policy_source_on_replay(self):
+        """policy A 冻结后，owner 策略表改成 B 也不能改变重放结果。
+
+        两段控制：先把当前策略表换成 B（重解析就会漂移），再把 ``policy_for`` 换成
+        ``AssertionError``（纯运行时期间调用当前 owner 就直接失败）。两者都必须看到
+        fingerprint 与 entry 结果逐字节不变。
+        """
+        with mock.patch.object(PT, "_execution_quote_status", return_value={
+                "fresh": True, "status": "cross_source_checked"}):
+            baseline = self._run()
+        poisoned = dict(EP._POLICY_CACHE or EP._default_policies())
+        poisoned[self.challenger.strategy_id] = replace(
+            EP.policy_for("tq_breakout"), entry_label="重放的另一个策略",
+            chase_lane="sector_hot", manual_entry_review=True,
+            red_light_reason="重放期间另一个暂停理由",
+        )
+        with mock.patch.object(EP, "_POLICY_CACHE", poisoned), \
+                mock.patch.object(PT, "_execution_quote_status", return_value={
+                    "fresh": True, "status": "cross_source_checked"}):
+            replayed = self._run()
+        self.assertEqual(baseline.run_fingerprint, replayed.run_fingerprint)
+        self.assertEqual(baseline.decisions, replayed.decisions)
+        self.assertEqual(baseline.challenger_runtime_inputs,
+                         replayed.challenger_runtime_inputs)
+        with mock.patch.object(EP, "policy_for",
+                               side_effect=AssertionError("current policy resolved")), \
+                mock.patch.object(PT, "_execution_quote_status", return_value={
+                    "fresh": True, "status": "cross_source_checked"}):
+            isolated = self._run()
+        self.assertEqual(baseline.run_fingerprint, isolated.run_fingerprint)
+        self.assertEqual(baseline.decisions, isolated.decisions)
+
+    def test_frozen_entry_policy_supplies_the_declared_market_pause_reason(self):
+        """市场灯文案属于 owner policy：重放时必须来自冻结快照，而不是当前策略表。"""
+        candidate = replace(
+            self.candidate,
+            entry_state=replace(self.candidate.entry_state,
+                                market_state={"light": "red"},
+                                require_market_gate=True),
+        )
+        poisoned = dict(EP._POLICY_CACHE or EP._default_policies())
+        poisoned[self.challenger.strategy_id] = replace(
+            EP.policy_for("tq_breakout"), red_light_reason="重放期间另一个暂停理由")
+        with mock.patch.object(EP, "_POLICY_CACHE", poisoned), \
+                mock.patch.object(EP, "policy_for",
+                                  side_effect=AssertionError("current policy resolved")), \
+                mock.patch.object(PT, "_execution_quote_status", return_value={
+                    "fresh": True, "status": "cross_source_checked"}):
+            result = self._run(candidates=(candidate,))
+        entry = result.decisions[0]["entry"]
+        self.assertFalse(entry["allowed"])
+        self.assertIn(self.execution_policy.policy.red_light_reason, entry["reasons"])
+        self.assertNotIn("重放期间另一个暂停理由", entry["reasons"])
+
+    def test_shadow_run_requires_the_frozen_policy_bound_to_the_challenger(self):
+        with self.assertRaisesRegex(ValueError, "challenger_execution_policy_identity_mismatch"):
+            self._run(execution_policy=EP.execution_policy_snapshot("tq_breakout"))
+        with self.assertRaisesRegex(TypeError, "frozen entry execution policy snapshot"):
+            self._run(execution_policy=EP.policy_for(self.challenger.strategy_id))
+
     def test_duplicate_candidate_legs_are_rejected(self):
         with self.assertRaisesRegex(ValueError, "shadow_candidates_must_be_unique"):
             SH.evaluate_shadow(
                 spec=self.spec, environment=self.environment,
                 strategy_version=self.strategy_version, lifecycle_state="shadow",
+                execution_policy=self.execution_policy,
                 candidates=(self.candidate, self.candidate),
             )
 

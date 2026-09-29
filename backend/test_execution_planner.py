@@ -641,6 +641,17 @@ class SharedGateTests(_StubbedPlannerTest):
                     EP.policy_for("reported_profit_breakout").red_light_reason, gate["reason"])
         self.assertFalse(EP.market_gate({"light": "green"}, "tq_breakout")["blocked"])
 
+    def test_market_gate_reads_the_declared_policy_it_is_given(self):
+        """显式传入的 policy 决定暂停文案；传入时不再解析当前策略表。"""
+        declared = replace(EP.policy_for("tq_breakout"), red_light_reason="显式传入的暂停理由")
+        gate = EP.market_gate({"light": "red"}, "tq_breakout", declared)
+        self.assertTrue(gate["blocked"])
+        self.assertEqual("显式传入的暂停理由", gate["reason"])
+        self.assertEqual(
+            EP.policy_for("tq_breakout").red_light_reason,
+            EP.market_gate({"light": "red"}, "tq_breakout")["reason"],
+        )
+
     def test_account_risk_gate_only_reports_when_blocked(self):
         self.assertEqual([], EP.account_risk_gate({"blocked": False, "reasons": ["x"]}))
         self.assertEqual(["熔断"], EP.account_risk_gate({"blocked": True, "reasons": ["熔断"]}))
@@ -1635,6 +1646,117 @@ class ExecutionStateBuilderTests(unittest.TestCase):
             with self.subTest(policy_field=field), mock.patch.object(
                     EP, "policy_for", lambda account_id, policy=changed_policy: policy):
                 self.assertNotEqual(base_identity, EP.execution_policy_fingerprint("tq_breakout"))
+
+    def test_execution_policy_snapshot_freezes_one_owner_projection(self):
+        snapshot = EP.execution_policy_snapshot("tq_breakout")
+        self.assertEqual(snapshot.account_id, "tq_breakout")
+        self.assertIs(snapshot.policy, EP.policy_for("tq_breakout"))
+        self.assertEqual(snapshot.fingerprint, EP.execution_policy_fingerprint("tq_breakout"))
+        self.assertEqual(snapshot.projection(), {
+            "account_id": "tq_breakout",
+            "policy_account_id": "tq_breakout",
+            "chase_lane": snapshot.policy.chase_lane,
+            "manual_entry_review": snapshot.policy.manual_entry_review,
+            "seat_reserve_owner": snapshot.policy.seat_reserve_owner,
+            "holds_reserved_seat": snapshot.policy.holds_reserved_seat,
+            "seat_reserve_deadline": snapshot.policy.seat_reserve_deadline,
+            "red_light_reason": snapshot.policy.red_light_reason,
+            "execution_planner_version": EP.EXECUTION_PLANNER_VERSION,
+            "fingerprint": snapshot.fingerprint,
+        })
+        # 未知/custom 策略沿用保守默认策略：绑定身份是请求方，policy 自身行 id 为空。
+        unknown = EP.execution_policy_snapshot("not_a_registered_strategy")
+        self.assertEqual(unknown.account_id, "not_a_registered_strategy")
+        self.assertEqual(unknown.policy, EP.policy_for("not_a_strategy"))
+        self.assertEqual(unknown.projection()["policy_account_id"], "")
+        with self.assertRaisesRegex(ValueError, "execution policy account identity is required"):
+            EP.execution_policy_snapshot("  ")
+
+    def test_execution_policy_snapshot_rejects_a_forged_binding(self):
+        foreign = EP.policy_for("not_a_strategy")
+        with self.assertRaisesRegex(ValueError, "execution policy account identity mismatch"):
+            EP.ExecutionPolicySnapshot(
+                account_id="trend_pullback", policy=EP.policy_for("tq_breakout"),
+                fingerprint=EP.execution_policy_fingerprint("tq_breakout"),
+            )
+        with self.assertRaisesRegex(ValueError, "execution policy fingerprint mismatch"):
+            EP.ExecutionPolicySnapshot(
+                account_id="not_a_strategy", policy=foreign,
+                fingerprint=EP.execution_policy_fingerprint("tq_breakout"),
+            )
+        with self.assertRaises(TypeError):
+            EP.ExecutionPolicySnapshot(
+                account_id="not_a_strategy", policy="not-a-policy",
+                fingerprint=EP.execution_policy_fingerprint("not_a_strategy"),
+            )
+
+    def test_entry_evaluation_consumes_an_explicit_frozen_policy(self):
+        """显式传入冻结快照后，评估全程不再解析当前策略表。"""
+        state = EP.EntryGateState(
+            capacity_available=True, position_limit=2, pool_limit=2,
+            shared_cash=100_000.0, market_state={"light": "red"},
+            require_market_gate=True, account_risk_state={"blocked": False, "reasons": []},
+        )
+        quote = {"code": "002241", "price": 21.5, "name": "test"}
+        context = _runtime_context_for_state(
+            entry_state=state, quote=quote, strategy_id="tq_breakout",
+        )
+        frozen = EP.execution_policy_snapshot("tq_breakout")
+        with mock.patch.object(EP, "policy_for",
+                               side_effect=AssertionError("current policy resolved")):
+            result = EP.evaluate_entry_state(
+                state=state, account_id="tq_breakout", code="002241", side="buy",
+                quote=quote, asof_day="2026-09-08", amount=100.0,
+                runtime_context=context, execution_policy=frozen,
+            )
+        self.assertFalse(result["allowed"])
+        self.assertIn(frozen.policy.red_light_reason, result["reasons"])
+        self.assertEqual(result["policy"]["chase_lane"], frozen.policy.chase_lane)
+        self.assertIs(result["requires_manual_entry_review"],
+                      bool(frozen.policy.manual_entry_review))
+
+    def test_entry_evaluation_fails_closed_on_frozen_policy_mismatch(self):
+        """显式 policy 与 context fingerprint 不一致必须 raise，不得回退当前策略表。"""
+        state = EP.EntryGateState(account_risk_state={"blocked": False, "reasons": []})
+        quote = {"code": "002241", "price": 21.5, "name": "test"}
+        context = _runtime_context_for_state(
+            entry_state=state, quote=quote, strategy_id="tq_breakout",
+        )
+        # 当前策略表里 tq_breakout 与 context 一致；显式传入另一份冻结策略时必须失败，
+        # 而不是“重新解析当前策略后自动纠正 fingerprint”。
+        other = EP.policy_for("not_a_strategy")
+        forged = EP.ExecutionPolicySnapshot(
+            account_id="tq_breakout", policy=other,
+            fingerprint=EP.execution_policy_fingerprint("not_a_strategy"),
+        )
+        with mock.patch.object(EP, "policy_for",
+                               side_effect=AssertionError("current policy resolved")):
+            with self.assertRaisesRegex(
+                ValueError, "entry runtime context execution policy identity mismatch",
+            ):
+                EP.evaluate_entry_state(
+                    state=state, account_id="tq_breakout", code="002241", side="sell",
+                    quote=quote, asof_day="2026-09-08",
+                    runtime_context=context, execution_policy=forged,
+                )
+
+    def test_entry_evaluation_rejects_a_policy_bound_to_another_account(self):
+        state = EP.EntryGateState(account_risk_state={"blocked": False, "reasons": []})
+        quote = {"code": "002241", "price": 21.5, "name": "test"}
+        with self.assertRaisesRegex(
+            ValueError, "entry execution policy account identity mismatch",
+        ):
+            EP.evaluate_entry_state(
+                state=state, account_id="trend_pullback", code="002241", side="sell",
+                quote=quote, asof_day="2026-09-08",
+                execution_policy=EP.execution_policy_snapshot("tq_breakout"),
+            )
+        with self.assertRaisesRegex(TypeError, "owner execution policy snapshot is required"):
+            EP.evaluate_entry_state(
+                state=state, account_id="tq_breakout", code="002241", side="sell",
+                quote=quote, asof_day="2026-09-08",
+                execution_policy=EP.policy_for("tq_breakout"),
+            )
 
     def test_entry_context_binds_market_gate_option(self):
         quote = {"code": "002241", "price": 21.5, "name": "test"}

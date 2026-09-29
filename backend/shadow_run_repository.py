@@ -31,6 +31,7 @@ def _material(evidence: SR.ShadowRunEvidence) -> dict:
     return {
         "schema_version": SR.SHADOW_RUN_SCHEMA_VERSION,
         "spec": SR._plain(evidence.spec),
+        "challenger_runtime_inputs": SR._plain(evidence.challenger_runtime_inputs),
         "environment": SR._plain(evidence.environment),
         "strategy_definition_fingerprint": evidence.strategy_definition_fingerprint,
         "before_state": SR._plain(evidence.before_state),
@@ -103,6 +104,7 @@ def get_run(conn: sqlite3.Connection, run_id: str) -> SR.ShadowRunEvidence | Non
     return SR.ShadowRunEvidence(
         run_id=str(row[0]), run_fingerprint=str(row[1]), spec=material["spec"],
         environment=material["environment"],
+        challenger_runtime_inputs=material["challenger_runtime_inputs"],
         strategy_definition_fingerprint=material["strategy_definition_fingerprint"],
         before_state=material["before_state"], decisions=tuple(material["decisions"]),
         after_state=material["after_state"],

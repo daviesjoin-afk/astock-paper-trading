@@ -480,6 +480,7 @@ class ShadowRunEvidence:
     run_fingerprint: str
     spec: Mapping[str, Any]
     environment: Mapping[str, Any]
+    challenger_runtime_inputs: Mapping[str, Any]
     strategy_definition_fingerprint: str
     before_state: Mapping[str, Any]
     decisions: tuple[Mapping[str, Any], ...]
@@ -490,6 +491,7 @@ class ShadowRunEvidence:
         return {"schema_version": SHADOW_RUN_SCHEMA_VERSION, "run_id": self.run_id,
                 "run_fingerprint": self.run_fingerprint, "spec": _plain(self.spec),
                 "environment": _plain(self.environment),
+                "challenger_runtime_inputs": _plain(self.challenger_runtime_inputs),
                 "strategy_definition_fingerprint": self.strategy_definition_fingerprint,
                 "before_state": _plain(self.before_state),
                 "decisions": _plain(self.decisions), "after_state": _plain(self.after_state),
@@ -498,9 +500,16 @@ class ShadowRunEvidence:
 
 def evaluate_shadow(*, spec: ShadowRunSpec, environment: FrozenShadowEnvironment,
                     strategy_version: Any, lifecycle_state: str,
+                    execution_policy: EP.ExecutionPolicySnapshot,
                     candidates: tuple[ShadowCandidate, ...],
                     previous_run: ShadowRunEvidence | None = None) -> ShadowRunEvidence:
-    """Pure DSL Challenger evaluation over owner-resolved, explicit inputs."""
+    """Pure DSL Challenger evaluation over owner-resolved, explicit inputs.
+
+    ``execution_policy`` is the owner-issued freeze captured by the application
+    service before this call. Every entry decision and every recorded policy
+    identity reads that one object, so nothing here re-resolves the current
+    ``ExecutionPolicy`` owner state and a replay cannot drift with it.
+    """
     if spec.environment_fingerprint != environment.identity.environment_fingerprint:
         raise ShadowRuntimeError("NOT_COMPARABLE", "shadow_environment_not_comparable")
     if (spec.session_date, spec.decision_at) != (
@@ -514,6 +523,10 @@ def evaluate_shadow(*, spec: ShadowRunSpec, environment: FrozenShadowEnvironment
         raise ShadowRuntimeError("NOT_COMPARABLE", "active_comparator_exact_strategy_identity_mismatch")
     if lifecycle_state != "shadow":
         raise ValueError("challenger_lifecycle_not_shadow")
+    if not isinstance(execution_policy, EP.ExecutionPolicySnapshot):
+        raise TypeError("frozen entry execution policy snapshot is required")
+    if execution_policy.account_id != spec.challenger.strategy_id:
+        raise ValueError("challenger_execution_policy_identity_mismatch")
     if not candidates:
         raise ValueError("shadow_candidates_required")
     if len({(row.symbol, row.side) for row in candidates}) != len(candidates):
@@ -546,6 +559,9 @@ def evaluate_shadow(*, spec: ShadowRunSpec, environment: FrozenShadowEnvironment
         state = _state_for_run(spec, previous_run)
 
     quote_fingerprints = dict(environment.identity.symbol_quote_fingerprints)
+    # Run-level evidence, recorded once: every candidate below consumed this exact
+    # frozen owner policy, and its fingerprint explains the entry identity check.
+    challenger_runtime_inputs = {"entry_policy": execution_policy.projection()}
     decisions: list[dict[str, Any]] = []
     for candidate in sorted(candidates, key=lambda row: (row.symbol, row.side)):
         code = candidate.symbol
@@ -594,7 +610,7 @@ def evaluate_shadow(*, spec: ShadowRunSpec, environment: FrozenShadowEnvironment
                 already_filled_quantity=0,
                 same_day_consumed_quantity=state.session_consumed_quantity.get(code, 0),
             )
-            entry_policy_fp = EP.execution_policy_fingerprint(spec.challenger.strategy_id)
+            entry_policy_fp = execution_policy.fingerprint
             strategy_runtime_context = SRC.build_comparable_runtime_context(
                 strategy_id=spec.challenger.strategy_id,
                 strategy_version=spec.challenger.version,
@@ -620,6 +636,7 @@ def evaluate_shadow(*, spec: ShadowRunSpec, environment: FrozenShadowEnvironment
                 code=code, side=candidate.side, quote=quote, asof_day=spec.session_date,
                 amount=desired_amount, fees=desired_fees,
                 runtime_context=strategy_runtime_context,
+                execution_policy=execution_policy,
             )
             if entry_result["allowed"]:
                 order_mapping = {
@@ -685,6 +702,7 @@ def evaluate_shadow(*, spec: ShadowRunSpec, environment: FrozenShadowEnvironment
     material = {
         "schema_version": SHADOW_RUN_SCHEMA_VERSION,
         "spec": spec.projection(),
+        "challenger_runtime_inputs": challenger_runtime_inputs,
         "environment": environment.projection(),
         "strategy_definition_fingerprint": fingerprint(definition),
         "before_state": state_before_projection(spec, previous_run),
@@ -696,6 +714,7 @@ def evaluate_shadow(*, spec: ShadowRunSpec, environment: FrozenShadowEnvironment
     return ShadowRunEvidence(
         run_id=run_fingerprint, run_fingerprint=run_fingerprint,
         spec=material["spec"], environment=material["environment"],
+        challenger_runtime_inputs=material["challenger_runtime_inputs"],
         strategy_definition_fingerprint=material["strategy_definition_fingerprint"],
         before_state=material["before_state"], decisions=tuple(decisions),
         after_state=material["after_state"],

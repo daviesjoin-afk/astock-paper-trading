@@ -110,6 +110,14 @@ MUTATIONS = [
         '                "entry_gate_state": {},\n',
         "test_shadow_runtime.ShadowRuntimeTests.test_shadow_run_evidence_keeps_candidate_inputs",
     ),
+    # M-C16：把显式 frozen policy 变异回隐式的当前 owner 解析。
+    (
+        "backend/shadow_runtime.py",
+        '                runtime_context=strategy_runtime_context,\n'
+        '                execution_policy=execution_policy,\n',
+        '                runtime_context=strategy_runtime_context,\n',
+        "test_shadow_runtime.ShadowRuntimeTests.test_frozen_entry_policy_is_the_only_policy_source_on_replay",
+    ),
 ]
 
 
