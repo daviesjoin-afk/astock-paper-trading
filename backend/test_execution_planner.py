@@ -18,6 +18,7 @@ from dataclasses import replace
 from unittest import mock
 
 import execution_planner as EP
+import paper_quote_policy as PQP
 import simulation_runtime_context as SRC
 
 BACKEND_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -871,6 +872,84 @@ class RevalidateTests(_StubbedPlannerTest):
 
 
 class PlanEntryTests(_StubbedPlannerTest):
+    def test_entry_runtime_context_freezes_quote_freshness_clock(self):
+        quote = {
+            "code": "002241", "price": 21.5,
+            "quote_source": "live", "quote_validation": "cross_source_checked",
+            "quote_at": "2026-09-08T10:00:00+08:00", "quote_cross_check": {},
+        }
+        state = EP.EntryGateState(
+            account_risk_state={"blocked": False, "reasons": []},
+            require_market_gate=False,
+            capacity_available=True, position_limit=5, pool_limit=6,
+            shared_cash=100_000.0,
+        )
+        context = _runtime_context_for_state(
+            entry_state=state, quote=quote, strategy_id="tq_breakout",
+            session_date="2026-09-08", decision_at="2026-09-08T10:05:00+08:00",
+        )
+        wall_clock = {
+            "date": dt.date(2026, 9, 8),
+            "instant": dt.datetime(2026, 9, 8, 10, 5),
+        }
+
+        def quote_fresh(candidate, asof_date, *, reference_at=None):
+            return PQP.quote_is_fresh(
+                candidate, asof_date,
+                date_fn=lambda value: (value if isinstance(value, dt.date)
+                                       else dt.date.fromisoformat(str(value)[:10])),
+                today_fn=lambda: wall_clock["date"],
+                now_fn=lambda tz=None: wall_clock["instant"].replace(tzinfo=tz),
+                reference_at=reference_at,
+            )
+
+        def execution_quote_status(candidate, asof_date, purpose="entry", *, reference_at=None):
+            return PQP.execution_quote_status(
+                candidate, asof_date, purpose=purpose, quote_fresh=quote_fresh,
+                reference_at=reference_at,
+            )
+
+        stub = types.SimpleNamespace(
+            **vars(_pt_stub()),
+            _execution_quote_status=execution_quote_status,
+            _security_scope=lambda *args: {"allowed": True},
+        )
+
+        def evaluate(runtime):
+            return EP.evaluate_entry_state(
+                state=state, account_id="tq_breakout", code="002241", side="buy",
+                quote=quote, asof_day="2026-09-08", runtime_context=runtime,
+            )
+
+        outcomes = []
+        with mock.patch.object(EP, "_pt", lambda: stub):
+            for machine_date, machine_time in (
+                (dt.date(2026, 9, 8), dt.datetime(2026, 9, 8, 10, 5)),
+                (dt.date(2026, 9, 8), dt.datetime(2026, 9, 8, 10, 30)),
+                (dt.date(2026, 9, 9), dt.datetime(2026, 9, 9, 10, 0)),
+            ):
+                wall_clock["date"] = machine_date
+                wall_clock["instant"] = machine_time
+                result = evaluate(context)
+                outcomes.append((result["allowed"], result["gates"]["execution_quote"]))
+
+            self.assertEqual(outcomes[0], outcomes[1])
+            self.assertEqual(outcomes[0], outcomes[2])
+            self.assertTrue(outcomes[0][0])
+            self.assertTrue(outcomes[0][1]["fresh"])
+
+            later_decision = _runtime_context_for_state(
+                entry_state=state, quote=quote, strategy_id="tq_breakout",
+                session_date="2026-09-08", decision_at="2026-09-08T10:30:00+08:00",
+            )
+            wall_clock["date"] = dt.date(2026, 9, 8)
+            wall_clock["instant"] = dt.datetime(2026, 9, 8, 10, 5)
+            changed = evaluate(later_decision)
+
+        self.assertNotEqual(context.context_fingerprint, later_decision.context_fingerprint)
+        self.assertFalse(changed["allowed"])
+        self.assertFalse(changed["gates"]["execution_quote"]["fresh"])
+
     def test_plan_entry_composes_the_shared_gates_and_reports_the_policy(self):
         stub = types.SimpleNamespace(**vars(_pt_stub()), _execution_quote_status=lambda quote, day, purpose="entry": {"fresh": True},
             _security_scope=lambda code, name=None, risk_flag=None: {"allowed": True},

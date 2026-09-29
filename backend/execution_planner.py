@@ -1192,10 +1192,17 @@ def capacity_gate_from_state(
     return {"gate": gate, "reasons": reasons, "reserve": reserve}
 
 
-def quote_gate(quote, asof_day, purpose: str = "entry") -> dict[str, Any]:
+def quote_gate(
+    quote, asof_day, purpose: str = "entry", *, reference_at: str | None = None,
+) -> dict[str, Any]:
     """行情新鲜度门禁（复用 ``_execution_quote_status``，口径不变）。"""
     PT = _pt()
-    status = PT._execution_quote_status(quote, asof_day, purpose=purpose)
+    if reference_at is None:
+        status = PT._execution_quote_status(quote, asof_day, purpose=purpose)
+    else:
+        status = PT._execution_quote_status(
+            quote, asof_day, purpose=purpose, reference_at=reference_at,
+        )
     return {
         "status": status,
         "fresh": bool(status.get("fresh")),
@@ -1433,7 +1440,10 @@ def evaluate_entry_state(
         gates["position_count_gate"] = capacity["gate"]
         gates["seat_reserve"] = capacity["reserve"]
         reasons.extend(capacity["reasons"])
-    freshness = quote_gate(quote, asof_day, purpose="entry" if side == "buy" else "exit")
+    freshness = quote_gate(
+        quote, asof_day, purpose="entry" if side == "buy" else "exit",
+        reference_at=(runtime_context.decision_at if runtime_context is not None else None),
+    )
     gates["execution_quote"] = freshness["status"]
     if not freshness["fresh"]:
         reasons.append(f"成交行情未通过校验：{freshness['reason'] or '未知行情状态'}")

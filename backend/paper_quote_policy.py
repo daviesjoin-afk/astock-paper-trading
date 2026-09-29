@@ -5,7 +5,10 @@ from __future__ import annotations
 import datetime as dt
 
 
-def quote_is_fresh(quote, asof_date, *, date_fn, today_fn=dt.date.today, now_fn=dt.datetime.now):
+def quote_is_fresh(
+    quote, asof_date, *, date_fn, today_fn=dt.date.today, now_fn=dt.datetime.now,
+    reference_at=None,
+):
     """只有带源时间戳的当日公开行情才可触发成交。"""
     if not quote or quote.get("quote_source") != "live":
         return False
@@ -16,6 +19,20 @@ def quote_is_fresh(quote, asof_date, *, date_fn, today_fn=dt.date.today, now_fn=
     day = date_fn(asof_date)
     if quote_time.date() != day:
         return False
+    if reference_at is not None:
+        try:
+            reference_time = dt.datetime.fromisoformat(
+                str(reference_at).strip().replace("Z", "+00:00")
+            )
+        except (TypeError, ValueError):
+            return False
+        business_timezone = dt.timezone(dt.timedelta(hours=8))
+        if quote_time.tzinfo is None:
+            quote_time = quote_time.replace(tzinfo=business_timezone)
+        if reference_time.tzinfo is None:
+            reference_time = reference_time.replace(tzinfo=business_timezone)
+        age_seconds = (reference_time - quote_time).total_seconds()
+        return -120 <= age_seconds <= 20 * 60
     # 回放历史日期时只校验源日期；当日运行还要防止接口返回长时间未更新的收盘价。
     if day != today_fn():
         return True
@@ -33,7 +50,9 @@ def is_trading_active(quote, *, num):
     return not (pct == 0 and amount == 0 and turnover == 0 and volume == 0)
 
 
-def execution_quote_status(quote, asof_date, purpose="entry", *, quote_fresh):
+def execution_quote_status(
+    quote, asof_date, purpose="entry", *, quote_fresh, reference_at=None,
+):
     """自动成交行情门禁，不联网、不读账本。"""
     if not quote:
         return {"fresh": False, "status": "missing", "reason": "缺少行情"}
@@ -55,7 +74,12 @@ def execution_quote_status(quote, asof_date, purpose="entry", *, quote_fresh):
             "quote_at": quote.get("quote_at"),
             **diagnostics,
         }
-    if not quote_fresh(quote, asof_date):
+    fresh = (
+        quote_fresh(quote, asof_date)
+        if reference_at is None else
+        quote_fresh(quote, asof_date, reference_at=reference_at)
+    )
+    if not fresh:
         return {
             "fresh": False,
             "status": "stale",

@@ -95,6 +95,10 @@ MUTATIONS = [
      'if False:\n'
      '            raise ValueError("entry runtime context quote symbol mismatch")',
      "test_execution_planner.ExecutionStateBuilderTests.test_entry_context_rejects_quote_symbol_mismatch"),
+    ("backend/execution_planner.py",
+     'reference_at=(runtime_context.decision_at if runtime_context is not None else None),',
+     'reference_at=None,',
+     "test_execution_planner.PlanEntryTests.test_entry_runtime_context_freezes_quote_freshness_clock"),
 ]
 
 
