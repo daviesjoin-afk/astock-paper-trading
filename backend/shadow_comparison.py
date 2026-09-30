@@ -93,6 +93,22 @@ class ObservationAlignment(str, Enum):
     NOT_COMPARABLE = "NOT_COMPARABLE"
 
 
+class LegEvidenceState(str, Enum):
+    """What one leg's own owner evidence can prove about one dimension.
+
+    A container existing (a candidate, an order row) is not owner evidence:
+    `PRESENT` requires the authority's own decision for this stage.
+    """
+
+    PRESENT = "PRESENT"
+    #: The owner's own evidence proves the stage never applied.
+    NOT_APPLICABLE = "NOT_APPLICABLE"
+    #: The stage applies, but the owner produced no evidence for it.
+    MISSING = "MISSING"
+    #: Evidence exists but cannot be used for this stage.
+    UNAVAILABLE = "UNAVAILABLE"
+
+
 def _text(value: Any, label: str) -> str:
     text = str(value or "")
     if not text.strip() or text != text.strip():
@@ -188,6 +204,7 @@ class ActiveOrderEvidence:
     fees: float | None = None
     realized_pnl: float | None = None
     signal_evidence: Mapping[str, Any] | None = None
+    admission_evidence: Mapping[str, Any] | None = None
     execution_evidence: Mapping[str, Any] | None = None
 
     def __post_init__(self):
@@ -226,6 +243,8 @@ class ActiveOrderEvidence:
         object.__setattr__(self, "order_type", _optional_text(self.order_type))
         object.__setattr__(self, "signal_evidence",
                            _frozen_mapping(self.signal_evidence, "Active signal evidence"))
+        object.__setattr__(self, "admission_evidence",
+                           _frozen_mapping(self.admission_evidence, "Active admission evidence"))
         execution = _frozen_mapping(self.execution_evidence, "Active execution evidence")
         object.__setattr__(self, "execution_evidence", execution)
         claimed = (execution or {}).get("runtime_context_availability") if execution else None
@@ -262,6 +281,20 @@ class ActiveOrderEvidence:
         """The Execution Authority's own evidence projection, verbatim."""
         return self.execution_evidence
 
+    @property
+    def admission(self) -> Mapping[str, Any] | None:
+        """The Active buy-path admission decision, when its owner persisted one.
+
+        It is read from the order's own row (exact linkage, never a time- or
+        latest-based guess) and names its source. It is a different authority
+        from ``execution_planner.evaluate_entry_state``, so the comparison
+        reports both vocabularies verbatim and never maps one onto the other.
+        """
+        evidence = self.admission_evidence or {}
+        if not str(evidence.get("decision") or "").strip():
+            return None
+        return evidence
+
     def projection(self) -> dict[str, Any]:
         return {
             "order_id": self.order_id,
@@ -287,6 +320,7 @@ class ActiveOrderEvidence:
             "realized_pnl": self.realized_pnl,
             "created_at": self.created_at,
             "signal_evidence": SR._plain(self.signal_evidence),
+            "admission_evidence": SR._plain(self.admission_evidence),
             "execution_evidence": SR._plain(self.execution_evidence),
         }
 
@@ -369,11 +403,15 @@ class ComparisonSpec:
     active_comparator: SR.StrategyStamp
     shadow_run_id: str
     active_order_ids: tuple[int, ...]
+    #: Exact Active evidence identity. Order ids alone are NOT an evidence
+    #: identity: `paper_orders` rows are updated in place, so a comparison must
+    #: pin the fingerprint of the projection it consumed and fail closed when the
+    #: mutable row has drifted.
+    active_evidence_id: str
     environment_fingerprint: str
     session_date: str
     decision_at: str
     expected_observations: tuple[ObservationKey, ...]
-    active_evidence_id: str | None = None
     comparison_schema_version: str = COMPARISON_SCHEMA_VERSION
 
     def __post_init__(self):
@@ -403,9 +441,8 @@ class ComparisonSpec:
         identities = [item.identity for item in observations]
         if len(set(identities)) != len(identities):
             raise ShadowComparisonError("comparison_scope_ambiguous_duplicate")
-        if self.active_evidence_id is not None and not _SHA256.fullmatch(
-                str(self.active_evidence_id)):
-            raise ValueError("declared Active evidence id is invalid")
+        if not _SHA256.fullmatch(str(self.active_evidence_id or "")):
+            raise ValueError("exact Active evidence fingerprint is required")
         object.__setattr__(self, "active_order_ids", order_ids)
         object.__setattr__(self, "session_date", day)
         # Both owners persist the canonical UTC instant; normalizing here with the
@@ -447,6 +484,9 @@ class CoverageEvidence:
     missing_observations: int
     unavailable_observations: int
     coverage_ratio: float
+    #: Aligned observations whose required dimensions are not owner-complete.
+    #: They are part of `partial`, never of `available`.
+    aligned_incomplete_observations: int = 0
     blocking_reasons: tuple[str, ...] = ()
 
     def __post_init__(self):
@@ -462,6 +502,10 @@ class CoverageEvidence:
         if (counts["available"] + counts["partial"] + counts["missing"]
                 + counts["unavailable"]) != counts["expected"]:
             raise ValueError("coverage buckets must partition the expected observations")
+        incomplete = _count(self.aligned_incomplete_observations,
+                            "aligned incomplete observations")
+        if incomplete > counts["partial"]:
+            raise ValueError("aligned incomplete observations must be part of partial")
         ratio = float(self.coverage_ratio)
         if (not math.isfinite(ratio)
                 or round(ratio, 6) != round(counts["available"] / counts["expected"], 6)):
@@ -476,6 +520,7 @@ class CoverageEvidence:
             "partial_observations": self.partial_observations,
             "missing_observations": self.missing_observations,
             "unavailable_observations": self.unavailable_observations,
+            "aligned_incomplete_observations": self.aligned_incomplete_observations,
             "coverage_ratio": self.coverage_ratio,
             "blocking_reasons": list(self.blocking_reasons),
         }
@@ -488,7 +533,8 @@ class ShadowComparisonReport:
     report_id: str
     report_fingerprint: str
     comparison_spec: Mapping[str, Any]
-    active_evidence_identity: Mapping[str, Any]
+    active_evidence: Mapping[str, Any]
+    active_order_lifecycle: Mapping[str, Any]
     shadow_run_id: str
     shadow_run_fingerprint: str
     environment_identity: Mapping[str, Any]
@@ -513,7 +559,8 @@ class ShadowComparisonReport:
             "report_id": self.report_id,
             "report_fingerprint": self.report_fingerprint,
             "comparison_spec": SR._plain(self.comparison_spec),
-            "active_evidence_identity": SR._plain(self.active_evidence_identity),
+            "active_evidence": SR._plain(self.active_evidence),
+            "active_order_lifecycle": SR._plain(self.active_order_lifecycle),
             "shadow_run_id": self.shadow_run_id,
             "shadow_run_fingerprint": self.shadow_run_fingerprint,
             "environment_identity": SR._plain(self.environment_identity),
@@ -606,8 +653,7 @@ def _binding_reasons(*, spec: ComparisonSpec, active_evidence: ActiveComparisonE
         reasons.append("shadow_run_identity_mismatch")
     if tuple(active_evidence.source_identity.get("order_ids") or ()) != spec.active_order_ids:
         reasons.append("active_evidence_identity_mismatch")
-    if (spec.active_evidence_id is not None
-            and active_evidence.source_fingerprint != spec.active_evidence_id):
+    if active_evidence.source_fingerprint != spec.active_evidence_id:
         reasons.append("active_evidence_fingerprint_mismatch")
     if _as_stamp(shadow_spec.get("challenger")) != spec.challenger.projection():
         reasons.append("challenger_strategy_identity_mismatch")
@@ -670,19 +716,27 @@ def _shadow_observations(shadow_run: SR.ShadowRunEvidence) -> dict[str, Mapping[
     return observations
 
 
-def _leg_dimension(*, present: bool, active: Any, challenger: Any,
-                   delta: Mapping[str, Any] | None,
+def _leg_dimension(*, active: Any, challenger: Any,
+                   active_state: str, challenger_state: str,
+                   delta: Mapping[str, Any] | None = None,
                    reasons=()) -> dict[str, Any]:
-    """One per-observation dimension, with absence kept explicit."""
-    if present:
+    """One per-observation dimension, with each leg's owner evidence explicit.
+
+    A dimension is only AVAILABLE when both legs' own authority evidence is
+    PRESENT. Absence is reported as MISSING (or NOT_APPLICABLE when the owner's
+    own evidence proves the stage never applied) and is never turned into a
+    false, a rejected, or a zero.
+    """
+    states = {active_state, challenger_state}
+    if states == {LegEvidenceState.PRESENT.value}:
         availability = DimensionAvailability.AVAILABLE.value
-    elif active is None and challenger is None:
+    elif states <= {LegEvidenceState.MISSING.value, LegEvidenceState.UNAVAILABLE.value}:
         availability = DimensionAvailability.UNAVAILABLE.value
     else:
         availability = DimensionAvailability.PARTIAL.value
     return {
         "availability": availability,
-        "missing": {"active": active is None, "challenger": challenger is None},
+        "legs": {"active": active_state, "challenger": challenger_state},
         "active": active,
         "challenger": challenger,
         "delta": dict(delta) if delta is not None else None,
@@ -694,41 +748,64 @@ def _relation(left: Any, right: Any) -> str:
     return "SAME" if left == right else "DIFFERENT"
 
 
+def _challenger_signal_blocked(challenger: Mapping[str, Any] | None) -> bool:
+    """Does the owner's own signal decision prove no later stage applied?"""
+    signal = challenger.get("signal") if isinstance(challenger, Mapping) else None
+    outcome = signal.get("outcome") if isinstance(signal, Mapping) else None
+    return str(outcome or "").strip().lower() == "blocked"
+
+
 def _signal_dimension(active: ActiveOrderEvidence | None,
                       challenger: Mapping[str, Any] | None) -> dict[str, Any]:
-    active_decision = (active.signal_evidence or {}).get("signal_decision") if active else None
-    active_evidence = (active.signal_evidence or {}).get("signal_evidence") if active else None
-    challenger_signal = challenger.get("signal") if isinstance(challenger, Mapping) else None
+    present, missing = (
+        LegEvidenceState.PRESENT.value, LegEvidenceState.MISSING.value)
     active_payload = None
-    if active is not None:
+    active_state = missing
+    reasons: list[str] = []
+    if active is None:
+        reasons.append("active_observation_absent")
+    else:
+        active_decision = (active.signal_evidence or {}).get("signal_decision")
         active_payload = {
             "outcome": (active_decision or {}).get("outcome"),
             "status": (active_decision or {}).get("status"),
             "reason": (active_decision or {}).get("reason"),
-            "evidence": active_evidence,
+            "evidence": (active.signal_evidence or {}).get("signal_evidence"),
             # Selection scores are raw owner output from the persisted signal
             # row; the comparison never synthesizes a score of its own.
             "selection_scores": (active.signal_evidence or {}).get("selection_scores"),
         }
-    challenger_payload = None
-    if isinstance(challenger_signal, Mapping):
-        challenger_payload = {
-            "outcome": challenger_signal.get("outcome"),
-            "status": challenger_signal.get("status"),
-            "reason": challenger_signal.get("reason"),
-            "evidence": challenger_signal.get("evidence"),
-        }
-    present = (active_payload is not None and active_payload.get("outcome") is not None
-               and challenger_payload is not None
-               and challenger_payload.get("outcome") is not None)
-    if not present:
-        reasons = []
-        if active_payload is None or active_payload.get("outcome") is None:
+        if active_payload["outcome"] is not None:
+            active_state = present
+        elif active.signal_evidence is None:
             reasons.append("active_signal_evidence_absent")
-        if challenger_payload is None or challenger_payload.get("outcome") is None:
+        else:
+            reasons.append("active_signal_decision_absent")
+    challenger_payload = None
+    challenger_state = missing
+    if challenger is None:
+        reasons.append("challenger_observation_absent")
+    else:
+        challenger_signal = challenger.get("signal")
+        challenger_payload = {
+            "outcome": (challenger_signal or {}).get("outcome")
+            if isinstance(challenger_signal, Mapping) else None,
+            "status": (challenger_signal or {}).get("status")
+            if isinstance(challenger_signal, Mapping) else None,
+            "reason": (challenger_signal or {}).get("reason")
+            if isinstance(challenger_signal, Mapping) else None,
+            "evidence": (challenger_signal or {}).get("evidence")
+            if isinstance(challenger_signal, Mapping) else None,
+        }
+        if challenger_payload["outcome"] is not None:
+            challenger_state = present
+        else:
             reasons.append("challenger_signal_evidence_absent")
-        return _leg_dimension(present=False, active=active_payload,
-                              challenger=challenger_payload, delta=None, reasons=reasons)
+    if active_state != present or challenger_state != present:
+        return _leg_dimension(active=active_payload, challenger=challenger_payload,
+                              active_state=active_state,
+                              challenger_state=challenger_state, delta=None,
+                              reasons=reasons)
     delta = {
         "active_outcome": active_payload["outcome"],
         "challenger_outcome": challenger_payload["outcome"],
@@ -743,68 +820,113 @@ def _signal_dimension(active: ActiveOrderEvidence | None,
         "evidence_relation": _relation(active_payload.get("evidence"),
                                        challenger_payload.get("evidence")),
     }
-    return _leg_dimension(present=True, active=active_payload,
-                          challenger=challenger_payload, delta=delta)
+    return _leg_dimension(active=active_payload, challenger=challenger_payload,
+                          active_state=active_state, challenger_state=challenger_state,
+                          delta=delta)
 
 
 def _decision_dimension(active: ActiveOrderEvidence | None,
                         challenger: Mapping[str, Any] | None) -> dict[str, Any]:
+    present, not_applicable, missing, unavailable = (
+        LegEvidenceState.PRESENT.value, LegEvidenceState.NOT_APPLICABLE.value,
+        LegEvidenceState.MISSING.value, LegEvidenceState.UNAVAILABLE.value)
     entry = challenger.get("entry") if isinstance(challenger, Mapping) else None
     candidate = challenger.get("candidate") if isinstance(challenger, Mapping) else None
     active_payload = None
+    active_state = missing
     if active is not None:
+        admission = active.admission
         active_payload = {
-            "order_status": active.order_status,
-            "order_reason": active.order_reason,
+            # The order's own persisted admission decision. It comes from the
+            # Active buy path, a different authority from the Challenger's entry
+            # gate, so it is reported verbatim under its own source name.
+            "admission_source": (admission or {}).get("source")
+            or "risk_payload.decision_snapshot.final",
+            "admission_decision": (admission or {}).get("decision"),
+            "admission_reason": (admission or {}).get("reason"),
+            "admission_score": (admission or {}).get("score"),
+            "admission_gates": (admission or {}).get("gates"),
+            "admission_provenance": (EvidenceProvenance.OWNER_ISSUED.value
+                                     if admission is not None
+                                     else EvidenceProvenance.UNAVAILABLE.value),
             "order_type": active.order_type,
             "requested_quantity": active.requested_quantity,
             "planned_price": active.planned_price,
-            # The Active path does not persist an entry admission decision; the
-            # comparison will not invent one, so this stays unknown.
-            "entry_admission": None,
         }
+        active_state = present if admission is not None else missing
     challenger_payload = None
-    if isinstance(entry, Mapping) or isinstance(candidate, Mapping):
-        entry = entry if isinstance(entry, Mapping) else {}
-        candidate = candidate if isinstance(candidate, Mapping) else {}
+    challenger_state = missing
+    if isinstance(challenger, Mapping):
+        entry_mapping = entry if isinstance(entry, Mapping) else None
+        candidate_mapping = candidate if isinstance(candidate, Mapping) else None
         challenger_payload = {
-            "entry_allowed": entry.get("allowed"),
-            "entry_reasons": list(entry.get("reasons") or ()),
-            "entry_gates": entry.get("gates"),
-            "entry_policy": entry.get("policy"),
-            "requires_manual_entry_review": entry.get("requires_manual_entry_review"),
-            "order_type": candidate.get("order_type"),
-            "requested_quantity": candidate.get("desired_quantity"),
-            "reference_price": candidate.get("reference_price"),
+            "admission_source": "entry_gate",
+            "admission_decision": (entry_mapping or {}).get("allowed"),
+            "admission_reasons": list((entry_mapping or {}).get("reasons") or ()),
+            "admission_gates": (entry_mapping or {}).get("gates"),
+            "admission_policy": (entry_mapping or {}).get("policy"),
+            "requires_manual_entry_review": (entry_mapping or {}).get(
+                "requires_manual_entry_review"),
+            "admission_provenance": (EvidenceProvenance.OWNER_ISSUED.value
+                                     if entry_mapping is not None
+                                     and "allowed" in entry_mapping
+                                     else EvidenceProvenance.UNAVAILABLE.value),
+            "order_type": (candidate_mapping or {}).get("order_type"),
+            "requested_quantity": (candidate_mapping or {}).get("desired_quantity"),
+            "reference_price": (candidate_mapping or {}).get("reference_price"),
         }
-    present = active_payload is not None and challenger_payload is not None
-    if not present:
+        has_admission = (entry_mapping is not None and "allowed" in entry_mapping)
+        if has_admission:
+            challenger_state = present
+        elif _challenger_signal_blocked(challenger):
+            # The owner's own signal decision proves the candidate never reached
+            # an admission decision.
+            challenger_state = not_applicable
+        else:
+            challenger_state = missing
+    if active_state != present or challenger_state != present:
         reasons = []
-        if active_payload is None:
-            reasons.append("active_decision_evidence_absent")
-        if challenger_payload is None:
-            reasons.append("challenger_decision_evidence_absent")
-        return _leg_dimension(present=False, active=active_payload,
-                              challenger=challenger_payload, delta=None, reasons=reasons)
+        if active is None:
+            reasons.append("active_observation_absent")
+        elif active_state == missing:
+            reasons.append("active_admission_decision_not_persisted")
+        elif active_state == unavailable:
+            reasons.append("active_admission_evidence_unusable")
+        if challenger is None:
+            reasons.append("challenger_observation_absent")
+        elif challenger_state == not_applicable:
+            reasons.append("challenger_admission_not_applicable")
+        elif challenger_state == missing:
+            reasons.append("challenger_admission_decision_absent")
+        elif challenger_state == unavailable:
+            reasons.append("challenger_admission_evidence_unusable")
+        return _leg_dimension(active=active_payload, challenger=challenger_payload,
+                              active_state=active_state,
+                              challenger_state=challenger_state, delta=None,
+                              reasons=reasons)
     active_quantity = active_payload.get("requested_quantity")
     challenger_quantity = challenger_payload.get("requested_quantity")
     delta = {
-        "challenger_entry_allowed": challenger_payload.get("entry_allowed"),
-        "challenger_entry_reason_count": len(challenger_payload.get("entry_reasons") or ()),
+        "active_admission_decision": active_payload.get("admission_decision"),
+        "challenger_admission_decision": challenger_payload.get("admission_decision"),
         "order_type_relation": _relation(active_payload.get("order_type"),
                                          challenger_payload.get("order_type")),
         "requested_quantity_delta": (
             active_quantity - challenger_quantity
             if isinstance(active_quantity, int) and isinstance(challenger_quantity, int)
             else None),
-        # The two legs persist different vocabularies (an Active ledger status
-        # versus an entry-gate admission). Mapping them is not this layer's
-        # authority, so the cross-vocabulary relation stays explicitly unknown.
-        "cross_vocabulary_admission_relation": DimensionAvailability.UNAVAILABLE.value,
-        "cross_vocabulary_reason": "active_entry_admission_not_persisted",
+        # The two legs' admission decisions come from different authorities with
+        # different vocabularies (an Active buy-path outcome versus an entry-gate
+        # admission). No owner has defined a mapping, so the comparison states the
+        # two facts and that the relation itself is undefined - it does not invent
+        # one, and it does not present a lifecycle status as an admission.
+        "cross_vocabulary_admission_relation": unavailable,
+        "cross_vocabulary_relation_defined": False,
+        "cross_vocabulary_reason": "no_owner_defined_admission_vocabulary_mapping",
     }
-    return _leg_dimension(present=True, active=active_payload,
-                          challenger=challenger_payload, delta=delta)
+    return _leg_dimension(active=active_payload, challenger=challenger_payload,
+                          active_state=active_state, challenger_state=challenger_state,
+                          delta=delta)
 
 
 def _fill_ratio(requested: Any, filled: Any) -> float | None:
@@ -817,108 +939,187 @@ def _fill_ratio(requested: Any, filled: Any) -> float | None:
 
 def _execution_dimension(active: ActiveOrderEvidence | None,
                          challenger: Mapping[str, Any] | None) -> dict[str, Any]:
+    present, not_applicable, missing, unavailable = (
+        LegEvidenceState.PRESENT.value, LegEvidenceState.NOT_APPLICABLE.value,
+        LegEvidenceState.MISSING.value, LegEvidenceState.UNAVAILABLE.value)
+    entry = challenger.get("entry") if isinstance(challenger, Mapping) else None
     candidate = challenger.get("candidate") if isinstance(challenger, Mapping) else None
     execution = challenger.get("execution") if isinstance(challenger, Mapping) else None
     active_payload = None
+    active_state = missing
     if active is not None:
+        evidence = active.execution
         active_payload = {
-            "order_status": active.order_status,
-            "requested_quantity": active.requested_quantity,
-            "filled_quantity": active.filled_quantity,
-            "amount": active.amount,
-            "fees": active.fees,
-            "realized_pnl": active.realized_pnl,
-            "execution_evidence": active.execution,
+            # The Execution Authority's own evidence, verbatim, plus the ledger
+            # column as a separate labelled fact.
+            "execution_evidence": evidence,
+            "execution_evidence_availability": (
+                EvidenceProvenance.OWNER_ISSUED.value if evidence is not None
+                else EvidenceProvenance.UNAVAILABLE.value),
+            "execution_fill_quantity": ((evidence or {}).get("fill_quantity")
+                                        if evidence is not None else None),
+            "ledger_requested_quantity": active.requested_quantity,
+            "ledger_filled_quantity": active.filled_quantity,
+            "ledger_amount": active.amount,
+            "ledger_fees": active.fees,
+            "ledger_realized_pnl": active.realized_pnl,
         }
+        # Without the Execution Authority's own evidence the Active leg has no
+        # execution evidence; the ledger status is not used to infer one.
+        active_state = present if evidence is not None else unavailable
     challenger_payload = None
-    if isinstance(execution, Mapping) or isinstance(candidate, Mapping):
-        execution = execution if isinstance(execution, Mapping) else {}
-        candidate = candidate if isinstance(candidate, Mapping) else {}
+    challenger_state = missing
+    if isinstance(challenger, Mapping):
+        execution_mapping = execution if isinstance(execution, Mapping) else None
+        entry_mapping = entry if isinstance(entry, Mapping) else None
+        candidate_mapping = candidate if isinstance(candidate, Mapping) else None
         challenger_payload = {
-            "requested_quantity": candidate.get("desired_quantity"),
-            "filled_quantity": execution.get("fill_quantity"),
-            "remaining_quantity": execution.get("remaining_quantity"),
-            "status": execution.get("status"),
-            "reasons": list(execution.get("reasons") or ()),
-            "reference_price": execution.get("reference_price"),
-            "fill_price": execution.get("fill_price"),
-            "slippage_amount": execution.get("slippage_amount"),
-            "fees": execution.get("fees"),
-            "ruleset_version": execution.get("ruleset_version"),
-            "liquidity_evidence": execution.get("liquidity_evidence"),
-            "tradability_evidence": execution.get("tradability_evidence"),
+            "candidate_present": candidate_mapping is not None,
+            "execution_evidence": execution_mapping,
+            "execution_evidence_availability": (
+                EvidenceProvenance.OWNER_ISSUED.value if execution_mapping is not None
+                else EvidenceProvenance.UNAVAILABLE.value),
+            # Never fabricated: absent execution evidence has no fill quantity.
+            "execution_fill_quantity": ((execution_mapping or {}).get("fill_quantity")
+                                        if execution_mapping is not None else None),
+            "remaining_quantity": ((execution_mapping or {}).get("remaining_quantity")
+                                   if execution_mapping is not None else None),
+            "status": ((execution_mapping or {}).get("status")
+                       if execution_mapping is not None else None),
+            "reasons": (list((execution_mapping or {}).get("reasons") or ())
+                        if execution_mapping is not None else None),
+            "reference_price": ((execution_mapping or {}).get("reference_price")
+                                if execution_mapping is not None else None),
+            "fill_price": ((execution_mapping or {}).get("fill_price")
+                           if execution_mapping is not None else None),
+            "fees": ((execution_mapping or {}).get("fees")
+                     if execution_mapping is not None else None),
+            "slippage_amount": ((execution_mapping or {}).get("slippage_amount")
+                                if execution_mapping is not None else None),
+            "ruleset_version": ((execution_mapping or {}).get("ruleset_version")
+                                if execution_mapping is not None else None),
+            "liquidity_evidence": ((execution_mapping or {}).get("liquidity_evidence")
+                                   if execution_mapping is not None else None),
+            "tradability_evidence": ((execution_mapping or {}).get("tradability_evidence")
+                                     if execution_mapping is not None else None),
+            "requested_quantity": (candidate_mapping or {}).get("desired_quantity"),
         }
-    active_ratio = (_fill_ratio(active_payload.get("requested_quantity"),
-                                active_payload.get("filled_quantity"))
-                    if active_payload is not None else None)
-    challenger_ratio = (_fill_ratio(challenger_payload.get("requested_quantity"),
-                                    challenger_payload.get("filled_quantity"))
-                        if challenger_payload is not None else None)
-    present = active_payload is not None and challenger_payload is not None
-    if not present:
+        if execution_mapping is not None:
+            challenger_state = present
+        elif entry_mapping is not None and entry_mapping.get("allowed") is False:
+            # The owner's own admission decision proves no execution attempt
+            # exists, so this stage did not apply rather than being incomplete.
+            challenger_state = not_applicable
+        elif _challenger_signal_blocked(challenger):
+            challenger_state = not_applicable
+        else:
+            challenger_state = missing
+    active_ratio = _fill_ratio(
+        (active_payload or {}).get("ledger_requested_quantity"),
+        (active_payload or {}).get("execution_fill_quantity"))
+    challenger_ratio = _fill_ratio(
+        (challenger_payload or {}).get("requested_quantity"),
+        (challenger_payload or {}).get("execution_fill_quantity"))
+    if active_state != present or challenger_state != present:
         reasons = []
-        if active_payload is None:
-            reasons.append("active_execution_evidence_absent")
-        elif active_payload.get("execution_evidence") is None:
+        if active_state == unavailable:
             reasons.append("active_execution_evidence_not_persisted")
-        if challenger_payload is None:
+        elif active_state == missing:
+            reasons.append("active_execution_evidence_absent")
+        if challenger_state == missing:
             reasons.append("challenger_execution_evidence_absent")
-        return _leg_dimension(present=False, active=active_payload,
-                              challenger=challenger_payload, delta=None, reasons=reasons)
+        elif challenger_state == not_applicable:
+            reasons.append("challenger_execution_not_applicable")
+        elif challenger_state == unavailable:
+            reasons.append("challenger_execution_evidence_absent")
+        return _leg_dimension(active=active_payload, challenger=challenger_payload,
+                              active_state=active_state,
+                              challenger_state=challenger_state, delta=None,
+                              reasons=reasons)
+    active_filled = active_payload.get("execution_fill_quantity")
+    challenger_filled = challenger_payload.get("execution_fill_quantity")
     delta = {
         "active_fill_ratio": active_ratio,
         "challenger_fill_ratio": challenger_ratio,
         "fill_ratio_relation": (
             _relation(active_ratio, challenger_ratio)
             if active_ratio is not None and challenger_ratio is not None else None),
-        "filled_quantity_delta": (active_payload["filled_quantity"]
-                                  - int(challenger_payload.get("filled_quantity") or 0)),
+        "fill_quantity_delta": (
+            active_filled - challenger_filled
+            if isinstance(active_filled, int) and isinstance(challenger_filled, int)
+            else None),
     }
-    return _leg_dimension(present=True, active=active_payload,
-                          challenger=challenger_payload, delta=delta)
+    return _leg_dimension(active=active_payload, challenger=challenger_payload,
+                          active_state=active_state, challenger_state=challenger_state,
+                          delta=delta)
 
 
 def _risk_dimension(active: ActiveOrderEvidence | None,
                     challenger: Mapping[str, Any] | None) -> dict[str, Any]:
+    present, missing, unavailable = (
+        LegEvidenceState.PRESENT.value, LegEvidenceState.MISSING.value,
+        LegEvidenceState.UNAVAILABLE.value)
     entry = challenger.get("entry") if isinstance(challenger, Mapping) else None
     candidate = challenger.get("candidate") if isinstance(challenger, Mapping) else None
     active_payload = None
+    active_state = missing
     if active is not None:
+        # Inventory result: no exact, order-linked Risk Authority decision is
+        # persisted. `paper_risk_decisions` carries no order reference, so any
+        # (account, code, side) match would be a time-ordered guess, and the
+        # order's own lifecycle status is not risk evidence. The Active risk
+        # rejection therefore stays UNAVAILABLE rather than being fabricated.
         active_payload = {
-            "order_status": active.order_status,
-            "order_reason": active.order_reason,
-            "provenance": EvidenceProvenance.OWNER_ISSUED.value,
+            "risk_rejection_evidence": None,
+            "risk_rejection_availability": EvidenceProvenance.UNAVAILABLE.value,
+            "reason": "no_order_linked_risk_authority_evidence",
+            "detail": {
+                "paper_risk_decisions_order_linkage": None,
+                "order_lifecycle_status_used": False,
+                "exact_linkage_searched": True,
+            },
         }
+        active_state = unavailable
     challenger_payload = None
-    if isinstance(entry, Mapping) or isinstance(candidate, Mapping):
-        entry = entry if isinstance(entry, Mapping) else {}
-        candidate = candidate if isinstance(candidate, Mapping) else {}
+    challenger_state = missing
+    if isinstance(challenger, Mapping):
+        entry_mapping = entry if isinstance(entry, Mapping) else None
+        candidate_mapping = candidate if isinstance(candidate, Mapping) else None
+        has_entry = entry_mapping is not None and "allowed" in entry_mapping
         challenger_payload = {
-            "entry_allowed": entry.get("allowed"),
-            "entry_reasons": list(entry.get("reasons") or ()),
-            "entry_provenance": EvidenceProvenance.OWNER_ISSUED.value,
+            "entry_allowed": ((entry_mapping or {}).get("allowed") if has_entry else None),
+            "entry_reasons": (list((entry_mapping or {}).get("reasons") or ())
+                              if has_entry else None),
+            # No entry decision means no owner-issued risk evidence either.
+            "entry_provenance": (EvidenceProvenance.OWNER_ISSUED.value if has_entry
+                                 else EvidenceProvenance.UNAVAILABLE.value),
             # R32-C established that this identity is caller-declared evidence.
             # It is reported as declared, never promoted to owner-verified.
-            "risk_policy_identity": candidate.get("risk_policy_identity"),
+            "risk_policy_identity": ((candidate_mapping or {}).get("risk_policy_identity")
+                                     if candidate_mapping is not None else None),
             "risk_policy_identity_provenance": EvidenceProvenance.DECLARED.value,
         }
-    present = active_payload is not None and challenger_payload is not None
-    if not present:
-        reasons = []
-        if active_payload is None:
-            reasons.append("active_risk_evidence_absent")
-        if challenger_payload is None:
-            reasons.append("challenger_risk_evidence_absent")
-        return _leg_dimension(present=False, active=active_payload,
-                              challenger=challenger_payload, delta=None, reasons=reasons)
-    delta = {
-        "active_order_status": active_payload["order_status"],
-        "challenger_entry_allowed": challenger_payload.get("entry_allowed"),
-        "challenger_entry_reasons": list(challenger_payload.get("entry_reasons") or ()),
-        "risk_policy_identity_provenance": EvidenceProvenance.DECLARED.value,
-    }
-    return _leg_dimension(present=True, active=active_payload,
-                          challenger=challenger_payload, delta=delta)
+        challenger_state = present if has_entry else missing
+    reasons = []
+    if active is None:
+        reasons.append("active_observation_absent")
+    elif active_state == unavailable:
+        reasons.append("active_risk_rejection_evidence_absent")
+    if challenger is None:
+        reasons.append("challenger_observation_absent")
+    elif challenger_state == missing:
+        reasons.append("challenger_risk_rejection_evidence_absent")
+    delta = None
+    if active_state == present and challenger_state == present:
+        delta = {
+            "challenger_entry_allowed": challenger_payload.get("entry_allowed"),
+            "challenger_entry_reasons": list(
+                challenger_payload.get("entry_reasons") or ()),
+            "risk_policy_identity_provenance": EvidenceProvenance.DECLARED.value,
+        }
+    return _leg_dimension(active=active_payload, challenger=challenger_payload,
+                          active_state=active_state, challenger_state=challenger_state,
+                          delta=delta, reasons=reasons)
 
 
 def _observation_comparison(*, key: ObservationKey, active: ActiveOrderEvidence | None,
@@ -966,6 +1167,7 @@ def _coverage(*, expected: tuple[ObservationKey, ...],
             unavailable_observations=total, coverage_ratio=0.0,
             blocking_reasons=_reasons(reasons))
     available = partial = missing = unavailable = 0
+    aligned_incomplete = 0
     for item in observations:
         alignment = item["alignment"]
         if alignment == ObservationAlignment.ALIGNED.value:
@@ -977,20 +1179,26 @@ def _coverage(*, expected: tuple[ObservationKey, ...],
             if required_ok:
                 available += 1
             else:
-                unavailable += 1
+                # Evidence exists on both legs but a required dimension is not
+                # owner-complete, so the observation is not a completed
+                # comparison and must not be counted as available.
+                partial += 1
+                aligned_incomplete += 1
         elif alignment == ObservationAlignment.NO_EVIDENCE.value:
             missing += 1
         else:
             partial += 1
-    return CoverageEvidence(
+    coverage = CoverageEvidence(
         expected_observations=total,
         available_observations=available,
         partial_observations=partial,
         missing_observations=missing,
         unavailable_observations=unavailable,
         coverage_ratio=round(available / total, 6),
+        aligned_incomplete_observations=aligned_incomplete,
         blocking_reasons=_reasons(reasons),
     )
+    return coverage
 
 
 def _aggregate_availability(present: int, total: int) -> str:
@@ -1036,40 +1244,43 @@ def _signal_aggregate(observations: tuple[Mapping[str, Any], ...]) -> dict[str, 
 
 
 def _decision_aggregate(observations: tuple[Mapping[str, Any], ...]) -> dict[str, Any]:
-    allowed = blocked = present = 0
-    statuses: dict[str, int] = {}
+    present = 0
+    allowed = blocked = 0
+    active_decisions: dict[str, int] = {}
     reasons: list[str] = []
     for item in observations:
-        dimension = item["dimensions"]["decision"]
-        delta = dimension["delta"]
+        delta = item["dimensions"]["decision"]["delta"]
         if not delta:
             reasons.append("decision_delta_unavailable:"
                            f"{item['observation']['symbol']}|{item['observation']['side']}")
             continue
         present += 1
-        status = str(delta.get("active_order_status") or "")
-        statuses[status] = statuses.get(status, 0) + 1
-        if delta.get("challenger_entry_allowed") is True:
+        active_decision = str(delta.get("active_admission_decision") or "")
+        active_decisions[active_decision] = active_decisions.get(active_decision, 0) + 1
+        challenger_decision = delta.get("challenger_admission_decision")
+        if challenger_decision is True:
             allowed += 1
-        elif delta.get("challenger_entry_allowed") is False:
+        elif challenger_decision is False:
             blocked += 1
     return {
         "availability": _aggregate_availability(present, len(observations)),
-        "challenger_entry_allowed": allowed,
-        "challenger_entry_blocked": blocked,
-        "active_order_statuses": {key: statuses[key] for key in sorted(statuses)},
-        # Two different persisted vocabularies; mapping them is not this
-        # layer's authority, so no cross-leg admission conclusion is emitted.
+        "challenger_admission_allowed": allowed,
+        "challenger_admission_blocked": blocked,
+        "active_admission_decisions": {key: active_decisions[key]
+                                       for key in sorted(active_decisions)},
+        # Two different persisted vocabularies; mapping them is not this layer's
+        # authority, so no cross-leg admission conclusion is emitted.
         "cross_vocabulary_admission_relation": DimensionAvailability.UNAVAILABLE.value,
-        "cross_vocabulary_reason": "active_entry_admission_not_persisted",
+        "cross_vocabulary_relation_defined": False,
+        "cross_vocabulary_reason": "no_owner_defined_admission_vocabulary_mapping",
         "blocking_reasons": list(_reasons(reasons)),
     }
 
 
 def _execution_aggregate(observations: tuple[Mapping[str, Any], ...]) -> dict[str, Any]:
+    present = 0
     active_filled = challenger_filled = 0
     active_requested = challenger_requested = 0
-    present = 0
     reasons: list[str] = []
     for item in observations:
         dimension = item["dimensions"]["execution"]
@@ -1080,51 +1291,120 @@ def _execution_aggregate(observations: tuple[Mapping[str, Any], ...]) -> dict[st
         present += 1
         active = dimension["active"] or {}
         challenger = dimension["challenger"] or {}
-        active_filled += int(active.get("filled_quantity") or 0)
-        challenger_filled += int(challenger.get("filled_quantity") or 0)
-        active_requested += int(active.get("requested_quantity") or 0)
-        challenger_requested += int(challenger.get("requested_quantity") or 0)
+        # Only quantities the owner actually produced are summed; an absent
+        # quantity is never coerced to zero.
+        if isinstance(active.get("execution_fill_quantity"), int):
+            active_filled += int(active["execution_fill_quantity"])
+        if isinstance(challenger.get("execution_fill_quantity"), int):
+            challenger_filled += int(challenger["execution_fill_quantity"])
+        if isinstance(active.get("ledger_requested_quantity"), int):
+            active_requested += int(active["ledger_requested_quantity"])
+        if isinstance(challenger.get("requested_quantity"), int):
+            challenger_requested += int(challenger["requested_quantity"])
+    total = len(observations)
+    if not present:
+        # Nothing was comparable, so no total is asserted: an absent quantity is
+        # never reported as a zero.
+        return {
+            "availability": DimensionAvailability.UNAVAILABLE.value,
+            "comparable_observations": 0,
+            "active_requested_quantity": None,
+            "challenger_requested_quantity": None,
+            "active_filled_quantity": None,
+            "challenger_filled_quantity": None,
+            "fill_quantity_delta": None,
+            "blocking_reasons": list(_reasons(reasons)),
+        }
     return {
-        "availability": _aggregate_availability(present, len(observations)),
-        "aligned_observations": present,
+        "availability": _aggregate_availability(present, total),
+        "comparable_observations": present,
         "active_requested_quantity": active_requested,
         "challenger_requested_quantity": challenger_requested,
         "active_filled_quantity": active_filled,
         "challenger_filled_quantity": challenger_filled,
-        "filled_quantity_delta": active_filled - challenger_filled,
+        "fill_quantity_delta": active_filled - challenger_filled,
         "blocking_reasons": list(_reasons(reasons)),
     }
 
 
 def _risk_aggregate(observations: tuple[Mapping[str, Any], ...]) -> dict[str, Any]:
-    present = 0
-    statuses: dict[str, int] = {}
+    active_present = challenger_present = 0
     entry_reasons: set[str] = set()
     declared = 0
     reasons: list[str] = []
     for item in observations:
         dimension = item["dimensions"]["risk_rejection"]
-        delta = dimension["delta"]
-        if not delta:
-            reasons.append("risk_delta_unavailable:"
+        states = dimension["legs"]
+        if states["active"] == LegEvidenceState.PRESENT.value:
+            active_present += 1
+        else:
+            reasons.append("active_risk_rejection_evidence_absent:"
                            f"{item['observation']['symbol']}|{item['observation']['side']}")
-            continue
-        present += 1
-        status = str(delta.get("active_order_status") or "")
-        statuses[status] = statuses.get(status, 0) + 1
-        entry_reasons.update(str(reason) for reason in delta.get("challenger_entry_reasons") or ())
-        declared += 1
+        challenger = dimension["challenger"] or {}
+        if states["challenger"] == LegEvidenceState.PRESENT.value:
+            challenger_present += 1
+            entry_reasons.update(str(reason)
+                                 for reason in challenger.get("entry_reasons") or ())
+        else:
+            reasons.append("challenger_risk_rejection_evidence_absent:"
+                           f"{item['observation']['symbol']}|{item['observation']['side']}")
+        if challenger.get("risk_policy_identity") is not None:
+            declared += 1
+    total = len(observations)
+    if not active_present and not challenger_present:
+        availability = DimensionAvailability.UNAVAILABLE.value
+    elif active_present == total and challenger_present == total:
+        availability = DimensionAvailability.AVAILABLE.value
+    else:
+        availability = DimensionAvailability.PARTIAL.value
     return {
-        "availability": _aggregate_availability(present, len(observations)),
-        "active_order_statuses": {key: statuses[key] for key in sorted(statuses)},
+        "availability": availability,
+        "active_risk_rejection_observations": active_present,
+        "challenger_risk_rejection_observations": challenger_present,
         "challenger_entry_reasons": sorted(entry_reasons),
         "declared_risk_identity_observations": declared,
         "provenance": {
-            "active_rejection_outcome": EvidenceProvenance.OWNER_ISSUED.value,
+            # No order-linked Risk Authority decision is persisted, so the
+            # Active side carries no owner-issued rejection evidence at all.
+            "active_rejection_outcome": EvidenceProvenance.UNAVAILABLE.value,
             "challenger_entry_decision": EvidenceProvenance.OWNER_ISSUED.value,
             "challenger_risk_policy_identity": EvidenceProvenance.DECLARED.value,
         },
         "blocking_reasons": list(_reasons(reasons)),
+    }
+
+
+def _order_lifecycle(active_evidence: ActiveComparisonEvidence) -> dict[str, Any]:
+    """Active order lifecycle facts, kept apart from any admission decision.
+
+    `paper_orders.status` / `reason` are ledger lifecycle facts. They are
+    reported here verbatim and are explicitly **not** used as an entry admission,
+    an execution result, or risk evidence.
+    """
+    rows = [{
+        "order_id": order.order_id,
+        "symbol": order.symbol,
+        "side": order.side,
+        "order_status": order.order_status,
+        "order_reason": order.order_reason,
+        "order_type": order.order_type,
+        "requested_quantity": order.requested_quantity,
+        "filled_quantity": order.filled_quantity,
+        "amount": order.amount,
+        "fees": order.fees,
+        "realized_pnl": order.realized_pnl,
+        "created_at": order.created_at,
+    } for order in active_evidence.orders]
+    statuses: dict[str, int] = {}
+    for row in rows:
+        statuses[row["order_status"]] = statuses.get(row["order_status"], 0) + 1
+    return {
+        "provenance": EvidenceProvenance.OWNER_ISSUED.value,
+        "used_as_entry_admission": False,
+        "used_as_execution_result": False,
+        "used_as_risk_evidence": False,
+        "status_counts": {key: statuses[key] for key in sorted(statuses)},
+        "orders": rows,
     }
 
 
@@ -1243,13 +1523,15 @@ def _performance(shadow_run: SR.ShadowRunEvidence) -> dict[str, Any]:
 
 def _provenance_map() -> dict[str, Any]:
     return {
-        "active.order_columns": EvidenceProvenance.OWNER_ISSUED.value,
+        "active.order_lifecycle_columns": EvidenceProvenance.OWNER_ISSUED.value,
         "active.signal_decision": EvidenceProvenance.OWNER_ISSUED.value,
         "active.signal_evidence": EvidenceProvenance.OWNER_ISSUED.value,
+        "active.admission_decision": EvidenceProvenance.OWNER_ISSUED.value,
         "active.execution_evidence": EvidenceProvenance.OWNER_ISSUED.value,
         "active.runtime_context": EvidenceProvenance.OWNER_ISSUED.value,
         "active.selection_scores": EvidenceProvenance.OWNER_ISSUED.value,
-        "active.entry_admission": EvidenceProvenance.UNAVAILABLE.value,
+        # No order-linked Risk Authority decision exists in the Active ledger.
+        "active.risk_rejection": EvidenceProvenance.UNAVAILABLE.value,
         "active.turnover_denominator": EvidenceProvenance.UNAVAILABLE.value,
         "active.performance": EvidenceProvenance.UNAVAILABLE.value,
         "challenger.signal": EvidenceProvenance.OWNER_ISSUED.value,
@@ -1261,13 +1543,16 @@ def _provenance_map() -> dict[str, Any]:
         "challenger.risk_policy_identity": EvidenceProvenance.DECLARED.value,
         "comparison.deltas": EvidenceProvenance.DERIVED.value,
         "comparison.coverage": EvidenceProvenance.DERIVED.value,
+        "comparison.active_order_lifecycle": EvidenceProvenance.OWNER_ISSUED.value,
     }
 
 
 def _observation_not_comparable(key: ObservationKey,
                                reasons) -> dict[str, Any]:
     dimensions = {
-        name: _leg_dimension(present=False, active=None, challenger=None,
+        name: _leg_dimension(active=None, challenger=None,
+                             active_state=LegEvidenceState.UNAVAILABLE.value,
+                             challenger_state=LegEvidenceState.UNAVAILABLE.value,
                              delta=None, reasons=reasons)
         for name in REQUIRED_COMPARISON_DIMENSIONS
     }
@@ -1387,11 +1672,13 @@ def build_shadow_comparison(*, spec: ComparisonSpec,
     material = {
         "schema_version": COMPARISON_SCHEMA_VERSION,
         "comparison_spec": spec.projection(),
-        "active_evidence_identity": {
-            "source_schema_version": active_evidence.source_schema_version,
-            "source_identity": dict(active_evidence.source_identity),
-            "source_fingerprint": active_evidence.source_fingerprint,
-        },
+        # The full canonical Active envelope (source table, order ids, source
+        # schema version, source fingerprint and the exact consumed projection)
+        # is persisted so the report can re-verify its own source fingerprint.
+        "active_evidence": active_evidence.projection(),
+        # Order lifecycle facts live in their own section and are explicitly not
+        # used as an admission, an execution result, or risk evidence.
+        "active_order_lifecycle": _order_lifecycle(active_evidence),
         "shadow_run_id": shadow_run.run_id,
         "shadow_run_fingerprint": shadow_run.run_fingerprint,
         "environment_identity": environment_identity,
@@ -1414,7 +1701,8 @@ def build_shadow_comparison(*, spec: ComparisonSpec,
         report_id=report_fingerprint,
         report_fingerprint=report_fingerprint,
         comparison_spec=material["comparison_spec"],
-        active_evidence_identity=material["active_evidence_identity"],
+        active_evidence=material["active_evidence"],
+        active_order_lifecycle=material["active_order_lifecycle"],
         shadow_run_id=material["shadow_run_id"],
         shadow_run_fingerprint=material["shadow_run_fingerprint"],
         environment_identity=material["environment_identity"],

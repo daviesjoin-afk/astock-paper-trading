@@ -48,7 +48,8 @@ _ORDER_DDL = """
         side TEXT NOT NULL, status TEXT NOT NULL, reason TEXT, order_type TEXT,
         qty INTEGER NOT NULL, planned_price REAL, filled_qty INTEGER NOT NULL DEFAULT 0,
         filled_price REAL, amount REAL, fees REAL, realized_pnl REAL,
-        created_at TEXT NOT NULL, execution_evidence TEXT NOT NULL DEFAULT '{}'
+        created_at TEXT NOT NULL, execution_evidence TEXT NOT NULL DEFAULT '{}',
+        risk_payload TEXT NOT NULL DEFAULT '{}'
     )
 """
 
@@ -214,8 +215,22 @@ class ShadowComparisonTests(unittest.TestCase):
         )
         return int(cursor.lastrowid)
 
+    def _risk_payload(self, *, decision="approved", reason=None, with_snapshot=True):
+        """The order's own risk_payload as the production writers shape it."""
+        payload = {
+            "chase_entry": {"allowed": True, "required": False, "reason": None},
+            "three_day_timing_gate": {"allowed": True, "mode": "常规入场", "reason": None},
+            "entry_price_gate": {"allowed": True, "reason": None},
+        }
+        if with_snapshot:
+            payload["decision_snapshot"] = {
+                "version": "decision-snapshot-v3",
+                "final": {"score": 88.5, "reason": reason, "decision": decision},
+            }
+        return json.dumps(payload, ensure_ascii=False)
+
     def _ledger(self, *, orders=(), signals=True, with_reports=True,
-                execution_evidence=None):
+                execution_evidence=None, risk_payload=None):
         """Minimal faithful ledger: the exact columns the service reads."""
         conn = sqlite3.connect(":memory:")
         conn.execute(_ORDER_DDL)
@@ -247,12 +262,16 @@ class ShadowComparisonTests(unittest.TestCase):
                 "cycle_id": 7,
             }
             row.update({key: value for key, value in overrides.items()
-                        if key not in {"execution_evidence", "signal_decision",
-                                       "link_signal"}})
+                        if key not in {"execution_evidence", "risk_payload",
+                                       "signal_decision", "link_signal"}})
             evidence = overrides.get("execution_evidence")
             if evidence is None:
                 evidence = (execution_evidence if execution_evidence is not None
                             else self._execution_evidence())
+            row_payload = overrides.get("risk_payload")
+            if row_payload is None:
+                row_payload = (risk_payload if risk_payload is not None
+                               else self._risk_payload())
             signal_id = None
             if signals and overrides.get("link_signal", True):
                 signal_id = self._signal_row(
@@ -261,14 +280,14 @@ class ShadowComparisonTests(unittest.TestCase):
                 "INSERT INTO paper_orders(account_id,signal_id,cycle_id,strategy_id,"
                 "strategy_version,strategy_checksum,code,side,status,reason,order_type,"
                 "qty,planned_price,filled_qty,filled_price,amount,fees,realized_pnl,"
-                "created_at,execution_evidence)"
-                " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "created_at,execution_evidence,risk_payload)"
+                " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (row["account_id"], signal_id, row["cycle_id"], row["strategy_id"],
                  row["strategy_version"], row["strategy_checksum"], row["code"],
                  row["side"], row["status"], row["reason"], row["order_type"],
                  row["qty"], row["planned_price"], row["filled_qty"],
                  row["filled_price"], row["amount"], row["fees"],
-                 row["realized_pnl"], row["created_at"], evidence),
+                 row["realized_pnl"], row["created_at"], evidence, row_payload),
             )
             order_ids.append(int(cursor.lastrowid))
         conn.commit()
@@ -280,6 +299,7 @@ class ShadowComparisonTests(unittest.TestCase):
             "active_comparator": self.active,
             "shadow_run_id": self.shadow_run.run_id,
             "active_order_ids": tuple(order_ids),
+            "active_evidence_id": _sha("placeholder-active-evidence"),
             "environment_fingerprint": self.identity.environment_fingerprint,
             "session_date": self.day,
             "decision_at": self.decision_at,
@@ -288,18 +308,21 @@ class ShadowComparisonTests(unittest.TestCase):
         values.update(overrides)
         return SC.ComparisonSpec(**values)
 
-    def _report(self, *, orders=(), execution_evidence=None, expected=None,
-                shadow_run=None, signals=True, spec_overrides=None):
+    def _report(self, *, orders=(), execution_evidence=None, risk_payload=None,
+                expected=None, shadow_run=None, signals=True, spec_overrides=None):
+        """Declare the evidence id from the loaded evidence, as a caller must."""
         conn, order_ids = self._ledger(orders=orders, signals=signals,
-                                      execution_evidence=execution_evidence)
+                                       execution_evidence=execution_evidence,
+                                       risk_payload=risk_payload)
         run = shadow_run if shadow_run is not None else self.shadow_run
         keys = tuple(expected) if expected is not None else (
             SC.ObservationKey(self.code, "buy"),)
         overrides = {"shadow_run_id": run.run_id,
                      "environment_fingerprint": run.spec["environment_fingerprint"]}
         overrides.update(spec_overrides or {})
-        spec = self._comparison_spec(order_ids=order_ids, expected=keys, **overrides)
-        evidence = SCS.load_active_comparison_evidence(conn, spec)
+        draft = self._comparison_spec(order_ids=order_ids, expected=keys, **overrides)
+        evidence = SCS.load_active_comparison_evidence(conn, draft)
+        spec = replace(draft, active_evidence_id=evidence.source_fingerprint)
         report = SC.build_shadow_comparison(
             spec=spec, active_evidence=evidence, shadow_run=run)
         return conn, spec, evidence, report
@@ -351,6 +374,27 @@ class ShadowComparisonTests(unittest.TestCase):
         )
         return environment, identity, context
 
+    def _blocked_signal_run(self):
+        """A real run whose own signal decision blocked the candidate.
+
+        The Challenger's signal outcome is owner evidence that the later stages
+        never applied, which is different from missing downstream evidence.
+        """
+        version = types.SimpleNamespace(
+            strategy_id=self.challenger.strategy_id, version=self.challenger.version,
+            checksum=self.challenger.checksum,
+            definition={"dsl_ast": {
+                "op": "gt", "left": {"op": "field", "name": "close"},
+                "right": {"op": "const", "value": 10_000.0}}},
+        )
+        with mock.patch.object(PT, "_execution_quote_status", return_value={
+                "fresh": True, "status": "cross_source_checked"}):
+            return SH.evaluate_shadow(
+                spec=self.shadow_spec, environment=self.environment,
+                strategy_version=version, lifecycle_state="shadow",
+                execution_policy=self.execution_policy,
+                candidates=(self.candidate,))
+
     def _two_symbol_run(self):
         """A real run over two symbols, used for continuation and coverage."""
         environment, identity, context = self._environment_for(
@@ -374,28 +418,51 @@ class ShadowComparisonTests(unittest.TestCase):
         conn, spec, evidence, first = self._report()
         second_conn, _, _, second = self._report()
         second_conn.close()
-        self.assertEqual("AVAILABLE", first.availability)
+        # Required dimensions are signal/decision/execution/risk_rejection; the
+        # Active ledger has no order-linked risk rejection evidence, so a report
+        # cannot be AVAILABLE today. It is PARTIAL, never silently complete.
+        self.assertEqual("PARTIAL", first.availability)
+        # The Active side has no order-linked risk evidence at all, so the
+        # dimension can never be AVAILABLE; it is PARTIAL (one leg present).
+        self.assertEqual("PARTIAL", first.risk_rejection["availability"])
+        self.assertEqual("UNAVAILABLE",
+                         first.observations[0]["dimensions"]["risk_rejection"]["legs"][
+                             "active"])
         self.assertEqual(first.report_id, first.report_fingerprint)
         self.assertEqual(first.report_fingerprint, second.report_fingerprint)
         self.assertEqual(first.projection(), second.projection())
-        # A different building order of the same declared scope is the same input.
+        # A different declaration order of the same scope is the same input.
         reversed_spec = self._comparison_spec(
-            order_ids=spec.active_order_ids, expected=spec.expected_observations)
+            order_ids=spec.active_order_ids, expected=spec.expected_observations,
+            active_evidence_id=spec.active_evidence_id)
         self.assertEqual(spec.scope_identity(), reversed_spec.scope_identity())
         conn.close()
 
     def test_d1b_report_fingerprint_binds_the_exact_evidence_identities(self):
         conn, spec, evidence, report = self._report()
         self.assertEqual(evidence.source_fingerprint,
-                         report.active_evidence_identity["source_fingerprint"])
+                         report.active_evidence["source_fingerprint"])
+        self.assertEqual(spec.active_evidence_id,
+                         report.active_evidence["source_fingerprint"])
         self.assertEqual(spec.shadow_run_id, report.shadow_run_id)
         self.assertEqual(self.shadow_run.run_fingerprint,
                          report.shadow_run_fingerprint)
+        # The persisted envelope can re-verify its own source fingerprint.
+        self.assertEqual(evidence.source_fingerprint,
+                         SC.SR.fingerprint({
+                             "source_schema_version": report.active_evidence[
+                                 "source_schema_version"],
+                             "source": report.active_evidence["source_identity"]["source"],
+                             "orders": report.active_evidence["orders"],
+                         }))
+        self.assertEqual(spec.active_order_ids,
+                         tuple(report.active_evidence["source_identity"]["order_ids"]))
         # Different Active evidence content -> different report identity.
         changed_evidence = SC.ActiveComparisonEvidence.build(
             (replace(evidence.orders[0], amount=999.0),))
         same_spec = self._comparison_spec(
-            order_ids=spec.active_order_ids, expected=spec.expected_observations)
+            order_ids=spec.active_order_ids, expected=spec.expected_observations,
+            active_evidence_id=spec.active_evidence_id)
         changed_report = SC.build_shadow_comparison(
             spec=same_spec, active_evidence=changed_evidence,
             shadow_run=self.shadow_run)
@@ -404,13 +471,17 @@ class ShadowComparisonTests(unittest.TestCase):
         self.assertNotEqual(report.report_fingerprint,
                             changed_report.report_fingerprint)
         self.assertEqual(changed_evidence.source_fingerprint,
-                         changed_report.active_evidence_identity["source_fingerprint"])
+                         changed_report.active_evidence["source_fingerprint"])
+        # A spec that still declares the old evidence id blocks the new content.
+        self.assertEqual("UNAVAILABLE", changed_report.availability)
+        self.assertIn("active_evidence_fingerprint_mismatch",
+                      changed_report.blocking_reasons)
         # Different ShadowRun identity -> different report identity.
         other_run = replace(self.shadow_run, run_id=_sha("other-run"),
                             run_fingerprint=_sha("other-run"))
         run_spec = self._comparison_spec(
             order_ids=spec.active_order_ids, expected=spec.expected_observations,
-            shadow_run_id=other_run.run_id)
+            shadow_run_id=other_run.run_id, active_evidence_id=spec.active_evidence_id)
         run_report = SC.build_shadow_comparison(
             spec=run_spec, active_evidence=evidence, shadow_run=other_run)
         self.assertNotEqual(report.report_fingerprint, run_report.report_fingerprint)
@@ -497,8 +568,7 @@ class ShadowComparisonTests(unittest.TestCase):
             expected=expected)
         by_key = {(item["observation"]["symbol"], item["observation"]["side"]): item
                   for item in report.observations}
-        aligned = by_key[(self.code, "buy")]
-        self.assertEqual("ALIGNED", aligned["alignment"])
+        self.assertEqual("ALIGNED", by_key[(self.code, "buy")]["alignment"])
         active_only = by_key[(self.other_code, "buy")]
         self.assertEqual("ACTIVE_EVIDENCE_ONLY", active_only["alignment"])
         self.assertTrue(active_only["active_evidence_present"])
@@ -507,23 +577,24 @@ class ShadowComparisonTests(unittest.TestCase):
         self.assertEqual("NO_EVIDENCE", unobserved["alignment"])
         for item in (active_only, unobserved):
             for name, dimension in item["dimensions"].items():
-                if dimension["missing"]["challenger"]:
-                    self.assertIn(name, ("signal", "decision", "execution",
-                                         "risk_rejection"))
+                self.assertNotEqual("AVAILABLE", dimension["availability"], name)
+                self.assertIsNone(dimension["delta"], name)
+                self.assertTrue(dimension["blocking_reasons"], name)
+                if dimension["legs"]["challenger"] in {"MISSING", "UNAVAILABLE"}:
                     self.assertIsNone(dimension["challenger"], name)
-                    self.assertIsNone(dimension["delta"], name)
-                    self.assertTrue(dimension["blocking_reasons"], name)
-        # Absence is never counted as a blocked or zero decision.
-        self.assertEqual(0, report.decision_delta["challenger_entry_blocked"])
-        self.assertEqual(1, report.decision_delta["challenger_entry_allowed"])
-        self.assertEqual({"expected_observations": 3, "available_observations": 1,
-                          "partial_observations": 1, "missing_observations": 1,
-                          "unavailable_observations": 0},
-                         {key: report.coverage[key] for key in (
-                             "expected_observations", "available_observations",
-                             "partial_observations", "missing_observations",
-                             "unavailable_observations")})
-        self.assertEqual(round(1 / 3, 6), report.coverage["coverage_ratio"])
+        # Absence is never counted as a blocked decision or a zero fill.
+        self.assertEqual(0, report.decision_delta["challenger_admission_blocked"])
+        self.assertEqual(1, report.execution["comparable_observations"])
+        self.assertEqual(100, report.execution["challenger_filled_quantity"])
+        self.assertEqual({"active": "PRESENT", "challenger": "MISSING"},
+                         by_key[(self.other_code, "buy")]["dimensions"]["execution"]["legs"])
+        coverage = report.coverage
+        self.assertEqual(3, coverage["expected_observations"])
+        self.assertEqual(0, coverage["available_observations"])
+        self.assertEqual(2, coverage["partial_observations"])
+        self.assertEqual(1, coverage["missing_observations"])
+        self.assertEqual(1, coverage["aligned_incomplete_observations"])
+        self.assertEqual(0.0, coverage["coverage_ratio"])
         self.assertEqual("PARTIAL", report.availability)
         conn.close()
 
@@ -538,11 +609,26 @@ class ShadowComparisonTests(unittest.TestCase):
             expected=expected, shadow_run=run,
             execution_evidence=self._execution_evidence(
                 runtime_context=context.projection()))
-        self.assertEqual(4, report.coverage["expected_observations"])
-        self.assertEqual(2, report.coverage["available_observations"])
-        self.assertEqual(2, report.coverage["missing_observations"])
-        self.assertEqual(0.5, report.coverage["coverage_ratio"])
+        coverage = report.coverage
+        self.assertEqual(4, coverage["expected_observations"])
+        # Two observations aligned, but required dimensions are not owner-complete
+        # (no order-linked Active risk evidence), so none counts as available.
+        self.assertEqual(2, coverage["aligned_incomplete_observations"])
+        self.assertEqual(0, coverage["available_observations"])
+        self.assertEqual(2, coverage["missing_observations"])
+        self.assertEqual(0.0, coverage["coverage_ratio"])
         self.assertEqual("PARTIAL", report.availability)
+        # The ratio is always available/expected, and a ratio that silently drops
+        # the unavailable remainder is rejected by construction.
+        unit = SC.CoverageEvidence(
+            expected_observations=4, available_observations=2, partial_observations=0,
+            missing_observations=2, unavailable_observations=0, coverage_ratio=0.5)
+        self.assertEqual(0.5, unit.projection()["coverage_ratio"])
+        with self.assertRaisesRegex(ValueError, "must equal available/expected"):
+            SC.CoverageEvidence(
+                expected_observations=4, available_observations=2,
+                partial_observations=0, missing_observations=2,
+                unavailable_observations=0, coverage_ratio=1.0)
         conn.close()
 
     def test_d6_replay_from_exact_evidence_ignores_current_state(self):
@@ -596,7 +682,7 @@ class ShadowComparisonTests(unittest.TestCase):
                         side_effect=AssertionError("pure comparison opened a database")):
             report = SC.build_shadow_comparison(
                 spec=spec, active_evidence=evidence, shadow_run=self.shadow_run)
-        self.assertEqual("AVAILABLE", report.availability)
+        self.assertEqual("PARTIAL", report.availability)
         conn.close()
 
     def test_d8_declared_risk_identity_is_never_promoted_to_verified(self):
@@ -605,12 +691,18 @@ class ShadowComparisonTests(unittest.TestCase):
                          report.provenance["challenger.risk_policy_identity"])
         self.assertEqual("OWNER_ISSUED", report.provenance["challenger.entry_policy"])
         self.assertEqual("OWNER_ISSUED", report.provenance["challenger.entry"])
-        self.assertEqual("UNAVAILABLE", report.provenance["active.entry_admission"])
-        self.assertEqual("DECLARED",
-                         report.risk_rejection["provenance"]["challenger_risk_policy_identity"])
+        self.assertEqual("OWNER_ISSUED", report.provenance["active.admission_decision"])
+        self.assertEqual("UNAVAILABLE", report.provenance["active.risk_rejection"])
+        self.assertEqual(
+            "DECLARED",
+            report.risk_rejection["provenance"]["challenger_risk_policy_identity"])
+        self.assertEqual(
+            "UNAVAILABLE",
+            report.risk_rejection["provenance"]["active_rejection_outcome"])
         risk = report.observations[0]["dimensions"]["risk_rejection"]
         self.assertEqual("DECLARED", risk["challenger"]["risk_policy_identity_provenance"])
         self.assertEqual("OWNER_ISSUED", risk["challenger"]["entry_provenance"])
+        self.assertEqual("UNAVAILABLE", risk["active"]["risk_rejection_availability"])
         self.assertEqual({"captured_policy_fingerprint": _sha("risk-policy")},
                          risk["challenger"]["risk_policy_identity"])
         rendered = json.dumps(report.projection(), ensure_ascii=False)
@@ -649,8 +741,9 @@ class ShadowComparisonTests(unittest.TestCase):
         self.assertEqual([self.other_code], performance["challenger_valuation_missing_symbols"])
         self.assertIsNone(performance["challenger"])
         self.assertEqual("UNAVAILABLE", performance["active_availability"])
-        # Best-effort dimensions never block the report's own availability.
-        self.assertEqual("AVAILABLE", report.availability)
+        # Best-effort dimensions never block the report's own availability, and
+        # the report is PARTIAL anyway because a required dimension is incomplete.
+        self.assertEqual("PARTIAL", report.availability)
         conn.close()
 
     def test_d9b_performance_uses_only_the_frozen_environment_quotes(self):
@@ -720,6 +813,169 @@ class ShadowComparisonTests(unittest.TestCase):
                       "overall_score", "ranking", "verdict"):
             self.assertNotIn(token, rendered)
         self.assertEqual(SC.COMPARISON_SCHEMA_VERSION, report.schema_version)
+        conn.close()
+
+    # ── D13–D18: exact evidence identity and evidence completeness ────────────
+
+    def test_d13_mutated_active_row_fails_closed_against_the_pinned_fingerprint(self):
+        """order id 不是 evidence identity：同一 order id 的行漂移必须 fail closed。"""
+        # A comparison may not run without a pinned Active evidence fingerprint.
+        for invalid in (None, "", "not-a-fingerprint"):
+            with self.subTest(declared=invalid):
+                with self.assertRaisesRegex(
+                        ValueError, "exact Active evidence fingerprint is required"):
+                    self._comparison_spec(
+                        order_ids=(1,),
+                        expected=(SC.ObservationKey(self.code, "buy"),),
+                        active_evidence_id=invalid)
+        conn, spec, evidence, _ = self._report()
+        for migration_id in (24, 25):
+            migration = next(item for item in db_migrate.MIGRATIONS["paper_trading"]
+                             if item[0] == migration_id)
+            db_migrate._run_operation(conn, migration[2])
+        SRR.append_run(conn, self.shadow_run)
+        cursor = conn.execute(
+            "UPDATE paper_orders SET filled_qty=?,amount=?,status=?,execution_evidence=?"
+            " WHERE id=?",
+            (0, 0.0, "cancelled", "{}", spec.active_order_ids[0]))
+        self.assertEqual(1, cursor.rowcount)
+        conn.commit()
+        drifted = SCS.load_active_comparison_evidence(conn, spec)
+        self.assertEqual(tuple(spec.active_order_ids),
+                         tuple(drifted.source_identity["order_ids"]))
+        self.assertNotEqual(evidence.source_fingerprint, drifted.source_fingerprint)
+        # The same declared fingerprint no longer matches the mutable row.
+        with self.assertRaisesRegex(SC.ShadowComparisonError,
+                                    "active_evidence_fingerprint_mismatch"):
+            SCS.build_and_append_comparison(conn, spec=spec)
+        self.assertEqual(0, conn.execute(
+            "SELECT COUNT(*) FROM shadow_comparison_reports").fetchone()[0])
+        # Re-declaring the drifted fingerprint is a different comparison, and it
+        # is an explicit act: it produces a different report identity.
+        re_declared = replace(spec, active_evidence_id=drifted.source_fingerprint)
+        replayed = SCS.build_and_append_comparison(conn, spec=re_declared)
+        self.assertNotEqual(evidence.source_fingerprint, replayed.active_evidence[
+            "source_fingerprint"])
+        self.assertEqual(1, conn.execute(
+            "SELECT COUNT(*) FROM shadow_comparison_reports").fetchone()[0])
+        conn.close()
+
+    def test_d14_candidate_without_execution_evidence_is_not_execution_evidence(self):
+        blocked_run = self._blocked_signal_run()
+        self.assertIsNone(blocked_run.decisions[0]["execution"])
+        self.assertIsNone(blocked_run.decisions[0]["entry"])
+        conn, spec, evidence, report = self._report(shadow_run=blocked_run)
+        execution = report.observations[0]["dimensions"]["execution"]
+        # The owner's own signal decision proves the stage never applied.
+        self.assertEqual("NOT_APPLICABLE", execution["legs"]["challenger"])
+        self.assertEqual("PRESENT", execution["legs"]["active"])
+        self.assertNotEqual("AVAILABLE", execution["availability"])
+        self.assertIsNone(execution["challenger"]["execution_fill_quantity"])
+        self.assertIsNone(execution["delta"])
+        self.assertNotEqual("AVAILABLE", report.availability)
+        self.assertEqual(0, report.coverage["available_observations"])
+        self.assertNotEqual(1.0, report.coverage["coverage_ratio"])
+        # An entry-admitted candidate with no execution evidence is MISSING.
+        tampered = replace(blocked_run, decisions=({
+            **dict(blocked_run.decisions[0]),
+            "signal": {"outcome": "approved", "status": "pending", "reason": "x",
+                       "evidence": None},
+            "entry": {"allowed": True, "reasons": [], "gates": {},
+                      "policy": None, "requires_manual_entry_review": False},
+        },))
+        _, _, _, missing_report = self._report(shadow_run=tampered)
+        missing = missing_report.observations[0]["dimensions"]["execution"]
+        self.assertEqual("MISSING", missing["legs"]["challenger"])
+        self.assertNotEqual("AVAILABLE", missing["availability"])
+        self.assertIsNone(missing["challenger"]["execution_fill_quantity"])
+        self.assertEqual(0, missing_report.coverage["available_observations"])
+        conn.close()
+
+    def test_d15_active_execution_evidence_absent_is_never_complete(self):
+        # Without the Execution Authority's own envelope the Active decision has
+        # neither a comparable environment nor an execution result.
+        conn, spec, evidence, report = self._report(execution_evidence="{}")
+        self.assertEqual("UNAVAILABLE", report.availability)
+        self.assertTrue(any(item.startswith("active_runtime_context_unavailable:")
+                            for item in report.blocking_reasons),
+                        report.blocking_reasons)
+        self.assertNotEqual(
+            "AVAILABLE",
+            report.observations[0]["dimensions"]["execution"]["availability"])
+        self.assertEqual(0, report.coverage["available_observations"])
+        conn.close()
+
+    def test_d15b_owner_issued_zero_is_reported_as_zero_not_fabricated(self):
+        """0 只能来自 owner 明确产出的证据；缺失永远是 None。"""
+        conn, spec, evidence, report = self._report(
+            execution_evidence=self._execution_evidence(fill_quantity=0))
+        execution = report.observations[0]["dimensions"]["execution"]
+        self.assertEqual("PRESENT", execution["legs"]["active"])
+        self.assertTrue(execution["active"]["execution_evidence_availability"]
+                        == "OWNER_ISSUED")
+        self.assertEqual(0, execution["active"]["execution_fill_quantity"])
+        self.assertEqual(0.0, execution["delta"]["active_fill_ratio"])
+        self.assertEqual("AVAILABLE", execution["availability"])
+        self.assertEqual(0, report.execution["active_filled_quantity"])
+        conn.close()
+
+    def test_d16_missing_challenger_entry_is_not_an_admission_decision(self):
+        blocked_run = self._blocked_signal_run()
+        conn, spec, evidence, report = self._report(shadow_run=blocked_run)
+        decision = report.observations[0]["dimensions"]["decision"]
+        risk = report.observations[0]["dimensions"]["risk_rejection"]
+        self.assertEqual("NOT_APPLICABLE", decision["legs"]["challenger"])
+        self.assertNotEqual("AVAILABLE", decision["availability"])
+        self.assertIsNone(decision["challenger"]["admission_decision"])
+        self.assertEqual("UNAVAILABLE",
+                         decision["challenger"]["admission_provenance"])
+        self.assertNotEqual("AVAILABLE", risk["availability"])
+        # No entry decision means no owner-issued risk evidence either.
+        self.assertEqual("UNAVAILABLE", risk["challenger"]["entry_provenance"])
+        self.assertIsNone(risk["challenger"]["entry_reasons"])
+        self.assertEqual("DECLARED",
+                         risk["challenger"]["risk_policy_identity_provenance"])
+        conn.close()
+
+    def test_d17_order_status_is_not_risk_authority_evidence(self):
+        conn, spec, evidence, report = self._report()
+        risk = report.observations[0]["dimensions"]["risk_rejection"]
+        self.assertEqual("UNAVAILABLE", risk["legs"]["active"])
+        self.assertIsNone(risk["active"]["risk_rejection_evidence"])
+        self.assertEqual("UNAVAILABLE", risk["active"]["risk_rejection_availability"])
+        self.assertEqual("no_order_linked_risk_authority_evidence",
+                         risk["active"]["reason"])
+        self.assertFalse(risk["active"]["detail"]["order_lifecycle_status_used"])
+        self.assertIsNone(risk["active"]["detail"]["paper_risk_decisions_order_linkage"])
+        self.assertEqual("UNAVAILABLE", report.provenance["active.risk_rejection"])
+        # The lifecycle status is reported, but in its own section and flagged as
+        # not being an admission, an execution result, or risk evidence.
+        lifecycle = report.active_order_lifecycle
+        self.assertEqual("filled", lifecycle["orders"][0]["order_status"])
+        self.assertEqual({"filled": 1}, lifecycle["status_counts"])
+        self.assertFalse(lifecycle["used_as_entry_admission"])
+        self.assertFalse(lifecycle["used_as_execution_result"])
+        self.assertFalse(lifecycle["used_as_risk_evidence"])
+        self.assertEqual("OWNER_ISSUED", lifecycle["provenance"])
+        conn.close()
+
+    def test_d18_absent_execution_never_becomes_zero_or_false(self):
+        blocked_run = self._blocked_signal_run()
+        conn, spec, evidence, report = self._report(shadow_run=blocked_run)
+        rendered = report.projection()
+        execution = rendered["observations"][0]["dimensions"]["execution"]
+        self.assertIsNone(execution["challenger"]["execution_fill_quantity"])
+        self.assertIsNone(execution["challenger"]["status"])
+        self.assertIsNone(execution["challenger"]["reasons"])
+        self.assertIsNone(execution["delta"])
+        self.assertIsNone(rendered["execution"]["challenger_filled_quantity"])
+        self.assertIsNone(rendered["execution"]["fill_quantity_delta"])
+        self.assertFalse(execution["challenger"]["candidate_present"] is None)
+        # Nothing anywhere claims a zero fill or a rejected flag for the absent leg.
+        flattened = json.dumps(execution["challenger"], ensure_ascii=False)
+        self.assertNotIn('"filled_quantity": 0', flattened)
+        self.assertNotIn('"rejected"', flattened)
+        self.assertNotIn('"fill_ratio": 0', flattened)
         conn.close()
 
     # ── persistence contract ─────────────────────────────────────────────────

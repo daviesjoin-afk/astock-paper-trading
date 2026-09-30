@@ -21,15 +21,18 @@ MUTATIONS = [
     # M-D2：缺证据的一侧被当成"被拒"，而不是 MISSING。
     (
         "backend/shadow_comparison.py",
-        '        if challenger_payload is None:\n'
-        '            reasons.append("challenger_decision_evidence_absent")\n'
-        '        return _leg_dimension(present=False, active=active_payload,\n'
-        '                              challenger=challenger_payload, delta=None, reasons=reasons)\n',
-        '        if challenger_payload is None:\n'
-        '            reasons.append("challenger_decision_evidence_absent")\n'
-        '        return _leg_dimension(present=False, active=active_payload,\n'
-        '                              challenger=challenger_payload,\n'
-        '                              delta={"challenger_entry_allowed": False},\n'
+        '        elif challenger_state == unavailable:\n'
+        '            reasons.append("challenger_admission_evidence_unusable")\n'
+        '        return _leg_dimension(active=active_payload, challenger=challenger_payload,\n'
+        '                              active_state=active_state,\n'
+        '                              challenger_state=challenger_state, delta=None,\n'
+        '                              reasons=reasons)\n',
+        '        elif challenger_state == unavailable:\n'
+        '            reasons.append("challenger_admission_evidence_unusable")\n'
+        '        return _leg_dimension(active=active_payload, challenger=challenger_payload,\n'
+        '                              active_state=active_state,\n'
+        '                              challenger_state=challenger_state,\n'
+        '                              delta={"challenger_admission_decision": False},\n'
         '                              reasons=reasons)\n',
         "test_shadow_comparison.ShadowComparisonTests.test_d4_absence_is_missing_not_false_reject_or_zero",
     ),
@@ -52,15 +55,11 @@ MUTATIONS = [
         '            values = _row_mapping(cursor, cursor.fetchone())\n',
         "test_shadow_comparison.ShadowComparisonTests.test_d7b_a_missing_named_active_evidence_row_fails_closed",
     ),
-    # M-D5：report fingerprint 不再覆盖 Active evidence identity。
+    # M-D5：report fingerprint 不再覆盖 Active evidence identity 与消费投影。
     (
         "backend/shadow_comparison.py",
-        '        "active_evidence_identity": {\n'
-        '            "source_schema_version": active_evidence.source_schema_version,\n'
-        '            "source_identity": dict(active_evidence.source_identity),\n'
-        '            "source_fingerprint": active_evidence.source_fingerprint,\n'
-        '        },\n',
-        '        "active_evidence_identity": {},\n',
+        '        "active_evidence": active_evidence.projection(),\n',
+        '        "active_evidence": {"source_schema_version": ACTIVE_EVIDENCE_SCHEMA_VERSION},\n',
         "test_shadow_comparison.ShadowComparisonTests.test_d1b_report_fingerprint_binds_the_exact_evidence_identities",
     ),
     # M-D6：report fingerprint 不再覆盖 ShadowRun identity。
@@ -85,6 +84,53 @@ MUTATIONS = [
         '    if missing:\n',
         '    if False:\n',
         "test_shadow_comparison.ShadowComparisonTests.test_d9_missing_exact_valuation_stays_unavailable",
+    ),
+    # M-D9：允许 ComparisonSpec 不带 exact Active evidence fingerprint。
+    (
+        "backend/shadow_comparison.py",
+        '        if not _SHA256.fullmatch(str(self.active_evidence_id or "")):\n'
+        '            raise ValueError("exact Active evidence fingerprint is required")\n',
+        '        if False:\n'
+        '            raise ValueError("exact Active evidence fingerprint is required")\n',
+        "test_shadow_comparison.ShadowComparisonTests.test_d13_mutated_active_row_fails_closed_against_the_pinned_fingerprint",
+    ),
+    # M-D10：production service 跳过 Active fingerprint 相等校验。
+    (
+        "backend/shadow_comparison_service.py",
+        '    if active_evidence.source_fingerprint != spec.active_evidence_id:\n'
+        '        raise SC.ShadowComparisonError("active_evidence_fingerprint_mismatch")\n',
+        '    if False:\n'
+        '        raise SC.ShadowComparisonError("active_evidence_fingerprint_mismatch")\n',
+        "test_shadow_comparison.ShadowComparisonTests.test_d13_mutated_active_row_fails_closed_against_the_pinned_fingerprint",
+    ),
+    # M-D11：candidate 存在即被当成 execution evidence 存在。
+    (
+        "backend/shadow_comparison.py",
+        '        if execution_mapping is not None:\n'
+        '            challenger_state = present\n',
+        '        if isinstance(challenger, Mapping):\n'
+        '            challenger_state = present\n',
+        "test_shadow_comparison.ShadowComparisonTests.test_d14_candidate_without_execution_evidence_is_not_execution_evidence",
+    ),
+    # M-D12：缺失的 fill quantity 被转成 0。
+    (
+        "backend/shadow_comparison.py",
+        '            "execution_fill_quantity": ((execution_mapping or {}).get("fill_quantity")\n'
+        '                                        if execution_mapping is not None else None),\n',
+        '            "execution_fill_quantity": ((execution_mapping or {}).get("fill_quantity")\n'
+        '                                        or 0),\n',
+        "test_shadow_comparison.ShadowComparisonTests.test_d18_absent_execution_never_becomes_zero_or_false",
+    ),
+    # M-D13：order lifecycle status 被升级成 Active risk evidence。
+    (
+        "backend/shadow_comparison.py",
+        '        active_payload = {\n'
+        '            "risk_rejection_evidence": None,\n'
+        '            "risk_rejection_availability": EvidenceProvenance.UNAVAILABLE.value,\n',
+        '        active_payload = {\n'
+        '            "risk_rejection_evidence": {"order_status": active.order_status},\n'
+        '            "risk_rejection_availability": EvidenceProvenance.OWNER_ISSUED.value,\n',
+        "test_shadow_comparison.ShadowComparisonTests.test_d17_order_status_is_not_risk_authority_evidence",
     ),
 ]
 

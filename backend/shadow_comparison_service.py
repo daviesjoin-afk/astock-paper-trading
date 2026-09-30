@@ -10,18 +10,20 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from collections.abc import Mapping
 
 import shadow_comparison as SC
 import shadow_comparison_repository as SCR
 import shadow_run_repository as SRR
 
-# ``risk_payload`` is deliberately not selected: it can be hundreds of KB per
-# order and the comparison contract does not consume it.
+# ``risk_payload`` is selected on purpose: it is the order's own row, so it is
+# the only exactly-linked Active admission decision. It is read for the
+# explicitly named orders only (never for a page or a scan).
 _ORDER_COLUMNS = (
     "id", "account_id", "signal_id", "cycle_id", "strategy_id", "strategy_version",
     "strategy_checksum", "code", "side", "status", "reason", "order_type", "qty",
     "planned_price", "filled_qty", "filled_price", "amount", "fees", "realized_pnl",
-    "created_at", "execution_evidence",
+    "created_at", "execution_evidence", "risk_payload",
 )
 _SIGNAL_COLUMNS = (
     "id", "status", "reason", "signal_date", "intended_date", "rank_score", "t_tier",
@@ -56,6 +58,33 @@ def _execution_evidence(raw) -> dict | None:
     """The Execution Authority's persisted evidence, or unknown when unwritten."""
     evidence = _json_mapping(raw, label="active_execution_evidence")
     return evidence or None
+
+
+def _admission_evidence(raw) -> dict | None:
+    """The order's own persisted buy-path admission decision, when one exists.
+
+    The linkage is exact by construction: this is the named order's own column,
+    never a lookup by account/code/time. Rows written by the frozen-entry
+    waitlist path carry no decision snapshot and are reported as absent rather
+    than reconstructed.
+    """
+    payload = _json_mapping(raw, label="active_risk_payload")
+    snapshot = payload.get("decision_snapshot")
+    final = snapshot.get("final") if isinstance(snapshot, Mapping) else None
+    if not isinstance(final, Mapping) or not str(final.get("decision") or "").strip():
+        return None
+    gates = {name: dict(payload[name])
+             for name in ("chase_entry", "three_day_timing_gate",
+                          "entry_price_gate", "execution_dispatch")
+             if isinstance(payload.get(name), Mapping)}
+    return {
+        "source": "risk_payload.decision_snapshot.final",
+        "decision": str(final.get("decision")),
+        "reason": final.get("reason"),
+        # Named so it can never be mistaken for a comparison-made score.
+        "admission_score": final.get("score"),
+        "gates": gates or None,
+    }
 
 
 def _signal_evidence(conn: sqlite3.Connection, signal_id) -> dict | None:
@@ -135,6 +164,7 @@ def load_active_comparison_evidence(
             fees=values.get("fees"),
             realized_pnl=values.get("realized_pnl"),
             signal_evidence=_signal_evidence(conn, values.get("signal_id")),
+            admission_evidence=_admission_evidence(values.get("risk_payload")),
             execution_evidence=_execution_evidence(values.get("execution_evidence")),
         ))
     return SC.ActiveComparisonEvidence.build(orders)
@@ -143,11 +173,20 @@ def load_active_comparison_evidence(
 def build_and_append_comparison(
         conn: sqlite3.Connection, *, spec: SC.ComparisonSpec,
 ) -> SC.ShadowComparisonReport:
-    """Read the named evidence, build one report, append it idempotently."""
+    """Read the named evidence, build one report, append it idempotently.
+
+    The declared `active_evidence_id` is checked against the fingerprint of the
+    exact projection just loaded. `paper_orders` rows are updated in place as
+    execution progresses, so order ids alone are not an evidence identity: a
+    drifted row is a different comparison and fails closed here instead of being
+    accepted as the same one.
+    """
     shadow_run = SRR.get_run(conn, spec.shadow_run_id)
     if shadow_run is None:
         raise SC.ShadowComparisonError("explicit_shadow_run_unavailable")
     active_evidence = load_active_comparison_evidence(conn, spec)
+    if active_evidence.source_fingerprint != spec.active_evidence_id:
+        raise SC.ShadowComparisonError("active_evidence_fingerprint_mismatch")
     report = SC.build_shadow_comparison(
         spec=spec, active_evidence=active_evidence, shadow_run=shadow_run,
     )
