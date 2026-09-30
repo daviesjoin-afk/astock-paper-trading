@@ -1875,6 +1875,8 @@ def init_db():
                 # R32-C（v24）：既有账本同样要走这条快路径补建 ShadowRun 证据表，
                 # 否则升级后的库永远没有 shadow_runs（Shadow 运行只能 fail closed）。
                 PSM.ensure_shadow_runs_table(conn)
+                # R32-D（v25）：同理，既有账本走快路径时也必须补建比对报告表。
+                PSM.ensure_shadow_comparison_reports(conn)
                 _ensure_accounts(conn)
                 _ensure_user_strategy_accounts(conn)
                 _ensure_cycle(conn)
@@ -2177,6 +2179,8 @@ def init_db():
         PSM.ensure_position_risk_state(conn)
         PSM.ensure_risk_scan_run_state(conn)  # R16 v21（DDL 只在 migration）
         PSM.ensure_shadow_runs_table(conn)  # R32-C v24（DDL 只在 paper_schema_migrations）
+        # R32-D v25：比对报告表（DDL 同样只在 paper_schema_migrations）。
+        PSM.ensure_shadow_comparison_reports(conn)
         _ensure_accounts(conn)
         _ensure_user_strategy_accounts(conn)
         _ensure_cycle(conn)

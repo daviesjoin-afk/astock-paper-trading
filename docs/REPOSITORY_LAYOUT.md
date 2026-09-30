@@ -56,12 +56,15 @@ Dockerfile          应用镜像；docker-compose*.yml 本地与服务器编排
   `user_strategy_participation`（用户策略接入生产链路）
 - **订单意图与执行**：`order_intent`（意图契约，拒绝数量越权）、`execution_planner`
   （中央计划/复核/落库）、`execution_dispatch`
-- **可比较与 Shadow 运行时（R32-A/B COMPLETE，R32-C IN REVIEW）**：
+- **可比较与 Shadow 运行时（R32-A/B/C COMPLETE，R32-D IN REVIEW）**：
   `market_data_contract.snapshot_fingerprint()` 拥有 Market Snapshot identity；
   `simulation_runtime_context` 冻结 Active exact facts；`shadow_runtime` 拥有环境身份与
   reference state 纯转移；`shadow_run_service` 按 exact stamp 解析 owner 并执行；
   `shadow_run_repository` 只读写显式 ID 的
   append-only ShadowRun evidence，不提供 latest continuation 查询。
+  R32-D 另加三个模块：`shadow_comparison`（纯 domain/report contract，不碰 DB/时钟/provider）、
+  `shadow_comparison_repository`（只按显式 report ID 幂等追加/读取 `shadow_comparison_reports`）、
+  `shadow_comparison_service`（按显式 ID 加载 Active 与 ShadowRun 证据并编排）。
 - **执行真实性证据**：`execution_evidence`（三态成交证据契约）、`execution_lifecycle`
   （成交状态机与非法跳转拒绝）、`execution_outcome`（`selection_executable` ×
   `execution_verified` 连接与收益分层）

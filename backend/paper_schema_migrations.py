@@ -1108,3 +1108,86 @@ def ensure_shadow_runs_table(conn):
            BEGIN SELECT RAISE(ABORT,'shadow runs are append-only'); END"""
     )
     return changes
+
+
+# ─── Active/Challenger 比对证据（v25 / R32-D） ────────────────────────────────
+#
+# 不变量::
+#
+#     shadow_comparison_reports = Active/Challenger 比对事实的唯一追加式 owner
+#     shadow_runs               = Challenger 运行证据 owner；比对不回填其字段
+#     paper_*                   = 正式账本；比对路径绝不写入其中任何一张表
+#
+# 刻意只建**一张**报告表：不建立 comparison_signal / comparison_execution /
+# comparison_risk / comparison_performance 这类平行 authority 表。signal /
+# decision / execution / risk / turnover / performance 都是同一份 canonical
+# report envelope 的字段，派生展示必须从该 envelope 重建。
+#
+# 身份：``report_id`` 是对 canonical report material 的 SHA-256，因此
+# ``report_id == report_fingerprint``（CHECK 强制）；``PRIMARY KEY(report_id)`` +
+# ``UNIQUE(report_fingerprint)`` 让重复追加成为幂等 no-op，而不是第二条逻辑重复行。
+# ``created_at`` 只是写入时刻，永不参与任何决策。
+#
+# 对 ``shadow_runs`` 刻意**不建**外键：比对只引用 exact run identity，且两侧都是
+# append-only 证据；外键会在 ``PRAGMA foreign_keys`` 关闭的路径上退化成装饰，
+# 真正的绑定由 service 按显式 run id 读取 + builder 的 identity 校验承担。
+
+
+def shadow_comparison_report_ddl(table="shadow_comparison_reports"):
+    """``shadow_comparison_reports`` 的规范 DDL（migration 与 ``init_db`` 共用）。"""
+    return f"""
+        CREATE TABLE IF NOT EXISTS {table}(
+            report_id TEXT PRIMARY KEY CHECK(length(report_id)=64),
+            report_fingerprint TEXT NOT NULL UNIQUE CHECK(length(report_fingerprint)=64),
+            shadow_run_id TEXT NOT NULL CHECK(length(shadow_run_id)=64),
+            shadow_run_fingerprint TEXT NOT NULL CHECK(length(shadow_run_fingerprint)=64),
+            active_strategy_id TEXT NOT NULL,
+            active_strategy_version INTEGER NOT NULL CHECK(active_strategy_version>0),
+            active_strategy_checksum TEXT NOT NULL CHECK(length(active_strategy_checksum)=64),
+            challenger_strategy_id TEXT NOT NULL,
+            challenger_strategy_version INTEGER NOT NULL CHECK(challenger_strategy_version>0),
+            challenger_strategy_checksum TEXT NOT NULL CHECK(length(challenger_strategy_checksum)=64),
+            environment_fingerprint TEXT NOT NULL CHECK(length(environment_fingerprint)=64),
+            session_date TEXT NOT NULL,
+            decision_at TEXT NOT NULL,
+            availability TEXT NOT NULL CHECK(availability IN ('AVAILABLE','PARTIAL','UNAVAILABLE')),
+            coverage_ratio REAL NOT NULL CHECK(coverage_ratio>=0 AND coverage_ratio<=1),
+            evidence_json TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            CHECK(report_id=report_fingerprint)
+        )
+    """
+
+
+def ensure_shadow_comparison_reports(conn):
+    """v25：建比对报告追加表 + 索引 + append-only guard（幂等、不回填）。
+
+    既有账本走 ``init_db`` 快路径时也必须执行本函数，否则升级后的线上库永远没有
+    ``shadow_comparison_reports``，比对只能 fail closed。本函数只创建自己的表，
+    不 INSERT、不 UPDATE 任何正式账本，也不触碰 ``shadow_runs``。
+    """
+    changes = {}
+    if not table_columns(conn, "shadow_comparison_reports"):
+        conn.execute(shadow_comparison_report_ddl("shadow_comparison_reports"))
+        changes["shadow_comparison_reports"] = "created"
+    else:
+        changes["shadow_comparison_reports"] = "ok"
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_shadow_comparison_reports_run"
+        " ON shadow_comparison_reports(shadow_run_id)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_shadow_comparison_reports_scope"
+        " ON shadow_comparison_reports(environment_fingerprint,session_date,decision_at)"
+    )
+    conn.execute(
+        """CREATE TRIGGER IF NOT EXISTS shadow_comparison_reports_no_update
+           BEFORE UPDATE ON shadow_comparison_reports
+           BEGIN SELECT RAISE(ABORT,'shadow comparison reports are append-only'); END"""
+    )
+    conn.execute(
+        """CREATE TRIGGER IF NOT EXISTS shadow_comparison_reports_no_delete
+           BEFORE DELETE ON shadow_comparison_reports
+           BEGIN SELECT RAISE(ABORT,'shadow comparison reports are append-only'); END"""
+    )
+    return changes

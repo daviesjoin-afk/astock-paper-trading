@@ -63,7 +63,7 @@ research → validation_failed
 | --- | --- | --- |
 | `draft` / `candidate` / `research` | 编辑、候选和研究阶段，不进入正式新周期 | 由显式 transition table 决定 |
 | `validated` | exact version 已通过 R29 PIT/OOS validation | `shadow`，或安全迁移 |
-| `shadow` | exact version 已通过 R29+R30 promotion policy；R32-C 提供隔离式 Challenger run evidence | `paper` 仍由 R31 Promotion Policy 判定；R32-C 不做晋级 |
+| `shadow` | exact version 已通过 R29+R30 promotion policy；R32-C 提供隔离式 Challenger run evidence，R32-D 提供 Active/Challenger 比对证据 | `paper` 仍由 R31 Promotion Policy 判定；R32-C/D 都不做晋级 |
 | `paper` | 可进入新的 paper simulation 周期 | `production_sim` 暂因下游 runtime evidence owner 缺失而 blocked，也可安全降级/暂停/退休 |
 | `production_sim` | 当前最高正式模拟运行级别 | 安全降级、暂停或退休 |
 | `degraded` / `paused` | 禁止新正式周期；保留版本与历史 | 暂停或退休 |
@@ -86,7 +86,7 @@ research → validation_failed
 
 ### R32 阶段状态与可比较运行上下文
 
-R31、R32-A（Comparable Runtime Context）、R32-B（Active Comparable Evidence Closure）已完成；R32-C（Isolated Shadow Runtime）正在审核；R32-D、R32-E、R33 **NOT STARTED**。Shadow 使用与 Active capture 对齐的 market、quote、tradability、factor fingerprints 和显式 decision instant，同时保留各自 exact strategy identity 与策略专属状态；它只追加写 ShadowRun evidence，不写正式账本。完整契约见 [`R32_COMPARABLE_RUNTIME_CONTEXT.md`](R32_COMPARABLE_RUNTIME_CONTEXT.md)、[`R32B_ACTIVE_COMPARABLE_EVIDENCE.md`](R32B_ACTIVE_COMPARABLE_EVIDENCE.md) 和 [`R32C_ISOLATED_SHADOW_RUNTIME.md`](R32C_ISOLATED_SHADOW_RUNTIME.md)。
+R31、R32-A（Comparable Runtime Context）、R32-B（Active Comparable Evidence Closure）、R32-C（Isolated Shadow Runtime）已完成；R32-D（Active/Challenger Comparison Evidence）正在审核；R32-E、R33 **NOT STARTED**。Shadow 使用与 Active capture 对齐的 market、quote、tradability、factor fingerprints 和显式 decision instant，同时保留各自 exact strategy identity 与策略专属状态；它只追加写 ShadowRun evidence，不写正式账本。R32-D 只从一份 exact Active evidence、一条 exact ShadowRun 和一份显式 spec 生成不可变比对报告（共享环境七维相等是硬前提，缺失即 UNAVAILABLE/PARTIAL，不查 latest/current），报告只陈述事实与 delta，不产生 winner、综合分或晋级结论。完整契约见 [`R32_COMPARABLE_RUNTIME_CONTEXT.md`](R32_COMPARABLE_RUNTIME_CONTEXT.md)、[`R32B_ACTIVE_COMPARABLE_EVIDENCE.md`](R32B_ACTIVE_COMPARABLE_EVIDENCE.md)、[`R32C_ISOLATED_SHADOW_RUNTIME.md`](R32C_ISOLATED_SHADOW_RUNTIME.md) 和 [`R32D_CHALLENGER_COMPARISON_EVIDENCE.md`](R32D_CHALLENGER_COMPARISON_EVIDENCE.md)。
 
 就绪后，所有消费者读同一份不可变契约 `StrategyRuntimeContext`（`strategy_runtime.StrategyRuntimeContext`）：
 

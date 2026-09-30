@@ -81,7 +81,7 @@
 
 阶段状态：R32-A **COMPLETE**；R32-B **COMPLETE（PR #217 MERGED）**。
 
-## R32-C 隔离式 Shadow Runtime（IN REVIEW）
+## R32-C 隔离式 Shadow Runtime（COMPLETE，PR #218 MERGED）
 
 | 场景 / 契约 | 实现位置 | 回归用例 | 状态 |
 | --- | --- | --- | --- |
@@ -107,7 +107,29 @@
 | ShadowRun DDL 单一事实来源；migration v24 与 `init_db` 两条路径调用同一函数，既有账本升级后表与 append-only guard 齐备 | `paper_schema_migrations.ensure_shadow_runs_table`、`paper_trading.init_db` | `test_shadow_runtime.py`（v24 DDL owner、existing ledger init_db） | ✅ |
 | 语义 mutation（canonical order、provider、环境、账本、prior run、lifecycle、wall clock、reference cash、T+1 rollover、typed evidence、共享环境维度比较、candidate 唯一性、证据输入、frozen entry policy） | `work/r32c_shadow_runtime_mutation_check.py` | 16/16 DETECTED，restore SHA256 PASS | ✅ |
 
-阶段状态：R32-A/B **COMPLETE**；R32-C **IN REVIEW**；R32-D/E、R33 **NOT STARTED**。
+阶段状态：R32-A/B/C **COMPLETE**（R32-C = PR #218 MERGED）；R32-D **IN REVIEW**；R32-E、R33 **NOT STARTED**。
+
+## R32-D Active/Challenger 比对证据（IN REVIEW）
+
+| 场景 / 契约 | 实现位置 | 回归用例 | 状态 |
+| --- | --- | --- | --- |
+| 同一份 exact Active evidence + 同一 ShadowRun + 同一 spec 得到同一报告与同一 fingerprint；declared scope 顺序不影响 identity | `shadow_comparison.build_shadow_comparison` | `test_shadow_comparison.py`（D1） | ✅ |
+| report fingerprint 覆盖 exact Active evidence identity 与 exact ShadowRun identity：任一改变即改变 report identity | `shadow_comparison.build_shadow_comparison` | `test_shadow_comparison.py`（D1b） | ✅ |
+| 七个共享环境维度（session、decision instant、market policy、market snapshot、quote、tradability、execution ruleset）逐维相等是硬前提；任一维不同 → UNAVAILABLE + `environment_mismatch`，且不计算任何 delta | `shadow_comparison.build_shadow_comparison` | `test_shadow_comparison.py`（D2 逐维） | ✅ |
+| 不用 `ComparableRuntimeContext.context_fingerprint` 全等做比较判据；两腿策略专属差异是正常的 | `shadow_comparison._environment_identity` | `test_shadow_comparison.py`（D2/D1） | ✅ |
+| Active runtime context 不可用时不重建：报告 UNAVAILABLE + 稳定 reason，coverage 0.0 | `shadow_comparison_service`、`shadow_comparison._active_leg_reasons` | `test_shadow_comparison.py`（D3） | ✅ |
+| 缺失 observation 记 `MISSING`，绝不等同 false / rejected / zero；不按 DB row order 决定顺序 | `shadow_comparison._observation_comparison` | `test_shadow_comparison.py`（D4） | ✅ |
+| coverage 分母恒为显式 expected：expected=4 / available=2 / missing=2 → 0.5，缺失不会被过滤成 1.0 | `shadow_comparison._coverage` | `test_shadow_comparison.py`（D5、D4） | ✅ |
+| 从 exact evidence 重放：改变 current 策略表、`policy_for`、现行行情与 DB 路径后 fingerprint 不变；显式 ID 缺失时 fail closed，不回退"最新一条" | `shadow_comparison_service`、`shadow_run_repository.get_run` | `test_shadow_comparison.py`（D6、D7b） | ✅ |
+| 纯层不打开 DB、不读 provider/cache/archive、不取机器时间、不存在 latest/current/head/find 入口 | `shadow_comparison`（结构证明） | `test_shadow_comparison.py`（D7） | ✅ |
+| declared risk identity 必须标 `DECLARED`，绝不提升为 owner-verified；entry policy 标 `OWNER_ISSUED`；报告内不出现 `OWNER_VERIFIED` | `shadow_comparison._provenance_map`、`_risk_dimension` | `test_shadow_comparison.py`（D8） | ✅ |
+| Performance 只用同一 frozen environment 的 quote 估值；缺 exact 持仓估值 → UNAVAILABLE，不读 latest quote；drawdown 恒 UNAVAILABLE | `shadow_comparison._performance` | `test_shadow_comparison.py`（D9、D9b） | ✅ |
+| Turnover：Active normalized 因缺同语义分母恒 UNAVAILABLE（不读 current NAV）；Shadow 分母 = `ShadowRunSpec.reference_capital` | `shadow_comparison._turnover` | `test_shadow_comparison.py`（D1/D11） | ✅ |
+| report 追加幂等（重复追加 row=1 且内容一致）；内容篡改即指纹不符报错；UPDATE/DELETE 被 append-only guard 拒绝 | `shadow_comparison_repository`、migration v25 | `test_shadow_comparison.py`（D10） | ✅ |
+| 比对前后正式账本与 `shadow_runs` 逐字节不变；只新增一条 `shadow_comparison_reports` | `shadow_comparison_service.build_and_append_comparison` | `test_shadow_comparison.py`（D11） | ✅ |
+| 报告不含 winner / promote / overall score / ranking 等业务结论字段 | `shadow_comparison.ShadowComparisonReport` | `test_shadow_comparison.py`（D12，字段级黑名单 + 文本扫描） | ✅ |
+| 比对报告 DDL 单一事实来源（`paper_schema_migrations.ensure_shadow_comparison_reports`）；migration v25 与 `init_db` 两条路径调用同一函数 | `paper_schema_migrations`、`db_migrate`、`paper_trading.init_db` | `test_shadow_comparison.py`（v25 DDL owner、existing ledger init_db） | ✅ |
+| 语义 mutation M-D1–M-D8（环境相等、缺失即 false、coverage 失真、latest 回退、指纹丢证据身份、declared→verified、缺估值不 fail closed） | `work/r32d_shadow_comparison_mutation_check.py` | 8/8 DETECTED，restore SHA256 PASS | ✅ |
 | 策略产品线端到端（内置模板 + 用户策略同链路） | — | `test_strategy_product_line_e2e.py` | ✅ |
 | 风险收紧（画像只能更严，系统键不可触碰） | `strategy_risk_enforcement.py` | `test_strategy_risk_enforcement.py`、`test_asymmetric_risk_gate_wiring.py` | ✅ |
 
