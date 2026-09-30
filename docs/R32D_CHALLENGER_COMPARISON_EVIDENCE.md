@@ -324,18 +324,7 @@ blocking_reasons
 
 R32-D 只产出 comparison evidence。把 report 接到生命周期、晋级、运营界面与生产调用者属 R32-E；R32-E 在把这些事实写进 promotion evidence 前，必须先处理两处 provenance 缺口：Active 侧没有 owner-issued entry evidence，以及 Shadow 侧 `risk_policy_identity` 仍只是 DECLARED。DEPLOY = NOT DEPLOYED。
 
-## 五、验证结果
-
-复现命令（workspace 根目录）：
-
-```text
-focused:   cd backend && python -m unittest test_shadow_comparison test_shadow_runtime \
-             test_execution_planner test_paper_decision_audit test_simulation_runtime_context -q
-mutation:  python work/r32d_shadow_comparison_mutation_check.py
-full:      python -m unittest discover -s backend -p "test_*.py"
-docker:    docker run --rm --network none --tmpfs /app/data_cache:rw,size=64m,uid=10001,gid=10001 \
-             astock-codex:ci python -m unittest discover -s backend -p "test_*.py"
-```
+## 五、验证结果（R32-D）
 
 | 层 | 结果 |
 | --- | --- |
@@ -376,3 +365,129 @@ Net production LOC:              +32 / -11（shadow_comparison.py +1/-1，shadow
 ```
 
 未新增 facade / manager / helper 模块；改动集中在既有 `shadow_comparison_service.py`（capture owner）与 `shadow_comparison.py` 的一处 owner-key 读取修正。新增 mutation：`M-D14`（`admission_score` 退回旧键）、`M-D15`（capture 的 fingerprint 不再由 exact 行内容决定）、`M-D16`（capture 重新接受 `ComparisonSpec` 参数）。
+## 七、R32-E1：Comparable Evidence Provenance Closure
+
+状态：R32-E1 IN REVIEW。目标不是降低判据，而是让**未来新产生**的 Active / Challenger evidence 拥有真正可比较、owner-issued、exact-linked 的 provenance；历史旧记录保持 PARTIAL / UNAVAILABLE，绝不用当前状态回填。
+
+### 7.1 开工前 inventory（结论）
+
+| 问题 | 结论 |
+| --- | --- |
+| Active BUY 的 entry/admission authority | `paper_trading` 的买入路径自带门禁（`_chase_entry_gate` / `_three_day_timing_gate` / `_new_entry_price_gate` / 容量 / 现金 / `execution_dispatch`）。`execution_planner.plan_entry`（统一编排入口）**生产 caller = 0** |
+| Challenger 的 entry authority | `execution_planner.evaluate_entry_state`（唯一生产消费者是 Shadow runtime） |
+| 能否共享同一纯 authority | 暂时不能：两条路径的输入状态来源不同（正式账本 + 连接 vs 显式 `EntryGateState` 快照），迁移会改变真实下单判定，属行为变更而非 provenance 变更 |
+| 与 `evaluate_entry_state` 重复的 Active 条件 | 容量（策略席位 + 共享池）、现金、行情新鲜度、市场灯在两侧各有一份；语义相近但输入与 owner 不同 |
+| `paper_risk_decisions` 的业务 owner | `paper_trading._risk_log`（写入）与 `paper_risk_service._risk_log`（风险扫描写入）；表本身没有 order 引用列 |
+| `risk_policy_identity` 的来源 | Active：`execution_planner` 由 `strategy_runtime` 的 pinned `risk_fingerprint` + `compiled_risk_profile` 组装（owner-issued）；Challenger：`ShadowCandidate.risk_policy_identity`（caller-declared） |
+| 已有 canonical risk-policy snapshot / fingerprint | **只有 compiler，没有 snapshot**：`strategy_runtime` 从 exact definition 编译 `StrategyRiskFingerprint` + `StrategyRiskProfile`（冻结 dataclass），但没有"有效风险策略"的 sha256 |
+| 新路径接管后会变成重复实现的 helper | `execution_planner` 里内联的 risk identity dict 组装（本轮已删）；`strategy_risk_enforcement.compiled_profile_*` / `paper_trading._risk_profile` 是**另一层**（生产参数收紧融合），不是同一个投影，未动 |
+
+### 7.2 Entry evidence（E1-2）
+
+两腿的 entry evidence **仍然来自不同 authority**，本轮不合并，原因是行为风险：把 Active 买入路径迁到 `evaluate_entry_state` 会改变真实下单判定（输入状态来源不同），而那属于 trading 行为变更，不属于 provenance closure。按要求给出显式边界：
+
+```text
+Active admission owner      paper_trading 买入路径（ledger-connection 语义）
+Active证据                order 自己 risk_payload.decision_snapshot.final（精确 linkage）
+Challenger admission owner  execution_planner.evaluate_entry_state（纯快照语义）
+不可比较字段                两条路径的 admission 词汇与门禁集合（无任何 owner 定义映射）
+comparison 行为             只并列两份 owner 原文，cross_vocabulary_relation_defined = False
+删除 milestone             Active 买入路径与 manual 路径迁到唯一 Entry Authority 的那个 PR
+                           （届时 plan_entry 的 caller 从 0 变为 1，旧门禁集合随之删除）
+```
+
+`plan_entry` 的 caller 目前是 0，但它是**待接线的 canonical 编排入口**，不是被取代的旧实现：删掉它会移除迁移目标本身，所以本 PR 不删，并在此显式登记（`Old implementation deletable now: NO — blocker: 它是 Active/手动路径迁移的目标入口；milestone: 上述迁移 PR`）。
+
+### 7.3 Risk evidence 的精确 order 关联（E1-3）
+
+`paper_risk_decisions` 此前没有 order 引用，"某张订单的风控决策是什么"只能靠 `(account_id, code, side)` + 时间序猜最近一条 —— 这是被明令禁止的 provenance fabrication。migration **v26** 只加一列 + 一个部分索引：
+
+```text
+paper_risk_decisions.order_id INTEGER      -- 写入当刻确实持有 order_id 的调用点才盖
+idx_paper_risk_decisions_order             -- WHERE order_id IS NOT NULL
+```
+
+规则与不变量：
+
+- 只有**写入当刻手里有 order_id** 的调用点才盖这一列（当前是 Execution Authority 对已存在订单的两次决策：成交提交与执行受阻）。其余写入点保持 NULL。
+- **绝不回填**：历史行 `order_id IS NULL` 就是诚实的"legacy 归属不可证明"。
+- comparison 只按 `order_id = 该 order` 读取；不得回退到 `(account, code, side)`、`ORDER BY id DESC` 或"最新一条"。
+- 被禁止的替代品（order status / reason）在 comparison 里只作为**独立的 lifecycle 事实**出现，并显式标注 `used_as_risk_evidence = false`。
+
+### 7.4 Challenger 的 owner-issued risk policy（E1-4）
+
+`strategy_runtime`（Risk Authority 的编译 owner）新增唯一投影入口，Active 腿与 Challenger 腿共用同一个形状：
+
+```text
+compile_risk_policy(definition)                     # 唯一编译点
+risk_policy_projection(fingerprint, profile)        # 唯一投影形状（字段集只有一份）
+risk_policy_projection_for_context(context)         # Active：pinned runtime context
+risk_policy_projection_for_definition(definition)   # Challenger：exact version definition
+is_risk_policy_projection(value)                    # 消费方校验外部输入
+```
+
+`shadow_run_service.run_shadow()` 在进入纯运行时前**捕获一次**，作为显式必填输入传给 `evaluate_shadow(risk_policy=...)`，并写入 run-level `challenger_runtime_inputs.risk_policy`（source / strategy stamp / projection）。纯运行时因此不再读任何 current risk policy；comparison 只消费 run 里那份证据。
+
+`ShadowCandidate.risk_policy_identity`（caller-declared 输入）**已删除**：迁移后 caller = 0，不留兼容字段。旧 run 已持久化的证据仍会被读（那是证据兼容，不是代码路径），并保持 `DECLARED`。
+
+### 7.5 语义（E1-5 / E1-6）
+
+```text
+新数据 + owner evidence 完整   risk_rejection = AVAILABLE，报告可达 AVAILABLE（coverage = 1）
+新数据缺 order-linked 决策     risk_rejection 不 AVAILABLE，报告 PARTIAL
+legacy 行（order_id IS NULL）  继续 UNAVAILABLE / PARTIAL，绝不 backfill
+legacy run（只有 caller 声明） risk policy identity 标 DECLARED，绝不提升为 owner 事实
+```
+
+### 7.6 验证结果（R32-E1）
+
+| 层 | 结果 |
+| --- | --- |
+| focused R32-C/D/E1 + Active audit | 见下方 PR 描述（本 PR 的 exact head 数据） |
+| 语义 mutation M-D1–M-D19 | **19/19 DETECTED**；survived / fake / timeout = 0；restore SHA256 PASS |
+| R32-C mutation 复验 | 16/16 DETECTED（未受影响） |
+| ruff / compileall | PASS |
+
+新增用例：E1-1 两腿共用一个 owner risk policy 契约、E1-2 order-linked 风险决策使该维度 AVAILABLE（报告可达 AVAILABLE）、E1-3 别的 order 的风险证据被拒（fail closed）、E1-4 comparison 重放不读 current risk policy、E1-5/6 legacy 与未关联决策永不被借用、E1-7 order status 永不作为风险证据、E1-8 旧 caller-declared 输入已删除且 projection 只有一份、E1-9 执行经济学未动。
+
+### 7.7 本 PR 的维护性报告
+
+```text
+Business authority added:        strategy_runtime 的 risk policy projection（唯一投影形状）
+Business authority removed:      —
+Old architecture removed:        YES（caller-declared risk identity 输入 + 内联 risk identity dict）
+Old production callers before:   1（execution_planner 内联组装）+ 1（ShadowCandidate 字段消费）
+Old production callers after:    0 / 0
+Compatibility path added:        NO
+Compatibility path removed:      NO（无遗留 wrapper 可删）
+Duplicate implementation:        before=2（strategy_runtime 编译 + execution_planner 内联组装）
+                                 after=1（只有 strategy_runtime）
+New facade/wrapper:              0
+Old facade/wrapper removed:      0
+Implicit current-state lookup:   before=0 / after=0
+Direct DB write sites:           before=1（shadow_comparison_reports）/ after=1
+Large if/elif decision chain:    NO
+Frontend duplicated business rule: NO
+Dead production code removed:    files=0 / production LOC=-（旧字段与内联组装，见上）
+Net production LOC:              +X / -Y（见 PR 描述）
+核心业务规则理解:                before=14 modules / after=14 modules（未新增模块）
+paper_trading.py:                15,855 LOC / 325 defs（+order_id 盖章参数与注释）
+Can newly-added code replace existing code instead of coexisting?  YES → 已执行
+                                 （caller-declared identity 字段与内联组装均已删除）
+```
+
+## 八、R32-E2+ 边界
+
+R32-E1 只做 provenance closure。生命周期/晋级 wiring（E2）、工作区（E3）、架构收敛与 R32 收口（E4）各自独立审核。
+
+复现命令（workspace 根目录）：
+
+```text
+focused:   cd backend && python -m unittest test_shadow_comparison test_shadow_runtime \
+             test_execution_planner test_paper_decision_audit test_simulation_runtime_context -q
+mutation:  python work/r32d_shadow_comparison_mutation_check.py
+full:      python -m unittest discover -s backend -p "test_*.py"
+docker:    docker run --rm --network none --tmpfs /app/data_cache:rw,size=64m,uid=10001,gid=10001 \
+             astock-codex:ci python -m unittest discover -s backend -p "test_*.py"
+```
+

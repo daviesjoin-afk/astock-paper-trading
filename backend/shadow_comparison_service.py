@@ -60,6 +60,28 @@ def _execution_evidence(raw) -> dict | None:
     return evidence or None
 
 
+def _risk_decision_evidence(conn: sqlite3.Connection, order_id: int) -> tuple:
+    """Risk decisions exactly linked to one order, or none at all.
+
+    The linkage is the `paper_risk_decisions.order_id` column written by the
+    caller that already held the order id. There is deliberately no fallback to
+    `(account, code, side)` or "the latest decision": a decision that is not
+    linked to this row is not evidence for this row.
+    """
+    rows = conn.execute(
+        "SELECT id,decision,reason,created_at FROM paper_risk_decisions"
+        " WHERE order_id=? ORDER BY id",
+        (int(order_id),),
+    ).fetchall()
+    return tuple({
+        "risk_decision_id": int(row[0]),
+        "order_id": int(order_id),
+        "decision": str(row[1]),
+        "reason": row[2],
+        "created_at": row[3],
+    } for row in rows)
+
+
 def _admission_evidence(raw) -> dict | None:
     """The order's own persisted buy-path admission decision, when one exists.
 
@@ -178,6 +200,7 @@ def capture_active_comparison_evidence(
             signal_evidence=_signal_evidence(conn, values.get("signal_id")),
             admission_evidence=_admission_evidence(values.get("risk_payload")),
             execution_evidence=_execution_evidence(values.get("execution_evidence")),
+            risk_decision_evidence=_risk_decision_evidence(conn, int(values["id"])),
         ))
     return SC.ActiveComparisonEvidence.build(orders)
 

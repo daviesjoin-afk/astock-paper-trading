@@ -74,9 +74,11 @@ MUTATIONS = [
     # M-D7：caller-declared risk identity 被提升成 owner 事实。
     (
         "backend/shadow_comparison.py",
-        '        "challenger.risk_policy_identity": EvidenceProvenance.DECLARED.value,\n',
-        '        "challenger.risk_policy_identity": EvidenceProvenance.OWNER_ISSUED.value,\n',
-        "test_shadow_comparison.ShadowComparisonTests.test_d8_declared_risk_identity_is_never_promoted_to_verified",
+        '            challenger_payload["risk_policy_identity_provenance"] = (\n'
+        '                EvidenceProvenance.DECLARED.value if declared is not None\n'
+        '                else declared_provenance)\n',
+        '            challenger_payload["risk_policy_identity_provenance"] = declared_provenance\n',
+        "test_shadow_comparison.ShadowComparisonTests.test_d8b_legacy_run_risk_identity_stays_declared",
     ),
     # M-D8：缺 exact 估值时不再 fail closed，而是用能找到的价格继续算。
     (
@@ -124,13 +126,11 @@ MUTATIONS = [
     # M-D13：order lifecycle status 被升级成 Active risk evidence。
     (
         "backend/shadow_comparison.py",
-        '        active_payload = {\n'
-        '            "risk_rejection_evidence": None,\n'
-        '            "risk_rejection_availability": EvidenceProvenance.UNAVAILABLE.value,\n',
-        '        active_payload = {\n'
-        '            "risk_rejection_evidence": {"order_status": active.order_status},\n'
-        '            "risk_rejection_availability": EvidenceProvenance.OWNER_ISSUED.value,\n',
-        "test_shadow_comparison.ShadowComparisonTests.test_d17_order_status_is_not_risk_authority_evidence",
+        '        decisions = tuple(active.risk_decision_evidence or ())\n',
+        '        decisions = ({"risk_decision_id": 0, "order_id": active.order_id,\n'
+        '                      "decision": active.order_status,\n'
+        '                      "reason": active.order_reason},)\n',
+        "test_shadow_comparison.ShadowComparisonTests.test_e1_7_order_status_is_never_risk_evidence",
     ),
     # M-D14：admission_score 退回旧键（owner projection 已不再有裸 score 键）。
     (
@@ -158,6 +158,40 @@ MUTATIONS = [
         '        comparison_spec: SC.ComparisonSpec | None = None,\n'
         ') -> SC.ActiveComparisonEvidence:\n',
         "test_shadow_comparison.ShadowComparisonTests.test_d20_active_capture_depends_only_on_explicit_order_ids",
+    ),
+    # M-D17：风险证据改用 (account, code, side) 猜最近一条，而不是精确 order 关联。
+    (
+        "backend/shadow_comparison_service.py",
+        '    rows = conn.execute(\n'
+        '        "SELECT id,decision,reason,created_at FROM paper_risk_decisions"\n'
+        '        " WHERE order_id=? ORDER BY id",\n'
+        '        (int(order_id),),\n'
+        '    ).fetchall()\n',
+        '    rows = conn.execute(\n'
+        '        "SELECT id,decision,reason,created_at FROM paper_risk_decisions"\n'
+        '        " WHERE account_id=(SELECT account_id FROM paper_orders WHERE id=?)"\n'
+        '        "   AND code=(SELECT code FROM paper_orders WHERE id=?)"\n'
+        '        "   AND side=(SELECT side FROM paper_orders WHERE id=?)"\n'
+        '        " ORDER BY id DESC LIMIT 1",\n'
+        '        (int(order_id), int(order_id), int(order_id)),\n'
+        '    ).fetchall()\n',
+        "test_shadow_comparison.ShadowComparisonTests.test_e1_5_6_legacy_and_unlinked_risk_decisions_are_never_borrowed",
+    ),
+    # M-D18：新 run 的 owner-issued risk policy identity 被丢弃（退回 legacy 分支）。
+    (
+        "backend/shadow_comparison.py",
+        '        owner_projection = owner_section.get("projection")\n',
+        '        owner_projection = None\n',
+        "test_shadow_comparison.ShadowComparisonTests.test_e1_1_both_legs_use_one_owner_risk_policy_contract",
+    ),
+    # M-D19：owner risk policy shape 校验被移除（任意 caller dict 都能当 owner 事实）。
+    (
+        "backend/shadow_runtime.py",
+        '    if not SRT.is_risk_policy_projection(risk_policy):\n'
+        '        raise ValueError("owner_risk_policy_projection_required")\n',
+        '    if False:\n'
+        '        raise ValueError("owner_risk_policy_projection_required")\n',
+        "test_shadow_comparison.ShadowComparisonTests.test_e1_8_superseded_risk_identity_input_is_deleted",
     ),
 ]
 

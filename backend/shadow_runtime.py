@@ -22,6 +22,7 @@ import simulation_runtime_context as SRC
 import signal_service as SIG
 import strategy_dsl as DSL
 import strategy_lifecycle as SL
+import strategy_runtime as SRT
 import tradability_archive as TA
 
 ENVIRONMENT_SCHEMA_VERSION = "comparable-environment-v1"
@@ -457,7 +458,6 @@ class ShadowCandidate:
     side: str
     desired_quantity: int
     entry_state: EP.EntryGateState
-    risk_policy_identity: Mapping[str, Any]
     reference_price: float | None = None
     order_type: str = "market"
 
@@ -469,9 +469,6 @@ class ShadowCandidate:
             raise ValueError("Shadow candidate quantity must be positive")
         if not isinstance(self.entry_state, EP.EntryGateState):
             raise TypeError("captured EntryGateState is required")
-        if not isinstance(self.risk_policy_identity, Mapping) or not self.risk_policy_identity:
-            raise ValueError("captured risk policy identity is required")
-        object.__setattr__(self, "risk_policy_identity", _freeze(dict(self.risk_policy_identity)))
 
 
 @dataclass(frozen=True, slots=True)
@@ -501,6 +498,7 @@ class ShadowRunEvidence:
 def evaluate_shadow(*, spec: ShadowRunSpec, environment: FrozenShadowEnvironment,
                     strategy_version: Any, lifecycle_state: str,
                     execution_policy: EP.ExecutionPolicySnapshot,
+                    risk_policy: Mapping[str, Any],
                     candidates: tuple[ShadowCandidate, ...],
                     previous_run: ShadowRunEvidence | None = None) -> ShadowRunEvidence:
     """Pure DSL Challenger evaluation over owner-resolved, explicit inputs.
@@ -509,6 +507,12 @@ def evaluate_shadow(*, spec: ShadowRunSpec, environment: FrozenShadowEnvironment
     service before this call. Every entry decision and every recorded policy
     identity reads that one object, so nothing here re-resolves the current
     ``ExecutionPolicy`` owner state and a replay cannot drift with it.
+
+    ``risk_policy`` is the Risk Authority's own projection of the exact
+    Challenger version's risk policy (``strategy_runtime`` compiles it from the
+    immutable definition). It is the only source of this run's risk policy
+    identity: the run never reads a current risk policy, and the projection has
+    exactly the same shape the Active leg records.
     """
     if spec.environment_fingerprint != environment.identity.environment_fingerprint:
         raise ShadowRuntimeError("NOT_COMPARABLE", "shadow_environment_not_comparable")
@@ -527,6 +531,8 @@ def evaluate_shadow(*, spec: ShadowRunSpec, environment: FrozenShadowEnvironment
         raise TypeError("frozen entry execution policy snapshot is required")
     if execution_policy.account_id != spec.challenger.strategy_id:
         raise ValueError("challenger_execution_policy_identity_mismatch")
+    if not SRT.is_risk_policy_projection(risk_policy):
+        raise ValueError("owner_risk_policy_projection_required")
     if not candidates:
         raise ValueError("shadow_candidates_required")
     if len({(row.symbol, row.side) for row in candidates}) != len(candidates):
@@ -561,7 +567,17 @@ def evaluate_shadow(*, spec: ShadowRunSpec, environment: FrozenShadowEnvironment
     quote_fingerprints = dict(environment.identity.symbol_quote_fingerprints)
     # Run-level evidence, recorded once: every candidate below consumed this exact
     # frozen owner policy, and its fingerprint explains the entry identity check.
-    challenger_runtime_inputs = {"entry_policy": execution_policy.projection()}
+    challenger_runtime_inputs = {
+        "entry_policy": execution_policy.projection(),
+        # The Risk Authority's own projection of the exact Challenger version.
+        "risk_policy": {
+            "source": "strategy_runtime.risk_policy_projection_for_definition",
+            "strategy_id": spec.challenger.strategy_id,
+            "strategy_version": spec.challenger.version,
+            "strategy_checksum": spec.challenger.checksum,
+            "projection": dict(risk_policy),
+        },
+    }
     decisions: list[dict[str, Any]] = []
     for candidate in sorted(candidates, key=lambda row: (row.symbol, row.side)):
         code = candidate.symbol
@@ -622,7 +638,7 @@ def evaluate_shadow(*, spec: ShadowRunSpec, environment: FrozenShadowEnvironment
                 tradability_evidence_fingerprints=dict(
                     environment.identity.tradability_evidence_fingerprints),
                 execution_ruleset_version=environment.identity.execution_ruleset_identity,
-                risk_policy_identity=candidate.risk_policy_identity,
+                risk_policy_identity=dict(risk_policy),
                 execution_state_fingerprint=EP.execution_state_fingerprint(execution_state),
                 entry_gate_state_fingerprint=entry_state_fingerprint,
                 entry_policy_fingerprint=entry_policy_fp,
@@ -692,7 +708,6 @@ def evaluate_shadow(*, spec: ShadowRunSpec, environment: FrozenShadowEnvironment
                 "reference_price": candidate.reference_price,
                 "order_type": candidate.order_type,
                 "entry_gate_state": _captured_entry_state_projection(candidate.entry_state),
-                "risk_policy_identity": _plain(candidate.risk_policy_identity),
             },
             "signal": signal.projection(),
             "entry": entry_result,

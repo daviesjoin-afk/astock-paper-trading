@@ -107,7 +107,21 @@
 | ShadowRun DDL 单一事实来源；migration v24 与 `init_db` 两条路径调用同一函数，既有账本升级后表与 append-only guard 齐备 | `paper_schema_migrations.ensure_shadow_runs_table`、`paper_trading.init_db` | `test_shadow_runtime.py`（v24 DDL owner、existing ledger init_db） | ✅ |
 | 语义 mutation（canonical order、provider、环境、账本、prior run、lifecycle、wall clock、reference cash、T+1 rollover、typed evidence、共享环境维度比较、candidate 唯一性、证据输入、frozen entry policy） | `work/r32c_shadow_runtime_mutation_check.py` | 16/16 DETECTED，restore SHA256 PASS | ✅ |
 
-阶段状态：R32-A/B/C **COMPLETE**（R32-C = PR #218 MERGED）；R32-D **IN REVIEW**；R32-E、R33 **NOT STARTED**。
+阶段状态：R32-A/B/C/D **COMPLETE**（R32-C = PR #218 MERGED，R32-D = PR #219 MERGED）；R32-E1 **IN REVIEW**；R32-E2～E4、R33 **NOT STARTED**。
+
+## R32-E1 Comparable Evidence Provenance Closure（IN REVIEW）
+
+| 场景 / 契约 | 实现位置 | 回归用例 | 状态 |
+| --- | --- | --- | --- |
+| Active 与 Challenger 的 risk policy identity 来自同一个 owner 投影形状（唯一编译点 + 唯一字段集），Challenger 侧标 `OWNER_ISSUED` 并带 exact strategy binding | `strategy_runtime.compile_risk_policy` / `risk_policy_projection*`、`shadow_run_service` | `test_shadow_comparison.py`（E1-1）、`test_shadow_runtime.py`（frozen entry policy 读回） | ✅ |
+| 风险决策有精确的 order 关联（`paper_risk_decisions.order_id`，migration v26，幂等且绝不回填）；关联存在时 risk_rejection 可 AVAILABLE，报告可达 AVAILABLE | `paper_schema_migrations.ensure_risk_decision_order_linkage`、`shadow_comparison_service._risk_decision_evidence` | `test_shadow_comparison.py`（E1-2、v26 DDL owner、existing ledger init_db） | ✅ |
+| 属于别的 order 的风险证据被拒（fail closed），并拒绝缺 order_id 的伪证据 | `shadow_comparison.ActiveOrderEvidence` | `test_shadow_comparison.py`（E1-3） | ✅ |
+| comparison 重放不读取 current risk policy（owner 编译器被 patch 成抛错仍能完成），run 里记录的就是决策消费的那一份 | `shadow_comparison.build_shadow_comparison`、`shadow_run_service` | `test_shadow_comparison.py`（E1-4） | ✅ |
+| legacy order（无 order 关联）与 legacy run（caller 自述 identity）保持 PARTIAL / UNAVAILABLE + `DECLARED`，绝不 backfill、绝不用 (account, code, side) 或"最新一条"借用 | `shadow_comparison._risk_dimension` | `test_shadow_comparison.py`（E1-5/6、D8b） | ✅ |
+| order lifecycle status/reason 永不作为风险证据（只作为独立 lifecycle 事实，并标注 `used_as_risk_evidence = false`） | `shadow_comparison._order_lifecycle` | `test_shadow_comparison.py`（E1-7、D17） | ✅ |
+| 旧的 caller-declared risk identity 输入与内联 projection 组装已删除（caller = 0）；owner risk policy shape 校验强制外部输入 | `strategy_runtime.is_risk_policy_projection`、`shadow_runtime.evaluate_shadow` | `test_shadow_comparison.py`（E1-8） | ✅ |
+| 执行经济学（滑点/费用/参与率/手数/T+1）未被本 PR 触碰 | `execution_planner`、`paper_trading_rules` | `test_shadow_comparison.py`（E1-9） | ✅ |
+| 语义 mutation M-D1–M-D19（含 order 关联被替换成 (account,code,side) 猜测、owner identity 被丢弃、owner shape 校验被移除） | `work/r32d_shadow_comparison_mutation_check.py` | 19/19 DETECTED，restore SHA256 PASS | ✅ |
 
 ## R32-D Active/Challenger 比对证据（IN REVIEW）
 

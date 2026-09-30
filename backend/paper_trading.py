@@ -1877,6 +1877,8 @@ def init_db():
                 PSM.ensure_shadow_runs_table(conn)
                 # R32-D（v25）：同理，既有账本走快路径时也必须补建比对报告表。
                 PSM.ensure_shadow_comparison_reports(conn)
+                # R32-E1（v26）：风险决策的精确 order 关联列（幂等、不回填）。
+                PSM.ensure_risk_decision_order_linkage(conn)
                 _ensure_accounts(conn)
                 _ensure_user_strategy_accounts(conn)
                 _ensure_cycle(conn)
@@ -2181,6 +2183,8 @@ def init_db():
         PSM.ensure_shadow_runs_table(conn)  # R32-C v24（DDL 只在 paper_schema_migrations）
         # R32-D v25：比对报告表（DDL 同样只在 paper_schema_migrations）。
         PSM.ensure_shadow_comparison_reports(conn)
+        # R32-E1 v26：风险决策的精确 order 关联列。
+        PSM.ensure_risk_decision_order_linkage(conn)
         _ensure_accounts(conn)
         _ensure_user_strategy_accounts(conn)
         _ensure_cycle(conn)
@@ -3282,7 +3286,13 @@ def _recovery_observation(conn, account_id, code, watch, quote, day):
 
 
 def _risk_log(conn, account_id, code, side, decision, reason, payload, *,
-              strategy_stamp=None):
+              strategy_stamp=None, order_id=None):
+    """Append one risk decision; ``order_id`` only when the caller holds it.
+
+    The order linkage is a write-time fact: a caller that already has the exact
+    order stamps it, everyone else leaves NULL. Nothing here ever looks up "the
+    latest decision" for an order.
+    """
     payload = _with_decision_snapshot(
         payload or {}, account_id=account_id, code=code, side=side,
         decision=decision, reason=reason,
@@ -3294,10 +3304,11 @@ def _risk_log(conn, account_id, code, side, decision, reason, payload, *,
     conn.execute(
         """INSERT INTO paper_risk_decisions(
                account_id,code,side,decision,reason,payload,created_at,
-               strategy_id,strategy_version,strategy_checksum)
-           VALUES(?,?,?,?,?,?,?,?,?,?)""",
+               strategy_id,strategy_version,strategy_checksum,order_id)
+           VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
         (account_id, code, side, decision, reason, _json(payload), _now(),
-         strategy_id, strategy_version, strategy_checksum),
+         strategy_id, strategy_version, strategy_checksum,
+         int(order_id) if order_id is not None else None),
     )
 
 

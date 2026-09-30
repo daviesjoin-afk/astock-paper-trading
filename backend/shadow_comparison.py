@@ -206,6 +206,7 @@ class ActiveOrderEvidence:
     signal_evidence: Mapping[str, Any] | None = None
     admission_evidence: Mapping[str, Any] | None = None
     execution_evidence: Mapping[str, Any] | None = None
+    risk_decision_evidence: tuple[Mapping[str, Any], ...] = ()
 
     def __post_init__(self):
         if isinstance(self.order_id, bool) or not isinstance(self.order_id, int) or self.order_id < 1:
@@ -252,6 +253,18 @@ class ActiveOrderEvidence:
             raise ValueError("Active execution evidence runtime context availability is invalid")
         if (str(claimed) == "AVAILABLE") != (self.runtime_context is not None):
             raise ValueError("Active execution evidence runtime context is inconsistent")
+        # Order-linked risk decisions. Each one must name the exact decision row
+        # it came from and must belong to THIS order: a decision that cannot be
+        # tied to this order is not evidence for it.
+        decisions = tuple(self.risk_decision_evidence or ())
+        for item in decisions:
+            if (not isinstance(item, Mapping)
+                    or not isinstance(item.get("risk_decision_id"), int)
+                    or not str(item.get("decision") or "").strip()
+                    or item.get("order_id") != self.order_id):
+                raise ValueError("order-linked risk decision evidence is invalid")
+        object.__setattr__(self, "risk_decision_evidence",
+                           tuple(MappingProxyType(dict(item)) for item in decisions))
 
     @property
     def key(self) -> ObservationKey:
@@ -322,6 +335,7 @@ class ActiveOrderEvidence:
             "signal_evidence": SR._plain(self.signal_evidence),
             "admission_evidence": SR._plain(self.admission_evidence),
             "execution_evidence": SR._plain(self.execution_evidence),
+            "risk_decision_evidence": SR._plain(self.risk_decision_evidence),
         }
 
 
@@ -1054,8 +1068,16 @@ def _execution_dimension(active: ActiveOrderEvidence | None,
                           delta=delta)
 
 
+def _risk_identity_evidence(value: Any, source: str) -> tuple[Any, str, str | None]:
+    """Classify one risk policy identity by where its evidence came from."""
+    if isinstance(value, Mapping) and value:
+        return dict(value), EvidenceProvenance.OWNER_ISSUED.value, source
+    return None, EvidenceProvenance.UNAVAILABLE.value, None
+
+
 def _risk_dimension(active: ActiveOrderEvidence | None,
-                    challenger: Mapping[str, Any] | None) -> dict[str, Any]:
+                    challenger: Mapping[str, Any] | None,
+                    run_risk_policy: Mapping[str, Any] | None = None) -> dict[str, Any]:
     present, missing, unavailable = (
         LegEvidenceState.PRESENT.value, LegEvidenceState.MISSING.value,
         LegEvidenceState.UNAVAILABLE.value)
@@ -1064,28 +1086,57 @@ def _risk_dimension(active: ActiveOrderEvidence | None,
     active_payload = None
     active_state = missing
     if active is not None:
-        # Inventory result: no exact, order-linked Risk Authority decision is
+        # Inventory result: no exact, order-linked Risk Authority *decision* is
         # persisted. `paper_risk_decisions` carries no order reference, so any
         # (account, code, side) match would be a time-ordered guess, and the
-        # order's own lifecycle status is not risk evidence. The Active risk
-        # rejection therefore stays UNAVAILABLE rather than being fabricated.
+        # order's own lifecycle status is not risk evidence. The rejection axis
+        # therefore stays UNAVAILABLE rather than being fabricated. The order's
+        # own evidence envelope still carries the owner-issued risk *policy*
+        # projection that was in effect for this exact order, and that is
+        # reported as such.
+        context = active.runtime_context or {}
+        owner_identity = context.get("risk_policy_identity")
+        has_owner_identity = isinstance(owner_identity, Mapping) and bool(owner_identity)
+        decisions = tuple(active.risk_decision_evidence or ())
         active_payload = {
-            "risk_rejection_evidence": None,
-            "risk_rejection_availability": EvidenceProvenance.UNAVAILABLE.value,
-            "reason": "no_order_linked_risk_authority_evidence",
+            # Exactly-linked, owner-issued risk decisions, verbatim. Which value
+            # means "rejected" is the owner's vocabulary, not this layer's call.
+            "risk_decision_evidence": [dict(item) for item in decisions] or None,
+            "risk_decision_evidence_availability": (
+                EvidenceProvenance.OWNER_ISSUED.value if decisions
+                else EvidenceProvenance.UNAVAILABLE.value),
+            "risk_decision_linkage": "paper_risk_decisions.order_id",
+            "reason": None if decisions else "no_order_linked_risk_authority_evidence",
+            "risk_policy_identity": dict(owner_identity) if has_owner_identity else None,
+            "risk_policy_identity_provenance": (
+                EvidenceProvenance.OWNER_ISSUED.value if has_owner_identity
+                else EvidenceProvenance.UNAVAILABLE.value),
+            "risk_policy_identity_source": (
+                "execution_evidence.runtime_context.risk_policy_identity"
+                if has_owner_identity else None),
             "detail": {
-                "paper_risk_decisions_order_linkage": None,
+                "paper_risk_decisions_order_linkage": (
+                    "paper_risk_decisions.order_id" if decisions else None),
                 "order_lifecycle_status_used": False,
                 "exact_linkage_searched": True,
             },
         }
-        active_state = unavailable
+        active_state = present if decisions else unavailable
     challenger_payload = None
     challenger_state = missing
     if isinstance(challenger, Mapping):
         entry_mapping = entry if isinstance(entry, Mapping) else None
         candidate_mapping = candidate if isinstance(candidate, Mapping) else None
         has_entry = entry_mapping is not None and "allowed" in entry_mapping
+        # Prefer the Risk Authority's own projection recorded by the run; only a
+        # legacy run falls back to the caller-declared dict it captured then.
+        owner_section = run_risk_policy if isinstance(run_risk_policy, Mapping) else {}
+        owner_projection = owner_section.get("projection")
+        legacy_declared = ((candidate_mapping or {}).get("risk_policy_identity")
+                           if candidate_mapping is not None else None)
+        identity, provenance, identity_source = _risk_identity_evidence(
+            owner_projection, "strategy_runtime.risk_policy_projection")
+
         challenger_payload = {
             "entry_allowed": ((entry_mapping or {}).get("allowed") if has_entry else None),
             "entry_reasons": (list((entry_mapping or {}).get("reasons") or ())
@@ -1093,12 +1144,25 @@ def _risk_dimension(active: ActiveOrderEvidence | None,
             # No entry decision means no owner-issued risk evidence either.
             "entry_provenance": (EvidenceProvenance.OWNER_ISSUED.value if has_entry
                                  else EvidenceProvenance.UNAVAILABLE.value),
-            # R32-C established that this identity is caller-declared evidence.
-            # It is reported as declared, never promoted to owner-verified.
-            "risk_policy_identity": ((candidate_mapping or {}).get("risk_policy_identity")
-                                     if candidate_mapping is not None else None),
-            "risk_policy_identity_provenance": EvidenceProvenance.DECLARED.value,
+            "risk_policy_identity": identity,
+            "risk_policy_identity_provenance": provenance,
+            "risk_policy_identity_source": identity_source,
+            "risk_policy_identity_binding": (
+                {"strategy_id": owner_section.get("strategy_id"),
+                 "strategy_version": owner_section.get("strategy_version"),
+                 "strategy_checksum": owner_section.get("strategy_checksum")}
+                if identity is not None else None),
         }
+        if identity is None:
+            # R32-D captured this identity from the caller. It stays labelled as
+            # declared for legacy runs: no backfill, no promotion to owner fact.
+            declared, declared_provenance, declared_source = _risk_identity_evidence(
+                legacy_declared, "legacy_run_captured_risk_policy_identity")
+            challenger_payload["risk_policy_identity"] = declared
+            challenger_payload["risk_policy_identity_provenance"] = (
+                EvidenceProvenance.DECLARED.value if declared is not None
+                else declared_provenance)
+            challenger_payload["risk_policy_identity_source"] = declared_source
         challenger_state = present if has_entry else missing
     reasons = []
     if active is None:
@@ -1112,10 +1176,13 @@ def _risk_dimension(active: ActiveOrderEvidence | None,
     delta = None
     if active_state == present and challenger_state == present:
         delta = {
+            "active_risk_decisions": [dict(item) for item in
+                                      (active_payload.get("risk_decision_evidence") or ())],
             "challenger_entry_allowed": challenger_payload.get("entry_allowed"),
             "challenger_entry_reasons": list(
                 challenger_payload.get("entry_reasons") or ()),
-            "risk_policy_identity_provenance": EvidenceProvenance.DECLARED.value,
+            "risk_policy_identity_provenance": challenger_payload.get(
+                "risk_policy_identity_provenance"),
         }
     return _leg_dimension(active=active_payload, challenger=challenger_payload,
                           active_state=active_state, challenger_state=challenger_state,
@@ -1123,12 +1190,13 @@ def _risk_dimension(active: ActiveOrderEvidence | None,
 
 
 def _observation_comparison(*, key: ObservationKey, active: ActiveOrderEvidence | None,
-                            challenger: Mapping[str, Any] | None) -> dict[str, Any]:
+                            challenger: Mapping[str, Any] | None,
+                            run_risk_policy: Mapping[str, Any] | None = None) -> dict[str, Any]:
     dimensions = {
         "signal": _signal_dimension(active, challenger),
         "decision": _decision_dimension(active, challenger),
         "execution": _execution_dimension(active, challenger),
-        "risk_rejection": _risk_dimension(active, challenger),
+        "risk_rejection": _risk_dimension(active, challenger, run_risk_policy),
     }
     has_active = active is not None
     has_challenger = isinstance(challenger, Mapping)
@@ -1364,11 +1432,12 @@ def _risk_aggregate(observations: tuple[Mapping[str, Any], ...]) -> dict[str, An
         "challenger_entry_reasons": sorted(entry_reasons),
         "declared_risk_identity_observations": declared,
         "provenance": {
-            # No order-linked Risk Authority decision is persisted, so the
-            # Active side carries no owner-issued rejection evidence at all.
-            "active_rejection_outcome": EvidenceProvenance.UNAVAILABLE.value,
+            "active_rejection_outcome": _field_provenance(
+                observations, "active", "risk_decision_evidence_availability"),
+            "active_risk_policy_identity": _identity_provenance(observations, "active"),
             "challenger_entry_decision": EvidenceProvenance.OWNER_ISSUED.value,
-            "challenger_risk_policy_identity": EvidenceProvenance.DECLARED.value,
+            "challenger_risk_policy_identity": _identity_provenance(
+                observations, "challenger"),
         },
         "blocking_reasons": list(_reasons(reasons)),
     }
@@ -1521,7 +1590,30 @@ def _performance(shadow_run: SR.ShadowRunEvidence) -> dict[str, Any]:
     }
 
 
-def _provenance_map() -> dict[str, Any]:
+def _field_provenance(observations: tuple[Mapping[str, Any], ...], leg: str,
+                      field: str) -> str:
+    """The strongest provenance actually present for one risk evidence field."""
+    seen = set()
+    for item in observations:
+        payload = item["dimensions"]["risk_rejection"].get(leg)
+        if isinstance(payload, Mapping):
+            seen.add(str(payload.get(field) or ""))
+    for candidate in (EvidenceProvenance.OWNER_ISSUED.value,
+                      EvidenceProvenance.DECLARED.value):
+        if candidate in seen:
+            return candidate
+    return EvidenceProvenance.UNAVAILABLE.value
+
+
+def _identity_provenance(observations: tuple[Mapping[str, Any], ...], leg: str) -> str:
+    """The strongest risk policy identity provenance actually present."""
+    return _field_provenance(observations, leg, "risk_policy_identity_provenance")
+
+
+def _provenance_map(*, active_risk_policy_provenance: str = EvidenceProvenance.UNAVAILABLE.value,
+                    challenger_risk_policy_provenance: str = EvidenceProvenance.UNAVAILABLE.value,
+                    active_risk_rejection_provenance: str = EvidenceProvenance.UNAVAILABLE.value
+                    ) -> dict[str, Any]:
     return {
         "active.order_lifecycle_columns": EvidenceProvenance.OWNER_ISSUED.value,
         "active.signal_decision": EvidenceProvenance.OWNER_ISSUED.value,
@@ -1530,8 +1622,10 @@ def _provenance_map() -> dict[str, Any]:
         "active.execution_evidence": EvidenceProvenance.OWNER_ISSUED.value,
         "active.runtime_context": EvidenceProvenance.OWNER_ISSUED.value,
         "active.selection_scores": EvidenceProvenance.OWNER_ISSUED.value,
-        # No order-linked Risk Authority decision exists in the Active ledger.
-        "active.risk_rejection": EvidenceProvenance.UNAVAILABLE.value,
+        # The order's own envelope carries the Risk Authority's projection; its
+        # rejection decisions only exist when a writer stamped the order id.
+        "active.risk_policy_identity": active_risk_policy_provenance,
+        "active.risk_rejection": active_risk_rejection_provenance,
         "active.turnover_denominator": EvidenceProvenance.UNAVAILABLE.value,
         "active.performance": EvidenceProvenance.UNAVAILABLE.value,
         "challenger.signal": EvidenceProvenance.OWNER_ISSUED.value,
@@ -1540,7 +1634,9 @@ def _provenance_map() -> dict[str, Any]:
         "challenger.entry_policy": EvidenceProvenance.OWNER_ISSUED.value,
         "challenger.environment": EvidenceProvenance.CAPTURED_INPUT.value,
         "challenger.entry_gate_state": EvidenceProvenance.CAPTURED_INPUT.value,
-        "challenger.risk_policy_identity": EvidenceProvenance.DECLARED.value,
+        # Owner-issued for runs that captured the Risk Authority's projection;
+        # DECLARED only for legacy runs, which are never backfilled.
+        "challenger.risk_policy_identity": challenger_risk_policy_provenance,
         "comparison.deltas": EvidenceProvenance.DERIVED.value,
         "comparison.coverage": EvidenceProvenance.DERIVED.value,
         "comparison.active_order_lifecycle": EvidenceProvenance.OWNER_ISSUED.value,
@@ -1633,12 +1729,17 @@ def build_shadow_comparison(*, spec: ComparisonSpec,
         challenger_observations: dict[str, Mapping[str, Any]] = {}
     else:
         challenger_observations = _shadow_observations(shadow_run)
+    # The run's own owner-issued risk policy evidence, if it captured one.
+    run_inputs = shadow_run.challenger_runtime_inputs
+    run_risk_policy = (dict(run_inputs or {}).get("risk_policy")
+                       if isinstance(run_inputs, Mapping) else None)
     active_observations = active_evidence.orders_by_identity()
     observations = tuple(
         _observation_not_comparable(key, blocking) if blocked
         else _observation_comparison(
             key=key, active=active_observations.get(key.identity),
-            challenger=challenger_observations.get(key.identity))
+            challenger=challenger_observations.get(key.identity),
+            run_risk_policy=run_risk_policy)
         for key in spec.expected_observations
     )
 
@@ -1693,7 +1794,12 @@ def build_shadow_comparison(*, spec: ComparisonSpec,
         "execution": execution,
         "risk_rejection": risk_rejection,
         "performance": performance,
-        "provenance": _provenance_map(),
+        "provenance": _provenance_map(
+            active_risk_policy_provenance=_identity_provenance(observations, "active"),
+            challenger_risk_policy_provenance=_identity_provenance(
+                observations, "challenger"),
+            active_risk_rejection_provenance=_field_provenance(
+                observations, "active", "risk_decision_evidence_availability")),
         "blocking_reasons": list(blocking),
     }
     report_fingerprint = SR.fingerprint(material)

@@ -5,6 +5,7 @@ profiles.  This module deliberately has no order-placement or network I/O.
 """
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from dataclasses import replace as dataclass_replace
 import sqlite3
@@ -29,6 +30,59 @@ class EvolutionControlProfile:
     enabled: bool
     lifecycle_stage: str
     interval_hours: int
+
+
+def compile_risk_policy(definition, *, compiled_dsl=None):
+    """Compile one exact version definition into its risk policy objects.
+
+    This is the single compile site: the runtime context, the Active leg and the
+    Challenger leg all derive their risk policy from here, so the same exact
+    definition always yields the same policy.
+    """
+    definition = dict(definition or {})
+    ast = compiled_dsl if compiled_dsl is not None else definition.get("dsl_ast")
+    compiled = DSL.normalize(ast) if ast is not None else None
+    fingerprint = compile_strategy_risk_fingerprint(compiled, definition.get("metadata"))
+    return fingerprint, compile_strategy_risk_profile(fingerprint)
+
+
+def risk_policy_projection(fingerprint, risk_profile) -> dict[str, Any]:
+    """The single owner-owned projection of one risk policy.
+
+    Nothing else may build this shape: a comparison must read both legs' risk
+    policy identity from this function, so the two legs cannot drift apart in
+    field names or ordering.
+    """
+    return {
+        "strategy_risk_fingerprint": fingerprint.to_dict(),
+        "compiled_risk_profile": risk_profile.to_dict(),
+    }
+
+
+def risk_policy_projection_for_context(context: StrategyRuntimeContext) -> dict[str, Any]:
+    """Projection of one pinned runtime context's risk policy."""
+    return risk_policy_projection(context.risk_fingerprint, context.risk_profile)
+
+
+def risk_policy_projection_for_definition(definition, *, compiled_dsl=None) -> dict[str, Any]:
+    """Projection of an exact version definition, without needing a cycle.
+
+    Shadow challengers are not pinned to a formal cycle, so their risk policy
+    identity comes from the exact immutable version definition instead of a
+    cycle-resolved runtime context.
+    """
+    return risk_policy_projection(*compile_risk_policy(definition, compiled_dsl=compiled_dsl))
+
+
+def is_risk_policy_projection(value) -> bool:
+    """True when `value` is a canonical risk policy projection from this owner.
+
+    Consumers validate explicitly supplied risk policy identities with this, so a
+    caller cannot smuggle in a private shape that the comparison would then have
+    to interpret.
+    """
+    return (isinstance(value, Mapping)
+            and set(value) == {"strategy_risk_fingerprint", "compiled_risk_profile"})
 
 
 def lifecycle_stage_for(spec) -> str:
@@ -131,8 +185,7 @@ def _build_context(
     definition = dict(version.definition)
     ast = definition.get("dsl_ast")
     compiled = DSL.normalize(ast) if ast is not None else None
-    fingerprint = compile_strategy_risk_fingerprint(compiled, definition.get("metadata"))
-    risk = compile_strategy_risk_profile(fingerprint)
+    fingerprint, risk = compile_risk_policy(definition, compiled_dsl=compiled)
     execution = EP.execution_profile_for(fingerprint)
     soft = risk.soft_limits
     # PR-26：生命周期阶段来自注册表的真实状态，不再是 active/shadow 二选一。

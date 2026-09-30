@@ -25,6 +25,7 @@ import paper_schema_migrations as PSM
 import paper_trading as PT
 import shadow_run_repository as SRR
 import shadow_runtime as SH
+import strategy_runtime as SRT
 import shadow_run_service as SHS
 import simulation_runtime_context as SRC
 import tradability_archive as TA
@@ -107,6 +108,10 @@ class ShadowRuntimeTests(unittest.TestCase):
             definition={"dsl_ast": {"op": "gt", "left": {"op": "field", "name": "close"},
                                     "right": {"op": "const", "value": 0}}},
         )
+        # The Risk Authority compiles the exact version's risk policy; the
+        # service does the same for the resolved version.
+        self.risk_policy = SRT.risk_policy_projection_for_definition(
+            self.strategy_version.definition)
         self.candidate = SH.ShadowCandidate(
             symbol=self.code, side="buy", desired_quantity=100,
             entry_state=EP.EntryGateState(
@@ -114,7 +119,6 @@ class ShadowRuntimeTests(unittest.TestCase):
                 shared_cash=100_000.0,
                 require_market_gate=False,
             ),
-            risk_policy_identity={"captured_policy_fingerprint": _sha("risk-policy")},
             reference_price=10.0,
         )
 
@@ -125,6 +129,7 @@ class ShadowRuntimeTests(unittest.TestCase):
             strategy_version=self.strategy_version, lifecycle_state=lifecycle,
             execution_policy=(self.execution_policy if execution_policy is None
                               else execution_policy),
+            risk_policy=self.risk_policy,
             candidates=candidates or (self.candidate,), previous_run=previous,
         )
 
@@ -440,6 +445,7 @@ class ShadowRuntimeTests(unittest.TestCase):
             later = SH.evaluate_shadow(spec=later_spec, environment=later_environment,
                                        strategy_version=self.strategy_version, lifecycle_state="shadow",
                                        execution_policy=self.execution_policy,
+                                       risk_policy=self.risk_policy,
                                        candidates=(self.candidate,),
                                        previous_run=SRR.get_run(conn, original.run_id))
             SRR.append_run(conn, later)
@@ -465,6 +471,7 @@ class ShadowRuntimeTests(unittest.TestCase):
                 spec=spec, environment=self.environment,
                 strategy_version=self.strategy_version, lifecycle_state="shadow",
                 execution_policy=self.execution_policy,
+                risk_policy=self.risk_policy,
                 candidates=(candidate,),
             )
         entry = result.decisions[0]["entry"]
@@ -489,6 +496,7 @@ class ShadowRuntimeTests(unittest.TestCase):
                 spec=self.spec, environment=self.environment,
                 strategy_version=self.strategy_version, lifecycle_state="shadow",
                 execution_policy=self.execution_policy,
+                risk_policy=self.risk_policy,
                 candidates=(candidate,),
             )
         entry = result.decisions[0]["entry"]
@@ -528,6 +536,7 @@ class ShadowRuntimeTests(unittest.TestCase):
                 spec=spec, environment=self.environment,
                 strategy_version=self.strategy_version, lifecycle_state="shadow",
                 execution_policy=self.execution_policy,
+                risk_policy=self.risk_policy,
                 candidates=(candidate,), previous_run=previous,
             )
             return result.decisions[0]
@@ -559,14 +568,18 @@ class ShadowRuntimeTests(unittest.TestCase):
                 spec=self.spec, environment=self.environment,
                 strategy_version=self.strategy_version, lifecycle_state="shadow",
                 execution_policy=self.execution_policy,
+                risk_policy=self.risk_policy,
                 candidates=(captured,),
             )
         candidate = result.decisions[0]["candidate"]
         self.assertEqual(candidate["desired_quantity"], 100)
         self.assertEqual(candidate["reference_price"], 10.0)
         self.assertEqual(candidate["order_type"], "market")
-        self.assertEqual(candidate["risk_policy_identity"],
-                         {"captured_policy_fingerprint": _sha("risk-policy")})
+        # 调用方自述的 risk policy identity 已不再是运行输入：候选只带 entry state。
+        self.assertNotIn("risk_policy_identity", candidate)
+        # 本次运行的风险身份只有一处：owner 编译的那份投影（run-level）。
+        self.assertEqual(result.challenger_runtime_inputs["risk_policy"]["projection"],
+                         self.risk_policy)
         # 记录的是调用方捕获的原始输入……
         self.assertEqual(candidate["entry_gate_state"]["shared_cash"], 1.0)
         self.assertEqual(candidate["entry_gate_state"]["position_limit"], 5)
@@ -592,7 +605,15 @@ class ShadowRuntimeTests(unittest.TestCase):
         for replay in (result, stored):
             with self.subTest(source=type(replay).__name__):
                 evidence = dict(replay.challenger_runtime_inputs)
-                self.assertEqual(evidence, {"entry_policy": frozen})
+                self.assertEqual(evidence["entry_policy"], frozen)
+                risk = evidence["risk_policy"]
+                self.assertEqual(risk["projection"], self.risk_policy)
+                self.assertEqual(
+                    "strategy_runtime.risk_policy_projection_for_definition",
+                    risk["source"])
+                self.assertEqual(self.challenger.strategy_id, risk["strategy_id"])
+                self.assertEqual(self.challenger.version, risk["strategy_version"])
+                self.assertEqual(self.challenger.checksum, risk["strategy_checksum"])
                 policy = evidence["entry_policy"]
                 # Owner 字段集 + 绑定身份 + fingerprint 全部可读回。
                 self.assertEqual(policy["fingerprint"], self.execution_policy.fingerprint)
@@ -682,6 +703,7 @@ class ShadowRuntimeTests(unittest.TestCase):
                 spec=self.spec, environment=self.environment,
                 strategy_version=self.strategy_version, lifecycle_state="shadow",
                 execution_policy=self.execution_policy,
+                risk_policy=self.risk_policy,
                 candidates=(self.candidate, self.candidate),
             )
 
