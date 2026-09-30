@@ -844,7 +844,7 @@ def _decision_dimension(active: ActiveOrderEvidence | None,
             or "risk_payload.decision_snapshot.final",
             "admission_decision": (admission or {}).get("decision"),
             "admission_reason": (admission or {}).get("reason"),
-            "admission_score": (admission or {}).get("score"),
+            "admission_score": (admission or {}).get("admission_score"),
             "admission_gates": (admission or {}).get("gates"),
             "admission_provenance": (EvidenceProvenance.OWNER_ISSUED.value
                                      if admission is not None

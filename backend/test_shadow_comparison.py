@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import hashlib
+import inspect
 import json
 import os
 import re
@@ -293,13 +294,13 @@ class ShadowComparisonTests(unittest.TestCase):
         conn.commit()
         return conn, order_ids
 
-    def _comparison_spec(self, *, order_ids, expected, **overrides):
+    def _comparison_spec(self, *, order_ids, expected, active_evidence_id, **overrides):
         values = {
             "challenger": self.challenger,
             "active_comparator": self.active,
             "shadow_run_id": self.shadow_run.run_id,
             "active_order_ids": tuple(order_ids),
-            "active_evidence_id": _sha("placeholder-active-evidence"),
+            "active_evidence_id": active_evidence_id,
             "environment_fingerprint": self.identity.environment_fingerprint,
             "session_date": self.day,
             "decision_at": self.decision_at,
@@ -310,19 +311,21 @@ class ShadowComparisonTests(unittest.TestCase):
 
     def _report(self, *, orders=(), execution_evidence=None, risk_payload=None,
                 expected=None, shadow_run=None, signals=True, spec_overrides=None):
-        """Declare the evidence id from the loaded evidence, as a caller must."""
+        """Capture the exact evidence first, then declare its fingerprint."""
         conn, order_ids = self._ledger(orders=orders, signals=signals,
                                        execution_evidence=execution_evidence,
                                        risk_payload=risk_payload)
         run = shadow_run if shadow_run is not None else self.shadow_run
         keys = tuple(expected) if expected is not None else (
             SC.ObservationKey(self.code, "buy"),)
+        evidence = SCS.capture_active_comparison_evidence(
+            conn, active_order_ids=tuple(order_ids))
         overrides = {"shadow_run_id": run.run_id,
                      "environment_fingerprint": run.spec["environment_fingerprint"]}
         overrides.update(spec_overrides or {})
-        draft = self._comparison_spec(order_ids=order_ids, expected=keys, **overrides)
-        evidence = SCS.load_active_comparison_evidence(conn, draft)
-        spec = replace(draft, active_evidence_id=evidence.source_fingerprint)
+        spec = self._comparison_spec(
+            order_ids=order_ids, expected=keys,
+            active_evidence_id=evidence.source_fingerprint, **overrides)
         report = SC.build_shadow_comparison(
             spec=spec, active_evidence=evidence, shadow_run=run)
         return conn, spec, evidence, report
@@ -492,10 +495,19 @@ class ShadowComparisonTests(unittest.TestCase):
     def test_d7b_a_missing_named_active_evidence_row_fails_closed(self):
         conn, order_ids = self._ledger()
         expected = (SC.ObservationKey(self.code, "buy"),)
-        spec = self._comparison_spec(order_ids=(order_ids[0] + 1,), expected=expected)
+        # The declared fingerprint here is deliberately irrelevant: the capture
+        # refuses a missing row before any fingerprint comparison happens.
+        declared = SCS.capture_active_comparison_evidence(
+            conn, active_order_ids=tuple(order_ids)).source_fingerprint
+        spec = self._comparison_spec(order_ids=(order_ids[0] + 1,), expected=expected,
+                                     active_evidence_id=declared)
         with self.assertRaisesRegex(SC.ShadowComparisonError,
                                     "active_order_evidence_unavailable"):
-            SCS.load_active_comparison_evidence(conn, spec)
+            SCS.capture_active_comparison_evidence(
+                conn, active_order_ids=(order_ids[0] + 1,))
+        with self.assertRaisesRegex(SC.ShadowComparisonError,
+                                    "explicit_active_order_ids_required"):
+            SCS.capture_active_comparison_evidence(conn, active_order_ids=())
         # No "latest order" substitute may be found instead.
         migration = next(item for item in db_migrate.MIGRATIONS["paper_trading"]
                          if item[0] == 24)
@@ -651,7 +663,8 @@ class ShadowComparisonTests(unittest.TestCase):
                                       side_effect=AssertionError("current quote read")), \
                     mock.patch.object(PT, "DB_PATH", "definitely-not-the-ledger"):
                 reloaded = SRR.get_run(conn, spec.shadow_run_id)
-                active_again = SCS.load_active_comparison_evidence(conn, spec)
+                active_again = SCS.capture_active_comparison_evidence(
+                    conn, active_order_ids=spec.active_order_ids)
                 replayed = SC.build_shadow_comparison(
                     spec=spec, active_evidence=active_again, shadow_run=reloaded)
         finally:
@@ -840,7 +853,8 @@ class ShadowComparisonTests(unittest.TestCase):
             (0, 0.0, "cancelled", "{}", spec.active_order_ids[0]))
         self.assertEqual(1, cursor.rowcount)
         conn.commit()
-        drifted = SCS.load_active_comparison_evidence(conn, spec)
+        drifted = SCS.capture_active_comparison_evidence(
+            conn, active_order_ids=spec.active_order_ids)
         self.assertEqual(tuple(spec.active_order_ids),
                          tuple(drifted.source_identity["order_ids"]))
         self.assertNotEqual(evidence.source_fingerprint, drifted.source_fingerprint)
@@ -976,6 +990,82 @@ class ShadowComparisonTests(unittest.TestCase):
         self.assertNotIn('"filled_quantity": 0', flattened)
         self.assertNotIn('"rejected"', flattened)
         self.assertNotIn('"fill_ratio": 0', flattened)
+        conn.close()
+
+    # ── D19–D20: owner-key mapping and the single capture owner ──────────────
+
+    def test_d19_admission_score_comes_from_its_canonical_owner_key(self):
+        """owner 原始分数经 capture → observation → 持久化 report 全程保持 88.5。"""
+        conn, spec, evidence, report = self._report()
+        self.assertEqual(88.5, evidence.orders[0].admission_evidence["admission_score"])
+        self.assertEqual(88.5, evidence.orders[0].admission["admission_score"])
+        decision = report.observations[0]["dimensions"]["decision"]
+        self.assertEqual(88.5, decision["active"]["admission_score"])
+        self.assertEqual("risk_payload.decision_snapshot.final",
+                         decision["active"]["admission_source"])
+        self.assertEqual("approved", decision["active"]["admission_decision"])
+        # Round-tripping through the append-only report table keeps the value.
+        SCR.append_report(conn, report)
+        stored = SCR.get_report(conn, report.report_id)
+        self.assertEqual(88.5, stored.observations[0]["dimensions"]["decision"][
+            "active"]["admission_score"])
+        self.assertEqual(
+            88.5,
+            stored.active_evidence["orders"][0]["admission_evidence"]["admission_score"])
+        # The owner's raw score keeps its namespaced name: no bare "score" key
+        # reappears anywhere in the persisted report.
+        self.assertEqual(set(), _keys(stored.projection()) & {"score"})
+        conn.close()
+
+    def test_d20_active_capture_depends_only_on_explicit_order_ids(self):
+        """capture 不依赖 ComparisonSpec；旧的 spec 驱动签名已删除（0 caller）。"""
+        parameters = inspect.signature(
+            SCS.capture_active_comparison_evidence).parameters
+        self.assertEqual({"conn", "active_order_ids"}, set(parameters))
+        self.assertEqual(inspect.Parameter.KEYWORD_ONLY,
+                         parameters["active_order_ids"].kind)
+        module_functions = [name for name, item in vars(SCS).items()
+                            if inspect.isfunction(item)
+                            and "active_comparison_evidence" in name]
+        self.assertEqual(["capture_active_comparison_evidence"], module_functions)
+        conn, order_ids = self._ledger()
+        with self.assertRaisesRegex(SC.ShadowComparisonError,
+                                    "explicit_active_order_ids_required"):
+            SCS.capture_active_comparison_evidence(conn, active_order_ids=(1, 1))
+        conn.close()
+
+    def test_d20b_documented_caller_flow_works_end_to_end(self):
+        """§二.6 的正式调用顺序：capture → declare → build_and_append。"""
+        conn, order_ids = self._ledger()
+        for migration_id in (24, 25):
+            migration = next(item for item in db_migrate.MIGRATIONS["paper_trading"]
+                             if item[0] == migration_id)
+            db_migrate._run_operation(conn, migration[2])
+        SRR.append_run(conn, self.shadow_run)
+        evidence = SCS.capture_active_comparison_evidence(
+            conn, active_order_ids=tuple(order_ids))
+        spec = SC.ComparisonSpec(
+            challenger=self.challenger, active_comparator=self.active,
+            shadow_run_id=self.shadow_run.run_id,
+            active_order_ids=tuple(order_ids),
+            active_evidence_id=evidence.source_fingerprint,
+            environment_fingerprint=self.identity.environment_fingerprint,
+            session_date=self.day, decision_at=self.decision_at,
+            expected_observations=(SC.ObservationKey(self.code, "buy"),),
+        )
+        report = SCS.build_and_append_comparison(conn, spec=spec)
+        self.assertEqual(evidence.source_fingerprint,
+                         report.active_evidence["source_fingerprint"])
+        self.assertEqual(1, conn.execute(
+            "SELECT COUNT(*) FROM shadow_comparison_reports").fetchone()[0])
+        # Capturing again after a mutable-row change no longer matches the spec.
+        conn.execute("UPDATE paper_orders SET amount=? WHERE id=?", (7.0, order_ids[0]))
+        conn.commit()
+        with self.assertRaisesRegex(SC.ShadowComparisonError,
+                                    "active_evidence_fingerprint_mismatch"):
+            SCS.build_and_append_comparison(conn, spec=spec)
+        self.assertEqual(1, conn.execute(
+            "SELECT COUNT(*) FROM shadow_comparison_reports").fetchone()[0])
         conn.close()
 
     # ── persistence contract ─────────────────────────────────────────────────

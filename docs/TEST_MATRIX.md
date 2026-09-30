@@ -115,6 +115,8 @@
 | --- | --- | --- | --- |
 | 同一份 exact Active evidence + 同一 ShadowRun + 同一 spec 得到同一报告与同一 fingerprint；declared scope 顺序不影响 identity | `shadow_comparison.build_shadow_comparison` | `test_shadow_comparison.py`（D1） | ✅ |
 | `ComparisonSpec.active_evidence_id` 必填且必须是合法 SHA-256；order IDs 本身不是 exact evidence identity | `shadow_comparison.ComparisonSpec` | `test_shadow_comparison.py`（D13） | ✅ |
+| Active evidence 只有唯一 capture owner `capture_active_comparison_evidence(conn, active_order_ids=...)`：只依赖显式 order IDs，不接收 ComparisonSpec；旧 spec 驱动签名已删除且无 caller | `shadow_comparison_service` | `test_shadow_comparison.py`（D20、D20b） | ✅ |
+| owner 原始 admission 分数经 capture → observation → 持久化 report 全程走 canonical `admission_score` 键（88.5），report 内不出现裸业务键 `score` | `shadow_comparison_service._admission_evidence`、`shadow_comparison._decision_dimension` | `test_shadow_comparison.py`（D19、D12） | ✅ |
 | 同一 order id 的行被原地更新（filled_qty/amount/status/execution_evidence）后，按旧 fingerprint 调 production comparison 必须 `active_evidence_fingerprint_mismatch` fail closed 且不写 report；显式重声明新 fingerprint 才产生**不同** report | `shadow_comparison_service.build_and_append_comparison` | `test_shadow_comparison.py`（D13） | ✅ |
 | 持久化 report 保存完整 canonical Active envelope（source table / order IDs / schema version / source fingerprint / 本次消费的 exact 投影），可自行重算 source fingerprint | `shadow_comparison.ShadowComparisonReport.active_evidence` | `test_shadow_comparison.py`（D1b、D13） | ✅ |
 | report fingerprint 覆盖 exact Active evidence identity 与 exact ShadowRun identity：任一改变即改变 report identity | `shadow_comparison.build_shadow_comparison` | `test_shadow_comparison.py`（D1b） | ✅ |
@@ -137,7 +139,7 @@
 | 比对前后正式账本与 `shadow_runs` 逐字节不变；只新增一条 `shadow_comparison_reports` | `shadow_comparison_service.build_and_append_comparison` | `test_shadow_comparison.py`（D11） | ✅ |
 | 报告不含 winner / promote / overall score / ranking 等业务结论字段（`score` 是精确键黑名单，owner 原始分数一律带前缀命名） | `shadow_comparison.ShadowComparisonReport` | `test_shadow_comparison.py`（D12，字段级黑名单 + 文本扫描） | ✅ |
 | 比对报告 DDL 单一事实来源（`paper_schema_migrations.ensure_shadow_comparison_reports`）；migration v25 与 `init_db` 两条路径调用同一函数 | `paper_schema_migrations`、`db_migrate`、`paper_trading.init_db` | `test_shadow_comparison.py`（v25 DDL owner、existing ledger init_db） | ✅ |
-| 语义 mutation M-D1–M-D13（环境相等、缺失即 false、coverage 失真、latest 回退、指纹丢 Active/Shadow 身份、declared→verified、缺估值不 fail closed、spec 可无 fingerprint、跳过 fingerprint 相等、容器即证据、None→0、order status 当 risk 证据） | `work/r32d_shadow_comparison_mutation_check.py` | 13/13 DETECTED，restore SHA256 PASS | ✅ |
+| 语义 mutation M-D1–M-D16（环境相等、缺失即 false、coverage 失真、latest 回退、指纹丢 Active/Shadow 身份、declared→verified、缺估值不 fail closed、spec 可无 fingerprint、跳过 fingerprint 相等、容器即证据、None→0、order status 当 risk 证据、admission_score 退回旧键、capture 指纹脱离行内容、capture 重新接受 spec 参数） | `work/r32d_shadow_comparison_mutation_check.py` | 16/16 DETECTED，restore SHA256 PASS | ✅ |
 | 策略产品线端到端（内置模板 + 用户策略同链路） | — | `test_strategy_product_line_e2e.py` | ✅ |
 | 风险收紧（画像只能更严，系统键不可触碰） | `strategy_risk_enforcement.py` | `test_strategy_risk_enforcement.py`、`test_asymmetric_risk_gate_wiring.py` | ✅ |
 

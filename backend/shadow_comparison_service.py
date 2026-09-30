@@ -125,12 +125,24 @@ def _signal_evidence(conn: sqlite3.Connection, signal_id) -> dict | None:
     }
 
 
-def load_active_comparison_evidence(
-        conn: sqlite3.Connection, spec: SC.ComparisonSpec,
+def capture_active_comparison_evidence(
+        conn: sqlite3.Connection, *, active_order_ids: tuple[int, ...],
 ) -> SC.ActiveComparisonEvidence:
-    """Load exactly the declared Active orders, one row each, by primary key."""
+    """Capture exactly the named Active orders and fingerprint that projection.
+
+    This is the only owner of the Active-evidence SQL, projection and
+    fingerprint. It deliberately depends on nothing but the explicit order ids:
+    a comparison spec pins the fingerprint of this capture, so the capture
+    cannot take a spec without creating a circular dependency.
+    """
+    ids = tuple(active_order_ids)
+    if (not ids
+            or any(isinstance(item, bool) or not isinstance(item, int) or item < 1
+                   for item in ids)
+            or len(set(ids)) != len(ids)):
+        raise SC.ShadowComparisonError("explicit_active_order_ids_required")
     orders = []
-    for order_id in spec.active_order_ids:
+    for order_id in ids:
         cursor = conn.execute(
             f"SELECT {','.join(_ORDER_COLUMNS)} FROM paper_orders WHERE id=?",
             (int(order_id),),
@@ -175,16 +187,25 @@ def build_and_append_comparison(
 ) -> SC.ShadowComparisonReport:
     """Read the named evidence, build one report, append it idempotently.
 
-    The declared `active_evidence_id` is checked against the fingerprint of the
-    exact projection just loaded. `paper_orders` rows are updated in place as
-    execution progresses, so order ids alone are not an evidence identity: a
-    drifted row is a different comparison and fails closed here instead of being
-    accepted as the same one.
+    Normal caller flow::
+
+        evidence = capture_active_comparison_evidence(conn, active_order_ids=ids)
+        spec = ComparisonSpec(
+            ..., active_order_ids=ids,
+            active_evidence_id=evidence.source_fingerprint, ...,
+        )
+        build_and_append_comparison(conn, spec=spec)
+
+    The declared `active_evidence_id` is checked against a *fresh* capture of the
+    named rows. `paper_orders` rows are updated in place as execution progresses,
+    so order ids alone are not an evidence identity: a drifted row is a different
+    comparison and fails closed here instead of being accepted as the same one.
     """
     shadow_run = SRR.get_run(conn, spec.shadow_run_id)
     if shadow_run is None:
         raise SC.ShadowComparisonError("explicit_shadow_run_unavailable")
-    active_evidence = load_active_comparison_evidence(conn, spec)
+    active_evidence = capture_active_comparison_evidence(
+        conn, active_order_ids=spec.active_order_ids)
     if active_evidence.source_fingerprint != spec.active_evidence_id:
         raise SC.ShadowComparisonError("active_evidence_fingerprint_mismatch")
     report = SC.build_shadow_comparison(

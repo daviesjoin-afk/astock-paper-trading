@@ -115,6 +115,18 @@ ComparisonSpec.active_evidence_id  = 必填
 
 禁止把新算出的 fingerprint 当成"同一次 comparison"自动接受。想比较漂移后的内容，必须**显式重新声明**新的 fingerprint——那是一次不同的 comparison，report identity 也随之不同。`active_evidence_id` 不接受 `None` 或非法 SHA-256。
 
+**capture owner 与调用顺序。** Active evidence 的唯一 capture owner 是
+`shadow_comparison_service.capture_active_comparison_evidence(conn, *, active_order_ids)`：它独占 Active 证据的 SQL、投影与 fingerprint，**只依赖显式 order IDs**，不接收 `ComparisonSpec`——spec 要 pin 的正是这次 capture 的 fingerprint，让 capture 依赖 spec 就是循环依赖。正式调用顺序：
+
+```text
+evidence = capture_active_comparison_evidence(conn, active_order_ids=ids)
+spec = ComparisonSpec(..., active_order_ids=ids,
+                      active_evidence_id=evidence.source_fingerprint, ...)
+build_and_append_comparison(conn, spec=spec)   # 内部重新 capture 当前行再比对
+```
+
+`build_and_append_comparison()` 在写入前**重新 capture** 当前行并比对已声明的 fingerprint：不一致即 `active_evidence_fingerprint_mismatch` 且不写任何 report。旧签名 `load_active_comparison_evidence(conn, spec)` 已删除（迁移后 caller = 0），不留 compatibility wrapper，也不存在第二套 Active evidence query/projection。
+
 ### 3.2 ComparisonSpec
 
 ```text
@@ -327,16 +339,16 @@ docker:    docker run --rm --network none --tmpfs /app/data_cache:rw,size=64m,ui
 
 | 层 | 结果 |
 | --- | --- |
-| focused R32-C/D + Active audit | 168 tests OK |
+| focused R32-C/D + Active audit | 171 tests OK |
 | ruff / compileall | PASS |
-| 语义 mutation M-D1–M-D13 | **13/13 DETECTED**；survived / fake / timeout = 0；restore SHA256 PASS；恢复后基线 GREEN |
-| backend 完整套件 | 5090 tests，OK (skipped=5) |
-| Docker `--network none` | 5090 tests，OK (skipped=30) |
+| 语义 mutation M-D1–M-D16 | **16/16 DETECTED**；survived / fake / timeout = 0；restore SHA256 PASS；恢复后基线 GREEN |
+| backend 完整套件 | 5093 tests，OK (skipped=5) |
+| Docker `--network none` | 5093 tests，OK (skipped=30) |
 | frontend | build + 150 unit tests 通过；`frontend/dist` 无漂移 |
 | Chromium E2E | 34 passed（CI 形态 `workers=1`） |
 | Security Leak Scan | 0 values（2 项截图属既有人工复核条目） |
 
-回归用例：D1 确定性、D1b fingerprint 绑定 exact 证据身份并可自验、D2 七维环境逐维 fail closed、D3/D15 Active runtime context / execution envelope 缺失不重建、D4 缺失即 MISSING、D5 coverage 分母、D6 历史重放、D7 纯层无 DB/时钟/latest 入口、D7b 显式 ID 缺失 fail closed、D8 provenance、D9/D9b 估值只取 frozen environment、D10 幂等与 append-only、D11 正式账本零写入、D12 无 winner/score、**D13 order id 行漂移 fail closed**、**D14 candidate 无 execution 不算 execution evidence**、**D15b owner-issued 0 vs 缺失 None**、**D16 无 entry 的 Challenger 不算 admission/risk 证据**、**D17 order status 不是 Risk Authority 证据**、**D18 缺失永不变成 0/false**。
+回归用例：D1 确定性、D1b fingerprint 绑定 exact 证据身份并可自验、D2 七维环境逐维 fail closed、D3/D15 Active runtime context / execution envelope 缺失不重建、D4 缺失即 MISSING、D5 coverage 分母、D6 历史重放、D7 纯层无 DB/时钟/latest 入口、D7b 显式 ID 缺失 fail closed、D8 provenance、D9/D9b 估值只取 frozen environment、D10 幂等与 append-only、D11 正式账本零写入、D12 无 winner/score、D13 order id 行漂移 fail closed、D14 candidate 无 execution 不算 execution evidence、D15b owner-issued 0 vs 缺失 None、D16 无 entry 的 Challenger 不算 admission/risk 证据、D17 order status 不是 Risk Authority 证据、D18 缺失永不变成 0/false、**D19 owner 原始分数走 canonical `admission_score` 键并贯穿持久化**、**D20 capture owner 只依赖显式 order IDs（旧 spec 驱动签名已删除）**、**D20b §二.6 正式调用顺序端到端**。
 
 ## 六、架构报告
 
@@ -351,3 +363,16 @@ docker:    docker run --rm --network none --tmpfs /app/data_cache:rw,size=64m,ui
 - `paper_trading.py`：15,851 LOC / 325 defs → 15,855 LOC / 325 defs（仅 R32-D 首轮的 `init_db` ensure 调用；本轮未改动）。
 - fingerprint 实现仍只有一份：`shadow_runtime.canonical_json` / `fingerprint`；`shadow_comparison` 不 import `hashlib`。
 - 本轮的取舍：report 现在持久化**完整 canonical Active envelope**（source table / order IDs / schema version / source fingerprint / 消费的 exact 投影），因此 report 自身可重算 source fingerprint；代价是 evidence 更大，这是"可审计 Active envelope"的显式成本。服务因此按显式 order id 读取 `risk_payload`（该列为精确 linkage 的 admission 证据），不再因为"可能很大"而跳过它。
+
+### 6.1 architecture convergence（本轮）
+
+```text
+Old production API removed:      shadow_comparison_service.load_active_comparison_evidence(conn, spec)
+Old callers migrated:            5（1 个生产调用点 + 4 个测试调用点）
+Old caller count after migration: 0（全仓库 0 处引用）
+Compatibility path remaining:    0（未包 compatibility wrapper；placeholder-spec 引导路径已删除）
+Duplicate capture implementation: 0（SQL / 投影 / fingerprint 只有 capture_active_comparison_evidence 一处）
+Net production LOC:              +32 / -11（shadow_comparison.py +1/-1，shadow_comparison_service.py +31/-10）
+```
+
+未新增 facade / manager / helper 模块；改动集中在既有 `shadow_comparison_service.py`（capture owner）与 `shadow_comparison.py` 的一处 owner-key 读取修正。新增 mutation：`M-D14`（`admission_score` 退回旧键）、`M-D15`（capture 的 fingerprint 不再由 exact 行内容决定）、`M-D16`（capture 重新接受 `ComparisonSpec` 参数）。

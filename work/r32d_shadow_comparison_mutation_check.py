@@ -132,6 +132,33 @@ MUTATIONS = [
         '            "risk_rejection_availability": EvidenceProvenance.OWNER_ISSUED.value,\n',
         "test_shadow_comparison.ShadowComparisonTests.test_d17_order_status_is_not_risk_authority_evidence",
     ),
+    # M-D14：admission_score 退回旧键（owner projection 已不再有裸 score 键）。
+    (
+        "backend/shadow_comparison.py",
+        '            "admission_score": (admission or {}).get("admission_score"),\n',
+        '            "admission_score": (admission or {}).get("score"),\n',
+        "test_shadow_comparison.ShadowComparisonTests.test_d19_admission_score_comes_from_its_canonical_owner_key",
+    ),
+    # M-D15：capture 的 fingerprint 不再由加载到的 exact 行内容决定
+    #        （等价于让占位 fingerprint 也能通过）。
+    (
+        "backend/shadow_comparison.py",
+        '        "orders": [order.projection() for order in orders],\n',
+        '        "orders": [],\n',
+        "test_shadow_comparison.ShadowComparisonTests.test_d13_mutated_active_row_fails_closed_against_the_pinned_fingerprint",
+    ),
+    # M-D16：capture owner 重新接受 ComparisonSpec 参数（占位循环依赖回流）。
+    (
+        "backend/shadow_comparison_service.py",
+        'def capture_active_comparison_evidence(\n'
+        '        conn: sqlite3.Connection, *, active_order_ids: tuple[int, ...],\n'
+        ') -> SC.ActiveComparisonEvidence:\n',
+        'def capture_active_comparison_evidence(\n'
+        '        conn: sqlite3.Connection, *, active_order_ids: tuple[int, ...],\n'
+        '        comparison_spec: SC.ComparisonSpec | None = None,\n'
+        ') -> SC.ActiveComparisonEvidence:\n',
+        "test_shadow_comparison.ShadowComparisonTests.test_d20_active_capture_depends_only_on_explicit_order_ids",
+    ),
 ]
 
 BASELINE_MODULES = ("test_shadow_comparison", "test_shadow_runtime")
