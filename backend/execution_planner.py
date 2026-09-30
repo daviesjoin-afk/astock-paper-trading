@@ -12,7 +12,9 @@
 本模块把**执行决策**集中到一处：
 
 - :class:`ExecutionPolicy` / :func:`policy_for`：把身份差异收敛成一张声明式策略表，
-  执行代码只读策略字段，不再按账户 ID 分支；
+  执行代码只读策略字段，不再按账户 ID 分支；:func:`execution_policy_snapshot` 把
+  这张表的解析结果冻结成不可变快照（策略对象 + owner 字段投影 + fingerprint），
+  供“一次捕获、显式传入、可回放”的调用方使用，fingerprint 的字段集仍只有本模块一份；
 - :func:`seat_reserve_gate` / :func:`capacity_gate`：席位与容量门禁，自动与手动共用；
 - :func:`quote_gate` / :func:`security_gate` / :func:`market_gate` /
   :func:`account_risk_gate` / :func:`cash_gate`：继续复用既有行情新鲜度、证券范围、
@@ -22,7 +24,9 @@
 - :func:`commit_fill`：统一成交落库原语（预留 → 扣款 → 记 lot → 写 fill → 风险日志）。
 
 本模块不在导入期依赖 ``paper_trading``（惰性取用，避免循环导入），且不改任何
-既有门禁的判定口径——只改“谁来编排”。
+既有门禁的判定口径——只改“谁来编排”。``evaluate_entry_state`` 与 ``market_gate``
+新增可选 ``execution_policy`` / ``policy`` 入参：缺省时行为与既有一致（走
+``policy_for(account_id)``），显式传入已冻结快照时只消费该对象，不再解析当前策略表。
 """
 from __future__ import annotations
 
@@ -46,10 +50,12 @@ import paper_trading_rules as PTR
 __all__ = [
     "EXECUTION_PLANNER_VERSION",
     "ExecutionPolicy",
+    "ExecutionPolicySnapshot",
     "ExecutionStateSnapshot",
     "EntryGateState",
     "execution_state_fingerprint",
     "execution_policy_fingerprint",
+    "execution_policy_snapshot",
     "entry_gate_state_fingerprint",
     "ExecutionContext",
     "ExecutionDecision",
@@ -1259,15 +1265,21 @@ def security_gate(code, name=None, risk_flag=None) -> dict[str, Any]:
     }
 
 
-def market_gate(market, account_id: str) -> dict[str, Any]:
-    """市场灯门禁（红灯/未知禁止新开仓；文案按策略声明，判定口径不变）。"""
+def market_gate(market, account_id: str,
+                policy: ExecutionPolicy | None = None) -> dict[str, Any]:
+    """市场灯门禁（红灯/未知禁止新开仓；文案按策略声明，判定口径不变）。
+
+    ``policy`` 显式传入时只消费该对象的暂停文案，不再解析当前策略表；缺省保持
+    既有 ``policy_for(account_id)`` 行为，判定口径不变。
+    """
     state = market if isinstance(market, Mapping) else {}
     light = state.get("light")
     blocked = light in ("red", "unknown")
+    declared = policy if policy is not None else policy_for(account_id)
     return {
         "market": dict(state),
         "blocked": blocked,
-        "reason": policy_for(account_id).red_light_reason if blocked else None,
+        "reason": declared.red_light_reason if blocked else None,
         "planner": EXECUTION_PLANNER_VERSION,
     }
 
@@ -1386,9 +1398,14 @@ def entry_gate_state_fingerprint(state: EntryGateState) -> str:
     })
 
 
-def _execution_policy_fingerprint_for(policy: ExecutionPolicy) -> str:
-    """Fingerprint only policy facts consumed by entry evaluation and its result."""
-    return _state_fingerprint("entry-execution-policy", {
+def _execution_policy_projection_for(policy: ExecutionPolicy) -> dict[str, Any]:
+    """The one owner-owned field set that explains an entry policy fingerprint.
+
+    Every consumer (fingerprint, freeze contract, run evidence) reads this dict,
+    so a new decision-relevant policy field becomes identity + evidence in one
+    place instead of drifting across callers.
+    """
+    return {
         "account_id": policy.account_id,
         "chase_lane": policy.chase_lane,
         "manual_entry_review": policy.manual_entry_review,
@@ -1397,7 +1414,13 @@ def _execution_policy_fingerprint_for(policy: ExecutionPolicy) -> str:
         "seat_reserve_deadline": policy.seat_reserve_deadline,
         "red_light_reason": policy.red_light_reason,
         "execution_planner_version": EXECUTION_PLANNER_VERSION,
-    })
+    }
+
+
+def _execution_policy_fingerprint_for(policy: ExecutionPolicy) -> str:
+    """Fingerprint only policy facts consumed by entry evaluation and its result."""
+    return _state_fingerprint("entry-execution-policy",
+                              _execution_policy_projection_for(policy))
 
 
 def execution_policy_fingerprint(account_id: str) -> str:
@@ -1405,14 +1428,84 @@ def execution_policy_fingerprint(account_id: str) -> str:
     return _execution_policy_fingerprint_for(policy_for(account_id))
 
 
+@dataclass(frozen=True)
+class ExecutionPolicySnapshot:
+    """Owner-issued immutable freeze of one resolved entry ``ExecutionPolicy``.
+
+    ``account_id`` is the requesting identity this freeze is bound to, which is
+    not always the policy row's own id: an unknown/custom strategy keeps using the
+    conservative default policy (whose ``account_id`` is empty), and the freeze
+    binds it to the requested identity instead of inventing a second policy table.
+    Registered accounts freeze with both ids equal. Callers that must not depend
+    on the current owner state — Shadow runs, replay, evidence — capture one of
+    these once and pass it explicitly.
+    """
+
+    account_id: str
+    policy: ExecutionPolicy
+    fingerprint: str
+
+    def __post_init__(self):
+        account = str(self.account_id or "")
+        if not account or account != account.strip():
+            raise ValueError("execution policy account identity is required")
+        if not isinstance(self.policy, ExecutionPolicy):
+            raise TypeError("execution policy snapshot requires an owner ExecutionPolicy")
+        if self.policy.account_id and self.policy.account_id != account:
+            raise ValueError("execution policy account identity mismatch")
+        if self.fingerprint != _execution_policy_fingerprint_for(self.policy):
+            raise ValueError("execution policy fingerprint mismatch")
+
+    def projection(self) -> dict[str, Any]:
+        """Owner-owned evidence: bound identity, the policy row id, and its facts."""
+        return {
+            **_execution_policy_projection_for(self.policy),
+            "account_id": self.account_id,
+            "policy_account_id": self.policy.account_id,
+            "fingerprint": self.fingerprint,
+        }
+
+
+def execution_policy_snapshot(account_id: str) -> ExecutionPolicySnapshot:
+    """Freeze the current owner policy for one explicit account/strategy identity."""
+    account = str(account_id or "")
+    if not account or account != account.strip():
+        raise ValueError("execution policy account identity is required")
+    policy = policy_for(account)
+    return ExecutionPolicySnapshot(
+        account_id=account, policy=policy,
+        fingerprint=_execution_policy_fingerprint_for(policy),
+    )
+
+
+def _resolve_entry_policy(account_id: str,
+                          execution_policy: ExecutionPolicySnapshot | None
+                          ) -> ExecutionPolicy:
+    """Pick the one entry policy to use; never falls back once one is supplied."""
+    if execution_policy is None:
+        return policy_for(account_id)
+    if not isinstance(execution_policy, ExecutionPolicySnapshot):
+        raise TypeError("owner execution policy snapshot is required")
+    if execution_policy.account_id != str(account_id or ""):
+        raise ValueError("entry execution policy account identity mismatch")
+    return execution_policy.policy
+
+
 def evaluate_entry_state(
     *, state: EntryGateState, account_id: str, code: str, side: str,
     quote: Mapping[str, Any], asof_day,
     amount: float = 0.0, fees: float = 0.0, runtime_context: Any = None,
+    execution_policy: ExecutionPolicySnapshot | None = None,
 ) -> dict[str, Any]:
-    """Pure canonical entry gate over a previously captured explicit state."""
+    """Pure canonical entry gate over a previously captured explicit state.
+
+    ``execution_policy`` 传入 owner 冻结快照时，本次评估（含市场灯文案与 runtime
+    context 的策略身份校验）只消费该快照，不再解析当前策略表；缺省 ``None`` 保持
+    既有 ``policy_for(account_id)`` 行为。
+    """
     if not isinstance(state, EntryGateState):
         raise TypeError("entry gate state snapshot is required")
+    actual_policy = _resolve_entry_policy(account_id, execution_policy)
     if runtime_context is not None:
         import simulation_runtime_context as SRC
 
@@ -1423,7 +1516,6 @@ def evaluate_entry_state(
             raise ValueError("entry runtime context state identity mismatch")
         if runtime_context.strategy_id != str(account_id or ""):
             raise ValueError("entry runtime context strategy/account identity mismatch")
-        actual_policy = policy_for(account_id)
         expected_policy_identity = runtime_context.entry_policy_fingerprint
         if (not expected_policy_identity
                 or _execution_policy_fingerprint_for(actual_policy) != expected_policy_identity):
@@ -1446,7 +1538,6 @@ def evaluate_entry_state(
         expected_quote_identity = dict(runtime_context.symbol_quote_fingerprints).get(requested_code)
         if not expected_quote_identity or actual_quote_identity != expected_quote_identity:
             raise ValueError("entry runtime context quote identity mismatch")
-    policy = actual_policy if runtime_context is not None else policy_for(account_id)
     reasons: list[str] = []
     gates: dict[str, Any] = {}
     scope = security_gate(code, quote.get("name"), quote.get("risk_flag"))
@@ -1454,7 +1545,7 @@ def evaluate_entry_state(
     if not scope["allowed"]:
         reasons.append(scope["reason"])
     if state.require_market_gate and state.market_state is not None:
-        market_check = market_gate(state.market_state, account_id)
+        market_check = market_gate(state.market_state, account_id, actual_policy)
         gates["market"] = market_check["market"]
         if market_check["blocked"]:
             reasons.append(market_check["reason"])
@@ -1497,12 +1588,12 @@ def evaluate_entry_state(
         "gates": gates,
         "policy": {
             "account_id": account_id,
-            "chase_lane": policy.chase_lane,
-            "manual_entry_review": policy.manual_entry_review,
-            "seat_reserve_owner": policy.seat_reserve_owner,
+            "chase_lane": actual_policy.chase_lane,
+            "manual_entry_review": actual_policy.manual_entry_review,
+            "seat_reserve_owner": actual_policy.seat_reserve_owner,
             "planner": EXECUTION_PLANNER_VERSION,
         },
-        "requires_manual_entry_review": bool(policy.manual_entry_review),
+        "requires_manual_entry_review": bool(actual_policy.manual_entry_review),
     }
 
 

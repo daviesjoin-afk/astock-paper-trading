@@ -70,7 +70,7 @@
 
 阶段状态：R31 **COMPLETE**；R32-A **COMPLETE（PR #216 MERGED）**。
 
-## R32-B Active 可比较证据闭环（IN PROGRESS）
+## R32-B Active 可比较证据闭环（COMPLETE）
 
 | 场景 / 契约 | 实现位置 | 回归用例 | 状态 |
 | --- | --- | --- | --- |
@@ -79,7 +79,35 @@
 | 缺失 owner fact 明确 unavailable；后续出现新归档事实不升级已捕获结果 | `execution_planner`、`paper_decision_audit` | `test_execution_planner.ExecutionStateBuilderTests.test_missing_owner_fact_remains_unavailable_after_a_later_archive_fact` | ✅ |
 | 决策审计保存固定 reason code，不自行补查当前状态 | `paper_decision_audit` | `test_paper_decision_audit.py` | ✅ |
 
-阶段状态：R32-A **COMPLETE**；R32-B **IN PROGRESS**；R32-C、R33 **NOT STARTED**。
+阶段状态：R32-A **COMPLETE**；R32-B **COMPLETE（PR #217 MERGED）**。
+
+## R32-C 隔离式 Shadow Runtime（IN REVIEW）
+
+| 场景 / 契约 | 实现位置 | 回归用例 | 状态 |
+| --- | --- | --- | --- |
+| Environment identity 对象键及集合顺序稳定；冻结输入与调用者嵌套对象脱离；绑定 Active context、session、decision instant、market、quote、factor、tradability 与 execution ruleset | `shadow_runtime.ComparableEnvironmentIdentity`、`FrozenShadowEnvironment` | `test_shadow_runtime.py` | ✅ |
+| Active capture 的七个共享环境维度（session、decision instant、market policy、market snapshot、quote、tradability、execution ruleset identity）逐项与环境 identity 相符，任一维不同即 NOT_COMPARABLE | `shadow_runtime.FrozenShadowEnvironment` | `test_shadow_runtime.py`（C6 逐维非空真控制） | ✅ |
+| tradability 只接受 owner 的 typed immutable decision；Shadow execution 不读取 archive repository | `shadow_runtime.FrozenShadowEnvironment` | `test_shadow_runtime.py`（C3、typed evidence） | ✅ |
+| 同一冻结环境、exact Challenger version、reference state 与 reference capital 得到相同 append-only ShadowRun | `shadow_runtime.run_shadow` | `test_shadow_runtime.py`（C1） | ✅ |
+| decision 与 quote freshness 使用显式 `decision_at`，不读取机器时钟 | `execution_planner.evaluate_entry_state` | `test_shadow_runtime.py`（C2） | ✅ |
+| Shadow runner 不读 provider/archive/cache；只接受冻结 Active evidence | `shadow_runtime` | `test_shadow_runtime.py`（C3） | ✅ |
+| ShadowRun repository 只写自身 append-only 表；正式 cash/positions/lots/orders/fills/reservations/risk decisions/position risk state 不变 | `shadow_run_repository`、migration v24 | `test_shadow_runtime.py`（C4） | ✅ |
+| exact challenger lifecycle 必须为 `shadow`；环境不一致、continuation 未显式绑定 prior run 时 fail closed | `shadow_run_service`、`shadow_runtime.evaluate_shadow` | `test_shadow_runtime.py`（C5–C7） | ✅ |
+| 新 run 后按显式 ID 重读旧 run，旧 fingerprint/replay 不变；不提供 latest fallback | `shadow_run_repository.get_run` | `test_shadow_runtime.py`（C8） | ✅ |
+| Entry 与 execution 共用 isolated reference cash/state；formal cash 和 formal portfolio occupancy 不进入 Challenger 运行 | `shadow_runtime.evaluate_shadow` | `test_shadow_runtime.py`（C9–C10） | ✅ |
+| continuation 跨 session 使已有持仓可卖并重置当日成交量；同 session 保留 T+1 与消费量状态 | `shadow_runtime._state_for_run` | `test_shadow_runtime.py`（C8） | ✅ |
+| run evidence 保存本次消费的 candidate 输入（requested qty、reference price、捕获 EntryGateState 全字段、risk identity）；重复 `(symbol, side)` candidate 拒绝 | `shadow_runtime.evaluate_shadow` | `test_shadow_runtime.py`（evidence inputs、duplicate legs） | ✅ |
+| run-level evidence 保存本次消费的 exact Entry Policy identity（owner projection + fingerprint + 绑定身份 + 策略行 id），可按 run ID 从 repository 逐字节读回 | `execution_planner.ExecutionPolicySnapshot`、`shadow_runtime.evaluate_shadow`、`shadow_run_repository` | `test_shadow_runtime.py`（frozen entry policy evidence、DB 往返） | ✅ |
+| 显式冻结策略后，owner 策略表改成另一份策略、且 `policy_for` 直接抛错，replay 的 fingerprint 与 entry 结果仍逐字节不变 | `shadow_run_service.run_shadow`、`shadow_runtime.evaluate_shadow` | `test_shadow_runtime.py`（replay invariant、服务端捕获一次） | ✅ |
+| 市场灯暂停文案来自本次冻结的策略，而不是当前策略表 | `execution_planner.market_gate`、`execution_planner.evaluate_entry_state` | `test_shadow_runtime.py`（frozen market reason）、`test_execution_planner.py`（declared policy） | ✅ |
+| 显式 policy 与 runtime context fingerprint 不一致时 fail closed，不回退当前策略表自动纠正；绑定到别的 account 的策略被拒 | `execution_planner.evaluate_entry_state`、`execution_planner.ExecutionPolicySnapshot` | `test_execution_planner.py`（frozen policy mismatch、forged binding） | ✅ |
+| 手改 `context_fingerprint` 的伪造 context 被拒（重建校验不是恒真） | `shadow_runtime._rebuild_runtime_context` | `test_shadow_runtime.py`（forged context） | ✅ |
+| 挑战者捕获的 `position_limit` 仍然生效；Shadow 只隔离正式占位/共享池预留 | `shadow_runtime.evaluate_shadow` | `test_shadow_runtime.py`（capacity binding） | ✅ |
+| 决策路径不打开数据库；provider/archive 读取为 0 | `shadow_runtime.evaluate_shadow` | `test_shadow_runtime.py`（C3、no-database） | ✅ |
+| ShadowRun DDL 单一事实来源；migration v24 与 `init_db` 两条路径调用同一函数，既有账本升级后表与 append-only guard 齐备 | `paper_schema_migrations.ensure_shadow_runs_table`、`paper_trading.init_db` | `test_shadow_runtime.py`（v24 DDL owner、existing ledger init_db） | ✅ |
+| 语义 mutation（canonical order、provider、环境、账本、prior run、lifecycle、wall clock、reference cash、T+1 rollover、typed evidence、共享环境维度比较、candidate 唯一性、证据输入、frozen entry policy） | `work/r32c_shadow_runtime_mutation_check.py` | 16/16 DETECTED，restore SHA256 PASS | ✅ |
+
+阶段状态：R32-A/B **COMPLETE**；R32-C **IN REVIEW**；R32-D/E、R33 **NOT STARTED**。
 | 策略产品线端到端（内置模板 + 用户策略同链路） | — | `test_strategy_product_line_e2e.py` | ✅ |
 | 风险收紧（画像只能更严，系统键不可触碰） | `strategy_risk_enforcement.py` | `test_strategy_risk_enforcement.py`、`test_asymmetric_risk_gate_wiring.py` | ✅ |
 

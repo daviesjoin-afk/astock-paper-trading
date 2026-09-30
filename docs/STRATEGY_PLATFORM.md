@@ -63,7 +63,7 @@ research → validation_failed
 | --- | --- | --- |
 | `draft` / `candidate` / `research` | 编辑、候选和研究阶段，不进入正式新周期 | 由显式 transition table 决定 |
 | `validated` | exact version 已通过 R29 PIT/OOS validation | `shadow`，或安全迁移 |
-| `shadow` | exact version 已通过 R29+R30 promotion policy；不代表已有 R32 shadow runtime | `paper` 暂因 shadow evidence owner 缺失而 blocked |
+| `shadow` | exact version 已通过 R29+R30 promotion policy；R32-C 提供隔离式 Challenger run evidence | `paper` 仍由 R31 Promotion Policy 判定；R32-C 不做晋级 |
 | `paper` | 可进入新的 paper simulation 周期 | `production_sim` 暂因下游 runtime evidence owner 缺失而 blocked，也可安全降级/暂停/退休 |
 | `production_sim` | 当前最高正式模拟运行级别 | 安全降级、暂停或退休 |
 | `degraded` / `paused` | 禁止新正式周期；保留版本与历史 | 暂停或退休 |
@@ -86,7 +86,7 @@ research → validation_failed
 
 ### R32 阶段状态与可比较运行上下文
 
-R31 生命周期与晋级边界、R32-A（Comparable Runtime Context）已完成。R32-B（Active Comparable Evidence Closure）正在实现；R32-C Shadow runtime 和 R33 **NOT STARTED**。R32-A 的市场事实 identity 由 `market_data_contract.snapshot_fingerprint()` 提供；策略精确版本、market policy、tradability fingerprint、execution ruleset 与现有 risk identity 一起组成不可变运行上下文。正式执行路径从 Tradability Archive 单次捕获事实，并让 context 指纹与执行决策复用同一事实；缺失时记录 `UNAVAILABLE` 和稳定原因码，不做历史回填。完整契约见 [`R32_COMPARABLE_RUNTIME_CONTEXT.md`](R32_COMPARABLE_RUNTIME_CONTEXT.md) 和 [`R32B_ACTIVE_COMPARABLE_EVIDENCE.md`](R32B_ACTIVE_COMPARABLE_EVIDENCE.md)。
+R31、R32-A（Comparable Runtime Context）、R32-B（Active Comparable Evidence Closure）已完成；R32-C（Isolated Shadow Runtime）正在审核；R32-D、R32-E、R33 **NOT STARTED**。Shadow 使用与 Active capture 对齐的 market、quote、tradability、factor fingerprints 和显式 decision instant，同时保留各自 exact strategy identity 与策略专属状态；它只追加写 ShadowRun evidence，不写正式账本。完整契约见 [`R32_COMPARABLE_RUNTIME_CONTEXT.md`](R32_COMPARABLE_RUNTIME_CONTEXT.md)、[`R32B_ACTIVE_COMPARABLE_EVIDENCE.md`](R32B_ACTIVE_COMPARABLE_EVIDENCE.md) 和 [`R32C_ISOLATED_SHADOW_RUNTIME.md`](R32C_ISOLATED_SHADOW_RUNTIME.md)。
 
 就绪后，所有消费者读同一份不可变契约 `StrategyRuntimeContext`（`strategy_runtime.StrategyRuntimeContext`）：
 

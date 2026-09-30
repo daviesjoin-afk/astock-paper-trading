@@ -296,6 +296,12 @@ MIGRATIONS = {
         # blocked / pending / 从未成交的 signal 没有任何 order 可借。
         (23, "新增信号的不可变周期归属字段 cycle_id（幂等，不回填）",
          paper_schema.ensure_signal_cycle_provenance),
+        # R32-C ShadowRun 是隔离 challenger 的唯一追加式证据 owner；不建立
+        # 与正式 paper cash/orders/fills/positions 平行的账本表。DDL 单一事实
+        # 来源在 paper_schema_migrations：migration 与 init_db 快路径调用同一
+        # 个函数，既有账本升级后不会缺表。
+        (24, "新增隔离式 ShadowRun 追加证据表",
+         paper_schema.ensure_shadow_runs_table),
     ],
     "adaptive_learning": [
         (1, "创建 schema_version 表", """
