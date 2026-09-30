@@ -302,6 +302,12 @@ MIGRATIONS = {
         # 个函数，既有账本升级后不会缺表。
         (24, "新增隔离式 ShadowRun 追加证据表",
          paper_schema.ensure_shadow_runs_table),
+        # R32-D 比对报告是 Active/Challenger 比对事实的唯一追加式 owner；只建
+        # 一张报告表，不建立 comparison_signal/execution/risk/performance 这类
+        # 平行 authority 表。DDL 单一事实来源同样在 paper_schema_migrations：
+        # migration 与 init_db 快路径调用同一个函数。
+        (25, "新增 Active/Challenger 比对报告追加证据表",
+         paper_schema.ensure_shadow_comparison_reports),
     ],
     "adaptive_learning": [
         (1, "创建 schema_version 表", """
