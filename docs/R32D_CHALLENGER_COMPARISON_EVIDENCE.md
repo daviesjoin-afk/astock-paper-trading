@@ -494,7 +494,7 @@ inventory 结论（BUY 路径的 `allowed=False` 来源，按 owner 事实分类
 
 | owner fact（分支变量） | authority | 说明 |
 | --- | --- | --- |
-| `dispatch_gate != "none"` 或 `dispatch_plan["blocked"]` | `EXECUTION` | 执行派发闸门的结论 |
+| `dispatch_gate != "none"` 或 `dispatch_plan["blocked"]` | `EXECUTION` | 执行派发闸门 / Execution Dispatch 的 hard block |
 | `count_only_blocked`（只有策略席位/共享池容量原因） | `ALLOCATION` | 容量/席位 owner |
 | `timing_block_reasons and not hard_reasons`（只有时机软阻断） | `TIMING` | 交易时段/时机 owner |
 | 其余复合结论（入场模型、证券范围、行情/数据类硬否决…） | `ENTRY` | Active admission owner 的复合结论 |
@@ -503,6 +503,7 @@ inventory 结论（BUY 路径的 `allowed=False` 来源，按 owner 事实分类
 要点：
 
 - 复合结论行**永不**标 `RISK`；它绑定刚创建的 `order_id`，authority 由产生该结论的**分支事实**决定（不是 `decision_name` / reason 文案）。
+- **Execution Dispatch 的 hard block 必须用原始 owner fact**：`dispatch_plan["blocked"]` 会先写进 `reasons` 使 `allowed` 变假，于是 `dispatch_gate = dispatch_plan["gate"] if allowed else "none"` 被抹成 `"none"`。只看被改写后的 `dispatch_gate` 会把"核验已驳回、由 Execution Authority 终止"错误持久化成 `ENTRY`。因此分类输入显式保留 `dispatch_blocked = bool(dispatch_plan.get("blocked"))`，`dispatch_blocked or dispatch_gate != "none"` → `EXECUTION`（真实 owner 输出里确实存在 `blocked=True, gate="none"`：`verification_required` + `verification_rejected`）。这是纯 provenance 修正，`allowed` / `order_status` / signal status / 派发语义 / 核验驳回行为 / 资金预占一律不变。
 - Risk Authority 的否决以**它自己的行**记录（`shared_risk_state_blocked`），并且仍绑定同一张订单 —— 那是买入路径在上面实际消费过的那份 owner output，写入当刻落库，不是事后重跑、也不是由复合结论冒充。
 - 市场/数据类硬否决当前没有独立的 owner boolean 暴露在该写入点（只有合并后的 reason 文案），因此按 admission owner 记 `ENTRY`；把它们细分成 `MARKET` 需要 owner 侧新增可判定的 owner fact，已登记为后续项，**不做字符串分类**。
 - 真实路径用例：R1（Risk Authority 否决 → RISK+ENTRY 两行都 exact-linked → 维度 PRESENT/AVAILABLE）、R2（入场闸门拒绝 → 只有 ENTRY，绝不 RISK，维度保持 UNAVAILABLE 且不降级）、R3（同一订单上再放一条 EXECUTION 行 → 只有 RISK 行进风险维度，execution 行不进）、R4（order-linked 必须声明 authority 的 write-time 强制 + 词表 owner）。

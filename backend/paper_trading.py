@@ -10034,7 +10034,11 @@ def _buy_order(conn, account, signal, quote, market, news, asof_day, *, all_quot
         qty < LOT_SIZE and not hard_reasons
         and set(sizing.get("binding_constraints") or []).issubset({"cash", "weight", "exposure", "industry"})
     )
-    if dispatch_plan.get("blocked"):
+    # Execution Dispatch 的 hard block 是 owner 事实：``blocked`` 会先写进 reasons，
+    # 因而让 ``allowed`` 变假、把 ``dispatch_gate`` 抹成 "none"。分类 provenance 时
+    # 必须用这个**原始 owner fact**，而不是被 allowed 改写后的 gate。
+    dispatch_blocked = bool(dispatch_plan.get("blocked"))
+    if dispatch_blocked:
         reasons.append(str(dispatch_plan["blocked_reason"]))
     # A Q3 sample is worth recording only if every ordinary execution/risk
     # gate also passed.  It must never turn stale quotes, a hard veto or an
@@ -10164,10 +10168,10 @@ def _buy_order(conn, account, signal, quote, market, news, asof_day, *, all_quot
         #
         # R32-E1：这一行是 Active admission owner 对**这张刚创建的订单**的复合结论，
         # 因此 (a) 写入当刻精确绑定 order_id，(b) authority 由产生该结论的**分支
-        # 事实**决定（不是 reason 文案）：执行派发闸门 → EXECUTION；只有席位/共享池
-        # 容量原因 → ALLOCATION；只有时机软阻断 → TIMING；其余复合结论 → ENTRY。
-        # 复合结论**永不**标 RISK。
-        if dispatch_gate != "none":
+        # 事实**决定（不是 reason 文案）：Execution Dispatch 的 hard block 或派发闸门
+        # → EXECUTION；只有席位/共享池容量原因 → ALLOCATION；只有时机软阻断 →
+        # TIMING；其余复合结论 → ENTRY。复合结论**永不**标 RISK。
+        if dispatch_blocked or dispatch_gate != "none":
             admission_authority = "EXECUTION"
         elif count_only_blocked:
             admission_authority = "ALLOCATION"

@@ -264,13 +264,21 @@ MUTATIONS = [
         '                      decision_kind="shared_risk_state_blocked")\n',
         "test_r32e1_active_buy_provenance.ActiveBuyDecisionProvenanceTests.test_r1_real_risk_authority_veto_is_exactly_linked",
     ),
+    # M-D27：Execution Dispatch 的 hard block 不再归 EXECUTION（退回只看被 allowed
+    #        改写后的 dispatch_gate，于是被错误记成 ENTRY）。
+    (
+        "backend/paper_trading.py",
+        '        if dispatch_blocked or dispatch_gate != "none":\n',
+        '        if dispatch_gate != "none":\n',
+        "test_r32e1_active_buy_provenance.ActiveBuyDecisionProvenanceTests.test_r5_execution_dispatch_hard_block_is_execution_provenance",
+    ),
 ]
 
 BASELINE_MODULES = ("test_shadow_comparison", "test_shadow_runtime",
                     "test_r32e1_active_buy_provenance")
 
 
-def run(args: tuple[str, ...], timeout: int = 90):
+def run(args: tuple[str, ...], timeout: int = 600):
     return subprocess.run(args, cwd=BACKEND, capture_output=True, text=True,
                           encoding="utf-8", errors="replace", timeout=timeout)
 

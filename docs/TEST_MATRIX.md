@@ -125,7 +125,8 @@
 | 旧的 caller-declared risk identity 输入与内联 projection 组装已删除（caller = 0）；owner risk policy shape 校验强制外部输入 | `strategy_runtime.is_risk_policy_projection`、`shadow_runtime.evaluate_shadow` | `test_shadow_comparison.py`（E1-8） | ✅ |
 | 执行经济学（滑点/费用/参与率/手数/T+1）未被本 PR 触碰 | `execution_planner`、`paper_trading_rules` | `test_shadow_comparison.py`（E1-9） | ✅ |
 | **真实 Active BUY production path**：驱动真实 `PT._buy_order`（owner 边界注入 owner 输出，不手工 INSERT 决策行）后，复合 admission 结论与 Risk Authority 否决各自成行、都精确绑定刚创建的 order_id；只有 RISK 行进 risk_rejection，容量/时机/派发拒绝绝不冒充 RISK，Risk 缺失时不降级 | `paper_trading._buy_order` | `test_r32e1_active_buy_provenance.py`（R1–R4） | ✅ |
-| 语义 mutation M-D1–M-D26（含 execution row 回流 risk_rejection、write-time authority 强制被删、exact-version 相等校验被删、canonical-shaped 伪造 policy 被接受、order 关联被换成 (account,code,side) 猜测、**BUY 复合结论丢弃 order linkage、复合 rejection 被标成 RISK、Risk Authority 证据被改 owner**） | `work/r32d_shadow_comparison_mutation_check.py` | 26/26 DETECTED，restore SHA256 PASS | ✅ |
+| **Execution Dispatch hard block 的 owner provenance**：`dispatch_plan["blocked"]=True` 时 `allowed` 变假会把 `dispatch_gate` 抹成 `"none"`，分类必须用原始 `blocked` 事实 → `EXECUTION`；`verification_required`+`verification_rejected` 这类真实 `blocked=True/gate="none"` 状态不得被记成 `ENTRY`（纯 provenance 修正，不改交易行为） | `paper_trading._buy_order` | `test_r32e1_active_buy_provenance.py`（R5、R6 三类矩阵） | ✅ |
+| 语义 mutation M-D1–M-D27（含 execution row 回流 risk_rejection、write-time authority 强制被删、exact-version 相等校验被删、canonical-shaped 伪造 policy 被接受、order 关联被换成 (account,code,side) 猜测、BUY 复合结论丢弃 order linkage、复合 rejection 被标成 RISK、Risk Authority 证据被改 owner、**dispatch hard block 退回只看被改写的 gate**） | `work/r32d_shadow_comparison_mutation_check.py` | 27/27 DETECTED，restore SHA256 PASS | ✅ |
 
 ## R32-D Active/Challenger 比对证据（IN REVIEW）
 

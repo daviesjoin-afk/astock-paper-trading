@@ -18,6 +18,7 @@ BACKEND = os.path.dirname(os.path.abspath(__file__))
 if BACKEND not in sys.path:
     sys.path.insert(0, BACKEND)
 
+import execution_dispatch as EPD  # noqa: E402
 import paper_trading as PT  # noqa: E402
 import shadow_comparison as SC  # noqa: E402
 import shadow_comparison_service as SCS  # noqa: E402
@@ -204,6 +205,73 @@ class ActiveBuyDecisionProvenanceTests(unittest.TestCase):
         self.assertEqual(3, dimension["active"]["detail"]["order_linked_rows_examined"])
         self.assertEqual(2, dimension["active"]["detail"][
             "order_linked_non_risk_authority_rows"])
+
+    # ── 5.C Execution Dispatch hard block → EXECUTION provenance ─────────────
+
+    def _execution_blocked_buy(self):
+        """Real Execution Dispatch hard block: verification required + rejected.
+
+        The owner runs its own logic (``verification_required`` profile plus the
+        persisted rejection fact); only its two input facts are supplied here, so
+        ``plan_execution_dispatch`` really produces ``blocked=True, gate="none"``
+        and the whole downstream path stays production code.
+        """
+        profile = {"verification_required": True, "batch": False, "ttl_minutes": None}
+        with mock.patch.object(PT, "_execution_profile_for_account",
+                               return_value=profile), \
+                mock.patch.object(EPD, "is_verification_rejected", return_value=True):
+            return self._run_buy()
+
+    def test_r5_execution_dispatch_hard_block_is_execution_provenance(self):
+        result, order, rows = self._execution_blocked_buy()
+        self.assertFalse(result.get("filled"))
+        authorities = [self._authority(row) for row in rows]
+        self.assertEqual(["EXECUTION"], authorities)
+        composite = rows[0]
+        self.assertEqual(int(order["id"]), int(composite["order_id"]))
+        self.assertEqual("rejected", composite["decision"])
+        self.assertIn("核验驳回", composite["reason"])
+        # The admission owner must not impersonate an execution hard block.
+        self.assertNotEqual("ENTRY", self._authority(composite))
+        self.assertEqual("shared_risk_state_blocked" not in composite["decision"], True)
+        evidence = self._capture(order)
+        linked = evidence.orders[0].risk_decision_evidence
+        self.assertEqual(["EXECUTION"],
+                         [item["decision_provenance"]["authority"] for item in linked])
+        # An execution hard block is never risk evidence.
+        dimension = self._risk_dimension(evidence)
+        self.assertEqual("UNAVAILABLE", dimension["legs"]["active"])
+        self.assertIsNone(dimension["active"]["risk_decision_evidence"])
+
+    def test_r6_three_rejection_owners_are_distinguishable(self):
+        """三类拒绝在同一矩阵里区分：RISK / ENTRY / EXECUTION。"""
+        def flow(**kwargs):
+            # paper_signals 的唯一键是 (account_id, signal_date, code)：同一矩阵
+            # 里连着跑三次真实买入前先清掉上一轮的信号/订单行，避免唯一键冲突。
+            with PT._db(immediate=True) as conn:
+                conn.execute("DELETE FROM paper_signals WHERE account_id=? AND code=?",
+                             (ACCOUNT, CODE))
+                conn.execute("DELETE FROM paper_orders WHERE account_id=? AND code=?",
+                             (ACCOUNT, CODE))
+            return self._run_buy(**kwargs)[2]
+
+        risk_rows = flow(veto={
+            "blocked": True, "reasons": ["共享资金池单日亏损 3.20% 触发熔断"],
+            "daily_loss_pct": 3.2, "drawdown_pct": 1.0,
+            "cooldown_until": None, "cooldown_active": False})
+        entry_rows = flow(
+            entry_block=(False, "入场价格闸门：当前价高于该策略允许的入场区间"))
+        profile = {"verification_required": True, "batch": False, "ttl_minutes": None}
+        with mock.patch.object(PT, "_execution_profile_for_account",
+                               return_value=profile), \
+                mock.patch.object(EPD, "is_verification_rejected", return_value=True):
+            execution_rows = flow()
+        self.assertEqual({"RISK", "ENTRY"}, {self._authority(r) for r in risk_rows})
+        self.assertEqual({"ENTRY"}, {self._authority(r) for r in entry_rows})
+        self.assertEqual({"EXECUTION"}, {self._authority(r) for r in execution_rows})
+        # Only the Risk Authority flow may claim RISK.
+        self.assertNotIn("RISK", {self._authority(r) for r in entry_rows})
+        self.assertNotIn("RISK", {self._authority(r) for r in execution_rows})
 
     # ── 架构约束：owner 词表与 write-time 强制 ───────────────────────────────
 
