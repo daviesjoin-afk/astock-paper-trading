@@ -265,6 +265,9 @@ version 显式提供且 != report.challenger_strategy_stamp.version
 comparison_report_id 缺失 / 取不到
   → 没有 Active comparator fact：active.available=false + unavailable_reason
     （Challenger 仅作为 registry_candidate 展示，comparison_bound=false）
+  → challenger 与 registry_head 是两个独立事实，允许不同：
+    requested candidate = explicit version（未提供则等于 head）
+    registry_head       = 真正的 current head（永不被 requested candidate 覆盖）
 ```
 
 因此历史 report 保持 exact identity：registry head 前进后，Workspace 仍显示 report 里那个旧版本，

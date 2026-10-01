@@ -114,6 +114,16 @@ class _PromotionFixture:
             checksum=self.version.checksum, definition=DEFINITION)
         self._pin_challenger(self._exact_challenger_stamp())
 
+    def _save_next_version(self):
+        """Move the registry head to a new immutable version and return that head."""
+        head = SR.get_version(self.spec.id, conn=self.paper)
+        SR.save_definition(self.paper, self.spec.id,
+                           {"dsl_ast": {"op": "lt", "left": {"op": "field", "name": "close"},
+                                        "right": {"op": "const", "value": 0}}},
+                           expected_version=int(head.version), actor="r32-final-test")
+        self.paper.commit()
+        return SR.get_version(self.spec.id, conn=self.paper)
+
     def _seed_state(self, state):
         """Fixture seed of the lifecycle state.
 
@@ -470,12 +480,7 @@ class ChallengerWorkspaceReadModelTests(_PromotionFixture, unittest.TestCase):
         stale_version = int(self.version.version)
         stale_checksum = self.version.checksum
         # The registry moves on: a new immutable version becomes the head.
-        SR.save_definition(self.paper, self.spec.id, {"dsl_ast": {"op": "lt",
-                          "left": {"op": "field", "name": "close"},
-                          "right": {"op": "const", "value": 0}}},
-                          expected_version=stale_version, actor="r32-final-test")
-        self.paper.commit()
-        head = SR.get_version(self.spec.id, conn=self.paper)
+        head = self._save_next_version()
         self.assertEqual(stale_version + 1, int(head.version))
         self.assertNotEqual(stale_checksum, head.checksum)
 
@@ -495,6 +500,32 @@ class ChallengerWorkspaceReadModelTests(_PromotionFixture, unittest.TestCase):
         self.assertFalse(view["lifecycle_promotion"]["eligible"])
         self.assertIn("strategy_version_changed",
                       view["lifecycle_promotion"]["blocking_reasons"])
+
+    def test_w1d_the_requested_candidate_never_impersonates_the_head(self):
+        stale_checksum = self.version.checksum
+        head = self._save_next_version()
+        self.assertEqual(int(self.version.version) + 1, int(head.version))
+        self.assertNotEqual(stale_checksum, head.checksum)
+        # No report, explicit stale version: the candidate is the requested one and
+        # the head stays the actual current head — two facts, allowed to differ.
+        view = self._read(version=int(self.version.version))
+        self.assertFalse(view["active"]["available"])
+        self.assertEqual("shadow_comparison_report_required",
+                         view["active"]["unavailable_reason"])
+        self.assertEqual(int(self.version.version), view["challenger"]["version"])
+        self.assertEqual(stale_checksum, view["challenger"]["checksum"])
+        self.assertEqual("registry_candidate", view["challenger"]["identity_source"])
+        self.assertFalse(view["challenger"]["comparison_bound"])
+        self.assertEqual(int(head.version), view["registry_head"]["version"])
+        self.assertEqual(head.checksum, view["registry_head"]["checksum"])
+        self.assertNotEqual(view["challenger"]["version"], view["registry_head"]["version"])
+        self.assertNotEqual(view["challenger"]["checksum"], view["registry_head"]["checksum"])
+        # And with no explicit version the candidate is the head itself.
+        implicit = self._read()
+        self.assertEqual(int(head.version), implicit["challenger"]["version"])
+        self.assertEqual(int(head.version), implicit["registry_head"]["version"])
+        self.assertEqual(head.checksum, implicit["challenger"]["checksum"])
+        self.assertEqual(head.checksum, implicit["registry_head"]["checksum"])
 
     def test_w1c_a_report_of_another_strategy_fails_closed(self):
         self._pin_foreign_challenger("another_strategy", 1, "f" * 64)

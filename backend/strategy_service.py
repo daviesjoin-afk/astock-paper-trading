@@ -568,6 +568,9 @@ def challenger_read_model(strategy_id: str, *, comparison_report_id: str | None 
         spec = SR.get(strategy_id, conn=conn)
         if spec is None:
             raise StrategyNotFound("unknown strategy id")
+        # The actual current head is its own owner fact: a caller-requested exact
+        # version must never be reported as the registry head.
+        registry_head = SR.get_version(strategy_id, conn=conn)
         report, reason = _exact_comparison_report(conn, comparison_report_id)
         if report is not None:
             challenger = _leg_from_report_stamp(
@@ -583,15 +586,13 @@ def challenger_read_model(strategy_id: str, *, comparison_report_id: str | None 
                 raise InvalidStrategyDefinition("shadow_comparison_identity_mismatch")
             if version is not None and int(version) != challenger["version"]:
                 raise InvalidStrategyDefinition("shadow_comparison_identity_mismatch")
-            legacy_head = SR.get_version(strategy_id, conn=conn)
         else:
             # No report ⇒ no Active comparator fact. The Challenger is shown as a
             # registry candidate so the page can explain what evidence is needed.
             candidate = (SR.get_version(strategy_id, version, conn=conn)
-                         if version is not None else SR.get_version(strategy_id, conn=conn))
+                         if version is not None else registry_head)
             if candidate is None:
                 raise StrategyNotFound("strategy version not found")
-            legacy_head = candidate
             challenger = {
                 "available": True,
                 "unavailable_reason": None,
@@ -625,8 +626,8 @@ def challenger_read_model(strategy_id: str, *, comparison_report_id: str | None 
             "active": active,
             "challenger": challenger,
             "registry_head": {
-                "version": (int(legacy_head.version) if legacy_head is not None else None),
-                "checksum": (legacy_head.checksum if legacy_head is not None else None),
+                "version": (int(registry_head.version) if registry_head is not None else None),
+                "checksum": (registry_head.checksum if registry_head is not None else None),
             },
             "comparison": _comparison_section(report, comparison_report_id, reason),
             "lifecycle_promotion": {

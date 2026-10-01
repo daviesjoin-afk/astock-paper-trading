@@ -19,6 +19,7 @@ to turn a named regression RED:
     M-F13 the frontend derives readiness from coverage instead of the owner
     M-F14 the workspace Active leg falls back to the endpoint's registry identity
     M-F15 the report's Challenger stops being bound to the endpoint strategy
+    M-F16 a caller-requested candidate is reported as the registry head
 
 Usage:  python work/r32_final_mutation_check.py
 """
@@ -161,6 +162,20 @@ MUTATIONS = [
         '            if False:\n'
         '                raise InvalidStrategyDefinition("shadow_comparison_identity_mismatch")\n',
         ("py", "test_r32_final_promotion.ChallengerWorkspaceReadModelTests.test_w1c_a_report_of_another_strategy_fails_closed"),
+    ),
+    # M-F16：requested candidate 冒充 registry head。
+    (
+        "backend/strategy_service.py",
+        '            candidate = (SR.get_version(strategy_id, version, conn=conn)\n'
+        '                         if version is not None else registry_head)\n'
+        '            if candidate is None:\n'
+        '                raise StrategyNotFound("strategy version not found")\n',
+        '            candidate = (SR.get_version(strategy_id, version, conn=conn)\n'
+        '                         if version is not None else registry_head)\n'
+        '            if candidate is None:\n'
+        '                raise StrategyNotFound("strategy version not found")\n'
+        '            registry_head = candidate\n',
+        ("py", "test_r32_final_promotion.ChallengerWorkspaceReadModelTests.test_w1d_the_requested_candidate_never_impersonates_the_head"),
     ),
 ]
 
