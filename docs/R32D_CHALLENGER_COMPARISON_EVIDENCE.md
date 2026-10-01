@@ -443,7 +443,6 @@ payload.decision_provenance = {
 无法证明 exact linkage 时：`active risk_rejection = UNAVAILABLE`，报告保持 `PARTIAL`，绝不让 execution evidence 把它升级成 `AVAILABLE`。
 
 ### 7.4 Challenger 的 owner-issued risk policy（E1-4）
-
 `strategy_runtime`（Risk Authority 的编译 owner）新增唯一投影入口，Active 腿与 Challenger 腿共用同一个形状：
 
 ```text
@@ -486,6 +485,27 @@ legacy run（只有 caller 声明）                 risk policy identity 标 DE
 | ruff / compileall | PASS |
 
 新增用例：E1-1 两腿共用一个 owner risk policy 契约、E1-2 Risk Authority 的 order-linked 决策使该维度 AVAILABLE（报告可达 AVAILABLE）、**E1-R1** execution_blocked 不进 risk_rejection、**E1-R2** 成功成交 action 同样不进、**E1-R3** 决定权在 authority label 而不在 decision 文案、**E1-R4** 别的 order 的风险证据被拒 + 无 authority 的 row 不被消费、**E1-R5** 同一 order 上两种 authority 各进各自的维度、**E1-R6/R7** 篡改 fingerprint / profile 都 fail closed、**E1-R8** current config 改变不影响 replay、**E1-R9** capture / supplied / recorded 三者 canonical 相等、**E1-R10** authority 词表与写入期强制由 owner 独占、E1-5/6 legacy 与未关联决策永不被借用、E1-7 order status 永不作为风险证据、E1-8 旧 caller-declared 输入已删除且 projection 只有一份、E1-9 执行经济学未动。
+
+### 7.6.1 真实 Active BUY production path（本轮新增）
+
+`test_r32e1_active_buy_provenance.py` **不手工 INSERT** 决策行：它直接驱动真实 `PT._buy_order`（真实门禁组合、真实订单行、真实 write-time provenance），只在**owner 边界**注入一个 owner 自己的输出（`_shared_risk_state` 或入场闸门），然后走 `capture_active_comparison_evidence()` 与纯 `risk_rejection` 维度。
+
+inventory 结论（BUY 路径的 `allowed=False` 来源，按 owner 事实分类，不按 reason 文案）：
+
+| owner fact（分支变量） | authority | 说明 |
+| --- | --- | --- |
+| `dispatch_gate != "none"` 或 `dispatch_plan["blocked"]` | `EXECUTION` | 执行派发闸门的结论 |
+| `count_only_blocked`（只有策略席位/共享池容量原因） | `ALLOCATION` | 容量/席位 owner |
+| `timing_block_reasons and not hard_reasons`（只有时机软阻断） | `TIMING` | 交易时段/时机 owner |
+| 其余复合结论（入场模型、证券范围、行情/数据类硬否决…） | `ENTRY` | Active admission owner 的复合结论 |
+| `risk_state["blocked"]`（`_shared_risk_state` = 共享池熔断/回撤/冷静期） | **独立 `RISK` 行** | Risk Authority 自己的否决，与复合结论分开成行 |
+
+要点：
+
+- 复合结论行**永不**标 `RISK`；它绑定刚创建的 `order_id`，authority 由产生该结论的**分支事实**决定（不是 `decision_name` / reason 文案）。
+- Risk Authority 的否决以**它自己的行**记录（`shared_risk_state_blocked`），并且仍绑定同一张订单 —— 那是买入路径在上面实际消费过的那份 owner output，写入当刻落库，不是事后重跑、也不是由复合结论冒充。
+- 市场/数据类硬否决当前没有独立的 owner boolean 暴露在该写入点（只有合并后的 reason 文案），因此按 admission owner 记 `ENTRY`；把它们细分成 `MARKET` 需要 owner 侧新增可判定的 owner fact，已登记为后续项，**不做字符串分类**。
+- 真实路径用例：R1（Risk Authority 否决 → RISK+ENTRY 两行都 exact-linked → 维度 PRESENT/AVAILABLE）、R2（入场闸门拒绝 → 只有 ENTRY，绝不 RISK，维度保持 UNAVAILABLE 且不降级）、R3（同一订单上再放一条 EXECUTION 行 → 只有 RISK 行进风险维度，execution 行不进）、R4（order-linked 必须声明 authority 的 write-time 强制 + 词表 owner）。
 
 ### 7.7 本 PR 的维护性报告
 

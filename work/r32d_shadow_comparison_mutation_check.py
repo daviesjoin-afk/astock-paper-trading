@@ -235,9 +235,39 @@ MUTATIONS = [
         '        raise ValueError("challenger_risk_policy_identity_mismatch")\n',
         "test_shadow_comparison.ShadowComparisonTests.test_e1_r7_tampered_profile_fails_closed",
     ),
+    # M-D24：Active BUY 复合结论已拿到 order_id 却丢弃 linkage。
+    (
+        "backend/paper_trading.py",
+        '        _risk_log(conn, account["id"], code, "buy", decision_name, reason, risk,\n'
+        '                  order_id=int(cursor.lastrowid), authority=admission_authority,\n'
+        '                  decision_kind=decision_name)\n',
+        '        _risk_log(conn, account["id"], code, "buy", decision_name, reason, risk,\n'
+        '                  authority=admission_authority,\n'
+        '                  decision_kind=decision_name)\n',
+        "test_r32e1_active_buy_provenance.ActiveBuyDecisionProvenanceTests.test_r1_real_risk_authority_veto_is_exactly_linked",
+    ),
+    # M-D25：复合 ENTRY rejection 被错误标成 RISK。
+    (
+        "backend/paper_trading.py",
+        '        else:\n'
+        '            admission_authority = "ENTRY"\n',
+        '        else:\n'
+        '            admission_authority = "RISK"\n',
+        "test_r32e1_active_buy_provenance.ActiveBuyDecisionProvenanceTests.test_r2_non_risk_rejection_is_never_labelled_risk",
+    ),
+    # M-D26：真实 Risk Authority 的 BUY evidence 被押成非 owner authority。
+    (
+        "backend/paper_trading.py",
+        '                      order_id=int(cursor.lastrowid), authority="RISK",\n'
+        '                      decision_kind="shared_risk_state_blocked")\n',
+        '                      order_id=int(cursor.lastrowid), authority="ENTRY",\n'
+        '                      decision_kind="shared_risk_state_blocked")\n',
+        "test_r32e1_active_buy_provenance.ActiveBuyDecisionProvenanceTests.test_r1_real_risk_authority_veto_is_exactly_linked",
+    ),
 ]
 
-BASELINE_MODULES = ("test_shadow_comparison", "test_shadow_runtime")
+BASELINE_MODULES = ("test_shadow_comparison", "test_shadow_runtime",
+                    "test_r32e1_active_buy_provenance")
 
 
 def run(args: tuple[str, ...], timeout: int = 90):

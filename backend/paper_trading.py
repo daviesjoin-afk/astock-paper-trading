@@ -10161,7 +10161,32 @@ def _buy_order(conn, account, signal, quote, market, news, asof_day, *, all_quot
         # §56：闸门未放行的决策在此记录一次 risk 事件。成功路径的 risk log 与
         # audit 由 execution_planner.commit_fill 统一写入，绝不在此重复记录
         # （否则同一笔成交会在 paper_risk_decisions 里出现两次）。
-        _risk_log(conn, account["id"], code, "buy", decision_name, reason, risk)
+        #
+        # R32-E1：这一行是 Active admission owner 对**这张刚创建的订单**的复合结论，
+        # 因此 (a) 写入当刻精确绑定 order_id，(b) authority 由产生该结论的**分支
+        # 事实**决定（不是 reason 文案）：执行派发闸门 → EXECUTION；只有席位/共享池
+        # 容量原因 → ALLOCATION；只有时机软阻断 → TIMING；其余复合结论 → ENTRY。
+        # 复合结论**永不**标 RISK。
+        if dispatch_gate != "none":
+            admission_authority = "EXECUTION"
+        elif count_only_blocked:
+            admission_authority = "ALLOCATION"
+        elif timing_block_reasons and not hard_reasons:
+            admission_authority = "TIMING"
+        else:
+            admission_authority = "ENTRY"
+        _risk_log(conn, account["id"], code, "buy", decision_name, reason, risk,
+                  order_id=int(cursor.lastrowid), authority=admission_authority,
+                  decision_kind=decision_name)
+        if risk_state.get("blocked"):
+            # 独立的 Risk Authority 结论（共享池熔断/回撤/冷静期）：这正是买入路径
+            # 在上面实际消费过的那份 owner output，写入当刻绑定同一张订单 —— 不是
+            # 事后重跑风控，也不是由复合结论冒充。
+            _risk_log(conn, account["id"], code, "buy", "shared_risk_state_blocked",
+                      "；".join(str(item) for item in risk_state.get("reasons") or ()),
+                      {"account_risk": risk_state},
+                      order_id=int(cursor.lastrowid), authority="RISK",
+                      decision_kind="shared_risk_state_blocked")
         if (risk.get("slot_borrow") or {}).get("allowed"):
             risk["slot_borrow_rollback"] = _rollback_slot_borrow(conn, risk["slot_borrow"], cycle_id=current_cycle["id"])
         if order_status in EPD.GATED_ORDER_STATUSES:

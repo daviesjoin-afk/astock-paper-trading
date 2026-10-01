@@ -744,6 +744,13 @@ def run(context: RiskRunContext, *, ports: RiskServicePorts):
                      *strategy_stamp, sell_cycle_id),
                 )
                 order_id = int(cursor.lastrowid)
+                # R32-E1：这条卖出委托由 Risk Authority 的退出决策产生，因此在写入
+                # 当刻把**当时实际消费的那份 owner 结论**绑定到该订单（不是事后重跑
+                # 风控，也不是由 execution 结果冒充）。
+                _risk_log(conn, position["account_id"], position["code"], "sell",
+                          quality_action or "risk_exit", quality_reason or reason, detail,
+                          order_id=order_id, authority="RISK",
+                          decision_kind=str(quality_action or "risk_exit"))
                 EP.commit_fill(
                     conn,
                     account=account_map.get(position["account_id"], {"id": position["account_id"]}),

@@ -1228,7 +1228,9 @@ def ensure_risk_decision_order_linkage(conn):
 #: owner: every writer must state one of these, and no reader may ever infer an
 #: authority from a table name, a decision string, a reason, a status, or the
 #: mere presence of an order id.
-RISK_DECISION_AUTHORITIES = ("EXECUTION", "RISK", "ENTRY", "INTRADAY", "AUDIT")
+RISK_DECISION_AUTHORITIES = (
+    "EXECUTION", "RISK", "ENTRY", "ALLOCATION", "TIMING", "INTRADAY", "AUDIT",
+)
 RISK_DECISION_PROVENANCE_SCHEMA_VERSION = "risk-decision-provenance-v1"
 
 
