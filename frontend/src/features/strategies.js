@@ -574,7 +574,7 @@ export async function wbCreatePromotionProposal(strategyId,targetState){
   var evidence={};
   if(value('wbPromotionR29').trim()) evidence.r29_run_key=value('wbPromotionR29').trim();
   if(value('wbPromotionR30').trim()) evidence.r30_report_key=value('wbPromotionR30').trim();
-  if(value('wbPromotionShadow').trim()) evidence.future_shadow_evidence_ref=value('wbPromotionShadow').trim();
+  if(value('wbPromotionComparisonReport').trim()) evidence.shadow_comparison_report_id=value('wbPromotionComparisonReport').trim();
   if(value('wbPromotionPaper').trim()) evidence.future_paper_evidence_ref=value('wbPromotionPaper').trim();
   try{
     var proposal=await apiPostJson('/api/strategies/'+encodeURIComponent(strategyId)+'/promotion/proposals',{
@@ -722,7 +722,7 @@ export async function wbOpenDetail(strategyId){
   var evidenceInputs='<div class="strategy-promotion-evidence">'
     +'<label>Exact R29 run key<input id="wbPromotionR29" maxlength="64" autocomplete="off"></label>'
     +'<label>Exact R30 report key<input id="wbPromotionR30" maxlength="64" autocomplete="off"></label>'
-    +'<label>Future shadow evidence ref<input id="wbPromotionShadow" autocomplete="off"></label>'
+    +'<label>Exact ShadowComparisonReport id<input id="wbPromotionComparisonReport" maxlength="64" autocomplete="off"></label>'
     +'<label>Future paper runtime evidence ref<input id="wbPromotionPaper" autocomplete="off"></label></div>';
   var historyHtml=historyRows||'<li>当前 exact version 尚无生命周期事件。</li>';
   box.innerHTML='<header class="strategy-editor-head"><h3>'+adaptiveEsc(item.name||item.id)+' '+wbStatusBadge(lifecycle.state||item.status)+'</h3>'

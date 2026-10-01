@@ -10,16 +10,14 @@ from __future__ import annotations
 import datetime as dt
 import hashlib
 import json
-import sqlite3
 from typing import Any, Mapping
 
 import promotion_science as PS
-import execution_verification as EV
 
 __all__ = [
     "STRATEGY_CHAMPION_VERSION", "ROLE_CHAMPION", "ROLE_CHALLENGER",
     "STATUS_SHADOW", "STATUS_READY", "STATUS_PROMOTED", "STATUS_ROLLED_BACK",
-    "PROMOTION_TOLERANCE", "active_runtime_checksum", "collect_ledger_metrics",
+    "PROMOTION_TOLERANCE", "active_runtime_checksum",
     "collect_shadow_ledger_metrics", "compare_for_promotion", "ensure_schema",
     "evaluate_challenger", "open_challenger", "promote_challenger",
     "rollback_challenger", "run_shadow_context", "run_shadow_counterfactual",
@@ -165,78 +163,6 @@ def _metric_result(*, realized, denom, buy_amount, attempts, filled_buys, per_co
         "concentration_hhi": round(hhi, 4), "filled_orders": int(filled_buys),
         "version": STRATEGY_CHAMPION_VERSION,
     }
-
-
-def collect_ledger_metrics(conn, strategy_id: str, since: str, until: str) -> dict[str, Any]:
-    """Legacy formal-ledger helper retained for callers outside promotion.
-
-    **Round-10 §9 审计结论：dead / legacy，无生产调用者。**
-
-    promotion 路径只使用 :func:`collect_shadow_ledger_metrics`（见
-    ``compare_for_promotion``），本函数在 ``backend/`` 内除自身定义外仅被
-    ``test_strategy_invariants`` 调用。它保留在模块导出表里是为了兼容仓库外
-    的调用方，因此**登记为 legacy**，不得作为当前持仓语义的来源。
-
-    执行绩效（收益 / 回撤 / 换手 / 成交率）只统计**已验证**成交：``status='filled'``
-    只是账本自称，没有成交流水证据的行不得参与策略排名。
-
-    关于 ``carried_value``：它衡量的是「``since`` 之前建仓、至今仍计入分母的
-    历史持仓成本」，属于**历史评价窗口**语义。旧实现直接读 ``paper_positions``
-    投影的 ``SUM(qty*cost) WHERE entry_date<since`` —— 那既用了当前投影冒充
-    ``since`` 时点的事实，又可能把旧周期残留镜像行算进来。按规格「不能用当前
-    状态解释历史」，这里改为**只统计 ``since`` 之前已取得、且带 durable 取得
-    证据的 lot**；无法证明的部分返回 0 并显式标注，而不是拿今天的投影顶上。
-    """
-    orders = [dict(row) for row in conn.execute(
-        """SELECT side,status,code,COALESCE(amount,0) amount,COALESCE(realized_pnl,0) realized_pnl,
-                  executed_at,created_at FROM paper_orders WHERE account_id=? AND status='filled'
-               AND """ + EV.VERIFIED_PREDICATE + """
-               AND executed_at IS NOT NULL AND executed_at>=? AND executed_at<? AND COALESCE(amount,0)>0""",
-        (str(strategy_id), str(since), str(until)),
-    ).fetchall()]
-    attempts = conn.execute(
-        """SELECT COUNT(*) FROM paper_orders WHERE account_id=? AND side='buy'
-              AND ((created_at>=? AND created_at<?) OR (executed_at>=? AND executed_at<?))""",
-        (str(strategy_id), str(since), str(until), str(since), str(until)),
-    ).fetchone()[0]
-    buys = [item for item in orders if item["side"] == "buy"]
-    buy_amount = sum(float(item["amount"] or 0) for item in buys)
-    per_code: dict[str, float] = {}
-    for item in buys:
-        per_code[item["code"]] = per_code.get(item["code"], 0.0) + float(item["amount"] or 0)
-    daily: dict[str, float] = {}
-    for item in orders:
-        if item["side"] == "sell":
-            day = str(item["executed_at"])[:10]
-            daily[day] = daily.get(day, 0.0) + float(item["realized_pnl"] or 0)
-    cumulative = peak = max_drawdown = 0.0
-    for day in sorted(daily):
-        cumulative += daily[day]
-        peak = max(peak, cumulative)
-        max_drawdown = max(max_drawdown, peak - cumulative)
-    # 历史评价窗口的底仓成本：只看 ``since`` 之前取得、且有 durable 取得证据的
-    # lot（``acquired_at`` 是该 lot 的取得事实）。不用 paper_positions 投影，
-    # 也不用「今天的持仓」冒充历史。
-    try:
-        carried = conn.execute(
-            "SELECT COALESCE(SUM(remaining_qty*cost),0) FROM paper_position_lots"
-            " WHERE account_id=? AND acquired_at<?",
-            (str(strategy_id), str(since)[:10]),
-        ).fetchone()[0]
-        carried_evidence = "lot_acquisition_evidence"
-    except sqlite3.Error:
-        # 无 lots 表（极老 schema）⇒ 历史底仓无法证明，返回 0 而不是回落到投影。
-        carried = 0
-        carried_evidence = "unprovable_no_lot_ledger"
-    carried_value = float(carried or 0)
-    result = _metric_result(realized=sum(float(item["realized_pnl"] or 0) for item in orders if item["side"] == "sell"),
-                            denom=max(buy_amount + carried_value, 1.0), buy_amount=buy_amount, attempts=attempts,
-                            filled_buys=len(buys), per_code=per_code, navs=[], since=since, until=until)
-    result["max_drawdown_pct"] = round(max_drawdown / max(buy_amount + carried_value, 1.0) * 100.0, 4)
-    result["carried_value"] = round(carried_value, 2)
-    result["carried_value_evidence"] = carried_evidence
-    result["legacy_helper"] = True
-    return result
 
 
 def collect_shadow_ledger_metrics(conn, challenger_id: int, role: str, since: str, until: str) -> dict[str, Any]:

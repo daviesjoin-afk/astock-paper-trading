@@ -93,26 +93,6 @@ class PoolExposureInvariantTests(unittest.TestCase):
             self.assertLessEqual(sum(allocation["limits"].values()), 15)
             self.assertNotIn(removed.strategy_id, allocation["limits"])
 
-    def test_ledger_metrics_replay_for_an_unknown_account(self):
-        """删除策略后指标重放不报错（空序列即可）。"""
-        import strategy_champion as SCM
-
-        conn = sqlite3.connect(":memory:")
-        conn.row_factory = sqlite3.Row
-        conn.executescript(
-            """CREATE TABLE paper_orders(id INTEGER PRIMARY KEY, account_id TEXT,
-                side TEXT, code TEXT, amount REAL, status TEXT, realized_pnl REAL,
-                executed_at TEXT, created_at TEXT,
-                execution_status TEXT, execution_verified INTEGER);
-            CREATE TABLE paper_positions(account_id TEXT, code TEXT, qty INTEGER,
-                cost REAL, entry_date TEXT);"""
-        )
-        metrics = SCM.collect_ledger_metrics(
-            conn, "deleted_strategy",
-            (dt.datetime.now() - dt.timedelta(days=5)).isoformat(timespec="seconds"),
-            dt.datetime.now().isoformat(timespec="seconds"))
-        self.assertEqual(0.0, metrics["return_pct"])
-
 
 class SymbolAggregateInvariantTests(unittest.TestCase):
     """不变式 2：单票 aggregate 不越界。"""
