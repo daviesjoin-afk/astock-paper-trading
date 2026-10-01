@@ -232,6 +232,20 @@ def get_strategy_lifecycle(strategy_id: str):
         _raise_http(exc)
 
 
+@router.get("/{strategy_id}/challenger")
+def get_strategy_challenger(
+    strategy_id: str,
+    comparison_report_id: Annotated[str | None, Query(max_length=64)] = None,
+    version: Annotated[int | None, Query(ge=1)] = None,
+):
+    """Active vs Challenger workspace facts for exactly the named evidence."""
+    try:
+        return SVC.challenger_read_model(
+            strategy_id, comparison_report_id=comparison_report_id, version=version)
+    except SVC.StrategyError as exc:
+        _raise_http(exc)
+
+
 @router.post("/{strategy_id}/promotion/proposals", status_code=201)
 def create_strategy_promotion_proposal(
     strategy_id: str, payload: Models.PromotionProposalRequest | None = None,

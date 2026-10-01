@@ -10282,12 +10282,6 @@ def _buy_order(conn, account, signal, quote, market, news, asof_day, *, all_quot
     return {"filled": True, "code": code, "qty": qty, "price": round(fill_price, 2)}
 
 
-def _manual_risk_state(*args, **kwargs):
-    """Facade (Phase 2): moved to manual_orders. Original signature: _manual_risk_state(conn, account, nav, asof_day)"""
-    from manual_orders import _manual_risk_state as _impl
-    return _impl(*args, **kwargs)
-
-
 def _manual_order_plan(*args, **kwargs):
     """Facade (Phase 2): moved to manual_orders. Original signature: _manual_order_plan("""
     from manual_orders import _manual_order_plan as _impl

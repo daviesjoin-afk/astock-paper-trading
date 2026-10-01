@@ -21,6 +21,25 @@ POLICY_VERSION = "strategy-promotion-policy-v1"
 PROPOSER_TYPES = frozenset({"human", "system", "ai"})
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 
+#: Provenance paths the shadow -> paper evidence relies on. The report must carry
+#: its own owner provenance for each of them: a report whose provenance map is
+#: absent or degraded is not admissible. This is a presence/ownership check over
+#: the owner's own labels — never a threshold, a score, or a comparison of one
+#: strategy against another.
+REQUIRED_COMPARISON_PROVENANCE = (
+    "active.order_lifecycle_columns",
+    "active.signal_decision",
+    "active.admission_decision",
+    "active.execution_evidence",
+    "active.runtime_context",
+    "challenger.signal",
+    "challenger.entry",
+    "challenger.execution",
+    "comparison.deltas",
+    "comparison.coverage",
+    "comparison.active_order_lifecycle",
+)
+
 
 class PromotionError(ValueError):
     """Stable rejection from the promotion policy or proposal ledger."""
@@ -57,18 +76,21 @@ def _thaw(value):
 class PromotionEvidenceBundle:
     r29_run_key: str | None = None
     r30_report_key: str | None = None
-    future_shadow_evidence_ref: str | None = None
+    #: Exact identity of the immutable ``ShadowComparisonReport`` that carries the
+    #: shadow -> paper evidence. Exactly one identity, the one the owner already
+    #: persists (``report_id == report_fingerprint``); no second comparison key is
+    #: invented here.
+    shadow_comparison_report_id: str | None = None
     future_paper_evidence_ref: str | None = None
 
     def __post_init__(self):
-        for key in ("r29_run_key", "r30_report_key"):
+        for key in ("r29_run_key", "r30_report_key", "shadow_comparison_report_id"):
             value = getattr(self, key)
             if value is not None and (not isinstance(value, str) or not _SHA256.fullmatch(value)):
                 raise PromotionError(f"{key}_invalid")
-        for key in ("future_shadow_evidence_ref", "future_paper_evidence_ref"):
-            value = getattr(self, key)
-            if value is not None and (not isinstance(value, str) or not value.strip()):
-                raise PromotionError(f"{key}_invalid")
+        value = self.future_paper_evidence_ref
+        if value is not None and (not isinstance(value, str) or not value.strip()):
+            raise PromotionError("future_paper_evidence_ref_invalid")
 
     @classmethod
     def from_mapping(cls, raw: Mapping | None):
@@ -76,7 +98,7 @@ class PromotionEvidenceBundle:
             raw = {}
         if not isinstance(raw, Mapping):
             raise PromotionError("promotion_evidence_bundle_invalid")
-        allowed = {"r29_run_key", "r30_report_key", "future_shadow_evidence_ref",
+        allowed = {"r29_run_key", "r30_report_key", "shadow_comparison_report_id",
                    "future_paper_evidence_ref"}
         if set(raw) - allowed:
             raise PromotionError("promotion_evidence_bundle_unknown_field")
@@ -84,7 +106,7 @@ class PromotionEvidenceBundle:
 
     def projection(self):
         return {"r29_run_key": self.r29_run_key, "r30_report_key": self.r30_report_key,
-                "future_shadow_evidence_ref": self.future_shadow_evidence_ref,
+                "shadow_comparison_report_id": self.shadow_comparison_report_id,
                 "future_paper_evidence_ref": self.future_paper_evidence_ref}
 
 
@@ -149,7 +171,7 @@ PROMOTION_RULES = {
     ("research", "validated"): ("r29_run_key",),
     ("research", "validation_failed"): ("deterministic_r29_failure_evidence",),
     ("validated", "shadow"): ("r29_run_key", "r30_report_key"),
-    ("shadow", "paper"): ("future_shadow_evidence_ref",),
+    ("shadow", "paper"): ("shadow_comparison_report_id",),
     ("paper", "production_sim"): ("future_paper_evidence_ref",),
 }
 
@@ -283,6 +305,91 @@ def _verify_r30(evidence_conn, report_key: str, run_key: str,
     return report, None
 
 
+def _verify_shadow_comparison(conn: sqlite3.Connection, report_id: str,
+                              identity: Mapping):
+    """Verify one exact ``ShadowComparisonReport`` as the shadow -> paper evidence.
+
+    The comparison report is the single owner of Active/Challenger comparison
+    facts, so this policy verifies *that* exact immutable record and nothing else:
+    it never searches for a latest comparison, a current challenger, or a most
+    recent shadow run. Every check below is a fact about the named report, and an
+    unknown vocabulary fails closed instead of being read as success.
+    """
+    try:
+        import shadow_comparison as SC
+        import shadow_comparison_repository as SCR
+        import shadow_runtime as SRW
+    except Exception:
+        return None, "shadow_comparison_evidence_unavailable"
+    try:
+        report = SCR.get_report(conn, report_id)
+    except SCR.ShadowComparisonRepositoryError:
+        return None, "shadow_comparison_corrupt"
+    except sqlite3.OperationalError:
+        # No comparison-evidence table in this environment: that is absence.
+        return None, "shadow_comparison_report_not_found"
+    except Exception:
+        return None, "shadow_comparison_corrupt"
+    if report is None:
+        return None, "shadow_comparison_report_not_found"
+    try:
+        if (str(report.report_id) != str(report_id)
+                or str(report.report_id) != str(report.report_fingerprint)):
+            return None, "shadow_comparison_identity_mismatch"
+        spec = report.comparison_spec if isinstance(report.comparison_spec, Mapping) else {}
+        declared = {key: value for key, value in spec.items()
+                    if key != "comparison_scope_identity"}
+        if SRW.fingerprint(declared) != str(spec.get("comparison_scope_identity") or ""):
+            return None, "shadow_comparison_identity_mismatch"
+        stamp = (report.challenger_strategy_stamp
+                 if isinstance(report.challenger_strategy_stamp, Mapping) else {})
+        if (str(stamp.get("strategy_id") or "") != identity["strategy_id"]
+                or int(stamp.get("version") or 0) != identity["strategy_version"]
+                or str(stamp.get("checksum") or "") != identity["strategy_checksum"]):
+            return None, "shadow_comparison_identity_mismatch"
+        declared_challenger = spec.get("challenger")
+        if (not isinstance(declared_challenger, Mapping)
+                or str(declared_challenger.get("strategy_id") or "") != identity["strategy_id"]):
+            return None, "shadow_comparison_identity_mismatch"
+        environment = (report.environment_identity
+                       if isinstance(report.environment_identity, Mapping) else {})
+        shared = environment.get("shared_environment_fingerprints")
+        if (str(environment.get("shared_environment_equality") or "") != "EQUAL"
+                or not isinstance(shared, Mapping)
+                or not shared.get("shadow") or not shared.get("active")
+                or str(shared.get("active")) != str(shared.get("shadow"))):
+            return None, "shadow_comparison_environment_mismatch"
+        availability = str(report.availability or "")
+        states = {SC.ComparisonAvailability.AVAILABLE.value,
+                  SC.ComparisonAvailability.PARTIAL.value,
+                  SC.ComparisonAvailability.UNAVAILABLE.value}
+        if availability not in states:
+            return None, "shadow_comparison_corrupt"
+        if availability != SC.ComparisonAvailability.AVAILABLE.value:
+            return None, ("shadow_comparison_partial"
+                          if availability == SC.ComparisonAvailability.PARTIAL.value
+                          else "shadow_comparison_unavailable")
+        if tuple(report.blocking_reasons or ()):
+            return None, "shadow_comparison_blocking_reasons"
+        coverage = report.coverage if isinstance(report.coverage, Mapping) else {}
+        if tuple(coverage.get("blocking_reasons") or ()):
+            return None, "shadow_comparison_blocking_reasons"
+        expected = coverage.get("expected_observations")
+        if (isinstance(expected, bool) or not isinstance(expected, int) or expected < 1
+                or coverage.get("available_observations") != expected):
+            return None, "shadow_comparison_coverage_incomplete"
+        provenance = report.provenance if isinstance(report.provenance, Mapping) else {}
+        admissible = {SC.EvidenceProvenance.OWNER_ISSUED.value,
+                      SC.EvidenceProvenance.CAPTURED_INPUT.value,
+                      SC.EvidenceProvenance.DERIVED.value}
+        for path in REQUIRED_COMPARISON_PROVENANCE:
+            if str(provenance.get(path) or "") not in admissible:
+                return None, "shadow_comparison_provenance_incomplete"
+    except Exception:
+        return None, "shadow_comparison_corrupt"
+    return report, None
+
+
 def evaluate(conn: sqlite3.Connection, *, strategy_id: str, strategy_version: int,
              strategy_checksum: str, from_state: str, target_state: str,
              evidence_bundle: PromotionEvidenceBundle | Mapping | None = None,
@@ -368,10 +475,30 @@ def evaluate(conn: sqlite3.Connection, *, strategy_id: str, strategy_version: in
                     else:
                         satisfied.append("r30_report_key")
                         fingerprints["r30_report_fingerprint"] = report["report_fingerprint"]
-    elif (from_state, target_state) in {("shadow", "paper"), ("paper", "production_sim")}:
-        reason = ("shadow_evidence_owner_unavailable" if target_state == "paper"
-                  else "paper_runtime_evidence_owner_unavailable")
-        reasons.append(reason)
+    elif (from_state, target_state) == ("shadow", "paper"):
+        # shadow -> paper consumes exactly one immutable ShadowComparisonReport.
+        # The report is read from ``conn``: its append-only owner table lives in
+        # this same paper database (created by the paper schema migrations), while
+        # the R29/R30 evidence lives in the separate evidence connection.
+        if not bundle.shadow_comparison_report_id:
+            reasons.append("shadow_comparison_report_required")
+        else:
+            report, reason = _verify_shadow_comparison(
+                conn, bundle.shadow_comparison_report_id, identity)
+            if reason:
+                reasons.append(reason)
+            else:
+                satisfied.append("shadow_comparison_report_id")
+                fingerprints["shadow_comparison_report_fingerprint"] = str(
+                    report.report_fingerprint)
+                fingerprints["shadow_comparison_scope_identity"] = str(
+                    (report.comparison_spec or {}).get("comparison_scope_identity") or "")
+                fingerprints["shadow_run_fingerprint"] = str(report.shadow_run_fingerprint)
+    elif (from_state, target_state) == ("paper", "production_sim"):
+        # paper -> production_sim still has no evidence owner. Filling
+        # ``future_paper_evidence_ref`` with comparison evidence would fabricate a
+        # fact this policy cannot verify, so the edge stays blocked.
+        reasons.append("paper_runtime_evidence_owner_unavailable")
     decision_material = {"policy_version": POLICY_VERSION, **identity,
                          "from_state": from_state, "target_state": target_state,
                          "evidence_bundle": bundle.projection(),

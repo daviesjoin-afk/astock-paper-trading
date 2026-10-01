@@ -15,39 +15,6 @@ from __future__ import annotations
 import market_data_service as MDSvc
 
 
-def _manual_risk_state(conn, account, nav, asof_day):
-    # Phase 2 extraction: resolved at call time to avoid a circular import.
-    from paper_trading import (
-        _account_reference_capital,
-        _date,
-        _num,
-        _risk_profile,
-    )
-    profile = _risk_profile(account)
-    day = _date(asof_day).isoformat()
-    start_nav = _num(account.get("daily_start_nav"), nav)
-    navs = [r[0] for r in conn.execute(
-        "SELECT nav FROM paper_nav WHERE account_id=? ORDER BY nav_date", (account["id"],)
-    ).fetchall()]
-    peak = max(navs + [nav, _account_reference_capital(account) or nav])
-    daily_loss = 1 - nav / start_nav if start_nav else 0.0
-    drawdown = 1 - nav / peak if peak else 0.0
-    reasons = []
-    cooldown = account.get("cooldown_until")
-    if cooldown and str(cooldown) >= day:
-        reasons.append(f"冷静期至 {cooldown}")
-    if daily_loss >= profile["daily_loss"]:
-        reasons.append(f"单日亏损 {daily_loss*100:.2f}% 已触发熔断")
-    if drawdown >= profile["drawdown"]:
-        reasons.append(f"滚动回撤 {drawdown*100:.2f}% 已触发熔断")
-    return {
-        "blocked": bool(reasons), "reasons": reasons,
-        "daily_loss_pct": round(daily_loss * 100, 2),
-        "drawdown_pct": round(drawdown * 100, 2),
-        "cooldown_until": cooldown,
-    }
-
-
 def _manual_order_plan(
     conn, account_id, code, side, qty=0, order_type="market",
     limit_price=None, asof_day=None, quote=None, exclude_reservation_key=None,

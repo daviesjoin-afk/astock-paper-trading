@@ -3447,6 +3447,34 @@ merge authority 永远是**当前 PR HEAD 的 exact-head CI**，不是文档里�
 因此 PR body 不再记录 `HEAD = <sha>` 快照（那会导致"为更新 SHA 再 commit → SHA 又变"的
 循环）；改为写 "GitHub Actions checks on current PR HEAD"，人工审核时从 GitHub API 读取。
 
+## R32 最终 authority graph（两条独立链，禁止 cross-mutation）
+
+```text
+Lifecycle chain（生命周期晋级）
+  Strategy Version → Comparable Runtime Context → Active Evidence + ShadowRun
+        → ShadowComparisonReport（唯一比对事实 owner，exact id == fingerprint）
+        → strategy_promotion（唯一 Lifecycle Promotion Policy）
+        → PromotionProposal / PromotionDecision
+        → strategy_lifecycle.transition()（唯一 lifecycle 写入口）
+        → SHADOW → PAPER
+
+Parameter-head chain（参数头晋升）
+  Parameter Challenger → strategy_champion scientific comparison（指标/容差）
+        → Champion activation decision
+        → self_evolution.activate_params_candidate
+        → formal parameter head
+```
+
+两条链的名字都含 promotion，但 **target fact 不同**：一条改 lifecycle state，一条改正式参数头。
+它们各自 authority count = 1，且 `Lifecycle Promotion → parameter head = 0`、
+`Champion Activation → lifecycle state = 0`（由 `backend/test_r32_final_promotion.py` 的
+authority 隔离守卫与 `work/r32_final_mutation_check.py` 的 M-F11/M-F12 守护）。
+
+Entry 侧的分工同样按 owner 固定：Entry/Admission 只决定「能不能进入」及其 owner evidence；
+per-strategy `risk_scale` 属于 sizing/market-exposure policy；红灯板块热点的 `shadow_exception`
+属于 research/shadow observation policy；dispatch/fill 属于 Execution Authority。
+它们不合并成一个 authority（`backend/test_r32_final_ownership_boundary.py`）。
+
 ## 架构演进记录（历史批次：模块化与边界固化）
 
 > 下面这段是**当时**的变更记录，保留原样以追溯判断依据；当前领域边界与策略平台视图见本文上半部分与 [`docs/STRATEGY_PLATFORM.md`](docs/STRATEGY_PLATFORM.md)。
