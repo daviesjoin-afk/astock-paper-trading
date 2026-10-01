@@ -147,7 +147,12 @@ class PaperFillWritePathGuardTests(unittest.TestCase):
             "paper_trading.py": ("_execution_verified_predicate", "_row_is_verified"),
             "paper_repository.py": ("EV.VERIFIED_PREDICATE",),
             "dashboard_queries.py": ("_execution_verified_predicate",),
-            "strategy_champion.py": ("EV.VERIFIED_PREDICATE",),
+            #: ``strategy_champion.py`` 原在本表：它的 ``collect_ledger_metrics``
+            #: 读正式账本的执行绩效。R32 Final 已把该函数作为 dead code 删除
+            #: （production caller = 0，只剩一个测试 caller），因此它不再是正式账本
+            #: 的读路径；剩下的 ``collect_shadow_ledger_metrics`` 只读隔离影子账本
+            #: （``shadow_orders`` / ``shadow_fills`` / ``shadow_nav``），不带执行核验。
+            #: 反向断言见下方 ``migrated``：它不得重新长出一份正式账本判定。
             "adaptive_risk.py": ("EV.VERIFIED_PREDICATE", "EV.is_verified_row"),
             "adaptive_selection.py": ("EV.VERIFIED_PREDICATE",),
             "rebalance_scanner.py": ("EV.VERIFIED_PREDICATE",),
@@ -176,6 +181,19 @@ class PaperFillWritePathGuardTests(unittest.TestCase):
             [], predicate_holders,
             "deepseek_research 的 pnl 路径已迁到 typed owner facts，"
             "不得重新持有执行绩效谓词（判定只能有一份实现）",
+        )
+        #: 同一条反向断言也覆盖 ``strategy_champion.py``：它的正式账本读路径已在
+        #: R32 Final 删除（见上表说明），因此它同样不得持有唯一执行绩效谓词。
+        #: 若将来它重新判断正式账本的执行绩效，必须先接回唯一谓词本身。
+        champion_tree = ast.parse(sources.get("strategy_champion.py", ""))
+        champion_holders = [
+            node.attr for node in ast.walk(champion_tree)
+            if isinstance(node, ast.Attribute) and node.attr == "VERIFIED_PREDICATE"
+        ]
+        self.assertEqual(
+            [], champion_holders,
+            "strategy_champion 不再读正式账本执行绩效，不得重新持有执行绩效谓词"
+            "（判定只能有一份实现）",
         )
         # 非空性：同一套扫描真的看得见这种引用（否则上面只是"恒空"）。
         probe = ast.parse(
