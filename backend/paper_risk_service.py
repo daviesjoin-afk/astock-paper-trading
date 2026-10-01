@@ -26,6 +26,7 @@ import paper_repository as PRP
 import paper_risk_decision as PRD
 import paper_risk_evidence as PREv
 import paper_risk_scan_state as PRSS
+import paper_schema_migrations as PSM
 import strategy_policies as SPOL
 import strategy_registry as SR
 import strategy_selection_resolver as SRES
@@ -241,19 +242,34 @@ def run(context: RiskRunContext, *, ports: RiskServicePorts):
             **kwargs,
         )
 
-    def _risk_log(conn, account_id, code, side, decision, reason, payload):
+    def _risk_log(conn, account_id, code, side, decision, reason, payload, *,
+                  authority=None, decision_kind=None, order_id=None):
+        """Append one risk decision with its write-time provenance.
+
+        Mirrors ``paper_trading._risk_log``: the Risk Authority states its own
+        authority and kind here (never inferred by a reader), and an
+        order-linked row must declare its authority because an id alone only
+        proves which order the row belongs to.
+        """
+        if order_id is not None and authority is None:
+            raise ValueError(
+                "order-linked risk decision requires an explicit authority")
         payload = _with_decision_snapshot(
             payload or {}, account_id=account_id, code=code, side=side,
             decision=decision, reason=reason,
         )
+        if authority is not None:
+            payload["decision_provenance"] = PSM.risk_decision_provenance(
+                authority, decision_kind or decision)
         strategy_id, strategy_version, strategy_checksum = _strategy_stamp(conn, account_id, cycle_id=cycle_id)
         conn.execute(
             """INSERT INTO paper_risk_decisions(
                    account_id,code,side,decision,reason,payload,created_at,
-                   strategy_id,strategy_version,strategy_checksum)
-               VALUES(?,?,?,?,?,?,?,?,?,?)""",
+                   strategy_id,strategy_version,strategy_checksum,order_id)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
             (account_id, code, side, decision, reason, _json(payload), _now(),
-             strategy_id, strategy_version, strategy_checksum),
+             strategy_id, strategy_version, strategy_checksum,
+             int(order_id) if order_id is not None else None),
         )
 
     if not positions:
@@ -611,6 +627,9 @@ def run(context: RiskRunContext, *, ports: RiskServicePorts):
                         ),
                         quality_reason,
                         {"downside_guard": downside_guard, "quote_status": quote_status},
+                        authority="RISK",
+                        decision_kind=("downside_pending" if guard_pending
+                                       else "downside_warning"),
                     )
             PREv.save_position_review(conn, cycle_id, quality_review, quality_action, quality_reason)
             if ratio <= 0:
@@ -623,7 +642,9 @@ def run(context: RiskRunContext, *, ports: RiskServicePorts):
                     "permission_scope_exit_t1_locked"
                     if quality_action == "permission_scope_exit" else "held_t1"
                 )
-                _risk_log(conn, position["account_id"], position["code"], "sell", pending_action, "A股 T+1，暂不可卖", detail)
+                _risk_log(conn, position["account_id"], position["code"], "sell", pending_action,
+                          "A股 T+1，暂不可卖", detail, authority="RISK",
+                          decision_kind=pending_action)
                 continue
             sellable = int(position.get("available_qty") or 0)
             if ratio >= 0.999:
@@ -639,7 +660,7 @@ def run(context: RiskRunContext, *, ports: RiskServicePorts):
                         "partial_skipped_min_lot",
                         f"可卖 {sellable} 股不足按 {ratio*100:.0f}% 部分减仓的最低一手，"
                         "保留观察不做整仓清仓",
-                        detail,
+                        detail, authority="RISK", decision_kind="partial_skipped_min_lot",
                     )
                     continue
                 planned_qty = partial_qty
@@ -687,7 +708,12 @@ def run(context: RiskRunContext, *, ports: RiskServicePorts):
                      planned_qty, price or None, status, order_reason, _json(detail), _now(),
                      *strategy_stamp, cycle_id),
                 )
-                _risk_log(conn, position["account_id"], position["code"], "sell", "unfilled", order_reason, detail)
+                # The Risk Authority's own decision about the sell order it just
+                # created: the same decision result, bound to that exact order at
+                # write time (never re-derived afterwards).
+                _risk_log(conn, position["account_id"], position["code"], "sell", "unfilled",
+                          order_reason, detail, authority="RISK", decision_kind="unfilled",
+                          order_id=int(cursor.lastrowid))
                 orders.append({"code": position["code"], "status": status, "reason": order_reason})
                 continue
             qty = planned_qty

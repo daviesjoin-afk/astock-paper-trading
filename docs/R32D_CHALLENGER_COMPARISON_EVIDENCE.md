@@ -384,35 +384,63 @@ Net production LOC:              +32 / -11（shadow_comparison.py +1/-1，shadow
 
 ### 7.2 Entry evidence（E1-2）
 
-两腿的 entry evidence **仍然来自不同 authority**，本轮不合并，原因是行为风险：把 Active 买入路径迁到 `evaluate_entry_state` 会改变真实下单判定（输入状态来源不同），而那属于 trading 行为变更，不属于 provenance closure。按要求给出显式边界：
+两个不可比较 authority 的边界与**迁移 gate**：
 
 ```text
-Active admission owner      paper_trading 买入路径（ledger-connection 语义）
-Active证据                order 自己 risk_payload.decision_snapshot.final（精确 linkage）
-Challenger admission owner  execution_planner.evaluate_entry_state（纯快照语义）
-不可比较字段                两条路径的 admission 词汇与门禁集合（无任何 owner 定义映射）
-comparison 行为             只并列两份 owner 原文，cross_vocabulary_relation_defined = False
-删除 milestone             Active 买入路径与 manual 路径迁到唯一 Entry Authority 的那个 PR
-                           （届时 plan_entry 的 caller 从 0 变为 1，旧门禁集合随之删除）
+Active admission owner       paper_trading 买入路径（ledger-connection 语义）
+Active evidence              order 自己 risk_payload.decision_snapshot.final（精确 linkage）
+Challenger admission owner   execution_planner.evaluate_entry_state（纯快照语义）
+不可比较字段                 两条 admission 词汇与门禁集合（无任何 owner 定义映射）
+comparison 行为              只并列两份 owner 原文，cross_vocabulary_relation_defined = False
+
+E4 前置 gate（硬性）：
+  R32-E4 开始前，Active 买入路径与手动路径必须已迁到唯一 Entry Authority；
+  否则 R32 **不得**标记 COMPLETE。如果该迁移无法做到行为等价，
+  必须单独开一个 human-reviewed convergence PR（显式改变交易判定的 PR），
+  不允许在 E4 cleanup 里顺手改掉交易判定，也不允许把"未来某个 PR"当成 milestone。
 ```
 
-`plan_entry` 的 caller 目前是 0，但它是**待接线的 canonical 编排入口**，不是被取代的旧实现：删掉它会移除迁移目标本身，所以本 PR 不删，并在此显式登记（`Old implementation deletable now: NO — blocker: 它是 Active/手动路径迁移的目标入口；milestone: 上述迁移 PR`）。
+`plan_entry` 的 caller 目前是 0，但它是**待接线的 canonical 编排入口**，不是被取代的旧实现：删掉它会移除上述迁移的目标本身。它按固定格式登记：`Old implementation deletable now: NO — blocker: 它是 Active/手动路径迁移的目标入口；Deletion milestone: 上述 E4 前置 gate 命名的迁移 PR`。
 
-### 7.3 Risk evidence 的精确 order 关联（E1-3）
+### 7.3 Risk evidence：精确 order 关联 + write-time authority provenance（E1-3）
 
-`paper_risk_decisions` 此前没有 order 引用，"某张订单的风控决策是什么"只能靠 `(account_id, code, side)` + 时间序猜最近一条 —— 这是被明令禁止的 provenance fabrication。migration **v26** 只加一列 + 一个部分索引：
+`paper_risk_decisions` 同时承载多种 authority 的日志，而且此前没有 order 引用。**order id 只能证明"这条 row 属于哪张订单"，永远不能证明"这条 row 是 Risk Authority 的风险裁决"**。因此两件事必须同时成立：
+
+**(a) 精确 order 关联（migration v26）**
 
 ```text
 paper_risk_decisions.order_id INTEGER      -- 写入当刻确实持有 order_id 的调用点才盖
 idx_paper_risk_decisions_order             -- WHERE order_id IS NOT NULL
 ```
 
-规则与不变量：
+规则：只有写入当刻手里有 order_id 的调用点才盖；**绝不回填**（历史 NULL 就是诚实的"归属不可证明"）；读取只按 `order_id = 该 order`，不得回退到 `(account, code, side)`、`ORDER BY id DESC` 或"最新一条"。
 
-- 只有**写入当刻手里有 order_id** 的调用点才盖这一列（当前是 Execution Authority 对已存在订单的两次决策：成交提交与执行受阻）。其余写入点保持 NULL。
-- **绝不回填**：历史行 `order_id IS NULL` 就是诚实的"legacy 归属不可证明"。
-- comparison 只按 `order_id = 该 order` 读取；不得回退到 `(account, code, side)`、`ORDER BY id DESC` 或"最新一条"。
-- 被禁止的替代品（order status / reason）在 comparison 里只作为**独立的 lifecycle 事实**出现，并显式标注 `used_as_risk_evidence = false`。
+**(b) write-time authority provenance（`_risk_log` 注入，不由读取方推断）**
+
+```text
+payload.decision_provenance = {
+    schema_version: "risk-decision-provenance-v1",
+    authority:      EXECUTION | RISK | ENTRY | INTRADAY | AUDIT,
+    decision_kind:  <writer 声明的 kind>
+}
+```
+
+- 词表由 owner 拥有（`paper_trading.RISK_DECISION_AUTHORITIES`），未知值直接拒绝。
+- **order-linked 的 row 必须声明 authority**：只给 order id 不给 authority 直接 `ValueError`。id 从来不是归属证明。
+- comparison 只按 `payload.decision_provenance.authority` 选择证据；**禁止**按表名、decision 字符串、reason 文案、status 或"order_id 非空"来分类。测试 E1-R3 用同一条 `execution_blocked` 文案分别标 `RISK` / `EXECUTION`，证明**决定权在 label 而不在文案**。
+- 未声明 provenance 的 row（含不能解析的 payload）保持未分类 → **永不被当作风险证据**，只是不参与。
+
+**(c) 消费规则**
+
+| row 的 authority | comparison 归入 | 能否让 risk_rejection PRESENT |
+| --- | --- | --- |
+| `RISK` + exact order linkage | `risk_rejection`（owner-issued，原文） | ✅ |
+| `EXECUTION` + exact order linkage | `execution` 维度的 supporting evidence | ❌（E1-R1/R2） |
+| 其它 / 未声明 / order_id NULL | 不消费 | ❌ |
+
+真正的 Risk Authority order-linked 写入点是 `paper_risk_service` 对**它刚刚创建的那张卖单**的决策（同一 decision result 在写入当刻绑定 order id，绝不是事后重跑）；Execution Authority 的两处（成交提交、执行受阻）标 `EXECUTION` 并只进 execution 维度；order 自身的 `status` / `reason` 永远只是 lifecycle 事实（`used_as_risk_evidence = false`）。
+
+无法证明 exact linkage 时：`active risk_rejection = UNAVAILABLE`，报告保持 `PARTIAL`，绝不让 execution evidence 把它升级成 `AVAILABLE`。
 
 ### 7.4 Challenger 的 owner-issued risk policy（E1-4）
 
@@ -428,27 +456,36 @@ is_risk_policy_projection(value)                    # 消费方校验外部输�
 
 `shadow_run_service.run_shadow()` 在进入纯运行时前**捕获一次**，作为显式必填输入传给 `evaluate_shadow(risk_policy=...)`，并写入 run-level `challenger_runtime_inputs.risk_policy`（source / strategy stamp / projection）。纯运行时因此不再读任何 current risk policy；comparison 只消费 run 里那份证据。
 
+纯运行时也不再只校验 shape，而是做**确定性验证**：supplied `risk_policy` 必须 canonical-equal 于
+
+```text
+strategy_runtime.risk_policy_projection_for_definition(exact strategy_version.definition)
+```
+
+不等即 `challenger_risk_policy_identity_mismatch`（E1-R6/R7：只篡改 `strategy_risk_fingerprint` 或只篡改 `compiled_risk_profile` 都 fail closed；M-D23 证明只比 key 集合是不够的）。关键点是：这一步只验证**调用方显式传入的不可变输入**，不读 current strategy、不读 DB、不读 cache、不读 latest、不重新解析 lifecycle，因此 replay contract 不受影响（E1-R8：current config 改变、exact 输入不变 → 报告逐字节不变）。service 仍是 capture once → 显式传入；pure runtime 只 verify + consume。
+
 `ShadowCandidate.risk_policy_identity`（caller-declared 输入）**已删除**：迁移后 caller = 0，不留兼容字段。旧 run 已持久化的证据仍会被读（那是证据兼容，不是代码路径），并保持 `DECLARED`。
 
 ### 7.5 语义（E1-5 / E1-6）
 
 ```text
-新数据 + owner evidence 完整   risk_rejection = AVAILABLE，报告可达 AVAILABLE（coverage = 1）
-新数据缺 order-linked 决策     risk_rejection 不 AVAILABLE，报告 PARTIAL
-legacy 行（order_id IS NULL）  继续 UNAVAILABLE / PARTIAL，绝不 backfill
-legacy run（只有 caller 声明） risk policy identity 标 DECLARED，绝不提升为 owner 事实
+新数据 + Risk Authority 的 order-linked 决策   risk_rejection = AVAILABLE，报告可达 AVAILABLE（coverage = 1）
+新数据只有 execution authority 的 order row    risk_rejection 仍 UNAVAILABLE → 报告 PARTIAL（E1-R1/R2）
+新数据缺 order-linked 决策                     risk_rejection 不 AVAILABLE，报告 PARTIAL
+legacy 行（order_id IS NULL）                  继续 UNAVAILABLE / PARTIAL，绝不 backfill
+legacy run（只有 caller 声明）                 risk policy identity 标 DECLARED，绝不提升为 owner 事实
 ```
 
 ### 7.6 验证结果（R32-E1）
 
 | 层 | 结果 |
 | --- | --- |
-| focused R32-C/D/E1 + Active audit | 见下方 PR 描述（本 PR 的 exact head 数据） |
-| 语义 mutation M-D1–M-D19 | **19/19 DETECTED**；survived / fake / timeout = 0；restore SHA256 PASS |
+| focused R32-C/D/E1 | 74 tests OK |
+| 语义 mutation M-D1–M-D23 | **23/23 DETECTED**；survived / fake / timeout = 0；restore SHA256 PASS |
 | R32-C mutation 复验 | 16/16 DETECTED（未受影响） |
 | ruff / compileall | PASS |
 
-新增用例：E1-1 两腿共用一个 owner risk policy 契约、E1-2 order-linked 风险决策使该维度 AVAILABLE（报告可达 AVAILABLE）、E1-3 别的 order 的风险证据被拒（fail closed）、E1-4 comparison 重放不读 current risk policy、E1-5/6 legacy 与未关联决策永不被借用、E1-7 order status 永不作为风险证据、E1-8 旧 caller-declared 输入已删除且 projection 只有一份、E1-9 执行经济学未动。
+新增用例：E1-1 两腿共用一个 owner risk policy 契约、E1-2 Risk Authority 的 order-linked 决策使该维度 AVAILABLE（报告可达 AVAILABLE）、**E1-R1** execution_blocked 不进 risk_rejection、**E1-R2** 成功成交 action 同样不进、**E1-R3** 决定权在 authority label 而不在 decision 文案、**E1-R4** 别的 order 的风险证据被拒 + 无 authority 的 row 不被消费、**E1-R5** 同一 order 上两种 authority 各进各自的维度、**E1-R6/R7** 篡改 fingerprint / profile 都 fail closed、**E1-R8** current config 改变不影响 replay、**E1-R9** capture / supplied / recorded 三者 canonical 相等、**E1-R10** authority 词表与写入期强制由 owner 独占、E1-5/6 legacy 与未关联决策永不被借用、E1-7 order status 永不作为风险证据、E1-8 旧 caller-declared 输入已删除且 projection 只有一份、E1-9 执行经济学未动。
 
 ### 7.7 本 PR 的维护性报告
 

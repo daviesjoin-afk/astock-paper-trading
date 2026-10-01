@@ -30,6 +30,13 @@ ACTIVE_EVIDENCE_SCHEMA_VERSION = "paper-orders-active-evidence-v1"
 ACTIVE_EVIDENCE_SOURCE = "paper_orders"
 SHARED_ENVIRONMENT_SCHEMA_VERSION = "comparison-shared-environment-v1"
 
+#: The write-time ``authority`` label the Risk Authority stamps on its own
+#: decisions, and the one the Execution Authority stamps. Consumers select on
+#: this label; they never classify a row by its decision text or table name.
+#: A test pins these to ``paper_trading.RISK_DECISION_AUTHORITIES``.
+RISK_AUTHORITY_LABEL = "RISK"
+EXECUTION_AUTHORITY_LABEL = "EXECUTION"
+
 #: Dimensions that must be complete for a report to be AVAILABLE.
 REQUIRED_COMPARISON_DIMENSIONS = ("signal", "decision", "execution", "risk_rejection")
 #: Dimensions reported on a best-effort basis; incomplete here never blocks AVAILABLE.
@@ -263,6 +270,11 @@ class ActiveOrderEvidence:
                     or not str(item.get("decision") or "").strip()
                     or item.get("order_id") != self.order_id):
                 raise ValueError("order-linked risk decision evidence is invalid")
+            provenance = item.get("decision_provenance")
+            if provenance is not None and (
+                    not isinstance(provenance, Mapping)
+                    or not str(provenance.get("authority") or "").strip()):
+                raise ValueError("risk decision provenance is invalid")
         object.__setattr__(self, "risk_decision_evidence",
                            tuple(MappingProxyType(dict(item)) for item in decisions))
 
@@ -977,6 +989,11 @@ def _execution_dimension(active: ActiveOrderEvidence | None,
             "ledger_amount": active.amount,
             "ledger_fees": active.fees,
             "ledger_realized_pnl": active.realized_pnl,
+            # Order-linked Execution Authority decisions are supporting evidence
+            # for the execution dimension; they are never risk evidence.
+            "order_linked_execution_decisions": [
+                dict(item) for item in (active.risk_decision_evidence or ())
+                if _decision_authority(item) == EXECUTION_AUTHORITY_LABEL] or None,
         }
         # Without the Execution Authority's own evidence the Active leg has no
         # execution evidence; the ledger status is not used to infer one.
@@ -1068,6 +1085,15 @@ def _execution_dimension(active: ActiveOrderEvidence | None,
                           delta=delta)
 
 
+def _decision_authority(item: Mapping[str, Any]) -> str | None:
+    """One row's writer-declared authority, or None when unclassified."""
+    provenance = item.get("decision_provenance")
+    if not isinstance(provenance, Mapping):
+        return None
+    authority = str(provenance.get("authority") or "").strip()
+    return authority or None
+
+
 def _risk_identity_evidence(value: Any, source: str) -> tuple[Any, str, str | None]:
     """Classify one risk policy identity by where its evidence came from."""
     if isinstance(value, Mapping) and value:
@@ -1097,16 +1123,24 @@ def _risk_dimension(active: ActiveOrderEvidence | None,
         context = active.runtime_context or {}
         owner_identity = context.get("risk_policy_identity")
         has_owner_identity = isinstance(owner_identity, Mapping) and bool(owner_identity)
-        decisions = tuple(active.risk_decision_evidence or ())
+        # Only rows the Risk Authority itself labelled as its own decision are
+        # risk evidence. An order id proves which order a row belongs to, never
+        # which authority produced it.
+        linked_rows = tuple(active.risk_decision_evidence or ())
+        risk_rows = tuple(item for item in linked_rows
+                          if _decision_authority(item) == RISK_AUTHORITY_LABEL)
         active_payload = {
             # Exactly-linked, owner-issued risk decisions, verbatim. Which value
             # means "rejected" is the owner's vocabulary, not this layer's call.
-            "risk_decision_evidence": [dict(item) for item in decisions] or None,
+            "risk_decision_evidence": [dict(item) for item in risk_rows] or None,
             "risk_decision_evidence_availability": (
-                EvidenceProvenance.OWNER_ISSUED.value if decisions
+                EvidenceProvenance.OWNER_ISSUED.value if risk_rows
                 else EvidenceProvenance.UNAVAILABLE.value),
             "risk_decision_linkage": "paper_risk_decisions.order_id",
-            "reason": None if decisions else "no_order_linked_risk_authority_evidence",
+            "risk_decision_authority": RISK_AUTHORITY_LABEL,
+            "reason": None if risk_rows else (
+                "order_linked_rows_are_not_risk_authority_decisions" if linked_rows
+                else "no_order_linked_risk_authority_evidence"),
             "risk_policy_identity": dict(owner_identity) if has_owner_identity else None,
             "risk_policy_identity_provenance": (
                 EvidenceProvenance.OWNER_ISSUED.value if has_owner_identity
@@ -1116,12 +1150,14 @@ def _risk_dimension(active: ActiveOrderEvidence | None,
                 if has_owner_identity else None),
             "detail": {
                 "paper_risk_decisions_order_linkage": (
-                    "paper_risk_decisions.order_id" if decisions else None),
+                    "paper_risk_decisions.order_id" if risk_rows else None),
+                "order_linked_rows_examined": len(linked_rows),
+                "order_linked_non_risk_authority_rows": len(linked_rows) - len(risk_rows),
                 "order_lifecycle_status_used": False,
                 "exact_linkage_searched": True,
             },
         }
-        active_state = present if decisions else unavailable
+        active_state = present if risk_rows else unavailable
     challenger_payload = None
     challenger_state = missing
     if isinstance(challenger, Mapping):

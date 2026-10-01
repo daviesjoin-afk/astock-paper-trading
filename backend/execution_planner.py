@@ -1928,6 +1928,7 @@ def commit_fill(
                 conn, account_id, code, side, "execution_blocked",
                 reason_codes or reason, execution_evidence,
                 strategy_stamp=order_strategy_stamp, order_id=order_id,
+                authority="EXECUTION", decision_kind="execution_blocked",
             )
         return None
 
@@ -2119,6 +2120,7 @@ def commit_fill(
         conn, account_id, code, side, action,
         risk_log_reason or reason, fill_detail,
         strategy_stamp=order_strategy_stamp, order_id=order_id,
+        authority="EXECUTION", decision_kind=str(action),
     )
     PT._audit(
         conn, account_id, audit_action or action,

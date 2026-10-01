@@ -114,14 +114,17 @@
 | 场景 / 契约 | 实现位置 | 回归用例 | 状态 |
 | --- | --- | --- | --- |
 | Active 与 Challenger 的 risk policy identity 来自同一个 owner 投影形状（唯一编译点 + 唯一字段集），Challenger 侧标 `OWNER_ISSUED` 并带 exact strategy binding | `strategy_runtime.compile_risk_policy` / `risk_policy_projection*`、`shadow_run_service` | `test_shadow_comparison.py`（E1-1）、`test_shadow_runtime.py`（frozen entry policy 读回） | ✅ |
-| 风险决策有精确的 order 关联（`paper_risk_decisions.order_id`，migration v26，幂等且绝不回填）；关联存在时 risk_rejection 可 AVAILABLE，报告可达 AVAILABLE | `paper_schema_migrations.ensure_risk_decision_order_linkage`、`shadow_comparison_service._risk_decision_evidence` | `test_shadow_comparison.py`（E1-2、v26 DDL owner、existing ledger init_db） | ✅ |
-| 属于别的 order 的风险证据被拒（fail closed），并拒绝缺 order_id 的伪证据 | `shadow_comparison.ActiveOrderEvidence` | `test_shadow_comparison.py`（E1-3） | ✅ |
+| 风险决策有精确的 order 关联（`paper_risk_decisions.order_id`，migration v26，幂等且绝不回填）**且**带 write-time authority provenance（`payload.decision_provenance`，order-linked row 必须声明 authority，否则写入期拒绝）；只有 `RISK` authority 的 row 才进 risk_rejection，`EXECUTION` row 只进 execution 维度 | `paper_schema_migrations.ensure_risk_decision_order_linkage`、`paper_trading._risk_log`、`shadow_comparison_service._risk_decision_evidence`、`shadow_comparison._risk_dimension` | `test_shadow_comparison.py`（E1-2、E1-R1、E1-R2、E1-R3、E1-R5、E1-R10、v26 DDL owner、existing ledger init_db） | ✅ |
+| 同一条 decision 文案按 authority label 分流（禁止按表名/decision 字符串/reason/status/order_id 非空分类）；未声明 provenance 的 row 永不被当作风险证据 | `shadow_comparison._decision_authority` | `test_shadow_comparison.py`（E1-R3、E1-R4） | ✅ |
+| supplied risk_policy 必须 canonical-equal 于 owner 基于 exact `strategy_version.definition` 的投影（只比 key 集合不够）；篡改 fingerprint 或 profile 都 fail closed | `strategy_runtime.risk_policy_projection_for_definition`、`shadow_runtime.evaluate_shadow` | `test_shadow_comparison.py`（E1-R6、E1-R7、E1-R9） | ✅ |
+| current strategy/risk config 改变但显式输入不变 → replay 报告逐字节不变（只验证显式不可变输入，不读 DB/current/latest） | `shadow_runtime.evaluate_shadow` | `test_shadow_comparison.py`（E1-R8） | ✅ |
+| 属于别的 order 的风险证据被拒（fail closed），并拒绝缺 order_id 的伪证据 | `shadow_comparison.ActiveOrderEvidence` | `test_shadow_comparison.py`（E1-R4） | ✅ |
 | comparison 重放不读取 current risk policy（owner 编译器被 patch 成抛错仍能完成），run 里记录的就是决策消费的那一份 | `shadow_comparison.build_shadow_comparison`、`shadow_run_service` | `test_shadow_comparison.py`（E1-4） | ✅ |
 | legacy order（无 order 关联）与 legacy run（caller 自述 identity）保持 PARTIAL / UNAVAILABLE + `DECLARED`，绝不 backfill、绝不用 (account, code, side) 或"最新一条"借用 | `shadow_comparison._risk_dimension` | `test_shadow_comparison.py`（E1-5/6、D8b） | ✅ |
 | order lifecycle status/reason 永不作为风险证据（只作为独立 lifecycle 事实，并标注 `used_as_risk_evidence = false`） | `shadow_comparison._order_lifecycle` | `test_shadow_comparison.py`（E1-7、D17） | ✅ |
 | 旧的 caller-declared risk identity 输入与内联 projection 组装已删除（caller = 0）；owner risk policy shape 校验强制外部输入 | `strategy_runtime.is_risk_policy_projection`、`shadow_runtime.evaluate_shadow` | `test_shadow_comparison.py`（E1-8） | ✅ |
 | 执行经济学（滑点/费用/参与率/手数/T+1）未被本 PR 触碰 | `execution_planner`、`paper_trading_rules` | `test_shadow_comparison.py`（E1-9） | ✅ |
-| 语义 mutation M-D1–M-D19（含 order 关联被替换成 (account,code,side) 猜测、owner identity 被丢弃、owner shape 校验被移除） | `work/r32d_shadow_comparison_mutation_check.py` | 19/19 DETECTED，restore SHA256 PASS | ✅ |
+| 语义 mutation M-D1–M-D23（含 execution row 回流 risk_rejection、write-time authority 强制被删、exact-version 相等校验被删、canonical-shaped 伪造 policy 被接受、order 关联被换成 (account,code,side) 猜测） | `work/r32d_shadow_comparison_mutation_check.py` | 23/23 DETECTED，restore SHA256 PASS | ✅ |
 
 ## R32-D Active/Challenger 比对证据（IN REVIEW）
 

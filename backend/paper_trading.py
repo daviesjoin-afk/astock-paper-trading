@@ -3286,17 +3286,28 @@ def _recovery_observation(conn, account_id, code, watch, quote, day):
 
 
 def _risk_log(conn, account_id, code, side, decision, reason, payload, *,
-              strategy_stamp=None, order_id=None):
-    """Append one risk decision; ``order_id`` only when the caller holds it.
+              strategy_stamp=None, order_id=None, authority=None,
+              decision_kind=None):
+    """Append one risk decision with its write-time provenance.
 
-    The order linkage is a write-time fact: a caller that already has the exact
-    order stamps it, everyone else leaves NULL. Nothing here ever looks up "the
-    latest decision" for an order.
+    ``authority`` / ``decision_kind`` are injected here (not accepted from the
+    payload) so the row carries an owner-stated provenance that a reader can
+    consume without classifying anything itself. The legal vocabulary and the
+    provenance shape belong to the schema owner
+    (``paper_schema_migrations``). An order-linked row must declare its
+    authority: an id alone proves which order the row belongs to, never which
+    authority produced it.
     """
+    if order_id is not None and authority is None:
+        raise ValueError(
+            "order-linked risk decision requires an explicit authority")
     payload = _with_decision_snapshot(
         payload or {}, account_id=account_id, code=code, side=side,
         decision=decision, reason=reason,
     )
+    if authority is not None:
+        payload["decision_provenance"] = PSM.risk_decision_provenance(
+            authority, decision_kind or decision)
     if strategy_stamp is None:
         strategy_id, strategy_version, strategy_checksum = _strategy_stamp(conn, account_id)
     else:

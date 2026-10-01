@@ -549,6 +549,12 @@ def evaluate_shadow(*, spec: ShadowRunSpec, environment: FrozenShadowEnvironment
     if ast is None:
         raise ValueError("challenger_dsl_unavailable")
     ast = DSL.normalize(ast)
+    # The supplied risk policy must be the Risk Authority's canonical projection
+    # of THIS exact immutable version definition. This only verifies an explicit
+    # input: it reads no current policy, database, cache or lifecycle state, so
+    # the replay contract is untouched.
+    if dict(risk_policy) != SRT.risk_policy_projection_for_definition(definition):
+        raise ValueError("challenger_risk_policy_identity_mismatch")
 
     if spec.previous_shadow_run_id is None:
         if previous_run is not None:

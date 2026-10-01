@@ -1221,3 +1221,23 @@ def ensure_risk_decision_order_linkage(conn):
             " ON paper_risk_decisions(order_id) WHERE order_id IS NOT NULL"
         )
     return changes
+
+
+#: Legal ``authority`` values for a risk-decision row's write-time provenance.
+#: The vocabulary is a property of the table shape, so it lives with the schema
+#: owner: every writer must state one of these, and no reader may ever infer an
+#: authority from a table name, a decision string, a reason, a status, or the
+#: mere presence of an order id.
+RISK_DECISION_AUTHORITIES = ("EXECUTION", "RISK", "ENTRY", "INTRADAY", "AUDIT")
+RISK_DECISION_PROVENANCE_SCHEMA_VERSION = "risk-decision-provenance-v1"
+
+
+def risk_decision_provenance(authority, decision_kind):
+    """The single canonical shape of a risk decision's write-time provenance."""
+    if authority not in RISK_DECISION_AUTHORITIES:
+        raise ValueError(f"unknown risk decision authority: {authority!r}")
+    return {
+        "schema_version": RISK_DECISION_PROVENANCE_SCHEMA_VERSION,
+        "authority": authority,
+        "decision_kind": decision_kind,
+    }
