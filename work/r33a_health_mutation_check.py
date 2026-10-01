@@ -116,6 +116,24 @@ MUTATIONS = [
         '        raise StrategyHealthRepositoryError("health_snapshot_idempotency_conflict")\n',
         "test_r33a_strategy_health.StrategyHealthImmutabilityTests.test_h13_same_identity_different_content_conflicts",
     ),
+    # M-H11：成交计数退回按订单创建日绑定（丢窗口内成交、算进窗口外成交）。
+    (
+        "backend/strategy_health_service.py",
+        '        " AND substr(f.fill_date,1,10) >= ? AND substr(f.fill_date,1,10) < ?",\n',
+        '        " AND substr(o.created_at,1,10) >= ? AND substr(o.created_at,1,10) < ?",\n',
+        "test_r33a_strategy_health.StrategyHealthDimensionTests.test_h7c_fills_are_bounded_by_their_own_fill_date",
+    ),
+    # M-H12：畸形 comparison report id 不再在 owner reader 之前被挡。
+    (
+        "backend/strategy_health_service.py",
+        '    if not isinstance(comparison_report_id, str) or len(comparison_report_id) != 64:\n'
+        '        # 输入身份非法属于 caller 的错，不是「证据不存在」：在 owner reader 之前\n'
+        '        # 就 fail closed，这样 HTTP 层只会看到受控的 4xx，而不是 reader 抛出的 5xx。\n'
+        '        raise SH.HealthEvidenceError("exact_comparison_report_id_required")\n',
+        '    if False:\n'
+        '        raise SH.HealthEvidenceError("exact_comparison_report_id_required")\n',
+        "test_r33a_strategy_health.StrategyHealthApiSurfaceTests.test_malformed_or_unknown_comparison_report_id_is_a_controlled_4xx",
+    ),
 ]
 
 BASELINE_MODULE = "test_r33a_strategy_health"

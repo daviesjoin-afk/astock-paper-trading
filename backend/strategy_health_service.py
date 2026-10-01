@@ -56,12 +56,19 @@ def _verified_order_count(conn, identity, window) -> int:
 
 
 def _fill_counts(conn, identity, window) -> tuple[int, int]:
-    """Fills reachable only through their own order (the owner linkage)."""
+    """Fills reachable only through their own order, bounded by the FILL date.
+
+    The window is applied to the fill event's own owner column
+    (``paper_fills.fill_date``), never to the order's creation date: an order
+    created before the window can still fill inside it, and an order created
+    inside the window can fill after it. Bounding fills by ``created_at`` would
+    silently drop the first case and invent the second.
+    """
     rows = conn.execute(
         "SELECT COUNT(*), COUNT(DISTINCT f.order_id) FROM paper_fills f"
         " JOIN paper_orders o ON o.id=f.order_id"
         " WHERE o.strategy_id=? AND o.strategy_version=? AND o.strategy_checksum=?"
-        f" AND {_WINDOW_CLAUSE.replace('created_at', 'o.created_at')}",
+        " AND substr(f.fill_date,1,10) >= ? AND substr(f.fill_date,1,10) < ?",
         (*identity, window.observation_start, window.observation_end),
     ).fetchone()
     return int(rows[0] or 0), int(rows[1] or 0)
@@ -135,6 +142,10 @@ def _execution_dimension(conn, identity, window):
         "verified_orders": _verified_order_count(conn, identity, window),
         "fill_rows": fills,
         "orders_with_fill_rows": filled_orders,
+        # 窗口绑在哪一列上是一个事实，必须写出来：订单按自己的 created_at，
+        # 成交按自己的 fill_date。
+        "window_bound_columns": {"orders": "paper_orders.created_at",
+                                 "fills": "paper_fills.fill_date"},
         # 分档用 owner 自己的词表（execution_verification.EXECUTION_STATUSES /
         # EVIDENCE_SOURCES）；未盖章的行单独记 not_stamped，不折算成 unknown。
         "owner_execution_status": status_counts,
@@ -247,7 +258,15 @@ def _comparable_dimension(conn, identity, comparison_report_id):
     if not comparison_report_id:
         return SH.not_applicable_dimension(SH.DIMENSION_COMPARABLE_EVIDENCE,
                                            SH.REASON_COMPARISON_REPORT_NOT_SPECIFIED)
-    report = SCR.get_report(conn, comparison_report_id)
+    if not isinstance(comparison_report_id, str) or len(comparison_report_id) != 64:
+        # 输入身份非法属于 caller 的错，不是「证据不存在」：在 owner reader 之前
+        # 就 fail closed，这样 HTTP 层只会看到受控的 4xx，而不是 reader 抛出的 5xx。
+        raise SH.HealthEvidenceError("exact_comparison_report_id_required")
+    try:
+        report = SCR.get_report(conn, comparison_report_id)
+    except SCR.ShadowComparisonRepositoryError as exc:
+        # owner reader 自校验失败（指纹不符/证据损坏）→ 如实报损坏，不猜。
+        raise SH.HealthEvidenceError("comparison_report_corrupt") from exc
     if report is None:
         raise SH.HealthEvidenceError("exact_comparison_report_unavailable")
     stamp = dict(report.challenger_strategy_stamp or {})

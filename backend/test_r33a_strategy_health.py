@@ -334,6 +334,32 @@ class StrategyHealthDimensionTests(_HealthCase):
         facts = self._dimension(self._capture(), SH.DIMENSION_EXECUTION_EVIDENCE)["facts"]
         self.assertEqual(0, facts["orders_in_window"])
 
+    def test_h7c_fills_are_bounded_by_their_own_fill_date(self):
+        # 情况 A：订单在窗口**之前**创建、成交落在窗口内 → 必须计入（用订单日期会丢）。
+        early = self._seed_order(created_at="2026-08-20 09:30:00")
+        self._seed_fill(early, fill_date="2026-09-10")
+        facts_a = self._dimension(self._capture(), SH.DIMENSION_EXECUTION_EVIDENCE)["facts"]
+        self.assertEqual(0, facts_a["orders_in_window"])
+        self.assertEqual(1, facts_a["fill_rows"])
+        self.assertEqual(1, facts_a["orders_with_fill_rows"])
+        # 窗口绑在哪一列是事实的一部分，必须写出来。
+        self.assertEqual({"orders": "paper_orders.created_at",
+                          "fills": "paper_fills.fill_date"},
+                         facts_a["window_bound_columns"])
+        # 情况 B（另一次独立采集）：订单在窗口**之内**创建、成交在窗口之后 → 不得计入。
+        late = self._seed_order(created_at="2026-09-20 09:30:00")
+        self._seed_fill(late, fill_date="2026-10-05")
+        facts_b = self._dimension(
+            self._capture(observation_start="2026-09-15", observation_end="2026-09-25"),
+            SH.DIMENSION_EXECUTION_EVIDENCE)["facts"]
+        self.assertEqual(1, facts_b["orders_in_window"])
+        self.assertEqual(0, facts_b["fill_rows"])
+        self.assertEqual(0, facts_b["orders_with_fill_rows"])
+        activity = self._dimension(
+            self._capture(observation_start="2026-09-15", observation_end="2026-09-25"),
+            SH.DIMENSION_ACTIVITY_COVERAGE)["facts"]
+        self.assertEqual(0, activity["fill_rows"])
+
     def test_comparable_evidence_is_not_applicable_unless_named(self):
         comparable = self._dimension(self._capture(), SH.DIMENSION_COMPARABLE_EVIDENCE)
         self.assertEqual("NOT_APPLICABLE", comparable["status"])
@@ -485,6 +511,26 @@ class StrategyHealthApiSurfaceTests(_HealthCase):
             API.capture_strategy_health_snapshot(
                 self.spec.id, self._request(observation_start="2026-10-01",
                                             observation_end="2026-09-01"))
+        self.assertEqual(400, raised.exception.status_code)
+
+    def test_malformed_or_unknown_comparison_report_id_is_a_controlled_4xx(self):
+        # 畸形 id 是 caller 的输入错误：必须在 owner reader 之前 fail closed，
+        # 不能让它逃成 500。
+        with self.assertRaises(SH.HealthEvidenceError) as raised:
+            self._capture(comparison_report_id="short")
+        self.assertEqual("exact_comparison_report_id_required", str(raised.exception))
+        with self.assertRaises(HTTPException) as raised:
+            API.capture_strategy_health_snapshot(
+                self.spec.id, self._request(comparison_report_id="short"))
+        self.assertEqual(400, raised.exception.status_code)
+        self.assertEqual("exact_comparison_report_id_required", str(raised.exception.detail))
+        # 形状正确但不存在 → 同样是受控拒绝。
+        with self.assertRaises(SH.HealthEvidenceError) as raised:
+            self._capture(comparison_report_id="f" * 64)
+        self.assertEqual("exact_comparison_report_unavailable", str(raised.exception))
+        with self.assertRaises(HTTPException) as raised:
+            API.capture_strategy_health_snapshot(
+                self.spec.id, self._request(comparison_report_id="f" * 64))
         self.assertEqual(400, raised.exception.status_code)
 
     def test_the_route_surface_has_no_latest_endpoint(self):
