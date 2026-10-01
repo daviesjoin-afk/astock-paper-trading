@@ -481,3 +481,18 @@
 | Entry / sizing / observation 边界冻结 | Active 黄灯 per-strategy `risk_scale`（0.5/0.75/0.65）与红灯 sector-heat `shadow_exception` 语义不变；`EntryGateState` 与 planner 均无 sizing/observation 字段；manual 用的 canonical gate 无 `risk_scale`；比对报告不含 Active sizing modifier | `test_r32_final_ownership_boundary.py`（R-F9、R-F9b、R-F10、R-F11、R-F12） | — |
 | 前端不重算 readiness、不把缺失当 0 | AVAILABLE/PARTIAL/UNAVAILABLE 原样渲染；缺失渲染为「不可用」而非 `0`/`0/0`；两条晋级链分别命名且不合成；渲染函数内无 coverage→ready 推导 | `frontend/tests/challenger-workspace.test.mjs`（W8–W16） | M-F13 |
 
+## R33-A Exact Strategy Health Evidence（IN REVIEW）
+
+| 契约 | 断言 | 测试 | mutation |
+| --- | --- | --- | --- |
+| 同一组 exact 输入 → 同一快照指纹 | 重复采集得到同一 `snapshot_id`；指纹覆盖 exact version + 显式窗口 + 维度来源指纹；**不含** `created_at` | `test_r33a_strategy_health.py`（H1、H1b、H1c、H4b） | M-H3 / M-H8 |
+| 身份与窗口 fail closed | exact version 不存在或 checksum 不符 → `exact_strategy_version_not_persisted`；窗口缺失/非法/非前向 → 稳定 reason | H2、H3、H4 | M-H1 / M-H2 |
+| 维度只报告 owner 事实 | runtime 用 registry 的 exact-version readiness；lifecycle 用 exact state + 事件指纹；execution 用 owner 的核验结论列与唯一谓词；risk 按 `decision_provenance.authority` 分档；comparison 只认显式 report id | H5、H5b、H6、H6b、H7、H7b | M-H4 / M-H5 |
+| 缺失保持缺失 | performance 无 owner → `strategy_performance_owner_unavailable`；signals 无法归属到 version → `signal_strategy_attribution_unavailable`；未盖章的订单记 `not_stamped`，不升级成 verified、也不折算成 unknown | H7、H8、H9 | M-H4 / M-H6 |
+| coverage 只是证据覆盖率 | 分母恒为全部维度；`ratio == available/expected`；PARTIAL/NOT_APPLICABLE 不算覆盖；缺维度需带 reason | H10、H10b | — |
+| 历史不愈合 | 快照按 id 精确读取，新证据出现后旧快照字节不变；新事实需要新快照 | H11、H15 | M-H7 |
+| append-only 与 exact get | 同 id 幂等；同 id 不同内容冲突；坏 id 形状拒绝；非空表上未知 id 不得兜底到最新；只有 `append_snapshot`/`get_snapshot` | H12、H13、H14、H15 | M-H7 / M-H10 |
+| 零 lifecycle / 零正式账本写入 | 采集前后 lifecycle state + 事件序列、以及 orders/fills/positions/nav 计数完全一致 | H16、H17 | M-H9 |
+| 纯 builder 无 ambient 依赖 | 无 sqlite3 / 网络 / 时钟 / provider；网络与时钟被 poison 后仍确定性 | H18 | — |
+| 最小 API surface | `POST …/health/snapshots` + `GET …/health/snapshots/{id}`；无 health/latest；身份冲突 400、未知快照 404 | `StrategyHealthApiSurfaceTests` | — |
+

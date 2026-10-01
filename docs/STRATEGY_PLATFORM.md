@@ -248,6 +248,37 @@ evidence；`risk_scale` 是 sizing/market-exposure policy（`paper_trading._stra
 `execution_planner.EntryGateState` 不承载 sizing 或 observation 字段，manual 路径因此不会继承
 Active 的 per-strategy 缩放。
 
+### R33-A：Exact Strategy Health Evidence（事实层）
+
+```text
+POST /api/strategies/{id}/health/snapshots        （显式 capture：exact version + 显式窗口）
+GET  /api/strategies/{id}/health/snapshots/{id}   （只按 id 精确读取；没有 latest 端点）
+
+Exact Strategy Version
+   ↓  registry runtime readiness（exact version）/ lifecycle / execution 核验结论 /
+      risk decision_provenance / 显式 comparison report
+StrategyHealthSnapshot（append-only，snapshot_id == snapshot_fingerprint）
+   ↓
+[STOP —— 退休 policy 属 R33-B，本 PR 未实现]
+```
+
+维度固定七项（`runtime_integrity` / `lifecycle_integrity` / `execution_evidence` /
+`risk_evidence` / `activity_coverage` / `performance` / `comparable_evidence`），每项带
+`status ∈ {AVAILABLE, PARTIAL, UNAVAILABLE, NOT_APPLICABLE}`、`facts`、
+`provenance ∈ {OWNER_ISSUED, CAPTURED_INPUT, DERIVED, UNAVAILABLE}`、`source_identity`、
+`source_fingerprint`、`blocking_reasons`。
+
+**本轮已登记的缺口（不得用替代物顶上）**：
+
+- `performance`：仓库**没有**「exact strategy version 历史绩效（NAV/return/drawdown/PnL）」的
+  owner（`paper_performance` 是日内持仓 P&L；`paper_portfolio_read_model` 明确不发布
+  nav/market_value/return），因此该维度恒为 `UNAVAILABLE`（`strategy_performance_owner_unavailable`）。
+- `activity_coverage.signals`：`paper_signals` 没有 strategy stamp，而 cycle pin 是
+  `(cycle_id, account_id)`，无法把一条 signal 归属到 exact version → 记
+  `signal_strategy_attribution_unavailable`，不编造。
+- 退休阈值（连续亏损 N 天 / 收益低于 X% / 回撤超过 Y% …）**仓库里不存在**，
+  标记 `POLICY DECISION REQUIRED FOR R33-B`，本轮不新增。
+
 ### Workspace identity 契约
 
 Workspace **绝不**从 registry current head 推导 Active / Challenger 的比对身份：

@@ -3475,6 +3475,31 @@ per-strategy `risk_scale` 属于 sizing/market-exposure policy；红灯板块热
 属于 research/shadow observation policy；dispatch/fill 属于 Execution Authority。
 它们不合并成一个 authority（`backend/test_r32_final_ownership_boundary.py`）。
 
+## R33-A authority graph（事实层，到此为止）
+
+```text
+Exact Strategy Version（immutable）
+        ↓
+Existing Owner Evidence
+   strategy_registry.runtime_readiness(exact version)
+   strategy_lifecycle（exact state + append-only events）
+   execution_verification / execution_evidence（owner 盖章的核验结论列 + 唯一谓词）
+   paper_risk_decisions.decision_provenance（authority 由写入方声明）
+   shadow_comparison_repository.get_report（只按显式 report id）
+        ↓
+StrategyHealthSnapshot（append-only，snapshot_id == snapshot_fingerprint）
+        ↓
+[STOP —— R33-B Retirement Policy 尚未实现]
+```
+
+`StrategyHealthSnapshot` 是**新的事实 authority**，不是第二个 lifecycle：采集路径不调用
+`strategy_lifecycle.transition`、不写正式账本，也不产生任何 `healthy/unhealthy` 结论
+（只有维度证据状态 `AVAILABLE/PARTIAL/UNAVAILABLE/NOT_APPLICABLE` 与稳定的 blocking reasons）。
+`coverage_ratio` 只是证据覆盖率，不等于健康结论；`0 trades` 是合法事实而非异常。
+
+R33-B 的正确方向是 `Health Snapshot → Retirement Policy → strategy_lifecycle`，
+**不是** `strategy_lifecycle → 查健康 DB`。
+
 ## 架构演进记录（历史批次：模块化与边界固化）
 
 > 下面这段是**当时**的变更记录，保留原样以追溯判断依据；当前领域边界与策略平台视图见本文上半部分与 [`docs/STRATEGY_PLATFORM.md`](docs/STRATEGY_PLATFORM.md)。
