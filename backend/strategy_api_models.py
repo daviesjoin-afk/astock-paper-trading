@@ -129,9 +129,23 @@ class PromotionProposalRequest(_Request):
     rationale: str = ""
 
 
+class StrategyHealthCaptureRequest(_Request):
+    """``POST /api/strategies/{id}/health/snapshots``。
+
+    R33-A 只接受**显式**的 exact version 与显式 observation window：没有
+    「latest」、没有「当前日」、没有隐式窗口，也没有任何由证据到结论的判断。
+    """
+
+    strategy_version: int
+    strategy_checksum: str
+    observation_start: str
+    observation_end: str
+    #: 可选：只接受**显式给出**的 exact R32 比对报告 id，绝不搜索最新报告。
+    comparison_report_id: str | None = None
+
+
 class StrategyCloneRequest(_Request):
     """``POST /api/strategies/{id}/clone``。"""
-
     new_strategy_id: str | None = None
     # 旧前端（策略注册表）传 ``id``；新契约用 ``new_strategy_id``。
     id: str | None = None
