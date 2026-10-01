@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""R32 Final semantic mutations (M-F1 … M-F13).
+"""R32 Final semantic mutations (M-F1 … M-F15).
 
 Each mutation breaks exactly one contract the Final PR introduces and is expected
 to turn a named regression RED:
@@ -17,6 +17,8 @@ to turn a named regression RED:
     M-F11 lifecycle promotion reaches into the parameter-head authority
     M-F12 parameter-head activation writes the lifecycle
     M-F13 the frontend derives readiness from coverage instead of the owner
+    M-F14 the workspace Active leg falls back to the endpoint's registry identity
+    M-F15 the report's Challenger stops being bound to the endpoint strategy
 
 Usage:  python work/r32_final_mutation_check.py
 """
@@ -138,6 +140,27 @@ MUTATIONS = [
         "+'<p>后端判断：'+(promotion.eligible?'eligible':'blocked')",
         "+'<p>后端判断：'+(((comparison.coverage||{}).coverage_ratio>=1)?'eligible':'blocked')",
         ("node", "tests/challenger-workspace.test.mjs"),
+    ),
+    # M-F14：Workspace 的 Active 腿被拉回 endpoint 自己的 registry identity。
+    (
+        "backend/strategy_service.py",
+        '            active = _leg_from_report_stamp(\n'
+        '                conn, report.active_strategy_stamp,\n'
+        '                source="shadow_comparison.active_strategy_stamp")\n',
+        '            active = _leg_from_report_stamp(\n'
+        '                conn, report.active_strategy_stamp,\n'
+        '                source="shadow_comparison.active_strategy_stamp")\n'
+        '            active["strategy_id"] = str(strategy_id)\n',
+        ("py", "test_r32_final_promotion.ChallengerWorkspaceReadModelTests.test_w1a_both_legs_come_from_the_report_stamps"),
+    ),
+    # M-F15：删掉 report Challenger 与 endpoint strategy_id 的绑定。
+    (
+        "backend/strategy_service.py",
+        '            if challenger["strategy_id"] != str(strategy_id):\n'
+        '                raise InvalidStrategyDefinition("shadow_comparison_identity_mismatch")\n',
+        '            if False:\n'
+        '                raise InvalidStrategyDefinition("shadow_comparison_identity_mismatch")\n',
+        ("py", "test_r32_final_promotion.ChallengerWorkspaceReadModelTests.test_w1c_a_report_of_another_strategy_fails_closed"),
     ),
 ]
 

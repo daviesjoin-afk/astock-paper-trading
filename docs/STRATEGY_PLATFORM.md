@@ -247,3 +247,27 @@ evidence；`risk_scale` 是 sizing/market-exposure policy（`paper_trading._stra
 是 research/shadow observation policy；dispatch/fill 归 Execution Authority。
 `execution_planner.EntryGateState` 不承载 sizing 或 observation 字段，manual 路径因此不会继承
 Active 的 per-strategy 缩放。
+
+### Workspace identity 契约
+
+Workspace **绝不**从 registry current head 推导 Active / Challenger 的比对身份：
+
+```text
+comparison_report_id 被明确提供且读取成功
+  → Active identity      = report.active_strategy_stamp      (exact id/version/checksum)
+  → Challenger identity  = report.challenger_strategy_stamp  (exact id/version/checksum)
+
+report.challenger_strategy_stamp.strategy_id != path strategy_id
+  → fail closed：shadow_comparison_identity_mismatch（400）
+version 显式提供且 != report.challenger_strategy_stamp.version
+  → fail closed：shadow_comparison_identity_mismatch（400）
+
+comparison_report_id 缺失 / 取不到
+  → 没有 Active comparator fact：active.available=false + unavailable_reason
+    （Challenger 仅作为 registry_candidate 展示，comparison_bound=false）
+```
+
+因此历史 report 保持 exact identity：registry head 前进后，Workspace 仍显示 report 里那个旧版本，
+而 Lifecycle Promotion 可以按自己的策略返回 `strategy_version_changed` —— 两个事实同时呈现，
+不会把旧 Challenger 静默换成 current head。Active 的 lifecycle state 用**它自己的** exact
+`SL.get_state(active_id, active_version, checksum)` 查询，查不到就是 `None`，绝不拿 Challenger 的状态填。

@@ -524,51 +524,109 @@ def _parameter_head_section(conn, strategy_id: str) -> dict:
             "versions": [dict(row) for row in rows]}
 
 
+def _leg_lifecycle_state(conn, strategy_id: str, version: int, checksum: str):
+    """Exact lifecycle lookup for one stamped version. Unknown stays unknown."""
+    state = SL.get_state(conn, strategy_id, version, checksum=checksum)
+    return (state or {}).get("state")
+
+
+def _leg_from_report_stamp(conn, stamp, *, source: str) -> dict:
+    """One comparison leg, taken verbatim from the report's own strategy stamp."""
+    values = dict(stamp or {})
+    leg_id = str(values.get("strategy_id") or "")
+    leg_version = int(values.get("version") or 0)
+    leg_checksum = str(values.get("checksum") or "")
+    if not leg_id or leg_version < 1 or not leg_checksum:
+        raise InvalidStrategyDefinition("shadow_comparison_stamp_invalid")
+    return {
+        "available": True,
+        "unavailable_reason": None,
+        "identity_source": source,
+        "comparison_bound": True,
+        "strategy_id": leg_id,
+        "version": leg_version,
+        "checksum": leg_checksum,
+        # The Active comparator's state is looked up for *its own* exact version;
+        # an unknown strategy/version is reported as unknown, never filled from
+        # the Challenger's state.
+        "lifecycle_state": _leg_lifecycle_state(conn, leg_id, leg_version, leg_checksum),
+    }
+
+
 def challenger_read_model(strategy_id: str, *, comparison_report_id: str | None = None,
                           version: int | None = None) -> dict:
     """Active vs Challenger workspace facts, assembled from exact owner output.
 
-    Read-only composition: every section is an owner's own value (registry,
-    lifecycle, comparison repository, promotion policy, activation ledger). The
-    comparison evidence is only ever the explicitly named report, and the two
-    promotion authorities stay in two separate sections.
+    Read-only composition, with one hard rule: while an exact
+    ``ShadowComparisonReport`` is named, **both comparison legs come from that
+    report's own strategy stamps** — never from the registry head. A report whose
+    Challenger stamp is not this endpoint's strategy, or a ``version`` that
+    contradicts the report, is an input identity conflict and fails closed.
+    Without a report there is no Active comparator fact at all.
     """
     def _work(conn):
         spec = SR.get(strategy_id, conn=conn)
         if spec is None:
             raise StrategyNotFound("unknown strategy id")
-        active_version = SR.get_version(strategy_id, conn=conn)
-        if active_version is None:
-            raise StrategyNotFound("strategy version not found")
-        challenger_version = (SR.get_version(strategy_id, version, conn=conn)
-                              if version is not None else active_version)
-        if challenger_version is None:
-            raise StrategyNotFound("strategy version not found")
-        active_state = SL.get_state(conn, strategy_id, active_version.version,
-                                    checksum=active_version.checksum)
-        challenger_state = SL.get_state(conn, strategy_id, challenger_version.version,
-                                        checksum=challenger_version.checksum)
-        state = (challenger_state or {}).get("state")
         report, reason = _exact_comparison_report(conn, comparison_report_id)
+        if report is not None:
+            challenger = _leg_from_report_stamp(
+                conn, report.challenger_strategy_stamp,
+                source="shadow_comparison.challenger_strategy_stamp")
+            active = _leg_from_report_stamp(
+                conn, report.active_strategy_stamp,
+                source="shadow_comparison.active_strategy_stamp")
+            # The named evidence must belong to this endpoint's strategy, and the
+            # caller's version must agree with it; otherwise the page would mix
+            # one strategy with another strategy's comparison.
+            if challenger["strategy_id"] != str(strategy_id):
+                raise InvalidStrategyDefinition("shadow_comparison_identity_mismatch")
+            if version is not None and int(version) != challenger["version"]:
+                raise InvalidStrategyDefinition("shadow_comparison_identity_mismatch")
+            legacy_head = SR.get_version(strategy_id, conn=conn)
+        else:
+            # No report ⇒ no Active comparator fact. The Challenger is shown as a
+            # registry candidate so the page can explain what evidence is needed.
+            candidate = (SR.get_version(strategy_id, version, conn=conn)
+                         if version is not None else SR.get_version(strategy_id, conn=conn))
+            if candidate is None:
+                raise StrategyNotFound("strategy version not found")
+            legacy_head = candidate
+            challenger = {
+                "available": True,
+                "unavailable_reason": None,
+                "identity_source": "registry_candidate",
+                "comparison_bound": False,
+                "strategy_id": str(strategy_id),
+                "version": int(candidate.version),
+                "checksum": candidate.checksum,
+                "lifecycle_state": _leg_lifecycle_state(
+                    conn, str(strategy_id), int(candidate.version), candidate.checksum),
+            }
+            active = {"available": False,
+                      "unavailable_reason": reason,
+                      "identity_source": None, "comparison_bound": False,
+                      "strategy_id": None, "version": None, "checksum": None,
+                      "lifecycle_state": None}
+        state = challenger["lifecycle_state"]
+        # The promotion candidate is the *displayed* Challenger exact identity. If
+        # that version is no longer the registry head, the policy itself returns
+        # `strategy_version_changed` — the workspace still shows the old exact
+        # version rather than silently swapping in the current head.
         decision = SPR.evaluate(
-            conn, strategy_id=strategy_id, strategy_version=challenger_version.version,
-            strategy_checksum=challenger_version.checksum,
+            conn, strategy_id=challenger["strategy_id"],
+            strategy_version=challenger["version"],
+            strategy_checksum=challenger["checksum"],
             from_state=state or "", target_state="paper",
             evidence_bundle=({"shadow_comparison_report_id": comparison_report_id}
                              if comparison_report_id else None))
         return {
             "strategy_id": strategy_id,
-            "active": {
-                "strategy_id": strategy_id,
-                "version": active_version.version,
-                "checksum": active_version.checksum,
-                "lifecycle_state": (active_state or {}).get("state"),
-            },
-            "challenger": {
-                "strategy_id": strategy_id,
-                "version": challenger_version.version,
-                "checksum": challenger_version.checksum,
-                "lifecycle_state": state,
+            "active": active,
+            "challenger": challenger,
+            "registry_head": {
+                "version": (int(legacy_head.version) if legacy_head is not None else None),
+                "checksum": (legacy_head.checksum if legacy_head is not None else None),
             },
             "comparison": _comparison_section(report, comparison_report_id, reason),
             "lifecycle_promotion": {
@@ -577,6 +635,9 @@ def challenger_read_model(strategy_id: str, *, comparison_report_id: str | None 
                 "policy_version": SPR.POLICY_VERSION,
                 "from_state": state,
                 "target_state": "paper",
+                "candidate": {"strategy_id": challenger["strategy_id"],
+                              "strategy_version": challenger["version"],
+                              "strategy_checksum": challenger["checksum"]},
                 "eligible": bool(decision.eligible),
                 "blocking_reasons": list(decision.blocking_reasons),
                 "required_evidence": list(decision.required_evidence),
@@ -588,8 +649,11 @@ def challenger_read_model(strategy_id: str, *, comparison_report_id: str | None 
             "parameter_head_activation": _parameter_head_section(conn, strategy_id),
             "lifecycle": {
                 "state": state,
+                "version": challenger["version"],
+                "checksum": challenger["checksum"],
                 "allowed_next_transitions": sorted(SL.TRANSITION_TABLE.get(state or "", ())),
-                "history": [dict(row) for row in SL.history(conn, strategy_id)][-20:],
+                "history": [dict(row) for row in SL.history(
+                    conn, challenger["strategy_id"], challenger["version"])][-20:],
             },
             "exact_evidence": {"comparison_report_id": comparison_report_id},
         }

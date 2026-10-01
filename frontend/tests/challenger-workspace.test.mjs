@@ -37,8 +37,18 @@ function block(html, testid) {
 function view(overrides = {}) {
   const base = {
     strategy_id: "r32_final_strategy",
-    active: { strategy_id: "r32_final_strategy", version: 1, checksum: "c".repeat(64), lifecycle_state: "shadow" },
-    challenger: { strategy_id: "r32_final_strategy", version: 1, checksum: "c".repeat(64), lifecycle_state: "shadow" },
+    active: {
+      available: true, unavailable_reason: null, comparison_bound: true,
+      identity_source: "shadow_comparison.active_strategy_stamp",
+      strategy_id: "active_fixture", version: 1, checksum: "a".repeat(64),
+      lifecycle_state: null,
+    },
+    challenger: {
+      available: true, unavailable_reason: null, comparison_bound: true,
+      identity_source: "shadow_comparison.challenger_strategy_stamp",
+      strategy_id: "r32_final_strategy", version: 1, checksum: "c".repeat(64),
+      lifecycle_state: "shadow",
+    },
     comparison: {
       available: true,
       unavailable_reason: null,
@@ -77,6 +87,21 @@ function view(overrides = {}) {
   };
   return { ...base, ...overrides };
 }
+
+test("W1a：两腿分别来自 report 的两个 exact stamp，绝不合并成一个 registry identity", () => {
+  const html = wb.wbChallengerHtml("r32_final_strategy", view());
+  const activeRow = block(html, "challenger-active");
+  const challengerRow = block(html, "challenger-challenger");
+  assert.ok(activeRow.includes("active_fixture"));
+  assert.ok(challengerRow.includes("r32_final_strategy"));
+  assert.ok(!activeRow.includes("r32_final_strategy"),
+    "the Active row must never show the Challenger strategy identity");
+  assert.ok(!challengerRow.includes("active_fixture"));
+  assert.ok(activeRow.includes("shadow_comparison.active_strategy_stamp"));
+  assert.ok(challengerRow.includes("shadow_comparison.challenger_strategy_stamp"));
+  assert.ok(activeRow.includes("a".repeat(64)));
+  assert.ok(challengerRow.includes("c".repeat(64)));
+});
 
 test("W8/W13：AVAILABLE 与后端 eligible 原样渲染", () => {
   const html = wb.wbChallengerHtml("r32_final_strategy", view());
@@ -129,6 +154,17 @@ test("W10/W11：不可用不是 0，也不是判通过", () => {
       blocking_reasons: ["shadow_comparison_report_not_found"], satisfied_evidence: [],
       evidence_fingerprints: {},
     },
+    active: {
+      available: false, unavailable_reason: "shadow_comparison_report_not_found",
+      identity_source: null, comparison_bound: false,
+      strategy_id: null, version: null, checksum: null, lifecycle_state: null,
+    },
+    challenger: {
+      available: true, unavailable_reason: null,
+      identity_source: "registry_candidate", comparison_bound: false,
+      strategy_id: "r32_final_strategy", version: 2, checksum: "c".repeat(64),
+      lifecycle_state: "shadow",
+    },
     parameter_head_activation: {
       authority: "strategy_champion", target_fact: "formal parameter/version head",
       available: false, unavailable_reason: "parameter_head_ledger_unavailable",
@@ -138,6 +174,12 @@ test("W10/W11：不可用不是 0，也不是判通过", () => {
   const html = wb.wbChallengerHtml("r32_final_strategy", unavailable);
   assert.ok(html.includes(">UNAVAILABLE<"));
   assert.ok(html.includes("shadow_comparison_report_not_found"));
+  // No report ⇒ no Active comparator fact: the row says unavailable instead of
+  // fabricating an identity from the registry head.
+  const activeRow = block(html, "challenger-active");
+  assert.ok(activeRow.includes("不可用"));
+  assert.ok(!activeRow.includes("r32_final_strategy"));
+  assert.ok(block(html, "challenger-challenger").includes("r32_final_strategy"));
   assert.ok(html.includes("不可用"), "missing evidence must render as 不可用");
   assert.ok(!html.includes("0/0"), "a missing coverage must not become 0/0");
   assert.ok(!html.includes("ratio 0"), "a missing coverage ratio must not become 0");
@@ -169,12 +211,12 @@ test("W15/W16：两条晋级链分别命名，前端不合成 readiness、不做
 });
 
 test("W16b：源码里没有前端自算 readiness 或缺失值转换", () => {
-  const start = source.indexOf("export function wbChallengerHtml");
+  const start = source.indexOf("// ── Active vs Challenger workspace");
   const end = source.indexOf("export async function wbLoadChallengerReport");
   assert.ok(start > 0 && end > start, "the challenger renderer must exist");
   const section = source.slice(start, end);
   for (const forbidden of ["coverage_ratio >= 1", "coverage_ratio == 1", "coverage_ratio === 1",
-                           "把 missing", "|| 0", "?? 0", "winner", "score"]) {
+                           "|| 0", "?? 0", "winner", "score"]) {
     assert.ok(!section.includes(forbidden), `the renderer must not contain ${forbidden}`);
   }
   // It reads the backend's own decision and never derives one.

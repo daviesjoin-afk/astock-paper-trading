@@ -336,6 +336,13 @@ UI 只读取并展示这两条链；AI 只能 propose / explain / summarize，�
 3. Workspace：`GET /api/strategies/{id}/challenger`（单一读端点）+ `strategy_service.challenger_read_model`
    （只组装 owner 事实）+ 现有 Strategy Workbench 的 Active vs Challenger 段落。**不新建第二个页面**，
    前端只渲染后端决定，两条 readiness 分列。
+   **identity 契约（评审 blocker 修复）**：命名了 exact `ShadowComparisonReport` 时，两条腿都取自
+   report 自己的 strategy stamp（`active_strategy_stamp` / `challenger_strategy_stamp`），**不**从
+   registry current head 推导；report 的 Challenger 不是本 endpoint 的策略、或显式 `version` 与
+   report 冲突时，以 `shadow_comparison_identity_mismatch` fail closed（400）；没有 report 时
+   `active.available=false`（**不存在** Active comparator fact），Challenger 仅作为
+   `registry_candidate` 展示。历史 report 因而不随 head 漂移（W1b），Active 的 lifecycle state 用
+   自己的 exact `SL.get_state` 查询，查不到即 `None`。
 4. 回归：`test_r32_final_promotion.py`（R-F1…R-F6、W1…W7、authority 隔离守卫）、
    `test_r32_final_ownership_boundary.py`（R-F9…R-F12，冻结 sizing / shadow_exception 语义）、
    `frontend/tests/challenger-workspace.test.mjs`（W8…W16）。

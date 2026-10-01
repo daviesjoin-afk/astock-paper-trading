@@ -100,6 +100,20 @@ class _PromotionFixture:
             session_date=self.day, decision_at=self.decision_at, reference_capital=100_000.0)
         self.shadow_run = self._shadow_run((self.candidate,))
 
+    def _pin_foreign_challenger(self, strategy_id, version, checksum):
+        """Pin the Challenger leg onto another strategy's exact stamp."""
+        self.strategy_version = types.SimpleNamespace(
+            strategy_id=strategy_id, version=int(version), checksum=checksum,
+            definition=DEFINITION)
+        self._pin_challenger(SH.StrategyStamp(strategy_id, int(version), checksum))
+
+    def _restore_challenger(self):
+        """Pin the Challenger leg back onto the registry's exact version."""
+        self.strategy_version = types.SimpleNamespace(
+            strategy_id=self.spec.id, version=int(self.version.version),
+            checksum=self.version.checksum, definition=DEFINITION)
+        self._pin_challenger(self._exact_challenger_stamp())
+
     def _seed_state(self, state):
         """Fixture seed of the lifecycle state.
 
@@ -416,17 +430,89 @@ class ChallengerWorkspaceReadModelTests(_PromotionFixture, unittest.TestCase):
     def _read(self, **kwargs):
         return SVC.challenger_read_model(self.spec.id, **kwargs)
 
-    def test_w1_exact_identities_and_lifecycle_states(self):
-        self._build_report()
-        view = self._read()
-        self.assertEqual(self.spec.id, view["active"]["strategy_id"])
-        self.assertEqual(int(self.version.version), view["active"]["version"])
-        self.assertEqual(self.version.checksum, view["active"]["checksum"])
+    def test_w1a_both_legs_come_from_the_report_stamps(self):
+        report = self._build_report()
+        view = self._read(comparison_report_id=report.report_id)
+        active_stamp = dict(report.active_strategy_stamp)
+        challenger_stamp = dict(report.challenger_strategy_stamp)
+        for leg, stamp, source in (("active", active_stamp,
+                                    "shadow_comparison.active_strategy_stamp"),
+                                   ("challenger", challenger_stamp,
+                                    "shadow_comparison.challenger_strategy_stamp")):
+            with self.subTest(leg=leg):
+                self.assertEqual(stamp["strategy_id"], view[leg]["strategy_id"])
+                self.assertEqual(int(stamp["version"]), view[leg]["version"])
+                self.assertEqual(stamp["checksum"], view[leg]["checksum"])
+                self.assertEqual(source, view[leg]["identity_source"])
+                self.assertTrue(view[leg]["comparison_bound"])
+                self.assertTrue(view[leg]["available"])
+        # The two legs are genuinely different strategies in this fixture: neither
+        # may be collapsed onto the endpoint's own registry identity.
+        self.assertNotEqual(view["active"]["strategy_id"], view["challenger"]["strategy_id"])
+        self.assertEqual(self.spec.id, view["challenger"]["strategy_id"])
+        self.assertEqual(active_stamp["strategy_id"], view["active"]["strategy_id"])
+        # Exactly one lifecycle state per leg, and an unknown Active comparator is
+        # reported as unknown rather than filled from the Challenger.
+        self.assertIsNone(view["active"]["lifecycle_state"])
         self.assertEqual("shadow", view["challenger"]["lifecycle_state"])
         self.assertEqual("shadow", view["lifecycle"]["state"])
         self.assertIn("paper", view["lifecycle"]["allowed_next_transitions"])
         self.assertEqual(["version_created"], [row["transition_kind"]
                                                for row in view["lifecycle"]["history"]])
+        self.assertEqual(int(self.version.version), view["lifecycle"]["version"])
+        self.assertEqual({"strategy_id": self.spec.id,
+                          "strategy_version": int(self.version.version),
+                          "strategy_checksum": self.version.checksum},
+                         view["lifecycle_promotion"]["candidate"])
+
+    def test_w1b_a_historical_report_keeps_its_exact_identity(self):
+        report = self._build_report()
+        stale_version = int(self.version.version)
+        stale_checksum = self.version.checksum
+        # The registry moves on: a new immutable version becomes the head.
+        SR.save_definition(self.paper, self.spec.id, {"dsl_ast": {"op": "lt",
+                          "left": {"op": "field", "name": "close"},
+                          "right": {"op": "const", "value": 0}}},
+                          expected_version=stale_version, actor="r32-final-test")
+        self.paper.commit()
+        head = SR.get_version(self.spec.id, conn=self.paper)
+        self.assertEqual(stale_version + 1, int(head.version))
+        self.assertNotEqual(stale_checksum, head.checksum)
+
+        view = self._read(comparison_report_id=report.report_id)
+        # The displayed Challenger is still the report's exact version, not the head.
+        self.assertEqual(stale_version, view["challenger"]["version"])
+        self.assertEqual(stale_checksum, view["challenger"]["checksum"])
+        self.assertEqual(stale_version, view["lifecycle"]["version"])
+        self.assertEqual(stale_checksum, view["lifecycle"]["checksum"])
+        self.assertEqual({"strategy_id": self.spec.id, "strategy_version": stale_version,
+                          "strategy_checksum": stale_checksum},
+                         view["lifecycle_promotion"]["candidate"])
+        # The head is reported separately, so the drift is visible rather than hidden.
+        self.assertEqual(int(head.version), view["registry_head"]["version"])
+        self.assertEqual(head.checksum, view["registry_head"]["checksum"])
+        # And the policy blocks the stale candidate on its own terms.
+        self.assertFalse(view["lifecycle_promotion"]["eligible"])
+        self.assertIn("strategy_version_changed",
+                      view["lifecycle_promotion"]["blocking_reasons"])
+
+    def test_w1c_a_report_of_another_strategy_fails_closed(self):
+        self._pin_foreign_challenger("another_strategy", 1, "f" * 64)
+        foreign = self._build_report()
+        self.assertEqual("another_strategy", foreign.challenger_strategy_stamp["strategy_id"])
+        with self.assertRaises(SVC.InvalidStrategyDefinition) as raised:
+            self._read(comparison_report_id=foreign.report_id)
+        self.assertEqual("shadow_comparison_identity_mismatch", str(raised.exception))
+        # An explicit version that contradicts the report is the same conflict.
+        self._restore_challenger()
+        report = self._build_report()
+        with self.assertRaises(SVC.InvalidStrategyDefinition) as raised:
+            self._read(comparison_report_id=report.report_id,
+                       version=int(self.version.version) + 1)
+        self.assertEqual("shadow_comparison_identity_mismatch", str(raised.exception))
+        # The matching request stays usable.
+        self.assertTrue(self._read(comparison_report_id=report.report_id,
+                                   version=int(self.version.version))["comparison"]["available"])
 
     def test_w2_the_named_report_is_the_only_comparison_evidence(self):
         report = self._build_report()
@@ -494,11 +580,29 @@ class ChallengerWorkspaceReadModelTests(_PromotionFixture, unittest.TestCase):
         self.assertIsNone(unnamed["comparison"]["performance"])
         self.assertIn("shadow_comparison_report_required",
                       unnamed["lifecycle_promotion"]["blocking_reasons"])
+        # No report ⇒ no Active comparator fact at all: never the registry head.
+        self.assertFalse(unnamed["active"]["available"])
+        self.assertEqual("shadow_comparison_report_required",
+                         unnamed["active"]["unavailable_reason"])
+        self.assertIsNone(unnamed["active"]["strategy_id"])
+        self.assertIsNone(unnamed["active"]["version"])
+        self.assertIsNone(unnamed["active"]["checksum"])
+        self.assertIsNone(unnamed["active"]["lifecycle_state"])
+        self.assertFalse(unnamed["active"]["comparison_bound"])
+        # The Challenger is a registry candidate here, explicitly not bound to a
+        # comparison, so nothing is fabricated into an Active fact.
+        self.assertFalse(unnamed["challenger"]["comparison_bound"])
+        self.assertEqual("registry_candidate", unnamed["challenger"]["identity_source"])
+        self.assertEqual(self.spec.id, unnamed["challenger"]["strategy_id"])
+        self.assertEqual(int(self.version.version), unnamed["challenger"]["version"])
         # A perfectly good report exists and the unnamed request still reports
         # absence: the workspace never resolves "the newest one".
         unknown = self._read(comparison_report_id="e" * 64)
         self.assertEqual("shadow_comparison_report_not_found",
                          unknown["comparison"]["unavailable_reason"])
+        self.assertEqual("shadow_comparison_report_not_found",
+                         unknown["active"]["unavailable_reason"])
+        self.assertIsNone(unknown["active"]["strategy_id"])
         self.assertEqual(report.report_id,
                          self._read(comparison_report_id=report.report_id)["comparison"]["report_id"])
         self.assertTrue(self._read(comparison_report_id=report.report_id)[

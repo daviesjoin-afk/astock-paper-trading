@@ -680,6 +680,17 @@ function wbDeltaRows(title,section){
     +(reasons?'<ul>'+reasons+'</ul>':'')
     +'<details><summary>owner 事实</summary><code>'+adaptiveEsc(JSON.stringify(section||{}))+'</code></details></article>';
 }
+function wbLegHtml(leg){
+  // A comparison leg is whatever the exact report's own stamp says. When there is
+  // no such fact, the leg is unavailable — never filled from the registry head.
+  if(!leg||leg.available===false){
+    return '<span class="strategy-fact-unknown">不可用</span> · '+wbFact((leg&&leg.unavailable_reason)||null);
+  }
+  return adaptiveEsc(leg.strategy_id||'')+' v'+adaptiveEsc(String(leg.version==null?'':leg.version))
+    +' · '+adaptiveEsc(leg.lifecycle_state||'不可用')
+    +' · <code>'+adaptiveEsc(String(leg.checksum||''))+'</code>'
+    +(leg.identity_source?' <small>来源 '+adaptiveEsc(leg.identity_source)+'</small>':'');
+}
 export function wbChallengerHtml(strategyId,view){
   if(!view) return '<p>Challenger 视图暂不可用。</p>';
   var comparison=view.comparison||{};
@@ -696,8 +707,8 @@ export function wbChallengerHtml(strategyId,view){
     +'<label>Exact ShadowComparisonReport id<input id="wbChallengerReport" maxlength="64" autocomplete="off" value="'+adaptiveEsc(WB_STATE.challengerReportId||'')+'"></label>'
     +'<div class="strategy-lifecycle-actions"><button type="button" data-testid="challenger-load" onclick="wbLoadChallengerReport(\''+adaptiveEsc(strategyId)+'\')">按 exact id 读取比对证据</button></div>'
     +'<dl class="strategy-preview-grid">'
-    +'<dt>Active</dt><dd data-testid="challenger-active">'+adaptiveEsc(active.strategy_id||'')+' v'+adaptiveEsc(String(active.version==null?'':active.version))+' · '+adaptiveEsc(active.lifecycle_state||'不可用')+' · <code>'+adaptiveEsc(String(active.checksum||''))+'</code></dd>'
-    +'<dt>Challenger</dt><dd data-testid="challenger-challenger">'+adaptiveEsc(challenger.strategy_id||'')+' v'+adaptiveEsc(String(challenger.version==null?'':challenger.version))+' · '+adaptiveEsc(challenger.lifecycle_state||'不可用')+' · <code>'+adaptiveEsc(String(challenger.checksum||''))+'</code></dd>'
+    +'<dt>Active</dt><dd data-testid="challenger-active">'+wbLegHtml(active)+'</dd>'
+    +'<dt>Challenger</dt><dd data-testid="challenger-challenger">'+wbLegHtml(challenger)+'</dd>'
     +'<dt>Comparison report</dt><dd data-testid="challenger-report">'+wbFact(comparison.report_id)+'</dd>'
     +'<dt>Report fingerprint</dt><dd>'+wbFact(comparison.report_fingerprint)+'</dd>'
     +'<dt>Comparison scope identity</dt><dd>'+wbFact(comparison.comparison_scope_identity)+'</dd>'
