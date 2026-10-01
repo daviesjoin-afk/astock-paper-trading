@@ -468,3 +468,16 @@
 | M60 | identity check self-attested without identity rows（省略身份行也自称核对过） | CAUGHT |
 | S0 | 哨兵：只改注释 | UNDETECTED（预期） |
 
+## R32 Final（IN REVIEW）
+
+| 契约 | 断言 | 测试 | mutation |
+| --- | --- | --- | --- |
+| shadow → paper 只消费一份 exact `ShadowComparisonReport`（`report_id == report_fingerprint`） | `AVAILABLE` + coverage 完整 + blocking 为空 + owner provenance 完整 + challenger id/version/checksum 相等 + 共享环境 EQUAL → eligible；决策指纹记录 report/scope/shadow-run 三个 exact 指纹 | `test_r32_final_promotion.py`（R-F1、R-F1b） | M-F3 / M-F4 / M-F5 |
+| `PARTIAL` / `UNAVAILABLE` 永远阻断 | blocked reason 稳定（`shadow_comparison_partial` / `_unavailable` / `_blocking_reasons` / `_coverage_incomplete` / `_provenance_incomplete` / `_environment_mismatch` / `_corrupt`）；`PARTIAL` 绝不进 eligible | `test_r32_final_promotion.py`（R-F2、R-F3、R-F3b、R-F3c、R-F4c、R-F4d） | M-F1 / M-F2 / M-F9 / M-F10 |
+| 无 latest / current 兜底 | repository 无 latest getter；promotion 源码无 latest 调用；被阻断的 named report 不会回落到可用的另一份；未知 id 保持 not_found | `test_r32_final_promotion.py`（R-F5、R-F5b） | M-F5 |
+| proposal 生命周期 | apply → 恰好一条 `promotion` 事件（`version_created` + promotion）；AI 不可 apply；世界漂移后 proposal 变 stale 且 fail closed；`paper → production_sim` 仍 blocked | `test_r32_final_promotion.py`（R-F6、R-F6b、R-F6c） | M-F6 / M-F7 |
+| 两条 authority 互不越权 | promotion 源码不出现 `strategy_champion` / `activate_params_candidate` / `self_evolution` / 指标词表；champion 源码不出现 `strategy_lifecycle` / `shadow_comparison` / `promotion_proposal`；lifecycle 只经 `SL.transition` | `test_r32_final_promotion.py`（PromotionAuthoritySeparationTests） | M-F11 / M-F12 |
+| Workspace 只组装 owner 事实 | active/challenger exact identity、named report、availability/coverage/blocking 原样、readiness 等于 `strategy_promotion.evaluate` 的同一 decision fingerprint；两条 readiness 分列且不合并；无名证据保持 absent（不是 0） | `test_r32_final_promotion.py`（W1–W7） | — |
+| Entry / sizing / observation 边界冻结 | Active 黄灯 per-strategy `risk_scale`（0.5/0.75/0.65）与红灯 sector-heat `shadow_exception` 语义不变；`EntryGateState` 与 planner 均无 sizing/observation 字段；manual 用的 canonical gate 无 `risk_scale`；比对报告不含 Active sizing modifier | `test_r32_final_ownership_boundary.py`（R-F9、R-F9b、R-F10、R-F11、R-F12） | — |
+| 前端不重算 readiness、不把缺失当 0 | AVAILABLE/PARTIAL/UNAVAILABLE 原样渲染；缺失渲染为「不可用」而非 `0`/`0/0`；两条晋级链分别命名且不合成；渲染函数内无 coverage→ready 推导 | `frontend/tests/challenger-workspace.test.mjs`（W8–W16） | M-F13 |
+

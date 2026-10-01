@@ -50,7 +50,7 @@ export var WB_INDICATOR_LABELS={ma:'均线 MA',ema:'指数均线 EMA',rsi:'RSI',
 
 export var WB_STATUS_BADGES={draft:['DRAFT','strategy-status-draft'],candidate:['CANDIDATE','strategy-status-validated'],research:['RESEARCH','strategy-status-validated'],validated:['VALIDATED','strategy-status-validated'],shadow:['SHADOW','strategy-status-draft'],paper:['PAPER','strategy-status-active'],production_sim:['PRODUCTION_SIM','strategy-status-active'],degraded:['DEGRADED','strategy-status-paused'],paused:['PAUSED','strategy-status-paused'],retiring:['RETIRING','strategy-status-paused'],archived:['ARCHIVED','strategy-status-archived'],rejected:['REJECTED','strategy-status-archived'],validation_failed:['VALIDATION_FAILED','strategy-status-archived'],quarantined:['QUARANTINED','strategy-status-paused']};
 
-export var WB_STATE={items:[],summary:null,originFilter:'all',statusFilter:'all',view:'list',editingId:null,editingVersion:null,editorMode:'builder'};
+export var WB_STATE={items:[],summary:null,originFilter:'all',statusFilter:'all',view:'list',editingId:null,editingVersion:null,editorMode:'builder',challengerReportId:''};
 
 export async function loadStrategyWorkbench(force){
   var target=$('wbList'); if(!target) return;
@@ -662,13 +662,79 @@ export function wbRenderNotFound(strategyId,message){
   wbShowView('detail');
 }
 
+// ── Active vs Challenger workspace（只渲染后端 owner 事实）─────────────────
+// 前端不计算 availability / coverage / readiness，也不把 missing 变成 0/false：
+// 每个值要么原样呈现 owner 的语义，要么显示「不可用」。
+export function wbFact(value){
+  if(value===null||value===undefined||value==='') return '<span class="strategy-fact-unknown">不可用</span>';
+  if(typeof value==='object') return '<code>'+adaptiveEsc(JSON.stringify(value))+'</code>';
+  return adaptiveEsc(String(value));
+}
+function wbAvailabilityTag(value){
+  var label=(value===null||value===undefined||value==='')?'UNAVAILABLE':String(value);
+  return '<span class="strategy-availability strategy-availability-'+adaptiveEsc(label.toLowerCase())+'">'+adaptiveEsc(label)+'</span>';
+}
+function wbDeltaRows(title,section){
+  var reasons=((section&&section.blocking_reasons)||[]).map(function(reason){return '<li>'+adaptiveEsc(reason)+'</li>';}).join('');
+  return '<article data-testid="challenger-dimension-'+adaptiveEsc(title)+'"><b>'+adaptiveEsc(title)+'</b> '+wbAvailabilityTag(section&&section.availability)
+    +(reasons?'<ul>'+reasons+'</ul>':'')
+    +'<details><summary>owner 事实</summary><code>'+adaptiveEsc(JSON.stringify(section||{}))+'</code></details></article>';
+}
+export function wbChallengerHtml(strategyId,view){
+  if(!view) return '<p>Challenger 视图暂不可用。</p>';
+  var comparison=view.comparison||{};
+  var coverage=comparison.coverage||null;
+  var active=view.active||{}, challenger=view.challenger||{};
+  var promotion=view.lifecycle_promotion||{};
+  var activation=view.parameter_head_activation||{};
+  var environment=comparison.environment_identity||null;
+  var spec=comparison.comparison_spec||null;
+  var promotionReasons=(promotion.blocking_reasons||[]).map(function(reason){return '<li>'+adaptiveEsc(reason)+'</li>';}).join('');
+  var activationRows=(activation.versions||[]).map(function(item){
+    return '<li>'+adaptiveEsc(item.role||'')+' · '+adaptiveEsc(item.status||'')+' · v'+adaptiveEsc(String(item.id))+'</li>';}).join('');
+  return '<h4>Active vs Challenger（生命周期晋级与参数头晋升互相独立）</h4>'
+    +'<label>Exact ShadowComparisonReport id<input id="wbChallengerReport" maxlength="64" autocomplete="off" value="'+adaptiveEsc(WB_STATE.challengerReportId||'')+'"></label>'
+    +'<div class="strategy-lifecycle-actions"><button type="button" data-testid="challenger-load" onclick="wbLoadChallengerReport(\''+adaptiveEsc(strategyId)+'\')">按 exact id 读取比对证据</button></div>'
+    +'<dl class="strategy-preview-grid">'
+    +'<dt>Active</dt><dd data-testid="challenger-active">'+adaptiveEsc(active.strategy_id||'')+' v'+adaptiveEsc(String(active.version==null?'':active.version))+' · '+adaptiveEsc(active.lifecycle_state||'不可用')+' · <code>'+adaptiveEsc(String(active.checksum||''))+'</code></dd>'
+    +'<dt>Challenger</dt><dd data-testid="challenger-challenger">'+adaptiveEsc(challenger.strategy_id||'')+' v'+adaptiveEsc(String(challenger.version==null?'':challenger.version))+' · '+adaptiveEsc(challenger.lifecycle_state||'不可用')+' · <code>'+adaptiveEsc(String(challenger.checksum||''))+'</code></dd>'
+    +'<dt>Comparison report</dt><dd data-testid="challenger-report">'+wbFact(comparison.report_id)+'</dd>'
+    +'<dt>Report fingerprint</dt><dd>'+wbFact(comparison.report_fingerprint)+'</dd>'
+    +'<dt>Comparison scope identity</dt><dd>'+wbFact(comparison.comparison_scope_identity)+'</dd>'
+    +'<dt>Availability</dt><dd data-testid="challenger-availability">'+wbAvailabilityTag(comparison.availability)+(comparison.available?'':' · '+wbFact(comparison.unavailable_reason))+'</dd>'
+    +'<dt>Coverage</dt><dd data-testid="challenger-coverage">'+(coverage?adaptiveEsc(String(coverage.available_observations))+'/'+adaptiveEsc(String(coverage.expected_observations))+' · ratio '+adaptiveEsc(String(coverage.coverage_ratio))+' · partial '+adaptiveEsc(String(coverage.partial_observations))+' · missing '+adaptiveEsc(String(coverage.missing_observations)):'<span class="strategy-fact-unknown">不可用</span>')+'</dd>'
+    +'<dt>Blocking reasons</dt><dd data-testid="challenger-blocking">'+adaptiveEsc((comparison.blocking_reasons||[]).join(', ')||'无')+'</dd>'
+    +'<dt>Environment equality</dt><dd>'+adaptiveEsc((environment&&environment.shared_environment_equality)||'不可用')+'</dd>'
+    +'<dt>session_date / decision_at</dt><dd>'+adaptiveEsc((spec&&spec.session_date)||'不可用')+' / '+adaptiveEsc((spec&&spec.decision_at)||'不可用')+'</dd></dl>'
+    +'<article data-testid="challenger-facts"><b>Signal / Decision / Execution / Risk / Turnover / Performance（owner 事实与 availability）</b>'
+    +wbDeltaRows('signal',comparison.signal_delta)+wbDeltaRows('decision',comparison.decision_delta)+wbDeltaRows('execution',comparison.execution)
+    +wbDeltaRows('risk',comparison.risk_rejection)+wbDeltaRows('turnover',comparison.turnover)+wbDeltaRows('performance',comparison.performance)
+    +'<details><summary>provenance（owner 声明）</summary><code>'+adaptiveEsc(JSON.stringify(comparison.provenance||{}))+'</code></details></article>'
+    +'<article data-testid="lifecycle-promotion-readiness"><b>生命周期晋级（Lifecycle Promotion）</b><p>authority '+adaptiveEsc(promotion.authority||'')+' · target '+adaptiveEsc(promotion.target_fact||'')+'</p>'
+    +'<p>后端判断：'+(promotion.eligible?'eligible':'blocked')+' · policy '+adaptiveEsc(promotion.policy_version||'')+' · decision '+adaptiveEsc(promotion.decision_fingerprint||'')+'</p>'
+    +'<p>required '+adaptiveEsc((promotion.required_evidence||[]).join(', ')||'无')+' · satisfied '+adaptiveEsc((promotion.satisfied_evidence||[]).join(', ')||'无')+'</p>'
+    +(promotionReasons?'<ul>'+promotionReasons+'</ul>':'')+'</article>'
+    +'<article data-testid="parameter-head-activation"><b>参数头晋升（Parameter-Head Champion Activation）</b><p>authority '+adaptiveEsc(activation.authority||'')+' · target '+adaptiveEsc(activation.target_fact||'')+' · executor '+adaptiveEsc(activation.mutation_executor||'')+'</p>'
+    +'<p>该 readiness 由 '+adaptiveEsc(activation.authority||'')+' 自己决定；两条链分别展示，不合并、不相加、不相与。</p>'
+    +(activation.available?(activationRows?'<ul>'+activationRows+'</ul>':'<p>暂无参数头版本。</p>'):'<p>'+wbFact(activation.unavailable_reason)+'</p>')+'</article>';
+}
+export async function wbLoadChallengerReport(strategyId){
+  var input=document.getElementById('wbChallengerReport');
+  WB_STATE.challengerReportId=((input&&input.value)||'').trim();
+  await wbOpenDetail(strategyId);
+}
+
 export async function wbOpenDetail(strategyId){
   var item;
   try{ item=await api('/api/strategies/'+encodeURIComponent(strategyId)+'?_='+Date.now()); }
   catch(e){ wbRenderNotFound(strategyId,e&&e.message); return null; }
-  var versions=[],lifecycle={};
+  var versions=[],lifecycle={},challengerView=null;
   try{ versions=(await api('/api/strategies/'+encodeURIComponent(strategyId)+'/versions')).items||[]; }catch(e){}
   try{ lifecycle=await api('/api/strategies/'+encodeURIComponent(strategyId)+'/lifecycle'); }catch(e){}
+  try{
+    challengerView=await api('/api/strategies/'+encodeURIComponent(strategyId)+'/challenger'
+      +(WB_STATE.challengerReportId?'?comparison_report_id='+encodeURIComponent(WB_STATE.challengerReportId):''));
+  }catch(e){}
   var box=$('wbDetail'); if(!box) return;
   WB_STATE.editingId=strategyId; WB_STATE.editingVersion=item.version||item.current_version;
   var currentVersion=lifecycle.version||item.version||item.current_version||1;
@@ -681,6 +747,7 @@ export async function wbOpenDetail(strategyId){
     var evidenceRefs=[];
     if(bundle.r29_run_key) evidenceRefs.push('R29 '+bundle.r29_run_key);
     if(bundle.r30_report_key) evidenceRefs.push('R30 '+bundle.r30_report_key);
+    if(bundle.shadow_comparison_report_id) evidenceRefs.push('Comparison '+bundle.shadow_comparison_report_id);
     return '<li data-testid="strategy-lifecycle-event"><span class="strategy-version-time">'+adaptiveEsc(ev.created_at||'')+'</span> '
       +'<b>'+adaptiveEsc(ev.from_state||'initial')+' → '+adaptiveEsc(ev.to_state||'')+'</b>'
       +'<small>v'+adaptiveEsc(ev.strategy_version)+' · '+adaptiveEsc(ev.actor_type||'')+':'+adaptiveEsc(ev.actor_id||'')
@@ -736,6 +803,7 @@ export async function wbOpenDetail(strategyId){
     +'<h4>Promotion Policy 与 exact evidence</h4><p>eligibility 和阻断原因由后端返回；这里仅提交明确的 evidence identity 与 rationale。</p>'
     +evidenceInputs+'<div class="strategy-promotion-targets">'+(promotionButtons||'<small>没有 promotion transition 可用。</small>')+'</div>'
     +'<h4>Promotion proposals</h4><div class="strategy-promotion-proposals">'+(proposals||'<p>暂无 proposal。</p>')+'</div></section>'
+    +'<section class="strategy-challenger-workspace" data-testid="challenger-workspace">'+wbChallengerHtml(strategyId,challengerView)+'</section>'
     +'<div class="strategy-detail-columns"><section><h4>运行时摘要</h4><dl class="strategy-preview-grid">'
     +'<dt>ID</dt><dd>'+adaptiveEsc(item.id)+'</dd><dt>来源</dt><dd>'+(item.origin==='user'?'自定义':'内置')+'</dd>'
     +'<dt>生命周期阶段</dt><dd>'+(runtime.runtime_ready?adaptiveEsc(runtime.lifecycle_stage||'—'):'—')+'</dd>'

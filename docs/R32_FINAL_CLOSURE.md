@@ -218,3 +218,130 @@ sector_rotation light=red (板块热点)
 
 以上 4 项都不改变 `allowed` / `order_status` / sizing / 阈值 / 执行经济学，可作为缩小范围的
 R32-FINAL（Promotion + Workspace）先交人审；Entry Authority 收敛与参数头 promotion 归属另行决策。
+
+---
+
+# DECISION RESOLUTION（人工裁决，随后按此实现）
+
+## R1. Q1 = (a)：Entry 边界按 owner 分裂，不做「单一 Entry Authority」重写
+
+`risk_scale` **不归** Entry Authority，它是 **策略市场状态 → sizing/budget modifier**；
+`shadow_exception` **不归** Entry Authority，它是 **research/shadow observation policy**，不能授权正式成交。
+
+```text
+Entry / Admission Authority   → 只拥有「能不能进入」及其 owner evidence
+Sizing / Market Exposure      → risk_scale、budget/exposure scaling
+Research / Shadow Observation → shadow_exception
+Execution Authority           → dispatch / fill / execution constraints
+```
+
+因此 §C 探出的 20+ Active gate **本轮不迁移**；`_buy_order` 不被重写；
+`manual` 路径**不继承** Active 的 per-strategy risk_scale。取而代之的验收口径是：
+
+```text
+[ ] 每个业务事实只有一个 owner
+[ ] risk_scale 只有一个 sizing-policy owner
+[ ] shadow_exception 只有一个 research owner
+[ ] Execution Dispatch 只有一个 execution owner
+[ ] Shadow entry 使用 frozen explicit owner facts
+[ ] Active comparison 使用实际 persisted owner evidence
+[ ] 不同 vocabulary 不制造等价映射
+[ ] Comparison 不重新执行 entry / risk / sizing
+[ ] 本 PR 不改变 Active/manual 的交易行为
+[ ] 没有新增重复 gate implementation
+```
+
+真正 dead、caller=0 的旧 helper 仍然删除（见 R3），但不为「单一 Entry Authority」重写主路径。
+后续若要彻底整理 Active/manual admission，作为独立的 production-entry convergence 工程，不夹在 R32 里。
+
+## R2. Q2：两条晋级链并列，互不越权
+
+```text
+Lifecycle Promotion
+  owner            = strategy_promotion
+  target fact      = strategy lifecycle state
+  mutation executor= strategy_lifecycle.transition()
+  authority count  = 1
+
+Parameter-Head Champion Activation
+  owner            = strategy_champion
+  target fact      = formal parameter/version head
+  mutation executor= self_evolution.activate_params_candidate
+  authority count  = 1
+```
+
+二者**不是** duplicate authority，禁止再写「Promotion authority count = 1」这种笼统口径。
+`strategy_champion.compare_for_promotion` / `promote_challenger` /
+`/api/paper/strategy-champion/promote` / `self_evolution.activate_params_candidate` **全部保留**；
+仅删除经 caller audit 确认的 dead code。
+
+文档与 UI 口径固定为「生命周期晋级 / Lifecycle Promotion」与「参数头晋升 /
+Parameter-Head Champion Activation」，不做重命名 churn。
+
+## R3. 已执行的删除（caller audit = 0）
+
+| 被删对象 | production caller | test caller | replacement |
+| --- | --- | --- | --- |
+| `PromotionEvidenceBundle.future_shadow_evidence_ref` | 0 | 0 | `shadow_comparison_report_id` |
+| `strategy_champion.collect_ledger_metrics` | 0 | 1（`test_strategy_invariants`，随函数一并删除） | 无 |
+| `manual_orders._manual_risk_state` + `paper_trading._manual_risk_state` facade | 0 | 0 | `paper_trading._shared_risk_state` |
+
+保留：`strategy_champion` 参数头激活系统、`tradability_shadow`、`tradability_position_shadow`、
+`factor_quality_shadow`、`execution_quality_shadow`、`portfolio_shadow`。
+
+## R4. 唯一 authority graph（本 PR 之后）
+
+```text
+Lifecycle chain（生命周期晋级）
+  Strategy Version
+        ↓
+  Comparable Runtime Context
+        ↓
+  Active Evidence + ShadowRun
+        ↓
+  ShadowComparisonReport          ← 唯一比对事实 owner（exact id == fingerprint）
+        ↓
+  strategy_promotion              ← 唯一 Lifecycle Promotion Policy
+        ↓
+  PromotionProposal / PromotionDecision
+        ↓
+  strategy_lifecycle.transition() ← 唯一 lifecycle 写入口
+        ↓
+  SHADOW → PAPER
+
+Parameter-head chain（参数头晋升）
+  Parameter Challenger
+        ↓
+  strategy_champion scientific comparison（指标/容差）
+        ↓
+  Champion activation decision
+        ↓
+  self_evolution.activate_params_candidate
+        ↓
+  formal parameter head
+
+NO CROSS-MUTATION：
+  Lifecycle Promotion → parameter head  = 0
+  Champion Activation → lifecycle state = 0
+```
+
+UI 只读取并展示这两条链；AI 只能 propose / explain / summarize，不能改变 evidence、readiness 或 lifecycle。
+
+## R5. 本 PR 交付内容
+
+1. Lifecycle Promotion 消费 exact `ShadowComparisonReport`（`shadow_comparison_report_id`，64-hex
+   单一身份），12 项校验，`PARTIAL` / `UNAVAILABLE` / 身份不符 / 环境不符 / coverage 不完整 /
+   blocking / provenance 不完整 / 损坏一律 BLOCK；`paper → production_sim` 仍无 owner，保持 blocked。
+2. 删除 `future_shadow_evidence_ref` 与上述 dead code。
+3. Workspace：`GET /api/strategies/{id}/challenger`（单一读端点）+ `strategy_service.challenger_read_model`
+   （只组装 owner 事实）+ 现有 Strategy Workbench 的 Active vs Challenger 段落。**不新建第二个页面**，
+   前端只渲染后端决定，两条 readiness 分列。
+4. 回归：`test_r32_final_promotion.py`（R-F1…R-F6、W1…W7、authority 隔离守卫）、
+   `test_r32_final_ownership_boundary.py`（R-F9…R-F12，冻结 sizing / shadow_exception 语义）、
+   `frontend/tests/challenger-workspace.test.mjs`（W8…W16）。
+5. Mutation：`work/r32_final_mutation_check.py`（M-F1…M-F13）。
+
+不变量（本轮最终）与工单 §Q 一致：`No duplicated owner for the same business fact`、
+`Lifecycle Promotion Policy authority count = 1`、`Parameter-head Champion Activation authority count = 1`、
+`Lifecycle mutation authority count = 1`、`Parameter-head mutation authority count = 1`、
+`No lifecycle promotion path mutates parameter head`、`No parameter-head promotion path mutates lifecycle`。

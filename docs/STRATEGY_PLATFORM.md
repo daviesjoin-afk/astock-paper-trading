@@ -225,3 +225,25 @@ origin == 'user'
 | 删除限制 | `backend/strategy_registry.py` | `backend/test_strategy_hard_delete_lifecycle.py`、`backend/test_strategy_archive_replay.py` |
 | 端到端产品线 | — | `backend/test_strategy_product_line_e2e.py`、`backend/test_production_path_golden_replay.py` |
 | 浏览器端 | `frontend/src/features/strategies.js` | `frontend/e2e/specs/strategy-*.spec.js` |
+| Active/Challenger 工作区（read model + 单一读端点） | `backend/strategy_service.py`（`challenger_read_model`）、`backend/api_strategies.py`（`GET /api/strategies/{id}/challenger`）、`frontend/src/features/strategies.js`（`wbChallengerHtml`） | `backend/test_r32_final_promotion.py`（W1–W7）、`frontend/tests/challenger-workspace.test.mjs`（W8–W16） |
+
+## R32 最终：两条晋级链与 Entry 侧边界
+
+```text
+生命周期晋级（Lifecycle Promotion）
+  Active Evidence + ShadowRun → ShadowComparisonReport → strategy_promotion
+  → PromotionDecision → strategy_lifecycle.transition() → shadow/paper 状态
+
+参数头晋升（Parameter-Head Champion Activation）
+  Challenger 参数 → strategy_champion.compare_for_promotion（指标/容差）
+  → promote_challenger → self_evolution.activate_params_candidate → 正式参数头
+```
+
+两条链互不越权（无 cross-mutation），UI 与文档都不把它们合并成同一个 Ready/Promote 按钮或综合 readiness。
+
+Entry 侧按 owner 分裂，不追求「单一 Entry Authority」：Entry/Admission 只拥有准入及其 owner
+evidence；`risk_scale` 是 sizing/market-exposure policy（`paper_trading._strategy_market_policy`，
+被 `_buy_order` 作为 sizing 输入消费于 `paper_trading.py:9772`）；红灯板块热点的 `shadow_exception`
+是 research/shadow observation policy；dispatch/fill 归 Execution Authority。
+`execution_planner.EntryGateState` 不承载 sizing 或 observation 字段，manual 路径因此不会继承
+Active 的 per-strategy 缩放。

@@ -24,6 +24,7 @@ if BACKEND_DIR not in sys.path:
 
 import execution_planner as EP  # noqa: E402
 import paper_schema_migrations as PSM  # noqa: E402
+import paper_trading as PT  # noqa: E402
 import shadow_comparison as SC  # noqa: E402
 import shadow_comparison_repository as SCR  # noqa: E402
 import shadow_comparison_service as SCS  # noqa: E402
@@ -32,6 +33,7 @@ import strategy_lifecycle as SL  # noqa: E402
 import strategy_promotion as SP  # noqa: E402
 import strategy_registry as SR  # noqa: E402
 import strategy_runtime as SRT  # noqa: E402
+import strategy_service as SVC  # noqa: E402
 import test_shadow_comparison as _CT  # noqa: E402
 
 DSL = {"op": "gt", "left": {"op": "field", "name": "close"},
@@ -40,8 +42,12 @@ DEFINITION = {"dsl_ast": DSL}
 STRATEGY_ID = "r32_final_strategy"
 
 
-class PromotionComparisonEvidenceTests(unittest.TestCase):
-    """R-F1 … R-F6: the shadow -> paper evidence contract."""
+class _PromotionFixture:
+    """Shared fixture: a real paper database plus one real comparison report.
+
+    Not a TestCase: the promotion and workspace regressions both inherit it, and
+    its helper methods are the only thing either one reuses.
+    """
 
     # The comparison fixture owns the exact environment, ShadowRun and report
     # builder; only its methods are reused, never its test cases.
@@ -57,7 +63,8 @@ class PromotionComparisonEvidenceTests(unittest.TestCase):
     def setUp(self):
         _CT.ShadowComparisonTests.setUp(self)
         self.tmp = tempfile.TemporaryDirectory(prefix="r32-final-", ignore_cleanup_errors=True)
-        self.paper = sqlite3.connect(os.path.join(self.tmp.name, "paper.sqlite3"), timeout=10)
+        self.paper_path = os.path.join(self.tmp.name, "paper.sqlite3")
+        self.paper = sqlite3.connect(self.paper_path, timeout=10)
         self.paper.row_factory = sqlite3.Row
         SR.ensure_schema(self.paper)
         self.spec = SR.create_user_definition(self.paper, STRATEGY_ID, "R32 Final", dsl_ast=DSL)
@@ -131,7 +138,9 @@ class PromotionComparisonEvidenceTests(unittest.TestCase):
         report = SC.build_shadow_comparison(
             spec=spec, active_evidence=evidence, shadow_run=self.shadow_run)
         conn.close()
-        return SCR.append_report(self.paper, report)
+        appended = SCR.append_report(self.paper, report)
+        self.paper.commit()
+        return appended
 
     def _evaluate(self, report_id, **overrides):
         values = {"strategy_id": self.spec.id,
@@ -151,6 +160,9 @@ class PromotionComparisonEvidenceTests(unittest.TestCase):
             strategy_checksum=self.version.checksum, from_state="shadow", target_state="paper",
             evidence_bundle={"shadow_comparison_report_id": report.report_id},
             proposer_type=proposer_type, proposer_id=proposer_id, rationale="exact comparison")
+
+class PromotionComparisonEvidenceTests(_PromotionFixture, unittest.TestCase):
+    """R-F1 … R-F6: the shadow -> paper evidence contract."""
 
     # ── R-F1: exact AVAILABLE comparison satisfies shadow -> paper ───────────
 
@@ -376,6 +388,121 @@ class PromotionComparisonEvidenceTests(unittest.TestCase):
         self.assertFalse(decision.eligible)
         self.assertEqual(["paper_runtime_evidence_owner_unavailable"],
                          self._blocking(decision))
+
+
+
+
+class ChallengerWorkspaceReadModelTests(_PromotionFixture, unittest.TestCase):
+    """W1 … W7: the workspace is assembled from owners, and never guesses."""
+
+    def setUp(self):
+        super().setUp()
+        # The service opens its own connection to the same file; close ours while
+        # the migrations run (they set the journal mode) and reopen afterwards.
+        self.paper.close()
+        self._patches = [mock.patch.object(PT, "DB_PATH", self.paper_path),
+                         mock.patch.object(SR, "DEFAULT_DB_PATH", self.paper_path)]
+        for item in self._patches:
+            item.start()
+        PT.init_db()
+        self.paper = sqlite3.connect(self.paper_path, timeout=10)
+        self.paper.row_factory = sqlite3.Row
+
+    def tearDown(self):
+        for item in reversed(self._patches):
+            item.stop()
+        super().tearDown()
+
+    def _read(self, **kwargs):
+        return SVC.challenger_read_model(self.spec.id, **kwargs)
+
+    def test_w1_exact_identities_and_lifecycle_states(self):
+        self._build_report()
+        view = self._read()
+        self.assertEqual(self.spec.id, view["active"]["strategy_id"])
+        self.assertEqual(int(self.version.version), view["active"]["version"])
+        self.assertEqual(self.version.checksum, view["active"]["checksum"])
+        self.assertEqual("shadow", view["challenger"]["lifecycle_state"])
+        self.assertEqual("shadow", view["lifecycle"]["state"])
+        self.assertIn("paper", view["lifecycle"]["allowed_next_transitions"])
+        self.assertEqual(["version_created"], [row["transition_kind"]
+                                               for row in view["lifecycle"]["history"]])
+
+    def test_w2_the_named_report_is_the_only_comparison_evidence(self):
+        report = self._build_report()
+        section = self._read(comparison_report_id=report.report_id)["comparison"]
+        self.assertTrue(section["available"])
+        self.assertEqual(report.report_id, section["report_id"])
+        self.assertEqual(report.report_fingerprint, section["report_fingerprint"])
+        self.assertEqual(report.comparison_spec["comparison_scope_identity"],
+                         section["comparison_scope_identity"])
+        self.assertEqual(report.shadow_run_id, section["shadow_run_id"])
+        self.assertEqual(dict(report.challenger_strategy_stamp),
+                         section["challenger_strategy_stamp"])
+        self.assertEqual(report.report_id,
+                         self._read(comparison_report_id=report.report_id)[
+                             "exact_evidence"]["comparison_report_id"])
+
+    def test_w3_to_w5_availability_coverage_and_blocking_come_from_the_owner(self):
+        partial = self._build_report(kind="partial")
+        view = self._read(comparison_report_id=partial.report_id)
+        section = view["comparison"]
+        self.assertEqual("PARTIAL", section["availability"])
+        self.assertEqual(dict(partial.coverage), section["coverage"])
+        self.assertEqual(list(partial.blocking_reasons), section["blocking_reasons"])
+        self.assertEqual(0.0, section["coverage"]["coverage_ratio"])
+        # A partial comparison is never rendered as ready.
+        self.assertFalse(view["lifecycle_promotion"]["eligible"])
+        self.assertIn("shadow_comparison_partial",
+                      view["lifecycle_promotion"]["blocking_reasons"])
+
+    def test_w6_readiness_comes_from_the_policy_not_the_read_model(self):
+        report = self._build_report()
+        section = self._read(comparison_report_id=report.report_id)["lifecycle_promotion"]
+        self.assertEqual("strategy_promotion", section["authority"])
+        expected = SP.evaluate(self.paper, strategy_id=self.spec.id,
+                               strategy_version=int(self.version.version),
+                               strategy_checksum=self.version.checksum,
+                               from_state="shadow", target_state="paper",
+                               evidence_bundle={"shadow_comparison_report_id": report.report_id})
+        self.assertEqual(expected.eligible, section["eligible"])
+        self.assertEqual(expected.decision_fingerprint, section["decision_fingerprint"])
+        self.assertEqual(list(expected.blocking_reasons), section["blocking_reasons"])
+        self.assertEqual(dict(expected.evidence_fingerprints), section["evidence_fingerprints"])
+
+    def test_w6b_the_two_authorities_are_never_merged(self):
+        self._build_report()
+        view = self._read()
+        self.assertEqual("strategy_promotion", view["lifecycle_promotion"]["authority"])
+        self.assertEqual("strategy lifecycle state", view["lifecycle_promotion"]["target_fact"])
+        activation = view["parameter_head_activation"]
+        self.assertEqual("strategy_champion", activation["authority"])
+        self.assertEqual("formal parameter/version head", activation["target_fact"])
+        self.assertNotIn("eligible", activation)
+        for combined in ("ready", "promotable", "winner", "score", "ranking"):
+            self.assertNotIn(combined, view)
+
+    def test_w7_no_latest_fallback_and_absent_evidence_stays_absent(self):
+        report = self._build_report()
+        unnamed = self._read()
+        self.assertFalse(unnamed["comparison"]["available"])
+        self.assertEqual("shadow_comparison_report_required",
+                         unnamed["comparison"]["unavailable_reason"])
+        self.assertEqual("UNAVAILABLE", unnamed["comparison"]["availability"])
+        # Absent is not zero: the missing coverage keeps its unknown shape.
+        self.assertIsNone(unnamed["comparison"]["coverage"])
+        self.assertIsNone(unnamed["comparison"]["performance"])
+        self.assertIn("shadow_comparison_report_required",
+                      unnamed["lifecycle_promotion"]["blocking_reasons"])
+        # A perfectly good report exists and the unnamed request still reports
+        # absence: the workspace never resolves "the newest one".
+        unknown = self._read(comparison_report_id="e" * 64)
+        self.assertEqual("shadow_comparison_report_not_found",
+                         unknown["comparison"]["unavailable_reason"])
+        self.assertEqual(report.report_id,
+                         self._read(comparison_report_id=report.report_id)["comparison"]["report_id"])
+        self.assertTrue(self._read(comparison_report_id=report.report_id)[
+            "lifecycle_promotion"]["eligible"])
 
 
 class PromotionAuthoritySeparationTests(unittest.TestCase):

@@ -434,6 +434,168 @@ def lifecycle_read_model(strategy_id: str) -> dict:
     return _with_connection(_work)
 
 
+# ---------------------------------------------------------------------------
+# Active vs Challenger workspace（read model：只组装 owner 事实）
+# ---------------------------------------------------------------------------
+
+def _exact_comparison_report(conn, report_id):
+    """The explicitly named report, or ``None`` with a stable owner reason.
+
+    There is deliberately no "newest report" resolution: an unnamed or unknown
+    report is reported as absent. A row the owner's reader rejects as corrupt is
+    reported as corrupt rather than being silently dropped.
+    """
+    if report_id is None:
+        return None, "shadow_comparison_report_required"
+    if not isinstance(report_id, str) or len(report_id) != 64:
+        raise InvalidStrategyDefinition("exact_comparison_report_id_required")
+    import shadow_comparison_repository as SCR
+    try:
+        report = SCR.get_report(conn, report_id)
+    except SCR.ShadowComparisonRepositoryError:
+        return None, "shadow_comparison_corrupt"
+    except Exception:
+        return None, "shadow_comparison_report_not_found"
+    if report is None:
+        return None, "shadow_comparison_report_not_found"
+    return report, None
+
+
+def _comparison_section(report, report_id, reason) -> dict:
+    """The comparison owner's own facts, verbatim. Nothing is recomputed here."""
+    base = {"authority": "shadow_comparison", "report_id": report_id}
+    if report is None:
+        return {**base, "available": False, "unavailable_reason": reason,
+                "availability": "UNAVAILABLE", "coverage": None, "blocking_reasons": [],
+                "report_fingerprint": None, "comparison_scope_identity": None,
+                "shadow_run_id": None, "shadow_run_fingerprint": None,
+                "active_strategy_stamp": None, "challenger_strategy_stamp": None,
+                "environment_identity": None, "provenance": None, "observations": [],
+                "signal_delta": None, "decision_delta": None, "execution": None,
+                "risk_rejection": None, "turnover": None, "performance": None}
+    return {
+        **base, "available": True, "unavailable_reason": None,
+        "availability": str(report.availability),
+        "coverage": dict(report.coverage),
+        "blocking_reasons": [str(item) for item in report.blocking_reasons],
+        "report_fingerprint": str(report.report_fingerprint),
+        "comparison_scope_identity": str(
+            (report.comparison_spec or {}).get("comparison_scope_identity") or ""),
+        "comparison_spec": dict(report.comparison_spec or {}),
+        "shadow_run_id": str(report.shadow_run_id),
+        "shadow_run_fingerprint": str(report.shadow_run_fingerprint),
+        "active_strategy_stamp": dict(report.active_strategy_stamp or {}),
+        "challenger_strategy_stamp": dict(report.challenger_strategy_stamp or {}),
+        "environment_identity": dict(report.environment_identity or {}),
+        "provenance": dict(report.provenance or {}),
+        "observations": [dict(item) for item in report.observations],
+        "signal_delta": dict(report.signal_delta or {}),
+        "decision_delta": dict(report.decision_delta or {}),
+        "execution": dict(report.execution or {}),
+        "risk_rejection": dict(report.risk_rejection or {}),
+        "turnover": dict(report.turnover or {}),
+        "performance": dict(report.performance or {}),
+    }
+
+
+def _parameter_head_section(conn, strategy_id: str) -> dict:
+    """Current parameter-head activation state — a separate authority.
+
+    This is the Champion activation ledger. Its target fact is the formal
+    parameter/version head, never the strategy lifecycle state, so it is reported
+    in its own section and is never combined with the lifecycle promotion
+    readiness. Read-only.
+    """
+    import strategy_champion as SCM
+    section = {"authority": "strategy_champion",
+               "target_fact": "formal parameter/version head",
+               "engine": SCM.STRATEGY_CHAMPION_VERSION,
+               "mutation_executor": "self_evolution.activate_params_candidate",
+               "versions": []}
+    try:
+        rows = conn.execute(
+            "SELECT id,role,status,source,base_checksum,proposed_at,evaluated_at"
+            " FROM strategy_champion_versions WHERE strategy_id=?"
+            " ORDER BY id DESC LIMIT 5", (str(strategy_id),)).fetchall()
+    except Exception:
+        return {**section, "available": False,
+                "unavailable_reason": "parameter_head_ledger_unavailable"}
+    return {**section, "available": True, "unavailable_reason": None,
+            "versions": [dict(row) for row in rows]}
+
+
+def challenger_read_model(strategy_id: str, *, comparison_report_id: str | None = None,
+                          version: int | None = None) -> dict:
+    """Active vs Challenger workspace facts, assembled from exact owner output.
+
+    Read-only composition: every section is an owner's own value (registry,
+    lifecycle, comparison repository, promotion policy, activation ledger). The
+    comparison evidence is only ever the explicitly named report, and the two
+    promotion authorities stay in two separate sections.
+    """
+    def _work(conn):
+        spec = SR.get(strategy_id, conn=conn)
+        if spec is None:
+            raise StrategyNotFound("unknown strategy id")
+        active_version = SR.get_version(strategy_id, conn=conn)
+        if active_version is None:
+            raise StrategyNotFound("strategy version not found")
+        challenger_version = (SR.get_version(strategy_id, version, conn=conn)
+                              if version is not None else active_version)
+        if challenger_version is None:
+            raise StrategyNotFound("strategy version not found")
+        active_state = SL.get_state(conn, strategy_id, active_version.version,
+                                    checksum=active_version.checksum)
+        challenger_state = SL.get_state(conn, strategy_id, challenger_version.version,
+                                        checksum=challenger_version.checksum)
+        state = (challenger_state or {}).get("state")
+        report, reason = _exact_comparison_report(conn, comparison_report_id)
+        decision = SPR.evaluate(
+            conn, strategy_id=strategy_id, strategy_version=challenger_version.version,
+            strategy_checksum=challenger_version.checksum,
+            from_state=state or "", target_state="paper",
+            evidence_bundle=({"shadow_comparison_report_id": comparison_report_id}
+                             if comparison_report_id else None))
+        return {
+            "strategy_id": strategy_id,
+            "active": {
+                "strategy_id": strategy_id,
+                "version": active_version.version,
+                "checksum": active_version.checksum,
+                "lifecycle_state": (active_state or {}).get("state"),
+            },
+            "challenger": {
+                "strategy_id": strategy_id,
+                "version": challenger_version.version,
+                "checksum": challenger_version.checksum,
+                "lifecycle_state": state,
+            },
+            "comparison": _comparison_section(report, comparison_report_id, reason),
+            "lifecycle_promotion": {
+                "authority": "strategy_promotion",
+                "target_fact": "strategy lifecycle state",
+                "policy_version": SPR.POLICY_VERSION,
+                "from_state": state,
+                "target_state": "paper",
+                "eligible": bool(decision.eligible),
+                "blocking_reasons": list(decision.blocking_reasons),
+                "required_evidence": list(decision.required_evidence),
+                "satisfied_evidence": list(decision.satisfied_evidence),
+                "evidence_fingerprints": dict(decision.evidence_fingerprints),
+                "decision_fingerprint": decision.decision_fingerprint,
+                "mutation_executor": "strategy_lifecycle.transition",
+            },
+            "parameter_head_activation": _parameter_head_section(conn, strategy_id),
+            "lifecycle": {
+                "state": state,
+                "allowed_next_transitions": sorted(SL.TRANSITION_TABLE.get(state or "", ())),
+                "history": [dict(row) for row in SL.history(conn, strategy_id)][-20:],
+            },
+            "exact_evidence": {"comparison_report_id": comparison_report_id},
+        }
+    return _with_connection(_work)
+
+
 def create_promotion_proposal(strategy_id: str, request: Models.PromotionProposalRequest) -> dict:
     def _work(conn):
         spec = SR.get(strategy_id, conn=conn)
