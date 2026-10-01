@@ -24,11 +24,13 @@ import execution_planner as EP
 import market_data_contract as MDC
 import paper_schema_migrations as PSM
 import paper_trading as PT
+import paper_trading_rules as PTR
 import shadow_comparison as SC
 import shadow_comparison_repository as SCR
 import shadow_comparison_service as SCS
 import shadow_run_repository as SRR
 import shadow_runtime as SH
+import strategy_runtime as SRT
 import simulation_runtime_context as SRC
 import tradability_archive as TA
 
@@ -59,6 +61,16 @@ _SIGNAL_DDL = """
         id INTEGER PRIMARY KEY AUTOINCREMENT, status TEXT NOT NULL, reason TEXT,
         signal_date TEXT NOT NULL, intended_date TEXT NOT NULL, rank_score REAL,
         t_tier TEXT, t_score REAL, close_price REAL, payload TEXT NOT NULL
+    )
+"""
+
+_RISK_DECISION_DDL = """
+    CREATE TABLE paper_risk_decisions(
+        id INTEGER PRIMARY KEY AUTOINCREMENT, account_id TEXT NOT NULL, code TEXT,
+        side TEXT NOT NULL, decision TEXT NOT NULL, reason TEXT,
+        payload TEXT NOT NULL DEFAULT '{}', created_at TEXT NOT NULL,
+        strategy_id TEXT, strategy_version INTEGER, strategy_checksum TEXT,
+        order_id INTEGER
     )
 """
 
@@ -156,13 +168,14 @@ class ShadowComparisonTests(unittest.TestCase):
                                     "right": {"op": "const", "value": 0}}},
         )
         self.execution_policy = EP.execution_policy_snapshot(self.challenger.strategy_id)
+        self.risk_policy = SRT.risk_policy_projection_for_definition(
+            self.strategy_version.definition)
         self.candidate = SH.ShadowCandidate(
             symbol=self.code, side="buy", desired_quantity=100,
             entry_state=EP.EntryGateState(
                 capacity_available=True, position_limit=5, pool_limit=5,
                 shared_cash=100_000.0, require_market_gate=False,
             ),
-            risk_policy_identity={"captured_policy_fingerprint": _sha("risk-policy")},
             reference_price=10.0,
         )
         self.shadow_run = self._shadow_run((self.candidate,))
@@ -173,7 +186,8 @@ class ShadowComparisonTests(unittest.TestCase):
             return SH.evaluate_shadow(
                 spec=self.shadow_spec, environment=self.environment,
                 strategy_version=self.strategy_version, lifecycle_state="shadow",
-                execution_policy=self.execution_policy, candidates=tuple(candidates),
+                execution_policy=self.execution_policy,
+                risk_policy=self.risk_policy, candidates=tuple(candidates),
             )
 
     def _active_runtime_context(self, **overrides):
@@ -236,6 +250,7 @@ class ShadowComparisonTests(unittest.TestCase):
         conn = sqlite3.connect(":memory:")
         conn.execute(_ORDER_DDL)
         conn.execute(_SIGNAL_DDL)
+        conn.execute(_RISK_DECISION_DDL)
         if with_reports:
             migration = next(item for item in db_migrate.MIGRATIONS["paper_trading"]
                              if item[0] == 25)
@@ -377,6 +392,37 @@ class ShadowComparisonTests(unittest.TestCase):
         )
         return environment, identity, context
 
+    def _link_risk_decision(self, conn, order_id, *, decision="execution_blocked",
+                            reason="共享资金池可用现金不足", authority="RISK",
+                            decision_kind=None, order_link=True):
+        """Append one order-linked risk decision with write-time provenance."""
+        payload = {"decision_provenance": {
+            "schema_version": "risk-decision-provenance-v1",
+            "authority": authority,
+            "decision_kind": decision_kind or decision,
+        }} if authority else {}
+        cursor = conn.execute(
+            "INSERT INTO paper_risk_decisions(account_id,code,side,decision,reason,"
+            "payload,created_at,strategy_id,strategy_version,strategy_checksum,order_id)"
+            " VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+            (self.active.strategy_id, self.code, "buy", decision, reason,
+             json.dumps(payload, ensure_ascii=False), "2026-09-08 10:05:01",
+             self.active.strategy_id, self.active.version, self.active.checksum,
+             int(order_id) if order_link else None),
+        )
+        conn.commit()
+        return int(cursor.lastrowid)
+
+    def _shadow_run_with_risk_policy(self, risk_policy):
+        """Evaluate one shadow run with an explicitly supplied risk policy."""
+        with mock.patch.object(PT, "_execution_quote_status", return_value={
+                "fresh": True, "status": "cross_source_checked"}):
+            return SH.evaluate_shadow(
+                spec=self.shadow_spec, environment=self.environment,
+                strategy_version=self.strategy_version, lifecycle_state="shadow",
+                execution_policy=self.execution_policy, risk_policy=risk_policy,
+                candidates=(self.candidate,))
+
     def _blocked_signal_run(self):
         """A real run whose own signal decision blocked the candidate.
 
@@ -396,6 +442,7 @@ class ShadowComparisonTests(unittest.TestCase):
                 spec=self.shadow_spec, environment=self.environment,
                 strategy_version=version, lifecycle_state="shadow",
                 execution_policy=self.execution_policy,
+                risk_policy=self.risk_policy,
                 candidates=(self.candidate,))
 
     def _two_symbol_run(self):
@@ -411,7 +458,8 @@ class ShadowComparisonTests(unittest.TestCase):
             run = SH.evaluate_shadow(
                 spec=spec, environment=environment,
                 strategy_version=self.strategy_version, lifecycle_state="shadow",
-                execution_policy=self.execution_policy, candidates=candidates,
+                execution_policy=self.execution_policy,
+                risk_policy=self.risk_policy, candidates=candidates,
             )
         return run, identity, context
 
@@ -700,27 +748,64 @@ class ShadowComparisonTests(unittest.TestCase):
 
     def test_d8_declared_risk_identity_is_never_promoted_to_verified(self):
         conn, spec, evidence, report = self._report()
-        self.assertEqual("DECLARED",
+        # New runs carry the Risk Authority's own projection.
+        self.assertEqual("OWNER_ISSUED",
                          report.provenance["challenger.risk_policy_identity"])
         self.assertEqual("OWNER_ISSUED", report.provenance["challenger.entry_policy"])
         self.assertEqual("OWNER_ISSUED", report.provenance["challenger.entry"])
         self.assertEqual("OWNER_ISSUED", report.provenance["active.admission_decision"])
         self.assertEqual("UNAVAILABLE", report.provenance["active.risk_rejection"])
         self.assertEqual(
-            "DECLARED",
+            "OWNER_ISSUED",
             report.risk_rejection["provenance"]["challenger_risk_policy_identity"])
+        self.assertEqual("OWNER_ISSUED",
+                         report.risk_rejection["provenance"]["active_risk_policy_identity"])
         self.assertEqual(
             "UNAVAILABLE",
             report.risk_rejection["provenance"]["active_rejection_outcome"])
         risk = report.observations[0]["dimensions"]["risk_rejection"]
-        self.assertEqual("DECLARED", risk["challenger"]["risk_policy_identity_provenance"])
-        self.assertEqual("OWNER_ISSUED", risk["challenger"]["entry_provenance"])
-        self.assertEqual("UNAVAILABLE", risk["active"]["risk_rejection_availability"])
-        self.assertEqual({"captured_policy_fingerprint": _sha("risk-policy")},
-                         risk["challenger"]["risk_policy_identity"])
+        self.assertEqual("OWNER_ISSUED",
+                         risk["challenger"]["risk_policy_identity_provenance"])
+        self.assertEqual("strategy_runtime.risk_policy_projection",
+                         risk["challenger"]["risk_policy_identity_source"])
+        self.assertEqual(self.risk_policy, risk["challenger"]["risk_policy_identity"])
+        # The Active leg's identity is whatever its own capture recorded.
+        self.assertEqual({"active_capture": "fixture"},
+                         risk["active"]["risk_policy_identity"])
+        self.assertEqual(
+            "execution_evidence.runtime_context.risk_policy_identity",
+            risk["active"]["risk_policy_identity_source"])
+        self.assertEqual("OWNER_ISSUED",
+                         risk["active"]["risk_policy_identity_provenance"])
+        self.assertEqual("UNAVAILABLE", risk["active"]["risk_decision_evidence_availability"])
         rendered = json.dumps(report.projection(), ensure_ascii=False)
         self.assertNotIn("OWNER_VERIFIED", rendered)
         self.assertNotIn("owner_verified", rendered)
+        conn.close()
+
+    def test_d8b_legacy_run_risk_identity_stays_declared(self):
+        """旧 run 只有 caller 自述的 identity：保持 DECLARED，绝不回填。"""
+        legacy_decision = dict(self.shadow_run.decisions[0])
+        legacy_decision["candidate"] = dict(legacy_decision["candidate"])
+        legacy_decision["candidate"]["risk_policy_identity"] = {
+            "captured_policy_fingerprint": _sha("legacy-declared")}
+        legacy_run = replace(
+            self.shadow_run, decisions=(legacy_decision,),
+            challenger_runtime_inputs={"entry_policy": self.execution_policy.projection()})
+        conn, spec, evidence, report = self._report(shadow_run=legacy_run)
+        risk = report.observations[0]["dimensions"]["risk_rejection"]
+        self.assertEqual("DECLARED", risk["challenger"]["risk_policy_identity_provenance"])
+        self.assertEqual("legacy_run_captured_risk_policy_identity",
+                         risk["challenger"]["risk_policy_identity_source"])
+        self.assertEqual({"captured_policy_fingerprint": _sha("legacy-declared")},
+                         risk["challenger"]["risk_policy_identity"])
+        self.assertEqual("DECLARED",
+                         report.provenance["challenger.risk_policy_identity"])
+        self.assertEqual("DECLARED",
+                         report.risk_rejection["provenance"]["challenger_risk_policy_identity"])
+        # The legacy identity is never presented as an owner fact.
+        self.assertNotIn("OWNER_VERIFIED",
+                         json.dumps(report.projection(), ensure_ascii=False))
         conn.close()
 
     def test_d9_missing_exact_valuation_stays_unavailable(self):
@@ -740,6 +825,7 @@ class ShadowComparisonTests(unittest.TestCase):
                 spec=second_spec, environment=environment,
                 strategy_version=self.strategy_version, lifecycle_state="shadow",
                 execution_policy=self.execution_policy,
+                risk_policy=self.risk_policy,
                 candidates=(self.candidate,), previous_run=first,
             )
         self.assertEqual(100, second.after_state["positions"].get(self.other_code))
@@ -947,7 +1033,7 @@ class ShadowComparisonTests(unittest.TestCase):
         # No entry decision means no owner-issued risk evidence either.
         self.assertEqual("UNAVAILABLE", risk["challenger"]["entry_provenance"])
         self.assertIsNone(risk["challenger"]["entry_reasons"])
-        self.assertEqual("DECLARED",
+        self.assertEqual("OWNER_ISSUED",
                          risk["challenger"]["risk_policy_identity_provenance"])
         conn.close()
 
@@ -955,8 +1041,8 @@ class ShadowComparisonTests(unittest.TestCase):
         conn, spec, evidence, report = self._report()
         risk = report.observations[0]["dimensions"]["risk_rejection"]
         self.assertEqual("UNAVAILABLE", risk["legs"]["active"])
-        self.assertIsNone(risk["active"]["risk_rejection_evidence"])
-        self.assertEqual("UNAVAILABLE", risk["active"]["risk_rejection_availability"])
+        self.assertIsNone(risk["active"]["risk_decision_evidence"])
+        self.assertEqual("UNAVAILABLE", risk["active"]["risk_decision_evidence_availability"])
         self.assertEqual("no_order_linked_risk_authority_evidence",
                          risk["active"]["reason"])
         self.assertFalse(risk["active"]["detail"]["order_lifecycle_status_used"])
@@ -1068,7 +1154,372 @@ class ShadowComparisonTests(unittest.TestCase):
             "SELECT COUNT(*) FROM shadow_comparison_reports").fetchone()[0])
         conn.close()
 
-    # ── persistence contract ─────────────────────────────────────────────────
+    # ── R32-E1: owner-issued, exactly-linked risk evidence ───────────────────
+
+    def test_e1_1_both_legs_use_one_owner_risk_policy_contract(self):
+        conn, spec, evidence, report = self._report()
+        risk = report.observations[0]["dimensions"]["risk_rejection"]
+        owner_keys = {"strategy_risk_fingerprint", "compiled_risk_profile"}
+        self.assertEqual(owner_keys, set(self.risk_policy))
+        self.assertEqual(owner_keys, set(risk["challenger"]["risk_policy_identity"]))
+        self.assertEqual("OWNER_ISSUED",
+                         risk["challenger"]["risk_policy_identity_provenance"])
+        self.assertEqual("strategy_runtime.risk_policy_projection",
+                         risk["challenger"]["risk_policy_identity_source"])
+        binding = risk["challenger"]["risk_policy_identity_binding"]
+        self.assertEqual(self.challenger.strategy_id, binding["strategy_id"])
+        self.assertEqual(self.challenger.version, binding["strategy_version"])
+        self.assertEqual(self.challenger.checksum, binding["strategy_checksum"])
+        self.assertEqual("OWNER_ISSUED",
+                         risk["active"]["risk_policy_identity_provenance"])
+        self.assertEqual("OWNER_ISSUED", report.provenance["active.risk_policy_identity"])
+        self.assertEqual("OWNER_ISSUED",
+                         report.provenance["challenger.risk_policy_identity"])
+        conn.close()
+
+    def test_e1_2_order_linked_risk_decision_completes_the_dimension(self):
+        """owner evidence 完整时 risk_rejection 可以 AVAILABLE（报告可达 AVAILABLE）。"""
+        conn, order_ids = self._ledger()
+        decision_id = self._link_risk_decision(
+            conn, order_ids[0], decision="downside_warning", authority="RISK")
+        evidence = SCS.capture_active_comparison_evidence(
+            conn, active_order_ids=tuple(order_ids))
+        linked = evidence.orders[0].risk_decision_evidence
+        self.assertEqual(1, len(linked))
+        self.assertEqual(decision_id, linked[0]["risk_decision_id"])
+        self.assertEqual(order_ids[0], linked[0]["order_id"])
+        self.assertEqual("RISK", linked[0]["decision_provenance"]["authority"])
+        spec = self._comparison_spec(
+            order_ids=tuple(order_ids),
+            expected=(SC.ObservationKey(self.code, "buy"),),
+            active_evidence_id=evidence.source_fingerprint)
+        report = SC.build_shadow_comparison(
+            spec=spec, active_evidence=evidence, shadow_run=self.shadow_run)
+        risk = report.observations[0]["dimensions"]["risk_rejection"]
+        self.assertEqual("PRESENT", risk["legs"]["active"])
+        self.assertEqual("AVAILABLE", risk["availability"])
+        self.assertEqual("AVAILABLE", report.risk_rejection["availability"])
+        self.assertEqual("downside_warning",
+                         risk["active"]["risk_decision_evidence"][0]["decision"])
+        self.assertEqual("paper_risk_decisions.order_id",
+                         risk["active"]["risk_decision_linkage"])
+        self.assertEqual("OWNER_ISSUED", report.provenance["active.risk_rejection"])
+        # Every required dimension is now owner-complete, so the report itself
+        # reaches AVAILABLE with full coverage.
+        self.assertEqual("AVAILABLE", report.availability)
+        self.assertEqual(1, report.coverage["available_observations"])
+        self.assertEqual(1.0, report.coverage["coverage_ratio"])
+        self.assertEqual(1, report.risk_rejection["active_risk_rejection_observations"])
+        conn.close()
+
+    def test_e1_r1_execution_blocked_row_is_not_risk_evidence(self):
+        """只有 execution_blocked(order_id=X)：execution 有证据，risk 仍是 UNAVAILABLE。"""
+        conn, order_ids = self._ledger()
+        self._link_risk_decision(conn, order_ids[0], decision="execution_blocked",
+                                 authority="EXECUTION")
+        evidence = SCS.capture_active_comparison_evidence(
+            conn, active_order_ids=tuple(order_ids))
+        linked = evidence.orders[0].risk_decision_evidence
+        self.assertEqual("EXECUTION", linked[0]["decision_provenance"]["authority"])
+        spec = self._comparison_spec(
+            order_ids=tuple(order_ids),
+            expected=(SC.ObservationKey(self.code, "buy"),),
+            active_evidence_id=evidence.source_fingerprint)
+        report = SC.build_shadow_comparison(
+            spec=spec, active_evidence=evidence, shadow_run=self.shadow_run)
+        risk = report.observations[0]["dimensions"]["risk_rejection"]
+        execution = report.observations[0]["dimensions"]["execution"]
+        self.assertEqual("UNAVAILABLE", risk["legs"]["active"])
+        self.assertIsNone(risk["active"]["risk_decision_evidence"])
+        self.assertEqual("order_linked_rows_are_not_risk_authority_decisions",
+                         risk["active"]["reason"])
+        self.assertEqual(1, risk["active"]["detail"]["order_linked_rows_examined"])
+        self.assertEqual(1, risk["active"]["detail"]["order_linked_non_risk_authority_rows"])
+        self.assertNotEqual("AVAILABLE", risk["availability"])
+        # The Execution Authority's own decision stays execution evidence.
+        self.assertEqual("PRESENT", execution["legs"]["active"])
+        self.assertEqual(1, len(execution["active"]["order_linked_execution_decisions"]))
+        self.assertEqual("UNAVAILABLE", report.provenance["active.risk_rejection"])
+        self.assertEqual("PARTIAL", report.availability)
+        self.assertEqual(0.0, report.coverage["coverage_ratio"])
+        conn.close()
+
+    def test_e1_r2_successful_execution_action_row_is_not_risk_evidence(self):
+        conn, order_ids = self._ledger()
+        self._link_risk_decision(conn, order_ids[0], decision="manual_filled",
+                                 decision_kind="manual_filled", authority="EXECUTION")
+        evidence = SCS.capture_active_comparison_evidence(
+            conn, active_order_ids=tuple(order_ids))
+        spec = self._comparison_spec(
+            order_ids=tuple(order_ids),
+            expected=(SC.ObservationKey(self.code, "buy"),),
+            active_evidence_id=evidence.source_fingerprint)
+        report = SC.build_shadow_comparison(
+            spec=spec, active_evidence=evidence, shadow_run=self.shadow_run)
+        risk = report.observations[0]["dimensions"]["risk_rejection"]
+        self.assertNotEqual("PRESENT", risk["legs"]["active"])
+        self.assertEqual("UNAVAILABLE", report.provenance["active.risk_rejection"])
+        self.assertEqual("PARTIAL", report.availability)
+        conn.close()
+
+    def test_e1_r3_the_authority_label_decides_not_the_decision_text(self):
+        """同一 decision 文案：标 RISK 才算风险证据，标 EXECUTION 不算。"""
+        for authority, expected_state in (("RISK", "PRESENT"),
+                                          ("EXECUTION", "UNAVAILABLE")):
+            with self.subTest(authority=authority):
+                conn, order_ids = self._ledger()
+                self._link_risk_decision(conn, order_ids[0],
+                                         decision="execution_blocked",
+                                         authority=authority)
+                evidence = SCS.capture_active_comparison_evidence(
+                    conn, active_order_ids=tuple(order_ids))
+                spec = self._comparison_spec(
+                    order_ids=tuple(order_ids),
+                    expected=(SC.ObservationKey(self.code, "buy"),),
+                    active_evidence_id=evidence.source_fingerprint)
+                report = SC.build_shadow_comparison(
+                    spec=spec, active_evidence=evidence, shadow_run=self.shadow_run)
+                risk = report.observations[0]["dimensions"]["risk_rejection"]
+                self.assertEqual(expected_state, risk["legs"]["active"])
+                conn.close()
+
+    def test_e1_r4_risk_evidence_from_another_order_is_rejected(self):
+        conn, order_ids = self._ledger(
+            orders=({"code": self.code}, {"code": self.other_code}))
+        self._link_risk_decision(conn, order_ids[1], authority="RISK")
+        evidence = SCS.capture_active_comparison_evidence(
+            conn, active_order_ids=tuple(order_ids))
+        self.assertEqual((), evidence.orders[0].risk_decision_evidence)
+        self.assertEqual(1, len(evidence.orders[1].risk_decision_evidence))
+        with self.assertRaisesRegex(ValueError,
+                                    "order-linked risk decision evidence is invalid"):
+            replace(evidence.orders[1], risk_decision_evidence=({
+                "risk_decision_id": 1, "order_id": 4242,
+                "decision": "downside_warning"},))
+        with self.assertRaisesRegex(ValueError,
+                                    "order-linked risk decision evidence is invalid"):
+            replace(evidence.orders[1], risk_decision_evidence=({"decision": "x"},))
+        # A row without a declared authority cannot be consumed as risk evidence.
+        conn2, order_ids2 = self._ledger()
+        self._link_risk_decision(conn2, order_ids2[0], authority=None, order_link=True)
+        evidence2 = SCS.capture_active_comparison_evidence(
+            conn2, active_order_ids=tuple(order_ids2))
+        self.assertIsNone(evidence2.orders[0].risk_decision_evidence[0][
+            "decision_provenance"])
+        spec = self._comparison_spec(
+            order_ids=tuple(order_ids2),
+            expected=(SC.ObservationKey(self.code, "buy"),),
+            active_evidence_id=evidence2.source_fingerprint)
+        report = SC.build_shadow_comparison(
+            spec=spec, active_evidence=evidence2, shadow_run=self.shadow_run)
+        self.assertEqual("UNAVAILABLE",
+                         report.observations[0]["dimensions"]["risk_rejection"]["legs"]["active"])
+        conn.close()
+        conn2.close()
+
+    def test_e1_r5_only_the_risk_authority_row_feeds_the_dimension(self):
+        conn, order_ids = self._ledger()
+        self._link_risk_decision(conn, order_ids[0], decision="execution_blocked",
+                                 authority="EXECUTION")
+        self._link_risk_decision(conn, order_ids[0], decision="downside_warning",
+                                 authority="RISK")
+        evidence = SCS.capture_active_comparison_evidence(
+            conn, active_order_ids=tuple(order_ids))
+        self.assertEqual(2, len(evidence.orders[0].risk_decision_evidence))
+        spec = self._comparison_spec(
+            order_ids=tuple(order_ids),
+            expected=(SC.ObservationKey(self.code, "buy"),),
+            active_evidence_id=evidence.source_fingerprint)
+        report = SC.build_shadow_comparison(
+            spec=spec, active_evidence=evidence, shadow_run=self.shadow_run)
+        risk = report.observations[0]["dimensions"]["risk_rejection"]
+        execution = report.observations[0]["dimensions"]["execution"]
+        risk_rows = risk["active"]["risk_decision_evidence"]
+        self.assertEqual(1, len(risk_rows))
+        self.assertEqual("downside_warning", risk_rows[0]["decision"])
+        self.assertEqual("RISK", risk_rows[0]["decision_provenance"]["authority"])
+        self.assertEqual(2, risk["active"]["detail"]["order_linked_rows_examined"])
+        self.assertEqual(1, risk["active"]["detail"]["order_linked_non_risk_authority_rows"])
+        exec_rows = execution["active"]["order_linked_execution_decisions"]
+        self.assertEqual(1, len(exec_rows))
+        self.assertEqual("execution_blocked", exec_rows[0]["decision"])
+        conn.close()
+
+    def test_e1_r6_tampered_fingerprint_fails_closed(self):
+        conn, order_ids = self._ledger()
+        tampered = json.loads(json.dumps(self.risk_policy))
+        tampered["strategy_risk_fingerprint"]["archetype"] = "momentum"
+        self.assertNotEqual(self.risk_policy, tampered)
+        with self.assertRaisesRegex(ValueError,
+                                    "challenger_risk_policy_identity_mismatch"):
+            self._shadow_run_with_risk_policy(tampered)
+        conn.close()
+
+    def test_e1_r7_tampered_profile_fails_closed(self):
+        conn, order_ids = self._ledger()
+        tampered = json.loads(json.dumps(self.risk_policy))
+        tampered["compiled_risk_profile"]["template"] = "Forged"
+        with self.assertRaisesRegex(ValueError,
+                                    "challenger_risk_policy_identity_mismatch"):
+            self._shadow_run_with_risk_policy(tampered)
+        conn.close()
+
+    def test_e1_r8_current_config_change_does_not_change_the_replay(self):
+        conn, order_ids = self._ledger()
+        self._link_risk_decision(conn, order_ids[0], authority="RISK")
+        evidence = SCS.capture_active_comparison_evidence(
+            conn, active_order_ids=tuple(order_ids))
+        spec = self._comparison_spec(
+            order_ids=tuple(order_ids),
+            expected=(SC.ObservationKey(self.code, "buy"),),
+            active_evidence_id=evidence.source_fingerprint)
+        baseline = SC.build_shadow_comparison(
+            spec=spec, active_evidence=evidence, shadow_run=self.shadow_run)
+        with mock.patch.object(SRT, "risk_policy_projection_for_definition",
+                               side_effect=AssertionError("current risk config read")), \
+                mock.patch.object(SRT, "compile_risk_policy",
+                                  side_effect=AssertionError("current risk config read")), \
+                mock.patch.object(EP, "policy_for",
+                                  side_effect=AssertionError("current policy read")), \
+                mock.patch.object(PT, "_execution_quote_status",
+                                  side_effect=AssertionError("current quote read")):
+            replayed = SC.build_shadow_comparison(
+                spec=spec, active_evidence=evidence, shadow_run=self.shadow_run)
+        self.assertEqual(baseline.report_fingerprint, replayed.report_fingerprint)
+        self.assertEqual(baseline.projection(), replayed.projection())
+        conn.close()
+
+    def test_e1_r9_capture_input_and_recorded_projection_are_the_same(self):
+        conn, order_ids = self._ledger()
+        for migration_id in (24, 25, 26):
+            migration = next(item for item in db_migrate.MIGRATIONS["paper_trading"]
+                             if item[0] == migration_id)
+            db_migrate._run_operation(conn, migration[2])
+        SRR.append_run(conn, self.shadow_run)
+        declared = SRT.risk_policy_projection_for_definition(
+            self.strategy_version.definition)
+        self.assertEqual(self.risk_policy, declared)
+        evidence = SCS.capture_active_comparison_evidence(
+            conn, active_order_ids=tuple(order_ids))
+        spec = self._comparison_spec(
+            order_ids=tuple(order_ids),
+            expected=(SC.ObservationKey(self.code, "buy"),),
+            active_evidence_id=evidence.source_fingerprint)
+        report = SCS.build_and_append_comparison(conn, spec=spec)
+        recorded = self.shadow_run.challenger_runtime_inputs["risk_policy"]
+        # The run could only be built because evaluate_shadow verified the
+        # supplied projection against the exact version definition (R6/R7 show a
+        # tampered projection is rejected), so capture == supplied == recorded.
+        self.assertEqual(declared, recorded["projection"])
+        self.assertEqual(declared,
+                         report.observations[0]["dimensions"]["risk_rejection"][
+                             "challenger"]["risk_policy_identity"])
+        self.assertEqual("strategy_runtime.risk_policy_projection_for_definition",
+                         recorded["source"])
+        conn.close()
+
+    def test_e1_r10_authority_labels_have_one_owner(self):
+        self.assertIn(SC.RISK_AUTHORITY_LABEL, PSM.RISK_DECISION_AUTHORITIES)
+        self.assertIn(SC.EXECUTION_AUTHORITY_LABEL, PSM.RISK_DECISION_AUTHORITIES)
+        self.assertEqual("risk-decision-provenance-v1",
+                         PSM.RISK_DECISION_PROVENANCE_SCHEMA_VERSION)
+        conn = sqlite3.connect(":memory:")
+        conn.execute(_ORDER_DDL)
+        conn.execute(_SIGNAL_DDL)
+        conn.execute(_RISK_DECISION_DDL)
+        # An order-linked row without a declared authority is rejected at write
+        # time: the id alone never implies an authority.
+        with self.assertRaisesRegex(ValueError,
+                                    "order-linked risk decision requires an explicit authority"):
+            PT._risk_log(conn, "acct", "600000", "buy", "execution_blocked", "r", {},
+                         order_id=1)
+        with self.assertRaisesRegex(ValueError, "unknown risk decision authority"):
+            PT._risk_log(conn, "acct", "600000", "buy", "x", "r", {}, authority="GUESSED")
+        # The shape itself has exactly one owner.
+        self.assertEqual({
+            "schema_version": "risk-decision-provenance-v1",
+            "authority": "RISK",
+            "decision_kind": "unfilled",
+        }, PSM.risk_decision_provenance("RISK", "unfilled"))
+        conn.close()
+
+    def test_e1_5_6_legacy_and_unlinked_risk_decisions_are_never_borrowed(self):
+        conn, order_ids = self._ledger()
+        # Same account/code/side, but written by a path that held no order id.
+        conn.execute(
+            "INSERT INTO paper_risk_decisions(account_id,code,side,decision,reason,"
+            "payload,created_at,strategy_id,strategy_version,strategy_checksum,order_id)"
+            " VALUES(?,?,?,?,?,?,?,?,?,?,NULL)",
+            (self.active.strategy_id, self.code, "buy", "execution_blocked",
+             "同一账户同标的的历史决策", "{}", "2026-09-08 10:05:02",
+             self.active.strategy_id, self.active.version, self.active.checksum))
+        conn.commit()
+        evidence = SCS.capture_active_comparison_evidence(
+            conn, active_order_ids=tuple(order_ids))
+        self.assertEqual((), evidence.orders[0].risk_decision_evidence)
+        spec = self._comparison_spec(
+            order_ids=tuple(order_ids),
+            expected=(SC.ObservationKey(self.code, "buy"),),
+            active_evidence_id=evidence.source_fingerprint)
+        report = SC.build_shadow_comparison(
+            spec=spec, active_evidence=evidence, shadow_run=self.shadow_run)
+        risk = report.observations[0]["dimensions"]["risk_rejection"]
+        self.assertEqual("UNAVAILABLE", risk["legs"]["active"])
+        self.assertNotEqual("AVAILABLE", risk["availability"])
+        self.assertEqual("no_order_linked_risk_authority_evidence",
+                         risk["active"]["reason"])
+        self.assertIsNone(risk["active"]["risk_decision_evidence"])
+        self.assertFalse(risk["active"]["detail"]["order_lifecycle_status_used"])
+        self.assertEqual("UNAVAILABLE", report.provenance["active.risk_rejection"])
+        self.assertEqual("PARTIAL", report.availability)
+        self.assertEqual(0.0, report.coverage["coverage_ratio"])
+        conn.close()
+
+    def test_e1_7_order_status_is_never_risk_evidence(self):
+        conn, order_ids = self._ledger(
+            orders=({"status": "risk_rejected", "reason": "风控拒绝"},))
+        evidence = SCS.capture_active_comparison_evidence(
+            conn, active_order_ids=tuple(order_ids))
+        spec = self._comparison_spec(
+            order_ids=tuple(order_ids),
+            expected=(SC.ObservationKey(self.code, "buy"),),
+            active_evidence_id=evidence.source_fingerprint)
+        report = SC.build_shadow_comparison(
+            spec=spec, active_evidence=evidence, shadow_run=self.shadow_run)
+        risk = report.observations[0]["dimensions"]["risk_rejection"]
+        self.assertIsNone(risk["active"]["risk_decision_evidence"])
+        self.assertEqual("risk_rejected",
+                         report.active_order_lifecycle["orders"][0]["order_status"])
+        self.assertFalse(report.active_order_lifecycle["used_as_risk_evidence"])
+        self.assertEqual("UNAVAILABLE", report.provenance["active.risk_rejection"])
+        conn.close()
+
+    def test_e1_8_superseded_risk_identity_input_is_deleted(self):
+        """旧 caller-declared 输入 caller = 0 后确实删除，且不再有第二份 projection。"""
+        self.assertNotIn("risk_policy_identity",
+                         inspect.signature(SH.ShadowCandidate).parameters)
+        self.assertIn("risk_policy", inspect.signature(SH.evaluate_shadow).parameters)
+        production = sorted(path for path in Path(BACKEND_DIR).glob("*.py")
+                            if not path.name.startswith("test_"))
+        builders = []
+        for path in production:
+            text = path.read_text(encoding="utf-8")
+            if '"strategy_risk_fingerprint":' in text:
+                builders.append(path.name)
+        self.assertEqual(["strategy_runtime.py"], builders)
+        planner = Path(EP.__file__).read_text(encoding="utf-8")
+        self.assertIn("SRT.risk_policy_projection_for_context(runtime)", planner)
+        self.assertNotIn('"strategy_risk_fingerprint": runtime.risk_fingerprint.to_dict()',
+                         planner)
+        with self.assertRaisesRegex(ValueError, "owner_risk_policy_projection_required"):
+            self._shadow_run_with_risk_policy({"captured_policy_fingerprint": _sha("caller")})
+
+    def test_e1_9_execution_economics_are_untouched(self):
+        self.assertEqual(PTR.SLIPPAGE, EP.SIMULATED_SLIPPAGE_RATE)
+        self.assertEqual(0.01, EP.MAX_VOLUME_PARTICIPATION)
+        planner = Path(EP.__file__).read_text(encoding="utf-8")
+        self.assertEqual(1, planner.count("fees = round(estimate_execution_fees"))
+        self.assertEqual(2, planner.count("SIMULATED_SLIPPAGE_RATE"))
 
     def test_v25_comparison_schema_has_one_ddl_owner_and_is_idempotent(self):
         migration = next(item for item in db_migrate.MIGRATIONS["paper_trading"]
@@ -1116,6 +1567,55 @@ class ShadowComparisonTests(unittest.TestCase):
                 self.assertIn("shadow_comparison_reports", names)
                 self.assertIn("shadow_comparison_reports_no_update", names)
                 self.assertIn("shadow_comparison_reports_no_delete", names)
+            finally:
+                conn.close()
+
+
+    def test_v26_risk_decision_order_linkage_is_idempotent_and_never_backfills(self):
+        migration = next(item for item in db_migrate.MIGRATIONS["paper_trading"]
+                         if item[0] == 26)
+        self.assertIs(migration[2], PSM.ensure_risk_decision_order_linkage)
+        conn = sqlite3.connect(":memory:")
+        try:
+            conn.execute(
+                "CREATE TABLE paper_risk_decisions(id INTEGER PRIMARY KEY, account_id TEXT,"
+                " code TEXT, side TEXT, decision TEXT, reason TEXT, payload TEXT,"
+                " created_at TEXT, strategy_id TEXT, strategy_version INTEGER,"
+                " strategy_checksum TEXT)")
+            conn.execute(
+                "INSERT INTO paper_risk_decisions(id,account_id,code,side,decision,reason,"
+                "payload,created_at) VALUES(1,'legacy','600000','buy','execution_blocked',"
+                "'legacy row','{}','2026-01-01 10:00:00')")
+            self.assertEqual(PSM.ensure_risk_decision_order_linkage(conn),
+                             {"paper_risk_decisions": ("order_id",)})
+            self.assertEqual(PSM.ensure_risk_decision_order_linkage(conn),
+                             {"paper_risk_decisions": ()})
+            row = conn.execute(
+                "SELECT order_id FROM paper_risk_decisions WHERE id=1").fetchone()
+            # Historical rows keep the honest "unknown linkage" state.
+            self.assertIsNone(row[0])
+            names = {item[0] for item in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='index'")}
+            self.assertIn("idx_paper_risk_decisions_order", names)
+        finally:
+            conn.close()
+
+    def test_existing_ledger_init_db_creates_risk_decision_order_linkage(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "paper.sqlite3")
+            with mock.patch.object(PT, "DB_PATH", path), \
+                    mock.patch.object(PT, "_benchmark_close", return_value=None), \
+                    mock.patch.object(PT, "_RUNBOOK_BOOT", None, create=True):
+                PT.init_db()
+                conn = sqlite3.connect(path)
+                conn.execute("DROP INDEX idx_paper_risk_decisions_order")
+                conn.close()
+                PT.init_db()
+            conn = sqlite3.connect(path)
+            try:
+                names = {item[0] for item in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='index'")}
+                self.assertIn("idx_paper_risk_decisions_order", names)
             finally:
                 conn.close()
 

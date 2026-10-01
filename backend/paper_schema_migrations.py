@@ -1191,3 +1191,55 @@ def ensure_shadow_comparison_reports(conn):
            BEGIN SELECT RAISE(ABORT,'shadow comparison reports are append-only'); END"""
     )
     return changes
+
+
+# ─── 风险决策的精确订单关联（v26 / R32-E1） ───────────────────────────────────
+#
+# 不变量::
+#
+#     paper_risk_decisions.order_id = 「这条风险决策说的是哪张订单」的精确事实
+#
+# 背景：``paper_risk_decisions`` 一直没有 order 引用，于是"某张订单的风控决策
+# 是什么"只能靠 ``(account_id, code, side)`` 加时间序去猜最近一条 —— 这正是
+# R32-E1 明令禁止的 provenance fabrication（表本身无唯一约束，每轮扫描都追加，
+# "最近一条"既不是同一张订单，也不一定属于同一次尝试）。
+#
+# 本函数只做两件事：加一列 + 加索引。**绝不回填**：升级前那行属于哪张订单无法
+# 从任何当前状态反推（``paper_orders`` 的 retry 链、status 变化、归档都可能已经
+# 改写可见性），``order_id IS NULL`` 就是诚实的 legacy 归属状态。只有**写入当刻
+# 手里确实有 order_id** 的调用点才盖这一列（当前是 Execution Authority 对已存在
+# 订单的决策），其余写入点保持 NULL。
+
+
+def ensure_risk_decision_order_linkage(conn):
+    """v26：风险决策的精确 order 关联列（幂等，**绝不回填**）。"""
+    changes = {"paper_risk_decisions": ensure_columns(
+        conn, "paper_risk_decisions", {"order_id": "INTEGER"})}
+    if "order_id" in table_columns(conn, "paper_risk_decisions"):
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_paper_risk_decisions_order"
+            " ON paper_risk_decisions(order_id) WHERE order_id IS NOT NULL"
+        )
+    return changes
+
+
+#: Legal ``authority`` values for a risk-decision row's write-time provenance.
+#: The vocabulary is a property of the table shape, so it lives with the schema
+#: owner: every writer must state one of these, and no reader may ever infer an
+#: authority from a table name, a decision string, a reason, a status, or the
+#: mere presence of an order id.
+RISK_DECISION_AUTHORITIES = (
+    "EXECUTION", "RISK", "ENTRY", "ALLOCATION", "TIMING", "INTRADAY", "AUDIT",
+)
+RISK_DECISION_PROVENANCE_SCHEMA_VERSION = "risk-decision-provenance-v1"
+
+
+def risk_decision_provenance(authority, decision_kind):
+    """The single canonical shape of a risk decision's write-time provenance."""
+    if authority not in RISK_DECISION_AUTHORITIES:
+        raise ValueError(f"unknown risk decision authority: {authority!r}")
+    return {
+        "schema_version": RISK_DECISION_PROVENANCE_SCHEMA_VERSION,
+        "authority": authority,
+        "decision_kind": decision_kind,
+    }

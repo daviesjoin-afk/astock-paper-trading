@@ -6,6 +6,7 @@ import sqlite3
 import execution_planner as EP
 import shadow_run_repository as SRR
 import shadow_runtime as SR
+import strategy_runtime as SRT
 
 
 def run_shadow(conn: sqlite3.Connection, *, spec: SR.ShadowRunSpec,
@@ -17,12 +18,17 @@ def run_shadow(conn: sqlite3.Connection, *, spec: SR.ShadowRunSpec,
     optional previous run ID. There is no head/latest/provider fallback.
 
     The current entry ``ExecutionPolicy`` is resolved exactly once, here, and
-    frozen before the pure runtime runs. Shadow evaluation itself therefore has
-    no remaining dependency on the owner's current policy state, and the frozen
-    fingerprint is recorded in the run evidence.
+    frozen before the pure runtime runs. The Challenger's risk policy identity is
+    compiled by the Risk Authority (``strategy_runtime``) from the exact
+    immutable version definition — again exactly once, before the pure runtime —
+    so the run consumes owner-issued risk evidence rather than a caller-declared
+    dict, and Shadow evaluation itself has no remaining dependency on the
+    owner's current policy state.
     """
     version, lifecycle_state = SR.resolve_exact_shadow_strategy(conn, spec.challenger)
     execution_policy = EP.execution_policy_snapshot(spec.challenger.strategy_id)
+    risk_policy = SRT.risk_policy_projection_for_definition(
+        dict(getattr(version, "definition", {}) or {}))
     previous_run = None
     if spec.previous_shadow_run_id is not None:
         previous_run = SRR.get_run(conn, spec.previous_shadow_run_id)
@@ -33,7 +39,7 @@ def run_shadow(conn: sqlite3.Connection, *, spec: SR.ShadowRunSpec,
     evidence = SR.evaluate_shadow(
         spec=spec, environment=environment, strategy_version=version,
         lifecycle_state=lifecycle_state, execution_policy=execution_policy,
-        candidates=candidates, previous_run=previous_run,
+        risk_policy=risk_policy, candidates=candidates, previous_run=previous_run,
     )
     return SRR.append_run(conn, evidence)
 

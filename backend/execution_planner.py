@@ -679,10 +679,8 @@ def _runtime_context_for_order(
         return SRC.ActiveRuntimeContextResult.unavailable(
             "missing_execution_state",
         )
-    risk_identity = {
-        "strategy_risk_fingerprint": runtime.risk_fingerprint.to_dict(),
-        "compiled_risk_profile": runtime.risk_profile.to_dict(),
-    }
+    # The owner-owned risk-policy projection: one shape for both comparison legs.
+    risk_identity = SRT.risk_policy_projection_for_context(runtime)
     context = SRC.build_comparable_runtime_context(
         strategy_id=strategy_id, strategy_version=version,
         strategy_checksum=checksum, session_date=str(asof_day),
@@ -1929,7 +1927,8 @@ def commit_fill(
             PT._risk_log(
                 conn, account_id, code, side, "execution_blocked",
                 reason_codes or reason, execution_evidence,
-                strategy_stamp=order_strategy_stamp,
+                strategy_stamp=order_strategy_stamp, order_id=order_id,
+                authority="EXECUTION", decision_kind="execution_blocked",
             )
         return None
 
@@ -2120,7 +2119,8 @@ def commit_fill(
     PT._risk_log(
         conn, account_id, code, side, action,
         risk_log_reason or reason, fill_detail,
-        strategy_stamp=order_strategy_stamp,
+        strategy_stamp=order_strategy_stamp, order_id=order_id,
+        authority="EXECUTION", decision_kind=str(action),
     )
     PT._audit(
         conn, account_id, audit_action or action,

@@ -324,18 +324,7 @@ blocking_reasons
 
 R32-D 只产出 comparison evidence。把 report 接到生命周期、晋级、运营界面与生产调用者属 R32-E；R32-E 在把这些事实写进 promotion evidence 前，必须先处理两处 provenance 缺口：Active 侧没有 owner-issued entry evidence，以及 Shadow 侧 `risk_policy_identity` 仍只是 DECLARED。DEPLOY = NOT DEPLOYED。
 
-## 五、验证结果
-
-复现命令（workspace 根目录）：
-
-```text
-focused:   cd backend && python -m unittest test_shadow_comparison test_shadow_runtime \
-             test_execution_planner test_paper_decision_audit test_simulation_runtime_context -q
-mutation:  python work/r32d_shadow_comparison_mutation_check.py
-full:      python -m unittest discover -s backend -p "test_*.py"
-docker:    docker run --rm --network none --tmpfs /app/data_cache:rw,size=64m,uid=10001,gid=10001 \
-             astock-codex:ci python -m unittest discover -s backend -p "test_*.py"
-```
+## 五、验证结果（R32-D）
 
 | 层 | 结果 |
 | --- | --- |
@@ -376,3 +365,187 @@ Net production LOC:              +32 / -11（shadow_comparison.py +1/-1，shadow
 ```
 
 未新增 facade / manager / helper 模块；改动集中在既有 `shadow_comparison_service.py`（capture owner）与 `shadow_comparison.py` 的一处 owner-key 读取修正。新增 mutation：`M-D14`（`admission_score` 退回旧键）、`M-D15`（capture 的 fingerprint 不再由 exact 行内容决定）、`M-D16`（capture 重新接受 `ComparisonSpec` 参数）。
+## 七、R32-E1：Comparable Evidence Provenance Closure
+
+状态：R32-E1 IN REVIEW。目标不是降低判据，而是让**未来新产生**的 Active / Challenger evidence 拥有真正可比较、owner-issued、exact-linked 的 provenance；历史旧记录保持 PARTIAL / UNAVAILABLE，绝不用当前状态回填。
+
+### 7.1 开工前 inventory（结论）
+
+| 问题 | 结论 |
+| --- | --- |
+| Active BUY 的 entry/admission authority | `paper_trading` 的买入路径自带门禁（`_chase_entry_gate` / `_three_day_timing_gate` / `_new_entry_price_gate` / 容量 / 现金 / `execution_dispatch`）。`execution_planner.plan_entry`（统一编排入口）**生产 caller = 0** |
+| Challenger 的 entry authority | `execution_planner.evaluate_entry_state`（唯一生产消费者是 Shadow runtime） |
+| 能否共享同一纯 authority | 暂时不能：两条路径的输入状态来源不同（正式账本 + 连接 vs 显式 `EntryGateState` 快照），迁移会改变真实下单判定，属行为变更而非 provenance 变更 |
+| 与 `evaluate_entry_state` 重复的 Active 条件 | 容量（策略席位 + 共享池）、现金、行情新鲜度、市场灯在两侧各有一份；语义相近但输入与 owner 不同 |
+| `paper_risk_decisions` 的业务 owner | `paper_trading._risk_log`（写入）与 `paper_risk_service._risk_log`（风险扫描写入）；表本身没有 order 引用列 |
+| `risk_policy_identity` 的来源 | Active：`execution_planner` 由 `strategy_runtime` 的 pinned `risk_fingerprint` + `compiled_risk_profile` 组装（owner-issued）；Challenger：`ShadowCandidate.risk_policy_identity`（caller-declared） |
+| 已有 canonical risk-policy snapshot / fingerprint | **只有 compiler，没有 snapshot**：`strategy_runtime` 从 exact definition 编译 `StrategyRiskFingerprint` + `StrategyRiskProfile`（冻结 dataclass），但没有"有效风险策略"的 sha256 |
+| 新路径接管后会变成重复实现的 helper | `execution_planner` 里内联的 risk identity dict 组装（本轮已删）；`strategy_risk_enforcement.compiled_profile_*` / `paper_trading._risk_profile` 是**另一层**（生产参数收紧融合），不是同一个投影，未动 |
+
+### 7.2 Entry evidence（E1-2）
+
+两个不可比较 authority 的边界与**迁移 gate**：
+
+```text
+Active admission owner       paper_trading 买入路径（ledger-connection 语义）
+Active evidence              order 自己 risk_payload.decision_snapshot.final（精确 linkage）
+Challenger admission owner   execution_planner.evaluate_entry_state（纯快照语义）
+不可比较字段                 两条 admission 词汇与门禁集合（无任何 owner 定义映射）
+comparison 行为              只并列两份 owner 原文，cross_vocabulary_relation_defined = False
+
+E4 前置 gate（硬性）：
+  R32-E4 开始前，Active 买入路径与手动路径必须已迁到唯一 Entry Authority；
+  否则 R32 **不得**标记 COMPLETE。如果该迁移无法做到行为等价，
+  必须单独开一个 human-reviewed convergence PR（显式改变交易判定的 PR），
+  不允许在 E4 cleanup 里顺手改掉交易判定，也不允许把"未来某个 PR"当成 milestone。
+```
+
+`plan_entry` 的 caller 目前是 0，但它是**待接线的 canonical 编排入口**，不是被取代的旧实现：删掉它会移除上述迁移的目标本身。它按固定格式登记：`Old implementation deletable now: NO — blocker: 它是 Active/手动路径迁移的目标入口；Deletion milestone: 上述 E4 前置 gate 命名的迁移 PR`。
+
+### 7.3 Risk evidence：精确 order 关联 + write-time authority provenance（E1-3）
+
+`paper_risk_decisions` 同时承载多种 authority 的日志，而且此前没有 order 引用。**order id 只能证明"这条 row 属于哪张订单"，永远不能证明"这条 row 是 Risk Authority 的风险裁决"**。因此两件事必须同时成立：
+
+**(a) 精确 order 关联（migration v26）**
+
+```text
+paper_risk_decisions.order_id INTEGER      -- 写入当刻确实持有 order_id 的调用点才盖
+idx_paper_risk_decisions_order             -- WHERE order_id IS NOT NULL
+```
+
+规则：只有写入当刻手里有 order_id 的调用点才盖；**绝不回填**（历史 NULL 就是诚实的"归属不可证明"）；读取只按 `order_id = 该 order`，不得回退到 `(account, code, side)`、`ORDER BY id DESC` 或"最新一条"。
+
+**(b) write-time authority provenance（`_risk_log` 注入，不由读取方推断）**
+
+```text
+payload.decision_provenance = {
+    schema_version: "risk-decision-provenance-v1",
+    authority:      EXECUTION | RISK | ENTRY | INTRADAY | AUDIT,
+    decision_kind:  <writer 声明的 kind>
+}
+```
+
+- 词表由 owner 拥有（`paper_trading.RISK_DECISION_AUTHORITIES`），未知值直接拒绝。
+- **order-linked 的 row 必须声明 authority**：只给 order id 不给 authority 直接 `ValueError`。id 从来不是归属证明。
+- comparison 只按 `payload.decision_provenance.authority` 选择证据；**禁止**按表名、decision 字符串、reason 文案、status 或"order_id 非空"来分类。测试 E1-R3 用同一条 `execution_blocked` 文案分别标 `RISK` / `EXECUTION`，证明**决定权在 label 而不在文案**。
+- 未声明 provenance 的 row（含不能解析的 payload）保持未分类 → **永不被当作风险证据**，只是不参与。
+
+**(c) 消费规则**
+
+| row 的 authority | comparison 归入 | 能否让 risk_rejection PRESENT |
+| --- | --- | --- |
+| `RISK` + exact order linkage | `risk_rejection`（owner-issued，原文） | ✅ |
+| `EXECUTION` + exact order linkage | `execution` 维度的 supporting evidence | ❌（E1-R1/R2） |
+| 其它 / 未声明 / order_id NULL | 不消费 | ❌ |
+
+真正的 Risk Authority order-linked 写入点是 `paper_risk_service` 对**它刚刚创建的那张卖单**的决策（同一 decision result 在写入当刻绑定 order id，绝不是事后重跑）；Execution Authority 的两处（成交提交、执行受阻）标 `EXECUTION` 并只进 execution 维度；order 自身的 `status` / `reason` 永远只是 lifecycle 事实（`used_as_risk_evidence = false`）。
+
+无法证明 exact linkage 时：`active risk_rejection = UNAVAILABLE`，报告保持 `PARTIAL`，绝不让 execution evidence 把它升级成 `AVAILABLE`。
+
+### 7.4 Challenger 的 owner-issued risk policy（E1-4）
+`strategy_runtime`（Risk Authority 的编译 owner）新增唯一投影入口，Active 腿与 Challenger 腿共用同一个形状：
+
+```text
+compile_risk_policy(definition)                     # 唯一编译点
+risk_policy_projection(fingerprint, profile)        # 唯一投影形状（字段集只有一份）
+risk_policy_projection_for_context(context)         # Active：pinned runtime context
+risk_policy_projection_for_definition(definition)   # Challenger：exact version definition
+is_risk_policy_projection(value)                    # 消费方校验外部输入
+```
+
+`shadow_run_service.run_shadow()` 在进入纯运行时前**捕获一次**，作为显式必填输入传给 `evaluate_shadow(risk_policy=...)`，并写入 run-level `challenger_runtime_inputs.risk_policy`（source / strategy stamp / projection）。纯运行时因此不再读任何 current risk policy；comparison 只消费 run 里那份证据。
+
+纯运行时也不再只校验 shape，而是做**确定性验证**：supplied `risk_policy` 必须 canonical-equal 于
+
+```text
+strategy_runtime.risk_policy_projection_for_definition(exact strategy_version.definition)
+```
+
+不等即 `challenger_risk_policy_identity_mismatch`（E1-R6/R7：只篡改 `strategy_risk_fingerprint` 或只篡改 `compiled_risk_profile` 都 fail closed；M-D23 证明只比 key 集合是不够的）。关键点是：这一步只验证**调用方显式传入的不可变输入**，不读 current strategy、不读 DB、不读 cache、不读 latest、不重新解析 lifecycle，因此 replay contract 不受影响（E1-R8：current config 改变、exact 输入不变 → 报告逐字节不变）。service 仍是 capture once → 显式传入；pure runtime 只 verify + consume。
+
+`ShadowCandidate.risk_policy_identity`（caller-declared 输入）**已删除**：迁移后 caller = 0，不留兼容字段。旧 run 已持久化的证据仍会被读（那是证据兼容，不是代码路径），并保持 `DECLARED`。
+
+### 7.5 语义（E1-5 / E1-6）
+
+```text
+新数据 + Risk Authority 的 order-linked 决策   risk_rejection = AVAILABLE，报告可达 AVAILABLE（coverage = 1）
+新数据只有 execution authority 的 order row    risk_rejection 仍 UNAVAILABLE → 报告 PARTIAL（E1-R1/R2）
+新数据缺 order-linked 决策                     risk_rejection 不 AVAILABLE，报告 PARTIAL
+legacy 行（order_id IS NULL）                  继续 UNAVAILABLE / PARTIAL，绝不 backfill
+legacy run（只有 caller 声明）                 risk policy identity 标 DECLARED，绝不提升为 owner 事实
+```
+
+### 7.6 验证结果（R32-E1）
+
+| 层 | 结果 |
+| --- | --- |
+| focused R32-C/D/E1 | 74 tests OK |
+| 语义 mutation M-D1–M-D23 | **23/23 DETECTED**；survived / fake / timeout = 0；restore SHA256 PASS |
+| R32-C mutation 复验 | 16/16 DETECTED（未受影响） |
+| ruff / compileall | PASS |
+
+新增用例：E1-1 两腿共用一个 owner risk policy 契约、E1-2 Risk Authority 的 order-linked 决策使该维度 AVAILABLE（报告可达 AVAILABLE）、**E1-R1** execution_blocked 不进 risk_rejection、**E1-R2** 成功成交 action 同样不进、**E1-R3** 决定权在 authority label 而不在 decision 文案、**E1-R4** 别的 order 的风险证据被拒 + 无 authority 的 row 不被消费、**E1-R5** 同一 order 上两种 authority 各进各自的维度、**E1-R6/R7** 篡改 fingerprint / profile 都 fail closed、**E1-R8** current config 改变不影响 replay、**E1-R9** capture / supplied / recorded 三者 canonical 相等、**E1-R10** authority 词表与写入期强制由 owner 独占、E1-5/6 legacy 与未关联决策永不被借用、E1-7 order status 永不作为风险证据、E1-8 旧 caller-declared 输入已删除且 projection 只有一份、E1-9 执行经济学未动。
+
+### 7.6.1 真实 Active BUY production path（本轮新增）
+
+`test_r32e1_active_buy_provenance.py` **不手工 INSERT** 决策行：它直接驱动真实 `PT._buy_order`（真实门禁组合、真实订单行、真实 write-time provenance），只在**owner 边界**注入一个 owner 自己的输出（`_shared_risk_state` 或入场闸门），然后走 `capture_active_comparison_evidence()` 与纯 `risk_rejection` 维度。
+
+inventory 结论（BUY 路径的 `allowed=False` 来源，按 owner 事实分类，不按 reason 文案）：
+
+| owner fact（分支变量） | authority | 说明 |
+| --- | --- | --- |
+| `dispatch_gate != "none"` 或 `dispatch_plan["blocked"]` | `EXECUTION` | 执行派发闸门 / Execution Dispatch 的 hard block |
+| `count_only_blocked`（只有策略席位/共享池容量原因） | `ALLOCATION` | 容量/席位 owner |
+| `timing_block_reasons and not hard_reasons`（只有时机软阻断） | `TIMING` | 交易时段/时机 owner |
+| 其余复合结论（入场模型、证券范围、行情/数据类硬否决…） | `ENTRY` | Active admission owner 的复合结论 |
+| `risk_state["blocked"]`（`_shared_risk_state` = 共享池熔断/回撤/冷静期） | **独立 `RISK` 行** | Risk Authority 自己的否决，与复合结论分开成行 |
+
+要点：
+
+- 复合结论行**永不**标 `RISK`；它绑定刚创建的 `order_id`，authority 由产生该结论的**分支事实**决定（不是 `decision_name` / reason 文案）。
+- **Execution Dispatch 的 hard block 必须用原始 owner fact**：`dispatch_plan["blocked"]` 会先写进 `reasons` 使 `allowed` 变假，于是 `dispatch_gate = dispatch_plan["gate"] if allowed else "none"` 被抹成 `"none"`。只看被改写后的 `dispatch_gate` 会把"核验已驳回、由 Execution Authority 终止"错误持久化成 `ENTRY`。因此分类输入显式保留 `dispatch_blocked = bool(dispatch_plan.get("blocked"))`，`dispatch_blocked or dispatch_gate != "none"` → `EXECUTION`（真实 owner 输出里确实存在 `blocked=True, gate="none"`：`verification_required` + `verification_rejected`）。这是纯 provenance 修正，`allowed` / `order_status` / signal status / 派发语义 / 核验驳回行为 / 资金预占一律不变。
+- Risk Authority 的否决以**它自己的行**记录（`shared_risk_state_blocked`），并且仍绑定同一张订单 —— 那是买入路径在上面实际消费过的那份 owner output，写入当刻落库，不是事后重跑、也不是由复合结论冒充。
+- 市场/数据类硬否决当前没有独立的 owner boolean 暴露在该写入点（只有合并后的 reason 文案），因此按 admission owner 记 `ENTRY`；把它们细分成 `MARKET` 需要 owner 侧新增可判定的 owner fact，已登记为后续项，**不做字符串分类**。
+- 真实路径用例：R1（Risk Authority 否决 → RISK+ENTRY 两行都 exact-linked → 维度 PRESENT/AVAILABLE）、R2（入场闸门拒绝 → 只有 ENTRY，绝不 RISK，维度保持 UNAVAILABLE 且不降级）、R3（同一订单上再放一条 EXECUTION 行 → 只有 RISK 行进风险维度，execution 行不进）、R4（order-linked 必须声明 authority 的 write-time 强制 + 词表 owner）。
+
+### 7.7 本 PR 的维护性报告
+
+```text
+Business authority added:        strategy_runtime 的 risk policy projection（唯一投影形状）
+Business authority removed:      —
+Old architecture removed:        YES（caller-declared risk identity 输入 + 内联 risk identity dict）
+Old production callers before:   1（execution_planner 内联组装）+ 1（ShadowCandidate 字段消费）
+Old production callers after:    0 / 0
+Compatibility path added:        NO
+Compatibility path removed:      NO（无遗留 wrapper 可删）
+Duplicate implementation:        before=2（strategy_runtime 编译 + execution_planner 内联组装）
+                                 after=1（只有 strategy_runtime）
+New facade/wrapper:              0
+Old facade/wrapper removed:      0
+Implicit current-state lookup:   before=0 / after=0
+Direct DB write sites:           before=1（shadow_comparison_reports）/ after=1
+Large if/elif decision chain:    NO
+Frontend duplicated business rule: NO
+Dead production code removed:    files=0 / production LOC=-（旧字段与内联组装，见上）
+Net production LOC:              +X / -Y（见 PR 描述）
+核心业务规则理解:                before=14 modules / after=14 modules（未新增模块）
+paper_trading.py:                15,855 LOC / 325 defs（+order_id 盖章参数与注释）
+Can newly-added code replace existing code instead of coexisting?  YES → 已执行
+                                 （caller-declared identity 字段与内联组装均已删除）
+```
+
+## 八、R32-E2+ 边界
+
+R32-E1 只做 provenance closure。生命周期/晋级 wiring（E2）、工作区（E3）、架构收敛与 R32 收口（E4）各自独立审核。
+
+复现命令（workspace 根目录）：
+
+```text
+focused:   cd backend && python -m unittest test_shadow_comparison test_shadow_runtime \
+             test_execution_planner test_paper_decision_audit test_simulation_runtime_context -q
+mutation:  python work/r32d_shadow_comparison_mutation_check.py
+full:      python -m unittest discover -s backend -p "test_*.py"
+docker:    docker run --rm --network none --tmpfs /app/data_cache:rw,size=64m,uid=10001,gid=10001 \
+             astock-codex:ci python -m unittest discover -s backend -p "test_*.py"
+```
+

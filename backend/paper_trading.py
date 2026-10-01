@@ -1877,6 +1877,8 @@ def init_db():
                 PSM.ensure_shadow_runs_table(conn)
                 # R32-D（v25）：同理，既有账本走快路径时也必须补建比对报告表。
                 PSM.ensure_shadow_comparison_reports(conn)
+                # R32-E1（v26）：风险决策的精确 order 关联列（幂等、不回填）。
+                PSM.ensure_risk_decision_order_linkage(conn)
                 _ensure_accounts(conn)
                 _ensure_user_strategy_accounts(conn)
                 _ensure_cycle(conn)
@@ -2181,6 +2183,8 @@ def init_db():
         PSM.ensure_shadow_runs_table(conn)  # R32-C v24（DDL 只在 paper_schema_migrations）
         # R32-D v25：比对报告表（DDL 同样只在 paper_schema_migrations）。
         PSM.ensure_shadow_comparison_reports(conn)
+        # R32-E1 v26：风险决策的精确 order 关联列。
+        PSM.ensure_risk_decision_order_linkage(conn)
         _ensure_accounts(conn)
         _ensure_user_strategy_accounts(conn)
         _ensure_cycle(conn)
@@ -3282,11 +3286,28 @@ def _recovery_observation(conn, account_id, code, watch, quote, day):
 
 
 def _risk_log(conn, account_id, code, side, decision, reason, payload, *,
-              strategy_stamp=None):
+              strategy_stamp=None, order_id=None, authority=None,
+              decision_kind=None):
+    """Append one risk decision with its write-time provenance.
+
+    ``authority`` / ``decision_kind`` are injected here (not accepted from the
+    payload) so the row carries an owner-stated provenance that a reader can
+    consume without classifying anything itself. The legal vocabulary and the
+    provenance shape belong to the schema owner
+    (``paper_schema_migrations``). An order-linked row must declare its
+    authority: an id alone proves which order the row belongs to, never which
+    authority produced it.
+    """
+    if order_id is not None and authority is None:
+        raise ValueError(
+            "order-linked risk decision requires an explicit authority")
     payload = _with_decision_snapshot(
         payload or {}, account_id=account_id, code=code, side=side,
         decision=decision, reason=reason,
     )
+    if authority is not None:
+        payload["decision_provenance"] = PSM.risk_decision_provenance(
+            authority, decision_kind or decision)
     if strategy_stamp is None:
         strategy_id, strategy_version, strategy_checksum = _strategy_stamp(conn, account_id)
     else:
@@ -3294,10 +3315,11 @@ def _risk_log(conn, account_id, code, side, decision, reason, payload, *,
     conn.execute(
         """INSERT INTO paper_risk_decisions(
                account_id,code,side,decision,reason,payload,created_at,
-               strategy_id,strategy_version,strategy_checksum)
-           VALUES(?,?,?,?,?,?,?,?,?,?)""",
+               strategy_id,strategy_version,strategy_checksum,order_id)
+           VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
         (account_id, code, side, decision, reason, _json(payload), _now(),
-         strategy_id, strategy_version, strategy_checksum),
+         strategy_id, strategy_version, strategy_checksum,
+         int(order_id) if order_id is not None else None),
     )
 
 
@@ -10012,7 +10034,11 @@ def _buy_order(conn, account, signal, quote, market, news, asof_day, *, all_quot
         qty < LOT_SIZE and not hard_reasons
         and set(sizing.get("binding_constraints") or []).issubset({"cash", "weight", "exposure", "industry"})
     )
-    if dispatch_plan.get("blocked"):
+    # Execution Dispatch 的 hard block 是 owner 事实：``blocked`` 会先写进 reasons，
+    # 因而让 ``allowed`` 变假、把 ``dispatch_gate`` 抹成 "none"。分类 provenance 时
+    # 必须用这个**原始 owner fact**，而不是被 allowed 改写后的 gate。
+    dispatch_blocked = bool(dispatch_plan.get("blocked"))
+    if dispatch_blocked:
         reasons.append(str(dispatch_plan["blocked_reason"]))
     # A Q3 sample is worth recording only if every ordinary execution/risk
     # gate also passed.  It must never turn stale quotes, a hard veto or an
@@ -10139,7 +10165,32 @@ def _buy_order(conn, account, signal, quote, market, news, asof_day, *, all_quot
         # §56：闸门未放行的决策在此记录一次 risk 事件。成功路径的 risk log 与
         # audit 由 execution_planner.commit_fill 统一写入，绝不在此重复记录
         # （否则同一笔成交会在 paper_risk_decisions 里出现两次）。
-        _risk_log(conn, account["id"], code, "buy", decision_name, reason, risk)
+        #
+        # R32-E1：这一行是 Active admission owner 对**这张刚创建的订单**的复合结论，
+        # 因此 (a) 写入当刻精确绑定 order_id，(b) authority 由产生该结论的**分支
+        # 事实**决定（不是 reason 文案）：Execution Dispatch 的 hard block 或派发闸门
+        # → EXECUTION；只有席位/共享池容量原因 → ALLOCATION；只有时机软阻断 →
+        # TIMING；其余复合结论 → ENTRY。复合结论**永不**标 RISK。
+        if dispatch_blocked or dispatch_gate != "none":
+            admission_authority = "EXECUTION"
+        elif count_only_blocked:
+            admission_authority = "ALLOCATION"
+        elif timing_block_reasons and not hard_reasons:
+            admission_authority = "TIMING"
+        else:
+            admission_authority = "ENTRY"
+        _risk_log(conn, account["id"], code, "buy", decision_name, reason, risk,
+                  order_id=int(cursor.lastrowid), authority=admission_authority,
+                  decision_kind=decision_name)
+        if risk_state.get("blocked"):
+            # 独立的 Risk Authority 结论（共享池熔断/回撤/冷静期）：这正是买入路径
+            # 在上面实际消费过的那份 owner output，写入当刻绑定同一张订单 —— 不是
+            # 事后重跑风控，也不是由复合结论冒充。
+            _risk_log(conn, account["id"], code, "buy", "shared_risk_state_blocked",
+                      "；".join(str(item) for item in risk_state.get("reasons") or ()),
+                      {"account_risk": risk_state},
+                      order_id=int(cursor.lastrowid), authority="RISK",
+                      decision_kind="shared_risk_state_blocked")
         if (risk.get("slot_borrow") or {}).get("allowed"):
             risk["slot_borrow_rollback"] = _rollback_slot_borrow(conn, risk["slot_borrow"], cycle_id=current_cycle["id"])
         if order_status in EPD.GATED_ORDER_STATUSES:

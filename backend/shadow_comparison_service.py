@@ -60,6 +60,53 @@ def _execution_evidence(raw) -> dict | None:
     return evidence or None
 
 
+def _decision_provenance(raw) -> dict | None:
+    """The writer-declared provenance of one risk-decision row, or unknown.
+
+    A row whose payload cannot be read keeps no provenance: it is then never
+    consumed as risk evidence rather than being classified by its text.
+    """
+    try:
+        payload = json.loads(str(raw or "{}"))
+    except ValueError:
+        return None
+    if not isinstance(payload, Mapping):
+        return None
+    declared = payload.get("decision_provenance")
+    if not isinstance(declared, Mapping):
+        return None
+    return {
+        "schema_version": declared.get("schema_version"),
+        "authority": declared.get("authority"),
+        "decision_kind": declared.get("decision_kind"),
+    }
+
+
+def _risk_decision_evidence(conn: sqlite3.Connection, order_id: int) -> tuple:
+    """Risk-decision rows exactly linked to one order, with their provenance.
+
+    The linkage is the `paper_risk_decisions.order_id` column written by the
+    caller that already held the order id. The *authority* is the row's own
+    write-time `decision_provenance`: nothing here infers it from the table
+    name, the decision string, the reason text, a status, or the mere presence
+    of an order id. There is deliberately no fallback to `(account, code, side)`
+    or "the latest decision".
+    """
+    rows = conn.execute(
+        "SELECT id,decision,reason,created_at,payload FROM paper_risk_decisions"
+        " WHERE order_id=? ORDER BY id",
+        (int(order_id),),
+    ).fetchall()
+    return tuple({
+        "risk_decision_id": int(row[0]),
+        "order_id": int(order_id),
+        "decision": str(row[1]),
+        "reason": row[2],
+        "created_at": row[3],
+        "decision_provenance": _decision_provenance(row[4]),
+    } for row in rows)
+
+
 def _admission_evidence(raw) -> dict | None:
     """The order's own persisted buy-path admission decision, when one exists.
 
@@ -178,6 +225,7 @@ def capture_active_comparison_evidence(
             signal_evidence=_signal_evidence(conn, values.get("signal_id")),
             admission_evidence=_admission_evidence(values.get("risk_payload")),
             execution_evidence=_execution_evidence(values.get("execution_evidence")),
+            risk_decision_evidence=_risk_decision_evidence(conn, int(values["id"])),
         ))
     return SC.ActiveComparisonEvidence.build(orders)
 

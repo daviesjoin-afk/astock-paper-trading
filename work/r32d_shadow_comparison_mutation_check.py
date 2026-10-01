@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -74,9 +75,11 @@ MUTATIONS = [
     # M-D7：caller-declared risk identity 被提升成 owner 事实。
     (
         "backend/shadow_comparison.py",
-        '        "challenger.risk_policy_identity": EvidenceProvenance.DECLARED.value,\n',
-        '        "challenger.risk_policy_identity": EvidenceProvenance.OWNER_ISSUED.value,\n',
-        "test_shadow_comparison.ShadowComparisonTests.test_d8_declared_risk_identity_is_never_promoted_to_verified",
+        '            challenger_payload["risk_policy_identity_provenance"] = (\n'
+        '                EvidenceProvenance.DECLARED.value if declared is not None\n'
+        '                else declared_provenance)\n',
+        '            challenger_payload["risk_policy_identity_provenance"] = declared_provenance\n',
+        "test_shadow_comparison.ShadowComparisonTests.test_d8b_legacy_run_risk_identity_stays_declared",
     ),
     # M-D8：缺 exact 估值时不再 fail closed，而是用能找到的价格继续算。
     (
@@ -124,13 +127,15 @@ MUTATIONS = [
     # M-D13：order lifecycle status 被升级成 Active risk evidence。
     (
         "backend/shadow_comparison.py",
-        '        active_payload = {\n'
-        '            "risk_rejection_evidence": None,\n'
-        '            "risk_rejection_availability": EvidenceProvenance.UNAVAILABLE.value,\n',
-        '        active_payload = {\n'
-        '            "risk_rejection_evidence": {"order_status": active.order_status},\n'
-        '            "risk_rejection_availability": EvidenceProvenance.OWNER_ISSUED.value,\n',
-        "test_shadow_comparison.ShadowComparisonTests.test_d17_order_status_is_not_risk_authority_evidence",
+        '        linked_rows = tuple(active.risk_decision_evidence or ())\n',
+        '        linked_rows = tuple(active.risk_decision_evidence or ()) + (\n'
+        '            {"risk_decision_id": 0, "order_id": active.order_id,\n'
+        '             "decision": active.order_status, "reason": active.order_reason,\n'
+        '             "decision_provenance": {\n'
+        '                 "schema_version": "risk-decision-provenance-v1",\n'
+        '                 "authority": RISK_AUTHORITY_LABEL,\n'
+        '                 "decision_kind": "order_status"}},)\n',
+        "test_shadow_comparison.ShadowComparisonTests.test_e1_7_order_status_is_never_risk_evidence",
     ),
     # M-D14：admission_score 退回旧键（owner projection 已不再有裸 score 键）。
     (
@@ -159,14 +164,151 @@ MUTATIONS = [
         ') -> SC.ActiveComparisonEvidence:\n',
         "test_shadow_comparison.ShadowComparisonTests.test_d20_active_capture_depends_only_on_explicit_order_ids",
     ),
+    # M-D17：风险证据改用 (account, code, side) 猜最近一条，而不是精确 order 关联。
+    (
+        "backend/shadow_comparison_service.py",
+        '    rows = conn.execute(\n'
+        '        "SELECT id,decision,reason,created_at,payload FROM paper_risk_decisions"\n'
+        '        " WHERE order_id=? ORDER BY id",\n'
+        '        (int(order_id),),\n'
+        '    ).fetchall()\n',
+        '    rows = conn.execute(\n'
+        '        "SELECT id,decision,reason,created_at,payload FROM paper_risk_decisions"\n'
+        '        " WHERE account_id=(SELECT account_id FROM paper_orders WHERE id=?)"\n'
+        '        "   AND code=(SELECT code FROM paper_orders WHERE id=?)"\n'
+        '        "   AND side=(SELECT side FROM paper_orders WHERE id=?)"\n'
+        '        " ORDER BY id DESC LIMIT 1",\n'
+        '        (int(order_id), int(order_id), int(order_id)),\n'
+        '    ).fetchall()\n',
+        "test_shadow_comparison.ShadowComparisonTests.test_e1_5_6_legacy_and_unlinked_risk_decisions_are_never_borrowed",
+    ),
+    # M-D18：新 run 的 owner-issued risk policy identity 被丢弃（退回 legacy 分支）。
+    (
+        "backend/shadow_comparison.py",
+        '        owner_projection = owner_section.get("projection")\n',
+        '        owner_projection = None\n',
+        "test_shadow_comparison.ShadowComparisonTests.test_e1_1_both_legs_use_one_owner_risk_policy_contract",
+    ),
+    # M-D19：owner risk policy shape 校验被移除（任意 caller dict 都能当 owner 事实）。
+    (
+        "backend/shadow_runtime.py",
+        '    if not SRT.is_risk_policy_projection(risk_policy):\n'
+        '        raise ValueError("owner_risk_policy_projection_required")\n',
+        '    if False:\n'
+        '        raise ValueError("owner_risk_policy_projection_required")\n',
+        "test_shadow_comparison.ShadowComparisonTests.test_e1_8_superseded_risk_identity_input_is_deleted",
+    ),
+    # M-D20：execution authority 的 order-linked row 被重新允许进入 risk_rejection。
+    (
+        "backend/shadow_comparison.py",
+        '        risk_rows = tuple(item for item in linked_rows\n'
+        '                          if _decision_authority(item) == RISK_AUTHORITY_LABEL)\n',
+        '        risk_rows = tuple(linked_rows)\n',
+        "test_shadow_comparison.ShadowComparisonTests.test_e1_r1_execution_blocked_row_is_not_risk_evidence",
+    ),
+    # M-D21：写入方不再需要声明 authority（order id 本身就当成归属证明）。
+    (
+        "backend/paper_trading.py",
+        '    if order_id is not None and authority is None:\n'
+        '        raise ValueError(\n'
+        '            "order-linked risk decision requires an explicit authority")\n',
+        '    if False:\n'
+        '        raise ValueError(\n'
+        '            "order-linked risk decision requires an explicit authority")\n',
+        "test_shadow_comparison.ShadowComparisonTests.test_e1_r10_authority_labels_have_one_owner",
+    ),
+    # M-D22：supplied risk_policy 与 exact strategy version owner projection 的相等校验被删除。
+    (
+        "backend/shadow_runtime.py",
+        '    if dict(risk_policy) != SRT.risk_policy_projection_for_definition(definition):\n'
+        '        raise ValueError("challenger_risk_policy_identity_mismatch")\n',
+        '    if False:\n'
+        '        raise ValueError("challenger_risk_policy_identity_mismatch")\n',
+        "test_shadow_comparison.ShadowComparisonTests.test_e1_r6_tampered_fingerprint_fails_closed",
+    ),
+    # M-D23：只比较 key 集合，canonical-shaped 的伪造 policy 因此被接受。
+    (
+        "backend/shadow_runtime.py",
+        '    if dict(risk_policy) != SRT.risk_policy_projection_for_definition(definition):\n'
+        '        raise ValueError("challenger_risk_policy_identity_mismatch")\n',
+        '    if set(risk_policy) != set(SRT.risk_policy_projection_for_definition(definition)):\n'
+        '        raise ValueError("challenger_risk_policy_identity_mismatch")\n',
+        "test_shadow_comparison.ShadowComparisonTests.test_e1_r7_tampered_profile_fails_closed",
+    ),
+    # M-D24：Active BUY 复合结论已拿到 order_id 却丢弃 linkage。
+    (
+        "backend/paper_trading.py",
+        '        _risk_log(conn, account["id"], code, "buy", decision_name, reason, risk,\n'
+        '                  order_id=int(cursor.lastrowid), authority=admission_authority,\n'
+        '                  decision_kind=decision_name)\n',
+        '        _risk_log(conn, account["id"], code, "buy", decision_name, reason, risk,\n'
+        '                  authority=admission_authority,\n'
+        '                  decision_kind=decision_name)\n',
+        "test_r32e1_active_buy_provenance.ActiveBuyDecisionProvenanceTests.test_r1_real_risk_authority_veto_is_exactly_linked",
+    ),
+    # M-D25：复合 ENTRY rejection 被错误标成 RISK。
+    (
+        "backend/paper_trading.py",
+        '        else:\n'
+        '            admission_authority = "ENTRY"\n',
+        '        else:\n'
+        '            admission_authority = "RISK"\n',
+        "test_r32e1_active_buy_provenance.ActiveBuyDecisionProvenanceTests.test_r2_non_risk_rejection_is_never_labelled_risk",
+    ),
+    # M-D26：真实 Risk Authority 的 BUY evidence 被押成非 owner authority。
+    (
+        "backend/paper_trading.py",
+        '                      order_id=int(cursor.lastrowid), authority="RISK",\n'
+        '                      decision_kind="shared_risk_state_blocked")\n',
+        '                      order_id=int(cursor.lastrowid), authority="ENTRY",\n'
+        '                      decision_kind="shared_risk_state_blocked")\n',
+        "test_r32e1_active_buy_provenance.ActiveBuyDecisionProvenanceTests.test_r1_real_risk_authority_veto_is_exactly_linked",
+    ),
+    # M-D27：Execution Dispatch 的 hard block 不再归 EXECUTION（退回只看被 allowed
+    #        改写后的 dispatch_gate，于是被错误记成 ENTRY）。
+    (
+        "backend/paper_trading.py",
+        '        if dispatch_blocked or dispatch_gate != "none":\n',
+        '        if dispatch_gate != "none":\n',
+        "test_r32e1_active_buy_provenance.ActiveBuyDecisionProvenanceTests.test_r5_execution_dispatch_hard_block_is_execution_provenance",
+    ),
 ]
 
-BASELINE_MODULES = ("test_shadow_comparison", "test_shadow_runtime")
+BASELINE_MODULES = ("test_shadow_comparison", "test_shadow_runtime",
+                    "test_r32e1_active_buy_provenance")
 
 
-def run(args: tuple[str, ...], timeout: int = 90):
+def run(args: tuple[str, ...], timeout: int = 600):
     return subprocess.run(args, cwd=BACKEND, capture_output=True, text=True,
                           encoding="utf-8", errors="replace", timeout=timeout)
+
+
+def restore(path: Path, data: bytes, attempts: int = 10) -> None:
+    """Put the original bytes back, retrying transient write failures.
+
+    A failed restore must never abort the remaining restores: leaving a mutated
+    harness in the worktree would silently corrupt the next run. Writing can
+    fail transiently on Windows while another process still holds the file.
+    """
+    for attempt in range(1, attempts + 1):
+        try:
+            path.write_bytes(data)
+            if path.read_bytes() == data:
+                return
+        except OSError:
+            pass
+        time.sleep(0.5 * attempt)
+    raise SystemExit(f"RESTORE FAILED for {path}: worktree is not clean")
+
+
+def restore_all(original: dict[Path, bytes]) -> list[str]:
+    failures = []
+    for path, data in original.items():
+        try:
+            restore(path, data)
+        except SystemExit as exc:  # keep restoring the others first
+            failures.append(str(exc))
+    return failures
 
 
 def main() -> int:
@@ -203,10 +345,13 @@ def main() -> int:
                     print(f"M-D{index} SURVIVED")
                     print((result.stdout + result.stderr)[-1200:])
             finally:
-                path.write_bytes(original[path])
+                restore(path, original[path])
     finally:
-        for path, data in original.items():
-            path.write_bytes(data)
+        failures = restore_all(original)
+    if failures:
+        for item in failures:
+            print(item)
+        return 1
     restored = all(hashlib.sha256(path.read_bytes()).hexdigest() == hashes[path]
                    for path in files)
     final = run((sys.executable, "-m", "unittest", *BASELINE_MODULES, "-q"))

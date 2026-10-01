@@ -308,6 +308,12 @@ MIGRATIONS = {
         # migration 与 init_db 快路径调用同一个函数。
         (25, "新增 Active/Challenger 比对报告追加证据表",
          paper_schema.ensure_shadow_comparison_reports),
+        # R32-E1：风险决策的精确订单关联。此前 paper_risk_decisions 没有 order
+        # 引用，"某张订单的风控决策"只能靠 (account, code, side) + 时间序猜最近
+        # 一条，属于被明令禁止的 provenance fabrication。只加列 + 索引，历史行
+        # 保持 NULL（诚实 legacy），绝不回填。
+        (26, "新增风险决策的精确 order 关联列（幂等，不回填）",
+         paper_schema.ensure_risk_decision_order_linkage),
     ],
     "adaptive_learning": [
         (1, "创建 schema_version 表", """

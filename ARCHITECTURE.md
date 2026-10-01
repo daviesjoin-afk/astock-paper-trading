@@ -3340,7 +3340,7 @@ timeline 不嵌入结论，未关联 canonical id 的 legacy result 保持 unava
 B3 不新增 ledger、migration、provider 或 authority，不改变 trading/tuning 权限，也不删除 roadmap
 能力。owner identity、PIT、verification、runtime terminal instant、stable attempt identity、历史市场证据、
 cycle membership 与 physical DB origin 等缺口继续 **OPEN / REQUIRED**，production fail closed。
-R27-B2C = **COMPLETE**；R27-B3 = **COMPLETE（PR #210 MERGED）**；R28-A = **COMPLETE**；R29-A = **COMPLETE（PR #212 MERGED）**；R29-FINAL = **COMPLETE**；R30 = **COMPLETE**；R31 = **COMPLETE（PR #215 MERGED）**；R32-A = **COMPLETE（PR #216 MERGED）**；R32-B = **COMPLETE（PR #217 MERGED）**；R32-C = **COMPLETE（PR #218 MERGED）**；R32-D = **IN REVIEW**；R32-E、R33 = **NOT STARTED**。
+R27-B2C = **COMPLETE**；R27-B3 = **COMPLETE（PR #210 MERGED）**；R28-A = **COMPLETE**；R29-A = **COMPLETE（PR #212 MERGED）**；R29-FINAL = **COMPLETE**；R30 = **COMPLETE**；R31 = **COMPLETE（PR #215 MERGED）**；R32-A = **COMPLETE（PR #216 MERGED）**；R32-B = **COMPLETE（PR #217 MERGED）**；R32-C = **COMPLETE（PR #218 MERGED）**；R32-D = **COMPLETE（PR #219 MERGED）**；R32-E1 = **IN REVIEW**；R32-E2～E4、R33 = **NOT STARTED**。
 
 ### R28-A：Strategy Experiment Identity & Result Contract（COMPLETE）
 
