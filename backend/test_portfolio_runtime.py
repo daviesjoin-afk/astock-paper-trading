@@ -1,0 +1,304 @@
+# -*- coding: utf-8 -*-
+"""R34-A contract regressions for exact portfolio runtime facts."""
+from __future__ import annotations
+
+import json
+import ast
+import os
+import pathlib
+import sqlite3
+import sys
+import tempfile
+import unittest
+from dataclasses import replace
+
+BACKEND = os.path.dirname(os.path.abspath(__file__))
+if BACKEND not in sys.path:
+    sys.path.insert(0, BACKEND)
+
+import paper_trading as PT
+import api_paper as API
+import portfolio_runtime as PR
+import portfolio_runtime_repository as PRRepo
+import portfolio_runtime_service as PRS
+
+CHECKSUM = "a" * 64
+
+
+def _dimensions():
+    values = []
+    for name in PR.DIMENSIONS:
+        if name == "capital":
+            values.append(PR.PortfolioDimension(
+                name, PR.AVAILABLE, {"capital": 100}, "OWNER_ISSUED", "ledger"))
+        else:
+            values.append(PR.PortfolioDimension(
+                name, PR.UNAVAILABLE, {}, "UNAVAILABLE",
+                blocking_reasons=(f"{name}_owner_unavailable",)))
+    return tuple(values)
+
+
+def _build(**overrides):
+    values = {"cycle_id": 7, "asof_day": "2026-09-30",
+              "decision_at": "2026-10-01T09:30:00+08:00",
+              "cycle_identity": {"cycle_id": 7, "cycle_key": "c-7"},
+              "strategy_pins": [{"account_id": "s1", "strategy_id": "s1",
+                                 "strategy_version": 2,
+                                 "strategy_checksum": CHECKSUM}],
+              "economic_owner_ids": ["s1"], "execution_participant_ids": ["s1"],
+              "risk_exit_participant_ids": ["s1"],
+              "source_identities": {"cycle": "paper_cycles:7"},
+              "market_evidence_identity": None, "dimensions": _dimensions()}
+    values.update(overrides)
+    return PR.build_portfolio_runtime_snapshot(**values)
+
+
+class PortfolioRuntimeContractTests(unittest.TestCase):
+    def test_pa1_same_input_has_same_fingerprint(self):
+        self.assertEqual(_build().snapshot_fingerprint, _build().snapshot_fingerprint)
+
+    def test_pa2_strategy_input_order_is_canonical(self):
+        pin2 = {"account_id": "s2", "strategy_id": "s2", "strategy_version": 1,
+                "strategy_checksum": "b" * 64}
+        first = _build(strategy_pins=[pin2, _build().strategy_pins[0]],
+                       economic_owner_ids=["s1", "s2"],
+                       execution_participant_ids=["s1", "s2"],
+                       risk_exit_participant_ids=["s1", "s2"])
+        second = _build(strategy_pins=[_build().strategy_pins[0], pin2],
+                        economic_owner_ids=["s1", "s2"],
+                        execution_participant_ids=["s1", "s2"],
+                        risk_exit_participant_ids=["s1", "s2"])
+        self.assertEqual(first.snapshot_id, second.snapshot_id)
+
+    def test_pa3_missing_explicit_cycle_fails(self):
+        with self.assertRaisesRegex(PR.PortfolioRuntimeError, "cycle_id_required"):
+            _build(cycle_id=None)
+        with self.assertRaisesRegex(PR.PortfolioRuntimeError, "cycle_id_required"):
+            _build(cycle_id=0)
+
+    def test_pa4_bad_exact_pin_checksum_fails(self):
+        with self.assertRaisesRegex(PR.PortfolioRuntimeError, "pin_identity_invalid"):
+            _build(strategy_pins=[{"account_id": "s1", "strategy_id": "s1",
+                                   "strategy_version": 2, "strategy_checksum": "bad"}])
+
+    def test_exact_strategy_pins_must_cover_each_economic_owner(self):
+        with self.assertRaisesRegex(PR.PortfolioRuntimeError, "must_cover_economic_owners"):
+            _build(strategy_pins=[], economic_owner_ids=["s1"])
+
+    def test_pa5_no_current_or_latest_lookup_exists_in_service(self):
+        source = pathlib.Path(PRS.__file__).read_text(encoding="utf-8").lower()
+        self.assertNotIn("latest", source)
+        self.assertNotIn("current_cycle", source)
+
+    def test_pa6_idle_cycle_has_empty_participants(self):
+        item = _build(strategy_pins=[], economic_owner_ids=[],
+                      execution_participant_ids=[], risk_exit_participant_ids=[])
+        self.assertEqual(item.economic_owner_ids, ())
+        self.assertEqual(item.execution_participant_ids, ())
+
+    def test_pa7_lifecycle_pause_does_not_remove_economic_owner(self):
+        item = _build(strategy_pins=[{"account_id": "s1", "strategy_id": "s1",
+                                     "strategy_version": 2, "strategy_checksum": CHECKSUM,
+                                     "lifecycle_state": "paused"}],
+                      execution_participant_ids=[], risk_exit_participant_ids=["s1"])
+        self.assertEqual(item.economic_owner_ids, ("s1",))
+        self.assertEqual(item.execution_participant_ids, ())
+        self.assertEqual(item.risk_exit_participant_ids, ("s1",))
+
+    def test_pa8_risk_exit_scope_is_independent_and_can_retain_open_lot_owner(self):
+        item = _build(execution_participant_ids=[], risk_exit_participant_ids=["legacy"])
+        self.assertEqual(item.risk_exit_participant_ids, ("legacy",))
+
+    def test_pa9_pending_capacity_failure_is_unavailable_not_zero(self):
+        dimension = PR.PortfolioDimension("capacity", PR.UNAVAILABLE, {}, "UNAVAILABLE",
+                                          blocking_reasons=("pending_read_failed",))
+        self.assertEqual(dimension.status, PR.UNAVAILABLE)
+        self.assertNotIn("pending_amount", dimension.facts)
+
+    def test_pa10_cost_basis_does_not_become_market_value(self):
+        item = _build()
+        facts = item.projection()["dimensions"]
+        self.assertNotIn("market_value", json.dumps(facts))
+
+    def test_pa11_correlation_without_owner_is_unavailable_not_zero(self):
+        item = next(d for d in _build().dimensions if d.name == "correlation")
+        self.assertEqual(item.status, PR.UNAVAILABLE)
+        self.assertNotIn("correlation", item.facts)
+
+    def test_pa12_no_style_owner_does_not_guess_classification(self):
+        item = next(d for d in _build().dimensions if d.name == "concentration")
+        self.assertEqual(item.status, PR.UNAVAILABLE)
+        self.assertEqual(item.facts, {})
+
+    def test_pa13_signal_conflict_requires_exact_evidence(self):
+        item = next(d for d in _build().dimensions if d.name == "signal_conflicts")
+        self.assertEqual(item.status, PR.UNAVAILABLE)
+
+    def test_pa14_zero_activity_is_not_a_zero_risk_or_correlation_fact(self):
+        item = _build()
+        for name in ("risk_consumption", "correlation"):
+            fact = next(d for d in item.dimensions if d.name == name)
+            self.assertEqual(fact.status, PR.UNAVAILABLE)
+
+    def test_pa15_persisted_snapshot_does_not_heal(self):
+        conn = sqlite3.connect(":memory:")
+        conn.execute("CREATE TABLE portfolio_runtime_snapshots(snapshot_id TEXT PRIMARY KEY,"
+                     "snapshot_fingerprint TEXT NOT NULL,evidence_json TEXT NOT NULL,"
+                     "created_at TEXT NOT NULL)")
+        snapshot = _build()
+        PRRepo.append_snapshot(conn, snapshot, created_at="fixed")
+        changed = _build(dimensions=tuple(
+            PR.PortfolioDimension(d.name, PR.PARTIAL, {"later": True}, "CAPTURED_INPUT",
+                                  blocking_reasons=("later_evidence",))
+            if d.name == "correlation" else d for d in _dimensions()))
+        PRRepo.append_snapshot(conn, changed, created_at="later")
+        self.assertEqual(PRRepo.get_snapshot(conn, snapshot.snapshot_id).projection(),
+                         snapshot.projection())
+        self.assertNotEqual(snapshot.snapshot_id, changed.snapshot_id)
+        conn.close()
+
+    def test_pa16_capture_is_read_only_for_formal_ledger(self):
+        self._with_idle_capture()
+
+    def test_pa17_capture_does_not_write_lifecycle(self):
+        self._with_idle_capture()
+
+    def _with_idle_capture(self):
+        temp = tempfile.TemporaryDirectory(prefix="r34a-")
+        old_db = PT.DB_PATH
+        PT.DB_PATH = os.path.join(temp.name, "paper.sqlite3")
+        try:
+            PT.init_db()
+            PT.start_new_cycle(capital=10_000, include_dashboard=False)
+            conn = sqlite3.connect(PT.DB_PATH)
+            conn.row_factory = sqlite3.Row
+            cycle_id = int(conn.execute("SELECT MAX(id) FROM paper_cycles").fetchone()[0])
+            # Use an exact idle cycle to avoid manufacturing strategy ownership.
+            conn.execute("UPDATE paper_cycles SET enabled_strategies='[]' WHERE id=?", (cycle_id,))
+            conn.commit()
+            before = {table: conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+                      for table in ("paper_accounts", "paper_cycles", "paper_orders",
+                                    "paper_fills", "paper_position_lots",
+                                    "strategy_lifecycle_events")}
+            conn.close()
+            result = PRS.capture_portfolio_runtime_snapshot(
+                cycle_id=cycle_id, asof_day="2026-09-30",
+                decision_at="2026-10-01T09:30:00+08:00")
+            retry = PRS.capture_portfolio_runtime_snapshot(
+                cycle_id=cycle_id, asof_day="2026-09-30",
+                decision_at="2026-10-01T09:30:00+08:00")
+            self.assertEqual(retry, result)
+            self.assertEqual(PRS.get_portfolio_runtime_snapshot(result["snapshot_id"]), result)
+            dimensions = {item["name"]: item for item in result["dimensions"]}
+            self.assertEqual(dimensions["correlation"]["status"], PR.UNAVAILABLE)
+            self.assertIsNone(dimensions["strategy_exposure"]["facts"]["market_value_by_account"])
+            check = sqlite3.connect(PT.DB_PATH)
+            after = {table: check.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+                     for table in before}
+            self.assertEqual(before, after)
+            self.assertEqual(check.execute(
+                "SELECT COUNT(*) FROM portfolio_runtime_snapshots").fetchone()[0], 1)
+            self.assertEqual(result["cycle_id"], cycle_id)
+            check.close()
+        finally:
+            PT.DB_PATH = old_db
+            temp.cleanup()
+
+    def test_pa18_repository_exposes_only_exact_getter(self):
+        self.assertEqual(set(PRRepo.__all__),
+                         {"PortfolioRuntimeRepositoryError", "append_snapshot", "get_snapshot"})
+
+    def test_pa19_same_id_different_content_conflicts(self):
+        conn = sqlite3.connect(":memory:")
+        conn.execute("CREATE TABLE portfolio_runtime_snapshots(snapshot_id TEXT PRIMARY KEY,"
+                     "snapshot_fingerprint TEXT NOT NULL,evidence_json TEXT NOT NULL,"
+                     "created_at TEXT NOT NULL)")
+        original = _build()
+        PRRepo.append_snapshot(conn, original)
+        conn.execute("UPDATE portfolio_runtime_snapshots SET evidence_json='{}' WHERE snapshot_id=?",
+                     (original.snapshot_id,))
+        with self.assertRaisesRegex(PRRepo.PortfolioRuntimeRepositoryError,
+                                    "idempotency_conflict"):
+            PRRepo.append_snapshot(conn, original)
+        conn.close()
+
+    def test_pa20_snapshot_contains_no_rank_or_score(self):
+        projection = json.dumps(_build().projection()).lower()
+        for forbidden in ("portfolio_score", "health_score", "winner", "rank"):
+            self.assertNotIn(forbidden, projection)
+
+    def test_dimensions_must_be_complete_and_unique(self):
+        with self.assertRaisesRegex(PR.PortfolioRuntimeError, "dimensions_must_be_complete"):
+            _build(dimensions=_dimensions()[:-1])
+
+    def test_execution_participants_must_be_economic_owners(self):
+        with self.assertRaisesRegex(PR.PortfolioRuntimeError, "scope_inconsistent"):
+            _build(execution_participant_ids=["alien"])
+
+    def test_unavailable_dimension_cannot_claim_owner_provenance(self):
+        with self.assertRaisesRegex(PR.PortfolioRuntimeError, "provenance_mismatch"):
+            PR.PortfolioDimension("capacity", PR.UNAVAILABLE, {}, "OWNER_ISSUED",
+                                  blocking_reasons=("failed",))
+
+    def test_not_applicable_dimension_cannot_carry_facts(self):
+        with self.assertRaisesRegex(PR.PortfolioRuntimeError, "must_be_empty"):
+            PR.PortfolioDimension("capacity", PR.NOT_APPLICABLE, {"pending": 0},
+                                  "OWNER_ISSUED", blocking_reasons=("not_applicable",))
+
+    def test_unavailable_dimension_requires_reason(self):
+        with self.assertRaisesRegex(PR.PortfolioRuntimeError, "requires_reason"):
+            PR.PortfolioDimension("capacity", PR.UNAVAILABLE, {}, "UNAVAILABLE")
+
+    def test_fingerprint_verification_binds_cycle_identity(self):
+        self.assertFalse(PR.verify_snapshot_fingerprint(replace(_build(), cycle_id=8)))
+
+    def test_exact_getter_reads_named_snapshot_not_newer_snapshot(self):
+        conn = sqlite3.connect(":memory:")
+        conn.execute("CREATE TABLE portfolio_runtime_snapshots(snapshot_id TEXT PRIMARY KEY,"
+                     "snapshot_fingerprint TEXT NOT NULL,evidence_json TEXT NOT NULL,"
+                     "created_at TEXT NOT NULL)")
+        first = _build()
+        second = _build(asof_day="2026-10-01")
+        PRRepo.append_snapshot(conn, first, created_at="1")
+        PRRepo.append_snapshot(conn, second, created_at="2")
+        self.assertEqual(PRRepo.get_snapshot(conn, first.snapshot_id).snapshot_id,
+                         first.snapshot_id)
+        conn.close()
+
+    def test_corrupt_stored_evidence_is_rejected(self):
+        conn = sqlite3.connect(":memory:")
+        conn.execute("CREATE TABLE portfolio_runtime_snapshots(snapshot_id TEXT PRIMARY KEY,"
+                     "snapshot_fingerprint TEXT NOT NULL,evidence_json TEXT NOT NULL,"
+                     "created_at TEXT NOT NULL)")
+        snapshot = _build()
+        PRRepo.append_snapshot(conn, snapshot)
+        conn.execute("UPDATE portfolio_runtime_snapshots SET evidence_json='{}' WHERE snapshot_id=?",
+                     (snapshot.snapshot_id,))
+        with self.assertRaisesRegex(PRRepo.PortfolioRuntimeRepositoryError,
+                                    "evidence_invalid"):
+            PRRepo.get_snapshot(conn, snapshot.snapshot_id)
+        conn.close()
+
+    def test_pure_builder_has_no_database_provider_or_clock_imports(self):
+        tree = ast.parse(pathlib.Path(PR.__file__).read_text(encoding="utf-8"))
+        imports = {alias.name.split(".")[0] for node in ast.walk(tree)
+                   if isinstance(node, (ast.Import, ast.ImportFrom))
+                   for alias in node.names}
+        self.assertFalse(imports & {"sqlite3", "fastapi", "requests", "urllib", "time",
+                                    "socket", "paper_trading", "market_data_service"})
+
+    def test_api_exposes_only_explicit_snapshot_capture_and_get(self):
+        from fastapi import FastAPI
+        app = FastAPI()
+        app.include_router(API.portfolio_runtime_router)
+        paths = set(app.openapi()["paths"])
+        self.assertEqual(paths, {"/api/portfolio/runtime/snapshots",
+                                 "/api/portfolio/runtime/snapshots/{snapshot_id}"})
+
+    def test_created_at_is_not_fingerprint_material(self):
+        snapshot = _build()
+        self.assertTrue(PR.verify_snapshot_fingerprint(snapshot))
+
+
+if __name__ == "__main__":
+    unittest.main()

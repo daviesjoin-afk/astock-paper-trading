@@ -86,7 +86,7 @@ research → validation_failed
 
 ### R32 阶段状态与可比较运行上下文
 
-R31 与 R32 **COMPLETE**；R33-A/B **COMPLETE**；R33-C **IN REVIEW**；R33 **NOT COMPLETE**。Shadow 使用与 Active capture 对齐的 market、quote、tradability、factor fingerprints 和显式 decision instant，同时保留各自 exact strategy identity 与策略专属状态；它只追加写 ShadowRun evidence，不写正式账本。R32-D 只从一份 exact Active evidence、一条 exact ShadowRun 和一份显式 spec 生成不可变比对报告（共享环境七维相等是硬前提，缺失即 UNAVAILABLE/PARTIAL，不查 latest/current），报告只陈述事实与 delta，不产生 winner、综合分或晋级结论。完整契约见 [`R32_COMPARABLE_RUNTIME_CONTEXT.md`](R32_COMPARABLE_RUNTIME_CONTEXT.md)、[`R32B_ACTIVE_COMPARABLE_EVIDENCE.md`](R32B_ACTIVE_COMPARABLE_EVIDENCE.md)、[`R32C_ISOLATED_SHADOW_RUNTIME.md`](R32C_ISOLATED_SHADOW_RUNTIME.md) 和 [`R32D_CHALLENGER_COMPARISON_EVIDENCE.md`](R32D_CHALLENGER_COMPARISON_EVIDENCE.md)。
+R31、R32、R33 **COMPLETE**；R34-A **IN REVIEW**；R34-B/C **NOT STARTED**；R34 **NOT COMPLETE**。Shadow 使用与 Active capture 对齐的 market、quote、tradability、factor fingerprints 和显式 decision instant，同时保留各自 exact strategy identity 与策略专属状态；它只追加写 ShadowRun evidence，不写正式账本。R32-D 只从一份 exact Active evidence、一条 exact ShadowRun 和一份显式 spec 生成不可变比对报告（共享环境七维相等是硬前提，缺失即 UNAVAILABLE/PARTIAL，不查 latest/current），报告只陈述事实与 delta，不产生 winner、综合分或晋级结论。完整契约见 [`R32_COMPARABLE_RUNTIME_CONTEXT.md`](R32_COMPARABLE_RUNTIME_CONTEXT.md)、[`R32B_ACTIVE_COMPARABLE_EVIDENCE.md`](R32B_ACTIVE_COMPARABLE_EVIDENCE.md)、[`R32C_ISOLATED_SHADOW_RUNTIME.md`](R32C_ISOLATED_SHADOW_RUNTIME.md) 和 [`R32D_CHALLENGER_COMPARISON_EVIDENCE.md`](R32D_CHALLENGER_COMPARISON_EVIDENCE.md)。
 
 就绪后，所有消费者读同一份不可变契约 `StrategyRuntimeContext`（`strategy_runtime.StrategyRuntimeContext`）：
 
@@ -309,7 +309,7 @@ StrategyHealthSnapshot → StrategyRetirementPolicy → StrategyRetirementDecisi
 Proposal 与 approval 只追加，不维护 current/latest retirement 状态。执行时重新读取并验证
 decision、snapshot 指纹、immutable version/checksum、当前 lifecycle state 与合法迁移；任何漂移
 都 fail closed。没有自动审批、调度器或后台退休路径；workflow 不写 cash、positions、orders、fills。
-R33-C 状态为 **IN REVIEW**，R33 仍 **NOT COMPLETE**。
+R33-C 已合并，R33 为 **COMPLETE**。R34-A 的 portfolio runtime 是只读 exact facts 快照：经济所有权、执行参与者、risk-exit 参与者与 allocation 分开；没有 exact market/classification/return-series owner 的维度保持 unavailable。R34-A 不 rank、不分配、不写交易或 lifecycle，R34-B/C 尚未开始。
 
 ### Workspace identity 契约
 

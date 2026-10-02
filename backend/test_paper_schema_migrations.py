@@ -51,6 +51,21 @@ class PaperSchemaMigrationTests(unittest.TestCase):
         self.assertIsNotNone(self.conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='paper_ignition_shadow'").fetchone())
         self.assertIsNotNone(self.conn.execute("SELECT name FROM sqlite_master WHERE type='index' AND name='idx_paper_ignition_shadow_unique'").fetchone())
 
+    def test_portfolio_runtime_snapshot_table_is_additive_and_append_only(self):
+        first = migrations.ensure_portfolio_runtime_snapshots(self.conn)
+        second = migrations.ensure_portfolio_runtime_snapshots(self.conn)
+        self.assertEqual(first["portfolio_runtime_snapshots"], "created")
+        self.assertEqual(second["portfolio_runtime_snapshots"], "ok")
+        self.conn.execute(
+            "INSERT INTO portfolio_runtime_snapshots VALUES(?,?,?,?)",
+            ("a" * 64, "a" * 64, "{}", "fixed"))
+        for statement in (
+            "UPDATE portfolio_runtime_snapshots SET evidence_json='{}'",
+            "DELETE FROM portfolio_runtime_snapshots",
+        ):
+            with self.assertRaises(sqlite3.IntegrityError):
+                self.conn.execute(statement)
+
 
 if __name__ == "__main__":
     unittest.main()

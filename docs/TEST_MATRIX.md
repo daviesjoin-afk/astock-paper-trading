@@ -511,7 +511,7 @@
 | 纯函数在 provider/AI/时钟 poison 下不变 | socket / time / datetime.now 全部 poison 后决策指纹不变 | P15 | — |
 | 最小 API surface | `POST …/retirement/evaluate` + `GET …/retirement/decisions/{id}`；无 status / latest 端点；未知证据 404、身份冲突 400 | RetirementApiSurfaceTests | M-R4 |
 
-## R33-C Strategy Retirement Controlled Workflow（IN REVIEW）
+## R33-C Strategy Retirement Controlled Workflow（COMPLETE，PR #224 MERGED）
 
 | 契约 | 断言 | 测试 | mutation |
 | --- | --- | --- | --- |
@@ -523,5 +523,20 @@
 | 正式账本隔离 | execution 只产生 lifecycle event，不改 cash、positions、orders、fills | C13 | — |
 | API 边界 | 创建、approve/reject、execute、exact proposal GET；无 current status 或 latest proposal endpoint | `RetirementWorkflowApiTests` | M-C5 |
 
-阶段状态：R31 **COMPLETE**；R32 **COMPLETE**；R33-A **COMPLETE**；R33-B **COMPLETE**；R33-C **IN REVIEW**；R33 **NOT COMPLETE**。本 PR **MERGE = NOT MERGED，DEPLOY = NOT DEPLOYED**。
+阶段状态：R31/R32/R33-A/B/C **COMPLETE**；R33 **COMPLETE**。
+
+## R34-A Exact Multi-Strategy Portfolio Runtime Facts（IN REVIEW）
+
+| 契约 | 断言 | 测试 | mutation |
+| --- | --- | --- | --- |
+| Exact deterministic snapshot | 显式 cycle/as-of/decision_at；精确 pin；策略输入 canonical 排序；ID 等于 fingerprint；created_at 不参与指纹 | `test_portfolio_runtime.py`（PA1–PA4、fingerprint tests） | M-P1 / M-P2 / M-P8 |
+| 三种参与范围分开 | cycle economic owners、lifecycle execution participants、as-of remaining-lot risk-exit participants 来自既有 owner；idle 保持空 | PA6–PA8；cycle ownership / risk-exit owner suites | M-P4 |
+| 缺失是缺失 | 市值不从成本推断；无 classification / exact return series / signal proof 时维度不可用；未知风险、容量不变成 0 | PA9–PA14、PA20；bounded portfolio read-model suite | M-P5 / M-P6 / M-P7 / M-P10 |
+| 持久化不可变且精确 | append-only、幂等；同 ID 异内容冲突；坏证据拒绝；按命名 snapshot ID 读取，历史不愈合 | PA15、PA18–PA19、exact getter tests | M-P9 |
+| capture 隔离正式账本 | capture 仅追加本表，不写 cycles/accounts/orders/fills/lots/lifecycle | PA16–PA17；risk-exit owner suite | — |
+| 最小 API 与架构边界 | 仅显式 capture 与 snapshot ID GET；无 latest/current；纯 builder 不接 DB/provider/clock | `api_paper.py` routes；PA5 | — |
+
+Mutation matrix `work/r34a_portfolio_runtime_mutation_check.py`: M-P1…M-P10 **10/10 DETECTED**；survived/fake/timeout = 0；restore SHA256 PASS；恢复后基线 GREEN。
+
+阶段状态：R31/R32/R33 **COMPLETE**；R34-A **IN REVIEW**；R34-B/C **NOT STARTED**；R34 **NOT COMPLETE**；MERGE **NOT MERGED**；DEPLOY **NOT DEPLOYED**。
 

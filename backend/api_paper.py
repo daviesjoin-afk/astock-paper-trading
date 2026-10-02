@@ -7,11 +7,50 @@ import time
 
 from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import JSONResponse
+from pydantic import BaseModel, ConfigDict
 
 import paper_trading as P
+import portfolio_runtime as PR
+import portfolio_runtime_repository as PRRepo
+import portfolio_runtime_service as PRS
 
 
 router = APIRouter(prefix="/api/paper", tags=["paper-trading"])
+portfolio_runtime_router = APIRouter(prefix="/api/portfolio/runtime",
+                                     tags=["portfolio-runtime-facts"])
+
+
+class PortfolioRuntimeCaptureRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    cycle_id: int
+    asof_day: str
+    decision_at: str
+    market_evidence_identity: str | None = None
+
+
+@portfolio_runtime_router.post("/snapshots", status_code=201)
+def capture_portfolio_runtime_snapshot(payload: PortfolioRuntimeCaptureRequest):
+    """Capture facts for the explicitly named cycle and as-of identity."""
+    try:
+        return PRS.capture_portfolio_runtime_snapshot(
+            cycle_id=payload.cycle_id, asof_day=payload.asof_day,
+            decision_at=payload.decision_at,
+            market_evidence_identity=payload.market_evidence_identity)
+    except (PR.PortfolioRuntimeError, PRRepo.PortfolioRuntimeRepositoryError,
+            ValueError) as exc:
+        status = 404 if str(exc) == "explicit_cycle_not_found" else 400
+        raise HTTPException(status_code=status, detail=str(exc)) from exc
+
+
+@portfolio_runtime_router.get("/snapshots/{snapshot_id}")
+def get_portfolio_runtime_snapshot(snapshot_id: str):
+    """Read only the exact immutable snapshot named by its fingerprint ID."""
+    try:
+        return PRS.get_portfolio_runtime_snapshot(snapshot_id)
+    except (PR.PortfolioRuntimeError, PRRepo.PortfolioRuntimeRepositoryError,
+            ValueError) as exc:
+        status = 404 if str(exc) == "portfolio_snapshot_not_found" else 400
+        raise HTTPException(status_code=status, detail=str(exc)) from exc
 
 # ─── 内存缓存 ───
 _cache_lock = threading.RLock()

@@ -31,7 +31,8 @@ import metrics as MET
 import operator_auth
 from fastapi.exception_handlers import request_validation_exception_handler
 from fastapi.exceptions import RequestValidationError
-from api_paper import risk_refresh_status, router as paper_router
+from api_paper import (portfolio_runtime_router, risk_refresh_status,
+                       router as paper_router)
 from api_adaptive import router as adaptive_router
 from api_settings import router as settings_router
 import api_strategies as strategies_api
@@ -532,6 +533,7 @@ app = FastAPI(
 app.add_middleware(GZipMiddleware, minimum_size=256, compresslevel=9)
 app.mount("/assets", StaticFiles(directory=os.path.join(FRONTEND, "assets")), name="assets")
 app.include_router(paper_router)
+app.include_router(portfolio_runtime_router)
 app.include_router(adaptive_router)
 app.include_router(settings_router)
 app.include_router(strategies_router)
