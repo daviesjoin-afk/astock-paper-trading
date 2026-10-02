@@ -91,6 +91,7 @@ __all__ = [
     "PositionCostSummary",
     "PortfolioFactProjection",
     "accounting_fact_projections",
+    "account_attached_by_asof",
 ]
 
 PORTFOLIO_READ_MODEL_VERSION = "portfolio-read-model-v1"
@@ -985,6 +986,12 @@ def _account_attached_by(conn, context: PortfolioReadContext, account_id) -> boo
     # No attachment provenance row: fall back only to account-scoped bounded
     # activity, never to the cycle's own creation evidence.
     return _cycle_has_bounded_activity(conn, context, account_id=account_id)
+
+
+def account_attached_by_asof(conn, *, cycle_id: int, asof_day, account_id) -> bool:
+    """Public read-only adapter for the canonical historical attachment proof."""
+    context = PortfolioReadContext(cycle_id=cycle_id, asof_day=asof_day)
+    return _account_attached_by(conn, context, account_id)
 
 
 def _cycle_initial(conn, context: PortfolioReadContext, account_id: str | None = None):

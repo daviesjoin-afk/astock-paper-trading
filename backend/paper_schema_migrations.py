@@ -1321,6 +1321,29 @@ def ensure_strategy_health_snapshots(conn):
     return changes
 
 
+def ensure_portfolio_runtime_snapshots(conn):
+    """v30: append-only exact-cycle portfolio runtime fact snapshots."""
+    changes = {}
+    if not table_columns(conn, "portfolio_runtime_snapshots"):
+        conn.execute("""CREATE TABLE portfolio_runtime_snapshots(
+            snapshot_id TEXT PRIMARY KEY,
+            snapshot_fingerprint TEXT NOT NULL,
+            evidence_json TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            CHECK(snapshot_id = snapshot_fingerprint)
+        )""")
+        changes["portfolio_runtime_snapshots"] = "created"
+    else:
+        changes["portfolio_runtime_snapshots"] = "ok"
+    conn.execute("""CREATE TRIGGER IF NOT EXISTS portfolio_runtime_snapshots_no_update
+        BEFORE UPDATE ON portfolio_runtime_snapshots
+        BEGIN SELECT RAISE(ABORT,'portfolio runtime snapshots are append-only'); END""")
+    conn.execute("""CREATE TRIGGER IF NOT EXISTS portfolio_runtime_snapshots_no_delete
+        BEFORE DELETE ON portfolio_runtime_snapshots
+        BEGIN SELECT RAISE(ABORT,'portfolio runtime snapshots are append-only'); END""")
+    return changes
+
+
 # ─── 策略退休决策（v28 / R33-B） ─────────────────────────────────────────────
 #
 # 不变量::

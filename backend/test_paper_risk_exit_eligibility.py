@@ -144,6 +144,13 @@ class RiskExitEligibilityContractTests(unittest.TestCase):
         expected = {"acc_exec_only", "acc_overlap", "acc_lot_only"}
         self.assertEqual(res, expected)
 
+    def test_exact_asof_owner_ids_replace_current_remaining_qty_read(self):
+        self._add_lot("current_only", 10.0)
+        result = PRE.risk_exit_account_ids(
+            self.conn, base_account_ids=["execution"], cycle_id=12,
+            asof_account_ids=["paused_with_asof_lot"])
+        self.assertEqual(result, {"execution", "paused_with_asof_lot"})
+
     # Row reader compatibility (bare sqlite connection without row_factory)
     def test_bare_sqlite_connection_compatibility(self):
         bare_conn = sqlite3.connect(":memory:")

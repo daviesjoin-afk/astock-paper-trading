@@ -3340,7 +3340,7 @@ timeline 不嵌入结论，未关联 canonical id 的 legacy result 保持 unava
 B3 不新增 ledger、migration、provider 或 authority，不改变 trading/tuning 权限，也不删除 roadmap
 能力。owner identity、PIT、verification、runtime terminal instant、stable attempt identity、历史市场证据、
 cycle membership 与 physical DB origin 等缺口继续 **OPEN / REQUIRED**，production fail closed。
-R27-B2C = **COMPLETE**；R27-B3 = **COMPLETE（PR #210 MERGED）**；R28-A = **COMPLETE**；R29-A = **COMPLETE（PR #212 MERGED）**；R29-FINAL = **COMPLETE**；R30 = **COMPLETE**；R31 = **COMPLETE（PR #215 MERGED）**；R32 = **COMPLETE**；R33-A = **COMPLETE（PR #222 MERGED）**；R33-B = **COMPLETE（PR #223 MERGED）**；R33-C = **IN REVIEW（未合并）**；R33 = **NOT COMPLETE**。
+R27-B2C = **COMPLETE**；R27-B3 = **COMPLETE（PR #210 MERGED）**；R28-A = **COMPLETE**；R29-A = **COMPLETE（PR #212 MERGED）**；R29-FINAL = **COMPLETE**；R30 = **COMPLETE**；R31 = **COMPLETE（PR #215 MERGED）**；R32 = **COMPLETE**；R33-A = **COMPLETE（PR #222 MERGED）**；R33-B = **COMPLETE（PR #223 MERGED）**；R33-C = **COMPLETE（PR #224 MERGED）**；R33 = **COMPLETE**；R34-A = **IN REVIEW**；R34-B/C = **NOT STARTED**；R34 = **NOT COMPLETE**。
 
 ### R28-A：Strategy Experiment Identity & Result Contract（COMPLETE）
 
@@ -3391,7 +3391,7 @@ R30 从 exact completed R29 run 与完整 `ExperimentSpec` 建立不可变计划
 缺少证据就标记 unavailable。Synthetic view 留在内存，不回写任何历史 owner。报告 ledger append-only，API 离线，
 Research Workspace 只渲染报告事实，unknown 保持 null；R30 不产生分数、晋级或生命周期状态。
 R30 exit matrix、全量验证和 exact-head CI 均已通过。完整 contract 与 API/UI 边界见
-[`docs/R30_ROBUSTNESS_VALIDATION.md`](docs/R30_ROBUSTNESS_VALIDATION.md), [`docs/R32_COMPARABLE_RUNTIME_CONTEXT.md`](docs/R32_COMPARABLE_RUNTIME_CONTEXT.md), [`docs/R32B_ACTIVE_COMPARABLE_EVIDENCE.md`](docs/R32B_ACTIVE_COMPARABLE_EVIDENCE.md), [`docs/R32C_ISOLATED_SHADOW_RUNTIME.md`](docs/R32C_ISOLATED_SHADOW_RUNTIME.md), and [`docs/R32D_CHALLENGER_COMPARISON_EVIDENCE.md`](docs/R32D_CHALLENGER_COMPARISON_EVIDENCE.md). R32-A establishes deterministic market and runtime identity plus explicit state injection; R32-B closes Active evidence provenance; R32-C runs an exact Shadow version only over frozen Active evidence and stores append-only isolated evidence; R32-D builds an immutable Active/Challenger comparison report from one exact Active evidence envelope, one exact ShadowRun and one explicit spec, appending only its own report table. **R32 is COMPLETE.** R33-A/B are COMPLETE; R33-C is IN REVIEW and R33 is NOT COMPLETE.
+[`docs/R30_ROBUSTNESS_VALIDATION.md`](docs/R30_ROBUSTNESS_VALIDATION.md), [`docs/R32_COMPARABLE_RUNTIME_CONTEXT.md`](docs/R32_COMPARABLE_RUNTIME_CONTEXT.md), [`docs/R32B_ACTIVE_COMPARABLE_EVIDENCE.md`](docs/R32B_ACTIVE_COMPARABLE_EVIDENCE.md), [`docs/R32C_ISOLATED_SHADOW_RUNTIME.md`](docs/R32C_ISOLATED_SHADOW_RUNTIME.md), and [`docs/R32D_CHALLENGER_COMPARISON_EVIDENCE.md`](docs/R32D_CHALLENGER_COMPARISON_EVIDENCE.md). R32-A establishes deterministic market and runtime identity plus explicit state injection; R32-B closes Active evidence provenance; R32-C runs an exact Shadow version only over frozen Active evidence and stores append-only isolated evidence; R32-D builds an immutable Active/Challenger comparison report from one exact Active evidence envelope, one exact ShadowRun and one explicit spec, appending only its own report table. **R32 and R33 are COMPLETE.** R34-A is IN REVIEW; R34-B/C are NOT STARTED; R34 is NOT COMPLETE.
 
 ### 仅作 review signal（不进入 CI gate）
 
@@ -3524,6 +3524,27 @@ v1 只实现两条规则：证据不完整 → `INSUFFICIENT_EVIDENCE`（PARTIAL
 （`DEGRADE_CANDIDATE` / `RETIRE_CANDIDATE` / `ARCHIVE_READY`）属保留词表：仓库尚无可 owner 化的
 退休阈值，也没有 exact-version 历史绩效 owner，因此 v1 对真实快照**只会**给出
 `INSUFFICIENT_EVIDENCE` —— 这是刻意的安全结果。
+
+## R34-A authority graph（exact portfolio runtime facts）
+
+```text
+explicit cycle_id + asof_day + decision_at
+        ↓
+paper_cycle_ownership.exact_cycle_owner_snapshot
+strategy_registry exact cycle pins + strategy_lifecycle exact version states
+paper_portfolio_read_model bounded as-of accounting/lots
+        ↓
+portfolio_runtime.build_portfolio_runtime_snapshot（纯、确定性）
+        ↓
+portfolio_runtime_repository（append-only; exact snapshot ID read）
+        ↓
+POST /api/portfolio/runtime/snapshots
+GET  /api/portfolio/runtime/snapshots/{snapshot_id}
+```
+
+R34-A 只记录 cycle economic owners、execution participants、as-of risk-exit owners、capital 与 strategy/symbol cost basis 等事实。缺 exact market valuation、classification、turnover window、risk-consumption history、signal intent、pending-capacity history 或 strategy-version return-series owner 时，维度保持 PARTIAL/UNAVAILABLE。成本不是市值；缺失不是零；R33 health 不参与打分。
+
+Cycle owns capital. Lifecycle controls execution permission. Existing exposure still owns risk-exit rights. Snapshot capture 只写自己的 append-only 表，不写正式账本、lifecycle、allocation 或 order；没有 latest/current getter。R34-B allocator policy 与 R34-C production wiring 均保留为后续阶段，本 PR 停在 R34-A review。
 
 ## 架构演进记录（历史批次：模块化与边界固化）
 

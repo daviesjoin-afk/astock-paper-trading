@@ -329,6 +329,9 @@ MIGRATIONS = {
         # 不创建 current/latest retirement 状态，也不触发自动 transition。
         (29, "新增策略退休 proposal 与 approval 追加证据表（幂等，不回填）",
          paper_schema.ensure_strategy_retirement_workflow),
+        # R34-A：精确 cycle/as-of 组合运行事实的 append-only 快照 owner。
+        (30, "新增组合运行事实追加快照表（幂等，不回填）",
+         paper_schema.ensure_portfolio_runtime_snapshots),
     ],
     "adaptive_learning": [
         (1, "创建 schema_version 表", """

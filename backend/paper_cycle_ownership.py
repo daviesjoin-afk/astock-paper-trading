@@ -212,6 +212,58 @@ def cycle_ledger_ids(conn, cycle_id, *, builtin_scope):
     )
 
 
+def exact_cycle_owner_snapshot(conn, cycle_id, *, asof_day, attachment_prover,
+                               builtin_scope):
+    """Read one explicitly named cycle and its economic owners fail-closed.
+
+    This strict capture entry has no latest-cycle or legacy fallback. The normal
+    compatibility resolvers below intentionally retain their existing behavior.
+    """
+    try:
+        exact_id = int(cycle_id)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("explicit_cycle_id_required") from exc
+    if exact_id <= 0:
+        raise ValueError("explicit_cycle_id_required")
+    try:
+        row = _row(conn,
+                   "SELECT id,cycle_key,status,enabled_strategies,capital"
+                   " FROM paper_cycles WHERE id=?", (exact_id,))
+    except sqlite3.Error as exc:
+        raise ValueError("exact_cycle_identity_unavailable") from exc
+    if row is None:
+        raise ValueError("explicit_cycle_not_found")
+    enabled = _loads(row["enabled_strategies"], None)
+    if (not isinstance(enabled, list)
+            or any(not isinstance(value, str) or not value for value in enabled)
+            or len(set(enabled)) != len(enabled)):
+        raise ValueError("cycle_economic_owners_unavailable")
+    known_ids = set(PAS.ACCOUNT_SPECS) | set(USP.user_known_ids(conn))
+    if any(value not in known_ids for value in enabled):
+        raise ValueError("cycle_economic_owners_unavailable")
+    try:
+        bound = {str(item[0]) for item in conn.execute(
+            "SELECT id FROM paper_accounts WHERE cycle_id=?", (exact_id,)
+        ).fetchall() if item[0]}
+    except sqlite3.Error as exc:
+        raise ValueError("cycle_economic_owners_unavailable") from exc
+    # Reuse the accounting owner's as-of attachment proof (effective_date plus
+    # its bounded-activity fallback); current cycle binding alone is not history.
+    if enabled and set(enabled) != bound:
+        raise ValueError("cycle_economic_owners_unavailable")
+    if any(not attachment_prover(
+            conn, cycle_id=exact_id, asof_day=asof_day, account_id=account_id)
+           for account_id in enabled):
+        raise ValueError("cycle_economic_owners_unavailable")
+    owners = tuple(sorted(enabled))
+    return {"cycle_identity": {"cycle_id": int(row["id"]),
+                               "cycle_key": row["cycle_key"],
+                               "observed_status": row["status"],
+                               "declared_strategy_ids": sorted(enabled)},
+            "economic_owner_ids": tuple(str(value) for value in owners),
+            "cycle_capital": row["capital"]}
+
+
 def cycle_participant_resolution(conn, cycle_id=None, *, builtin_scope):
     """解析当前周期权威参与者，并给出判定来源供审计。
 

@@ -36,6 +36,8 @@ def risk_exit_account_ids(
     conn: Any,
     base_account_ids: Iterable[Any] | None = None,
     *,
+    cycle_id: int | None = None,
+    asof_account_ids: Iterable[Any] | None = None,
     rows_fn: Callable[[Any, str, tuple[Any, ...]], list[Any]] | None = None,
 ) -> set[Any]:
     """Return distinct account IDs eligible for risk-exit evaluation.
@@ -46,12 +48,19 @@ def risk_exit_account_ids(
     any truthy raw account_id is added as str(raw_value) without stripping).
     """
     result = set(base_account_ids or ())
+    if asof_account_ids is not None:
+        result.update(str(value) for value in asof_account_ids if value)
+        return result
     sql = "SELECT DISTINCT account_id FROM paper_position_lots WHERE remaining_qty>0"
+    params: tuple[Any, ...] = ()
+    if cycle_id is not None:
+        sql += " AND cycle_id=?"
+        params = (int(cycle_id),)
 
     if rows_fn is not None:
-        raw_rows = rows_fn(conn, sql, ())
+        raw_rows = rows_fn(conn, sql, params)
     elif conn is not None and hasattr(conn, "execute"):
-        cursor = conn.execute(sql)
+        cursor = conn.execute(sql, params)
         raw_rows = cursor.fetchall()
     else:
         raw_rows = []

@@ -86,6 +86,12 @@ R33-C 再加 `strategy_retirement_workflow`（proposal/approval 不可变契约�
 `strategy_retirement_workflow_service`（重新验证 exact decision/snapshot/version/state，
 仅在人工 APPROVE 后调用 `strategy_lifecycle.transition`）。它不增加状态机、latest 查询、
 后台扫描或正式交易账本写入。
+R34-A 加入组合运行事实链：`portfolio_runtime`（纯、确定性 exact cycle/as-of snapshot 契约）、
+`portfolio_runtime_service`（只读 portfolio owners 并追加快照）、`portfolio_runtime_repository`
+（append-only + exact snapshot ID 查询）。schema DDL/migration 仍由
+`paper_schema_migrations` / `db_migrate` 唯一维护；新增路由仅提供
+`POST /api/portfolio/runtime/snapshots` 与 `GET /api/portfolio/runtime/snapshots/{snapshot_id}`。
+它不调用 allocator/coordinator，不写正式 paper ledger、lifecycle 或订单，也没有 current/latest 路由。
 - **执行真实性证据**：`execution_evidence`（三态成交证据契约）、`execution_lifecycle`
   （成交状态机与非法跳转拒绝）、`execution_outcome`（`selection_executable` ×
   `execution_verified` 连接与收益分层）
