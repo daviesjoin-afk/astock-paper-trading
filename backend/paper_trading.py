@@ -1881,6 +1881,8 @@ def init_db():
                 PSM.ensure_risk_decision_order_linkage(conn)
                 # R33-A（v27）：既有账本走快路径时也必须补建策略健康快照表。
                 PSM.ensure_strategy_health_snapshots(conn)
+                # R33-B（v28）：退休决策追加表同理。
+                PSM.ensure_strategy_retirement_decisions(conn)
                 _ensure_accounts(conn)
                 _ensure_user_strategy_accounts(conn)
                 _ensure_cycle(conn)
@@ -2189,6 +2191,8 @@ def init_db():
         PSM.ensure_risk_decision_order_linkage(conn)
         # R33-A v27：策略健康快照表（DDL 只在 paper_schema_migrations）。
         PSM.ensure_strategy_health_snapshots(conn)
+        # R33-B v28：策略退休决策表（DDL 同样只在 paper_schema_migrations）。
+        PSM.ensure_strategy_retirement_decisions(conn)
         _ensure_accounts(conn)
         _ensure_user_strategy_accounts(conn)
         _ensure_cycle(conn)

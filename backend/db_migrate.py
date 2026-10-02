@@ -320,6 +320,11 @@ MIGRATIONS = {
         # paper_schema_migrations：migration 与 init_db 快路径调用同一个函数。
         (27, "新增策略健康快照追加证据表（幂等，不回填）",
          paper_schema.ensure_strategy_health_snapshots),
+        # R33-B：退休决策表是 policy **建议**的追加式 owner。它不写 lifecycle、
+        # 不写正式账本，也没有 current_retirement_state / latest_decision 这类
+        # 会诱导「当前状态」的列。DDL 单一事实来源同样在 paper_schema_migrations。
+        (28, "新增策略退休决策追加证据表（幂等，不回填）",
+         paper_schema.ensure_strategy_retirement_decisions),
     ],
     "adaptive_learning": [
         (1, "创建 schema_version 表", """

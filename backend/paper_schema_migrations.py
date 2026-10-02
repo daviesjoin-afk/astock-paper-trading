@@ -1319,3 +1319,75 @@ def ensure_strategy_health_snapshots(conn):
            BEGIN SELECT RAISE(ABORT,'strategy health snapshots are append-only'); END"""
     )
     return changes
+
+
+# ─── 策略退休决策（v28 / R33-B） ─────────────────────────────────────────────
+#
+# 不变量::
+#
+#     strategy_retirement_decisions = 「某份健康快照给出了哪条 policy 建议」的
+#     唯一追加式 owner
+#
+# R33-B 只产出**建议**：决策表是证据，不是状态。因此刻意没有
+# current_retirement_state / latest_decision 这类列或表 —— 否则读路径会开始
+# 把「最近一次建议」当成「当前退休状态」，而那正是 R33-B 明令禁止的诱导。
+# 同 id 不同内容必须冲突，不允许 overwrite；需要新结论就追加新决策。
+# 决策不写 lifecycle：本表不引用 strategy_lifecycle_* 任何列。
+
+
+STRATEGY_RETIREMENT_DECISION_COLUMNS = (
+    "decision_id", "decision_fingerprint", "snapshot_id", "snapshot_fingerprint",
+    "strategy_id", "strategy_version", "decision_type", "policy_version",
+    "evidence_json", "created_at",
+)
+
+
+def strategy_retirement_decision_ddl(table="strategy_retirement_decisions"):
+    """``strategy_retirement_decisions`` 的规范 DDL（migration 与 ``init_db`` 共用）。"""
+    return f"""
+    CREATE TABLE IF NOT EXISTS {table}(
+        decision_id TEXT PRIMARY KEY,
+        decision_fingerprint TEXT NOT NULL,
+        snapshot_id TEXT NOT NULL,
+        snapshot_fingerprint TEXT NOT NULL,
+        strategy_id TEXT NOT NULL,
+        strategy_version INTEGER NOT NULL,
+        decision_type TEXT NOT NULL,
+        policy_version TEXT NOT NULL,
+        evidence_json TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        CHECK(decision_id = decision_fingerprint)
+    )
+    """
+
+
+def ensure_strategy_retirement_decisions(conn):
+    """v28：建策略退休决策追加表 + 索引 + append-only guard（幂等、不回填）。
+
+    只创建自己的表；不 INSERT/UPDATE 任何正式账本，也不触碰 lifecycle 的任何表。
+    """
+    changes = {}
+    if not table_columns(conn, "strategy_retirement_decisions"):
+        conn.execute(strategy_retirement_decision_ddl("strategy_retirement_decisions"))
+        changes["strategy_retirement_decisions"] = "created"
+    else:
+        changes["strategy_retirement_decisions"] = "ok"
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_strategy_retirement_decisions_snapshot"
+        " ON strategy_retirement_decisions(snapshot_id)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_strategy_retirement_decisions_version"
+        " ON strategy_retirement_decisions(strategy_id,strategy_version,policy_version)"
+    )
+    conn.execute(
+        """CREATE TRIGGER IF NOT EXISTS strategy_retirement_decisions_no_update
+           BEFORE UPDATE ON strategy_retirement_decisions
+           BEGIN SELECT RAISE(ABORT,'strategy retirement decisions are append-only'); END"""
+    )
+    conn.execute(
+        """CREATE TRIGGER IF NOT EXISTS strategy_retirement_decisions_no_delete
+           BEFORE DELETE ON strategy_retirement_decisions
+           BEGIN SELECT RAISE(ABORT,'strategy retirement decisions are append-only'); END"""
+    )
+    return changes

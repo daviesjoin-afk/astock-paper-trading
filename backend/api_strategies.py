@@ -40,6 +40,9 @@ import strategy_api_models as Models
 import strategy_health as SH
 import strategy_health_repository as SHR
 import strategy_health_service as SHV
+import strategy_retirement_policy as RP
+import strategy_retirement_repository as RR
+import strategy_retirement_service as RTV
 import strategy_service as SVC
 
 router = APIRouter(prefix="/api/strategies", tags=["strategies"])
@@ -72,6 +75,12 @@ def _raise_http(exc: SVC.StrategyError) -> None:
 def _raise_health_http(exc: ValueError) -> None:
     """Health-evidence rejections are input/identity conflicts, never 5xx."""
     status = 404 if str(exc) == "health_snapshot_not_found" else 400
+    raise HTTPException(status_code=status, detail=str(exc)) from exc
+
+
+def _raise_retirement_http(exc: ValueError) -> None:
+    """Retirement-policy rejections are input/identity conflicts, never 5xx."""
+    status = 404 if "not_found" in str(exc) else 400
     raise HTTPException(status_code=status, detail=str(exc)) from exc
 
 
@@ -308,6 +317,31 @@ def get_strategy_health_snapshot(strategy_id: str, snapshot_id: str):
         _raise_http(exc)
     except (SH.HealthEvidenceError, SHR.StrategyHealthRepositoryError) as exc:
         _raise_health_http(exc)
+
+
+@router.post("/{strategy_id}/retirement/evaluate", status_code=201)
+def evaluate_strategy_retirement(
+    strategy_id: str, payload: Models.StrategyRetirementEvaluateRequest | None = None,
+):
+    """Evaluate one explicitly named health snapshot into a policy recommendation."""
+    request = _coerce(Models.StrategyRetirementEvaluateRequest, payload)
+    try:
+        return RTV.evaluate_retirement(strategy_id, snapshot_id=request.snapshot_id)
+    except SVC.StrategyError as exc:
+        _raise_http(exc)
+    except (RP.RetirementPolicyError, RR.StrategyRetirementRepositoryError) as exc:
+        _raise_retirement_http(exc)
+
+
+@router.get("/{strategy_id}/retirement/decisions/{decision_id}")
+def get_strategy_retirement_decision(strategy_id: str, decision_id: str):
+    """Read exactly one retirement decision by id — there is no status endpoint."""
+    try:
+        return RTV.get_retirement_decision(strategy_id, decision_id)
+    except SVC.StrategyError as exc:
+        _raise_http(exc)
+    except (RP.RetirementPolicyError, RR.StrategyRetirementRepositoryError) as exc:
+        _raise_retirement_http(exc)
 
 
 # ---------------------------------------------------------------------------
