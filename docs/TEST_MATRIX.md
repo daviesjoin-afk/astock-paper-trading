@@ -468,7 +468,7 @@
 | M60 | identity check self-attested without identity rows（省略身份行也自称核对过） | CAUGHT |
 | S0 | 哨兵：只改注释 | UNDETECTED（预期） |
 
-## R32 Final（IN REVIEW）
+## R32 Final（COMPLETE）
 
 | 契约 | 断言 | 测试 | mutation |
 | --- | --- | --- | --- |
@@ -481,7 +481,7 @@
 | Entry / sizing / observation 边界冻结 | Active 黄灯 per-strategy `risk_scale`（0.5/0.75/0.65）与红灯 sector-heat `shadow_exception` 语义不变；`EntryGateState` 与 planner 均无 sizing/observation 字段；manual 用的 canonical gate 无 `risk_scale`；比对报告不含 Active sizing modifier | `test_r32_final_ownership_boundary.py`（R-F9、R-F9b、R-F10、R-F11、R-F12） | — |
 | 前端不重算 readiness、不把缺失当 0 | AVAILABLE/PARTIAL/UNAVAILABLE 原样渲染；缺失渲染为「不可用」而非 `0`/`0/0`；两条晋级链分别命名且不合成；渲染函数内无 coverage→ready 推导 | `frontend/tests/challenger-workspace.test.mjs`（W8–W16） | M-F13 |
 
-## R33-A Exact Strategy Health Evidence（IN REVIEW）
+## R33-A Exact Strategy Health Evidence（COMPLETE，PR #222 MERGED）
 
 | 契约 | 断言 | 测试 | mutation |
 | --- | --- | --- | --- |
@@ -496,7 +496,7 @@
 | 纯 builder 无 ambient 依赖 | 无 sqlite3 / 网络 / 时钟 / provider；网络与时钟被 poison 后仍确定性 | H18 | — |
 | 最小 API surface | `POST …/health/snapshots` + `GET …/health/snapshots/{id}`；无 health/latest；身份冲突 400、未知快照 404 | `StrategyHealthApiSurfaceTests` | — |
 
-## R33-B Strategy Retirement Policy（IN REVIEW）
+## R33-B Strategy Retirement Policy（COMPLETE，PR #223 MERGED）
 
 | 契约 | 断言 | 测试 | mutation |
 | --- | --- | --- | --- |
@@ -510,4 +510,18 @@
 | proposal 只描述不执行 | 候选决策 → 固定 target_state，且必须落在 lifecycle owner 的合法边内（否则不产出）；`executed=false`；NO_ACTION / INSUFFICIENT_EVIDENCE 不产出 | TransitionProposalTests | — |
 | 纯函数在 provider/AI/时钟 poison 下不变 | socket / time / datetime.now 全部 poison 后决策指纹不变 | P15 | — |
 | 最小 API surface | `POST …/retirement/evaluate` + `GET …/retirement/decisions/{id}`；无 status / latest 端点；未知证据 404、身份冲突 400 | RetirementApiSurfaceTests | M-R4 |
+
+## R33-C Strategy Retirement Controlled Workflow（IN REVIEW）
+
+| 契约 | 断言 | 测试 | mutation |
+| --- | --- | --- | --- |
+| Proposal exact binding | proposal 绑定 decision/snapshot 指纹、strategy id/version/checksum、current/target state；错 snapshot、版本或 checksum fail closed | C1–C3 | M-C3 / M-C7 |
+| Operator approval | 仅显式 operator 可 APPROVE/REJECT；pending 不可执行，REJECT 不写 lifecycle；审批本身不执行 | C4–C6、API validation | M-C1 / M-C2 |
+| Controlled transition | 仅 APPROVED proposal 执行；执行前复核 decision、snapshot、版本、checksum、current state 与 `TRANSITION_TABLE`；经 R31 CAS/event owner 一次执行；retry 从 exact matching event 返回相同执行结果语义 | C6–C8 | M-C3 / M-C4 / M-C6 / M-C9 |
+| Append-only evidence | 同一 proposal append 幂等；proposal / approval 指纹篡改可检测；表拒绝 UPDATE/DELETE；无 current/latest 字段或 fallback | C9–C11、repository schema guard | M-C5 / M-C7 / M-C8 |
+| 无 AI/provider 自动决策 | approval 只接受 operator 身份；workflow 不依赖 AI/provider；health/policy 不导入 lifecycle；只有 execute 用例调用 lifecycle transition | C12、C14–C15 | M-C1 / M-C6 |
+| 正式账本隔离 | execution 只产生 lifecycle event，不改 cash、positions、orders、fills | C13 | — |
+| API 边界 | 创建、approve/reject、execute、exact proposal GET；无 current status 或 latest proposal endpoint | `RetirementWorkflowApiTests` | M-C5 |
+
+阶段状态：R31 **COMPLETE**；R32 **COMPLETE**；R33-A **COMPLETE**；R33-B **COMPLETE**；R33-C **IN REVIEW**；R33 **NOT COMPLETE**。本 PR **MERGE = NOT MERGED，DEPLOY = NOT DEPLOYED**。
 

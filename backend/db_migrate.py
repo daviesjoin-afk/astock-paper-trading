@@ -325,6 +325,10 @@ MIGRATIONS = {
         # 会诱导「当前状态」的列。DDL 单一事实来源同样在 paper_schema_migrations。
         (28, "新增策略退休决策追加证据表（幂等，不回填）",
          paper_schema.ensure_strategy_retirement_decisions),
+        # R33-C：生命周期迁移 proposal 与人工 approval 均为追加式证据；
+        # 不创建 current/latest retirement 状态，也不触发自动 transition。
+        (29, "新增策略退休 proposal 与 approval 追加证据表（幂等，不回填）",
+         paper_schema.ensure_strategy_retirement_workflow),
     ],
     "adaptive_learning": [
         (1, "创建 schema_version 表", """
