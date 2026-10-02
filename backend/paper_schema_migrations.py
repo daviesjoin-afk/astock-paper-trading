@@ -1391,3 +1391,73 @@ def ensure_strategy_retirement_decisions(conn):
            BEGIN SELECT RAISE(ABORT,'strategy retirement decisions are append-only'); END"""
     )
     return changes
+
+
+# ─── 策略退休人工工作流（v29 / R33-C）──────────────────────────────────────
+# Proposal 与 approval 都是不可变证据。运行态从确切 proposal、approval 以及
+# lifecycle event/current exact state 推导；这里不建 current/latest 状态表。
+STRATEGY_RETIREMENT_PROPOSAL_COLUMNS = (
+    "proposal_id", "proposal_fingerprint", "decision_id", "decision_fingerprint",
+    "snapshot_id", "snapshot_fingerprint", "strategy_id", "strategy_version",
+    "strategy_checksum", "current_state", "target_state", "reason",
+    "approval_status", "created_at", "evidence_json",
+)
+
+STRATEGY_RETIREMENT_APPROVAL_COLUMNS = (
+    "approval_id", "approval_fingerprint", "proposal_id", "proposal_fingerprint",
+    "operator_identity", "approval_action", "approved_at", "reason", "evidence_json",
+)
+
+
+def ensure_strategy_retirement_workflow(conn):
+    """v29: create append-only proposal/approval evidence, without data backfill."""
+    changes = {}
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS strategy_retirement_proposals(
+            proposal_id TEXT PRIMARY KEY,
+            proposal_fingerprint TEXT NOT NULL UNIQUE,
+            decision_id TEXT NOT NULL,
+            decision_fingerprint TEXT NOT NULL,
+            snapshot_id TEXT NOT NULL,
+            snapshot_fingerprint TEXT NOT NULL,
+            strategy_id TEXT NOT NULL,
+            strategy_version INTEGER NOT NULL CHECK(strategy_version > 0),
+            strategy_checksum TEXT NOT NULL,
+            current_state TEXT NOT NULL,
+            target_state TEXT NOT NULL,
+            reason TEXT NOT NULL,
+            approval_status TEXT NOT NULL CHECK(approval_status='PENDING_APPROVAL'),
+            created_at TEXT NOT NULL,
+            evidence_json TEXT NOT NULL,
+            CHECK(proposal_id=proposal_fingerprint),
+            CHECK(decision_id=decision_fingerprint)
+        )
+    """)
+    changes["strategy_retirement_proposals"] = "created"
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS strategy_retirement_approvals(
+            approval_id TEXT PRIMARY KEY,
+            approval_fingerprint TEXT NOT NULL UNIQUE,
+            proposal_id TEXT NOT NULL UNIQUE,
+            proposal_fingerprint TEXT NOT NULL,
+            operator_identity TEXT NOT NULL CHECK(length(trim(operator_identity)) > 0),
+            approval_action TEXT NOT NULL CHECK(approval_action IN ('APPROVE','REJECT')),
+            approved_at TEXT NOT NULL,
+            reason TEXT NOT NULL,
+            evidence_json TEXT NOT NULL,
+            CHECK(approval_id=approval_fingerprint)
+        )
+    """)
+    changes["strategy_retirement_approvals"] = "created"
+    for table in ("strategy_retirement_proposals", "strategy_retirement_approvals"):
+        conn.execute(
+            f"""CREATE TRIGGER IF NOT EXISTS {table}_no_update
+                BEFORE UPDATE ON {table}
+                BEGIN SELECT RAISE(ABORT,'{table} are append-only'); END"""
+        )
+        conn.execute(
+            f"""CREATE TRIGGER IF NOT EXISTS {table}_no_delete
+                BEFORE DELETE ON {table}
+                BEGIN SELECT RAISE(ABORT,'{table} are append-only'); END"""
+        )
+    return changes

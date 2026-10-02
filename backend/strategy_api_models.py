@@ -154,6 +154,20 @@ class StrategyRetirementEvaluateRequest(_Request):
     snapshot_id: str
 
 
+class RetirementProposalRequest(_Request):
+    """Create a controlled transition proposal from one exact R33-B decision."""
+
+    decision_id: str = Field(min_length=64, max_length=64)
+
+
+class RetirementApprovalRequest(_Request):
+    """One explicit operator decision; there is no AI or automatic approval mode."""
+
+    operator_identity: str = Field(min_length=1, max_length=128)
+    approval_action: Literal["APPROVE", "REJECT"] = "APPROVE"
+    reason: str = Field(default="", max_length=1000)
+
+
 class StrategyCloneRequest(_Request):
     """``POST /api/strategies/{id}/clone``。"""
     new_strategy_id: str | None = None

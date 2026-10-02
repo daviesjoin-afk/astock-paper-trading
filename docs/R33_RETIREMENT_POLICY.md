@@ -176,7 +176,7 @@ StrategyRetirementDecision（append-only evidence）
         ↓
 LifecycleTransitionProposal（仅结构，未执行）
         ↓
-[STOP —— 执行属未来 R33-C / operator flow，且必须经 R31 的 transition authority]
+[STOP —— 本文只定义 R33-B policy；受控执行由 R33-C proposal/approval workflow 实现，并经 R31 transition authority]
 ```
 
 AI 只能 summarize / explain；**永远不能**产出或 apply retirement transition。

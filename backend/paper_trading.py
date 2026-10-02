@@ -1883,6 +1883,8 @@ def init_db():
                 PSM.ensure_strategy_health_snapshots(conn)
                 # R33-B（v28）：退休决策追加表同理。
                 PSM.ensure_strategy_retirement_decisions(conn)
+                # R33-C（v29）：受控提案与人工审批也是追加式记录。
+                PSM.ensure_strategy_retirement_workflow(conn)
                 _ensure_accounts(conn)
                 _ensure_user_strategy_accounts(conn)
                 _ensure_cycle(conn)
@@ -2193,6 +2195,8 @@ def init_db():
         PSM.ensure_strategy_health_snapshots(conn)
         # R33-B v28：策略退休决策表（DDL 同样只在 paper_schema_migrations）。
         PSM.ensure_strategy_retirement_decisions(conn)
+        # R33-C v29：策略退休 proposal/approval 追加表。
+        PSM.ensure_strategy_retirement_workflow(conn)
         _ensure_accounts(conn)
         _ensure_user_strategy_accounts(conn)
         _ensure_cycle(conn)

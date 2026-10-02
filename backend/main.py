@@ -36,6 +36,7 @@ from api_adaptive import router as adaptive_router
 from api_settings import router as settings_router
 import api_strategies as strategies_api
 from api_strategies import router as strategies_router
+from api_strategies import retirement_workflow_router
 from resource_guard import heavy_job_lease
 
 FRONTEND = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "frontend")
@@ -534,6 +535,7 @@ app.include_router(paper_router)
 app.include_router(adaptive_router)
 app.include_router(settings_router)
 app.include_router(strategies_router)
+app.include_router(retirement_workflow_router)
 
 
 # ─── PR-2：HTTP 操作员安全边界（Operator Security Boundary）───────────────

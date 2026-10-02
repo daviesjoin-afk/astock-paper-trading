@@ -43,9 +43,13 @@ import strategy_health_service as SHV
 import strategy_retirement_policy as RP
 import strategy_retirement_repository as RR
 import strategy_retirement_service as RTV
+import strategy_retirement_workflow as RWF
+import strategy_retirement_workflow_repository as RWFR
+import strategy_retirement_workflow_service as RWS
 import strategy_service as SVC
 
 router = APIRouter(prefix="/api/strategies", tags=["strategies"])
+retirement_workflow_router = APIRouter(tags=["strategy-retirement-workflow"])
 
 # 已有历史引用的策略只能归档，删除请求给出可执行的替代路径。
 ARCHIVE_INSTEAD_HINT = "该策略已有历史引用，请使用归档（transition → retiring → archived）而非删除"
@@ -82,6 +86,19 @@ def _raise_retirement_http(exc: ValueError) -> None:
     """Retirement-policy rejections are input/identity conflicts, never 5xx."""
     status = 404 if "not_found" in str(exc) else 400
     raise HTTPException(status_code=status, detail=str(exc)) from exc
+
+
+def _raise_workflow_http(exc: ValueError) -> None:
+    reason = str(exc)
+    if "not_found" in reason:
+        status = 404
+    elif any(token in reason for token in (
+            "mismatch", "changed", "stale", "conflict", "already", "not_pending",
+            "required", "no_executable", "invalid_lifecycle_transition")):
+        status = 409
+    else:
+        status = 400
+    raise HTTPException(status_code=status, detail=reason) from exc
 
 
 # ---------------------------------------------------------------------------
@@ -343,6 +360,50 @@ def get_strategy_retirement_decision(strategy_id: str, decision_id: str):
         _raise_http(exc)
     except (RP.RetirementPolicyError, RR.StrategyRetirementRepositoryError) as exc:
         _raise_retirement_http(exc)
+
+
+@router.post("/{strategy_id}/retirement/proposals", status_code=201)
+def create_strategy_retirement_proposal(
+    strategy_id: str, payload: Models.RetirementProposalRequest | None = None,
+):
+    request = _coerce(Models.RetirementProposalRequest, payload)
+    try:
+        return RWS.create_transition_proposal(strategy_id, decision_id=request.decision_id)
+    except (RWF.RetirementWorkflowError,
+            RWFR.RetirementWorkflowRepositoryError) as exc:
+        _raise_workflow_http(exc)
+
+
+@retirement_workflow_router.post("/api/retirement/proposals/{proposal_id}/approve")
+def approve_retirement_proposal(
+    proposal_id: str, payload: Models.RetirementApprovalRequest | None = None,
+):
+    request = _coerce(Models.RetirementApprovalRequest, payload)
+    try:
+        return RWS.approve_transition_proposal(
+            proposal_id, operator_identity=request.operator_identity,
+            approval_action=request.approval_action, reason=request.reason)
+    except (RWF.RetirementWorkflowError,
+            RWFR.RetirementWorkflowRepositoryError) as exc:
+        _raise_workflow_http(exc)
+
+
+@retirement_workflow_router.post("/api/retirement/proposals/{proposal_id}/execute")
+def execute_retirement_proposal(proposal_id: str):
+    try:
+        return RWS.execute_transition_proposal(proposal_id)
+    except (RWF.RetirementWorkflowError,
+            RWFR.RetirementWorkflowRepositoryError) as exc:
+        _raise_workflow_http(exc)
+
+
+@retirement_workflow_router.get("/api/retirement/proposals/{proposal_id}")
+def get_retirement_proposal(proposal_id: str):
+    try:
+        return RWS.get_transition_proposal(proposal_id)
+    except (RWF.RetirementWorkflowError,
+            RWFR.RetirementWorkflowRepositoryError) as exc:
+        _raise_workflow_http(exc)
 
 
 # ---------------------------------------------------------------------------

@@ -86,7 +86,7 @@ research → validation_failed
 
 ### R32 阶段状态与可比较运行上下文
 
-R31、R32-A（Comparable Runtime Context）、R32-B（Active Comparable Evidence Closure）、R32-C（Isolated Shadow Runtime）、R32-D（Active/Challenger Comparison Evidence）已完成；R32-E1（Comparable Evidence Provenance Closure）正在审核；R32-E2～E4、R33 **NOT STARTED**。Shadow 使用与 Active capture 对齐的 market、quote、tradability、factor fingerprints 和显式 decision instant，同时保留各自 exact strategy identity 与策略专属状态；它只追加写 ShadowRun evidence，不写正式账本。R32-D 只从一份 exact Active evidence、一条 exact ShadowRun 和一份显式 spec 生成不可变比对报告（共享环境七维相等是硬前提，缺失即 UNAVAILABLE/PARTIAL，不查 latest/current），报告只陈述事实与 delta，不产生 winner、综合分或晋级结论。完整契约见 [`R32_COMPARABLE_RUNTIME_CONTEXT.md`](R32_COMPARABLE_RUNTIME_CONTEXT.md)、[`R32B_ACTIVE_COMPARABLE_EVIDENCE.md`](R32B_ACTIVE_COMPARABLE_EVIDENCE.md)、[`R32C_ISOLATED_SHADOW_RUNTIME.md`](R32C_ISOLATED_SHADOW_RUNTIME.md) 和 [`R32D_CHALLENGER_COMPARISON_EVIDENCE.md`](R32D_CHALLENGER_COMPARISON_EVIDENCE.md)。
+R31 与 R32 **COMPLETE**；R33-A/B **COMPLETE**；R33-C **IN REVIEW**；R33 **NOT COMPLETE**。Shadow 使用与 Active capture 对齐的 market、quote、tradability、factor fingerprints 和显式 decision instant，同时保留各自 exact strategy identity 与策略专属状态；它只追加写 ShadowRun evidence，不写正式账本。R32-D 只从一份 exact Active evidence、一条 exact ShadowRun 和一份显式 spec 生成不可变比对报告（共享环境七维相等是硬前提，缺失即 UNAVAILABLE/PARTIAL，不查 latest/current），报告只陈述事实与 delta，不产生 winner、综合分或晋级结论。完整契约见 [`R32_COMPARABLE_RUNTIME_CONTEXT.md`](R32_COMPARABLE_RUNTIME_CONTEXT.md)、[`R32B_ACTIVE_COMPARABLE_EVIDENCE.md`](R32B_ACTIVE_COMPARABLE_EVIDENCE.md)、[`R32C_ISOLATED_SHADOW_RUNTIME.md`](R32C_ISOLATED_SHADOW_RUNTIME.md) 和 [`R32D_CHALLENGER_COMPARISON_EVIDENCE.md`](R32D_CHALLENGER_COMPARISON_EVIDENCE.md)。
 
 就绪后，所有消费者读同一份不可变契约 `StrategyRuntimeContext`（`strategy_runtime.StrategyRuntimeContext`）：
 
@@ -296,6 +296,20 @@ v1 只实现两条规则：证据不完整（任一维 PARTIAL/UNAVAILABLE）⇒
 （drawdown / 连续亏损 / 执行失败率 / 风险违规频率全部 `POLICY DECISION REQUIRED`），
 也没有 exact-version 历史绩效 owner，因此**v1 对真实快照只会给出 `INSUFFICIENT_EVIDENCE`**。
 policy 不读原始表、不重算收益或风险、不写 lifecycle，也不接受任何「最新/当前」输入。
+
+### R33-C：Strategy Retirement Controlled Workflow（人工控制边界）
+
+```text
+StrategyHealthSnapshot → StrategyRetirementPolicy → StrategyRetirementDecision
+  → LifecycleTransitionProposal（exact decision/snapshot/version/checksum）
+  → RetirementApproval（operator APPROVE / REJECT）
+  → R31 strategy_lifecycle.transition（仅 APPROVED，CAS + TRANSITION_TABLE）
+```
+
+Proposal 与 approval 只追加，不维护 current/latest retirement 状态。执行时重新读取并验证
+decision、snapshot 指纹、immutable version/checksum、当前 lifecycle state 与合法迁移；任何漂移
+都 fail closed。没有自动审批、调度器或后台退休路径；workflow 不写 cash、positions、orders、fills。
+R33-C 状态为 **IN REVIEW**，R33 仍 **NOT COMPLETE**。
 
 ### Workspace identity 契约
 

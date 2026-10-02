@@ -56,7 +56,7 @@ Dockerfile          应用镜像；docker-compose*.yml 本地与服务器编排
   `user_strategy_participation`（用户策略接入生产链路）
 - **订单意图与执行**：`order_intent`（意图契约，拒绝数量越权）、`execution_planner`
   （中央计划/复核/落库）、`execution_dispatch`
-- **可比较与 Shadow 运行时（R32-A/B/C COMPLETE，R32-D IN REVIEW）**：
+- **可比较与 Shadow 运行时（R32 COMPLETE）**：
   `market_data_contract.snapshot_fingerprint()` 拥有 Market Snapshot identity；
   `simulation_runtime_context` 冻结 Active exact facts；`shadow_runtime` 拥有环境身份与
   reference state 纯转移；`shadow_run_service` 按 exact stamp 解析 owner 并执行；
@@ -70,7 +70,7 @@ R33-A 再加三个模块（事实层，不建 policy）：`strategy_health`（�
 `build_strategy_health` + 指纹，不碰 DB/时钟/provider）、`strategy_health_repository`
 （只按显式 snapshot ID 幂等追加/读取 `strategy_health_snapshots`，不做业务解释）、
 `strategy_health_service`（按显式 exact version + 显式窗口读 owner 证据并编排采集）。
-健康快照**只写自己的表**：不写 lifecycle、不写正式账本；R33-B 的退休 policy 尚未实现。
+健康快照**只写自己的表**：不写 lifecycle、不写正式账本；R33-B policy 只追加 decision，R33-C workflow 经人工审批后调用 R31 lifecycle。
 `strategy_registry.runtime_readiness` 新增可选 `version`/`checksum` 参数（缺省仍是 head，
 行为不变）：健康事实必须绑 exact version，head ready 不能证明历史 version ready。
 
@@ -80,6 +80,12 @@ strategy_lifecycle / sqlite3）、`strategy_retirement_repository`（只按显�
 `strategy_retirement_decisions`，不做业务判断）、`strategy_retirement_service`（按显式 snapshot ID
 读既有快照、调用 policy、追加决策，并只**描述** proposal；不调用 `transition`）。
 决策表**只有建议**：没有 current_retirement_state / latest_decision 这类列。
+
+R33-C 再加 `strategy_retirement_workflow`（proposal/approval 不可变契约）、
+`strategy_retirement_workflow_repository`（append + exact-id read）与
+`strategy_retirement_workflow_service`（重新验证 exact decision/snapshot/version/state，
+仅在人工 APPROVE 后调用 `strategy_lifecycle.transition`）。它不增加状态机、latest 查询、
+后台扫描或正式交易账本写入。
 - **执行真实性证据**：`execution_evidence`（三态成交证据契约）、`execution_lifecycle`
   （成交状态机与非法跳转拒绝）、`execution_outcome`（`selection_executable` ×
   `execution_verified` 连接与收益分层）

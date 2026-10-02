@@ -4,8 +4,9 @@ R33 的目标是把「什么算可证明的健康事实」先钉死，再谈自�
 
 ```text
 R33-A  Exact Strategy Health Evidence        ← COMPLETE（PR #222，merge 3b9082d）
-R33-B  Retirement Policy                     ← IN REVIEW（详见 docs/R33_RETIREMENT_POLICY.md）
-R33-C  Health Monitor / Workspace / Closure   NOT STARTED
+R33-B  Strategy Retirement Policy            ← COMPLETE（PR #223，merge 28d7a11）
+R33-C  Strategy Retirement Controlled Workflow ← IN REVIEW（本 PR）
+R33    NOT COMPLETE；本轮不合并、不部署
 ```
 
 R33-A **只建立事实层**：immutable / exact-version / deterministic / auditable / replayable 的
