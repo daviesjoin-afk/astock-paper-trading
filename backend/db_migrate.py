@@ -314,6 +314,12 @@ MIGRATIONS = {
         # 保持 NULL（诚实 legacy），绝不回填。
         (26, "新增风险决策的精确 order 关联列（幂等，不回填）",
          paper_schema.ensure_risk_decision_order_linkage),
+        # R33-A：策略健康快照是「exact version + 显式窗口」健康事实的唯一追加式
+        # owner。它只是**证据**：不写 lifecycle、不写正式账本、不建 health_current/
+        # health_latest 这类平行 authority。DDL 单一事实来源同样在
+        # paper_schema_migrations：migration 与 init_db 快路径调用同一个函数。
+        (27, "新增策略健康快照追加证据表（幂等，不回填）",
+         paper_schema.ensure_strategy_health_snapshots),
     ],
     "adaptive_learning": [
         (1, "创建 schema_version 表", """

@@ -1879,6 +1879,8 @@ def init_db():
                 PSM.ensure_shadow_comparison_reports(conn)
                 # R32-E1（v26）：风险决策的精确 order 关联列（幂等、不回填）。
                 PSM.ensure_risk_decision_order_linkage(conn)
+                # R33-A（v27）：既有账本走快路径时也必须补建策略健康快照表。
+                PSM.ensure_strategy_health_snapshots(conn)
                 _ensure_accounts(conn)
                 _ensure_user_strategy_accounts(conn)
                 _ensure_cycle(conn)
@@ -2185,6 +2187,8 @@ def init_db():
         PSM.ensure_shadow_comparison_reports(conn)
         # R32-E1 v26：风险决策的精确 order 关联列。
         PSM.ensure_risk_decision_order_linkage(conn)
+        # R33-A v27：策略健康快照表（DDL 只在 paper_schema_migrations）。
+        PSM.ensure_strategy_health_snapshots(conn)
         _ensure_accounts(conn)
         _ensure_user_strategy_accounts(conn)
         _ensure_cycle(conn)

@@ -583,18 +583,23 @@ def active_ids(*, conn=None, db_path=None):
                  if SL.allows_formal_cycle(spec.status))
 
 
-def runtime_readiness(conn, strategy_id):
+def runtime_readiness(conn, strategy_id, *, version=None, checksum=None):
     """Compile the four runtime contracts needed before a new cycle may use a strategy.
 
     Built-ins retain their audited native implementation path while user
     strategies must carry a valid executable DSL AST.  This is intentionally a
     pure compilation gate: it does not place orders or mutate definitions.
+
+    ``version``/``checksum`` select an **exact immutable version** instead of the
+    head. This is the same gate over the same primitives, only bound explicitly:
+    the head's readiness never proves that a historical version compiles.
     """
     spec = get(strategy_id, conn=conn)
     if spec is None:
         raise ValueError("unknown strategy id")
-    version = get_version(spec.id, conn=conn)
-    definition = version.definition if version else {}
+    version_row = (get_version(spec.id, version, checksum=checksum, conn=conn)
+                   if version is not None else get_version(spec.id, conn=conn))
+    definition = version_row.definition if version_row else {}
     dsl_ast = definition.get("dsl_ast")
     checks = {"dsl_compiled": False, "fingerprint_valid": False,
               "risk_profile_compiled": False, "execution_profile_compiled": False}
@@ -620,8 +625,8 @@ def runtime_readiness(conn, strategy_id):
         fingerprint = risk_profile = execution_profile = None
     return {
         "strategy_id": spec.id,
-        "version": version.version if version else None,
-        "checksum": version.checksum if version else None,
+        "version": version_row.version if version_row else None,
+        "checksum": version_row.checksum if version_row else None,
         "runtime_ready": not errors and all(checks.values()),
         "checks": checks,
         "errors": errors,

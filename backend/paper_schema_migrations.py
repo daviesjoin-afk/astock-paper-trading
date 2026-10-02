@@ -1243,3 +1243,79 @@ def risk_decision_provenance(authority, decision_kind):
         "authority": authority,
         "decision_kind": decision_kind,
     }
+
+
+# ─── 策略健康快照（v27 / R33-A） ─────────────────────────────────────────────
+#
+# 不变量::
+#
+#     strategy_health_snapshots = 「某个 exact strategy version 在某个显式
+#     observation window 下拥有哪些健康事实」的唯一追加式 owner
+#
+# R33-A 只建**事实层**：健康快照既不改 lifecycle，也不写正式账本，也不发布
+# health_score / rank / tier 这类结论。快照一旦写入不可改（append-only trigger）；
+# 历史证据不会因为「今天数据变全了」而愈合 —— 需要新事实就追加**新快照**。
+#
+# DDL 单一事实来源在本模块：migration 与 init_db 快路径调用同一个函数，
+# 否则升级后的线上库永远没有这张表（健康采集只能 fail closed）。
+
+STRATEGY_HEALTH_SNAPSHOT_COLUMNS = (
+    "snapshot_id", "snapshot_fingerprint", "health_contract_version",
+    "strategy_id", "strategy_version", "strategy_checksum",
+    "observation_start", "observation_end", "window_identity",
+    "lifecycle_state", "coverage_ratio", "evidence_json", "created_at",
+)
+
+
+def strategy_health_snapshot_ddl(table="strategy_health_snapshots"):
+    """``strategy_health_snapshots`` 的规范 DDL（migration 与 ``init_db`` 共用）。"""
+    return f"""
+    CREATE TABLE IF NOT EXISTS {table}(
+        snapshot_id TEXT PRIMARY KEY,
+        snapshot_fingerprint TEXT NOT NULL,
+        health_contract_version TEXT NOT NULL,
+        strategy_id TEXT NOT NULL,
+        strategy_version INTEGER NOT NULL,
+        strategy_checksum TEXT NOT NULL,
+        observation_start TEXT NOT NULL,
+        observation_end TEXT NOT NULL,
+        window_identity TEXT NOT NULL,
+        lifecycle_state TEXT,
+        coverage_ratio REAL NOT NULL,
+        evidence_json TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        CHECK(snapshot_id = snapshot_fingerprint)
+    )
+    """
+
+
+def ensure_strategy_health_snapshots(conn):
+    """v27：建策略健康快照追加表 + 索引 + append-only guard（幂等、不回填）。
+
+    只创建自己的表；不 INSERT/UPDATE 任何正式账本，也不触碰 lifecycle 的任何表。
+    """
+    changes = {}
+    if not table_columns(conn, "strategy_health_snapshots"):
+        conn.execute(strategy_health_snapshot_ddl("strategy_health_snapshots"))
+        changes["strategy_health_snapshots"] = "created"
+    else:
+        changes["strategy_health_snapshots"] = "ok"
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_strategy_health_snapshots_version"
+        " ON strategy_health_snapshots(strategy_id,strategy_version)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_strategy_health_snapshots_window"
+        " ON strategy_health_snapshots(observation_start,observation_end)"
+    )
+    conn.execute(
+        """CREATE TRIGGER IF NOT EXISTS strategy_health_snapshots_no_update
+           BEFORE UPDATE ON strategy_health_snapshots
+           BEGIN SELECT RAISE(ABORT,'strategy health snapshots are append-only'); END"""
+    )
+    conn.execute(
+        """CREATE TRIGGER IF NOT EXISTS strategy_health_snapshots_no_delete
+           BEFORE DELETE ON strategy_health_snapshots
+           BEGIN SELECT RAISE(ABORT,'strategy health snapshots are append-only'); END"""
+    )
+    return changes

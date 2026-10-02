@@ -65,6 +65,14 @@ Dockerfile          应用镜像；docker-compose*.yml 本地与服务器编排
   R32-D 另加三个模块：`shadow_comparison`（纯 domain/report contract，不碰 DB/时钟/provider）、
   `shadow_comparison_repository`（只按显式 report ID 幂等追加/读取 `shadow_comparison_reports`）、
   `shadow_comparison_service`（按显式 ID 加载 Active 与 ShadowRun 证据并编排）。
+
+R33-A 再加三个模块（事实层，不建 policy）：`strategy_health`（纯 contract + 纯
+`build_strategy_health` + 指纹，不碰 DB/时钟/provider）、`strategy_health_repository`
+（只按显式 snapshot ID 幂等追加/读取 `strategy_health_snapshots`，不做业务解释）、
+`strategy_health_service`（按显式 exact version + 显式窗口读 owner 证据并编排采集）。
+健康快照**只写自己的表**：不写 lifecycle、不写正式账本；R33-B 的退休 policy 尚未实现。
+`strategy_registry.runtime_readiness` 新增可选 `version`/`checksum` 参数（缺省仍是 head，
+行为不变）：健康事实必须绑 exact version，head ready 不能证明历史 version ready。
 - **执行真实性证据**：`execution_evidence`（三态成交证据契约）、`execution_lifecycle`
   （成交状态机与非法跳转拒绝）、`execution_outcome`（`selection_executable` ×
   `execution_verified` 连接与收益分层）

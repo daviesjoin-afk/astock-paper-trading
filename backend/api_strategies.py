@@ -37,6 +37,9 @@ from fastapi import APIRouter, HTTPException, Query
 from pydantic import ValidationError
 
 import strategy_api_models as Models
+import strategy_health as SH
+import strategy_health_repository as SHR
+import strategy_health_service as SHV
 import strategy_service as SVC
 
 router = APIRouter(prefix="/api/strategies", tags=["strategies"])
@@ -64,6 +67,12 @@ def status_for_error(exc: SVC.StrategyError) -> int:
 
 def _raise_http(exc: SVC.StrategyError) -> None:
     raise HTTPException(status_code=status_for_error(exc), detail=str(exc)) from exc
+
+
+def _raise_health_http(exc: ValueError) -> None:
+    """Health-evidence rejections are input/identity conflicts, never 5xx."""
+    status = 404 if str(exc) == "health_snapshot_not_found" else 400
+    raise HTTPException(status_code=status, detail=str(exc)) from exc
 
 
 # ---------------------------------------------------------------------------
@@ -269,6 +278,36 @@ def list_strategy_promotion_proposals(
                 "items": SVC.list_promotion_proposals(strategy_id, version=version, limit=limit)}
     except SVC.StrategyError as exc:
         _raise_http(exc)
+
+
+@router.post("/{strategy_id}/health/snapshots", status_code=201)
+def capture_strategy_health_snapshot(
+    strategy_id: str, payload: Models.StrategyHealthCaptureRequest | None = None,
+):
+    """Capture one exact strategy health snapshot (evidence only)."""
+    request = _coerce(Models.StrategyHealthCaptureRequest, payload)
+    try:
+        return SHV.capture_strategy_health(
+            strategy_id, strategy_version=request.strategy_version,
+            strategy_checksum=request.strategy_checksum,
+            observation_start=request.observation_start,
+            observation_end=request.observation_end,
+            comparison_report_id=request.comparison_report_id)
+    except SVC.StrategyError as exc:
+        _raise_http(exc)
+    except (SH.HealthEvidenceError, SHR.StrategyHealthRepositoryError) as exc:
+        _raise_health_http(exc)
+
+
+@router.get("/{strategy_id}/health/snapshots/{snapshot_id}")
+def get_strategy_health_snapshot(strategy_id: str, snapshot_id: str):
+    """Read exactly one health snapshot by id — there is no latest endpoint."""
+    try:
+        return SHV.get_health_snapshot(strategy_id, snapshot_id)
+    except SVC.StrategyError as exc:
+        _raise_http(exc)
+    except (SH.HealthEvidenceError, SHR.StrategyHealthRepositoryError) as exc:
+        _raise_health_http(exc)
 
 
 # ---------------------------------------------------------------------------
