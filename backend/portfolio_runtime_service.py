@@ -10,7 +10,6 @@ import math
 import paper_cycle_ownership as PCY
 import paper_portfolio_read_model as PPRM
 import paper_risk_exit_eligibility as PRE
-import paper_schema_migrations as PSM
 import paper_trading as PT
 import portfolio_runtime as PR
 import portfolio_runtime_repository as PRRepo
@@ -79,7 +78,9 @@ def _capture(conn, *, cycle_id: int, asof_day: str, decision_at: str,
              market_evidence_identity: str | None):
     try:
         ownership = PCY.exact_cycle_owner_snapshot(
-            conn, cycle_id, builtin_scope=PT.ACTIVE_ACCOUNT_IDS)
+            conn, cycle_id, asof_day=asof_day,
+            attachment_prover=PPRM.account_attached_by_asof,
+            builtin_scope=PT.ACTIVE_ACCOUNT_IDS)
     except ValueError as exc:
         raise PR.PortfolioRuntimeError(str(exc)) from exc
     owners = ownership["economic_owner_ids"]
@@ -188,7 +189,6 @@ def _capture(conn, *, cycle_id: int, asof_day: str, decision_at: str,
 def _with_connection(work, *, initialize=False):
     if initialize:
         with PT._db(immediate=True) as conn:
-            PSM.ensure_portfolio_runtime_snapshots(conn)
             snapshot = work(conn)
             conn.commit()
             return snapshot

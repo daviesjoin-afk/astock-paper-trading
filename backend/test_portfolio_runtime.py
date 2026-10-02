@@ -17,6 +17,8 @@ if BACKEND not in sys.path:
     sys.path.insert(0, BACKEND)
 
 import paper_trading as PT
+import paper_cycle_ownership as PCY
+import paper_portfolio_read_model as PPRM
 import api_paper as API
 import portfolio_runtime as PR
 import portfolio_runtime_repository as PRRepo
@@ -226,6 +228,75 @@ class PortfolioRuntimeContractTests(unittest.TestCase):
         projection = json.dumps(_build().projection()).lower()
         for forbidden in ("portfolio_score", "health_score", "winner", "rank"):
             self.assertNotIn(forbidden, projection)
+
+    def _owner_conn(self, enabled, bound, attachment_dates):
+        import paper_account_specs as PAS
+
+        conn = sqlite3.connect(":memory:")
+        conn.execute("CREATE TABLE paper_cycles(id INTEGER PRIMARY KEY,cycle_key TEXT,"
+                     "status TEXT,enabled_strategies TEXT,capital REAL)")
+        conn.execute("CREATE TABLE paper_accounts(id TEXT PRIMARY KEY,cycle_id INTEGER)")
+        conn.execute("CREATE TABLE paper_parameter_versions(cycle_id INTEGER,account_id TEXT,"
+                     "effective_date TEXT)")
+        conn.execute("INSERT INTO paper_cycles VALUES(7,'c-7','running',?,1000)",
+                     (json.dumps(enabled),))
+        conn.executemany("INSERT INTO paper_accounts(id,cycle_id) VALUES(?,7)",
+                         [(account,) for account in bound])
+        conn.executemany("INSERT INTO paper_parameter_versions VALUES(7,?,?)",
+                         [(account, day) for account, day in attachment_dates.items()])
+        return conn, PAS.builtin_account_ids()
+
+    def test_pa21_exact_cycle_owners_require_asof_attachment_proof(self):
+        import paper_account_specs as PAS
+
+        first, second = PAS.builtin_account_ids()[:2]
+        conn, builtin_scope = self._owner_conn(
+            [first, second], [first, second], {first: "2026-10-01", second: "2026-10-10"})
+        try:
+            with self.assertRaisesRegex(ValueError, "cycle_economic_owners_unavailable"):
+                PCY.exact_cycle_owner_snapshot(
+                    conn, 7, asof_day="2026-10-01",
+                    attachment_prover=PPRM.account_attached_by_asof,
+                    builtin_scope=builtin_scope)
+            owner_snapshot = PCY.exact_cycle_owner_snapshot(
+                conn, 7, asof_day="2026-10-10",
+                attachment_prover=PPRM.account_attached_by_asof,
+                builtin_scope=builtin_scope)
+            self.assertEqual(owner_snapshot["economic_owner_ids"], tuple(sorted((first, second))))
+        finally:
+            conn.close()
+
+    def test_pa22_configured_and_resolved_owner_sets_must_match(self):
+        import paper_account_specs as PAS
+
+        first, second = PAS.builtin_account_ids()[:2]
+        conn, builtin_scope = self._owner_conn(
+            [first, second], [first],
+            {first: "2026-10-01", second: "2026-10-01"})
+        try:
+            with self.assertRaisesRegex(ValueError, "cycle_economic_owners_unavailable"):
+                PCY.exact_cycle_owner_snapshot(
+                    conn, 7, asof_day="2026-10-01",
+                    attachment_prover=PPRM.account_attached_by_asof,
+                    builtin_scope=builtin_scope)
+            conn.execute("UPDATE paper_cycles SET enabled_strategies=? WHERE id=7",
+                         (json.dumps([first, "unknown"]),))
+            with self.assertRaisesRegex(ValueError, "cycle_economic_owners_unavailable"):
+                PCY.exact_cycle_owner_snapshot(
+                    conn, 7, asof_day="2026-10-01",
+                    attachment_prover=PPRM.account_attached_by_asof,
+                    builtin_scope=builtin_scope)
+        finally:
+            conn.close()
+
+    def test_pa23_service_does_not_own_snapshot_schema(self):
+        tree = ast.parse(pathlib.Path(PRS.__file__).read_text(encoding="utf-8"))
+        imported = {alias.name for node in ast.walk(tree)
+                    if isinstance(node, (ast.Import, ast.ImportFrom))
+                    for alias in node.names}
+        self.assertNotIn("paper_schema_migrations", imported)
+        source = pathlib.Path(PRS.__file__).read_text(encoding="utf-8")
+        self.assertNotIn("ensure_portfolio_runtime_snapshots", source)
 
     def test_dimensions_must_be_complete_and_unique(self):
         with self.assertRaisesRegex(PR.PortfolioRuntimeError, "dimensions_must_be_complete"):

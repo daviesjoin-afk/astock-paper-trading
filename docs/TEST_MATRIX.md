@@ -530,13 +530,13 @@
 | 契约 | 断言 | 测试 | mutation |
 | --- | --- | --- | --- |
 | Exact deterministic snapshot | 显式 cycle/as-of/decision_at；精确 pin；策略输入 canonical 排序；ID 等于 fingerprint；created_at 不参与指纹 | `test_portfolio_runtime.py`（PA1–PA4、fingerprint tests） | M-P1 / M-P2 / M-P8 |
-| 三种参与范围分开 | cycle economic owners、lifecycle execution participants、as-of remaining-lot risk-exit participants 来自既有 owner；idle 保持空 | PA6–PA8；cycle ownership / risk-exit owner suites | M-P4 |
+| 三种参与范围分开 | cycle economic owners、lifecycle execution participants、as-of remaining-lot risk-exit participants 来自既有 owner；idle 保持空；经济 owners 按 as-of attachment 证据解析，配置与解析集合必须完全一致 | PA6–PA8、PA21–PA22；cycle ownership / risk-exit owner suites | M-P4 / M-P11 / M-P12 |
 | 缺失是缺失 | 市值不从成本推断；无 classification / exact return series / signal proof 时维度不可用；未知风险、容量不变成 0 | PA9–PA14、PA20；bounded portfolio read-model suite | M-P5 / M-P6 / M-P7 / M-P10 |
 | 持久化不可变且精确 | append-only、幂等；同 ID 异内容冲突；坏证据拒绝；按命名 snapshot ID 读取，历史不愈合 | PA15、PA18–PA19、exact getter tests | M-P9 |
 | capture 隔离正式账本 | capture 仅追加本表，不写 cycles/accounts/orders/fills/lots/lifecycle | PA16–PA17；risk-exit owner suite | — |
 | 最小 API 与架构边界 | 仅显式 capture 与 snapshot ID GET；无 latest/current；纯 builder 不接 DB/provider/clock | `api_paper.py` routes；PA5 | — |
 
-Mutation matrix `work/r34a_portfolio_runtime_mutation_check.py`: M-P1…M-P10 **10/10 DETECTED**；survived/fake/timeout = 0；restore SHA256 PASS；恢复后基线 GREEN。
+Mutation matrix `work/r34a_portfolio_runtime_mutation_check.py`: M-P1…M-P12 **12/12 DETECTED**；survived/fake/timeout = 0；restore SHA256 PASS；恢复后基线 GREEN。PA23 additionally guards that the service does not import migrations or invoke snapshot DDL; schema remains in migration v30 / `paper_trading.init_db`.
 
 阶段状态：R31/R32/R33 **COMPLETE**；R34-A **IN REVIEW**；R34-B/C **NOT STARTED**；R34 **NOT COMPLETE**；MERGE **NOT MERGED**；DEPLOY **NOT DEPLOYED**。
 

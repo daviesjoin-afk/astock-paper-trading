@@ -48,6 +48,13 @@ MUTATIONS = [
      'return {"schema_version": self.schema_version,',
      'return {"portfolio_score": 0, "schema_version": self.schema_version,',
      "test_portfolio_runtime.PortfolioRuntimeContractTests.test_pa20_snapshot_contains_no_rank_or_score"),
+    ("backend/paper_cycle_ownership.py",
+     'if any(not attachment_prover(',
+     'if False and any(not attachment_prover(',
+     "test_portfolio_runtime.PortfolioRuntimeContractTests.test_pa21_exact_cycle_owners_require_asof_attachment_proof"),
+    ("backend/paper_cycle_ownership.py",
+     'if enabled and set(enabled) != bound:', 'if enabled and False and set(enabled) != bound:',
+     "test_portfolio_runtime.PortfolioRuntimeContractTests.test_pa22_configured_and_resolved_owner_sets_must_match"),
 ]
 
 

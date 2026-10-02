@@ -212,7 +212,8 @@ def cycle_ledger_ids(conn, cycle_id, *, builtin_scope):
     )
 
 
-def exact_cycle_owner_snapshot(conn, cycle_id, *, builtin_scope):
+def exact_cycle_owner_snapshot(conn, cycle_id, *, asof_day, attachment_prover,
+                               builtin_scope):
     """Read one explicitly named cycle and its economic owners fail-closed.
 
     This strict capture entry has no latest-cycle or legacy fallback. The normal
@@ -233,13 +234,28 @@ def exact_cycle_owner_snapshot(conn, cycle_id, *, builtin_scope):
     if row is None:
         raise ValueError("explicit_cycle_not_found")
     enabled = _loads(row["enabled_strategies"], None)
-    if not isinstance(enabled, list) or any(not isinstance(value, str) for value in enabled):
-        raise ValueError("cycle_owner_configuration_unavailable")
-    owners = cycle_ledger_ids(conn, exact_id, builtin_scope=builtin_scope)
-    if any(str(owner) not in enabled for owner in owners):
+    if (not isinstance(enabled, list)
+            or any(not isinstance(value, str) or not value for value in enabled)
+            or len(set(enabled)) != len(enabled)):
         raise ValueError("cycle_economic_owners_unavailable")
-    if enabled and not owners:
+    known_ids = set(PAS.ACCOUNT_SPECS) | set(USP.user_known_ids(conn))
+    if any(value not in known_ids for value in enabled):
         raise ValueError("cycle_economic_owners_unavailable")
+    try:
+        bound = {str(item[0]) for item in conn.execute(
+            "SELECT id FROM paper_accounts WHERE cycle_id=?", (exact_id,)
+        ).fetchall() if item[0]}
+    except sqlite3.Error as exc:
+        raise ValueError("cycle_economic_owners_unavailable") from exc
+    # Reuse the accounting owner's as-of attachment proof (effective_date plus
+    # its bounded-activity fallback); current cycle binding alone is not history.
+    if enabled and set(enabled) != bound:
+        raise ValueError("cycle_economic_owners_unavailable")
+    if any(not attachment_prover(
+            conn, cycle_id=exact_id, asof_day=asof_day, account_id=account_id)
+           for account_id in enabled):
+        raise ValueError("cycle_economic_owners_unavailable")
+    owners = tuple(sorted(enabled))
     return {"cycle_identity": {"cycle_id": int(row["id"]),
                                "cycle_key": row["cycle_key"],
                                "observed_status": row["status"],
