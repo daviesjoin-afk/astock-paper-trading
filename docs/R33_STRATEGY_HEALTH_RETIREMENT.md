@@ -3,13 +3,22 @@
 R33 的目标是把「什么算可证明的健康事实」先钉死，再谈自动降级/退休。分三个可独立审核的 PR：
 
 ```text
-R33-A  Exact Strategy Health Evidence        ← 本 PR（IN REVIEW）
-R33-B  Degradation & Retirement Policy       NOT STARTED
+R33-A  Exact Strategy Health Evidence        ← COMPLETE（PR #222，merge 3b9082d）
+R33-B  Retirement Policy                     ← IN REVIEW（详见 docs/R33_RETIREMENT_POLICY.md）
 R33-C  Health Monitor / Workspace / Closure   NOT STARTED
 ```
 
 R33-A **只建立事实层**：immutable / exact-version / deterministic / auditable / replayable 的
 `StrategyHealthSnapshot`。它不回答「该不该退休」，也**不执行任何 lifecycle 修改**。
+
+R33-B **只建立 policy**：把快照解释成 `StrategyRetirementDecision`（动作候选或证据不足），
+并最多产出一个**未执行**的 `LifecycleTransitionProposal`。它同样不写 lifecycle。
+
+```text
+Health Snapshot → Retirement Policy → Transition Proposal → [STOP]
+```
+
+自动退休 / 归档 / 删除 / 停交易：**R33-A 与 R33-B 都不做**。
 
 ## 0. 基线
 
