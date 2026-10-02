@@ -279,6 +279,24 @@ StrategyHealthSnapshot（append-only，snapshot_id == snapshot_fingerprint）
 - 退休阈值（连续亏损 N 天 / 收益低于 X% / 回撤超过 Y% …）**仓库里不存在**，
   标记 `POLICY DECISION REQUIRED FOR R33-B`，本轮不新增。
 
+### R33-B：Strategy Retirement Policy（policy 层，不执行 lifecycle）
+
+```text
+POST /api/strategies/{id}/retirement/evaluate          body: {snapshot_id}   （必须显式 snapshot id）
+GET  /api/strategies/{id}/retirement/decisions/{id}    （只按 id 精确读取；没有 status 端点）
+
+StrategyHealthSnapshot → strategy_retirement_policy（纯函数）→ StrategyRetirementDecision
+   → LifecycleTransitionProposal（仅结构，executed=false）→ [STOP]
+```
+
+决策词表固定为动作候选：`NO_ACTION` / `DEGRADE_CANDIDATE` / `RETIRE_CANDIDATE` / `ARCHIVE_READY` /
+`INSUFFICIENT_EVIDENCE`（**没有** BAD_STRATEGY / FAILED_STRATEGY / UNHEALTHY，也没有 score / rank / tier）。
+v1 只实现两条规则：证据不完整（任一维 PARTIAL/UNAVAILABLE）⇒ `INSUFFICIENT_EVIDENCE`；
+证据完整且无信号 ⇒ `NO_ACTION`。三个动作候选属保留词表 —— 仓库还没有可 owner 化的退休阈值
+（drawdown / 连续亏损 / 执行失败率 / 风险违规频率全部 `POLICY DECISION REQUIRED`），
+也没有 exact-version 历史绩效 owner，因此**v1 对真实快照只会给出 `INSUFFICIENT_EVIDENCE`**。
+policy 不读原始表、不重算收益或风险、不写 lifecycle，也不接受任何「最新/当前」输入。
+
 ### Workspace identity 契约
 
 Workspace **绝不**从 registry current head 推导 Active / Challenger 的比对身份：

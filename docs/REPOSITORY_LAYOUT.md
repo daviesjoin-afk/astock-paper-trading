@@ -73,6 +73,13 @@ R33-A 再加三个模块（事实层，不建 policy）：`strategy_health`（�
 健康快照**只写自己的表**：不写 lifecycle、不写正式账本；R33-B 的退休 policy 尚未实现。
 `strategy_registry.runtime_readiness` 新增可选 `version`/`checksum` 参数（缺省仍是 head，
 行为不变）：健康事实必须绑 exact version，head ready 不能证明历史 version ready。
+
+R33-B 再加三个模块（policy 层，不做 lifecycle mutation）：`strategy_retirement_policy`
+（纯 contract + 纯 `evaluate_retirement_policy`，只依赖事实层，不 import paper_trading /
+strategy_lifecycle / sqlite3）、`strategy_retirement_repository`（只按显式 decision ID 幂等追加/读取
+`strategy_retirement_decisions`，不做业务判断）、`strategy_retirement_service`（按显式 snapshot ID
+读既有快照、调用 policy、追加决策，并只**描述** proposal；不调用 `transition`）。
+决策表**只有建议**：没有 current_retirement_state / latest_decision 这类列。
 - **执行真实性证据**：`execution_evidence`（三态成交证据契约）、`execution_lifecycle`
   （成交状态机与非法跳转拒绝）、`execution_outcome`（`selection_executable` ×
   `execution_verified` 连接与收益分层）

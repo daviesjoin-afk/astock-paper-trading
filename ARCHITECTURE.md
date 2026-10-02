@@ -3500,6 +3500,31 @@ StrategyHealthSnapshot（append-only，snapshot_id == snapshot_fingerprint）
 R33-B 的正确方向是 `Health Snapshot → Retirement Policy → strategy_lifecycle`，
 **不是** `strategy_lifecycle → 查健康 DB`。
 
+## R33-B authority graph（policy 层，到此为止）
+
+```text
+StrategyHealthSnapshot（R33-A，append-only 证据）
+        ↓
+strategy_retirement_policy.evaluate_retirement_policy（纯函数，只依赖事实层）
+        ↓
+StrategyRetirementDecision（append-only，decision_id == decision_fingerprint）
+        ↓
+LifecycleTransitionProposal（仅结构：target_state + reason，executed=false）
+        ↓
+[STOP —— 执行必须走 R31 的 strategy_lifecycle.transition，本阶段不做]
+```
+
+依赖方向是单向的：`strategy_health → retirement_policy → application service → repository`。
+policy 不 import `paper_trading` / `strategy_lifecycle` / sqlite3（由 AST 守卫证明），因此它
+**不可能**读原始账本或写 lifecycle；合法性判断由 lifecycle owner 自己的 `TRANSITION_TABLE`
+在 service 层完成，且只用于**决定是否给出 proposal**，不用于执行。
+
+v1 只实现两条规则：证据不完整 → `INSUFFICIENT_EVIDENCE`（PARTIAL/UNAVAILABLE 永不算够，
+`UNKNOWN` 既不是「好」也不是「坏」）；证据完整且无信号 → `NO_ACTION`。三个动作候选
+（`DEGRADE_CANDIDATE` / `RETIRE_CANDIDATE` / `ARCHIVE_READY`）属保留词表：仓库尚无可 owner 化的
+退休阈值，也没有 exact-version 历史绩效 owner，因此 v1 对真实快照**只会**给出
+`INSUFFICIENT_EVIDENCE` —— 这是刻意的安全结果。
+
 ## 架构演进记录（历史批次：模块化与边界固化）
 
 > 下面这段是**当时**的变更记录，保留原样以追溯判断依据；当前领域边界与策略平台视图见本文上半部分与 [`docs/STRATEGY_PLATFORM.md`](docs/STRATEGY_PLATFORM.md)。

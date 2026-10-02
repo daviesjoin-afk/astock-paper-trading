@@ -144,6 +144,16 @@ class StrategyHealthCaptureRequest(_Request):
     comparison_report_id: str | None = None
 
 
+class StrategyRetirementEvaluateRequest(_Request):
+    """``POST /api/strategies/{id}/retirement/evaluate``。
+
+    R33-B 只接受**显式**的 health snapshot id：没有 latest health、没有 current
+    health，也没有任何隐式的「当前状态」输入。
+    """
+
+    snapshot_id: str
+
+
 class StrategyCloneRequest(_Request):
     """``POST /api/strategies/{id}/clone``。"""
     new_strategy_id: str | None = None

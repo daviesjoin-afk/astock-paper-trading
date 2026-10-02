@@ -496,3 +496,18 @@
 | 纯 builder 无 ambient 依赖 | 无 sqlite3 / 网络 / 时钟 / provider；网络与时钟被 poison 后仍确定性 | H18 | — |
 | 最小 API surface | `POST …/health/snapshots` + `GET …/health/snapshots/{id}`；无 health/latest；身份冲突 400、未知快照 404 | `StrategyHealthApiSurfaceTests` | — |
 
+## R33-B Strategy Retirement Policy（IN REVIEW）
+
+| 契约 | 断言 | 测试 | mutation |
+| --- | --- | --- | --- |
+| 同一快照 → 同一决策；policy version 与快照身份都进指纹 | 重复评估同一快照得到同一 `decision_id`；不同快照/不同 policy version ⇒ 不同决策；内容相同但身份不同的两份快照必须得到不同决策 | `test_r33b_retirement_policy.py`（P1、P2、P3、身份参与指纹） | M-R1 / M-R6 |
+| 证据完整性闸门最先 | 任一维 PARTIAL/UNAVAILABLE ⇒ `INSUFFICIENT_EVIDENCE`（逐维点名），绝不产出动作；真实快照（performance UNAVAILABLE + activity PARTIAL）必然命中 | P4、P5、P5b、P6、P7 | M-R2 / M-R3 |
+| UNKNOWN / PARTIAL 永不触发退休 | `risk_evidence` UNAVAILABLE 既不判「好」也不判「坏」；`performance` UNAVAILABLE 不是「收益 0」；`execution` PARTIAL 不得 retire | P5、P6、P7 | M-R2 / M-R3 |
+| 0 活动不是退休信号 | 窗口内 0 笔订单仍不得产出退休候选；证据完整 + 无信号 ⇒ `NO_ACTION` | P8、NO_ACTION 用例 | — |
+| policy 不读原始表 / 不写 lifecycle | AST 判定：policy 只 import 事实层（无 sqlite3/paper_trading/strategy_lifecycle）；不存在任何名为 `transition` 的调用；评估期间 lifecycle state 与事件序列字节不变 | P9、P10 | M-R5 |
+| 快照身份不符即 fail closed | 被篡改（指纹自校验失败）的快照不得作为决策输入 | P13 | M-R7 |
+| append-only 与 exact get | 同 id 幂等；同 id 不同内容冲突；表拒绝 UPDATE/DELETE；未知 id 不得兜底到最新；只有 `append_decision`/`get_decision` | P11、P12、P14、append-only 触发器用例 | M-R4 / M-R8 |
+| proposal 只描述不执行 | 候选决策 → 固定 target_state，且必须落在 lifecycle owner 的合法边内（否则不产出）；`executed=false`；NO_ACTION / INSUFFICIENT_EVIDENCE 不产出 | TransitionProposalTests | — |
+| 纯函数在 provider/AI/时钟 poison 下不变 | socket / time / datetime.now 全部 poison 后决策指纹不变 | P15 | — |
+| 最小 API surface | `POST …/retirement/evaluate` + `GET …/retirement/decisions/{id}`；无 status / latest 端点；未知证据 404、身份冲突 400 | RetirementApiSurfaceTests | M-R4 |
+
