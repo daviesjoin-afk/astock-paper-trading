@@ -8,6 +8,7 @@ policy layer.
 from __future__ import annotations
 
 import ast
+import datetime as dt
 import json
 import os
 import pathlib
@@ -592,10 +593,23 @@ class LedgerImmutabilityTests(unittest.TestCase):
             cycle_id = int(conn.execute("SELECT MAX(id) FROM paper_cycles").fetchone()[0])
             attached = conn.execute(
                 "SELECT MAX(effective_date) FROM paper_parameter_versions").fetchone()[0]
+            created_raw = conn.execute(
+                "SELECT MAX(created_at) FROM strategy_lifecycle_events").fetchone()[0]
             conn.close()
-            decision_at = f"{attached}T23:00:00+08:00"
+            # Derive the decision instant from the real owner evidence instead of
+            # a literal: the capture must be able to see the pinned version's
+            # lifecycle event, and it must stay >= the requested as-of day.
+            created = dt.datetime.fromisoformat(str(created_raw))
+            if created.tzinfo is None:
+                created = created.replace(tzinfo=dt.timezone.utc)
+            decision = created + dt.timedelta(hours=1)
+            attach_day = dt.date.fromisoformat(str(attached))
+            if decision.date() <= attach_day:
+                decision = dt.datetime.combine(
+                    attach_day + dt.timedelta(days=1), dt.time(9, 30),
+                    tzinfo=dt.timezone(dt.timedelta(hours=8)))
             snapshot = PRS.capture_portfolio_runtime_snapshot(
-                cycle_id=cycle_id, asof_day=str(attached), decision_at=decision_at)
+                cycle_id=cycle_id, asof_day=str(attached), decision_at=decision.isoformat())
 
             conn = sqlite3.connect(PT.DB_PATH)
             before = self._counts(conn)
