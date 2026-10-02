@@ -433,6 +433,37 @@ class RetirementApiSurfaceTests(_RetirementCase):
         self.assertEqual(400, raised.exception.status_code)
         self.assertEqual("health_snapshot_strategy_mismatch", str(raised.exception.detail))
 
+    def test_a_malformed_or_corrupt_snapshot_id_is_a_controlled_4xx(self):
+        from fastapi import HTTPException
+        # 畸形 id：必须是 caller 输入错误（400），不能逃成 500。
+        with self.assertRaises(HTTPException) as raised:
+            self.API.evaluate_strategy_retirement(
+                self.spec.id, self.Models.StrategyRetirementEvaluateRequest(
+                    snapshot_id="short"))
+        self.assertEqual(400, raised.exception.status_code)
+        self.assertEqual("explicit_health_snapshot_id_required", str(raised.exception.detail))
+        with self.assertRaises(RP.RetirementPolicyError) as raised:
+            RTV.evaluate_retirement(self.spec.id, snapshot_id="short")
+        self.assertEqual("explicit_health_snapshot_id_required", str(raised.exception))
+        # 存储行自校验失败（被篡改的快照证据）：同样是受控拒绝。
+        snapshot = self._snapshot()
+        self.conn.execute(
+            "INSERT INTO strategy_health_snapshots(snapshot_id,snapshot_fingerprint,"
+            "health_contract_version,strategy_id,strategy_version,strategy_checksum,"
+            "observation_start,observation_end,window_identity,lifecycle_state,"
+            "coverage_ratio,evidence_json,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            ("d" * 64, "d" * 64, "x", self.spec.id, int(self.version.version),
+             self.version.checksum, "2026-09-01", "2026-10-01", "w", None, 0.0,
+             '{"tampered":true}', "2026-10-01T00:00:00+00:00"))
+        self.conn.commit()
+        with self.assertRaises(HTTPException) as raised:
+            self.API.evaluate_strategy_retirement(
+                self.spec.id, self.Models.StrategyRetirementEvaluateRequest(
+                    snapshot_id="d" * 64))
+        self.assertEqual(400, raised.exception.status_code)
+        self.assertEqual("health_snapshot_corrupt", str(raised.exception.detail))
+        self.assertTrue(snapshot["snapshot_id"])
+
     def test_the_route_surface_has_no_status_or_latest_endpoint(self):
         paths = {getattr(route, "path", "") for route in self.API.router.routes}
         self.assertIn("/api/strategies/{strategy_id}/retirement/evaluate", paths)

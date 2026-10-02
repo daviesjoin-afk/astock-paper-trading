@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""R33-B semantic mutations (M-R1 … M-R8).
+"""R33-B semantic mutations (M-R1 … M-R9).
 
 每条变异只破坏一个 contract，并且必须让指定回归变 RED：
 
@@ -11,6 +11,7 @@
     M-R6  the policy version leaves the decision fingerprint
     M-R7  the snapshot identity check removed
     M-R8  the decision table stops being append-only
+    M-R9  health snapshot repository rejections stop being translated
 
 Usage:  python work/r33b_retirement_mutation_check.py
 """
@@ -53,10 +54,8 @@ MUTATIONS = [
     # M-R4：评估时兜底到「最新一份快照」。
     (
         "backend/strategy_retirement_service.py",
-        '    snapshot = SHRepo.get_snapshot(conn, snapshot_id)\n'
         '    if snapshot is None:\n'
         '        raise RP.RetirementPolicyError("health_snapshot_not_found")\n',
-        '    snapshot = SHRepo.get_snapshot(conn, snapshot_id)\n'
         '    if snapshot is None:\n'
         '        row = conn.execute("SELECT snapshot_id FROM strategy_health_snapshots"\n'
         '                           " ORDER BY rowid DESC LIMIT 1").fetchone()\n'
@@ -100,6 +99,21 @@ MUTATIONS = [
         "           BEGIN SELECT RAISE(ABORT,'strategy retirement decisions are append-only'); END\"\"\"\n",
         '        """SELECT 1"""\n',
         "test_r33b_retirement_policy.RetirementDecisionContractTests.test_the_decision_table_rejects_update_and_delete",
+    ),
+    # M-R9：health snapshot 的仓库级拒绝不再被翻译（畸形 id 逃成 5xx）。
+    (
+        "backend/strategy_retirement_service.py",
+        '    try:\n'
+        '        snapshot = SHRepo.get_snapshot(conn, snapshot_id)\n'
+        '    except SHRepo.StrategyHealthRepositoryError as exc:\n'
+        '        # 畸形 id 是 caller 的输入错误，存储行自校验失败是损坏：两者都在这里翻译成\n'
+        '        # 受控的 retirement 拒绝，HTTP 层才会给出 4xx 而不是 500。\n'
+        '        reason = ("explicit_health_snapshot_id_required"\n'
+        '                  if str(exc) == "explicit_health_snapshot_id_required"\n'
+        '                  else "health_snapshot_corrupt")\n'
+        '        raise RP.RetirementPolicyError(reason) from exc\n',
+        '    snapshot = SHRepo.get_snapshot(conn, snapshot_id)\n',
+        "test_r33b_retirement_policy.RetirementApiSurfaceTests.test_a_malformed_or_corrupt_snapshot_id_is_a_controlled_4xx",
     ),
 ]
 

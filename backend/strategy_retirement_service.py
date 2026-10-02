@@ -27,7 +27,15 @@ def _with_paper_connection(work, *, immediate: bool = False):
 
 
 def _snapshot_for(conn, strategy_id: str, snapshot_id: str):
-    snapshot = SHRepo.get_snapshot(conn, snapshot_id)
+    try:
+        snapshot = SHRepo.get_snapshot(conn, snapshot_id)
+    except SHRepo.StrategyHealthRepositoryError as exc:
+        # 畸形 id 是 caller 的输入错误，存储行自校验失败是损坏：两者都在这里翻译成
+        # 受控的 retirement 拒绝，HTTP 层才会给出 4xx 而不是 500。
+        reason = ("explicit_health_snapshot_id_required"
+                  if str(exc) == "explicit_health_snapshot_id_required"
+                  else "health_snapshot_corrupt")
+        raise RP.RetirementPolicyError(reason) from exc
     if snapshot is None:
         raise RP.RetirementPolicyError("health_snapshot_not_found")
     if snapshot.strategy_id != str(strategy_id):

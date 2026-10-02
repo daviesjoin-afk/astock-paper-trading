@@ -329,7 +329,8 @@ def evaluate_strategy_retirement(
         return RTV.evaluate_retirement(strategy_id, snapshot_id=request.snapshot_id)
     except SVC.StrategyError as exc:
         _raise_http(exc)
-    except (RP.RetirementPolicyError, RR.StrategyRetirementRepositoryError) as exc:
+    except (RP.RetirementPolicyError, RR.StrategyRetirementRepositoryError,
+            SHR.StrategyHealthRepositoryError, SH.HealthEvidenceError) as exc:
         _raise_retirement_http(exc)
 
 
