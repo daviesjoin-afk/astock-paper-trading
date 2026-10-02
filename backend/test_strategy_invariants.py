@@ -211,18 +211,12 @@ class MinLotInvariantTests(unittest.TestCase):
 
 
 class IntentPriorityInvariantTests(unittest.TestCase):
-    """不变式 7：风险退出永远高于新开仓。"""
+    """不变式 7：风险退出永远高于新开仓。
 
-    def test_p0_exit_sorts_before_any_buy_for_any_mix(self):
-        intents = []
-        for index in range(12):
-            intents.append({"order": index, "priority": "P5", "side": "buy"})
-            intents.append({"order": index + 100, "priority": "P4", "side": "buy"})
-        intents.append({"order": 999, "priority": "P0", "side": "sell",
-                        "purpose": "hard_stop 崩盘"})
-        ordered = PCO.sort_intents_by_priority(intents)
-        self.assertEqual("P0", ordered[0]["priority"])
-        self.assertEqual("sell", ordered[0]["side"])
+    ``test_p0_exit_sorts_before_any_buy_for_any_mix`` 依赖已删除的
+    ``sort_intents_by_priority``；该业务不变式已迁移到 canonical 分配 policy
+    （``test_portfolio_allocation_policy.ConflictPolicyTests``）。
+    """
 
     def test_scale_in_yields_to_in_flight_risk_exit(self):
         path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "paper_trading.py")

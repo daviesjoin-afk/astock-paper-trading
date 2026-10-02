@@ -34,7 +34,6 @@ import paper_allocation as PA
 import paper_sizing as PSZ
 import paper_trading as PT
 import paper_trading_rules as PTR
-import portfolio_coordinator as PCO
 import runtime_settings as RSET
 import strategy_dsl_schema as DSL
 import strategy_registry as SR
@@ -500,26 +499,13 @@ class _PaperDbFixture(unittest.TestCase):
 
 
 class ForcedExitPriorityTests(_PaperDbFixture):
-    """测试组 J：容量压力下，风控退出不被新开仓挤掉。"""
+    """测试组 J：容量压力下，风控退出不被新开仓挤掉。
 
-    def test_risk_exit_is_always_p0(self):
-        for purpose in ("hard_stop", "崩盘清仓", "强平", "risk_exit", "drawdown"):
-            with self.subTest(purpose=purpose):
-                self.assertEqual("P0", PCO.classify_intent("sell", purpose)["priority"])
-
-    def test_exits_sort_before_entries_regardless_of_input_order(self):
-        def classified(side, purpose, index):
-            item = {"side": side, "purpose": purpose, "order": index}
-            item["priority"] = PCO.classify_intent(side, purpose)["priority"]
-            return item
-
-        entries = [classified("buy", "new_entry", index) for index in range(20)]
-        exits = [classified("sell", "hard_stop", 999)]
-        for order in (entries + exits, exits + entries, entries[:10] + exits + entries[10:]):
-            with self.subTest(first=order[0]["side"] + order[0]["purpose"]):
-                ordered = PCO.sort_intents_by_priority(order)
-                self.assertEqual("P0", ordered[0]["priority"])
-                self.assertEqual("sell", ordered[0]["side"])
+    意图排序断言已迁移到 canonical 分配 policy（``test_portfolio_allocation_policy``
+    的 ``ConflictPolicyTests``），因为按 purpose 文本猜语义的 ``classify_intent``
+    / ``sort_intents_by_priority`` 已在 R34-B 删除。这里保留与分配核心无关的
+    容量门禁不变式。
+    """
 
     def test_full_pool_blocks_new_entries_but_never_blocks_exits(self):
         nav = 1_000_000.0
@@ -534,23 +520,10 @@ class ForcedExitPriorityTests(_PaperDbFixture):
         self.assertFalse(EPL.cash_gate(self.conn, "buy", 1e6, 0.0, shared_cash=0.0)["allowed"])
         self.assertLessEqual(headroom, 1e-6)
 
-    def test_entry_intent_classification_is_never_above_exit(self):
-        mapping = {
-            "new_entry": PCO.classify_intent("buy", "new_entry")["priority"],
-            "add_position": PCO.classify_intent("buy", "scale_in 加仓")["priority"],
-            "risk_exit": PCO.classify_intent("sell", "hard_stop")["priority"],
-            "take_profit": PCO.classify_intent("sell", "take_profit")["priority"],
-        }
-        for name in ("new_entry", "add_position"):
-            with self.subTest(intent=name):
-                self.assertLess(
-                    PCO.INTENT_PRIORITY_INDEX[mapping["risk_exit"]],
-                    PCO.INTENT_PRIORITY_INDEX[mapping[name]],
-                )
-        self.assertLess(
-            PCO.INTENT_PRIORITY_INDEX[mapping["risk_exit"]],
-            PCO.INTENT_PRIORITY_INDEX[mapping["take_profit"]],
-        )
+    # 意图优先级不变式（风险退出高于入场、与输入顺序无关）已迁移到 canonical
+    # 分配 policy：test_portfolio_allocation_policy.ConflictPolicyTests。
+    # test_entry_intent_classification_is_never_above_exit 依赖已删除的
+    # classify_intent / INTENT_PRIORITY_INDEX，故在此移除。
 
 
 if __name__ == "__main__":  # pragma: no cover

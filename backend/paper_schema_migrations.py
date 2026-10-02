@@ -1344,6 +1344,38 @@ def ensure_portfolio_runtime_snapshots(conn):
     return changes
 
 
+def ensure_portfolio_allocation_plans(conn):
+    """v31: append-only R34-B multi-strategy allocation plans.
+
+    不变量：``portfolio_allocation_plans`` 是「R34-B policy 为某个精确快照
+    算出了哪份资源计划」的唯一追加式 owner。
+
+    计划是**证据**，不是状态：表里只有不可变的、带指纹的单行记录。
+    ``CHECK(plan_id = plan_fingerprint)`` 加上两个 append-only trigger，让
+    ``latest`` / ``current`` / 覆盖写这类路径在 schema 层面就不可能存在。
+    本函数只建表，不做任何回填，也不写正式账本。
+    """
+    changes = {}
+    if not table_columns(conn, "portfolio_allocation_plans"):
+        conn.execute("""CREATE TABLE portfolio_allocation_plans(
+            plan_id TEXT PRIMARY KEY,
+            plan_fingerprint TEXT NOT NULL,
+            plan_json TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            CHECK(plan_id = plan_fingerprint)
+        )""")
+        changes["portfolio_allocation_plans"] = "created"
+    else:
+        changes["portfolio_allocation_plans"] = "ok"
+    conn.execute("""CREATE TRIGGER IF NOT EXISTS portfolio_allocation_plans_no_update
+        BEFORE UPDATE ON portfolio_allocation_plans
+        BEGIN SELECT RAISE(ABORT,'portfolio allocation plans are append-only'); END""")
+    conn.execute("""CREATE TRIGGER IF NOT EXISTS portfolio_allocation_plans_no_delete
+        BEFORE DELETE ON portfolio_allocation_plans
+        BEGIN SELECT RAISE(ABORT,'portfolio allocation plans are append-only'); END""")
+    return changes
+
+
 # ─── 策略退休决策（v28 / R33-B） ─────────────────────────────────────────────
 #
 # 不变量::

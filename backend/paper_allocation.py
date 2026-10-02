@@ -20,7 +20,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Sequence
+from typing import Any, Mapping, Sequence
 
 __all__ = [
     "ALLOCATION_ENGINE_VERSION",
@@ -36,6 +36,7 @@ __all__ = [
     "minimum_deployable_budget",
     "pool_headroom",
     "position_limits",
+    "position_limits_from_weights",
     "stage_capital_scale",
     "strategy_pool_budget",
 ]
@@ -166,8 +167,10 @@ def _runtime_map(runtimes: Sequence[StrategyRuntime]) -> dict[str, StrategyRunti
     return result
 
 
-def position_limits(
-    runtimes: Sequence[StrategyRuntime],
+def position_limits_from_weights(
+    weights: Mapping[str, float],
+    declared_caps: Mapping[str, int],
+    declared_mins: Mapping[str, int],
     *,
     hard_pool_cap,
     strategy_max_positions,
@@ -176,19 +179,21 @@ def position_limits(
     account_order=None,
     baseline_exposure=None,
 ) -> dict[str, Any]:
-    """按有效权重在总席位硬上限内分配各策略席位（任意 N 个策略）。
+    """席位分配的唯一算术核：输入是**已给定**的权重与声明式上下限。
 
-    不变式：``Σ limits ≤ total_cap ≤ min(hard_pool_cap, Σ max_positions)``，
-    且 ``Σ limits ≥ 0``；函数返回前再做一次最终钳制，保证无论输入如何
-    都不会越过共享池硬上限。
+    本函数是 weight-agnostic 的纯算术：它不读 ``StrategyRuntime``，也不
+    计算任何动态因子。``position_limits()`` 是它唯一的 legacy 适配层
+    （权重来自 :meth:`StrategyRuntime.effective_weight` 的六因子乘积）；
+    canonical R34-B 路径用显式声明权重直接调用本函数。
+
+    不变式：``Σ limits ≤ total_cap ≤ min(hard_pool_cap, Σ caps)``，且
+    ``0 ≤ limits[key] ≤ caps[key]``；返回前再做一次最终钳制。
 
     **确定性 tie-break（PR-54）**：同分策略的取舍顺序是显式的——先看
     ``account_order``（越小越优先），再按策略 id 字典序。因此结果只取决于
-    策略集合本身，与调用方传入的 list 顺序无关（此前同分时依赖
-    ``max(...)`` 命中输入列表里的第一个，同一组策略换顺序会拿到不同席位）。
+    策略集合本身，与调用方传入的 dict 顺序无关。
     """
-    runtime_map = _runtime_map(runtimes)
-    ids = sorted(runtime_map)
+    ids = sorted(weights)
     count = len(ids)
     if count == 0:
         return {
@@ -200,35 +205,15 @@ def position_limits(
             "effective_weights": {},
         }
     order = {key: int(value) for key, value in (account_order or {}).items()}
-    weights = {key: runtime_map[key].effective_weight() for key in ids}
-    caps = {
-        key: max(
-            1,
-            int(
-                runtime_map[key].max_positions
-                if runtime_map[key].max_positions is not None
-                else strategy_max_positions
-            ),
-        )
-        for key in ids
-    }
-    mins = {
-        key: max(
-            0,
-            int(
-                runtime_map[key].min_positions
-                if runtime_map[key].min_positions is not None
-                else strategy_min_positions
-            ),
-        )
-        for key in ids
-    }
-    hard_cap = min(int(hard_pool_cap), sum(caps.values()))
+    caps = {key: int(declared_caps[key]) for key in ids}
+    mins = {key: int(declared_mins[key]) for key in ids}
+    hard_cap = min(int(hard_pool_cap), sum(caps[key] for key in ids))
+    weight_sum = sum(weights[key] for key in ids)
     if baseline_exposure is None:
-        baseline = sum(weights.values()) / count
+        baseline = weight_sum / count
     else:
         baseline = float(baseline_exposure)
-    current = sum(weights.values()) / count
+    current = weight_sum / count
     risk_scale = max(0.60, min(1.0, current / max(baseline, 0.01)))
     base_floor_total = min(hard_cap, strategy_min_positions * count)
     total_cap = max(base_floor_total, min(hard_cap, int(round(hard_cap * risk_scale))))
@@ -247,7 +232,7 @@ def position_limits(
     while sum(minimum.values()) > total_cap and any(minimum[key] > 0 for key in ids):
         heaviest = max(ids, key=lambda item: (minimum[item], -order.get(item, 99), item))
         minimum[heaviest] -= 1
-    weight_total = sum(weights.values()) or 1.0
+    weight_total = weight_sum or 1.0
     raw = {key: total_cap * weights[key] / weight_total for key in ids}
     limits = {
         key: max(minimum[key], min(caps[key], int(raw[key])))
@@ -290,8 +275,65 @@ def position_limits(
         "protected_slot_floor": protected,
         "total_cap": total_cap,
         "limits": limits,
-        "effective_weights": {key: round(value, 6) for key, value in weights.items()},
+        "effective_weights": {key: round(weights[key], 6) for key in ids},
     }
+
+
+def position_limits(
+    runtimes: Sequence[StrategyRuntime],
+    *,
+    hard_pool_cap,
+    strategy_max_positions,
+    strategy_min_positions,
+    protected_slot_floor,
+    account_order=None,
+    baseline_exposure=None,
+) -> dict[str, Any]:
+    """按有效权重在总席位硬上限内分配各策略席位（任意 N 个策略）。
+
+    Legacy 适配层：只负责把 ``StrategyRuntime`` 解析成权重与声明式上下限，
+    数学全部由 :func:`position_limits_from_weights` 承担。公开签名与输出结构
+    保持不变。
+
+    不变式：``Σ limits ≤ total_cap ≤ min(hard_pool_cap, Σ max_positions)``，
+    且 ``Σ limits ≥ 0``。
+    """
+    runtime_map = _runtime_map(runtimes)
+    ids = sorted(runtime_map)
+    weights = {key: runtime_map[key].effective_weight() for key in ids}
+    caps = {
+        key: max(
+            1,
+            int(
+                runtime_map[key].max_positions
+                if runtime_map[key].max_positions is not None
+                else strategy_max_positions
+            ),
+        )
+        for key in ids
+    }
+    mins = {
+        key: max(
+            0,
+            int(
+                runtime_map[key].min_positions
+                if runtime_map[key].min_positions is not None
+                else strategy_min_positions
+            ),
+        )
+        for key in ids
+    }
+    return position_limits_from_weights(
+        weights,
+        caps,
+        mins,
+        hard_pool_cap=hard_pool_cap,
+        strategy_max_positions=strategy_max_positions,
+        strategy_min_positions=strategy_min_positions,
+        protected_slot_floor=protected_slot_floor,
+        account_order=account_order,
+        baseline_exposure=baseline_exposure,
+    )
 
 
 def strategy_pool_budget(

@@ -1887,6 +1887,8 @@ def init_db():
                 PSM.ensure_strategy_retirement_workflow(conn)
                 # R34-A：精确组合事实快照表（DDL owner 在 paper_schema_migrations）。
                 PSM.ensure_portfolio_runtime_snapshots(conn)
+                # R34-B（v31）：多策略分配计划追加表（DDL owner 同上）。
+                PSM.ensure_portfolio_allocation_plans(conn)
                 _ensure_accounts(conn)
                 _ensure_user_strategy_accounts(conn)
                 _ensure_cycle(conn)
@@ -2200,6 +2202,8 @@ def init_db():
         # R33-C v29：策略退休 proposal/approval 追加表。
         PSM.ensure_strategy_retirement_workflow(conn)
         PSM.ensure_portfolio_runtime_snapshots(conn)
+        # R34-B v31：多策略分配计划追加表（DDL 同样只在 paper_schema_migrations）。
+        PSM.ensure_portfolio_allocation_plans(conn)
         _ensure_accounts(conn)
         _ensure_user_strategy_accounts(conn)
         _ensure_cycle(conn)

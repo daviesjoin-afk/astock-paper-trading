@@ -41,34 +41,6 @@ def _order(conn, code, qty, price, *, side="buy", status="pending_limit", signal
     conn.commit()
 
 
-class IntentPriorityTests(unittest.TestCase):
-    def test_priority_order_matches_p0_to_p5(self):
-        self.assertEqual(
-            ["P0", "P1", "P2", "P3", "P4", "P5"],
-            [name for name, _, _ in PCO.INTENT_PRIORITY],
-        )
-
-    def test_risk_exit_classifies_as_p0(self):
-        intent = PCO.classify_intent("sell", "hard_stop touched; 崩盘清仓")
-        self.assertEqual("P0", intent["priority"])
-
-    def test_take_profit_classifies_as_p1(self):
-        self.assertEqual("P1", PCO.classify_intent("sell", "take_profit scale_out")["priority"])
-
-    def test_buy_classifies_as_p4_and_add_as_p5(self):
-        self.assertEqual("P4", PCO.classify_intent("buy", "entry")["priority"])
-        self.assertEqual("P5", PCO.classify_intent("buy", "scale_in 确认加仓")["priority"])
-
-    def test_sort_puts_risk_exit_before_add_position(self):
-        intents = [
-            {"order": 1, "priority": "P5", "side": "buy"},
-            {"order": 2, "priority": "P0", "side": "sell"},
-            {"order": 3, "priority": "P4", "side": "buy"},
-        ]
-        ordered = PCO.sort_intents_by_priority(intents)
-        self.assertEqual(["P0", "P4", "P5"], [item["priority"] for item in ordered])
-
-
 class AggregateExposureTests(unittest.TestCase):
     def test_same_symbol_is_aggregated_across_strategies(self):
         quotes = {"600000": {"price": 12.0}, "000001": {"price": 20.0}}
