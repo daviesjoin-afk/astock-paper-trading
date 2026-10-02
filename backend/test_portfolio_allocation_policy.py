@@ -24,6 +24,7 @@ if BACKEND not in sys.path:
     sys.path.insert(0, BACKEND)
 
 import api_paper as API
+import paper_allocation as PA
 import paper_trading as PT
 import portfolio_allocation_policy as PAP
 import portfolio_allocation_repository as PAPRepo
@@ -191,8 +192,8 @@ class PlanIdentityTests(unittest.TestCase):
             for forbidden in ("latest", "current_cycle", "recent", "newest"):
                 self.assertNotIn(forbidden, lowered, msg=f"service calls {name}")
         self.assertEqual(_module_functions(PAS.__file__),
-                         {"_declarations", "_intents", "_with_connection",
-                          "capture_portfolio_allocation_plan",
+                         {"_allocation_stage", "_declarations", "_intents",
+                          "_with_connection", "capture_portfolio_allocation_plan",
                           "get_portfolio_allocation_plan"})
 
     def test_b8_input_order_is_canonical(self):
@@ -270,6 +271,15 @@ class DeclarationAndWeightContractTests(unittest.TestCase):
                                     "canonical_weight_invalid"):
             _build(weights={"s1": float("nan"), "s2": 1.0})
 
+    def test_b32_negative_canonical_weight_fails_closed(self):
+        # A negative weight is a malformed declaration: it would distort every
+        # other strategy's pool share, so it must not reach the arithmetic.
+        for bad in (-1.0, -0.0001, float("-inf")):
+            with self.subTest(weight=bad):
+                with self.assertRaisesRegex(PAP.PortfolioAllocationPolicyError,
+                                            "canonical_weight_invalid"):
+                    _build(weights={"s1": bad, "s2": 1.0})
+
 
 class SlotPlanTests(unittest.TestCase):
     def test_b9_total_slots_never_exceed_the_hard_pool_cap(self):
@@ -299,6 +309,19 @@ class SlotPlanTests(unittest.TestCase):
         self.assertEqual(plan.slot_plan["engine"], "allocation-engine-v2")
         self.assertEqual(plan.slot_plan["eligible_source"],
                          "PortfolioRuntimeSnapshot.execution_participant_ids")
+
+    def test_b31_negative_pool_and_slot_bounds_fail_closed(self):
+        # A negative bound is not a smaller budget. Without this gate the plan
+        # is PLANNED with negative total_cap and negative per-strategy slots.
+        for field in ("hard_pool_cap", "strategy_max_positions",
+                      "strategy_min_positions", "protected_slot_floor"):
+            with self.subTest(field=field):
+                with self.assertRaisesRegex(PAP.PortfolioAllocationPolicyError,
+                                            f"canonical_{field}_invalid"):
+                    _build(**{field: -1})
+        with self.assertRaisesRegex(PAP.PortfolioAllocationPolicyError,
+                                    "canonical_hard_pool_cap_invalid"):
+            _build(hard_pool_cap="many")
 
 
 class EvidenceGateTests(unittest.TestCase):
@@ -443,6 +466,24 @@ class ConflictPolicyTests(unittest.TestCase):
         self.assertNotIn("r1", plan.conflict_plan["deferred_intent_ids"])
         self.assertEqual(sorted(plan.conflict_plan["deferred_intent_ids"]), ["a1", "n1"])
         self.assertEqual(plan.conflict_plan["ordered_intents"][0]["intent_id"], "r1")
+
+    def test_b33_a_denied_risk_exit_does_not_arbitrate(self):
+        # An intent the policy already denied must not defer a valid one.
+        plan = _build(intents=(
+            PAP.ResourceIntent("denied_exit", "outsider", "RISK_EXIT", "600000"),
+            PAP.ResourceIntent("valid_entry", "s1", "NEW_ENTRY", "600000")))
+        rows = {row["intent_id"]: row for row in plan.conflict_plan["ordered_intents"]}
+        self.assertFalse(rows["denied_exit"]["exit_right_eligible"])
+        self.assertTrue(rows["valid_entry"]["new_resource_eligible"])
+        self.assertEqual(list(plan.conflict_plan["deferred_intent_ids"]), [])
+        self.assertEqual(list(plan.conflict_plan["arbitration"]), [])
+        # A denied entry is not deferred either; it is denied, with a reason.
+        denied = _build(intents=(
+            PAP.ResourceIntent("ok_exit", "s1", "RISK_EXIT", "600000"),
+            PAP.ResourceIntent("bad_entry", "outsider", "NEW_ENTRY", "600000")))
+        self.assertEqual(list(denied.conflict_plan["deferred_intent_ids"]), [])
+        rows = {row["intent_id"]: row for row in denied.conflict_plan["ordered_intents"]}
+        self.assertIsNotNone(rows["bad_entry"]["denial_reason"])
 
     # ── business invariants migrated off the deleted text-derived path ──
     def test_migrated_canonical_priority_vocabulary_order(self):
@@ -645,6 +686,18 @@ class LedgerImmutabilityTests(unittest.TestCase):
             self.assertEqual(plan["correlation_term"]["status"], PAP.UNAVAILABLE)
             self.assertEqual(plan["plan_id"], plan["plan_fingerprint"])
             self.assertTrue(plan["slot_plan"]["limits"])
+
+            # B34: the declaration must carry an allocation *stage*, not the raw
+            # lifecycle state. A raw state such as "paper" is not in the
+            # allocation vocabulary and would silently declare a capital scale
+            # of 0.0 for every real strategy.
+            declarations = plan["strategy_resource_declarations"]
+            self.assertTrue(declarations)
+            for declaration in declarations:
+                self.assertIn(declaration["lifecycle_stage"], PA.LIFECYCLE_STAGES)
+                self.assertIsNotNone(declaration["capital_scale"])
+            self.assertTrue(any(item["capital_scale"] > 0 for item in declarations))
+            self.assertTrue(any(item["max_positions"] > 0 for item in declarations))
             self.assertLessEqual(sum(plan["slot_plan"]["limits"].values()),
                                  plan["slot_plan"]["hard_pool_cap"])
             for reason in plan["blocking_reasons"]:

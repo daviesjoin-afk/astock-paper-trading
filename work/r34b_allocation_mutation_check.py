@@ -172,6 +172,47 @@ MUTATIONS = [
         "detectors": [_case("PersistenceTests",
                             "test_b26_same_plan_id_with_different_content_conflicts")],
     },
+    {
+        "id": "M-B15",
+        "semantic": "a negative pool or slot bound reaches the arithmetic",
+        "edits": [(POLICY,
+                   '        if number < 0:\n'
+                   '            raise PortfolioAllocationPolicyError(f"canonical_{name}_invalid")',
+                   '        if False:\n'
+                   '            raise PortfolioAllocationPolicyError(f"canonical_{name}_invalid")')],
+        "detectors": [_case("SlotPlanTests",
+                            "test_b31_negative_pool_and_slot_bounds_fail_closed")],
+    },
+    {
+        "id": "M-B16",
+        "semantic": "a negative canonical weight reaches the arithmetic",
+        "edits": [(POLICY,
+                   '        if weight < 0.0:\n'
+                   '            raise PortfolioAllocationPolicyError("canonical_weight_invalid")',
+                   '        if False:\n'
+                   '            raise PortfolioAllocationPolicyError("canonical_weight_invalid")')],
+        "detectors": [_case("DeclarationAndWeightContractTests",
+                            "test_b32_negative_canonical_weight_fails_closed")],
+    },
+    {
+        "id": "M-B17",
+        "semantic": "an already-denied risk exit still arbitrates a valid entry",
+        "edits": [(POLICY,
+                   '        blockers = [row for row in group if row["intent_kind"] == "RISK_EXIT"\n'
+                   '                    and row["exit_right_eligible"]]',
+                   '        blockers = [row for row in group if row["intent_kind"] == "RISK_EXIT"]')],
+        "detectors": [_case("ConflictPolicyTests",
+                            "test_b33_a_denied_risk_exit_does_not_arbitrate")],
+    },
+    {
+        "id": "M-B18",
+        "semantic": "the raw lifecycle state is used as the allocation stage",
+        "edits": [(SERVICE,
+                   '        stage = _allocation_stage(conn, strategy_id, pin.get("lifecycle_state"))',
+                   '        stage = str(pin.get("lifecycle_state") or "quarantined")')],
+        "detectors": [_case("LedgerImmutabilityTests",
+                            "test_b27_evaluation_leaves_the_formal_ledger_untouched")],
+    },
 ]
 
 

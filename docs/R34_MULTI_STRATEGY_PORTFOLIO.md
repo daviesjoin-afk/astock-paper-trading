@@ -234,16 +234,31 @@ detected, survived/fake/timeout = 0, restore SHA256 PASS. PA21/PA22 guard
 historical exact owner resolution; PA23 guards the service/schema ownership
 boundary. Snapshot DDL remains owned by migration v30.
 
-R34-B: `test_portfolio_allocation_policy` covers B1–B30 plus the canonical
+R34-B: `test_portfolio_allocation_policy` covers B1–B34 plus the canonical
 business invariants migrated off the deleted text-derived path;
 `test_paper_allocation_limits_equivalence` proves the `position_limits` refactor
 is behavior-equivalent to the pre-refactor arithmetic over a 300+ case sweep
 (0/1/N strategies, varied weights, caps, mins, `account_order`,
 `protected_slot_floor`, `baseline_exposure`, comparing `total_cap`,
 `risk_scale`, `protected_slot_floor`, `limits`, `effective_weights`); mutation
-matrix `work/r34b_allocation_mutation_check.py` reports M-B1…M-B14 14/14
+matrix `work/r34b_allocation_mutation_check.py` reports M-B1…M-B18 18/18
 detected, survived/fake/timeout = 0, restore SHA256 PASS. Plan DDL is owned by
 migration v31.
+
+Review follow-ups closed at this head:
+
+- B31 / B32: a negative pool or slot bound and a negative canonical weight fail
+  closed instead of being fed to the arithmetic (a negative bound previously
+  produced a `PLANNED` plan with negative `total_cap` and negative per-strategy
+  limits).
+- B33: an intent the policy has already denied no longer arbitrates, so a denied
+  `RISK_EXIT` cannot defer a valid entry for the same symbol.
+- B34: the strategy declaration carries an allocation **stage**, not the raw
+  lifecycle state. `paper` is a lifecycle state, not a stage, and passing it
+  straight through fell into the unknown-stage branch and silently declared the
+  quarantined capital scale of `0.0` for every real strategy. The stage now comes
+  from the existing owner mapping `strategy_runtime.lifecycle_stage_for` instead
+  of a second, parallel rule.
 
 R31, R32, and R33 are COMPLETE. R34-A is COMPLETE. R34-B is IN REVIEW after this
 PR; R34-C is NOT STARTED; R34 is NOT COMPLETE; R35–R37 are NOT STARTED. This PR

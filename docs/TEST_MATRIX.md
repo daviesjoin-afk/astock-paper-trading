@@ -554,8 +554,9 @@ Mutation matrix `work/r34a_portfolio_runtime_mutation_check.py`: M-P1…M-P12 **
 | 不接管 Risk 权限 | 计划中不出现 ALLOW/BLOCK/risk_decision；conflict authority 明确为资源执行优先级而非风险批准 | B24 | — |
 | 持久化与 API 最小面 | append 幂等；同 ID 异内容冲突；串改组件破坏指纹；仅 `append_plan` / `get_plan`；路由仅 plans POST + plans/{id} GET；service 不拥有 schema | B25、B26、B28、架构守卫；B27 集成（全表计数变化仅限本表） | M-B14 |
 | 纯 policy 边界 | policy 只依赖 stdlib + `paper_allocation` + `portfolio_runtime`；无 DB/网络/时钟/provider/AI；不 import 旧 coordinator | B13、B30、架构守卫 | — |
+| 畸形输入必须 fail closed | 负数 pool/slot 上下界与负数 canonical 权重都被拒（否则会输出带负 `total_cap` 与负席位的 PLANNED 计划）；已被判否的 intent 不参与仲裁，因此被否的 RISK_EXIT 无法推迟同标的的合法入场；声明携带 allocation **stage** 而非 lifecycle 状态（`paper` 不是 stage，直接透传会静默声明 quarantine 的 `capital_scale = 0.0`） | B31–B34（B34 走真实 cycle 的捕获集成断言） | M-B15 / M-B16 / M-B17 / M-B18 |
 
-Mutation matrix `work/r34b_allocation_mutation_check.py`: M-B1…M-B14 **14/14 DETECTED**；survived/fake/timeout = 0；restore SHA256 PASS；恢复后基线 GREEN。计划 DDL 归 migration v31 / `paper_trading.init_db`。
+Mutation matrix `work/r34b_allocation_mutation_check.py`: M-B1…M-B18 **18/18 DETECTED**；survived/fake/timeout = 0；restore SHA256 PASS；恢复后基线 GREEN。计划 DDL 归 migration v31 / `paper_trading.init_db`。
 
 阶段状态：R31/R32/R33 **COMPLETE**；R34-A **COMPLETE**；R34-B **IN REVIEW**；R34-C **NOT STARTED**；R34 **NOT COMPLETE**；MERGE **NOT MERGED**；DEPLOY **NOT DEPLOYED**。
 

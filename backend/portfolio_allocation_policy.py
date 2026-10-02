@@ -431,8 +431,12 @@ def _conflict_plan(snapshot: PR.PortfolioRuntimeSnapshot, intents) -> dict:
     deferred: list[str] = []
     for symbol in sorted(by_symbol):
         group = by_symbol[symbol]
-        blockers = [row for row in group if row["intent_kind"] == "RISK_EXIT"]
-        entries = [row for row in group if row["intent_kind"] in ENTRY_INTENT_KINDS]
+        # Only intents the policy actually grants may contend for a symbol. An
+        # already-denied intent must not defer a valid one.
+        blockers = [row for row in group if row["intent_kind"] == "RISK_EXIT"
+                    and row["exit_right_eligible"]]
+        entries = [row for row in group if row["intent_kind"] in ENTRY_INTENT_KINDS
+                   and row["new_resource_eligible"]]
         if blockers and entries:
             blocking_ids = [row["intent_id"] for row in blockers]
             deferred_ids = [row["intent_id"] for row in entries]
@@ -606,7 +610,12 @@ def build_portfolio_allocation_plan(
 
     validated_weights: dict[str, float] = {}
     for key, value in dict(weights or {}).items():
-        validated_weights[str(key)] = _finite_number(value, what="weight")
+        weight = _finite_number(value, what="weight")
+        # A negative weight is a malformed declaration, not a small allocation:
+        # it would distort the pool share of every other strategy.
+        if weight < 0.0:
+            raise PortfolioAllocationPolicyError("canonical_weight_invalid")
+        validated_weights[str(key)] = weight
     # Exact coverage both ways: no silent fallback to a dynamic factor and no
     # stray strategy that is not an eligible execution participant.
     if set(validated_weights) - set(eligible):
@@ -646,16 +655,32 @@ def build_portfolio_allocation_plan(
     for intent in explicit_intents:
         if not isinstance(intent, ResourceIntent):
             raise PortfolioAllocationPolicyError("canonical_intent_required")
+
+    # Pool and slot bounds are owner-declared resource facts. A negative bound is
+    # not a smaller budget: it would emit a PLANNED plan with negative slots, so
+    # it fails closed instead of reaching the arithmetic.
+    bounds = {}
+    for name, value in (("hard_pool_cap", hard_pool_cap),
+                        ("strategy_max_positions", strategy_max_positions),
+                        ("strategy_min_positions", strategy_min_positions),
+                        ("protected_slot_floor", protected_slot_floor)):
+        try:
+            number = int(value)
+        except (TypeError, ValueError) as exc:
+            raise PortfolioAllocationPolicyError(f"canonical_{name}_invalid") from exc
+        if number < 0:
+            raise PortfolioAllocationPolicyError(f"canonical_{name}_invalid")
+        bounds[name] = number
     # Fingerprint material must be input-order independent: declarations are
     # ordered by account and intents by their explicit id.
     declared = tuple(sorted(declared, key=lambda item: item.account_id))
     explicit_intents = tuple(sorted(explicit_intents, key=lambda item: item.intent_id))
 
     slot_plan = _slot_plan(
-        snapshot, declared, validated_weights, hard_pool_cap=hard_pool_cap,
-        strategy_max_positions=strategy_max_positions,
-        strategy_min_positions=strategy_min_positions,
-        protected_slot_floor=protected_slot_floor, account_order=account_order,
+        snapshot, declared, validated_weights, hard_pool_cap=bounds["hard_pool_cap"],
+        strategy_max_positions=bounds["strategy_max_positions"],
+        strategy_min_positions=bounds["strategy_min_positions"],
+        protected_slot_floor=bounds["protected_slot_floor"], account_order=account_order,
         baseline_exposure=baseline_exposure)
     capital_plan = _capital_plan(snapshot)
     capacity_plan = _capacity_plan(snapshot)

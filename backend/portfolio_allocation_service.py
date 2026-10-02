@@ -14,6 +14,8 @@ formal migration owner.
 """
 from __future__ import annotations
 
+from dataclasses import replace as dataclass_replace
+
 import paper_allocation as PA
 import paper_trading as PT
 import portfolio_allocation_policy as PAP
@@ -22,8 +24,29 @@ import portfolio_runtime as PR
 import portfolio_runtime_repository as PRRepo
 import runtime_settings as RSET
 import strategy_dsl_schema as DSL
+import strategy_lifecycle as SL
 import strategy_registry as SR
 import strategy_runtime as SRT
+
+
+def _allocation_stage(conn, strategy_id: str, lifecycle_state) -> str:
+    """Map the exact pinned lifecycle *state* to the allocation *stage*.
+
+    A lifecycle state such as ``paper`` is not an allocation stage; feeding it
+    straight to ``paper_allocation.stage_capital_scale`` would fall through the
+    unknown-stage branch and silently declare the quarantined scale of ``0.0``.
+    The mapping therefore comes from the existing owner
+    (``strategy_runtime.lifecycle_stage_for``), which is the same function the
+    live allocation path uses, rather than from a second, parallel rule.
+    """
+    state = str(lifecycle_state or "").strip()
+    if not state:
+        return "quarantined"
+    spec = SR.get(strategy_id, conn=conn)
+    if spec is None:
+        return "quarantined"
+    return SRT.lifecycle_stage_for(dataclass_replace(
+        spec, status=state, supports_new_cycle=SL.allows_formal_cycle(state)))
 
 
 def _declarations(conn, snapshot: PR.PortfolioRuntimeSnapshot):
@@ -51,7 +74,7 @@ def _declarations(conn, snapshot: PR.PortfolioRuntimeSnapshot):
         compiled = DSL.normalize(ast) if ast is not None else None
         _fingerprint, risk = SRT.compile_risk_policy(definition, compiled_dsl=compiled)
         soft = risk.soft_limits
-        stage = str(pin.get("lifecycle_state") or "quarantined")
+        stage = _allocation_stage(conn, strategy_id, pin.get("lifecycle_state"))
         declarations.append(PAP.StrategyResourceDeclaration(
             account_id=str(account),
             strategy_id=strategy_id,
