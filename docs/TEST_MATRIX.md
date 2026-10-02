@@ -517,7 +517,7 @@
 | --- | --- | --- | --- |
 | Proposal exact binding | proposal 绑定 decision/snapshot 指纹、strategy id/version/checksum、current/target state；错 snapshot、版本或 checksum fail closed | C1–C3 | M-C3 / M-C7 |
 | Operator approval | 仅显式 operator 可 APPROVE/REJECT；pending 不可执行，REJECT 不写 lifecycle；审批本身不执行 | C4–C6、API validation | M-C1 / M-C2 |
-| Controlled transition | 仅 APPROVED proposal 执行；执行前复核 decision、snapshot、版本、checksum、current state 与 `TRANSITION_TABLE`；经 R31 CAS/event owner 一次执行 | C6–C8 | M-C3 / M-C4 / M-C6 |
+| Controlled transition | 仅 APPROVED proposal 执行；执行前复核 decision、snapshot、版本、checksum、current state 与 `TRANSITION_TABLE`；经 R31 CAS/event owner 一次执行；retry 从 exact matching event 返回相同执行结果语义 | C6–C8 | M-C3 / M-C4 / M-C6 / M-C9 |
 | Append-only evidence | 同一 proposal append 幂等；proposal / approval 指纹篡改可检测；表拒绝 UPDATE/DELETE；无 current/latest 字段或 fallback | C9–C11、repository schema guard | M-C5 / M-C7 / M-C8 |
 | 无 AI/provider 自动决策 | approval 只接受 operator 身份；workflow 不依赖 AI/provider；health/policy 不导入 lifecycle；只有 execute 用例调用 lifecycle transition | C12、C14–C15 | M-C1 / M-C6 |
 | 正式账本隔离 | execution 只产生 lifecycle event，不改 cash、positions、orders、fills | C13 | — |

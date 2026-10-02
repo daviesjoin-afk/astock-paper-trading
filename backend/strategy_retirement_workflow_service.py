@@ -247,7 +247,9 @@ def execute_transition_proposal(proposal_id: str) -> dict:
             raise WF.RetirementWorkflowError("human_operator_required")
         already = _matching_lifecycle_event(conn, proposal, approval)
         if already is not None:
-            return _response(conn, proposal, approval)
+            result = _response(conn, proposal, approval)
+            result["transitioned_state"] = str(already["to_state"])
+            return result
 
         decision = _decision_for(conn, proposal.decision_id, proposal.strategy_id)
         if (decision.decision_fingerprint != proposal.decision_fingerprint

@@ -134,9 +134,9 @@ class RetirementWorkflowContractTests(_WorkflowCase):
             reason="approved after review")
         self.assertEqual("APPROVED", approved["status"])
         self.assertEqual("draft", self._state(), "approval alone must not transition lifecycle")
-        result = RWS.execute_transition_proposal(proposal["proposal_id"])
-        self.assertEqual("EXECUTED", result["status"])
-        self.assertEqual("archived", result["transitioned_state"])
+        first = RWS.execute_transition_proposal(proposal["proposal_id"])
+        self.assertEqual("EXECUTED", first["status"])
+        self.assertEqual(proposal["target_state"], first["transitioned_state"])
         self.assertEqual("archived", self._state())
         event = self.conn.execute(
             "SELECT actor_type,actor_id,reason_text,evidence_json FROM strategy_lifecycle_events"
@@ -147,8 +147,11 @@ class RetirementWorkflowContractTests(_WorkflowCase):
         self.assertEqual(proposal["proposal_fingerprint"], evidence["proposal_fingerprint"])
         self.assertEqual(approved["approval"]["approval_fingerprint"],
                          evidence["approval_fingerprint"])
-        self.assertEqual("EXECUTED", RWS.execute_transition_proposal(
-            proposal["proposal_id"])["status"])
+        retry = RWS.execute_transition_proposal(proposal["proposal_id"])
+        self.assertEqual("EXECUTED", retry["status"])
+        self.assertEqual(first["transitioned_state"], retry["transitioned_state"])
+        self.assertEqual(first["lifecycle_event"]["event_fingerprint"],
+                         retry["lifecycle_event"]["event_fingerprint"])
         self.assertEqual(1, self.conn.execute(
             "SELECT COUNT(*) FROM strategy_lifecycle_events WHERE strategy_id=?"
             " AND strategy_version=? AND to_state='archived'",

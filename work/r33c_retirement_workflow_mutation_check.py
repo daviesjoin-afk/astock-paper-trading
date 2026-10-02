@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""R33-C semantic mutations M-C1…M-C8; all must make focused regressions RED."""
+"""R33-C semantic mutations M-C1…M-C9; all must make focused regressions RED."""
 from __future__ import annotations
 
 import hashlib
@@ -77,6 +77,13 @@ MUTATIONS = [
         '            and _sha(approval.fingerprint_material()) == approval.approval_fingerprint)\n',
         '    return True\n',
         "test_r33c_retirement_workflow.RetirementWorkflowContractTests.test_c11_approval_mutation_is_detected",
+    ),
+    # M-C9: drop transitioned_state only on an otherwise successful exact-event retry.
+    (
+        "backend/strategy_retirement_workflow_service.py",
+        '            result["transitioned_state"] = str(already["to_state"])\n',
+        '            result.pop("transitioned_state", None)\n',
+        "test_r33c_retirement_workflow.RetirementWorkflowContractTests.test_c6_approved_proposal_executes_once_through_lifecycle_owner",
     ),
 ]
 
