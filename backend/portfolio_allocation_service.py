@@ -29,7 +29,8 @@ import strategy_registry as SR
 import strategy_runtime as SRT
 
 
-def _allocation_stage(conn, strategy_id: str, lifecycle_state) -> str:
+def _allocation_stage(conn, strategy_id: str, lifecycle_state, *, definition,
+                      version: int, checksum: str) -> str:
     """Map the exact pinned lifecycle *state* to the allocation *stage*.
 
     A lifecycle state such as ``paper`` is not an allocation stage; feeding it
@@ -42,11 +43,14 @@ def _allocation_stage(conn, strategy_id: str, lifecycle_state) -> str:
     state = str(lifecycle_state or "").strip()
     if not state:
         return "quarantined"
-    spec = SR.get(strategy_id, conn=conn)
-    if spec is None:
+    identity = SR.get(strategy_id, conn=conn)
+    if identity is None:
         return "quarantined"
+    exact_metadata = dict((definition or {}).get("metadata") or {})
     return SRT.lifecycle_stage_for(dataclass_replace(
-        spec, status=state, supports_new_cycle=SL.allows_formal_cycle(state)))
+        identity, metadata=exact_metadata, status=state,
+        supports_new_cycle=SL.allows_formal_cycle(state),
+        current_version=int(version), current_checksum=str(checksum)))
 
 
 def _declarations(conn, snapshot: PR.PortfolioRuntimeSnapshot):
@@ -74,7 +78,9 @@ def _declarations(conn, snapshot: PR.PortfolioRuntimeSnapshot):
         compiled = DSL.normalize(ast) if ast is not None else None
         _fingerprint, risk = SRT.compile_risk_policy(definition, compiled_dsl=compiled)
         soft = risk.soft_limits
-        stage = _allocation_stage(conn, strategy_id, pin.get("lifecycle_state"))
+        stage = _allocation_stage(
+            conn, strategy_id, pin.get("lifecycle_state"), definition=definition,
+            version=version, checksum=checksum)
         declarations.append(PAP.StrategyResourceDeclaration(
             account_id=str(account),
             strategy_id=strategy_id,

@@ -208,10 +208,32 @@ MUTATIONS = [
         "id": "M-B18",
         "semantic": "the raw lifecycle state is used as the allocation stage",
         "edits": [(SERVICE,
-                   '        stage = _allocation_stage(conn, strategy_id, pin.get("lifecycle_state"))',
+                   '        stage = _allocation_stage(\n'
+                   '            conn, strategy_id, pin.get("lifecycle_state"), definition=definition,\n'
+                   '            version=version, checksum=checksum)',
                    '        stage = str(pin.get("lifecycle_state") or "quarantined")')],
         "detectors": [_case("LedgerImmutabilityTests",
                             "test_b27_evaluation_leaves_the_formal_ledger_untouched")],
+    },
+    {
+        "id": "M-B19",
+        "semantic": "historical allocation stage uses current-head metadata",
+        "edits": [(SERVICE,
+                   '        identity, metadata=exact_metadata, status=state,',
+                   '        identity, metadata=dict((SR.get(strategy_id, conn=conn).metadata or {})), '
+                   'status=state,')],
+        "detectors": [_case("LedgerImmutabilityTests",
+                            "test_b35_historical_allocation_stage_uses_exact_version_metadata")],
+    },
+    {
+        "id": "M-B20",
+        "semantic": "economic ownership grants risk-exit eligibility",
+        "edits": [(POLICY,
+                   '    exit_scope = set(snapshot.risk_exit_participant_ids)',
+                   '    exit_scope = set(snapshot.risk_exit_participant_ids) | '
+                   'set(snapshot.economic_owner_ids)')],
+        "detectors": [_case("EligibilityScopeTests",
+                            "test_b36_economic_owner_without_risk_exit_right_cannot_block_entry")],
     },
 ]
 

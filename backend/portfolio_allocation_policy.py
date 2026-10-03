@@ -393,8 +393,7 @@ def _conflict_plan(snapshot: PR.PortfolioRuntimeSnapshot, intents) -> dict:
     deferred rather than dropped.
     """
     eligible = set(snapshot.execution_participant_ids)
-    economic = set(snapshot.economic_owner_ids)
-    exit_scope = set(snapshot.risk_exit_participant_ids) | economic
+    exit_scope = set(snapshot.risk_exit_participant_ids)
     seen = set()
     for intent in intents:
         if intent.intent_id in seen:
@@ -411,7 +410,7 @@ def _conflict_plan(snapshot: PR.PortfolioRuntimeSnapshot, intents) -> dict:
         if entry and not new_ok:
             denial = "new_resource_eligibility_requires_execution_participant"
         elif not entry and not exit_ok:
-            denial = "exit_right_requires_economic_owner_or_risk_exit_scope"
+            denial = "exit_right_requires_risk_exit_scope"
         rows.append({
             "intent_id": str(intent.intent_id), "account_id": account,
             "intent_kind": kind, "symbol": str(intent.symbol),

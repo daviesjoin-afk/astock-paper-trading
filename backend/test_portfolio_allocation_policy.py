@@ -30,7 +30,9 @@ import portfolio_allocation_policy as PAP
 import portfolio_allocation_repository as PAPRepo
 import portfolio_allocation_service as PAS
 import portfolio_runtime as PR
+import portfolio_runtime_repository as PRRepo
 import portfolio_runtime_service as PRS
+import strategy_registry as SR
 
 CHECKSUM = "a" * 64
 OTHER_CHECKSUM = "b" * 64
@@ -82,14 +84,15 @@ def _full_evidence_dimensions():
 
 def _snapshot(*, economic=("s1", "s2"), execution=None, risk_exit=None,
               asof_day="2026-09-30", decision_at="2026-10-01T09:30:00+08:00",
-              dimensions=None, checksums=None):
+              dimensions=None, checksums=None, lifecycle_states=None):
     owners = tuple(sorted(economic))
     execution = tuple(sorted(owners if execution is None else execution))
     risk_exit = tuple(sorted(execution if risk_exit is None else risk_exit))
     checksums = dict(checksums or {})
+    lifecycle_states = dict(lifecycle_states or {})
     pins = [{"account_id": account, "strategy_id": account, "strategy_version": 1,
              "strategy_checksum": checksums.get(account, CHECKSUM),
-             "lifecycle_state": "active"} for account in owners]
+             "lifecycle_state": lifecycle_states.get(account, "active")} for account in owners]
     return PR.build_portfolio_runtime_snapshot(
         cycle_id=7, asof_day=asof_day, decision_at=decision_at,
         cycle_identity={"cycle_id": 7, "cycle_key": "c-7"},
@@ -410,6 +413,24 @@ class EligibilityScopeTests(unittest.TestCase):
         self.assertTrue(rows["e2"]["exit_right_eligible"])
         self.assertNotIn("legacy_only", plan.eligible_resource_strategy_ids)
 
+    def test_b36_economic_owner_without_risk_exit_right_cannot_block_entry(self):
+        snapshot = _snapshot(economic=("s1", "paused_no_lot"), execution=("s1",),
+                             risk_exit=("s1",),
+                             lifecycle_states={"paused_no_lot": "paused"})
+        plan = _build(snapshot=snapshot, declarations=_declarations(("s1",)),
+                      weights={"s1": 1.0}, intents=(
+                          PAP.ResourceIntent("invalid_exit", "paused_no_lot", "RISK_EXIT",
+                                             "600000", 600000),
+                          PAP.ResourceIntent("valid_entry", "s1", "NEW_ENTRY",
+                                             "600000", 600000)))
+        rows = {row["intent_id"]: row for row in plan.conflict_plan["ordered_intents"]}
+        self.assertFalse(rows["invalid_exit"]["exit_right_eligible"])
+        self.assertEqual(rows["invalid_exit"]["denial_reason"],
+                         "exit_right_requires_risk_exit_scope")
+        self.assertTrue(rows["valid_entry"]["new_resource_eligible"])
+        self.assertEqual(list(plan.conflict_plan["deferred_intent_ids"]), [])
+        self.assertEqual(list(plan.conflict_plan["arbitration"]), [])
+
 
 class ConflictPolicyTests(unittest.TestCase):
     def _intents(self):
@@ -622,6 +643,55 @@ class ArchitectureGuardTests(unittest.TestCase):
 
 
 class LedgerImmutabilityTests(unittest.TestCase):
+    def test_b35_historical_allocation_stage_uses_exact_version_metadata(self):
+        temp = tempfile.TemporaryDirectory(prefix="r34b-pinned-stage-")
+        old_db = PT.DB_PATH
+        PT.DB_PATH = os.path.join(temp.name, "paper.sqlite3")
+        strategy_id = "historical_stage_test"
+        try:
+            PT.init_db()
+            with PT._db(immediate=True) as conn:
+                initial = SR.create_user_definition(
+                    conn, strategy_id, "Historical Stage Test",
+                    metadata={"lifecycle_stage": "pilot"}, actor="human")
+                pinned = SR.get_version(strategy_id, 1, checksum=initial.current_checksum,
+                                        conn=conn)
+                current = SR.save_definition(
+                    conn, strategy_id, {"metadata": {"lifecycle_stage": "mature"}},
+                    expected_version=1, actor="human", change_note="advance allocation stage")
+                self.assertEqual((pinned.version, current.version), (1, 2))
+                self.assertEqual(pinned.definition["metadata"]["lifecycle_stage"], "pilot")
+                self.assertEqual(current.definition["metadata"]["lifecycle_stage"], "mature")
+                snapshot = PR.build_portfolio_runtime_snapshot(
+                    cycle_id=7, asof_day="2026-09-30",
+                    decision_at="2026-10-01T09:30:00+08:00",
+                    cycle_identity={"cycle_id": 7, "cycle_key": "historical-pin"},
+                    strategy_pins=[{"account_id": strategy_id, "strategy_id": strategy_id,
+                                    "strategy_version": pinned.version,
+                                    "strategy_checksum": pinned.checksum,
+                                    "lifecycle_state": "paper"}],
+                    economic_owner_ids=[strategy_id],
+                    execution_participant_ids=[strategy_id],
+                    risk_exit_participant_ids=[strategy_id],
+                    source_identities={"cycle_owner": "paper_cycle_ownership:7"},
+                    market_evidence_identity=None, dimensions=_r34a_dimensions())
+                PRRepo.append_snapshot(conn, snapshot)
+
+            plan = PAS.capture_portfolio_allocation_plan(
+                portfolio_snapshot_id=snapshot.snapshot_id,
+                allocation_weights={strategy_id: 1.0})
+            declaration = plan["strategy_resource_declarations"][0]
+            self.assertEqual(declaration["strategy_id"], strategy_id)
+            self.assertEqual(declaration["strategy_version"], 1)
+            self.assertEqual(declaration["strategy_checksum"], pinned.checksum)
+            self.assertEqual(declaration["lifecycle_stage"], "pilot")
+            self.assertEqual(declaration["capital_scale"],
+                             PA.stage_capital_scale(PA.StrategyRuntime(
+                                 strategy_id=strategy_id, lifecycle_stage="pilot"))[0])
+        finally:
+            PT.DB_PATH = old_db
+            temp.cleanup()
+
     def test_b27_evaluation_leaves_the_formal_ledger_untouched(self):
         temp = tempfile.TemporaryDirectory(prefix="r34b-plan-")
         old_db = PT.DB_PATH
